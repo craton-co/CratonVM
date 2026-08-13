@@ -2026,6 +2026,37 @@ fn huc_builtin_endpoint_identification(host: &str, chain: &[Vec<u8>]) -> Result<
     crate::x509_manager::verify_hostname(&leaf, host).map_err(|e| e.to_string())
 }
 
+/// rustls's own spelling of a negotiated suite, translated to the name JSSE
+/// reports — which is what `SSLSession.getCipherSuite()` and
+/// `HttpsURLConnection.getCipherSuite()` are contracted to return.
+///
+/// The two agree on every TLS 1.2 suite (both use the IANA registry name, e.g.
+/// `TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256`) and disagree on every TLS 1.3 one:
+/// rustls's `CipherSuite` enum spells them `TLS13_AES_256_GCM_SHA384`
+/// (`rustls/src/enums.rs`, the `enum_builder!` variant names, which is what
+/// `format!("{:?}", cs.suite())` prints), while the registry — and therefore
+/// JSSE — spells the same suite `TLS_AES_256_GCM_SHA384`. Measured on this host
+/// rather than assumed (`scratchpad/c12/C12Probe.java`, HotSpot 25.0.3+9-LTS):
+///
+/// ```text
+/// JSSE supports TLS_AES_256_GCM_SHA384 = true
+/// JSSE has any TLS13_* name            = false
+/// ```
+///
+/// TLS 1.3 is this client's default, so without this every `getCipherSuite()`
+/// answer on the ordinary path would carry a name no JSSE program has ever seen
+/// — and `t27_tls::java_cipher_name_to_suite`, the VM's own reverse mapping,
+/// only accepts the JSSE spelling, so the round trip did not close either.
+///
+/// Prefix-only, deliberately: it is exactly the five `TLS13_*` variants, and a
+/// name that does not carry the prefix is already the registry's.
+fn jsse_cipher_suite_name(rustls_name: &str) -> String {
+    match rustls_name.strip_prefix("TLS13_") {
+        Some(rest) => format!("TLS_{rest}"),
+        None => rustls_name.to_string(),
+    }
+}
+
 /// Endpoint identification for a completed client handshake, run immediately
 /// after the `TrustManager` check and before a single request byte is written
 /// — the same point, and in the same order, real JSSE runs it.
@@ -2063,6 +2094,42 @@ fn huc_verify_hostname(
     cipher: &str,
     peer_chain_der: Vec<Vec<u8>>,
 ) -> Result<(), String> {
+    // STEP 0 — record the negotiated session against the carrier, BEFORE
+    // anything that can return.
+    //
+    // `HttpsURLConnection.getCipherSuite()` / `getServerCertificates()` /
+    // `getLocalCertificates()` / `getPeerPrincipal()` / `getLocalPrincipal()` /
+    // `getSSLSession()` (registered in `net_phase_e::register_https_session_accessors`)
+    // answer from this table and from nothing else; with no entry they answer
+    // `IllegalStateException: connection not yet open`, which is HotSpot's own
+    // answer for an unhandshaken connection — a missing ANSWER, never a wrong
+    // one. This function is the only place in the VM holding the carrier, the
+    // protocol, the cipher suite and the peer chain at the same instant.
+    //
+    // THE PLACEMENT IS THE WHOLE POINT, not a stylistic choice. STEP 1 below
+    // ends in `if builtin.is_ok() { return Ok(()); }`, and that early return is
+    // the path EVERY SUCCESSFUL REQUEST TAKES — the endpoint-identification
+    // check passing is the normal case. A capture written anywhere after it
+    // would record a session only for connections whose built-in name check
+    // FAILED: green under any probe that deliberately breaks verification, and
+    // dead in production. Do not move this below STEP 1.
+    //
+    // Recorded even when identification later fails, exactly as the real JDK
+    // does: the session exists once the handshake completes, and whether the
+    // peer is ACCEPTED is a separate question, answered by this function's
+    // `Err` and the exception the caller raises from it. A caller that catches
+    // that exception and then asks what was negotiated gets the same answer
+    // HotSpot gives.
+    if let Some(conn) = connection {
+        crate::net_phase_e::record_https_carrier_session(
+            ctx,
+            conn,
+            protocol,
+            cipher,
+            &peer_chain_der,
+        );
+    }
+
     // STEP 1 — the built-in check, always first and always on its own.
     let builtin = huc_builtin_endpoint_identification(host, &peer_chain_der);
     if crate::nbflags().dbg_tls_auth_ok {
@@ -2653,7 +2720,7 @@ fn perform(
                 let cipher = stream
                     .conn
                     .negotiated_cipher_suite()
-                    .map(|cs| format!("{:?}", cs.suite()))
+                    .map(|cs| jsse_cipher_suite_name(&format!("{:?}", cs.suite())))
                     .unwrap_or_else(|| "TLS_AES_256_GCM_SHA384".to_string());
                 huc_verify_hostname(
                     ctx,
@@ -4302,6 +4369,100 @@ mod http_url_connection_tests {
     #[allow(unused_imports)]
     use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
+
+    /// rustls's TLS 1.3 spelling is not JSSE's, and `getCipherSuite()` is
+    /// contracted to answer JSSE's. Both directions asserted: the five
+    /// `TLS13_*` variants are rewritten, and a TLS 1.2 name — where the two
+    /// already agree — must pass through untouched. Oracle for the expected
+    /// strings: `scratchpad/c12/C12Probe.java` §B on HotSpot 25.
+    #[test]
+    fn tls13_suite_names_are_reported_with_jsse_spelling() {
+        assert_eq!(
+            jsse_cipher_suite_name("TLS13_AES_256_GCM_SHA384"),
+            "TLS_AES_256_GCM_SHA384"
+        );
+        assert_eq!(
+            jsse_cipher_suite_name("TLS13_AES_128_GCM_SHA256"),
+            "TLS_AES_128_GCM_SHA256"
+        );
+        assert_eq!(
+            jsse_cipher_suite_name("TLS13_CHACHA20_POLY1305_SHA256"),
+            "TLS_CHACHA20_POLY1305_SHA256"
+        );
+        assert_eq!(
+            jsse_cipher_suite_name("TLS13_AES_128_CCM_8_SHA256"),
+            "TLS_AES_128_CCM_8_SHA256"
+        );
+        // TLS 1.2: already the registry name on both sides.
+        assert_eq!(
+            jsse_cipher_suite_name("TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256"),
+            "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256"
+        );
+        // Not a blanket "TLS" rewrite: only the prefix, and only when present.
+        assert_eq!(jsse_cipher_suite_name("UNKNOWN"), "UNKNOWN");
+    }
+
+    /// SOURCE WITNESS — the session capture must stay ABOVE the early return.
+    ///
+    /// `huc_verify_hostname` ends STEP 1 with `if builtin.is_ok() { return
+    /// Ok(()); }`, and that return is the path EVERY SUCCESSFUL REQUEST TAKES.
+    /// A `record_https_carrier_session` call below it would record a session
+    /// only for connections whose built-in hostname check FAILED — i.e. it
+    /// would pass any probe that deliberately breaks verification and capture
+    /// nothing in production, leaving all six `HttpsURLConnection` session
+    /// accessors answering `IllegalStateException: connection not yet open`
+    /// forever. No behavioural test can see that difference without a live TLS
+    /// peer, so the ordering is asserted against the source.
+    ///
+    /// Reads the WORKING TREE rather than an `include_str!` snapshot, so it
+    /// tracks the file someone is editing, and skips rather than fails if the
+    /// source is not on disk (a packaged build). Line endings are normalised
+    /// because this repository is edited from both Windows and Linux.
+    #[test]
+    fn the_session_capture_precedes_the_success_path_early_return() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src")
+            .join("http_url_connection.rs");
+        let Ok(src) = std::fs::read_to_string(&path) else {
+            println!("http_url_connection.rs not on disk at {path:?}; witness skipped");
+            return;
+        };
+        let lines: Vec<&str> = src.lines().map(|l| l.trim_end_matches('\r')).collect();
+
+        let fn_start = lines
+            .iter()
+            .position(|l| l.starts_with("fn huc_verify_hostname("))
+            .expect("huc_verify_hostname must still exist");
+        // The function body ends at the next top-level `}`.
+        let fn_end = lines
+            .iter()
+            .enumerate()
+            .skip(fn_start)
+            .find(|(_, l)| **l == "}")
+            .map(|(i, _)| i)
+            .expect("huc_verify_hostname must be terminated");
+        let body = &lines[fn_start..fn_end];
+
+        let capture = body
+            .iter()
+            .position(|l| l.contains("record_https_carrier_session("))
+            .expect(
+                "huc_verify_hostname must record the negotiated session; without it every \
+                 HttpsURLConnection session accessor answers \"connection not yet open\"",
+            );
+        let early_return = body
+            .iter()
+            .position(|l| l.trim() == "if builtin.is_ok() {")
+            .expect("STEP 1's success-path early return must still be recognisable");
+
+        assert!(
+            capture < early_return,
+            "record_https_carrier_session is at body line {capture}, BELOW the \
+             `if builtin.is_ok()` early return at body line {early_return} — that is the \
+             path every successful request takes, so the capture would only ever fire for \
+             connections whose hostname check FAILED. Move it back above STEP 1."
+        );
+    }
 
     /// A pooled keep-alive connection must actually be CLOSED once it is past
     /// `POOL_IDLE_WINDOW`, not merely become ineligible for reuse.

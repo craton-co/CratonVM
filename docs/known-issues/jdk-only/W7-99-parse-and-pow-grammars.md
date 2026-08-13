@@ -1,7 +1,29 @@
 # W7-99 — `Math.pow`, `Math.ulp`, and the numeric parse grammars
 
-**Status:** fixed in `native-builtins/src/lang_math.rs`; awaiting a rebuild to
-re-measure.
+**Status:** fixed in `native-builtins/src/lang_math.rs`. **MEASURED on a real
+binary 2026-08-12** — see the reconciliation banner.
+
+> ## RECONCILED 2026-08-12 (lane C18)
+>
+> The "awaiting a rebuild to re-measure" hedge this record shipped with is
+> **discharged for all three families**, and one of the three has to be split:
+>
+> * **`Math.pow` special values — FIXED and VERIFIED on a real binary.
+>   MEASURED.** §1 is closed.
+> * **`Math.pow` is nevertheless not one item.** A *second*, independent
+>   `Math.pow` defect was found afterwards and is **NOT** covered by §1: the
+>   fast path took `a.powi(b as i32)` (binary exponentiation) for integral
+>   exponents, measured at **1.4 ulp at |b| = 2 and 44.3 ulp at |b| = 63
+>   against `Math.pow`'s 1-ulp contract**. It is on **ordinary** inputs, which
+>   is exactly why a special-value census missed it. See
+>   `W7-95-intrinsic-semantics-census.md` §"`Math.pow`: the special values
+>   were the smaller half". Do not read §1's closure as closing "pow".
+> * **`Math.ulp` is NOT a defect. MEASURED**, by exhaustive proof over all
+>   4,294,967,296 `float` bit patterns, not by sample. §2 below is the
+>   pre-fix state.
+> * **`Math.floorDiv(MIN_VALUE, -1)`** (§"Unchecked-arithmetic sweep")
+>   — **FIXED and VERIFIED on a real binary. No family aborts the VM any
+>   more.**
 **Found by:** the 755-row raw-bit `Intrinsic` differential census against
 HotSpot 25 (2026-08-12). 677 rows agreed; these are three of the 39 divergent
 triples.

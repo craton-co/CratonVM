@@ -4,6 +4,25 @@
 identity. Lane C7, 2026-08-12. Windows host, **no binary was run** — every
 "after" below is marked PREDICTED.
 
+> **RECONCILED 2026-08-12 (lane C18).** Two corrections, both **SOURCE-VERIFIED
+> readings of the current tree** — not measurements on a binary.
+>
+> 1. **The values-view "interface door wins for inherited methods" hazard does
+>    not exist.** Where this record and `C7-2` §4 (row A2) say the interface
+>    registration would win for `isEmpty` / `stream` / `toArray(IntFunction)`
+>    on `HashMap$Values` and read `ArrayList` slot 1 on a one-field object:
+>    it cannot. The native-above-the-receiver walk follows `superclass` only
+>    and never enumerates interfaces, so `java/util/Collection.isEmpty()Z` is
+>    never looked up. `C13-1` §1.1, reading
+>    `vm/src/runtime/interpreter/invoke.rs:3281-3323` and its two mirrors.
+>    It had been carried into a brief as "the highest-risk item" of this
+>    rewrite; it is not an item.
+> 2. **The rewrite this record feeds COSTS registrations, it does not save
+>    them.** Retiring the eight `ArrayList` rows `P2` §3.2 blocks on, while
+>    adding the ~25 real view-class rows the correct shape needs, is a **net
+>    +17**. Any framing of this work as shrinking the shadow count is
+>    backwards. Correctness is the reason to do it; registration count is not.
+
 **Why this record exists.** `P2-COLLECTIONS-SHADOWS-20260812.md` §3.2 names
 `Map.values()` as the single blocker keeping eight further `ArrayList`
 registrations from retirement, and §7.8 hands the rewrite to L5 as

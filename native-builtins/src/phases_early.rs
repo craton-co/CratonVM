@@ -6,7 +6,10 @@
 use cratonvm_native_api::{NativeContext, NativeHandleScope, NativeMethodRegistry};
 use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError};
 use cratonvm_types::{ObjectRef, Value};
-use crate::util_concurrent_ext::{atomic_array_cas, atomic_array_rmw};
+use crate::util_concurrent_ext::{
+    atomic_array_cas, atomic_array_index, atomic_array_new_length, atomic_array_raw_index,
+    atomic_array_rmw,
+};
 
 /// The deadline a `java/net/SocketInputStream` read must honour, derived from
 /// the socket's own `SO_RCVTIMEO`.
@@ -1994,22 +1997,23 @@ pub(crate) fn register_core_stdlib_extras(r: &mut NativeMethodRegistry) {
         Ok(Some(Value::Object(Some(s))))
     });
 
-    // --- String.chars() → IntStream ---
-    r.register(s, "chars", "()Ljava/util/stream/IntStream;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let val = ctx.read_string(this).unwrap_or_default();
-        // Create an int array of char values
-        let chars: Vec<i32> = val.chars().map(|c| c as i32).collect();
-        let arr = ctx.new_array(cratonvm_types::ArrayElementType::Int, chars.len());
-        for (i, &c) in chars.iter().enumerate() {
-            ctx.set_array_element(arr, i, Value::Int(c));
-        }
-        // Wrap in IntStream synthetic (field 0 = int[], field 1 = length)
-        let stream = try_alloc_concurrent_synthetic(ctx, "java/util/stream/IntStream", 2)?;
-        ctx.set_field(stream, 0, Value::Object(Some(arr)));
-        ctx.set_field(stream, 1, Value::Int(chars.len() as i32));
-        Ok(Some(Value::Object(Some(stream))))
-    });
+    // --- String.chars() → IntStream — RETIRED, deliberately not registered ---
+    //
+    // The twin of the `codePointAt` retirement below, found by the same
+    // question and removed for the same reason. The closure that was here did
+    // `ctx.read_string(this).chars().map(|c| c as i32)`, which is Rust's
+    // `char` iterator — CODE POINTS. Java's `chars()` is the code-UNIT view:
+    // `"a\u{1F600}b".chars()` is `[97, 55357, 56832, 98]` (four), and this
+    // body answered `[97, 128512, 98]` (three), so `chars().count()` was wrong
+    // over any astral character, not merely the values. The `read_string`
+    // round trip also folded an unpaired surrogate to U+FFFD.
+    //
+    // `lang_string::native_string_chars` is the body that reads the String's
+    // own `value` array as UTF-16, and `lang_math.rs:729` registers it. As
+    // with `codePointAt`, that registration owns the slot in real-JDK mode
+    // and was OVERWRITTEN by this one in synthetic-jdk mode, where
+    // `register_enterprise_final_natives` runs after `register_wrapper_natives`.
+    // W7-95a.
 
     // --- String.toUpperCase(Locale) / toLowerCase(Locale) ---
     // Share the locale-aware implementation rather than folding with Rust's
@@ -2056,14 +2060,50 @@ pub(crate) fn register_core_stdlib_extras(r: &mut NativeMethodRegistry) {
         },
     );
 
-    // --- String.codePointAt(int) ---
-    r.register(s, "codePointAt", "(I)I", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let val = ctx.read_string(this).unwrap_or_default();
-        let idx = args.get(1).and_then(|v| v.as_int()).unwrap_or(0) as usize;
-        let cp = val.chars().nth(idx).map(|c| c as i32).unwrap_or(0);
-        Ok(Some(Value::Int(cp)))
-    });
+    // --- String.codePointAt(int) — RETIRED, deliberately not registered here ---
+    //
+    // What used to be here:
+    //
+    //     r.register(s, "codePointAt", "(I)I", |ctx, args| {
+    //         let val = ctx.read_string(this).unwrap_or_default();
+    //         let idx = args.get(1)... as usize;
+    //         let cp = val.chars().nth(idx).map(|c| c as i32).unwrap_or(0);
+    //     });
+    //
+    // `chars().nth(idx)` counts Rust `char`s — CODE POINTS — and Java's
+    // `codePointAt(int index)` takes an index in UTF-16 CODE UNITS. The two
+    // agree for a wholly-BMP string and diverge silently for anything else:
+    // no exception, just a wrong character, and one code point of skew for
+    // every astral character to the left of `index`. The `read_string` round
+    // trip made it worse — a Rust `str` cannot hold an unpaired surrogate, so
+    // `"x\uD800y".codePointAt(1)` answered U+FFFD. And out of range answered
+    // `0` where the spec says `StringIndexOutOfBoundsException`.
+    //
+    // Which body wins is not a matter of which is better —
+    // `NativeMethodRegistry::register` is LAST-WRITE-WINS, and this
+    // registration ran LATER than the good one in exactly one of the two
+    // shipping modes. Measured from `--dump-native-registry`:
+    //
+    //   real-JDK / compatible mode  `register_core_stdlib_extras` is not
+    //     called at all (it is reached only through
+    //     `register_enterprise_final_natives`), so `lang_math.rs:760` ->
+    //     `lang_string::native_string_code_point_at` already owned the slot.
+    //     Two dumps agree: `owns_slot=true, overwrote=None`, and no
+    //     `phases_early` row for `java/lang/String` exists.
+    //
+    //   synthetic-jdk mode  `register_synthetic_overrides` calls
+    //     `register_wrapper_natives` (lib.rs:23411) FIRST and
+    //     `register_enterprise_final_natives` (lib.rs:24005) after it, so this
+    //     closure overwrote the good body and was the live answer.
+    //
+    // So this was not dead code, and removing it is a behaviour change in
+    // synthetic-jdk mode — to the body that decodes the String's own `value`
+    // array as UTF-16, handles surrogate pairs, and throws SIOOBE with
+    // HotSpot's message. W7-95a.
+    //
+    // Same defect family as the atomic-array bounds hole fixed this wave:
+    // an implementation that is right for the common case and silently wrong
+    // at the edge, with nothing in the type system or the fixtures to notice.
 
     // --- StringJoiner ---
     // Layout: 3-field (delimiter=0 String, prefix=1 String, parts=2 ArrayList)
@@ -20429,6 +20469,31 @@ pub(crate) fn register_phase54_atomics(r: &mut NativeMethodRegistry) {
 ///
 /// Called from `register_phase54_atomics` in synthetic mode and directly from
 /// `register_essential_natives` in real-JDK mode.
+/// Resolve `(backing array, RANGE-CHECKED index)` for an `AtomicReferenceArray`
+/// element native.
+///
+/// The twin of `util_concurrent_ext`'s `atomic_array_slot`, differing only in
+/// how the backing array is reached: `AtomicIntegerArray`/`AtomicLongArray`
+/// read slot 0, this one reads the field by NAME so it lands on the real JDK
+/// layout's `array` whatever number that layout gives it.
+///
+/// `Ok(None)` = no receiver / no backing array, which keeps each caller's
+/// historical `null`-shaped default. `Err` = out of range, and HotSpot throws
+/// `ArrayIndexOutOfBoundsException` there — see `atomic_array_index` for the
+/// measured before/after table and for why the check belongs on a funnel.
+fn ara_slot(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> Result<Option<(ObjectRef, usize)>, MethodCallFailed> {
+    let this = obj_arg(args, 0)?;
+    let raw = atomic_array_raw_index(args);
+    let arr = match ctx.get_field_by_name(this, "array") {
+        Value::Object(Some(o)) => o,
+        _ => return Ok(None),
+    };
+    Ok(Some((arr, atomic_array_index(ctx, arr, raw)?)))
+}
+
 pub(crate) fn register_atomic_reference_array_natives(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Intrinsic);
@@ -20436,7 +20501,10 @@ pub(crate) fn register_atomic_reference_array_natives(r: &mut NativeMethodRegist
     let ara = "java/util/concurrent/atomic/AtomicReferenceArray";
     r.register(ara, "<init>", "(I)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let len = args[1].as_int().unwrap_or(0) as usize;
+        // `new AtomicReferenceArray(-1)` throws NegativeArraySizeException on
+        // HotSpot (measured, JDK 25.0.3+9). The old `as usize` handed
+        // `usize::MAX` to `new_array` instead.
+        let len = atomic_array_new_length(args[1].as_int().unwrap_or(0))?;
         let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, len);
         // Use by-name writes so we land on the real `array` slot regardless of
         // how the class layout numbers its fields.
@@ -20452,41 +20520,29 @@ pub(crate) fn register_atomic_reference_array_natives(r: &mut NativeMethodRegist
             Ok(Some(Value::Int(0)))
         }
     });
-    r.register(ara, "get", "(I)Ljava/lang/Object;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let idx = args[1].as_int().unwrap_or(0) as usize;
-        if let Value::Object(Some(arr)) = ctx.get_field_by_name(this, "array") {
-            Ok(Some(ctx.get_array_element(arr, idx)))
-        } else {
-            Ok(Some(Value::Object(None)))
+    let ara_get = |ctx: &mut dyn NativeContext, args: &[Value]| -> MethodCallResult {
+        match ara_slot(ctx, args)? {
+            Some((arr, idx)) => Ok(Some(ctx.get_array_element(arr, idx))),
+            None => Ok(Some(Value::Object(None))),
         }
-    });
-    r.register(ara, "set", "(ILjava/lang/Object;)V", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let idx = args[1].as_int().unwrap_or(0) as usize;
+    };
+    r.register(ara, "get", "(I)Ljava/lang/Object;", ara_get);
+    let ara_set = |ctx: &mut dyn NativeContext, args: &[Value]| -> MethodCallResult {
         let val = args[2];
-        if let Value::Object(Some(arr)) = ctx.get_field_by_name(this, "array") {
+        if let Some((arr, idx)) = ara_slot(ctx, args)? {
             ctx.set_array_element(arr, idx, val);
         }
         Ok(None)
-    });
-    r.register(ara, "lazySet", "(ILjava/lang/Object;)V", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let idx = args[1].as_int().unwrap_or(0) as usize;
-        let val = args[2];
-        if let Value::Object(Some(arr)) = ctx.get_field_by_name(this, "array") {
-            ctx.set_array_element(arr, idx, val);
-        }
-        Ok(None)
-    });
+    };
+    r.register(ara, "set", "(ILjava/lang/Object;)V", ara_set);
+    r.register(ara, "lazySet", "(ILjava/lang/Object;)V", ara_set);
     let ara_cas = |ctx: &mut dyn NativeContext, args: &[Value]| -> MethodCallResult {
-        let this = obj_arg(args, 0)?;
-        let idx = args[1].as_int().unwrap_or(0) as usize;
-        if let Value::Object(Some(arr)) = ctx.get_field_by_name(this, "array") {
-            let ok = atomic_array_cas(ctx, arr, idx, args[2], args[3]);
-            Ok(Some(Value::Int(i32::from(ok))))
-        } else {
-            Ok(Some(Value::Int(0)))
+        match ara_slot(ctx, args)? {
+            Some((arr, idx)) => {
+                let ok = atomic_array_cas(ctx, arr, idx, args[2], args[3]);
+                Ok(Some(Value::Int(i32::from(ok))))
+            }
+            None => Ok(Some(Value::Int(0))),
         }
     };
     r.register(
@@ -20512,14 +20568,13 @@ pub(crate) fn register_atomic_reference_array_natives(r: &mut NativeMethodRegist
         "getAndSet",
         "(ILjava/lang/Object;)Ljava/lang/Object;",
         |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            let idx = args[1].as_int().unwrap_or(0) as usize;
-            if let Value::Object(Some(arr)) = ctx.get_field_by_name(this, "array") {
-                let new_val = args[2];
-                let (old, _) = atomic_array_rmw(ctx, arr, idx, |_| new_val);
-                Ok(Some(old))
-            } else {
-                Ok(Some(Value::Object(None)))
+            let new_val = args[2];
+            match ara_slot(ctx, args)? {
+                Some((arr, idx)) => {
+                    let (old, _) = atomic_array_rmw(ctx, arr, idx, |_| new_val);
+                    Ok(Some(old))
+                }
+                None => Ok(Some(Value::Object(None))),
             }
         },
     );

@@ -4105,8 +4105,148 @@ pub(crate) fn register_phase64_natives(registry: &mut NativeMethodRegistry) {
 
 // =============================================================================
 // HexFormat — Java 17
-// HexFormat = 2-field (delimiter=0 String, prefix=1 String)
+//
+// `HexFormat` is an immutable OPTION OBJECT: `of()` / `ofDelimiter()` mint one
+// and every `with*` returns a copy with one setting changed. The whole family
+// used to be written as if it were a bare byte<->hex codec:
+//
+//   * `withUpperCase()` was `Ok(Some(args[0]))` -- literally "return self",
+//     under the comment *"Simplified: return self (real impl would flag
+//     uppercase)"*. Measured: expected `00FF0A80`, produced `00ff0a80`.
+//   * `withDelimiter`, `withSuffix`, `withLowerCase` were not registered.
+//   * `formatHex` built its answer from the raw bytes with `{:02x}` and never
+//     looked at the receiver AT ALL, so `withPrefix` -- which WAS honoured to
+//     the extent of being stored -- was dropped on the floor too. The defect
+//     was therefore never "uppercase is missing"; it was that a configuration
+//     object had no reader, so EVERY setting was inert.
+//
+// Three of the old bodies could also reach a Rust panic, which is not a Java
+// throwable and takes the VM with it:
+//
+//   * `formatHex(b, 3, 1)` computed `(to - from) * 2` on `usize` -- `3 - 1`
+//     reversed is fine, but `from > to` (HotSpot: `IndexOutOfBoundsException:
+//     Range [3, 1) out of bounds for length 4`) underflows, and a negative
+//     `from` widened to `usize::MAX` before that.
+//   * `parseHex` sliced the Rust `String` by BYTE index, `&s[i*2..i*2+2]`,
+//     which panics with "byte index is not a char boundary" on any non-ASCII
+//     input. HotSpot answers `NumberFormatException: not a hexadecimal digit`.
+//
+// Instance layout, and it is the REAL JDK 25 one (verified by reflection on
+// Microsoft OpenJDK 25.0.3+9: `String delimiter, String prefix, String suffix,
+// boolean ucase`), so the same slot numbers serve both modes:
+//
+//     delimiter@0   prefix@1   suffix@2   ucase@3
+//
+// Every expected value below is a transcript from that JDK, not a memory.
 // =============================================================================
+
+const P64_HF_DELIMITER: usize = 0;
+const P64_HF_PREFIX: usize = 1;
+const P64_HF_SUFFIX: usize = 2;
+const P64_HF_UCASE: usize = 3;
+const P64_HF_SLOTS: usize = 4;
+
+/// A `HexFormat` receiver's configuration, read off the object rather than
+/// assumed. The reader that did not exist.
+struct P64HexCfg {
+    delimiter: String,
+    prefix: String,
+    suffix: String,
+    ucase: bool,
+}
+
+fn p64_hf_string(ctx: &mut dyn NativeContext, this: ObjectRef, slot: usize) -> String {
+    if ctx.object_num_fields(this) <= slot {
+        return String::new();
+    }
+    match ctx.get_field(this, slot) {
+        Value::Object(Some(r)) => ctx.read_string(r).unwrap_or_default(),
+        _ => String::new(),
+    }
+}
+
+fn p64_hex_cfg(ctx: &mut dyn NativeContext, this: ObjectRef) -> P64HexCfg {
+    let delimiter = p64_hf_string(ctx, this, P64_HF_DELIMITER);
+    let prefix = p64_hf_string(ctx, this, P64_HF_PREFIX);
+    let suffix = p64_hf_string(ctx, this, P64_HF_SUFFIX);
+    let ucase = ctx.object_num_fields(this) > P64_HF_UCASE
+        && matches!(ctx.get_field(this, P64_HF_UCASE), Value::Int(v) if v != 0);
+    P64HexCfg {
+        delimiter,
+        prefix,
+        suffix,
+        ucase,
+    }
+}
+
+/// Mint a `HexFormat` carrying the four settings.
+fn p64_hex_new(
+    ctx: &mut dyn NativeContext,
+    cfg: &P64HexCfg,
+) -> Result<ObjectRef, MethodCallFailed> {
+    let obj = try_alloc_concurrent_synthetic(ctx, "java/util/HexFormat", P64_HF_SLOTS)?;
+    let d = ctx.create_string(&cfg.delimiter);
+    ctx.set_field(obj, P64_HF_DELIMITER, Value::Object(Some(d)));
+    let p = ctx.create_string(&cfg.prefix);
+    ctx.set_field(obj, P64_HF_PREFIX, Value::Object(Some(p)));
+    let s = ctx.create_string(&cfg.suffix);
+    ctx.set_field(obj, P64_HF_SUFFIX, Value::Object(Some(s)));
+    ctx.set_field(obj, P64_HF_UCASE, Value::Int(i32::from(cfg.ucase)));
+    Ok(obj)
+}
+
+/// `Objects.requireNonNull(arg, name)` — `HexFormat.withDelimiter(null)` throws
+/// `NullPointerException: delimiter` on HotSpot, measured.
+fn p64_hf_required_string(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+    name: &'static str,
+) -> Result<String, MethodCallFailed> {
+    match args.get(1) {
+        Some(Value::Object(Some(r))) => Ok(ctx.read_string(*r).unwrap_or_default()),
+        _ => Err(RuntimeError::NullPointerException {
+            message: Some(name.to_string()),
+        }
+        .into()),
+    }
+}
+
+fn p64_hex_digits(ucase: bool) -> &'static [u8; 16] {
+    if ucase {
+        b"0123456789ABCDEF"
+    } else {
+        b"0123456789abcdef"
+    }
+}
+
+fn p64_push_byte(out: &mut String, b: u8, ucase: bool) {
+    let d = p64_hex_digits(ucase);
+    out.push(d[(b >> 4) as usize] as char);
+    out.push(d[(b & 0x0f) as usize] as char);
+}
+
+/// `HexFormat.isHexDigit(int ch)` accepts ONLY ASCII `0-9 a-f A-F`.
+///
+/// The old body did `*v as u8 as char`, truncating the code point to its low
+/// byte: `isHexDigit(0x661)` (ARABIC-INDIC DIGIT ONE) became `0x61` = `'a'` and
+/// answered `true`. HotSpot answers `false` — measured.
+fn p64_is_hex_digit(ch: i32) -> bool {
+    matches!(ch, 0x30..=0x39 | 0x41..=0x46 | 0x61..=0x66)
+}
+
+/// Digit value, or HotSpot's `NumberFormatException: not a hexadecimal digit:
+/// "g" = 103` (the trailing number is the code point, measured).
+fn p64_hex_digit_value(ch: char) -> Result<u32, MethodCallFailed> {
+    let cp = ch as i32;
+    if p64_is_hex_digit(cp) {
+        Ok(ch.to_digit(16).unwrap_or(0))
+    } else {
+        Err(RuntimeError::NumberFormatException {
+            message: format!("not a hexadecimal digit: \"{ch}\" = {cp}"),
+        }
+        .into())
+    }
+}
 
 pub(crate) fn register_p64_hex_format(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
@@ -4114,11 +4254,15 @@ pub(crate) fn register_p64_hex_format(r: &mut NativeMethodRegistry) {
     let hf = "java/util/HexFormat";
 
     r.register(hf, "of", "()Ljava/util/HexFormat;", |ctx, _args| {
-        let obj = try_alloc_concurrent_synthetic(ctx, "java/util/HexFormat", 2)?;
-        let empty = ctx.create_string("");
-        ctx.set_field(obj, 0, Value::Object(Some(empty))); // delimiter
-        let empty2 = ctx.create_string("");
-        ctx.set_field(obj, 1, Value::Object(Some(empty2))); // prefix
+        let obj = p64_hex_new(
+            ctx,
+            &P64HexCfg {
+                delimiter: String::new(),
+                prefix: String::new(),
+                suffix: String::new(),
+                ucase: false,
+            },
+        )?;
         Ok(Some(Value::Object(Some(obj))))
     });
     r.register(
@@ -4126,10 +4270,25 @@ pub(crate) fn register_p64_hex_format(r: &mut NativeMethodRegistry) {
         "ofDelimiter",
         "(Ljava/lang/String;)Ljava/util/HexFormat;",
         |ctx, args| {
-            let obj = try_alloc_concurrent_synthetic(ctx, "java/util/HexFormat", 2)?;
-            ctx.set_field(obj, 0, args.first().copied().unwrap_or(Value::Object(None)));
-            let empty = ctx.create_string("");
-            ctx.set_field(obj, 1, Value::Object(Some(empty)));
+            // STATIC: the delimiter is args[0], not args[1].
+            let delimiter = match args.first() {
+                Some(Value::Object(Some(r))) => ctx.read_string(*r).unwrap_or_default(),
+                _ => {
+                    return Err(RuntimeError::NullPointerException {
+                        message: Some("delimiter".to_string()),
+                    }
+                    .into())
+                }
+            };
+            let obj = p64_hex_new(
+                ctx,
+                &P64HexCfg {
+                    delimiter,
+                    prefix: String::new(),
+                    suffix: String::new(),
+                    ucase: false,
+                },
+            )?;
             Ok(Some(Value::Object(Some(obj))))
         },
     );
@@ -4151,44 +4310,77 @@ pub(crate) fn register_p64_hex_format(r: &mut NativeMethodRegistry) {
         "(Ljava/lang/String;)[B",
         native_p64_parse_hex,
     );
+    r.register(
+        hf,
+        "parseHex",
+        "(Ljava/lang/CharSequence;)[B",
+        native_p64_parse_hex,
+    );
     r.register(hf, "toHexDigits", "(B)Ljava/lang/String;", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let ucase = p64_hex_cfg(ctx, this).ucase;
         let b = match args.get(1) {
             Some(Value::Int(v)) => *v as u8,
             _ => 0,
         };
-        let s = format!("{:02x}", b);
-        let obj = ctx.create_string(&s);
+        let mut out = String::with_capacity(2);
+        p64_push_byte(&mut out, b, ucase);
+        let obj = ctx.create_string(&out);
         Ok(Some(Value::Object(Some(obj))))
     });
     r.register(hf, "toHexDigits", "(I)Ljava/lang/String;", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let ucase = p64_hex_cfg(ctx, this).ucase;
         let v = match args.get(1) {
             Some(Value::Int(v)) => *v,
             _ => 0,
         };
-        let s = format!("{:08x}", v);
-        let obj = ctx.create_string(&s);
+        let mut out = String::with_capacity(8);
+        for shift in (0..4).rev() {
+            p64_push_byte(&mut out, (v >> (shift * 8)) as u8, ucase);
+        }
+        let obj = ctx.create_string(&out);
         Ok(Some(Value::Object(Some(obj))))
     });
     r.register(hf, "toHexDigits", "(J)Ljava/lang/String;", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let ucase = p64_hex_cfg(ctx, this).ucase;
         let v = match args.get(1) {
             Some(Value::Long(v)) => *v,
             _ => 0,
         };
-        let s = format!("{:016x}", v);
-        let obj = ctx.create_string(&s);
+        let mut out = String::with_capacity(16);
+        for shift in (0..8).rev() {
+            p64_push_byte(&mut out, (v >> (shift * 8)) as u8, ucase);
+        }
+        let obj = ctx.create_string(&out);
         Ok(Some(Value::Object(Some(obj))))
     });
+    // STATIC methods: the CharSequence is args[0].
+    //
+    // Both used to be `from_str_radix(s.trim(), 16).unwrap_or(0)`, which is
+    // three divergences in one line: `trim()` accepted `" ff "` where HotSpot
+    // throws `NumberFormatException: not a hexadecimal digit: " " = 32`;
+    // `unwrap_or(0)` turned every malformed input into the answer `0`; and an
+    // over-long string silently wrapped where HotSpot throws
+    // `IllegalArgumentException: string length greater than 8: 9`.
     r.register(
         hf,
         "fromHexDigits",
         "(Ljava/lang/CharSequence;)I",
         |ctx, args| {
-            let s = match args.get(1) {
-                Some(Value::Object(Some(r))) => ctx.read_string(*r).unwrap_or_default(),
-                _ => String::new(),
-            };
-            let val = i64::from_str_radix(s.trim(), 16).unwrap_or(0) as i32;
-            Ok(Some(Value::Int(val)))
+            let chars = p64_hf_digits_arg(ctx, args)?;
+            if chars.len() > 8 {
+                return Err(RuntimeError::IllegalArgumentException {
+                    message: format!("string length greater than 8: {}", chars.len()),
+                }
+                .into());
+            }
+            let mut acc: u32 = 0;
+            for ch in chars {
+                acc = (acc << 4) | p64_hex_digit_value(ch)?;
+            }
+            Ok(Some(Value::Int(acc as i32)))
         },
     );
     r.register(
@@ -4196,119 +4388,346 @@ pub(crate) fn register_p64_hex_format(r: &mut NativeMethodRegistry) {
         "fromHexDigitsToLong",
         "(Ljava/lang/CharSequence;)J",
         |ctx, args| {
-            let s = match args.get(1) {
-                Some(Value::Object(Some(r))) => ctx.read_string(*r).unwrap_or_default(),
-                _ => String::new(),
-            };
-            let val = u64::from_str_radix(s.trim(), 16).unwrap_or(0) as i64;
-            Ok(Some(Value::Long(val)))
+            let chars = p64_hf_digits_arg(ctx, args)?;
+            if chars.len() > 16 {
+                return Err(RuntimeError::IllegalArgumentException {
+                    message: format!("string length greater than 16: {}", chars.len()),
+                }
+                .into());
+            }
+            let mut acc: u64 = 0;
+            for ch in chars {
+                acc = (acc << 4) | u64::from(p64_hex_digit_value(ch)?);
+            }
+            Ok(Some(Value::Long(acc as i64)))
         },
     );
     r.register(hf, "isHexDigit", "(I)Z", |_ctx, args| {
         let ch = match args.first() {
-            Some(Value::Int(v)) => *v as u8 as char,
-            _ => '\0',
+            Some(Value::Int(v)) => *v,
+            _ => -1,
         };
-        Ok(Some(Value::Int(if ch.is_ascii_hexdigit() { 1 } else { 0 })))
+        Ok(Some(Value::Int(i32::from(p64_is_hex_digit(ch)))))
     });
     r.register(hf, "delimiter", "()Ljava/lang/String;", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        Ok(Some(ctx.get_field(this, 0)))
+        let s = p64_hf_string(ctx, this, P64_HF_DELIMITER);
+        let obj = ctx.create_string(&s);
+        Ok(Some(Value::Object(Some(obj))))
     });
     r.register(hf, "prefix", "()Ljava/lang/String;", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        Ok(Some(ctx.get_field(this, 1)))
+        let s = p64_hf_string(ctx, this, P64_HF_PREFIX);
+        let obj = ctx.create_string(&s);
+        Ok(Some(Value::Object(Some(obj))))
     });
-    r.register(hf, "toString", "()Ljava/lang/String;", |ctx, _args| {
-        let s = ctx.create_string("HexFormat");
+    r.register(hf, "suffix", "()Ljava/lang/String;", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let s = p64_hf_string(ctx, this, P64_HF_SUFFIX);
+        let obj = ctx.create_string(&s);
+        Ok(Some(Value::Object(Some(obj))))
+    });
+    r.register(hf, "isUpperCase", "()Z", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let ucase = p64_hex_cfg(ctx, this).ucase;
+        Ok(Some(Value::Int(i32::from(ucase))))
+    });
+    r.register(hf, "toString", "()Ljava/lang/String;", |ctx, args| {
+        // HotSpot 25.0.3+9, measured:
+        //   uppercase: true, delimiter: "", prefix: "", suffix: ""
+        let this = obj_arg(args, 0)?;
+        let cfg = p64_hex_cfg(ctx, this);
+        let text = format!(
+            "uppercase: {}, delimiter: \"{}\", prefix: \"{}\", suffix: \"{}\"",
+            cfg.ucase, cfg.delimiter, cfg.prefix, cfg.suffix
+        );
+        let s = ctx.create_string(&text);
         Ok(Some(Value::Object(Some(s))))
     });
+    r.register(
+        hf,
+        "withDelimiter",
+        "(Ljava/lang/String;)Ljava/util/HexFormat;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let delimiter = p64_hf_required_string(ctx, args, "delimiter")?;
+            let mut cfg = p64_hex_cfg(ctx, this);
+            cfg.delimiter = delimiter;
+            let obj = p64_hex_new(ctx, &cfg)?;
+            Ok(Some(Value::Object(Some(obj))))
+        },
+    );
     r.register(
         hf,
         "withPrefix",
         "(Ljava/lang/String;)Ljava/util/HexFormat;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            let obj = try_alloc_concurrent_synthetic(ctx, "java/util/HexFormat", 2)?;
-            ctx.set_field(obj, 0, ctx.get_field(this, 0)); // keep delimiter
-            ctx.set_field(obj, 1, args.get(1).copied().unwrap_or(Value::Object(None)));
+            let prefix = p64_hf_required_string(ctx, args, "prefix")?;
+            let mut cfg = p64_hex_cfg(ctx, this);
+            cfg.prefix = prefix;
+            let obj = p64_hex_new(ctx, &cfg)?;
             Ok(Some(Value::Object(Some(obj))))
         },
     );
     r.register(
         hf,
-        "withUpperCase",
-        "()Ljava/util/HexFormat;",
-        |_ctx, args| {
-            // Simplified: return self (real impl would flag uppercase)
-            Ok(Some(args.first().copied().unwrap_or(Value::Object(None))))
+        "withSuffix",
+        "(Ljava/lang/String;)Ljava/util/HexFormat;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let suffix = p64_hf_required_string(ctx, args, "suffix")?;
+            let mut cfg = p64_hex_cfg(ctx, this);
+            cfg.suffix = suffix;
+            let obj = p64_hex_new(ctx, &cfg)?;
+            Ok(Some(Value::Object(Some(obj))))
         },
     );
+    r.register(hf, "withUpperCase", "()Ljava/util/HexFormat;", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let mut cfg = p64_hex_cfg(ctx, this);
+        cfg.ucase = true;
+        let obj = p64_hex_new(ctx, &cfg)?;
+        Ok(Some(Value::Object(Some(obj))))
+    });
+    r.register(hf, "withLowerCase", "()Ljava/util/HexFormat;", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let mut cfg = p64_hex_cfg(ctx, this);
+        cfg.ucase = false;
+        let obj = p64_hex_new(ctx, &cfg)?;
+        Ok(Some(Value::Object(Some(obj))))
+    });
     r.set_category(__prev_cat);
 }
 
-fn native_p64_format_hex(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let arr = match args.get(1) {
-        Some(Value::Object(Some(a))) => *a,
-        _ => {
-            let s = ctx.create_string("");
-            return Ok(Some(Value::Object(Some(s))));
+/// The `CharSequence` argument of the two STATIC `fromHexDigits` forms, as
+/// UTF-16-safe `char`s. `null` is HotSpot's
+/// `NullPointerException: Cannot invoke "java.lang.CharSequence.length()"
+/// because "string" is null` — measured.
+fn p64_hf_digits_arg(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> Result<Vec<char>, MethodCallFailed> {
+    match args.first() {
+        Some(Value::Object(Some(r))) => Ok(ctx
+            .read_string(*r)
+            .unwrap_or_default()
+            .chars()
+            .collect::<Vec<char>>()),
+        _ => Err(RuntimeError::NullPointerException {
+            message: Some(
+                "Cannot invoke \"java.lang.CharSequence.length()\" because \"string\" is null"
+                    .to_string(),
+            ),
         }
-    };
-    let len = ctx.array_length(arr);
-    let mut hex = String::with_capacity(len * 2);
-    for i in 0..len {
+        .into()),
+    }
+}
+
+/// The shared body of both `formatHex` forms: the READER the family was
+/// missing.
+///
+/// Shape, verified against HotSpot 25.0.3+9 with `{00, FF, 0A, 80}`:
+///
+/// ```text
+/// of()                                      00ff0a80
+/// of().withUpperCase()                      00FF0A80
+/// ofDelimiter(":")                          00:ff:0a:80
+/// of().withPrefix("0x")                     0x000xff0x0a0x80
+/// of().withSuffix(";")                      00;ff;0a;80;
+/// ofDelimiter(", ").withPrefix("0x")
+///        .withSuffix("!").withUpperCase()   0x00!, 0xFF!, 0x0A!, 0x80!
+/// ```
+///
+/// i.e. each byte is `prefix + 2 digits + suffix` and the DELIMITER goes
+/// between elements only — a suffix trails the last element, a delimiter does
+/// not.
+fn p64_format_hex_impl(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    arr: ObjectRef,
+    from: usize,
+    to: usize,
+) -> MethodCallResult {
+    let cfg = p64_hex_cfg(ctx, this);
+    let mut out = String::with_capacity((to - from) * (2 + cfg.prefix.len() + cfg.suffix.len()));
+    for i in from..to {
+        if i > from {
+            out.push_str(&cfg.delimiter);
+        }
+        out.push_str(&cfg.prefix);
         let b = match ctx.get_array_element(arr, i) {
             Value::Int(v) => v as u8,
             _ => 0,
         };
-        hex.push_str(&format!("{:02x}", b));
+        p64_push_byte(&mut out, b, cfg.ucase);
+        out.push_str(&cfg.suffix);
     }
-    let s = ctx.create_string(&hex);
+    let s = ctx.create_string(&out);
     Ok(Some(Value::Object(Some(s))))
+}
+
+/// `formatHex(byte[])`'s null contract: HotSpot throws
+/// `NullPointerException: Cannot read the array length because "bytes" is null`
+/// (measured). The old body answered `""`.
+fn p64_hf_bytes_arg(args: &[Value]) -> Result<ObjectRef, MethodCallFailed> {
+    match args.get(1) {
+        Some(Value::Object(Some(a))) => Ok(*a),
+        _ => Err(RuntimeError::NullPointerException {
+            message: Some(
+                "Cannot read the array length because \"bytes\" is null".to_string(),
+            ),
+        }
+        .into()),
+    }
+}
+
+fn native_p64_format_hex(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let arr = p64_hf_bytes_arg(args)?;
+    let len = ctx.array_length(arr);
+    p64_format_hex_impl(ctx, this, arr, 0, len)
 }
 
 fn native_p64_format_hex_range(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let arr = match args.get(1) {
-        Some(Value::Object(Some(a))) => *a,
-        _ => {
-            let s = ctx.create_string("");
-            return Ok(Some(Value::Object(Some(s))));
-        }
-    };
+    let this = obj_arg(args, 0)?;
+    let arr = p64_hf_bytes_arg(args)?;
+    let len = ctx.array_length(arr);
     let from = match args.get(2) {
-        Some(Value::Int(v)) => *v as usize,
+        Some(Value::Int(v)) => *v,
         _ => 0,
     };
     let to = match args.get(3) {
-        Some(Value::Int(v)) => *v as usize,
+        Some(Value::Int(v)) => *v,
         _ => 0,
     };
-    let mut hex = String::with_capacity((to - from) * 2);
-    for i in from..to {
-        let b = match ctx.get_array_element(arr, i) {
-            Value::Int(v) => v as u8,
-            _ => 0,
-        };
-        hex.push_str(&format!("{:02x}", b));
+    // `Objects.checkFromToIndex` — HotSpot's exact wording, measured:
+    //   Range [0, 9) out of bounds for length 4
+    //   Range [3, 1) out of bounds for length 4     (from > to)
+    // The old body widened both to `usize` and then computed `to - from`,
+    // so a reversed or negative range was an arithmetic overflow panic
+    // before it could be an exception.
+    if from < 0 || to < from || (to as i64) > len as i64 {
+        return Err(RuntimeError::ioobe(format!(
+            "Range [{from}, {to}) out of bounds for length {len}"
+        ))
+        .into());
     }
-    let s = ctx.create_string(&hex);
-    Ok(Some(Value::Object(Some(s))))
+    p64_format_hex_impl(ctx, this, arr, from as usize, to as usize)
 }
 
+/// `parseHex` — the inverse of `formatHex`, and it must honour the same
+/// configuration.
+///
+/// Measured on HotSpot 25.0.3+9:
+///
+/// ```text
+/// of().parseHex("00ff0a80")            [0, -1, 10, -128]
+/// of().parseHex("abc")                 IllegalArgumentException: string length not even: 3
+/// of().parseHex("0g")                  NumberFormatException: not a hexadecimal digit: "g" = 103
+/// ofDelimiter(":").parseHex("00:ff")   [0, -1]
+/// ofDelimiter(":").parseHex("00ff")    IllegalArgumentException: extra or missing delimiters
+///                                        or values consisting of prefix, two hexadecimal
+///                                        digits, and suffix
+/// of().parseHex(null)                  NullPointerException
+/// ```
+///
+/// The old body was `hex_str.len()/2` pairs sliced out of the Rust `String` by
+/// BYTE index with `unwrap_or(0)` on each — it accepted odd lengths by
+/// truncating, answered `0` for every bad digit, ignored the delimiter, and
+/// PANICKED on any non-ASCII input.
 fn native_p64_parse_hex(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let hex_str = match args.get(1) {
-        Some(Value::Object(Some(r))) => ctx.read_string(*r).unwrap_or_default(),
-        _ => String::new(),
+    let this = obj_arg(args, 0)?;
+    let chars: Vec<char> = match args.get(1) {
+        Some(Value::Object(Some(r))) => ctx.read_string(*r).unwrap_or_default().chars().collect(),
+        _ => {
+            return Err(RuntimeError::NullPointerException {
+                message: Some(
+                    "Cannot invoke \"java.lang.CharSequence.length()\" because \"string\" is null"
+                        .to_string(),
+                ),
+            }
+            .into())
+        }
     };
-    let bytes_len = hex_str.len() / 2;
-    let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, bytes_len);
-    for i in 0..bytes_len {
-        let byte_str = &hex_str[i * 2..i * 2 + 2];
-        let b = u8::from_str_radix(byte_str, 16).unwrap_or(0);
-        ctx.set_array_element(arr, i, Value::Int(b as i32));
+    let cfg = p64_hex_cfg(ctx, this);
+    let bytes = p64_parse_hex_chars(&chars, &cfg)?;
+    let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, bytes.len());
+    for (i, b) in bytes.iter().enumerate() {
+        ctx.set_array_element(arr, i, Value::Int(i32::from(*b as i8)));
     }
     Ok(Some(Value::Object(Some(arr))))
+}
+
+const P64_HF_STRIDE_ERR: &str = "extra or missing delimiters or values consisting of prefix, \
+     two hexadecimal digits, and suffix";
+
+fn p64_parse_hex_chars(chars: &[char], cfg: &P64HexCfg) -> Result<Vec<u8>, MethodCallFailed> {
+    let pre: Vec<char> = cfg.prefix.chars().collect();
+    let suf: Vec<char> = cfg.suffix.chars().collect();
+    let del: Vec<char> = cfg.delimiter.chars().collect();
+
+    if pre.is_empty() && suf.is_empty() && del.is_empty() {
+        if chars.len() % 2 != 0 {
+            return Err(RuntimeError::IllegalArgumentException {
+                message: format!("string length not even: {}", chars.len()),
+            }
+            .into());
+        }
+        let mut out = Vec::with_capacity(chars.len() / 2);
+        for pair in chars.chunks(2) {
+            let hi = p64_hex_digit_value(pair[0])?;
+            let lo = p64_hex_digit_value(pair[1])?;
+            out.push(((hi << 4) | lo) as u8);
+        }
+        return Ok(out);
+    }
+
+    if chars.is_empty() {
+        return Ok(Vec::new());
+    }
+    // One element is prefix + 2 digits + suffix; elements are joined by the
+    // delimiter, so the whole string is `n*stride - delimiter` characters.
+    let stride = pre.len() + 2 + suf.len() + del.len();
+    if (chars.len() + del.len()) % stride != 0 {
+        return Err(RuntimeError::IllegalArgumentException {
+            message: P64_HF_STRIDE_ERR.to_string(),
+        }
+        .into());
+    }
+    let count = (chars.len() + del.len()) / stride;
+    let mut out = Vec::with_capacity(count);
+    let mut at = 0usize;
+    for i in 0..count {
+        if i > 0 {
+            if chars[at..at + del.len()] != del[..] {
+                return Err(RuntimeError::IllegalArgumentException {
+                    message: P64_HF_STRIDE_ERR.to_string(),
+                }
+                .into());
+            }
+            at += del.len();
+        }
+        if chars[at..at + pre.len()] != pre[..] {
+            return Err(RuntimeError::IllegalArgumentException {
+                message: P64_HF_STRIDE_ERR.to_string(),
+            }
+            .into());
+        }
+        at += pre.len();
+        let hi = p64_hex_digit_value(chars[at])?;
+        let lo = p64_hex_digit_value(chars[at + 1])?;
+        out.push(((hi << 4) | lo) as u8);
+        at += 2;
+        if chars[at..at + suf.len()] != suf[..] {
+            return Err(RuntimeError::IllegalArgumentException {
+                message: P64_HF_STRIDE_ERR.to_string(),
+            }
+            .into());
+        }
+        at += suf.len();
+    }
+    Ok(out)
 }
 
 
@@ -9185,6 +9604,265 @@ mod cert_verify_bounds_security_tests {
         assert!(r2
             .find("java/util/zip/ZipOutputStream", "write", "([BII)V")
             .is_some());
+    }
+}
+
+// =============================================================================
+// java.util.UUID.fromString — the SPEC, not a canonical-form matcher
+// =============================================================================
+//
+// `UUID.fromString` is LENIENT in a way almost nobody remembers, and the
+// in-tree parser was strict in one direction and lax in the other — which is
+// the usual signature of a missing specification rather than two bugs.
+//
+// What it did: strip EVERY `-`, require exactly 32 remaining characters, then
+// `u64::from_str_radix(&hex[0..16]).unwrap_or(0)`. Measured against HotSpot
+// 25.0.3+9, that is wrong in five ways at once:
+//
+// ```text
+//                                                HotSpot            CratonVM (before)
+// "1-2-3-4-5"                                    00000001-0002-...  IAE Invalid UUID string
+// "0112233-4455-6677-8899-00aabbccddeef"         00112233-4455-...  IAE (35 chars, re-padded)
+// "00112233445566778899aabbccddeeff"  (no dash)  IAE                ACCEPTED
+// "0011-2233-4455-6677-8899-aabb-ccdd-eeff"      IAE / too large    ACCEPTED (dashes stripped)
+// "zzzzzzzz-zzzz-zzzz-zzzz-zzzzzzzzzzzz"         NumberFormatEx     00000000-0000-...-000000000000
+// fromString(null)                               NPE                null
+// ```
+//
+// and `&hex[0..16]` sliced a Rust `String` by BYTE index, so a 32-byte input
+// containing one multi-byte character whose boundary straddles offset 16
+// PANICS ("byte index is not a char boundary"). A panic is not a Java
+// throwable; it takes the VM.
+//
+// The actual algorithm (JDK 25 `java.base/java/util/UUID.java`), which every
+// row above follows from:
+//
+//   1. `length() > 36` -> `IllegalArgumentException: UUID string too large`.
+//   2. Locate five successive `-` by `indexOf`. If the FOURTH is absent or a
+//      FIFTH exists -> `IllegalArgumentException: Invalid UUID string: <s>`.
+//      Nothing checks where the dashes are, which is why the 36-character
+//      `"001122334455-6677-8899-0aab-bccddeef"` parses (to
+//      `22334455-6677-8899-0aab-0000bccddeef`).
+//   3. Each of the five groups goes through `Long.parseLong(cs, from, to, 16)`
+//      and is then MASKED to its field width, so a group may be shorter than
+//      its canonical length (zero-padded on the way in) or longer (truncated).
+//      A leading `+` or `-` is legal, because `parseLong` accepts one.
+//
+// So the parser is a `parseLong` five times over, and every divergence above
+// is the same missing fact: this is not a canonical-form matcher.
+//
+// Lives here rather than in `lib.rs` because that file is owned elsewhere;
+// `native_uuid_from_string` calls it. See the NOMINATIONS in
+// docs/known-issues/jdk-only/W8-C15-*.md.
+
+/// `Long.parseLong(CharSequence, begin, end, 16)`, transcribed including its
+/// two exception texts, which are observable through `UUID.fromString`:
+///
+/// ```text
+/// ""      / "-" / "+"   NumberFormatException: For input string: "" under radix 16
+/// "0x1"                 NumberFormatException: Error at index 1 in: "0x1"
+/// 17 x 'f'              NumberFormatException: Error at index 15 in: "fffffffffffffffff"
+/// ```
+///
+/// The overflow index is not the last character: HotSpot's `result < multmin`
+/// test fires one digit EARLY, at 15 for a 17-digit input, and this
+/// transcription keeps that so the message matches character for character.
+pub(crate) fn uuid_parse_long_hex(group: &[char]) -> Result<i64, MethodCallFailed> {
+    let text: String = group.iter().collect();
+    let sign_only_or_empty = || RuntimeError::NumberFormatException {
+        message: format!("For input string: \"{text}\" under radix 16"),
+    };
+    let err_at = |i: usize| RuntimeError::NumberFormatException {
+        message: format!("Error at index {i} in: \"{text}\""),
+    };
+    if group.is_empty() {
+        return Err(sign_only_or_empty().into());
+    }
+    let mut i = 0usize;
+    let mut negative = false;
+    let first = group[0];
+    if first < '0' {
+        if first == '-' {
+            negative = true;
+        } else if first != '+' {
+            return Err(err_at(0).into());
+        }
+        if group.len() == 1 {
+            return Err(sign_only_or_empty().into());
+        }
+        i = 1;
+    }
+    // Accumulate NEGATIVELY, as HotSpot does, so `Long.MIN_VALUE` is
+    // representable and the overflow test is a single comparison.
+    let limit: i64 = if negative { i64::MIN } else { -i64::MAX };
+    let multmin: i64 = limit / 16;
+    let mut result: i64 = 0;
+    while i < group.len() {
+        let digit = match group[i].to_digit(16) {
+            Some(d) => i64::from(d),
+            None => return Err(err_at(i).into()),
+        };
+        if result < multmin {
+            return Err(err_at(i).into());
+        }
+        result *= 16;
+        if result < limit + digit {
+            return Err(err_at(i).into());
+        }
+        result -= digit;
+        i += 1;
+    }
+    Ok(if negative { result } else { -result })
+}
+
+/// `UUID.fromString(name)` reduced to its `(mostSigBits, leastSigBits)` pair.
+///
+/// Returns the same throwables HotSpot does, including the message text —
+/// `IllegalArgumentException` for a shape failure and `NumberFormatException`
+/// for a group failure, which is a distinction a caller can and does test.
+pub(crate) fn uuid_from_string_bits(name: &str) -> Result<(i64, i64), MethodCallFailed> {
+    // `chars()`, not byte indices: the old parser's `&hex[0..16]` was a
+    // char-boundary panic waiting for a multi-byte input.
+    let chars: Vec<char> = name.chars().collect();
+    if chars.len() > 36 {
+        return Err(RuntimeError::IllegalArgumentException {
+            message: "UUID string too large".to_string(),
+        }
+        .into());
+    }
+    let dash_after = |from: usize| -> Option<usize> {
+        if from > chars.len() {
+            return None;
+        }
+        chars[from..].iter().position(|c| *c == '-').map(|p| p + from)
+    };
+    let invalid = || RuntimeError::IllegalArgumentException {
+        message: format!("Invalid UUID string: {name}"),
+    };
+    let dash1 = match dash_after(0) {
+        Some(d) => d,
+        None => return Err(invalid().into()),
+    };
+    let dash2 = match dash_after(dash1 + 1) {
+        Some(d) => d,
+        None => return Err(invalid().into()),
+    };
+    let dash3 = match dash_after(dash2 + 1) {
+        Some(d) => d,
+        None => return Err(invalid().into()),
+    };
+    let dash4 = match dash_after(dash3 + 1) {
+        Some(d) => d,
+        None => return Err(invalid().into()),
+    };
+    // A FIFTH dash is what rejects "1-2-3-4-5-6" and "-1-2-3-4-5".
+    if dash_after(dash4 + 1).is_some() {
+        return Err(invalid().into());
+    }
+    let g0 = uuid_parse_long_hex(&chars[0..dash1])? as u64;
+    let g1 = uuid_parse_long_hex(&chars[dash1 + 1..dash2])? as u64;
+    let g2 = uuid_parse_long_hex(&chars[dash2 + 1..dash3])? as u64;
+    let g3 = uuid_parse_long_hex(&chars[dash3 + 1..dash4])? as u64;
+    let g4 = uuid_parse_long_hex(&chars[dash4 + 1..chars.len()])? as u64;
+
+    let mut msb = g0 & 0xffff_ffff;
+    msb <<= 16;
+    msb |= g1 & 0xffff;
+    msb <<= 16;
+    msb |= g2 & 0xffff;
+    let mut lsb = g3 & 0xffff;
+    lsb <<= 48;
+    lsb |= g4 & 0xffff_ffff_ffff;
+    Ok((msb as i64, lsb as i64))
+}
+
+#[cfg(test)]
+mod uuid_from_string_spec_tests {
+    use super::{uuid_from_string_bits, uuid_parse_long_hex};
+
+    /// Every expectation is a line of `scratchpad/c15/P4Uuid` / `P4b` output on
+    /// Microsoft OpenJDK 25.0.3+9, transcribed, not remembered.
+    #[test]
+    fn lenient_forms_hotspot_accepts() {
+        assert_eq!(
+            uuid_from_string_bits("1-2-3-4-5").expect("HotSpot accepts this"),
+            (0x0000_0001_0002_0003, 0x0004_0000_0000_0005)
+        );
+        assert_eq!(
+            uuid_from_string_bits("0112233-4455-6677-8899-00aabbccddeef").expect("35-char form"),
+            (0x0011_2233_4455_6677, 0x8899_0aab_bccd_deefu64 as i64)
+        );
+        // Groups WIDER than their field are masked, not rejected.
+        assert_eq!(
+            uuid_from_string_bits("fffffffff-2-3-4-5").expect("9 f's mask to 8"),
+            (0xffff_ffff_0002_0003u64 as i64, 0x0004_0000_0000_0005)
+        );
+        // `Long.parseLong` accepts a leading sign, so `UUID.fromString` does.
+        assert_eq!(
+            uuid_from_string_bits("+1-2-3-4-5").expect("leading plus"),
+            (0x0000_0001_0002_0003, 0x0004_0000_0000_0005)
+        );
+        // Dash POSITIONS are not checked, only that there are exactly four.
+        assert_eq!(
+            uuid_from_string_bits("001122334455-6677-8899-0aab-bccddeef")
+                .expect("36 chars, misplaced dashes"),
+            (0x2233_4455_6677_8899u64 as i64, 0x0aab_0000_bccd_deef)
+        );
+    }
+
+    #[test]
+    fn strict_forms_hotspot_rejects() {
+        // The over-LAX half of the same missing spec: the old parser stripped
+        // dashes and counted to 32, so both of these were ACCEPTED.
+        for bad in [
+            "00112233445566778899aabbccddeeff",
+            "1-2-3-4-5-6",
+            "-1-2-3-4-5",
+            "1-2-3-4",
+            "",
+        ] {
+            assert!(
+                uuid_from_string_bits(bad).is_err(),
+                "HotSpot rejects {bad:?}"
+            );
+        }
+        assert!(uuid_from_string_bits(&"a".repeat(37)).is_err(), "too large");
+        // Not silently zero: a non-hex group is a NumberFormatException.
+        assert!(uuid_from_string_bits("zzzzzzzz-zzzz-zzzz-zzzz-zzzzzzzzzzzz").is_err());
+        // An empty group is a NumberFormatException, not an IAE.
+        assert!(uuid_from_string_bits("1-2-3-4-").is_err());
+    }
+
+    #[test]
+    fn parse_long_hex_matches_hotspot_messages() {
+        let e = uuid_parse_long_hex(&"0x1".chars().collect::<Vec<_>>()).unwrap_err();
+        assert!(
+            format!("{e:?}").contains("Error at index 1"),
+            "bad digit index, got {e:?}"
+        );
+        // Overflow is reported one digit EARLY, at 15 of 17.
+        let e = uuid_parse_long_hex(&"f".repeat(17).chars().collect::<Vec<_>>()).unwrap_err();
+        assert!(
+            format!("{e:?}").contains("Error at index 15"),
+            "overflow index, got {e:?}"
+        );
+        // A 16-digit group is fine and wraps to a negative i64.
+        assert_eq!(
+            uuid_parse_long_hex(&"ffffffffffffffff".chars().collect::<Vec<_>>()).ok(),
+            None,
+            "16 f's overflow a signed long — HotSpot masks AFTER parseLong, \
+             and parseLong itself refuses; UUID's own groups are never that wide \
+             except the 12-digit one"
+        );
+    }
+
+    /// The mutation check the standing lesson asks for: if the fifth-dash
+    /// rejection is removed, `strict_forms_hotspot_rejects` must go red. Kept
+    /// as an assertion on the boundary rather than a comment.
+    #[test]
+    fn fifth_dash_is_the_rejecting_rule() {
+        assert!(uuid_from_string_bits("1-2-3-4-5").is_ok());
+        assert!(uuid_from_string_bits("1-2-3-4-5-6").is_err());
     }
 }
 

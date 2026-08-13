@@ -1336,7 +1336,7 @@ public class RJdkIntrinsics2 {
         check(be.get(OPAQUE_I[3]) == 'A', "the BIG_ENDIAN char view must read 'A'");
         check(be.charAt(OPAQUE_I[4]) == 'B', "the BIG_ENDIAN char view's charAt(1) must be 'B'");
         check(!be.hasArray(), "a ByteBuffer-backed char view must report hasArray() == false");
-        check("AB  ".equals(be.toString()),
+        check("AB\u0000\u0000".equals(be.toString()),
                 "the view's toString must be its four chars, trailing NULs included");
         check(be.remaining() == 4, "eight bytes make four chars");
         CharBuffer le = raw.order(ByteOrder.LITTLE_ENDIAN).asCharBuffer();

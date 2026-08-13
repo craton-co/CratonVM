@@ -3782,13 +3782,40 @@ pub(crate) fn native_string_ends_with(
     Ok(Some(Value::Int(if result { 1 } else { 0 })))
 }
 
+/// `String.trim()` — remove leading/trailing chars whose value is `<= U+0020`.
+///
+/// W7-95a. This is NOT `String.strip()` and it is NOT `str::trim()`; the tree
+/// had all three collapsed onto Rust's. `trim()` predates Unicode-aware
+/// whitespace in Java and is defined by a raw code-unit comparison against
+/// the space character, while `strip()` uses `Character.isWhitespace`. Three
+/// rules, and Rust's `str::trim` (Unicode `White_Space`) is none of them.
+///
+/// Measured on OpenJDK 25.0.3+9, printed as code units so the console cannot
+/// lie about what survived:
+///
+/// ```text
+///  input (as code units)      trim()            strip()          str::trim() gave
+///  [00A0, 0078, 00A0]         [160,120,160]     [160,120,160]    [120]
+///  [0000, 0078, 0000]         [120]             [0,120,0]        [0,120,0]
+///  [001C, 0078, 001C]         [120]             [120]            [28,120,28]
+///  [2028, 0078, 2028]         [8232,120,8232]   [120]            [120]
+/// ```
+///
+/// Every row where `trim()` and `strip()` differ is a row Rust's `trim` gets
+/// wrong for at least one of them, which is why one shared implementation was
+/// never going to work.
 pub(crate) fn native_string_trim(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
-    let text = ctx.read_string(this).unwrap_or_default();
-    let trimmed = text.trim().to_string();
+    let units = read_string_chars(ctx, this);
+    let start = units.iter().position(|&u| u > 0x20).unwrap_or(units.len());
+    let end = units
+        .iter()
+        .rposition(|&u| u > 0x20)
+        .map_or(start, |i| i + 1);
+    let trimmed = String::from_utf16_lossy(&units[start..end]);
     let result = ctx.create_string_uninterned(&trimmed);
     Ok(Some(Value::Object(Some(result))))
 }
@@ -3940,7 +3967,36 @@ fn string_case_impl(
         }
         changed
     } else {
-        let mapped = if lowercase {
+        // `str::to_uppercase` (the FULL mapping) is the right primitive here
+        // and must stay: `String.toUpperCase()` really does answer "SS" for a
+        // sharp s. Only `Character.toUpperCase(char)` is the 1:1 mapping, and
+        // that lives in `java_char_to_upper_case`.
+        //
+        // The one correction is the version skew: Rust's tables case-pair the
+        // six code points in `JDK_UNMAPPED_CASE_CODE_POINTS`, and the JDK maps
+        // each to itself (measured: `toUpperCase()` of the one-character string
+        // `[A7D3]` is `[A7D3]` on OpenJDK 25.0.3+9). Map character by
+        // character only when one is
+        // actually present, so the ordinary path keeps the single bulk call —
+        // the ASCII fast path above never reaches here, and every code point
+        // in the list is above U+A7CD, so the scan is a cheap early-out for
+        // essentially all real text.
+        let mapped = if folded
+            .chars()
+            .any(|c| is_jdk_unmapped_case_code_point(u32::from(c)))
+        {
+            let mut out = String::with_capacity(folded.len());
+            for c in folded.chars() {
+                if is_jdk_unmapped_case_code_point(u32::from(c)) {
+                    out.push(c);
+                } else if lowercase {
+                    out.extend(c.to_lowercase());
+                } else {
+                    out.extend(c.to_uppercase());
+                }
+            }
+            out
+        } else if lowercase {
             folded.to_lowercase()
         } else {
             folded.to_uppercase()
@@ -4923,43 +4979,71 @@ pub(crate) fn native_string_get_chars(
     Ok(None)
 }
 
-pub(crate) fn native_string_strip(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+/// The `String.strip*` family's shared walk.
+///
+/// W7-95a. `strip`/`stripLeading`/`stripTrailing` are specified in terms of
+/// `Character.isWhitespace`, which is not `char::is_whitespace` — see
+/// [`java_char_is_whitespace`] for the eight code points that disagree and for
+/// the measurement. Measured, code units in / code units out: `strip()` of
+/// `[2007, 0078, 2007]` is `[8199, 120, 8199]` on HotSpot 25.0.3+9 and was
+/// `[120]` here (`U+2007` FIGURE SPACE is a non-breaking space, which Java
+/// deliberately does not treat as whitespace); `strip()` of
+/// `[001C, 0078, 001C]` is `[120]` there and was `[28, 120, 28]` here.
+///
+/// Java strips by code POINT, so the walk skips a whole surrogate pair — but
+/// no supplementary code point is whitespace, so the pair never strips and
+/// walking by code unit gives the same answer. Reading units rather than a
+/// `str` also keeps an unpaired surrogate out of the U+FFFD substitution.
+fn string_strip_range(units: &[u16], leading: bool, trailing: bool) -> (usize, usize) {
+    let mut start = 0;
+    let mut end = units.len();
+    if leading {
+        while start < end && java_char_is_whitespace(units[start]) {
+            start += 1;
+        }
+    }
+    if trailing {
+        while end > start && java_char_is_whitespace(units[end - 1]) {
+            end -= 1;
+        }
+    }
+    (start, end)
+}
+
+fn native_string_strip_impl(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+    leading: bool,
+    trailing: bool,
+) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
-    let s = ctx.read_string(this).unwrap_or_default();
+    let units = read_string_chars(ctx, this);
+    let (start, end) = string_strip_range(&units, leading, trailing);
+    let stripped = String::from_utf16_lossy(&units[start..end]);
     Ok(Some(Value::Object(Some(
-        ctx.create_string_uninterned(s.trim()),
+        ctx.create_string_uninterned(&stripped),
     ))))
+}
+
+pub(crate) fn native_string_strip(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    native_string_strip_impl(ctx, args, true, true)
 }
 
 pub(crate) fn native_string_strip_leading(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
-    let this = match args.first() {
-        Some(Value::Object(Some(obj))) => *obj,
-        _ => return Ok(Some(Value::Object(None))),
-    };
-    let s = ctx.read_string(this).unwrap_or_default();
-    Ok(Some(Value::Object(Some(
-        ctx.create_string_uninterned(s.trim_start()),
-    ))))
+    native_string_strip_impl(ctx, args, true, false)
 }
 
 pub(crate) fn native_string_strip_trailing(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
-    let this = match args.first() {
-        Some(Value::Object(Some(obj))) => *obj,
-        _ => return Ok(Some(Value::Object(None))),
-    };
-    let s = ctx.read_string(this).unwrap_or_default();
-    Ok(Some(Value::Object(Some(
-        ctx.create_string_uninterned(s.trim_end()),
-    ))))
+    native_string_strip_impl(ctx, args, false, true)
 }
 
 pub(crate) fn native_string_copy_value_of(
@@ -5006,8 +5090,14 @@ pub(crate) fn native_string_code_point_at(
         Some(Value::Int(i)) => *i,
         _ => 0,
     };
-    let s = ctx.read_string(this).unwrap_or_default();
-    let chars: Vec<u16> = s.encode_utf16().collect();
+    // `read_string_chars`, NOT `ctx.read_string(..).encode_utf16()`. W7-95a:
+    // that round trip goes through a Rust `String`, a Rust `str` cannot hold
+    // an unpaired surrogate, and `String::from_utf16_lossy` therefore replaces
+    // one with U+FFFD. `"x\uD800y".codePointAt(1)` measured 65533 here against
+    // HotSpot 25.0.3+9's 55296 — a 65533 in a code-point answer is the
+    // diagnosis, not a coincidence. `read_string_chars` decodes the String's
+    // own `value` array to UTF-16 code units and never sees UTF-8.
+    let chars = read_string_chars(ctx, this);
     if index_i32 < 0 || (index_i32 as usize) >= chars.len() {
         // Message as well as class: the real `codePointAt` reaches
         // `Preconditions.checkIndex(index, length, SIOOBE_FORMATTER)`.
@@ -5030,6 +5120,26 @@ pub(crate) fn native_string_code_point_at(
     Ok(Some(Value::Int(ch as i32)))
 }
 
+/// `String.codePointCount(int, int)`.
+///
+/// W7-95a. Two defects, both from the same three lines: the bounds were cast
+/// straight to `usize` (so a negative `beginIndex` became a huge index that
+/// the `while` simply skipped) and `endIndex` was *clamped* to the length
+/// instead of rejected. Every out-of-range call therefore returned a number
+/// where HotSpot throws. Measured on 25.0.3+9:
+///
+/// ```text
+/// "a<U+1F600>b".codePointCount(3, 1)   IndexOutOfBoundsException: Range [3, 1) out of bounds for length 4
+/// "a<U+1F600>b".codePointCount(0, 9)   IndexOutOfBoundsException: Range [0, 9) out of bounds for length 4
+/// "a<U+1F600>b".codePointCount(-1, 2)  IndexOutOfBoundsException: Range [-1, 2) out of bounds for length 4
+/// ```
+///
+/// The thrown class is the SUPERCLASS `IndexOutOfBoundsException`, not
+/// `StringIndexOutOfBoundsException`: this call site reaches `Preconditions`
+/// without the `String` domain's exception formatter. `codePointAt` a few
+/// lines above *does* get the SIOOBE formatter, so the two neighbours throw
+/// different classes on purpose — a `catch (StringIndexOutOfBoundsException)`
+/// around this one would not fire on HotSpot either.
 pub(crate) fn native_string_code_point_count(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -5038,17 +5148,31 @@ pub(crate) fn native_string_code_point_count(
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Int(0))),
     };
-    let begin = match args.get(1) {
-        Some(Value::Int(i)) => *i as usize,
+    let begin_i32 = match args.get(1) {
+        Some(Value::Int(i)) => *i,
         _ => 0,
     };
-    let end = match args.get(2) {
-        Some(Value::Int(i)) => *i as usize,
+    let end_i32 = match args.get(2) {
+        Some(Value::Int(i)) => *i,
         _ => 0,
     };
-    let s = ctx.read_string(this).unwrap_or_default();
-    let chars: Vec<u16> = s.encode_utf16().collect();
-    let end = end.min(chars.len());
+    // `read_string_chars` for the surrogate reason spelled out in
+    // `native_string_code_point_at`: a lossy UTF-8 round trip turns the
+    // unpaired surrogates this method exists to count into U+FFFD.
+    let chars = read_string_chars(ctx, this);
+    let length = chars.len() as i32;
+    if begin_i32 < 0 || begin_i32 > end_i32 || end_i32 > length {
+        return Err(cratonvm_types::error::RuntimeError::ioobe(
+            cratonvm_types::error::out_of_bounds_message::check_from_to_index(
+                i64::from(begin_i32),
+                i64::from(end_i32),
+                i64::from(length),
+            ),
+        )
+        .into());
+    }
+    let begin = begin_i32 as usize;
+    let end = end_i32 as usize;
     let mut count = 0;
     let mut i = begin;
     while i < end {
@@ -5067,6 +5191,33 @@ pub(crate) fn native_string_code_point_count(
     Ok(Some(Value::Int(count)))
 }
 
+/// `String.offsetByCodePoints(int, int)`.
+///
+/// W7-95a. The old body was **VM-fatal**, not merely wrong. `index` was cast
+/// to `usize`, so any `index > length()` survived; the backward branch then
+/// did `pos -= 1` followed by an unguarded `chars[pos]`, and
+/// `"a<U+1F600>b".offsetByCodePoints(10, -1)` indexed a 4-element `Vec` at 9.
+/// A Rust panic is not a Java throwable — it terminates the VM, from one line
+/// of ordinary application bytecode. `for _ in 0..(-code_point_offset)` was a
+/// second one: negating `Integer.MIN_VALUE` overflows `i32`, which panics in
+/// any debug-assertions profile.
+///
+/// Both branches now transcribe `Character.offsetByCodePoints`, whose loops
+/// are bounded by `i < limit` / `i > start` and which reports a *shortfall*
+/// (`x > 0` after the loop) as the throw. Measured on OpenJDK 25.0.3+9, all
+/// four of these throw `IndexOutOfBoundsException` with a **null** message —
+/// the plain superclass, no `Preconditions` text, unlike `codePointCount`'s
+/// neighbouring `Range [a, b)` wording:
+///
+/// ```text
+/// "a<U+1F600>b".offsetByCodePoints(0, 9)     IndexOutOfBoundsException  (ran off the end)
+/// "a<U+1F600>b".offsetByCodePoints(0, -1)    IndexOutOfBoundsException  (ran off the start)
+/// "a<U+1F600>b".offsetByCodePoints(10, -1)   IndexOutOfBoundsException  (index > length)
+/// "a<U+1F600>b".offsetByCodePoints(-1, 1)    IndexOutOfBoundsException  (index < 0)
+/// ```
+///
+/// while the in-range answers are `offsetByCodePoints(0, 2) == 3` and
+/// `offsetByCodePoints(4, -2) == 1` — the surrogate pair counts as one step.
 pub(crate) fn native_string_offset_by_code_points(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -5075,44 +5226,58 @@ pub(crate) fn native_string_offset_by_code_points(
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Int(0))),
     };
-    let index = match args.get(1) {
-        Some(Value::Int(i)) => *i as usize,
+    let index_i32 = match args.get(1) {
+        Some(Value::Int(i)) => *i,
         _ => 0,
     };
     let code_point_offset = match args.get(2) {
         Some(Value::Int(i)) => *i,
         _ => 0,
     };
-    let s = ctx.read_string(this).unwrap_or_default();
-    let chars: Vec<u16> = s.encode_utf16().collect();
-    let mut pos = index;
+    // `read_string_chars`: see `native_string_code_point_at`.
+    let chars = read_string_chars(ctx, this);
+    let length = chars.len() as i32;
+    // `String.offsetByCodePoints`'s own precondition. Note `index > length()`,
+    // not `>=`: the position one past the last char is a legal starting point
+    // for a backward walk.
+    if index_i32 < 0 || index_i32 > length {
+        return Err(cratonvm_types::error::RuntimeError::ioobe_no_message().into());
+    }
+    let mut pos = index_i32 as usize;
     if code_point_offset >= 0 {
-        for _ in 0..code_point_offset {
-            if pos >= chars.len() {
-                break;
-            }
+        // `Character.offsetByCodePoints`, forward arm: `x` counts the steps
+        // still owed, and a nonzero `x` at the end is the throw.
+        let mut x = code_point_offset;
+        while x > 0 && pos < chars.len() {
             let ch = chars[pos];
-            if (0xD800..=0xDBFF).contains(&ch) && pos + 1 < chars.len() {
-                let low = chars[pos + 1];
-                if (0xDC00..=0xDFFF).contains(&low) {
-                    pos += 2;
-                    continue;
-                }
-            }
             pos += 1;
+            if (0xD800..=0xDBFF).contains(&ch)
+                && pos < chars.len()
+                && (0xDC00..=0xDFFF).contains(&chars[pos])
+            {
+                pos += 1;
+            }
+            x -= 1;
+        }
+        if x > 0 {
+            return Err(cratonvm_types::error::RuntimeError::ioobe_no_message().into());
         }
     } else {
-        for _ in 0..(-code_point_offset) {
-            if pos == 0 {
-                break;
-            }
+        // Backward arm. `code_point_offset.unsigned_abs()` rather than
+        // `-code_point_offset`: the latter panics on `Integer.MIN_VALUE`.
+        let mut x = i64::from(code_point_offset.unsigned_abs());
+        while x > 0 && pos > 0 {
             pos -= 1;
-            if pos > 0
-                && (0xDC00..=0xDFFF).contains(&chars[pos])
+            if (0xDC00..=0xDFFF).contains(&chars[pos])
+                && pos > 0
                 && (0xD800..=0xDBFF).contains(&chars[pos - 1])
             {
                 pos -= 1;
             }
+            x -= 1;
+        }
+        if x > 0 {
+            return Err(cratonvm_types::error::RuntimeError::ioobe_no_message().into());
         }
     }
     Ok(Some(Value::Int(pos as i32)))
@@ -5195,11 +5360,42 @@ pub(crate) fn native_string_indent(
             }
             result.push_str(line);
         } else if n < 0 {
-            // Remove up to |n| leading whitespace characters
-            let remove = (-n) as usize;
-            let spaces = line.len() - line.trim_start().len();
-            let skip = remove.min(spaces);
-            result.push_str(&line[skip..]);
+            // W7-95a, found while auditing this file for panics. Java's rule is
+            // `s.substring(Math.min(-n, s.indexOfNonWhitespace()))` — a count of
+            // CHARACTERS, over `Character.isWhitespace`. The old body was
+            // `line.len() - line.trim_start().len()`, a count of BYTES over
+            // Rust's Unicode `White_Space`, followed by `&line[skip..]`. Two
+            // defects, and the second is VM-fatal:
+            //
+            //  * Wrong table. Measured on OpenJDK 25.0.3+9, printed as code
+            //    units: `indent(-1)` of `[00A0, 0061]` is `[160, 97, 10]` —
+            //    Java KEEPS a leading non-breaking space, because
+            //    `Character.isWhitespace` excludes it. Rust's `trim_start`
+            //    removes it.
+            //  * **Slicing a `str` at a byte offset that is not a character
+            //    boundary panics**, and a Rust panic is not a Java throwable:
+            //    it terminates the VM. That exact input reached it — U+00A0 is
+            //    two UTF-8 bytes, `trim_start` reported `spaces == 2`, `-n`
+            //    was 1, and `&line[1..]` landed inside the character.
+            //
+            // `n.unsigned_abs()` rather than `-n` for the third one:
+            // `indent(Integer.MIN_VALUE)` is specified as `stripLeading()`, and
+            // negating `Integer.MIN_VALUE` overflows `i32`. Capping the
+            // character count at `non_ws` makes the MIN_VALUE case fall out as
+            // "strip all of it", which is what HotSpot answers.
+            let remove = n.unsigned_abs() as usize;
+            let non_ws = line
+                .chars()
+                .position(|c| !char_is_java_whitespace(c))
+                .unwrap_or_else(|| line.chars().count());
+            let skip_chars = remove.min(non_ws);
+            // Convert a CHARACTER count back to a byte offset through
+            // `char_indices`, which can only ever land on a boundary.
+            let byte_off = line
+                .char_indices()
+                .nth(skip_chars)
+                .map_or(line.len(), |(i, _)| i);
+            result.push_str(&line[byte_off..]);
         } else {
             result.push_str(line);
         }
@@ -7894,10 +8090,240 @@ pub(crate) fn format_arg(
 }
 
 // ---------------------------------------------------------------------------
+// Java's character tables, for the `String` methods that are specified in
+// terms of them.
+//
+// W7-95a. Every one of the three predicates below exists because the Rust
+// standard-library method with the plausibly-matching name implements the
+// UNICODE definition and Java's is deliberately different. Reaching for
+// `char::is_whitespace` / `char::to_uppercase` here is the single root cause
+// behind `String.isBlank` and `String.regionMatches(true, ...)` disagreeing
+// with HotSpot, and it is the same reflex W7-95 measured across the whole
+// `java/lang/Character` family.
+// ---------------------------------------------------------------------------
+
+/// `Character.isWhitespace` for one UTF-16 code unit — the JAVADOC rule, not
+/// `char::is_whitespace`.
+///
+/// * Rust's `char::is_whitespace` is the Unicode **White_Space** property:
+///   `Zs ∪ Zl ∪ Zp ∪ {U+0009..U+000D, U+0085}`.
+/// * Java's `isWhitespace` is "a Unicode space character (`Zs`/`Zl`/`Zp`) that
+///   is **not** a non-breaking space (`U+00A0`, `U+2007`, `U+202F`), **or** one
+///   of `U+0009..U+000D`, `U+001C..U+001F`".
+///
+/// Eight code points disagree. Measured on Microsoft OpenJDK 25.0.3+9 —
+/// written by NAME here, never as the character itself, because a doc comment
+/// holding a literal U+00A0 is one re-encode away from holding a space:
+/// `isBlank()` of a lone `U+00A0` NBSP, `U+0085` NEL, `U+2007` FIGURE SPACE
+/// or `U+202F` NARROW NBSP is `false` there and was `true` here; of
+/// `U+001C`..`U+001F` (file/group/record/unit separator) it is `true` there
+/// and was `false` here.
+///
+/// A surrogate code unit is `Cs`, never whitespace, and no arm below admits
+/// one — which is what HotSpot answers.
+///
+/// **This is an ENUMERATION, deliberately, and not the derivation it replaced.**
+/// The first version computed `Zs | Zl | Zp` as
+/// `char::is_whitespace(cp) && !matches!(cp, 0x09..=0x0D | 0x85)` and subtracted
+/// the three non-breaking spaces. That was correct — verified over all
+/// 1,114,112 code points against `Character.isWhitespace` on OpenJDK 25.0.3+9,
+/// zero mismatches, and agreeing with the enumeration below at every one of
+/// them — but it was correct *by consulting a Rust Unicode table at runtime*,
+/// and that is the dependency this file has already been bitten by once: see
+/// [`JDK_UNMAPPED_CASE_CODE_POINTS`], where Rust's tables being NEWER than the
+/// JDK's produced a wrong answer that no amount of care about the Java side
+/// could have caught. Whitespace is a small, stable, enumerable set, so the
+/// version-skew hazard is removed rather than managed.
+///
+/// The enumeration itself was swept exhaustively: `WsSweep`, all 1,114,112
+/// code points, `proposed mismatches=0`.
+///
+/// **Twin.** `native_character_is_whitespace` in
+/// `native-builtins/src/lang_math.rs` is the same rule for the
+/// `java/lang/Character` triples (W7-98a). That lane independently replaced its
+/// derivation with this same enumeration; the two now agree character for
+/// character AND line for line, which is the point — two enumerations of the
+/// same constants cannot silently drift the way two derivations over a moving
+/// table can. They should still be hoisted onto one predicate; see N5.
+fn java_char_is_whitespace(ch: u16) -> bool {
+    matches!(u32::from(ch),
+        0x0009..=0x000D      // TAB, LF, VT, FF, CR
+        | 0x001C..=0x0020    // FILE/GROUP/RECORD/UNIT SEPARATOR, SPACE
+        | 0x1680             // OGHAM SPACE MARK
+        | 0x2000..=0x2006    // EN QUAD .. SIX-PER-EM SPACE  (2007 FIGURE SPACE excluded)
+        | 0x2008..=0x200A    // PUNCTUATION SPACE .. HAIR SPACE
+        | 0x2028..=0x2029    // LINE SEPARATOR, PARAGRAPH SEPARATOR
+        | 0x205F             // MEDIUM MATHEMATICAL SPACE
+        | 0x3000             // IDEOGRAPHIC SPACE
+    )
+    // Absent on purpose, each measured `false` on HotSpot: 0x00A0 NBSP,
+    // 0x2007 FIGURE SPACE, 0x202F NARROW NBSP (non-breaking spaces are
+    // excluded by the javadoc), and 0x0085 NEL.
+}
+
+/// Code points whose case mapping **Rust has and the JDK does not**.
+///
+/// Not a Unicode subtlety — a VERSION SKEW, and the reason this file no longer
+/// derives any table from Rust's `char` methods where the JDK's answer can be
+/// enumerated instead.
+///
+/// Measured on Microsoft OpenJDK 25.0.3+9, which is on Unicode 16:
+///
+/// ```text
+///          Character.toUpperCase  toLowerCase  isDefined  getType
+/// U+A7CE   U+A7CE                 U+A7CE       false      0 (UNASSIGNED)
+/// U+A7CF   U+A7CF                 U+A7CF       false      0
+/// U+A7D2   U+A7D2                 U+A7D2       false      0
+/// U+A7D3   U+A7D3                 U+A7D3       true       2 (LOWERCASE_LETTER)
+/// U+A7D4   U+A7D4                 U+A7D4       false      0
+/// U+A7D5   U+A7D5                 U+A7D5       true       2 (LOWERCASE_LETTER)
+/// ```
+///
+/// All six map to THEMSELVES, for `Character.toUpperCase`/`toLowerCase`, for
+/// `String.toUpperCase`/`toLowerCase`, and for `String.regionMatches(true,…)`
+/// / `equalsIgnoreCase` — all four measured. Rust's tables are newer and pair
+/// them (`A7CF`/`A7CE`, `A7D3`/`A7D2`, `A7D5`/`A7D4`), so every one of those
+/// answers came back wrong.
+///
+/// Note the two shapes, because they need the same fix for different reasons:
+/// four of the six are UNASSIGNED in the JDK's Unicode version, while `A7D3`
+/// and `A7D5` are assigned lowercase letters that simply have no uppercase
+/// partner yet — a newer Unicode added the capitals. **The VM must answer what
+/// the JDK answers, not what Unicode currently says**, and this list will need
+/// revisiting whenever *either* side moves. That is the recurring hazard, and
+/// it is why the whitespace predicate above was converted to an enumeration.
+///
+/// How this was missed the first time, since the method looked exhaustive: the
+/// original exception table was derived by dumping all 65,536 BMP code units
+/// from the JDK and diffing them against **Python's** `str.upper()`/`lower()`
+/// as a stand-in for Rust's. Python here is on UCD 16.0.0 and agrees with the
+/// JDK at all six, so the diff was empty and reported success. The Java side of
+/// that measurement was real; the Rust side was a proxy that was never
+/// validated as one. `[setup lies]` — a probe's setup is code that can be
+/// wrong, and an exhaustive sweep against the wrong oracle is still exhaustive.
+const JDK_UNMAPPED_CASE_CODE_POINTS: [u16; 6] = [0xA7CE, 0xA7CF, 0xA7D2, 0xA7D3, 0xA7D4, 0xA7D5];
+
+/// Whether a code unit is one of [`JDK_UNMAPPED_CASE_CODE_POINTS`].
+///
+/// A contiguous range test would be wrong: `U+A7D0`/`U+A7D1` and
+/// `U+A7D6`/`U+A7D7` sit inside the same span and ARE case pairs in the JDK
+/// (measured: `toUpperCase(U+A7D1) == U+A7D0`), so the six must be listed, not
+/// bracketed.
+#[inline]
+fn is_jdk_unmapped_case_code_point(cp: u32) -> bool {
+    cp <= 0xFFFF && JDK_UNMAPPED_CASE_CODE_POINTS.contains(&(cp as u16))
+}
+
+/// [`java_char_is_whitespace`] for a Rust `char` rather than a code unit.
+///
+/// For callers that already hold a `&str` (`indent`). A supplementary code
+/// point is never whitespace in Java, so the `> 0xFFFF` arm is `false` rather
+/// than a truncation.
+fn char_is_java_whitespace(c: char) -> bool {
+    let cp = u32::from(c);
+    cp <= 0xFFFF && java_char_is_whitespace(cp as u16)
+}
+
+/// `Character.toUpperCase(char)` — Java's **1:1** mapping, not the full one.
+///
+/// `char::to_uppercase()` yields the FULL (SpecialCasing) mapping, which can
+/// be several characters: `ß` → `"SS"`, `ﬀ` → `"FF"`. Java's `char`-taking
+/// overload is UnicodeData's *simple* mapping and returns the input unchanged
+/// whenever the full mapping does not fit in one `char`. Taking `.next()` off
+/// the iterator — the shape W7-95 measured in `native_character_to_upper_case`
+/// — turns `ß` into `S`.
+///
+/// The exception arms are the complete set for the BMP, derived rather than
+/// sampled: `Character.toUpperCase((char) c)` was dumped for all 65 536 code
+/// units on OpenJDK 25.0.3+9 and diffed against "full mapping, multi-char
+/// falls back to identity". Exactly 27 code units differ, all of them Greek
+/// vowels with ypogegrammeni whose simple uppercase is the TITLECASE
+/// character (`U+1F80` → `U+1F88`) while the full mapping is a two-character
+/// expansion. Everywhere else the two rules agree, which is why this is a
+/// small `match` and not a ported table.
+///
+/// A surrogate code unit has no scalar value; Java maps every unmapped char to
+/// *itself*, so this returns the input rather than `char::from_u32`'s `None`.
+fn java_char_to_upper_case(ch: u16) -> u16 {
+    // Rust's tables are newer than the JDK's and pair these; the JDK maps each
+    // to itself. See `JDK_UNMAPPED_CASE_CODE_POINTS`.
+    if is_jdk_unmapped_case_code_point(u32::from(ch)) {
+        return ch;
+    }
+    match ch {
+        0x1F80..=0x1F87 | 0x1F90..=0x1F97 | 0x1FA0..=0x1FA7 => return ch + 8,
+        0x1FB3 => return 0x1FBC,
+        0x1FC3 => return 0x1FCC,
+        0x1FF3 => return 0x1FFC,
+        _ => {}
+    }
+    let Some(c) = char::from_u32(u32::from(ch)) else {
+        return ch;
+    };
+    let mut it = c.to_uppercase();
+    match (it.next(), it.next()) {
+        (Some(u), None) if u32::from(u) <= 0xFFFF => u as u16,
+        _ => ch,
+    }
+}
+
+/// `Character.toLowerCase(char)` — Java's **1:1** mapping. See
+/// [`java_char_to_upper_case`] for the derivation; the same BMP-wide dump
+/// finds exactly ONE code unit where the full lowercase mapping differs from
+/// Java's simple one: `U+0130` LATIN CAPITAL LETTER I WITH DOT ABOVE, whose
+/// SpecialCasing full mapping is the two characters `i` + `U+0307` and whose
+/// simple mapping is plain `i`. That one code point is the difference between
+/// `"İ".regionMatches(true, 0, "i", 0, 1)` answering `true` (HotSpot) and
+/// `false`.
+fn java_char_to_lower_case(ch: u16) -> u16 {
+    // See the twin above and `JDK_UNMAPPED_CASE_CODE_POINTS`.
+    if is_jdk_unmapped_case_code_point(u32::from(ch)) {
+        return ch;
+    }
+    if ch == 0x0130 {
+        return 0x0069;
+    }
+    let Some(c) = char::from_u32(u32::from(ch)) else {
+        return ch;
+    };
+    let mut it = c.to_lowercase();
+    match (it.next(), it.next()) {
+        (Some(l), None) if u32::from(l) <= 0xFFFF => l as u16,
+        _ => ch,
+    }
+}
+
+// ---------------------------------------------------------------------------
 // String modern methods (Java 11+)
 // ---------------------------------------------------------------------------
 
-/// repeat(int) — "ab".repeat(3) → "ababab"
+/// `String.repeat(int)` — "ab".repeat(3) → "ababab".
+///
+/// W7-95a. The old body was `std::cmp::max(0, n) as usize`, which turned every
+/// contract violation into a silent empty string, and then handed the count
+/// straight to `str::repeat`, which has no upper bound at all.
+///
+/// Measured on OpenJDK 25.0.3+9, in the JDK's own check order:
+///
+/// ```text
+/// "ab".repeat(-1)                  IllegalArgumentException: count is negative: -1
+/// "ab".repeat(Integer.MIN_VALUE)   IllegalArgumentException: count is negative: -2147483648
+/// "".repeat(-1)                    IllegalArgumentException          (count is checked FIRST,
+///                                                                    before the empty-string
+///                                                                    short circuit)
+/// "ab".repeat(0)                   ""
+/// "ab".repeat(Integer.MAX_VALUE)   OutOfMemoryError: Required length exceeds implementation limit
+/// "abc".repeat(1000000000)         OutOfMemoryError: Required length exceeds implementation limit
+/// ```
+///
+/// The overflow guard is the JDK's `Integer.MAX_VALUE / count < len`, and
+/// `len` there is the length of the compact `value` **byte** array — one byte
+/// per char for a LATIN-1 string, two for a UTF-16 one — which is why the
+/// coder is reconstructed below instead of using the char count. Without it
+/// `str::repeat` attempts a multi-gigabyte allocation and aborts the process:
+/// a capacity overflow is a Rust panic, and a Rust panic is not a Java
+/// throwable. `try_reserve_exact` covers the residual case where the
+/// Java-legal length is still more memory than this process can get.
 pub(crate) fn native_string_repeat(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -7907,16 +8333,79 @@ pub(crate) fn native_string_repeat(
         _ => return Ok(Some(Value::Object(None))),
     };
     let count = match args.get(1) {
-        Some(Value::Int(n)) => std::cmp::max(0, *n) as usize,
+        Some(Value::Int(n)) => *n,
         _ => 0,
     };
-    let s = ctx.read_string(this).unwrap_or_default();
-    let result = s.repeat(count);
+    if count < 0 {
+        return Err(
+            cratonvm_types::error::RuntimeError::IllegalArgumentException {
+                message: format!("count is negative: {count}"),
+            }
+            .into(),
+        );
+    }
+    let units = read_string_chars(ctx, this);
+    if units.is_empty() || count == 0 {
+        return Ok(Some(Value::Object(Some(ctx.create_string_uninterned("")))));
+    }
+    if count == 1 {
+        // `return this` — `String.repeat(1)` is specified to hand back the
+        // receiver, and a String is immutable, so sharing it is correct.
+        return Ok(Some(Value::Object(Some(this))));
+    }
+    // The JDK's guard, on the same quantity the JDK measures: `value.length`,
+    // which is 2 bytes per char once any char needs the UTF-16 coder.
+    let value_len = if units.iter().all(|&u| u <= 0xFF) {
+        units.len() as i64
+    } else {
+        units.len() as i64 * 2
+    };
+    if i64::from(i32::MAX) / i64::from(count) < value_len {
+        return Err(oome_repeat_limit().into());
+    }
+    // Lossy exactly where the old body was: `create_string` takes a `&str`, so
+    // a `String` whose content includes an unpaired surrogate cannot be
+    // rebuilt losslessly by any native. The unit COUNT is preserved (U+FFFD is
+    // one UTF-16 unit, as is a lone surrogate), so the length and the bounds
+    // above are right either way. See this record's NOMINATIONS: the fix is a
+    // `create_string_from_utf16` on `NativeContext`, next to the VM's existing
+    // lossless reader `read_java_string_units`.
+    let text = String::from_utf16_lossy(&units);
+    let Some(utf8_len) = text.len().checked_mul(count as usize) else {
+        return Err(oome_repeat_limit().into());
+    };
+    let mut result = String::new();
+    if result.try_reserve_exact(utf8_len).is_err() {
+        return Err(oome_repeat_limit().into());
+    }
+    for _ in 0..count {
+        result.push_str(&text);
+    }
     let str_obj = ctx.create_string_uninterned(&result);
     Ok(Some(Value::Object(Some(str_obj))))
 }
 
-/// isBlank() — true if empty or all whitespace
+/// HotSpot's exact `String.repeat` overflow wording, in one place so the three
+/// bail-outs above cannot drift apart.
+fn oome_repeat_limit() -> cratonvm_types::error::RuntimeError {
+    cratonvm_types::error::RuntimeError::OutOfMemoryError {
+        message: "Required length exceeds implementation limit".to_string(),
+    }
+}
+
+/// `String.isBlank()` — empty, or every code point is `Character.isWhitespace`.
+///
+/// W7-95a. The old body was `s.trim().is_empty()`, and `str::trim` is Unicode
+/// **White_Space**, which is not Java's table — see [`java_char_is_whitespace`]
+/// for the eight code points that disagree and the measurement. A lone
+/// `U+00A0` answered `true` here and `false` on HotSpot; `U+001C`..`U+001F`
+/// answered `false` here and `true` on HotSpot.
+///
+/// Tested per code UNIT rather than per code point, which is equivalent: no
+/// supplementary code point is whitespace and neither is a surrogate, so a
+/// pair and each of its halves all answer `false`. Reading the units directly
+/// also keeps the `str` round trip (and its U+FFFD substitution) out of a
+/// method whose answer depends on the exact code points present.
 pub(crate) fn native_string_is_blank(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -7925,8 +8414,10 @@ pub(crate) fn native_string_is_blank(
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Int(1))),
     };
-    let s = ctx.read_string(this).unwrap_or_default();
-    Ok(Some(Value::Int(if s.trim().is_empty() { 1 } else { 0 })))
+    let blank = with_string_chars_scratch(ctx, this, |units| {
+        units.iter().all(|&u| java_char_is_whitespace(u))
+    });
+    Ok(Some(Value::Int(if blank { 1 } else { 0 })))
 }
 
 /// chars() — returns IntStream of char values
@@ -7960,9 +8451,65 @@ pub(crate) fn native_string_chars(ctx: &mut dyn NativeContext, args: &[Value]) -
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
-    let s = ctx.read_string(this).unwrap_or_default();
-    let char_values: Vec<Value> = s.encode_utf16().map(|c| Value::Int(c as i32)).collect();
+    // `read_string_chars`, not `ctx.read_string(..).encode_utf16()`: `chars()`
+    // is the code-UNIT view and must reproduce an unpaired surrogate exactly.
+    // Through a Rust `String` one becomes U+FFFD -- `"x\uD800y".chars()` gave
+    // `[120, 65533, 121]` against HotSpot 25.0.3+9's `[120, 55296, 121]`
+    // (W7-95a). Same root cause as `codePointAt`; same one-line fix.
+    let char_values: Vec<i32> = read_string_chars(ctx, this)
+        .into_iter()
+        .map(i32::from)
+        .collect();
+    int_stream_of(ctx, &char_values)
+}
 
+/// `String.codePoints()` — an `IntStream` of **code points**, which is not
+/// `chars()`.
+///
+/// W7-95a. `codePoints` was registered onto `native_string_chars` with the
+/// comment "Same as chars for BMP" at two registration sites. It is not the
+/// same for any string that contains a surrogate pair: measured on OpenJDK
+/// 25.0.3+9, `"a<U+1F600>b".codePoints()` is `[97, 128512, 98]` and this VM
+/// answered `[97, 55357, 56832, 98]` — four elements where Java has three, so
+/// every `codePoints().count()` over emoji was wrong, not just the values.
+///
+/// A surrogate that is *not* part of a pair is its own code point and passes
+/// through unchanged (`"x\uD800y"` → `[120, 55296, 121]`), which is exactly
+/// why this cannot be written over a Rust `str`.
+pub(crate) fn native_string_code_points(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let units = read_string_chars(ctx, this);
+    let mut code_points: Vec<i32> = Vec::with_capacity(units.len());
+    let mut i = 0;
+    while i < units.len() {
+        let ch = units[i];
+        if (0xD800..=0xDBFF).contains(&ch) && i + 1 < units.len() {
+            let low = units[i + 1];
+            if (0xDC00..=0xDFFF).contains(&low) {
+                code_points
+                    .push(0x10000 + ((i32::from(ch) - 0xD800) << 10) + (i32::from(low) - 0xDC00));
+                i += 2;
+                continue;
+            }
+        }
+        code_points.push(i32::from(ch));
+        i += 1;
+    }
+    int_stream_of(ctx, &code_points)
+}
+
+/// Build the synthetic `IntStream` both `chars()` and `codePoints()` return.
+///
+/// Extracted so the two cannot drift: the layout notes below were paid for
+/// twice already (a 1-field allocation and a reference-array allocation), and
+/// a second copy of them is a second place to get them wrong.
+fn int_stream_of(ctx: &mut dyn NativeContext, char_values: &[i32]) -> MethodCallResult {
     // 2-field synthetic stream layout: field 0 = elements array, field 1 =
     // close handlers (None -- chars()/codePoints() never register any).
     // Must be 2 fields (not 1) to match STREAM_NUM_FIELDS in
@@ -7982,7 +8529,7 @@ pub(crate) fn native_string_chars(ctx: &mut dyn NativeContext, args: &[Value]) -
     // stream (confirmed via a standalone `chars().toArray()` repro).
     let arr = ctx.new_array(cratonvm_types::ArrayElementType::Int, char_values.len());
     for (i, val) in char_values.iter().enumerate() {
-        ctx.set_array_element(arr, i, *val);
+        ctx.set_array_element(arr, i, Value::Int(*val));
     }
     ctx.set_field(stream, 0, Value::Object(Some(arr)));
     ctx.set_field(stream, 1, Value::Object(None));
@@ -8007,7 +8554,7 @@ pub(crate) fn native_string_region_matches_ic(
         _ => 0,
     };
     let other = match args.get(3) {
-        Some(Value::Object(Some(obj))) => ctx.read_string(*obj).unwrap_or_default(),
+        Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Int(0))),
     };
     let ooffset_i = match args.get(4) {
@@ -8018,30 +8565,69 @@ pub(crate) fn native_string_region_matches_ic(
         Some(Value::Int(v)) => *v,
         _ => 0,
     };
-    if toffset_i < 0 || ooffset_i < 0 || len_i < 0 {
-        return Ok(Some(Value::Int(0)));
-    }
-    let toffset = toffset_i as usize;
-    let ooffset = ooffset_i as usize;
-    let len = len_i as usize;
+    region_matches_impl(ctx, this, toffset_i, other, ooffset_i, len_i, ignore_case)
+}
 
-    let s = ctx.read_string(this).unwrap_or_default();
-    // bug nb-lang-string: regionMatches offsets/len are in UTF-16 code UNITS,
-    // not Unicode code points. Index over u16 to agree with charAt/length.
-    let s_units: Vec<u16> = s.encode_utf16().collect();
-    let o_units: Vec<u16> = other.encode_utf16().collect();
+/// `String.regionMatches`, both overloads.
+///
+/// W7-95a. Two defects, one shared body now.
+///
+/// **A negative `len` answers `true`, and did not.** The JDK's bounds test is
+///
+/// ```text
+/// if ((ooffset < 0) || (toffset < 0)
+///         || (toffset > (long) length() - len)
+///         || (ooffset > (long) other.length() - len)) return false;
+/// ```
+///
+/// with its own comment "toffset, ooffset, or len might be near `-1>>>1`",
+/// which is why it widens to `long` rather than adding. When `len` is
+/// negative, `length() - len` is *larger* than the length, the test passes,
+/// and the comparison loop `while (len-- > 0)` runs zero times — so the answer
+/// is `true`. Measured on OpenJDK 25.0.3+9: `"ABC".regionMatches(0, "abc", 0,
+/// -1)` and the same call with `Integer.MIN_VALUE` are both `true`; this VM
+/// answered `false` from an `if len_i < 0 { return false }` guard that has no
+/// counterpart in the JDK. Callers that pass a computed length depend on it.
+///
+/// **Both sides are read losslessly.** `ctx.read_string` goes through a Rust
+/// `String`, where every unpaired surrogate becomes U+FFFD — so two *different*
+/// lone surrogates compared equal. `read_string_chars` reads the `value`
+/// arrays as UTF-16 code units, which is also the unit `toffset`/`ooffset`/`len`
+/// are specified in.
+#[allow(clippy::too_many_arguments)]
+fn region_matches_impl(
+    ctx: &mut dyn NativeContext,
+    this: cratonvm_types::ObjectRef,
+    toffset_i: i32,
+    other: cratonvm_types::ObjectRef,
+    ooffset_i: i32,
+    len_i: i32,
+    ignore_case: bool,
+) -> MethodCallResult {
+    // regionMatches offsets/len are in UTF-16 code UNITS, not Unicode code
+    // points. Index over u16 to agree with charAt/length.
+    let s_units = read_string_chars(ctx, this);
+    let o_units = read_string_chars(ctx, other);
 
-    if toffset
-        .checked_add(len)
-        .map_or(true, |end| end > s_units.len())
-        || ooffset
-            .checked_add(len)
-            .map_or(true, |end| end > o_units.len())
+    // The JDK's test, in `i64` for the same reason the JDK uses `long`.
+    let toffset = i64::from(toffset_i);
+    let ooffset = i64::from(ooffset_i);
+    let len = i64::from(len_i);
+    if ooffset < 0
+        || toffset < 0
+        || toffset > s_units.len() as i64 - len
+        || ooffset > o_units.len() as i64 - len
     {
         return Ok(Some(Value::Int(0)));
     }
+    if len <= 0 {
+        // `while (len-- > 0)` compared nothing. Not an error, not `false`.
+        return Ok(Some(Value::Int(1)));
+    }
 
-    for i in 0..len {
+    let toffset = toffset as usize;
+    let ooffset = ooffset as usize;
+    for i in 0..len as usize {
         let su = s_units[toffset + i];
         let ou = o_units[ooffset + i];
         let eq = if ignore_case {
@@ -8056,20 +8642,41 @@ pub(crate) fn native_string_region_matches_ic(
     Ok(Some(Value::Int(1)))
 }
 
-/// Case-insensitive comparison of two UTF-16 code units, mirroring
-/// `String.regionMatches(true, ...)`: equal directly, or after folding both to
-/// upper-case, or (per the JDK) to lower-case. Surrogate code units (which are
-/// not assignable to a `char` scalar) only compare equal when bit-identical.
+/// Case-insensitive comparison of two UTF-16 code units, transcribing
+/// `StringUTF16.regionMatchesCI`:
+///
+/// ```text
+/// if (c1 == c2) continue;
+/// char u1 = Character.toUpperCase(c1);
+/// char u2 = Character.toUpperCase(c2);
+/// if (u1 == u2) continue;
+/// if (Character.toLowerCase(u1) == Character.toLowerCase(u2)) continue;
+/// return false;
+/// ```
+///
+/// Note that the JDK lower-cases the **upper-cased** forms, not the originals;
+/// that composition is what makes `U+212A` KELVIN SIGN match `k`.
+///
+/// W7-95a. The old body called `char::to_uppercase()`/`to_lowercase()`, the
+/// FULL Unicode mappings, and compared the resulting iterators.
+/// `"İ".regionMatches(true, 0, "i", 0, 1)` is `true` on OpenJDK 25.0.3+9 and
+/// was `false` here: Java's 1:1 `Character.toLowerCase(U+0130)` is plain `i`,
+/// while the full SpecialCasing mapping is two characters. See
+/// [`java_char_to_upper_case`] for the BMP-wide derivation of the difference.
+///
+/// A surrogate code unit has no case mapping and both helpers return it
+/// unchanged, so surrogates compare equal only when bit-identical — which is
+/// what HotSpot answers.
 fn code_unit_eq_ignore_case(a: u16, b: u16) -> bool {
     if a == b {
         return true;
     }
-    match (char::from_u32(a as u32), char::from_u32(b as u32)) {
-        (Some(ca), Some(cb)) => {
-            ca.to_uppercase().eq(cb.to_uppercase()) || ca.to_lowercase().eq(cb.to_lowercase())
-        }
-        _ => false,
+    let ua = java_char_to_upper_case(a);
+    let ub = java_char_to_upper_case(b);
+    if ua == ub {
+        return true;
     }
+    java_char_to_lower_case(ua) == java_char_to_lower_case(ub)
 }
 
 /// regionMatches(int toffset, String other, int ooffset, int len) — case-sensitive
@@ -8086,7 +8693,7 @@ pub(crate) fn native_string_region_matches(
         _ => 0,
     };
     let other = match args.get(2) {
-        Some(Value::Object(Some(obj))) => ctx.read_string(*obj).unwrap_or_default(),
+        Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Int(0))),
     };
     let ooffset_i = match args.get(3) {
@@ -8097,35 +8704,7 @@ pub(crate) fn native_string_region_matches(
         Some(Value::Int(v)) => *v,
         _ => 0,
     };
-    if toffset_i < 0 || ooffset_i < 0 || len_i < 0 {
-        return Ok(Some(Value::Int(0)));
-    }
-    let toffset = toffset_i as usize;
-    let ooffset = ooffset_i as usize;
-    let len = len_i as usize;
-
-    let s = ctx.read_string(this).unwrap_or_default();
-    // bug nb-lang-string: regionMatches offsets/len are in UTF-16 code UNITS,
-    // not Unicode code points. Index over u16 to agree with charAt/length.
-    let s_units: Vec<u16> = s.encode_utf16().collect();
-    let o_units: Vec<u16> = other.encode_utf16().collect();
-
-    if toffset
-        .checked_add(len)
-        .map_or(true, |end| end > s_units.len())
-        || ooffset
-            .checked_add(len)
-            .map_or(true, |end| end > o_units.len())
-    {
-        return Ok(Some(Value::Int(0)));
-    }
-
-    for i in 0..len {
-        if s_units[toffset + i] != o_units[ooffset + i] {
-            return Ok(Some(Value::Int(0)));
-        }
-    }
-    Ok(Some(Value::Int(1)))
+    region_matches_impl(ctx, this, toffset_i, other, ooffset_i, len_i, false)
 }
 
 /// formatted(Object[]) — instance method: this.formatted(args) → String.format(this, args)

@@ -604,11 +604,43 @@ pub(crate) fn aastore_element_assignable(
     }
     let component = &array_desc[1..];
 
-    // Object[] (and Serializable[]/Cloneable[]) accept any reference element.
-    if component == "Ljava/lang/Object;"
-        || component == "Ljava/io/Serializable;"
-        || component == "Ljava/lang/Cloneable;"
-    {
+    // `Object[]` accepts any reference element. This one is a RULE, not a
+    // heuristic: every reference value is a `java.lang.Object`, so no component
+    // information and no hierarchy walk can ever make the store illegal.
+    //
+    // `Serializable[]` and `Cloneable[]` used to be admitted by this same arm,
+    // on the theory that they too "accept any reference". They do not. They are
+    // ordinary marker interfaces and `aastore` checks them like any other —
+    // MEASURED on HotSpot 25.0.3 under `-Xint` (`scratchpad/c16/Arm3.java`):
+    //
+    //   Serializable[] <- Object      ArrayStoreException: java.lang.Object
+    //   Serializable[] <- Integer     OK          (Integer -> Number -> Serializable)
+    //   Serializable[] <- String      OK
+    //   Serializable[] <- int[]       OK          (every ARRAY is Serializable)
+    //   Serializable[] <- lambda      ArrayStoreException
+    //   Cloneable[]    <- Object      ArrayStoreException: java.lang.Object
+    //   Cloneable[]    <- Integer     ArrayStoreException: java.lang.Integer
+    //   Cloneable[]    <- String      ArrayStoreException: java.lang.String
+    //   Cloneable[]    <- int[]       OK          (every ARRAY is Cloneable)
+    //   Cloneable[]    <- ArrayList   OK          (ArrayList implements it)
+    //
+    // The `Integer` pair is the tell: it is Serializable and is NOT Cloneable,
+    // which no blanket can express. The two array rows are the JVMS §4.10.1.2 /
+    // JLS §10.7 rule that is easy to miss — every array type implements BOTH,
+    // and getting that wrong turns ordinary array-of-array code into spurious
+    // exceptions. It stays right without an arm here: an array value falls into
+    // the block immediately below, and `array_is_assignable_to_impl` opens with
+    // exactly that rule (`target_name == "java/io/Serializable" ||
+    // "java/lang/Cloneable"` -> true).
+    //
+    // A plain object with one of these components is now answered by the same
+    // machinery as any other interface component — `is_subclass_of` walks the
+    // implemented-interface DAG, so `Serializable[] <- Integer` resolves through
+    // `Number`. The one population that has no real interface data is the
+    // FABRICATED class, and it is served precisely at the bottom of this
+    // function rather than by admitting three component types unconditionally.
+    // docs/known-issues/jdk-only/W8-C16-1-serializable-cloneable-are-not-object.md
+    if component == "Ljava/lang/Object;" {
         return true;
     }
 
@@ -640,10 +672,51 @@ pub(crate) fn aastore_element_assignable(
     }
     let comp_name = &component[1..component.len() - 1];
 
-    // Resolve the element's runtime class id; an unknown/synthetic class id
-    // (no loaded class entry) is treated as assignable (fail open).
+    // Resolve the element's runtime class id.
+    //
+    // `ClassId(0)` is NOT "unknown". It is `java/lang/Object`: it is the first
+    // class this VM loads (`ClassManager::bootstrap_core_classes` puts it first
+    // and `ClassStore::add` hands out dense ids from zero), and that identity is
+    // measured, not inferred — `vm/src/native/jni.rs`'s `jclass` encoding note
+    // records `FindClass("java/lang/Object")` returning `(nil)` from a C probe
+    // for exactly this reason.
+    //
+    // This arm used to `return true` on it unconditionally, described in-comment
+    // as "an unknown/synthetic class id (no loaded class entry)". That
+    // description was false, and the cost was the entire
+    // `<interface>[] <- new Object()` family: HotSpot 25.0.3 throws
+    // `ArrayStoreException: java.lang.Object` for `Comparable[] <- Object`, and
+    // this predicate answered `true` without ever looking at the component.
+    // Because it sits ABOVE the interface arm further down, it — not that arm —
+    // is what admitted `RArrayStoreTiers`' `s02`.
+    //
+    // The job the comment CLAIMED is done properly ~30 lines below by
+    // `cm.get_class(value_class_id).is_none()`, which asks the class store
+    // instead of pattern-matching an id.
+    //
+    // What genuinely still needs a hatch here is the OTHER face of `ClassId(0)`:
+    // the all-zero header the collector leaves over a reclaimed span reads as
+    // `java.lang.Object` too (the H2-CID0 family — see
+    // `vm/src/memory/reclaim_guard.rs`). `reclaimed_hole_at` is the precise
+    // successor for that exact ambiguity and it has no false positives — a live
+    // object is never inside a free block, never past the allocation frontier
+    // and never in the inactive semispace — so ask it rather than failing open
+    // on every genuine `new Object()`. It takes the heap locks, but only a value
+    // that is BOTH `ClassId(0)` AND bound for a non-`Object[]` component gets
+    // this far: an `Object[]` component returned above, and an ARRAY value
+    // (every primitive array header also carries `ClassId(0)`, having no
+    // component class) returned in the block above that. `Serializable[]` and
+    // `Cloneable[]` components used to return above as well and now reach here
+    // — that is the whole added cost of splitting that arm, and it is the same
+    // two heap locks on a component type that is rare in real bytecode.
     let value_class_id = shared.mem.heap.class_id_of(value_ref);
-    if value_class_id == ClassId::new(0) {
+    if value_class_id == ClassId::new(0)
+        && shared
+            .mem
+            .heap
+            .reclaimed_hole_at(value_ref.as_ptr() as usize)
+            .is_some()
+    {
         return true;
     }
     let array_component_class_id = shared.mem.heap.class_id_of(array_ref);
@@ -708,18 +781,56 @@ pub(crate) fn aastore_element_assignable(
             }
             current = class.superclass;
         }
-        // Component is an INTERFACE → fail open. Proving a value implements an
-        // interface is unreliable in this VM (dynamic proxies, annotation
-        // proxies, and synthetic classes implement interfaces at runtime / by
-        // name, invisibly to the static hierarchy). A genuine ArrayStoreException
-        // essentially always involves a concrete-class component (Number[],
-        // String[], …); for an interface[] we don't risk a spurious throw.
-        if cm.get_class(comp_id).map_or(false, |c| c.is_interface()) {
+        // Provably assignable iff the value's class is a subtype of the
+        // component class. `is_subclass_of` walks BOTH the superclass chain and
+        // the implemented-interface DAG, transitively through super-interfaces
+        // (`classloading/src/class.rs`, `is_subclass_of_inner`), so it answers an
+        // INTERFACE component unaided: `Comparable[] <- Integer` is `true` here
+        // because `Integer` IMPLEMENTS `Comparable`. That is a different
+        // relation from extending it, and it is the one a fix phrased as "is the
+        // value a subclass of the component" gets wrong.
+        if cm.is_subclass_of(value_class_id, comp_id) {
             return true;
         }
-        // Provably assignable iff value's class is a subclass/subtype of the
-        // component class (interfaces handled by `is_subclass_of`).
-        if cm.is_subclass_of(value_class_id, comp_id) {
+        // An INTERFACE component is NOT a reason to fail open.
+        //
+        // A blanket `if comp.is_interface() { return true }` used to sit here,
+        // ABOVE the `is_subclass_of` call, citing dynamic proxies, annotation
+        // proxies and synthetic classes — populations that acquire interfaces at
+        // runtime, invisibly to the static hierarchy. Every one of those is now
+        // served by a more precise successor BELOW this point (the synthetic-id
+        // range test, the `$Proxy`/`AnnotationProxy` name test,
+        // `class_chain_reaches_proxy_instance`, `synthetic_implements`), each
+        // added after the blanket and none of them reachable while it stood. It
+        // got the legal stores right for the same reason it got the illegal ones
+        // wrong: it never looked.
+        //
+        // Measured, HotSpot 25.0.3 vs. this VM under `--nojit` — i.e. this
+        // predicate, not the JIT (`regression-suite/src/RArrayStoreTiers.java`,
+        // 2026-08-12):
+        //   s03 `Runnable[]   <- String`  HotSpot ArrayStoreException, here no-throw
+        //   s02 `Comparable[] <- Object`  HotSpot ArrayStoreException, here no-throw
+        // s02 was admitted by the `ClassId(0)` arm further up, which fires first;
+        // removing this blanket alone would not have moved it. The legal
+        // neighbours that must keep passing are s08 `Comparable[] <- Integer` and
+        // s09 `Runnable[] <- lambda`. See
+        // docs/known-issues/jdk-only/W7-101-aastore-interface-component-blanket.md.
+        //
+        // The one thing the blanket did provide, restored precisely: an interface
+        // component is the relation the by-name superclass walk above cannot
+        // cover, because interfaces are not on the superclass chain. Under a
+        // split loader (`@CompileWithForkedClassLoader`) the value's `interfaces`
+        // vector can name the OTHER loader's copy of the component, and
+        // `is_subclass_of` compares ClassIds, so it refuses a legal store. Ask
+        // the loader-blind walk that already exists for exactly that shape in JIT
+        // `checkcast`/`instanceof`: it walks supers AND interfaces BY NAME.
+        //
+        // It subsumes the superclass walk above — read the two as one check with
+        // a hot, allocation-free fast path, not as independent defences. And it
+        // cannot rescue the two rows above: `java/lang/Object` reaches no
+        // `java/lang/Comparable` node under any name, and `java/lang/String`
+        // reaches no `java/lang/Runnable`.
+        if cm.is_assignable_to_name(value_class_id, comp_name) {
             return true;
         }
     }
@@ -744,6 +855,58 @@ pub(crate) fn aastore_element_assignable(
             if vn == "java/lang/annotation/AnnotationProxy"
                 || vn.ends_with("AnnotationProxy")
                 || vn.contains("$Proxy")
+            {
+                return true;
+            }
+            //   - a FABRICATED class against `Serializable[]` / `Cloneable[]`.
+            //
+            // This is the other half of splitting the `Object`/`Serializable`/
+            // `Cloneable` arm at the top of this function, and it is the half
+            // that keeps the contract: this predicate must never produce a
+            // FALSE `ArrayStoreException`.
+            //
+            // A `ClassOrigin::CompatibilityStub` is a stand-in minted because
+            // the real class bytes were not found — the whole JDK in
+            // synthetic-JDK mode, and any missing class in real-JDK mode. Its
+            // interface vector is whatever `class_manager.rs`'s `jdk_interfaces`
+            // table declares, which is a curated list and not the class file:
+            // it names `java/lang/Cloneable` for exactly TWO classes
+            // (`Hashtable`, `Properties`), while HotSpot has it on 81 classes
+            // in `java.base`'s `java.util`/`java.lang`/`java.io`/`java.text`
+            // packages alone (MEASURED, `scratchpad/c16/score.rs` over a table
+            // generated from the runtime image). Without this arm, storing a
+            // fabricated `ArrayList` into a `Cloneable[]` would start throwing
+            // where the real JVM stores it happily.
+            //
+            // Deliberately NOT a re-run of the interface blanket `W7-101`
+            // deleted. It is scoped three ways: to these two component types,
+            // to values whose class the VM admits it fabricated, and to the
+            // point AFTER `is_subclass_of` and `is_assignable_to_name` have
+            // both declined — so a stub that DOES declare the interface is
+            // answered by the hierarchy and never reaches here.
+            //
+            // `java/lang/Object` is excluded, and that exclusion is the point.
+            // A fabricated `Object` is not a case of missing information:
+            // `java.lang.Object` implements NO interfaces, which is the
+            // definition of the root type and not a fact about a class file. So
+            // the two rows that motivated this whole change —
+            // `Serializable[] <- new Object()` and `Cloneable[] <- new Object()`,
+            // both `ArrayStoreException` on HotSpot — are now refused in BOTH
+            // modes, not just where real class bytes exist. Without this line
+            // synthetic-JDK mode would keep admitting them, because in that mode
+            // `java/lang/Object` is itself a stub.
+            //
+            // What it costs: `Cloneable[] <- <fabricated Integer>` stays
+            // admitted in synthetic-JDK mode, where HotSpot throws. That is the
+            // fail-open direction this function is required to prefer, it is
+            // bounded by the stub population rather than applying to every
+            // value, and it shrinks every time `synthetic_implements`' marker
+            // lists below grow — a stub that IS on those lists never reaches
+            // here, and a stub that is not is a class this VM genuinely has no
+            // interface data for.
+            if (comp_name == "java/io/Serializable" || comp_name == "java/lang/Cloneable")
+                && vn != "java/lang/Object"
+                && cls.origin.is_compatibility_stub()
             {
                 return true;
             }
@@ -816,6 +979,85 @@ pub(crate) fn class_chain_reaches_proxy_instance(shared: &SharedVm, class_id: Cl
 // Helper: name-based type compatibility for synthetic classes
 // ---------------------------------------------------------------------------
 
+/// Does the INNERMOST SIMPLE name of `obj_name` contain `term` as a camel-case
+/// word?
+///
+/// This is the whole of `synthetic_implements`' collection-family heuristic, and
+/// it replaced `obj_name.contains(term)` over the FULL binary name. Two things
+/// were wrong with the full-name test, and both are the same mistake:
+///
+/// 1. **A container lends its name to every member.** `java/util/Collections$*`
+///    and `java/util/ImmutableCollections$*` all contain "Collection" through
+///    the enclosing class, so `ImmutableCollections$Map1` (a `Map`) answered
+///    `instanceof Collection` — the `W8-C4-2` defect — and so did
+///    `ImmutableCollections$Access`, `$HasStableDelegates` and `$StableMap`,
+///    which that fix did not reach. Naming the containers one at a time is what
+///    produced that record; the simple name closes the whole family at once.
+/// 2. **A cursor is not a collection.** `ArrayList$Itr`,
+///    `ArrayDeque$DeqSpliterator`, `SetN$SetNIterator` — every iterator and
+///    spliterator inherits its owner's name and was admitted as a `Collection`.
+///
+/// And "contains" is not "is": `AbstractQueuedSynchronizer` contains "Queue" but
+/// is not one; `TooManyListenersException` contains "List". Requiring the term
+/// to end the name or be followed by another capitalised word rules those out
+/// without losing `WorkQueue` or `ListResourceBundle`.
+///
+/// MEASURED, over all 3,462 classes of `java.base`'s
+/// `java.util`/`java.lang`/`java.io`/`java.math`/`java.text`/`java.time`/
+/// `java.net`/`java.security`/`java.nio` packages, name list and every oracle
+/// cell generated from the runtime image itself (`scratchpad/c16/GenJrt.java`
+/// walks `jrt:/`, `scratchpad/c16/score.rs` scores it under plain `rustc`), for
+/// the six targets this arm decides (`Collection`, `List`, `Set`, `Queue`,
+/// `Deque`, `Iterable` — 20,772 name×target cells):
+///
+/// ```text
+///                      OVER-ADMISSIONS   correct admissions
+///   full-name contains       410                282
+///   simple name + word        50                266
+/// ```
+///
+/// `scratchpad/c16/verify.rs` re-scores THIS function — extracted verbatim, not
+/// paraphrased — and asserts those two numbers, so the comment cannot drift from
+/// the code without the probe going red.
+///
+/// Only OVER-ADMISSIONS (this fallback says yes, HotSpot says no) are defects.
+/// It can only ADMIT — it runs after `is_subclass_of` has already declined — so
+/// a `false` is "no opinion", and summing both directions reports hundreds of
+/// bogus "wrong" rows and points at the wrong code. That correction is the one
+/// thing to carry forward if this heuristic is revisited.
+///
+/// The 16 correct admissions lost are inner classes whose OWNER's name carried
+/// the meaning (`ReverseOrderListView$Rand`, `CopyOnWriteArrayList$Reversed`,
+/// `ConcurrentSkipListMap$Values`, …). None of them is a name the synthetic-JDK
+/// fabrication tables in `classloading/src/class_manager.rs` mention, so none is
+/// reachable through this fallback in practice — checked, not assumed.
+///
+/// docs/known-issues/jdk-only/W8-C16-2-synthetic-implements-simple-name.md
+fn simple_name_has_word(obj_name: &str, term: &str) -> bool {
+    let simple = match obj_name.rfind(['$', '/']) {
+        Some(i) => &obj_name[i + 1..],
+        None => obj_name,
+    };
+    // A cursor over a collection is never the collection.
+    if simple.ends_with("Iterator")
+        || simple.ends_with("Spliterator")
+        || simple.ends_with("Itr")
+        || simple.ends_with("Iter")
+    {
+        return false;
+    }
+    let (b, t) = (simple.as_bytes(), term.as_bytes());
+    if t.is_empty() || b.len() < t.len() {
+        return false;
+    }
+    (0..=b.len() - t.len()).any(|i| {
+        &b[i..i + t.len()] == t && {
+            let after = i + t.len();
+            after == b.len() || b[after].is_ascii_uppercase() || b[after].is_ascii_digit()
+        }
+    })
+}
+
 /// Synthetic classes (HashMap$Entry, etc.) may not have proper interface
 /// relationships in the ClassStore because they were created in Rust without
 /// loading a real .class file. This function provides a name-based fallback
@@ -883,6 +1125,155 @@ pub(super) fn synthetic_implements(shared: &SharedVm, obj_class_id: ClassId, tar
             || obj_name.contains("$EntryItr");
     }
 
+    // `java/io/Serializable` and `java/lang/Cloneable` — the two JLS §10.7
+    // marker interfaces.
+    //
+    // These arms exist because `aastore_element_assignable` stopped admitting
+    // `Serializable[]` / `Cloneable[]` unconditionally (HotSpot throws
+    // `ArrayStoreException` for `Serializable[] <- Object`, `Cloneable[] <-
+    // Object` and `Cloneable[] <- Integer`; measured, `scratchpad/c16/Arm3.java`).
+    // Once that arm is gone the answer comes from the class hierarchy, and for a
+    // FABRICATED class the hierarchy is `class_manager.rs`'s `jdk_interfaces`
+    // table — which names `java/lang/Cloneable` on exactly two classes. So the
+    // marker relationships have to be declarable by name like every other
+    // relationship in this function.
+    //
+    // Every name below is MEASURED on HotSpot 25.0.3, not recalled: the lists
+    // were checked row-by-row against a table generated from the runtime image
+    // (`scratchpad/c16/GenJrt.java` walks `jrt:/modules/java.base` and reads
+    // `Serializable.class.isAssignableFrom(c)` for each of 3,462 classes;
+    // `scratchpad/c16/score.rs` asserts every listed name is `true` there). That
+    // check threw out two entries that "everyone knows" are on these lists:
+    //
+    //   java/util/WeakHashMap — NOT Serializable, NOT Cloneable
+    //                           (`getInterfaces()` is `[java.util.Map]` alone)
+    //   java/util/AbstractMap — declares `clone()` but NOT `Cloneable`
+    //
+    // `WeakHashMap` is worth a second look: `jdk_interfaces` groups it with
+    // `HashMap` and hands it `java/io/Serializable`, so synthetic-JDK mode
+    // answers `instanceof Serializable` true where HotSpot answers false. That
+    // is a defect in a different crate, recorded as a nomination in
+    // docs/known-issues/jdk-only/W8-C16-1-serializable-cloneable-are-not-object.md.
+    //
+    // Placement: ABOVE the `java/util/Collections$` exclusion below, which
+    // returns `false` for every target, not just the collection ones — a
+    // `Collections$SingletonList` is genuinely `Serializable` and must not be
+    // denied by a guard written about the substring "Collection".
+    if target_class_name == "java/io/Serializable" || target_class_name == "java/lang/Cloneable" {
+        // JVMS §4.10.1.2 / JLS §10.7: EVERY array type implements both. Named
+        // here as well as in `array_is_assignable_to_impl` because this function
+        // is also reached from `checkcast`/`instanceof` on a raw array class
+        // name, which does not go through that path.
+        if obj_name.starts_with('[') {
+            return true;
+        }
+        if target_class_name == "java/lang/Cloneable" {
+            return matches!(
+                &*obj_name,
+                "java/util/ArrayList"
+                    | "java/util/LinkedList"
+                    | "java/util/Vector"
+                    | "java/util/Stack"
+                    | "java/util/HashMap"
+                    | "java/util/LinkedHashMap"
+                    | "java/util/TreeMap"
+                    | "java/util/IdentityHashMap"
+                    | "java/util/EnumMap"
+                    | "java/util/Hashtable"
+                    | "java/util/Properties"
+                    | "java/util/HashSet"
+                    | "java/util/LinkedHashSet"
+                    | "java/util/TreeSet"
+                    | "java/util/ArrayDeque"
+                    | "java/util/BitSet"
+                    | "java/util/Date"
+                    | "java/util/Calendar"
+                    | "java/util/GregorianCalendar"
+                    | "java/util/Locale"
+                    | "java/util/TimeZone"
+                    | "java/util/SimpleTimeZone"
+                    | "java/text/Format"
+                    | "java/text/DateFormat"
+                    | "java/text/SimpleDateFormat"
+                    | "java/text/NumberFormat"
+                    | "java/text/DecimalFormat"
+            );
+        }
+        return matches!(
+            &*obj_name,
+            "java/lang/String"
+                | "java/lang/Integer"
+                | "java/lang/Long"
+                | "java/lang/Short"
+                | "java/lang/Byte"
+                | "java/lang/Float"
+                | "java/lang/Double"
+                | "java/lang/Boolean"
+                | "java/lang/Character"
+                | "java/lang/Number"
+                | "java/lang/Enum"
+                | "java/lang/Throwable"
+                | "java/lang/Exception"
+                | "java/lang/RuntimeException"
+                | "java/lang/Error"
+                | "java/lang/StringBuilder"
+                | "java/lang/StringBuffer"
+                | "java/math/BigInteger"
+                | "java/math/BigDecimal"
+                | "java/io/File"
+                | "java/util/ArrayList"
+                | "java/util/LinkedList"
+                | "java/util/Vector"
+                | "java/util/Stack"
+                | "java/util/HashMap"
+                | "java/util/LinkedHashMap"
+                | "java/util/TreeMap"
+                | "java/util/IdentityHashMap"
+                | "java/util/EnumMap"
+                | "java/util/Hashtable"
+                | "java/util/Properties"
+                | "java/util/HashSet"
+                | "java/util/LinkedHashSet"
+                | "java/util/TreeSet"
+                | "java/util/ArrayDeque"
+                | "java/util/PriorityQueue"
+                | "java/util/BitSet"
+                | "java/util/Date"
+                | "java/util/Calendar"
+                | "java/util/GregorianCalendar"
+                | "java/util/Locale"
+                | "java/util/UUID"
+                | "java/util/Currency"
+                | "java/util/Random"
+                | "java/util/TimeZone"
+                | "java/util/SimpleTimeZone"
+                | "java/util/AbstractMap$SimpleEntry"
+                | "java/util/AbstractMap$SimpleImmutableEntry"
+                | "java/util/concurrent/ConcurrentHashMap"
+                | "java/util/concurrent/CopyOnWriteArrayList"
+                | "java/util/concurrent/ConcurrentLinkedQueue"
+                | "java/util/concurrent/ConcurrentSkipListMap"
+                | "java/util/concurrent/LinkedBlockingQueue"
+                | "java/util/concurrent/ArrayBlockingQueue"
+                | "java/util/concurrent/atomic/AtomicInteger"
+                | "java/util/concurrent/atomic/AtomicLong"
+                | "java/util/concurrent/atomic/AtomicBoolean"
+                | "java/util/concurrent/atomic/AtomicReference"
+                | "java/net/URI"
+                | "java/net/URL"
+                | "java/net/InetAddress"
+                | "java/net/InetSocketAddress"
+                | "java/text/SimpleDateFormat"
+                | "java/text/DecimalFormat"
+                | "java/time/Duration"
+                | "java/time/Instant"
+                | "java/time/LocalDate"
+                | "java/time/LocalDateTime"
+                | "java/time/LocalTime"
+                | "java/time/ZonedDateTime"
+        );
+    }
+
     // Iterable implementations (all Collection types)
     //
     // `java/util/Collections$*` (the utility class's nested helper/view
@@ -903,16 +1294,54 @@ pub(super) fn synthetic_implements(shared: &SharedVm, obj_class_id: ClassId, tar
     // already resolved precisely) or one of CratonVM's own `cratonvm/
     // internal/Unmodifiable*` stamps (which declare their own accurate
     // interfaces in `vm_init.rs`), so it never needs this heuristic.
-    if obj_name.starts_with("java/util/Collections$") {
+    //
+    // NOTE, 2026-08-13: the "substring probe" the paragraph above and the
+    // `ImmutableCollections$Map` paragraph below both describe is no longer a
+    // substring of the FULL name — it is `simple_name_has_word` over the
+    // innermost simple name, which closes `Collections$SingletonMap` and
+    // `ImmutableCollections$Map1` on its own. These two prefix exclusions are
+    // KEPT anyway, and what they now decide was measured rather than assumed:
+    // 94 cells, of which HotSpot says `true` for 92 (`Collections$CheckedList`,
+    // `$EmptySet`, `$AsLIFOQueue`, …). So they cost 92 correct admissions to
+    // prevent 2 over-admissions. Removing them is a pure recall change that
+    // wants its own vector — not a same-wave add-on to a change no lane could
+    // build. docs/known-issues/jdk-only/W8-C16-2-synthetic-implements-simple-name.md
+    if obj_name.starts_with("java/util/Collections$")
+        // `java.util.ImmutableCollections` is the CONTAINER class of the
+        // `Map.of()` / `List.of()` / `Set.of()` family, and its own name
+        // contains the substring "Collection" — the same trap the
+        // `Collections$` prefix above exists for, missed because the prefix
+        // differs by one word. Its Map members reached the
+        // `contains("Collection")` term below and were admitted as
+        // `instanceof Collection` / `Iterable`, which HotSpot 25 denies
+        // (measured: `Map.of("k","v") instanceof Collection` is false, and
+        // `(Collection) Map.of("k","v")` throws). CratonVM let the cast through
+        // and died four frames later at `ImmutableCollections$Map1.iterator()`.
+        //
+        // Deliberately narrower than excluding the whole `ImmutableCollections$`
+        // family: `List12`/`ListN`/`Set12`/`SetN` are green today in all three
+        // arms, they are admitted by this fallback's `List`/`Set` terms rather
+        // than by the accident, and moving a green cell is not something to do
+        // in a change the authoring lane cannot build.
+        //
+        // Scope, stated so it is not read as more than it is: this closes the
+        // `--jdk-only` (strict) face only. Under `--real-jdk` the VM stamps a
+        // `cratonvm/internal/UnmodifiableMap`, which the `java/util/` prefix
+        // below already excludes — that mode gets `Collection` right and
+        // `AbstractMap` wrong, by a different mechanism, and stays open.
+        // docs/known-issues/jdk-only/W8-C4-2-map-of-instanceof-collection.md
+        || obj_name.starts_with("java/util/ImmutableCollections$Map")
+        || obj_name == "java/util/ImmutableCollections$AbstractImmutableMap"
+    {
         return false;
     }
     if target_class_name == "java/lang/Iterable" {
         return obj_name.starts_with("java/util/")
-            && (obj_name.contains("List")
-                || obj_name.contains("Set")
-                || obj_name.contains("Queue")
-                || obj_name.contains("Deque")
-                || obj_name.contains("Collection"));
+            && (simple_name_has_word(&obj_name, "List")
+                || simple_name_has_word(&obj_name, "Set")
+                || simple_name_has_word(&obj_name, "Queue")
+                || simple_name_has_word(&obj_name, "Deque")
+                || simple_name_has_word(&obj_name, "Collection"));
     }
 
     // Collection / Set / List supertypes. These MUST stay distinct: a Set is
@@ -925,31 +1354,27 @@ pub(super) fn synthetic_implements(shared: &SharedVm, obj_class_id: ClassId, tar
     // NoSuchMethodError RegularEnumSet.get(I)). Match each interface only
     // against the class-name family that actually implements it.
     if obj_name.starts_with("java/util/") {
+        let has = |term: &str| simple_name_has_word(&obj_name, term);
         match target_class_name {
             "java/util/Collection" | "java/lang/Iterable" => {
-                if obj_name.contains("List")
-                    || obj_name.contains("Set")
-                    || obj_name.contains("Queue")
-                    || obj_name.contains("Deque")
-                    || obj_name.contains("Collection")
-                {
+                if has("List") || has("Set") || has("Queue") || has("Deque") || has("Collection") {
                     return true;
                 }
             }
             "java/util/List" => {
                 // Lists only (ArrayList, LinkedList, CopyOnWriteArrayList,
                 // Arrays$ArrayList, …). A Set/Queue is NOT a List.
-                if obj_name.contains("List") {
+                if has("List") {
                     return true;
                 }
             }
             "java/util/Set" => {
-                if obj_name.contains("Set") {
+                if has("Set") {
                     return true;
                 }
             }
             "java/util/Queue" | "java/util/Deque" => {
-                if obj_name.contains("Queue") || obj_name.contains("Deque") {
+                if has("Queue") || has("Deque") {
                     return true;
                 }
             }

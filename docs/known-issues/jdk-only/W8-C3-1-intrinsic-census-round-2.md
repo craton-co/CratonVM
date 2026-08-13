@@ -1,12 +1,22 @@
 # W8-C3-1 — the `Intrinsic` census round 2: closing the 40% that was never called
 
-**Status: OPEN — a vector, not a finding. `regression-suite/src/RJdkIntrinsics2.java`
+**Status: OPEN — a vector, plus one measured property of the run. `regression-suite/src/RJdkIntrinsics2.java`
 is 448 checks over 173 registered `Intrinsic` triples, green on HotSpot
-25.0.3+9 and never yet run against a CratonVM binary. It is not registered in
-`regression-suite/run.sh` — see NOMINATIONS.**
+25.0.3+9. It is not registered in `regression-suite/run.sh` — see NOMINATIONS.**
+
+> **RECONCILED 2026-08-12 (lane C18).** The sentence "never yet run against a
+> CratonVM binary" was true when this lane filed it and is **no longer true**:
+> the orchestrator has since run this second-generation census on a binary.
+> The one result that belongs in every record is **MEASURED: no family aborts
+> the VM. Every failure in this census is a Java `AssertionError`, not a Rust
+> panic.** Per-check counts are deliberately not reproduced here — this lane
+> did not run it and will not restate numbers it did not take. Everything
+> below still marked PREDICTED stays PREDICTED.
 
 W7-95 measured `NativeKind::Intrinsic` and found 39 divergent triples, six of
-them VM-fatal. Its own numbers say the sample was partial, and it said so:
+them VM-fatal **at that time — none of the six aborts the VM any more; see the
+banner above and `W7-95`'s own reconciliation banner**. Its own numbers say the
+sample was partial, and it said so:
 
 > **387 of the 645 registered `Intrinsic` triples were never invoked**, and the
 > untested set is *not* a random remainder.
@@ -123,6 +133,12 @@ list read backwards — least likely to abort the VM first.
   this probe simply did not call." Family `divmod` calls both, at
   `Long.MIN_VALUE / -1L`, after the family's non-overflowing rows have already
   reported.
+  **RESOLVED (C18, 2026-08-12): the prediction did not hold, and that is good
+  news. MEASURED — no family aborts the VM. `floorDiv`/`floorMod` at
+  `MIN_VALUE / -1` is fixed and verified on a real binary in both classes, and
+  every failure this census reports is a Java `AssertionError`.** The
+  ordering-so-a-panic-truncates-only-its-own-block design below is retained on
+  purpose: it costs nothing and it is what makes that statement checkable.
 * **`Math.abs(Integer.MIN_VALUE)` must wrap.** Not covered by W7-95's inference
   that the `Exact` family's `StrictMath` twins are green, because `abs` is not
   in that family: Java specifies the wrap, and Rust's `i32::abs` panics on that

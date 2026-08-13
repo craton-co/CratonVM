@@ -1,9 +1,39 @@
 # W7-92 — `Runtime.addShutdownHook` registers, and nothing ever starts the thread
 
-Status: **OPEN**. Both modes. The registry is correct and complete; **execution
-is absent on every one of the five exit paths.** Measured against HotSpot
-25.0.3+9 on all five, plus `Runtime.halt`, `removeShutdownHook`, concurrent
-hooks and duplicate registration. Lane C9, 2026-08-12.
+> ## RECONCILED 2026-08-12 (lane C18) — the DEFECT is measured; the FIX is not
+>
+> Keep these two apart, because this record's hedges cover both and only one of
+> them is still open.
+>
+> * **The defect is MEASURED, and stated flatly: shutdown hooks NEVER RUN.**
+>   Against HotSpot 25 on the same program, HotSpot prints **three hook lines**
+>   and CratonVM prints **none**, **with no output-lost marker**. That last
+>   clause is the one that matters: §0's warning that *"a hook that runs but
+>   whose output is lost is indistinguishable from a hook that never ran"* is
+>   **discharged** — this is not an output-capture artefact. Any record that
+>   still hedges on *whether* hooks run should be read against this.
+> * **The fix is NOT measured.** Every CratonVM "after" in this record stays
+>   **PREDICTED**, and `ShutdownProbe` across the nine exit modes
+>   (`WAVE-D-QUEUE.md`, measurement 3) is still owed. Nothing here has been
+>   upgraded.
+> * **§0's "12, 9 and 36 findings" are superseded as counts.** The
+>   re-adjudication is `C8-CORPUS-HARNESS-DEFECTS-20260812.md` §4.1: **62 of
+>   75 stored `DIVERGE` rows (83%) were harness artefacts.** §0's *argument* —
+>   one missing feature wearing many hats — is confirmed, not weakened; only
+>   the arithmetic moved.
+
+Status: **FIX LANDED (lane C11, 2026-08-12), CratonVM side NOT YET RUN.** The
+runner exists, each hook is `start()`ed as its own thread and joined, and every
+exit path but `Runtime.halt` reaches it — see §7 for the implementation and §8
+for the four contract questions §1 left open, now measured. Every CratonVM
+"after" in this record is **PREDICTED** until the orchestrator runs
+`ShutdownProbe` and `RShutdownHooks` against a build of it. Two residual
+divergences are stated in §9 and are why this doc stays in `known-issues`.
+
+Diagnosis (§0–§6) by lane C9, 2026-08-12: the registry is correct and complete;
+**execution was absent on every one of the five exit paths.** Measured against
+HotSpot 25.0.3+9 on all five, plus `Runtime.halt`, `removeShutdownHook`,
+concurrent hooks and duplicate registration.
 
 Predecessors, all of which name this gap and none of which closes it:
 `P4A-SPRING-20260812.md` §7 N1 (the nomination this record completes and
@@ -391,3 +421,322 @@ set. It captures each arm's output into a variable before printing, because
 
 `regression-suite/src/RShutdownHooks.java` is the shippable half and is checked
 in; it needs the N2 registration line to be scheduled.
+
+`HookContract.java` and `RunTerm.java` (§8) are in lane C11's scratchpad
+(`…/scratchpad/c11/`), not checked in. They answer the contract questions that
+`ShutdownProbe` does not, and every one of them had to be settled before the
+runner could be written — three of the four decided a branch in it.
+
+---
+
+## 7. The fix, as landed — lane C11, 2026-08-12
+
+Shape **(A)** of §2.2: run them Rust-side from `SHUTDOWN_HOOKS`. Shape (B)
+(stop intercepting and let the JDK's own `ApplicationShutdownHooks` do it)
+remains the target and is still not a one-wave change.
+
+Two files, both owned by the implementing lane:
+`native-builtins/src/lang_system.rs` and `vm-cli/src/main.rs`.
+
+### 7.1 The reader
+
+`run_shutdown_hooks(ctx: &mut dyn NativeContext, trigger: &str)`, next to the
+registry it reads. Reached from four places:
+
+| exit path | call site | trigger |
+| --- | --- | --- |
+| `System.exit(n)`, from any thread | `native_system_exit`, before the slot-map sweep | `System.exit` |
+| `Runtime.exit(n)` | `native_runtime_exit`, same position | `Runtime.exit` |
+| a JDK-side route into shutdown | the new `java/lang/Shutdown.runHooks()V` native | `Shutdown.runHooks` |
+| `main` returned / `main` threw | `vm-cli/src/main.rs`, after the non-daemon join, above `match result` | `main-returned` / `uncaught` |
+| **`Runtime.halt(n)`** | **none, deliberately** | — |
+
+Before the sweep, not after: a hook is Java code that loads classes and
+allocates, so `sweep_declared_slot_maps_before_exit` would otherwise census a
+heap the hooks are about to change.
+
+**Hooks are started as threads, not `run()` inline.** §4.2 called inline
+execution "an acceptable first step"; it was cheap enough to skip that step and
+three separate measurements say inline would have been wrong rather than merely
+approximate — the vector asserts `ownThread=true`, HotSpot's hooks are
+concurrent (§8, `crosswait`), and a hook that touches anything requiring a stack
+walk needs a real Java frame on a real VM thread. Two loops, start-all then
+join-all, exactly as `ApplicationShutdownHooks.runHooks` has them; one
+start-join pair per hook would deadlock the `crosswait` shape.
+
+**The join is bounded, and this is the one deliberate divergence in the runner.**
+HotSpot loops on `hook.join()` forever, so a hung hook hangs the JVM with no
+diagnostic. This VM is read by harnesses that score a wedged process as "the VM
+hung" and file it as a finding, which is the failure mode this record exists to
+stop. Default bound 30 s, then a named line on stderr and exit continues;
+`CRATONVM_SHUTDOWN_HOOK_TIMEOUT_MS=0` restores HotSpot's unbounded wait, any
+other value sets the bound. The join polls `thread_is_alive` inside the
+`begin_blocking_region` / `end_blocking_region` protocol — mandatory, not
+hygiene: the hook threads allocate, and a thread sleeping outside a blocked
+region never reaches the safepoint a collection needs.
+
+Handles are re-resolved from the global-root table on **every** use rather than
+cached as `ObjectRef`s across the invokes. The roots are GC-remapped; a cached
+raw ref would go stale under the moving collector precisely because a hook body
+allocates.
+
+### 7.2 N1-C1, honoured — one unconditional line
+
+```
+[cratonvm] shutdown hooks: ran=1 threw=0 skipped=0 unjoined=0 trigger=main-returned
+```
+
+Unconditional, on stderr, beside the `[cratonvm] System.exit(N) called` line
+that is already unconditional there. `ran=0` for a program with no hooks is the
+honest reading and is what turns `ran=0` on a program *with* hooks into a
+finding instead of a silence. Four counters rather than the two N1-C1 asked for,
+because the runner can now distinguish four states:
+
+* `ran` — started and observed to finish.
+* `threw` — `start()` failed at the VM boundary. An exception from a hook's
+  **body** is deliberately not counted: it lands on the hook's own thread and
+  HotSpot swallows it (§8, `throwing` — rc unchanged, the other two hooks ran).
+* `skipped` — already started, or already finished. HotSpot does not re-run a
+  terminated hook either (§8, `RunTerm`).
+* `unjoined` — started, still running when the bound expired.
+
+`extract()` in `regression-suite/harness-guard.sh` keeps only `^(PASS|CK) `, so
+this line is filtered out of every scheduled vector's diff and cannot itself
+become a cross-VM difference.
+
+### 7.3 N1-C2, honoured — and the bridge is NOT `vm.invoke`
+
+Both halves land, but not as N1-C2 wrote them:
+
+* `java/lang/Shutdown.runHooks()V` **is** registered onto the runner
+  (`NativeKind::Bridge`), so any JDK-side route into shutdown reaches the same
+  drain. It is the right interception while the hooks live Rust-side, because
+  `ApplicationShutdownHooks.hooks` is never populated (§2.2) and running the
+  real body would run nothing.
+* the launcher **does not** go through it. `vm.invoke("java/lang/Shutdown",
+  "runHooks", "()V", &[])` needs `java/lang/Shutdown` to resolve, which is a
+  real-JDK-mode assumption, and N1-C2's own `let _ =` would have swallowed the
+  failure — a bridge that silently does nothing in synthetic-JDK mode is the
+  exact shape this record is about. The launcher builds a
+  `cratonvm_vm::vm::NativeContextImpl { shared: &vm.shared, thread: &mut
+  vm.main_thread }` (the same construction `Vm::begin_main_thread_blocking_
+  region` uses ten lines earlier) and calls `run_shutdown_hooks` directly. Both
+  routes drain the one list, so neither can double-run a hook.
+
+Placement is N1-C2's: after `wait_for_non_daemon_threads`, above `match result`.
+The ordering is load-bearing — HotSpot's `nondaemon` transcript prints
+`KEEPER-DONE` before the hook output.
+
+### 7.4 N1-C3, honoured, plus one contract N1 did not have
+
+`shutdown_hook_add` now returns `Result<(), MethodCallFailed>`:
+
+* duplicate registration → `IllegalArgumentException("Hook previously
+  registered")` (§1.3);
+* registration after shutdown has begun → `IllegalStateException("Shutdown in
+  progress")` (§8, new). Without it a late registration is accepted and then
+  silently dropped, which is this record's own defect reintroduced by its
+  repair.
+
+`shutdown_hook_remove` returns `Result<bool, MethodCallFailed>` and throws the
+same ISE during shutdown, also measured. A hook thread that has already run to
+completion is still **accepted** at registration (§1.4) and is `skipped` at
+shutdown.
+
+`native_thread_start0`'s "has this thread already been started" predicate moved
+into `thread_already_started` in the same file and both callers now use it. The
+runner has to ask the identical question, and two copies of it would be a twin
+pair with nothing keeping them in step — the drift species this tree has a
+record of.
+
+### 7.5 PREDICTED CratonVM behaviour
+
+Every row below is a prediction from the code, not a measurement; the lane could
+not execute the binary.
+
+| probe | predicted `--real-jdk` and `--jdk-only` |
+| --- | --- |
+| `ShutdownProbe normal` | `HOOK-RAN-OUT/-ERR/-FD1`, `startedAsThread=true`, rc 0 |
+| `ShutdownProbe exitmain` | same, rc 3 |
+| `ShutdownProbe exitother` | same, rc 4 |
+| `ShutdownProbe uncaught` | hook output present, rc 1, but **before** the trace (§9.1) |
+| `ShutdownProbe nondaemon` | hook output after `KEEPER-DONE`, rc 0 |
+| `ShutdownProbe halt` | no hook output, rc 5 |
+| `ShutdownProbe remove` / `dup` | unchanged; `dup` now throws IAE |
+| `RShutdownHooks` | all four HotSpot lines, `ownThread=true` |
+| `CorpusMain` | `CORPUS-END … completed=exit` finally appears — the marker whose absence produced the 12/9/36 false DIVERGE verdicts |
+
+The most valuable falsifier is unchanged and is now inverted: a CratonVM run of
+`ShutdownProbe normal` that prints **no** `HOOK-RAN-FD1 normal`, or a
+`ran=0` on the `[cratonvm] shutdown hooks:` line while a hook was registered.
+
+---
+
+## 8. The four contract questions §1 left open — measured
+
+HotSpot `25.0.3+9`, Windows 11, `HookContract.java` / `RunTerm.java`. Each one
+decided a branch in §7's runner.
+
+**(a) `addShutdownHook` / `removeShutdownHook` during shutdown → ISE.**
+
+```
+=== MODE addduring
+MAIN-START addduring / MAIN-END addduring
+ADD-DURING threw=java.lang.IllegalStateException msg=Shutdown in progress
+rc=0
+
+=== MODE removeduring
+MAIN-START removeduring / MAIN-END removeduring
+OTHER-HOOK-RAN
+REMOVE-DURING threw=java.lang.IllegalStateException msg=Shutdown in progress
+rc=0
+```
+
+Note the second one: the hook the late `remove` tried to cancel ran anyway.
+
+**(b) A hook that throws does not stop the others and does not change the exit
+code.**
+
+```
+=== MODE throwing
+MAIN-END throwing
+HOOK-3-RAN
+HOOK-BOOM-ENTERED
+Exception in thread "h-boom" java.lang.IllegalStateException: deliberate-hook-throw
+	at HookContract.lambda$main$5(HookContract.java:70)
+	at java.base/java.lang.Thread.run(Thread.java:1474)
+HOOK-1-RAN
+rc=0
+```
+
+All three ran; the trace is printed by the hook's own thread; `rc=0`. Note also
+the order — 3, boom, 1 — which is the §1 warning about hook ORDER, measured.
+
+**(c) Hooks run concurrently, and a hook may block on another hook.**
+
+```
+=== MODE crosswait
+SIGNAL firing
+WAITER released=true
+rc=0
+```
+
+`h-waiter` blocks on a `CountDownLatch` that `h-signal` counts down. This is the
+measurement that rules out an inline runner: inline, `h-waiter` would have burned
+its 10 s timeout and answered `released=false`, or deadlocked outright with no
+bound.
+
+**(d) `System.exit` inside a hook hangs HotSpot forever; `Runtime.halt` inside a
+hook terminates immediately.**
+
+```
+=== MODE exitinhook (bounded to 12s by the probe runner)
+MAIN-END exitinhook
+PEER-HOOK-RAN
+EXIT-HOOK-ENTERED
+rc=124        <- `timeout` fired; the JVM was still alive
+
+=== MODE haltinhook
+HALT-HOOK-ENTERED
+rc=9
+```
+
+§4.3 predicted the hang from `Shutdown.exit` being `synchronized`; it is
+confirmed. CratonVM does **not** reproduce it (§9.2).
+
+**(e) A hook thread that already ran is accepted and is not re-run.**
+`RunTerm`: `DEAD-BODY-RAN` appears once (from the explicit `start()`), then
+`MAIN-END`, then the three live hooks — no second `DEAD-BODY-RAN`, no
+`IllegalThreadStateException` reaching the console.
+
+---
+
+## 9. Residual divergences and NOMINATIONS
+
+### 9.1 OPEN — on the uncaught path the hook output precedes the stack trace
+
+HotSpot: trace, then hooks (§1, `uncaught`). CratonVM after this fix: hooks,
+then trace. Not a placement mistake — the launcher renders a fatal exception by
+`bail!`ing a joined string that `main()` prints **after** `run()` returns, so no
+call site inside `run()` can be after it. Fixing it means restructuring how the
+launcher renders a fatal exception, which changes output that every harness in
+this tree reads; it is deliberately not folded into this wave. `rc` and the
+presence of the hook output are both correct.
+
+### 9.2 STATED — `System.exit` from inside a hook terminates instead of hanging
+
+HotSpot deadlocks (§8d). Here the second entry finds the list drained, prints
+`ran=0 … trigger=System.exit`, and `std::process::exit` fires from the hook
+thread. That is a divergence in CratonVM's favour and it is not worth a
+redesign, but it must be written down rather than discovered: a workload that
+relies on the hang (there are none known) would see the process die.
+
+### 9.3 NOMINATION — the signal door is still closed, and the pair must not
+silently re-close
+
+`native-builtins/src/lib.rs` (lane C9's file) carries a corrected comment on the
+`jdk/internal/misc/Signal.handle0` silent accept, whose current text says a
+Tomcat or log4j teardown "reaches this VM through neither door". **One of those
+two doors is now open.** The comment ends with "do not restore the old sentence
+until its `RShutdownHooks` vector is green", which is the right condition; the
+nomination is to replace the middle of it once the orchestrator has run the
+vector:
+
+*old*:
+```
+    // It does not. `Runtime.addShutdownHook` is intercepted by a native in
+    // `lang_system.rs` that roots the hook in a `SHUTDOWN_HOOKS` vector whose
+    // only reader is `removeShutdownHook`, and no exit path in this VM runs
+    // it — not `System.exit`, not `Runtime.exit`, not the launcher's
+    // post-`main` return, not the uncaught-exception path. So a Tomcat or
+    // log4j teardown reaches this VM through neither door: the signal
+    // handler is accepted and never fires, AND the shutdown hook is accepted
+    // and never runs. The accept above is still the right call for boot; what
+    // is removed is the false consolation. See
+```
+*new*:
+```
+    // It was not true when it was written. W7-92 has since given
+    // `SHUTDOWN_HOOKS` a reader (`lang_system::run_shutdown_hooks`, reached
+    // from `System.exit`, `Runtime.exit`, `Shutdown.runHooks` and the
+    // launcher's post-`main` path), so the addShutdownHook door IS now open
+    // and a Tomcat or log4j teardown registered that way does run. The
+    // SIGNAL door is still shut: this handler is accepted and never fires,
+    // so a teardown that depends on SIGTERM/SIGINT — not on a registered
+    // hook — still gets nothing, and nothing in this VM converts a signal
+    // into a call to `run_shutdown_hooks`. That is the remaining half. See
+```
+
+Related and separate: `vm/src/runtime/signals.rs` holds a **third** shutdown
+mechanism — `SignalHandler` with its own `shutdown_hooks`, `add_shutdown_hook`,
+`initiate_shutdown` and `run_shutdown_hooks` — whose only callers in the whole
+tree are its own unit tests. It is Rust-`fn`-valued, unconnected to Java hooks,
+and is the same write-only shape this record is about, one layer down. Whoever
+closes the signal door should either wire it or delete it; leaving a second
+green-looking shutdown API next to the real one is how a later lane concludes
+signals are handled.
+
+### 9.4 WITHDRAWN — N2 is already landed
+
+Checked rather than assumed: `regression-suite/run.sh:106` already carries
+`RShutdownHooks` in `CORE_CLASSES` (between `RJdkIntrinsics2` and
+`RSimpleTimeZoneRaw`), so the vector is scheduled and the `STRICT_COVERAGE=1`
+census is not at risk. Nothing to nominate; §3 N2 is closed. **The vector has
+therefore been running red-or-vacuous against a VM that never ran a hook — it
+is the first thing to re-read after this build.**
+
+### 9.5 NOMINATION — two process-global statics that should be VM-scoped
+
+`SHUTDOWN_HOOKS` was already process-global (W5-1 §357 calls it out as an
+unpartitioned table) and `SHUTDOWN_IN_PROGRESS` now joins it. In the CLI there is
+one VM per process so nothing latches wrongly, but an in-process second `Vm`
+after a first one has shut down would find `addShutdownHook` throwing
+`IllegalStateException` forever. Both belong on the VM-scoped table, together —
+see `process-global-native-caches-must-be-vm-scoped`.
+
+### 9.6 NOMINATION — `CRATONVM_SHUTDOWN_HOOK_TIMEOUT_MS` should be a declared flag
+
+It is read with `std::env::var` behind a `OnceLock` because `nbflags()` lives in
+`native-builtins/src/lib.rs`, which this lane does not own. It should move into
+that struct with the others so `--help`, the flag-group expander and the
+unknown-token guard all see it.

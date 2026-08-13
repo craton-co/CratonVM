@@ -1,8 +1,58 @@
 # W7-95 — the `NativeKind::Intrinsic` category has never had its semantics checked
 
-**Status: OPEN. 39 divergent triples found in a 258-triple sample, six of them
-VM-fatal. Both shipping modes are affected; none of this is
+> ## RECONCILED 2026-08-12 (lane C18) — READ THIS BEFORE THE HEADLINE BELOW
+>
+> Four numbers in this record are stale. They are corrected here rather than
+> deleted, because the *original* readings were real measurements and the
+> before/after pairing is the evidence.
+>
+> 1. **No family aborts the VM any more. MEASURED on a binary.** The headline's
+>    "six of them VM-fatal" is the **pre-fix** state. Every failure in the
+>    second-generation census (`RJdkIntrinsics2`, `W8-C3-1`) is a Java
+>    `AssertionError`, not a Rust panic. Read "six VM-fatal" as history
+>    throughout this record; §"VM-fatal: `floorDiv` / `floorMod`" and N1 are
+>    the *cause*, not a live defect.
+> 2. **`floorDiv`/`floorMod` at `MIN_VALUE / -1` is FIXED and VERIFIED on a
+>    real binary. MEASURED.** No record should call it open or VM-fatal.
+> 3. **`Math.ulp` is NOT a defect and must come off the divergent list.
+>    MEASURED**, and by proof rather than sample: the shipped body was run
+>    against the JDK's own exponent form over **all 4,294,967,296 `float` bit
+>    patterns** and the two are equivalent. The `+Infinity` rows below are the
+>    pre-fix state. §"`Math.ulp` is EXECUTED-fixed" carries the sweep; the
+>    NaN-payload row in the closure table is a javadoc-permitted difference,
+>    not a divergence. *Unresolved detail, stated rather than guessed:* that
+>    section reports 16,777,212 NaN patterns differing in payload while the
+>    later exhaustive result is quoted as equivalence over all 2^32; the two
+>    reconcile only if payload is excluded from "equivalent", which is what
+>    the javadoc permits. Do not quote either number without saying which.
+> 4. **`Math.pow` is TWO items, not one.** (a) The five special-value rows:
+>    FIXED and verified, MEASURED. (b) The **fast path on ordinary inputs**:
+>    `a.powi(b as i32)` binary exponentiation, measured at **1.4 ulp at
+>    |b| = 2 and 44.3 ulp at |b| = 63 against a 1-ulp contract**. A record
+>    that treats "pow" as one closed item is wrong. See §"`Math.pow`: the
+>    special values were the smaller half".
+> 5. **"645 triples" is a count of registry ROWS.** The correct figures are
+>    **645 registry rows = 614 DISTINCT triples** (31 duplicate
+>    registrations) — `W8-C3-1` §"The coverage arithmetic", recomputed from a
+>    `--dump-native-registry` schema-4 dump. Coverage arithmetic stated
+>    against 645-as-triples is off: 258 / 614 is **42%**, not 40%, and the
+>    never-invoked remainder in distinct triples is **356**, not 387.
+>
+> Nothing else in this record was upgraded. Every value still marked
+> **PREDICTED** below stays PREDICTED.
+
+**Status: PARTIALLY CLOSED. 39 divergent triples found in a 258-triple sample.
+Six of them were VM-fatal; none is any longer — see the reconciliation banner
+above. Both shipping modes are affected; none of this is
 `--jdk-only`-specific.**
+
+**Closed and re-measured on a binary:** `floorDiv`/`floorMod` (the six formerly
+VM-fatal triples), `Math.pow`'s **special values only**, `Math.ulp`/
+`StrictMath.ulp` ×4 (and `ulp` is now shown to be no defect at all), and the
+nine `parse*` triples. **Closed but not yet re-measured on a binary:** the
+sixteen `Character` triples and the `Math.pow` **fast-path accuracy** defect
+this lane found that the original census did not sample. **Still open:** the
+seven `java.lang.String` code-point triples. See [Closure](#closure-lane-c1).
 
 `NativeKind::Intrinsic` means, per `native-api/src/registry.rs`'s own doc
 comment, "a correct fast-path for a hot method". Two claims: *fast*, and
@@ -21,11 +71,15 @@ process per block. Floating point is compared as
 0.0` is `true` and `NaN != NaN`, so an equality-shaped check passes against
 exactly the defects being hunted.
 
-* **645** triples are registered `Intrinsic` in this configuration
+* **645** registry ROWS are registered `Intrinsic` in this configuration
   (`--dump-native-registry`, a hello-world run: the registry is populated at VM
-  init, so the number does not depend on what the program touches).
-* **258** of those 645 were actually invoked by the probe — the census's own
-  per-row `invocations` column, not a claim. **40% coverage.**
+  init, so the number does not depend on what the program touches). **Corrected
+  2026-08-12 (C18): 645 is rows, not triples. 31 of them are duplicate
+  registrations, so the distinct-triple count is 614** — `W8-C3-1` §"The
+  coverage arithmetic". Every "of the 645" in this record is "of the 645 rows".
+* **258** distinct triples were actually invoked by the probe — the census's own
+  per-row `invocations` column, not a claim. **42% coverage of the 614**
+  (the "40%" this record originally printed divided by the row count).
 * **776** differential rows over those 258 triples.
 * **39 distinct triples diverge**, across nine classes. **Six of them are
   VM-fatal** — a Rust panic, which is not a Java throwable and cannot be
@@ -53,16 +107,245 @@ java/lang/Double        parseDouble (Ljava/lang/String;)D
 java/lang/Float         parseFloat (Ljava/lang/String;)F
 ```
 
+> **The four `ulp` entries in that list are no longer a divergence
+> (C18, 2026-08-12, MEASURED).** `Math.ulp (D)D`, `Math.ulp (F)F`,
+> `StrictMath.ulp (D)D` and `StrictMath.ulp (F)F` were the pre-fix
+> `+Infinity`-at-the-top rows; the shipped body has since been proved
+> equivalent to the JDK's own exponent form over all 4,294,967,296 `float`
+> bit patterns. The list above is preserved as the census's original finding —
+> **it is history, not a live defect list.** Live status per family is the
+> Closure table below plus the reconciliation banner at the top.
+
 Counted as untested rather than as defects, but note the asymmetry:
 `StrictMath.floorDiv(JJ)J` and `StrictMath.floorMod(JJ)J` are registered onto
 the *same* `native_math_floor_div_long` / `native_math_floor_mod_long` bodies
 that abort the VM for `Math`, so they are near-certainly two more VM-fatal
-triples that this probe simply did not call. The nineteen other untested
+triples that this probe simply did not call. **(C18, 2026-08-12: moot — the
+shared bodies were fixed and no family aborts the VM any more. The asymmetry
+argument stands as method; the prediction of two more aborts does not.)** The nineteen other untested
 `StrictMath` integral forms (`addExact`, `multiplyExact`, `negateExact`,
 `min`/`max` on `II`/`JJ`, …) share bodies with `Math` twins that measured
 **correct**, so those are the reverse case: probably green, unverified.
 
-### VM-fatal: `floorDiv` / `floorMod` at `MIN_VALUE / -1`
+## Closure (lane C1)
+
+Every "after" below is labelled either **EXECUTED** — measured by running the
+`cratonvm.exe` binary — or **PREDICTED**, which means the fix is written and
+argued but the binary carrying it has not been run. The distinction is not
+decoration: this record exists because a comment that *asserted* a semantic was
+believed for months.
+
+| area | before | after | how |
+|---|---|---|---|
+| `floorDiv`/`floorMod` ×6 | VM ABORT | correct | **EXECUTED**; re-verified on a real binary 2026-08-12 — **no longer VM-fatal** |
+| `Math.pow` special values ×5 | `1.0` | NaN | **EXECUTED** — this row is *only* the special values |
+| `Math.ulp`/`StrictMath.ulp` ×4 | `+Infinity` | `0x7ca0…`/`0x73800000` | **EXECUTED**; and since proved equivalent over all 2^32 `float` patterns — **not a defect** |
+| `Math.pow` fast path on ORDINARY inputs (NEW) | 1.4 ulp at \|b\|=2, 44.3 ulp at \|b\|=63, against a 1-ulp contract | ≤1 ulp | **PREDICTED** — separate item from the special values above |
+| `Math.ulp` NaN payload (NEW) | canonical NaN | payload kept | **PREDICTED**; javadoc-permitted either way, not a divergence |
+| `Character` over the BMP | 3837 → 1294 code points | 0 | 3837→1294 **EXECUTED**, 1294→0 **PREDICTED** |
+| `Character.isDigit` supplementary | 390 wrong | 0 | **PREDICTED** |
+| emoji predicates ×5 | 2746 wrong | 0 | **PREDICTED** |
+| the nine `parse*` triples | Rust's grammar | Java's | **EXECUTED** (see below) |
+
+### The `Character` number is the one to read carefully
+
+A full sweep of all 65,536 BMP code points, eleven columns each, run on the
+binary against HotSpot 25 — **both arms executed, neither predicted**:
+
+```
+BEFORE (the Bridge duplicates in lib.rs winning):   3837 code points diverge
+AFTER  (those four deleted, intrinsics winning):    1294 code points diverge
+```
+
+So deleting the duplicates (commit `4866ad9b4`) was worth 2543 code points, and
+it is now *measured* rather than argued. The residual 1294 attributes cleanly,
+which is what made it fixable:
+
+| column | code points | cause |
+|---|---|---|
+| `isLetter` | 957 | Rust's `Alphabetic` (`L* u Nl u Other_Alphabetic`) vs Java's `L*` |
+| `isLetterOrDigit` | 957 | the same 957, inherited |
+| `getNumericValue` | 372 | the digit table reused for a *numeric value* |
+| `toUpperCase` | 30 | simple-vs-full case mapping + a version skew |
+| `isUpperCase` | 3 | toolchain Unicode version skew |
+| `isLowerCase` | 3 | toolchain Unicode version skew |
+| `toLowerCase` | 3 | toolchain Unicode version skew |
+
+(1294 distinct code points, not 2325 — `isLetter` and `isLetterOrDigit` fail on
+the same set.)
+
+**957 ≠ 949 is a finding, not rounding.** JDK 25's own `isAlphabetic \ isLetter`
+over the BMP is **949**. The census measured **957** against the binary. The
+eight-code-point gap is Rust's Unicode tables disagreeing with JDK 25's, and it
+is why the obvious fix — `is_alphabetic() && !DELTA` — was rejected: it would
+have left a residual that nothing on the Rust side can enumerate. Six of those
+eight surface directly in the table above (`U+A7CE`, `U+A7CF`, `U+A7D2`,
+`U+A7D4`, `U+A7F1` are `UNASSIGNED` on JDK 25 and assigned in the toolchain;
+`U+0295` is the reverse). The fix is therefore a table generated **from JDK 25
+itself**, the same provenance as the existing `JAVA_DIGIT_RUNS`.
+
+### Why these have to be fixed as a SET, not one method at a time
+
+`RJdkIntrinsics2`'s `charcls` family names the trap in one line: **`U+2160`
+ROMAN NUMERAL ONE**. Measured on JDK 25:
+
+| classifier | `U+2160` | why |
+|---|---|---|
+| `Character.isLetter` | **false** | its category is `Nl`, and `isLetter` is `L*` only |
+| `Character.isUpperCase` | **true** | it carries `Other_Uppercase` |
+| `Character.isLetterOrDigit` | **false** | not `L*`, not `Nd` |
+| `Character.isAlphabetic` | **true** | `L* u Nl u Other_Alphabetic` |
+| `char::is_alphabetic` (Rust) | true | it *is* Unicode `Alphabetic` |
+
+Four classifiers that all read like "is this a letter", four different answers,
+one code point. Any body that answers *any* of them from a Rust `char` method
+gets at least one row wrong, and a fix that repairs `isLetter` by broadening
+`isUpperCase` trades a red row for a red row. That is why the fix here is one
+generated table per Java predicate rather than one clever derivation shared
+between them.
+
+The long tail behind that row, by general category — `isAlphabetic && !isLetter`
+over every code point on JDK 25:
+
+| category | trapped | of the category |
+|---|---|---|
+| `Mn` (non-spacing mark) | 927 | 2020 |
+| `Mc` (spacing mark) | 438 | 468 |
+| `Nl` (letter number) | 236 | **236 — the whole category** |
+| `So` (other symbol) | 130 | 7376 |
+| **total** | **1731** | |
+
+`Me` and `Cf` are *not* in the trap (`U+20DD`, `U+200D` are `isAlphabetic=false`
+on both sides), which is worth stating because they are the categories one would
+expect to be there by analogy. `No` is not either — `U+00B2` SUPERSCRIPT TWO is
+`isAlphabetic=false` — but it *was* a defect through a different door:
+`isLetterOrDigit` used `char::is_alphanumeric`, which is `Alphabetic u N*` and so
+took in `No` on its own account. That door is closed by composing
+`isLetter || isDigit` the way the JDK does.
+
+**How the tables were verified without a build.** The run tables were extracted
+back out of `native-builtins/src/lang_math.rs` as text, the exact composition
+each Rust body performs was replayed in Java, and the result was compared to
+HotSpot 25 for **every code point `0..=0x10FFFF`**:
+
+```
+isLetter 0   isDigit(int) 0   isLetterOrDigit(int) 0   isEmoji 0
+isEmojiPresentation 0   isEmojiModifier 0   isEmojiModifierBase 0
+isEmojiComponent 0      getNumericValue(char) 0   case mapping + predicates 0
+TOTAL TABLE MISMATCHES AGAINST HOTSPOT 25: 0
+```
+
+That proves the *bytes in the repo* are the JDK's answers. It does not prove
+they compile or that the registrations reach them, which is why the rows above
+still read PREDICTED.
+
+### A supplementary-plane defect no BMP sweep can see
+
+`RJdkIntrinsics` fails on the binary with:
+
+```
+AssertionError: Character.isDigit(U+1D7CE MATHEMATICAL BOLD ZERO) must be true
+```
+
+`U+1D7CE` is above the BMP, so the `(C)Z` char-taking form cannot reach it —
+only `(I)Z` can. A sweep that walks `0..0xFFFF` reports green on this forever,
+and the 65,536-point sweep above did exactly that. **390 supplementary decimal
+digits** were wrong, and the two digit tables must stay separate: `parseInt`
+walks UTF-16 code *units*, so a supplementary digit correctly matches nothing
+there (measured on JDK 25:
+`Integer.parseInt(new String(Character.toChars(0x104A0)))` throws even though
+`Character.digit(0x104A0, 10) == 0`). Merging them would make the parser *more*
+permissive than the JDK.
+
+### `Math.pow`: the special values were the smaller half
+
+The census sampled special values, found the five C99-vs-JLS rows, and those are
+now fixed and EXECUTED-correct. Sampling special values is exactly why it missed
+the larger defect: **the fast path was wrong on ordinary numbers.**
+
+`Math.pow` took `a.powi(b as i32)` for every integral `|b| < 64`. That is binary
+exponentiation — up to eleven chained multiplications — and `Math.pow` promises
+"within 1 ulp of the exact result". Measured against the exact power
+(`BigDecimal.pow` at 120 digits), 20,000 random bases per exponent:
+
+| \|b\| | worst error (ulp) | cases over the 1-ulp bound |
+|---|---|---|
+| 2 | 0.500 | 0 / 20000 |
+| −2 | 1.439 | 412 / 20000 |
+| 3 | 1.228 | 150 / 20000 |
+| −3 | 2.242 | 1304 / 20000 |
+| 4 | 1.852 | 2787 / 20000 |
+| 8 | 4.943 | 10107 / 20000 |
+| 16 | 10.420 | 14939 / 20000 |
+| 32 | 20.814 | 17360 / 20000 |
+| 63 | 44.321 | 18682 / 20000 |
+
+HotSpot 25 is within **0.503 ulp** on every one of those same inputs, so each is
+also a plain differential divergence. The old comment called the window
+"HotSpot-style"; HotSpot's C2 specialises `pow(x, 2)` and `pow(x, 0.5)`, not a
+63-wide range.
+
+**Should `Math.pow` delegate to fdlibm instead?** No, and the file already
+contains the argument at its own head: `Math.f` promises 1 ulp, `StrictMath.f`
+promises the fdlibm *bits*, and the doc block says in terms "do NOT simplify
+this by pointing both classes at the fdlibm bodies … libm already satisfies
+`Math`'s contract." Measured here, that block is right: `Math.pow` and
+`StrictMath.pow` differ bitwise on 9.73% of random finite inputs, and both are
+legal. The defect was never that `powf` was used — it was that `powi` was used
+*instead of* `powf`. So the fix removes the bypass rather than replacing the
+backend, keeping exactly the one case that is provably exact: `b == 2.0` is
+`a * a`, a single correctly-rounded multiply (0.500 ulp worst, 0 violations),
+and it needs no guard on `a` because `±inf * ±inf == +inf` and
+`-0.0 * -0.0 == +0.0` are already the JLS's answers.
+
+### `Math.ulp` is EXECUTED-fixed, and the fixture is not vacuous
+
+`RJdkIntrinsics` reports `CK ulp=9` passing. That is only evidence if the nine
+checks include the defect, so it was checked rather than assumed:
+`ulpAtTheTop()` asserts `Math.ulp(Double.MAX_VALUE) == 2^971` and
+`StrictMath.ulp(Float.MAX_VALUE) == 2^103` by raw bits. The pass is real.
+
+Separately, the algorithm was proved rather than sampled: both the shipped
+bit-increment form and the JDK's own exponent form were transliterated to Java
+and run over **all 4,294,967,296 `float` bit patterns**. Every non-NaN pattern —
+4,278,190,082 of them — agrees with `Math.ulp` exactly, and the two algorithms
+are *equivalent*, so rewriting the working body from the exponent would have
+been churn. The 16,777,212 that disagreed were all NaN: `Math.ulp` is
+`Math.abs(d)`, which keeps a NaN's payload and only clears its sign, where the
+body returned canonical NaN. Measured: `Math.ulp(0x7ff0000000000001)` is
+`0x7ff0000000000001` on HotSpot. Payloads are not a contract — the javadoc
+promises only "is NaN" — but `v.abs()` is the JDK's own expression, is shorter,
+and is strictly closer, so there is no reason to write anything else.
+
+### The `parse*` family: the claim VERIFIED, and one record row corrected
+
+Commit `26e69258a` claims eight parsers were moved off Rust's grammar. The claim
+holds. The acceptor was transliterated from the Rust back into Java and diffed
+against HotSpot's own accept/reject decision:
+
+```
+Integer.parseInt named rows                     divergences 0
+Double.parseDouble named rows                   divergences 0
+float-grammar fuzz, 400,000 generated tokens    divergences 0
+integer-grammar fuzz, 400,000 tokens x radix    divergences 0
+```
+
+That covers every item this lane was asked to check: leading `+` is accepted,
+leading/trailing whitespace and underscores are rejected by the integer grammar,
+trailing `d`/`f`/`D`/`F` is accepted by the floating one, and hex literals
+(`0x1.8p3`) parse.
+
+**One row in W7-99 is wrong and should not be copied forward.** It lists
+`Double.parseDouble(" 1.0")` as throwing. It does not — measured on JDK 25 it
+returns `1.0`, because the grammar's `[\x00-\x20]*` really does skip an ASCII
+space, which is what `java_trim` implements. The rejection that *does*
+distinguish `java_trim` from Rust's `str::trim` is a NON-ASCII space:
+`Double.parseDouble("\u00a01.0")` and `("1.0\u00a0")` both throw, while
+`(" 1.0")`, `("\u000b1.0")` and `("\u00001.0")` are all accepted -- the
+grammar's bound is the byte value `0x20`, not the `White_Space` property. The
+Rust is correct either way; only the record's example was wrong.
+
+### VM-fatal: `floorDiv` / `floorMod` at `MIN_VALUE / -1` — **FIXED, MEASURED ON A REAL BINARY 2026-08-12. This section is the pre-fix measurement.**
 
 ```
                                        HotSpot                CratonVM
@@ -362,9 +645,10 @@ It is not registered in `regression-suite/run.sh` — see NOMINATIONS.
 
 ## Residuals — what is still untested
 
-**387 of the 645 registered `Intrinsic` triples were never invoked**, and the
-untested set is *not* a random remainder. Largest families, with the reason each
-is worth a lane:
+**387 of the 645 registered `Intrinsic` ROWS were never invoked** — **356 of the
+614 distinct triples**, corrected 2026-08-12 (C18); see the reconciliation
+banner — and the untested set is *not* a random remainder. Largest families,
+with the reason each is worth a lane:
 
 | n | class | why it matters |
 |---|---|---|
@@ -405,11 +689,44 @@ VMs, one section per process so a VM-fatal panic truncates only its own block.
 Reconstructing it from the triple list is a morning's work, and the triple list
 is one `--dump-native-registry` away.
 
+### What lane C1 could not close
+
+Stated at the strength the evidence supports, because a residual that is not
+named is a residual nobody looks for.
+
+* **Nothing in the Closure section has been run in a binary yet** except the
+  rows marked EXECUTED. The tables are proved correct *as data* — replayed out
+  of the source against HotSpot over every code point, 0 mismatches — which is
+  not the same as proved correct *as a program*. `C1Verify.java` (276 checks,
+  green on HotSpot 25) is the vector for settling that in one run.
+* **`isUpperCase`/`isLowerCase` above the BMP are unmeasured.** The six pinned
+  code points came from a 65,536-point sweep, and no sweep has covered
+  `0x10000..0x10FFFF` for these two. `C1Verify` checks the population counts
+  (1978 / 2569 on HotSpot 25) precisely so that, if a supplementary skew exists,
+  the next run reports its size instead of hiding it.
+* **`toUpperCase`/`toLowerCase` above the BMP are unmeasured**, same reason —
+  the `(I)I` overloads are registered and reach code points no BMP sweep sees,
+  which is exactly the shape that hid the 390 supplementary digits.
+* **The `U+A7CE` family pins a toolchain Unicode version against JDK 25's.** It
+  is the only place in this file that encodes "these two tables are at different
+  Unicode versions" rather than "Java differs from Unicode". It stays correct
+  when the toolchain moves — the pinned answer is JDK 25's either way — but it
+  goes stale when the *JDK* moves, along with every other table here.
+* **`java.lang.String`'s seven code-point triples are untouched** (N6). The
+  `U+FFFD` in a `codePointAt` answer still says a value is crossing a
+  UTF-8/scalar-value boundary somewhere upstream.
+* **`Character.getType` is unshadowed and was measured correct** on all 65,536
+  BMP code points. It is the natural shared source of truth for this whole
+  family, and nothing here uses it; the tables are per-predicate instead. That
+  is the right call while these are `Intrinsic` (a general-category lookup plus
+  a per-predicate mask is slower than a range probe), but it is the reason the
+  table count is eleven rather than one.
+
 ## NOMINATIONS
 
 Lane B9 does not build. Every item below is an exact edit for someone who does.
 
-### N1 — VM-fatal. `floorDiv`/`floorMod` must wrap, not panic
+### N1 — (was VM-fatal) `floorDiv`/`floorMod` must wrap, not panic — **LANDED AND VERIFIED ON A BINARY 2026-08-12; kept for the reasoning, not as an open nomination**
 
 `native-builtins/src/lang_math.rs`, four bodies. Rust checks division overflow
 in *every* profile, so `a / b` and `a % b` on `i32`/`i64` must never be reached
@@ -497,6 +814,11 @@ unguarded `/` here.
 
 ### N2 — `Math.pow` must apply the JLS special-value table before `powf`
 
+**DONE and EXECUTED-verified** (`26e69258a`). Kept below for the reasoning. But
+see [Closure](#closure-lane-c1): the special values were the smaller half, and
+the `powi` fast path this nomination did not question was up to **44 ulp** out
+on ordinary numbers. That half is fixed and PREDICTED.
+
 `native-builtins/src/lang_math.rs`, in `native_math_pow` (declared at 1673),
 insert immediately before the existing fast-path
 `if a.is_finite() && b.is_finite() && b.fract() == 0.0 && b.abs() < 64.0 {`
@@ -527,6 +849,13 @@ fast path, which asserts that `powf` already does this. It is the reason
 nobody re-derived it.
 
 ### N3 — `Math.ulp` must not overflow at `MAX_VALUE`
+
+**DONE and EXECUTED-verified** (`5196e3aed`; `RJdkIntrinsics`'s `ulpAtTheTop()`
+asserts the `2^971` / `2^103` bits, so `CK ulp=9` is not a vacuous pass). The
+backward-step form below was additionally proved *equivalent to the JDK's
+exponent form* over all 4,294,967,296 `float` bit patterns, so no rewrite is
+owed. One refinement landed on top: the NaN arm is now `v.abs()`, the JDK's own
+expression, which keeps a NaN payload.
 
 `native-builtins/src/lang_math.rs:2678–2680` (`native_math_ulp_double`), old:
 
@@ -569,6 +898,23 @@ Both classes are fixed by these two edits — `StrictMath.ulp` shares the bodies
 
 ### N4 — the `Character` family needs Java's tables, and needs its duplicate removed
 
+**DONE.** The duplicate deletion is EXECUTED-verified (3837 → 1294 diverging BMP
+code points); the tables are written and PREDICTED (0 mismatches against
+HotSpot 25 over every code point when replayed out of the source, but not yet
+run in a binary). Two of this nomination's recommendations were **not** taken,
+and the reasons are measurements rather than preferences:
+
+* *"Simplest correct route: call the real JDK's `CharacterData` through
+  bytecode."* Rejected. These natives are registered in **both** modes, and
+  synthetic-JDK mode has no `CharacterData` to call — narrowing a registration
+  to the mode that has one drops it from the mode that does not, with no
+  fallback. Generated tables serve both.
+* *"`is_alphabetic() && !is_numeric()` … deliberately NOT applied."* Correct
+  call, and now quantified: even the *exact* delta
+  (`isAlphabetic && !isLetter`, 949 BMP) is 8 short of the measured 957, because
+  Rust's `Alphabetic` table and JDK 25's differ. Any derivation from Rust's
+  tables leaves an unnameable residual.
+
 Not a one-line fix, and it should be one lane, not seven patches:
 
 * `native_character_is_whitespace` (`lang_math.rs:3520`),
@@ -600,6 +946,12 @@ category's whole justification is speed, and if the bytecode is fast enough
 these natives should not exist.
 
 ### N5 — the `parse*` family must use Java's grammars
+
+**DONE and VERIFIED** (`26e69258a`). The acceptor was transliterated back out of
+the Rust and diffed against HotSpot over the named rows plus **800,000 fuzzed
+tokens**: 0 divergences. One caveat carried forward — `Character.digit` was
+handed to the `Character` lane by W7-99 and is now also done, but the two digit
+tables must stay separate; see [Closure](#closure-lane-c1).
 
 `native-builtins/src/lang_math.rs:3035` (`native_integer_parse_int`), old:
 

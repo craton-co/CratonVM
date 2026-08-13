@@ -138,6 +138,15 @@ cue that the call site arrived.
 
 ## NOMINATION 1 — the populator (one line, `http_url_connection.rs`)
 
+> **LANDED 2026-08-12 by lane C12**, as `STEP 0`, above STEP 1, with a source
+> witness pinning it there. Lane C12 also found that the `cipher` string this
+> block records was rustls's spelling (`TLS13_AES_256_GCM_SHA384`) and not
+> JSSE's (`TLS_AES_256_GCM_SHA384`) — i.e. the headline accessor would have
+> answered a name HotSpot never produces — and fixed it at the point of
+> production. See
+> `C12-2-https-session-capture-and-the-cipher-name-it-records.md`; the
+> `#[allow(dead_code)]` removal in `net_phase_e.rs` is nominated there.
+
 `huc_verify_hostname` already has the connection, the protocol, the cipher and
 the peer chain in scope at the same instant, and already builds an
 `SSLSession` from exactly those. It just discards them.
@@ -181,6 +190,17 @@ capture a session only for connections whose built-in name check FAILED — i.e.
 it would read green on the failure path and be dead on the success path.
 
 ## NOMINATION 2 — `java.util.Optional` has two incompatible synthetic layouts
+
+> **VERIFIED 2026-08-12 by lane C12, and it is worse than this section says.**
+> The line numbers are right, but the arity disagreement is a symptom: the
+> defect is that slot 0 holds an `int` presence FLAG, and on a real
+> `java.util.Optional` slot 0 **is** `value` — the reference `isPresent()`
+> tests for null and `get()` returns. `previousResponse()` (`http2.rs:2108`)
+> uses the correct 1-slot arity and still writes an `Int`, which is how we know
+> it is not about the layout. `Value::Int(0)` is not null to
+> `ref_operand_is_null`, so the empty case reads as PRESENT. Nine sites, a
+> measurement plan and the fix shape:
+> `C12-3-optional-value-slot-holds-an-int-flag.md`.
 
 Not this lane's defect and not measured; recorded because it was found while
 choosing a layout, and a wrong guess here is silent.

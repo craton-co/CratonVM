@@ -257,6 +257,22 @@ pub(super) fn execute_instruction(
                     }
                 },
             )?;
+            // JVMS §6.5 aastore fixes the order of the three checks:
+            // NullPointerException (done above, by `pop_object_ref_ctx_with`),
+            // THEN ArrayIndexOutOfBoundsException, THEN ArrayStoreException.
+            // The bounds test used to be nothing but `set_array_element`'s error
+            // return, which runs AFTER the covariance block below — so an
+            // out-of-range index with an incompatible value reported
+            // `ArrayStoreException` where HotSpot reports
+            // `ArrayIndexOutOfBoundsException` (measured: `RArrayStoreTiers` s15).
+            // `jit_aastore` already had this order; the interpreter did not.
+            // See docs/known-issues/jdk-only/W8-C10-1-typecheck-hatch-audit-and-aastore-precedence.md
+            {
+                let alen = shared.mem.heap.array_length(array_ref) as i32;
+                if index < 0 || index >= alen {
+                    return Err(RuntimeError::aioobe(index, alen).into());
+                }
+            }
             // JVMS §aastore covariance check: a reference store into an
             // Object[]-family array whose element's runtime type is NOT
             // assignment-compatible with the array's component type throws

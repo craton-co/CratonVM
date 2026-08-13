@@ -61,6 +61,26 @@ corpus_classpath() {
 # workload. Both arms get this directory.
 corpus_workdir() { echo "$1"; }
 
+# ...and the same directory is why the arms must not INHERIT each other's
+# files. The CratonVM arm runs first; whatever it leaves in `data/` is the
+# oracle's input. A carried-over store made `TestBackup` fail with
+# `MVStoreException: Chunk 2 not found` while all three arms are green run
+# alone (docs/known-issues/jdk-only/P4A-H2-DIVERGENCES-20260812.md §3c, and
+# C8-H2-TESTBACKUP-SHARED-WORKDIR-20260812.md). run-corpus.sh removes these
+# paths, relative to the workdir, before EACH arm.
+#
+# `data` is safe to delete and is confirmed scratch: H2's OWN .gitignore lists
+# it, and nothing on the classpath comes from it.
+#
+# DO NOT ADD `ext` HERE, and do not add anything else without checking the same
+# way. `ext/` is also in H2's .gitignore -- and it is where `corpus_classpath`
+# above gets every third-party jar. Declaring it would make the driver delete
+# the classpath before the first arm and produce ~200 identical
+# NoClassDefFoundErrors, which is exactly the shape that reads as a sweeping VM
+# regression. `temp` is a candidate (H2 tests write there too) but no run has
+# measured it carrying over, and an unmeasured entry here is a silent `rm -rf`.
+CORPUS_CLEAN_PATHS="data"
+
 # H2's own convention: a runnable test is a CONCRETE top-level class extending
 # TestBase or TestDb, each carrying its own `main`. Discovery therefore takes
 # an intersection of two sources, and needs both:

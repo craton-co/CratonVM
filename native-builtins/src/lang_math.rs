@@ -736,7 +736,12 @@ pub(crate) fn register_wrapper_natives(registry: &mut NativeMethodRegistry) {
         "java/lang/String",
         "codePoints",
         "()Ljava/util/stream/IntStream;",
-        native_string_chars, // Same as chars for BMP
+        // NOT "same as chars" — that was true only for the BMP, which is what
+        // the old comment said and why this went unnoticed. `chars()` yields
+        // UTF-16 code UNITS, so a supplementary character arrives as its two
+        // surrogates; `codePoints()` must pair them back into one code point.
+        // docs/known-issues/jdk-only/W7-95a-string-code-point-family.md
+        crate::lang_string::native_string_code_points,
     );
     registry.register(
         "java/lang/String",
@@ -1157,33 +1162,46 @@ pub(crate) fn register_wrapper_natives(registry: &mut NativeMethodRegistry) {
         "(C)Ljava/lang/String;",
         native_character_static_to_string,
     );
-    // Java 21: Character emoji detection methods
+    // Java 21: Character emoji detection methods.
+    //
+    // W7-95(C1). All five bodies used to be hand-written coarse ranges with
+    // comments like "basic emoji ranges" — whole blocks approximated rather
+    // than the property enumerated. Measured against HotSpot 25 over every code
+    // point `0..=0x10FFFF`, they were wrong on **2,746**:
+    //
+    //     isEmoji              1282 wrong  (1265 false positives, 17 misses)
+    //     isEmojiPresentation  1416 wrong  (1350 false positives, 66 misses)
+    //     isEmojiModifierBase    17 wrong  (all misses)
+    //     isEmojiComponent       31 wrong  (30 misses, 1 false positive)
+    //     isEmojiModifier         0 wrong  <- the one that was a real range
+    //
+    // The two the census had already caught (`isEmojiPresentation(U+2764)`
+    // true-for-false, `isEmojiComponent(U+1F1E6)` false-for-true) were not
+    // corner cases: `0x2600..=0x27BF` as "emoji presentation" claims 448 code
+    // points of which HotSpot agrees on 25. The tables below are the JDK's own
+    // answers; `isEmojiModifier` keeps a table too, so a future Unicode bump
+    // regenerates all five the same way instead of five different ways.
     registry.register("java/lang/Character", "isEmoji", "(I)Z", |_ctx, args| {
         let cp = match args.first() {
             Some(Value::Int(v)) => *v as u32,
             _ => 0,
         };
-        // Basic emoji ranges: emoticons, transport, misc symbols, dingbats, regional indicators
-        let is_emoji = matches!(cp,
-            0x231A..=0x231B | 0x23E9..=0x23F3 | 0x23F8..=0x23FA |
-            0x25AA..=0x25AB | 0x25B6 | 0x25C0 | 0x25FB..=0x25FE |
-            0x2600..=0x27BF | 0x2934..=0x2935 | 0x2B05..=0x2B07 |
-            0x2B1B..=0x2B1C | 0x2B50 | 0x2B55 | 0x3030 | 0x303D |
-            0x3297 | 0x3299 | 0x1F004 | 0x1F0CF |
-            0x1F170..=0x1F171 | 0x1F17E..=0x1F17F | 0x1F18E |
-            0x1F191..=0x1F19A | 0x1F1E0..=0x1F1FF |
-            0x1F200..=0x1F251 | 0x1F300..=0x1F9FF |
-            0x1FA00..=0x1FA6F | 0x1FA70..=0x1FAFF |
-            0x200D | 0xFE0F | 0x20E3 |
-            0x0023 | 0x002A | 0x0030..=0x0039
-        );
+        let is_emoji = in_code_point_runs(JAVA_EMOJI_RUNS, cp);
         Ok(Some(Value::Int(if is_emoji { 1 } else { 0 })))
     });
-    registry.register("java/lang/Character", "isEmojiPresentation", "(I)Z", |_ctx, args| {
-        let cp = match args.first() { Some(Value::Int(v)) => *v as u32, _ => 0 };
-        let is_ep = matches!(cp, 0x1F300..=0x1F9FF | 0x1FA00..=0x1FAFF | 0x2600..=0x26FF | 0x2700..=0x27BF);
-        Ok(Some(Value::Int(if is_ep { 1 } else { 0 })))
-    });
+    registry.register(
+        "java/lang/Character",
+        "isEmojiPresentation",
+        "(I)Z",
+        |_ctx, args| {
+            let cp = match args.first() {
+                Some(Value::Int(v)) => *v as u32,
+                _ => 0,
+            };
+            let is_ep = in_code_point_runs(JAVA_EMOJI_PRESENTATION_RUNS, cp);
+            Ok(Some(Value::Int(if is_ep { 1 } else { 0 })))
+        },
+    );
     registry.register(
         "java/lang/Character",
         "isEmojiModifier",
@@ -1193,23 +1211,23 @@ pub(crate) fn register_wrapper_natives(registry: &mut NativeMethodRegistry) {
                 Some(Value::Int(v)) => *v as u32,
                 _ => 0,
             };
-            let is_em = (0x1F3FB..=0x1F3FF).contains(&cp);
+            let is_em = in_code_point_runs(JAVA_EMOJI_MODIFIER_RUNS, cp);
             Ok(Some(Value::Int(if is_em { 1 } else { 0 })))
         },
     );
-    registry.register("java/lang/Character", "isEmojiModifierBase", "(I)Z", |_ctx, args| {
-        let cp = match args.first() { Some(Value::Int(v)) => *v as u32, _ => 0 };
-        let is_emb = matches!(cp, 0x261D | 0x26F9 | 0x270A..=0x270D | 0x1F385 | 0x1F3C2..=0x1F3C4 |
-            0x1F3C7 | 0x1F3CA..=0x1F3CC | 0x1F442..=0x1F443 | 0x1F446..=0x1F450 |
-            0x1F466..=0x1F478 | 0x1F47C | 0x1F481..=0x1F483 | 0x1F485..=0x1F487 |
-            0x1F4AA | 0x1F574..=0x1F575 | 0x1F57A | 0x1F590 | 0x1F595..=0x1F596 |
-            0x1F645..=0x1F647 | 0x1F64B..=0x1F64F | 0x1F6A3 | 0x1F6B4..=0x1F6B6 |
-            0x1F6C0 | 0x1F6CC | 0x1F90F | 0x1F918..=0x1F91F | 0x1F926 |
-            0x1F930..=0x1F939 | 0x1F93D..=0x1F93E | 0x1F9B5..=0x1F9B6 | 0x1F9B8..=0x1F9B9 |
-            0x1F9BB | 0x1F9CD..=0x1F9CF | 0x1F9D1..=0x1F9DD
-        );
-        Ok(Some(Value::Int(if is_emb { 1 } else { 0 })))
-    });
+    registry.register(
+        "java/lang/Character",
+        "isEmojiModifierBase",
+        "(I)Z",
+        |_ctx, args| {
+            let cp = match args.first() {
+                Some(Value::Int(v)) => *v as u32,
+                _ => 0,
+            };
+            let is_emb = in_code_point_runs(JAVA_EMOJI_MODIFIER_BASE_RUNS, cp);
+            Ok(Some(Value::Int(if is_emb { 1 } else { 0 })))
+        },
+    );
     registry.register(
         "java/lang/Character",
         "isEmojiComponent",
@@ -1219,8 +1237,7 @@ pub(crate) fn register_wrapper_natives(registry: &mut NativeMethodRegistry) {
                 Some(Value::Int(v)) => *v as u32,
                 _ => 0,
             };
-            let is_ec = matches!(cp, 0x200D | 0xFE0E..=0xFE0F | 0x20E3 | 0x1F3FB..=0x1F3FF |
-            0xE0020..=0xE007F | 0x0023 | 0x002A | 0x0030..=0x0039);
+            let is_ec = in_code_point_runs(JAVA_EMOJI_COMPONENT_RUNS, cp);
             Ok(Some(Value::Int(if is_ec { 1 } else { 0 })))
         },
     );
@@ -1701,19 +1718,43 @@ pub(crate) fn native_math_pow(_ctx: &mut dyn NativeContext, args: &[Value]) -> M
     if b.is_nan() || (b.is_infinite() && a.abs() == 1.0) {
         return Ok(Some(Value::Double(f64::NAN)));
     }
-    // HotSpot-style fast path: integer-valued exponent with finite base.
-    // - Gated on a.is_finite() && b.is_finite() so the remaining NaN/±infinity
-    //   edge cases fall through to powf, which agrees with the JLS on them
-    //   (pow(NaN, 0) == 1, pow(±0, neg) == ±inf, ...).
-    // - b.fract() == 0.0 ensures b is an exact integer (also false for NaN, but we already gated that).
-    // - |b| < 64 keeps powi cheap and avoids producing values that overflow to ±inf when powf
-    //   would have given a finite (but huge) result via continuous exponentiation.
-    // - Negative bases with integer exponents are fine: powi does repeated multiplication, which
-    //   matches Java's result for integer-valued b. Only fractional b on negative a yields NaN in
-    //   Java, and we route those through powf.
-    if a.is_finite() && b.is_finite() && b.fract() == 0.0 && b.abs() < 64.0 {
-        let bi = b as i32;
-        return Ok(Some(Value::Double(a.powi(bi))));
+    // W7-95(C1). THE FAST PATH USED TO BE `a.powi(b as i32)` FOR EVERY
+    // INTEGRAL `|b| < 64`, AND THAT BREAKS `Math.pow`'S ACCURACY CONTRACT.
+    //
+    // `Math.pow` promises "within 1 ulp of the exact result". `f64::powi` is
+    // binary exponentiation — up to eleven chained multiplications for `|b|`
+    // near 63 — and each one rounds. Measured against the EXACT power
+    // (`BigDecimal.pow` at 120 digits), 20,000 random bases per exponent:
+    //
+    //     |b|      worst error, ulp      cases over the 1-ulp bound
+    //       2            0.500                      0 / 20000
+    //      -2            1.439                    412 / 20000
+    //       3            1.228                    150 / 20000
+    //      -3            2.242                   1304 / 20000
+    //       4            1.852                   2787 / 20000
+    //       8            4.943                  10107 / 20000
+    //      16           10.420                  14939 / 20000
+    //      32           20.814                  17360 / 20000
+    //      63           44.321                  18682 / 20000
+    //
+    // HotSpot 25's `Math.pow` is within 0.503 ulp on every one of those same
+    // inputs, so each of these is also a straight differential divergence. The
+    // old comment called this "HotSpot-style"; HotSpot's C2 specialises
+    // `pow(x, 2)` and `pow(x, 0.5)`, not a 63-wide window.
+    //
+    // What survives is the one case that is provably exact: `a * a` is a
+    // SINGLE correctly-rounded multiply, hence the correctly-rounded square,
+    // hence 0.5 ulp — measured 0.500 worst, 0 violations. It needs no guard on
+    // `a`, because it is also right on the specials: `±inf * ±inf == +inf` and
+    // `-0.0 * -0.0 == +0.0` are exactly the JLS's answers for `pow(±inf, 2.0)`
+    // and `pow(-0.0, 2.0)`, and `NaN * NaN` is NaN.
+    //
+    // Everything else goes to `powf`, i.e. to the host libm — which is what
+    // the doc block at the head of this file says `Math` should use, on the
+    // grounds that libm already satisfies `Math`'s 1-ulp contract. `powi` was
+    // the one place that bypassed libm and the one place that did not.
+    if b == 2.0 {
+        return Ok(Some(Value::Double(a * a)));
     }
     Ok(Some(Value::Double(a.powf(b))))
 }
@@ -2728,10 +2769,17 @@ pub(crate) fn native_math_ulp_double(
         Some(Value::Double(v)) => *v,
         _ => 0.0,
     };
-    let result = if v.is_nan() {
-        f64::NAN
-    } else if v.is_infinite() {
-        f64::INFINITY
+    // W7-95(C1). The JDK's own `Math.ulp` answers `Math.abs(d)` for the whole
+    // `MAX_EXPONENT + 1` case — NaN and both infinities — which for a NaN
+    // PRESERVES ITS PAYLOAD and only clears the sign. Measured on HotSpot 25:
+    // `Math.ulp(0x7ff0000000000001)` is `0x7ff0000000000001`, not the canonical
+    // `0x7ff8000000000000` that `f64::NAN` would have produced, and
+    // `Math.ulp(0xfff8000000000000)` is `0x7ff8000000000000`. Only "is NaN" is
+    // specified, so this is fidelity rather than a contract — but `v.abs()` is
+    // both the JDK's expression and strictly closer to it, so there is no
+    // reason to write anything else.
+    let result = if v.is_nan() || v.is_infinite() {
+        v.abs()
     } else {
         let abs = v.abs();
         let bits = abs.to_bits();
@@ -2759,10 +2807,16 @@ pub(crate) fn native_math_ulp_float(
         Some(Value::Float(v)) => *v,
         _ => 0.0,
     };
-    let result = if v.is_nan() {
-        f32::NAN
-    } else if v.is_infinite() {
-        f32::INFINITY
+    // See `native_math_ulp_double`: `Math.abs(d)` is the JDK's answer for NaN
+    // and for both infinities, and it keeps a NaN payload.
+    //
+    // EXHAUSTIVELY VERIFIED, this width: all 4,294,967,296 `float` bit patterns
+    // were run through this algorithm and through `Math.ulp` on HotSpot 25 and
+    // compared as `floatToRawIntBits`. Every non-NaN pattern — 4,278,190,082 of
+    // them — already matched; the 16,777,212 that did not were exactly the
+    // non-canonical NaNs this change fixes.
+    let result = if v.is_nan() || v.is_infinite() {
+        v.abs()
     } else {
         let abs = v.abs();
         let bits = abs.to_bits();
@@ -3706,6 +3760,382 @@ pub(crate) fn native_boolean_value_of(
     Ok(Some(Value::Object(Some(obj))))
 }
 
+// ---------------------------------------------------------------------------
+// W7-95(C1) / W7-98 — java.lang.Character's tables are JAVA's, not Rust's.
+//
+// Every table below was GENERATED by walking `0..=0x10FFFF` on Microsoft
+// OpenJDK 25.0.3+9 and recording the maximal runs over which the JDK's own
+// answer holds, exactly as `JAVA_DIGIT_RUNS` above was. None of them is copied
+// from Unicode data files, so none of them can be a transcription of the wrong
+// Unicode version: the provenance is the oracle the differential is run
+// against.
+//
+// The reason this cannot be delegated to a Rust `char` method is that Java's
+// predicates are deliberately NOT Unicode's:
+//
+//   * `char::is_alphabetic` is the Unicode **Alphabetic** property, which is
+//     `L* u Nl u Other_Alphabetic`. `Character.isLetter` is exactly the five
+//     `L*` categories. Measured on JDK 25: 949 BMP and 1,731 total code points
+//     are Alphabetic and not letters — and the census measured **957** BMP
+//     disagreements against the shipping binary, so Rust's Alphabetic table
+//     and JDK 25's differ by eight code points on top of the definitional gap.
+//     Deriving `isLetter` as `is_alphabetic() && !delta` would therefore have
+//     left a residual that nothing in this tree can name. The direct table
+//     leaves none.
+//   * Rust has no emoji predicates at all; the five that were here were
+//     hand-written coarse ranges, and they were wrong on 2,746 code points.
+// ---------------------------------------------------------------------------
+
+/// Is `cp` inside one of a sorted, non-overlapping list of inclusive ranges?
+fn in_code_point_runs(runs: &[(u32, u32)], cp: u32) -> bool {
+    runs.binary_search_by(|&(lo, hi)| {
+        if hi < cp {
+            std::cmp::Ordering::Less
+        } else if lo > cp {
+            std::cmp::Ordering::Greater
+        } else {
+            std::cmp::Ordering::Equal
+        }
+    })
+    .is_ok()
+}
+
+/// The value a `(first, last, value_at_first)` run assigns to `cp`, where the
+/// value increases by one across the run.
+fn value_in_runs(runs: &[(u32, u32, i32)], cp: u32) -> Option<i32> {
+    runs.binary_search_by(|&(lo, hi, _)| {
+        if hi < cp {
+            std::cmp::Ordering::Less
+        } else if lo > cp {
+            std::cmp::Ordering::Greater
+        } else {
+            std::cmp::Ordering::Equal
+        }
+    })
+    .ok()
+    .map(|i| {
+        let (lo, _, base) = runs[i];
+        base + (cp - lo) as i32
+    })
+}
+
+/// `Character.isLetter` - the five `L*` general categories, over EVERY plane.
+/// 677 runs, 141028 code points.
+#[rustfmt::skip]
+const JAVA_LETTER_RUNS: &[(u32, u32)] = &[
+    (0x0041, 0x005A), (0x0061, 0x007A), (0x00AA, 0x00AA), (0x00B5, 0x00B5), (0x00BA, 0x00BA),
+    (0x00C0, 0x00D6), (0x00D8, 0x00F6), (0x00F8, 0x02C1), (0x02C6, 0x02D1), (0x02E0, 0x02E4),
+    (0x02EC, 0x02EC), (0x02EE, 0x02EE), (0x0370, 0x0374), (0x0376, 0x0377), (0x037A, 0x037D),
+    (0x037F, 0x037F), (0x0386, 0x0386), (0x0388, 0x038A), (0x038C, 0x038C), (0x038E, 0x03A1),
+    (0x03A3, 0x03F5), (0x03F7, 0x0481), (0x048A, 0x052F), (0x0531, 0x0556), (0x0559, 0x0559),
+    (0x0560, 0x0588), (0x05D0, 0x05EA), (0x05EF, 0x05F2), (0x0620, 0x064A), (0x066E, 0x066F),
+    (0x0671, 0x06D3), (0x06D5, 0x06D5), (0x06E5, 0x06E6), (0x06EE, 0x06EF), (0x06FA, 0x06FC),
+    (0x06FF, 0x06FF), (0x0710, 0x0710), (0x0712, 0x072F), (0x074D, 0x07A5), (0x07B1, 0x07B1),
+    (0x07CA, 0x07EA), (0x07F4, 0x07F5), (0x07FA, 0x07FA), (0x0800, 0x0815), (0x081A, 0x081A),
+    (0x0824, 0x0824), (0x0828, 0x0828), (0x0840, 0x0858), (0x0860, 0x086A), (0x0870, 0x0887),
+    (0x0889, 0x088E), (0x08A0, 0x08C9), (0x0904, 0x0939), (0x093D, 0x093D), (0x0950, 0x0950),
+    (0x0958, 0x0961), (0x0971, 0x0980), (0x0985, 0x098C), (0x098F, 0x0990), (0x0993, 0x09A8),
+    (0x09AA, 0x09B0), (0x09B2, 0x09B2), (0x09B6, 0x09B9), (0x09BD, 0x09BD), (0x09CE, 0x09CE),
+    (0x09DC, 0x09DD), (0x09DF, 0x09E1), (0x09F0, 0x09F1), (0x09FC, 0x09FC), (0x0A05, 0x0A0A),
+    (0x0A0F, 0x0A10), (0x0A13, 0x0A28), (0x0A2A, 0x0A30), (0x0A32, 0x0A33), (0x0A35, 0x0A36),
+    (0x0A38, 0x0A39), (0x0A59, 0x0A5C), (0x0A5E, 0x0A5E), (0x0A72, 0x0A74), (0x0A85, 0x0A8D),
+    (0x0A8F, 0x0A91), (0x0A93, 0x0AA8), (0x0AAA, 0x0AB0), (0x0AB2, 0x0AB3), (0x0AB5, 0x0AB9),
+    (0x0ABD, 0x0ABD), (0x0AD0, 0x0AD0), (0x0AE0, 0x0AE1), (0x0AF9, 0x0AF9), (0x0B05, 0x0B0C),
+    (0x0B0F, 0x0B10), (0x0B13, 0x0B28), (0x0B2A, 0x0B30), (0x0B32, 0x0B33), (0x0B35, 0x0B39),
+    (0x0B3D, 0x0B3D), (0x0B5C, 0x0B5D), (0x0B5F, 0x0B61), (0x0B71, 0x0B71), (0x0B83, 0x0B83),
+    (0x0B85, 0x0B8A), (0x0B8E, 0x0B90), (0x0B92, 0x0B95), (0x0B99, 0x0B9A), (0x0B9C, 0x0B9C),
+    (0x0B9E, 0x0B9F), (0x0BA3, 0x0BA4), (0x0BA8, 0x0BAA), (0x0BAE, 0x0BB9), (0x0BD0, 0x0BD0),
+    (0x0C05, 0x0C0C), (0x0C0E, 0x0C10), (0x0C12, 0x0C28), (0x0C2A, 0x0C39), (0x0C3D, 0x0C3D),
+    (0x0C58, 0x0C5A), (0x0C5D, 0x0C5D), (0x0C60, 0x0C61), (0x0C80, 0x0C80), (0x0C85, 0x0C8C),
+    (0x0C8E, 0x0C90), (0x0C92, 0x0CA8), (0x0CAA, 0x0CB3), (0x0CB5, 0x0CB9), (0x0CBD, 0x0CBD),
+    (0x0CDD, 0x0CDE), (0x0CE0, 0x0CE1), (0x0CF1, 0x0CF2), (0x0D04, 0x0D0C), (0x0D0E, 0x0D10),
+    (0x0D12, 0x0D3A), (0x0D3D, 0x0D3D), (0x0D4E, 0x0D4E), (0x0D54, 0x0D56), (0x0D5F, 0x0D61),
+    (0x0D7A, 0x0D7F), (0x0D85, 0x0D96), (0x0D9A, 0x0DB1), (0x0DB3, 0x0DBB), (0x0DBD, 0x0DBD),
+    (0x0DC0, 0x0DC6), (0x0E01, 0x0E30), (0x0E32, 0x0E33), (0x0E40, 0x0E46), (0x0E81, 0x0E82),
+    (0x0E84, 0x0E84), (0x0E86, 0x0E8A), (0x0E8C, 0x0EA3), (0x0EA5, 0x0EA5), (0x0EA7, 0x0EB0),
+    (0x0EB2, 0x0EB3), (0x0EBD, 0x0EBD), (0x0EC0, 0x0EC4), (0x0EC6, 0x0EC6), (0x0EDC, 0x0EDF),
+    (0x0F00, 0x0F00), (0x0F40, 0x0F47), (0x0F49, 0x0F6C), (0x0F88, 0x0F8C), (0x1000, 0x102A),
+    (0x103F, 0x103F), (0x1050, 0x1055), (0x105A, 0x105D), (0x1061, 0x1061), (0x1065, 0x1066),
+    (0x106E, 0x1070), (0x1075, 0x1081), (0x108E, 0x108E), (0x10A0, 0x10C5), (0x10C7, 0x10C7),
+    (0x10CD, 0x10CD), (0x10D0, 0x10FA), (0x10FC, 0x1248), (0x124A, 0x124D), (0x1250, 0x1256),
+    (0x1258, 0x1258), (0x125A, 0x125D), (0x1260, 0x1288), (0x128A, 0x128D), (0x1290, 0x12B0),
+    (0x12B2, 0x12B5), (0x12B8, 0x12BE), (0x12C0, 0x12C0), (0x12C2, 0x12C5), (0x12C8, 0x12D6),
+    (0x12D8, 0x1310), (0x1312, 0x1315), (0x1318, 0x135A), (0x1380, 0x138F), (0x13A0, 0x13F5),
+    (0x13F8, 0x13FD), (0x1401, 0x166C), (0x166F, 0x167F), (0x1681, 0x169A), (0x16A0, 0x16EA),
+    (0x16F1, 0x16F8), (0x1700, 0x1711), (0x171F, 0x1731), (0x1740, 0x1751), (0x1760, 0x176C),
+    (0x176E, 0x1770), (0x1780, 0x17B3), (0x17D7, 0x17D7), (0x17DC, 0x17DC), (0x1820, 0x1878),
+    (0x1880, 0x1884), (0x1887, 0x18A8), (0x18AA, 0x18AA), (0x18B0, 0x18F5), (0x1900, 0x191E),
+    (0x1950, 0x196D), (0x1970, 0x1974), (0x1980, 0x19AB), (0x19B0, 0x19C9), (0x1A00, 0x1A16),
+    (0x1A20, 0x1A54), (0x1AA7, 0x1AA7), (0x1B05, 0x1B33), (0x1B45, 0x1B4C), (0x1B83, 0x1BA0),
+    (0x1BAE, 0x1BAF), (0x1BBA, 0x1BE5), (0x1C00, 0x1C23), (0x1C4D, 0x1C4F), (0x1C5A, 0x1C7D),
+    (0x1C80, 0x1C8A), (0x1C90, 0x1CBA), (0x1CBD, 0x1CBF), (0x1CE9, 0x1CEC), (0x1CEE, 0x1CF3),
+    (0x1CF5, 0x1CF6), (0x1CFA, 0x1CFA), (0x1D00, 0x1DBF), (0x1E00, 0x1F15), (0x1F18, 0x1F1D),
+    (0x1F20, 0x1F45), (0x1F48, 0x1F4D), (0x1F50, 0x1F57), (0x1F59, 0x1F59), (0x1F5B, 0x1F5B),
+    (0x1F5D, 0x1F5D), (0x1F5F, 0x1F7D), (0x1F80, 0x1FB4), (0x1FB6, 0x1FBC), (0x1FBE, 0x1FBE),
+    (0x1FC2, 0x1FC4), (0x1FC6, 0x1FCC), (0x1FD0, 0x1FD3), (0x1FD6, 0x1FDB), (0x1FE0, 0x1FEC),
+    (0x1FF2, 0x1FF4), (0x1FF6, 0x1FFC), (0x2071, 0x2071), (0x207F, 0x207F), (0x2090, 0x209C),
+    (0x2102, 0x2102), (0x2107, 0x2107), (0x210A, 0x2113), (0x2115, 0x2115), (0x2119, 0x211D),
+    (0x2124, 0x2124), (0x2126, 0x2126), (0x2128, 0x2128), (0x212A, 0x212D), (0x212F, 0x2139),
+    (0x213C, 0x213F), (0x2145, 0x2149), (0x214E, 0x214E), (0x2183, 0x2184), (0x2C00, 0x2CE4),
+    (0x2CEB, 0x2CEE), (0x2CF2, 0x2CF3), (0x2D00, 0x2D25), (0x2D27, 0x2D27), (0x2D2D, 0x2D2D),
+    (0x2D30, 0x2D67), (0x2D6F, 0x2D6F), (0x2D80, 0x2D96), (0x2DA0, 0x2DA6), (0x2DA8, 0x2DAE),
+    (0x2DB0, 0x2DB6), (0x2DB8, 0x2DBE), (0x2DC0, 0x2DC6), (0x2DC8, 0x2DCE), (0x2DD0, 0x2DD6),
+    (0x2DD8, 0x2DDE), (0x2E2F, 0x2E2F), (0x3005, 0x3006), (0x3031, 0x3035), (0x303B, 0x303C),
+    (0x3041, 0x3096), (0x309D, 0x309F), (0x30A1, 0x30FA), (0x30FC, 0x30FF), (0x3105, 0x312F),
+    (0x3131, 0x318E), (0x31A0, 0x31BF), (0x31F0, 0x31FF), (0x3400, 0x4DBF), (0x4E00, 0xA48C),
+    (0xA4D0, 0xA4FD), (0xA500, 0xA60C), (0xA610, 0xA61F), (0xA62A, 0xA62B), (0xA640, 0xA66E),
+    (0xA67F, 0xA69D), (0xA6A0, 0xA6E5), (0xA717, 0xA71F), (0xA722, 0xA788), (0xA78B, 0xA7CD),
+    (0xA7D0, 0xA7D1), (0xA7D3, 0xA7D3), (0xA7D5, 0xA7DC), (0xA7F2, 0xA801), (0xA803, 0xA805),
+    (0xA807, 0xA80A), (0xA80C, 0xA822), (0xA840, 0xA873), (0xA882, 0xA8B3), (0xA8F2, 0xA8F7),
+    (0xA8FB, 0xA8FB), (0xA8FD, 0xA8FE), (0xA90A, 0xA925), (0xA930, 0xA946), (0xA960, 0xA97C),
+    (0xA984, 0xA9B2), (0xA9CF, 0xA9CF), (0xA9E0, 0xA9E4), (0xA9E6, 0xA9EF), (0xA9FA, 0xA9FE),
+    (0xAA00, 0xAA28), (0xAA40, 0xAA42), (0xAA44, 0xAA4B), (0xAA60, 0xAA76), (0xAA7A, 0xAA7A),
+    (0xAA7E, 0xAAAF), (0xAAB1, 0xAAB1), (0xAAB5, 0xAAB6), (0xAAB9, 0xAABD), (0xAAC0, 0xAAC0),
+    (0xAAC2, 0xAAC2), (0xAADB, 0xAADD), (0xAAE0, 0xAAEA), (0xAAF2, 0xAAF4), (0xAB01, 0xAB06),
+    (0xAB09, 0xAB0E), (0xAB11, 0xAB16), (0xAB20, 0xAB26), (0xAB28, 0xAB2E), (0xAB30, 0xAB5A),
+    (0xAB5C, 0xAB69), (0xAB70, 0xABE2), (0xAC00, 0xD7A3), (0xD7B0, 0xD7C6), (0xD7CB, 0xD7FB),
+    (0xF900, 0xFA6D), (0xFA70, 0xFAD9), (0xFB00, 0xFB06), (0xFB13, 0xFB17), (0xFB1D, 0xFB1D),
+    (0xFB1F, 0xFB28), (0xFB2A, 0xFB36), (0xFB38, 0xFB3C), (0xFB3E, 0xFB3E), (0xFB40, 0xFB41),
+    (0xFB43, 0xFB44), (0xFB46, 0xFBB1), (0xFBD3, 0xFD3D), (0xFD50, 0xFD8F), (0xFD92, 0xFDC7),
+    (0xFDF0, 0xFDFB), (0xFE70, 0xFE74), (0xFE76, 0xFEFC), (0xFF21, 0xFF3A), (0xFF41, 0xFF5A),
+    (0xFF66, 0xFFBE), (0xFFC2, 0xFFC7), (0xFFCA, 0xFFCF), (0xFFD2, 0xFFD7), (0xFFDA, 0xFFDC),
+    (0x10000, 0x1000B), (0x1000D, 0x10026), (0x10028, 0x1003A), (0x1003C, 0x1003D),
+    (0x1003F, 0x1004D), (0x10050, 0x1005D), (0x10080, 0x100FA), (0x10280, 0x1029C),
+    (0x102A0, 0x102D0), (0x10300, 0x1031F), (0x1032D, 0x10340), (0x10342, 0x10349),
+    (0x10350, 0x10375), (0x10380, 0x1039D), (0x103A0, 0x103C3), (0x103C8, 0x103CF),
+    (0x10400, 0x1049D), (0x104B0, 0x104D3), (0x104D8, 0x104FB), (0x10500, 0x10527),
+    (0x10530, 0x10563), (0x10570, 0x1057A), (0x1057C, 0x1058A), (0x1058C, 0x10592),
+    (0x10594, 0x10595), (0x10597, 0x105A1), (0x105A3, 0x105B1), (0x105B3, 0x105B9),
+    (0x105BB, 0x105BC), (0x105C0, 0x105F3), (0x10600, 0x10736), (0x10740, 0x10755),
+    (0x10760, 0x10767), (0x10780, 0x10785), (0x10787, 0x107B0), (0x107B2, 0x107BA),
+    (0x10800, 0x10805), (0x10808, 0x10808), (0x1080A, 0x10835), (0x10837, 0x10838),
+    (0x1083C, 0x1083C), (0x1083F, 0x10855), (0x10860, 0x10876), (0x10880, 0x1089E),
+    (0x108E0, 0x108F2), (0x108F4, 0x108F5), (0x10900, 0x10915), (0x10920, 0x10939),
+    (0x10980, 0x109B7), (0x109BE, 0x109BF), (0x10A00, 0x10A00), (0x10A10, 0x10A13),
+    (0x10A15, 0x10A17), (0x10A19, 0x10A35), (0x10A60, 0x10A7C), (0x10A80, 0x10A9C),
+    (0x10AC0, 0x10AC7), (0x10AC9, 0x10AE4), (0x10B00, 0x10B35), (0x10B40, 0x10B55),
+    (0x10B60, 0x10B72), (0x10B80, 0x10B91), (0x10C00, 0x10C48), (0x10C80, 0x10CB2),
+    (0x10CC0, 0x10CF2), (0x10D00, 0x10D23), (0x10D4A, 0x10D65), (0x10D6F, 0x10D85),
+    (0x10E80, 0x10EA9), (0x10EB0, 0x10EB1), (0x10EC2, 0x10EC4), (0x10F00, 0x10F1C),
+    (0x10F27, 0x10F27), (0x10F30, 0x10F45), (0x10F70, 0x10F81), (0x10FB0, 0x10FC4),
+    (0x10FE0, 0x10FF6), (0x11003, 0x11037), (0x11071, 0x11072), (0x11075, 0x11075),
+    (0x11083, 0x110AF), (0x110D0, 0x110E8), (0x11103, 0x11126), (0x11144, 0x11144),
+    (0x11147, 0x11147), (0x11150, 0x11172), (0x11176, 0x11176), (0x11183, 0x111B2),
+    (0x111C1, 0x111C4), (0x111DA, 0x111DA), (0x111DC, 0x111DC), (0x11200, 0x11211),
+    (0x11213, 0x1122B), (0x1123F, 0x11240), (0x11280, 0x11286), (0x11288, 0x11288),
+    (0x1128A, 0x1128D), (0x1128F, 0x1129D), (0x1129F, 0x112A8), (0x112B0, 0x112DE),
+    (0x11305, 0x1130C), (0x1130F, 0x11310), (0x11313, 0x11328), (0x1132A, 0x11330),
+    (0x11332, 0x11333), (0x11335, 0x11339), (0x1133D, 0x1133D), (0x11350, 0x11350),
+    (0x1135D, 0x11361), (0x11380, 0x11389), (0x1138B, 0x1138B), (0x1138E, 0x1138E),
+    (0x11390, 0x113B5), (0x113B7, 0x113B7), (0x113D1, 0x113D1), (0x113D3, 0x113D3),
+    (0x11400, 0x11434), (0x11447, 0x1144A), (0x1145F, 0x11461), (0x11480, 0x114AF),
+    (0x114C4, 0x114C5), (0x114C7, 0x114C7), (0x11580, 0x115AE), (0x115D8, 0x115DB),
+    (0x11600, 0x1162F), (0x11644, 0x11644), (0x11680, 0x116AA), (0x116B8, 0x116B8),
+    (0x11700, 0x1171A), (0x11740, 0x11746), (0x11800, 0x1182B), (0x118A0, 0x118DF),
+    (0x118FF, 0x11906), (0x11909, 0x11909), (0x1190C, 0x11913), (0x11915, 0x11916),
+    (0x11918, 0x1192F), (0x1193F, 0x1193F), (0x11941, 0x11941), (0x119A0, 0x119A7),
+    (0x119AA, 0x119D0), (0x119E1, 0x119E1), (0x119E3, 0x119E3), (0x11A00, 0x11A00),
+    (0x11A0B, 0x11A32), (0x11A3A, 0x11A3A), (0x11A50, 0x11A50), (0x11A5C, 0x11A89),
+    (0x11A9D, 0x11A9D), (0x11AB0, 0x11AF8), (0x11BC0, 0x11BE0), (0x11C00, 0x11C08),
+    (0x11C0A, 0x11C2E), (0x11C40, 0x11C40), (0x11C72, 0x11C8F), (0x11D00, 0x11D06),
+    (0x11D08, 0x11D09), (0x11D0B, 0x11D30), (0x11D46, 0x11D46), (0x11D60, 0x11D65),
+    (0x11D67, 0x11D68), (0x11D6A, 0x11D89), (0x11D98, 0x11D98), (0x11EE0, 0x11EF2),
+    (0x11F02, 0x11F02), (0x11F04, 0x11F10), (0x11F12, 0x11F33), (0x11FB0, 0x11FB0),
+    (0x12000, 0x12399), (0x12480, 0x12543), (0x12F90, 0x12FF0), (0x13000, 0x1342F),
+    (0x13441, 0x13446), (0x13460, 0x143FA), (0x14400, 0x14646), (0x16100, 0x1611D),
+    (0x16800, 0x16A38), (0x16A40, 0x16A5E), (0x16A70, 0x16ABE), (0x16AD0, 0x16AED),
+    (0x16B00, 0x16B2F), (0x16B40, 0x16B43), (0x16B63, 0x16B77), (0x16B7D, 0x16B8F),
+    (0x16D40, 0x16D6C), (0x16E40, 0x16E7F), (0x16F00, 0x16F4A), (0x16F50, 0x16F50),
+    (0x16F93, 0x16F9F), (0x16FE0, 0x16FE1), (0x16FE3, 0x16FE3), (0x17000, 0x187F7),
+    (0x18800, 0x18CD5), (0x18CFF, 0x18D08), (0x1AFF0, 0x1AFF3), (0x1AFF5, 0x1AFFB),
+    (0x1AFFD, 0x1AFFE), (0x1B000, 0x1B122), (0x1B132, 0x1B132), (0x1B150, 0x1B152),
+    (0x1B155, 0x1B155), (0x1B164, 0x1B167), (0x1B170, 0x1B2FB), (0x1BC00, 0x1BC6A),
+    (0x1BC70, 0x1BC7C), (0x1BC80, 0x1BC88), (0x1BC90, 0x1BC99), (0x1D400, 0x1D454),
+    (0x1D456, 0x1D49C), (0x1D49E, 0x1D49F), (0x1D4A2, 0x1D4A2), (0x1D4A5, 0x1D4A6),
+    (0x1D4A9, 0x1D4AC), (0x1D4AE, 0x1D4B9), (0x1D4BB, 0x1D4BB), (0x1D4BD, 0x1D4C3),
+    (0x1D4C5, 0x1D505), (0x1D507, 0x1D50A), (0x1D50D, 0x1D514), (0x1D516, 0x1D51C),
+    (0x1D51E, 0x1D539), (0x1D53B, 0x1D53E), (0x1D540, 0x1D544), (0x1D546, 0x1D546),
+    (0x1D54A, 0x1D550), (0x1D552, 0x1D6A5), (0x1D6A8, 0x1D6C0), (0x1D6C2, 0x1D6DA),
+    (0x1D6DC, 0x1D6FA), (0x1D6FC, 0x1D714), (0x1D716, 0x1D734), (0x1D736, 0x1D74E),
+    (0x1D750, 0x1D76E), (0x1D770, 0x1D788), (0x1D78A, 0x1D7A8), (0x1D7AA, 0x1D7C2),
+    (0x1D7C4, 0x1D7CB), (0x1DF00, 0x1DF1E), (0x1DF25, 0x1DF2A), (0x1E030, 0x1E06D),
+    (0x1E100, 0x1E12C), (0x1E137, 0x1E13D), (0x1E14E, 0x1E14E), (0x1E290, 0x1E2AD),
+    (0x1E2C0, 0x1E2EB), (0x1E4D0, 0x1E4EB), (0x1E5D0, 0x1E5ED), (0x1E5F0, 0x1E5F0),
+    (0x1E7E0, 0x1E7E6), (0x1E7E8, 0x1E7EB), (0x1E7ED, 0x1E7EE), (0x1E7F0, 0x1E7FE),
+    (0x1E800, 0x1E8C4), (0x1E900, 0x1E943), (0x1E94B, 0x1E94B), (0x1EE00, 0x1EE03),
+    (0x1EE05, 0x1EE1F), (0x1EE21, 0x1EE22), (0x1EE24, 0x1EE24), (0x1EE27, 0x1EE27),
+    (0x1EE29, 0x1EE32), (0x1EE34, 0x1EE37), (0x1EE39, 0x1EE39), (0x1EE3B, 0x1EE3B),
+    (0x1EE42, 0x1EE42), (0x1EE47, 0x1EE47), (0x1EE49, 0x1EE49), (0x1EE4B, 0x1EE4B),
+    (0x1EE4D, 0x1EE4F), (0x1EE51, 0x1EE52), (0x1EE54, 0x1EE54), (0x1EE57, 0x1EE57),
+    (0x1EE59, 0x1EE59), (0x1EE5B, 0x1EE5B), (0x1EE5D, 0x1EE5D), (0x1EE5F, 0x1EE5F),
+    (0x1EE61, 0x1EE62), (0x1EE64, 0x1EE64), (0x1EE67, 0x1EE6A), (0x1EE6C, 0x1EE72),
+    (0x1EE74, 0x1EE77), (0x1EE79, 0x1EE7C), (0x1EE7E, 0x1EE7E), (0x1EE80, 0x1EE89),
+    (0x1EE8B, 0x1EE9B), (0x1EEA1, 0x1EEA3), (0x1EEA5, 0x1EEA9), (0x1EEAB, 0x1EEBB),
+    (0x20000, 0x2A6DF), (0x2A700, 0x2B739), (0x2B740, 0x2B81D), (0x2B820, 0x2CEA1),
+    (0x2CEB0, 0x2EBE0), (0x2EBF0, 0x2EE5D), (0x2F800, 0x2FA1D), (0x30000, 0x3134A),
+    (0x31350, 0x323AF),
+];
+
+/// `Character.isEmoji`. 150 runs, 1431 code points.
+#[rustfmt::skip]
+const JAVA_EMOJI_RUNS: &[(u32, u32)] = &[
+    (0x0023, 0x0023), (0x002A, 0x002A), (0x0030, 0x0039), (0x00A9, 0x00A9), (0x00AE, 0x00AE),
+    (0x203C, 0x203C), (0x2049, 0x2049), (0x2122, 0x2122), (0x2139, 0x2139), (0x2194, 0x2199),
+    (0x21A9, 0x21AA), (0x231A, 0x231B), (0x2328, 0x2328), (0x23CF, 0x23CF), (0x23E9, 0x23F3),
+    (0x23F8, 0x23FA), (0x24C2, 0x24C2), (0x25AA, 0x25AB), (0x25B6, 0x25B6), (0x25C0, 0x25C0),
+    (0x25FB, 0x25FE), (0x2600, 0x2604), (0x260E, 0x260E), (0x2611, 0x2611), (0x2614, 0x2615),
+    (0x2618, 0x2618), (0x261D, 0x261D), (0x2620, 0x2620), (0x2622, 0x2623), (0x2626, 0x2626),
+    (0x262A, 0x262A), (0x262E, 0x262F), (0x2638, 0x263A), (0x2640, 0x2640), (0x2642, 0x2642),
+    (0x2648, 0x2653), (0x265F, 0x2660), (0x2663, 0x2663), (0x2665, 0x2666), (0x2668, 0x2668),
+    (0x267B, 0x267B), (0x267E, 0x267F), (0x2692, 0x2697), (0x2699, 0x2699), (0x269B, 0x269C),
+    (0x26A0, 0x26A1), (0x26A7, 0x26A7), (0x26AA, 0x26AB), (0x26B0, 0x26B1), (0x26BD, 0x26BE),
+    (0x26C4, 0x26C5), (0x26C8, 0x26C8), (0x26CE, 0x26CF), (0x26D1, 0x26D1), (0x26D3, 0x26D4),
+    (0x26E9, 0x26EA), (0x26F0, 0x26F5), (0x26F7, 0x26FA), (0x26FD, 0x26FD), (0x2702, 0x2702),
+    (0x2705, 0x2705), (0x2708, 0x270D), (0x270F, 0x270F), (0x2712, 0x2712), (0x2714, 0x2714),
+    (0x2716, 0x2716), (0x271D, 0x271D), (0x2721, 0x2721), (0x2728, 0x2728), (0x2733, 0x2734),
+    (0x2744, 0x2744), (0x2747, 0x2747), (0x274C, 0x274C), (0x274E, 0x274E), (0x2753, 0x2755),
+    (0x2757, 0x2757), (0x2763, 0x2764), (0x2795, 0x2797), (0x27A1, 0x27A1), (0x27B0, 0x27B0),
+    (0x27BF, 0x27BF), (0x2934, 0x2935), (0x2B05, 0x2B07), (0x2B1B, 0x2B1C), (0x2B50, 0x2B50),
+    (0x2B55, 0x2B55), (0x3030, 0x3030), (0x303D, 0x303D), (0x3297, 0x3297), (0x3299, 0x3299),
+    (0x1F004, 0x1F004), (0x1F0CF, 0x1F0CF), (0x1F170, 0x1F171), (0x1F17E, 0x1F17F),
+    (0x1F18E, 0x1F18E), (0x1F191, 0x1F19A), (0x1F1E6, 0x1F1FF), (0x1F201, 0x1F202),
+    (0x1F21A, 0x1F21A), (0x1F22F, 0x1F22F), (0x1F232, 0x1F23A), (0x1F250, 0x1F251),
+    (0x1F300, 0x1F321), (0x1F324, 0x1F393), (0x1F396, 0x1F397), (0x1F399, 0x1F39B),
+    (0x1F39E, 0x1F3F0), (0x1F3F3, 0x1F3F5), (0x1F3F7, 0x1F4FD), (0x1F4FF, 0x1F53D),
+    (0x1F549, 0x1F54E), (0x1F550, 0x1F567), (0x1F56F, 0x1F570), (0x1F573, 0x1F57A),
+    (0x1F587, 0x1F587), (0x1F58A, 0x1F58D), (0x1F590, 0x1F590), (0x1F595, 0x1F596),
+    (0x1F5A4, 0x1F5A5), (0x1F5A8, 0x1F5A8), (0x1F5B1, 0x1F5B2), (0x1F5BC, 0x1F5BC),
+    (0x1F5C2, 0x1F5C4), (0x1F5D1, 0x1F5D3), (0x1F5DC, 0x1F5DE), (0x1F5E1, 0x1F5E1),
+    (0x1F5E3, 0x1F5E3), (0x1F5E8, 0x1F5E8), (0x1F5EF, 0x1F5EF), (0x1F5F3, 0x1F5F3),
+    (0x1F5FA, 0x1F64F), (0x1F680, 0x1F6C5), (0x1F6CB, 0x1F6D2), (0x1F6D5, 0x1F6D7),
+    (0x1F6DC, 0x1F6E5), (0x1F6E9, 0x1F6E9), (0x1F6EB, 0x1F6EC), (0x1F6F0, 0x1F6F0),
+    (0x1F6F3, 0x1F6FC), (0x1F7E0, 0x1F7EB), (0x1F7F0, 0x1F7F0), (0x1F90C, 0x1F93A),
+    (0x1F93C, 0x1F945), (0x1F947, 0x1F9FF), (0x1FA70, 0x1FA7C), (0x1FA80, 0x1FA89),
+    (0x1FA8F, 0x1FAC6), (0x1FACE, 0x1FADC), (0x1FADF, 0x1FAE9), (0x1FAF0, 0x1FAF8),
+];
+
+/// `Character.isEmojiPresentation`. 80 runs, 1212 code points.
+#[rustfmt::skip]
+const JAVA_EMOJI_PRESENTATION_RUNS: &[(u32, u32)] = &[
+    (0x231A, 0x231B), (0x23E9, 0x23EC), (0x23F0, 0x23F0), (0x23F3, 0x23F3), (0x25FD, 0x25FE),
+    (0x2614, 0x2615), (0x2648, 0x2653), (0x267F, 0x267F), (0x2693, 0x2693), (0x26A1, 0x26A1),
+    (0x26AA, 0x26AB), (0x26BD, 0x26BE), (0x26C4, 0x26C5), (0x26CE, 0x26CE), (0x26D4, 0x26D4),
+    (0x26EA, 0x26EA), (0x26F2, 0x26F3), (0x26F5, 0x26F5), (0x26FA, 0x26FA), (0x26FD, 0x26FD),
+    (0x2705, 0x2705), (0x270A, 0x270B), (0x2728, 0x2728), (0x274C, 0x274C), (0x274E, 0x274E),
+    (0x2753, 0x2755), (0x2757, 0x2757), (0x2795, 0x2797), (0x27B0, 0x27B0), (0x27BF, 0x27BF),
+    (0x2B1B, 0x2B1C), (0x2B50, 0x2B50), (0x2B55, 0x2B55), (0x1F004, 0x1F004),
+    (0x1F0CF, 0x1F0CF), (0x1F18E, 0x1F18E), (0x1F191, 0x1F19A), (0x1F1E6, 0x1F1FF),
+    (0x1F201, 0x1F201), (0x1F21A, 0x1F21A), (0x1F22F, 0x1F22F), (0x1F232, 0x1F236),
+    (0x1F238, 0x1F23A), (0x1F250, 0x1F251), (0x1F300, 0x1F320), (0x1F32D, 0x1F335),
+    (0x1F337, 0x1F37C), (0x1F37E, 0x1F393), (0x1F3A0, 0x1F3CA), (0x1F3CF, 0x1F3D3),
+    (0x1F3E0, 0x1F3F0), (0x1F3F4, 0x1F3F4), (0x1F3F8, 0x1F43E), (0x1F440, 0x1F440),
+    (0x1F442, 0x1F4FC), (0x1F4FF, 0x1F53D), (0x1F54B, 0x1F54E), (0x1F550, 0x1F567),
+    (0x1F57A, 0x1F57A), (0x1F595, 0x1F596), (0x1F5A4, 0x1F5A4), (0x1F5FB, 0x1F64F),
+    (0x1F680, 0x1F6C5), (0x1F6CC, 0x1F6CC), (0x1F6D0, 0x1F6D2), (0x1F6D5, 0x1F6D7),
+    (0x1F6DC, 0x1F6DF), (0x1F6EB, 0x1F6EC), (0x1F6F4, 0x1F6FC), (0x1F7E0, 0x1F7EB),
+    (0x1F7F0, 0x1F7F0), (0x1F90C, 0x1F93A), (0x1F93C, 0x1F945), (0x1F947, 0x1F9FF),
+    (0x1FA70, 0x1FA7C), (0x1FA80, 0x1FA89), (0x1FA8F, 0x1FAC6), (0x1FACE, 0x1FADC),
+    (0x1FADF, 0x1FAE9), (0x1FAF0, 0x1FAF8),
+];
+
+/// `Character.isEmojiModifier`. 1 run, 5 code points.
+#[rustfmt::skip]
+const JAVA_EMOJI_MODIFIER_RUNS: &[(u32, u32)] = &[(0x1F3FB, 0x1F3FF)];
+
+/// `Character.isEmojiModifierBase`. 40 runs, 134 code points.
+#[rustfmt::skip]
+const JAVA_EMOJI_MODIFIER_BASE_RUNS: &[(u32, u32)] = &[
+    (0x261D, 0x261D), (0x26F9, 0x26F9), (0x270A, 0x270D), (0x1F385, 0x1F385),
+    (0x1F3C2, 0x1F3C4), (0x1F3C7, 0x1F3C7), (0x1F3CA, 0x1F3CC), (0x1F442, 0x1F443),
+    (0x1F446, 0x1F450), (0x1F466, 0x1F478), (0x1F47C, 0x1F47C), (0x1F481, 0x1F483),
+    (0x1F485, 0x1F487), (0x1F48F, 0x1F48F), (0x1F491, 0x1F491), (0x1F4AA, 0x1F4AA),
+    (0x1F574, 0x1F575), (0x1F57A, 0x1F57A), (0x1F590, 0x1F590), (0x1F595, 0x1F596),
+    (0x1F645, 0x1F647), (0x1F64B, 0x1F64F), (0x1F6A3, 0x1F6A3), (0x1F6B4, 0x1F6B6),
+    (0x1F6C0, 0x1F6C0), (0x1F6CC, 0x1F6CC), (0x1F90C, 0x1F90C), (0x1F90F, 0x1F90F),
+    (0x1F918, 0x1F91F), (0x1F926, 0x1F926), (0x1F930, 0x1F939), (0x1F93C, 0x1F93E),
+    (0x1F977, 0x1F977), (0x1F9B5, 0x1F9B6), (0x1F9B8, 0x1F9B9), (0x1F9BB, 0x1F9BB),
+    (0x1F9CD, 0x1F9CF), (0x1F9D1, 0x1F9DD), (0x1FAC3, 0x1FAC5), (0x1FAF0, 0x1FAF8),
+];
+
+/// `Character.isEmojiComponent`. 10 runs, 146 code points.
+#[rustfmt::skip]
+const JAVA_EMOJI_COMPONENT_RUNS: &[(u32, u32)] = &[
+    (0x0023, 0x0023), (0x002A, 0x002A), (0x0030, 0x0039), (0x200D, 0x200D), (0x20E3, 0x20E3),
+    (0xFE0F, 0xFE0F), (0x1F1E6, 0x1F1FF), (0x1F3FB, 0x1F3FF), (0x1F9B0, 0x1F9B3),
+    (0xE0020, 0xE007F),
+];
+
+/// The SUPPLEMENTARY decimal digits, which `JAVA_DIGIT_RUNS` deliberately omits.
+///
+/// The two tables serve different callers and must not be merged.
+/// `JAVA_DIGIT_RUNS` backs `Integer.parseInt` and `Character.digit(char, int)`,
+/// which walk UTF-16 code UNITS — a supplementary digit reaches them as a lone
+/// surrogate and correctly matches nothing (measured on JDK 25:
+/// `Integer.parseInt(new String(Character.toChars(0x104A0)))` throws even though
+/// `Character.digit(0x104A0, 10) == 0`). This table backs only the code-POINT
+/// overloads, where the JDK really does answer for them.
+/// 39 runs, 390 code points.
+#[rustfmt::skip]
+const JAVA_SUPPLEMENTARY_DIGIT_RUNS: &[(u32, u32)] = &[
+    (0x104A0, 0x104A9), (0x10D30, 0x10D39), (0x10D40, 0x10D49), (0x11066, 0x1106F),
+    (0x110F0, 0x110F9), (0x11136, 0x1113F), (0x111D0, 0x111D9), (0x112F0, 0x112F9),
+    (0x11450, 0x11459), (0x114D0, 0x114D9), (0x11650, 0x11659), (0x116C0, 0x116C9),
+    (0x116D0, 0x116D9), (0x116DA, 0x116E3), (0x11730, 0x11739), (0x118E0, 0x118E9),
+    (0x11950, 0x11959), (0x11BF0, 0x11BF9), (0x11C50, 0x11C59), (0x11D50, 0x11D59),
+    (0x11DA0, 0x11DA9), (0x11F50, 0x11F59), (0x16130, 0x16139), (0x16A60, 0x16A69),
+    (0x16AC0, 0x16AC9), (0x16B50, 0x16B59), (0x16D70, 0x16D79), (0x1CCF0, 0x1CCF9),
+    (0x1D7CE, 0x1D7D7), (0x1D7D8, 0x1D7E1), (0x1D7E2, 0x1D7EB), (0x1D7EC, 0x1D7F5),
+    (0x1D7F6, 0x1D7FF), (0x1E140, 0x1E149), (0x1E2F0, 0x1E2F9), (0x1E4F0, 0x1E4F9),
+    (0x1E5F1, 0x1E5FA), (0x1E950, 0x1E959), (0x1FBF0, 0x1FBF9),
+];
+
+/// `Character.getNumericValue(char)`, BMP only because only `(C)I` is
+/// registered. 123 runs; every value increases by one across its run.
+#[rustfmt::skip]
+const JAVA_NUMERIC_VALUE_RUNS: &[(u32, u32, i32)] = &[
+    (0x0030, 0x0039, 0), (0x0041, 0x005A, 10), (0x0061, 0x007A, 10), (0x00B2, 0x00B3, 2),
+    (0x00B9, 0x00B9, 1), (0x0660, 0x0669, 0), (0x06F0, 0x06F9, 0), (0x07C0, 0x07C9, 0),
+    (0x0966, 0x096F, 0), (0x09E6, 0x09EF, 0), (0x09F9, 0x09F9, 16), (0x0A66, 0x0A6F, 0),
+    (0x0AE6, 0x0AEF, 0), (0x0B66, 0x0B6F, 0), (0x0BE6, 0x0BF0, 0), (0x0BF1, 0x0BF1, 100),
+    (0x0BF2, 0x0BF2, 1000), (0x0C66, 0x0C6F, 0), (0x0C78, 0x0C7B, 0), (0x0C7C, 0x0C7E, 1),
+    (0x0CE6, 0x0CEF, 0), (0x0D66, 0x0D70, 0), (0x0D71, 0x0D71, 100), (0x0D72, 0x0D72, 1000),
+    (0x0DE6, 0x0DEF, 0), (0x0E50, 0x0E59, 0), (0x0ED0, 0x0ED9, 0), (0x0F20, 0x0F29, 0),
+    (0x1040, 0x1049, 0), (0x1090, 0x1099, 0), (0x1369, 0x1372, 1), (0x1373, 0x1373, 20),
+    (0x1374, 0x1374, 30), (0x1375, 0x1375, 40), (0x1376, 0x1376, 50), (0x1377, 0x1377, 60),
+    (0x1378, 0x1378, 70), (0x1379, 0x1379, 80), (0x137A, 0x137A, 90), (0x137B, 0x137B, 100),
+    (0x137C, 0x137C, 10000), (0x16EE, 0x16F0, 17), (0x17E0, 0x17E9, 0), (0x17F0, 0x17F9, 0),
+    (0x1810, 0x1819, 0), (0x1946, 0x194F, 0), (0x19D0, 0x19D9, 0), (0x19DA, 0x19DA, 1),
+    (0x1A80, 0x1A89, 0), (0x1A90, 0x1A99, 0), (0x1B50, 0x1B59, 0), (0x1BB0, 0x1BB9, 0),
+    (0x1C40, 0x1C49, 0), (0x1C50, 0x1C59, 0), (0x2070, 0x2070, 0), (0x2074, 0x2079, 4),
+    (0x2080, 0x2089, 0), (0x215F, 0x215F, 1), (0x2160, 0x216B, 1), (0x216C, 0x216C, 50),
+    (0x216D, 0x216D, 100), (0x216E, 0x216E, 500), (0x216F, 0x216F, 1000), (0x2170, 0x217B, 1),
+    (0x217C, 0x217C, 50), (0x217D, 0x217D, 100), (0x217E, 0x217E, 500),
+    (0x217F, 0x217F, 1000), (0x2180, 0x2180, 1000), (0x2181, 0x2181, 5000),
+    (0x2182, 0x2182, 10000), (0x2185, 0x2185, 6), (0x2186, 0x2186, 50),
+    (0x2187, 0x2187, 50000), (0x2188, 0x2188, 100000), (0x2189, 0x2189, 0),
+    (0x2460, 0x2473, 1), (0x2474, 0x2487, 1), (0x2488, 0x249B, 1), (0x24EA, 0x24EA, 0),
+    (0x24EB, 0x24F4, 11), (0x24F5, 0x24FE, 1), (0x24FF, 0x24FF, 0), (0x2776, 0x277F, 1),
+    (0x2780, 0x2789, 1), (0x278A, 0x2793, 1), (0x3007, 0x3007, 0), (0x3021, 0x3029, 1),
+    (0x3038, 0x3038, 10), (0x3039, 0x3039, 20), (0x303A, 0x303A, 30), (0x3192, 0x3195, 1),
+    (0x3220, 0x3229, 1), (0x3248, 0x3248, 10), (0x3249, 0x3249, 20), (0x324A, 0x324A, 30),
+    (0x324B, 0x324B, 40), (0x324C, 0x324C, 50), (0x324D, 0x324D, 60), (0x324E, 0x324E, 70),
+    (0x324F, 0x324F, 80), (0x3251, 0x325F, 21), (0x3280, 0x3289, 1), (0x32B1, 0x32BF, 36),
+    (0xA620, 0xA629, 0), (0xA6E6, 0xA6EE, 1), (0xA6EF, 0xA6EF, 0), (0xA8D0, 0xA8D9, 0),
+    (0xA900, 0xA909, 0), (0xA9D0, 0xA9D9, 0), (0xA9F0, 0xA9F9, 0), (0xAA50, 0xAA59, 0),
+    (0xABF0, 0xABF9, 0), (0xF96B, 0xF96B, 3), (0xF973, 0xF973, 10), (0xF978, 0xF978, 2),
+    (0xF9B2, 0xF9B2, 0), (0xF9D1, 0xF9D1, 6), (0xF9D3, 0xF9D3, 6), (0xF9FD, 0xF9FD, 10),
+    (0xFF10, 0xFF19, 0), (0xFF21, 0xFF3A, 10), (0xFF41, 0xFF5A, 10),
+];
+
+/// The `-2` sentinel `getNumericValue` returns for a code point whose numeric
+/// value exists but is not a non-negative integer (`U+00BD` VULGAR FRACTION ONE
+/// HALF). 9 runs, 59 code points.
+#[rustfmt::skip]
+const JAVA_NUMERIC_VALUE_NEG2_RUNS: &[(u32, u32)] = &[
+    (0x00BC, 0x00BE), (0x09F4, 0x09F8), (0x0B72, 0x0B77), (0x0D58, 0x0D5E), (0x0D73, 0x0D78),
+    (0x0F2A, 0x0F33), (0x2150, 0x215E), (0x2CFD, 0x2CFD), (0xA830, 0xA835),
+];
+
 // --- Character ---
 
 pub(crate) fn native_character_value_of(
@@ -3738,12 +4168,14 @@ pub(crate) fn native_character_value_of(
 /// `java_char_digit(c, 10).is_some()` reproduces `Character.isDigit(char)` with
 /// **zero** mismatches.
 ///
-/// RESIDUAL, and deliberate: this triple is registered for `(I)Z` as well, and
-/// `JAVA_DIGIT_RUNS` is BMP-only by design (see its doc comment). A
-/// SUPPLEMENTARY decimal digit — `U+1D7CE` MATHEMATICAL BOLD DIGIT ZERO, and
-/// the rest of `U+1D7CE..U+1E959` — still answers `false` where HotSpot answers
-/// `true`. That is unchanged from before this fix, not a regression, and it is
-/// only reachable through the `int` overload.
+/// W7-95(C1) closes the residual the previous fix left open. This triple is
+/// registered for `(I)Z` as well, and `JAVA_DIGIT_RUNS` is BMP-only by design
+/// (see its doc comment), so every SUPPLEMENTARY decimal digit — `U+1D7CE`
+/// MATHEMATICAL BOLD DIGIT ZERO and the 389 others — answered `false` where
+/// HotSpot answers `true`. [`JAVA_SUPPLEMENTARY_DIGIT_RUNS`] is the second half,
+/// and it is consulted ONLY here, never from the parse family: the two overloads
+/// genuinely have different answers and merging the tables would make
+/// `Integer.parseInt` more permissive than the JDK.
 pub(crate) fn native_character_is_digit(
     _ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -3752,32 +4184,34 @@ pub(crate) fn native_character_is_digit(
         Some(Value::Int(v)) => *v as u32,
         _ => 0,
     };
-    let result = char::from_u32(ch).is_some_and(|c| java_char_digit(c, 10).is_some());
+    let result = java_is_digit_code_point(ch);
     Ok(Some(Value::Int(if result { 1 } else { 0 })))
 }
 
-/// `Character.isLetter` — KNOWN WRONG, and not fixable from Rust's std tables.
+/// `Character.isDigit(int)` — the BMP table plus the supplementary one.
+fn java_is_digit_code_point(cp: u32) -> bool {
+    char::from_u32(cp).is_some_and(|c| java_char_digit(c, 10).is_some())
+        || in_code_point_runs(JAVA_SUPPLEMENTARY_DIGIT_RUNS, cp)
+}
+
+/// `Character.isLetter` — the five `L*` categories, from a JDK-25-generated
+/// table.
 ///
-/// W7-98(a), the one predicate in this family with no in-tree answer. Java's
-/// `isLetter` is the general categories `Lu|Ll|Lt|Lm|Lo`. Rust's
-/// `char::is_alphabetic` is the Unicode **Alphabetic** property, which is
-/// `L* ∪ Nl ∪ Other_Alphabetic` — a strictly larger set. Measured over the
-/// whole BMP against HotSpot 25: **957 of 65,536** code points disagree, all in
-/// the same direction (we answer `true`, Java answers `false`) — `U+2160`
-/// ROMAN NUMERAL ONE and `U+3007` IDEOGRAPHIC NUMBER ZERO (`Nl`), and the
-/// combining marks carrying `Other_Alphabetic` (`U+0345`, `U+0483..`,
-/// `U+05B0..`, …).
+/// W7-98(a) carried this as KNOWN WRONG on the grounds that Rust's std exposes
+/// no `Nl` and no `Other_Alphabetic`, so `is_alphabetic` (the Unicode
+/// **Alphabetic** property, `L* u Nl u Other_Alphabetic`) could not be narrowed
+/// exactly. That is true of any *derivation* from Rust's tables and W7-95(C1)
+/// stops trying to derive one.
 ///
-/// Rust's std exposes no `Nl` and no `Other_Alphabetic`, so no derivation from
-/// what is available is exact — the closest,
-/// `is_alphabetic() && !is_numeric()`, still misses 892, because it removes
-/// `Nl` but not the marks. Deliberately NOT applied: it trades an exact,
-/// explainable rule for a marginally smaller wrong number.
-///
-/// The exact fix is to stop shadowing `java.lang.Character` here and let
-/// `CharacterData` answer — `Character.getType` is unshadowed today and matches
-/// HotSpot on **all 65,536** BMP code points, so the route is known-good. See
-/// docs/known-issues/jdk-only/W7-98-character-unicode.md.
+/// The delta is enumerable from the oracle: `Character.isAlphabetic` on JDK 25
+/// IS the Alphabetic property, so `isAlphabetic && !isLetter` names the whole
+/// difference — **949** BMP and **1,731** total code points, all in the same
+/// direction. But the census measured **957** BMP disagreements against the
+/// shipping binary, and 957 != 949: Rust's Alphabetic table and JDK 25's differ
+/// by eight further code points that nothing on this side can enumerate. So
+/// subtracting the delta would have left a residual with no name.
+/// [`JAVA_LETTER_RUNS`] is the JDK's own answer, 677 runs over every plane, and
+/// leaves none.
 pub(crate) fn native_character_is_letter(
     _ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -3786,7 +4220,7 @@ pub(crate) fn native_character_is_letter(
         Some(Value::Int(v)) => *v as u32,
         _ => 0,
     };
-    let result = char::from_u32(ch).is_some_and(|c| c.is_alphabetic());
+    let result = in_code_point_runs(JAVA_LETTER_RUNS, ch);
     Ok(Some(Value::Int(if result { 1 } else { 0 })))
 }
 
@@ -3814,9 +4248,21 @@ pub(crate) fn native_character_is_letter(
 /// = Java's `isSpaceChar`, and the rest is the javadoc sentence transcribed.
 /// The three excluded code points are the javadoc's own list, not a sample.
 ///
-/// A surrogate is `Cs`, never whitespace: `char::from_u32` answers `None` for
-/// one and the low-range arm rejects it, so it falls out `false` — which is
-/// what HotSpot answers.
+/// A surrogate is `Cs`, never whitespace, and falls out `false` — which is what
+/// HotSpot answers.
+///
+/// W7-95(C1) replaced the derivation with the enumeration. The derivation was
+/// CORRECT — `White_Space \ {U+0009..U+000D, U+0085}` really is `Zs u Zl u Zp`,
+/// and the rest was the javadoc sentence — but it read three separate facts off
+/// Rust's Unicode tables to produce an answer that is, in total, **25 code
+/// points**. Enumerating them from JDK 25 is smaller, faster, provably exact,
+/// and unlike the derivation it cannot silently change when the toolchain's
+/// Unicode version moves. Measured on HotSpot 25 over `0..=0x10FFFF`:
+/// `isWhitespace` is true for exactly `U+0009..U+000D`, `U+001C..U+0020`,
+/// `U+1680`, `U+2000..U+2006`, `U+2008..U+200A`, `U+2028..U+2029`, `U+205F`,
+/// `U+3000` — note the two holes, `U+2007` FIGURE SPACE and `U+00A0`/`U+202F`,
+/// which are excluded precisely because a non-breaking space must not be
+/// treated as a break opportunity.
 pub(crate) fn native_character_is_whitespace(
     _ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -3825,13 +4271,48 @@ pub(crate) fn native_character_is_whitespace(
         Some(Value::Int(v)) => *v as u32,
         _ => 0,
     };
-    // `Zs ∪ Zl ∪ Zp` — i.e. Java's `Character.isSpaceChar`.
-    let is_space_char = char::from_u32(ch).is_some_and(|c| c.is_whitespace())
-        && !matches!(ch, 0x09..=0x0D | 0x85);
-    let result = (is_space_char && !matches!(ch, 0x00A0 | 0x2007 | 0x202F))
-        || matches!(ch, 0x09..=0x0D | 0x1C..=0x1F);
+    let result = matches!(
+        ch,
+        0x0009..=0x000D
+            | 0x001C..=0x0020
+            | 0x1680
+            | 0x2000..=0x2006
+            | 0x2008..=0x200A
+            | 0x2028..=0x2029
+            | 0x205F
+            | 0x3000
+    );
     Ok(Some(Value::Int(if result { 1 } else { 0 })))
 }
+
+/// `Character.isUpperCase` / `isLowerCase` are the Unicode **Uppercase** and
+/// **Lowercase** properties — `Lu u Other_Uppercase` and `Ll u Other_Lowercase`
+/// — which is exactly what `char::is_uppercase`/`is_lowercase` implement, so
+/// unlike `isLetter` these two are NOT a definitional mismatch. Verified on
+/// JDK 25: `isUpperCase` differs from `getType == UPPERCASE_LETTER` on 120 code
+/// points and `isLowerCase` from `LOWERCASE_LETTER` on 311, i.e. Java really
+/// does take the contributory properties.
+///
+/// W7-95(C1). What remained after that was six code points of TOOLCHAIN
+/// version skew, measured by sweeping all 65,536 BMP code points on both VMs:
+/// `U+A7CE`, `U+A7D2`, `U+A7D4` answered uppercase here and do not on JDK 25;
+/// `U+A7CF` and `U+A7F1` answered lowercase here and do not; `U+0295` LATIN
+/// LETTER PHARYNGEAL VOICED FRICATIVE answers lowercase on JDK 25 and did not
+/// here. Same cause as [`JAVA_SIMPLE_LOWERCASE_OVERRIDES`]'s Latin Extended-D
+/// entries. Pinned rather than left open, because six is small enough to
+/// vanish from a residual list and large enough to fail a differential.
+///
+/// Five of the six are one fact, and it is checkable rather than asserted:
+/// `Character.getType` on HotSpot 25 answers `0` (`UNASSIGNED`) for `U+A7CE`,
+/// `U+A7CF`, `U+A7D2`, `U+A7D4` and `U+A7F1`. An unassigned code point is not
+/// uppercase, not lowercase, and maps to itself — so one rule covers all five
+/// and both predicates, rather than five ad-hoc entries. (`U+A7D3` and `U+A7D5`
+/// ARE assigned on JDK 25, `getType == LOWERCASE_LETTER`; only their spurious
+/// uppercase MAPPING needed correcting, which
+/// [`JAVA_SIMPLE_UPPERCASE_OVERRIDES`] does.) The sixth, `U+0295`, is the
+/// reverse direction: JDK 25 has it as `LOWERCASE_LETTER` and the toolchain
+/// does not.
+const JAVA_UNASSIGNED_ON_JDK25: &[u32] = &[0xA7CE, 0xA7CF, 0xA7D2, 0xA7D4, 0xA7F1];
 
 pub(crate) fn native_character_is_upper_case(
     _ctx: &mut dyn NativeContext,
@@ -3841,7 +4322,8 @@ pub(crate) fn native_character_is_upper_case(
         Some(Value::Int(v)) => *v as u32,
         _ => 0,
     };
-    let result = char::from_u32(ch).is_some_and(|c| c.is_uppercase());
+    let result = !JAVA_UNASSIGNED_ON_JDK25.contains(&ch)
+        && char::from_u32(ch).is_some_and(|c| c.is_uppercase());
     Ok(Some(Value::Int(if result { 1 } else { 0 })))
 }
 
@@ -3853,7 +4335,9 @@ pub(crate) fn native_character_is_lower_case(
         Some(Value::Int(v)) => *v as u32,
         _ => 0,
     };
-    let result = char::from_u32(ch).is_some_and(|c| c.is_lowercase());
+    let result = ch == 0x0295
+        || (!JAVA_UNASSIGNED_ON_JDK25.contains(&ch)
+            && char::from_u32(ch).is_some_and(|c| c.is_lowercase()));
     Ok(Some(Value::Int(if result { 1 } else { 0 })))
 }
 
@@ -3873,8 +4357,64 @@ pub(crate) fn native_character_is_lower_case(
 ///
 /// The `int`-taking overloads already had the right shape (`.unwrap_or(cp)`);
 /// this makes the `char` overloads agree.
+/// The BMP code points where JDK 25's SIMPLE case mapping and the answer this
+/// file could otherwise produce disagree — measured, not derived.
+///
+/// W7-95(C1). Both tables come from diffing a full 65,536-code-point sweep of
+/// `Character.toUpperCase`/`toLowerCase` run on the CratonVM binary against the
+/// same sweep on HotSpot 25, so every entry is an executed divergence rather
+/// than a guess about what Rust's tables contain. There are exactly two causes,
+/// and they are worth keeping distinct:
+///
+/// 1. **The ypogegrammeni family**, 27 of the 30 upper rows
+///    (`U+1F80..U+1F87`, `U+1F90..U+1F97`, `U+1FA0..U+1FA7`, `U+1FB3`,
+///    `U+1FC3`, `U+1FF3`). These have a multi-char FULL uppercase *and* a
+///    single-char SIMPLE uppercase (`U+1FB3` -> `U+1FBC`), and Rust's std
+///    exposes only the full mapping — so the arity rule below correctly refuses
+///    it and returns the input, where Java returns the titlecase form. W7-98
+///    predicted this exact residual by name and could not close it; the
+///    enumeration closes it.
+/// 2. **A toolchain-vs-JDK Unicode version skew** in Latin Extended-D:
+///    `U+A7CE/A7CF`, `U+A7D2/A7D3`, `U+A7D4/A7D5`. The toolchain's tables carry
+///    these as case PAIRS; JDK 25 maps each to itself. This is not a
+///    specification difference — it is two Unicode versions — and it is the
+///    only part of this file that pins one.
+#[rustfmt::skip]
+const JAVA_SIMPLE_UPPERCASE_OVERRIDES: &[(u32, u32)] = &[
+    (0x1F80, 0x1F88), (0x1F81, 0x1F89), (0x1F82, 0x1F8A), (0x1F83, 0x1F8B), (0x1F84, 0x1F8C),
+    (0x1F85, 0x1F8D), (0x1F86, 0x1F8E), (0x1F87, 0x1F8F), (0x1F90, 0x1F98), (0x1F91, 0x1F99),
+    (0x1F92, 0x1F9A), (0x1F93, 0x1F9B), (0x1F94, 0x1F9C), (0x1F95, 0x1F9D), (0x1F96, 0x1F9E),
+    (0x1F97, 0x1F9F), (0x1FA0, 0x1FA8), (0x1FA1, 0x1FA9), (0x1FA2, 0x1FAA), (0x1FA3, 0x1FAB),
+    (0x1FA4, 0x1FAC), (0x1FA5, 0x1FAD), (0x1FA6, 0x1FAE), (0x1FA7, 0x1FAF), (0x1FB3, 0x1FBC),
+    (0x1FC3, 0x1FCC), (0x1FF3, 0x1FFC), (0xA7CF, 0xA7CF), (0xA7D3, 0xA7D3), (0xA7D5, 0xA7D5),
+];
+
+/// See [`JAVA_SIMPLE_UPPERCASE_OVERRIDES`]. All three are cause (2).
+#[rustfmt::skip]
+const JAVA_SIMPLE_LOWERCASE_OVERRIDES: &[(u32, u32)] = &[
+    (0xA7CE, 0xA7CE), (0xA7D2, 0xA7D2), (0xA7D4, 0xA7D4),
+];
+
+#[inline]
+fn case_override(table: &[(u32, u32)], cp: u32) -> Option<u32> {
+    table
+        .binary_search_by_key(&cp, |&(from, _)| from)
+        .ok()
+        .map(|i| table[i].1)
+}
+
 #[inline]
 fn character_case_map(ch: u32, upper: bool) -> u32 {
+    if let Some(mapped) = case_override(
+        if upper {
+            JAVA_SIMPLE_UPPERCASE_OVERRIDES
+        } else {
+            JAVA_SIMPLE_LOWERCASE_OVERRIDES
+        },
+        ch,
+    ) {
+        return mapped;
+    }
     let Some(c) = char::from_u32(ch) else {
         // Surrogate (or otherwise not a scalar value): return it unchanged.
         return ch;
@@ -3991,10 +4531,11 @@ pub(crate) fn native_character_to_upper_case_int(
 /// `false`. Measured over the whole BMP against HotSpot 25, that was **1,257 of
 /// 65,536** wrong.
 ///
-/// Composing the two predicates the way the JDK does drops it to **957** —
-/// exactly [`native_character_is_letter`]'s count, i.e. this method now
-/// contributes NO error of its own and inherits precisely one documented
-/// residual instead of carrying a second, independent one.
+/// Composing the two predicates the way the JDK does dropped it to **957** —
+/// exactly [`native_character_is_letter`]'s count, i.e. this method contributed
+/// NO error of its own. W7-95(C1) then took `isLetter` and `isDigit` to zero, so
+/// this one follows to zero with no further change than keeping the composition
+/// honest.
 pub(crate) fn native_character_is_letter_or_digit(
     _ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -4003,8 +4544,7 @@ pub(crate) fn native_character_is_letter_or_digit(
         Some(Value::Int(v)) => *v as u32,
         _ => 0,
     };
-    let result = char::from_u32(ch)
-        .is_some_and(|c| c.is_alphabetic() || java_char_digit(c, 10).is_some());
+    let result = in_code_point_runs(JAVA_LETTER_RUNS, ch) || java_is_digit_code_point(ch);
     Ok(Some(Value::Int(if result { 1 } else { 0 })))
 }
 
@@ -4646,18 +5186,20 @@ pub(crate) fn native_character_for_digit(
 /// [`java_char_digit`] picks up every non-ASCII `Nd` run and takes that to
 /// **372**.
 ///
-/// The 372 that remain are the part `JAVA_DIGIT_RUNS` does not model, because
-/// `Character.digit` does not either:
+/// W7-95(C1) closes the 372. They were the part `JAVA_DIGIT_RUNS` does not
+/// model, because `Character.digit` does not either — and reusing the digit
+/// table for a *numeric value* was the category error:
 ///
 /// * `Nl`/`No` numeric values — `U+2160` ROMAN NUMERAL ONE is `1`, `U+00B2`
-///   SUPERSCRIPT TWO is `2`; both answer `-1` here.
-/// * the `-2` sentinel Java returns for a code point with a numeric value that
-///   is not a non-negative integer (`U+00BD` VULGAR FRACTION ONE HALF); we
-///   answer `-1`.
+///   SUPERSCRIPT TWO is `2`; `Character.digit` says `-1` for both, correctly,
+///   because they are not digits in any radix.
+/// * the `-2` sentinel Java returns for a code point whose numeric value is not
+///   a non-negative integer (`U+00BD` VULGAR FRACTION ONE HALF), which the
+///   digit table has no way to express at all.
 ///
-/// Both need the JDK's own numeric-value table, which is `CharacterData`'s to
-/// own — the exact fix is to stop shadowing it. See
-/// docs/known-issues/jdk-only/W7-98-character-unicode.md.
+/// [`JAVA_NUMERIC_VALUE_RUNS`] + [`JAVA_NUMERIC_VALUE_NEG2_RUNS`] are the JDK's
+/// own answer, generated by walking the BMP on JDK 25. BMP is the whole domain:
+/// only `(C)I` is registered, so no argument can exceed `U+FFFF`.
 pub(crate) fn native_character_get_numeric_value(
     _ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -4666,10 +5208,11 @@ pub(crate) fn native_character_get_numeric_value(
         Some(Value::Int(v)) => *v as u32,
         _ => return Ok(Some(Value::Int(-1))),
     };
-    let result = char::from_u32(ch)
-        .and_then(|c| java_char_digit(c, 36))
-        .map(|d| d as i32)
-        .unwrap_or(-1);
+    let result = match value_in_runs(JAVA_NUMERIC_VALUE_RUNS, ch) {
+        Some(v) => v,
+        None if in_code_point_runs(JAVA_NUMERIC_VALUE_NEG2_RUNS, ch) => -2,
+        None => -1,
+    };
     Ok(Some(Value::Int(result)))
 }
 

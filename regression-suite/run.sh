@@ -103,7 +103,7 @@ JDKONLY_MODULE="cratonvm.jdkonly.svc"
 # every scheduled class already receives that flag, so a second registration
 # would run the identical command twice. Nothing schedules by glob — every list
 # here is explicit — so the name collision is cosmetic.
-CORE_CLASSES="RCollections RStrings RNumbers RSerial RCrypto RExceptions RReflect ROptionalClassForName RPrivateLambdaOwner RLambdaDefaultOverload RJitGc RJitStringLayout RJitArrayTypecheck RArraysMismatch RExecutorShutdown RBlockingQueue RChmKeySetView RChannelInterrupt RSocketChannelInterrupt RAtomicArray RDirectBufferElem RMapResizeGc RMapGcStress RForNameGcStress ROverlaySystemGcStress RFileTimes RNioNoFollow RSyncMethodJit RFieldSiteCache RMethodSiteCache RDataInputFastPull RCanAccessRules RChaCha20Cipher RLockedIdentityHash RCanAccessReceiver RForeignLayoutCollections RForeignLayoutJdkInterfaces RLoaderChurnDefine RClassUnloadSweep RPriorityQueueGc RTreeRangeGc RJdkViews RJdkFormatLocale RJdkStrictMath RJdkByteOrder RJdkIntrinsics"
+CORE_CLASSES="RCollections RStrings RNumbers RSerial RCrypto RExceptions RReflect ROptionalClassForName RPrivateLambdaOwner RLambdaDefaultOverload RJitGc RJitStringLayout RJitArrayTypecheck RArrayStoreTiers RArrayStoreInterfaces RArraysMismatch RExecutorShutdown RBlockingQueue RChmKeySetView RChannelInterrupt RSocketChannelInterrupt RAtomicArray RDirectBufferElem RMapResizeGc RMapGcStress RForNameGcStress ROverlaySystemGcStress RFileTimes RNioNoFollow RSyncMethodJit RFieldSiteCache RMethodSiteCache RDataInputFastPull RCanAccessRules RChaCha20Cipher RLockedIdentityHash RCanAccessReceiver RForeignLayoutCollections RForeignLayoutJdkInterfaces RLoaderChurnDefine RClassUnloadSweep RPriorityQueueGc RTreeRangeGc RJdkViews RJdkFormatLocale RJdkStrictMath RJdkByteOrder RJdkIntrinsics RJdkIntrinsics2 RShutdownHooks RSimpleTimeZoneRaw RImmutableFactoryTypes RJdkStringCodePoints"
 
 # The JDK-only corpus (docs/feature-designs/jdk-only-mode.md). Not in the
 # default set: `--jdk-only` is an internal-diagnostic policy in wave 1 and is
@@ -116,7 +116,7 @@ CORE_CLASSES="RCollections RStrings RNumbers RSerial RCrypto RExceptions RReflec
 # decoder can answer — the JDK's own static stamp predicates, dropLookupMode,
 # a defined class read back through java.lang.Class — so a registered surface
 # agreeing with itself cannot make them pass.
-JDKONLY_CLASSES="RJdkHello RJdkStrict RJdkCollections RJdkLambdas RJdkHandles RJdkProxy RJdkReflect RJdkFieldModule RJdkRecords RJdkHidden RJdkModule RJdkServices RJdkAqs RJdkPhaser RJdkExecutors RJdkForkJoin RJdkNio RJdkNet RJdkProcess RJdkSecurity RJdkJmx RJdkJni RJdkFailure RJdkStampedStamps RJdkLookupIn RJdkDefineClass RJdkX509Intercept RJdkLogging RJdkSqlPackage RJdkEnvMap RJdkProxyIface RJdkFunctionCombinators RJdkForeign RJdkEnumerations RJdkAsyncChannel"
+JDKONLY_CLASSES="RJdkHello RJdkStrict RJdkCollections RJdkLambdas RJdkHandles RJdkProxy RJdkReflect RJdkFieldModule RJdkRecords RJdkHidden RJdkModule RJdkServices RJdkAqs RJdkPhaser RJdkExecutors RJdkForkJoin RJdkNio RJdkNet RJdkProcess RJdkSecurity RJdkJmx RJdkJni RJdkFailure RJdkStampedStamps RJdkLookupIn RJdkDefineClass RJdkX509Intercept RJdkLogging RJdkSqlPackage RJdkEnvMap RJdkProxyIface RJdkFunctionCombinators RJdkForeign RJdkEnumerations RJdkAsyncChannel RJdkMapViews"
 
 # Vectors that deliberately belong to NO class list. Every entry needs a
 # reason, because "not scheduled" is indistinguishable from "forgotten" once

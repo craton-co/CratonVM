@@ -1,5 +1,24 @@
 # C6-2 — `SimpleTimeZone` answers from its ID, and it is four natives, not a constructor
 
+> **SUPERSEDED IN PART, 2026-08-12 by lane C12** —
+> `C12-1-simpletimezone-the-trap-and-the-second-site.md`. Both nominations
+> LANDED. Three corrections to read before using this record:
+> 1. **The trap in 3B is answered: the base registration does NOT capture a real
+>    `SimpleTimeZone`.** Not by guessing between the two readings — by the
+>    dispatch source, which passes the RECEIVER's class name, skips the
+>    superclass climb when the receiver's class declares the method, and keys the
+>    late re-check on the declaring class. Real `SimpleTimeZone` declares all
+>    three live members (`javap`). C12-1 §2 has the citations; the confirming run
+>    is still required and is C12-1 §6 step 1.
+> 2. **§D's predicted number is wrong.** Measured, the bc-java parse skew is
+>    **7,200,000 ms**, not 10,800,000: São Paulo was observing DST on
+>    2002-01-22, and the tzdb path applies the transition for the instant rather
+>    than the standard offset. The skew is a time series, not a constant.
+> 3. **Residual 3 was the live one.** `date_format_fast.rs:806` reproduces this
+>    defect BELOW dispatch, so no unregistration reaches it — and that, not the
+>    natives, is where `SimpleDateFormat.format` over an app-built
+>    `SimpleTimeZone` actually lands. Measured oracle + nomination in C12-1 §3/§5.
+
 **2026-08-12, lane C6.** The observable was isolated by another lane and is
 quoted verbatim in §1. This record does three things that finding did not:
 **locates the mechanism**, **shows the defect is not confined to
@@ -191,6 +210,17 @@ host default so it is reproducible: `SimpleDateFormat("yyyyMMddHHmmss")` with
 `20020122122220` — HotSpot `1011702140000`, CratonVM **PREDICTED**
 `1011712940000`, i.e. off by exactly `10800000` ms, matching the five
 local-time rows in `P4A-CORPORA-20260812.md` §A.
+
+> **This prediction is WRONG, and `P4A-CORPORA`'s number is not (C18,
+> 2026-08-12).** Measured in `C12-1` §4, the `America/Sao_Paulo` gap is
+> **7,200,000 ms**, not 10,800,000: São Paulo was observing DST on
+> 2002-01-22, and the tzdb path applies the zone's *total* offset at that
+> instant rather than its standard offset. `P4A-CORPORA`'s `10800000` is a
+> different quantity — the **host default zone** `America/Buenos_Aires`
+> (−03:00, no DST then) — and is correct as measured. **The skew is not a
+> constant**; it is whatever the zone's total offset was at the instant
+> parsed, so a test asserting a fixed delta passes or fails on its choice of
+> date.
 
 ---
 

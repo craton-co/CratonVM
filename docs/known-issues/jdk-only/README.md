@@ -1,5 +1,14 @@
 # JDK-only mode — open defects
 
+> **Start at [`INDEX.md`](INDEX.md)** (added 2026-08-13, lane C18): one line per
+> record — status read from the record's own prose rather than its filename,
+> provenance (**MEASURED / PREDICTED / SOURCE-ONLY**), grouped by subsystem. It
+> also carries the corrections this directory's records had drifted away from,
+> the `W7-39` number-collision resolution, and the contradictions that are
+> stated rather than guessed. **The record count in the status line below is
+> stale** — the directory holds 155 `.md` files as of 2026-08-13 00:07; recount
+> before quoting either number.
+
 **Status:** OPEN, **94 records** (recount before quoting; this drifts on every merge — the count is `ls docs/known-issues/jdk-only/*.md | wc -l` minus this file, `HANDOFF-*`, the `RETIREMENT-*` docs and any dated census deliverable such as `STUB-CENSUS-*`, which is **105 − 11 = 94** late on 2026-08-12, after the eight moves in `RETIREMENT-20260812B.md`. **Recounted from the directory rather than carried forward, and the old arithmetic `100 − 6` is stale**: the directory grew by five more dated deliverables that day — `APP-READINESS-`, `JDK-ONLY-REPORT-CENSUS-`, `P1-BASELINE-`, `P2-COLLECTIONS-SHADOWS-` and `P4B-SYNTHETIC-JDK-MODE-20260812.md` — none of which is a defect record. **94 is still the right number and the arithmetic that produced it is not**: both terms moved and cancelled, so a reader who quoted 94 without recounting would have been right for the wrong reason, and the next deliverable to land breaks that coincidence. The exclusion list is the thing that drifts, not the count. Also note the deliverables land from parallel lanes and some are **untracked in the working tree when you count**, so `git ls-files` and `ls` disagree here by design). Index rebuilt from the tree on **2026-08-12**
 by W7-78-inherited-residual-closeout.md, on top of the reconciliation pass
 W7-55-record-reconciliation.md. **Fourteen records left the directory that day,

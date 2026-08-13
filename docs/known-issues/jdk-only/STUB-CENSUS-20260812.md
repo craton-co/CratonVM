@@ -71,6 +71,14 @@ Confirmation line on stderr, from the run this document is built on:
 census/reg-strict-adj.json (intrinsic=645, bridge=9781, synthetic-stub=0)
 ```
 
+> **Read `intrinsic=645` as ROWS (C18, 2026-08-12).** Every number in this
+> census is a registry-row count, which is what the dump emits. The
+> **distinct-triple** count behind those 645 rows is **614** — 31 rows are
+> duplicate registrations of a triple already registered. Coverage arithmetic
+> must use 614; deletion arithmetic must use 645. `W8-C3-1` §"The coverage
+> arithmetic" has the recomputation; `W7-95` originally read 645 as triples and
+> now carries a correction banner.
+
 Each row carries more than the five fields asked for:
 
 | field | meaning |
@@ -148,6 +156,9 @@ Measured, both binaries, same trivial program:
 | `cratonvm-f8` | `--jdk-only` | 645 | 9781 | **0** |
 | `cratonvm-control-44044c7e2` (pristine dev) | compatible | 645 | 9741 | **1280** |
 | `cratonvm-control-44044c7e2` | `--jdk-only` | 645 | 9741 | **0** |
+
+(The `intrinsic` column is **rows**, not distinct triples — 645 rows = 614
+distinct triples. See the note in §2.)
 
 `--jdk-only` drops **every** `SyntheticStub` and **nothing else**. So the
 premise of the brief's category (C) is exactly right: a stub that runs in strict

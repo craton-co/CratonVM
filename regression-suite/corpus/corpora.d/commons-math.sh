@@ -58,13 +58,19 @@ corpus_is_built() {
 # discovered.
 #
 # That is worse than a broken run. The failure is IDENTICAL on both arms, so
-# the markers match and run-corpus.sh scores the class **AGREE** -- measured
-# here on 2026-08-12, on this corpus and on bc-java. `oracle_vacuous` does not
-# catch it: it inspects the SBRUNNER_RESULT line, and this failure never gets
-# far enough to print one. So the guard against "we learned nothing rendering
-# as we verified it" has a hole exactly here, and the fix belongs in BOTH
-# places -- see the NOMINATION in docs/known-issues/jdk-only/P4A-CORPORA-20260812.md
-# for the run-corpus.sh half, which this lane may not edit.
+# the markers match and run-corpus.sh scored the class **AGREE** -- measured
+# here on 2026-08-12, on this corpus and on bc-java.
+#
+# The run-corpus.sh half of the fix LANDED on 2026-08-12 (lane C8):
+# `oracle_vacuous` now returns vacuous for a junit-kind oracle that threw with
+# no SBRUNNER_RESULT at all (it died during DISCOVERY) and for a
+# linkage-family throw escaping to the wrapper. Either shape is reported as
+# ORACLE-VACUOUS -- unadjudicated -- instead of AGREE. See
+# docs/known-issues/jdk-only/C8-CORPUS-HARNESS-DEFECTS-20260812.md §2.8.
+# Re-adjudicating the stored logs with that guard (lane C17) moved the two
+# `AccurateMathTest`/`DfpTest` rows in this corpus off DIVERGE and onto
+# ORACLE-VACUOUS, which is the honest reading: the oracle is the arm that died.
+# The classpath half below is still what stops the failure happening at all.
 #
 # The classpath half of the fix: pin ONE jar per artifact, the highest version
 # present, instead of adding a whole group directory recursively.

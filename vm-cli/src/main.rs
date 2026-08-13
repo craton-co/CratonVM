@@ -4664,6 +4664,45 @@ fn run() -> Result<()> {
         }
     }
 
+    // W7-92 — the launcher's two exit paths: `main` returned, and `main` threw.
+    // HotSpot runs shutdown hooks on BOTH (measured, 25.0.3+9: the `normal`,
+    // `nondaemon` and `uncaught` rows of the record's oracle table), so this
+    // sits ABOVE the `match` for the same reason the slot-map census at :4361
+    // does. `System.exit` / `Runtime.exit` never reach this line;
+    // `lang_system::native_system_exit` carries the trigger for those.
+    //
+    // AFTER `wait_for_non_daemon_threads`, and that ordering is not cosmetic:
+    // HotSpot's `nondaemon` transcript prints `KEEPER-DONE` BEFORE the hook
+    // output. Shutdown does not begin until the last non-daemon thread ends.
+    //
+    // Called directly rather than through `vm.invoke("java/lang/Shutdown",
+    // "runHooks", "()V", &[])`. The Java route would depend on
+    // `java/lang/Shutdown` resolving, which is a real-JDK-mode assumption —
+    // and a bridge that silently does nothing in synthetic-JDK mode is the
+    // exact failure shape this record is about. The native registration on
+    // that triple still exists for JDK-side callers; both land on the same
+    // drained list, so neither can double-run the hooks.
+    //
+    // KNOWN ORDERING DIVERGENCE, stated rather than discovered: on the
+    // uncaught-exception path HotSpot prints the stack trace and THEN runs the
+    // hooks. Here the trace is rendered by `bail!` and printed by `main()`
+    // after `run()` returns, so CratonVM's hook output lands BEFORE it. Fixing
+    // that means restructuring how the launcher renders a fatal exception,
+    // which is a change to output every harness in this tree reads; W7-92 §7
+    // records it as the follow-up.
+    {
+        let mut ctx = cratonvm_vm::vm::NativeContextImpl {
+            shared: &vm.shared,
+            thread: &mut vm.main_thread,
+        };
+        let trigger = if result.is_ok() {
+            "main-returned"
+        } else {
+            "uncaught"
+        };
+        cratonvm_native_builtins::lang_system::run_shutdown_hooks(&mut ctx, trigger);
+    }
+
     match result {
         Ok(_) => Ok(()),
         Err(MethodCallFailed::InternalError(e)) => {

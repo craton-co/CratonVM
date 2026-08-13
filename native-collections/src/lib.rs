@@ -155,6 +155,24 @@ const CF_IDENTITY_MAP: u16 = 1 << 10;
 /// those natives are on the hot path for every ordinary HashSet and ArrayList
 /// too (see the `collections-classification-cost` notes above).
 const CF_KEY_SET_VIEW: u16 = 1 << 11;
+/// Exact class is one of the five real JDK classes `Map.values()` returns:
+/// `HashMap$Values`, `LinkedHashMap$LinkedValues`, `TreeMap$Values`,
+/// `Hashtable$ValueCollection`, `ConcurrentHashMap$ValuesView`.
+///
+/// Every one of them holds its source map in a single reference field and
+/// nothing else — so it matches neither the ArrayList layout the `native_al_*`
+/// natives read nor the HashSet layout the `native_hs_*` natives read. Reaching
+/// one of those natives with such a receiver answers EMPTY today (`al_state`'s
+/// layout guard reports `data = None`, which every caller reads as size 0), and
+/// its real bytecode is no better: `HashMap$Values.size()` is
+/// `getfield this$0.size`, a field this VM never writes for an integer-keyed
+/// map (see [`is_values_view_class`] for the measurement). `vc_route` consults
+/// this bit and re-expresses the call over the live source map.
+///
+/// A memoized bit rather than a `class_name_of_id` call for the same reason
+/// [`CF_KEY_SET_VIEW`] is one: the natives that ask are on the hot path for
+/// every ordinary `ArrayList` too.
+const CF_VALUES_VIEW: u16 = 1 << 12;
 
 /// Cached classification of one `ClassId`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -312,6 +330,24 @@ fn classify_class(ctx: &dyn NativeContext, cid: ClassId) -> ClassFacts {
     // rather than a 17th variant. Paid once per `ClassId`, then cached forever.
     if ctx.class_name_arc_of_id(cid).as_deref() == Some(KSV_CLASS) {
         flags |= CF_KEY_SET_VIEW;
+    }
+    // The five `Map.values()` view classes — same one-name treatment, and the
+    // same `class_name_arc_of_id` the two blocks above already pay for. Exact
+    // class, not ancestry: `AbstractCollection` is the shared superclass of
+    // four of them AND of every foreign collection that legitimately reaches
+    // these natives, so an ancestry test would capture receivers whose backing
+    // this VM does not own. See [`CF_VALUES_VIEW`].
+    if matches!(
+        ctx.class_name_arc_of_id(cid).as_deref(),
+        Some(
+            "java/util/HashMap$Values"
+                | "java/util/LinkedHashMap$LinkedValues"
+                | "java/util/TreeMap$Values"
+                | "java/util/Hashtable$ValueCollection"
+                | "java/util/concurrent/ConcurrentHashMap$ValuesView"
+        )
+    ) {
+        flags |= CF_VALUES_VIEW;
     }
     ClassFacts(flags)
 }
@@ -4626,6 +4662,11 @@ pub fn native_al_size(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     if let Some(b) = unmod_receiver_backing(ctx, this) {
         return native_al_size(ctx, &[Value::Object(Some(b))]);
     }
+    // A real `Map.values()` view class counts through its source map, not
+    // through an ArrayList backing it does not have. See `vc_route_source_size`.
+    if let Some(r) = vc_route_source_size(ctx, this) {
+        return r;
+    }
     let this = resync_values_view(ctx, this)?;
     let (data, size) = al_state(ctx, this);
     if data.is_none() {
@@ -4649,6 +4690,15 @@ pub fn native_al_is_empty(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Int(1))),
     };
+    // Same source-map count as `native_al_size`, reduced to the boolean. Going
+    // through the count rather than through `vc_route` keeps `isEmpty()` free
+    // of the carrier allocation.
+    if let Some(r) = vc_route_source_size(ctx, this) {
+        return Ok(Some(Value::Int(match r? {
+            Some(Value::Int(n)) => i32::from(n == 0),
+            _ => 1,
+        })));
+    }
     let this = resync_values_view(ctx, this)?;
     let (data, size) = al_state(ctx, this);
     if data.is_none() {
@@ -4701,6 +4751,16 @@ fn altrace_describe(ctx: &mut dyn NativeContext, v: Value) -> String {
 }
 
 pub fn native_al_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    // `List.get(int)` on a values view is not reachable from correct Java — the
+    // real classes are `AbstractCollection`s and the cast to `List` throws
+    // (`view.castToList=java.lang.ClassCastException`, measured). The guard is
+    // here because this native is registered on `java/util/List` and can be
+    // reached by a synthetic/reflective receiver regardless of what Java could
+    // express, and answering element 0 of an object that has no elements is the
+    // failure this whole family is about.
+    if let Some(r) = vc_route(ctx, args, native_al_get) {
+        return r;
+    }
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
@@ -5067,6 +5127,9 @@ pub fn native_al_contains(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
     if let Some(r) = ksv_route(ctx, args, native_ksv_contains) {
         return r;
     }
+    if let Some(r) = vc_route(ctx, args, native_al_contains) {
+        return r;
+    }
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Int(0))),
@@ -5191,6 +5254,9 @@ fn native_al_last_index_of(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
 
 pub fn native_al_to_array(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     if let Some(r) = ksv_route(ctx, args, native_ksv_to_array) {
+        return r;
+    }
+    if let Some(r) = vc_route(ctx, args, native_al_to_array) {
         return r;
     }
     if cratonvm_types::flags::runtime_var("CRATONVM_DBG_TOARRAY").is_ok() {
@@ -5435,6 +5501,9 @@ pub fn native_al_to_array_typed(ctx: &mut dyn NativeContext, args: &[Value]) -> 
     if let Some(r) = ksv_route(ctx, args, native_ksv_to_array_typed) {
         return r;
     }
+    if let Some(r) = vc_route(ctx, args, native_al_to_array_typed) {
+        return r;
+    }
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
@@ -5492,6 +5561,13 @@ fn native_collection_to_array_generator(
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
+    // `al_or_collection_elements`' fallback walks the receiver's own
+    // `iterator()`, which for a real view class is the JDK's table-walking
+    // iterator over a table this VM never populates — i.e. silently empty.
+    // Route before that fallback can be taken.
+    if let Some(r) = vc_route(ctx, args, native_collection_to_array_generator) {
+        return r;
+    }
     let generator = args.get(1).copied().unwrap_or(Value::Object(None));
     let elems = al_or_collection_elements(ctx, this)?;
     let size = elems.len();
@@ -5563,6 +5639,12 @@ fn native_collection_to_array_generator(
 
 pub fn native_al_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     if let Some(r) = ksv_route(ctx, args, native_ksv_iterator) {
+        return r;
+    }
+    // A real view class has no element array to iterate. Rebuilding the live
+    // carrier here also preserves write-through `remove()`, because the carrier
+    // it builds is the marker-carrying one `propagate_list_removal` understands.
+    if let Some(r) = vc_route(ctx, args, native_al_iterator) {
         return r;
     }
     let input = match args.first() {
@@ -6619,6 +6701,17 @@ fn native_al_hash_code(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Int(0))),
     };
+    // A `Map.values()` view is an `AbstractCollection`, which does not override
+    // `hashCode` — so on a real JVM it hashes by IDENTITY, not by content. This
+    // VM's view is an `ArrayList`-shaped carrier, so without this arm the
+    // `AbstractList` 31*acc+e contract below runs on an object whose real class
+    // never had it. See [`al_is_values_view`] for the HotSpot transcript.
+    //
+    // No `resync_values_view` first: an identity hash does not depend on the
+    // contents, and re-collecting them would be a GC point for nothing.
+    if al_is_values_view(ctx, this) {
+        return Ok(Some(Value::Int(ctx.identity_hash_code(this))));
+    }
     let (data, size) = al_state(ctx, this);
     let size = size as usize;
     let mut hash: i32 = 1;
@@ -6672,6 +6765,19 @@ fn native_al_equals(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     let other = unwrap_unmod(ctx, other_raw);
     if std::ptr::eq(this.as_ptr(), other.as_ptr()) {
         return Ok(Some(Value::Int(1)));
+    }
+    // A `Map.values()` view is an `AbstractCollection`, which does not override
+    // `equals` — so on a real JVM two distinct views are NEVER equal, however
+    // equal their contents, and a view is never equal to a `List` of the same
+    // elements in either direction. Both identity checks above have already
+    // run, so reaching here with a view on either side means "not the same
+    // object", which is the whole of the answer. See [`al_is_values_view`].
+    //
+    // Order matters: this must sit AFTER the identity checks (so `v.equals(v)`
+    // still answers true, as HotSpot's `selfView.equals=true` records) and
+    // BEFORE `al_state`, so no content is ever compared.
+    if al_is_values_view(ctx, this) || al_is_values_view(ctx, other) {
+        return Ok(Some(Value::Int(0)));
     }
     let (data_a, size_a) = al_state(ctx, this);
     let (data_b, size_b) = al_state(ctx, other);
@@ -12195,20 +12301,11 @@ fn resync_values_view(ctx: &mut dyn NativeContext, list: ObjectRef) -> Result<Ob
     let source = ctx.read_native_pin(source_pin, source);
     // Determine whether elements are Map.Entry (entrySet) by inspecting the
     // current head element's class — restricted to our synthetic entry classes
-    // so an app value type named `*Entry` is not misread as an entry.
-    let is_entry_view = {
-        let (data, size) = al_state(ctx, list);
-        match data {
-            Some(d) if size > 0 => match ctx.get_array_element(d, 0) {
-                Value::Object(Some(e)) => ctx
-                    .class_name_of_id(ctx.class_id_of_object(e))
-                    .map(|n| is_synthetic_map_entry_class(&n))
-                    .unwrap_or(false),
-                _ => false,
-            },
-            _ => false,
-        }
-    };
+    // so an app value type named `*Entry` is not misread as an entry. Factored
+    // into `al_view_holds_entries` so this reading and `al_is_values_view`'s
+    // cannot drift; the body is unchanged (both are pure field reads, so
+    // hoisting it behind a call introduces no GC point).
+    let is_entry_view = al_view_holds_entries(ctx, list);
     let entries = collect_entries_any(ctx, source)?;
 
     // GC-SAFETY: the entry-view branch below allocates a new `SimpleEntry`
@@ -12285,6 +12382,246 @@ fn values_view_source(ctx: &dyn NativeContext, list: ObjectRef) -> Option<Object
         }
     }
     None
+}
+
+/// `true` iff a marker-carrying view list holds `Map.Entry` elements (an
+/// `entrySet()` view) rather than plain values (a `values()` view).
+///
+/// Restricted to our synthetic entry classes so an app value type named
+/// `*Entry` is not misread as an entry — the same test [`resync_values_view`]
+/// applies, factored out so the two callers cannot drift. An EMPTY view answers
+/// `false`: with no head element there is nothing to classify, and every caller
+/// of this predicate wants `values()` to be the default reading.
+fn al_view_holds_entries(ctx: &dyn NativeContext, list: ObjectRef) -> bool {
+    let (data, size) = al_state(ctx, list);
+    match data {
+        Some(d) if size > 0 => match ctx.get_array_element(d, 0) {
+            Value::Object(Some(e)) => ctx
+                .class_name_of_id(ctx.class_id_of_object(e))
+                .map(|n| is_synthetic_map_entry_class(&n))
+                .unwrap_or(false),
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
+/// `true` iff `list` is one of this crate's live `Map.values()` views — an
+/// `ArrayList`-shaped carrier with a source-map marker in its trailing capacity
+/// slot ([`values_view_source`]) whose elements are values, not entries.
+///
+/// **Why any native needs to ask.** On a real JVM `Map.values()` returns a
+/// `HashMap$Values` / `LinkedHashMap$LinkedValues` / `TreeMap$Values` /
+/// `Hashtable$ValueCollection`, and every one of those extends
+/// `java.util.AbstractCollection`, which overrides **neither `equals` nor
+/// `hashCode`**. Both therefore come from `java.lang.Object` and are IDENTITY
+/// operations. Measured on HotSpot 25.0.3+9 (probe `ValuesSem`, two `HashMap`s
+/// with identical contents):
+///
+/// ```text
+///   hm.values.class                       java.util.HashMap$Values
+///   equalMaps.values.equals               false      <- content-equal, still not equal
+///   values.hashCode.isIdentity            true
+///   values.equals.arrayListOfSameContent  false
+///   arrayListOfSameContent.equals.values  false
+///   empty.values.equals.emptyList         false      <- not even when both are empty
+///   equalMaps.keySet.equals               true       <- contrast: AbstractSet DOES override
+/// ```
+///
+/// This VM hands back a `java/util/ArrayList` instead (`native_map_values`,
+/// `native_chm_values`, `make_live_values_list`), so without this predicate
+/// `native_al_equals`/`native_al_hash_code` answer `AbstractList`'s
+/// CONTENT-based contract on an object whose real class has no such contract.
+/// The divergence is silent and it runs in the wrong direction: two unrelated
+/// maps' value collections compare EQUAL, and a `values()` view compares equal
+/// to an ordinary `ArrayList` of the same elements — so a `Set<Collection<..>>`
+/// or a `Map` keyed on a view collapses distinct entries into one.
+///
+/// The `keySet()`/`entrySet()` views are deliberately NOT covered: their real
+/// classes extend `AbstractSet`, which DOES override both, so the content-based
+/// answer is the correct one there. That is why the entry discriminator is part
+/// of this predicate and not an afterthought.
+/// The second disjunct covers a receiver whose class is ALREADY one of the five
+/// real view classes ([`is_values_view_class`]). For such an object the answer
+/// is the same and the reason is stronger — its real superclass genuinely is
+/// `AbstractCollection`, so identity is not an emulation but the actual
+/// contract. Keeping both readings behind one predicate is what stops the
+/// `ArrayList`-shaped carrier and the real class from drifting apart while the
+/// two shapes coexist.
+fn al_is_values_view(ctx: &dyn NativeContext, list: ObjectRef) -> bool {
+    if is_values_view_class(ctx, list) {
+        return true;
+    }
+    values_view_source(ctx, list).is_some() && !al_view_holds_entries(ctx, list)
+}
+
+/// `true` iff `obj`'s runtime class is one of the five real JDK classes that
+/// `Map.values()` returns. See [`CF_VALUES_VIEW`].
+///
+/// **Why these receivers need rerouting rather than their own bytecode.**
+/// Measured on HotSpot 25.0.3+9 (`javap -p -c java.util.HashMap$Values`), the
+/// real body of `size()` is three instructions:
+///
+/// ```text
+///   0: aload_0
+///   1: getfield  #7   // Field this$0:Ljava/util/HashMap;
+///   4: getfield  #19  // Field java/util/HashMap.size:I
+///   7: ireturn
+/// ```
+///
+/// — a RAW read of the source map's `size` field. In this VM an integer-keyed
+/// `HashMap`'s entries live in the `hm_int_fast_shards` overlay:
+/// `try_hm_int_fast_put` inserts into the Rust shard and returns without ever
+/// calling `set_map_size`, and it only engages when `map_state` already reports
+/// size 0. `native_map_size` reads `hm_int_fast_len` BEFORE `map_state`, so the
+/// two owners never reconcile and the heap `size` slot stays 0 for the object's
+/// whole life. Real `HashMap$Values.size()` would therefore answer **0** on a
+/// non-empty map. `Hashtable$ValueCollection.size()` is the same shape
+/// (`getfield this$0.count`).
+///
+/// Not every method is like that, and the difference decides which ones need a
+/// native at all — `TreeMap$Values.size()` is `invokevirtual TreeMap.size()`
+/// and `HashMap$Values.clear()` is `invokevirtual HashMap.clear()`, both of
+/// which reach registered natives and are correct as bytecode. The per-class
+/// split is tabulated in `docs/known-issues/jdk-only/C13-1-*`.
+#[inline]
+fn is_values_view_class(ctx: &dyn NativeContext, obj: ObjectRef) -> bool {
+    receiver_facts(ctx, obj).has(CF_VALUES_VIEW)
+}
+
+/// The source map a real view-class object was built over.
+///
+/// Resolved BY NAME, never by slot, and the reason is
+/// `LinkedHashMap$LinkedValues` — it is the one member of the family with TWO
+/// fields, and `javap -p` declares them in this order:
+///
+/// ```text
+/// final class java.util.LinkedHashMap$LinkedValues extends
+///         java.util.AbstractCollection<V> implements java.util.SequencedCollection<V> {
+///   final boolean reversed;
+///   final java.util.LinkedHashMap this$0;
+/// ```
+///
+/// so its `this$0` is slot **1**, not slot 0. A hard-coded slot 0 would read
+/// the `reversed` boolean as an object reference — a wrong-typed read of
+/// exactly the kind `al_state`'s layout guard exists to prevent. The CHM member
+/// needs the second name: `ConcurrentHashMap$ValuesView` declares no map field
+/// itself and inherits `map` from `ConcurrentHashMap$CollectionView`, which
+/// `resolve_field_index_by_class_id` finds by walking the chain (the same walk
+/// that finds `Properties`' inherited `count` in [`map_size_slot`]).
+fn values_view_class_source(ctx: &dyn NativeContext, view: ObjectRef) -> Option<ObjectRef> {
+    let cid = ctx.class_id_of_object(view);
+    let nf = ctx.object_num_fields(view);
+    for name in ["this$0", "map"] {
+        if let Some(slot) = ctx.resolve_field_index_by_class_id(cid, name) {
+            if slot < nf {
+                if let Value::Object(Some(m)) = ctx.get_field(view, slot) {
+                    return Some(m);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Reroute a real `Map.values()` view-class receiver that arrived at one of the
+/// generic `ArrayList`-shaped natives, by re-expressing the call over a live
+/// `ArrayList`-shaped view of the same source map.
+///
+/// The twin of [`ksv_route`], and it exists for the same reason: a receiver
+/// that matches neither layout the generic natives read must not be decoded as
+/// though it did. It differs in one deliberate way — `ksv_route` hands off to a
+/// hand-written `native_ksv_*` implementation per method, whereas this one
+/// rebuilds the marker-carrying carrier that `native_map_values` already
+/// produces and then calls the SAME `imp`. That reuse is the point: liveness,
+/// write-through removal and the entry/value discriminator are all already
+/// implemented and measured on that path (`values_view_source` /
+/// `resync_values_view` / `propagate_list_removal`), so a view-class receiver
+/// gets the behaviour this VM already ships rather than a second
+/// implementation of it that can drift.
+///
+/// Two consequences worth stating rather than discovering:
+///
+/// * the iterator handed back is an iterator over the rebuilt carrier, so its
+///   `remove()` writes through to the source exactly as `values().iterator()`
+///   does today;
+/// * a `reversed` `LinkedValues` iterates FORWARD here. The `reversed` bit is
+///   read by nothing in this crate yet. That is a fidelity gap, not a crash,
+///   and it is unreachable until `native_lhm_values` returns the real class.
+///
+/// Errors are returned, never flattened to "empty". `collect_entries_any` can
+/// refuse (a `hashCode()` on an element can throw), and this crate has already
+/// paid once for a helper that mapped a refusal onto `Vec::new()` — see
+/// `collection_elements_generic`'s own doc.
+fn vc_route(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+    imp: fn(&mut dyn NativeContext, &[Value]) -> MethodCallResult,
+) -> Option<MethodCallResult> {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return None,
+    };
+    if !is_values_view_class(ctx, this) {
+        return None;
+    }
+    let source = values_view_class_source(ctx, this)?;
+    // GC-safety, and the pins go up FIRST — before `collect_entries_any`, not
+    // between it and `make_view_list_of`. Two distinct hazards:
+    //
+    //  * `collect_entries_any` re-enters Java (a TreeMap comparator, an
+    //    element's `hashCode`, a `Properties` entrySet rebuild), so it can move
+    //    `source` and every remaining argument before it returns. Pinning after
+    //    it would pin an address that is already stale — the "Family 1"
+    //    stale-ObjectRef shape this crate has paid for repeatedly (see
+    //    `remove_source_entry_by_value` immediately below).
+    //  * `make_view_list_of` then allocates the carrier AND its backing array.
+    //
+    // `vals` needs no pin of its own: `make_view_list_of` pins the slice it is
+    // handed as its very first act, before it allocates, and nothing between
+    // this `collect` and that call touches the Java heap.
+    let source_pin = ctx.pin_native_root(source);
+    let tail: Vec<Value> = args[1..].to_vec();
+    let (_, tail_handles) = pin_value_slice(ctx, &tail);
+    let entries = match collect_entries_any(ctx, source) {
+        Ok(e) => e,
+        Err(e) => {
+            ctx.unpin_native_roots(source_pin);
+            return Some(Err(e));
+        }
+    };
+    let vals: Vec<Value> = entries.into_iter().map(|(_, v)| v).collect();
+    let source = ctx.read_native_pin(source_pin, source);
+    let list = match make_view_list_of(ctx, source, &vals) {
+        Ok(l) => l,
+        Err(e) => {
+            ctx.unpin_native_roots(source_pin);
+            return Some(Err(e));
+        }
+    };
+    let mut call_args: Vec<Value> = Vec::with_capacity(args.len());
+    call_args.push(Value::Object(Some(list)));
+    for (i, v) in tail.iter().enumerate() {
+        call_args.push(read_pinned_elem(ctx, tail_handles[i], *v));
+    }
+    let r = imp(ctx, &call_args);
+    ctx.unpin_native_roots(source_pin);
+    Some(r)
+}
+
+/// `vc_route`'s cheap arm for the two size questions.
+///
+/// `size()` and `isEmpty()` do not need the elements, so rebuilding the carrier
+/// for them would be an allocation (and a GC point) purely to count. Ask the
+/// source map instead — `native_map_size` already dispatches the TreeMap / CHM
+/// / integer-overlay families correctly, which is exactly the set of answers a
+/// view over that map must agree with.
+fn vc_route_source_size(ctx: &mut dyn NativeContext, this: ObjectRef) -> Option<MethodCallResult> {
+    if !is_values_view_class(ctx, this) {
+        return None;
+    }
+    let source = values_view_class_source(ctx, this)?;
+    Some(native_map_size(ctx, &[Value::Object(Some(source))]))
 }
 
 /// Delete the first entry of `source` whose value equals `value` (identity
@@ -15801,6 +16138,9 @@ fn native_collections_unmodifiable_list(
 
 fn native_al_for_each(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     if let Some(r) = ksv_route(ctx, args, native_ksv_for_each) {
+        return r;
+    }
+    if let Some(r) = vc_route(ctx, args, native_al_for_each) {
         return r;
     }
     let this = match args.first() {
@@ -20544,6 +20884,9 @@ fn native_stream_concat(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
 
 fn native_al_stream(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     if let Some(r) = ksv_route(ctx, args, native_ksv_stream) {
+        return r;
+    }
+    if let Some(r) = vc_route(ctx, args, native_al_stream) {
         return r;
     }
     let this = match args.first() {
@@ -31740,6 +32083,64 @@ fn register_linked_list_natives(registry: &mut NativeMethodRegistry) {
     registry.register(c, "clear", "()V", native_ll_clear);
     registry.register(c, "peek", "()Ljava/lang/Object;", native_ll_peek);
     registry.register(c, "poll", "()Ljava/lang/Object;", native_ll_poll);
+    // ---- the four `LinkedList` methods real bytecode was still MUTATING ----
+    //
+    // `ll_get` reads the overlay FIRST and only falls back to the real
+    // `first`/`last`/`size` on a MISS (see its overlay-MISS arm). `ll_set`
+    // mirrors overlay -> heap, but nothing mirrors heap -> overlay, and
+    // `<init>` seeds the overlay for every natively constructed list — so once
+    // a `LinkedList` exists, ANY real-bytecode write to `size`/`first`/`last`
+    // is invisible to every native reader, permanently. `native_ll_iterator`
+    // records the resulting reproducer (`NullPointerException: Cannot read
+    // field "item"` in real `LinkedList$ListItr.previous`) and concludes
+    // "keep the natives the single writer". These four registrations are the
+    // rest of that conclusion: without them the class still has four public
+    // entry points that run real mutating bytecode.
+    //
+    // Verified against `javap -p -c java.util.LinkedList` (JDK 25.0.3+9), which
+    // is what makes this a list of four and not a guess:
+    //
+    //   pollFirst()  `getfield first` then `invokevirtual unlinkFirst` — real
+    //                `unlinkFirst` writes `first`, `size` and `modCount`. The
+    //                `java/util/Deque` interface bridge does NOT cover it
+    //                (`register_queue_deque_interface_natives` registers
+    //                `peekFirst`/`peekLast` but no `pollFirst`/`pollLast`), and
+    //                an interface row would not win anyway: `LinkedList`
+    //                declares the method itself.
+    //   pollLast()   same shape through `unlinkLast`.
+    //   addAll(I,C)  links the new nodes inline, writing `first`/`last`/`size`.
+    //                Its no-index sibling `addAll(C)` was already registered
+    //                (`native_ll_add_all`, in the bulk-op registrar) — this is
+    //                the half of the pair that was missed.
+    //   descendingIterator()  does NOT go through the registered
+    //                `listIterator(I)`: its bytecode is
+    //                `new LinkedList$ListItr; dup; …; invokevirtual size;
+    //                 invokespecial ListItr.<init>(LinkedList;I)`, i.e. it
+    //                constructs the real node-live `ListItr` DIRECTLY, so
+    //                `remove()` calls real `LinkedList.unlink`. This is the
+    //                exact path `native_ll_iterator`'s comment names as the
+    //                measured reproducer, and it was the one door left open.
+    //
+    // The remaining unregistered `LinkedList` methods were checked and are
+    // benign: `remove()`, `element()`, `offerFirst`, `offerLast`, `push`, `pop`
+    // are one-line `invokevirtual`s onto methods registered above; `peekFirst`,
+    // `peekLast`, `indexOf`, `lastIndexOf` only READ the mirrored heap chain;
+    // `clone()` writes only the fresh clone's own fields before populating it
+    // through the native `add`.
+    registry.register(c, "pollFirst", "()Ljava/lang/Object;", native_ll_poll_first);
+    registry.register(c, "pollLast", "()Ljava/lang/Object;", native_ll_poll_last);
+    registry.register(
+        c,
+        "addAll",
+        "(ILjava/util/Collection;)Z",
+        native_ll_add_all_at,
+    );
+    registry.register(
+        c,
+        "descendingIterator",
+        "()Ljava/util/Iterator;",
+        native_ll_descending_iterator,
+    );
     registry.register(c, "offer", "(Ljava/lang/Object;)Z", native_ll_add);
     registry.register(c, "toArray", "()[Ljava/lang/Object;", native_ll_to_array);
     // LinkedList.toArray(T[]) — typed overload. Without this the JDK's
@@ -33002,6 +33403,181 @@ fn native_ll_poll(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
         return Ok(Some(Value::Object(None)));
     }
     Ok(Some(ll_unlink_first(ctx, this)))
+}
+
+/// `LinkedList.pollFirst()` — real bytecode is `first == null ? null :
+/// unlinkFirst(first)`, i.e. exactly `poll()`'s body. Registered separately
+/// because a native on `poll` does not intercept `pollFirst`, and the real
+/// `unlinkFirst` is a second writer on `size`/`first` that `ll_get`'s
+/// overlay-first read can never see. See the registrar note.
+fn native_ll_poll_first(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    native_ll_poll(ctx, args)
+}
+
+/// `LinkedList.pollLast()` — `last == null ? null : unlinkLast(last)`. The
+/// mirror image of [`native_ll_poll_first`]; `removeLast()` differs only in
+/// throwing `NoSuchElementException` on empty where this answers `null`.
+fn native_ll_poll_last(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    if ll_size(ctx, this) == 0 {
+        return Ok(Some(Value::Object(None)));
+    }
+    Ok(Some(ll_unlink_last(ctx, this)))
+}
+
+/// `LinkedList.addAll(int index, Collection c)` — the indexed half of the
+/// `addAll` pair whose no-index sibling is [`native_ll_add_all`].
+///
+/// Bounds are checked BEFORE the first link, as the JDK does
+/// (`checkPositionIndex` precedes `c.toArray()`), so a bad index cannot leave a
+/// half-inserted list. `collect_collection_elements_or_real` is the same
+/// accessor `native_ll_add_all` uses, so a foreign (non-native-backed) source
+/// collection is read through its own bytecode rather than reported empty.
+fn native_ll_add_all_at(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let index = match args.get(1) {
+        Some(Value::Int(i)) => *i,
+        _ => 0,
+    };
+    let coll = match args.get(2) {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let size = ll_size(ctx, this);
+    if index < 0 || index > size {
+        return Err(ll_out_of_bounds(index, size));
+    }
+    // Family-1 fix (cce0079), copied from `native_ll_add_all`: every link
+    // allocates a node, so an earlier iteration's GC leaves `this` and every
+    // later `elems` slot stale. Pin and refresh per iteration. The insertion
+    // point walk (`ll_node_at`) must also be redone per element, because the
+    // node that was at `at` moves one position along after each insert.
+    //
+    // The pin is taken BEFORE the element collection, not after: reading a
+    // foreign source collection runs its own bytecode, which is a GC point that
+    // can relocate `this`.
+    let this_pin = ctx.pin_native_root(this);
+    let elems = match collect_collection_elements_or_real(ctx, coll) {
+        Ok(e) => e,
+        Err(err) => {
+            ctx.unpin_native_roots(this_pin);
+            return Err(err);
+        }
+    };
+    if elems.is_empty() {
+        ctx.unpin_native_roots(this_pin);
+        return Ok(Some(Value::Int(0)));
+    }
+    let (_, handles) = pin_value_slice(ctx, &elems);
+    // The loop's first act is a `read_native_pin`, so this binding is only a
+    // carrier — do not pre-refresh it, or the assignment reads as dead.
+    let mut this = this;
+    let mut at = index;
+    let mut failed: Option<MethodCallFailed> = None;
+    for (i, e) in elems.iter().enumerate() {
+        this = ctx.read_native_pin(this_pin, this);
+        let e = read_pinned_elem(ctx, handles[i], *e);
+        let step = if at >= ll_size(ctx, this) {
+            ll_link_last(ctx, this, e)
+        } else {
+            match ll_node_at(ctx, this, at) {
+                Some(succ) => ll_link_before(ctx, this, e, succ),
+                None => ll_link_last(ctx, this, e),
+            }
+        };
+        if let Err(err) = step {
+            failed = Some(err);
+            break;
+        }
+        at += 1;
+    }
+    ctx.unpin_native_roots(this_pin);
+    match failed {
+        Some(e) => Err(e),
+        None => Ok(Some(Value::Int(1))),
+    }
+}
+
+/// `LinkedList.descendingIterator()` — a REVERSED snapshot iterator.
+///
+/// Real `descendingIterator()` does not delegate to the registered
+/// `listIterator(int)`: it `new`s a `java/util/LinkedList$ListItr` and calls its
+/// constructor directly, so the returned iterator is node-live and its
+/// `remove()` runs real `LinkedList.unlink` — a second writer on `size`,
+/// `first` and `last` that `ll_get` never observes. That is the measured
+/// reproducer `native_ll_iterator`'s comment records, and until this
+/// registration existed it was reachable from plain Java with no reflection.
+///
+/// The snapshot is reversed in place before it is handed to
+/// `real_snapshot_iterator`, which builds a REAL `java/util/Arrays$ArrayItr`
+/// over it — so `hasNext`/`next` are real JDK bytecode over real fields, and
+/// only `remove()` is routed back through the natives.
+///
+/// Residual, stated because `SnapshotItrRoute::LinkedList`'s own doc states it:
+/// that route removes the FIRST occurrence of the returned element rather than
+/// unlinking the exact node, so on a list holding DUPLICATES a
+/// `descendingIterator().remove()` deletes the wrong one of the equal pair. The
+/// alternative it replaces deleted the right node and then corrupted `size` for
+/// the rest of the list's life, so this is the smaller residual, not the
+/// absence of one.
+fn native_ll_descending_iterator(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    // GC-safety: mirrors `native_ll_iterator`'s refusal arm — `ll_snapshot_array`
+    // allocates, so `this` is pinned across it and re-read before it is recorded
+    // as the iterator's backing. `snap` is pinned too, because the fallback arm
+    // below has to hand it on AFTER an allocation attempt.
+    let this_pin = ctx.pin_native_root(this);
+    let snap = ll_snapshot_array(ctx, this);
+    let snap_pin = ctx.pin_native_root(snap);
+    let n = ctx.array_length(snap);
+    // Reverse in place. Pure array reads/writes: no allocation, so no GC point
+    // separates the two ends of a swap.
+    if n > 1 {
+        let mut lo = 0usize;
+        let mut hi = n - 1;
+        while lo < hi {
+            let a = ctx.get_array_element(snap, lo);
+            let b = ctx.get_array_element(snap, hi);
+            ctx.set_array_element(snap, lo, b);
+            ctx.set_array_element(snap, hi, a);
+            lo += 1;
+            hi -= 1;
+        }
+    }
+    let this = ctx.read_native_pin(this_pin, this);
+    let snap_cur = ctx.read_native_pin(snap_pin, snap);
+    match real_snapshot_iterator(ctx, snap_cur, n, Some((this, SnapshotItrRoute::LinkedList))) {
+        Ok(v) => {
+            ctx.unpin_native_roots(this_pin);
+            Ok(v)
+        }
+        // Only reachable in an image with no real `java/util/Arrays$ArrayItr`,
+        // i.e. a `synthetic-jdk` build — where there is no real `LinkedList`
+        // bytecode for this method to have been shadowing in the first place.
+        // Fall back to the crate's historical snapshot shape rather than
+        // propagating a refusal that names a class the strict mode was never
+        // asked about. `remove()` is `UnsupportedOperationException` on that
+        // shape, which is what every other synthetic-jdk snapshot iterator
+        // already answers; the real-JDK arm above is the one that carries the
+        // `SnapshotItrRoute::LinkedList` write-back.
+        Err(_) => {
+            let snap_cur = ctx.read_native_pin(snap_pin, snap);
+            ctx.unpin_native_roots(this_pin);
+            make_fabricated_iterator_from_array(ctx, snap_cur, n)
+        }
+    }
 }
 
 fn native_ll_to_array(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {

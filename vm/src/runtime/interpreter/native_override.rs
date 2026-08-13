@@ -2856,10 +2856,61 @@ pub(super) fn force_native_over_real_jdk_bytecode(
     if class_name == "javax/management/MBeanServer" {
         return true;
     }
-    // The real Collections.emptyList() returns the class's pre-built static
-    // singleton. During the Brave bootstrap that slot can retain a polluted
-    // ArrayList, so use the registered constructor-backed empty-list native
-    // instead of exposing that stale shared state.
+    // `java/util/Collections.emptyList()`.
+    //
+    // The comment that stood here said: "The real Collections.emptyList()
+    // returns the class's pre-built static singleton. During the Brave
+    // bootstrap that slot can retain a polluted ArrayList, so use the
+    // registered constructor-backed empty-list native instead of exposing that
+    // stale shared state."
+    //
+    // Only its first sentence is still true, and the rest is self-refuting
+    // against the native it routes to. `native_collections_empty_list`
+    // (`native-collections/src/lib.rs`) begins with
+    // `collections_empty_singleton(ctx, "EMPTY_LIST")`, which is a
+    // `get_static_field(java/util/Collections, EMPTY_LIST)` — it READS the very
+    // slot the comment claims this arm exists to avoid. If that slot held a
+    // polluted `ArrayList`, this arm would hand the pollution straight back. It
+    // cannot deliver the protection it advertised, and could not on the day it
+    // was written unless the native looked different then.
+    //
+    // The hazard itself was real and was fixed AT ITS SOURCE, elsewhere:
+    // `ensure_collections_empty_singletons` used to seed `EMPTY_LIST` with an
+    // ordinary MUTABLE synthetic `java/util/ArrayList`, so
+    // `emptyList() instanceof ArrayList` was true, kotlin-reflect's shaded
+    // protobuf `SmallSortedMap.ensureEntryArrayMutable` skipped its replacement
+    // step on the strength of that, and mutated the process-wide singleton. It
+    // now seeds the real immutable `Collections$Empty*` instances. That is where
+    // "a polluted ArrayList in the slot" was closed; this arm never closed it.
+    //
+    // WHAT THE ARM ACTUALLY DOES TODAY is the native's SECOND half: when
+    // `EMPTY_LIST` is not yet initialised, fabricate a fresh empty list rather
+    // than returning null. Note that fallback diverges from the oracle on all
+    // three properties measured on HotSpot 25.0.3:
+    //     class            = java.util.Collections$EmptyList   (fallback: ArrayList)
+    //     add("x")         = UnsupportedOperationException     (fallback: ACCEPTED)
+    //     two calls same   = true                              (fallback: fresh each call)
+    // so the arm buys bootstrap-order robustness and pays for it in fidelity.
+    //
+    // DO NOT DELETE THIS AS A ONE-LINER. Two things have to be established
+    // first, and neither is done:
+    //
+    // 1. Whether this arm decides anything at all. `resolve_step1_native`
+    //    resolves the triple in the registry and dispatches what it finds
+    //    BEFORE this function runs — that is exactly why the twelve-shape
+    //    forced-native `java/lang/String` policy above turned out to be
+    //    measured inert and was deleted. `Collections.emptyList` is a live
+    //    `Bridge` registration (`native-collections/src/lib.rs`,
+    //    `register_collections_utility_natives`), so the same question applies
+    //    and has not been asked.
+    // 2. Removing it is a PAIR, not a line. Handing the method back to real JDK
+    //    bytecode also needs the triple in `RETIRED_SHADOW_TRIPLES`
+    //    (`native-api/src/retired_shadow.rs`) — it is not there today. Dropping
+    //    this arm alone leaves the registered native winning by ordinary
+    //    dispatch and changes nothing; adding the table entry alone leaves this
+    //    arm forcing the native over the bytecode. Neither half is useful on
+    //    its own, and that file's own rule applies: a class's state has to
+    //    become real before its shadow can be retired.
     if class_name == "java/util/Collections"
         && method_name == "emptyList"
         && method_descriptor == "()Ljava/util/List;"

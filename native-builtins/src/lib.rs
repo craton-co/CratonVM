@@ -14675,11 +14675,27 @@ pub fn register_essential_natives_with_shims(
     // installs no OS signal handlers, so the Java handler that was just
     // registered will never fire. We still report 0 rather than -1: every
     // in-tree caller (`Terminator.setup` during initPhase1, Tomcat/log4j
-    // shutdown hooks) treats the exception as fatal-to-that-feature, and the
+    // shutdown hooks) treats the exception as fatal-to-that-feature, so
+    // throwing here would break boot without buying the caller any working
+    // signal delivery. Deliberate silent accept; see the wave-2 stub-removal
+    // report.
+    //
+    // CORRECTED 2026-08-12 (lane C9). This comment used to end "...and the
     // VM's own shutdown path runs through `Runtime.addShutdownHook`, not
-    // signals — so throwing here would break boot without buying the caller
-    // any working signal delivery. Deliberate silent accept; see the wave-2
-    // stub-removal report.
+    // signals", offering that as the reason the silent accept is harmless.
+    // **That premise is false and it is the second-worst thing about it: the
+    // comment reads as an assurance that orderly shutdown still works.** It
+    // does not. `Runtime.addShutdownHook` is intercepted by a native in
+    // `lang_system.rs` that roots the hook in a `SHUTDOWN_HOOKS` vector whose
+    // only reader is `removeShutdownHook`, and no exit path in this VM runs
+    // it — not `System.exit`, not `Runtime.exit`, not the launcher's
+    // post-`main` return, not the uncaught-exception path. So a Tomcat or
+    // log4j teardown reaches this VM through neither door: the signal
+    // handler is accepted and never fires, AND the shutdown hook is accepted
+    // and never runs. The accept above is still the right call for boot; what
+    // is removed is the false consolation. See
+    // `docs/known-issues/jdk-only/W7-92-shutdown-hooks-never-run.md`, and do
+    // not restore the old sentence until its `RShutdownHooks` vector is green.
     registry.register_with_kind(
         "jdk/internal/misc/Signal",
         "handle0",
@@ -19999,49 +20015,38 @@ pub fn register_essential_natives_with_shims(
     // `fixed-suite-bugs/h2-suite-bugs/bug-h2-timezone-zonerules-offset-miscalculation-FIXED.md`.
 
     fn alloc_synth_timezone(ctx: &mut dyn NativeContext, id_str: &str) -> Result<cratonvm_types::Value, MethodCallFailed> {
-        // DST-aware path (hib-temporal DST-boundary skew): for a zone whose
-        // current recurring DST rule is known (`tz_dst_rule`), construct a
-        // real `java.util.SimpleTimeZone` through its full constructor — its
-        // real bytecode implements `getOffset(long)`/`inDaylightTime`
-        // correctly for both halves of the year, where the transitions-less
-        // synthetic ZoneInfo below returns the standard (winter) offset
-        // year-round (the HIB-CV-34 known limitation; visible as the
-        // `LocalDateTimeTest` "expected 2018-10-28T01:00 but was
-        // 2018-10-28T00:00" 1-hour skew on any DST-period date). Any failure
-        // falls through to the legacy ZoneInfo path — never worse.
-        if let (Some(std_secs), Some(rule)) =
-            (tz_standard_offset_seconds(id_str), tz_dst_rule(id_str))
-        {
-            let id_obj = ctx.create_string(id_str);
-            let mut args: Vec<Value> = Vec::with_capacity(13);
-            args.push(Value::Int(std_secs.saturating_mul(1000)));
-            args.push(Value::Object(Some(id_obj)));
-            args.extend(rule.iter().map(|&v| Value::Int(v)));
-            if let Ok(Some(Value::Object(Some(obj)))) = ctx.new_object_initialized(
-                "java/util/SimpleTimeZone",
-                "(ILjava/lang/String;IIIIIIIIIII)V",
-                &args,
-            ) {
-                // HIB-DST-STARTYEAR (2026-07-17): gate the just-constructed
-                // SimpleTimeZone's DST rule to real HotSpot's own historical
-                // adoption year for this zone via the real
-                // `SimpleTimeZone.setStartYear(int)` bytecode — see
-                // `dst_start_year` above for how these years were found and
-                // what this fix does/doesn't cover. Best-effort: any
-                // dispatch failure just leaves the SimpleTimeZone ungated
-                // (this project's pre-fix, DST-applied-year-round
-                // behavior) — never worse than before this fix.
-                if let Some(start_year) = dst_start_year(id_str) {
-                    let _ = ctx.invoke_virtual_bytecode_only(
-                        obj,
-                        "setStartYear",
-                        "(I)V",
-                        &[Value::Int(start_year)],
-                    );
-                }
-                return Ok(cratonvm_types::Value::Object(Some(obj)));
-            }
-        }
+        // C12-1 (2026-08-12): the DST-aware `tz_dst_rule` branch that used to
+        // stand here — construct a real `java.util.SimpleTimeZone` through its
+        // 13-arg constructor and gate it with `setStartYear` — is DELETED.
+        //
+        // Three independent reasons, in order of weight:
+        //
+        //  1. It is superseded. The TZDB-OFFSET note below states it in the
+        //     file's own words: the tzdb path "Supersedes the previous
+        //     `tz_dst_rule`/`dst_start_year`/`historical_lmt_offset`
+        //     hand-rolled approximations (a ~20-zone allowlist modeling only
+        //     each zone's *current* recurring DST rule) — this covers every
+        //     zone's full historical transition table instead." The
+        //     approximation's consumers were retired then; the branch that
+        //     PRODUCED it was not.
+        //  2. It disagrees with the oracle. Measured on HotSpot 25.0.3+9-LTS:
+        //     `TimeZone.getTimeZone("America/New_York").getClass()` is
+        //     `sun.util.calendar.ZoneInfo`, for every id tried and never a
+        //     `SimpleTimeZone`. The `ZoneInfo` path below is the shape real
+        //     HotSpot returns, so this deletion moves toward the oracle.
+        //  3. It is what made the `SimpleTimeZone` native family look
+        //     justified. Those four natives existed to make THIS fabricated
+        //     object answer from tzdb, and being per-CLASS they also captured
+        //     every `new SimpleTimeZone(rawOffset, id)` an application builds
+        //     — see the unregistration below and
+        //     `docs/known-issues/jdk-only/C6-2-simpletimezone-id-resolved-instead-of-rawoffset.md`.
+        //     With no fabricated `SimpleTimeZone` left to serve, the
+        //     registration has no remaining constituency at all.
+        //
+        // `tz_dst_rule` and `dst_start_year` above are now unreferenced. They
+        // are left in place only so this diff is one behaviour change rather
+        // than two; they have NO callers and must not acquire new ones —
+        // `crate::tzdb` is the single source of transition data.
         // Prefer sun/util/calendar/ZoneInfo (concrete subclass of TimeZone).
         // Fall back to allocating with class-id 0 if init fails — the
         // caller only needs an object whose `getID()` returns id_str.
@@ -20470,12 +20475,49 @@ pub fn register_essential_natives_with_shims(
     ()
 }
     register_tzdb_offset_natives_for(registry, "sun/util/calendar/ZoneInfo");
-    register_tzdb_offset_natives_for(registry, "java/util/SimpleTimeZone");
-    // The abstract base too. Only the two concrete subclasses above carried the
-    // offset family, so anything holding a `TimeZone`-typed reference — which
-    // is how the API is normally used — had no `getRawOffset`. A subclass
-    // receiver still resolves its own exact-class registration first; this is
-    // the fallback for the base.
+    // C12-1 (2026-08-12): `java/util/SimpleTimeZone` is DELIBERATELY NOT HERE.
+    //
+    // These four bodies answer from the RECEIVER'S `ID` FIELD, resolved against
+    // tzdb. That is right for a `ZoneInfo`, whose id IS the zone. It is wrong
+    // for a `java.util.SimpleTimeZone`, whose id is by contract an opaque LABEL
+    // and whose offset is the `rawOffset` its constructor stored:
+    // `new SimpleTimeZone(18000000, "America/Buenos_Aires").getRawOffset()` is
+    // `18000000` on HotSpot 25 and was `-10800000` here, because the label won.
+    // `SimpleTimeZone.getRawOffset()` is one instruction — `getfield rawOffset`
+    // — and this registration shadowed it. See
+    // `docs/known-issues/jdk-only/C6-2-simpletimezone-id-resolved-instead-of-rawoffset.md`
+    // for the full measurement set, including the silent half: unregistered
+    // `inDaylightTime(Date)` is `getOffset(t) != this.rawOffset` in real
+    // bytecode, so a hijacked `getOffset` against the real field made a zone
+    // with NO DST rule report that it IS in daylight time.
+    //
+    // WHY THE BASE REGISTRATION BELOW DOES NOT SIMPLY INHERIT THE DEFECT.
+    // `NativeMethodRegistry::find` is an exact `(class, method, descriptor)`
+    // lookup with no hierarchy walk of its own; the walk lives in the caller.
+    // For an invokevirtual, `try_stackless_invoke`'s `class_name` is the
+    // RECEIVER's runtime class (`invoke.rs`, `invoke_class`), `walk_native_hierarchy`
+    // is `false`, and the superclass climb is skipped outright when the
+    // receiver's own class declares the method
+    // (`invoke.rs`: `if has_own_bytecode { return None; }`). Real
+    // `java.util.SimpleTimeZone` DECLARES all three live members of this family
+    // — `getRawOffset()I`, `getOffset(J)I` and `getOffsets(J[I)I` (`javap -p`,
+    // JDK 25) — so with the exact-class registration gone each one runs its own
+    // bytecode and never reaches `java/util/TimeZone`'s copy. The late
+    // native-override check at step 6 keys on the DECLARING class of the
+    // resolved method, which is `SimpleTimeZone` for the same reason.
+    //
+    // The base registration therefore still does its job (a `TimeZone`-typed
+    // receiver with no bytecode of its own — the synthetic-JDK stub, and the
+    // `ZoneInfo`-less fallback object this function's tail allocates) without
+    // capturing a real `SimpleTimeZone`. `getOffsetsByWall(J[I)I` is the one
+    // member `SimpleTimeZone` does not declare, and it cannot be reached on one:
+    // `SimpleTimeZone` is not a `ZoneInfo`, and the only caller
+    // (`GregorianCalendar`) downcasts before invoking it.
+    //
+    // The abstract base. Only the concrete subclass above carries the offset
+    // family, so anything holding a `TimeZone`-typed reference to a receiver
+    // with no bytecode of its own — which is how the API is normally used —
+    // would otherwise have no `getRawOffset`.
     register_tzdb_offset_natives_for(registry, "java/util/TimeZone");
 
     // `TimeZone.getID()` reads the `ID` field, exactly as the real base-class
@@ -21267,6 +21309,19 @@ fn register_hex_format_real_jdk_natives(registry: &mut NativeMethodRegistry) {
         let obj = ctx.create_string(&s);
         Ok(Some(Value::Object(Some(obj))))
     });
+    // The bodies above build their answer with `{:02x}` and never read the
+    // RECEIVER, so every `HexFormat.with*` setting — uppercase, delimiter,
+    // prefix, suffix — was inert: an option object with no reader. They also
+    // carried two panics reachable from ordinary bytecode (`formatHex(b,3,1)`
+    // underflows a usize; `parseHex` byte-slices a String) and answered
+    // `isHexDigit(0x661) == true` through an `as u8` truncation.
+    //
+    // `register_p64_hex_format` is the corrected twin. Registering it LAST is
+    // deliberate: `register()` is last-write-wins, and until this call existed
+    // the phases_late family only ever won in synthetic-jdk mode, so the
+    // shipping default ran the broken copy.
+    // docs/known-issues/jdk-only/W8-C15-2-option-objects-with-no-reader.md
+    crate::phases_late::register_p64_hex_format(registry);
     registry.set_category(__prev_cat);
 }
 
@@ -23217,7 +23272,22 @@ pub fn register_synthetic_overrides(registry: &mut NativeMethodRegistry) {
         "java/lang/String",
         "codePoints",
         "()Ljava/util/stream/IntStream;",
-        native_string_chars, // Same as chars() for BMP characters
+        // NOT `native_string_chars`, which is what this line said until
+        // 2026-08-12 with the comment "Same as chars() for BMP characters" —
+        // true for the BMP, and precisely why nobody looked again. `chars()`
+        // yields UTF-16 code UNITS, so a supplementary character arrives as its
+        // two surrogates and `codePoints()` must pair them back into ONE code
+        // point: on HotSpot 25 `"a😀b".codePoints()` is
+        // `[97, 128512, 98]` (3 elements), against `[97, 55357, 56832, 98]`
+        // (4) for `chars()`. So `codePoints().count()` was wrong too, not only
+        // the values.
+        //
+        // This is the SECOND of exactly two registrations of this triple; the
+        // twin is `lang_math.rs`'s, and `register()` is last-write-wins, so
+        // whichever registrar runs later silently decides. Both now bind the
+        // same body, which is what makes the fix independent of that order.
+        // docs/known-issues/jdk-only/W7-95a-string-code-point-family.md
+        crate::lang_string::native_string_code_points,
     );
     registry.register(
         "java/lang/String",
@@ -28022,22 +28092,24 @@ fn native_uuid_random(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCal
 }
 
 fn native_uuid_from_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    // `UUID.fromString(null)` is a NullPointerException on HotSpot, not a null
+    // return — a native whose descriptor returns java/util/UUID must not answer
+    // the void-shaped `Ok(None)`.
     let s = match args.first() {
         Some(Value::Object(Some(r))) => ctx.read_string(*r).unwrap_or_default(),
-        _ => return Ok(Some(Value::Object(None))),
+        _ => return Err(RuntimeError::NullPointerException { message: None }.into()),
     };
-    // Parse UUID format: 8-4-4-4-12 hex
-    let hex: String = s.chars().filter(|c| *c != '-').collect();
-    if hex.len() != 32 {
-        return Err(
-            cratonvm_types::error::RuntimeError::IllegalArgumentException {
-                message: format!("Invalid UUID string: {s}"),
-            }
-            .into(),
-        );
-    }
-    let msb = u64::from_str_radix(&hex[0..16], 16).unwrap_or(0) as i64;
-    let lsb = u64::from_str_radix(&hex[16..32], 16).unwrap_or(0) as i64;
+    // The previous body stripped EVERY dash and checked only that 32 hex digits
+    // remained. That is over-strict and over-lax at once — the same missing
+    // spec seen from two sides:
+    //   * it REJECTED "1-2-3-4-5", which HotSpot accepts and zero-pads,
+    //   * it ACCEPTED a dash-less 32-char string and a 7-dash string,
+    //   * `unwrap_or(0)` turned "zzzz…" into the nil UUID instead of throwing,
+    //   * `&hex[0..16]` byte-slices a String and panics on a multi-byte char.
+    // The real algorithm is five `Long.parseLong` calls with masking and no
+    // dash-position count. `uuid_from_string_bits` transcribes it.
+    // docs/known-issues/jdk-only/W8-C15-2-option-objects-with-no-reader.md
+    let (msb, lsb) = crate::phases_late::uuid_from_string_bits(&s)?;
     let uuid = alloc_uuid(ctx, msb, lsb);
     Ok(Some(Value::Object(Some(uuid?))))
 }
@@ -32720,9 +32792,14 @@ fn native_b64_encode(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(None),
     };
+    // A null ARGUMENT to encode/decode is a NullPointerException on HotSpot.
+    // `Ok(None)` is the VOID shape and these natives' descriptors return
+    // `[B` / `String`, so answering it here handed the interpreter a value
+    // of the wrong kind instead of throwing.
+    // docs/known-issues/jdk-only/W8-C15-2-option-objects-with-no-reader.md
     let src = match args.get(1) {
         Some(Value::Object(Some(o))) => *o,
-        _ => return Ok(None),
+        _ => return Err(RuntimeError::NullPointerException { message: None }.into()),
     };
     let variant = b64_encoder_variant(ctx, this);
     let no_padding = b64_no_padding(ctx, this);
@@ -32737,9 +32814,14 @@ fn native_b64_encode_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> M
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(None),
     };
+    // A null ARGUMENT to encode/decode is a NullPointerException on HotSpot.
+    // `Ok(None)` is the VOID shape and these natives' descriptors return
+    // `[B` / `String`, so answering it here handed the interpreter a value
+    // of the wrong kind instead of throwing.
+    // docs/known-issues/jdk-only/W8-C15-2-option-objects-with-no-reader.md
     let src = match args.get(1) {
         Some(Value::Object(Some(o))) => *o,
-        _ => return Ok(None),
+        _ => return Err(RuntimeError::NullPointerException { message: None }.into()),
     };
     let variant = b64_encoder_variant(ctx, this);
     let no_padding = b64_no_padding(ctx, this);
@@ -32768,9 +32850,14 @@ fn native_b64_decode_bytes(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(None),
     };
+    // A null ARGUMENT to encode/decode is a NullPointerException on HotSpot.
+    // `Ok(None)` is the VOID shape and these natives' descriptors return
+    // `[B` / `String`, so answering it here handed the interpreter a value
+    // of the wrong kind instead of throwing.
+    // docs/known-issues/jdk-only/W8-C15-2-option-objects-with-no-reader.md
     let src = match args.get(1) {
         Some(Value::Object(Some(o))) => *o,
-        _ => return Ok(None),
+        _ => return Err(RuntimeError::NullPointerException { message: None }.into()),
     };
     let variant = b64_decoder_variant(ctx, this);
     let bytes = b64_read_byte_array(ctx, src);

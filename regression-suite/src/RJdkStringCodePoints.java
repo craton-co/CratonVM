@@ -323,6 +323,202 @@ public class RJdkStringCodePoints {
         str("str.mix", " \t x \t ", "[32,9,32,120]");
     }
 
+    // String.indent(n) for NEGATIVE n is
+    // `s.substring(Math.min(-n, s.indexOfNonWhitespace()))` -- a count of
+    // CHARACTERS over Character.isWhitespace. Implementing it as a count of
+    // BYTES over Rust's whitespace both keeps the wrong characters AND slices
+    // a str at a non-boundary, which panics and kills the VM. The nbsp row is
+    // the panic; only these rows are here, because indent()'s line-terminator
+    // rules are a separate defect that RJdkIntrinsics2's strfmt family owns.
+    static void indent() {
+        ind("ind.nbsp.m1", "\u00A0a", -1, "[160,97,10]");
+        ind("ind.linesep.m1", "\u2028a", -1, "[97,10]");
+        ind("ind.sp2.m1", "  a", -1, "[32,97,10]");
+        ind("ind.sp2.m2", "  a", -2, "[97,10]");
+        ind("ind.sp2.m9", "  a", -9, "[97,10]");
+        ind("ind.fs.m1", "\u001Ca", -1, "[97,10]");
+        ind("ind.tab.m1", "\ta", -1, "[97,10]");
+        ind("ind.min", "  a", Integer.MIN_VALUE, "[97,10]");
+        ind("ind.empty.1", "", 1, "[]");
+    }
+
+    static void ind(String label, String s, int n, String expected) {
+        String got;
+        try {
+            got = units(s.indent(n));
+        } catch (Throwable t) {
+            got = ex(t);
+        }
+        eq(label, got, expected);
+    }
+
+    // The whitespace table, pinned COMPLETELY rather than sampled.
+    // Character.isWhitespace is true for exactly 25 code points on JDK 25
+    // (enumerated by sweeping all 1,114,112 and collecting the hits), so the
+    // whole set fits in one positive row, and the four Unicode White_Space
+    // code points Java EXCLUDES fit in four negative ones. A table this small
+    // does not need a sample.
+    static final String ALL_JAVA_WS =
+            "\t\n\u000B\f\r\u001C\u001D\u001E\u001F\u0020"
+            + "\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2008\u2009\u200A"
+            + "\u2028\u2029\u205F\u3000";
+
+    static void whitespaceTable() {
+        eq("ws.count", Integer.toString(ALL_JAVA_WS.length()), "25");
+        blk("ws.all", ALL_JAVA_WS, "true");
+        // and each one alone, so a single wrong member cannot hide behind the
+        // other 24 in the conjunction above
+        for (int i = 0; i < ALL_JAVA_WS.length(); i++) {
+            char c = ALL_JAVA_WS.charAt(i);
+            blk("ws.one." + Integer.toHexString(c), String.valueOf(c), "true");
+        }
+        // Unicode says White_Space, Java says no. These four are the entire
+        // disagreement, and each is a non-breaking space or NEL.
+        blk("ws.not.0085", "\u0085", "false");
+        blk("ws.not.00a0", "\u00A0", "false");
+        blk("ws.not.2007", "\u2007", "false");
+        blk("ws.not.202f", "\u202F", "false");
+    }
+
+    // Version skew: Rust's Unicode tables are NEWER than the JDK's and
+    // case-pair these six; JDK 25 maps every one to itself. regionMatches
+    // ignore-case is the discriminator -- it is false on HotSpot and would be
+    // true against a table that pairs them.
+    static final char[] SKEW = { '\uA7CE', '\uA7CF', '\uA7D2', '\uA7D3', '\uA7D4', '\uA7D5' };
+
+    static void unicodeVersionSkew() {
+        // fixtures first: four of the six are UNASSIGNED in JDK 25 and two are
+        // assigned lowercase letters with no uppercase partner. If a future JDK
+        // assigns them, these rows are the ones that must be re-measured.
+        eq("skew.a7ce.def", Boolean.toString(Character.isDefined(0xA7CE)), "false");
+        eq("skew.a7d3.def", Boolean.toString(Character.isDefined(0xA7D3)), "true");
+        eq("skew.a7d3.type", Integer.toString(Character.getType(0xA7D3)), "2");
+
+        for (int i = 0; i < SKEW.length; i++) {
+            String s = String.valueOf(SKEW[i]);
+            String tag = Integer.toHexString(SKEW[i]);
+            eq("skew.up." + tag, units(s.toUpperCase(java.util.Locale.ROOT)),
+                    "[" + (int) SKEW[i] + "]");
+            eq("skew.lo." + tag, units(s.toLowerCase(java.util.Locale.ROOT)),
+                    "[" + (int) SKEW[i] + "]");
+        }
+        // the three pairs Rust joins and the JDK does not
+        rmi("skew.rm.a7cf", "\uA7CF", true, 0, "\uA7CE", 0, 1, "false");
+        rmi("skew.rm.a7d3", "\uA7D3", true, 0, "\uA7D2", 0, 1, "false");
+        rmi("skew.rm.a7d5", "\uA7D5", true, 0, "\uA7D4", 0, 1, "false");
+        // negative controls: neighbours inside the SAME span that the JDK DOES
+        // case-pair, so a blanket range guard over A7CE..A7D5 would break them
+        rmi("skew.ctl.a7d1", "\uA7D1", true, 0, "\uA7D0", 0, 1, "true");
+        rmi("skew.ctl.a7d7", "\uA7D7", true, 0, "\uA7D6", 0, 1, "true");
+        rmi("skew.ctl.a7cd", "\uA7CD", true, 0, "\uA7CC", 0, 1, "true");
+        // and the full-mapping path must still expand, i.e. the fix above must
+        // not have turned String.toUpperCase into the 1:1 mapping
+        eq("skew.sharps.up", units("\u00DF".toUpperCase(java.util.Locale.ROOT)), "[83,83]");
+    }
+
+    // The MIDDLE of the domain, not just the corners. W7-95's Math.pow finding
+    // was that special values were right while ordinary inputs were 44 ulp
+    // wrong, because the census sampled edges. The code-point family's
+    // "ordinary input" is any text at all, so walk real blocks end to end and
+    // check the four methods against each other and against Character's own
+    // arithmetic at EVERY position.
+    static void sweep() {
+        int[] starts = { 0x0020, 0x00C0, 0x0400, 0x0590, 0x0E00, 0x1E00, 0x3040, 0x4E00,
+                0xAC00, 0xA7C0, 0x10000, 0x1F600, 0x20000, 0x10FF00 };
+        for (int i = 0; i < starts.length; i++) {
+            sweepBlock(starts[i], 64);
+        }
+    }
+
+    // The sweep's EXPECTATIONS must not come from the VM under test. A code
+    // point needs two UTF-16 units iff it is supplementary -- that is
+    // arithmetic, not a lookup, so compute it here instead of calling
+    // Character.charCount, which is itself a native this suite is auditing.
+    // Otherwise a charCount that is wrong in the same direction as
+    // codePointAt would make every row below agree vacuously.
+    static int cc(int cp) {
+        return cp >= 0x10000 ? 2 : 1;
+    }
+
+    static void sweepBlock(int start, int count) {
+        StringBuilder sb = new StringBuilder();
+        int[] cps = new int[count];
+        int n = 0;
+        int wantUnits = 0;
+        for (int cp = start; n < count && cp <= 0x10FFFF; cp++) {
+            if (cp >= 0xD800 && cp <= 0xDFFF) {
+                continue;
+            }
+            cps[n++] = cp;
+            wantUnits += cc(cp);
+            sb.appendCodePoint(cp);
+        }
+        String s = sb.toString();
+        String tag = "sweep." + Integer.toHexString(start);
+        String fail = null;
+
+        // [setup lies]: validate the fixture before trusting any row over it.
+        // If appendCodePoint is broken, say so instead of blaming codePointAt.
+        if (s.length() != wantUnits) {
+            fail = "FIXTURE length=" + s.length() + " want " + wantUnits;
+        }
+        if (fail == null && s.codePointCount(0, s.length()) != n) {
+            fail = "codePointCount(0,len)=" + s.codePointCount(0, s.length()) + " want " + n;
+        }
+        int idx = 0;
+        for (int k = 0; k < n && fail == null; k++) {
+            if (s.codePointAt(idx) != cps[k]) {
+                fail = "codePointAt(" + idx + ")=" + s.codePointAt(idx) + " want " + cps[k];
+            } else if (s.offsetByCodePoints(0, k) != idx) {
+                fail = "offsetByCodePoints(0," + k + ")=" + s.offsetByCodePoints(0, k)
+                        + " want " + idx;
+            } else if (s.codePointCount(0, idx) != k) {
+                fail = "codePointCount(0," + idx + ")=" + s.codePointCount(0, idx) + " want " + k;
+            } else {
+                idx += cc(cps[k]);
+            }
+        }
+        if (fail == null && idx != s.length()) {
+            fail = "forward walk ended at " + idx + " want " + s.length();
+        }
+        // backward walk: offsetByCodePoints from the end must retrace it
+        for (int k = 0; k <= n && fail == null; k++) {
+            int back = s.offsetByCodePoints(s.length(), -k);
+            int wantIdx = s.length();
+            for (int j = 0; j < k; j++) {
+                wantIdx -= cc(cps[n - 1 - j]);
+            }
+            if (back != wantIdx) {
+                fail = "offsetByCodePoints(len,-" + k + ")=" + back + " want " + wantIdx;
+            }
+        }
+        // codePoints() must agree with the walk, element for element
+        if (fail == null) {
+            int[] got = s.codePoints().toArray();
+            if (got.length != n) {
+                fail = "codePoints().length=" + got.length + " want " + n;
+            } else {
+                for (int k = 0; k < n; k++) {
+                    if (got[k] != cps[k]) {
+                        fail = "codePoints()[" + k + "]=" + got[k] + " want " + cps[k];
+                        break;
+                    }
+                }
+            }
+        }
+        // regionMatches against itself at every offset, and repeat(2) must be
+        // exactly the concatenation
+        for (int k = 0; k <= s.length() && fail == null; k++) {
+            if (!s.regionMatches(k, s, k, s.length() - k)) {
+                fail = "regionMatches(self) false at " + k;
+            }
+        }
+        if (fail == null && !(s + s).equals(s.repeat(2))) {
+            fail = "repeat(2) != s+s";
+        }
+        eq(tag, fail == null ? "ok" : fail, "ok");
+    }
+
     static void regionMatches() {
         rm("rm.same", "ABC", 0, "ABC", 0, 3, "true");
         rm("rm.mid", "ABC", 1, "xBC", 1, 2, "true");
@@ -371,6 +567,10 @@ public class RJdkStringCodePoints {
         repeat();
         isBlank();
         trimStrip();
+        indent();
+        whitespaceTable();
+        unicodeVersionSkew();
+        sweep();
         regionMatches();
         System.out.println("@@RESULT checks=" + checks + " fails=" + fails);
         if (fails != 0) {

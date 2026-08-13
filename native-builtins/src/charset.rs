@@ -44,11 +44,24 @@ const CR_UNMAPPABLE: i32 = 3;
 
 /// Read the UTF-16 code units from a Java `String` object.  Returns the
 /// empty vec if the object isn't a String.
+///
+/// W7-95a. This used to be `ctx.read_string(s).encode_utf16()`, which is a
+/// round trip through a Rust `String` — and a Rust `str` cannot hold an
+/// unpaired surrogate, so `String::from_utf16_lossy` silently substituted
+/// U+FFFD for one. That is exactly the wrong answer for this function's only
+/// caller, `Charset.encode(String)`: a lone surrogate is *malformed input*
+/// that a real `CharsetEncoder` must report, and U+FFFD is a perfectly
+/// encodable character, so the malformed unit was laundered into three valid
+/// UTF-8 bytes (`EF BF BD`) before the encoder ever saw it.
+///
+/// `lang_string::read_string_chars` is the tree's existing lossless reader:
+/// it decodes the String's own `value` array (legacy `char[]`, compact
+/// LATIN-1 `byte[]`, or compact UTF-16 `byte[]`) straight to code units and
+/// never constructs a `str`. For every well-formed String the two agree
+/// exactly; they differ only on the inputs this function is supposed to be
+/// able to see.
 pub(crate) fn read_string_utf16(ctx: &dyn NativeContext, s: ObjectRef) -> Vec<u16> {
-    match ctx.read_string(s) {
-        Some(t) => t.encode_utf16().collect(),
-        None => Vec::new(),
-    }
+    crate::lang_string::read_string_chars(ctx, s)
 }
 
 /// Read a Rust `String` from a Java `String` slot of an object.  Used

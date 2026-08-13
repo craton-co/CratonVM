@@ -47,25 +47,75 @@ use crate::{try_alloc_concurrent_synthetic, obj_arg, platform_lib_name};
 // valid. `removeShutdownHook` resolves each handle and compares it against the
 // argument, so identity matching survives object motion.
 //
-// Known gap, unchanged by this registry: cratonvm does not yet RUN the
-// registered hooks at VM shutdown. Retaining them is what the correctness of
-// the *running* program depends on; executing them on exit is tracked
-// separately in the doc above.
+// W7-92 (2026-08-12): this list HAD no reader. `shutdown_hook_add` pushed,
+// `shutdown_hook_remove` popped, and nothing ever ran a hook on any of the five
+// exit paths — the "write-only counter" shape, with the gap named in this very
+// comment for months. The cost was not local: a corpus harness keyed on a
+// `completed=` marker printed from a shutdown hook, the marker never appeared,
+// and three separate lanes each read that as a sweeping cross-VM DIVERGE
+// verdict (12, 9 and 36 findings). See W7-100.
+//
+// `run_shutdown_hooks` below is that reader. It is reached from `System.exit`,
+// from `Runtime.exit`, from the intercepted `java/lang/Shutdown.runHooks()V`,
+// and from the launcher's post-`main` path (`vm-cli/src/main.rs`, after the
+// non-daemon join). It is deliberately NOT reached from `Runtime.halt`, which
+// is specified as forcible termination — measured on HotSpot 25.0.3+9: `halt`
+// skips hooks and `halt` called from INSIDE a hook terminates immediately.
 // ---------------------------------------------------------------------------
 static SHUTDOWN_HOOKS: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
 
+/// Set the moment `run_shutdown_hooks` drains the list, i.e. once shutdown has
+/// begun. From that point HotSpot's `ApplicationShutdownHooks.add`/`remove`
+/// throw `IllegalStateException("Shutdown in progress")`.
+///
+/// MEASURED on 25.0.3+9 (lane C11, `HookContract addduring` / `removeduring`):
+/// both calls, made from inside a running hook, threw
+/// `java.lang.IllegalStateException: Shutdown in progress`, and in the `remove`
+/// case the hook it tried to cancel ran anyway.
+///
+/// Without this flag a late registration would be accepted and then silently
+/// dropped — the same "a marker that never appears" shape this whole record is
+/// about, reintroduced by its own repair.
+static SHUTDOWN_IN_PROGRESS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// Register `hook` as a shutdown hook, rooting it for the life of the VM.
-/// Idempotent per object: re-registering the same thread does not add a second
-/// root (HotSpot throws `IllegalArgumentException` there; keeping the single
-/// existing registration is the conservative choice and never loses the root).
-fn shutdown_hook_add(ctx: &mut dyn NativeContext, hook: ObjectRef) {
+///
+/// Two refusals, both HotSpot contracts measured rather than recalled:
+///
+/// * re-registering a hook that is already registered throws
+///   `IllegalArgumentException` (W7-92 §1.3). This used to return silently —
+///   "the conservative choice" — which was invisible while nothing ran the
+///   hooks and becomes a second silent no-op the moment they do.
+/// * registering after shutdown has begun throws `IllegalStateException`.
+///
+/// NOT refused: a hook `Thread` that has already run to completion. It is not
+/// alive, `ApplicationShutdownHooks.add` accepts it, and HotSpot printed
+/// `TERMINATED-ACCEPTED` for exactly that case. `run_shutdown_hooks` will not
+/// re-run it (HotSpot does not either — measured, `RunTerm`), it counts as
+/// `skipped`.
+fn shutdown_hook_add(
+    ctx: &mut dyn NativeContext,
+    hook: ObjectRef,
+) -> Result<(), MethodCallFailed> {
+    if SHUTDOWN_IN_PROGRESS.load(std::sync::atomic::Ordering::SeqCst) {
+        return Err(RuntimeError::IllegalStateException {
+            message: "Shutdown in progress".to_string(),
+        }
+        .into());
+    }
     {
         let hooks = SHUTDOWN_HOOKS.lock().unwrap_or_else(|e| e.into_inner());
         if hooks
             .iter()
             .any(|h| ctx.resolve_global_root(*h) == Some(hook))
         {
-            return;
+            // HotSpot: `ApplicationShutdownHooks.add` throws
+            // IllegalArgumentException("Hook previously registered").
+            return Err(RuntimeError::IllegalArgumentException {
+                message: "Hook previously registered".to_string(),
+            }
+            .into());
         }
     }
     let handle = ctx.add_global_root(hook);
@@ -73,11 +123,22 @@ fn shutdown_hook_add(ctx: &mut dyn NativeContext, hook: ObjectRef) {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .push(handle);
+    Ok(())
 }
 
 /// Drop a previously registered hook. Returns true iff it was registered —
-/// `Runtime.removeShutdownHook`'s documented contract.
-fn shutdown_hook_remove(ctx: &mut dyn NativeContext, hook: ObjectRef) -> bool {
+/// `Runtime.removeShutdownHook`'s documented contract — and throws
+/// `IllegalStateException` once shutdown has begun, as HotSpot does.
+fn shutdown_hook_remove(
+    ctx: &mut dyn NativeContext,
+    hook: ObjectRef,
+) -> Result<bool, MethodCallFailed> {
+    if SHUTDOWN_IN_PROGRESS.load(std::sync::atomic::Ordering::SeqCst) {
+        return Err(RuntimeError::IllegalStateException {
+            message: "Shutdown in progress".to_string(),
+        }
+        .into());
+    }
     let handle = {
         let mut hooks = SHUTDOWN_HOOKS.lock().unwrap_or_else(|e| e.into_inner());
         match hooks
@@ -85,11 +146,191 @@ fn shutdown_hook_remove(ctx: &mut dyn NativeContext, hook: ObjectRef) -> bool {
             .position(|h| ctx.resolve_global_root(*h) == Some(hook))
         {
             Some(pos) => hooks.remove(pos),
-            None => return false,
+            None => return Ok(false),
         }
     };
     ctx.remove_global_root(handle);
-    true
+    Ok(true)
+}
+
+/// How long `run_shutdown_hooks` waits for a started hook thread to finish.
+///
+/// HotSpot waits FOREVER (`ApplicationShutdownHooks.runHooks` loops on
+/// `hook.join()`), and a hung hook there hangs the JVM with no diagnostic at
+/// all. This VM is run overwhelmingly by harnesses that read a wedged process
+/// as "the VM hung" and produce a false finding, so the default here is a
+/// bounded wait plus a loud line naming what was still running — a stated,
+/// visible divergence rather than a silent hang.
+///
+/// `CRATONVM_SHUTDOWN_HOOK_TIMEOUT_MS=0` restores HotSpot's unbounded wait;
+/// any other value sets the bound in milliseconds. Read with `std::env::var`
+/// rather than through `nbflags()` because that struct lives in `lib.rs`, which
+/// this lane does not own; a follow-up should move it (see W7-92 §7).
+fn shutdown_hook_join_bound() -> Option<std::time::Duration> {
+    static BOUND: std::sync::OnceLock<Option<std::time::Duration>> = std::sync::OnceLock::new();
+    *BOUND.get_or_init(|| {
+        let ms = std::env::var("CRATONVM_SHUTDOWN_HOOK_TIMEOUT_MS")
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .unwrap_or(30_000);
+        if ms == 0 {
+            None
+        } else {
+            Some(std::time::Duration::from_millis(ms))
+        }
+    })
+}
+
+/// Has `thread` already been started (and possibly since finished)?
+///
+/// Extracted from `native_thread_start0`, which is the only other place that
+/// asks. Two readers because only one lookup route is aliasing-proof: a
+/// real-JDK mirror resolves through the process-unique `Thread.tid` index,
+/// while a fabricated mirror has no `tid` field and would fall back to an
+/// unguarded pointer walk, so it reads the on-mirror marker `vm_exec::
+/// thread_start` writes instead. Keeping this in ONE function is deliberate:
+/// the shutdown runner and `Thread.start()` must not drift apart about what
+/// "already started" means, and this tree has a written record of exactly that
+/// species of twin drifting.
+pub(crate) fn thread_already_started(ctx: &mut dyn NativeContext, thread: ObjectRef) -> bool {
+    if crate::has_real_jdk_thread_layout(ctx, thread) {
+        ctx.thread_run_state(thread) != 0
+    } else {
+        ctx.object_num_fields(thread) > 2 && matches!(ctx.get_field(thread, 2), Value::Long(_))
+    }
+}
+
+/// Run every registered `Runtime.addShutdownHook` hook, once, before the
+/// process is torn down. THE READER W7-92 is about.
+///
+/// **Each hook is genuinely `start()`ed as its own thread and then joined**,
+/// not `run()` inline on the exiting thread. That is not gold-plating:
+///
+/// * `Thread.currentThread().getName()` inside the hook is observable, and the
+///   shipped vector (`regression-suite/src/RShutdownHooks.java`) asserts on it
+///   (`ownThread=true`);
+/// * hooks run CONCURRENTLY on HotSpot — measured (`HookContract crosswait`):
+///   a hook that blocks until a second hook signals it is released, which an
+///   inline runner would deadlock on;
+/// * a hook needs a real Java frame on a real VM thread the moment it touches
+///   anything that walks the stack, and Tomcat/log4j teardown does.
+///
+/// Ordering is NOT part of the contract: HotSpot starts all hooks and then
+/// joins them all, so their relative order is unspecified (measured: three
+/// hooks came back 3, boom, 1). A fix must not be judged on hook order.
+///
+/// Idempotent: the list is drained under the lock and `SHUTDOWN_IN_PROGRESS`
+/// is set, so a hook that itself calls `System.exit` re-enters this function
+/// and finds nothing to run.
+///
+/// Four counters on ONE unconditional stderr line, because "ran three hooks"
+/// and "the list was empty" being indistinguishable in the output is the exact
+/// defect this whole record exists to close, and a repair that prints only on
+/// failure reproduces it:
+///
+/// * `ran`    — hooks whose thread was started and observed to finish.
+/// * `threw`  — hooks whose `start()` failed at the VM boundary. An exception
+///   thrown by a hook's BODY is not counted here and must not be: it lands on
+///   the hook's own thread, HotSpot swallows it (measured: rc unchanged, the
+///   other two hooks still ran) and so does this.
+/// * `skipped` — hooks that were already started or already finished. HotSpot
+///   does not re-run a terminated hook either (measured, `RunTerm`).
+/// * `unjoined` — started but still running when the wait bound expired.
+///
+/// NOT called from `native_shutdown_halt0`: `Runtime.halt` is forcible
+/// termination and the JDK runs hooks from `Shutdown.exit`, which halt
+/// bypasses. Measured both ways on 25.0.3+9. Do not "fix" that asymmetry.
+pub fn run_shutdown_hooks(ctx: &mut dyn NativeContext, trigger: &str) {
+    SHUTDOWN_IN_PROGRESS.store(true, std::sync::atomic::Ordering::SeqCst);
+    let handles: Vec<usize> = {
+        let mut hooks = SHUTDOWN_HOOKS.lock().unwrap_or_else(|e| e.into_inner());
+        std::mem::take(&mut *hooks)
+    };
+
+    let mut threw = 0usize;
+    let mut skipped = 0usize;
+    let mut started: Vec<usize> = Vec::with_capacity(handles.len());
+
+    // Phase 1 — start them all, then phase 2 joins them all. Same shape as
+    // `ApplicationShutdownHooks.runHooks`, and the reason it is two loops
+    // rather than one start-join pair is the `crosswait` measurement above.
+    for &handle in &handles {
+        // Re-resolved from the global-root table on every use: the handles are
+        // GC-remapped, a raw `ObjectRef` cached across an `invoke_virtual`
+        // would go stale under a moving collector, and a hook body allocates.
+        let Some(hook) = ctx.resolve_global_root(handle) else {
+            skipped += 1;
+            continue;
+        };
+        if thread_already_started(ctx, hook) {
+            skipped += 1;
+            continue;
+        }
+        match ctx.invoke_virtual(hook, "start", "()V", &[]) {
+            Ok(_) => started.push(handle),
+            Err(e) => {
+                threw += 1;
+                // Unconditional, not `tracing::warn!`: tracing is compiled out
+                // of release builds of this VM, and a hook that could not even
+                // be started is precisely the state that must not be silent.
+                eprintln!(
+                    "[cratonvm] shutdown hook could not be started; continuing with the \
+                     remaining hooks: {e:?}"
+                );
+            }
+        }
+    }
+
+    // Phase 2 — join. Poll `thread_is_alive` rather than `ctx.thread_join`
+    // so the wait can be bounded; `thread_start` registers the thread as alive
+    // BEFORE spawning it, so there is no "not yet visible" race here.
+    let bound = shutdown_hook_join_bound();
+    let deadline = bound.map(|d| std::time::Instant::now() + d);
+    let mut unjoined = 0usize;
+    for &handle in &started {
+        loop {
+            let Some(hook) = ctx.resolve_global_root(handle) else {
+                break;
+            };
+            if !ctx.thread_is_alive(hook) {
+                break;
+            }
+            if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+                unjoined += 1;
+                break;
+            }
+            // The blocked-region protocol is mandatory, not hygiene: the hook
+            // threads allocate, so a stop-the-world collection can be requested
+            // while we sleep here, and a thread sleeping outside a blocked
+            // region never reaches the safepoint. `native_thread_join_timed`
+            // does the same dance for the same reason.
+            ctx.begin_blocking_region();
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            ctx.end_blocking_region();
+        }
+    }
+    let ran = started.len() - unjoined;
+
+    for handle in handles {
+        ctx.remove_global_root(handle);
+    }
+
+    if unjoined > 0 {
+        eprintln!(
+            "[cratonvm] shutdown hooks: {unjoined} still running after {}ms; continuing exit. \
+             Set CRATONVM_SHUTDOWN_HOOK_TIMEOUT_MS=0 to wait forever (HotSpot's behaviour) \
+             or to a larger bound.",
+            bound.map(|d| d.as_millis()).unwrap_or(0)
+        );
+    }
+    // UNCONDITIONAL, on stderr, next to the `[cratonvm] System.exit(N) called`
+    // line that is already unconditional on that path. `ran=0` for a program
+    // with no hooks is the honest reading, and it is what makes `ran=0` on a
+    // program WITH hooks a finding rather than a silence.
+    eprintln!(
+        "[cratonvm] shutdown hooks: ran={ran} threw={threw} skipped={skipped} \
+         unjoined={unjoined} trigger={trigger}"
+    );
 }
 
 type PreExitHook = fn(code: i32);
@@ -1036,21 +1277,16 @@ pub(crate) fn native_thread_start0(
     // (`mark_dead` only flips `alive`), so present-but-not-alive is
     // TERMINATED and missing is NEW.
     //
-    // Two readers because only one lookup route is aliasing-proof: a real-JDK
-    // mirror resolves through the process-unique `Thread.tid` index, while a
-    // fabricated mirror has no `tid` field and would fall back to an unguarded
-    // pointer walk, so it reads the on-mirror marker `vm_exec::thread_start`
-    // writes instead. This native is the convergence point of all four
-    // registrations and of the container route, including the `--jdk-only`
-    // case where the real `start()` bytecode runs; a refusal here does not
-    // leak a container registration, because that bytecode's `finally` calls
+    // The two-reader predicate lives in `thread_already_started` (this file):
+    // W7-92's shutdown runner has to ask the identical question before it
+    // `start()`s a hook, and two copies of "has this thread already been
+    // started" would be a twin pair with nothing keeping them in step. This
+    // native is the convergence point of all four registrations and of the
+    // container route, including the `--jdk-only` case where the real
+    // `start()` bytecode runs; a refusal here does not leak a container
+    // registration, because that bytecode's `finally` calls
     // `container.onExit(this)`. See W7-27-thread-exit-java-cleanup.md §13.
-    let already_started = if crate::has_real_jdk_thread_layout(ctx, this) {
-        ctx.thread_run_state(this) != 0
-    } else {
-        ctx.object_num_fields(this) > 2 && matches!(ctx.get_field(this, 2), Value::Long(_))
-    };
-    if already_started {
+    if thread_already_started(ctx, this) {
         return Err(RuntimeError::IllegalThreadStateException {
             message: "Thread.start: this thread has already been started".to_string(),
         }
@@ -1477,6 +1713,13 @@ pub(crate) fn native_system_exit(ctx: &mut dyn NativeContext, args: &[Value]) ->
     // otherwise be invisible. Log to stderr directly since tracing may not be
     // flushed before process::exit.
     eprintln!("[cratonvm] System.exit({code}) called вЂ” process terminating");
+    // W7-92: hooks first, and BEFORE the slot-map sweep — a hook is Java code
+    // that can load classes and allocate, so sweeping first would census a
+    // heap the hooks are about to change. `System.exit` from a non-main thread
+    // reaches this same native on that thread's ctx, so this one line covers
+    // two of the five exit paths (measured on HotSpot: rc 3 and rc 4, hooks
+    // ran on both).
+    run_shutdown_hooks(ctx, "System.exit");
     sweep_declared_slot_maps_before_exit(&*ctx, "System.exit");
     invoke_pre_exit_hook(code);
     std::process::exit(code);
@@ -1556,7 +1799,7 @@ pub(crate) fn register_runtime_natives(registry: &mut NativeMethodRegistry) {
         |ctx, args| {
             // args[0] = the `Runtime` receiver, args[1] = the hook `Thread`.
             if let Some(Value::Object(Some(hook))) = args.get(1) {
-                shutdown_hook_add(ctx, *hook);
+                shutdown_hook_add(ctx, *hook)?;
             }
             Ok(None)
         },
@@ -1567,7 +1810,7 @@ pub(crate) fn register_runtime_natives(registry: &mut NativeMethodRegistry) {
         "(Ljava/lang/Thread;)Z",
         |ctx, args| {
             let removed = match args.get(1) {
-                Some(Value::Object(Some(hook))) => shutdown_hook_remove(ctx, *hook),
+                Some(Value::Object(Some(hook))) => shutdown_hook_remove(ctx, *hook)?,
                 _ => false,
             };
             Ok(Some(Value::Int(i32::from(removed))))
@@ -1593,6 +1836,31 @@ pub(crate) fn register_runtime_natives(registry: &mut NativeMethodRegistry) {
         // HotSpot's does nothing an application can observe.
         Ok(None)
     }, NativeKind::Bridge);
+
+    // W7-92: `java.lang.Shutdown.runHooks()` is `private static void` WITH a
+    // `Code` attribute in the real JDK, so this is an interception of the same
+    // kind as the two `exit` natives — and it is the right one while the hooks
+    // live Rust-side, because the JDK's own `Shutdown.hooks` array is empty:
+    // `Runtime.addShutdownHook` is intercepted here too, so
+    // `ApplicationShutdownHooks.hooks` is never populated and the JDK's slot 1
+    // hook is never installed. Running the real body would run nothing.
+    //
+    // This registration is what lets any JDK-side route into shutdown
+    // (`Shutdown.exit`, a future signal handler, an agent) land on the same
+    // drain as the launcher and the `exit` natives. It is NOT how the launcher
+    // reaches the hooks — `vm-cli` calls `run_shutdown_hooks` directly, because
+    // a `vm.invoke` of this triple would depend on `java/lang/Shutdown`
+    // resolving, which is a real-JDK-mode assumption.
+    registry.register_with_kind(
+        "java/lang/Shutdown",
+        "runHooks",
+        "()V",
+        |ctx, _args| {
+            run_shutdown_hooks(ctx, "Shutdown.runHooks");
+            Ok(None)
+        },
+        NativeKind::Bridge,
+    );
     registry.register_with_kind(
         "java/lang/Shutdown",
         "halt0",
@@ -2751,6 +3019,8 @@ pub(crate) fn native_runtime_exit(ctx: &mut dyn NativeContext, args: &[Value]) -
 
     // B6: Surface Runtime.exit calls so silent shutdowns are visible.
     eprintln!("[cratonvm] Runtime.exit({code}) called вЂ” process terminating");
+    // W7-92: see `native_system_exit` for why the hooks run before the sweep.
+    run_shutdown_hooks(ctx, "Runtime.exit");
     sweep_declared_slot_maps_before_exit(&*ctx, "Runtime.exit");
     invoke_pre_exit_hook(code);
     std::process::exit(code);
@@ -2764,6 +3034,14 @@ pub(crate) fn native_runtime_exit(ctx: &mut dyn NativeContext, args: &[Value]) -
 /// bypasses. The VM-internal pre-exit hook (staged-archive cleanup, JFR
 /// dump-on-exit) still fires — it is not a Java shutdown hook, and its own
 /// comment already claims to cover `Runtime.halt`.
+///
+/// W7-92 made the `exit` paths run hooks and deliberately left this one alone.
+/// MEASURED on HotSpot 25.0.3+9: `ShutdownProbe halt` produced no hook output
+/// and rc=5, and `HookContract haltinhook` — `Runtime.halt(9)` called from
+/// INSIDE a running hook — terminated immediately at rc=9 with the remaining
+/// hooks unrun. The absence of a `run_shutdown_hooks` call below is the
+/// behaviour, not an oversight; a later sweep tidying the asymmetry away would
+/// be a regression.
 pub(crate) fn native_shutdown_halt0(
     ctx: &mut dyn NativeContext,
     args: &[Value],

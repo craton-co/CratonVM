@@ -1,5 +1,27 @@
 # P2 — the `java.util` collections shadows: 8 of 68 registrations are retirable
 
+> ## RECONCILED 2026-08-12 (lane C18) — the direction of this campaign is the
+> opposite of what the title suggests
+>
+> **SOURCE-VERIFIED reading, not a measurement on a binary.**
+>
+> * **The census direction is backwards as usually quoted.** Retiring the 8
+>   `ArrayList` rows this record recommends *while adding the ~25 real
+>   view-class rows that the corrected `Map.values()` shape requires* (`C7-1`,
+>   `C13-2`) is a **NET +17 registrations**. Any record or brief framing the
+>   collections work as *shrinking* the shadow count should say plainly that
+>   **correctness here COSTS registrations.** The 8 are still worth retiring;
+>   the reason is fidelity, not arithmetic.
+> * **§2.2's line range for `register_interface_natives` is stale twice over.**
+>   `28697–28896` truncated the function mid-block (`C7-2` §1); in the current
+>   tree it spans **28773–28991** with **38 registrations** (`C13-1` §5.1).
+>   Its own in-file header comment saying "these 23" is stale too.
+> * **There is a second interface registrar this record does not mention:**
+>   `register_queue_deque_interface_natives`, **`:38096`, 23 rows** — not
+>   `:37787` and not 18. Four of the 23 come out of a `for` loop, so a count
+>   taken by grepping `registry.register(` call sites undercounts, and five of
+>   the 23 are on concrete `$Itr` classes rather than interfaces.
+
 **What this is.** A per-triple adjudication of the `java.util` collections slice
 of the 226 `native-shadows-bytecode` rows a `--jdk-only --explain-jdk-only` run
 reported as *actually taken*. It answers, per family, the only question that

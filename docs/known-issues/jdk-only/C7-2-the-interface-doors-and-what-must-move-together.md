@@ -4,6 +4,34 @@
 plus `javap` against JDK 25.0.3+9. **No CratonVM binary was run**; every
 dispatch claim below is marked either READ or MEASURED-BY-P2.
 
+> ## RECONCILED 2026-08-12 (lane C18) — three of this record's numbers, and its
+> headline hazard, are SUPERSEDED
+>
+> All three corrections are **SOURCE-VERIFIED readings** (a later lane read the
+> current tree), not measurements on a binary. That is a different and weaker
+> category than MEASURED, and it is stated so deliberately.
+>
+> 1. **`register_queue_deque_interface_natives` registers 23 rows, not 18**,
+>    and opens at **`:38096`** in the current tree. Four of the extra rows are
+>    emitted inside a `for` loop, so **counting `registry.register(` call sites
+>    by grep undercounts**; five of the 23 are not interface rows at all
+>    (`ArrayDeque$Itr` / `PriorityQueue$Itr`). Source: `C13-1` §5.1.
+> 2. **`register_interface_natives` spans 28773–28991** in the current tree,
+>    with **38 registrations**. This record's "38 registrations" is right; its
+>    "opens at 28697" is the pre-edit figure. The function's own in-file header
+>    comment still says "these 23" and is stale — do not trust it.
+> 3. **§4's atomic-set row A2 — the `HashMap$Values` "the interface door DOES
+>    win for inherited methods" hazard — DOES NOT EXIST.** The native-above-
+>    the-receiver walk follows `superclass` **only** and never enumerates
+>    interfaces, so `java/util/Collection.isEmpty()Z` is never looked up for a
+>    values view. Disproved by reading `vm/src/runtime/interpreter/invoke.rs:3281-3323`
+>    and its two mirrors; written up in `C13-1` §1.1. This mattered because it
+>    was carried into a brief as "the highest-risk item" of the `values()`
+>    rewrite. It is not an item at all.
+>
+> Everything else in this record stands, including its central dependency rule
+> (§2) — which is in fact *why* the hazard does not exist.
+
 ---
 
 ## 1. The line numbers, corrected

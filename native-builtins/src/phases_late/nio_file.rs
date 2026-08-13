@@ -60,6 +60,34 @@ pub(crate) const P57_FS_JAR_FIELD: usize = 1;
 /// the separator, field 1 the mounted-JAR path; these are mutually exclusive.
 pub(crate) const P57_FS_JRT_FIELD: usize = 2;
 
+/// Field index on a synthetic `java/nio/file/FileSystem` holding the single
+/// `FileSystemProvider` object that `FileSystem.provider()` hands out for THIS
+/// filesystem. Lazily populated by `p57_fs_provider`.
+///
+/// Why the provider lives on the FileSystem rather than in a Rust-side cache:
+/// a `OnceLock<ObjectRef>` would be both process-global (surviving across VMs
+/// in-process) and invisible to the GC as a root. The owning FileSystem is
+/// already a GC root by virtue of the `FileSystems$DefaultFileSystemHolder.
+/// defaultFileSystem` static stash that `p57_default_filesystem_singleton`
+/// writes, so hanging the provider off it inherits correct rooting and correct
+/// VM scoping for free.
+///
+/// HotSpot's contract, measured (`scratchpad/c14/FsIdentity.java` on Temurin
+/// 25.0.3.9): `getDefault().provider() == getDefault().provider()`,
+/// `== DefaultFileSystemProvider.instance()`, and
+/// `== FileSystemProvider.installedProviders().get(0)` are all `true`. Before
+/// this field existed every one of those minted a fresh object and every one
+/// of those identities was false.
+/// docs/known-issues/jdk-only/W8-C14-2-default-provider-singleton.md
+pub(crate) const P57_FS_PROVIDER_FIELD: usize = 3;
+
+/// Instance-slot count of a synthetic `java/nio/file/FileSystem`:
+/// 0 = separator, 1 = mounted-JAR path, 2 = mounted jrt `java.home`,
+/// 3 = the provider singleton. Named so the three allocation sites cannot
+/// drift from each other or from `P57_FS_PROVIDER_FIELD` (a synthetic class's
+/// width being declared in several places is a recorded defect family).
+pub(crate) const P57_FS_SLOTS: usize = 4;
+
 /// Native equivalent of `java.nio.file.Path.toString()`, tuned for synthetic
 /// and real `java/nio/file/Path` values used by Javac/ZipFS and JRT paths.
 /// This avoids going back through virtual `Path.toString` dispatch, keeping
@@ -791,6 +819,107 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(Some(fs))))
         },
     );
+
+    // --- sun.nio.fs.DefaultFileSystemProvider.theFileSystem() → FileSystem ---
+    //
+    // The SECOND door to the same singleton. `getDefault()` above was
+    // intercepted and this one was not, so the two disagreed: the real
+    // `DefaultFileSystemProvider.<clinit>` ran and built its own
+    // `WindowsFileSystem`, and the `jdk_concrete_getclass_alias` mapping
+    // (FileSystem -> sun.nio.fs.WindowsFileSystem) made both objects report the
+    // same class name, which is what hid the split.
+    //
+    // This is NOT a niche door. Verbatim callers in java.base (JDK 25 src.zip):
+    //   * java.util.zip.ZipFile$Source.builtInFS  -- static final, then
+    //     `Files.readAttributes(builtInFS.getPath(file.getPath()), ...)` on
+    //     EVERY zip/jar open.
+    //   * java.io.FilePermission.builtInFS -- static final, plus the derived
+    //     `here` / EMPTY_PATH / DASH_PATH / DOTDOT_PATH constants.
+    //   * java.io.WinNTFileSystem.isInvalid() -- the Windows `File` path
+    //     validity check.
+    //   * java.nio.file.FileSystems.getDefault() itself, on the
+    //     `!VM.isModuleSystemInited()` branch -- i.e. for the whole of early
+    //     boot, `getDefault()` IS `theFileSystem()`.
+    //   * jdk.internal.jimage.ImageReaderFactory.<clinit>, reflectively.
+    //
+    // Every `Path` the second filesystem minted was a real-bytecode
+    // `WindowsPath` whose field 0 is a `WindowsFileSystem` OBJECT (javap: the
+    // first instance field is `private final WindowsFileSystem fs`; the String
+    // `path` is field 3). `p57_read_path` reads field 0, `read_string`
+    // correctly refuses a non-String, the documented `toString()` fallback
+    // re-enters this same native because dispatch is receiver-aware, and the
+    // `IN_TOSTRING_FALLBACK` guard then returns "". Downstream every file-IO
+    // native saw an EMPTY path -- the empty-message `NoSuchFileException` that
+    // kills `System.initPhase2`.
+    //
+    // HotSpot 25 returns one shared object through both doors, measured:
+    // `theFileSystem==getDefault|true` (scratchpad/c14/FsIdentity.java). The
+    // mutation control (FsIdentityMutant.java) builds a second provider by hand
+    // and that row flips to false, so the row is load-bearing rather than
+    // vacuously green.
+    //
+    // Descriptor read off the image, not recalled -- `javap -p --module
+    // java.base sun.nio.fs.DefaultFileSystemProvider` on Temurin 25.0.3.9:
+    //   public static java.nio.file.FileSystem theFileSystem();
+    // It returns the INTERFACE type on every platform, so this descriptor is
+    // portable. Static, so `args` carries no receiver.
+    // docs/known-issues/jdk-only/W8-C14-1-default-filesystem-second-door.md
+    r.register(
+        "sun/nio/fs/DefaultFileSystemProvider",
+        "theFileSystem",
+        "()Ljava/nio/file/FileSystem;",
+        |ctx, _args| {
+            let fs = p57_default_filesystem_singleton(ctx)?;
+            Ok(Some(Value::Object(Some(fs))))
+        },
+    );
+
+    // --- sun.nio.fs.DefaultFileSystemProvider.instance() → the provider ---
+    //
+    // Registered TOGETHER with `theFileSystem` above and with the
+    // `FileSystem.provider()` / `installedProviders()` repairs below, because
+    // this door is only half a fix on its own: `sun.nio.ch.UnixDomainSockets.
+    // generateTempName()` compares
+    //   path.getFileSystem().provider() != DefaultFileSystemProvider.instance()
+    // with `!=`, so unifying one side while the other still mints a fresh
+    // object per call leaves the comparison exactly as broken as before.
+    //
+    // Leaving it unregistered is not neutral either: `instance()` compiles to a
+    // bare `getstatic INSTANCE`, and that getstatic triggers
+    // `DefaultFileSystemProvider.<clinit>`, whose whole body is
+    // `INSTANCE = new WindowsFileSystemProvider()` -- and
+    // `WindowsFileSystemProvider.<init>` does
+    // `theFileSystem = new WindowsFileSystem(this, StaticProperty.userDir())`.
+    // So an un-intercepted `instance()` reconstructs the very second filesystem
+    // the registration above exists to eliminate.
+    // `java.nio.file.FileSystems$DefaultFileSystemHolder.getDefaultProvider()`
+    // calls it directly.
+    //
+    // PLATFORM-SPECIFIC DESCRIPTOR. Unlike `theFileSystem`, `instance()`
+    // returns the CONCRETE provider type, which differs per platform. The
+    // Windows arm is verified by javap on Temurin 25.0.3.9 windows/x64:
+    //   public static sun.nio.fs.WindowsFileSystemProvider instance();
+    // The other two arms are UNVERIFIED -- javap the corresponding image before
+    // trusting them. The failure mode if an arm is wrong is a registration that
+    // never matches (a dead registration), which is today's behaviour, not a
+    // crash; that is why guessing here is acceptable and guessing in the
+    // returned VALUE would not be.
+    let instance_desc: &'static str = if cfg!(windows) {
+        "()Lsun/nio/fs/WindowsFileSystemProvider;"
+    } else if cfg!(target_os = "macos") {
+        "()Lsun/nio/fs/MacOSXFileSystemProvider;"
+    } else {
+        "()Lsun/nio/fs/LinuxFileSystemProvider;"
+    };
+    r.register(
+        "sun/nio/fs/DefaultFileSystemProvider",
+        "instance",
+        instance_desc,
+        |ctx, _args| {
+            let p = p57_default_provider_singleton(ctx)?;
+            Ok(Some(Value::Object(Some(p))))
+        },
+    );
     r.register(
         file_systems,
         "newFileSystem",
@@ -919,37 +1048,22 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         "provider",
         "()Ljava/nio/file/spi/FileSystemProvider;",
         |ctx, args| {
-            // Report the scheme matching this FileSystem so callers that check
-            // `fs.provider().getScheme()` see "jrt"/"jar" for a mounted virtual
-            // FS, "file" otherwise.
-            let scheme_str = match obj_arg(args, 0) {
-                Ok(this)
-                    if matches!(
-                        ctx.get_field(this, P57_FS_JRT_FIELD),
-                        Value::Object(Some(_))
-                    ) =>
-                {
-                    "jrt"
-                }
-                Ok(this)
-                    if matches!(
-                        ctx.get_field(this, P57_FS_JAR_FIELD),
-                        Value::Object(Some(_))
-                    ) =>
-                {
-                    "jar"
-                }
-                _ => "file",
+            // One provider object per FileSystem, cached in
+            // P57_FS_PROVIDER_FIELD. This used to allocate a FRESH provider on
+            // every call, which made even `fs.provider() == fs.provider()`
+            // false; HotSpot answers true (measured, `provider==provider|true`
+            // in scratchpad/c14/FsIdentity.java). `p57_fs_provider` still
+            // reports the scheme matching this FileSystem, so callers that
+            // check `fs.provider().getScheme()` keep seeing "jrt"/"jar" for a
+            // mounted virtual FS and "file" otherwise.
+            //
+            // A receiver we cannot read (no arg 0) has no field to cache in;
+            // fall back to the default provider rather than inventing one, so
+            // the answer is still the singleton.
+            let provider = match obj_arg(args, 0) {
+                Ok(this) => p57_fs_provider(ctx, this)?,
+                Err(_) => p57_default_provider_singleton(ctx)?,
             };
-            let provider =
-                try_alloc_concurrent_synthetic(ctx, "java/nio/file/spi/FileSystemProvider", 1)?;
-            // Pin across the create_string below — a moving young GC there
-            // would relocate the fresh provider (native stale-local family).
-            let provider_pin = ctx.pin_native_root(provider);
-            let scheme = ctx.create_string(scheme_str);
-            let provider = ctx.read_native_pin(provider_pin, provider);
-            ctx.set_field(provider, 0, Value::Object(Some(scheme)));
-            ctx.unpin_native_roots(provider_pin);
             Ok(Some(Value::Object(Some(provider))))
         },
     );
@@ -2009,28 +2123,29 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         "()Ljava/util/List;",
         |ctx, _args| {
             use cratonvm_types::ArrayElementType;
-            let mk_provider = |ctx: &mut dyn NativeContext,
-                               scheme: &str|
-             -> Result<ObjectRef, MethodCallFailed> {
-                let p = try_alloc_concurrent_synthetic(ctx, "java/nio/file/spi/FileSystemProvider", 1)?;
-                // Pin across the create_string below — a moving young GC there
-                // would relocate the fresh provider (native stale-local family).
-                let p_pin = ctx.pin_native_root(p);
-                let s = ctx.create_string(scheme);
-                let p = ctx.read_native_pin(p_pin, p);
-                ctx.set_field(p, 0, Value::Object(Some(s)));
-                ctx.unpin_native_roots(p_pin);
-                Ok(p)
-            };
+            // The jar/jrt entries stay per-call allocations (see the residual
+            // note in W8-C14-2); `p57_alloc_provider` is now the single
+            // implementation, replacing a byte-identical private `mk_provider`
+            // closure that used to live here.
+            //
             // "jrt" lets `FileSystems.getFileSystem(URI.create("jrt:/"))` resolve
             // (the real-JDK static iterates installedProviders by scheme) so the
             // in-process compiler can read platform classes from the runtime
             // image (HIB-CV-27).
-            let file_p = mk_provider(ctx, "file")?;
+            //
+            // Element 0 MUST BE the very object `FileSystems.getDefault()
+            // .provider()` returns: the `FileSystemProvider.installedProviders`
+            // javadoc makes the default provider the first element of this
+            // list, and HotSpot answers
+            // `installedProviders.get0==getDefault.provider|true` (measured,
+            // scratchpad/c14/FsIdentity.java). This was `mk_provider(ctx,
+            // "file")` — a fresh object per call — so the identity was false,
+            // and false again between two consecutive calls to this method.
+            let file_p = p57_default_provider_singleton(ctx)?;
             let file_pin = ctx.pin_native_root(file_p);
-            let jar_p = mk_provider(ctx, "jar")?;
+            let jar_p = p57_alloc_provider(ctx, "jar")?;
             let jar_pin = ctx.pin_native_root(jar_p);
-            let jrt_p = mk_provider(ctx, "jrt")?;
+            let jrt_p = p57_alloc_provider(ctx, "jrt")?;
             let jrt_pin = ctx.pin_native_root(jrt_p);
             let arr = ctx.new_array(ArrayElementType::Reference, 3);
             let arr_pin = ctx.pin_native_root(arr);
@@ -2077,7 +2192,17 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
                 let fs = p57_alloc_jrt_filesystem(ctx, &jh)?;
                 return Ok(Some(Value::Object(Some(fs))));
             }
-            let fs = p57_alloc_default_filesystem(ctx)?;
+            // The default filesystem, NOT a fresh one. `FileSystems
+            // .getFileSystem(URI.create("file:///"))` resolves the "file"
+            // provider and calls this; HotSpot returns the same object as
+            // `getDefault()` (measured: `getFileSystem(file:///)==getDefault
+            // |true`). `p57_alloc_default_filesystem` here handed back a second
+            // filesystem — the same two-doors defect as
+            // `DefaultFileSystemProvider.theFileSystem`, one level down, and
+            // `FileSystems$DefaultFileSystemHolder.getDefaultFileSystem()`
+            // reaches it via exactly this call
+            // (`provider.getFileSystem(URI.create("file:///"))`).
+            let fs = p57_default_filesystem_singleton(ctx)?;
             Ok(Some(Value::Object(Some(fs))))
         },
     );
@@ -10837,9 +10962,11 @@ pub(crate) fn p57_parent_of(path: &str) -> String {
 pub(crate) fn p57_alloc_default_filesystem(ctx: &mut dyn NativeContext) -> Result<ObjectRef, MethodCallFailed> {
     // Field 0 = separator; field 1 (P57_FS_JAR_FIELD) = mounted-JAR path (or
     // null); field 2 (P57_FS_JRT_FIELD) = mounted runtime-image java.home (or
-    // null). The jrt field exists on every FS object so the jrt-aware
-    // FileSystem.getPath/getRootDirectories natives can read it unconditionally.
-    let fs = try_alloc_concurrent_synthetic(ctx, "java/nio/file/FileSystem", 3)?;
+    // null); field 3 (P57_FS_PROVIDER_FIELD) = the provider singleton for this
+    // FS (or null until first `provider()` call). The jrt field exists on every
+    // FS object so the jrt-aware FileSystem.getPath/getRootDirectories natives
+    // can read it unconditionally.
+    let fs = try_alloc_concurrent_synthetic(ctx, "java/nio/file/FileSystem", P57_FS_SLOTS)?;
     // Pin across the create_string below — a moving young GC there would
     // relocate the fresh FileSystem (native stale-local family).
     let fs_pin = ctx.pin_native_root(fs);
@@ -10870,7 +10997,7 @@ pub(crate) fn p57_alloc_jar_filesystem(ctx: &mut dyn NativeContext, jar_path: &s
 /// `getPath`/`readAttributes`/`newDirectoryStream` route through the jrt helpers
 /// when they see the P57_FS_JRT_FIELD / a `JRTFS`-encoded path.
 pub(crate) fn p57_alloc_jrt_filesystem(ctx: &mut dyn NativeContext, java_home: &str) -> Result<ObjectRef, MethodCallFailed> {
-    let fs = try_alloc_concurrent_synthetic(ctx, "java/nio/file/FileSystem", 3)?;
+    let fs = try_alloc_concurrent_synthetic(ctx, "java/nio/file/FileSystem", P57_FS_SLOTS)?;
     // Pin across the create_strings below — a moving young GC there would
     // relocate the fresh FileSystem (native stale-local family).
     let fs_pin = ctx.pin_native_root(fs);
@@ -11488,6 +11615,118 @@ pub(crate) fn p57_default_filesystem_singleton(ctx: &mut dyn NativeContext) -> R
         return Ok(fs);
     }
     Ok(p57_alloc_default_filesystem(ctx)?)
+}
+
+/// The URI scheme this synthetic FileSystem serves: "jrt" / "jar" / "file".
+/// Reads only, allocates nothing, so callers may use it before pinning.
+pub(crate) fn p57_fs_scheme(ctx: &dyn NativeContext, fs: ObjectRef) -> &'static str {
+    if matches!(ctx.get_field(fs, P57_FS_JRT_FIELD), Value::Object(Some(_))) {
+        "jrt"
+    } else if matches!(ctx.get_field(fs, P57_FS_JAR_FIELD), Value::Object(Some(_))) {
+        "jar"
+    } else {
+        "file"
+    }
+}
+
+/// The ONE `FileSystemProvider` object belonging to `fs` — allocated on first
+/// use, then stored in `P57_FS_PROVIDER_FIELD` and returned unchanged forever.
+///
+/// `FileSystem.provider()` and `FileSystemProvider.installedProviders()` both
+/// minted a FRESH provider on every call before this helper existed, so even
+/// `fs.provider() == fs.provider()` — a self-comparison — was false. HotSpot
+/// guarantees a singleton: `WindowsFileSystemProvider` is created exactly once,
+/// in `DefaultFileSystemProvider.<clinit>`, and every door returns that object.
+///
+/// The identity is load-bearing in java.base itself, not just in applications:
+/// `sun.nio.ch.UnixDomainSockets.generateTempName()` reads, verbatim,
+/// `if (path.getFileSystem().provider() != DefaultFileSystemProvider.instance())`
+/// and throws `UnsupportedOperationException` when that holds — a raw `!=`
+/// between the two doors this helper unifies. (Deliberately not a fenced code
+/// block: rustdoc collects doctests from private items and would try to compile
+/// Java as Rust.)
+pub(crate) fn p57_fs_provider(
+    ctx: &mut dyn NativeContext,
+    fs: ObjectRef,
+) -> Result<ObjectRef, MethodCallFailed> {
+    // SLOT-WIDTH GUARD — do not remove, and do not read slot 3 above it.
+    //
+    // Only CratonVM's own synthetic `java/nio/file/FileSystem` has
+    // P57_FS_SLOTS slots. A REAL `sun.nio.fs.WindowsFileSystem` has exactly
+    // THREE instance fields (javap: `provider`, `defaultDirectory`,
+    // `defaultRoot`), so `P57_FS_PROVIDER_FIELD` is one past its end, and
+    // dispatch has been receiver-aware since 2026-07 — a real FileSystem
+    // subtype receiver's `provider()` call routes into this native. An
+    // unguarded read here would be an out-of-bounds field read on a real JDK
+    // class, which is a genuine defect in this VM and not a cosmetic one.
+    //
+    // The same width mismatch is also why the scheme sniff must NOT run on a
+    // real receiver: `p57_fs_scheme` reads slots 1 and 2 looking for our
+    // jar/jrt markers, but on a real `WindowsFileSystem` those slots hold
+    // `defaultDirectory` and `defaultRoot` — both non-null Strings — so it
+    // would report "jrt" for the platform's own file system. (The
+    // per-call-allocating code this helper replaced had exactly that bug, and
+    // answered `fs.provider().getScheme()` = "jrt" for a real receiver.)
+    if ctx.object_num_fields(fs) > P57_FS_PROVIDER_FIELD {
+        if let Value::Object(Some(p)) = ctx.get_field(fs, P57_FS_PROVIDER_FIELD) {
+            return Ok(p);
+        }
+        let scheme_str = p57_fs_scheme(ctx, fs);
+        // Pin `fs` across BOTH allocations below: either can trigger a moving
+        // young GC that relocates it, and we still have to write slot 3
+        // afterwards (native stale-local family).
+        let fs_pin = ctx.pin_native_root(fs);
+        let provider = p57_alloc_provider(ctx, scheme_str)?;
+        let fs = ctx.read_native_pin(fs_pin, fs);
+        ctx.set_field(fs, P57_FS_PROVIDER_FIELD, Value::Object(Some(provider)));
+        ctx.unpin_native_roots(fs_pin);
+        return Ok(provider);
+    }
+
+    // Undersized receiver: a real FileSystem, with nowhere to cache. The only
+    // real one that reaches here is the platform default, whose provider on
+    // HotSpot IS `DefaultFileSystemProvider.instance()` — so answer with the
+    // default singleton rather than minting a per-call object.
+    //
+    // Terminates: the default filesystem singleton is always allocated with
+    // P57_FS_SLOTS, so the recursive call takes the branch above and returns
+    // without recursing again.
+    let dfs = p57_default_filesystem_singleton(ctx)?;
+    if ctx.object_num_fields(dfs) > P57_FS_PROVIDER_FIELD {
+        return p57_fs_provider(ctx, dfs);
+    }
+    // Last resort only if even the singleton came back undersized (it cannot
+    // today). Uncached, so identity is not guaranteed — but never OOB.
+    p57_alloc_provider(ctx, "file")
+}
+
+/// Allocate a fresh 1-field synthetic `FileSystemProvider` carrying `scheme`.
+/// Callers are responsible for caching it; use `p57_fs_provider` unless you
+/// specifically need an uncached one (the jar/jrt entries of
+/// `installedProviders`).
+pub(crate) fn p57_alloc_provider(
+    ctx: &mut dyn NativeContext,
+    scheme_str: &str,
+) -> Result<ObjectRef, MethodCallFailed> {
+    let provider = try_alloc_concurrent_synthetic(ctx, "java/nio/file/spi/FileSystemProvider", 1)?;
+    // Pin across the create_string below — a moving young GC there would
+    // relocate the fresh provider (native stale-local family).
+    let provider_pin = ctx.pin_native_root(provider);
+    let scheme = ctx.create_string(scheme_str);
+    let provider = ctx.read_native_pin(provider_pin, provider);
+    ctx.set_field(provider, 0, Value::Object(Some(scheme)));
+    ctx.unpin_native_roots(provider_pin);
+    Ok(provider)
+}
+
+/// The default filesystem's provider — the object HotSpot calls
+/// `DefaultFileSystemProvider.instance()` and `FileSystems.getDefault()
+/// .provider()`, and which is element 0 of `installedProviders()`.
+pub(crate) fn p57_default_provider_singleton(
+    ctx: &mut dyn NativeContext,
+) -> Result<ObjectRef, MethodCallFailed> {
+    let fs = p57_default_filesystem_singleton(ctx)?;
+    p57_fs_provider(ctx, fs)
 }
 
 pub(crate) fn p57_alloc_enum(
