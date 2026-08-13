@@ -1146,6 +1146,173 @@ fn native_hashtable_clone(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
     Ok(Some(Value::Object(Some(clone))))
 }
 
+/// `java.util.Hashtable$Enumerator` — java.base's OWN enumerator over a
+/// `Hashtable`, and the class `Hashtable.getEnumeration(int)` instantiates.
+const HASHTABLE_ENUMERATOR_CLASS: &str = "java/util/Hashtable$Enumerator";
+
+/// `Enumerator(Hashtable this$0, int type, boolean iterator)` — the inner
+/// class's only constructor, verified with `javap -p -s` against JDK 25.
+const HASHTABLE_ENUMERATOR_CTOR: &str = "(Ljava/util/Hashtable;IZ)V";
+
+/// `java.util.Hashtable.KEYS` — the `getEnumeration(int)` selector for keys.
+/// Measured, not assumed: driving a real `Enumerator` with 0 yields the keys
+/// and with 1 the values, on HotSpot 25 and on CratonVM alike.
+const HASHTABLE_TYPE_KEYS: i32 = 0;
+
+/// `java.util.Hashtable.VALUES` — the selector for `elements()`.
+const HASHTABLE_TYPE_VALUES: i32 = 1;
+
+/// True iff the receiver's slot-0 bucket array holds at least one node.
+///
+/// This is the gate on the real-enumerator landing below, and it is phrased as
+/// a question about the STORE rather than about the receiver's class on
+/// purpose. It answers "no" for exactly the two receivers that must not take
+/// that landing, and for no others:
+///
+///   * an EMPTY `Hashtable`, where java.base itself does not build an
+///     `Enumerator` (`getEnumeration` short-circuits to
+///     `Collections.emptyEnumeration()` when `count == 0`, and that carrier is
+///     deliberately not an `Iterator`); and
+///   * `Properties`, whose entries live in an identity-keyed side table
+///     (`properties_sidetable`) and NOT in the slot-0 buckets — a real
+///     `Enumerator` over a `Properties` enumerates nothing at all. Measured
+///     2026-08-12: `[]` against a `keySet()` of `[pk]` on CratonVM, and a
+///     `NullPointerException` in the `Enumerator` constructor on HotSpot,
+///     whose `Properties.table` is null outright. (In real-JDK mode a
+///     `Properties` receiver never reaches here anyway — JDK 9+ `Properties`
+///     declares its own `keys()`/`elements()` over its `map` field, so
+///     resolution stops there. The gate is what keeps that true when
+///     `Properties` does NOT declare them, which is the synthetic-JDK shape.)
+///
+/// Reads fields only — allocates nothing, retains nothing, and returns on the
+/// first node rather than walking the whole table.
+fn hashtable_has_entry(ctx: &dyn NativeContext, this: ObjectRef) -> bool {
+    let buckets = match ctx.get_field(this, 0) {
+        Value::Object(Some(arr)) => arr,
+        _ => return false,
+    };
+    let cap = ctx.array_length(buckets);
+    for i in 0..cap {
+        if let Value::Object(Some(_)) = ctx.get_array_element(buckets, i) {
+            return true;
+        }
+    }
+    false
+}
+
+/// A real `java.util.Hashtable$Enumerator` over `this`, or `None` when this
+/// image cannot build one.
+///
+/// WHY THIS EXISTS. `Hashtable.keys()`/`elements()` are shadowed by natives
+/// because CratonVM populates the table with its own bucket nodes
+/// (`cratonvm/synthetic/AnonymousObject$N`) rather than
+/// `java.util.Hashtable$Entry`. The shadow then had to produce an
+/// `Enumeration` from a snapshot, and every carrier it could reach was the
+/// wrong TYPE: the fabricated `java/util/Enumeration$Impl` (refused under
+/// `--jdk-only`, since no JDK declares it), then `Collections.enumeration(...)`
+/// — which is a real class, but an `Enumeration` and nothing else.
+///
+/// The real `Hashtable$Enumerator` implements `Enumeration` AND `Iterator`
+/// over ONE cursor, and code in the wild takes one element through the
+/// `Enumeration` face and the rest through the `Iterator` face. A
+/// `Collections$3` breaks that pattern while passing every value assertion.
+///
+/// WHY IT WORKS ANYWAY. The premise behind the snapshot — "the real backing
+/// store is not usable" — was measured and is FALSE for `Hashtable`. The
+/// receiver's real `table` field IS populated (6 entries → `usedSlots=6`,
+/// `count=6`, `threshold=8`), so java.base's own `Enumerator` reads the real
+/// array and the real `modCount`, and its `Entry.key`/`.value`/`.next` field
+/// accesses land correctly on our nodes. Measured 2026-08-12 against JDK 25:
+/// keys, values, keys≠values, `NoSuchElementException` past the end, the
+/// dual-face shared cursor, two independent cursors, `Collections.list(...)`,
+/// and a `Hashtable(Map)`-built receiver all agree line-for-line with HotSpot.
+///
+/// This is the same rule as `classloader::real_snapshot_enumeration`, taken
+/// one step further: prefer a real class the JDK builds ITSELF — here not just
+/// the carrier but the whole cursor, so the type is right by construction and
+/// nothing has to know what the carrier is called.
+///
+/// `None` (never a fabrication, and never a half-built object) when the class
+/// is absent or would be stood in for — the synthetic-JDK shape, where the
+/// caller keeps the snapshot carrier it has always had.
+///
+/// Returns the receiver alongside the answer, read back through the pin. That
+/// is not decoration: this function runs Java code (`<clinit>`, the
+/// constructor) and the heap can move under it, so the caller's own `this` is
+/// stale on return — and `args[0]` is a COPY made before the move, so
+/// re-reading the argument slice would hand back the same stale ref rather
+/// than a fresh one.
+fn real_hashtable_enumerator(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    enum_type: i32,
+) -> Result<(Option<ObjectRef>, ObjectRef), cratonvm_types::error::MethodCallFailed> {
+    // Never accept a stand-in: a fabricated `Hashtable$Enumerator` would be
+    // exactly the class-fabrication this landing exists to stop minting, and
+    // its methods would be unbound. Ask before a stub can be created, and
+    // again after initialization in case one already existed.
+    if ctx.would_fabricate_synthetic_stub(HASHTABLE_ENUMERATOR_CLASS)
+        || ctx.is_class_synthetic_stub(HASHTABLE_ENUMERATOR_CLASS)
+    {
+        // Nothing ran, so the caller's `this` is still good.
+        return Ok((None, this));
+    }
+    // GC-SAFETY: `ensure_class_initialized` and `new_object_initialized` both
+    // run Java code and can move the heap, and `this` is a bare Rust local the
+    // collector cannot see. Root it across both and read it back through the
+    // pin — the contract `make_snapshot_enumeration` documents.
+    let pin = ctx.pin_native_root(this);
+    // Unpin on EVERY exit path, the error one included — hence the split: the
+    // inner half may use `?`, this half may not.
+    let out = real_hashtable_enumerator_pinned(ctx, this, pin, enum_type);
+    ctx.unpin_native_roots(pin);
+    out
+}
+
+/// [`real_hashtable_enumerator`] with `this` already rooted at `pin`.
+fn real_hashtable_enumerator_pinned(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    pin: usize,
+    enum_type: i32,
+) -> Result<(Option<ObjectRef>, ObjectRef), cratonvm_types::error::MethodCallFailed> {
+    // A class this image does not have is not an error here — it is the
+    // synthetic-JDK shape, and the caller has a landing for it. Discard the
+    // failure rather than surfacing it at the application's `keys()` call site,
+    // which is the mistake the fabricated carrier made in the other direction.
+    if ctx.ensure_class_initialized(HASHTABLE_ENUMERATOR_CLASS).is_err() {
+        return Ok((None, ctx.read_native_pin(pin, this)));
+    }
+    if ctx.is_class_synthetic_stub(HASHTABLE_ENUMERATOR_CLASS)
+        || !ctx.method_exists(
+            HASHTABLE_ENUMERATOR_CLASS,
+            "<init>",
+            HASHTABLE_ENUMERATOR_CTOR,
+        )
+    {
+        return Ok((None, ctx.read_native_pin(pin, this)));
+    }
+    let this = ctx.read_native_pin(pin, this);
+    // `iterator = false` is what `getEnumeration(int)` passes: it selects the
+    // Enumeration-face contract (no modCount check in `nextElement`). The
+    // Iterator face stays available either way — that is the whole point of
+    // the class — and `next()` checks `modCount` regardless of this flag.
+    let built = ctx.new_object_initialized(
+        HASHTABLE_ENUMERATOR_CLASS,
+        HASHTABLE_ENUMERATOR_CTOR,
+        &[
+            Value::Object(Some(this)),
+            Value::Int(enum_type),
+            Value::Int(0),
+        ],
+    )?;
+    let this = ctx.read_native_pin(pin, this);
+    match built {
+        Some(Value::Object(Some(enm))) => Ok((Some(enm), this)),
+        _ => Ok((None, this)),
+    }
+}
+
 // FIX: added `type_marker` param. The synthetic Enumeration carries a
 // discriminator in field 2 (1 = keys snapshot, 0 = values/elements snapshot)
 // so callers can tell a keys()-enumeration from an elements()-enumeration.
@@ -1193,6 +1360,18 @@ fn make_hashtable_enumeration(
     // wrapped by real `Collections.enumeration` bytecode. Compatible mode is
     // byte-identical — the `Ok` arm below is the old body unchanged.
     //
+    // SINCE 2026-08-12 THIS IS THE FALLBACK, NOT THE PRIMARY PATH. That
+    // landing fixed the crash and the values but not the TYPE: the carrier is
+    // `java.util.Collections$3`, an `Enumeration` and nothing else, where the
+    // JDK's own `Hashtable$Enumerator` is an `Enumeration` AND an `Iterator`
+    // over one cursor. `RJdkEnumerations` asserts that dual role and was RED
+    // on exactly this. `native_hashtable_keys`/`elements` now build the real
+    // `Hashtable$Enumerator` over the live table first (see
+    // [`real_hashtable_enumerator`]), and only fall through to here when the
+    // receiver has no entries in its slot-0 buckets or the image has no such
+    // class. Both remaining arms are correct where they are reached, so
+    // nothing below changed.
+    //
     // The `type_marker` is dropped on the real carrier, which is safe because
     // nothing reads field 2: `register_enumeration_impl_natives`
     // (`classloader.rs:6104`) reads slots 0 and 1 only, and `classloader.rs`
@@ -1216,17 +1395,40 @@ fn make_hashtable_enumeration(
     Ok(Some(Value::Object(Some(en))))
 }
 
-/// `elements()Ljava/util/Enumeration;` — snapshot of values.
+/// `elements()Ljava/util/Enumeration;` — java.base's own `Enumerator` over the
+/// live table when one can be built, else a snapshot of values.
 fn native_hashtable_elements(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = obj_arg(args, 0)?;
+    let mut this = obj_arg(args, 0)?;
+    if hashtable_has_entry(ctx, this) {
+        let (enm, refreshed) = real_hashtable_enumerator(ctx, this, HASHTABLE_TYPE_VALUES)?;
+        if let Some(enm) = enm {
+            return Ok(Some(Value::Object(Some(enm))));
+        }
+        this = refreshed;
+    }
     let values = collect_hashtable(ctx, this, false);
     // FIX: type marker 0 = values/elements snapshot.
     make_hashtable_enumeration(ctx, values, 0)
 }
 
-/// `keys()Ljava/util/Enumeration;` — snapshot of keys.
+/// `keys()Ljava/util/Enumeration;` — java.base's own `Enumerator` over the live
+/// table when one can be built, else a snapshot of keys.
+///
+/// The snapshot arm is unchanged and still reached in two cases: an image with
+/// no real `java.util.Hashtable$Enumerator` (the synthetic-JDK shape), and a
+/// receiver whose slot-0 buckets hold nothing — see [`hashtable_has_entry`] for
+/// why those two are the same question.
 fn native_hashtable_keys(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = obj_arg(args, 0)?;
+    let mut this = obj_arg(args, 0)?;
+    if hashtable_has_entry(ctx, this) {
+        let (enm, refreshed) = real_hashtable_enumerator(ctx, this, HASHTABLE_TYPE_KEYS)?;
+        if let Some(enm) = enm {
+            return Ok(Some(Value::Object(Some(enm))));
+        }
+        // The attempt ran Java code and may have moved the heap: take the
+        // receiver it read back through its pin, not the stale `args[0]` copy.
+        this = refreshed;
+    }
     let keys = collect_hashtable(ctx, this, true);
     // FIX: type marker 1 = keys snapshot.
     make_hashtable_enumeration(ctx, keys, 1)

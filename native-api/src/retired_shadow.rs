@@ -187,7 +187,7 @@
 //! invisible; `every_entry_is_reachable_through_the_predicate` is the test that
 //! catches exactly that.
 //!
-//! # `java/util` collections — adjudicated 2026-08-12, EIGHT of 68 retirable, HELD
+//! # `java/util` collections — retired 2026-08-12, EIGHT of 68 registrations
 //!
 //! A `--jdk-only --explain-jdk-only` run reported 226 `native-shadows-bytecode`
 //! rows actually taken; 62 of them are `java.util` collections triples, 68
@@ -197,8 +197,8 @@
 //! docs/known-issues/jdk-only/P2-COLLECTIONS-SHADOWS-20260812.md. **Eight are
 //! retirable. Sixty are not, and most of them never will be by this route.**
 //!
-//! The eight, in the sorted position they would take (at the HEAD — every
-//! `java/util/A…`, `C…` and `H…` key sorts before `java/util/logging/`):
+//! The eight, at the HEAD of the table — every `java/util/A…` and `C…` key
+//! sorts before `java/util/logging/`:
 //!
 //! ```text
 //!   java/util/ArrayList        <init>          ()V
@@ -209,6 +209,22 @@
 //!   java/util/Arrays$ArrayList iterator        ()Ljava/util/Iterator;
 //!   java/util/Collections      synchronizedMap (Ljava/util/Map;)Ljava/util/Map;
 //! ```
+//!
+//! **All seven are LIVE, not paper entries.** A census on an ordinary
+//! collections workload
+//! (`--jdk-only --explain-jdk-only --jdk-only-report`) reports every one of
+//! them as an actually-taken `native-shadows-bytecode` row — the kind that
+//! distinguishes a dispatching shadow from a mere refusal record. The
+//! `LogRecord.<init>` inert-entry trap does not apply to any of them.
+//!
+//! **What this does NOT fix, stated because the campaign brief says it does.**
+//! The `Collections.synchronizedList` data loss in
+//! STUB-CENSUS-20260812.md §5.2 is attributed there to a
+//! `Collections.synchronized*` identity stub. That stub was removed by
+//! `e8a7caba4` (2026-07-01); both live registrars build the real wrapper
+//! through the real constructor. Retiring `synchronizedMap` is
+//! behaviour-preserving by construction and **fixes nothing** — the measured
+//! loss has an unidentified cause. See P2-COLLECTIONS-SHADOWS §7.1.
 //!
 //! ## Why the other sixty are a different question, not a longer list
 //!
@@ -326,6 +342,28 @@
 /// table, which reads as "not retired" and is invisible. The test below
 /// asserts the ordering.
 static RETIRED_SHADOW_TRIPLES: &[(&str, &str, &str)] = &[
+    // `java/util` collections, retired 2026-08-12. Seven triples / EIGHT
+    // registrations — `<init>(I)V` is registered twice, in `native-builtins`
+    // and in `native-collections`, and a retirement moves both. These are the
+    // only rows of the 68-registration `java.util` slice whose §1.4
+    // precondition is met: `al_slots` / `al_mod_count_slot` / `al_itr_slots`
+    // resolve `elementData`, `size`, `modCount`, `cursor`, `lastRet`,
+    // `expectedModCount` and `this$0` BY NAME, and `try_alloc_synthetic` loads
+    // the real `java/util/ArrayList$Itr`. The other sixty are held: their state
+    // is in Rust side tables or fabricated slots, so retiring them answers an
+    // EMPTY collection over a populated one. See the module docs and
+    // docs/known-issues/jdk-only/P2-COLLECTIONS-SHADOWS-20260812.md.
+    //
+    // NOT here, and load-bearing FOR these five: `java/util/Arrays.copyOf`.
+    // Real `ArrayList.grow`/`toArray`/`ArrayList(Collection)` funnel through
+    // it, so it stays a `Bridge` — these entries depend on that.
+    ("java/util/ArrayList", "<init>", "()V"),
+    ("java/util/ArrayList", "<init>", "(I)V"),
+    ("java/util/ArrayList", "<init>", "(Ljava/util/Collection;)V"),
+    ("java/util/ArrayList", "add", "(Ljava/lang/Object;)Z"),
+    ("java/util/ArrayList", "clear", "()V"),
+    ("java/util/Arrays$ArrayList", "iterator", "()Ljava/util/Iterator;"),
+    ("java/util/Collections", "synchronizedMap", "(Ljava/util/Map;)Ljava/util/Map;"),
     ("java/util/logging/FileHandler", "<init>", "()V"),
     ("java/util/logging/FileHandler", "<init>", "(Ljava/lang/String;)V"),
     ("java/util/logging/FileHandler", "close", "()V"),
@@ -424,10 +462,20 @@ static RETIRED_SHADOW_TRIPLES: &[(&str, &str, &str)] = &[
 /// Is this exact triple a retired §1.4 shadow?
 ///
 /// The class-name prefix test is a cheap discriminator: every entry is under
-/// `java/util/logging/`, and almost no registration is, so the common case
-/// costs one prefix compare and nothing else.
+/// `java/util/`, and almost no registration is, so the common case costs one
+/// prefix compare and nothing else.
+///
+/// The prefix was `java/util/logging/` until the 2026-08-12 collections wave;
+/// widening it to `java/util/` is not a widening of what is retired — the
+/// binary search still decides that — only of what gets asked. An entry under
+/// a prefix this test rejects answers `false`, which reads as "not retired" and
+/// is invisible; `every_entry_is_reachable_through_the_predicate` is the guard.
+/// `java/util/` now admits `java/util/concurrent/`, `java/util/stream/` and the
+/// rest of the package tree to one extra binary search each, which is the whole
+/// cost, and `the_held_collection_families_are_not_retired` is the test that
+/// says admitting them changes no answer.
 pub fn triple_is_retired_shadow(class_name: &str, method_name: &str, descriptor: &str) -> bool {
-    if !class_name.starts_with("java/util/logging/") {
+    if !class_name.starts_with("java/util/") {
         return false;
     }
     RETIRED_SHADOW_TRIPLES
@@ -496,15 +544,75 @@ mod tests {
     }
 
     /// A vacuity floor. An empty table would make every test above pass and
-    /// retire nothing — the 2026-08-11 measurement recorded 84 triples, and the
-    /// 2026-08-12 source-pair retirement added four.
+    /// retire nothing — the 2026-08-11 measurement recorded 84 triples, the
+    /// 2026-08-12 source-pair retirement added four, and the 2026-08-12
+    /// collections wave added seven more (eight registrations).
     #[test]
     fn the_table_is_not_empty() {
         assert!(
             RETIRED_SHADOW_TRIPLES.len() >= 80,
-            "expected the measured java.util.logging population (88), got {}",
+            "expected 88 java.util.logging triples + 7 java.util collections = 95, got {}",
             RETIRED_SHADOW_TRIPLES.len()
         );
+    }
+
+    /// The seven `java/util` collections triples are retired — and the eight
+    /// registrations they cover are `<init>(I)V` twice, which this table
+    /// expresses as ONE entry because it retires TRIPLES.
+    #[test]
+    fn the_retirable_collections_slice_is_retired() {
+        for (c, m, d) in [
+            ("java/util/ArrayList", "<init>", "()V"),
+            ("java/util/ArrayList", "<init>", "(I)V"),
+            ("java/util/ArrayList", "<init>", "(Ljava/util/Collection;)V"),
+            ("java/util/ArrayList", "add", "(Ljava/lang/Object;)Z"),
+            ("java/util/ArrayList", "clear", "()V"),
+            ("java/util/Arrays$ArrayList", "iterator", "()Ljava/util/Iterator;"),
+            ("java/util/Collections", "synchronizedMap", "(Ljava/util/Map;)Ljava/util/Map;"),
+        ] {
+            assert!(triple_is_retired_shadow(c, m, d), "not retired: {c}.{m}{d}");
+        }
+    }
+
+    /// The sixty registrations that are NOT retirable stay untouched — and this
+    /// is the test that earns the widened `java/util/` prefix.
+    ///
+    /// Each family below keeps its entries in a Rust side table or a fabricated
+    /// slot layout, so refusing its shadow hands real bytecode an EMPTY
+    /// collection rather than a working one. That is not a reading: with
+    /// `CRATONVM_ENFORCE_NATIVE_SHADOW` scoped to each of the three families
+    /// under `--jdk-only` on 2026-08-12, `TreeMap.firstKey` answered the wrong
+    /// key and `TreeSet` lost half its elements, `ConcurrentHashMap.size`
+    /// answered 1 for a two-entry map, and `ArrayDeque` reported 39 after 40
+    /// `addLast`s and then dropped an element across a drain/refill.
+    ///
+    /// `Arrays.copyOf` is in the list for the opposite reason: it is the one
+    /// triple the five `ArrayList` retirements DEPEND on staying a `Bridge`.
+    #[test]
+    fn the_held_collection_families_are_not_retired() {
+        for (c, m, d) in [
+            // needs-VM-support: state is not real.
+            ("java/util/TreeMap", "get", "(Ljava/lang/Object;)Ljava/lang/Object;"),
+            ("java/util/TreeSet", "add", "(Ljava/lang/Object;)Z"),
+            ("java/util/ArrayDeque", "addLast", "(Ljava/lang/Object;)V"),
+            ("java/util/concurrent/ConcurrentHashMap", "put",
+             "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;"),
+            ("java/util/Hashtable", "put", "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;"),
+            ("java/util/LinkedHashSet", "add", "(Ljava/lang/Object;)Z"),
+            ("java/util/HashMap", "put", "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;"),
+            ("java/util/HashSet", "iterator", "()Ljava/util/Iterator;"),
+            ("java/util/LinkedList", "add", "(Ljava/lang/Object;)Z"),
+            // Entangled with `Map.values()`: these ArrayList methods are the
+            // implementation of the values view, and retiring them freezes it.
+            ("java/util/ArrayList", "size", "()I"),
+            ("java/util/ArrayList", "get", "(I)Ljava/lang/Object;"),
+            ("java/util/ArrayList", "iterator", "()Ljava/util/Iterator;"),
+            ("java/util/ArrayList$Itr", "next", "()Ljava/lang/Object;"),
+            // Load-bearing FOR the retirements above.
+            ("java/util/Arrays", "copyOf", "([Ljava/lang/Object;I)[Ljava/lang/Object;"),
+        ] {
+            assert!(!triple_is_retired_shadow(c, m, d), "wrongly retired: {c}.{m}{d}");
+        }
     }
 
     /// `LogRecord`'s source pair is retired as a SET of four.

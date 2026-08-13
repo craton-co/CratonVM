@@ -48861,6 +48861,292 @@ fn make_snapshot_enumeration(ctx: &mut dyn NativeContext, elems: &[Value]) -> Re
     out
 }
 
+/// The real JDK bin-node class a `ConcurrentHashMap.table` is an array of.
+const CHM_NODE_CLASS: &str = "java/util/concurrent/ConcurrentHashMap$Node";
+/// The JDK's own dual `Enumeration`/`Iterator` carriers.
+const CHM_KEY_ITER_CLASS: &str = "java/util/concurrent/ConcurrentHashMap$KeyIterator";
+const CHM_VALUE_ITER_CLASS: &str = "java/util/concurrent/ConcurrentHashMap$ValueIterator";
+/// `BaseIterator(Node<K,V>[] tab, int size, int index, int limit, ConcurrentHashMap<K,V> map)`
+/// — both carriers inherit this shape verbatim, so one descriptor serves both.
+const CHM_ITER_INIT_DESC: &str = concat!(
+    "([Ljava/util/concurrent/ConcurrentHashMap$Node;III",
+    "Ljava/util/concurrent/ConcurrentHashMap;)V"
+);
+
+/// Resolve a REAL image class, never a fabrication.
+///
+/// `ensure_class_initialized` fabricates a stand-in rather than failing, so an
+/// `Ok` from it is not evidence the image has the class (the recurring
+/// `ensure-class-initialized-fabricates-instead-of-failing` shape). Both the
+/// name the id resolves BACK to and the synthetic-stub predicate are checked,
+/// and either mismatch is reported as "not available" so the caller falls back
+/// rather than building a carrier out of a stub.
+fn chm_real_class(ctx: &mut dyn NativeContext, name: &str) -> Option<ClassId> {
+    if ctx.is_class_synthetic_stub(name) {
+        return None;
+    }
+    if let Some(cid) = ctx.class_id_by_name(name) {
+        return Some(cid);
+    }
+    let cid = ctx.ensure_class_initialized(name).ok()?;
+    if ctx.class_name_of_id(cid).as_deref() == Some(name) {
+        Some(cid)
+    } else {
+        None
+    }
+}
+
+/// Materialise the segmented store into a REAL `ConcurrentHashMap$Node[]` and
+/// publish it in the receiver's real `table` field, returning the array.
+///
+/// # Why this exists
+///
+/// `Hashtable`'s precedent is the whole argument: its bucket array lives in the
+/// receiver's own `table` field, and java.base's own `Hashtable$Enumerator`
+/// walks it correctly even though the NODES are ours. CHM was the opposite —
+/// measured on this binary, `--jdk-only`, JDK 25.0.3+9, for an empty map, a
+/// 6-entry map and a 200-entry map alike:
+///
+/// ```text
+///                        HotSpot 25                    CratonVM --jdk-only
+///   table                len=16 used=6 $Node           null
+///   baseCount / sizeCtl  6 / 12                        0 / 0
+///   slot 0 (AbstractMap.keySet)  null                  Object[4] of segments
+///   keys()               $KeyIterator (dual)           Collections$3 (NOT an Iterator)
+/// ```
+///
+/// so `keys()`/`elements()` could not hand back the JDK's dual
+/// `Enumeration`+`Iterator` carrier: there was nothing for a `KeyIterator` to
+/// walk. That is `RJdkEnumerations`' `carriersAreTheJdksOwnDualInterface\
+/// Enumerators` vector.
+///
+/// The feasibility question was settled by measurement BEFORE this was written
+/// (`probes/ChmDrive.java`): a `Node[]` built by hand at the Java level, handed
+/// to java.base's own `KeyIterator`/`ValueIterator`, iterates CORRECTLY on
+/// CratonVM `--jdk-only` — both faces, one shared cursor, the right multiset.
+/// `Traverser.advance()`, `tabAt()`'s `U.getReferenceAcquire` and its checkcast
+/// to `$Node` all run. So the shape is walkable; only the field was missing.
+///
+/// # What this is and is NOT
+///
+/// It is a **refresh-on-read mirror**, not a move of the authority. The
+/// segmented store rooted at slot 0 remains the one writable copy; every
+/// mutator (`put`/`remove`/`compute*`/…) is unchanged and never runs this. The
+/// mirror is rebuilt from scratch on each `keys()`/`elements()`, so `table` is
+/// exactly as fresh as the most recent iteration and can never drift silently
+/// behind the store the way a build-once cache would.
+///
+/// **Concurrency.** This adds no new sharing and takes no segment lock. It
+/// reads the segments exactly as `chm_collect_all_keys` already does, so it
+/// inherits that walk's existing weak consistency, and it publishes a private,
+/// freshly-allocated array that no other thread can reach until the store to
+/// `table` makes it visible. A concurrent mutation during or after the walk is
+/// not reflected in an iterator already handed out — which is precisely what
+/// `ConcurrentHashMap`'s spec permits of its weakly-consistent iterators
+/// ("may or may not reflect" post-construction modifications). Two threads
+/// calling `keys()` at once each build their own array; the last store to
+/// `table` wins, and both iterators still hold their own. What this does NOT
+/// give is atomicity of the snapshot against a concurrent writer — no more and
+/// no less than the snapshot enumeration it replaces.
+///
+/// **It does not unblock retiring the CHM shadows.** Retirement needs `table`
+/// to be the AUTHORITY that real `putVal`/`get` bytecode CASes into, which a
+/// mirror is not. See `W7-96-chm-table-never-populated.md`.
+///
+/// # Why the fallback is total
+///
+/// Any surprise — no real `$Node` in the image, an over-large table, a
+/// primitive in a slot a real `$Node` declares as a reference (which
+/// descriptor coercion would silently turn into a DIFFERENT value on store) —
+/// returns `None` and the caller keeps today's snapshot carrier verbatim. A
+/// partially-materialised `table` would be a populated-looking lie, which is
+/// the one outcome worse than the null it replaces.
+fn chm_publish_real_table(ctx: &mut dyn NativeContext, this: ObjectRef) -> Option<ObjectRef> {
+    // `this` is pinned for the WHOLE body and every early exit unwinds through
+    // the single `unpin_native_roots` below, so the many `return None` arms
+    // inside cannot leak a pin. The array and key/value pins taken later are
+    // all above this handle and are released by the same call.
+    let this_pin = ctx.pin_native_root(this);
+    let out = chm_publish_real_table_pinned(ctx, this, this_pin);
+    ctx.unpin_native_roots(this_pin);
+    out
+}
+
+/// [`chm_publish_real_table`]'s body, with `this` already pinned as `this_pin`
+/// and the unpin left to the caller.
+fn chm_publish_real_table_pinned(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    this_pin: usize,
+) -> Option<ObjectRef> {
+    // Class resolution can LOAD a class, which allocates, so this runs before
+    // anything raw is read off `this` and `this` is re-read straight after.
+    let node_cid = chm_real_class(ctx, CHM_NODE_CLASS)?;
+    let this = ctx.read_native_pin(this_pin, this);
+    let node_width = ctx.class_num_total_fields(node_cid).max(NODE_NUM_FIELDS);
+    let table_slot = receiver_table_slot(ctx, this)?;
+
+    // Snapshot the segmented store. `get_field`/`get_array_element`/
+    // `array_length` never allocate, so there is no GC point in this walk and
+    // the raw refs it collects are still live when it ends. Allocation starts
+    // below, behind pins.
+    let mut entries: Vec<(i32, Value, Value)> = Vec::new();
+    for seg in chm_all_segments(ctx, this) {
+        let (buckets, _size, cap) = map_state(ctx, seg);
+        if let Some(b) = buckets {
+            for i in 0..(cap as usize) {
+                let mut node_val = ctx.get_array_element(b, i);
+                while let Value::Object(Some(node)) = node_val {
+                    // The JDK's `spread()` masks with `HASH_BITS`, and
+                    // `Traverser.advance()` reads `e.hash < 0` as "this bin
+                    // head is a Forwarding/Tree/Reservation node, not a
+                    // mapping". A negative hash here would make java.base
+                    // treat our plain node as a control node and walk off it.
+                    let hash = match ctx.get_field(node, NODE_FIELD_HASH) {
+                        Value::Int(h) => h & 0x7fff_ffff,
+                        _ => return None,
+                    };
+                    let key = get_node_key(ctx, node);
+                    let value = get_node_value(ctx, node);
+                    // A value that IS the segment object is an in-flight
+                    // `computeIfAbsent` reservation, not a mapping — invisible
+                    // to iteration, exactly as the JDK's ReservationNode is.
+                    // See `chm_collect_all_entries`.
+                    let reserved = matches!(value, Value::Object(Some(v))
+                        if std::ptr::eq(v.as_ptr(), seg.as_ptr()));
+                    if !reserved {
+                        // A real `$Node` declares `key` and `val` as
+                        // references. A primitive stored into one would be
+                        // descriptor-coerced on the way in and read back as a
+                        // different value, so abandon rather than publish it.
+                        if !matches!(key, Value::Object(Some(_)))
+                            || !matches!(value, Value::Object(Some(_)))
+                        {
+                            return None;
+                        }
+                        entries.push((hash, key, value));
+                    }
+                    node_val = ctx.get_field(node, NODE_FIELD_NEXT);
+                }
+            }
+        }
+    }
+
+    // HotSpot's own sizing, so the published table matches it bin-for-bin:
+    // start at DEFAULT_CAPACITY and double while the count exceeds the 0.75
+    // load factor. Measured against HotSpot: 6 entries -> 16, 200 -> 512.
+    let n = entries.len();
+    let mut cap = 16usize;
+    while n > cap - (cap >> 2) {
+        if cap > (1usize << 29) {
+            return None;
+        }
+        cap <<= 1;
+    }
+
+    // GC discipline: every collected key/value must be pinned before the first
+    // allocation and re-read after each one. `this` is already pinned by the
+    // caller, whose handle is the base that unwinds this whole batch.
+    let flat: Vec<Value> = entries.iter().flat_map(|(_, k, v)| [*k, *v]).collect();
+    let (_flat_base, flat_pins) = pin_value_slice(ctx, &flat);
+    let table = ctx.try_new_ref_array(node_cid, cap)?;
+    let table_pin = ctx.pin_native_root(table);
+
+    for (i, (hash, _, _)) in entries.iter().enumerate() {
+        // The only GC point in the loop. Everything raw is stale after it.
+        let node = ctx.alloc_object(node_cid, node_width);
+        let table = ctx.read_native_pin(table_pin, table);
+        let key = read_pinned_elem(ctx, flat_pins[i * 2], flat[i * 2]);
+        let value = read_pinned_elem(ctx, flat_pins[i * 2 + 1], flat[i * 2 + 1]);
+        // Read the current bin head straight out of the array rather than
+        // carrying it across the allocation above.
+        let idx = (*hash as usize) & (cap - 1);
+        let head = ctx.get_array_element(table, idx);
+        ctx.set_field(node, NODE_FIELD_HASH, Value::Int(*hash));
+        ctx.set_field(node, NODE_FIELD_KEY, key);
+        ctx.set_field(node, NODE_FIELD_VALUE, value);
+        ctx.set_field(node, NODE_FIELD_NEXT, head);
+        ctx.set_array_element(table, idx, Value::Object(Some(node)));
+    }
+
+    let this = ctx.read_native_pin(this_pin, this);
+    let table = ctx.read_native_pin(table_pin, table);
+    // The bookkeeping HotSpot carries alongside the array. `baseCount` is a
+    // `long` and `sizeCtl` the 0.75 threshold; both are resolved by NAME, so a
+    // receiver that does not declare them (a subclass with a shadowing layout)
+    // simply gets the array and no bookkeeping rather than a stray store.
+    ctx.set_field(this, table_slot, Value::Object(Some(table)));
+    let cid = ctx.class_id_of_object(this);
+    let width = ctx.object_num_fields(this);
+    if let Some(slot) = ctx.resolve_field_index_by_class_id(cid, "baseCount") {
+        if slot < width {
+            ctx.set_field(this, slot, Value::Long(n as i64));
+        }
+    }
+    if let Some(slot) = ctx.resolve_field_index_by_class_id(cid, "sizeCtl") {
+        if slot < width {
+            ctx.set_field(this, slot, Value::Int((cap - (cap >> 2)) as i32));
+        }
+    }
+    Some(table)
+}
+
+/// Build java.base's OWN `KeyIterator`/`ValueIterator` over a freshly
+/// materialised `table` — the dual `Enumeration`+`Iterator` carrier that
+/// `ConcurrentHashMap.keys()`/`elements()` are specified to return.
+///
+/// `Ok(None)` means "this image cannot supply the real carrier", and the
+/// caller keeps the snapshot enumeration it has always returned. Errors from
+/// the constructor propagate rather than being swallowed, so a Java exception
+/// raised inside `<init>` is not left pending behind a silent fallback.
+fn chm_real_dual_iterator(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    values: bool,
+) -> Result<Option<ObjectRef>, MethodCallFailed> {
+    let itr_class = if values {
+        CHM_VALUE_ITER_CLASS
+    } else {
+        CHM_KEY_ITER_CLASS
+    };
+    // Pinned before the class lookup, not after: resolving a class can load it,
+    // and loading allocates.
+    let this_pin = ctx.pin_native_root(this);
+    let out = (|| -> Result<Option<ObjectRef>, MethodCallFailed> {
+        if chm_real_class(ctx, itr_class).is_none() {
+            return Ok(None);
+        }
+        let this = ctx.read_native_pin(this_pin, this);
+        let table = match chm_publish_real_table(ctx, this) {
+            Some(t) => t,
+            None => return Ok(None),
+        };
+        let table_pin = ctx.pin_native_root(table);
+        let n = ctx.array_length(table) as i32;
+        let this = ctx.read_native_pin(this_pin, this);
+        let table = ctx.read_native_pin(table_pin, table);
+        // `keys()` is `new KeyIterator<>(t, f, 0, f, this)` with `f =
+        // t.length`, against `Traverser(tab, size, index, limit)`.
+        let built = ctx.new_object_initialized(
+            itr_class,
+            CHM_ITER_INIT_DESC,
+            &[
+                Value::Object(Some(table)),
+                Value::Int(n),
+                Value::Int(0),
+                Value::Int(n),
+                Value::Object(Some(this)),
+            ],
+        )?;
+        Ok(match built {
+            Some(Value::Object(Some(it))) => Some(it),
+            _ => None,
+        })
+    })();
+    ctx.unpin_native_roots(this_pin);
+    out
+}
+
 fn native_chm_elements(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
@@ -48871,6 +49157,15 @@ fn native_chm_elements(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
             )?))))
         }
     };
+    // `chm_real_dual_iterator` allocates, so the caller's `this` is stale on
+    // the fallback path unless it is pinned across the attempt.
+    let this_pin = ctx.pin_native_root(this);
+    let built = chm_real_dual_iterator(ctx, this, true);
+    let this = ctx.read_native_pin(this_pin, this);
+    ctx.unpin_native_roots(this_pin);
+    if let Some(it) = built? {
+        return Ok(Some(Value::Object(Some(it))));
+    }
     let vals = chm_collect_all_values(ctx, this);
     Ok(Some(Value::Object(Some(make_snapshot_enumeration(
         ctx, &vals,
@@ -48887,6 +49182,14 @@ fn native_chm_keys(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
             )?))))
         }
     };
+    // See `native_chm_elements` for the pin.
+    let this_pin = ctx.pin_native_root(this);
+    let built = chm_real_dual_iterator(ctx, this, false);
+    let this = ctx.read_native_pin(this_pin, this);
+    ctx.unpin_native_roots(this_pin);
+    if let Some(it) = built? {
+        return Ok(Some(Value::Object(Some(it))));
+    }
     let keys = chm_collect_all_keys(ctx, this);
     Ok(Some(Value::Object(Some(make_snapshot_enumeration(
         ctx, &keys,

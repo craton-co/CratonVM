@@ -2331,10 +2331,28 @@ pub(crate) fn native_math_floor_div_int(
         }
         .into());
     }
-    // Java floorDiv: rounds toward negative infinity
-    let d = a / b;
-    let r = a % b;
-    let result = if (r != 0) && ((r ^ b) < 0) { d - 1 } else { d };
+    // Java floorDiv: rounds toward negative infinity.
+    //
+    // WRAPPING, not `/` and `%`. `Integer.MIN_VALUE / -1` overflows `i32`, and
+    // **Rust checks division overflow unconditionally — in release as well as
+    // debug**. The resulting panic is not a Java throwable, so it does not
+    // become an `ArithmeticException`: it terminates the VM. One line of
+    // ordinary application bytecode, in the default mode, with no flags.
+    //
+    // JVMS §6.5 (`idiv`/`irem`) specifies the wrap: `MIN_VALUE / -1` is
+    // `MIN_VALUE` and `MIN_VALUE % -1` is `0`. HotSpot 25, measured, agrees.
+    //
+    // The `b == 0` guard directly above is the tell — it handles the divisor
+    // *Java* forbids and not the one *Rust* forbids. Same shape in all four
+    // bodies here (`floorDiv`/`floorMod` × `int`/`long`), and `StrictMath`
+    // registers onto these same bodies, so it was eight fatal triples.
+    let d = a.wrapping_div(b);
+    let r = a.wrapping_rem(b);
+    let result = if (r != 0) && ((r ^ b) < 0) {
+        d.wrapping_sub(1)
+    } else {
+        d
+    };
     Ok(Some(Value::Int(result)))
 }
 
@@ -2357,9 +2375,15 @@ pub(crate) fn native_math_floor_div_long(
         }
         .into());
     }
-    let d = a / b;
-    let r = a % b;
-    let result = if (r != 0) && ((r ^ b) < 0) { d - 1 } else { d };
+    // Wrapping, for the reason spelled out on the `int` body above:
+    // `Long.MIN_VALUE / -1` overflows and Rust panics on it in release.
+    let d = a.wrapping_div(b);
+    let r = a.wrapping_rem(b);
+    let result = if (r != 0) && ((r ^ b) < 0) {
+        d.wrapping_sub(1)
+    } else {
+        d
+    };
     Ok(Some(Value::Long(result)))
 }
 
@@ -2382,9 +2406,16 @@ pub(crate) fn native_math_floor_mod_int(
         }
         .into());
     }
-    // Java floorMod: a - floorDiv(a,b) * b
-    let r = a % b;
-    let result = if (r != 0) && ((r ^ b) < 0) { r + b } else { r };
+    // Java floorMod: a - floorDiv(a,b) * b. Wrapping, for the reason on the
+    // `floorDiv` int body above — `MIN_VALUE % -1` overflows and Rust panics on
+    // it in release, killing the VM rather than raising anything catchable.
+    // JVMS §6.5: the answer is 0.
+    let r = a.wrapping_rem(b);
+    let result = if (r != 0) && ((r ^ b) < 0) {
+        r.wrapping_add(b)
+    } else {
+        r
+    };
     Ok(Some(Value::Int(result)))
 }
 
@@ -2407,8 +2438,13 @@ pub(crate) fn native_math_floor_mod_long(
         }
         .into());
     }
-    let r = a % b;
-    let result = if (r != 0) && ((r ^ b) < 0) { r + b } else { r };
+    // Wrapping — see the `floorDiv` int body above.
+    let r = a.wrapping_rem(b);
+    let result = if (r != 0) && ((r ^ b) < 0) {
+        r.wrapping_add(b)
+    } else {
+        r
+    };
     Ok(Some(Value::Long(result)))
 }
 

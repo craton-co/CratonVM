@@ -35,6 +35,31 @@ corpus_is_built() {
   return 0
 }
 
+# Add the jars of the HIGHEST version of one maven artifact.
+#
+# `cp_add_jars_r "$m2/org/junit/platform"` sweeps the whole group recursively,
+# so it puts EVERY cached version of every artifact on the classpath at once.
+# The local repository holds junit-platform 1.12.1 and 1.14.4, and both landed.
+# JUnit detects that itself and refuses to run:
+#
+#   JUnitException: Some JUnit versions on the classpath are not upward compatible
+#     - org.junit.jupiter.engine:      5.14.4
+#     - org.junit.platform.commons:    1.12.1
+#   Caused by: java.lang.NoSuchMethodError:
+#     'org.junit.platform.engine.OutputDirectoryCreator
+#      org.junit.platform.engine.EngineDiscoveryRequest.getOutputDirectoryCreator()'
+#
+# It dies in DISCOVERY, before any test runs, on BOTH arms -- so every class
+# scored a vacuous AGREE at ~2 s with rc=1 on each side. An agreeing failure is
+# not an oracle, and a 12/12 built out of them says nothing about the VM.
+cp_add_newest_artifact() {
+  local ad="$1" v best=""
+  [ -d "$ad" ] || return 0
+  while IFS= read -r v; do [ -d "$ad/$v" ] && best="$v"; done < <(ls -1 "$ad" 2>/dev/null | sort -V)
+  [ -n "$best" ] || return 0
+  cp_add_jars "$ad/$best"
+}
+
 corpus_classpath() {
   local r="$1"
   cp_add "$r/output/classes"
@@ -44,9 +69,25 @@ corpus_classpath() {
   # alongside the build, not in output/build/lib.
   cp_add_jars_r "$r/output/build/webapps/examples/WEB-INF/lib"
   local m2="${M2_REPO:-C:/Users/Victor/.m2/repository}"
-  cp_add_jars_r "$m2/org/junit/platform"
-  cp_add_jars_r "$m2/org/junit/jupiter"
-  cp_add_jars_r "$m2/org/junit/vintage"
+
+  # Tomcat 12's tests are JUnit *4* sources -- `org.junit.Test`,
+  # `org.junit.Assume`, `@RunWith(Parameterized.class)` -- executed by the
+  # junit-vintage engine. Without junit 4 itself the vintage engine discovers
+  # nothing, so pinning the platform version alone would still have produced a
+  # zero-test run. `junit/junit` also caches 3.8.1 here, which must not win;
+  # picking the newest per artifact takes 4.13.2 and leaves 3.8.1 out.
+  cp_add_newest_artifact "$m2/junit/junit"
+  cp_add_newest_artifact "$m2/org/hamcrest/hamcrest-core"
+
+  local a
+  for a in junit-platform-commons junit-platform-engine junit-platform-launcher \
+           junit-platform-suite-api; do
+    cp_add_newest_artifact "$m2/org/junit/platform/$a"
+  done
+  for a in junit-jupiter junit-jupiter-api junit-jupiter-engine junit-jupiter-params; do
+    cp_add_newest_artifact "$m2/org/junit/jupiter/$a"
+  done
+  cp_add_newest_artifact "$m2/org/junit/vintage/junit-vintage-engine"
   cp_add_jars_r "$m2/org/opentest4j"
   cp_add_jars_r "$m2/org/apiguardian"
   return 0
@@ -58,6 +99,17 @@ corpus_discover() {
     case "$f" in *'$'*) continue ;; esac
     rel="${f#"$r/output/testclasses/"}"
     rel="${rel%.class}"
-    printf '%s\n' "${rel//\//.}"
+    rel="${rel//\//.}"
+    # `Tester*` is Tomcat's naming convention for a test FIXTURE -- a support
+    # class, a fake OCSP responder, a valve that records what it was given --
+    # not a test. Tomcat's own build agrees and says so explicitly:
+    # build.xml:2276 carries `<exclude name="**/Tester*.java" />` inside the
+    # fileset that selects what to run. `Test*` matches `Tester*`, so without
+    # this filter 152 of the 805 names discovered here (19%) are classes that
+    # declare no test at all. Running one is not a VM measurement: it produces
+    # an empty or erroring JUnit result on BOTH arms and pollutes the ratio
+    # with rows that say nothing about CratonVM.
+    case "${rel##*.}" in Tester*) continue ;; esac
+    printf '%s\n' "$rel"
   done
 }

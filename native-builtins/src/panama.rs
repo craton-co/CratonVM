@@ -1727,13 +1727,21 @@ fn pe_segment_access_addr(
     }
 
     // Bounds check: 0 <= offset and offset + width <= size, with overflow guard.
+    //
+    // Bounds, not state. The final FFM API specifies `IllegalStateException`
+    // for a SCOPE violation — a closed arena, the wrong thread — and
+    // `IndexOutOfBoundsException` for an access outside the segment. Measured
+    // on HotSpot 25: `seg.get(JAVA_INT, 62)` on a 64-byte segment raises
+    // `IndexOutOfBoundsException`. A caller writing
+    // `catch (IndexOutOfBoundsException e)` — the idiom for a bounds check —
+    // did not catch ours.
     let end = offset.checked_add(width);
     if offset < 0 || end.map_or(true, |e| e > size) {
-        return Err(RuntimeError::IllegalStateException {
-            message: format!(
+        return Err(RuntimeError::IndexOutOfBoundsException {
+            message: Some(format!(
                 "offset {} + {} bytes exceeds segment size {}",
                 offset, width, size
-            ),
+            )),
         }
         .into());
     }

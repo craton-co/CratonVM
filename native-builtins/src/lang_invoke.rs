@@ -221,6 +221,14 @@ const VH_KIND_BYTE_VIEW_BE: i32 = 4;
 // `(ByteBuffer, byteIndex)` and direct buffers must hit native memory.
 const VH_KIND_BYTE_BUFFER_VIEW_LE: i32 = 5;
 const VH_KIND_BYTE_BUFFER_VIEW_BE: i32 = 6;
+// An FFM LAYOUT VarHandle (`ValueLayout.JAVA_INT.varHandle()`,
+// `layout.varHandle(PathElement...)`), whose coordinates are
+// `(MemorySegment, long[, long])`. Reported by the describe-yourself pair;
+// this kind is never written into a slot, because the handle's meaning lives
+// in `P67_MEMORY_SEGMENT_VH_TABLE` (see `SegmentVhShape`). Deliberately NOT
+// `3`: `phases_late/reflect_invoke.rs` numbers ITS memory-segment kind 3 under
+// a different slot map, and 3 already means `VH_KIND_BYTE_VIEW_LE` here.
+const VH_KIND_MEMORY_SEGMENT_LAYOUT: i32 = 7;
 
 // ---------------------------------------------------------------------------
 // WP4.2 — VarHandle metadata side table
@@ -320,11 +328,54 @@ pub(crate) fn vh_meta_update_field_index(ctx: &mut dyn NativeContext, vh: Object
 }
 
 // ---------------------------------------------------------------------------
+// FFM layout VarHandles (`ValueLayout.JAVA_INT.varHandle()`,
+// `layout.varHandle(PathElement...)`)
+// ---------------------------------------------------------------------------
+//
+// The receiver is a synthetic `java/lang/invoke/VarHandle` whose slots the real
+// class declares as `vform`/`…`, so nothing about what it addresses can be read
+// off the object — this table IS the handle's meaning. It used to hold only the
+// access WIDTH, which was enough for `accessModeType` and for nothing else:
+//
+//   * `varType()`/`coordinateTypes()` refused (`kind 0`) because they fell
+//     through to the generic path, which read slot 0 — `foreign_ffm`'s
+//     endianness flag — as a kind tag;
+//   * `get`/`set` fell through to the INSTANCE-FIELD arm for the same reason
+//     and silently did nothing. Measured on the shipping binary:
+//     `vhInt.set(seg, 0L, 11); (int) vhInt.get(seg, 0L)` answered `0`, and the
+//     cross-check `seg.get(JAVA_INT, 4)` agreed — the write never happened —
+//     where HotSpot answers `11`/`22` (probes/PFfm.java, `RJdkForeign
+//     .layoutVarHandles`);
+//   * an index coordinate (`sequenceElement()`) could not be expressed at all,
+//     so a sequence-element handle addressed offset 0 and `set` took the INDEX
+//     as its value.
+//
+// Width alone also cannot name a carrier: `JAVA_INT` and `JAVA_FLOAT` are both
+// four bytes and must answer `int`/`float`. So the row records the carrier, the
+// byte order, the fixed offset the layout path walked to, and the stride of the
+// one open index the path left behind.
+#[derive(Clone, Copy, Debug)]
+pub struct SegmentVhShape {
+    /// Access width in bytes (1, 2, 4 or 8).
+    pub width: i32,
+    /// JVM descriptor byte of the layout's carrier: `b'Z'`, `b'B'`, `b'C'`,
+    /// `b'S'`, `b'I'`, `b'J'`, `b'F'` or `b'D'`.
+    pub carrier: u8,
+    pub little_endian: bool,
+    /// Byte offset the layout path resolved to, added to the caller's own
+    /// offset coordinate.
+    pub base_offset: i64,
+    /// Stride of the trailing `long` index coordinate; `0` means the handle has
+    /// no index coordinate.
+    pub stride: i64,
+}
+
 static P67_MEMORY_SEGMENT_VH_TABLE: std::sync::OnceLock<
-    parking_lot::Mutex<rustc_hash::FxHashMap<i32, i32>>,
+    parking_lot::Mutex<rustc_hash::FxHashMap<i32, SegmentVhShape>>,
 > = std::sync::OnceLock::new();
 
-fn p67_memory_segment_vh_table() -> &'static parking_lot::Mutex<rustc_hash::FxHashMap<i32, i32>> {
+fn p67_memory_segment_vh_table(
+) -> &'static parking_lot::Mutex<rustc_hash::FxHashMap<i32, SegmentVhShape>> {
     P67_MEMORY_SEGMENT_VH_TABLE
         .get_or_init(|| parking_lot::Mutex::new(rustc_hash::FxHashMap::default()))
 }
@@ -332,21 +383,209 @@ fn p67_memory_segment_vh_table() -> &'static parking_lot::Mutex<rustc_hash::FxHa
 pub(crate) fn register_p67_memory_segment_var_handle(
     ctx: &mut dyn NativeContext,
     vh: ObjectRef,
-    width: i32,
+    shape: SegmentVhShape,
 ) {
     ctx.register_var_handle_root(vh);
     let key = ctx.identity_hash_code(vh);
-    p67_memory_segment_vh_table()
-        .lock()
-        .insert(key, width.clamp(1, 8));
+    let shape = SegmentVhShape {
+        width: shape.width.clamp(1, 8),
+        ..shape
+    };
+    p67_memory_segment_vh_table().lock().insert(key, shape);
+}
+
+pub(crate) fn p67_segment_vh_shape(
+    ctx: &dyn NativeContext,
+    vh: ObjectRef,
+) -> Option<SegmentVhShape> {
+    let key = ctx.identity_hash_code(vh);
+    p67_memory_segment_vh_table().lock().get(&key).copied()
 }
 
 pub(crate) fn p67_memory_segment_var_handle_width(
     ctx: &dyn NativeContext,
     vh: ObjectRef,
 ) -> Option<i32> {
-    let key = ctx.identity_hash_code(vh);
-    p67_memory_segment_vh_table().lock().get(&key).copied()
+    p67_segment_vh_shape(ctx, vh).map(|s| s.width)
+}
+
+/// The JVM descriptor of an FFM layout handle's carrier.
+fn layout_vh_carrier_desc(carrier: u8) -> &'static str {
+    match carrier {
+        b'Z' => DESC_BOOLEAN,
+        b'B' => DESC_BYTE,
+        b'C' => DESC_CHAR,
+        b'S' => DESC_SHORT,
+        b'J' => DESC_LONG,
+        b'F' => DESC_FLOAT,
+        b'D' => DESC_DOUBLE,
+        _ => DESC_INT,
+    }
+}
+
+/// The coordinate descriptors of an FFM layout handle: `(MemorySegment, long)`
+/// plus one more `long` when the layout path left an open index behind.
+fn layout_vh_coordinates(shape: SegmentVhShape) -> Vec<String> {
+    let mut coords = vec![
+        "Ljava/lang/foreign/MemorySegment;".to_string(),
+        DESC_LONG.to_string(),
+    ];
+    if shape.stride > 0 {
+        coords.push(DESC_LONG.to_string());
+    }
+    coords
+}
+
+/// Resolve an FFM layout handle's access into a validated raw address, and say
+/// which argument slot carries the value on a write.
+///
+/// `args` is `[vh, segment, offset, (index,)? (value)?]`. The offset is the
+/// layout path's own `base_offset` plus the caller's offset coordinate plus
+/// `index * stride` when the handle has an index coordinate.
+///
+/// Out of bounds raises `IndexOutOfBoundsException`, which is what the JDK
+/// raises for a segment access past the end — never a zero read or a dropped
+/// write, which is what this path did before it existed.
+fn layout_vh_access(
+    ctx: &mut dyn NativeContext,
+    shape: SegmentVhShape,
+    args: &[Value],
+) -> Result<Option<(usize, usize)>, MethodCallFailed> {
+    let Some(Value::Object(Some(seg))) = args.get(1).copied() else {
+        return Ok(None);
+    };
+    // GC-safety: the scope check runs `Scope.checkValidState()` bytecode, which
+    // can collect and relocate the segment. Pin it across the call and re-read
+    // the (possibly forwarded) reference before touching its fields — and
+    // release the pin BEFORE propagating a closed-scope failure.
+    let seg_pin = ctx.pin_native_root(seg);
+    let checked = crate::phases_late::foreign_ffm::p67_segment_check_scope(ctx, seg);
+    let seg = ctx.read_native_pin(seg_pin, seg);
+    ctx.unpin_native_roots(seg_pin);
+    checked?;
+    let long_at = |i: usize| -> i64 {
+        match args.get(i) {
+            Some(Value::Long(v)) => *v,
+            Some(Value::Int(v)) => *v as i64,
+            _ => 0,
+        }
+    };
+    let mut offset = shape.base_offset.saturating_add(long_at(2));
+    let value_index = if shape.stride > 0 {
+        offset = offset.saturating_add(shape.stride.saturating_mul(long_at(3)));
+        4
+    } else {
+        3
+    };
+    let base = crate::panama_libffi::segment_address(ctx, seg);
+    let size = crate::panama_libffi::segment_byte_size(ctx, seg);
+    let width = shape.width.clamp(1, 8) as i64;
+    if base == 0 || offset < 0 || offset.saturating_add(width) > size {
+        return Err(RuntimeError::IndexOutOfBoundsException {
+            message: Some(format!(
+                "VarHandle access of {width} bytes at offset {offset} is out of bounds for a \
+                 segment of {size} bytes"
+            )),
+        }
+        .into());
+    }
+    Ok(Some(((base as usize).wrapping_add(offset as usize), value_index)))
+}
+
+/// Read an FFM layout handle's variable out of a segment.
+fn layout_vh_read(shape: SegmentVhShape, addr: usize) -> Value {
+    let le = shape.little_endian;
+    // SAFETY: `addr` was bounds-checked against the segment's own recorded
+    // size by `layout_vh_access`, and the width is the layout's.
+    unsafe {
+        let p = addr as *const u8;
+        let mut raw = [0u8; 8];
+        let w = shape.width.clamp(1, 8) as usize;
+        std::ptr::copy_nonoverlapping(p, raw.as_mut_ptr(), w);
+        let u = |n: usize| -> u64 {
+            let mut v: u64 = 0;
+            for i in 0..n {
+                let b = raw[i] as u64;
+                if le {
+                    v |= b << (8 * i);
+                } else {
+                    v = (v << 8) | b;
+                }
+            }
+            v
+        };
+        match shape.carrier {
+            b'Z' => Value::Int(i32::from(raw[0] != 0)),
+            b'B' => Value::Int(raw[0] as i8 as i32),
+            b'C' => Value::Int(u(2) as u16 as i32),
+            b'S' => Value::Int(u(2) as u16 as i16 as i32),
+            b'J' => Value::Long(u(8) as i64),
+            b'F' => Value::Float(f32::from_bits(u(4) as u32)),
+            b'D' => Value::Double(f64::from_bits(u(8))),
+            _ => Value::Int(u(4) as u32 as i32),
+        }
+    }
+}
+
+/// Write an FFM layout handle's variable into a segment.
+fn layout_vh_write(shape: SegmentVhShape, addr: usize, value: Value) {
+    let w = shape.width.clamp(1, 8) as usize;
+    let raw: u64 = match (shape.carrier, value) {
+        (b'F', Value::Float(f)) => f.to_bits() as u64,
+        (b'F', Value::Int(v)) => (v as f32).to_bits() as u64,
+        (b'D', Value::Double(d)) => d.to_bits(),
+        (b'D', Value::Float(f)) => (f as f64).to_bits(),
+        (_, Value::Long(v)) => v as u64,
+        (_, Value::Int(v)) => v as i64 as u64,
+        (_, Value::Float(f)) => f.to_bits() as u64,
+        (_, Value::Double(d)) => d.to_bits(),
+        _ => 0,
+    };
+    let bytes = if shape.little_endian {
+        raw.to_le_bytes()
+    } else {
+        // Big-endian: the significant bytes are the LAST `w` of the eight.
+        let be = raw.to_be_bytes();
+        let mut out = [0u8; 8];
+        out[..w].copy_from_slice(&be[8 - w..]);
+        out
+    };
+    // SAFETY: bounds-checked by `layout_vh_access`; `w` is the layout width.
+    unsafe {
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), addr as *mut u8, w);
+    }
+}
+
+/// `VarHandle.get` for an FFM layout handle, boxed for the polymorphic call
+/// site.
+fn layout_vh_get(
+    ctx: &mut dyn NativeContext,
+    shape: SegmentVhShape,
+    args: &[Value],
+) -> MethodCallResult {
+    let Some((addr, _)) = layout_vh_access(ctx, shape, args)? else {
+        return Ok(Some(Value::Object(None)));
+    };
+    let value = layout_vh_read(shape, addr);
+    Ok(Some(box_value(
+        ctx,
+        value,
+        layout_vh_carrier_desc(shape.carrier),
+    )))
+}
+
+/// `VarHandle.set` for an FFM layout handle.
+fn layout_vh_set(
+    ctx: &mut dyn NativeContext,
+    shape: SegmentVhShape,
+    args: &[Value],
+) -> MethodCallResult {
+    let Some((addr, value_index)) = layout_vh_access(ctx, shape, args)? else {
+        return Ok(None);
+    };
+    let value = args.get(value_index).copied().unwrap_or(Value::Int(0));
+    layout_vh_write(shape, addr, value);
+    Ok(None)
 }
 
 // Descriptor helpers — reconstruct JVM descriptor from MethodType object
@@ -678,6 +917,195 @@ fn field_descriptor_from_mirror(
 }
 
 // ---------------------------------------------------------------------------
+// `MethodType` interning
+// ---------------------------------------------------------------------------
+//
+// `MethodType` is specified to be INTERNED: `MethodType.methodType(...)`,
+// `fromMethodDescriptorString(...)` and an `ldc CONSTANT_MethodType` must all
+// hand back the *same instance* for the same descriptor, so `==` holds and
+// `MethodHandle` call-site matching stays identity-based (JVMS §5.4.3.5,
+// `java.lang.invoke.MethodType`'s class javadoc).
+//
+// The four `methodType` registrations below are `Bridge` natives that SHADOW
+// the real JDK bytecode — the `--jdk-only` census reports them as
+// `bridge-ran-over-bytecode` — and each one minted a fresh 2-field carrier.
+// So on a real image every `methodType()` result was a NEW object:
+//
+// ```text
+//   probes/PMt.java, --jdk-only, one binary          CratonVM   HotSpot 25
+//     MethodType.methodType(String,String) == itself  false      true
+//     fromMethodDescriptorString == itself            true       true   <- interns
+//     fromMethodDescriptorString == methodType(..)    false      true
+// ```
+//
+// which is the `RJdkProxyIface.ldcMethodType` failure: the `ldc` decoder
+// (`vm/src/runtime/interpreter/constants.rs`) already does the right thing and
+// prefers the real interning factory — the NON-interned side of that `==` was
+// the fixture's right-hand `MethodType.methodType(String.class, String.class)`,
+// i.e. this file.
+//
+// Retiring the four shadows (re-tagging them `SyntheticStub` so `--jdk-only`
+// refuses them, as `native-api/src/retired_shadow.rs` does for JUL) is the
+// structurally right cure and is NOMINATED — it cannot be done here, because
+// four rows moving `Bridge` -> `SyntheticStub` also move three frozen
+// baselines that can only be re-frozen from a Linux/JDK-25 census
+// (`stub_ratchet.rs` runs `SLACK = 0`). What this file can do — in BOTH modes,
+// with no census motion — is stop fabricating and delegate to the JDK's own
+// interning factories.
+
+/// Class name of the interning factory chain's receiver.
+const MT_CLASS: &str = "java/lang/invoke/MethodType";
+/// `MethodType.genericMethodType(int)` — an interned all-`Object` type. Used as
+/// the CHAIN BASE because it takes no strings and no `ClassLoader`: the JDK
+/// answers `genericMethodType(0)` out of its own `objectOnlyTypes` cache, so
+/// there is no descriptor to parse and no class name to resolve.
+const MT_GENERIC: &str = "(I)Ljava/lang/invoke/MethodType;";
+/// `MethodType.changeReturnType(Class)`.
+const MT_CHANGE_RETURN: &str = "(Ljava/lang/Class;)Ljava/lang/invoke/MethodType;";
+/// `MethodType.insertParameterTypes(int, Class...)`. Called with index 0 on the
+/// empty base rather than `appendParameterTypes`, which would route through the
+/// `parameterCount()` shim below for no reason.
+const MT_INSERT_PARAMS: &str = "(I[Ljava/lang/Class;)Ljava/lang/invoke/MethodType;";
+
+/// The real JDK's interned `MethodType` for `rtype`/`ptypes`, or `None` when
+/// the class library does not carry the factory chain (synthetic-JDK builds),
+/// in which case the caller falls back to the 2-field carrier.
+///
+/// **Why this chain and not `fromMethodDescriptorString`.** That factory is
+/// what the `ldc` decoder and `StackFrame.getMethodType()` use, and it interns
+/// — but it takes a *descriptor string plus a `ClassLoader`*, and the caller
+/// here holds `Class` MIRRORS, whose loaders may differ from each other. Going
+/// through a descriptor would re-resolve every parameter by NAME under one
+/// guessed loader, which is both slower and wrong the moment two loaders each
+/// define a class of the same name. `genericMethodType(0)` ->
+/// `insertParameterTypes(0, ptypes)` -> `changeReturnType(rtype)` consumes the
+/// mirrors as they are: no strings, no loader, no name resolution, and every
+/// step lands in `MethodType.makeImpl(..., true)`, i.e. the intern table.
+///
+/// Verified end to end on the SHIPPING binary before the change, by running
+/// that exact sequence from Java (probes/PMt2.java): under `--jdk-only` the
+/// composed type is `==` to `fromMethodDescriptorString`'s for `(String)String`
+/// and `()void`, is stable across calls, and answers `returnType`/
+/// `parameterType(i)` with the identical mirrors — so what is being delegated
+/// to is known to work in this VM, not assumed to.
+///
+/// None of the three methods is registered anywhere in this tree, so invoking
+/// them reaches real bytecode instead of re-entering this file.
+fn method_type_interned_via_jdk(
+    ctx: &mut dyn NativeContext,
+    rtype: ObjectRef,
+    ptypes: Option<ObjectRef>,
+) -> Result<Option<ObjectRef>, MethodCallFailed> {
+    if !ctx.method_exists(MT_CLASS, "genericMethodType", MT_GENERIC)
+        || !ctx.method_exists(MT_CLASS, "changeReturnType", MT_CHANGE_RETURN)
+        || !ctx.method_exists(MT_CLASS, "insertParameterTypes", MT_INSERT_PARAMS)
+    {
+        return Ok(None);
+    }
+    // GC-safety: every `invoke*` below can collect and relocate the caller's
+    // mirrors, which are bare `ObjectRef`s in Rust locals. Pin them for the
+    // whole chain and re-read through the handles after each call.
+    let rtype_pin = ctx.pin_native_root(rtype);
+    let ptypes_pin = ptypes.map(|p| ctx.pin_native_root(p));
+    let out = method_type_interned_chain(ctx, rtype, rtype_pin, ptypes, ptypes_pin);
+    ctx.unpin_native_roots(rtype_pin);
+    out
+}
+
+/// The pinned body of [`method_type_interned_via_jdk`].
+///
+/// Failure policy, following the same split
+/// `vm/src/runtime/interpreter/constants.rs` established for the `ldc` path: a
+/// Java-visible exception from `insertParameterTypes` / `changeReturnType` IS
+/// the answer (`void` as a parameter type, a null element, too many argument
+/// slots — HotSpot throws `IllegalArgumentException`/`NullPointerException`
+/// there too), so it propagates rather than being replaced by a fabricated
+/// type. Anything else — a missing return value, an internal error, or a
+/// failure of the BASE call, which validates nothing and cannot be the user's
+/// answer — falls back to the carrier this file has always built.
+fn method_type_interned_chain(
+    ctx: &mut dyn NativeContext,
+    rtype: ObjectRef,
+    rtype_pin: usize,
+    ptypes: Option<ObjectRef>,
+    ptypes_pin: Option<usize>,
+) -> Result<Option<ObjectRef>, MethodCallFailed> {
+    let mut mt = match ctx.invoke(MT_CLASS, "genericMethodType", MT_GENERIC, &[Value::Int(0)]) {
+        Ok(Some(Value::Object(Some(o)))) => o,
+        _ => return Ok(None),
+    };
+    let mut mt_pin = ctx.pin_native_root(mt);
+    if let (Some(p), Some(p_pin)) = (ptypes, ptypes_pin) {
+        let arr = ctx.read_native_pin(p_pin, p);
+        if ctx.array_length(arr) > 0 {
+            let recv = ctx.read_native_pin(mt_pin, mt);
+            match ctx.invoke_virtual(
+                recv,
+                "insertParameterTypes",
+                MT_INSERT_PARAMS,
+                &[Value::Int(0), Value::Object(Some(arr))],
+            ) {
+                Ok(Some(Value::Object(Some(o)))) => {
+                    mt = o;
+                    mt_pin = ctx.pin_native_root(mt);
+                }
+                Err(e @ MethodCallFailed::ExceptionThrown(_)) => return Err(e),
+                _ => return Ok(None),
+            }
+        }
+    }
+    let recv = ctx.read_native_pin(mt_pin, mt);
+    let rt = ctx.read_native_pin(rtype_pin, rtype);
+    match ctx.invoke_virtual(
+        recv,
+        "changeReturnType",
+        MT_CHANGE_RETURN,
+        &[Value::Object(Some(rt))],
+    ) {
+        Ok(Some(Value::Object(Some(o)))) => Ok(Some(o)),
+        Err(e @ MethodCallFailed::ExceptionThrown(_)) => Err(e),
+        _ => Ok(None),
+    }
+}
+
+/// One `MethodType` for the four `methodType(...)` overloads: the real JDK's
+/// interned instance when the image has the factory chain, otherwise the
+/// 2-field `(returnType, parameterArray)` carrier this file has always minted,
+/// with its fabricated `MethodTypeForm`.
+///
+/// `ptypes` is consumed as given; `None` (an absent or null parameter array)
+/// becomes a 0-length one on the fallback path, so `parameterCount()` and
+/// `parameterArray()` never meet a null slot.
+fn make_method_type(
+    ctx: &mut dyn NativeContext,
+    rtype: ObjectRef,
+    ptypes: Option<ObjectRef>,
+) -> MethodCallResult {
+    if let Some(interned) = method_type_interned_via_jdk(ctx, rtype, ptypes)? {
+        return Ok(Some(Value::Object(Some(interned))));
+    }
+    // GC-safety: the allocation and the empty-array creation below can each
+    // relocate the caller's mirrors and the carrier itself.
+    let rtype_pin = ctx.pin_native_root(rtype);
+    let ptypes_pin = ptypes.map(|p| ctx.pin_native_root(p));
+    let obj = try_alloc_concurrent_synthetic(ctx, MT_CLASS, 6)?;
+    let obj_pin = ctx.pin_native_root(obj);
+    let rt = ctx.read_native_pin(rtype_pin, rtype);
+    let obj = ctx.read_native_pin(obj_pin, obj);
+    ctx.set_field(obj, 0, Value::Object(Some(rt)));
+    let params = match (ptypes, ptypes_pin) {
+        (Some(p), Some(pin)) => ctx.read_native_pin(pin, p),
+        _ => ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0),
+    };
+    let obj = ctx.read_native_pin(obj_pin, obj);
+    ctx.set_field(obj, 1, Value::Object(Some(params)));
+    populate_method_type_form(ctx, obj)?;
+    let obj = ctx.read_native_pin(obj_pin, obj);
+    ctx.unpin_native_roots(rtype_pin);
+    Ok(Some(Value::Object(Some(obj))))
+}
+
+// ---------------------------------------------------------------------------
 // java.lang.invoke — MethodHandle, MethodType, MethodHandles (stubs)
 // ---------------------------------------------------------------------------
 pub fn register_phase54_method_handle(r: &mut NativeMethodRegistry) {
@@ -691,12 +1119,11 @@ pub fn register_phase54_method_handle(r: &mut NativeMethodRegistry) {
         "(Ljava/lang/Class;[Ljava/lang/Class;)Ljava/lang/invoke/MethodType;",
         |ctx, args| {
             let ret = obj_arg(args, 0)?;
-            let params = args.get(1).copied().unwrap_or(Value::Object(None));
-            let obj = try_alloc_concurrent_synthetic(ctx, "java/lang/invoke/MethodType", 6)?;
-            ctx.set_field(obj, 0, Value::Object(Some(ret)));
-            ctx.set_field(obj, 1, params);
-            populate_method_type_form(ctx, obj)?;
-            Ok(Some(Value::Object(Some(obj))))
+            let params = match args.get(1) {
+                Some(Value::Object(p)) => *p,
+                _ => None,
+            };
+            make_method_type(ctx, ret, params)
         },
     );
     r.register(
@@ -705,14 +1132,7 @@ pub fn register_phase54_method_handle(r: &mut NativeMethodRegistry) {
         "(Ljava/lang/Class;)Ljava/lang/invoke/MethodType;",
         |ctx, args| {
             let ret = obj_arg(args, 0)?;
-            let obj = try_alloc_concurrent_synthetic(ctx, "java/lang/invoke/MethodType", 6)?;
-            ctx.set_field(obj, 0, Value::Object(Some(ret)));
-            // Empty params — allocate a 0-length Class[] so `parameterCount()`
-            // and the form-builder both see a non-null array.
-            let empty = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0);
-            ctx.set_field(obj, 1, Value::Object(Some(empty)));
-            populate_method_type_form(ctx, obj)?;
-            Ok(Some(Value::Object(Some(obj))))
+            make_method_type(ctx, ret, None)
         },
     );
     r.register(
@@ -722,13 +1142,16 @@ pub fn register_phase54_method_handle(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let ret = obj_arg(args, 0)?;
             let param = obj_arg(args, 1)?;
+            // GC-safety: `new_array` can collect and relocate both mirrors.
+            let ret_pin = ctx.pin_native_root(ret);
+            let param_pin = ctx.pin_native_root(param);
             let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 1);
+            let param = ctx.read_native_pin(param_pin, param);
             ctx.set_array_element(arr, 0, Value::Object(Some(param)));
-            let obj = try_alloc_concurrent_synthetic(ctx, "java/lang/invoke/MethodType", 6)?;
-            ctx.set_field(obj, 0, Value::Object(Some(ret)));
-            ctx.set_field(obj, 1, Value::Object(Some(arr)));
-            populate_method_type_form(ctx, obj)?;
-            Ok(Some(Value::Object(Some(obj))))
+            let ret = ctx.read_native_pin(ret_pin, ret);
+            let out = make_method_type(ctx, ret, Some(arr));
+            ctx.unpin_native_roots(ret_pin);
+            out
         },
     );
     // methodType(Class rtype, Class ptype0, Class... morePtypes)
@@ -740,24 +1163,35 @@ pub fn register_phase54_method_handle(r: &mut NativeMethodRegistry) {
             let ret = obj_arg(args, 0)?;
             let ptype0 = obj_arg(args, 1)?;
             // morePtypes may be null or an array
-            let more_len = match args.get(2) {
-                Some(Value::Object(Some(arr))) => ctx.array_length(*arr),
-                _ => 0,
+            let more = match args.get(2) {
+                Some(Value::Object(Some(a))) => Some(*a),
+                _ => None,
             };
+            let more_len = more.map(|a| ctx.array_length(a)).unwrap_or(0);
+            // GC-safety: `new_array` and the element copies can each collect;
+            // pin every reference the loop below still needs afterwards.
+            let ret_pin = ctx.pin_native_root(ret);
+            let ptype0_pin = ctx.pin_native_root(ptype0);
+            let more_pin = more.map(|a| ctx.pin_native_root(a));
             let total = 1 + more_len;
             let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, total);
+            let arr_pin = ctx.pin_native_root(arr);
+            let ptype0 = ctx.read_native_pin(ptype0_pin, ptype0);
+            let arr = ctx.read_native_pin(arr_pin, arr);
             ctx.set_array_element(arr, 0, Value::Object(Some(ptype0)));
-            if let Some(Value::Object(Some(more))) = args.get(2) {
+            if let (Some(m), Some(m_pin)) = (more, more_pin) {
                 for i in 0..more_len {
-                    let elem = ctx.get_array_element(*more, i);
+                    let m = ctx.read_native_pin(m_pin, m);
+                    let elem = ctx.get_array_element(m, i);
+                    let arr = ctx.read_native_pin(arr_pin, arr);
                     ctx.set_array_element(arr, 1 + i, elem);
                 }
             }
-            let obj = try_alloc_concurrent_synthetic(ctx, "java/lang/invoke/MethodType", 6)?;
-            ctx.set_field(obj, 0, Value::Object(Some(ret)));
-            ctx.set_field(obj, 1, Value::Object(Some(arr)));
-            populate_method_type_form(ctx, obj)?;
-            Ok(Some(Value::Object(Some(obj))))
+            let ret = ctx.read_native_pin(ret_pin, ret);
+            let arr = ctx.read_native_pin(arr_pin, arr);
+            let out = make_method_type(ctx, ret, Some(arr));
+            ctx.unpin_native_roots(ret_pin);
+            out
         },
     );
     r.register(mt, "returnType", "()Ljava/lang/Class;", |ctx, args| {
@@ -1754,12 +2188,22 @@ fn p67_memory_segment_varhandle_descriptor(
     vh: ObjectRef,
     access_type: i32,
 ) -> Option<String> {
+    // The shape table names the CARRIER, which a width cannot: `JAVA_INT` and
+    // `JAVA_FLOAT` are both four bytes and must type as `int`/`float`. It also
+    // carries the index coordinate a sequence-element path added.
+    if let Some(shape) = p67_segment_vh_shape(ctx, vh) {
+        return Some(vh_access_mode_descriptor(
+            access_type,
+            &layout_vh_coordinates(shape),
+            layout_vh_carrier_desc(shape.carrier),
+        ));
+    }
     let slot_width = if ctx.get_field(vh, 2).as_int() == Some(3) {
         ctx.get_field(vh, 1).as_int()
     } else {
         None
     };
-    if let Some(width) = p67_memory_segment_var_handle_width(ctx, vh).or(slot_width) {
+    if let Some(width) = slot_width {
         let coords = vec![
             "Ljava/lang/foreign/MemorySegment;".to_string(),
             DESC_LONG.to_string(),
@@ -1902,6 +2346,19 @@ fn vh_value_and_coordinate_descriptors(
     ctx: &mut dyn NativeContext,
     vh: ObjectRef,
 ) -> (i32, String, Vec<String>, bool) {
+    // An FFM layout handle describes itself out of the shape table — the
+    // carrier the layout named and `(MemorySegment, long[, long])` — and must
+    // be answered before the generic paths, whose slot reads would take this
+    // receiver's endianness flag for a kind tag (that is the `kind 0` in the
+    // refusal `RJdkForeign.layoutVarHandles` used to raise).
+    if let Some(shape) = p67_segment_vh_shape(ctx, vh) {
+        return (
+            VH_KIND_MEMORY_SEGMENT_LAYOUT,
+            layout_vh_carrier_desc(shape.carrier).to_string(),
+            layout_vh_coordinates(shape),
+            true,
+        );
+    }
     let meta = vh_meta_get(ctx, vh);
     // A real-JDK array handle has no side-table entry and its slots belong to
     // the real class, so the fallbacks below would read `vform` as a kind tag.
@@ -2124,7 +2581,12 @@ fn vh_class_list(ctx: &mut dyn NativeContext, descs: &[String]) -> Option<Value>
 /// types (see [`real_array_var_handle_descriptors`]), and an answer read off
 /// the object is not a fabrication.
 fn vh_meta_is_authoritative(ctx: &mut dyn NativeContext, vh: ObjectRef) -> bool {
-    vh_meta_get(ctx, vh).is_some() || real_array_var_handle_descriptors(ctx, vh).is_some()
+    // The FFM layout table is a third source of truth, and a recorded one: the
+    // carrier comes from the layout the handle was minted from, not from a
+    // guess about the receiver's slots.
+    p67_segment_vh_shape(ctx, vh).is_some()
+        || vh_meta_get(ctx, vh).is_some()
+        || real_array_var_handle_descriptors(ctx, vh).is_some()
 }
 
 fn varhandle_var_type(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -2887,6 +3349,18 @@ fn varhandle_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
             return result;
         }
     }
+    // An FFM LAYOUT handle (`ValueLayout.JAVA_INT.varHandle()`,
+    // `layout.varHandle(PathElement...)`) is a synthetic receiver whose meaning
+    // lives only in the shape table, so it must be answered before the slot
+    // reads below — which would take slot 0 (its endianness flag) for a kind
+    // tag and route the access to the instance-field arm, where it silently
+    // did nothing.
+    if let Some(shape) = p67_segment_vh_shape(ctx, this) {
+        // `layout_vh_get`, not `segment_vh_get`: the latter takes the real
+        // `SegmentVarHandle` receiver handled above, this one takes the shape.
+        // The `set` twin twelve lines below already had it right.
+        return layout_vh_get(ctx, shape, args);
+    }
     // Round-7 HIGH-2 fix: fetch the side-table meta exactly once and reuse
     // the bound Arc for `kind`/`field_index`/`class_name`/`field_name`/
     // `field_desc`. Previously each helper (`vh_meta_get`, `vh_type_desc`,
@@ -3036,6 +3510,11 @@ fn varhandle_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
         if let Some(result) = segment_vh_set(ctx, this, args) {
             return result;
         }
+    }
+    // FFM layout handle — see the matching check in `varhandle_get` for what
+    // fell through here before (a silently dropped write).
+    if let Some(shape) = p67_segment_vh_shape(ctx, this) {
+        return layout_vh_set(ctx, shape, args);
     }
     // Round-7 HIGH-2 fix: bind the Arc once and reuse for kind / field_index
     // / class+field lookups instead of re-locking `vh_meta_table` each branch.
@@ -12950,7 +13429,17 @@ mod tests {
     fn p67_memory_segment_varhandle_access_mode_type_uses_segment_and_offset_coordinates() {
         let mut ctx = MockNativeContext::new();
         let vh = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/invoke/VarHandle", 3).unwrap();
-        register_p67_memory_segment_var_handle(&mut ctx, vh, 4);
+        register_p67_memory_segment_var_handle(
+            &mut ctx,
+            vh,
+            SegmentVhShape {
+                width: 4,
+                carrier: b'I',
+                little_endian: true,
+                base_offset: 0,
+                stride: 0,
+            },
+        );
 
         let access_type =
             try_alloc_concurrent_synthetic(&mut ctx, "java/lang/invoke/VarHandle$AccessType", 2).unwrap();
@@ -12984,6 +13473,44 @@ mod tests {
         assert_eq!(
             descriptor_from_method_type(&ctx, set_mt),
             "(Ljava/lang/foreign/MemorySegment;JI)V"
+        );
+    }
+
+    /// A `sequenceElement()` path adds a `long` INDEX coordinate, and the
+    /// carrier — not the width — decides the value type: a `JAVA_FLOAT` handle
+    /// is four bytes wide and types as `float`.
+    #[test]
+    fn p67_layout_varhandle_reports_its_index_coordinate_and_carrier() {
+        let mut ctx = MockNativeContext::new();
+        let vh = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/invoke/VarHandle", 3).unwrap();
+        register_p67_memory_segment_var_handle(
+            &mut ctx,
+            vh,
+            SegmentVhShape {
+                width: 4,
+                carrier: b'F',
+                little_endian: true,
+                base_offset: 0,
+                stride: 4,
+            },
+        );
+        let access_type =
+            try_alloc_concurrent_synthetic(&mut ctx, "java/lang/invoke/VarHandle$AccessType", 2)
+                .unwrap();
+        ctx.set_field(access_type, 1, Value::Int(0));
+        let get_mt = match varhandle_access_mode_type_uncached(
+            &mut ctx,
+            &[Value::Object(Some(vh)), Value::Object(Some(access_type))],
+        )
+        .unwrap()
+        .unwrap()
+        {
+            Value::Object(Some(mt)) => mt,
+            other => panic!("expected MethodType, got {other:?}"),
+        };
+        assert_eq!(
+            descriptor_from_method_type(&ctx, get_mt),
+            "(Ljava/lang/foreign/MemorySegment;JJ)F"
         );
     }
 

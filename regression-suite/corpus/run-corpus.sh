@@ -456,9 +456,20 @@ cmd_run() {
     # The VM's own watchdog is disabled so that `timeout` is the single
     # authority on the wall; two independent killers make a TIMEOUT row
     # impossible to attribute. regression-suite/run.sh:443 does the same.
+    # Run in the corpus's OWN working directory. `$wd` was computed and never
+    # used, so both arms ran in the invoking cwd — measured consequences, both
+    # of which read as VM findings and were not:
+    #   * H2 wrote its databases into the git worktree as untracked `data/`,
+    #     and a carried-over corrupt store made `TestBackup` DIVERGE where all
+    #     three arms are green when run alone.
+    #   * Running Tomcat's `TestSsl` from the right root took the HOTSPOT
+    #     ORACLE from failed=7 to failed=1 — six real oracle passes were being
+    #     scored as failures, i.e. the harness was manufacturing divergence on
+    #     the reference side.
+    # A subshell keeps the cd local; every other path here is absolute.
     t0=$(date +%s%3N)
-    CRATONVM_DISABLE_DEFAULT_WATCHDOG=1 timeout "$TIMEOUT" \
-      "$CV" --java-home "$JDK" $mflags $CV_ARGS "@$argf" CorpusMain $invoke_prefix "$c" \
+    ( cd "$wd" && CRATONVM_DISABLE_DEFAULT_WATCHDOG=1 timeout "$TIMEOUT" \
+      "$CV" --java-home "$JDK" $mflags $CV_ARGS "@$argf" CorpusMain $invoke_prefix "$c" ) \
       > "$cvlog" 2>&1
     cvrc=$?
     t1=$(date +%s%3N); cvms=$((t1-t0))
@@ -474,8 +485,13 @@ cmd_run() {
       hsstate=SKIPPED; hsrc=-1; hsms=0
       : > "$hslog"
     else
+      # Same working directory as the CratonVM arm — see the note there. An
+      # oracle run from the wrong cwd manufactures divergence on the REFERENCE
+      # side, which is the worst possible place for it: a red oracle row reads
+      # as a VM defect and is scored as one.
       t0=$(date +%s%3N)
-      timeout "$TIMEOUT" "$HS" "@$argf" CorpusMain $invoke_prefix "$c" > "$hslog" 2>&1
+      ( cd "$wd" && timeout "$TIMEOUT" "$HS" "@$argf" CorpusMain $invoke_prefix "$c" ) \
+        > "$hslog" 2>&1
       hsrc=$?
       t1=$(date +%s%3N); hsms=$((t1-t0))
       hsstate="$(classify_arm "$hsrc" "$hslog")"

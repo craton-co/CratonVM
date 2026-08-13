@@ -4128,6 +4128,38 @@ fn run() -> Result<()> {
         );
     }
 
+    // Materialise the boot module layer.
+    //
+    // Measured 2026-08-12: without this, the FIRST `ServiceLoader.load()` in a
+    // process returns **zero** module-declared providers under `--jdk-only`.
+    // Every `provides` clause in the JDK image is lost —
+    // `java.nio.file.spi.FileSystemProvider` 2 -> 0,
+    // `java.util.spi.ToolProvider` 9 -> 0, `javax.tools.JavaCompiler` 1 -> 0 —
+    // while classpath `META-INF/services` providers keep working, which is why
+    // a `ServiceLoader` probe reads green and this stays hidden. Controlled:
+    // three consecutive `load` calls with no `ModuleLayer` touch return 0 every
+    // time, so it is the boot call and not warm-up.
+    //
+    // Consequence found in the corpus, not in a probe: H2's `SourceCompiler`
+    // branches on `ToolProvider.getSystemJavaCompiler()`, which is null ONLY
+    // under `--jdk-only`, so it silently takes a `com.sun.tools.javac` path
+    // HotSpot never runs.
+    //
+    // Root cause is upstream of here — `System.initPhase2` is deliberately
+    // skipped. In `--real-jdk` a `SyntheticStub` ServiceLoader native covers
+    // for that; `--jdk-only` correctly refuses the stub, and the skip becomes a
+    // silent WRONG ANSWER rather than a refusal. This is a behavioural patch
+    // over that gap, not the principled fix: the principled fix is to run
+    // `initPhase2`, and it is recorded as such.
+    if vm.shared.config.java_home.is_some() {
+        let _ = vm.invoke(
+            "java/lang/ModuleLayer",
+            "boot",
+            "()Ljava/lang/ModuleLayer;",
+            &[],
+        );
+    }
+
     // Pre-allocate the singleton java.lang.OutOfMemoryError while the heap is
     // still fresh, so a later 100%-full-heap OOM (in either user code or a
     // premain) can be thrown without allocating the throwable — which would
