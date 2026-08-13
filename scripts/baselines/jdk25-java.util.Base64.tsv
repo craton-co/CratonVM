@@ -1,4 +1,4 @@
-# jdk-baseline	1
+# jdk-baseline	2
 # kind	class
 # name	java.util.Base64
 # module	java.base
@@ -10,11 +10,14 @@
 # regenerate	python scripts/jdk-baseline/generate.py --update
 # public-methods	7
 # protected-methods	0
-# rows	10
+# declared-methods	8
+# declared-fields	0
+# rows	11
 # columns	kind	name	descriptor	flags
 CLASS	java.util.Base64		public,final
 EXTENDS	java.lang.Object		
 SUPERTYPE	java.lang.Object		
+METHOD	<init>	()V	private
 METHOD	getDecoder	()Ljava/util/Base64$Decoder;	public,static
 METHOD	getEncoder	()Ljava/util/Base64$Encoder;	public,static
 METHOD	getMimeDecoder	()Ljava/util/Base64$Decoder;	public,static

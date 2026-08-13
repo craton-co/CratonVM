@@ -1791,6 +1791,40 @@ pub(crate) fn is_ffm_group_layout_native_override(
         )
 }
 
+/// FFM `java.lang.foreign.MemoryLayout` — the layout factories and the two
+/// instance methods `foreign_ffm.rs` answers on the interface itself.
+///
+/// **Descriptors javac cannot emit are not listed** (F27, 2026-08-13). Four
+/// entries spelling the four factories with a `…)Ljava/lang/foreign/MemoryLayout;`
+/// return were deleted here and at the inline copy of this table further down
+/// `force_native_over_real_jdk_bytecode`. `javap java.lang.foreign.MemoryLayout`
+/// on 25.0.3+9-LTS:
+///
+/// ```text
+///   public static java.lang.foreign.PaddingLayout  paddingLayout(long);
+///   public static java.lang.foreign.SequenceLayout sequenceLayout(long, MemoryLayout);
+///   public static java.lang.foreign.StructLayout   structLayout(MemoryLayout...);
+///   public static java.lang.foreign.UnionLayout    unionLayout(MemoryLayout...);
+/// ```
+///
+/// A call site's descriptor comes from the resolved method's own descriptor, so
+/// no classfile can name the erased-return spellings, and — measured — no
+/// registration anywhere in the workspace answers them either: they were
+/// `panama.rs`'s, and F16 deleted those rows on 2026-08-13. Their only remaining
+/// occurrences in the tree were the two copies of this table.
+///
+/// Removing a force-route entry IS a behaviour change: it decides whether a
+/// registered native shadows real JDK bytecode. Here it cannot be, because the
+/// triple has no call site AND no registration — the predicate could only ever
+/// have cost a fruitless registry probe for a call that cannot occur. The
+/// JDK-true spellings beside them are untouched and still registered
+/// (`foreign_ffm.rs::structLayout`/`sequenceLayout`/`unionLayout`/
+/// `paddingLayout`), which is what keeps the bootstrap-cycle escape the inline
+/// copy's comment describes.
+///
+/// `withName(String)Ljava/lang/foreign/MemoryLayout;` STAYS: `javap` shows
+/// `public abstract java.lang.foreign.MemoryLayout withName(java.lang.String);`,
+/// so that one is the real descriptor, not an erased twin.
 pub(crate) fn is_ffm_memory_layout_native_override(
     class_name: &str,
     method_name: &str,
@@ -1803,22 +1837,12 @@ pub(crate) fn is_ffm_memory_layout_native_override(
                 "sequenceLayout",
                 "(JLjava/lang/foreign/MemoryLayout;)Ljava/lang/foreign/SequenceLayout;"
             ) | (
-                "sequenceLayout",
-                "(JLjava/lang/foreign/MemoryLayout;)Ljava/lang/foreign/MemoryLayout;"
-            ) | (
                 "structLayout",
                 "([Ljava/lang/foreign/MemoryLayout;)Ljava/lang/foreign/StructLayout;"
             ) | (
-                "structLayout",
-                "([Ljava/lang/foreign/MemoryLayout;)Ljava/lang/foreign/MemoryLayout;"
-            ) | (
                 "unionLayout",
                 "([Ljava/lang/foreign/MemoryLayout;)Ljava/lang/foreign/UnionLayout;"
-            ) | (
-                "unionLayout",
-                "([Ljava/lang/foreign/MemoryLayout;)Ljava/lang/foreign/MemoryLayout;"
             ) | ("paddingLayout", "(J)Ljava/lang/foreign/PaddingLayout;")
-                | ("paddingLayout", "(J)Ljava/lang/foreign/MemoryLayout;")
                 | (
                     "varHandle",
                     "([Ljava/lang/foreign/MemoryLayout$PathElement;)Ljava/lang/invoke/VarHandle;"
@@ -3804,44 +3828,25 @@ pub(super) fn force_native_over_real_jdk_bytecode(
     ) {
         return true;
     }
-    // FFM layout factories: JDK 25's real `MemoryLayout.sequenceLayout` runs
-    // through `jdk/internal/foreign/Utils` while `SharedUtils.<clinit>` is still
-    // building its `C_POINTER` constant. That circular path re-enters
-    // `SharedUtils` before `ValueLayout.JAVA_BYTE` has been populated and
+    // FFM layout factories: THE SECOND COPY OF THIS TABLE IS GONE (F27,
+    // 2026-08-13). What stood here was an inline `matches!` over the same
+    // `java/lang/foreign/MemoryLayout` triples that
+    // `is_ffm_memory_layout_native_override` lists — nine of them verbatim,
+    // inside the SAME function that calls that helper a few hundred lines below.
+    // Both arms returned `true`, so the duplication was invisible; it was also
+    // the only reason the four stale erased-return descriptors had to be deleted
+    // twice. The helper is a strict superset (it adds `name` and `withName`), so
+    // deleting this block changes no triple's answer.
+    //
+    // The rationale it carried, kept because it is the reason the routing exists
+    // at all: JDK 25's real `MemoryLayout.sequenceLayout` runs through
+    // `jdk/internal/foreign/Utils` while `SharedUtils.<clinit>` is still building
+    // its `C_POINTER` constant. That circular path re-enters `SharedUtils` before
+    // `ValueLayout.JAVA_BYTE` has been populated and
     // `Objects.requireNonNull(elementLayout)` throws a bare NPE. The registered
     // native factories are bytecode-equivalent for CratonVM's supported Panama
     // layout model and avoid that bootstrap cycle.
-    if class_name == "java/lang/foreign/MemoryLayout"
-        && matches!(
-            (method_name, method_descriptor),
-            (
-                "sequenceLayout",
-                "(JLjava/lang/foreign/MemoryLayout;)Ljava/lang/foreign/SequenceLayout;"
-            ) | (
-                "sequenceLayout",
-                "(JLjava/lang/foreign/MemoryLayout;)Ljava/lang/foreign/MemoryLayout;"
-            ) | (
-                "structLayout",
-                "([Ljava/lang/foreign/MemoryLayout;)Ljava/lang/foreign/StructLayout;"
-            ) | (
-                "structLayout",
-                "([Ljava/lang/foreign/MemoryLayout;)Ljava/lang/foreign/MemoryLayout;"
-            ) | (
-                "unionLayout",
-                "([Ljava/lang/foreign/MemoryLayout;)Ljava/lang/foreign/UnionLayout;"
-            ) | (
-                "unionLayout",
-                "([Ljava/lang/foreign/MemoryLayout;)Ljava/lang/foreign/MemoryLayout;"
-            ) | ("paddingLayout", "(J)Ljava/lang/foreign/PaddingLayout;")
-                | ("paddingLayout", "(J)Ljava/lang/foreign/MemoryLayout;")
-                | (
-                    "varHandle",
-                    "([Ljava/lang/foreign/MemoryLayout$PathElement;)Ljava/lang/invoke/VarHandle;"
-                )
-        )
-    {
-        return true;
-    }
+
     // FFM ValueLayout subinterfaces are abstract/covariant in the real JDK
     // surface. CratonVM backs the supported layouts with small synthetic
     // objects, so calls such as `ValueLayout$OfFloat.withByteAlignment(J)`

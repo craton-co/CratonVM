@@ -1,4 +1,4 @@
-# jdk-baseline	1
+# jdk-baseline	2
 # kind	class
 # name	java.util.concurrent.StructuredTaskScope$Joiner
 # module	java.base
@@ -10,6 +10,8 @@
 # regenerate	python scripts/jdk-baseline/generate.py --update
 # public-methods	8
 # protected-methods	0
+# declared-methods	8
+# declared-fields	0
 # rows	11
 # columns	kind	name	descriptor	flags
 CLASS	java.util.concurrent.StructuredTaskScope$Joiner		public,interface,abstract

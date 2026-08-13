@@ -1,4 +1,4 @@
-# jdk-baseline	1
+# jdk-baseline	2
 # kind	class
 # name	java.util.concurrent.SynchronousQueue
 # module	java.base
@@ -10,7 +10,9 @@
 # regenerate	python scripts/jdk-baseline/generate.py --update
 # public-methods	23
 # protected-methods	0
-# rows	37
+# declared-methods	28
+# declared-fields	6
+# rows	46
 # columns	kind	name	descriptor	flags
 CLASS	java.util.concurrent.SynchronousQueue		public
 EXTENDS	java.util.AbstractQueue		
@@ -39,6 +41,7 @@ METHOD	peek	()Ljava/lang/Object;	public
 METHOD	poll	()Ljava/lang/Object;	public
 METHOD	poll	(JLjava/util/concurrent/TimeUnit;)Ljava/lang/Object;	public
 METHOD	put	(Ljava/lang/Object;)V	public
+METHOD	readResolve	()Ljava/lang/Object;	private
 METHOD	remainingCapacity	()I	public
 METHOD	remove	(Ljava/lang/Object;)Z	public
 METHOD	removeAll	(Ljava/util/Collection;)Z	public
@@ -49,3 +52,11 @@ METHOD	take	()Ljava/lang/Object;	public
 METHOD	toArray	()[Ljava/lang/Object;	public
 METHOD	toArray	([Ljava/lang/Object;)[Ljava/lang/Object;	public
 METHOD	toString	()Ljava/lang/String;	public
+METHOD	writeObject	(Ljava/io/ObjectOutputStream;)V	private
+METHOD	xfer	(Ljava/lang/Object;J)Ljava/lang/Object;	private
+FIELD	fair	Z	private,final,transient
+FIELD	qlock	Ljava/util/concurrent/locks/ReentrantLock;	private
+FIELD	serialVersionUID	J	private,static,final
+FIELD	transferer	Ljava/util/concurrent/SynchronousQueue$Transferer;	private,final,transient
+FIELD	waitingConsumers	Ljava/util/concurrent/SynchronousQueue$WaitQueue;	private
+FIELD	waitingProducers	Ljava/util/concurrent/SynchronousQueue$WaitQueue;	private

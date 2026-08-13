@@ -45,6 +45,48 @@ import javax.net.ssl.SSLSocketFactory;
  *     getHandshakeSession()   = null   (on the socket and on the engine)
  * </pre>
  *
+ * <h2>The four doors F18 registered, and why they needed a fixture</h2>
+ *
+ * <p>{@code invalidate()}, {@code getPeerHost()}, {@code getPeerPort()} and
+ * {@code getSessionContext()} had <b>no registration at all</b> until
+ * {@code docs/known-issues/jdk-only/F18-1-four-session-doors-with-no-registration-and-the-twin-that-read-another-table-20260813.md}.
+ * An unregistered {@code SSLSession} method is not a wrong value — it resolves to the
+ * {@code Code}-less interface declaration and raises {@code AbstractMethodError}, which
+ * would have aborted DOOR 1 here and taken every later check with it, exactly the way
+ * {@code getHandshakeSession} did before E31-1 registered it. F18 §7 recorded that this
+ * file asserted <b>nothing</b> about any of the four; that is what the arms below close.
+ *
+ * <p>HotSpot 25.0.3+9-LTS, measured (scratchpad/f25, both doors identical):
+ *
+ * <pre>
+ *   getPeerHost()           = null      (and NOT the engine's own peer host — see below)
+ *   getPeerPort()           = -1        (NOT 0; 0 is an unwritten slot, not a port)
+ *   getSessionContext()     = null
+ *   invalidate()            returns normally, and moves NOTHING on this session:
+ *                           isValid stays false, getSessionContext stays null,
+ *                           getId keeps its exact bytes, the suite and protocol
+ *                           sentinels are unchanged, and a second call is idempotent
+ *   getPeerPrincipal()      SSLPeerUnverifiedException: peer not authenticated
+ *   getPeerCertificates()   SSLPeerUnverifiedException: peer not authenticated
+ * </pre>
+ *
+ * <p><b>What this file cannot prove, stated so nobody reads its green as more than it
+ * is.</b> F18's headline measurement is that on a session that genuinely negotiated,
+ * {@code invalidate()} moves <i>two</i> accessors — {@code isValid()} to false <b>and</b>
+ * {@code getSessionContext()} to null — correcting an "isValid and nothing else" claim
+ * repeated in four comments across three files. The second half is only visible where a
+ * live context exists, and this file opens no connection, so it asserts the other side of
+ * the same contract: that {@code invalidate()} does not <i>mint</i> a context, an id or a
+ * suite on a session that negotiated nothing. Likewise F18 measured
+ * {@code getPeerPrincipal().equals(peerCerts[0].getSubjectX500Principal())} — true, and
+ * the reason {@code getPeerPrincipal} is not a sibling accessor but the leaf certificate's
+ * subject. Both doors refuse here, so that row has no vector without a handshake and is
+ * <b>not</b> written; see this lane's record.
+ *
+ * <p>{@code getApplicationBufferSize()} is measured 16704 on the null session and is
+ * deliberately NOT asserted: F18 §8.3 records CratonVM's 16384 as a knowing under-report,
+ * so a row here would be red for a reason this file does not own.
+ *
  * <h2>Why the sentinel is honesty and not a fabrication</h2>
  *
  * <p>{@code --jdk-only} exists to refuse invented stand-ins. {@code SSL_NULL_WITH_NULL_NULL} is not
@@ -116,6 +158,128 @@ public class RSslNullSession {
 
         // Two reads of getId() must agree — an id, even an empty one, is stable per session.
         ck(door + ".getId.stable", Arrays.equals(s.getId(), s.getId()), Boolean.TRUE);
+
+        // APPENDED, so every row above keeps its position in this door's sequence.
+        //
+        // Three of F18's four doors. Each is a plain read here and each has a
+        // DIFFERENT wrong-answer shape a plausible implementation produces:
+        //
+        //   getPeerHost   — the engine created with createSSLEngine("localhost", 443)
+        //                   answers "localhost" from getPeerHost(), and its SESSION
+        //                   still answers null (measured). An implementation that
+        //                   forwarded the engine's own peer host into the session
+        //                   passes on the no-argument door and fails on that one.
+        //                   Worse, slot 3 is the ATTRIBUTE MAP on the 4-field session
+        //                   shape, so a width-blind read hands a java.util.HashMap back
+        //                   through a ()Ljava/lang/String; descriptor as soon as
+        //                   anything has called putValue — E31-1 §2, and the arm
+        //                   `attributes` below is the executable form of it.
+        //   getPeerPort   — 0 is what an UNWRITTEN slot holds; -1 is what "no peer"
+        //                   means. Both wide producers write -1 explicitly, so a 0 here
+        //                   is the allocator's fill being reported as an answer, and a
+        //                   connected peer never reports port 0 anyway.
+        //   getSessionContext — null is the INTERFACE's own answer for "unavailable in
+        //                   this environment" (SSLSession.java:77-84), not a stand-in
+        //                   for one. Contrast getCipherSuite, which may not return null
+        //                   at all and therefore needs the JSSE sentinel above.
+        ck(door + ".getPeerHost", String.valueOf(s.getPeerHost()), "null");
+        ck(door + ".getPeerPort", s.getPeerPort(), -1);
+        ck(door + ".getSessionContext", String.valueOf(s.getSessionContext()), "null");
+
+        // ...and the MESSAGES of the two refusals, which the class-name rows above
+        // cannot see. F18 measured both doors refusing identically; an IOException
+        // whose message names the right thing never matches the caller's catch, and
+        // the converse — the right class carrying some other explanation — is what
+        // lets a wrong internal cause survive a repair.
+        ck(door + ".getPeerCertificates.message", refusalMessage(() -> s.getPeerCertificates()),
+                "peer not authenticated");
+        ck(door + ".getPeerPrincipal.message", refusalMessage(() -> s.getPeerPrincipal()),
+                "peer not authenticated");
+    }
+
+    /**
+     * DOOR-agnostic arm for {@code invalidate()}, the fourth of F18's doors and the only
+     * one that MUTATES.
+     *
+     * <p>Run on a session of its own so nothing above it observes the mutation, and run on
+     * BOTH doors because the two are minted by different code paths with different field
+     * widths, and width is what decides what a slot means (F18 §2.3).
+     *
+     * <p>The claim is deliberately narrow. On a session that negotiated nothing HotSpot
+     * moves NOTHING — so this arm is the negative half of F18's contract, and it is the
+     * half that catches the two mistakes a fixture-less fix makes: raising
+     * {@code AbstractMethodError} because the door was never registered, and inverting the
+     * bit so that invalidating a session makes it valid.
+     */
+    static void invalidateMovesNothingHere(String door, SSLSession s) {
+        ck(door + ".invalidate.raises", raised(s::invalidate), "none");
+        ck(door + ".invalidate.isValid", s.isValid(), Boolean.FALSE);
+        // The second accessor F18 found. It is null before and after here, so the row
+        // asserts that invalidate() does not MINT a context — the direction this file
+        // can see. The drop from a live SSLSessionContextImpl to null needs a handshake.
+        ck(door + ".invalidate.getSessionContext", String.valueOf(s.getSessionContext()), "null");
+        // getId keeps its exact bytes. This is the row a "simplification" of getId onto
+        // the validity predicate breaks, which is why it is asserted rather than assumed.
+        ck(door + ".invalidate.getId.length", s.getId().length, 0);
+        ck(door + ".invalidate.getCipherSuite", s.getCipherSuite(), "SSL_NULL_WITH_NULL_NULL");
+        ck(door + ".invalidate.getPeerPort", s.getPeerPort(), -1);
+        // Idempotent: a second call neither throws nor flips anything back.
+        ck(door + ".invalidate.twice.raises", raised(s::invalidate), "none");
+        ck(door + ".invalidate.twice.isValid", s.isValid(), Boolean.FALSE);
+    }
+
+    /**
+     * The attribute map must not shadow the identity doors.
+     *
+     * <p>E31-1 §2's recorded defect: slot 3 carries the peer host on the wide session
+     * shapes and the ATTRIBUTE MAP on the 4-field one, so a width-blind reader returns a
+     * {@code java.util.HashMap} through {@code ()Ljava/lang/String;} — and Jetty's
+     * {@code SecureRequestCustomizer.retrieveSni()} calls {@code putValue} on every SSL
+     * request, so the trap is armed in the field and by nothing in this suite.
+     *
+     * <p>Written as a state CHANGE rather than a state read: rows 1-6 establish that the
+     * attribute really landed, and only then do the three identity doors get asked again.
+     * Without the first half a VM whose {@code putValue} silently did nothing would pass
+     * the second half for the wrong reason.
+     */
+    static void attributes() throws Exception {
+        SSLSocketFactory f = (SSLSocketFactory) SSLSocketFactory.getDefault();
+        SSLSocket sock = (SSLSocket) f.createSocket();
+        SSLSession s = sock.getSession();
+        ck("attrs.before.valueNames", Arrays.toString(s.getValueNames()), "[]");
+        ck("attrs.before.getValue", String.valueOf(s.getValue("cratonvm.f25")), "null");
+        ck("attrs.putValue.raises", raised(() -> s.putValue("cratonvm.f25", "v")), "none");
+        ck("attrs.after.getValue", String.valueOf(s.getValue("cratonvm.f25")), "v");
+        ck("attrs.after.getValue.class",
+                s.getValue("cratonvm.f25") == null
+                        ? "null" : s.getValue("cratonvm.f25").getClass().getName(),
+                "java.lang.String");
+        ck("attrs.after.valueNames", Arrays.toString(s.getValueNames()), "[cratonvm.f25]");
+
+        // The three rows this arm exists for. The attribute is now present, so a reader
+        // that resolves slot 3 without consulting the session's WIDTH answers the map
+        // here — visibly, because String.valueOf of a HashMap is "{cratonvm.f25=v}".
+        ck("attrs.shadow.getPeerHost", String.valueOf(s.getPeerHost()), "null");
+        ck("attrs.shadow.getPeerPort", s.getPeerPort(), -1);
+        ck("attrs.shadow.getSessionContext", String.valueOf(s.getSessionContext()), "null");
+
+        ck("attrs.removeValue.raises", raised(() -> s.removeValue("cratonvm.f25")), "none");
+        ck("attrs.removed.valueNames", Arrays.toString(s.getValueNames()), "[]");
+        sock.close();
+    }
+
+    /** Both doors, for the one arm that mutates the session it is given. */
+    static void invalidate() throws Exception {
+        SSLSocketFactory f = (SSLSocketFactory) SSLSocketFactory.getDefault();
+        SSLSocket sock = (SSLSocket) f.createSocket();
+        invalidateMovesNothingHere("socketInv", sock.getSession());
+        sock.close();
+
+        SSLContext c = SSLContext.getInstance("TLS");
+        c.init(null, null, null);
+        SSLEngine e = c.createSSLEngine();
+        e.setUseClientMode(true);
+        invalidateMovesNothingHere("engineInv", e.getSession());
     }
 
     static String refusal(ThrowingCall c) {
@@ -129,8 +293,40 @@ public class RSslNullSession {
         }
     }
 
+    /**
+     * The detail message of the refusal, or a description of what came out instead.
+     *
+     * <p>Separate from {@link #refusal} on purpose: the class-name row and the message row
+     * fail on disjoint defects, and collapsing them into one string would make a single
+     * check answer two questions and report neither clearly.
+     */
+    static String refusalMessage(ThrowingCall c) {
+        try {
+            Object v = c.call();
+            return "RETURNED " + (v == null ? "null" : v.getClass().getName());
+        } catch (SSLPeerUnverifiedException e) {
+            return String.valueOf(e.getMessage());
+        } catch (Throwable t) {
+            return t.getClass().getName() + ": " + t.getMessage();
+        }
+    }
+
+    /** The class of whatever {@code r} raised, or {@code "none"} — a door that ANSWERS. */
+    static String raised(ThrowingRun r) {
+        try {
+            r.run();
+            return "none";
+        } catch (Throwable t) {
+            return t.getClass().getName();
+        }
+    }
+
     interface ThrowingCall {
         Object call() throws Exception;
+    }
+
+    interface ThrowingRun {
+        void run() throws Exception;
     }
 
     /**
@@ -186,6 +382,12 @@ public class RSslNullSession {
         unconnectedSocket();
         preHandshakeEngine();
         unofferable();
+        // Both arms below mint sessions of their own, and both MUTATE them — one through
+        // invalidate(), one through putValue() — so neither may run against a session an
+        // earlier arm has asserted on. Last, for the same reason the unmodifiable-set row
+        // is last in RJdkSecurity.
+        invalidate();
+        attributes();
         // SEPARATE lines, and `failures` first so the LAST word of the counted
         // line is the count. These were one line — `CK RSslNullSession
         // checks=47 failures=0` — and that spelling makes the harness BLIND to

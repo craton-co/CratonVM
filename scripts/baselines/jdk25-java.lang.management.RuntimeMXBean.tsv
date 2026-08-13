@@ -1,4 +1,4 @@
-# jdk-baseline	1
+# jdk-baseline	2
 # kind	class
 # name	java.lang.management.RuntimeMXBean
 # module	java.management
@@ -10,6 +10,8 @@
 # regenerate	python scripts/jdk-baseline/generate.py --update
 # public-methods	17
 # protected-methods	0
+# declared-methods	17
+# declared-fields	0
 # rows	22
 # columns	kind	name	descriptor	flags
 CLASS	java.lang.management.RuntimeMXBean		public,interface,abstract

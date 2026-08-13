@@ -2958,11 +2958,134 @@ pub(crate) fn alloc_wrapper(
 type ScopedValueCache<const N: usize> =
     std::collections::HashMap<usize, [Option<cratonvm_types::ObjectRef>; N]>;
 
-static INTEGER_CACHE: std::sync::OnceLock<parking_lot::Mutex<ScopedValueCache<256>>> =
+/// The one cache in this file whose upper bound is **configurable**, so its
+/// backing store cannot be a `[Option<ObjectRef>; N]` like the other five.
+///
+/// See [`integer_cache_bound`] for the rule and the measurement. The `Vec` is
+/// sized once, at bound-resolution time, and never resized afterwards — so an
+/// index computed against the latched bound is always in range.
+type ScopedIntegerCache = std::collections::HashMap<usize, Vec<Option<cratonvm_types::ObjectRef>>>;
+
+static INTEGER_CACHE: std::sync::OnceLock<parking_lot::Mutex<ScopedIntegerCache>> =
     std::sync::OnceLock::new();
 
-fn integer_cache() -> &'static parking_lot::Mutex<ScopedValueCache<256>> {
+fn integer_cache() -> &'static parking_lot::Mutex<ScopedIntegerCache> {
     INTEGER_CACHE.get_or_init(|| parking_lot::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// `IntegerCache.low` — `-128`, and NOT configurable. `jdk25src/java.base/
+/// java/lang/Integer.java`: `static final int low = -128;` is a literal with
+/// no property behind it, and only `high` reads one.
+const INTEGER_CACHE_LOW: i32 = -128;
+
+/// The property `IntegerCache.<clinit>` reads. HotSpot reads it through
+/// `jdk.internal.misc.VM.getSavedProperty`, not `System.getProperty` — which
+/// is why `System.getProperty("java.lang.Integer.IntegerCache.high")` answers
+/// **`null`** on HotSpot even in a run where the cache really was widened
+/// (MEASURED: `prop.System=null` under `-Djava.lang.Integer.IntegerCache
+/// .high=1000` *and* under `-XX:AutoBoxCacheMax=1000`, while `int.1000`
+/// answered `true` in both). CratonVM has no saved-property split; `-D` lands
+/// in `shared.system_properties`, which is what `get_system_property` reads,
+/// and it is populated from `VmConfig` before any bytecode runs.
+const INTEGER_CACHE_HIGH_PROPERTY: &str = "java.lang.Integer.IntegerCache.high";
+
+/// The resolved `IntegerCache.high` for one VM, latched on first use.
+///
+/// VM-scoped rather than a process-global `OnceLock`: a `OnceLock` latches the
+/// FIRST VM's answer for the lifetime of the process, and this crate's Rust
+/// tests build several independent VMs in one binary.
+static INTEGER_CACHE_HIGH: std::sync::OnceLock<
+    parking_lot::Mutex<std::collections::HashMap<usize, i32>>,
+> = std::sync::OnceLock::new();
+
+fn integer_cache_high() -> &'static parking_lot::Mutex<std::collections::HashMap<usize, i32>> {
+    INTEGER_CACHE_HIGH.get_or_init(|| parking_lot::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// `IntegerCache.high`'s value from a raw property string, or `None` to keep
+/// the default.
+///
+/// Transliterated from `jdk25src/java.base/java/lang/Integer.java`:
+///
+/// ```text
+/// h = Math.max(parseInt(v), 127);
+/// h = Math.min(h, Integer.MAX_VALUE - (-low) - 1);
+/// ... catch (NumberFormatException nfe) { /* ignore it */ }
+/// ```
+///
+/// Three rules, each of which has its own measured row and none of which is
+/// guessable from the other two (all on OpenJDK 25.0.3+9, `CacheHigh.java`):
+///
+/// * `=1000` widens to `-128..=1000`: `int.1000` true, `int.1001` false.
+/// * `=50` does **not** narrow: `Math.max(.., 127)` floors it, and `int.128`
+///   stays false while `int.127` stays true. A reader who implemented only
+///   "high = parsed" would make a *narrowing* configuration observable, which
+///   HotSpot never does.
+/// * `=abc` is ignored, not fatal: `int.128` false, the run completes.
+///
+/// The parse is [`java_parse_signed`], not `str::parse` — the property is read
+/// by `Integer.parseInt`, whose grammar accepts a leading `+` and rejects
+/// surrounding whitespace, and this file already owns that grammar.
+fn parse_integer_cache_high(raw: &str) -> Option<i32> {
+    match java_parse_signed(raw, 10, i32::MIN as i64, i32::MAX as i64) {
+        JavaIntParse::Ok(v) => {
+            // `Math.max(parsed, 127)` then `Math.min(h, MAX_VALUE - 128 - 1)`.
+            let h = (v as i32).max(127);
+            Some(h.min(i32::MAX - (-INTEGER_CACHE_LOW) - 1))
+        }
+        // `NumberFormatException` on both arms — `Integer.parseInt` raises it
+        // for a malformed string AND for a well-formed out-of-int-range one,
+        // and `IntegerCache`'s `catch` swallows both identically.
+        JavaIntParse::Malformed | JavaIntParse::OutOfRange => None,
+    }
+}
+
+/// The `IntegerCache.high` in force for this VM, resolving and latching it on
+/// the first call.
+///
+/// Latching on first use is HotSpot's own timing, not an approximation of it:
+/// `IntegerCache.high` is a `static final` assigned in `IntegerCache
+/// .<clinit>`, which runs at the first autobox in the VM's life and never
+/// again. A later `System.setProperty` does not move HotSpot's bound and does
+/// not move this one.
+///
+/// **Lock order is memo → cache, and only here.** Every other reader takes
+/// `integer_cache()` alone; nothing takes the cache lock and then this memo,
+/// so the pair cannot deadlock.
+///
+/// The `try_reserve_exact` is not defensive padding. `high` is permitted up to
+/// `Integer.MAX_VALUE - 129`, i.e. a backing store of ~17 GB; HotSpot answers
+/// that configuration with an `OutOfMemoryError` from `new Integer[...]`, but
+/// a `vec![None; len]` here would **abort the process**, which is strictly
+/// worse than any Java outcome. On a refusal the bound falls back to the JDK
+/// default rather than to something in between, so the VM stays in a state the
+/// oracle can also produce.
+fn integer_cache_bound(ctx: &mut dyn NativeContext) -> i32 {
+    let scope = ctx.vm_identity();
+    if let Some(high) = integer_cache_high().lock().get(&scope).copied() {
+        return high;
+    }
+    let mut high = 127i32;
+    if let Some(raw) = ctx.get_system_property(INTEGER_CACHE_HIGH_PROPERTY) {
+        if let Some(parsed) = parse_integer_cache_high(&raw) {
+            high = parsed;
+        }
+    }
+    let mut entries: Vec<Option<cratonvm_types::ObjectRef>> = Vec::new();
+    let len = (high as i64 - INTEGER_CACHE_LOW as i64 + 1) as usize;
+    if entries.try_reserve_exact(len).is_err() {
+        high = 127;
+        entries = vec![None; 256];
+    } else {
+        entries.resize(len, None);
+    }
+    let mut memo = integer_cache_high().lock();
+    if let Some(existing) = memo.get(&scope).copied() {
+        return existing;
+    }
+    integer_cache().lock().entry(scope).or_insert(entries);
+    memo.insert(scope, high);
+    high
 }
 
 static BOOLEAN_CACHE: std::sync::OnceLock<parking_lot::Mutex<ScopedValueCache<2>>> =
@@ -3092,28 +3215,34 @@ fn cached_wrapper_box<const N: usize>(
 /// but not re-pointed is a use-after-move that only appears after a compacting
 /// collection, and the canonical instances are by construction long-lived
 /// enough to be moved.
-fn scan_one_cache<const N: usize>(
-    cache: &'static parking_lot::Mutex<ScopedValueCache<N>>,
+/// The generic is `AsRef<[Option<ObjectRef>]>`, not `const N: usize`, so that
+/// the ONE scan covers both backing shapes: the five fixed-bound caches'
+/// `[Option<ObjectRef>; N]` and `INTEGER_CACHE`'s `Vec` (whose length depends
+/// on `IntegerCache.high`). Both `[T; N]` and `Vec<T>` satisfy it, so the six
+/// call sites below are unchanged and no cache can acquire a second, separate
+/// hook — which is the failure this function was factored out to prevent.
+fn scan_one_cache<C: AsRef<[Option<cratonvm_types::ObjectRef>]>>(
+    cache: &'static parking_lot::Mutex<std::collections::HashMap<usize, C>>,
     vm_identity: usize,
     out: &mut Vec<cratonvm_types::ObjectRef>,
 ) {
     let cache = cache.lock();
     if let Some(entries) = cache.get(&vm_identity) {
-        for slot in entries.iter().flatten() {
+        for slot in entries.as_ref().iter().flatten() {
             out.push(*slot);
         }
     }
 }
 
 /// Remap one cache's entries for `vm_identity` through the GC pointer map.
-fn update_one_cache<const N: usize>(
-    cache: &'static parking_lot::Mutex<ScopedValueCache<N>>,
+fn update_one_cache<C: AsMut<[Option<cratonvm_types::ObjectRef>]>>(
+    cache: &'static parking_lot::Mutex<std::collections::HashMap<usize, C>>,
     vm_identity: usize,
     pointer_map: &cratonvm_types::PointerMap,
 ) {
     let mut cache = cache.lock();
     if let Some(entries) = cache.get_mut(&vm_identity) {
-        for obj_ref in entries.iter_mut().flatten() {
+        for obj_ref in entries.as_mut().iter_mut().flatten() {
             let old_addr = obj_ref.as_ptr() as usize;
             if let Some(&new_addr) = pointer_map.get(&old_addr) {
                 debug_assert!(new_addr != 0, "GC pointer map contains null address");
@@ -3151,6 +3280,89 @@ pub fn gc_update_value_of_cache_refs(
     update_one_cache(short_cache(), vm_identity, pointer_map);
 }
 
+/// The canonical wrapper for `(desc, v)` **if one is already cached**, without
+/// allocating, initialising a class, or populating anything.
+///
+/// This exists for exactly one caller shape: code on the `&SharedVm` side of
+/// the native boundary — `vm/src/vm/vm_exec.rs`'s proxy argument boxing — which
+/// has no `&mut dyn NativeContext` and therefore cannot call
+/// `native_integer_value_of` and friends at all. HotSpot answers those paths
+/// canonically (MEASURED, F19-1 §2: `proxy.int`/`char`/`bool`/`long`/`byte`/
+/// `short` all `true`), and today they allocate. Rather than mint a second
+/// `IntegerCache` over there, this reads the SIX caches that already exist here
+/// and are already wired into `gc_scan_value_of_cache_roots` /
+/// `gc_update_value_of_cache_refs` as one `VmRootSource { scan, remap }` pair.
+///
+/// **Read-only is a correctness requirement, not a performance one.**
+/// Populating a cache needs `alloc_wrapper`, which needs
+/// `ensure_class_initialized`, which runs `<clinit>` — and a proxy invocation
+/// is not a legal place to trigger class initialisation. So a miss is `None`
+/// and the caller keeps its existing allocation. A `None` must never be turned
+/// into a `null` argument; that is the defect recorded above
+/// `lang_class::create_method_object`.
+///
+/// **The `Value` variant is matched as well as the descriptor, and that is the
+/// load-bearing half.** A `long` slot can legitimately present as a compact
+/// `Value::Int` — the shape `native_wrapper_long_value` exists to widen. A
+/// descriptor-only match would answer `("J", Value::Int(5))` with the cached
+/// `Long.valueOf(0)`: an identity fix converted into a **wrong answer**, which
+/// is worse than the defect it fixes. Every mismatched pair falls through to
+/// `None`, i.e. to today's fresh box carrying the right value.
+///
+/// `"Z"` is deliberately absent, and it is the one arm a reader would expect
+/// and must not add. `Boolean.valueOf` returns the live `Boolean.TRUE`/`FALSE`
+/// **static fields**, not a privately minted twin (see
+/// [`native_boolean_value_of`]); `BOOLEAN_CACHE` is only its bootstrap
+/// fallback, so an entry in it is not guaranteed to be the instance the rest
+/// of the VM calls canonical. `vm_exec.rs` resolves the statics directly
+/// (`proxy_canonical_boolean`) and needs nothing from here. `"F"`/`"D"` are
+/// absent because HotSpot caches neither (`neg.floatValueOf` = false);
+/// "completing the family to eight" is a regression, not a completion.
+pub fn canonical_wrapper_if_cached(
+    vm_identity: usize,
+    desc: &str,
+    v: Value,
+) -> Option<cratonvm_types::ObjectRef> {
+    fn read<C: AsRef<[Option<cratonvm_types::ObjectRef>]>>(
+        cache: &'static parking_lot::Mutex<std::collections::HashMap<usize, C>>,
+        vm_identity: usize,
+        idx: usize,
+    ) -> Option<cratonvm_types::ObjectRef> {
+        let guard = cache.lock();
+        guard
+            .get(&vm_identity)
+            .and_then(|entries| entries.as_ref().get(idx).copied().flatten())
+    }
+    match (desc, v) {
+        // `IntegerCache`'s upper bound is configurable, so the bound is not
+        // checked here at all: the backing store's LENGTH is the bound, and
+        // `read`'s `get(idx)` is exactly that test. Reading the latched bound
+        // instead would need the memo, and a VM that has not boxed an `int`
+        // yet has neither — which is a miss either way.
+        ("I", Value::Int(x)) if x >= INTEGER_CACHE_LOW => {
+            read(integer_cache(), vm_identity, (x - INTEGER_CACHE_LOW) as usize)
+        }
+        ("J", Value::Long(x)) if (-128..=127).contains(&x) => {
+            read(long_cache(), vm_identity, (x + 128) as usize)
+        }
+        // `CharacterCache` has no negative half: `if (c <= 127)` indexes by
+        // the code unit itself, so the offset the other three use is absent.
+        ("C", Value::Int(x)) if (0..=127).contains(&x) => {
+            read(character_cache(), vm_identity, x as usize)
+        }
+        // `ByteCache` is unconditional over all 256 byte values, but a raw
+        // `Value::Int` in a `B` slot can carry anything, so the range test
+        // stays — it is a domain check here, not a cache-bound check.
+        ("B", Value::Int(x)) if (-128..=127).contains(&x) => {
+            read(byte_cache(), vm_identity, (x + 128) as usize)
+        }
+        ("S", Value::Int(x)) if (-128..=127).contains(&x) => {
+            read(short_cache(), vm_identity, (x + 128) as usize)
+        }
+        _ => None,
+    }
+}
+
 pub(crate) fn native_integer_value_of(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -3159,13 +3371,24 @@ pub(crate) fn native_integer_value_of(
         Some(Value::Int(v)) => *v,
         _ => 0,
     };
-    if (-128..=127).contains(&val) {
-        let idx = (val + 128) as usize;
+    // `high` is `IntegerCache.high`, which is CONFIGURABLE — see
+    // [`integer_cache_bound`]. `low` is not. This is the only member of the
+    // family whose bound is not a literal, and widening it must not drag the
+    // others: MEASURED under `-Djava.lang.Integer.IntegerCache.high=1000`,
+    // `int.1000` is `true` while `long.128`, `short.128` and `char.128` are
+    // all still `false`.
+    let high = integer_cache_bound(ctx);
+    if (INTEGER_CACHE_LOW..=high).contains(&val) {
+        let idx = (val - INTEGER_CACHE_LOW) as usize;
         let scope = ctx.vm_identity();
         // Fast path: lock, read, drop lock before any heap allocation.
+        // `entries.get(idx)` rather than `entries[idx]`: the bound is latched
+        // per VM and the store is sized to it, so a miss here is impossible —
+        // but an indexing panic inside a native is a VM abort, and a `None`
+        // is an extra allocation.
         if let Some(cached) = {
             let c = integer_cache().lock();
-            c.get(&scope).and_then(|entries| entries[idx])
+            c.get(&scope).and_then(|entries| entries.get(idx).copied().flatten())
         } {
             return Ok(Some(Value::Object(Some(cached))));
         }
@@ -3176,11 +3399,15 @@ pub(crate) fn native_integer_value_of(
         // (the loser allocation is collectible — but the race is rare and
         // it preserves the JLS identity invariant).
         let mut cache = integer_cache().lock();
-        let entries = cache.entry(scope).or_insert([None; 256]);
-        if let Some(existing) = entries[idx] {
-            return Ok(Some(Value::Object(Some(existing))));
+        let entries = cache
+            .entry(scope)
+            .or_insert_with(|| vec![None; (high as i64 - INTEGER_CACHE_LOW as i64 + 1) as usize]);
+        if let Some(slot) = entries.get_mut(idx) {
+            if let Some(existing) = *slot {
+                return Ok(Some(Value::Object(Some(existing))));
+            }
+            *slot = Some(obj);
         }
-        entries[idx] = Some(obj);
         return Ok(Some(Value::Object(Some(obj))));
     }
     let obj = alloc_wrapper(ctx, "java/lang/Integer");
@@ -7021,6 +7248,238 @@ mod tests {
             box_char(&mut ctx, 'q' as u32),
             moved,
             "the cache still points at the pre-move address — remap hook missed CHARACTER_CACHE"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // F29 — `IntegerCache.high` is configurable, and `canonical_wrapper_if_cached`
+    // -----------------------------------------------------------------------
+
+    fn box_int(
+        ctx: &mut crate::test_utils::MockNativeContext,
+        v: i32,
+    ) -> cratonvm_types::ObjectRef {
+        ref_of(native_integer_value_of(ctx, &[Value::Int(v)]).unwrap())
+    }
+
+    /// The parse rule, as a PURE function — no mock, no VM, no cache.
+    ///
+    /// Each row is one of the three independent clauses in `IntegerCache
+    /// .<clinit>`, and each was MEASURED on OpenJDK 25.0.3+9 (`CacheHigh.java`)
+    /// before it was written here.
+    #[test]
+    fn integer_cache_high_follows_the_jdks_three_clauses() {
+        // MEASURED `-D...high=1000`: int.1000 true, int.1001 false.
+        assert_eq!(parse_integer_cache_high("1000"), Some(1000));
+        // MEASURED `-D...high=50`: int.128 STILL false. `Math.max(v, 127)`
+        // means the property can only widen, never narrow. Drop the `.max`
+        // and this row is the one that fails.
+        assert_eq!(parse_integer_cache_high("50"), Some(127));
+        assert_eq!(parse_integer_cache_high("-9"), Some(127));
+        // MEASURED `-D...high=abc`: ignored, and the run completes.
+        assert_eq!(parse_integer_cache_high("abc"), None);
+        assert_eq!(parse_integer_cache_high(""), None);
+        // `Integer.parseInt`'s grammar, not `str::parse`'s: a leading `+` is
+        // legal, surrounding whitespace is not.
+        assert_eq!(parse_integer_cache_high("+300"), Some(300));
+        assert_eq!(parse_integer_cache_high(" 300"), None);
+        assert_eq!(parse_integer_cache_high("300 "), None);
+        // A well-formed value wider than an `int` raises NumberFormatException
+        // in the JDK too, and the `catch` swallows it identically.
+        assert_eq!(parse_integer_cache_high("99999999999"), None);
+        // `Math.min(h, Integer.MAX_VALUE - (-low) - 1)`.
+        assert_eq!(
+            parse_integer_cache_high(&i32::MAX.to_string()),
+            Some(i32::MAX - 129)
+        );
+    }
+
+    /// The property must actually reach the cache, and must not drag the other
+    /// five bounds with it.
+    #[test]
+    fn the_integer_cache_widens_on_the_property_and_nothing_else_moves() {
+        let mut ctx = mock_ctx();
+        ctx.set_vm_identity(0x5f29);
+        ctx.set_system_property("java.lang.Integer.IntegerCache.high", "1000");
+
+        // MEASURED on HotSpot with the same property: int.128/200/999/1000
+        // true, int.1001 false, int.-128 true, int.-129 false.
+        assert_eq!(box_int(&mut ctx, 128), box_int(&mut ctx, 128));
+        assert_eq!(box_int(&mut ctx, 1000), box_int(&mut ctx, 1000));
+        assert_eq!(box_int(&mut ctx, -128), box_int(&mut ctx, -128));
+        assert_ne!(box_int(&mut ctx, 1001), box_int(&mut ctx, 1001));
+        assert_ne!(box_int(&mut ctx, -129), box_int(&mut ctx, -129));
+
+        // The five that MEASURED `false` at 128 in the very same HotSpot run.
+        // This is the mutation guard for a "consistency" edit that routes the
+        // bound through the whole family.
+        assert_ne!(
+            ref_of(native_long_value_of(&mut ctx, &[Value::Long(128)]).unwrap()),
+            ref_of(native_long_value_of(&mut ctx, &[Value::Long(128)]).unwrap())
+        );
+        assert_ne!(
+            ref_of(native_short_value_of(&mut ctx, &[Value::Int(128)]).unwrap()),
+            ref_of(native_short_value_of(&mut ctx, &[Value::Int(128)]).unwrap())
+        );
+        assert_ne!(box_char(&mut ctx, 128), box_char(&mut ctx, 128));
+    }
+
+    /// A VM with no property set keeps the JDK default, and the widened VM
+    /// next door does not leak into it. The caches are process-global; only
+    /// `vm_identity` separates them.
+    #[test]
+    fn the_integer_cache_bound_is_per_vm_not_per_process() {
+        let mut wide = mock_ctx();
+        wide.set_vm_identity(0x5f2a);
+        wide.set_system_property("java.lang.Integer.IntegerCache.high", "500");
+        assert_eq!(box_int(&mut wide, 300), box_int(&mut wide, 300));
+
+        let mut plain = mock_ctx();
+        plain.set_vm_identity(0x5f2b);
+        assert_ne!(
+            box_int(&mut plain, 300),
+            box_int(&mut plain, 300),
+            "a second VM inherited the first VM's bound — the memo is not VM-scoped"
+        );
+        assert_eq!(box_int(&mut plain, 127), box_int(&mut plain, 127));
+    }
+
+    /// The widened region must be REPORTED and REMAPPED, not just allocated.
+    /// A bound that grows past a hook that still walks 256 slots is a
+    /// use-after-move that only a compacting collection reveals.
+    #[test]
+    fn the_widened_integer_region_is_both_scanned_and_remapped() {
+        let mut ctx = mock_ctx();
+        let vm = 0x5f2cusize;
+        ctx.set_vm_identity(vm);
+        ctx.set_system_property("java.lang.Integer.IntegerCache.high", "1000");
+
+        let before = box_int(&mut ctx, 900);
+        let mut roots: Vec<cratonvm_types::ObjectRef> = Vec::new();
+        gc_scan_value_of_cache_roots(vm, &mut roots);
+        assert!(
+            roots.contains(&before),
+            "the widened region is not reported as a root — it would be swept"
+        );
+
+        let moved = ctx.alloc_object(cratonvm_types::ClassId::new(1), 1);
+        let mut map = cratonvm_types::PointerMap::default();
+        map.insert(before.as_ptr() as usize, moved.as_ptr() as usize);
+        gc_update_value_of_cache_refs(vm, &map);
+        assert_eq!(
+            box_int(&mut ctx, 900),
+            moved,
+            "the widened region was not remapped — the scan and remap sets disagree"
+        );
+    }
+
+    /// `canonical_wrapper_if_cached` reads, and only reads.
+    #[test]
+    fn canonical_wrapper_if_cached_never_populates_and_agrees_when_it_hits() {
+        let mut ctx = mock_ctx();
+        let vm = 0x5f2dusize;
+        ctx.set_vm_identity(vm);
+
+        // Cold: nothing has boxed anything in this VM, so every probe misses.
+        // A helper that populated on demand would return `Some` here — and
+        // would have had to run `<clinit>` to do it.
+        assert_eq!(canonical_wrapper_if_cached(vm, "I", Value::Int(7)), None);
+        assert_eq!(canonical_wrapper_if_cached(vm, "C", Value::Int(97)), None);
+
+        // Warm: the answer is the SAME OBJECT the native itself returns, not
+        // a private twin that merely behaves the same.
+        let i7 = box_int(&mut ctx, 7);
+        assert_eq!(canonical_wrapper_if_cached(vm, "I", Value::Int(7)), Some(i7));
+        let ca = box_char(&mut ctx, 97);
+        assert_eq!(canonical_wrapper_if_cached(vm, "C", Value::Int(97)), Some(ca));
+        let j5 = ref_of(native_long_value_of(&mut ctx, &[Value::Long(5)]).unwrap());
+        assert_eq!(canonical_wrapper_if_cached(vm, "J", Value::Long(5)), Some(j5));
+        let b3 = ref_of(native_byte_value_of(&mut ctx, &[Value::Int(3)]).unwrap());
+        assert_eq!(canonical_wrapper_if_cached(vm, "B", Value::Int(3)), Some(b3));
+        let s9 = ref_of(native_short_value_of(&mut ctx, &[Value::Int(9)]).unwrap());
+        assert_eq!(canonical_wrapper_if_cached(vm, "S", Value::Int(9)), Some(s9));
+
+        // The probe itself must not have installed anything: another VM
+        // identity still misses for the same values.
+        assert_eq!(
+            canonical_wrapper_if_cached(0x5f2e, "I", Value::Int(7)),
+            None
+        );
+    }
+
+    /// The guard that turns an identity fix into a wrong answer if it is
+    /// dropped: a `long` slot presenting as a compact `Value::Int`.
+    #[test]
+    fn canonical_wrapper_if_cached_matches_the_variant_not_only_the_descriptor() {
+        let mut ctx = mock_ctx();
+        let vm = 0x5f2fusize;
+        ctx.set_vm_identity(vm);
+        // Populate `Long.valueOf(0)` so the wrong answer is AVAILABLE to be
+        // returned. Without this the test passes for the wrong reason.
+        let zero = ref_of(native_long_value_of(&mut ctx, &[Value::Long(0)]).unwrap());
+        assert_eq!(canonical_wrapper_if_cached(vm, "J", Value::Long(0)), Some(zero));
+
+        // `("J", Value::Int(5))` must MISS. A descriptor-only match indexes
+        // slot 5 + 128 of LONG_CACHE — or worse, defaults the payload to 0 and
+        // hands back `zero` for a field holding 5.
+        assert_eq!(canonical_wrapper_if_cached(vm, "J", Value::Int(5)), None);
+        assert_eq!(canonical_wrapper_if_cached(vm, "J", Value::Int(0)), None);
+        // The mirror: an `int`-descriptor slot carrying a `Long`.
+        let _ = box_int(&mut ctx, 5);
+        assert_eq!(canonical_wrapper_if_cached(vm, "I", Value::Long(5)), None);
+    }
+
+    /// The four descriptors this helper must NOT answer, each for its own
+    /// measured reason.
+    #[test]
+    fn canonical_wrapper_if_cached_declines_z_f_d_and_the_out_of_bound_arms() {
+        let mut ctx = mock_ctx();
+        let vm = 0x5f30usize;
+        ctx.set_vm_identity(vm);
+        let _ = native_boolean_value_of(&mut ctx, &[Value::Int(1)]);
+        let _ = box_int(&mut ctx, 7);
+
+        // `Z`: the canonical Boolean is the live `Boolean.TRUE` static field,
+        // which this signature cannot reach. `vm_exec.rs` resolves it itself.
+        assert_eq!(canonical_wrapper_if_cached(vm, "Z", Value::Int(1)), None);
+        assert_eq!(canonical_wrapper_if_cached(vm, "Z", Value::Int(0)), None);
+        // `F`/`D`: HotSpot caches neither. MEASURED `neg.floatValueOf` = false.
+        assert_eq!(canonical_wrapper_if_cached(vm, "F", Value::Float(0.0)), None);
+        assert_eq!(canonical_wrapper_if_cached(vm, "D", Value::Double(0.0)), None);
+        // Out of bound, per type. MEASURED `fieldoob.*` = false throughout.
+        assert_eq!(canonical_wrapper_if_cached(vm, "I", Value::Int(-129)), None);
+        assert_eq!(canonical_wrapper_if_cached(vm, "C", Value::Int(128)), None);
+        assert_eq!(canonical_wrapper_if_cached(vm, "C", Value::Int(-1)), None);
+        assert_eq!(canonical_wrapper_if_cached(vm, "S", Value::Int(128)), None);
+        assert_eq!(canonical_wrapper_if_cached(vm, "J", Value::Long(128)), None);
+        // A reference descriptor and a null are misses, not panics.
+        assert_eq!(
+            canonical_wrapper_if_cached(vm, "Ljava/lang/Integer;", Value::Int(7)),
+            None
+        );
+        assert_eq!(canonical_wrapper_if_cached(vm, "I", Value::Object(None)), None);
+    }
+
+    /// The configurable bound and the read-only probe must agree: a value
+    /// inside a WIDENED `IntegerCache` is reachable through the probe too.
+    /// This is the row that fails if the probe hard-codes `-128..=127`.
+    #[test]
+    fn canonical_wrapper_if_cached_follows_the_configured_integer_bound() {
+        let mut ctx = mock_ctx();
+        let vm = 0x5f31usize;
+        ctx.set_vm_identity(vm);
+        ctx.set_system_property("java.lang.Integer.IntegerCache.high", "1000");
+        let i900 = box_int(&mut ctx, 900);
+        assert_eq!(
+            canonical_wrapper_if_cached(vm, "I", Value::Int(900)),
+            Some(i900)
+        );
+        // Still bounded: 1001 is outside the configured high and the store is
+        // sized to the bound, so this is a miss rather than an index panic.
+        assert_eq!(canonical_wrapper_if_cached(vm, "I", Value::Int(1001)), None);
+        assert_eq!(
+            canonical_wrapper_if_cached(vm, "I", Value::Int(i32::MAX)),
+            None
         );
     }
 

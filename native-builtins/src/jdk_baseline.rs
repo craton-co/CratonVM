@@ -29,6 +29,37 @@
 //! | 3 | `expect_registered: false`, **is** registered | `CLOSED` |
 //! | 4 | a triage row naming a member this JDK does not declare | `STALE` |
 //!
+//! # Two questions, two populations (format version 2, F23-1)
+//!
+//! Version 1 of the baselines emitted a member only if it was `public` or
+//! `protected`. That is structurally blind to package-private and private
+//! members — **the access level most JDK natives live at** — so auditing a
+//! *native* registrar against it audited the one population the oracle omits.
+//! It cost a false positive and a false negative on the first class anybody
+//! pointed `javap -p` at (`jdk.internal.misc.CDS`): a real `private static
+//! native logLambdaFormInvoker(String)` read as off-surface, and two real,
+//! unregistered natives (`getCDSConfigStatus()I`,
+//! `needsClassInitBarrier0(Class)Z`) could not be reported at all. Across the
+//! 32 baselines the filter hid **528 of 1908 rows — 27.7% of the surface**.
+//!
+//! Version 2 emits everything. That makes "does this member exist" and "is this
+//! member public" two different questions, and **this module answers them from
+//! two different populations on purpose**:
+//!
+//! | question | accessor | used by |
+//! |---|---|---|
+//! | is this a real, dispatchable member? | [`Baseline::declares`], [`Baseline::declared_surface`] | [`audit`] kind 4, [`audit_off_surface`] kind 5 |
+//! | must every member of this have a row? | [`Baseline::public_surface`] | [`audit`] kind 1 (`UNCOVERED`) |
+//!
+//! **The `UNCOVERED` denominator was deliberately NOT widened.** Widening it
+//! would demand a triage row for each of those 528 members before any converted
+//! guard could go green — a different and much larger job than the one this
+//! change is. The cost of not widening it is stated plainly so nobody reads
+//! silence as coverage: **[`audit`] still cannot report a missing *private*
+//! native.** [`Baseline::native_surface`] is the opt-in for guards that want
+//! exactly that population — 8 methods on `CDS`, 5 on `java.lang.Module`, not
+//! 528 members.
+//!
 //! # Never hand-edit a baseline
 //!
 //! `scripts/baselines/README.md`'s rule applies verbatim: every row is written
@@ -44,7 +75,7 @@ use std::collections::BTreeSet;
 // adding a class is one `include_str!` plus one `ALL` row and nothing else.
 // Regenerate with `python scripts/jdk-baseline/generate.py --update`.
 //
-// All thirty checked-in baselines are wired in, not just the ones a guard
+// All 32 checked-in baselines are wired in, not just the ones a guard
 // reads today: `every_checked_in_baseline_is_wired_in_and_parses` is a
 // two-way source witness over this list, and it can only be two-way if the
 // list is meant to be complete. A baseline nobody includes is a file that can
@@ -108,6 +139,22 @@ pub(crate) const STRUCTURED_TASK_SCOPE_SUBTASK: &str = include_str!(
 );
 pub(crate) const SUBMISSION_PUBLISHER: &str =
     include_str!("../../scripts/baselines/jdk25-java.util.concurrent.SubmissionPublisher.tsv");
+/// `sun.management.ManagementFactoryHelper` — the declared owner of
+/// `cds.rs`'s `getCDSMetrics()Lsun/management/CDSMetrics;`. It declares 22
+/// public methods and **`getCDSMetrics` is not one of them**; see
+/// `management_factory_helper_does_not_declare_get_cds_metrics`.
+pub(crate) const SUN_MANAGEMENT_FACTORY_HELPER: &str =
+    include_str!("../../scripts/baselines/jdk25-sun.management.ManagementFactoryHelper.tsv");
+/// `sun.reflect.ReflectionFactory` (module `jdk.unsupported`) — the twin of
+/// [`REFLECTION_FACTORY`], and the class two of the four triples in
+/// `lib.rs::essential_path_does_not_override_reflection_factory_serialization`
+/// name. The two types are **not** the same surface: this one has 14 public
+/// methods to the `jdk.internal` type's 25, and its
+/// `newOptionalDataExceptionForSerialization` takes a `Z` and returns an
+/// `OptionalDataException` where the `jdk.internal` one takes nothing and
+/// returns a `Constructor`.
+pub(crate) const SUN_REFLECTION_FACTORY: &str =
+    include_str!("../../scripts/baselines/jdk25-sun.reflect.ReflectionFactory.tsv");
 pub(crate) const SYNCHRONOUS_QUEUE: &str =
     include_str!("../../scripts/baselines/jdk25-java.util.concurrent.SynchronousQueue.tsv");
 
@@ -192,10 +239,23 @@ pub(crate) const ALL: &[(&str, &str)] = &[
         REFLECTION_FACTORY,
     ),
     ("jdk25-module-java.base.tsv", MODULE_JAVA_BASE),
+    (
+        "jdk25-sun.management.ManagementFactoryHelper.tsv",
+        SUN_MANAGEMENT_FACTORY_HELPER,
+    ),
+    (
+        "jdk25-sun.reflect.ReflectionFactory.tsv",
+        SUN_REFLECTION_FACTORY,
+    ),
 ];
 
 /// The `# jdk-baseline` format version this parser understands.
-const FORMAT_VERSION: &str = "1";
+///
+/// `2` (F23-1) is the all-access population. A version-1 file carries only
+/// public and protected members, and this parser must refuse it rather than
+/// answer [`Baseline::declares`] from a set narrower than the caller expects —
+/// which is exactly the silent narrowing that produced the CDS false positive.
+const FORMAT_VERSION: &str = "2";
 
 /// The `java.version` prefix these baselines were taken on.
 ///
@@ -239,13 +299,23 @@ pub(crate) struct Row {
     /// one. Empty where the kind has neither.
     pub descriptor: &'static str,
     /// Comma-separated, in the generator's fixed order:
-    /// `public,protected,static,final,abstract,interface,native,synchronized,bridge,synthetic`.
+    /// `public,protected,private,static,final,synchronized,bridge,varargs,native,abstract,strictfp,synthetic`.
+    ///
+    /// Package-private members carry **no** access token at all, which is why
+    /// [`Row::is_public`] is a positive test and there is no `is_package_private`
+    /// written as `!is_private()`.
     pub flags: &'static str,
 }
 
 impl Row {
     pub(crate) fn has_flag(&self, f: &str) -> bool {
         self.flags.split(',').any(|x| x == f)
+    }
+
+    /// `true` only for `ACC_PUBLIC`. Protected, private and package-private all
+    /// answer `false`.
+    pub(crate) fn is_public(&self) -> bool {
+        self.has_flag("public")
     }
 }
 
@@ -284,6 +354,11 @@ pub(crate) struct Baseline {
 /// * `# rows` must equal the number of rows found.
 /// * `# public-methods` (class) must equal a recount of the public,
 ///   non-`<init>`/`<clinit>` `METHOD` rows.
+/// * `# declared-methods` (class, v2) must equal a recount of **all** non-
+///   `<clinit>` `METHOD` rows, at every access level. This is the count that
+///   would have caught the version-1 defect: a generator that reverted to the
+///   public filter still reproduces `# public-methods` exactly.
+/// * `# declared-fields` (class, v2) must equal a recount of the `FIELD` rows.
 /// * `# unqualified-exports` (module) must equal a recount of the unqualified
 ///   `EXPORTS` rows.
 /// * every row must have exactly four fields and a kind legal for its
@@ -295,6 +370,8 @@ pub(crate) fn parse(text: &'static str) -> Baseline {
     let mut format = "";
     let mut columns = "";
     let mut declared_public_methods: Option<usize> = None;
+    let mut declared_all_methods: Option<usize> = None;
+    let mut declared_all_fields: Option<usize> = None;
     let mut declared_unqualified_exports: Option<usize> = None;
     let mut declared_rows: Option<usize> = None;
     let mut rows: Vec<Row> = Vec::new();
@@ -317,6 +394,8 @@ pub(crate) fn parse(text: &'static str) -> Baseline {
                 "java.version" => java_version = v,
                 "columns" => columns = v,
                 "public-methods" => declared_public_methods = v.parse().ok(),
+                "declared-methods" => declared_all_methods = v.parse().ok(),
+                "declared-fields" => declared_all_fields = v.parse().ok(),
                 "unqualified-exports" => declared_unqualified_exports = v.parse().ok(),
                 "rows" => declared_rows = v.parse().ok(),
                 _ => {}
@@ -399,14 +478,49 @@ pub(crate) fn parse(text: &'static str) -> Baseline {
         rows,
     };
     match kind {
-        "class" => assert_eq!(
-            Some(b.public_methods().len()),
-            declared_public_methods,
-            "{class}: the file's own `# public-methods` header says \
-             {declared_public_methods:?} and a recount of its rows says {}. Two programs \
-             counting the same file must agree; one of them is wrong.",
-            b.public_methods().len()
-        ),
+        "class" => {
+            assert_eq!(
+                Some(b.public_methods().len()),
+                declared_public_methods,
+                "{class}: the file's own `# public-methods` header says \
+                 {declared_public_methods:?} and a recount of its rows says {}. Two programs \
+                 counting the same file must agree; one of them is wrong.",
+                b.public_methods().len()
+            );
+            // The v2 counts. These are the ones that notice a generator quietly
+            // reverting to the public/protected filter: `# public-methods` is
+            // identical either way, so it cannot.
+            let all_methods = b
+                .rows
+                .iter()
+                .filter(|r| r.kind == "METHOD" && r.name != "<clinit>")
+                .count();
+            assert_eq!(
+                Some(all_methods),
+                declared_all_methods,
+                "{class}: the file's own `# declared-methods` header says \
+                 {declared_all_methods:?} and a recount of its rows says {all_methods}. A \
+                 MISSING header here means a format-version-1 file — one that lists only \
+                 public and protected members — reached a parser that answers \
+                 `declares()` as though it were the whole class."
+            );
+            let all_fields = b.rows.iter().filter(|r| r.kind == "FIELD").count();
+            assert_eq!(
+                Some(all_fields),
+                declared_all_fields,
+                "{class}: the file's own `# declared-fields` header says \
+                 {declared_all_fields:?} and a recount of its rows says {all_fields}."
+            );
+            // NO per-file "this baseline must contain a non-public member"
+            // assertion, and the reason is measured rather than assumed: nine of
+            // the 32 baselines legitimately have none. `Flow$Publisher`,
+            // `BlockingQueue`, `RuntimeMXBean`, `SSLSession` and the four
+            // `StructuredTaskScope` types are interfaces whose every member is
+            // implicitly public, and `module-java.base` has no members at all.
+            // A per-file floor would have been red on all nine. The corpus-level
+            // floor that DOES bite lives in
+            // `the_widened_population_is_present_and_is_not_a_rounding_error`.
+        }
         "module" => assert_eq!(
             Some(b.unqualified_exports().len()),
             declared_unqualified_exports,
@@ -452,12 +566,68 @@ impl Baseline {
             .collect()
     }
 
+    /// Every method this class declares **at any access level**, except
+    /// `<clinit>` — the population a native registration can legitimately be
+    /// keyed on, because a private native is dispatched from the JDK's own
+    /// bytecode exactly like a public one.
+    ///
+    /// This is [`audit_off_surface`]'s reachability test, and it is the half of
+    /// the version-2 widening that changes a verdict: under version 1 a
+    /// registration on `CDS.logLambdaFormInvoker(Ljava/lang/String;)V` — a real
+    /// `private static native` — was reported `OFF-SURFACE`, and acting on that
+    /// report would have deleted the only registration for the one overload
+    /// that has no bytecode to fall back to.
+    ///
+    /// `<clinit>` is excluded because nothing can register a native for it: it
+    /// is invoked by the VM, never named by a `NativeRegistry` key a caller
+    /// could produce.
+    pub(crate) fn declared_surface(&self) -> Vec<(&'static str, &'static str)> {
+        self.rows
+            .iter()
+            .filter(|r| r.kind == "METHOD" && r.name != "<clinit>")
+            .map(|r| (r.name, r.descriptor))
+            .collect()
+    }
+
+    /// Every `native` method this class declares, at any access level.
+    ///
+    /// **This is the population a native registrar should be censused against**,
+    /// and version 1 could not express it: 5 of `CDS`'s 8 natives and all 5 of
+    /// `java.lang.Module`'s are private, so a public-only baseline reported 3 and
+    /// 0. It is deliberately much smaller than [`Self::declared_surface`] — 13
+    /// methods across all 32 baselines — so a guard can be two-way over it
+    /// without anybody first writing 538 triage rows.
+    pub(crate) fn native_surface(&self) -> Vec<(&'static str, &'static str)> {
+        self.rows
+            .iter()
+            .filter(|r| r.kind == "METHOD" && r.has_flag("native"))
+            .map(|r| (r.name, r.descriptor))
+            .collect()
+    }
+
     /// Whether this class declares a method with exactly this name and
     /// descriptor, at any access level.
+    ///
+    /// The doc said "at any access level" under version 1 too, and it was not
+    /// true: the file it read had no private or package-private rows in it. The
+    /// sentence is now backed by the data.
     pub(crate) fn declares(&self, name: &str, descriptor: &str) -> bool {
         self.rows
             .iter()
             .any(|r| r.kind == "METHOD" && r.name == name && r.descriptor == descriptor)
+    }
+
+    /// The flags of the method with exactly this name and descriptor, e.g.
+    /// `private,static,native`. `None` if the class does not declare it.
+    ///
+    /// Exists so a diagnostic can say *why* a member is not on the public
+    /// surface instead of implying it does not exist — the distinction F17-1
+    /// had to make by hand with `javap -p`.
+    pub(crate) fn flags_of(&self, name: &str, descriptor: &str) -> Option<&'static str> {
+        self.rows
+            .iter()
+            .find(|r| r.kind == "METHOD" && r.name == name && r.descriptor == descriptor)
+            .map(|r| r.flags)
     }
 
     /// Every descriptor this class declares under `name`, at any access level.
@@ -566,9 +736,28 @@ pub(crate) fn audit(
             ));
             continue;
         }
-        // Kind 4 — the row rotted. Three sub-cases, because they need three
-        // different repairs and a single message would hide which one applies.
-        if !jdk.contains(&(name, descriptor)) {
+        // Kind 4 — the row rotted.
+        //
+        // F23-1 changed BOTH the test and the order of its sub-cases, and the
+        // order is the part that was a bug:
+        //
+        //  * The test is now "does this JDK declare this exact member at ANY
+        //    access level", not "is it public". A triage row naming a real
+        //    private native describes a real dispatch target, and demanding its
+        //    deletion would be the CDS false positive with a different message
+        //    on it. Non-public rows fall through to the expect/registered check
+        //    below, which is where they belong.
+        //  * The exact-match test now runs FIRST. It used to be second, behind
+        //    `descriptors_named(name).is_empty()`, so a private member with a
+        //    public overload of the same name got "the name is right and the
+        //    descriptor is not" — a confident, specific and wrong diagnosis
+        //    pointing at the overload. That is `CDS.logLambdaFormInvoker`
+        //    exactly: one private 1-String native, one public 4-String wrapper.
+        //
+        // What did NOT change is `jdk`, the kind-1 denominator: it is still the
+        // PUBLIC surface. See the module doc — widening it would demand a row
+        // for each of 538 non-public members before any guard could go green.
+        if !jdk.contains(&(name, descriptor)) && !baseline.declares(name, descriptor) {
             let others = baseline.descriptors_named(name);
             problems.push(if !others.is_empty() {
                 format!(
@@ -579,20 +768,13 @@ pub(crate) fn audit(
                     baseline.java_version,
                     others.join(" / ")
                 )
-            } else if baseline.declares(name, descriptor) {
-                format!(
-                    "STALE row (not public): {class}.{name}{descriptor} is declared but is \
-                     not public on java.version {}, so it is not part of the surface this \
-                     census covers.",
-                    baseline.java_version
-                )
             } else {
                 format!(
-                    "STALE row: {class}.{name}{descriptor} is not a public member of that \
-                     class on java.version {}. Delete the row — a triage row for a member \
-                     the JDK does not have can never be satisfied and can never be \
-                     noticed. If you meant a member inherited from {}, baseline the type \
-                     that declares it; `javap -public` on a leaf class never lists one.",
+                    "STALE row: {class}.{name}{descriptor} is not a member of that class \
+                     at any access level on java.version {}. Delete the row — a triage row \
+                     for a member the JDK does not have can never be satisfied and can \
+                     never be noticed. If you meant a member inherited from {}, baseline \
+                     the type that declares it; a leaf class's member list never shows one.",
                     baseline.java_version,
                     if baseline.supertypes().is_empty() {
                         "a supertype".to_string()
@@ -637,6 +819,174 @@ pub(crate) fn audit(
                  is the direction that made every guard in E25 §3 a restatement: a \
                  population transcribed from the registrar cannot contain a method the \
                  registrar never had."
+            ));
+        }
+    }
+
+    problems.sort();
+    problems
+}
+
+/// One row of the off-surface record: `(name, descriptor, reason)`.
+///
+/// A registration this VM makes on the class whose `(name, descriptor)` the
+/// JDK does **not** declare as a public member. See [`audit_off_surface`].
+pub(crate) type OffSurface = (&'static str, &'static str, &'static str);
+
+/// The fifth check: **the registry's own rows, audited against the JDK.**
+///
+/// # Why [`audit`] cannot do this
+///
+/// [`audit`] walks two populations — the triage rows and the JDK surface. A
+/// registration that is in *neither* is invisible to all four of its kinds:
+/// kind 4 fires only when somebody wrote a row for it, and the whole premise
+/// of E25 is that nobody writes rows for things they are not already thinking
+/// about. So `audit` catches a fabricated name in a *hand list* and misses the
+/// same fabricated name in the *registrar* — which is the copy that is loaded
+/// into a running VM.
+///
+/// This closes it from the other end. `registrations` is every `(name,
+/// descriptor)` the registry holds for the class (from
+/// `NativeMethodRegistry::dump_registrations`, filtered to that class);
+/// `expected` is the recorded, justified set of registrations that are
+/// deliberately off the public surface. Both directions fail:
+///
+/// | # | condition | name in the output |
+/// |---|---|---|
+/// | 5 | a registration the JDK does not declare **at any access level**, with no row | `OFF-SURFACE` |
+/// | 6 | an `expected` row nothing registers any more | `DEAD OFF-SURFACE row` |
+/// | 7a | an `expected` row the JDK declares **publicly** | `STALE OFF-SURFACE row (public)` |
+/// | 7b | an `expected` row the JDK declares **non-publicly** | `STALE OFF-SURFACE row (declared, not public)` |
+///
+/// Kinds 6 and 7 are the same standing-permission shape as [`audit`]'s kind 3:
+/// a record that says "we knowingly register something the JDK does not have"
+/// must stop saying it the moment either half stops being true.
+///
+/// # What F23-1 changed, and why it is a narrowing of kind 5
+///
+/// Kind 5 used to fire for any registration outside the *public* surface. It
+/// therefore fired on every native keyed on a private JDK method — which is
+/// where most JDK natives are. Five of `jdk.internal.misc.CDS`'s eight natives
+/// are `private static native`, and every one of them was reported as a
+/// fabrication by a version-1 baseline.
+///
+/// Kind 7b is the price of that narrowing, paid deliberately: an exemption
+/// written while the oracle was blind must now announce itself, because the row
+/// says "the JDK does not have this" about something the JDK has.
+///
+/// Off-surface is not automatically a defect. Three of its shapes are routine
+/// in this tree and each needs a different `reason`:
+///
+/// * **a synthetic `<init>()V`** on a class whose real constructor is absent
+///   (an interface). A *private* or *protected* real constructor is no longer
+///   off-surface at all — it is on the declared surface, and this is one of the
+///   places the version-1 blindness fired most often.
+/// * **an inherited member** — a leaf class's own member table never lists one,
+///   so `getObjectName` on `RuntimeMXBean` is declared by
+///   `PlatformManagedObject` and is genuinely reachable. Baseline the declaring
+///   type and the row moves onto the surface.
+/// * **a name this JDK does not have anywhere**, which is the `$Config` shape
+///   and is always a defect: no real call can produce that key.
+///
+/// The reason field is what tells the next reader which of the three this is,
+/// and the ratchet is what stops the answer from silently going out of date.
+pub(crate) fn audit_off_surface(
+    baseline: &Baseline,
+    registrations: &[(&str, &str)],
+    expected: &[OffSurface],
+) -> Vec<String> {
+    assert_eq!(
+        baseline.kind, "class",
+        "audit_off_surface() takes a `# kind class` baseline; {} is a `{}` baseline.",
+        baseline.class, baseline.kind
+    );
+    let class = baseline.class;
+    // F23-1: the reachability test is the DECLARED surface, not the public one.
+    // A native registered on a private JDK method is dispatched by the JDK's own
+    // bytecode exactly like a public one — `CDS.<clinit>` calls
+    // `getCDSConfigStatus()I`, which is `private static native`. Testing against
+    // `public_surface()` here reported five real, reachable CDS natives as
+    // fabrications; three of them survived only because the lane acting on the
+    // report re-measured with `javap -p` first.
+    let surface: BTreeSet<(&str, &str)> = baseline.declared_surface().into_iter().collect();
+    let public: BTreeSet<(&str, &str)> = baseline.public_surface().into_iter().collect();
+    let recorded: BTreeSet<(&str, &str)> = expected.iter().map(|&(n, d, _)| (n, d)).collect();
+    assert_eq!(
+        recorded.len(),
+        expected.len(),
+        "{class}: the off-surface record has a duplicate row; one of the two is unread."
+    );
+    let live: BTreeSet<(&str, &str)> = registrations.iter().copied().collect();
+
+    let mut problems: Vec<String> = Vec::new();
+
+    // Kind 5 — this VM registers it, the JDK does not declare it, nobody said so.
+    for &(name, descriptor) in &live {
+        if surface.contains(&(name, descriptor)) || recorded.contains(&(name, descriptor)) {
+            continue;
+        }
+        let others = baseline.descriptors_named(name);
+        problems.push(if !others.is_empty() {
+            format!(
+                "OFF-SURFACE (descriptor): this VM registers {class}.{name}{descriptor}, but \
+                 java.version {} declares `{name}` only as {}. A native keyed on this triple \
+                 can never be found by a real call. Fix the descriptor, or record it here \
+                 with a reason.",
+                baseline.java_version,
+                others.join(" / ")
+            )
+        } else {
+            format!(
+                "OFF-SURFACE: this VM registers {class}.{name}{descriptor} and java.version \
+                 {} does not declare it AT ANY ACCESS LEVEL. If it is inherited \
+                 from {}, baseline the declaring type; if it is a synthetic <init>, say so; \
+                 if the JDK has no such name at all, the registration is unreachable and \
+                 must go. Every case needs a row here, not silence.",
+                baseline.java_version,
+                if baseline.supertypes().is_empty() {
+                    "a supertype".to_string()
+                } else {
+                    baseline.supertypes().join(", ")
+                }
+            )
+        });
+    }
+
+    // Kinds 6 and 7 — the record outlived what it records.
+    for &(name, descriptor, reason) in expected {
+        if reason.trim().is_empty() {
+            problems.push(format!(
+                "UNJUSTIFIED OFF-SURFACE: {class}.{name}{descriptor} is recorded as a \
+                 deliberate off-surface registration with no reason. Say which of the three \
+                 shapes it is."
+            ));
+        }
+        if !live.contains(&(name, descriptor)) {
+            problems.push(format!(
+                "DEAD OFF-SURFACE row: {class}.{name}{descriptor} is recorded here \
+                 (\"{reason}\") and nothing registers it any more. Delete the row — an \
+                 exemption that outlives its exception is standing permission for the next \
+                 one."
+            ));
+        }
+        // Kind 7 has two arms since F23-1, and they need opposite repairs.
+        if public.contains(&(name, descriptor)) {
+            problems.push(format!(
+                "STALE OFF-SURFACE row (public): {class}.{name}{descriptor} IS a public \
+                 member on java.version {} (\"{reason}\"). Move it into the TRIAGE table, \
+                 where the four-kind ratchet covers it.",
+                baseline.java_version
+            ));
+        } else if surface.contains(&(name, descriptor)) {
+            problems.push(format!(
+                "STALE OFF-SURFACE row (declared, not public): {class}.{name}{descriptor} \
+                 IS declared by java.version {} as `{}` (\"{reason}\"). It is a real \
+                 dispatch target, so the registration needs no exemption — DELETE THE ROW, \
+                 do not delete the registration. This is the shape a format-version-1 \
+                 baseline could not see: it listed only public and protected members, so \
+                 every private native read as a fabrication.",
+                baseline.java_version,
+                baseline.flags_of(name, descriptor).unwrap_or("")
             ));
         }
     }
@@ -711,9 +1061,12 @@ mod tests {
             .collect();
 
         // Anti-vacuity: an empty or near-empty listing must not read as
-        // agreement. Thirty were checked in on 2026-08-13.
+        // agreement. Thirty were checked in on 2026-08-13 (E32/E37); E41 added
+        // `sun.reflect.ReflectionFactory` and
+        // `sun.management.ManagementFactoryHelper`, the second class rows 22
+        // and 3 each register on.
         assert!(
-            on_disk.len() >= 30,
+            on_disk.len() >= 32,
             "found only {} jdk25-*.tsv in {} — this census is measuring its own reach, not \
              the baselines. `[reach≠defect]`",
             on_disk.len(),
@@ -748,10 +1101,90 @@ mod tests {
             assert!(!b.class.is_empty(), "{name}: parsed to an empty class name");
             total_rows += b.rows.len();
         }
+        // F23-1: this floor was `> 1_000` against a corpus of 1380 rows, and the
+        // widening took the corpus to 1908 — so the old floor is now cleared by
+        // 900 rows and could not notice a third of the corpus vanishing. A floor
+        // a widened baseline trivially clears is not a floor. Re-derived from the
+        // measured total with the same ~30% headroom the original had, which is
+        // enough to absorb a JDK point release and not enough to absorb the
+        // version-1 filter coming back (that would take it to 1380 — RED).
         assert!(
-            total_rows > 1_000,
-            "the thirty baselines parsed to only {total_rows} rows in total; a truncated \
-             include would look exactly like this."
+            total_rows >= 1_800,
+            "the 32 baselines parsed to only {total_rows} rows in total; 1908 were measured \
+             on openjdk 25.0.3+9. A truncated include looks exactly like this, and so does \
+             a generator that reverted to the format-version-1 public/protected filter \
+             (1380). See `the_widened_population_is_present_and_is_not_a_rounding_error` \
+             for the floor that names the population directly."
+        );
+    }
+
+    /// **The anti-vacuity floor that a widened baseline does NOT trivially
+    /// clear**, and the measure of how much of the surface the version-1
+    /// instrument was not looking at.
+    ///
+    /// `every_checked_in_baseline_is_wired_in_and_parses` counts rows, and a
+    /// row count is exactly the kind of number that drifts upward until it
+    /// stops meaning anything. This one counts the population version 1 could
+    /// not emit, so a version-1 corpus scores **10** against a floor of 500 —
+    /// red by a factor of fifty, no matter how many rows the files have.
+    ///
+    /// Measured on openjdk 25.0.3+9. The v1 column is `git show HEAD:` over the
+    /// 30 tracked baselines (the other two were written the same day by the same
+    /// version-1 generator):
+    ///
+    /// | | v1 | v2 |
+    /// |---|---|---|
+    /// | rows | 1380 | 1908 |
+    /// | member rows (METHOD+FIELD) | 779 | 1307 |
+    /// | non-public member rows | **10** | **538** |
+    /// | ...of which `protected` | 10 | 10 |
+    /// | **...of which private or package-private** | **0** | **528** |
+    /// | **native methods visible** | **3** | **13** |
+    ///
+    /// Version 1 kept `ACC_PROTECTED` as well as `ACC_PUBLIC`, which is why the
+    /// v1 figure is 10 and not 0 — and why "non-public" is the wrong word for
+    /// what it hid. What it hid was every private and package-private member:
+    /// 528 rows, **27.7% of the surface**, and 10 of the 13 `native` methods.
+    /// That last number is the one that matters for a native registrar: the
+    /// version-1 baselines could see 3 of the JDK natives on the classes they
+    /// baseline.
+    #[test]
+    fn the_widened_population_is_present_and_is_not_a_rounding_error() {
+        let mut member_rows = 0usize;
+        let mut non_public = 0usize;
+        let mut natives = 0usize;
+        for &(_, text) in ALL {
+            let b = parse(text);
+            for r in &b.rows {
+                if r.kind == "METHOD" || r.kind == "FIELD" {
+                    member_rows += 1;
+                    if !r.is_public() {
+                        non_public += 1;
+                    }
+                }
+                if r.kind == "METHOD" && r.has_flag("native") {
+                    natives += 1;
+                }
+            }
+        }
+        assert!(
+            member_rows >= 1_250,
+            "only {member_rows} member rows across the 32 baselines; 1307 measured."
+        );
+        assert!(
+            non_public >= 500,
+            "only {non_public} of {member_rows} member rows are non-public. 538 were \
+             measured, and a format-version-1 corpus scores 10 — every one of them \
+             `protected`, because that filter kept ACC_PROTECTED and hid only the private \
+             and package-private members. This assertion cannot be satisfied by a baseline \
+             set that still carries that filter, however many rows it has. `[gate=FR]`"
+        );
+        assert!(
+            natives >= 13,
+            "only {natives} `native` methods visible across the 32 baselines; 13 measured, \
+             of which 10 are non-public. A public-only corpus sees 3. Auditing a NATIVE \
+             registrar against a surface that omits 10 of 13 natives is the defect F23-1 \
+             fixed."
         );
     }
 
@@ -780,6 +1213,20 @@ mod tests {
         // The denominator E32-4's rewrite is built on, pinned here so it cannot
         // move silently: 17 public methods + 3 public constructors.
         assert_eq!(parse(SUBMISSION_PUBLISHER).public_surface().len(), 20);
+
+        // F23-1: the same three counts taken with the OTHER instrument.
+        // `javap -public` is what produced the version-1 defect, so a KAT built
+        // only on it agrees with a generator that drops every private member —
+        // and did, for 32 files. These are `javap -p <class> | grep -c '('` on
+        // the same JDK, same day (`generate.py::KNOWN_ANSWERS_ALL_ACCESS`).
+        assert_eq!(parse(MAC).declared_surface().len(), 22);
+        assert_eq!(parse(CHARACTER).declared_surface().len(), 104);
+        assert_eq!(
+            parse(CDS).declared_surface().len(),
+            28,
+            "13 members is what `javap -public jdk.internal.misc.CDS` prints, and 13 is what \
+             every guard on this class saw until F23-1."
+        );
     }
 
     /// The JDK-version pin, and the E25 §5 step 4 residual it closes.
@@ -841,6 +1288,128 @@ mod tests {
         );
         parse_must_reject("truncating the file to its header", header_only);
         parse_must_reject("an include_str! that resolved to nothing", "");
+    }
+
+    /// **The planted bypass for F23-1 itself: a version-1 file must not be read
+    /// as though it were a whole class.**
+    ///
+    /// Two mutants, because they are two different accidents:
+    ///
+    /// 1. the version marker says `1`. A checkout that predates this change has
+    ///    32 of these, and every one of them answers `declares()` from a
+    ///    public-and-protected-only set.
+    /// 2. the version marker says `2` and the *content* is version 1 — a
+    ///    generator whose filter came back, with headers rewritten to match its
+    ///    own truncated output. This is the one a version check alone cannot
+    ///    catch, and it is why `# declared-methods` exists.
+    #[test]
+    fn a_version_one_baseline_is_refused_in_both_of_its_shapes() {
+        let old_marker = leak(CDS.replace("# jdk-baseline\t2", "# jdk-baseline\t1"));
+        let msg = parse_must_reject("a format-version-1 marker", old_marker);
+        assert!(msg.contains("format version"), "wrong diagnosis: {msg}");
+
+        // Mutant 2. Drop every non-public METHOD row — which is what the
+        // version-1 generator did — and rewrite `# rows` and `# declared-methods`
+        // the way that generator would have, so the only header left disagreeing
+        // is the one this change added. `# public-methods` is untouched and
+        // correct in BOTH files, which is the whole point: it cannot notice.
+        let kept: Vec<&str> = CDS
+            .lines()
+            .filter(|l| {
+                !l.starts_with("METHOD\t")
+                    || l.split('\t').nth(3).is_some_and(|f| {
+                        f.split(',').any(|x| x == "public" || x == "protected")
+                    })
+            })
+            .collect();
+        let dropped = CDS.lines().count() - kept.len();
+        assert!(
+            dropped >= 15,
+            "the mutant must actually remove the private members it is standing in for; it \
+             removed {dropped}"
+        );
+        let rows = kept
+            .iter()
+            .filter(|l| !l.starts_with("# ") && !l.is_empty())
+            .count();
+        let refiltered = leak(
+            kept.iter()
+                .map(|l| {
+                    if l.starts_with("# rows\t") {
+                        format!("# rows\t{rows}")
+                    } else {
+                        (*l).to_string()
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("\n"),
+        );
+        let msg = parse_must_reject(
+            "a generator that reverted to the public-only filter",
+            refiltered,
+        );
+        assert!(
+            msg.contains("`# declared-methods` header"),
+            "the `# rows` and `# public-methods` headers were rewritten to be self-consistent, \
+             exactly as a reverted generator would write them, so `# declared-methods` is the \
+             only check that can fire — and it must: {msg}"
+        );
+    }
+
+    /// The mutation check the widening needs in the other direction: a member
+    /// that is **known present and known private** must be found by
+    /// `declares`/`declared_surface` and must NOT be found by `public_surface`.
+    ///
+    /// Without this the widening could be a no-op — `declares` would keep
+    /// answering `false` for every private member and every guard would stay
+    /// green while staying wrong, which is the state the tree was in.
+    #[test]
+    fn a_known_private_member_is_visible_and_a_known_absent_one_is_not() {
+        let b = parse(CDS);
+        let public: BTreeSet<_> = b.public_surface().into_iter().collect();
+        let declared: BTreeSet<_> = b.declared_surface().into_iter().collect();
+
+        // Present, private, native. `javap -p jdk.internal.misc.CDS`:
+        //   private static native int getCDSConfigStatus();
+        //   private static native void logLambdaFormInvoker(java.lang.String);
+        //   private static native boolean needsClassInitBarrier0(java.lang.Class<?>);
+        //   private static native void dumpClassList(java.lang.String);
+        //   private static native void dumpDynamicArchive(java.lang.String);
+        for (n, d) in [
+            ("getCDSConfigStatus", "()I"),
+            ("logLambdaFormInvoker", "(Ljava/lang/String;)V"),
+            ("needsClassInitBarrier0", "(Ljava/lang/Class;)Z"),
+            ("dumpClassList", "(Ljava/lang/String;)V"),
+            ("dumpDynamicArchive", "(Ljava/lang/String;)V"),
+        ] {
+            assert!(b.declares(n, d), "{n}{d} is a real member of JDK 25's CDS");
+            assert!(declared.contains(&(n, d)), "{n}{d} must be on the declared surface");
+            assert!(
+                !public.contains(&(n, d)),
+                "{n}{d} is private; it must NOT be on the public surface. If it is, the two \
+                 populations have been collapsed into one and `audit`'s UNCOVERED denominator \
+                 just grew by 538 members."
+            );
+            assert_eq!(b.flags_of(n, d), Some("private,static,native"));
+        }
+
+        // Absent at every access level. These are the two `cds.rs` really did
+        // register on names JDK 25 does not have, and F17-1 really did remove.
+        for (n, d) in [("isDumpingClassList", "()Z"), ("isSharingEnabled", "()Z")] {
+            assert!(
+                !b.declares(n, d) && b.descriptors_named(n).is_empty(),
+                "{n}{d} is not a CDS member at ANY access level on 25.0.3+9 — the widening \
+                 must not turn a real absence into a false present"
+            );
+        }
+
+        // And the population that matters for a native registrar.
+        assert_eq!(
+            b.native_surface().len(),
+            8,
+            "CDS declares 8 natives; a public-only baseline showed 3 of them: {:?}",
+            b.native_surface()
+        );
     }
 
     #[test]
@@ -1049,6 +1618,502 @@ mod tests {
             3,
             "and the three real members are covered by nothing: {problems:#?}"
         );
+    }
+
+    // --- the fifth check: the registry's own rows, audited against the JDK ---
+
+    /// Kind 5, on synthetic input, with the planted bypass in both directions.
+    #[test]
+    fn off_surface_catches_a_registration_the_jdk_does_not_declare() {
+        let b = parse(MAC);
+        // `getInstanceStrong` is a `SecureRandom` method, not a `Mac` one.
+        let problems = audit_off_surface(
+            &b,
+            &[
+                ("reset", "()V"),
+                ("getInstanceStrong", "()Ljavax/crypto/Mac;"),
+            ],
+            &[],
+        );
+        assert_eq!(problems.len(), 1, "{problems:#?}");
+        assert!(
+            problems[0]
+                .contains("OFF-SURFACE: this VM registers javax.crypto.Mac.getInstanceStrong"),
+            "{problems:#?}"
+        );
+        // Recorded with a reason, the same input is silent — and that is the
+        // whole point of the reason field.
+        assert!(audit_off_surface(
+            &b,
+            &[
+                ("reset", "()V"),
+                ("getInstanceStrong", "()Ljavax/crypto/Mac;")
+            ],
+            &[(
+                "getInstanceStrong",
+                "()Ljavax/crypto/Mac;",
+                "deliberate, for this test"
+            )],
+        )
+        .is_empty());
+    }
+
+    /// The sharper sub-case: right name, wrong descriptor. This is the one
+    /// that reads as a plain absence if you only ever grep for the name.
+    #[test]
+    fn off_surface_reports_a_wrong_descriptor_as_a_wrong_descriptor() {
+        let b = parse(MAC);
+        let problems = audit_off_surface(&b, &[("reset", "(I)V")], &[]);
+        assert_eq!(problems.len(), 1, "{problems:#?}");
+        assert!(
+            problems[0]
+                .contains("OFF-SURFACE (descriptor): this VM registers javax.crypto.Mac.reset(I)V"),
+            "{problems:#?}"
+        );
+        assert!(problems[0].contains("()V"), "{problems:#?}");
+    }
+
+    /// Kinds 6 and 7 — the record outliving what it records. These are the two
+    /// that get omitted, and they are the reason this is a ratchet and not a
+    /// filter.
+    #[test]
+    fn an_off_surface_row_that_rotted_is_refused_in_both_directions() {
+        let b = parse(MAC);
+        // Kind 6: nothing registers it any more.
+        let dead = audit_off_surface(&b, &[], &[("gone", "()V", "was registered once")]);
+        assert!(
+            dead.iter().any(|p| p.starts_with("DEAD OFF-SURFACE row")),
+            "{dead:#?}"
+        );
+        // Kind 7: the JDK declares it publicly, so it belongs in TRIAGE.
+        let stale = audit_off_surface(
+            &b,
+            &[("reset", "()V")],
+            &[("reset", "()V", "believed not a JDK member")],
+        );
+        assert!(
+            stale.iter().any(|p| p.starts_with("STALE OFF-SURFACE row")),
+            "{stale:#?}"
+        );
+        // An unexplained exemption is an omission wearing a record's clothes.
+        let mute = audit_off_surface(&b, &[("gone", "()V")], &[("gone", "()V", "  ")]);
+        assert!(
+            mute.iter()
+                .any(|p| p.starts_with("UNJUSTIFIED OFF-SURFACE")),
+            "{mute:#?}"
+        );
+    }
+
+    // --- live re-enactments: real registrations, real baselines -------------
+    //
+    // Each of these takes the (class, name, descriptor) triples verbatim out
+    // of a registrar in this crate and audits them against the checked-in
+    // baseline for the class they are registered on. They are re-enactments,
+    // not guards on those files: they prove the mechanism against real data
+    // and they do NOT make the originating test red. Converting the guards is
+    // E25 rows 3, 4-6 and 16, delivered as nominations in
+    // docs/known-issues/jdk-only/E41-R11-TWELVE-GUARDS-CONVERTED-20260813.md.
+
+    /// **Rows 4-6.** `shared_secrets_bridge.rs`'s `FACTORIES` is 15 rows and
+    /// `all_factories_listed` asserts `FACTORIES.len() == 15` — a const against
+    /// a literal copied out of that const. Two of those fifteen name a method
+    /// `jdk.internal.access.SharedSecrets` does not have on JDK 25:
+    ///
+    /// * `getJavaSecurityAccess` — `JavaSecurityAccess` and its accessor went
+    ///   with the Security Manager (JEP 486). There is no such getter; the
+    ///   three `getJavaSecurity*Access` methods that DO exist are
+    ///   `Properties`, `Signature` and `Spec`.
+    /// * `getJavaUtilJarAccess` — the real spelling has never had the `get`
+    ///   prefix. `javaUtilJarAccess()` is the method; `getJavaUtilJarAccess`
+    ///   is a name this tree invented.
+    ///
+    /// Both are registered on `jdk/internal/access/SharedSecrets` **and** on
+    /// the legacy `jdk/internal/misc/SharedSecrets` alias, so four
+    /// registrations are keyed on names no real call can produce, and
+    /// `every_factory_returns_access_interface` cannot say so because its
+    /// whole test is `starts_with("getJava")` — which both of them pass.
+    #[test]
+    fn kind_four_catches_two_of_the_fifteen_shared_secrets_factories() {
+        let b = parse(SHARED_SECRETS);
+        assert_eq!(b.internal_name(), "jdk/internal/access/SharedSecrets");
+        assert_eq!(
+            b.public_surface().len(),
+            65,
+            "64 public methods + the public no-arg constructor. E25 rows 4-6 quote `15 of 30` \
+             for the `getJava*Access` getters alone; the class a native registrar can key on \
+             is 65 members wide."
+        );
+
+        // Verbatim from shared_secrets_bridge.rs:61 `FACTORIES`, as
+        // `register_factories` keys them: `(method, "()" + ret_desc)`.
+        #[rustfmt::skip]
+        const AS_THE_TREE_HAS_THEM: &[Triage] = &[
+            ("getJavaLangAccess", "()Ljdk/internal/access/JavaLangAccess;", true, ""),
+            ("getJavaLangInvokeAccess", "()Ljdk/internal/access/JavaLangInvokeAccess;", true, ""),
+            ("getJavaLangRefAccess", "()Ljdk/internal/access/JavaLangRefAccess;", true, ""),
+            ("getJavaLangReflectAccess", "()Ljdk/internal/access/JavaLangReflectAccess;", true, ""),
+            ("getJavaIOAccess", "()Ljdk/internal/access/JavaIOAccess;", true, ""),
+            ("getJavaIORandomAccessFileAccess", "()Ljdk/internal/access/JavaIORandomAccessFileAccess;", true, ""),
+            ("getJavaIOFileDescriptorAccess", "()Ljdk/internal/access/JavaIOFileDescriptorAccess;", true, ""),
+            ("getJavaNetInetAddressAccess", "()Ljdk/internal/access/JavaNetInetAddressAccess;", true, ""),
+            ("getJavaNetUriAccess", "()Ljdk/internal/access/JavaNetUriAccess;", true, ""),
+            ("getJavaNioAccess", "()Ljdk/internal/access/JavaNioAccess;", true, ""),
+            ("getJavaSecurityAccess", "()Ljdk/internal/access/JavaSecurityAccess;", true, ""),
+            ("getJavaUtilJarAccess", "()Ljdk/internal/access/JavaUtilJarAccess;", true, ""),
+            ("getJavaUtilZipFileAccess", "()Ljdk/internal/access/JavaUtilZipFileAccess;", true, ""),
+            ("getJavaNetHttpCookieAccess", "()Ljdk/internal/access/JavaNetHttpCookieAccess;", true, ""),
+            ("getJavaUtilResourceBundleAccess", "()Ljdk/internal/access/JavaUtilResourceBundleAccess;", true, ""),
+        ];
+
+        let problems = audit(&b, AS_THE_TREE_HAS_THEM, |_, _| true);
+        let stale: Vec<&String> = problems.iter().filter(|p| p.starts_with("STALE")).collect();
+        assert_eq!(
+            stale.len(),
+            2,
+            "exactly two FACTORIES rows name a member JDK 25's SharedSecrets does not \
+             declare: {problems:#?}"
+        );
+        assert!(
+            stale.iter().any(|p| p.contains("getJavaSecurityAccess")),
+            "{stale:#?}"
+        );
+        assert!(
+            stale.iter().any(|p| p.contains("getJavaUtilJarAccess")),
+            "{stale:#?}"
+        );
+        // And the real spelling is right there in the same baseline, uncovered.
+        assert!(
+            b.declares(
+                "javaUtilJarAccess",
+                "()Ljdk/internal/access/JavaUtilJarAccess;"
+            ),
+            "the JDK's own spelling carries no `get` prefix"
+        );
+        assert!(
+            !b.declares(
+                "getJavaSecurityAccess",
+                "()Ljdk/internal/access/JavaSecurityAccess;"
+            ),
+            "JEP 486 took JavaSecurityAccess out; nothing declares this getter"
+        );
+    }
+
+    /// **Row 3, and the retraction.** This test used to be called
+    /// `kind_four_catches_five_of_the_ten_cds_registrations` and asserted
+    /// `stale.len() == 5`. **Three of those five were artifacts of the
+    /// version-1 baseline**, and the report they justified came within one
+    /// commit of deleting three real, reachable natives.
+    ///
+    /// The ten triples below are `cds.rs::register_cds_natives` as E41/F8 found
+    /// it. Audited against the format-version-2 baseline:
+    ///
+    /// | registered | v1 verdict | v2 verdict — measured with `javap -p` |
+    /// |---|---|---|
+    /// | `isDumpingClassList()Z` | STALE | **STALE.** No such name at any access level |
+    /// | `isSharingEnabled()Z` | STALE | **STALE.** No such name; `isUsingArchive()Z` is the JDK-true spelling |
+    /// | `logLambdaFormInvoker(Ljava/lang/String;)V` | STALE (descriptor) | **REAL.** `private static native`, and the public 4-String overload's whole body is `logLambdaFormInvoker(prefix+" "+holder+…)` — CDS.java:142-146 |
+    /// | `dumpClassList(Ljava/lang/String;)V` | STALE | **REAL.** `private static native` |
+    /// | `dumpDynamicArchive(Ljava/lang/String;)V` | STALE | **REAL.** `private static native` |
+    ///
+    /// The `logLambdaFormInvoker` row is the one that shows why the sub-case
+    /// ORDER in `audit` mattered: the JDK declares that name twice, once
+    /// privately with one parameter and once publicly with four, so the
+    /// version-1 code path found the public overload and produced *"the name is
+    /// right and the descriptor is not"* — a specific, confident, wrong
+    /// instruction to change the registration to a body that drops three
+    /// arguments and to drop the only form with no bytecode fallback.
+    ///
+    /// Two of five survive. `[triage=stale]`.
+    #[test]
+    fn kind_four_catches_two_of_the_ten_cds_registrations_not_five() {
+        let b = parse(CDS);
+        assert_eq!(b.internal_name(), "jdk/internal/misc/CDS");
+
+        // Verbatim from cds.rs::register_cds_natives as of E41/F8, BEFORE
+        // F17-1 edited it. Kept in that shape on purpose: this test is the
+        // re-enactment of the wrong verdict, not a guard on today's file.
+        #[rustfmt::skip]
+        const AS_F8_FOUND_THEM: &[Triage] = &[
+            ("<init>", "()V", true, ""),
+            ("isDumpingClassList", "()Z", true, ""),
+            ("isDumpingArchive", "()Z", true, ""),
+            ("isSharingEnabled", "()Z", true, ""),
+            ("initializeFromArchive", "(Ljava/lang/Class;)V", true, ""),
+            ("getRandomSeedForDumping", "()J", true, ""),
+            ("logLambdaFormInvoker", "(Ljava/lang/String;)V", true, ""),
+            ("defineArchivedModules", "(Ljava/lang/ClassLoader;Ljava/lang/ClassLoader;)V", true, ""),
+            ("dumpClassList", "(Ljava/lang/String;)V", true, ""),
+            ("dumpDynamicArchive", "(Ljava/lang/String;)V", true, ""),
+        ];
+
+        let problems = audit(&b, AS_F8_FOUND_THEM, |_, _| true);
+        let stale: Vec<&String> = problems.iter().filter(|p| p.starts_with("STALE")).collect();
+        assert_eq!(
+            stale.len(),
+            2,
+            "two of the ten name something JDK 25 does not have, not five: {problems:#?}"
+        );
+        assert!(stale.iter().any(|p| p.contains("isDumpingClassList")));
+        assert!(stale.iter().any(|p| p.contains("isSharingEnabled")));
+        assert_eq!(
+            stale
+                .iter()
+                .filter(|p| p.starts_with("STALE row (descriptor)"))
+                .count(),
+            0,
+            "the single `STALE row (descriptor)` the version-1 run produced was \
+             `logLambdaFormInvoker`, and it was wrong: {stale:#?}"
+        );
+
+        // The three retractions, stated as data rather than as prose.
+        for (n, d) in [
+            ("logLambdaFormInvoker", "(Ljava/lang/String;)V"),
+            ("dumpClassList", "(Ljava/lang/String;)V"),
+            ("dumpDynamicArchive", "(Ljava/lang/String;)V"),
+        ] {
+            assert_eq!(
+                b.flags_of(n, d),
+                Some("private,static,native"),
+                "{n}{d} was reported off-surface and is a real native"
+            );
+        }
+        assert!(
+            b.declares("isDumpingStaticArchive", "()Z") && b.declares("isUsingArchive", "()Z"),
+            "the two methods the tree's `isDumpingClassList`/`isSharingEnabled` were probably \
+             meant to be are both right here in the same baseline"
+        );
+        // Kind 1 is unchanged by the widening, and that is the design: 13 public
+        // members, 5 of them covered by a row above, 8 uncovered. Widening this
+        // denominator to the declared surface would have made it 23.
+        assert_eq!(
+            problems
+                .iter()
+                .filter(|p| p.starts_with("UNCOVERED"))
+                .count(),
+            8
+        );
+    }
+
+    /// The other half of the retraction: `cds.rs` **as F17-1 left it** is
+    /// entirely on JDK 25's declared surface — eleven registrations, zero
+    /// off-surface — and the version-1 oracle would have called five of them
+    /// fabrications.
+    ///
+    /// This is the test that would have prevented the near-miss, and it is
+    /// mutation-checked in both directions below: a real private member must
+    /// pass, and a name the JDK does not have must not.
+    #[test]
+    fn f23_1_every_cds_registration_is_on_the_jdk25_declared_surface() {
+        let b = parse(CDS);
+
+        // Verbatim from cds.rs::register_cds_natives in the working tree.
+        #[rustfmt::skip]
+        const AS_THE_TREE_HAS_THEM: &[(&str, &str)] = &[
+            ("<init>", "()V"),
+            ("isDumpingArchive", "()Z"),
+            ("isUsingArchive", "()Z"),
+            ("getCDSConfigStatus", "()I"),
+            ("needsClassInitBarrier0", "(Ljava/lang/Class;)Z"),
+            ("initializeFromArchive", "(Ljava/lang/Class;)V"),
+            ("getRandomSeedForDumping", "()J"),
+            ("logLambdaFormInvoker", "(Ljava/lang/String;)V"),
+            ("defineArchivedModules", "(Ljava/lang/ClassLoader;Ljava/lang/ClassLoader;)V"),
+            ("dumpClassList", "(Ljava/lang/String;)V"),
+            ("dumpDynamicArchive", "(Ljava/lang/String;)V"),
+        ];
+
+        assert!(
+            audit_off_surface(&b, AS_THE_TREE_HAS_THEM, &[]).is_empty(),
+            "{:#?}",
+            audit_off_surface(&b, AS_THE_TREE_HAS_THEM, &[])
+        );
+
+        // Mutation, direction 1 — plant a name JDK 25 does not have. If this
+        // does not fire, the widening turned the check into a rubber stamp.
+        let planted = {
+            let mut v = AS_THE_TREE_HAS_THEM.to_vec();
+            v.push(("isDumpingClassList", "()Z"));
+            v
+        };
+        let problems = audit_off_surface(&b, &planted, &[]);
+        assert_eq!(problems.len(), 1, "{problems:#?}");
+        assert!(
+            problems[0].contains("isDumpingClassList") && problems[0].contains("ANY ACCESS LEVEL"),
+            "{problems:#?}"
+        );
+
+        // Mutation, direction 2 — five of the eleven are non-public, so under
+        // the version-1 rule (public surface as the reachability test) this same
+        // input produced five OFF-SURFACE reports. Recomputed here from the
+        // public surface directly, because that is the number the deleted-
+        // registration proposal was built on.
+        let public: BTreeSet<_> = b.public_surface().into_iter().collect();
+        let would_have_been_reported: Vec<_> = AS_THE_TREE_HAS_THEM
+            .iter()
+            .filter(|k| !public.contains(&(k.0, k.1)))
+            .collect();
+        assert_eq!(
+            would_have_been_reported.len(),
+            5,
+            "the version-1 rule reports five real natives as fabrications: {would_have_been_reported:#?}"
+        );
+    }
+
+    /// Kind 7b — an off-surface exemption written while the oracle was blind.
+    ///
+    /// Every such row in the tree is now a lie in the safe direction ("we
+    /// knowingly register something the JDK does not have", about something the
+    /// JDK has), and the repair is the opposite of what the message for kind 7a
+    /// asks for: delete the ROW, keep the registration.
+    #[test]
+    fn kind_seven_b_an_exemption_written_against_a_blind_oracle_is_refused() {
+        let b = parse(CDS);
+        let problems = audit_off_surface(
+            &b,
+            &[("logLambdaFormInvoker", "(Ljava/lang/String;)V")],
+            &[(
+                "logLambdaFormInvoker",
+                "(Ljava/lang/String;)V",
+                "the JDK declares a four-String overload under this name",
+            )],
+        );
+        let hit = problems
+            .iter()
+            .find(|p| p.starts_with("STALE OFF-SURFACE row (declared, not public)"))
+            .unwrap_or_else(|| panic!("{problems:#?}"));
+        assert!(
+            hit.contains("private,static,native") && hit.contains("DELETE THE ROW"),
+            "the message must quote the access level and say which of the two things to \
+             delete: {hit}"
+        );
+    }
+
+    /// **Row 3, the other class.** `register_cds_natives` also registers six
+    /// natives on `sun/management/CDSMetrics` and a seventh,
+    /// `ManagementFactoryHelper.getCDSMetrics()Lsun/management/CDSMetrics;`,
+    /// that returns one.
+    ///
+    /// `sun.management.CDSMetrics` **is not in the JDK 25 runtime image** — a
+    /// `jrt:/` walk finds no such class file, which is the same refusal the
+    /// generator gave for `StructuredTaskScope$Config`. So there is no
+    /// baseline to convert that half of row 3 against, and there never will
+    /// be; the missing file is the finding.
+    ///
+    /// What CAN be checked is the owner, and it says the same thing from the
+    /// other side: `sun.management.ManagementFactoryHelper` is in the image,
+    /// declares 22 public methods, and `getCDSMetrics` is not among them. A
+    /// native registered under a name its own owner class does not declare is
+    /// a native no bytecode can reach.
+    #[test]
+    fn management_factory_helper_does_not_declare_get_cds_metrics() {
+        let b = parse(SUN_MANAGEMENT_FACTORY_HELPER);
+        assert_eq!(b.internal_name(), "sun/management/ManagementFactoryHelper");
+        assert_eq!(b.public_methods().len(), 22);
+        let problems = audit_off_surface(
+            &b,
+            &[("getCDSMetrics", "()Lsun/management/CDSMetrics;")],
+            &[],
+        );
+        assert_eq!(problems.len(), 1, "{problems:#?}");
+        assert!(
+            problems[0].contains("registers sun.management.ManagementFactoryHelper.getCDSMetrics"),
+            "{problems:#?}"
+        );
+        assert!(
+            !b.declares("getCDSMetrics", "()Lsun/management/CDSMetrics;"),
+            "not at any access level either — this is not a visibility question"
+        );
+    }
+
+    /// **Row 16, the half that is not `$Config`.**
+    /// `kind_four_would_have_caught_structured_task_scope_config` covers the
+    /// fabricated nested type. This covers the outer class, which is real, and
+    /// which the tree also gets wrong in four places at once — three names JDK
+    /// 25 does not declare and one that is declared with a different return
+    /// type:
+    ///
+    /// * `isShutdown()Z` — JEP 505 shipped `isCancelled()Z`.
+    /// * `shutdown()V` — gone; cancellation is the joiner's business now.
+    /// * `joinUntil(Ljava/time/Instant;)…` — gone; a deadline is a
+    ///   `Configuration.withTimeout`.
+    /// * `join()` — declared, but it returns `Ljava/lang/Object;`, not
+    ///   `Ljava/util/concurrent/StructuredTaskScope;`. The preview API returned
+    ///   the scope for chaining; the final one returns the joiner's result.
+    ///
+    /// `s52_total_registration_count` asserts none of these: its fourteen
+    /// triples are seven `$Joiner`, six `$Config` and exactly one on the outer
+    /// class (`open(Joiner)`), so every row above is outside its population.
+    #[test]
+    fn kind_four_catches_the_outer_structured_task_scope_surface() {
+        let b = parse(STRUCTURED_TASK_SCOPE);
+        assert_eq!(
+            b.internal_name(),
+            "java/util/concurrent/StructuredTaskScope"
+        );
+
+        // Verbatim from jdk25_concurrency.rs's registrations on CLS_TASK_SCOPE.
+        #[rustfmt::skip]
+        const AS_THE_TREE_HAS_THEM: &[Triage] = &[
+            ("close", "()V", true, ""),
+            ("fork", "(Ljava/util/concurrent/Callable;)Ljava/util/concurrent/StructuredTaskScope$Subtask;", true, ""),
+            ("isShutdown", "()Z", true, ""),
+            ("join", "()Ljava/util/concurrent/StructuredTaskScope;", true, ""),
+            ("joinUntil", "(Ljava/time/Instant;)Ljava/util/concurrent/StructuredTaskScope;", true, ""),
+            ("open", "()Ljava/util/concurrent/StructuredTaskScope;", true, ""),
+            ("open", "(Ljava/util/concurrent/StructuredTaskScope$Joiner;)Ljava/util/concurrent/StructuredTaskScope;", true, ""),
+            ("shutdown", "()V", true, ""),
+        ];
+
+        let problems = audit(&b, AS_THE_TREE_HAS_THEM, |_, _| true);
+        let stale: Vec<&String> = problems.iter().filter(|p| p.starts_with("STALE")).collect();
+        assert_eq!(stale.len(), 4, "{problems:#?}");
+        assert!(
+            stale
+                .iter()
+                .any(|p| p.starts_with("STALE row (descriptor)") && p.contains(".join()")),
+            "`join` exists under a different return type, which is the diagnosis that says \
+             `fix the descriptor` rather than `delete the row`: {stale:#?}"
+        );
+        // The three the JDK declares and this VM registers nothing for.
+        assert!(b.declares("isCancelled", "()Z"));
+        assert!(b.declares("join", "()Ljava/lang/Object;"));
+        assert!(b.declares(
+            "fork",
+            "(Ljava/lang/Runnable;)Ljava/util/concurrent/StructuredTaskScope$Subtask;"
+        ));
+    }
+
+    /// The two `ReflectionFactory` types are not one surface, and row 22's
+    /// guard names triples on both.
+    #[test]
+    fn the_two_reflection_factories_are_different_classes() {
+        let internal = parse(REFLECTION_FACTORY);
+        let unsupported = parse(SUN_REFLECTION_FACTORY);
+        assert_eq!(internal.public_surface().len(), 25);
+        assert_eq!(unsupported.public_surface().len(), 14);
+        // Same name, different descriptor, on the two types — a guard that
+        // reads one baseline for both would report a false STALE.
+        assert!(internal.declares(
+            "newOptionalDataExceptionForSerialization",
+            "()Ljava/lang/reflect/Constructor;"
+        ));
+        assert!(unsupported.declares(
+            "newOptionalDataExceptionForSerialization",
+            "(Z)Ljava/io/OptionalDataException;"
+        ));
+        // `getConstantPool` is registered on the jdk.internal type by
+        // `register_essential_natives_with_shims` (lib.rs) and is not a member
+        // of either. It is `SharedSecrets.getJavaLangAccess().getConstantPool`.
+        for b in [&internal, &unsupported] {
+            assert!(
+                !b.declares(
+                    "getConstantPool",
+                    "(Ljava/lang/Class;)Ljdk/internal/reflect/ConstantPool;"
+                ),
+                "{} declares getConstantPool",
+                b.class
+            );
+        }
     }
 
     /// The module accessors, and the internal/binary spelling trap E32 §5

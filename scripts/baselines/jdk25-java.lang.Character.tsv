@@ -1,4 +1,4 @@
-# jdk-baseline	1
+# jdk-baseline	2
 # kind	class
 # name	java.lang.Character
 # module	java.base
@@ -10,7 +10,9 @@
 # regenerate	python scripts/jdk-baseline/generate.py --update
 # public-methods	96
 # protected-methods	0
-# rows	176
+# declared-methods	104
+# declared-fields	74
+# rows	188
 # columns	kind	name	descriptor	flags
 CLASS	java.lang.Character		public,final
 EXTENDS	java.lang.Object		
@@ -21,17 +23,21 @@ SUPERTYPE	java.io.Serializable
 SUPERTYPE	java.lang.Comparable		
 SUPERTYPE	java.lang.Object		
 SUPERTYPE	java.lang.constant.Constable		
+METHOD	<clinit>	()V	static
 METHOD	<init>	(C)V	public
 METHOD	charCount	(I)I	public,static
 METHOD	charValue	()C	public
 METHOD	codePointAt	(Ljava/lang/CharSequence;I)I	public,static
 METHOD	codePointAt	([CI)I	public,static
 METHOD	codePointAt	([CII)I	public,static
+METHOD	codePointAtImpl	([CII)I	static
 METHOD	codePointBefore	(Ljava/lang/CharSequence;I)I	public,static
 METHOD	codePointBefore	([CI)I	public,static
 METHOD	codePointBefore	([CII)I	public,static
+METHOD	codePointBeforeImpl	([CII)I	static
 METHOD	codePointCount	(Ljava/lang/CharSequence;II)I	public,static
 METHOD	codePointCount	([CII)I	public,static
+METHOD	codePointCountImpl	([CII)I	static
 METHOD	codePointOf	(Ljava/lang/String;)I	public,static
 METHOD	compare	(CC)I	public,static
 METHOD	compareTo	(Ljava/lang/Character;)I	public
@@ -104,6 +110,7 @@ METHOD	isWhitespace	(I)Z	public,static
 METHOD	lowSurrogate	(I)C	public,static
 METHOD	offsetByCodePoints	(Ljava/lang/CharSequence;II)I	public,static
 METHOD	offsetByCodePoints	([CIIII)I	public,static
+METHOD	offsetByCodePointsImpl	([CIIII)I	static
 METHOD	reverseBytes	(C)C	public,static
 METHOD	toChars	(I)[C	public,static
 METHOD	toChars	(I[CI)I	public,static
@@ -113,11 +120,15 @@ METHOD	toLowerCase	(I)I	public,static
 METHOD	toString	()Ljava/lang/String;	public
 METHOD	toString	(C)Ljava/lang/String;	public,static
 METHOD	toString	(I)Ljava/lang/String;	public,static
+METHOD	toSurrogates	(I[CI)V	static
 METHOD	toTitleCase	(C)C	public,static
 METHOD	toTitleCase	(I)I	public,static
 METHOD	toUpperCase	(C)C	public,static
 METHOD	toUpperCase	(I)I	public,static
+METHOD	toUpperCaseCharArray	(I)[C	static
+METHOD	toUpperCaseEx	(I)I	static
 METHOD	valueOf	(C)Ljava/lang/Character;	public,static
+FIELD	$assertionsDisabled	Z	static,final,synthetic
 FIELD	BYTES	I	public,static,final
 FIELD	COMBINING_SPACING_MARK	B	public,static,final
 FIELD	CONNECTOR_PUNCTUATION	B	public,static,final
@@ -151,6 +162,7 @@ FIELD	DIRECTIONALITY_UNDEFINED	B	public,static,final
 FIELD	DIRECTIONALITY_WHITESPACE	B	public,static,final
 FIELD	ENCLOSING_MARK	B	public,static,final
 FIELD	END_PUNCTUATION	B	public,static,final
+FIELD	ERROR	I	static,final
 FIELD	FINAL_QUOTE_PUNCTUATION	B	public,static,final
 FIELD	FORMAT	B	public,static,final
 FIELD	INITIAL_QUOTE_PUNCTUATION	B	public,static,final
@@ -188,3 +200,5 @@ FIELD	TITLECASE_LETTER	B	public,static,final
 FIELD	TYPE	Ljava/lang/Class;	public,static,final
 FIELD	UNASSIGNED	B	public,static,final
 FIELD	UPPERCASE_LETTER	B	public,static,final
+FIELD	serialVersionUID	J	private,static,final
+FIELD	value	C	private,final

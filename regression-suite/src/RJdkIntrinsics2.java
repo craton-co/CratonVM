@@ -1,6 +1,7 @@
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.CharBuffer;
+import java.nio.IntBuffer;
 import java.util.Arrays;
 import java.util.Base64;
 import java.util.HexFormat;
@@ -1375,7 +1376,12 @@ public class RJdkIntrinsics2 {
                 "parseHex(seq, 2, 6) must be the half-open CHARACTER range, two bytes");
         check(Arrays.equals(f.parseHex("x00ff0a80".toCharArray(), 1, 5),
                         new byte[] { 0, (byte) 0xff }),
-                "the char[] overload must honour its own offset/length");
+                "the char[] overload's (fromIndex, toIndex) must be a half-open RANGE — the"
+                        + " class javadoc calls them offset/length (HexFormat.java:79) and the"
+                        + " SIGNATURE (:577) does not. Read as offset/length, (1, 5) is the"
+                        + " five characters \"00ff0\", an ODD length that throws; read as a"
+                        + " range it is \"00ff\" = {0, 0xff}. Both measured on jdk-25.0.3+9."
+                        + " F2-1 NOMINATION 3");
         check(Arrays.equals(HexFormat.ofDelimiter(":").parseHex("00:ff:0a:80"), hb),
                 "a CONFIGURED formatter's parseHex must consume its own delimiter");
         check(Arrays.equals(HexFormat.ofDelimiter(", ").withPrefix("0x").withSuffix("!")
@@ -1542,7 +1548,48 @@ public class RJdkIntrinsics2 {
                         + " that fabricates a fresh receiver per factory call fails here and"
                         + " nowhere else, which is exactly how the Base64 factories failed");
 
-        sectionEnd("hex", 73);
+        // F2-1 NOMINATION 3, second and third halves. APPENDED at the end of
+        // the family ON PURPOSE: F2's prediction table is keyed by check number
+        // (it stops at 32 of 73 and names 32-49, 54-57, 69, 73), and inserting
+        // these beside the other parseHex rows would have renumbered every one
+        // of them. These are checks 74-77; every number in that table still
+        // means what it meant. The denominator moves 73 -> 77.
+        //
+        // The DEFECT F2-1 §1.1 found has no row anywhere in this file: every
+        // parseHex row above passes a `String`, and the native's reader is
+        // class-guarded to real java.lang.String, so a non-String CharSequence
+        // read back EMPTY and parseHex answered a zero-length array. Silent —
+        // no exception, no wrong byte, just nothing. The JDK's own ranged
+        // bytecode manufactures exactly such an operand (HexFormat.java:577-582
+        // wraps the char[] in a CharBuffer and calls the one-argument form), so
+        // the whole ranged family rode on a reader no row ever exercised.
+        check(Arrays.equals(f.parseHex(new StringBuilder("00ff0a80")), hb),
+                "parseHex(CharSequence) must read a NON-String CharSequence — the parameter"
+                        + " is CharSequence, and a reader that only understands java.lang.String"
+                        + " answers an EMPTY array here rather than throwing; measured [0, -1,"
+                        + " 10, -128] on jdk-25.0.3+9");
+        check(Arrays.equals(f.parseHex(CharBuffer.wrap("x00ff0a80y", 1, 9)), hb),
+                "and a CharBuffer specifically — this is the operand the JDK's own"
+                        + " parseHex(char[], int, int) builds internally, so this row is what"
+                        + " stands between the ranged overloads and a silent empty answer;"
+                        + " its length() is the REMAINING count, 8");
+        h = null;
+        try {
+            sink = f.parseHex("x00ff0a80".toCharArray(), OPAQUE_I[6], OPAQUE_I[4]).length;
+        } catch (Throwable x) {
+            h = x;
+        }
+        check("java.lang.IndexOutOfBoundsException".equals(nameOf(h)),
+                "parseHex(char[], 3, 1) — a REVERSED range — must throw"
+                        + " IndexOutOfBoundsException, not return an empty array and not"
+                        + " underflow a length computation; got " + nameOf(h));
+        check("Range [3, 1) out of bounds for length 9".equals(h.getMessage()),
+                "and the message counts the WHOLE operand (length 9), not the slice — where"
+                        + " the odd-length IllegalArgumentException one family up counts the"
+                        + " SLICE (\"string length not even: 3\"). Two bounds messages, two"
+                        + " different denominators; got " + h.getMessage());
+
+        sectionEnd("hex", 77);
     }
 
     // -----------------------------------------------------------------------
@@ -3023,6 +3070,103 @@ public class RJdkIntrinsics2 {
                         + " new AtomicReferenceArray(-1) is NegativeArraySizeException above;"
                         + " got " + nameOf(t));
 
+        // GAP 3b: the THIRD accessible-array state — ARRAY-BACKED but
+        // READ-ONLY. The two cells above are (read-only AND array-less) and
+        // (writable AND array-backed); nothing in this file has ever asked what
+        // happens when a buffer HAS an array it is not allowed to hand out.
+        //
+        // hasArray() is (hb != null) && !isReadOnly, and array()/arrayOffset()
+        // are the SAME three-way split in the SAME order — hb first:
+        //
+        //     if (hb == null)  throw new UnsupportedOperationException();
+        //     if (isReadOnly)  throw new ReadOnlyBufferException();
+        //
+        // (JDK 25 java.base/java/nio/CharBuffer.java L1490/L1513/L1541, and the
+        // byte-identical ByteBuffer bodies at the same three line numbers.)
+        // This is the cell where CratonVM's ByteBuffer natives classified
+        // storage only and handed a MUTABLE ALIAS to the backing array out, to
+        // a caller that had followed the documented hasArray() -> array()
+        // protocol and been told true. A wrong CAPABILITY, not a wrong value,
+        // and this fixture passed regardless.
+        //
+        // Every row below compares the EXACT class name, never instanceof:
+        // ReadOnlyBufferException EXTENDS UnsupportedOperationException (JDK 25
+        // java.base/java/nio/ReadOnlyBufferException.java:40), so an
+        // instanceof-shaped assertion absorbs a swap in one direction and only
+        // nameOf() can discriminate.
+        CharBuffer roArr = CharBuffer.allocate(OPAQUE_I[6] + 1).asReadOnlyBuffer();
+        check(roArr.isReadOnly(),
+                "allocate(4).asReadOnlyBuffer() must be READ-ONLY — the premise of the next"
+                        + " three rows, and the row that fails if asReadOnlyBuffer() hands"
+                        + " the receiver back instead of a read-only view");
+        check(!roArr.hasArray(),
+                "a read-only ARRAY-BACKED buffer must report hasArray() == false — an"
+                        + " implementation that only classifies storage as heap-or-direct"
+                        + " answers true here and steers the caller straight into array()");
+        step("bounds", "CharBuffer.allocate(4).asReadOnlyBuffer().array()");
+        t = null;
+        try {
+            sink = roArr.array().length;
+        } catch (Throwable x) {
+            t = x;
+        }
+        check("java.nio.ReadOnlyBufferException".equals(nameOf(t)),
+                "array() on a read-only ARRAY-BACKED buffer must throw"
+                        + " ReadOnlyBufferException — NOT UnsupportedOperation, which is the"
+                        + " array-LESS answer, and above all not the array itself; got "
+                        + nameOf(t));
+        step("bounds", "CharBuffer.allocate(4).asReadOnlyBuffer().arrayOffset()");
+        t = null;
+        try {
+            sink = roArr.arrayOffset();
+        } catch (Throwable x) {
+            t = x;
+        }
+        check("java.nio.ReadOnlyBufferException".equals(nameOf(t)),
+                "arrayOffset() repeats array()'s split exactly — a read-only receiver must"
+                        + " throw ReadOnlyBufferException, not answer a plain offset that is"
+                        + " indistinguishable from a legitimate one; got " + nameOf(t));
+
+        // ...and the FOURTH cell, which is what proves the split is NOT
+        // "read-only versus not": a typed VIEW over a writable ByteBuffer is
+        // itself WRITABLE and still has no accessible array, so it answers
+        // UnsupportedOperation.
+        IntBuffer vw = ByteBuffer.allocate(OPAQUE_I[11]).asIntBuffer();
+        check(!vw.isReadOnly(),
+                "asIntBuffer() over a WRITABLE ByteBuffer is itself writable — the premise"
+                        + " that makes the next three rows a statement about hb rather than"
+                        + " about read-only");
+        check(!vw.hasArray(),
+                "and it still reports hasArray() == false: a view buffer's hb is null");
+        step("bounds", "ByteBuffer.allocate(16).asIntBuffer().array()");
+        t = null;
+        try {
+            sink = vw.array().length;
+        } catch (Throwable x) {
+            t = x;
+        }
+        check("java.lang.UnsupportedOperationException".equals(nameOf(t)),
+                "array() on a WRITABLE array-less view must throw UnsupportedOperation —"
+                        + " not ReadOnlyBuffer, and not a null array whose .length surfaces"
+                        + " as a NullPointerException at some unrelated site; got "
+                        + nameOf(t));
+        check(t.getMessage() == null,
+                "and HotSpot's is new UnsupportedOperationException() — the NO-ARGUMENT"
+                        + " constructor, so getMessage() is null. A detail message is"
+                        + " invisible to every catch and to every class-name row above, so"
+                        + " this is the only assertion in the file that can see one; got "
+                        + t.getMessage());
+        step("bounds", "ByteBuffer.allocate(16).asIntBuffer().arrayOffset()");
+        t = null;
+        try {
+            sink = vw.arrayOffset();
+        } catch (Throwable x) {
+            t = x;
+        }
+        check("java.lang.UnsupportedOperationException".equals(nameOf(t)),
+                "arrayOffset() on the same writable view must throw UnsupportedOperation"
+                        + " too — the identical split; got " + nameOf(t));
+
         // GAP 4: position / limit / slice — the state a buffer carries, and the
         // exception class that is NOT IndexOutOfBounds.
         CharBuffer win = CharBuffer.wrap("abcdef", OPAQUE_I[4], OPAQUE_I[6]);
@@ -3178,7 +3322,144 @@ public class RJdkIntrinsics2 {
                 "putChar into a read-only ByteBuffer must throw ReadOnlyBufferException, got "
                         + nameOf(t));
 
-        sectionEnd("bounds", 93);
+        // GAP 3c: READ-ONLY IS CONTAGIOUS. GAP 3b asks what a read-only buffer
+        // answers; nothing has ever asked what a buffer DERIVED from one
+        // answers. MEASURED on jdk-25.0.3+9, all seven families, identical:
+        // duplicate()/slice()/slice(int,int) INHERIT isReadOnly and
+        // asReadOnlyBuffer() sets it unconditionally, so there is no
+        // composition of buffer operations that returns to writable.
+        //
+        // This is where the wrong CAPABILITY GAP 3b closes re-opens ONE CALL
+        // LATER: a duplicate that lost the flag answers hasArray() == true and
+        // hands out the SAME backing array the read-only buffer wraps, so every
+        // write through it corrupts a read-only buffer with no exception.
+        //
+        // APPENDED at the end of the family ON PURPOSE, exactly as the `hex`
+        // family's F2-1 rows were: this file has a prediction table keyed by
+        // check NUMBER, and inserting beside the GAP 3b rows would renumber
+        // every row after them. These are checks 103-121 of `bounds`.
+        //
+        // Every row compares an EXACT class name. ReadOnlyBufferException
+        // EXTENDS UnsupportedOperationException, so instanceof discriminates in
+        // one direction only.
+        CharBuffer roDup = roArr.duplicate();
+        check(roDup.isReadOnly(),
+                "duplicate() of a read-only buffer is read-only — rcb.duplicate()"
+                        + " is a java.nio.HeapCharBufferR. An implementation that copies"
+                        + " pos/lim/cap and writes nothing to isReadOnly answers false here");
+        check(!roDup.hasArray(),
+                "and therefore reports hasArray() == false — this is the row that"
+                        + " stops the caller being steered into array() a second time");
+        step("bounds", "CharBuffer.allocate(4).asReadOnlyBuffer().duplicate().array()");
+        t = null;
+        try {
+            sink = roDup.array().length;
+        } catch (Throwable x) {
+            t = x;
+        }
+        check("java.nio.ReadOnlyBufferException".equals(nameOf(t)),
+                "array() on the duplicate of a read-only buffer must throw"
+                        + " ReadOnlyBufferException; a duplicate that lost the flag returns"
+                        + " the array and this row sees no throwable at all; got " + nameOf(t));
+        check(roArr.slice().isReadOnly(),
+                "slice() is contagious too — rcb.slice() is a HeapCharBufferR");
+        check(roArr.slice(0, 2).isReadOnly(),
+                "and so is the absolute-indexed slice(int,int) overload, which is a"
+                        + " SEPARATE registration and can be fixed independently");
+        check(roDup.asReadOnlyBuffer().isReadOnly(),
+                "asReadOnlyBuffer() is ONE-WAY: nothing in java.nio clears the flag,"
+                        + " there is no asWritableBuffer, and a read-only buffer's own"
+                        + " asReadOnlyBuffer() stays read-only");
+        CharBuffer wArr = CharBuffer.allocate(OPAQUE_I[6] + 1);
+        check(!wArr.duplicate().isReadOnly(),
+                "and it is NOT contagious upward — hcb.duplicate().isReadOnly() is"
+                        + " false. An implementation that stamped every derived view"
+                        + " read-only passes every row above and fails this one");
+        check(wArr.duplicate().hasArray(),
+                "a writable duplicate keeps its accessible array");
+
+        ByteBuffer roBb = ByteBuffer.allocate(OPAQUE_I[11]).asReadOnlyBuffer();
+        check(roBb.duplicate().isReadOnly(),
+                "the ByteBuffer half of the same contract — rbb.duplicate() is a"
+                        + " java.nio.HeapByteBufferR. This is the family whose natives"
+                        + " share the source's backing array, so the mutable alias here"
+                        + " aliases the READ-ONLY buffer's own storage");
+        check(!roBb.duplicate().hasArray(), "rbb.duplicate().hasArray() is false");
+        step("bounds", "ByteBuffer.allocate(16).asReadOnlyBuffer().duplicate().array()");
+        t = null;
+        try {
+            sink = roBb.duplicate().array().length;
+        } catch (Throwable x) {
+            t = x;
+        }
+        check("java.nio.ReadOnlyBufferException".equals(nameOf(t)),
+                "rbb.duplicate().array() must throw ReadOnlyBufferException; got "
+                        + nameOf(t));
+        check(roBb.slice().isReadOnly(), "rbb.slice().isReadOnly()");
+        step("bounds", "ByteBuffer.allocate(16).asReadOnlyBuffer().slice().arrayOffset()");
+        t = null;
+        try {
+            sink = roBb.slice().arrayOffset();
+        } catch (Throwable x) {
+            t = x;
+        }
+        check("java.nio.ReadOnlyBufferException".equals(nameOf(t)),
+                "arrayOffset() on a read-only slice repeats array()'s split — a plain"
+                        + " offset here is indistinguishable from a legitimate one; got "
+                        + nameOf(t));
+        check(!ByteBuffer.allocate(OPAQUE_I[11]).duplicate().isReadOnly(),
+                "hbb.duplicate().isReadOnly() is false");
+
+        // The three rows that make the typed families' arrayOffset registration
+        // load-bearing: arrayOffset was registered for ByteBuffer only, so on a
+        // VM-minted IntBuffer it resolved to the Code-less java/nio/Buffer
+        // declaration and threw AbstractMethodError.
+        IntBuffer wIb = IntBuffer.allocate(OPAQUE_I[6] + 1);
+        check(wIb.arrayOffset() == 0,
+                "IntBuffer.allocate(4).arrayOffset() is 0 — an ANSWER, not an"
+                        + " AbstractMethodError from an unregistered accessor");
+        step("bounds", "IntBuffer.allocate(4).asReadOnlyBuffer().arrayOffset()");
+        t = null;
+        try {
+            sink = wIb.asReadOnlyBuffer().arrayOffset();
+        } catch (Throwable x) {
+            t = x;
+        }
+        check("java.nio.ReadOnlyBufferException".equals(nameOf(t)),
+                "the read-only cell of the typed families' arrayOffset; got " + nameOf(t));
+        step("bounds", "IntBuffer.allocate(4).asReadOnlyBuffer().duplicate().arrayOffset()");
+        t = null;
+        try {
+            sink = wIb.asReadOnlyBuffer().duplicate().arrayOffset();
+        } catch (Throwable x) {
+            t = x;
+        }
+        check("java.nio.ReadOnlyBufferException".equals(nameOf(t)),
+                "and the same cell reached through a DUPLICATE, which is the"
+                        + " registration and the contagion in one row; got " + nameOf(t));
+        step("bounds", "ByteBuffer.allocate(16).asIntBuffer().arrayOffset()");
+        t = null;
+        try {
+            sink = ByteBuffer.allocate(OPAQUE_I[11]).asIntBuffer().arrayOffset();
+        } catch (Throwable x) {
+            t = x;
+        }
+        check("java.lang.UnsupportedOperationException".equals(nameOf(t)),
+                "a WRITABLE typed view has no array at all, so arrayOffset() answers"
+                        + " UnsupportedOperation — the cell a read-only-first"
+                        + " implementation gets wrong; got " + nameOf(t));
+        check(t != null && t.getMessage() == null,
+                "and that UnsupportedOperationException carries a NULL detail message."
+                        + " This is one of only two assertions in this file that can see a"
+                        + " wrong message; the CLASS being right is what let"
+                        + " \"direct buffer has no backing array\" survive a prior repair");
+
+        // 93 -> 102: F14 added GAP 3b, the nine rows for the read-only
+        // ARRAY-BACKED cell and the writable ARRAY-LESS view cell. Re-derived
+        // by running this family on jdk-25.0.3+9, not by adding 9 on paper.
+        // 102 -> 121: F21 added GAP 3c, the nineteen read-only-contagion and
+        // typed-arrayOffset rows. Same derivation: measured, not counted.
+        sectionEnd("bounds", 121);
     }
 
     // -----------------------------------------------------------------------

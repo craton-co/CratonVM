@@ -46,6 +46,23 @@ java.lang.module.ModuleDescriptor
 javax.net.ssl.SSLSession                         # E12-1 / E22-1 — the null session
 javax.net.ssl.SSLSocket
 
+# --- the second class each of rows 3 and 22 registers on (E41) -------------
+# E37 §7.1 called row 3 "half convertible" because only one of the two classes
+# `register_cds_natives` targets was baselined, and row 22 asserts two triples
+# on `sun/reflect/ReflectionFactory` as well as two on the `jdk.internal`
+# twin. Both of these ARE in the JDK 25 image, so both are one line each.
+#
+# `sun.management.CDSMetrics` is deliberately NOT here and never will be: the
+# jrt walk in E41 §3 reports it NOT IN IMAGE on openjdk 25.0.3+9, exactly as
+# the generator reported `StructuredTaskScope$Config`. `register_cds_natives`
+# makes six registrations on it plus a seventh returning it from
+# `ManagementFactoryHelper.getCDSMetrics()`, a method the real
+# `ManagementFactoryHelper` (baselined below) does not declare. A class the
+# generator refuses to write is a class no guard can be converted against, and
+# that refusal IS the finding.
+sun.reflect.ReflectionFactory                    # row 22  — the jdk.unsupported twin (lib.rs:4957)
+sun.management.ManagementFactoryHelper           # row 3   — the getCDSMetrics() owner (cds.rs:1321)
+
 # --- supertypes that carry the members the guards above look for -----------
 # `javap -public` never lists an inherited member, so a guard reading only the
 # leaf baseline reads an inherited method as absent. These four are the direct

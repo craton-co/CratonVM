@@ -1,4 +1,4 @@
-# jdk-baseline	1
+# jdk-baseline	2
 # kind	class
 # name	java.util.AbstractCollection
 # module	java.base
@@ -10,7 +10,9 @@
 # regenerate	python scripts/jdk-baseline/generate.py --update
 # public-methods	14
 # protected-methods	0
-# rows	21
+# declared-methods	16
+# declared-fields	0
+# rows	22
 # columns	kind	name	descriptor	flags
 CLASS	java.util.AbstractCollection		public,abstract
 EXTENDS	java.lang.Object		
@@ -24,6 +26,7 @@ METHOD	addAll	(Ljava/util/Collection;)Z	public
 METHOD	clear	()V	public
 METHOD	contains	(Ljava/lang/Object;)Z	public
 METHOD	containsAll	(Ljava/util/Collection;)Z	public
+METHOD	finishToArray	([Ljava/lang/Object;Ljava/util/Iterator;)[Ljava/lang/Object;	private,static
 METHOD	isEmpty	()Z	public
 METHOD	iterator	()Ljava/util/Iterator;	public,abstract
 METHOD	remove	(Ljava/lang/Object;)Z	public

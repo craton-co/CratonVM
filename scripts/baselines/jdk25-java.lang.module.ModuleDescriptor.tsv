@@ -1,4 +1,4 @@
-# jdk-baseline	1
+# jdk-baseline	2
 # kind	class
 # name	java.lang.module.ModuleDescriptor
 # module	java.base
@@ -10,14 +10,21 @@
 # regenerate	python scripts/jdk-baseline/generate.py --update
 # public-methods	28
 # protected-methods	0
-# rows	33
+# declared-methods	37
+# declared-fields	15
+# rows	58
 # columns	kind	name	descriptor	flags
 CLASS	java.lang.module.ModuleDescriptor		public,final
 EXTENDS	java.lang.Object		
 IMPLEMENTS	java.lang.Comparable		
 SUPERTYPE	java.lang.Comparable		
 SUPERTYPE	java.lang.Object		
+METHOD	<clinit>	()V	static
+METHOD	<init>	(Ljava/lang/String;Ljava/lang/module/ModuleDescriptor$Version;Ljava/lang/String;Ljava/util/Set;Ljava/util/Set;Ljava/util/Set;Ljava/util/Set;Ljava/util/Set;Ljava/util/Set;Ljava/util/Set;Ljava/lang/String;)V	private
+METHOD	<init>	(Ljava/lang/String;Ljava/lang/module/ModuleDescriptor$Version;Ljava/util/Set;Ljava/util/Set;Ljava/util/Set;Ljava/util/Set;Ljava/util/Set;Ljava/util/Set;Ljava/util/Set;Ljava/lang/String;IZ)V	private
 METHOD	accessFlags	()Ljava/util/Set;	public
+METHOD	compare	(Ljava/lang/Object;Ljava/lang/Object;)I	private,static
+METHOD	compare	(Ljava/util/Set;Ljava/util/Set;)I	private,static
 METHOD	compareTo	(Ljava/lang/Object;)I	public,bridge,synthetic
 METHOD	compareTo	(Ljava/lang/module/ModuleDescriptor;)I	public
 METHOD	equals	(Ljava/lang/Object;)Z	public
@@ -25,14 +32,18 @@ METHOD	exports	()Ljava/util/Set;	public
 METHOD	hashCode	()I	public
 METHOD	isAutomatic	()Z	public
 METHOD	isOpen	()Z	public
+METHOD	lambda$toString$0	(Ljava/lang/Object;)Ljava/lang/String;	private,static,synthetic
 METHOD	mainClass	()Ljava/util/Optional;	public
 METHOD	modifiers	()Ljava/util/Set;	public
+METHOD	modsHashCode	(Ljava/lang/Iterable;)I	private,static
+METHOD	modsValue	(Ljava/util/Set;)J	private,static
 METHOD	name	()Ljava/lang/String;	public
 METHOD	newAutomaticModule	(Ljava/lang/String;)Ljava/lang/module/ModuleDescriptor$Builder;	public,static
 METHOD	newModule	(Ljava/lang/String;)Ljava/lang/module/ModuleDescriptor$Builder;	public,static
 METHOD	newModule	(Ljava/lang/String;Ljava/util/Set;)Ljava/lang/module/ModuleDescriptor$Builder;	public,static
 METHOD	newOpenModule	(Ljava/lang/String;)Ljava/lang/module/ModuleDescriptor$Builder;	public,static
 METHOD	opens	()Ljava/util/Set;	public
+METHOD	packageName	(Ljava/lang/String;)Ljava/lang/String;	private,static
 METHOD	packages	()Ljava/util/Set;	public
 METHOD	provides	()Ljava/util/Set;	public
 METHOD	rawVersion	()Ljava/util/Optional;	public
@@ -43,5 +54,21 @@ METHOD	read	(Ljava/nio/ByteBuffer;Ljava/util/function/Supplier;)Ljava/lang/modul
 METHOD	requires	()Ljava/util/Set;	public
 METHOD	toNameAndVersion	()Ljava/lang/String;	public
 METHOD	toString	()Ljava/lang/String;	public
+METHOD	toString	(Ljava/util/Set;Ljava/lang/String;)Ljava/lang/String;	private,static
 METHOD	uses	()Ljava/util/Set;	public
 METHOD	version	()Ljava/util/Optional;	public
+FIELD	$assertionsDisabled	Z	static,final,synthetic
+FIELD	automatic	Z	private,final
+FIELD	exports	Ljava/util/Set;	private,final
+FIELD	hash	I	private,transient
+FIELD	mainClass	Ljava/lang/String;	private,final
+FIELD	modifiers	Ljava/util/Set;	private,final
+FIELD	name	Ljava/lang/String;	private,final
+FIELD	open	Z	private,final
+FIELD	opens	Ljava/util/Set;	private,final
+FIELD	packages	Ljava/util/Set;	private,final
+FIELD	provides	Ljava/util/Set;	private,final
+FIELD	rawVersionString	Ljava/lang/String;	private,final
+FIELD	requires	Ljava/util/Set;	private,final
+FIELD	uses	Ljava/util/Set;	private,final
+FIELD	version	Ljava/lang/module/ModuleDescriptor$Version;	private,final

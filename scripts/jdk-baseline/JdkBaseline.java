@@ -26,6 +26,37 @@
  *      export. Reading its bytes needs no `--add-exports`; the generator must
  *      not need flags that a CI job might forget.
  *
+ * WHY EVERY MEMBER AND NOT JUST THE PUBLIC ONES  (format version 2, F23-1)
+ * ------------------------------------------------------------------------
+ * Version 1 of this file emitted a member only if ACC_PUBLIC or ACC_PROTECTED
+ * was set. That made the baselines structurally blind to package-private and
+ * private members -- which is the access level MOST JDK natives live at, and
+ * therefore the one population a *native* registrar most needs an oracle for.
+ * On `jdk.internal.misc.CDS`, the first class anybody pointed `javap -p` at, the
+ * blind spot produced an error in both directions at once:
+ *
+ *   - false positive: `logLambdaFormInvoker(Ljava/lang/String;)V` read as
+ *     off-surface. It is real -- `private static native` -- and sits beside a
+ *     public four-String overload whose body just concatenates and calls it.
+ *   - false negative: `getCDSConfigStatus()I` (called from `<clinit>`, so every
+ *     public predicate on the class depends on it) and
+ *     `needsClassInitBarrier0(Ljava/lang/Class;)Z` are real natives with no
+ *     registration, and a public-only baseline cannot report a MISSING private
+ *     native as anything at all.
+ *
+ * So version 2 emits every entry of the method and field tables, with the access
+ * level in the flags column. "Does this member exist" and "is this member public"
+ * become two different questions a consumer asks separately -- see
+ * `Baseline::declared_surface` vs `Baseline::public_surface` in
+ * native-builtins/src/jdk_baseline.rs. The `# public-methods` and
+ * `# protected-methods` headers keep their version-1 meaning exactly, so a guard
+ * whose denominator was the public surface has the same denominator it had.
+ *
+ * The version was bumped even though no COLUMN changed. The row grammar is the
+ * same; the population is not, and a version-1 parser reading a version-2 file
+ * would answer `declares()` from a wider set than it was written against without
+ * ever saying so. That is the same silent-widening this change exists to stop.
+ *
  * BYTE STABILITY
  * --------------
  * Every collection is sorted before emission; rows are joined with an explicit
@@ -58,8 +89,13 @@ import java.util.TreeSet;
 
 public final class JdkBaseline {
 
-    /** Bumped only when the row grammar changes. A consumer must reject a version it does not know. */
-    static final String FORMAT_VERSION = "1";
+    /**
+     * Bumped when the row grammar OR the emitted population changes. A consumer must reject a
+     * version it does not know.
+     *
+     * <p>2 (F23-1): every member is emitted, not only public/protected ones.
+     */
+    static final String FORMAT_VERSION = "2";
 
     public static void main(String[] args) throws Exception {
         Path outDir = null;
@@ -213,32 +249,48 @@ public final class JdkBaseline {
             rows.add(row("SUPERTYPE", s, "", ""));
         }
 
+        // EVERY entry of the method table, at every access level. See the
+        // "WHY EVERY MEMBER" note at the top of this file: the version-1
+        // public/protected filter that used to stand here is the defect.
         TreeSet<String> members = new TreeSet<>();
         int publicMethods = 0;
         int protectedMethods = 0;
+        int declaredMethods = 0;
         for (MethodModel m : cm.methods()) {
             int f = m.flags().flagsMask();
-            if ((f & (ACC_PUBLIC | ACC_PROTECTED)) == 0) {
-                continue;
-            }
             String name = m.methodName().stringValue();
             members.add(row("METHOD", name, m.methodType().stringValue(), methodFlags(f)));
+            if (!name.equals("<clinit>")) {
+                // `# declared-methods` counts <init> and excludes <clinit>, which is
+                // exactly what `javap -p <class> | grep -c '('` counts: javap prints
+                // the class initialiser as `static {};`, with no parentheses.
+                declaredMethods++;
+            }
             if (!name.equals("<init>") && !name.equals("<clinit>")) {
                 if ((f & ACC_PUBLIC) != 0) {
                     publicMethods++;
-                } else {
+                } else if ((f & ACC_PROTECTED) != 0) {
                     protectedMethods++;
                 }
             }
         }
         TreeSet<String> fields = new TreeSet<>();
+        int declaredFields = 0;
         for (FieldModel f : cm.fields()) {
             int fl = f.flags().flagsMask();
-            if ((fl & (ACC_PUBLIC | ACC_PROTECTED)) == 0) {
-                continue;
-            }
             fields.add(row("FIELD", f.fieldName().stringValue(),
                     f.fieldType().stringValue(), fieldFlags(fl)));
+            declaredFields++;
+        }
+        // The rows go into TreeSets to be sorted, and a set can silently swallow a
+        // duplicate. JVMS 4.6 forbids two methods with the same name AND descriptor,
+        // so a collision here means the parse is wrong, not the class file -- and it
+        // would show up as a header count no reader could reconcile.
+        if (members.size() != cm.methods().size() || fields.size() != cm.fields().size()) {
+            throw new IllegalStateException(binaryName + ": the sorted row set lost a member ("
+                    + members.size() + "/" + cm.methods().size() + " methods, "
+                    + fields.size() + "/" + cm.fields().size() + " fields). Two class-file "
+                    + "entries produced the same row, which JVMS 4.6 says cannot happen.");
         }
         rows.addAll(members);
         rows.addAll(fields);
@@ -250,6 +302,13 @@ public final class JdkBaseline {
         // hand-edited file is caught by the reader before it is believed.
         sb.append("# public-methods\t").append(publicMethods).append('\n');
         sb.append("# protected-methods\t").append(protectedMethods).append('\n');
+        // `# declared-methods` is the version-2 population: every method-table
+        // entry except <clinit>, at every access level. It is the number
+        // `javap -p <class> | grep -c '('` prints. `# public-methods` is
+        // unchanged from version 1 and remains the denominator of every guard
+        // whose question is "is this on the PUBLIC surface".
+        sb.append("# declared-methods\t").append(declaredMethods).append('\n');
+        sb.append("# declared-fields\t").append(declaredFields).append('\n');
         sb.append("# rows\t").append(rows.size()).append('\n');
         sb.append("# columns\tkind\tname\tdescriptor\tflags\n");
         for (String r : rows) {

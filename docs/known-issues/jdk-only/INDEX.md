@@ -12,6 +12,15 @@ branch `claude/jdk-only-mode-completion-1351c0` at `HEAD = 7c00dee66`
 > count. Do not carry the number 153 forward without recounting; that is exactly
 > the mistake `README.md`'s own headline documents.
 
+> **SECOND PASS — lane F25, 2026-08-13.** The warning above was right. Listing
+> re-taken: **227 `.md` files** including this one, and **73 of them had no row
+> in this index** — every wave-D, wave-E and wave-F record, the whole
+> `W8-D`/`W8-E`/`W8-F` harness line, the two C19 fixture records, and **all
+> seven records of the SSL-session chain**. They are added below, in a dated
+> block of their own rather than merged into C18's topic tables, so that
+> C18's snapshot stays legible as the snapshot it is. **This block will rot the
+> same way**: lanes F14–F25 were still landing while it was written.
+
 ## How to read the columns
 
 **Status** — derived by **reading each record's own status prose**, never from
@@ -316,6 +325,158 @@ NOMINATIONS at the bottom of this file.**
 | W7-84-primitive-in-reference-store | a primitive stored into a declared-reference slot | FIXED-UNVERIFIED | MIXED | four implementations converged on auto-boxing |
 | W7-89-memorysession-checkvalidstate | the FFM liveness gate fails open on closed arenas | FIXED-UNVERIFIED | MIXED | |
 | W7-90-slot-map-sweep-caller | the declared-slot-map sweep had no caller | OPEN | SRC | three of four doors closed |
+
+---
+
+# SECOND PASS — waves D, E and F (added by lane F25, 2026-08-13)
+
+**73 records, none of which had a row above.** Subjects are each record's own
+H1, condensed; status is read from the record's own status prose, never from
+its filename.
+
+**A provenance convention runs through almost all of these and is stated once
+here rather than repeated 73 times.** Waves D/E/F worked on a shared branch
+whose lanes were forbidden to build or run CratonVM, so the standard shape is:
+**HotSpot 25.0.3+9-LTS column MEASURED on the lane's own host, tree and
+`jdk25src` citations READ, CratonVM "after" column PREDICTED** — i.e. `MIXED`
+in this index's vocabulary, and `FIXED-UNVERIFIED` where a fix landed. Rows
+below carry `MIXED` unless the record itself says otherwise; the exceptions
+worth knowing are the `R11` baseline line (E32/E37/E41-R11 ran `cargo test` and
+say so) and the `W8-E*` harness records (which ran the suite).
+
+> **Do not read `FIXED-UNVERIFIED` here as "nearly done".** In this directory it
+> means *no binary carrying the change has ever executed*. Several of these
+> records also say, in their own residuals, that they were never type-checked.
+
+## The SSL / TLS session chain — read in this order
+
+Seven records, not six, and each one corrects or extends the one before it. A
+reader who opens any single one of them will get a picture that a later record
+in the chain has already moved.
+
+| # | record | what it established | status | prov |
+|---|---|---|---|---|
+| 1 | E12-1-the-null-session-and-the-fabricated-cipher | a session that negotiated nothing answered `TLS_AES_256_GCM_SHA384`, `"UNKNOWN"`, a 32-byte pseudo-random id, and a **null** `SSLSocket.getSession()`; the eleven accessors are NOT uniform (some refuse, some answer null). Created `RSslNullSession` | FIXED-UNVERIFIED | MIXED |
+| 2 | E22-1-the-null-session-in-the-registrar-that-actually-answers | the E12-1 fix went into a registrar that does not answer; the live one is `t27_tls.rs`. **`--dump-native-registry` is the instrument**, not grep | FIXED-UNVERIFIED | MIXED |
+| 3 | E31-1-the-unregistered-door-and-the-slot-that-resurrects-a-fabrication | `getHandshakeSession` had no registration at all, so `RSslNullSession` ran **1 of its 47 checks**; and slot 3 is the peer host on the wide shapes and the **attribute map** on the 4-field one, which Jetty arms on every SSL request | FIXED-UNVERIFIED | MIXED |
+| 4 | E42-1-the-slot-that-was-never-there-and-the-predicate-that-was-its-own-negation | the attribute slot the previous record reached for did not exist at that width, and a predicate was its own negation. Blocks the obvious "widen NEW-13" repair | FIXED-UNVERIFIED | MIXED |
+| 5 | F6-1-the-arm-that-had-to-move-and-the-two-minters-it-keeps-wrong | the width arm moved; two minters are **deliberately** left wrong, with the reason recorded | FIXED-UNVERIFIED | MIXED |
+| 6 | F10-1-the-two-minters-that-told-a-completed-handshake-it-never-happened | a COMPLETED handshake reported as never negotiated; `HTTPS_CLIENT_SESSION_MARKER` is not free to choose — it must not collide with any real socket id | FIXED-UNVERIFIED | MIXED (HTTPS arm measured on a loopback `HttpsServer`) |
+| 7 | F18-1-four-session-doors-with-no-registration-and-the-twin-that-read-another-table | `invalidate`/`getPeerHost`/`getPeerPort`/`getSessionContext` had **no registration** (⇒ `AbstractMethodError`), and `getPeerPrincipal` read a different table from its twin `getPeerCertificates`. **Corrects "invalidate moves isValid and nothing else"** — it moves `getSessionContext` too | FIXED-UNVERIFIED | MIXED |
+
+Adjacent, same family, not part of the chain proper:
+`E3-1-the-cipher-name-helper-and-its-real-denominator` (the helper had 1 caller
+of 8) and `D3-3-rustls-cipher-names-reaching-jsse` (five of seven sites need
+the rustls spelling).
+
+**Fixture state:** `regression-suite/src/RSslNullSession.java` was **47 checks**
+through records 1–7 and asserted nothing about any of record 7's four doors.
+Lane F25 extended it to **89 checks**; see
+`F25-1-the-four-doors-the-null-session-never-knocked-on-and-two-argument-kind-vectors-20260813.md`.
+
+## Wave D
+
+| record | subject | status | prov |
+|---|---|---|---|
+| D1-R11-SERVICELOADER-DOUBLE-SOURCE | the duplicate `junit-jupiter` engine is a modular jar on `-cp` promoted into the boot layer; **not intermittent**, and `getResources` is innocent | OPEN | MIXED |
+| D3-1-simpledateformat-format-zone-arm | the zone-arm patch is right and **the fixture meant to prove it cannot** | OPEN | MIXED |
+| D3-2-http2-optional-reference-layout | eleven `Optional` sites, not nine — and every one is dead outside synthetic-JDK mode | OPEN | MIXED |
+| D3-3-rustls-cipher-names-reaching-jsse | five of seven sites need the rustls spelling; one is a provable no-op | OPEN | MIXED |
+| W8-D2-1-two-summary-lines-and-the-suite-denominator | two REGRESSION SUITE lines in one log, neither with a denominator | META (instrument audit, no VM defect) | MEAS |
+
+## Wave E — defect and census records
+
+| record | subject | status | prov |
+|---|---|---|---|
+| E1-1-simpledateformat-format-zone-arm-landed | the `format` zone arm LANDED; the fixture the brief named cannot gate it | FIXED-UNVERIFIED | MIXED |
+| E2-1-optional-reference-layout-landed | eleven `Optional` sites fixed, one left alone; the builder family keeps four fixture rows red | FIXED-UNVERIFIED | MIXED |
+| E5-1-base64-null-contract-and-the-fourth-site | the fourth Base64 null site, and a whole-surface audit behind it | FIXED-UNVERIFIED | MIXED |
+| E7-1-character-int-code-point-contracts | `Character.charCount` lost the sign; the above-BMP case tables had never been looked at | FIXED-UNVERIFIED | MIXED |
+| E8-1-string-null-contracts-and-the-third-copy-of-six-constants | `String`'s reference arguments swallowed every null; six version-skew constants needed a third copy | FIXED | MIXED |
+| E10-1-intrinsic-census-round-3 | 292 of the last 420 `Intrinsic` triples, and a `SimpleDateFormat` memo collision | OPEN | MIXED |
+| E13-1-the-six-builders-decode-a-reference-as-an-int | six builders decoded a reference as an `Int`; four more sites the idiom did not mark; one row that still cannot go green | FIXED-UNVERIFIED | MIXED |
+| E14-1-base64-the-fabricated-receiver-and-the-seven-methods-that-read-it | the fabricated Base64 receiver and the seven methods reading it | OPEN (NOMINATION §7) | MIXED |
+| E17-1-character-digit-int-and-the-fifteen-unregistered | `Character.digit(int,int)` stays unregistered; the "15 deliberately unregistered" methods are **57** | OPEN — **no code change** | SRC |
+| E18-1-the-jit-facing-string-doors-and-the-fourth-copy-of-one-search-rule | the JIT-facing `String` doors, and one JVMS search rule written four times | FIXED | MIXED |
+| E21-1-getstatic-has-no-native-path | `GETSTATIC` has no native path; the family is **148, not 5** | OPEN | PRED |
+| E23-1-synthetic-jdk-nosuchmethoderror-census | 7,700 methods over 845 classes; the one that costs 88 fixtures | META (measurement + one behaviour-neutral deletion) | MEAS |
+| E26-1-the-reach-audit-what-eleven-green-families-were-not-asking | eleven GREEN families audited for what they were **not** asking | OPEN (mostly NOMINATION §8) | MIXED |
+| E27-1-the-jit-indexof-int-intrinsic-was-the-fifth-copy | closes E18-1's three JIT doors; the fifth copy of the search rule; one E18-1 claim was wrong | FIXED | MIXED |
+| E34-1-the-throwable-ctor-table-and-the-descriptor-javac-actually-emits | one fixed descriptor list; 62 classes, 97 constructors that do not exist and 15 that do | FIXED (registrar data) | PRED |
+| E36-1-inverted-enum-fallbacks-and-the-field-shaped-rows-that-cannot-fire | inverted `name`/`ordinal` fallbacks; a `values()` returning nine nulls with the difficulty stated as its excuse; 21 field-shaped rows classified | OPEN | PRED |
+| E38-1-biginteger-shifts-ctors-and-the-stringbuilder-repeat-twin | the shift that allocates, the constructor that validated nothing, the `repeat` twin that won | LANDED (unbuilt) | MIXED |
+| E39-1-four-pending-nominations-applied-on-top-of-the-new-denominators | four pending nominations APPLIED on denominators that had just moved | META / APPLIED | MIXED |
+| E40-1-the-test-that-pinned-a-wrong-type-and-the-36-sites-a-getstatic-cannot-reach | a test pinning a wrong type; a withdrawn class three tests still describe; 36 call sites no `getstatic` can reach | OPEN | PRED |
+| E41-GATHERER-SLOT-MAP-AND-JUL-LOGGER-CONVENTION | one slot map per class for `Gatherer`; the **second** `java/util/logging/Logger` convention | FIXED-UNVERIFIED | MIXED |
+| E43-1-collapsing-the-blanket-throwable-ctor-rule-onto-one-table | the blanket throwable-`<init>` rule was at **five** sites, not four | FIXED (registrar side) | PRED |
+
+## Wave E / R11 — the JDK-baseline and unfalsifiable-guard line
+
+The one part of waves D–F that **ran tests**. Read E32 → E37 → E41-R11 in order.
+
+| record | subject | status | prov |
+|---|---|---|---|
+| E4-R11-CLASS-PATH-MODULE-BOOT-LAYER-FIX | the fix for the class-path module promoted into the boot layer, and the one jar shape it does NOT close | FIXED-UNVERIFIED | PRED |
+| E16-R11-P59-MODULE-LAYER-TWIN | NOM E-7's "dormant twin" was **not dormant, and not for the stated reason** | OPEN | MIXED |
+| E20-R11-INTERSECTION-BLIND-GUARD | a guard that could not fail for the case it was written for, and a census built from its own answer | OPEN | MIXED |
+| E25-R11-GUARD-POPULATION-SWEEP | the seventeenth `Mac` method, and every other guard whose population was its own answer | FIXED-UNVERIFIED | MIXED |
+| E28-R11-P59-MODULE-WIDTHS-AND-CATALOG | three widths, and a catalog side effect whose real blocker is a field **NAME** | OPEN | MIXED |
+| E32-R11-JDK-BASELINE-CAPABILITY | checked-in JDK surface baselines + the generator that writes them — **the missing capability, built** | FIXED-MEASURED (generator self-verified); consumer pending | MEAS |
+| E33-R11-FOUR-UNFALSIFIABLE-GUARDS | four guards that could not go red, repaired and **mutation-checked** | FIXED-UNVERIFIED-BY-CARGO | MEAS (mutation) |
+| E35-R11-SYNTHETIC-WIDTH-SWEEP | every synthetic allocation in `native-builtins/src/lib.rs` against its declaration and its twins | OPEN | MIXED |
+| E37-R11-JDK-BASELINE-CONSUMER-AND-RATCHET | a self-testing parser, a four-kind two-way ratchet, the worked rewrite | FIXED-MEASURED (17/17) | MEAS |
+| E41-R11-TWELVE-GUARDS-CONVERTED | twelve guards converted; three class names JDK 25 does not have | FIXED-MEASURED (25/25 in module) | MEAS |
+
+## Wave W8-E — harness, oracles and the `aastore` atomic set
+
+The `W8-E` line is where the **suite's own instruments** were audited. Six
+fixtures had a broken HotSpot oracle; that is the standing reason a green
+family is not evidence.
+
+| record | subject | status | prov |
+|---|---|---|---|
+| W8-E6-1-aastore-ase-names-the-component-not-the-array | `aastore`'s ArrayStoreException named the element's COMPONENT class; the helper that fixed this for `checkcast` had one caller | APPLIED | MIXED |
+| W8-E9-1-three-broken-oracles-and-the-suite-denominator | three fixtures whose HotSpot oracle was broken, and the suite's denominator. **The authority for the `checks=`/`fails=` one-value-per-line rule** | FIXED-MEASURED | MEAS |
+| W8-E11-1-jit-aastore-third-twin-and-the-check-only-helper | the third `aastore` twin, and a check-only helper that lets the inline store come back | APPLIED + NOMINATION SET | MIXED |
+| W8-E15-1-the-fourth-broken-oracle-the-unscheduled-vector-and-the-reach-ratchet | the fourth broken oracle, a vector registered nowhere, and G5 — a ratchet for **reach** | FIXED-MEASURED (for two fixtures) | MEAS |
+| W8-E19-1-the-void-guard-sweep-and-the-aastore-atomic-set | undefined-RAX guard sweep; the `aastore` ATOMIC SET, 2 of 5 applied — **the tree does not build until §3 lands** | OPEN (partial) | MIXED |
+| W8-E24-1-the-aastore-abi-slot-applied-and-seven-literals-the-nomination-missed | the ABI slot APPLIED 5 of 5; seven count literals W8-E19-1 did not carry | FIXED-UNVERIFIED | MIXED |
+| W8-E29-1-bridge-census-round-1 | the first `Bridge` census — the largest `NativeKind` had never been measured | OPEN | MIXED |
+| W8-E30-1-broken-oracles-five-and-six-and-a-lint | oracles five and six, shared launch hooks, and G6 — a lint making the reporting dialect self-enforcing | FIXED-MEASURED (for three fixtures) | MEAS |
+
+## Wave F
+
+| record | subject | status | prov |
+|---|---|---|---|
+| F1-1-the-boxing-caches-were-three-of-six-and-the-bounds-all-differ | three of six boxing caches, and no two of the six share a bound | FIXED-UNVERIFIED | MIXED |
+| F2-1-the-charbuffer-that-read-empty-and-the-two-shifts-that-allocated | a `CharBuffer` that read empty, a shift that allocated 256 MB, a constructor that invented a zero | LANDED (unbuilt) | MIXED |
+| F3-1-RANDOM-NULL-CONTRACT-AND-THE-SECOND-JUL-LOGGER-CONVENTION | `java.util.Random`'s null contract lives in a file that lane could not edit; the second `Logger` convention in `lib.rs` | OPEN (NOMINATION) | MIXED |
+| F5-1-charbuffer-accessible-array-three-way-split | `hasArray`/`array`/`arrayOffset` had ONE branch where the JDK has THREE | FIXED-UNVERIFIED | MIXED |
+| F6-1 … | see the SSL chain above | | |
+| F9-1-the-eighteen-that-could-not-fail-and-the-descriptor-that-cannot-be-corrected | eighteen tests an `if let` could skip; two struct layouts HotSpot refuses to build; a descriptor that cannot be corrected in the test | OPEN | PRED |
+| F10-1 … | see the SSL chain above | | |
+| F11-1-reflective-boxing-is-canonical-everywhere-except-array-get | reflective boxing is canonical everywhere except `Array.get`; the caller that forbade the obvious fix was never a caller | FIXED-UNVERIFIED | MIXED |
+| F12-1-NULL-CONTRACT-APPLIED-AND-THE-GETINSTANCE-ARGUMENT-ORDER | NOM F3-1 applied, plus a seventh divergence: `getInstance`'s argument **ORDER**. **Five of the seven had no check anywhere in the tree** | FIXED-UNVERIFIED | MIXED |
+| F14-1-the-mutable-alias-a-hasarray-check-handed-out | the mutable alias `hasArray()` handed out, and the supertype that makes half the family's assertions ornamental | FIXED-UNVERIFIED | MIXED |
+| F15-1-two-registrars-that-no-bytecode-can-name | two registrars no bytecode on this JDK can name, and the mode question that shortens every reachability argument | OPEN | MIXED |
+| F16-1-one-layout-encoding-and-the-padding-the-jdk-never-inserts | one layout encoding, padding the JDK never inserts, and the union that discarded its members | FIXED-UNVERIFIED | PRED |
+| F17-1-cds-sharedsecrets-fabrications | eleven CDS natives for classes JDK 25 does not have; two real natives a public-only baseline could not see; a factory-name guard punishing the correct spelling | FIXED-UNVERIFIED | MIXED |
+| F18-1 … | see the SSL chain above | | |
+| F19-1-the-sixteen-that-allocated-and-the-boolean-that-was-not-TRUE | sixteen allocating sites, a `Boolean` that was not `TRUE`, and the fifth boxing implementation that is the only correct one | FIXED-UNVERIFIED | MIXED |
+| F20-1-the-three-unguarded-rescales-and-the-scale-that-negates-into-a-panic | three unguarded rescales, a scale that negates into a panic, two twins that shadow their own fix | **PARTIAL** | MIXED |
+| F21-1-read-only-is-contagious-and-the-registrar-that-shadows-the-fix | read-only is contagious through `duplicate`/`slice`/`slice(int,int)`; three copies converge; a registrar shadows the repair | FIXED-UNVERIFIED | MIXED (916-row seven-family sweep MEASURED) |
+| F22-1-formatter-utf16-units-and-t-zone | `java.util.Formatter` carried its output as a Rust `String`; `%t` had no time zone | FIXED-UNVERIFIED | MIXED |
+| W8-F4-1-the-formatter-conversion-table-swept-against-the-spec | `%h` was an alias for `%s`; the null argument had never taken the JDK's printer | OPEN (edits landed, unbuilt) | MIXED |
+| W8-F7-1-the-argument-driven-allocation-sweep-of-biginteger-and-bigdecimal | one bit that cost 256 MB, and the sweep for everything else sized by an argument | LANDED (unbuilt) | MIXED |
+| W8-F13-1-formattable-never-dispatched-and-the-upper-caser-ran-after-the-justifier | `%s` of a `Formattable` never dispatched; the upper-caser ran AFTER the width justifier | OPEN (edits landed, unbuilt) | MIXED |
+| F25-1-the-four-doors-the-null-session-never-knocked-on-and-two-argument-kind-vectors | fixture-only: F21-1's GAP 3c landed (19 rows), `RSslNullSession` 47 → 89, `RJdkSecurity` 80 → 123, this index brought current | FIXED-MEASURED **on the oracle only** — no CratonVM run | MEAS (HotSpot) |
+
+## Wave C stragglers — the two C19 fixture records
+
+| record | subject | status | prov |
+|---|---|---|---|
+| C19-1-optional-shape-fixture | `RJdkOptionalShape` — the executable form of C12-3, with an honest account of which rows reach it | FIXED-UNVERIFIED | MIXED |
+| C19-2-simpledateformat-zone-fixture | `RSimpleDateFormatZone` — the `format`-shaped vector C12-1 §5 asked for, vacuity trap closed mechanically | FIXED-UNVERIFIED | MIXED |
 
 ---
 

@@ -24,6 +24,22 @@ The oracle is JdkBaseline.java in this directory, which reads
 and parses it with `java.lang.classfile`. This script only orchestrates it:
 compile-cache, write, diff, and the known-answer test.
 
+Format version 2 (F23-1, 2026-08-13)
+------------------------------------
+Version 1 emitted a member only if ACC_PUBLIC or ACC_PROTECTED was set, so the
+baselines were structurally blind to package-private and private members --
+which is the access level MOST JDK natives live at, and therefore the one
+population a native registrar most needs an oracle for. Measured over the 32
+checked-in files, the filter hid 528 of 1908 rows: **27.7% of the surface**, and
+10 of the 13 `native` methods.
+
+Version 2 emits every member, with the access level in the flags column. The
+`# public-methods` header keeps its version-1 meaning exactly, so a consumer
+whose question was "is this on the PUBLIC surface" has the same denominator it
+had; a consumer whose question is "does this member exist" now asks
+`# declared-methods` / the row set. See
+docs/known-issues/jdk-only/F23-1-the-guard-that-could-not-see-a-private-native-20260813.md.
+
 Exit codes
 ----------
     0  everything agreed
@@ -72,6 +88,36 @@ PREFIX = "jdk25-"
 KNOWN_ANSWERS = {
     "javax.crypto.Mac": 17,
     "java.lang.Character": 96,
+}
+
+# ---------------------------------------------------------------------------
+# (c2) The SECOND known-answer test, added with format version 2 (F23-1).
+#
+# KNOWN_ANSWERS above is measured with `javap -public`, and that is precisely
+# the instrument that produced the version-1 defect: it cannot see a private
+# member, so a KAT built only on it agrees with a generator that drops every
+# private member. It agreed with the broken one for 32 files.
+#
+# These are measured with `javap -p` on the same JDK, same day:
+#
+#   $ javap -p javax.crypto.Mac         | grep -c '('   -> 22
+#   $ javap -p java.lang.Character      | grep -c '('   -> 104
+#   $ javap -p jdk.internal.misc.CDS    | grep -c '('   -> 28
+#
+# `grep -c '('` counts method lines and not the class initialiser, because javap
+# prints that as `static {};` with no parentheses -- which is why
+# `# declared-methods` excludes <clinit> and includes <init>. Fields never
+# contain a '(' in any of the three.
+#
+# CDS is in this list on purpose and not as an example: it is the class whose
+# two real, private, unregistered natives (`getCDSConfigStatus()I`,
+# `needsClassInitBarrier0(Ljava/lang/Class;)Z`) version 1 could not report, and
+# 28 vs the 13 `javap -public` prints is the size of the blind spot in one line.
+# ---------------------------------------------------------------------------
+KNOWN_ANSWERS_ALL_ACCESS = {
+    "javax.crypto.Mac": 22,
+    "java.lang.Character": 104,
+    "jdk.internal.misc.CDS": 28,
 }
 
 # Header keys whose value is a property of the JDK BUILD, not of the class
@@ -131,13 +177,13 @@ def run_generator(dest: Path) -> None:
 def norm(b: bytes) -> list[str]:
     """CRLF-insensitive line view.
 
-    `.gitattributes` does not pin `scripts/baselines/*.tsv` to LF and this repo
-    is developed with core.autocrlf=true, so the checked-out file is CRLF on
-    Windows and LF on Linux while the generator always writes LF. Comparing raw
-    bytes would make --check fail on one platform and pass on the other, for a
-    difference that is not in the data. See NOM E32-1 in the record: the real
-    fix is a .gitattributes line, and until it lands EVERY reader of these files
-    -- this script and the nominated Rust helper both -- must trim_end().
+    NOM E32-1 landed: `.gitattributes:45` now pins `scripts/baselines/jdk25-*.tsv`
+    to `text eol=lf`, so a fresh checkout is LF on every platform and the
+    generator's LF output matches it byte for byte. This normalisation is kept
+    anyway, because a working tree checked out BEFORE that line landed still has
+    CRLF in these files and --check must not fail for a difference that is not in
+    the data. The Rust reader (`native-builtins/src/jdk_baseline.rs::parse`)
+    trims '\\r' for the same reason.
     """
     return b.decode("utf-8").replace("\r\n", "\n").split("\n")
 
@@ -154,7 +200,15 @@ def split_header(lines: list[str]) -> tuple[dict[str, str], list[str]]:
 
 
 def verify_known_answers(fresh: Path) -> int:
-    """(c): the generator must reproduce two independently measured counts."""
+    """(c) + (c2): the generator must reproduce five independently measured counts.
+
+    Two are `javap -public` counts of the PUBLIC method surface, and three are
+    `javap -p` counts of the WHOLE method table. Both halves are required and
+    they fail for different reasons: the public half catches a generator that
+    over- or under-counts bridges/constructors/synthetics, and the all-access
+    half catches a generator that drops an access level -- which is the version-1
+    defect, and which the public half is structurally unable to notice.
+    """
     bad = 0
     print("--- generator known-answer test (see KNOWN_ANSWERS for provenance) ---")
     for cls, expected in sorted(KNOWN_ANSWERS.items()):
@@ -174,10 +228,44 @@ def verify_known_answers(fresh: Path) -> int:
             and r.split("\t")[1] not in ("<init>", "<clinit>")
             and "public" in r.split("\t")[3].split(","))
         ok = declared == expected == counted
-        print(f"  {'OK  ' if ok else 'FAIL'} {cls}: expected {expected}, "
-              f"header says {declared}, rows count {counted}")
+        print(f"  {'OK  ' if ok else 'FAIL'} {cls} (javap -public): expected "
+              f"{expected}, header says {declared}, rows count {counted}")
         if not ok:
             bad += 1
+
+    print("--- all-access known-answer test (KNOWN_ANSWERS_ALL_ACCESS) ---")
+    for cls, expected in sorted(KNOWN_ANSWERS_ALL_ACCESS.items()):
+        f = fresh / f"{PREFIX}{cls}.tsv"
+        if not f.exists():
+            print(f"  FAIL {cls}: the generator emitted no baseline at all")
+            bad += 1
+            continue
+        hdr, body = split_header(norm(f.read_bytes()))
+        if "declared-methods" not in hdr:
+            print(f"  FAIL {cls}: no `# declared-methods` header. This generator "
+                  f"is emitting format version 1, whose baselines are blind to "
+                  f"private and package-private members.")
+            bad += 1
+            continue
+        declared = int(hdr["declared-methods"])
+        counted = sum(
+            1 for r in body
+            if r.startswith("METHOD\t") and r.split("\t")[1] != "<clinit>")
+        # The check that gives this KAT its teeth: at least one of the counted
+        # rows must be non-public. A generator that silently reverted to the
+        # public filter would still reproduce KNOWN_ANSWERS above.
+        nonpublic = sum(
+            1 for r in body
+            if r.startswith("METHOD\t")
+            and "public" not in r.split("\t")[3].split(",")
+            and "protected" not in r.split("\t")[3].split(","))
+        ok = declared == expected == counted and nonpublic > 0
+        print(f"  {'OK  ' if ok else 'FAIL'} {cls} (javap -p): expected {expected}, "
+              f"header says {declared}, rows count {counted}, "
+              f"of which {nonpublic} are neither public nor protected")
+        if not ok:
+            bad += 1
+
     if bad:
         print("\nThe GENERATOR is wrong, not the JDK. Do not update the "
               "baselines from a generator that fails its own known answers.")

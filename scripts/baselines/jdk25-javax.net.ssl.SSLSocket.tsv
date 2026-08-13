@@ -1,4 +1,4 @@
-# jdk-baseline	1
+# jdk-baseline	2
 # kind	class
 # name	javax.net.ssl.SSLSocket
 # module	java.base
@@ -10,6 +10,8 @@
 # regenerate	python scripts/jdk-baseline/generate.py --update
 # public-methods	25
 # protected-methods	0
+# declared-methods	30
+# declared-fields	0
 # rows	36
 # columns	kind	name	descriptor	flags
 CLASS	javax.net.ssl.SSLSocket		public,abstract

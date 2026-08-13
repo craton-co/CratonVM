@@ -1,4 +1,4 @@
-# jdk-baseline	1
+# jdk-baseline	2
 # kind	class
 # name	javax.crypto.Mac
 # module	java.base
@@ -10,14 +10,20 @@
 # regenerate	python scripts/jdk-baseline/generate.py --update
 # public-methods	17
 # protected-methods	0
-# rows	23
+# declared-methods	22
+# declared-fields	11
+# rows	39
 # columns	kind	name	descriptor	flags
 CLASS	javax.crypto.Mac		public
 EXTENDS	java.lang.Object		
 IMPLEMENTS	java.lang.Cloneable		
 SUPERTYPE	java.lang.Cloneable		
 SUPERTYPE	java.lang.Object		
+METHOD	<clinit>	()V	static
+METHOD	<init>	(Ljava/security/Provider$Service;Ljava/util/Iterator;Ljava/lang/String;)V	private
 METHOD	<init>	(Ljavax/crypto/MacSpi;Ljava/security/Provider;Ljava/lang/String;)V	protected
+METHOD	chooseFirstProvider	()V	
+METHOD	chooseProvider	(Ljava/security/Key;Ljava/security/spec/AlgorithmParameterSpec;)V	private
 METHOD	clone	()Ljava/lang/Object;	public,final
 METHOD	doFinal	()[B	public,final
 METHOD	doFinal	([B)[B	public,final
@@ -28,6 +34,7 @@ METHOD	getInstance	(Ljava/lang/String;Ljava/lang/String;)Ljavax/crypto/Mac;	publ
 METHOD	getInstance	(Ljava/lang/String;Ljava/security/Provider;)Ljavax/crypto/Mac;	public,static,final
 METHOD	getMacLength	()I	public,final
 METHOD	getProvider	()Ljava/security/Provider;	public,final
+METHOD	getProviderName	()Ljava/lang/String;	private
 METHOD	init	(Ljava/security/Key;)V	public,final
 METHOD	init	(Ljava/security/Key;Ljava/security/spec/AlgorithmParameterSpec;)V	public,final
 METHOD	reset	()V	public,final
@@ -35,3 +42,14 @@ METHOD	update	(B)V	public,final
 METHOD	update	(Ljava/nio/ByteBuffer;)V	public,final
 METHOD	update	([B)V	public,final
 METHOD	update	([BII)V	public,final
+FIELD	algorithm	Ljava/lang/String;	private,final
+FIELD	debug	Lsun/security/util/Debug;	private,static,final
+FIELD	firstService	Ljava/security/Provider$Service;	private
+FIELD	initialized	Z	private
+FIELD	lock	Ljava/lang/Object;	private,final
+FIELD	pdebug	Lsun/security/util/Debug;	private,static,final
+FIELD	provider	Ljava/security/Provider;	private
+FIELD	serviceIterator	Ljava/util/Iterator;	private
+FIELD	skipDebug	Z	private,static,final
+FIELD	spi	Ljavax/crypto/MacSpi;	private
+FIELD	warnCount	I	private,static
