@@ -177,6 +177,47 @@ pub fn real_default_handler(ctx: &dyn NativeContext) -> Option<ObjectRef> {
     }
 }
 
+/// The thread's `ThreadGroup`, read the way `Thread.getThreadGroup()` reads it.
+///
+/// This is the rung the handler chain was missing. `ThreadGroup` **implements
+/// `Thread.UncaughtExceptionHandler`**, and the JDK's own
+/// `getUncaughtExceptionHandler()` returns it whenever no per-thread handler is
+/// set — which is the default state of every thread a program ever creates. Its
+/// `uncaughtException` is what prints `Exception in thread "..."` plus the
+/// stack trace, after giving `Thread.getDefaultUncaughtExceptionHandler()` its
+/// chance.
+///
+/// Dropping it made the native return `null` for the overwhelmingly common
+/// case, which is not merely a missing print: the JDK's
+/// `Thread.dispatchUncaughtException(Throwable)` — the fallback this VM invokes
+/// when it finds no handler of its own — is
+/// `getUncaughtExceptionHandler().uncaughtException(this, e)`, so a null there
+/// is an immediate `NullPointerException` *inside the uncaught-exception
+/// handler*. Every uncaught exception on a thread with no explicit handler
+/// therefore became a double fault that named neither throwable. Measured
+/// against HotSpot on the same class file (`UncaughtProbe`):
+/// `t.getUncaughtExceptionHandler()` is `ThreadGroup[name=main,maxpri=10]`
+/// there and was `null` here.
+///
+/// Two layouts are accepted, in the order `Thread.getThreadGroup()` itself
+/// would resolve them: JDK 19+ keeps `group` on the inner
+/// `Thread$FieldHolder`, older layouts keep it directly on `Thread`. A virtual
+/// thread has no `FieldHolder` at all and answers `None` here — correct by
+/// omission rather than by accident, since the JDK gives virtual threads a
+/// constant group whose `uncaughtException` this VM does not route through
+/// this native.
+fn real_thread_group(ctx: &dyn NativeContext, thread: ObjectRef) -> Option<ObjectRef> {
+    if let Value::Object(Some(holder)) = ctx.get_field_by_name(thread, "holder") {
+        if let Value::Object(Some(group)) = ctx.get_field_by_name(holder, "group") {
+            return Some(group);
+        }
+    }
+    match ctx.get_field_by_name(thread, "group") {
+        Value::Object(Some(group)) => Some(group),
+        _ => None,
+    }
+}
+
 fn store_handler(ctx: &mut dyn NativeContext, thread: ObjectRef, handler: ObjectRef) {
     let tkey = ctx.identity_hash_code(thread);
     {
@@ -245,10 +286,17 @@ pub fn register_uncaught_handler_natives(r: &mut NativeMethodRegistry) {
         },
     );
 
-    // getUncaughtExceptionHandler() — instance.  Per spec, falls back
-    // to ThreadGroup or default-handler when unset.  We approximate
-    // that by returning the registered per-instance handler if any,
-    // else the default handler, else null.
+    // getUncaughtExceptionHandler() — instance.  Per spec, falls back to the
+    // process default and then to the thread's ThreadGroup when unset.
+    //
+    // The ThreadGroup rung used to be missing, and the comment here used to
+    // call that an "approximation". It was not an approximation, it was the
+    // default case: a thread with no explicit handler is every thread a
+    // program creates, so this native answered `null` almost always — and
+    // `Thread.dispatchUncaughtException` is
+    // `getUncaughtExceptionHandler().uncaughtException(this, e)`, so `null`
+    // there is an NPE raised inside the uncaught-exception handler itself.
+    // See `real_thread_group`.
     r.register(
         th,
         "getUncaughtExceptionHandler",
@@ -266,12 +314,17 @@ pub fn register_uncaught_handler_natives(r: &mut NativeMethodRegistry) {
             {
                 return Ok(Some(Value::Object(Some(h))));
             }
-            Ok(
-                match default_uncaught_handler(&*ctx).or_else(|| real_default_handler(&*ctx)) {
-                    Some(h) => Some(Value::Object(Some(h))),
-                    None => Some(Value::Object(None)),
-                },
-            )
+            // Then the process-wide default, then the ThreadGroup. The last
+            // rung is what the JDK returns for a thread with no handler of its
+            // own, and `ThreadGroup.uncaughtException` is what prints
+            // `Exception in thread "..."` and the stack trace.
+            let fallback = default_uncaught_handler(&*ctx)
+                .or_else(|| real_default_handler(&*ctx))
+                .or_else(|| real_thread_group(&*ctx, this));
+            Ok(match fallback {
+                Some(h) => Some(Value::Object(Some(h))),
+                None => Some(Value::Object(None)),
+            })
         },
     );
 
