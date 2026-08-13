@@ -4,10 +4,11 @@
 revision recorded as needing "a workload that genuinely fills the old
 generation" are fixed in wave 7; that prerequisite turned out to be only half
 the story, and the other half was two configuration gates and one hardcoded
-argument. Two unrelated residuals keep this page open — a NEW and unexplained
-phantom-extent finding under memory pressure, and the
-16-bytes-per-empty-object retention, which is measured and deliberately left
-alone.
+argument. Both residuals have now been taken on (2026-08-13). The phantom-extent finding
+is **NOT REPRODUCIBLE** — 25 runs, including at the commit it was recorded at —
+so it stays open as an unexplained observation with a leading hypothesis and a
+new discriminator, not as a live defect. The 16-bytes-per-empty-object retention
+is **re-measured on current dev and the deferral stands**.
 
 ## Background
 
@@ -197,24 +198,57 @@ enumeration is what `collect_young_to_old_roots` turns into the concurrent
 marker's young→old roots, and its call site calls those mandatory — "a missed
 mark root here = cleanup frees a live object".
 
-### Phantom extents under memory pressure — NEW, unexplained
+### Phantom extents under memory pressure — NOT REPRODUCIBLE (2026-08-13)
 
-Found while reaching for the sites above, and not part of this family:
+The original observation, kept because it was real when taken:
 
 | | 700m | 450m | 320m |
 |---|---|---|---|
 | `phantom_extents` (sequential walk) | 0 | 224 | 847 |
 | `par_accepts` / `par_attempts` | 8/8 | 3/13 | 2/20 |
 | chunk bails, reason | — | `phantom=12` | `phantom=66` |
+| `sp_evacuated` | 162 002 | 235 764 | 83 221 |
 
-Every bail is reason `phantom` — a header whose extent subsumes a marked object
-base, which is the corruption family, not a benign shape (`zero_span=0` and all
-three zero-run refusals 0 at every size). It appears only when selective
-promotion is active, which makes forwarded headers the obvious suspect —
-**ruled out**: `ObjectHeader::make_forwarded` is
-`quartet_of(prev) | target | MARK_FORWARDED`, so kind, element type, `gc_age`
-and `gc_flags` all survive forwarding and `gen_object_total_size` sizes a
-forwarded header correctly. Sample reports:
+**It does not reproduce.** Re-run against the documented recipe (batch-01 class,
+`-XX:+UseGenerationalGC`, `CRATONVM_GC_STATS=1`), every run reading
+`phantom_extents=0`, `live_in_dead=0`, `par_accepts == par_attempts` and every
+chunk-bail reason 0:
+
+* **6 heap sizes** — 700m, 450m, 320m, 260m, 220m, 190m.
+* **12 classes** — all of batch-01 at 320m.
+* **2 binaries, ABBA-interleaved** at 320m — current dev AND a build of
+  `5defebbb0^`, i.e. the commit the numbers above were taken at. So this is not
+  "wave 4 fixed it": it does not reproduce at its own commit either.
+* The stated precondition IS satisfied — selective promotion is active in every
+  run (`sp_selective=5..14`, `sp_evacuated=669..114085`), so this is not the
+  "narrow probe reports its own reach" failure.
+
+What differs is scale of work, not configuration: the original 700m run
+evacuated 162 002 objects where the re-run evacuates 669. Those runs were taken
+on a host at load >100 with 45 leaked Testcontainers containers, and the honest
+reading is that the trigger is a timing/pressure regime that a quiet host does
+not enter, not a code path that has since changed.
+
+#### The leading hypothesis, and the discriminator that would settle it
+
+The check's premise is "`side_sorted` holds object BASES, and live objects never
+nest". The first half has one documented exception, in `mark_young`'s own
+comment:
+
+> When the anchor oracle cannot resolve a candidate ... the code below falls
+> back to side-marking the RAW candidate address — which is correct only if the
+> candidate happens to BE a base.
+
+A conservative candidate is frequently an object-INTERIOR word, and the
+late-resolution pass that marks the real base cannot unmark the raw address — so
+`side_sorted` can carry both. An interior mark of a perfectly VALID object then
+satisfies the phantom premise exactly. That fits every feature of the finding:
+`live_in_dead=0` throughout (nothing was ever freed wrongly — the object is
+retained, the sweep just discards its own work), the correlation with selective
+promotion and with memory pressure (more fragmentation → more unresolved
+candidates), and both sample reports, whose heads size CONSISTENTLY
+(`144 = 16 + 16×8`, `272 = 16 + 16×16`) with the victim at an interior offset of
+32 and 128:
 
 ```
 offset=513936 span_bytes=144 span_head_class_id=0    kind_byte=1 num_slots=16
@@ -223,10 +257,22 @@ offset=518792 span_bytes=272 span_head_class_id=65   kind_byte=0 num_slots=16
              victim_interior_offset=128 last_anchor_off=518440
 ```
 
-`live_in_dead=0` throughout, so the guard is catching it and re-anchoring before
-anything is freed — it is a throughput cost and a grid-integrity signal, not a
-known reclamation bug. Repro: any batch-01 class at `--Xmx 320m` under
-`-XX:+UseGenerationalGC` with `CRATONVM_GC_STATS=1`.
+It is a hypothesis, not a measurement, and 25 runs could not promote it. So what
+landed is the **discriminator**, not a fix: `SWEEP_PHANTOM_INTERIOR_MARKS`
+(`[GC] young_sweep: … phantom_nonbase_marks=`) counts how many of the marks a
+reported extent subsumes are unresolved RAW candidates, and the bounded report
+gained `victim_is_unresolved_raw` and `nonbase_marks_inside`. Read beside
+`phantom_extents`: **equal counts say the guard is firing on interior marks;
+zero says the subsumed marks were real bases and the walk really did leave the
+grid.** One line, next occurrence, instead of another 25 runs.
+
+**The verdict itself is deliberately unchanged.** Screening interior marks out
+of the check is a one-line change and it is tempting, but it would weaken a
+CORRUPTION guard on a symptom that cannot currently be reproduced, and it would
+cost detection for a real phantom whose only subsumed mark happens to be an
+unresolved candidate. That trade needs the counter's evidence first. The
+end-of-sweep `dead_regions` × `side_sorted` merge remains the backstop either
+way, and it RETAINS rather than zeroes.
 
 ### The 16-bytes-per-empty-object retention — MEASURED, and deliberately not closed
 
@@ -270,3 +316,24 @@ clobbered, a family that has cost this codebase several investigations.
 The instrument is kept so the decision is re-checkable rather than a remembered
 opinion: if a workload ever shows this figure growing with cycle count, that is
 new evidence and the trade changes.
+
+**Re-checked 2026-08-13, after waves 5–7.** Same instrument, same class
+(`BatchingConnectionTest`, `-XX:+UseGenerationalGC`), current dev — the point
+being that waves 6 and 7 added two more sites that step over empty-object runs,
+so the standing retention could have grown:
+
+| `-Xmx` | retained | young used | fraction |
+|---|---|---|---|
+| 700m | 21 728 B | 96.2 MB | 0.023% |
+| 450m | 11 520 B | 96.3 MB | 0.012% |
+| 320m | 19 072 B | 52.6 MB | 0.036% |
+| 260m | 20 768 B | 68.2 MB | 0.030% |
+| 220m | 19 040 B | 57.4 MB | 0.033% |
+| 190m | 20 256 B | 49.7 MB | 0.041% |
+
+11.5–21.7 KB against 13–29 KB before, and the fraction ceiling is 0.041% against
+0.045%. No growth, and the two new sites did not move it — which is what the
+mechanism predicts, since both of them run on paths that reclaim nothing
+(`fixup_young_old_refs` walks a freshly-compacted to-space, and
+`walk_young_objects` only enumerates). **The deferral stands, on fresh numbers
+rather than on the earlier decision being remembered.**
