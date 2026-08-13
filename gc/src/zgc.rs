@@ -3069,6 +3069,58 @@ impl ZgcRealHeap {
         // no thread holding a clone of `bridge` outlives this borrow of `self`.
     }
 
+    /// Logical page size for the relocation-set view over the arena.
+    ///
+    /// The arena is one flat span with no pages, and `zgc::page`'s allocator
+    /// is not adopted -- replacing `Arena` with it is a rewrite of the
+    /// allocation path, not an increment. But `forwarding`'s relocation-set
+    /// SELECTOR only needs pages as an accounting unit: a page id, the live
+    /// bytes on it, and its allocated extent. Imposing a logical grid over the
+    /// arena gives it all three, which is what turns compaction from "slide
+    /// the whole region" into "evacuate the pages whose garbage pays for the
+    /// copy".
+    ///
+    /// 2 MiB matches `ZPageConfig`'s Small page size, so the accounting unit
+    /// is the one the rest of the ZGC modules already reason in, and it is
+    /// four times `ZGC_TLAB_MAX_CHUNK` -- big enough that a page is not a
+    /// single thread's chunk, small enough to be a useful granularity on the
+    /// 64 MiB default heap.
+    const Z_LOGICAL_PAGE_BYTES: usize = 2 * 1024 * 1024;
+
+    /// Build the relocation-set candidates: one per logical page, with the
+    /// live bytes and allocated extent the selector ranks on.
+    ///
+    /// `live` is the post-sweep live set, so a page's live bytes is the sum of
+    /// its survivors' sizes and its garbage is `extent - live` -- the "benefit
+    /// side" `PageCandidate::capacity_bytes`'s own doc insists must be the
+    /// bump extent and not the page span, because bytes never allocated cost
+    /// nothing to reclaim and counting them inverts the ranking.
+    fn page_candidates(&self, live: &[usize], base: usize, low_end: usize) -> Vec<forwarding::PageCandidate> {
+        let page_of = |addr: usize| ((addr - base) / Self::Z_LOGICAL_PAGE_BYTES) as u64;
+        let pages = (low_end - base).div_ceil(Self::Z_LOGICAL_PAGE_BYTES);
+        let mut live_bytes = vec![0usize; pages.max(1)];
+        for addr in live {
+            if *addr < base || *addr >= low_end {
+                continue;
+            }
+            let size = Self::alloc_size(self.header_ref(*addr as *mut u8)).unwrap_or(0);
+            live_bytes[page_of(*addr) as usize] += size;
+        }
+        (0..pages)
+            .map(|i| {
+                let page_start = base + i * Self::Z_LOGICAL_PAGE_BYTES;
+                let page_end = (page_start + Self::Z_LOGICAL_PAGE_BYTES).min(low_end);
+                forwarding::PageCandidate {
+                    page_id: i as u64,
+                    live_bytes: live_bytes[i],
+                    // The bump extent of this page, not its span.
+                    capacity_bytes: page_end.saturating_sub(page_start),
+                    size_class_index: forwarding::ZFWD_SIZE_CLASS_SMALL,
+                }
+            })
+            .collect()
+    }
+
     /// Is the default-off stop-the-world compaction sub-flag set?
     ///
     /// `CRATONVM_ZGC_RELOCATE=1`. This is the sub-flag the production plan's
@@ -3170,11 +3222,54 @@ impl ZgcRealHeap {
             // only be copied into space a lower-addressed survivor has already
             // vacated. Out-of-order copying overwrites a survivor that has not
             // moved yet -- silent heap corruption, not a failed assert.
-            let mut survivors: Vec<usize> =
-                live.iter().copied().filter(|b| *b >= base && *b < low_end).collect();
+            // ---- Which pages are worth evacuating -------------------------
+            //
+            // `forwarding::ZRelocationSet::select` is the real ZGC selector
+            // and this is its first production caller. It ranks the logical
+            // pages by profitability -- copy cost is live bytes, benefit is
+            // `extent - live` -- refuses pages above `max_live_occupancy`
+            // (0.25 by default: copy one byte to reclaim at least three), and
+            // stops at `max_evacuation_bytes`.
+            //
+            // Without it this function slid the WHOLE low region every cycle,
+            // which copies a dense, wholly-live page for no reclaim at all.
+            // With it, a page that is 90% live is left to decay.
+            let candidates = self.page_candidates(live, base, low_end);
+            let policy = forwarding::ZRelocationPolicy::default();
+            let reloc_set = forwarding::ZRelocationSet::select(&candidates, &policy);
+            let selected: std::collections::HashSet<u64> =
+                reloc_set.pages().iter().map(|p| p.page_id).collect();
+            if selected.is_empty() {
+                // Nothing profitable to move. Not a failure -- it is the
+                // selector doing its job on a heap whose pages are all dense.
+                let reclaimed = arena.retract_cursor_into_free_tail();
+                return (0, reclaimed, pointer_map);
+            }
+
+            let page_of = |addr: usize| ((addr - base) / Self::Z_LOGICAL_PAGE_BYTES) as u64;
+            // Survivors ON THE SELECTED PAGES ONLY. An object on an unselected
+            // page must not move, so the slide's destination cursor has to
+            // start above the highest unselected survivor -- see below.
+            let mut survivors: Vec<usize> = live
+                .iter()
+                .copied()
+                .filter(|b| *b >= base && *b < low_end)
+                .filter(|b| selected.contains(&page_of(*b)))
+                .collect();
             survivors.sort_unstable();
 
-            let mut dest = base;
+            // The slide may only use space below the first page it is allowed
+            // to disturb. Sliding into an unselected page would overwrite
+            // survivors this cycle promised not to touch.
+            let first_selected_page = reloc_set
+                .pages()
+                .iter()
+                .map(|p| p.page_id)
+                .min()
+                .expect("non-empty, checked above");
+            let slide_floor = base + first_selected_page as usize * Self::Z_LOGICAL_PAGE_BYTES;
+
+            let mut dest = slide_floor;
             for from in survivors {
                 let Some(size) = Self::alloc_size(self.header_ref(from as *mut u8)) else {
                     // A header this collector cannot size cannot be moved, and
@@ -3201,7 +3296,24 @@ impl ZgcRealHeap {
                 }
                 dest = to + size;
             }
-            reclaimed = arena.compact_low_to(dest - base);
+            // The cursor may only drop to the compacted end if nothing that
+            // STAYED PUT lives above it.
+            //
+            // Only UNSELECTED survivors count here. An object on a selected
+            // page has already been slid down, so its entry in `live` names an
+            // address it no longer occupies -- taking the maximum over the
+            // whole live set pins the cursor at the pre-compaction top and
+            // reclaims exactly nothing, which is what the first draft did.
+            let highest_pinned_end = live
+                .iter()
+                .copied()
+                .filter(|b| *b >= base && *b < low_end)
+                .filter(|b| !selected.contains(&page_of(*b)))
+                .map(|b| b + Self::alloc_size(self.header_ref(b as *mut u8)).unwrap_or(0))
+                .max()
+                .unwrap_or(base);
+            let new_cursor = dest.max(highest_pinned_end) - base;
+            reclaimed = arena.compact_low_to(new_cursor);
         }
 
         if moved == 0 {
@@ -9197,6 +9309,72 @@ pub(crate) mod tests {
                 }
             },
         );
+    }
+
+    /// **The relocation-set selector actually refuses a dense page.**
+    ///
+    /// Adopting `forwarding::ZRelocationSet::select` only means something if
+    /// its policy changes an outcome. A page whose live occupancy is at or
+    /// above `max_live_occupancy` (0.25 by default -- copy one byte to reclaim
+    /// at least three) must be left to decay rather than copied for nothing,
+    /// and this is the test that says so: every object is live, so there is no
+    /// garbage to reclaim and the profitable move is not to move.
+    ///
+    /// Without the selector this function slid the whole low region every
+    /// cycle, which on this fixture copies every byte and reclaims none. The
+    /// exact edit that trips it: drop the `select` call and slide everything.
+    #[test]
+    fn the_selector_refuses_to_evacuate_a_page_with_no_garbage_to_reclaim() {
+        let heap = ZgcRealHeap::with_capacity(256 * 1024);
+        heap.set_tlab_enabled(false);
+        let mut all = Vec::new();
+        for _ in 0..24 {
+            all.push(heap.alloc_object(ClassId::new(1), 4));
+        }
+        // EVERY object is live: occupancy 1.0, garbage 0.
+        let live: Vec<usize> = all.iter().map(|o| o.as_ptr() as usize).collect();
+
+        let (moved, _reclaimed, map) = heap.relocate_stw(&live);
+
+        assert_eq!(
+            moved, 0,
+            "a wholly-live page is pure copy cost and zero reclaim; the policy \
+             must refuse it"
+        );
+        assert!(map.is_empty(), "nothing moved, so nothing to remap");
+        // ...and every object is still readable where it was.
+        for o in &all {
+            assert!(heap.registry.contains(o.as_ptr() as usize));
+        }
+    }
+
+    /// ...and it still evacuates a page that IS mostly garbage.
+    ///
+    /// The pair to the test above: a policy that refused everything would
+    /// satisfy that one and would have turned compaction off entirely.
+    #[test]
+    fn the_selector_still_evacuates_a_page_that_is_mostly_garbage() {
+        let heap = ZgcRealHeap::with_capacity(256 * 1024);
+        heap.set_tlab_enabled(false);
+        let mut survivors = Vec::new();
+        for i in 0..40 {
+            let o = heap.alloc_object(ClassId::new(1), 4);
+            // One in ten survives: occupancy 0.1, well under the 0.25 cutoff.
+            if i % 10 == 0 {
+                survivors.push(o);
+            }
+        }
+        let live: Vec<usize> = survivors.iter().map(|o| o.as_ptr() as usize).collect();
+
+        let (moved, reclaimed, map) = heap.relocate_stw(&live);
+
+        assert!(
+            moved > 0,
+            "a page that is 90% garbage is exactly what the policy exists to \
+             evacuate"
+        );
+        assert!(reclaimed > 0, "and the cursor must come back down");
+        assert!(!map.is_empty());
     }
 
     /// The intent sub-flag is off unless asked for.

@@ -65,7 +65,39 @@ The machinery is not missing — it is *unadopted*. Counting symbol uses of each
 | `adapters` | **0** | no |
 
 Six of twelve, and the six that are missing are exactly the moving,
-generational and concurrent halves. Three specific facts make this concrete:
+generational and concurrent halves.
+
+> **Re-counted 2026-08-13, after Phases 3 and 4: eight of twelve.** Same
+> method, same command, `zgc.rs` outside its `mod tests`:
+>
+> | submodule | uses, 08-13 morning | uses, after this work |
+> |---|---:|---:|
+> | `census` | 24 | 25 |
+> | `mark` | 16 | 25 |
+> | `tlab` | 11 | 13 |
+> | `vaddr` | 9 | 8 |
+> | `forwarding` | **0** | **7** |
+> | `barrier` | **0** | **6** |
+> | `page` | 2 | 2 |
+> | `metrics` | 1 | 1 |
+> | `generation` | 0 | **0** |
+> | `relocate` | 0 | **0** |
+> | `remembered` | 0 | **0** |
+> | `adapters` | 0 | **0** |
+>
+> `forwarding` is adopted for its **relocation-set selector**, which now
+> decides what compaction moves; `barrier` for its `ZBarrierContext`, which is
+> drivable but on no read path. The four still at zero are the honest remainder
+> and each is blocked on the same thing: **`zgc::page`'s allocator**.
+> `relocate`'s machinery is the *concurrent* evacuator and wants real pages to
+> evacuate; `generation` and `remembered` want pages to age and to record
+> cross-generational edges between. Replacing `Arena` with the page allocator
+> is a rewrite of the allocation path, not an increment, and it is the single
+> next thing that unblocks all four. The logical-page grid this work imposed
+> over the arena (`Z_LOGICAL_PAGE_BYTES`) is deliberately an *accounting* view
+> only — enough for the selector, not a substitute for the allocator.
+
+Three specific facts make this concrete:
 
 * **Relocation is hard-coded off.** `vm/src/vm/vm_init.rs:1713` —
   `const RELOCATION_REQUESTED: bool = false;`
