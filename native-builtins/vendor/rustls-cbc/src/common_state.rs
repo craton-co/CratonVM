@@ -571,6 +571,56 @@ impl CommonState {
         err.into()
     }
 
+    /// True if the peer has sent us a `close_notify` alert — the TLS
+    /// mechanism for securely half-closing a connection.
+    ///
+    /// **CratonVM addition — not upstream rustls.** Upstream exposes this only
+    /// through the [`IoState`] that `process_new_packets()` returns, i.e. only
+    /// to a caller that keeps the result of the call that consumed the alert.
+    /// CratonVM's `javax.net.ssl.SSLEngine` bridge needs it as a *state*
+    /// question: JSSE's `unwrap` reports `Status.CLOSED` on that call **and
+    /// every call after it**, and that report is the only way a caller learns
+    /// the connection closed cleanly rather than dropped (netty's
+    /// `SslHandler.unwrap` switches on exactly it to fire
+    /// `SslCloseCompletionEvent`).
+    ///
+    /// [`IoState`]: crate::IoState
+    pub fn has_received_close_notify(&self) -> bool {
+        self.has_received_close_notify
+    }
+
+    /// Queues a **fatal** alert of `desc` to be sent in the next
+    /// [`Connection::write_tls`] call.
+    ///
+    /// **CratonVM addition — not upstream rustls.** CratonVM's
+    /// `javax.net.ssl.SSLEngine` lets the application reject a peer
+    /// certificate chain *after* rustls has accepted it: a custom
+    /// `X509TrustManager` is Java code, and it cannot run inside rustls's own
+    /// verifier callback, which executes while the engine registry lock is
+    /// held (calling into the JVM there can allocate, collect, and re-enter
+    /// that same lock). JSSE's contract for such a rejection is that the peer
+    /// is told with a fatal alert; with no way to queue one the peer saw only
+    /// a TCP close and could not tell a rejected certificate from a dropped
+    /// network — which is exactly the difference netty's
+    /// `ParameterizedSslHandlerTest.testAlertProducedAndSend` waits forever
+    /// for.
+    ///
+    /// Idempotent, and subject to the same guard as [`Self::send_close_notify`]:
+    /// once any fatal alert or `close_notify` has been queued, further calls
+    /// do nothing. That replaces `send_fatal_alert`'s `debug_assert!`, which
+    /// would abort a debug build on a second rejection.
+    ///
+    /// [`Connection::write_tls`]: crate::Connection::write_tls
+    pub fn queue_fatal_alert(&mut self, desc: AlertDescription) {
+        if self.sent_fatal_alert {
+            return;
+        }
+        debug!("Sending fatal alert {:?}", desc);
+        let m = Message::build_alert(AlertLevel::Fatal, desc);
+        self.send_msg(m, self.record_layer.is_encrypting());
+        self.sent_fatal_alert = true;
+    }
+
     /// Queues a `close_notify` warning alert to be sent in the next
     /// [`Connection::write_tls`] call.  This informs the peer that the
     /// connection is being closed.

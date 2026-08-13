@@ -10756,6 +10756,20 @@ fn jdk_interfaces(name: &str) -> &'static [&'static str] {
         // checkcast/instanceof honest — what this table is for — without
         // putting an aliased field layout into the dispatch chain.
         "cratonvm/synthetic/Process" => &["java/lang/Process"],
+        // The platform MXBean *extension* interfaces. `ManagementFactory
+        // .getThreadMXBean()` / `.getOperatingSystemMXBean()` fabricate their
+        // beans under these names so that `instanceof com.sun.management.…`
+        // answers true, the way it does on every real JVM (see
+        // `native-builtins/src/jmx.rs::alloc_extension_mxbean`). In real-JDK
+        // mode the extends-relation comes from the loaded class file; in
+        // synthetic-JDK mode there is no class file, so without these entries
+        // the fabricated stub would satisfy the extension `instanceof` and
+        // FAIL the base one — trading one broken type test for another, in the
+        // direction that breaks existing callers.
+        "com/sun/management/ThreadMXBean" => &["java/lang/management/ThreadMXBean"],
+        "com/sun/management/OperatingSystemMXBean" => {
+            &["java/lang/management/OperatingSystemMXBean"]
+        }
         "java/lang/String" => &[
             "java/io/Serializable",
             "java/lang/Comparable",

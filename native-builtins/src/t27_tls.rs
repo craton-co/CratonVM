@@ -8030,6 +8030,23 @@ impl EngineConn {
             EngineConn::Server(s) => s.send_close_notify(),
         }
     }
+    /// Queue a fatal alert for the peer — see
+    /// `rustls::CommonState::queue_fatal_alert` (a CratonVM addition to the
+    /// vendored fork) for why this exists and why it is idempotent.
+    fn queue_fatal_alert(&mut self, desc: rustls::AlertDescription) {
+        match self {
+            EngineConn::Client(c) => c.queue_fatal_alert(desc),
+            EngineConn::Server(s) => s.queue_fatal_alert(desc),
+        }
+    }
+    /// Has the peer sent us a `close_notify`? The inbound half of the
+    /// connection is then closed for good — see `do_unwrap`'s CLOSED report.
+    fn peer_has_closed(&self) -> bool {
+        match self {
+            EngineConn::Client(c) => c.has_received_close_notify(),
+            EngineConn::Server(s) => s.has_received_close_notify(),
+        }
+    }
     fn peer_certificates(&self) -> Option<&[CertificateDer<'static>]> {
         match self {
             EngineConn::Client(c) => c.peer_certificates(),
@@ -8413,6 +8430,21 @@ fn alloc_engine_result(
 /// Compute the next handshake status from an EngineState.
 fn handshake_status_of(s: &EngineState) -> i32 {
     if s.closed_inbound && s.closed_outbound {
+        // …but a fully-closed engine can still OWE the peer a record. The
+        // automatic TLS 1.2 `close_notify` response (see `do_unwrap`) closes
+        // both halves and queues the reply in one step, and rustls holds that
+        // reply until a `write_tls` — which only happens if the caller is told
+        // to `wrap` again. Answering NOT_HANDSHAKING here made netty stop
+        // wrapping and the reply was never emitted: `CloseNotifyTest`'s TLS 1.2
+        // parameterisation read `null` where the client's own close_notify
+        // belonged.
+        //
+        // `wants_write()` as well as `outbound`, because the queue that matters
+        // here is rustls's — `outbound` only holds what a previous `wrap`
+        // already drained out of it.
+        if !s.outbound.is_empty() || s.conn.as_ref().is_some_and(|c| c.wants_write()) {
+            return HS_NEED_WRAP_R;
+        }
         return HS_NOT_HANDSHAKING_R;
     }
     // `write_tls()` may have produced more than one complete TLS record. A
@@ -9493,6 +9525,9 @@ fn engine_capture_negotiation(state: &mut EngineState) {
 /// (`trust_ctx_key`), so this can safely cross the lock-drop boundary before
 /// `engine_run_trust_check` (which calls into Java) runs.
 struct PendingTrustCheck {
+    /// The engine this check belongs to, so a rejection can queue the fatal
+    /// alert JSSE sends the peer — see `reject_peer_with_fatal_alert`.
+    engine_id: i32,
     is_client: bool,
     peer_chain_der: Vec<Vec<u8>>,
     /// `None` when the owning `SSLContext` has no `TrustManager[]` attached —
@@ -9524,7 +9559,7 @@ fn endpoint_alg_verifies_identity(alg: &str) -> bool {
 /// deferred to `engine_run_trust_check` specifically so no allocating/GC-
 /// triggering call ever happens while this lock is held (see
 /// `EngineState::trust_managers_ctx_key`'s doc for why that matters).
-fn engine_take_pending_trust_check(state: &mut EngineState) -> Option<PendingTrustCheck> {
+fn engine_take_pending_trust_check(id: i32, state: &mut EngineState) -> Option<PendingTrustCheck> {
     if state.trust_check_done {
         return None;
     }
@@ -9567,6 +9602,7 @@ fn engine_take_pending_trust_check(state: &mut EngineState) -> Option<PendingTru
         .and_then(|c| c.negotiated_cipher_suite())
         .map(|cs| format!("{:?}", cs.suite()));
     Some(PendingTrustCheck {
+        engine_id: id,
         is_client: state.is_client,
         peer_chain_der: state.peer_cert_chain_der.clone(),
         trust_ctx_key,
@@ -9741,6 +9777,7 @@ fn engine_run_trust_check(
     if rejected {
         let detail = rejection.unwrap_or_else(|| "no exception detail available".to_string());
         set_last_trust_rejection_detail(&detail);
+        reject_peer_with_fatal_alert(pending.engine_id);
         return Err(crate::phases_early::throw_jca_exc(
             ctx,
             "javax/net/ssl/SSLHandshakeException",
@@ -9748,6 +9785,35 @@ fn engine_run_trust_check(
         ));
     }
     engine_check_endpoint_identity(ctx, &pending, jsse_identifies)
+}
+
+/// Tell the peer that its certificate was refused, the way JSSE does: queue a
+/// fatal `certificate_unknown` alert on the engine's rustls connection.
+///
+/// This is the missing half of a `TrustManager` rejection. rustls has already
+/// ACCEPTED the chain by the time the Java manager is consulted (the
+/// consultation is deliberately deferred until after `process_new_packets`, so
+/// that calling into the JVM never happens while the engine registry lock is
+/// held), so rustls itself generates no alert. Throwing
+/// `SSLHandshakeException` locally and sending nothing left the peer with an
+/// unexplained TCP close: netty's
+/// `ParameterizedSslHandlerTest.testAlertProducedAndSend` waits for an
+/// `SSLException` derived from that alert and blocked forever without it
+/// (~170x HotSpot's 6 s, still running after 17 minutes).
+///
+/// `certificate_unknown` is the description JSSE maps a `CertificateException`
+/// from a `TrustManager` to. The record itself is emitted by the next `wrap`,
+/// which netty performs because `setHandshakeFailure` -> `ctx.close()` ->
+/// `closeOutboundAndChannel` flushes an empty buffer through the engine.
+///
+/// Takes no `NativeContext` and calls no Java: it must be safe to run on the
+/// rejection path, which is already unwinding.
+fn reject_peer_with_fatal_alert(engine_id: i32) {
+    with_engine(engine_id, |s| {
+        if let Some(c) = s.conn.as_mut() {
+            c.queue_fatal_alert(rustls::AlertDescription::CertificateUnknown);
+        }
+    });
 }
 
 /// Would real JSSE perform endpoint identification itself for this
@@ -9892,6 +9958,9 @@ fn engine_check_endpoint_identity(
                 eprintln!("[dbg-tls-auth] {detail}");
             }
             set_last_trust_rejection_detail(&detail);
+            // Same reasoning as the TrustManager rejection above: the peer has
+            // to be told, or it sees an unexplained close.
+            reject_peer_with_fatal_alert(pending.engine_id);
             Err(crate::phases_early::throw_jca_exc(
                 ctx,
                 "javax/net/ssl/SSLHandshakeException",
@@ -9934,6 +10003,12 @@ pub(crate) fn run_client_trust_check_for_chain(
     engine_run_trust_check(
         ctx,
         PendingTrustCheck {
+            // No SSLEngine here: this is the native client-socket path, whose
+            // rustls connection is owned by `servlet::s2_tls_connect` and is
+            // not in `engine_registry`. `reject_peer_with_fatal_alert` is a
+            // no-op for an id that names no engine, which is the right answer
+            // — that path tears the socket down itself.
+            engine_id: -1,
             is_client: true,
             peer_chain_der,
             trust_ctx_key: Some(trust_ctx_key),
@@ -10654,18 +10729,54 @@ fn do_wrap(
         );
     }
 
-    // Closed-outbound short-circuit.
+    // Closed outbound — but NOT a short circuit.
+    //
+    // `closeOutbound()` queues a `close_notify` on the rustls connection, and
+    // a fatal alert may be queued there too (a `TrustManager` rejection — see
+    // `engine_run_trust_check`). The wrap that FOLLOWS the close is the call
+    // JSSE specifies as the one that emits that record: `wrap` returns
+    // `Status.CLOSED` with `bytesProduced` equal to the alert's length, and
+    // only once the queue is empty does it produce nothing.
+    //
+    // This used to return `CLOSED, produced=0` immediately, so the alert was
+    // generated, encrypted, and then left in rustls's write queue forever.
+    // Measured consequences, all one defect:
+    //   * netty's `CloseNotifyTest` / `ApplicationProtocolNegotiationHandlerTest`
+    //     see an EMPTY outbound buffer where a close_notify record belongs
+    //     (`assertCloseNotify`: "0 to be greater than or equal to 7");
+    //   * `ParameterizedSslHandlerTest.testAlertProducedAndSend` blocks
+    //     forever in `awaitUninterruptibly()` — the peer is waiting for an
+    //     alert that is sitting in this queue.
+    //
+    // The drain below is the ordinary path; `closed` only suppresses reading
+    // application data from `srcs` (JSSE consumes nothing after close) and
+    // forces the reported status to CLOSED.
     let closed = with_engine(id, |s| s.closed_outbound).unwrap_or(false);
     if closed {
+        let no_conn = with_engine(id, |s| s.conn.is_none()).unwrap_or(true);
+        let nothing_queued = with_engine(id, |s| s.outbound.is_empty()).unwrap_or(true);
+        if no_conn && nothing_queued {
+            // Closed before anything was ever negotiated: there is no record
+            // layer to encode an alert with, so CLOSED with nothing produced
+            // is the whole truth. Realizing a connection here would start a
+            // handshake for a closed engine.
+            if __dbg_hs {
+                eprintln!(
+                    "[dbg-tls-hs] thread={:?} do_wrap id={} CLOSED_NO_CONNECTION",
+                    std::thread::current().id(),
+                    id
+                );
+            }
+            let result = alloc_engine_result(ctx, SR_CLOSED, HS_NOT_HANDSHAKING_R, 0, 0);
+            return Ok(Some(Value::Object(Some(result?))));
+        }
         if __dbg_hs {
             eprintln!(
-                "[dbg-tls-hs] thread={:?} do_wrap id={} CLOSED_OUTBOUND_SHORT_CIRCUIT",
+                "[dbg-tls-hs] thread={:?} do_wrap id={} CLOSED_OUTBOUND_DRAIN",
                 std::thread::current().id(),
                 id
             );
         }
-        let result = alloc_engine_result(ctx, SR_CLOSED, HS_NOT_HANDSHAKING_R, 0, 0);
-        return Ok(Some(Value::Object(Some(result?))));
     }
 
     // Lazily realize rustls connection.
@@ -10711,14 +10822,17 @@ fn do_wrap(
     // wraps, which is why nothing but the WebSocket client ever noticed.
     let mut app_bytes = Vec::new();
     let mut consumed_app = 0usize;
-    let needs_app_data = with_engine(id, |s| {
-        s.handshake_finished_reported
-            && s.conn
-                .as_ref()
-                .map(|c| !c.is_handshaking())
-                .unwrap_or(false)
-    })
-    .unwrap_or(false);
+    // `!closed`: JSSE consumes nothing from `srcs` once `closeOutbound()` has
+    // been called — the only thing left to produce is the queued alert.
+    let needs_app_data = !closed
+        && with_engine(id, |s| {
+            s.handshake_finished_reported
+                && s.conn
+                    .as_ref()
+                    .map(|c| !c.is_handshaking())
+                    .unwrap_or(false)
+        })
+        .unwrap_or(false);
     if needs_app_data {
         for bb in &srcs {
             let n = bb_read_into(ctx, *bb, &mut app_bytes, 16384);
@@ -10763,17 +10877,37 @@ fn do_wrap(
         // lets Tomcat flush it and call wrap again for the remaining record.
         let status = if drained.is_empty() && !s.outbound.is_empty() {
             SR_BUFFER_OVERFLOW
+        } else if closed {
+            // JSSE: every wrap after `closeOutbound()` reports CLOSED,
+            // including the one that carries the close_notify / alert record.
+            // netty writes `out` BEFORE it looks at the status, so reporting
+            // CLOSED alongside a non-zero `bytesProduced` is exactly what gets
+            // the record onto the wire and then stops the wrap loop.
+            SR_CLOSED
         } else {
             SR_OK
         };
         engine_capture_negotiation(s);
-        let hs = handshake_status_of(s);
+        // A closed engine is not handshaking; it either still owes the peer
+        // the rest of its alert (NEED_WRAP, so a caller that loops keeps
+        // pulling) or it owes nothing.
+        let hs = if closed {
+            // `wants_write()` too: rustls may still be holding the alert that
+            // no `wrap` has drained into `outbound` yet.
+            if s.outbound.is_empty() && !s.conn.as_ref().is_some_and(|c| c.wants_write()) {
+                HS_NOT_HANDSHAKING_R
+            } else {
+                HS_NEED_WRAP_R
+            }
+        } else {
+            handshake_status_of(s)
+        };
         if hs == HS_FINISHED_R {
             s.handshake_finished_reported = true;
         }
         // Extract-only — see `engine_take_pending_trust_check`'s doc for why
         // the actual Java call must happen after this lock is dropped.
-        let pending_trust_check = engine_take_pending_trust_check(s);
+        let pending_trust_check = engine_take_pending_trust_check(id, s);
         (cons, status, hs, drained, pending_trust_check)
     };
     if let Some(pending) = pending_trust_check {
@@ -11154,10 +11288,32 @@ fn do_unwrap(
                             &format!("rustls: {}", e),
                         ));
                     }
-                    return Err(RuntimeError::IOException {
-                        message: format!("rustls process_new_packets: {}", e),
-                    }
-                    .into());
+                    // POST-handshake record-layer failure. `SSLException`, not
+                    // a bare `IOException`, for the same reason the handshake
+                    // branch above gives — and here it is load-bearing rather
+                    // than merely tidy: a **fatal alert from the peer** lands
+                    // on this line, and it is the only signal that says "the
+                    // other side rejected us" as opposed to "the socket
+                    // dropped". netty's
+                    // `ParameterizedSslHandlerTest.testAlertProducedAndSend`
+                    // waits for exactly `cause.getCause() instanceof
+                    // SSLException` and hung forever (~170x HotSpot's 6 s) on
+                    // the `IOException` this used to throw. `SSLException`
+                    // extends `IOException`, so every existing
+                    // `catch (IOException)` is unaffected.
+                    let msg = match e {
+                        rustls::Error::AlertReceived(desc) => {
+                            // JSSE's wording, so a caller matching on the
+                            // message sees what it sees on HotSpot.
+                            format!("Received fatal alert: {desc:?}")
+                        }
+                        other => format!("rustls process_new_packets: {other}"),
+                    };
+                    return Err(crate::phases_early::throw_jca_exc(
+                        ctx,
+                        "javax/net/ssl/SSLException",
+                        &msg,
+                    ));
                 }
                 let mut tmp = [0u8; 16384];
                 loop {
@@ -11198,13 +11354,60 @@ fn do_unwrap(
             // returning OK here makes Tomcat's handshake loop spin forever).
             status = SR_BUFFER_UNDERFLOW;
         }
+        // The peer's `close_notify` has arrived: JSSE reports CLOSED from this
+        // unwrap and every one after it, and that report is the ONLY way a
+        // caller learns the connection was closed cleanly rather than dropped.
+        //
+        // netty's `SslHandler.unwrap` switches on exactly this
+        // (`case CLOSED: notifyClosure = true`) to fire
+        // `SslCloseCompletionEvent`; without it `CloseNotifyTest` sees the
+        // decrypted response arrive and then no close event at all. Marking
+        // `closed_inbound` here is the same fact seen through
+        // `isInboundDone()`, which is how a caller that polls rather than
+        // switches finds out.
+        //
+        // CLOSED overrides BUFFER_UNDERFLOW deliberately: once the peer has
+        // closed there is no more network data to ask for, and telling the
+        // caller to read more is how a close turns into a spin.
+        if s.conn.as_ref().is_some_and(|c| c.peer_has_closed()) {
+            s.closed_inbound = true;
+            status = SR_CLOSED;
+            // TLS 1.2 and below: answer the peer's `close_notify` with our
+            // own, automatically, the way JSSE does.
+            //
+            // RFC 5246 §7.2.1 makes the response required; RFC 8446 §6.1 makes
+            // it optional, and JSSE's TLS 1.3 engine does NOT send one — an
+            // asymmetry netty encodes directly (`CloseNotifyTest.jdkTls13`
+            // takes a different branch for exactly this, and asserts the
+            // automatic response on every other parameterisation). rustls
+            // queues nothing on its own in either case, so under TLS 1.2 the
+            // peer waited for a record that was never coming:
+            // `ParameterizedSslHandlerTest.testCloseNotify`'s client promise
+            // never completed.
+            //
+            // Marking the engine outbound-closed as well is what JSSE does
+            // here too — an automatic close is a full close, and the next
+            // `wrap` is the one that emits the record (see `do_wrap`'s
+            // closed-outbound drain).
+            let responds = s
+                .conn
+                .as_ref()
+                .and_then(|c| c.protocol_version())
+                .is_some_and(|v| v != rustls::ProtocolVersion::TLSv1_3);
+            if responds && !s.closed_outbound {
+                s.closed_outbound = true;
+                if let Some(c) = s.conn.as_mut() {
+                    c.send_close_notify();
+                }
+            }
+        }
         let hs = handshake_status_of(s);
         if hs == HS_FINISHED_R {
             s.handshake_finished_reported = true;
         }
         // Extract-only — see `engine_take_pending_trust_check`'s doc for why
         // the actual Java call must happen after this lock is dropped.
-        let pending_trust_check = engine_take_pending_trust_check(s);
+        let pending_trust_check = engine_take_pending_trust_check(id, s);
         (status, hs, plaintext, pending_trust_check)
     };
     if let Some(pending) = pending_trust_check {

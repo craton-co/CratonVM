@@ -73,7 +73,7 @@ filed) · ❌ real blocker
 | `io.netty.buffer.PooledAlignedBigEndianDirectByteBufTest` | HANG | ✅ **417/417** vs the Unsafe-enabled oracle 417/417 (plain HotSpot starts 0) |
 | `io.netty.buffer.PooledBigEndianDirectByteBufTest` | HANG | ✅ **417/417** |
 | `io.netty.buffer.PooledBigEndianHeapByteBufTest` | FAIL/HANG | ✅ **417/417** |
-| `io.netty.buffer.PooledByteBufAllocatorTest` | HANG | ⚠ 46 ok / 1 abort vs HotSpot 45 ok / 2 abort — no failures either side. HotSpot skips `testArenaMetrics{,No}CacheAlign` (unsafe property (retired: `unsafe-memory-access-property-flips-netty-to-unsafe-paths-20260812`)), CratonVM runs them and passes; CratonVM skips `shouldReuseChunks` ([ThreadMXBean](threadmxbean-not-com-sun-extension-20260812.md)) |
+| `io.netty.buffer.PooledByteBufAllocatorTest` | HANG | ⚠ 46 ok / 1 abort vs HotSpot 45 ok / 2 abort — no failures either side. HotSpot skips `testArenaMetrics{,No}CacheAlign` (unsafe property (retired: `unsafe-memory-access-property-flips-netty-to-unsafe-paths-20260812`)), CratonVM runs them and passes; CratonVM skips `shouldReuseChunks` ([ThreadMXBean](../../internal/fixed-bugs/mxbean-not-com-sun-extension-FIXED-20260813.md) — FIXED 2026-08-13) |
 | `io.netty.buffer.PooledLittleEndianDirectByteBufTest` | HANG | ✅ **417/417** |
 | `io.netty.buffer.PooledLittleEndianHeapByteBufTest` | HANG | ✅ **417/417** |
 | `io.netty.buffer.ReadOnlyByteBufTest` | FAIL | ✅ **27/27** — repaired by the batch-07 `StackWalker$Option` fix, as that page predicted |

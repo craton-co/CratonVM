@@ -16091,23 +16091,82 @@ pub(crate) fn pbkdf2_get_algorithm(
 ) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     let key = pbkdf2_key_for(ctx, this);
-    let algo = skf_algo_table()
-        .lock()
-        .unwrap()
-        .get(&key)
-        .cloned()
-        .unwrap_or_default();
+    let algo = skf_algo_table().lock().unwrap().get(&key).cloned();
+    let Some(algo) = algo else {
+        // Not one of ours — see `skf_receiver_is_ours`. Answer from the real
+        // object's own field rather than from an empty table entry.
+        //
+        // Type-checked, not trusted: `get_field_by_name` can fall back to a
+        // name->slot mapping, and a slot that is not the field we asked for
+        // reads back as some other object entirely. Returning it would put a
+        // `String` where a `Provider` belongs (measured: the sibling
+        // `getProvider` did exactly that, and the caller got
+        // `NoSuchMethodError: java.lang.String.getName()`).
+        if let Value::Object(Some(s)) = ctx.get_field_by_name(this, "algorithm") {
+            if ctx
+                .class_name_of_id(ctx.class_id_of_object(s))
+                .is_some_and(|n| n == "java/lang/String")
+            {
+                return Ok(Some(Value::Object(Some(s))));
+            }
+        }
+        return Ok(Some(Value::Object(Some(ctx.create_string("")))));
+    };
     Ok(Some(Value::Object(Some(ctx.create_string(&algo)))))
 }
 
-/// `SecretKeyFactory.getProvider()` — SunJCE, which is where HotSpot resolves
-/// every `PBKDF2With*` and `PBEWith*` factory.
+/// `SecretKeyFactory.getProvider()` — SunJCE for the factories this VM builds,
+/// which is where HotSpot resolves every `PBKDF2With*` and `PBEWith*` factory;
+/// the real object's own `provider` field for any other receiver.
 pub(crate) fn pbkdf2_get_provider(
     ctx: &mut dyn NativeContext,
-    _args: &[Value],
+    args: &[Value],
 ) -> MethodCallResult {
+    if let Ok(this) = obj_arg(args, 0) {
+        if !skf_receiver_is_ours(ctx, this) {
+            // Type-checked for the reason `pbkdf2_get_algorithm` documents: an
+            // unchecked `get_field_by_name` handed back the `algorithm` String
+            // here and the caller died on `String.getName()`.
+            if let Value::Object(Some(p)) = ctx.get_field_by_name(this, "provider") {
+                let pid = ctx.class_id_by_name("java/security/Provider");
+                let is_provider =
+                    pid.is_some_and(|pid| ctx.is_subclass(ctx.class_id_of_object(p), pid));
+                if is_provider {
+                    return Ok(Some(Value::Object(Some(p))));
+                }
+            }
+        }
+    }
     let p = crate::jca::make_named_provider(ctx, "SunJCE")?;
     Ok(Some(Value::Object(Some(p))))
+}
+
+/// Did **this VM** build this `SecretKeyFactory`?
+///
+/// `getInstance(String[, String])` is a native here, and every factory it
+/// returns is recorded in `skf_algo_table`. `getInstance(String, Provider)` is
+/// NOT registered, so that overload runs the real JDK bytecode and hands back a
+/// genuine `SecretKeyFactory` wrapping the requested provider's own SPI — and
+/// the three natives registered on this class then shadowed the real bytecode
+/// for it too.
+///
+/// The consequence was not a crash but a **silently wrong key**, which is the
+/// worst shape this workspace has a name for. Measured 2026-08-13 against
+/// HotSpot 25 with the same jars: BouncyCastle's `PEMUtilities.getKey` asks for
+/// `SecretKeyFactory.getInstance("PBKDF-OpenSSL", bcProvider)` and derives
+/// `90e508cc4fc9798bdec87516bebe5ecd`; on CratonVM the same call reported
+/// provider `SunJCE`, algorithm `""`, and derived
+/// `bcfb6da32cd0aae96fdc53ed8980f72b` — `generateSecret` had fallen out of its
+/// `unwrap_or(256)` default and run PBKDF2-HMAC-SHA256 under another
+/// algorithm's name. Every netty PKCS#1-encrypted-key test failed downstream of
+/// that (`IOException: Invalid lenByte`, because netty then fell back to
+/// handing raw PKCS#1 bytes to `EncryptedPrivateKeyInfo`).
+///
+/// Table membership is the right test rather than a class-name check: it is
+/// exactly "did our `getInstance` produce this object".
+fn skf_receiver_is_ours(ctx: &mut dyn NativeContext, this: ObjectRef) -> bool {
+    let key = pbkdf2_key_for(ctx, this);
+    skf_algo_table().lock().unwrap().contains_key(&key)
 }
 
 /// `SecretKeyFactory.generateSecret(PBEKeySpec)` for a PBKDF2 synthetic.
@@ -16119,6 +16178,31 @@ pub(crate) fn pbkdf2_generate_secret(
     args: &[Value],
 ) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
+    // A factory this VM did not build belongs to the provider that did — run
+    // ITS `engineGenerateSecret` instead of deriving a key of our own choosing
+    // under its algorithm's name. See `skf_receiver_is_ours` for the measured
+    // wrong-key this closes.
+    if !skf_receiver_is_ours(ctx, this) {
+        if let Value::Object(Some(spi)) = ctx.get_field_by_name(this, "spi") {
+            let spec = args.get(1).copied().unwrap_or(Value::Object(None));
+            return ctx.invoke_virtual(
+                spi,
+                "engineGenerateSecret",
+                "(Ljava/security/spec/KeySpec;)Ljavax/crypto/SecretKey;",
+                &[spec],
+            );
+        }
+        // No SPI to delegate to (a receiver of a shape we do not recognise).
+        // Refuse rather than derive something: this native has no idea what
+        // algorithm was asked for, and answering anyway is how the defect
+        // above happened.
+        return Err(RuntimeError::SecurityException {
+            message: "SecretKeyFactory.generateSecret: this factory was not created by CratonVM \
+                      and carries no provider SPI to delegate to"
+                .to_string(),
+        }
+        .into());
+    }
     // Same GC-stable, collision-disambiguated key used by `getInstance` so the
     // PRF is looked up deterministically for THIS factory instance.
     let key = pbkdf2_key_for(ctx, this);

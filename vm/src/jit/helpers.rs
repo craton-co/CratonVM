@@ -3623,6 +3623,7 @@ pub unsafe extern "C" fn jit_newarray(vm_ptr: i64, atype: i64, length: i64) -> i
     // common-case cost of the original helper.
     if heap.try_alloc_young_probe(total_size).is_some() {
         if let Some(obj_ref) = heap.try_alloc_array(ClassId::new(0), elem_type, length as usize) {
+            jit_note_external_alloc(total_size);
             return jit_newarray_finish(obj_ref, atype, length);
         }
     }
@@ -3640,6 +3641,7 @@ pub unsafe extern "C" fn jit_newarray(vm_ptr: i64, atype: i64, length: i64) -> i
     // probe above is unchanged, so a healthy heap never reaches this line and
     // pays nothing.
     if let Some(obj_ref) = heap.try_alloc_array_full(ClassId::new(0), elem_type, length as usize) {
+        jit_note_external_alloc(total_size);
         return jit_newarray_finish(obj_ref, atype, length);
     }
     // Slow path: young gen full (or the probe-then-alloc race lost the slot).
@@ -3711,7 +3713,38 @@ pub unsafe extern "C" fn jit_newarray(vm_ptr: i64, atype: i64, length: i64) -> i
             }
         }
     };
+    jit_note_external_alloc(total_size);
     jit_newarray_finish(obj_ref, atype, length)
+}
+
+/// Charge `bytes` to the calling thread's allocation counter — the one behind
+/// `com.sun.management.ThreadMXBean.getThreadAllocatedBytes`.
+///
+/// Only for allocations that **bypassed the TLAB**. TLAB-served allocations,
+/// including the ones compiled code performs with its own inline bump, are
+/// already accounted for by [`cratonvm_gc::Tlab::thread_allocated_bytes`],
+/// which reads the live cursor; charging them here as well would double-count.
+///
+/// The JIT keeps its own copies of the interpreter's slow allocation paths
+/// (`jit_newarray`, `jit_new_object`, `jit_anewarray_object`), so the
+/// accounting `alloc_object_shared` / `gc_alloc_array` do has to be repeated
+/// here — otherwise a compiled thread's counter would silently omit every
+/// humongous object it allocated, which is the direction that reads as good
+/// news to a caller asserting "we allocated less than N".
+///
+/// Best-effort: no `JvmThread` (a foreign/unattached caller) means no counter
+/// to charge, and monitoring must never be the thing that fails an allocation.
+///
+/// # Safety
+/// Same contract as [`jit_thread_mut`]: call only from a JIT helper running on
+/// the thread that installed `JIT_THREAD`, with no other `&mut JvmThread` (and
+/// no live `JitThreadGuard`) outstanding. Every call site below sits after the
+/// allocation's own guards have been dropped.
+#[inline]
+unsafe fn jit_note_external_alloc(bytes: usize) {
+    if let Some((thread, _guard)) = jit_thread_mut() {
+        thread.tlab.note_external_allocation(bytes);
+    }
 }
 
 /// W1-vm: surface an allocation failure from `jit_newarray` as a catchable
@@ -4227,6 +4260,9 @@ pub unsafe extern "C" fn jit_new_object(vm_ptr: i64, class_id_raw: i64, num_fiel
             }
         }
     };
+    // Every arm reaching here allocated outside the TLAB (the TLAB arm above
+    // returns early), so the thread's allocation counter has to be told.
+    jit_note_external_alloc(total_size);
     // Initialize primitive-typed fields to proper JVM default values (zero
     // memory reads as Object(None) which is wrong for int/long/float/double
     // fields) + JLS §12.6 finalizer registration.
@@ -4885,6 +4921,8 @@ pub unsafe extern "C" fn jit_anewarray_object(
             }
         }
     };
+    // Non-TLAB arm (the guarded-refill TLAB arm above returns early).
+    jit_note_external_alloc(total_size);
     arr.as_ptr() as i64
 }
 
