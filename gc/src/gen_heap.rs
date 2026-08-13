@@ -590,6 +590,31 @@ pub static SWEEP_PHANTOM_EXTENTS: AtomicU64 = AtomicU64::new(0);
 /// Bounded report counter for [`SWEEP_PHANTOM_EXTENTS`].
 static SWEEP_PHANTOM_REPORTS: AtomicU64 = AtomicU64::new(0);
 
+/// Marks subsumed by a reported phantom extent that may NOT be object bases.
+///
+/// [`SWEEP_PHANTOM_EXTENTS`] rests on "`side_sorted` holds object BASES, and
+/// live objects never nest". The first half has one documented exception: when
+/// no anchor interval resolves a CONSERVATIVE candidate, `mark_young`'s
+/// fallback side-marks the RAW candidate address, which is a base only if the
+/// candidate happened to be one. A conservative candidate is frequently an
+/// object-INTERIOR word (a field address, a derived pointer, a spilled register
+/// mid-object), and the late-resolution pass that marks the real base cannot
+/// unmark the raw address — so `side_sorted` can carry both.
+///
+/// An interior mark of a perfectly VALID object satisfies the phantom check's
+/// premise exactly, which would make the verdict a false positive that unwinds
+/// every reclamation since the last anchor: a throughput cost, not a
+/// correctness one (`live_in_dead` stayed 0 throughout the 2026-08-13 finding).
+///
+/// This counter does not change the verdict — it says whether that explanation
+/// is the right one. `unresolved_snapshot` is exactly the set of marks that may
+/// not be bases; everything else came from a precise ref-slot value (a base by
+/// construction) or from `resolve_candidate_bases`. Read it beside
+/// `phantom_extents`: equal counts say the guard is firing on interior marks,
+/// zero says the subsumed marks were real bases and the walk really did leave
+/// the object grid.
+pub static SWEEP_PHANTOM_INTERIOR_MARKS: AtomicU64 = AtomicU64::new(0);
+
 /// H2-CID0 — reclaim spans the sweep refused to publish because they already
 /// overlapped a free block. Publishing one is a double free: the allocator can
 /// hand the same bytes to two objects, and the second allocation zeroes them
@@ -10346,6 +10371,25 @@ impl GenerationalHeap {
                     .is_some_and(|&a| a < abs + total_size)
                 {
                     let victim = side_sorted[live_probe];
+                    // Are the subsumed marks object BASES? See
+                    // `SWEEP_PHANTOM_INTERIOR_MARKS` — this classifies, it does
+                    // not gate. Bounded by the marks inside this one extent.
+                    let mut nonbase_inside = 0u64;
+                    let mut probe = live_probe;
+                    while let Some(&a) = side_sorted.get(probe) {
+                        if a >= abs + total_size {
+                            break;
+                        }
+                        if unresolved_snapshot.binary_search(&a).is_ok() {
+                            nonbase_inside += 1;
+                        }
+                        probe += 1;
+                    }
+                    if nonbase_inside != 0 {
+                        SWEEP_PHANTOM_INTERIOR_MARKS.fetch_add(nonbase_inside, Ordering::Relaxed);
+                    }
+                    let victim_is_unresolved_raw =
+                        unresolved_snapshot.binary_search(&victim).is_ok();
                     SWEEP_PHANTOM_EXTENTS.fetch_add(1, Ordering::Relaxed);
                     if SWEEP_PHANTOM_REPORTS.fetch_add(1, Ordering::Relaxed) < 8 {
                         tracing::error!(
@@ -10362,6 +10406,14 @@ impl GenerationalHeap {
                             num_slots = header.num_slots(),
                             victim = format!("{victim:#x}"),
                             victim_interior_offset = victim - abs,
+                            // The discriminator: `true` means this "live
+                            // object" is an unresolved RAW conservative
+                            // candidate, i.e. possibly an interior word of the
+                            // very object being sized here, and the verdict is
+                            // then a false positive. See
+                            // `SWEEP_PHANTOM_INTERIOR_MARKS`.
+                            victim_is_unresolved_raw,
+                            nonbase_marks_inside = nonbase_inside,
                             // Where the walk last stood on ground truth, and the
                             // stride that took it from there to here. The break is
                             // upstream of the detection: if `prev_*` sizes an object
