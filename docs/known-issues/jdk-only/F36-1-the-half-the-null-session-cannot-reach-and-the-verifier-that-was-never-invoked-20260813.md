@@ -305,13 +305,57 @@ answer is **yes**, on four grounds, with the one residual risk named.
    Every row was mutation-checked (§6), so a green run is a run in which 95
    comparisons could each have been lost.
 
-**The residual risk, stated plainly: cost, not flakiness.** The vector performs
-one RSA-2048 key generation and four TLS 1.3 handshakes, which is ~7 s on HotSpot
-on this host — comfortably inside the harness's 120 s `TIMEOUT`, but it is the
-most expensive vector in the suite by wall time, and on CratonVM's interpreter it
-will be slower by whatever the interpreter ratio is for RSA key generation. If it
-ever approaches the cap, the fix is `kpg.initialize(2048)` → a smaller modulus or
-a cached key pair, **not** a longer timeout.
+5. **It costs 3-4 s, and getting there found a defect worth more than the
+   vector.** The first working version ran in **62 s** against the harness's
+   120 s `TIMEOUT` — a 2x margin, which is not a margin. §4.1 is what it was and
+   why it matters beyond this file.
+
+**The residual risk, stated plainly: cost, not flakiness.** One RSA-2048 key
+generation (520 ms measured) and four TLS 1.3 handshakes, 3-4 s total on HotSpot
+on this host. On CratonVM's interpreter it will be slower by whatever that
+ratio is. If it ever approaches the cap, the fix is a smaller modulus or a cached
+key pair, **not** a longer timeout.
+
+### 4.1 The 62 seconds: `SSLSocket.close()` waits for the peer's `close_notify`
+
+Worth its own section because it is a property of `javax.net.ssl` that any lane
+writing a TLS fixture will meet, and because the symptom points away from the
+cause.
+
+`SSLSocket.close()` performs the TLS **closure handshake**: it sends
+`close_notify` and then waits for the peer's, bounded by `SO_TIMEOUT`. This
+vector deliberately leaves response bodies unread until the `drainTrap` family,
+so the client sends no `close_notify` until the very end — and the accept thread,
+**the only thing that can accept the next connection**, sat in `close()` for the
+full 20 s each time. Four connections, ~62 s per run, every run.
+
+Three things about it are worth recording:
+
+* **It is invisible in the output.** The three 62 s runs and the three 3-4 s runs
+  are **byte-identical** (`md5 9d86efa94509b107fa91a73f0b89464f` on both sets).
+  Nothing in the transcript says "this took a minute"; a vector like this fails
+  by TIMING OUT one day on a slower box, not by disagreeing.
+* **The obvious diagnosis was wrong twice.** It was first read as the box being
+  busy — until `RJdkSecurity` measured 3 s in the same shell. Then as slow DNS,
+  because an earlier `HttpsServer` draft reported `getPeerHost()` as
+  `kubernetes.docker.internal` on this host — until reverse lookup of `127.0.0.1`
+  measured **4 ms**. `[chk instr]`: the instrument that finally named it was a
+  seven-line timing probe over resolve/reverse/`SecureRandom`/keygen/`SSLContext`,
+  all of which came back fast, which is what left the socket close as the only
+  candidate.
+* **The fix is one line and it is NOT a longer timeout.** After the response is
+  flushed, the accepted socket's `SO_TIMEOUT` drops to 200 ms, so `close()`
+  cannot block on a peer that has nothing left to say. The response is already
+  written, so nothing the client needs depends on a graceful close. A
+  `SocketTimeoutException` from `close()` is then EXPECTED and is explicitly not
+  recorded as a server error — otherwise the fix would have turned a 60 s stall
+  into a red `server.error` row.
+
+The same shape produced the OTHER robustness fix in the accept loop: a plain
+`for (i = 0; i < n; i++)` counted a `SocketTimeoutException` from `accept()` as a
+served connection, so on a loaded box a slow client loses its acceptor and the
+next `connect()` stalls until the watchdog. Both are in `serve()` and both carry
+their measurement in a comment.
 
 One thing that is *not* a reliability question but must not be mistaken for one:
 if CratonVM cannot serve TLS on the accept side at all, this vector is red for a
@@ -465,7 +509,7 @@ wrong implementation answers, each compiled and run.
 | M25 | `removeValue(present)` | `AbstractMethodError` | DIED |
 | M26 | `getValueNames` after remove | `[cratonvm.f36]` — a `removeValue` that no-ops | DIED |
 
-### 6.2 `RSslLiveSession` — MUTATION_TOTALS_PLACEHOLDER
+### 6.2 `RSslLiveSession` — **95 of 95 died. NONE SURVIVED.**
 
 All 95 rows, one mutant each, each mutant being what a **named** wrong
 implementation answers. The substitution is applied inside `ck()` in a **copy** of
@@ -473,11 +517,179 @@ the fixture, keyed by row name and selected per run with `-Dmut=<row>`, so one
 compile serves every mutant and the replacing value is the one named in the table
 — never a generic flip. The table is `scratchpad/f36/live_mut.py`.
 
-MUTATION_TABLE_PLACEHOLDER
+**The harness was validated AS a harness**, because a mutation run that cannot
+kill is worth exactly as much as a guard that cannot fire, and this directory has
+a record (`[proxy oracle]`) of an exhaustive sweep whose compared side was a
+stand-in. Two rows — one `Boolean`-valued (`inv.sessionContext.isNull`) and one
+`String`-valued (`server.peerPrincipal.message`) — were ALSO mutated by editing
+the fixture's own source text, compiled and run. Both produce output
+**byte-identical** to the hook-based mutant, exit code included:
+
+```text
+CK RSslLiveSession inv.sessionContext.isNull = true  WANT false
+CK RSslLiveSession fails=1                                   rc=1   (both routes, diff empty)
+CK RSslLiveSession server.peerPrincipal.message = peer not authenticated  WANT null
+CK RSslLiveSession fails=1                                   rc=1   (both routes, diff empty)
+```
+
+That equivalence is not luck: `ck` is a pure comparison with no side effect and no
+control flow depending on `want`, so substituting the expectation inside it and
+substituting it in the source are the same program.
+
+| family | rows | died | what the mutants name |
+|---|---|---|---|
+| `handshake` | 25 | **25** | the completed client session |
+| `attrs` | 17 | **17** | the attribute map on a WIDE session, and the one-letter message pair |
+| `distinct` | 6 | **6** | two connections, one SSLContext |
+| `invalidate` | 14 | **14** | F18's headline - the half RSslNullSession cannot reach |
+| `verifier` | 11 | **11** | the HostnameVerifier door, and the control that makes it mean something |
+| `serverSide` | 15 | **15** | negotiated, peer NOT authenticated |
+| `drainTrap` | 7 | **7** | HotSpot's KeepAliveCache recycle |
+
+**`handshake`** — 25 rows, 25 died.
+
+| row | mutated to (the implementation it names) | |
+|---|---|---|
+| `client.cipherSuite.isNullSentinel` | the SSL_NULL_WITH_NULL_NULL sentinel for a negotiation | DIED |
+| `client.cipherSuite.matchesConnection` | two doors served by two registrars disagreeing | DIED |
+| `client.conn.peerPrincipal` | the connection door refusing where the session answers | DIED |
+| `client.conn.serverCertificates.length` | the connection door losing the chain its session has | DIED |
+| `client.getId.length` | the null session's byte[0] for a real handshake | DIED |
+| `client.getId.twiceEqualContent` | an id reseeded from a per-call session object | DIED |
+| `client.getId.twiceSameArray` | an accessor handing out its own array, not a clone | DIED |
+| `client.isValid` | the pre-F10 minter writing -1 into the stream-id slot | DIED |
+| `client.leafSubject.equalsPeerPrincipal` | the same split seen from the certificate's side | DIED |
+| `client.localCertificates` | an empty array where null is the contract | DIED |
+| `client.localPrincipal` | the SERVER's identity reflected back at the client | DIED |
+| `client.peerCertificates.length` | an empty chain where the peer sent one | DIED |
+| `client.peerHost` | the peer ADDRESS reported as the requested host | DIED |
+| `client.peerPort.isServerPort` | an unwritten port slot | DIED |
+| `client.peerPrincipal.class` | the internal name type instead of the javax one | DIED |
+| `client.peerPrincipal.equalsLeafSubject` | F10 N2: the two doors reading different tables | DIED |
+| `client.peerPrincipal.name` | a fabricated subject | DIED |
+| `client.protocol.isModernTls` | a fabricated protocol string outside JSSE vocabulary | DIED |
+| `client.protocol.isNoneSentinel` | the NONE sentinel reported for a negotiation | DIED |
+| `client.responseCode` | a server arm that never answered | DIED |
+| `client.sessionContext.isNull` | no context minted for a live session | DIED |
+| `client.sessionContext.isSSLSessionContext` | a fabricated object of the wrong type | DIED |
+| `client.sslSession.isPresent` | getSSLSession() empty on a completed handshake | DIED |
+| `client.sslSession.sameObjectTwice` | F10 N1: a fresh session minted per accessor call | DIED |
+| `client.valueNames.length` | an attribute map pre-seeded by the implementation | DIED |
+
+**`attrs`** — 17 rows, 17 died.
+
+| row | mutated to (the implementation it names) | |
+|---|---|---|
+| `attrs.getValue` | a putValue that silently no-ops | DIED |
+| `attrs.getValue.class` | E31-1 2: the attribute map through the value door | DIED |
+| `attrs.getValue.null.message` | ONE shared constant, spelled putValue-style | DIED |
+| `attrs.getValue.null.raises` | a lookup that simply misses and answers null | DIED |
+| `attrs.putValue.nullName.message` | ONE shared constant, spelled getValue-style | DIED |
+| `attrs.putValue.nullName.raises` | a body that dereferences the name | DIED |
+| `attrs.putValue.nullValue.message` | the shared constant on the value arm | DIED |
+| `attrs.putValue.nullValue.raises` | a guard that checks only the NAME | DIED |
+| `attrs.putValue.raises` | the unregistered door, pre-F18 state | DIED |
+| `attrs.removeValue.null.message` | the shared constant on the third site | DIED |
+| `attrs.removeValue.null.raises` | removeValue treating null as nothing-to-remove | DIED |
+| `attrs.removeValue.raises` | removeValue unregistered | DIED |
+| `attrs.removed.valueNames` | a removeValue that no-ops | DIED |
+| `attrs.shadow.peerHost` | E31-1 2: a width-blind slot-3 read on the WIDE shape | DIED |
+| `attrs.shadow.peerPort.isServerPort` | the port slot lost once an attribute is set | DIED |
+| `attrs.shadow.sessionContext.isNull` | the context lost once an attribute is set | DIED |
+| `attrs.valueNames` | a putValue that stores nothing | DIED |
+
+**`distinct`** — 6 rows, 6 died.
+
+| row | mutated to (the implementation it names) | |
+|---|---|---|
+| `distinct.idsDiffer` | both ids empty, so equal for the wrong reason | DIED |
+| `distinct.second.getId.length` | the second session falling back to byte[0] | DIED |
+| `distinct.second.isValid` | only the first session marked negotiated | DIED |
+| `distinct.second.peerPrincipal` | the peer chain recorded only for the first connection | DIED |
+| `distinct.second.responseCode` | the second exchange never served | DIED |
+| `distinct.second.sessionContext.isNull` | a context minted only for the first session | DIED |
+
+**`invalidate`** — 14 rows, 14 died.
+
+| row | mutated to (the implementation it names) | |
+|---|---|---|
+| `inv.before.sessionContext.isNull` | no context to drop, which would make the next row vacuous | DIED |
+| `inv.cipherSuite.unchanged` | invalidate() treated as a reset | DIED |
+| `inv.getId.length` | getId simplified onto the validity predicate | DIED |
+| `inv.getId.unchanged` | an invalidate() that clears the id too | DIED |
+| `inv.isValid` | a width-4 invalidate() that no-ops | DIED |
+| `inv.other.sessionContext.isNull` | the whole context dropped for every session | DIED |
+| `inv.other.stillValid` | invalidate() applied to the CONTEXT, not the session | DIED |
+| `inv.peerCertificates.length` | the chain dropped on invalidate() | DIED |
+| `inv.peerPrincipal.unchanged` | the peer chain dropped with the context | DIED |
+| `inv.protocol.unchanged` | invalidate() treated as a reset | DIED |
+| `inv.raises` | invalidate() unregistered in real-JDK mode, pre-F18 | DIED |
+| `inv.sessionContext.isNull` | 'invalidate moves isValid and nothing else' - the claim F18 corrected | DIED |
+| `inv.twice.isValid` | a second invalidate() flipping the bit back | DIED |
+| `inv.twice.raises` | an invalidate() that is not idempotent | DIED |
+
+**`verifier`** — 11 rows, 11 died.
+
+| row | mutated to (the implementation it names) | |
+|---|---|---|
+| `verifier.cipherSuite.isNullSentinel` | the sentinel on the verifier's session | DIED |
+| `verifier.control.notInvokedWhenBuiltInMatches` | a verifier called even when endpoint identification matched | DIED |
+| `verifier.control.responseCode` | the control exchange never served | DIED |
+| `verifier.getId.length` | the same minter's byte[0] | DIED |
+| `verifier.hostArg` | the verifier handed the certificate name, not the requested host | DIED |
+| `verifier.invoked` | the verifier never consulted - the null-capture that produced a wrong record | DIED |
+| `verifier.isValid` | huc_verify_hostname's -1: the handshake it was invoked to vet | DIED |
+| `verifier.peerPrincipal` | the verifier's session with no peer chain | DIED |
+| `verifier.responseCode` | the IP-literal exchange never served | DIED |
+| `verifier.sameObjectAsGetSSLSession` | F18's recorded claim, measured false here | DIED |
+| `verifier.sessionContext.isNull` | no context on the verifier's session | DIED |
+
+**`serverSide`** — 15 rows, 15 died.
+
+| row | mutated to (the implementation it names) | |
+|---|---|---|
+| `server.cipherSuite.isNullSentinel` | the sentinel on the acceptor's session | DIED |
+| `server.error` | a server thread that failed silently | DIED |
+| `server.getId.length` | the acceptor's byte[0] | DIED |
+| `server.isValid` | the acceptor's session marked not-negotiated | DIED |
+| `server.localCertificates.length` | null where the server has a chain | DIED |
+| `server.localPrincipal` | the server's OWN identity refused | DIED |
+| `server.localPrincipal.class` | the internal name type | DIED |
+| `server.peerCertificates.message` | the no-argument constructor again | DIED |
+| `server.peerCertificates.raises` | an unauthenticated peer's chain fabricated | DIED |
+| `server.peerPort.isPositive` | an unwritten port slot reported as 0 | DIED |
+| `server.peerPrincipal.message` | a refusal built with the no-argument constructor | DIED |
+| `server.peerPrincipal.raises` | an unauthenticated peer ANSWERED instead of refused | DIED |
+| `server.session.isNull` | no server-side session at all | DIED |
+| `server.sessionContext.isNull` | no context on the server side | DIED |
+| `server.valueNames.length` | a pre-seeded attribute map | DIED |
+
+**`drainTrap`** — 7 rows, 7 died.
+
+| row | mutated to (the implementation it names) | |
+|---|---|---|
+| `drain.body` | a body the client never received | DIED |
+| `drain.conn.cipherSuite.message` | the right class carrying another explanation | DIED |
+| `drain.conn.cipherSuite.raises` | a connection accessor still answering after the recycle | DIED |
+| `drain.conn.sslSession.message` | the right class, wrong explanation | DIED |
+| `drain.conn.sslSession.raises` | getSSLSession still answering after the recycle | DIED |
+| `drain.session.getId.length` | the session's id cleared with the connection | DIED |
+| `drain.session.isValid` | the SESSION invalidated by the connection's recycle | DIED |
 
 ### 6.3 Determinism
 
-DETERMINISM_PLACEHOLDER
+Three consecutive runs of the shipped vector on HotSpot, byte-identical:
+
+```text
+run1 rc=0 3s   run2 rc=0 4s   run3 rc=0 4s
+md5  9d86efa94509b107fa91a73f0b89464f  (all three)
+```
+
+And the result that makes §4.1 safe to have landed: the **62 s** runs taken
+before that fix carry the **same md5**. The change is timing-only; not one of the
+95 answers moved.
+
+`RJdkSecurity` is 3 s and unchanged in cost — its 26 new rows add no I/O.
 
 ---
 
@@ -658,12 +870,21 @@ Cheapest first. Every CratonVM row is unmeasured.
    java -cp regression-suite/build RJdkSecurity     # srArgKinds=52, PASS (149 checks)
    java -cp regression-suite/build RSslLiveSession  # fails=0, PASS (95 checks)
    ```
-2. **The tripwires are real.** Change `if (n != 52)` to `53`, or any
-   `sectionEnd("<family>", N)` literal to `N+1`, and confirm each throws. Both
-   forms were checked this way.
-3. **The watchdog is real.** Drop its sleep to 1 ms and confirm the run prints
-   `CK RSslLiveSession FAILED watchdog-90s phase=handshake` and exits 4. A
-   watchdog that has never been shown to fire is the same species of defect as
+2. **The tripwires are real — CHECKED, both forms.** `if (n != 52)` → `53` throws
+   `AssertionError: srArgKinds ran 52 checks, header says 53` from
+   `RJdkSecurity.secureRandomArgumentKinds`, and no `PASS` line.
+   `sectionEnd("verifier", 11)` → `12` prints
+
+   ```text
+   CK RSslLiveSession FAILED phase=verifier java.lang.AssertionError: block verifier ran 11 checks, header says 12
+   ```
+
+   and exits 1 — note that it goes through the vector's own `catch (Throwable)`,
+   so a denominator slip is reported on the `CK` prefix rather than escaping as a
+   bare stack trace.
+3. **The watchdog is real — CHECKED.** With its sleep dropped to 1 ms the run
+   prints `CK RSslLiveSession FAILED watchdog-90s phase=startup` and exits **4**.
+   A watchdog that has never been shown to fire is the same species of defect as
    the hang it guards against.
 4. **CratonVM**, once NOMINATION 1 lands: `--real-jdk` for `RSslLiveSession`,
    both modes for `RJdkSecurity`. Read §7.3 first — five groups of rows are the
