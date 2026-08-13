@@ -31,7 +31,7 @@ which needs nobody's permission and no source edit at all.
 | | triples | registrations |
 |---|---:|---:|
 | measured slice (this lane) | 62 | **68** |
-| **RETIRE — recommended** | 7 | **8** |
+| **RETIRED 2026-08-12** (was "recommended"; §8) | 7 | **8** |
 | KEEP — state is not real (needs-VM-support) | 43 | 47 |
 | KEEP — the native is load-bearing *for* real bytecode | 1 | 2 |
 | KEEP — entangled with `Map.values()` | 7 | 8 |
@@ -496,7 +496,13 @@ That is the complete predicted diff. **A ninth row is a finding.**
 
 ---
 
-## 5. Why nothing was retired here
+## 5. Why nothing was retired *here* — superseded in part by §8
+
+§5.2's condition has been met: the measurement was taken, and the eight landed
+(§8). §5.1's arithmetic obligation is **not** discharged — the three `25/linux`
+artefacts still have to be re-frozen from one Linux census, and no Windows lane
+can do it. §5.3's inert-entry check was run: all seven triples dispatch today
+(§8.4).
 
 ### 5.1 The same reason `java/io/PrintWriter` is held
 
@@ -576,6 +582,12 @@ table, not the dial, becomes the instrument.
 **Arm C is the part that must not be skipped.** Three negative controls that go
 red are what turn "we read the source" into "we measured it", and this directory
 already has a record of a probe reporting its own reach rather than the defect.
+
+> **RUN 2026-08-12 — and the last sentence came true about arm C itself.** Two
+> of the three controls go red against this corpus; `ArrayDeque` does **not**,
+> because the corpus never calls `delete(i)`. A prefix alone does not make a
+> negative control — each family needs a workload that drives the path its §3
+> entry names. §8.2 has the one that turns `ArrayDeque` red.
 
 ---
 
@@ -674,3 +686,141 @@ whatever change happens to be under test.
 registrations; and the `hm_int_fast` / `lhm_overlay` retirements that would
 unblock `HashMap` and `LinkedHashSet`. Each is a `native-collections` change, and
 the census's own lane table puts that file in L5 — *"do last, alone"*.
+
+---
+
+## 8. The measurement, taken 2026-08-12 — and the eight are landed
+
+One prebuilt binary (`jdkonly-wave2-target/release/cratonvm.exe`), Windows host,
+JDK 25.0.3, only `CRATONVM_ENFORCE_NATIVE_SHADOW` differing between arms. No
+rebuild, no source edit, exactly as §6 says.
+
+### 8.1 Arms A and B are verdict-neutral; C1 and C3 are red
+
+`SUITE=jdk-only CRATONVM_ARGS=--jdk-only bash regression-suite/run.sh`:
+
+| arm | scope | result |
+|---|---|---|
+| baseline | (dial off) | **32 passed / 4 failed** |
+| A | `ArrayList,Arrays$ArrayList,Collections` | **32 / 4**, identical failing set |
+| B | `List,Collection,Iterator` (§2.2 doors) | **32 / 4**, identical failing set |
+| C1 | `TreeMap,TreeSet` | **10 / 51** RED |
+| C2 | `ArrayDeque` | 32 / 4 — see §8.2 |
+| C3 | `concurrent/ConcurrentHashMap` | **28 / 12** RED |
+
+The failing set in the baseline and in A and B is `RJdkProxyIface`,
+`RJdkForeign`, `RJdkEnumerations` (+ the `RJdkEnumerations` harness row). C3
+adds `RJdkModule`, `RJdkSecurity`, `RJdkX509Intercept`, `RJdkLogging`.
+
+Arm B answering neutral is worth stating on its own: closing the §2.2 interface
+doors alone changes nothing on this corpus, so the doors are not silently
+carrying these dispatches today.
+
+### 8.2 §6's arm C is NOT sufficient as written — the ArrayDeque control is vacuous
+
+C2 came back verdict-neutral, which §6 says would mean "this document's
+state-model reading is wrong for that family". It is not. **The probe's reach is
+wrong.** The `RJdk*` corpus only pushes and pops a deque's ENDS, and real
+`ArrayDeque.addLast`/`pollFirst` never call `delete(i)` — the method §3.5 names.
+A probe that does (40 `addLast`s past the initial capacity, a middle
+`remove(Object)`, four `Iterator.remove`s, then an alternating drain and a
+reuse), same binary, same dial, `--jdk-only`:
+
+```text
+                          dial OFF        dial=java/util/ArrayDeque   HotSpot
+  size after 40 addLast   40              39                          40
+  size after It.remove×4  35              39                          35
+  toArray length          35              34                          35
+  drained count           35              41                          35
+  pollFirst after reuse   "z"             null                        "z"
+```
+
+Five wrong answers, and the shape is exactly the two-writers-on-`size`
+corruption §3.5 predicts. **All three negative controls go red once each is
+driven on the path its own §3 entry names.** The same probe under arm C1 gives
+`TreeMap.firstKey` = `k1` for a map whose first key is `k0` and a `TreeSet` that
+kept 1 of 2 elements; under C3, `ConcurrentHashMap.size` = 1 for a two-entry map
+with `containsKey` false for a key that is present. Under arm A every ArrayList,
+`Arrays.asList` and `synchronizedMap` line is HotSpot-identical.
+
+The general lesson is already in this directory: a narrow probe reports its own
+reach, not the defect. **§6's arm C should be re-written to name a workload per
+family, not just a prefix.**
+
+### 8.3 The H2 corpus moved nothing
+
+`bash regression-suite/corpus/run-corpus.sh run h2 --classes-from <14>
+--cv <binary> --mode jdk-only --timeout 200`, dial off then dial at arm A:
+
+```text
+  BEFORE (dial off)   AGREE=9  DIVERGE=0  CV-BROKEN=5   14/14 classes
+  AFTER  (arm A)      AGREE=8  DIVERGE=1  CV-BROKEN=3   12/14 (arm was cut short)
+```
+
+Per class over the 12 both arms adjudicated, **every verdict is identical except
+`TestBackup`** — and `TestBackup` is a pre-existing flake, proven by ABBA
+(§7.7): the same `MVStoreException: Chunk 2 not found` appears with the dial
+**off**. The two classes the cut-short arm missed were re-run standalone in both
+arms: `TestCluster` passes in 161–183 s in both (its corpus `CV-TIMEOUT` was
+host contention), and `TestCompatibility` exceeds even a doubled 400 s cap in
+both (`rc=124` at 406 s dial-off, 403 s dial-on) — pre-existing either way.
+
+This BEFORE does not reproduce the AGREE=10 DIVERGE=2 CV-BROKEN=2 the campaign
+carried for today, and the reason is §7.5: it ran alongside another arm on a
+three-session host, HotSpot itself needed 86 s and 74 s on two of these classes,
+and five 200 s caps fired. **The comparison that survives is the per-class one
+between two arms, not either arm's totals.**
+
+### 8.4 The census says all seven are live, and confirms the `Arrays.copyOf` keep
+
+`--jdk-only --explain-jdk-only --jdk-only-report` on an ordinary collections
+workload reports every one of the seven triples as an actually-taken
+`native-shadows-bytecode` row — the kind that means a dispatching shadow, not
+the `synthetic-native-registered` refusal record. None is an inert entry.
+
+Arming arm A makes **`java/util/Arrays.copyOf([Ljava/lang/Object;I)` appear** in
+the taken-shadow set, where the dial-off run never reaches it. That is real
+`ArrayList.grow` funnelling through it the instant the native constructors
+yield — §3.3's "load-bearing *for* the retirements" confirmed by experiment
+rather than by reading, and the reason it must stay a `Bridge`.
+
+One instrument caveat, because it inverts the obvious reading: with the dial
+armed the yielding row is **still** recorded `native-shadows-bytecode` (the
+record is written on the yield path too), so the per-run census cannot tell you
+whether the dial engaged. Only the behavioural probe can. After the table lands,
+those rows leave the population for a different reason: a `SyntheticStub` is
+refused at the door and never reaches step 1.
+
+### 8.5 What landed, and what did not
+
+Landed in `native-api/src/retired_shadow.rs`: the seven triples at the head of
+`RETIRED_SHADOW_TRIPLES` (88 → 95 entries), the discriminator widened from
+`java/util/logging/` to `java/util/`, and two new tests — one asserting the
+seven are reachable, one asserting the held families and `Arrays.copyOf` are
+**not** retired, which is what earns the wider prefix.
+
+Not landed, and it is the same obligation §5.1 names: the three `25/linux`
+artefacts. They cannot be re-frozen from a Windows host — both gate scripts exit
+2 ("REFUSING") — and the record is explicit that a hand-derived count landing
+too high widens a slack-free ratchet. The predicted diff, to check against a
+real Linux census rather than to paste:
+
+```text
+  stub ratchet          +8   (from the OBSERVED 1261 no-management: 1261 + 8 = 1269;
+                              the management figure compounds two unmeasured terms)
+  bridge.rows                       9711 -> 9703
+  bridge.shadows_bytecode           4457 -> 4449
+  bridge.shadows_bytecode_anywhere  6066 -> 6058
+  bridge.without_acc_native         8912 -> 8904
+  registrations.bridge              9711 -> 9703
+  registrations.synthetic-stub      1262 -> 1270
+  total_rows                       11636 -> 11636      (a retag moves no row)
+  bridge.stated_shadows_bytecode      24 ->   24       (unchanged)
+  kind map: EXACTLY 8 rows, bridge -> synthetic-stub, kind_stated 0 -> 1
+```
+
+All eight kind-map rows were verified present as `bridge` / `kind_stated=0`
+before the edit (`:6241-6244`, `:6246`, `:6248`, `:6314`, `:6360`), and
+`NativeMethodRegistry::register:5782-5798` was verified to set both the kind and
+`next_kind_stated`. **A ninth row is a finding.** The base itself is stale by its
+own note, so these are deltas on a base nobody has taken.
