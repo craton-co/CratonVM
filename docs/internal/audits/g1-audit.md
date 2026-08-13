@@ -486,17 +486,45 @@ Ordered. Each item is a precondition for the next being meaningful.
    single-threaded under STW. (The two contracts that still told a future reader
    to convert it "before enabling parallel evacuation" were corrected in
    `g1.rs`.)
-5. **Bound the remembered set.** The "undead" entry is closed (G1-8): the prune
-   is now generation-aware, so a recycled-then-retyped source no longer survives
-   forever. What remains is a *bound* — the set is still additive within a
-   generation, with pruning only at `cleanup`, so a mark-cycle-long burst of
-   cross-region stores is unbounded until the next cleanup.
-   `rset_bytes_per_live_byte` is published (G1-6) and is the number that says
-   whether that matters on a real workload; nothing has measured it yet.
-6. **Decide the JNI-pinned-source policy explicitly.** Today JIT-pinned regions
-   are walked wholesale and JNI-pinned ones are not. Once G1-2 is closed the
-   asymmetry is sound; while it is open it is the hazard. Either way it should
-   be a stated policy with a test, not a comment.
+5. **Bound the remembered set.** *Bound: DONE. Measurement: still open.*
+   The premise needed correcting first — this rset is REGION-granular, not
+   card-granular, so one rset can never hold more entries than the heap has
+   regions and "a mark-cycle-long burst of cross-region stores is unbounded"
+   is not the shape of the problem. What IS unbounded is the total: every
+   region may name every other, i.e. O(regions²). At the 256 MiB default that
+   ceiling is ~1 MiB of metadata; at 32 GiB it is ~17 GiB, larger than the heap
+   it describes. `RememberedSet` now COARSENS past
+   `CRATONVM_G1_RSET_SOURCE_CAP` (default 512) distinct sources: it drops the
+   precise set and asserts only "some region points into me", and
+   `live_rset_sources` reads that as every plausible source. O(regions·cap),
+   and a memory/scan-time trade rather than a correctness one — covered by
+   `a_coarsened_remembered_set_still_finds_every_live_edge`, whose second half
+   runs a real collection because reading a coarsened set as the empty set it
+   physically contains would drop exactly the objects the rset exists to find.
+   `rset_coarsened` counts it.
+   The MEASUREMENT half is not done, and the reason is now specific rather than
+   "nobody ran it". Two blockers, one removed: `record_heap_occupancy` had a
+   single caller in the tree (`GenerationalHeap`), so under G1 the DENOMINATOR
+   was never published and every per-live-byte ratio was structurally zero — G1
+   publishes it now (`live_bytes=1445440` on a real run). The numerator is
+   published from `cleanup`, so a reading needs a workload that completes a
+   concurrent mark cycle AND has old→young edges to record. The churn probe
+   used here is the wrong shape: 120 iterations at 16 MiB produced 21 pauses,
+   all `kind=young`, every one reporting `rset_sources=0`, because its live set
+   never ages into Old. A deep retained tree (binarytrees-shaped) is what would
+   produce the number.
+6. ~~**Decide the JNI-pinned-source policy explicitly.**~~ **DONE.** Stated in
+   `a_jni_pinned_region_is_an_ordinary_rset_source_not_a_wholesale_one`, which
+   pins both halves: a JNI-pinned region is held out of the CSet but is an
+   ORDINARY remembered-set source (barrier-covered), while a JIT-pinned region
+   is additionally walked wholesale (walk-covered, because that set includes
+   regions holding a published un-retired TLAB tail that no barrier ever saw).
+   The asymmetry is sound exactly while every store out of a JNI-pinned region
+   is barriered, which is what G1-2 was about and G1-2 is closed. The test
+   asserts the dependency at the source-set level rather than by collecting
+   with the entry erased: doing that drops a live object and trips the V7b
+   verifier, which is the correct behaviour and not something a test should
+   need to provoke.
 7. ~~**Put an STW witness on the mark-cycle entry points.**~~ **DONE**
    (2026-08-13). `start_concurrent_mark`, `remark` and `cleanup` now take
    `&StopTheWorldToken`, threaded through the `VmHeap` wrappers to the two VM

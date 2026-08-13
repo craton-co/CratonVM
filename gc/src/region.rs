@@ -120,6 +120,59 @@ pub struct RememberedSet {
     /// per-thread same-region successive stores (handled by the
     /// caller's TLS pointer cache without touching this mutex at all).
     sources: parking_lot::Mutex<FxHashMap<usize, u64>>,
+    /// COARSENED (audit §9 item 5): this rset gave up naming individual source
+    /// regions because it exceeded [`rset_source_cap`], and now means "any
+    /// region could hold an edge into me". The scan side must then treat every
+    /// plausible source as a source.
+    ///
+    /// # What is and is not bounded here
+    ///
+    /// This rset is REGION-granular, not card-granular: an entry is a source
+    /// region index, so one rset can never hold more entries than the heap has
+    /// regions no matter how many stores a mutator makes. The audit item's
+    /// "unbounded until the next cleanup" is therefore not quite the shape of
+    /// the problem — a burst of cross-region stores into one region is bounded
+    /// by `region_count` on its own.
+    ///
+    /// What is genuinely unbounded is the TOTAL, across the heap: every region
+    /// may name every other, so the whole remembered set is O(regions^2). At
+    /// the 256 MiB default (256 regions of 1 MiB) that ceiling is ~1 MiB of
+    /// metadata and nobody would notice. At a 32 GiB heap it is 32768 regions,
+    /// and the same ceiling is ~17 GiB — larger than the heap it describes.
+    /// Coarsening is what turns that quadratic into O(regions * cap).
+    ///
+    /// Coarsening is one-way for the life of the region's contents: it clears
+    /// on [`Self::clear`], which `G1Region::reset` calls when the region is
+    /// recycled. Recovering precision without a reset would mean rebuilding the
+    /// exact source set, and the module already refuses to expose that (see
+    /// `retain_sources`) because a dropped live entry is a use-after-free.
+    coarsened: std::sync::atomic::AtomicBool,
+}
+
+/// Maximum number of distinct source regions one remembered set will name
+/// before coarsening (audit §9 item 5).
+///
+/// `CRATONVM_G1_RSET_SOURCE_CAP=<n>`; `0` disables coarsening entirely, which
+/// restores the previous unbounded-in-total behaviour and is there for
+/// bisecting a suspected coarsening regression, not for production.
+///
+/// The default is chosen for the shape of the cost, not from a measurement:
+/// coarsening trades metadata for scan time (a coarsened target makes the next
+/// pause walk every plausible source region wholesale), so it should be rare
+/// enough never to fire on a heap whose region count is small — where the
+/// quadratic ceiling is harmless anyway — and firm enough to matter on one
+/// where it is not. 512 leaves the 256-region default heap unable to reach the
+/// cap at all, and caps a 32768-region heap at ~256 MiB of rset instead of
+/// ~17 GiB.
+pub fn rset_source_cap() -> usize {
+    use std::sync::OnceLock;
+    static CAP: OnceLock<usize> = OnceLock::new();
+    *CAP.get_or_init(|| {
+        match cratonvm_types::flags::runtime_var("CRATONVM_G1_RSET_SOURCE_CAP") {
+            Ok(v) => v.trim().parse::<usize>().unwrap_or(512),
+            Err(_) => 512,
+        }
+    })
 }
 
 impl RememberedSet {
@@ -142,14 +195,65 @@ impl RememberedSet {
     /// after the source was recycled is the live one, and the older stamp
     /// describes a holder that no longer exists.
     pub fn add_reference_in_generation(&self, source_region: usize, generation: u64) {
-        let mut guard = self.sources.lock();
-        let slot = guard.entry(source_region).or_insert(generation);
-        *slot = (*slot).max(generation);
+        self.add_reference_in_generation_within(source_region, generation, rset_source_cap());
     }
 
-    /// Clear the remembered set.
+    /// [`Self::add_reference_in_generation`] with the coarsening cap as a
+    /// PARAMETER rather than a process-global.
+    ///
+    /// Split out for the same reason the CSet verifier's budget was: the cap
+    /// reader is a `OnceLock` over an environment variable, so a test cannot
+    /// vary it without publishing process-global state to every other test in
+    /// the binary — the exact hazard that produced this crate's
+    /// narrow-oop-geometry flake. Tests drive a small cap through here; nothing
+    /// else should.
+    pub fn add_reference_in_generation_within(
+        &self,
+        source_region: usize,
+        generation: u64,
+        cap: usize,
+    ) {
+        use std::sync::atomic::Ordering;
+        if self.coarsened.load(Ordering::Relaxed) {
+            // Already means "everything"; recording more would only cost
+            // memory to say the same thing.
+            return;
+        }
+        let mut guard = self.sources.lock();
+        if guard.contains_key(&source_region) {
+            let slot = guard.entry(source_region).or_insert(generation);
+            *slot = (*slot).max(generation);
+            return;
+        }
+        if cap != 0 && guard.len() >= cap {
+            // Coarsen: drop the precise set and let the scan side fall back to
+            // walking every plausible source. Correctness is preserved because
+            // the fallback is a SUPERSET of what was recorded — the entries
+            // being dropped are all still covered, just not named.
+            guard.clear();
+            guard.shrink_to_fit();
+            self.coarsened.store(true, Ordering::Relaxed);
+            crate::gc_metrics::record_g1_rset_coarsened();
+            return;
+        }
+        guard.insert(source_region, generation);
+    }
+
+    /// Has this rset given up naming individual sources? See the field docs.
+    pub fn is_coarsened(&self) -> bool {
+        self.coarsened.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Clear the remembered set, including any coarsening.
+    ///
+    /// Clearing the coarsened flag here is what makes coarsening recoverable at
+    /// all: `G1Region::reset` zero-fills the region and calls this, so nothing
+    /// that could have held an edge survives, and the region starts naming
+    /// sources precisely again.
     pub fn clear(&self) {
         self.sources.lock().clear();
+        self.coarsened
+            .store(false, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// G1MAT-4 — drop every recorded source region for which `keep` returns

@@ -113,6 +113,11 @@ struct Counters {
     /// has never verified the whole heap in one pause, and the difference
     /// matters when reading a zero `cset_verify_dangling`.
     cset_verify_truncated: AtomicU64,
+    /// Remembered sets that gave up naming individual source regions and
+    /// coarsened to "any region may point into me" (audit §9 item 5). A
+    /// non-zero value means some pause after it walked every plausible source
+    /// region wholesale, which is correct but is the expensive arm.
+    rset_coarsened: AtomicU64,
     /// Nanoseconds spent in card refinement (flush + drain + dirty-card scan).
     /// Ungated.
     refinement_nanos: AtomicU64,
@@ -140,6 +145,7 @@ impl Counters {
             cset_verify_pauses: AtomicU64::new(0),
             cset_verify_dangling: AtomicU64::new(0),
             cset_verify_truncated: AtomicU64::new(0),
+            rset_coarsened: AtomicU64::new(0),
             refinement_nanos: AtomicU64::new(0),
             refinement_passes: AtomicU64::new(0),
             allocated_objects: AtomicU64::new(0),
@@ -326,6 +332,13 @@ pub fn record_g1_cset_verify(objects: u64, dangling: u64, truncated: bool) {
     });
 }
 
+/// Record that one remembered set coarsened (audit §9 item 5).
+pub fn record_g1_rset_coarsened() {
+    with_counters(|c| {
+        c.rset_coarsened.fetch_add(1, Ordering::Relaxed);
+    });
+}
+
 /// Record one refinement pass of `nanos` nanoseconds (card buffer flush +
 /// pending drain + dirty-card scan).
 pub fn record_refinement(nanos: u64) {
@@ -385,6 +398,7 @@ pub struct GcMetricsRaw {
     pub cset_verify_pauses: u64,
     pub cset_verify_dangling: u64,
     pub cset_verify_truncated: u64,
+    pub rset_coarsened: u64,
     pub refinement_nanos: u64,
     pub refinement_passes: u64,
     pub allocated_objects: u64,
@@ -543,6 +557,7 @@ pub fn gc_metrics_raw() -> GcMetricsRaw {
         cset_verify_pauses: c.cset_verify_pauses.load(Ordering::Relaxed),
         cset_verify_dangling: c.cset_verify_dangling.load(Ordering::Relaxed),
         cset_verify_truncated: c.cset_verify_truncated.load(Ordering::Relaxed),
+        rset_coarsened: c.rset_coarsened.load(Ordering::Relaxed),
         refinement_nanos: c.refinement_nanos.load(Ordering::Relaxed),
         refinement_passes: c.refinement_passes.load(Ordering::Relaxed),
         allocated_objects: c.allocated_objects.load(Ordering::Relaxed),
@@ -1288,6 +1303,7 @@ mod tests {
             cset_verify_pauses: 0,
             cset_verify_dangling: 0,
             cset_verify_truncated: 0,
+            rset_coarsened: 0,
             refinement_nanos: 4_000_000,
             refinement_passes: 4,
             allocated_objects: 1_000,

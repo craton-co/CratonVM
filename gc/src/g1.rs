@@ -8231,6 +8231,22 @@ impl G1Collector {
     fn live_rset_sources(regions: &[G1Region], cset: &[usize]) -> std::collections::HashSet<usize> {
         let mut set = std::collections::HashSet::new();
         for &cset_idx in cset {
+            // COARSENED (audit §9 item 5): this rset stopped naming individual
+            // sources when it hit `rset_source_cap`, so it now asserts only
+            // "some region points into me". The sound reading is every region
+            // that could hold such an edge — which is what makes coarsening a
+            // memory/scan-time trade and not a correctness one. Getting this
+            // wrong in the cheap direction (treating a coarsened rset as empty)
+            // would drop exactly the live objects the set exists to find.
+            if regions[cset_idx].rset.is_coarsened() {
+                for (i, r) in regions.iter().enumerate() {
+                    if r.region_type != RegionType::Free && !cset.contains(&i) {
+                        set.insert(i);
+                    }
+                }
+                // Nothing another CSet region can add to a whole-heap set.
+                return set;
+            }
             // `sources_with_generations()` snapshots under the per-rset mutex
             // and returns owned pairs, so the lock is not held across the body.
             for (source, generation) in regions[cset_idx].rset.sources_with_generations() {
@@ -16548,6 +16564,219 @@ mod tests {
     /// enter a collection set, because Phase 5 zero-fills and re-types every
     /// CSet region that holds no self-forwarded object. That is what lets
     /// `pin_region_for_addr` promise a JNI critical section a stable address.
+    /// Audit §9 item 5 — the remembered set is bounded, and bounding it does
+    /// not lose objects.
+    ///
+    /// The bound is coarsening: past `rset_source_cap()` distinct sources an
+    /// rset stops naming them and asserts only "some region points into me".
+    /// That is a memory/scan-time trade, and it is only sound if the scan side
+    /// reads a coarsened set as the SUPERSET — every plausible source — rather
+    /// than as the empty set it now physically contains. Reading it the cheap
+    /// way would drop exactly the live objects the remembered set exists to
+    /// find, which is why the second half of this test runs a real collection
+    /// rather than stopping at the flag.
+    #[test]
+    fn a_coarsened_remembered_set_still_finds_every_live_edge() {
+        let gc = make_collector();
+
+        // --- the flag, and what it does to the source set ----------------
+        let target = 1usize;
+        {
+            let regions = gc.regions.lock();
+            // Cap of 2: the third DISTINCT source coarsens.
+            regions[target].rset.add_reference_in_generation_within(3, 0, 2);
+            regions[target].rset.add_reference_in_generation_within(4, 0, 2);
+            assert!(!regions[target].rset.is_coarsened(), "still under the cap");
+            regions[target].rset.add_reference_in_generation_within(5, 0, 2);
+            assert!(
+                regions[target].rset.is_coarsened(),
+                "exceeding the cap must coarsen rather than grow"
+            );
+            assert_eq!(
+                regions[target].rset.source_count(),
+                0,
+                "coarsening releases the precise set — that is the whole point \
+                 of the bound"
+            );
+
+            let sources = G1Collector::live_rset_sources(&regions, &[target]);
+            for (i, r) in regions.iter().enumerate() {
+                if i != target && r.region_type != RegionType::Free {
+                    assert!(
+                        sources.contains(&i),
+                        "a coarsened rset must be read as EVERY plausible \
+                         source; region {i} is missing"
+                    );
+                }
+            }
+        }
+
+        // --- and the behaviour: no object is lost by the bound -----------
+        //
+        // P -> Q across regions, with the recorded entry then destroyed by
+        // coarsening. Nothing names P any more, so Q survives only if the
+        // coarsened read is the superset.
+        let gc2 = make_collector();
+        let p = gc2.alloc_object(ClassId::new(1), 1);
+        let p_region = gc2.lookup_region_for_addr(p.as_ptr() as usize).unwrap();
+        gc2.current_eden.store(usize::MAX, Ordering::Relaxed);
+        let q = gc2.alloc_object(ClassId::new(2), 1);
+        let q_region = gc2.lookup_region_for_addr(q.as_ptr() as usize).unwrap();
+        assert_ne!(p_region, q_region);
+        gc2.set_field(q, 0, Value::Int(9191));
+        gc2.set_field(p, 0, Value::Object(Some(q)));
+        // Hold P's region out of the CSet so it is a source rather than a
+        // collection target, exactly as a JNI pin would.
+        gc2.pin_region(p_region);
+
+        {
+            // Coarsen Q's rset, which destroys the entry that named P. A cap of
+            // 1 coarsens on the second distinct source.
+            let regions = gc2.regions.lock();
+            regions[q_region]
+                .rset
+                .add_reference_in_generation_within(999_999, 0, 1);
+            regions[q_region]
+                .rset
+                .add_reference_in_generation_within(999_998, 0, 1);
+            assert!(regions[q_region].rset.is_coarsened());
+            assert!(
+                !regions[q_region].rset.sources().contains(&p_region),
+                "the entry naming P is gone — this test would pass vacuously otherwise"
+            );
+        }
+
+        let q_addr = q.as_ptr() as usize;
+        let mut roots: Vec<ObjectRef> = vec![];
+        let result = gc2.young_collection(&mut roots, &NoopMonitors);
+        let q_new = result
+            .pointer_map
+            .get(&q_addr)
+            .copied()
+            .expect("a coarsened remembered set must still reach Q through the wholesale walk");
+        match gc2.get_field(p, 0) {
+            Value::Object(Some(r)) => assert_eq!(r.as_ptr() as usize, q_new),
+            other => panic!("P's reference was lost under coarsening: {other:?}"),
+        }
+        assert_eq!(gc2.get_field(q_new_ref(q_new), 0).as_int(), Some(9191));
+    }
+
+    /// Helper: rebuild an `ObjectRef` from a post-GC address.
+    fn q_new_ref(addr: usize) -> ObjectRef {
+        // SAFETY: `addr` came out of this pause's pointer map, so it names a
+        // live, 8-byte-aligned to-space object.
+        unsafe { ObjectRef::from_raw(addr as *mut u8) }
+    }
+
+    /// Audit §9 item 6 — the JNI-pinned-source policy, stated and pinned.
+    ///
+    /// There are two no-relocation pin vocabularies and they are covered
+    /// DIFFERENTLY as remembered-set sources. Until now that difference lived in
+    /// a comment, which is what the audit item objects to:
+    ///
+    /// * a **JNI-pinned** region (`G1Region::pinned` / `pin_count`, JEP 423) is
+    ///   held out of the collection set but is an ORDINARY remembered-set
+    ///   source. A CSet object referenced only from it survives because the
+    ///   post-write barrier recorded that edge. Nothing walks the region
+    ///   wholesale.
+    /// * a **JIT-pinned** region is additionally walked WHOLESALE (see
+    ///   `a_jit_pinned_region_is_a_wholesale_rset_source_on_the_parallel_path_too`),
+    ///   because `jit_pinned_region_set()` also contains every region holding a
+    ///   published un-retired TLAB tail — memory no barrier ever saw.
+    ///
+    /// THE POLICY, stated: the JNI half is barrier-covered, the JIT half is
+    /// walk-covered, and the asymmetry is deliberate. It is sound exactly while
+    /// every store that can install a reference out of a JNI-pinned region
+    /// fires the barrier — which is what G1-2 was about, and G1-2 is closed:
+    /// under a backend that publishes no live region bounds (G1, ZGC) every
+    /// inline JIT reference store bails to `jit_putfield_object`, which fires
+    /// the collector's own barrier. If that ever stops being true, this test's
+    /// second half is the one that starts lying, and the fix is to promote
+    /// JNI-pinned regions to wholesale sources too.
+    #[test]
+    fn a_jni_pinned_region_is_an_ordinary_rset_source_not_a_wholesale_one() {
+        // --- the barrier-covered case: the edge is recorded, so Q survives ---
+        let gc = make_collector();
+        let p = gc.alloc_object(ClassId::new(1), 1);
+        let p_region = gc.lookup_region_for_addr(p.as_ptr() as usize).unwrap();
+        // Retire the current Eden so Q lands in a different region.
+        gc.current_eden.store(usize::MAX, Ordering::Relaxed);
+        let q = gc.alloc_object(ClassId::new(2), 1);
+        let q_region = gc.lookup_region_for_addr(q.as_ptr() as usize).unwrap();
+        assert_ne!(p_region, q_region, "Q must be cross-region from P");
+        gc.set_field(q, 0, Value::Int(2424));
+        gc.set_field(p, 0, Value::Object(Some(q))); // fires the post-write barrier
+
+        gc.pin_region(p_region);
+        assert!(gc.is_pinned(p_region));
+        assert!(
+            !gc.jit_pinned_region_set().contains(&p_region),
+            "a JNI pin must NOT put the region in the JIT-pinned set — the two \
+             vocabularies are separate, and conflating them is what would make \
+             this policy vacuous"
+        );
+
+        // The mechanism: P's region is reachable as an ORDINARY rset source of
+        // the CSet, i.e. because the barrier recorded the edge.
+        {
+            let regions = gc.regions.lock();
+            let sources = G1Collector::live_rset_sources(&regions, &[q_region]);
+            assert!(
+                sources.contains(&p_region),
+                "the JNI-pinned holder must appear as a remembered-set source \
+                 of the region it points into"
+            );
+        }
+
+        let q_addr = q.as_ptr() as usize;
+        let mut roots: Vec<ObjectRef> = vec![];
+        let result = gc.young_collection(&mut roots, &NoopMonitors);
+        let q_new = result
+            .pointer_map
+            .get(&q_addr)
+            .copied()
+            .expect("Q is live through the pinned region's remembered set");
+        match gc.get_field(p, 0) {
+            Value::Object(Some(r)) => assert_eq!(
+                r.as_ptr() as usize,
+                q_new,
+                "P's slot must be rewritten to Q's new address"
+            ),
+            other => panic!("P's reference was lost: {other:?}"),
+        }
+
+        // --- the dependency, made explicit -------------------------------
+        //
+        // Same shape, but with the barrier's record erased: the JNI-pinned
+        // region then covers NOTHING. Asserted at the source-set level rather
+        // than by running a pause, deliberately — actually collecting with the
+        // record erased drops a live object and leaves P pointing into a freed
+        // region, which is precisely the `[g1][SECURITY V7b]` condition the
+        // post-evacuation verifier exists to catch, and it does catch it. A
+        // test should not have to corrupt the heap to state where a region's
+        // coverage comes from.
+        let gc2 = make_collector();
+        let p2 = gc2.alloc_object(ClassId::new(1), 1);
+        let p2_region = gc2.lookup_region_for_addr(p2.as_ptr() as usize).unwrap();
+        gc2.current_eden.store(usize::MAX, Ordering::Relaxed);
+        let q2 = gc2.alloc_object(ClassId::new(2), 1);
+        let q2_region = gc2.lookup_region_for_addr(q2.as_ptr() as usize).unwrap();
+        assert_ne!(p2_region, q2_region);
+        gc2.set_field(p2, 0, Value::Object(Some(q2)));
+        gc2.pin_region(p2_region);
+        gc2.regions.lock()[q2_region].rset.clear();
+
+        let regions = gc2.regions.lock();
+        assert!(
+            !G1Collector::live_rset_sources(&regions, &[q2_region]).contains(&p2_region),
+            "with the entry erased the pinned holder is no longer a source"
+        );
+        assert!(
+            !gc2.jit_pinned_region_set().contains(&p2_region),
+            "and nothing else would walk it: a JNI pin is not a JIT pin, so the              remembered set is the WHOLE of a JNI-pinned region's coverage. If              this ever stops holding, the policy above needs rewriting rather              than this assertion"
+        );
+    }
+
     #[test]
     fn a_pinned_region_is_never_evacuated() {
         let gc = make_collector();
