@@ -5597,12 +5597,17 @@ pub(crate) fn native_character_instance_to_string(
         _ => return Ok(Some(Value::Object(None))),
     };
     let val = match ctx.get_field(this, 0) {
-        Value::Int(v) => v as u32,
+        Value::Int(v) => v,
         _ => 0,
     };
-    let ch = char::from_u32(val).unwrap_or('\0');
-    let s = ctx.create_string(&ch.to_string());
-    Ok(Some(Value::Object(Some(s))))
+    // Delegate to the static twin rather than repeating its body. `char` cannot
+    // represent an unpaired surrogate, so the `char::from_u32(val).unwrap_or('\0')`
+    // that used to live here answered U+0000 for every one of D800..=DFFF —
+    // MEASURED 2026-08-13: `Character.valueOf('\uD800').toString().charAt(0)` was
+    // 0 where HotSpot gives 55296, while the STATIC `Character.toString(char)` and
+    // `String.valueOf(char)` were both already correct. The static twin has
+    // handled this since it was written; this one never called it.
+    native_character_static_to_string(ctx, &[Value::Int(val)])
 }
 
 // hashCode for Int-stored wrappers (Integer, Byte, Short, Character)

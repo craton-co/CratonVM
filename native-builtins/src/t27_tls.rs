@@ -13696,6 +13696,13 @@ fn register_ssl_session_real(r: &mut NativeMethodRegistry) {
         "getValue",
         "(Ljava/lang/String;)Ljava/lang/Object;",
         |ctx, args| {
+        // MEASURED: IllegalArgumentException, SINGULAR "argument".
+        if matches!(args.get(1), None | Some(Value::Object(None))) {
+            return Err(RuntimeError::IllegalArgumentException {
+                message: "argument can not be null".into(),
+            }
+            .into());
+        }
             let this = obj_arg(args, 0)?;
             let name = args.get(1).copied().unwrap_or(Value::Object(None));
             // E31: `sslsess_attrs_slot`, not `num_fields - 1` — see its doc.
@@ -13724,8 +13731,14 @@ fn register_ssl_session_real(r: &mut NativeMethodRegistry) {
             let name = args.get(1).copied().unwrap_or(Value::Object(None));
             let value = args.get(2).copied().unwrap_or(Value::Object(None));
             if matches!(name, Value::Object(None)) || matches!(value, Value::Object(None)) {
-                return Err(RuntimeError::NullPointerException {
-                    message: Some("name and value must not be null".into()),
+                return Err(RuntimeError::IllegalArgumentException {
+                    // MEASURED 2026-08-13 (scratchpad/orch/Three.java): JSSE
+                    // VALIDATES here rather than dereferencing, so the KIND is
+                    // IllegalArgumentException, not NPE -- and the text is the
+                    // JDK's, not the invented "name and value must not be null".
+                    // Note the PLURAL: putValue says "arguments", getValue and
+                    // removeValue say "argument". One letter, two messages.
+                    message: "arguments can not be null".into(),
                 }
                 .into());
             }
@@ -13759,6 +13772,13 @@ fn register_ssl_session_real(r: &mut NativeMethodRegistry) {
         },
     );
     r.register(cls, "removeValue", "(Ljava/lang/String;)V", |ctx, args| {
+        // MEASURED: IllegalArgumentException, SINGULAR "argument".
+        if matches!(args.get(1), None | Some(Value::Object(None))) {
+            return Err(RuntimeError::IllegalArgumentException {
+                message: "argument can not be null".into(),
+            }
+            .into());
+        }
         let this = obj_arg(args, 0)?;
         let name = args.get(1).copied().unwrap_or(Value::Object(None));
         // E31: `sslsess_attrs_slot`, not `num_fields - 1` — see its doc.

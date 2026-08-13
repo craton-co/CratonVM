@@ -1445,6 +1445,15 @@ fn store_parsed_entries(ctx: &mut dyn NativeContext, this: ObjectRef, parsed: &[
 /// the bytes as a Java `.properties` file, and populates the side-
 /// table for `this`.
 fn native_properties_load(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    // Null-argument contract MEASURED 2026-08-13 (scratchpad/orch/Three.java).
+    // The JDK names the PARAMETER here rather than using the helpful-NPE
+    // dereference text, so the message cannot be derived -- it is transcribed.
+    if matches!(args.get(1), None | Some(Value::Object(None))) {
+        return Err(RuntimeError::NullPointerException {
+            message: Some("inStream parameter is null".into()),
+        }
+        .into());
+    }
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(None),
@@ -1537,6 +1546,15 @@ fn iso_8859_1_bytes(s: &str) -> Vec<u8> {
 /// not call `Reader.close()` (the caller owns the stream lifecycle,
 /// matching real JDK `Properties.load(Reader)`).
 fn native_properties_load_reader(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    // Null-argument contract MEASURED 2026-08-13 (scratchpad/orch/Three.java).
+    // The JDK names the PARAMETER here rather than using the helpful-NPE
+    // dereference text, so the message cannot be derived -- it is transcribed.
+    if matches!(args.get(1), None | Some(Value::Object(None))) {
+        return Err(RuntimeError::NullPointerException {
+            message: Some("reader parameter is null".into()),
+        }
+        .into());
+    }
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(None),
@@ -3569,6 +3587,15 @@ fn build_store_text(
 /// `ConcurrentBeanWrapperTests`, which stores a cloned system-properties snapshot
 /// and reloads it, depends on this).
 fn native_properties_store_stream(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    // Null-argument contract MEASURED 2026-08-13 (scratchpad/orch/Three.java).
+    // The JDK names the PARAMETER here rather than using the helpful-NPE
+    // dereference text, so the message cannot be derived -- it is transcribed.
+    if matches!(args.get(1), None | Some(Value::Object(None))) {
+        return Err(RuntimeError::NullPointerException {
+            message: None,
+        }
+        .into());
+    }
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(None),
@@ -3618,6 +3645,15 @@ fn native_properties_store_stream(ctx: &mut dyn NativeContext, args: &[Value]) -
 /// but writes the text straight to the `Writer` (no `\uXXXX` escaping; the
 /// Writer's own charset encodes the characters).
 fn native_properties_store_writer(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    // Null-argument contract MEASURED 2026-08-13 (scratchpad/orch/Three.java).
+    // The JDK names the PARAMETER here rather than using the helpful-NPE
+    // dereference text, so the message cannot be derived -- it is transcribed.
+    if matches!(args.get(1), None | Some(Value::Object(None))) {
+        return Err(RuntimeError::NullPointerException {
+            message: None,
+        }
+        .into());
+    }
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(None),
