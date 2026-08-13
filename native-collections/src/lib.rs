@@ -53236,6 +53236,17 @@ fn native_collections_n_copies(ctx: &mut dyn NativeContext, args: &[Value]) -> M
         _ => 0,
     };
     let val = args.get(1).cloned().unwrap_or(Value::Object(None));
+    // MEASURED 2026-08-13 (scratchpad/orch/Two.java): a negative length is
+    // IllegalArgumentException with the count in the text, NOT a clamp. The
+    // `n.max(0)` below turned nCopies(-1, x) into an empty list -- a plausible
+    // answer, so nothing downstream could notice. The check precedes both
+    // allocations and the pins: an early return between pin and unpin leaks.
+    if n < 0 {
+        return Err(RuntimeError::IllegalArgumentException {
+            message: format!("List length = {n}").into(),
+        }
+        .into());
+    }
     let __al_n_fields = al_slots(ctx).2;
     // cceres3: pin across GC-capable call (stream stale-at-store wave) — the
     // two allocations can move `val` and the freshly allocated `list`.

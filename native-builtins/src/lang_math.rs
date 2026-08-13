@@ -223,8 +223,24 @@ pub(crate) fn register_math_natives(registry: &mut NativeMethodRegistry, class: 
         registry.register(class, "cosh", "(D)D", native_math_cosh);
         registry.register(class, "tanh", "(D)D", native_math_tanh);
     }
-    registry.register(class, "copySign", "(DD)D", native_math_copy_sign_double);
-    registry.register(class, "copySign", "(FF)F", native_math_copy_sign_float);
+    // `Math.copySign` and `StrictMath.copySign` DIFFER on a NaN sign argument,
+    // and this registrar serves both classes with one body. MEASURED
+    // 2026-08-13 (scratchpad/orch/Two.java) on 25.0.3+9-LTS:
+    //
+    //   StrictMath.copySign(1.0, -NaN) = 3ff0000000000000  (+1.0)
+    //   Math.copySign(1.0, -NaN)       = bff0000000000000  (-1.0)
+    //
+    // StrictMath specifies that a NaN sign argument is ALWAYS treated as
+    // positive; Math is explicitly permitted to propagate the raw sign bit for
+    // speed, and its answer already matched. So only the strict form is wrong,
+    // and only for NaN -- `copySign(1.0, -0.0)` is -1.0 in BOTH and must stay.
+    if class == "java/lang/StrictMath" {
+        registry.register(class, "copySign", "(DD)D", native_strictmath_copy_sign_double);
+        registry.register(class, "copySign", "(FF)F", native_strictmath_copy_sign_float);
+    } else {
+        registry.register(class, "copySign", "(DD)D", native_math_copy_sign_double);
+        registry.register(class, "copySign", "(FF)F", native_math_copy_sign_float);
+    }
     registry.register(class, "nextUp", "(D)D", native_math_next_up_double);
     registry.register(class, "nextDown", "(D)D", native_math_next_down_double);
     registry.register(class, "nextAfter", "(DD)D", native_math_next_after);
@@ -2630,6 +2646,44 @@ pub(crate) fn native_math_tanh(_ctx: &mut dyn NativeContext, args: &[Value]) -> 
 }
 
 #[inline]
+
+/// `StrictMath.copySign` — identical to [`native_math_copy_sign_double`] except
+/// that a NaN sign argument is ALWAYS treated as positive (JDK spec). Rust's
+/// `f64::copysign` copies the raw sign bit, which is the `Math` behaviour.
+pub(crate) fn native_strictmath_copy_sign_double(
+    _ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let mag = match args.first() {
+        Some(Value::Double(v)) => *v,
+        _ => 0.0,
+    };
+    let sign = match args.get(1) {
+        Some(Value::Double(v)) => *v,
+        _ => 0.0,
+    };
+    let sign = if sign.is_nan() { 1.0 } else { sign };
+    Ok(Some(Value::Double(mag.copysign(sign))))
+}
+
+/// The `float` half of the same rule; both were wrong, and a family fix that
+/// took only the `double` form would have left the `(FF)F` row red.
+pub(crate) fn native_strictmath_copy_sign_float(
+    _ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let mag = match args.first() {
+        Some(Value::Float(v)) => *v,
+        _ => 0.0,
+    };
+    let sign = match args.get(1) {
+        Some(Value::Float(v)) => *v,
+        _ => 0.0,
+    };
+    let sign = if sign.is_nan() { 1.0 } else { sign };
+    Ok(Some(Value::Float(mag.copysign(sign))))
+}
+
 pub(crate) fn native_math_copy_sign_double(
     _ctx: &mut dyn NativeContext,
     args: &[Value],
