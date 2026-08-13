@@ -1751,7 +1751,7 @@ impl VmHeap {
     /// previous unfinished cycle, we log a warning and join the stale
     /// worker before restarting. Skipping the new cycle would leave a
     /// running worker racing with the bitmap clear below.
-    pub fn g1_start_concurrent_mark(&self) {
+    pub fn g1_start_concurrent_mark(&self, stw: &crate::collector::StopTheWorldToken) {
         if let VmHeap::G1(state) = self {
             let mut slot = state.concurrent_mark.lock();
             if let Some(stale) = slot.take() {
@@ -1766,7 +1766,7 @@ impl VmHeap {
             }
             // Order matters: phase must be ConcurrentMark before the
             // worker starts stepping.
-            state.collector.start_concurrent_mark();
+            state.collector.start_concurrent_mark(stw);
             *slot = Some(ConcurrentMarkController::spawn(Arc::clone(
                 &state.collector,
             )));
@@ -1786,14 +1786,22 @@ impl VmHeap {
     }
 
     /// Mark roots into G1's mark bitmap.
-    pub fn g1_mark_roots(&self, roots: &[cratonvm_types::ObjectRef]) {
+    ///
+    /// I-17: `remark` is an STW phase, so this wrapper takes the witness too
+    /// rather than fabricating one — the caller is inside the initial-mark
+    /// pause and already holds it.
+    pub fn g1_mark_roots(
+        &self,
+        stw: &crate::collector::StopTheWorldToken,
+        roots: &[cratonvm_types::ObjectRef],
+    ) {
         if let VmHeap::G1(g1) = self {
-            g1.remark(roots); // remark marks roots + drains SATB
-                              // The worker (spawned by `g1_start_concurrent_mark` just before this)
-                              // may have already drained the initially-empty worklist and parked
-                              // with `quiesced=true`. These roots seed real work, so wake it and
-                              // clear the premature quiescence — otherwise the completion poll
-                              // could fire before the seeded graph is marked.
+            g1.remark(stw, roots); // remark marks roots + drains SATB
+            // The worker (spawned by `g1_start_concurrent_mark` just before
+            // this) may have already drained the initially-empty worklist and
+            // parked with `quiesced=true`. These roots seed real work, so wake
+            // it and clear the premature quiescence — otherwise the completion
+            // poll could fire before the seeded graph is marked.
             if let Some(ctrl) = g1.concurrent_mark.lock().as_ref() {
                 ctrl.notify_work_available();
             }
@@ -1871,6 +1879,7 @@ impl VmHeap {
     /// an already-completed cycle.
     pub fn g1_final_remark_and_cleanup(
         &self,
+        stw: &crate::collector::StopTheWorldToken,
         roots: &[cratonvm_types::ObjectRef],
         process_refs: Option<&mut dyn FnMut(&dyn Fn(usize) -> bool) -> Vec<usize>>,
     ) -> bool {
@@ -1894,7 +1903,7 @@ impl VmHeap {
             };
             let steps = ctrl.steps_performed();
             let outcome = ctrl.request_stop_and_join();
-            state.collector.remark(roots);
+            state.collector.remark(stw, roots);
             while !state.collector.concurrent_mark_step(usize::MAX) {}
             tracing::debug!(
                 "g1_final_remark_and_cleanup: remark+drain done (worker steps={}, joined_ok={})",
@@ -1914,7 +1923,7 @@ impl VmHeap {
                 .collector
                 .gc_state
                 .set_phase(ConcurrentGcPhase::ConcurrentSweep);
-            state.collector.cleanup();
+            state.collector.cleanup(stw);
             state.collector.gc_state.set_phase(ConcurrentGcPhase::Idle);
             return true;
         }
@@ -1930,6 +1939,23 @@ impl VmHeap {
     /// reaches the bitmap. Retained for tests and as the abort/teardown
     /// path; the runtime cycle driver no longer calls it.
     ///
+    /// **This path therefore reclaims NOTHING, by design** (audit G1-3 /
+    /// §8.2). Skipping the remark means the gray set is not drained to a fixed
+    /// point, and `G1Collector::cleanup` no longer trusts its caller about
+    /// that: it re-checks the worklist and, finding it non-empty, takes the
+    /// retain-everything fail-safe — no in-place free of a zero-live Old
+    /// region, no humongous reclaim — because on an incomplete closure
+    /// `live_bytes == 0` does not mean "unreachable", and acting on it frees
+    /// live objects. The pause is recorded with
+    /// `g1_degraded::CLEANUP_CLOSURE_INCOMPLETE` so the declined reclamation
+    /// is visible in `collector_decision_report()` rather than silent.
+    ///
+    /// So the useful reading of this method is "stop the marker and return the
+    /// phase machine to `Idle`", not "finish the cycle". A caller that wants
+    /// the cycle's reclamation must run [`Self::g1_final_remark_and_cleanup`],
+    /// which drives `concurrent_mark_step` to a fixed point first. Covered by
+    /// `g1::tests::cleanup_with_an_undrained_gray_set_retains_every_region`.
+    ///
     /// Task #56: drains the [`ConcurrentMarkController`] slot and joins
     /// the background worker (blocking). The STW remark the caller runs
     /// next requires a quiescent worklist, so the join is mandatory.
@@ -1938,7 +1964,7 @@ impl VmHeap {
     /// called twice, or before any cycle started. Skipping cleanup keeps
     /// the phase machine clean (cleanup itself is idempotent, but
     /// running it from Idle would flip `marking_complete` spuriously).
-    pub fn g1_signal_marking_complete(&self) {
+    pub fn g1_signal_marking_complete(&self, stw: &crate::collector::StopTheWorldToken) {
         if let VmHeap::G1(state) = self {
             let ctrl = state.concurrent_mark.lock().take();
             match ctrl {
@@ -1954,7 +1980,7 @@ impl VmHeap {
                         .collector
                         .gc_state
                         .set_phase(ConcurrentGcPhase::ConcurrentSweep);
-                    state.collector.cleanup();
+                    state.collector.cleanup(stw);
                     state.collector.gc_state.set_phase(ConcurrentGcPhase::Idle);
                 }
                 None => {
@@ -2673,6 +2699,14 @@ mod concurrent_mark_controller_tests {
     use super::*;
     use crate::g1::G1CollectorConfig;
 
+    /// Test-only `StopTheWorldToken` (I-17). Single-threaded test harness, so
+    /// the STW invariant the token witnesses is trivially satisfied.
+    #[inline]
+    fn stw() -> crate::collector::StopTheWorldToken {
+        // SAFETY: single-threaded test harness; no mutator is running.
+        unsafe { crate::collector::StopTheWorldToken::new() }
+    }
+
     fn make_g1_heap() -> VmHeap {
         // Small heap — fast to construct, big enough for the few
         // allocations these tests perform.
@@ -2726,7 +2760,7 @@ mod concurrent_mark_controller_tests {
 
         // Start: phase flips to ConcurrentMark and a controller is
         // installed.
-        heap.g1_start_concurrent_mark();
+        heap.g1_start_concurrent_mark(&stw());
         assert!(
             heap.g1_is_marking_active(),
             "phase must be ConcurrentMark after start"
@@ -2738,7 +2772,7 @@ mod concurrent_mark_controller_tests {
 
         // Complete: drains the slot, joins the worker, runs cleanup,
         // phase returns to Idle.
-        heap.g1_signal_marking_complete();
+        heap.g1_signal_marking_complete(&stw());
         assert!(
             !g1_state(&heap).unwrap().has_active_controller(),
             "controller slot must be drained after g1_signal_marking_complete",
@@ -2757,8 +2791,8 @@ mod concurrent_mark_controller_tests {
         let collector_arc_before = Arc::strong_count(&g1_state(&heap).unwrap().collector);
 
         for _ in 0..10 {
-            heap.g1_start_concurrent_mark();
-            heap.g1_signal_marking_complete();
+            heap.g1_start_concurrent_mark(&stw());
+            heap.g1_signal_marking_complete(&stw());
         }
 
         // After every cycle has joined, the only strong reference to
@@ -2784,18 +2818,18 @@ mod concurrent_mark_controller_tests {
         // remains ConcurrentMark; the new controller is parked.
         let heap = make_g1_heap();
 
-        heap.g1_start_concurrent_mark();
+        heap.g1_start_concurrent_mark(&stw());
         let first_arc_count = Arc::strong_count(&g1_state(&heap).unwrap().collector);
 
         // Second start without complete in between — must not leak.
-        heap.g1_start_concurrent_mark();
+        heap.g1_start_concurrent_mark(&stw());
         assert!(
             g1_state(&heap).unwrap().has_active_controller(),
             "a controller must still be parked after the second start",
         );
 
         // Single signal-complete drains everything.
-        heap.g1_signal_marking_complete();
+        heap.g1_signal_marking_complete(&stw());
         let final_arc_count = Arc::strong_count(&g1_state(&heap).unwrap().collector);
         assert!(
             final_arc_count <= first_arc_count,
@@ -2816,15 +2850,15 @@ mod concurrent_mark_controller_tests {
         let heap = make_g1_heap();
 
         assert!(!heap.g1_is_marking_active());
-        heap.g1_signal_marking_complete(); // no-op path
+        heap.g1_signal_marking_complete(&stw()); // no-op path
         assert!(!heap.g1_is_marking_active());
         assert!(!g1_state(&heap).unwrap().has_active_controller());
 
         // Calling it twice (after a real cycle then a stray call) must
         // also be a no-op.
-        heap.g1_start_concurrent_mark();
-        heap.g1_signal_marking_complete();
-        heap.g1_signal_marking_complete(); // stray second call
+        heap.g1_start_concurrent_mark(&stw());
+        heap.g1_signal_marking_complete(&stw());
+        heap.g1_signal_marking_complete(&stw()); // stray second call
         assert!(!heap.g1_is_marking_active());
     }
 
@@ -2842,7 +2876,7 @@ mod concurrent_mark_controller_tests {
         // reference that mutators overwrite during marking.
         let obj = heap.alloc_object(cratonvm_types::ClassId::new(1), 0);
 
-        heap.g1_start_concurrent_mark();
+        heap.g1_start_concurrent_mark(&stw());
 
         // Before the overwrite, the SATB queue is empty (initial-mark
         // activated it but nothing was logged yet).
@@ -2886,7 +2920,7 @@ mod concurrent_mark_controller_tests {
         );
 
         // Cleanup so we don't strand the worker.
-        heap.g1_signal_marking_complete();
+        heap.g1_signal_marking_complete(&stw());
     }
 
     /// Residual humongous OOB regression: `read_char_array_bulk` on a G1

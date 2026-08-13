@@ -251,6 +251,27 @@ jobs:
         if: matrix.os == 'ubuntu-latest'
         run: cargo test -p cratonvm-native-builtins --test lock_discipline_ratchet -- --nocapture
 
+      # A `cargo test` binary runs its tests on parallel threads in ONE process,
+      # so a test that publishes PROCESS-GLOBAL state reinterprets the heaps of
+      # every test beside it. Five `gen_heap` unit tests used to enable narrow
+      # oops around their own assertions, which flips
+      # `element_byte_size(Reference)` from 8 to 4 process-wide; reference
+      # arrays written at stride 8 were read back at stride 4 and decoded the
+      # high half of a pointer as a whole reference. That surfaced as
+      # `ObjectRef pointer not 8-byte aligned` in the G1 parallel-evacuation
+      # tests and was mis-attributed to a race in the evacuator for months.
+      #
+      # The `cargo test --workspace` job above cannot see this class of bug:
+      # the measured rate was 14 failures in 300 full-suite runs, so a
+      # single-run job is green ~95% of the time while the defect is fully
+      # live. Repetition is the gate. Scoped to the two collector crates and
+      # to their `--lib` suites, which is where process-global heap geometry
+      # is both written and read.
+      - name: GC suite flake gate (repeat runs)
+        if: matrix.os == 'ubuntu-latest'
+        shell: bash
+        run: bash scripts/gc-flake-gate.sh
+
   # `synthetic-jdk` feature gate. This feature is documented and supported (see
   # the `[features]` table in vm/Cargo.toml and NEW-11 in docs/roadmap.md), but
   # it is deliberately NOT in the default set — so every job above compiles the

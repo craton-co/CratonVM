@@ -11955,7 +11955,7 @@ impl GenerationalHeap {
                         base,
                         stretch_lo,
                         stretch_hi,
-                        cratonvm_types::narrow_oop::narrow_oops_enabled(),
+                        active_narrow_geometry(),
                         |_slot, _width, value| mark_if_old_base(value),
                     );
                 }
@@ -12148,7 +12148,7 @@ impl GenerationalHeap {
         // compressible range, so a slot is only ever rewritten to a value that
         // round-trips; the guard keeps a non-encodable destination from
         // silently becoming a null.
-        let narrow = cratonvm_types::narrow_oop::narrow_oops_enabled();
+        let narrow = active_narrow_geometry();
         let rewrite_stretch_conservatively = |lo: usize, hi: usize| {
             // SAFETY: `[base+lo, base+hi)` is mapped from-space memory, and
             // each `slot` handed back is a location this scan just read.
@@ -15216,6 +15216,12 @@ fn parallel_sweep_walk(
 ///   * `width == 4` — an aligned 32-bit half DECODED as a narrow oop. Only
 ///     produced when compressed oops are on, and never for a zero (null) slot.
 ///
+/// `narrow` is `Some((base, shift))` — the geometry to decode halves under —
+/// or `None` for wide-only. It is passed EXPLICITLY rather than read from
+/// `narrow_oop`'s process-globals so that a test can exercise the narrow arm
+/// without publishing a geometry every other test in the binary would then
+/// read its own heap under (see `narrow_oop::disable_for_test`).
+///
 /// Both widths are visited rather than one or the other. Only reference FIELDS
 /// and reference ARRAY ELEMENTS are narrowed, so an unparseable stretch can
 /// still hold full-width pointers (legacy 16-byte `Value` cells, internal
@@ -15237,7 +15243,7 @@ unsafe fn for_each_conservative_ref_slot(
     base: usize,
     lo: usize,
     hi: usize,
-    narrow: bool,
+    narrow: Option<(u64, usize)>,
     mut visit: impl FnMut(usize, usize, usize),
 ) {
     let mut w = lo & !7;
@@ -15245,18 +15251,32 @@ unsafe fn for_each_conservative_ref_slot(
         let addr = base + w;
         // SAFETY: caller guarantees `[base+lo, base+hi)` is mapped.
         visit(addr, 8, unsafe { *(addr as *const u64) } as usize);
-        if narrow {
+        if let Some((nbase, nshift)) = narrow {
             for half in 0..2 {
                 let slot = addr + half * 4;
                 // SAFETY: within the same mapped 8 bytes.
                 let encoded = unsafe { *(slot as *const u32) };
                 if encoded != 0 {
-                    visit(slot, 4, cratonvm_types::narrow_oop::decode(encoded) as usize);
+                    visit(
+                        slot,
+                        4,
+                        cratonvm_types::narrow_oop::decode_with(nbase, nshift, encoded) as usize,
+                    );
                 }
             }
         }
         w += 8;
     }
+}
+
+/// The published narrow-oop geometry, or `None` when compression is off.
+/// The one place the conservative walks read the globals; everything below
+/// takes the geometry as an argument.
+#[inline]
+fn active_narrow_geometry() -> Option<(u64, usize)> {
+    use cratonvm_types::narrow_oop;
+    narrow_oop::narrow_oops_enabled()
+        .then(|| (narrow_oop::narrow_base(), narrow_oop::narrow_shift()))
 }
 
 #[inline]
@@ -21045,17 +21065,35 @@ mod tests {
 #[cfg(test)]
 mod conservative_narrow_scan_tests {
     use super::*;
-    use std::sync::Mutex;
 
-    /// The narrow-oop base/shift are process-global, so these tests serialise
-    /// against each other and restore the disabled state on the way out.
-    static NARROW_CFG: Mutex<()> = Mutex::new(());
-
+    /// The geometry these tests decode under. Passed EXPLICITLY to every call;
+    /// `narrow_oop::enable` is deliberately never used here.
+    ///
+    /// It used to be published to the process-global narrow-oop config, with a
+    /// local `Mutex` serialising these five tests against each other. That
+    /// mutex bounded the wrong thing. `narrow_oop::ENABLED` is read by
+    /// `element_byte_size(ArrayElementType::Reference)` on EVERY reference
+    /// array access in the process, and `cargo test` runs the whole binary's
+    /// tests on parallel threads — so for as long as one of these tests held
+    /// the flag on, every other test's reference arrays were read back at a
+    /// 4-byte element stride they were never written at. Element `2k+1` then
+    /// decoded the high 32 bits of pointer `k` as a whole reference, which
+    /// surfaced as `ObjectRef pointer not 8-byte aligned: 0x1d1` (a Win64
+    /// pointer's high half) in `g1::tests::parallel_matches_serial_no_loss_or_dup`
+    /// — a G1 parallel-evacuation flake that was neither G1's nor a race — and
+    /// as `assert_region_encodable` firing in the `gen_heap` tests against the
+    /// window `0x20000000..0x81ffffff8`, which is exactly the `BASE`/`SHIFT`
+    /// below. See `narrow_oop::disable_for_test`.
     const BASE: u64 = 0x2000_0000;
     const SHIFT: usize = 3;
+    const GEOM: Option<(u64, usize)> = Some((BASE, SHIFT));
+
+    fn enc(addr: u64) -> u32 {
+        cratonvm_types::narrow_oop::encode_with(BASE, SHIFT, addr)
+    }
 
     /// Collect `(slot_offset_from_base, width, value)` over a buffer.
-    fn scan(buf: &[u64], narrow: bool) -> Vec<(usize, usize, usize)> {
+    fn scan(buf: &[u64], narrow: Option<(u64, usize)>) -> Vec<(usize, usize, usize)> {
         let base = buf.as_ptr() as usize;
         let mut out = Vec::new();
         // SAFETY: the whole slice is mapped, and `hi` is its byte length.
@@ -21069,21 +21107,15 @@ mod conservative_narrow_scan_tests {
 
     #[test]
     fn a_narrow_oop_pair_is_invisible_to_the_word_scan_and_visible_with_narrow_on() {
-        let _guard = NARROW_CFG.lock().unwrap_or_else(|e| e.into_inner());
-        assert!(cratonvm_types::narrow_oop::enable(BASE, SHIFT));
-
         let a = BASE + (0x100 << SHIFT);
         let b = BASE + (0x200 << SHIFT);
-        let (ea, eb) = (
-            cratonvm_types::narrow_oop::encode(a),
-            cratonvm_types::narrow_oop::encode(b),
-        );
+        let (ea, eb) = (enc(a), enc(b));
         assert_ne!(ea, 0, "test address must be encodable");
         assert_ne!(eb, 0, "test address must be encodable");
         // Two 4-byte references packed into one 8-byte word, little-endian.
         let buf = vec![(ea as u64) | ((eb as u64) << 32)];
 
-        let wide = scan(&buf, false);
+        let wide = scan(&buf, None);
         assert_eq!(wide.len(), 1, "one 8-byte word");
         assert!(
             !wide.iter().any(|&(_, _, v)| v == a as usize || v == b as usize),
@@ -21091,7 +21123,7 @@ mod conservative_narrow_scan_tests {
             wide[0].2
         );
 
-        let narrow = scan(&buf, true);
+        let narrow = scan(&buf, GEOM);
         let values: Vec<usize> = narrow.iter().map(|&(_, _, v)| v).collect();
         assert!(values.contains(&(a as usize)), "first narrow oop decoded");
         assert!(values.contains(&(b as usize)), "second narrow oop decoded");
@@ -21099,41 +21131,31 @@ mod conservative_narrow_scan_tests {
         // back at the width it read.
         assert!(narrow.contains(&(0, 4, a as usize)), "{:x?}", narrow);
         assert!(narrow.contains(&(4, 4, b as usize)), "{:x?}", narrow);
-
-        cratonvm_types::narrow_oop::disable_for_test();
     }
 
     #[test]
     fn full_width_pointers_are_still_scanned_when_narrow_is_on() {
-        let _guard = NARROW_CFG.lock().unwrap_or_else(|e| e.into_inner());
-        assert!(cratonvm_types::narrow_oop::enable(BASE, SHIFT));
-
         // A legacy 16-byte `Value` cell or an internal pointer is NOT narrowed,
         // so turning narrow oops on must not stop the 8-byte scan from seeing
         // it. Both widths, not one or the other.
         let raw = 0xdead_beef_0000_1000u64;
         let buf = vec![raw];
-        let got = scan(&buf, true);
+        let got = scan(&buf, GEOM);
         assert!(
             got.iter().any(|&(off, w, v)| off == 0 && w == 8 && v == raw as usize),
             "the full-width word must still be visited: {:x?}",
             got
         );
-
-        cratonvm_types::narrow_oop::disable_for_test();
     }
 
     #[test]
     fn null_halves_produce_no_narrow_candidate() {
-        let _guard = NARROW_CFG.lock().unwrap_or_else(|e| e.into_inner());
-        assert!(cratonvm_types::narrow_oop::enable(BASE, SHIFT));
-
         // encode(0) is 0 and decode(0) is 0; a null slot must not be offered as
         // a candidate address, or every zeroed word would decode to `base`.
         let a = BASE + (0x100 << SHIFT);
-        let ea = cratonvm_types::narrow_oop::encode(a);
+        let ea = enc(a);
         let buf = vec![ea as u64, 0u64];
-        let got = scan(&buf, true);
+        let got = scan(&buf, GEOM);
         assert_eq!(
             got.iter().filter(|&&(_, w, _)| w == 4).count(),
             1,
@@ -21141,17 +21163,12 @@ mod conservative_narrow_scan_tests {
             got
         );
         assert!(got.contains(&(0, 4, a as usize)));
-
-        cratonvm_types::narrow_oop::disable_for_test();
     }
 
     #[test]
     fn narrow_off_visits_exactly_the_aligned_words() {
-        let _guard = NARROW_CFG.lock().unwrap_or_else(|e| e.into_inner());
-        cratonvm_types::narrow_oop::disable_for_test();
-
         let buf = vec![1u64, 2, 3, 4];
-        let got = scan(&buf, false);
+        let got = scan(&buf, None);
         assert_eq!(
             got,
             vec![(0, 8, 1), (8, 8, 2), (16, 8, 3), (24, 8, 4)],
@@ -21161,23 +21178,18 @@ mod conservative_narrow_scan_tests {
 
     #[test]
     fn a_relocated_narrow_reference_round_trips_through_encode() {
-        let _guard = NARROW_CFG.lock().unwrap_or_else(|e| e.into_inner());
-        assert!(cratonvm_types::narrow_oop::enable(BASE, SHIFT));
-
         // What the rewrite walk does: decode, look the old base up, re-encode
         // the new base at the SAME width. If that round trip were lossy the
         // fallback would write a corrupt reference rather than a stale one.
         for n in [1u64, 2, 0x100, 0xffff, 0x10_0000] {
             let addr = BASE + (n << SHIFT);
-            let e = cratonvm_types::narrow_oop::encode(addr);
+            let e = enc(addr);
             assert_ne!(e, 0, "{addr:#x} must be encodable");
             assert_eq!(
-                cratonvm_types::narrow_oop::decode(e),
+                cratonvm_types::narrow_oop::decode_with(BASE, SHIFT, e),
                 addr,
                 "{addr:#x} must round-trip"
             );
         }
-
-        cratonvm_types::narrow_oop::disable_for_test();
     }
 }

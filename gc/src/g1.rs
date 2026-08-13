@@ -212,12 +212,12 @@ fn array_element_to_bytes(element_type: ArrayElementType, value: Value, raw: &mu
 /// `true`) will opt INTO the multi-threaded evacuator once it is built; unset or
 /// any other value keeps evacuation single-threaded.
 ///
-/// Nothing gates on it yet — the parallel work_list / CAS-forwarding machinery
-/// is a deliberate follow-up: the single-threaded evacuator must be memory-safe
-/// across the gauntlet first (cf. the open gpu-bench-cpu G1 SIGSEGV). The
-/// behaviour-identical groundwork that *does* land now is the `evacuate_object`
-/// freshness signal that removes the `pointer_map.contains_key` evacuation
-/// TOCTOU at the ref-scan sites.
+/// STALE UNTIL 2026-08-13, corrected here: this used to say "nothing gates on
+/// it yet — the parallel work_list / CAS-forwarding machinery is a deliberate
+/// follow-up". That machinery landed (Step 9); `young_collection` and
+/// `mixed_collection` dispatch on this flag to `*_parallel`. What is still true
+/// is the DEFAULT: off, and the serial path remains the supported one while
+/// G1-9 is open.
 fn parallel_evac_enabled() -> bool {
     gc_flags().g1_parallel_evac
 }
@@ -613,10 +613,8 @@ impl<'a> SharedEvac<'a> {
         deferred_self_forwarded: &mut Vec<usize>,
         defer_self_forwarded: bool,
     ) {
-        let (kind, etype, alen, nslots) = {
-            let h = &*(obj_ptr as *const ObjectHeader);
-            (h.kind(), h.element_type(), h.array_length(), h.num_slots())
-        };
+        let header = &*(obj_ptr as *const ObjectHeader);
+        let (kind, etype, alen) = (header.kind(), header.element_type(), header.array_length());
         if kind == ObjectKind::Array {
             if etype == ArrayElementType::Reference {
                 for i in 0..alen as usize {
@@ -647,32 +645,58 @@ impl<'a> SharedEvac<'a> {
                 }
             }
         } else {
-            for slot_idx in 0..nslots as usize {
-                let slot_ptr = obj_ptr.add(HEADER_SIZE + slot_idx * SLOT_SIZE);
-                let value = std::ptr::read(slot_ptr as *const Value);
-                if let Value::Object(Some(ref_obj)) = value {
-                    let ref_ptr = ref_obj.as_ptr();
-                    if let Some(ridx) = self.collector.lookup_region_for_addr(ref_ptr as usize) {
-                        if self.cset.contains(&ridx) {
-                            if let Some((new_ptr, fresh)) =
-                                self.evacuate(tlab, ref_ptr, forwards, objs, bytes)
-                            {
-                                let nv = Value::Object(Some(ObjectRef::from_raw(new_ptr)));
-                                std::ptr::write(slot_ptr as *mut Value, nv);
-                                if fresh {
-                                    Self::record_fresh_child(
-                                        ref_ptr,
-                                        new_ptr,
-                                        defer_self_forwarded,
-                                        children,
-                                        deferred_self_forwarded,
-                                    );
-                                }
+            // COMPACT-LAYOUT PARITY (G1-9). This used to stride
+            // `HEADER_SIZE + slot_idx * SLOT_SIZE` over `num_slots()` and decode
+            // each 16 bytes as a `Value`, i.e. it assumed the LEGACY uniform
+            // cell layout for every object. Every other reference walk in this
+            // file — the serial evacuator, the Phase-4 remap, the mark scan,
+            // the V7b verifier — goes through `for_each_flat_object_reference`,
+            // which dispatches on `is_compact_object` and walks the registered
+            // `CompactLayout::field_offsets`. The parallel evacuator did not,
+            // and that is a real divergence, not a stylistic one:
+            //
+            //   * a compact object's reference fields live at PACKED offsets,
+            //     so the legacy stride visits neither of them. Their referents
+            //     are never evacuated and their slots are never rewritten — the
+            //     holder survives into to-space still pointing into a region
+            //     Phase 5 then frees. That is exactly the
+            //     `[g1][SECURITY V7b] post-evacuation dangling reference` this
+            //     path was reported to produce;
+            //   * `num_slots()` is the hierarchy-wide FIELD COUNT, so the
+            //     legacy stride also runs off the end of a compact body — a
+            //     19-field compact object occupies 152 bytes but this loop
+            //     addressed `16 + 19*16 = 320` of them, reading and, on a
+            //     decode that happened to look like `Value::Object`, WRITING
+            //     over whatever followed it in the region.
+            //
+            // Neither symptom is a race: it reproduces identically with
+            // `CRATONVM_G1_WORKERS=1`. It stayed hidden because a compact
+            // object requires a registered `CompactLayout`, which only a real
+            // class does — the gc unit tests allocate through
+            // `alloc_object(ClassId, n)` with no layout registered, so their
+            // objects are legacy-layout and this loop was accidentally correct
+            // for every one of them.
+            for_each_flat_object_reference(obj_ptr, header, 0, |slot_ptr, raw, compact| {
+                let ref_ptr = raw as *mut u8;
+                if let Some(ridx) = self.collector.lookup_region_for_addr(raw) {
+                    if self.cset.contains(&ridx) {
+                        if let Some((new_ptr, fresh)) =
+                            self.evacuate(tlab, ref_ptr, forwards, objs, bytes)
+                        {
+                            write_flat_object_reference(slot_ptr, new_ptr as usize, compact);
+                            if fresh {
+                                Self::record_fresh_child(
+                                    ref_ptr,
+                                    new_ptr,
+                                    defer_self_forwarded,
+                                    children,
+                                    deferred_self_forwarded,
+                                );
                             }
                         }
                     }
                 }
-            }
+            });
         }
     }
 
@@ -771,33 +795,33 @@ impl<'a> SharedEvac<'a> {
                     }
                 }
             } else {
-                for slot_idx in 0..nslots as usize {
-                    let slot_ptr = obj_ptr.add(HEADER_SIZE + slot_idx * SLOT_SIZE);
-                    let value = std::ptr::read(slot_ptr as *const Value);
-                    if let Value::Object(Some(ref_obj)) = value {
-                        let ref_ptr = ref_obj.as_ptr();
-                        if let Some(ridx) = self.collector.lookup_region_for_addr(ref_ptr as usize)
-                        {
-                            if self.cset.contains(&ridx) {
-                                if let Some((new_ptr, fresh)) =
-                                    self.evacuate(tlab, ref_ptr, forwards, objs, bytes)
-                                {
-                                    let nv = Value::Object(Some(ObjectRef::from_raw(new_ptr)));
-                                    std::ptr::write(slot_ptr as *mut Value, nv);
-                                    if fresh {
-                                        Self::record_fresh_child(
-                                            ref_ptr,
-                                            new_ptr,
-                                            true,
-                                            &mut newly,
-                                            deferred_self_forwarded,
-                                        );
-                                    }
+                // COMPACT-LAYOUT PARITY (G1-9) — same divergence and same fix
+                // as `process_object`; see the long note there. This is the
+                // seed walk, so a compact holder missed here is a
+                // remembered-set source whose CSet-bound edges are never
+                // rewritten at all.
+                let header = &*(obj_ptr as *const ObjectHeader);
+                for_each_flat_object_reference(obj_ptr, header, 0, |slot_ptr, raw, compact| {
+                    let ref_ptr = raw as *mut u8;
+                    if let Some(ridx) = self.collector.lookup_region_for_addr(raw) {
+                        if self.cset.contains(&ridx) {
+                            if let Some((new_ptr, fresh)) =
+                                self.evacuate(tlab, ref_ptr, forwards, objs, bytes)
+                            {
+                                write_flat_object_reference(slot_ptr, new_ptr as usize, compact);
+                                if fresh {
+                                    Self::record_fresh_child(
+                                        ref_ptr,
+                                        new_ptr,
+                                        true,
+                                        &mut newly,
+                                        deferred_self_forwarded,
+                                    );
                                 }
                             }
                         }
                     }
-                }
+                });
             }
 
             offset += obj_size;
@@ -4104,17 +4128,19 @@ impl G1Collector {
     /// `pointer_map.contains_key(...)` dedup pre-check below is a
     /// plain-`HashMap` operation that is correct ONLY because young/mixed
     /// evacuation runs single-threaded under STW with the calling thread
-    /// holding `self.regions.lock()` for the entire collection. The
-    /// `gc_worker_threads` config field (default 4) exists for a future
-    /// parallel evacuator; the dedup will become a TOCTOU the moment the
-    /// `work_list`/`pointer_map` is shared between worker threads: two
-    /// workers can sample `contains_key == false` for the same source addr,
-    /// both call `evacuate_object`, one wins the insert, and the loser's
-    /// freshly-copied Survivor allocation is leaked while still being
-    /// pushed onto a worklist for double-scan. Before enabling parallel
-    /// evacuation, convert `pointer_map` to a `DashMap` (or per-worker
-    /// shards) and use `entry().or_insert_with(...)` so the dedup signal
-    /// is the entry's vacancy state, not a separate `contains_key` call.
+    /// holding `self.regions.lock()` for the entire collection.
+    ///
+    /// The TOCTOU this paragraph used to warn about — two workers sampling
+    /// `contains_key == false` for the same address, both copying, one leaking
+    /// its copy and both scanning — is real, and it is why the PARALLEL
+    /// evacuator does not share this map at all. It took the "per-worker
+    /// shards" half of the advice and dropped the `contains_key` half
+    /// entirely: `SharedEvac::evacuate` decides the winner with a CAS on the
+    /// from-space object's own mark word, each worker records its winning
+    /// `(old, new)` pairs into a thread-local `Vec`, and those shards are
+    /// merged into one `pointer_map` only after `thread::scope` joins. So no
+    /// `DashMap` is owed here; this map stays plain because it stays
+    /// single-threaded. See the module note above `RegionsBase`.
     ///
     /// The caller is documented to hold the regions lock; we cannot
     /// `debug_assert!` directly on lock ownership (parking_lot Mutex offers
@@ -5241,7 +5267,20 @@ impl G1Collector {
     ///
     /// Audit fix (HIGH-3): also clears the mark worklist so a previous
     /// aborted cycle doesn't leak gray pointers into the new cycle.
-    pub fn start_concurrent_mark(&self) {
+    ///
+    /// # Stop-the-world
+    ///
+    /// I-17 (audit §7). This phase is STW and had no mechanical enforcement of
+    /// it — every other mutating-by-`&self` entry point on this collector takes
+    /// a [`StopTheWorldToken`], and the three mark-cycle entry points
+    /// (`start_concurrent_mark`, `remark`, `cleanup`) did not, so the one
+    /// invariant in the table with nothing but a comment behind it was the one
+    /// governing the phase that reclassifies and frees regions. The token is a
+    /// zero-sized witness: it costs nothing at run time and makes the
+    /// requirement a signature rather than a convention.
+    ///
+    /// [`StopTheWorldToken`]: crate::collector::StopTheWorldToken
+    pub fn start_concurrent_mark(&self, _stw: &crate::collector::StopTheWorldToken) {
         self.gc_state.set_phase(ConcurrentGcPhase::InitialMark);
         self.satb_queue.activate();
         // Round-2 fix (HIGH — GC #5): clear every per-region bitmap so a
@@ -5859,7 +5898,15 @@ impl G1Collector {
     /// empty. Callers who want a true STW final-remark should follow
     /// up with `concurrent_mark_step(usize::MAX)` to drain the worklist
     /// before transitioning to sweep.
-    pub fn remark(&self, roots: &[ObjectRef]) {
+    ///
+    /// # Stop-the-world
+    ///
+    /// Requires a [`StopTheWorldToken`] — see
+    /// [`Self::start_concurrent_mark`] for why the mark cycle takes the witness
+    /// (I-17).
+    ///
+    /// [`StopTheWorldToken`]: crate::collector::StopTheWorldToken
+    pub fn remark(&self, _stw: &crate::collector::StopTheWorldToken, roots: &[ObjectRef]) {
         self.gc_state.set_phase(ConcurrentGcPhase::Remark);
 
         let regions = self.regions.lock();
@@ -5966,7 +6013,15 @@ impl G1Collector {
 
     /// Cleanup phase: compute per-region live_bytes and gc_efficiency,
     /// free completely empty old regions.
-    pub fn cleanup(&self) {
+    ///
+    /// # Stop-the-world
+    ///
+    /// Requires a [`StopTheWorldToken`] — see
+    /// [`Self::start_concurrent_mark`] for why the mark cycle takes the witness
+    /// (I-17).
+    ///
+    /// [`StopTheWorldToken`]: crate::collector::StopTheWorldToken
+    pub fn cleanup(&self, _stw: &crate::collector::StopTheWorldToken) {
         let mut regions = self.regions.lock();
         // SECURITY FIX (V7a): cleanup recycles completely-empty Old
         // regions (reset to Free below). Invalidate every mutator's RSet
@@ -9269,10 +9324,10 @@ mod tests {
         assert_eq!(gc.count_regions(RegionType::HumongousStart), 2);
         assert_eq!(gc.count_regions(RegionType::HumongousContinuation), 2);
 
-        gc.start_concurrent_mark();
-        gc.remark(&[live]);
+        gc.start_concurrent_mark(&stw());
+        gc.remark(&stw(), &[live]);
         assert!(gc.concurrent_mark_step(usize::MAX));
-        gc.cleanup();
+        gc.cleanup(&stw());
 
         assert_eq!(gc.count_regions(RegionType::HumongousStart), 1);
         assert_eq!(gc.count_regions(RegionType::HumongousContinuation), 1);
@@ -10194,14 +10249,14 @@ mod tests {
         let gc = make_collector();
         assert_eq!(gc.gc_phase(), ConcurrentGcPhase::Idle);
 
-        gc.start_concurrent_mark();
+        gc.start_concurrent_mark(&stw());
         assert_eq!(gc.gc_phase(), ConcurrentGcPhase::ConcurrentMark);
 
         let done = gc.concurrent_mark_step(1000);
         assert!(done); // no objects to mark, should complete immediately
 
         let obj = gc.alloc_object(ClassId::new(1), 0);
-        gc.remark(&[obj]);
+        gc.remark(&stw(), &[obj]);
         assert_eq!(gc.gc_phase(), ConcurrentGcPhase::Remark);
     }
 
@@ -10243,7 +10298,7 @@ mod tests {
             }
         }
 
-        gc.cleanup();
+        gc.cleanup(&stw());
 
         // The region containing our marked object must report non-zero
         // live_bytes (was always 0 under the buggy global bitmap). The
@@ -10302,10 +10357,10 @@ mod tests {
         let h = gc.alloc_object(ClassId::new(2), 0);
         gc.set_field(g, 0, Value::Object(Some(h)));
 
-        gc.start_concurrent_mark();
+        gc.start_concurrent_mark(&stw());
         // Seed G gray (as the initial-mark root scan would); do NOT drain —
         // the young pause interrupts marking mid-cycle.
-        gc.remark(&[g]);
+        gc.remark(&stw(), &[g]);
 
         let mut roots: Vec<ObjectRef> = vec![];
         let result = gc.young_collection(&mut roots, &NoopMonitors);
@@ -10344,7 +10399,7 @@ mod tests {
         let gc = make_collector();
         let x = gc.alloc_object(ClassId::new(7), 0);
 
-        gc.start_concurrent_mark();
+        gc.start_concurrent_mark(&stw());
         // A mutator overwrites the last reference to X mid-cycle: the SATB
         // pre-barrier logs X. Flush the thread-local buffer immediately so
         // a concurrent test's registry-wide flush cannot steal the entry
@@ -10399,8 +10454,8 @@ mod tests {
         // A NEW marking cycle overlaps the post-cleanup mixed sequence
         // (reachable in production: start_concurrent_mark does not clear
         // marking_complete).
-        gc.start_concurrent_mark();
-        gc.remark(&[obj]); // OBJ gray, unscanned
+        gc.start_concurrent_mark(&stw());
+        gc.remark(&stw(), &[obj]); // OBJ gray, unscanned
         gc.marking_complete.store(true, Ordering::Relaxed);
         gc.mixed_gc_remaining.store(1, Ordering::Relaxed);
 
@@ -10463,8 +10518,8 @@ mod tests {
         let g = gc.alloc_object(ClassId::new(2), 1);
         gc.set_field(g, 0, Value::Object(Some(x)));
 
-        gc.start_concurrent_mark();
-        gc.remark(&[g]); // G gray, unscanned; X reachable ONLY through G
+        gc.start_concurrent_mark(&stw());
+        gc.remark(&stw(), &[g]); // G gray, unscanned; X reachable ONLY through G
 
         // Mid-cycle young pause with no roots: the evacuation closure
         // reaches neither G nor X. Pre-fix: G dropped → X never marked →
@@ -10473,7 +10528,7 @@ mod tests {
         gc.young_collection(&mut no_roots, &NoopMonitors);
 
         while !gc.concurrent_mark_step(usize::MAX) {}
-        gc.cleanup();
+        gc.cleanup(&stw());
 
         let regions = gc.regions.lock();
         assert_eq!(
@@ -10510,10 +10565,10 @@ mod tests {
         // snapshot and its region wholly garbage at mark start.
         roots.clear();
 
-        gc.start_concurrent_mark();
-        gc.remark(&[]);
+        gc.start_concurrent_mark(&stw());
+        gc.remark(&stw(), &[]);
         while !gc.concurrent_mark_step(usize::MAX) {}
-        gc.cleanup();
+        gc.cleanup(&stw());
 
         let regions = gc.regions.lock();
         assert_eq!(
@@ -10552,14 +10607,14 @@ mod tests {
         // Filler object whose address saturates the worklist.
         let x = gc.alloc_object(ClassId::new(2), 0);
 
-        gc.start_concurrent_mark();
+        gc.start_concurrent_mark(&stw());
         gc.mark_worklist
             .lock()
             .extend(std::iter::repeat(x.as_ptr() as usize).take(MARK_WORKLIST_CAP));
 
         // Pre-fix: y's push is dropped (worklist at cap) and nothing ever
         // marks it — cleanup frees its region while it is a remark root.
-        gc.remark(&[y]);
+        gc.remark(&stw(), &[y]);
         assert!(
             gc.mark_worklist_overflowed.load(Ordering::Relaxed),
             "cap hit must set the overflow flag"
@@ -10573,7 +10628,7 @@ mod tests {
         }
 
         while !gc.concurrent_mark_step(usize::MAX) {}
-        gc.cleanup();
+        gc.cleanup(&stw());
 
         let regions = gc.regions.lock();
         assert_eq!(
@@ -10618,12 +10673,12 @@ mod tests {
         assert_eq!(garbage_addr & 0x7, 0);
         unsafe { std::ptr::write_bytes(garbage_addr as *mut u8, 0xFF, 32) };
 
-        gc.start_concurrent_mark();
+        gc.start_concurrent_mark(&stw());
         gc.mark_worklist.lock().push(garbage_addr);
-        gc.remark(&[]);
+        gc.remark(&stw(), &[]);
         while !gc.concurrent_mark_step(usize::MAX) {}
 
-        gc.cleanup();
+        gc.cleanup(&stw());
         {
             let regions = gc.regions.lock();
             assert_eq!(
@@ -10638,10 +10693,10 @@ mod tests {
         );
 
         // A clean follow-up cycle reclaims the wholly-dead region.
-        gc.start_concurrent_mark();
-        gc.remark(&[]);
+        gc.start_concurrent_mark(&stw());
+        gc.remark(&stw(), &[]);
         while !gc.concurrent_mark_step(usize::MAX) {}
-        gc.cleanup();
+        gc.cleanup(&stw());
         let regions = gc.regions.lock();
         assert_eq!(
             regions[x_region].region_type,
@@ -10681,13 +10736,13 @@ mod tests {
             let r = gc.alloc_object(ClassId::new(2), 2);
             gc.set_field(r, 0, Value::Object(Some(x)));
 
-            gc.start_concurrent_mark();
+            gc.start_concurrent_mark(&stw());
             if hide {
                 gc.set_reference_skip_set(&[r.as_ptr() as usize]);
             }
-            gc.remark(&[r]);
+            gc.remark(&stw(), &[r]);
             while !gc.concurrent_mark_step(usize::MAX) {}
-            gc.cleanup();
+            gc.cleanup(&stw());
 
             let regions = gc.regions.lock();
             regions[x_region].region_type
@@ -10714,7 +10769,7 @@ mod tests {
 
         // Survivor case: R is rooted through the pause.
         let r = gc.alloc_object(ClassId::new(2), 2);
-        gc.start_concurrent_mark();
+        gc.start_concurrent_mark(&stw());
         gc.set_reference_skip_set(&[r.as_ptr() as usize]);
         let mut roots = vec![r];
         gc.young_collection(&mut roots, &NoopMonitors);
@@ -10729,7 +10784,7 @@ mod tests {
 
         // Casualty case: R2 is unrooted and dies in the young CSet.
         let r2 = gc.alloc_object(ClassId::new(2), 2);
-        gc.start_concurrent_mark();
+        gc.start_concurrent_mark(&stw());
         gc.set_reference_skip_set(&[r2.as_ptr() as usize]);
         let mut no_roots: Vec<ObjectRef> = vec![];
         gc.young_collection(&mut no_roots, &NoopMonitors);
@@ -10752,14 +10807,14 @@ mod tests {
             let old_val = gc.alloc_object(ClassId::new(2), 0);
             gc.set_field(holder, 0, Value::Object(Some(old_val)));
 
-            gc.start_concurrent_mark();
+            gc.start_concurrent_mark(&stw());
             if suppress {
                 gc.set_field_no_satb(holder, 0, Value::Object(None));
             } else {
                 gc.set_field(holder, 0, Value::Object(None));
             }
             // remark flushes every thread-local SATB buffer into the gray set.
-            gc.remark(&[]);
+            gc.remark(&stw(), &[]);
             let grayed = gc.dbg_is_grayed_or_marked(old_val.as_ptr() as usize);
             gc.abort_concurrent_mark();
             grayed
@@ -10794,8 +10849,8 @@ mod tests {
         gc.young_collection(&mut roots, &NoopMonitors);
         let (live, dead) = (roots[0], roots[1]);
 
-        gc.start_concurrent_mark();
-        gc.remark(&[live]);
+        gc.start_concurrent_mark(&stw());
+        gc.remark(&stw(), &[live]);
         while !gc.concurrent_mark_step(usize::MAX) {}
 
         // Post-mark-start allocation: TAMS says live despite no mark bit.
@@ -10835,13 +10890,13 @@ mod tests {
         };
         roots.clear(); // D is dead at mark start
 
-        gc.start_concurrent_mark();
-        gc.remark(&[]);
+        gc.start_concurrent_mark(&stw());
+        gc.remark(&stw(), &[]);
         while !gc.concurrent_mark_step(usize::MAX) {}
         assert!(!gc.is_live_after_mark(d.as_ptr() as usize));
 
         gc.resurrect_after_remark(&[d.as_ptr() as usize]);
-        gc.cleanup();
+        gc.cleanup(&stw());
 
         let regions = gc.regions.lock();
         assert_eq!(
@@ -12593,6 +12648,331 @@ mod tests {
         arr
     }
 
+    /// G1-9 regression: the parallel evacuator must scan a COMPACT object's
+    /// reference fields.
+    ///
+    /// This is the coverage gap that let G1-9 hide for months. Every other gc
+    /// unit test allocates through `alloc_object(ClassId, n)` with no
+    /// `CompactLayout` registered for that class, so its objects take the
+    /// legacy uniform 16-byte-cell body — and the parallel evacuator's old
+    /// `HEADER_SIZE + slot_idx * SLOT_SIZE` stride is accidentally CORRECT for
+    /// exactly those objects. A compact body needs a registered layout, which
+    /// only a real loaded class produced, so the defect was reachable only from
+    /// a full VM run: `-XX:+UseG1GC` + parallel evacuation reported
+    /// `[g1][SECURITY V7b] post-evacuation dangling reference` on the first
+    /// pause, deterministically, including at `CRATONVM_G1_WORKERS=1`.
+    ///
+    /// Registering the layout here closes that gap. Under the pre-fix scan the
+    /// holders' reference fields are never visited, so their referents are
+    /// never evacuated and the assertions below fail.
+    ///
+    /// # This test writes PROCESS-GLOBAL state, deliberately and narrowly
+    ///
+    /// `register_class_layout` publishes into the same kind of process-wide
+    /// table that `narrow_oop::enable` does, and `cargo test` runs this
+    /// binary's tests on parallel threads — the hazard that produced this
+    /// session's original flake (see `narrow_oop::disable_for_test`). The blast
+    /// radius is bounded here in a way it was not there: a registration only
+    /// affects objects allocated with THIS `(class_id, field_count)` pair, and
+    /// `COMPACT_HOLDER_CLASS` is an id no other test in this crate uses. It is
+    /// also never unregistered, so the state it publishes is monotone — a
+    /// second run of this test finds its own layout already present rather than
+    /// racing a teardown.
+    #[test]
+    fn parallel_evacuation_scans_compact_object_reference_fields() {
+        use cratonvm_types::field_layout::{CompactLayout, FieldStorageKind};
+
+        // An id no other gc test allocates with; see the note above.
+        const COMPACT_HOLDER_CLASS: u32 = 4242;
+
+        // Four fields: int, ref, int, ref — references at PACKED offsets that
+        // the legacy 16-byte stride cannot land on. Body is 32 bytes where the
+        // legacy layout would be 4 * 16 = 64, so the old loop also addressed
+        // twice the object's length.
+        let layout = CompactLayout {
+            field_offsets: vec![0, 8, 16, 24],
+            is_ref: vec![false, true, false, true],
+            field_kinds: vec![
+                FieldStorageKind::Int,
+                FieldStorageKind::Reference,
+                FieldStorageKind::Int,
+                FieldStorageKind::Reference,
+            ],
+            ref_offsets: vec![8, 24],
+            body_size: 32,
+        };
+
+        let gc = G1Collector::new(parallel_config(8, 32));
+        cratonvm_types::register_class_layout(
+            gc.layout_domain(),
+            COMPACT_HOLDER_CLASS,
+            std::sync::Arc::new(layout),
+        );
+
+        let holders = 200usize;
+        let shared = 40usize;
+
+        let children: Vec<ObjectRef> = (0..shared)
+            .map(|j| {
+                let c = gc.alloc_object(ClassId::new(9), 1);
+                gc.set_field(c, 0, Value::Int(7_000 + j as i32));
+                c
+            })
+            .collect();
+
+        let arr = gc.alloc_array(ClassId::new(0), ArrayElementType::Reference, holders);
+        for i in 0..holders {
+            let h = gc.alloc_object(ClassId::new(COMPACT_HOLDER_CLASS), 4);
+            assert!(
+                cratonvm_types::is_compact_object(&gc.get_header(h)),
+                "holder {i} must be COMPACT — otherwise this test proves nothing \
+                 (is the layout registered under the collector's domain?)"
+            );
+            gc.set_field(h, 0, Value::Int(i as i32));
+            gc.set_field(h, 1, Value::Object(Some(children[i % shared])));
+            gc.set_field(h, 2, Value::Int(-(i as i32)));
+            gc.set_field(h, 3, Value::Object(Some(children[(i * 3 + 1) % shared])));
+            gc.set_array_element(arr, i, Value::Object(Some(h))).unwrap();
+        }
+
+        let mut roots = vec![arr];
+        let res = gc.young_collection_parallel(&mut roots, &NoopMonitors);
+
+        // 1 array + holders + shared children, each copied exactly once. Under
+        // the pre-fix scan the children are never reached, so this count is
+        // short by `shared` before it is short by anything else.
+        assert_eq!(
+            res.stats.objects_copied,
+            1 + holders + shared,
+            "every live object — including the compact holders' referents — is copied once"
+        );
+
+        let mut child_addrs = std::collections::HashSet::new();
+        for i in 0..holders {
+            let h = match gc.get_array_element(roots[0], i).unwrap() {
+                Value::Object(Some(o)) => o,
+                other => panic!("holder {i} lost -> {other:?}"),
+            };
+            assert_eq!(gc.get_field(h, 0).as_int(), Some(i as i32), "holder {i} int 0");
+            assert_eq!(
+                gc.get_field(h, 2).as_int(),
+                Some(-(i as i32)),
+                "holder {i} int 2"
+            );
+            for (slot, j) in [(1usize, i % shared), (3usize, (i * 3 + 1) % shared)] {
+                let child = match gc.get_field(h, slot) {
+                    Value::Object(Some(o)) => o,
+                    other => panic!("holder {i} slot {slot} lost -> {other:?}"),
+                };
+                assert_eq!(
+                    gc.get_field(child, 0).as_int(),
+                    Some(7_000 + j as i32),
+                    "holder {i} slot {slot} points at the wrong child"
+                );
+                child_addrs.insert(child.as_ptr() as usize);
+            }
+        }
+        assert_eq!(
+            child_addrs.len(),
+            shared,
+            "the shared children must be evacuated to one copy each"
+        );
+    }
+
+    /// Shape for the repeated-collection oracle below: an array of `p` parents,
+    /// each holding an identity int and TWO references into a pool of `s`
+    /// shared children, each of which holds an identity int and a reference
+    /// into a pool of `l` shared leaves.
+    ///
+    /// Two levels of sharing, not one, and two reference slots per parent
+    /// rather than one: the CAS-forwarding loser arm in `SharedEvac::evacuate`
+    /// is only reachable when two workers race on the SAME object, so a tree
+    /// never exercises it — that is why the original decode bug there needed a
+    /// diamond to surface at all. A second level means a worker can lose a race
+    /// on a child while another worker is still copying that child's referent.
+    fn build_shared_graph(gc: &G1Collector, p: usize, s: usize, l: usize) -> ObjectRef {
+        let leaves: Vec<ObjectRef> = (0..l)
+            .map(|k| {
+                let o = gc.alloc_object(ClassId::new(11), 1);
+                gc.set_field(o, 0, Value::Int(20_000 + k as i32));
+                o
+            })
+            .collect();
+        let children: Vec<ObjectRef> = (0..s)
+            .map(|j| {
+                let o = gc.alloc_object(ClassId::new(10), 2);
+                gc.set_field(o, 0, Value::Int(10_000 + j as i32));
+                gc.set_field(o, 1, Value::Object(Some(leaves[j % l])));
+                o
+            })
+            .collect();
+        let arr = gc.alloc_array(ClassId::new(0), ArrayElementType::Reference, p);
+        for i in 0..p {
+            let parent = gc.alloc_object(ClassId::new(9), 3);
+            gc.set_field(parent, 0, Value::Int(i as i32));
+            gc.set_field(parent, 1, Value::Object(Some(children[i % s])));
+            gc.set_field(parent, 2, Value::Object(Some(children[(i * 7 + 3) % s])));
+            gc.set_array_element(arr, i, Value::Object(Some(parent)))
+                .unwrap();
+        }
+        arr
+    }
+
+    /// Walk the whole graph and assert every property a correct evacuation
+    /// preserves: nothing lost, nothing duplicated, no two objects sharing an
+    /// address, every identity int intact.
+    ///
+    /// The duplication and overlap checks are the ones a value-multiset
+    /// comparison misses. A shared child copied TWICE still yields the right
+    /// value through both parents — it is visible only as two distinct
+    /// addresses carrying one identity. Two objects copied to the SAME address
+    /// is likewise value-plausible until one address is seen carrying two
+    /// identities.
+    fn verify_shared_graph(
+        gc: &G1Collector,
+        arr: ObjectRef,
+        round: usize,
+        p: usize,
+        s: usize,
+        l: usize,
+    ) {
+        use std::collections::{HashMap, HashSet};
+        let mut addr_of_identity: HashMap<i32, usize> = HashMap::new();
+        let mut identity_of_addr: HashMap<usize, i32> = HashMap::new();
+        let mut leaf_addrs: HashSet<usize> = HashSet::new();
+
+        for i in 0..p {
+            let parent = match gc.get_array_element(arr, i).unwrap() {
+                Value::Object(Some(o)) => o,
+                other => panic!("round {round}: parent {i} lost -> {other:?}"),
+            };
+            assert_eq!(
+                gc.get_field(parent, 0).as_int(),
+                Some(i as i32),
+                "round {round}: parent {i} identity"
+            );
+            let mut note = |identity: i32, addr: usize| {
+                let canonical = *addr_of_identity.entry(identity).or_insert(addr);
+                assert_eq!(
+                    canonical, addr,
+                    "round {round}: object {identity} exists at TWO addresses ({canonical:#x} and {addr:#x}) - evacuated twice"
+                );
+                let owner = *identity_of_addr.entry(addr).or_insert(identity);
+                assert_eq!(
+                    owner, identity,
+                    "round {round}: address {addr:#x} carries TWO identities ({owner} and {identity}) - overlapping copies"
+                );
+            };
+            note(i as i32, parent.as_ptr() as usize);
+
+            for (slot, j) in [(1usize, i % s), (2usize, (i * 7 + 3) % s)] {
+                let child = match gc.get_field(parent, slot) {
+                    Value::Object(Some(o)) => o,
+                    other => panic!("round {round}: parent {i} slot {slot} lost -> {other:?}"),
+                };
+                let child_id = 10_000 + j as i32;
+                assert_eq!(
+                    gc.get_field(child, 0).as_int(),
+                    Some(child_id),
+                    "round {round}: parent {i} slot {slot} points at the wrong child"
+                );
+                note(child_id, child.as_ptr() as usize);
+
+                let leaf = match gc.get_field(child, 1) {
+                    Value::Object(Some(o)) => o,
+                    other => panic!("round {round}: child {j} leaf lost -> {other:?}"),
+                };
+                let leaf_id = 20_000 + (j % l) as i32;
+                assert_eq!(
+                    gc.get_field(leaf, 0).as_int(),
+                    Some(leaf_id),
+                    "round {round}: child {j} points at the wrong leaf"
+                );
+                note(leaf_id, leaf.as_ptr() as usize);
+                leaf_addrs.insert(leaf.as_ptr() as usize);
+            }
+        }
+        assert_eq!(
+            leaf_addrs.len(),
+            l,
+            "round {round}: the shared leaves collapsed or multiplied"
+        );
+        assert_eq!(
+            addr_of_identity.len(),
+            p + s + l,
+            "round {round}: reachable object count changed"
+        );
+    }
+
+    /// G1-9 oracle at unit level.
+    ///
+    /// Every other parallel-evacuation test runs ONE collection over a graph
+    /// built moments earlier, so it only ever exercises Eden -> Survivor with
+    /// every object at age 0. The audit's corruption is reported from sustained
+    /// churn, where the same objects are re-evacuated pause after pause, age
+    /// past `promotion_age` into the Old TLAB, and are reached through a heap
+    /// whose region types keep changing under them.
+    ///
+    /// So: hold one graph across repeated 8-worker parallel pauses, allocate
+    /// real garbage between them, and re-verify the WHOLE graph — structure and
+    /// identity, not just a value multiset — after every pause.
+    #[test]
+    fn repeated_parallel_young_collections_never_lose_duplicate_or_corrupt() {
+        let gc = G1Collector::new(parallel_config(8, 32));
+        let (p, s, l) = (300usize, 60usize, 20usize);
+        let arr = build_shared_graph(&gc, p, s, l);
+        let mut roots = vec![arr];
+
+        for round in 0..8usize {
+            // Garbage the pause has to walk past and reclaim.
+            for g in 0..200i32 {
+                let junk = gc.alloc_object(ClassId::new(99), 2);
+                gc.set_field(junk, 0, Value::Int(g));
+            }
+            let res = gc.young_collection_parallel(&mut roots, &NoopMonitors);
+            if round == 0 {
+                // Everything live is young and in the CSet on the first pause.
+                assert_eq!(
+                    res.stats.objects_copied,
+                    1 + p + s + l,
+                    "round 0: exactly the live set is copied, once each"
+                );
+            }
+            verify_shared_graph(&gc, roots[0], round, p, s, l);
+        }
+    }
+
+    /// The same oracle with a mark cycle OPEN across the pauses.
+    ///
+    /// A young pause under an active cycle takes paths the quiescent one never
+    /// does: `marking_keepalive_roots` evacuates CSet-resident gray/SATB
+    /// objects as extra roots, the survivors are re-grayed after Phase 5, and
+    /// the mark worklist is remapped through the same `pointer_map` the roots
+    /// were. That interaction is where a lost or double-copied object would
+    /// show up not as a value divergence but as a stale gray entry.
+    #[test]
+    fn repeated_parallel_young_collections_under_an_open_mark_cycle() {
+        let gc = G1Collector::new(parallel_config(8, 32));
+        let (p, s, l) = (200usize, 40usize, 15usize);
+        let arr = build_shared_graph(&gc, p, s, l);
+        let mut roots = vec![arr];
+
+        gc.start_concurrent_mark(&stw());
+        gc.remark(&stw(), &roots);
+
+        for round in 0..6usize {
+            for g in 0..150i32 {
+                let junk = gc.alloc_object(ClassId::new(99), 2);
+                gc.set_field(junk, 0, Value::Int(g));
+            }
+            // Drive some marking between pauses so the gray set is genuinely
+            // non-empty when the next evacuation starts.
+            gc.concurrent_mark_step(64);
+            gc.young_collection_parallel(&mut roots, &NoopMonitors);
+            verify_shared_graph(&gc, roots[0], round, p, s, l);
+        }
+    }
+
     fn reachable_ints(gc: &G1Collector, root_arr: ObjectRef, n: usize) -> Vec<i32> {
         let mut vals = Vec::new();
         let mut seen = std::collections::HashSet::new();
@@ -13074,7 +13454,7 @@ mod tests {
             assert!(regions[idx].mark_bitmap.try_mark(above_addr));
         });
 
-        gc.cleanup();
+        gc.cleanup(&stw());
 
         let (live_bytes, cursor, efficiency) = {
             let regions = gc.regions.lock();
@@ -13122,7 +13502,7 @@ mod tests {
         force_mark_snapshot(&gc, idx, tams);
         // Nothing marked: `dead` is unreachable in the snapshot, `fresh` is
         // implicitly live because it postdates it.
-        gc.cleanup();
+        gc.cleanup(&stw());
 
         let (live_bytes, cursor, region_type) = {
             let regions = gc.regions.lock();
@@ -13222,7 +13602,7 @@ mod tests {
         );
 
         // Marking active: the overwritten referent must be logged.
-        gc.start_concurrent_mark();
+        gc.start_concurrent_mark(&stw());
         gc.set_array_element(arr, 0, Value::Object(Some(new)))
             .unwrap();
         crate::satb::flush_thread_satb_buffer(gc.satb_queue());
@@ -13250,7 +13630,7 @@ mod tests {
 
         gc.set_array_element(arr, 0, Value::Object(Some(referent)))
             .unwrap();
-        gc.start_concurrent_mark();
+        gc.start_concurrent_mark(&stw());
         crate::satb::flush_thread_satb_buffer(gc.satb_queue());
         let _ = gc.satb_queue().drain();
 
@@ -13295,7 +13675,7 @@ mod tests {
 
         // No mark-start snapshot: cleanup keeps the pure-bitmap verdict and
         // performs no in-place frees, so this isolates the rset pruning.
-        gc.cleanup();
+        gc.cleanup(&stw());
 
         let sources = {
             let regions = gc.regions.lock();
@@ -13544,11 +13924,11 @@ mod tests {
         };
 
         check("idle");
-        gc.start_concurrent_mark();
+        gc.start_concurrent_mark(&stw());
         check("after start_concurrent_mark");
         assert!(gc.gc_state.is_marking_active() && gc.satb_queue.is_active());
 
-        gc.remark(&[]);
+        gc.remark(&stw(), &[]);
         check("after remark");
 
         gc.abort_concurrent_mark();
@@ -13567,7 +13947,7 @@ mod tests {
     #[test]
     fn abort_leaves_the_marking_phase_before_closing_the_satb_queue() {
         let gc = make_collector();
-        gc.start_concurrent_mark();
+        gc.start_concurrent_mark(&stw());
         assert!(gc.gc_state.is_marking_active());
         assert!(gc.satb_queue.is_active());
         gc.abort_concurrent_mark();
@@ -13589,7 +13969,7 @@ mod tests {
         let new = gc.alloc_object(ClassId::new(3), 0);
         gc.set_field(holder, 0, Value::Object(Some(old)));
 
-        gc.start_concurrent_mark();
+        gc.start_concurrent_mark(&stw());
         gc.set_field(holder, 0, Value::Object(Some(new)));
         crate::satb::flush_thread_satb_buffer(gc.satb_queue());
 
@@ -13615,7 +13995,7 @@ mod tests {
         gc.set_array_element(arr, 0, Value::Object(Some(old)))
             .expect("in bounds");
 
-        gc.start_concurrent_mark();
+        gc.start_concurrent_mark(&stw());
         gc.set_array_element(arr, 0, Value::Object(Some(new)))
             .expect("in bounds");
         crate::satb::flush_thread_satb_buffer(gc.satb_queue());
@@ -13660,9 +14040,9 @@ mod tests {
         let obj = gc.alloc_object(ClassId::new(1), 1);
         let idx = retype_region_of(&gc, obj.as_ptr() as usize, RegionType::Old);
 
-        gc.start_concurrent_mark();
+        gc.start_concurrent_mark(&stw());
         assert!(gc.mark_worklist.lock().is_empty());
-        gc.cleanup();
+        gc.cleanup(&stw());
 
         assert_eq!(
             gc.regions.lock()[idx].region_type,
@@ -13682,11 +14062,11 @@ mod tests {
         let obj = gc.alloc_object(ClassId::new(1), 1);
         let idx = retype_region_of(&gc, obj.as_ptr() as usize, RegionType::Old);
 
-        gc.start_concurrent_mark();
+        gc.start_concurrent_mark(&stw());
         // One gray entry the marker never got to. Its address is irrelevant —
         // what matters is that the closure is not at a fixed point.
         gc.mark_worklist.lock().push(obj.as_ptr() as usize);
-        gc.cleanup();
+        gc.cleanup(&stw());
 
         assert_eq!(
             gc.regions.lock()[idx].region_type,
@@ -13721,9 +14101,9 @@ mod tests {
             RegionType::HumongousStart
         );
 
-        gc.start_concurrent_mark();
+        gc.start_concurrent_mark(&stw());
         gc.mark_worklist.lock().push(big.as_ptr() as usize);
-        gc.cleanup();
+        gc.cleanup(&stw());
 
         assert_eq!(
             gc.regions.lock()[start].region_type,
@@ -13941,8 +14321,8 @@ mod tests {
         assert!(gc.regions.lock()[source].rset.sources().is_empty());
 
         // ...and cleanup prunes the now-dangling entry naming it.
-        gc.start_concurrent_mark();
-        gc.cleanup();
+        gc.start_concurrent_mark(&stw());
+        gc.cleanup(&stw());
         assert!(
             !gc.regions.lock()[target].rset.sources().contains(&source),
             "an entry naming a Free source must be pruned, not carried forever"
@@ -14010,8 +14390,8 @@ mod tests {
 
         // And cleanup drops the entry outright, so it stops costing memory and
         // a per-pause lookup.
-        gc.start_concurrent_mark();
-        gc.cleanup();
+        gc.start_concurrent_mark(&stw());
+        gc.cleanup(&stw());
         assert!(
             !gc.regions.lock()[target].rset.sources().contains(&source),
             "cleanup must prune an entry whose source was recycled, not only \
@@ -14070,8 +14450,8 @@ mod tests {
             );
         }
 
-        gc.start_concurrent_mark();
-        gc.cleanup();
+        gc.start_concurrent_mark(&stw());
+        gc.cleanup(&stw());
         let sources = gc.regions.lock()[target].rset.sources();
         assert!(sources.contains(&fresh));
         assert!(sources.contains(&unstamped));

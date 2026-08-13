@@ -4981,7 +4981,14 @@ pub(super) fn g1_concurrent_mark_cycle(shared: &SharedVm, thread: &mut JvmThread
         // SATB activation must reach the global queue before the
         // marker starts consuming it.
         shared.mem.heap.flush_thread_satb();
-        shared.mem.heap.g1_start_concurrent_mark();
+        // SAFETY (I-17): `stw_take_over_and_wait` above has parked every other
+        // mutator at a safepoint (or forcibly stopped and conservatively
+        // scanned it), and `taken` is still held, so this thread is the only
+        // mutator for the whole initial-mark block below. G1's mark-cycle entry
+        // points now require this witness for the same reason `collect_garbage`
+        // does: they reclassify and free regions.
+        let stw = unsafe { cratonvm_gc::collector::StopTheWorldToken::new() };
+        shared.mem.heap.g1_start_concurrent_mark(&stw);
         // INT-8: publish the referent-slot skip set for this cycle —
         // the Weak/Soft/Phantom Reference OBJECT addresses currently
         // registered. Inside this STW the snapshot is consistent (no
@@ -5002,7 +5009,7 @@ pub(super) fn g1_concurrent_mark_cycle(shared: &SharedVm, thread: &mut JvmThread
             // INT-3 — frozen in-JIT peers' conservative register/stack roots.
             .chain(xt_roots.into_iter())
             .collect();
-        shared.mem.heap.g1_mark_roots(&all_roots);
+        shared.mem.heap.g1_mark_roots(&stw, &all_roots);
         tracing::debug!("[G1] Initial mark: {} roots marked", all_roots.len());
         // Clear TLAB skip regions + resume frozen peers BEFORE reopening
         // the world (same race rationale as maybe_gc's epilogue).
@@ -5109,10 +5116,14 @@ pub(super) fn g1_final_remark_cleanup(shared: &SharedVm, thread: &mut JvmThread)
         let mut process = |is_live: &dyn Fn(usize) -> bool| -> Vec<usize> {
             g1_remark_process_references(shared, is_live)
         };
+        // SAFETY (I-17): same pause as above — `stw_take_over_and_wait` parked
+        // every other mutator and `taken` is still held. The remark drain and
+        // cleanup that follow are STW phases; the token is their witness.
+        let stw = unsafe { cratonvm_gc::collector::StopTheWorldToken::new() };
         let completed = shared
             .mem
             .heap
-            .g1_final_remark_and_cleanup(&all_roots, Some(&mut process));
+            .g1_final_remark_and_cleanup(&stw, &all_roots, Some(&mut process));
         tracing::debug!(
             "[G1] Final remark: {} roots, cycle_completed={}",
             all_roots.len(),

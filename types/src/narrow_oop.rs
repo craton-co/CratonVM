@@ -105,6 +105,31 @@ pub fn enable(base: u64, shift: usize) -> bool {
 }
 
 /// Disable narrow oops. Test-only: the production contract is write-once.
+///
+/// # This is not a knob a test may flip while other tests run
+///
+/// `ENABLED` is PROCESS-global and is read on the hot path of every reference
+/// access — [`ref_element_size`] is what `element_byte_size(Reference)`
+/// returns, so flipping it retypes every reference array in the process from
+/// an 8-byte element stride to a 4-byte one, mid-life. A `cargo test` binary
+/// runs its tests on parallel threads in ONE process, so a test that enables
+/// narrow oops around its own assertions silently reinterprets the heaps of
+/// every test running beside it: an array written with 8-byte elements is read
+/// back at stride 4, and element `2k+1` decodes the HIGH half of pointer `k`
+/// as if it were a whole reference.
+///
+/// That is not hypothetical. It is the root cause of the long-standing
+/// `g1::tests::parallel_matches_serial_no_loss_or_dup` flake — which read as a
+/// race in G1's parallel evacuator for months (`audits/g1-audit.md` G1-9, in
+/// the internal record tree) and is not one — and of the sibling
+/// `compressed_oops::assert_region_encodable` flake in the `gen_heap` tests,
+/// whose reported window `0x20000000..0x81ffffff8` is exactly the `BASE`/`SHIFT`
+/// a narrow-oop unit test installs.
+///
+/// A local `Mutex` that serialises the narrow-oop tests against EACH OTHER does
+/// not help: the blast radius is every other test in the binary, and none of
+/// them takes that lock. Use [`encode_with`] / [`decode_with`] and pass the
+/// geometry explicitly instead.
 pub fn disable_for_test() {
     ENABLED.store(false, Ordering::Release);
     BASE.store(0, Ordering::Relaxed);
@@ -160,11 +185,27 @@ fn report_unencodable(addr: u64) -> u32 {
 /// Only valid while [`narrow_oops_enabled`]. `0` maps to `0`.
 #[inline(always)]
 pub fn encode(addr: u64) -> u32 {
+    encode_with(narrow_base(), narrow_shift(), addr)
+}
+
+/// Decode a 32-bit narrow oop back to a 64-bit address. `0` maps to `0`.
+#[inline(always)]
+pub fn decode(narrow: u32) -> u64 {
+    decode_with(narrow_base(), narrow_shift(), narrow)
+}
+
+/// [`encode`] against an EXPLICIT geometry instead of the published globals.
+///
+/// The transform is a pure function of `(base, shift, addr)`; the globals are
+/// only how production names the one geometry a live heap was allocated under.
+/// Tests that need to exercise the encoding must use this, NOT [`enable`] —
+/// see the warning on [`disable_for_test`] for why flipping the globals under
+/// a running test binary corrupts unrelated tests.
+#[inline(always)]
+pub fn encode_with(base: u64, shift: usize, addr: u64) -> u32 {
     if addr == 0 {
         return 0;
     }
-    let base = narrow_base();
-    let shift = narrow_shift();
     let delta = addr.wrapping_sub(base);
     // A single unsigned compare covers both `addr < base` (which wraps to a
     // huge delta) and `addr >= limit`. Misalignment is rejected too: the low
@@ -176,13 +217,14 @@ pub fn encode(addr: u64) -> u32 {
     (delta >> shift) as u32
 }
 
-/// Decode a 32-bit narrow oop back to a 64-bit address. `0` maps to `0`.
+/// [`decode`] against an EXPLICIT geometry instead of the published globals.
+/// See [`encode_with`].
 #[inline(always)]
-pub fn decode(narrow: u32) -> u64 {
+pub fn decode_with(base: u64, shift: usize, narrow: u32) -> u64 {
     if narrow == 0 {
         return 0;
     }
-    narrow_base() + ((narrow as u64) << narrow_shift())
+    base + ((narrow as u64) << shift)
 }
 
 // --- Reference-slot accessors ------------------------------------------------
@@ -338,73 +380,55 @@ pub fn probe_report() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
 
-    // The config is process-wide; serialise the tests that mutate it.
-    static LOCK: Mutex<()> = Mutex::new(());
-
-    #[test]
-    fn disabled_by_default_reports_wide_slots() {
-        let _g = LOCK.lock().unwrap();
-        disable_for_test();
-        assert!(!narrow_oops_enabled());
-        assert_eq!(ref_field_size(), 8);
-        assert_eq!(ref_element_size(), 8);
-    }
+    // NOTE: nothing in this module may call `enable` / `disable_for_test`.
+    //
+    // Those publish the PROCESS-GLOBAL geometry, and a `cargo test` binary runs
+    // its tests on parallel threads — so a test that flips the config here is
+    // retyping every reference slot in every OTHER test in this binary, including
+    // `heap_types::tests::element_byte_size_reference`, which asserts the wide
+    // (8-byte) element size. The tests that genuinely need a published geometry
+    // live alone in `types/tests/narrow_oop_global_config.rs`; see the warning on
+    // [`disable_for_test`] for what this cost in `cratonvm-gc`.
+    //
+    // Everything below is the pure arithmetic, exercised through `encode_with` /
+    // `decode_with`.
 
     #[test]
     fn roundtrip_shift3() {
-        let _g = LOCK.lock().unwrap();
-        disable_for_test();
         let base = 0x7f00_0000_0000u64;
-        assert!(enable(base, 3));
         for delta in [8u64, 16, 4096, 1 << 20, (u32::MAX as u64) << 3] {
             let addr = base + delta;
-            let n = encode(addr);
-            assert_eq!(decode(n), addr, "delta {delta:#x}");
+            let n = encode_with(base, 3, addr);
+            assert_eq!(decode_with(base, 3, n), addr, "delta {delta:#x}");
         }
-        assert_eq!(encode(0), 0);
-        assert_eq!(decode(0), 0);
-        assert_eq!(ref_field_size(), 4);
-        disable_for_test();
+        assert_eq!(encode_with(base, 3, 0), 0);
+        assert_eq!(decode_with(base, 3, 0), 0);
     }
 
     #[test]
     fn roundtrip_shift0() {
-        let _g = LOCK.lock().unwrap();
-        disable_for_test();
         let base = 0x1000u64;
-        assert!(enable(base, 0));
         for delta in [1u64, 7, 8, 1 << 20, u32::MAX as u64] {
             let addr = base + delta;
-            assert_eq!(decode(encode(addr)), addr);
+            assert_eq!(decode_with(base, 0, encode_with(base, 0, addr)), addr);
         }
-        disable_for_test();
     }
 
     #[test]
-    fn encodability_window() {
-        let _g = LOCK.lock().unwrap();
-        disable_for_test();
-        let base = 0x7f00_0000_0000u64;
-        assert!(enable(base, 3));
-        assert!(is_encodable(0));
-        assert!(!is_encodable(base), "base itself must be reserved for null");
-        assert!(is_encodable(base + 8));
+    fn the_geometry_is_a_parameter_not_a_global() {
+        // The same address encodes differently under two geometries, and each
+        // decodes back through its own — the property that lets a test exercise
+        // the codec without publishing anything.
+        let addr = 0x7f00_0000_1000u64;
+        let a = encode_with(0x7f00_0000_0000, 3, addr);
+        let b = encode_with(0x7f00_0000_0800, 3, addr);
+        assert_ne!(a, b);
+        assert_eq!(decode_with(0x7f00_0000_0000, 3, a), addr);
+        assert_eq!(decode_with(0x7f00_0000_0800, 3, b), addr);
         assert!(
-            !is_encodable(base + 4),
-            "misaligned address is not encodable"
+            !narrow_oops_enabled(),
+            "a unit test must not leave the process-global geometry published"
         );
-        assert!(!is_encodable(base - 8));
-        assert!(!is_encodable(narrow_limit()));
-        disable_for_test();
-    }
-
-    #[test]
-    fn rejects_oversized_shift() {
-        let _g = LOCK.lock().unwrap();
-        disable_for_test();
-        assert!(!enable(0x1000, 4));
-        assert!(!narrow_oops_enabled());
     }
 }
