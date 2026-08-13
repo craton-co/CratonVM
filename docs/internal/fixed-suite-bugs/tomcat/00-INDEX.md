@@ -225,3 +225,22 @@ set run on two binaries; the residual `TestSsl` / `TestClientCert` failures are
 the pre-existing renegotiation ones, identical on both arms. Write-up:
 [websocket-jsse-wrap-consumed-app-data-during-handshake-FIXED](websocket-jsse-wrap-consumed-app-data-during-handshake-FIXED.md).
 
+
+## `TestNonBlockingAPI`'s ZGC hang — a TLAB chunk is a RESERVATION, 2026-08-13
+
+The class ran to its timeout after `OutOfMemoryError` for a 2.1 MB `char[]`
+with **1.99 GB of a 2.15 GB heap on the free list**. It reads as fragmentation
+and the fragmentation is real, but it is a symptom: a TLAB chunk is *reserved*
+space no collection can reclaim while its thread lives, its size was flat at
+512 KiB however many threads a workload ran, and this class runs ~4,000 —
+`4,000 x 512 KiB` is the whole heap, claimed behind a counter (`allocated`)
+that only ever sees object bytes. `CRATONVM_ZGC_TLAB=0` passes it 44/44 in
+244.7 s; the switch was already there and already documented, as a remark
+rather than as a measurement to take.
+
+Six defects in all, four in the allocator, one in the diagnostics, and one that
+has nothing to do with GC: `Thread.getUncaughtExceptionHandler()` returned null
+where HotSpot returns the ThreadGroup, so **every** uncaught exception in the
+VM was an NPE raised inside the uncaught-exception handler. Baseline rc=124 at
+900 s → `OK (44 tests)`, rc=0, zero OOM warnings. Write-up:
+[zgc-nonblockingapi-fragmentation-oom-double-fault-hang-FIXED-20260813](zgc-nonblockingapi-fragmentation-oom-double-fault-hang-FIXED-20260813.md).

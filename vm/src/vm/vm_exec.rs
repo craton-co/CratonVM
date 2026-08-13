@@ -3083,7 +3083,40 @@ fn safe_native_call_impl(
                 "unknown native method panic".to_string()
             };
             let in_bootstrap = shared.get_init_level() < 4;
-            if (msg.contains("unaligned pointer") || msg.contains("null pointer")) && in_bootstrap {
+            if let Some(oom) = &return_oom {
+                // A heap-exhaustion unwind is NOT a native bug and must not be
+                // reported as one. `NativeAllocOom` is neither a `String` nor a
+                // `&str`, so the ladder above degrades it to "unknown native
+                // method panic" and the final arm below logged that at ERROR,
+                // naming a callback address and a Java frame — which is how a
+                // working, catchable `OutOfMemoryError` came to read as a VM
+                // crash, and why the Tomcat `TestNonBlockingAPI` page filed
+                // "root cause of the native method panic" as an open question.
+                // There was no panic to root-cause. Say what actually happened,
+                // at the severity it actually has.
+                let top = thread
+                    .frames
+                    .last()
+                    .map(|f| {
+                        format!(
+                            "{}.{}{}",
+                            f.class_name(),
+                            f.method_name(),
+                            f.method_descriptor()
+                        )
+                    })
+                    .unwrap_or_default();
+                tracing::warn!(
+                    target: "cratonvm::gc::guard",
+                    java_frame = %top,
+                    "a native allocation could not be served and unwound to the \
+                     native-call boundary, where it becomes a catchable \
+                     java.lang.OutOfMemoryError ({oom:?}). This is the handled \
+                     heap-exhaustion path, not a native method fault.",
+                );
+            } else if (msg.contains("unaligned pointer") || msg.contains("null pointer"))
+                && in_bootstrap
+            {
                 shared
                     .debug
                     .swallow_counter
@@ -4918,6 +4951,72 @@ impl NativeContextImpl<'_> {
             }
         }
         self.shared.mem.heap.alloc_object(class_id, num_fields)
+    }
+}
+
+/// `class: message` for a Throwable, read out of the heap **without invoking
+/// any Java code and without allocating a single Java object**.
+///
+/// Every caller is on a thread-death or double-fault path, and at least one of
+/// them runs on a heap that has just refused an allocation. `toString()` would
+/// need a `StringBuilder`, a `char[]` and a `String` to answer, so on exactly
+/// the failure this exists to describe it would fail again — and a second
+/// failure inside the reporter is what turns a legible error into a silent
+/// one. So: class name from the class manager, `detailMessage` read straight
+/// out of its field slot.
+///
+/// Mirrors the field walk in `runtime::exceptions::set_detail_message_by_name`
+/// (the write side), including its `_fN` opaque-bootstrap-metadata fallback,
+/// so the two cannot disagree about which slot holds the message.
+pub(crate) fn describe_throwable(shared: &SharedVm, exc: ObjectRef) -> String {
+    if shared.mem.heap.is_object_address(exc.as_ptr() as usize).is_none() {
+        return format!("<not a live object: {:p}>", exc.as_ptr());
+    }
+    let class_id = shared.mem.heap.class_id_of(exc);
+    let (name, message_slot) = {
+        let cm = shared.classes.class_manager.read();
+        let name = cm
+            .get_class(class_id)
+            .map(|c| c.name.to_string())
+            .unwrap_or_else(|| format!("<class_id={}>", class_id.as_u32()));
+        let mut slot = None;
+        let mut opaque = None;
+        let mut walk = Some(class_id);
+        while let Some(cid) = walk {
+            let Some(cls) = cm.get_class(cid) else { break };
+            if &*cls.name == "java/lang/Throwable"
+                && cls.fields.len() >= 2
+                && cls.fields.iter().take(2).all(|f| f.name.starts_with("_f"))
+            {
+                opaque = Some(cls.first_field_index + 1);
+            }
+            let mut inst = 0usize;
+            for f in &cls.fields {
+                if f.is_static() {
+                    continue;
+                }
+                if &*f.name == "detailMessage" {
+                    slot = Some(cls.first_field_index + inst);
+                    break;
+                }
+                inst += 1;
+            }
+            if slot.is_some() {
+                break;
+            }
+            walk = cls.superclass;
+        }
+        (name, slot.or(opaque))
+    };
+    let message = message_slot
+        .map(|idx| shared.mem.heap.get_field(exc, idx))
+        .and_then(|v| match v {
+            Value::Object(Some(s)) => super::read_java_string(&shared.mem.heap, s),
+            _ => None,
+        });
+    match message {
+        Some(m) => format!("{name}: {m}"),
+        None => name,
     }
 }
 
@@ -13676,9 +13775,40 @@ impl<'a> NativeThreadAccess for NativeContextImpl<'a> {
                     );
                     jvm_thread.native_pin_roots.truncate(pin_base);
                     if let Err(de) = dispatch_result {
+                        // NAME both throwables. This used to print two raw
+                        // `ObjectRef { ptr: 0x... }` addresses, which says a
+                        // thread died and a handler died with it and nothing
+                        // whatsoever about either — the state the Tomcat
+                        // `TestNonBlockingAPI` double fault was first reported
+                        // in, where neither exception could be identified from
+                        // the log at all.
+                        //
+                        // `describe_throwable` deliberately reads the class and
+                        // `detailMessage` out of the heap instead of invoking
+                        // `toString()`: the commonest reason the handler
+                        // dispatch fails in the first place is that the heap
+                        // cannot serve an allocation, and a reporter that needs
+                        // three of them would fail for the same reason and
+                        // print nothing.
+                        let first = shared_arc
+                            .mem
+                            .heap
+                            .is_object_address(exc_now.as_ptr() as usize)
+                            .map(|_| describe_throwable(&shared_arc, exc_now))
+                            .unwrap_or_else(|| format!("{e:?}"));
+                        let second = match &de {
+                            MethodCallFailed::ExceptionThrown(d) => {
+                                describe_throwable(&shared_arc, *d)
+                            }
+                            other => format!("{other:?}"),
+                        };
+                        // HotSpot's shape first, so the ORIGINAL failure is
+                        // legible even when the handler chain is what broke —
+                        // the whole point of a fallback report.
+                        eprintln!("Exception in thread \"{name}\" {first}");
                         eprintln!(
-                            "Thread {} terminated with error: {:?} (dispatchUncaughtException also failed: {:?})",
-                            tid, e, de
+                            "Thread {tid} terminated with error: {first} \
+                             (dispatchUncaughtException also failed: {second})",
                         );
                     }
                 } else {
