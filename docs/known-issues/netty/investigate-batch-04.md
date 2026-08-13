@@ -56,7 +56,7 @@ Legend: ✅ matches HotSpot · ⚪ fails on HotSpot too · ❌ CratonVM defect
 | `io.netty.handler.codec.AdaptiveCumulatorTest` | FAIL | ✅ **77/77** |
 | `io.netty.handler.codec.MessageAggregatorTest` | FAIL | ✅ **2/2** |
 | `io.netty.handler.codec.NativeImageHandlerMetadataTest` | FAIL | ⚪ **fails identically on HotSpot** |
-| `io.netty.handler.codec.compression.BrotliIntegrationTest` | HANG | ❌ genuine hang → [hangs outside the interpreter](brotli-integration-test-hangs-outside-the-interpreter-20260812.md). 11/11 in 9.4 s on HotSpot; on CratonVM no output after t+3 s and the stack-dump watchdog never fires |
+| `io.netty.handler.codec.compression.BrotliIntegrationTest` | HANG | ✅ **not a hang** → [diagnosed and closed](../../internal/fixed-suite-bugs/netty-brotli-huge-decompress-not-a-hang-FIXED-20260812.md). 10 of its 11 tests pass in 4.2 s; `testHugeDecompress` builds 256 MB one `ByteBuf.writeByte` at a time, and that call costs ~2500 ns here vs ~9 ns on HotSpot. The watchdog defect that made this look like a native-code block is fixed |
 
 ## Filed from this page
 
@@ -67,7 +67,10 @@ Legend: ✅ matches HotSpot · ⚪ fails on HotSpot too · ❌ CratonVM defect
   written, measured and **backed out**, with the measurement showing why it
   cannot land without the option surface.
 * [`inet6address-drops-the-scope-id-20260812.md`](inet6address-drops-the-scope-id-20260812.md)
-* [`brotli-integration-test-hangs-outside-the-interpreter-20260812.md`](brotli-integration-test-hangs-outside-the-interpreter-20260812.md)
+* [`netty-brotli-huge-decompress-not-a-hang-FIXED-20260812.md`](../../internal/fixed-suite-bugs/netty-brotli-huge-decompress-not-a-hang-FIXED-20260812.md)
+  — **closed 2026-08-12**: not a hang and not outside the interpreter. Ten of
+  eleven tests pass; the eleventh is the ByteBuf per-byte throughput wall. The
+  watchdog that reported a running thread as "in native (Rust) code" is fixed.
 
 ## Repro
 

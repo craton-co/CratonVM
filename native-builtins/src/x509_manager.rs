@@ -458,6 +458,32 @@ const GN_TAG_DIRECTORY: u8 = 0xa4;
 const OID_SIG_SHA256_RSA: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x0b];
 ///   1.2.840.10045.4.3.2 — ecdsa-with-SHA256 (P-256 most common)
 const OID_SIG_ECDSA_SHA256: &[u8] = &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x03, 0x02];
+///   1.2.840.113549.1.1.5 — sha1WithRSAEncryption
+///
+/// **Deliberate widening, recorded as such.** Accepting SHA-1 makes chains
+/// that previously failed CLOSED verifiable. That is the HotSpot-parity
+/// answer — HotSpot's `SunJSSE` validates these chains, and every JDK ships
+/// `SHA1withRSA` — and it is what
+/// `io.netty.handler.ssl.SslContextTrustManagerTest` (all 4 tests) needs: its
+/// test CAs are SHA-1-signed, so CratonVM rejected them with
+/// `signature-algorithm OID at index 0 not implemented`. SHA-1 is
+/// collision-broken for *chosen-prefix* attacks against a CA that still signs
+/// with it; this verifier's job is to agree with the platform it emulates, not
+/// to impose a stricter policy the platform does not (a stricter policy that
+/// only CratonVM enforces reads to an application as "this VM cannot do TLS").
+const OID_SIG_SHA1_RSA: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x05];
+///   1.2.840.113549.1.1.12 — sha384WithRSAEncryption
+const OID_SIG_SHA384_RSA: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x0c];
+///   1.2.840.113549.1.1.13 — sha512WithRSAEncryption
+const OID_SIG_SHA512_RSA: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x0d];
+///   1.2.840.10045.4.3.3 — ecdsa-with-SHA384
+const OID_SIG_ECDSA_SHA384: &[u8] = &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x03, 0x03];
+///   1.2.840.10045.4.3.4 — ecdsa-with-SHA512
+const OID_SIG_ECDSA_SHA512: &[u8] = &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x03, 0x04];
+///   1.2.840.10045.4.3.1 — ecdsa-with-SHA224 (recognised, see below)
+const OID_SIG_ECDSA_SHA224: &[u8] = &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x03, 0x01];
+///   1.2.840.113549.1.1.14 — sha224WithRSAEncryption (recognised, see below)
+const OID_SIG_SHA224_RSA: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x0e];
 
 // --- Signature-algorithm OIDs we deliberately do NOT support yet. ---
 //
@@ -472,6 +498,10 @@ const OID_SIG_ECDSA_SHA256: &[u8] = &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x03, 
 //     SEQUENCE)
 //   * 1.3.101.112 — id-Ed25519 (pure EdDSA over Curve25519, separate
 //     verify path — no SHA-256 preimage)
+//   * 1.2.840.113549.1.1.14 / 1.2.840.10045.4.3.1 — the SHA-224 pair. Named
+//     here rather than left to the catch-all so the error says "known and
+//     unimplemented"; SHA-224 is the one member of the SHA-2 family this tree
+//     has no engine for, and no CA in the corpus issues with it.
 ///   1.2.840.10040.4.3 — id-dsa-with-sha1
 const OID_SIG_DSA_SHA1: &[u8] = &[0x2a, 0x86, 0x48, 0xce, 0x38, 0x04, 0x03];
 ///   1.2.840.113549.1.1.10 — id-RSASSA-PSS
@@ -2011,39 +2041,73 @@ fn verify_one_signature(
     cert: &ParsedCert,
     issuer_spki: &[u8],
 ) -> Result<(), TrustError> {
-    use crate::crypto_impl::{parse_ecdsa_public_key, parse_rsa_public_key, Ecdsa, Rsa, Sha256};
+    use crate::crypto_impl::{
+        parse_ecdsa_public_key, parse_rsa_public_key, Ecdsa, Rsa, Sha256, Sha384, Sha512,
+    };
+    use cratonvm_native_builtins_crypto::signature::DigestAlgorithm;
 
     let oid = cert.signature_algorithm_oid.as_slice();
     let sig = cert.signature_value.as_slice();
     let tbs = cert.tbs_bytes.as_slice();
 
-    if oid == OID_SIG_SHA256_RSA {
-        // PKCS#1 v1.5 RSA-SHA256: hash(tbs) → EMSA-PKCS1-v1_5 envelope, then
-        // s^e mod n and byte-equality compare.
+    // PKCS#1 v1.5 RSA, digest chosen by OID. The verification core
+    // (`crypto::signature::verify_rsa_pkcs1_v15_checked`) is already
+    // digest-parameterised, so this is a dispatch table rather than a copy per
+    // algorithm — the in-tree `Rsa::pkcs1v15_encode`, whose DigestInfo prefix
+    // IS hard-coded to SHA-256, is not on this path.
+    let rsa_digest = if oid == OID_SIG_SHA256_RSA {
+        Some(DigestAlgorithm::Sha256)
+    } else if oid == OID_SIG_SHA1_RSA {
+        Some(DigestAlgorithm::Sha1)
+    } else if oid == OID_SIG_SHA384_RSA {
+        Some(DigestAlgorithm::Sha384)
+    } else if oid == OID_SIG_SHA512_RSA {
+        Some(DigestAlgorithm::Sha512)
+    } else {
+        None
+    };
+
+    if let Some(digest_alg) = rsa_digest {
         let pk = match parse_rsa_public_key(issuer_spki) {
             Some(k) => k,
             None => return Err(TrustError::BadSignature { at }),
         };
-        if Rsa::verify_sha256(&pk, tbs, sig) {
+        if Rsa::verify_pkcs1_v15(&pk, digest_alg, tbs, sig) {
             Ok(())
         } else {
             Err(TrustError::BadSignature { at })
         }
-    } else if oid == OID_SIG_ECDSA_SHA256 {
-        // ECDSA-with-SHA256 over P-256: DER-decoded (r, s), check u1*G +
-        // u2*Q.x ≡ r (mod n). `verify_with_digest` takes a pre-hashed
-        // digest so we hash the TBS once here.
+    } else if oid == OID_SIG_ECDSA_SHA256
+        || oid == OID_SIG_ECDSA_SHA384
+        || oid == OID_SIG_ECDSA_SHA512
+    {
+        // ECDSA: DER-decoded (r, s), check u1*G + u2*Q.x ≡ r (mod n).
+        // `verify_with_digest` takes a PRE-HASHED digest and truncates it to
+        // the curve order's bit length itself (FIPS 186-4 §6.4), which is
+        // exactly why SHA-384/512 need no separate verify path — only the
+        // right hash over the TBS.
         let pk = match parse_ecdsa_public_key(issuer_spki) {
             Some(k) => k,
             None => return Err(TrustError::BadSignature { at }),
         };
-        let digest = Sha256::digest(tbs);
+        let digest: Vec<u8> = if oid == OID_SIG_ECDSA_SHA384 {
+            Sha384::digest(tbs).to_vec()
+        } else if oid == OID_SIG_ECDSA_SHA512 {
+            Sha512::digest(tbs).to_vec()
+        } else {
+            Sha256::digest(tbs).to_vec()
+        };
         if Ecdsa::verify_with_digest(&pk, &digest, sig) {
             Ok(())
         } else {
             Err(TrustError::BadSignature { at })
         }
-    } else if oid == OID_SIG_DSA_SHA1 || oid == OID_SIG_RSA_PSS || oid == OID_SIG_ED25519 {
+    } else if oid == OID_SIG_DSA_SHA1
+        || oid == OID_SIG_RSA_PSS
+        || oid == OID_SIG_ED25519
+        || oid == OID_SIG_SHA224_RSA
+        || oid == OID_SIG_ECDSA_SHA224
+    {
         // Known-but-unimplemented. See OID const block for the rationale —
         // each of these needs additional parsing (PSS parameters) or a
         // distinct primitive (DSA, EdDSA) we don't expose at this layer yet.
@@ -3923,8 +3987,58 @@ fn fnv1a_32(b: &[u8]) -> u32 {
     h
 }
 
-fn cert_exception(message: String) -> MethodCallFailed {
-    RuntimeError::IOException { message }.into()
+/// Throw a REAL `java.security.cert.CertificateException` for a failed PKIX
+/// check, rather than an `IOException` whose *message* merely names one.
+///
+/// `X509TrustManager.checkServerTrusted`/`checkClientTrusted` declare
+/// `throws CertificateException`, and **callers discriminate on the TYPE**:
+/// a TLS stack catches `CertificateException` to turn a validation failure
+/// into a handshake alert, and a test catches it to assert that an untrusted
+/// chain was in fact rejected. An `IOException` matches neither, so it sails
+/// straight through the `catch` that exists to handle exactly this.
+///
+/// `io.netty.handler.ssl.SslContextTrustManagerTest` is the witness: its two
+/// mixed-expectation tests (`testUsingCAsOneAandB`, `testUsingCAsOneAandTwo`)
+/// call `checkServerTrusted` inside `catch (CertificateException)` and assert
+/// the negative case was rejected. With an `IOException` the negative case
+/// escaped the catch and failed the test, while the two all-positive tests
+/// passed — so the symptom looked like "some chains do not validate" when the
+/// validation verdict was right and only its exception class was wrong.
+///
+/// Falls back to the historic `IOException` when the class cannot be
+/// constructed, so no configuration loses the failure entirely — the one
+/// thing that must never happen here is a silently-trusted connection.
+fn cert_exception(ctx: &mut dyn NativeContext, message: String) -> MethodCallFailed {
+    cert_exception_of(ctx, "java/security/cert/CertificateException", message)
+}
+
+/// [`cert_exception`] for a specific exception class — `CertPathValidatorException`
+/// on the `PKIXValidator.engineValidate` path, which declares that type rather
+/// than `CertificateException`.
+/// `pub(crate)` re-export of [`cert_exception`] for `tls.rs`'s
+/// `checkServerTrusted` path, so both trust-check entry points raise the same
+/// exception CLASS rather than agreeing only on the message text.
+pub(crate) fn cert_exception_external(
+    ctx: &mut dyn NativeContext,
+    message: String,
+) -> MethodCallFailed {
+    cert_exception(ctx, message)
+}
+
+fn cert_exception_of(
+    ctx: &mut dyn NativeContext,
+    class_name: &str,
+    message: String,
+) -> MethodCallFailed {
+    let msg = ctx.create_string(&message);
+    match ctx.new_object_initialized(
+        class_name,
+        "(Ljava/lang/String;)V",
+        &[Value::Object(Some(msg))],
+    ) {
+        Ok(Some(Value::Object(Some(exc)))) => MethodCallFailed::ExceptionThrown(exc),
+        _ => RuntimeError::IOException { message }.into(),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -4084,7 +4198,7 @@ fn do_check_trusted(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     };
     let chain = read_chain_arg(ctx, &chain_val);
     if chain.is_empty() {
-        return Err(cert_exception("certificate chain is empty".into()));
+        return Err(cert_exception(ctx, "certificate chain is empty".into()));
     }
 
     let (trust, hit) = {
@@ -4113,7 +4227,7 @@ fn do_check_trusted(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
 
     match validate_chain(&chain, &trust) {
         Ok(()) => Ok(None),
-        Err(e) => Err(cert_exception(format!("CertificateException: {}", e))),
+        Err(e) => Err(cert_exception(ctx, e.to_string())),
     }
 }
 
@@ -4154,7 +4268,7 @@ fn pkix_engine_validate(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     let _this = this_arg(args)?;
     let chain_val = match args.get(1) {
         Some(v) => v.clone(),
-        None => return Err(cert_exception("null chain".into())),
+        None => return Err(cert_exception(ctx, "null chain".into())),
     };
     let chain = read_chain_arg(ctx, &chain_val);
     let trust = build_trust_manager_state(0);
@@ -4168,7 +4282,11 @@ fn pkix_engine_validate(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
             };
             Ok(Some(Value::Object(Some(chain_arr))))
         }
-        Err(e) => Err(cert_exception(format!("CertPathValidatorException: {}", e))),
+        Err(e) => Err(cert_exception_of(
+            ctx,
+            "java/security/cert/CertPathValidatorException",
+            e.to_string(),
+        )),
     }
 }
 

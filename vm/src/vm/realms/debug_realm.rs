@@ -126,6 +126,16 @@ pub struct DebugRealm {
     /// before aborting the process.
     pub stack_dump_ack_count: std::sync::atomic::AtomicU32,
 
+    /// T19.H1 — the thread ids behind [`stack_dump_ack_count`], in ack order.
+    ///
+    /// The count alone cannot answer the question the summary needs: *which*
+    /// running threads stayed silent. A thread that is RUNNING and did not ack
+    /// is not in the interpreter at all — it is in JIT-compiled code or a long
+    /// native call — and saying so is the difference between a five-minute
+    /// diagnosis and the wrong one. See
+    /// [`crate::threading::thread_registry::ThreadRegistry::render_thread_summary_for`].
+    pub stack_dump_acked_tids: parking_lot::Mutex<Vec<u64>>,
+
     /// Sampling mode for [`Self::stack_dump_requested`] (see `--stack-sample-ms`).
     ///
     /// The watchdog's dump is one-shot: the flag is never cleared and each

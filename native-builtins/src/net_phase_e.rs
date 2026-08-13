@@ -1200,9 +1200,17 @@ pub(crate) fn inet_addr_resolve(
                             _ => 0,
                         };
                     }
-                    Some(hotspot_ip_string(
-                        &std::net::Ipv6Addr::from(octets).to_string(),
-                    ))
+                    // NOT `hotspot_ip_string`: that folds a v4-mapped address
+                    // to its dotted quad, which is right for `getByName` and
+                    // `InetAddress.getByAddress` (both hand back an
+                    // `Inet4Address`) and WRONG here. This branch only runs
+                    // for an object the real JDK already built as an
+                    // `Inet6Address` — `Inet6Address.getByAddress(String,
+                    // byte[], int)` is not intercepted — and the JDK
+                    // specifies that factory to keep the 16-byte form.
+                    // Folding it left `getAddress()` handing back 4 bytes for
+                    // an `instanceof Inet6Address` receiver.
+                    Some(ipv6_uncompressed_text(&std::net::Ipv6Addr::from(octets)))
                 }
                 _ => None,
             },
@@ -2081,16 +2089,34 @@ fn hotspot_ip_string(ip: &str) -> String {
     match ip.parse::<std::net::IpAddr>() {
         Ok(std::net::IpAddr::V6(v6)) => match v6.to_ipv4_mapped() {
             Some(v4) => v4.to_string(),
-            None => v6
-                .segments()
-                .iter()
-                .map(|seg| format!("{seg:x}"))
-                .collect::<Vec<_>>()
-                .join(":"),
+            None => ipv6_uncompressed_text(&v6),
         },
         Ok(std::net::IpAddr::V4(v4)) => v4.to_string(),
         Err(_) => ip.to_string(),
     }
+}
+
+/// HotSpot's `Inet6Address.numericToTextFormat` — eight 16-bit groups as
+/// minimal lowercase hex joined by `:`, with NO `::` zero-compression and
+/// **no v4-mapped fold**.
+///
+/// Split out of [`hotspot_ip_string`] because the fold is a property of the
+/// *entry point*, not of the address: `getByName` / `InetAddress.getByAddress`
+/// fold a v4-mapped address to an `Inet4Address`, but an object that is
+/// ALREADY an `Inet6Address` — one the real JDK built via
+/// `Inet6Address.getByAddress(String, byte[], int)`, which is not intercepted
+/// — must keep all sixteen bytes. Folding its text made
+/// `inet_addr_address_bytes` re-parse four bytes out of a v6 object, so
+/// `getAddress().length` was 4 on an `instanceof Inet6Address` receiver:
+/// internally inconsistent, and `io.netty.util.NetUtil.toAddressString`
+/// indexes 16 (`ArrayIndexOutOfBoundsException: Index 4 out of bounds for
+/// length 4`, `NetUtilTest.testIpv4MappedIp6GetByName`).
+fn ipv6_uncompressed_text(v6: &std::net::Ipv6Addr) -> String {
+    v6.segments()
+        .iter()
+        .map(|seg| format!("{seg:x}"))
+        .collect::<Vec<_>>()
+        .join(":")
 }
 
 fn alloc_inet_address(ctx: &mut dyn NativeContext, host: &str, ip: &str) -> Result<ObjectRef, MethodCallFailed> {
@@ -17824,6 +17850,46 @@ mod tests {
         // Plain IPv4 and non-IP hosts: untouched.
         assert_eq!(hotspot_ip_string("127.0.0.1"), "127.0.0.1");
         assert_eq!(hotspot_ip_string("example.com"), "example.com");
+    }
+
+    /// The v4-mapped fold belongs to the ENTRY POINT, not to the address.
+    ///
+    /// `getByName` / `InetAddress.getByAddress(byte[])` hand back an
+    /// `Inet4Address` for `::ffff:a.b.c.d` and HotSpot agrees — that is
+    /// [`hotspot_ip_string`], asserted above. But
+    /// `Inet6Address.getByAddress(String, byte[], int)` is specified to KEEP
+    /// all sixteen bytes, and CratonVM does not intercept it: the real JDK
+    /// bytecode builds the object, and the only CratonVM code that touches it
+    /// afterwards is `inet_addr_resolve`'s `holder6` branch, which reads the
+    /// 16 real octets back out. Folding there produced an object that answered
+    /// `instanceof Inet6Address` while `getAddress()` returned four bytes, and
+    /// `io.netty.util.NetUtil.toAddressString` indexes 16
+    /// (`ArrayIndexOutOfBoundsException: Index 4 out of bounds for length 4`,
+    /// `NetUtilTest.testIpv4MappedIp6GetByName` — HotSpot 14/14, CratonVM
+    /// 13/14 until this split).
+    #[test]
+    fn ipv6_uncompressed_text_never_folds_a_v4_mapped_address() {
+        let mapped: std::net::Ipv6Addr = "::ffff:192.168.0.1".parse().unwrap();
+        // The reader form keeps the v6 shape …
+        assert_eq!(ipv6_uncompressed_text(&mapped), "0:0:0:0:0:ffff:c0a8:1");
+        // … and re-parses to sixteen octets, which is the property netty needs.
+        assert_eq!(
+            ipv6_uncompressed_text(&mapped)
+                .parse::<std::net::Ipv6Addr>()
+                .unwrap()
+                .octets()
+                .len(),
+            16
+        );
+        // … while the entry-point form still folds, byte-identical to HotSpot.
+        assert_eq!(hotspot_ip_string("::ffff:192.168.0.1"), "192.168.0.1");
+        // A genuine IPv6 address renders the same through both.
+        let real: std::net::Ipv6Addr = "2001:db8::1".parse().unwrap();
+        assert_eq!(ipv6_uncompressed_text(&real), "2001:db8:0:0:0:0:0:1");
+        assert_eq!(
+            ipv6_uncompressed_text(&real),
+            hotspot_ip_string("2001:db8::1")
+        );
     }
 
     #[test]

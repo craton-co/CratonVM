@@ -3999,16 +3999,36 @@ fn run() -> Result<()> {
                 }
 
                 let total_acks = shared_for_watchdog.stack_dump_ack_count();
+                // Print the per-thread summary HERE, not at request time: only
+                // now is it known which threads answered, and that is what lets
+                // the summary tell a RUNNING-and-dumped thread apart from a
+                // RUNNING-and-silent one (JIT-compiled code or a long native
+                // call). See `SharedVm::dump_thread_summary_after_dumps`.
+                shared_for_watchdog.dump_thread_summary_after_dumps();
                 eprintln!(
                     "=== T19.H1 watchdog: {total_acks} thread(s) dumped; \
                      aborting process ==="
                 );
 
                 // KC-watchdog-native: when zero Java threads ack'd a dump,
-                // every interpreter thread is parked in native (Rust) code
-                // — the most common cause being a JNI / native-method loop
-                // or a deadlock on a Rust mutex inside the runtime. The
-                // Java-frame dump produces nothing actionable, so fall
+                // no thread reached an interpreter dispatch point. That is
+                // TWO states, not one, and this block used to assert the
+                // wrong one of them as fact ("main thread is in native
+                // (Rust) code"):
+                //
+                //   * parked in native (Rust) code — a JNI/native-method
+                //     loop or a deadlock on a runtime mutex; or
+                //   * RUNNING in JIT-COMPILED code, which the interpreter's
+                //     dump hook cannot observe at all because the hook lives
+                //     in the dispatch loop the thread is not executing.
+                //
+                // `--nojit` separates them in one re-run, and the message
+                // below now says so. Guessing cost
+                // known-issues/netty/brotli-integration-test-hangs-outside-the-interpreter
+                // an entire investigation: nothing was blocked, a compiled
+                // `ByteBuf.writeByte` loop was simply 200x too slow.
+                //
+                // Either way the Java-frame dump produces nothing, so fall
                 // back to:
                 //   1. The watchdog thread's own native backtrace (cheap
                 //      and tells you WHERE in the runtime the watchdog
@@ -4024,13 +4044,20 @@ fn run() -> Result<()> {
                 if total_acks == 0 {
                     let pid = std::process::id();
                     eprintln!(
-                        "=== T19.H1 watchdog: no Java threads responded \
-                         — main thread is in native (Rust) code. \
-                         pid={pid}. Attach a native debugger before the \
-                         3s post-dump grace ends to capture the hang \
-                         site (Windows: `cdb -p {pid}` then `~* k`; \
-                         Linux: `gdb -p {pid}` then `thread apply all bt`). \
-                         ==="
+                        "=== T19.H1 watchdog: no Java thread reached an \
+                         interpreter dispatch point. That is EITHER \
+                         JIT-compiled code (which this hook cannot observe \
+                         — it lives in the dispatch loop) OR native (Rust) \
+                         code. Do NOT assume the second: re-run with \
+                         --nojit, and if the frame dumps appear there the \
+                         thread was in compiled code and was RUNNING, not \
+                         stuck. pid={pid}. To settle it on the live process \
+                         instead, attach a native debugger before the 3s \
+                         post-dump grace ends (Windows: `cdb -p {pid}` then \
+                         `~* k`; Linux: `gdb -p {pid}` then `thread apply \
+                         all bt`) — a thread burning CPU in \
+                         `jit_invoke_*`/compiled frames is the first case, \
+                         one parked in a futex/read is the second. ==="
                     );
                     let bt = std::backtrace::Backtrace::force_capture();
                     eprintln!(
