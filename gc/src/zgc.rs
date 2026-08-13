@@ -2778,6 +2778,7 @@ impl ZgcRealHeap {
             high_blocks,
             high_bytes,
             high_max,
+            high_reserve_unclaimed: arena.unclaimed_high_reserve(),
             occupants: Vec::new(),
             unregistered_bytes: 0,
         };
@@ -2947,28 +2948,24 @@ impl ZgcRealHeap {
             // does the free-list probe run, and `has_free_block_at_least` is
             // O(1) for exactly the "no" answer that matters here.
             //
-            // The margin is widened by whatever of the large-object reserve is
-            // still UNCLAIMED, and that widening is the point. A TLAB chunk is
-            // reserved space, not allocated space: `allocated` never sees the
-            // part of a chunk that has not been handed to an object, so on a
-            // workload with thousands of threads the classic live-bytes trigger
-            // is blind to the arena filling up. Measured on `TestNonBlockingAPI`
-            // (2026-08-13): ~4,000 threads x 512 KiB of chunks consumed the
-            // whole 2 GB arena while `allocated` — object bytes — sat around
-            // 150 MB, so the only trigger that ever fired was this one, and at
-            // a bare `margin` it fired when the un-bumped middle was already
-            // down to 16 MB. By then the small-object end had bumped straight
-            // through the large-object reserve, and the large-object region was
-            // stuck at the 93 MB it had happened to claim.
+            // WIDENING THE MARGIN BY THE UNCLAIMED LARGE-OBJECT RESERVE WAS
+            // TRIED HERE, MEASURED, AND REMOVED. The reasoning was sound: a
+            // TLAB chunk is reserved space, not allocated space, so `allocated`
+            // cannot see the arena filling with chunks, and on
+            // `TestNonBlockingAPI` (2026-08-13) this was the ONLY trigger that
+            // ever fired — at a bare `margin`, when the un-bumped middle was
+            // already down to 16 MB. Collecting earlier does keep the reserve
+            // intact.
             //
-            // Arming while the middle is still `margin + unclaimed reserve`
-            // wide collects EARLY enough that the retired chunk tails reach the
-            // free list and refills start recycling instead of bumping — which
-            // is what leaves the reserve for the end it was reserved for. It
-            // cannot storm: `needs_gc` puts both of its terms behind the same
-            // `gc_rearm` floor.
-            let margin = zgc_headroom_margin(arena.capacity())
-                .saturating_add(arena.unclaimed_high_reserve());
+            // It is still not here, because the arm was priced against what it
+            // changed. Once `ZGC_TLAB_RESERVATION_SHARE` bounds what chunks may
+            // claim at all, the class passes with the bare margin (`OK (44
+            // tests)`, zero OOM warnings) — and the widened margin cost **4.6%
+            // on `TestTomcat`**, a class with nowhere near enough threads for
+            // the chunk to shrink, i.e. a class that paid for the trigger and
+            // got nothing back. Collecting earlier is the wrong lever for a
+            // reservation that should not have been that large.
+            let margin = zgc_headroom_margin(arena.capacity());
             let tail = arena.capacity().saturating_sub(arena.used());
             if tail < margin && !arena.has_free_block_at_least(margin) {
                 self.headroom_low.store(true, Ordering::Relaxed);
@@ -4910,6 +4907,11 @@ struct ZFragReport {
     high_blocks: usize,
     high_bytes: usize,
     high_max: usize,
+    /// Bytes of the large-object floor the high end has not claimed yet. Large
+    /// here and a failing large allocation together mean the reserve was
+    /// respected but the region never grew into it; small means the region is
+    /// as big as it is allowed to get and the floor is the thing to raise.
+    high_reserve_unclaimed: usize,
     /// `(class_id, objects, bytes)` for the occupants of the winning window's
     /// walls, largest byte total first.
     occupants: Vec<(u32, usize, usize)>,
@@ -4936,6 +4938,7 @@ impl ZFragReport {
             high_blocks = self.high_blocks,
             high_bytes = self.high_bytes,
             high_max = self.high_max,
+            high_reserve_unclaimed = self.high_reserve_unclaimed,
             "zgc frag: the shape of the free list at the failing request \
              (histograms are log2 lower bounds: `512K:3892` = 3892 spans of \
              512 KiB..1 MiB)",

@@ -139,16 +139,30 @@ trigger that ever fired was `headroom_low`, and at a bare
 `zgc_headroom_margin` it fires when the un-bumped middle is already down to
 16 MB — long after the small-object end has bumped through everything else.
 
-**Fix:** `headroom_low` is armed while the middle is still
-`margin + unclaimed large-object reserve` wide, so the collection happens early
-enough for retired chunk tails to reach the free list and refills to start
-recycling. It cannot storm: `needs_gc` puts both terms behind the same
-`gc_rearm` floor.
+**Fix considered, measured, and NOT taken.** Arming `headroom_low` while the
+middle is still `margin + unclaimed large-object reserve` wide does work — it
+collects early enough for retired chunk tails to reach the free list, and it
+cannot storm because `needs_gc` puts both terms behind the same `gc_rearm`
+floor. It landed, and then it was priced against what it changed:
 
-Same defect class as the `ZipContentTests` fix of 2026-08-10, whose defect 1 was
-"the trigger asked about LIVE BYTES when the binding constraint is ALLOCATABLE
-SPACE". This one asked about the whole arena when the binding constraint is one
-end's share of it.
+| arm | `TestNonBlockingAPI` | `TestTomcat` (ordinary, ~no threads) |
+|---|---|---|
+| widened trigger | `OK (44 tests)` | 36.4 s |
+| bare margin | `OK (44 tests)` | 34.8 s |
+
+With defect 1 fixed, the class passes either way — and the widening costs
+**4.6%** on a class that has nowhere near enough threads for the chunk to
+shrink, i.e. a class that pays for the trigger and gets nothing back. It was
+removed. The comment at the site records the reasoning and the number, because
+the next person to hit a reservation-shaped OOM will reach for exactly this
+lever.
+
+The diagnosis stands even though the fix did not: this is the same defect class
+as the `ZipContentTests` fix of 2026-08-10, whose defect 1 was "the trigger
+asked about LIVE BYTES when the binding constraint is ALLOCATABLE SPACE". This
+one asked about the whole arena when the binding constraint is one end's share
+of it. The right answer was to stop the reservation being that large, not to
+collect more often around it.
 
 ## Defect 5 — no floor under the large-object region
 
@@ -262,13 +276,16 @@ the same loaded host:
 | baseline | 32.7 s | 36.8 s | 34.8 s |
 | this branch | 34.3 s | 38.4 s | 36.4 s |
 
-**~4.6% slower**, and the branch is slower in both rounds, so it is probably
-real rather than host noise — the earlier-firing `headroom_low` is the likely
-cause. That is the price of the trade and it is worth stating plainly: this
-class does not have enough threads for the chunk to shrink at all (the clamp
-binds below ~256 threads), so what it is paying for is the trigger, not the
-TLAB change. A wider re-measurement belongs with the suite re-baseline in
-feature-designs/zgc-maturity-assessment-and-plan-20260813.md, Phase 1.
+**~4.6% slower**, and the branch was slower in both rounds, so it was probably
+real rather than host noise. That measurement is what retired the widened
+headroom trigger (defect 4): `TestTomcat` has nowhere near enough threads for
+the chunk to shrink, so it was paying for the trigger and getting nothing back,
+and the class this whole page is about passes without it. The landed branch has
+the bare margin.
+
+A wider re-measurement still belongs with the suite re-baseline in
+feature-designs/zgc-maturity-assessment-and-plan-20260813.md, Phase 1 — one
+class is not a throughput baseline.
 
 Every new test was watched to **fail before it passed**: stubbing `alloc_high`
 to delegate to `alloc` fails all five region tests; stubbing the high retraction

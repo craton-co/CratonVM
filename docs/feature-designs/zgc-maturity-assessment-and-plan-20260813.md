@@ -120,7 +120,11 @@ supporting mechanism was sized by a constant that nobody re-derived when the
 workload changed. Three of the six defects behind this one OOM are of that
 kind. The fixes that landed with this document — a reservation budget scaled by
 the live thread count, a refill that accepts a recycled chunk, a two-ended
-arena, a trigger that can see the reserve — mitigate Gap A. They do **not**
+arena with a floor under its large-object end — mitigate Gap A. (A fifth,
+arming the headroom trigger earlier, was written, measured at **4.6% on an
+ordinary class for no change in outcome once the reservation was bounded**, and
+removed. That is the discipline the rest of this plan needs: price every arm
+against what it changed.) They do **not**
 make the collector compact, so a workload whose large objects are themselves
 long-lived and interleaved will still find a ceiling, just a much higher one.
 
