@@ -1699,6 +1699,53 @@ impl ResolvesServerCert for SniCertResolver {
     }
 }
 
+
+/// Build **this side's own** TLS identity from a certificate chain and its
+/// private key.
+///
+/// Deliberately `CertifiedKey::new` and not `CertifiedKey::from_der`. The
+/// difference is one call — `from_der` additionally runs `keys_match()`, which
+/// parses the end-entity certificate through webpki purely to compare its
+/// `SubjectPublicKeyInfo` against the private key's:
+///
+/// ```text
+/// pub fn keys_match(&self) -> Result<(), Error> {
+///     let Some(key_spki) = self.key.public_key() else {
+///         return Err(InconsistentKeys::Unknown.into());   // <- already tolerated
+///     };
+///     let cert = ParsedCertificate::try_from(self.end_entity_cert()?)?;
+///     match key_spki == cert.subject_public_key_info() { … }
+/// }
+/// ```
+///
+/// webpki's parser accepts only v3 certificates (`cert.rs`'s `version3`), so a
+/// **v1** identity fails that parse, and the failure escapes as
+/// `InvalidCertificate(Other(UnsupportedCertVersion))` instead of landing in
+/// the `InconsistentKeys::Unknown` arm the surrounding code already treats as
+/// "cannot tell, carry on". The result was that this VM would not *present* a
+/// v1 certificate at all — an error raised while building a config, before any
+/// peer or trust decision exists. JSSE has no such restriction, and netty's
+/// mutual-auth fixtures are all v1 end-entity certificates, so 72 of
+/// `JdkSslEngineTest`'s failures were this one check.
+///
+/// What is given up is the early "your certificate and private key do not
+/// match" diagnosis; a genuine mismatch now fails at handshake time instead of
+/// config time. That check is best-effort in rustls itself — a key provider
+/// that cannot expose a public key already skips it — and this module's own
+/// `SniCertResolver` has always built its identity this way, so the five
+/// single-certificate paths were the odd ones out rather than the safe ones.
+///
+/// This does NOT touch peer verification: a peer's chain still goes through
+/// webpki path building, v3 rule included.
+fn identity_certified_key(
+    chain: Vec<CertificateDer<'static>>,
+    key: PrivateKeyDer<'static>,
+) -> Result<CertifiedKey, String> {
+    let signing_key = rustls::crypto::ring::sign::any_supported_type(&key)
+        .map_err(|e| format!("unsupported private key: {}", e))?;
+    Ok(CertifiedKey::new(chain, signing_key))
+}
+
 impl SniCertResolver {
     /// Build a `CertifiedKey` from PEM blobs. Uses rustls's ring-backed
     /// signer, which covers RSA 2048/3072/4096 and ECDSA P-256/P-384.
@@ -1707,9 +1754,7 @@ impl SniCertResolver {
         // Same repair as the non-SNI server builder: a JDK EC key arrives
         // without the `publicKey [1]` ring needs, and the cert carries it.
         let key = repair_ec_key_for_ring(parse_private_key_pem(key_pem)?, &chain);
-        let signing_key = rustls::crypto::ring::sign::any_supported_type(&key)
-            .map_err(|e| format!("unsupported private key: {}", e))?;
-        Ok(Arc::new(CertifiedKey::new(chain, signing_key)))
+        Ok(Arc::new(identity_certified_key(chain, key)?))
     }
 }
 
@@ -1961,9 +2006,12 @@ pub(crate) fn build_server_config_single_cert_ex_ciphers(
         builder.with_no_client_auth()
     };
 
-    let mut config = builder
-        .with_single_cert(chain, key)
-        .map_err(|e| format!("ServerConfig with_single_cert failed: {}", e))?;
+    // `with_single_cert` is exactly `CertifiedKey::from_der` + this resolver;
+    // the only difference is the `keys_match` parse. See
+    // `identity_certified_key`.
+    let mut config = builder.with_cert_resolver(Arc::new(
+        rustls::sign::SingleCertAndKey::from(identity_certified_key(chain, key)?),
+    ));
 
     // T2.7.11 — server ALPN advertisement.
     config.alpn_protocols = alpn_protocols
@@ -2028,9 +2076,11 @@ pub(crate) fn build_client_config(
             // A JDK-generated EC client identity needs the same repair as the
             // server one — ring rejects it otherwise.
             let key = repair_ec_key_for_ring(parse_private_key_pem(key_pem)?, &chain);
-            builder
-                .with_client_auth_cert(chain, key)
-                .map_err(|e| format!("with_client_auth_cert failed: {}", e))?
+            // See `identity_certified_key` for why this is not
+            // `with_client_auth_cert`.
+            builder.with_client_cert_resolver(Arc::new(
+                rustls::sign::SingleCertAndKey::from(identity_certified_key(chain, key)?),
+            ))
         }
         None => builder.with_no_client_auth(),
     };
@@ -2363,9 +2413,11 @@ fn build_client_config_ex_with_provider(
             // A JDK-generated EC client identity needs the same repair as the
             // server one — ring rejects it otherwise.
             let key = repair_ec_key_for_ring(parse_private_key_pem(key_pem)?, &chain);
-            builder
-                .with_client_auth_cert(chain, key)
-                .map_err(|e| format!("with_client_auth_cert failed: {}", e))?
+            // See `identity_certified_key` for why this is not
+            // `with_client_auth_cert`.
+            builder.with_client_cert_resolver(Arc::new(
+                rustls::sign::SingleCertAndKey::from(identity_certified_key(chain, key)?),
+            ))
         }
         ClientAuthMode::Fixed(None) => builder.with_no_client_auth(),
     };
@@ -3455,10 +3507,12 @@ fn build_server_config_single_cert_passthrough_client_auth(
             algorithms,
             root_hints,
         });
+    // See `identity_certified_key` for why this is not `with_single_cert`.
     let mut config = builder
         .with_client_cert_verifier(verifier)
-        .with_single_cert(chain, key)
-        .map_err(|e| format!("ServerConfig with_single_cert failed: {}", e))?;
+        .with_cert_resolver(Arc::new(rustls::sign::SingleCertAndKey::from(
+            identity_certified_key(chain, key)?,
+        )));
     config.alpn_protocols = alpn_protocols
         .iter()
         .map(|s| s.as_bytes().to_vec())
@@ -3488,9 +3542,11 @@ pub(crate) fn build_client_config_ciphers(
             // A JDK-generated EC client identity needs the same repair as the
             // server one — ring rejects it otherwise.
             let key = repair_ec_key_for_ring(parse_private_key_pem(key_pem)?, &chain);
-            builder
-                .with_client_auth_cert(chain, key)
-                .map_err(|e| format!("with_client_auth_cert failed: {}", e))?
+            // See `identity_certified_key` for why this is not
+            // `with_client_auth_cert`.
+            builder.with_client_cert_resolver(Arc::new(
+                rustls::sign::SingleCertAndKey::from(identity_certified_key(chain, key)?),
+            ))
         }
         None => builder.with_no_client_auth(),
     };
