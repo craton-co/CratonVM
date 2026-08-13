@@ -271,3 +271,74 @@ it. Whoever revisits this should either profile where the inter-chunk gap
 actually goes (the 08-11 update's other suggested next step, still not
 done) or accept this as a known, understood perf wall and move on — not
 resume the opcode-admission whack-a-mole where this session left off.
+
+---
+
+## 2026-08-13 — the last open item, done: the send path is not CPU-bound at all
+
+This page closed with two alternatives and a recommendation:
+
+> Whoever revisits this should either **profile where the inter-chunk gap
+> actually goes** (the 08-11 update's other suggested next step, still not done)
+> or accept this as a known, understood perf wall and move on — not resume the
+> opcode-admission whack-a-mole where this session left off.
+
+The profile has now been taken, on branch
+`fix/websocket-frame-truncation-20260813`, and it settles the question.
+
+`--stack-sample-ms 5` over one `TestAsyncMessagesPerformance` run (37 s wall,
+so ~7,400 sampling opportunities per thread):
+
+| thread | samples | share of wall |
+|---|---:|---:|
+| `main` (the client) | 1,443 | ~19 % |
+| `http-nio-…-exec-4` (**the send thread**) | 574 | **~7.7 %** |
+| `http-nio-…-Poller` | 28 | ~0.4 % |
+| every other thread | < 40 each | — |
+
+**No thread in the process is CPU-saturated, and the send thread least of all.**
+Of its 574 samples, **494 (86.1 %)** have the same deepest named frame:
+
+```
+class=org/apache/tomcat/websocket/TesterAsyncTiming$Endpoint method=onMessage pc=78 last_pc=75
+```
+
+`javap` on that method puts `invokestatic java/lang/Thread.sleep:(J)V` at
+pc=75 — the test's own deliberate 50 ms pause. So the great majority of the
+send thread's already-tiny CPU footprint is the fixture sleeping on purpose.
+
+### What that means for this page
+
+The inter-chunk gap is **not** produced by the cost of executing the send
+path's code. Compiling more of that code therefore cannot close it, and the
+`ldc`/`ldc_w`/`invokedynamic`/`laload`/`athrow` admission work this page
+scoped must not be resumed. That is the same conclusion the page already
+reached twice — once when `endMessage` became compilable and the numbers did
+not respond (08-11), once when `startMessage` did and they did not respond
+either (08-12) — now from a third and independent angle, and this one explains
+*why* those two null results were not bad luck.
+
+Where the gap does live is the async write → completion → next-send handoff
+latency, which is a different problem from anything on this page and is not
+opened here.
+
+### One thing this page's family DID have, and it was elsewhere
+
+While chasing the neighbouring `TestWebSocketFrameClient` failure, the
+WebSocket **text** send path turned out to be genuinely CPU-bound — 88 % of the
+server thread in `Utf8Encoder.encodeNotHasArray`, on two single-element buffer
+accessors — because the `java/lang/String` JIT call-site intrinsics were inert
+in two of the three compile doors. `String.charAt` measured **408 ns** per call
+against HotSpot's 0.6. Fixed the same day; see
+`websocket-frameclient-message-truncation-is-a-string-intrinsic-hole-FIXED-20260813`.
+
+That fix does **not** move this test, and was not expected to:
+`TesterAsyncTiming` sends `ByteBuffer`s through `sendBinary`, so it never
+enters `Utf8Encoder`. Measured anyway, because "expected not to move" is a
+prediction and not a result — before `SEQ0=0 SEQ1=1 SEQ2=279`, after
+`SEQ0=0 SEQ1=0 SEQ2=299`, framing failures **0** in both, i.e. unchanged inside
+this test's own several-fold noise band.
+
+**Status: CLOSED.** Every item this page left open is answered. It remains a
+real, understood latency wall on `testAsyncTiming`; it is not a framing bug, not
+a JIT-admission problem, and not a throughput problem.
