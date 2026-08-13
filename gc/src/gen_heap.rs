@@ -414,9 +414,11 @@ pub static SWEEP_WALK_OVERSHOOT_HITS: AtomicU64 = AtomicU64::new(0);
 /// live memory).
 pub static SWEEP_ZERO_SPAN_HITS: AtomicU64 = AtomicU64::new(0);
 
-/// Zero runs the young walk recognised as a run of EMPTY objects and stepped
+/// Zero runs a young walk recognised as a run of EMPTY objects and stepped
 /// over on-grid, instead of treating as a desync — see
-/// [`zero_run_is_empty_object_run`]. Deliberately a SEPARATE counter from
+/// [`zero_run_is_empty_object_run`]. Summed across the three walks that ask:
+/// the sequential sweep, the parallel [`sweep_chunk`], and
+/// [`clear_all_mark_bits_in_arena`]. Deliberately a SEPARATE counter from
 /// [`SWEEP_ZERO_SPAN_HITS`], which now counts only the runs that still take the
 /// unwind: this shape is normal and frequent (147 per young cycle on the
 /// hibernate-reactive repro), so folding the two together would turn its
@@ -11464,7 +11466,7 @@ impl GenerationalHeap {
         // both the normal-completion and the `break` arm because it sits
         // after the `while` loop. Now hole-aware: the dead spans are on the
         // free list (published above), so the re-walk skips them.
-        clear_all_mark_bits_in_arena(&mut young_from);
+        clear_all_mark_bits_in_arena(&mut young_from, &side_sorted);
         report_phase("clear-marks");
 
         let live_bytes = bytes_before.saturating_sub(bytes_swept);
@@ -15716,16 +15718,42 @@ fn sweep_chunk(ctx: &SweepCtx<'_>, lo: usize, hi: usize) -> Option<SweepChunkRes
             return None;
         }
 
-        // Unlisted all-zero span: never parseable, and its presence is
-        // evidence the grid broke. Sequential path owns the recovery.
+        // Unlisted all-zero span. Only SOME of these are evidence the grid
+        // broke: a run of EMPTY objects is the ordinary post-HEADER_SIZE-16
+        // shape (see `zero_run_is_empty_object_run`), and a marked object at
+        // the run start is simply a live `ClassId(0)` container whose header
+        // legitimately reads zero. Bailing on either was expensive out of all
+        // proportion — one `None` makes `parallel_sweep_walk` discard EVERY
+        // chunk and re-run the whole arena sequentially, and on the
+        // hibernate-reactive repro that happened on every cycle
+        // (`par_attempts=5 par_fails=5`, all five the zero-run branch, so
+        // `par_prefix_end` was 0 for the entire run). Anything the predicate
+        // does not vouch for still bails; the sequential path still owns the
+        // report and the unwind/re-anchor policy.
         // SAFETY: in-bounds 8-byte header read, as above.
         if unsafe { *(obj_ptr as *const u64) } == 0 {
             let limit = free_iter
                 .peek()
                 .map(|&&(off, _)| off)
                 .unwrap_or(ctx.used)
-                .min(ctx.used);
-            if zero_run_end(from_base, cursor, limit) - cursor >= HEADER_SIZE {
+                .min(ctx.used)
+                // Never step over `hi`: the chain must land exactly on the
+                // next anchor or the chunk is discarded anyway.
+                .min(hi);
+            let run_end = zero_run_end(from_base, cursor, limit);
+            let vouched_live = ctx.side_sorted.binary_search(&(from_base + cursor)).is_ok();
+            if run_end - cursor >= HEADER_SIZE && !vouched_live {
+                if zero_run_is_empty_object_run(
+                    from_base,
+                    cursor,
+                    run_end,
+                    ctx.used,
+                    ctx.side_sorted,
+                ) {
+                    SWEEP_ZERO_SPAN_EMPTY_RUNS.fetch_add(1, Ordering::Relaxed);
+                    cursor = run_end;
+                    continue;
+                }
                 return None;
             }
         }
@@ -16561,7 +16589,12 @@ fn resync_to_next_free_block(
     false
 }
 
-fn clear_all_mark_bits_in_arena(arena: &mut Arena) {
+/// `side_sorted` is this collection's live set (marked object bases, ascending)
+/// — the same slice the sweep walk used. It is what lets this walk tell an
+/// ordinary run of dead EMPTY objects apart from a desync; without it every
+/// such run costs a re-anchor and leaves stale marks behind (see the note at
+/// the zero-run branch).
+fn clear_all_mark_bits_in_arena(arena: &mut Arena, side_sorted: &[usize]) {
     let base = arena.base_ptr() as usize;
     let used = arena.used();
     let free_blocks = arena.free_blocks_sorted();
@@ -16603,6 +16636,17 @@ fn clear_all_mark_bits_in_arena(arena: &mut Arena) {
         // is not parseable — re-anchor at the next free block (carries no
         // mark bits to clear) instead of striding it as phantom objects and
         // writing the mark-clear byte into live-object interiors.
+        //
+        // …but a run of EMPTY objects is not that (`zero_run_is_empty_object_run`),
+        // and re-anchoring on one is not free HERE in a way it is nowhere else:
+        // the marks in the skipped stretch are LEFT SET, and the next
+        // non-moving sweep treats a set `GC_FLAG_MARKED` as live regardless of
+        // reachability (the bug-C5 note at the call site). So the false
+        // positive feeds itself — measured at ~800 re-anchors per young cycle
+        // on the hibernate-reactive repro. Step over the run instead: it can
+        // hold no mark to clear, because a header carrying `GC_FLAG_MARKED` is
+        // by definition not all-zero, and the predicate refuses any run with a
+        // marked base inside it.
         // SAFETY: reads the first header word at `obj_ptr` (`cursor < used`),
         // already dereferenced in-bounds as a header above.
         let word0 = unsafe { *(obj_ptr as *const u64) };
@@ -16614,7 +16658,15 @@ fn clear_all_mark_bits_in_arena(arena: &mut Arena) {
                 .unwrap_or(used)
                 .min(used);
             let run_end = zero_run_end(base, cursor, limit);
-            if run_end - cursor >= HEADER_SIZE {
+            // A marked base AT the run start is a live `ClassId(0)` container
+            // that DOES carry a mark bit — parse it normally below.
+            let vouched_live = side_sorted.binary_search(&(base + cursor)).is_ok();
+            if run_end - cursor >= HEADER_SIZE && !vouched_live {
+                if zero_run_is_empty_object_run(base, cursor, run_end, used, side_sorted) {
+                    SWEEP_ZERO_SPAN_EMPTY_RUNS.fetch_add(1, Ordering::Relaxed);
+                    cursor = run_end;
+                    continue;
+                }
                 anomaly = true;
             }
         }

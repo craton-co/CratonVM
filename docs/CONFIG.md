@@ -342,7 +342,7 @@ sense, so they keep their own name.
 | `CRATONVM_JAVA_HOME` | Overrides `JAVA_HOME` for the boot probe — set this when `JAVA_HOME` points at a cratonvm shim tree (Maven, Gradle) but the boot modules should come from a real JDK. |
 | `CRATONVM_BIN` | Path to the `cratonvm` binary, for harnesses that re-exec it. |
 | `CRATONVM_MAVEN_REPO_LOCAL` | Local Maven repository root. |
-| `CRATONVM_ENABLE_ASSERTIONS` | Enable Java `assert` statement evaluation (the `-ea` analog) for the run. |
+| `CRATONVM_ENABLE_ASSERTIONS` | Enable Java `assert` statement evaluation for the run. An unscoped `-ea` / `-enableassertions` / `-esa` sets it; `-da` / `-dsa` clears it, overriding an inherited export. Scoped forms (`-ea:some.pkg`) are ignored — the switch is JVM-wide. |
 | `CRATONVM_DISABLE_JIT` | Interpreter-only execution (the `--nojit` flag sets this). Useful for isolating whether a misbehaviour originates in the JIT. |
 
 ### Not `CRATONVM_*`
