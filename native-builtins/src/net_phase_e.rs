@@ -7743,8 +7743,336 @@ fn url_component_ref(
     None
 }
 
+// ---------------------------------------------------------------------------
+// The `https:` carrier's TLS session
+// ---------------------------------------------------------------------------
+//
+// WHY THIS EXISTS. `URL.openConnection()` on an `https:` URL used to hand back
+// `javax/net/ssl/HttpsURLConnection` ITSELF, which is `abstract`. On HotSpot 25:
+//
+//     $ javap -p --module java.base javax.net.ssl.HttpsURLConnection
+//       public abstract java.lang.String getCipherSuite();
+//       public abstract java.security.cert.Certificate[] getLocalCertificates();
+//       public abstract java.security.cert.Certificate[] getServerCertificates()
+//
+// so all three threw `AbstractMethodError: ... has no Code attribute` on a
+// connection that had completed a real, certificate-verified handshake, and the
+// CONCRETE `getSSLSession()` on the same class answered `Optional.empty()`
+// SILENTLY -- "this connection has no TLS session" on a connection that has
+// one, with no diagnostic for a caller that branches on it. Measured against
+// HotSpot 25 in `docs/known-issues/jdk-only/P4A-TOMCAT-20260812.md` section 3
+// and re-measured for this record.
+//
+// The carrier is now the concrete `HttpsURLConnectionImpl`, as HotSpot returns.
+// That alone is NOT a fix: every method on that class is
+// `getfield delegate; invokevirtual DelegateHttpsURLConnection....`, and this
+// VM's carrier is allocated rather than constructed, so `delegate` is null and
+// the swap by itself only trades the `AbstractMethodError` for an NPE. The six
+// accessors below are the other half; they are registered on BOTH the Impl and
+// the abstract base so neither receiver can reach that bytecode.
+//
+// THE UNCONNECTED SHAPE IS MEASURED, NOT ASSUMED. On HotSpot 25, all six
+// accessors on a connection that has not completed a handshake throw the SAME
+// exception:
+//
+//     class = sun.net.www.protocol.https.HttpsURLConnectionImpl
+//     getCipherSuite        THREW java.lang.IllegalStateException: connection not yet open
+//     getServerCertificates THREW java.lang.IllegalStateException: connection not yet open
+//     getLocalCertificates  THREW java.lang.IllegalStateException: connection not yet open
+//     getPeerPrincipal      THREW java.lang.IllegalStateException: connection not yet open
+//     getLocalPrincipal     THREW java.lang.IllegalStateException: connection not yet open
+//     getSSLSession         THREW java.lang.IllegalStateException: connection not yet open
+//
+// `getSSLSession()` included -- so today's silent `Optional.empty()` is wrong
+// even for the unconnected case, and answering `IllegalStateException` here
+// cannot regress a caller relative to HotSpot.
+//
+// GC. The table holds PLAIN DATA only (two `String`s and the peer chain's DER
+// bytes), never an `ObjectRef`, so it needs no rooting in any collector path --
+// the same rule `sock_side_table` above states and for the same reason. It is
+// keyed by `NativeObjKey` (VM identity + `identityHashCode`), which is stable
+// across relocation and scoped to one VM, not by a raw address.
+
+/// One completed client handshake, as the six `HttpsURLConnection` session
+/// accessors need to answer it.
+#[derive(Clone, Debug, Default)]
+struct HttpsCarrierSession {
+    /// `TLSv1.3` / `TLSv1.2`, exactly as the handshake reported it.
+    protocol: String,
+    /// The negotiated cipher suite name, e.g. `TLS_AES_256_GCM_SHA384`.
+    cipher: String,
+    /// The peer's certificate chain, leaf first, DER-encoded.
+    peer_chain_der: Vec<Vec<u8>>,
+}
+
+fn https_carrier_sessions() -> &'static OrderedPlMutex<HashMap<NativeObjKey, HttpsCarrierSession>> {
+    static T: OnceLock<OrderedPlMutex<HashMap<NativeObjKey, HttpsCarrierSession>>> =
+        OnceLock::new();
+    T.get_or_init(|| OrderedPlMutex::new(HashMap::new(), LockLevel::Scratch))
+}
+
+/// Record the TLS session a completed `https:` request negotiated, against the
+/// `HttpsURLConnection` carrier that made it.
+///
+/// Called from the handshake path in `http_url_connection.rs`, which is the one
+/// place that has the protocol, the cipher suite and the peer chain in hand at
+/// the same time. Without a call to this, every accessor below answers
+/// `IllegalStateException: connection not yet open`, which is HotSpot's own
+/// answer for a connection that has not handshaken -- so a missing call is a
+/// missing ANSWER, never a wrong one.
+///
+/// UNCALLED AS OF THIS COMMIT, deliberately and temporarily. The one call site
+/// is a single line inside `http_url_connection.rs`'s `huc_verify_hostname`,
+/// which is the only place holding all three values at once; that file belongs
+/// to another lane, so it is a NOMINATION rather than an edit here. Until it
+/// lands, all six accessors answer `IllegalStateException: connection not yet
+/// open` -- HotSpot's own answer for an unhandshaken connection, so the
+/// half-landed state is safe but useless. `#[allow(dead_code)]` is scoped to
+/// this one function so its removal is the reviewer's cue that the call site
+/// arrived.
+#[allow(dead_code)]
+pub(crate) fn record_https_carrier_session(
+    ctx: &dyn NativeContext,
+    connection: ObjectRef,
+    protocol: &str,
+    cipher: &str,
+    peer_chain_der: &[Vec<u8>],
+) {
+    let key = native_obj_key(ctx, connection);
+    https_carrier_sessions().lock().insert(
+        key,
+        HttpsCarrierSession {
+            protocol: protocol.to_string(),
+            cipher: cipher.to_string(),
+            peer_chain_der: peer_chain_der.to_vec(),
+        },
+    );
+}
+
+/// The recorded session for this carrier, CLONED out of the table before
+/// anything else happens.
+///
+/// Cloning rather than holding the guard is load-bearing: every caller below
+/// goes on to allocate Java objects and to `invoke_virtual` into Java, and a
+/// native that holds a process-global lock across a call back into bytecode is
+/// the lock cycle this project has already paid for once (`registry-guard
+/// across a blocking call`).
+fn https_carrier_session(
+    ctx: &dyn NativeContext,
+    connection: ObjectRef,
+) -> Option<HttpsCarrierSession> {
+    let key = native_obj_key(ctx, connection);
+    https_carrier_sessions().lock().get(&key).cloned()
+}
+
+/// HotSpot's exact refusal for any session accessor on a connection that has
+/// not completed a handshake -- see the transcript above. A real, catchable
+/// `java.lang.IllegalStateException`, not an `IOException` whose message merely
+/// reads like one: callers catch this by type.
+fn https_not_yet_open(ctx: &mut dyn NativeContext) -> MethodCallFailed {
+    let jmsg = ctx.create_string("connection not yet open");
+    match ctx.new_object_initialized(
+        "java/lang/IllegalStateException",
+        "(Ljava/lang/String;)V",
+        &[Value::Object(Some(jmsg))],
+    ) {
+        Ok(Some(Value::Object(Some(exc)))) => {
+            // The caller's Java frame has no catch-local root for this yet and
+            // `new_object_initialized` has already released its constructor
+            // pin -- same hand-off as `socket_ex`.
+            let exc_pin = ctx.pin_native_root(exc);
+            let exc = ctx.read_native_pin(exc_pin, exc);
+            MethodCallFailed::ExceptionThrown(exc)
+        }
+        Ok(_) => ioex("connection not yet open"),
+        Err(failed) => failed,
+    }
+}
+
+/// Materialise the recorded handshake as the same synthetic
+/// `javax/net/ssl/SSLSession` shape the hostname-verifier path builds, so the
+/// layout-aware accessors already registered in
+/// `t27_tls::register_ssl_session_real` read it correctly.
+///
+/// Deliberately NOT a second certificate decoder. `getPeerCertificates`,
+/// `getPeerPrincipal` and `getLocalPrincipal` are already implemented once, on
+/// `javax/net/ssl/SSLSession`; the accessors below delegate to them rather than
+/// re-deriving an X.509 subject from DER, which is the "thin direct helper
+/// reimplements the native" shape this workspace keeps finding.
+fn https_session_object(
+    ctx: &mut dyn NativeContext,
+    s: &HttpsCarrierSession,
+) -> Result<ObjectRef, MethodCallFailed> {
+    let session0 = try_alloc_concurrent_synthetic(
+        ctx,
+        "javax/net/ssl/SSLSession",
+        crate::phases_late::ssl_security::NEW13_SSL_SESS_FIELDS,
+    )?;
+    let session_pin = ctx.pin_native_root(session0);
+
+    // GC: each allocated argument must survive the allocations that follow it,
+    // so the session is re-read from its pin before every write.
+    let proto_s = ctx.create_string(&s.protocol);
+    let session = ctx.read_native_pin(session_pin, session0);
+    ctx.set_field(
+        session,
+        crate::phases_late::ssl_security::NEW13_SESS_PROTO,
+        Value::Object(Some(proto_s)),
+    );
+    let cipher_s = ctx.create_string(&s.cipher);
+    let session = ctx.read_native_pin(session_pin, session0);
+    ctx.set_field(
+        session,
+        crate::phases_late::ssl_security::NEW13_SESS_CIPHER,
+        Value::Object(Some(cipher_s)),
+    );
+    // -1: this connection owned its rustls state inside `perform` and was never
+    // registered in the `servlet` TLS id space, so there is no id to record.
+    // Every accessor that would consult it already tolerates a miss. Same value
+    // and same reason as `huc_verify_hostname`'s session.
+    ctx.set_field(
+        session,
+        crate::phases_late::ssl_security::NEW13_SESS_TLSID,
+        Value::Int(-1),
+    );
+    let session = ctx.read_native_pin(session_pin, session0);
+    crate::t27_tls::record_client_peer_chain(ctx, session, s.peer_chain_der.clone());
+    Ok(session)
+}
+
+/// The six `javax.net.ssl.HttpsURLConnection` session accessors, on BOTH
+/// carrier classes.
+///
+/// Registered on the abstract base as well as the Impl because the base is
+/// still reachable: `javax/net/ssl/HttpsURLConnection` remains a carrier for
+/// anything that constructed one directly, and its three abstract declarations
+/// have no Code attribute at all, so without a native there is nothing to run.
+///
+/// REGISTRATION ORDER. `register()` is last-write-wins, and
+/// `http_url_connection.rs`'s `register_one` DOES overwrite this file's
+/// registrations for the shared request surface (`connect`, `getResponseCode`,
+/// `getInputStream`, ... -- confirmed in a `--dump-native-registry` dump, where
+/// this file's rows for those read `owns_slot: false`). None of the six names
+/// below appear in `register_one`, so none of them can be overwritten by it.
+/// If a later change adds any of them there, THAT copy wins and this one goes
+/// silently dead -- check the dump, not the source order.
+fn register_https_session_accessors(r: &mut NativeMethodRegistry) {
+    // Bridge, explicitly and locally: these stand in for real JDK bytecode that
+    // exists and would work if `delegate` were populated. Set here rather than
+    // inherited from whatever category the enclosing registration scope happens
+    // to be in, so the `--dump-native-registry` kind for these six does not
+    // depend on where the call sits.
+    let __prev_cat = r.current_category();
+    r.set_category(NativeKind::Bridge);
+    for cls in [
+        "sun/net/www/protocol/https/HttpsURLConnectionImpl",
+        "javax/net/ssl/HttpsURLConnection",
+    ] {
+        r.register(cls, "getCipherSuite", "()Ljava/lang/String;", |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let Some(s) = https_carrier_session(ctx, this) else {
+                return Err(https_not_yet_open(ctx));
+            };
+            let out = ctx.create_string(&s.cipher);
+            Ok(Some(Value::Object(Some(out))))
+        });
+        r.register(
+            cls,
+            "getServerCertificates",
+            "()[Ljava/security/cert/Certificate;",
+            |ctx, args| {
+                let this = obj_arg(args, 0)?;
+                let Some(s) = https_carrier_session(ctx, this) else {
+                    return Err(https_not_yet_open(ctx));
+                };
+                let session = https_session_object(ctx, &s)?;
+                // `SSLSession.getPeerCertificates` is the single implementation
+                // of "decode this chain into java.security.cert.Certificate
+                // mirrors", and it already throws SSLPeerUnverifiedException
+                // for an empty chain -- the real-JDK contract, and the same one
+                // HttpsURLConnection.getServerCertificates declares.
+                ctx.invoke_virtual(
+                    session,
+                    "getPeerCertificates",
+                    "()[Ljava/security/cert/Certificate;",
+                    &[],
+                )
+            },
+        );
+        r.register(
+            cls,
+            "getLocalCertificates",
+            "()[Ljava/security/cert/Certificate;",
+            |ctx, args| {
+                let this = obj_arg(args, 0)?;
+                let Some(s) = https_carrier_session(ctx, this) else {
+                    return Err(https_not_yet_open(ctx));
+                };
+                let session = https_session_object(ctx, &s)?;
+                ctx.invoke_virtual(
+                    session,
+                    "getLocalCertificates",
+                    "()[Ljava/security/cert/Certificate;",
+                    &[],
+                )
+            },
+        );
+        r.register(
+            cls,
+            "getPeerPrincipal",
+            "()Ljava/security/Principal;",
+            |ctx, args| {
+                let this = obj_arg(args, 0)?;
+                let Some(s) = https_carrier_session(ctx, this) else {
+                    return Err(https_not_yet_open(ctx));
+                };
+                let session = https_session_object(ctx, &s)?;
+                ctx.invoke_virtual(session, "getPeerPrincipal", "()Ljava/security/Principal;", &[])
+            },
+        );
+        r.register(
+            cls,
+            "getLocalPrincipal",
+            "()Ljava/security/Principal;",
+            |ctx, args| {
+                let this = obj_arg(args, 0)?;
+                let Some(s) = https_carrier_session(ctx, this) else {
+                    return Err(https_not_yet_open(ctx));
+                };
+                let session = https_session_object(ctx, &s)?;
+                ctx.invoke_virtual(
+                    session,
+                    "getLocalPrincipal",
+                    "()Ljava/security/Principal;",
+                    &[],
+                )
+            },
+        );
+        r.register(cls, "getSSLSession", "()Ljava/util/Optional;", |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let Some(s) = https_carrier_session(ctx, this) else {
+                // NOT `Optional.empty()`. HotSpot throws here too (transcript
+                // above), and the empty Optional is precisely the silent lie
+                // this change exists to remove.
+                return Err(https_not_yet_open(ctx));
+            };
+            let session = https_session_object(ctx, &s)?;
+            let session_pin = ctx.pin_native_root(session);
+            // `java.util.Optional` has exactly one instance field, `value`, at
+            // slot 0 -- this is `Optional.ofNullable(session)` in the real
+            // layout, not the two-slot flag+value shape `http2.rs` uses.
+            let opt = try_alloc_concurrent_synthetic(ctx, "java/util/Optional", 1)?;
+            let session = ctx.read_native_pin(session_pin, session);
+            ctx.set_field(opt, 0, Value::Object(Some(session)));
+            Ok(Some(Value::Object(Some(opt))))
+        });
+    }
+    r.set_category(__prev_cat);
+}
+
 fn register_re4_url_http(r: &mut NativeMethodRegistry) {
     let url = "java/net/URL";
+    register_https_session_accessors(r);
 
     // ---- java.net.URL(String) ------------------------------------------
     //
@@ -8686,7 +9014,24 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
                 // the carrier with `instanceof HttpsURLConnection`.  Returning
                 // the plain HTTP base here skipped that whole configuration
                 // branch, so its permissive TrustManager was never created.
-                "javax/net/ssl/HttpsURLConnection"
+                //
+                // The CONCRETE subclass is what the real JDK returns and it
+                // still satisfies that `instanceof` -- `javap` on HotSpot 25
+                // confirms
+                //   sun.net.www.protocol.https.HttpsURLConnectionImpl
+                //       extends javax.net.ssl.HttpsURLConnection
+                // -- so the Spring branch above is preserved. Handing back the
+                // ABSTRACT base instead made getCipherSuite(),
+                // getLocalCertificates() and getServerCertificates(), all three
+                // DECLARED ABSTRACT on it, throw
+                // `AbstractMethodError: ... has no Code attribute`. See
+                // `https_session_accessors` below, which is the other half of
+                // this change and must not be separated from it: the Impl's
+                // own bytecode is `getfield delegate; invokevirtual ...` for
+                // every one of those methods, and this carrier is allocated
+                // rather than constructed, so `delegate` is null and the swap
+                // alone would only trade the AbstractMethodError for an NPE.
+                "sun/net/www/protocol/https/HttpsURLConnectionImpl"
             } else {
                 "java/net/HttpURLConnection"
             };

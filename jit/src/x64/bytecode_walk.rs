@@ -1761,69 +1761,86 @@ impl Compiler {
                     pc += 1;
                 }
 
-                // aastore — store reference to Object[] array (inline store + barrier-only call)
+                // aastore — store reference into a reference array, via the
+                // `jit_aastore` helper (vm/src/jit/helpers.rs).
                 //
-                // R20 / HIGH-5 (see docs/PRESENTATION.md): replace the full `jit_aastore`
-                // helper call with an inline `MOV QWORD [array + index*8 + HEADER_SIZE], val`
-                // followed by a CALL to the much-cheaper `write_barrier` helper. The barrier
-                // helper short-circuits when `val == 0` (null), so we don't need an inline
-                // null check. Array layout is compact 8-byte pointers (matches the already-
-                // inlined `aaload` path).
+                // ## Why this is a helper call and not the inline store
                 //
-                // ArrayStoreException note: the current `jit_aastore` helper does NOT enforce
-                // the ASE check (the interpreter does it via `set_array_element`). This inline
-                // path matches the helper's behavior exactly — no regression. Wiring an inline
-                // ASE check is a follow-up that needs type-narrowing infrastructure (not yet
-                // tracked in this JIT).
+                // It used to be inline. R20 / HIGH-5 (docs/PRESENTATION.md)
+                // replaced the `jit_aastore` call with an inline
+                // `MOV QWORD [array + index*8 + HEADER_SIZE], val` plus a
+                // barrier-only helper call, and justified dropping the helper
+                // with this comment:
+                //
+                //     "the current `jit_aastore` helper does NOT enforce the
+                //      ASE check (the interpreter does it via
+                //      `set_array_element`). This inline path matches the
+                //      helper's behavior exactly — no regression."
+                //
+                // That premise was TRUE when it was written and was FALSIFIED
+                // later, silently, when the JVMS §aastore covariance check
+                // landed inside `jit_aastore` — because a premise stated in a
+                // comment is not a compile-time link. From that moment the
+                // compiled tier performed every reference array store
+                // unconditionally while the interpreter refused the illegal
+                // ones, and nothing failed to build.
+                //
+                // The consequence is not a wrong answer, it is heap type
+                // confusion: `Object[] a = new String[1]; a[0] = anInteger;`
+                // leaves an `Integer` inside a `String[]`, so a later
+                // `aaload`-and-use reads a `String`-typed reference to an
+                // `Integer` with no cast to catch it. Under a precise GC that
+                // is a memory-safety-relevant corruption, not an etiquette
+                // problem — and it is TIER-DEPENDENT: correct for the first
+                // ~500 executions and wrong once the method tiers up. See
+                // docs/known-issues/jdk-only/W7-38-jit-aastore-store-check.md.
+                //
+                // ## Why the whole opcode routes to the helper
+                //
+                // `jit_aastore` is not an ASE-check helper, it is the complete
+                // opcode: null check (pending-NPE, `ASTORE_OBJECT` action),
+                // bounds check (pending-AIOOBE with index+length), the JVMS
+                // covariance check routed through `throw_runtime_error` so the
+                // message carries HotSpot's EXTERNAL class name, the SATB
+                // pre-write barrier, the store, and the card mark. Calling it
+                // restores all six in their correct order with no new helper
+                // and no ABI change — `helpers.aastore` has been populated all
+                // along (the slot was simply never emitted against).
+                //
+                // A cheaper shape exists — keep this inline lowering and call
+                // a *check-only* helper before the store — but it needs a new
+                // helper + `jit-api` ABI slot, i.e. a coordinated change
+                // across three crates. That is the throughput follow-up; it is
+                // deliberately not bundled with the correctness fix, because
+                // the correctness fix has to be landable on its own. The cost
+                // being paid back is one call per reference array store.
+                //
+                // ## Ordering
+                //
+                // `flush_scratch_registers` first: it rewrites every
+                // register-resident (`Scratch`/`Xmm`) stack slot to a frame
+                // slot, so the three `load_slot_to_reg` calls below all read
+                // from memory and cannot clobber one another's source
+                // register regardless of ABI (`ARG_REGS` is RCX/RDX/R8/R9 on
+                // Windows, RDI/RSI/RDX/RCX on SysV).
+                //
+                // `emit_post_invoke_exception_check(b'V')` drains the pending
+                // NPE / AIOOBE / ArrayStoreException the helper may have set.
+                // 0x53 is a one-byte opcode, so the snapshot keeps THIS pc as
+                // the throw pc, which is what the handler `[start_pc, end_pc)`
+                // range test needs (see the note at that function).
                 0x53 => {
                     self.flush_scratch_registers();
                     let val_slot = self.pop_stack();
                     let index_slot = self.pop_stack();
                     let array_slot = self.pop_stack();
-                    self.load_slot_to_reg(RAX, array_slot);
-                    self.load_slot_to_reg(RCX, index_slot);
-                    // Round-8 CRIT fix: NPE on null array (JVMS §aastore).
-                    self.emit_null_check_array_store_at(code, pc);
-                    self.emit_bounds_check(pc);
-                    // Round-7 fix (CRIT, UAF in JIT): SATB pre-write barrier.
-                    // Inline-load the OLD reference at the slot and pipe it
-                    // through `jit_satb_pre_write_barrier(vm_ptr, old_ref)`
-                    // BEFORE the inline store overwrites it. The helper
-                    // short-circuits via a single Acquire load when no
-                    // concurrent mark cycle is in flight (`SatbQueue::
-                    // is_active() == false`), so the steady-state cost is
-                    // just an inline load + a not-taken-branch call. Without
-                    // this, a still-live reference overwritten by JIT code
-                    // during concurrent marking would be silently dropped by
-                    // the marker → use-after-free on the next mixed
-                    // evacuation (audit: history/round7-gc.md §1).
-                    //
-                    // Save RAX (array) / RCX (index) into argument registers
-                    // first since `emit_ref_aload_regs` clobbers RAX with
-                    // the loaded value.
-                    self.emit_ref_aload_regs(); // RAX = OLD ref value
+                    // jit_aastore(vm_ptr, array_ptr, index, val)
                     self.emit_load_local(ARG_REGS[0], self.heap_local_offset);
-                    self.emit_mov_reg_reg(ARG_REGS[1], RAX);
-                    self.emit_call_absolute(self.helpers.satb_pre_write_barrier);
-                    // Reload array / index / new value (helper call may have
-                    // clobbered scratch registers including RAX, RCX, RDX).
-                    self.load_slot_to_reg(RAX, array_slot);
-                    self.load_slot_to_reg(RCX, index_slot);
-                    self.load_slot_to_reg(RDX, val_slot);
-                    // Inline store: MOV QWORD [RAX + RCX*8 + HEADER_SIZE], RDX
-                    self.emit_ref_astore_regs();
-                    // Post-store publication. Generational GC exposes a stable
-                    // atomic card map, so RAX=array/RDX=value can mark it
-                    // inline without a helper transition. G1/ZGC retain their
-                    // collector-specific helper.
-                    if self.inline_card_mark_available() {
-                        self.emit_inline_card_mark_regs(RAX, RDX);
-                    } else {
-                        self.emit_load_local(ARG_REGS[0], self.heap_local_offset);
-                        self.load_slot_to_reg(ARG_REGS[1], array_slot);
-                        self.load_slot_to_reg(ARG_REGS[2], val_slot);
-                        self.emit_call_absolute(self.helpers.write_barrier);
-                    }
+                    self.load_slot_to_reg(ARG_REGS[1], array_slot);
+                    self.load_slot_to_reg(ARG_REGS[2], index_slot);
+                    self.load_slot_to_reg(ARG_REGS[3], val_slot);
+                    self.emit_call_absolute(self.helpers.aastore);
+                    self.emit_post_invoke_exception_check(b'V');
                     pc += 1;
                 }
 

@@ -1,6 +1,14 @@
 # W7-51 — the vacuous-test population, measured instead of sampled
 
-Status: **W6-5's two open residuals are closed structurally**, and a systematic
+Status: **OPEN. Round 5 (2026-08-12, lane C9) asked whether this record can be
+closed and the answer is no.** Thirteen tests that cannot fail are still in the
+tree, verified by symbol at this commit, and §6.3's proposed detector — the
+cheap textual tell the expensive sweep produced as a by-product — has been
+**measured for the first time and its recall is 3 of the 9 findings it claims to
+name**. Read §7 before working from §6.3 or from any "still open" list here.
+
+Status of the original round: **W6-5's two open residuals are closed
+structurally**, and a systematic
 sweep of the whole test surface found **67 further findings** plus one
 population of 23. Round 1 (`W6-5-vacuous-tests.md`) found six by accident, while
 reading source for something else. This round asked the question on purpose.
@@ -814,3 +822,161 @@ the production function is provably absent from the call path (that is a
 structural fact, not a judgement), and weaker for F13/F14/F16/F25, where the
 claim is only that **no assertion exists**. That one needs no mutation: a test
 with no assertion cannot fail, and F13, F14, F16 and F25 have none.
+
+---
+
+## 7. Round 5 (2026-08-12, lane C9) — can this record be closed? No, and the reason is one level up again
+
+**Method.** Read-only. Every §6.2 symbol re-derived against the working tree by
+`git grep -l "fn <symbol>"` — symbol, not line number, since §6 already
+established that every line number in §2.2/§2.3 has drifted. Then the thing
+§6.3 asked for and nobody did: **the detector was executed.** No cargo, and no
+Rust changes to any file this lane does not own.
+
+### 7.1 The thirteen are still there — verified, not assumed
+
+All twelve symbols of §6.2, plus §6.3's `vtable.rs` addition, resolve at this
+commit, each in the file §6 names:
+
+```
+test_secure_gaussian_uses_csprng_and_is_finite       native-builtins/src/securerandom.rs
+nio_selector_indefinite_block_path_honors_wakeup     native-io/src/nio_selector.rs
+path_rejects_parent_segment                          native-builtins/src/jboss_resource_loader.rs
+wp3_6_max_direct_transfer_size_is_int_max            native-io/src/file_channel.rs
+system_init_phase1_is_registered_as_native           vm/tests/wave3_scanner.rs
+zip_comment_round_trips                              native-io/src/zip_real_jar.rs
+rg9_tiered_manager_exists                            jit/src/lib.rs
+p89_cross_region_rset_tracking                       gc/src/g1.rs
+p89_soft_ref_retained_with_free_heap                 gc/src/g1.rs
+jvmti_hooks_off_by_default                           classloading/src/class_manager.rs
+values_equal_null_null / _ints / _long / _mixed_types  native-collections/src/lib.rs
+test_serialization_not_supported_returns_err         native-builtins/src/serialization.rs
+t10_9_a_adapter_preserves_empty_dispatch             vm/src/runtime/vtable.rs
+```
+
+`alloc_zero_returns_some` resolves nowhere and `alloc_zero_is_refused` resolves
+in `jit/src/platform.rs` — §6.1's "renamed, *the old name was the lie*" row is
+confirmed. F27's `gpu-offload` gate, both `churn=(n > 0)` booleans
+(`RForNameGcStress.java:135`, `ROverlaySystemGcStress.java:193`), the two
+arithmetic tolerances (`types/src/compact_value.rs:2852`, `:2857`) and the
+`jdk-only-strict-probes.sh` absent-arm agreement (`:376`, `:402`) are all
+verbatim. **Nothing on this record's open list has moved.**
+
+### 7.2 The finding: §6.3's detector was never run, and it does not work
+
+§6.3's whole point is that the expensive census produced a cheap detector as a
+by-product and nobody consumed it. It then states that detector's recall as a
+fact:
+
+> Grepping **that sentence** across the eight first-party crates (excluding
+> `vendor/`) returns 16 hits in ~10 seconds. It names every one of F1, F5, F6,
+> F7, F9, F18–F21 and F22–F24 — and at least one the sweep did not report
+> [`t10_9_a_adapter_preserves_empty_dispatch`].
+
+Executed here for the first time. The hit COUNT reproduces — a widened form of
+the tell returns 16 hits across the first-party crates in about ten seconds.
+**What those hits NAME does not.** The exact phrase occurs in four files:
+
+| file | finding it names |
+| --- | --- |
+| `native-builtins/src/securerandom.rs:1815` | F1 |
+| `native-builtins/src/serialization.rs:5913` | F22–F24 |
+| `native-io/src/file_channel.rs:1825` | F7 |
+| `native-builtins/src/xnio_io_thread.rs:1458` | not an F-finding |
+
+and in **none** of `jboss_resource_loader.rs` (F5), `ironjacamar_pool.rs` (F6),
+`zip_real_jar.rs` (F9), `native-collections/src/lib.rs` (F18–F21),
+`nio_selector.rs` (F3), `wave3_scanner.rs` (F8), `jit/src/lib.rs` (F11),
+`g1.rs` (F13/F14), `class_manager.rs` (F16), `gen_heap.rs` (F25) — **or
+`vtable.rs`, the one case §6.3 offers as its own demonstration.** Measured
+recall: **3 of the 9 findings claimed, and 0 of the 2 it is demonstrated on.**
+
+**Why, and this is the durable lesson.** The two sentences the detector keys on
+are gone from the tree:
+
+```
+$ git grep -c "we duplicate the check here"      -- '*.rs'    ->  (no hits)
+$ git grep -c "simulate the conversion manually" -- '*.rs'    ->  (no hits)
+```
+
+Both were replaced by the round-3/4 annotation pass. `jboss_resource_loader.rs`
+now opens its test with `**THIS TEST CANNOT FAIL, and it is standing in for a
+SECURITY control.**`, and `vtable.rs` with `**THIS TEST CANNOT FAIL, and its
+name overstates what it covers.**` — strictly better prose, written by someone
+fixing this exact defect, which **destroyed the detector's recall as a side
+effect.** A detector keyed on prose is invalidated by improving the prose.
+
+So §6.3's conclusion survives and its instrument does not: the census did
+produce a cheap detector, nobody ran it, and by the time anyone did, the repair
+pass had disarmed it. **A detector whose recall is asserted rather than measured
+is the same species this record is about — a check that reads as good news
+because nothing ever made it speak.** That is the third occurrence inside this
+record's own repairs (§3's deleted `rounds.capped=(12 > 0)`, W6-5 §3.4, here).
+
+### 7.3 The repair: a stable marker plus a positive control
+
+Prose is the wrong key. Two sites have already independently converged on a
+literal, stable one — `THIS TEST CANNOT FAIL` — and it is greppable, but it is
+on **2 of the 13**:
+
+```
+$ git grep -c "THIS TEST CANNOT FAIL" -- '*.rs' ':!*/vendor/*'
+native-builtins/src/jboss_resource_loader.rs:1
+vm/src/runtime/vtable.rs:1
+```
+
+**NOMINATION (this lane owns neither file).** Adopt that literal as the campaign
+marker, put it on all thirteen, and gate it — with the gate's **positive control
+built in**, which is the half this campaign keeps omitting:
+
+* `vm/tests/vacuous_marker_census.rs`, reached by the `cargo test --workspace`
+  step `.github/workflows/ci.yml` already runs. It carries the thirteen
+  `(symbol, file)` pairs of §7.1 and asserts, for each, that the file contains
+  both the symbol and the marker.
+* **The positive control, which is the entire point:** the census must also
+  assert `found >= 13`. A gate written only as "no unmarked vacuous test exists"
+  passes identically when the search matched nothing at all — a wrong path, a
+  renamed crate, a `ripgrep` that is not installed, a stray `|| true`. All three
+  of this campaign's calibrated instances of that failure — the CI gate whose
+  `|| true` made "clean tree" and "search failed" identical, the mutation test
+  written against a `ripgrep` branch on a host with no `ripgrep`, and the
+  `ArrayDeque` negative control that drove only the ends of the deque and so
+  never called the method under test — are one defect: **the machinery's own
+  silence read as a pass.** An assertion with a positive floor cannot be
+  satisfied by silence.
+* Clearing a row is what makes the test green again — the ratchet shape §1.1
+  established and the reason its `probe_fixture_census.rs` works. A marker
+  removed because the test was genuinely repaired is a **deletion from the
+  table, in the same commit**, or the gate stays red.
+
+This does not repair the thirteen. It makes their number honest and makes a
+silent failure of the accounting loud — the strictly smaller claim this record
+is entitled to make without a build.
+
+### 7.4 Disposition — why W7-51 cannot be closed
+
+| blocker | state at this commit | measured how |
+| --- | --- | --- |
+| the thirteen tests that cannot fail | **all present, verbatim** | symbol grep, §7.1 |
+| §6.3's detector | **recall 3/9, disarmed by the annotation pass** | executed, §7.2 |
+| 11 of the 13 carry no greppable marker | **unmarked** | §7.3 |
+| the 16 missing `apps/` fixtures (§1.1) | unchanged | §1.1's own baseline |
+| F27 `gpu-offload` placement | unchanged | `gpu_residency.rs:8` |
+| `jdk-only-strict-probes.sh` absent-arm agreement | unchanged, **and still argued for in its own comments** | `:376`, `:402` |
+| the two `churn=(n > 0)` booleans | verbatim | §7.1 |
+| the two arithmetic tolerances | verbatim | §7.1 |
+
+**Closing this record requires a build, and this lane could not run one.** Every
+row above is a grep or a reading against the tree; none is a mutation, and
+§4.3's caveat still governs. The honest position: W7-51 is a correct and
+unusually well-evidenced description of a population that has now been
+re-measured four times and repaired twice, and **both repairs were
+documentation.** What it is still missing is the thing it names in its own §5 —
+*a vacuous test is not found by reading tests; it is found by breaking the code
+they claim to cover* — applied to the thirteen, one `cargo test` at a time.
+
+**One thing round 5 asks the next lane NOT to do:** do not re-derive §6.2. It
+has now been verified against the tree twice, by symbol, and both passes found
+the same list unchanged. A third reading buys nothing. Land §7.3's gate, then
+break one of the thirteen and watch it stay green — that is the only evidence
+this record does not already have.
