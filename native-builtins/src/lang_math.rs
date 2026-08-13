@@ -3391,47 +3391,19 @@ pub(crate) fn native_short_parse_short(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
-    let s_obj = match args.first() {
-        Some(Value::Object(Some(obj))) => *obj,
-        _ => {
-            return Err(cratonvm_types::error::RuntimeError::NumberFormatException {
-                message: "null".to_string(),
-            }
-            .into())
-        }
-    };
-    let text = ctx.read_string(s_obj).unwrap_or_default();
-    match text.trim().parse::<i16>() {
-        Ok(v) => Ok(Some(Value::Int(v as i32))),
-        Err(_) => Err(cratonvm_types::error::RuntimeError::NumberFormatException {
-            message: format!("For input string: \"{text}\""),
-        }
-        .into()),
-    }
+    let text = read_string_arg_nfe(ctx, args)?;
+    let v = java_parse_narrow(&text, 10, i16::MIN as i64, i16::MAX as i64)?;
+    Ok(Some(Value::Int(v as i32)))
 }
 
 pub(crate) fn native_short_parse_short_radix(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
-    let s_obj = match args.first() {
-        Some(Value::Object(Some(obj))) => *obj,
-        _ => {
-            return Err(cratonvm_types::error::RuntimeError::NumberFormatException {
-                message: "null".to_string(),
-            }
-            .into())
-        }
-    };
+    let text = read_string_arg_nfe(ctx, args)?;
     let radix = parse_radix_arg(args)?;
-    let text = ctx.read_string(s_obj).unwrap_or_default();
-    match i16::from_str_radix(text.trim(), radix) {
-        Ok(v) => Ok(Some(Value::Int(v as i32))),
-        Err(_) => Err(cratonvm_types::error::RuntimeError::NumberFormatException {
-            message: format!("For input string: \"{text}\""),
-        }
-        .into()),
-    }
+    let v = java_parse_narrow(&text, radix, i16::MIN as i64, i16::MAX as i64)?;
+    Ok(Some(Value::Int(v as i32)))
 }
 
 pub(crate) fn native_integer_to_hex_string(
@@ -3582,23 +3554,9 @@ pub(crate) fn native_long_parse_long(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
-    let s_obj = match args.first() {
-        Some(Value::Object(Some(obj))) => *obj,
-        _ => {
-            return Err(cratonvm_types::error::RuntimeError::NumberFormatException {
-                message: "null".to_string(),
-            }
-            .into())
-        }
-    };
-    let text = ctx.read_string(s_obj).unwrap_or_default();
-    match text.trim().parse::<i64>() {
-        Ok(v) => Ok(Some(Value::Long(v))),
-        Err(_) => Err(cratonvm_types::error::RuntimeError::NumberFormatException {
-            message: format!("For input string: \"{text}\""),
-        }
-        .into()),
-    }
+    let text = read_string_arg_nfe(ctx, args)?;
+    let v = java_parse_into(&text, 10, i64::MIN, i64::MAX, false)?;
+    Ok(Some(Value::Long(v)))
 }
 
 pub(crate) fn native_long_nlz(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -4723,24 +4681,10 @@ pub(crate) fn native_long_parse_long_radix(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
-    let s_obj = match args.first() {
-        Some(Value::Object(Some(obj))) => *obj,
-        _ => {
-            return Err(cratonvm_types::error::RuntimeError::NumberFormatException {
-                message: "null".to_string(),
-            }
-            .into())
-        }
-    };
+    let text = read_string_arg_nfe(ctx, args)?;
     let radix = parse_radix_arg(args)?;
-    let text = ctx.read_string(s_obj).unwrap_or_default();
-    match i64::from_str_radix(text.trim(), radix) {
-        Ok(v) => Ok(Some(Value::Long(v))),
-        Err(_) => Err(cratonvm_types::error::RuntimeError::NumberFormatException {
-            message: format!("For input string: \"{text}\""),
-        }
-        .into()),
-    }
+    let v = java_parse_into(&text, radix, i64::MIN, i64::MAX, false)?;
+    Ok(Some(Value::Long(v)))
 }
 
 /// `Long.toString(long, int)` — THIS is the body that runs; same

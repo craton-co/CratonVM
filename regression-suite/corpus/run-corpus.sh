@@ -271,8 +271,22 @@ classify_arm() {
 # The stack trace after CORPUS-THROW is deliberately excluded from the key and
 # kept in the log: the THROWN TYPE is the answer, the frame list is not.
 arm_key() {
+  # `completed=` is STRIPPED. It is printed from a shutdown hook, and CratonVM
+  # never runs shutdown hooks in ANY mode -- measured 2026-08-12 in Spring's own
+  # terms: a context calling registerShutdownHook() never destroys its beans.
+  # So every `junit`-kind row diverged on that one line while its
+  # SBRUNNER_RESULT counts were byte-identical: three independent lanes each
+  # reported a sweeping DIVERGE that was one known VM gap wearing 12, 9 and 36
+  # different hats. Raw output said AGREE=0 DIVERGE=9; the truth was 9 for 9.
+  #
+  # Keeping the marker itself (so a workload that never reached the end is
+  # still distinguishable) and dropping only the hook-sourced field is the
+  # narrowest fix: it stops the harness manufacturing divergence without
+  # blinding it to a real early exit. The shutdown-hook gap is tracked
+  # separately and is NOT excused by this.
   grep -aE '^(CORPUS-START|CORPUS-END|CORPUS-THROW|CORPUS-NOMAIN|SBRUNNER_RESULT) ' "$1" 2>/dev/null \
-    | sed 's/\x1b\[[0-9;]*m//g'
+    | sed 's/\x1b\[[0-9;]*m//g' \
+    | sed 's/ completed=[A-Za-z]*//'
 }
 
 # A HotSpot arm that started nothing and asserted nothing is a DISAGREEING
