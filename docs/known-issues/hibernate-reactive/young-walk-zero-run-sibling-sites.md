@@ -1,112 +1,134 @@
 # The young walk treats a run of EMPTY objects as corruption at other sites
 
-**Status:** the parallel-sweep half is **RESOLVED** (2026-08-13):
-`par_accepts == par_attempts` on every cycle of every run, and all seven
-chunk-bail reasons and all three zero-run refusal reasons read zero. **Five
-latent sites remain** — walks that still misread the shape but that a census
-measured at exactly zero on the only repro available. Those are what keeps this
-page open.
+**Status:** the two sites that can be reached from a real workload are
+**RESOLVED** (2026-08-13). **Three remain**, and the reason they remain is now
+precise: they are never entered at all on any workload reachable from this
+repro, so no change to them can be measured. A separate finding — phantom
+extents under memory pressure — is split out at the bottom.
 
 ## Background
 
-An empty object — `ClassId(0)`, `kind = Object` (tag 0), `num_slots = 0` — is
+An empty object — `ClassId(0)`, `kind = Object`, `num_slots = 0` — is
 HEADER_SIZE all-zero bytes, because `MARK_NEUTRAL`, `ObjectKind::Object` and
 `ArrayElementType::Reference` are all `0`. Eight `zero_run_end` callers in
 `gc/src/gen_heap.rs` shared the rule "an all-zero run of at least HEADER_SIZE at
 a walk-grid offset is evidence the grid broke", and for that shape the rule is a
-false positive.
+false positive. Four waves have now closed five of them.
 
-Three waves closed it, each one narrowing the question with a census rather than
-a guess:
+## What "measured at zero" was hiding
 
-1. the sequential sweep's copy — the hang, `young-sweep-empty-object-run-unwind-20260812-FIXED`;
-2. `sweep_chunk` and `clear_all_mark_bits_in_arena` — the two of seven siblings a
-   census showed firing;
-3. the ragged tail, below.
+The previous revision of this page recorded five sites at zero anomaly hits and
+concluded they were inert. Two separate instrument errors were behind that, and
+both are worth keeping in mind before quoting a zero:
 
-## Wave 3: which check, and then which condition
+**1. A zero anomaly count does not distinguish "ran and did not see it" from
+"never ran".** `YOUNG_WALK_ENTRIES` now counts entries per walk. At the default
+`--Xmx 1500m`, all five read **0 entries** — none of them execute at all. The
+two inside `selective_on` need PROMOTION_AGE to be reachable, and after the
+wave-1..3 fixes the workload does so few young collections (2–4 for a whole
+run) that nothing ever ages into promotion. `sp_sweeps=3 sp_selective=0` says it
+directly.
 
-After wave 2 the parallel sweep was accepted on ~74% of attempts. `par_accepts`
-is a per-cycle verdict over seven different checks, and one `None` from any
-chunk discards the whole attempt, so the shortfall named nothing. Splitting it
-(`PAR_CHUNK_BAILS`) over eight runs:
+**2. The counter I quoted could not see the site I was quoting it about.**
+`zero_spans` (`SWEEP_ZERO_SPAN_HITS`) is incremented only in the sequential main
+sweep walk. The evacuation pre-pass has its own, separately-written zero-run
+branch that incremented nothing. Reading `zero_spans=0` and concluding "the zero
+run is not what stops the pre-pass" was reading a counter from a different
+walk. This is the same failure as the ordering trap recorded in the wave-3
+section: an instrument that cannot answer the question returns a confident zero.
+
+## Reaching them, and what was there
+
+Shrinking the heap makes selective promotion reachable. `--Xmx 320m / 450m /
+700m` on `org.hibernate.reactive.BatchingConnectionTest`,
+`-XX:+UseGenerationalGC`:
+
+| | 700m | 450m | 320m |
+|---|---|---|---|
+| `evac_prepass` entries | 3 | 4 | 6 |
+| `fixup_3a` entries | 2 | 2 | 5 |
+| `mark_y2o` / `fixup_yo` / `walk_young` | 0 | 0 | 0 |
+| `sp_evacuated` | 162 002 | 235 764 | 83 221 |
+
+With the pre-pass finally running, `EVAC_UNWIND_REASONS` says what stops it —
+and it is the benign shape after all:
 
 ```
-overshoot=0 gap_filler=0 zero_span=26..85 bad_size=0 hole_crossing=0
-phantom=0 anchor_miss=0
+evac_unwind: overshoot=0 zero_span=1..4537 bad_size=0 hole_crossing=0
+             candidates_dropped=3328..162615
 ```
 
-**Every** bail was the zero run. Splitting *that* (`ZERO_RUN_REFUSALS`):
+Every unwind is the zero run. **Between 3 328 and 162 615 promotion candidates
+were discarded per run** — and under a permanent non-moving sweep, selective
+promotion is the young generation's only exit for live data. The first revision
+of this page claimed exactly this and was retracted on the faulty census above;
+it was right.
 
-```
-misaligned=4..8 live_inside=0 implausible_next=0
-```
+## Fix
 
-**Every** refusal was the alignment test — the predicate's cheapest condition,
-and the one carrying the least evidence.
+`zero_run_empty_object_resume` applied at both passes, plus the `vouched_live`
+escape each was also missing. Both have `side_sorted` in scope, so the argument
+is the one already validated at the three earlier sites — with a second reason
+on top that is specific to these two: **an empty object has no fields**, so a
+run of them holds nothing for the evacuation pass to promote or age, and nothing
+for the (3a) pass to rewrite.
 
-### The trap in that second census
+ABBA-interleaved, wave3/wave4/wave4/wave3, at two heap sizes, two rounds each
+(16 runs, all `ok=61 failed=0`):
 
-`live_inside=0` did **not** mean no live base was inside the run. The alignment
-test ran first and returned immediately, so the informative check never got to
-ask. A cheap test ordered in front of an expensive one makes the expensive one's
-zero unreadable, and that zero is exactly what a reader will quote. The
-predicate now truncates first, so both remaining conditions judge the same
-boundary and their counts mean what they say.
-
-### What a ragged run actually is
-
-A run can only be ragged by 8 bytes — the walk is word-granular. That happens
-when the object *after* the empty ones also has a zero first word, i.e. it is
-itself a `ClassId(0)` empty object whose **mark word** is not zero.
-`zero_run_end` stops 8 bytes inside that header, so `run_end` is not an object
-start — but `cursor + n * HEADER_SIZE` is, and it is precisely that object's
-base.
-
-A one-off probe classified every ragged tail over six runs as neither
-side-marked, nor header-marked, nor aged: in practice it is a minted identity
-hash or a lock word, i.e. a **dead** empty object that was used before it died.
-So truncating does not merely unblock the walk, it resumes on garbage the sweep
-then reclaims.
-
-The first attempt at this test asserted the wrong mechanism — that the tail was
-an *interpreter*-allocated object, whose mark word was assumed non-zero. The
-fixture assertion (`the_interpreter_empty_object_has_a_zero_first_word_and_a_live_second`)
-failed immediately: the bare constructor yields a wholly zero header, so the run
-it was meant to make ragged was not ragged at all. That assertion is kept.
-
-### Result
-
-Truncating the run down to the last whole slot, and judging *that* boundary
-against the live-base and plausible-next-header checks:
-
-| six runs, same class, `-XX:+UseGenerationalGC` | before wave 3 | after |
+| | wave 3 | wave 4 |
 |---|---|---|
-| `par_accepts` / `par_attempts` | 17 / 23 | **4/4, 4/4, 2/2, 3/3, 2/2, 3/3** |
-| chunk bails, all seven reasons | `zero_span` 26–85 | all **0** |
-| zero-run refusals, all three | `misaligned` 4–8 | all **0** |
-| `zero_spans` (sequential unwind path) | 2–63 | **0** |
-| `phantom_extents` / `live_in_dead` | 0 / 0 | 0 / 0 |
-
-`zero_spans=0` is the stronger statement: the sequential walk's unwind path —
-the thing that caused the original hang — no longer fires at all on this
-workload.
+| `evac_unwind zero_span` | 1 – 1 297 per run | **0, all 8 runs** |
+| `candidates_dropped` | 3 328 – 162 615 per run | **0, all 8 runs** |
 
 ## Still open
 
-**Five latent sites.** The selective-promotion evacuation pre-pass, the second
-pre-pass walk, `mark_young_to_old_refs`, `fixup_young_old_refs` and
-`walk_young_objects` still carry the original rule. A census measured each at
-exactly **0** on this repro, so wiring them to `zero_run_empty_object_resume`
-would be an unmeasurable change at real risk — but the shape is still misread
-there, and a workload that reaches them would pay for it. The predicate they
-need already exists and returns a resume point; what each one lacks is the live
-set to pass it (`walk_young_objects` has none at all).
+### Three sites that cannot be reached
 
-**Skipped empty objects are never reclaimed.** A run that the predicate accepts
-is stepped over, not parsed — deliberately, since the span may be a live
-allocation whose header a stale register-held reference clobbered. That leaves
-16 bytes per dead empty object retained until a moving cycle resets from-space.
-Bounded and self-limiting (the same objects are re-skipped each cycle rather than
-accumulating), and untouched by these three waves. Parsing them instead would
-reclaim it, and is a separate safety argument from the one made here.
+`mark_young_to_old_refs`, `fixup_young_old_refs` and `walk_young_objects` read
+**0 entries** at every heap size tried. The first two are on the major-GC /
+compaction path (`sp_defrag=0` throughout) and the third is the diagnostic walk
+behind `jcmd GC.heap_info` / `GC.class_histogram`. Wiring them would be an
+unmeasurable change, and unlike the two just fixed, none of them has a live set
+to pass the predicate — `mark_young_to_old_refs` has `walked_bases` (the bases
+the sweep verified, arguably a better on-grid oracle), `fixup_young_old_refs`
+has nothing, `walk_young_objects` has nothing. Whoever needs them should first
+find a workload that enters them; `YOUNG_WALK_ENTRIES` makes that a one-line
+check rather than a guess.
+
+### Phantom extents under memory pressure — NEW, unexplained
+
+Found while reaching for the sites above, and not part of this family:
+
+| | 700m | 450m | 320m |
+|---|---|---|---|
+| `phantom_extents` (sequential walk) | 0 | 224 | 847 |
+| `par_accepts` / `par_attempts` | 8/8 | 3/13 | 2/20 |
+| chunk bails, reason | — | `phantom=12` | `phantom=66` |
+
+Every bail is reason `phantom` — a header whose extent subsumes a marked object
+base, which is the corruption family, not a benign shape (`zero_span=0` and all
+three zero-run refusals 0 at every size). It appears only when selective
+promotion is active, which makes forwarded headers the obvious suspect —
+**ruled out**: `ObjectHeader::make_forwarded` is
+`quartet_of(prev) | target | MARK_FORWARDED`, so kind, element type, `gc_age`
+and `gc_flags` all survive forwarding and `gen_object_total_size` sizes a
+forwarded header correctly. Sample reports:
+
+```
+offset=513936 span_bytes=144 span_head_class_id=0    kind_byte=1 num_slots=16
+             victim_interior_offset=32  last_anchor_off=513296
+offset=518792 span_bytes=272 span_head_class_id=65   kind_byte=0 num_slots=16
+             victim_interior_offset=128 last_anchor_off=518440
+```
+
+`live_in_dead=0` throughout, so the guard is catching it and re-anchoring before
+anything is freed — it is a throughput cost and a grid-integrity signal, not a
+known reclamation bug. Repro: any batch-01 class at `--Xmx 320m` under
+`-XX:+UseGenerationalGC` with `CRATONVM_GC_STATS=1`.
+
+### The 16-bytes-per-empty-object retention
+
+Unchanged from wave 3: an accepted run is stepped over, not parsed, so each dead
+empty object stays until a moving cycle resets from-space. Bounded and
+self-limiting; parsing them is a separate safety argument.
