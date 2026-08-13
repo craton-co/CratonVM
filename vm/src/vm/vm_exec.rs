@@ -8940,6 +8940,25 @@ impl<'a> NativeClassAccess for NativeContextImpl<'a> {
             .find_all_resource_urls(name)
     }
 
+    fn next_resource_url(
+        &self,
+        name: &str,
+        segment: u32,
+        index: u32,
+    ) -> Option<(String, u32, u32)> {
+        let (url, seg, idx) = self
+            .shared
+            .classes
+            .class_manager
+            .read()
+            .next_resource_url_from(name, segment as usize, index as usize)?;
+        Some((url, seg as u32, idx as u32))
+    }
+
+    fn resource_name_supports_incremental_scan(&self, name: &str) -> bool {
+        cratonvm_classloading::ClassManager::resource_name_supports_incremental_scan(name)
+    }
+
     fn find_all_resource_bytes(&self, name: &str) -> Vec<Vec<u8>> {
         self.shared
             .classes
