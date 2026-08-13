@@ -27554,7 +27554,17 @@ mod layout_constant_inventory {
         // `cell()` closure it replaced biased BOTH branches by payload64 and
         // never mentioned payload32, which is precisely how the compact arm
         // ended up 4 bytes past `coder` and `hash`.
-        ("lib.rs", [3, 1, 2, 1, 0, 0, 1, 1]),
+        //
+        // 2026-08-12: `AtomicIntFieldLayout::new` (the ATOMIC_INT intrinsic
+        // region) adds the same two-offsets-per-field pair as the String one,
+        // for `AtomicInteger.value`: `HEADER_SIZE` 3 -> 5, `SLOT_SIZE` 2 -> 3
+        // and `FIELD_CELL_PAYLOAD32_OFFSET` 1 -> 2 (the legacy arm's
+        // header-plus-cell-plus-payload32 address), and `HEADER_SIZE` again
+        // for the compact arm's header-plus-body-offset. `value` is an `int`,
+        // so there is no payload64 arm and no ref/narrow-oop case. Both sites
+        // are disp32 in the emitted `LOCK XADD [RAX+disp32], ECX`, so neither
+        // shares the disp8 hazard.
+        ("lib.rs", [5, 1, 3, 1, 0, 0, 2, 1]),
         // ir_lower.rs: the `use` list, the three compile-time invariants
         // restated at the top of that file, two disp32 field-address
         // computations, two disp8 float array element accesses, and the disp8
