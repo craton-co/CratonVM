@@ -1244,6 +1244,66 @@ pub(crate) fn new13_resolve_tls_id(ctx: &dyn NativeContext, this: ObjectRef) -> 
     crate::net_phase_e::sock_stream_id_for_upcall(ctx, this)
 }
 
+/// Has this `javax/net/ssl/SSLSocket` ever been successfully connected?
+///
+/// **E42 — this is a LATCH, not the negation of "closed", and that distinction
+/// is measured rather than argued.** `isConnected()` used to answer
+/// `!isClosed()`, which is wrong at BOTH ends. HotSpot 25.0.3+9-LTS, three
+/// byte-identical runs (`scratchpad/e42/E42SocketPredicates.java`):
+///
+/// ```text
+///   fresh SSLSocket (zero-arg createSocket)  isConnected=false isClosed=false
+///   the same socket after close()            isConnected=false isClosed=true
+///   connected, open                          isConnected=true  isClosed=false
+///   connected, then close()                  isConnected=true  isClosed=true
+///   bind()ed but never connected             isConnected=false isClosed=false
+/// ```
+///
+/// So "not closed" answered `true` for the never-connected socket
+/// (`RSslNullSession`'s DOOR 1 check 1, and the only check that vector
+/// currently reaches) and `false` for a socket that was connected and then
+/// closed. The two states are independent: `java.net.Socket` keeps them in
+/// separate bits of one word — `CONNECTED = 1 << 2`, `CLOSED = 1 << 3`
+/// (`jdk25src/java.base/java/net/Socket.java:115-157`), and `close()` sets
+/// `CLOSED` without touching `CONNECTED`.
+///
+/// **The signals, in the order they are consulted, and why each is sound.**
+/// This VM's `SSLSocket` has no `connected` bit of its own, so the latch is
+/// reconstructed from state that already exists and that `close()` already
+/// leaves alone:
+///
+/// 1. `new13_resolve_tls_id(..) >= 0` — a live stream. This is the same
+///    question every I/O method on this socket asks, so a socket for which it
+///    answers "no stream" cannot read or write either. Not a latch on its own:
+///    `close()` stamps the id to `-1` (and `sock_mark_closed_for_upcall`
+///    clears the side-table copy), which is exactly why it cannot be the whole
+///    answer.
+/// 2. `NEW13_SOCK_HOST` holding a String — the socket was given a peer. All
+///    three connect paths write it (`connect`, `new13_finish_socket`, the
+///    layered-handshake path), `SSLServerSocket.accept` writes the same slot,
+///    and NOTHING clears it, including `close()`. The zero-arg
+///    `createSocket()` never writes it. That is the latch.
+/// 3. `net_phase_e`'s side-table `host` — the same signal for a socket built
+///    through that module's own `createSocket(String, int)`, where the raw
+///    field write may have been dropped by the layout guard (see
+///    `new13_finish_socket`'s comment on why the side table is authoritative
+///    for this class).
+///
+/// **This cannot introduce a new wrong answer.** Relative to `!closed` it can
+/// only move a never-connected socket from `true` to `false` (correct) and a
+/// closed-with-a-known-peer socket from `false` to `true` (correct). A
+/// connected socket whose peer was recorded in neither place still answers
+/// `false` after close — which is the answer it already gave.
+pub(crate) fn new13_socket_ever_connected(ctx: &dyn NativeContext, this: ObjectRef) -> bool {
+    if new13_resolve_tls_id(ctx, this) >= 0 {
+        return true;
+    }
+    if matches!(ctx.get_field(this, NEW13_SOCK_HOST), Value::Object(Some(_))) {
+        return true;
+    }
+    !crate::net_phase_e::sock_get(ctx, this).host.is_empty()
+}
+
 // ---------------------------------------------------------------------------
 // The receiver `SSLSocket.getInputStream()` / `getOutputStream()` hands back
 // ---------------------------------------------------------------------------
@@ -1394,17 +1454,76 @@ fn tls_stream_clear_id(ctx: &mut dyn NativeContext, this: ObjectRef) {
     }
 }
 
-// SSLSession field layout: 3 fields.
+// SSLSession field layout: 4 fields.
 //   0 = protocol String
 //   1 = cipher String
 //   2 = tls_id Int (s2_registry id of the backing TLS stream; -1 after close)
-pub(crate) const NEW13_SSL_SESS_FIELDS: usize = 3;
+//   3 = attribute map (java.util.HashMap or null) — E42, see below
+//
+// E42 (2026-08-13): **was 3, and the missing 4th slot was a live defect, not a
+// missing feature.** `t27_tls`'s JSSE attribute API (`putValue`/`getValue`/
+// `removeValue`/`getValueNames`) stores its `java.util.HashMap` in the
+// session's LAST slot, and on the 3-field shape the last slot was
+// `NEW13_SESS_TLSID` — which is also the slot `t27_tls::session_has_negotiated`
+// reads to decide whether anything was negotiated at all. A single `putValue`
+// therefore turned `Int(-1)` ("never connected") into a `HashMap` reference,
+// which that predicate cannot read as an id, so `isValid()` went back to
+// `true` and `getId()` back to 32 fabricated bytes: **an unrelated convenience
+// API resurrected the exact fabrication the E12 and E22 lanes removed.**
+// `invalidate()` was a second writer of the same slot and inverted outright
+// (`Int(-1) -> Int(0)`, a VALID stream id — invalidating the null session made
+// it valid). Both were stopped defensively in E31 by making the attribute API
+// a NO-OP for shapes with no dedicated slot; this is the structural fix behind
+// that, and it is E31-1's NOMINATION 1 and 2.
+//
+// The writer is not hypothetical: Jetty's `SecureRequestCustomizer
+// .retrieveSni()` calls `getValue()` then `putValue()` on EVERY SSL request,
+// and this shape is what `new13_resolve_socket_session` hands it.
+//
+// **Why 4 and not any other width.** Widening a session shape moves it through
+// `t27_tls`'s width tables, and those tables are the readers that decide what
+// each slot MEANS. At width 4 all four of them already agree with this layout,
+// so nothing here retargets an existing slot — the change is purely additive:
+//
+// | `t27_tls` reader           | at width 3        | at width 4        |
+// |----------------------------|-------------------|-------------------|
+// | `session_proto_slot`       | 0 (protocol)      | 0 — unchanged     |
+// | `session_cipher_slot`      | 1 (cipher)        | 1 — unchanged     |
+// | `sslsess_attrs_slot`       | `None`            | **`Some(3)`**     |
+// | `session_has_negotiated`   | slot 2 `>= 0`     | see the CAVEAT    |
+// | `getCreationTime` (`> 5`)  | `epoch_millis_now`| unchanged         |
+//
+// Width 4 is also already `SSLServerSocket.accept`'s shape (`t27_tls`, "4-field
+// synthetic session: proto, cipher, streamId, attrs") — this layout is
+// BYTE-IDENTICAL to it, so the widening retires a distinct width rather than
+// adding one. Five `javax/net/ssl/SSLSession` widths in this tree become four.
+//
+// **CAVEAT — the one co-requisite, and it is BLOCKING.**
+// `t27_tls::session_has_negotiated`'s `_ => true` arm (which width 4 falls
+// into) is scoped by the premise "the 4- and 6-field shapes are only minted
+// after a handshake". This change makes that premise false for width 4, so the
+// arm must be merged with the 3-field one — `3 | 4 => slot 2 >= 0` — IN THE
+// SAME COMMIT. That merge is a provable no-op for the accept shape, whose slot
+// 2 is `RUSTLS_SOCK_ID_BASE + stream_id` and therefore always `>= 0`; without
+// it this widening makes the null session valid again, which is the defect
+// above with the sign flipped. `the_widened_null_session_is_still_not_
+// negotiated` in this file's test module fails loudly if the two ever part
+// company, so the co-requisite is enforced by the build and not by this
+// comment. See docs/known-issues/jdk-only/E42-1-*.md.
+pub(crate) const NEW13_SSL_SESS_FIELDS: usize = 4;
 
 pub(crate) const NEW13_SESS_PROTO: usize = 0;
 
 pub(crate) const NEW13_SESS_CIPHER: usize = 1;
 
 pub(crate) const NEW13_SESS_TLSID: usize = 2;
+
+/// The dedicated JSSE attribute-map slot — `t27_tls::sslsess_attrs_slot`
+/// answers `Some(3)` for this width. Every minter of this shape writes
+/// `Value::Object(None)` here, so the map is allocated lazily by the first
+/// `putValue` and nothing else can be mistaken for one. See
+/// [`NEW13_SSL_SESS_FIELDS`] for why the slot exists.
+pub(crate) const NEW13_SESS_ATTRS: usize = 3;
 
 // ---------------------------------------------------------------------------
 // The two "nothing was negotiated" sentinels
@@ -1456,6 +1575,91 @@ pub(crate) const JSSE_NULL_CIPHER_SUITE: &str = "SSL_NULL_WITH_NULL_NULL";
 /// that has negotiated nothing — measured, not chosen.
 pub(crate) const JSSE_NULL_PROTOCOL: &str = "NONE";
 
+/// The TLS versions this VM offers, in HotSpot's preference order.
+///
+/// **E42 — the ORDER is part of the answer.** Measured, HotSpot 25.0.3+9-LTS
+/// (`scratchpad/e42/E42EnabledSets.java`), on a fresh `SSLEngine` and on a
+/// never-connected `SSLSocket` alike:
+///
+/// ```text
+///   getEnabledProtocols() = [TLSv1.3, TLSv1.2]
+/// ```
+///
+/// most-preferred first. One site in this file spelled the pair the other way
+/// round under the comment `// Default: TLSv1.2, TLSv1.3`, and the order is
+/// directly observable — `RSslNullSession` asserts the exact string
+/// `"[TLSv1.3, TLSv1.2]"`, and a caller that takes element 0 as "the version
+/// we would prefer" reads the reversed list as a downgrade.
+pub(crate) const JSSE_ENABLED_PROTOCOLS: [&str; 2] = ["TLSv1.3", "TLSv1.2"];
+
+/// The suite list this VM offers, as a fresh Java `String[]`.
+///
+/// **E42 — one list, one spelling.** `t27_tls::SUPPORTED_CIPHER_SUITE_NAMES` is
+/// the single source of truth (`SSLSocket.getSupportedCipherSuites` and
+/// `.getEnabledCipherSuites` already both read it), but this file also carried
+/// THREE inline copies of it — `SSLSocketFactory.getSupportedCipherSuites`
+/// (13 entries), `SSLEngine.getSupportedCipherSuites` (13), and
+/// `SSLSocketFactory.getDefaultCipherSuites` (7). All three had drifted: the
+/// two 13-entry copies predate the `TLS_DHE_RSA_*` pair, so this VM's own
+/// factory disclaimed two suites its sockets negotiate.
+///
+/// The 7-entry copy is the interesting one, because it was not a stale copy —
+/// it modelled a narrower "defaults" set, and no such set exists. Measured,
+/// HotSpot 25.0.3+9-LTS (`scratchpad/e42/E42FactoryDefaults.java`):
+///
+/// ```text
+///   SSLSocketFactory.getDefaultCipherSuites().length   = 31
+///   SSLSocketFactory.getSupportedCipherSuites().length = 31
+///   default equals supported (element-wise)            = true
+///   socket.getEnabledCipherSuites() equals both        = true
+/// ```
+///
+/// enabled == default == supported, one array, three doors. So the "defaults
+/// are a subset" model was invented, and the harm it does is concrete: a caller
+/// that intersects its own configured list against `getDefaultCipherSuites()`
+/// — which is precisely what that accessor is for — was told this VM cannot do
+/// ChaCha20 or any CBC suite.
+pub(crate) fn jsse_supported_suite_name_array(
+    ctx: &mut dyn NativeContext,
+) -> Result<ObjectRef, MethodCallFailed> {
+    let suites = crate::t27_tls::SUPPORTED_CIPHER_SUITE_NAMES;
+    let arr = ctx.new_ref_array(cratonvm_types::ClassId::new(0), suites.len());
+    // PIN: every `create_string` below is an allocation and therefore a GC
+    // point, so a moving young collection mid-loop relocates `arr` and the
+    // remaining `set_array_element` calls write through a stale reference.
+    // The inline copies this replaces all had that hazard; it is latent only
+    // because the arrays are small and built early.
+    let pin = ctx.pin_native_root(arr);
+    for (i, &s) in suites.iter().enumerate() {
+        let so = ctx.create_string(s);
+        let arr = ctx.read_native_pin(pin, arr);
+        ctx.set_array_element(arr, i, Value::Object(Some(so)));
+    }
+    let arr = ctx.read_native_pin(pin, arr);
+    ctx.unpin_native_roots(pin);
+    Ok(arr)
+}
+
+/// [`JSSE_ENABLED_PROTOCOLS`] as a fresh Java `String[]`.
+pub(crate) fn jsse_enabled_protocol_array(
+    ctx: &mut dyn NativeContext,
+) -> Result<ObjectRef, MethodCallFailed> {
+    let arr = ctx.new_ref_array(
+        cratonvm_types::ClassId::new(0),
+        JSSE_ENABLED_PROTOCOLS.len(),
+    );
+    // PIN — see `jsse_supported_suite_name_array`.
+    let pin = ctx.pin_native_root(arr);
+    for (i, &p) in JSSE_ENABLED_PROTOCOLS.iter().enumerate() {
+        let so = ctx.create_string(p);
+        let arr = ctx.read_native_pin(pin, arr);
+        ctx.set_array_element(arr, i, Value::Object(Some(so)));
+    }
+    let arr = ctx.read_native_pin(pin, arr);
+    ctx.unpin_native_roots(pin);
+    Ok(arr)
+}
+
 /// Allocate the `NEW13_SSL_SESS_FIELDS`-shaped equivalent of JSSE's
 /// `SSLSessionImpl.nullSession`: a real, non-null session object that reports
 /// "nothing negotiated" in the JDK's own vocabulary.
@@ -1488,6 +1692,13 @@ pub(crate) fn new13_alloc_null_ssl_session(
     ctx.set_field(session, NEW13_SESS_PROTO, Value::Object(Some(proto_str)));
     ctx.set_field(session, NEW13_SESS_CIPHER, Value::Object(Some(cipher_str)));
     ctx.set_field(session, NEW13_SESS_TLSID, Value::Int(tls_id));
+    // E42: the attribute slot starts EMPTY rather than unwritten. An
+    // allocation default is whatever the allocator leaves behind; writing
+    // `Object(None)` explicitly is what makes "no attributes have been set"
+    // a state this constructor asserts instead of one it inherits. The map
+    // itself is allocated lazily by the first `putValue`
+    // (`t27_tls::sslsess_attrs_map`).
+    ctx.set_field(session, NEW13_SESS_ATTRS, Value::Object(None));
     ctx.unpin_native_roots(pin);
     Ok(session)
 }
@@ -2061,6 +2272,9 @@ pub(crate) fn new13_alloc_ssl_session(ctx: &mut dyn NativeContext, tls_id: i32) 
     ctx.set_field(session, NEW13_SESS_PROTO, Value::Object(Some(proto_str)));
     ctx.set_field(session, NEW13_SESS_CIPHER, Value::Object(Some(cipher_str)));
     ctx.set_field(session, NEW13_SESS_TLSID, Value::Int(tls_id));
+    // E42: see `new13_alloc_null_ssl_session` — the attribute slot is
+    // explicitly empty, not merely unwritten.
+    ctx.set_field(session, NEW13_SESS_ATTRS, Value::Object(None));
     // FIX (netty-https-client-trust residual): record the peer chain this
     // client connection already captured so a later `getPeerCertificates()`
     // on THIS session object doesn't spuriously see "no certificate" — see
@@ -2787,21 +3001,18 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
         "getDefaultCipherSuites",
         "()[Ljava/lang/String;",
         |ctx, _args| {
-            let suites = [
-                "TLS_AES_128_GCM_SHA256",
-                "TLS_AES_256_GCM_SHA384",
-                "TLS_CHACHA20_POLY1305_SHA256",
-                "TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256",
-                "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256",
-                "TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384",
-                "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384",
-            ];
-            let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, suites.len());
-            for (i, &s) in suites.iter().enumerate() {
-                let str_obj = ctx.create_string(s);
-                ctx.set_array_element(arr, i, Value::Object(Some(str_obj)));
-            }
-            Ok(Some(Value::Object(Some(arr))))
+            // E42: this was a SEVEN-element list — a narrower "defaults" set
+            // that the oracle says does not exist. Measured, HotSpot
+            // 25.0.3+9-LTS (`scratchpad/e42/E42FactoryDefaults.java`):
+            // `getDefaultCipherSuites()` and `getSupportedCipherSuites()` are
+            // element-wise EQUAL (31 each), and a fresh socket's
+            // `getEnabledCipherSuites()` equals both. There is one list. A
+            // caller intersecting its configuration against this accessor —
+            // which is what the accessor is for — was told this VM cannot do
+            // ChaCha20 or any CBC suite. See `jsse_supported_suite_name_array`.
+            Ok(Some(Value::Object(Some(jsse_supported_suite_name_array(
+                ctx,
+            )?))))
         },
     );
     r.register(
@@ -2809,29 +3020,15 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
         "getSupportedCipherSuites",
         "()[Ljava/lang/String;",
         |ctx, _args| {
-            let suites = [
-                "TLS_AES_128_GCM_SHA256",
-                "TLS_AES_256_GCM_SHA384",
-                "TLS_CHACHA20_POLY1305_SHA256",
-                "TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256",
-                "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256",
-                "TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384",
-                "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384",
-                "TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256",
-                "TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256",
-                // T-CBC.1: real CBC-mode suites, see t27_tls_cbc /
-                // fixed-suite-bugs/rustls-cbc-cipher-suites-not-supported.md
-                "TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA256",
-                "TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA256",
-                "TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA384",
-                "TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA384",
-            ];
-            let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, suites.len());
-            for (i, &s) in suites.iter().enumerate() {
-                let str_obj = ctx.create_string(s);
-                ctx.set_array_element(arr, i, Value::Object(Some(str_obj)));
-            }
-            Ok(Some(Value::Object(Some(arr))))
+            // E42: was a 13-entry inline copy of
+            // `t27_tls::SUPPORTED_CIPHER_SUITE_NAMES` that had drifted two
+            // entries behind it (the `TLS_DHE_RSA_*` pair), so this VM's
+            // factory disclaimed two suites its own sockets negotiate — while
+            // `SSLSocket.getSupportedCipherSuites` in this same file read the
+            // constant and listed them. Same list, one spelling.
+            Ok(Some(Value::Object(Some(jsse_supported_suite_name_array(
+                ctx,
+            )?))))
         },
     );
 
@@ -3209,12 +3406,21 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
                     None,
                 )
             });
-        let session = try_alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLSession", 3)?;
+        // E42: `NEW13_SSL_SESS_FIELDS`, not a bare `3`. This was the one minter
+        // of this shape that spelled its own width, so it would have kept
+        // minting the pre-E42 layout — and `t27_tls`'s slot rules are keyed on
+        // the WIDTH, so a stale 3 here means a socket that really did handshake
+        // gets a session with no attribute slot while its siblings have one.
+        // The literal is why this site needed finding at all; the constant is
+        // why it cannot drift again.
+        let session =
+            try_alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLSession", NEW13_SSL_SESS_FIELDS)?;
         let protocol = ctx.create_string(&protocol);
         let cipher = ctx.create_string(&cipher);
         ctx.set_field(session, NEW13_SESS_PROTO, Value::Object(Some(protocol)));
         ctx.set_field(session, NEW13_SESS_CIPHER, Value::Object(Some(cipher)));
         ctx.set_field(session, NEW13_SESS_TLSID, Value::Int(real_tls_id));
+        ctx.set_field(session, NEW13_SESS_ATTRS, Value::Object(None));
         // CLIENT-mode only (a server stream never has "peer certificates" in
         // this sense for our purposes here) — without this, a caller like
         // Apache HttpComponents' `AbstractClientTlsStrategy.verifySession()`,
@@ -3724,21 +3930,31 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
                 );
             }
             let ciphers = ssl_sock_supported_cipher_suites(ctx)?;
-            let protocols = {
-                let arr = ctx.new_ref_array(cratonvm_types::ClassId::new(0), 1);
-                let negotiated =
-                    if let Value::Object(Some(session)) = ctx.get_field(this, NEW13_SOCK_SESSION) {
-                        match ctx.get_field(session, NEW13_SESS_PROTO) {
-                            Value::Object(Some(s)) => ctx.read_string(s),
-                            _ => None,
-                        }
-                    } else {
-                        None
-                    };
-                let s = ctx.create_string(&negotiated.unwrap_or_else(|| "TLSv1.3".to_string()));
-                ctx.set_array_element(arr, 0, Value::Object(Some(s)));
-                arr
-            };
+            // E42 (E12-1 residual 5): this built a ONE-element array from the
+            // SESSION's negotiated protocol, falling back to a hard-coded
+            // `"TLSv1.3"`. Two defects in one expression, and both are the
+            // category error E12 fixed in `getEnabledProtocols` next door:
+            // `SSLParameters` describes CONFIGURATION, not what a handshake
+            // produced, and the fallback announced this VM's preferred version
+            // as though it were an outcome.
+            //
+            // Measured, HotSpot 25.0.3+9-LTS
+            // (`scratchpad/e42/E42EnabledSets.java`), on an unconnected socket
+            // and on a socket from a version-pinned context:
+            //
+            //     getSSLParameters().getProtocols() = [TLSv1.3, TLSv1.2]
+            //     getEnabledProtocols()             = [TLSv1.3, TLSv1.2]
+            //     equal (element-wise)              = true
+            //     pinned to TLSv1.2: BOTH           = [TLSv1.2]
+            //
+            // The two accessors are the same answer through two doors, so they
+            // are now one call. That also carries E12's sentinel filter here
+            // for free: reading `NEW13_SESS_PROTO` raw would have reported
+            // `["NONE"]` for an unconnected socket once
+            // `new13_resolve_socket_session` started returning the null session
+            // — the exact unmasking E12-1 §5 records for site 8, in the door it
+            // did not check.
+            let protocols = ssl_sock_enabled_protocols(ctx, this)?;
             let params = match ctx.new_object_initialized(
                 "javax/net/ssl/SSLParameters",
                 "([Ljava/lang/String;[Ljava/lang/String;)V",
@@ -3822,13 +4038,11 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
     // set-side storage, so `set*` below are accepted but not persisted).
     fn ssl_sock_supported_cipher_suites(ctx: &mut dyn NativeContext) -> Result<ObjectRef, MethodCallFailed> {
         // Single source of truth — see `t27_tls::SUPPORTED_CIPHER_SUITE_NAMES`.
-        let suites = crate::t27_tls::SUPPORTED_CIPHER_SUITE_NAMES;
-        let arr = ctx.new_ref_array(cratonvm_types::ClassId::new(0), suites.len());
-        for (i, &s) in suites.iter().enumerate() {
-            let so = ctx.create_string(s);
-            ctx.set_array_element(arr, i, Value::Object(Some(so)));
-        }
-        Ok(arr)
+        // E42: the body moved to the module-level `jsse_supported_suite_name_array`
+        // so the SSLEngine and SSLSocketFactory doors — which each carried
+        // their own drifted inline copy of the list — share this one. This
+        // wrapper stays because it is the name three registrations already use.
+        jsse_supported_suite_name_array(ctx)
     }
     r.register(
         ssl_sock,
@@ -3898,69 +4112,80 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(Some(arr))))
         },
     );
+    // The protocol list `getEnabledProtocols()` and
+    // `getSSLParameters().getProtocols()` BOTH answer.
+    //
+    // E42: measured equal on HotSpot for an unconnected socket and for a
+    // version-pinned one (`scratchpad/e42/E42EnabledSets.java`), so they are
+    // one answer through two doors. `getSSLParameters` used to have its own
+    // copy that read the session raw and guessed `"TLSv1.3"` on a miss.
+    fn ssl_sock_enabled_protocols(
+        ctx: &mut dyn NativeContext,
+        this: ObjectRef,
+    ) -> Result<ObjectRef, MethodCallFailed> {
+        // Report the protocol actually negotiated (stored on the
+        // session) alongside TLSv1.2 so callers checking membership
+        // against either standard name succeed.
+        //
+        // FIX (TestSsl.testClientInitiatedRenegotiation[JSSE]): read the
+        // session through `new13_resolve_socket_session` rather than the
+        // raw field. The raw read returns null on the
+        // `createSocket(String, int)` path (see that helper's comment),
+        // and the `unwrap_or` below then fabricated `"TLSv1.3"` — which is
+        // how a socket built from an `SSLContext.getInstance("TLSv1.2")`
+        // came to report `[TLSv1.3]`. The fabricated value was reported
+        // whatever the connection had actually negotiated, so it was a
+        // guess presented as a fact, not merely an imprecise default.
+        //
+        // E12: `new13_resolve_socket_session` now returns JSSE's INVALID
+        // session instead of null for an unconnected socket, so this
+        // consumer has to reject the sentinel explicitly. **This method is
+        // about CONFIGURATION, not about what was negotiated**, and the
+        // sentinel means "nothing was negotiated" — letting it through
+        // would have made an unconnected socket report `["NONE"]`, which
+        // is a worse answer than the one being fixed. Measured on HotSpot
+        // 25.0.3+9-LTS (`scratchpad/e12/E12Enabled.java`), on a socket
+        // from the zero-arg `createSocket()`:
+        //
+        //     getEnabledProtocols()  = [TLSv1.3, TLSv1.2]
+        //     getSession().getProtocol() = NONE
+        //     getEnabledProtocols() contains "NONE" = false
+        //
+        // so the no-negotiation answer is the enabled LIST, not a single
+        // guessed version. The old `unwrap_or("TLSv1.3")` was a one-element
+        // guess in exactly the case HotSpot answers with two.
+        let negotiated =
+            if let Ok(Value::Object(Some(session))) = new13_resolve_socket_session(ctx, this) {
+                match ctx.get_field(session, NEW13_SESS_PROTO) {
+                    Value::Object(Some(s)) => ctx.read_string(s),
+                    _ => None,
+                }
+            } else {
+                None
+            }
+            .filter(|p| p != JSSE_NULL_PROTOCOL);
+        match negotiated {
+            Some(proto) => {
+                let arr = ctx.new_ref_array(cratonvm_types::ClassId::new(0), 1);
+                let s = ctx.create_string(&proto);
+                ctx.set_array_element(arr, 0, Value::Object(Some(s)));
+                Ok(arr)
+            }
+            // E42: the two-element literal that used to stand here is now
+            // `JSSE_ENABLED_PROTOCOLS`, so the socket door, the engine door and
+            // `getSSLParameters` cannot disagree about the order.
+            None => jsse_enabled_protocol_array(ctx),
+        }
+    }
     r.register(
         ssl_sock,
         "getEnabledProtocols",
         "()[Ljava/lang/String;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            // Report the protocol actually negotiated (stored on the
-            // session) alongside TLSv1.2 so callers checking membership
-            // against either standard name succeed.
-            //
-            // FIX (TestSsl.testClientInitiatedRenegotiation[JSSE]): read the
-            // session through `new13_resolve_socket_session` rather than the
-            // raw field. The raw read returns null on the
-            // `createSocket(String, int)` path (see that helper's comment),
-            // and the `unwrap_or` below then fabricated `"TLSv1.3"` — which is
-            // how a socket built from an `SSLContext.getInstance("TLSv1.2")`
-            // came to report `[TLSv1.3]`. The fabricated value was reported
-            // whatever the connection had actually negotiated, so it was a
-            // guess presented as a fact, not merely an imprecise default.
-            //
-            // E12: `new13_resolve_socket_session` now returns JSSE's INVALID
-            // session instead of null for an unconnected socket, so this
-            // consumer has to reject the sentinel explicitly. **This method is
-            // about CONFIGURATION, not about what was negotiated**, and the
-            // sentinel means "nothing was negotiated" — letting it through
-            // would have made an unconnected socket report `["NONE"]`, which
-            // is a worse answer than the one being fixed. Measured on HotSpot
-            // 25.0.3+9-LTS (`scratchpad/e12/E12Enabled.java`), on a socket
-            // from the zero-arg `createSocket()`:
-            //
-            //     getEnabledProtocols()  = [TLSv1.3, TLSv1.2]
-            //     getSession().getProtocol() = NONE
-            //     getEnabledProtocols() contains "NONE" = false
-            //
-            // so the no-negotiation answer is the enabled LIST, not a single
-            // guessed version. The old `unwrap_or("TLSv1.3")` was a one-element
-            // guess in exactly the case HotSpot answers with two.
-            let negotiated =
-                if let Ok(Value::Object(Some(session))) = new13_resolve_socket_session(ctx, this) {
-                    match ctx.get_field(session, NEW13_SESS_PROTO) {
-                        Value::Object(Some(s)) => ctx.read_string(s),
-                        _ => None,
-                    }
-                } else {
-                    None
-                }
-                .filter(|p| p != JSSE_NULL_PROTOCOL);
-            match negotiated {
-                Some(proto) => {
-                    let arr = ctx.new_ref_array(cratonvm_types::ClassId::new(0), 1);
-                    let s = ctx.create_string(&proto);
-                    ctx.set_array_element(arr, 0, Value::Object(Some(s)));
-                    Ok(Some(Value::Object(Some(arr))))
-                }
-                None => {
-                    let arr = ctx.new_ref_array(cratonvm_types::ClassId::new(0), 2);
-                    let s1 = ctx.create_string("TLSv1.3");
-                    let s2 = ctx.create_string("TLSv1.2");
-                    ctx.set_array_element(arr, 0, Value::Object(Some(s1)));
-                    ctx.set_array_element(arr, 1, Value::Object(Some(s2)));
-                    Ok(Some(Value::Object(Some(arr))))
-                }
-            }
+            Ok(Some(Value::Object(Some(ssl_sock_enabled_protocols(
+                ctx, this,
+            )?))))
         },
     );
     // STUB-REMOVAL (wave 2): this was an unconditional no-op, so a caller
@@ -4164,21 +4389,53 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
         }
         Ok(Some(Value::Int(if closed { 1 } else { 0 })))
     });
+    // E42 (E31-1 NOMINATION 6): this answered `!isClosed()`, and a positive
+    // predicate implemented as the negation of a different one is wrong at both
+    // ends — a never-connected socket is not closed, and a closed socket was
+    // still once connected. Measured on HotSpot, both directions, in
+    // `new13_socket_ever_connected`'s doc comment; the JDK keeps `CONNECTED`
+    // and `CLOSED` in separate bits and `close()` never touches the first.
+    //
+    // This is the ONE check `regression-suite/src/RSslNullSession.java`
+    // currently reaches (`ck("socket.isConnected", s.isConnected(),
+    // Boolean.FALSE)`, DOOR 1 line 1), and it was RED — invisibly, because the
+    // vector aborts on the next line and never prints a summary.
+    //
+    // The sibling `isClosed()` immediately above is CORRECT and deliberately
+    // unchanged: it reads the closed flag, which is what it is asking about.
     r.register(ssl_sock, "isConnected", "()Z", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let closed = match ctx.get_field(this, NEW13_SOCK_CLOSED) {
-            Value::Int(c) => c != 0,
-            _ => crate::net_phase_e::sock_is_closed_for_upcall(ctx, this),
-        };
+        let connected = new13_socket_ever_connected(ctx, this);
         if crate::nbflags().dbg_tls_sock {
             eprintln!(
                 "[dbg-tls-sock] thread={:?} isConnected sock={:?} -> {}",
                 std::thread::current().id(),
                 this,
-                !closed
+                connected
             );
         }
-        Ok(Some(Value::Int(if closed { 0 } else { 1 })))
+        Ok(Some(Value::Int(if connected { 1 } else { 0 })))
+    });
+    // E42: `isBound()` had NO registration on this class, so the real
+    // `java.net.Socket.isBound()` bytecode ran and read the `state` word out of
+    // a synthetic object whose slots this file writes `Int`s into — the exact
+    // "undefined, and in practice non-deterministically truthy roughly one run
+    // in three" shape `net_phase_e` recorded when `isInputShutdown` had the
+    // same gap. Measured (`scratchpad/e42/E42SocketPredicates.java`): `false`
+    // on a fresh socket, `true` once connected, and STILL `true` after
+    // `close()` — a latch, like `isConnected()`.
+    //
+    // On this VM's `SSLSocket` surface the two latches coincide, and that is a
+    // statement about the surface rather than about `java.net.Socket`: there is
+    // no `bind` registration on this class, so a caller cannot reach the
+    // bound-but-not-connected state HotSpot's arm H shows (a plain
+    // `new Socket()` + `bind()`, which answers `isBound()=true`
+    // `isConnected()=false`). If `SSLSocket.bind` is ever registered, this must
+    // gain its own flag rather than keep sharing one.
+    r.register(ssl_sock, "isBound", "()Z", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let bound = new13_socket_ever_connected(ctx, this);
+        Ok(Some(Value::Int(if bound { 1 } else { 0 })))
     });
     // `java.net.Socket` has the same registrations, but a real-JDK
     // `SSLSocket` receiver does not reliably inherit them through the native
@@ -4188,19 +4445,51 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
     // `isInputShutdown()` immediately before every request-body write and
     // turns that false positive into `ConnectionClosedException`.
     //
-    // There is no independent half-close state for a rustls SSLSocket: the
-    // only supported shutdown operation is `close()`, which marks the shared
-    // side-table entry closed.  Use that authoritative state for both
-    // directions rather than interpreting the host JDK's physical layout.
+    // E42 — the SAME conflation as `isConnected()` above, in the same file, and
+    // the correct implementation already existed one module away.
+    //
+    // "There is no independent half-close state for a rustls SSLSocket: the
+    // only supported shutdown operation is close(), which marks the shared
+    // side-table entry closed. Use that authoritative state for both
+    // directions" — that is what stood here, and both clauses are false.
+    // `net_phase_e`'s `SockSide` has carried dedicated `input_shutdown` /
+    // `output_shutdown` flags all along; its own `java/net/Socket
+    // .shutdownInput()`/`shutdownOutput()` natives set them, and its own
+    // `isInputShutdown`/`isOutputShutdown` READ them
+    // (`net_phase_e.rs`, `r.register(sock, "isInputShutdown", ...)` →
+    // `sock_get(ctx, this).input_shutdown`). These two copies were the drifted
+    // twins that asked `closed` instead — the same "the right helper exists and
+    // only some call sites use it" shape this directory keeps recording.
+    //
+    // Measured, HotSpot 25.0.3+9-LTS, three byte-identical runs
+    // (`scratchpad/e42/E42SocketPredicates.java`):
+    //
+    //     fresh socket                    isInputShutdown=false isOutputShutdown=false
+    //     closed, never shut down         isInputShutdown=false isOutputShutdown=false
+    //     connected + shutdownOutput()    isInputShutdown=false isOutputShutdown=true
+    //     that socket after close()       isInputShutdown=false isOutputShutdown=true
+    //
+    // i.e. `close()` sets NEITHER. `SHUT_IN`/`SHUT_OUT` are their own bits
+    // (`jdk25src/java.base/java/net/Socket.java:119-120`), written only by
+    // `shutdownInput`/`shutdownOutput`.
+    //
+    // **The consumer the old spelling was written for is unaffected.** Apache
+    // HttpClient5's `DefaultBHttpClientConnection$1.checkTLS()` calls
+    // `isInputShutdown()` before every write on a LIVE socket; that socket is
+    // not closed and has not been shut down, so it answered `false` before and
+    // answers `false` now. What changes is a CLOSED socket, which stops
+    // claiming a half-close that never happened — HotSpot's answer.
     r.register(ssl_sock, "isInputShutdown", "()Z", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let closed = crate::net_phase_e::sock_is_closed_for_upcall(ctx, this);
-        Ok(Some(Value::Int(if closed { 1 } else { 0 })))
+        Ok(Some(Value::Int(
+            crate::net_phase_e::sock_get(ctx, this).input_shutdown,
+        )))
     });
     r.register(ssl_sock, "isOutputShutdown", "()Z", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let closed = crate::net_phase_e::sock_is_closed_for_upcall(ctx, this);
-        Ok(Some(Value::Int(if closed { 1 } else { 0 })))
+        Ok(Some(Value::Int(
+            crate::net_phase_e::sock_get(ctx, this).output_shutdown,
+        )))
     });
     r.register(ssl_sock, "getPort", "()I", |ctx, args| {
         let this = obj_arg(args, 0)?;
@@ -5679,15 +5968,12 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
             let this = obj_arg(args, 0)?;
             match ctx.get_field(this, 3) {
                 Value::Object(Some(arr)) => Ok(Some(Value::Object(Some(arr)))),
-                _ => {
-                    // Default: TLSv1.2, TLSv1.3
-                    let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 2);
-                    let p1 = ctx.create_string("TLSv1.2");
-                    let p2 = ctx.create_string("TLSv1.3");
-                    ctx.set_array_element(arr, 0, Value::Object(Some(p1)));
-                    ctx.set_array_element(arr, 1, Value::Object(Some(p2)));
-                    Ok(Some(Value::Object(Some(arr))))
-                }
+                // E42: the pair was spelled `["TLSv1.2", "TLSv1.3"]` under the
+                // comment `// Default: TLSv1.2, TLSv1.3`. Measured on HotSpot
+                // (`scratchpad/e42/E42EnabledSets.java`) a fresh engine answers
+                // `[TLSv1.3, TLSv1.2]` — most-preferred first, and the order is
+                // observable. See `JSSE_ENABLED_PROTOCOLS`.
+                _ => Ok(Some(Value::Object(Some(jsse_enabled_protocol_array(ctx)?)))),
             }
         },
     );
@@ -5709,12 +5995,31 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
             let this = obj_arg(args, 0)?;
             match ctx.get_field(this, 4) {
                 Value::Object(Some(arr)) => Ok(Some(Value::Object(Some(arr)))),
-                _ => {
-                    let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 1);
-                    let s = ctx.create_string("TLS_AES_128_GCM_SHA256");
-                    ctx.set_array_element(arr, 0, Value::Object(Some(s)));
-                    Ok(Some(Value::Object(Some(arr))))
-                }
+                // E42 — this was a ONE-element list holding
+                // `TLS_AES_128_GCM_SHA256`, and the comment on
+                // `getSupportedCipherSuites` below justified the gap between
+                // the two accessors as "what's already modeled by the
+                // getEnabledCipherSuites default branch above". Nothing was
+                // modelled: the branch was a single hard-coded suite name.
+                //
+                // Measured, HotSpot 25.0.3+9-LTS
+                // (`scratchpad/e42/E42EnabledSets.java`), on an engine from
+                // `SSLContext.getInstance("TLS").createSSLEngine()`:
+                //
+                //     enabledCipherSuites.count   = 31
+                //     supportedCipherSuites.count = 31
+                //     enabled equals supported    = true
+                //
+                // There is no enabled/supported distinction to model, and the
+                // SOCKET door in this same file already knew that — its
+                // `getEnabledCipherSuites` and `getSupportedCipherSuites` both
+                // answer `SUPPORTED_CIPHER_SUITE_NAMES`. So the two doors of
+                // one VM disagreed: one offered 15 suites, the other 1. Netty's
+                // `JdkSslContext$Defaults.init` validates its configured list
+                // against an engine's suites during every server bootstrap.
+                _ => Ok(Some(Value::Object(Some(jsse_supported_suite_name_array(
+                    ctx,
+                )?)))),
             }
         },
     );
@@ -5740,41 +6045,36 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
     // SSLContext.getDefault().createSSLEngine().getSupportedCipherSuites() to validate
     // its configured cipher list against the engine's supported set — every
     // ServerHttpsRequestIntegrationTests run (Reactor Netty server backend) hits this
-    // during server bootstrap. Mirrors the same fuller suite list already used by
-    // SSLSocketFactory.getSupportedCipherSuites/SSLSocket's supported-suites native for
-    // consistency (this synthetic engine has no negotiated-state distinction between
-    // "supported" and "enabled defaults" beyond what's already modeled by the
-    // getEnabledCipherSuites default branch above).
+    // during server bootstrap.
+    //
+    // E42: the sentence that stood here — "this synthetic engine has no
+    // negotiated-state distinction between 'supported' and 'enabled defaults'
+    // beyond what's already modeled by the getEnabledCipherSuites default
+    // branch above" — asserted a model that did not exist (that branch was one
+    // hard-coded suite name), and its first clause is right for a reason it did
+    // not give: HotSpot has no such distinction EITHER. Measured, enabled ==
+    // supported, element-wise, on a fresh engine. Both accessors now answer
+    // `t27_tls::SUPPORTED_CIPHER_SUITE_NAMES`, which is what this comment's
+    // "mirrors the same fuller suite list" claim always meant to say — the
+    // inline copy had drifted two entries behind it.
     r.register(
         ssleng,
         "getSupportedCipherSuites",
         "()[Ljava/lang/String;",
         |ctx, _args| {
-            let suites = [
-                "TLS_AES_128_GCM_SHA256",
-                "TLS_AES_256_GCM_SHA384",
-                "TLS_CHACHA20_POLY1305_SHA256",
-                "TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256",
-                "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256",
-                "TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384",
-                "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384",
-                "TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256",
-                "TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256",
-                // T-CBC.1: real CBC-mode suites, see t27_tls_cbc /
-                // fixed-suite-bugs/rustls-cbc-cipher-suites-not-supported.md
-                "TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA256",
-                "TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA256",
-                "TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA384",
-                "TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA384",
-            ];
-            let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, suites.len());
-            for (i, &s) in suites.iter().enumerate() {
-                let str_obj = ctx.create_string(s);
-                ctx.set_array_element(arr, i, Value::Object(Some(str_obj)));
-            }
-            Ok(Some(Value::Object(Some(arr))))
+            Ok(Some(Value::Object(Some(jsse_supported_suite_name_array(
+                ctx,
+            )?))))
         },
     );
+    // NOTE: `getSupportedProtocols` is deliberately NOT
+    // `JSSE_ENABLED_PROTOCOLS`. Measured (`scratchpad/e42/E42EnabledSets.java`)
+    // HotSpot's supported list is strictly wider than its enabled one —
+    // `[TLSv1.3, TLSv1.2, TLSv1.1, TLSv1, SSLv3, SSLv2Hello]` vs
+    // `[TLSv1.3, TLSv1.2]` — so these two ARE a real distinction, unlike the
+    // cipher pair above. This VM offers only the two, so the lists coincide
+    // here by capability rather than by definition, and collapsing them into
+    // one constant would erase the difference for whoever widens the VM.
     r.register(
         ssleng,
         "getSupportedProtocols",
@@ -6195,14 +6495,40 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
             // enable it (`setEnabledCipherSuites("SSL_NULL_WITH_NULL_NULL")`
             // throws `IllegalArgumentException`). See `JSSE_NULL_CIPHER_SUITE`.
             //
-            // Slot order here is (proto, cipher), matching the `< 7 fields`
-            // arm of `t27_tls::register_ssl_session_real`'s field-count
-            // disambiguation as well as `NEW13_SESS_PROTO`/`_CIPHER`.
-            let session = try_alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLSession", 2)?;
-            let proto = ctx.create_string(JSSE_NULL_PROTOCOL);
-            let cipher = ctx.create_string(JSSE_NULL_CIPHER_SUITE);
-            ctx.set_field(session, 0, Value::Object(Some(proto)));
-            ctx.set_field(session, 1, Value::Object(Some(cipher)));
+            // E42: this used to mint a bespoke 2-FIELD session — a fifth
+            // `javax/net/ssl/SSLSession` width whose only difference from the
+            // null session next door was that it had no stream-id slot and no
+            // attribute slot. It is the same object in the same state, so it is
+            // now the same constructor: `new13_alloc_null_ssl_session(-1)`,
+            // which writes the identical (protocol, cipher) sentinel pair, pins
+            // across both `create_string` GC points (this site did not), and
+            // carries `NEW13_SESS_ATTRS` so a `putValue` on a pre-handshake
+            // engine session round-trips instead of silently vanishing.
+            //
+            // Every `t27_tls` width rule answers the same for both widths, so
+            // no accessor changes: `session_proto_slot` = 0 and
+            // `session_cipher_slot` = 1 at width 2 and at width 4;
+            // `session_has_negotiated` answered `false` at width 2 via the
+            // `0..=2` arm and answers `false` at width 4 by reading
+            // `NEW13_SESS_TLSID = -1` (the co-requisite arm merge —
+            // see `NEW13_SSL_SESS_FIELDS`). Two ways of saying "nothing was
+            // negotiated" collapse into one.
+            //
+            // Slot order is (proto, cipher), matching the `< 6 fields` arm of
+            // `t27_tls`'s field-count disambiguation as well as
+            // `NEW13_SESS_PROTO`/`_CIPHER`.
+            //
+            // `this` is PINNED across the constructor: it allocates a session
+            // and two Strings, each a GC point, and the receiver is written
+            // afterwards. The old code had the same three allocation points
+            // and did not pin, so the cache write below could land through a
+            // stale reference under a moving young collection — the hazard
+            // `new13_alloc_null_ssl_session`'s own comment describes for the
+            // session object, applied to the engine that owns it.
+            let this_pin = ctx.pin_native_root(this);
+            let session = new13_alloc_null_ssl_session(ctx, -1)?;
+            let this = ctx.read_native_pin(this_pin, this);
+            ctx.unpin_native_roots(this_pin);
             ctx.set_field(this, 6, Value::Object(Some(session)));
             Ok(Some(Value::Object(Some(session))))
         },
@@ -7531,12 +7857,134 @@ pub(crate) mod new13_tests {
             }
             assert!(ctx_ids[i] < NEW13_SSL_CTX_FIELDS);
         }
-        let sess_ids = [NEW13_SESS_PROTO, NEW13_SESS_CIPHER, NEW13_SESS_TLSID];
+        let sess_ids = [
+            NEW13_SESS_PROTO,
+            NEW13_SESS_CIPHER,
+            NEW13_SESS_TLSID,
+            NEW13_SESS_ATTRS,
+        ];
         for i in 0..sess_ids.len() {
             for j in (i + 1)..sess_ids.len() {
                 assert_ne!(sess_ids[i], sess_ids[j], "duplicate SSLSession field index");
             }
             assert!(sess_ids[i] < NEW13_SSL_SESS_FIELDS);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // E42 — the widened session shape, and the co-requisite it must not
+    // outlive
+    // -----------------------------------------------------------------------
+
+    /// **The co-requisite, mechanised.** Widening `NEW13_SSL_SESS_FIELDS` from
+    /// 3 to 4 gives this shape a dedicated attribute slot — and moves it out of
+    /// `t27_tls::session_has_negotiated`'s `3 =>` arm, which reads the stream
+    /// id, into an arm that must read it too. If that arm is ever the
+    /// `_ => true` one, the null session becomes VALID again and `getId()` goes
+    /// back to 32 fabricated bytes: the exact defect the E12 and E22 lanes
+    /// removed, re-created by a widening meant to fix a different one.
+    ///
+    /// A comment saying "land these together" cannot fail a build. This can.
+    #[test]
+    fn the_widened_null_session_is_still_not_negotiated() {
+        use crate::test_utils::MockNativeContext;
+        use cratonvm_native_api::NativeHeapAccess;
+        let mut ctx = MockNativeContext::new();
+        let sess = ctx.alloc_object(ClassId::new(0), NEW13_SSL_SESS_FIELDS);
+        ctx.set_field(sess, NEW13_SESS_TLSID, Value::Int(-1));
+        ctx.set_field(sess, NEW13_SESS_ATTRS, Value::Object(None));
+        assert!(
+            !crate::t27_tls::session_has_negotiated(&ctx, sess),
+            "a {}-field session carrying tls_id = -1 has negotiated NOTHING. \
+             `t27_tls::session_has_negotiated`'s arm for this width must read \
+             slot {} (>= 0), not answer `true` unconditionally — see \
+             NEW13_SSL_SESS_FIELDS's CAVEAT. HotSpot 25.0.3+9-LTS, \
+             unconnected SSLSocket: isValid() = false, getId() = byte[0].",
+            NEW13_SSL_SESS_FIELDS,
+            NEW13_SESS_TLSID
+        );
+    }
+
+    /// MUTATION CHECK for the test above: without it,
+    /// `session_has_negotiated` could answer `false` for every shape and the
+    /// first test would still pass — measuring one branch and calling it
+    /// coverage, the shape this directory keeps recording.
+    #[test]
+    fn the_widened_session_still_reports_a_real_stream_as_negotiated() {
+        use crate::test_utils::MockNativeContext;
+        use cratonvm_native_api::NativeHeapAccess;
+        let mut ctx = MockNativeContext::new();
+        let sess = ctx.alloc_object(ClassId::new(0), NEW13_SSL_SESS_FIELDS);
+        ctx.set_field(sess, NEW13_SESS_TLSID, Value::Int(7));
+        ctx.set_field(sess, NEW13_SESS_ATTRS, Value::Object(None));
+        assert!(
+            crate::t27_tls::session_has_negotiated(&ctx, sess),
+            "a session that recorded stream id 7 DID negotiate"
+        );
+    }
+
+    /// The widening exists so the attribute API has somewhere to write that is
+    /// not the stream id. This pins the slot the two files have to agree on:
+    /// `t27_tls::sslsess_attrs_slot` answers `Some(3)` for width 4, and slot 3
+    /// is `NEW13_SESS_ATTRS`. If they ever part company, a `putValue` lands on
+    /// `NEW13_SESS_TLSID` again.
+    #[test]
+    fn the_attribute_slot_is_the_last_one_and_is_not_the_stream_id() {
+        assert_eq!(
+            NEW13_SESS_ATTRS,
+            NEW13_SSL_SESS_FIELDS - 1,
+            "`t27_tls::sslsess_attrs_slot` resolves this shape's attribute slot \
+             from its WIDTH; the dedicated slot must be the last one"
+        );
+        assert_ne!(
+            NEW13_SESS_ATTRS, NEW13_SESS_TLSID,
+            "the whole point of the widening: `putValue` must not be able to \
+             overwrite the stream id, which is also the negotiation signal"
+        );
+    }
+
+    /// E42 — the two spellings of the enabled-protocol pair, in HotSpot's
+    /// order. `RSslNullSession` asserts the exact string `[TLSv1.3, TLSv1.2]`,
+    /// so the order is not cosmetic.
+    #[test]
+    fn the_enabled_protocol_pair_is_most_preferred_first() {
+        assert_eq!(
+            JSSE_ENABLED_PROTOCOLS,
+            ["TLSv1.3", "TLSv1.2"],
+            "HotSpot 25.0.3+9-LTS, fresh SSLEngine and unconnected SSLSocket \
+             alike: getEnabledProtocols() = [TLSv1.3, TLSv1.2]"
+        );
+    }
+
+    /// E42 — enabled == supported, measured, so the three doors that answer a
+    /// suite list must answer the SAME list. The three inline copies this
+    /// replaced had drifted to 13, 13 and 7 entries.
+    #[test]
+    fn every_suite_list_door_answers_the_one_supported_list() {
+        use crate::test_utils::MockNativeContext;
+        use cratonvm_native_api::NativeHeapAccess;
+        let r = build_registry();
+        let mut ctx = MockNativeContext::new();
+        let expected = crate::t27_tls::SUPPORTED_CIPHER_SUITE_NAMES.len();
+        for (cls, name) in [
+            ("javax/net/ssl/SSLSocketFactory", "getDefaultCipherSuites"),
+            ("javax/net/ssl/SSLSocketFactory", "getSupportedCipherSuites"),
+            ("javax/net/ssl/SSLSocket", "getSupportedCipherSuites"),
+            ("javax/net/ssl/SSLSocket", "getEnabledCipherSuites"),
+        ] {
+            let f = r
+                .find(cls, name, "()[Ljava/lang/String;")
+                .unwrap_or_else(|| panic!("{cls}.{name} registered"));
+            match f(&mut ctx, &[Value::Object(None)]) {
+                Ok(Some(Value::Object(Some(a)))) => assert_eq!(
+                    ctx.array_length(a),
+                    expected,
+                    "{cls}.{name} must answer the one supported list — HotSpot \
+                     25.0.3+9-LTS measures default == supported == enabled, \
+                     element-wise (scratchpad/e42/E42FactoryDefaults.java)"
+                ),
+                other => panic!("{cls}.{name} must return a String[], got {other:?}"),
+            }
         }
     }
 

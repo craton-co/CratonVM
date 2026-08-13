@@ -50186,39 +50186,44 @@ use std::sync::Arc;
         assert!(matches!(obj, Value::Object(Some(_))));
     }
 
-    #[test]
-    fn watch_event_kinds_p66() {
-        let shared = Arc::new(SharedVm::new(VmConfig::default()));
-        let mut thread = JvmThread::new(ThreadId(0), "test");
-        let swek = "java/nio/file/StandardWatchEventKinds";
-
-        let create = call_native(
-            &shared,
-            &mut thread,
-            swek,
-            "ENTRY_CREATE",
-            "Ljava/nio/file/WatchEvent$Kind;",
-            &[],
-        )
-        .unwrap()
-        .unwrap();
-        if let Value::Object(Some(s)) = create {
-            let text = read_java_string(&shared.mem.heap, s).unwrap();
-            assert_eq!(text, "ENTRY_CREATE");
-        }
-
-        let modify = call_native(
-            &shared,
-            &mut thread,
-            swek,
-            "ENTRY_MODIFY",
-            "Ljava/nio/file/WatchEvent$Kind;",
-            &[],
-        )
-        .unwrap()
-        .unwrap();
-        assert!(matches!(modify, Value::Object(Some(_))));
-    }
+    // `watch_event_kinds_p66` WAS HERE AND IS DELETED (E40-1 §1, answering
+    // E36-1 N2(a)). It asserted
+    //
+    //     read_java_string(call_native(StandardWatchEventKinds, "ENTRY_CREATE",
+    //                                  "Ljava/nio/file/WatchEvent$Kind;")) == "ENTRY_CREATE"
+    //
+    // i.e. it did not merely keep a dead registration alive, it PINNED A WRONG
+    // TYPE AS CORRECT. Measured on the oracle (JDK 25.0.3+9-LTS):
+    //
+    //     ENTRY_CREATE.getClass().getName()
+    //       = java.nio.file.StandardWatchEventKinds$StdWatchEventKind
+    //     ENTRY_CREATE.name() = "ENTRY_CREATE"
+    //     ENTRY_CREATE.type() = interface java.nio.file.Path
+    //     (ENTRY_CREATE instanceof String) = false
+    //     javap: public static final WatchEvent$Kind<Path> ENTRY_CREATE;
+    //
+    // The four registrations it drove (`native-builtins/src/phases_late/
+    // nio_file.rs`, `register_p66_watch_service`) each answer
+    // `ctx.create_string("ENTRY_CREATE")` — a `java/lang/String` where the
+    // descriptor names a `WatchEvent$Kind`. They are also unreachable:
+    // `StandardWatchEventKinds.ENTRY_CREATE` compiles to a real `getstatic`
+    // (measured), and `getstatic` never consults the native registry
+    // (E21-1 §1). So EVERY assertion this test could make was one of
+    //   (a) green now and red the moment the type is fixed — what it did;
+    //   (b) red now, because the row answers a String today;
+    //   (c) vacuous — and its second half, `matches!(modify, Object(Some(_)))`,
+    //       already was.
+    // There is no fourth option, which is why the right edit is deletion and
+    // not a rewrite. The row deletion is nominated (E40-1 §5 N1); this file's
+    // `call_native` panics on an unregistered triple, so it had to go first.
+    //
+    // The behaviour worth testing is the CONSUMER, and it lives in a crate this
+    // test module cannot reach through the registry: `native-io`'s
+    // `watch_event_kind_bit` / `watch_event_kind_object`. Replacement coverage
+    // is `native-io/src/lib.rs`'s
+    // `watch_event_kind_bit_translates_all_three_kind_shapes` and
+    // `watch_event_kind_object_round_trips_through_the_bit`, which assert the
+    // oracle's `name()` and reject `OVERFLOW`.
 
     #[test]
     fn start_virtual_thread_p66() {
@@ -50709,56 +50714,39 @@ use std::sync::Arc;
         }
     }
 
-    #[test]
-    fn string_template_basics_p67() {
-        let shared = Arc::new(SharedVm::new(VmConfig::default()));
-        let mut thread = JvmThread::new(ThreadId(0), "test");
-        let st = "java/lang/StringTemplate";
-
-        let text = create_java_string(&shared, "Hello World");
-        let tmpl = call_native(
-            &shared,
-            &mut thread,
-            st,
-            "of",
-            "(Ljava/lang/String;)Ljava/lang/StringTemplate;",
-            &[Value::Object(Some(text))],
-        )
-        .unwrap()
-        .unwrap();
-        assert!(matches!(tmpl, Value::Object(Some(_))));
-
-        if let Value::Object(Some(t)) = tmpl {
-            // interpolate returns the fragment
-            let result = call_native(
-                &shared,
-                &mut thread,
-                st,
-                "interpolate",
-                "()Ljava/lang/String;",
-                &[Value::Object(Some(t))],
-            )
-            .unwrap()
-            .unwrap();
-            if let Value::Object(Some(s)) = result {
-                let txt = read_java_string(&shared.mem.heap, s).unwrap();
-                assert_eq!(txt, "Hello World");
-            }
-        }
-
-        // STR processor
-        let proc = call_native(
-            &shared,
-            &mut thread,
-            st,
-            "STR",
-            "Ljava/lang/StringTemplate$Processor;",
-            &[],
-        )
-        .unwrap()
-        .unwrap();
-        assert!(matches!(proc, Value::Object(Some(_))));
-    }
+    // `string_template_basics_p67` WAS HERE AND IS DELETED WHOLE (E40-1 §1,
+    // answering E36-1 N2(b) — and going further than that nomination did).
+    //
+    // Measured on the oracle (JDK 25.0.3+9-LTS, Microsoft build 25.0.3+9):
+    //
+    //     $ javap -p java.lang.StringTemplate
+    //     Error: class not found: java.lang.StringTemplate
+    //
+    // The class does not exist. String templates were a preview API (JEP 430 in
+    // 21, JEP 459 in 22) and were WITHDRAWN; nothing in JDK 25 declares
+    // `java.lang.StringTemplate`, and no javac on this host can compile a
+    // reference to it. E36-1 N2(b) asked only for the `STR` block to go,
+    // keeping `of`/`interpolate` because they "exercise real method-shaped
+    // registrations". Method-shaped is not the same as reachable: being an
+    // `invokestatic` target only helps if some classfile can name the class,
+    // and none can. The whole test drove one withdrawn class, so the whole test
+    // goes; the paired registrar deletion is nominated (E40-1 §5 N2).
+    //
+    // Two further facts found while checking, and recorded because they change
+    // the verdict on the half E36-1 wanted kept:
+    //
+    //  * `fragments` is registered `()Ljava/util/List;` and its body is
+    //    `Ok(Some(ctx.get_field(this, 0)))` — slot 0 is the String handed to
+    //    `of(String)`. It answers a `java/lang/String` where its own descriptor
+    //    names a `java/util/List`. That is the SAME defect as
+    //    `watch_event_kinds_p66`'s (a native answering in a form its descriptor
+    //    does not name), in the family E36-1 proposed to keep, and no test
+    //    called it — so the family was not "half tested, half dead", it was
+    //    half dead and half untested.
+    //  * this test's own `interpolate` assertion sat inside
+    //    `if let Value::Object(Some(s)) = result` with no `else`, so an
+    //    `interpolate` that returned `Value::Int(0)` or a null would have
+    //    passed it silently.
 
     #[test]
     fn parameterized_type_p67() {
@@ -50882,7 +50870,25 @@ use std::sync::Arc;
         .unwrap();
         assert!(matches!(logger, Value::Object(Some(_))));
 
-        // isLoggable
+        // isLoggable — DIVERGENCE PIN, NOT A CORRECTNESS ASSERTION (E40-1 §1).
+        //
+        // This row answers `true` for every level, and this assertion is here
+        // to make that visible, not to bless it. Measured on the oracle (JDK
+        // 25.0.3+9-LTS), `System.getLogger("test.logger")` is a
+        // `sun.util.logging.internal.LoggingProviderImpl$JULWrapper` and:
+        //
+        //     isLoggable(ALL)=false   isLoggable(TRACE)=false
+        //     isLoggable(DEBUG)=false isLoggable(INFO)=true
+        //     isLoggable(WARNING)=true isLoggable(ERROR)=true
+        //     isLoggable(OFF)=true
+        //     isLoggable(null) -> NullPointerException: Cannot invoke
+        //       "java.util.logging.Level.intValue()" because "level" is null
+        //
+        // So the JDK answers `false` for the three levels below the default,
+        // and THROWS for the argument this call actually passes. Fixing that
+        // needs the severity comparison this VM has nowhere to do yet — see the
+        // `Level` note below — so the answer is left as it is and labelled.
+        // Nominated: E40-1 §5 N3.
         let loggable = call_native(
             &shared,
             &mut thread,
@@ -50893,20 +50899,59 @@ use std::sync::Arc;
         )
         .unwrap()
         .unwrap();
-        assert_eq!(loggable, Value::Int(1));
+        assert_eq!(
+            loggable,
+            Value::Int(1),
+            "isLoggable is a fabricated unconditional `true`; HotSpot answers \
+             false for ALL/TRACE/DEBUG on a default logger and NPEs on a null \
+             level. Change this only together with the fix, not to match a \
+             different fabrication"
+        );
 
-        // Logger.Level enum
-        let info = call_native(
-            &shared,
-            &mut thread,
-            "java/lang/System$Logger$Level",
-            "INFO",
-            "Ljava/lang/System$Logger$Level;",
-            &[],
-        )
-        .unwrap()
-        .unwrap();
-        assert!(matches!(info, Value::Object(Some(_))));
+        // NO `System$Logger$Level` ASSERTION HERE, DELIBERATELY (E40-1 §1,
+        // answering E36-1 N2(c)).
+        //
+        // What stood here was
+        //
+        //     call_native("java/lang/System$Logger$Level", "INFO",
+        //                 "Ljava/lang/System$Logger$Level;", &[])
+        //     assert!(matches!(info, Value::Object(Some(_))));
+        //
+        // — an existence check on one of seven field-shaped rows in
+        // `native-builtins/src/phases_late.rs` that no bytecode can reach
+        // (`Level.INFO` compiles to a real `getstatic`, and `getstatic` never
+        // consults the native registry, E21-1 §1). A non-null answer is
+        // precisely what a nameless, severity-less enum constant also gives, so
+        // the assertion could not distinguish a working constant from a broken
+        // one.
+        //
+        // E36-1 §4c DECIDED NOT TO CONVERT THESE ROWS TO A `<clinit>`, and that
+        // decision is upheld here rather than quietly completed. Its reason,
+        // restated so this test is not "finished" by someone who has not read
+        // it: `java.lang.System$Logger$Level` is a REAL JDK class with real
+        // `<clinit>` bytecode in every image, a registered native `<clinit>`
+        // BEATS real bytecode on the cold interpreter path, and the class
+        // carries `private final int severity`. Measured on the oracle
+        // (JDK 25.0.3+9-LTS):
+        //
+        //     ALL=-2147483648 TRACE=400 DEBUG=500 INFO=800
+        //     WARNING=900 ERROR=1000 OFF=2147483647
+        //     (javap also shows getName() and $VALUES)
+        //
+        // A conversion that writes only `name`/`ordinal` therefore SHADOWS the
+        // real `<clinit>` and turns `getSeverity()` into 0 for every level —
+        // trading a dead row for a live regression, in the mode that matters
+        // most. And `classloading/src/class_manager.rs` declares no statics for
+        // this class at all (`grep -c "System\$Logger\$Level"` there is 0,
+        // re-checked 2026-08-13), while `set_static_field_by_name` is a silent
+        // no-op for an undeclared static — so a `<clinit>` landed alone would
+        // publish into the void on the synthetic side as well.
+        //
+        // The test worth having is not an existence check at all: it reads
+        // `INFO` out of the STATIC and asserts `name() == "INFO"` and
+        // `getSeverity() == 800`. It belongs with that conversion, not before
+        // it. Until then this test asserts nothing about `Level`, which is the
+        // honest state — a dead row with a recorded blocker is not coverage.
     }
 
     #[test]
@@ -61223,22 +61268,36 @@ use std::sync::Arc;
         assert_eq!(end, Some(Value::Int(6))); // "123def" has length 6
     }
 
-    /// G37: Multi-catch — multiple exception table entries with same handler_pc.
-    /// This test verifies the interpreter's find_exception_handler iterates all entries.
-    #[test]
-    fn multi_catch_exception_handler() {
-        // We can't easily construct bytecode with multi-catch in a unit test,
-        // but we verify the handler lookup behavior: multiple entries for the same
-        // PC range pointing to the same handler_pc, with different catch_type values.
-        // This is validated by the find_exception_handler function which iterates
-        // all exception table entries — multi-catch "just works" at bytecode level.
-        //
-        // Verified correct: find_exception_handler at interpreter.rs:2374 iterates
-        // all entries with `for entry in frame.exception_table().iter()`, and any
-        // matching catch_type (or catch_type==0 for catch-all) returns the handler_pc.
-        // Multi-catch produces multiple entries: {start, end, handler, IOException},
-        // {start, end, handler, SQLException}, etc. — all naturally matched.
-    }
+    // `multi_catch_exception_handler` (G37) WAS HERE AND IS DELETED (E40-1 §3).
+    //
+    // Its body was EMPTY — fifteen lines of comment and not one statement — so
+    // it could not fail under any input, any interpreter change, or any
+    // deletion of the code it named. It was one of four such tests in this file
+    // and the only one with no executable line at all. Mutating the code under
+    // test cannot turn it red because it does not call the code under test.
+    //
+    // Worse, it read as coverage while its own text admits it is not: "We can't
+    // easily construct bytecode with multi-catch in a unit test, but we verify
+    // the handler lookup behavior" — followed by a paragraph of code review
+    // ("Verified correct: find_exception_handler at interpreter.rs:2374
+    // iterates all entries..."), which is a claim about a source file, at a
+    // line number, made by a reader. `find_exception_handler` has since moved
+    // to `vm/src/runtime/interpreter/exception_dispatch.rs:226`, so the
+    // citation had already rotted, and nothing would have reported that.
+    //
+    // The claim is still worth testing, and the premise ("can't easily
+    // construct bytecode") is FALSE in this file today: `register_test_class`
+    // takes a `CodeAttribute` with a real `exception_table`, and the tests from
+    // `reflect_method_invoke_static_void` onward drive hand-assembled bytecode
+    // through the interpreter. The test worth having builds ONE method whose
+    // table holds two entries over the same PC range with the same
+    // `handler_pc` and two DIFFERENT `catch_type`s, throws each of the two
+    // exception classes in turn, and asserts the handler ran for both — and it
+    // must also assert the negative, that a third, unrelated class does NOT
+    // reach that handler, or a `find_exception_handler` that returns the first
+    // entry unconditionally would pass. `find_exception_handler` is
+    // `pub(super)` to `crate::runtime::interpreter`, so a direct unit test
+    // belongs in that module, not here. Nominated: E40-1 §5 N4.
 
     // =======================================================================
     // Phase 46: Formatting and ClassLoader fixes

@@ -8331,22 +8331,30 @@ pub fn register_essential_natives_with_shims(
     // — clobbering the marker `getOurStackTrace()` keys on. The shared natives
     // write `detailMessage` by name, seed the `cause = this` sentinel, and
     // capture the trace.
-    for cls in &[
-        "java/lang/ClassCastException",
-        "java/lang/IllegalArgumentException",
-        "java/lang/IllegalStateException",
-        "java/lang/IllegalThreadStateException",
-        "java/lang/UnsupportedOperationException",
-        "java/lang/NullPointerException",
-        "java/lang/IndexOutOfBoundsException",
-        "java/lang/ArrayIndexOutOfBoundsException",
-        "java/lang/StringIndexOutOfBoundsException",
-        "java/lang/NumberFormatException",
-        "java/lang/SecurityException",
-        "java/lang/NoSuchMethodError",
-        "java/lang/NoSuchFieldError",
-        "java/lang/VerifyError",
-    ] {
+    //
+    // E43 (2026-08-13): this list held fourteen classes. Thirteen of them —
+    // ClassCastException, IllegalArgumentException, IllegalStateException,
+    // UnsupportedOperationException, NullPointerException,
+    // IndexOutOfBoundsException, ArrayIndexOutOfBoundsException,
+    // StringIndexOutOfBoundsException, NumberFormatException,
+    // SecurityException, NoSuchMethodError, NoSuchFieldError and VerifyError —
+    // are rows of the JDK-derived table in
+    // `lang_misc::register_throwable_subclass_natives`, which every one of them
+    // lists with BOTH `()V` and `(Ljava/lang/String;)V`, bound to these exact
+    // two bodies. That registrar is called from THIS function, further down
+    // (search `register_throwable_subclass_natives`), with no early return in
+    // between, and `register` is last-write-wins — so all 26 of those
+    // registrations were overwritten by an identical pair a few hundred lines
+    // later, every boot, in both modes. Deleting them is a provable no-op and
+    // it is 26 fewer shadowed rows for the duplicate-registration census.
+    //
+    // `java/lang/IllegalThreadStateException` is the one name that is NOT in
+    // that table, so it is the one that has to stay. MEASURED on JDK 25.0.3+9:
+    // it declares `()V` and `(Ljava/lang/String;)V` and both are public, so
+    // this pair satisfies the same rule the table is built from — a descriptor
+    // belongs iff the real class declares it and it is public (or was already
+    // registered). It is not registered anywhere else.
+    for cls in &["java/lang/IllegalThreadStateException"] {
         let cls_static: &'static str = Box::leak(cls.to_string().into_boxed_str());
         registry.register(
             cls_static,
@@ -21814,68 +21822,43 @@ pub fn register_synthetic_overrides(registry: &mut NativeMethodRegistry) {
     // subclass natives are registered in BOTH synthetic-jdk and real-JDK
     // modes — see bench/wildfly-boot/diagnostic.md §WP8.10.7.)
 
-    // --- Exception constructors ---
-    // Throwable/Exception/RuntimeException/<init>()V — no-op (fields default to null)
-    // <init>(Ljava/lang/String;)V — set field 0 = message
-    // <init>(Ljava/lang/String;Ljava/lang/Throwable;)V — set field 0 = message, field 1 = cause
-    // <init>(Ljava/lang/Throwable;)V — set field 1 = cause
-    for exc_class in &[
-        "java/lang/Throwable",
-        "java/lang/Exception",
-        "java/lang/RuntimeException",
-        "java/lang/Error",
-        "java/lang/LinkageError",
-        "java/lang/VerifyError",
-        "java/lang/NoClassDefFoundError",
-        "java/lang/NullPointerException",
-        "java/lang/ArithmeticException",
-        "java/lang/ArrayIndexOutOfBoundsException",
-        "java/lang/IndexOutOfBoundsException",
-        "java/lang/StringIndexOutOfBoundsException",
-        "java/lang/ClassCastException",
-        "java/lang/IllegalArgumentException",
-        "java/lang/IllegalStateException",
-        "java/lang/UnsupportedOperationException",
-        "java/lang/ClassNotFoundException",
-        "java/lang/NoSuchMethodException",
-        "java/lang/reflect/InvocationTargetException",
-        "java/lang/StackOverflowError",
-        "java/lang/OutOfMemoryError",
-        "java/util/NoSuchElementException",
-        "java/util/InputMismatchException",
-        "java/io/IOException",
-        "java/io/FileNotFoundException",
-        "java/lang/NumberFormatException",
-        "java/util/ConcurrentModificationException",
-        "java/lang/NegativeArraySizeException",
-        "java/lang/AssertionError",
-        "java/lang/MatchException",
-    ] {
-        // No-arg exception constructor — message defaults to null, but
-        // `cause` must be initialized to the self-sentinel (`this`) so a
-        // later `initCause()` call succeeds. JDK declares
-        // `private Throwable cause = this;` and our `<init>` shadows the
-        // bytecode that mirrors that initializer.
-        registry.register(exc_class, "<init>", "()V", native_exc_init_noargs);
-        registry.register(
-            exc_class,
-            "<init>",
-            "(Ljava/lang/String;)V",
-            native_exc_init_message,
-        );
-        registry.register(
-            exc_class,
-            "<init>",
-            "(Ljava/lang/String;Ljava/lang/Throwable;)V",
-            native_exc_init_message_cause,
-        );
-        registry.register(
-            exc_class,
-            "<init>",
-            "(Ljava/lang/Throwable;)V",
-            native_exc_init_cause,
-        );
-    }
+    // --- Exception constructors: DELETED, they are the table's job now ---
+    //
+    // E34-1 §7 site 3, collapsed by E43 (2026-08-13). This was a `for exc_class
+    // in &[30 class names]` loop registering the SAME four descriptors — `()V`,
+    // `(String)V`, `(String,Throwable)V`, `(Throwable)V` — on every one of them:
+    // 120 registrations, of which 82 restated what
+    // `lang_misc::register_throwable_subclass_natives`' per-class JDK-derived
+    // table had already registered (with better bodies) and 38 named
+    // constructors the real JDK 25 class DOES NOT DECLARE.
+    //
+    // All 30 names are in that table (MEASURED: set difference is empty), and
+    // `register_builtins` calls `register_essential_natives` — which reaches
+    // `register_throwable_subclass_natives` — BEFORE it calls this function, so
+    // deleting the loop does not leave a single descriptor unregistered. It
+    // stops this function from LAST-WRITE-WINNING over the table.
+    //
+    // Two consequences worth naming, because they are behaviour changes and not
+    // just bookkeeping:
+    //   * `java/lang/AssertionError.<init>(Ljava/lang/String;)V` — the private
+    //     one that `AssertionError(Object)`'s own bytecode calls via
+    //     `this(String.valueOf(...))` — now runs `lang_misc`'s body instead of
+    //     this loop's identical one, which is the same effect. The (Object)
+    //     overload and the six primitive overloads are unaffected either way:
+    //     this loop never registered them, and the table already does.
+    //   * `java/lang/reflect/InvocationTargetException.<init>()V` and
+    //     `(Ljava/lang/Throwable;)V` were being overwritten HERE with the
+    //     generic message/cause bodies, so the wrapped throwable landed in
+    //     `cause` rather than the JDK's `target` field. The table's
+    //     `native_invocation_target_exception_init_target` now wins, and
+    //     `target` is a declared field on the synthetic stub
+    //     (`class_manager.rs::synthetic_stub_fields`), so the by-name write
+    //     lands in both modes.
+    //
+    // Do not re-add a blanket list here. `the_blanket_four_ctor_loops_stay_
+    // collapsed_onto_the_table` (bottom of this file) is a source witness that
+    // fails if this loop or its twin in `register_exception_extras_natives`
+    // comes back.
 
     // --- java.lang.Thread ---
     registry.register("java/lang/Thread", "registerNatives", "()V", native_noop);
@@ -38823,8 +38806,52 @@ fn register_enterprise_natives(registry: &mut NativeMethodRegistry) {
 // ===========================================================================
 
 fn register_exception_extras_natives(registry: &mut NativeMethodRegistry) {
-    // Register constructors for commonly-needed exception types
-    // All use the standard Throwable 2-field layout (field 0 = message, field 1 = cause)
+    // Bridges for commonly-needed exception types: `getMessage()` and
+    // `toString()`. All use the standard Throwable 2-field layout
+    // (field 0 = message, field 1 = cause).
+    //
+    // THIS FUNCTION NO LONGER REGISTERS CONSTRUCTORS FROM THIS LIST.
+    //
+    // E34-1 §7 site 4, collapsed by E43 (2026-08-13). Until now the loop below
+    // also registered the same four `<init>` descriptors — `()V`, `(String)V`,
+    // `(String,Throwable)V`, `(Throwable)V` — on every name here: 212
+    // registrations. It was a copy-paste twin of
+    // `lang_misc::register_throwable_subclass_natives`, carrying that
+    // function's two long "deliberately NOT in this list" comments verbatim
+    // (they are still below, because they still explain the getMessage
+    // bridges, which is what they were always really about) over a list that
+    // had since drifted, and bound to a second set of ctor bodies.
+    //
+    // It is called from `register_synthetic_overrides` AND from
+    // `reflect_annotations.rs`, i.e. in BOTH modes, and in both it runs AFTER
+    // `register_throwable_subclass_natives`. There is no unregister API, so
+    // `register` is last-write-wins: these 212 rows were the ones actually
+    // answering for ~52 classes, and the JDK-derived table was being buried.
+    //
+    // MEASURED on JDK 25.0.3+9-LTS (`scratchpad/e43/Removals43.java`, which
+    // reflects over every (class, descriptor) this loop registered that the
+    // table does not carry): 89 such pairs across sites 3 and 4, of which
+    //   * 85 are constructors the real class DOES NOT DECLARE AT ALL, so no
+    //     `javac` on any real JDK could ever have compiled a call to them —
+    //     e.g. `java/io/UncheckedIOException` was advertising all four while
+    //     declaring none of them, and `java/text/ParseException` likewise;
+    //   * 4 are real, and all four are `java/lang/VirtualMachineError`, the one
+    //     name here that is outside the table's measured 62. They are restated
+    //     explicitly after the loop rather than deleted.
+    //
+    // The two ctor bodies were diffed, as E34-1 N3 asked. `lang_misc::
+    // native_exc_init_noargs` and `native_exception_init_empty` are the same
+    // three statements. `lang_misc::native_exc_init_message` and
+    // `native_exception_init_msg` are the same three statements plus, in the
+    // latter, the opt-in `CRATONVM_DBG_NPE_TRACE` surefire forensic — which
+    // fires only for `NullPointerException("Name is null")`. That single
+    // difference is preserved by one named re-registration after the loop, so
+    // collapsing onto the table does not silently retire a diagnostic.
+    //
+    // ADDING A CLASS HERE: it must also be a row of the table in
+    // `lang_misc.rs` (or be added to the allow-list in
+    // `the_blanket_four_ctor_loops_stay_collapsed_onto_the_table`, which is a
+    // source witness at the bottom of this file that enforces exactly that).
     let exceptions = [
         "java/lang/Error",
         "java/lang/AssertionError",
@@ -38907,25 +38934,10 @@ fn register_exception_extras_natives(registry: &mut NativeMethodRegistry) {
         "java/util/concurrent/BrokenBarrierException",
     ];
     for exc in &exceptions {
-        registry.register(exc, "<init>", "()V", native_exception_init_empty);
-        registry.register(
-            exc,
-            "<init>",
-            "(Ljava/lang/String;)V",
-            native_exception_init_msg,
-        );
-        registry.register(
-            exc,
-            "<init>",
-            "(Ljava/lang/String;Ljava/lang/Throwable;)V",
-            crate::lang_misc::native_exc_init_message_cause,
-        );
-        registry.register(
-            exc,
-            "<init>",
-            "(Ljava/lang/Throwable;)V",
-            crate::lang_misc::native_exc_init_cause,
-        );
+        // No `<init>` here — see this function's header. The constructors for
+        // every name in this list come from the JDK-derived per-class table in
+        // `lang_misc::register_throwable_subclass_natives`, which runs earlier
+        // on both boot paths.
         registry.register(
             exc,
             "getMessage",
@@ -38939,6 +38951,69 @@ fn register_exception_extras_natives(registry: &mut NativeMethodRegistry) {
             native_exception_to_string,
         );
     }
+
+    // `java/lang/VirtualMachineError` is the ONE name above that the table does
+    // not carry, so it is the one whose constructors this function must still
+    // register — deleting them would have left it with none. It keeps its
+    // HISTORICAL bodies, byte-for-byte the pair the deleted loop gave it, so
+    // this is a no-op for it and not a quiet re-binding.
+    //
+    // It also happens to be a class for which the blanket four were right.
+    // MEASURED, `javap -p java.lang.VirtualMachineError` on JDK 25.0.3+9-LTS:
+    //     public VirtualMachineError();
+    //     public VirtualMachineError(String);
+    //     public VirtualMachineError(String, Throwable);
+    //     public VirtualMachineError(Throwable);
+    // All four declared, all four public — the same rule the table is built
+    // from admits all four. It is abstract, so no `new` reaches them directly;
+    // the reachable path is a subclass's `super(...)`, which is an
+    // `invokespecial` on this exact triple.
+    //
+    // This is the same treatment application throwables get. A `…/DbException`
+    // is not in the table and never was in this list either; its `<init>` is
+    // answered by `vm_exec.rs`'s final native-registry fallback walking up the
+    // dispatch chain to `java/lang/RuntimeException`, whose four descriptors
+    // the table still carries, and its stub still declares the historical four
+    // via `class_manager.rs::synthetic_stub_ctor_methods`' `is_throwable_like`
+    // arm. Nothing in this change narrows either of those.
+    let vm_error = "java/lang/VirtualMachineError";
+    registry.register(vm_error, "<init>", "()V", native_exception_init_empty);
+    registry.register(
+        vm_error,
+        "<init>",
+        "(Ljava/lang/String;)V",
+        native_exception_init_msg,
+    );
+    registry.register(
+        vm_error,
+        "<init>",
+        "(Ljava/lang/String;Ljava/lang/Throwable;)V",
+        crate::lang_misc::native_exc_init_message_cause,
+    );
+    registry.register(
+        vm_error,
+        "<init>",
+        "(Ljava/lang/Throwable;)V",
+        crate::lang_misc::native_exc_init_cause,
+    );
+
+    // The one behavioural difference between the two ctor-body families, kept
+    // alive by name rather than by a 212-row loop.
+    //
+    // `native_exception_init_msg` is `lang_misc::native_exc_init_message` plus
+    // the `CRATONVM_DBG_NPE_TRACE` surefire forensic, and that forensic fires
+    // for exactly one class and message: `NullPointerException("Name is null")`
+    // (`java.lang.Enum.valueOf(null)`'s text). `(Ljava/lang/String;)V` is a
+    // declared public constructor of `java/lang/NullPointerException` and is a
+    // row of the table, so this restates a triple the table already owns with
+    // a strict superset of its body — it does not widen the registered
+    // surface by one descriptor.
+    registry.register(
+        "java/lang/NullPointerException",
+        "<init>",
+        "(Ljava/lang/String;)V",
+        native_exception_init_msg,
+    );
 }
 
 fn native_exception_init_empty(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -45055,5 +45130,223 @@ mod radix_to_string_tests {
         assert_eq!(java_int_to_string_radix(255, 16), "ff");
         assert_eq!(java_int_to_string_radix(255, 8), "377");
         assert_eq!(java_long_to_string_radix(255, 36), "73");
+    }
+}
+
+/// The Throwable `<init>` rule is allowed to exist at ONE place in this crate.
+///
+/// Background: the rule "register these four fixed `<init>` descriptors on a
+/// list of throwable class names" was implemented at five sites. E34 replaced
+/// site 1 (`lang_misc::register_throwable_subclass_natives`) with a per-class
+/// table derived from JDK 25 by reflection, and mirrored it into the synthetic
+/// stub declarations in `classloading/src/class_manager.rs`. E43 deleted the
+/// other copies in this file. The copies were not harmless: they ran LATER, and
+/// `NativeMethodRegistry::register` is last-write-wins with no unregister API,
+/// so the blanket four buried the measured table for ~52 classes and kept 85
+/// descriptors registered that the real JDK class does not declare at all.
+///
+/// The failure mode this test exists to catch is the one that already happened
+/// four times: someone needs one more exception constructor, finds a
+/// convenient list of exception class names in this file, and adds a blanket
+/// loop next to it. That is silent — nothing errors, the registry just answers
+/// with the wrong body for fifty classes.
+///
+/// This is a SOURCE witness. It reads this crate's own working-tree sources
+/// rather than a built registry, because the two boot paths that reach the
+/// collapsed sites live behind different feature configurations
+/// (`register_synthetic_overrides` is `#[cfg(feature = "synthetic-jdk")]`,
+/// `reflect_annotations`' promotion is the real-JDK one) and a `#[cfg(feature
+/// = ...)]` test only guards the configuration it is compiled into. A source
+/// scan guards both, and it runs with no VM boot.
+///
+/// Non-vacuity, since a source witness that finds nothing passes loudly:
+/// every lookup below panics with a named message when it misses, the two
+/// extracted function bodies are size-checked, the parsed table is
+/// row-count-checked, and the allow-list is checked to be exactly as small as
+/// it claims — including that its one member is genuinely absent from the
+/// table, so the exemption expires the moment the table absorbs it.
+#[cfg(test)]
+mod throwable_ctor_single_table_witness {
+    /// The only class this crate may register throwable constructors for
+    /// outside the JDK-derived table, and why.
+    ///
+    /// `java/lang/VirtualMachineError` is the single name in
+    /// `register_exception_extras_natives`' list that E34's 62-class table does
+    /// not carry. MEASURED (`javap -p`, JDK 25.0.3+9-LTS): it declares `()V`,
+    /// `(String)V`, `(String,Throwable)V` and `(Throwable)V`, all public — so
+    /// the blanket four are, for this one class, exactly the right set. When a
+    /// future regeneration adds it to the table, this list must shrink to
+    /// empty; the assertion below fails until it does.
+    const ALLOWED_OUTSIDE_THE_TABLE: &[&str] = &["java/lang/VirtualMachineError"];
+
+    /// Text of one top-level `fn` in this file, from its signature to the next
+    /// closing brace in column 0. Panics rather than returning an empty body.
+    fn top_level_fn_body<'a>(src: &'a str, signature: &str, what: &str) -> &'a str {
+        let start = src
+            .find(signature)
+            .unwrap_or_else(|| panic!("{what}: {signature:?} not found in native-builtins/src/lib.rs — this witness cannot check what it cannot find"));
+        let rest = &src[start + 1..];
+        let stop = rest
+            .find("\n}\n")
+            .unwrap_or_else(|| panic!("{what}: no column-0 closing brace after {signature:?}"));
+        &rest[..stop]
+    }
+
+    #[test]
+    fn the_blanket_four_ctor_loops_stay_collapsed_onto_the_table() {
+        let src_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let lib = std::fs::read_to_string(src_dir.join("lib.rs"))
+            .expect("native-builtins/src/lib.rs is readable");
+        let lang_misc = std::fs::read_to_string(src_dir.join("lang_misc.rs"))
+            .expect("native-builtins/src/lang_misc.rs is readable");
+
+        // Assembled, not written as one literal, so this test's own text is
+        // never what a scan of these files finds.
+        let begin = format!("// THROWABLE-CTOR-{}-BEGIN", "TABLE").replace("-BEGIN", " BEGIN");
+        let end = format!("// THROWABLE-CTOR-{}-END", "TABLE").replace("-END", " END");
+        let ctor = format!("\"{}\"", "<init>");
+
+        // --- 1. the one table, read out of the file that owns it -------------
+        let start = lang_misc
+            .find(&begin)
+            .unwrap_or_else(|| panic!("table start marker {begin:?} not found in lang_misc.rs"));
+        let stop = lang_misc[start..]
+            .find(&end)
+            .map(|i| start + i)
+            .unwrap_or_else(|| panic!("table end marker {end:?} not found in lang_misc.rs"));
+        let table: Vec<&str> = lang_misc[start..stop]
+            .lines()
+            .filter_map(|line| {
+                line.trim()
+                    .strip_prefix("(\"")
+                    .and_then(|rest| rest.split_once("\", &["))
+                    .map(|(class, _)| class)
+            })
+            .collect();
+        assert!(
+            table.len() >= 60,
+            "parsed only {} rows out of the throwable ctor table; the extractor is broken and \
+             everything below would be comparing against nothing",
+            table.len()
+        );
+
+        // --- 2. site 3 is gone and stays gone --------------------------------
+        let synthetic = top_level_fn_body(
+            &lib,
+            "\npub fn register_synthetic_overrides(",
+            "site 3 (register_synthetic_overrides)",
+        );
+        assert!(
+            synthetic.len() > 50_000,
+            "register_synthetic_overrides extracted as only {} bytes — the body scan is broken",
+            synthetic.len()
+        );
+        let site3_binder = format!("for {} in", "exc_class");
+        assert!(
+            !synthetic.contains(&site3_binder),
+            "`register_synthetic_overrides` has a `{site3_binder} ...` loop again. That was E34-1 \
+             §7 site 3: 120 registrations over 30 class names, of which 82 restated the \
+             JDK-derived table in lang_misc.rs (worse: LATER, so they won the slot) and 38 named \
+             constructors JDK 25 does not declare. Add the class to the table instead."
+        );
+
+        // --- 3. site 4 registers no constructors from its list ---------------
+        let extras = top_level_fn_body(
+            &lib,
+            "\nfn register_exception_extras_natives(",
+            "site 4 (register_exception_extras_natives)",
+        );
+        assert!(
+            extras.len() > 2_000,
+            "register_exception_extras_natives extracted as only {} bytes — body scan is broken",
+            extras.len()
+        );
+        let loop_head = format!("for {} in &exceptions {{", "exc");
+        let loop_start = extras.find(&loop_head).unwrap_or_else(|| {
+            panic!("site 4's `{loop_head}` loop is gone; re-point this witness")
+        });
+        let loop_body = {
+            let rest = &extras[loop_start..];
+            let stop = rest
+                .find("\n    }\n")
+                .unwrap_or_else(|| panic!("site 4's loop has no column-4 closing brace"));
+            &rest[..stop]
+        };
+        assert!(
+            loop_body.len() > 200,
+            "site 4's loop body extracted as {} bytes — the scan is broken",
+            loop_body.len()
+        );
+        assert!(
+            !loop_body.contains(&ctor),
+            "`register_exception_extras_natives` registers constructors from its class list \
+             again. That list is a getMessage/toString bridge list; it is NOT a constructor \
+             table, and it drifted away from the real one for long enough to keep 85 \
+             non-existent descriptors registered. The constructors belong in the per-class \
+             table in lang_misc.rs."
+        );
+
+        // --- 4. every class it does bridge is a row of the table -------------
+        let list_start = extras
+            .find("let exceptions = [")
+            .expect("site 4's class list is gone; re-point this witness");
+        let list_end = extras[list_start..]
+            .find("];")
+            .map(|i| list_start + i)
+            .expect("site 4's class list has no terminator");
+        let listed: Vec<&str> = extras[list_start..list_end]
+            .lines()
+            .filter_map(|line| {
+                let line = line.trim();
+                line.strip_prefix('"')
+                    .and_then(|rest| rest.strip_suffix("\","))
+                    .filter(|c| c.contains('/'))
+            })
+            .collect();
+        assert!(
+            listed.len() >= 50,
+            "parsed only {} classes out of site 4's list; the extractor is broken",
+            listed.len()
+        );
+        for class in &listed {
+            assert!(
+                table.contains(class) || ALLOWED_OUTSIDE_THE_TABLE.contains(class),
+                "`register_exception_extras_natives` bridges {class}, which is neither a row of \
+                 the JDK-derived throwable table in lang_misc.rs nor in this witness's \
+                 allow-list. Two lists of throwable class names that are allowed to disagree is \
+                 exactly how the four copies of this rule drifted apart. Add it to the table \
+                 (regenerate with scratchpad/e34/Gen34.java) or justify it here."
+            );
+        }
+
+        // --- 5. the allow-list cannot be padded ------------------------------
+        for exempt in ALLOWED_OUTSIDE_THE_TABLE {
+            assert!(
+                listed.contains(exempt),
+                "{exempt} is exempted by this witness but is not actually registered by \
+                 `register_exception_extras_natives` — a stale exemption is a hole"
+            );
+            assert!(
+                !table.contains(exempt),
+                "{exempt} is now a row of the JDK-derived table, so its hand-written \
+                 constructors in `register_exception_extras_natives` are a second copy again. \
+                 Delete them and remove it from ALLOWED_OUTSIDE_THE_TABLE."
+            );
+        }
+
+        // --- 6. the constructors site 4 still registers are the named few ----
+        // Four for the allow-listed class, plus one deliberate restatement of
+        // `NullPointerException.<init>(Ljava/lang/String;)V` that carries the
+        // opt-in CRATONVM_DBG_NPE_TRACE forensic. Pinned so that a new
+        // constructor smuggled in here is a failing diff, not a silent one.
+        let ctors_outside_the_loop = extras.matches(&ctor).count();
+        assert_eq!(
+            ctors_outside_the_loop,
+            4 * ALLOWED_OUTSIDE_THE_TABLE.len() + 1,
+            "`register_exception_extras_natives` registers {ctors_outside_the_loop} constructor \
+             descriptors; it is allowed exactly four per allow-listed class plus the one \
+             `NullPointerException.<init>(Ljava/lang/String;)V` restatement that keeps the \
+             surefire NPE forensic alive. Anything else belongs in the table."
+        );
     }
 }

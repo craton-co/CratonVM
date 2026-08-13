@@ -471,55 +471,35 @@ pub(crate) fn register_string_builder_natives(registry: &mut NativeMethodRegistr
     registry.register(class, "capacity", "()I", native_sb_capacity);
     registry.register(class, "ensureCapacity", "(I)V", native_sb_ensure_cap);
     registry.register(class, "trimToSize", "()V", native_sb_trim_to_size);
-    // Java 21: StringBuilder.repeat(CharSequence, int) / repeat(int codePoint, int count)
-    registry.register(
-        class,
-        "repeat",
-        "(Ljava/lang/CharSequence;I)Ljava/lang/StringBuilder;",
-        |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            let cs = match args.get(1) {
-                Some(Value::Object(Some(o))) => *o,
-                _ => return Ok(Some(Value::Object(Some(this)))),
-            };
-            let count = match args.get(2) {
-                Some(Value::Int(v)) => (*v).max(0) as usize,
-                _ => 0,
-            };
-            let cs_str = ctx.read_string(cs).unwrap_or_default();
-            let cs_chars: Vec<u16> = cs_str.encode_utf16().collect();
-            let mut chars = sb_read_chars(ctx, this);
-            for _ in 0..count {
-                chars.extend_from_slice(&cs_chars);
-            }
-            let this = sb_write_chars(ctx, this, &chars);
-            Ok(Some(Value::Object(Some(this))))
-        },
-    );
-    registry.register(
-        class,
-        "repeat",
-        "(Ljava/lang/String;I)Ljava/lang/StringBuilder;",
-        |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            let s = match args.get(1) {
-                Some(Value::Object(Some(o))) => *o,
-                _ => return Ok(Some(Value::Object(Some(this)))),
-            };
-            let count = match args.get(2) {
-                Some(Value::Int(v)) => (*v).max(0) as usize,
-                _ => 0,
-            };
-            let s_str = ctx.read_string(s).unwrap_or_default();
-            let s_chars: Vec<u16> = s_str.encode_utf16().collect();
-            let mut chars = sb_read_chars(ctx, this);
-            for _ in 0..count {
-                chars.extend_from_slice(&s_chars);
-            }
-            let this = sb_write_chars(ctx, this, &chars);
-            Ok(Some(Value::Object(Some(this))))
-        },
-    );
+    // Java 21: StringBuilder.repeat(CharSequence, int) / repeat(String, int).
+    //
+    // These MUST be natives: unregistered, they fall through to the real
+    // `AbstractStringBuilder.repeat` → `ensureCapacityNewCoder` →
+    // `Arrays.copyOf(value, …)` bytecode, which treats `value` as a
+    // compact-string `byte[]`. CratonVM's StringBuilder backing is a `char[]`,
+    // so the real bytecode's `System.arraycopy` copies char[]→byte[] and throws
+    // `ArrayStoreException: incompatible array element types (src=Char,
+    // dest=Byte)`. `java.time.format.DateTimeFormatter` uses `buf.repeat('0',
+    // n)` for zero-padding, so this broke every timestamp/temporal literal
+    // (35 Hibernate suite classes).
+    //
+    // DE-DUPLICATED 2026-08-13 (lane E38). This registrar used to register
+    // `repeat` SIX times for three descriptors: each of these three lines was
+    // preceded by an inline closure spelling `Ljava/lang/StringBuilder;`
+    // literally instead of `L{class};`. `register()` is last-registration-wins,
+    // so for a `class` of `java/lang/StringBuilder` the pairs collided and the
+    // winner was decided by source order alone — the two `CharSequence`/`String`
+    // closures lost harmlessly, but the `(II)` closure came AFTER its
+    // `format!`-spelled sibling and won, and it was the worse body: it clamped a
+    // negative count with `.max(0)` (where the JDK throws
+    // `IllegalArgumentException`) and encoded through `char::from_u32`, falling
+    // back to `code_point as u16` — so `repeat(0x110000, 1)` appended U+0000 and
+    // `repeat(-1, 1)` appended U+FFFF where the JDK refuses both. Because the
+    // losing spelling named `StringBuilder` literally, `StringBuffer` and
+    // `AbstractStringBuilder` kept the correct body: the same call had two
+    // answers, chosen by the receiver's static type. Removing the duplicates
+    // (rather than repairing them) leaves ONE body per descriptor for all three
+    // classes.
     registry.register(
         class,
         "repeat",
@@ -531,48 +511,6 @@ pub(crate) fn register_string_builder_natives(registry: &mut NativeMethodRegistr
         "repeat",
         &format!("(Ljava/lang/String;I)L{class};"),
         native_sb_repeat_charsequence,
-    );
-    // Java 21: StringBuilder.repeat(int codePoint, int count). MUST be a native:
-    // unregistered, it falls through to the real `AbstractStringBuilder.repeat`
-    // → `ensureCapacityNewCoder` → `Arrays.copyOf(value, …)` bytecode, which
-    // treats `value` as a compact-string `byte[]`. CratonVM's StringBuilder
-    // backing is a `char[]`, so the real bytecode's `System.arraycopy` copies
-    // char[]→byte[] and throws `ArrayStoreException: incompatible array element
-    // types (src=Char, dest=Byte)`. `java.time.format.DateTimeFormatter` uses
-    // `buf.repeat('0', n)` for zero-padding, so this broke every timestamp/
-    // temporal literal (35 Hibernate suite classes).
-    registry.register(
-        class,
-        "repeat",
-        "(II)Ljava/lang/StringBuilder;",
-        |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            let code_point = match args.get(1) {
-                Some(Value::Int(v)) => *v,
-                _ => 0,
-            };
-            let count = match args.get(2) {
-                Some(Value::Int(v)) => (*v).max(0) as usize,
-                _ => 0,
-            };
-            // Encode the code point to UTF-16 units (surrogate pair for
-            // supplementary planes); fall back to a single unit for an invalid
-            // code point (e.g. a lone surrogate) rather than dropping it.
-            let mut units: Vec<u16> = Vec::with_capacity(2);
-            match char::from_u32(code_point as u32) {
-                Some(c) => {
-                    let mut buf = [0u16; 2];
-                    units.extend_from_slice(c.encode_utf16(&mut buf));
-                }
-                None => units.push(code_point as u16),
-            }
-            let mut chars = sb_read_chars(ctx, this);
-            for _ in 0..count {
-                chars.extend_from_slice(&units);
-            }
-            let this = sb_write_chars(ctx, this, &chars);
-            Ok(Some(Value::Object(Some(this))))
-        },
     );
 }
 
@@ -1758,6 +1696,17 @@ pub(crate) fn native_sb_repeat_codepoint(
     Ok(Some(Value::Object(Some(this))))
 }
 
+/// `AbstractStringBuilder.repeat(CharSequence cs, int count)` (JDK 25
+/// `AbstractStringBuilder.java:2166-2217`).
+///
+/// Two contract items were missing and both were `.max(0)`-shaped silence:
+///
+///   * `count < 0` is `IllegalArgumentException("count is negative: " + count)`,
+///     the method's only documented throw. Clamping to 0 answered "did nothing"
+///     for a call the JDK refuses.
+///   * a null `cs` repeats the four characters `"null"` — "If `cs` is `null`,
+///     then the four characters `"null"` are repeated into this sequence" —
+///     where this returned the receiver untouched.
 pub(crate) fn native_sb_repeat_charsequence(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -1766,20 +1715,33 @@ pub(crate) fn native_sb_repeat_charsequence(
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(None),
     };
-    let cs = match args.get(1) {
-        Some(Value::Object(Some(o))) => *o,
-        _ => return Ok(Some(Value::Object(Some(this)))),
-    };
-    let count = match args.get(2) {
-        Some(Value::Int(v)) => (*v).max(0) as usize,
+    let count_i32 = match args.get(2) {
+        Some(Value::Int(v)) => *v,
         _ => 0,
     };
+    if count_i32 < 0 {
+        return Err(
+            cratonvm_types::error::RuntimeError::IllegalArgumentException {
+                message: format!("count is negative: {count_i32}"),
+            }
+            .into(),
+        );
+    }
+    let count = count_i32 as usize;
     if count == 0 {
         return Ok(Some(Value::Object(Some(this))));
     }
+    let cs = match args.get(1) {
+        Some(Value::Object(Some(o))) => Some(*o),
+        // null CharSequence -> the literal "null", per the javadoc.
+        _ => None,
+    };
     let mut scope = NativeHandleScope::new(ctx);
     let this_handle = scope.root(this);
-    let text = invoke_to_string(&mut *scope, cs).unwrap_or_default();
+    let text = match cs {
+        Some(o) => invoke_to_string(&mut *scope, o).unwrap_or_default(),
+        None => "null".to_string(),
+    };
     let this = scope.get(&this_handle);
     let units: Vec<u16> = text.encode_utf16().collect();
     let mut chars = sb_read_chars(&*scope, this);
@@ -2345,6 +2307,82 @@ pub(crate) fn native_sb_append_charsequence_off_len(
     Ok(Some(Value::Object(Some(this))))
 }
 
+/// True when `units` holds a surrogate code unit that is NOT part of a
+/// well-formed high+low pair — i.e. exactly the content a Rust `str` cannot
+/// represent.
+pub(crate) fn has_unpaired_surrogate(units: &[u16]) -> bool {
+    let mut i = 0;
+    while i < units.len() {
+        let u = units[i];
+        if (0xD800..=0xDBFF).contains(&u) {
+            if i + 1 < units.len() && (0xDC00..=0xDFFF).contains(&units[i + 1]) {
+                i += 2;
+                continue;
+            }
+            return true;
+        }
+        if (0xDC00..=0xDFFF).contains(&u) {
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
+
+/// Materialise a fresh (uninterned) Java `String` from raw UTF-16 code units.
+///
+/// `String::from_utf16_lossy` — which every `String`-returning builder native
+/// used to end in — cannot carry an UNPAIRED surrogate: a Rust `str` is
+/// well-formed UTF-8, so each lone `\uD800..\uDFFF` silently becomes U+FFFD.
+/// Nothing threw, and the substitution is unrecoverable: after
+/// `sb.append((char) 0xD800)`, `sb.charAt(0)` answered 0xD800 while
+/// `sb.toString().charAt(0)` answered 0xFFFD — the builder and its own
+/// `toString` disagreed about their contents.
+///
+/// The lossless reader for the other direction ([`read_string_chars`]) has been
+/// in this file all along; this is its write-side twin.
+///
+/// The ordinary case is byte-for-byte the previous behaviour: well-formed units
+/// still go through `create_string_uninterned_gc_safe(&str)`, so no allocation
+/// path, interning rule or GC-safety property moves for text that has no lone
+/// surrogate. Only a slice that actually contains one takes the units path —
+/// `new_object("java/lang/String")` plus `init_string_from_units`, the same
+/// pair `native_string_init_from_char_array` uses, documented as preserving
+/// "raw code units byte-for-byte (including unpaired surrogates)". Both of
+/// those allocate with the non-triggering `try_alloc_*` primitives, but the
+/// fresh String is not reachable from any Java root, so it is pinned across
+/// them anyway.
+pub(crate) fn sb_string_from_units(
+    ctx: &mut dyn NativeContext,
+    units: &[u16],
+) -> Result<cratonvm_types::ObjectRef, cratonvm_types::error::MethodCallFailed> {
+    if !has_unpaired_surrogate(units) {
+        let text = String::from_utf16_lossy(units);
+        return Ok(ctx.create_string_uninterned_gc_safe(&text));
+    }
+    let obj = match ctx.new_object("java/lang/String")? {
+        Some(Value::Object(Some(o))) => o,
+        // Allocation refused without reporting a failure: fall back to the
+        // lossy form rather than hand a null out of a String-typed method.
+        _ => {
+            let text = String::from_utf16_lossy(units);
+            return Ok(ctx.create_string_uninterned_gc_safe(&text));
+        }
+    };
+    let h = ctx.pin_native_root(obj);
+    let obj = ctx.read_native_pin(h, obj);
+    let ok = ctx.init_string_from_units(obj, units);
+    let obj = ctx.read_native_pin(h, obj);
+    ctx.unpin_native_roots(h);
+    if !ok {
+        return Err(cratonvm_types::error::RuntimeError::OutOfMemoryError {
+            message: "Java heap space (String from UTF-16 units)".to_string(),
+        }
+        .into());
+    }
+    Ok(obj)
+}
+
 pub(crate) fn native_sb_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
@@ -2365,19 +2403,18 @@ pub(crate) fn native_sb_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -
         };
         chars.push(ch);
     }
-    let text = String::from_utf16_lossy(&chars);
     // `StringBuilder.toString()` must return a *fresh* String distinct from
     // any equal literal — the JVM spec only pools literals and `intern()`.
     // Routing it through the interned pool made `==` wrongly report identity
     // (e.g. `sb.toString() == "literal"`), breaking identity-based symbol
     // comparisons such as xerces' `NamespaceSupport`.
-    // `_gc_safe`: `text` is already Rust-owned; `this`/`buf` are not
-    // dereferenced again below, so a moving young GC here is safe. Without
-    // this, a StringBuilder.toString()-heavy hot loop (e.g. Response.
-    // toAbsolute()) hard-aborts the whole process on young-gen exhaustion
-    // instead of collecting and continuing -- see docs/known-issues/
-    // tomcat-08-07/silent-hang-no-signature-cluster.md.
-    let result = ctx.create_string_uninterned_gc_safe(&text);
+    // `_gc_safe` (inside `sb_string_from_units`): the units are already
+    // Rust-owned; `this`/`buf` are not dereferenced again below, so a moving
+    // young GC here is safe. Without this, a StringBuilder.toString()-heavy hot
+    // loop (e.g. Response.toAbsolute()) hard-aborts the whole process on
+    // young-gen exhaustion instead of collecting and continuing -- see
+    // docs/known-issues/tomcat-08-07/silent-hang-no-signature-cluster.md.
+    let result = sb_string_from_units(ctx, &chars)?;
     Ok(Some(Value::Object(Some(result))))
 }
 
@@ -2731,6 +2768,29 @@ pub(crate) fn native_sb_append_code_point(
     native_sb_append_codepoint(ctx, args)
 }
 
+/// `AbstractStringBuilder.reverse()` (JDK 25
+/// `AbstractStringBuilder.java:1696-1733`, delegating to
+/// `StringUTF16.reverse`).
+///
+/// The javadoc is explicit that this is NOT a plain code-unit reversal, which
+/// is what this used to be:
+///
+/// > Causes this character sequence to be replaced by the reverse of the
+/// > sequence. **If there are any surrogate pairs included in the sequence,
+/// > these are treated as single characters for the reverse operation. Thus,
+/// > the order of the high-low surrogates is never reversed.**
+///
+/// > Note that the reverse operation may result in producing surrogate pairs
+/// > that were unpaired low-surrogates and high-surrogates before the
+/// > operation. For example, reversing `"\uDC00\uD800"` produces
+/// > `"𐀀"` which is a valid surrogate pair.
+///
+/// The JDK does it in two passes and so does this: reverse every code unit,
+/// then walk the result and swap back any `(low, high)` neighbour — that
+/// neighbour is exactly a pair the first pass inverted. The second pass runs
+/// only when the first saw a surrogate, and it advances TWO units after a swap
+/// (`putChar(val, i++, c1)`), so `"\uDC00\uD800"` in the *input* is left as the
+/// valid pair the javadoc promises rather than being swapped a second time.
 pub(crate) fn native_sb_reverse(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
@@ -2738,16 +2798,34 @@ pub(crate) fn native_sb_reverse(ctx: &mut dyn NativeContext, args: &[Value]) -> 
     };
     let (buf, count) = sb_state(ctx, this);
     if let Some(buf) = buf {
-        let count = count as usize;
-        let mut i = 0;
-        let mut j = if count > 0 { count - 1 } else { 0 };
-        while i < j {
-            let a = ctx.get_array_element(buf, i);
-            let b = ctx.get_array_element(buf, j);
-            ctx.set_array_element(buf, i, b);
-            ctx.set_array_element(buf, j, a);
-            i += 1;
-            j -= 1;
+        let count = count.max(0) as usize;
+        let mut units: Vec<u16> = Vec::with_capacity(count);
+        let count = count.min(ctx.array_length(buf));
+        for i in 0..count {
+            units.push(match ctx.get_array_element(buf, i) {
+                Value::Int(c) => c as u16,
+                _ => 0,
+            });
+        }
+        let had_surrogate = units.iter().any(|&u| (0xD800..=0xDFFF).contains(&u));
+        units.reverse();
+        if had_surrogate {
+            let mut i = 0usize;
+            while i + 1 < units.len() {
+                // A LOW surrogate followed by a HIGH one is a pair the
+                // reversal inverted; put it back.
+                if (0xDC00..=0xDFFF).contains(&units[i])
+                    && (0xD800..=0xDBFF).contains(&units[i + 1])
+                {
+                    units.swap(i, i + 1);
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
+        }
+        for (i, &u) in units.iter().enumerate() {
+            ctx.set_array_element(buf, i, Value::Int(i32::from(u)));
         }
     }
     Ok(Some(Value::Object(Some(this))))
@@ -3362,26 +3440,66 @@ pub(crate) fn native_sb_set_length(
     Ok(None)
 }
 
+/// `String.indexOf(value, coder, count, str, fromIndex)`'s contract — the body
+/// `AbstractStringBuilder.indexOf(String, int)` delegates to
+/// (`StringLatin1`/`StringUTF16.indexOf`):
+///
+/// ```text
+///     if (fromIndex >= valueCount) {
+///         return (strCount == 0 ? valueCount : -1);
+///     }
+///     if (fromIndex < 0) { fromIndex = 0; }
+///     if (strCount == 0) { return fromIndex; }
+/// ```
+///
+/// Note the first arm: `sb.indexOf("", 99)` is the LENGTH, not -1 and not 99.
+///
+/// The counterpart of [`u16_last_index_of`], and the same reason for existing:
+/// both operands are UTF-16 code units. The two `indexOf` natives used to
+/// build a Rust `String` with `String::from_utf16_lossy` and call `str::find`,
+/// which (a) cannot represent an unpaired surrogate in either operand, so a
+/// lone `\uD800` needle was searched for as U+FFFD and matched the wrong
+/// position — or matched a DIFFERENT lone surrogate, since every one of them
+/// collapses to the same replacement character — and (b) then converted a UTF-8
+/// BYTE offset back to a code-unit index by re-encoding the prefix.
+fn u16_index_of(haystack: &[u16], needle: &[u16], from: i32) -> i32 {
+    let n = haystack.len() as i32;
+    let m = needle.len() as i32;
+    if from >= n {
+        return if m == 0 { n } else { -1 };
+    }
+    let from = from.max(0);
+    if m == 0 {
+        return from;
+    }
+    if m > n - from {
+        return -1;
+    }
+    let mut k = from;
+    while k <= n - m {
+        let s = k as usize;
+        if &haystack[s..s + m as usize] == needle {
+            return k;
+        }
+        k += 1;
+    }
+    -1
+}
+
 /// indexOf(String) — find substring, return -1 if not found
 pub(crate) fn native_sb_index_of(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Int(-1))),
     };
-    let target = match args.get(1) {
-        Some(Value::Object(Some(obj))) => ctx.read_string(*obj).unwrap_or_default(),
+    // `read_string_chars`, not `read_string`: the needle may itself hold an
+    // unpaired surrogate.
+    let target: Vec<u16> = match args.get(1) {
+        Some(Value::Object(Some(obj))) => read_string_chars(ctx, *obj),
         _ => return Ok(Some(Value::Int(-1))),
     };
     let chars = sb_read_chars(ctx, this);
-    let haystack: String = String::from_utf16_lossy(&chars);
-    match haystack.find(&target) {
-        Some(byte_pos) => {
-            // Convert byte position to char position
-            let char_pos = haystack[..byte_pos].encode_utf16().count();
-            Ok(Some(Value::Int(char_pos as i32)))
-        }
-        None => Ok(Some(Value::Int(-1))),
-    }
+    Ok(Some(Value::Int(u16_index_of(&chars, &target, 0))))
 }
 
 /// indexOf(String, int) — find substring from offset
@@ -3393,26 +3511,16 @@ pub(crate) fn native_sb_index_of_from(
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Int(-1))),
     };
-    let target = match args.get(1) {
-        Some(Value::Object(Some(obj))) => ctx.read_string(*obj).unwrap_or_default(),
+    let target: Vec<u16> = match args.get(1) {
+        Some(Value::Object(Some(obj))) => read_string_chars(ctx, *obj),
         _ => return Ok(Some(Value::Int(-1))),
     };
     let from = match args.get(2) {
-        Some(Value::Int(i)) => std::cmp::max(0, *i) as usize,
+        Some(Value::Int(i)) => *i,
         _ => 0,
     };
     let chars = sb_read_chars(ctx, this);
-    if from >= chars.len() {
-        return Ok(Some(Value::Int(-1)));
-    }
-    let haystack: String = String::from_utf16_lossy(&chars[from..]);
-    match haystack.find(&target) {
-        Some(byte_pos) => {
-            let char_pos = haystack[..byte_pos].encode_utf16().count();
-            Ok(Some(Value::Int((from + char_pos) as i32)))
-        }
-        None => Ok(Some(Value::Int(-1))),
-    }
+    Ok(Some(Value::Int(u16_index_of(&chars, &target, from))))
 }
 
 /// Last occurrence of `needle` in `haystack` at a start index <= `from`
@@ -3447,12 +3555,10 @@ pub(crate) fn native_sb_last_index_of(
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Int(-1))),
     };
+    // `read_string_chars`: an unpaired surrogate in the needle cannot survive
+    // `read_string().encode_utf16()`, which routes through a Rust `str`.
     let target: Vec<u16> = match args.get(1) {
-        Some(Value::Object(Some(obj))) => ctx
-            .read_string(*obj)
-            .unwrap_or_default()
-            .encode_utf16()
-            .collect(),
+        Some(Value::Object(Some(obj))) => read_string_chars(ctx, *obj),
         _ => return Ok(Some(Value::Int(-1))),
     };
     let chars = sb_read_chars(ctx, this);
@@ -3472,12 +3578,10 @@ pub(crate) fn native_sb_last_index_of_from(
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Int(-1))),
     };
+    // `read_string_chars`: an unpaired surrogate in the needle cannot survive
+    // `read_string().encode_utf16()`, which routes through a Rust `str`.
     let target: Vec<u16> = match args.get(1) {
-        Some(Value::Object(Some(obj))) => ctx
-            .read_string(*obj)
-            .unwrap_or_default()
-            .encode_utf16()
-            .collect(),
+        Some(Value::Object(Some(obj))) => read_string_chars(ctx, *obj),
         _ => return Ok(Some(Value::Int(-1))),
     };
     let from = match args.get(2) {
@@ -3508,8 +3612,10 @@ pub(crate) fn native_sb_substring(ctx: &mut dyn NativeContext, args: &[Value]) -
     if let Some(failure) = sb_check_from_to_index(start, count, count) {
         return Err(failure);
     }
-    let result = String::from_utf16_lossy(&chars[start as usize..]);
-    let str_obj = ctx.create_string_uninterned(&result);
+    // Units, not `from_utf16_lossy`: `new StringBuilder("a\uD800b").substring(1, 2)`
+    // is a one-char String holding an unpaired surrogate. See
+    // [`sb_string_from_units`].
+    let str_obj = sb_string_from_units(ctx, &chars[start as usize..])?;
     Ok(Some(Value::Object(Some(str_obj))))
 }
 
@@ -3566,8 +3672,7 @@ pub(crate) fn native_sb_substring_range(
     if let Some(failure) = sb_check_from_to_index(start, end, count) {
         return Err(failure);
     }
-    let result = String::from_utf16_lossy(&chars[start as usize..end as usize]);
-    let str_obj = ctx.create_string_uninterned(&result);
+    let str_obj = sb_string_from_units(ctx, &chars[start as usize..end as usize])?;
     Ok(Some(Value::Object(Some(str_obj))))
 }
 

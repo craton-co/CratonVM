@@ -537,7 +537,21 @@ pub(crate) fn bi_shift_left_str(value: &str, n: i32) -> String {
         return value.to_string();
     }
     if n < 0 {
-        return bi_shift_right_str(value, -n);
+        // NOT `-n`: that OVERFLOWS for `i32::MIN` — a panic in a debug build,
+        // and in release it wraps straight back to `i32::MIN`, so these two
+        // helpers called each other forever (stack overflow). `unsigned_abs` is
+        // the JDK's own rule, "-n considered unsigned"
+        // (BigInteger.java:3502-3504), and a right shift of 2^31 or more bits
+        // clears every magnitude word: 0, or -1 for a negative value.
+        let k = n.unsigned_abs();
+        if k > i32::MAX as u32 {
+            return if value.starts_with('-') {
+                "-1".to_string()
+            } else {
+                "0".to_string()
+            };
+        }
+        return bi_shift_right_str(value, k as i32);
     }
     // multiply absolute magnitude by 2^n via repeated doubling, preserving sign
     let (neg, abs) = bi_parse_sign(value);
@@ -567,7 +581,18 @@ pub(crate) fn bi_shift_right_str(value: &str, n: i32) -> String {
         return value.to_string();
     }
     if n < 0 {
-        return bi_shift_left_str(value, -n);
+        // See `bi_shift_left_str`: `-n` overflows for `i32::MIN` and the two
+        // helpers then recurse into each other forever. A LEFT shift of 2^31 or
+        // more bits is `ArithmeticException("BigInteger would overflow
+        // supported range")` on HotSpot; this `String`-returning helper has no
+        // error channel and is NOT registered as a native (the registered
+        // `shiftLeft`/`shiftRight` enforce it via `bi_checked_shl`), so the arm
+        // is unreachable from Java — it must simply not recurse.
+        let k = n.unsigned_abs();
+        if k > i32::MAX as u32 {
+            return value.to_string();
+        }
+        return bi_shift_left_str(value, k as i32);
     }
     let (neg, abs) = bi_parse_sign(value);
     // For positive values: floor-divide by 2^n == divide unsigned by 2^n.
@@ -1432,91 +1457,34 @@ pub(crate) fn register_biginteger_natives(registry: &mut NativeMethodRegistry) {
         },
     );
 
-    // bitLength — number of bits in the magnitude (string-based)
-    registry.register(bi, "bitLength", "()I", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let s = bi_read(ctx, this).trim_start_matches('-').to_string();
-        if s == "0" {
-            return Ok(Some(Value::Int(0)));
-        }
-        let mut val = s;
-        let mut bits = 0;
-        while val != "0" {
-            val = bi_div_unsigned(&val, "2");
-            bits += 1;
-        }
-        Ok(Some(Value::Int(bits)))
-    });
-
-    // bitCount — number of set bits (string-based)
-    registry.register(bi, "bitCount", "()I", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let s = bi_read(ctx, this).trim_start_matches('-').to_string();
-        if s == "0" {
-            return Ok(Some(Value::Int(0)));
-        }
-        let mut val = s;
-        let mut count = 0;
-        while val != "0" {
-            let rem = bi_mod_unsigned(&val, "2");
-            if rem == "1" {
-                count += 1;
-            }
-            val = bi_div_unsigned(&val, "2");
-        }
-        Ok(Some(Value::Int(count)))
-    });
-
-    // testBit — test bit at index (string-based)
-    registry.register(bi, "testBit", "(I)Z", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let bit = match args.get(1) {
-            Some(Value::Int(b)) => *b,
-            _ => 0,
-        };
-        let s = bi_read(ctx, this).trim_start_matches('-').to_string();
-        if s == "0" {
-            return Ok(Some(Value::Int(0)));
-        }
-        let mut val = s;
-        for _ in 0..bit {
-            val = bi_div_unsigned(&val, "2");
-            if val == "0" {
-                return Ok(Some(Value::Int(0)));
-            }
-        }
-        let rem = bi_mod_unsigned(&val, "2");
-        Ok(Some(Value::Int(if rem == "1" { 1 } else { 0 })))
-    });
-
-    // shiftLeft — multiply by 2^n (string-based)
+    // shiftLeft / shiftRight — see `bi_shift_arg` and `bi_checked_shl` for the
+    // contract. Both are limb shifts (`crate::bigint::BigInt::{shl,shr}`), not
+    // the repeated decimal multiply/divide this used to run: `shiftLeft(n)`
+    // looped `n` times over a growing decimal string, so an ordinary
+    // `x.shiftLeft(Integer.MAX_VALUE)` was 2^31 arbitrary-precision multiplies
+    // — a hang, not a wrong answer — and `n = Integer.MIN_VALUE` evaluated
+    // `-n`, which OVERFLOWS: a panic in a debug build (a panic is not a Java
+    // throwable; it takes the VM down) and a silently empty `0..i32::MIN`
+    // range in release, so `ONE.shiftLeft(Integer.MIN_VALUE)` answered 1 where
+    // HotSpot answers 0.
     registry.register(bi, "shiftLeft", "(I)Ljava/math/BigInteger;", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let n = match args.get(1) {
             Some(Value::Int(v)) => *v,
             _ => 0,
         };
-        let s = bi_read(ctx, this);
-        let (neg, abs) = bi_parse_sign(&s);
-        let mut result = abs.to_string();
-        if n > 0 {
-            for _ in 0..n {
-                result = bi_mul_unsigned(&result, "2");
-            }
-        } else if n < 0 {
-            for _ in 0..(-n) {
-                result = bi_div_unsigned(&result, "2");
-            }
-        }
-        let final_str = if neg && result != "0" {
-            format!("-{}", result)
+        let v = bi_read_int(ctx, this);
+        let (left, k) = bi_shift_arg(n);
+        let res = if left {
+            bi_checked_shl(&v, k)?
         } else {
-            result
+            v.shr(k)
         };
-        Ok(Some(Value::Object(Some(bi_alloc(ctx, &final_str)?))))
+        Ok(Some(Value::Object(Some(bi_alloc_int(ctx, &res)?))))
     });
 
-    // shiftRight — divide by 2^n (string-based)
+    // shiftRight — the same split with the direction inverted (JDK 25
+    // `BigInteger.shiftRight`, BigInteger.java:3565-3577).
     registry.register(
         bi,
         "shiftRight",
@@ -1527,122 +1495,38 @@ pub(crate) fn register_biginteger_natives(registry: &mut NativeMethodRegistry) {
                 Some(Value::Int(v)) => *v,
                 _ => 0,
             };
-            let s = bi_read(ctx, this);
-            let (neg, abs) = bi_parse_sign(&s);
-            let mut result = abs.to_string();
-            if n > 0 {
-                for _ in 0..n {
-                    result = bi_div_unsigned(&result, "2");
-                }
-            } else if n < 0 {
-                for _ in 0..(-n) {
-                    result = bi_mul_unsigned(&result, "2");
-                }
-            }
-            let final_str = if neg && result != "0" {
-                format!("-{}", result)
+            let v = bi_read_int(ctx, this);
+            let (was_left, k) = bi_shift_arg(n);
+            let res = if was_left {
+                v.shr(k)
             } else {
-                result
+                bi_checked_shl(&v, k)?
             };
-            Ok(Some(Value::Object(Some(bi_alloc(ctx, &final_str)?))))
+            Ok(Some(Value::Object(Some(bi_alloc_int(ctx, &res)?))))
         },
     );
 
-    // Bitwise operations: and, or, xor, not (string-based)
-    registry.register(
-        bi,
-        "and",
-        "(Ljava/math/BigInteger;)Ljava/math/BigInteger;",
-        |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            let other = obj_arg(args, 1)?;
-            let a = bi_read(ctx, this).trim_start_matches('-').to_string();
-            let b = bi_read(ctx, other).trim_start_matches('-').to_string();
-            let result = bi_bitwise_and(&a, &b);
-            Ok(Some(Value::Object(Some(bi_alloc(ctx, &result)?))))
-        },
-    );
-    registry.register(
-        bi,
-        "or",
-        "(Ljava/math/BigInteger;)Ljava/math/BigInteger;",
-        |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            let other = obj_arg(args, 1)?;
-            let a = bi_read(ctx, this).trim_start_matches('-').to_string();
-            let b = bi_read(ctx, other).trim_start_matches('-').to_string();
-            let result = bi_bitwise_or(&a, &b);
-            Ok(Some(Value::Object(Some(bi_alloc(ctx, &result)?))))
-        },
-    );
-    registry.register(
-        bi,
-        "xor",
-        "(Ljava/math/BigInteger;)Ljava/math/BigInteger;",
-        |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            let other = obj_arg(args, 1)?;
-            let a = bi_read(ctx, this).trim_start_matches('-').to_string();
-            let b = bi_read(ctx, other).trim_start_matches('-').to_string();
-            let result = bi_bitwise_xor(&a, &b);
-            Ok(Some(Value::Object(Some(bi_alloc(ctx, &result)?))))
-        },
-    );
-    registry.register(bi, "not", "()Ljava/math/BigInteger;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let s = bi_read(ctx, this);
-        // Java BigInteger.not() returns -(this + 1) per the spec
-        let neg_result = bi_add_str(&s, "1");
-        let final_str = if neg_result.starts_with('-') {
-            neg_result[1..].to_string()
-        } else if neg_result == "0" {
-            "-1".to_string()
-        } else {
-            format!("-{}", neg_result)
-        };
-        Ok(Some(Value::Object(Some(bi_alloc(ctx, &final_str)?))))
-    });
-
-    // toByteArray — convert to two's complement byte array
-    registry.register(bi, "toByteArray", "()[B", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let s = bi_read(ctx, this);
-        // Try i128 first (covers most cases)
-        if let Ok(val) = s.parse::<i128>() {
-            let bytes = val.to_be_bytes();
-            let start = if val >= 0 {
-                bytes.iter().position(|&b| b != 0).unwrap_or(15).min(15)
-            } else {
-                bytes
-                    .iter()
-                    .position(|&b| b != 0xFF)
-                    .unwrap_or(15)
-                    .saturating_sub(1)
-            };
-            let significant = &bytes[start..];
-            let arr = ctx.new_array(
-                cratonvm_types::ArrayElementType::Byte,
-                significant.len().max(1),
-            );
-            for (i, &b) in significant.iter().enumerate() {
-                ctx.set_array_element(arr, i, Value::Int(b as i8 as i32));
-            }
-            return Ok(Some(Value::Object(Some(arr))));
-        }
-        // For numbers beyond i128 range, use binary conversion
-        let (_neg, abs) = bi_parse_sign(&s);
-        let binary = bi_to_binary(abs);
-        let pad_len = (8 - (binary.len() % 8)) % 8;
-        let padded = format!("{}{}", "0".repeat(pad_len + 8), binary); // extra byte for sign
-        let byte_count = padded.len() / 8;
-        let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, byte_count);
-        for i in 0..byte_count {
-            let byte_str = &padded[i * 8..(i + 1) * 8];
-            let byte_val = u8::from_str_radix(byte_str, 2).unwrap_or(0);
-            ctx.set_array_element(arr, i, Value::Int(byte_val as i8 as i32));
-        }
-        Ok(Some(Value::Object(Some(arr))))
-    });
+    // `and` / `or` / `xor` / `bitLength` / `bitCount` / `testBit` are NOT
+    // registered here on purpose — see the
+    // "REGISTRATION CONSOLIDATION" note above `bi_shift_arg`. The decimal
+    // versions that used to live here read `bi_read(..).trim_start_matches('-')`,
+    // i.e. they threw the SIGN away before computing, so `(-1) & 5` answered 1
+    // instead of 5 and `(-9).bitCount()` answered 2 instead of 1; `testBit`
+    // looped `0..bit`, so a negative bit address silently answered instead of
+    // raising `ArithmeticException`. Every one of them had a correct
+    // two's-complement limb twin already registered (earlier, and in BOTH JDK
+    // modes) by `phases_late::register_p71_biginteger_extras`, which these
+    // re-registrations were shadowing in synthetic-jdk mode.
+    // `not` and `toByteArray` are NOT registered here either, for the same
+    // reason. The decimal `not` mapped `~(-1)` to -1 instead of 0 (the
+    // `neg_result == "0"` arm fired on the one input where `-(this+1)` is
+    // legitimately zero), and the decimal `toByteArray` sign-extended a
+    // negative through `i128::to_be_bytes` and then trimmed one byte too few,
+    // so `(-1).toByteArray()` was `{0xFF, 0xFF}` where HotSpot gives `{0xFF}`.
+    // `phases_late::register_p71_biginteger_extras` registers both, earlier and
+    // in both modes; its `toByteArray` calls `bi_to_byte_array_str` — the
+    // CORRECT converter, which lives in THIS file and which this registration
+    // was shadowing (`[1 of 10 callsites]` inside one class).
 
     // valueOf(long) — create from long value
     registry.register(bi, "valueOf", "(J)Ljava/math/BigInteger;", |ctx, args| {
@@ -1793,17 +1677,322 @@ pub(crate) fn register_biginteger_natives(registry: &mut NativeMethodRegistry) {
     ()
 }
 
+// ---------------------------------------------------------------------------
+// BigInteger shift contract
+//
+// REGISTRATION CONSOLIDATION (2026-08-13, lane E38). `java/math/BigInteger` is
+// registered by TWO registrars and `NativeMethodRegistry::register` is
+// last-registration-wins:
+//
+//   * `phases_late::register_p71_biginteger_extras`, reached from
+//     `register_essential_natives` (native-builtins/src/lib.rs:7913) — runs in
+//     EVERY jdk mode, and computes on `crate::bigint::BigInt` limbs with full
+//     two's-complement semantics;
+//   * `register_biginteger_natives` (this file), reached only from
+//     `register_synthetic_overrides` (lib.rs:24010, `#[cfg(feature =
+//     "synthetic-jdk")]`) — runs LATER, so in synthetic-jdk mode its
+//     decimal-string bodies OVERWROTE the limb ones.
+//
+// Fourteen triples overlapped. The eight whose decimal body was demonstrably
+// wrong (`and`/`or`/`xor`/`not`/`bitLength`/`bitCount`/`testBit`/
+// `toByteArray` — all of them sign-stripping, see the notes at their former
+// sites) are simply no longer registered here, so the limb twin wins in both
+// modes and there is ONE implementation per triple. `shiftLeft`/`shiftRight`
+// are the exception: they are still registered, because the limb twin's LEFT
+// arm has no `checkRange` guard and `x.shiftRight(Integer.MIN_VALUE)` there
+// allocates `vec![0u32; 67_108_864]` (~256 MB) before answering. Until that is
+// fixed at its own site (NOMINATION in the lane record) this file must keep a
+// body that refuses instead.
+
+/// Split a `BigInteger` shift argument into `(is_a_left_shift, distance)` for
+/// `shiftLeft`; `shiftRight` inverts the direction.
+///
+/// JDK 25 `BigInteger.java:3494-3506`:
+///
+/// ```text
+///     } else {
+///         // Possible int overflow in (-n) is not a trouble,
+///         // because shiftRightImpl considers its argument unsigned
+///         return shiftRightImpl(-n);
+///     }
+/// ```
+///
+/// So a negative `n` flips the direction and `-n` is then read as an UNSIGNED
+/// 32-bit count. `i32::unsigned_abs` is exactly that widening
+/// (`Integer.MIN_VALUE` -> 2_147_483_648), which is why the distance split is
+/// not where the defect lives — [`bi_checked_shl`] is.
+fn bi_shift_arg(n: i32) -> (bool, u32) {
+    if n >= 0 {
+        (true, n as u32)
+    } else {
+        (false, n.unsigned_abs())
+    }
+}
+
+/// Magnitude bit length (NOT `BigInteger.bitLength()`, which subtracts the sign
+/// bit for an exact power of two). `mag_le` is normalized, so the top limb is
+/// non-zero whenever the value is non-zero.
+fn bi_mag_bits(v: &crate::bigint::BigInt) -> u64 {
+    match v.mag_le().last() {
+        Some(&top) if top != 0 => {
+            (v.mag_le().len() as u64 - 1) * 32 + (32 - u64::from(top.leading_zeros()))
+        }
+        _ => 0,
+    }
+}
+
+/// `value << k` with the JDK's range guard.
+///
+/// `BigInteger` supports a magnitude of at most `Integer.MAX_VALUE` bits:
+/// `checkRange` (JDK 25 `BigInteger.java:1213-1217`) is
+///
+/// ```text
+///     if (mag.length > MAX_MAG_LENGTH || mag.length == MAX_MAG_LENGTH && mag[0] < 0)
+///         reportOverflow();   // ArithmeticException("BigInteger would overflow supported range")
+/// ```
+///
+/// with `MAX_MAG_LENGTH == Integer.MAX_VALUE / 32 + 1 == 1 << 26`. `mag[0] < 0`
+/// means the top word's sign bit is set, so the two arms together say exactly
+/// "magnitude bit length > `Integer.MAX_VALUE`".
+///
+/// MEASURED on Microsoft OpenJDK 25.0.3+9 (`scratchpad/e38/Shift2.java`):
+///
+/// ```text
+/// ONE.shiftLeft(MIN)   = 0            (-9).shiftLeft(MIN)  = -1
+/// ONE.shiftRight(MIN) !! ArithmeticException: BigInteger would overflow supported range
+/// ONE.shiftLeft(MAX)  !! ArithmeticException: BigInteger would overflow supported range
+/// ONE.shiftRight(MAX)  = 0            (-1).shiftRight(MAX) = -1
+/// ONE.shiftLeft(1<<30) = <bitLength 1073741825>          (-9).shiftRight(1) = -5
+/// ```
+///
+/// HotSpot allocates the oversized `int[]` and *then* throws (157 ms and ~256 MB
+/// for the `shiftRight(MIN)` row). We refuse from the bit count alone, so the
+/// observable answer is identical and the allocation never happens — a
+/// multi-hundred-megabyte allocation reachable from `x.shiftRight(n)` with an
+/// attacker-chosen `n` is a denial-of-service shape, not merely a slow path.
+fn bi_checked_shl(
+    v: &crate::bigint::BigInt,
+    k: u32,
+) -> Result<crate::bigint::BigInt, MethodCallFailed> {
+    if v.is_zero() || k == 0 {
+        return Ok(v.clone());
+    }
+    if bi_mag_bits(v) + u64::from(k) > i32::MAX as u64 {
+        return Err(RuntimeError::ArithmeticException {
+            message: "BigInteger would overflow supported range".to_string(),
+        }
+        .into());
+    }
+    Ok(v.shl(k))
+}
+
+// ---------------------------------------------------------------------------
+// BigInteger(String) / BigInteger(String, int)
+
+/// `digitsPerInt` from JDK 25 `BigInteger.java:4795-4797`, verbatim. It exists
+/// here only to reproduce the exception MESSAGE: the real constructor parses in
+/// groups of this many digits with `Integer.parseInt(group, radix)`, so a bad
+/// character is reported as `For input string: "<the group it fell in>"` and
+/// not as the whole operand. Index 0/1 are unused (radix is 2..=36).
+const BI_DIGITS_PER_INT: [usize; 37] = [
+    0, 0, 30, 19, 15, 13, 11, 11, 10, 9, 9, 8, 8, 8, 8, 7, 7, 7, 7, 7, 7, 7, 6, 6, 6, 6, 6, 6, 6,
+    6, 6, 6, 6, 6, 6, 6, 5,
+];
+
+/// `Character.digit(c, radix)`, restricted to what a Rust `char` API can
+/// answer.
+///
+/// RESIDUAL, MEASURED on JDK 25.0.3+9: `Character.digit` also accepts non-ASCII
+/// Unicode decimal digits and fullwidth Latin letters, so HotSpot reads
+/// `new BigInteger("٣")` as **3** and `new BigInteger("１２")` as
+/// **12**, where this returns `None` and the constructor raises
+/// `NumberFormatException`. `char::to_digit` is ASCII-only and Rust's standard
+/// library exposes no numeric value for the `Nd` category. That is a narrowing
+/// of an accepting case, not a widening: every input this admits, HotSpot
+/// admits with the same value. Before this commit the constructor validated
+/// NOTHING, so those inputs produced a silent wrong magnitude rather than a
+/// different exception.
+fn bi_java_digit(c: char, radix: u32) -> Option<u32> {
+    c.to_digit(radix)
+}
+
+/// Reproduce `Integer.parseInt(group, radix)`'s message for the group that
+/// contains the first non-digit, matching the real constructor's grouping.
+///
+/// The JDK skips leading zeros first, then splits the REMAINING digits into a
+/// short first group of `numDigits % digitsPerInt[radix]` (or a full group when
+/// that is 0) followed by full groups. Confirmed against HotSpot on four
+/// independent shapes: `"1_0"` -> `"1_0"`, `" 7"` -> `" 7"`,
+/// `"1234567890123_4567890"` -> `"3_4567890"`, and
+/// `"aaaaaaaaaaaaaaaaaaaaaaaaG"` radix 16 -> `"aaaaaaG"`.
+fn bi_number_format_message(digits: &[char], bad_at: usize, radix: u32) -> String {
+    let per = BI_DIGITS_PER_INT[radix as usize];
+    // Leading zeros are consumed before grouping starts.
+    let zeros = digits
+        .iter()
+        .take_while(|c| bi_java_digit(**c, radix) == Some(0))
+        .count();
+    let group = if bad_at < zeros || per == 0 {
+        // The bad character is inside the leading-zero run (so the run stopped
+        // there and grouping starts at it), or an impossible radix.
+        digits[bad_at..].iter().collect::<String>()
+    } else {
+        let n_digits = digits.len() - zeros;
+        let first = match n_digits % per {
+            0 => per,
+            r => r,
+        };
+        let off = bad_at - zeros;
+        let (start, len) = if off < first {
+            (zeros, first)
+        } else {
+            let g = (off - first) / per;
+            (zeros + first + g * per, per)
+        };
+        let end = (start + len).min(digits.len());
+        digits[start..end].iter().collect::<String>()
+    };
+    if radix == 10 {
+        format!("For input string: \"{group}\"")
+    } else {
+        format!("For input string: \"{group}\" under radix {radix}")
+    }
+}
+
+/// The whole of `java.math.BigInteger(String val, int radix)`'s validation, in
+/// the JDK's own order (JDK 25 `BigInteger.java:526-602`), returning the
+/// canonical signed decimal string this file stores.
+///
+/// Order matters and was verified one row at a time on HotSpot 25.0.3+9
+/// (`scratchpad/e38/Ctor.java`):
+///
+/// ```text
+/// new BigInteger("", 1)   !! NumberFormatException: Radix out of range     (radix beats length)
+/// new BigInteger("")      !! NumberFormatException: Zero length BigInteger
+/// new BigInteger("-")     !! NumberFormatException: Zero length BigInteger (sign-only)
+/// new BigInteger("5-")    !! NumberFormatException: Illegal embedded sign character
+/// new BigInteger("--5")   !! NumberFormatException: Illegal embedded sign character
+/// new BigInteger("-+5")   !! NumberFormatException: Illegal embedded sign character
+/// new BigInteger("+7")     = 7        new BigInteger("-000") = 0
+/// new BigInteger("1_0")   !! NumberFormatException: For input string: "1_0"
+/// ```
+///
+/// The sign rule is `lastIndexOf`, not "starts with": that is why `"5-"` and
+/// `"1+2"` are *sign* errors rather than digit errors.
+///
+/// NULL is handled by the callers, before this: `val.length()` is the real
+/// constructor's first statement, so `new BigInteger(null, 40)` is a
+/// `NullPointerException` and NOT `Radix out of range` (measured).
+fn bi_parse_java(s: &str, radix: i32) -> Result<String, MethodCallFailed> {
+    if !(2..=36).contains(&radix) {
+        return Err(RuntimeError::NumberFormatException {
+            message: "Radix out of range".to_string(),
+        }
+        .into());
+    }
+    let nfe = |message: String| -> MethodCallFailed {
+        RuntimeError::NumberFormatException { message }.into()
+    };
+    if s.is_empty() {
+        return Err(nfe("Zero length BigInteger".to_string()));
+    }
+    // "Check for at most one leading sign" — `val.lastIndexOf`. '-' and '+' are
+    // ASCII, so a byte index of 0 is a char index of 0.
+    let last_minus = s.rfind('-');
+    let last_plus = s.rfind('+');
+    let mut neg = false;
+    let mut rest = s;
+    if let Some(i) = last_minus {
+        if i != 0 || last_plus.is_some() {
+            return Err(nfe("Illegal embedded sign character".to_string()));
+        }
+        neg = true;
+        rest = &s[1..];
+    } else if let Some(i) = last_plus {
+        if i != 0 {
+            return Err(nfe("Illegal embedded sign character".to_string()));
+        }
+        rest = &s[1..];
+    }
+    if rest.is_empty() {
+        return Err(nfe("Zero length BigInteger".to_string()));
+    }
+    let digits: Vec<char> = rest.chars().collect();
+    let radix_u = radix as u32;
+    if let Some(bad) = digits
+        .iter()
+        .position(|c| bi_java_digit(*c, radix_u).is_none())
+    {
+        return Err(nfe(bi_number_format_message(&digits, bad, radix_u)));
+    }
+    if radix == 10 {
+        // Already decimal — no limb round trip for the hot constructor. Strip
+        // leading zeros so the stored string is canonical ("-000" is 0, and
+        // `bi_write_into` derives `signum` from the leading '-').
+        let trimmed = rest.trim_start_matches('0');
+        if trimmed.is_empty() {
+            return Ok("0".to_string());
+        }
+        return Ok(if neg {
+            format!("-{trimmed}")
+        } else {
+            trimmed.to_string()
+        });
+    }
+    let base = crate::bigint::BigInt::from_le_words(false, vec![radix_u]);
+    let mut acc = crate::bigint::BigInt::zero();
+    for &ch in &digits {
+        // `bi_java_digit` already answered `Some` for every char above.
+        let d = bi_java_digit(ch, radix_u).unwrap_or(0);
+        acc = acc
+            .mul(&base)
+            .add(&crate::bigint::BigInt::from_le_words(false, vec![d]));
+    }
+    if acc.is_zero() {
+        return Ok("0".to_string());
+    }
+    Ok(if neg {
+        acc.neg_value().to_decimal()
+    } else {
+        acc.to_decimal()
+    })
+}
+
+/// `new BigInteger(String)` — the real constructor is `this(val, 10)`
+/// (JDK 25 `BigInteger.java:620`-ish), so it delegates.
+///
+/// This validated NOTHING before: `new BigInteger("abc")` wrote "abc" into the
+/// value slot with `signum = 1`, `new BigInteger("")` produced a non-zero
+/// BigInteger over the empty string, and `new BigInteger("+7")` stored "+7"
+/// (whose magnitude words are whatever `decimal_to_mag_words` makes of a '+').
 fn native_bi_init_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(None),
     };
-    let s = match args.get(1) {
-        Some(Value::Object(Some(o))) => ctx.read_string(*o).unwrap_or_default(),
-        _ => "0".to_string(),
-    };
-    bi_write_into(ctx, this, &s);
+    let s = bi_ctor_string_arg(ctx, args.get(1))?;
+    let decimal = bi_parse_java(&s, 10)?;
+    bi_write_into(ctx, this, &decimal);
     Ok(None)
+}
+
+/// The `String val` argument of either constructor. A null is a
+/// `NullPointerException` from `val.length()` — the real constructor's first
+/// statement, ahead of even the radix check (measured: `new BigInteger(null,
+/// 40)` is an NPE, not `Radix out of range`).
+fn bi_ctor_string_arg(
+    ctx: &dyn NativeContext,
+    arg: Option<&Value>,
+) -> Result<String, MethodCallFailed> {
+    match arg {
+        Some(Value::Object(Some(o))) => Ok(ctx.read_string(*o).unwrap_or_default()),
+        _ => Err(RuntimeError::NullPointerException {
+            message: Some(
+                "Cannot invoke \"String.length()\" because \"val\" is null".to_string(),
+            ),
+        }
+        .into()),
+    }
 }
 
 /// Populate an existing `BigInteger` instance with the value parsed from a
@@ -1833,73 +2022,31 @@ fn bi_write_into(ctx: &mut dyn NativeContext, this: ObjectRef, value: &str) {
     }
 }
 
+/// `new BigInteger(String, int)`.
+///
+/// Unlike `toString(int)` — which IGNORES a bad radix and uses 10 — this
+/// CONSTRUCTOR throws. Measured on real JDK 25: radix 0, 1, -1, 37, 40 and
+/// `Integer.MIN_VALUE` all raise `NumberFormatException: Radix out of range`.
+/// That guard also closes a panic that predates it: an older body called
+/// `i128::from_str_radix(abs, radix as u32)`, and `from_str_radix` PANICS for a
+/// radix outside 2..=36 (a negative radix widening to a huge `u32` besides), so
+/// an ordinary `new BigInteger(s, 40)` from Java aborted the VM instead of
+/// throwing.
+///
+/// What it still did not do was validate the DIGITS on the radix-10 path — the
+/// path `new BigInteger(String)` also lands on — where the operand was passed
+/// through as if it were already a decimal literal. See [`bi_parse_java`].
 fn native_bi_init_string_radix(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(None),
     };
-    let s = match args.get(1) {
-        Some(Value::Object(Some(o))) => ctx.read_string(*o).unwrap_or_default(),
-        _ => "0".to_string(),
-    };
+    let s = bi_ctor_string_arg(ctx, args.get(1))?;
     let radix = match args.get(2) {
         Some(Value::Int(r)) => *r,
         _ => 10,
     };
-    // Unlike `toString(int)` — which IGNORES a bad radix and uses 10 — the
-    // `BigInteger(String, int)` CONSTRUCTOR throws. Measured on real JDK 25:
-    // radix 0, 1, -1, 37, 40 and Integer.MIN_VALUE all raise
-    // `NumberFormatException: Radix out of range`.
-    //
-    // This guard also closes a panic: the old body called
-    // `i128::from_str_radix(abs, radix as u32)`, and `from_str_radix` panics
-    // when the radix is outside 2..=36 (a negative radix widened to a huge
-    // `u32` besides). An ordinary `new BigInteger(s, 40)` from Java aborted
-    // the VM instead of throwing.
-    if !(2..=36).contains(&radix) {
-        return Err(RuntimeError::NumberFormatException {
-            message: "Radix out of range".to_string(),
-        }
-        .into());
-    }
-    // Convert from given radix to decimal
-    let decimal = if radix == 10 {
-        s
-    } else {
-        // Arbitrary precision. The old body narrowed through `i128` and then
-        // `.unwrap_or(0)`, so any value past `i128::MAX` — and any malformed
-        // string — silently became 0 where the JDK either keeps every digit
-        // or throws.
-        let (neg, abs) = match s.strip_prefix('+') {
-            // The JDK accepts a leading `+`; `bi_parse_sign` only knows `-`.
-            Some(rest) => (false, rest),
-            None => bi_parse_sign(&s),
-        };
-        if abs.is_empty() {
-            return Err(RuntimeError::NumberFormatException {
-                message: "Zero length BigInteger".to_string(),
-            }
-            .into());
-        }
-        let base = crate::bigint::BigInt::from_le_words(false, vec![radix as u32]);
-        let mut acc = crate::bigint::BigInt::zero();
-        for ch in abs.chars() {
-            let Some(d) = ch.to_digit(radix as u32) else {
-                return Err(RuntimeError::NumberFormatException {
-                    message: format!("For input string: \"{s}\" under radix {radix}"),
-                }
-                .into());
-            };
-            acc = acc
-                .mul(&base)
-                .add(&crate::bigint::BigInt::from_le_words(false, vec![d]));
-        }
-        if neg {
-            acc.neg_value().to_decimal()
-        } else {
-            acc.to_decimal()
-        }
-    };
+    let decimal = bi_parse_java(&s, radix)?;
     bi_write_into(ctx, this, &decimal);
     Ok(None)
 }
@@ -3238,6 +3385,13 @@ fn native_bd_divide_scale(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         Some(Value::Int(v)) => *v,
         _ => 0,
     };
+    // `divide(BigDecimal, int, int)`'s third argument is the rounding mode; it
+    // was read by nobody, so every negative-scale and every rounding decision
+    // below used whatever `format!` does.
+    let mode = match args.get(3) {
+        Some(Value::Int(v)) => *v,
+        _ => 4, // ROUND_HALF_UP
+    };
     let a: f64 = bd_read(ctx, this).parse().unwrap_or(0.0);
     let b: f64 = bd_read(ctx, other).parse().unwrap_or(0.0);
     if b == 0.0 {
@@ -3246,9 +3400,28 @@ fn native_bd_divide_scale(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         }
         .into());
     }
-    let s = format!("{:.prec$}", a / b, prec = new_scale as usize);
-    let result = bd_alloc(ctx, &s, new_scale);
-    Ok(Some(Value::Object(Some(result?))))
+    // HAZARD (sign-losing `as` cast, fixed 2026-08-13): `scale` may legally be
+    // NEGATIVE — `x.divide(y, -2, HALF_UP)` means "round to hundreds" and is an
+    // ordinary BigDecimal call. `prec = new_scale as usize` turned -2 into
+    // 18_446_744_073_709_551_614 and `format!("{:.prec$}")` then tried to render
+    // that many fractional digits: an unbounded allocation reachable from plain
+    // bytecode, i.e. a denial of service, not a wrong answer. Format at a
+    // non-negative precision and let the existing exact `setScale` machinery
+    // apply the negative scale with the caller's rounding mode.
+    let work_prec = new_scale.max(0);
+    let s = format!("{:.prec$}", a / b, prec = work_prec as usize);
+    if new_scale >= 0 {
+        let result = bd_alloc(ctx, &s, new_scale);
+        return Ok(Some(Value::Object(Some(result?))));
+    }
+    let interim = bd_alloc(ctx, &s, 0)?;
+    // `bd_set_scale_impl` allocates, so `interim` can be relocated by a minor
+    // GC before it is read — the same use-after-move `bi_alloc` documents.
+    let h = ctx.pin_native_root(interim);
+    let interim = ctx.read_native_pin(h, interim);
+    let result = bd_set_scale_impl(ctx, interim, new_scale, mode);
+    ctx.unpin_native_roots(h);
+    result
 }
 
 fn native_bd_compare_to(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {

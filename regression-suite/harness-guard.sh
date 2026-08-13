@@ -262,9 +262,12 @@ harness_guard_extract() {
   # "no count" or silently no-ops. They are the reason G6 exists as a guard and
   # not just as a better G1 message.
   #
-  # Neither is hypothetical and neither is common: a census of the corpus found
-  # ONE vector on each spelling and 75+ on the correct one, which is exactly the
-  # profile that makes a lint worth having and a widened parser not.
+  # Neither is hypothetical and neither is common — which is exactly the profile
+  # that makes a lint worth having and a widened parser not. MEASURED over the 94
+  # scheduled vectors: N1 one (RShutdownHooks, W8-E9-1 §3), N2 two
+  # (RSslNullSession and RJdkProcess), N3 none, and 76+ on the correct spelling.
+  # RJdkProcess was found BY THIS GUARD on its first run over the corpus, after
+  # four hand-censuses had missed it — see W8-E30-1 §4.4.
 
   # N1. `PASS <Class> checks=4` — RShutdownHooks, and it hid a published count
   # for a year (W8-E9-1 §3). harness_check_count's PASS arm requires the

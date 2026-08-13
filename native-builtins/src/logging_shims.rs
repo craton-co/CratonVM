@@ -618,14 +618,24 @@ fn jul_logger_filter_names_table(vm: usize) -> &'static std::sync::Mutex<std::co
     crate::logmanager::per_vm_table(&T, vm)
 }
 
+/// The name-keyed filter table's key. Delegates to
+/// [`crate::logmanager::read_jul_logger_name`] — the one function that knows
+/// where each of this VM's three JUL Logger layouts keeps its name.
+///
+/// It used to inline a two-step guess of its own: `get_field_by_name(.., "name")`
+/// and then a raw `get_field(logger, LOGGER_FIELD_NAME)` — and the constant that
+/// resolved to (`use super::*` → `lib.rs:36361`) is **0**, not the declared 2.
+/// Slot 0 of `java/util/logging/Logger` is `config:
+/// Ljava/util/logging/Logger$ConfigurationData;` (`class_manager.rs:14191`), so
+/// the fallback arm was reading a `ConfigurationData` and calling `read_string`
+/// on it. This is the only reader of that convention that is LIVE in every mode
+/// — `Logger.setFilter`/`getFilter` are registered by
+/// `register_essential_natives_with_shims` (`lib.rs:17592`/`:17608`) and
+/// `--dump-native-registry` reports both with `owns_slot: true` in compatible
+/// mode — so it is the one that had to move, not merely the shadowed ones.
 fn jul_logger_filter_name(ctx: &mut dyn NativeContext, logger: ObjectRef) -> Option<String> {
-    match ctx.get_field_by_name(logger, "name") {
-        Value::Object(Some(name)) => ctx.read_string(name),
-        _ => match ctx.get_field(logger, LOGGER_FIELD_NAME) {
-            Value::Object(Some(name)) => ctx.read_string(name),
-            _ => None,
-        },
-    }
+    let name_obj = crate::logmanager::jul_logger_name_object(&*ctx, logger)?;
+    ctx.read_string(name_obj)
 }
 
 pub(crate) fn jul_logger_filter_get(
@@ -1811,12 +1821,23 @@ pub(crate) fn register_logging_natives(registry: &mut NativeMethodRegistry) {
             let Some(Value::Object(Some(handler))) = args.get(1) else {
                 return Ok(None);
             };
-            let handlers = match ctx.get_field(*this, 2) {
-                Value::Object(Some(list)) => list,
-                _ => {
+            // Side table, not slot 2 — slot 2 is `name` on the declared layout
+            // (`class_manager.rs:14191`), and this used to overwrite it with an
+            // ArrayList. Same table the winning `addHandler`
+            // (`reflect_annotations.rs:213`) uses, so the two agree.
+            let handlers = match jul_logger_handlers_get(ctx, *this) {
+                Some(list) => list,
+                None => {
                     let list = try_alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2)?;
                     cratonvm_native_collections::native_al_init(ctx, &[Value::Object(Some(list))])?;
-                    ctx.set_field(*this, 2, Value::Object(Some(list)));
+                    // `jul_logger_handlers_set` calls `add_global_root`, which
+                    // may grow the root table and collect — the `set_field` it
+                    // replaces could not. Pin the list across it and re-read
+                    // before handing the address to `native_al_add`.
+                    let list_pin = ctx.pin_native_root(list);
+                    jul_logger_handlers_set(ctx, *this, list);
+                    let list = ctx.read_native_pin(list_pin, list);
+                    ctx.unpin_native_roots(list_pin);
                     list
                 }
             };
@@ -1861,7 +1882,7 @@ pub(crate) fn register_logging_natives(registry: &mut NativeMethodRegistry) {
                 _ => return Ok(None),
             };
             let level = args.get(1).copied().unwrap_or(Value::Object(None));
-            ctx.set_field(this, LOGGER_FIELD_LEVEL, level);
+            ctx.set_field(this, crate::logmanager::LOGGER_FIELD_LEVEL, level);
             // Also publish to the name-keyed explicit-level table. That table
             // is what `logmanager::native_jul_logger_is_loggable` — which wins
             // the `isLoggable` registry slot — consults FIRST, so without this
@@ -1887,14 +1908,18 @@ pub(crate) fn register_logging_natives(registry: &mut NativeMethodRegistry) {
                 _ => return Ok(Some(Value::Int(1))),
             };
             let arg_val = jul_level_int(ctx, args.get(1).copied()).unwrap_or(800);
-            // Slot 1 holds EITHER a `Level` object or its raw int value:
+            // The level slot holds EITHER a `Level` object or its raw int value:
             // `java/util/logging/Logger.setLevel` is registered twice in this
             // file, and the later registration (which wins) stores
             // `Value::Int(level_val)` where the earlier one stored the Level
             // object. Reading only the object shape meant every `setLevel`
             // silently left this at the INFO default, so `isLoggable` said yes
             // to everything — `logger.setLevel(SEVERE)` did not suppress INFO.
-            let stored = ctx.get_field(this, LOGGER_FIELD_LEVEL);
+            //
+            // The slot is `logmanager::LOGGER_FIELD_LEVEL`, the VM-internal slot
+            // the declaration anchors past the 12 real fields — NOT the local
+            // `LOGGER_FIELD_LEVEL = 1`, which is `manager: LogManager`.
+            let stored = ctx.get_field(this, crate::logmanager::LOGGER_FIELD_LEVEL);
             let current = jul_level_int(ctx, Some(stored)).unwrap_or(800); // default INFO
             // A message is loggable if its level >= logger's current level
             Ok(Some(Value::Int(if arg_val >= current { 1 } else { 0 })))
@@ -2949,6 +2974,27 @@ pub(crate) fn register_slf4j_natives(registry: &mut NativeMethodRegistry) {
     register_slf4j_binder_stubs_pub(registry);
 
     // --- java.util.logging (JUL) — standard JDK logging ---
+    //
+    // ONE slot map: the one `ClassManager::synthetic_stub_fields` declares for
+    // `java/util/logging/Logger` (`class_manager.rs:14191`, real-JDK order) and
+    // `logmanager.rs` names — `LOGGER_FIELD_NAME` 2, `LOGGER_FIELD_PARENT` 8,
+    // `LOGGER_FIELD_LEVEL` 12 (VM-internal, anchored past the 12 real fields).
+    //
+    // These bodies used to ask for a 2- or 3-slot Logger and write the name at
+    // 0 and the level at 1, which on the declared layout is the name String
+    // into `config: Logger$ConfigurationData` and an `Int` into
+    // `manager: LogManager` — a wrong-typed write into a reference slot, and
+    // exactly the defect `logmanager.rs:161`'s comment records as already fixed
+    // there ("this used to sit on `manager`"). The width was never the hazard:
+    // `Logger` HAS a declaration, so `try_alloc_concurrent_synthetic`'s closing
+    // `num_fields.max(real)` clamped 3 up to 13 and the writes landed in bounds.
+    // The field IDENTITY was.
+    //
+    // These are not all dead. `getGlobal`, `setLevel`, `getLevel`, `getName` and
+    // `config(String)V` are the LAST registration for their triples in
+    // synthetic-JDK mode: `register_slf4j_natives` runs at `lib.rs:24029`, and
+    // `logmanager::register_logmanager_natives` (`lib.rs:24372`, the final say)
+    // registers neither `getGlobal` nor `getLevel`/`setLevel`/`getName`/`config`.
     let jul_logger = "java/util/logging/Logger";
     registry.register(
         jul_logger,
@@ -2956,9 +3002,21 @@ pub(crate) fn register_slf4j_natives(registry: &mut NativeMethodRegistry) {
         "(Ljava/lang/String;)Ljava/util/logging/Logger;",
         |ctx, args| {
             let name = args.first().copied().unwrap_or(Value::Object(None));
-            let logger = try_alloc_concurrent_synthetic(ctx, "java/util/logging/Logger", 3)?;
-            ctx.set_field(logger, 0, name);
-            ctx.set_field(logger, 1, Value::Int(800)); // INFO level
+            let logger = try_alloc_concurrent_synthetic(
+                ctx,
+                "java/util/logging/Logger",
+                crate::logmanager::LOGGER_NUM_FIELDS,
+            )?;
+            ctx.set_field(logger, crate::logmanager::LOGGER_FIELD_NAME, name);
+            // No explicit level — `jul_level_int` answers `None` for an unset
+            // slot and every caller applies the JDK default (INFO). Storing
+            // `Int(800)` here instead would be an Int in a slot the declaration
+            // types `Ljava/lang/Object;`.
+            ctx.set_field(
+                logger,
+                crate::logmanager::LOGGER_FIELD_LEVEL,
+                Value::Object(None),
+            );
             Ok(Some(Value::Object(Some(logger))))
         },
     );
@@ -2968,9 +3026,21 @@ pub(crate) fn register_slf4j_natives(registry: &mut NativeMethodRegistry) {
         "()Ljava/util/logging/Logger;",
         |ctx, _| {
             let name = ctx.create_string("global");
-            let logger = try_alloc_concurrent_synthetic(ctx, "java/util/logging/Logger", 3)?;
-            ctx.set_field(logger, 0, Value::Object(Some(name)));
-            ctx.set_field(logger, 1, Value::Int(800));
+            let logger = try_alloc_concurrent_synthetic(
+                ctx,
+                "java/util/logging/Logger",
+                crate::logmanager::LOGGER_NUM_FIELDS,
+            )?;
+            ctx.set_field(
+                logger,
+                crate::logmanager::LOGGER_FIELD_NAME,
+                Value::Object(Some(name)),
+            );
+            ctx.set_field(
+                logger,
+                crate::logmanager::LOGGER_FIELD_LEVEL,
+                Value::Object(None),
+            );
             Ok(Some(Value::Object(Some(logger))))
         },
     );
@@ -3004,7 +3074,7 @@ pub(crate) fn register_slf4j_natives(registry: &mut NativeMethodRegistry) {
             // holds a `Level` OBJECT rather than a raw int — which is what the
             // OTHER two `setLevel` registrations store. That default made
             // `setLevel(SEVERE)` suppress nothing. Decode every shape instead.
-            let stored = ctx.get_field(this, 1);
+            let stored = ctx.get_field(this, crate::logmanager::LOGGER_FIELD_LEVEL);
             let logger_level = jul_level_int(ctx, Some(stored)).unwrap_or(800);
             let check_level = jul_level_int(ctx, args.get(1).copied()).unwrap_or(800);
             Ok(Some(Value::Int(if check_level >= logger_level {
@@ -3024,7 +3094,17 @@ pub(crate) fn register_slf4j_natives(registry: &mut NativeMethodRegistry) {
             // `None` here means `setLevel(null)` — "inherit from the parent",
             // which must CLEAR the explicit level rather than pin it at INFO.
             let decoded = jul_level_int(ctx, Some(level));
-            ctx.set_field(this, 1, Value::Int(decoded.unwrap_or(800)));
+            // Store the `Level` REFERENCE, at the declared VM-internal slot.
+            // Both halves changed together and neither alone would be right:
+            // the old `set_field(this, 1, Value::Int(..))` put an Int into
+            // `manager: Ljava/util/logging/LogManager;`, and slot 12 is typed
+            // `Ljava/lang/Object;`, so moving the Int there would just relocate
+            // the wrong-tag write. `jul_level_int` decodes the object shape, and
+            // this now matches what `lib.rs:17605` (`register_essential_natives_
+            // with_shims`, the real-JDK-mode owner of this triple) already
+            // stores — so the two modes stop disagreeing about where the level
+            // lives.
+            ctx.set_field(this, crate::logmanager::LOGGER_FIELD_LEVEL, level);
             // Publish to the name-keyed explicit-level table too: the
             // `isLoggable` that actually wins the registry slot
             // (`logmanager::native_jul_logger_is_loggable`, re-registered last
@@ -3044,6 +3124,16 @@ pub(crate) fn register_slf4j_natives(registry: &mut NativeMethodRegistry) {
         "getLevel",
         "()Ljava/util/logging/Level;",
         |ctx, _| {
+            // NOT a slot bug — this ignores the receiver entirely and mints a
+            // fresh INFO `Level` per call, so no Logger slot is read and the two
+            // slots it writes are `Level`'s own (`name` 0, `value` 1), which
+            // match the real class. Left as-is deliberately: making it read
+            // `LOGGER_FIELD_LEVEL` (which `setLevel` above now writes, and which
+            // `lib.rs:17632` already reads in real-JDK mode) would start
+            // returning `null` for a logger with no explicit level — the real
+            // JDK contract, but a behaviour change that needs a run this lane
+            // could not do. Recorded in E41's note; it is the remaining
+            // divergence between this registrar and the essential one.
             let level = try_alloc_concurrent_synthetic(ctx, "java/util/logging/Level", 2)?;
             let name = ctx.create_string("INFO");
             ctx.set_field(level, 0, Value::Object(Some(name)));
@@ -3080,29 +3170,34 @@ pub(crate) fn register_slf4j_natives(registry: &mut NativeMethodRegistry) {
                 _ => return Ok(None),
             };
             let handler = args.get(1).copied().unwrap_or(Value::Object(None));
-            // Logger comment in phases_late.rs: field 2 = handlers ArrayList. Some allocations
-            // only create 2 fields, so guard with object_num_fields.
-            if ctx.object_num_fields(this) > 2 {
-                // Lazily initialise the handlers ArrayList if absent.
-                let handlers = match ctx.get_field(this, 2) {
-                    Value::Object(Some(lst)) => lst,
-                    _ => {
-                        let lst = try_alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2)?;
-                        cratonvm_native_collections::native_al_init(
-                            ctx,
-                            &[Value::Object(Some(lst))],
-                        )
+            // The GC-safe side table, not slot 2. The old comment cited "Logger
+            // comment in phases_late.rs: field 2 = handlers ArrayList" — a peer
+            // site, not the declaration, and the declaration
+            // (`class_manager.rs:14191`) says slot 2 is `name: Ljava/lang/String;`.
+            // The `object_num_fields(this) > 2` guard that went with it was
+            // measuring the legacy 2-field shim shape, which no producer in this
+            // file mints any more.
+            let handlers = match jul_logger_handlers_get(ctx, this) {
+                Some(lst) => lst,
+                None => {
+                    let lst = try_alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2)?;
+                    cratonvm_native_collections::native_al_init(ctx, &[Value::Object(Some(lst))])
                         .ok();
-                        ctx.set_field(this, 2, Value::Object(Some(lst)));
-                        lst
-                    }
-                };
-                cratonvm_native_collections::native_al_add(
-                    ctx,
-                    &[Value::Object(Some(handlers)), handler],
-                )
-                .ok();
-            }
+                    // `jul_logger_handlers_set` calls `add_global_root`, which
+                    // may grow the root table and collect — the `set_field` it
+                    // replaces could not. Pin across it and re-read.
+                    let lst_pin = ctx.pin_native_root(lst);
+                    jul_logger_handlers_set(ctx, this, lst);
+                    let lst = ctx.read_native_pin(lst_pin, lst);
+                    ctx.unpin_native_roots(lst_pin);
+                    lst
+                }
+            };
+            cratonvm_native_collections::native_al_add(
+                ctx,
+                &[Value::Object(Some(handlers)), handler],
+            )
+            .ok();
             Ok(None)
         },
     );
@@ -3116,14 +3211,13 @@ pub(crate) fn register_slf4j_natives(registry: &mut NativeMethodRegistry) {
                 _ => return Ok(None),
             };
             let handler = args.get(1).copied().unwrap_or(Value::Object(None));
-            if ctx.object_num_fields(this) > 2 {
-                if let Value::Object(Some(handlers)) = ctx.get_field(this, 2) {
-                    cratonvm_native_collections::native_al_remove_obj(
-                        ctx,
-                        &[Value::Object(Some(handlers)), handler],
-                    )
-                    .ok();
-                }
+            // Side table — see `addHandler` above.
+            if let Some(handlers) = jul_logger_handlers_get(ctx, this) {
+                cratonvm_native_collections::native_al_remove_obj(
+                    ctx,
+                    &[Value::Object(Some(handlers)), handler],
+                )
+                .ok();
             }
             Ok(None)
         },
@@ -3160,10 +3254,22 @@ pub(crate) fn register_slf4j_natives(registry: &mut NativeMethodRegistry) {
         "getLogger",
         "(Ljava/lang/String;)Ljava/util/logging/Logger;",
         |ctx, args| {
+            // Shadowed by `logmanager.rs:5927` (registered last, and
+            // `--dump-native-registry` reports it `owns_slot: true`), but kept on
+            // the one declared slot map so a registration-order change cannot
+            // resurrect a second one.
             let name = args.first().copied().unwrap_or(Value::Object(None));
-            let logger = try_alloc_concurrent_synthetic(ctx, "java/util/logging/Logger", 2)?;
-            ctx.set_field(logger, 0, name);
-            ctx.set_field(logger, 1, Value::Int(800));
+            let logger = try_alloc_concurrent_synthetic(
+                ctx,
+                "java/util/logging/Logger",
+                crate::logmanager::LOGGER_NUM_FIELDS,
+            )?;
+            ctx.set_field(logger, crate::logmanager::LOGGER_FIELD_NAME, name);
+            ctx.set_field(
+                logger,
+                crate::logmanager::LOGGER_FIELD_LEVEL,
+                Value::Object(None),
+            );
             Ok(Some(Value::Object(Some(logger))))
         },
     );
@@ -3747,13 +3853,22 @@ fn slf4j_log_msg(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
 }
 
 /// java.util.logging (JUL) log message handler.
+///
+/// Slot map: NONE of its own. Both reads below used to be raw slot indices from
+/// the legacy 2/3-field shim layout — `get_field(this, 0)` for the name and
+/// `get_field(logger, 2)` for the handler list — against a class that
+/// `ClassManager::synthetic_stub_fields` declares in **real-JDK order**
+/// (`class_manager.rs:14191`: `config` 0, `manager` 1, `name` **2**). On the
+/// 13-slot Logger that `Logger.getLogger(name)` actually returns, slot 0 is the
+/// (unset) `config` and slot 2 is the **name String** — so the name came back
+/// empty and the "handler list" was a `java.lang.String` that the fan-out loop
+/// below then called `size()` / `get(I)` on. This is not dead code: it is the
+/// registered body for `Logger.config(String)V` in
+/// [`register_slf4j_natives`], and nothing re-registers that triple after it.
 pub(crate) fn jul_log_msg(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // args[0] = this (Logger), args[1] = message string
     let logger_name = match args.first() {
-        Some(Value::Object(Some(this))) => match ctx.get_field(*this, 0) {
-            Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
-            _ => String::new(),
-        },
+        Some(Value::Object(Some(this))) => crate::logmanager::read_jul_logger_name(&*ctx, *this),
         _ => String::new(),
     };
     if let Some(Value::Object(Some(msg))) = args.get(1) {
@@ -3771,9 +3886,13 @@ pub(crate) fn jul_log_msg(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
     else {
         return Ok(None);
     };
-    let handlers = match ctx.get_field(*logger, 2) {
-        Value::Object(Some(list)) => list,
-        _ => return Ok(None),
+    // The GC-safe side table, not a raw slot: `jul_logger_handlers_set` is what
+    // the `addHandler` that actually owns the registry slot
+    // (`reflect_annotations.rs:213`, re-registered last) writes into, and slot 2
+    // on the declared layout is the logger's NAME.
+    let handlers = match jul_logger_handlers_get(ctx, *logger) {
+        Some(list) => list,
+        None => return Ok(None),
     };
     let level_class = match ctx.ensure_class_initialized("java/util/logging/Level") {
         Ok(class) => class,

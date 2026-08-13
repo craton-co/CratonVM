@@ -4517,68 +4517,69 @@ pub(crate) fn register_p64_collectors_teeing(r: &mut NativeMethodRegistry) {
 
 // =============================================================================
 // java.util.stream.Gatherer — Java 22 (preview → final Java 24)
-// Stub for the Gatherer API
+//
+// ONE slot map for this class, and it is NOT this file's.
+//
+// `java/util/stream/Gatherer` has NO `synthetic_stub_fields` arm, so
+// `class_num_total_fields` answers 0 and `try_alloc_concurrent_synthetic`'s
+// closing `let n = num_fields.max(real)` leaves the caller's request as the
+// LITERAL object width — there is no clamp to hide a disagreement behind. This
+// registrar used to model the class at 3 slots (initializer 0, integrator 1,
+// finisher 2) while `lib.rs::register_pd_stream_gatherers` models it at 5
+// (initializer 0, integrator 1, combiner 2, finisher 3, VM-internal KIND 4).
+// Not two widths — two INCOMPATIBLE maps: `finisher` was slot 2 here and slot 3
+// there, and slot 2 there is the `combiner`.
+//
+// The 5-slot map is the right one on both authorities available without a run:
+//
+//   * the ORACLE. `Gatherer` itself is an interface; the carrier the real JDK
+//     returns from every one of its static factories is the record
+//     `java.util.stream.Gatherers.GathererImpl`, whose components are
+//     `initializer, integrator, combiner, finisher` in that order (JDK 25
+//     source, `java.base/java/util/stream/Gatherers.java:502-506`). Slots 0..3
+//     of the 5-slot map ARE that record, in order; slot 4 is a VM-internal kind
+//     tag anchored past it. The 3-slot map dropped `combiner` — which is a real
+//     interface method, `Gatherer.combiner()` — and so mis-seated `finisher`.
+//   * the CONSUMERS. `register_phase_d_natives` (`lib.rs:24181`) runs AFTER
+//     `register_phase67_natives` (`lib.rs:24124`) inside
+//     `register_synthetic_overrides`, and `register()` is
+//     last-registration-wins, so every reader that actually executes is
+//     lib.rs's: `pd_stream_gather` opens with `ctx.get_field(gatherer, 4)`,
+//     `finisher()` reads slot 3, `combiner()` reads slot 2.
+//
+// So every factory here was minting objects for readers that disagreed with it.
+// Six of the seven were already shadowed by a 5-slot twin in `lib.rs`; the
+// seventh, `ofSequential(Supplier,Integrator)`, was registered ONLY here, and
+// its 3-slot product reached `get_field(gatherer, 4)`. `Heap::get_field`
+// (`gc/src/heap.rs:652`) opens with `assert!(index < num_slots)`, so
+// `stream.gather(Gatherer.ofSequential(sup, integ))` aborted the VM with
+// "field index 4 out of bounds (num_slots=3)". That overload is now registered
+// in the 5-slot shape at `lib.rs:42681`.
+//
+// The producers and accessors are therefore DELETED here rather than widened to
+// 5: widening would leave two copies of one slot map to drift apart again,
+// which is the defect itself. Deleted (each already re-registered later, and
+// already winning, in `lib.rs::register_pd_stream_gatherers`):
+//
+//   Gatherer.of(Integrator)                                lib.rs:42693
+//   Gatherer.ofSequential(Supplier,Integrator)             lib.rs:42681
+//   Gatherer.ofSequential(Supplier,Integrator,BiConsumer)  lib.rs:42636
+//   Gatherer.initializer() / integrator() / finisher()     lib.rs:42599..42634
+//   Gatherers.fold / scan / windowFixed / windowSliding    lib.rs:42741..42811
+//   Stream.gather(Gatherer)                                lib.rs:42591
+//
+// `lib.rs` additionally serves `Gatherer.combiner()`, `Gatherer$Downstream.push`
+// and `Gatherers.mapConcurrent`, which this file never had. What is left below
+// is the ONE pair `lib.rs` does not register.
+//
+// See docs/known-issues/jdk-only/E35-R11-SYNTHETIC-WIDTH-SWEEP-20260813.md §3.1
+// and E41's record for the full derivation.
 // =============================================================================
 
 pub(crate) fn register_p67_gatherer(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let g = "java/util/stream/Gatherer";
-    // Gatherer.of(integrator) → Gatherer
-    r.register(
-        g,
-        "of",
-        "(Ljava/util/stream/Gatherer$Integrator;)Ljava/util/stream/Gatherer;",
-        |ctx, args| {
-            // 3-field: initializer=0, integrator=1, finisher=2
-            let obj = try_alloc_concurrent_synthetic(ctx, "java/util/stream/Gatherer", 3)?;
-            ctx.set_field(obj, 0, Value::Object(None));
-            ctx.set_field(obj, 1, args.first().copied().unwrap_or(Value::Object(None)));
-            ctx.set_field(obj, 2, Value::Object(None));
-            Ok(Some(Value::Object(Some(obj))))
-        },
-    );
-    r.register(g, "ofSequential", "(Ljava/util/function/Supplier;Ljava/util/stream/Gatherer$Integrator;)Ljava/util/stream/Gatherer;", |ctx, args| {
-        let obj = try_alloc_concurrent_synthetic(ctx, "java/util/stream/Gatherer", 3)?;
-        ctx.set_field(obj, 0, args.first().copied().unwrap_or(Value::Object(None)));
-        ctx.set_field(obj, 1, args.get(1).copied().unwrap_or(Value::Object(None)));
-        ctx.set_field(obj, 2, Value::Object(None));
-        Ok(Some(Value::Object(Some(obj))))
-    });
-    r.register(g, "ofSequential", "(Ljava/util/function/Supplier;Ljava/util/stream/Gatherer$Integrator;Ljava/util/function/BiConsumer;)Ljava/util/stream/Gatherer;", |ctx, args| {
-        let obj = try_alloc_concurrent_synthetic(ctx, "java/util/stream/Gatherer", 3)?;
-        ctx.set_field(obj, 0, args.first().copied().unwrap_or(Value::Object(None)));
-        ctx.set_field(obj, 1, args.get(1).copied().unwrap_or(Value::Object(None)));
-        ctx.set_field(obj, 2, args.get(2).copied().unwrap_or(Value::Object(None)));
-        Ok(Some(Value::Object(Some(obj))))
-    });
-    r.register(
-        g,
-        "integrator",
-        "()Ljava/util/stream/Gatherer$Integrator;",
-        |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            Ok(Some(ctx.get_field(this, 1)))
-        },
-    );
-    r.register(
-        g,
-        "initializer",
-        "()Ljava/util/function/Supplier;",
-        |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            Ok(Some(ctx.get_field(this, 0)))
-        },
-    );
-    r.register(
-        g,
-        "finisher",
-        "()Ljava/util/function/BiConsumer;",
-        |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            Ok(Some(ctx.get_field(this, 2)))
-        },
-    );
     // Gatherer.defaultInitializer / defaultFinisher
     //
     // KEEP — but the wave-3 one-liner ("null IS the Gatherer sentinel") is only
@@ -4590,13 +4591,15 @@ pub(crate) fn register_p67_gatherer(r: &mut NativeMethodRegistry) {
     // are considered to be stateless, and invoking their initializer is
     // optional" (`java.base/java/util/stream/Gatherer.java`, @implSpec).
     //
-    // That identity test is the only spec-defined observation, and this model
-    // passes it: `Gatherer.of(..)` above stores null in slots 0 and 2, and
-    // `initializer()`/`finisher()` hand those same slots straight back, so
-    // `g.initializer() == Gatherer.defaultInitializer()` compares null with
-    // null and answers `true` exactly where the real JDK would. The gather
-    // engine (`pd_gather_fold` / `pd_gather_scan` / `pd_gather_custom` in
-    // lib.rs) reads the same sentinel by branching on `Value::Object(Some(_))`.
+    // That identity test is the only spec-defined observation, and the model
+    // passes it: `Gatherer.of(..)` (now `lib.rs:42693`, the 5-slot map) stores
+    // null in the initializer slot 0 and the finisher slot 3, and
+    // `initializer()`/`finisher()` (`lib.rs:42599`/`:42626`) hand those same
+    // slots straight back, so `g.initializer() == Gatherer.defaultInitializer()`
+    // compares null with null and answers `true` exactly where the real JDK
+    // would. The gather engine (`pd_gather_fold` / `pd_gather_scan` /
+    // `pd_gather_custom` in lib.rs) reads the same sentinel by branching on
+    // `Value::Object(Some(_))`.
     // Manufacturing a synthetic Supplier / BiConsumer here would flip that
     // identity test to `false` for every default gatherer AND hand the engine a
     // value it then has to call.
@@ -4620,72 +4623,6 @@ pub(crate) fn register_p67_gatherer(r: &mut NativeMethodRegistry) {
         "defaultFinisher",
         "()Ljava/util/function/BiConsumer;",
         |_ctx, _args| Ok(Some(Value::Object(None))),
-    );
-
-    // Gatherers utility class (Java 22)
-    let gs = "java/util/stream/Gatherers";
-    // Gatherers.fold(initial, folder)
-    r.register(
-        gs,
-        "fold",
-        "(Ljava/util/function/Supplier;Ljava/util/function/BiFunction;)Ljava/util/stream/Gatherer;",
-        |ctx, args| {
-            let obj = try_alloc_concurrent_synthetic(ctx, "java/util/stream/Gatherer", 3)?;
-            ctx.set_field(obj, 0, args.first().copied().unwrap_or(Value::Object(None)));
-            ctx.set_field(obj, 1, args.get(1).copied().unwrap_or(Value::Object(None)));
-            ctx.set_field(obj, 2, Value::Object(None));
-            Ok(Some(Value::Object(Some(obj))))
-        },
-    );
-    // Gatherers.scan(initial, scanner)
-    r.register(
-        gs,
-        "scan",
-        "(Ljava/util/function/Supplier;Ljava/util/function/BiFunction;)Ljava/util/stream/Gatherer;",
-        |ctx, args| {
-            let obj = try_alloc_concurrent_synthetic(ctx, "java/util/stream/Gatherer", 3)?;
-            ctx.set_field(obj, 0, args.first().copied().unwrap_or(Value::Object(None)));
-            ctx.set_field(obj, 1, args.get(1).copied().unwrap_or(Value::Object(None)));
-            ctx.set_field(obj, 2, Value::Object(None));
-            Ok(Some(Value::Object(Some(obj))))
-        },
-    );
-    // Gatherers.windowFixed(size) → Gatherer
-    r.register(
-        gs,
-        "windowFixed",
-        "(I)Ljava/util/stream/Gatherer;",
-        |ctx, args| {
-            let obj = try_alloc_concurrent_synthetic(ctx, "java/util/stream/Gatherer", 3)?;
-            ctx.set_field(obj, 0, args.first().copied().unwrap_or(Value::Int(1)));
-            ctx.set_field(obj, 1, Value::Object(None));
-            ctx.set_field(obj, 2, Value::Object(None));
-            Ok(Some(Value::Object(Some(obj))))
-        },
-    );
-    // Gatherers.windowSliding(size) → Gatherer
-    r.register(
-        gs,
-        "windowSliding",
-        "(I)Ljava/util/stream/Gatherer;",
-        |ctx, args| {
-            let obj = try_alloc_concurrent_synthetic(ctx, "java/util/stream/Gatherer", 3)?;
-            ctx.set_field(obj, 0, args.first().copied().unwrap_or(Value::Int(1)));
-            ctx.set_field(obj, 1, Value::Object(None));
-            ctx.set_field(obj, 2, Value::Object(None));
-            Ok(Some(Value::Object(Some(obj))))
-        },
-    );
-
-    // Stream.gather(Gatherer) — add to Stream
-    r.register(
-        "java/util/stream/Stream",
-        "gather",
-        "(Ljava/util/stream/Gatherer;)Ljava/util/stream/Stream;",
-        |_ctx, args| {
-            // Simplified: return a new empty stream (real impl would transform elements)
-            Ok(Some(args.first().copied().unwrap_or(Value::Object(None))))
-        },
     );
     r.set_category(__prev_cat);
 }

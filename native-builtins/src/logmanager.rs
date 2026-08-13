@@ -153,7 +153,15 @@ const LM_FIELD_READY: usize = LM_REAL_FIELDS + 1;
 
 /// Real `Logger` instance-field count on JDK 21–25.
 const LOGGER_REAL_FIELDS: usize = 12;
-const LOGGER_NUM_FIELDS: usize = LOGGER_REAL_FIELDS + 1;
+/// The width `ClassManager::synthetic_stub_fields` declares for
+/// `java/util/logging/Logger` (`class_manager.rs:14191`): the 12 real fields
+/// plus the one VM-internal slot [`LOGGER_FIELD_LEVEL`] is anchored on.
+///
+/// `pub(crate)` because it is the width every JUL Logger producer in the tree
+/// must ask for. `logging_shims` used to ask 2 or 3 and write its own
+/// name/level slots at 0/1 — a second slot map for a class that already had a
+/// declaration, which put the name on `config` and the level on `manager`.
+pub(crate) const LOGGER_NUM_FIELDS: usize = LOGGER_REAL_FIELDS + 1;
 pub(crate) const LOGGER_FIELD_NAME: usize = 2;
 pub(crate) const LOGGER_FIELD_PARENT: usize = 8;
 /// VM-internal: a real `Logger` has no `level` field at all — the effective
