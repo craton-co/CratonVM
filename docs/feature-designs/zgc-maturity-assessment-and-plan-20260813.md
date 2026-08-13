@@ -528,11 +528,32 @@ interpreter/native barrier and x64 barrier emission (~6-7 instructions), then
 `zgc::relocate`'s *concurrent* machinery and `forwarding`'s per-page table —
 which only become the right structures once `zgc::page` is adopted, since a
 single arena with no pages carries no information in a page-keyed table — then
-`generation` + `remembered`. **And the `VmHeap::Zgc` arm audit (R6): 58 arms
-plus a macro assert non-moving, and compaction now returns a non-empty pointer
-map.** That audit is the reason compaction stays behind a default-off flag
-rather than being wired into the normal path, and it is the next thing to do
-in this phase.
+`generation` + `remembered`. **R6's `VmHeap::Zgc` arm audit is DONE (2026-08-13).**
+
+R6 said: *"58 arms plus a macro; the affirmative ones (`true`, `(0,0)`) assert
+facts that are only true for a non-moving collector, and none of them will fail
+loudly when they become wrong."* Compaction is the change that can make them
+wrong, so the audit stopped being theoretical the moment it landed.
+
+Result: of the 28 `VmHeap::Zgc` arms that return a value, exactly **two** take
+a *pre-GC address* and therefore have a moving-collector answer —
+`watched_pre_gc_addr_survived` and `pre_gc_addr_did_not_survive` — and **both
+are already correct**, because each consults the `pointer_map` before it
+reaches its ZGC arm. That is not a reading, it is now a test: the ZGC arms
+themselves are `is_addr_live`, a registry lookup, which after a slide answers
+about zeroed bytes at the old address. Delete either map check and a survivor
+that moved is reported dead at its old address, and
+`process_references_after_gc` drops every reference to it — the H2/HIB-CV-32
+shape those predicates were written for. Verified by deleting the check.
+
+The other arms are about *reachability walking* (`metadata_pin_deferrable`,
+`mirror_pin_deferrable`), *generational structure this backend does not have*
+(`old_gen_needs_gc`, `is_in_young_addr`), or *G1 machinery* — none of which a
+slide changes. The remaining reason compaction stays behind a default-off flag
+is therefore no longer this audit but the consumers OUTSIDE `gc/`: JIT frame
+maps, monitor tables, external root providers and native side tables all take
+the pointer map, and none has been exercised against a ZGC cycle that returns
+a non-empty one.
 
 ---
 

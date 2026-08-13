@@ -3147,6 +3147,14 @@ impl ZgcRealHeap {
     /// another phase owns: `collect_garbage` passes the post-sweep registry
     /// (everything the sweep did not reclaim), and a test passes whatever it
     /// built.
+    #[cfg(test)]
+    pub(crate) fn relocate_stw_for_test(
+        &self,
+        live: &[usize],
+    ) -> (usize, usize, cratonvm_types::PointerMap) {
+        self.relocate_stw(live)
+    }
+
     fn relocate_stw(&self, live: &[usize]) -> (usize, usize, cratonvm_types::PointerMap) {
         let mut pointer_map = cratonvm_types::PointerMap::default();
         let mut moved = 0usize;
@@ -7292,7 +7300,7 @@ impl GarbageCollector for ZgcRealHeap {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     // ------------------------------------------------------------------
@@ -8792,6 +8800,12 @@ mod tests {
     static OVERLAY_ARMED: parking_lot::Mutex<Option<(usize, ObjectRef)>> =
         parking_lot::Mutex::new(None);
     static OVERLAY_TEST_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
+    /// Shared with `vm_heap`'s tests: the flag-sensitive ZGC fixtures set a
+    /// process-visible override and must not run concurrently.
+    pub(crate) fn tests_overlay_lock() -> parking_lot::MutexGuard<'static, ()> {
+        OVERLAY_TEST_LOCK.lock()
+    }
 
     fn overlay_provider_roots(owner_addr: usize, _class_id: Option<u32>) -> Vec<ObjectRef> {
         match *OVERLAY_ARMED.lock() {
