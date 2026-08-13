@@ -416,7 +416,7 @@ pub static SWEEP_ZERO_SPAN_HITS: AtomicU64 = AtomicU64::new(0);
 
 /// Zero runs a young walk recognised as a run of EMPTY objects and stepped
 /// over on-grid, instead of treating as a desync — see
-/// [`zero_run_is_empty_object_run`]. Summed across the three walks that ask:
+/// [`zero_run_empty_object_resume`]. Summed across the three walks that ask:
 /// the sequential sweep, the parallel [`sweep_chunk`], and
 /// [`clear_all_mark_bits_in_arena`]. Deliberately a SEPARATE counter from
 /// [`SWEEP_ZERO_SPAN_HITS`], which now counts only the runs that still take the
@@ -512,6 +512,39 @@ pub static SWEEP_ANCHOR_NOT_A_BASE: AtomicU64 = AtomicU64::new(0);
 pub static PAR_SWEEP_ATTEMPTS: AtomicU64 = AtomicU64::new(0);
 /// H2-CID0 — companion to [`PAR_SWEEP_ATTEMPTS`]: attempts that were accepted.
 pub static PAR_SWEEP_ACCEPTS: AtomicU64 = AtomicU64::new(0);
+
+/// Which check abandoned a parallel sweep chunk, by reason.
+///
+/// [`PAR_SWEEP_ACCEPTS`] is a per-CYCLE verdict and one `None` from any chunk
+/// discards the whole attempt, so a shortfall there says only "something
+/// disagreed with the grid somewhere". The seven reasons mean entirely
+/// different things — a hole-crossing extent is a free-list/grid disagreement,
+/// a phantom extent is the corruption family, and a chain that misses its
+/// anchor is an anchor that was never an object start — and picking the wrong
+/// one to chase costs a whole investigation.
+///
+/// Index: `0` free-block overshoot, `1` malformed GAP filler, `2` unlisted zero
+/// span (the ones [`zero_run_empty_object_resume`] refuses), `3` implausible
+/// header size, `4` extent crosses a free hole, `5` phantom extent (subsumes a
+/// live object), `6` the chain did not land exactly on the next anchor.
+pub static PAR_CHUNK_BAILS: [AtomicU64; 7] = [
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+];
+
+/// Count a [`PAR_CHUNK_BAILS`] reason and abandon the chunk. Every `return
+/// None` in `sweep_chunk` goes through here so a new bail cannot be added
+/// without choosing a reason for it.
+#[inline]
+fn chunk_bail(reason: usize) -> Option<SweepChunkResult> {
+    PAR_CHUNK_BAILS[reason].fetch_add(1, Ordering::Relaxed);
+    None
+}
 
 /// H2-CID0 — bounded report counter for the off-grid-anchor warning.
 static ANCHOR_OFF_GRID_REPORTS: AtomicU64 = AtomicU64::new(0);
@@ -9874,19 +9907,21 @@ impl GenerationalHeap {
                 let vouched_live = side_sorted.binary_search(&(from_base + cursor)).is_ok();
                 // A run of EMPTY objects is not a desync — step over it on-grid
                 // and keep every reclaim decision behind it. See
-                // `zero_run_is_empty_object_run` for the measurement that
+                // `zero_run_empty_object_resume` for the measurement that
                 // separates this shape from the corruption the unwind below
                 // exists for. Still never parsed and never freed: over-retention
                 // is always safe here.
-                if run_end - cursor >= HEADER_SIZE
-                    && !vouched_live
-                    && zero_run_is_empty_object_run(from_base, cursor, run_end, used, &side_sorted)
-                {
+                let empty_resume = if run_end - cursor >= HEADER_SIZE && !vouched_live {
+                    zero_run_empty_object_resume(from_base, cursor, run_end, used, &side_sorted)
+                } else {
+                    None
+                };
+                if let Some(resume) = empty_resume {
                     SWEEP_ZERO_SPAN_EMPTY_RUNS.fetch_add(1, Ordering::Relaxed);
-                    // `run_end <= limit` (the next free block's offset), so the
-                    // run never crosses a free block and `free_iter` is already
-                    // positioned correctly.
-                    cursor = run_end;
+                    // `resume <= run_end <= limit` (the next free block's
+                    // offset), so the run never crosses a free block and
+                    // `free_iter` is already positioned correctly.
+                    cursor = resume;
                     continue;
                 }
                 if run_end - cursor >= HEADER_SIZE && !vouched_live {
@@ -15691,7 +15726,7 @@ fn sweep_chunk(ctx: &SweepCtx<'_>, lo: usize, hi: usize) -> Option<SweepChunkRes
         let (resynced, overshot) = skip_free_blocks(&mut cursor, &mut free_iter);
         if overshot {
             // The grid and the free list disagree — sequential recovery only.
-            return None;
+            return chunk_bail(0);
         }
         if resynced {
             continue;
@@ -15715,12 +15750,12 @@ fn sweep_chunk(ctx: &SweepCtx<'_>, lo: usize, hi: usize) -> Option<SweepChunkRes
                 cursor += gap;
                 continue;
             }
-            return None;
+            return chunk_bail(1);
         }
 
         // Unlisted all-zero span. Only SOME of these are evidence the grid
         // broke: a run of EMPTY objects is the ordinary post-HEADER_SIZE-16
-        // shape (see `zero_run_is_empty_object_run`), and a marked object at
+        // shape (see `zero_run_empty_object_resume`), and a marked object at
         // the run start is simply a live `ClassId(0)` container whose header
         // legitimately reads zero. Bailing on either was expensive out of all
         // proportion — one `None` makes `parallel_sweep_walk` discard EVERY
@@ -15743,7 +15778,7 @@ fn sweep_chunk(ctx: &SweepCtx<'_>, lo: usize, hi: usize) -> Option<SweepChunkRes
             let run_end = zero_run_end(from_base, cursor, limit);
             let vouched_live = ctx.side_sorted.binary_search(&(from_base + cursor)).is_ok();
             if run_end - cursor >= HEADER_SIZE && !vouched_live {
-                if zero_run_is_empty_object_run(
+                if let Some(resume) = zero_run_empty_object_resume(
                     from_base,
                     cursor,
                     run_end,
@@ -15751,21 +15786,21 @@ fn sweep_chunk(ctx: &SweepCtx<'_>, lo: usize, hi: usize) -> Option<SweepChunkRes
                     ctx.side_sorted,
                 ) {
                     SWEEP_ZERO_SPAN_EMPTY_RUNS.fetch_add(1, Ordering::Relaxed);
-                    cursor = run_end;
+                    cursor = resume;
                     continue;
                 }
-                return None;
+                return chunk_bail(2);
             }
         }
 
         let total_size = gen_object_total_size(header);
         if total_size < HEADER_SIZE || cursor + total_size > ctx.used {
-            return None;
+            return chunk_bail(3);
         }
         // An object can never span a pre-existing free hole.
         if let Some(&&(foff, _)) = free_iter.peek() {
             if foff > cursor && foff < cursor + total_size {
-                return None;
+                return chunk_bail(4);
             }
         }
 
@@ -15783,7 +15818,7 @@ fn sweep_chunk(ctx: &SweepCtx<'_>, lo: usize, hi: usize) -> Option<SweepChunkRes
             .get(live_probe)
             .is_some_and(|&a| a < abs + total_size)
         {
-            return None;
+            return chunk_bail(5);
         }
 
         if header.is_forwarded() {
@@ -15815,7 +15850,7 @@ fn sweep_chunk(ctx: &SweepCtx<'_>, lo: usize, hi: usize) -> Option<SweepChunkRes
     // The chain must land EXACTLY on the next anchor; anything else means the
     // anchor was not a real object start after all.
     if cursor != hi {
-        return None;
+        return chunk_bail(6);
     }
     Some(out)
 }
@@ -16510,32 +16545,114 @@ fn next_grid_anchor(anchors: &[usize], after: usize) -> Option<usize> {
 ///
 /// `[base + cursor, base + used)` must be mapped from-space, and `run_end` must
 /// be the end of an all-zero run starting at `cursor` (so `run_end <= used`).
-fn zero_run_is_empty_object_run(
+/// Why [`zero_run_verdict`] answered as it did.
+///
+/// A boolean here was not enough: once the parallel chunk walker's seven bail
+/// reasons collapsed onto "the zero run", the only remaining question was which
+/// of the three conditions had rejected, and every one of them means something
+/// different — misaligned is a run that cannot be whole objects, a live base
+/// inside is the walk being somewhere it should not be, and an implausible
+/// following header is the run not ending where an object starts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ZeroRunVerdict {
+    /// A run of empty objects ending at `resume`, an on-grid offset. `resume`
+    /// is the run's end rounded DOWN to a whole HEADER_SIZE slot, which is not
+    /// always the run's end — see the truncation note in `zero_run_verdict`.
+    EmptyObjects { resume: usize },
+    /// The run does not contain even one whole HEADER_SIZE slot.
+    Misaligned,
+    /// A marked object BASE starts strictly inside the run.
+    LiveInside,
+    /// The header at `run_end` does not size plausibly, so `run_end` is not a
+    /// believable object start.
+    ImplausibleNext,
+}
+
+/// Refusals by [`ZeroRunVerdict`], index = discriminant order minus the
+/// accepting variant: `0` Misaligned, `1` LiveInside, `2` ImplausibleNext.
+/// Printed beside the chunk-bail split; see `PAR_CHUNK_BAILS`.
+pub static ZERO_RUN_REFUSALS: [AtomicU64; 3] =
+    [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+
+fn zero_run_verdict(
     base: usize,
     cursor: usize,
     run_end: usize,
     used: usize,
     side_sorted: &[usize],
-) -> bool {
-    if (run_end - cursor) % HEADER_SIZE != 0 {
-        return false;
+) -> ZeroRunVerdict {
+    // Truncate to the last whole slot, and judge THAT boundary.
+    //
+    // Requiring the run itself to be a multiple of HEADER_SIZE looked like the
+    // conservative choice and is wrong about what ends a zero run. The walk is
+    // word-granular, so a run can only be ragged by 8 bytes, and that happens
+    // whenever the object AFTER the empty ones has a zero first word — i.e. it
+    // is itself a `ClassId(0)` empty object (`class_id` and `shape` both zero)
+    // whose MARK word is not zero. `MARK_NEUTRAL` is 0 and `ObjectKind::Object`
+    // and `ArrayElementType::Reference` are both 0, so a freshly built empty
+    // object is wholly zero; something has to have written that second word.
+    // A one-off probe over six runs classified every ragged tail as neither
+    // side-marked, nor header-marked, nor aged — so in practice it is a minted
+    // identity hash or a lock word, i.e. a DEAD empty object that was used
+    // before it died. `zero_run_end` stops 8 bytes INSIDE that header, so
+    // `run_end` is not an object start — but `cursor + n * HEADER_SIZE` is, and
+    // it is exactly that object's base, which is both on-grid and the next
+    // thing the walk wants to reclaim.
+    //
+    // Measured: on `org.hibernate.reactive.BatchingConnectionTest` under
+    // `-XX:+UseGenerationalGC`, after the earlier zero-run fixes, EVERY
+    // remaining parallel-chunk bail was the zero run and EVERY zero-run refusal
+    // was this alignment test.
+    //
+    // Read that census carefully, though: the alignment test used to run FIRST
+    // and return immediately, so `live_inside=0` did not mean no live base was
+    // inside — it meant the check never got to ask. Ordering a cheap test in
+    // front of an informative one makes the informative one's zero unreadable.
+    // Truncating first fixes that too: the live-base and plausible-next-header
+    // checks below now judge the truncated end, and a live base AT that end is
+    // the expected case rather than a veto (it is where the walk resumes).
+    let run_end = cursor + ((run_end - cursor) / HEADER_SIZE) * HEADER_SIZE;
+    if run_end - cursor < HEADER_SIZE {
+        ZERO_RUN_REFUSALS[0].fetch_add(1, Ordering::Relaxed);
+        return ZeroRunVerdict::Misaligned;
     }
     // No marked base strictly inside `(cursor, run_end)`. `side_sorted` is
     // ascending, so the only candidate is the last entry below `run_end`.
     let hi = base + run_end;
     let i = side_sorted.partition_point(|&a| a < hi);
     if i > 0 && side_sorted[i - 1] > base + cursor {
-        return false;
+        ZERO_RUN_REFUSALS[1].fetch_add(1, Ordering::Relaxed);
+        return ZeroRunVerdict::LiveInside;
     }
     if run_end >= used {
-        return true;
+        return ZeroRunVerdict::EmptyObjects { resume: run_end };
     }
     // SAFETY: `run_end < used` and the run is HEADER_SIZE-aligned from an
     // on-grid `cursor`, so `base + run_end` is a header-aligned address inside
     // the mapped from-space region the caller guarantees.
     let next = unsafe { &*((base + run_end) as *const ObjectHeader) };
     let size = gen_object_total_size(next);
-    size >= HEADER_SIZE && run_end + size <= used
+    if size >= HEADER_SIZE && run_end + size <= used {
+        ZeroRunVerdict::EmptyObjects { resume: run_end }
+    } else {
+        ZERO_RUN_REFUSALS[2].fetch_add(1, Ordering::Relaxed);
+        ZeroRunVerdict::ImplausibleNext
+    }
+}
+
+/// `Some(resume)` when the run is a run of EMPTY objects and the walk may step
+/// to `resume`; `None` when it is evidence the walk left the object grid.
+fn zero_run_empty_object_resume(
+    base: usize,
+    cursor: usize,
+    run_end: usize,
+    used: usize,
+    side_sorted: &[usize],
+) -> Option<usize> {
+    match zero_run_verdict(base, cursor, run_end, used, side_sorted) {
+        ZeroRunVerdict::EmptyObjects { resume } => Some(resume),
+        _ => None,
+    }
 }
 
 fn zero_run_end(base: usize, start: usize, limit: usize) -> usize {
@@ -16637,7 +16754,7 @@ fn clear_all_mark_bits_in_arena(arena: &mut Arena, side_sorted: &[usize]) {
         // mark bits to clear) instead of striding it as phantom objects and
         // writing the mark-clear byte into live-object interiors.
         //
-        // …but a run of EMPTY objects is not that (`zero_run_is_empty_object_run`),
+        // …but a run of EMPTY objects is not that (`zero_run_empty_object_resume`),
         // and re-anchoring on one is not free HERE in a way it is nowhere else:
         // the marks in the skipped stretch are LEFT SET, and the next
         // non-moving sweep treats a set `GC_FLAG_MARKED` as live regardless of
@@ -16662,9 +16779,11 @@ fn clear_all_mark_bits_in_arena(arena: &mut Arena, side_sorted: &[usize]) {
             // that DOES carry a mark bit — parse it normally below.
             let vouched_live = side_sorted.binary_search(&(base + cursor)).is_ok();
             if run_end - cursor >= HEADER_SIZE && !vouched_live {
-                if zero_run_is_empty_object_run(base, cursor, run_end, used, side_sorted) {
+                if let Some(resume) =
+                    zero_run_empty_object_resume(base, cursor, run_end, used, side_sorted)
+                {
                     SWEEP_ZERO_SPAN_EMPTY_RUNS.fetch_add(1, Ordering::Relaxed);
-                    cursor = run_end;
+                    cursor = resume;
                     continue;
                 }
                 anomaly = true;
@@ -16902,7 +17021,73 @@ mod tests {
     fn one_empty_object_of_zeros_is_not_a_desync() {
         let mut buf = vec![0u64; 8]; // 64 bytes
         let base = put_header(&mut buf, HEADER_SIZE, plain_object(2));
-        assert!(zero_run_is_empty_object_run(base, 0, HEADER_SIZE, 64, &[]));
+        assert_eq!(
+            zero_run_empty_object_resume(base, 0, HEADER_SIZE, 64, &[]),
+            Some(HEADER_SIZE)
+        );
+    }
+
+    /// An empty object whose mark word is NOT zero — the interpreter shape,
+    /// which mints the identity hash eagerly. Its `class_id` and `shape` are
+    /// still zero, so its FIRST WORD is zero and a zero run running into it
+    /// stops 8 bytes inside its header.
+    fn empty_object_with_a_mark_word() -> ObjectHeader {
+        let h = ObjectHeader::new(
+            ClassId::new(0),
+            ObjectKind::Object,
+            ArrayElementType::Reference,
+            0,
+            0,
+        );
+        // `MARK_NEUTRAL`, `ObjectKind::Object` and `ArrayElementType::Reference`
+        // are ALL zero, so the constructor alone yields a wholly zero header —
+        // the JIT-allocated shape. A collector-visible bit is what separates the
+        // two; a bumped `gc_age` stands in for the mark/hash/lock family.
+        h.set_gc_age(1);
+        h
+    }
+
+    /// The fixture the truncation test rests on: this header's first word must
+    /// be zero and its second must not, or the test below is testing nothing.
+    /// This assertion has already earned its keep once — the first version of
+    /// the fixture used the bare constructor and produced a wholly zero header,
+    /// so the run it was meant to make ragged was not ragged at all.
+    #[test]
+    fn the_interpreter_empty_object_has_a_zero_first_word_and_a_live_second() {
+        let mut buf = vec![0u64; 4];
+        let base = put_header(&mut buf, 0, empty_object_with_a_mark_word());
+        // SAFETY: `buf` is 8-aligned and 32 bytes long; both words are in bounds.
+        let (w0, w1) = unsafe { (*(base as *const u64), *((base + 8) as *const u64)) };
+        assert_eq!(w0, 0, "class_id|shape must both be zero for ClassId(0)");
+        assert_ne!(w1, 0, "the mark word must be non-zero, or no run is ragged");
+    }
+
+    /// The residual this predicate was left with: a dead empty object followed
+    /// by an empty object carrying a collector bit makes a 24-byte zero run —
+    /// ragged by exactly one word, because the run ends inside the second
+    /// object's header. Rounding down to the last whole slot is what makes
+    /// `resume` an object start, and it lands exactly on that second object's
+    /// base — which is where the walk wants to resume anyway.
+    #[test]
+    fn a_ragged_zero_run_resumes_at_the_last_whole_slot() {
+        let mut buf = vec![0u64; 8]; // 64 bytes
+        let base = put_header(&mut buf, HEADER_SIZE, empty_object_with_a_mark_word());
+        // The run really is ragged: 16 zero bytes + the second object's zero
+        // first word.
+        assert_eq!(zero_run_end(base, 0, 64), HEADER_SIZE + 8);
+        assert_eq!(
+            zero_run_empty_object_resume(base, 0, HEADER_SIZE + 8, 64, &[]),
+            Some(HEADER_SIZE),
+            "must resume at the empty object's end, not at the ragged run's end"
+        );
+    }
+
+    /// A run with no whole slot in it at all is not a run of objects.
+    #[test]
+    fn a_zero_run_shorter_than_one_slot_is_still_a_desync() {
+        let mut buf = vec![0u64; 8];
+        let base = put_header(&mut buf, 8, plain_object(1));
+        assert_eq!(zero_run_empty_object_resume(base, 0, 8, 64, &[]), None);
     }
 
     /// Several empty objects in a row are still empty objects.
@@ -16910,28 +17095,10 @@ mod tests {
     fn several_empty_objects_of_zeros_are_not_a_desync() {
         let mut buf = vec![0u64; 16]; // 128 bytes
         let base = put_header(&mut buf, 3 * HEADER_SIZE, plain_object(1));
-        assert!(zero_run_is_empty_object_run(
-            base,
-            0,
-            3 * HEADER_SIZE,
-            128,
-            &[]
-        ));
-    }
-
-    /// A zero run that is not a whole number of object slots cannot be a run of
-    /// objects, so resuming at its end would resume off-grid.
-    #[test]
-    fn a_misaligned_zero_run_is_still_a_desync() {
-        let mut buf = vec![0u64; 8];
-        let base = put_header(&mut buf, HEADER_SIZE + 8, plain_object(1));
-        assert!(!zero_run_is_empty_object_run(
-            base,
-            0,
-            HEADER_SIZE + 8,
-            64,
-            &[]
-        ));
+        assert_eq!(
+            zero_run_empty_object_resume(base, 0, 3 * HEADER_SIZE, 128, &[]),
+            Some(3 * HEADER_SIZE)
+        );
     }
 
     /// A marked object starting INSIDE the run means the run is not a sequence
@@ -16941,13 +17108,10 @@ mod tests {
         let mut buf = vec![0u64; 8];
         let base = put_header(&mut buf, 2 * HEADER_SIZE, plain_object(0));
         let live = base + HEADER_SIZE;
-        assert!(!zero_run_is_empty_object_run(
-            base,
-            0,
-            2 * HEADER_SIZE,
-            64,
-            &[live]
-        ));
+        assert_eq!(
+            zero_run_empty_object_resume(base, 0, 2 * HEADER_SIZE, 64, &[live]),
+            None
+        );
     }
 
     /// A live base AT the run start is the caller's `vouched_live` case and
@@ -16956,13 +17120,10 @@ mod tests {
     fn a_live_base_before_the_run_does_not_veto() {
         let mut buf = vec![0u64; 8];
         let base = put_header(&mut buf, 2 * HEADER_SIZE, plain_object(0));
-        assert!(zero_run_is_empty_object_run(
-            base,
-            HEADER_SIZE,
-            2 * HEADER_SIZE,
-            64,
-            &[base]
-        ));
+        assert_eq!(
+            zero_run_empty_object_resume(base, HEADER_SIZE, 2 * HEADER_SIZE, 64, &[base]),
+            Some(2 * HEADER_SIZE)
+        );
     }
 
     /// A run that reaches the end of the used region has no following header to
@@ -16971,7 +17132,7 @@ mod tests {
     fn a_zero_run_to_the_end_of_used_is_not_a_desync() {
         let mut buf = vec![0u64; 4];
         let base = buf.as_mut_ptr() as usize;
-        assert!(zero_run_is_empty_object_run(base, 0, 32, 32, &[]));
+        assert_eq!(zero_run_empty_object_resume(base, 0, 32, 32, &[]), Some(32));
     }
 
     /// If the header the run lands on does not size plausibly, `run_end` is not
@@ -16981,7 +17142,10 @@ mod tests {
         let mut buf = vec![0u64; 8];
         // 4096 slots = 32 KiB, far past the 64-byte `used` bound.
         let base = put_header(&mut buf, HEADER_SIZE, plain_object(4096));
-        assert!(!zero_run_is_empty_object_run(base, 0, HEADER_SIZE, 64, &[]));
+        assert_eq!(
+            zero_run_empty_object_resume(base, 0, HEADER_SIZE, 64, &[]),
+            None
+        );
     }
 
     /// H2-CID0 (2026-08-05) — "nobody looked" must not read as "nothing found".
