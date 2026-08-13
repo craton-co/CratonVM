@@ -122,7 +122,7 @@ never *held* by anything — it was handed out by the compile probe and used
 directly.
 
 **Refuted here:** "almost certainly the same bug as the json-smart parse
-corruption" (`docs/internal/jit-virtual-direct-entry-json-corruption-20260727.md`,
+corruption" (`../fixed-suite-bugs/jit-virtual-direct-entry-json-corruption-20260727.md`,
 closed 2026-07-28).
 That doc proposed its own test — run the json-smart probe under
 `CRATONVM_JIT_POISON_FREE=1`, which never unmaps or recycles a retired buffer,

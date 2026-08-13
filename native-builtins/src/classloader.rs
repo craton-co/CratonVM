@@ -155,6 +155,36 @@ fn set_app_loader(vm: usize, value: Option<ObjectRef>) {
     with_loader_singletons(|table| table.entry(vm).or_default().app = value);
 }
 
+/// Which built-in loader `this` is, as the `ClassLoaderId` wire ordinal
+/// (`NATIVE_EXTENSION` for platform, `NATIVE_APPLICATION` for app), or `None`
+/// when `this` is neither singleton (in practice: a user-defined loader, or
+/// bootstrap — which has no `ClassLoader` object to be `this` in the first
+/// place). Used by `find_loaded_class_for_loader_inner` to bound a built-in
+/// loader's `findLoadedClass` visibility to itself and its own ancestors
+/// (Bootstrap -> Extension -> Application is a strict chain, not a mutually
+/// visible group). Mirrors `parent_is_platform`'s identity check: the
+/// singleton reference is the fast path, the class name is the real-JDK
+/// fallback (the JDK can manufacture another loader object of the same kind
+/// before our singleton is observed).
+fn builtin_loader_ordinal(ctx: &mut dyn NativeContext, this: ObjectRef) -> Option<u32> {
+    let vm = ctx.vm_identity();
+    if platform_loader_of(vm).is_some_and(|p| p.as_ptr() == this.as_ptr())
+        || ctx
+            .class_name_of_id(ctx.class_id_of_object(this))
+            .is_some_and(|name| name == "jdk/internal/loader/ClassLoaders$PlatformClassLoader")
+    {
+        return Some(cratonvm_types::ClassLoaderId::NATIVE_EXTENSION);
+    }
+    if app_loader_of(vm).is_some_and(|p| p.as_ptr() == this.as_ptr())
+        || ctx
+            .class_name_of_id(ctx.class_id_of_object(this))
+            .is_some_and(|name| name == "jdk/internal/loader/ClassLoaders$AppClassLoader")
+    {
+        return Some(cratonvm_types::ClassLoaderId::NATIVE_APPLICATION);
+    }
+    None
+}
+
 /// Temporary debug-only accessor (CRATONVM_DBG_OBSREG investigation).
 pub(crate) fn platform_loader_dbg(vm: usize) -> Option<ObjectRef> {
     platform_loader_of(vm)
@@ -2399,6 +2429,33 @@ pub fn loader_namespace_id(ctx: &mut dyn NativeContext, loader: ObjectRef) -> u3
 /// are 2-3 deep.
 fn loader_namespace_id_at(ctx: &mut dyn NativeContext, loader: ObjectRef, depth: usize) -> u32 {
     if !is_user_defined_loader(ctx, loader) && !is_bare_url_class_loader(ctx, loader) {
+        // Which built-in loader `loader` actually is matters to a caller
+        // reached through `parent_namespace_id`: a blanket `0` here does not
+        // just mean "no id", it means "this loader's PARENT delegates to the
+        // WHOLE built-in chain (Bootstrap, Extension, Application)" — see
+        // `loaded_class_for_requesting_loader`'s built-in-chain fallback.
+        // Collapsing the platform loader into that generic `0` let a
+        // `ModifiedClassPathClassLoader` (parent = platform, specifically to
+        // EXCLUDE Application from delegation) fall back to probing
+        // Application anyway, silently resolving a same-named class through
+        // the wrong loader — observed as the `PropertySource`/
+        // `EnumerablePropertySource` cross-loader `ClassCastException`
+        // family under `@ClassPathExclusions`. Identity check mirrors
+        // `parent_is_platform` above: the singleton reference is the fast
+        // path, the class name is the real-JDK fallback (the JDK can
+        // manufacture another `PlatformClassLoader` object before our
+        // singleton is observed).
+        let vm = ctx.vm_identity();
+        let is_platform = platform_loader_of(vm).is_some_and(|p| p.as_ptr() == loader.as_ptr())
+            || ctx
+                .class_name_of_id(ctx.class_id_of_object(loader))
+                .is_some_and(|name| name == "jdk/internal/loader/ClassLoaders$PlatformClassLoader");
+        if is_platform {
+            return cratonvm_types::ClassLoaderId::NATIVE_EXTENSION;
+        }
+        if app_loader_of(vm).is_some_and(|p| p.as_ptr() == loader.as_ptr()) {
+            return cratonvm_types::ClassLoaderId::NATIVE_APPLICATION;
+        }
         return 0;
     }
     if let Some(v) = loader_id_of(ctx, loader) {
@@ -2744,8 +2801,33 @@ fn find_loaded_class_for_loader_inner(
             // loaders. Application-namespace classes that merely record a
             // user-defined defining loader still keep their app-loader
             // visibility below.
-            if ctx.loader_id_of_class(cid) > 2 {
+            //
+            // The three built-in loaders are NOT mutually visible either: they
+            // form a strict ancestor chain (Bootstrap -> Extension/Platform ->
+            // Application), and `findLoadedClass` must only report a class
+            // defined by `this` or one of `this`'s OWN ancestors — never a
+            // descendant's. A blanket `> 2` here treated Bootstrap, Extension,
+            // and Application as one undifferentiated group: asking the
+            // PLATFORM loader whether it has an application class "loaded"
+            // (as happens on every `super.loadClass` delegation from a loader
+            // parented to platform — e.g. a `ModifiedClassPathClassLoader`,
+            // Spring's `@ClassPathExclusions` isolation) found the app
+            // loader's pre-existing copy and returned it, so the isolated
+            // loader's `loadClass` never reached its own `findClass` to define
+            // a fresh one — a same-named class split across two loaders,
+            // observed as the `PropertySource`/`EnumerablePropertySource`
+            // family's `ClassCastException` under `@ClassPathExclusions`.
+            // `builtin_loader_ordinal(this) == None` (bootstrap has no `this`
+            // object in practice, or the singleton could not be identified)
+            // keeps the old permissive bound as a safe fallback.
+            let candidate_ordinal = ctx.loader_id_of_class(cid);
+            if candidate_ordinal > 2 {
                 return None;
+            }
+            if let Some(this_ordinal) = builtin_loader_ordinal(ctx, this) {
+                if candidate_ordinal > this_ordinal as i32 {
+                    return None;
+                }
             }
             if let Some(def) = defining_loader_for(ctx.vm_identity(), cid.as_u32()) {
                 if !loader_can_see_defining(ctx, this, def) {

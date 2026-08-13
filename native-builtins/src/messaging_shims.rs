@@ -2178,6 +2178,22 @@ pub(crate) fn register_spring_messaging_bridges(registry: &mut NativeMethodRegis
     );
 }
 
+/// Shut a Netty group down with a ZERO quiet period.
+///
+/// **Call this directly, from a bridge that owns the group.** It is deliberately
+/// NOT registered against `EventExecutorGroup.shutdownGracefully()`: the only
+/// caller is `native_springboot_mongo_reactive_customizer_destroy`, whose group
+/// this VM created itself (in the matching `customize` bridge, with a
+/// `cratonvm-mongo-reactive` daemon thread factory) and whose monitor callback
+/// keeps re-enqueuing work so the ordinary two-second quiet period never
+/// becomes quiet.
+///
+/// A registration would apply it to every Netty group in the process, because
+/// `MultiThreadIoEventLoopGroup` — the class check below — is the ordinary
+/// Netty 4.2 group, not a Mongo-specific one. That is what it used to do, and
+/// a zero quiet period does not drain: Netty runs channel deregistration, and
+/// therefore `handlerRemoved`, as a queued event-loop task. See
+/// `netty_group_shutdown_gracefully_is_not_forced_to_a_zero_quiet_period`.
 pub(crate) fn native_netty_event_executor_group_shutdown_gracefully(
     ctx: &mut dyn NativeContext,
     args: &[Value],

@@ -1519,6 +1519,74 @@ impl FileDescriptorTable {
         Ok(fd)
     }
 
+    /// Bind an already-open UDP socket to `bind_addr`, KEEPING ITS `FdId`.
+    ///
+    /// A bound socket cannot be rebound, so this creates a freshly bound one
+    /// and swaps it into the table under the same id. The id is what matters:
+    /// it is the identity every side table keys on, and in particular the NIO
+    /// selector registers a channel under it — which, for netty, happens
+    /// BEFORE the bind (`AbstractChannel.register0` runs `javaChannel()
+    /// .register(selector, 0)`, and `doBind` comes later). Allocating a fresh
+    /// id here, which is what `close(old)` + `open_udp(addr)` did, left that
+    /// registration keyed on an id nothing answers to and holding a dup of a
+    /// socket that would never become readable again: netty's event loop
+    /// never saw a single inbound datagram.
+    ///
+    /// The previous socket closes when the last `Arc` to it drops, so a
+    /// selector still holding a dup keeps that dup alive until it re-registers
+    /// — the epoll set then drops the old fd on its own.
+    ///
+    /// `reuse_address` reapplies `SO_REUSEADDR`, which is a PRE-bind option:
+    /// whatever was set on the socket this one replaces is not inherited.
+    pub fn udp_rebind(
+        &self,
+        fd: FdId,
+        bind_addr: Option<&str>,
+        reuse_address: bool,
+    ) -> Result<(), io::Error> {
+        use std::net::ToSocketAddrs;
+        // Refuse before creating anything, so a bad fd cannot leak a socket.
+        match self.get_entry(fd) {
+            Some(entry) if matches!(&*entry, FileEntry::UdpSocket(_)) => {}
+            Some(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "fd is not a UDP socket",
+                ))
+            }
+            None => {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "bad fd for udp rebind",
+                ))
+            }
+        }
+        let addr_str = bind_addr.unwrap_or("0.0.0.0:0");
+        let udp = if reuse_address {
+            let sock_addr = addr_str
+                .to_socket_addrs()?
+                .next()
+                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "no addr resolved"))?;
+            let domain = if sock_addr.is_ipv4() {
+                socket2::Domain::IPV4
+            } else {
+                socket2::Domain::IPV6
+            };
+            let socket =
+                socket2::Socket::new(domain, socket2::Type::DGRAM, Some(socket2::Protocol::UDP))?;
+            socket.set_reuse_address(true)?;
+            socket.bind(&sock_addr.into())?;
+            std::net::UdpSocket::from(socket)
+        } else {
+            std::net::UdpSocket::bind(addr_str)?
+        };
+        disable_udp_connreset(&udp);
+        self.entries
+            .write()
+            .insert(fd, Arc::new(FileEntry::UdpSocket(udp)));
+        Ok(())
+    }
+
     /// Send UDP datagram to a target address. Returns bytes sent.
     pub fn udp_send(&self, fd: FdId, data: &[u8], target: &str) -> Result<usize, io::Error> {
         let entry = self

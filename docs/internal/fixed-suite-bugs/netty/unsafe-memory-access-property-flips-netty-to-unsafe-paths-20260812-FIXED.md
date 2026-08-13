@@ -92,7 +92,7 @@ AdaptiveByteBufAllocatorTest, -Dio.netty.noUnsafe=true
 Zero `AbstractMethodError`s in the whole run. A full audit of the FFM surface
 came with it — 46 calls on both VMs, 15 `AbstractMethodError`s closed to 2; the
 remainder are recorded in
-[ffm-elements-spliterator-and-allocatefrom-gaps](../../../known-issues/netty/ffm-elements-spliterator-and-allocatefrom-gaps-20260813.md).
+ffm-elements-spliterator-and-allocatefrom-gaps (retired: `ffm-elements-spliterator-and-allocatefrom-gaps-20260813`).
 
 **2. Stop setting the property.** `vm_init` no longer seeds it, and `vm-cli`
 rewrites `--sun-misc-unsafe-memory-access=<mode>` — HotSpot's own launcher flag,
