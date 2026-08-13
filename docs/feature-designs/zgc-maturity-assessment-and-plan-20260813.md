@@ -560,12 +560,56 @@ undeclared flag is served by a live `getenv` rather than the latched snapshot,
 so `CRATONVM_GC=token` cannot reach it and a flag-dependent test silently
 measures the developer's ambient environment.
 
-**What still genuinely remains:** colored slots through the seven sites, the
-interpreter/native barrier and x64 barrier emission (~6-7 instructions), then
-`zgc::relocate`'s *concurrent* machinery and `forwarding`'s per-page table —
-which only become the right structures once `zgc::page` is adopted, since a
-single arena with no pages carries no information in a page-keyed table — then
-`generation` + `remembered`. **R6's `VmHeap::Zgc` arm audit is DONE (2026-08-13).**
+**Also landed 2026-08-13: the read-path barrier and stage (a).**
+
+*The read path.* `ZgcRealHeap::load_barrier_slot` runs the barrier's fast path
+and, on the slow path, forwards the offset, publishes to the marker and
+**self-heals** the slot. `get_array_element`'s Reference arm goes through it,
+which answers sites 6 and 7 of the tripwire suite from the other side: the
+shared `read_prim_element` arm nulls a coloured word, so ZGC must reach the
+barrier *before* that arm rather than teaching that arm about colours. The
+shared arm is untouched.
+
+**The barrier is gated, and the gate is not an optimisation: it cannot run over
+an uncoloured slot.** `ZFastPath::Good` carries a bare 42-bit offset and the
+classifier decides good-vs-bad on the metadata bits; a plain arena pointer is
+well above 2^42, so its address bits read as colours and `address_mask`
+truncates them. Every reference read would take the slow path and resolve to
+the wrong object. Arming is an explicit flag rather than
+`good_mask() != Z_REMAPPED`, because `Z_REMAPPED` is both the quiescent state
+and a real colour, so the inferred predicate is false during the remap phase,
+which is exactly when the barrier matters most.
+
+*Stage (a).* `x64::zgc_read_barrier_blocks_inline_fields` routes every
+compact-field access through `jit_getfield` / `jit_putfield_object` while the
+barrier is armed. Those go through the heap accessors, which barrier, so JIT
+reference loads are barriered. This is the identical mechanism, and the
+identical argument, as the compressed-oops clause it sits beside: a
+representation the inline emitter does not understand disables the inline
+emitter rather than being half-supported. The design doc already called the
+helper-CALL arms "the barrier's cheap escape hatch".
+
+**`zgc_relocation_permitted` therefore no longer refuses on the JIT alone**,
+the first time that gate has moved since it was written. It tests the
+*capability* (`zgc_codegen_honours_read_barrier`), not the runtime armed state,
+because asking the latter at VM init answers "not armed" forever. The
+obligation is recorded where it can be acted on: **if inline reference emission
+is ever re-enabled under an armed barrier, that function must go back to
+`false`**, and the test pinning the disjunction goes red.
+
+**What still genuinely remains**, and it is now a short list:
+
+* **Inline x64 barrier emission** (~6-7 instructions on the fast path). Pure
+  throughput: correctness is already carried by the helper route. It is the
+  only part of stage (a) not done, and the part that was always an
+  optimisation.
+* **Replacing `Arena` with `ZPageAllocator`.** No longer a precondition for
+  anything being adopted, but it is what turns the generational split from
+  *accounting* into a real young space, and what `zgc::relocate`'s concurrent
+  evacuator wants.
+* **Making any of it default-on**, which is a suite measurement, not code.
+
+**R6's `VmHeap::Zgc` arm audit is DONE (2026-08-13).**
 
 R6 said: *"58 arms plus a macro; the affirmative ones (`true`, `(0,0)`) assert
 facts that are only true for a non-moving collector, and none of them will fail
