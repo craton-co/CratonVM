@@ -214,6 +214,73 @@ neither is measured here.
 nanosecond in both columns, so the scalar-replacement/elision path this page's
 predecessor narrowed is unaffected.
 
+## The OSR door is the THIRD compile door, and it binds by invoke kind (2026-08-13)
+
+The paragraph above was right that the OSR site never binds and wrong about
+where to fix it. Two measurements corrected it:
+
+* `CRATONVM_BG_COMPILE=0` — which routes compilation through the mutator door
+  and its *compiling* callee resolver — leaves `disp_calls` at **one per
+  iteration**, exactly as the default does. So the lookup-only background
+  resolver is not what holds the site open.
+* the artifact that actually runs a hot loop comes from `compile_osr_artifact`,
+  which reaches `x64::compile_with_param_slots` **directly** and carries its own
+  copy of the invoke ladder — a third door, with `inline_sites` hard-coded empty
+  and its own eager-callee-compile list.
+
+That door binds by invoke KIND. Same body, same OSR'd loop
+(`probes/CallKind.java`), CratonVM vs HotSpot:
+
+| call | HotSpot | CratonVM | dispatch entries |
+|---|---|---|---|
+| `invokestatic` | 0.3 ns | 26.7 ns | 0 — eagerly compiled + direct-bound |
+| `invokevirtual` | 0.3 ns | 29.1 ns | 0 — bound via the MIC |
+| **`new Holder(i)`** | 1.9 ns | **317.9 ns** | **98 000 / 100 000** |
+
+`invoke_kind == 1` had no bind path here at all, in a door where the other two
+kinds have had one for a long time. (Note for anyone re-deriving this: a
+`private` method call is **not** a usable control — javac has emitted
+`invokevirtual` for private members since nestmates, so a probe written to test
+`invokespecial` that way is testing the MIC instead. `javap -c` settles it.)
+
+### What landed, and what was reverted on measurement
+
+Admitting **non-`()V` `invokespecial`** to that door's eager-compile + direct-bind
+list is worth **2.3x**: `new F(i)` where `F(int v){i=v;}` goes 212 ns → 92 ns,
+with `new Object()` flat at 79 ns as a control.
+
+Rerouting **non-elidable `()V` constructors** through the same path — the
+FastThreadLocal shape, and the whole point of the exercise — was tried and
+**reverted**. It makes `compile_with_param_slots` refuse the enclosing method,
+and an OSR refusal is not a fallback to a slower compile: it marks the method
+**OSR-denied for the process lifetime**, so the hot loop interprets forever.
+
+| | dev | with the `()V` reroute |
+|---|---|---|
+| `new A()` where `A(){i=ATOMIC.getAndIncrement();}` | 311 ns | **1412 ns** |
+| real `new FastThreadLocal<Boolean>()` | 451 ns | **1868 ns** |
+
+with `OSR-compile FAILED … marked OSR-denied` in the trace, `jit_entries`
+unchanged at one per iteration (the interpreter entering the compiled `<init>`),
+and `execute_frame_from_index` at the top of the profile. **Why the codegen
+refuses that shape is unresolved** — the sibling non-`()V` admission does not
+trip it, so it is specific to the `()V` site reaching the bind through the
+deferred-elidability list, not to binding `invokespecial` as such. That is the
+next thing to look at, and it is now a one-question investigation.
+
+### Two traps this cost a build cycle each, worth writing down
+
+* **`disp_calls` going to zero is what BOTH the fix and the breakage look
+  like.** The first attempt drove it 4 197 002 → 0 and was 5x SLOWER, because
+  the method stopped compiling. `jit_entries` and wall-clock are the
+  discriminators; a dispatch counter alone is not.
+* **`JitDirectCall.num_params` and `JitInvokeInfo.num_jit_args` disagree about
+  the receiver** for the same site. The codegen's instance arm computes
+  `let n = callee_params + 1` itself, so `num_params` is receiver-EXCLUDED,
+  while `num_jit_args` is receiver-INCLUDED. Passing the receiver-included count
+  to both made the emitter pop three operands off a two-operand stack, which is
+  how the first attempt broke the compile.
+
 ### Ground truth
 
 Run with a 3000-second cap (50 minutes) on the fixed binary: **still `rc=124`**
