@@ -6578,8 +6578,38 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
             ctx.set_field(this, BB_LIMIT, Value::Int(cap));
             Ok(Some(Value::Object(Some(this))))
         });
-        r.register(cls, "array", "()[I", |ctx, args| {
-            Ok(Some(Value::Object(s2_bb_arr(ctx, obj_arg(args, 0)?))))
+        // The element type differs per family, and this loop registered all
+        // FIVE under `()[I`. Measured with `--dump-native-registry`
+        // (2026-08-13): four PHANTOM rows nothing can dispatch to
+        // (`DoubleBuffer.array()[I` etc.), and for `IntBuffer` — the one whose
+        // descriptor happened to be right — this row OWNED the slot, so
+        // `native-io`'s `native_tb_array` and its F14-1 refusals never ran.
+        //
+        // The body was `Ok(Some(Value::Object(s2_bb_arr(...))))`: a `None`
+        // became a silent Java `null`, so `ByteBuffer.allocate(16)
+        // .asIntBuffer().array().length` raised NullPointerException where
+        // HotSpot throws UnsupportedOperationException. That is the same
+        // wrong-capability shape F14-1 fixed in the twin, in the copy that
+        // actually wins — "diff a family fix against every member".
+        //
+        // `Absent` is UOE here with no fourth arm: unlike `ByteBuffer` above,
+        // every receiver of a typed view is array-less in the JDK, and F37-1
+        // measured views answering UnsupportedOperationException.
+        let array_desc = match cls {
+            "java/nio/LongBuffer" => "()[J",
+            "java/nio/ShortBuffer" => "()[S",
+            "java/nio/FloatBuffer" => "()[F",
+            "java/nio/DoubleBuffer" => "()[D",
+            _ => "()[I",
+        };
+        r.register(cls, "array", array_desc, |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let arr = s2_bb_arr(ctx, this);
+            match buffer_array_access(arr.is_some(), s2_bb_is_read_only(ctx, this)) {
+                BufferArrayAccess::Accessible => Ok(Some(Value::Object(arr))),
+                BufferArrayAccess::ReadOnly => Err(RuntimeError::ReadOnlyBufferException.into()),
+                BufferArrayAccess::Absent => Err(s2_bb_no_backing_array()),
+            }
         });
         // `isDirect` — IMPLEMENTED wave 4 (2026-07-28). The wave-3 note here
         // claimed "every receiver is a heap view backed by the int[]", which is

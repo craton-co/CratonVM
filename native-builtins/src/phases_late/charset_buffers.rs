@@ -1529,11 +1529,43 @@ pub(crate) fn register_p62_char_buffer(r: &mut NativeMethodRegistry) {
         // toString() is documented as toString(position(), limit()). For
         // synthetic/heap buffers our `cb_to_string_range` historically treats
         // the range as relative, so keep the old 0..remaining call here.
-        let args2 = [
-            Value::Object(Some(this)),
-            Value::Int(0),
-            Value::Int(lim - pos),
-        ];
+        //
+        // BUT the range convention differs by receiver, and this registration
+        // is reached by BOTH routes while the `StringCharBuffer` one below is
+        // reached by only one. `StringCharBuffer` does not declare
+        // `toString()` — the JDK inherits it from `CharBuffer` — so
+        // `Class.getMethod("toString")` resolves to the DECLARING class and
+        // reflection / `Method.invoke` / `ctx.invoke_virtual` land HERE, while
+        // a bytecode `invokevirtual` dispatches on the receiver and lands
+        // there. Measured 2026-08-13 on `CharBuffer.wrap("x00ff0a80y", 1, 9)`:
+        // bytecode gave `00ff0a80` (correct) and the reflective route gave
+        // `x00ff0a8` — the right LENGTH from the wrong ORIGIN, because this
+        // arm passed a relative `0` for a receiver whose window lives in
+        // `position`. `HexFormat.parseHex(CharSequence)` is specified as
+        // `parseHex(CharBuffer.wrap(...))`, so it read the unsliced text and
+        // threw `NumberFormatException: not a hexadecimal digit: "x"`.
+        //
+        // Dispatch on the receiver's real class so ONE implementation serves
+        // both routes; the twin below stays as the direct-dispatch entry.
+        let is_string_cb = ctx
+            .class_name_of_id(ctx.class_id_of_object(this))
+            .map(|n| n == "java/nio/StringCharBuffer")
+            .unwrap_or(false);
+        let args2 = if is_string_cb {
+            // Absolute: JDK `StringCharBuffer.toString(start, end)` is
+            // `str.subSequence(start + offset, end + offset)`.
+            [
+                Value::Object(Some(this)),
+                Value::Int(pos),
+                Value::Int(lim),
+            ]
+        } else {
+            [
+                Value::Object(Some(this)),
+                Value::Int(0),
+                Value::Int(lim - pos),
+            ]
+        };
         cb_to_string_range(ctx, &args2)
     });
     r.register(
