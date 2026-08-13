@@ -20835,13 +20835,25 @@ pub(super) fn proxy_resolve_declaring_class_mirror(
 /// arm now resolves the real `Boolean.TRUE`/`FALSE` statics, the same way the
 /// native does — see [`proxy_canonical_boolean`].
 ///
-/// The other five arms (`C B S I`, and `J` via [`proxy_box_value`]) are still
-/// fresh. Their canonical instances live in `lang_math`'s process-global
-/// caches, which are `pub(crate)` to `cratonvm-native-builtins` and reachable
-/// only through a `&mut dyn NativeContext` — which this function does not have
-/// and cannot get without changing both call sites' signatures. Minting a
-/// cache HERE would make this the fifth boxing implementation and the second
-/// `IntegerCache`, so it is a NOMINATION (F19-1 N1), not a local fix.
+/// The other five arms (`C B S I`, and `J` via [`proxy_box_value`]) used to be
+/// fresh, for a reason that was true when it was written and is not any more:
+/// the canonical instances live in `lang_math`'s caches, which were reachable
+/// only through a `&mut dyn NativeContext` this function does not have.
+/// `lang_math::canonical_wrapper_if_cached` (F29-1 §3) is now a `pub` probe
+/// keyed on `vm_identity`, so the five arms read those SAME six caches instead
+/// of minting a second `IntegerCache` here. There is exactly ONE boxing cache
+/// in this VM and it is not in this file.
+///
+/// **The probe cannot allocate and cannot run `<clinit>`, and that is a
+/// correctness property rather than a performance one** — populating a cache
+/// needs `alloc_wrapper` → `ensure_class_initialized` → `<clinit>`, and a
+/// proxy invocation is not a legal place to trigger class initialisation. A
+/// miss is `None` and the caller keeps its existing allocation. `Z` is not
+/// routed through it (the probe declines `Z` deliberately): `Boolean.valueOf`
+/// answers with the live `TRUE`/`FALSE` STATICS, which `proxy_canonical_boolean`
+/// above resolves directly. `F`/`D` are not routed either, because HotSpot
+/// caches neither — `neg.floatValueOf` = false — so a fresh `Float` is the
+/// right answer there and not a fallback.
 pub(super) fn proxy_box_value_for_desc(shared: &SharedVm, value: Value, pdesc: &str) -> Value {
     if let Value::Int(v) = value {
         // `Z` before the generic wrapper table: a `boolean` argument has a
@@ -20853,6 +20865,24 @@ pub(super) fn proxy_box_value_for_desc(shared: &SharedVm, value: Value, pdesc: &
             // Fall through to the allocating path — never to `null`. A boxing
             // failure that becomes a null argument is a defect already
             // recorded above `lang_class::create_method_object`.
+        }
+        // `C B S I`: the canonical instance IF one is already cached, read out
+        // of the six caches in `lang_math.rs`. Read-only — it cannot allocate
+        // and cannot run `<clinit>`, which is what makes it legal here.
+        // Measured canonical on HotSpot: `proxy.char` / `byte` / `short` /
+        // `int` all true (F19-1 §2). A miss falls through to the allocating
+        // table below, never to `null`.
+        //
+        // `Z` reaches this line only when `proxy_canonical_boolean` above
+        // could not resolve the statics; the probe declines `Z` (F29-1 §3.2),
+        // so this is a pass-through for that arm and the table below still
+        // does the `val != 0` normalisation.
+        if let Some(obj) = cratonvm_native_builtins::lang_math::canonical_wrapper_if_cached(
+            shared.vm_identity,
+            pdesc,
+            Value::Int(v),
+        ) {
+            return Value::Object(Some(obj));
         }
         let wrapper = match pdesc {
             "Z" => Some("java/lang/Boolean"),
@@ -20881,6 +20911,28 @@ pub(super) fn proxy_box_value_for_desc(shared: &SharedVm, value: Value, pdesc: &
                 .unwrap_or(ClassId::new(0));
             let obj = shared.mem.heap.alloc_object(class_id, 1);
             shared.mem.heap.set_field(obj, 0, stored);
+            return Value::Object(Some(obj));
+        }
+    }
+    // `J` has no `Value::Int` arm above, so it is taken here rather than in
+    // the wrapper table. Measured `proxy.long` = true. `F`/`D` are NOT taken:
+    // HotSpot caches neither (`neg.floatValueOf` = false), so
+    // `canonical_wrapper_if_cached` declines them and `proxy_box_value`'s
+    // fresh allocation is the correct answer, not a fallback.
+    //
+    // `value`, NOT `Value::Int(v)`. This is outside the `if let Value::Int(v)`
+    // block on purpose: a `long` slot can present as a compact `Value::Int`,
+    // and a descriptor-only lookup would answer `("J", Value::Int(5))` with
+    // the cached `Long.valueOf(0)` — an identity fix converted into a WRONG
+    // ANSWER. The probe's own variant guard is the second half of that
+    // defence; this line is the first. F29-1 §3 records that the pair has
+    // already caught two lanes.
+    if pdesc == "J" {
+        if let Some(obj) = cratonvm_native_builtins::lang_math::canonical_wrapper_if_cached(
+            shared.vm_identity,
+            pdesc,
+            value,
+        ) {
             return Value::Object(Some(obj));
         }
     }
@@ -27861,6 +27913,81 @@ mod tests {
                  statics; `Boolean.valueOf` is `return b ? TRUE : FALSE`, so \
                  those two fields ARE the canonical instances and a private \
                  mirror of them is not",
+            ),
+        ] {
+            assert!(squashed.contains(&needle), "{why} (`{needle}` is gone)");
+        }
+    }
+
+    #[test]
+    fn a_cache_miss_on_c_b_s_i_j_still_boxes_and_never_becomes_null() {
+        // `canonical_wrapper_if_cached`'s contract is "the canonical instance
+        // IF one is already cached", and `test_shared()` has cached NOTHING —
+        // no `Integer.valueOf` runs in this crate's test binary — so every
+        // call below takes the MISS path. What must survive a miss is the
+        // thing the record above `lang_class::create_method_object` names: an
+        // object, carrying its own value, never a `null` in an `Object[]`
+        // argument slot. This is the half of the probe a behavioural test in
+        // this module CAN see; the wiring itself needs the witness below.
+        let shared = test_shared();
+        for (pdesc, arg) in [
+            ("C", Value::Int(97)),
+            ("B", Value::Int(3)),
+            ("S", Value::Int(9)),
+            ("I", Value::Int(7)),
+            // `J` is the arm that is taken past the wrapper table rather than
+            // inside it, and the one whose value a descriptor-only lookup
+            // would replace with a cached `Long.valueOf(0)`.
+            ("J", Value::Long(5)),
+        ] {
+            let obj = match proxy_box_value_for_desc(&shared, arg, pdesc) {
+                Value::Object(Some(o)) => o,
+                other => panic!("`{pdesc}` arg boxed to {other:?}, which is not an object"),
+            };
+            assert_eq!(
+                shared.mem.heap.get_field(obj, 0),
+                arg,
+                "a `{pdesc}` argument must still carry its own value; a miss \
+                 that answers with some other cached wrapper is a WRONG \
+                 ANSWER, not merely a non-canonical one"
+            );
+        }
+    }
+
+    #[test]
+    fn the_five_fresh_proxy_arms_now_read_the_one_boxing_cache() {
+        // A SOURCE WITNESS, and nothing else in this module can be one. The
+        // behavioural test above exercises the MISS path, which is byte-for-
+        // byte the pre-existing allocating code — so deleting the probe
+        // entirely would not move a single assertion here. Populating the
+        // caches to force a HIT is not available either: population runs
+        // through `alloc_wrapper` → `ensure_class_initialized` → `<clinit>`,
+        // i.e. a bootstrapped VM, which `test_shared()` is not.
+        //
+        // Needles are assembled with `format!` at runtime for the reason the
+        // witness above gives: spelled as literals they would match this
+        // test's own source text, since the file being searched IS this file.
+        // Whitespace is stripped so a rustfmt re-wrap cannot break them.
+        let src = include_str!("vm_exec.rs");
+        let squashed: String = src.chars().filter(|c| !c.is_whitespace()).collect();
+        let probe = format!("canonical_wrapper_if_{}", "cached");
+        let call = format!("cratonvm_native_builtins::lang_math::{probe}");
+        for (needle, why) in [
+            (
+                format!("ifletSome(obj)={call}(shared.vm_identity,pdesc,Value::Int(v),)"),
+                "the `C B S I` arms no longer consult the one boxing cache, so \
+                 a proxy's `char`/`byte`/`short`/`int` argument is a fresh box \
+                 again (measured true on HotSpot 25.0.3+9: proxy.char, \
+                 proxy.byte, proxy.short, proxy.int)",
+            ),
+            (
+                format!("ifpdesc==\"J\"{{ifletSome(obj)={call}(shared.vm_identity,pdesc,value,)"),
+                "the `J` arm is gone, or — far worse — it no longer passes the \
+                 raw `value`. A `long` slot can present as a compact \
+                 `Value::Int`, and a descriptor-only lookup answers \
+                 (\"J\", Value::Int(5)) with the cached `Long.valueOf(0)`: an \
+                 identity fix converted into a WRONG ANSWER. F29-1 §3 records \
+                 that this exact pair has already caught two lanes",
             ),
         ] {
             assert!(squashed.contains(&needle), "{why} (`{needle}` is gone)");

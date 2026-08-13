@@ -15,9 +15,70 @@ use cratonvm_types::error::{
 };
 use cratonvm_types::{ArrayElementType, ClassId, ObjectKind, ObjectRef, Value};
 
-use crate::lang_class::{box_value, mirror_class_id, mirror_class_name};
+// `box_value` is deliberately NOT imported: after the split described below,
+// every unqualified boxing call in this file is the canonical one, and the
+// four sites that must stay fresh spell `crate::lang_class::box_value` in
+// full so the exception is visible rather than inferred from the argument.
+use crate::lang_class::{box_value_canonical, mirror_class_id, mirror_class_name};
 use crate::{try_alloc_concurrent_synthetic, obj_arg};
 
+// ---------------------------------------------------------------------------
+// WHICH BOXING HELPER THIS FILE USES, AND WHY IT IS TWO
+// ---------------------------------------------------------------------------
+//
+// `box_value` allocates a FRESH wrapper on every call. `box_value_canonical`
+// routes `I J Z B S C` through the registered `X.valueOf` natives — i.e.
+// through the wrapper caches — and falls back to `box_value` for everything
+// else. They are NOT interchangeable: the difference is observable with `==`,
+// and the choice per call site is a MEASUREMENT.
+//
+// The measurement, taken on Microsoft OpenJDK 25.0.3+9 (105 rows, byte
+// identical across three runs and under `-Xint`, so it is not a JIT artefact —
+// scratchpad/f19/ReflBoxOracle.java, tabulated in
+// docs/known-issues/jdk-only/F19-1-*.md §2):
+//
+//   MethodHandle return adaptation (`asType`/`invoke`/`invokeWithArguments`)
+//       mh.asTypeInt / asTypeChar / asTypeBool / asTypeLong / asTypeByte /
+//       asTypeShort = true,  mh.invokeAsObject = true,
+//       mh.invokeWithArgsInt / Char / Long = true          -> CANONICAL
+//   MethodHandle collector element boxing
+//       mhcoll.int / char / bool / long = true, mhvar.int / char = true
+//                                                          -> CANONICAL
+//   VarHandle.get, every shape measured
+//       vh.fieldInt / Char / Bool / Long / Byte / Short = true,
+//       vh.staticInt = true, vh.arrInt / Char / Bool / Long = true,
+//       vh.byteViewInt / byteViewLong = true,
+//       vh.getAndSetInt = true, vh.compareAndExchangeInt = true
+//       ffm.layoutInt / layoutChar / layoutLong / layoutByte = true
+//                                                          -> CANONICAL
+//   float / double, on EVERY one of those paths
+//       mhnc.asTypeFloat = false, vhnc.fieldFloat = false   -> FRESH
+//   any value outside its type's cache bound
+//       mhoob.asTypeInt1000 = false, vhoob.fieldInt1000 = false,
+//       vhoob.staticInt1000 = false, vhoob.arrInt1000 = false,
+//       ffmoob.layoutInt1000 = false, mhcolloob.int1000 = false
+//                                        -> FRESH, and `box_value_canonical`
+//                                           produces that itself: the `valueOf`
+//                                           natives have their own uncached arm
+//
+// Every "FRESH" row above is still `.equals`-equal to the canonical instance
+// (blind.equalsOob / blind.equalsFloat = true), so no equality-shaped
+// assertion can see this in either direction. `regression-suite/src/
+// RJdkReflBox.java` asserts it with `==`, in both directions.
+//
+// Two sites in this file deliberately keep `box_value`:
+//
+//   * the `"F"` / `"D"` arms of the two collector loops. Routing them through
+//     `box_value_canonical` would be behaviour-IDENTICAL (it delegates F and D
+//     straight back), but leaving them spelled `box_value` keeps the measured
+//     asymmetry visible at the site instead of hiding it inside a helper.
+//     `Float`/`Double` have no cache on HotSpot at all: neg.floatValueOf and
+//     neg.doubleValueOf are both `false`.
+//   * `native_mhn_get_member_vm_info`'s vmindex. That `Object[]` slot is
+//     JDK-internal plumbing whose HotSpot counterpart is `create`-boxed, not
+//     `valueOf`-boxed, and no Java-visible identity depends on it. It is the
+//     `Array.get` half of the split and is annotated at the site.
+//
 // ---------------------------------------------------------------------------
 // Hoisted descriptor / class-name string constants
 // ---------------------------------------------------------------------------
@@ -567,7 +628,11 @@ fn layout_vh_get(
         return Ok(Some(Value::Object(None)));
     };
     let value = layout_vh_read(shape, addr);
-    Ok(Some(box_value(
+    // CANONICAL — measured `ffm.layoutInt` / `layoutChar` / `layoutLong` /
+    // `layoutByte` = true. `layout_vh_read` and `layout_vh_carrier_desc` both
+    // switch on `shape.carrier`, so the `Value` variant and the descriptor
+    // always agree here and the helper's variant guard is never the arm taken.
+    Ok(Some(box_value_canonical(
         ctx,
         value,
         layout_vh_carrier_desc(shape.carrier),
@@ -725,6 +790,123 @@ fn widen_primitive_to_descriptor(v: Value, comp: &str) -> Value {
         (DESC_DOUBLE, Value::Long(l)) => Value::Double(l as f64),
         (DESC_DOUBLE, Value::Float(f)) => Value::Double(f as f64),
         _ => v,
+    }
+}
+
+/// Which primitive descriptor should drive the WRAPPER CLASS for one element
+/// of a reference-component collector / varargs array, when the component
+/// itself settles it — `None` when it does not.
+///
+/// # The measurement this is built on, and the diagnosis it corrects
+///
+/// F19-1 §7 N2 states that fixing the collector arms *"needs the target
+/// handle's `MethodType`"*. **MEASURED on OpenJDK 25.0.3+9 (`CollBox.java`,
+/// byte-identical over three runs, under `-Xint`, and under
+/// `-XX:-UseCompressedOops`), that is not where the information is:**
+///
+/// ```text
+/// coll = firstOf(Object[])Object . asCollector(Object[].class, 1)
+/// coll.type()                 = (Object)Object      <-- the MethodType
+/// coll.invoke(aChar)  .getClass() = java.lang.Character
+/// coll.invoke(anInt)  .getClass() = java.lang.Integer
+/// coll.invoke(aBool)  .getClass() = java.lang.Boolean
+/// coll.asType((char)Object).invoke(aChar).getClass() = java.lang.Character
+/// coll.asType((int)Object) .invoke(anInt) .getClass() = java.lang.Integer
+/// ```
+///
+/// The handle's `MethodType` says `Object` for every one of those rows, and
+/// the answers still differ. The wrapper class is chosen by the **call site's
+/// static parameter type** — the descriptor of the signature-polymorphic
+/// `invoke`, or the `asType` adapter's parameter when one is interposed. The
+/// target's `MethodType` is `(Object[])Object` and could not distinguish them
+/// either. So the `Object[]` case is NOT fixable at this arm and is nominated
+/// against `vm/src/vm/vm_exec.rs`, which is where the call-site descriptor
+/// exists (it is already read there as `descriptor`, by
+/// `unbox_poly_return_checked`) and is not passed to the native.
+///
+/// # What IS settled here, and why it is total rather than a heuristic
+///
+/// When the array component is one of the eight wrapper classes, HotSpot
+/// **refuses** every call whose static argument type is not that wrapper's
+/// primitive, so the component pins the answer for every call that runs at
+/// all. MEASURED (`CollBox2.java`):
+///
+/// | collector | from `char` | from `int` | from `long` |
+/// |---|---|---|---|
+/// | `Character[]` | `Character` | `WrongMethodTypeException` | — |
+/// | `Integer[]` | `WrongMethodTypeException` | `Integer` | `WrongMethodTypeException` |
+/// | `Long[]` | — | `WrongMethodTypeException` | `Long` |
+/// | `Boolean[]`/`Byte[]`/`Short[]`/`Float[]` | — | per type | — |
+/// | `Object[]`/`Comparable[]` | `Character` | `Integer` | `Long` |
+///
+/// `Number[]` behaves like `Object[]` for the arms it accepts and refuses the
+/// rest (`Number` from `char` is a `WrongMethodTypeException`), so it is a
+/// `None` here rather than a ninth row — a reference component that is not
+/// itself a wrapper carries no primitive.
+///
+/// The `Value` variant is matched as well as the descriptor, for the same
+/// reason `box_value_canonical` matches it: `native_long_value_of` reads
+/// `Some(Value::Long(v))` and defaults to 0, so a `("Ljava/lang/Long;",
+/// Value::Int(5))` pair routed on the descriptor alone would box **0**. That
+/// pair is not a shape HotSpot accepts anyway (`LongComp.fromInt` throws), so
+/// declining it costs nothing and falling back to the variant keeps today's
+/// answer.
+///
+/// `F`/`D` are returned like the rest; the CALL SITES decide to spell those
+/// two `box_value`, because `Float`/`Double` have no cache on HotSpot
+/// (MEASURED `FloatComp.id` = false, matching `neg.floatValueOf` = false).
+fn collector_element_box_desc(component: &str, v: Value) -> Option<&'static str> {
+    let prim = match component {
+        "Ljava/lang/Character;" => DESC_CHAR,
+        "Ljava/lang/Boolean;" => DESC_BOOLEAN,
+        "Ljava/lang/Byte;" => DESC_BYTE,
+        "Ljava/lang/Short;" => DESC_SHORT,
+        "Ljava/lang/Integer;" => DESC_INT,
+        "Ljava/lang/Long;" => DESC_LONG,
+        "Ljava/lang/Float;" => DESC_FLOAT,
+        "Ljava/lang/Double;" => DESC_DOUBLE,
+        _ => return None,
+    };
+    match (prim, v) {
+        (DESC_CHAR | DESC_BOOLEAN | DESC_BYTE | DESC_SHORT | DESC_INT, Value::Int(_)) => Some(prim),
+        (DESC_LONG, Value::Long(_)) => Some(prim),
+        (DESC_FLOAT, Value::Float(_)) => Some(prim),
+        (DESC_DOUBLE, Value::Double(_)) => Some(prim),
+        _ => None,
+    }
+}
+
+/// Box one element of a reference-component collector / varargs array.
+///
+/// The single implementation of the rule `mh_dispatch`'s `MH_KIND_COLLECT` arm
+/// and `build_varargs_array`'s reference arm both need. It was two copies
+/// before, which is how they came to disagree with each other in the first
+/// place, and the whole of [`collector_element_box_desc`]'s doc comment is the
+/// justification for both.
+fn box_collector_element(ctx: &mut dyn NativeContext, v: Value, component: &str) -> Value {
+    if let Some(desc) = collector_element_box_desc(component, v) {
+        // `F`/`D` stay on `box_value`: HotSpot caches neither, and
+        // `box_value_canonical` would only hand them straight back here. The
+        // spelling is what keeps the measured asymmetry readable at the site.
+        return if desc == DESC_FLOAT || desc == DESC_DOUBLE {
+            crate::lang_class::box_value(ctx, v, desc)
+        } else {
+            crate::lang_class::box_value_canonical(ctx, v, desc)
+        };
+    }
+    // The component does not name a wrapper class (`Object[]` is the ordinary
+    // case), so the only type information left is the runtime `Value` variant.
+    // That is a KNOWN wrong answer for `char`/`boolean`/`byte`/`short`, all of
+    // which travel as `Value::Int` and come out `Integer` — see
+    // [`collector_element_box_desc`] for the measurement and the nomination.
+    // It is a wrong CLASS, not a wrong identity, and caching it does not make
+    // it wronger: the same object graph, one allocation cheaper.
+    match v {
+        Value::Int(_) => crate::lang_class::box_value_canonical(ctx, v, DESC_INT),
+        Value::Long(_) => crate::lang_class::box_value_canonical(ctx, v, DESC_LONG),
+        Value::Float(_) => crate::lang_class::box_value(ctx, v, DESC_FLOAT),
+        Value::Double(_) => crate::lang_class::box_value(ctx, v, DESC_DOUBLE),
+        other => other,
     }
 }
 
@@ -3173,7 +3355,13 @@ fn segment_vh_get(
             })?,
         };
         let raw = if be { seg_swap_bytes(raw, width) } else { raw };
-        Ok(Some(box_value(
+        // CANONICAL — same measurement as `layout_vh_get`: an FFM
+        // `MemorySegment` read handed back through a `VarHandle` is
+        // `X.valueOf`-boxed on HotSpot. `seg_decode_value` and
+        // `seg_shape_desc` switch on the same `SegShape`, so the variant and
+        // the descriptor agree (including `Address`, which is `Value::Long`
+        // and `"J"` in both).
+        Ok(Some(box_value_canonical(
             ctx,
             seg_decode_value(shape, raw),
             seg_shape_desc(shape),
@@ -3333,7 +3521,34 @@ fn vh_box_access_result(
         return Ok(Some(value));
     }
     let desc = vh_access_value_desc(ctx, args);
-    Ok(Some(box_value(ctx, value, &desc)))
+    // Widen BEFORE boxing, exactly as `varhandle_get`'s three field arms and
+    // `Field.get` do. This `let` SHADOWS the binding twelve lines up, after
+    // the `matches!(value, Value::Object(_))` early return has already
+    // excluded references — so the coercion only ever sees a primitive, which
+    // is its contract.
+    let value = crate::lang_class::coerce_reflective_field_value(value, &desc);
+    // CANONICAL — measured `vh.getAndSetInt` = true and
+    // `vh.compareAndExchangeInt` = true: the value a read-modify-write mode
+    // HANDS BACK is `X.valueOf`-boxed on HotSpot, exactly like a plain `get`.
+    //
+    // The variant guard inside `box_value_canonical` matters HERE more than
+    // anywhere else in this file: `desc` comes from `vh_access_value_desc`,
+    // which resolves the VARIABLE's declared descriptor, while `value` came
+    // from whatever the access mode computed. A `("J", Value::Int)` pair is
+    // therefore reachable, and the helper answers it by falling back to
+    // `box_value` — i.e. today's behaviour verbatim, never a cached
+    // `Long.valueOf(0)`. `vh_access_value_desc`'s own `DESC_REF` fallback is
+    // likewise untouched: a reference descriptor is not one of the six arms.
+    //
+    // F19-1 N3 scoped the missing `coerce_reflective_field_value` to
+    // `varhandle_get`'s three field arms. MEASURED (`VhLong.java`),
+    // `vh.getAndSetLong` hands back the old value **5** as a canonical
+    // `Long` — so this funnel is a FOURTH member of that set, not a bystander:
+    // the same `("J", Value::Int(5))` slot reaches it through `getAndSet` and
+    // came out as a `Long` wrapper carrying compact-Int bits. The coercion
+    // above closes it, and it is the member a fix that reads only
+    // `varhandle_get` leaves behind — three of four looks complete.
+    Ok(Some(box_value_canonical(ctx, value, &desc)))
 }
 
 /// VarHandle.get(receiver) → value
@@ -3380,7 +3595,10 @@ fn varhandle_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
             _ => 0,
         };
         let value = byte_view_get(ctx, arr, idx, elem, le);
-        return Ok(Some(box_value(ctx, value, byte_view_desc(elem))));
+        // CANONICAL — measured `vh.byteViewInt` = true and `vh.byteViewLong`
+        // = true. `byte_view_get` and `byte_view_desc` switch on the same
+        // `elem`, so variant and descriptor agree.
+        return Ok(Some(box_value_canonical(ctx, value, byte_view_desc(elem))));
     }
     if let Some((elem, le)) = byte_buffer_view_kind(meta.as_deref()) {
         let bb = match args.get(1) {
@@ -3392,7 +3610,13 @@ fn varhandle_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
             _ => 0,
         };
         let value = byte_buffer_view_get(ctx, bb, idx, elem, le).unwrap_or(Value::Object(None));
-        return Ok(Some(box_value(ctx, value, byte_view_desc(elem))));
+        // CANONICAL — the `ByteBuffer` twin of the `byte[]` view above; same
+        // measurement. Note the `unwrap_or(Value::Object(None))` on the line
+        // before: on a failed read the pair is `(desc, Value::Object(None))`,
+        // which matches none of the six cached arms, so it falls back to
+        // `box_value` and keeps that (pre-existing, separately nominated)
+        // shape byte-for-byte rather than caching a null-carrying wrapper.
+        return Ok(Some(box_value_canonical(ctx, value, byte_view_desc(elem))));
     }
     // C38: Array-element VarHandle call — detected by args[1] being an array
     // and args[2] being an Int. Handles real-JDK VarHandleLongs$Array and the
@@ -3405,7 +3629,14 @@ fn varhandle_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
         let idx = vh_array_index(ctx, arr, idx)?;
         let desc = array_element_desc(ctx, arr);
         let value = ctx.get_array_element(arr, idx);
-        return Ok(Some(box_value(ctx, value, desc)));
+        // CANONICAL — measured `vh.arrInt` / `arrChar` / `arrBool` / `arrLong`
+        // = true. NOTE the contrast this must not be "unified" with:
+        // `java.lang.reflect.Array.get` on the SAME `int[]` is FRESH on both
+        // VMs (`array.int` = false, and `array.selfid` = false — it is not
+        // even identical to itself). Two reads of one array element, two
+        // different contracts, because `Array.get` is `Reflection::array_get`
+        // -> `create()` while a `VarHandle` gets a `valueOf`-shaped adapter.
+        return Ok(Some(box_value_canonical(ctx, value, desc)));
     }
     let (kind, field_idx) = match meta.as_deref() {
         Some(m) => (m.kind, m.field_index),
@@ -3434,8 +3665,51 @@ fn varhandle_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
                 None => vh_type_desc(ctx, this),
             };
             if field_idx >= 0 {
-                let val = ctx.get_field(receiver, field_idx as usize);
-                Ok(Some(box_value(ctx, val, &td)))
+                let val = crate::lang_class::coerce_reflective_field_value(
+                    ctx.get_field(receiver, field_idx as usize),
+                    &td,
+                );
+                // CANONICAL — measured `vh.fieldInt` / `fieldChar` /
+                // `fieldBool` / `fieldLong` / `fieldByte` / `fieldShort` =
+                // true, and `vh.fieldBoolTRUE` = true (a `boolean` field read
+                // through a VarHandle IS `Boolean.TRUE`, not a look-alike).
+                //
+                // `ctx.get_field` returns the RAW slot, which for a `long`
+                // field can present as a compact `Value::Int` — which is why
+                // the read is wrapped in `coerce_reflective_field_value`, the
+                // SAME function `Field.get` uses. Without it this arm produced
+                // a `Long` wrapper whose slot 0 held raw compact-`Int` bits: a
+                // wrong ANSWER, not merely a non-canonical one, and one the
+                // helper's variant guard could only downgrade to a fresh box
+                // rather than repair.
+                //
+                // F19-1 §5.5 listed `vh.fieldLong`'s HotSpot verdict as
+                // **unknown**. It is now MEASURED on OpenJDK 25.0.3+9
+                // (`VhLong.java`, identical under `-Xint`), and the direction
+                // is the same as `Field.get`'s — widen FIRST, then box
+                // canonically, not the reverse:
+                //
+                //   vh.fieldLong      = java.lang.Long, value 5,  id true
+                //   vh.fieldLongZero  = value 0,                  id true
+                //   vh.fieldDouble    = java.lang.Double, 1.5,    id FALSE
+                //   vh.getAndSetLong  = old value 5,              id true
+                //   field.long        = value 5,                  id true
+                //
+                // The fix is `coerce_reflective_field_value` at this arm,
+                // at the by-name arm below, at `VH_KIND_STATIC` (whose
+                // `get_static_field` is equally raw), and at
+                // `vh_box_access_result` — which the `getAndSet` row above
+                // puts inside the family rather than beside it. All FOUR are
+                // applied; three of them would have looked like the whole set.
+                // `Double` is NOT an identity row (id false) but IS a value
+                // row: a `double` slot carrying raw bits as a `Value::Long`
+                // must be REINTERPRETED, which is the arm this file's own
+                // `widen_primitive_to_descriptor` would get WRONG — it
+                // converts numerically, so `1.5` comes back as `4.609e18`.
+                // One rule, one implementation, and it is `lang_class`'s;
+                // substituting the local widener here is a silent wrong
+                // answer, not a shortcut.
+                Ok(Some(box_value_canonical(ctx, val, &td)))
             } else {
                 // Resolve by name (reuse the meta Arc we already hold).
                 let (class, field) = match meta.as_deref() {
@@ -3450,9 +3724,22 @@ fn varhandle_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
                         // Cache for next time
                         ctx.set_field(this, VH_FIELD_INDEX, Value::Int(idx as i32));
                         vh_meta_update_field_index(ctx, this, idx as i32);
-                        let val = ctx.get_field(receiver, idx);
-                        // Reuse already-computed type descriptor.
-                        Ok(Some(box_value(ctx, val, &td)))
+                        // Widened through the SAME function as the
+                        // `field_idx >= 0` arm above: a VarHandle that
+                        // resolved late must not answer differently from one
+                        // that resolved early, in the value any more than in
+                        // the identity.
+                        let val = crate::lang_class::coerce_reflective_field_value(
+                            ctx.get_field(receiver, idx),
+                            &td,
+                        );
+                        // Reuse already-computed type descriptor. CANONICAL,
+                        // for the same measurement as the `field_idx >= 0`
+                        // arm twenty lines up — this is the same read after a
+                        // by-name resolve, and a VarHandle that happened to
+                        // resolve late must not answer with a different
+                        // identity than one that resolved early.
+                        Ok(Some(box_value_canonical(ctx, val, &td)))
                     }
                     None => Ok(Some(Value::Object(None))),
                 }
@@ -3466,7 +3753,7 @@ fn varhandle_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
                     vh_read_string(ctx, this, VH_FIELD).unwrap_or_default(),
                 ),
             };
-            let val = match vh_static_slot(ctx, &class, &field) {
+            let raw = match vh_static_slot(ctx, &class, &field) {
                 Some((cid, sidx)) => ctx.get_static_field(cid, sidx),
                 None => return Ok(Some(Value::Object(None))),
             };
@@ -3474,7 +3761,20 @@ fn varhandle_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
                 Some(m) => vh_type_desc_from_meta(m),
                 None => vh_type_desc(ctx, this),
             };
-            Ok(Some(box_value(ctx, val, &td)))
+            // Widen BEFORE boxing, and therefore after `td` — the read above
+            // is deliberately named `raw`, because that is what
+            // `get_static_field` hands back.
+            let val = crate::lang_class::coerce_reflective_field_value(raw, &td);
+            // CANONICAL — measured `vh.staticInt` = true. The out-of-bound
+            // twin is measured too and is the arm the helper delegates:
+            // `vhoob.staticInt1000` = false.
+            //
+            // `get_static_field` is as raw as `get_field`, so this arm is a
+            // member of the widening set — see the block on the
+            // `VH_KIND_INSTANCE` arm above for the measurement and for why
+            // this file's own `widen_primitive_to_descriptor` is the wrong
+            // function for it.
+            Ok(Some(box_value_canonical(ctx, val, &td)))
         }
         VH_KIND_ARRAY => {
             // args = [vh, array, index]
@@ -3494,7 +3794,12 @@ fn varhandle_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
             // `Int`, i.e. exactly the shape a partial fix would leave behind.
             let value = ctx.get_array_element(arr, idx);
             let desc = array_element_desc(ctx, arr);
-            Ok(Some(box_value(ctx, value, desc)))
+            // CANONICAL, for the same measurement as the `vh_array_call` fast
+            // path above. Switched even though the comment above says this
+            // branch is normally shadowed: an arm that is reachable only in
+            // the shape a partial fix leaves behind is exactly the arm that
+            // must not disagree with its twin.
+            Ok(Some(box_value_canonical(ctx, value, desc)))
         }
         _ => Ok(Some(Value::Object(None))),
     }
@@ -8737,9 +9042,16 @@ fn box_direct_primitive_return(
     ) {
         return result;
     }
+    // CANONICAL — this is MethodHandle return adaptation, and HotSpot's
+    // `asType` inserts a `valueOf` handle for the primitive->Object step.
+    // Measured: `mh.asTypeInt` / `asTypeChar` / `asTypeBool` / `asTypeLong` /
+    // `asTypeByte` / `asTypeShort` = true, and `mh.invokeAsObject` = true.
+    // `ret_desc` was just narrowed to the eight primitive descriptors, and it
+    // is the DECLARED return type of the target while `v` is what dispatch
+    // produced, so the helper's variant guard is load-bearing here too.
     match result {
         Ok(Some(v @ Value::Object(Some(_)))) => Ok(Some(v)),
-        Ok(Some(v)) => Ok(Some(box_value(ctx, v, ret_desc))),
+        Ok(Some(v)) => Ok(Some(box_value_canonical(ctx, v, ret_desc))),
         other => other,
     }
 }
@@ -9572,13 +9884,23 @@ pub(crate) fn mh_dispatch(
                     // `int`s in its `Object[] args` and Groovy's
                     // `args[0].getClass()` (Selector.setGuards) dereferences a
                     // raw int as an object → NPE.
-                    match v {
-                        Value::Int(_) => crate::lang_class::box_value(ctx, v, "I"),
-                        Value::Long(_) => crate::lang_class::box_value(ctx, v, "J"),
-                        Value::Float(_) => crate::lang_class::box_value(ctx, v, "F"),
-                        Value::Double(_) => crate::lang_class::box_value(ctx, v, "D"),
-                        other => other,
-                    }
+                    //
+                    // CANONICAL for `I`/`J` — measured `mhcoll.int` /
+                    // `mhcoll.long` / `mhvar.int` = true. Out of bound is
+                    // measured and needs no arm of its own:
+                    // `mhcolloob.int1000` = false, which is what the `valueOf`
+                    // native's own uncached path already produces.
+                    //
+                    // The wrapper CLASS comes from `comp` when `comp` settles
+                    // it (`Character[]` -> `Character`, MEASURED, and HotSpot
+                    // refuses every other static argument type for that
+                    // collector) and from the `Value` variant otherwise, which
+                    // is a KNOWN wrong answer for `char`/`boolean`/`byte`/
+                    // `short` in the ordinary `Object[]` case. Both halves,
+                    // the measurement that separates them and the nomination
+                    // that would close the second are on
+                    // `collector_element_box_desc`.
+                    box_collector_element(ctx, v, &comp)
                 } else {
                     // The mirror image, for the same reason: a primitive
                     // collector's element slot is raw, and an argument that
@@ -10593,13 +10915,16 @@ fn build_varargs_array(
             let pin = ctx.pin_native_root(arr);
             let mut arr = arr;
             for (i, v) in vals.iter().enumerate() {
-                let ov = match *v {
-                    Value::Int(_) => crate::lang_class::box_value(ctx, *v, "I"),
-                    Value::Long(_) => crate::lang_class::box_value(ctx, *v, "J"),
-                    Value::Float(_) => crate::lang_class::box_value(ctx, *v, "F"),
-                    Value::Double(_) => crate::lang_class::box_value(ctx, *v, "D"),
-                    other => other,
-                };
+                // The varargs twin of `mh_dispatch`'s collector loop, and now
+                // literally the same function rather than a copy of it — the
+                // two arms disagreeing is the shape that produced this
+                // family's defects. `component` here is the TARGET's trailing
+                // array component, so `vChar(Character...)` settles the
+                // wrapper class the same way `asCollector(Character[], 1)`
+                // does: MEASURED `H.vChar.fromChar` = `java.lang.Character`,
+                // `H.vChar.id` = true, and `H.vLong.fromInt` throws on
+                // HotSpot rather than widening. Measured `mhvar.int` = true.
+                let ov = box_collector_element(ctx, *v, component);
                 arr = ctx.read_native_pin(pin, arr);
                 ctx.set_array_element(arr, i, ov);
             }
@@ -10629,9 +10954,15 @@ fn auto_box_return(
 ) -> MethodCallResult {
     let ret_desc = return_type_desc(desc);
     match ret_desc {
+        // CANONICAL — this is the signature-polymorphic `invoke` /
+        // `invokeWithArguments` return path. Measured
+        // `mh.invokeWithArgsInt` / `Char` / `Long` = true and
+        // `mh.invokeAsObject` = true; `mhnc.asTypeFloat` = false and
+        // `mhoob.asTypeInt1000` = false are the two arms
+        // `box_value_canonical` delegates back to `box_value` itself.
         "I" | "J" | "F" | "D" | "Z" | "B" | "S" | "C" => match result {
             Ok(Some(v @ Value::Object(Some(_)))) => Ok(Some(v)),
-            Ok(Some(val)) => Ok(Some(box_value(ctx, val, ret_desc))),
+            Ok(Some(val)) => Ok(Some(box_value_canonical(ctx, val, ret_desc))),
             other => other,
         },
         "V" => match result {
@@ -12698,7 +13029,22 @@ pub(crate) fn native_mhn_get_member_vm_info(
     // afterward); pin them and re-read the forwarded references before use.
     let arr_pin = ctx.pin_native_root(arr);
     let member_name_pin = ctx.pin_native_root(member_name);
-    // Box vmindex as Integer
+    // Box vmindex as Integer — `box_value`, i.e. FRESH, and NOT the cached
+    // sibling every other boxing site in this file was switched to.
+    //
+    // This is the one site here whose HotSpot counterpart is not a `valueOf`
+    // adapter. `MethodHandleNatives.getMemberVMInfo` is a VM native that fills
+    // an `Object[]` with `java_lang_boxing_object::create`-shaped values, the
+    // same allocator `Reflection::array_get` uses — and `Array.get` is
+    // measured FRESH on both VMs (`array.int` = false, `array.selfid` = false).
+    // The slot is JDK-internal plumbing that no Java code identity-compares,
+    // so there is no observable to conform to and no reason to put a
+    // per-`vmindex` entry into a process-global cache.
+    //
+    // If a later lane "finishes the job" by switching this line, the thing it
+    // will have changed is which of two indistinguishable objects a JDK
+    // internal receives — and the thing it will have lost is the annotation
+    // saying the difference was checked. Leave it.
     let boxed = crate::lang_class::box_value(ctx, Value::Int(vmindex), "I");
     let arr = ctx.read_native_pin(arr_pin, arr);
     let member_name = ctx.read_native_pin(member_name_pin, member_name);
@@ -12859,6 +13205,255 @@ mod tests {
     use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
     use crate::test_utils::MockNativeContext;
+
+    // -----------------------------------------------------------------------
+    // F29 — the collector element's WRAPPER CLASS
+    //
+    // `collector_element_box_desc` is a pure function of (component
+    // descriptor, `Value` variant), so it is tested as one: no mock, no VM, no
+    // slot table. Every row below is a MEASURED HotSpot 25.0.3+9 observable
+    // from `CollBox.java` / `CollBox2.java`, named in the assertion message so
+    // a future reader can re-run the row rather than re-derive it.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn a_wrapper_typed_component_settles_the_element_class() {
+        // MEASURED: G.CharacterComp.fromChar = java.lang.Character
+        assert_eq!(
+            collector_element_box_desc("Ljava/lang/Character;", Value::Int(97)),
+            Some("C")
+        );
+        // MEASURED: G.BooleanComp.fromBool / ByteComp / ShortComp / IntegerComp
+        assert_eq!(
+            collector_element_box_desc("Ljava/lang/Boolean;", Value::Int(1)),
+            Some("Z")
+        );
+        assert_eq!(
+            collector_element_box_desc("Ljava/lang/Byte;", Value::Int(3)),
+            Some("B")
+        );
+        assert_eq!(
+            collector_element_box_desc("Ljava/lang/Short;", Value::Int(9)),
+            Some("S")
+        );
+        assert_eq!(
+            collector_element_box_desc("Ljava/lang/Integer;", Value::Int(7)),
+            Some("I")
+        );
+        // MEASURED: G.LongComp.fromLong = java.lang.Long, G.LongComp.id = true
+        assert_eq!(
+            collector_element_box_desc("Ljava/lang/Long;", Value::Long(5)),
+            Some("J")
+        );
+        // MEASURED: G.FloatComp.fromFloat = java.lang.Float, and
+        // G.FloatComp.id = FALSE — the class is settled, the identity is not.
+        assert_eq!(
+            collector_element_box_desc("Ljava/lang/Float;", Value::Float(1.5)),
+            Some("F")
+        );
+        assert_eq!(
+            collector_element_box_desc("Ljava/lang/Double;", Value::Double(1.5)),
+            Some("D")
+        );
+    }
+
+    /// The negative control, and it is the important half: an `Object[]`
+    /// collector must NOT be answered from the component, because HotSpot
+    /// answers it from the CALL SITE and this arm cannot see one.
+    /// MEASURED: `coll.type()` = `(Object)Object` while `coll.invoke(aChar)`
+    /// is a `Character` and `coll.invoke(anInt)` an `Integer`.
+    #[test]
+    fn a_non_wrapper_component_settles_nothing() {
+        for comp in [
+            "Ljava/lang/Object;",
+            "Ljava/lang/Number;",
+            "Ljava/lang/Comparable;",
+            "Ljava/lang/String;",
+            "Ljava/io/Serializable;",
+            "[I",
+            "",
+        ] {
+            assert_eq!(
+                collector_element_box_desc(comp, Value::Int(97)),
+                None,
+                "{comp} must fall back to the Value variant, not invent a wrapper"
+            );
+        }
+        // MEASURED: C.componentNumber.fromInt = java.lang.Integer, i.e. the
+        // fallback's answer is already right for `Number[]` from an `int`;
+        // C.componentNumber.fromChar THROWS on HotSpot, so there is no row
+        // this `None` gets wrong.
+    }
+
+    /// The variant guard. `("Ljava/lang/Long;", Value::Int(5))` routed on the
+    /// descriptor alone reaches `native_long_value_of`, which reads
+    /// `Some(Value::Long(v))` and defaults to **0** — an identity fix turned
+    /// into a wrong answer. HotSpot never accepts that pair either
+    /// (MEASURED: `G.LongComp.fromInt` throws `WrongMethodTypeException`), so
+    /// declining costs nothing.
+    #[test]
+    fn the_component_is_not_trusted_against_a_mismatched_value_variant() {
+        assert_eq!(
+            collector_element_box_desc("Ljava/lang/Long;", Value::Int(5)),
+            None
+        );
+        assert_eq!(
+            collector_element_box_desc("Ljava/lang/Integer;", Value::Long(7)),
+            None
+        );
+        assert_eq!(
+            collector_element_box_desc("Ljava/lang/Character;", Value::Long(97)),
+            None
+        );
+        assert_eq!(
+            collector_element_box_desc("Ljava/lang/Float;", Value::Double(1.5)),
+            None
+        );
+        assert_eq!(
+            collector_element_box_desc("Ljava/lang/Double;", Value::Float(1.5)),
+            None
+        );
+        // A reference element travelling through a wrapper-typed collector —
+        // already boxed by the caller — must be left alone, not re-boxed.
+        assert_eq!(
+            collector_element_box_desc("Ljava/lang/Character;", Value::Object(None)),
+            None
+        );
+    }
+
+    /// `char` and `int` are the same `Value::Int` and must still separate on
+    /// the component. This is the single row that fails if a later edit
+    /// "simplifies" the helper back to a variant-only match — which is exactly
+    /// the state this lane found.
+    #[test]
+    fn char_and_int_separate_on_the_component_though_the_variant_cannot() {
+        let same_bits = Value::Int(97);
+        assert_eq!(
+            collector_element_box_desc("Ljava/lang/Character;", same_bits),
+            Some("C")
+        );
+        assert_eq!(
+            collector_element_box_desc("Ljava/lang/Integer;", same_bits),
+            Some("I")
+        );
+        assert_ne!(
+            collector_element_box_desc("Ljava/lang/Character;", same_bits),
+            collector_element_box_desc("Ljava/lang/Integer;", same_bits)
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // F39 — the VarHandle field path's widener
+    //
+    // MEASURED on OpenJDK 25.0.3+9 (`scratchpad/f29/VhLong.java`, identical
+    // under `-Xint`):
+    //
+    //   vh.fieldLong     = java.lang.Long,   value 5,   id true
+    //   vh.getAndSetLong = java.lang.Long,   value 5,   id true
+    //   vh.fieldDouble   = java.lang.Double, value 1.5, id FALSE
+    //
+    // so the direction is `Field.get`'s: widen FIRST, box canonically second.
+    // Both tests below are about the FUNCTION CHOICE, which is the half of
+    // this fix that a behavioural test cannot see — every wrong answer here is
+    // still a `Double` of the right class, and `vh.fieldDouble` is not even an
+    // identity row.
+    // -----------------------------------------------------------------------
+
+    /// The two wideners are NOT interchangeable, and that is the whole reason
+    /// the four arms reach into `lang_class` rather than call the local one
+    /// already in scope. Pure functions on both sides — no mock, no VM, no
+    /// slot table, so nothing here can measure the mock instead of the rule.
+    #[test]
+    fn the_field_widener_reinterprets_where_the_local_one_converts() {
+        // The raw slot of a `double` field holding 1.5, exactly as
+        // `ctx.get_field` hands it back: the IEEE-754 bit pattern, carried in
+        // a `Value::Long`. Decimal, for a reader checking by hand:
+        // 4_609_434_218_613_702_656.
+        let bits = Value::Long(1.5f64.to_bits() as i64);
+
+        // MEASURED: vh.fieldDouble.value = 1.5. The `1.5` here is a literal,
+        // not a restatement of the implementation — this assertion is the one
+        // that fails if the field path is ever "unified" onto the numeric
+        // widener.
+        assert_eq!(
+            crate::lang_class::coerce_reflective_field_value(bits, DESC_DOUBLE),
+            Value::Double(1.5),
+            "the field path must REINTERPRET the slot's bits, not convert them"
+        );
+        // The local one converts NUMERICALLY, which is correct where it is
+        // used (a collector element really is a number being widened) and
+        // catastrophic on a field read: 1.5 comes back as ~4.609e18.
+        assert_eq!(
+            widen_primitive_to_descriptor(bits, DESC_DOUBLE),
+            Value::Double(1.5f64.to_bits() as i64 as f64)
+        );
+        // Same input, same descriptor, two different answers. Anyone
+        // collapsing the two functions has to delete this line to do it.
+        assert_ne!(
+            crate::lang_class::coerce_reflective_field_value(bits, DESC_DOUBLE),
+            widen_primitive_to_descriptor(bits, DESC_DOUBLE)
+        );
+        // The `J` arm — a `long` field holding 5 whose slot presents as a
+        // compact `Value::Int` — is where the two AGREE. It is included so
+        // the `D` row above cannot be read as "the two functions differ
+        // everywhere", which would make the choice look arbitrary rather than
+        // forced.
+        assert_eq!(
+            crate::lang_class::coerce_reflective_field_value(Value::Int(5), DESC_LONG),
+            Value::Long(5)
+        );
+        assert_eq!(
+            widen_primitive_to_descriptor(Value::Int(5), DESC_LONG),
+            Value::Long(5)
+        );
+    }
+
+    /// A SOURCE WITNESS for the call sites, because the set is **four** and
+    /// three of them look like the whole set — F19-1 N3 scoped this fix to
+    /// `varhandle_get`'s three field arms, and `vh_box_access_result` (the RMW
+    /// funnel, measured by `vh.getAndSetLong`) is the fourth. No behavioural
+    /// test in this module can stand in: `MockNativeContext`'s slots are not
+    /// the VM's, and the test above proves the FUNCTION is right whether or
+    /// not anything calls it.
+    ///
+    /// Needles are assembled with `format!` at runtime: spelled as literals
+    /// they would match this test's own source text, since the file being
+    /// searched IS this file. Whitespace is stripped so a rustfmt re-wrap
+    /// cannot break them.
+    #[test]
+    fn all_four_varhandle_read_arms_widen_before_boxing() {
+        let src = include_str!("lang_invoke.rs");
+        let squashed: String = src.chars().filter(|c| !c.is_whitespace()).collect();
+        let widen = format!("crate::lang_class::coerce_reflective_field_{}", "value");
+        for (needle, why) in [
+            (
+                format!("letval={widen}(ctx.get_field(receiver,field_idxasusize),&td,)"),
+                "varhandle_get's VH_KIND_INSTANCE by-index arm no longer \
+                 widens, so a `long` field holding 5 boxes to a `Long` \
+                 carrying compact-Int bits (measured: vh.fieldLong.value = 5)",
+            ),
+            (
+                format!("letval={widen}(ctx.get_field(receiver,idx),&td,)"),
+                "varhandle_get's by-NAME arm no longer widens — the same read \
+                 after a late resolve, which must not answer differently from \
+                 one that resolved early",
+            ),
+            (
+                format!("letval={widen}(raw,&td);"),
+                "VH_KIND_STATIC no longer widens; `get_static_field` is as raw \
+                 as `get_field` and this arm is not a bystander",
+            ),
+            (
+                format!("letvalue={widen}(value,&desc);"),
+                "vh_box_access_result — the RMW funnel — no longer widens. \
+                 This is the arm F19-1 N3 missed: measured, vh.getAndSetLong \
+                 hands back the old value 5 as a canonical Long, so the same \
+                 raw slot reaches this funnel through getAndSet",
+            ),
+        ] {
+            assert!(squashed.contains(&needle), "{why} (`{needle}` is gone)");
+        }
+    }
 
     // MH_KIND_DROP dispatch must trim the dynamic args using the EXACT
     // `pos:count` encoded at construction time (see MH_KIND_RETURN_FILTER's
@@ -13043,7 +13638,12 @@ mod tests {
     #[test]
     fn auto_box_return_preserves_already_boxed_primitive_result() {
         let mut ctx = MockNativeContext::new();
-        let boxed = match box_value(&mut ctx, Value::Int(0), "Z") {
+        // The FRESH helper on purpose, and spelled in full because this file
+        // no longer imports it. `box_value_canonical("Z", 0)` would hand back
+        // the shared `Boolean.FALSE` instance, which is process-global and
+        // keyed by `vm_identity()` — a fixture this test then writes slot 0 of
+        // would be mutating an object other tests in this binary also hold.
+        let boxed = match crate::lang_class::box_value(&mut ctx, Value::Int(0), "Z") {
             Value::Object(Some(obj)) => obj,
             other => panic!("expected boxed Boolean fixture, got {:?}", other),
         };

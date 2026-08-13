@@ -4266,6 +4266,11 @@ pub mod vector_api;
 pub mod boot_loader;
 /// Third-party compression JNI shims (snappy-java + zstd-jni) for Kafka codecs.
 pub mod compression_native;
+/// JDK-25 surface baselines (`scripts/baselines/jdk25-*.tsv`) plus the `audit`
+/// / `audit_off_surface` checks that compare our registrations against them.
+/// Declared here deliberately: without this line the module compiles in no
+/// build, so its tests are not a gate on anything.
+pub mod jdk_baseline;
 pub mod keystore;
 pub mod lookup_define;
 pub mod security_manager;
@@ -17596,10 +17601,19 @@ pub fn register_essential_natives_with_shims(
                     wrote_real_config = true;
                 }
             }
-            // Our `allocate_logger`-created synthetic loggers (slot0=name,
-            // slot1=level, slot2=parent) have no `config` object at all, so
-            // the branch above never fires for them -- write the level slot
-            // directly so `getLevel()` (below) and the ancestor-walking
+            // Our `allocate_logger`-created synthetic loggers use the DECLARED
+            // layout (`class_manager.rs:14191`, real-JDK field order): name =
+            // `LOGGER_FIELD_NAME` (2), parent = `LOGGER_FIELD_PARENT` (8),
+            // level = `LOGGER_FIELD_LEVEL` (12, the VM-internal slot anchored
+            // past the 12 real fields). The "slot0=name, slot1=level,
+            // slot2=parent" this comment claimed until 2026-08-13 was the
+            // retired 3-field shim layout — and the three lines below it
+            // already use the `logmanager` constants, so the comment described
+            // neither the producer nor the reader it sits between.
+            //
+            // Such a logger has no `config` object at all, so the branch above
+            // never fires for it -- write the level slot directly so
+            // `getLevel()` (below) and the ancestor-walking
             // `getEffectiveLevel()` callers in real Spring Boot bytecode see
             // the update instead of a permanent null.
             if !wrote_real_config {
@@ -21430,7 +21444,17 @@ fn register_string_format_real_jdk_natives(registry: &mut NativeMethodRegistry) 
         };
         let empty = ctx.create_string("");
         ctx.set_field(this, 0, Value::Object(Some(empty)));
-        ctx.set_field(this, 1, Value::Object(None));
+        // Slot 1 is the DEFAULT format locale, not null — the real
+        // `java.util.Formatter()` is `this(Locale.getDefault(Category.FORMAT),
+        // new StringBuilder())`. See [`formatter_default_locale`] for the
+        // measured `tr_TR` rows and for the three-rung degradation. Pinned
+        // across the resolution because it runs Java code and can move `this`;
+        // slot 0 is written first so the new string is rooted through it.
+        let pin = ctx.pin_native_root(this);
+        let locale = formatter_default_locale(ctx);
+        let this = ctx.read_native_pin(pin, this);
+        ctx.unpin_native_roots(pin);
+        ctx.set_field(this, 1, locale);
         Ok(None)
     });
     registry.register(f, "<init>", "(Ljava/util/Locale;)V", |ctx, args| {
@@ -21450,7 +21474,12 @@ fn register_string_format_real_jdk_natives(registry: &mut NativeMethodRegistry) 
         };
         let appendable = args.get(1).copied().unwrap_or(Value::Object(None));
         ctx.set_field(this, 0, appendable);
-        ctx.set_field(this, 1, Value::Object(None));
+        // See the `()V` constructor above: slot 1 is the DEFAULT format locale.
+        let pin = ctx.pin_native_root(this);
+        let locale = formatter_default_locale(ctx);
+        let this = ctx.read_native_pin(pin, this);
+        ctx.unpin_native_roots(pin);
+        ctx.set_field(this, 1, locale);
         Ok(None)
     });
     // `Formatter(Appendable, Locale)` is deliberately NOT registered here,
@@ -21464,6 +21493,28 @@ fn register_string_format_real_jdk_natives(registry: &mut NativeMethodRegistry) 
     // `format` below reads slot 1, the real constructor is all this needs.
     // The synthetic-mode registrar `register_formatter_natives` DOES need the
     // overload, because there is no real constructor there; it has it.
+    //
+    // F38: that argument was offered as a reason to DELETE the `()V` and
+    // `(Appendable)V` registrations too, rather than teach them the default
+    // locale. It does not carry, and the reason is slot 0, not slot 1.
+    //
+    // The real `Formatter()` writes `a = new StringBuilder()`. `read_string`
+    // (vm_exec.rs) returns `None` for ANY object whose class is known and is
+    // not `java/lang/String` — a deliberate guard, added because the structural
+    // reader decoded a `StringBuilder`'s whole char[] CAPACITY. So with the
+    // native gone, `toString()` below would read a `StringBuilder` out of slot
+    // 0, get `None`, and answer the empty string for every
+    // `new Formatter().format(...).toString()`. `format`'s own appending path
+    // survives it (it falls through to `invoke_virtual(sb, "append", ...)`),
+    // which is what makes the failure silent rather than loud.
+    //
+    // Deleting is therefore not the smaller change: it is the toString fix plus
+    // moving every `new Formatter()` onto real bytecode that resolves
+    // `Locale.getDefault(FORMAT)` AND `DecimalFormatSymbols.getInstance(l)
+    // .getZeroDigit()` at construction. The `toString()` half is done just
+    // below, so whoever wants the deletion now has its precondition; the
+    // decision to keep the registrations is a decision about what a lane that
+    // cannot build or run should land, not a claim that the deletion is wrong.
     registry.register(
         f,
         "format",
@@ -21533,10 +21584,7 @@ fn register_string_format_real_jdk_natives(registry: &mut NativeMethodRegistry) 
             _ => return Ok(Some(Value::Object(None))),
         };
         match ctx.get_field(this, 0) {
-            Value::Object(Some(o)) => {
-                let s = ctx.read_string(o).unwrap_or_default();
-                Ok(Some(Value::Object(Some(ctx.create_string(&s)))))
-            }
+            Value::Object(Some(o)) => Ok(Some(formatter_sink_text(ctx, o))),
             _ => Ok(Some(Value::Object(Some(ctx.create_string(""))))),
         }
     });
@@ -23313,45 +23361,44 @@ pub fn register_synthetic_overrides(registry: &mut NativeMethodRegistry) {
         "([Ljava/lang/Object;)Ljava/lang/String;",
         native_string_formatted,
     );
+    // `String.indent(int)` — the SAME body `lang_math::register_wrapper_natives`
+    // binds (`lib.rs:14679`, inside `register_essential_natives_with_shims`),
+    // not a second copy.
+    //
+    // This slot used to hold an inline closure, and because
+    // `register_builtins` runs `register_essential_natives` and only THEN
+    // `register_synthetic_overrides`, and `register()` is last-write-wins, that
+    // closure WON in synthetic-JDK mode — silently reverting W7-95a's fix for
+    // exactly the mode the blocking gate runs in. The closure was the pre-W7-95a
+    // body: `let strip = (-n) as usize; if line.len() > strip { &line[strip..] }`.
+    // Three defects, measured against `openjdk 25.0.3 2026-04-21 LTS
+    // (25.0.3+9-LTS)` (Microsoft build) on this host, `scratchpad/f20/Ind.java`:
+    //
+    //   HotSpot                                     old closure
+    //   "abc".indent(-1)        = "abc\n"           "bc\n"        wrong answer
+    //   "  abc".indent(-5)      = "abc\n"           ""            wrong answer
+    //   (U+00A0)+"abc".indent(-1) = the same string back  VM ABORT  (see below)
+    //   "abc".indent(MIN_VALUE) = "abc\n"           VM ABORT      (debug)
+    //
+    // Row 3 is the VM-fatal one and it is why this had to move rather than be
+    // patched in place: Java strips only leading `Character.isWhitespace`
+    // characters, capped at `-n` — `s.substring(Math.min(-n, s.indexOfNonWhitespace()))`
+    // - and `Character.isWhitespace(U+00A0)` is **false** (measured). The
+    // closure counted BYTES and sliced `&line[1..]`, which lands inside
+    // U+00A0's two-byte UTF-8 encoding: `panic!("byte index 1 is not a char
+    // boundary")`, and a Rust panic is not a Java throwable — it takes the VM
+    // down where HotSpot returns a string. Row 4 is `-i32::MIN`, an overflow
+    // panic in debug; the JDK has an explicit `n == Integer.MIN_VALUE` arm
+    // (`stripLeading()`) for that same reason, `String.java:4036`.
+    //
+    // `lang_string::native_string_indent` is the arm that already gets all four
+    // right. This is a re-point, not a re-implementation: a third copy of one
+    // rule is how the first two drifted.
     registry.register(
         "java/lang/String",
         "indent",
         "(I)Ljava/lang/String;",
-        |ctx, args| {
-            let this = match args.first() {
-                Some(Value::Object(Some(o))) => *o,
-                _ => return Ok(Some(Value::Object(None))),
-            };
-            let n = match args.get(1) {
-                Some(Value::Int(v)) => *v,
-                _ => 0,
-            };
-            let s = ctx.read_string(this).unwrap_or_default();
-            let indent = if n > 0 {
-                " ".repeat(n as usize)
-            } else {
-                String::new()
-            };
-            let result: String = s
-                .lines()
-                .map(|line| {
-                    if n > 0 {
-                        format!("{}{}\n", indent, line)
-                    } else if n < 0 {
-                        let strip = (-n) as usize;
-                        let trimmed = if line.len() > strip {
-                            &line[strip..]
-                        } else {
-                            ""
-                        };
-                        format!("{}\n", trimmed)
-                    } else {
-                        format!("{}\n", line)
-                    }
-                })
-                .collect();
-            Ok(Some(Value::Object(Some(ctx.create_string(&result)))))
-        },
+        crate::lang_string::native_string_indent,
     );
     registry.register(
         "java/lang/String",
@@ -26958,8 +27005,103 @@ fn system_logger_threshold(ctx: &mut dyn NativeContext, this: Option<ObjectRef>)
     }
 }
 
-/// `System.Logger.isLoggable(Level)`: never true for `OFF`, otherwise true iff
-/// the level is at least as severe as this logger's threshold.
+/// Is the `Level` argument itself `null`?
+///
+/// Distinct from "the level's name could not be read": a minted or
+/// short receiver can present a `Level` whose `name` field is unreadable, and
+/// that is a shape problem to be absorbed, not a caller error to be thrown at.
+/// Only an actually-absent reference is the `null` the JDK raises on.
+fn system_logger_level_arg_is_null(level: Option<&Value>) -> bool {
+    !matches!(level, Some(Value::Object(Some(_))))
+}
+
+/// `System.Logger`'s null-`Level` contract.
+///
+/// Every `System.Logger` method that takes a `Level` dereferences it, and BOTH
+/// implementations a JDK can hand out do so before anything else — before the
+/// message is looked at and before a `Supplier` is evaluated:
+///
+/// * `sun.util.logging.internal.LoggingProviderImpl$JULWrapper` (what
+///   `System.getLogger` returns whenever `java.logging` is resolved, i.e. the
+///   stock case) is `julLogger.isLoggable(toJUL(level))`; `toJUL(null)` is
+///   `null` and `java.util.logging.Logger.isLoggable` then calls
+///   `level.intValue()`.
+/// * `jdk.internal.logger.SimpleConsoleLogger` (the no-`java.logging` fallback,
+///   and the class this VM's own strict fallback constructs) is
+///   `isLoggable(PlatformLogger.toPlatformLevel(level))`;
+///   `toPlatformLevel(null)` returns `null` (`PlatformLogger.java:511`) and the
+///   next line is `level.ordinal()`.
+///
+/// So the two disagree about `OFF` (see [`system_logger_is_loggable`]) but
+/// agree unanimously about `null`. MEASURED on this host, `openjdk 25.0.3
+/// 2026-04-21 LTS (25.0.3+9-LTS)` (Microsoft build), `scratchpad/f20/Slog.java`,
+/// against `System.getLogger("f20.probe")` (which reported itself as
+/// `sun.util.logging.internal.LoggingProviderImpl$JULWrapper`):
+///
+/// ```text
+/// isLoggable(null) !! java.lang.NullPointerException: Cannot invoke "java.util.logging.Level.intValue()" because "level" is null
+/// log(null, "m")   !! java.lang.NullPointerException: Cannot invoke "java.util.logging.Level.intValue()" because "level" is null
+/// ```
+///
+/// Before this, a null `Level` fell through `system_logger_level_name` to
+/// `None`, then through `system_logger_severity_of` to the
+/// `.unwrap_or(SYSTEM_LOGGER_SEVERITY_INFO)` default, and `isLoggable(null)`
+/// answered **true** — a fabricated permission, and the `log` family silently
+/// published at INFO instead of throwing. That is the shape a caller cannot
+/// see: the wrong answer is the permissive one.
+///
+/// The message is the `JULWrapper` road's, because that is the road a stock
+/// JDK takes and therefore the string an oracle diff will hold. The
+/// `SimpleConsoleLogger` road NPEs at a different expression and so would
+/// carry different text; the TYPE is what both roads agree on and what any
+/// `catch` sees.
+fn system_logger_require_level(level: Option<&Value>) -> Result<(), MethodCallFailed> {
+    if system_logger_level_arg_is_null(level) {
+        return Err(RuntimeError::NullPointerException {
+            message: Some(
+                "Cannot invoke \"java.util.logging.Level.intValue()\" because \"level\" is null"
+                    .to_string(),
+            ),
+        }
+        .into());
+    }
+    Ok(())
+}
+
+/// `System.Logger.isLoggable(Level)`: true iff the level is at least as severe
+/// as this logger's threshold.
+///
+/// # `OFF` — the two JDK implementations DISAGREE, and this is not a guess
+///
+/// This body used to short-circuit `OFF` to `false`, with a comment claiming
+/// that as the contract. It is the contract of exactly one of the two
+/// implementations. MEASURED on this host (`scratchpad/f20/Slog.java`,
+/// OpenJDK 25.0.3+9), against the logger `System.getLogger` actually returns:
+///
+/// ```text
+/// impl class = sun.util.logging.internal.LoggingProviderImpl$JULWrapper
+/// isLoggable(ALL)=false  isLoggable(TRACE)=false  isLoggable(DEBUG)=false
+/// isLoggable(INFO)=true  isLoggable(WARNING)=true isLoggable(ERROR)=true
+/// isLoggable(OFF)=true
+/// ```
+///
+/// `OFF` is **true** there, because JUL's rule is
+/// `level.intValue() >= levelValue && levelValue != offValue` — the `OFF`
+/// exclusion is on the LOGGER's level, not on the argument's, and
+/// `Level.OFF.intValue()` is `Integer.MAX_VALUE`, which clears any threshold.
+/// `SimpleConsoleLogger.isLoggable` (`SimpleConsoleLogger.java:127-131`) is
+/// `level != PlatformLogger.Level.OFF && level.ordinal() >= effectiveLevel.ordinal()`
+/// and answers **false**.
+///
+/// Which one is the oracle for a given CratonVM run depends on whether
+/// `java.logging` is resolved, which this lane could not determine without
+/// running the VM. **The `OFF` arm is therefore left as it is and recorded, not
+/// changed**: flipping it would be right for the stock module graph and wrong
+/// for the strict fallback this file's own
+/// `CRATON_SYSTEM_LOGGER_CLASS` road replaces with a real
+/// `SimpleConsoleLogger`. See
+/// `docs/known-issues/jdk-only/F20-1-the-three-unguarded-rescales-and-the-scale-that-negates-into-a-panic-20260813.md`.
+/// The remaining severity rows above all agree with this body.
 fn system_logger_is_loggable(
     ctx: &mut dyn NativeContext,
     this: Option<ObjectRef>,
@@ -27049,13 +27191,26 @@ fn system_logger_emit(
     level: Option<&Value>,
     message: Option<String>,
     throwable: Option<&Value>,
-) {
+) -> Result<(), MethodCallFailed> {
+    // The null-`Level` NPE is raised BEFORE the message is consulted, because
+    // that is the order both JDK implementations use: the level is
+    // dereferenced by `isLoggable`, which every `log` overload calls first.
+    // Ordering is observable — `log(null, (String) null)` throws on HotSpot and
+    // used to return silently here, since the `message == None` early-return
+    // below came first. See `system_logger_require_level`.
+    system_logger_require_level(level)?;
     let message = match message {
         Some(message) => message,
-        None => return,
+        // MEASURED residual, NOT fixed here: HotSpot publishes a null message
+        // as the text "null" (`log(INFO, (String) null)` printed
+        // `INFO: null`), where this returns without emitting. That is an
+        // output-text divergence with no permission component, and it is
+        // recorded rather than changed because `message: Option<String>` is
+        // this helper's "nothing to say" channel for several callers.
+        None => return Ok(()),
     };
     if !system_logger_is_loggable(ctx, this, level) {
-        return;
+        return Ok(());
     }
     let level_name = system_logger_level_name(ctx, level).unwrap_or_else(|| "INFO".to_string());
     let logger_name = system_logger_name_of(ctx, this);
@@ -27065,6 +27220,7 @@ fn system_logger_emit(
         &format!("[{logger_name}] {message}"),
         throwable,
     );
+    Ok(())
 }
 
 /// The real `java.base` class the strict-mode fallback constructs instead of
@@ -27225,6 +27381,7 @@ fn native_system_logger_is_loggable(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
+    system_logger_require_level(args.get(1))?;
     let loggable = system_logger_is_loggable(ctx, system_logger_this(args), args.get(1));
     Ok(Some(Value::Int(i32::from(loggable))))
 }
@@ -27236,7 +27393,7 @@ fn native_system_logger_log_string(
 ) -> MethodCallResult {
     let this = system_logger_this(args);
     let message = system_logger_text(ctx, args.get(2));
-    system_logger_emit(ctx, this, args.get(1), message, None);
+    system_logger_emit(ctx, this, args.get(1), message, None)?;
     Ok(None)
 }
 
@@ -27255,7 +27412,7 @@ fn native_system_logger_log_string_throwable(
 ) -> MethodCallResult {
     let this = system_logger_this(args);
     let message = system_logger_text(ctx, args.get(2));
-    system_logger_emit(ctx, this, args.get(1), message, args.get(3));
+    system_logger_emit(ctx, this, args.get(1), message, args.get(3))?;
     Ok(None)
 }
 
@@ -27267,7 +27424,7 @@ fn native_system_logger_log_params(
     let this = system_logger_this(args);
     let message = system_logger_text(ctx, args.get(2))
         .map(|message| system_logger_format(ctx, &message, args.get(3)));
-    system_logger_emit(ctx, this, args.get(1), message, None);
+    system_logger_emit(ctx, this, args.get(1), message, None)?;
     Ok(None)
 }
 
@@ -27277,11 +27434,14 @@ fn native_system_logger_log_supplier(
     args: &[Value],
 ) -> MethodCallResult {
     let this = system_logger_this(args);
+    // Before the Supplier is invoked: HotSpot dereferences the level in
+    // `isLoggable` and never reaches `Supplier.get()` for a null level.
+    system_logger_require_level(args.get(1))?;
     if !system_logger_is_loggable(ctx, this, args.get(1)) {
         return Ok(None);
     }
     let message = system_logger_supplier_text(ctx, args.get(2));
-    system_logger_emit(ctx, this, args.get(1), message, None);
+    system_logger_emit(ctx, this, args.get(1), message, None)?;
     Ok(None)
 }
 
@@ -27291,11 +27451,14 @@ fn native_system_logger_log_supplier_throwable(
     args: &[Value],
 ) -> MethodCallResult {
     let this = system_logger_this(args);
+    // Before the Supplier is invoked: HotSpot dereferences the level in
+    // `isLoggable` and never reaches `Supplier.get()` for a null level.
+    system_logger_require_level(args.get(1))?;
     if !system_logger_is_loggable(ctx, this, args.get(1)) {
         return Ok(None);
     }
     let message = system_logger_supplier_text(ctx, args.get(2));
-    system_logger_emit(ctx, this, args.get(1), message, args.get(3));
+    system_logger_emit(ctx, this, args.get(1), message, args.get(3))?;
     Ok(None)
 }
 
@@ -27308,7 +27471,7 @@ fn native_system_logger_log_bundle_throwable(
 ) -> MethodCallResult {
     let this = system_logger_this(args);
     let message = system_logger_text(ctx, args.get(3));
-    system_logger_emit(ctx, this, args.get(1), message, args.get(4));
+    system_logger_emit(ctx, this, args.get(1), message, args.get(4))?;
     Ok(None)
 }
 
@@ -27322,7 +27485,7 @@ fn native_system_logger_log_bundle_params(
     let this = system_logger_this(args);
     let message = system_logger_text(ctx, args.get(3))
         .map(|message| system_logger_format(ctx, &message, args.get(4)));
-    system_logger_emit(ctx, this, args.get(1), message, None);
+    system_logger_emit(ctx, this, args.get(1), message, None)?;
     Ok(None)
 }
 
@@ -34927,6 +35090,52 @@ const BD_INFLATED: i64 = i64::MIN;
 /// `BigDecimal.toString` decimal representation (no exponent — used for
 /// arithmetic, not pretty-printing, so we keep it simple and round-trip-able
 /// through `f64::parse`).
+///
+/// # `scale` is an ARGUMENT, and this signature cannot refuse
+///
+/// `scale` reaches here straight off the object's `scale` field, which
+/// `new BigDecimal(BigInteger, int)` lets a caller set to anything, including
+/// `Integer.MIN_VALUE`. Two consequences, one of which was a guaranteed VM
+/// abort:
+///
+/// 1. **`-scale` overflowed.** The negative-scale branch used to write
+///    `(-scale) as usize`. At `scale == i32::MIN` that is `-i32::MIN`, which
+///    **panics in a debug build** ("attempt to negate with overflow") and in
+///    release wraps back to `i32::MIN`, which then *sign-extends* through
+///    `as usize` to 18446744071562067968 and asks `String::repeat` for it. A
+///    Rust panic is not a Java throwable — it takes the VM down and cannot be
+///    caught. Now `scale.unsigned_abs()`, which is total.
+/// 2. **The remaining size is still `scale`-driven**, and this function
+///    returns a `String`, not a `Result`, so the *refusal* has to be at the
+///    caller. It is not there yet — see the NOMINATION in
+///    `docs/known-issues/jdk-only/F20-1-the-three-unguarded-rescales-and-the-scale-that-negates-into-a-panic-20260813.md`.
+///
+/// ## What HotSpot answers at these boundaries — MEASURED
+///
+/// `openjdk 25.0.3 2026-04-21 LTS (25.0.3+9-LTS)` (Microsoft build) on this
+/// host, `scratchpad/f20/Plain.java`. The reachable caller is
+/// `math_bignum::bd_read` → `BigDecimal.toPlainString()`:
+///
+/// ```text
+/// new BigDecimal(ZERO, MIN).toPlainString() = 0                        [90 ms]
+/// new BigDecimal(ONE,  MIN).toPlainString() !! ArithmeticException: Overflow          [0 ms]
+/// new BigDecimal(ONE,  MAX).toPlainString() !! OutOfMemoryError: too large to fit in a String [0 ms]
+/// ```
+///
+/// Row 1 is why the `unscaled == "0" && scale < 0` short-circuit below is not
+/// an optimisation but the contract: `toPlainString` tests `signum() == 0`
+/// *before* it validates the scale, so a zero value takes any scale. Row 2 is
+/// `checkScaleNonZero(-(long) scale)` — the STATIC form, which always throws,
+/// unlike the instance `checkScale` that `setScale` uses and that exempts a
+/// zero value. Row 3 is a length screen, not an attempted allocation: HotSpot
+/// answers in 0 ms with a 3 GB heap available.
+///
+/// So the two divergences left here are: `scale == i32::MIN` with a nonzero
+/// value, where HotSpot throws `ArithmeticException("Overflow")` and this
+/// returns a ~2 GB string of zeros; and a large positive `scale`, where
+/// HotSpot throws `OutOfMemoryError` immediately and this tries. Neither is a
+/// VM abort any more, which is the part that could be fixed inside this
+/// signature.
 fn apply_scale(unscaled: &str, scale: i32) -> String {
     // A zero value with a POSITIVE scale still renders its fractional zeros:
     // `new BigDecimal("0").setScale(2)` is "0.00", and H2 DECIMAL(p,2) columns
@@ -34952,8 +35161,17 @@ fn apply_scale(unscaled: &str, scale: i32) -> String {
             format!("{}0.{}{}", sign, "0".repeat(pad), abs)
         }
     } else {
-        // Negative scale = trailing zeros.
-        format!("{}{}{}", sign, abs, "0".repeat((-scale) as usize))
+        // Negative scale = trailing zeros. `unsigned_abs`, NOT `-scale`:
+        // `scale` is caller-chosen and `-i32::MIN` is a panic in debug and a
+        // sign-extended 1.8e19 in release. See this function's doc comment.
+        let zeros = scale.unsigned_abs() as usize;
+        let mut out = String::with_capacity(sign.len() + abs.len() + zeros);
+        out.push_str(sign);
+        out.push_str(&abs);
+        for _ in 0..zeros {
+            out.push('0');
+        }
+        out
     }
 }
 
@@ -34989,16 +35207,65 @@ fn bigint_from_i64(v: i64) -> crate::bigint::BigInt {
 /// Multiply an unscaled `BigInt` by `10^n` (n >= 0) — used to align scales for
 /// `add`/`subtract` (BigDecimal rescales the smaller-scale operand up to the
 /// larger scale before adding the unscaled integers).
+///
+/// # `n` comes from an ARGUMENT, and this function cannot refuse
+///
+/// `n` is a difference of two caller-chosen `BigDecimal` scales, so it is
+/// attacker-controlled up to `Integer.MAX_VALUE`. This body used to build the
+/// literal decimal string `"1" + "0"*n` and hand it to `BigInt::from_decimal`:
+/// an `n`-byte `String` (up to ~2 GB from one ordinary call) followed by an
+/// O(n²) digit-at-a-time parse. Both are gone — see below — but the SIZE OF
+/// THE ANSWER is still `n`-driven, and this signature returns a `BigInt`, not
+/// a `Result`, so **the refusal has to be at the call sites**. Every caller
+/// must have run `math_bignum::bd_pow_ten_check(n)?` first. Three had not, as
+/// of 2026-08-13 (lane F20 — see
+/// `docs/known-issues/jdk-only/F20-1-the-three-unguarded-rescales-and-the-scale-that-negates-into-a-panic-20260813.md`):
+/// `native_bd_add`, `native_bd_subtract` and `bd_truncated_bigint`, all in
+/// `native-builtins/src/math_bignum.rs`. `bd_set_scale_impl` is guarded and is
+/// the model.
+///
+/// ## The boundary, MEASURED — do not invent a cap
+///
+/// `BigDecimal`'s own `10^n` factor is `bigTenToThe(n)`, which is
+/// `BigInteger.TEN.pow(n)` for anything past its table, so it inherits
+/// `BigInteger.pow`'s range check verbatim. `bd_pow_ten_check` is that check
+/// specialised to base 10 and nothing more. Its boundary, measured on this
+/// host against `openjdk 25.0.3 2026-04-21 LTS (25.0.3+9-LTS)` (Microsoft
+/// build), `scratchpad/f20/Pow10.java`, `-Xmx48m`:
+///
+/// ```text
+/// TEN.pow(715827881) !! java.lang.OutOfMemoryError: Java heap space              [61916 ms]
+/// TEN.pow(715827882) !! java.lang.OutOfMemoryError: Java heap space              [73069 ms]
+/// TEN.pow(715827883) !! ArithmeticException: BigInteger would overflow supported range [1 ms]
+/// TEN.pow(715827884) !! ArithmeticException: BigInteger would overflow supported range [0 ms]
+/// ```
+///
+/// So the JDK refuses at `n >= 715_827_883` and NOT below it: at 715827882 it
+/// really tries, and a heap big enough would answer. That is exactly
+/// `bd_pow_ten_check`'s predicate (`3n >= Integer.MAX_VALUE`, since 10 has one
+/// trailing zero bit and `bitLength(5) == 3`). A guessed cap anywhere under
+/// 715827883 would refuse where HotSpot succeeds, which is a fresh divergence
+/// and worse than the DoS it removes.
+///
+/// ## Why the string is gone
+///
+/// `10^n` is now `(5^n) << n`, which is not a rewrite of the JDK's algorithm
+/// but *literally* the JDK's algorithm: `BigInteger.pow` factors
+/// `2^getLowestSetBit()` out of the base, exponentiates the odd part by
+/// repeated squaring and shifts the powers of two back at the end — see
+/// [`bi_pow_check_range`]'s doc comment, which already relies on that
+/// factorisation to bound the answer's bit length. For base 10 that is
+/// `10 = 2·5`, so `TEN.pow(n)` computes `5^n << n`. Reusing [`bigint_pow5`]
+/// keeps it to one square-and-multiply loop in this file rather than a second
+/// copy of one.
 fn bigint_mul_pow10(bi: &crate::bigint::BigInt, n: i32) -> crate::bigint::BigInt {
     if n <= 0 {
         return bi.clone();
     }
-    let mut p = String::with_capacity(1 + n as usize);
-    p.push('1');
-    for _ in 0..n {
-        p.push('0');
-    }
-    bi.mul(&crate::bigint::BigInt::from_decimal(&p))
+    // `BigInteger.TEN.pow(n)` == `5^n << n`. No `n`-byte String, no O(n²)
+    // decimal parse; the remaining cost is the multiplication itself, which is
+    // the cost of the answer and not of the argument's spelling.
+    bi.mul(&bigint_pow5(n as u32).shl(n as u32))
 }
 
 /// Low `bits` of a `BigInt`'s two's-complement representation — the
@@ -36341,8 +36608,22 @@ fn native_level_clinit(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCa
     Ok(None)
 }
 
-const LOGGER_FIELD_NAME: usize = 0;
-const LOGGER_FIELD_LEVEL: usize = 1;
+// `java/util/logging/Logger` has exactly ONE slot map in this VM and it is
+// `crate::logmanager::LOGGER_FIELD_*` (name 2, parent 8, level 12), matching
+// the declaration at `class_manager.rs:14191`. A second, local
+// `LOGGER_FIELD_NAME = 0` / `LOGGER_FIELD_LEVEL = 1` used to live here and was
+// read by the four bodies below; it named `config: Logger$ConfigurationData`
+// and `manager: LogManager`, so a name `String` went into the config slot and
+// a `Level` into the manager slot. Nothing ever asserted, because `Logger` IS
+// declared and `try_alloc_concurrent_synthetic`'s `num_fields.max(real)`
+// clamped every 3-slot ask up to 13 — the clamp protects the heap, not the
+// field's identity. Do not reintroduce a local Logger slot constant here —
+// every Logger slot access in this file names the `logmanager` constants.
+//
+// `LEVEL_FIELD_*` below is a DIFFERENT class and stays: those are
+// `java/util/logging/Level`'s own `name`/`value`, they match the real class,
+// and `native_level_init` is registered by
+// `register_essential_natives_with_shims` — live in every mode.
 const LEVEL_FIELD_NAME: usize = 0;
 const LEVEL_FIELD_VALUE: usize = 1;
 
@@ -36370,25 +36651,37 @@ fn native_level_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     Ok(None)
 }
 
+/// `Logger.getLogger(String)`, delegating to the one JUL Logger producer.
+///
+/// Registered only from `logging_shims::register_logging_natives`, which is
+/// shadowed one call later by `register_slf4j_natives` (`lib.rs:24012`) and
+/// again by `logmanager::register_logmanager_natives` (`:24357`) — so this is
+/// unreachable through the registry today. It is corrected rather than left
+/// alone because "currently shadowed" is a registration-ORDER property, and the
+/// map it used to mint (a 3-slot Logger with the name in `config` and an INFO
+/// `Level` in `manager`) is one reorder away from being handed to readers that
+/// index slots 2/8/12. See NOM F3-2 for the paired removal.
+///
+/// `get_or_create_logger` is also the only producer that caches by name,
+/// links `parent`, and pins across the allocating steps.
 fn native_logger_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let logger = try_alloc_concurrent_synthetic(ctx, "java/util/logging/Logger", 3)?;
-    ctx.set_field(
-        logger,
-        LOGGER_FIELD_NAME,
-        args.first().copied().unwrap_or(Value::Object(None)),
-    );
-    let info = alloc_level(ctx, "INFO", 800);
-    ctx.set_field(logger, LOGGER_FIELD_LEVEL, Value::Object(Some(info?)));
-    Ok(Some(Value::Object(Some(logger))))
+    let name = match args.first() {
+        Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
+        _ => String::new(),
+    };
+    Ok(Some(Value::Object(Some(
+        crate::logmanager::get_or_create_logger(ctx, &name)?,
+    ))))
 }
 
+/// `Logger.getGlobal()` — `java.util.logging.Logger.GLOBAL_LOGGER_NAME` is
+/// `"global"`, and the JDK returns the SAME object as
+/// `Logger.getLogger("global")`. Going through `get_or_create_logger` is what
+/// makes that identity hold here; minting a fresh Logger per call did not.
 fn native_logger_get_global(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    let name = ctx.create_string("global");
-    let logger = try_alloc_concurrent_synthetic(ctx, "java/util/logging/Logger", 3)?;
-    ctx.set_field(logger, LOGGER_FIELD_NAME, Value::Object(Some(name)));
-    let info = alloc_level(ctx, "INFO", 800);
-    ctx.set_field(logger, LOGGER_FIELD_LEVEL, Value::Object(Some(info?)));
-    Ok(Some(Value::Object(Some(logger))))
+    Ok(Some(Value::Object(Some(
+        crate::logmanager::get_or_create_logger(ctx, "global")?,
+    ))))
 }
 
 /// `Logger.getName()`, third of the three registrations for this triple.
@@ -36410,12 +36703,26 @@ fn native_logger_get_name(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
     ))
 }
 
+/// `Logger.getLevel()` — reads the ONE level slot,
+/// `logmanager::LOGGER_FIELD_LEVEL` (12), which is where `setLevel`
+/// (`lib.rs:17613`), `allocate_logger` and `register_slf4j_natives` all write.
+/// It used to read slot 1, i.e. `manager: LogManager`.
+///
+/// The width guard mirrors `logmanager::native_jul_logger_is_loggable`:
+/// `Heap::get_field` asserts `index < num_slots`, and a Logger narrower than
+/// the declaration can still arrive from a bytecode `new` in a mode that sizes
+/// from a stub. Answering `null` there is the JDK's own "no explicit level".
 fn native_logger_get_level(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
     };
-    Ok(Some(ctx.get_field(this, LOGGER_FIELD_LEVEL)))
+    if ctx.object_num_fields(this) <= crate::logmanager::LOGGER_FIELD_LEVEL {
+        return Ok(Some(Value::Object(None)));
+    }
+    Ok(Some(
+        ctx.get_field(this, crate::logmanager::LOGGER_FIELD_LEVEL),
+    ))
 }
 
 fn native_logger_log(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -36424,8 +36731,20 @@ fn native_logger_log(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
 }
 
 /// Log a message only if the logger's current level allows `method_level`.
-/// Compares current level (read from LOGGER_FIELD_LEVEL field 1) against the
-/// method's inherent level (SEVERE=1000 .. FINEST=300).
+///
+/// Compares the logger's configured level — `logmanager::LOGGER_FIELD_LEVEL`
+/// (12), the slot every writer in the tree uses — against the method's
+/// inherent level (SEVERE=1000 .. FINEST=300). The doc line here used to say
+/// "field 1", which was `manager: LogManager`: this read a `LogManager`
+/// reference and asked it for `LEVEL_FIELD_VALUE`, so the threshold silently
+/// stayed at the INFO default and `setLevel(SEVERE)` suppressed nothing.
+///
+/// The slot holds EITHER a `Level` reference or a raw `Int` (an older
+/// `setLevel` stored the decoded int); both shapes are decoded, exactly as
+/// `logmanager::native_jul_logger_is_loggable` does. `LEVEL_FIELD_VALUE` = 1 is
+/// right for both `Level` layouts — the real class is `name` 0, `value` 1
+/// (measured with `javap -p java.util.logging.Level` on JDK 25), and the VM's
+/// 2-slot synthetic `Level` is a prefix of it.
 fn native_logger_log_if(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -36435,9 +36754,19 @@ fn native_logger_log_if(
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(None),
     };
-    let current = match ctx.get_field(this, LOGGER_FIELD_LEVEL) {
-        Value::Object(Some(l)) => ctx.get_field(l, LEVEL_FIELD_VALUE).as_int().unwrap_or(800),
-        _ => 800, // default INFO
+    // `Heap::get_field` asserts `index < num_slots`; a Logger narrower than the
+    // declaration keeps the JDK default instead of aborting the VM.
+    let current = if ctx.object_num_fields(this) <= crate::logmanager::LOGGER_FIELD_LEVEL {
+        800
+    } else {
+        match ctx.get_field(this, crate::logmanager::LOGGER_FIELD_LEVEL) {
+            Value::Int(v) => v,
+            Value::Object(Some(l)) if ctx.object_num_fields(l) > LEVEL_FIELD_VALUE => ctx
+                .get_field(l, LEVEL_FIELD_VALUE)
+                .as_int()
+                .unwrap_or(800),
+            _ => 800, // no explicit level — the JDK default is INFO
+        }
     };
     if method_level < current {
         return Ok(None); // filter out — level is below logger threshold
@@ -40874,6 +41203,56 @@ fn native_array_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     // For char[] we must return Character, for byte[] Byte, etc. — otherwise
     // the JDK code that unboxes via Character.charValue() / Byte.byteValue()
     // would receive an Integer and fail type-checks.
+    //
+    // DO NOT DEDUPLICATE THE EIGHT ARMS BELOW ONTO THE CACHED BOXING HELPER.
+    // `lang_class::box_value_canonical` exists and routes `I J Z B S C` into
+    // the six `X.valueOf` caches; three reflective call sites take it
+    // (`Field.get`, `Method.invoke`'s return, `SerializedLambda`'s captured
+    // args) because HotSpot answers the CANONICAL box on those paths.
+    // `Array.get` is the one reflective path that does NOT, and allocating
+    // fresh here is the contract, not an oversight.
+    //
+    // The JDK's reason: since JDK 18 `Field.get`/`Method.invoke` run on
+    // `MethodHandle` accessors (`MethodHandleAccessorFactory`) whose boxing
+    // step is a direct handle to `X.valueOf`, so they inherit `IntegerCache`
+    // and friends for free. `java.lang.reflect.Array.get` is a VM native,
+    // `Reflection::array_get`, which boxes with
+    // `java_lang_boxing_object::create` — a function that allocates and has
+    // never consulted a cache. That is an implementation detail of the JDK
+    // and it is nonetheless OBSERVABLE, so it is behaviour we must match.
+    //
+    // MEASURED on this host, `openjdk 25.0.3 2026-04-21 LTS (25.0.3+9-LTS)`
+    // (Microsoft build), `scratchpad/f20/ArrGet.java` — lane F20 re-took these
+    // rather than inherit them from lane F11's 70-row table
+    // (docs/known-issues/jdk-only/F11-1-reflective-boxing-is-canonical-everywhere-except-array-get.md):
+    //
+    //   Array.get int[]      == Integer.valueOf(7)   : false
+    //   Array.get char[]     == Character.valueOf(a) : false
+    //   Array.get byte[]     == Byte.valueOf(3)      : false
+    //   Array.get short[]    == Short.valueOf(9)     : false
+    //   Array.get long[]     == Long.valueOf(5)      : false
+    //   Array.get boolean[]  == Boolean.TRUE         : false
+    //   Array.get boolean[]  == Boolean.FALSE        : false
+    //   Array.get int[] twice self-identity          : false
+    //   Array.get int[] equals Integer.valueOf(7)    : true      <- see below
+    //   Integer.valueOf(Array.getInt(ia,0)) == Integer.valueOf(7): true
+    //   Field.get int        == Integer.valueOf(7)   : true      <- the contrast
+    //   Method.invoke ()I    == Integer.valueOf(7)   : true      <- the contrast
+    //
+    // Two rows carry the whole warning. `Array.get` is not even SELF-identical
+    // across two calls on the same element, so "returns the canonical box" is
+    // not merely unspecified here, it is false. And every fresh row is still
+    // `.equals`-equal, so no equality-shaped assertion — which is what almost
+    // every reflective test in this tree writes — can see a dedup that breaks
+    // this. The `Boolean` arm is the sharpest edge: `Boolean.TRUE` identity is
+    // exactly what `native_boolean_value_of`'s own comment documents Xerces'
+    // `XML11Configuration.configurePipeline()` relying on, so a "helpful"
+    // rewrite of that arm onto the cache would be right for every OTHER boxing
+    // caller in this tree and wrong here.
+    //
+    // The sibling `Array.getInt`/`getChar`/… return bare primitives and never
+    // box at all; the caller's own `valueOf` is what makes the control row
+    // above canonical. Do not conflate the two families.
     match elem {
         ArrayElementType::Boolean => {
             let v = match val {
@@ -42372,6 +42751,84 @@ fn register_formatter_natives(r: &mut NativeMethodRegistry) {
     r.set_category(__prev_cat);
 }
 
+/// The `Locale` a `java.util.Formatter` constructed WITHOUT one carries — for
+/// the four natives that shadow those constructors.
+///
+/// # Why the slot may not be left null
+///
+/// `Formatter()` is `this(Locale.getDefault(Locale.Category.FORMAT), new
+/// StringBuilder())` and `Formatter(Appendable)` is
+/// `this(Locale.getDefault(Locale.Category.FORMAT), a)`. Both natives wrote
+/// `null` there instead, and `format` reads that slot and hands it to
+/// `lang_string::native_string_format_locale`, which sees an EXPLICIT null —
+/// a request `java.util.Formatter` answers differently from "no locale given"
+/// in three separate places (ASCII separators, `Locale.US` date names,
+/// `Locale.US` zone names). Two different requests collapsed onto one value, so
+/// no amount of correctness at the reading end can separate them.
+///
+/// Measured on HotSpot 25 with `-Duser.language=tr -Duser.country=TR`, which is
+/// what makes the two visible at all:
+///
+/// | expression | HotSpot 25 |
+/// |---|---|
+/// | `new Formatter(sb).format("%tb", d)` | `Kas` |
+/// | `new Formatter(sb, (Locale) null).format("%tb", d)` | `Nov` |
+/// | `new Formatter().format("%,d", 1234567)` | `1.234.567` |
+/// | `String.format((Locale) null, "%,d", 1234567)` | `1,234,567` |
+/// | `new Formatter(sb).locale()` | `tr_TR` |
+/// | `new Formatter(sb, (Locale) null).locale()` | `null` |
+///
+/// The last pair is the proof that the JDK stores a real `Locale` in the field
+/// rather than deciding late: `locale()` is a plain field read.
+///
+/// # Three rungs, each degrading to the one below
+///
+/// 1. `Locale.getDefault(Locale.Category.FORMAT)` — the category the JDK's own
+///    constructors ask for, and the one that can differ from the base default
+///    when `user.language.format` is set or `setDefault(FORMAT, l)` has run.
+///    The `Locale$Category.FORMAT` constant is READ as a static field and the
+///    overload is called only if that read produced an object: real
+///    `Locale.getDefault(Category)` opens with `Objects.requireNonNull`, so
+///    handing it a null would trade a wrong locale for an NPE.
+/// 2. `Locale.getDefault()` — the base default.
+/// 3. `null`, i.e. exactly the previous behaviour. A VM with no reachable
+///    `java.util.Locale` (synthetic-JDK configurations that do not register
+///    one) keeps the answers it had rather than failing construction.
+///
+/// Nothing here FABRICATES a `Locale`. `locale_bootstrap` already overrides
+/// both `getDefault` overloads with a cached, stable-identity object resolved
+/// from `user.language`/`user.country`, so rung 1 runs a native rather than the
+/// JDK adapter chain — which is also why it cannot re-enter `String.format`.
+fn formatter_default_locale(ctx: &mut dyn NativeContext) -> Value {
+    let mut category: Option<ObjectRef> = None;
+    if let Some(cid) = ctx.class_id_by_name("java/util/Locale$Category") {
+        if let Some(idx) = ctx.static_field_index_by_name(cid, "FORMAT") {
+            if let Value::Object(Some(o)) = ctx.get_static_field(cid, idx) {
+                category = Some(o);
+            }
+        }
+    }
+    if let Some(cat) = category {
+        if let Ok(Some(v @ Value::Object(Some(_)))) = ctx.invoke(
+            "java/util/Locale",
+            "getDefault",
+            "(Ljava/util/Locale$Category;)Ljava/util/Locale;",
+            &[Value::Object(Some(cat))],
+        ) {
+            return v;
+        }
+    }
+    match ctx.invoke(
+        "java/util/Locale",
+        "getDefault",
+        "()Ljava/util/Locale;",
+        &[],
+    ) {
+        Ok(Some(v @ Value::Object(Some(_)))) => v,
+        _ => Value::Object(None),
+    }
+}
+
 fn native_formatter_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
@@ -42380,7 +42837,16 @@ fn native_formatter_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     // Store content as a plain string (field 0)
     let empty = ctx.create_string("");
     ctx.set_field(this, 0, Value::Object(Some(empty)));
-    ctx.set_field(this, 1, Value::Object(None));
+    // Slot 1 is the DEFAULT format locale, not null — see
+    // [`formatter_default_locale`]. Resolving it runs Java code, so the
+    // receiver is pinned across the call: `format` two functions down pins for
+    // exactly this reason. Slot 0 is written FIRST so the string just created
+    // is reachable from `this` (and therefore rooted) while that runs.
+    let pin = ctx.pin_native_root(this);
+    let locale = formatter_default_locale(ctx);
+    let this = ctx.read_native_pin(pin, this);
+    ctx.unpin_native_roots(pin);
+    ctx.set_field(this, 1, locale);
     Ok(None)
 }
 
@@ -42394,7 +42860,12 @@ fn native_formatter_init_appendable(
     };
     let appendable = args.get(1).copied().unwrap_or(Value::Object(None));
     ctx.set_field(this, 0, appendable);
-    ctx.set_field(this, 1, Value::Object(None));
+    // See the `()V` constructor above: slot 1 is the DEFAULT format locale.
+    let pin = ctx.pin_native_root(this);
+    let locale = formatter_default_locale(ctx);
+    let this = ctx.read_native_pin(pin, this);
+    ctx.unpin_native_roots(pin);
+    ctx.set_field(this, 1, locale);
     Ok(None)
 }
 
@@ -42470,6 +42941,44 @@ fn native_formatter_format(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
     Ok(Some(Value::Object(Some(this))))
 }
 
+/// `Formatter.toString()`'s body, which is `a.toString()` on the sink in
+/// slot 0 — for the two registrars that each carried a copy of it.
+///
+/// # `read_string` alone is a defaulting reader
+///
+/// Both copies were `ctx.read_string(sink).unwrap_or_default()`.
+/// `NativeContext::read_string` returns `None` for any object whose class is
+/// known and is not `java/lang/String` (vm_exec.rs, a deliberate guard against
+/// the structural reader decoding a `StringBuilder`'s full char[] capacity), so
+/// `unwrap_or_default()` turned every non-`String` sink into the EMPTY STRING —
+/// a plausible answer, silently wrong, and reached by the single most ordinary
+/// use of the class:
+///
+/// | expression | HotSpot 25 | CratonVM before |
+/// |---|---|---|
+/// | `new Formatter(sb).format("%d",42).toString()` | `42` | `` (empty) |
+/// | `new Formatter().format("%d",1).toString()` | `1` | `1` |
+///
+/// The second row is why it survived: the `()V` native writes a real `String`
+/// into slot 0, so only the `Appendable`-taking constructors — the ones whose
+/// sink is the caller's — could show it. `format` itself was never affected;
+/// its own `read_string` miss falls through to `invoke_virtual(sink, "append",
+/// …)`, which works, so the text really is in the caller's `StringBuilder` and
+/// only the `Formatter`'s own view of it was empty.
+///
+/// The fallback is `toString()` on the sink, which is what the JDK does and
+/// what every `Appendable` implements. A sink that answers nothing at all still
+/// degrades to the empty string, which is the previous behaviour.
+fn formatter_sink_text(ctx: &mut dyn NativeContext, sink: ObjectRef) -> Value {
+    if let Some(s) = ctx.read_string(sink) {
+        return Value::Object(Some(ctx.create_string(&s)));
+    }
+    match ctx.invoke_virtual(sink, "toString", "()Ljava/lang/String;", &[]) {
+        Ok(Some(v @ Value::Object(Some(_)))) => v,
+        _ => Value::Object(Some(ctx.create_string(""))),
+    }
+}
+
 fn native_formatter_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
@@ -42477,10 +42986,7 @@ fn native_formatter_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
     };
     let sb = ctx.get_field(this, 0);
     match sb {
-        Value::Object(Some(o)) => {
-            let s = ctx.read_string(o).unwrap_or_default();
-            Ok(Some(Value::Object(Some(ctx.create_string(&s)))))
-        }
+        Value::Object(Some(o)) => Ok(Some(formatter_sink_text(ctx, o))),
         _ => Ok(Some(Value::Object(Some(ctx.create_string(""))))),
     }
 }

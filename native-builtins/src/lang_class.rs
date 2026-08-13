@@ -6637,7 +6637,38 @@ pub(crate) fn native_field_get(ctx: &mut dyn NativeContext, args: &[Value]) -> M
 /// otherwise cross `Field.get(Object)` as the wrong `Value` variant. The
 /// ordinary numeric-wrapper paths already handle the one-word primitive
 /// descriptors directly.
-fn coerce_reflective_field_value(value: Value, descriptor: &str) -> Value {
+///
+/// # Two callers, one rule
+///
+/// `pub(crate)` because the VarHandle field path in `lang_invoke.rs` needs
+/// exactly this and nothing weaker. `ctx.get_static_field` and `ctx.get_field`
+/// are as raw there as they are here, and MEASURED on OpenJDK 25.0.3+9
+/// (`scratchpad/f29/VhLong.java`, identical under `-Xint`) the two paths agree
+/// row for row:
+///
+/// ```text
+/// field.long        = java.lang.Long,   value 5,   id true
+/// vh.fieldLong      = java.lang.Long,   value 5,   id true
+/// vh.getAndSetLong  = java.lang.Long,   value 5,   id true
+/// vh.fieldDouble    = java.lang.Double, value 1.5, id FALSE
+/// ```
+///
+/// The direction is this one: **widen first, box canonically second.** The
+/// reverse has no meaning, and "box canonically without widening" produces a
+/// `Long` wrapper whose slot holds compact-`Int` bits — a wrong ANSWER rather
+/// than a wrong identity.
+///
+/// # The lookalike in `lang_invoke.rs` that must NOT be substituted
+///
+/// That file has its own `widen_primitive_to_descriptor`, and the two are not
+/// interchangeable. It converts NUMERICALLY —
+/// `(DESC_DOUBLE, Value::Long(l)) => Value::Double(l as f64)` — where a field
+/// slot must be REINTERPRETED: a `double` field holding `1.5` presents its
+/// raw bits as `Value::Long(4_609_434_218_613_702_656)`, which this function
+/// answers `1.5` and the numeric widener answers `4.609e18`. Same shape,
+/// different operation, and the wrong one is silent. That is why the VarHandle
+/// arms call across to here instead of growing a second widener locally.
+pub(crate) fn coerce_reflective_field_value(value: Value, descriptor: &str) -> Value {
     match descriptor.as_bytes().first().copied() {
         Some(b'J') => match value {
             Value::Long(_) => value,

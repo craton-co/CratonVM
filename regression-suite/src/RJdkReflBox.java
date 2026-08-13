@@ -54,9 +54,12 @@ import java.nio.ByteOrder;
  *
  * <h2>Every expected value was MEASURED on the oracle</h2>
  *
- * <p>All 102 expectations come from {@code scratchpad/f19/ReflBoxOracle.java} run on Microsoft
- * OpenJDK 25.0.3+9 (build 25.0.3+9-LTS). The transcript is §2 of
- * {@code docs/known-issues/jdk-only/F19-1-the-sixteen-that-allocated-and-the-boolean-that-was-not-TRUE-20260813.md}.
+ * <p>All 107 expectations come from {@code scratchpad/f19/ReflBoxOracle.java} run on Microsoft
+ * OpenJDK 25.0.3+9 (build 25.0.3+9-LTS), except the four {@code mhcollc}/{@code mhcolll} rows,
+ * which come from {@code scratchpad/f29/CollBox2.java} §G and were re-measured in place by lane
+ * F39 by running this whole class on the same oracle. The transcripts are §2 of
+ * {@code docs/known-issues/jdk-only/F19-1-the-sixteen-that-allocated-and-the-boolean-that-was-not-TRUE-20260813.md}
+ * and §2 of {@code docs/known-issues/jdk-only/F29-1-the-wrapper-class-comes-from-the-call-site-not-the-methodtype-20260813.md}.
  * Nothing here was typed from memory or inferred from the JDK sources. The oracle output was
  * byte-identical across three runs, under {@code -Xint}, and under
  * {@code -XX:-UseCompressedOops} — so no row is a JIT or a heap-layout artefact.
@@ -394,16 +397,27 @@ public class RJdkReflBox {
 
     // ---- 7. MethodHandle collector / varargs element boxing -----------------
     //
-    // Deliberately narrow: `int` and `long` only. The `char` and `boolean`
-    // element rows are ALSO canonical on HotSpot (measured: mhcoll.char and
-    // mhcoll.bool are both true) but they ask a second question this file is
-    // not the gate for — which WRAPPER CLASS the element gets — and CratonVM
-    // answers that one wrong for a separate, nominated reason: the collector
-    // arm picks the wrapper from the VM `Value` variant, and boolean / char /
-    // byte / short all share one variant with int. Adding those rows here
-    // would make this vector red for a defect it is not measuring. They are
-    // written out in F19-1 N2 with the measurement, ready to move here once
-    // the wrapper-class question is answered.
+    // Two different questions live here and the split between them is not the
+    // one F19-1 N2 drew. That record said the wrapper CLASS comes from the
+    // target handle's `MethodType`; F29-1 §1 MEASURED that it does not —
+    // `coll.type()` is `(Object)Object` and one such handle produces six
+    // different wrapper classes. The class comes from the CALL SITE's static
+    // parameter type, which `asType` boxes by.
+    //
+    // So the rows here divide by whether the call site is recoverable:
+    //
+    //   * a WRAPPER-TYPED component (`Character[]`, `Long[]`) settles the
+    //     class at the collector arm itself, and HotSpot answers every
+    //     cross-type call to such a collector with a
+    //     `WrongMethodTypeException` (F29-1 §2), so for every call that runs
+    //     at all the component IS the answer. Those rows are below.
+    //   * an `Object[]` component settles nothing, and CratonVM cannot see
+    //     the call-site descriptor from a native at all (F29-1 §2.3 /
+    //     NOMINATION 2). `mhcoll.char`, `mhcoll.bool` and `mhvar.char` are
+    //     ALSO canonical on HotSpot — measured — and are written out verbatim
+    //     in F29-1 NOMINATION 4b, held back because they would be red for a
+    //     defect this file is not the gate for. They move here, and this
+    //     family's denominator moves 8 → 11, when NOMINATION 2 lands.
 
     static void mhcollect() throws Throwable {
         MethodHandles.Lookup lk = MethodHandles.lookup();
@@ -415,7 +429,35 @@ public class RJdkReflBox {
         ck("mhcolloob.int1000", coll.invoke(I1000) == Integer.valueOf(I1000), false);
         MethodHandle var = idn.asVarargsCollector(Object[].class);
         ck("mhvar.int", var.invoke(I7) == Integer.valueOf(I7), true);
-        sectionEnd("mhcollect", 4);
+
+        // The wrapper CLASS, which is a different question from the identity
+        // and is settled by the component here. MEASURED on HotSpot 25.0.3+9
+        // (F29-1 §2). `instanceof` rather than `getClass().getName().equals`:
+        // the dialect wants one boolean observable per CK line, and
+        // `instanceof` is the narrowest thing that fails when the VM boxes a
+        // `char` as an `Integer`. The `Id` row beside it keeps the identity
+        // question asserted — neither row stands in for the other, and a VM
+        // could pass either one alone.
+        MethodHandle collC = lk.findStatic(RJdkReflBox.class, "firstOfChar",
+                MethodType.methodType(Object.class, Character[].class))
+                .asCollector(Character[].class, 1);
+        ck("mhcollc.charClass", collC.invoke(CA) instanceof Character, true);
+        ck("mhcollc.charId", collC.invoke(CA) == Character.valueOf(CA), true);
+        MethodHandle collL = lk.findStatic(RJdkReflBox.class, "firstOfLong",
+                MethodType.methodType(Object.class, Long[].class))
+                .asCollector(Long[].class, 1);
+        ck("mhcolll.longClass", collL.invoke(J5) instanceof Long, true);
+        ck("mhcolll.longId", collL.invoke(J5) == Long.valueOf(J5), true);
+        sectionEnd("mhcollect", 8);
+    }
+
+    /** Wrapper-typed collector targets — see the family header above. */
+    public static Object firstOfChar(Character[] xs) {
+        return xs[0];
+    }
+
+    public static Object firstOfLong(Long[] xs) {
+        return xs[0];
     }
 
     // ---- 8. VarHandle, every shape ------------------------------------------
@@ -453,6 +495,16 @@ public class RJdkReflBox {
         // Read-modify-write: the value handed BACK is the old one, boxed.
         Holder rmw = new Holder();
         ck("vh.getAndSetInt", ((Object) vi.getAndSet(rmw, 42)) == Integer.valueOf(I7), true);
+        // The `long` twin of the row above, and NOT a duplicate of it. The
+        // RMW funnel is a fourth boxing site beside `VarHandle.get`'s three
+        // field arms, and a fix that reads only `get` leaves it behind — three
+        // of four looks like the whole set. `long` is the width that exposes
+        // it: the raw slot can present as a compact int, so the wrapper comes
+        // back carrying the wrong bits, which no `int` row can see. MEASURED
+        // on HotSpot 25.0.3+9 (F29-1 §4): vh.getAndSetLong hands back 5, and
+        // it is `== Long.valueOf(5)`.
+        Holder rmwJ = new Holder();
+        ck("vh.getAndSetLong", ((Object) vj.getAndSet(rmwJ, 42L)) == Long.valueOf(J5), true);
         Holder rmw2 = new Holder();
         ck("vh.compareAndExchangeInt",
                 ((Object) vi.compareAndExchange(rmw2, 7, 42)) == Integer.valueOf(I7), true);
@@ -476,7 +528,7 @@ public class RJdkReflBox {
         VarHandle bvl = MethodHandles.byteArrayViewVarHandle(long[].class, ByteOrder.LITTLE_ENDIAN);
         byte[] raw8 = new byte[] {5, 0, 0, 0, 0, 0, 0, 0};
         ck("vh.byteViewLong", ((Object) bvl.get(raw8, 0)) == Long.valueOf(J5), true);
-        sectionEnd("varhandle", 20);
+        sectionEnd("varhandle", 21);
     }
 
     // ---- 9. FFM layout VarHandle --------------------------------------------

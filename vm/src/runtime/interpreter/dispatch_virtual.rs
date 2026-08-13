@@ -475,7 +475,6 @@ pub(super) fn execute_invokevirtual_vtable_fast(
             // inner one blocks.
             {
                 const MAX_DEPTH: usize = 32;
-                const PROXY_INSTANCE: &str = "java/lang/reflect/Proxy$Instance";
                 let mut current = Some(receiver_class_id);
                 let mut is_proxy = false;
                 for _ in 0..MAX_DEPTH {
@@ -487,7 +486,20 @@ pub(super) fn execute_invokevirtual_vtable_fast(
                         Some(c) => c,
                         None => break,
                     };
-                    if &*class.name == PROXY_INSTANCE {
+                    // `class_name_is_proxy_super`, NOT a local
+                    // `Proxy$Instance` literal. The super of a generated
+                    // `$ProxyN` is `java/lang/reflect/Proxy` by default
+                    // (`CRATONVM_REAL_PROXY_SUPER` is truthy-default-true),
+                    // so a one-name test recognises no shipped proxy and
+                    // this guard never fired between 2026-07-02 and
+                    // 2026-08-13 — see, under docs/known-issues/jdk-only/,
+                    // F32-1-the-proxy-route-and-the-drifted-twin-20260813.md.
+                    // The shared predicate is name-only and takes NO lock,
+                    // which is what makes it callable under the `cm` guard
+                    // this block holds (a nested second read self-deadlocks
+                    // under parking_lot's writer-preferring fairness — the
+                    // original reason this walk was inlined at all).
+                    if class_name_is_proxy_super(&class.name) {
                         is_proxy = true;
                         break;
                     }
