@@ -1,6 +1,21 @@
 # `TestLob` fails past the LOB pipe-stream fix: `MVStoreException: Chunk N not found` and `OverlappingFileLockException`
 
 ## Status
+
+**HotSpot control, 2026-08-10 — the H2 race fires on stock HotSpot too.**
+This page attributes symptom 1 to a real H2-level chunk-reclaim race "made
+practically reachable by CratonVM's documented raw interpreter-throughput gap".
+A stock HotSpot 25 control over the H2 non-passing set on the same host, same
+build, same classpath, same 300 s cap now shows **HotSpot failing `TestLob`
+with the same `MVStoreException: Chunk 6 not found`**. So the race does not
+need CratonVM's throughput gap to be reachable — it is reachable on this host
+under load on the reference VM. That strengthens the page's conclusion (not a
+CratonVM defect) and weakens only its explanation of *why* it shows up. Caveat
+worth carrying: that control shared the host with three concurrent CratonVM
+suite runs, so it establishes "reachable under load on HotSpot", not
+"reachable on an idle HotSpot".
+See `internal/fixed-suite-bugs/h2-suite-bugs/gc-variant-fullsuite-crashes-hangs-fails-20260810-FIXED.md` §4.
+
 **CLOSED (2026-07-23 follow-up session) — both symptoms are now understood
 to be the SAME underlying H2-level mechanism, and are not open CratonVM
 defects.** One genuine, independent CratonVM bug was found and FIXED along
@@ -15,7 +30,7 @@ it for history.
    regard for an in-progress multi-page traversal still needing other
    data in that chunk), made practically reachable by CratonVM's
    documented raw interpreter-throughput gap vs HotSpot (see
-   `bug-h2-mvstore-insert-loop-perf-hang.md`) rather than a CratonVM
+   `bug-h2-mvstore-insert-loop-perf-hang-RESOLVED-20260807.md`) rather than a CratonVM
    defect to fix directly. Tracked as a known limitation — see "Confirmed
    root cause" below for the full analysis, and that section for what
    would need to change (H2 upstream, or closing CratonVM's general perf
@@ -279,7 +294,7 @@ chunk id, the exact serialized metadata string, and an immediate
   presumably present on HotSpot too in principle, but likely never
   wins there because HotSpot's rollback traversal is fast enough
   (matching the *raw interpreter throughput gap* documented in
-  `bug-h2-mvstore-insert-loop-perf-hang.md` — same general "CratonVM is
+  `bug-h2-mvstore-insert-loop-perf-hang-RESOLVED-20260807.md` — same general "CratonVM is
   slow enough to blow open a race window that's negligible on HotSpot"
   theme as this session's earlier, now-fixed FileChannel bugs, just a
   different specific mechanism).
@@ -300,7 +315,7 @@ chunk id, the exact serialized metadata string, and an immediate
   too in principle, but the rollback traversal there is fast enough
   that the background reclaim mechanism essentially never wins the
   race in practice; CratonVM's raw interpreter-throughput gap
-  (documented in `bug-h2-mvstore-insert-loop-perf-hang.md` — the same
+  (documented in `bug-h2-mvstore-insert-loop-perf-hang-RESOLVED-20260807.md` — the same
   workload class, MVStore per-operation overhead) is wide enough to
   flip the odds. **Not something to "fix" directly in CratonVM** short
   of closing that general performance gap or an upstream H2 fix to its
@@ -551,7 +566,7 @@ CratonVM's documented interpreter-throughput gap widening the window).
 `Database.java` is out of scope for a CratonVM fix (and `apps/h2database`
 isn't part of this repo regardless, per `.gitignore`); the one concrete,
 CratonVM-side action item (closing the general interpreter-throughput
-gap) is already tracked separately in `bug-h2-mvstore-insert-loop-perf-hang.md`.
+gap) is already tracked separately in `bug-h2-mvstore-insert-loop-perf-hang-RESOLVED-20260807.md`.
 
 **Disposition**: both documented symptoms are CLOSED as understood,
 non-CratonVM-bug H2-level limitations. The one genuine CratonVM defect
@@ -569,7 +584,7 @@ shadowing) is fixed and merged.
   this ruled out first).
 - The class passes on HotSpot JDK 25 (per the parent doc's original
   Cluster A description) — CratonVM-specific.
-- Checked `bug-h2-mvstore-insert-loop-perf-hang.md` for a shared root
+- Checked `bug-h2-mvstore-insert-loop-perf-hang-RESOLVED-20260807.md` for a shared root
   cause (its own "Related" section asked whoever picks this up to check)
   — **not the same root cause**. That doc is pure per-operation
   interpreter throughput (`TransactionMap`/`MVMap.operate` overhead,

@@ -799,7 +799,7 @@ pub(super) fn isolated_loader_class_not_found(
     shared: &SharedVm,
     thread: &mut JvmThread,
     name: &str,
-) -> MethodCallFailed {
+) -> Result<MethodCallFailed, MethodCallFailed> {
     use cratonvm_native_api::NativeContext as _;
     let mut ctx = crate::vm::NativeContextImpl { shared, thread };
     let exception = cratonvm_native_builtins::jboss_module_loader::alloc_single_message_exception(
@@ -807,8 +807,8 @@ pub(super) fn isolated_loader_class_not_found(
         "java/lang/NoClassDefFoundError",
         1,
         &name.replace('/', "."),
-    );
-    MethodCallFailed::ExceptionThrown(exception)
+    )?;
+    Ok(MethodCallFailed::ExceptionThrown(exception))
 }
 
 /// Resolve a `CONSTANT_Class` reference (`ldc X.class`, `new`/`anewarray`,
@@ -1109,7 +1109,7 @@ pub(crate) fn resolve_class_loader_aware(
                     );
                 }
             }
-            return Err(isolated_loader_class_not_found(shared, thread, name));
+            return Err(isolated_loader_class_not_found(shared, thread, name)?);
         }
         let fallback = shared.load_class_concurrent_for(name, requesting_frame(thread));
         if dbg_trace {
@@ -1300,13 +1300,16 @@ pub(crate) fn drive_defining_loader_load(
         // namespace and defining-loader association.
         match result {
             Ok(Some(Value::Object(Some(_)))) => result,
-            _ => cratonvm_native_builtins::service_loader::impl_jars_load_class(
+            _ => match cratonvm_native_builtins::service_loader::impl_jars_load_class(
                 &mut ctx,
                 Some(loader_obj),
                 name,
-            )
-            .map(|mirror| Ok(Some(Value::Object(Some(mirror)))))
-            .unwrap_or(result),
+            ) {
+                Ok(Some(mirror)) => Ok(Some(Value::Object(Some(mirror)))),
+                // A refusal here leaves the original resolution result standing,
+                // exactly as "archive had no such class" already did.
+                _ => result,
+            },
         }
     };
     // Defensive: a re-entrant call that unwound abnormally must not leave stray

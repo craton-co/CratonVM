@@ -20,6 +20,14 @@ By participating, you are expected to uphold this code.
    cargo build --all-targets
    cargo test --all
    ```
+4. Optional, recommended — enable the repository's hooks:
+   ```bash
+   git config core.hooksPath .githooks
+   ```
+   Currently one `pre-push` hook, running the ~1.8 s flag-surface guards. CI
+   already runs them, but branches here are merged into `dev` and pushed
+   directly, so CI reports a red surface rather than preventing one. See
+   [docs/contributing/flag-surface-hook.md](docs/contributing/flag-surface-hook.md).
 
 ## Development Workflow
 
@@ -81,7 +89,7 @@ which entries you saw — a *new* name in the output is the signal.
 | `cuda-bridge` | Thin CUDA Driver API bridge for GPU offload |
 | `craton-gpu` | Build-time Java annotation sources (`@Parallel` etc.) for GPU offload |
 | `classloading` | Class loading & bytecode verification |
-| `gc` | Generational GC default (young/old; Cheney moving + non-moving sweep); opt-in G1 region collector (`-XX:+UseG1GC`, experimental); feature-gated `zgc` stub |
+| `gc` | Generational GC default (young/old; Cheney moving + non-moving sweep); opt-in G1 region collector (`-XX:+UseG1GC`, experimental); `ZgcRealHeap`, a real memory-backed STW non-moving mark-sweep that `-XX:+UseZGC` genuinely selects, but compiled in only behind the default-off `zgc` feature, so absent from a stock build |
 | `jfr` | Java Flight Recorder |
 | `vm` | VM runtime engine |
 | `vm-cli` | Command-line entry point |
@@ -198,9 +206,19 @@ When your PR adds a feature, fixes a bug, or changes behavior:
    `SyntheticStub` outright, so a mis-tagged bridge is never registered at all
    and the failure surfaces far from its cause. Background:
    the retired `native-kind-is-ambient-and-defaults-to-syntheticstub` write-up
-   (RETIRED 2026-08-06 — the ambient default no longer decides anything; the
-   reclassification it pointed at is in
-   [`docs/known-issues/jdk-only/l5bc-awt-builtins-bridge-residuals.md`](docs/known-issues/jdk-only/l5bc-awt-builtins-bridge-residuals.md)).
+   (RETIRED 2026-08-06 — the ambient default no longer decides anything). The
+   reclassification it pointed at was re-homed and then closed: all four of its
+   items landed 2026-08-11, and the population is now five slack-free ratchets
+   scored by `regression-suite/bridge-ratchet.sh` rather than a number in a
+   document. Background: the retired `bridge-reclassification-wave` write-up.
+
+   One class of mis-tag is now decided centrally rather than at the site: a
+   registration whose receiver class **no supported JDK image declares** cannot
+   bind to an `ACC_NATIVE` method, so `register()` re-tags it `SyntheticStub`
+   from the measured table in `native-api/src/no_image_receiver.rs`. If you are
+   adding a native on a class the VM mints — an iterator stand-in, a functional
+   combinator, a `cratonvm/…` receiver — check that table before choosing a
+   kind; it is probably already deciding for you.
 
 4. **Use `NativeContext`** — the `ctx` parameter provides:
    - `ctx.alloc_object(class_id)` — allocate a new object

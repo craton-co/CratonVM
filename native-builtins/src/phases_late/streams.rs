@@ -131,7 +131,7 @@ pub(crate) fn register_phase56_stream_extras(r: &mut NativeMethodRegistry) {
         } else {
             ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0)
         };
-        let itr = alloc_concurrent_synthetic(ctx, "java/util/ServiceLoader$Itr", 2);
+        let itr = try_alloc_concurrent_synthetic(ctx, "java/util/ServiceLoader$Itr", 2)?;
         ctx.set_field(itr, 0, Value::Object(Some(arr)));
         ctx.set_field(itr, 1, Value::Int(0));
         Ok(Some(Value::Object(Some(itr))))
@@ -149,7 +149,7 @@ pub(crate) fn register_phase56_stream_extras(r: &mut NativeMethodRegistry) {
             } else {
                 ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0)
             };
-            let itr = alloc_concurrent_synthetic(ctx, "java/util/ServiceLoader$Itr", 2);
+            let itr = try_alloc_concurrent_synthetic(ctx, "java/util/ServiceLoader$Itr", 2)?;
             ctx.set_field(itr, 0, Value::Object(Some(arr)));
             ctx.set_field(itr, 1, Value::Int(0));
             Ok(Some(Value::Object(Some(itr))))
@@ -324,18 +324,10 @@ pub(crate) fn register_phase56_stream_extras(r: &mut NativeMethodRegistry) {
         "(Ljava/util/stream/IntStream;Ljava/util/stream/IntStream;)Ljava/util/stream/IntStream;",
         p56_int_stream_concat,
     );
-    r.register(
-        is,
-        "forEachOrdered",
-        "(Ljava/util/function/IntConsumer;)V",
-        p56_int_stream_for_each_ordered,
-    );
-    r.register(
-        is,
-        "summaryStatistics",
-        "()Ljava/util/IntSummaryStatistics;",
-        p56_int_stream_summary_stats,
-    );
+    // `forEachOrdered` and `summaryStatistics` moved to
+    // `register_phase56_primitive_stream_terminals` (called at the end of this
+    // function) so the real-JDK build can reach them without also inheriting
+    // the intermediate ops here — see the note on that registrar.
 
     // --- LongStream extras ---
     let ls = "java/util/stream/LongStream";
@@ -393,12 +385,6 @@ pub(crate) fn register_phase56_stream_extras(r: &mut NativeMethodRegistry) {
         "(Ljava/util/stream/LongStream;Ljava/util/stream/LongStream;)Ljava/util/stream/LongStream;",
         p56_long_stream_concat,
     );
-    r.register(
-        ls,
-        "summaryStatistics",
-        "()Ljava/util/LongSummaryStatistics;",
-        p56_long_stream_summary_stats,
-    );
 
     // --- DoubleStream extras ---
     let ds = "java/util/stream/DoubleStream";
@@ -445,12 +431,84 @@ pub(crate) fn register_phase56_stream_extras(r: &mut NativeMethodRegistry) {
         |_ctx, args| Ok(Some(args[0])),
     );
     r.register(ds, "concat", "(Ljava/util/stream/DoubleStream;Ljava/util/stream/DoubleStream;)Ljava/util/stream/DoubleStream;", p56_double_stream_concat);
+    register_phase56_primitive_stream_terminals(r);
+    r.set_category(__prev_cat);
+}
+
+/// The primitive-stream TERMINALS this crate owns: `summaryStatistics` and
+/// `forEachOrdered` on `IntStream` / `LongStream` / `DoubleStream`.
+///
+/// Split out of `register_phase56_stream_extras` on 2026-08-11 so the real-JDK
+/// build has something safe to call. The rest of this file is synthetic-JDK
+/// only: its single caller is `lib.rs::register_synthetic_overrides`, which
+/// `vm/src/native/builtins.rs` replaces with a no-op shim whenever the
+/// `synthetic-jdk` feature is off — and it is off by default. That is why
+/// `IntStream.rangeClosed(1,5).summaryStatistics()` killed the run under
+/// `--real-jdk`: `native_int_stream_range_closed` (native-collections, live in
+/// both modes) hands back a synthetic object whose class IS the interface
+/// `java/util/stream/IntStream`, nothing live registers `summaryStatistics` on
+/// that interface, and the interface's own declaration has no Code attribute.
+/// native-collections already carries the same finding for `LongStream.mapToObj`
+/// in its own registrar comment.
+///
+/// TERMINALS ONLY, and deliberately. The intermediate ops in
+/// `register_phase56_stream_extras` build their result with `p56_build_stream`,
+/// which allocates a REFERENCE array; native-collections' `make_int_stream`
+/// allocates a primitive `Int`/`Long`/`Double` array and comments that a
+/// reference array coerces `Value::Int` to null. Registering those into the
+/// real-JDK path would hand the live readers a stream of nulls. The two
+/// terminals here return a statistics object and void respectively, so they
+/// never mint a stream.
+///
+/// ORDERING: safe to call from the real-JDK essentials path, which runs BEFORE
+/// `register_collections_natives` and would therefore be overwritten by it.
+/// Every triple below is one native-collections does NOT register (verified
+/// against its `register_{int,long,double}_stream_natives`), so nothing here is
+/// a re-registration. Adding a triple that native-collections also registers
+/// makes this registrar silently inert — check before extending it.
+pub(crate) fn register_phase56_primitive_stream_terminals(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
+
     r.register(
-        ds,
+        "java/util/stream/IntStream",
+        "forEachOrdered",
+        "(Ljava/util/function/IntConsumer;)V",
+        p56_int_stream_for_each_ordered,
+    );
+    r.register(
+        "java/util/stream/IntStream",
+        "summaryStatistics",
+        "()Ljava/util/IntSummaryStatistics;",
+        p56_int_stream_summary_stats,
+    );
+
+    r.register(
+        "java/util/stream/LongStream",
+        "forEachOrdered",
+        "(Ljava/util/function/LongConsumer;)V",
+        p56_long_stream_for_each_ordered,
+    );
+    r.register(
+        "java/util/stream/LongStream",
+        "summaryStatistics",
+        "()Ljava/util/LongSummaryStatistics;",
+        p56_long_stream_summary_stats,
+    );
+
+    r.register(
+        "java/util/stream/DoubleStream",
+        "forEachOrdered",
+        "(Ljava/util/function/DoubleConsumer;)V",
+        p56_double_stream_for_each_ordered,
+    );
+    r.register(
+        "java/util/stream/DoubleStream",
         "summaryStatistics",
         "()Ljava/util/DoubleSummaryStatistics;",
         p56_double_stream_summary_stats,
     );
+
     r.set_category(__prev_cat);
 }
 
@@ -470,7 +528,7 @@ pub(crate) fn p56_build_stream(
     ctx: &mut dyn NativeContext,
     elems: Vec<Value>,
     class: &str,
-) -> ObjectRef {
+) -> Result<ObjectRef, MethodCallFailed> {
     use cratonvm_types::ArrayElementType;
     let len = elems.len();
     // Pin across the array/stream allocs below — a moving young GC there
@@ -484,11 +542,11 @@ pub(crate) fn p56_build_stream(
         let v = read_pinned_object_value(ctx, *p, *v);
         ctx.set_array_element(arr, i, v);
     }
-    let stream = alloc_concurrent_synthetic(ctx, class, 1);
+    let stream = try_alloc_concurrent_synthetic(ctx, class, 1)?;
     let arr = ctx.read_native_pin(arr_pin, arr);
     ctx.set_field(stream, 0, Value::Object(Some(arr)));
     ctx.unpin_native_roots(first_pin.unwrap_or(arr_pin));
-    stream
+    Ok(stream)
 }
 
 // --- Stream.peek ---
@@ -513,7 +571,7 @@ pub(crate) fn p56_stream_peek(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
     ctx.unpin_native_roots(consumer_pin);
     // Return new stream with same elements
     let result = p56_build_stream(ctx, elems, "java/util/stream/Stream");
-    Ok(Some(Value::Object(Some(result))))
+    Ok(Some(Value::Object(Some(result?))))
 }
 
 // --- Stream.takeWhile ---
@@ -547,7 +605,7 @@ pub(crate) fn p56_stream_take_while(
     let result = read_pinned_object_values(ctx, &pins[..taken], &elems[..taken]);
     ctx.unpin_native_roots(predicate_pin);
     let s = p56_build_stream(ctx, result, "java/util/stream/Stream");
-    Ok(Some(Value::Object(Some(s))))
+    Ok(Some(Value::Object(Some(s?))))
 }
 
 // --- Stream.dropWhile ---
@@ -581,7 +639,7 @@ pub(crate) fn p56_stream_drop_while(
     let result = read_pinned_object_values(ctx, &pins[start..], &elems[start..]);
     ctx.unpin_native_roots(predicate_pin);
     let s = p56_build_stream(ctx, result, "java/util/stream/Stream");
-    Ok(Some(Value::Object(Some(s))))
+    Ok(Some(Value::Object(Some(s?))))
 }
 
 // --- Stream.forEachOrdered ---
@@ -615,7 +673,7 @@ pub(crate) fn p56_stream_concat(ctx: &mut dyn NativeContext, args: &[Value]) -> 
     let mut elems = p56_read_stream_elems(ctx, a);
     elems.extend(p56_read_stream_elems(ctx, b));
     let s = p56_build_stream(ctx, elems, "java/util/stream/Stream");
-    Ok(Some(Value::Object(Some(s))))
+    Ok(Some(Value::Object(Some(s?))))
 }
 
 // --- Stream.ofNullable ---
@@ -629,7 +687,7 @@ pub(crate) fn p56_stream_of_nullable(
         vec![args[0]]
     };
     let s = p56_build_stream(ctx, elems, "java/util/stream/Stream");
-    Ok(Some(Value::Object(Some(s))))
+    Ok(Some(Value::Object(Some(s?))))
 }
 
 // --- Stream.iterate(seed, op) — generate 256 elements (lazy in real JVM, eager here) ---
@@ -667,7 +725,7 @@ pub(crate) fn p56_stream_iterate(ctx: &mut dyn NativeContext, args: &[Value]) ->
     let elems = read_pinned_object_values(ctx, &pins, &elems);
     ctx.unpin_native_roots(op_pin);
     let s = p56_build_stream(ctx, elems, "java/util/stream/Stream");
-    Ok(Some(Value::Object(Some(s))))
+    Ok(Some(Value::Object(Some(s?))))
 }
 
 // --- Stream.iterate(seed, hasNext, op) --- Java 9+
@@ -723,7 +781,7 @@ pub(crate) fn p56_stream_iterate_predicate(
     let elems = read_pinned_object_values(ctx, &pins, &elems);
     ctx.unpin_native_roots(has_next_pin);
     let s = p56_build_stream(ctx, elems, "java/util/stream/Stream");
-    Ok(Some(Value::Object(Some(s))))
+    Ok(Some(Value::Object(Some(s?))))
 }
 
 // --- Stream.generate(Supplier) — generate 256 elements ---
@@ -750,7 +808,7 @@ pub(crate) fn p56_stream_generate(ctx: &mut dyn NativeContext, args: &[Value]) -
     let elems = read_pinned_object_values(ctx, &pins, &elems);
     ctx.unpin_native_roots(supplier_pin);
     let s = p56_build_stream(ctx, elems, "java/util/stream/Stream");
-    Ok(Some(Value::Object(Some(s))))
+    Ok(Some(Value::Object(Some(s?))))
 }
 
 // --- Stream.flatMapToInt ---
@@ -784,7 +842,7 @@ pub(crate) fn p56_stream_flat_map_to_int(
     }
     ctx.unpin_native_roots(func_pin);
     let s = p56_build_stream(ctx, ints, "java/util/stream/IntStream");
-    Ok(Some(Value::Object(Some(s))))
+    Ok(Some(Value::Object(Some(s?))))
 }
 
 // --- Stream.flatMapToLong ---
@@ -818,7 +876,7 @@ pub(crate) fn p56_stream_flat_map_to_long(
     }
     ctx.unpin_native_roots(func_pin);
     let s = p56_build_stream(ctx, longs, "java/util/stream/LongStream");
-    Ok(Some(Value::Object(Some(s))))
+    Ok(Some(Value::Object(Some(s?))))
 }
 
 // --- Stream.flatMapToDouble ---
@@ -852,7 +910,7 @@ pub(crate) fn p56_stream_flat_map_to_double(
     }
     ctx.unpin_native_roots(func_pin);
     let s = p56_build_stream(ctx, doubles, "java/util/stream/DoubleStream");
-    Ok(Some(Value::Object(Some(s))))
+    Ok(Some(Value::Object(Some(s?))))
 }
 
 // --- Stream.mapToInt ---
@@ -882,7 +940,7 @@ pub(crate) fn p56_stream_map_to_int(
     }
     ctx.unpin_native_roots(func_pin);
     let s = p56_build_stream(ctx, ints, "java/util/stream/IntStream");
-    Ok(Some(Value::Object(Some(s))))
+    Ok(Some(Value::Object(Some(s?))))
 }
 
 // --- Stream.mapToLong ---
@@ -912,7 +970,7 @@ pub(crate) fn p56_stream_map_to_long(
     }
     ctx.unpin_native_roots(func_pin);
     let s = p56_build_stream(ctx, longs, "java/util/stream/LongStream");
-    Ok(Some(Value::Object(Some(s))))
+    Ok(Some(Value::Object(Some(s?))))
 }
 
 // --- Stream.mapToDouble ---
@@ -942,7 +1000,7 @@ pub(crate) fn p56_stream_map_to_double(
     }
     ctx.unpin_native_roots(func_pin);
     let s = p56_build_stream(ctx, doubles, "java/util/stream/DoubleStream");
-    Ok(Some(Value::Object(Some(s))))
+    Ok(Some(Value::Object(Some(s?))))
 }
 
 // --- IntStream.peek ---
@@ -962,7 +1020,7 @@ pub(crate) fn p56_int_stream_peek(ctx: &mut dyn NativeContext, args: &[Value]) -
     }
     ctx.unpin_native_roots(consumer_pin);
     let result = p56_build_stream(ctx, elems, "java/util/stream/IntStream");
-    Ok(Some(Value::Object(Some(result))))
+    Ok(Some(Value::Object(Some(result?))))
 }
 
 // --- IntStream.takeWhile ---
@@ -993,7 +1051,7 @@ pub(crate) fn p56_int_stream_take_while(
     }
     ctx.unpin_native_roots(predicate_pin);
     let s = p56_build_stream(ctx, result, "java/util/stream/IntStream");
-    Ok(Some(Value::Object(Some(s))))
+    Ok(Some(Value::Object(Some(s?))))
 }
 
 // --- IntStream.dropWhile ---
@@ -1028,7 +1086,7 @@ pub(crate) fn p56_int_stream_drop_while(
     }
     ctx.unpin_native_roots(predicate_pin);
     let s = p56_build_stream(ctx, result, "java/util/stream/IntStream");
-    Ok(Some(Value::Object(Some(s))))
+    Ok(Some(Value::Object(Some(s?))))
 }
 
 // --- IntStream.sorted → IntStream (natural ascending order) ---
@@ -1045,7 +1103,7 @@ pub(crate) fn p56_int_stream_sorted(
     let mut elems = p56_read_stream_elems(ctx, this);
     elems.sort_by_key(|v| v.as_int().unwrap_or(0));
     let s = p56_build_stream(ctx, elems, "java/util/stream/IntStream");
-    Ok(Some(Value::Object(Some(s))))
+    Ok(Some(Value::Object(Some(s?))))
 }
 
 // --- IntStream.boxed → Stream ---
@@ -1062,7 +1120,7 @@ pub(crate) fn p56_int_stream_boxed(
     let mut pins = Vec::with_capacity(elems.len());
     let mut first_pin = None;
     for v in elems {
-        let wrapper = alloc_concurrent_synthetic(ctx, "java/lang/Integer", 1);
+        let wrapper = try_alloc_concurrent_synthetic(ctx, "java/lang/Integer", 1)?;
         let h = ctx.pin_native_root(wrapper);
         if first_pin.is_none() {
             first_pin = Some(h);
@@ -1076,7 +1134,7 @@ pub(crate) fn p56_int_stream_boxed(
         ctx.unpin_native_roots(h);
     }
     let s = p56_build_stream(ctx, boxed, "java/util/stream/Stream");
-    Ok(Some(Value::Object(Some(s))))
+    Ok(Some(Value::Object(Some(s?))))
 }
 
 // --- IntStream.asLongStream → LongStream ---
@@ -1094,7 +1152,7 @@ pub(crate) fn p56_int_stream_as_long(
         })
         .collect();
     let s = p56_build_stream(ctx, longs, "java/util/stream/LongStream");
-    Ok(Some(Value::Object(Some(s))))
+    Ok(Some(Value::Object(Some(s?))))
 }
 
 // --- IntStream.asDoubleStream → DoubleStream ---
@@ -1112,7 +1170,7 @@ pub(crate) fn p56_int_stream_as_double(
         })
         .collect();
     let s = p56_build_stream(ctx, doubles, "java/util/stream/DoubleStream");
-    Ok(Some(Value::Object(Some(s))))
+    Ok(Some(Value::Object(Some(s?))))
 }
 
 // --- IntStream.concat ---
@@ -1125,7 +1183,7 @@ pub(crate) fn p56_int_stream_concat(
     let mut elems = p56_read_stream_elems(ctx, a);
     elems.extend(p56_read_stream_elems(ctx, b));
     let s = p56_build_stream(ctx, elems, "java/util/stream/IntStream");
-    Ok(Some(Value::Object(Some(s))))
+    Ok(Some(Value::Object(Some(s?))))
 }
 
 // --- IntStream.forEachOrdered ---
@@ -1142,6 +1200,53 @@ pub(crate) fn p56_int_stream_for_each_ordered(
     for v in elems {
         let c = ctx.read_native_pin(consumer_pin, consumer);
         if let Err(e) = ctx.invoke_virtual(c, "accept", "(I)V", &[v]) {
+            ctx.unpin_native_roots(consumer_pin);
+            return Err(e);
+        }
+    }
+    ctx.unpin_native_roots(consumer_pin);
+    Ok(None)
+}
+
+// --- LongStream.forEachOrdered ---
+// Added 2026-08-11 with the W7-2 sweep. `forEachOrdered` was registered for
+// IntStream and for the reference Stream but for neither of the other two
+// primitive streams — the same "covered for whichever members a probe reached"
+// shape as `summaryStatistics` itself. Ordered and unordered traversal are the
+// same traversal for a sequential synthetic stream, so this is `forEach`.
+pub(crate) fn p56_long_stream_for_each_ordered(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let consumer = obj_arg(args, 1)?;
+    let elems = p56_read_stream_elems(ctx, this);
+    // Pin across the consumer callbacks below — a moving young GC there would
+    // relocate `consumer` (native stale-local family; elements are primitive).
+    let consumer_pin = ctx.pin_native_root(consumer);
+    for v in elems {
+        let c = ctx.read_native_pin(consumer_pin, consumer);
+        if let Err(e) = ctx.invoke_virtual(c, "accept", "(J)V", &[v]) {
+            ctx.unpin_native_roots(consumer_pin);
+            return Err(e);
+        }
+    }
+    ctx.unpin_native_roots(consumer_pin);
+    Ok(None)
+}
+
+// --- DoubleStream.forEachOrdered --- see the LongStream note above.
+pub(crate) fn p56_double_stream_for_each_ordered(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let consumer = obj_arg(args, 1)?;
+    let elems = p56_read_stream_elems(ctx, this);
+    let consumer_pin = ctx.pin_native_root(consumer);
+    for v in elems {
+        let c = ctx.read_native_pin(consumer_pin, consumer);
+        if let Err(e) = ctx.invoke_virtual(c, "accept", "(D)V", &[v]) {
             ctx.unpin_native_roots(consumer_pin);
             return Err(e);
         }
@@ -1170,7 +1275,7 @@ pub(crate) fn p56_long_stream_peek(
     }
     ctx.unpin_native_roots(consumer_pin);
     let result = p56_build_stream(ctx, elems, "java/util/stream/LongStream");
-    Ok(Some(Value::Object(Some(result))))
+    Ok(Some(Value::Object(Some(result?))))
 }
 
 // --- LongStream.takeWhile ---
@@ -1201,7 +1306,7 @@ pub(crate) fn p56_long_stream_take_while(
     }
     ctx.unpin_native_roots(predicate_pin);
     let s = p56_build_stream(ctx, result, "java/util/stream/LongStream");
-    Ok(Some(Value::Object(Some(s))))
+    Ok(Some(Value::Object(Some(s?))))
 }
 
 // --- LongStream.dropWhile ---
@@ -1236,7 +1341,7 @@ pub(crate) fn p56_long_stream_drop_while(
     }
     ctx.unpin_native_roots(predicate_pin);
     let s = p56_build_stream(ctx, result, "java/util/stream/LongStream");
-    Ok(Some(Value::Object(Some(s))))
+    Ok(Some(Value::Object(Some(s?))))
 }
 
 // --- LongStream.boxed → Stream ---
@@ -1252,7 +1357,7 @@ pub(crate) fn p56_long_stream_boxed(
     let mut pins = Vec::with_capacity(elems.len());
     let mut first_pin = None;
     for v in elems {
-        let wrapper = alloc_concurrent_synthetic(ctx, "java/lang/Long", 1);
+        let wrapper = try_alloc_concurrent_synthetic(ctx, "java/lang/Long", 1)?;
         let h = ctx.pin_native_root(wrapper);
         if first_pin.is_none() {
             first_pin = Some(h);
@@ -1266,7 +1371,7 @@ pub(crate) fn p56_long_stream_boxed(
         ctx.unpin_native_roots(h);
     }
     let s = p56_build_stream(ctx, boxed, "java/util/stream/Stream");
-    Ok(Some(Value::Object(Some(s))))
+    Ok(Some(Value::Object(Some(s?))))
 }
 
 // --- LongStream.mapToObj(LongFunction) -> Stream ---
@@ -1303,7 +1408,7 @@ pub(crate) fn p56_long_stream_map_to_obj(
     let out = read_pinned_object_values(ctx, &pins, &out);
     ctx.unpin_native_roots(func_pin);
     let s = p56_build_stream(ctx, out, "java/util/stream/Stream");
-    Ok(Some(Value::Object(Some(s))))
+    Ok(Some(Value::Object(Some(s?))))
 }
 
 // --- DoubleStream.mapToObj(DoubleFunction) -> Stream ---
@@ -1335,7 +1440,7 @@ pub(crate) fn p56_double_stream_map_to_obj(
     let out = read_pinned_object_values(ctx, &pins, &out);
     ctx.unpin_native_roots(func_pin);
     let s = p56_build_stream(ctx, out, "java/util/stream/Stream");
-    Ok(Some(Value::Object(Some(s))))
+    Ok(Some(Value::Object(Some(s?))))
 }
 
 // --- LongStream.asDoubleStream ---
@@ -1353,7 +1458,7 @@ pub(crate) fn p56_long_stream_as_double(
         })
         .collect();
     let s = p56_build_stream(ctx, doubles, "java/util/stream/DoubleStream");
-    Ok(Some(Value::Object(Some(s))))
+    Ok(Some(Value::Object(Some(s?))))
 }
 
 // --- LongStream.concat ---
@@ -1366,7 +1471,7 @@ pub(crate) fn p56_long_stream_concat(
     let mut elems = p56_read_stream_elems(ctx, a);
     elems.extend(p56_read_stream_elems(ctx, b));
     let s = p56_build_stream(ctx, elems, "java/util/stream/LongStream");
-    Ok(Some(Value::Object(Some(s))))
+    Ok(Some(Value::Object(Some(s?))))
 }
 
 // --- DoubleStream.peek ---
@@ -1389,7 +1494,7 @@ pub(crate) fn p56_double_stream_peek(
     }
     ctx.unpin_native_roots(consumer_pin);
     let result = p56_build_stream(ctx, elems, "java/util/stream/DoubleStream");
-    Ok(Some(Value::Object(Some(result))))
+    Ok(Some(Value::Object(Some(result?))))
 }
 
 // --- DoubleStream.takeWhile ---
@@ -1420,7 +1525,7 @@ pub(crate) fn p56_double_stream_take_while(
     }
     ctx.unpin_native_roots(predicate_pin);
     let s = p56_build_stream(ctx, result, "java/util/stream/DoubleStream");
-    Ok(Some(Value::Object(Some(s))))
+    Ok(Some(Value::Object(Some(s?))))
 }
 
 // --- DoubleStream.dropWhile ---
@@ -1455,7 +1560,7 @@ pub(crate) fn p56_double_stream_drop_while(
     }
     ctx.unpin_native_roots(predicate_pin);
     let s = p56_build_stream(ctx, result, "java/util/stream/DoubleStream");
-    Ok(Some(Value::Object(Some(s))))
+    Ok(Some(Value::Object(Some(s?))))
 }
 
 // --- DoubleStream.boxed → Stream ---
@@ -1471,7 +1576,7 @@ pub(crate) fn p56_double_stream_boxed(
     let mut pins = Vec::with_capacity(elems.len());
     let mut first_pin = None;
     for v in elems {
-        let wrapper = alloc_concurrent_synthetic(ctx, "java/lang/Double", 1);
+        let wrapper = try_alloc_concurrent_synthetic(ctx, "java/lang/Double", 1)?;
         let h = ctx.pin_native_root(wrapper);
         if first_pin.is_none() {
             first_pin = Some(h);
@@ -1485,7 +1590,7 @@ pub(crate) fn p56_double_stream_boxed(
         ctx.unpin_native_roots(h);
     }
     let s = p56_build_stream(ctx, boxed, "java/util/stream/Stream");
-    Ok(Some(Value::Object(Some(s))))
+    Ok(Some(Value::Object(Some(s?))))
 }
 
 // --- DoubleStream.concat ---
@@ -1498,12 +1603,28 @@ pub(crate) fn p56_double_stream_concat(
     let mut elems = p56_read_stream_elems(ctx, a);
     elems.extend(p56_read_stream_elems(ctx, b));
     let s = p56_build_stream(ctx, elems, "java/util/stream/DoubleStream");
-    Ok(Some(Value::Object(Some(s))))
+    Ok(Some(Value::Object(Some(s?))))
 }
 
 // ---------------------------------------------------------------------------
 // Summary Statistics: IntSummaryStatistics, LongSummaryStatistics, DoubleSummaryStatistics
 // 4-field synthetic: (count=0 Long, sum=1 Long/Double, min=2, max=3)
+//
+// That 4-slot shape is the SYNTHETIC one, shared with native-collections'
+// `summarizing*`/`averaging*` collectors, and it is only the whole truth for two
+// of the three classes. `javap -p` against the JDK 25 image says:
+//
+//   java.util.IntSummaryStatistics     count, sum, min, max                    (4)
+//   java.util.LongSummaryStatistics    count, sum, min, max                    (4)
+//   java.util.DoubleSummaryStatistics  count, sum, sumCompensation, simpleSum,
+//                                      min, max                                (6)
+//
+// so on a REAL `DoubleSummaryStatistics` receiver slots 2 and 3 are
+// `sumCompensation` and `simpleSum`, not min and max. `try_alloc_concurrent_
+// synthetic` clamps the slot count UP to the resolved class's real field count
+// and keeps the REAL class id, so which of the two shapes a terminal is holding
+// is decided at run time by whether the class file loaded — see
+// `p56_double_stats_store` below, which is the only place that decides it.
 // ---------------------------------------------------------------------------
 pub(crate) const STATS_FIELD_COUNT: usize = 0;
 
@@ -1513,19 +1634,153 @@ pub(crate) const STATS_FIELD_MIN: usize = 2;
 
 pub(crate) const STATS_FIELD_MAX: usize = 3;
 
+/// Real `java.util.DoubleSummaryStatistics` field order (javap -p, JDK 25).
+/// Only reachable when the real class file loaded; see `p56_double_stats_store`.
+const REAL_DSS_FIELD_COUNT: usize = 0;
+const REAL_DSS_FIELD_SUM: usize = 1;
+const REAL_DSS_FIELD_SUM_COMPENSATION: usize = 2;
+const REAL_DSS_FIELD_SIMPLE_SUM: usize = 3;
+const REAL_DSS_FIELD_MIN: usize = 4;
+const REAL_DSS_FIELD_MAX: usize = 5;
+
+/// `java.lang.Math.min(double,double)`, which is NOT Rust's `f64::min`.
+///
+/// Java propagates NaN and orders `-0.0` below `+0.0`; Rust's `f64::min` is IEEE
+/// `minNum`, which RETURNS THE NON-NaN OPERAND. Measured on HotSpot 25,
+/// `DoubleStream.of(1.0, Double.NaN, 3.0).summaryStatistics()` prints
+/// `count=3, sum=NaN, min=NaN, average=NaN, max=NaN` — every field NaN, because
+/// `accept` folds with `Math.min`/`Math.max`. Folding with `f64::min` instead
+/// answers `min=1.0, max=3.0` beside a NaN sum: three fields that cannot all
+/// have come from the same data, which is the shape of a wrong answer that
+/// reads as a right one.
+fn p56_java_math_min(a: f64, b: f64) -> f64 {
+    if a.is_nan() || b.is_nan() {
+        return f64::NAN;
+    }
+    if a == 0.0 && b == 0.0 {
+        // `Math.min(-0.0, 0.0)` is `-0.0`; `==` cannot tell them apart.
+        return if a.is_sign_negative() { a } else { b };
+    }
+    if a <= b {
+        a
+    } else {
+        b
+    }
+}
+
+/// `java.lang.Math.max(double,double)` — the mirror of [`p56_java_math_min`].
+fn p56_java_math_max(a: f64, b: f64) -> f64 {
+    if a.is_nan() || b.is_nan() {
+        return f64::NAN;
+    }
+    if a == 0.0 && b == 0.0 {
+        return if a.is_sign_negative() { b } else { a };
+    }
+    if a >= b {
+        a
+    } else {
+        b
+    }
+}
+
+/// Render a double the way `String.format("%f", d)` does, which is what every
+/// `*SummaryStatistics.toString()` in the JDK uses for its `average` (and, for
+/// the double flavour, for `sum`/`min`/`max` too).
+///
+/// Rust's `{}` prints `3` where Java prints `3.000000`, and `inf` where Java
+/// prints `Infinity` — both of which an empty `DoubleSummaryStatistics` hits on
+/// its very first line (`min=Infinity, max=-Infinity`, measured on HotSpot 25).
+///
+/// KNOWN GAP, stated rather than hidden: the JDK's `%f` is locale-sensitive
+/// (the same call prints `3,000000` under a comma-decimal default locale) and
+/// rounds HALF_UP where Rust's `{:.6}` rounds half-to-even. This renders the
+/// C/en form unconditionally.
+fn p56_format_java_f(d: f64) -> String {
+    if d.is_nan() {
+        "NaN".to_string()
+    } else if d.is_infinite() {
+        if d.is_sign_negative() {
+            "-Infinity".to_string()
+        } else {
+            "Infinity".to_string()
+        }
+    } else {
+        format!("{:.6}", d)
+    }
+}
+
+/// Read a `*SummaryStatistics` slot known to hold a `long`, defaulting to 0.
+fn p56_stats_long(ctx: &dyn NativeContext, stats: ObjectRef, slot: usize) -> i64 {
+    match ctx.get_field(stats, slot) {
+        Value::Long(l) => l,
+        _ => 0,
+    }
+}
+
+/// Read a `*SummaryStatistics` slot known to hold an `int`. The default is the
+/// caller's identity value (`Integer.MAX_VALUE` for min, `MIN_VALUE` for max),
+/// never 0 — a 0 default is what made `IntStream.of(5, 7)` report `min=0` before
+/// the identity-seeding ctor below existed.
+fn p56_stats_int(ctx: &dyn NativeContext, stats: ObjectRef, slot: usize, identity: i32) -> i32 {
+    match ctx.get_field(stats, slot) {
+        Value::Int(i) => i,
+        _ => identity,
+    }
+}
+
+/// Read a `*SummaryStatistics` slot known to hold a `double`, defaulting to the
+/// caller's identity value — see [`p56_stats_int`].
+fn p56_stats_double(ctx: &dyn NativeContext, stats: ObjectRef, slot: usize, identity: f64) -> f64 {
+    match ctx.get_field(stats, slot) {
+        Value::Double(d) => d,
+        _ => identity,
+    }
+}
+
+/// The two argument checks every `*SummaryStatistics(count, min, max, sum)`
+/// constructor performs, with the JDK's exact messages (measured on HotSpot 25:
+/// `java.lang.IllegalArgumentException: Negative count value` and
+/// `... : Minimum greater than maximum`).
+///
+/// The min/max check is conditional on `count > 0` — the JDK skips the whole
+/// body for an empty statistics and leaves the identity field defaults, which is
+/// why `new IntSummaryStatistics(0L, 9, 1, 0L)` constructs cleanly.
+fn p56_stats_ctor_guard(count: i64, min_gt_max: bool) -> Result<(), MethodCallFailed> {
+    if count < 0 {
+        return Err(RuntimeError::IllegalArgumentException {
+            message: "Negative count value".to_string(),
+        }
+        .into());
+    }
+    if count > 0 && min_gt_max {
+        return Err(RuntimeError::IllegalArgumentException {
+            message: "Minimum greater than maximum".to_string(),
+        }
+        .into());
+    }
+    Ok(())
+}
+
 pub(crate) fn p56_int_stream_summary_stats(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     let elems = p56_read_stream_elems(ctx, this);
-    let count = elems.len() as i64;
+    // COUNT WHAT WE FOLD. The previous spelling took `count` from `elems.len()`
+    // but summed only the `Value::Int` elements, so any element of another
+    // shape produced a statistics object whose count and sum disagreed —
+    // `count=5, sum=0` reads as a real answer, not as the layout error it is.
+    let mut count: i64 = 0;
     let mut sum: i64 = 0;
     let mut min = i32::MAX;
     let mut max = i32::MIN;
     for v in &elems {
         if let Value::Int(i) = v {
-            sum += *i as i64;
+            count += 1;
+            // The JDK's `sum` is a plain `long +=`, so it WRAPS rather than
+            // saturating. Match it.
+            sum = sum.wrapping_add(*i as i64);
             if *i < min {
                 min = *i;
             }
@@ -1534,11 +1789,14 @@ pub(crate) fn p56_int_stream_summary_stats(
             }
         }
     }
+    // Identity values for the empty stream: HotSpot 25 prints
+    // `min=2147483647, max=-2147483648` for `IntStream.of().summaryStatistics()`
+    // (measured), which is what the JDK's field initialisers leave behind.
     if count == 0 {
         min = i32::MAX;
         max = i32::MIN;
     }
-    let stats = alloc_concurrent_synthetic(ctx, "java/util/IntSummaryStatistics", 4);
+    let stats = try_alloc_concurrent_synthetic(ctx, "java/util/IntSummaryStatistics", 4)?;
     ctx.set_field(stats, STATS_FIELD_COUNT, Value::Long(count));
     ctx.set_field(stats, STATS_FIELD_SUM, Value::Long(sum));
     ctx.set_field(stats, STATS_FIELD_MIN, Value::Int(min));
@@ -1552,12 +1810,14 @@ pub(crate) fn p56_long_stream_summary_stats(
 ) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     let elems = p56_read_stream_elems(ctx, this);
-    let count = elems.len() as i64;
+    // Count what we fold — see `p56_int_stream_summary_stats`.
+    let mut count: i64 = 0;
     let mut sum: i64 = 0;
     let mut min = i64::MAX;
     let mut max = i64::MIN;
     for v in &elems {
         if let Value::Long(l) = v {
+            count += 1;
             sum = sum.wrapping_add(*l);
             if *l < min {
                 min = *l;
@@ -1571,7 +1831,7 @@ pub(crate) fn p56_long_stream_summary_stats(
         min = i64::MAX;
         max = i64::MIN;
     }
-    let stats = alloc_concurrent_synthetic(ctx, "java/util/LongSummaryStatistics", 4);
+    let stats = try_alloc_concurrent_synthetic(ctx, "java/util/LongSummaryStatistics", 4)?;
     ctx.set_field(stats, STATS_FIELD_COUNT, Value::Long(count));
     ctx.set_field(stats, STATS_FIELD_SUM, Value::Long(sum));
     ctx.set_field(stats, STATS_FIELD_MIN, Value::Long(min));
@@ -1585,31 +1845,98 @@ pub(crate) fn p56_double_stream_summary_stats(
 ) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     let elems = p56_read_stream_elems(ctx, this);
-    let count = elems.len() as i64;
+    // Count what we fold — see `p56_int_stream_summary_stats`.
+    let mut count: i64 = 0;
+    // COMPENSATED summation, byte-for-byte `DoubleSummaryStatistics.
+    // sumWithCompensation` plus the `simpleSum` shadow its `getSum()` falls back
+    // to. A naive `sum += d` is measurably not the same number:
+    // `DoubleStream.of(1e16, 1.0, -1e16).summaryStatistics().getSum()` is `0.0`
+    // on HotSpot 25 (measured) and `2.0` naively.
     let mut sum: f64 = 0.0;
+    let mut compensation: f64 = 0.0;
+    let mut simple_sum: f64 = 0.0;
     let mut min = f64::INFINITY;
     let mut max = f64::NEG_INFINITY;
     for v in &elems {
         if let Value::Double(d) = v {
-            sum += *d;
-            if *d < min {
-                min = *d;
-            }
-            if *d > max {
-                max = *d;
-            }
+            count += 1;
+            simple_sum += *d;
+            let tmp = *d - compensation;
+            let velvel = sum + tmp;
+            compensation = (velvel - sum) - tmp;
+            sum = velvel;
+            // Java's Math.min/max, not Rust's — NaN must propagate into all
+            // three of min/max/sum together. See `p56_java_math_min`.
+            min = p56_java_math_min(min, *d);
+            max = p56_java_math_max(max, *d);
         }
     }
     if count == 0 {
         min = f64::INFINITY;
         max = f64::NEG_INFINITY;
     }
-    let stats = alloc_concurrent_synthetic(ctx, "java/util/DoubleSummaryStatistics", 4);
-    ctx.set_field(stats, STATS_FIELD_COUNT, Value::Long(count));
-    ctx.set_field(stats, STATS_FIELD_SUM, Value::Double(sum));
-    ctx.set_field(stats, STATS_FIELD_MIN, Value::Double(min));
-    ctx.set_field(stats, STATS_FIELD_MAX, Value::Double(max));
+    // `getSum()`'s own reconciliation: the compensated total, except that a
+    // spurious NaN produced by accumulating same-signed infinities is answered
+    // with the correctly-signed infinity `simpleSum` kept.
+    let total = {
+        let tmp = sum - compensation;
+        if tmp.is_nan() && simple_sum.is_infinite() {
+            simple_sum
+        } else {
+            tmp
+        }
+    };
+    let stats = try_alloc_concurrent_synthetic(ctx, "java/util/DoubleSummaryStatistics", 4)?;
+    p56_double_stats_store(ctx, stats, count, total, simple_sum, min, max);
     Ok(Some(Value::Object(Some(stats))))
+}
+
+/// Write a `DoubleSummaryStatistics` result into whichever of the two layouts
+/// the receiver actually has.
+///
+/// This is the one place that decides it. The synthetic class this file's own
+/// accessors serve declares four fields (count, sum, min, max); the REAL
+/// `java.util.DoubleSummaryStatistics` declares six (count, sum,
+/// sumCompensation, simpleSum, min, max — `javap -p`, JDK 25), and its `getMin`
+/// / `getMax` read slots 4 and 5. Writing the 4-slot shape onto a real receiver
+/// puts min into `sumCompensation` and max into `simpleSum`, after which the
+/// real `getMin()`/`getMax()` answer 0.0 and the real `getSum()` answers
+/// `sum - min` — three wrong numbers and no error anywhere.
+///
+/// `try_alloc_concurrent_synthetic` resolves the class by name and clamps the
+/// slot count UP to the real one, so the discriminator is the allocated
+/// object's own field count, not a compile-time mode flag.
+fn p56_double_stats_store(
+    ctx: &mut dyn NativeContext,
+    stats: ObjectRef,
+    count: i64,
+    sum: f64,
+    simple_sum: f64,
+    min: f64,
+    max: f64,
+) {
+    let class_id = ctx.class_id_of_object(stats);
+    let fields = ctx.class_num_total_fields(class_id);
+    if fields > REAL_DSS_FIELD_MAX {
+        ctx.set_field(stats, REAL_DSS_FIELD_COUNT, Value::Long(count));
+        // `sum` is already the reconciled total, so the compensation term the
+        // real `getSum()` subtracts must be zero, not left at whatever the
+        // allocation defaulted to.
+        ctx.set_field(stats, REAL_DSS_FIELD_SUM, Value::Double(sum));
+        ctx.set_field(
+            stats,
+            REAL_DSS_FIELD_SUM_COMPENSATION,
+            Value::Double(0.0),
+        );
+        ctx.set_field(stats, REAL_DSS_FIELD_SIMPLE_SUM, Value::Double(simple_sum));
+        ctx.set_field(stats, REAL_DSS_FIELD_MIN, Value::Double(min));
+        ctx.set_field(stats, REAL_DSS_FIELD_MAX, Value::Double(max));
+    } else {
+        ctx.set_field(stats, STATS_FIELD_COUNT, Value::Long(count));
+        ctx.set_field(stats, STATS_FIELD_SUM, Value::Double(sum));
+        ctx.set_field(stats, STATS_FIELD_MIN, Value::Double(min));
+        ctx.set_field(stats, STATS_FIELD_MAX, Value::Double(max));
+    }
 }
 
 pub(crate) fn register_phase56_summary_stats(r: &mut NativeMethodRegistry) {
@@ -1710,20 +2037,99 @@ pub(crate) fn register_phase56_summary_stats(r: &mut NativeMethodRegistry) {
             Value::Int(i) => i,
             _ => 0,
         };
+        // The JDK's format string is
+        // `"%s{count=%d, sum=%d, min=%d, average=%f, max=%d}"` — `average` is
+        // `%f`, i.e. SIX decimal places. Rust's `{}` printed `average=3` where
+        // HotSpot 25 prints `average=3.000000` (measured). See
+        // `p56_format_java_f`.
+        let avg = if count == 0 {
+            0.0
+        } else {
+            sum as f64 / count as f64
+        };
         let s = format!(
             "IntSummaryStatistics{{count={}, sum={}, min={}, average={}, max={}}}",
             count,
             sum,
             min,
-            if count == 0 {
-                0.0
-            } else {
-                sum as f64 / count as f64
-            },
+            p56_format_java_f(avg),
             max
         );
         let obj = ctx.create_string(&s);
         Ok(Some(Value::Object(Some(obj))))
+    });
+    // `combine(IntSummaryStatistics)` — declared by the class (javap, JDK 25)
+    // and registered nowhere until 2026-08-11. It is not an exotic corner: it is
+    // the third argument of `IntPipeline.summaryStatistics()`'s own
+    // `collect(IntSummaryStatistics::new, ::accept, ::combine)`, and every
+    // `Collectors.summarizingInt` merge goes through it.
+    r.register(
+        iss,
+        "combine",
+        "(Ljava/util/IntSummaryStatistics;)V",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let other = match args.get(1) {
+                Some(Value::Object(Some(o))) => *o,
+                // The JDK dereferences `other` unconditionally, so a null
+                // argument is an NPE there, not a silent no-op.
+                _ => return Err(RuntimeError::NullPointerException { message: None }.into()),
+            };
+            let (c, s, mn, mx) = (
+                p56_stats_long(ctx, this, STATS_FIELD_COUNT),
+                p56_stats_long(ctx, this, STATS_FIELD_SUM),
+                p56_stats_int(ctx, this, STATS_FIELD_MIN, i32::MAX),
+                p56_stats_int(ctx, this, STATS_FIELD_MAX, i32::MIN),
+            );
+            let (oc, os, omn, omx) = (
+                p56_stats_long(ctx, other, STATS_FIELD_COUNT),
+                p56_stats_long(ctx, other, STATS_FIELD_SUM),
+                p56_stats_int(ctx, other, STATS_FIELD_MIN, i32::MAX),
+                p56_stats_int(ctx, other, STATS_FIELD_MAX, i32::MIN),
+            );
+            ctx.set_field(this, STATS_FIELD_COUNT, Value::Long(c.wrapping_add(oc)));
+            ctx.set_field(this, STATS_FIELD_SUM, Value::Long(s.wrapping_add(os)));
+            ctx.set_field(this, STATS_FIELD_MIN, Value::Int(mn.min(omn)));
+            ctx.set_field(this, STATS_FIELD_MAX, Value::Int(mx.max(omx)));
+            Ok(None)
+        },
+    );
+    // `IntSummaryStatistics(long count, int min, int max, long sum)` — note the
+    // argument order, which is NOT the field order, and the two documented
+    // IllegalArgumentExceptions. With `count == 0` the JDK ignores min/max
+    // entirely and leaves the identity defaults: `new IntSummaryStatistics(0L,
+    // 9, 1, 0L)` prints `min=2147483647, max=-2147483648` on HotSpot 25
+    // (measured) rather than throwing "Minimum greater than maximum".
+    r.register(iss, "<init>", "(JIIJ)V", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let count = match args.get(1) {
+            Some(Value::Long(l)) => *l,
+            _ => 0,
+        };
+        let min = match args.get(2) {
+            Some(Value::Int(i)) => *i,
+            _ => 0,
+        };
+        let max = match args.get(3) {
+            Some(Value::Int(i)) => *i,
+            _ => 0,
+        };
+        let sum = match args.get(4) {
+            Some(Value::Long(l)) => *l,
+            _ => 0,
+        };
+        p56_stats_ctor_guard(count, min > max)?;
+        ctx.set_field(this, STATS_FIELD_COUNT, Value::Long(count.max(0)));
+        if count > 0 {
+            ctx.set_field(this, STATS_FIELD_SUM, Value::Long(sum));
+            ctx.set_field(this, STATS_FIELD_MIN, Value::Int(min));
+            ctx.set_field(this, STATS_FIELD_MAX, Value::Int(max));
+        } else {
+            ctx.set_field(this, STATS_FIELD_SUM, Value::Long(0));
+            ctx.set_field(this, STATS_FIELD_MIN, Value::Int(i32::MAX));
+            ctx.set_field(this, STATS_FIELD_MAX, Value::Int(i32::MIN));
+        }
+        Ok(None)
     });
 
     // --- LongSummaryStatistics ---
@@ -1816,20 +2222,100 @@ pub(crate) fn register_phase56_summary_stats(r: &mut NativeMethodRegistry) {
             Value::Long(l) => l,
             _ => 0,
         };
+        // `%f` average — see the IntSummaryStatistics toString above.
+        let avg = if count == 0 {
+            0.0
+        } else {
+            sum as f64 / count as f64
+        };
         let s = format!(
             "LongSummaryStatistics{{count={}, sum={}, min={}, average={}, max={}}}",
             count,
             sum,
             min,
-            if count == 0 {
-                0.0
-            } else {
-                sum as f64 / count as f64
-            },
+            p56_format_java_f(avg),
             max
         );
         let obj = ctx.create_string(&s);
         Ok(Some(Value::Object(Some(obj))))
+    });
+    // `LongSummaryStatistics` implements BOTH `LongConsumer` and `IntConsumer`
+    // (javap, JDK 25), so it declares `accept(int)` beside `accept(long)`. Only
+    // the long overload was registered, so `IntStream.forEach(stats::accept)`
+    // and any `IntConsumer`-typed use of a LongSummaryStatistics reached a
+    // bodiless declaration. The JDK's implementation is `accept((long) value)`.
+    r.register(lss, "accept", "(I)V", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let val = match args.get(1) {
+            Some(Value::Int(i)) => *i as i64,
+            _ => 0,
+        };
+        let count = p56_stats_long(ctx, this, STATS_FIELD_COUNT);
+        let sum = p56_stats_long(ctx, this, STATS_FIELD_SUM);
+        let min = p56_stats_long(ctx, this, STATS_FIELD_MIN);
+        let max = p56_stats_long(ctx, this, STATS_FIELD_MAX);
+        ctx.set_field(this, STATS_FIELD_COUNT, Value::Long(count + 1));
+        ctx.set_field(this, STATS_FIELD_SUM, Value::Long(sum.wrapping_add(val)));
+        ctx.set_field(this, STATS_FIELD_MIN, Value::Long(min.min(val)));
+        ctx.set_field(this, STATS_FIELD_MAX, Value::Long(max.max(val)));
+        Ok(None)
+    });
+    // `combine` / the 4-arg ctor — see the IntSummaryStatistics notes above.
+    r.register(
+        lss,
+        "combine",
+        "(Ljava/util/LongSummaryStatistics;)V",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let other = match args.get(1) {
+                Some(Value::Object(Some(o))) => *o,
+                _ => return Err(RuntimeError::NullPointerException { message: None }.into()),
+            };
+            let c = p56_stats_long(ctx, this, STATS_FIELD_COUNT);
+            let s = p56_stats_long(ctx, this, STATS_FIELD_SUM);
+            let mn = p56_stats_long(ctx, this, STATS_FIELD_MIN);
+            let mx = p56_stats_long(ctx, this, STATS_FIELD_MAX);
+            let oc = p56_stats_long(ctx, other, STATS_FIELD_COUNT);
+            let os = p56_stats_long(ctx, other, STATS_FIELD_SUM);
+            let omn = p56_stats_long(ctx, other, STATS_FIELD_MIN);
+            let omx = p56_stats_long(ctx, other, STATS_FIELD_MAX);
+            ctx.set_field(this, STATS_FIELD_COUNT, Value::Long(c.wrapping_add(oc)));
+            ctx.set_field(this, STATS_FIELD_SUM, Value::Long(s.wrapping_add(os)));
+            ctx.set_field(this, STATS_FIELD_MIN, Value::Long(mn.min(omn)));
+            ctx.set_field(this, STATS_FIELD_MAX, Value::Long(mx.max(omx)));
+            Ok(None)
+        },
+    );
+    r.register(lss, "<init>", "(JJJJ)V", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let count = match args.get(1) {
+            Some(Value::Long(l)) => *l,
+            _ => 0,
+        };
+        let min = match args.get(2) {
+            Some(Value::Long(l)) => *l,
+            _ => 0,
+        };
+        let max = match args.get(3) {
+            Some(Value::Long(l)) => *l,
+            _ => 0,
+        };
+        let sum = match args.get(4) {
+            Some(Value::Long(l)) => *l,
+            _ => 0,
+        };
+        p56_stats_ctor_guard(count, min > max)?;
+        ctx.set_field(this, STATS_FIELD_COUNT, Value::Long(count.max(0)));
+        if count > 0 {
+            ctx.set_field(this, STATS_FIELD_SUM, Value::Long(sum));
+            ctx.set_field(this, STATS_FIELD_MIN, Value::Long(min));
+            ctx.set_field(this, STATS_FIELD_MAX, Value::Long(max));
+        } else {
+            ctx.set_field(this, STATS_FIELD_SUM, Value::Long(0));
+            ctx.set_field(this, STATS_FIELD_MIN, Value::Long(i64::MAX));
+            ctx.set_field(this, STATS_FIELD_MAX, Value::Long(i64::MIN));
+        }
+        Ok(None)
     });
 
     // --- DoubleSummaryStatistics ---
@@ -1897,38 +2383,127 @@ pub(crate) fn register_phase56_summary_stats(r: &mut NativeMethodRegistry) {
         };
         ctx.set_field(this, STATS_FIELD_COUNT, Value::Long(count + 1));
         ctx.set_field(this, STATS_FIELD_SUM, Value::Double(sum + val));
-        ctx.set_field(this, STATS_FIELD_MIN, Value::Double(min.min(val)));
-        ctx.set_field(this, STATS_FIELD_MAX, Value::Double(max.max(val)));
+        // Java's Math.min/max, not Rust's `f64::min`/`max`: NaN must poison
+        // min/max the way it poisons the sum, and `-0.0` must sort below `+0.0`.
+        // See `p56_java_math_min` for the measured HotSpot behaviour.
+        ctx.set_field(
+            this,
+            STATS_FIELD_MIN,
+            Value::Double(p56_java_math_min(min, val)),
+        );
+        ctx.set_field(
+            this,
+            STATS_FIELD_MAX,
+            Value::Double(p56_java_math_max(max, val)),
+        );
         Ok(None)
     });
     r.register(dss, "toString", "()Ljava/lang/String;", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let count = match ctx.get_field(this, STATS_FIELD_COUNT) {
-            Value::Long(l) => l,
-            _ => 0,
-        };
-        let sum = match ctx.get_field(this, STATS_FIELD_SUM) {
-            Value::Double(d) => d,
-            _ => 0.0,
-        };
-        let min = match ctx.get_field(this, STATS_FIELD_MIN) {
-            Value::Double(d) => d,
-            _ => 0.0,
-        };
-        let max = match ctx.get_field(this, STATS_FIELD_MAX) {
-            Value::Double(d) => d,
-            _ => 0.0,
-        };
+        let count = p56_stats_long(ctx, this, STATS_FIELD_COUNT);
+        let sum = p56_stats_double(ctx, this, STATS_FIELD_SUM, 0.0);
+        let min = p56_stats_double(ctx, this, STATS_FIELD_MIN, f64::INFINITY);
+        let max = p56_stats_double(ctx, this, STATS_FIELD_MAX, f64::NEG_INFINITY);
+        // The double flavour's JDK format string is
+        // `"%s{count=%d, sum=%f, min=%f, average=%f, max=%f}"` — FOUR `%f`
+        // fields, not one. Rust's `{}` printed `min=inf` for an empty
+        // statistics where HotSpot 25 prints `min=Infinity` (measured), and
+        // `sum=6.5` where it prints `sum=6.500000`.
+        let avg = if count == 0 { 0.0 } else { sum / count as f64 };
         let s = format!(
             "DoubleSummaryStatistics{{count={}, sum={}, min={}, average={}, max={}}}",
             count,
-            sum,
-            min,
-            if count == 0 { 0.0 } else { sum / count as f64 },
-            max
+            p56_format_java_f(sum),
+            p56_format_java_f(min),
+            p56_format_java_f(avg),
+            p56_format_java_f(max)
         );
         let obj = ctx.create_string(&s);
         Ok(Some(Value::Object(Some(obj))))
+    });
+    // `combine` / the 4-arg ctor — see the IntSummaryStatistics notes above.
+    // The synthetic 4-slot shape has no `sumCompensation`, so `combine` adds the
+    // reconciled sums directly rather than replaying `sumWithCompensation`
+    // twice; that costs the compensation term, not a field.
+    r.register(
+        dss,
+        "combine",
+        "(Ljava/util/DoubleSummaryStatistics;)V",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let other = match args.get(1) {
+                Some(Value::Object(Some(o))) => *o,
+                _ => return Err(RuntimeError::NullPointerException { message: None }.into()),
+            };
+            let c = p56_stats_long(ctx, this, STATS_FIELD_COUNT);
+            let s = p56_stats_double(ctx, this, STATS_FIELD_SUM, 0.0);
+            let mn = p56_stats_double(ctx, this, STATS_FIELD_MIN, f64::INFINITY);
+            let mx = p56_stats_double(ctx, this, STATS_FIELD_MAX, f64::NEG_INFINITY);
+            let oc = p56_stats_long(ctx, other, STATS_FIELD_COUNT);
+            let os = p56_stats_double(ctx, other, STATS_FIELD_SUM, 0.0);
+            let omn = p56_stats_double(ctx, other, STATS_FIELD_MIN, f64::INFINITY);
+            let omx = p56_stats_double(ctx, other, STATS_FIELD_MAX, f64::NEG_INFINITY);
+            ctx.set_field(this, STATS_FIELD_COUNT, Value::Long(c.wrapping_add(oc)));
+            ctx.set_field(this, STATS_FIELD_SUM, Value::Double(s + os));
+            ctx.set_field(
+                this,
+                STATS_FIELD_MIN,
+                Value::Double(p56_java_math_min(mn, omn)),
+            );
+            ctx.set_field(
+                this,
+                STATS_FIELD_MAX,
+                Value::Double(p56_java_math_max(mx, omx)),
+            );
+            Ok(None)
+        },
+    );
+    // `DoubleSummaryStatistics(long count, double min, double max, double sum)`
+    // carries a THIRD check the int/long flavours do not: if any of min, max or
+    // sum is NaN then all three must be. Measured on HotSpot 25,
+    // `new DoubleSummaryStatistics(2L, Double.NaN, 3.0, 4.0)` throws
+    // `IllegalArgumentException: Some, not all, of the minimum, maximum, or sum
+    // is NaN`.
+    r.register(dss, "<init>", "(JDDD)V", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let count = match args.get(1) {
+            Some(Value::Long(l)) => *l,
+            _ => 0,
+        };
+        let min = match args.get(2) {
+            Some(Value::Double(d)) => *d,
+            _ => 0.0,
+        };
+        let max = match args.get(3) {
+            Some(Value::Double(d)) => *d,
+            _ => 0.0,
+        };
+        let sum = match args.get(4) {
+            Some(Value::Double(d)) => *d,
+            _ => 0.0,
+        };
+        p56_stats_ctor_guard(count, min > max)?;
+        if count > 0 {
+            let any_nan = min.is_nan() || max.is_nan() || sum.is_nan();
+            let all_nan = min.is_nan() && max.is_nan() && sum.is_nan();
+            if any_nan && !all_nan {
+                return Err(RuntimeError::IllegalArgumentException {
+                    message: "Some, not all, of the minimum, maximum, or sum is NaN".to_string(),
+                }
+                .into());
+            }
+        }
+        ctx.set_field(this, STATS_FIELD_COUNT, Value::Long(count.max(0)));
+        if count > 0 {
+            ctx.set_field(this, STATS_FIELD_SUM, Value::Double(sum));
+            ctx.set_field(this, STATS_FIELD_MIN, Value::Double(min));
+            ctx.set_field(this, STATS_FIELD_MAX, Value::Double(max));
+        } else {
+            ctx.set_field(this, STATS_FIELD_SUM, Value::Double(0.0));
+            ctx.set_field(this, STATS_FIELD_MIN, Value::Double(f64::INFINITY));
+            ctx.set_field(this, STATS_FIELD_MAX, Value::Double(f64::NEG_INFINITY));
+        }
+        Ok(None)
     });
     r.set_category(__prev_cat);
 }
@@ -2240,7 +2815,7 @@ pub(crate) fn register_phase56_function_extras(r: &mut NativeMethodRegistry) {
         |ctx, _args| {
             // Create a lambda proxy that returns its argument
             let proxy =
-                alloc_concurrent_synthetic(ctx, "java/util/function/UnaryOperator$Identity", 0);
+                try_alloc_concurrent_synthetic(ctx, "java/util/function/UnaryOperator$Identity", 0)?;
             Ok(Some(Value::Object(Some(proxy))))
         },
         cratonvm_native_api::NativeKind::SyntheticStub,
@@ -2275,7 +2850,7 @@ pub(crate) fn register_phase56_function_extras(r: &mut NativeMethodRegistry) {
             let comparator_pin = pinned_object_value(ctx, comparator);
             // Store comparator in a 1-field synthetic
             let proxy =
-                alloc_concurrent_synthetic(ctx, "java/util/function/BinaryOperator$MaxBy", 1);
+                try_alloc_concurrent_synthetic(ctx, "java/util/function/BinaryOperator$MaxBy", 1)?;
             ctx.set_field(
                 proxy,
                 0,
@@ -2299,7 +2874,7 @@ pub(crate) fn register_phase56_function_extras(r: &mut NativeMethodRegistry) {
             // relocate it (native stale-local family).
             let comparator_pin = pinned_object_value(ctx, comparator);
             let proxy =
-                alloc_concurrent_synthetic(ctx, "java/util/function/BinaryOperator$MinBy", 1);
+                try_alloc_concurrent_synthetic(ctx, "java/util/function/BinaryOperator$MinBy", 1)?;
             ctx.set_field(
                 proxy,
                 0,
@@ -2513,7 +3088,7 @@ pub(crate) fn register_phase56_function_extras(r: &mut NativeMethodRegistry) {
             let this_pin = ctx.pin_native_root(this);
             let other_pin = pinned_object_value(ctx, other);
             let composite =
-                alloc_concurrent_synthetic(ctx, "java/util/function/Predicate$$Lambda$And", 2);
+                try_alloc_concurrent_synthetic(ctx, "java/util/function/Predicate$$Lambda$And", 2)?;
             let this = ctx.read_native_pin(this_pin, this);
             ctx.set_field(composite, 0, Value::Object(Some(this)));
             ctx.set_field(
@@ -2537,7 +3112,7 @@ pub(crate) fn register_phase56_function_extras(r: &mut NativeMethodRegistry) {
             let this_pin = ctx.pin_native_root(this);
             let other_pin = pinned_object_value(ctx, other);
             let composite =
-                alloc_concurrent_synthetic(ctx, "java/util/function/Predicate$$Lambda$Or", 2);
+                try_alloc_concurrent_synthetic(ctx, "java/util/function/Predicate$$Lambda$Or", 2)?;
             let this = ctx.read_native_pin(this_pin, this);
             ctx.set_field(composite, 0, Value::Object(Some(this)));
             ctx.set_field(
@@ -2559,7 +3134,7 @@ pub(crate) fn register_phase56_function_extras(r: &mut NativeMethodRegistry) {
             // would relocate `this` (native stale-local family).
             let this_pin = ctx.pin_native_root(this);
             let composite =
-                alloc_concurrent_synthetic(ctx, "java/util/function/Predicate$$Lambda$Negate", 1);
+                try_alloc_concurrent_synthetic(ctx, "java/util/function/Predicate$$Lambda$Negate", 1)?;
             let this = ctx.read_native_pin(this_pin, this);
             ctx.set_field(composite, 0, Value::Object(Some(this)));
             ctx.unpin_native_roots(this_pin);
@@ -2577,7 +3152,7 @@ pub(crate) fn register_phase56_function_extras(r: &mut NativeMethodRegistry) {
             // would relocate it (native stale-local family).
             let target_pin = pinned_object_value(ctx, target);
             let composite =
-                alloc_concurrent_synthetic(ctx, "java/util/function/Predicate$$Lambda$Negate", 1);
+                try_alloc_concurrent_synthetic(ctx, "java/util/function/Predicate$$Lambda$Negate", 1)?;
             ctx.set_field(
                 composite,
                 0,
@@ -2812,7 +3387,7 @@ pub(crate) fn register_phase56_function_extras(r: &mut NativeMethodRegistry) {
             let this_pin = ctx.pin_native_root(this);
             let after_pin = pinned_object_value(ctx, after);
             let composite =
-                alloc_concurrent_synthetic(ctx, "java/util/function/Consumer$AndThen", 2);
+                try_alloc_concurrent_synthetic(ctx, "java/util/function/Consumer$AndThen", 2)?;
             let this = ctx.read_native_pin(this_pin, this);
             ctx.set_field(composite, 0, Value::Object(Some(this)));
             ctx.set_field(
@@ -3246,7 +3821,7 @@ pub(crate) fn p59_stream_from_spliterator(
             // Pin across the stream alloc below — a moving young GC there
             // would relocate the fresh array (native stale-local family).
             let empty_pin = ctx.pin_native_root(empty);
-            let stream = alloc_concurrent_synthetic(ctx, "java/util/stream/Stream", 1);
+            let stream = try_alloc_concurrent_synthetic(ctx, "java/util/stream/Stream", 1)?;
             let empty = ctx.read_native_pin(empty_pin, empty);
             ctx.set_field(stream, 0, Value::Object(Some(empty)));
             ctx.unpin_native_roots(empty_pin);
@@ -3256,7 +3831,7 @@ pub(crate) fn p59_stream_from_spliterator(
     // Pin across the stream alloc below — a moving young GC there would
     // relocate the element array (native stale-local family).
     let arr_pin = ctx.pin_native_root(arr);
-    let stream = alloc_concurrent_synthetic(ctx, "java/util/stream/Stream", 1);
+    let stream = try_alloc_concurrent_synthetic(ctx, "java/util/stream/Stream", 1)?;
     let arr = ctx.read_native_pin(arr_pin, arr);
     ctx.set_field(stream, 0, Value::Object(Some(arr)));
     ctx.unpin_native_roots(arr_pin);
@@ -3559,7 +4134,7 @@ pub(crate) fn p59_int_stream_from_spliterator(
     // Pin across the stream alloc below — a moving young GC there would
     // relocate the element array (native stale-local family).
     let arr_pin = ctx.pin_native_root(arr);
-    let stream = alloc_concurrent_synthetic(ctx, "java/util/stream/IntStream", 1);
+    let stream = try_alloc_concurrent_synthetic(ctx, "java/util/stream/IntStream", 1)?;
     let arr = ctx.read_native_pin(arr_pin, arr);
     ctx.set_field(stream, 0, Value::Object(Some(arr)));
     ctx.unpin_native_roots(arr_pin);
@@ -3578,7 +4153,7 @@ pub(crate) fn p59_long_stream_from_spliterator(
     // Pin across the stream alloc below — a moving young GC there would
     // relocate the element array (native stale-local family).
     let arr_pin = ctx.pin_native_root(arr);
-    let stream = alloc_concurrent_synthetic(ctx, "java/util/stream/LongStream", 1);
+    let stream = try_alloc_concurrent_synthetic(ctx, "java/util/stream/LongStream", 1)?;
     let arr = ctx.read_native_pin(arr_pin, arr);
     ctx.set_field(stream, 0, Value::Object(Some(arr)));
     ctx.unpin_native_roots(arr_pin);
@@ -3597,7 +4172,7 @@ pub(crate) fn p59_double_stream_from_spliterator(
     // Pin across the stream alloc below — a moving young GC there would
     // relocate the element array (native stale-local family).
     let arr_pin = ctx.pin_native_root(arr);
-    let stream = alloc_concurrent_synthetic(ctx, "java/util/stream/DoubleStream", 1);
+    let stream = try_alloc_concurrent_synthetic(ctx, "java/util/stream/DoubleStream", 1)?;
     let arr = ctx.read_native_pin(arr_pin, arr);
     ctx.set_field(stream, 0, Value::Object(Some(arr)));
     ctx.unpin_native_roots(arr_pin);
@@ -3627,7 +4202,7 @@ pub(crate) fn p59_collection_spliterator(
     // .lowest -> Arrays.stream -> Arrays.asList(arr).stream() ->
     // Collection.stream() default method -> this native).
     let len = ctx.array_length(data) as i32;
-    let spl = alloc_concurrent_synthetic(ctx, "java/util/Spliterator", 3);
+    let spl = try_alloc_concurrent_synthetic(ctx, "java/util/Spliterator", 3)?;
     let data = ctx.read_native_pin(data_pin, data);
     ctx.set_field(spl, 0, Value::Object(Some(data)));
     ctx.set_field(spl, 1, Value::Int(0)); // cursor at start
@@ -3691,7 +4266,7 @@ pub(crate) fn p59_hashset_spliterator(
     // 3-field layout (elements=0, pos=1, fence=2) — see the companion fix
     // in `p59_collection_spliterator` above for why fence must be set.
     let fence = keys.len() as i32;
-    let spl = alloc_concurrent_synthetic(ctx, "java/util/Spliterator", 3);
+    let spl = try_alloc_concurrent_synthetic(ctx, "java/util/Spliterator", 3)?;
     let arr = ctx.read_native_pin(arr_pin, arr);
     ctx.set_field(spl, 0, Value::Object(Some(arr)));
     ctx.set_field(spl, 1, Value::Int(0));
@@ -3740,7 +4315,7 @@ pub(crate) fn register_p64_stream_modern(r: &mut NativeMethodRegistry) {
             if count > 0 {
                 ctx.set_array_element(arr, 0, val);
             }
-            let stream = alloc_concurrent_synthetic(ctx, "java/util/stream/Stream", 1);
+            let stream = try_alloc_concurrent_synthetic(ctx, "java/util/stream/Stream", 1)?;
             ctx.set_field(stream, 0, Value::Object(Some(arr)));
             Ok(Some(Value::Object(Some(stream))))
         },
@@ -3769,7 +4344,7 @@ pub(crate) fn register_p64_stream_modern(r: &mut NativeMethodRegistry) {
                     ctx.set_array_element(new_arr, a_len + i, ctx.get_array_element(b, i));
                 }
             }
-            let stream = alloc_concurrent_synthetic(ctx, "java/util/stream/Stream", 1);
+            let stream = try_alloc_concurrent_synthetic(ctx, "java/util/stream/Stream", 1)?;
             ctx.set_field(stream, 0, Value::Object(Some(new_arr)));
             Ok(Some(Value::Object(Some(stream))))
         },
@@ -3804,7 +4379,7 @@ pub(crate) fn native_p64_stream_to_list(
         Value::Object(Some(a)) => a,
         _ => {
             // Empty list
-            let al = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
+            let al = try_alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2)?;
             ctx.set_field(al, 0, Value::Object(None));
             ctx.set_field(al, 1, Value::Int(0));
             return Ok(Some(Value::Object(Some(al))));
@@ -3815,7 +4390,7 @@ pub(crate) fn native_p64_stream_to_list(
     for i in 0..len {
         ctx.set_array_element(new_arr, i, ctx.get_array_element(arr, i));
     }
-    let al = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
+    let al = try_alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2)?;
     ctx.set_field(al, 0, Value::Object(Some(new_arr)));
     ctx.set_field(al, 1, Value::Int(len as i32));
     Ok(Some(Value::Object(Some(al))))
@@ -3869,7 +4444,7 @@ pub(crate) fn register_p67_gatherer(r: &mut NativeMethodRegistry) {
         "(Ljava/util/stream/Gatherer$Integrator;)Ljava/util/stream/Gatherer;",
         |ctx, args| {
             // 3-field: initializer=0, integrator=1, finisher=2
-            let obj = alloc_concurrent_synthetic(ctx, "java/util/stream/Gatherer", 3);
+            let obj = try_alloc_concurrent_synthetic(ctx, "java/util/stream/Gatherer", 3)?;
             ctx.set_field(obj, 0, Value::Object(None));
             ctx.set_field(obj, 1, args.first().copied().unwrap_or(Value::Object(None)));
             ctx.set_field(obj, 2, Value::Object(None));
@@ -3877,14 +4452,14 @@ pub(crate) fn register_p67_gatherer(r: &mut NativeMethodRegistry) {
         },
     );
     r.register(g, "ofSequential", "(Ljava/util/function/Supplier;Ljava/util/stream/Gatherer$Integrator;)Ljava/util/stream/Gatherer;", |ctx, args| {
-        let obj = alloc_concurrent_synthetic(ctx, "java/util/stream/Gatherer", 3);
+        let obj = try_alloc_concurrent_synthetic(ctx, "java/util/stream/Gatherer", 3)?;
         ctx.set_field(obj, 0, args.first().copied().unwrap_or(Value::Object(None)));
         ctx.set_field(obj, 1, args.get(1).copied().unwrap_or(Value::Object(None)));
         ctx.set_field(obj, 2, Value::Object(None));
         Ok(Some(Value::Object(Some(obj))))
     });
     r.register(g, "ofSequential", "(Ljava/util/function/Supplier;Ljava/util/stream/Gatherer$Integrator;Ljava/util/function/BiConsumer;)Ljava/util/stream/Gatherer;", |ctx, args| {
-        let obj = alloc_concurrent_synthetic(ctx, "java/util/stream/Gatherer", 3);
+        let obj = try_alloc_concurrent_synthetic(ctx, "java/util/stream/Gatherer", 3)?;
         ctx.set_field(obj, 0, args.first().copied().unwrap_or(Value::Object(None)));
         ctx.set_field(obj, 1, args.get(1).copied().unwrap_or(Value::Object(None)));
         ctx.set_field(obj, 2, args.get(2).copied().unwrap_or(Value::Object(None)));
@@ -3968,7 +4543,7 @@ pub(crate) fn register_p67_gatherer(r: &mut NativeMethodRegistry) {
         "fold",
         "(Ljava/util/function/Supplier;Ljava/util/function/BiFunction;)Ljava/util/stream/Gatherer;",
         |ctx, args| {
-            let obj = alloc_concurrent_synthetic(ctx, "java/util/stream/Gatherer", 3);
+            let obj = try_alloc_concurrent_synthetic(ctx, "java/util/stream/Gatherer", 3)?;
             ctx.set_field(obj, 0, args.first().copied().unwrap_or(Value::Object(None)));
             ctx.set_field(obj, 1, args.get(1).copied().unwrap_or(Value::Object(None)));
             ctx.set_field(obj, 2, Value::Object(None));
@@ -3981,7 +4556,7 @@ pub(crate) fn register_p67_gatherer(r: &mut NativeMethodRegistry) {
         "scan",
         "(Ljava/util/function/Supplier;Ljava/util/function/BiFunction;)Ljava/util/stream/Gatherer;",
         |ctx, args| {
-            let obj = alloc_concurrent_synthetic(ctx, "java/util/stream/Gatherer", 3);
+            let obj = try_alloc_concurrent_synthetic(ctx, "java/util/stream/Gatherer", 3)?;
             ctx.set_field(obj, 0, args.first().copied().unwrap_or(Value::Object(None)));
             ctx.set_field(obj, 1, args.get(1).copied().unwrap_or(Value::Object(None)));
             ctx.set_field(obj, 2, Value::Object(None));
@@ -3994,7 +4569,7 @@ pub(crate) fn register_p67_gatherer(r: &mut NativeMethodRegistry) {
         "windowFixed",
         "(I)Ljava/util/stream/Gatherer;",
         |ctx, args| {
-            let obj = alloc_concurrent_synthetic(ctx, "java/util/stream/Gatherer", 3);
+            let obj = try_alloc_concurrent_synthetic(ctx, "java/util/stream/Gatherer", 3)?;
             ctx.set_field(obj, 0, args.first().copied().unwrap_or(Value::Int(1)));
             ctx.set_field(obj, 1, Value::Object(None));
             ctx.set_field(obj, 2, Value::Object(None));
@@ -4007,7 +4582,7 @@ pub(crate) fn register_p67_gatherer(r: &mut NativeMethodRegistry) {
         "windowSliding",
         "(I)Ljava/util/stream/Gatherer;",
         |ctx, args| {
-            let obj = alloc_concurrent_synthetic(ctx, "java/util/stream/Gatherer", 3);
+            let obj = try_alloc_concurrent_synthetic(ctx, "java/util/stream/Gatherer", 3)?;
             ctx.set_field(obj, 0, args.first().copied().unwrap_or(Value::Int(1)));
             ctx.set_field(obj, 1, Value::Object(None));
             ctx.set_field(obj, 2, Value::Object(None));
@@ -4213,7 +4788,7 @@ pub(crate) fn register_p69_spliterator(r: &mut NativeMethodRegistry) {
                 _ => return Ok(Some(Value::Object(None))),
             };
             let len = ctx.array_length(arr);
-            let obj = alloc_concurrent_synthetic(ctx, "java/util/Spliterator", 3);
+            let obj = try_alloc_concurrent_synthetic(ctx, "java/util/Spliterator", 3)?;
             ctx.set_field(obj, 0, Value::Object(Some(arr)));
             ctx.set_field(obj, 1, Value::Int(0));
             ctx.set_field(obj, 2, Value::Int(len as i32));
@@ -4226,7 +4801,7 @@ pub(crate) fn register_p69_spliterator(r: &mut NativeMethodRegistry) {
         "()Ljava/util/Spliterator;",
         |ctx, _args| {
             let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0);
-            let obj = alloc_concurrent_synthetic(ctx, "java/util/Spliterator", 3);
+            let obj = try_alloc_concurrent_synthetic(ctx, "java/util/Spliterator", 3)?;
             ctx.set_field(obj, 0, Value::Object(Some(arr)));
             ctx.set_field(obj, 1, Value::Int(0));
             ctx.set_field(obj, 2, Value::Int(0));
@@ -4258,7 +4833,7 @@ pub(crate) fn register_p69_spliterator(r: &mut NativeMethodRegistry) {
                 Some(Value::Object(Some(it))) => *it,
                 _ => {
                     let empty = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0);
-                    let obj = alloc_concurrent_synthetic(ctx, "java/util/Spliterator", 3);
+                    let obj = try_alloc_concurrent_synthetic(ctx, "java/util/Spliterator", 3)?;
                     ctx.set_field(obj, 0, Value::Object(Some(empty)));
                     ctx.set_field(obj, 1, Value::Int(0));
                     ctx.set_field(obj, 2, Value::Int(0));
@@ -4287,7 +4862,7 @@ pub(crate) fn register_p69_spliterator(r: &mut NativeMethodRegistry) {
             for (i, v) in collected.iter().enumerate() {
                 ctx.set_array_element(arr, i, *v);
             }
-            let obj = alloc_concurrent_synthetic(ctx, "java/util/Spliterator", 3);
+            let obj = try_alloc_concurrent_synthetic(ctx, "java/util/Spliterator", 3)?;
             ctx.set_field(obj, 0, Value::Object(Some(arr)));
             ctx.set_field(obj, 1, Value::Int(0));
             ctx.set_field(obj, 2, Value::Int(collected.len() as i32));
@@ -4318,7 +4893,7 @@ pub(crate) fn register_p69_spliterator(r: &mut NativeMethodRegistry) {
                 Some(Value::Object(Some(s))) => *s,
                 _ => {
                     let empty = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0);
-                    let stream = alloc_concurrent_synthetic(ctx, "java/util/stream/Stream", 1);
+                    let stream = try_alloc_concurrent_synthetic(ctx, "java/util/stream/Stream", 1)?;
                     ctx.set_field(stream, 0, Value::Object(Some(empty)));
                     return Ok(Some(Value::Object(Some(stream))));
                 }
@@ -4351,7 +4926,7 @@ pub(crate) fn register_p69_spliterator(r: &mut NativeMethodRegistry) {
                     drain_spliterator(ctx, spliterator)?
                 }
             };
-            let stream = alloc_concurrent_synthetic(ctx, "java/util/stream/Stream", 1);
+            let stream = try_alloc_concurrent_synthetic(ctx, "java/util/stream/Stream", 1)?;
             ctx.set_field(stream, 0, Value::Object(Some(arr)));
             Ok(Some(Value::Object(Some(stream))))
         },
@@ -4362,7 +4937,7 @@ pub(crate) fn register_p69_spliterator(r: &mut NativeMethodRegistry) {
         "(Ljava/util/Spliterator$OfInt;Z)Ljava/util/stream/IntStream;",
         |ctx, _args| {
             let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0);
-            let stream = alloc_concurrent_synthetic(ctx, "java/util/stream/IntStream", 1);
+            let stream = try_alloc_concurrent_synthetic(ctx, "java/util/stream/IntStream", 1)?;
             ctx.set_field(stream, 0, Value::Object(Some(arr)));
             Ok(Some(Value::Object(Some(stream))))
         },
@@ -4373,7 +4948,7 @@ pub(crate) fn register_p69_spliterator(r: &mut NativeMethodRegistry) {
         "(Ljava/util/Spliterator$OfLong;Z)Ljava/util/stream/LongStream;",
         |ctx, _args| {
             let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0);
-            let stream = alloc_concurrent_synthetic(ctx, "java/util/stream/LongStream", 1);
+            let stream = try_alloc_concurrent_synthetic(ctx, "java/util/stream/LongStream", 1)?;
             ctx.set_field(stream, 0, Value::Object(Some(arr)));
             Ok(Some(Value::Object(Some(stream))))
         },
@@ -4384,7 +4959,7 @@ pub(crate) fn register_p69_spliterator(r: &mut NativeMethodRegistry) {
         "(Ljava/util/Spliterator$OfDouble;Z)Ljava/util/stream/DoubleStream;",
         |ctx, _args| {
             let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0);
-            let stream = alloc_concurrent_synthetic(ctx, "java/util/stream/DoubleStream", 1);
+            let stream = try_alloc_concurrent_synthetic(ctx, "java/util/stream/DoubleStream", 1)?;
             ctx.set_field(stream, 0, Value::Object(Some(arr)));
             Ok(Some(Value::Object(Some(stream))))
         },
@@ -4458,7 +5033,7 @@ pub(crate) fn drain_spliterator(
         );
     }
     // Allocate the collector consumer.
-    let collector = alloc_concurrent_synthetic(ctx, "cratonvm/internal/StreamCollector", 2);
+    let collector = try_alloc_concurrent_synthetic(ctx, "cratonvm/internal/StreamCollector", 2)?;
     let initial = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 16);
     ctx.set_field(collector, 0, Value::Object(Some(initial)));
     ctx.set_field(collector, 1, Value::Int(0));

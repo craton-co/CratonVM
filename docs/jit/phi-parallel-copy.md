@@ -1,7 +1,7 @@
 # Phi resolution in `ir_lower`: the parallel copy and its scratch word
 
 Scope: the "phi web on a CFG edge is a *parallel* copy" item of
-`docs/feature-designs/c2/deep-research-vm-c2.md`, as it lands in the optimizing
+the C2 review, as it lands in the optimizing
 backend.
 
 Subject: `jit/src/ir_lower.rs` — `Lowerer::emit_phi_copies`,

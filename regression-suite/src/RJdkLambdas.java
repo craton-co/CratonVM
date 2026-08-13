@@ -147,8 +147,21 @@ public class RJdkLambdas {
         // constructor ref
         Supplier<ArrayList<String>> ctor = ArrayList::new;
         check(ctor.get().isEmpty(), "constructor ref");
+        // `isEmpty()` is true of one memoised instance handed back forever, so
+        // it cannot see a dispatcher that caches the constructed object -- a
+        // shape this VM has two independent lambda dispatchers to get wrong.
+        // A constructor reference must ALLOCATE on every call.
+        check(ctor.get() != ctor.get(), "constructor ref must allocate a new instance per call");
         Function<Integer, ArrayList<String>> ctor1 = ArrayList::new;
         check(ctor1.apply(8).isEmpty(), "constructor ref with arg");
+        ArrayList<String> sized = ctor1.apply(8);
+        sized.add("only");
+        // ...and the argument must reach the capacity constructor rather than
+        // being dropped into an (int-element) collection constructor.
+        check(sized.size() == 1 && sized.get(0).equals("only"),
+                "constructor ref with arg produced " + sized);
+        check(ctor1.apply(8) != ctor1.apply(8),
+                "constructor ref with arg must allocate a new instance per call");
         // array constructor ref
         java.util.function.IntFunction<String[]> arr = String[]::new;
         check(arr.apply(3).length == 3, "array constructor ref");

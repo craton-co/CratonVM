@@ -277,16 +277,95 @@ fn infl_init(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     Ok(Some(Value::Long(handle)))
 }
 
-fn infl_set_dictionary(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+/// `Inflater.setDictionary(long addr, byte[] b, int off, int len)`.
+///
+/// A zlib PRESET DICTIONARY seeds the LZ77 window before decoding. The stream
+/// asks for one by setting `FDICT` in the header's second byte and following it
+/// with the dictionary's ADLER-32; zlib then reports `Z_NEED_DICT`, which the
+/// JDK surfaces as `Inflater.needsDictionary()`, and the caller is expected to
+/// supply the dictionary and resume.
+///
+/// This used to be a no-op, on the stated grounds that "flate2's
+/// `Decompress::set_dictionary` is gated behind a zlib backend feature we don't
+/// enable". That was not true: `native-builtins/Cargo.toml` has always built
+/// flate2 with `features = ["zlib"]`, which sets flate2's `any_zlib` and
+/// compiles `set_dictionary` in. The no-op cost SPDY every compressed header
+/// block — `SpdyHeaderBlockZlibDecoder` hands the dictionary over exactly as
+/// above, got silence, inflated 0 bytes and reported `Invalid Header Block`.
+///
+/// Errors are swallowed rather than thrown: the JDK's own native returns
+/// `void` and its only documented failure is `IllegalArgumentException` for a
+/// dictionary whose checksum does not match the stream's `DICTID`, which zlib
+/// reports the same way as any other `Z_DATA_ERROR`. Reporting nothing leaves
+/// `needsDictionary()` true, so the caller's next `inflate()` still makes no
+/// progress and the stream fails where it would have failed anyway.
+fn infl_set_dictionary(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // static setDictionary(long, byte[], int off, int len)
-    // flate2's `Decompress::set_dictionary` is gated behind a zlib backend
-    // feature we don't enable; preset dictionaries are not used by any
-    // JAR/ZIP entry encountered on the bootstrap path, so we no-op here.
+    let addr = arg_long(args, 0);
+    let Some(arr) = arg_obj(args, 1) else {
+        return Ok(None);
+    };
+    let off = arg_int(args, 2).max(0) as usize;
+    let len = arg_int(args, 3).max(0) as usize;
+    let dict = read_byte_array(ctx, arr, off, len);
+    let mut tbl = inflater_table().lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(st) = tbl.get_mut(&addr) {
+        let _ = st.decomp.set_dictionary(&dict);
+    }
     Ok(None)
 }
 
-fn infl_set_dictionary_buffer(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    // Direct buffer setDictionary — not essential for bootstrap; no-op.
+/// Read a preset dictionary out of a direct `ByteBuffer`'s native memory.
+///
+/// Shared by both `setDictionaryBuffer` natives. A buffer address that cannot
+/// be read is reported as `IllegalArgumentException`, which is UNCHECKED and is
+/// the exception `setDictionary` already documents — the sibling `inflate*`
+/// natives raise `IOException` for the same fault, but they are declared
+/// `throws DataFormatException` and `setDictionary*` is declared to throw
+/// nothing, so a checked throwable out of this frame would escape every
+/// caller's `catch`.
+fn read_direct_dictionary(
+    ctx: &mut dyn NativeContext,
+    buf_addr: i64,
+    len: usize,
+) -> Result<Vec<u8>, MethodCallFailed> {
+    let mut dict = vec![0u8; len];
+    if len > 0 && !ctx.copy_from_native_memory(buf_addr, &mut dict) {
+        return Err(RuntimeError::IllegalArgumentException {
+            message: format!("setDictionaryBuffer: invalid dictionary buffer address {buf_addr:#x}"),
+        }
+        .into());
+    }
+    Ok(dict)
+}
+
+/// `Inflater.setDictionaryBuffer(long addr, long bufferAddress, int len)` — the
+/// direct-`ByteBuffer` flavour of [`infl_set_dictionary`], reached from
+/// `Inflater.setDictionary(ByteBuffer)` when the buffer is direct.
+///
+/// This was a no-op for a stated reason that had gone stale in the same way the
+/// heap overload's had: "the direct-buffer inflate natives are themselves
+/// unsupported (`infl_direct_buffer_unsupported`), so a caller cannot get far
+/// enough to need this". There is no `infl_direct_buffer_unsupported` — all
+/// four `inflate*` overloads (and all four `deflate*` overloads) read and write
+/// direct-buffer memory for real. So a caller CAN get there, and did: an app
+/// that inflates a preset-dictionary stream into a direct `ByteBuffer` hit
+/// exactly the SPDY failure the heap overload was fixed for, with the
+/// justification for the gap pointing at a function that does not exist.
+///
+/// Verify the premise, not the comment: `deflate_dictDirectBuffer_len` is 18
+/// bytes against HotSpot's 18 and the no-dictionary encoder's 53.
+fn infl_set_dictionary_buffer(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    // static setDictionaryBuffer(long addr, long bufferAddress, int len)
+    let addr = arg_long(args, 0);
+    let buf_addr = arg_long(args, 1);
+    let len = arg_int(args, 2).max(0) as usize;
+    let dict = read_direct_dictionary(ctx, buf_addr, len)?;
+    let mut tbl = inflater_table().lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(st) = tbl.get_mut(&addr) {
+        // Errors swallowed for the same reason as the heap overload.
+        let _ = st.decomp.set_dictionary(&dict);
+    }
     Ok(None)
 }
 
@@ -631,13 +710,44 @@ fn defl_init(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     Ok(Some(Value::Long(handle)))
 }
 
-fn defl_set_dictionary(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    // Preset dictionaries not needed for the bootstrap JAR path; see
-    // infl_set_dictionary for rationale.
+/// `Deflater.setDictionary(long addr, byte[] b, int off, int len)` — the
+/// compressing half of the preset-dictionary contract; see
+/// [`infl_set_dictionary`] for why this was a no-op and why that was wrong.
+///
+/// Without it the encoder silently produced a stream with `FDICT` clear, so a
+/// round trip through CratonVM's own Deflater+Inflater still "worked" — both
+/// halves ignored the dictionary — while the output was rejected by any real
+/// zlib peer and any stream from one was rejected here. That mutual blindness
+/// is why a probe has to compare the COMPRESSED LENGTH against HotSpot (57 vs
+/// 75 bytes for the same input) rather than just asserting the round trip.
+fn defl_set_dictionary(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let addr = arg_long(args, 0);
+    let Some(arr) = arg_obj(args, 1) else {
+        return Ok(None);
+    };
+    let off = arg_int(args, 2).max(0) as usize;
+    let len = arg_int(args, 3).max(0) as usize;
+    let dict = read_byte_array(ctx, arr, off, len);
+    let mut tbl = deflater_table().lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(st) = tbl.get_mut(&addr) {
+        let _ = st.compress.set_dictionary(&dict);
+    }
     Ok(None)
 }
 
-fn defl_set_dictionary_buffer(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+/// `Deflater.setDictionaryBuffer(long addr, long bufferAddress, int len)` — the
+/// direct-`ByteBuffer` flavour of [`defl_set_dictionary`]; see
+/// [`infl_set_dictionary_buffer`] for why this pair was a no-op and why the
+/// reason given was not true.
+fn defl_set_dictionary_buffer(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let addr = arg_long(args, 0);
+    let buf_addr = arg_long(args, 1);
+    let len = arg_int(args, 2).max(0) as usize;
+    let dict = read_direct_dictionary(ctx, buf_addr, len)?;
+    let mut tbl = deflater_table().lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(st) = tbl.get_mut(&addr) {
+        let _ = st.compress.set_dictionary(&dict);
+    }
     Ok(None)
 }
 
@@ -960,7 +1070,8 @@ fn defl_end(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
 }
 
 // audit-round6: `RuntimeError` is now used by the direct-buffer inflate
-// natives (`infl_direct_buffer_unsupported`), so the former
+// natives (`infl_inflate_bytes_buffer` and friends, which report an unreadable
+// buffer address rather than fabricating a successful step), so the former
 // `_unused_runtime_error` import-silencing shim has been removed.
 #[allow(dead_code)]
 fn _unused_ret() -> ObjectRef {
@@ -1197,7 +1308,6 @@ pub fn register_zip_real_natives(r: &mut NativeMethodRegistry) {
 
     // Deflater
     let dl = "java/util/zip/Deflater";
-    r.register(dl, "initIDs", "()V", defl_init_ids);
     r.register_with_kind(dl, "init", "(IIZ)J", defl_init, NativeKind::Bridge);
     r.register_with_kind(dl, "setDictionary", "(J[BII)V", defl_set_dictionary, NativeKind::Bridge);
     r.register_with_kind(
@@ -1976,5 +2086,350 @@ mod tests {
         .unwrap()
         .unwrap();
         assert_eq!(null_arr, Value::Int(1));
+    }
+
+    /// Copy `bytes` into a fresh mock `byte[]`.
+    fn byte_array(ctx: &mut dyn NativeContext, bytes: &[u8]) -> ObjectRef {
+        let arr = ctx.new_array(ArrayElementType::Byte, bytes.len());
+        for (i, b) in bytes.iter().enumerate() {
+            ctx.set_array_element(arr, i, Value::Int(*b as i8 as i32));
+        }
+        arr
+    }
+
+    /// A zlib PRESET DICTIONARY must actually reach zlib, in both directions.
+    ///
+    /// Both `setDictionary` natives used to be no-ops, on the stated grounds
+    /// that flate2's `set_dictionary` was "gated behind a zlib backend feature
+    /// we don't enable" — untrue, `native-builtins/Cargo.toml` has always used
+    /// `features = ["zlib"]`. SPDY compresses every header block with a preset
+    /// dictionary, so `SpdyHeaderBlockZlibDecoder` handed the dictionary over,
+    /// got silence, inflated 0 bytes and reported `Invalid Header Block`.
+    ///
+    /// Asserting a round trip through our OWN Deflater+Inflater would not have
+    /// caught it: with both halves ignoring the dictionary the round trip is
+    /// green and the bytes on the wire are still wrong. So the compressing
+    /// half is pinned on the header's `FDICT` bit and the decompressing half on
+    /// the `needDict` result bit — both of which are only reachable when the
+    /// dictionary genuinely reaches zlib.
+    #[test]
+    fn set_dictionary_reaches_zlib_on_both_halves() {
+        const DICT: &[u8] = b"optionsgetheadpostputdeletetraceacceptaccept-charset";
+        let payload = b"accept-charset: utf-8 accept: text/html options get head post";
+
+        let mut ctx = mock_ctx();
+
+        // --- compressing half: the emitted zlib header must set FDICT -------
+        let daddr = match defl_init(&mut ctx, &[Value::Int(6), Value::Int(0), Value::Int(0)])
+            .unwrap()
+            .unwrap()
+        {
+            Value::Long(a) => a,
+            other => panic!("expected Long handle, got {other:?}"),
+        };
+        let dict_arr = byte_array(&mut ctx, DICT);
+        defl_set_dictionary(
+            &mut ctx,
+            &[
+                Value::Long(daddr),
+                Value::Object(Some(dict_arr)),
+                Value::Int(0),
+                Value::Int(DICT.len() as i32),
+            ],
+        )
+        .unwrap();
+
+        let in_arr = byte_array(&mut ctx, payload);
+        let out_arr = ctx.new_array(ArrayElementType::Byte, 512);
+        let packed = match defl_deflate_bytes_bytes(
+            &mut ctx,
+            &[
+                Value::Object(None),
+                Value::Long(daddr),
+                Value::Object(Some(in_arr)),
+                Value::Int(0),
+                Value::Int(payload.len() as i32),
+                Value::Object(Some(out_arr)),
+                Value::Int(0),
+                Value::Int(512),
+                Value::Int(4), // FINISH
+                Value::Int(0),
+            ],
+        )
+        .unwrap()
+        .unwrap()
+        {
+            Value::Long(v) => v,
+            other => panic!("expected Long, got {other:?}"),
+        };
+        let (_, produced, _) = unpack_deflate_result(packed);
+        assert!(produced > 2, "deflate produced nothing");
+        let compressed = read_byte_array(&ctx, out_arr, 0, produced);
+
+        // zlib header: CMF, FLG. FDICT is bit 5 of FLG, and a DICTID follows.
+        assert_eq!(compressed[0] & 0x0f, 8, "expected deflate method in CMF");
+        assert_ne!(
+            compressed[1] & 0x20,
+            0,
+            "FDICT must be set — the dictionary never reached the compressor \
+             (this is the bug: the stream is then unreadable by any peer that \
+             expects the preset dictionary)"
+        );
+
+        // --- decompressing half: needDict, then progress after setDictionary -
+        let iaddr = match infl_init(&mut ctx, &[Value::Int(0)]).unwrap().unwrap() {
+            Value::Long(a) => a,
+            other => panic!("expected Long handle, got {other:?}"),
+        };
+        let cin = byte_array(&mut ctx, &compressed);
+        let cout = ctx.new_array(ArrayElementType::Byte, 512);
+        // `Inflater` keeps its own input cursor: the header bytes the first
+        // call consumes must NOT be handed to the second one, or zlib sees a
+        // second header mid-stream and raises DataFormatException.
+        let inflate = |ctx: &mut dyn NativeContext, off: usize| -> (usize, usize, bool) {
+            let p = match infl_inflate_bytes_bytes(
+                ctx,
+                &[
+                    Value::Object(None),
+                    Value::Long(iaddr),
+                    Value::Object(Some(cin)),
+                    Value::Int(off as i32),
+                    Value::Int((compressed.len() - off) as i32),
+                    Value::Object(Some(cout)),
+                    Value::Int(0),
+                    Value::Int(512),
+                ],
+            )
+            .unwrap()
+            .unwrap()
+            {
+                Value::Long(v) => v as u64,
+                other => panic!("expected Long, got {other:?}"),
+            };
+            (
+                (p & 0x7FFF_FFFF) as usize,
+                ((p >> 31) & 0x7FFF_FFFF) as usize,
+                (p >> 63) & 1 == 1,
+            )
+        };
+
+        let (consumed_first, produced_first, need_dict) = inflate(&mut ctx, 0);
+        assert_eq!(produced_first, 0, "no output is possible before the dictionary");
+        assert!(
+            need_dict,
+            "inflate must report needDict for an FDICT stream"
+        );
+
+        let dict_arr2 = byte_array(&mut ctx, DICT);
+        infl_set_dictionary(
+            &mut ctx,
+            &[
+                Value::Long(iaddr),
+                Value::Object(Some(dict_arr2)),
+                Value::Int(0),
+                Value::Int(DICT.len() as i32),
+            ],
+        )
+        .unwrap();
+
+        let (_, produced_second, _) = inflate(&mut ctx, consumed_first);
+        assert_eq!(
+            produced_second,
+            payload.len(),
+            "after setDictionary the stream must decode — a no-op setDictionary \
+             leaves this at 0, which is what made SPDY report Invalid Header Block"
+        );
+        assert_eq!(read_byte_array(&ctx, cout, 0, produced_second), payload);
+    }
+
+    /// Deflate `payload` with `dict_addr` as a DIRECT-buffer preset dictionary
+    /// (or with no dictionary at all when `dict_addr` is `None`), returning the
+    /// compressed bytes.
+    fn deflate_with_buffer_dictionary(
+        ctx: &mut dyn NativeContext,
+        payload: &[u8],
+        dict: Option<(i64, usize)>,
+    ) -> Vec<u8> {
+        let addr = match defl_init(ctx, &[Value::Int(6), Value::Int(0), Value::Int(0)])
+            .unwrap()
+            .unwrap()
+        {
+            Value::Long(a) => a,
+            other => panic!("expected Long handle, got {other:?}"),
+        };
+        if let Some((dict_addr, dict_len)) = dict {
+            defl_set_dictionary_buffer(
+                ctx,
+                &[
+                    Value::Long(addr),
+                    Value::Long(dict_addr),
+                    Value::Int(dict_len as i32),
+                ],
+            )
+            .unwrap();
+        }
+        let in_arr = byte_array(ctx, payload);
+        let out_arr = ctx.new_array(ArrayElementType::Byte, 512);
+        let packed = match defl_deflate_bytes_bytes(
+            ctx,
+            &[
+                Value::Object(None),
+                Value::Long(addr),
+                Value::Object(Some(in_arr)),
+                Value::Int(0),
+                Value::Int(payload.len() as i32),
+                Value::Object(Some(out_arr)),
+                Value::Int(0),
+                Value::Int(512),
+                Value::Int(4), // FINISH
+                Value::Int(0),
+            ],
+        )
+        .unwrap()
+        .unwrap()
+        {
+            Value::Long(v) => v,
+            other => panic!("expected Long, got {other:?}"),
+        };
+        let (_, produced, _) = unpack_deflate_result(packed);
+        read_byte_array(ctx, out_arr, 0, produced)
+    }
+
+    /// The DIRECT-`ByteBuffer` `setDictionary` overloads must reach zlib too.
+    ///
+    /// These two stayed no-ops when the heap overloads were fixed, on the
+    /// stated grounds that "the direct-buffer inflate natives are themselves
+    /// unsupported (`infl_direct_buffer_unsupported`), so a caller cannot get
+    /// far enough to need this". No such function exists: all four `inflate*`
+    /// and all four `deflate*` overloads read and write direct-buffer memory
+    /// for real, so the gap was reachable — the same wrong-on-the-wire stream
+    /// SPDY tripped over, reached through `setDictionary(ByteBuffer)`.
+    ///
+    /// Pinned on FDICT and on the compressed LENGTH against a no-dictionary
+    /// control, for the same reason as the heap test: a round trip through our
+    /// own encoder is green either way.
+    #[test]
+    fn set_dictionary_buffer_reaches_zlib_on_both_halves() {
+        const DICT: &[u8] = b"optionsgetheadpostputdeletetraceacceptaccept-charset";
+        let payload = b"accept-charset: utf-8 accept: text/html options get head post";
+
+        let mut ctx = mock_ctx();
+
+        // A direct ByteBuffer's payload is plain native memory as far as the
+        // native is concerned; a `Vec`'s backing store is the same thing here,
+        // and `MockNativeContext` copies from real pointers.
+        let dict_mem = DICT.to_vec();
+        let dict_addr = dict_mem.as_ptr() as i64;
+
+        let plain = deflate_with_buffer_dictionary(&mut ctx, payload, None);
+        let with_dict =
+            deflate_with_buffer_dictionary(&mut ctx, payload, Some((dict_addr, DICT.len())));
+
+        assert_ne!(
+            with_dict[1] & 0x20,
+            0,
+            "FDICT must be set — the direct-buffer dictionary never reached the \
+             compressor"
+        );
+        assert!(
+            with_dict.len() < plain.len(),
+            "a preset dictionary must shrink this payload: {} bytes with the \
+             dictionary vs {} without (equal lengths mean the no-op is still \
+             there)",
+            with_dict.len(),
+            plain.len()
+        );
+
+        // --- decompressing half -------------------------------------------
+        let iaddr = match infl_init(&mut ctx, &[Value::Int(0)]).unwrap().unwrap() {
+            Value::Long(a) => a,
+            other => panic!("expected Long handle, got {other:?}"),
+        };
+        let cin = byte_array(&mut ctx, &with_dict);
+        let cout = ctx.new_array(ArrayElementType::Byte, 512);
+        let mut inflate = |ctx: &mut dyn NativeContext, off: usize| -> (usize, usize, bool) {
+            let p = match infl_inflate_bytes_bytes(
+                ctx,
+                &[
+                    Value::Object(None),
+                    Value::Long(iaddr),
+                    Value::Object(Some(cin)),
+                    Value::Int(off as i32),
+                    Value::Int((with_dict.len() - off) as i32),
+                    Value::Object(Some(cout)),
+                    Value::Int(0),
+                    Value::Int(512),
+                ],
+            )
+            .unwrap()
+            .unwrap()
+            {
+                Value::Long(v) => v as u64,
+                other => panic!("expected Long, got {other:?}"),
+            };
+            (
+                (p & 0x7FFF_FFFF) as usize,
+                ((p >> 31) & 0x7FFF_FFFF) as usize,
+                (p >> 63) & 1 == 1,
+            )
+        };
+
+        let (consumed_first, produced_first, need_dict) = inflate(&mut ctx, 0);
+        assert_eq!(produced_first, 0, "no output is possible before the dictionary");
+        assert!(need_dict, "inflate must report needDict for an FDICT stream");
+
+        infl_set_dictionary_buffer(
+            &mut ctx,
+            &[
+                Value::Long(iaddr),
+                Value::Long(dict_addr),
+                Value::Int(DICT.len() as i32),
+            ],
+        )
+        .unwrap();
+
+        let (_, produced_second, _) = inflate(&mut ctx, consumed_first);
+        assert_eq!(
+            produced_second,
+            payload.len(),
+            "after setDictionary(ByteBuffer) the stream must decode — the no-op \
+             left this at 0"
+        );
+        assert_eq!(read_byte_array(&ctx, cout, 0, produced_second), payload);
+
+        // Keep the dictionary alive until every native has copied out of it.
+        drop(dict_mem);
+    }
+
+    /// An unreadable dictionary address is reported, not silently dropped —
+    /// and `IllegalArgumentException` is chosen because it is UNCHECKED:
+    /// `setDictionary` declares no checked exception, so a `DataFormatException`
+    /// (what the sibling `inflate*` natives raise for a bad address) would
+    /// escape every caller's `catch`.
+    #[test]
+    fn set_dictionary_buffer_reports_an_unreadable_address() {
+        let mut ctx = mock_ctx();
+        let addr = match defl_init(&mut ctx, &[Value::Int(6), Value::Int(0), Value::Int(0)])
+            .unwrap()
+            .unwrap()
+        {
+            Value::Long(a) => a,
+            other => panic!("expected Long handle, got {other:?}"),
+        };
+
+        assert!(
+            defl_set_dictionary_buffer(
+                &mut ctx,
+                &[Value::Long(addr), Value::Long(0), Value::Int(8)]
+            )
+            .is_err(),
+            "a null buffer address with a non-zero length must be reported"
+        );
+        // A zero-length dictionary reads nothing, so the address is irrelevant.
+        assert!(defl_set_dictionary_buffer(
+            &mut ctx,
+            &[Value::Long(addr), Value::Long(0), Value::Int(0)]
+        )
+        .is_ok());
     }
 }

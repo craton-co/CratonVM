@@ -119,7 +119,7 @@ pub struct TransformerEntry {
 ///     loads in VM B;
 ///   * `reset_transformer_chain()` in one VM wiped another's chain.
 ///
-/// See `docs/feature-designs/vm-process-global-state-round-2.md`.
+/// See `feature-designs/vm-process-global-state-round-2.md`.
 type TransformerChains = HashMap<usize, Vec<TransformerEntry>>;
 
 fn transformer_chains() -> &'static RwLock<TransformerChains> {
@@ -229,6 +229,10 @@ pub fn forget_vm_transformers(vm: usize) {
         .write()
         .unwrap_or_else(PoisonError::into_inner);
     chains.remove(&vm);
+    // The load-time offer memo is keyed on the same identity and must go with
+    // it — a later VM that reuses the identity would otherwise start life
+    // believing it had already offered every class the previous one loaded.
+    forget_vm_load_time_offers(vm);
 }
 
 /// Set once any VM in this process registers a transformer, and never cleared.
@@ -281,8 +285,13 @@ pub fn transformer_count(vm: usize) -> usize {
 }
 
 /// Reset `vm`'s chain. Used by VM shutdown / test isolation.
+///
+/// Clears the load-time offer memo with it: "start over" has to mean the next
+/// transformer registered in this VM sees class loads again, not that it
+/// inherits the previous chain's already-offered set.
 pub fn reset_transformer_chain(vm: usize) {
     with_chain_mut(vm, |chain| chain.clear());
+    forget_vm_load_time_offers(vm);
 }
 
 /// Public hook for Agent 2.4-C's `agent_loader.rs`. After a `-javaagent:`
@@ -1266,7 +1275,12 @@ pub fn run_load_time_transform_chain(
         ClassLoaderId::UserDefined(_) => {
             Some(cratonvm_native_builtins::classloader::get_or_create_app_loader(ctx))
         }
-    };
+    }
+    // This transformer entry point returns the bytes and has no error channel
+    // to carry a refusal. If `--jdk-only` refuses the app loader, fall back to
+    // the bootstrap loader (`None`) — the same answer this already gave for a
+    // bootstrap class — and let the recorded violation stand.
+    .and_then(|loader| loader.ok());
     run_chain_over_bytes(
         ctx,
         class_name,
@@ -1553,6 +1567,92 @@ thread_local! {
 /// turning the walk into an unbounded recursion.
 const SUPERTYPE_STAGE_DEPTH: u32 = 24;
 
+/// Class names already offered to `vm`'s load-time transformer chain.
+///
+/// # Why the load-time hook needs a memo at all
+///
+/// [`pre_transform_for_load`] does not sit at a class *definition* site — it
+/// sits on the constant-pool resolution path, which runs for every `new`,
+/// `checkcast`, `instanceof`, field owner and method owner the interpreter
+/// executes. It approximated "this class is not defined yet, so a definition is
+/// about to follow" with `ClassManager::resolve_fast_path_class_id`, and that
+/// approximation has a hole with a name-shaped edge: when a class is defined by
+/// a **user loader** *and* the same name is also reachable on the built-in
+/// delegation chain, `resolve_fast_path_class_id` deliberately answers `None`
+/// (it will not hand a `UserDefined` ClassId to a request the delegation chain
+/// can answer itself). So for every such class the "already defined" early-out
+/// never fires, and each resolution paid, in full:
+///
+///   * `find_class_bytes_for_transform` — a jar read + inflate + `to_vec`,
+///   * the same again for the supertype/interface pre-stage walk,
+///   * a Java `byte[]` allocation of the whole class file, and
+///   * an interpreted call into every registered `transform`.
+///
+/// That is not a small constant. Under Mockito's inline mock maker — which
+/// self-attaches a `ClassFileTransformer` in essentially every Spring Boot test
+/// — a class whose test runs under a `URLClassLoader` (Spring Boot's
+/// `@ClassPathExclusions` / `ModifiedClassPathClassLoader`, where *every*
+/// application class takes the shadowed shape above) went from a 21 s pass to a
+/// 300 s timeout with no forward progress at all.
+///
+/// # Why keying on the name alone is the right granularity
+///
+/// The seam this hook writes through — `ClassManager::stage_transformed_class`
+/// / `pending_transformed_classes` — is itself keyed by name, with "a second
+/// stage for the same name overwrites the first". A second offer for a name
+/// therefore *cannot* reach a second definition even in principle; it can only
+/// overwrite bytes staged for the first. Offering once per name per VM is
+/// exactly the granularity the staging mechanism supports, so the memo costs no
+/// coverage the seam could have delivered.
+///
+/// Keyed per VM for the same reason [`TransformerChains`] is: one process can
+/// own several heaps, and a name offered in VM A says nothing about VM B.
+/// Dropped by [`forget_vm_transformers`] when the VM goes away.
+type LoadTimeOffered = HashMap<usize, std::collections::HashSet<Box<str>>>;
+
+fn load_time_offered() -> &'static RwLock<LoadTimeOffered> {
+    static INSTANCE: OnceLock<RwLock<LoadTimeOffered>> = OnceLock::new();
+    INSTANCE.get_or_init(|| RwLock::new(HashMap::new()))
+}
+
+/// Claim the single load-time offer for `name` in `vm`.
+///
+/// Returns `true` for the caller that should go on and do the work, and
+/// `false` for every caller after it. Read-locked on the repeat path (which is
+/// the overwhelmingly common one — one `true` per class against arbitrarily
+/// many `false`s), and write-locked only to record a first offer.
+///
+/// `CRATONVM_DBG=load-transform-no-memo` makes this always answer `true`, i.e.
+/// restores the pre-fix "re-offer on every resolution" behaviour. It exists as
+/// the red control for the fix above: with it set, the hang reproduces.
+fn claim_load_time_offer(vm: usize, name: &str) -> bool {
+    if cratonvm_types::flags::runtime_var("CRATONVM_DBG_LOAD_TRANSFORM_NO_MEMO").is_ok() {
+        return true;
+    }
+    {
+        let offered = load_time_offered()
+            .read()
+            .unwrap_or_else(PoisonError::into_inner);
+        if offered.get(&vm).is_some_and(|set| set.contains(name)) {
+            return false;
+        }
+    }
+    let mut offered = load_time_offered()
+        .write()
+        .unwrap_or_else(PoisonError::into_inner);
+    offered.entry(vm).or_default().insert(name.into())
+}
+
+/// Drop `vm`'s load-time offer memo. Paired with [`forget_vm_transformers`]:
+/// an identity that gets reused by a later VM must not inherit the names the
+/// previous one already offered.
+fn forget_vm_load_time_offers(vm: usize) {
+    let mut offered = load_time_offered()
+        .write()
+        .unwrap_or_else(PoisonError::into_inner);
+    offered.remove(&vm);
+}
+
 /// True when this VM has at least one registered `ClassFileTransformer`.
 ///
 /// The load path consults this before doing anything else. The relaxed global
@@ -1589,6 +1689,16 @@ pub fn pre_transform_for_load(
     }
     let reentrant = TRANSFORM_IN_FLIGHT.with(|s| s.borrow().iter().any(|n| n == name));
     if reentrant {
+        return;
+    }
+    // One offer per name per VM. This is the load path's own bound on how much
+    // work a registered transformer can cost: without it every *resolution* of
+    // a class the "already defined" check below cannot recognise (see
+    // [`LoadTimeOffered`] for the exact shape — a user-loader class whose name
+    // the delegation chain also answers) re-read the class file, re-walked its
+    // supertypes and re-entered Java. Claimed BEFORE the read lock below so the
+    // repeat path is one hash probe and nothing else.
+    if !claim_load_time_offer(shared.vm_identity, name) {
         return;
     }
     // Already defined: transform-on-load is over for this class. (A retransform
@@ -1979,27 +2089,8 @@ pub fn register_self_attach_natives(r: &mut NativeMethodRegistry) {
 pub fn register_instrumentation_natives(r: &mut NativeMethodRegistry) {
     let impl_class = "sun/instrument/InstrumentationImpl";
     // Two-arg add (transformer, canRetransform).
-    r.register(
-        impl_class,
-        "addTransformer0",
-        "(Ljava/lang/instrument/ClassFileTransformer;Z)V",
-        native_add_transformer0,
-    );
     // Some JDK builds also have a one-arg variant that defaults
     // canRetransform=false.
-    r.register(
-        impl_class,
-        "addTransformer0",
-        "(Ljava/lang/instrument/ClassFileTransformer;)V",
-        (|ctx: &mut dyn NativeContext, args: &[Value]| {
-            let with_can = [
-                args.first().cloned().unwrap_or(Value::Object(None)),
-                args.get(1).cloned().unwrap_or(Value::Object(None)),
-                Value::Int(0),
-            ];
-            native_add_transformer0(ctx, &with_can)
-        }) as NativeCallback,
-    );
     // JDK 25 InstrumentationImpl.addTransformer(transformer, canRetransform) is
     // a Java method that stores the transformer in `mTransformerManager` /
     // `mRetransfomableTransformerManager`. We don't drive those Java fields
@@ -2059,12 +2150,6 @@ pub fn register_instrumentation_natives(r: &mut NativeMethodRegistry) {
         }) as NativeCallback,
         NativeKind::Bridge,
     );
-    r.register(
-        impl_class,
-        "redefineClasses0",
-        "([Ljava/lang/instrument/ClassDefinition;)V",
-        native_redefine_classes0,
-    );
     r.register_with_kind(
         impl_class,
         "retransformClasses0",
@@ -2075,18 +2160,6 @@ pub fn register_instrumentation_natives(r: &mut NativeMethodRegistry) {
             native_retransform_classes0(ctx, &[receiver, classes])
         }) as NativeCallback,
         NativeKind::Bridge,
-    );
-    r.register(
-        impl_class,
-        "retransformClasses0",
-        "([Ljava/lang/Class;)V",
-        native_retransform_classes0,
-    );
-    r.register(
-        impl_class,
-        "getAllLoadedClasses0",
-        "()[Ljava/lang/Class;",
-        native_get_all_loaded_classes0,
     );
     // JDK 25 (J)[Ljava/lang/Class; variant — first arg is `long jvmtienv`.
     r.register_with_kind(
@@ -2099,12 +2172,6 @@ pub fn register_instrumentation_natives(r: &mut NativeMethodRegistry) {
         }) as NativeCallback,
         NativeKind::Bridge,
     );
-    r.register(
-        impl_class,
-        "getInitiatedClasses0",
-        "(Ljava/lang/ClassLoader;)[Ljava/lang/Class;",
-        native_get_initiated_classes0,
-    );
     r.register_with_kind(
         impl_class,
         "getInitiatedClasses0",
@@ -2115,12 +2182,6 @@ pub fn register_instrumentation_natives(r: &mut NativeMethodRegistry) {
             native_get_initiated_classes0(ctx, &[receiver, loader])
         }) as NativeCallback,
         NativeKind::Bridge,
-    );
-    r.register(
-        impl_class,
-        "isModifiableClass0",
-        "(Ljava/lang/Class;)Z",
-        native_is_modifiable_class0,
     );
     r.register_with_kind(
         impl_class,
@@ -2133,12 +2194,6 @@ pub fn register_instrumentation_natives(r: &mut NativeMethodRegistry) {
         }) as NativeCallback,
         NativeKind::Bridge,
     );
-    r.register(
-        impl_class,
-        "getObjectSize0",
-        "(Ljava/lang/Object;)J",
-        native_get_object_size0,
-    );
     r.register_with_kind(
         impl_class,
         "getObjectSize0",
@@ -2150,28 +2205,6 @@ pub fn register_instrumentation_natives(r: &mut NativeMethodRegistry) {
         }) as NativeCallback,
         NativeKind::Bridge,
     );
-    r.register(
-        impl_class,
-        "appendToBootstrapClassLoaderSearch0",
-        "(Ljava/lang/String;)V",
-        native_append_to_bootstrap_search0,
-    );
-    r.register(
-        impl_class,
-        "appendToBootstrapClassLoaderSearch0",
-        "(JLjava/lang/String;)V",
-        (|ctx: &mut dyn NativeContext, args: &[Value]| {
-            let receiver = args.first().cloned().unwrap_or(Value::Object(None));
-            let path = args.get(2).cloned().unwrap_or(Value::Object(None));
-            native_append_to_bootstrap_search0(ctx, &[receiver, path])
-        }) as NativeCallback,
-    );
-    r.register(
-        impl_class,
-        "appendToSystemClassLoaderSearch0",
-        "(Ljava/lang/String;)V",
-        native_append_to_system_search0,
-    );
     // JDK 25 unified append: appendToClassLoaderSearch0(long jvmtiEnv,
     // String jar, boolean isBootstrap). Drives both the bootstrap- and
     // system-classloader append forms (Mockito inline mock maker injects its
@@ -2182,22 +2215,6 @@ pub fn register_instrumentation_natives(r: &mut NativeMethodRegistry) {
         "(JLjava/lang/String;Z)V",
         native_append_to_classloader_search0,
         NativeKind::Bridge,
-    );
-    r.register(
-        impl_class,
-        "appendToSystemClassLoaderSearch0",
-        "(JLjava/lang/String;)V",
-        (|ctx: &mut dyn NativeContext, args: &[Value]| {
-            let receiver = args.first().cloned().unwrap_or(Value::Object(None));
-            let path = args.get(2).cloned().unwrap_or(Value::Object(None));
-            native_append_to_system_search0(ctx, &[receiver, path])
-        }) as NativeCallback,
-    );
-    r.register(
-        impl_class,
-        "setNativeMethodPrefix0",
-        "(Ljava/lang/instrument/ClassFileTransformer;Ljava/lang/String;)V",
-        native_set_native_method_prefix0,
     );
     // JDK 25 setNativeMethodPrefixes(long, String[], boolean) — bulk variant,
     // and the form `Instrumentation.setNativeMethodPrefix` actually calls on
@@ -2280,12 +2297,6 @@ pub fn register_instrumentation_natives(r: &mut NativeMethodRegistry) {
         |_ctx, _args| Ok(None),
         NativeKind::Bridge,
     );
-    r.register(
-        impl_class,
-        "setHasRetransformableTransformers",
-        "(Z)V",
-        |_ctx, _args| Ok(None),
-    );
     // JDK 25 InstrumentationImpl natives take `long jvmtienv` (descriptor (J)Z).
     // Register both the (J)Z variant (the JDK 25 actual signature) and the
     // legacy ()Z variant (backstop in case some workloads see the older arity).
@@ -2295,36 +2306,6 @@ pub fn register_instrumentation_natives(r: &mut NativeMethodRegistry) {
         "(J)Z",
         native_is_retransform_supported0,
         NativeKind::Bridge,
-    );
-    r.register(
-        impl_class,
-        "isRetransformClassesSupported0",
-        "()Z",
-        native_is_retransform_supported0,
-    );
-    r.register(
-        impl_class,
-        "isRedefineClassesSupported0",
-        "(J)Z",
-        native_is_redefine_supported0,
-    );
-    r.register(
-        impl_class,
-        "isRedefineClassesSupported0",
-        "()Z",
-        native_is_redefine_supported0,
-    );
-    r.register(
-        impl_class,
-        "isNativeMethodPrefixSupported0",
-        "(J)Z",
-        native_is_prefix_supported0,
-    );
-    r.register(
-        impl_class,
-        "isNativeMethodPrefixSupported0",
-        "()Z",
-        native_is_prefix_supported0,
     );
 
     // WP2.4 v3 follow-up — public-name aliases. The bench/wave2-4 agent
@@ -2401,6 +2382,17 @@ pub fn register_instrumentation_natives(r: &mut NativeMethodRegistry) {
     // body IS the implementation. This registration also appears in
     // `interpreter.rs`'s force-native-override table so it beats the real
     // bytecode, which would otherwise enter VM-private init we cannot honour.
+    //
+    // RESTORED 2026-08-11. `dc55e8057` deleted it as `method-nowhere` — true,
+    // and it always will be: `<init>` is a constructor, so no image declares it
+    // `ACC_NATIVE` and a census cannot tell CratonVM's deliberate no-op from a
+    // dead row. Deleting it left three things pointing at nothing: the
+    // `ctx.invoke("sun/instrument/InstrumentationImpl", "<init>", …)` in
+    // `attach_agent_in_process` above, the force-native-override entry in
+    // `native_override.rs`, and the paragraph you are reading. The invoke then
+    // reaches the real ctor and enters exactly the VM-private init this comment
+    // says cannot be honoured — on the self-attach path, which is the one every
+    // `Mockito.mock()` arms.
     r.register(
         impl_class,
         "<init>",
@@ -3154,81 +3146,82 @@ mod tests {
         assert!(sz > 0);
     }
 
+    /// The registrar must cover every `InstrumentationImpl` native the JDK
+    /// declares — **at the descriptor the JDK declares it with**.
+    ///
+    /// Until 2026-08-11 this asserted thirteen spellings with no leading
+    /// `long`: `redefineClasses0([ClassDefinition;)V`,
+    /// `getAllLoadedClasses0()[Class;`, `isModifiableClass0(Class;)Z` and the
+    /// rest. **Every native on this class takes `long jvmtienv` first**, on
+    /// both Temurin 21.0.12+8 and 25.0.4+7 (`javap -p -s --module
+    /// java.instrument`), so those thirteen could never bind and the test
+    /// agreed with thirteen registrations that could never be reached. Both
+    /// sides were wrong together, which is why it stayed green for so long.
+    ///
+    /// `dc55e8057` deleted the unbindable registrations as dead — correctly —
+    /// and this test went red. The fix is the real descriptors, not the
+    /// registrations back.
+    ///
+    /// Three of the old assertions have no JDK counterpart at all and are gone
+    /// rather than corrected: `isRedefineClassesSupported0`,
+    /// `isNativeMethodPrefixSupported0` and `setNativeMethodPrefix0` are not
+    /// native on any supported image, and `appendTo{Bootstrap,System}
+    /// ClassLoaderSearch0` is one JDK method, `appendToClassLoaderSearch0`,
+    /// taking `(long, String, boolean)`.
     #[test]
     fn register_natives_includes_required_methods() {
         let mut r = NativeMethodRegistry::new();
         register_instrumentation_natives(&mut r);
         let impl_class = "sun/instrument/InstrumentationImpl";
-        assert!(r
-            .find(
-                impl_class,
-                "addTransformer0",
-                "(Ljava/lang/instrument/ClassFileTransformer;Z)V",
-            )
-            .is_some());
-        assert!(r
-            .find(
-                impl_class,
-                "removeTransformer",
-                "(Ljava/lang/instrument/ClassFileTransformer;)Z",
-            )
-            .is_some());
-        assert!(r
-            .find(
-                impl_class,
-                "redefineClasses0",
-                "([Ljava/lang/instrument/ClassDefinition;)V",
-            )
-            .is_some());
-        assert!(r
-            .find(impl_class, "retransformClasses0", "([Ljava/lang/Class;)V",)
-            .is_some());
-        assert!(r
-            .find(impl_class, "getAllLoadedClasses0", "()[Ljava/lang/Class;")
-            .is_some());
-        assert!(r
-            .find(impl_class, "isModifiableClass0", "(Ljava/lang/Class;)Z")
-            .is_some());
-        assert!(r
-            .find(impl_class, "getObjectSize0", "(Ljava/lang/Object;)J")
-            .is_some());
-        assert!(r
-            .find(impl_class, "isRetransformClassesSupported0", "()Z")
-            .is_some());
-        assert!(r
-            .find(impl_class, "isRedefineClassesSupported0", "()Z")
-            .is_some());
-        assert!(r
-            .find(impl_class, "isNativeMethodPrefixSupported0", "()Z")
-            .is_some());
-        assert!(r
-            .find(
-                impl_class,
-                "appendToBootstrapClassLoaderSearch0",
-                "(Ljava/lang/String;)V",
-            )
-            .is_some());
-        assert!(r
-            .find(
-                impl_class,
-                "appendToSystemClassLoaderSearch0",
-                "(Ljava/lang/String;)V",
-            )
-            .is_some());
-        assert!(r
-            .find(
-                impl_class,
-                "setNativeMethodPrefix0",
-                "(Ljava/lang/instrument/ClassFileTransformer;Ljava/lang/String;)V",
-            )
-            .is_some());
-        assert!(r
-            .find(
-                impl_class,
-                "getInitiatedClasses0",
-                "(Ljava/lang/ClassLoader;)[Ljava/lang/Class;",
-            )
-            .is_some());
+        // (method, descriptor) — each one verified present and ACC_NATIVE on
+        // BOTH supported images. Keep this list and the image in step: a
+        // descriptor here that the JDK does not declare is a registration that
+        // binds to nothing, and this assertion would hide it.
+        for (name, descriptor) in [
+            ("redefineClasses0", "(J[Ljava/lang/instrument/ClassDefinition;)V"),
+            ("retransformClasses0", "(J[Ljava/lang/Class;)V"),
+            ("getAllLoadedClasses0", "(J)[Ljava/lang/Class;"),
+            ("getInitiatedClasses0", "(JLjava/lang/ClassLoader;)[Ljava/lang/Class;"),
+            ("isModifiableClass0", "(JLjava/lang/Class;)Z"),
+            ("getObjectSize0", "(JLjava/lang/Object;)J"),
+            ("isRetransformClassesSupported0", "(J)Z"),
+            ("appendToClassLoaderSearch0", "(JLjava/lang/String;Z)V"),
+            ("setHasRetransformableTransformers", "(JZ)V"),
+            ("setNativeMethodPrefixes", "(J[Ljava/lang/String;Z)V"),
+        ] {
+            assert!(
+                r.find(impl_class, name, descriptor).is_some(),
+                "{impl_class}.{name}{descriptor} is declared native by JDK 21                  and 25 and must be registered"
+            );
+        }
+        // The no-`jvmtienv` spellings must NOT come back. Re-adding one makes
+        // the assertions above pass while binding nothing, which is exactly the
+        // state this test was in before 2026-08-11.
+        for (name, descriptor) in [
+            ("redefineClasses0", "([Ljava/lang/instrument/ClassDefinition;)V"),
+            ("retransformClasses0", "([Ljava/lang/Class;)V"),
+            ("getAllLoadedClasses0", "()[Ljava/lang/Class;"),
+            ("isModifiableClass0", "(Ljava/lang/Class;)Z"),
+            ("getObjectSize0", "(Ljava/lang/Object;)J"),
+        ] {
+            assert!(
+                r.find(impl_class, name, descriptor).is_none(),
+                "{impl_class}.{name}{descriptor} has no leading `long jvmtienv`                  and is declared by no supported JDK image; registering it                  binds nothing and hides the arity that does"
+            );
+        }
+        // CratonVM's own convenience surface on the same class: no-`0`, no
+        // `jvmtienv`. These are ours, not the JDK's, and the census scores them
+        // `method-nowhere` for that reason.
+        for (name, descriptor) in [
+            ("removeTransformer", "(Ljava/lang/instrument/ClassFileTransformer;)Z"),
+            ("addTransformer", "(Ljava/lang/instrument/ClassFileTransformer;)V"),
+            ("addTransformer", "(Ljava/lang/instrument/ClassFileTransformer;Z)V"),
+        ] {
+            assert!(
+                r.find(impl_class, name, descriptor).is_some(),
+                "{impl_class}.{name}{descriptor} is CratonVM's own entry point                  and must stay registered"
+            );
+        }
         // Bridge surface for the in-process probe.
         let bridge = "cratonvm/Instrument";
         assert!(r
@@ -3250,5 +3243,75 @@ mod tests {
         assert!(r
             .find(bridge, "redefineClass", "(Ljava/lang/Class;[B)Z")
             .is_some());
+    }
+
+    // ---- Load-time transform: one offer per name per VM ----------------
+    //
+    // The bug these pin: `pre_transform_for_load` sits on the constant-pool
+    // resolution path, so a name whose "already defined" early-out cannot fire
+    // (a user-loader class the delegation chain also answers) was re-offered —
+    // class file re-read, supertypes re-walked, Java re-entered — on EVERY
+    // resolution. See [`LoadTimeOffered`].
+    //
+    // Identities are picked high and distinct so these never collide with a
+    // real VM identity or with each other under the test harness's shared
+    // process.
+
+    #[test]
+    fn load_time_offer_is_claimed_exactly_once_per_name() {
+        let vm = 0x10ad_0001_usize;
+        assert!(
+            claim_load_time_offer(vm, "com/foo/Bar"),
+            "the first resolution must do the work"
+        );
+        for _ in 0..1000 {
+            assert!(
+                !claim_load_time_offer(vm, "com/foo/Bar"),
+                "every later resolution of the same name must be a no-op"
+            );
+        }
+        // A different name is still its own first offer.
+        assert!(claim_load_time_offer(vm, "com/foo/Baz"));
+        forget_vm_load_time_offers(vm);
+    }
+
+    #[test]
+    fn load_time_offer_memo_is_per_vm() {
+        let a = 0x10ad_0002_usize;
+        let b = 0x10ad_0003_usize;
+        assert!(claim_load_time_offer(a, "com/foo/Bar"));
+        assert!(
+            claim_load_time_offer(b, "com/foo/Bar"),
+            "a name offered in VM A says nothing about VM B — its heap, its \
+             transformer chain, its class file"
+        );
+        assert!(!claim_load_time_offer(a, "com/foo/Bar"));
+        forget_vm_load_time_offers(a);
+        forget_vm_load_time_offers(b);
+    }
+
+    #[test]
+    fn forgetting_a_vm_drops_its_offer_memo() {
+        let vm = 0x10ad_0004_usize;
+        assert!(claim_load_time_offer(vm, "com/foo/Bar"));
+        assert!(!claim_load_time_offer(vm, "com/foo/Bar"));
+        // An identity a later VM reuses must not inherit the previous VM's
+        // already-offered set, or that VM's agent never sees a class load.
+        forget_vm_transformers(vm);
+        assert!(claim_load_time_offer(vm, "com/foo/Bar"));
+        forget_vm_load_time_offers(vm);
+    }
+
+    #[test]
+    fn resetting_the_chain_drops_the_offer_memo() {
+        let vm = 0x10ad_0005_usize;
+        assert!(claim_load_time_offer(vm, "com/foo/Bar"));
+        assert!(!claim_load_time_offer(vm, "com/foo/Bar"));
+        reset_transformer_chain(vm);
+        assert!(
+            claim_load_time_offer(vm, "com/foo/Bar"),
+            "\"start over\" has to mean the next transformer sees class loads"
+        );
+        forget_vm_load_time_offers(vm);
     }
 }

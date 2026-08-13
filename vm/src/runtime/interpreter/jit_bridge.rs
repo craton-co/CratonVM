@@ -556,6 +556,31 @@ pub(super) fn compile_osr_artifact(
             // drops the per-object dispatch. See `execute` for the rationale.
             let ctor_direct_call_off = crate::runtime::env_cache::ctor_direct_call_disabled();
             let mut pending_ctor_sites: Vec<(usize, String, usize)> = Vec::new();
+            // THIRD COMPILE DOOR, 2026-08-13. `java/lang/String`'s call-site
+            // intrinsics (`length`/`isEmpty`/`charAt`/`hashCode`/`equals`/
+            // `compareTo`/`indexOf`) were bound only in `jit::try_compile`'s
+            // ladder, and this door passed `string_layout: None` under the
+            // comment "String intrinsics land in a later wave". The wave never
+            // came, so in a hot loop — the one place they matter, and the one
+            // place compiled HERE — every one of them was inert: measured on
+            // this branch before the fix, `String.charAt(i)` in a 20M-iteration
+            // loop cost **408 ns/call** (HotSpot: 0.6 ns), because the site ran
+            // the real `charAt` → `isLatin1` → `StringLatin1.charAt` →
+            // `String.checkIndex` → `Preconditions.checkIndex` chain instead of
+            // the inline decode. `String.length()` likewise cost 28 ns.
+            //
+            // This is verbatim the lesson the `Thread.currentThread()` bind
+            // above records ("binding it in all THREE compile doors is the
+            // whole lesson of that document") — and, like it, no timing could
+            // have found it: a resolver, a codegen ladder and two green unit
+            // suites all agree the intrinsic exists. `CRATONVM_DBG_INTRINSIC=1`
+            // (jit/src/lib.rs) is the lever that names which door produced a
+            // body, so the next one of these is a one-run question.
+            //
+            // Resolved BEFORE the `class_manager` read lock below: this helper
+            // takes that same lock, and a recursive read on a `parking_lot`
+            // RwLock can deadlock against a queued writer.
+            let osr_string_layout = super::dispatch_static::resolve_string_field_layout(shared);
             if !scan.invoke_ops.is_empty() {
                 let cm_lock = shared.classes.class_manager.read();
                 let class = cm_lock.get_class(class_id)?;
@@ -602,6 +627,81 @@ pub(super) fn compile_osr_artifact(
                     // vm_ptr frame slot exists.
                     if invoke_kind == 3 && is_recursive_call {
                         continue;
+                    }
+
+                    // `java/lang/String` / `java/lang/CharSequence` call-site
+                    // intrinsics — see `osr_string_layout` above for why this
+                    // arm exists and what its absence cost. The matcher and the
+                    // codegen must agree about the layout or the codegen would
+                    // fall through and `CALL` an intrinsic sentinel address, so
+                    // the SAME `osr_string_layout` value is handed to
+                    // `compile_with_param_slots` below (the `string_layout`
+                    // argument) — exactly the invariant
+                    // `try_compile_inner` documents for its own copy.
+                    //
+                    // `guard_class_id` comes from the resolver: 0 for a
+                    // `java/lang/String` site (final class, monomorphic), the
+                    // real String class id for a `java/lang/CharSequence` site
+                    // so the codegen guards the receiver and deopts for any
+                    // non-String `CharSequence`.
+                    if matches!(invoke_kind, 0 | 2) {
+                        if let Some((entry, num_params, ret, guard_class_id)) =
+                            cratonvm_jit::try_resolve_string_intrinsic(
+                                target_class,
+                                mn,
+                                desc,
+                                osr_string_layout,
+                            )
+                        {
+                            direct_calls2.push((
+                                pc,
+                                crate::jit::JitDirectCall {
+                                    entry,
+                                    needs_context: false,
+                                    num_params,
+                                    return_type: ret,
+                                    guard_class_id,
+                                },
+                            ));
+                            continue;
+                        }
+                    }
+
+                    // The layout-independent STATIC intrinsic families
+                    // (`Math`/`StrictMath`, `Integer`/`Long` bit ops, …). This
+                    // door previously recognised exactly one of them by hand —
+                    // `Math.sqrt`, immediately below — so an OSR body paid full
+                    // dispatch for `Math.abs`, `Math.min`/`max`,
+                    // `Integer.bitCount`, `Long.numberOfTrailingZeros` and the
+                    // rest, all of which lower to one or two instructions.
+                    //
+                    // Restricted to `invokestatic`: every member of those
+                    // families is static, so `guard_class_id: 0` (no receiver
+                    // guard) is exactly right, and the restriction also keeps
+                    // the CRC32/CRC32C members — the only ones in
+                    // `try_resolve_intrinsic` whose inline code is sound ONLY
+                    // behind a resolved receiver class-id guard, which this
+                    // door has no resolver for — off this path entirely.
+                    if invoke_kind == 3 {
+                        if let Some((entry, num_params, ret)) =
+                            cratonvm_jit::try_resolve_intrinsic(target_class, mn, desc)
+                        {
+                            if !cratonvm_jit::JitIntrinsic::from_entry(entry)
+                                .is_some_and(|i| i.is_crc32_family())
+                            {
+                                direct_calls2.push((
+                                    pc,
+                                    crate::jit::JitDirectCall {
+                                        entry,
+                                        needs_context: false,
+                                        num_params,
+                                        return_type: ret,
+                                        guard_class_id: 0,
+                                    },
+                                ));
+                                continue;
+                            }
+                        }
                     }
 
                     // Math.sqrt intrinsic: inline as SQRTSD (no dispatch overhead)
@@ -704,6 +804,58 @@ pub(super) fn compile_osr_artifact(
                         ));
                         continue;
                     }
+                    // ===== INTRINSIC REGION BEGIN: ATOMIC_INT =====
+                    // `AtomicInteger` read-modify-write family, through the
+                    // SAME matcher `jit::try_compile_inner` uses so the two
+                    // doors cannot drift on which shapes are admitted.
+                    //
+                    // Registered here because this door reaches
+                    // `x64::compile_with_param_slots` directly. For this family
+                    // the OSR site is the load-bearing one, for the same reason
+                    // spelled out on the HashMap arm below: a counter loop
+                    // written inside ONE method never passes through
+                    // `jit::try_compile`, and that is exactly the shape
+                    // (`while (nextIndex.getAndIncrement() < MAX)`) this
+                    // intrinsic exists to speed up.
+                    //
+                    // The class-manager guard is read and dropped inside the
+                    // `let` so no lock is held across the matcher call.
+                    if invoke_kind == 0
+                        && target_class == "java/util/concurrent/atomic/AtomicInteger"
+                    {
+                        let atomic_cid = shared
+                            .classes
+                            .class_manager
+                            .read()
+                            .find_bootstrap_class_by_name(
+                                "java/util/concurrent/atomic/AtomicInteger",
+                            )
+                            .map(|id| id.as_u32());
+                        if let Some((entry, num_params, ret, guard_class_id)) =
+                            atomic_cid.and_then(|cid| {
+                                cratonvm_jit::try_resolve_atomic_intrinsic(
+                                    &target_class,
+                                    &mn,
+                                    &desc,
+                                    cid,
+                                )
+                            })
+                        {
+                            direct_calls2.push((
+                                pc,
+                                crate::jit::JitDirectCall {
+                                    entry,
+                                    needs_context: false,
+                                    num_params,
+                                    return_type: ret,
+                                    guard_class_id,
+                                },
+                            ));
+                            continue;
+                        }
+                    }
+                    // ===== INTRINSIC REGION END: ATOMIC_INT =====
+
                     // `Integer.intValue()` thin direct call — `Integer` is
                     // `final`, so a site declared against it is statically
                     // monomorphic (guard-free); the helper handles the
@@ -983,6 +1135,13 @@ pub(super) fn compile_osr_artifact(
             // elidable `C.<init>()V` AS `java/lang/Object.<init>` so the codegen
             // elision drops the per-object dispatch; else the real dispatch info.
             // (See the `execute` path for the soundness argument.)
+            // Pcs whose `<init>()V` target `is_elidable_construction` PROVED empty. The
+            // backend may elide only these; a no-arg constructor that is NOT proven empty
+            // keeps both its allocation and its call, because eliding it would drop
+            // whatever the body writes to global state (see
+            // docs/known-issues/netty/jit-elided-constructor-side-effects-20260812.md).
+            let mut elidable_init_pcs: std::collections::HashSet<usize> =
+                std::collections::HashSet::new();
             for (pc, tclass, pcount) in pending_ctor_sites {
                 let elidable = shared
                     .load_class_concurrent(&tclass)
@@ -992,6 +1151,9 @@ pub(super) fn compile_osr_artifact(
                         is_elidable_construction(shared, &cm2, tid)
                     })
                     .unwrap_or(false);
+                if elidable {
+                    elidable_init_pcs.insert(pc);
+                }
                 let info_class: &str = if elidable {
                     "java/lang/Object"
                 } else {
@@ -1036,13 +1198,22 @@ pub(super) fn compile_osr_artifact(
             // Class-`ldc` sites, served at run time by `helpers.ldc_class_cp`.
             // Before this an OSR artifact refused any method containing one.
             let mut ldc_class_info2: Vec<(usize, u32, u16)> = Vec::new();
+            // The `ldc`-family pcs whose constant is floating-point. Codegen
+            // types these by their consuming opcode; the deopt operand-stack
+            // snapshot has none to ask, and without the tag every numeric `ldc`
+            // read as `Unsupported` and refused OSR entry for the whole
+            // artifact — see `x64::Compiler::ldc_fp_pcs`.
+            let mut ldc_fp_pcs2: rustc_hash::FxHashSet<usize> = rustc_hash::FxHashSet::default();
             if !scan.ldc_ops.is_empty() {
                 let cm_lock = shared.classes.class_manager.read();
                 let class = cm_lock.get_class(class_id)?;
                 for &(pc, cp_idx) in &scan.ldc_ops {
                     let val = match class.constant_pool.get(cp_idx) {
                         Some(ConstantPoolEntry::Integer(v)) => *v as i64, // JVM spec: bounded float-to-long conversion
-                        Some(ConstantPoolEntry::Float(v)) => v.to_bits() as i64, // Cast: JIT ABI -- float bits to i64
+                        Some(ConstantPoolEntry::Float(v)) => {
+                            ldc_fp_pcs2.insert(pc);
+                            v.to_bits() as i64 // Cast: JIT ABI -- float bits to i64
+                        }
                         Some(ConstantPoolEntry::StringReference { string_index })
                             if class.constant_pool.get_utf8_wide(*string_index).is_none() =>
                         {
@@ -1076,7 +1247,10 @@ pub(super) fn compile_osr_artifact(
                 for &(pc, cp_idx) in &scan.ldc2w_ops {
                     let val = match class.constant_pool.get(cp_idx)? {
                         ConstantPoolEntry::Long(v) => *v,
-                        ConstantPoolEntry::Double(v) => v.to_bits() as i64, // Cast: JIT ABI -- float bits to i64
+                        ConstantPoolEntry::Double(v) => {
+                            ldc_fp_pcs2.insert(pc);
+                            v.to_bits() as i64 // Cast: JIT ABI -- float bits to i64
+                        }
                         _ => return None,
                     };
                     ldc2w_info2.push((pc, val));
@@ -1300,13 +1474,18 @@ pub(super) fn compile_osr_artifact(
                 // cm._jit_strings, same retention as the invoke-info strs.
                 ldc_class_info2,
                 ldc2w_info2,
+                ldc_fp_pcs2,
                 std::collections::HashMap::new(), // branch_hints
                 std::collections::HashMap::new(), // loop_unroll_hints
                 &helpers,
                 scan.non_escaping_new.clone(), // escape analysis results
                 std::collections::HashMap::new(), // inline_sites
                 std::collections::HashMap::new(), // inline_guard_variants (PGO-02, no guarded plan from this scan-based fast path)
-                None, // string_layout — String intrinsics land in a later wave
+                // string_layout — the SAME value the matcher above used, so a
+                // registered String sentinel is never one this codegen cannot
+                // emit. Was `None` ("String intrinsics land in a later wave"),
+                // which made every String intrinsic inert in OSR bodies.
+                osr_string_layout,
                 &param_jvm_slots,
                 param_slot_span,
                 param_oop_mask,
@@ -1319,6 +1498,7 @@ pub(super) fn compile_osr_artifact(
                 // inert in production (empty registry).
                 &format!("{class_name}.{method_name}:{method_descriptor}"),
                 indy_info,
+                Some(elidable_init_pcs),
             );
             let Some(mut cm) = cm else {
                 // RBC.2 — a backend bail here is just as permanent as one in
@@ -2175,6 +2355,64 @@ pub(super) fn resolve_jit_new_site(
     })
 }
 
+/// Would dispatching `class_name.<init>()V` reach a native, rather than the
+/// bytecode constructor?
+///
+/// Split out of [`is_elidable_construction`] so it can be tested directly: the
+/// elision decision is a *compile-time prediction* of what a later dispatch will
+/// do, and a prediction that drifts from the dispatch is exactly the class of
+/// bug the caller's json-smart comment describes.
+///
+/// # Why this is `resolve_native_dispatch_wave1` and not `find(..).is_some()`
+///
+/// It used to be the latter, which is the wrong question under strict policy:
+/// `JdkOnly` sends a non-`Intrinsic` bridge standing in front of concrete
+/// bytecode to the bytecode (§7 step 3), so the native the old check refused
+/// over never runs, and the refusal was pure pessimism — the JIT declined to
+/// elide a constructor that provably does nothing.
+///
+/// The two inputs a name triple cannot supply:
+///
+/// * `compat_native_wins: true` — this site's pre-existing verdict, and a
+///   faithful one: today a registered `<init>()V` native wins over the bytecode
+///   constructor, which is the whole reason the caller checks at all.
+/// * `bytecode_available: true` — established by the caller, not assumed: it
+///   only asks after `init.code()` returned `Some`.
+///
+/// # Why the prediction cannot drift
+///
+/// The dispatch side of this decision — `admit_forced_native`, reached from
+/// `intercept_force_registered_native{,_cached}` — calls the SAME resolver with
+/// the SAME two constants (`compat_native_wins: true`, `bytecode_available:
+/// true`) for the same triple. One function, one pair of inputs, so compile-time
+/// and run-time cannot answer differently. That is the property to preserve if
+/// either side is ever changed.
+///
+/// A `Some(_)` of any shape means "not the trivial bytecode body": `NativeBridge`
+/// and `Intrinsic` both run other code, and a strict `Reject` throws, which
+/// eliding would silently turn into success. `None` means the bytecode is what
+/// executes.
+///
+/// `Compatible` is bit-for-bit the old behaviour: with `compat_native_wins ==
+/// true` the resolver answers `Some` for every registration and `None` for none,
+/// which is `find(..).is_some()` spelled through the policy.
+fn elidable_ctor_native_would_run(shared: &SharedVm, class_name: &str) -> bool {
+    let registered = shared
+        .natives
+        .native_methods
+        .find_with_kind(class_name, "<init>", "()V");
+    crate::vm::resolve_native_dispatch_wave1(
+        crate::vm::dispatch_policy(shared),
+        class_name,
+        "<init>",
+        "()V",
+        registered,
+        true,
+        true,
+    )
+    .is_some()
+}
+
 /// Whether constructing `class_id` via its no-arg constructor is *elidable* for
 /// JIT escape-analysis scalar replacement — i.e. `new C(); dup; invokespecial
 /// C.<init>()V` may be replaced by a zero-initialised scalar object with no call.
@@ -2198,8 +2436,14 @@ pub(super) fn is_elidable_construction(
     let Some(class) = cm.get_class(class_id) else {
         return false;
     };
+    let Some(init) = class.find_method("<init>", "()V") else {
+        return false;
+    };
+    let Some(code) = init.code() else {
+        return false;
+    };
     // A REGISTERED NATIVE SHADOWS THE BYTECODE CONSTRUCTOR. `invokespecial`
-    // always prefers a registered native over bytecode, so a trivial-looking
+    // prefers a registered native over bytecode, so a trivial-looking
     // `<init>()V` body says nothing about what actually runs — and eliding the
     // call skips the native's side effects entirely.
     //
@@ -2215,20 +2459,16 @@ pub(super) fn is_elidable_construction(
     // (jsonsmart-parser-jit-retired-20260727.md). The companion
     // `map_resize` fix makes the fallback capacity correct; this one keeps the
     // native constructor running in the first place.
-    if shared
-        .natives
-        .native_methods
-        .find(&class.name, "<init>", "()V")
-        .is_some()
-    {
+    //
+    // The §3 item-4 residual of the retired wave-2 markers record.
+    // The question is NOT "is a native registered" but "would dispatching this
+    // `<init>` reach one" — see [`elidable_ctor_native_would_run`], which is
+    // where that distinction and its `bytecode_available` premise are argued.
+    // The check sits BELOW the body lookup because that premise is `init.code()`
+    // having returned `Some`.
+    if elidable_ctor_native_would_run(shared, &class.name) {
         return false;
     }
-    let Some(init) = class.find_method("<init>", "()V") else {
-        return false;
-    };
-    let Some(code) = init.code() else {
-        return false;
-    };
     let bc = &code.code;
     // aload_0 (0x2a); invokespecial (0xb7) hi lo; return (0xb1) — exactly 5 bytes.
     if bc.len() != 5 || bc[0] != 0x2a || bc[1] != 0xb7 || bc[4] != 0xb1 {
@@ -2397,13 +2637,51 @@ pub(super) fn jit_invoke_targets_native_shadow(
     // same-descriptor native for a genuinely unrelated interface is rare and
     // merely costs a missed tier-up opportunity for that one caller, never a
     // correctness bug).
+    // `CRATONVM_JIT=-native-shadow-interface-blind` suppresses this arm, so its
+    // cost can be A/B'd on a real workload before anyone decides whether to make
+    // it precise. Default-on: it is a CORRECTNESS guard (a compiled direct call
+    // bypasses the interpreter's native-vs-bytecode choice), and the shape it
+    // covers is real — `GroovyClassValueJava7 implements GroovyClassValue,
+    // extends java.lang.ClassValue` inheriting a natively-registered `get()`.
+    // The lever exists to measure the arm, not to be shipped off.
     let interface_blind_possible_shadow = is_interface_ref
         && !direct
         && !inherited
+        && crate::runtime::env_cache::jit_native_shadow_interface_blind()
         && shared
             .natives
             .native_methods
             .might_have_method_descriptor(&method_name, &descriptor);
+    // Which arm fired, counted. The three have very different standing:
+    // `direct`/`inherited` are precise facts about THIS call, while
+    // `interface_blind` is a class-blind "does ANY registered native have this
+    // (name, descriptor)" probe whose own comment concedes it "can only ever ADD
+    // conservatism". On a Spring Boot context startup this whole predicate seals
+    // 1,279 methods out of the JIT — more than the 1,155 that reach C2 — and
+    // until now nothing said which arm was responsible for them.
+    //
+    // MEASURED 2026-08-12 on netty `AdaptiveByteBufAllocatorTest` (dev
+    // `6d1bfd531`), which is the shape this predicate should hurt most: 826 M
+    // calls, and its hot allocator methods call `ArrayList.add`, `Math.min` and
+    // `AtomicIntegerArray.get`, all shadowed. Arm split
+    // `direct=474 interface-blind=97 inherited=60` — the class-blind arm is 15%
+    // of the population, not the bulk.
+    //
+    // And the seal is NOT a throughput lever here. Interleaved on one box:
+    // default 594 s / 1117 sealed, `-native-shadow-interface-blind` 493 s /
+    // 1056 sealed, `-native-shadow-caller-seal` (the whole seal off) **591 s**
+    // / 675 sealed. Compiling 626 more methods moved the wall clock 0.5%. So
+    // making this arm precise is a correctness/coverage argument, not a
+    // performance one — the cost on call-dense code is the per-entry transfer
+    // machinery, not the population this seals. See
+    // `docs/known-issues/netty/adaptive-bytebuf-allocator-throughput-20260812.md`.
+    if direct {
+        cratonvm_jit::note_jit_native_shadow_cause("direct");
+    } else if inherited {
+        cratonvm_jit::note_jit_native_shadow_cause("inherited");
+    } else if interface_blind_possible_shadow {
+        cratonvm_jit::note_jit_native_shadow_cause("interface-blind");
+    }
     if (direct || inherited || interface_blind_possible_shadow)
         && crate::runtime::env_cache::dbg_jitc()
     {
@@ -3272,6 +3550,7 @@ pub(super) fn try_jit_upgrade_with_gate(
                 is_synchronized: method.is_synchronized(),
                 is_static: method.is_static(),
                 force_native_cache: std::sync::OnceLock::new(),
+            intercept_shape_cache: std::sync::OnceLock::new(),
                 native_callback_cache: std::sync::OnceLock::new(),
                 invoc_key: std::sync::OnceLock::new(),
                 jit_probe_generation: std::sync::atomic::AtomicU64::new(0),
@@ -4513,6 +4792,7 @@ pub(super) fn try_jit_compile_callee_slow(
         is_synchronized: method.is_synchronized(),
         is_static: method.is_static(),
         force_native_cache: std::sync::OnceLock::new(),
+            intercept_shape_cache: std::sync::OnceLock::new(),
         native_callback_cache: std::sync::OnceLock::new(),
         invoc_key: std::sync::OnceLock::new(),
         jit_probe_generation: std::sync::atomic::AtomicU64::new(0),
@@ -5517,12 +5797,49 @@ pub(super) fn background_compile_task(
             )
         })
         .unwrap_or(false);
+    // A `None` above is not one thing. The comment on `published` already lists
+    // the causes — "skip-listed, resolver miss, code-cache cap, concurrent
+    // redefine" — and two of them are PERMANENT POLICY, not a codegen attempt
+    // that failed. Reporting every `None` as a codegen failure made
+    // `complete_task` spend `tier_fail_count` on methods no compile was ever
+    // run for: three futile background tasks each, then the method is retired
+    // and reported by `jit-method-stats` as `compile-failed reason=unrecorded`
+    // — unrecorded precisely because nothing ran to record a bail site.
+    //
+    // That is how a Spring Boot context startup reported
+    // `hot_but_stuck_in_interpreter=79 (ineligible-by-policy=0,
+    // compile-failures=69)` while 2499 methods sat in the skip-seal census:
+    // every one of those 69 was a policy verdict wearing a codegen failure's
+    // label, which sent the reader looking for a compiler bug that is not there.
+    //
+    // `MethodState::ineligible` is the field that exists for exactly this, and
+    // `complete_task` already honours it — it just was never told.
+    let declined_permanently = !published
+        && (shared
+            .jit
+            .jit_skip_set
+            .read()
+            // The skip-set is keyed by `Arc<str>` and `MethodKey` holds
+            // `String`, so the probe has to materialise a key. Three small
+            // allocations on a path that runs once per FAILED compile task —
+            // not per invocation — which is the whole reason this check can
+            // afford to be here at all.
+            .contains(&(
+                std::sync::Arc::from(task.method_key.class_name.as_str()),
+                std::sync::Arc::from(task.method_key.method_name.as_str()),
+                std::sync::Arc::from(task.method_key.descriptor.as_str()),
+            ))
+            || cratonvm_jit::is_jit_bail_listed(
+                &task.method_key.class_name,
+                &task.method_key.method_name,
+                &task.method_key.descriptor,
+            ));
     CompileOutcome {
         // Widening: smaller integer -> 64-bit (zero/sign-extended, value preserved)
         compile_time_ms: start.elapsed().as_millis() as u64,
         published,
         c2_upgrade_candidate,
-        declined_permanently: false,
+        declined_permanently,
     }
 }
 
@@ -6002,6 +6319,28 @@ fn resolve_inline_site_from(
         }
     }
 
+    // `ldc` / `ldc_w` in an INLINE CANDIDATE.
+    //
+    // The inline mini-emitter (`x64/inlining.rs`) materialises these as bare
+    // x86 immediates and has no path to `helpers.ldc_string` /
+    // `helpers.ldc_class_cp`. So only the two constant kinds that ARE an
+    // immediate — `Integer` and `Float` — can be recorded. Every other kind
+    // (String, Class, MethodHandle, MethodType, condy) names a *reference*
+    // materialised at run time, and there is no i64 that stands for it.
+    //
+    // This used to end `_ => 0`, which recorded a perfectly well-formed entry
+    // claiming the constant's value was zero. The emitter then trusted it and
+    // pushed `null`. A one-line `Dialect.extractPattern(unit) { return
+    // "extract(?1 from ?2)"; }` spliced into `H2Dialect.extractPattern`
+    // compiled to `xor eax,eax; ret`, and every Hibernate HQL `extract()` /
+    // `cast()` / `str()` query then died in `PatternRenderer.<init>` with
+    // `NullPointerException: ... because "pattern" is null` (2026-08-11 Linux
+    // full suite: 17 of 34 method failures across four HQL classes, all green
+    // under `--nojit`).
+    //
+    // Refuse the whole inline site instead. The callee still compiles and is
+    // still CALLED — it just is not spliced — which is what "cannot model it"
+    // has to mean.
     let mut ldc_info = Vec::new();
     if has_ldc {
         let mut fpc = 0;
@@ -6011,7 +6350,7 @@ fn resolve_inline_site_from(
                 let val = match callee_class_info.constant_pool.get(cp_idx) {
                     Some(ConstantPoolEntry::Integer(v)) => *v as i64, // JVM spec: bounded float-to-long conversion
                     Some(ConstantPoolEntry::Float(v)) => (*v as f32).to_bits() as i32 as i64, // Cast: JIT ABI -- float bits to i64
-                    _ => 0,
+                    _ => return None,
                 };
                 ldc_info.push((fpc, val));
                 fpc += 2;
@@ -6020,7 +6359,7 @@ fn resolve_inline_site_from(
                 let val = match callee_class_info.constant_pool.get(cp_idx) {
                     Some(ConstantPoolEntry::Integer(v)) => *v as i64, // JVM spec: bounded float-to-long conversion
                     Some(ConstantPoolEntry::Float(v)) => (*v as f32).to_bits() as i32 as i64, // Cast: JIT ABI -- float bits to i64
-                    _ => 0,
+                    _ => return None,
                 };
                 ldc_info.push((fpc, val));
                 fpc += 3;
@@ -6030,6 +6369,9 @@ fn resolve_inline_site_from(
         }
     }
 
+    // Same contract for `ldc2_w`: `Long` and `Double` are the only entries the
+    // JVMS permits here, so a third kind means the constant pool disagrees with
+    // the bytecode — refuse rather than splice a zero.
     let mut ldc2w_info = Vec::new();
     if has_ldc2w {
         let mut fpc = 0;
@@ -6039,7 +6381,7 @@ fn resolve_inline_site_from(
                 let val = match callee_class_info.constant_pool.get(cp_idx)? {
                     ConstantPoolEntry::Long(v) => *v,
                     ConstantPoolEntry::Double(v) => v.to_bits() as i64, // Cast: JIT ABI -- float bits to i64
-                    _ => 0,
+                    _ => return None,
                 };
                 ldc2w_info.push((fpc, val));
                 fpc += 3;
@@ -6398,15 +6740,13 @@ impl Drop for JitSynchronizedMonitorGuard {
             let Some(monitor) = thread.native_pin_roots.get(self.pin_index).copied() else {
                 return;
             };
-            if let Err(error) = shared.threads.monitors.exit(monitor, thread.thread_id) {
+            if let Err(error) = crate::vm::vm_exec::monitor_exit_and_retract_jmx(
+                shared,
+                monitor,
+                thread.thread_id,
+            ) {
                 tracing::warn!(thread_id = ?thread.thread_id, ?error,
                     "implicit monitorexit after JIT synchronized method failed");
-            }
-            if !shared.threads.monitors.holds(monitor, thread.thread_id) {
-                shared
-                    .threads
-                    .thread_registry
-                    .remove_jmx_locked_monitor(thread.thread_id, monitor);
             }
             thread.native_pin_roots.truncate(self.pin_index);
         }
@@ -7406,4 +7746,97 @@ pub(super) fn execute_jit_call_decoded(
     }
 
     Ok(Some(CachedCallResult::Handled))
+}
+
+#[cfg(test)]
+mod elidable_ctor_policy_tests {
+    use super::elidable_ctor_native_would_run;
+    use crate::vm::SharedVm;
+    use cratonvm_native_api::NativeKind;
+    use cratonvm_types::compat::CompatibilityMode;
+
+    /// Not a real native — never invoked by these tests, which only ask the
+    /// POLICY question. A registration needs a callback, so this is one.
+    fn stub(
+        _ctx: &mut dyn cratonvm_native_api::NativeContext,
+        _args: &[crate::types::Value],
+    ) -> Result<Option<crate::types::Value>, cratonvm_types::error::MethodCallFailed> {
+        Ok(None)
+    }
+
+    fn vm_with(mode: CompatibilityMode, kind: NativeKind) -> SharedVm {
+        let mut config = crate::config::VmConfig::default();
+        config.compatibility_mode = mode;
+        // `JdkOnly` + the synthetic library is a rejected pair (the synthetic
+        // library IS ~5,200 synthetic stubs), and `VmConfig::default()` selects
+        // the synthetic library. Turn it off for BOTH arms rather than only the
+        // strict one, so the two VMs differ in exactly the variable under test.
+        config.use_synthetic_jdk = false;
+        let mut vm = SharedVm::new(config);
+        vm.natives.native_methods.register_with_kind(
+            "cratonvm/test/ElidableCtorFixture",
+            "<init>",
+            "()V",
+            stub,
+            kind,
+        );
+        vm
+    }
+
+    /// The predicate the JIT's constructor elision consults must flip with
+    /// policy for a `Bridge`, and must NOT flip for an `Intrinsic`.
+    ///
+    /// This is the §1.4 rule stated as the JIT sees it. Under `Compatible` a
+    /// registered `<init>()V` native wins over the bytecode constructor, so
+    /// eliding the call would skip it — the json-smart `HashMap` defect. Under
+    /// `JdkOnly` a non-intrinsic bridge in front of concrete bytecode loses (§7
+    /// step 3), so nothing is skipped and the elision is sound. An `Intrinsic`
+    /// is §1.4's reviewed exception and runs in both modes, so refusing to
+    /// elide must survive the mode change.
+    ///
+    /// Both directions are asserted because the one-sided version passes
+    /// against a predicate that has been rewritten to a constant.
+    #[test]
+    fn ctor_elision_asks_policy_not_just_registration() {
+        const FIXTURE: &str = "cratonvm/test/ElidableCtorFixture";
+
+        let compat_bridge = vm_with(CompatibilityMode::Compatible, NativeKind::Bridge);
+        assert!(
+            elidable_ctor_native_would_run(&compat_bridge, FIXTURE),
+            "Compatible must keep the pre-policy behaviour: a registered <init> \
+             native wins, so the constructor call may not be elided"
+        );
+
+        let strict_bridge = vm_with(CompatibilityMode::JdkOnly, NativeKind::Bridge);
+        assert!(
+            !elidable_ctor_native_would_run(&strict_bridge, FIXTURE),
+            "JdkOnly sends a Bridge standing in front of concrete bytecode to the \
+             bytecode (contract §7 step 3), so nothing is skipped by eliding and \
+             the old blanket refusal was pessimism"
+        );
+
+        let strict_intrinsic = vm_with(CompatibilityMode::JdkOnly, NativeKind::Intrinsic);
+        assert!(
+            elidable_ctor_native_would_run(&strict_intrinsic, FIXTURE),
+            "an Intrinsic is §1.4's reviewed exception and still runs under strict \
+             policy, so eliding its constructor would skip it"
+        );
+
+        let compat_intrinsic = vm_with(CompatibilityMode::Compatible, NativeKind::Intrinsic);
+        assert!(elidable_ctor_native_would_run(&compat_intrinsic, FIXTURE));
+    }
+
+    /// A class with NO registered `<init>()V` is answered `false` in both
+    /// modes — otherwise the predicate would refuse every elision and read as
+    /// working while doing nothing.
+    #[test]
+    fn an_unregistered_ctor_never_blocks_elision() {
+        for mode in [CompatibilityMode::Compatible, CompatibilityMode::JdkOnly] {
+            let vm = vm_with(mode, NativeKind::Bridge);
+            assert!(
+                !elidable_ctor_native_would_run(&vm, "cratonvm/test/NoSuchFixture"),
+                "{mode:?}: an unregistered triple must not block elision"
+            );
+        }
+    }
 }

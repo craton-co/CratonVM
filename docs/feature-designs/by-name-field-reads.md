@@ -1,40 +1,43 @@
-# `get_field_by_name` is not descriptor-aware — the by-name field-read family
+# `get_field_by_name` is not descriptor-aware
 
-**Status: 🟡 PARTIALLY FIXED 2026-08-01.** The dangerous call sites in
-`native-builtins/` are fixed (22 of them, listed in §4) behind a new
-descriptor-safe reader module, `native-builtins/src/field_read.rs`, with seven
-unit tests. The underlying `NativeContext` accessor is unchanged — fixing it
-properly is an API change in `native-api/` + `vm/`, specified in §6. The
-remaining low-risk call sites are censused in §3 with a grep recipe in §5.
+**Status:** Partial — the dangerous call sites are mitigated; the accessor
+itself is unchanged.
 
-This is the defect class behind two already-fixed bugs on this branch: the
-BouncyCastle stream-cipher round count (a recoverable key) and `Enum.toString`
-returning a primitive from a `()Ljava/lang/String;` method.
+## What is true today
 
-> **⚠️ The `Enum.toString` fix caused a worse regression, now reverted (2026-08-01).**
-> `5bc7458e4` fixed it by resolving `"name"` on the RECEIVER's class
-> (`declares_field` + `ref_field`) instead of reading `java.lang.Enum`'s slot 0.
-> But by-name resolution returns the **most-derived** declaration — §6.2 below
-> says so — and an enum may declare its own field called `name`. Spring Boot's
-> `WebEndpointTest.Infrastructure` does (`JERSEY("Jersey")`), so `Enum.name()`
-> answered `"Jersey"` instead of `"JERSEY"`; `Enum.valueOf` matches on `name()`
-> and threw `No enum constant JERSEY`; the enum-valued annotation attribute
-> resolved to nothing; and JUnit rejected every `@TestTemplate` class keyed on
-> such an enum with `displayName must not be null or blank` — zero tests run,
-> in 1.2 s, before any Spring context started. `native_enum_name` now reads
-> `Enum`'s own slot again and keeps only the primitive-tag degrade, which is
-> the part that was actually needed. Pinned by
-> `lang_misc::tests::enum_name_reads_enums_own_slot_not_a_shadowing_subclass_field`
-> and `probes/EnumShadowedNameProbe.java`.
->
-> **The lesson for the rest of this doc: `ref_field` is only safe where the
-> field name cannot be shadowed.** For a field declared by a SUPER-class —
-> which is every `java.lang.*` base-class field a native reads — by-name
-> resolution addresses the wrong slot the moment an application subclass reuses
-> the name. Prefer the known index there, and use §6.2's descriptor-qualified
-> resolver once it exists.
+`NativeContextImpl::get_field_by_name` (`vm/src/vm/vm_exec.rs`) still performs
+the raw read — it resolves a field index in the hierarchy and calls
+`heap.get_field(obj, index)` with **no descriptor decode**. The one-line fix
+(routing through the descriptor-aware `self.get_field(obj, index)`) is not
+applied, and there is no `get_field_by_name_desc` on `NativeContext`.
 
----
+What *has* landed is a descriptor-safe reader module,
+`native-builtins/src/field_read.rs`, used at roughly 22 call sites — the ones
+where a wrong answer had security or correctness consequences. There remain
+2,000+ `get_field_by_name` uses across the tree.
+
+**Get the failure direction right — it is the opposite of the folklore.**
+
+| Situation | by-name reader answers | by-index reader answers |
+|---|---|---|
+| field is **absent** | `Value::Object(None)` | — |
+| field is **present but unwritten**, reference slot, tagged layout | `Value::Int(0)` | `Value::Object(None)` |
+
+So "answers `Int(0)` for an absent field" is wrong twice over: an absent field
+gives `Object(None)`, and the `Int(0)` case is a *present* one. Records
+elsewhere in the tree took the loose phrasing literally and built layout
+discriminators on it. The only absent-vs-null oracle available is
+`resolve_field_index_by_class_id(..).is_some()`.
+
+This is the defect class behind two fixed bugs: a BouncyCastle stream-cipher
+round count read out of a reference slot (recovering a key), and
+`Enum.toString` returning a primitive from a `()Ljava/lang/String;` method.
+
+**A by-name resolution returns the most-derived declaration.** Fixing a
+`java.lang.Enum` read by resolving `"name"` on the *receiver's* class is
+therefore not a fix: an enum may declare its own field called `name`, and then
+`Enum.name()` answers the field's value instead of the constant's name, which
+makes `Enum.valueOf` throw `No enum constant`. That attempted fix was reverted.
 
 ## 1. The two readers disagree
 
@@ -323,7 +326,15 @@ family.
 
 *This is a behaviour change for every native in the tree* and must not be
 folded into a call-site fix. Expect fallout in natives that today rely on the
-`Int(0)`-means-absent behaviour; `lang_misc::init_suppressed_sentinel` documents
+`Int(0)`-means-absent behaviour
+(**terminology** read that as *unwritten*, not *absent*. This
+document's own §1 table is the authority — an **absent** field answers
+`Object(None)` from production `get_field_by_name`; `Int(0)` is what a
+present-but-**unwritten** slot decodes to. Several records elsewhere in `docs/`
+took the loose phrasing literally and built layout discriminators on it; see
+[§4 of *Natives over real JDK
+classes*](../architecture/natives-over-real-jdk-classes.md));
+`lang_misc::init_suppressed_sentinel` documents
 relying on it explicitly, and `read_throwable_field`
 (`native-builtins/src/lang_misc.rs:128`) was broken once by not accounting for
 it. Land it on its own, with the synthetic-jdk VM gate green on both platforms.
@@ -369,8 +380,9 @@ write per reference field per native-allocated object.
 
 ## Related
 
-* `docs/known-issues/c2/crypto-failure-mode-audit.md` — the crypto-side guards
-  (`check_rounds`, `demand_rounds`) that instance (a) was upstream of.
+* [`../security/crypto-failure-contract.md`](../security/crypto-failure-contract.md)
+  — the crypto-side guards (`check_rounds`, `demand_rounds`) that instance (a)
+  was upstream of.
 * `native-api/src/registry.rs:2173-2180` — the trait doc for both accessors.
   It documents the "not found" case but not the descriptor asymmetry; worth
   amending alongside 6.1.

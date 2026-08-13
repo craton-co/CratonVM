@@ -16,6 +16,21 @@ categories.workspace = true
 # packaged so the redefine/security integration tests exercise the same bytes
 # from a cargo package copy as they do from the workspace checkout.
 
+# The no-real-JDK build. This crate has no natives of its own; the feature
+# exists because `synthetic_stub_fields` must describe a DIFFERENT layout in
+# that build for the four `java.io` Reader/Writer classes, whose only writers
+# (`native_isr_init` and friends, in `cratonvm-native-io`) are gated on it. See
+# `shadow_layout::reader_writer_models_match_the_build`, which asserts both
+# arms, and the model table's own comment for why the split is the honest
+# spelling rather than one model that is wrong in one of the two builds.
+#
+# Declared here so the `#[cfg(feature = "synthetic-jdk")]` arms are not inert:
+# an undeclared feature name compiles to `false` with only an `unexpected cfg
+# condition value` WARNING, which is exactly the shape of an arm that ships
+# doing nothing.
+[features]
+synthetic-jdk = []
+
 [dependencies]
 cratonvm-types = { path = "../types", version = "0.3.0" }
 cratonvm-reader = { path = "../reader", version = "0.3.0" }

@@ -37,7 +37,8 @@ use cratonvm_native_api::{NativeContext, NativeKind, NativeMethodRegistry};
 use cratonvm_types::error::{MethodCallResult, RuntimeError};
 use cratonvm_types::{ObjectRef, Value};
 
-use crate::alloc_concurrent_synthetic;
+use crate::try_alloc_concurrent_synthetic;
+use cratonvm_types::error::MethodCallFailed;
 
 /// StackWalker field layout we use across this module (mirrors the real
 /// JDK private fields the `<init>(EnumSet, int, ExtendedOption, Scope, Continuation)`
@@ -67,8 +68,8 @@ fn alloc_walker(
     options: Value,
     estimate_depth: i32,
     retain_class_ref: bool,
-) -> ObjectRef {
-    let walker = alloc_concurrent_synthetic(ctx, "java/lang/StackWalker", STACK_WALKER_FIELD_COUNT);
+) -> Result<ObjectRef, MethodCallFailed> {
+    let walker = try_alloc_concurrent_synthetic(ctx, "java/lang/StackWalker", STACK_WALKER_FIELD_COUNT)?;
     // Real-JDK field declaration order is:
     //   continuation, contScope, options, extendedOption, estimateDepth, retainClassRef
     // Our synthetic-mode hard-coded indices (FIELD_OPTIONS=0,
@@ -103,7 +104,7 @@ fn alloc_walker(
         retain_idx,
         Value::Int(if retain_class_ref { 1 } else { 0 }),
     );
-    walker
+    Ok(walker)
 }
 
 /// `StackWalker.getInstance()` — no options; an empty set is stored.
@@ -118,15 +119,15 @@ pub(crate) fn native_get_instance_default(
     // so allocating it as synthetic leaves Set methods broken under real-JDK
     // dispatch.
     let options = build_options_set(ctx, &[]);
-    let walker = alloc_walker(ctx, Value::Object(Some(options)), 1, false);
+    let walker = alloc_walker(ctx, Value::Object(Some(options?)), 1, false)?;
     Ok(Some(Value::Object(Some(walker))))
 }
 
 /// Helper: allocate a real `java.util.HashSet` and add each provided option
 /// reference to it. Used by every `getInstance(...)` variant so the stored
 /// option set is queryable via standard `Set.contains` without NPE.
-fn build_options_set(ctx: &mut dyn NativeContext, opts: &[ObjectRef]) -> ObjectRef {
-    let set = alloc_concurrent_synthetic(ctx, "java/util/HashSet", 0);
+fn build_options_set(ctx: &mut dyn NativeContext, opts: &[ObjectRef]) -> Result<ObjectRef, MethodCallFailed> {
+    let set = try_alloc_concurrent_synthetic(ctx, "java/util/HashSet", 0)?;
     let _ = ctx.invoke(
         "java/util/HashSet",
         "<init>",
@@ -141,7 +142,7 @@ fn build_options_set(ctx: &mut dyn NativeContext, opts: &[ObjectRef]) -> ObjectR
             &[Value::Object(Some(set)), Value::Object(Some(*opt))],
         );
     }
-    set
+    Ok(set)
 }
 
 /// `StackWalker.getInstance(StackWalker$Option)` — build a one-option walker.
@@ -164,7 +165,7 @@ pub(crate) fn native_get_instance_one_option(
         }
     };
     let options = build_options_set(ctx, &[option]);
-    let walker = alloc_walker(ctx, Value::Object(Some(options)), 1, true);
+    let walker = alloc_walker(ctx, Value::Object(Some(options?)), 1, true)?;
     Ok(Some(Value::Object(Some(walker))))
 }
 
@@ -195,7 +196,7 @@ pub(crate) fn native_get_instance_set_depth(
         }
         .into());
     }
-    let walker = alloc_walker(ctx, option_set_arg, estimate_depth, true);
+    let walker = alloc_walker(ctx, option_set_arg, estimate_depth, true)?;
     Ok(Some(Value::Object(Some(walker))))
 }
 
@@ -288,27 +289,116 @@ pub(crate) fn native_get_caller_class(
     Ok(Some(Value::Object(None)))
 }
 
+/// Canonical fallback constant list, used only when the loaded class reports
+/// no enum-typed static fields (a stripped synthetic stand-in). Declaration
+/// order IS ordinal order, so this mirrors the JDK source order.
+const OPTION_FALLBACK_CONSTANTS: [&str; 4] = [
+    "RETAIN_CLASS_REFERENCE",
+    "DROP_METHOD_INFO",
+    "SHOW_REFLECT_FRAMES",
+    "SHOW_HIDDEN_FRAMES",
+];
+
+/// Names of the enum constants `java.lang.StackWalker$Option` declares, in
+/// declaration (= ordinal) order.
+///
+/// Read from the loaded class rather than hard-coded: `DROP_METHOD_INFO` only
+/// exists from JDK 22, so a fixed list is wrong on one JDK or the other. Enum
+/// constants are exactly the static fields whose descriptor is the enum type
+/// itself, which excludes `$VALUES` (an array) and any other static.
+fn option_constant_names(ctx: &dyn NativeContext, class_name: &str) -> Vec<String> {
+    let self_descriptor = format!("L{class_name};");
+    let names: Vec<String> = match ctx.class_id_by_name(class_name) {
+        Some(cid) => ctx
+            .declared_fields(cid)
+            .into_iter()
+            .filter(|f| f.is_static && f.descriptor == self_descriptor)
+            .map(|f| f.name)
+            .collect(),
+        None => Vec::new(),
+    };
+    if names.is_empty() {
+        return OPTION_FALLBACK_CONSTANTS
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect();
+    }
+    names
+}
+
+/// `java.lang.StackWalker$Option.<clinit>`.
+///
+/// Builds REAL enum constants — `name` and `ordinal` populated — not bare
+/// instances. A nameless constant is not merely cosmetic: `Enum.valueOf`
+/// resolves by comparing `name`, so nameless constants make
+/// `Option.valueOf("SHOW_REFLECT_FRAMES")` (and every other name) throw
+/// `IllegalArgumentException: No enum constant`. Mockito's
+/// `Java9PlusLocationImpl.<clinit>` does exactly that lookup, so it died with
+/// `ExceptionInInitializerError` and every Mockito-based test class failed
+/// wholesale — 7 of the 19 netty `io.netty.util` classes in
+/// `docs/known-issues/netty/investigate-batch-12.md` / `-13.md`.
+///
+/// The constant set is read from the loaded class (see
+/// `option_constant_names`) so the array matches whichever JDK is in use, and
+/// `$VALUES` is built in declaration order so `ordinal()` agrees with
+/// `values()[i]`.
 fn native_option_clinit(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
     let class_name = "java/lang/StackWalker$Option";
-    let mut values = Vec::with_capacity(3);
+    let names = option_constant_names(ctx, class_name);
 
-    for name in [
-        "RETAIN_CLASS_REFERENCE",
-        "SHOW_HIDDEN_FRAMES",
-        "SHOW_REFLECT_FRAMES",
-    ] {
-        let option = alloc_concurrent_synthetic(ctx, class_name, 0);
-        ctx.set_static_field_by_name(class_name, name, Value::Object(Some(option)));
-        values.push(option);
+    // Every constant is ROOTED for the whole clinit, not just across its own
+    // `create_string`. The per-constant pin below fixes the one allocation
+    // inside an iteration, but each later iteration allocates two more objects
+    // (the next constant and its name String) and `new_ref_array` allocates a
+    // third — all with the earlier constants live only as bare `ObjectRef`s.
+    // One moving young collection in any of those and `$VALUES` gets filled
+    // with vacated from-space addresses. Handles resolve post-GC; raw
+    // `ObjectRef`s in a `Vec` do not.
+    let mut scope = cratonvm_native_api::NativeHandleScope::new(ctx);
+    let mut handles = Vec::with_capacity(names.len());
+
+    for (ordinal, name) in names.iter().enumerate() {
+        // 2 slots = java.lang.Enum's (name, ordinal), the layout every other
+        // synthetic JDK enum in this crate uses (see `p57_alloc_enum`).
+        let option = try_alloc_concurrent_synthetic(&mut *scope, class_name, 2)?;
+        let handle = scope.root(option);
+        // Pin across `create_string`: a moving young GC there would relocate
+        // the freshly allocated constant (native stale-local family).
+        let name_str = scope.create_string(name);
+        let option = scope.get(&handle);
+        scope.set_field_by_name(option, "name", Value::Object(Some(name_str)));
+        scope.set_field_by_name(option, "ordinal", Value::Int(ordinal as i32));
+        // `set_field_by_name` is a NO-OP when the field is absent, which is the
+        // case for a stripped synthetic stand-in that declares no `java.lang.Enum`
+        // superclass fields. Fall back to Enum's (name, ordinal) slot convention
+        // — the same one `p57_alloc_enum` writes positionally — but only when the
+        // by-name write demonstrably did not land, so a real-JDK layout is never
+        // written through blind slot indices.
+        if !matches!(
+            scope.get_field_by_name(option, "name"),
+            Value::Object(Some(_))
+        ) {
+            scope.set_field(option, 0, Value::Object(Some(name_str)));
+            scope.set_field(option, 1, Value::Int(ordinal as i32));
+        }
+        scope.set_static_field_by_name(class_name, name, Value::Object(Some(option)));
+        handles.push(handle);
     }
 
-    let option_class = ctx.class_id_of_object(values[0]);
-    let values_array = ctx.new_ref_array(option_class, values.len());
-    for (idx, option) in values.into_iter().enumerate() {
-        ctx.set_array_element(values_array, idx, Value::Object(Some(option)));
+    let option_class = {
+        let first = scope.get(&handles[0]);
+        scope.class_id_of_object(first)
+    };
+    let values_array = scope.new_ref_array(option_class, handles.len());
+    let values_handle = scope.root(values_array);
+    for (idx, handle) in handles.iter().enumerate() {
+        let option = scope.get(handle);
+        let array = scope.get(&values_handle);
+        scope.set_array_element(array, idx, Value::Object(Some(option)));
     }
-    ctx.set_static_field_by_name(class_name, "$VALUES", Value::Object(Some(values_array)));
-    ctx.set_static_field_by_name(class_name, "ENUM$VALUES", Value::Object(Some(values_array)));
+    let values_array = scope.get(&values_handle);
+    scope.set_static_field_by_name(class_name, "$VALUES", Value::Object(Some(values_array)));
+    scope.set_static_field_by_name(class_name, "ENUM$VALUES", Value::Object(Some(values_array)));
 
     Ok(None)
 }
@@ -356,7 +446,7 @@ pub fn register_stack_walker_boot(registry: &mut NativeMethodRegistry) {
                 }
                 .into());
             }
-            let walker = alloc_walker(ctx, option_set_arg, 1, true);
+            let walker = alloc_walker(ctx, option_set_arg, 1, true)?;
             Ok(Some(Value::Object(Some(walker))))
         },
     );
@@ -403,6 +493,7 @@ pub fn register_stack_walker_boot(registry: &mut NativeMethodRegistry) {
         NativeKind::Bridge,
     );
     registry.set_category(__prev_cat);
+    ()
 }
 
 /// `StackStreamFactory$AbstractStackWalker.checkStackWalkModes()Z` —
@@ -570,7 +661,7 @@ mod tests {
     #[test]
     fn get_instance_set_depth_rejects_nonpositive() {
         let mut ctx = MockNativeContext::new();
-        let set = alloc_concurrent_synthetic(&mut ctx, "java/util/Set", 1);
+        let set = try_alloc_concurrent_synthetic(&mut ctx, "java/util/Set", 1).unwrap();
         let bad_args = [Value::Object(Some(set)), Value::Int(0)];
         let err = native_get_instance_set_depth(&mut ctx, &bad_args).unwrap_err();
         let s = format!("{:?}", err);
@@ -606,7 +697,7 @@ mod tests {
     #[test]
     fn get_instance_set_depth_sets_fields_correctly() {
         let mut ctx = MockNativeContext::new();
-        let set = alloc_concurrent_synthetic(&mut ctx, "java/util/Set", 1);
+        let set = try_alloc_concurrent_synthetic(&mut ctx, "java/util/Set", 1).unwrap();
         let args = [Value::Object(Some(set)), Value::Int(16)];
         let result = native_get_instance_set_depth(&mut ctx, &args)
             .unwrap()
@@ -629,31 +720,60 @@ mod tests {
         }
     }
 
-    #[test]
-    fn option_clinit_populates_enum_values_array() {
+    /// Stand a `StackWalker$Option` class up in the mock declaring exactly
+    /// `constants` (plus `$VALUES`), run the native clinit, and assert
+    /// `$VALUES` is those constants in that order — each carrying the
+    /// `name`/`ordinal` state `java.lang.Enum` declares.
+    ///
+    /// The name/ordinal assertions are the point. Asserting only that
+    /// `$VALUES[i]` is the same object as the i-th static field — which is
+    /// what this test used to do — holds for ANY set of instances the native
+    /// invents, including the nameless ones that made `Enum.valueOf` match
+    /// nothing and took out every Mockito-backed netty test class. A test that
+    /// cannot fail on the original bug is not cover for it.
+    fn assert_option_clinit_shape(constants: &[&str]) {
         use cratonvm_native_api::FieldMetadata;
 
         let mut ctx = MockNativeContext::new();
         let option_class = ctx
             .ensure_class_initialized("java/lang/StackWalker$Option")
             .unwrap();
-        let fields = [
-            ("RETAIN_CLASS_REFERENCE", "Ljava/lang/StackWalker$Option;"),
-            ("SHOW_HIDDEN_FRAMES", "Ljava/lang/StackWalker$Option;"),
-            ("SHOW_REFLECT_FRAMES", "Ljava/lang/StackWalker$Option;"),
-            ("$VALUES", "[Ljava/lang/StackWalker$Option;"),
-        ]
-        .into_iter()
-        .enumerate()
-        .map(|(slot_index, (name, descriptor))| FieldMetadata {
-            name: name.to_string(),
-            descriptor: descriptor.to_string(),
-            access_flags: 0,
-            slot_index,
-            declaring_class_id: option_class,
-            is_static: true,
-        })
-        .collect();
+        let mut fields: Vec<FieldMetadata> = constants
+            .iter()
+            .map(|n| (*n, "Ljava/lang/StackWalker$Option;"))
+            .chain(std::iter::once((
+                "$VALUES",
+                "[Ljava/lang/StackWalker$Option;",
+            )))
+            .enumerate()
+            .map(|(slot_index, (name, descriptor))| FieldMetadata {
+                name: name.to_string(),
+                descriptor: descriptor.to_string(),
+                access_flags: 0,
+                slot_index,
+                declaring_class_id: option_class,
+                is_static: true,
+            })
+            .collect();
+        // The INSTANCE fields every enum inherits from `java.lang.Enum`, in
+        // the JDK's slot order. Without them the mock falls back to a generic
+        // name→slot table that puts `name` and `ordinal` wherever it likes,
+        // and the assertions below would be measuring the mock rather than
+        // the native.
+        for (slot_index, (name, descriptor)) in
+            [("name", "Ljava/lang/String;"), ("ordinal", "I")]
+                .into_iter()
+                .enumerate()
+        {
+            fields.push(FieldMetadata {
+                name: name.to_string(),
+                descriptor: descriptor.to_string(),
+                access_flags: 0,
+                slot_index,
+                declaring_class_id: option_class,
+                is_static: false,
+            });
+        }
         ctx.set_declared_fields(option_class, fields);
 
         native_option_clinit(&mut ctx, &[]).expect("clinit should succeed");
@@ -665,20 +785,76 @@ mod tests {
             Value::Object(Some(array)) => array,
             other => panic!("expected non-null $VALUES array, got {:?}", other),
         };
-        assert_eq!(ctx.array_length(values_array), 3);
+        assert_eq!(
+            ctx.array_length(values_array),
+            constants.len(),
+            "$VALUES must have one entry per constant the class declares"
+        );
 
-        for (idx, name) in [
-            "RETAIN_CLASS_REFERENCE",
-            "SHOW_HIDDEN_FRAMES",
-            "SHOW_REFLECT_FRAMES",
-        ]
-        .into_iter()
-        .enumerate()
-        {
+        for (idx, name) in constants.iter().enumerate() {
             let slot = ctx.static_field_index_by_name(option_class, name).unwrap();
             let static_value = ctx.get_static_field(option_class, slot);
-            assert_eq!(ctx.get_array_element(values_array, idx), static_value);
+            assert_eq!(
+                ctx.get_array_element(values_array, idx),
+                static_value,
+                "$VALUES[{idx}] must be {name}"
+            );
+            let constant = match static_value {
+                Value::Object(Some(o)) => o,
+                other => panic!("{name} static is {other:?}, expected an object"),
+            };
+            // Non-null is NOT the contract; the name must be the RIGHT string.
+            // Merged 2026-08-12 from the jdk-only campaign, which found the
+            // weaker shape twice in one day: a doc froze "values() returns
+            // length 3" as verified-good while all three constants were wrong,
+            // and a sibling enum passed a non-null-and-named check while
+            // `values()[0] == State.NEW` was false. A null-check and an
+            // identity/equality check are different assertions, and only the
+            // latter can see a fabricated constant.
+            match ctx.get_field_by_name(constant, "name") {
+                Value::Object(Some(s)) => assert_eq!(
+                    ctx.read_string(s).as_deref(),
+                    // `name` is `&&str` from `constants.iter()`; deref rather
+                    // than `.as_str()`, which resolves to the still-unstable
+                    // `str::as_str` and fails to compile the whole test target.
+                    Some(*name),
+                    "{name} carries the wrong Enum.name — a wrong or null name makes \
+                     Enum.valueOf's constant directory match nothing"
+                ),
+                other => panic!(
+                    "{name} must carry an Enum.name string, got {other:?} — a null name \
+                     makes Enum.valueOf's constant directory match nothing"
+                ),
+            }
+            assert_eq!(
+                ctx.get_field_by_name(constant, "ordinal"),
+                Value::Int(idx as i32),
+                "{name} must carry ordinal {idx}"
+            );
         }
+    }
+
+    /// JDK 22+ declares four constants, with `DROP_METHOD_INFO` at ordinal 1.
+    #[test]
+    fn option_clinit_populates_enum_values_array() {
+        assert_option_clinit_shape(&[
+            "RETAIN_CLASS_REFERENCE",
+            "DROP_METHOD_INFO",
+            "SHOW_REFLECT_FRAMES",
+            "SHOW_HIDDEN_FRAMES",
+        ]);
+    }
+
+    /// JDK 9–21 has no `DROP_METHOD_INFO`; the native follows the class it
+    /// actually finds rather than publishing a constant that JDK never
+    /// declared.
+    #[test]
+    fn option_clinit_follows_a_pre_jdk22_three_constant_class() {
+        assert_option_clinit_shape(&[
+            "RETAIN_CLASS_REFERENCE",
+            "SHOW_REFLECT_FRAMES",
+            "SHOW_HIDDEN_FRAMES",
+        ]);
     }
 
     #[test]
@@ -696,7 +872,7 @@ mod tests {
     #[test]
     fn get_instance_one_option_sets_retain_flag() {
         let mut ctx = MockNativeContext::new();
-        let option = alloc_concurrent_synthetic(&mut ctx, "java/lang/StackWalker$Option", 1);
+        let option = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/StackWalker$Option", 1).unwrap();
         let args = [Value::Object(Some(option))];
         let result = native_get_instance_one_option(&mut ctx, &args)
             .unwrap()

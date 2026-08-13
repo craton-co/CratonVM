@@ -2344,10 +2344,10 @@ fn build_string_collection(
     ctx: &mut dyn NativeContext,
     class_name: &str,
     items: Vec<String>,
-) -> ObjectRef {
+) -> Result<ObjectRef, MethodCallFailed> {
     let coll = match ctx.new_object(class_name) {
         Ok(Some(Value::Object(Some(o)))) => o,
-        _ => return crate::alloc_concurrent_synthetic(ctx, class_name, 2),
+        _ => return crate::try_alloc_concurrent_synthetic(ctx, class_name, 2),
     };
     let pin = ctx.pin_native_root(coll);
     let _ = ctx.invoke(class_name, "<init>", "()V", &[Value::Object(Some(coll))]);
@@ -2363,13 +2363,13 @@ fn build_string_collection(
     }
     let coll = ctx.read_native_pin(pin, coll);
     ctx.unpin_native_roots(pin);
-    coll
+    Ok(coll)
 }
 
 /// Build a real `HashSet<String>` populated with the side-table keys for the
 /// given Properties object.  Returns an empty HashSet if the object isn't
 /// tracked.
-fn build_key_set(ctx: &mut dyn NativeContext, this: &mut ObjectRef) -> ObjectRef {
+fn build_key_set(ctx: &mut dyn NativeContext, this: &mut ObjectRef) -> Result<ObjectRef, MethodCallFailed> {
     let keys: Vec<String> = ordered_snapshot_kv(ctx, this)
         .into_iter()
         .map(|(k, _v)| k)
@@ -2384,7 +2384,7 @@ fn build_key_set(ctx: &mut dyn NativeContext, this: &mut ObjectRef) -> ObjectRef
     // the entire process (a MUCH more common class) is completely
     // unaffected. `LinkedHashSet extends HashSet`, so `instanceof HashSet`
     // and the `Set` contract are unchanged for callers.
-    build_string_collection(ctx, "java/util/LinkedHashSet", keys)
+    Ok(build_string_collection(ctx, "java/util/LinkedHashSet", keys)?)
 }
 
 /// Side table linking a `Properties.keySet()` snapshot `Set` (by identity
@@ -2572,9 +2572,12 @@ fn native_linkedhashset_remove(ctx: &mut dyn NativeContext, args: &[Value]) -> M
 /// paths mis-aligned — see `entrySet`).  `this` is pinned across the
 /// re-entrant `create_string`/`add` calls so a moving GC cannot leave a stale
 /// `vec`.
-fn build_enumeration(ctx: &mut dyn NativeContext, items: Vec<String>) -> ObjectRef {
-    let empty = |ctx: &mut dyn NativeContext| {
-        crate::alloc_concurrent_synthetic(ctx, "java/util/Collections$EmptyEnumeration", 0)
+fn build_enumeration(
+    ctx: &mut dyn NativeContext,
+    items: Vec<String>,
+) -> Result<ObjectRef, MethodCallFailed> {
+    let empty = |ctx: &mut dyn NativeContext| -> Result<ObjectRef, MethodCallFailed> {
+        crate::try_alloc_concurrent_synthetic(ctx, "java/util/Collections$EmptyEnumeration", 0)
     };
     let vec = match ctx.new_object("java/util/Vector") {
         Ok(Some(Value::Object(Some(o)))) => o,
@@ -2606,10 +2609,10 @@ fn build_enumeration(ctx: &mut dyn NativeContext, items: Vec<String>) -> ObjectR
     let vec = ctx.read_native_pin(pin, vec);
     let result = match ctx.invoke_virtual(vec, "elements", "()Ljava/util/Enumeration;", &[]) {
         Ok(Some(Value::Object(Some(e)))) => e,
-        _ => empty(ctx),
+        _ => empty(ctx)?,
     };
     ctx.unpin_native_roots(pin);
-    result
+    Ok(result)
 }
 
 /// Native `Properties.stringPropertyNames()Ljava/util/Set;` — Surefire
@@ -2675,7 +2678,7 @@ fn native_properties_string_property_names(
     // Same `LinkedHashSet` this returned before (see `build_key_set` for why
     // that class and not `HashSet`).
     let set = build_string_collection(ctx, "java/util/LinkedHashSet", names);
-    Ok(Some(Value::Object(Some(set))))
+    Ok(Some(Value::Object(Some(set?))))
 }
 
 /// Native `Properties.keySet()Ljava/util/Set;` — returns a synthetic
@@ -2691,7 +2694,7 @@ fn native_properties_key_set(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
         }
     };
     let mut this = this;
-    let mut set = build_key_set(ctx, &mut this);
+    let mut set = build_key_set(ctx, &mut this)?;
     let set_pin = ctx.pin_native_root(set);
     // Add keys for CHM-exclusive (non-String-valued) entries so the key view
     // matches the real map; `stringPropertyNames()` deliberately does NOT do
@@ -2760,7 +2763,7 @@ fn native_properties_values(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => {
-            let list = crate::alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
+            let list = crate::try_alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2)?;
             let arr = ctx.new_array(ArrayElementType::Reference, 0);
             ctx.set_field(list, 0, Value::Object(Some(arr)));
             ctx.set_field(list, 1, Value::Int(0));
@@ -2939,7 +2942,7 @@ fn native_properties_keys(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
             return Ok(Some(Value::Object(Some(build_enumeration(
                 ctx,
                 Vec::new(),
-            )))))
+            )?))))
         }
     };
     let mut this = this;
@@ -2954,7 +2957,7 @@ fn native_properties_keys(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
             keys.push(s);
         }
     }
-    Ok(Some(Value::Object(Some(build_enumeration(ctx, keys)))))
+    Ok(Some(Value::Object(Some(build_enumeration(ctx, keys)?))))
 }
 
 /// Collect this Properties object's own String keys (side-table + CHM-exclusive
@@ -3003,7 +3006,7 @@ fn native_properties_property_names(
             return Ok(Some(Value::Object(Some(build_enumeration(
                 ctx,
                 Vec::new(),
-            )))))
+            )?))))
         }
     };
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -3020,7 +3023,7 @@ fn native_properties_property_names(
         cur = props_defaults(ctx, p);
         depth += 1;
     }
-    Ok(Some(Value::Object(Some(build_enumeration(ctx, out)))))
+    Ok(Some(Value::Object(Some(build_enumeration(ctx, out)?))))
 }
 
 /// Native `Properties.elements()Ljava/util/Enumeration;` — companion to
@@ -3033,7 +3036,7 @@ fn native_properties_elements(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
             .collect(),
         _ => Vec::new(),
     };
-    Ok(Some(Value::Object(Some(build_enumeration(ctx, vals)))))
+    Ok(Some(Value::Object(Some(build_enumeration(ctx, vals)?))))
 }
 
 /// Native `Properties.contains(Object)Z` — Hashtable-style value lookup.
@@ -3441,10 +3444,13 @@ fn build_store_text(
     // `System.lineSeparator()`. Match it so callers that re-split the output on
     // the platform separator (e.g. Spring's `SortedProperties.store`, which does
     // `contents.split(System.lineSeparator())`) see the right line boundaries.
+    // The fallback is the platform default, not LF: an unseeded property here
+    // used to make `store` write LF-terminated lines that
+    // `split(System.lineSeparator())` then failed to split on Windows.
     let eol = ctx
         .get_system_property("line.separator")
         .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "\n".to_string());
+        .unwrap_or_else(|| if cfg!(windows) { "\r\n" } else { "\n" }.to_string());
     // Pin `this` across the Date allocation so the entry walk below sees the
     // forwarded (post-GC) reference.
     let this_pin = ctx.pin_native_root(this);
@@ -3495,10 +3501,17 @@ fn native_properties_store_stream(ctx: &mut dyn NativeContext, args: &[Value]) -
     }
     let out_cur = ctx.read_native_pin(out_pin, out);
     let write_res = ctx.invoke_virtual(out_cur, "write", "([B)V", &[Value::Object(Some(arr))]);
+    // The flush PROPAGATES. `Properties.store(OutputStream, String)` is
+    // `store0(new BufferedWriter(new OutputStreamWriter(out, ISO_8859_1)), …)`
+    // and `store0` ends in a bare `bw.flush()` under `throws IOException` with
+    // no `catch`. On a BufferedWriter that flush IS the byte delivery, so
+    // dropping its failure made `store` report success over a file that was
+    // never written. W7-57-close-flush-swallow-sweep.md
     let out_cur = ctx.read_native_pin(out_pin, out);
-    let _ = ctx.invoke_virtual(out_cur, "flush", "()V", &[]);
+    let flush_res = ctx.invoke_virtual(out_cur, "flush", "()V", &[]);
     ctx.unpin_native_roots(this_pin);
     write_res?;
+    flush_res?;
     Ok(None)
 }
 
@@ -3532,10 +3545,16 @@ fn native_properties_store_writer(ctx: &mut dyn NativeContext, args: &[Value]) -
         "(Ljava/lang/String;)V",
         &[Value::Object(Some(str_obj))],
     );
+    // The flush PROPAGATES, exactly as in the `OutputStream` overload above:
+    // `store(Writer, String)` wraps the writer in a `BufferedWriter` when it
+    // is not already one and calls the same `store0`, whose last statement is
+    // a bare `bw.flush()` under `throws IOException`.
+    // W7-57-close-flush-swallow-sweep.md
     let writer_cur = ctx.read_native_pin(writer_pin, writer);
-    let _ = ctx.invoke_virtual(writer_cur, "flush", "()V", &[]);
+    let flush_res = ctx.invoke_virtual(writer_cur, "flush", "()V", &[]);
     ctx.unpin_native_roots(this_pin);
     write_res?;
+    flush_res?;
     Ok(None)
 }
 

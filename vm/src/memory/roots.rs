@@ -129,22 +129,49 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
     // and the generational collector consults it to pick the non-moving sweep.
     cratonvm_gc::gc_quiescence::clear_unregistered_jit_frame_on_stack();
     let conditional_metadata = conditional_loader_metadata(shared);
-    cratonvm_types::metadata_pin::set_metadata_weak_mode(conditional_metadata);
-    cratonvm_types::metadata_pin::replace_metadata_pins(&[]);
+    cratonvm_types::metadata_pin::set_metadata_weak_mode(shared.vm_identity, conditional_metadata);
+    cratonvm_types::metadata_pin::replace_metadata_pins(shared.vm_identity, &[]);
 
     // A live activation keeps its defining loader and class metadata alive,
     // including static methods that carry no receiver oop. Interpreter frames
     // expose ClassId directly; compiled activations are counted globally by
     // JitEntryGuard so cross-thread STW scans see them too.
+    // TEMP-DIAG (CRATONVM_DBG_MIRRORPIN_WHY): name WHICH activation is rooting
+    // a user loader. Both of these push a loader with no heap referrer, so a
+    // retention-path walk cannot see them at all.
+    let act_dbg = cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_MIRRORPIN_WHY").is_some();
+    let act_name = |cid: u32| -> String {
+        shared
+            .classes
+            .class_manager
+            .read()
+            .get_class(cratonvm_types::ClassId::new(cid))
+            .map(|c| c.name.to_string())
+            .unwrap_or_default()
+    };
     for frame in &thread.frames {
         if let Some(loader) =
             cratonvm_native_builtins::classloader::defining_loader_for(shared.vm_identity, frame.class_id.as_u32())
         {
+            if act_dbg {
+                eprintln!(
+                    "[MIRRORWHY] root via FRAME class={:?} loader={:#x}",
+                    act_name(frame.class_id.as_u32()),
+                    loader.as_ptr() as usize
+                );
+            }
             roots.push(loader);
         }
     }
     for class_id in cratonvm_types::jit_activation::active_class_ids() {
         if let Some(loader) = cratonvm_native_builtins::classloader::defining_loader_for(shared.vm_identity, class_id) {
+            if act_dbg {
+                eprintln!(
+                    "[MIRRORWHY] root via JIT_ACTIVATION class={:?} loader={:#x}",
+                    act_name(class_id),
+                    loader.as_ptr() as usize
+                );
+            }
             roots.push(loader);
         }
     }
@@ -233,6 +260,7 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
                             cratonvm_types::loader_pin::loader_pin_addr(class_id.as_u32())
                         {
                             cratonvm_types::metadata_pin::add_metadata_pin(
+                                shared.vm_identity,
                                 loader,
                                 obj_ref.as_ptr() as usize,
                             );
@@ -258,6 +286,7 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
                 if let Some(loader) = cratonvm_types::loader_pin::loader_pin_addr(class_id.as_u32())
                 {
                     cratonvm_types::metadata_pin::add_metadata_pin(
+                        shared.vm_identity,
                         loader,
                         obj_ref.as_ptr() as usize,
                     );
@@ -387,6 +416,17 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
     // which is exactly what that machinery wants.
     {
         let class_mirrors = shared.classes.class_mirrors.read();
+        // TEMP-DIAG (CRATONVM_DBG_MIRRORPIN): name the DECISION, not just the
+        // outcome. "The mirror was still marked" is compatible with both
+        // "rooted unconditionally here" and "genuinely reachable from a live
+        // edge", and those want opposite fixes.
+        let mirror_dbg = cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_MIRRORPIN").is_some();
+        if mirror_dbg {
+            eprintln!(
+                "[DBG_MIRRORPIN] roots: conditional_metadata={conditional_metadata} mirrors={}",
+                class_mirrors.len()
+            );
+        }
         if conditional_metadata {
             let cm = shared.classes.class_manager.read();
             for (&class_id, obj_ref) in class_mirrors.iter() {
@@ -415,12 +455,22 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
                 // entire retained JSP-compiler graph, and an explicit
                 // `System.gc()` was the run's first collection, so nothing had
                 // ever been promoted.
-                if is_user_defined
-                    && shared
-                        .mem
-                        .heap
-                        .mirror_pin_deferrable(obj_ref.as_ptr() as usize)
-                {
+                let deferrable = shared
+                    .mem
+                    .heap
+                    .mirror_pin_deferrable(obj_ref.as_ptr() as usize);
+                if mirror_dbg && is_user_defined {
+                    let name = cm
+                        .get_class(class_id)
+                        .map(|c| c.name.to_string())
+                        .unwrap_or_default();
+                    eprintln!(
+                        "[DBG_MIRRORPIN] roots: user class={name:?} mirror={:#x} deferrable={deferrable} => {}",
+                        obj_ref.as_ptr() as usize,
+                        if deferrable { "DEFERRED" } else { "ROOTED" }
+                    );
+                }
+                if is_user_defined && deferrable {
                     continue;
                 }
                 roots.push(*obj_ref);
@@ -429,6 +479,17 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
             for obj_ref in class_mirrors.values() {
                 roots.push(*obj_ref);
             }
+        }
+    }
+
+    // 6b. Cached proxy-dispatch `Method` objects (see `proxy_method_cache`'s
+    // doc comment in `class_realm.rs`) — these are meant to be shared and
+    // reused across every future dispatch to the same proxy method, so they
+    // must stay alive unconditionally for as long as the cache entry exists,
+    // exactly like `class_mirrors` above.
+    {
+        for obj_ref in shared.classes.proxy_method_cache.read().values() {
+            roots.push(*obj_ref);
         }
     }
 
@@ -656,6 +717,7 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
                 if let Some(loader) = cratonvm_types::loader_pin::loader_pin_addr(class_id.as_u32())
                 {
                     cratonvm_types::metadata_pin::add_metadata_pin(
+                        shared.vm_identity,
                         loader,
                         object.as_ptr() as usize,
                     );
@@ -721,6 +783,7 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
         && crate::jit::conservative_roots::refresh_moving_young_coverage_for_collection()
         && !cratonvm_gc::gc_quiescence::moving_young_coverage_incomplete();
     if !moving_young_precise_only {
+        crate::memory::native_roots::rootprof::note_scan_caller(0); // gc-roots
         crate::jit::conservative_roots::scan_active_jit_frames(&shared.mem.heap, &mut roots);
     }
     // G1 pin-in-place for conservative JIT roots: the generational collector
@@ -796,7 +859,36 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
     // 15-21. VM/native side tables. The registry owns every built-in scan and
     // its matching relocation callback as one entry. The historical notes
     // below document why each registered source is a root.
+    let __pre_native_roots = roots.len();
     crate::memory::native_roots::scan_all_roots(shared, &mut roots);
+    // CRATONVM_DBG_ROOT_SOURCE, second question: which channel hands the
+    // collector an address that is NOT an object start?
+    //
+    // The G1 evacuation-failure path learned the hard way that it gets them —
+    // its kept-seed and ref-scan guards both reject INTERIOR pointers
+    // (`object_start + 8`, or 0x60 into an array's payload) that arrived in
+    // this very array. `is_object_address` is the strict probe, so a young or
+    // mid-initialisation object can legitimately fail it; the index split is
+    // what makes the output actionable. Everything below `__pre_native_roots`
+    // came from this thread's frames/stack, everything at or above it from a
+    // NAMED source that `root_source_of` can name.
+    if crate::memory::native_roots::root_attribution_on() {
+        for (i, r) in roots.iter().enumerate() {
+            let addr = r.as_ptr() as usize;
+            if shared.mem.heap.is_object_address(addr).is_none() {
+                eprintln!(
+                    "[ROOT-NOT-OBJECT] idx={i}/{} addr=0x{addr:x} phase={} source={:?}",
+                    roots.len(),
+                    if i < __pre_native_roots {
+                        "frame/thread"
+                    } else {
+                        "native-source"
+                    },
+                    crate::memory::native_roots::root_source_of(addr),
+                );
+            }
+        }
+    }
     if let Some(t0) = __rp_t0 {
         let ns = t0.elapsed().as_nanos();
         if ns >= 20_000_000 {

@@ -133,6 +133,23 @@ fn forwarding_overflow() -> &'static ForwardingOverflowTable {
 /// The GC should call this after a moving collection has fully relocated
 /// objects and rewritten all references, so interned high-address forwardings
 /// do not accumulate across cycles.
+///
+/// **NOT CALLED YET — this is an obligation, not a description.** As of
+/// 2026-08-07 the only caller in the tree is this module's own
+/// `forwarding_overflow_table_clears` test, because `CompactHeader` itself is
+/// not yet adopted on any collector path (`migrate_to_compact`'s callers are
+/// all tests too). Whoever adopts it inherits this: without a per-cycle clear
+/// the table grows monotonically for the lifetime of the process, and
+/// [`ForwardingOverflowTable::intern`] `assert!`s once the 29-bit token space is
+/// exhausted — a hard panic rather than a leak you can outrun. The right place
+/// is wherever the collector finishes rewriting references, next to whatever
+/// already drops the pointer map.
+///
+/// Note the ordering constraint that makes this sharper than "free some
+/// memory": clearing while any live header still carries an overflow token
+/// makes that header's [`CompactHeader::forwarding_ptr`] answer `0`, silently,
+/// because [`ForwardingOverflowTable::resolve`] returns `0` for an unknown
+/// token. Too early is worse than too late.
 pub fn clear_forwarding_overflow_table() {
     forwarding_overflow().clear();
 }
@@ -1180,11 +1197,51 @@ fn element_byte_size(et: crate::heap::ArrayElementType) -> usize {
 mod tests {
     use super::*;
 
-    /// Serializes the handful of tests that observe the *global* forwarding
-    /// overflow side table's length, so concurrent test threads cannot perturb
-    /// each other's count assertions. Per-header invariants (exact address
-    /// round-trip, tag bit) are deterministic regardless and don't need this.
-    static OVERFLOW_TABLE_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    /// Serialises every test that **touches** the global forwarding overflow
+    /// side table — interning a high address counts, not just asserting the
+    /// table's length.
+    ///
+    /// # The premise this used to carry was wrong
+    ///
+    /// It read: "Per-header invariants (exact address round-trip, tag bit) are
+    /// deterministic regardless and don't need this." A round-trip through the
+    /// *inline* encoding is indeed per-header. A round-trip through the
+    /// **overflow** encoding is not: `set_forwarding_ptr` stores only a token in
+    /// the header and parks the real address in this process-wide table, so
+    /// `forwarding_ptr()` is a lookup in shared mutable state. Any test that
+    /// interns is therefore exposed to `forwarding_overflow_table_clears`, whose
+    /// `clear_forwarding_overflow_table()` wipes the whole table — every other
+    /// test's tokens with it. `resolve` answers `0` for a missing token, so the
+    /// victim fails with `0 != <its address>`.
+    ///
+    /// That is not theoretical. Before this guard was widened,
+    /// `cargo test -p cratonvm-gc --lib -- forwarding` failed **15 runs out of
+    /// 40**, spread across four different victims
+    /// (`forwarding_ptr_distinct_high_targets`, `forwarding_ptr_above_8gb_exact`,
+    /// `forwarding_ptr_mixed_sweep`,
+    /// `forwarding_ptr_overflow_survives_raw_roundtrip`) — whichever happened to
+    /// be between its intern and its read when the clear landed. In the full
+    /// suite it diluted to roughly one run in four, which is exactly the rate at
+    /// which a flake gets re-run rather than diagnosed.
+    ///
+    /// The clearing test analysed the race in one direction only and concluded
+    /// its own assertions were safe. They are — concurrent interning only *adds*
+    /// entries, and its token is never reissued. What it did not consider is the
+    /// other direction: what its clear does to everyone else.
+    ///
+    /// # How to apply
+    ///
+    /// Hold this for the whole test if the test interns **any** address above
+    /// [`CompactHeader::FORWARD_INLINE_MAX_ADDR`], including a sweep where only
+    /// some entries are high. Tests that stay entirely inline do not need it.
+    /// `--test-threads=1` is not the fix: it would hide this class of bug across
+    /// the other 980 tests in the crate.
+    fn overflow_table_guard() -> std::sync::MutexGuard<'static, ()> {
+        static OVERFLOW_TABLE_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        OVERFLOW_TABLE_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
 
     // -- CompactHeader construction -----------------------------------------
 
@@ -1373,6 +1430,8 @@ mod tests {
     /// routes such targets through the overflow side table.
     #[test]
     fn forwarding_ptr_above_8gb_exact() {
+        // Interns into the shared overflow table — see `overflow_table_guard`.
+        let _guard = overflow_table_guard();
         // 16 GB, 8-byte aligned. addr >> 3 needs 31 bits, so the 30-bit inline
         // field cannot hold it.
         let addr: usize = 16usize * 1024 * 1024 * 1024;
@@ -1395,6 +1454,8 @@ mod tests {
     /// the token lives inside the 64-bit header value itself.
     #[test]
     fn forwarding_ptr_overflow_survives_raw_roundtrip() {
+        // Interns into the shared overflow table — see `overflow_table_guard`.
+        let _guard = overflow_table_guard();
         let addr: usize = 0x7_0000_0008; // 28 GB + 8, aligned
         let mut h = CompactHeader::new_object(3, 0);
         h.set_forwarding_ptr(addr);
@@ -1406,6 +1467,10 @@ mod tests {
     /// Two distinct high targets must not alias to the same address.
     #[test]
     fn forwarding_ptr_distinct_high_targets() {
+        // Interns twice into the shared overflow table — see
+        // `overflow_table_guard`. This was the most frequent victim of the clear
+        // race, holding two live tokens across four reads.
+        let _guard = overflow_table_guard();
         let a: usize = 0x10_0000_0000; // 64 GB
         let b: usize = 0x10_0000_0008; // 64 GB + 8
         let mut ha = CompactHeader::new_object(1, 0);
@@ -1422,11 +1487,13 @@ mod tests {
     /// the next aligned address up tips into the overflow path.
     #[test]
     fn forwarding_ptr_inline_boundary() {
+        // The `just_over` half interns into the shared overflow table, so this
+        // test needs the guard even though its first half is pure inline —
+        // "mostly inline" is not "inline". See `overflow_table_guard`.
+        let _guard = overflow_table_guard();
         let max_inline = CompactHeader::FORWARD_INLINE_MAX_ADDR;
         assert_eq!(max_inline & 0x7, 0, "inline max must be 8-byte aligned");
 
-        // Per-header invariants only (no global-count assertions) so this is
-        // robust under concurrent test execution.
         let mut h = CompactHeader::new_object(9, 1);
         h.set_forwarding_ptr(max_inline);
         assert_eq!(h.forwarding_ptr(), max_inline);
@@ -1451,6 +1518,9 @@ mod tests {
     /// including 0, small, near-boundary, and several multi-GB targets.
     #[test]
     fn forwarding_ptr_mixed_sweep() {
+        // Four of the eight addresses below are above the inline ceiling and
+        // intern into the shared overflow table — see `overflow_table_guard`.
+        let _guard = overflow_table_guard();
         let addrs: Vec<usize> = vec![
             0,
             8,
@@ -1476,17 +1546,22 @@ mod tests {
 
     /// The overflow side table can be cleared between GC cycles.
     ///
-    /// Asserted via per-header round-trips (deterministic even under concurrent
-    /// test execution): tokens are monotonic and never reissued, so a token
-    /// dropped by `clear()` resolves to 0 afterwards regardless of any
-    /// concurrent interning by other tests. The `>= 1` length check is also
-    /// race-safe because other interners only *add* entries. The guard is held
-    /// for documentation/ordering; correctness does not depend on it.
+    /// This test's *own* assertions are race-safe and its doc used to say so:
+    /// tokens are monotonic and never reissued, so a token dropped by `clear()`
+    /// resolves to 0 afterwards regardless of concurrent interning, and the
+    /// `>= 1` length check only ever gains entries. That reasoning was correct
+    /// and it concluded "correctness does not depend on the guard" — of the one
+    /// direction it looked at.
+    ///
+    /// The direction it missed is what this test does **to** its neighbours.
+    /// `clear_forwarding_overflow_table()` is not scoped to this test's token;
+    /// it empties the process-wide table, so every concurrently-running test
+    /// holding an overflow forwarding loses its address. The guard is now
+    /// load-bearing here — it is what keeps this clear from landing between some
+    /// other test's intern and its read. See `overflow_table_guard`.
     #[test]
     fn forwarding_overflow_table_clears() {
-        let _guard = OVERFLOW_TABLE_GUARD
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _guard = overflow_table_guard();
 
         let addr = 20usize * 1024 * 1024 * 1024; // 20 GB -> overflow path
         let mut h = CompactHeader::new_object(1, 0);

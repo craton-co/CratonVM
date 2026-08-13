@@ -18,8 +18,7 @@ production caveats.
   Moving-young collection is now the default (`CRATONVM_NO_MOVING_YOUNG` opts
   out), so its remaining optimizations — the `pointer_map` `FxHashMap`, the
   disabled self-call spill elision, and the unpriced `jit_frame_record` helper —
-  are work on the default path, tracked in
-  [`docs/moving-young-throughput.md`](docs/moving-young-throughput.md).
+  are work on the default path.
 - Repeatable framework-throughput qualification for Spring Boot, Quarkus, and
   Micronaut, following [`docs/framework-throughput.md`](docs/framework-throughput.md).
 - Complete `java.util.concurrent` parity (ForkJoin, ReentrantReadWriteLock,
@@ -41,7 +40,12 @@ as a wish list.
   section below.
 - JNI: full function-table coverage and OnLoad/OnUnload protocol.
 - JCK compliance run on Java SE 25 (see [docs/legal.md](docs/legal.md)).
-- Concurrent garbage collector (G1 maturity, ZGC experimentation).
+- Concurrent garbage collector: G1 maturity, and production low-latency ZGC.
+  The `-XX:+UseZGC` backend that exists today is real and selectable but is a
+  stop-the-world non-moving mark-sweep, and it is compiled in only behind the
+  default-off `zgc` feature, so a stock build does not have it. The plan for a
+  genuinely concurrent, compacting one is
+  [docs/feature-designs/zgc-production-implementation-plan.md](docs/feature-designs/zgc-production-implementation-plan.md).
 - JFR event coverage matching OpenJDK 25.
 
 ## Longer-term
@@ -93,7 +97,7 @@ Two notes on the gates, so they are not read as more than they are:
   class-origin census diff and nowhere else — which is why the advisory job
   proposes a second leg. Widening JDK coverage repo-wide is a separate decision.
 
-### Wave-2 work required before the mode is complete
+### Work required before the mode is complete
 
 Ranked by **danger, not effort**, and tracked in
 [`docs/known-issues/jdk-only/README.md`](docs/known-issues/jdk-only/README.md),
@@ -109,8 +113,8 @@ they are dangerous in the *default* `compatible` mode too, not only under
    bridge registered outside a `with_category` scope is silently classified a
    stub — and then dropped under `CRATONVM_NO_STUBS` / `--jdk-only`. A stub
    created by omission has no syntactic marker, so a grep-based census
-   undercounts by construction. This already caused one boot regression
-   (2026-07-14). Everything else in this tier ends with "let `resolve_dispatch`
+   undercounts by construction. This already caused one boot regression.
+   Everything else in this tier ends with "let `resolve_dispatch`
    decide from the kind", so this must land first.
 2. **Fabricated object layouts leak into native code.** Index-based field access
    against assumed synthetic layouts still resolves against real bytes, pointing
@@ -130,8 +134,8 @@ they are dangerous in the *default* `compatible` mode too, not only under
    re-apply the policy and is uncounted. The JIT's inline-cache slots have the
    same hole; fixing either alone buys nothing.
 7. **The real-protected-stub allow-lists diverge** (11 classes vs 10, with a
-   documented heap-corruption reason behind the difference). Wave 2 must
-   reconcile them; both naive merge directions reintroduce a known defect.
+   documented heap-corruption reason behind the difference). They must be
+   reconciled; both naive merge directions reintroduce a known defect.
 8. **The `ThreadPoolExecutor.execute` receiver-shape special case is copied
    eight times.** A mechanical "delete every marked site" sweep leaves half the
    duplication enforcing a policy the other half no longer applies.
@@ -156,7 +160,7 @@ globals are already logged as violations to remove.
 
 ## GPU offload
 
-**Validated on real hardware 2026-07-11** (RTX 2060, `--features gpu-driver`):
+**Validated on real hardware** (RTX 2060, `--features gpu-driver`):
 automatic offload for the documented eligible kernel subset matches HotSpot
 checksums bit-for-bit and reaches ~210x over HotSpot C2 and
 ~3x over TornadoVM's PTX backend on a 48-division-per-element div-chain kernel at n = 2^24
@@ -178,9 +182,7 @@ Current product limits:
   CUDA hardware on every change, so the numbers above are point-in-time
   measurements rather than a continuously enforced budget.
 
-Closed GPU follow-ups, including asynchronous completion and the JIT-caller
-admission gate, are retained as
-historical evidence.
+Asynchronous completion and the JIT-caller admission gate are complete.
 
 Longer-horizon:
 
@@ -200,10 +202,8 @@ current state. CratonVM remains research-grade software; numbers are targets we
 are aiming at, and may shift as priorities change.
 
 - **Performance vs HotSpot C2** - narrow the current QuickBench TOTAL gap
-  (3.7x default in the 2026-07-08 snapshot, now that back-edge OSR is
-  default-on) toward <=1.2x of JDK 25 C2 runtime, with no single QuickBench
-  micro above 1.5x. Bring Binary Trees (depth=18), currently 23.7x in the
-  2026-07-08 recheck, under 5x through GC throughput work.
+  (3.7x default, with back-edge OSR default-on) toward <=1.2x of JDK 25 C2 runtime, with no single QuickBench
+  micro above 1.5x. Bring Binary Trees (depth=18), currently 23.7x, under 5x through GC throughput work.
 - **Bytecode verifier** - reach 100% of the structural/type checks needed to
   verify the pre-Java-7 split-verifier class-file corpus without `--noverify`.
 - **JCK / compliance** - target >=90% pass rate on a single chosen JCK area,

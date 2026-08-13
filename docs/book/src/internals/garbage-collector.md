@@ -11,7 +11,20 @@ Collection](../user-guide/memory-and-gc.md).
 |-----------|-----------|--------|
 | **Generational** | default / `-XX:+UseGenerationalGC` | The default. Young/old generations with write barriers and a card table. The default young path is non-moving mark/sweep with selective promotion; moving evacuation is opt-in and fail-closed on incomplete root coverage. |
 | **G1** (region-based) | `-XX:+UseG1GC` | Experimental. The generational collector remains the safety net during its maturation. |
-| `zgc` | feature-gated stub | Not a selectable production collector — a metadata simulation plus a real stop-the-world mark-sweep heap that isn't wired into the backend dispatch. |
+| **ZGC** (`ZgcRealHeap`, `gc/src/zgc.rs:1396`) | `-XX:+UseZGC`, in a build with the default-off `zgc` Cargo feature | Real and wired end to end — `GcAlgorithm::Zgc` → `GcBackend::Zgc` → `VmHeap::Zgc` — but **not** a real ZGC: one `Arena`, a non-moving whole-heap stop-the-world mark-sweep, no TLABs. Absent from a stock build. The colored-pointer / `ZPage` code alongside it in the same file (`ZgcCollector`, `ColoredPointer`, `LoadBarrier`, `GenerationalZgc`) is a metadata-only simulation with no production consumer. |
+
+> **On the `zgc` row.** `gc/src/vm_heap.rs` does `use crate::zgc::ZgcRealHeap`
+> and carries `VmHeap::Zgc` arms behind the same cfg, and `cratonvm-vm` forwards
+> the feature, so `-XX:+UseZGC` really selects it. The feature is
+> **default-off** — a stock build compiles only two backends, and
+> `cargo build --release -p cratonvm-cli --features zgc` is what produces a
+> ZGC-capable launcher. It stays default-off for pass-rate parity, not for want
+> of a consumer: on the 1975-class Spring Boot suite, same binary with only the
+> collector toggled, ZGC measures 1860 PASS / 49 HANG / 22 FAIL against the
+> default collector's 1902 / 18 / 11
+> (record `fixed-suite-bugs/springboot/zgc-real-fullsuite-regression-RETIRED-20260808.md`). The path to
+> a genuinely concurrent, generational, compacting ZGC is
+> [`docs/feature-designs/zgc-production-implementation-plan.md`](../../../feature-designs/zgc-production-implementation-plan.md).
 
 ## Generational design
 

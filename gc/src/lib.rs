@@ -49,7 +49,7 @@
 /// Every `CRATONVM_*` flag this crate reads is a field on
 /// [`cratonvm_types::GcFlags`], parsed once at first use. Before the typed
 /// config existed each of these was an independent `cratonvm_types::flags::runtime_var_os` call
-/// wrapped in its own `OnceLock`; see `docs/flag-census.md` for the
+/// wrapped in its own `OnceLock`; see `audits/flag-census.md` for the
 /// inventory and `cratonvm_types::flags` for the latching rules.
 #[inline]
 pub(crate) fn gc_flags() -> &'static cratonvm_types::GcFlags {
@@ -58,6 +58,12 @@ pub(crate) fn gc_flags() -> &'static cratonvm_types::GcFlags {
 
 pub mod a2dbg;
 pub mod arena;
+// The ONE implementation of "a non-reference value was stored into a slot the
+// class declares as a reference" (W7-84-primitive-in-reference-store.md).
+// Crate-private on purpose: it exists so `gen_heap`, `zgc`, `g1` and `heap`
+// cannot drift apart again, and a public re-export would invite a fifth
+// caller with a fifth opinion.
+mod autobox;
 pub mod blocked_access_debug;
 pub mod card_table;
 pub mod class_unloading;
@@ -95,10 +101,19 @@ pub mod vm_heap;
 // drain). Crate-internal: only `gen_heap` drives it.
 mod young_mark;
 pub mod zero_forensics;
-// Round-7 cross-cutting Fix 4: ZGC stub (1884 LOC) gated behind the `zgc`
-// feature. No in-workspace consumer references `zgc::*` today, so paying
-// the compile-time + binary-size cost on every build is pure waste. Flip
-// the feature on once a real consumer lands.
+// The Z Garbage Collector backend, gated behind the `zgc` feature.
+//
+// The "1884-LOC stub with no in-workspace consumer" this comment used to
+// claim has been false on both counts since the real collector landed:
+// `vm_heap.rs` does `use crate::zgc::ZgcRealHeap` and carries `VmHeap::Zgc`
+// arms behind the same cfg, and `cratonvm-vm` forwards the feature so
+// `-XX:+UseZGC` really selects it. Two things of different maturity sit
+// behind the one flag — a REAL memory-backed mark-sweep collector
+// (`ZgcRealHeap`) and a metadata-only SIMULATION of OpenJDK's colored-pointer
+// model (`ZgcCollector` / `ColoredPointer` / `LoadBarrier`). See the
+// `[features]` comment in `gc/Cargo.toml` for the full split.
+//
+// Default-OFF is a pass-rate-parity decision, not a "nothing uses it" one.
 #[cfg(feature = "zgc")]
 pub mod zgc;
 // Task #55: ZGC concurrent-mark controller — mirrors the G1

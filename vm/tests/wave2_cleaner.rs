@@ -91,7 +91,17 @@ fn run_probe(timeout: Duration) -> Option<(String, String, Option<i32>)> {
     let bin = cratonvm_binary()?;
     let probe = probe_dir();
     if !probe.join("CleanerProbe.class").exists() {
-        eprintln!("[wave2_cleaner] CleanerProbe.class missing — run javac in apps/cleaner_probe");
+        // Loud, and a failure under CRATONVM_REQUIRE_E2E — see
+        // `common::require_fixture`.
+        let _ = common::require_fixture(
+            "wave2_cleaner",
+            "the Wave 2 Cleaner fixture `CleanerProbe` (CleanerProbe.class, compiled from \
+             CleanerProbe.java)",
+            &[
+                probe.join("CleanerProbe.class"),
+                probe.join("CleanerProbe.java"),
+            ],
+        );
         return None;
     }
     let mut cmd = Command::new(&bin);

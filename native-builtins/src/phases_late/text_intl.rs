@@ -243,12 +243,12 @@ pub(crate) fn register_phase57_text(r: &mut NativeMethodRegistry) {
                 .collect();
             if cleaned.contains('.') {
                 let val: f64 = cleaned.parse().unwrap_or(0.0);
-                let obj = alloc_concurrent_synthetic(ctx, "java/lang/Double", 1);
+                let obj = try_alloc_concurrent_synthetic(ctx, "java/lang/Double", 1)?;
                 ctx.set_field(obj, 0, Value::Double(val));
                 Ok(Some(Value::Object(Some(obj))))
             } else {
                 let val: i64 = cleaned.parse().unwrap_or(0);
-                let obj = alloc_concurrent_synthetic(ctx, "java/lang/Long", 1);
+                let obj = try_alloc_concurrent_synthetic(ctx, "java/lang/Long", 1)?;
                 ctx.set_field(obj, 0, Value::Long(val));
                 Ok(Some(Value::Object(Some(obj))))
             }
@@ -269,12 +269,12 @@ pub(crate) fn register_phase57_text(r: &mut NativeMethodRegistry) {
                 .collect();
             if cleaned.contains('.') {
                 let val: f64 = cleaned.parse().unwrap_or(0.0);
-                let obj = alloc_concurrent_synthetic(ctx, "java/lang/Double", 1);
+                let obj = try_alloc_concurrent_synthetic(ctx, "java/lang/Double", 1)?;
                 ctx.set_field(obj, 0, Value::Double(val));
                 Ok(Some(Value::Object(Some(obj))))
             } else {
                 let val: i64 = cleaned.parse().unwrap_or(0);
-                let obj = alloc_concurrent_synthetic(ctx, "java/lang/Long", 1);
+                let obj = try_alloc_concurrent_synthetic(ctx, "java/lang/Long", 1)?;
                 ctx.set_field(obj, 0, Value::Long(val));
                 Ok(Some(Value::Object(Some(obj))))
             }
@@ -287,7 +287,7 @@ pub(crate) fn register_phase57_text(r: &mut NativeMethodRegistry) {
         "getInstance",
         "()Ljava/text/NumberFormat;",
         |ctx, _args| {
-            let obj = alloc_concurrent_synthetic(ctx, "java/text/DecimalFormat", 3);
+            let obj = try_alloc_concurrent_synthetic(ctx, "java/text/DecimalFormat", 3)?;
             // Pin across the create_string below — a moving young GC there
             // would relocate the fresh format (native stale-local family).
             let obj_pin = ctx.pin_native_root(obj);
@@ -306,7 +306,7 @@ pub(crate) fn register_phase57_text(r: &mut NativeMethodRegistry) {
         "getIntegerInstance",
         "()Ljava/text/NumberFormat;",
         |ctx, _args| {
-            let obj = alloc_concurrent_synthetic(ctx, "java/text/DecimalFormat", 3);
+            let obj = try_alloc_concurrent_synthetic(ctx, "java/text/DecimalFormat", 3)?;
             // Pin across the create_string below — a moving young GC there
             // would relocate the fresh format (native stale-local family).
             let obj_pin = ctx.pin_native_root(obj);
@@ -325,7 +325,7 @@ pub(crate) fn register_phase57_text(r: &mut NativeMethodRegistry) {
         "getCurrencyInstance",
         "()Ljava/text/NumberFormat;",
         |ctx, _args| {
-            let obj = alloc_concurrent_synthetic(ctx, "java/text/DecimalFormat", 3);
+            let obj = try_alloc_concurrent_synthetic(ctx, "java/text/DecimalFormat", 3)?;
             // Pin across the create_string below — a moving young GC there
             // would relocate the fresh format (native stale-local family).
             let obj_pin = ctx.pin_native_root(obj);
@@ -344,7 +344,7 @@ pub(crate) fn register_phase57_text(r: &mut NativeMethodRegistry) {
         "getPercentInstance",
         "()Ljava/text/NumberFormat;",
         |ctx, _args| {
-            let obj = alloc_concurrent_synthetic(ctx, "java/text/DecimalFormat", 3);
+            let obj = try_alloc_concurrent_synthetic(ctx, "java/text/DecimalFormat", 3)?;
             // Pin across the create_string below — a moving young GC there
             // would relocate the fresh format (native stale-local family).
             let obj_pin = ctx.pin_native_root(obj);
@@ -681,7 +681,7 @@ pub(crate) fn register_p61_text_formatting(r: &mut NativeMethodRegistry) {
                 (0.0, seg.trim())
             };
             // Store limit as a boxed Double synthetic
-            let limit_obj = alloc_concurrent_synthetic(ctx, "java/lang/Double", 1);
+            let limit_obj = try_alloc_concurrent_synthetic(ctx, "java/lang/Double", 1)?;
             ctx.set_field(limit_obj, 0, Value::Double(limit));
             ctx.set_array_element(limits_arr, i, Value::Object(Some(limit_obj)));
             let fmt_s = ctx.create_string(format_str);
@@ -757,6 +757,29 @@ pub(crate) fn register_p61_text_formatting(r: &mut NativeMethodRegistry) {
         }
     });
 
+    // Read an arbitrary `CharSequence` argument, not just `String`.
+    // `ctx.read_string` only understands the compact-string `String` layout;
+    // called on any other `CharSequence` (e.g. pgjdbc's SCRAM stringprep
+    // wraps a `char[]` in `java.nio.CharBuffer` before calling
+    // `Normalizer.normalize`) it silently returns `None`, and the old
+    // `.unwrap_or_default()` at the two call sites below turned that into an
+    // empty string instead of the real content — surfacing downstream as an
+    // `ArrayIndexOutOfBoundsException` in `Character.codePointAt` on the
+    // now-empty array. Mirrors the `String.format("%s", ...)` fast-path in
+    // `lang_string.rs` (real `String` read directly; everything else via its
+    // own `toString()`, which every `CharSequence` must provide).
+    fn read_char_sequence(ctx: &mut dyn NativeContext, obj: cratonvm_types::ObjectRef) -> String {
+        if ctx.class_id_by_name("java/lang/String") == Some(ctx.class_id_of_object(obj)) {
+            if let Some(s) = ctx.read_string(obj) {
+                return s;
+            }
+        }
+        match ctx.invoke_virtual(obj, "toString", "()Ljava/lang/String;", &[]) {
+            Ok(Some(Value::Object(Some(s)))) => ctx.read_string(s).unwrap_or_default(),
+            _ => String::new(),
+        }
+    }
+
     // --- Normalizer — real Unicode normalization via unicode-normalization crate ---
     let norm = "java/text/Normalizer";
     r.register(
@@ -766,7 +789,7 @@ pub(crate) fn register_p61_text_formatting(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             use unicode_normalization::UnicodeNormalization;
             let input = match args.first() {
-                Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
+                Some(Value::Object(Some(s))) => read_char_sequence(ctx, *s),
                 _ => return Ok(Some(Value::Object(None))),
             };
             // Read the Form's ordinal via `Enum.ordinal()` so this works for
@@ -803,7 +826,7 @@ pub(crate) fn register_p61_text_formatting(r: &mut NativeMethodRegistry) {
                 is_nfc_quick, is_nfd_quick, is_nfkc_quick, is_nfkd_quick, IsNormalized,
             };
             let input = match args.first() {
-                Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
+                Some(Value::Object(Some(s))) => read_char_sequence(ctx, *s),
                 _ => return Ok(Some(Value::Int(1))),
             };
             let form_ordinal = match args.get(1) {
@@ -951,12 +974,12 @@ pub(crate) fn register_p62_time_expansion(r: &mut NativeMethodRegistry) {
             Some(Value::Int(v)) => *v,
             _ => 2000,
         };
-        let obj = alloc_concurrent_synthetic(ctx, "java/time/Year", 1);
+        let obj = try_alloc_concurrent_synthetic(ctx, "java/time/Year", 1)?;
         ctx.set_field(obj, 0, Value::Int(y));
         Ok(Some(Value::Object(Some(obj))))
     });
     r.register(yr, "now", "()Ljava/time/Year;", |ctx, _args| {
-        let obj = alloc_concurrent_synthetic(ctx, "java/time/Year", 1);
+        let obj = try_alloc_concurrent_synthetic(ctx, "java/time/Year", 1)?;
         ctx.set_field(obj, 0, Value::Int(2026));
         Ok(Some(Value::Object(Some(obj))))
     });
@@ -1000,7 +1023,7 @@ pub(crate) fn register_p62_time_expansion(r: &mut NativeMethodRegistry) {
             Some(Value::Long(v)) => *v as i32,
             _ => 0,
         };
-        let obj = alloc_concurrent_synthetic(ctx, "java/time/Year", 1);
+        let obj = try_alloc_concurrent_synthetic(ctx, "java/time/Year", 1)?;
         ctx.set_field(obj, 0, Value::Int(y + add));
         Ok(Some(Value::Object(Some(obj))))
     });
@@ -1014,7 +1037,7 @@ pub(crate) fn register_p62_time_expansion(r: &mut NativeMethodRegistry) {
             Some(Value::Long(v)) => *v as i32,
             _ => 0,
         };
-        let obj = alloc_concurrent_synthetic(ctx, "java/time/Year", 1);
+        let obj = try_alloc_concurrent_synthetic(ctx, "java/time/Year", 1)?;
         ctx.set_field(obj, 0, Value::Int(y - sub));
         Ok(Some(Value::Object(Some(obj))))
     });
@@ -1055,13 +1078,13 @@ pub(crate) fn register_p62_time_expansion(r: &mut NativeMethodRegistry) {
             Some(Value::Int(v)) => *v,
             _ => 1,
         };
-        let obj = alloc_concurrent_synthetic(ctx, "java/time/YearMonth", 2);
+        let obj = try_alloc_concurrent_synthetic(ctx, "java/time/YearMonth", 2)?;
         ctx.set_field(obj, 0, Value::Int(y));
         ctx.set_field(obj, 1, Value::Int(m));
         Ok(Some(Value::Object(Some(obj))))
     });
     r.register(ym, "now", "()Ljava/time/YearMonth;", |ctx, _args| {
-        let obj = alloc_concurrent_synthetic(ctx, "java/time/YearMonth", 2);
+        let obj = try_alloc_concurrent_synthetic(ctx, "java/time/YearMonth", 2)?;
         ctx.set_field(obj, 0, Value::Int(2026));
         ctx.set_field(obj, 1, Value::Int(2));
         Ok(Some(Value::Object(Some(obj))))
@@ -1104,7 +1127,7 @@ pub(crate) fn register_p62_time_expansion(r: &mut NativeMethodRegistry) {
         let total = (y * 12 + (m - 1)) + add;
         let new_y = total.div_euclid(12);
         let new_m = total.rem_euclid(12) + 1;
-        let obj = alloc_concurrent_synthetic(ctx, "java/time/YearMonth", 2);
+        let obj = try_alloc_concurrent_synthetic(ctx, "java/time/YearMonth", 2)?;
         ctx.set_field(obj, 0, Value::Int(new_y));
         ctx.set_field(obj, 1, Value::Int(new_m));
         Ok(Some(Value::Object(Some(obj))))
@@ -1134,7 +1157,7 @@ pub(crate) fn register_p62_time_expansion(r: &mut NativeMethodRegistry) {
             Some(Value::Int(v)) => *v,
             _ => 1,
         };
-        let obj = alloc_concurrent_synthetic(ctx, "java/time/MonthDay", 2);
+        let obj = try_alloc_concurrent_synthetic(ctx, "java/time/MonthDay", 2)?;
         ctx.set_field(obj, 0, Value::Int(m));
         ctx.set_field(obj, 1, Value::Int(d));
         Ok(Some(Value::Object(Some(obj))))
@@ -1221,7 +1244,7 @@ pub(crate) fn register_p62_format_factories(r: &mut NativeMethodRegistry) {
         "getIntegerInstance",
         "()Ljava/text/NumberFormat;",
         |ctx, _args| {
-            let obj = alloc_concurrent_synthetic(ctx, "java/text/NumberFormat", 3);
+            let obj = try_alloc_concurrent_synthetic(ctx, "java/text/NumberFormat", 3)?;
             // Pin across the create_string below — a moving young GC there
             // would relocate the fresh format (native stale-local family).
             let obj_pin = ctx.pin_native_root(obj);
@@ -1239,7 +1262,7 @@ pub(crate) fn register_p62_format_factories(r: &mut NativeMethodRegistry) {
         "getCurrencyInstance",
         "()Ljava/text/NumberFormat;",
         |ctx, _args| {
-            let obj = alloc_concurrent_synthetic(ctx, "java/text/NumberFormat", 3);
+            let obj = try_alloc_concurrent_synthetic(ctx, "java/text/NumberFormat", 3)?;
             // Pin across the create_string below — a moving young GC there
             // would relocate the fresh format (native stale-local family).
             let obj_pin = ctx.pin_native_root(obj);
@@ -1257,7 +1280,7 @@ pub(crate) fn register_p62_format_factories(r: &mut NativeMethodRegistry) {
         "getPercentInstance",
         "()Ljava/text/NumberFormat;",
         |ctx, _args| {
-            let obj = alloc_concurrent_synthetic(ctx, "java/text/NumberFormat", 3);
+            let obj = try_alloc_concurrent_synthetic(ctx, "java/text/NumberFormat", 3)?;
             // Pin across the create_string below — a moving young GC there
             // would relocate the fresh format (native stale-local family).
             let obj_pin = ctx.pin_native_root(obj);
@@ -1290,7 +1313,7 @@ pub(crate) fn register_p62_format_factories(r: &mut NativeMethodRegistry) {
         "getDateInstance",
         "()Ljava/text/DateFormat;",
         |ctx, _args| {
-            let obj = alloc_concurrent_synthetic(ctx, "java/text/DateFormat", 3);
+            let obj = try_alloc_concurrent_synthetic(ctx, "java/text/DateFormat", 3)?;
             // Pin across the create_string below — a moving young GC there
             // would relocate the fresh format (native stale-local family).
             let obj_pin = ctx.pin_native_root(obj);
@@ -1306,7 +1329,7 @@ pub(crate) fn register_p62_format_factories(r: &mut NativeMethodRegistry) {
         "getTimeInstance",
         "()Ljava/text/DateFormat;",
         |ctx, _args| {
-            let obj = alloc_concurrent_synthetic(ctx, "java/text/DateFormat", 3);
+            let obj = try_alloc_concurrent_synthetic(ctx, "java/text/DateFormat", 3)?;
             // Pin across the create_string below — a moving young GC there
             // would relocate the fresh format (native stale-local family).
             let obj_pin = ctx.pin_native_root(obj);
@@ -1322,7 +1345,7 @@ pub(crate) fn register_p62_format_factories(r: &mut NativeMethodRegistry) {
         "getDateTimeInstance",
         "()Ljava/text/DateFormat;",
         |ctx, _args| {
-            let obj = alloc_concurrent_synthetic(ctx, "java/text/DateFormat", 3);
+            let obj = try_alloc_concurrent_synthetic(ctx, "java/text/DateFormat", 3)?;
             // Pin across the create_string below — a moving young GC there
             // would relocate the fresh format (native stale-local family).
             let obj_pin = ctx.pin_native_root(obj);
@@ -1338,7 +1361,7 @@ pub(crate) fn register_p62_format_factories(r: &mut NativeMethodRegistry) {
         "getDateInstance",
         "(I)Ljava/text/DateFormat;",
         |ctx, _args| {
-            let obj = alloc_concurrent_synthetic(ctx, "java/text/DateFormat", 3);
+            let obj = try_alloc_concurrent_synthetic(ctx, "java/text/DateFormat", 3)?;
             // Pin across the create_string below — a moving young GC there
             // would relocate the fresh format (native stale-local family).
             let obj_pin = ctx.pin_native_root(obj);
@@ -1354,7 +1377,7 @@ pub(crate) fn register_p62_format_factories(r: &mut NativeMethodRegistry) {
         "getTimeInstance",
         "(I)Ljava/text/DateFormat;",
         |ctx, _args| {
-            let obj = alloc_concurrent_synthetic(ctx, "java/text/DateFormat", 3);
+            let obj = try_alloc_concurrent_synthetic(ctx, "java/text/DateFormat", 3)?;
             // Pin across the create_string below — a moving young GC there
             // would relocate the fresh format (native stale-local family).
             let obj_pin = ctx.pin_native_root(obj);
@@ -1370,7 +1393,7 @@ pub(crate) fn register_p62_format_factories(r: &mut NativeMethodRegistry) {
         "getDateTimeInstance",
         "(II)Ljava/text/DateFormat;",
         |ctx, _args| {
-            let obj = alloc_concurrent_synthetic(ctx, "java/text/DateFormat", 3);
+            let obj = try_alloc_concurrent_synthetic(ctx, "java/text/DateFormat", 3)?;
             // Pin across the create_string below — a moving young GC there
             // would relocate the fresh format (native stale-local family).
             let obj_pin = ctx.pin_native_root(obj);
@@ -1406,7 +1429,7 @@ pub(crate) fn p62_new_number_format(
     ctx: &mut dyn NativeContext,
     _args: &[Value],
 ) -> MethodCallResult {
-    let obj = alloc_concurrent_synthetic(ctx, "java/text/NumberFormat", 3);
+    let obj = try_alloc_concurrent_synthetic(ctx, "java/text/NumberFormat", 3)?;
     // Pin across the create_string below — a moving young GC there would
     // relocate the fresh format (native stale-local family).
     let obj_pin = ctx.pin_native_root(obj);
@@ -1514,21 +1537,22 @@ pub(crate) fn register_p63_resource_bundle(r: &mut NativeMethodRegistry) {
     r.register(rb, "getLocale", "()Ljava/util/Locale;", |ctx, _args| {
         // Same "empty language, empty country" ROOT locale
         // `locale_resources.rs` builds for its own base-bundle path.
-        let root = crate::locale_alloc(ctx, "", "");
+        let root = crate::locale_alloc(ctx, "", "")?;
         Ok(Some(Value::Object(Some(root))))
     });
     r.register(rb, "getKeys", "()Ljava/util/Enumeration;", |ctx, _args| {
-        let e = alloc_concurrent_synthetic(ctx, "java/util/Collections$EmptyEnumeration", 0);
+        let e = try_alloc_concurrent_synthetic(ctx, "java/util/Collections$EmptyEnumeration", 0)?;
         Ok(Some(Value::Object(Some(e))))
     });
     r.register(rb, "keySet", "()Ljava/util/Set;", |ctx, _args| {
-        let set = alloc_concurrent_synthetic(ctx, "java/util/HashSet", 3);
+        let set = try_alloc_concurrent_synthetic(ctx, "java/util/HashSet", 3)?;
         ctx.set_field(set, 0, Value::Object(None));
         ctx.set_field(set, 1, Value::Int(0));
         ctx.set_field(set, 2, Value::Int(16));
         Ok(Some(Value::Object(Some(set))))
     });
     r.set_category(__prev_cat);
+    ()
 }
 
 /// Build a Java String[] from a Rust slice of &str.
@@ -1950,12 +1974,12 @@ pub(crate) fn resource_bundle_get_bundle(
         Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
         _ => String::new(),
     };
-    let obj = alloc_concurrent_synthetic(ctx, "java/util/ResourceBundle", 2);
+    let obj = try_alloc_concurrent_synthetic(ctx, "java/util/ResourceBundle", 2)?;
     // Pin across the map alloc / per-entry puts below — a moving young GC
     // there would relocate the fresh bundle and map (native stale-local
     // family).
     let obj_pin = ctx.pin_native_root(obj);
-    let map = alloc_concurrent_synthetic(ctx, "java/util/HashMap", 3);
+    let map = try_alloc_concurrent_synthetic(ctx, "java/util/HashMap", 3)?;
     let map_pin = ctx.pin_native_root(map);
     cratonvm_native_collections::native_map_init(ctx, &[Value::Object(Some(map))]).ok();
     let obj = ctx.read_native_pin(obj_pin, obj);
@@ -2044,7 +2068,7 @@ pub(crate) fn register_p65_datetime_builder(r: &mut NativeMethodRegistry) {
     let dtfb = "java/time/format/DateTimeFormatterBuilder";
     r.register(dtfb, "<init>", "()V", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let al = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
+        let al = try_alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2)?;
         ctx.set_field(al, 0, Value::Object(None));
         ctx.set_field(al, 1, Value::Int(0));
         ctx.set_field(this, 0, Value::Object(Some(al)));
@@ -2112,7 +2136,7 @@ pub(crate) fn register_p65_datetime_builder(r: &mut NativeMethodRegistry) {
         "()Ljava/time/format/DateTimeFormatter;",
         |ctx, _args| {
             // Return a basic DateTimeFormatter stub
-            let dtf = alloc_concurrent_synthetic(ctx, "java/time/format/DateTimeFormatter", 2);
+            let dtf = try_alloc_concurrent_synthetic(ctx, "java/time/format/DateTimeFormatter", 2)?;
             let pat = ctx.create_string("");
             ctx.set_field(dtf, 0, Value::Object(Some(pat)));
             ctx.set_field(dtf, 1, Value::Object(None));
@@ -2124,7 +2148,7 @@ pub(crate) fn register_p65_datetime_builder(r: &mut NativeMethodRegistry) {
         "toFormatter",
         "(Ljava/util/Locale;)Ljava/time/format/DateTimeFormatter;",
         |ctx, _args| {
-            let dtf = alloc_concurrent_synthetic(ctx, "java/time/format/DateTimeFormatter", 2);
+            let dtf = try_alloc_concurrent_synthetic(ctx, "java/time/format/DateTimeFormatter", 2)?;
             let pat = ctx.create_string("");
             ctx.set_field(dtf, 0, Value::Object(Some(pat)));
             ctx.set_field(dtf, 1, Value::Object(None));
@@ -2239,7 +2263,7 @@ pub(crate) fn register_p66_collator(r: &mut NativeMethodRegistry) {
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let c = "java/text/Collator";
     r.register(c, "getInstance", "()Ljava/text/Collator;", |ctx, _args| {
-        let obj = alloc_concurrent_synthetic(ctx, "java/text/Collator", 1);
+        let obj = try_alloc_concurrent_synthetic(ctx, "java/text/Collator", 1)?;
         ctx.set_field(obj, 0, Value::Int(2)); // SECONDARY strength
         Ok(Some(Value::Object(Some(obj))))
     });
@@ -2248,7 +2272,7 @@ pub(crate) fn register_p66_collator(r: &mut NativeMethodRegistry) {
         "getInstance",
         "(Ljava/util/Locale;)Ljava/text/Collator;",
         |ctx, _args| {
-            let obj = alloc_concurrent_synthetic(ctx, "java/text/Collator", 1);
+            let obj = try_alloc_concurrent_synthetic(ctx, "java/text/Collator", 1)?;
             ctx.set_field(obj, 0, Value::Int(2));
             Ok(Some(Value::Object(Some(obj))))
         },
@@ -2337,7 +2361,7 @@ pub(crate) fn register_p66_collator(r: &mut NativeMethodRegistry) {
             // Normalize string based on strength for comparison
             let normalized = collator_normalize(&s, strength);
             // CollationKey = 2-field (source=0, key_bytes=1)
-            let ck = alloc_concurrent_synthetic(ctx, "java/text/CollationKey", 2);
+            let ck = try_alloc_concurrent_synthetic(ctx, "java/text/CollationKey", 2)?;
             ctx.set_field(ck, 0, args.get(1).copied().unwrap_or(Value::Object(None)));
             let key_s = ctx.create_string(&normalized);
             ctx.set_field(ck, 1, Value::Object(Some(key_s)));
@@ -2410,12 +2434,12 @@ pub(crate) const BI_CHARACTER: i32 = 2;
 
 pub(crate) const BI_LINE: i32 = 3;
 
-pub(crate) fn bi_alloc_kind(ctx: &mut dyn NativeContext, kind: i32) -> ObjectRef {
-    let obj = alloc_concurrent_synthetic(ctx, "java/text/BreakIterator", 3);
+pub(crate) fn bi_alloc_kind(ctx: &mut dyn NativeContext, kind: i32) -> Result<ObjectRef, MethodCallFailed> {
+    let obj = try_alloc_concurrent_synthetic(ctx, "java/text/BreakIterator", 3)?;
     ctx.set_field(obj, 0, Value::Object(None));
     ctx.set_field(obj, 1, Value::Int(0));
     ctx.set_field(obj, 2, Value::Int(kind));
-    obj
+    Ok(obj)
 }
 
 pub(crate) fn java_text_len(text: &str) -> usize {
@@ -2714,49 +2738,49 @@ pub(crate) fn register_p66_break_iterator(r: &mut NativeMethodRegistry) {
         bi,
         "getWordInstance",
         "()Ljava/text/BreakIterator;",
-        |ctx, _args| Ok(Some(Value::Object(Some(bi_alloc_kind(ctx, BI_WORD))))),
+        |ctx, _args| Ok(Some(Value::Object(Some(bi_alloc_kind(ctx, BI_WORD)?)))),
     );
     r.register(
         bi,
         "getWordInstance",
         "(Ljava/util/Locale;)Ljava/text/BreakIterator;",
-        |ctx, _args| Ok(Some(Value::Object(Some(bi_alloc_kind(ctx, BI_WORD))))),
+        |ctx, _args| Ok(Some(Value::Object(Some(bi_alloc_kind(ctx, BI_WORD)?)))),
     );
     r.register(
         bi,
         "getSentenceInstance",
         "()Ljava/text/BreakIterator;",
-        |ctx, _args| Ok(Some(Value::Object(Some(bi_alloc_kind(ctx, BI_SENTENCE))))),
+        |ctx, _args| Ok(Some(Value::Object(Some(bi_alloc_kind(ctx, BI_SENTENCE)?)))),
     );
     r.register(
         bi,
         "getSentenceInstance",
         "(Ljava/util/Locale;)Ljava/text/BreakIterator;",
-        |ctx, _args| Ok(Some(Value::Object(Some(bi_alloc_kind(ctx, BI_SENTENCE))))),
+        |ctx, _args| Ok(Some(Value::Object(Some(bi_alloc_kind(ctx, BI_SENTENCE)?)))),
     );
     r.register(
         bi,
         "getCharacterInstance",
         "()Ljava/text/BreakIterator;",
-        |ctx, _args| Ok(Some(Value::Object(Some(bi_alloc_kind(ctx, BI_CHARACTER))))),
+        |ctx, _args| Ok(Some(Value::Object(Some(bi_alloc_kind(ctx, BI_CHARACTER)?)))),
     );
     r.register(
         bi,
         "getCharacterInstance",
         "(Ljava/util/Locale;)Ljava/text/BreakIterator;",
-        |ctx, _args| Ok(Some(Value::Object(Some(bi_alloc_kind(ctx, BI_CHARACTER))))),
+        |ctx, _args| Ok(Some(Value::Object(Some(bi_alloc_kind(ctx, BI_CHARACTER)?)))),
     );
     r.register(
         bi,
         "getLineInstance",
         "()Ljava/text/BreakIterator;",
-        |ctx, _args| Ok(Some(Value::Object(Some(bi_alloc_kind(ctx, BI_LINE))))),
+        |ctx, _args| Ok(Some(Value::Object(Some(bi_alloc_kind(ctx, BI_LINE)?)))),
     );
     r.register(
         bi,
         "getLineInstance",
         "(Ljava/util/Locale;)Ljava/text/BreakIterator;",
-        |ctx, _args| Ok(Some(Value::Object(Some(bi_alloc_kind(ctx, BI_LINE))))),
+        |ctx, _args| Ok(Some(Value::Object(Some(bi_alloc_kind(ctx, BI_LINE)?)))),
     );
     r.register(bi, "setText", "(Ljava/lang/String;)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
@@ -2853,13 +2877,14 @@ pub(crate) fn register_p66_break_iterator(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let this = obj_arg(args, 0)?;
             // Return a StringCharacterIterator wrapping the text
-            let ci = alloc_concurrent_synthetic(ctx, "java/text/StringCharacterIterator", 2);
+            let ci = try_alloc_concurrent_synthetic(ctx, "java/text/StringCharacterIterator", 2)?;
             ctx.set_field(ci, 0, ctx.get_field(this, 0));
             ctx.set_field(ci, 1, Value::Int(0));
             Ok(Some(Value::Object(Some(ci))))
         },
     );
     r.set_category(__prev_cat);
+    ()
 }
 
 // =============================================================================
@@ -2933,7 +2958,7 @@ pub(crate) fn register_p69_compact_number_format(r: &mut NativeMethodRegistry) {
         "getCompactNumberInstance",
         "()Ljava/text/NumberFormat;",
         |ctx, _args| {
-            let obj = alloc_concurrent_synthetic(ctx, "java/text/CompactNumberFormat", 2);
+            let obj = try_alloc_concurrent_synthetic(ctx, "java/text/CompactNumberFormat", 2)?;
             ctx.set_field(obj, 0, Value::Object(None));
             ctx.set_field(obj, 1, Value::Int(0));
             Ok(Some(Value::Object(Some(obj))))
@@ -2944,7 +2969,7 @@ pub(crate) fn register_p69_compact_number_format(r: &mut NativeMethodRegistry) {
         "getCompactNumberInstance",
         "(Ljava/util/Locale;Ljava/text/NumberFormat$Style;)Ljava/text/NumberFormat;",
         |ctx, _args| {
-            let obj = alloc_concurrent_synthetic(ctx, "java/text/CompactNumberFormat", 2);
+            let obj = try_alloc_concurrent_synthetic(ctx, "java/text/CompactNumberFormat", 2)?;
             ctx.set_field(obj, 0, Value::Object(None));
             ctx.set_field(obj, 1, Value::Int(0));
             Ok(Some(Value::Object(Some(obj))))

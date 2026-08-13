@@ -4,7 +4,7 @@
 |---|---|
 | **Status** | Active. This is the gate every `SyntheticStub` must pass to survive into strict mode. |
 | **Normative source** | [`feature-designs/jdk-only-mode.md`](feature-designs/jdk-only-mode.md) §1, §4, §7 |
-| **Input** | `target/jdk-only-audit/stub-review.tsv` — see [`jdk-only-audit.md`](jdk-only-audit.md) §5.1 |
+| **Input** | `target/jdk-only-audit/stub-review.tsv`, produced by `scripts/jdk-only-census.sh` |
 | **Related** | [`synthetic-vs-real-explained.md`](synthetic-vs-real-explained.md) (the existing change policy) · [`jdk-only-runtime-services.md`](jdk-only-runtime-services.md) |
 
 Reviewing a stub means answering one question: **why does Rust code run here
@@ -28,7 +28,7 @@ invalid *destination*: shims are forbidden under `JdkOnly` by contract §1.
 > `native-api/src/registry.rs` — and it **defaults to `SyntheticStub`**. A
 > `register()` call outside a `with_category(...)` block is tagged a stub by
 > omission, not by judgement. `vm/src/vm/vm_init.rs` records the consequence:
-> a global drop of all `SyntheticStub` natives on 2026-07-14 was reverted the
+> a global drop of all `SyntheticStub` natives was once reverted the
 > same day because JMX and `Function$Identity` are permanent bridges wearing the
 > wrong tag. Promotion review exists to find those, not only to delete fakes.
 
@@ -140,7 +140,7 @@ cargo run -p cratonvm-difftest --bin cratonvm-difftest -- \
 ```
 
 A removal that "looks safe" and a removal that *is* safe are different claims.
-The 2026-07-14 revert is the standing counter-example.
+That reverted global drop is the standing counter-example.
 
 ---
 
@@ -193,7 +193,7 @@ Copy this into the PR body and tick it.
 ## PR discipline
 
 **One coherent subsystem per PR.** This is not a style preference — it is the
-mitigation for the 2026-07-14 failure mode, where a global change made the
+mitigation for that failure mode, where a global change made the
 regression unattributable and the only recovery was a full revert.
 
 Every classification PR includes:

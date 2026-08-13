@@ -49,7 +49,12 @@ commit `45cc4f4f`, merged in mid-investigation):
    that point. Fixed upstream: the `defineClass0/1/2` natives now recover from
    an "already defined" backend error only when the exact same loader
    namespace already owns the class, instead of surfacing a
-   lifecycle-breaking error.
+   lifecycle-breaking error. **Narrowed 2026-08-11** to the defining-loader
+   OBJECT rather than the namespace: the ~14 cycles here are ~14 DIFFERENT
+   `WebappClassLoader`s, each of which HotSpot lets define its own copy, so
+   they stay on the recovery arm -- while a loader genuinely redefining its
+   own name now raises `LinkageError` as HotSpot does. Record:
+   fixed-bugs/duplicate-defineclass-served-the-mirror-instead-of-linkageerror-FIXED-20260811.md
 
 A third, unrelated harness-only gap was found and fixed locally (not a
 CratonVM defect): the Linux Tomcat harness at `/data/data/apps/tomcat` (Azure

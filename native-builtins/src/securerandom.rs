@@ -76,6 +76,7 @@ use cratonvm_types::{ObjectRef, Value};
 // already claimed parking-lot semantics.
 use parking_lot::RwLock;
 use rustc_hash::FxHashMap;
+use cratonvm_types::error::MethodCallFailed;
 
 // ---------------------------------------------------------------------------
 // OS entropy helpers
@@ -550,26 +551,60 @@ pub(crate) fn native_random_next_gaussian(
     if let Some(cached) = with_gaussian_table_write(|t| t.remove(&key)) {
         return Ok(Some(Value::Double(cached)));
     }
-    // Cap the retry loop so a pathological seed cannot hang us:
-    // P(reject) per pair ≈ 1 - π/4 ≈ 0.215, so 64 retries is well
-    // under 2^-32 failure probability.
+    match rnd_gaussian_pair(&mut |bits| lcg_next(ctx, this, bits)) {
+        Some((v1, v2)) => {
+            with_gaussian_table_write(|t| {
+                t.insert(key, v2);
+            });
+            Ok(Some(Value::Double(v1)))
+        }
+        None => Ok(Some(Value::Double(0.0))),
+    }
+}
+
+/// The polar (Marsaglia) method exactly as `java.util.Random.nextGaussian()`
+/// specifies it, returning BOTH variates of the accepted pair.
+///
+/// Factored out of the native for one reason: **the native cannot be tested.**
+/// Its draws come through `lcg_next(ctx, …)`, which needs a live
+/// `NativeContext`, so every in-crate test of the seeded gaussian stream has to
+/// call something else — and "something else" was a second, independent copy of
+/// this arithmetic living in `native-collections`. That copy had the `log` fix
+/// and a bit-exact test; this one, which is the copy that actually runs, had
+/// neither, and the green test on the other copy is what made that invisible for
+/// as long as it was. `next` is `Random.next(bits)`, so the sequence is now
+/// testable without a VM. See the seeded-sequence test below.
+///
+/// The multiplier is `StrictMath.sqrt(-2 * StrictMath.log(s) / s)` in the JDK,
+/// and the `StrictMath` there is load-bearing: `sqrt`, `*` and `/` are
+/// exactly-rounded IEEE 754 and agree everywhere, but `log` is a bit-for-bit
+/// fdlibm contract that platform libm does not meet — the two disagree on 7.3%
+/// of uniform draws in (0,1). Using `s.ln()` here put every SEEDED gaussian
+/// stream one ULP off HotSpot's: `new Random(42).nextGaussian()` printed
+/// `1.141905315473055` against HotSpot's `1.1419053154730547`.
+/// W7-44-numberformat-enum-and-double-tostring.md,
+/// W7-54-strictmath-fdlibm-family.md.
+///
+/// Returns `None` if 64 consecutive pairs are rejected. P(reject) per pair is
+/// `1 - pi/4 ~= 0.215`, so that is under `2^-42` — the cap exists only so a
+/// pathological seed cannot hang the VM, and the JDK's own loop is unbounded.
+fn rnd_gaussian_pair(next: &mut dyn FnMut(u32) -> i32) -> Option<(f64, f64)> {
+    // One `nextDouble()` draw: `(next(26) << 27 + next(27)) * 2^-53`.
+    fn uniform(next: &mut dyn FnMut(u32) -> i32) -> f64 {
+        let hi = (next(26) as i64) << 27;
+        let lo = next(27) as i64;
+        (hi + lo) as f64 / ((1i64 << 53) as f64)
+    }
     for _ in 0..64 {
-        let h1 = (lcg_next(ctx, this, 26) as i64) << 27;
-        let l1 = lcg_next(ctx, this, 27) as i64;
-        let v1 = 2.0 * ((h1 + l1) as f64 / ((1i64 << 53) as f64)) - 1.0;
-        let h2 = (lcg_next(ctx, this, 26) as i64) << 27;
-        let l2 = lcg_next(ctx, this, 27) as i64;
-        let v2 = 2.0 * ((h2 + l2) as f64 / ((1i64 << 53) as f64)) - 1.0;
+        let v1 = 2.0 * uniform(next) - 1.0;
+        let v2 = 2.0 * uniform(next) - 1.0;
         let s = v1 * v1 + v2 * v2;
         if s < 1.0 && s != 0.0 {
-            let mult = (-2.0 * s.ln() / s).sqrt();
-            with_gaussian_table_write(|t| {
-                t.insert(key, v2 * mult);
-            });
-            return Ok(Some(Value::Double(v1 * mult)));
+            let mult = (-2.0 * cratonvm_types::fdlibm::log(s) / s).sqrt();
+            return Some((v1 * mult, v2 * mult));
         }
     }
-    Ok(Some(Value::Double(0.0)))
+    None
 }
 
 // ---------------------------------------------------------------------------
@@ -596,9 +631,9 @@ pub(crate) fn native_random_next_gaussian(
 /// instance this module hands out. `regression-suite/src/RJdkSecurity.java:136`
 /// asserts `sr.getProvider() != null` and failed in BOTH `--real-jdk` and
 /// `--jdk-only`. Attach the owning `Provider` here as well.
-fn secure_random_record_algorithm(ctx: &mut dyn NativeContext, args: &[Value]) {
+fn secure_random_record_algorithm(ctx: &mut dyn NativeContext, args: &[Value]) -> Result<(), MethodCallFailed> {
     let Some(Value::Object(Some(this))) = args.first().copied() else {
-        return;
+        return Ok(());
     };
     // `create_string` can move the heap; pin `this` across it.
     let pin = ctx.pin_native_root(this);
@@ -606,7 +641,8 @@ fn secure_random_record_algorithm(ctx: &mut dyn NativeContext, args: &[Value]) {
     let this = ctx.read_native_pin(pin, this);
     ctx.set_field_by_name(this, "algorithm", Value::Object(Some(algo)));
     ctx.unpin_native_roots(pin);
-    secure_random_attach_provider(ctx, this, DEFAULT_ALGORITHM);
+    secure_random_attach_provider(ctx, this, DEFAULT_ALGORITHM)?;
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -692,7 +728,7 @@ fn secure_random_attach_provider(
     ctx: &mut dyn NativeContext,
     this: ObjectRef,
     algo: &str,
-) -> ObjectRef {
+) -> Result<ObjectRef, MethodCallFailed> {
     let name = secure_random_provider_name(algo);
     let pin = ctx.pin_native_root(this);
     // `resolve_or_make_provider` hands back the caller's REAL registered
@@ -700,9 +736,9 @@ fn secure_random_attach_provider(
     // what that provider's own constructor set.
     let provider = crate::jca::provider_chain::resolve_or_make_provider(ctx, &name);
     let this = ctx.read_native_pin(pin, this);
-    ctx.set_field_by_name(this, "provider", Value::Object(Some(provider)));
+    ctx.set_field_by_name(this, "provider", Value::Object(Some(provider?)));
     ctx.unpin_native_roots(pin);
-    this
+    Ok(this)
 }
 
 // ---------------------------------------------------------------------------
@@ -953,7 +989,11 @@ fn sha1prng_next_gaussian(ctx: &mut dyn NativeContext, this: ObjectRef) -> Optio
         let v2 = 2.0 * sha1prng_next_double(ctx, this)? - 1.0;
         let s = v1 * v1 + v2 * v2;
         if s < 1.0 && s != 0.0 {
-            let mult = (-2.0 * s.ln() / s).sqrt();
+            // fdlibm `log`, not `f64::ln`: this stream is SEEDED and therefore
+            // reproducible, so a last-ULP libm difference is observable as a
+            // divergence from HotSpot. Same reason as `java.util.Random`'s
+            // polar method — W7-44-numberformat-enum-and-double-tostring.md.
+            let mult = (-2.0 * cratonvm_types::fdlibm::log(s) / s).sqrt();
             with_prng_write(|t| {
                 if let Some(p) = t.get_mut(&key) {
                     p.next_gaussian = Some(v2 * mult);
@@ -971,7 +1011,7 @@ pub(crate) fn native_secure_random_init(
 ) -> MethodCallResult {
     // Per the JDK SecureRandom contract the no-arg ctor selects a default
     // provider; we always select "OS-CSPRNG", the strongest source available.
-    secure_random_record_algorithm(ctx, args);
+    secure_random_record_algorithm(ctx, args)?;
     Ok(None)
 }
 
@@ -1310,7 +1350,10 @@ pub(crate) fn native_secure_random_next_gaussian(
         let v2 = 2.0 * secure_uniform()? - 1.0;
         let s = v1 * v1 + v2 * v2;
         if s < 1.0 && s != 0.0 {
-            let mult = (-2.0 * s.ln() / s).sqrt();
+            // fdlibm `log` for the same reason as the seeded paths, though
+            // here the uniforms come from the OS CSPRNG so no observer can
+            // tell: kept identical so the three polar sites cannot drift.
+            let mult = (-2.0 * cratonvm_types::fdlibm::log(s) / s).sqrt();
             return Ok(Some(Value::Double(v1 * mult)));
         }
     }
@@ -1383,10 +1426,10 @@ pub(crate) fn native_secure_random_generate_seed(
 /// The String is created and pinned *before* the object allocation so a moving
 /// GC during `alloc_concurrent_synthetic` cannot leave us writing through a
 /// stale reference.
-fn make_secure_random(ctx: &mut dyn NativeContext, algorithm: &str) -> ObjectRef {
+fn make_secure_random(ctx: &mut dyn NativeContext, algorithm: &str) -> Result<ObjectRef, MethodCallFailed> {
     let algo_str = ctx.create_string(algorithm);
     let pin = ctx.pin_native_root(algo_str);
-    let sr = crate::alloc_concurrent_synthetic(ctx, "java/security/SecureRandom", 4);
+    let sr = crate::try_alloc_concurrent_synthetic(ctx, "java/security/SecureRandom", 4)?;
     let algo_str = ctx.read_native_pin(pin, algo_str);
     // Resolve `algorithm:String` by name so the slot matches the real layout
     // regardless of synthetic vs real-JDK field ordering.
@@ -1394,7 +1437,7 @@ fn make_secure_random(ctx: &mut dyn NativeContext, algorithm: &str) -> ObjectRef
     ctx.unpin_native_roots(pin);
     // `provider` is the second field `getDefaultPRNG` / `GetInstance` stamp;
     // without it `getProvider()` reads back null. Returns the forwarded `sr`.
-    secure_random_attach_provider(ctx, sr, algorithm)
+    Ok(secure_random_attach_provider(ctx, sr, algorithm)?)
 }
 
 /// `SecureRandom.getInstance(String algorithm)` — static factory.  `algorithm`
@@ -1428,7 +1471,7 @@ pub(crate) fn native_secure_random_get_instance(
             &format!("{algo} SecureRandom not available"),
         ));
     }
-    Ok(Some(Value::Object(Some(make_secure_random(ctx, &algo)))))
+    Ok(Some(Value::Object(Some(make_secure_random(ctx, &algo)?))))
 }
 
 /// `SecureRandom.getInstance(String algorithm, String provider)` and
@@ -1475,7 +1518,7 @@ pub(crate) fn native_secure_random_get_instance_strong(
     Ok(Some(Value::Object(Some(make_secure_random(
         ctx,
         DEFAULT_ALGORITHM,
-    )))))
+    )?))))
 }
 
 // ---------------------------------------------------------------------------
@@ -1636,6 +1679,69 @@ mod tests {
         assert_eq!(LCG_MULTIPLIER, 0x5DEECE66D);
         assert_eq!(LCG_INCREMENT, 0xB);
         assert_eq!(LCG_MASK, 0xFFFF_FFFF_FFFF);
+    }
+
+    /// `java.util.Random.nextGaussian()` must reproduce the JDK's documented
+    /// stream for a given seed, **in this crate's copy of the polar method**.
+    ///
+    /// The emphasis is the point. An identical test already existed over in
+    /// `native-collections`, and it was green throughout the period this body
+    /// was wrong — because `java/util/Random.nextGaussian` is registered twice,
+    /// registration is last-write-wins, and `vm_init.rs` deliberately registers
+    /// THIS module last (the collections version reads the seed from a synthetic
+    /// field layout that is wrong in real-JDK mode). So the tested copy was not
+    /// the running copy: W7-44 put fdlibm's `log` into the collections body, the
+    /// startup order overwrote it with this one's `f64::ln`, and every seeded
+    /// gaussian stream stayed one ULP off HotSpot with a green suite.
+    ///
+    /// Two registrars, one test, and the test on the wrong side of the
+    /// last-write-wins boundary. The fix is not only the `log` — it is that this
+    /// crate now has its own assertion on its own code.
+    ///
+    /// Bit patterns are the first six values of `new Random(42)` on Temurin
+    /// jdk-25.0.3+9, and they are asserted AS BITS: a tolerance would pass on
+    /// platform libm and prove nothing, which is how the divergence survived.
+    /// W7-54-strictmath-fdlibm-family.md.
+    #[test]
+    fn next_gaussian_matches_jdk_seeded_sequence() {
+        // `new Random(42)` — seed scrambling plus `next(bits)`, verbatim.
+        let mut seed = scramble_seed(42);
+        let mut next = move |bits: u32| -> i32 {
+            seed = seed
+                .wrapping_mul(LCG_MULTIPLIER)
+                .wrapping_add(LCG_INCREMENT)
+                & LCG_MASK;
+            (seed >> (48 - bits)) as i32
+        };
+
+        // Drain pairs the way the native does: first value, then the cached one.
+        let mut got = Vec::new();
+        while got.len() < 6 {
+            let (a, b) = rnd_gaussian_pair(&mut next)
+                .expect("64 consecutive rejections is a 2^-42 event, not a seed property");
+            got.push(a);
+            got.push(b);
+        }
+
+        let expected: [i64; 6] = [
+            4607821503525903750,
+            4606456510138157127,
+            -4616641179245592382,
+            -4615707776640798080,
+            4598733263062401967,
+            4604341753479877564,
+        ];
+        for (i, want_bits) in expected.iter().enumerate() {
+            assert_eq!(
+                got[i].to_bits() as i64,
+                *want_bits,
+                "value {i}: got {} ({:#018x}), want {} ({:#018x})",
+                got[i],
+                got[i].to_bits(),
+                f64::from_bits(*want_bits as u64),
+                *want_bits as u64
+            );
+        }
     }
 
     #[test]

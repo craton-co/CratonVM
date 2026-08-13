@@ -14,7 +14,7 @@
 #[path = "tls_impl.rs"]
 pub mod tls_impl;
 
-use crate::{alloc_concurrent_synthetic, native_noop, native_noop_with_this, obj_arg};
+use crate::{try_alloc_concurrent_synthetic, native_noop, native_noop_with_this, obj_arg};
 use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
 use cratonvm_types::error::{MethodCallFailed, MethodCallResult};
 use cratonvm_types::ClassId;
@@ -131,13 +131,13 @@ fn epoch_millis() -> i64 {
 // Allocation helpers
 // ---------------------------------------------------------------------------
 
-fn alloc_ssl_context(ctx: &mut dyn NativeContext, protocol_idx: i32) -> ObjectRef {
-    let obj = alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLContext", 12);
+fn alloc_ssl_context(ctx: &mut dyn NativeContext, protocol_idx: i32) -> Result<ObjectRef, MethodCallFailed> {
+    let obj = try_alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLContext", 12)?;
     ctx.set_field(obj, CTX_PROTOCOL_IDX, Value::Int(protocol_idx));
     ctx.set_field(obj, CTX_INITIALIZED, Value::Int(0));
     ctx.set_field(obj, CTX_KM_REF, Value::Int(0));
     ctx.set_field(obj, CTX_TM_REF, Value::Int(0));
-    obj
+    Ok(obj)
 }
 
 /// Establish the field state a freshly-created synthetic `SSLEngine` must
@@ -166,10 +166,10 @@ fn init_ssl_engine_fields(ctx: &mut dyn NativeContext, obj: ObjectRef) {
     ctx.set_field(obj, ENG_ENDPOINT_ID_ALG, Value::Int(0));
 }
 
-fn alloc_ssl_engine(ctx: &mut dyn NativeContext) -> ObjectRef {
-    let obj = alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLEngine", ENG_FIELD_COUNT);
+fn alloc_ssl_engine(ctx: &mut dyn NativeContext) -> Result<ObjectRef, MethodCallFailed> {
+    let obj = try_alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLEngine", ENG_FIELD_COUNT)?;
     init_ssl_engine_fields(ctx, obj);
-    obj
+    Ok(obj)
 }
 
 /// Field state of a freshly-created synthetic `SSLSession`. Shared with
@@ -185,10 +185,10 @@ fn init_ssl_session_fields(ctx: &mut dyn NativeContext, obj: ObjectRef) {
     ctx.set_field(obj, SES_CREATION_TIME, Value::Long(epoch_millis()));
 }
 
-fn alloc_ssl_session(ctx: &mut dyn NativeContext) -> ObjectRef {
-    let obj = alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLSession", 6);
+fn alloc_ssl_session(ctx: &mut dyn NativeContext) -> Result<ObjectRef, MethodCallFailed> {
+    let obj = try_alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLSession", 6)?;
     init_ssl_session_fields(ctx, obj);
-    obj
+    Ok(obj)
 }
 
 /// Field state of a freshly-created synthetic `SSLParameters` — shared with
@@ -202,17 +202,17 @@ fn init_ssl_parameters_fields(ctx: &mut dyn NativeContext, obj: ObjectRef) {
     ctx.set_field(obj, PAR_APP_PROTOCOLS, Value::Object(None));
 }
 
-fn alloc_ssl_parameters(ctx: &mut dyn NativeContext) -> ObjectRef {
-    let obj = alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLParameters", PAR_FIELD_COUNT);
+fn alloc_ssl_parameters(ctx: &mut dyn NativeContext) -> Result<ObjectRef, MethodCallFailed> {
+    let obj = try_alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLParameters", PAR_FIELD_COUNT)?;
     init_ssl_parameters_fields(ctx, obj);
-    obj
+    Ok(obj)
 }
 
-fn alloc_ssl_engine_result(ctx: &mut dyn NativeContext, status: i32, hs_status: i32) -> ObjectRef {
-    let obj = alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLEngineResult", 2);
+fn alloc_ssl_engine_result(ctx: &mut dyn NativeContext, status: i32, hs_status: i32) -> Result<ObjectRef, MethodCallFailed> {
+    let obj = try_alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLEngineResult", 2)?;
     ctx.set_field(obj, 0, Value::Int(status));
     ctx.set_field(obj, 1, Value::Int(hs_status));
-    obj
+    Ok(obj)
 }
 
 // ---------------------------------------------------------------------------
@@ -447,7 +447,7 @@ fn register_ssl_context(r: &mut NativeMethodRegistry) {
                 // "TLS", "Default", and anything a caller's Provider added.
                 _ => 0,
             };
-            let obj = alloc_ssl_context(ctx, protocol_idx);
+            let obj = alloc_ssl_context(ctx, protocol_idx)?;
             Ok(Some(Value::Object(Some(obj))))
         },
     );
@@ -458,7 +458,7 @@ fn register_ssl_context(r: &mut NativeMethodRegistry) {
         "getDefault",
         "()Ljavax/net/ssl/SSLContext;",
         |ctx, _args| {
-            let obj = alloc_ssl_context(ctx, 2); // TLSv1.3
+            let obj = alloc_ssl_context(ctx, 2)?; // TLSv1.3
             ctx.set_field(obj, CTX_INITIALIZED, Value::Int(1));
             Ok(Some(Value::Object(Some(obj))))
         },
@@ -492,7 +492,7 @@ fn register_ssl_context(r: &mut NativeMethodRegistry) {
         "createSSLEngine",
         "()Ljavax/net/ssl/SSLEngine;",
         |ctx, _args| {
-            let eng = alloc_ssl_engine(ctx);
+            let eng = alloc_ssl_engine(ctx)?;
             Ok(Some(Value::Object(Some(eng))))
         },
     );
@@ -503,7 +503,7 @@ fn register_ssl_context(r: &mut NativeMethodRegistry) {
         "createSSLEngine",
         "(Ljava/lang/String;I)Ljavax/net/ssl/SSLEngine;",
         |ctx, args| {
-            let eng = alloc_ssl_engine(ctx);
+            let eng = alloc_ssl_engine(ctx)?;
             // Store peer host
             if let Some(Value::Object(Some(host_ref))) = args.get(1) {
                 if let Some(host_str) = ctx.read_string(*host_ref) {
@@ -532,7 +532,7 @@ fn register_ssl_context(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let this = obj_arg(args, 0)?;
             require_initialized_context(ctx, this, "getSocketFactory()")?;
-            let sf = alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLSocketFactory", 2);
+            let sf = try_alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLSocketFactory", 2)?;
             Ok(Some(Value::Object(Some(sf))))
         },
     );
@@ -545,7 +545,7 @@ fn register_ssl_context(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let this = obj_arg(args, 0)?;
             require_initialized_context(ctx, this, "getServerSocketFactory()")?;
-            let ssf = alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLServerSocketFactory", 2);
+            let ssf = try_alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLServerSocketFactory", 2)?;
             Ok(Some(Value::Object(Some(ssf))))
         },
     );
@@ -556,7 +556,7 @@ fn register_ssl_context(r: &mut NativeMethodRegistry) {
         "getDefaultSSLParameters",
         "()Ljavax/net/ssl/SSLParameters;",
         |ctx, _args| {
-            let p = alloc_ssl_parameters(ctx);
+            let p = alloc_ssl_parameters(ctx)?;
             Ok(Some(Value::Object(Some(p))))
         },
     );
@@ -567,7 +567,7 @@ fn register_ssl_context(r: &mut NativeMethodRegistry) {
         "getSupportedSSLParameters",
         "()Ljavax/net/ssl/SSLParameters;",
         |ctx, _args| {
-            let p = alloc_ssl_parameters(ctx);
+            let p = alloc_ssl_parameters(ctx)?;
             Ok(Some(Value::Object(Some(p))))
         },
     );
@@ -583,6 +583,7 @@ fn register_ssl_context(r: &mut NativeMethodRegistry) {
         Ok(Some(Value::Object(Some(s))))
     });
     r.set_category(__prev_cat);
+    ()
 }
 
 /// Protocol name for a `CTX_PROTOCOL_IDX` slot value.
@@ -646,7 +647,7 @@ fn register_ssl_engine(r: &mut NativeMethodRegistry) {
                 // PRESERVED NEGATIVE: `CLOSED` is a real, correct answer —
                 // `closeOutbound()` was called and there is genuinely nothing
                 // more to send. It claims no protection, so it stays a value.
-                let result = alloc_ssl_engine_result(ctx, STATUS_CLOSED, HS_NOT_HANDSHAKING);
+                let result = alloc_ssl_engine_result(ctx, STATUS_CLOSED, HS_NOT_HANDSHAKING)?;
                 return Ok(Some(Value::Object(Some(result))));
             }
             // DENY-BY-DEFAULT: everything below fabricates a successful
@@ -665,7 +666,7 @@ fn register_ssl_engine(r: &mut NativeMethodRegistry) {
                 _ => HS_NOT_HANDSHAKING,
             };
             ctx.set_field(this, ENG_HANDSHAKE_STATUS, Value::Int(next_hs));
-            let result = alloc_ssl_engine_result(ctx, STATUS_OK, next_hs);
+            let result = alloc_ssl_engine_result(ctx, STATUS_OK, next_hs)?;
             Ok(Some(Value::Object(Some(result))))
         },
     );
@@ -683,7 +684,7 @@ fn register_ssl_engine(r: &mut NativeMethodRegistry) {
             };
             if inbound_done != 0 {
                 // PRESERVED NEGATIVE — see the matching comment in `wrap`.
-                let result = alloc_ssl_engine_result(ctx, STATUS_CLOSED, HS_NOT_HANDSHAKING);
+                let result = alloc_ssl_engine_result(ctx, STATUS_CLOSED, HS_NOT_HANDSHAKING)?;
                 return Ok(Some(Value::Object(Some(result))));
             }
             // DENY-BY-DEFAULT: the arms below can report `HS_FINISHED` — a
@@ -705,11 +706,11 @@ fn register_ssl_engine(r: &mut NativeMethodRegistry) {
             // If handshake just finished, mark it complete
             if next_hs == HS_FINISHED {
                 ctx.set_field(this, ENG_HANDSHAKE_STATUS, Value::Int(HS_NOT_HANDSHAKING));
-                let result = alloc_ssl_engine_result(ctx, STATUS_OK, HS_FINISHED);
+                let result = alloc_ssl_engine_result(ctx, STATUS_OK, HS_FINISHED)?;
                 return Ok(Some(Value::Object(Some(result))));
             }
             ctx.set_field(this, ENG_HANDSHAKE_STATUS, Value::Int(next_hs));
-            let result = alloc_ssl_engine_result(ctx, STATUS_OK, next_hs);
+            let result = alloc_ssl_engine_result(ctx, STATUS_OK, next_hs)?;
             Ok(Some(Value::Object(Some(result))))
         },
     );
@@ -745,7 +746,7 @@ fn register_ssl_engine(r: &mut NativeMethodRegistry) {
             // Return the enum as a synthetic object carrying the int status
             let hs_val = ctx.get_field(this, ENG_HANDSHAKE_STATUS);
             let hs_obj =
-                alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLEngineResult$HandshakeStatus", 1);
+                try_alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLEngineResult$HandshakeStatus", 1)?;
             ctx.set_field(hs_obj, 0, hs_val);
             Ok(Some(Value::Object(Some(hs_obj))))
         },
@@ -939,7 +940,7 @@ fn register_ssl_engine(r: &mut NativeMethodRegistry) {
             // and re-read the (possibly forwarded) reference before touching
             // its fields again.
             let pin = ctx.pin_native_root(this);
-            let p = alloc_ssl_parameters(ctx);
+            let p = alloc_ssl_parameters(ctx)?;
             let this = ctx.read_native_pin(pin, this);
             let protocols = ctx.get_field(this, ENG_ENABLED_PROTOCOLS);
             let ciphers = ctx.get_field(this, ENG_ENABLED_CIPHERS);
@@ -964,11 +965,12 @@ fn register_ssl_engine(r: &mut NativeMethodRegistry) {
         "getSession",
         "()Ljavax/net/ssl/SSLSession;",
         |ctx, _args| {
-            let ses = alloc_ssl_session(ctx);
+            let ses = alloc_ssl_session(ctx)?;
             Ok(Some(Value::Object(Some(ses))))
         },
     );
     r.set_category(__prev_cat);
+    ()
 }
 
 // ---------------------------------------------------------------------------
@@ -1434,7 +1436,7 @@ fn register_trust_manager_factory(r: &mut NativeMethodRegistry) {
                 },
                 _ => 0,
             };
-            let obj = alloc_concurrent_synthetic(ctx, "javax/net/ssl/TrustManagerFactory", 3);
+            let obj = try_alloc_concurrent_synthetic(ctx, "javax/net/ssl/TrustManagerFactory", 3)?;
             ctx.set_field(obj, 0, Value::Int(alg_idx));
             ctx.set_field(obj, 1, Value::Int(0));
             ctx.set_field(obj, 2, Value::Int(0));
@@ -1534,7 +1536,7 @@ fn register_trust_manager_factory(r: &mut NativeMethodRegistry) {
             // TrustManagerFactory SPI path. Returning the bare interface here
             // lets invokevirtual resolve to abstract interface slots such as
             // getAcceptedIssuers(), which have no Code attribute.
-            let tm = alloc_concurrent_synthetic(ctx, crate::x509_manager::FQN_X509_TM, 2);
+            let tm = try_alloc_concurrent_synthetic(ctx, crate::x509_manager::FQN_X509_TM, 2)?;
             crate::x509_manager::set_tm_id(ctx, tm, tm_id);
             let arr = ctx.new_ref_array(ClassId::new(0), 1);
             ctx.set_array_element(arr, 0, Value::Object(Some(tm)));
@@ -1591,7 +1593,7 @@ fn register_key_manager_factory(r: &mut NativeMethodRegistry) {
                 },
                 _ => 0,
             };
-            let obj = alloc_concurrent_synthetic(ctx, "javax/net/ssl/KeyManagerFactory", 3);
+            let obj = try_alloc_concurrent_synthetic(ctx, "javax/net/ssl/KeyManagerFactory", 3)?;
             ctx.set_field(obj, 0, Value::Int(alg_idx));
             ctx.set_field(obj, 1, Value::Int(0));
             ctx.set_field(obj, 2, Value::Int(0));
@@ -1628,7 +1630,7 @@ fn register_key_manager_factory(r: &mut NativeMethodRegistry) {
         "getKeyManagers",
         "()[Ljavax/net/ssl/KeyManager;",
         |ctx, _args| {
-            let km = alloc_concurrent_synthetic(ctx, "javax/net/ssl/X509KeyManager", 1);
+            let km = try_alloc_concurrent_synthetic(ctx, "javax/net/ssl/X509KeyManager", 1)?;
             let arr = ctx.new_ref_array(ClassId::new(0), 1);
             ctx.set_array_element(arr, 0, Value::Object(Some(km)));
             Ok(Some(Value::Object(Some(arr))))
@@ -1769,7 +1771,7 @@ fn register_key_store(r: &mut NativeMethodRegistry) {
                 },
                 _ => (0, "JKS"),
             };
-            let obj = alloc_concurrent_synthetic(ctx, "java/security/KeyStore", 5);
+            let obj = try_alloc_concurrent_synthetic(ctx, "java/security/KeyStore", 5)?;
             ctx.set_field(obj, 0, Value::Int(type_idx));
             ctx.set_field(obj, 1, Value::Int(0)); // not loaded
             ctx.set_field(obj, 2, Value::Int(0)); // 0 entries
@@ -2104,7 +2106,7 @@ fn register_ssl_socket_factory(r: &mut NativeMethodRegistry) {
         "getDefault",
         "()Ljavax/net/ssl/SSLSocketFactory;",
         |ctx, _args| {
-            let sf = alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLSocketFactory", 2);
+            let sf = try_alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLSocketFactory", 2)?;
             Ok(Some(Value::Object(Some(sf))))
         },
     );
@@ -2120,8 +2122,8 @@ fn register_ssl_socket_factory(r: &mut NativeMethodRegistry) {
             // and a real-bytecode `synchronized (socketLock)` method (e.g.
             // `getImpl()`) would otherwise NPE. Same bug family as
             // jndirealmintegration-ldap-connection-npe.md.
-            let sock = alloc_concurrent_synthetic(ctx, "java/net/Socket", 2);
-            let sock = crate::net_phase_e::re1_init_socket_locks(ctx, sock);
+            let sock = try_alloc_concurrent_synthetic(ctx, "java/net/Socket", 2)?;
+            let sock = crate::net_phase_e::re1_init_socket_locks(ctx, sock)?;
             Ok(Some(Value::Object(Some(sock))))
         },
     );
@@ -2132,8 +2134,8 @@ fn register_ssl_socket_factory(r: &mut NativeMethodRegistry) {
         "createSocket",
         "(Ljava/net/Socket;Ljava/lang/String;IZ)Ljava/net/Socket;",
         |ctx, _args| {
-            let sock = alloc_concurrent_synthetic(ctx, "java/net/Socket", 2);
-            let sock = crate::net_phase_e::re1_init_socket_locks(ctx, sock);
+            let sock = try_alloc_concurrent_synthetic(ctx, "java/net/Socket", 2)?;
+            let sock = crate::net_phase_e::re1_init_socket_locks(ctx, sock)?;
             Ok(Some(Value::Object(Some(sock))))
         },
     );
@@ -2163,6 +2165,7 @@ fn register_ssl_socket_factory(r: &mut NativeMethodRegistry) {
         },
     );
     r.set_category(__prev_cat);
+    ()
 }
 
 // ---------------------------------------------------------------------------
@@ -2280,14 +2283,16 @@ fn validate_cert_chain(
 
     match crate::x509_manager::validate_chain(&chain_der, &trust) {
         Ok(()) => Ok(None),
-        Err(e) => Err(cratonvm_types::error::RuntimeError::IOException {
-            // Mirrors the production trust-manager path: a failed PKIX check
-            // surfaces as a CertificateException (mapped to IOException at the
-            // native boundary) so apps see a real validation failure rather
-            // than a silently-trusted connection.
-            message: format!("CertificateException: {}", e),
-        }
-        .into()),
+        // A failed PKIX check must surface as a REAL
+        // `java.security.cert.CertificateException`, not an `IOException`
+        // whose message names one: `checkServerTrusted` declares that type and
+        // every caller — TLS stacks turning a failure into a handshake alert,
+        // tests asserting an untrusted chain was rejected — catches it by
+        // type. See `x509_manager::cert_exception`, which this shares.
+        Err(e) => Err(crate::x509_manager::cert_exception_external(
+            ctx,
+            e.to_string(),
+        )),
     }
 }
 
@@ -2585,7 +2590,7 @@ fn register_ssl_context_impl(r: &mut NativeMethodRegistry) {
                 "DTLSV1.2" => 9,
                 _ => 0,
             };
-            let obj = alloc_ssl_context(ctx, protocol_idx);
+            let obj = alloc_ssl_context(ctx, protocol_idx)?;
             Ok(Some(Value::Object(Some(obj))))
         },
     );
@@ -2595,7 +2600,7 @@ fn register_ssl_context_impl(r: &mut NativeMethodRegistry) {
         "getDefault",
         "()Ljavax/net/ssl/SSLContext;",
         |ctx, _args| {
-            let obj = alloc_ssl_context(ctx, 0);
+            let obj = alloc_ssl_context(ctx, 0)?;
             ctx.set_field(obj, CTX_INITIALIZED, Value::Int(1));
             Ok(Some(Value::Object(Some(obj))))
         },
@@ -2617,7 +2622,7 @@ fn register_ssl_context_impl(r: &mut NativeMethodRegistry) {
         "createSSLEngine",
         "()Ljavax/net/ssl/SSLEngine;",
         |ctx, _args| {
-            let eng = alloc_ssl_engine(ctx);
+            let eng = alloc_ssl_engine(ctx)?;
             Ok(Some(Value::Object(Some(eng))))
         },
     );
@@ -2635,6 +2640,7 @@ fn register_ssl_context_impl(r: &mut NativeMethodRegistry) {
         Ok(Some(Value::Object(Some(s))))
     });
     r.set_category(__prev_cat);
+    ()
 }
 
 // ---------------------------------------------------------------------------
@@ -2733,7 +2739,7 @@ fn engine_result_enum_accessor(
                 Ok(Some(v))
             } else {
                 // Pure synthetic-JDK mode: legacy 1-slot int holder.
-                let holder = alloc_concurrent_synthetic(ctx, enum_cls, 1);
+                let holder = try_alloc_concurrent_synthetic(ctx, enum_cls, 1)?;
                 ctx.set_field(holder, 0, Value::Int(code));
                 Ok(Some(Value::Object(Some(holder))))
             }
@@ -3275,7 +3281,7 @@ mod tls_tests {
             MethodCallFailed::ExceptionThrown(exc) => {
                 let cid = ctx.class_id_of_object(exc);
                 assert_eq!(
-                    ctx.class_name_of_id(cid).as_deref(),
+                    ctx.class_name_arc_of_id(cid).as_deref(),
                     Some("java/security/NoSuchAlgorithmException")
                 );
             }
@@ -3424,7 +3430,7 @@ mod tls_tests {
 
         // MUST RAISE (default): no cryptography happened, so no OK status.
         set_noncrypto_engine_opt_in(false);
-        let engine = alloc_ssl_engine(&mut ctx);
+        let engine = alloc_ssl_engine(&mut ctx).unwrap();
         let args = [Value::Object(Some(engine))];
         assert!(
             wrap(&mut ctx, &args).is_err(),
@@ -3450,7 +3456,7 @@ mod tls_tests {
 
         // MUST STILL WORK: the explicit opt-in restores the legacy behaviour.
         set_noncrypto_engine_opt_in(true);
-        let legacy = alloc_ssl_engine(&mut ctx);
+        let legacy = alloc_ssl_engine(&mut ctx).unwrap();
         let legacy_args = [Value::Object(Some(legacy))];
         assert!(matches!(
             wrap(&mut ctx, &legacy_args),
@@ -4885,5 +4891,199 @@ mod tls_tests {
             "post-handshake cipher suite {:?} is not on the RFC 8446 §9.1 MTI allowlist",
             sm.cipher_suite,
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Registrar ordering — the ratchet for W7-61
+// ---------------------------------------------------------------------------
+
+/// Four registrars write `javax/net/ssl/SSLEngine` and
+/// `javax/net/ssl/SSLContext.createSSLEngine`, under three mutually
+/// incompatible slot maps (`tls.rs` 14 slots, `phases_late::ssl_security` 7,
+/// `tls_impl` 3). Registration is last-write-wins, so WHICH ONE RUNS LAST is
+/// the whole question — and W7-49-slot-index-recensus.md filed the site as a
+/// live 7-over-2 heap-corruption row because it answered that question from a
+/// call-graph walk that stopped at the first registrar it reached.
+///
+/// These tests pin the answer against the registry itself, by identity of the
+/// registered `fn` pointer, so a future reordering of `lib.rs` fails here
+/// rather than silently moving which slot map is authoritative. They assert
+/// ORDER, not behaviour: no engine is allocated and no TLS runs.
+///
+/// The three orderings pinned, all re-derived by brace-depth scan of the
+/// registrar bodies (see the block comment at `register_p68_ssl`'s SSLEngine
+/// section for why a column-0 scan gets this file wrong):
+///
+///   * Compatible / strict: `register_p68_ssl` (lib.rs 18191) then
+///     `net_phase_e::register_phase_e_networking` (18214). net_phase_e wins
+///     `createSSLEngine`, which is what makes `ssleng_alloc` — the 7-wide
+///     allocation on a class declaring 2 — DEAD in that mode.
+///   * Synthetic: `register_tls_natives` (23713) then
+///     `register_phase68_natives` (23716). p68 wins, both for
+///     `createSSLEngine` and for the 21 `SSLEngine` triples it registers.
+///   * Nothing later than `t27_tls::register_sslengine_real` (18252) touches
+///     `sun/security/ssl/SSLEngineImpl`, which is the class the Compatible
+///     engine actually is.
+#[cfg(test)]
+mod registry_ordering_tests {
+    use cratonvm_native_api::NativeMethodRegistry;
+
+    /// The callback `find` reports for a triple, as a raw address, so two
+    /// registrations can be compared for identity.
+    fn cb_addr(r: &NativeMethodRegistry, cls: &str, name: &str, desc: &str) -> Option<usize> {
+        r.find(cls, name, desc).map(|cb| cb as usize)
+    }
+
+    const CREATE_ENGINE: (&str, &str, &str) = (
+        "javax/net/ssl/SSLContext",
+        "createSSLEngine",
+        "()Ljavax/net/ssl/SSLEngine;",
+    );
+    const CREATE_ENGINE_HOSTPORT: (&str, &str, &str) = (
+        "javax/net/ssl/SSLContext",
+        "createSSLEngine",
+        "(Ljava/lang/String;I)Ljavax/net/ssl/SSLEngine;",
+    );
+
+    /// Compatible / strict: `net_phase_e` overwrites p68's `createSSLEngine`,
+    /// so `ssleng_alloc` never runs and the 7-vs-2 over-allocation W7-49
+    /// reported cannot happen in this mode.
+    #[test]
+    fn net_phase_e_wins_create_ssl_engine_on_the_essential_path() {
+        // net_phase_e alone — the reference callback.
+        let mut solo = NativeMethodRegistry::new();
+        crate::net_phase_e::register_re6_ssl_context(&mut solo);
+
+        // The essential path's real order.
+        let mut boot = NativeMethodRegistry::new();
+        crate::phases_late::ssl_security::register_p68_ssl(&mut boot);
+        crate::net_phase_e::register_re6_ssl_context(&mut boot);
+
+        for (cls, name, desc) in [CREATE_ENGINE, CREATE_ENGINE_HOSTPORT] {
+            let want = cb_addr(&solo, cls, name, desc)
+                .unwrap_or_else(|| panic!("register_re6_ssl_context must register {name}{desc}"));
+            let got = cb_addr(&boot, cls, name, desc)
+                .unwrap_or_else(|| panic!("{name}{desc} must be registered after both"));
+            assert_eq!(
+                got, want,
+                "net_phase_e::register_re6_ssl_context must be the LAST writer of \
+                 {cls}.{name}{desc} on the essential path (lib.rs 18191 then 18214). \
+                 If p68 wins here, `ssleng_alloc` is live again and it allocates \
+                 7 slots on a class declaring 2 — see W7-61.",
+            );
+        }
+    }
+
+    /// Synthetic overlay: `register_phase68_natives` runs AFTER
+    /// `register_tls_natives` (lib.rs 23713 then 23716, stated there
+    /// deliberately), so p68's 7-slot map is authoritative in synthetic mode.
+    /// A renumber of p68's map is therefore NOT inert there.
+    #[test]
+    fn p68_ssl_is_the_last_writer_on_the_ssl_engine_surface() {
+        let mut solo = NativeMethodRegistry::new();
+        crate::phases_late::ssl_security::register_p68_ssl(&mut solo);
+
+        let mut overlay = NativeMethodRegistry::new();
+        super::register_tls_natives(&mut overlay);
+        crate::phases_late::register_phase68_natives(&mut overlay);
+
+        // Every triple p68 registers on the engine must be p68's afterwards.
+        for (name, desc) in [
+            ("setUseClientMode", "(Z)V"),
+            ("getUseClientMode", "()Z"),
+            ("beginHandshake", "()V"),
+            ("closeInbound", "()V"),
+            ("closeOutbound", "()V"),
+            ("isInboundDone", "()Z"),
+            ("isOutboundDone", "()Z"),
+            ("setEnabledProtocols", "([Ljava/lang/String;)V"),
+            ("setEnabledCipherSuites", "([Ljava/lang/String;)V"),
+            ("getSession", "()Ljavax/net/ssl/SSLSession;"),
+        ] {
+            let want = cb_addr(&solo, "javax/net/ssl/SSLEngine", name, desc)
+                .unwrap_or_else(|| panic!("register_p68_ssl must register {name}{desc}"));
+            let got = cb_addr(&overlay, "javax/net/ssl/SSLEngine", name, desc)
+                .unwrap_or_else(|| panic!("{name}{desc} must be registered after both"));
+            assert_eq!(
+                got, want,
+                "register_p68_ssl must be the LAST writer of SSLEngine.{name}{desc} \
+                 in synthetic mode (lib.rs 23713 then 23716). If tls.rs wins here, \
+                 the 14-slot map is authoritative and p68's 7-slot map became dead \
+                 code — which inverts every reachability verdict in W7-61.",
+            );
+        }
+        // …and the allocator with it.
+        for (cls, name, desc) in [CREATE_ENGINE, CREATE_ENGINE_HOSTPORT] {
+            let want = cb_addr(&solo, cls, name, desc)
+                .unwrap_or_else(|| panic!("register_p68_ssl must register {name}{desc}"));
+            let got = cb_addr(&overlay, cls, name, desc).unwrap();
+            assert_eq!(
+                got, want,
+                "register_p68_ssl (`ssleng_alloc`, 7 slots) must be the synthetic-mode \
+                 winner of {cls}.{name}{desc}",
+            );
+        }
+    }
+
+    /// The Compatible-mode engine is a `sun/security/ssl/SSLEngineImpl`, and
+    /// `t27_tls` owns that class outright — every triple p68 puts on the
+    /// abstract `javax/net/ssl/SSLEngine` also exists there, so the abstract
+    /// map is never reached by a superclass walk from a real engine.
+    #[test]
+    fn t27_covers_every_engine_triple_p68_registers_on_the_abstract_class() {
+        let mut p68 = NativeMethodRegistry::new();
+        crate::phases_late::ssl_security::register_p68_ssl(&mut p68);
+
+        let mut t27 = NativeMethodRegistry::new();
+        crate::t27_tls::register_sslengine_real(&mut t27);
+
+        // The 21 triples `register_p68_ssl` registers on the abstract class.
+        for (name, desc) in [
+            ("setUseClientMode", "(Z)V"),
+            ("getUseClientMode", "()Z"),
+            ("setNeedClientAuth", "(Z)V"),
+            ("getNeedClientAuth", "()Z"),
+            ("setWantClientAuth", "(Z)V"),
+            ("getWantClientAuth", "()Z"),
+            ("setEnabledProtocols", "([Ljava/lang/String;)V"),
+            ("getEnabledProtocols", "()[Ljava/lang/String;"),
+            ("setEnabledCipherSuites", "([Ljava/lang/String;)V"),
+            ("getEnabledCipherSuites", "()[Ljava/lang/String;"),
+            ("getSupportedCipherSuites", "()[Ljava/lang/String;"),
+            ("getSupportedProtocols", "()[Ljava/lang/String;"),
+            ("beginHandshake", "()V"),
+            (
+                "getHandshakeStatus",
+                "()Ljavax/net/ssl/SSLEngineResult$HandshakeStatus;",
+            ),
+            (
+                "wrap",
+                "(Ljava/nio/ByteBuffer;Ljava/nio/ByteBuffer;)Ljavax/net/ssl/SSLEngineResult;",
+            ),
+            (
+                "unwrap",
+                "(Ljava/nio/ByteBuffer;Ljava/nio/ByteBuffer;)Ljavax/net/ssl/SSLEngineResult;",
+            ),
+            ("closeOutbound", "()V"),
+            ("closeInbound", "()V"),
+            ("isOutboundDone", "()Z"),
+            ("isInboundDone", "()Z"),
+            ("getSession", "()Ljavax/net/ssl/SSLSession;"),
+        ] {
+            assert!(
+                p68.find("javax/net/ssl/SSLEngine", name, desc).is_some(),
+                "this list tracks register_p68_ssl's SSLEngine surface; \
+                 {name}{desc} is no longer on it — update the list, do not delete it",
+            );
+            assert!(
+                t27.find("sun/security/ssl/SSLEngineImpl", name, desc)
+                    .is_some(),
+                "t27_tls must own SSLEngineImpl.{name}{desc}. Without it, a virtual \
+                 call on the Compatible-mode engine falls through to the hierarchy \
+                 walk and can reach p68's 7-slot map on the abstract superclass, \
+                 which writes an Int into `peerHost` — the W7-61 corruption path.",
+            );
+        }
     }
 }

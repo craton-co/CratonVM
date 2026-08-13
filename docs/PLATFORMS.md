@@ -70,7 +70,7 @@ Internally `cratonvm-cli`'s `gpu` feature maps to `cratonvm-vm`'s
 
 | Feature | Linux | Windows | macOS | Source |
 |---|---|---|---|---|
-| GPU offload (CUDA, NVIDIA-only) | Full — same driver-API path as Windows; not exercised as heavily as the Windows dev box | Full — validated on real hardware: Windows 11 + RTX 2060 (sm_75), 2026-07-11 | Not supported — CUDA is NVIDIA-only and NVIDIA ships no CUDA driver for macOS | [`cuda-bridge/`](../cuda-bridge/src/), [`jit-cuda/`](../jit-cuda/src/), [`vm-cli/src/main.rs`](../vm-cli/src/main.rs) |
+| GPU offload (CUDA, NVIDIA-only) | Full — same driver-API path as Windows; not exercised as heavily as the Windows dev box | Full — validated on real hardware: Windows 11 + RTX 2060 (sm_75) | Not supported — CUDA is NVIDIA-only and NVIDIA ships no CUDA driver for macOS | [`cuda-bridge/`](../cuda-bridge/src/), [`jit-cuda/`](../jit-cuda/src/), [`vm-cli/src/main.rs`](../vm-cli/src/main.rs) |
 
 No AMD/ROCm or Intel/oneAPI backend exists or is planned for Phase 1/2; "GPU
 offload" in CratonVM documentation always means CUDA. See
@@ -112,8 +112,7 @@ disabled (interpreter-only).
   the test binary is built on Darwin. CI does not currently include a
   macOS runner; treat macOS as best-effort.
 - **GPU offload** is not part of CI (no CUDA-capable CI runner). It was
-  manually validated on real hardware — Windows 11 + RTX 2060 (sm_75) — on
-  2026-07-11.
+  manually validated on real hardware — Windows 11 + RTX 2060 (sm_75).
 
 ## Further reading
 

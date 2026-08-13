@@ -388,9 +388,11 @@ function Import-HotspotBaseline {
   foreach ($row in @(Import-Csv -Path $path -Delimiter "`t")) {
     if (-not ($row.PSObject.Properties.Name -contains 'class')) { continue }
     $map["$($row.module)`t$($row.class)"] = [pscustomobject]@{
-      status = Get-RowStatus $row
-      failed = [int]([string]$row.failed -replace '[^0-9]', '' -replace '^$', '0')
-      tests  = [int]([string]$row.tests  -replace '[^0-9]', '' -replace '^$', '0')
+      status           = Get-RowStatus $row
+      failed           = [int]([string]$row.failed  -replace '[^0-9]', '' -replace '^$', '0')
+      tests            = [int]([string]$row.tests   -replace '[^0-9]', '' -replace '^$', '0')
+      aborted          = [int]([string]$row.aborted -replace '[^0-9]', '' -replace '^$', '0')
+      containersFailed = [int]([string]$row.containersFailed -replace '[^0-9]', '' -replace '^$', '0')
     }
   }
   # Say the size out loud: a baseline that silently loaded zero rows is
@@ -400,25 +402,211 @@ function Import-HotspotBaseline {
   return $map
 }
 
+# `hotspot-baseline-latest.tsv` is what `Import-HotspotBaseline` reads by
+# default, and every `-Vm hotspot` run used to blind-copy its own results over
+# it. That makes "latest" mean "most recent", not "best", so any ad-hoc
+# few-class HotSpot check destroys the coverage of a full-suite one: on
+# 2026-08-01 a 5-class run replaced an 81-class baseline, and the reclassifier
+# has been running against 5 irrelevant rows ever since -- which is one reason
+# host-caused Windows failures kept being attributed to CratonVM.
+#
+# Merge on `module + class` instead, newest row winning per key, so a narrow
+# rerun refreshes the classes it actually covered and leaves the rest standing.
+# Returns the resulting class count for the caller to log.
+function Merge-HotspotBaselineLatest {
+  param([string]$BaselineDir, [string]$ResultsPath)
+  $latest = Join-Path $BaselineDir 'hotspot-baseline-latest.tsv'
+  $fresh = @(Import-Csv -Path $ResultsPath -Delimiter "`t")
+  $merged = [ordered]@{}
+  if (Test-Path $latest) {
+    foreach ($row in @(Import-Csv -Path $latest -Delimiter "`t")) {
+      if (-not ($row.PSObject.Properties.Name -contains 'class')) { continue }
+      $merged["$($row.module)`t$($row.class)"] = $row
+    }
+  }
+  foreach ($row in $fresh) {
+    if (-not ($row.PSObject.Properties.Name -contains 'class')) { continue }
+    $merged["$($row.module)`t$($row.class)"] = $row
+  }
+  # Write the file the same way every other results TSV in .suite/ is written --
+  # a header line plus tab-joined fields. `Export-Csv` would quote every field,
+  # and the free-text `note` column routinely contains quotes and tabs of its
+  # own, so round-tripping through it corrupts exactly the rows that carry the
+  # most diagnostic text. The fresh results file defines the current schema;
+  # older rows are projected onto it and any column they lack comes out empty.
+  $header = (Get-Content -Path $ResultsPath -TotalCount 1)
+  $columns = $header -split "`t"
+  $out = New-Object System.Collections.Generic.List[string]
+  $out.Add($header)
+  $i = 1
+  foreach ($row in $merged.Values) {
+    $fields = foreach ($col in $columns) {
+      if ($col -eq 'index') {
+        [string]$i
+      } else {
+        $v = ''
+        if ($row.PSObject.Properties.Name -contains $col) { $v = [string]$row.$col }
+        # A stray tab or newline in a note would shift every later column.
+        ($v -replace "`t", ' ') -replace "`r|`n", ' '
+      }
+    }
+    $out.Add(($fields -join "`t"))
+    $i++
+  }
+  Set-Content -Path $latest -Value $out -Encoding ascii
+  return $merged.Count
+}
+
 # Returns 'BOTH-FAIL' when the reference VM fails this class the same way or
 # worse, otherwise ''. Conservative on purpose:
 #
 #   * only a CratonVM `FAIL` is eligible. A CRASH/HANG/LOADFAIL is categorically
 #     worse than an assertion failure and must never be excused by one.
 #   * the baseline row must itself be `FAIL`, for the same reason in reverse.
-#   * CratonVM must not fail MORE tests than HotSpot did. If it fails 5 where
-#     HotSpot fails 2, three of those are ours and the row stays `FAIL`.
+#   * CratonVM must not come out WORSE than HotSpot on any counter the `FAIL`
+#     verdict is built from. If it fails 5 where HotSpot fails 2, three of
+#     those are ours and the row stays `FAIL`.
+#
+# That last rule has to cover every counter line ~883 tests, not just `failed`.
+# Comparing `failed` alone let a row where CratonVM aborted 5 tests and HotSpot
+# aborted 1 come out `BOTH-FAIL` on the strength of `0 -gt 0` being false --
+# four extra aborts excused by a reference VM that never had them. `aborted` and
+# `containersFailed` are what made `ApplicationTempTests` a `FAIL` in the first
+# place (`failed=0 aborted=1`), so they are exactly the counters that must be
+# compared for this class of row.
 #
 # Anything that does not qualify keeps its own status and gets the baseline
 # appended to its note, so a near-miss is visible rather than silently dropped.
 function Resolve-BothFailStatus {
-  param([object]$Baseline, [string]$Module, [string]$Class, [string]$Status, [int]$Failed)
+  param(
+    [object]$Baseline, [string]$Module, [string]$Class, [string]$Status,
+    [int]$Failed, [int]$Aborted, [int]$ContainersFailed
+  )
   if (-not $Baseline) { return '' }
   $row = $Baseline["$Module`t$Class"]
   if (-not $row) { return '' }
   if ($Status -ne 'FAIL' -or $row.status -ne 'FAIL') { return '' }
   if ($Failed -gt $row.failed) { return '' }
+  if ($Aborted -gt $row.aborted) { return '' }
+  if ($ContainersFailed -gt $row.containersFailed) { return '' }
   return 'BOTH-FAIL'
+}
+
+# ---------------------------------------------------------------------------
+# Host capability gating -- failures the host cannot not have
+# ---------------------------------------------------------------------------
+# Three Spring Boot classes create symbolic links in test setup:
+# `ConfigTreePropertySourceTests` (Kubernetes ConfigMap trees are a `..data`
+# directory plus one relative link per key), `ApplicationTempTests`, and
+# `FileWatcherTests`. Creating one on Windows needs `SeCreateSymbolicLinkPrivilege`
+# -- an elevated token, or Developer Mode. Without it the call fails on ANY VM:
+# verified 2026-08-11 on this host, where stock HotSpot (Temurin 25.0.3) fails
+# the same calls with the same `FileSystemException`.
+#
+# All three pass under CratonVM on Linux, where the call needs no privilege
+# (2026-08-11: FileWatcherTests 15/15, ConfigTreePropertySourceTests 23/23,
+# ApplicationTempTests 7/7, zero skipped or aborted -- i.e. the symlink tests
+# genuinely ran).
+#
+# So on a privilege-less Windows host these rows are a property of the host, not
+# a CratonVM defect, and arriving as a plain `FAIL` sent them round a triage loop
+# that could not converge: the identical `FAIL 23/3` for
+# `ConfigTreePropertySourceTests` appears in at least ten runs between
+# 2026-07-27 and 2026-08-01. `Resolve-BothFailStatus` cannot help here -- it
+# needs a same-scope HotSpot baseline, and no Windows full-suite HotSpot run has
+# ever existed. A capability probe needs no reference VM at all.
+function Test-HostSymlinkSupport {
+  if ($null -ne $script:HostSymlinkSupport) { return $script:HostSymlinkSupport }
+  $probeDir = Join-Path ([System.IO.Path]::GetTempPath()) ("craton-symlink-probe-" + [guid]::NewGuid().ToString('N'))
+  $supported = $false
+  $detail = ''
+  try {
+    New-Item -ItemType Directory -Path $probeDir -Force | Out-Null
+    $target = Join-Path $probeDir 'target.txt'
+    Set-Content -Path $target -Value 'probe' -Encoding ascii
+    $link = Join-Path $probeDir 'link.txt'
+    try {
+      New-Item -ItemType SymbolicLink -Path $link -Target $target -ErrorAction Stop | Out-Null
+      $supported = Test-Path $link
+    } catch {
+      $detail = $_.Exception.Message
+    }
+  } catch {
+    $detail = $_.Exception.Message
+  } finally {
+    try { Remove-Item -Path $probeDir -Recurse -Force -ErrorAction SilentlyContinue } catch {}
+  }
+  $script:HostSymlinkSupport = $supported
+  if ($supported) {
+    Write-Info 'host symlink support: yes -- symlink-dependent classes are scored normally'
+  } else {
+    # Say it out loud. A probe whose result is never printed is indistinguishable
+    # from a probe that never ran, and this one silently reclassifies rows.
+    Write-Info "host symlink support: NO (creating a symbolic link failed: $detail) -- symlink-only failures will be recorded as ENV-GATED"
+  }
+  return $script:HostSymlinkSupport
+}
+
+# What a symlink-privilege failure looks like in a per-class log, on BOTH sides
+# of the divide it has to span.
+#
+# Do NOT match the OS's explanation text. It is localized -- on this host the
+# Win32 message arrives in Russian and `-Duser.language=en` does not change it,
+# because it comes from `FormatMessage`, not from Java. A detector keyed on
+# "A required privilege is not held by the client" would silently never fire.
+# Match the exception TYPE and the JUnit-sanctioned abort reason instead.
+$script:SymlinkGapSignature =
+  'java\.nio\.file\.FileSystemException|java\.lang\.UnsupportedOperationException.*[Ss]ymbolic|createSymbolicLink|[Ss]ymlink creation not supported|[Ss]ymbolic links? (are )?not supported'
+
+# Returns 'ENV-GATED' when EVERY non-passing test in this class failed for want
+# of the host symlink privilege, otherwise ''.
+#
+# Deliberately strict, because this status excuses a row:
+#
+#   * only a plain `FAIL` qualifies. A CRASH/HANG/LOADFAIL is a different
+#     category of wrong and is never a host gap.
+#   * `containersFailed` disqualifies: a container-level failure is not a
+#     per-test symlink refusal.
+#   * the number of failure/abort blocks carrying the signature must EQUAL the
+#     counter they are explaining. If `failed=3` and only two blocks match, the
+#     third failure is ours and the row stays FAIL.
+#
+# That last rule is also what makes this safe against a stale
+# `SbRunner.class`: with no `SBRUNNER_ABORTED_DETAIL` lines emitted, the counts
+# cannot match, and the row stays FAIL rather than being excused by evidence
+# that was never printed.
+function Resolve-EnvGatedStatus {
+  # Stdout ONLY, never the combined text. Every SBRUNNER_* marker is printed on
+  # stdout, and `$combined` appends stderr AFTER it -- so the last failure block
+  # would otherwise swallow the whole of stderr, and a stray `FileSystemException`
+  # logged there could satisfy the check for a failure that was nothing of the
+  # kind.
+  param([string]$Status, [string]$Stdout, [int]$Failed, [int]$Aborted, [int]$ContainersFailed)
+  if ($Status -ne 'FAIL') { return '' }
+  if ($ContainersFailed -gt 0) { return '' }
+  if ($Failed -le 0 -and $Aborted -le 0) { return '' }
+  if (Test-HostSymlinkSupport) { return '' }
+
+  if ($Failed -gt 0) {
+    # Split on the per-failure marker SbRunner prints, so each failure's own
+    # stack trace is checked rather than the whole log at once (one symlink
+    # failure must not excuse an unrelated second one). The final block is
+    # bounded at the summary line for the same reason.
+    $blocks = @([regex]::Split($Stdout, 'SBRUNNER_FAILURE_DETAIL ') | Select-Object -Skip 1)
+    if ($blocks.Count -ne $Failed) { return '' }
+    foreach ($block in $blocks) {
+      $body = ($block -split 'SBRUNNER_RESULT ')[0]
+      if ($body -notmatch $script:SymlinkGapSignature) { return '' }
+    }
+  }
+  if ($Aborted -gt 0) {
+    $lines = @([regex]::Matches($Stdout, '(?m)^SBRUNNER_ABORTED_DETAIL (.*)$'))
+    if ($lines.Count -ne $Aborted) { return '' }
+    foreach ($line in $lines) {
+      if ($line.Groups[1].Value -notmatch $script:SymlinkGapSignature) { return '' }
+    }
+  }
+  return 'ENV-GATED'
 }
 
 function Get-BaselineNote {
@@ -426,7 +614,11 @@ function Get-BaselineNote {
   if (-not $Baseline) { return '' }
   $row = $Baseline["$Module`t$Class"]
   if (-not $row) { return '' }
-  return "hotspot-baseline: $($row.status) $($row.failed)/$($row.tests)"
+  $note = "hotspot-baseline: $($row.status) $($row.failed)/$($row.tests)"
+  if ($row.aborted -gt 0 -or $row.containersFailed -gt 0) {
+    $note += " aborted=$($row.aborted) containersFailed=$($row.containersFailed)"
+  }
+  return $note
 }
 
 # ---------------------------------------------------------------------------
@@ -767,6 +959,34 @@ function Get-EffectiveClassTimeoutSec {
     # throughput gap. Do not paper over it with a timeout; see
     # docs/known-issues/springboot/configurationpropertiesbeanregistrationaotprocessortests-hang.md.
     'core/spring-boot|org.springframework.boot.context.properties.source.ConfigurationPropertySourcesTests' = 5400
+    # EMBEDDED-SERVER-BUDGET.1 (2026-08-11): these two build, start and stop a
+    # fresh embedded container per @Test -- 121 (Tomcat) and ~100 (Jetty)
+    # container starts in one process, each of which runs Jasper's whole TLD
+    # scan over the module's 130-jar test classpath. Both were reported as
+    # HANG at 300s in every full-suite run since 2026-08-06, and the Jetty one
+    # once as `tests=0` at a 2400s ceiling. Neither is stuck. Measured alone
+    # on an idle Windows host, default collector, -Xmx 2g, after the
+    # JarFile-accessor stat fix landed:
+    #   Tomcat 420.2s, 132 tests, 0 failed   (HotSpot 41.1s / 129 tests)
+    #   Jetty  407.0s, 113 tests, 0 failed   (HotSpot 28.6s / 111 tests)
+    # -- see fixed-suite-bugs/springboot/tomcat-jetty-servletwebserverfactorytests-300s-budget-overrun-FIXED-20260811.md.
+    # The 10-14x ratio is a real throughput item and is tracked as one
+    # (known-issues/tomcat/!webapp-deploy-annotation-scan-interpreted-226x.md);
+    # this entry exists so the suite reports 132/132 and 113/113 instead of a
+    # HANG, not to hide the ratio. Headroom over the observed time for
+    # contention when several slow classes share a -Parallel batch.
+    'module/spring-boot-tomcat|org.springframework.boot.tomcat.servlet.TomcatServletWebServerFactoryTests' = 900
+    'module/spring-boot-jetty|org.springframework.boot.jetty.servlet.JettyServletWebServerFactoryTests' = 900
+    # PULSAR-BUDGET.1 (2026-08-11): reported as a deterministic 300s HANG in
+    # the three 2026-08-06/07 full-suite runs. It is not stuck -- the evidence
+    # for "hang" was a 0-byte .out.log (SbRunner prints nothing until the run
+    # finishes, and this class logs nothing of its own) and an identical last
+    # .err.log line, which is the last line of every PASSING run of this class
+    # too. Alone on an idle host it completes 74/74 in 178-204s, and 220-277s
+    # when sharing the box -- right on the 300s boundary, which is why the
+    # suite has always seen it flip between HANG and PASS. See
+    # fixed-suite-bugs/springboot/pulsarautoconfigurationtests-onbeancondition-multivaluemap-classcastexception-flake-FIXED-20260811.md.
+    'module/spring-boot-pulsar|org.springframework.boot.pulsar.autoconfigure.PulsarAutoConfigurationTests' = 900
   }
   $key = "$($ClassRow.module)|$($ClassRow.class)"
   if ($slowClasses.ContainsKey($key)) {
@@ -795,23 +1015,36 @@ function New-ProcessRecord {
   $outFile = Join-Path $logDir "$safe.out.log"
   $errFile = Join-Path $logDir "$safe.err.log"
 
+  # Several modules' own build.gradle add --add-opens=java.base/java.net=ALL-UNNAMED
+  # to their Gradle `test` task JVM args (jetty/security/servlet/tomcat/webflux/
+  # websocket -- reflective field reset in their web-server test fixtures, via
+  # @DirtiesUrlFactories -> ReflectionTestUtils.setField(URL.class, "factory", null)).
+  # This runner launches SbRunner directly instead of through Gradle's test task,
+  # so none of those per-module jvmArgs apply; without it those classes fail with
+  # "IllegalStateException: Unable to reset field", which is a harness gap, not a
+  # genuine VM behavior difference. Apply it universally -- opens are additive and
+  # harmless for modules that don't need it.
+  #
+  # "Universally" has to mean BOTH launch arms, and for three weeks it did not:
+  # the flag was added (948df715a, 2026-07-17) to the hotspot branch only,
+  # deliberately, because CratonVM did not enforce the module boundary at all and
+  # the flag was moot there. Commit 7c92363bd (2026-08-06) closed that
+  # encapsulation hole, and the same seven-plus classes that had always needed the
+  # flag on HotSpot started failing 100% on CratonVM -- a harness asymmetry that
+  # had been invisible only because the VM was wrong in a compensating direction.
+  # Keep the argument in one variable so a future arm cannot silently omit it. See
+  # fixed-suite-bugs/springboot/dirtiesurlfactories-craton-launcher-missing-add-opens-FIXED-20260809.md.
+  $addOpensJavaNet = '--add-opens=java.base/java.net=ALL-UNNAMED'
+
   if ($Vm -eq 'hotspot') {
     $file = $JavaExe
-    # Several modules' own build.gradle add --add-opens=java.base/java.net=ALL-UNNAMED
-    # to their Gradle `test` task JVM args (jetty/security/servlet/tomcat/webflux/
-    # websocket -- reflective field reset in their web-server test fixtures). This
-    # runner launches SbRunner directly instead of through Gradle's test task, so
-    # none of those per-module jvmArgs apply; without it those classes fail with
-    # "IllegalStateException: Unable to reset field" on real HotSpot too, which is
-    # a harness gap, not a genuine VM behavior difference. Apply it universally --
-    # opens are additive and harmless for modules that don't need it.
-    $args = @("-Xmx$MaxHeap", '-Dfile.encoding=UTF-8', '-Djava.awt.headless=true', '--add-opens=java.base/java.net=ALL-UNNAMED')
+    $args = @("-Xmx$MaxHeap", '-Dfile.encoding=UTF-8', '-Djava.awt.headless=true', $addOpensJavaNet)
     if ($NoJit) { $args += '-Xint' }
     if ($LaunchSpec.kind -eq 'jar') { $args += @('-jar', $LaunchSpec.value, $class) }
     else { $args += @('-cp', $LaunchSpec.value, 'SbRunner', $class) }
   } else {
     $file = $ExePath
-    $args = @('--java-home', $JdkPath, '--Xmx', $MaxHeap)
+    $args = @('--java-home', $JdkPath, '--Xmx', $MaxHeap, $addOpensJavaNet)
     # The suite normally disables the VM watchdog because it owns the
     # per-class timeout.  Preserve that default, but let a caller provide a
     # real watchdog value through -CratonArgs for a diagnostic run.
@@ -893,7 +1126,38 @@ function Complete-ProcessRecord {
     $noteMatch = [regex]::Match($combined, '(?im)^(?!\s+at\s)(.*(?:Exception|Error|Caused by|SBRUNNER_LOAD_FAIL|panicked|not implemented|NoClassDef|NoSuchMethod|AbstractMethod|AssertionError).*)$')
     if ($noteMatch.Success) { $note = (($noteMatch.Groups[1].Value -replace "`t", ' ') -replace "`r|`n", ' ') }
   }
-  if ($note.Length -gt 180) { $note = $note.Substring(0, 180) }
+  # Record how far the [moving-young] GC fallback escalated, because that count
+  # is what distinguishes the two very different rows that both surface as a
+  # 300s HANG:
+  #
+  #   * a handful of fallbacks is harmless -- FlywayAutoConfigurationTests hits
+  #     7 and still completes (496s standalone, 73/73);
+  #   * a count in the thousands is a death spiral -- the young free list
+  #     fragments until allocation fails. IntegrationAutoConfigurationTests
+  #     reaches #16384 and dies of OutOfMemoryError after 3.8 HOURS;
+  #     QuartzEndpointWebIntegrationTests reaches #4096 and does not finish in
+  #     2400s. Both pass in ~220-260s under `--nojit`, with zero fallbacks.
+  #
+  # Without this, all three read as "the class is slow, raise its timeout" --
+  # which is the wrong fix for the latter two and costs a multi-hour standalone
+  # rerun to discover. Same mechanism as the ZipContentTests OOM (512
+  # consecutive fallbacks, clean under `--nojit`).
+  $fallbacks = [regex]::Matches($combined, '\[moving-young\] fallback #(\d+)')
+  if ($fallbacks.Count -gt 0) {
+    $peak = 0
+    foreach ($m in $fallbacks) {
+      $n = [int]$m.Groups[1].Value
+      if ($n -gt $peak) { $peak = $n }
+    }
+    $reason = ''
+    $rm = [regex]::Match($combined, '\[moving-young\] fallback #\d+: reason=([a-z-]+)')
+    if ($rm.Success) { $reason = " $($rm.Groups[1].Value)" }
+    $gcNote = "moving-young-fallback peak=#$peak$reason"
+    $note = if ($note) { "$gcNote | $note" } else { $gcNote }
+  }
+  # Truncate AFTER the GC note is prepended, so a long exception string cannot
+  # push the fallback count out of the row.
+  if ($note.Length -gt 240) { $note = $note.Substring(0, 240) }
 
   # Reclassify a failure the reference VM shares, and in every other case still
   # record what HotSpot did, so a row that stayed FAIL despite a failing
@@ -901,9 +1165,20 @@ function Complete-ProcessRecord {
   if ($status -ne 'PASS' -and $status -ne 'EMPTY') {
     $baselineNote = Get-BaselineNote -Baseline $script:HotspotBaselineMap -Module $Record.module -Class $Record.class
     $bothFail = Resolve-BothFailStatus -Baseline $script:HotspotBaselineMap -Module $Record.module `
-      -Class $Record.class -Status $status -Failed $failed
+      -Class $Record.class -Status $status -Failed $failed -Aborted $aborted -ContainersFailed $containersFailed
     if ($bothFail) { $status = $bothFail }
     if ($baselineNote) { $note = if ($note) { "$note | $baselineNote" } else { $baselineNote } }
+    # Host-capability gating runs after the baseline reclassifier and can still
+    # apply to a row the baseline left alone: it needs no reference VM, which
+    # matters because no Windows full-suite HotSpot baseline has ever existed.
+    $envGated = Resolve-EnvGatedStatus -Status $status -Stdout $Stdout `
+      -Failed $failed -Aborted $aborted -ContainersFailed $containersFailed
+    if ($envGated) {
+      $status = $envGated
+      $gateNote = 'env-gated: host cannot create symbolic links (needs SeCreateSymbolicLinkPrivilege or Developer Mode); stock HotSpot fails these same tests here'
+      $note = if ($note) { "$gateNote | $note" } else { $gateNote }
+      if ($note.Length -gt 240) { $note = $note.Substring(0, 240) }
+    }
   }
 
   $line = @(
@@ -1023,9 +1298,9 @@ function Invoke-Mode {
     $baselineBase = "hotspot-baseline-$run"
     Copy-Item -Path $results -Destination (Join-Path $baselineDir "$baselineBase.tsv") -Force
     Copy-Item -Path $summaryPath -Destination (Join-Path $baselineDir "$baselineBase.md") -Force
-    Copy-Item -Path $results -Destination (Join-Path $baselineDir 'hotspot-baseline-latest.tsv') -Force
     Copy-Item -Path $summaryPath -Destination (Join-Path $baselineDir 'hotspot-baseline-latest.md') -Force
-    Write-Info "baseline copied to $baselineDir\$baselineBase.tsv"
+    $latestCount = Merge-HotspotBaselineLatest -BaselineDir $baselineDir -ResultsPath $results
+    Write-Info "baseline copied to $baselineDir\$baselineBase.tsv; hotspot-baseline-latest.tsv now covers $latestCount classes"
   }
   Write-Info "DONE mode=$mode wall=${elapsed}s summary=$summaryPath"
 }
@@ -1073,6 +1348,29 @@ $script:SpringBootDir = [System.IO.Path]::GetFullPath($SpringBootRoot)
 if (-not (Test-Path $script:SpringBootDir)) { Die "Spring Boot root not found: $script:SpringBootDir" }
 $script:SbRunnerDir = Join-Path $script:SpringBootDir 'sb-runner'
 if (-not (Test-Path (Join-Path $script:SbRunnerDir 'SbRunner.class'))) { Die "missing SbRunner.class in $script:SbRunnerDir (javac SbRunner.java against the JUnit platform jars first)" }
+# Existence was the only thing ever checked, so a `.class` compiled before the
+# `.java` last changed kept running unnoticed -- and the fixture directory is
+# NOT under version control, so it goes stale by default. That is why
+# `SBRUNNER_ABORTED_DETAIL` was documented as landed and yet appeared in no run
+# log: `SbRunner.class` in the fixture predated the change that emits it, and
+# the missing line was then read as "the reason strings are not wired up".
+# (Confirmed 2026-08-11 on the Azure fixture: `SbRunner$OutcomeReasonCollector.class`
+# did not exist beside a `SbRunner.java` that declares it.)
+#
+# Refuse to run on a stale runner rather than produce logs missing the very
+# evidence the harness now classifies on -- `Resolve-EnvGatedStatus` counts
+# those lines.
+foreach ($src in @('SbRunner.java', 'SbRunnerMethod.java')) {
+  $srcPath = Join-Path $script:SbRunnerDir $src
+  if (-not (Test-Path $srcPath)) { continue }
+  $clsPath = Join-Path $script:SbRunnerDir ([System.IO.Path]::ChangeExtension($src, '.class'))
+  if (-not (Test-Path $clsPath) -or
+      (Get-Item $srcPath).LastWriteTimeUtc -gt (Get-Item $clsPath).LastWriteTimeUtc) {
+    Die ("stale sb-runner: $src is newer than its .class in $script:SbRunnerDir. " +
+         "Recompile before running, e.g.`n" +
+         "  javac -cp `"<any module>/build/cratonvm-test-cp.txt contents>`" -d `"$script:SbRunnerDir`" `"$script:SbRunnerDir\*.java`"")
+  }
+}
 
 if (-not $WorkDir) { $WorkDir = Join-Path $PSScriptRoot '.suite' }
 $script:WorkRoot = [System.IO.Path]::GetFullPath($WorkDir)

@@ -87,11 +87,87 @@ fn java_home() -> Option<String> {
     None
 }
 
+/// Is the compiled class OLDER than the fixture source?
+///
+/// A `.class` that predates its `.java` is the documented stale-artefact trap:
+/// the compiled probe keeps answering a question the current source no longer
+/// asks, so an edit to the fixture appears in no log. An unreadable timestamp
+/// (no source at all, no metadata) is not evidence of staleness — and cannot be
+/// repaired by recompiling either — so it reads as `false` and any existing
+/// artefact is kept.
+fn class_older_than_source(cls: &Path, src: &Path) -> bool {
+    let Ok(src_mtime) = src.metadata().and_then(|m| m.modified()) else {
+        return false;
+    };
+    match cls.metadata().and_then(|m| m.modified()) {
+        Ok(cls_mtime) => cls_mtime < src_mtime,
+        // Cannot tell — recompile rather than trust it.
+        Err(_) => true,
+    }
+}
+
+/// Compile `MhProbe.java` unless an up-to-date `MhProbe.class` is already there.
+fn ensure_probe_compiled() -> bool {
+    let dir = probe_dir();
+    let cls = dir.join("MhProbe.class");
+    let src = dir.join("MhProbe.java");
+    if cls.exists() && !class_older_than_source(&cls, &src) {
+        return true;
+    }
+    if !src.exists() {
+        // Loud, and a failure under CRATONVM_REQUIRE_E2E — see
+        // `common::require_fixture`. `apps/` is gitignored (.gitignore line 12),
+        // which is why this fixture was never tracked.
+        let _ = common::require_fixture(
+            "wave2-c",
+            "the Wave 2 Task C fixture `MhProbe` (MhProbe.class, compiled from MhProbe.java)",
+            &[cls.clone(), src.clone()],
+        );
+        return false;
+    }
+    let compile = Command::new("javac")
+        .arg("--release")
+        .arg("21")
+        .arg("-d")
+        .arg(&dir)
+        .arg(&src)
+        .output();
+    match compile {
+        // javac cannot be launched at all — the one legitimate skip.
+        Err(_) => false,
+        // javac RAN and rejected the fixture: skipping here would make this test
+        // a permanent vacuous pass.
+        Ok(o) => {
+            // javac REJECTED THE ARGUMENTS, not the source: an unsupported
+            // `--release` means this javac never opened the file, which is a
+            // missing-toolchain condition rather than a broken probe.
+            if !o.status.success() {
+                let stderr_probe = String::from_utf8_lossy(&o.stderr);
+                if stderr_probe.contains("release version") && stderr_probe.contains("not supported")
+                {
+                    eprintln!(
+                        "[wave2-c] javac cannot target --release 21 ({}); skipping. Point \
+                         JAVA_HOME or CRATONVM_JAVA_HOME at a JDK 21+ install.",
+                        stderr_probe.lines().next().unwrap_or("").trim()
+                    );
+                    return false;
+                }
+            }
+            assert!(
+                o.status.success(),
+                "[wave2-c] the checked-in probe fixture failed to compile — fix the .java source. \
+                 javac stderr:\n{}",
+                String::from_utf8_lossy(&o.stderr)
+            );
+            cls.exists()
+        }
+    }
+}
+
 fn run_mh_probe(timeout: Duration) -> Option<(String, String, Option<i32>)> {
     let bin = cratonvm_binary()?;
     let probe = probe_dir();
-    if !probe.join("MhProbe.class").exists() {
-        eprintln!("[wave2-c] MhProbe.class missing — run javac in apps/methodhandles_probe");
+    if !ensure_probe_compiled() {
         return None;
     }
     let mut cmd = Command::new(&bin);

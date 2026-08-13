@@ -218,28 +218,84 @@ public class RJdkJmx {
 
     /** Platform MXBeans must be REAL beans, not fabricated shells. */
     static void platformBeans() throws Exception {
+        // Every assertion below that CAN be tied to a second, independent
+        // accessor is. A `!= null` or `> 0` on a platform bean is satisfied by a
+        // fabricated shell answering a constant -- which is precisely the shape
+        // this method's own comment says it exists to rule out -- so what is
+        // pinned instead is agreement with a source outside JMX, or an invariant
+        // the interface SPECIFIES. Nothing here is a host constant: every
+        // right-hand side is read at run time from the same VM.
         RuntimeMXBean rt = ManagementFactory.getRuntimeMXBean();
         check(rt != null, "RuntimeMXBean");
         check(rt.getName() != null && !rt.getName().isEmpty(), "RuntimeMXBean.getName");
         check(rt.getStartTime() > 0, "RuntimeMXBean.getStartTime");
+        // The VM cannot have started in the future, and cannot have been up for
+        // a negative time. A relational bound the test computes for itself, not
+        // a wall-clock window: a slower host widens it, never narrows it.
+        check(rt.getStartTime() <= System.currentTimeMillis(),
+                "RuntimeMXBean.getStartTime is in the future");
+        check(rt.getUptime() >= 0, "RuntimeMXBean.getUptime is negative");
         check(rt.getInputArguments() != null, "RuntimeMXBean.getInputArguments");
         check(rt.getObjectName().getCanonicalName().equals("java.lang:type=Runtime"),
                 "RuntimeMXBean ObjectName: " + rt.getObjectName());
 
         MemoryMXBean mem = ManagementFactory.getMemoryMXBean();
-        check(mem.getHeapMemoryUsage().getMax() != 0, "heap max");
-        check(mem.getHeapMemoryUsage().getUsed() > 0, "heap used");
+        java.lang.management.MemoryUsage heap = mem.getHeapMemoryUsage();
+        check(heap.getMax() != 0, "heap max");
+        check(heap.getUsed() > 0, "heap used");
+        // MemoryUsage's own contract: init <= committed unless undefined,
+        // used <= committed, and committed <= max unless max is undefined (-1).
+        // A shell that returns arbitrary numbers per getter breaks one of these;
+        // `getUsed() > 0` alone cannot see that.
+        check(heap.getUsed() <= heap.getCommitted(),
+                "heap used " + heap.getUsed() + " > committed " + heap.getCommitted());
+        check(heap.getMax() == -1 || heap.getCommitted() <= heap.getMax(),
+                "heap committed " + heap.getCommitted() + " > max " + heap.getMax());
+        check(heap.getInit() == -1 || heap.getInit() >= 0, "heap init " + heap.getInit());
 
         ThreadMXBean th = ManagementFactory.getThreadMXBean();
         check(th.getThreadCount() > 0, "thread count");
-        check(th.getAllThreadIds().length > 0, "thread id list");
+        long[] ids = th.getAllThreadIds();
+        check(ids.length > 0, "thread id list");
+        // The thread executing this line is live by construction, so it MUST be
+        // in the list. A fabricated array of plausible-looking ids is not.
+        long self = Thread.currentThread().getId();
+        boolean sawSelf = false;
+        for (long id : ids) {
+            if (id == self) {
+                sawSelf = true;
+            }
+        }
+        check(sawSelf, "getAllThreadIds() must contain the current thread " + self);
+        check(th.getThreadInfo(self) != null, "getThreadInfo of the current thread");
+        check(th.getThreadInfo(self).getThreadId() == self, "getThreadInfo identity");
 
         ClassLoadingMXBean cl = ManagementFactory.getClassLoadingMXBean();
         check(cl.getLoadedClassCount() > 0, "loaded class count");
+        // Total ever loaded cannot be smaller than the number loaded right now.
+        // Read total LAST so a class loaded between the two reads can only widen
+        // the inequality; the reverse order would be a race.
+        int loadedNow = cl.getLoadedClassCount();
+        check(cl.getTotalLoadedClassCount() >= loadedNow,
+                "total loaded " + cl.getTotalLoadedClassCount() + " < currently loaded "
+                        + loadedNow);
+        check(cl.getUnloadedClassCount() >= 0, "unloaded class count is negative");
 
         OperatingSystemMXBean os = ManagementFactory.getOperatingSystemMXBean();
         check(os.getAvailableProcessors() > 0, "available processors");
+        // Specified to be equivalent to Runtime.availableProcessors(); a stub
+        // answering a constant 1 on a multi-core host fails here and passes the
+        // `> 0` above.
+        check(os.getAvailableProcessors() == Runtime.getRuntime().availableProcessors(),
+                "OperatingSystemMXBean.getAvailableProcessors disagrees with Runtime");
         check(os.getName() != null, "os name");
+        // getName/getArch/getVersion are specified as the os.name / os.arch /
+        // os.version system properties. Compared, never printed: the values are
+        // host-specific, the AGREEMENT is not.
+        check(os.getName().equals(System.getProperty("os.name")), "os.name disagreement");
+        check(os.getArch().equals(System.getProperty("os.arch")), "os.arch disagreement");
+        check(os.getVersion().equals(System.getProperty("os.version")),
+                "os.version disagreement");
 
         // The platform server must expose them under their canonical names.
         MBeanServer mbs = ManagementFactory.getPlatformMBeanServer();
@@ -250,6 +306,26 @@ public class RJdkJmx {
         check(((Integer) mbs.getAttribute(new ObjectName("java.lang:type=OperatingSystem"),
                 "AvailableProcessors")) == os.getAvailableProcessors(),
                 "proxy read of a platform attribute must agree with the direct read");
+        // The same shape for a String-valued attribute, and for the bean whose
+        // direct read above is only pinned by non-emptiness: a Runtime bean and
+        // a server that were fabricated independently disagree here.
+        check(rt.getName().equals(mbs.getAttribute(new ObjectName("java.lang:type=Runtime"),
+                "Name")),
+                "the server's Runtime Name attribute disagrees with the direct read");
+        // The OperatingSystem bean's three String attributes, same shape. The
+        // rows above pin the DIRECT read against the system properties; these
+        // pin the SERVER's answer against that direct read, so a VM that grew
+        // two independent OS-attribute implementations -- one behind
+        // getOperatingSystemMXBean(), one behind the server's getAttribute --
+        // cannot have them drift apart unnoticed. Values are compared, never
+        // printed.
+        ObjectName osName = new ObjectName("java.lang:type=OperatingSystem");
+        check(os.getName().equals(mbs.getAttribute(osName, "Name")),
+                "the server's OperatingSystem Name attribute disagrees with the direct read");
+        check(os.getArch().equals(mbs.getAttribute(osName, "Arch")),
+                "the server's OperatingSystem Arch attribute disagrees with the direct read");
+        check(os.getVersion().equals(mbs.getAttribute(osName, "Version")),
+                "the server's OperatingSystem Version attribute disagrees with the direct read");
 
         // A platform MXBean proxy is a dynamic proxy over the server.
         RuntimeMXBean proxy = ManagementFactory.getPlatformMXBean(mbs, RuntimeMXBean.class);

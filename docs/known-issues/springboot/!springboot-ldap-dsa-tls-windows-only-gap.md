@@ -3,6 +3,42 @@
 **Status: OPEN — accepted platform limitation, 2026-07-31.** Windows only; the
 class passes 17/17 on Linux.
 
+## 2026-08-11 — the two load-bearing claims are now measured, not inferred, and the message names the key type
+
+This page's root-cause section reasons that a DSA certificate needs a `DHE_DSS`
+suite and that modern Windows SChannel no longer offers one. Both were
+inferences. Both were checked directly, on the Windows suite host:
+
+* **What HotSpot actually negotiates for this listener.** Running the single
+  failing test under Temurin 25.0.3 with `-Djavax.net.debug=ssl:handshake`:
+
+  ```
+  "cipher suite" : "TLS_DHE_DSS_WITH_AES_256_GCM_SHA384(0x00A3)"
+  ```
+
+  So the requirement really is a `DHE_DSS` suite, and rustls — which implements
+  no DHE key exchange at all — cannot reach it by any configuration.
+
+* **What SChannel offers.** `Get-TlsCipherSuite` on this Windows 11 host lists
+  **28 suites, of which 0 are DSS**. That settles the remaining "would feeding
+  `native-tls` a PKCS#12 instead of `from_pkcs8` help?" question: no. The import
+  failure (`CRYPT_E_ASN1_BADTAG`) is not the binding constraint — even a
+  successful import could not negotiate a handshake afterwards.
+
+Also measured: the key CratonVM lifts out of the fixture keystore is 335 bytes
+of PKCS#8 whose `AlgorithmIdentifier` OID is `1.2.840.10040.4.1` (`id-dsa`),
+captured with `CRATONVM_DBG=tls-hs`. The bytes are identical on Linux, where the
+OpenSSL fallback accepts them and the class passes 18/18 — so the two platforms
+differ only in the fallback, exactly as this page says.
+
+**What changed in code (2026-08-11):** the exception text only. It used to be
+rustls's generic "failed to parse private key as RSA, ECDSA, or EdDSA" followed
+by a localized Win32 ASN.1 error, which reads like a corrupt keystore. It now
+names the key algorithm and the missing capability, so the next reader of a
+Windows suite log does not have to re-derive this page. The gap itself is
+unchanged and the status stays OPEN for the reason given below: the fix is an
+OpenSSL dependency on Windows, not a VM change.
+
 ## Reconfirmed 2026-08-07, Windows full-suite (`craton-fullsuite-windows-20260806`)
 
 Triaging the 08-06/07 Windows full-suite run's non-passing classes turned this
@@ -20,6 +56,32 @@ locale renders the OS message in Russian ("Встречено неверное �
 ASN1", i.e. "an invalid ASN1 tag value was encountered") but the error code is
 identical. Confirms this is still the same accepted DSA/Windows-SChannel gap,
 not a new regression; no doc changes needed beyond this confirmation.
+
+## Reconfirmed 2026-08-10 — collector-agnostic (Generational, G1, and ZGC)
+
+Reconciling the 139-class union of non-passed classes from the three
+2026-08-08f full-suite reruns (`craton-nonpassed-{default,g1,zgc}-20260808f`)
+on `dev@6365de194`, `module/spring-boot-ldap` `EmbeddedLdapAutoConfigurationTests`
+is FAIL under **all three** GC backends, byte-identical signature in every
+run: 1 of 17 tests failed
+(`whenSslBundleIsConfiguredLdapsListenerIsConfigured`), same
+`directoryServer` `BeanCreationException` chain, same
+`IOException(ServerConfig with_single_cert failed: unexpected error: failed
+to parse private key as RSA, ECDSA, or EdDSA; ...)`, same `os error
+-2146881269` (`CRYPT_E_ASN1_BADTAG`):
+
+| GC | Shard | Seconds | Log |
+|---|---|---:|---|
+| default (Generational) | s2 | 34.225 | `craton-nonpassed-default-20260808f-s2/all-jit/logs/module_spring-boot-ldap.org.springframework.boot.ldap.autoconfigure.embedd-3c6a8c4df0c6.{out,err}.log` |
+| G1 | s2 | 38.808 | `craton-nonpassed-g1-20260808f-s2/all-jit/logs/module_spring-boot-ldap.org.springframework.boot.ldap.autoconfigure.embedded.Em-3c6a8c4df0c6.{out,err}.log` |
+| ZGC | s2 | 35.949 | `craton-nonpassed-zgc-20260808f-s2/all-jit/logs/module_spring-boot-ldap.org.springframework.boot.ldap.autoconfigure.embedded.E-3c6a8c4df0c6.{out,err}.log` |
+
+(all under `apps/spring-boot-suite-runner/.suite/results/`). This is the same
+1024-bit-DSA-key/Windows-SChannel platform gap across all three collectors,
+not a GC-specific defect — expected, since the root cause is a TLS
+key-type/backend limitation on Windows with nothing to do with the
+collector. Status and conclusion below unchanged: still OPEN, still an
+accepted platform limitation.
 
 ## Symptom
 
@@ -97,7 +159,7 @@ Other routes were considered and ruled out:
 - **Substituting a different key** — would stop testing the fixture's identity.
 
 This matches the posture already taken for the other legacy-crypto gaps in the
-rustls backend (`../../internal/fixed-suite-bugs/rustls-cbc-cipher-suites-not-supported.md`,
+rustls backend (`fixed-suite-bugs/rustls-cbc-cipher-suites-not-supported.md`,
 `rustls-tls11-protocol-not-supported.md`), with the added note that on Unix the
 gap *is* covered by the OpenSSL fallback.
 

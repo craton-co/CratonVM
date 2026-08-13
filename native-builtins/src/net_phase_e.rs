@@ -163,12 +163,13 @@ fn spring_dbg_enabled() -> bool {
 
 use cratonvm_native_api::{NativeContext, NativeHandleScope, NativeKind, NativeMethodRegistry};
 use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError};
+use cratonvm_types::lock_order::{LockLevel, OrderedPlMutex};
 use cratonvm_types::{ArrayElementType, ClassId, ObjectKind, ObjectRef, Value};
 
 use cratonvm_native_io::eintr::{is_eintr, retry_eintr, EintrIo, EintrStream};
 
 use crate::servlet::{s2_alloc_listener, s2_alloc_stream, s2_registry};
-use crate::{alloc_concurrent_synthetic, obj_arg};
+use crate::{try_alloc_concurrent_synthetic, obj_arg};
 
 // ---------------------------------------------------------------------------
 // Synthetic field layouts used by Phase E.
@@ -742,9 +743,17 @@ pub(crate) struct DsSide {
     pub reuse_address: i32,
 }
 
-fn ds_side_table() -> &'static Mutex<HashMap<ObjectRef, DsSide>> {
-    static T: OnceLock<Mutex<HashMap<ObjectRef, DsSide>>> = OnceLock::new();
-    T.get_or_init(|| Mutex::new(HashMap::new()))
+/// ARCH-2026-08-04 A6 — `LockLevel::Scratch` (L0, the leaf level) because no
+/// lock is ever taken while this one is held, and this one is never held across
+/// a re-entry into the VM. Every acquisition site has been read: `ds_get`
+/// copies a `DsSide` out and drops the guard; `ds_set` runs a closure and every
+/// one of its fourteen callers assigns plain `i32` fields and touches no `ctx`;
+/// `gc_scan_ds_roots` pushes keys into a `Vec`; `gc_remap_ds_roots` calls the
+/// pure `rekey`. The GC scan runs with the heap lock (L8) held, which is
+/// legal — L0 < L8 is the descending order the wrapper asserts.
+fn ds_side_table() -> &'static OrderedPlMutex<HashMap<ObjectRef, DsSide>> {
+    static T: OnceLock<OrderedPlMutex<HashMap<ObjectRef, DsSide>>> = OnceLock::new();
+    T.get_or_init(|| OrderedPlMutex::new(HashMap::new(), LockLevel::Scratch))
 }
 
 /// The peer a `DatagramSocket` was last `connect`ed to, as `(numeric host,
@@ -755,9 +764,12 @@ fn ds_side_table() -> &'static Mutex<HashMap<ObjectRef, DsSide>> {
 /// cleared by `disconnect`, and deliberately NOT cleared by `close`, because
 /// the JDK specifies `getPort`/`getInetAddress` keep answering after the socket
 /// is closed (same rule that keeps `isConnected()` true).
-fn ds_peer_table() -> &'static Mutex<HashMap<ObjectRef, (String, i32)>> {
-    static T: OnceLock<Mutex<HashMap<ObjectRef, (String, i32)>>> = OnceLock::new();
-    T.get_or_init(|| Mutex::new(HashMap::new()))
+/// Same `LockLevel::Scratch` claim as [`ds_side_table`], and the same four
+/// call shapes — `ds_peer` clones out, `ds_set_peer`/`ds_clear_peer` are one
+/// statement each, and the two GC hooks read keys or `rekey`.
+fn ds_peer_table() -> &'static OrderedPlMutex<HashMap<ObjectRef, (String, i32)>> {
+    static T: OnceLock<OrderedPlMutex<HashMap<ObjectRef, (String, i32)>>> = OnceLock::new();
+    T.get_or_init(|| OrderedPlMutex::new(HashMap::new(), LockLevel::Scratch))
 }
 
 /// The connected peer, or `None` when this socket has never connected or has
@@ -866,9 +878,12 @@ const SSC_TAG_CLIENT: u8 = 0;
 const SSC_TAG_SERVER: u8 = 1;
 const SSC_TAG_ORPHAN: u8 = 2;
 
-fn ssc_side_table() -> &'static Mutex<HashMap<SscKey, SscSide>> {
-    static T: OnceLock<Mutex<HashMap<SscKey, SscSide>>> = OnceLock::new();
-    T.get_or_init(|| Mutex::new(HashMap::new()))
+/// `LockLevel::Scratch`, on the same reading. `ssc_key` — the only `ctx` call
+/// on either path — runs BEFORE the guard is taken in both `ssc_get` and
+/// `ssc_set`, and `ssc_set`'s four callers assign one `i32` field each.
+fn ssc_side_table() -> &'static OrderedPlMutex<HashMap<SscKey, SscSide>> {
+    static T: OnceLock<OrderedPlMutex<HashMap<SscKey, SscSide>>> = OnceLock::new();
+    T.get_or_init(|| OrderedPlMutex::new(HashMap::new(), LockLevel::Scratch))
 }
 
 /// Carrier identity -> the `SscKey` it stands for. `get{Client,Server}
@@ -1020,8 +1035,8 @@ pub(crate) fn alloc_inet_address_external(
     ctx: &mut dyn NativeContext,
     host: &str,
     ip: &str,
-) -> ObjectRef {
-    alloc_inet_address(ctx, host, ip)
+) -> Result<ObjectRef, MethodCallFailed> {
+    Ok(alloc_inet_address(ctx, host, ip)?)
 }
 
 /// Mint an `InetAddress` mirror that remembers **no hostName**, the way the JDK
@@ -1041,8 +1056,8 @@ pub(crate) fn alloc_inet_address_external(
 /// get that row backwards. The distinction is "was a name supplied", which is
 /// only decidable HERE, at construction. Sites that want the named wildcard
 /// keep calling [`alloc_inet_address_external`] with an explicit host.
-pub(crate) fn alloc_inet_address_unnamed(ctx: &mut dyn NativeContext, ip: &str) -> ObjectRef {
-    alloc_inet_address(ctx, NO_HOST_NAME, ip)
+pub(crate) fn alloc_inet_address_unnamed(ctx: &mut dyn NativeContext, ip: &str) -> Result<ObjectRef, MethodCallFailed> {
+    Ok(alloc_inet_address(ctx, NO_HOST_NAME, ip)?)
 }
 
 /// Mint a mirror for a RESOLVING entry point (`getByName`, `getAllByName`,
@@ -1057,7 +1072,7 @@ pub(crate) fn alloc_inet_address_for_input(
     ctx: &mut dyn NativeContext,
     input: &str,
     ip: &str,
-) -> ObjectRef {
+) -> Result<ObjectRef, MethodCallFailed> {
     if host_input_is_numeric_literal(input) {
         alloc_inet_address(ctx, NO_HOST_NAME, ip)
     } else {
@@ -1076,6 +1091,40 @@ fn host_input_is_numeric_literal(input: &str) -> bool {
         .unwrap_or(input);
     let unscoped = bare.split('%').next().unwrap_or(bare);
     !unscoped.is_empty() && unscoped.parse::<IpAddr>().is_ok()
+}
+
+/// The `%scope` of a textual address literal, if it carries one.
+///
+/// `InetAddress.getByName("fe80::1%1")` and `getByName("fe80::1%eth0")` both
+/// produce an `Inet6Address` whose `getScopeId()`/`getHostAddress()` remember
+/// the scope on HotSpot. [`resolve_host`] answers with a bare
+/// `std::net::IpAddr`, which cannot carry one, so the scope must be taken from
+/// the INPUT text and threaded to the allocator separately.
+pub(crate) fn host_input_scope(input: &str) -> Option<&str> {
+    let bare = input
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(input);
+    match bare.split_once('%') {
+        Some((_, scope)) if !scope.is_empty() => Some(scope),
+        _ => None,
+    }
+}
+
+/// Split a possibly-scoped numeric address text into `(address, scope)`.
+///
+/// The `InetAddress` side table stores the scope glued onto the address text
+/// (`fe80:0:0:0:0:0:0:1%eth0`) because it is the only per-mirror store that is
+/// already a scanned + remapped GC root. Every consumer of the ADDRESS goes
+/// through [`inet_addr_resolve`], which splits here and hands back the bare
+/// half, so the storage choice is invisible to them: `getAddress()`, `equals`,
+/// `hashCode` and the `native-io` bind/connect decoders keep parsing a plain
+/// `IpAddr`. Only [`inet6_scope_suffix`] reads the other half.
+fn split_addr_scope(text: &str) -> (&str, Option<&str>) {
+    match text.split_once('%') {
+        Some((addr, scope)) if !scope.is_empty() => (addr, Some(scope)),
+        _ => (text, None),
+    }
 }
 
 /// `pub(crate)` re-export of [`resolve_host`] for sibling modules that need
@@ -1105,6 +1154,19 @@ pub(crate) fn inet_addr_resolve_external(
 /// `phases_early.rs` can consult the same table — otherwise they would read
 /// the (now intentionally unpopulated) instance slots and return null.
 pub(crate) fn inet_addr_get(this: ObjectRef) -> Option<(String, String)> {
+    // The stored address text may carry an IPv6 `%scope` (see
+    // [`split_addr_scope`]). Strip it here so EVERY consumer of this
+    // accessor — `net_channels`' channel decoders, `plain_socket`'s connect
+    // target, `InetSocketAddress.getHostString()` — keeps receiving the bare
+    // numeric form it parses today. Only [`inet6_scope_suffix`] reads the raw
+    // entry.
+    let (host, ip) = inet_addr_get_raw(this)?;
+    let (bare, _) = split_addr_scope(&ip);
+    Some((host, bare.to_string()))
+}
+
+/// The side-table entry exactly as stored, scope suffix included.
+fn inet_addr_get_raw(this: ObjectRef) -> Option<(String, String)> {
     inet_addr_side_table().lock().get(&this).cloned()
 }
 
@@ -1185,9 +1247,17 @@ pub(crate) fn inet_addr_resolve(
                             _ => 0,
                         };
                     }
-                    Some(hotspot_ip_string(
-                        &std::net::Ipv6Addr::from(octets).to_string(),
-                    ))
+                    // NOT `hotspot_ip_string`: that folds a v4-mapped address
+                    // to its dotted quad, which is right for `getByName` and
+                    // `InetAddress.getByAddress` (both hand back an
+                    // `Inet4Address`) and WRONG here. This branch only runs
+                    // for an object the real JDK already built as an
+                    // `Inet6Address` — `Inet6Address.getByAddress(String,
+                    // byte[], int)` is not intercepted — and the JDK
+                    // specifies that factory to keep the 16-byte form.
+                    // Folding it left `getAddress()` handing back 4 bytes for
+                    // an `instanceof Inet6Address` receiver.
+                    Some(ipv6_uncompressed_text(&std::net::Ipv6Addr::from(octets)))
                 }
                 _ => None,
             },
@@ -1231,7 +1301,9 @@ fn populate_inet_holder(
     ia: ObjectRef,
     host: &str,
     ip: &str,
-) -> ObjectRef {
+    // NOT named `scope`: the local `NativeHandleScope` below owns that name.
+    scope_arg: Option<&str>,
+) -> Result<ObjectRef, MethodCallFailed> {
     // Cross-call GC-safety (2026-08-04). Every `alloc_concurrent_synthetic` /
     // `create_string` / `new_array` below ALLOCATES, and the first one is
     // especially dangerous: on a cold VM it also loads and initialises
@@ -1256,7 +1328,7 @@ fn populate_inet_holder(
     // Only populate if the class actually declares a `holder` field — i.e.
     // a real-JDK `InetAddress` is loaded. With a purely synthetic stub the
     // field is absent and `set_field_by_name` is a harmless no-op anyway.
-    let holder = alloc_concurrent_synthetic(&mut *scope, "java/net/InetAddress$InetAddressHolder", 3);
+    let holder = try_alloc_concurrent_synthetic(&mut *scope, "java/net/InetAddress$InetAddressHolder", 3)?;
     let holder_h = scope.root(holder);
     // An absent hostName must be a genuine `null`, not an empty String: the
     // real-JDK readers test the field for null, not for emptiness.
@@ -1301,7 +1373,7 @@ fn populate_inet_holder(
     // is ever reached. Populate it so the real path resolves v6 correctly.
     if let Ok(std::net::IpAddr::V6(v6)) = parsed {
         let h6 =
-            alloc_concurrent_synthetic(&mut *scope, "java/net/Inet6Address$Inet6AddressHolder", 5);
+            try_alloc_concurrent_synthetic(&mut *scope, "java/net/Inet6Address$Inet6AddressHolder", 5)?;
         let h6_h = scope.root(h6);
         let octets = v6.octets();
         let arr = scope.new_array(ArrayElementType::Byte, octets.len());
@@ -1313,17 +1385,37 @@ fn populate_inet_holder(
         let h6_cur = scope.get(&h6_h);
         let arr_cur = scope.get(&arr_h);
         scope.set_field_by_name(h6_cur, "ipaddress", Value::Object(Some(arr_cur)));
-        // Loopback / global addresses carry no scope; link-local scope ids are
-        // not recoverable from a bare `Ipv6Addr`, so leave scope_id unset (0).
+        // Loopback / global addresses carry no scope. When the caller DID
+        // supply one it must reach `holder6`, because `Inet6Address
+        // .getScopeId()` is un-intercepted real-JDK bytecode reading exactly
+        // this field: leaving it 0 made `getByName("fe80::1%1").getScopeId()`
+        // answer 0 where HotSpot answers 1. An interface NAME is resolved to
+        // its kernel index the way the JDK's own `Inet6Address(String, byte[],
+        // NetworkInterface)` ctor does; `scope_ifname` itself stays null
+        // because minting a `NetworkInterface` here would recurse through
+        // `re8_make_interface`, which allocates `InetAddress`es of its own.
+        // The rendered `%eth0` form comes from the side table instead — see
+        // [`inet6_scope_suffix`].
+        let scope_id = scope_arg
+            .and_then(|s| s.parse::<i32>().ok().or_else(|| Some(re8_iface_index(s))))
+            .filter(|id| *id > 0);
+        let (id, id_set) = match scope_id {
+            Some(id) => (id, 1),
+            // A `%name` we could not resolve still means "scoped": the flag
+            // drives HotSpot's `%` rendering, and the side table supplies the
+            // text, so dropping it here would silently unscope the address.
+            None if scope_arg.is_some() => (0, 1),
+            None => (0, 0),
+        };
         let h6_cur = scope.get(&h6_h);
-        scope.set_field_by_name(h6_cur, "scope_id", Value::Int(0));
+        scope.set_field_by_name(h6_cur, "scope_id", Value::Int(id));
         let h6_cur = scope.get(&h6_h);
-        scope.set_field_by_name(h6_cur, "scope_id_set", Value::Int(0));
+        scope.set_field_by_name(h6_cur, "scope_id_set", Value::Int(id_set));
         let ia_cur = scope.get(&ia_h);
         let h6_cur = scope.get(&h6_h);
         scope.set_field_by_name(ia_cur, "holder6", Value::Object(Some(h6_cur)));
     }
-    scope.get(&ia_h)
+    Ok(scope.get(&ia_h))
 }
 
 /// Read one logical InetAddress field (`IA_HOST` or `IA_ADDR`) — side table
@@ -1336,6 +1428,122 @@ fn inet_addr_field(ctx: &mut dyn NativeContext, this: ObjectRef, which: usize) -
         return Value::Object(Some(ctx.create_string(&s)));
     }
     ctx.get_field(this, which)
+}
+
+/// The `%…` suffix HotSpot's `Inet6Address$Inet6AddressHolder.getHostAddress()`
+/// appends, or `None` for an address that carries no scope.
+///
+/// The JDK's own body is
+///
+/// ```java
+/// String s = numericToTextFormat(ipaddress);
+/// if (scope_ifname != null) s = s + "%" + scope_ifname.getName();
+/// else if (scope_id_set)    s = s + "%" + scope_id;
+/// ```
+///
+/// — note the ORDER (a named interface wins over the numeric id) and note that
+/// the numeric branch is gated on `scope_id_set`, **not** on `scope_id != 0`.
+/// `Inet6AddressHolder.init` sets the flag for any `scope_id >= 0`, so
+/// `Inet6Address.getByAddress(host, addr, 0)` — exactly what
+/// `io.netty.channel.unix.NativeInetAddress.address()` calls for a link-local
+/// peer — must render `%0`, while `getByAddress(host, addr, -1)` must render no
+/// suffix at all. A `scope_id != 0` test gets that pair backwards in both
+/// directions.
+///
+/// Only the SUFFIX is produced here; the numeric text itself stays in the
+/// side table / `holder6` unscoped, because every other reader of it
+/// (`getAddress()`, `equals`, `hashCode`, `isLoopbackAddress`, and the
+/// `native-io` bind/connect decoders) parses it as a bare `IpAddr` and a
+/// `%scope` suffix would make that parse fail.
+fn inet6_scope_suffix(ctx: &mut dyn NativeContext, this: ObjectRef) -> Option<String> {
+    // A CratonVM-minted mirror carries its scope in the side table, glued to
+    // the address text: it is built from a textual literal (`getByName
+    // ("fe80::1%eth0")`) or from `getifaddrs`, neither of which produces the
+    // `NetworkInterface` object `holder6.scope_ifname` would need — and
+    // building one here would recurse, since `re8_make_interface` mints
+    // `InetAddress`es of its own.
+    if let Some((_, ip)) = inet_addr_get_raw(this) {
+        if let (_, Some(scope)) = split_addr_scope(&ip) {
+            return Some(scope.to_string());
+        }
+    }
+    let holder6 = match ctx.get_field_by_name(this, "holder6") {
+        Value::Object(Some(h)) => h,
+        _ => return None,
+    };
+    // A named scope interface wins, exactly as the JDK orders it. Read the
+    // `name` FIELD rather than calling `getName()`: every `NetworkInterface`
+    // this VM hands out is a REAL-layout object built through the JDK's own
+    // `(String,int,InetAddress[])` constructor (see `re8_make_interface`), so
+    // the field is there — and an `invoke_virtual` here would run Java, hence
+    // possibly a moving collection, in the middle of a caller that is holding
+    // a Java `String` reference for the base address text.
+    if let Value::Object(Some(nif)) = ctx.get_field_by_name(holder6, "scope_ifname") {
+        if let Value::Object(Some(s)) = ctx.get_field_by_name(nif, "name") {
+            if let Some(name) = ctx.read_string(s) {
+                if !name.is_empty() {
+                    return Some(name);
+                }
+            }
+        }
+    }
+    match ctx.get_field_by_name(holder6, "scope_id_set") {
+        Value::Int(set) if set != 0 => match ctx.get_field_by_name(holder6, "scope_id") {
+            Value::Int(id) => Some(id.to_string()),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// The numeric text of an InetAddress mirror WITH the IPv6 scope suffix —
+/// i.e. what `getHostAddress()` must answer.
+///
+/// Every public renderer goes through here: `getHostAddress()` on all three
+/// registered classes, the `getHostName()` no-name fallback (HotSpot reaches
+/// the same place by failing a reverse lookup and returning `getHostAddress()`)
+/// and `toString()`'s right-hand half. They previously each read `IA_ADDR`
+/// directly and so each dropped the scope independently.
+///
+/// `pub(crate)` for the `phases_early.rs` duplicates of the same three natives.
+pub(crate) fn inet_addr_scoped_text(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    default: &str,
+) -> String {
+    let ip = inet_addr_field_string_or(ctx, this, IA_ADDR, default);
+    match inet6_scope_suffix(ctx, this) {
+        // `contains('%')` guards the (currently unreachable) case of a mirror
+        // whose stored text is already scoped — never append twice.
+        Some(scope) if !ip.is_empty() && !ip.contains('%') => format!("{ip}%{scope}"),
+        _ => ip,
+    }
+}
+
+/// `getHostAddress()` for every InetAddress class we register it on.
+///
+/// `pub(crate)` because the duplicate registration in `phases_early.rs` must
+/// answer identically — `getHostName` had six registrations and the winning
+/// pair was on the concrete subclasses (see
+/// `docs/internal/fixed-suite-bugs/inetaddress-tostring-hostname-literal-addresses-FIXED.md`),
+/// so a scope fix applied to only one of them is invisible half the time.
+pub(crate) fn inet_addr_host_address_value(ctx: &mut dyn NativeContext, this: ObjectRef) -> Value {
+    // `inet_addr_field` keeps the legacy fallback: an address object we never
+    // recorded and that has no `holder` still answers from its raw slot.
+    let base = inet_addr_field(ctx, this, IA_ADDR);
+    let Some(scope) = inet6_scope_suffix(ctx, this) else {
+        return base;
+    };
+    let Value::Object(Some(s)) = base else {
+        return base;
+    };
+    match ctx.read_string(s) {
+        // `contains('%')` never appends twice.
+        Some(text) if !text.is_empty() && !text.contains('%') => {
+            Value::Object(Some(ctx.create_string(&format!("{text}%{scope}"))))
+        }
+        _ => base,
+    }
 }
 
 /// `InetAddress.getHostName()` / `getCanonicalHostName()`.
@@ -1361,7 +1569,11 @@ fn inet_addr_host_name_value(ctx: &mut dyn NativeContext, this: ObjectRef) -> Va
     if !name.is_empty() {
         return Value::Object(Some(ctx.create_string(&name)));
     }
-    let ip = inet_addr_field_string_or(ctx, this, IA_ADDR, "");
+    // The no-name fallback is `getHostAddress()`, scope suffix and all —
+    // `io.netty.channel.unix.NativeInetAddressTest.testLinkOnlyAddressIncludeScopeId`
+    // asserts exactly this through `getHostName()`, not through
+    // `getHostAddress()`.
+    let ip = inet_addr_scoped_text(ctx, this, "");
     Value::Object(Some(ctx.create_string(&ip)))
 }
 
@@ -1613,7 +1825,7 @@ fn jar_entry_value_from_archive<R: std::io::Read + std::io::Seek>(
     ctx: &mut dyn NativeContext,
     archive: &mut zip::ZipArchive<R>,
     lookup: &str,
-) -> Value {
+) -> Result<Value, MethodCallFailed> {
     let (name, size, csize, method) = match archive.by_name(lookup) {
         Ok(entry) => {
             let name = entry.name().to_string();
@@ -1623,15 +1835,15 @@ fn jar_entry_value_from_archive<R: std::io::Read + std::io::Seek>(
             let method = entry.compression().to_u16() as i32;
             (name, size, csize, method)
         }
-        Err(_) => return Value::Object(None),
+        Err(_) => return Ok(Value::Object(None)),
     };
-    let je = alloc_concurrent_synthetic(ctx, "java/util/jar/JarEntry", 4);
+    let je = try_alloc_concurrent_synthetic(ctx, "java/util/jar/JarEntry", 4)?;
     let name_s = ctx.create_string(&name);
     ctx.set_field(je, 0, Value::Object(Some(name_s)));
     ctx.set_field(je, 1, Value::Long(size));
     ctx.set_field(je, 2, Value::Long(csize));
     ctx.set_field(je, 3, Value::Int(method));
-    Value::Object(Some(je))
+    Ok(Value::Object(Some(je)))
 }
 
 /// Parse a `jar:[file:]<path>!/<entry>` external form and return the entry's
@@ -1787,22 +1999,22 @@ fn jmod_zip_entry_name<'a>(disk: &str, entry: &'a str) -> std::borrow::Cow<'a, s
     }
 }
 
-fn jar_url_lookup_entry(ctx: &mut dyn NativeContext, ext: &str) -> Value {
+fn jar_url_lookup_entry(ctx: &mut dyn NativeContext, ext: &str) -> Result<Value, MethodCallFailed> {
     let after = match ext
         .strip_prefix("jar:file:")
         .or_else(|| ext.strip_prefix("jar:"))
     {
         Some(a) => a,
-        None => return Value::Object(None),
+        None => return Ok(Value::Object(None)),
     };
     let mut parts = after.splitn(2, "!/");
     let jar_raw = match parts.next() {
         Some(p) => p.trim_start_matches("file:"),
-        None => return Value::Object(None),
+        None => return Ok(Value::Object(None)),
     };
     let entry_name = match parts.next() {
         Some(e) if !e.is_empty() => e,
-        _ => return Value::Object(None),
+        _ => return Ok(Value::Object(None)),
     };
     // Tomcat `war:` nested-jar case (see `war_nested_jar_bytes`): the jar
     // component is packaged inside a WAR rather than sitting directly on
@@ -1811,9 +2023,9 @@ fn jar_url_lookup_entry(ctx: &mut dyn NativeContext, ext: &str) -> Value {
         let cursor = std::io::Cursor::new(bytes.as_slice());
         let mut archive = match zip::ZipArchive::new(cursor) {
             Ok(a) => a,
-            Err(_) => return Value::Object(None),
+            Err(_) => return Ok(Value::Object(None)),
         };
-        return jar_entry_value_from_archive(ctx, &mut archive, entry_name);
+        return Ok(jar_entry_value_from_archive(ctx, &mut archive, entry_name)?);
     }
     let trimmed = jar_raw.trim_start_matches('/');
     let disk = if std::path::Path::new(trimmed).exists() {
@@ -1825,16 +2037,16 @@ fn jar_url_lookup_entry(ctx: &mut dyn NativeContext, ext: &str) -> Value {
     };
     let file = match std::fs::File::open(&disk) {
         Ok(f) => f,
-        Err(_) => return Value::Object(None),
+        Err(_) => return Ok(Value::Object(None)),
     };
     let mut archive = match zip::ZipArchive::new(file) {
         Ok(a) => a,
-        Err(_) => return Value::Object(None),
+        Err(_) => return Ok(Value::Object(None)),
     };
     // Extract the entry metadata into owned values, then drop the `archive`
     // borrow before doing any `ctx` allocation (mirrors p59_jar_collect_entries).
     let lookup = jmod_zip_entry_name(&disk, entry_name);
-    jar_entry_value_from_archive(ctx, &mut archive, &lookup)
+    Ok(jar_entry_value_from_archive(ctx, &mut archive, &lookup)?)
 }
 
 /// Recover the originating `jar:…!/entry` URL from a synthetic
@@ -2066,25 +2278,55 @@ fn hotspot_ip_string(ip: &str) -> String {
     match ip.parse::<std::net::IpAddr>() {
         Ok(std::net::IpAddr::V6(v6)) => match v6.to_ipv4_mapped() {
             Some(v4) => v4.to_string(),
-            None => v6
-                .segments()
-                .iter()
-                .map(|seg| format!("{seg:x}"))
-                .collect::<Vec<_>>()
-                .join(":"),
+            None => ipv6_uncompressed_text(&v6),
         },
         Ok(std::net::IpAddr::V4(v4)) => v4.to_string(),
         Err(_) => ip.to_string(),
     }
 }
 
-fn alloc_inet_address(ctx: &mut dyn NativeContext, host: &str, ip: &str) -> ObjectRef {
+/// HotSpot's `Inet6Address.numericToTextFormat` — eight 16-bit groups as
+/// minimal lowercase hex joined by `:`, with NO `::` zero-compression and
+/// **no v4-mapped fold**.
+///
+/// Split out of [`hotspot_ip_string`] because the fold is a property of the
+/// *entry point*, not of the address: `getByName` / `InetAddress.getByAddress`
+/// fold a v4-mapped address to an `Inet4Address`, but an object that is
+/// ALREADY an `Inet6Address` — one the real JDK built via
+/// `Inet6Address.getByAddress(String, byte[], int)`, which is not intercepted
+/// — must keep all sixteen bytes. Folding its text made
+/// `inet_addr_address_bytes` re-parse four bytes out of a v6 object, so
+/// `getAddress().length` was 4 on an `instanceof Inet6Address` receiver:
+/// internally inconsistent, and `io.netty.util.NetUtil.toAddressString`
+/// indexes 16 (`ArrayIndexOutOfBoundsException: Index 4 out of bounds for
+/// length 4`, `NetUtilTest.testIpv4MappedIp6GetByName`).
+fn ipv6_uncompressed_text(v6: &std::net::Ipv6Addr) -> String {
+    v6.segments()
+        .iter()
+        .map(|seg| format!("{seg:x}"))
+        .collect::<Vec<_>>()
+        .join(":")
+}
+
+fn alloc_inet_address(ctx: &mut dyn NativeContext, host: &str, ip: &str) -> Result<ObjectRef, MethodCallFailed> {
+    // An IPv6 `%scope` travels with the address text through every caller
+    // (`getByName("fe80::1%eth0")`, the `getifaddrs` interface enumeration).
+    // Split it off before normalising — `hotspot_ip_string` parses the text,
+    // and a scoped literal parses as nothing, which used to silently classify
+    // the mirror as an `Inet4Address`.
+    let (ip_bare, scope) = split_addr_scope(ip);
     // Canonicalise the address string to HotSpot's exact textual form (v4-mapped
     // fold + uncompressed IPv6) — see [`hotspot_ip_string`] — so the mirror is an
     // `Inet4Address` with a 4-byte `getAddress()` where appropriate and
     // `getHostAddress()` is byte-identical to HotSpot.
-    let ip_norm = hotspot_ip_string(ip);
+    let ip_norm = hotspot_ip_string(ip_bare);
     let ip = ip_norm.as_str();
+    // A scope only exists on IPv6. A v4-mapped address folded to a dotted quad
+    // above is an `Inet4Address` now and must not keep one.
+    let scope = match ip.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V6(_)) => scope,
+        _ => None,
+    };
     // Allocate the *concrete* address class so `instanceof Inet4Address`
     // checks (e.g. Hazelcast's `DefaultAddressPicker`) and virtual dispatch
     // resolve correctly. A bare `InetAddress` is abstract in real-JDK.
@@ -2092,14 +2334,21 @@ fn alloc_inet_address(ctx: &mut dyn NativeContext, host: &str, ip: &str) -> Obje
         Ok(std::net::IpAddr::V6(_)) => "java/net/Inet6Address",
         _ => "java/net/Inet4Address",
     };
-    let ia = alloc_concurrent_synthetic(ctx, class_name, 2);
+    let ia = try_alloc_concurrent_synthetic(ctx, class_name, 2)?;
     // Record host/IP in the ObjectRef-keyed side table — source of truth for
     // the natives we override. Do NOT write bare Strings into instance slots
     // 0/1: those are the real-JDK `holder` reference fields, and a String
     // there poisons real-JDK InetAddress bytecode dispatch (bogus
     // `NoSuchMethodError java/lang/String.getHostName()`). See
     // `inet_addr_side_table()` for the full rationale.
-    inet_addr_set(ia, host, ip);
+    //
+    // The scope goes back onto the stored text; `inet_addr_resolve` splits it
+    // off again for every address consumer, and only `inet6_scope_suffix`
+    // reads it (see [`split_addr_scope`]).
+    match scope {
+        Some(s) => inet_addr_set(ia, host, &format!("{ip}%{s}")),
+        None => inet_addr_set(ia, host, ip),
+    }
     // Additionally populate a *real* `InetAddress$InetAddressHolder` so any
     // un-overridden real-JDK `InetAddress` / `Inet4Address` bytecode (the
     // `final` `getHostName()` accessor, `toString()`, …) reads a consistent
@@ -2111,7 +2360,7 @@ fn alloc_inet_address(ctx: &mut dyn NativeContext, host: &str, ip: &str) -> Obje
     // on the pre-GC identity, but that table is a scanned+remapped root
     // (`gc_scan_inet_addr_roots` / `gc_update_inet_addr_refs`), so it follows
     // the relocation on its own.
-    populate_inet_holder(ctx, ia, host, ip)
+    Ok(populate_inet_holder(ctx, ia, host, ip, scope)?)
 }
 
 /// `InetAddress.getByAddress(byte[])` — construct a concrete, layout-correct
@@ -2151,11 +2400,11 @@ fn native_inet_get_by_address(
     // must not remember one — HotSpot prints `/1.2.3.4`. The two-argument
     // factory `getByAddress(String, byte[])` is a different method and keeps
     // its host, however bogus (it is never resolved).
-    let obj = alloc_inet_address_unnamed(ctx, &ip_text);
+    let obj = alloc_inet_address_unnamed(ctx, &ip_text)?;
     Ok(Some(Value::Object(Some(obj))))
 }
 
-fn alloc_inet_socket_address(ctx: &mut dyn NativeContext, host: &str, port: i32) -> ObjectRef {
+fn alloc_inet_socket_address(ctx: &mut dyn NativeContext, host: &str, port: i32) -> Result<ObjectRef, MethodCallFailed> {
     // Wave 3-B² (RE.4): the real JDK `InetSocketAddress.getPort()` is
     //     getfield  holder
     //     invokevirtual InetSocketAddressHolder.getPort()
@@ -2173,13 +2422,13 @@ fn alloc_inet_socket_address(ctx: &mut dyn NativeContext, host: &str, port: i32)
     // are rooted and re-read before every write. See `populate_inet_holder`
     // for the failure this shape produced when it was missing.
     let mut scope = NativeHandleScope::new(ctx);
-    let isa = alloc_concurrent_synthetic(&mut *scope, "java/net/InetSocketAddress", 2);
+    let isa = try_alloc_concurrent_synthetic(&mut *scope, "java/net/InetSocketAddress", 2)?;
     let isa_h = scope.root(isa);
-    let holder = alloc_concurrent_synthetic(
+    let holder = try_alloc_concurrent_synthetic(
         &mut *scope,
         "java/net/InetSocketAddress$InetSocketAddressHolder",
         3,
-    );
+    )?;
     let holder_h = scope.root(holder);
     let h = scope.create_string(host);
     let holder_cur = scope.get(&holder_h);
@@ -2189,7 +2438,7 @@ fn alloc_inet_socket_address(ctx: &mut dyn NativeContext, host: &str, port: i32)
     let isa_cur = scope.get(&isa_h);
     scope.set_field(isa_cur, ISA_HOST, Value::Object(Some(holder_cur)));
     scope.set_field(isa_cur, ISA_PORT, Value::Int(port));
-    isa_cur
+    Ok(isa_cur)
 }
 
 /// Like [`alloc_inet_socket_address`], but populates the holder's `addr`
@@ -2208,23 +2457,23 @@ fn alloc_inet_socket_address_resolved(
     host: &str,
     ip: &str,
     port: i32,
-) -> ObjectRef {
+) -> Result<ObjectRef, MethodCallFailed> {
     // Cross-call GC-safety: see `alloc_inet_socket_address`. `alloc_inet_address`
     // in particular runs class initialisation on a cold VM, so everything held
     // across it must be rooted.
     let mut scope = NativeHandleScope::new(ctx);
-    let isa = alloc_concurrent_synthetic(&mut *scope, "java/net/InetSocketAddress", 2);
+    let isa = try_alloc_concurrent_synthetic(&mut *scope, "java/net/InetSocketAddress", 2)?;
     let isa_h = scope.root(isa);
-    let holder = alloc_concurrent_synthetic(
+    let holder = try_alloc_concurrent_synthetic(
         &mut *scope,
         "java/net/InetSocketAddress$InetSocketAddressHolder",
         3,
-    );
+    )?;
     let holder_h = scope.root(holder);
     let h = scope.create_string(host);
     let h_h = scope.root(h);
     let addr = alloc_inet_address(&mut *scope, host, ip);
-    let addr_h = scope.root(addr);
+    let addr_h = scope.root(addr?);
     let holder_cur = scope.get(&holder_h);
     let h_cur = scope.get(&h_h);
     let addr_cur = scope.get(&addr_h);
@@ -2234,7 +2483,7 @@ fn alloc_inet_socket_address_resolved(
     let isa_cur = scope.get(&isa_h);
     scope.set_field(isa_cur, ISA_HOST, Value::Object(Some(holder_cur)));
     scope.set_field(isa_cur, ISA_PORT, Value::Int(port));
-    isa_cur
+    Ok(isa_cur)
 }
 
 fn resolve_host(host: &str) -> Result<IpAddr, cratonvm_types::error::MethodCallFailed> {
@@ -2325,14 +2574,42 @@ pub fn register_phase_e_networking(registry: &mut NativeMethodRegistry) {
 // We register our own implementations that parse the raw URI string stored
 // at field 6 of our synthetic URI objects (scheme=0, host=1, port=2,
 // path=3, query=4, fragment=5, raw=6).
+//
+// JDK-ONLY-LAYOUT: that seven-slot model is a FABRICATION and none of its
+// indices survive on a real `java.net.URI`, which declares
+// `scheme, fragment, authority, userInfo, host, port, path, query, …`. So
+// every raw-slot access below is gated on [`uri_has_synthetic_layout`], asked
+// by NAME. Measured 2026-08-10 with `CRATONVM_DBG=overlay,overlay-all`:
+// eleven reads of slot 6 (`path`) and three of slot 2 (`authority`) per run of
+// `probes/W2ResidualCensusProbe`, all on real-layout receivers.
 // ===========================================================================
 
-/// Read the raw URI string from a synthetic URI object.
-/// Tries field 6 (alternate "raw" slot used by some JDK-shaped synthetics),
-/// then field 5 (`URL_FIELD_FULL` from `url_parse` / `native_url_to_uri`),
-/// then field 0 only when it looks like a complete URI (contains `:` after
-/// the scheme), so we don't mistake a bare `"file"` scheme token for the
-/// full `file:/C:/...` string.
+/// Does `uri` have OUR fabricated seven-slot `java/net/URI` layout rather than
+/// the real class's?
+///
+/// Asked by NAME, never by field count: `alloc_concurrent_synthetic` returns at
+/// least the requested slot count either way, and `define_class_with_options`
+/// pads a real `URI` up to the model's width, so a count test cannot separate
+/// the two layouts. That mistake shipped completely inert once already, in the
+/// first `VarHandle` guard.
+///
+/// A real `java.net.URI` declares `schemeSpecificPart`; a VM-fabricated stub has
+/// generated `_fN` placeholders and declares nothing of the sort.
+pub(crate) fn uri_has_synthetic_layout(ctx: &dyn NativeContext, uri: ObjectRef) -> bool {
+    let class_id = ctx.class_id_of_object(uri);
+    !ctx
+        .declared_fields(class_id)
+        .iter()
+        .any(|f| !f.is_static && f.name == "schemeSpecificPart")
+}
+
+/// Read the raw URI string from a URI object.
+///
+/// The real-JDK `string` field is tried first, by name. The raw-slot fallbacks
+/// (field 6, then 5, then 0) address OUR fabricated model and are reached only
+/// when the receiver actually has it — on a real `java.net.URI` slot 6 is
+/// `path` and slot 5 is `port`, so reading them answers the wrong field and,
+/// for slot 5, a primitive where a `String` was expected.
 pub(crate) fn uri_raw_string(ctx: &dyn NativeContext, uri: ObjectRef) -> String {
     // Real-JDK `java.net.URI` caches its full text in the `string` field.
     // Reading it by NAME works regardless of the instance-field slot order
@@ -2343,6 +2620,9 @@ pub(crate) fn uri_raw_string(ctx: &dyn NativeContext, uri: ObjectRef) -> String 
                 return r;
             }
         }
+    }
+    if !uri_has_synthetic_layout(ctx, uri) {
+        return String::new();
     }
     for &idx in &[6usize, 5usize] {
         match ctx.get_field(uri, idx) {
@@ -2365,6 +2645,88 @@ pub(crate) fn uri_raw_string(ctx: &dyn NativeContext, uri: ObjectRef) -> String 
             String::new()
         }
         _ => String::new(),
+    }
+}
+
+/// The `//authority` component of `uri`, or `None` when it has none.
+///
+/// The raw string is authoritative — it is what every sibling accessor in this
+/// registrar parses — with the real class's own `authority` field as the
+/// fallback for a `java.net.URI` that arrived fully constructed from real
+/// bytecode and never cached its text.
+///
+/// An EMPTY authority is `None`, not `Some("")`: `new URI("file:///tmp/x")`
+/// has a zero-length authority between the `//` and the path, and both the JDK
+/// and this VM must answer `null` for it.
+pub(crate) fn uri_authority_component(ctx: &dyn NativeContext, uri: ObjectRef) -> Option<String> {
+    let raw = uri_raw_string(ctx, uri);
+    if !raw.is_empty() {
+        return uri_split(&raw).1.filter(|a| !a.is_empty());
+    }
+    match ctx.get_field_by_name(uri, "authority") {
+        Value::Object(Some(s)) => ctx.read_string(s).filter(|a| !a.is_empty()),
+        _ => None,
+    }
+}
+
+/// The connection-relevant components of a `java.net.URI`, read WITHOUT a
+/// hand-numbered slot index.
+///
+/// `native-builtins/src/http2.rs` and `native-builtins/src/servlet.rs` each
+/// carried an identical private copy of the fabricated
+/// `scheme=0, host=1, port=2, path=3, query=4` model and read their URI
+/// receivers through it. Two copies of a layout is how the
+/// `real_protected_stub` allow-lists drifted, and on a real `java.net.URI`
+/// every one of those indices names a different field (`fragment`,
+/// `authority`, `userInfo`, `host`), so the readers were reporting the wrong
+/// component with no fault and no log line — an HTTP client dialling the
+/// fragment as its host.
+///
+/// One helper, parsing the same raw string the registered accessors parse, so
+/// there is no second model left to drift.
+pub(crate) struct UriComponents {
+    pub scheme: Option<String>,
+    pub host: Option<String>,
+    /// `-1` when the URI carries no explicit port, matching `URI.getPort()`.
+    pub port: i32,
+    pub path: String,
+    pub query: Option<String>,
+}
+
+pub(crate) fn uri_components(ctx: &dyn NativeContext, uri: ObjectRef) -> UriComponents {
+    let raw = uri_raw_string(ctx, uri);
+    if !raw.is_empty() {
+        let (scheme, authority, path, query, _) = uri_split(&raw);
+        let (host, port) = match authority.as_deref() {
+            Some(a) if !a.is_empty() => {
+                let (_, h, p) = uri_parse_authority(a);
+                (h, p)
+            }
+            _ => (None, -1),
+        };
+        return UriComponents {
+            scheme,
+            host,
+            port,
+            path,
+            query,
+        };
+    }
+    // No cached text: a real `java.net.URI` built by real bytecode. Its own
+    // fields are the answer, by name.
+    let str_field = |name: &str| match ctx.get_field_by_name(uri, name) {
+        Value::Object(Some(s)) => ctx.read_string(s).filter(|v| !v.is_empty()),
+        _ => None,
+    };
+    UriComponents {
+        scheme: str_field("scheme"),
+        host: str_field("host"),
+        port: match ctx.get_field_by_name(uri, "port") {
+            Value::Int(p) => p,
+            _ => -1,
+        },
+        path: str_field("path").unwrap_or_default(),
+        query: str_field("query"),
     }
 }
 
@@ -2759,7 +3121,7 @@ fn uri_merge_paths(base_path: &str, ref_path: &str, base_has_authority: bool) ->
 }
 
 /// RFC 3986 §5.2.4 — remove `.` and `..` segments from a path.
-fn uri_remove_dot_segments(path: &str) -> String {
+fn uri_remove_dot_segments(path: &str) -> Result<String, MethodCallFailed> {
     let absolute = path.starts_with('/');
     // A path whose final segment is "." or ".." resolves to a directory, so
     // the output must end with '/' (RFC 3986 §5.2.4 behaviour, matches JDK).
@@ -2783,12 +3145,12 @@ fn uri_remove_dot_segments(path: &str) -> String {
     if trailing_slash && !result.ends_with('/') {
         result.push('/');
     }
-    result
+    Ok(result)
 }
 
 /// Split a URI string into (scheme, authority, path, query, fragment).
 /// `authority` is `None` when the URI has no `//` authority component.
-fn uri_split(
+pub(crate) fn uri_split(
     s: &str,
 ) -> (
     Option<String>,
@@ -2906,15 +3268,15 @@ fn uri_host_is_valid(host: &str) -> bool {
 }
 
 /// RFC 3986 §5.2 — resolve a reference against a base URI string.
-fn uri_resolve_ref(base: &str, reference: &str) -> String {
+fn uri_resolve_ref(base: &str, reference: &str) -> Result<String, MethodCallFailed> {
     if reference.is_empty() {
-        return base.to_string();
+        return Ok(base.to_string());
     }
     let (r_scheme, r_auth, r_path, r_query, r_frag) = uri_split(reference);
     // Reference has a scheme → it is absolute, return as-is (normalized).
     if r_scheme.is_some() {
-        let path = uri_remove_dot_segments(&r_path);
-        return uri_recompose(&r_scheme, &r_auth, &path, &r_query, &r_frag);
+        let path = uri_remove_dot_segments(&r_path)?;
+        return Ok(uri_recompose(&r_scheme, &r_auth, &path, &r_query, &r_frag));
     }
     let (b_scheme, b_auth, b_path, b_query, _b_frag) = uri_split(base);
     let (t_auth, t_path, t_query);
@@ -2924,7 +3286,7 @@ fn uri_resolve_ref(base: &str, reference: &str) -> String {
         t_query = r_query;
     } else if r_path.is_empty() {
         t_auth = b_auth.clone();
-        t_path = b_path.clone();
+        t_path = Ok(b_path.clone());
         t_query = r_query.or(b_query);
     } else {
         t_auth = b_auth.clone();
@@ -2936,7 +3298,7 @@ fn uri_resolve_ref(base: &str, reference: &str) -> String {
         }
         t_query = r_query;
     }
-    uri_recompose(&b_scheme, &t_auth, &t_path, &t_query, &r_frag)
+    Ok(uri_recompose(&b_scheme, &t_auth, &t_path?, &t_query, &r_frag))
 }
 
 /// RFC 3986 §5.3 — recompose component parts into a URI string.
@@ -2974,9 +3336,41 @@ fn uri_recompose(
 /// real `java.net.URI` slot layout — writing by raw slot index would clobber
 /// e.g. the `path` field (real URI slot 6) with the full URI string and
 /// break `getPath()`/`new File(URI)`.
-fn make_uri(ctx: &mut dyn NativeContext, raw: &str) -> ObjectRef {
-    let uri_obj = alloc_concurrent_synthetic(ctx, "java/net/URI", 18);
+fn make_uri(ctx: &mut dyn NativeContext, raw: &str) -> Result<ObjectRef, MethodCallFailed> {
+    let uri_obj = try_alloc_concurrent_synthetic(ctx, "java/net/URI", 18)?;
+    uri_publish_named(ctx, uri_obj, raw, None);
+    Ok(uri_obj)
+}
+
+/// Write a URI's components into `uri_obj` under the names the real
+/// `java.net.URI` declares.
+///
+/// JDK-ONLY-LAYOUT. Eleven sites in four files allocate a `java/net/URI` and
+/// then stamp its components in by RAW SLOT INDEX, under three mutually
+/// inconsistent fabricated models (`raw@0 scheme@1 path@4`, `raw@0 raw@4`, and
+/// the `scheme@0 host@1 port@2 path@3 query@4` block that `http2.rs` and
+/// `servlet.rs` used to read). In real-JDK mode every one of those objects is a
+/// genuine `java.net.URI` whose slots are `scheme, fragment, authority,
+/// userInfo, host, port, path, query`, so each write landed on a different
+/// field than it named. It went unnoticed because the accessors read the SAME
+/// wrong slots back: writer and reader agreed, and the object was wrong only
+/// from real bytecode's point of view — which is precisely what
+/// `URI.getAuthority()` is.
+///
+/// `path_override` is for the callers that know a better path than the generic
+/// split produces (a `jar:` inner entry, a Windows drive-letter path).
+///
+/// This function writes ONLY by name. Its callers keep their raw-slot writes
+/// for a receiver that genuinely has a fabricated layout, asked by NAME through
+/// [`uri_has_synthetic_layout`].
+pub(crate) fn uri_publish_named(
+    ctx: &mut dyn NativeContext,
+    uri_obj: ObjectRef,
+    raw: &str,
+    path_override: Option<&str>,
+) {
     let (scheme, authority, path, query, fragment) = uri_split(raw);
+    let path = path_override.map_or(path, str::to_string);
     let ssp = {
         let mut s = String::new();
         if let Some(a) = &authority {
@@ -2990,34 +3384,58 @@ fn make_uri(ctx: &mut dyn NativeContext, raw: &str) -> ObjectRef {
         }
         s
     };
-    let raw_s = ctx.create_string(raw);
-    // `string` — the volatile full-text cache `uri_raw_string` reads first.
-    ctx.set_field_by_name(uri_obj, "string", Value::Object(Some(raw_s)));
-    let set = |ctx: &mut dyn NativeContext, name: &str, val: &Option<String>| {
+    // Pin across the whole publish. Every `put` below allocates a String, and a
+    // moving young GC there relocates `uri_obj` and leaves this raw ref stale —
+    // it then resolves to a reused, usually `java/lang/Object`, slot, and the
+    // component lands on a stranger. `make_uri` carried that exposure for one
+    // caller; this function now has eleven, so the pin belongs here rather than
+    // at each of them. `read_native_pin` is handle-authoritative: the stale
+    // local is only its out-of-range fallback.
+    let pin = ctx.pin_native_root(uri_obj);
+    let put = |ctx: &mut dyn NativeContext, name: &str, v: &str| {
+        let s = ctx.create_string(v);
+        let obj = ctx.read_native_pin(pin, uri_obj);
+        ctx.set_field_by_name(obj, name, Value::Object(Some(s)));
+    };
+    let put_opt = |ctx: &mut dyn NativeContext, name: &str, val: &Option<String>| {
         if let Some(v) = val {
             let s = ctx.create_string(v);
-            ctx.set_field_by_name(uri_obj, name, Value::Object(Some(s)));
+            let obj = ctx.read_native_pin(pin, uri_obj);
+            ctx.set_field_by_name(obj, name, Value::Object(Some(s)));
         }
     };
-    set(ctx, "scheme", &scheme);
-    set(ctx, "authority", &authority);
-    set(ctx, "query", &query);
-    set(ctx, "fragment", &fragment);
+
+    // `string` — the volatile full-text cache `uri_raw_string` reads first.
+    put(ctx, "string", raw);
+    put_opt(ctx, "scheme", &scheme);
+    put_opt(ctx, "authority", &authority);
+    put_opt(ctx, "query", &query);
+    put_opt(ctx, "fragment", &fragment);
     if !path.is_empty() {
-        let p = ctx.create_string(&path);
-        ctx.set_field_by_name(uri_obj, "path", Value::Object(Some(p)));
-        let dp = ctx.create_string(&path);
-        ctx.set_field_by_name(uri_obj, "decodedPath", Value::Object(Some(dp)));
+        put(ctx, "path", &path);
+        put(ctx, "decodedPath", &path);
     }
-    let ssp_s = ctx.create_string(&ssp);
-    ctx.set_field_by_name(uri_obj, "schemeSpecificPart", Value::Object(Some(ssp_s)));
-    let dssp = ctx.create_string(&ssp);
-    ctx.set_field_by_name(
-        uri_obj,
-        "decodedSchemeSpecificPart",
-        Value::Object(Some(dssp)),
-    );
-    uri_obj
+    put(ctx, "schemeSpecificPart", &ssp);
+    put(ctx, "decodedSchemeSpecificPart", &ssp);
+    // `host`, `userInfo` and `port` come out of the authority, and a real
+    // `java.net.URI` declares all three. Writing them keeps a receiver that
+    // real bytecode reads directly consistent with what the accessors answer.
+    let port = match authority.as_deref().filter(|a| !a.is_empty()) {
+        Some(a) => {
+            let (user_info, host, port) = uri_parse_authority(a);
+            if let Some(h) = host {
+                put(ctx, "host", &h);
+            }
+            if let Some(u) = user_info {
+                put(ctx, "userInfo", &u);
+            }
+            port
+        }
+        None => -1,
+    };
+    let obj = ctx.read_native_pin(pin, uri_obj);
+    ctx.set_field_by_name(obj, "port", Value::Int(port));
+    ctx.unpin_native_roots(pin);
 }
 
 fn register_uri_natives(r: &mut NativeMethodRegistry) {
@@ -3041,11 +3459,16 @@ fn register_uri_natives(r: &mut NativeMethodRegistry) {
                 }
             }
         }
-        // Fast path: scheme field (0) if it was set during construction.
-        if let Value::Object(Some(s)) = ctx.get_field(this, 0) {
-            if let Some(v) = ctx.read_string(s) {
-                if !v.is_empty() && !v.contains(':') {
-                    return Ok(Some(Value::Object(Some(ctx.create_string(&v)))));
+        // Fast path: OUR model's scheme slot (0) if it was set during
+        // construction. Slot 0 happens to be `scheme` on a real `URI` too, but
+        // the guard stays: this is the fabricated model's index, and it is the
+        // model that must own it.
+        if uri_has_synthetic_layout(ctx, this) {
+            if let Value::Object(Some(s)) = ctx.get_field(this, 0) {
+                if let Some(v) = ctx.read_string(s) {
+                    if !v.is_empty() && !v.contains(':') {
+                        return Ok(Some(Value::Object(Some(ctx.create_string(&v)))));
+                    }
                 }
             }
         }
@@ -3186,8 +3609,18 @@ fn register_uri_natives(r: &mut NativeMethodRegistry) {
             return Ok(Some(host));
         }
         // No authority section in the raw string → fall back to an explicit host
-        // slot set during construction.
-        if let Value::Object(Some(s)) = ctx.get_field(this, 1) {
+        // slot set during construction. Slot 1 is OUR model's `host`; on a real
+        // `java.net.URI` it is `fragment`, so ask before reading it, and prefer
+        // the real class's own `host` field when the receiver has one.
+        if uri_has_synthetic_layout(ctx, this) {
+            if let Value::Object(Some(s)) = ctx.get_field(this, 1) {
+                if let Some(v) = ctx.read_string(s) {
+                    if !v.is_empty() {
+                        return Ok(Some(Value::Object(Some(ctx.create_string(&v)))));
+                    }
+                }
+            }
+        } else if let Value::Object(Some(s)) = ctx.get_field_by_name(this, "host") {
             if let Some(v) = ctx.read_string(s) {
                 if !v.is_empty() {
                     return Ok(Some(Value::Object(Some(ctx.create_string(&v)))));
@@ -3201,7 +3634,16 @@ fn register_uri_natives(r: &mut NativeMethodRegistry) {
     // authority. Absent port is -1 (java.net.URI contract), not the int-default 0.
     r.register(uri, "getPort", "()I", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        if let Value::Int(p) = ctx.get_field(this, 2) {
+        // Slot 2 is OUR model's `port`; on a real `java.net.URI` it is
+        // `authority`, a `String`, so this read used to answer a reference
+        // where an `Int` was expected on every real-layout receiver.
+        if uri_has_synthetic_layout(ctx, this) {
+            if let Value::Int(p) = ctx.get_field(this, 2) {
+                if p > 0 {
+                    return Ok(Some(Value::Int(p)));
+                }
+            }
+        } else if let Value::Int(p) = ctx.get_field_by_name(this, "port") {
             if p > 0 {
                 return Ok(Some(Value::Int(p)));
             }
@@ -3212,6 +3654,38 @@ fn register_uri_natives(r: &mut NativeMethodRegistry) {
             return Ok(Some(Value::Int(port)));
         }
         Ok(Some(Value::Int(-1)))
+    });
+
+    // getAuthority() / getRawAuthority() → the `//authority` component.
+    //
+    // These were the two accessors in the family with NO native, so they fell
+    // through to real `java.net.URI` bytecode, which reads the `authority`
+    // field — and `native_uri_init`/`uri_store_named` never wrote it. Measured
+    // 2026-08-10 against Temurin 25.0.3:
+    // `new URI("http://user:pw@example.com:8080/a/b?q=1#frag").getAuthority()`
+    // answered **null** where HotSpot answers `user:pw@example.com:8080`. It is
+    // the same shape as `getUserInfo` before it was registered, and the same
+    // parse: authority is whatever `uri_split` puts between `//` and the path.
+    //
+    // `getAuthority` returns the DECODED form and `getRawAuthority` the literal
+    // one, exactly as the JDK's `decodedAuthority`/`authority` pair does; for an
+    // authority with no escapes the two coincide.
+    r.register(uri, "getAuthority", "()Ljava/lang/String;", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        Ok(Some(match uri_authority_component(ctx, this) {
+            Some(a) => {
+                let decoded = uri_percent_decode(&a);
+                Value::Object(Some(ctx.create_string(&decoded)))
+            }
+            None => Value::Object(None),
+        }))
+    });
+    r.register(uri, "getRawAuthority", "()Ljava/lang/String;", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        Ok(Some(match uri_authority_component(ctx, this) {
+            Some(a) => Value::Object(Some(ctx.create_string(&a))),
+            None => Value::Object(None),
+        }))
     });
 
     // getUserInfo() → decoded user-information from the raw authority. Was
@@ -3452,7 +3926,7 @@ fn register_uri_natives(r: &mut NativeMethodRegistry) {
             );
         }
         // Build a simple 13-field synthetic URL (same layout as p59_alloc_url).
-        let url = alloc_concurrent_synthetic(ctx, "java/net/URL", 13);
+        let url = try_alloc_concurrent_synthetic(ctx, "java/net/URL", 13)?;
         let file = if proto.is_empty() {
             &raw[..]
         } else {
@@ -3567,7 +4041,7 @@ fn register_uri_natives(r: &mut NativeMethodRegistry) {
         if opaque || path.is_empty() {
             return Ok(Some(Value::Object(Some(this))));
         }
-        let mut norm = uri_remove_dot_segments(&path);
+        let mut norm = uri_remove_dot_segments(&path)?;
         // For a relative path whose first segment ends up containing a ':',
         // prefix "./" so it cannot be re-parsed as a scheme (JDK does the same).
         if scheme.is_none() && authority.is_none() && !norm.starts_with('/') {
@@ -3584,7 +4058,7 @@ fn register_uri_natives(r: &mut NativeMethodRegistry) {
             return Ok(Some(Value::Object(Some(this))));
         }
         let recomposed = uri_recompose(&scheme, &authority, &norm, &query, &fragment);
-        Ok(Some(Value::Object(Some(make_uri(ctx, &recomposed)))))
+        Ok(Some(Value::Object(Some(make_uri(ctx, &recomposed)?))))
     });
 
     // resolve(URI) → RFC 3986 §5.2 reference resolution. The previous
@@ -3604,8 +4078,8 @@ fn register_uri_natives(r: &mut NativeMethodRegistry) {
                 Some(Value::Object(Some(o))) => uri_raw_string(ctx, *o),
                 _ => return Ok(Some(Value::Object(Some(this)))),
             };
-            let resolved = uri_resolve_ref(&base, &reference);
-            Ok(Some(Value::Object(Some(make_uri(ctx, &resolved)))))
+            let resolved = uri_resolve_ref(&base, &reference)?;
+            Ok(Some(Value::Object(Some(make_uri(ctx, &resolved)?))))
         },
     );
 
@@ -3622,8 +4096,8 @@ fn register_uri_natives(r: &mut NativeMethodRegistry) {
                 Some(Value::Object(Some(o))) => ctx.read_string(*o).unwrap_or_default(),
                 _ => return Ok(Some(Value::Object(Some(this)))),
             };
-            let resolved = uri_resolve_ref(&base, &reference);
-            Ok(Some(Value::Object(Some(make_uri(ctx, &resolved)))))
+            let resolved = uri_resolve_ref(&base, &reference)?;
+            Ok(Some(Value::Object(Some(make_uri(ctx, &resolved)?))))
         },
     );
 
@@ -3653,21 +4127,21 @@ fn register_uri_natives(r: &mut NativeMethodRegistry) {
             {
                 return Ok(Some(Value::Object(Some(other))));
             }
-            let b_norm = uri_remove_dot_segments(&b_path);
-            let t_norm = uri_remove_dot_segments(&t_path);
+            let b_norm = uri_remove_dot_segments(&b_path)?;
+            let t_norm = uri_remove_dot_segments(&t_path)?;
             if !t_norm.starts_with(&b_norm) {
                 return Ok(Some(Value::Object(Some(other))));
             }
             let rel = &t_norm[b_norm.len()..];
             if rel.is_empty() {
-                return Ok(Some(Value::Object(Some(make_uri(ctx, "")))));
+                return Ok(Some(Value::Object(Some(make_uri(ctx, "")?))));
             }
             if !b_norm.ends_with('/') && !rel.starts_with('/') {
                 return Ok(Some(Value::Object(Some(other))));
             }
             let rel = rel.strip_prefix('/').unwrap_or(rel);
             let recomposed = uri_recompose(&None, &None, rel, &t_query, &t_frag);
-            Ok(Some(Value::Object(Some(make_uri(ctx, &recomposed)))))
+            Ok(Some(Value::Object(Some(make_uri(ctx, &recomposed)?))))
         },
     );
 
@@ -3717,14 +4191,201 @@ fn register_uri_natives(r: &mut NativeMethodRegistry) {
                     "Expected scheme-specific part at index {pos}: {s}"
                 )));
             }
-            Ok(Some(Value::Object(Some(make_uri(ctx, &s)))))
+            Ok(Some(Value::Object(Some(make_uri(ctx, &s)?))))
         },
     );
+    ()
 }
 
 // ===========================================================================
 // RE.1 — java.net.Socket
 // ===========================================================================
+
+/// How long a parked `SocketInputStream.read` waits inside one poll before
+/// re-asking the registry whether its socket was closed under it.
+///
+/// A liveness bound, not a latency cost: the poll returns the instant the
+/// socket becomes readable, so payload is never delayed by it — it only bounds
+/// how long a reader stays parked after another thread calls `Socket.close()`.
+/// Same value and same role as `native-io/src/net.rs`'s
+/// `NET_READ_CLOSE_POLL_MS` and `socket_channel.rs`'s `READ_CLOSE_POLL_MS`,
+/// because this is the same loop.
+const RE1_READ_CLOSE_POLL_MS: i32 = 25;
+
+/// The error a parked read reports once its socket has been closed from
+/// another thread. [`re1_socket_read_stream`] maps it to a real
+/// `java.net.SocketException`.
+///
+/// `ErrorKind::Interrupted` is unambiguous at this site because
+/// [`re1_read_retry_eintr`] reissues every real EINTR and
+/// [`re1_socket_poll_readable`] reports one as "not ready" rather than as an
+/// error, so nothing else in this path can produce it. That is the same
+/// argument `socket_channel.rs::channel_async_closed_err` makes for the
+/// channel side.
+fn re1_socket_closed_err() -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::Interrupted, "socket closed")
+}
+
+/// Is `sid` still a live stream?
+///
+/// [`re1_close_socket`] *removes* the entry from `s2_registry().streams` (and
+/// `take_raw_socket_stream_for_tls` moves it out), so this flips exactly when
+/// Java closed the socket. The `net.rs` twin, `net_stream_still_registered`,
+/// tests for a `NetSocketHandle::Closed` marker instead only because that
+/// registry keeps closed slots; the question asked is identical.
+///
+/// The lock is taken for the map lookup alone and is never held across the
+/// poll or the read — the whole reason [`re1_socket_read_stream`] clones the
+/// `Arc` out in the first place (BUG-04 loopback hang).
+fn re1_stream_still_registered(sid: i32) -> bool {
+    s2_registry().lock().streams.contains_key(&sid)
+}
+
+/// One `recv`, reissued for as long as it reports EINTR.
+///
+/// EINTR must never escape to Java: this VM signals its own threads
+/// (`jit::xt_root_scan` SIGUSR2s every thread for a cross-thread root scan),
+/// so a bare `read` surfacing `Interrupted` would look to callers like a
+/// random mid-request connection abort.
+fn re1_read_retry_eintr(stream: &TcpStream, buf: &mut [u8]) -> std::io::Result<usize> {
+    // The std impl is `impl Read for &TcpStream`, so this reads through a
+    // shared stream without excluding a peer writer on the same fd.
+    let mut r = stream;
+    loop {
+        match r.read(buf) {
+            Err(e) if is_eintr(&e) => continue,
+            other => return other,
+        }
+    }
+}
+
+/// A blocking `SocketInputStream.read` that observes an asynchronous
+/// `Socket.close()`.
+///
+/// # Why the plain blocking read could not
+///
+/// `Socket.close()` on another thread reaches [`re1_close_socket`], which drops
+/// the registry's `Arc` and issues `shutdown(Both)` — but it does **not** close
+/// the OS handle, because this reader is holding an `Arc` clone of the very
+/// `TcpStream` the map dropped. HotSpot's answer to the same situation is
+/// `closesocket()` underneath the blocked `recv` (Windows) or `dup2` of a
+/// pre-closed descriptor plus a signal (Unix, `NativeDispatcher.preClose`).
+/// Neither is expressible over an `Arc<TcpStream>` without closing a handle
+/// another thread is mid-syscall on, which is a use-after-close the moment the
+/// OS recycles the number.
+///
+/// `shutdown` is not a substitute, and the platform split is what made this
+/// look like it was already fixed: on Linux `SHUT_RD` does wake a parked `recv`
+/// — with EOF, so the reader answered `-1` rather than throwing — while Winsock
+/// has no `shutdown` that aborts a pending blocking call at all, so on Windows
+/// the reader simply never returned.
+///
+/// So park in `poll` instead of in `recv` and re-ask the registry every
+/// [`RE1_READ_CLOSE_POLL_MS`]. That is not a new mechanism: it is the loop
+/// `net.rs::net_read_close_aware` and `socket_channel.rs::read_close_aware`
+/// landed on 2026-08-07 for the two *real* socket surfaces, and the loop
+/// [`re2_accept_into`] in this same file has used on the accept side since the
+/// MockWebServer teardown fix. This is the third reader that needed it and the
+/// one the 2026-08-07 pass missed, because it is the *synthetic*
+/// `java.net.Socket` surface (`CRATONVM_SYNTHETIC_NET_SOCKETS`) rather than
+/// either of the two the failing tests reached.
+///
+/// # `deadline` is not optional decoration
+///
+/// `Some(dl)` is a live `SO_TIMEOUT`. A wakeup that silently swallowed the
+/// caller's timeout would be the same defect pointed the other way: a
+/// `setSoTimeout(n)` reader would park past its own deadline forever. So the
+/// poll slice is clamped to the time remaining and an expired deadline returns
+/// `TimedOut` — which [`re1_socket_read_stream`] already maps to
+/// `SocketTimeoutException` — rather than merely declining to poll again. The
+/// socket's own `SO_RCVTIMEO` (applied at connect) stays set and remains the
+/// first line; this deadline is what still ends the park on a platform or a
+/// socket state where `SO_RCVTIMEO` does not fire.
+/// `pub(crate)` for `phases_early.rs`'s `java/net/SocketInputStream`, which is
+/// the FOURTH surface of this defect (W2-2). It keys the same `s2_registry()`
+/// `streams` map with the same `sid`, so the mechanism transfers with no
+/// adaptation — which is the reason that surface was converged onto this
+/// function rather than growing a fifth copy of the loop or being deleted.
+pub(crate) fn re1_read_close_aware(
+    sid: i32,
+    stream: &TcpStream,
+    buf: &mut [u8],
+    deadline: Option<std::time::Instant>,
+) -> std::io::Result<usize> {
+    loop {
+        let slice = match deadline {
+            None => RE1_READ_CLOSE_POLL_MS,
+            Some(dl) => {
+                let left = dl.saturating_duration_since(std::time::Instant::now());
+                if left.is_zero() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "Socket read timed out",
+                    ));
+                }
+                // Floor of 1 ms so a sub-millisecond remainder polls once more
+                // instead of spinning on a 0 ms timeout.
+                left.as_millis().clamp(1, RE1_READ_CLOSE_POLL_MS as u128) as i32
+            }
+        };
+        let ready = match re1_socket_poll_readable(stream, slice) {
+            Some(result) => result?,
+            // No poll primitive on this target: fall back to the pre-fix
+            // blocking read, which cannot see the close but at least still
+            // transfers bytes. Spinning on a stub that can never report
+            // readiness would be strictly worse than the bug.
+            None => return re1_read_retry_eintr(stream, buf),
+        };
+        // Asked AFTER the poll, so a close landing while we are parked is seen
+        // on the very next pass — and a close that raced a readiness edge still
+        // wins. That race is safe by construction rather than by luck:
+        // `re1_close_socket` removes the registry entry FIRST and only then
+        // issues `shutdown(Both)`, so by the time the shutdown's own readiness
+        // edge wakes this poll the entry is already gone. Without this check
+        // the Linux path would answer such a read with `-1` — a clean
+        // end-of-stream — where `Socket.close()` mandates a `SocketException`.
+        if !re1_stream_still_registered(sid) {
+            return Err(re1_socket_closed_err());
+        }
+        if !ready {
+            continue;
+        }
+        return re1_read_retry_eintr(stream, buf);
+    }
+}
+
+/// Build a real `java.net.SocketException` carrying `message`.
+///
+/// The concrete type is load-bearing, not decoration. JDK 25's
+/// `java.net.Socket.close()` specifies that "Any thread currently blocked in an
+/// I/O operation upon this socket will throw a SocketException", and callers
+/// catch that type; a `java.io.IOException` whose message merely mentions the
+/// name walks straight past `catch (SocketException e)`. `RuntimeError` has no
+/// `SocketException` variant — only its `ConnectException`/`BindException`/
+/// `SocketTimeoutException` subclasses — so the object has to be constructed,
+/// exactly as [`re1_socket_write_stream`] below already does for a peer reset.
+/// Falls back to a plain IOException if the class cannot be built.
+/// `pub(crate)` for the same reason as [`re1_read_close_aware`]: the close
+/// carrier is worthless without the concrete `java.net.SocketException` at the
+/// end of it, and `RuntimeError` has no variant for that type.
+pub(crate) fn re1_socket_exception(
+    ctx: &mut dyn NativeContext,
+    message: &str,
+) -> MethodCallFailed {
+    let jmsg = ctx.create_string(message);
+    match ctx.new_object_initialized(
+        "java/net/SocketException",
+        "(Ljava/lang/String;)V",
+        &[Value::Object(Some(jmsg))],
+    ) {
+        Ok(Some(Value::Object(Some(exc)))) => {
+            let exc_pin = ctx.pin_native_root(exc);
+            let exc = ctx.read_native_pin(exc_pin, exc);
+            MethodCallFailed::ExceptionThrown(exc)
+        }
+        _ => ioex(message.to_string()),
+    }
+}
 
 fn re1_socket_read_stream(
     ctx: &mut dyn NativeContext,
@@ -3748,10 +4409,18 @@ fn re1_socket_read_stream(
             "read out of range: off={off} len={ln} cap={cap}"
         )));
     }
-    let stream_id = sock_get(ctx, this).stream_id;
+    let side = sock_get(ctx, this);
+    let stream_id = side.stream_id;
     if stream_id < 0 {
         return Err(ioex("Socket not connected"));
     }
+    // A live `SO_TIMEOUT` has to bound the park, not just the recv — see
+    // `re1_read_close_aware`'s note on why the deadline is not optional.
+    // Computed here because `sock_get` needs `ctx`, which is not available
+    // inside the blocking region below.
+    let deadline = (side.read_timeout_ms > 0).then(|| {
+        std::time::Instant::now() + Duration::from_millis(side.read_timeout_ms as u64)
+    });
     // Clone the cheap Arc<TcpStream> out under a SHORT lock, then release
     // s2_registry BEFORE the blocking read(). Holding the global registry lock
     // across a blocking read deadlocks every other synthetic-socket operation
@@ -3772,40 +4441,63 @@ fn re1_socket_read_stream(
     };
     let dbg = crate::nbflags().dbg_sock;
     if dbg {
-        eprintln!("[dbg-sock] read: sid={stream_id} want={ln} (blocking on recv...)");
+        // "parking in poll", not "blocking on recv": since the asynchronous-close
+        // fix this read waits on readiness and re-asks the registry every
+        // RE1_READ_CLOSE_POLL_MS. A `[dbg-sock] read:` line with no matching
+        // `got=`/exception is therefore a reader that outlived its close, which
+        // is the exact symptom this line is used to hunt.
+        eprintln!("[dbg-sock] read: sid={stream_id} want={ln} (parking in poll...)");
     }
     let mut tmp = vec![0u8; ln];
     let mut blocked_refs = [Value::Object(Some(buf))];
     ctx.begin_blocking_region();
-    let read_result = loop {
-        match (&*stream).read(&mut tmp) {
-            Err(e)
-                if e.kind() == std::io::ErrorKind::Interrupted || e.raw_os_error() == Some(4) =>
-            {
-                continue
-            }
-            result => break result,
-        }
-    };
+    // Parks in `poll` rather than in `recv`, so a `Socket.close()` on another
+    // thread ends the park. The EINTR retry that used to be written out here
+    // now lives in `re1_read_retry_eintr`, which this calls once the poll says
+    // the socket is readable.
+    let read_result = re1_read_close_aware(stream_id, &stream, &mut tmp, deadline);
     ctx.end_blocking_region_refs(&mut blocked_refs);
 
     let buf = match blocked_refs[0] {
         Value::Object(Some(o)) => o,
         _ => buf,
     };
-    let n = read_result.map_err(|e| match e.kind() {
+    let n = match read_result {
+        Ok(n) => n,
+        // The socket was closed from another thread while this read was parked.
+        // JDK 25 `java.net.Socket.close()`: "Any thread currently blocked in an
+        // I/O operation upon this socket will throw a SocketException." The
+        // message matches what HotSpot actually produces, which is
+        // `NioSocketImpl.endRead`'s `throw new SocketException("Socket closed")`
+        // once the close has moved the impl to `ST_CLOSING`.
+        //
+        // That retyping is why the `net.rs` twin of this fix could get away with
+        // returning a generic error: on the real-JDK surface `endRead` runs in
+        // the `finally` of `implRead` and overwrites whatever text arrived. Here
+        // it cannot — these synthetic natives ARE the impl, `NioSocketImpl` is
+        // never on the path, and nothing downstream will name the type for us.
+        Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {
+            return Err(re1_socket_exception(ctx, "Socket closed"));
+        }
         // SO_RCVTIMEO is reported as TimedOut on Windows and often as
-        // WouldBlock on Unix. Both are Java SocketTimeoutException, not EOF
-        // and not a generic IOException; callers deliberately catch this
-        // concrete type to retry their protocol operation.
-        std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock => {
-            RuntimeError::SocketTimeoutException {
+        // WouldBlock on Unix, and `re1_read_close_aware` raises TimedOut itself
+        // when the `SO_TIMEOUT` deadline expires with the socket still quiet.
+        // All three are Java SocketTimeoutException, not EOF and not a generic
+        // IOException; callers deliberately catch this concrete type to retry
+        // their protocol operation.
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+            ) =>
+        {
+            return Err(RuntimeError::SocketTimeoutException {
                 message: format!("Socket read timed out: {e}"),
             }
-            .into()
+            .into());
         }
-        _ => ioex(format!("Socket read failed: {e}")),
-    })?;
+        Err(e) => return Err(ioex(format!("Socket read failed: {e}"))),
+    };
     if dbg {
         eprintln!("[dbg-sock] read: sid={stream_id} got={n}");
         if crate::nbflags().dbg_sock_bytes && n != 0 {
@@ -3820,6 +4512,92 @@ fn re1_socket_read_stream(
     }
     copy_bytes_into_java_array(ctx, buf, offset, &tmp[..n])?;
     Ok(Some(Value::Int(n as i32)))
+}
+
+/// Largest payload handed to one `send` while a blocking write is sliced.
+///
+/// A blocking-mode `send` of N bytes does not return until all N are queued, so
+/// an unsliced `write_all` parks inside the syscall for an unbounded time and
+/// observes neither the close nor the poll cadence. 8 KiB matches
+/// `socket_channel::WRITE_SLICE_MAX`, whose doc comment carries the measured
+/// evidence (`SendWake.java`, Windows 11, JDK 25.0.3: a writer parked in a
+/// blocking `send` was still parked 6 s after `shutdown(SHUT_WR)`; only closing
+/// the handle woke it). The common protocol frame is smaller than one slice and
+/// is therefore still issued whole.
+const RE1_WRITE_SLICE_MAX: usize = 8 * 1024;
+
+/// A blocking `SocketOutputStream.write` that observes an asynchronous
+/// `Socket.close()` — the write twin of [`re1_read_close_aware`].
+///
+/// The reader on this surface was fixed on 2026-08-11 and the writer beside it
+/// was not, which left the symmetric hole: a thread parked in `write_all`
+/// behind a peer that has stopped reading stays parked through
+/// `Socket.close()`, for exactly the reason the reader did —
+/// [`re1_close_socket`] removes the registry entry and issues `shutdown(Both)`,
+/// but cannot close the OS handle while this writer holds an `Arc` clone of the
+/// `TcpStream`.
+///
+/// # Mechanism, not a second mechanism
+///
+/// Identical loop to [`re1_read_close_aware`]: poll with a bounded slice,
+/// re-ask [`re1_stream_still_registered`] after the poll, return
+/// [`re1_socket_closed_err`] once the slot is gone. Only the direction of the
+/// poll and the slicing differ.
+///
+/// # What a partial transfer answers
+///
+/// A close that lands after some bytes are out returns `Ok(written)`. The
+/// caller's contract here is `write(byte[], int, int)`, which the JDK specifies
+/// as "writes len bytes" — so a short answer is reported to Java as the
+/// `SocketException` the close mandates, not silently swallowed. `written` is
+/// carried in the error path only for the debug line.
+///
+/// # On expiry
+///
+/// The `RE1_READ_CLOSE_POLL_MS` slice expiring is not an outcome — it is the
+/// point at which the registry is re-asked, and the loop continues. There is no
+/// second deadline: `java.net.Socket` has no write timeout, and this surface
+/// records only a `read_timeout_ms`.
+fn re1_write_close_aware(sid: i32, stream: &TcpStream, data: &[u8]) -> std::io::Result<usize> {
+    let mut written: usize = 0;
+    loop {
+        if written == data.len() {
+            return Ok(written);
+        }
+        let ready = match re1_socket_poll_writable(stream, RE1_READ_CLOSE_POLL_MS) {
+            Some(result) => result?,
+            // No poll primitive on this target: the pre-2026-08-12 blocking
+            // write, which cannot see the close but at least still transfers.
+            None => {
+                let mut w = stream;
+                w.write_all(&data[written..])?;
+                return Ok(data.len());
+            }
+        };
+        // Asked AFTER the poll for the reason `re1_read_close_aware` sets out
+        // at length: `re1_close_socket` removes the entry BEFORE it issues the
+        // shutdown, so by the time the shutdown's own readiness edge wakes this
+        // poll the entry is already gone.
+        if !re1_stream_still_registered(sid) {
+            return Err(re1_socket_closed_err());
+        }
+        if !ready {
+            continue;
+        }
+        let end = (written + RE1_WRITE_SLICE_MAX).min(data.len());
+        let mut w = stream;
+        match w.write(&data[written..end]) {
+            Ok(0) => continue,
+            Ok(n) => written += n,
+            // EINTR has written nothing; retry. Same rationale as
+            // `re1_read_retry_eintr`.
+            Err(e) if is_eintr(&e) => continue,
+            // Writable, then not: a concurrent writer on this socket took the
+            // room. Park again rather than report a short write.
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
+            Err(e) => return Err(e),
+        }
+    }
 }
 
 fn re1_socket_write_stream(
@@ -3849,13 +4627,28 @@ fn re1_socket_write_stream(
             .clone()
     };
     ctx.begin_blocking_region();
+    // ASYNCHRONOUS CLOSE (2026-08-12): a bare `write_all` here is the write
+    // twin of the read hole fixed on this surface on 2026-08-11 — a thread
+    // parked behind a peer that has stopped reading never noticed
+    // `Socket.close()`. `re1_write_close_aware` polls for writability, re-asks
+    // the registry, and slices; see its doc comment.
     let write_result = (|| -> std::io::Result<()> {
-        (&*stream).write_all(&data)?;
+        re1_write_close_aware(stream_id, &stream, &data)?;
         (&*stream).flush()?;
         Ok(())
     })();
     ctx.end_blocking_region();
     if let Err(e) = write_result {
+        // A close observed by the loop above arrives as `Interrupted`, which no
+        // other step on this path can produce (`re1_write_close_aware` reissues
+        // every real EINTR and the poll reports one as "not ready"). JDK 25's
+        // `Socket.close()` specifies that a thread blocked in an I/O operation
+        // on the socket throws a `SocketException` — "will", not "may" — and
+        // the concrete type is load-bearing because callers catch it above
+        // `catch (IOException)`.
+        if e.kind() == std::io::ErrorKind::Interrupted {
+            return Err(re1_socket_exception(ctx, "Socket closed"));
+        }
         // Real java.net.Socket write path: a peer-reset/broken-pipe write
         // failure must surface as a real, catchable java.net.SocketException
         // (matching real JDK's SocketOutputStream.socketWrite0) -- callers
@@ -3965,7 +4758,7 @@ fn native_socket_input_stream_read_one(
 /// Returns the (possibly GC-relocated) `this` — callers that keep using the
 /// Socket afterward MUST use the returned value, not their original local.
 #[must_use]
-pub(crate) fn re1_init_socket_locks(ctx: &mut dyn NativeContext, this: ObjectRef) -> ObjectRef {
+pub(crate) fn re1_init_socket_locks(ctx: &mut dyn NativeContext, this: ObjectRef) -> Result<ObjectRef, MethodCallFailed> {
     // GC-safety: `this` is a raw ObjectRef parameter, and `new_object` below
     // is a re-entrant, allocating call (it can trigger a GC). This is called
     // right after a fresh Socket allocation -- for a freshly-accepted Socket
@@ -3986,7 +4779,7 @@ pub(crate) fn re1_init_socket_locks(ctx: &mut dyn NativeContext, this: ObjectRef
     }
     let result = ctx.read_native_pin(pin_base, this);
     ctx.unpin_native_roots(pin_base);
-    result
+    Ok(result)
 }
 
 /// Run `f` against the raw `TcpStream` backing socket-state id `sid`,
@@ -4018,6 +4811,63 @@ fn re1_with_raw_stream<R>(sid: i32, f: impl FnOnce(&TcpStream) -> R) -> Option<R
     None
 }
 
+/// Wait up to `timeout_ms` for `stream` to become **readable**.
+///
+/// `Some(Ok(true))` — readable, or errored/hung up (which the read that
+/// follows then surfaces as the concrete socket error); `Some(Ok(false))` —
+/// the timeout expired; `Some(Err(_))` — the poll itself failed. `None` means
+/// this build has NO poll primitive at all, and is the caller's signal to fall
+/// back to a plain blocking read rather than spin on a stub that answers "not
+/// ready" forever. **That `None` arm is the one a "simplification" deletes and
+/// the one that prevents a livelock**; it is preserved verbatim by
+/// `cratonvm_native_io::net::poll_stream_readable`, which is where the three
+/// `#[cfg]` arms that used to live here now are.
+///
+/// COLLAPSED 2026-08-12, W2-2's out-of-file patch. This file used to carry its
+/// own `poll(2)`/`WSAPoll` binding — inherited from the zero-timeout readiness
+/// probe `SocketInputStream.available()` needs — because the `native-io`
+/// primitive both halves of the asynchronous-close wakeup park in
+/// (`net.rs::net_read_close_aware`, `socket_channel.rs::read_close_aware`) was
+/// `pub(crate)` to that crate and unreachable from here. It is now `pub`, along
+/// with its write twin, so the duplicate is gone rather than kept in agreement
+/// by hand. `native-builtins` already depends on the crate and already calls
+/// `cratonvm_native_io::net::take_stream_for_tls`, so no dependency edge is new.
+///
+/// Three properties survive the collapse unchanged, each of which is a real
+/// difference and not noise:
+///
+/// * the three-state contract above, `None` arm included;
+/// * readiness is `rc > 0`, **not** a `revents & POLLIN` mask test —
+///   POLLERR/POLLHUP/POLLNVAL are delivered whether or not they were requested
+///   and must count as ready, or a reader parks forever on a socket that can
+///   never become readable. `net_poll_raw` answers `Ok(count > 0)` for exactly
+///   that reason. Do not "restore" a mask test on either side;
+/// * EINTR is reported as "not ready", never as an error and never as an
+///   in-place re-poll. `poll(2)` is never auto-restarted by `SA_RESTART` and
+///   this VM signals parked threads on purpose (`jit::xt_root_scan` SIGUSR2s
+///   every thread for a cross-thread root scan), so re-polling in place with the
+///   same `timeout_ms` would restart the whole wait on every GC and silently
+///   defeat [`re1_read_close_aware`]'s `SO_TIMEOUT` deadline.
+///
+/// Still outstanding, and deliberately not attempted here: `servlet.rs` and
+/// `xnio_conduits.rs` hold the crate's other two bindings. `servlet.rs`'s is
+/// `selector_poll` over a `PollReq` **slice**, which the selector needs and this
+/// two-argument primitive cannot express — a genuine third shape rather than a
+/// fourth copy.
+fn re1_socket_poll_readable(stream: &TcpStream, timeout_ms: i32) -> Option<std::io::Result<bool>> {
+    cratonvm_native_io::net::poll_stream_readable(stream, timeout_ms)
+}
+
+/// Wait up to `timeout_ms` for `stream` to become **writable**. Same
+/// three-state contract as [`re1_socket_poll_readable`], and the reason the
+/// collapse needed the pair exported: this file's own binding had grown a
+/// direction parameter, so exporting only the readable half would have forced it
+/// to keep a private copy for the write direction — one site of a two-direction
+/// idiom converted, which is how a duplicate grows back.
+fn re1_socket_poll_writable(stream: &TcpStream, timeout_ms: i32) -> Option<std::io::Result<bool>> {
+    cratonvm_native_io::net::poll_stream_writable(stream, timeout_ms)
+}
+
 /// Zero-timeout OS readability query for a TCP stream.
 ///
 /// Used by `SocketInputStream.available()`, which must never block. A `peek`
@@ -4026,68 +4876,11 @@ fn re1_with_raw_stream<R>(sid: i32, f: impl FnOnce(&TcpStream) -> R) -> Option<R
 /// kernel socket state that neither consumes bytes nor flips the socket's
 /// persistent blocking mode (flipping it would race a concurrent blocking
 /// `read` on the same fd into a spurious `WouldBlock`; see the same rewrite in
-/// `native-api/src/fd_table.rs::tcp_available`). A failed probe reports
-/// not-readable, so `available()` degrades to 0 — the answer it gave
-/// unconditionally before.
-#[cfg(unix)]
+/// `native-api/src/fd_table.rs::tcp_available`). A failed probe — and a target
+/// with no poll at all — reports not-readable, so `available()` degrades to 0,
+/// the answer it gave unconditionally before.
 fn re1_socket_read_ready(stream: &TcpStream) -> bool {
-    use std::os::unix::io::AsRawFd;
-
-    let mut pfd = libc::pollfd {
-        fd: stream.as_raw_fd(),
-        events: libc::POLLIN,
-        revents: 0,
-    };
-    // SAFETY: `pfd` is a single, fully-initialised `pollfd`; `nfds == 1`
-    // matches the one-element buffer; timeout 0 returns immediately.
-    let rc = unsafe { libc::poll(&mut pfd as *mut libc::pollfd, 1 as libc::nfds_t, 0) };
-    if rc <= 0 {
-        return false;
-    }
-    pfd.revents & libc::POLLIN != 0
-}
-
-#[cfg(windows)]
-fn re1_socket_read_ready(stream: &TcpStream) -> bool {
-    use std::os::windows::io::AsRawSocket;
-
-    // `libc` does not re-export `WSAPoll`/`WSAPOLLFD` on Windows. The layout
-    // and signature below are byte-identical to the other `WSAPoll` bindings
-    // in this crate (`servlet.rs`, `xnio_conduits.rs`) —
-    // `clashing_extern_declarations` is a deny-lint here, so any divergence
-    // would fail the build.
-    #[repr(C)]
-    struct Wsapollfd {
-        fd: usize,
-        events: i16,
-        revents: i16,
-    }
-    const WSAPOLLRDNORM: i16 = 0x0100;
-
-    #[link(name = "Ws2_32")]
-    extern "system" {
-        fn WSAPoll(fd_array: *mut Wsapollfd, fds: u32, timeout: i32) -> i32;
-    }
-
-    let mut pfd = Wsapollfd {
-        fd: stream.as_raw_socket() as usize,
-        events: WSAPOLLRDNORM,
-        revents: 0,
-    };
-    // SAFETY: single, fully-initialised WSAPOLLFD; `nfds == 1` matches the
-    // buffer length; timeout 0 returns immediately.
-    let rc = unsafe { WSAPoll(&mut pfd as *mut Wsapollfd, 1, 0) };
-    if rc <= 0 {
-        return false;
-    }
-    pfd.revents & WSAPOLLRDNORM != 0
-}
-
-#[cfg(not(any(unix, windows)))]
-fn re1_socket_read_ready(_stream: &TcpStream) -> bool {
-    // No readiness primitive on this target — report not-readable so
-    // `available()` returns 0 rather than risking a blocking peek.
-    false
+    matches!(re1_socket_poll_readable(stream, 0), Some(Ok(true)))
 }
 
 fn re1_connect_socket(
@@ -4195,14 +4988,14 @@ fn re1_socket_adaptor_inet(
     // one and the numeric text otherwise, so route through the input-sensitive
     // allocator rather than assuming either.
     let ip = host.trim_matches(&['[', ']'][..]);
-    Ok(Some(alloc_inet_address_for_input(ctx, ip, ip)))
+    Ok(Some(alloc_inet_address_for_input(ctx, ip, ip)?))
 }
 
 fn register_re1_socket(r: &mut NativeMethodRegistry) {
     // NIO-SERVER-SOCKET (route 1): skip the synthetic java.net.Socket surface so
     // real bytecode drives sun/nio/ch/Net. See register_phase53_socket_stubs.
     if crate::vmflags().io.real_net_sockets {
-        return;
+        return ();
     }
     let sock = "java/net/Socket";
 
@@ -4660,7 +5453,7 @@ fn register_re1_socket(r: &mut NativeMethodRegistry) {
             let ip = resolve_host(&host)
                 .map(|i| i.to_string())
                 .unwrap_or_else(|_| host.clone());
-            let ia = alloc_inet_address(ctx, &host, &ip);
+            let ia = alloc_inet_address(ctx, &host, &ip)?;
             Ok(Some(Value::Object(Some(ia))))
         },
     );
@@ -4691,7 +5484,7 @@ fn register_re1_socket(r: &mut NativeMethodRegistry) {
             if let Some(addr) = re1_socket_adaptor_inet(ctx, this, true)? {
                 return Ok(Some(Value::Object(Some(addr))));
             }
-            let ia = alloc_inet_address(ctx, "localhost", "127.0.0.1");
+            let ia = alloc_inet_address(ctx, "localhost", "127.0.0.1")?;
             Ok(Some(Value::Object(Some(ia))))
         },
     );
@@ -4711,11 +5504,11 @@ fn register_re1_socket(r: &mut NativeMethodRegistry) {
             // call on the rustls-aware stream adapter instead of treating its
             // high-offset id as a plain raw s2 socket id.
             if sid >= crate::servlet::RUSTLS_SOCK_ID_BASE {
-                let is = alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLSocketInputStream", 1);
+                let is = try_alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLSocketInputStream", 1)?;
                 sock_set_for_create(ctx, is, 0, sid);
                 return Ok(Some(Value::Object(Some(is))));
             }
-            let is = alloc_concurrent_synthetic(ctx, "java/net/Socket$SocketInputStream", 3);
+            let is = try_alloc_concurrent_synthetic(ctx, "java/net/Socket$SocketInputStream", 3)?;
             // Side-table the stream's owner+sid so we don't depend on field
             // layout (real `Socket$SocketInputStream` has different fields
             // than the synthetic shape: `parent:Socket`, `in:InputStream`).
@@ -4734,11 +5527,11 @@ fn register_re1_socket(r: &mut NativeMethodRegistry) {
                 return Err(ioex("Socket.getOutputStream: not connected"));
             }
             if sid >= crate::servlet::RUSTLS_SOCK_ID_BASE {
-                let os = alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLSocketOutputStream", 1);
+                let os = try_alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLSocketOutputStream", 1)?;
                 sock_set_for_create(ctx, os, 0, sid);
                 return Ok(Some(Value::Object(Some(os))));
             }
-            let os = alloc_concurrent_synthetic(ctx, "java/net/Socket$SocketOutputStream", 3);
+            let os = try_alloc_concurrent_synthetic(ctx, "java/net/Socket$SocketOutputStream", 3)?;
             stream_owner_set(ctx, os, this);
             Ok(Some(Value::Object(Some(os))))
         },
@@ -4882,6 +5675,7 @@ fn register_re1_socket(r: &mut NativeMethodRegistry) {
         }
         re1_close_socket(ctx, owner)
     });
+    ()
 }
 
 /// Shut down and forget the TCP stream backing `this`, and mark the socket
@@ -5272,7 +6066,7 @@ fn register_re2_server_socket(r: &mut NativeMethodRegistry) {
     // surface so real bytecode drives sun/nio/ch/Net. See
     // register_phase53_socket_stubs.
     if crate::vmflags().io.real_net_sockets {
-        return;
+        return ();
     }
     // Install the plain-`ServerSocket` handler set for native-io's winning
     // `ss_wrapper_*` natives to delegate to (BUG-04). Every method native-io
@@ -5299,7 +6093,7 @@ fn register_re2_server_socket(r: &mut NativeMethodRegistry) {
         // This native bypasses ServerSocket's field initializers.  Preserve
         // the real object's synchronization invariant before its bytecode
         // options path reaches getImpl().
-        let this = re1_init_socket_locks(ctx, this);
+        let this = re1_init_socket_locks(ctx, this)?;
         ss_set(ctx, this, |s| {
             s.port = -1;
             s.backlog = 50;
@@ -5313,7 +6107,7 @@ fn register_re2_server_socket(r: &mut NativeMethodRegistry) {
 
     r.register(ss, "<init>", "(I)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let this = re1_init_socket_locks(ctx, this);
+        let this = re1_init_socket_locks(ctx, this)?;
         let port = args.get(1).and_then(|v| v.as_int()).unwrap_or(0);
         re2_bind_listener(ctx, this, "0.0.0.0", port, 50)
     });
@@ -5322,7 +6116,7 @@ fn register_re2_server_socket(r: &mut NativeMethodRegistry) {
 
     r.register(ss, "<init>", "(II)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let this = re1_init_socket_locks(ctx, this);
+        let this = re1_init_socket_locks(ctx, this)?;
         let port = args.get(1).and_then(|v| v.as_int()).unwrap_or(0);
         let backlog = args.get(2).and_then(|v| v.as_int()).unwrap_or(50);
         re2_bind_listener(ctx, this, "0.0.0.0", port, backlog)
@@ -5330,7 +6124,7 @@ fn register_re2_server_socket(r: &mut NativeMethodRegistry) {
 
     r.register(ss, "<init>", "(IILjava/net/InetAddress;)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let this = re1_init_socket_locks(ctx, this);
+        let this = re1_init_socket_locks(ctx, this)?;
         let port = args.get(1).and_then(|v| v.as_int()).unwrap_or(0);
         let backlog = args.get(2).and_then(|v| v.as_int()).unwrap_or(50);
         let host = match args.get(3) {
@@ -5393,14 +6187,14 @@ fn register_re2_server_socket(r: &mut NativeMethodRegistry) {
         }
         let lid = s.listener_id;
         let timeout_ms = s.so_timeout;
-        let sock = alloc_concurrent_synthetic(ctx, "java/net/Socket", 5);
+        let sock = try_alloc_concurrent_synthetic(ctx, "java/net/Socket", 5)?;
         sock_set(ctx, sock, |x| {
             x.port = 0;
             x.local_port = 0;
             x.closed = 0;
             x.stream_id = -1;
         });
-        let sock = re1_init_socket_locks(ctx, sock);
+        let sock = re1_init_socket_locks(ctx, sock)?;
         re2_accept_into(ctx, lid, sock, timeout_ms)
     });
 
@@ -5605,10 +6399,11 @@ fn register_re2_server_socket(r: &mut NativeMethodRegistry) {
                 alloc_inet_address(ctx, &ip, &ip)
             } else {
                 alloc_inet_address_unnamed(ctx, &ip)
-            };
+            }?;
             Ok(Some(Value::Object(Some(ia))))
         },
     );
+    ()
 }
 
 // ---------------------------------------------------------------------------
@@ -5662,7 +6457,7 @@ fn re2_server_socket_local_address(ctx: &mut dyn NativeContext, args: &[Value]) 
     });
     Ok(Some(Value::Object(Some(alloc_inet_socket_address_resolved(
         ctx, &ip, &ip, port,
-    )))))
+    )?))))
 }
 
 /// `isBound()` — true once a bind has succeeded, and true forever after,
@@ -5705,7 +6500,15 @@ fn register_re3_inet_address(r: &mut NativeMethodRegistry) {
             // the name "localhost". A numeric literal carries none — HotSpot's
             // `getByName("127.0.0.1").toString()` is `/127.0.0.1` — which is
             // what `alloc_inet_address_for_input` decides.
-            let obj = alloc_inet_address_for_input(ctx, &name, &ip.to_string());
+            //
+            // `resolve_host` answers with a bare `IpAddr`, which cannot carry
+            // an IPv6 `%scope`; take it back off the input text so
+            // `getByName("fe80::1%1").getScopeId()` is 1 rather than 0.
+            let ip_text = match host_input_scope(&name) {
+                Some(scope) if ip.is_ipv6() => format!("{ip}%{scope}"),
+                _ => ip.to_string(),
+            };
+            let obj = alloc_inet_address_for_input(ctx, &name, &ip_text)?;
             Ok(Some(Value::Object(Some(obj))))
         },
     );
@@ -5753,9 +6556,16 @@ fn register_re3_inet_address(r: &mut NativeMethodRegistry) {
             } else {
                 host
             };
+            // Same rule as `getByName` above: `to_socket_addrs` cannot carry an
+            // IPv6 `%scope`, so take it back off the input text.
+            let scope = host_input_scope(&name).map(str::to_string);
             for (i, ip) in addrs.iter().enumerate() {
+                let text = match scope.as_deref() {
+                    Some(s) if ip.contains(':') => format!("{ip}%{s}"),
+                    _ => ip.clone(),
+                };
                 // Same rule as `getByName` above: a literal keeps no name.
-                let obj = alloc_inet_address_for_input(ctx, &name, ip);
+                let obj = alloc_inet_address_for_input(ctx, &name, &text)?;
                 ctx.set_array_element(arr, i, Value::Object(Some(obj)));
             }
             Ok(Some(Value::Object(Some(arr))))
@@ -5767,7 +6577,7 @@ fn register_re3_inet_address(r: &mut NativeMethodRegistry) {
         "getLoopbackAddress",
         "()Ljava/net/InetAddress;",
         |ctx, _args| {
-            let obj = alloc_inet_address(ctx, "localhost", "127.0.0.1");
+            let obj = alloc_inet_address(ctx, "localhost", "127.0.0.1")?;
             Ok(Some(Value::Object(Some(obj))))
         },
     );
@@ -5781,14 +6591,14 @@ fn register_re3_inet_address(r: &mut NativeMethodRegistry) {
             let ip = resolve_host(&hostname)
                 .map(|i| i.to_string())
                 .unwrap_or_else(|_| "127.0.0.1".to_string());
-            let obj = alloc_inet_address(ctx, &hostname, &ip);
+            let obj = alloc_inet_address(ctx, &hostname, &ip)?;
             Ok(Some(Value::Object(Some(obj))))
         },
     );
 
     r.register(ia, "getHostAddress", "()Ljava/lang/String;", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        Ok(Some(inet_addr_field(ctx, this, IA_ADDR)))
+        Ok(Some(inet_addr_host_address_value(ctx, this)))
     });
     r.register(ia, "getHostName", "()Ljava/lang/String;", |ctx, args| {
         let this = obj_arg(args, 0)?;
@@ -5870,7 +6680,7 @@ fn register_re3_inet_address(r: &mut NativeMethodRegistry) {
             "()Ljava/lang/String;",
             |ctx, args| {
                 let this = obj_arg(args, 0)?;
-                Ok(Some(inet_addr_field(ctx, this, IA_ADDR)))
+                Ok(Some(inet_addr_host_address_value(ctx, this)))
             },
         );
         // These CONCRETE-subclass registrations are the ones that actually
@@ -5927,6 +6737,7 @@ fn register_re3_inet_address(r: &mut NativeMethodRegistry) {
         });
         register_inet_address_object_methods(r, cls);
     }
+    ()
 }
 
 /// Parse the `IA_ADDR` field of an InetAddress mirror and apply `pred`.
@@ -5965,8 +6776,11 @@ fn register_inet_address_object_methods(r: &mut NativeMethodRegistry, cls: &'sta
     r.register(cls, "toString", "()Ljava/lang/String;", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let host = inet_addr_field_string_or(ctx, this, IA_HOST, "");
-        let ip = inet_addr_field_string_or(ctx, this, IA_ADDR, "");
-        // Real-JDK `InetAddress.toString()` => `hostName + "/" + ipString`.
+        // Real-JDK `InetAddress.toString()` is
+        // `Objects.toString(holder().getHostName(), "") + "/" + getHostAddress()`
+        // — the right-hand half is `getHostAddress()`, so it carries the IPv6
+        // scope suffix too.
+        let ip = inet_addr_scoped_text(ctx, this, "");
         let s = ctx.create_string(&format!("{host}/{ip}"));
         Ok(Some(Value::Object(Some(s))))
     });
@@ -5976,11 +6790,23 @@ fn register_inet_address_object_methods(r: &mut NativeMethodRegistry, cls: &'sta
         // Real-JDK `Inet4Address.hashCode()` returns the packed address int.
         let h = match ip.parse::<IpAddr>() {
             Ok(IpAddr::V4(v4)) => i32::from_be_bytes(v4.octets()),
+            // `Inet6Address.hashCode()` is a wrapping SUM of the four 4-byte
+            // groups, each accumulated as `(component << 8) + ipaddress[i]`
+            // over SIGNED bytes — not an XOR, and not over unsigned bytes.
+            // Both differences are observable: for
+            // `fe80:3030:3030:3030:3030:3030:3030:3031` the JDK answers
+            // -1911504703 where the XOR-of-unsigned form answered something
+            // else entirely, so an `Inet6Address` used as a HashMap key
+            // hashed to a different bucket than an equal one obtained from
+            // real-JDK bytecode.
             Ok(IpAddr::V6(v6)) => {
-                let o = v6.octets();
                 let mut h = 0i32;
-                for chunk in o.chunks(4) {
-                    h ^= i32::from_be_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+                for chunk in v6.octets().chunks(4) {
+                    let mut component = 0i32;
+                    for b in chunk {
+                        component = component.wrapping_shl(8).wrapping_add(i32::from(*b as i8));
+                    }
+                    h = h.wrapping_add(component);
                 }
                 h
             }
@@ -7465,21 +8291,33 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
         // Spring Boot's `new File(url.toURI().getSchemeSpecificPart())` path.
         // Layout per http2.rs:
         //   scheme=0, host=1, port=2, path=3, query=4, fragment=5, raw=6
-        let uri = alloc_concurrent_synthetic(ctx, "java/net/URI", 7);
-        let raw_s = ctx.create_string(&url_str);
-        ctx.set_field(uri, 6, Value::Object(Some(raw_s))); // raw
-                                                           // Parse scheme.
-        if let Some(colon) = url_str.find(':') {
-            let scheme = &url_str[..colon];
-            let scheme_s = ctx.create_string(scheme);
-            ctx.set_field(uri, 0, Value::Object(Some(scheme_s)));
-            // For file: URIs, the path is everything after "file:".
-            if scheme == "file" {
-                let path = &url_str[colon + 1..];
-                let path_s = ctx.create_string(path);
-                ctx.set_field(uri, 3, Value::Object(Some(path_s)));
+        let uri = try_alloc_concurrent_synthetic(ctx, "java/net/URI", 7)?;
+        // JDK-ONLY-LAYOUT: raw slots only on OUR layout. On a real
+        // `java.net.URI` slot 6 is `path` and slot 3 is `userInfo`, so the full
+        // text went into the path and the path into the user information.
+        if uri_has_synthetic_layout(ctx, uri) {
+            let raw_s = ctx.create_string(&url_str);
+            ctx.set_field(uri, 6, Value::Object(Some(raw_s))); // raw
+            if let Some(colon) = url_str.find(':') {
+                let scheme = &url_str[..colon];
+                let scheme_s = ctx.create_string(scheme);
+                ctx.set_field(uri, 0, Value::Object(Some(scheme_s)));
+                // For file: URIs, the path is everything after "file:".
+                if scheme == "file" {
+                    let path = &url_str[colon + 1..];
+                    let path_s = ctx.create_string(path);
+                    ctx.set_field(uri, 3, Value::Object(Some(path_s)));
+                }
             }
         }
+        // The file: path override preserves this site's own rule: everything
+        // after `file:` is the path, including a Windows `/C:/…` form that the
+        // generic split would treat as an opaque scheme-specific part.
+        let file_path = url_str
+            .strip_prefix("file:")
+            .filter(|p| !p.is_empty())
+            .map(str::to_string);
+        uri_publish_named(ctx, uri, &url_str, file_path.as_deref());
         Ok(Some(Value::Object(Some(uri))))
     });
 
@@ -7938,7 +8776,7 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
         // single-byte reads observe an empty stream even though bulk reads
         // appeared to work, which broke XML resources inherited through a
         // filtered URLClassLoader.
-        let stream = crate::lang_class::t19_h10_alloc_byte_array_input_stream(ctx, &bytes);
+        let stream = crate::lang_class::t19_h10_alloc_byte_array_input_stream(ctx, &bytes)?;
         Ok(Some(Value::Object(Some(stream))))
     });
 
@@ -8091,7 +8929,7 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
             // was false even though `openStream()` served the right 23755
             // bytes (core.io.ModuleResourceTests.existingClassFileResource).
             if ext.starts_with("jrt:") {
-                let conn = alloc_concurrent_synthetic(ctx, JRT_URL_CONNECTION, 16);
+                let conn = try_alloc_concurrent_synthetic(ctx, JRT_URL_CONNECTION, 16)?;
                 ctx.set_field(conn, HUC_URL, Value::Object(Some(this)));
                 ctx.set_field(conn, HUC_DO_INPUT, Value::Int(1));
                 ctx.set_field(conn, HUC_CONNECTED, Value::Int(0));
@@ -8116,7 +8954,7 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
             } else {
                 "java/net/HttpURLConnection"
             };
-            let conn = alloc_concurrent_synthetic(ctx, carrier, 16);
+            let conn = try_alloc_concurrent_synthetic(ctx, carrier, 16)?;
             // Field HUC_URL holds the originating URL so `huc_url_string`
             // and `getInputStream` can recover its external form.
             ctx.set_field(conn, HUC_URL, Value::Object(Some(this)));
@@ -8336,7 +9174,7 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let this = obj_arg(args, 0)?;
             let ext = jar_url_conn_ext(ctx, this);
-            Ok(Some(jar_url_lookup_entry(ctx, &ext)))
+            Ok(Some(jar_url_lookup_entry(ctx, &ext)?))
         },
     );
     // java/net/JarURLConnection.getEntryName() — the entry path inside the jar
@@ -9030,7 +9868,7 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
                 _ => ctx.new_array(ArrayElementType::Byte, 0),
             };
             let len = ctx.array_length(body) as i32;
-            let stream = alloc_concurrent_synthetic(ctx, "java/io/ByteArrayInputStream", 4);
+            let stream = try_alloc_concurrent_synthetic(ctx, "java/io/ByteArrayInputStream", 4)?;
             ctx.set_field(stream, 0, Value::Object(Some(body))); // buf
             ctx.set_field(stream, 1, Value::Int(0)); // pos
             ctx.set_field(stream, 2, Value::Int(0)); // mark
@@ -9710,7 +10548,8 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
     // whatever subclass override exists (`UrlResource`'s own subclasses use
     // this to set custom request headers before `exists()`/`getInputStream()`
     // send the request — `ResourceTests.UrlResourceTests
-    // .canCustomizeHttpUrlConnectionForExists[Fallback]`).
+    // .canCustomizeHttpUrlConnectionForExists[Fallback]`).;
+    ()
 }
 
 // ===========================================================================
@@ -9764,8 +10603,8 @@ const RE5_BUILDER_COOKIE_HANDLER: usize = 7;
 const RE5_BUILDER_SSL_PARAMETERS: usize = 8;
 const RE5_BUILDER_NUM_FIELDS: usize = 9;
 
-fn re5_alloc_client(ctx: &mut dyn NativeContext) -> ObjectRef {
-    let client = alloc_concurrent_synthetic(ctx, "java/net/http/HttpClient", RE5_CLIENT_NUM_FIELDS);
+fn re5_alloc_client(ctx: &mut dyn NativeContext) -> Result<ObjectRef, MethodCallFailed> {
+    let client = try_alloc_concurrent_synthetic(ctx, "java/net/http/HttpClient", RE5_CLIENT_NUM_FIELDS)?;
     ctx.set_field(client, RE5_CLIENT_VERSION, Value::Object(None));
     ctx.set_field(client, RE5_CLIENT_REDIRECT, Value::Object(None));
     for field in [
@@ -9779,19 +10618,19 @@ fn re5_alloc_client(ctx: &mut dyn NativeContext) -> ObjectRef {
     ] {
         ctx.set_field(client, field, Value::Object(None));
     }
-    client
+    Ok(client)
 }
 
-fn re5_alloc_client_builder(ctx: &mut dyn NativeContext) -> ObjectRef {
-    let builder = alloc_concurrent_synthetic(
+fn re5_alloc_client_builder(ctx: &mut dyn NativeContext) -> Result<ObjectRef, MethodCallFailed> {
+    let builder = try_alloc_concurrent_synthetic(
         ctx,
         "java/net/http/HttpClient$Builder",
         RE5_BUILDER_NUM_FIELDS,
-    );
+    )?;
     for field in 0..RE5_BUILDER_NUM_FIELDS {
         ctx.set_field(builder, field, Value::Object(None));
     }
-    builder
+    Ok(builder)
 }
 
 fn re5_optional(ctx: &mut dyn NativeContext, value: Value) -> MethodCallResult {
@@ -9892,7 +10731,7 @@ fn re5_read_byte_array_range(
 fn re5_handler_tag(ctx: &dyn NativeContext, handler: Option<Value>) -> Option<String> {
     if let Some(Value::Object(Some(h))) = handler {
         let cid = ctx.class_id_of_object(h);
-        if ctx.class_name_of_id(cid).as_deref() == Some("java/net/http/HttpResponse$BodyHandler") {
+        if ctx.class_name_arc_of_id(cid).as_deref() == Some("java/net/http/HttpResponse$BodyHandler") {
             if let Value::Object(Some(s)) = ctx.get_field(h, 0) {
                 if let Some(tag) = ctx.read_string(s) {
                     return Some(tag);
@@ -9914,8 +10753,8 @@ fn re5_build_response(
     headers: &[(String, String)],
     body: &[u8],
     handler_tag: &str,
-) -> ObjectRef {
-    let out = alloc_concurrent_synthetic(ctx, "java/net/http/HttpResponse", RE5_RESP_NUM_FIELDS);
+) -> Result<ObjectRef, MethodCallFailed> {
+    let out = try_alloc_concurrent_synthetic(ctx, "java/net/http/HttpResponse", RE5_RESP_NUM_FIELDS)?;
     ctx.set_field(out, RE5_RESP_STATUS, Value::Int(status));
     let body_arr = ctx.new_array(ArrayElementType::Byte, body.len());
     for (i, b) in body.iter().enumerate() {
@@ -9930,19 +10769,19 @@ fn re5_build_response(
     ctx.set_field(out, RE5_RESP_HEADERS, Value::Object(Some(hdr_arr)));
     let tag = ctx.create_string(handler_tag);
     ctx.set_field(out, RE5_RESP_HANDLER_TAG, Value::Object(Some(tag)));
-    out
+    Ok(out)
 }
 
 /// Build the synthetic `java.net.http.HttpHeaders` view over a `String[]` of
 /// `"key: value"` lines (the shape both the synthetic `HttpResponse` and the
 /// synthetic `ResponseInfo` carry). The array is pinned across the
 /// allocation so a moving collector can't leave the stored reference stale.
-fn re5_make_http_headers(ctx: &mut dyn NativeContext, hdr_arr: Value) -> ObjectRef {
+fn re5_make_http_headers(ctx: &mut dyn NativeContext, hdr_arr: Value) -> Result<ObjectRef, MethodCallFailed> {
     let pinned = match hdr_arr {
         Value::Object(Some(a)) => Some((ctx.pin_native_root(a), a)),
         _ => None,
     };
-    let headers = alloc_concurrent_synthetic(ctx, "java/net/http/HttpHeaders", 1);
+    let headers = try_alloc_concurrent_synthetic(ctx, "java/net/http/HttpHeaders", 1)?;
     let arr_now = match pinned {
         Some((pin, a)) => Value::Object(Some(ctx.read_native_pin(pin, a))),
         None => Value::Object(None),
@@ -9951,7 +10790,7 @@ fn re5_make_http_headers(ctx: &mut dyn NativeContext, hdr_arr: Value) -> ObjectR
     if let Some((pin, _)) = pinned {
         ctx.unpin_native_roots(pin);
     }
-    headers
+    Ok(headers)
 }
 
 /// `Flow.Subscription.request(long)` for the one-shot replay subscription
@@ -10029,13 +10868,13 @@ fn re5_replay_subscription_request(
         ctx.invoke_virtual(subscriber_now, "onComplete", "()V", &[])?;
         Ok(None)
     };
-    let result = deliver(ctx);
+    let result = deliver(ctx)?;
     // Drop the parked references so the delivered body can be collected.
     let this_now = ctx.read_native_pin(this_pin, this);
     ctx.set_field(this_now, RE5_SUB_SUBSCRIBER, Value::Object(None));
     ctx.set_field(this_now, RE5_SUB_BODY, Value::Object(None));
     ctx.unpin_native_roots(this_pin);
-    result
+    Ok(result)
 }
 
 /// `Flow.Subscription.cancel()` for the one-shot replay subscription: mark
@@ -10082,7 +10921,7 @@ fn re5_drive_body_handler(
 
     // ResponseInfo synthetic: statusCode + the same "key: value" String[]
     // shape the synthetic HttpResponse carries.
-    let ri = alloc_concurrent_synthetic(ctx, RE5_RESPONSE_INFO, RE5_RI_NUM_FIELDS);
+    let ri = try_alloc_concurrent_synthetic(ctx, RE5_RESPONSE_INFO, RE5_RI_NUM_FIELDS)?;
     ctx.set_field(ri, RE5_RI_STATUS, Value::Int(status));
     let ri_pin = ctx.pin_native_root(ri);
     let hdr_arr = ctx.new_ref_array(ClassId::new(0), headers.len());
@@ -10125,7 +10964,7 @@ fn re5_drive_body_handler(
         }
         Some((ctx.pin_native_root(arr), arr))
     };
-    let subscription = alloc_concurrent_synthetic(ctx, RE5_REPLAY_SUBSCRIPTION, RE5_SUB_NUM_FIELDS);
+    let subscription = try_alloc_concurrent_synthetic(ctx, RE5_REPLAY_SUBSCRIPTION, RE5_SUB_NUM_FIELDS)?;
     {
         let subscriber_now = ctx.read_native_pin(subscriber_pin, subscriber);
         ctx.set_field(
@@ -10411,7 +11250,7 @@ fn re5_collect_publisher_body(
     let collector = Arc::new(Re5PublisherBodyCollector::default());
     re5_body_collectors().lock().insert(id, collector.clone());
 
-    let subscriber = alloc_concurrent_synthetic(ctx, RE5_BODY_COLLECTOR_SUBSCRIBER, 1);
+    let subscriber = try_alloc_concurrent_synthetic(ctx, RE5_BODY_COLLECTOR_SUBSCRIBER, 1)?;
     ctx.set_field(subscriber, 0, Value::Long(id as i64));
     let sub_global = ctx.add_global_root(subscriber);
     let pin = ctx.pin_native_root(publisher);
@@ -10757,17 +11596,17 @@ fn re5_do_request(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
                 _ => None,
             };
             let out =
-                re5_build_response(ctx, resp.status, &resp.headers, &resp.body, RE5_TAG_HANDLED);
+                re5_build_response(ctx, resp.status, &resp.headers, &resp.body, RE5_TAG_HANDLED)?;
             let body_obj_now = match body_obj_pin {
                 Some((pin, o)) => Value::Object(Some(ctx.read_native_pin(pin, o))),
                 None => Value::Object(None),
             };
             ctx.set_field(out, RE5_RESP_BODY_OBJ, body_obj_now);
             ctx.unpin_native_roots(handler_pin);
-            out
+            Ok(out)
         }
     };
-    Ok(Some(Value::Object(Some(out))))
+    Ok(Some(Value::Object(Some(out?))))
 }
 
 /// Extract the full external-form string from a `java.net.URI` and return it as
@@ -10857,7 +11696,7 @@ fn register_re5_http_client(r: &mut NativeMethodRegistry) {
         "newHttpClient",
         "()Ljava/net/http/HttpClient;",
         |ctx, _args| {
-            let obj = re5_alloc_client(ctx);
+            let obj = re5_alloc_client(ctx)?;
             Ok(Some(Value::Object(Some(obj))))
         },
     );
@@ -10866,7 +11705,7 @@ fn register_re5_http_client(r: &mut NativeMethodRegistry) {
         "newBuilder",
         "()Ljava/net/http/HttpClient$Builder;",
         |ctx, _args| {
-            let obj = re5_alloc_client_builder(ctx);
+            let obj = re5_alloc_client_builder(ctx)?;
             Ok(Some(Value::Object(Some(obj))))
         },
     );
@@ -10874,7 +11713,7 @@ fn register_re5_http_client(r: &mut NativeMethodRegistry) {
     let bld = "java/net/http/HttpClient$Builder";
     r.register(bld, "build", "()Ljava/net/http/HttpClient;", |ctx, args| {
         let builder = obj_arg(args, 0)?;
-        let obj = re5_alloc_client(ctx);
+        let obj = re5_alloc_client(ctx)?;
         for (from, to) in [
             (RE5_BUILDER_VERSION, RE5_CLIENT_VERSION),
             (RE5_BUILDER_REDIRECT, RE5_CLIENT_REDIRECT),
@@ -11163,7 +12002,7 @@ fn register_re5_http_client(r: &mut NativeMethodRegistry) {
         "newBuilder",
         "()Ljava/net/http/HttpRequest$Builder;",
         |ctx, _args| {
-            let b = alloc_concurrent_synthetic(ctx, "java/net/http/HttpRequest$Builder", 5);
+            let b = try_alloc_concurrent_synthetic(ctx, "java/net/http/HttpRequest$Builder", 5)?;
             let m = ctx.create_string("GET");
             ctx.set_field(b, 0, Value::Object(Some(m)));
             ctx.set_field(b, 1, Value::Object(None));
@@ -11177,7 +12016,7 @@ fn register_re5_http_client(r: &mut NativeMethodRegistry) {
         "newBuilder",
         "(Ljava/net/URI;)Ljava/net/http/HttpRequest$Builder;",
         |ctx, args| {
-            let b = alloc_concurrent_synthetic(ctx, "java/net/http/HttpRequest$Builder", 5);
+            let b = try_alloc_concurrent_synthetic(ctx, "java/net/http/HttpRequest$Builder", 5)?;
             let m = ctx.create_string("GET");
             ctx.set_field(b, 0, Value::Object(Some(m)));
             let uri = obj_arg(args, 0)?;
@@ -11395,7 +12234,7 @@ fn register_re5_http_client(r: &mut NativeMethodRegistry) {
 
     r.register(bl, "build", "()Ljava/net/http/HttpRequest;", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let req = alloc_concurrent_synthetic(ctx, "java/net/http/HttpRequest", 5);
+        let req = try_alloc_concurrent_synthetic(ctx, "java/net/http/HttpRequest", 5)?;
         for i in 0..5 {
             let v = ctx.get_field(this, i);
             ctx.set_field(req, i, v);
@@ -11410,7 +12249,7 @@ fn register_re5_http_client(r: &mut NativeMethodRegistry) {
         "(Ljava/lang/String;)Ljava/net/http/HttpRequest$BodyPublisher;",
         |ctx, args| {
             let body =
-                alloc_concurrent_synthetic(ctx, "java/net/http/HttpRequest$BodyPublisher", 1);
+                try_alloc_concurrent_synthetic(ctx, "java/net/http/HttpRequest$BodyPublisher", 1)?;
             ctx.set_field(
                 body,
                 0,
@@ -11425,7 +12264,7 @@ fn register_re5_http_client(r: &mut NativeMethodRegistry) {
         "()Ljava/net/http/HttpRequest$BodyPublisher;",
         |ctx, _args| {
             let body =
-                alloc_concurrent_synthetic(ctx, "java/net/http/HttpRequest$BodyPublisher", 1);
+                try_alloc_concurrent_synthetic(ctx, "java/net/http/HttpRequest$BodyPublisher", 1)?;
             let empty = ctx.create_string("");
             ctx.set_field(body, 0, Value::Object(Some(empty)));
             Ok(Some(Value::Object(Some(body))))
@@ -11437,7 +12276,7 @@ fn register_re5_http_client(r: &mut NativeMethodRegistry) {
         "([B)Ljava/net/http/HttpRequest$BodyPublisher;",
         |ctx, args| {
             let body =
-                alloc_concurrent_synthetic(ctx, "java/net/http/HttpRequest$BodyPublisher", 1);
+                try_alloc_concurrent_synthetic(ctx, "java/net/http/HttpRequest$BodyPublisher", 1)?;
             // Keep the original byte[] rather than round-tripping it through a
             // Java String.  Request builders copy this literal value into their
             // request body slot, and `re5_request_body_bytes` already knows how
@@ -11462,7 +12301,7 @@ fn register_re5_http_client(r: &mut NativeMethodRegistry) {
     ] {
         r.register(bps, "fromPublisher", desc, |ctx, args| {
             let body =
-                alloc_concurrent_synthetic(ctx, "java/net/http/HttpRequest$BodyPublisher", 1);
+                try_alloc_concurrent_synthetic(ctx, "java/net/http/HttpRequest$BodyPublisher", 1)?;
             ctx.set_field(
                 body,
                 0,
@@ -11478,7 +12317,7 @@ fn register_re5_http_client(r: &mut NativeMethodRegistry) {
         "ofString",
         "()Ljava/net/http/HttpResponse$BodyHandler;",
         |ctx, _args| {
-            let bh = alloc_concurrent_synthetic(ctx, "java/net/http/HttpResponse$BodyHandler", 1);
+            let bh = try_alloc_concurrent_synthetic(ctx, "java/net/http/HttpResponse$BodyHandler", 1)?;
             let tag = ctx.create_string("string");
             ctx.set_field(bh, 0, Value::Object(Some(tag)));
             Ok(Some(Value::Object(Some(bh))))
@@ -11489,7 +12328,7 @@ fn register_re5_http_client(r: &mut NativeMethodRegistry) {
         "discarding",
         "()Ljava/net/http/HttpResponse$BodyHandler;",
         |ctx, _args| {
-            let bh = alloc_concurrent_synthetic(ctx, "java/net/http/HttpResponse$BodyHandler", 1);
+            let bh = try_alloc_concurrent_synthetic(ctx, "java/net/http/HttpResponse$BodyHandler", 1)?;
             let tag = ctx.create_string("discarding");
             ctx.set_field(bh, 0, Value::Object(Some(tag)));
             Ok(Some(Value::Object(Some(bh))))
@@ -11503,7 +12342,7 @@ fn register_re5_http_client(r: &mut NativeMethodRegistry) {
         "ofInputStream",
         "()Ljava/net/http/HttpResponse$BodyHandler;",
         |ctx, _args| {
-            let bh = alloc_concurrent_synthetic(ctx, "java/net/http/HttpResponse$BodyHandler", 1);
+            let bh = try_alloc_concurrent_synthetic(ctx, "java/net/http/HttpResponse$BodyHandler", 1)?;
             let t = ctx.create_string("inputstream");
             ctx.set_field(bh, 0, Value::Object(Some(t)));
             Ok(Some(Value::Object(Some(bh))))
@@ -11514,7 +12353,7 @@ fn register_re5_http_client(r: &mut NativeMethodRegistry) {
         "ofByteArray",
         "()Ljava/net/http/HttpResponse$BodyHandler;",
         |ctx, _args| {
-            let bh = alloc_concurrent_synthetic(ctx, "java/net/http/HttpResponse$BodyHandler", 1);
+            let bh = try_alloc_concurrent_synthetic(ctx, "java/net/http/HttpResponse$BodyHandler", 1)?;
             let t = ctx.create_string("bytearray");
             ctx.set_field(bh, 0, Value::Object(Some(t)));
             Ok(Some(Value::Object(Some(bh))))
@@ -11566,7 +12405,7 @@ fn register_re5_http_client(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let this = obj_arg(args, 0)?;
             let arr = ctx.get_field(this, RE5_RESP_HEADERS);
-            let headers = re5_make_http_headers(ctx, arr);
+            let headers = re5_make_http_headers(ctx, arr)?;
             Ok(Some(Value::Object(Some(headers))))
         },
     );
@@ -11585,7 +12424,7 @@ fn register_re5_http_client(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let this = obj_arg(args, 0)?;
             let arr = ctx.get_field(this, RE5_RI_HEADERS);
-            let headers = re5_make_http_headers(ctx, arr);
+            let headers = re5_make_http_headers(ctx, arr)?;
             Ok(Some(Value::Object(Some(headers))))
         },
     );
@@ -11693,13 +12532,23 @@ fn register_re5_http_client(r: &mut NativeMethodRegistry) {
         ctx.unpin_native_roots(map_pin);
         Ok(Some(Value::Object(Some(map_now))))
     });
+    ()
 }
 
 // ===========================================================================
 // RE.6 — javax.net.ssl.SSLContext
 // ===========================================================================
 
-fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
+/// `pub(crate)` since 2026-08-12 (W7-61) so `tls.rs`'s registrar-ordering
+/// ratchet can name this exact registrar rather than the whole
+/// `register_phase_e_networking` umbrella. It is the LAST writer of
+/// `javax/net/ssl/SSLContext.createSSLEngine` on the Compatible/strict boot
+/// path (lib.rs 18191 `register_p68_ssl`, then 18214 this), and that is what
+/// makes `phases_late::ssl_security::ssleng_alloc` — a 7-slot allocation on a
+/// class declaring 2 — unreachable in that mode. Reordering the two silently
+/// re-arms the over-allocation, so the fact is pinned by a test rather than
+/// left to this comment.
+pub(crate) fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
     let ctx_cls = "javax/net/ssl/SSLContext";
     r.register(
         ctx_cls,
@@ -11736,7 +12585,7 @@ fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
                     &format!("{proto} SSLContext not available"),
                 ));
             }
-            let obj = alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLContext", 2);
+            let obj = try_alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLContext", 2)?;
             let name = ctx.create_string(&proto);
             ctx.set_field(obj, 0, Value::Object(Some(name)));
             ctx.set_field(obj, 1, Value::Int(0));
@@ -11780,7 +12629,7 @@ fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
             // a fresh one each time (e.g. OtlpMetricsExportAutoConfigurationTests
             // .whenNoSslBundleDefaultHttpSenderHasDefaultSslContext asserts
             // `httpClient.sslContext()).isSameAs(SSLContext.getDefault())`).
-            let obj = alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLContext", 2);
+            let obj = try_alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLContext", 2)?;
             let name = ctx.create_string("TLS");
             ctx.set_field(obj, 0, Value::Object(Some(name)));
             ctx.set_field(obj, 1, Value::Int(1));
@@ -11870,10 +12719,10 @@ fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
             let tms_h = tms_arr.map(|a| scope.root(a));
             let this_now = scope.get(&this_h);
             let tms_now = tms_h.as_ref().map(|h| scope.get(h));
-            crate::t27_tls::attach_trust_managers_to_ctx(&mut *scope, this_now, tms_now);
+            crate::t27_tls::attach_trust_managers_to_ctx(&mut *scope, this_now, tms_now)?;
             let this_now = scope.get(&this_h);
             let kms_now = kms_h.as_ref().map(|h| scope.get(h));
-            crate::t27_tls::attach_key_managers_to_ctx(&mut *scope, this_now, kms_now);
+            crate::t27_tls::attach_key_managers_to_ctx(&mut *scope, this_now, kms_now)?;
             let ctx = &mut scope;
             let kms_arr = kms_h.as_ref().map(|h| ctx.get(h));
             // Per-SSLContext mTLS identity: prefer resolving it DIRECTLY from
@@ -11891,7 +12740,7 @@ fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
             // Re-read through the handle rather than reusing the copy from the
             // top of the method: the two attaches above allocate.
             let this = ctx.get(&this_h);
-            crate::t27_tls::attach_pending_identity_to_ctx(&mut **ctx, this, resolved_identity);
+            crate::t27_tls::attach_pending_identity_to_ctx(&mut **ctx, this, resolved_identity)?;
             // Stash the actual TrustManager objects passed here (may include a
             // revocation-aware PKIXRevocationChecker attached by
             // Tomcat's SSLUtilBase.getTrustManagers, or a fully custom
@@ -11900,6 +12749,45 @@ fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
             // these — so without this, custom/OCSP/CRL trust managers are
             // silently never invoked. Consulted post-handshake by
             // `t27_tls::engine_run_trust_check`.
+
+            // args[3] — the caller's `SecureRandom`. This handler used to
+            // ignore it completely, which is a divergence from
+            // `sun.security.ssl.SSLContextImpl.engineInit` regardless of where
+            // the handshake's entropy comes from: that method ends with
+            //
+            //     secureRandom = Objects.requireNonNullElseGet(sr, SecureRandom::new);
+            //     /* The initial delay of seeding the random number generator
+            //      * could be long enough to cause the initial handshake on our
+            //      * first connection to time out and fail. Make sure it is
+            //      * primed and ready by getting some initial output from it. */
+            //     secureRandom.nextInt();
+            //
+            // (verified against this host's JDK 25 `src.zip`). The draw is part
+            // of the method's observable behaviour, not an implementation
+            // detail — netty's `SslContextBuilderTest.
+            // {testServerContextWithSecureRandom,testClientContextWithSecureRandom}`
+            // hand in a counting `SecureRandom` subclass and assert it was
+            // drawn from; both failed `expected: <true> but was: <false>`.
+            //
+            // NOTE, deliberately: this primes the caller's generator, it does
+            // NOT re-source the TLS handshake from it. CratonVM's engine is
+            // rustls-backed and its record/key randomness comes from `ring`'s
+            // CSPRNG through the `CryptoProvider`; there is no supported way to
+            // drive that from a Java object mid-handshake, and routing it
+            // through one would mean a caller's weak or fixed-seed
+            // `SecureRandom` silently weakened real key material. See the
+            // retirement note for this batch.
+            if let Some(Value::Object(Some(sr))) = args.get(3) {
+                // Rooted through the same handle scope everything else in this
+                // handler uses — `nextInt()` runs Java and can move `sr`, and a
+                // raw pin nested inside the scope would have to be unwound in
+                // exactly the right order on every exit path.
+                let sr_h = ctx.root(*sr);
+                let sr_now = ctx.get(&sr_h);
+                // A generator that throws propagates, exactly as it does out of
+                // the real `engineInit`.
+                ctx.invoke_virtual(sr_now, "nextInt", "()I", &[])?;
+            }
             Ok(None)
         },
     );
@@ -11915,7 +12803,7 @@ fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
                     ctx.identity_hash_code(this)
                 );
             }
-            let f = alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLSocketFactory", 1);
+            let f = try_alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLSocketFactory", 1)?;
             ctx.set_field(f, 0, Value::Object(Some(this)));
             // Obtaining a factory has no connection scope. The HttpsURLConnection
             // setter captures it later, either as an instance-specific config
@@ -11930,7 +12818,7 @@ fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
         "()Ljavax/net/ssl/SSLServerSocketFactory;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            let f = alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLServerSocketFactory", 1);
+            let f = try_alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLServerSocketFactory", 1)?;
             ctx.set_field(f, 0, Value::Object(Some(this)));
             Ok(Some(Value::Object(Some(f))))
         },
@@ -12037,7 +12925,7 @@ fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
         "(Ljava/lang/String;I)Ljavax/net/ssl/SSLEngine;",
     ] {
         r.register(ctx_cls, "createSSLEngine", desc, |ctx, args| {
-            let eng0 = alloc_concurrent_synthetic(ctx, "sun/security/ssl/SSLEngineImpl", 4);
+            let eng0 = try_alloc_concurrent_synthetic(ctx, "sun/security/ssl/SSLEngineImpl", 4)?;
             // Everything below this point allocates (a ReentrantLock, and the
             // peer-host String further down), so `eng` must be pinned and
             // re-read rather than held raw across those calls.
@@ -12065,13 +12953,13 @@ fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
                 // its roots before the next context creation can replace the
                 // thread-local selection used by the rustls engine.
                 crate::t27_tls::set_engine_trust_roots_override(ctx, eng);
-                if let Some((cert, key)) = identity {
+                if let Ok(Some((cert, key))) = identity {
                     crate::t27_tls::set_engine_identity_override(ctx, eng, cert, key);
                 }
                 // Remember which SSLContext created this engine so the
                 // post-handshake trust check can find its TrustManager[]
                 // (independent of whether a KMF identity was also present).
-                crate::t27_tls::set_engine_trust_ctx_key(ctx, eng, sslctx);
+                crate::t27_tls::set_engine_trust_ctx_key(ctx, eng, sslctx)?;
             }
             // `createSSLEngine(String host, int port)` — record the host the
             // caller intends to reach. Dropping it silently made this engine
@@ -12110,7 +12998,7 @@ fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
             // object. Pin across the alloc and read the forwarded address.
             let this0 = obj_arg(args, 0)?;
             let this_pin = ctx.pin_native_root(this0);
-            let obj = alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLSessionContext", 0);
+            let obj = try_alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLSessionContext", 0)?;
             let this = ctx.read_native_pin(this_pin, this0);
             ssc_bind(ctx, obj, this, SSC_TAG_CLIENT);
             ctx.unpin_native_roots(this_pin);
@@ -12127,7 +13015,7 @@ fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let this0 = obj_arg(args, 0)?;
             let this_pin = ctx.pin_native_root(this0);
-            let obj = alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLSessionContext", 0);
+            let obj = try_alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLSessionContext", 0)?;
             let this = ctx.read_native_pin(this_pin, this0);
             ssc_bind(ctx, obj, this, SSC_TAG_SERVER);
             ctx.unpin_native_roots(this_pin);
@@ -12177,6 +13065,38 @@ fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
         let this = obj_arg(args, 0)?;
         Ok(Some(Value::Int(ssc_get(ctx, this).timeout_secs)))
     });
+    // getIds() / getSession(byte[]) — the two LOOKUP methods on this
+    // interface. They had no registration at all, and `SSLSessionContext` is a
+    // real JDK interface with no bodies, so every call threw
+    // `AbstractMethodError: method javax/net/ssl/SSLSessionContext.getIds()
+    // Ljava/util/Enumeration; has no Code attribute`. That is 36 of netty's
+    // `JdkSslEngineTest` failures on its own (`SSLEngineTest
+    // .currentSessionCacheSize`, which every session-resumption test calls
+    // before it does anything else).
+    //
+    // The answers are honest rather than fabricated: rustls owns the session
+    // cache and exposes no enumeration of it, so this context genuinely knows
+    // of no cached sessions. An EMPTY enumeration and a null lookup are what
+    // the API says that state looks like — which is also what a real JSSE
+    // context answers before anything has been cached. The alternative, an
+    // `AbstractMethodError`, tells the caller nothing and cannot be caught by
+    // code written against this interface.
+    //
+    // If this VM ever grows a real session cache, these two are where it
+    // surfaces; the no-op cache-tuning setters above carry the same caveat.
+    r.register(ssc, "getIds", "()Ljava/util/Enumeration;", |ctx, _args| {
+        // The same object `Collections.emptyEnumeration()` answers, whose two
+        // methods this workspace already implements natively
+        // (`phases_late::collections::register_p63_enumeration`).
+        let e = try_alloc_concurrent_synthetic(ctx, "java/util/Collections$EmptyEnumeration", 0)?;
+        Ok(Some(Value::Object(Some(e))))
+    });
+    r.register(
+        ssc,
+        "getSession",
+        "([B)Ljavax/net/ssl/SSLSession;",
+        |_ctx, _args| Ok(Some(Value::Object(None))),
+    );
 
     let sf = "javax/net/ssl/SSLSocketFactory";
     r.register(
@@ -12198,7 +13118,7 @@ fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
             // cheap, purely in-VM call even though it runs re-entrantly from
             // inside another native.
             if huc_factory_probe_mode() {
-                let sock = alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLSocket", 5);
+                let sock = try_alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLSocket", 5)?;
                 let pin_base = ctx.pin_native_root(sock);
                 let sock = ctx.read_native_pin(pin_base, sock);
                 sock_set(ctx, sock, |s| {
@@ -12243,11 +13163,14 @@ fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
             // already relies on — populated by the same `getSocketFactory()`
             // call, just read through a path that isn't sensitive to which
             // object ends up at field 0.
-            let client_ident = match ctx.get_field(this_factory, 0) {
-                Value::Object(Some(sslctx)) => crate::t27_tls::ctx_identity(ctx, sslctx),
+            let configured_ident = match ctx.get_field(this_factory, 0) {
+                Value::Object(Some(sslctx)) => crate::t27_tls::ctx_identity(ctx, sslctx)?,
                 _ => None,
-            }
-            .or_else(crate::t27_tls::huc_default_client_identity);
+            };
+            let client_ident = match configured_ident {
+                Some(identity) => Some(identity),
+                None => crate::t27_tls::huc_default_client_identity(),
+            };
             #[cfg(unix)]
             let legacy_dsa_roots = crate::t27_tls::selected_context_trust_root_ders();
             #[cfg(unix)]
@@ -12306,17 +13229,19 @@ fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
             #[cfg(unix)]
             let connect_result = if legacy_dsa_client {
                 crate::servlet::s2_legacy_dsa_tls_connect(&host, port as u16, &legacy_dsa_roots)
+                    .map_err(|e| e.to_string())
             } else {
                 crate::t27_tls::rustls_client_connect(cfg, &host, port as u16)
                     .map(|rid| crate::servlet::RUSTLS_SOCK_ID_BASE + rid)
-                    .map_err(std::io::Error::other)
+                    .map_err(|e| e.to_string())
             };
             #[cfg(not(unix))]
             let connect_result = crate::t27_tls::rustls_client_connect(cfg, &host, port as u16)
-                .map(|rid| crate::servlet::RUSTLS_SOCK_ID_BASE + rid);
+                .map(|rid| crate::servlet::RUSTLS_SOCK_ID_BASE + rid)
+                .map_err(|e| e.to_string());
             ctx.end_blocking_region();
             let id = connect_result.map_err(|e| ioex(format!("TLS connect: {e}")))?;
-            let sock = alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLSocket", 5);
+            let sock = try_alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLSocket", 5)?;
             let pin_base = ctx.pin_native_root(sock);
             let sock = ctx.read_native_pin(pin_base, sock);
             sock_set(ctx, sock, |s| {
@@ -13305,7 +14230,7 @@ pub(crate) fn register_re7_datagram_socket(r: &mut NativeMethodRegistry) {
                 .and_then(|s| s.rsplit_once(':').map(|(h, _)| h.to_string()))
                 .unwrap_or_else(|| "0.0.0.0".to_string());
             // The UDP socket's own bound address, read back as numeric text.
-            let ia = alloc_inet_address_unnamed(ctx, &addr);
+            let ia = alloc_inet_address_unnamed(ctx, &addr)?;
             Ok(Some(Value::Object(Some(ia))))
         },
     );
@@ -13509,7 +14434,7 @@ pub(crate) fn register_re7_datagram_socket(r: &mut NativeMethodRegistry) {
                 // / `getPort()` would read the pre-receive values.
                 let mut scope = NativeHandleScope::new(ctx);
                 let pkt_h = scope.root(pkt);
-                let ia = alloc_inet_address_unnamed(&mut *scope, &oh);
+                let ia = alloc_inet_address_unnamed(&mut *scope, &oh)?;
                 let ia_h = scope.root(ia);
                 let pkt_cur = scope.get(&pkt_h);
                 let ia_cur = scope.get(&ia_h);
@@ -13681,10 +14606,11 @@ pub(crate) fn register_re7_datagram_socket(r: &mut NativeMethodRegistry) {
                 Some((host, _)) if !host.is_empty() => host,
                 _ => return Ok(Some(Value::Object(None))),
             };
-            let ia = alloc_inet_address_unnamed(ctx, &host);
+            let ia = alloc_inet_address_unnamed(ctx, &host)?;
             Ok(Some(Value::Object(Some(ia))))
         },
     );
+    ()
 }
 
 // ===========================================================================
@@ -13906,6 +14832,30 @@ fn re8_scan_host_ifaces() -> Vec<Re8HostIface> {
     // SAFETY: `head` came from the successful `getifaddrs` above, is still the
     // list head (the walk advanced a copy), and is freed exactly once.
     unsafe { libc::freeifaddrs(head) };
+    // The JDK's Linux enumeration CREATES a `NetworkInterface` from an
+    // address, so an interface carrying none is not in `getAll0()`'s output at
+    // all: HotSpot JDK 25 on this host reports five interfaces where the
+    // `AF_PACKET` entries `getifaddrs` also returns would make six (`ens1` is
+    // configured but address-less). Reporting the extra one gave
+    // `getNetworkInterfaces()` a member `getByName` on HotSpot answers `null`
+    // for, and put an interface with an empty `getInetAddresses()` in front of
+    // any "pick an interface and take its address" scan.
+    out.retain(|iface| !iface.addrs.is_empty());
+    // The JDK builds its interface list by PREPENDING each newly seen
+    // interface, so `getNetworkInterfaces()` hands them back in the reverse of
+    // the order it enumerated them, and `lo` — first out of the kernel — comes
+    // last. Reversing matches that shape, and on this host it makes the
+    // IPv4-carrying tail (`docker0`, `eth0`, `lo`) identical to HotSpot's.
+    //
+    // It does NOT reproduce HotSpot's order exactly, and cannot: the JDK's
+    // Linux IPv6 pass reads `/proc/net/if_inet6`, whose row order is a kernel
+    // hash-table walk, not the ascending-index order `getifaddrs` returns.
+    // With 14 veth interfaces present, HotSpot's block was
+    // 3422, 2845, 3427, 3424, … and ours is strictly descending. `Enumeration`
+    // order is unspecified by the API, so this is a difference rather than a
+    // defect — but do not read a probe row that names "the first non-loopback
+    // interface" as a divergence: it is naming whichever one came first.
+    out.reverse();
     for iface in &mut out {
         iface.index = re8_iface_index(&iface.name);
         iface.mtu = re8_sys_attr(&iface.name, "mtu").and_then(|t| t.parse::<i32>().ok());
@@ -14100,10 +15050,27 @@ fn re8_scan_host_ifaces() -> Vec<Re8HostIface> {
 /// us about that interface".
 fn re8_host_iface_by_name(name: &str) -> Option<Re8HostIface> {
     if let Some(text) = re8_sys_attr(name, "flags") {
-        let flags = text
+        let mut flags = text
             .strip_prefix("0x")
             .and_then(|hex| u32::from_str_radix(hex, 16).ok())
             .or_else(|| text.parse::<u32>().ok())?;
+        // `/sys/class/net/<if>/flags` is the kernel's `dev->flags`, which
+        // NEVER carries IFF_RUNNING (0x40) — that bit is synthesised by
+        // `dev_get_flags()` for `SIOCGIFFLAGS`/`getifaddrs` from the device's
+        // operational state. Measured on this host: `lo` reads 0x9 and `eth0`
+        // reads 0x1003, so `isUp0`'s faithful `IFF_UP && IFF_RUNNING` test was
+        // false for EVERY interface and `NetworkInterface.isUp()` answered
+        // false across the board — where HotSpot answers true for all five.
+        // Anything that picks "the first non-loopback interface that is up"
+        // found nothing at all. Re-derive the bit the way the kernel does.
+        if flags & RE8_IFF_UP != 0 {
+            let oper = re8_sys_attr(name, "operstate").unwrap_or_default();
+            // `netif_oper_up()`: IF_OPER_UP or IF_OPER_UNKNOWN. `lo` reports
+            // "unknown" and is nonetheless running.
+            if oper.is_empty() || oper == "up" || oper == "unknown" {
+                flags |= RE8_IFF_RUNNING;
+            }
+        }
         return Some(Re8HostIface {
             name: name.to_string(),
             index: re8_iface_index(name),
@@ -14189,7 +15156,7 @@ const RE8_LOOPBACK_INDEX: i32 = 1;
 ///
 /// GC note: the returned reference is NOT pinned. A caller that allocates again
 /// before using it must pin it across that allocation.
-fn re8_make_interface(ctx: &mut dyn NativeContext, host: &Re8HostIface) -> Option<ObjectRef> {
+fn re8_make_interface(ctx: &mut dyn NativeContext, host: &Re8HostIface) -> Result<Option<ObjectRef>, MethodCallFailed> {
     let addr_cid = ctx
         .class_id_by_name("java/net/InetAddress")
         .unwrap_or(ClassId::new(0));
@@ -14197,18 +15164,36 @@ fn re8_make_interface(ctx: &mut dyn NativeContext, host: &Re8HostIface) -> Optio
     // First pin of the batch: `unpin_native_roots(base_pin)` at the end
     // releases this and every pin taken after it.
     let base_pin = ctx.pin_native_root(addrs);
-    let hostname = hostname_string();
     for (i, ip) in host.addrs.iter().enumerate() {
-        let label = if ip.is_loopback() {
-            "localhost"
-        } else {
-            hostname.as_str()
+        // NO name. The JDK's `getAll0` builds these addresses from raw octets
+        // and never supplies a hostName, so HotSpot prints `/127.0.0.1` and
+        // `/fe80:…%eth0` for every row of `getInetAddresses()`. Labelling them
+        // `localhost` / `<hostname>` — which this loop used to do — is the
+        // exact divergence
+        // `docs/internal/fixed-suite-bugs/inetaddress-tostring-hostname-literal-addresses-FIXED.md`
+        // removed everywhere else; this call site was missed. `getHostName()`
+        // still answers the numeric text, because that is its no-name
+        // fallback.
+        let label = NO_HOST_NAME;
+        // EVERY IPv6 address reached through an interface is scoped to that
+        // interface, not just the link-local ones. Measured against HotSpot
+        // JDK 25 on this host: `lo`'s address is `0:0:0:0:0:0:0:1%lo` with
+        // `getScopeId() == 1`, even though `getifaddrs` reports
+        // `sin6_scope_id == 0` for it. The JDK's Linux enumeration reads
+        // `/proc/net/if_inet6` and stores the interface INDEX as the scope for
+        // every row, then `createNetworkInterface` attaches the interface as
+        // `scope_ifname` whenever that scope is non-zero — so the suffix is
+        // the interface NAME and the id is its index. Deriving the suffix from
+        // `sin6_scope_id` instead would leave `::1%lo` unscoped.
+        let text = match ip {
+            IpAddr::V6(_) => format!("{ip}%{}", host.name),
+            IpAddr::V4(_) => ip.to_string(),
         };
         // Allocates several objects, so re-read the array through its pin
         // before storing into it (native stale-local family).
-        let addr = alloc_inet_address(ctx, label, &ip.to_string());
+        let addr = alloc_inet_address(ctx, label, &text);
         addrs = ctx.read_native_pin(base_pin, addrs);
-        ctx.set_array_element(addrs, i, Value::Object(Some(addr)));
+        ctx.set_array_element(addrs, i, Value::Object(Some(addr?)));
     }
     let name0 = ctx.create_string(&host.name);
     let name_pin = ctx.pin_native_root(name0);
@@ -14216,7 +15201,7 @@ fn re8_make_interface(ctx: &mut dyn NativeContext, host: &Re8HostIface) -> Optio
         Ok(Some(Value::Object(Some(o)))) => o,
         _ => {
             ctx.unpin_native_roots(base_pin);
-            return None;
+            return Ok(None);
         }
     };
     let iface_pin = ctx.pin_native_root(iface0);
@@ -14234,6 +15219,28 @@ fn re8_make_interface(ctx: &mut dyn NativeContext, host: &Re8HostIface) -> Optio
             Value::Object(Some(addrs)),
         ],
     );
+    // `Inet6Address.getScopedInterface()` is un-intercepted real-JDK bytecode
+    // reading `holder6.scope_ifname`, and HotSpot's `createNetworkInterface`
+    // sets it to the very interface being built. It can only be written HERE,
+    // after the carrier exists: `alloc_inet_address` cannot mint one for its
+    // own address (this function is what mints interfaces, and it allocates
+    // addresses — the recursion has no base case). The rendered `%eth0` suffix
+    // does not depend on this (the side table supplies it), but
+    // `getScopedInterface()` answered null without it, and the JDK's own
+    // `Inet6Address(String, byte[], NetworkInterface)` constructor reads
+    // `getScopeId()` off these addresses to derive a scope for a new one.
+    //
+    // No allocation happens in this loop, so the pinned handles stay valid
+    // throughout.
+    let addrs_now = ctx.read_native_pin(base_pin, addrs);
+    let iface_now = ctx.read_native_pin(iface_pin, iface0);
+    for i in 0..ctx.array_length(addrs_now) {
+        if let Value::Object(Some(a)) = ctx.get_array_element(addrs_now, i) {
+            if let Value::Object(Some(h6)) = ctx.get_field_by_name(a, "holder6") {
+                ctx.set_field_by_name(h6, "scope_ifname", Value::Object(Some(iface_now)));
+            }
+        }
+    }
     // The package-private ctor leaves `childs` null and
     // `NetworkInterface.getSubInterfaces()`'s anonymous Enumeration reads
     // `childs.length` — see the note in `re8_make_loopback_interface`.
@@ -14250,7 +15257,7 @@ fn re8_make_interface(ctx: &mut dyn NativeContext, host: &Re8HostIface) -> Optio
     ctx.set_field_by_name(iface, "displayName", Value::Object(Some(display)));
     let iface = ctx.read_native_pin(iface_pin, iface0);
     ctx.unpin_native_roots(base_pin);
-    Some(iface)
+    Ok(Some(iface))
 }
 
 /// `getAll()` — one REAL-layout carrier per host interface.
@@ -14271,7 +15278,7 @@ fn re8_all_interfaces(ctx: &mut dyn NativeContext) -> ObjectRef {
     let mut pinned: Vec<(usize, ObjectRef)> = Vec::new();
     let mut base_pin: Option<usize> = None;
     for host in &hosts {
-        if let Some(iface) = re8_make_interface(ctx, host) {
+        if let Ok(Some(iface)) = re8_make_interface(ctx, host) {
             let pin = ctx.pin_native_root(iface);
             if base_pin.is_none() {
                 base_pin = Some(pin);
@@ -14312,17 +15319,19 @@ fn re8_find_interface(
     ctx: &mut dyn NativeContext,
     select: impl Fn(&Re8HostIface) -> bool,
     loopback_fallback: bool,
-) -> Option<ObjectRef> {
+) -> Result<Option<ObjectRef>, MethodCallFailed> {
     let hosts = re8_scan_host_ifaces();
     if hosts.is_empty() {
         return if loopback_fallback {
-            re8_make_loopback_interface(ctx)
+            Ok(re8_make_loopback_interface(ctx))
         } else {
-            None
+            Ok(None)
         };
     }
-    let host = hosts.into_iter().find(select)?;
-    re8_make_interface(ctx, &host)
+    let Some(host) = hosts.into_iter().find(select) else {
+        return Ok(None);
+    };
+    Ok(re8_make_interface(ctx, &host)?)
 }
 
 /// Build the single REAL-layout loopback `NetworkInterface` ("lo", index 1,
@@ -14570,7 +15579,7 @@ fn register_re8_network_interface(r: &mut NativeMethodRegistry) {
                 ctx,
                 move |host| host.name == wanted,
                 name == RE8_LOOPBACK_NAME,
-            );
+            )?;
             Ok(Some(Value::Object(iface)))
         },
         NativeKind::Bridge,
@@ -14588,7 +15597,7 @@ fn register_re8_network_interface(r: &mut NativeMethodRegistry) {
                 return Ok(Some(Value::Object(None)));
             };
             let iface =
-                re8_find_interface(ctx, move |host| host.addrs.contains(&ip), ip.is_loopback());
+                re8_find_interface(ctx, move |host| host.addrs.contains(&ip), ip.is_loopback())?;
             Ok(Some(Value::Object(iface)))
         },
         NativeKind::Bridge,
@@ -14637,7 +15646,7 @@ fn register_re8_network_interface(r: &mut NativeMethodRegistry) {
                 ctx,
                 move |host| host.index == index,
                 index == RE8_LOOPBACK_INDEX,
-            );
+            )?;
             Ok(Some(Value::Object(iface)))
         },
         NativeKind::Bridge,
@@ -15390,7 +16399,7 @@ fn re10_authenticate(
     hctx: ObjectRef,
     ex_pin: usize,
     ex0: ObjectRef,
-) -> AuthGate {
+) -> Result<AuthGate, MethodCallFailed> {
     // Cheap probe first. `HttpContext.getAuthenticator` is a registered native
     // that only looks the context up in a side table, so the no-authenticator
     // path costs one native call and allocates nothing.
@@ -15401,7 +16410,7 @@ fn re10_authenticate(
         &[],
     ) {
         Ok(Some(Value::Object(Some(a)))) => a,
-        _ => return AuthGate::Proceed,
+        _ => return Ok(AuthGate::Proceed),
     };
     // Pinned from here on; `unpin_native_roots(auth_pin)` at the end releases
     // this and the result (both pinned after the caller's batch, so the
@@ -15420,7 +16429,7 @@ fn re10_authenticate(
         // AuthFilter) — either way the request is NOT authenticated.
         _ => {
             ctx.unpin_native_roots(auth_pin);
-            return AuthGate::Reject(500);
+            return Ok(AuthGate::Reject(500));
         }
     };
     let result_pin = ctx.pin_native_root(result0);
@@ -15464,7 +16473,7 @@ fn re10_authenticate(
         None => AuthGate::Reject(500),
     };
     ctx.unpin_native_roots(auth_pin);
-    gate
+    Ok(gate)
 }
 
 fn re10_dispatch_pending(
@@ -15513,11 +16522,11 @@ fn re10_dispatch_pending(
                 // authentication gate below dereferences it after every one of
                 // those allocations.
                 let hctx_pin = ctx.pin_native_root(hctx0);
-                let ex0 = alloc_concurrent_synthetic(
+                let ex0 = try_alloc_concurrent_synthetic(
                     ctx,
                     "com/sun/net/httpserver/HttpExchange",
                     HEX_NUM_FIELDS,
-                );
+                )?;
                 let ex_pin = ctx.pin_native_root(ex0);
 
                 let m = ctx.create_string(&req.method);
@@ -15584,7 +16593,7 @@ fn re10_dispatch_pending(
                         let ip = sa.ip().to_string();
                         let isa =
                             alloc_inet_socket_address_resolved(ctx, &ip, &ip, sa.port() as i32);
-                        Value::Object(Some(isa))
+                        Value::Object(Some(isa?))
                     }
                     None => Value::Object(None),
                 };
@@ -15595,7 +16604,7 @@ fn re10_dispatch_pending(
                         let ip = sa.ip().to_string();
                         let isa =
                             alloc_inet_socket_address_resolved(ctx, &ip, &ip, sa.port() as i32);
-                        Value::Object(Some(isa))
+                        Value::Object(Some(isa?))
                     }
                     None => Value::Object(None),
                 };
@@ -15611,7 +16620,7 @@ fn re10_dispatch_pending(
                 // common case.
                 let hctx = ctx.read_native_pin(hctx_pin, hctx0);
                 let gate = re10_authenticate(ctx, hctx, ex_pin, ex0);
-                match gate {
+                match gate? {
                     AuthGate::Proceed => {
                         // Re-read both pinned roots immediately before the invoke
                         // (the exchange-build allocations above, and any
@@ -15638,6 +16647,16 @@ fn re10_dispatch_pending(
                             "(IJ)V",
                             &[Value::Int(code), Value::Long(-1)],
                         );
+                        //
+                        // KEPT SWALLOW. Same reasoning as that backstop — no
+                        // JDK body to copy a `catch` from — plus one this site
+                        // adds: it sits inside the pending-exchange dispatch
+                        // LOOP, holding `ex_pin`. Propagating would abort
+                        // serving every remaining pending exchange because one
+                        // rejected request failed to close, which is a worse
+                        // defect than the one being removed. The `Error`
+                        // residual is recorded rather than traded for that.
+                        // W7-57-close-flush-swallow-sweep.md
                         let ex = ctx.read_native_pin(ex_pin, ex0);
                         let _ = ctx.invoke_virtual(ex, "close", "()V", &[]);
                     }
@@ -15647,16 +16666,57 @@ fn re10_dispatch_pending(
                 let ex = ctx.read_native_pin(ex_pin, ex0);
                 let status = ctx.get_field(ex, 5).as_int().unwrap_or(200);
                 let mut body_bytes: Vec<u8> = Vec::new();
+                // W7-24: index of the real-JDK response buffer, if the strict
+                // policy refused the `ResponseBody` stand-in and
+                // `re10_real_jdk_response_body` parked a
+                // `java.io.ByteArrayOutputStream` here instead of chunks.
+                // Draining it means an `invoke_virtual`, which allocates, so it
+                // happens AFTER this walk rather than inside it — the walk's own
+                // invariant is that nothing in it allocates.
+                let mut real_sink: Option<usize> = None;
                 if let Value::Object(Some(chunks)) = ctx.get_field(ex, 6) {
                     // array_length / get_array_element do not allocate, so the
                     // chunk array and each `ba` stay valid through the walk.
                     let n = ctx.array_length(chunks);
                     for i in 0..n {
                         if let Value::Object(Some(ba)) = ctx.get_array_element(chunks, i) {
+                            // `object_is_array` is a heap object-kind check, not
+                            // a class-name test — a reference array reports its
+                            // COMPONENT class, so a name test cannot tell these
+                            // apart. Compatible mode never parks a non-array
+                            // here, so this arm is strict-only and the two can
+                            // never interleave: whether the mint is refused is a
+                            // property of the run, not of the call.
+                            if !ctx.object_is_array(ba) {
+                                real_sink.get_or_insert(i);
+                                continue;
+                            }
                             let ln = ctx.array_length(ba);
                             for j in 0..ln {
                                 if let Value::Int(b) = ctx.get_array_element(ba, j) {
                                     body_bytes.push(b as i8 as u8);
+                                }
+                            }
+                        }
+                    }
+                }
+                if let Some(i) = real_sink {
+                    // Re-read the exchange AND its chunk array from the pin
+                    // rather than reusing the locals above: `toByteArray()` runs
+                    // a method and can move both.
+                    let ex = ctx.read_native_pin(ex_pin, ex0);
+                    if let Value::Object(Some(chunks)) = ctx.get_field(ex, 6) {
+                        if let Value::Object(Some(sink)) = ctx.get_array_element(chunks, i) {
+                            if let Ok(Some(Value::Object(Some(arr)))) =
+                                ctx.invoke_virtual(sink, "toByteArray", "()[B", &[])
+                            {
+                                // `arr` is the invoke's own result, so it is
+                                // current, and nothing below allocates.
+                                let ln = ctx.array_length(arr);
+                                for j in 0..ln {
+                                    if let Value::Int(b) = ctx.get_array_element(arr, j) {
+                                        body_bytes.push(b as i8 as u8);
+                                    }
                                 }
                             }
                         }
@@ -15778,10 +16838,54 @@ fn re10_spawn_dispatcher(
 ) -> Result<(), cratonvm_types::error::MethodCallFailed> {
     let dbg = crate::nbflags().dbg_httpsrv;
     for idx in 0..HS_DISPATCHER_POOL {
-        let runner = alloc_concurrent_synthetic(ctx, HS_LOOP_CLASS, 1);
+        // W7-24 — `ensure_vm_internal_class`, not the compatibility door.
+        //
+        // `CratonVM$HttpServerLoop` is a shape this VM invents to carry
+        // `server_id` from here to `re10_serve_loop_run` on a real VM thread.
+        // `javap CratonVM.HttpServerLoop` against the JDK 25 image answers
+        // "class not found", the name is in no JDK namespace at all, and no
+        // class file can ever back it — contract §1 item 6's shape, which
+        // `ensure_vm_internal_class` exists to mint in every mode. Through
+        // `try_alloc_concurrent_synthetic` alone it acquired
+        // `ClassOrigin::CompatibilityStub`, which `--jdk-only` correctly
+        // refuses, and the refusal killed the whole server:
+        //
+        //     $ cratonvm --jdk-only … HttpServerWildcardAddressProbe
+        //     NoClassDefFoundError: CratonVM$HttpServerLoop
+        //         at HttpServerWildcardAddressProbe.main(…:49)
+        //
+        // i.e. `com.sun.net.httpserver.HttpServer.start()` could not start
+        // under strict mode. `bind()` and `getAddress()` were already fine —
+        // this is the one call the door took out.
+        //
+        // The natives are the OTHER gate, and here it is already open,
+        // measured rather than assumed: `--dump-native-registry` taken once
+        // per mode reports this class's single `run()V` as `kind":"bridge"` in
+        // Compatible AND under `--jdk-only`. The name is on none of
+        // `no_image_receiver.rs`'s tables — it does not start with `cratonvm/`
+        // so `VM_MINTED_STAND_IN_RECEIVERS` is not consulted, and it is in
+        // neither `NO_IMAGE_JDK_RECEIVERS` nor `VM_SERVICE_RECEIVERS` — so
+        // `receiver_declared_by_no_supported_image` answers false and nothing
+        // re-tags it `SyntheticStub`. That check is per class and is not a
+        // general licence: flipping the door on a receiver whose natives ARE
+        // dropped in strict buys an `UnsatisfiedLinkError` at the first call
+        // instead of a `NoClassDefFoundError` at the mint, which is a moved
+        // symptom rather than a fix (measured on
+        // `cratonvm/internal/LinkedListSnapshotListItr`).
+        //
+        // Pre-mint rather than replace, so the allocation below keeps its
+        // real-vs-requested field-count widening and its GC-safe retry:
+        // `fabricate_class` returns the existing `ClassId` for an
+        // already-loaded name before it reaches `admit_compatibility_class`,
+        // so `Compatible` is byte-for-byte unchanged and only the recorded
+        // ORIGIN moves (`compatibility-stub` → `vm-internal` in
+        // `--dump-class-origins`, and `vm_exec.rs`'s `stub_hint` stops
+        // suggesting a missing jar for a class no jar has).
+        ctx.ensure_vm_internal_class(HS_LOOP_CLASS, 1);
+        let runner = try_alloc_concurrent_synthetic(ctx, HS_LOOP_CLASS, 1)?;
         ctx.set_field(runner, 0, Value::Int(server_id));
 
-        let worker = alloc_concurrent_synthetic(ctx, "java/lang/Thread", HS_THREAD_NUM_FIELDS);
+        let worker = try_alloc_concurrent_synthetic(ctx, "java/lang/Thread", HS_THREAD_NUM_FIELDS)?;
         let name = ctx.create_string(&format!("cratonvm-httpserver-dispatch-{server_id}-{idx}"));
         // Populate the worker Thread via the registered
         // `Thread.<init>(ThreadGroup, Runnable, String)` native. This stores the
@@ -16032,7 +17136,7 @@ fn re10_alloc_server(
     ctx: &mut dyn NativeContext,
     class_name: &str,
     bound: Option<(TcpListener, IpAddr, i32)>,
-) -> ObjectRef {
+) -> Result<ObjectRef, MethodCallFailed> {
     let (listener, endpoint) = match bound {
         Some((l, ip, port)) => (Some(l), Some((ip, port))),
         None => (None, None),
@@ -16048,7 +17152,7 @@ fn re10_alloc_server(
         bound_port: AtomicI32::new(bound_port),
     });
     server_registry().lock().insert(server_id, state);
-    let srv0 = alloc_concurrent_synthetic(ctx, class_name, 6);
+    let srv0 = try_alloc_concurrent_synthetic(ctx, class_name, 6)?;
     // `alloc_inet_socket_address_resolved` allocates, so a moving young GC can
     // relocate `srv` between the two — pin it and read the forwarded address
     // back (native stale-local family). The previous inline version wrote its
@@ -16062,7 +17166,7 @@ fn re10_alloc_server(
             let ip_str = ip.to_string();
             Some(alloc_inet_socket_address_resolved(
                 ctx, &ip_str, &ip_str, port,
-            ))
+            )?)
         }
         None => None,
     };
@@ -16074,7 +17178,7 @@ fn re10_alloc_server(
     ctx.set_field(srv, HS_PORT, Value::Int(bound_port));
     ctx.set_field(srv, HS_EXECUTOR, Value::Object(None));
     ctx.unpin_native_roots(srv_pin);
-    srv
+    Ok(srv)
 }
 
 /// `HttpServer.create(InetSocketAddress, int)`.
@@ -16101,7 +17205,7 @@ pub(crate) fn re10_create_server(
         _ => None,
     };
     let srv = re10_alloc_server(ctx, class_name, bound);
-    Ok(Some(Value::Object(Some(srv))))
+    Ok(Some(Value::Object(Some(srv?))))
 }
 
 /// `HttpServer.create()` — a server that is deliberately NOT bound yet.
@@ -16113,7 +17217,7 @@ pub(crate) fn re10_create_server(
 /// exactly those. See [`re10_create_server`].
 pub(crate) fn re10_create_unbound_server(ctx: &mut dyn NativeContext) -> MethodCallResult {
     let srv = re10_alloc_server(ctx, "com/sun/net/httpserver/HttpServer", None);
-    Ok(Some(Value::Object(Some(srv))))
+    Ok(Some(Value::Object(Some(srv?))))
 }
 
 /// `HttpServer.bind(InetSocketAddress, int)` — really bind the listener.
@@ -16153,10 +17257,129 @@ pub(crate) fn re10_bind_server(ctx: &mut dyn NativeContext, args: &[Value]) -> M
     let ip_str = bound_ip.to_string();
     let sa_echo = alloc_inet_socket_address_resolved(ctx, &ip_str, &ip_str, bound_port);
     let this = ctx.read_native_pin(this_pin, this);
-    ctx.set_field(this, HS_ADDRESS, Value::Object(Some(sa_echo)));
+    ctx.set_field(this, HS_ADDRESS, Value::Object(Some(sa_echo?)));
     ctx.set_field(this, HS_PORT, Value::Int(bound_port));
     ctx.unpin_native_roots(this_pin);
     Ok(None)
+}
+
+/// `HttpExchange.getResponseBody()`'s real-JDK stand-in, built **only** when the
+/// policy has already refused the VM-minted `HttpExchange$ResponseBody`.
+///
+/// W7-24. `com/sun/net/httpserver/HttpExchange$ResponseBody` is a *behaviour
+/// carrier* in W7-17's classification, not a door defect, and the distinction
+/// decides the fix. `javap com.sun.net.httpserver.HttpExchange$ResponseBody`
+/// against the JDK 25 image answers "class not found", so it passes the
+/// guardrail — but `--dump-native-registry` taken once per mode reports its five
+/// natives (`write(I)`, `write([B)`, `write([BII)`, `flush`, `close`, all
+/// registered a few lines below) as `synthetic-stub` in Compatible and **absent**
+/// under `--jdk-only`. `CompatibilityStub` is therefore the CORRECT origin: the
+/// class exists only to carry an implementation strict mode is deliberately
+/// retiring, and the class and its natives are refused together on purpose.
+/// Re-minting it through `ensure_vm_internal_class` — the fix
+/// `CratonVM$HttpServerLoop` needed, three functions up — would put back a class
+/// strict mode has no implementation for and buy an `UnsatisfiedLinkError` at
+/// the handler's first `write` instead of the `NoClassDefFoundError` at the
+/// mint. What is missing here is not a door but a **fallback at the refusal**,
+/// which is the shape `craton_alloc_system_logger` already implements for
+/// `cratonvm/internal/SystemLogger`.
+///
+/// **Why `java.io.ByteArrayOutputStream`, and not what HotSpot returns.**
+/// Measured on this host, HotSpot 25's `getResponseBody()` hands back a
+/// `sun.net.httpserver.PlaceholderOutputStream`; that class cannot serve — it is
+/// package-private, its only constructor takes the `OutputStream` it wraps, and
+/// every write goes through a `checkWrap()` that throws until a real
+/// `ExchangeImpl` has called `setWrappedStream`. There is no `ExchangeImpl` on
+/// this path. `java.io.ByteArrayOutputStream` can: it is a real, public
+/// `java.base` class; every method this stream needs is registered `bridge` in
+/// BOTH modes (`native-io/src/lib.rs` — `<init>()V`, the three `write`s,
+/// `flush`, `close`, `toByteArray`), so nothing about it is dropped by the
+/// strict policy; and it has exactly the semantics the carrier had — accumulate
+/// now, hand the bytes to the dispatcher after `handle()` returns. It is not the
+/// name HotSpot reports, and this VM's Compatible answer
+/// (`com.sun.net.httpserver.HttpExchange$ResponseBody`) is not that name either,
+/// so the fallback costs no fidelity that was there to lose and buys a working
+/// response body where strict mode had none.
+///
+/// **Where it is parked.** In the exchange's own chunk array (slot 6), not in a
+/// Rust side table: the array is GC-traced from the exchange for exactly as long
+/// as the exchange lives, and `re10_dispatch_pending`'s drain already looks
+/// there, in order, for the response bytes. A side table keyed on an `ObjectRef`
+/// would need pinning across the whole handler call and would inherit a
+/// recycled address's state.
+fn re10_real_jdk_response_body(
+    ctx: &mut dyn NativeContext,
+    ex_pin: usize,
+    ex0: ObjectRef,
+    refusal: MethodCallFailed,
+) -> Result<ObjectRef, MethodCallFailed> {
+    // Keep the refusal itself alive across the allocations below.
+    // `MethodCallFailed::ExceptionThrown` carries a raw `ObjectRef`, and
+    // re-raising one that a young collection moved in the meantime is the same
+    // stale-local family every other site in this function's neighbourhood pins
+    // against. The pin batch belongs to the caller's `this_pin`, so the caller's
+    // single `unpin_native_roots` releases this one too — do not unpin here.
+    let refusal_pin = match &refusal {
+        MethodCallFailed::ExceptionThrown(exc) => Some((ctx.pin_native_root(*exc), *exc)),
+        _ => None,
+    };
+    // Same order as `real_jdk_system_logger`: ask whether the real class is
+    // there BEFORE trying to build it, so a missing image class leaves the
+    // refusal standing rather than turning it into a second, less informative
+    // failure.
+    let have_real = ctx.class_id_by_name("java/io/ByteArrayOutputStream").is_some()
+        || ctx
+            .ensure_class_initialized("java/io/ByteArrayOutputStream")
+            .is_ok();
+    let built = if have_real {
+        ctx.new_object_initialized("java/io/ByteArrayOutputStream", "()V", &[])
+    } else {
+        Ok(None)
+    };
+    let sink = match built {
+        Ok(Some(Value::Object(Some(o)))) => o,
+        _ => return Err(re10_reraise(ctx, refusal, refusal_pin)),
+    };
+    // No allocation between the create above and the park below — `get_field`,
+    // `array_length`, `get_array_element` and `set_array_element` do not
+    // allocate — so `sink` needs no pin of its own; the exchange does, because
+    // `new_object_initialized` ran a constructor.
+    let ex = ctx.read_native_pin(ex_pin, ex0);
+    let chunks = match ctx.get_field(ex, 6) {
+        Value::Object(Some(c)) => c,
+        _ => return Err(re10_reraise(ctx, refusal, refusal_pin)),
+    };
+    let cap = ctx.array_length(chunks);
+    for i in 0..cap {
+        if let Value::Object(None) = ctx.get_array_element(chunks, i) {
+            ctx.set_array_element(chunks, i, Value::Object(Some(sink)));
+            return Ok(sink);
+        }
+    }
+    // Chunk array full. The three `write` natives below silently drop a chunk in
+    // this case; a fallback stream that the drain will never read must NOT be
+    // silent about it — a response body dropped without a word is the
+    // "refusal laundered into a wrong answer" failure W7-17 §8 names as worse
+    // than either gate.
+    Err(ioex(
+        "HttpExchange.getResponseBody: no free response chunk slot for the \
+         real-JDK response body",
+    ))
+}
+
+/// Re-raise a refusal that has been held across allocations, reading it back
+/// from its pin first. Split out because the fallback above has three exits that
+/// must all do it and a copy that forgets the `read_native_pin` is invisible
+/// until a young collection happens to move the exception.
+fn re10_reraise(
+    ctx: &dyn NativeContext,
+    refusal: MethodCallFailed,
+    refusal_pin: Option<(usize, ObjectRef)>,
+) -> MethodCallFailed {
+    match refusal_pin {
+        Some((handle, exc)) => MethodCallFailed::ExceptionThrown(ctx.read_native_pin(handle, exc)),
+        None => refusal,
+    }
 }
 
 fn register_re10_http_server(r: &mut NativeMethodRegistry) {
@@ -16313,7 +17536,7 @@ fn register_re10_http_server(r: &mut NativeMethodRegistry) {
             // entry, and the context's slot 1, record the live address rather
             // than a vacated from-space slot.
             let h_pin = ctx.pin_native_root(handler0);
-            let hctx0 = alloc_concurrent_synthetic(ctx, "com/sun/net/httpserver/HttpContext", 2);
+            let hctx0 = try_alloc_concurrent_synthetic(ctx, "com/sun/net/httpserver/HttpContext", 2)?;
             let hctx_pin = ctx.pin_native_root(hctx0);
             let path_s = ctx.create_string(&path);
             let hctx = ctx.read_native_pin(hctx_pin, hctx0);
@@ -16429,7 +17652,7 @@ fn register_re10_http_server(r: &mut NativeMethodRegistry) {
             Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
             _ => String::new(),
         };
-        let uri = make_uri(ctx, &raw);
+        let uri = make_uri(ctx, &raw)?;
         Ok(Some(Value::Object(Some(uri))))
     });
     // Request/response headers are stored on the exchange as REAL
@@ -16474,7 +17697,7 @@ fn register_re10_http_server(r: &mut NativeMethodRegistry) {
             // `expected:<403> but was:<200>` under -Xmx1g GC pressure). Pin it
             // across the alloc and read the forwarded address back.
             let body_pin = ctx.pin_native_root(body0);
-            let stream = alloc_concurrent_synthetic(ctx, "java/io/ByteArrayInputStream", 4);
+            let stream = try_alloc_concurrent_synthetic(ctx, "java/io/ByteArrayInputStream", 4)?;
             let body = ctx.read_native_pin(body_pin, body0);
             ctx.set_field(stream, 0, Value::Object(Some(body))); // buf
             ctx.set_field(stream, 1, Value::Int(0)); // pos
@@ -16517,14 +17740,33 @@ fn register_re10_http_server(r: &mut NativeMethodRegistry) {
             // response body. Pin it across the alloc and read it back forwarded.
             let this0 = obj_arg(args, 0)?;
             let this_pin = ctx.pin_native_root(this0);
-            let out = alloc_concurrent_synthetic(
+            let out = match try_alloc_concurrent_synthetic(
                 ctx,
                 "com/sun/net/httpserver/HttpExchange$ResponseBody",
                 2,
-            );
-            let this = ctx.read_native_pin(this_pin, this0);
-            ctx.set_field(out, 0, Value::Object(Some(this)));
-            ctx.set_field(out, 1, Value::Int(0));
+            ) {
+                Ok(out) => {
+                    let this = ctx.read_native_pin(this_pin, this0);
+                    ctx.set_field(out, 0, Value::Object(Some(this)));
+                    ctx.set_field(out, 1, Value::Int(0));
+                    out
+                }
+                // W7-24 — the real-JDK fallback, taken ONLY at the refusal.
+                // `Compatible` never refuses this mint (measured: the class is
+                // fabricated once per run in every Compatible HttpServer run,
+                // and the `--jdk-only-report` row for it is the only
+                // `net_phase_e` row on the serve path besides the dispatcher's),
+                // so this arm cannot run there and Compatible is unchanged.
+                Err(refusal) => match re10_real_jdk_response_body(ctx, this_pin, this0, refusal) {
+                    Ok(out) => out,
+                    Err(err) => {
+                        // Unpin before unwinding: an early return past
+                        // `unpin_native_roots` leaks the frame.
+                        ctx.unpin_native_roots(this_pin);
+                        return Err(err);
+                    }
+                },
+            };
             ctx.unpin_native_roots(this_pin);
             Ok(Some(Value::Object(Some(out))))
         },
@@ -16651,6 +17893,7 @@ fn register_re10_http_server(r: &mut NativeMethodRegistry) {
     // inheritance. Mirror the complete public HttpServer bridge surface onto
     // the concrete class returned by the factory, including set/getExecutor.
     r.alias_class(hs, HS_IMPL_CLASS);
+    ()
 }
 
 // ---------------------------------------------------------------------------
@@ -16999,6 +18242,46 @@ mod tests {
         assert_eq!(hotspot_ip_string("example.com"), "example.com");
     }
 
+    /// The v4-mapped fold belongs to the ENTRY POINT, not to the address.
+    ///
+    /// `getByName` / `InetAddress.getByAddress(byte[])` hand back an
+    /// `Inet4Address` for `::ffff:a.b.c.d` and HotSpot agrees — that is
+    /// [`hotspot_ip_string`], asserted above. But
+    /// `Inet6Address.getByAddress(String, byte[], int)` is specified to KEEP
+    /// all sixteen bytes, and CratonVM does not intercept it: the real JDK
+    /// bytecode builds the object, and the only CratonVM code that touches it
+    /// afterwards is `inet_addr_resolve`'s `holder6` branch, which reads the
+    /// 16 real octets back out. Folding there produced an object that answered
+    /// `instanceof Inet6Address` while `getAddress()` returned four bytes, and
+    /// `io.netty.util.NetUtil.toAddressString` indexes 16
+    /// (`ArrayIndexOutOfBoundsException: Index 4 out of bounds for length 4`,
+    /// `NetUtilTest.testIpv4MappedIp6GetByName` — HotSpot 14/14, CratonVM
+    /// 13/14 until this split).
+    #[test]
+    fn ipv6_uncompressed_text_never_folds_a_v4_mapped_address() {
+        let mapped: std::net::Ipv6Addr = "::ffff:192.168.0.1".parse().unwrap();
+        // The reader form keeps the v6 shape …
+        assert_eq!(ipv6_uncompressed_text(&mapped), "0:0:0:0:0:ffff:c0a8:1");
+        // … and re-parses to sixteen octets, which is the property netty needs.
+        assert_eq!(
+            ipv6_uncompressed_text(&mapped)
+                .parse::<std::net::Ipv6Addr>()
+                .unwrap()
+                .octets()
+                .len(),
+            16
+        );
+        // … while the entry-point form still folds, byte-identical to HotSpot.
+        assert_eq!(hotspot_ip_string("::ffff:192.168.0.1"), "192.168.0.1");
+        // A genuine IPv6 address renders the same through both.
+        let real: std::net::Ipv6Addr = "2001:db8::1".parse().unwrap();
+        assert_eq!(ipv6_uncompressed_text(&real), "2001:db8:0:0:0:0:0:1");
+        assert_eq!(
+            ipv6_uncompressed_text(&real),
+            hotspot_ip_string("2001:db8::1")
+        );
+    }
+
     #[test]
     fn re3_get_by_address_uses_hotspot_ipv6_text_and_concrete_layout() {
         let mut ctx = MockNativeContext::new();
@@ -17086,7 +18369,7 @@ mod tests {
         // HotSpot on the same bytes:
         //   getByAddress("example.invalid", bytes) -> example.invalid/fe80:0:0:0:…
         let named =
-            alloc_inet_address(&mut ctx, "example.invalid", "fe80:0:0:0:67b0:99e:5a9b:287e");
+            alloc_inet_address(&mut ctx, "example.invalid", "fe80:0:0:0:67b0:99e:5a9b:287e").unwrap();
         assert_eq!(
             inet_addr_resolve(&ctx, named),
             Some((
@@ -17183,7 +18466,7 @@ mod tests {
     fn re5_handler_tag_classifies_synthetic_vs_real_handlers() {
         let mut ctx = MockNativeContext::new();
         // Synthetic tagged handler -> its tag.
-        let bh = alloc_concurrent_synthetic(&mut ctx, "java/net/http/HttpResponse$BodyHandler", 1);
+        let bh = try_alloc_concurrent_synthetic(&mut ctx, "java/net/http/HttpResponse$BodyHandler", 1).unwrap();
         let tag = ctx.create_string("string");
         ctx.set_field(bh, 0, Value::Object(Some(tag)));
         assert_eq!(
@@ -17197,11 +18480,11 @@ mod tests {
             Some("inputstream")
         );
         // A real user handler class -> None: drive the real protocol.
-        let real = alloc_concurrent_synthetic(
+        let real = try_alloc_concurrent_synthetic(
             &mut ctx,
             "org/springframework/http/client/JdkClientHttpRequest$DecompressingBodyHandler",
             1,
-        );
+        ).unwrap();
         assert_eq!(re5_handler_tag(&ctx, Some(Value::Object(Some(real)))), None);
     }
 
@@ -17229,7 +18512,7 @@ mod tests {
         subscriber: ObjectRef,
     ) -> ObjectRef {
         let subscription =
-            alloc_concurrent_synthetic(ctx, RE5_REPLAY_SUBSCRIPTION, RE5_SUB_NUM_FIELDS);
+            try_alloc_concurrent_synthetic(ctx, RE5_REPLAY_SUBSCRIPTION, RE5_SUB_NUM_FIELDS).unwrap();
         ctx.set_field(
             subscription,
             RE5_SUB_SUBSCRIBER,
@@ -17244,7 +18527,7 @@ mod tests {
     fn re5_replay_subscription_delivers_completion_exactly_once() {
         let mut ctx = MockNativeContext::new();
         ctx.set_invoke_virtual_hook(re5_recording_subscriber_hook);
-        let subscriber = alloc_concurrent_synthetic(&mut ctx, "test/RecordingSubscriber", 2);
+        let subscriber = try_alloc_concurrent_synthetic(&mut ctx, "test/RecordingSubscriber", 2).unwrap();
         let subscription = re5_test_replay_subscription(&mut ctx, subscriber);
 
         // Zero / negative demand: nothing delivered.
@@ -17284,7 +18567,7 @@ mod tests {
     fn re5_replay_subscription_cancel_before_demand_suppresses_delivery() {
         let mut ctx = MockNativeContext::new();
         ctx.set_invoke_virtual_hook(re5_recording_subscriber_hook);
-        let subscriber = alloc_concurrent_synthetic(&mut ctx, "test/RecordingSubscriber", 2);
+        let subscriber = try_alloc_concurrent_synthetic(&mut ctx, "test/RecordingSubscriber", 2).unwrap();
         let subscription = re5_test_replay_subscription(&mut ctx, subscriber);
 
         re5_replay_subscription_cancel(&mut ctx, &[Value::Object(Some(subscription))]).unwrap();
@@ -17339,7 +18622,7 @@ mod tests {
         for (i, b) in bytes.iter().copied().enumerate() {
             ctx.set_array_element(arr, i, Value::Int(b as i8 as i32));
         }
-        let bb = alloc_concurrent_synthetic(ctx, "java/nio/HeapByteBuffer", 5);
+        let bb = try_alloc_concurrent_synthetic(ctx, "java/nio/HeapByteBuffer", 5).unwrap();
         ctx.set_field(bb, 0, Value::Object(Some(arr)));
         ctx.set_field(bb, 1, Value::Int(0));
         ctx.set_field(bb, 2, Value::Int(bytes.len() as i32));
@@ -17365,8 +18648,14 @@ mod tests {
             Some(Value::Object(Some(s))) => s,
             _ => return Some(Ok(None)),
         };
+        // This helper answers `Option<MethodCallResult>`, so a refused
+        // allocation is reported the same way the `on_subscribe` failure below
+        // is: `Some(Err(..))`. A `?` here would mean "no such method".
         let subscription =
-            alloc_concurrent_synthetic(ctx, "java/util/concurrent/Flow$Subscription", 2);
+            match try_alloc_concurrent_synthetic(ctx, "java/util/concurrent/Flow$Subscription", 2) {
+                Ok(o) => o,
+                Err(e) => return Some(Err(e)),
+            };
         if let Err(e) = re5_body_collector_on_subscribe(
             ctx,
             &[
@@ -17402,7 +18691,7 @@ mod tests {
             .expect("fromPublisher native is registered");
 
         let mut ctx = MockNativeContext::new();
-        let publisher = alloc_concurrent_synthetic(&mut ctx, "test/SynchronousPublisher", 0);
+        let publisher = try_alloc_concurrent_synthetic(&mut ctx, "test/SynchronousPublisher", 0).unwrap();
         let body_publisher = match native(&mut ctx, &[Value::Object(Some(publisher))]).unwrap() {
             Some(Value::Object(Some(body_publisher))) => body_publisher,
             other => panic!("expected BodyPublisher object, got {other:?}"),
@@ -17418,7 +18707,7 @@ mod tests {
     fn re5_request_body_bytes_drives_from_publisher_bytebuffers() {
         let mut ctx = MockNativeContext::new();
         ctx.set_invoke_virtual_hook(re5_scripted_publisher_subscribe);
-        let publisher = alloc_concurrent_synthetic(&mut ctx, "test/SynchronousPublisher", 0);
+        let publisher = try_alloc_concurrent_synthetic(&mut ctx, "test/SynchronousPublisher", 0).unwrap();
 
         let body = re5_request_body_bytes(&mut ctx, Value::Object(Some(publisher))).unwrap();
 
@@ -17765,8 +19054,8 @@ mod tests {
             Some(Value::Object(Some(builder))) => builder,
             other => panic!("newBuilder returned {other:?}"),
         };
-        let executor = alloc_concurrent_synthetic(&mut ctx, "test/Executor", 0);
-        let proxy = alloc_concurrent_synthetic(&mut ctx, "test/ProxySelector", 0);
+        let executor = try_alloc_concurrent_synthetic(&mut ctx, "test/Executor", 0).unwrap();
+        let proxy = try_alloc_concurrent_synthetic(&mut ctx, "test/ProxySelector", 0).unwrap();
 
         for (method, descriptor, value) in [
             (

@@ -238,18 +238,18 @@ fn native_sql_timestamp_to_local_date_time(
     let this = crate::obj_arg(args, 0)?;
     let millis = sql_datetime_millis(ctx, this);
     let parts = crate::deprecated_util::millis_to_default_date_parts(ctx, millis);
-    let date = crate::alloc_concurrent_synthetic(ctx, "java/time/LocalDate", 3);
+    let date = crate::try_alloc_concurrent_synthetic(ctx, "java/time/LocalDate", 3)?;
     ctx.set_field(date, 0, Value::Int(parts.year));
     ctx.set_field(date, 1, Value::Int(parts.month + 1));
     ctx.set_field(date, 2, Value::Int(parts.date));
 
-    let time = crate::alloc_concurrent_synthetic(ctx, "java/time/LocalTime", 4);
+    let time = crate::try_alloc_concurrent_synthetic(ctx, "java/time/LocalTime", 4)?;
     ctx.set_field(time, 0, Value::Int(parts.hrs));
     ctx.set_field(time, 1, Value::Int(parts.min));
     ctx.set_field(time, 2, Value::Int(parts.sec));
     ctx.set_field(time, 3, Value::Int(timestamp_nanos(ctx, this)));
 
-    let ldt = crate::alloc_concurrent_synthetic(ctx, "java/time/LocalDateTime", 2);
+    let ldt = crate::try_alloc_concurrent_synthetic(ctx, "java/time/LocalDateTime", 2)?;
     ctx.set_field(ldt, 0, Value::Object(Some(date)));
     ctx.set_field(ldt, 1, Value::Object(Some(time)));
     Ok(Some(Value::Object(Some(ldt))))
@@ -303,7 +303,7 @@ fn sql_datetime_millis(ctx: &dyn NativeContext, obj: ObjectRef) -> i64 {
 /// in class_manager.rs, which has no `java/sql/Timestamp` case).
 fn timestamp_nanos_index(ctx: &dyn NativeContext, obj: ObjectRef) -> Option<usize> {
     let class_id = ctx.class_id_of_object(obj);
-    if ctx.class_name_of_id(class_id).as_deref() != Some("java/sql/Timestamp") {
+    if ctx.class_name_arc_of_id(class_id).as_deref() != Some("java/sql/Timestamp") {
         return None;
     }
     let num_fields = ctx.object_num_fields(obj);

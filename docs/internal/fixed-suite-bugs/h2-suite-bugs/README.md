@@ -70,7 +70,7 @@ correctness (see the perf-hang report).
   `TestCharsetCollator`/`TestSetCollation.testCp500Collator` both pass.
 - **`bug-h2-netutils-missing-pbe-algparams.md`** — missing
   `PBEWithHmacSHA256AndAES_256` AlgorithmParameters — `TestNetUtils`.
-- **`bug-h2-mvstore-insert-loop-perf-hang.md`** — MVStore insert/commit
+- **`bug-h2-mvstore-insert-loop-perf-hang-RESOLVED-20260807.md`** — MVStore insert/commit
   throughput cliff (~90× on a 10 000-row loop); the dominant "silent hang"
   cause. Progressing, not deadlocked.
 - **`bug-h2-inprocess-javac-resource-bundle.md`** — in-process javac

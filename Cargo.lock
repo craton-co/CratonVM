@@ -492,6 +492,7 @@ version = "0.3.0"
 dependencies = [
  "anyhow",
  "clap",
+ "cratonvm-classloading",
  "cratonvm-cuda-bridge",
  "cratonvm-jfr",
  "cratonvm-jit",
@@ -609,6 +610,7 @@ dependencies = [
  "parking_lot",
  "rustc-hash",
  "socket2",
+ "tracing",
 ]
 
 [[package]]

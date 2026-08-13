@@ -57,6 +57,24 @@
 //!   `java.lang.reflect.Type`), return a String-identity mapping so
 //!   the recursion terminates instead of throwing OpenDataException.
 //!
+//! 2026-08-11 — the two defence-in-depth overlays above are now OFF by default
+//! on a real-JDK run (see `real_mxbean_mapping_enabled`). They cost more than
+//! they bought: typing every unrecognised type as `SimpleType.STRING` and
+//! making `toOpenValue` the identity meant `MBeanServer.getAttribute` handed
+//! back the raw Java value, so `java.lang:type=Memory` / `HeapMemoryUsage`
+//! answered a `java.lang.management.MemoryUsage` where every other JVM answers
+//! a `CompositeDataSupport`.
+//!
+//! The PRIMARY fix — the `getMethods(Class)` Object-method filter described
+//! above — stays registered unconditionally, and it is why the real
+//! `DefaultMXBeanMappingFactory` now terminates here: the `Class` →
+//! `AnnotatedType[]` self-reference that started this whole workaround is
+//! never offered to the mapping factory in the first place. Measured against
+//! JDK 25 on Linux, the real machinery reproduces HotSpot's answers exactly
+//! for every platform-MXBean attribute this VM can serve, and rejects a
+//! genuinely self-referential MXBean type with HotSpot's own
+//! `NotCompliantMBeanException` rather than looping.
+//!
 //! Security posture:
 //! * No `unsafe` code anywhere in this module.
 //! * Filter list is a static set of well-known JDK Object method
@@ -80,11 +98,12 @@
 //!   Both are JDK-standard read-only fields; reading either cannot
 //!   trigger arbitrary-code-execution.
 
-use crate::alloc_concurrent_synthetic;
+use crate::try_alloc_concurrent_synthetic;
 use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
 use cratonvm_types::error::MethodCallResult;
 use cratonvm_types::{ClassId, ObjectRef, Value};
 use std::cell::RefCell;
+use cratonvm_types::error::MethodCallFailed;
 
 /// Internal name of `java.lang.Object`.
 const OBJECT_INTERNAL: &str = "java/lang/Object";
@@ -330,8 +349,8 @@ fn is_object_inherited_method(ctx: &dyn NativeContext, method_obj: ObjectRef) ->
 fn alloc_array_list_from(
     ctx: &mut dyn NativeContext,
     elements: &[(usize, ObjectRef)],
-) -> ObjectRef {
-    let list = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
+) -> Result<ObjectRef, MethodCallFailed> {
+    let list = try_alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2)?;
     // Pin across the backing-array allocation below — a moving young GC
     // there would relocate the fresh list (native stale-local family).
     let list_pin = ctx.pin_native_root(list);
@@ -357,7 +376,7 @@ fn alloc_array_list_from(
         ctx.set_field(list, 1, Value::Int(elements.len() as i32));
     }
     ctx.unpin_native_roots(list_pin);
-    list
+    Ok(list)
 }
 
 // ---------------------------------------------------------------------------
@@ -404,14 +423,14 @@ fn native_introspector_get_methods(
         Some(s) => s,
         None => {
             // Empty list — caller's iterator path won't crash.
-            return Ok(Some(Value::Object(Some(alloc_array_list_from(ctx, &[])))));
+            return Ok(Some(Value::Object(Some(alloc_array_list_from(ctx, &[])?))));
         }
     };
     let class_name_internal = class_name_dot.replace('.', "/");
     let cid = match ctx.class_id_by_name(&class_name_internal) {
         Some(c) => c,
         None => {
-            return Ok(Some(Value::Object(Some(alloc_array_list_from(ctx, &[])))));
+            return Ok(Some(Value::Object(Some(alloc_array_list_from(ctx, &[])?))));
         }
     };
 
@@ -480,7 +499,7 @@ fn native_introspector_get_methods(
                 &method_meta.name,
                 &method_meta.descriptor,
                 method_meta.access_flags,
-            );
+            )?;
             let method_mirror_pin = ctx.pin_native_root(method_mirror);
             method_mirrors.push((method_mirror_pin, method_mirror));
         }
@@ -497,7 +516,7 @@ fn native_introspector_get_methods(
     Ok(Some(Value::Object(Some(alloc_array_list_from(
         ctx,
         &method_mirrors,
-    )))))
+    )?))))
 }
 
 /// Allocate a `java.lang.reflect.Method` mirror with the JDK-25 field
@@ -509,7 +528,7 @@ pub(crate) fn build_method_mirror(
     name: &str,
     descriptor: &str,
     modifiers: u16,
-) -> ObjectRef {
+) -> Result<ObjectRef, MethodCallFailed> {
     // SPB.11: Delegate to the canonical `create_method_object` so that the
     // CratonVM extra metadata slots (raw descriptor, parameter count,
     // accessible flag) are populated. Without those, `Method.invoke`
@@ -531,7 +550,7 @@ pub(crate) fn build_method_mirror(
             exceptions: Vec::new(),
             signature,
         };
-        return crate::lang_class::create_method_object(ctx, &meta);
+        return Ok(crate::lang_class::create_method_object(ctx, &meta)?);
     }
     // Fallback when we can't resolve the declaring class id — fill in only
     // the JDK-named fields we can. Method.invoke will still error, but the
@@ -543,7 +562,7 @@ pub(crate) fn build_method_mirror(
     // GC during any of them would relocate the objects and leave the raw
     // `ObjectRef`s stale (native stale-local family).
     let declaring_pin = ctx.pin_native_root(declaring_class_mirror);
-    let method_obj = alloc_concurrent_synthetic(ctx, "java/lang/reflect/Method", 12);
+    let method_obj = try_alloc_concurrent_synthetic(ctx, "java/lang/reflect/Method", 12)?;
     let method_obj_pin = ctx.pin_native_root(method_obj);
     let declaring_class_mirror = ctx.read_native_pin(declaring_pin, declaring_class_mirror);
     ctx.set_field_by_name(
@@ -573,7 +592,7 @@ pub(crate) fn build_method_mirror(
     // allocating call, so the returned ref is current. Callers that hold it
     // across their own allocating calls pin it themselves.
     ctx.unpin_native_roots(declaring_pin);
-    method_obj
+    Ok(method_obj)
 }
 
 /// Minimal JVM method-descriptor parser. Returns `(parameter_descs,
@@ -765,7 +784,7 @@ fn native_converting_method_from(ctx: &mut dyn NativeContext, args: &[Value]) ->
     // calls below — a moving young GC there would relocate them (native
     // stale-local family).
     let method_pin = ctx.pin_native_root(method_obj);
-    let cvt = alloc_concurrent_synthetic(ctx, "com/sun/jmx/mbeanserver/ConvertingMethod", 4);
+    let cvt = try_alloc_concurrent_synthetic(ctx, "com/sun/jmx/mbeanserver/ConvertingMethod", 4)?;
     let cvt_pin = ctx.pin_native_root(cvt);
     // Field 0: method
     let method_obj = ctx.read_native_pin(method_pin, method_obj);
@@ -775,12 +794,12 @@ fn native_converting_method_from(ctx: &mut dyn NativeContext, args: &[Value]) ->
     // to operation dispatch signatures, which are keyed from paramMappings.
     let ret_mapping = alloc_identity_mapping(ctx);
     let cvt = ctx.read_native_pin(cvt_pin, cvt);
-    ctx.set_field(cvt, 1, Value::Object(Some(ret_mapping)));
+    ctx.set_field(cvt, 1, Value::Object(Some(ret_mapping?)));
     // Field 2: paramMappings.
     let method_obj = ctx.read_native_pin(method_pin, method_obj);
     let param_mappings = converting_method_param_mappings(ctx, method_obj);
     let cvt = ctx.read_native_pin(cvt_pin, cvt);
-    ctx.set_field(cvt, 2, Value::Object(Some(param_mappings)));
+    ctx.set_field(cvt, 2, Value::Object(Some(param_mappings?)));
     // Field 3: paramConversionIsIdentity = true
     ctx.set_field(cvt, 3, Value::Int(1));
     ctx.unpin_native_roots(method_pin);
@@ -790,7 +809,7 @@ fn native_converting_method_from(ctx: &mut dyn NativeContext, args: &[Value]) ->
 fn converting_method_param_mappings(
     ctx: &mut dyn NativeContext,
     method_obj: ObjectRef,
-) -> ObjectRef {
+) -> Result<ObjectRef, MethodCallFailed> {
     // Pin across the class-load and the reflective invokes below — a moving
     // young GC there would relocate `method_obj` (native stale-local family);
     // in particular the first invoke can move it before the fallback invoke
@@ -814,7 +833,7 @@ fn converting_method_param_mappings(
         }
     };
     let Some(mut param_types_arr) = arr else {
-        return ctx.new_ref_array(mapping_class_id, 0);
+        return Ok(ctx.new_ref_array(mapping_class_id, 0));
     };
 
     let param_types_pin = ctx.pin_native_root(param_types_arr);
@@ -830,12 +849,12 @@ fn converting_method_param_mappings(
             _ => {
                 let mapping = alloc_identity_mapping(ctx);
                 out = ctx.read_native_pin(out_pin, out);
-                ctx.set_array_element(out, i, Value::Object(Some(mapping)));
+                ctx.set_array_element(out, i, Value::Object(Some(mapping?)));
                 continue;
             }
         };
         let preserve_original_open_class = primitive_or_primitive_array_class_mirror(ctx, type_obj);
-        let mapping = alloc_mapping_for_type_object(ctx, type_obj);
+        let mapping = alloc_mapping_for_type_object(ctx, type_obj)?;
         if preserve_original_open_class {
             param_types_arr = ctx.read_native_pin(param_types_pin, param_types_arr);
             if let Value::Object(Some(open_class)) = ctx.get_array_element(param_types_arr, i) {
@@ -848,7 +867,7 @@ fn converting_method_param_mappings(
 
     out = ctx.read_native_pin(out_pin, out);
     ctx.unpin_native_roots(method_pin);
-    out
+    Ok(out)
 }
 
 fn invoke_reflect_type_array(
@@ -863,7 +882,7 @@ fn invoke_reflect_type_array(
     }
 }
 
-fn alloc_mapping_for_type_object(ctx: &mut dyn NativeContext, type_obj: ObjectRef) -> ObjectRef {
+fn alloc_mapping_for_type_object(ctx: &mut dyn NativeContext, type_obj: ObjectRef) -> Result<ObjectRef, MethodCallFailed> {
     let pin = ctx.pin_native_root(type_obj);
     let type_obj = ctx.read_native_pin(pin, type_obj);
     let mapping = match native_mapping_for_type(
@@ -875,10 +894,10 @@ fn alloc_mapping_for_type_object(ctx: &mut dyn NativeContext, type_obj: ObjectRe
         ],
     ) {
         Ok(Some(Value::Object(Some(mapping)))) => mapping,
-        _ => alloc_identity_mapping(ctx),
+        _ => alloc_identity_mapping(ctx)?,
     };
     ctx.unpin_native_roots(pin);
-    mapping
+    Ok(mapping)
 }
 
 fn primitive_or_primitive_array_class_mirror(ctx: &dyn NativeContext, type_obj: ObjectRef) -> bool {
@@ -909,18 +928,18 @@ fn primitive_or_primitive_array_name(name: &str) -> bool {
 /// the heap tidy; consumers compare by reference rarely (they read
 /// `getOpenType()` mostly), so referential identity is preserved
 /// across calls within the same thread.
-fn alloc_identity_mapping(ctx: &mut dyn NativeContext) -> ObjectRef {
+fn alloc_identity_mapping(ctx: &mut dyn NativeContext) -> Result<ObjectRef, MethodCallFailed> {
     // Field 0: javaType (Type) — null is acceptable.
     // Field 1: openType (OpenType) — SimpleType.STRING singleton.
     // Field 2: openClass (Class<?>) — String.class mirror.
-    let m = alloc_concurrent_synthetic(ctx, "com/sun/jmx/mbeanserver/MXBeanMapping", 3);
+    let m = try_alloc_concurrent_synthetic(ctx, "com/sun/jmx/mbeanserver/MXBeanMapping", 3)?;
     // Pin across the sibling allocations below — a moving young GC there
     // would relocate the fresh mapping (native stale-local family).
     let m_pin = ctx.pin_native_root(m);
     ctx.set_field(m, 0, Value::Object(None));
     let st = alloc_simple_type_string(ctx);
     let m = ctx.read_native_pin(m_pin, m);
-    ctx.set_field(m, 1, Value::Object(Some(st)));
+    ctx.set_field(m, 1, Value::Object(Some(st?)));
     let string_cid = ctx
         .ensure_class_initialized("java/lang/String")
         .unwrap_or(cratonvm_types::ClassId::new(0));
@@ -928,7 +947,7 @@ fn alloc_identity_mapping(ctx: &mut dyn NativeContext) -> ObjectRef {
     let m = ctx.read_native_pin(m_pin, m);
     ctx.set_field(m, 2, Value::Object(Some(string_mirror)));
     ctx.unpin_native_roots(m_pin);
-    m
+    Ok(m)
 }
 
 /// Allocate a synthetic `SimpleType<String>` instance. JDK 25's
@@ -938,7 +957,7 @@ fn alloc_identity_mapping(ctx: &mut dyn NativeContext) -> ObjectRef {
 /// allocate an equivalent instance whose `getClassName()` /
 /// `getTypeName()` / `getDescription()` / `isArray()` reads return
 /// JDK-equivalent values.
-fn alloc_simple_type_string(ctx: &mut dyn NativeContext) -> ObjectRef {
+fn alloc_simple_type_string(ctx: &mut dyn NativeContext) -> Result<ObjectRef, MethodCallFailed> {
     // Try to fetch the static SimpleType.STRING first — it's by far
     // the cleanest path because `MXBeanIntrospector.canUseOpenInfo`
     // does a `==` comparison against the singleton, which only works
@@ -946,14 +965,14 @@ fn alloc_simple_type_string(ctx: &mut dyn NativeContext) -> ObjectRef {
     if let Ok(cid) = ctx.ensure_class_initialized("javax/management/openmbean/SimpleType") {
         if let Some(idx) = ctx.static_field_index_by_name(cid, "STRING") {
             if let Value::Object(Some(s)) = ctx.get_static_field(cid, idx) {
-                return s;
+                return Ok(s);
             }
         }
     }
     // Fall back to a synthetic instance with the right field values.
     // Pin each fresh object across the subsequent `create_string` calls — a
     // moving young GC there would relocate them (native stale-local family).
-    let st = alloc_concurrent_synthetic(ctx, "javax/management/openmbean/SimpleType", 5);
+    let st = try_alloc_concurrent_synthetic(ctx, "javax/management/openmbean/SimpleType", 5)?;
     let st_pin = ctx.pin_native_root(st);
     let class_name = ctx.create_string("java.lang.String");
     let class_name_pin = ctx.pin_native_root(class_name);
@@ -968,7 +987,7 @@ fn alloc_simple_type_string(ctx: &mut dyn NativeContext) -> ObjectRef {
     ctx.set_field_by_name(st, "description", Value::Object(Some(description)));
     ctx.set_field_by_name(st, "isArray", Value::Int(0));
     ctx.unpin_native_roots(st_pin);
-    st
+    Ok(st)
 }
 
 /// Native override for
@@ -1015,7 +1034,7 @@ fn native_mapping_for_type(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
     // args[2] = the factory (recursive parameter)
     let type_obj = match args.get(1) {
         Some(Value::Object(Some(t))) => *t,
-        _ => return Ok(Some(Value::Object(Some(alloc_identity_mapping(ctx))))),
+        _ => return Ok(Some(Value::Object(Some(alloc_identity_mapping(ctx)?)))),
     };
 
     // T19.M1 — extract a normalized type-name representation we can
@@ -1036,7 +1055,7 @@ fn native_mapping_for_type(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         });
         if recursion_depth >= MAX_MAPPING_DEPTH {
             // Cycle — abort recursion with identity mapping.
-            return Ok(Some(Value::Object(Some(alloc_identity_mapping(ctx)))));
+            return Ok(Some(Value::Object(Some(alloc_identity_mapping(ctx)?))));
         }
     }
 
@@ -1045,7 +1064,7 @@ fn native_mapping_for_type(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
     // with names we know will trigger recursion.
     if let Some(name) = &normalized {
         if PROBLEMATIC_TYPE_NAMES.contains(&name.as_str()) {
-            return Ok(Some(Value::Object(Some(alloc_identity_mapping(ctx)))));
+            return Ok(Some(Value::Object(Some(alloc_identity_mapping(ctx)?))));
         }
     }
 
@@ -1065,7 +1084,7 @@ fn native_mapping_for_type(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
                     stack.remove(last_idx);
                 }
             });
-            return Ok(Some(Value::Object(Some(mapping))));
+            return Ok(Some(Value::Object(Some(mapping?))));
         }
     }
 
@@ -1095,7 +1114,7 @@ fn native_mapping_for_type(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
     // the underlying JDK Java implementation — would require mutual
     // recursion through the interpreter, which the registry doesn't
     // expose.
-    Ok(Some(Value::Object(Some(mapping))))
+    Ok(Some(Value::Object(Some(mapping?))))
 }
 
 /// T19.M1 — Resolve the canonical type name for a `Type` mirror.
@@ -1143,10 +1162,10 @@ fn resolve_type_name(ctx: &dyn NativeContext, type_obj: ObjectRef) -> Option<Str
 ///   here — `OpenConverter` only reads `openType` for cache hits).
 /// - `openClass` = `CompositeData.class` (the standard open class for
 ///   composite mappings).
-fn alloc_composite_mapping(ctx: &mut dyn NativeContext, schema: &CompositeSchema) -> ObjectRef {
+fn alloc_composite_mapping(ctx: &mut dyn NativeContext, schema: &CompositeSchema) -> Result<ObjectRef, MethodCallFailed> {
     // CompositeMapping fields match MXBeanMapping (identity layout) +
     // a CompositeType in the openType slot.
-    let m = alloc_concurrent_synthetic(ctx, "com/sun/jmx/mbeanserver/MXBeanMapping", 3);
+    let m = try_alloc_concurrent_synthetic(ctx, "com/sun/jmx/mbeanserver/MXBeanMapping", 3)?;
     // Pin across the sibling allocations below — a moving young GC there
     // would relocate the fresh mapping (native stale-local family).
     let m_pin = ctx.pin_native_root(m);
@@ -1155,7 +1174,7 @@ fn alloc_composite_mapping(ctx: &mut dyn NativeContext, schema: &CompositeSchema
     // Field 1: openType (OpenType) — synthetic CompositeType.
     let composite_type = alloc_composite_type(ctx, schema);
     let m = ctx.read_native_pin(m_pin, m);
-    ctx.set_field(m, 1, Value::Object(Some(composite_type)));
+    ctx.set_field(m, 1, Value::Object(Some(composite_type?)));
     // Field 2: openClass (Class<?>) — CompositeData.class mirror, fall
     // back to String.class if the class isn't loadable.
     let open_class_mirror =
@@ -1169,7 +1188,7 @@ fn alloc_composite_mapping(ctx: &mut dyn NativeContext, schema: &CompositeSchema
     let m = ctx.read_native_pin(m_pin, m);
     ctx.set_field(m, 2, Value::Object(Some(open_class_mirror)));
     ctx.unpin_native_roots(m_pin);
-    m
+    Ok(m)
 }
 
 /// T19.M1 — Allocate a synthetic `CompositeType` with the schema's
@@ -1183,8 +1202,8 @@ fn alloc_composite_mapping(ctx: &mut dyn NativeContext, schema: &CompositeSchema
 /// The synthetic CompositeType passes structural identity checks done
 /// by `OpenConverter.cacheIfRecursive` and avoids re-entering the
 /// recursive type analysis.
-fn alloc_composite_type(ctx: &mut dyn NativeContext, schema: &CompositeSchema) -> ObjectRef {
-    let ct = alloc_concurrent_synthetic(ctx, "javax/management/openmbean/CompositeType", 8);
+fn alloc_composite_type(ctx: &mut dyn NativeContext, schema: &CompositeSchema) -> Result<ObjectRef, MethodCallFailed> {
+    let ct = try_alloc_concurrent_synthetic(ctx, "javax/management/openmbean/CompositeType", 8)?;
     // Pin each fresh object across the subsequent allocating calls
     // (`create_string` / `ensure_class_initialized` / `new_ref_array`) — a
     // moving young GC there would relocate them (native stale-local family).
@@ -1228,7 +1247,7 @@ fn alloc_composite_type(ctx: &mut dyn NativeContext, schema: &CompositeSchema) -
     let item_names_arr = ctx.read_native_pin(item_names_pin, item_names_arr);
     ctx.set_field_by_name(ct, "itemNames", Value::Object(Some(item_names_arr)));
     ctx.unpin_native_roots(ct_pin);
-    ct
+    Ok(ct)
 }
 
 /// Helper trait extension for reading a String field at a known slot.
@@ -1253,7 +1272,68 @@ impl<T: NativeContext + ?Sized> ReadStringFieldExt for T {
 /// Anchor: `T19_H14_OPENMBEAN`. Registers the JMX OpenType / MXBean
 /// translation natives that unblock KC16 boot through
 /// `MBeanServer.registerMBean(MemoryMXBean)`.
+/// Should the JDK's own MXBean type-mapping machinery be left alone?
+///
+/// **Default: yes.** The `mappingForType` / `makeMapping` / `toOpenValue` /
+/// `ConvertingMethod.from` overrides below replace
+/// `DefaultMXBeanMappingFactory` with a synthetic mapping that types every
+/// unrecognised Java type as `SimpleType.STRING` and converts nothing
+/// (`toOpenValue` is identity). That is why
+/// `MBeanServer.getAttribute("java.lang:type=Memory", "HeapMemoryUsage")` used
+/// to hand back a raw `java.lang.management.MemoryUsage` where every other JVM
+/// returns a `CompositeDataSupport`, and why `getMBeanInfo` described every
+/// composite attribute as `java.lang.String`.
+///
+/// They were added because the real recursion was believed not to terminate on
+/// this VM (`OpenDataException` through `Class.getAnnotatedInterfaces()`).
+/// Measured 2026-08-11 against JDK 25 on Linux, that is no longer true: with
+/// the real machinery restored, every platform-MXBean attribute this VM can
+/// answer matches HotSpot exactly — `MemoryUsage` and every `MemoryPool`
+/// usage become `CompositeDataSupport`, `SystemProperties` becomes
+/// `TabularDataSupport`, `InputArguments` becomes `String[]`, and
+/// `getMBeanInfo` carries the real `CompositeType`. The recursion terminates:
+/// a self-referential MXBean type is rejected with the same
+/// `NotCompliantMBeanException` HotSpot raises, rather than hanging — where
+/// the synthetic mapping silently *accepted* it and handed back raw Java
+/// objects.
+///
+/// Gate, do not delete. `synthetic-jdk` builds have no real
+/// `com.sun.jmx.mbeanserver` bytecode to fall back to and keep the overrides;
+/// `CRATONVM_SYNTHETIC_MXBEAN_MAPPING=1` restores them on a real-JDK run,
+/// which is the one-run answer if an application MBean ever does drive the
+/// real factory into a recursion this VM cannot finish.
+///
+/// Mirrors `native-io`'s `real_raf_enabled()`, which flipped the same way for
+/// the same reason.
+pub(crate) fn real_mxbean_mapping_enabled() -> bool {
+    if cfg!(feature = "synthetic-jdk") {
+        return false;
+    }
+    // The latched `VmFlags` snapshot, not a live `getenv`. An undeclared flag
+    // read straight from `std::env` is unreachable from
+    // `CRATONVM_REAL=-mxbean-mapping` and invisible to
+    // `flags::with_thread_overrides`, so a test that arranges it through the
+    // supported hook silently measures the developer's ambient environment
+    // instead. `one_true_yes_exact` also accepts `yes`, which the previous
+    // `Ok("1") | Ok("true")` did not — a strict widening of an opt-out escape
+    // hatch, and one fewer bespoke truth table.
+    !crate::nbflags().synthetic_mxbean_mapping
+}
+
 pub fn register_jmx_openmbean_natives(registry: &mut NativeMethodRegistry) {
+    register_jmx_openmbean_natives_with(registry, !real_mxbean_mapping_enabled());
+}
+
+/// [`register_jmx_openmbean_natives`] with the type-mapping decision supplied
+/// rather than read from the environment, so a test can exercise both arms
+/// without touching process-wide state.
+///
+/// `synthetic_mapping = true` reinstates the pre-2026-08-11 overlay that types
+/// unrecognised Java types as `SimpleType.STRING` and converts nothing.
+pub fn register_jmx_openmbean_natives_with(
+    registry: &mut NativeMethodRegistry,
+    synthetic_mapping: bool,
+) {
     let __prev_cat = registry.current_category();
     registry.set_category(cratonvm_native_api::NativeKind::Bridge);
     // T19_H14_OPENMBEAN — primary Object-method filter.
@@ -1275,17 +1355,24 @@ pub fn register_jmx_openmbean_natives(registry: &mut NativeMethodRegistry) {
         "(Ljava/lang/Class;)Ljava/util/List;",
         native_introspector_get_methods,
     );
+    // Defence in depth: short-circuit the OpenType recursion at the
+    // mapping factory level too, so plain MBeans don't hit it.
+    if synthetic_mapping {
     // Defence in depth: if a path still reaches ConvertingMethod.from
     // with an Object method (e.g. tests bypass the introspector),
     // short-circuit by returning null.
+    //
+    // Inside the gate: this override installs an IDENTITY return mapping, so
+    // leaving it registered would keep `getAttribute` handing back the raw
+    // Java value even with the mapping factory restored. The Object-method
+    // filter it also provides is already covered by the `getMethods`
+    // registrations above, which stay unconditional.
     registry.register(
         "com/sun/jmx/mbeanserver/ConvertingMethod",
         "from",
         "(Ljava/lang/reflect/Method;)Lcom/sun/jmx/mbeanserver/ConvertingMethod;",
         native_converting_method_from,
     );
-    // Defence in depth: short-circuit the OpenType recursion at the
-    // mapping factory level too, so plain MBeans don't hit it.
     registry.register(
         "com/sun/jmx/mbeanserver/MXBeanMappingFactory",
         "mappingForType",
@@ -1351,12 +1438,19 @@ pub fn register_jmx_openmbean_natives(registry: &mut NativeMethodRegistry) {
         "(Ljava/lang/Object;)Ljava/lang/Object;",
         native_mxbean_mapping_identity,
     );
+    } // end if synthetic_mapping
 
     // T19_M1_PLATFORM_MXBEANS — additional defensive overrides on the
-    // OpenConverter path. JDK 25 splits the OpenType analysis between
-    // `MXBeanMappingFactory` (entry) and the package-private
-    // `OpenConverter.toConverter(Type)` (cache + recursion). We trap
-    // both with the same cycle-detection wrapper.
+    // OpenConverter path.
+    //
+    // INERT ON JDK 25 (checked 2026-08-11 with `javap --module java.management`):
+    // neither `com.sun.jmx.mbeanserver.OpenConverter` nor `MappedMXBeanType`
+    // exists on that image — both are pre-JDK-7 spellings, and the OpenType
+    // analysis lives entirely in `DefaultMXBeanMappingFactory`. Left registered
+    // rather than deleted because they still name real classes on the older
+    // images this VM is expected to run, and a registration that targets
+    // nothing costs nothing; do not read their presence as evidence that this
+    // path is live.
     registry.register(
         "com/sun/jmx/mbeanserver/OpenConverter",
         "toConverter",
@@ -1408,15 +1502,15 @@ pub(crate) fn build_composite_data(
     ctx: &mut dyn NativeContext,
     composite_type: Option<ObjectRef>,
     items: &[(String, Value)],
-) -> ObjectRef {
+) -> Result<ObjectRef, MethodCallFailed> {
     // Pin every ref held across the allocating calls below — a moving young
     // GC there would relocate them (native stale-local family). The map is
     // built FIRST so `build_string_keyed_map` can pin the item refs before
     // any allocation invalidates them.
     let composite_type_pin = composite_type.map(|o| ctx.pin_native_root(o));
-    let map = build_string_keyed_map(ctx, items);
+    let map = build_string_keyed_map(ctx, items)?;
     let map_pin = ctx.pin_native_root(map);
-    let obj = alloc_concurrent_synthetic(ctx, "javax/management/openmbean/CompositeDataSupport", 4);
+    let obj = try_alloc_concurrent_synthetic(ctx, "javax/management/openmbean/CompositeDataSupport", 4)?;
     let map = ctx.read_native_pin(map_pin, map);
     ctx.set_field_by_name(obj, CONTENTS_FIELD, Value::Object(Some(map)));
     let composite_type = match (composite_type_pin, composite_type) {
@@ -1428,13 +1522,13 @@ pub(crate) fn build_composite_data(
         Some(h) => ctx.unpin_native_roots(h),
         None => ctx.unpin_native_roots(map_pin),
     }
-    obj
+    Ok(obj)
 }
 
 /// Build a `java.util.HashMap` populated with the given String→Value pairs.
 /// Falls back to a synthetic 2-slot map (data array + size) when
 /// `HashMap.put` cannot be invoked (unit-test mock).
-fn build_string_keyed_map(ctx: &mut dyn NativeContext, items: &[(String, Value)]) -> ObjectRef {
+fn build_string_keyed_map(ctx: &mut dyn NativeContext, items: &[(String, Value)]) -> Result<ObjectRef, MethodCallFailed> {
     // Pin every ref-valued item BEFORE the first allocation below — the
     // per-item `create_string`/`put` calls allocate, and a moving young GC
     // there would relocate the not-yet-stored values (native stale-local
@@ -1484,12 +1578,12 @@ fn build_string_keyed_map(ctx: &mut dyn NativeContext, items: &[(String, Value)]
                 Some(&first) => ctx.unpin_native_roots(first),
                 None => ctx.unpin_native_roots(map_pin),
             }
-            return map;
+            return Ok(map);
         }
     }
     // Fallback: synthetic parallel-array map (keys[], vals[]) the natives
     // below understand directly.
-    let synth = alloc_concurrent_synthetic(ctx, "java/util/HashMap", 3);
+    let synth = try_alloc_concurrent_synthetic(ctx, "java/util/HashMap", 3)?;
     // Pin the fresh objects across the sibling allocations (native
     // stale-local family).
     let synth_pin = ctx.pin_native_root(synth);
@@ -1515,7 +1609,7 @@ fn build_string_keyed_map(ctx: &mut dyn NativeContext, items: &[(String, Value)]
         Some(&first) => ctx.unpin_native_roots(first),
         None => ctx.unpin_native_roots(synth_pin),
     }
-    synth
+    Ok(synth)
 }
 
 /// Read a value out of a carrier's backing map by key. Handles both the
@@ -1560,8 +1654,73 @@ fn carrier_get(ctx: &mut dyn NativeContext, carrier: ObjectRef, key: &str) -> Va
     Value::Object(None)
 }
 
+/// The two open-data carrier classes. These are REAL JDK classes under
+/// `real-jdk` mode — see [`delegates_to_bytecode`].
+const CDS_CLASS: &str = "javax/management/openmbean/CompositeDataSupport";
+const TDS_CLASS: &str = "javax/management/openmbean/TabularDataSupport";
+
+/// Is `obj` one of CratonVM's synthetic open-data carriers?
+///
+/// [`build_composite_data`] / [`build_tabular_data`] allocate an instance of
+/// the *real* `CompositeDataSupport` / `TabularDataSupport` class and keep
+/// their state on two CratonVM-private fields ([`CONTENTS_FIELD`],
+/// [`OPEN_TYPE_FIELD`]) rather than in the JDK's own `contents`/`compositeType`
+/// (resp. `dataMap`/`tabularType`). An instance the application built through
+/// the JDK constructors has neither field, so this is the only per-instance
+/// discriminator available — native registration is per
+/// (class, method, descriptor) and therefore global.
+fn is_synthetic_carrier(ctx: &dyn NativeContext, obj: ObjectRef) -> bool {
+    matches!(
+        ctx.get_field_by_name(obj, CONTENTS_FIELD),
+        Value::Object(Some(_))
+    ) || matches!(
+        ctx.get_field_by_name(obj, OPEN_TYPE_FIELD),
+        Value::Object(Some(_))
+    )
+}
+
+/// Should the carrier natives below hand `obj` back to real JDK bytecode?
+///
+/// They were written against the carriers [`build_composite_data`] /
+/// [`build_tabular_data`] mint, but registration made them shadow the JDK
+/// bytecode for *every* `CompositeDataSupport`/`TabularDataSupport`, including
+/// ones the application constructed itself. Those have no
+/// [`CONTENTS_FIELD`]/[`OPEN_TYPE_FIELD`], so the natives answered
+/// `null`/`false`/`0` for all of them:
+/// `new CompositeDataSupport(t, names, values).getCompositeType()` returned
+/// null, which made `CompositeType.isValue()` reject a value against the very
+/// type it was built from and `CompositeDataSupport`'s own constructor throw
+/// `OpenDataException` naming two type descriptions that print identically
+/// (`TestJMXAccessorTask.testCreatePropertyForTabularDataSupport`). The
+/// `TabularDataSupport` side was worse: the native `put` wrote into the carrier
+/// map while `values()` — which has no native — read the JDK's empty `dataMap`.
+///
+/// Same real-vs-synthetic-by-instance problem, and same remedy, as the
+/// `ThreadPoolExecutor.execute`/`submit`/`shutdown` natives; see
+/// [`NativeSystemAccess::invoke_virtual_bytecode_only`], which reaches the
+/// bytecode without re-entering this registration.
+///
+/// Gated on the class not being a fabricated stub so `synthetic-jdk` mode —
+/// where there is no bytecode to delegate to — keeps the carrier behaviour
+/// unchanged.
+///
+/// Note that the two builders currently have no caller outside this module's
+/// tests, so under `real-jdk` this predicate is true for every instance and
+/// the seven natives below defer wholesale. The per-instance check is kept
+/// rather than reduced to the class-level gate because it is what makes the
+/// natives correct again the moment a caller mints a carrier.
+fn delegates_to_bytecode(ctx: &dyn NativeContext, obj: ObjectRef, class_name: &str) -> bool {
+    !is_synthetic_carrier(ctx, obj) && !ctx.is_class_synthetic_stub(class_name)
+}
+
+/// Arguments to forward to [`NativeSystemAccess::invoke_virtual_bytecode_only`],
+/// which pushes the receiver itself.
+fn args_without_receiver(args: &[Value]) -> &[Value] {
+    args.get(1..).unwrap_or(&[])
+}
+
 fn register_open_data_carriers(r: &mut NativeMethodRegistry) {
-    let cds = "javax/management/openmbean/CompositeDataSupport";
+    let cds = CDS_CLASS;
 
     // CompositeData.get(String) -> Object.
     r.register(
@@ -1573,6 +1732,14 @@ fn register_open_data_carriers(r: &mut NativeMethodRegistry) {
                 Some(Value::Object(Some(o))) => *o,
                 _ => return Ok(Some(Value::Object(None))),
             };
+            if delegates_to_bytecode(ctx, this, CDS_CLASS) {
+                return ctx.invoke_virtual_bytecode_only(
+                    this,
+                    "get",
+                    "(Ljava/lang/String;)Ljava/lang/Object;",
+                    args_without_receiver(args),
+                );
+            }
             let key = match args.get(1) {
                 Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
                 _ => String::new(),
@@ -1587,6 +1754,14 @@ fn register_open_data_carriers(r: &mut NativeMethodRegistry) {
             Some(Value::Object(Some(o))) => *o,
             _ => return Ok(Some(Value::Int(0))),
         };
+        if delegates_to_bytecode(ctx, this, CDS_CLASS) {
+            return ctx.invoke_virtual_bytecode_only(
+                this,
+                "containsKey",
+                "(Ljava/lang/String;)Z",
+                args_without_receiver(args),
+            );
+        }
         let key = match args.get(1) {
             Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
             _ => String::new(),
@@ -1605,6 +1780,14 @@ fn register_open_data_carriers(r: &mut NativeMethodRegistry) {
                 Some(Value::Object(Some(o))) => *o,
                 _ => return Ok(Some(Value::Object(None))),
             };
+            if delegates_to_bytecode(ctx, this, CDS_CLASS) {
+                return ctx.invoke_virtual_bytecode_only(
+                    this,
+                    "getCompositeType",
+                    "()Ljavax/management/openmbean/CompositeType;",
+                    args_without_receiver(args),
+                );
+            }
             Ok(Some(ctx.get_field_by_name(this, OPEN_TYPE_FIELD)))
         },
     );
@@ -1619,6 +1802,14 @@ fn register_open_data_carriers(r: &mut NativeMethodRegistry) {
                 Some(Value::Object(Some(o))) => *o,
                 _ => return Ok(Some(Value::Object(None))),
             };
+            if delegates_to_bytecode(ctx, this, CDS_CLASS) {
+                return ctx.invoke_virtual_bytecode_only(
+                    this,
+                    "getAll",
+                    "([Ljava/lang/String;)[Ljava/lang/Object;",
+                    args_without_receiver(args),
+                );
+            }
             let keys = match args.get(1) {
                 Some(Value::Object(Some(a))) => *a,
                 _ => return Ok(Some(Value::Object(None))),
@@ -1651,7 +1842,7 @@ fn register_open_data_carriers(r: &mut NativeMethodRegistry) {
     // TabularDataSupport: a Map<List<?>, CompositeData> keyed by index
     // values. We model it on the same backing store keyed by the index's
     // String form; the natives operate on the carrier's contents map.
-    let tds = "javax/management/openmbean/TabularDataSupport";
+    let tds = TDS_CLASS;
 
     // TabularData.put(CompositeData) -> CompositeData. Key the row by the
     // String form of its first index item; for the simple platform tables
@@ -1665,6 +1856,14 @@ fn register_open_data_carriers(r: &mut NativeMethodRegistry) {
                 Some(Value::Object(Some(o))) => *o,
                 _ => return Ok(Some(Value::Object(None))),
             };
+            if delegates_to_bytecode(ctx, this, TDS_CLASS) {
+                return ctx.invoke_virtual_bytecode_only(
+                    this,
+                    "put",
+                    "(Ljavax/management/openmbean/CompositeData;)Ljavax/management/openmbean/CompositeData;",
+                    args_without_receiver(args),
+                );
+            }
             let row = match args.get(1) {
                 Some(Value::Object(Some(o))) => *o,
                 _ => return Ok(Some(Value::Object(None))),
@@ -1678,7 +1877,7 @@ fn register_open_data_carriers(r: &mut NativeMethodRegistry) {
                 Value::Object(Some(m)) => m,
                 _ => {
                     // Lazily create a backing HashMap on first put.
-                    let m = build_string_keyed_map(ctx, &[]);
+                    let m = build_string_keyed_map(ctx, &[])?;
                     let this = ctx.read_native_pin(this_pin, this);
                     ctx.set_field_by_name(this, CONTENTS_FIELD, Value::Object(Some(m)));
                     m
@@ -1712,6 +1911,9 @@ fn register_open_data_carriers(r: &mut NativeMethodRegistry) {
             Some(Value::Object(Some(o))) => *o,
             _ => return Ok(Some(Value::Int(0))),
         };
+        if delegates_to_bytecode(ctx, this, TDS_CLASS) {
+            return ctx.invoke_virtual_bytecode_only(this, "size", "()I", &[]);
+        }
         let map = match ctx.get_field_by_name(this, CONTENTS_FIELD) {
             Value::Object(Some(m)) => m,
             _ => return Ok(Some(Value::Int(0))),
@@ -1728,6 +1930,9 @@ fn register_open_data_carriers(r: &mut NativeMethodRegistry) {
             Some(Value::Object(Some(o))) => *o,
             _ => return Ok(Some(Value::Int(1))),
         };
+        if delegates_to_bytecode(ctx, this, TDS_CLASS) {
+            return ctx.invoke_virtual_bytecode_only(this, "isEmpty", "()Z", &[]);
+        }
         let map = match ctx.get_field_by_name(this, CONTENTS_FIELD) {
             Value::Object(Some(m)) => m,
             _ => return Ok(Some(Value::Int(1))),
@@ -1738,6 +1943,7 @@ fn register_open_data_carriers(r: &mut NativeMethodRegistry) {
         };
         Ok(Some(Value::Int(empty as i32)))
     });
+    ()
 }
 
 /// Build a `TabularDataSupport`-shaped carrier with the given tabular type
@@ -1745,14 +1951,14 @@ fn register_open_data_carriers(r: &mut NativeMethodRegistry) {
 pub(crate) fn build_tabular_data(
     ctx: &mut dyn NativeContext,
     tabular_type: Option<ObjectRef>,
-) -> ObjectRef {
+) -> Result<ObjectRef, MethodCallFailed> {
     // Pin every ref held across the allocating calls below — a moving young
     // GC there would relocate them (native stale-local family). The map is
     // built first so only the carrier needs a pin across it.
     let tabular_type_pin = tabular_type.map(|o| ctx.pin_native_root(o));
-    let map = build_string_keyed_map(ctx, &[]);
+    let map = build_string_keyed_map(ctx, &[])?;
     let map_pin = ctx.pin_native_root(map);
-    let obj = alloc_concurrent_synthetic(ctx, "javax/management/openmbean/TabularDataSupport", 4);
+    let obj = try_alloc_concurrent_synthetic(ctx, "javax/management/openmbean/TabularDataSupport", 4)?;
     let map = ctx.read_native_pin(map_pin, map);
     ctx.set_field_by_name(obj, CONTENTS_FIELD, Value::Object(Some(map)));
     let tabular_type = match (tabular_type_pin, tabular_type) {
@@ -1764,7 +1970,7 @@ pub(crate) fn build_tabular_data(
         Some(h) => ctx.unpin_native_roots(h),
         None => ctx.unpin_native_roots(map_pin),
     }
-    obj
+    Ok(obj)
 }
 
 /// T19.M1 — Native override for
@@ -1779,7 +1985,7 @@ fn native_open_converter_to_converter(
 ) -> MethodCallResult {
     let type_obj = match args.first() {
         Some(Value::Object(Some(t))) => *t,
-        _ => return Ok(Some(Value::Object(Some(alloc_open_converter(ctx, None))))),
+        _ => return Ok(Some(Value::Object(Some(alloc_open_converter(ctx, None)?)))),
     };
     let normalized = resolve_type_name(ctx, type_obj);
 
@@ -1787,13 +1993,13 @@ fn native_open_converter_to_converter(
     if let Some(name) = &normalized {
         let depth = VISITED_TYPES.with(|v| v.borrow().iter().filter(|t| t == &name).count());
         if depth >= MAX_MAPPING_DEPTH {
-            return Ok(Some(Value::Object(Some(alloc_open_converter(ctx, None)))));
+            return Ok(Some(Value::Object(Some(alloc_open_converter(ctx, None)?))));
         }
     }
 
     if let Some(name) = &normalized {
         if PROBLEMATIC_TYPE_NAMES.contains(&name.as_str()) {
-            return Ok(Some(Value::Object(Some(alloc_open_converter(ctx, None)))));
+            return Ok(Some(Value::Object(Some(alloc_open_converter(ctx, None)?))));
         }
     }
 
@@ -1802,11 +2008,11 @@ fn native_open_converter_to_converter(
             return Ok(Some(Value::Object(Some(alloc_open_converter(
                 ctx,
                 Some(schema),
-            )))));
+            )?))));
         }
     }
 
-    Ok(Some(Value::Object(Some(alloc_open_converter(ctx, None)))))
+    Ok(Some(Value::Object(Some(alloc_open_converter(ctx, None)?))))
 }
 
 /// T19.M1 — Allocate an `OpenConverter` instance with either a
@@ -1815,8 +2021,8 @@ fn native_open_converter_to_converter(
 fn alloc_open_converter(
     ctx: &mut dyn NativeContext,
     schema: Option<&CompositeSchema>,
-) -> ObjectRef {
-    let oc = alloc_concurrent_synthetic(ctx, "com/sun/jmx/mbeanserver/OpenConverter", 4);
+) -> Result<ObjectRef, MethodCallFailed> {
+    let oc = try_alloc_concurrent_synthetic(ctx, "com/sun/jmx/mbeanserver/OpenConverter", 4)?;
     // Pin across the sibling allocations below — a moving young GC there
     // would relocate the fresh converter (native stale-local family).
     let oc_pin = ctx.pin_native_root(oc);
@@ -1828,7 +2034,7 @@ fn alloc_open_converter(
         None => alloc_simple_type_string(ctx),
     };
     let oc = ctx.read_native_pin(oc_pin, oc);
-    ctx.set_field(oc, 1, Value::Object(Some(open_type)));
+    ctx.set_field(oc, 1, Value::Object(Some(open_type?)));
     // Field 2: openClass (Class<?>).
     let open_class_internal = if schema.is_some() {
         "javax/management/openmbean/CompositeData"
@@ -1845,7 +2051,7 @@ fn alloc_open_converter(
     // bidirectional conversion paths (we don't translate values).
     ctx.set_field(oc, 3, Value::Int(1));
     ctx.unpin_native_roots(oc_pin);
-    oc
+    Ok(oc)
 }
 
 /// T19.M1 — Native override for
@@ -1858,7 +2064,7 @@ fn native_mapped_mxbean_type(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
         _ => {
             return Ok(Some(Value::Object(Some(alloc_mapped_mxbean_type(
                 ctx, None,
-            )))))
+            )?))))
         }
     };
     let normalized = resolve_type_name(ctx, type_obj);
@@ -1868,33 +2074,33 @@ fn native_mapped_mxbean_type(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
         if depth >= MAX_MAPPING_DEPTH {
             return Ok(Some(Value::Object(Some(alloc_mapped_mxbean_type(
                 ctx, None,
-            )))));
+            )?))));
         }
     }
     if let Some(name) = &normalized {
         if PROBLEMATIC_TYPE_NAMES.contains(&name.as_str()) {
             return Ok(Some(Value::Object(Some(alloc_mapped_mxbean_type(
                 ctx, None,
-            )))));
+            )?))));
         }
         if let Some(schema) = composite_schema_for(name) {
             return Ok(Some(Value::Object(Some(alloc_mapped_mxbean_type(
                 ctx,
                 Some(schema),
-            )))));
+            )?))));
         }
     }
     Ok(Some(Value::Object(Some(alloc_mapped_mxbean_type(
         ctx, None,
-    )))))
+    )?))))
 }
 
 /// T19.M1 — Allocate a `MappedMXBeanType` instance.
 fn alloc_mapped_mxbean_type(
     ctx: &mut dyn NativeContext,
     schema: Option<&CompositeSchema>,
-) -> ObjectRef {
-    let mt = alloc_concurrent_synthetic(ctx, "com/sun/jmx/mbeanserver/MappedMXBeanType", 4);
+) -> Result<ObjectRef, MethodCallFailed> {
+    let mt = try_alloc_concurrent_synthetic(ctx, "com/sun/jmx/mbeanserver/MappedMXBeanType", 4)?;
     // Pin across the sibling allocations below — a moving young GC there
     // would relocate the fresh instance (native stale-local family).
     let mt_pin = ctx.pin_native_root(mt);
@@ -1903,7 +2109,7 @@ fn alloc_mapped_mxbean_type(
         None => alloc_simple_type_string(ctx),
     };
     let mt = ctx.read_native_pin(mt_pin, mt);
-    ctx.set_field(mt, 0, Value::Object(Some(open_type)));
+    ctx.set_field(mt, 0, Value::Object(Some(open_type?)));
     // Field 1: typeName.
     let type_name_str = match schema {
         Some(s) => ctx.create_string(s.type_name),
@@ -1916,7 +2122,7 @@ fn alloc_mapped_mxbean_type(
     // Field 3: arrayMapping flag — 0 (we don't model arrays here).
     ctx.set_field(mt, 3, Value::Int(0));
     ctx.unpin_native_roots(mt_pin);
-    mt
+    Ok(mt)
 }
 
 // ---------------------------------------------------------------------------
@@ -1966,23 +2172,88 @@ mod tests {
             .is_some());
     }
 
+    /// The type-mapping overlay is the synthetic arm ONLY.
+    ///
+    /// Registered by default, `ConvertingMethod.from` installs an identity
+    /// return mapping and `mappingForType` types everything it does not
+    /// recognise as `SimpleType.STRING`, which is what made
+    /// `MBeanServer.getAttribute` answer a raw `java.lang.management.
+    /// MemoryUsage` instead of a `CompositeDataSupport`.
     #[test]
-    fn test_converting_method_from_registered() {
-        let mut r = NativeMethodRegistry::new();
-        register_jmx_openmbean_natives(&mut r);
-        assert!(r
-            .find(
+    fn type_mapping_overlay_is_synthetic_only() {
+        const MAPPING_OVERLAY: &[(&str, &str, &str)] = &[
+            (
                 "com/sun/jmx/mbeanserver/ConvertingMethod",
                 "from",
-                "(Ljava/lang/reflect/Method;)Lcom/sun/jmx/mbeanserver/ConvertingMethod;"
-            )
-            .is_some());
+                "(Ljava/lang/reflect/Method;)Lcom/sun/jmx/mbeanserver/ConvertingMethod;",
+            ),
+            (
+                "com/sun/jmx/mbeanserver/MXBeanMappingFactory",
+                "mappingForType",
+                "(Ljava/lang/reflect/Type;Lcom/sun/jmx/mbeanserver/MXBeanMappingFactory;)Lcom/sun/jmx/mbeanserver/MXBeanMapping;",
+            ),
+            (
+                "com/sun/jmx/mbeanserver/DefaultMXBeanMappingFactory",
+                "mappingForType",
+                "(Ljava/lang/reflect/Type;Lcom/sun/jmx/mbeanserver/MXBeanMappingFactory;)Lcom/sun/jmx/mbeanserver/MXBeanMapping;",
+            ),
+            (
+                "com/sun/jmx/mbeanserver/DefaultMXBeanMappingFactory",
+                "makeMapping",
+                "(Ljava/lang/reflect/Type;Lcom/sun/jmx/mbeanserver/MXBeanMappingFactory;)Lcom/sun/jmx/mbeanserver/MXBeanMapping;",
+            ),
+            (
+                "com/sun/jmx/mbeanserver/MXBeanMapping",
+                "toOpenValue",
+                "(Ljava/lang/Object;)Ljava/lang/Object;",
+            ),
+            (
+                "com/sun/jmx/mbeanserver/MXBeanMapping",
+                "fromOpenValue",
+                "(Ljava/lang/Object;)Ljava/lang/Object;",
+            ),
+        ];
+
+        let mut real = NativeMethodRegistry::new();
+        register_jmx_openmbean_natives_with(&mut real, false);
+        for (c, m, d) in MAPPING_OVERLAY {
+            assert!(
+                real.find(c, m, d).is_none(),
+                "{c}.{m} must not shadow the real mapping factory by default"
+            );
+        }
+
+        let mut synth = NativeMethodRegistry::new();
+        register_jmx_openmbean_natives_with(&mut synth, true);
+        for (c, m, d) in MAPPING_OVERLAY {
+            assert!(
+                synth.find(c, m, d).is_some(),
+                "{c}.{m} must still be available for synthetic-jdk builds"
+            );
+        }
+
+        // The Object-method filter is the PRIMARY fix, not part of the
+        // overlay: it is what keeps the real factory from being offered the
+        // `Class` -> `AnnotatedType[]` self-reference at all, so it stays
+        // registered in both arms.
+        for r in [&real, &synth] {
+            assert!(r
+                .find(
+                    "com/sun/jmx/mbeanserver/MXBeanIntrospector",
+                    "getMethods",
+                    "(Ljava/lang/Class;)Ljava/util/List;"
+                )
+                .is_some());
+        }
     }
 
     #[test]
     fn test_mapping_for_type_registered() {
+        // Both `mappingForType` spellings belong to the synthetic overlay;
+        // `type_mapping_overlay_is_synthetic_only` above owns the full arm
+        // comparison. This one keeps the synthetic arm's own coverage.
         let mut r = NativeMethodRegistry::new();
-        register_jmx_openmbean_natives(&mut r);
+        register_jmx_openmbean_natives_with(&mut r, true);
         assert!(
             r.find(
                 "com/sun/jmx/mbeanserver/MXBeanMappingFactory",
@@ -2091,7 +2362,7 @@ mod tests {
     #[test]
     fn test_alloc_identity_mapping_returns_non_null() {
         let mut ctx = mock_ctx();
-        let m = alloc_identity_mapping(&mut ctx);
+        let m = alloc_identity_mapping(&mut ctx).unwrap();
         // Should be a real ObjectRef.
         let _ = m;
     }
@@ -2099,7 +2370,7 @@ mod tests {
     #[test]
     fn test_alloc_array_list_from_empty() {
         let mut ctx = mock_ctx();
-        let lst = alloc_array_list_from(&mut ctx, &[]);
+        let lst = alloc_array_list_from(&mut ctx, &[]).unwrap();
         // Slot 1 = size = 0
         match ctx.get_field(lst, 1) {
             Value::Int(0) => {}
@@ -2287,7 +2558,7 @@ mod tests {
 
         // Allocate a synthetic Class mirror that resolves to that
         // name via slot 1 (matches Class.name layout).
-        let class_mirror = alloc_concurrent_synthetic(&mut ctx, "java/lang/Class", 4);
+        let class_mirror = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/Class", 4).unwrap();
         let name_str = ctx.create_string("java.lang.management.MemoryUsage");
         ctx.set_field(class_mirror, 1, Value::Object(Some(name_str)));
 
@@ -2321,7 +2592,7 @@ mod tests {
             stack.push("java.lang.String".to_string());
         });
 
-        let class_mirror = alloc_concurrent_synthetic(&mut ctx, "java/lang/Class", 4);
+        let class_mirror = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/Class", 4).unwrap();
         let name_str = ctx.create_string("java.lang.String");
         ctx.set_field(class_mirror, 1, Value::Object(Some(name_str)));
 
@@ -2346,7 +2617,7 @@ mod tests {
         reset_visited();
         let mut ctx = mock_ctx();
 
-        let class_mirror = alloc_concurrent_synthetic(&mut ctx, "java/lang/Class", 4);
+        let class_mirror = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/Class", 4).unwrap();
         let name_str = ctx.create_string("com.acme.SomeBean");
         ctx.set_field(class_mirror, 1, Value::Object(Some(name_str)));
 
@@ -2368,7 +2639,7 @@ mod tests {
     fn t19_m1_problematic_type_short_circuits_without_push() {
         reset_visited();
         let mut ctx = mock_ctx();
-        let class_mirror = alloc_concurrent_synthetic(&mut ctx, "java/lang/Class", 4);
+        let class_mirror = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/Class", 4).unwrap();
         let name_str = ctx.create_string("java.lang.Class");
         ctx.set_field(class_mirror, 1, Value::Object(Some(name_str)));
 
@@ -2390,7 +2661,7 @@ mod tests {
     fn t19_m1_composite_type_short_circuits_without_recursion() {
         reset_visited();
         let mut ctx = mock_ctx();
-        let class_mirror = alloc_concurrent_synthetic(&mut ctx, "java/lang/Class", 4);
+        let class_mirror = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/Class", 4).unwrap();
         let name_str = ctx.create_string("java.lang.management.MemoryUsage");
         ctx.set_field(class_mirror, 1, Value::Object(Some(name_str)));
 
@@ -2415,7 +2686,7 @@ mod tests {
         let mut ctx = mock_ctx();
         let schema =
             composite_schema_for("java.lang.management.MemoryUsage").expect("schema present");
-        let m = alloc_composite_mapping(&mut ctx, schema);
+        let m = alloc_composite_mapping(&mut ctx, schema).unwrap();
         // Verify the openType slot is populated.
         match ctx.get_field(m, 1) {
             Value::Object(Some(_)) => {}
@@ -2427,7 +2698,7 @@ mod tests {
     fn t19_m1_alloc_composite_type_carries_item_names() {
         let mut ctx = mock_ctx();
         let schema = composite_schema_for("java.lang.management.LockInfo").expect("schema");
-        let ct = alloc_composite_type(&mut ctx, schema);
+        let ct = alloc_composite_type(&mut ctx, schema).unwrap();
         // The mock NativeContext doesn't map our well-known JMX field
         // names (typeName, description, className, isArray, itemNames)
         // to slots — production resolves these via the loaded class's
@@ -2443,7 +2714,7 @@ mod tests {
     fn t19_m1_alloc_open_converter_with_schema() {
         let mut ctx = mock_ctx();
         let schema = composite_schema_for("java.lang.management.ThreadInfo").expect("schema");
-        let oc = alloc_open_converter(&mut ctx, Some(schema));
+        let oc = alloc_open_converter(&mut ctx, Some(schema)).unwrap();
         // identityConverter flag (slot 3) should be 1.
         match ctx.get_field(oc, 3) {
             Value::Int(1) => {}
@@ -2454,7 +2725,7 @@ mod tests {
     #[test]
     fn t19_m1_alloc_open_converter_without_schema_uses_simple_string() {
         let mut ctx = mock_ctx();
-        let oc = alloc_open_converter(&mut ctx, None);
+        let oc = alloc_open_converter(&mut ctx, None).unwrap();
         // openType (slot 1) must be a SimpleType-shaped object (non-null).
         match ctx.get_field(oc, 1) {
             Value::Object(Some(_)) => {}
@@ -2465,7 +2736,7 @@ mod tests {
     #[test]
     fn t19_m1_alloc_mapped_mxbean_type_basic_for_unknown() {
         let mut ctx = mock_ctx();
-        let mt = alloc_mapped_mxbean_type(&mut ctx, None);
+        let mt = alloc_mapped_mxbean_type(&mut ctx, None).unwrap();
         // isBasicType (slot 2) should be 1 (SimpleType-mapped).
         match ctx.get_field(mt, 2) {
             Value::Int(1) => {}
@@ -2477,7 +2748,7 @@ mod tests {
     fn t19_m1_alloc_mapped_mxbean_type_composite_for_known() {
         let mut ctx = mock_ctx();
         let schema = composite_schema_for("java.lang.management.MemoryUsage").expect("schema");
-        let mt = alloc_mapped_mxbean_type(&mut ctx, Some(schema));
+        let mt = alloc_mapped_mxbean_type(&mut ctx, Some(schema)).unwrap();
         // isBasicType should be 0 for composite.
         match ctx.get_field(mt, 2) {
             Value::Int(0) => {}
@@ -2555,7 +2826,7 @@ mod tests {
     #[test]
     fn t19_m1_resolve_type_name_via_class_mirror_slot1() {
         let mut ctx = mock_ctx();
-        let class_mirror = alloc_concurrent_synthetic(&mut ctx, "java/lang/Class", 4);
+        let class_mirror = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/Class", 4).unwrap();
         let name_str = ctx.create_string("java.lang.management.MemoryUsage");
         ctx.set_field(class_mirror, 1, Value::Object(Some(name_str)));
         let resolved = resolve_type_name(&ctx, class_mirror);
@@ -2568,7 +2839,7 @@ mod tests {
     #[test]
     fn t19_m1_resolve_type_name_normalizes_slashes_to_dots() {
         let mut ctx = mock_ctx();
-        let class_mirror = alloc_concurrent_synthetic(&mut ctx, "java/lang/Class", 4);
+        let class_mirror = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/Class", 4).unwrap();
         let name_str = ctx.create_string("java/lang/management/MemoryUsage");
         ctx.set_field(class_mirror, 1, Value::Object(Some(name_str)));
         let resolved = resolve_type_name(&ctx, class_mirror);
@@ -2625,7 +2896,7 @@ mod tests {
             ("init".to_string(), Value::Long(0)),
             ("used".to_string(), Value::Long(1024)),
         ];
-        let cd = build_composite_data(&mut ctx, None, &items);
+        let cd = build_composite_data(&mut ctx, None, &items).unwrap();
         // The carrier object must be a real allocated object.
         assert!(ctx.object_num_fields(cd) >= 4);
     }
@@ -2633,8 +2904,68 @@ mod tests {
     #[test]
     fn build_tabular_data_returns_non_null() {
         let mut ctx = mock_ctx();
-        let td = build_tabular_data(&mut ctx, None);
+        let td = build_tabular_data(&mut ctx, None).unwrap();
         assert!(ctx.object_num_fields(td) >= 4);
+    }
+
+    #[test]
+    fn only_cratonvm_built_carriers_are_answered_by_the_carrier_natives() {
+        use cratonvm_native_api::FieldMetadata;
+        let mut ctx = mock_ctx();
+        let cid = match ctx.ensure_class_initialized(CDS_CLASS) {
+            Ok(cid) => cid,
+            Err(e) => panic!("mock could not initialize {CDS_CLASS}: {e:?}"),
+        };
+        // The mock resolves a field name only through `set_declared_fields`;
+        // the real VM's by-name path resolves the two carrier fields on the
+        // synthetically-allocated instance itself. Declare them so both
+        // branches below are reachable here.
+        ctx.set_declared_fields(
+            cid,
+            vec![
+                FieldMetadata {
+                    name: CONTENTS_FIELD.to_string(),
+                    descriptor: "Ljava/lang/Object;".to_string(),
+                    access_flags: 0,
+                    slot_index: 0,
+                    declaring_class_id: cid,
+                    is_static: false,
+                },
+                FieldMetadata {
+                    name: OPEN_TYPE_FIELD.to_string(),
+                    descriptor: "Ljava/lang/Object;".to_string(),
+                    access_flags: 0,
+                    slot_index: 1,
+                    declaring_class_id: cid,
+                    is_static: false,
+                },
+            ],
+        );
+
+        let carrier = match ctx.new_object(CDS_CLASS) {
+            Ok(Some(Value::Object(Some(o)))) => o,
+            other => panic!("mock could not allocate an instance: {other:?}"),
+        };
+
+        // Untouched, an instance looks exactly like one the application built
+        // through the JDK's own constructor: neither carrier field is set. The
+        // natives answered those from the carrier fields and so returned null
+        // for everything — `getCompositeType()` in particular, which made
+        // `CompositeType.isValue()` reject a value against its own declared
+        // type. It has to go back to the bytecode.
+        assert!(!is_synthetic_carrier(&ctx, carrier));
+        assert!(delegates_to_bytecode(&ctx, carrier, CDS_CLASS));
+
+        // Stamped the way `build_composite_data` stamps it, the same instance
+        // is this crate's own carrier and the natives must keep answering it —
+        // under `synthetic-jdk` there is no bytecode to fall back to.
+        let map = match ctx.new_object("java/util/HashMap") {
+            Ok(Some(Value::Object(Some(o)))) => o,
+            other => panic!("mock could not allocate a map: {other:?}"),
+        };
+        ctx.set_field_by_name(carrier, CONTENTS_FIELD, Value::Object(Some(map)));
+        assert!(is_synthetic_carrier(&ctx, carrier));
+        assert!(!delegates_to_bytecode(&ctx, carrier, CDS_CLASS));
     }
 
     #[test]
@@ -2646,7 +2977,7 @@ mod tests {
         // the synthetic map directly and verify slot layout.
         let mut ctx = mock_ctx();
         // Allocate a synthetic map exactly as the fallback does.
-        let synth = alloc_concurrent_synthetic(&mut ctx, "java/util/HashMap", 3);
+        let synth = try_alloc_concurrent_synthetic(&mut ctx, "java/util/HashMap", 3).unwrap();
         let keys = ctx.new_ref_array(ClassId::new(0), 1);
         let vals = ctx.new_ref_array(ClassId::new(0), 1);
         let k = ctx.create_string("used");

@@ -131,11 +131,23 @@ impl Compiler {
             .chain(self.ldc_class_info.iter().map(|&(pc, _, _)| pc))
             .collect();
 
+        // Only pcs the constant-pool resolver actually reduced to an immediate.
+        // A site it never saw must stay `Unknown` rather than default to the
+        // non-floating-point member of its pair.
+        let ldc_resolved: FxHashSet<usize> = self
+            .ldc_info
+            .iter()
+            .map(|&(pc, _)| pc)
+            .chain(self.ldc2w_info.iter().map(|&(pc, _)| pc))
+            .collect();
+
         let inputs = StackKindInputs {
             field_types,
             static_types,
             calls,
             ldc_refs: &ldc_refs,
+            ldc_fp: &self.ldc_fp_pcs,
+            ldc_resolved: &ldc_resolved,
         };
         self.stack_kinds = analyze(code, code_len, &inputs);
         if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_STACK_KINDS").is_some() {
@@ -651,6 +663,33 @@ impl Compiler {
     /// call is on the sentinel branch only. Emits nothing when the runtime
     /// offers no helper (unit-test compiles), which restores the previous
     /// behaviour exactly.
+    /// CRATONVM_DBG_DEOPT — name a direct JIT-to-JIT call site that gets NO
+    /// callee-deopt service check.
+    ///
+    /// Such a site is where an orphaned deopt frame is born: the callee traps,
+    /// stashes a frame keyed to ITSELF, and returns the `i64::MIN` sentinel;
+    /// with no check here the sentinel reaches this method's shared
+    /// exception-check stub, which reloads the sentinel and returns — so the
+    /// stash travels up to a consumer that cannot attribute it. Printing the
+    /// site, and WHICH of the two preconditions was missing, is what turns "an
+    /// orphan appeared" into a named call site.
+    pub(super) fn dbg_unserviced_direct_call(
+        &self,
+        kind: &str,
+        pc: usize,
+        has_info: bool,
+        has_args_base: bool,
+    ) {
+        if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_DEOPT").is_none() {
+            return;
+        }
+        eprintln!(
+            "[cratonvm-deopt] direct {kind} call at {}#{pc} has NO callee-deopt service \
+             (info={has_info} args_base={has_args_base})",
+            self.method_key,
+        );
+    }
+
     pub(super) fn emit_inline_callee_deopt_check(
         &mut self,
         info: *const crate::JitInvokeInfo,
@@ -1317,7 +1356,8 @@ impl Compiler {
                          reason={reason} site_pc={site_pc}"
                     );
                 }
-                self.buf.mark_overflowed();
+                self.buf
+                    .mark_codegen_unencodable("deopt-stub-without-saved-regs");
                 return;
             }
             if let Some(box_ptr) = frame_box_ptr {

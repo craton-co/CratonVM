@@ -2,8 +2,8 @@
 
 CratonVM's JIT compiler went through a long sequence of optimization rounds,
 starting from a naive interpreter that was roughly **97x slower** than the
-HotSpot interpreter. A March 2026 Round 26 snapshot reached about **1.5x of
-HotSpot C2** on QuickBench, but that is historical, not the current benchmark
+HotSpot interpreter. An early snapshot reached about **1.5x of
+HotSpot C2** on QuickBench; that figure is historical, not the current benchmark
 claim. For current measurements, see [Benchmarks](benchmarks.md).
 
 This chapter is the engineering story, useful background for anyone tuning

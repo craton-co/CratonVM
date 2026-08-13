@@ -91,8 +91,13 @@ public class RFileTimes {
             File archive = writeArchive(dir);
             entryTimesRoundTrip(archive);
             extractedFileTimes(dir, archive);
-            System.out.println("CK checks " + checks);
-            System.out.println("PASS RFileTimes");
+            // Spelled `CK RFileTimes checks=N`, not the older `CK checks N`.
+            // The count is the suite's guard against a vector that silently
+            // emitted FEWER observables than the oracle (harness-guard.sh, G3),
+            // and that guard has to be able to find the number: an unanchored
+            // `CK checks 40` is not attributable to a class.
+            System.out.println("CK RFileTimes checks=" + checks);
+            System.out.println("PASS RFileTimes (" + checks + " checks)");
         }
         finally {
             deleteTree(dir);

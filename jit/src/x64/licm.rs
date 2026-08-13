@@ -260,6 +260,17 @@ pub(super) fn instruction_start_map(code: &[u8], code_len: usize) -> Vec<bool> {
 ///
 /// When off, no Stage 3 codegen is emitted (byte-identical legacy path); when on,
 /// bintrees16/18 == golden (14985902 / 68332206), MinRegexProbe A3 repro green.
+/// ## The opt-out does not turn safepoint emission off while moving-young is on
+///
+/// The decision the codegen actually makes is
+/// `precise_jit_maps_enabled() || moving_young_enabled()` (`x64.rs`), and
+/// moving-young is default-ON — a moving young generation cannot be served by
+/// the conservative fallback, so the OR is correct. The consequence is that
+/// `CRATONVM_NO_PRECISE_JIT_MAPS=1` alone changes nothing about safepoint
+/// emission, and used to do so **silently**: an A/B on it reads as "precise
+/// maps cost nothing" when what actually happened is that both arms had them.
+/// That is how an inert lever produces a confident wrong answer, so the
+/// override now says so once, and names the flag that really turns it off.
 pub fn precise_jit_maps_enabled() -> bool {
     use std::sync::OnceLock;
     static G: OnceLock<bool> = OnceLock::new();
@@ -267,7 +278,18 @@ pub fn precise_jit_maps_enabled() -> bool {
         // Flipped back to DEFAULT-ON 2026-07-07 (see the doc comment above):
         // the BUG-01 ~6× throughput tax that motivated the d53c0e96 default-off
         // flip is gone on current dev. Opt out with CRATONVM_NO_PRECISE_JIT_MAPS=1.
-        cratonvm_types::flags::runtime_var_os("CRATONVM_NO_PRECISE_JIT_MAPS").is_none()
+        let enabled = cratonvm_types::flags::runtime_var_os("CRATONVM_NO_PRECISE_JIT_MAPS")
+            .is_none();
+        if !enabled && moving_young_enabled() {
+            eprintln!(
+                "[cratonvm] WARN: CRATONVM_NO_PRECISE_JIT_MAPS is set but a moving young \
+                 generation is enabled, and moving-young requires precise safepoint maps — \
+                 the codegen gate is `precise_jit_maps_enabled() || moving_young_enabled()`, \
+                 so precise maps stay ON and this flag changes nothing. Add \
+                 CRATONVM_NO_MOVING_YOUNG=1 to actually turn them off."
+            );
+        }
+        enabled
     })
 }
 
@@ -304,7 +326,7 @@ pub fn narrow_oops_block_inline_fields() -> bool {
 /// `CRATONVM_NO_JIT_INLINE_PUTFIELD`; the former
 /// `CRATONVM_JIT_INLINE_PUTFIELD` opt-in is accepted as a compatibility no-op.
 ///
-/// INT-6 (GC audit 2026-07-10), **as corrected by G1-2** (`docs/gc/g1-audit.md`
+/// INT-6 (GC audit 2026-07-10), **as corrected by G1-2** (`audits/g1-audit.md`
 /// §8.1, 2026-07-31). The previous wording claimed the guarded-getfield
 /// receiver check was prepended by "both inline arms"; three emitters did not
 /// have it, and the `region_bounds_addr != 0` test it named is not a backend
@@ -317,7 +339,7 @@ pub fn narrow_oops_block_inline_fields() -> bool {
 /// scanned wholesale — but a region held OUT of the CSet by a JNI pin is
 /// reachable only through its remembered set, so an inline store that skips
 /// `post_write_barrier_rset` loses that edge and the next pause frees a live
-/// referent (`docs/gc/g1-audit.md` §2, §5).
+/// referent (`audits/g1-audit.md` §2, §5).
 ///
 /// **What actually gates the backend.** NOT `helpers.region_bounds_addr != 0`:
 /// that field is the ADDRESS of the process-global `JIT_REGION_BOUNDS` static
@@ -359,7 +381,7 @@ pub fn inline_putfield_enabled() -> bool {
 
 /// Does the GC backend have LIVE heap-region bounds published right now?
 ///
-/// G1-2 (`docs/gc/g1-audit.md` §8.1). This is the predicate the inline
+/// G1-2 (`audits/g1-audit.md` §8.1). This is the predicate the inline
 /// reference-store emitters need and `helpers.region_bounds_addr != 0` is not.
 /// That field holds the address of the process-global `JIT_REGION_BOUNDS`
 /// static (`gc/src/gen_heap.rs`), which `vm/src/jit/helpers.rs` assigns from
@@ -814,6 +836,158 @@ pub fn inline_rbp_tls_mirror_write(value: usize) -> bool {
     }
 }
 
+// ---------------------------------------------------------------------------
+// The compile-id mirror — the identity half of the innermost-frame record
+// ---------------------------------------------------------------------------
+//
+// A second slot, written by the same instructions that write the RBP mirror, so
+// the GC can name the method owning `exact_rbp` instead of decoding the call
+// that created the frame (see the compile-id table in `lib.rs` for why the
+// decode cannot work for an indirect JIT->JIT call). Everything here mirrors
+// `inline_rbp_tls_disp` deliberately: same probe, same fail-to-zero rule, same
+// segment prefix. A zero displacement means codegen publishes no identity and
+// the scan keeps its old behaviour.
+#[cfg(windows)]
+pub fn inline_cm_tls_disp() -> usize {
+    use std::sync::OnceLock;
+    static DISP: OnceLock<usize> = OnceLock::new();
+    *DISP.get_or_init(|| {
+        // Only meaningful alongside the RBP mirror: the pair is what makes
+        // `(rbp, id)` describe one frame.
+        if inline_rbp_tls_disp() == 0 {
+            return 0;
+        }
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn TlsAlloc() -> u32;
+            fn TlsSetValue(idx: u32, val: *mut core::ffi::c_void) -> i32;
+        }
+        const TLS_OUT_OF_INDEXES: u32 = 0xFFFF_FFFF;
+        const TEB_TLS_SLOTS_OFF: usize = 0x1480;
+        // SAFETY: as `inline_rbp_tls_disp` — the documented Win32 TLS APIs plus
+        // a sentinel round-trip that proves the displacement before it is used.
+        let disp = unsafe {
+            'probe: {
+                let slot = TlsAlloc();
+                if slot == TLS_OUT_OF_INDEXES {
+                    break 'probe 0;
+                }
+                // A different sentinel from the RBP probe's, so a mix-up
+                // between the two slots cannot round-trip successfully.
+                let sentinel: usize = 0x434D_4944_5F50_0000 | (slot as usize & 0xFFFF);
+                if TlsSetValue(slot, sentinel as *mut core::ffi::c_void) == 0 {
+                    break 'probe 0;
+                }
+                let candidate = TEB_TLS_SLOTS_OFF + (slot as usize) * 8;
+                if read_gs_qword(candidate) == sentinel {
+                    TlsSetValue(slot, core::ptr::null_mut());
+                    break 'probe candidate;
+                }
+                let mut d = TEB_TLS_SLOTS_OFF;
+                let end = TEB_TLS_SLOTS_OFF + 64 * 8;
+                while d < end {
+                    if read_gs_qword(d) == sentinel {
+                        TlsSetValue(slot, core::ptr::null_mut());
+                        break 'probe d;
+                    }
+                    d += 8;
+                }
+                TlsSetValue(slot, core::ptr::null_mut());
+                0
+            }
+        };
+        if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_INLINE_FR").is_some() {
+            if disp != 0 {
+                eprintln!("[INLINE-FR] compile-id mirror ENABLED at gs:[{disp:#x}]");
+            } else {
+                eprintln!("[INLINE-FR] compile-id mirror probe FAILED — identity not published");
+            }
+        }
+        disp
+    })
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+thread_local! {
+    /// Linux counterpart of the Windows compile-id slot. Generated code writes
+    /// the low 32 bits of this cell as `fs:[disp32]`.
+    pub(super) static LINUX_INLINE_CM_MIRROR: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+pub fn inline_cm_tls_disp() -> usize {
+    use std::sync::OnceLock;
+    static DISP: OnceLock<usize> = OnceLock::new();
+    *DISP.get_or_init(|| {
+        if inline_rbp_tls_disp() == 0 {
+            return 0;
+        }
+        let disp = LINUX_INLINE_CM_MIRROR.with(|cell| {
+            // SAFETY / rationale: identical to `inline_rbp_tls_disp`'s Linux
+            // arm — derive the cell's offset from the FS base and prove it with
+            // a sentinel round-trip before any generated store uses it.
+            let fs_base = unsafe { read_fs_qword(0) };
+            let cell_addr = cell as *const std::cell::Cell<usize> as usize;
+            let delta = (cell_addr as i128) - (fs_base as i128);
+            let Ok(delta32) = i32::try_from(delta) else {
+                return 0;
+            };
+            if delta32 == 0 {
+                return 0;
+            }
+            let old = cell.replace(0x434D_4944_5F4C_4E58);
+            // SAFETY: reads back the 8 bytes the line above wrote through the
+            // same live thread-local; the comparison is what decides whether
+            // the derived displacement is trusted at all.
+            let probed = unsafe { read_fs_qword(delta32 as isize) };
+            cell.set(old);
+            if probed == 0x434D_4944_5F4C_4E58 {
+                (delta32 as u32) as usize
+            } else {
+                0
+            }
+        });
+        if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_INLINE_FR").is_some() {
+            if disp != 0 {
+                eprintln!("[INLINE-FR] compile-id mirror ENABLED at fs:[{:#x}]", disp as u32);
+            } else {
+                eprintln!("[INLINE-FR] compile-id mirror probe FAILED — identity not published");
+            }
+        }
+        disp
+    })
+}
+
+/// Unsupported targets publish no identity.
+#[cfg(not(any(windows, all(target_os = "linux", target_arch = "x86_64"))))]
+pub fn inline_cm_tls_disp() -> usize {
+    0
+}
+
+/// VM-side access to the Linux TLS cell used by generated `fs:` identity
+/// stores. `None` means the startup probe did not enable the mirror. The
+/// Windows side reads `gs:[disp]` directly with its own helper, exactly as it
+/// does for the RBP mirror.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+pub fn inline_cm_tls_mirror_read() -> Option<u32> {
+    if inline_cm_tls_disp() == 0 {
+        None
+    } else {
+        Some((LINUX_INLINE_CM_MIRROR.with(std::cell::Cell::get) & 0xFFFF_FFFF) as u32)
+    }
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+pub fn inline_cm_tls_mirror_write(value: u32) -> bool {
+    if inline_cm_tls_disp() == 0 {
+        false
+    } else {
+        LINUX_INLINE_CM_MIRROR.with(|cell| cell.set(value as usize));
+        true
+    }
+}
+
 /// Read the 8-byte value at `gs:[disp]` (Windows TEB-relative). Used only by
 /// the [`inline_rbp_tls_disp`] startup probe.
 ///
@@ -1224,7 +1398,7 @@ pub static STATIC_BASE_RESOLVER_CTX: std::sync::atomic::AtomicUsize =
 /// VM B's statics would bake the address of an unrelated class's slot into VM
 /// A's code — the same cross-VM aliasing that made the process-global
 /// `system_class_id` atomic and the unqualified `class_init_memo` wrong (see
-/// `docs/vm-jit-cache-keying.md`). There is no correct answer to give once two
+/// `audits/vm-jit-cache-keying.md`). There is no correct answer to give once two
 /// VMs share the process, so the mechanism turns itself off for BOTH and every
 /// static read goes back to the helper: slower, never wrong.
 static STATIC_BASE_RESOLVER_POISONED: std::sync::atomic::AtomicBool =

@@ -11,7 +11,7 @@ use cratonvm_types::{ObjectRef, Value};
 use std::sync::OnceLock;
 use std::time::Instant;
 
-use crate::{alloc_concurrent_synthetic, native_noop_with_this, obj_arg};
+use crate::{try_alloc_concurrent_synthetic, native_noop_with_this, obj_arg};
 // The live-thread helpers live in `crate::phases_late::management` rather than
 // here: this module is gated on the `management` feature, that one is
 // not, and both register the same `ThreadMXBean` triples. One copy is what
@@ -119,6 +119,16 @@ fn uptime_ms() -> u64 {
 static THREAD_CPU_TIME_ENABLED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(true);
 
+/// `com.sun.management.ThreadMXBean.setThreadAllocatedMemoryEnabled` state.
+///
+/// Defaults to `true` for the same reason and with the same caveat as
+/// [`THREAD_CPU_TIME_ENABLED`]: HotSpot boots with thread allocated-memory
+/// measurement on, the underlying accounting (a TLAB cursor) genuinely cannot
+/// be switched off, but the API's `setEnabled(false)` must still be visible
+/// through `isEnabled()`.
+static THREAD_ALLOCATED_MEMORY_ENABLED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(true);
+
 /// JMM contention monitoring is opt-in, like HotSpot. VM-side counters are
 /// reset at each enable transition so pre-enable lock activity is never leaked
 /// into the observable ThreadInfo values.
@@ -178,6 +188,227 @@ fn system_load_average() -> f64 {
         }
     }
     -1.0
+}
+
+/// The `com.sun.management.OperatingSystemMXBean` metrics, and the
+/// `com.sun.management.internal.OperatingSystemImpl` `*0` natives behind the
+/// real JDK's copy of the same bean.
+///
+/// One implementation for both surfaces, deliberately: they are two spellings
+/// of one question, and the pattern this file keeps hitting is a pair that
+/// drifts until one of them reports a number the other calls unavailable.
+///
+/// Everything here is `-1` off Linux — the JMM's documented "metric
+/// unavailable", which callers distinguish from a real measurement. On Linux
+/// the numbers come from `/proc`, i.e. from the same place `libmanagement`
+/// reads them, so they are measurements rather than plausible-looking
+/// inventions. The two CPU-*load* doubles stay at the `-1.0` sentinel: they
+/// are defined as a fraction over an interval, which needs sampling state this
+/// bean does not keep, and a single-shot number would be a guess.
+mod os_metrics {
+    /// Value of a `key:  <n> kB` line in a `/proc` file, in **bytes**.
+    #[cfg(target_os = "linux")]
+    fn proc_kb_field(path: &str, key: &str) -> Option<i64> {
+        let contents = std::fs::read_to_string(path).ok()?;
+        for line in contents.lines() {
+            let Some(rest) = line.strip_prefix(key) else {
+                continue;
+            };
+            let rest = rest.strip_prefix(':')?;
+            let kb: i64 = rest.split_whitespace().next()?.parse().ok()?;
+            return kb.checked_mul(1024);
+        }
+        None
+    }
+
+    /// Total physical memory (`getTotalMemorySize` /
+    /// `getTotalPhysicalMemorySize`).
+    pub(super) fn total_physical_memory() -> i64 {
+        #[cfg(target_os = "linux")]
+        {
+            if let Some(bytes) = proc_kb_field("/proc/meminfo", "MemTotal") {
+                return bytes;
+            }
+        }
+        -1
+    }
+
+    /// Free physical memory (`getFreeMemorySize` / `getFreePhysicalMemorySize`).
+    ///
+    /// `MemAvailable` first — that is the kernel's own estimate of what a new
+    /// allocation could actually get, and it is what a modern HotSpot reports.
+    /// `MemFree` is the fallback for kernels too old to publish it.
+    pub(super) fn free_physical_memory() -> i64 {
+        #[cfg(target_os = "linux")]
+        {
+            if let Some(bytes) = proc_kb_field("/proc/meminfo", "MemAvailable") {
+                return bytes;
+            }
+            if let Some(bytes) = proc_kb_field("/proc/meminfo", "MemFree") {
+                return bytes;
+            }
+        }
+        -1
+    }
+
+    /// `getTotalSwapSpaceSize`.
+    pub(super) fn total_swap() -> i64 {
+        #[cfg(target_os = "linux")]
+        {
+            if let Some(bytes) = proc_kb_field("/proc/meminfo", "SwapTotal") {
+                return bytes;
+            }
+        }
+        -1
+    }
+
+    /// `getFreeSwapSpaceSize`.
+    pub(super) fn free_swap() -> i64 {
+        #[cfg(target_os = "linux")]
+        {
+            if let Some(bytes) = proc_kb_field("/proc/meminfo", "SwapFree") {
+                return bytes;
+            }
+        }
+        -1
+    }
+
+    /// `getCommittedVirtualMemorySize` — this process's whole virtual size,
+    /// `VmSize` in `/proc/self/status`.
+    pub(super) fn committed_virtual_memory() -> i64 {
+        #[cfg(target_os = "linux")]
+        {
+            if let Some(bytes) = proc_kb_field("/proc/self/status", "VmSize") {
+                return bytes;
+            }
+        }
+        -1
+    }
+
+    /// `getProcessCpuTime`, in **nanoseconds**: user + system time for the
+    /// whole process, from fields 14/15 of `/proc/self/stat`.
+    ///
+    /// The fields are in clock ticks. `sysconf(_SC_CLK_TCK)` is 100 on every
+    /// Linux this VM targets and is not reachable without a libc binding, so
+    /// it is assumed rather than read — the same constant the in-tree
+    /// `/proc/…/stat` CPU-time reader for `getThreadCpuTime` already assumes.
+    ///
+    /// Parsing starts after the last `)`, because field 2 is the executable
+    /// name in parentheses and may itself contain spaces.
+    pub(super) fn process_cpu_time_ns() -> i64 {
+        #[cfg(target_os = "linux")]
+        {
+            const TICKS_PER_SEC: i64 = 100;
+            const NS_PER_TICK: i64 = 1_000_000_000 / TICKS_PER_SEC;
+            if let Ok(stat) = std::fs::read_to_string("/proc/self/stat") {
+                if let Some(after_comm) = stat.rfind(')').map(|i| &stat[i + 1..]) {
+                    let fields: Vec<&str> = after_comm.split_whitespace().collect();
+                    // After the `)` the first field is `state` (field 3), so
+                    // utime (14) and stime (15) are indices 11 and 12.
+                    if let (Some(utime), Some(stime)) = (fields.get(11), fields.get(12)) {
+                        if let (Ok(u), Ok(s)) = (utime.parse::<i64>(), stime.parse::<i64>()) {
+                            return u.saturating_add(s).saturating_mul(NS_PER_TICK);
+                        }
+                    }
+                }
+            }
+        }
+        -1
+    }
+
+    /// `getOpenFileDescriptorCount` — entries in `/proc/self/fd`.
+    ///
+    /// The `readdir` handle itself is one of them, so the raw count is one
+    /// too high; subtract it rather than report a number that grows every
+    /// time it is asked for.
+    pub(super) fn open_fd_count() -> i64 {
+        #[cfg(target_os = "linux")]
+        {
+            if let Ok(entries) = std::fs::read_dir("/proc/self/fd") {
+                let n = entries.count() as i64;
+                return (n - 1).max(0);
+            }
+        }
+        -1
+    }
+
+    /// `getMaxFileDescriptorCount` — the soft `NOFILE` limit, from
+    /// `/proc/self/limits`.
+    pub(super) fn max_fd_count() -> i64 {
+        #[cfg(target_os = "linux")]
+        {
+            if let Ok(limits) = std::fs::read_to_string("/proc/self/limits") {
+                for line in limits.lines() {
+                    let Some(rest) = line.strip_prefix("Max open files") else {
+                        continue;
+                    };
+                    if let Some(soft) = rest.split_whitespace().next() {
+                        if let Ok(v) = soft.parse::<i64>() {
+                            return v;
+                        }
+                        // "unlimited" — RLIM_INFINITY has no i64 spelling the
+                        // JMM defines, so report it as unavailable rather than
+                        // as some arbitrary large number.
+                        return -1;
+                    }
+                }
+            }
+        }
+        -1
+    }
+}
+
+/// The `()J` OS metrics under their **JDK 8 / legacy** `*0` native names.
+///
+/// Returned as a table rather than registered inline so the JDK 9+
+/// `com.sun.management.internal.OperatingSystemImpl` copy and the public
+/// interface methods can be built from the same list — a metric added here
+/// cannot be forgotten on one of the three surfaces.
+type OsMetricNative = fn(&mut dyn NativeContext, &[Value]) -> MethodCallResult;
+
+fn os_metric_long_natives() -> [(&'static str, OsMetricNative); 8] {
+    [
+        ("getCommittedVirtualMemorySize0", |_ctx, _args| {
+            Ok(Some(Value::Long(os_metrics::committed_virtual_memory())))
+        }),
+        ("getTotalSwapSpaceSize0", |_ctx, _args| {
+            Ok(Some(Value::Long(os_metrics::total_swap())))
+        }),
+        ("getFreeSwapSpaceSize0", |_ctx, _args| {
+            Ok(Some(Value::Long(os_metrics::free_swap())))
+        }),
+        ("getProcessCpuTime0", |_ctx, _args| {
+            Ok(Some(Value::Long(os_metrics::process_cpu_time_ns())))
+        }),
+        ("getFreePhysicalMemorySize0", |_ctx, _args| {
+            Ok(Some(Value::Long(os_metrics::free_physical_memory())))
+        }),
+        ("getTotalPhysicalMemorySize0", |_ctx, _args| {
+            Ok(Some(Value::Long(os_metrics::total_physical_memory())))
+        }),
+        ("getOpenFileDescriptorCount0", |_ctx, _args| {
+            Ok(Some(Value::Long(os_metrics::open_fd_count())))
+        }),
+        ("getMaxFileDescriptorCount0", |_ctx, _args| {
+            Ok(Some(Value::Long(os_metrics::max_fd_count())))
+        }),
+    ]
+}
+
+/// The same eight metrics under their **JDK 9+** `*0` native names. JDK 25
+/// renamed three of them (`getFreePhysicalMemorySize0` -> `getFreeMemorySize0`,
+/// `getTotalPhysicalMemorySize0` -> `getTotalMemorySize0`, and on the load side
+/// `getSystemCpuLoad0` -> `getCpuLoad0`); the rest are unchanged.
+fn os_metric_long_natives_jdk9() -> [(&'static str, OsMetricNative); 8] {
+    let mut table = os_metric_long_natives();
+    for entry in &mut table {
+        entry.0 = match entry.0 {
+            "getFreePhysicalMemorySize0" => "getFreeMemorySize0",
+            "getTotalPhysicalMemorySize0" => "getTotalMemorySize0",
+            other => other,
+        };
+    }
+    table
 }
 
 /// The VM's boot class path, as published in the `sun.boot.class.path` system
@@ -732,10 +963,10 @@ fn object_name_set_text(ctx: &mut dyn NativeContext, obj: ObjectRef, text: Strin
     ctx.set_field(obj, 0, Value::Object(Some(s)));
 }
 
-fn object_name_new(ctx: &mut dyn NativeContext, text: String) -> ObjectRef {
-    let obj = alloc_concurrent_synthetic(ctx, "javax/management/ObjectName", 1);
+fn object_name_new(ctx: &mut dyn NativeContext, text: String) -> Result<ObjectRef, MethodCallFailed> {
+    let obj = try_alloc_concurrent_synthetic(ctx, "javax/management/ObjectName", 1)?;
     object_name_set_text(ctx, obj, text);
-    obj
+    Ok(obj)
 }
 
 fn register_object_instance(r: &mut NativeMethodRegistry) {
@@ -921,7 +1152,7 @@ fn native_object_name_get_instance_string(
     if !object_name_has_required_structure(&text) {
         return Err(throw_malformed_object_name(ctx, &text));
     }
-    Ok(Some(Value::Object(Some(object_name_new(ctx, text)))))
+    Ok(Some(Value::Object(Some(object_name_new(ctx, text)?))))
 }
 
 fn native_object_name_get_instance_object(
@@ -1422,7 +1653,7 @@ pub fn register_management_factory_platform_server_stub(r: &mut NativeMethodRegi
         "java/lang/management/ManagementFactory",
         "getPlatformMBeanServer",
         "()Ljavax/management/MBeanServer;",
-        |ctx, _args| Ok(Some(Value::Object(Some(platform_mbean_server(ctx))))),
+        |ctx, _args| Ok(Some(Value::Object(Some(platform_mbean_server(ctx)?)))),
     );
     r.set_category(__prev_cat);
 }
@@ -1597,12 +1828,6 @@ pub fn register_vm_management_impl(r: &mut NativeMethodRegistry) {
         };
     r.register(
         cls,
-        "isThreadCpuTimeSupported",
-        "()Z",
-        other_thread_cpu_time,
-    );
-    r.register(
-        cls,
         "isOtherThreadCpuTimeSupported",
         "()Z",
         other_thread_cpu_time,
@@ -1775,10 +2000,6 @@ pub fn register_vm_management_impl(r: &mut NativeMethodRegistry) {
     // REAL: "resets the peak thread count to the current number of live
     // threads" (JMM). There IS peak state to reset now — the old comment's
     // premise was the missing high-water mark, not a spec exemption.
-    r.register(cls, "resetPeakThreadCount", "()V", |ctx, _args| {
-        reset_peak_thread_count(ctx);
-        Ok(None)
-    });
 
     // -- VMManagementImpl uptime + processor count --
     //
@@ -1825,8 +2046,8 @@ pub fn register_vm_management_impl(r: &mut NativeMethodRegistry) {
                 .ensure_class_initialized("sun/management/MemoryPoolImpl")
                 .unwrap_or(ClassId::new(0));
             let arr = ctx.new_ref_array(pool_cid, 2);
-            let p0 = alloc_memory_pool_impl(ctx, "Eden Space", true);
-            let p1 = alloc_memory_pool_impl(ctx, "Old Gen", true);
+            let p0 = alloc_memory_pool_impl(ctx, "Eden Space", true)?;
+            let p1 = alloc_memory_pool_impl(ctx, "Old Gen", true)?;
             ctx.set_array_element(arr, 0, Value::Object(Some(p0)));
             ctx.set_array_element(arr, 1, Value::Object(Some(p1)));
             Ok(Some(Value::Object(Some(arr))))
@@ -1845,7 +2066,7 @@ pub fn register_vm_management_impl(r: &mut NativeMethodRegistry) {
             // GarbageCollectorImpl extends MemoryManagerImpl + implements
             // GarbageCollectorMXBean — single instance covers both the
             // manager list and (via the instanceof filter) the GC list.
-            let gc = alloc_garbage_collector_impl(ctx, "G1 Young Generation");
+            let gc = alloc_garbage_collector_impl(ctx, "G1 Young Generation")?;
             ctx.set_array_element(arr, 0, Value::Object(Some(gc)));
             Ok(Some(Value::Object(Some(arr))))
         },
@@ -1905,10 +2126,15 @@ pub fn register_vm_management_impl(r: &mut NativeMethodRegistry) {
         "(Z)Ljava/lang/management/MemoryUsage;",
         |ctx, args| {
             let is_heap = matches!(args.get(1), Some(Value::Int(v)) if *v != 0);
-            let obj = alloc_concurrent_synthetic(ctx, "java/lang/management/MemoryUsage", 4);
+            let obj = try_alloc_concurrent_synthetic(ctx, "java/lang/management/MemoryUsage", 4)?;
             if is_heap {
                 let used = ctx.heap_allocated_bytes() as i64;
-                let committed = used.max(64 * 1024 * 1024);
+                // Same source as `Runtime.totalMemory()` (`committed_heap_bytes`),
+                // not the old `used.max(64 MiB)` floor: this bean and that
+                // accessor report the same quantity and used to disagree.
+                let committed = (ctx.committed_heap_bytes() as i64)
+                    .max(used)
+                    .min(ctx.max_heap_bytes().max(used));
                 ctx.set_field(obj, 0, Value::Long(ctx.initial_heap_bytes())); // init (real -Xms)
                 ctx.set_field(obj, 1, Value::Long(used)); // used (real)
                 ctx.set_field(obj, 2, Value::Long(committed)); // committed
@@ -2033,7 +2259,7 @@ pub fn register_vm_management_impl(r: &mut NativeMethodRegistry) {
                 "com/sun/management/HotSpotDiagnosticMXBean" => None,
                 _ => None,
             };
-            Ok(Some(Value::Object(bean)))
+            Ok(Some(Value::Object(bean.transpose()?)))
         },
     );
 
@@ -2049,14 +2275,14 @@ pub fn register_vm_management_impl(r: &mut NativeMethodRegistry) {
                 .unwrap_or_default();
             let beans: Vec<ObjectRef> = match cls_name.as_str() {
                 "java/lang/management/MemoryPoolMXBean" => vec![
-                    alloc_memory_pool_impl(ctx, "Eden Space", true),
-                    alloc_memory_pool_impl(ctx, "Old Gen", true),
+                    alloc_memory_pool_impl(ctx, "Eden Space", true)?,
+                    alloc_memory_pool_impl(ctx, "Old Gen", true)?,
                 ],
                 "java/lang/management/MemoryManagerMXBean" => {
-                    vec![alloc_garbage_collector_impl(ctx, "G1 Young Generation")]
+                    vec![alloc_garbage_collector_impl(ctx, "G1 Young Generation")?]
                 }
                 "java/lang/management/GarbageCollectorMXBean" => {
-                    vec![alloc_garbage_collector_impl(ctx, "G1 Young Generation")]
+                    vec![alloc_garbage_collector_impl(ctx, "G1 Young Generation")?]
                 }
                 // Other PlatformManagedObject classes (RuntimeMXBean, etc.)
                 // hit a separate `getPlatformMXBean` (singleton) path; the
@@ -2069,7 +2295,7 @@ pub fn register_vm_management_impl(r: &mut NativeMethodRegistry) {
             for (i, b) in beans.iter().enumerate() {
                 ctx.set_array_element(backing, i, Value::Object(Some(*b)));
             }
-            let list = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
+            let list = try_alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2)?;
             ctx.set_field_by_name(list, "elementData", Value::Object(Some(backing)));
             ctx.set_field_by_name(list, "size", Value::Int(beans.len() as i32));
             Ok(Some(Value::Object(Some(list))))
@@ -2239,7 +2465,7 @@ fn try_delegate_to_real_provider(
             Ok(Some(v)) => return Some(Ok(Some(v))),
             Ok(None) => {}
             Err(MethodCallFailed::ExceptionThrown(exc)) => {
-                let is_malformed = ctx.class_name_of_id(ctx.class_id_of_object(exc)).as_deref()
+                let is_malformed = ctx.class_name_arc_of_id(ctx.class_id_of_object(exc)).as_deref()
                     == Some("java/net/MalformedURLException");
                 if !is_malformed && first_exception.is_none() {
                     first_exception = Some(exc);
@@ -2307,7 +2533,7 @@ pub fn register_thread_impl(r: &mut NativeMethodRegistry) {
                     let info = ctx
                         .thread_jmx_snapshot(thread)
                         .map(|snapshot| alloc_snapshot_thread_info(ctx, snapshot))
-                        .unwrap_or_else(|| alloc_basic_thread_info(ctx, thread_id).expect("validated id"));
+                        .unwrap_or_else(|| Ok(alloc_basic_thread_info(ctx, thread_id).expect("validated id")))?;
                     let out = ctx.read_native_pin(out_pin, out);
                     ctx.set_array_element(out, i, Value::Object(Some(info)));
                 }
@@ -2549,15 +2775,6 @@ pub fn register_thread_impl(r: &mut NativeMethodRegistry) {
     // reaches the native and an unregistered one would be an
     // UnsatisfiedLinkError. Both shapes are registered; the `[J` pair is kept
     // for any JDK that declares the older form.
-    r.register(
-        cls,
-        "findMonitorDeadlockedThreads0",
-        "()[J",
-        |ctx, _args| deadlocked_threads_result(ctx),
-    );
-    r.register(cls, "findDeadlockedThreads0", "()[J", |ctx, _args| {
-        deadlocked_threads_result(ctx)
-    });
     r.register_with_kind(
         cls,
         "findMonitorDeadlockedThreads0",
@@ -2658,13 +2875,13 @@ fn long_arg(args: &[Value], idx: usize) -> i64 {
 /// — only the aggregate `heap_allocated_bytes`, which `MemoryImpl
 /// .getMemoryUsage0` already surfaces — so every `MemoryPoolImpl` usage query
 /// answers with the spec-defined sentinel rather than a fabricated number.
-fn undefined_memory_usage(ctx: &mut dyn NativeContext) -> ObjectRef {
-    let mu = alloc_concurrent_synthetic(ctx, "java/lang/management/MemoryUsage", 4);
+fn undefined_memory_usage(ctx: &mut dyn NativeContext) -> Result<ObjectRef, MethodCallFailed> {
+    let mu = try_alloc_concurrent_synthetic(ctx, "java/lang/management/MemoryUsage", 4)?;
     ctx.set_field(mu, 0, Value::Long(-1));
     ctx.set_field(mu, 1, Value::Long(-1));
     ctx.set_field(mu, 2, Value::Long(-1));
     ctx.set_field(mu, 3, Value::Long(-1));
-    mu
+    Ok(mu)
 }
 
 /// `sun.management.GarbageCollectorImpl` — per-collector counters.
@@ -2878,7 +3095,7 @@ pub fn register_memory_pool_impl(r: &mut NativeMethodRegistry) {
                 // Fall back to a freshly allocated synthetic enum object —
                 // the probe only stringifies via toString(), which on
                 // enums reads the `name` field at slot 0.
-                let e = alloc_concurrent_synthetic(ctx, "java/lang/management/MemoryType", 2);
+                let e = try_alloc_concurrent_synthetic(ctx, "java/lang/management/MemoryType", 2)?;
                 let label = ctx.create_string(field);
                 ctx.set_field_by_name(e, "name", Value::Object(Some(label)));
                 Ok(Some(Value::Object(Some(e))))
@@ -2889,7 +3106,7 @@ pub fn register_memory_pool_impl(r: &mut NativeMethodRegistry) {
     // getUsage / getCollectionUsage — the JMM "metric unavailable" sentinel;
     // see `undefined_memory_usage` for why that is the honest answer here.
     let undefined_usage: fn(&mut dyn NativeContext, &[Value]) -> MethodCallResult = |ctx, _args| {
-        let mu = undefined_memory_usage(ctx);
+        let mu = undefined_memory_usage(ctx)?;
         Ok(Some(Value::Object(Some(mu))))
     };
     for name in ["getUsage0", "getCollectionUsage0"] {
@@ -2916,7 +3133,7 @@ pub fn register_memory_pool_impl(r: &mut NativeMethodRegistry) {
             if let Value::Object(Some(peak)) = ctx.get_field_by_name(this, "peakUsage") {
                 return Ok(Some(Value::Object(Some(peak))));
             }
-            let mu = undefined_memory_usage(ctx);
+            let mu = undefined_memory_usage(ctx)?;
             Ok(Some(Value::Object(Some(mu))))
         },
         NativeKind::Bridge,
@@ -2936,7 +3153,7 @@ pub fn register_memory_pool_impl(r: &mut NativeMethodRegistry) {
         // Building the snapshot allocates, which can relocate the receiver —
         // keep it rooted and re-read it before the field write.
         let pin = ctx.pin_native_root(this);
-        let now = undefined_memory_usage(ctx);
+        let now = undefined_memory_usage(ctx)?;
         let this = ctx.read_native_pin(pin, this);
         ctx.set_field_by_name(this, "peakUsage", Value::Object(Some(now)));
         ctx.unpin_native_roots(pin);
@@ -2966,13 +3183,13 @@ pub fn register_memory_pool_impl(r: &mut NativeMethodRegistry) {
 /// `isHeap` populated.  The remaining fields default-initialise to zero
 /// (longs) / null (refs) which matches a "no-threshold" pool — fine for
 /// JConsole-style enumeration.
-pub fn alloc_memory_pool_impl(ctx: &mut dyn NativeContext, name: &str, is_heap: bool) -> ObjectRef {
-    let obj = alloc_concurrent_synthetic(ctx, "sun/management/MemoryPoolImpl", 12);
+pub fn alloc_memory_pool_impl(ctx: &mut dyn NativeContext, name: &str, is_heap: bool) -> Result<ObjectRef, MethodCallFailed> {
+    let obj = try_alloc_concurrent_synthetic(ctx, "sun/management/MemoryPoolImpl", 12)?;
     let n = ctx.create_string(name);
     ctx.set_field_by_name(obj, "name", Value::Object(Some(n)));
     ctx.set_field_by_name(obj, "isHeap", Value::Int(if is_heap { 1 } else { 0 }));
     ctx.set_field_by_name(obj, "isValid", Value::Int(1));
-    obj
+    Ok(obj)
 }
 
 /// Allocate a synthetic `sun.management.GarbageCollectorImpl` with the
@@ -2981,46 +3198,52 @@ pub fn alloc_memory_pool_impl(ctx: &mut dyn NativeContext, name: &str, is_heap: 
 /// `getMemoryManagerMXBeans()`) and `GarbageCollectorMXBean` (so it
 /// passes the `instanceof` filter in
 /// `ManagementFactoryHelper.getGarbageCollectorMXBeans`).
-pub fn alloc_garbage_collector_impl(ctx: &mut dyn NativeContext, name: &str) -> ObjectRef {
-    let obj = alloc_concurrent_synthetic(ctx, "sun/management/GarbageCollectorImpl", 4);
+pub fn alloc_garbage_collector_impl(ctx: &mut dyn NativeContext, name: &str) -> Result<ObjectRef, MethodCallFailed> {
+    let obj = try_alloc_concurrent_synthetic(ctx, "sun/management/GarbageCollectorImpl", 4)?;
     let n = ctx.create_string(name);
     init_memory_manager_fields(ctx, obj, Value::Object(Some(n)));
-    obj
+    Ok(obj)
 }
 
 /// `sun.management.OperatingSystemImpl` — process / OS metrics.
 ///
-/// FLAGGED, but honest: every method here returns the OpenJDK
-/// "metric unavailable" sentinel (-1 for longs, -1.0 for the CPU-load
-/// doubles). CratonVM has no portable in-VM source for committed/total/free
-/// virtual or physical memory, swap, open/max file descriptors, process CPU
-/// time, or system/process CPU load — the real JDK reads these from
-/// platform-specific syscalls in libmanagement (getrusage / /proc / GetProcessTimes),
-/// which we don't bridge. Rather than invent plausible numbers we surface
-/// the spec-defined -1 / -1.0 sentinel, so a caller can distinguish
-/// "unavailable" from a real measurement. (Note: available-processor count,
-/// OS name, and arch ARE real — they come from std::env / available_parallelism
-/// via the OperatingSystemMXBean alloc above, not from this class.)
+/// The eight `()J` counters are REAL on Linux, read from `/proc` by the
+/// [`os_metrics`] module — the same place `libmanagement` reads them. They
+/// were a flat `-1` until 2026-08-13, justified by "CratonVM has no portable
+/// in-VM source": true of a portable source, and false of the platform this VM
+/// is measured on, where the sibling `getSystemLoadAverage` had been reading
+/// `/proc/loadavg` all along. Off Linux they are still the OpenJDK "metric
+/// unavailable" sentinel, so a caller can distinguish unavailable from
+/// measured.
+///
+/// The two CPU-*load* doubles remain -1.0, and that is a different question,
+/// not an unfinished half of the same one: a load is a fraction over an
+/// interval and needs a previous sample, which this bean does not keep.
+///
+/// (Available-processor count, OS name and arch are real too, and come from
+/// the `OperatingSystemMXBean` alloc above rather than from this class.)
 pub fn register_operating_system_impl(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let cls = "sun/management/OperatingSystemImpl";
 
-    let neg_one_long: fn(&mut dyn NativeContext, &[Value]) -> MethodCallResult =
-        |_ctx, _args| Ok(Some(Value::Long(-1)));
-    for name in [
-        "getCommittedVirtualMemorySize0",
-        "getTotalSwapSpaceSize0",
-        "getFreeSwapSpaceSize0",
-        "getProcessCpuTime0",
-        "getFreePhysicalMemorySize0",
-        "getTotalPhysicalMemorySize0",
-        "getOpenFileDescriptorCount0",
-        "getMaxFileDescriptorCount0",
-    ] {
-        r.register(cls, name, "()J", neg_one_long);
+    // REAL on Linux, `-1` elsewhere — see the `os_metrics` module, which is
+    // the single implementation these `*0` natives, the JDK 9+ `*0` natives
+    // below, and the `com.sun.management.OperatingSystemMXBean` interface
+    // methods in `register_operating_system_mxbean` all read. The whole family
+    // was a flat `-1` on the stated premise that CratonVM "has no portable
+    // in-VM source" for them; that is true of a *portable* source and false of
+    // this host, where `/proc` publishes every one of them and the sibling
+    // `getSystemLoadAverage` was already reading `/proc/loadavg`.
+    for (name, metric) in os_metric_long_natives() {
+        r.register(cls, name, "()J", metric);
     }
 
+    // KEEP -1.0: unlike the counters above, a CPU *load* is a fraction over an
+    // interval, so answering it needs a previous sample. This bean keeps none,
+    // and a single-shot `/proc/stat` read would be a number with no defined
+    // meaning rather than a measurement. `-1.0` is the JMM's documented
+    // "not available".
     let neg_one_double: fn(&mut dyn NativeContext, &[Value]) -> MethodCallResult =
         |_ctx, _args| Ok(Some(Value::Double(-1.0)));
     for name in ["getSystemCpuLoad0", "getProcessCpuLoad0"] {
@@ -3032,7 +3255,6 @@ pub fn register_operating_system_impl(r: &mut NativeMethodRegistry) {
     // every one of ours answers independently (from the `-1` "metric
     // unavailable" sentinel), so there is no state a body here could set up
     // that anything would later read. It exists purely so `<clinit>` links.
-    r.register(cls, "initialize0", "()V", |_ctx, _args| Ok(None));
 
     // JDK 9+ moved the platform OS-bean implementation to
     // `com.sun.management.internal.OperatingSystemImpl` (the old
@@ -3050,17 +3272,8 @@ pub fn register_operating_system_impl(r: &mut NativeMethodRegistry) {
     // embedded driver unregistered. Same "metric unavailable" -1 / -1.0
     // sentinels as the legacy class.
     let mcls = "com/sun/management/internal/OperatingSystemImpl";
-    for name in [
-        "getCommittedVirtualMemorySize0",
-        "getTotalSwapSpaceSize0",
-        "getFreeSwapSpaceSize0",
-        "getProcessCpuTime0",
-        "getFreeMemorySize0",
-        "getTotalMemorySize0",
-        "getOpenFileDescriptorCount0",
-        "getMaxFileDescriptorCount0",
-    ] {
-        r.register_with_kind(mcls, name, "()J", neg_one_long, NativeKind::Bridge);
+    for (name, metric) in os_metric_long_natives_jdk9() {
+        r.register_with_kind(mcls, name, "()J", metric, NativeKind::Bridge);
     }
     for name in ["getCpuLoad0", "getProcessCpuLoad0"] {
         r.register_with_kind(mcls, name, "()D", neg_one_double, NativeKind::Bridge);
@@ -3129,27 +3342,10 @@ pub fn register_hotspot_diagnostic(r: &mut NativeMethodRegistry) {
     // `HotSpotDiagnosticMXBean.dumpHeap` propagates that, so failing here is
     // both spec-legal and the honest answer. BEHAVIOUR CHANGE: a caller that
     // previously "succeeded" now sees an IOException.
-    r.register(cls, "dumpHeap0", "(Ljava/lang/String;Z)V", |_ctx, _args| {
-        Err(jmx_ioex(
-            "heap dump unavailable: CratonVM has no HPROF writer",
-        ))
-    });
 
     // getDiagnosticOptions()Ljava/util/List; — empty ArrayList matches
     // "no manageable VM options exposed". JBoss only iterates this for
     // diagnostic display.
-    r.register(
-        cls,
-        "getDiagnosticOptions",
-        "()Ljava/util/List;",
-        |ctx, _args| {
-            let list = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
-            let backing = ctx.new_ref_array(ClassId::new(0), 0);
-            ctx.set_field(list, 0, Value::Object(Some(backing))); // elementData
-            ctx.set_field(list, 1, Value::Int(0)); // size
-            Ok(Some(Value::Object(Some(list))))
-        },
-    );
     r.set_category(__prev_cat);
 }
 
@@ -3309,32 +3505,11 @@ pub fn register_flag_impl(r: &mut NativeMethodRegistry) {
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let cls = "sun/management/Flag";
 
-    r.register(cls, "getInternalFlagCount", "()I", |_ctx, _args| {
-        Ok(Some(Value::Int(0)))
-    });
 
-    r.register(
-        cls,
-        "getAllFlagNames",
-        "()[Ljava/lang/String;",
-        |ctx, _args| {
-            let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0);
-            Ok(Some(Value::Object(Some(arr))))
-        },
-    );
 
     // Empty Flag[] — same reference-array pattern as getAllFlagNames; the
     // element type is `Lsun/management/Flag;` but our synthetic ref-array
     // doesn't carry the element class beyond ClassId::new(0).
-    r.register(
-        cls,
-        "getAllFlags",
-        "()[Lsun/management/Flag;",
-        |ctx, _args| {
-            let arr = ctx.new_ref_array(ClassId::new(0), 0);
-            Ok(Some(Value::Object(Some(arr))))
-        },
-    );
 
     // JDK 9+ exposes the management-flag backend as
     // `com.sun.management.internal.Flag`. This is the live surface, and it is
@@ -3437,7 +3612,7 @@ fn register_management_factory(r: &mut NativeMethodRegistry) {
 
     // KAFKA-MBEAN: do NOT register a native for
     // `ManagementFactory.getPlatformMBeanServer()`. The previous synthetic
-    // here allocated `alloc_concurrent_synthetic("javax/management/MBeanServer", 2)`,
+    // here allocated `try_alloc_concurrent_synthetic("javax/management/MBeanServer", 2)?`,
     // whose Class metadata is the *interface* `javax/management/MBeanServer`.
     // Any subsequent `invokeinterface MBeanServer.registerMBean(...)`
     // (e.g. Kafka's `kafka.utils.CoreUtils$.registerMBean` at
@@ -3460,7 +3635,7 @@ fn register_management_factory(r: &mut NativeMethodRegistry) {
         "getRuntimeMXBean",
         "()Ljava/lang/management/RuntimeMXBean;",
         |ctx, _args| {
-            let obj = alloc_runtime_mxbean(ctx);
+            let obj = alloc_runtime_mxbean(ctx)?;
             Ok(Some(Value::Object(Some(obj))))
         },
     );
@@ -3471,7 +3646,7 @@ fn register_management_factory(r: &mut NativeMethodRegistry) {
         "getMemoryMXBean",
         "()Ljava/lang/management/MemoryMXBean;",
         |ctx, _args| {
-            let obj = alloc_memory_mxbean(ctx);
+            let obj = alloc_memory_mxbean(ctx)?;
             Ok(Some(Value::Object(Some(obj))))
         },
     );
@@ -3482,7 +3657,7 @@ fn register_management_factory(r: &mut NativeMethodRegistry) {
         "getThreadMXBean",
         "()Ljava/lang/management/ThreadMXBean;",
         |ctx, _args| {
-            let obj = alloc_thread_mxbean(ctx);
+            let obj = alloc_thread_mxbean(ctx)?;
             Ok(Some(Value::Object(Some(obj))))
         },
     );
@@ -3493,7 +3668,7 @@ fn register_management_factory(r: &mut NativeMethodRegistry) {
         "getClassLoadingMXBean",
         "()Ljava/lang/management/ClassLoadingMXBean;",
         |ctx, _args| {
-            let obj = alloc_class_loading_mxbean(ctx);
+            let obj = alloc_class_loading_mxbean(ctx)?;
             Ok(Some(Value::Object(Some(obj))))
         },
     );
@@ -3504,7 +3679,7 @@ fn register_management_factory(r: &mut NativeMethodRegistry) {
         "getOperatingSystemMXBean",
         "()Ljava/lang/management/OperatingSystemMXBean;",
         |ctx, _args| {
-            let obj = alloc_os_mxbean(ctx);
+            let obj = alloc_os_mxbean(ctx)?;
             Ok(Some(Value::Object(Some(obj))))
         },
     );
@@ -3515,7 +3690,7 @@ fn register_management_factory(r: &mut NativeMethodRegistry) {
         "getCompilationMXBean",
         "()Ljava/lang/management/CompilationMXBean;",
         |ctx, _args| {
-            let obj = alloc_compilation_mxbean(ctx);
+            let obj = alloc_compilation_mxbean(ctx)?;
             Ok(Some(Value::Object(Some(obj))))
         },
     );
@@ -3546,7 +3721,7 @@ fn register_management_factory(r: &mut NativeMethodRegistry) {
                 "()V",
                 &[Value::Object(Some(list))],
             );
-            let gc = alloc_gc_mxbean(ctx);
+            let gc = alloc_gc_mxbean(ctx)?;
             let _ = ctx.invoke(
                 "java/util/ArrayList",
                 "add",
@@ -3631,7 +3806,7 @@ fn native_platform_managed_object_name(
     let this = obj_arg(args, 0)?;
     match platform_mxbean_object_name_text(ctx, this) {
         Some(text) => {
-            let name = object_name_new(ctx, text);
+            let name = object_name_new(ctx, text)?;
             Ok(Some(Value::Object(Some(name))))
         }
         None => Ok(Some(Value::Object(None))),
@@ -3675,10 +3850,10 @@ fn register_platform_managed_object_names(r: &mut NativeMethodRegistry) {
 // 2. RuntimeMXBean — 10-field synthetic
 // ---------------------------------------------------------------------------
 
-fn alloc_runtime_mxbean(ctx: &mut dyn NativeContext) -> ObjectRef {
-    let obj = alloc_concurrent_synthetic(ctx, "java/lang/management/RuntimeMXBean", 10);
-    init_runtime_mxbean_fields(ctx, obj);
-    obj
+fn alloc_runtime_mxbean(ctx: &mut dyn NativeContext) -> Result<ObjectRef, MethodCallFailed> {
+    let obj = try_alloc_concurrent_synthetic(ctx, "java/lang/management/RuntimeMXBean", 10)?;
+    init_runtime_mxbean_fields(ctx, obj)?;
+    Ok(obj)
 }
 
 /// Populate the 10 synthetic `RuntimeMXBean` slots the getters below read by
@@ -3686,9 +3861,30 @@ fn alloc_runtime_mxbean(ctx: &mut dyn NativeContext) -> ObjectRef {
 /// `<init>` native, so a bean carries the same state however it was built —
 /// without this, a directly-constructed bean answers `getName() == null` and
 /// hands back an untyped default slot for the `long` getters.
-fn init_runtime_mxbean_fields(ctx: &mut dyn NativeContext, obj: ObjectRef) {
+fn init_runtime_mxbean_fields(ctx: &mut dyn NativeContext, obj: ObjectRef) -> Result<(), MethodCallFailed> {
     let pid = std::process::id();
-    let name = ctx.create_string(&format!("cratonvm@{}", pid));
+    // `RuntimeMXBean.getName()` is specified only as "a name representing the
+    // running VM", but every JDK implements it as `pid + "@" + hostname`
+    // (`VMManagementImpl.getVmId()`), and — the part that matters here — the
+    // platform MBeanServer's `java.lang:type=Runtime` `Name` attribute is
+    // answered by that REAL JDK code even when `getRuntimeMXBean()` hands back
+    // this synthetic. `"cratonvm@<pid>"` therefore made one VM report two
+    // different names for itself depending on which accessor you asked
+    // (`RJdkJmx.platformBeans` pins them equal), and it was not even the
+    // shape any JDK uses. Build `pid@host` instead.
+    //
+    // Host name source, stated exactly because it is NOT the same function the
+    // JDK's `InetAddress.getLocalHost()` ends up in: that goes to
+    // `Inet{4,6}AddressImpl.getLocalHostName`, i.e. `inet_address.rs`'s
+    // `local_host_name()` (a raw `gethostname`), which is private to that
+    // module. `resolve_real_hostname()` is this crate's other, cached resolver
+    // (`HOSTNAME` env, then `COMPUTERNAME`, then the `hostname` binary,
+    // FQDN-trimmed to the short form for the same reason). The two answer the
+    // same short host name on every supported platform in the normal case, and
+    // were MEASURED equal on the Windows gate host; if a host is ever found
+    // where they differ, the fix is to make `local_host_name()` `pub(crate)`
+    // and call it here, not to widen the assertion.
+    let name = ctx.create_string(&format!("{}@{}", pid, crate::resolve_real_hostname()));
     ctx.set_field(obj, 0, Value::Object(Some(name)));
     let vm_name = ctx.create_string("CratonVM");
     ctx.set_field(obj, 1, Value::Object(Some(vm_name)));
@@ -3705,11 +3901,12 @@ fn init_runtime_mxbean_fields(ctx: &mut dyn NativeContext, obj: ObjectRef) {
     ctx.set_field(obj, 7, Value::Long(vm_start_epoch_ms() as i64));
     ctx.set_field(obj, 8, Value::Long(uptime_ms() as i64));
     // field 9 = inputArguments (empty ArrayList)
-    let args_list = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
+    let args_list = try_alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2)?;
     let empty_arr = ctx.new_ref_array(ClassId::new(0), 0);
     ctx.set_field(args_list, 0, Value::Object(Some(empty_arr)));
     ctx.set_field(args_list, 1, Value::Int(0));
     ctx.set_field(obj, 9, Value::Object(Some(args_list)));
+    Ok(())
 }
 
 fn register_runtime_mxbean(r: &mut NativeMethodRegistry) {
@@ -3723,7 +3920,7 @@ fn register_runtime_mxbean(r: &mut NativeMethodRegistry) {
     // factory does.
     r.register(cls, "<init>", "()V", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        init_runtime_mxbean_fields(ctx, this);
+        init_runtime_mxbean_fields(ctx, this)?;
         Ok(None)
     });
 
@@ -3873,8 +4070,8 @@ fn register_runtime_mxbean(r: &mut NativeMethodRegistry) {
 // AbstractMethodError family this whole MXBean surface otherwise hits.
 // ---------------------------------------------------------------------------
 
-fn alloc_logging_mxbean(ctx: &mut dyn NativeContext) -> ObjectRef {
-    alloc_concurrent_synthetic(ctx, "java/lang/management/PlatformLoggingMXBean", 0)
+fn alloc_logging_mxbean(ctx: &mut dyn NativeContext) -> Result<ObjectRef, MethodCallFailed> {
+    Ok(try_alloc_concurrent_synthetic(ctx, "java/lang/management/PlatformLoggingMXBean", 0)?)
 }
 
 /// The live `java.util.logging.LogManager` singleton.
@@ -4091,7 +4288,7 @@ fn register_platform_logging_mxbean(r: &mut NativeMethodRegistry) {
 /// `addNotificationListener` synchronizes on `listenerLock` and then mutates
 /// `listenerList`. Leaving either field null makes a real JMX client (notably
 /// Micrometer's `JvmHeapPressureMetrics`) fail during bootstrap.
-fn init_notification_emitter_support(ctx: &mut dyn NativeContext, emitter: ObjectRef) -> ObjectRef {
+fn init_notification_emitter_support(ctx: &mut dyn NativeContext, emitter: ObjectRef) -> Result<ObjectRef, MethodCallFailed> {
     // Both construction paths can allocate and relocate the receiver, so keep
     // it rooted and re-read it before every field access.
     let pin = ctx.pin_native_root(emitter);
@@ -4102,7 +4299,7 @@ fn init_notification_emitter_support(ctx: &mut dyn NativeContext, emitter: Objec
     ) {
         let lock = match ctx.new_object("java/lang/Object") {
             Ok(Some(Value::Object(Some(lock)))) => lock,
-            _ => alloc_concurrent_synthetic(ctx, "java/lang/Object", 0),
+            _ => try_alloc_concurrent_synthetic(ctx, "java/lang/Object", 0)?,
         };
         let current = ctx.read_native_pin(pin, emitter);
         ctx.set_field_by_name(current, "listenerLock", Value::Object(Some(lock)));
@@ -4117,7 +4314,7 @@ fn init_notification_emitter_support(ctx: &mut dyn NativeContext, emitter: Objec
             Ok(Some(Value::Object(Some(list)))) => list,
             // Synthetic-mode fallback. The real initialized ArrayList above
             // is required for real-JDK mode and covered by the probe.
-            _ => alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2),
+            _ => try_alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2)?,
         };
         let current = ctx.read_native_pin(pin, emitter);
         ctx.set_field_by_name(current, "listenerList", Value::Object(Some(list)));
@@ -4125,16 +4322,16 @@ fn init_notification_emitter_support(ctx: &mut dyn NativeContext, emitter: Objec
 
     let result = ctx.read_native_pin(pin, emitter);
     ctx.unpin_native_roots(pin);
-    result
+    Ok(result)
 }
 
-fn alloc_memory_mxbean(ctx: &mut dyn NativeContext) -> ObjectRef {
+fn alloc_memory_mxbean(ctx: &mut dyn NativeContext) -> Result<ObjectRef, MethodCallFailed> {
     // `MemoryMXBean` is an interface. Returning an object stamped with that
     // interface makes `instanceof NotificationEmitter` false and hides
     // MemoryImpl's inherited listener implementation. The concrete class's
     // registered `getMemoryUsage0` bridge still supplies live heap values.
-    let obj = alloc_concurrent_synthetic(ctx, "sun/management/MemoryImpl", 1);
-    let obj = init_notification_emitter_support(ctx, obj);
+    let obj = try_alloc_concurrent_synthetic(ctx, "sun/management/MemoryImpl", 1)?;
+    let obj = init_notification_emitter_support(ctx, obj)?;
     // Slot 0 = heapUsed, the same snapshot the `MemoryMXBean` *interface*
     // `<init>` native writes to ITS slot 0 (see `register_memory_mxbean`).
     // Without this the bean handed back by `ManagementFactory.getMemoryMXBean`
@@ -4155,7 +4352,7 @@ fn alloc_memory_mxbean(ctx: &mut dyn NativeContext) -> ObjectRef {
         let heap_used = ctx.heap_allocated_bytes() as i64;
         ctx.set_field(obj, 0, Value::Long(heap_used));
     }
-    obj
+    Ok(obj)
 }
 
 fn alloc_memory_usage(
@@ -4164,13 +4361,13 @@ fn alloc_memory_usage(
     used: i64,
     committed: i64,
     max: i64,
-) -> ObjectRef {
-    let obj = alloc_concurrent_synthetic(ctx, "java/lang/management/MemoryUsage", 4);
+) -> Result<ObjectRef, MethodCallFailed> {
+    let obj = try_alloc_concurrent_synthetic(ctx, "java/lang/management/MemoryUsage", 4)?;
     ctx.set_field(obj, 0, Value::Long(init));
     ctx.set_field(obj, 1, Value::Long(used));
     ctx.set_field(obj, 2, Value::Long(committed));
     ctx.set_field(obj, 3, Value::Long(max));
-    obj
+    Ok(obj)
 }
 
 fn register_memory_mxbean(r: &mut NativeMethodRegistry) {
@@ -4225,7 +4422,7 @@ fn register_memory_mxbean(r: &mut NativeMethodRegistry) {
                 Value::Long(v) => v,
                 _ => 64 * 1024 * 1024,
             };
-            let mu = alloc_memory_usage(ctx, 0, used, committed, max);
+            let mu = alloc_memory_usage(ctx, 0, used, committed, max)?;
             Ok(Some(Value::Object(Some(mu))))
         },
     );
@@ -4244,7 +4441,7 @@ fn register_memory_mxbean(r: &mut NativeMethodRegistry) {
                 Value::Long(v) => v,
                 _ => 64 * 1024 * 1024,
             };
-            let mu = alloc_memory_usage(ctx, 0, used, max, max);
+            let mu = alloc_memory_usage(ctx, 0, used, max, max)?;
             Ok(Some(Value::Object(Some(mu))))
         },
     );
@@ -4351,37 +4548,82 @@ fn register_memory_usage(r: &mut NativeMethodRegistry) {
         let this = obj_arg(args, 0)?;
         Ok(Some(ctx.get_field(this, 3)))
     });
-    r.register(cls, "toString", "()Ljava/lang/String;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let init_v = match ctx.get_field(this, 0) {
-            Value::Long(v) => v,
-            _ => 0,
-        };
-        let used_v = match ctx.get_field(this, 1) {
-            Value::Long(v) => v,
-            _ => 0,
-        };
-        let committed_v = match ctx.get_field(this, 2) {
-            Value::Long(v) => v,
-            _ => 0,
-        };
-        let max_v = match ctx.get_field(this, 3) {
-            Value::Long(v) => v,
-            _ => 0,
-        };
-        let text = format!(
-            "init={}, used={}, committed={}, max={}",
-            init_v, used_v, committed_v, max_v
-        );
-        let s = ctx.create_string(&text);
-        Ok(Some(Value::Object(Some(s))))
-    });
+    // `toString` is NOT overridden on a real JDK: the real bytecode reads the
+    // same four slots this file writes by index (`init`, `used`, `committed`,
+    // `max`, declared in that order) and renders HotSpot's exact
+    // `init = N(NK) used = N(NK) committed = N(NK) max = N(NK)` — including the
+    // `>> 10` kibibyte column and its `-1(-1K)` for an undefined value. The
+    // shim rendered `init=N, used=N, committed=N, max=N`, a format that exists
+    // on no real JVM, so anything logging or scraping a MemoryUsage read
+    // differently here. See `memoryusage_tostring_shim_enabled`.
+    if memoryusage_tostring_shim_enabled() {
+        r.register(cls, "toString", "()Ljava/lang/String;", |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let init_v = match ctx.get_field(this, 0) {
+                Value::Long(v) => v,
+                _ => 0,
+            };
+            let used_v = match ctx.get_field(this, 1) {
+                Value::Long(v) => v,
+                _ => 0,
+            };
+            let committed_v = match ctx.get_field(this, 2) {
+                Value::Long(v) => v,
+                _ => 0,
+            };
+            let max_v = match ctx.get_field(this, 3) {
+                Value::Long(v) => v,
+                _ => 0,
+            };
+            // Kept byte-for-byte identical to the real `MemoryUsage.toString()`
+            // so a synthetic-jdk run is not a second, different divergence.
+            let text = format!(
+                "init = {}({}K) used = {}({}K) committed = {}({}K) max = {}({}K)",
+                init_v,
+                init_v >> 10,
+                used_v,
+                used_v >> 10,
+                committed_v,
+                committed_v >> 10,
+                max_v,
+                max_v >> 10
+            );
+            let s = ctx.create_string(&text);
+            Ok(Some(Value::Object(Some(s))))
+        });
+    }
     r.set_category(__prev_cat);
 }
 
 // ---------------------------------------------------------------------------
 // 5. ThreadMXBean — 6-field synthetic
 // ---------------------------------------------------------------------------
+
+/// Should `java.lang.management.MemoryUsage.toString()` be answered by the
+/// shim rather than the class's own bytecode?
+///
+/// **Default: no.** `MemoryUsage` is a real, self-contained JDK class whose
+/// `toString` needs nothing this VM cannot already provide — the four fields it
+/// reads (`init`, `used`, `committed`, `max`) are declared in exactly the order
+/// this file writes them by index, so the real bytecode sees the values the
+/// sibling `getInit`/`getUsed`/`getCommitted`/`getMax` natives hand back.
+///
+/// `synthetic-jdk` builds have no such bytecode and keep the shim;
+/// `CRATONVM_SYNTHETIC_MEMORYUSAGE_TOSTRING=1` restores it on a real-JDK run.
+fn memoryusage_tostring_shim_enabled() -> bool {
+    if cfg!(feature = "synthetic-jdk") {
+        return true;
+    }
+    // The latched `VmFlags` snapshot, not a live `getenv`. An undeclared flag
+    // read straight from `std::env` is unreachable from
+    // `CRATONVM_REAL=-memoryusage-tostring` and invisible to
+    // `flags::with_thread_overrides`, so a test that arranges it through the
+    // supported hook silently measures the developer's ambient environment
+    // instead. `one_true_yes_exact` also accepts `yes`, which the previous
+    // `Ok("1") | Ok("true")` did not — a strict widening of an opt-out escape
+    // hatch. Same treatment as `jmx_openmbean`'s sibling gate.
+    crate::nbflags().synthetic_memoryusage_tostring
+}
 
 fn jmx_class_id_or_object(ctx: &mut dyn NativeContext, class_name: &str) -> ClassId {
     ctx.ensure_class_initialized(class_name)
@@ -4414,7 +4656,7 @@ fn alloc_basic_thread_info(
     let locked_synchronizers = ctx.new_ref_array(lock_info_cid, 0);
     let synchronizers_pin = ctx.pin_native_root(locked_synchronizers);
 
-    let info = alloc_concurrent_synthetic(ctx, "java/lang/management/ThreadInfo", 18);
+    let info = try_alloc_concurrent_synthetic(ctx, "java/lang/management/ThreadInfo", 18)?;
 
     let thread_name = ctx.read_native_pin(name_pin, thread_name);
     let stack_trace = ctx.read_native_pin(stack_pin, stack_trace);
@@ -4446,7 +4688,7 @@ fn alloc_basic_thread_info(
 /// build one ThreadInfo per actually-enumerated live thread (Tomcat's
 /// Diagnostics.getThreadDump() calls dumpAllThreads and greps the result for
 /// connector I/O thread names like "http-nio-...").
-fn alloc_named_thread_info(ctx: &mut dyn NativeContext, thread_id: i64, name: &str) -> ObjectRef {
+fn alloc_named_thread_info(ctx: &mut dyn NativeContext, thread_id: i64, name: &str) -> Result<ObjectRef, MethodCallFailed> {
     let stack_element_cid = jmx_class_id_or_object(ctx, "java/lang/StackTraceElement");
     let monitor_info_cid = jmx_class_id_or_object(ctx, "java/lang/management/MonitorInfo");
     let lock_info_cid = jmx_class_id_or_object(ctx, "java/lang/management/LockInfo");
@@ -4460,7 +4702,7 @@ fn alloc_named_thread_info(ctx: &mut dyn NativeContext, thread_id: i64, name: &s
     let locked_synchronizers = ctx.new_ref_array(lock_info_cid, 0);
     let synchronizers_pin = ctx.pin_native_root(locked_synchronizers);
 
-    let info = alloc_concurrent_synthetic(ctx, "java/lang/management/ThreadInfo", 18);
+    let info = try_alloc_concurrent_synthetic(ctx, "java/lang/management/ThreadInfo", 18)?;
 
     let thread_name = ctx.read_native_pin(name_pin, thread_name);
     let stack_trace = ctx.read_native_pin(stack_pin, stack_trace);
@@ -4484,14 +4726,14 @@ fn alloc_named_thread_info(ctx: &mut dyn NativeContext, thread_id: i64, name: &s
     );
 
     ctx.unpin_native_roots(name_pin);
-    info
+    Ok(info)
 }
 
 fn alloc_jmx_lock_info(
     ctx: &mut dyn NativeContext,
     object: ObjectRef,
     class_name_override: Option<&str>,
-) -> ObjectRef {
+) -> Result<ObjectRef, MethodCallFailed> {
     let class_name = class_name_override
         .map(str::to_owned)
         .or_else(|| ctx.class_name_of_id(ctx.class_id_of_object(object)))
@@ -4499,7 +4741,7 @@ fn alloc_jmx_lock_info(
         .replace('/', ".");
     let class_name = ctx.create_string(&class_name);
     let class_pin = ctx.pin_native_root(class_name);
-    let info = alloc_concurrent_synthetic(ctx, "java/lang/management/LockInfo", 2);
+    let info = try_alloc_concurrent_synthetic(ctx, "java/lang/management/LockInfo", 2)?;
     let class_name = ctx.read_native_pin(class_pin, class_name);
     ctx.set_field_by_name(info, "className", Value::Object(Some(class_name)));
     ctx.set_field_by_name(
@@ -4508,7 +4750,7 @@ fn alloc_jmx_lock_info(
         Value::Int(ctx.identity_hash_code(object)),
     );
     ctx.unpin_native_roots(class_pin);
-    info
+    Ok(info)
 }
 
 fn jmx_lock_name(
@@ -4554,7 +4796,7 @@ fn alloc_jmx_monitor_info(
     object: ObjectRef,
     locked_depth: i32,
     locked_frame: Option<ObjectRef>,
-) -> ObjectRef {
+) -> Result<ObjectRef, MethodCallFailed> {
     debug_assert_eq!(
         locked_depth >= 0,
         locked_frame.is_some(),
@@ -4567,7 +4809,7 @@ fn alloc_jmx_monitor_info(
     let class_name = ctx.create_string(&class_name);
     let class_pin = ctx.pin_native_root(class_name);
     let frame_pin = locked_frame.map(|f| (ctx.pin_native_root(f), f));
-    let info = alloc_concurrent_synthetic(ctx, "java/lang/management/MonitorInfo", 4);
+    let info = try_alloc_concurrent_synthetic(ctx, "java/lang/management/MonitorInfo", 4)?;
     let info_pin = ctx.pin_native_root(info);
     let class_name = ctx.read_native_pin(class_pin, class_name);
     let info = ctx.read_native_pin(info_pin, info);
@@ -4590,7 +4832,7 @@ fn alloc_jmx_monitor_info(
     }
     ctx.unpin_native_roots(info_pin);
     ctx.unpin_native_roots(class_pin);
-    info
+    Ok(info)
 }
 
 /// Materialize the real JDK `ThreadInfo` layout from the VM's GC-safe lock
@@ -4600,7 +4842,7 @@ fn alloc_jmx_monitor_info(
 fn alloc_snapshot_thread_info(
     ctx: &mut dyn NativeContext,
     snapshot: ThreadJmxSnapshot,
-) -> ObjectRef {
+) -> Result<ObjectRef, MethodCallFailed> {
     let stack_element_cid = jmx_class_id_or_object(ctx, "java/lang/StackTraceElement");
     let monitor_info_cid = jmx_class_id_or_object(ctx, "java/lang/management/MonitorInfo");
     let lock_info_cid = jmx_class_id_or_object(ctx, "java/lang/management/LockInfo");
@@ -4608,7 +4850,7 @@ fn alloc_snapshot_thread_info(
     let thread_name = ctx.create_string(&snapshot.thread_name);
     let name_pin = ctx.pin_native_root(thread_name);
     let stack_trace =
-        crate::lang_system::build_stack_trace_element_array(ctx, &snapshot.stack_trace);
+        crate::lang_system::build_stack_trace_element_array(ctx, &snapshot.stack_trace)?;
     let stack_pin = ctx.pin_native_root(stack_trace);
     // A monitor is reported only when it can be attributed to a stack frame.
     // `lockedMonitors` means "monitors this thread locked *in a stack frame*",
@@ -4661,18 +4903,18 @@ fn alloc_snapshot_thread_info(
             }
         };
         let depth = if frame.is_some() { 0 } else { -1 };
-        let info = alloc_jmx_monitor_info(ctx, monitor, depth, frame);
+        let info = alloc_jmx_monitor_info(ctx, monitor, depth, frame)?;
         let arr = ctx.read_native_pin(monitors_pin, locked_monitors);
         ctx.set_array_element(arr, i, Value::Object(Some(info)));
     }
     for (i, (pin, synchronizer)) in synchronizer_pins.iter().enumerate() {
         let synchronizer = ctx.read_native_pin(*pin, *synchronizer);
-        let info = alloc_jmx_lock_info(ctx, synchronizer, None);
+        let info = alloc_jmx_lock_info(ctx, synchronizer, None)?;
         let arr = ctx.read_native_pin(synchronizers_pin, locked_synchronizers);
         ctx.set_array_element(arr, i, Value::Object(Some(info)));
     }
 
-    let info = alloc_concurrent_synthetic(ctx, "java/lang/management/ThreadInfo", 18);
+    let info = try_alloc_concurrent_synthetic(ctx, "java/lang/management/ThreadInfo", 18)?;
     let info_pin = ctx.pin_native_root(info);
     let thread_name = ctx.read_native_pin(name_pin, thread_name);
     let stack_trace = ctx.read_native_pin(stack_pin, stack_trace);
@@ -4738,7 +4980,7 @@ fn alloc_snapshot_thread_info(
     );
     if let Some((lock_pin, lock)) = lock_pin {
         let lock = ctx.read_native_pin(lock_pin, lock);
-        let lock_info = alloc_jmx_lock_info(ctx, lock, snapshot.lock_class_name.as_deref());
+        let lock_info = alloc_jmx_lock_info(ctx, lock, snapshot.lock_class_name.as_deref())?;
         let info = ctx.read_native_pin(info_pin, info);
         ctx.set_field_by_name(info, "lock", Value::Object(Some(lock_info)));
         let lock_name = ctx.create_string(&jmx_lock_name(
@@ -4773,7 +5015,7 @@ fn alloc_snapshot_thread_info(
     ctx.unpin_native_roots(synchronizers_pin);
     let info = ctx.read_native_pin(info_pin, info);
     ctx.unpin_native_roots(info_pin);
-    info
+    Ok(info)
 }
 
 /// Populate the caller-supplied `long[] result` of
@@ -4851,7 +5093,7 @@ fn thread_info_array_for_ids(ctx: &mut dyn NativeContext, ids: &[i64]) -> Method
         let Some(snapshot) = ctx.thread_jmx_snapshot(thread) else {
             continue;
         };
-        let info = alloc_snapshot_thread_info(ctx, snapshot);
+        let info = alloc_snapshot_thread_info(ctx, snapshot)?;
         let arr_fresh = ctx.read_native_pin(arr_pin, arr);
         ctx.set_array_element(arr_fresh, i, Value::Object(Some(info)));
     }
@@ -4895,10 +5137,52 @@ fn registered_thread_name(ctx: &dyn NativeContext, thread_id: i64) -> Option<Str
         })
 }
 
-fn alloc_thread_mxbean(ctx: &mut dyn NativeContext) -> ObjectRef {
-    let obj = alloc_concurrent_synthetic(ctx, "java/lang/management/ThreadMXBean", 6);
+/// Allocate a platform MXBean under its `com.sun.management` **extension**
+/// interface rather than the `java.lang.management` base one.
+///
+/// On a real JVM `ManagementFactory.getThreadMXBean()` hands back an object
+/// that implements `com.sun.management.ThreadMXBean` (HotSpot:
+/// `com.sun.management.internal.HotSpotThreadImpl`), and
+/// `getOperatingSystemMXBean()` one that implements
+/// `com.sun.management.OperatingSystemMXBean`. CratonVM fabricated both as
+/// instances of the *base* interface, so every
+/// `instanceof com.sun.management.…` answered false — and a library that
+/// feature-detects the extension (netty's chunk-reuse heuristic, and most
+/// JVM-profiling libraries) silently took its fallback path with no exception
+/// and no failing test to show for it.
+///
+/// Allocating under the extension name fixes the type test in both directions:
+/// the extension interface *extends* the base one, so the base `instanceof`
+/// and every `checkcast java/lang/management/…` keep working. In synthetic-JDK
+/// mode the same relation comes from `class_manager::jdk_interfaces`, which
+/// lists the base interface as the extension stub's supertype.
+///
+/// `base` is a genuine fallback, not a formality: a JDK image without the
+/// `jdk.management` module has no extension interface to allocate against, and
+/// the base bean is still the right answer there.
+fn alloc_extension_mxbean(
+    ctx: &mut dyn NativeContext,
+    extension: &str,
+    base: &str,
+    num_fields: usize,
+) -> Result<ObjectRef, MethodCallFailed> {
+    match try_alloc_concurrent_synthetic(ctx, extension, num_fields) {
+        Ok(obj) => Ok(obj),
+        Err(_) => try_alloc_concurrent_synthetic(ctx, base, num_fields),
+    }
+}
+
+pub(crate) fn alloc_thread_mxbean(
+    ctx: &mut dyn NativeContext,
+) -> Result<ObjectRef, MethodCallFailed> {
+    let obj = alloc_extension_mxbean(
+        ctx,
+        "com/sun/management/ThreadMXBean",
+        "java/lang/management/ThreadMXBean",
+        6,
+    )?;
     init_thread_mxbean_fields(ctx, obj);
-    obj
+    Ok(obj)
 }
 
 /// Populate the 6 synthetic `ThreadMXBean` slots the count getters read by
@@ -4926,7 +5210,42 @@ fn init_thread_mxbean_fields(ctx: &mut dyn NativeContext, obj: ObjectRef) {
 fn register_thread_mxbean(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
-    let cls = "java/lang/management/ThreadMXBean";
+    // BOTH dispatch owners, for the same reason the
+    // `setThreadContentionMonitoringEnabled` loop below already gives: the
+    // receiver `getThreadMXBean()` hands back is now typed
+    // `com.sun.management.ThreadMXBean` (see `alloc_extension_mxbean`), and an
+    // `invokeinterface` resolving through that name must not fall through to
+    // an abstract, Code-less entry. Registering the base name alone would turn
+    // every call on the fixed bean into an AbstractMethodError — i.e. trading
+    // a silent wrong answer for a loud crash.
+    register_thread_mxbean_for("java/lang/management/ThreadMXBean", r);
+    register_thread_mxbean_for("com/sun/management/ThreadMXBean", r);
+    // Registered once, not per owner: this one already names its own owner
+    // list, and repeating it would file three duplicate registrations.
+    //
+    // The public interface is abstract in the JDK image, while the concrete
+    // implementation varies by release. Register all dispatch owners so an
+    // invokeinterface does not fall through to an abstract Code-less entry.
+    for owner in [
+        "java/lang/management/ThreadMXBean",
+        "com/sun/management/ThreadMXBean",
+        "sun/management/ThreadImpl",
+        "com/sun/management/internal/HotSpotThreadImpl",
+    ] {
+        r.register(
+            owner,
+            "setThreadContentionMonitoringEnabled",
+            "(Z)V",
+            native_set_thread_contention_monitoring_enabled,
+        );
+    }
+    register_thread_mxbean_extensions(r);
+    r.set_category(__prev_cat);
+}
+
+/// The `java.lang.management.ThreadMXBean` surface, registered under one
+/// dispatch owner. Called once per owner — see [`register_thread_mxbean`].
+fn register_thread_mxbean_for(cls: &'static str, r: &mut NativeMethodRegistry) {
     // Interface — synthetic receivers only. Without this the count getters
     // below read untyped default slots instead of the live thread counts.
     r.register(cls, "<init>", "()V", |ctx, args| {
@@ -5142,21 +5461,8 @@ fn register_thread_mxbean(r: &mut NativeMethodRegistry) {
     // ("no Code attribute"), failing ~every server unit test. Report `false`
     // (not supported): HotThreads then just logs "not supported" and returns,
     // never touching setThreadContentionMonitoringEnabled.
-    // The public interface is abstract in the JDK image, while the concrete
-    // implementation varies by release. Register all dispatch owners so an
-    // invokeinterface does not fall through to an abstract Code-less entry.
-    for owner in [
-        "java/lang/management/ThreadMXBean",
-        "sun/management/ThreadImpl",
-        "com/sun/management/internal/HotSpotThreadImpl",
-    ] {
-        r.register(
-            owner,
-            "setThreadContentionMonitoringEnabled",
-            "(Z)V",
-            native_set_thread_contention_monitoring_enabled,
-        );
-    }
+    // `setThreadContentionMonitoringEnabled` itself is registered once, by
+    // `register_thread_mxbean`, because it names its own owner list.
     r.register(
         cls,
         "isThreadContentionMonitoringSupported",
@@ -5215,10 +5521,11 @@ fn register_thread_mxbean(r: &mut NativeMethodRegistry) {
             let thread = ctx.enumerate_threads(usize::MAX).into_iter().find(|thread| {
                 matches!(ctx.get_field_by_name(*thread, "tid"), Value::Long(id) if id == thread_id)
             });
-            Ok(Some(Value::Object(thread.and_then(|thread| {
-                ctx.thread_jmx_snapshot(thread)
-                    .map(|snapshot| alloc_snapshot_thread_info(ctx, snapshot))
-            }))))
+            let info = match thread.and_then(|thread| ctx.thread_jmx_snapshot(thread)) {
+                Some(snapshot) => Some(alloc_snapshot_thread_info(ctx, snapshot)?),
+                None => None,
+            };
+            Ok(Some(Value::Object(info)))
         },
     );
     // REAL: one ThreadInfo per requested id. All four overloads share
@@ -5299,7 +5606,7 @@ fn register_thread_mxbean(r: &mut NativeMethodRegistry) {
                         thread_name: name,
                         ..ThreadJmxSnapshot::default()
                     });
-                let info = alloc_snapshot_thread_info(ctx, info);
+                let info = alloc_snapshot_thread_info(ctx, info)?;
                 let arr_fresh = ctx.read_native_pin(arr_pin, arr);
                 ctx.set_array_element(arr_fresh, i, Value::Object(Some(info)));
             }
@@ -5307,7 +5614,164 @@ fn register_thread_mxbean(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(Some(arr_final))))
         },
     );
-    r.set_category(__prev_cat);
+}
+
+/// The methods `com.sun.management.ThreadMXBean` adds on top of the base
+/// interface, registered under the extension name **only** — they do not exist
+/// on `java.lang.management.ThreadMXBean` and registering them there would
+/// claim a surface the base interface does not have.
+///
+/// The allocation counters are real, not sentinels:
+/// [`NativeContext::current_thread_allocated_bytes`] reads
+/// `Tlab::thread_allocated_bytes`, which is derived from the live TLAB cursor
+/// plus the recorded non-TLAB allocations — so it sees compiled code's inline
+/// bump as well as the interpreter's, and humongous objects that skipped the
+/// TLAB entirely. `-1` survives only as the JMM's genuine "not available",
+/// which is the honest answer for a context with no thread accounting at all.
+///
+/// **Only the CALLING thread is measurable.** The counter lives in the
+/// thread's own TLAB, which no other thread may read while its owner is
+/// running. `getThreadAllocatedBytes(id)` therefore answers for the caller's
+/// own id (and for the JDK's `0` == "current thread" convention) and returns
+/// the JMM's `-1` for any other id — the documented "value not available",
+/// which callers already handle. Claiming a number for a foreign thread would
+/// mean either a fabricated figure or a data race on a live cursor.
+fn register_thread_mxbean_extensions(r: &mut NativeMethodRegistry) {
+    let cls = "com/sun/management/ThreadMXBean";
+
+    /// Bytes allocated by the caller, or `None` when this VM cannot account
+    /// for the requested thread.
+    fn allocated_bytes_for(ctx: &mut dyn NativeContext, requested: Option<i64>) -> Option<u64> {
+        // `0` is the JDK's own spelling of "the current thread"
+        // (`getCurrentThreadAllocatedBytes()` compiles to a `0L` id), the same
+        // convention `cpu_time_for_requested_tid` follows.
+        let requested = requested.filter(|id| *id != 0);
+        if !current_thread_tid_matches(ctx, requested) {
+            return None;
+        }
+        ctx.current_thread_allocated_bytes()
+    }
+
+    let allocated_scalar: fn(&mut dyn NativeContext, &[Value]) -> MethodCallResult = |ctx, args| {
+        let requested = requested_thread_id(args);
+        Ok(Some(Value::Long(
+            allocated_bytes_for(ctx, requested).map_or(-1, |b| i64::try_from(b).unwrap_or(i64::MAX)),
+        )))
+    };
+    r.register(cls, "getThreadAllocatedBytes", "(J)J", allocated_scalar);
+    r.register(cls, "getCurrentThreadAllocatedBytes", "()J", |ctx, _args| {
+        Ok(Some(Value::Long(
+            ctx.current_thread_allocated_bytes()
+                .map_or(-1, |b| i64::try_from(b).unwrap_or(i64::MAX)),
+        )))
+    });
+    // Array form: one entry per requested id, `-1` where the id is not the
+    // caller's. Sized from the input array, as the JMM specifies.
+    r.register(cls, "getThreadAllocatedBytes", "([J)[J", |ctx, args| {
+        use cratonvm_types::ArrayElementType;
+        let ids = match args.get(1) {
+            Some(Value::Object(Some(arr))) => read_long_array(ctx, *arr),
+            _ => Vec::new(),
+        };
+        let answers: Vec<i64> = ids
+            .iter()
+            .map(|id| {
+                allocated_bytes_for(ctx, Some(*id))
+                    .map_or(-1, |b| i64::try_from(b).unwrap_or(i64::MAX))
+            })
+            .collect();
+        let out = ctx.new_array(ArrayElementType::Long, answers.len());
+        for (i, v) in answers.iter().enumerate() {
+            ctx.set_array_element(out, i, Value::Long(*v));
+        }
+        Ok(Some(Value::Object(Some(out))))
+    });
+    // SUPPORT is a platform property, not a per-call outcome: it answers
+    // whether this VM keeps the accounting at all, which it does exactly when
+    // the current thread can be read. Gating it on the *enable* flag would
+    // make re-enabling look impossible — the same reasoning
+    // `isCurrentThreadCpuTimeSupported` gives above.
+    r.register(
+        cls,
+        "isThreadAllocatedMemorySupported",
+        "()Z",
+        |ctx, _args| {
+            Ok(Some(Value::Int(i32::from(
+                ctx.current_thread_allocated_bytes().is_some(),
+            ))))
+        },
+    );
+    r.register(cls, "isThreadAllocatedMemoryEnabled", "()Z", |ctx, _args| {
+        Ok(Some(Value::Int(i32::from(
+            THREAD_ALLOCATED_MEMORY_ENABLED.load(std::sync::atomic::Ordering::Relaxed)
+                && ctx.current_thread_allocated_bytes().is_some(),
+        ))))
+    });
+    // Stored, not no-op'd — same argument as `setThreadCpuTimeEnabled`: the
+    // underlying accounting cannot be switched off, but the JMM lets a caller
+    // disable *measurement*, and a no-op would leave `isEnabled()` reporting
+    // true right after a `setEnabled(false)`.
+    r.register(
+        cls,
+        "setThreadAllocatedMemoryEnabled",
+        "(Z)V",
+        |_ctx, args| {
+            let enable = args.get(1).and_then(|v| v.as_int()).unwrap_or(0) != 0;
+            THREAD_ALLOCATED_MEMORY_ENABLED.store(enable, std::sync::atomic::Ordering::Relaxed);
+            Ok(None)
+        },
+    );
+    // `getTotalThreadAllocatedBytes()` is process-wide, so unlike the
+    // per-thread getters it has a source that does not need a foreign thread's
+    // cursor: the VM's own cumulative allocation counter.
+    r.register(cls, "getTotalThreadAllocatedBytes", "()J", |ctx, _args| {
+        Ok(Some(Value::Long(
+            i64::try_from(ctx.heap_allocated_bytes()).unwrap_or(i64::MAX),
+        )))
+    });
+    // The bulk CPU/user-time forms the extension interface adds. Same
+    // per-id resolution the scalar `getThreadCpuTime(J)` uses, so the two
+    // surfaces cannot disagree.
+    let cpu_time_array: fn(&mut dyn NativeContext, &[Value]) -> MethodCallResult = |ctx, args| {
+        thread_time_array(ctx, args, true)
+    };
+    let user_time_array: fn(&mut dyn NativeContext, &[Value]) -> MethodCallResult = |ctx, args| {
+        thread_time_array(ctx, args, false)
+    };
+    r.register(cls, "getThreadCpuTime", "([J)[J", cpu_time_array);
+    r.register(cls, "getThreadUserTime", "([J)[J", user_time_array);
+}
+
+/// Shared body of `com.sun.management.ThreadMXBean.getThreadCpuTime([J)` and
+/// `getThreadUserTime([J)`: one answer per requested id, `-1` where the JMM's
+/// "not available" applies.
+fn thread_time_array(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+    want_cpu: bool,
+) -> MethodCallResult {
+    use cratonvm_types::ArrayElementType;
+    let ids = match args.get(1) {
+        Some(Value::Object(Some(arr))) => read_long_array(ctx, *arr),
+        _ => Vec::new(),
+    };
+    let answers: Vec<i64> = ids
+        .iter()
+        .map(|id| {
+            cpu_time_for_requested_tid(ctx, Some(*id)).map_or(-1, |(cpu, user)| {
+                if want_cpu {
+                    cpu
+                } else {
+                    user
+                }
+            })
+        })
+        .collect();
+    let out = ctx.new_array(ArrayElementType::Long, answers.len());
+    for (i, v) in answers.iter().enumerate() {
+        ctx.set_array_element(out, i, Value::Long(*v));
+    }
+    Ok(Some(Value::Object(Some(out))))
 }
 
 // ---------------------------------------------------------------------------
@@ -5318,10 +5782,10 @@ fn register_thread_mxbean(r: &mut NativeMethodRegistry) {
 /// through. Slots 0..2 are the three class-count metrics.
 const CLM_VERBOSE: usize = 3;
 
-fn alloc_class_loading_mxbean(ctx: &mut dyn NativeContext) -> ObjectRef {
-    let obj = alloc_concurrent_synthetic(ctx, "java/lang/management/ClassLoadingMXBean", 4);
+fn alloc_class_loading_mxbean(ctx: &mut dyn NativeContext) -> Result<ObjectRef, MethodCallFailed> {
+    let obj = try_alloc_concurrent_synthetic(ctx, "java/lang/management/ClassLoadingMXBean", 4)?;
     init_class_loading_mxbean_fields(ctx, obj);
-    obj
+    Ok(obj)
 }
 
 /// Populate the synthetic `ClassLoadingMXBean` slots — shared by the factory
@@ -5395,24 +5859,48 @@ fn register_class_loading_mxbean(r: &mut NativeMethodRegistry) {
 // 7. OperatingSystemMXBean — 5-field synthetic
 // ---------------------------------------------------------------------------
 
-fn alloc_os_mxbean(ctx: &mut dyn NativeContext) -> ObjectRef {
-    let obj = alloc_concurrent_synthetic(ctx, "java/lang/management/OperatingSystemMXBean", 5);
+pub(crate) fn alloc_os_mxbean(ctx: &mut dyn NativeContext) -> Result<ObjectRef, MethodCallFailed> {
+    // See `alloc_extension_mxbean`: `com.sun.management.OperatingSystemMXBean`
+    // is the standard source of process/system CPU load and physical-memory
+    // figures, so the same silent-fallback risk applied here as on the thread
+    // bean.
+    let obj = alloc_extension_mxbean(
+        ctx,
+        "com/sun/management/OperatingSystemMXBean",
+        "java/lang/management/OperatingSystemMXBean",
+        5,
+    )?;
     init_os_mxbean_fields(ctx, obj);
-    obj
+    Ok(obj)
 }
 
 /// Populate the 5 synthetic `OperatingSystemMXBean` slots — shared by the
 /// factory path and the `<init>` native.
 fn init_os_mxbean_fields(ctx: &mut dyn NativeContext, obj: ObjectRef) {
-    // REAL: OS name / arch / version come from the live process. name+arch
-    // use std::env consts; version prefers the `os.version` system property
-    // (populated by the VM at startup, same source RuntimeMXBean.getClassPath
-    // reads), falling back to "unknown" only if the property is absent —
-    // i.e. we report the real version when the VM knows it rather than always
-    // faking "unknown".
-    let name = ctx.create_string(std::env::consts::OS);
+    // REAL: OS name / arch / version come from the live process, and all three
+    // come from the SAME place the corresponding system property does — the
+    // `os.name` / `os.arch` / `os.version` properties the VM seeds at startup
+    // (vm_init's `canonical_os_name` / `canonical_os_arch` /
+    // `canonical_os_version`, which reproduce HotSpot's spellings).
+    //
+    // `getName`/`getArch`/`getVersion` are SPECIFIED as those properties, so
+    // reading anything else is a divergence by construction. `std::env::consts`
+    // is exactly such an "anything else": it answers `"windows"` where HotSpot
+    // says `"Windows 11"`, and `"x86_64"` where HotSpot says `"amd64"` — the
+    // bean and `System.getProperty("os.name")` then disagree inside one VM.
+    // The consts survive only as the fallback for a VM whose property table is
+    // somehow unseeded, where a lowercase-but-true answer beats "unknown".
+    let os_name = ctx
+        .get_system_property("os.name")
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| String::from(std::env::consts::OS));
+    let name = ctx.create_string(&os_name);
     ctx.set_field(obj, 0, Value::Object(Some(name)));
-    let arch = ctx.create_string(std::env::consts::ARCH);
+    let os_arch = ctx
+        .get_system_property("os.arch")
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| String::from(std::env::consts::ARCH));
+    let arch = ctx.create_string(&os_arch);
     ctx.set_field(obj, 1, Value::Object(Some(arch)));
     let os_version = ctx
         .get_system_property("os.version")
@@ -5432,49 +5920,91 @@ fn init_os_mxbean_fields(ctx: &mut dyn NativeContext, obj: ObjectRef) {
 fn register_operating_system_mxbean(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
-    let cls = "java/lang/management/OperatingSystemMXBean";
-    // Interface — synthetic receivers only. All four index-based getters
-    // below would otherwise read null / untyped default slots.
-    r.register(cls, "<init>", "()V", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        init_os_mxbean_fields(ctx, this);
-        Ok(None)
-    });
+    // Both dispatch owners — `getOperatingSystemMXBean()` now hands back a
+    // receiver typed `com.sun.management.OperatingSystemMXBean` (see
+    // `alloc_extension_mxbean`), and an `invokeinterface` resolving through
+    // that name must find a body rather than an abstract, Code-less entry.
+    for cls in [
+        "java/lang/management/OperatingSystemMXBean",
+        "com/sun/management/OperatingSystemMXBean",
+    ] {
+        // Interface — synthetic receivers only. All four index-based getters
+        // below would otherwise read null / untyped default slots.
+        r.register(cls, "<init>", "()V", |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            init_os_mxbean_fields(ctx, this);
+            Ok(None)
+        });
 
-    r.register(cls, "getName", "()Ljava/lang/String;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        Ok(Some(ctx.get_field(this, 0)))
-    });
-    r.register(cls, "getArch", "()Ljava/lang/String;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        Ok(Some(ctx.get_field(this, 1)))
-    });
-    r.register(cls, "getVersion", "()Ljava/lang/String;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        Ok(Some(ctx.get_field(this, 2)))
-    });
-    r.register(cls, "getAvailableProcessors", "()I", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        Ok(Some(ctx.get_field(this, 3)))
-    });
-    // REAL where the platform publishes it: Linux's `/proc/loadavg`. The flat
-    // -1.0 was a fabricated "unavailable" on the one platform that does have
-    // the number (and the sibling registration in `phases_late::management`
-    // already read it). Non-Linux keeps the spec's -1.0 sentinel.
-    r.register(cls, "getSystemLoadAverage", "()D", |_ctx, _args| {
-        Ok(Some(Value::Double(system_load_average())))
-    });
+        r.register(cls, "getName", "()Ljava/lang/String;", |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            Ok(Some(ctx.get_field(this, 0)))
+        });
+        r.register(cls, "getArch", "()Ljava/lang/String;", |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            Ok(Some(ctx.get_field(this, 1)))
+        });
+        r.register(cls, "getVersion", "()Ljava/lang/String;", |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            Ok(Some(ctx.get_field(this, 2)))
+        });
+        r.register(cls, "getAvailableProcessors", "()I", |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            Ok(Some(ctx.get_field(this, 3)))
+        });
+        // REAL where the platform publishes it: Linux's `/proc/loadavg`. The
+        // flat -1.0 was a fabricated "unavailable" on the one platform that
+        // does have the number (and the sibling registration in
+        // `phases_late::management` already read it). Non-Linux keeps the
+        // spec's -1.0 sentinel.
+        r.register(cls, "getSystemLoadAverage", "()D", |_ctx, _args| {
+            Ok(Some(Value::Double(system_load_average())))
+        });
+    }
+    register_operating_system_mxbean_extensions(r);
     r.set_category(__prev_cat);
+}
+
+/// The methods `com.sun.management.OperatingSystemMXBean` adds on top of the
+/// base interface, registered under the extension name only.
+///
+/// Same single source as the `*0` natives (`os_metrics`), so the interface and
+/// the JDK's own `OperatingSystemImpl` cannot answer differently for the same
+/// metric on the same VM. Both the JDK 25 spellings and the deprecated JDK 8
+/// ones are registered: the deprecated pair is still what a great deal of
+/// library code calls.
+fn register_operating_system_mxbean_extensions(r: &mut NativeMethodRegistry) {
+    let cls = "com/sun/management/OperatingSystemMXBean";
+    for (name, metric) in os_metric_long_natives() {
+        // The interface methods are the `*0` names without the trailing `0`.
+        let public = name.strip_suffix('0').unwrap_or(name);
+        r.register(cls, public, "()J", metric);
+    }
+    for (name, metric) in os_metric_long_natives_jdk9() {
+        let public = name.strip_suffix('0').unwrap_or(name);
+        // `os_metric_long_natives_jdk9` renames only two entries; the rest
+        // would be duplicates of the loop above.
+        if matches!(public, "getFreeMemorySize" | "getTotalMemorySize") {
+            r.register(cls, public, "()J", metric);
+        }
+    }
+    // See `register_operating_system_impl`: a CPU load needs a previous
+    // sample, so -1.0 is the measurement, not a placeholder.
+    let neg_one_double: fn(&mut dyn NativeContext, &[Value]) -> MethodCallResult =
+        |_ctx, _args| Ok(Some(Value::Double(-1.0)));
+    for name in ["getCpuLoad", "getSystemCpuLoad", "getProcessCpuLoad"] {
+        r.register(cls, name, "()D", neg_one_double);
+    }
 }
 
 // ---------------------------------------------------------------------------
 // 8. CompilationMXBean — 3-field synthetic
 // ---------------------------------------------------------------------------
 
-fn alloc_compilation_mxbean(ctx: &mut dyn NativeContext) -> ObjectRef {
-    let obj = alloc_concurrent_synthetic(ctx, "java/lang/management/CompilationMXBean", 3);
+fn alloc_compilation_mxbean(ctx: &mut dyn NativeContext) -> Result<ObjectRef, MethodCallFailed> {
+    let obj = try_alloc_concurrent_synthetic(ctx, "java/lang/management/CompilationMXBean", 3)?;
     init_compilation_mxbean_fields(ctx, obj);
-    obj
+    Ok(obj)
 }
 
 /// Populate the 3 synthetic `CompilationMXBean` slots — shared by the factory
@@ -5573,10 +6103,10 @@ fn register_compilation_mxbean(r: &mut NativeMethodRegistry) {
 // / `getQueuedVirtualThreadCount()` are REAL as of 2026-07-28 — they read the
 // live `ForkJoinScheduler` counters through `NativeContext::vt_scheduler_stats`;
 // see the note on their registrations below.
-fn alloc_virtual_thread_scheduler_mxbean(ctx: &mut dyn NativeContext) -> ObjectRef {
-    let obj = alloc_concurrent_synthetic(ctx, "jdk/management/VirtualThreadSchedulerMXBean", 1);
+fn alloc_virtual_thread_scheduler_mxbean(ctx: &mut dyn NativeContext) -> Result<ObjectRef, MethodCallFailed> {
+    let obj = try_alloc_concurrent_synthetic(ctx, "jdk/management/VirtualThreadSchedulerMXBean", 1)?;
     ctx.set_field(obj, 0, Value::Int(ctx.available_processor_count()));
-    obj
+    Ok(obj)
 }
 
 fn register_virtual_thread_scheduler_mxbean(r: &mut NativeMethodRegistry) {
@@ -5639,10 +6169,10 @@ fn register_virtual_thread_scheduler_mxbean(r: &mut NativeMethodRegistry) {
 // 9. GarbageCollectorMXBean — 4-field synthetic
 // ---------------------------------------------------------------------------
 
-fn alloc_gc_mxbean(ctx: &mut dyn NativeContext) -> ObjectRef {
-    let obj = alloc_concurrent_synthetic(ctx, "java/lang/management/GarbageCollectorMXBean", 4);
+fn alloc_gc_mxbean(ctx: &mut dyn NativeContext) -> Result<ObjectRef, MethodCallFailed> {
+    let obj = try_alloc_concurrent_synthetic(ctx, "java/lang/management/GarbageCollectorMXBean", 4)?;
     init_gc_mxbean_fields(ctx, obj);
-    obj
+    Ok(obj)
 }
 
 /// Populate the 4 synthetic `GarbageCollectorMXBean` slots — shared by the
@@ -5761,14 +6291,14 @@ const MBS_ONAMES: usize = 4;
 const MBS_NUM_FIELDS: usize = 5;
 
 /// Allocate the in-process platform MBeanServer with an empty registry.
-fn alloc_mbean_server(ctx: &mut dyn NativeContext) -> ObjectRef {
-    alloc_mbean_server_with_domain(ctx, None)
+fn alloc_mbean_server(ctx: &mut dyn NativeContext) -> Result<ObjectRef, MethodCallFailed> {
+    Ok(alloc_mbean_server_with_domain(ctx, None)?)
 }
 
 /// Allocate an in-process MBeanServer whose default domain follows the
 /// `MBeanServerFactory` overload that created it.
-fn alloc_mbean_server_with_domain(ctx: &mut dyn NativeContext, domain: Option<&str>) -> ObjectRef {
-    let obj = alloc_concurrent_synthetic(ctx, "javax/management/MBeanServer", MBS_NUM_FIELDS);
+fn alloc_mbean_server_with_domain(ctx: &mut dyn NativeContext, domain: Option<&str>) -> Result<ObjectRef, MethodCallFailed> {
+    let obj = try_alloc_concurrent_synthetic(ctx, "javax/management/MBeanServer", MBS_NUM_FIELDS)?;
     let domain = ctx.create_string(domain.unwrap_or("DefaultDomain"));
     ctx.set_field(obj, MBS_DOMAIN, Value::Object(Some(domain)));
     ctx.set_field(obj, MBS_COUNT, Value::Int(0));
@@ -5778,7 +6308,7 @@ fn alloc_mbean_server_with_domain(ctx: &mut dyn NativeContext, domain: Option<&s
     ctx.set_field(obj, MBS_NAMES, Value::Object(Some(names)));
     ctx.set_field(obj, MBS_BEANS, Value::Object(Some(beans)));
     ctx.set_field(obj, MBS_ONAMES, Value::Object(Some(onames)));
-    obj
+    Ok(obj)
 }
 
 /// Resolve a stable registry key for an `ObjectName` argument. Tries the
@@ -5881,16 +6411,16 @@ fn jmx_exception(ctx: &mut dyn NativeContext, class: &str, message: String) -> M
     }
 }
 
-fn platform_mbean_server(ctx: &mut dyn NativeContext) -> ObjectRef {
+fn platform_mbean_server(ctx: &mut dyn NativeContext) -> Result<ObjectRef, MethodCallFailed> {
     let mut slot = platform_mbean_server_store()
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     if let Some(server) = *slot {
-        return server;
+        return Ok(server);
     }
-    let server = alloc_mbean_server(ctx);
+    let server = alloc_mbean_server(ctx)?;
     *slot = Some(server);
-    server
+    Ok(server)
 }
 
 /// `javax.management.InstanceNotFoundException` for an absent MBean.
@@ -5968,8 +6498,8 @@ fn jmx_attribute_not_found(ctx: &mut dyn NativeContext, attr: &str) -> MethodCal
 /// HashSet via [`build_real_hash_set`] — a synthetic stand-in's real `size()` /
 /// `iterator()` read its (empty) backing map, so callers see an empty set
 /// regardless of contents (the TC0622 defect).
-fn build_synthetic_hash_set(ctx: &mut dyn NativeContext, elems: &[ObjectRef]) -> ObjectRef {
-    let set = alloc_concurrent_synthetic(ctx, "java/util/HashSet", 2);
+fn build_synthetic_hash_set(ctx: &mut dyn NativeContext, elems: &[ObjectRef]) -> Result<ObjectRef, MethodCallFailed> {
+    let set = try_alloc_concurrent_synthetic(ctx, "java/util/HashSet", 2)?;
     let backing = ctx.new_ref_array(ClassId::new(0), elems.len());
     for (i, e) in elems.iter().enumerate() {
         ctx.set_array_element(backing, i, Value::Object(Some(*e)));
@@ -5977,7 +6507,7 @@ fn build_synthetic_hash_set(ctx: &mut dyn NativeContext, elems: &[ObjectRef]) ->
     ctx.set_field(set, 0, Value::Object(Some(backing)));
     ctx.set_field(set, 1, Value::Int(elems.len() as i32));
     ctx.set_field_by_name(set, "size", Value::Int(elems.len() as i32));
-    set
+    Ok(set)
 }
 
 /// Build a REAL `java.util.HashSet` and populate it via real `add(Object)`
@@ -5985,7 +6515,7 @@ fn build_synthetic_hash_set(ctx: &mut dyn NativeContext, elems: &[ObjectRef]) ->
 /// GC-safe: the elements are parked in a single ref-array and the set is pinned
 /// across the (allocating) `add` calls, so a moving collector can't strand them.
 /// Falls back to the synthetic stand-in only if the real class is unavailable.
-fn build_real_hash_set(ctx: &mut dyn NativeContext, elems: &[ObjectRef]) -> ObjectRef {
+fn build_real_hash_set(ctx: &mut dyn NativeContext, elems: &[ObjectRef]) -> Result<ObjectRef, MethodCallFailed> {
     // Park the elements in one heap array we can re-read across each add().
     let arr = ctx.new_ref_array(ClassId::new(0), elems.len());
     for (i, e) in elems.iter().enumerate() {
@@ -5996,7 +6526,7 @@ fn build_real_hash_set(ctx: &mut dyn NativeContext, elems: &[ObjectRef]) -> Obje
         Ok(Some(Value::Object(Some(s)))) => s,
         _ => {
             ctx.unpin_native_roots(base);
-            return build_synthetic_hash_set(ctx, elems);
+            return Ok(build_synthetic_hash_set(ctx, elems)?);
         }
     };
     let set_pin = ctx.pin_native_root(set);
@@ -6008,7 +6538,7 @@ fn build_real_hash_set(ctx: &mut dyn NativeContext, elems: &[ObjectRef]) -> Obje
     }
     let result = ctx.read_native_pin(set_pin, set);
     ctx.unpin_native_roots(base);
-    result
+    Ok(result)
 }
 
 /// Build a `javax.management.ObjectInstance(name, className)` for `bean` under
@@ -6017,8 +6547,8 @@ fn build_object_instance(
     ctx: &mut dyn NativeContext,
     name: Option<ObjectRef>,
     bean: Option<ObjectRef>,
-) -> ObjectRef {
-    let oi = alloc_concurrent_synthetic(ctx, "javax/management/ObjectInstance", 2);
+) -> Result<ObjectRef, MethodCallFailed> {
+    let oi = try_alloc_concurrent_synthetic(ctx, "javax/management/ObjectInstance", 2)?;
     ctx.set_field_by_name(oi, "name", Value::Object(name));
     let cls_name = bean
         .map(|b| {
@@ -6029,7 +6559,7 @@ fn build_object_instance(
         .replace('/', ".");
     let cls_name_str = ctx.create_string(&cls_name);
     ctx.set_field_by_name(oi, "className", Value::Object(Some(cls_name_str)));
-    oi
+    Ok(oi)
 }
 
 /// Resolve the `ObjectName` at registry index `i`. Prefers the ORIGINAL
@@ -6088,7 +6618,7 @@ fn mbs_query_set(
     server: ObjectRef,
     pattern: Option<ObjectRef>,
     as_instances: bool,
-) -> ObjectRef {
+) -> Result<ObjectRef, MethodCallFailed> {
     let server_pin = ctx.pin_native_root(server);
     let pat_pin = pattern.map(|p| ctx.pin_native_root(p));
     let set = match ctx.new_object_initialized("java/util/HashSet", "()V", &[]) {
@@ -6107,7 +6637,7 @@ fn mbs_query_set(
                 }
             }
             ctx.unpin_native_roots(server_pin);
-            return build_synthetic_hash_set(ctx, &elems);
+            return Ok(build_synthetic_hash_set(ctx, &elems)?);
         }
     };
     let set_pin = ctx.pin_native_root(set);
@@ -6149,8 +6679,8 @@ fn mbs_query_set(
                 let cand = ctx.read_native_pin(on_pin, on_ref);
                 build_object_instance(ctx, Some(cand), bean)
             } else {
-                ctx.read_native_pin(on_pin, on_ref)
-            };
+                Ok(ctx.read_native_pin(on_pin, on_ref))
+            }?;
             let elem_pin = ctx.pin_native_root(elem);
             let set_now = ctx.read_native_pin(set_pin, set);
             let e = ctx.read_native_pin(elem_pin, elem);
@@ -6166,7 +6696,7 @@ fn mbs_query_set(
     }
     let result = ctx.read_native_pin(set_pin, set);
     ctx.unpin_native_roots(server_pin);
-    result
+    Ok(result)
 }
 
 /// Read the registered bean at registry index `i`, or None.
@@ -6409,7 +6939,7 @@ pub fn register_mbean_server(r: &mut NativeMethodRegistry) {
                 ctx,
                 name_ref,
                 Some(bean),
-            )))))
+            )?))))
         },
     );
 
@@ -6493,7 +7023,7 @@ pub fn register_mbean_server(r: &mut NativeMethodRegistry) {
             let bean = mbs_lookup_bean_at(ctx, this, idx);
             Ok(Some(Value::Object(Some(build_object_instance(
                 ctx, name_ref, bean,
-            )))))
+            )?))))
         },
     );
 
@@ -6515,7 +7045,7 @@ pub fn register_mbean_server(r: &mut NativeMethodRegistry) {
             };
             Ok(Some(Value::Object(Some(mbs_query_set(
                 ctx, this, pattern, false,
-            )))))
+            )?))))
         },
     );
 
@@ -6534,7 +7064,7 @@ pub fn register_mbean_server(r: &mut NativeMethodRegistry) {
             };
             Ok(Some(Value::Object(Some(mbs_query_set(
                 ctx, this, pattern, true,
-            )))))
+            )?))))
         },
     );
 
@@ -6747,8 +7277,14 @@ pub fn register_mbean_server(r: &mut NativeMethodRegistry) {
             //
             // Sources used:
             //   AvailableProcessors -> available_parallelism (real)
-            //   Name / Arch         -> std::env consts (real)
-            //   Version             -> os.version system property (real)
+            //   Name / Arch / Version
+            //                       -> the os.name / os.arch / os.version
+            //                          system properties (real), the same
+            //                          source `init_os_mxbean_fields` reads.
+            //                          These attributes ARE those properties;
+            //                          answering from `std::env::consts`
+            //                          instead made this server row disagree
+            //                          with the direct bean read in one VM.
             //   *PhysicalMemory* / *Swap* / *FileDescriptor* /
             //   CommittedVirtualMemorySize / ProcessCpuTime
             //                       -> -1  (no in-VM source; spec sentinel)
@@ -6762,8 +7298,16 @@ pub fn register_mbean_server(r: &mut NativeMethodRegistry) {
                     // Container-aware (cgroup CPU quota under container support).
                     Some(ctx.available_processor_count().to_string())
                 }
-                "Name" => Some(std::env::consts::OS.to_string()),
-                "Arch" => Some(std::env::consts::ARCH.to_string()),
+                "Name" => Some(
+                    ctx.get_system_property("os.name")
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or_else(|| std::env::consts::OS.to_string()),
+                ),
+                "Arch" => Some(
+                    ctx.get_system_property("os.arch")
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or_else(|| std::env::consts::ARCH.to_string()),
+                ),
                 "Version" => Some(
                     ctx.get_system_property("os.version")
                         .filter(|s| !s.is_empty())
@@ -6835,14 +7379,14 @@ pub fn register_mbean_server_factory_synthetic(r: &mut NativeMethodRegistry) {
         Ok(Some(Value::Object(Some(alloc_mbean_server_with_domain(
             ctx,
             domain.as_deref(),
-        )))))
+        )?))))
     };
     let create_server: fn(&mut dyn NativeContext, &[Value]) -> MethodCallResult = |ctx, args| {
         let domain = args.first().and_then(|value| match value {
             Value::Object(Some(value)) => ctx.read_string(*value),
             _ => None,
         });
-        let server = alloc_mbean_server_with_domain(ctx, domain.as_deref());
+        let server = alloc_mbean_server_with_domain(ctx, domain.as_deref())?;
         Ok(Some(Value::Object(Some(track_created_mbean_server(
             ctx, server,
         )))))
@@ -7029,7 +7573,23 @@ mod jmx_tests {
         assert!(r.find(cls, "getUsed", "()J").is_some());
         assert!(r.find(cls, "getCommitted", "()J").is_some());
         assert!(r.find(cls, "getMax", "()J").is_some());
-        assert!(r.find(cls, "toString", "()Ljava/lang/String;").is_some());
+        // `toString` is deliberately NOT here: on a real JDK the class's own
+        // bytecode renders it, and the shim rendered a format that exists on no
+        // real JVM. `memoryusage_tostring_shim_is_off_by_default` below owns
+        // that assertion.
+        assert!(r.find(cls, "toString", "()Ljava/lang/String;").is_none());
+    }
+
+    /// The four getters stay native (they serve CratonVM-synthesised
+    /// `MemoryUsage` receivers); `toString` does not, because the real bytecode
+    /// reads the very slots those getters read and formats them the way every
+    /// other JVM does.
+    #[test]
+    fn memoryusage_tostring_shim_is_off_by_default() {
+        assert!(
+            !memoryusage_tostring_shim_enabled(),
+            "the MemoryUsage.toString shim must stay off unless synthetic-jdk              or CRATONVM_SYNTHETIC_MEMORYUSAGE_TOSTRING asks for it"
+        );
     }
 
     #[test]
@@ -7203,12 +7763,12 @@ mod jmx_tests {
         // invoke_virtual, so object_name_key falls back to reading the
         // name object as a String). Verify isRegistered + count + lookup.
         let mut ctx = crate::test_utils::mock_ctx();
-        let server = alloc_mbean_server(&mut ctx);
+        let server = alloc_mbean_server(&mut ctx).unwrap();
 
         // Name object: a mock String holding the canonical-name text.
         let name = ctx.create_string("com.acme:type=Widget");
         // Bean object: any allocated object.
-        let bean = alloc_concurrent_synthetic(&mut ctx, "com/acme/Widget", 2);
+        let bean = try_alloc_concurrent_synthetic(&mut ctx, "com/acme/Widget", 2).unwrap();
 
         // Not registered yet.
         assert!(mbs_find(&ctx, server, "com.acme:type=Widget").is_none());
@@ -7242,7 +7802,7 @@ mod jmx_tests {
     #[test]
     fn test_mbean_server_domains_follow_live_registry() {
         let mut ctx = crate::test_utils::mock_ctx();
-        let server = alloc_mbean_server(&mut ctx);
+        let server = alloc_mbean_server(&mut ctx).unwrap();
         let names = ctx.new_ref_array(ClassId::new(0), 4);
         for (i, name) in [
             "org.springframework.integration:type=MessageChannel",
@@ -7341,7 +7901,7 @@ mod jmx_tests {
         let name = object_name_new(
             &mut ctx,
             "JMImplementation:type=MBeanServerDelegate".to_string(),
-        );
+        ).unwrap();
         let result = native_object_name_get_canonical_key_property_list_string(
             &mut ctx,
             &[Value::Object(Some(name))],
@@ -7355,7 +7915,7 @@ mod jmx_tests {
         assert_eq!(s, "type=MBeanServerDelegate");
 
         // Domain-only pattern ("d:*") has no key properties.
-        let pattern_name = object_name_new(&mut ctx, "java.lang:*".to_string());
+        let pattern_name = object_name_new(&mut ctx, "java.lang:*".to_string()).unwrap();
         let result = native_object_name_get_canonical_key_property_list_string(
             &mut ctx,
             &[Value::Object(Some(pattern_name))],
@@ -7369,7 +7929,7 @@ mod jmx_tests {
         assert_eq!(s, "");
 
         // Property-list pattern ("d:k=v,*") strips the trailing ",*".
-        let plist_pattern = object_name_new(&mut ctx, "d:k=v,*".to_string());
+        let plist_pattern = object_name_new(&mut ctx, "d:k=v,*".to_string()).unwrap();
         let result = native_object_name_get_canonical_key_property_list_string(
             &mut ctx,
             &[Value::Object(Some(plist_pattern))],
@@ -7386,7 +7946,7 @@ mod jmx_tests {
     #[test]
     fn test_object_name_key_property_accessors_preserve_quoted_source_text() {
         let mut ctx = crate::test_utils::mock_ctx();
-        let name = object_name_new(&mut ctx, "d:b=2,a=\"x,y\",c=3,*".to_string());
+        let name = object_name_new(&mut ctx, "d:b=2,a=\"x,y\",c=3,*".to_string()).unwrap();
         let key = ctx.create_string("a");
 
         let result = native_object_name_get_key_property(
@@ -7440,7 +8000,7 @@ mod jmx_tests {
         let concrete = object_name_new(
             &mut ctx,
             "JMImplementation:type=MBeanServerDelegate".to_string(),
-        );
+        ).unwrap();
         let is_pattern = |ctx: &mut dyn NativeContext,
                           f: fn(&mut dyn NativeContext, &[Value]) -> MethodCallResult,
                           obj: ObjectRef| {
@@ -7470,7 +8030,7 @@ mod jmx_tests {
             concrete
         ));
 
-        let domain_pattern = object_name_new(&mut ctx, "java.*:type=Memory".to_string());
+        let domain_pattern = object_name_new(&mut ctx, "java.*:type=Memory".to_string()).unwrap();
         assert!(is_pattern(
             &mut ctx,
             native_object_name_is_pattern,
@@ -7487,7 +8047,7 @@ mod jmx_tests {
             domain_pattern
         ));
 
-        let plist_pattern = object_name_new(&mut ctx, "d:k=v,*".to_string());
+        let plist_pattern = object_name_new(&mut ctx, "d:k=v,*".to_string()).unwrap();
         assert!(is_pattern(
             &mut ctx,
             native_object_name_is_pattern,
@@ -7509,7 +8069,7 @@ mod jmx_tests {
             plist_pattern
         ));
 
-        let value_pattern = object_name_new(&mut ctx, "d:k=*".to_string());
+        let value_pattern = object_name_new(&mut ctx, "d:k=*".to_string()).unwrap();
         assert!(is_pattern(
             &mut ctx,
             native_object_name_is_pattern,

@@ -50,7 +50,7 @@ use std::time::{Duration, Instant};
 use parking_lot::Mutex;
 
 use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
-use cratonvm_types::error::{MethodCallResult, RuntimeError};
+use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError};
 use cratonvm_types::{ClassId, ObjectRef, Value};
 
 // ---------------------------------------------------------------------------
@@ -410,17 +410,27 @@ pub fn validate_select_1(conn_id: i64) -> Result<i64, String> {
 // Native callbacks
 // ---------------------------------------------------------------------------
 
-fn alloc_object_for(ctx: &mut dyn NativeContext, class_name: &str, min_slots: usize) -> ObjectRef {
+fn alloc_object_for(
+    ctx: &mut dyn NativeContext,
+    class_name: &str,
+    min_slots: usize,
+) -> Result<ObjectRef, MethodCallFailed> {
     // Fall back to a synthetic class (declaring `min_slots` fields) rather
     // than `ClassId::new(0)` when the real class can't be loaded: an object
     // allocated with `java/lang/Object`'s id but a non-zero slot count is an
     // undersized layout the GC's `get_field` bounds guard rejects.
+    //
+    // The fallback is the FALLIBLE spelling (JDK-only wave 2, step 3): under
+    // `--jdk-only` the policy refuses to fabricate rather than recording the
+    // violation and fabricating anyway, and the refusal arrives as the
+    // catchable `NoClassDefFoundError` contract §5 names rather than the
+    // uncatchable `MethodCallFailed::InternalError` the `?` conversion builds.
     let cid = match ctx.ensure_class_initialized(class_name) {
         Ok(cid) => cid,
-        Err(_) => ctx.ensure_synthetic_class(class_name, min_slots),
+        Err(_) => crate::util_concurrent_ext::refused_class(ctx, class_name, min_slots)?,
     };
     let n = ctx.class_num_total_fields(cid).max(min_slots);
-    ctx.alloc_object(cid, n)
+    Ok(ctx.alloc_object(cid, n))
 }
 
 fn obj_arg(args: &[Value], idx: usize) -> Option<ObjectRef> {
@@ -512,7 +522,7 @@ fn read_config_from_object(ctx: &mut dyn NativeContext, cfg: ObjectRef) -> PoolC
 /// AgroalDataSource.from(AgroalDataSourceConfiguration)LAgroalDataSource;
 fn native_ds_from(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let config = obj_arg(args, 0);
-    let ds = alloc_object_for(ctx, CLS_DS, DS_NUM_FIELDS);
+    let ds = alloc_object_for(ctx, CLS_DS, DS_NUM_FIELDS)?;
     let init_args = [
         Value::Object(Some(ds)),
         config
@@ -557,7 +567,7 @@ fn native_ds_get_connection(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     // JdbcConnection synthetic class and tuck the connection ID in slot 0;
     // apps_h2.rs's existing Connection natives (when they exist) already
     // key off that slot.
-    let conn_obj = alloc_object_for(ctx, CLS_H2_CONNECTION, 4);
+    let conn_obj = alloc_object_for(ctx, CLS_H2_CONNECTION, 4)?;
     ctx.set_field(conn_obj, 0, Value::Long(conn_id));
     // Slot 1: back-pointer to the AgroalDataSource so Connection.close() can
     // release the handle to the pool.
@@ -596,7 +606,7 @@ fn native_cfg_build(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     match ctx.get_field(builder, 0) {
         Value::Object(Some(cfg)) => Ok(Some(Value::Object(Some(cfg)))),
         _ => {
-            let cfg = alloc_object_for(ctx, CLS_CONFIG, CFG_NUM_FIELDS);
+            let cfg = alloc_object_for(ctx, CLS_CONFIG, CFG_NUM_FIELDS)?;
             // Apply safe defaults — mirrors Agroal's own defaulting logic.
             ctx.set_field(cfg, CFG_FIELD_MIN_SIZE, Value::Int(0));
             ctx.set_field(cfg, CFG_FIELD_MAX_SIZE, Value::Int(20));
@@ -629,7 +639,7 @@ fn native_props_read(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
 }
 
 fn write_config_to_object(ctx: &mut dyn NativeContext, cfg: &PoolConfig) -> MethodCallResult {
-    let obj = alloc_object_for(ctx, CLS_CONFIG, CFG_NUM_FIELDS);
+    let obj = alloc_object_for(ctx, CLS_CONFIG, CFG_NUM_FIELDS)?;
     let url_s = ctx.create_string(&cfg.jdbc_url);
     let drv_s = ctx.create_string(&cfg.driver);
     let user_s = ctx.create_string(&cfg.username);

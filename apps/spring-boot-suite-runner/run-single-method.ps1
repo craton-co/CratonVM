@@ -67,7 +67,12 @@ $env:CRATONVM_THREADS = '-default-watchdog'
 $env:CRATONVM_JIT = 'rootsnap-cache'
 foreach ($k in $ExtraEnv.Keys) { Set-Item -Path "env:$k" -Value $ExtraEnv[$k] }
 
-$args = @('--java-home', $JdkHome, '--Xmx', $MaxHeap, '--stack-dump-on-timeout', $StackDumpTimeoutSec)
+# Same reason as run-spring-boot-suite.ps1's New-ProcessRecord: the Gradle `test`
+# task of jetty/security/servlet/tomcat/webflux/websocket adds this to its jvmArgs
+# for @DirtiesUrlFactories' reflective `URL.factory` reset, and a direct SbRunner
+# launch gets none of those per-module args. Reproducing one method of an affected
+# class without it measures the missing flag, not the method.
+$args = @('--java-home', $JdkHome, '--Xmx', $MaxHeap, '--add-opens=java.base/java.net=ALL-UNNAMED', '--stack-dump-on-timeout', $StackDumpTimeoutSec)
 if ($NoJit) { $args += '--nojit' }
 if ($CratonArgs.Count -gt 0) { $args += $CratonArgs }
 $args += @('-Dfile.encoding=UTF-8', '-Djava.awt.headless=true', '-cp', $cp, 'SbRunnerMethod', $ClassName, $Method)

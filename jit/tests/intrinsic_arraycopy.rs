@@ -7,8 +7,9 @@
 //! Unlike the pure-leaf bit-op intrinsics, `arraycopy` touches the heap: the
 //! emitted code dereferences real array objects laid out exactly like the
 //! VM's `ObjectHeader` (`cratonvm_types::heap_types`). Each test therefore
-//! builds a byte buffer with that precise layout — a 40-byte header followed
-//! by compact element data — passes raw pointers to the JIT-compiled wrapper,
+//! builds a byte buffer with that precise layout — a `HEADER_SIZE`-byte header
+//! followed by compact element data — passes raw pointers to the JIT-compiled
+//! wrapper,
 //! and asserts the destination buffer matches a host-computed reference.
 //!
 //! Coverage:
@@ -29,7 +30,7 @@
 use cratonvm_jit::x64::{compile, compile_with_param_slots};
 use cratonvm_jit::{CompiledMethod, JitDirectCall, JitInvokeInfo};
 use cratonvm_jit_api::JitRuntimeHelpers;
-use cratonvm_types::{ArrayElementType, ObjectKind, HEADER_SIZE};
+use cratonvm_types::{ArrayElementType, ClassId, ObjectHeader, ObjectKind, HEADER_SIZE};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard};
@@ -254,17 +255,37 @@ impl FakeArray {
         let total = HEADER_SIZE + data_bytes;
         let words = total.div_ceil(8).max(1);
         let mut storage = vec![0u64; words];
-        // Write the header fields at their documented offsets.
-        let base = storage.as_mut_ptr() as *mut u8;
+        // Build the header through `ObjectHeader::new` rather than writing its
+        // fields at literal offsets.
+        //
+        // This fixture used to poke `kind` at offset 4, `element_type` at
+        // offset 5 and `array_length` at offset 12 — the pre-`header-16`
+        // layout. The 2026-08-07 shrink (24 -> 16) moved every one of them:
+        // `shape` now occupies offsets 4..8 and IS the array length for an
+        // array, and the kind/element_type/gc_age/gc_flags quartet moved into
+        // `mark_word` bits 48..63. Those writes therefore set the array's
+        // length to `ObjectKind::Array as u8` == 1 and left the element type
+        // unset, so the intrinsic's inline guard saw a 1-element array of the
+        // wrong kind, deopted instead of copying, and every value assertion
+        // failed against an untouched destination — a red that reads exactly
+        // like an arraycopy miscompile but was entirely in the fixture.
+        //
+        // Restating a layout in a test is what let that happen; going through
+        // the constructor is what stops the next shrink from doing it again.
+        let base = storage.as_mut_ptr() as *mut ObjectHeader;
         unsafe {
-            // class_id (offset 0): leave 0 — primitive arrays carry ClassId(0).
-            // kind (offset 4): ObjectKind::Array == 1.
-            *base.add(4) = ObjectKind::Array as u8;
-            // element_type (offset 5).
-            *base.add(5) = kind as u8;
-            // array_length (offset 12, u32 little-endian).
-            let len_le = (length as u32).to_le_bytes();
-            std::ptr::copy_nonoverlapping(len_le.as_ptr(), base.add(12), 4);
+            // Primitive arrays carry ClassId(0). `num_slots` is unused for an
+            // array shape — the constructor stores `array_length` there.
+            std::ptr::write(
+                base,
+                ObjectHeader::new(
+                    ClassId::new(0),
+                    ObjectKind::Array,
+                    kind,
+                    length as u32, // Cast: fixture array lengths are small
+                    0,
+                ),
+            );
         }
         FakeArray {
             storage,
@@ -425,6 +446,7 @@ fn compile_despec_arraycopy_with_dispatch(
         Vec::new(), // ldc_string_info
         Vec::new(), // ldc_class_info
         Vec::new(), // ldc2w_info
+        Default::default(), // ldc_fp_pcs
         HashMap::new(),
         HashMap::new(),
         helpers,
@@ -438,6 +460,9 @@ fn compile_despec_arraycopy_with_dispatch(
         Vec::new(),
         method_key,
         Vec::new(), // indy_info
+        // elidable_init_pcs: hand-built bytecode with no constant pool, so
+        // nothing is PROVEN to be an empty `<init>` and nothing may be elided.
+        None,
     )
     .expect("JIT compilation of the despecialized arraycopy wrapper failed")
 }

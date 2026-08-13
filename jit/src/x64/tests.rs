@@ -399,6 +399,7 @@ fn test_helpers() -> JitRuntimeHelpers {
         // Unwired (0) — these tests build no class-`ldc` site, and 0 makes
         // the backend refuse one rather than emit a null CALL.
         ldc_class_cp: 0,
+        aastore_type_check: sentinel,
     }
 }
 
@@ -547,6 +548,7 @@ fn self_recursive_second_call_map(method_key: &str) -> Option<crate::OopMapEntry
         Vec::new(), // ldc_string_info
         Vec::new(), // ldc_class_info
         Vec::new(), // ldc2w_info
+        Default::default(), // ldc_fp_pcs
         HashMap::new(),
         HashMap::new(),
         &helpers,
@@ -560,6 +562,7 @@ fn self_recursive_second_call_map(method_key: &str) -> Option<crate::OopMapEntry
         Vec::new(),
         method_key,
         Vec::new(),
+        None, // elidable_init_pcs: no constant pool, so nothing is proven empty
     )?;
     compiled
         .oop_maps
@@ -2392,8 +2395,18 @@ fn test_compile_math_sqrt_intrinsic() {
                                           // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
                                           // produced by the JIT compiler from valid bytecode and the mmap region is executable.
     let result2 = unsafe { compiled.try_call(&[input2]).expect("test JIT call") };
-    assert!((f64::from_bits(result2 as u64) - std::f64::consts::SQRT_2).abs() < 1e-14);
-    // Cast: JIT ABI convention
+    // Bits, not a tolerance. IEEE 754 requires `sqrt` to be CORRECTLY ROUNDED,
+    // so there is exactly one right answer and `SQRT_2` is it. The `1e-14` this
+    // used to allow is about 45 million ULP at 1.414 — wide enough to accept a
+    // wrong instruction, a wrong operand width, or a lost rounding mode. The
+    // `sqrt(4.0)` assertion six lines up was already exact, so this was the odd
+    // one out rather than a considered choice.
+    // W7-54-strictmath-fdlibm-family.md.
+    assert_eq!(
+        f64::from_bits(result2 as u64).to_bits(), // Cast: JIT ABI convention
+        std::f64::consts::SQRT_2.to_bits(),
+        "sqrtsd must be exactly rounded"
+    );
 }
 
 #[test]
@@ -4225,7 +4238,7 @@ fn osr_exit_maps_are_emitted_at_loop_headers_only() {
 // -----------------------------------------------------------------------
 // G1-2 — the inline reference-store fast paths must not elide the
 // collector's post-write barrier on a backend that publishes no region
-// bounds. `docs/gc/g1-audit.md` §8.1: under G1 a young region held out of
+// bounds. `audits/g1-audit.md` §8.1: under G1 a young region held out of
 // the collection set by a JNI pin is reachable ONLY through its remembered
 // set, so an inline store that skips `post_write_barrier_rset` loses the
 // edge and the next pause frees a live referent.
@@ -4584,6 +4597,7 @@ fn trusted_oop_receiver_substitution_requires_live_bounds() {
             Vec::new(), // ldc_string_info
             Vec::new(), // ldc_class_info
             Vec::new(), // ldc2w_info
+            Default::default(), // ldc_fp_pcs
             HashMap::new(),
             HashMap::new(),
             helpers,
@@ -4597,6 +4611,7 @@ fn trusted_oop_receiver_substitution_requires_live_bounds() {
             vec![(2usize, 0u32, true)],
             "T.setRef:(Ljava/lang/Object;)V", // non-empty ⇒ trusted-oop eligible
             Vec::new(),
+            None, // elidable_init_pcs: no constant pool, so nothing is proven empty
         )
         .expect("reference putfield must compile")
     };
@@ -11891,6 +11906,97 @@ fn s31_inline_ctor_non_elided_super_call_bails_cleanly() {
     sites.insert(1, callee);
 
     let _ = compile_with_inlines(&caller_code, caller_len, 1, 1, sites);
+}
+
+/// An `ldc` the [`crate::InlineSite`] cannot describe must REFUSE the splice,
+/// never push zero.
+///
+/// `site.ldc_info` carries only the constants this mini-emitter can materialise
+/// as an x86 immediate — `Integer` and `Float`. A String / Class / MethodHandle
+/// / condy `ldc` names a *reference* built at run time by
+/// `helpers.ldc_string` / `helpers.ldc_class_cp`, which the inline emitter
+/// never calls, so there is no i64 that stands for it and a miss is not a
+/// "value unknown, use 0" case.
+///
+/// It used to be treated as one, on BOTH ends: `build_inline_site` ended its
+/// constant-pool match `_ => 0`, and the emitter's lookup ended
+/// `else { xor rax, rax }`. A one-line
+/// `Dialect.extractPattern(unit) { return "extract(?1 from ?2)"; }` spliced
+/// into `H2Dialect.extractPattern` therefore compiled to `xor eax,eax; ret`,
+/// and every Hibernate HQL `extract()` / `cast()` / `str()` query died in
+/// `PatternRenderer.<init>` with `NullPointerException: ... "pattern" is null`.
+///
+/// THREE arms, so neither half can pass vacuously:
+/// * a site whose `ldc_info` HAS the pc — must splice, and `try_call` returns
+///   the constant, which is what proves the ldc arm is reachable at all;
+/// * the same site with `ldc_info` EMPTY — must be REFUSED;
+/// * a control site of the identical shape (same descriptor, `callee_max_locals`
+///   and `callee_code_len`, so the same frame reservation and buffer estimate)
+///   whose body opens with an opcode the mini-emitter has never had an arm for.
+///   That one is refused by the long-standing catch-all, and arm 2 must emit
+///   byte-for-byte what it emits. Byte equality against a *no-site* compile
+///   would not work and is not the claim: merely HAVING a site changes
+///   `inline_stack_reserve`, hence the frame size, hence several immediates.
+#[test]
+fn s31_inline_refuses_an_ldc_it_has_no_constant_for() {
+    // Caller: `int f() { return k(); }` — invokestatic #1 (pc 0); ireturn.
+    let caller_code: Vec<u8> = vec![
+        0xb8, 0x00, 0x01, // 0: invokestatic #1
+        0xac, // 3: ireturn
+        0, 0, // padding
+    ];
+    let caller_len = 4;
+    // Callee: `static int k() { return <cp#5>; }` — ldc #5 (pc 0); ireturn.
+    let callee_bytes = [0x12, 0x05, 0xac];
+
+    // Arm 1 — the constant IS describable: splice it.
+    let mut resolvable = make_inline_site(&callee_bytes, 0, 0, true, b'I');
+    resolvable.ldc_info = vec![(0, 1234)];
+    let mut sites = HashMap::new();
+    sites.insert(0, resolvable);
+    let spliced = compile_with_inlines(&caller_code, caller_len, 0, 1, sites)
+        .expect("a resolvable ldc must inline");
+    // SAFETY: JIT-compiled code from valid bytecode in an executable mapping.
+    unsafe {
+        assert_eq!(
+            spliced.try_call(&[]).expect("test JIT call"),
+            1234,
+            "the spliced body must return the constant the site described — if this \
+             stops holding the ldc arm is no longer reached and arm 2 proves nothing",
+        );
+    }
+
+    // Arm 2 — nothing describes pc 0 (the String / Class / condy case).
+    let unresolvable = make_inline_site(&callee_bytes, 0, 0, true, b'I');
+    assert!(
+        unresolvable.ldc_info.is_empty(),
+        "this arm's whole point is an ldc with no entry",
+    );
+    let mut sites = HashMap::new();
+    sites.insert(0, unresolvable);
+    let refused = compile_with_inlines(&caller_code, caller_len, 0, 1, sites)
+        .expect("a refused inline must still compile — it falls back to a real call");
+    assert_ne!(
+        refused.code_bytes(),
+        spliced.code_bytes(),
+        "an unresolvable ldc must not emit the same body as a resolvable one",
+    );
+
+    // Arm 3 — the control refusal: `monitorenter` (0xc2) has never had an arm
+    // in the inline emitter, so this body is refused by the catch-all at
+    // callee pc 0, exactly where the ldc arm must now refuse.
+    let control = make_inline_site(&[0xc2, 0x00, 0xac], 0, 0, true, b'I');
+    let mut sites = HashMap::new();
+    sites.insert(0, control);
+    let control_refused = compile_with_inlines(&caller_code, caller_len, 0, 1, sites)
+        .expect("the control refusal must also still compile");
+    assert_eq!(
+        refused.code_bytes(),
+        control_refused.code_bytes(),
+        "an ldc with no constant must be refused and rolled back, leaving exactly \
+         what any other refusal leaves — pushing 0 (`xor rax,rax`) here is a null \
+         where the callee returns a live reference",
+    );
 }
 
 #[test]

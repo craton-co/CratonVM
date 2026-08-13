@@ -711,6 +711,12 @@ fn bootstrap_generic(
             &info.target_descriptor,
         )
     }
+    .map_err(|err| VmError::Internal {
+        message: format!(
+            "invokedynamic generic: MethodType refused for {}: {err:?}",
+            info.target_descriptor
+        ),
+    })?
     .ok_or_else(|| VmError::Internal {
         message: format!(
             "invokedynamic generic: cannot build MethodType from {}",
@@ -758,6 +764,11 @@ fn bootstrap_generic(
                         &mut ctx, desc,
                     )
                 }
+                .map_err(|err| VmError::Internal {
+                    message: format!(
+                        "invokedynamic generic: MethodType refused for {desc}: {err:?}"
+                    ),
+                })?
                 .ok_or_else(|| VmError::Internal {
                     message: format!("invokedynamic generic: bad MethodType static arg {desc}"),
                 })?;
@@ -1288,7 +1299,7 @@ fn bootstrap_lambda(
     let registered = {
         let mut proxies = shared.classes.lambda_proxies.write();
         if proxies.len() < crate::vm::MAX_LAMBDA_PROXIES {
-            proxies.insert(proxy_class_id, call_site.clone());
+            proxies.insert(proxy_class_id, Arc::new(call_site.clone()));
             true
         } else {
             false

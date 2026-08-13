@@ -1,33 +1,39 @@
 # OSR exit, recompile, and the livelock
 
-**Status: CLOSED 2026-08-04. All four items landed.** Entry has worked for a
-long time. Exit is the weaker half — an OSR bail that resumes at the wrong
-interpreter state re-runs loop iterations, which is a *wrong-answer* bug
-invisible to any test that only checks the method terminates.
+**Status:** Shipped (default on), with one dead counter.
 
-> **Read the closeout first: `osr-02-exit-and-recompile-RETIRED-20260804.md`**
-> (in the internal tree). Everything below §"Current state" was written
-> 2026-08-03 and describes items 2 and 4 as open. They are not — and **two of
-> this document's own claims did not survive being implemented**:
->
-> * §4 calls `osr_exit_points` the set of loop boundaries. It is not: one
->   emitter (`emit_osr_exit_map_at_reason`) writes both the loop-boundary map
->   and the `invokedynamic` uncommon trap, so membership alone cannot tell a
->   completed iteration from a body that traps. The cross-check consults the
->   recorded *reason* as well.
-> * §"What to refuse" says to refuse an exit whose resume bci has more than one
->   native image. Taken as `(semantics, reason)` it took **10 of CratonBench's
->   11** OSR refusals and cost `matrixKernel(I)I` its OSR permanently — the
->   loop-boundary map and the speculative-BCE guard share a header bci in every
->   compiled counted loop. The predicate is `semantics` alone, and the refusal
->   belongs at *admission*, not at exit.
+## What it does today
 
-Answers the `osr-02` lane of `docs/feature-designs/c2/deep-research-vm-c2.md`.
-Independent of the entry-metadata contract
-(`docs/feature-designs/jit-osr-entry-metadata.md`), which owns the publication
-site.
+Entry is the strong half; exit is the one that can be *wrong* rather than
+merely absent, because an OSR bail that resumes at the wrong interpreter state
+re-runs loop iterations — a wrong-answer bug that no termination test sees.
 
----
+- **The per-pc compile memo** is `OSR_ENTRY_REJECTS` in `jit/src/lib.rs`, a
+  `(method_hash, entry_pc)` set behind an `RwLock` with
+  `is_osr_entry_rejected` / `mark_osr_entry_rejected` /
+  `osr_entry_reject_count`. `vm/src/runtime/interpreter.rs` adds a per-pc
+  exponential-backoff rejection budget on top.
+- **Exit classification** lives in `jit/src/osr_exit.rs`
+  (`classify_exit_site`, `resume_image`, `OsrExitSite`). The ambiguity refusal
+  runs at *admission*, and its predicate is `semantics` alone — not
+  `(semantics, reason)`, because the loop-boundary map and the speculative-BCE
+  guard share a header bci in every compiled counted loop, and pairing the two
+  refused almost every real OSR site.
+- **Counters** are `OSR_EVENTS` in `jit/src/metrics.rs`, ungated: a silent exit
+  is otherwise indistinguishable from never having entered.
+  `osr_entered`, `osr_exited` and `osr_refused_entry` are recorded from
+  `vm/src/runtime/interpreter/jit_bridge.rs`.
+
+## What is not built yet
+
+- **`osr_compile_declined` is declared and never recorded.** It has zero
+  recording sites anywhere in the tree, so it always reads 0. Either the
+  intended site was lost or it was never written.
+- **The in-place OSR-exit transfer** (`CRATONVM_OSR_EXIT_TRANSFER`) is
+  default-off; the safe reject path is what runs. The comment in
+  `jit_bridge.rs` claiming the gate "was dropped in favour of `can_osr_exit`
+  alone" disagrees with `jit/src/lib.rs`, so which path is live at that site is
+  **not verified**.
 
 ## Goal
 
@@ -67,7 +73,7 @@ direction.
 A neighbouring gate covers the case where the compile produces *nothing*:
 `is_jit_bail_listed` (RBC.2), added after *35 923 wasted pipelines* on `Nat.inc`.
 
-### 2. Making the exit state checkable — **DONE 2026-08-04**
+### 2. Making the exit state checkable — **DONE**
 
 > `probes/OsrExitDifferentialProbe.java` +
 > `regression-suite/perf/osr-exit-differential.sh`. Fifteen arms byte-identical
@@ -145,12 +151,12 @@ counting mechanism itself is covered by
 `record_osr_event_increments_its_row_only` and
 `osr_counts_report_every_event_in_a_fixed_order`. ~~There is no CLI surface that
 dumps `MetricsSummary` at exit yet, so the counters have not been read end to
-end from a live run.~~ **Closed 2026-08-04**: `dump_method_stats_to_stderr`
+end from a live run.~~ **Closed**: `dump_method_stats_to_stderr`
 (`CRATONVM_DBG_JIT_METHOD_STATS=1`) prints all ten rows, and the differential
 harness reads that line and fails the run if a forced-exit arm shows no entries
 or no exits.
 
-### 4. `osr_exit_points` — **cross-checked 2026-08-04**
+### 4. `osr_exit_points` — **cross-checked**
 
 > Landed, and it corrected two premises stated below.
 >
@@ -172,32 +178,6 @@ or no exits.
 happen. The counters above make that comparison *possible* — an `osr_exited`
 count with an empty `osr_exit_points` is now an observable disagreement — but
 nothing asserts it.~~
-
----
-
-## Implementation steps
-
-1. **Per-pc memo** — done before this lane; see above.
-2. **OSR lifecycle counters** — done. Instrumented at four sites in
-   `vm/src/runtime/interpreter/invoke.rs`: after `osr_enter_planned` returns
-   (counted *after*, so a panic in compiled code is not reported as a
-   successful entry), at the `i64::MIN` bail, and at both refusal paths.
-3. **The exit differential** — **DONE 2026-08-04.** Drive
-   `CRATONVM_OSR_EXIT_AFTER=N` over a loop probe that publishes an
-   iteration-count-sensitive accumulator, and compare CratonVM-with-JIT against
-   HotSpot and `--nojit`. The accumulator must be sensitive to *how many times
-   the loop body ran*, not just to the final value, or it cannot see the defect
-   the lane exists for.
-   → `probes/OsrExitDifferentialProbe.java` publishes three observables per
-   shape: `execs` (a static counter, once per body EXECUTION), `trace` (an
-   FNV-1a chain over the induction variable and the loop-carried state, a digest
-   of the frame at every iteration boundary) and the shape's own result. The
-   last one is deliberately the weak check, kept to show what a weak check
-   misses: under the injected defect it stayed byte-identical while `execs` went
-   200 000 → 200 006.
-4. **Cross-check `osr_exit_points`** against observed exits — **DONE
-   2026-08-04**, and the classification needed the recorded `reason` as well as
-   the set. See §4 above.
 
 ---
 
@@ -255,22 +235,10 @@ optimisation.
    raced — worth knowing, because the symptom was a one-in-N flake with no
    obvious cause.
 
-## Effort
-
-~~Steps 1–2: **done**. Step 3: **M**, and it is the one that addresses the
-wrong-answer bug rather than its visibility. Step 4: **S**, gated on step 3.~~
-**All four done.** Step 3's estimate was right about the shape and wrong about
-where the difficulty was: writing the probe was small, and what took the time
-was proving it could FAIL (inject the historical defect, watch it go red,
-revert) and discovering that the step-4 cross-check as specified would have
-mis-classified every `invokedynamic` trap as a loop boundary.
-
----
-
 ## What is left after this lane
 
 * ~~**The differential is a Java-level oracle, not a frame comparator.**~~
-  **CLOSED 2026-08-04.** `CRATONVM_DBG_OSR_FRAME_TRACE` +
+  **CLOSED.** `CRATONVM_DBG_OSR_FRAME_TRACE` +
   `regression-suite/perf/osr-frame-differential.sh` diff the resumed frame
   against the un-compiled run's, slot for slot. The item is now closed in the
   brief's own words rather than in substance.

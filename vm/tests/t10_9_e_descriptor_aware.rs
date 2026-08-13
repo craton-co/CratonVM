@@ -153,7 +153,10 @@ fn t10_9_e_3_coerce_d_from_long_reinterprets_bits() {
     let bits = std::f64::consts::PI.to_bits();
     let c = coerce_field_value_by_descriptor(Value::Long(bits as i64), b'D');
     match c {
-        Value::Double(d) => assert!((d - std::f64::consts::PI).abs() < 1e-12),
+        // Bit equality, not a tolerance: the test's own name says
+        // `reinterprets_bits`, and 1e-12 relative admits ~5,100 ulps of drift
+        // in a value that has been through no arithmetic at all.
+        Value::Double(d) => assert_eq!(d.to_bits(), std::f64::consts::PI.to_bits()),
         other => panic!("expected Double, got {other:?}"),
     }
 }

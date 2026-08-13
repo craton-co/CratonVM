@@ -20,7 +20,7 @@
 ///
 /// Every `CRATONVM_*` flag this crate reads is a field on
 /// [`cratonvm_types::LoaderFlags`], parsed once at first use. See
-/// `docs/flag-census.md` for the inventory and
+/// `audits/flag-census.md` for the inventory and
 /// `cratonvm_types::flags` for the latching rules.
 #[inline]
 pub(crate) fn loader_flags() -> &'static cratonvm_types::LoaderFlags {
@@ -40,6 +40,7 @@ mod class_manager;
 /// consumers in `vm-cli` / `difftest` name the type through
 /// `cratonvm_classloading::class_origin::…`.
 pub mod class_origin;
+pub mod define_census;
 mod class_path;
 pub(crate) mod fx_hash;
 pub mod jar_signer;
@@ -51,7 +52,7 @@ pub mod proxy_gen;
 pub mod resolution;
 /// The overlay detector's per-class instrument: CratonVM's fabricated slot
 /// model for a well-known JDK class, diffed against the layout the loaded image
-/// actually declares. See `docs/feature-designs/jdk-only-wave2/L4-overlay-detector-blind-spots.md`.
+/// actually declares. See `feature-designs/jdk-only-wave2/L4-overlay-detector-blind-spots.md`.
 pub mod shadow_layout;
 pub mod type_maps;
 pub mod verifier;
@@ -84,9 +85,13 @@ pub use class_manager::array_descriptor_element_class;
 pub use class_manager::synthetic_stub_instance_field_count;
 // The fabricated slot MODEL itself, not just its size. `shadow_layout` diffs it
 // against the real layout; a build-time gate over the `*_FIELD_*` constants —
-// the follow-up `docs/jdk-only-object-layout-audit.md` §"A gate worth adding"
+// the follow-up `audits/jdk-only-object-layout-audit.md` §"A gate worth adding"
 // asks for — would want the same table.
 pub use class_manager::synthetic_stub_field_model;
+// The per-class constructor descriptors the synthetic stub declares. Exported
+// because `native-builtins` must register natives for exactly this list —
+// the stub's method table and the registry cannot be allowed to disagree.
+pub use class_manager::{throwable_ctor_descriptors, THROWABLE_DEFAULT_CTORS};
 pub use class_manager::{
     any_class_redefined,
     class_definition_epoch,
@@ -120,7 +125,7 @@ pub use class_manager::{
     // "nobody has this name" apart from "several loaders each have their own
     // class under it". Every `Option`-returning lookup collapses the two, and a
     // caller that reads the collapse as "absent" loads a second copy — see
-    // `docs/feature-designs/classloading-identity-audit.md`.
+    // `feature-designs/classloading-identity-audit.md`.
     NameResolution,
     RedefineOptions,
     ResolutionInvalidateHook,
@@ -168,8 +173,8 @@ pub use loaders::{BUILTIN_LOADER_DELEGATION_CHAIN, MAX_BUILTIN_LOADER_DEPTH};
 // them instead of falling through to the loader-blind global path.
 pub use loaders::{
     dbg_loader_chain, has_user_loader_parents, loader_parent_chain_enabled,
-    register_user_loader_parent, user_loader_ancestors, user_loader_parent_known,
-    MAX_USER_LOADER_DEPTH,
+    register_user_loader_parent, user_loader_ancestors, user_loader_builtin_parent,
+    user_loader_parent_known, MAX_USER_LOADER_DEPTH,
 };
 pub use module::{
     descriptor_from_module_attribute, package_of, ModuleDescriptor, ModuleRegistry, JAVA_BASE,

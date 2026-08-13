@@ -291,6 +291,8 @@ fn constructor_is_synthetic_var_args_get_name_register() {
     );
 }
 
+mod common;
+
 #[test]
 fn reflect_probe_class_files_exist_when_staged() {
     let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -301,7 +303,16 @@ fn reflect_probe_class_files_exist_when_staged() {
         .join("reflect_probe")
         .join("classes");
     if !probe.exists() {
-        return; // not staged in this build
+        // Loud, and a failure under CRATONVM_REQUIRE_E2E — see
+        // `common::require_fixture`. `apps/` is gitignored (.gitignore line 12),
+        // so this fixture was never tracked and is absent from the tree.
+        let _ = common::require_fixture(
+            "wp2_1_reflect",
+            "the WP2.1 fixture directory `reflect_probe/classes` (built from \
+             ReflectProbe.java; this test pins its sealed-permits inner classes)",
+            &[probe.clone()],
+        );
+        return;
     }
     let main_class = probe.join("ReflectProbe.class");
     assert!(main_class.exists(), "ReflectProbe.class must be staged");

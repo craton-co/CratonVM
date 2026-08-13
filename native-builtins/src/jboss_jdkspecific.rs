@@ -29,11 +29,12 @@
 //! This module is loaded from `lib.rs::register_essential_natives` alongside
 //! the existing `jboss_module_xml` handlers.
 
+use cratonvm_classloading::module::ALL_UNNAMED_TARGET;
 use cratonvm_native_api::{NativeContext, NativeKind, NativeMethodRegistry};
 use cratonvm_types::error::{MethodCallResult, RuntimeError};
 use cratonvm_types::{ObjectRef, Value};
 
-use crate::alloc_concurrent_synthetic;
+use crate::try_alloc_concurrent_synthetic;
 use cratonvm_types::error::MethodCallFailed;
 
 /// Package names seeded into every synthetic `Module.getPackages()` call.
@@ -277,7 +278,7 @@ fn boot_layer_memo() -> &'static std::sync::Mutex<std::collections::HashMap<usiz
 /// ModuleLayer.boot()` and `someModule.getLayer() == ModuleLayer.boot()` are
 /// both spec'd identities, and JDK code compares layers with `==`. This used to
 /// allocate a FRESH layer on every call, so both comparisons were always false
-/// (measured: `regression-suite/src/RJdkModule.java:57` fails with "module must
+/// (measured: `regression-suite/src/RJdkModule.java:60` fails with "module must
 /// be in the boot layer" in real-jdk AND jdk-only, while HotSpot 25 passes).
 /// Memoise per VM instead.
 fn build_boot_layer(
@@ -294,7 +295,7 @@ fn build_boot_layer(
     }
     drop(memo);
 
-    let layer = alloc_concurrent_synthetic(ctx, "java/lang/ModuleLayer", MODULE_LAYER_FIELD_COUNT);
+    let layer = try_alloc_concurrent_synthetic(ctx, "java/lang/ModuleLayer", MODULE_LAYER_FIELD_COUNT)?;
     let layer_pin = ctx.pin_native_root(layer);
 
     let parents = new_initialized_object(ctx, "java/util/ArrayList", "()V", &[], "layer parents")?;
@@ -327,7 +328,175 @@ fn build_boot_layer(
         memo.insert(vm, handle);
     }
     drop(memo);
+    populate_boot_layer_modules(ctx, layer)?;
     Ok(layer)
+}
+
+/// Insert every registered module into the boot layer's `nameToModule` map and
+/// `modules` set.
+///
+/// # Why this exists
+///
+/// The layer above is allocated with a freshly created, EMPTY `HashMap` and
+/// nothing ever added to it — `build_module` sets the module's `layer` but the
+/// back-edge was never written. That is invisible for most of `ModuleLayer`'s
+/// surface, because CratonVM answers `findModule`, `getDescriptor` and the rest
+/// from its own `ModuleRegistry` rather than from the map. It is NOT invisible
+/// to services.
+///
+/// Real `ModuleLayer.getServicesCatalog()` self-populates: when the field is
+/// null it calls `ServicesCatalog.create()` and loops `nameToModule.values()`
+/// calling `catalog.register(m)`, which reads `m.getDescriptor().provides()`.
+/// Over an empty map that produces an empty catalog, and `ServiceLoader` reads
+/// providers from the catalog ONLY — never from a descriptor directly. So
+/// `ServiceLoader.load(layer, Service.class)` found nothing:
+/// `regression-suite/src/RJdkModule.java` failed with
+/// `AssertionError: module service providers: []` under `--jdk-only`, where the
+/// real `java.util.ServiceLoader` bytecode runs because the ServiceLoader
+/// natives are `NativeKind::SyntheticStub` and strict mode refuses them at
+/// registration. Diagnosis: `docs/known-issues/jdk-only/W6-11-*`, §3.
+///
+/// This also un-breaks `native_module_layer_modules`, which already built a
+/// catalog by iterating `nameToModule.values()` and was a no-op for services in
+/// BOTH modes for the same reason.
+///
+/// # Why it runs after the layer is published
+///
+/// `build_module` runs Java (`build_module_descriptor` allocates and
+/// initialises), and that can re-enter `ModuleLayer.boot()`. Publishing the
+/// layer to the memo and the global root table FIRST means such a re-entry gets
+/// this same object — a partially populated map at worst — instead of recursing
+/// into a second `build_boot_layer`. Population is idempotent: `HashMap.put`
+/// re-keys by name and `build_module` returns the cached mirror for a
+/// registered name.
+///
+/// A failure to build any one module is not fatal to the layer: the module is
+/// skipped and the rest are inserted. A layer missing one module is strictly
+/// better than no layer at all, which is what propagating would produce.
+fn populate_boot_layer_modules(
+    ctx: &mut dyn NativeContext,
+    layer: ObjectRef,
+) -> Result<(), MethodCallFailed> {
+    let names = ctx.module_names();
+    if names.is_empty() {
+        return Ok(());
+    }
+    let layer_pin = ctx.pin_native_root(layer);
+    for name in names {
+        let layer = ctx.read_native_pin(layer_pin, layer);
+        let Ok(module) = build_module(ctx, &name, layer) else {
+            continue;
+        };
+        let module_pin = ctx.pin_native_root(module);
+
+        // `nameToModule.put(name, module)` — the map real
+        // `getServicesCatalog()` iterates.
+        let layer = ctx.read_native_pin(layer_pin, layer);
+        if let Value::Object(Some(map)) = ctx.get_field_by_name(layer, "nameToModule") {
+            let map_pin = ctx.pin_native_root(map);
+            let key = ctx.create_string(&name);
+            let map = ctx.read_native_pin(map_pin, map);
+            let module = ctx.read_native_pin(module_pin, module);
+            let _ = ctx.invoke_virtual(
+                map,
+                "put",
+                "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+                &[Value::Object(Some(key)), Value::Object(Some(module))],
+            );
+            ctx.unpin_native_roots(map_pin);
+        }
+
+        // `modules.add(module)` — kept in step so `ModuleLayer.modules()` and
+        // the map cannot disagree about the layer's contents.
+        let layer = ctx.read_native_pin(layer_pin, layer);
+        if let Value::Object(Some(set)) = ctx.get_field_by_name(layer, "modules") {
+            let set_pin = ctx.pin_native_root(set);
+            let set = ctx.read_native_pin(set_pin, set);
+            let module = ctx.read_native_pin(module_pin, module);
+            let _ = ctx.invoke_virtual(
+                set,
+                "add",
+                "(Ljava/lang/Object;)Z",
+                &[Value::Object(Some(module))],
+            );
+            ctx.unpin_native_roots(set_pin);
+        }
+        // `ServicesCatalog.getServicesCatalog(appLoader).register(module)` —
+        // the OTHER of the two routes `ServiceLoader` takes, and the one the
+        // no-arg `ServiceLoader.load(Service.class)` uses.
+        //
+        // `ModuleServicesLookupIterator.iteratorFor(loader)` asks
+        // `ServicesCatalog.getServicesCatalogOrNull(loader)` — a per-loader
+        // `ClassLoaderValue` — and NOT the layer. Populating `nameToModule`
+        // above fixes only `ServiceLoader.load(layer, Service.class)`; without
+        // this the plain overload still answers `[]`. Both are asserted, three
+        // lines apart, in `RJdkModule.moduleServices()` (`:233` is this route,
+        // `:242` the layer one), and fixing the layer alone moved the failure
+        // by zero lines.
+        //
+        // Registering against the SYSTEM loader is what the real
+        // `ModuleLayer.defineModules` does for boot-layer modules resolved from
+        // `--module-path`: they are defined to the application loader, and its
+        // catalog is what the lookup walks. `getServicesCatalog` creates the
+        // catalog if absent, and `register(Module)` reads
+        // `descriptor.provides()`, so a module that declares none is a no-op
+        // rather than a special case.
+        let module = ctx.read_native_pin(module_pin, module);
+        register_module_in_loader_catalog(ctx, module);
+
+        ctx.unpin_native_roots(module_pin);
+    }
+    ctx.unpin_native_roots(layer_pin);
+    Ok(())
+}
+
+/// Add `module` to the system class loader's `ServicesCatalog`.
+///
+/// Best-effort by design: every step is a real-JDK call that a synthetic-JDK
+/// build may not have, and a missing services catalog must not take the boot
+/// layer down with it. A caller that gets no catalog is exactly where it was
+/// before this existed.
+fn register_module_in_loader_catalog(ctx: &mut dyn NativeContext, module: ObjectRef) {
+    let module_pin = ctx.pin_native_root(module);
+    let loader = match ctx.invoke(
+        "java/lang/ClassLoader",
+        "getSystemClassLoader",
+        "()Ljava/lang/ClassLoader;",
+        &[],
+    ) {
+        Ok(Some(Value::Object(Some(l)))) => l,
+        _ => {
+            ctx.unpin_native_roots(module_pin);
+            return;
+        }
+    };
+    let loader_pin = ctx.pin_native_root(loader);
+    let loader = ctx.read_native_pin(loader_pin, loader);
+    let catalog = match ctx.invoke(
+        "jdk/internal/module/ServicesCatalog",
+        "getServicesCatalog",
+        "(Ljava/lang/ClassLoader;)Ljdk/internal/module/ServicesCatalog;",
+        &[Value::Object(Some(loader))],
+    ) {
+        Ok(Some(Value::Object(Some(c)))) => c,
+        _ => {
+            ctx.unpin_native_roots(loader_pin);
+            ctx.unpin_native_roots(module_pin);
+            return;
+        }
+    };
+    let catalog_pin = ctx.pin_native_root(catalog);
+    let catalog = ctx.read_native_pin(catalog_pin, catalog);
+    let module = ctx.read_native_pin(module_pin, module);
+    let _ = ctx.invoke(
+        "jdk/internal/module/ServicesCatalog",
+        "register",
+        "(Ljava/lang/Module;)V",
+        &[Value::Object(Some(catalog)), Value::Object(Some(module))],
+    );
+    ctx.unpin_native_roots(catalog_pin);
+    ctx.unpin_native_roots(loader_pin);
+    ctx.unpin_native_roots(module_pin);
 }
 
 /// Build a `java.util.HashSet<String>` pre-populated with `packages`, backed
@@ -348,9 +517,9 @@ fn build_boot_layer(
 /// just on `HashSet` instead of `Module`. The real-layout helper builds an
 /// actual `HashMap` with real `HashMap$Node` buckets, so unforced real
 /// bytecode reads it correctly with no detection/adaptation needed.
-fn build_package_set(ctx: &mut dyn NativeContext, packages: &[&str]) -> ObjectRef {
+fn build_package_set(ctx: &mut dyn NativeContext, packages: &[&str]) -> Result<ObjectRef, MethodCallFailed> {
     let keys: Vec<ObjectRef> = packages.iter().map(|pkg| ctx.create_string(pkg)).collect();
-    crate::build_real_layout_string_hashset(ctx, &keys)
+    Ok(crate::build_real_layout_string_hashset(ctx, &keys)?)
 }
 
 /// The package set to record for `name` in `module_packages_table`.
@@ -390,7 +559,7 @@ fn record_module_packages(ctx: &mut dyn NativeContext, module: ObjectRef, name: 
 /// not override `equals`, so every JDK comparison of two Modules is `==`; a
 /// fresh Module per `findModule` call made
 /// `Greeter.class.getModule() == ModuleLayer.boot().findModule(m).get()` false
-/// (measured: `regression-suite/src/RJdkModule.java:129`, HotSpot passes).
+/// (measured: `regression-suite/src/RJdkModule.java:139`, HotSpot passes).
 ///
 /// Fabricated stand-ins for names the registry does NOT know are deliberately
 /// left out of that cache: they are a permissive fallback, not a fact about the
@@ -408,7 +577,7 @@ fn build_module(ctx: &mut dyn NativeContext, name: &str, layer: ObjectRef) -> Re
             return Ok(cached);
         }
     }
-    let module = alloc_concurrent_synthetic(ctx, "java/lang/Module", MODULE_FIELD_COUNT);
+    let module = try_alloc_concurrent_synthetic(ctx, "java/lang/Module", MODULE_FIELD_COUNT)?;
     let pin = ctx.pin_native_root(module);
     let name_str = ctx.create_string(name);
     let module = ctx.read_native_pin(pin, module);
@@ -485,10 +654,10 @@ pub(crate) fn native_module_define_module0(
 }
 
 /// Wrap an ObjectRef as `Optional.of(value)`.
-fn wrap_optional_present(ctx: &mut dyn NativeContext, value: ObjectRef) -> ObjectRef {
-    let opt = alloc_concurrent_synthetic(ctx, "java/util/Optional", 1);
+fn wrap_optional_present(ctx: &mut dyn NativeContext, value: ObjectRef) -> Result<ObjectRef, MethodCallFailed> {
+    let opt = try_alloc_concurrent_synthetic(ctx, "java/util/Optional", 1)?;
     ctx.set_field(opt, 0, Value::Object(Some(value)));
-    opt
+    Ok(opt)
 }
 
 /// `ModuleLayer.boot()` — produce the cached boot layer.
@@ -526,13 +695,68 @@ pub(crate) fn native_module_layer_find_module(
         return Err(e.into());
     }
 
+    // A layer built by `ModuleLayer.defineModules` is its OWN authority, and
+    // the boot `ModuleRegistry` knows nothing about it.
+    //
+    // `bootLayer.defineModules(cf, ...)` runs real JDK bytecode and populates
+    // the layer's canonical `nameToModule` map. Answering such a receiver from
+    // the boot registry is simply asking the wrong object: the name is absent
+    // there by construction, so `findModule` returned `Optional.empty()` for a
+    // module that the layer itself holds. Measured 2026-08-10 with
+    // `probes/MLProbe.java`, which replicates
+    // `com.sun.org.apache.xalan.internal.xsltc.trax.TemplatesImpl.createModule`
+    // line for line:
+    //
+    //   HotSpot   nameToModule = {cratonvm.dyn.translet=module …}
+    //             findModule(…) = Optional[module cratonvm.dyn.translet]
+    //   CratonVM  nameToModule = {cratonvm.dyn.translet=module …}   <- populated
+    //             findModule(…) = Optional.empty                    <- only this
+    //
+    // `TemplatesImpl.createModule` ends in `layer.findModule(mn).get()`, so the
+    // empty Optional surfaced as `NoSuchElementException: No value present` out
+    // of XSLTC — taking every `javax.xml.transform` consumer with it (8 classes
+    // in the 2026-08-10 Spring sweep: the XMLUnit comparison family plus
+    // `XsltViewTests`).
+    //
+    // `ModuleLayer.modules()` already reads this same map
+    // (`native_module_layer_modules`), which is why `layer.modules()` listed the
+    // module that `layer.findModule` could not find. This makes the two agree.
+    //
+    // Authoritative in BOTH directions: when the receiver carries the map, a
+    // miss is a real absence and must answer empty rather than falling through
+    // to the permissive fabrication below. Our synthetic boot layer has no such
+    // field, so it takes none of this path and keeps its existing behaviour.
+    if let Some(Value::Object(Some(layer))) = args.first() {
+        if let Value::Object(Some(name_to_module)) = ctx.get_field_by_name(*layer, "nameToModule") {
+            let map_pin = ctx.pin_native_root(name_to_module);
+            let name_pin = ctx.pin_native_root(name_obj);
+            let map = ctx.read_native_pin(map_pin, name_to_module);
+            let key = ctx.read_native_pin(name_pin, name_obj);
+            let got = ctx.invoke_virtual(
+                map,
+                "get",
+                "(Ljava/lang/Object;)Ljava/lang/Object;",
+                &[Value::Object(Some(key))],
+            );
+            ctx.unpin_native_roots(map_pin);
+            ctx.unpin_native_roots(name_pin);
+            return match got? {
+                Some(Value::Object(Some(module))) => {
+                    let opt = wrap_optional_present(ctx, module)?;
+                    Ok(Some(Value::Object(Some(opt))))
+                }
+                _ => ctx.invoke("java/util/Optional", "empty", "()Ljava/util/Optional;", &[]),
+            };
+        }
+    }
+
     // An ABSENT module must answer `Optional.empty()`.
     //
     // This used to fabricate a Module for any syntactically valid name, so
     // `ModuleLayer.boot().findModule(anything).isPresent()` was unconditionally
     // true. Two costs, both measured: `RJdkFailure.java:274`
     // (`findModule("cratonvm.no.such.module").isEmpty()`) failed outright, and
-    // `RJdkModule.java:48`'s "was --module-path passed?" check passed
+    // `RJdkModule.java:51`'s "was --module-path passed?" check passed
     // VACUOUSLY — which is why the real module defect only surfaced several
     // checks downstream.
     //
@@ -554,12 +778,12 @@ pub(crate) fn native_module_layer_find_module(
     };
     let module = build_module(ctx, &name, layer_ref)?;
     let opt = wrap_optional_present(ctx, module);
-    Ok(Some(Value::Object(Some(opt))))
+    Ok(Some(Value::Object(Some(opt?))))
 }
 
 /// `Module.getResourceAsStream(String)`.
 ///
-/// Registered nowhere before this — `RJdkModule.java:192/198/204/208` are the
+/// Registered nowhere before this — `RJdkModule.java:202/208/214/218` are the
 /// four checks that need it, and real JDK bytecode for this method routes
 /// through `BuiltinClassLoader.findResourceAsStream` / a `ModuleReader`, neither
 /// of which CratonVM models. Companion entry required in
@@ -710,7 +934,7 @@ fn resource_package_name(name: &str) -> &str {
 fn resource_caller_module(ctx: &mut dyn NativeContext) -> Option<String> {
     for cid in ctx.frame_class_ids() {
         if matches!(
-            ctx.class_name_of_id(cid).as_deref(),
+            ctx.class_name_arc_of_id(cid).as_deref(),
             Some("java/lang/Module")
         ) {
             continue;
@@ -775,7 +999,7 @@ pub(crate) fn native_module_get_packages(
         }
     };
     let refs: Vec<&str> = names.iter().map(String::as_str).collect();
-    let set = build_package_set(ctx, &refs);
+    let set = build_package_set(ctx, &refs)?;
     Ok(Some(Value::Object(Some(set))))
 }
 
@@ -987,7 +1211,7 @@ fn build_unqualified_export(
 // `regression-suite/src/RJdkModule.java` (`--module-path build-modules
 // --add-modules cratonvm.jdkonly.svc`): HotSpot reports
 // `exports=[com.cratonvm.jdkonly.svc, com.cratonvm.jdkonly.svc.open]`, CratonVM
-// reported `[]` and the vector died at `RJdkModule.java:69`.
+// reported `[]` and the vector died at `RJdkModule.java:72`.
 //
 // The registry stores names in INTERNAL (slash) form; every `java.lang.module`
 // API speaks BINARY (dot) form, so each name crosses `dotted` on the way out.
@@ -1060,7 +1284,7 @@ fn build_export_like(
     package_name: &str,
     targets: &[String],
 ) -> Result<ObjectRef, cratonvm_types::error::MethodCallFailed> {
-    let obj = alloc_concurrent_synthetic(ctx, class_name, 4);
+    let obj = try_alloc_concurrent_synthetic(ctx, class_name, 4)?;
     let pin = ctx.pin_native_root(obj);
 
     let mods = new_initialized_object(ctx, "java/util/HashSet", "()V", &[], "export mods")?;
@@ -1108,7 +1332,7 @@ fn build_provides(
     service: &str,
     providers: &[String],
 ) -> Result<ObjectRef, cratonvm_types::error::MethodCallFailed> {
-    let obj = alloc_concurrent_synthetic(ctx, "java/lang/module/ModuleDescriptor$Provides", 2);
+    let obj = try_alloc_concurrent_synthetic(ctx, "java/lang/module/ModuleDescriptor$Provides", 2)?;
     let pin = ctx.pin_native_root(obj);
 
     let list = new_initialized_object(ctx, "java/util/ArrayList", "()V", &[], "providers")?;
@@ -1147,30 +1371,165 @@ fn build_provides_set(
     Ok(set)
 }
 
+/// The binary name of the `requires` modifier enum.
+///
+/// Spelling a fixed JDK type as a literal is not the "bind by NAME" hazard this
+/// campaign keeps hitting — that one is a *decision* keyed on a rendered class /
+/// module / package name that varies with the code under test. This is the same
+/// kind of constant as the `java/util/HashSet` literals throughout this file:
+/// one specific JDK class, resolved once, compared against nothing.
+const REQUIRES_MODIFIER_ENUM: &str = "java/lang/module/ModuleDescriptor$Requires$Modifier";
+
+/// Read one enum constant out of an already-initialized enum's statics.
+///
+/// Pure reads only — `static_field_index_by_name` and `get_static_field` neither
+/// allocate nor re-enter Java, so a caller may hold an unpinned `ObjectRef`
+/// across this. Initializing the enum (which DOES run Java) is the caller's job,
+/// deliberately hoisted out of the allocation-bearing loop below.
+///
+/// `None` means the constant could not be produced — field absent, or a null
+/// static because the enum never really initialized (a synthetic-JDK stand-in).
+/// The caller must then leave that modifier out rather than write a null into a
+/// set whose `hashCode()` real JDK bytecode will walk.
+fn enum_constant(
+    ctx: &dyn NativeContext,
+    class_id: cratonvm_types::ClassId,
+    constant: &str,
+) -> Option<ObjectRef> {
+    let index = ctx.static_field_index_by_name(class_id, constant)?;
+    match ctx.get_static_field(class_id, index) {
+        Value::Object(Some(o)) => Some(o),
+        _ => None,
+    }
+}
+
+/// The binary name of the module-level modifier enum. Same constant-literal
+/// rationale as [`REQUIRES_MODIFIER_ENUM`].
+const MODULE_MODIFIER_ENUM: &str = "java/lang/module/ModuleDescriptor$Modifier";
+
+/// Build `ModuleDescriptor.modifiers()`.
+///
+/// This set was previously empty for every module unconditionally, which is a
+/// false positive claim for an open module: the javadoc for
+/// `ModuleDescriptor.isOpen()` is "Returns true if this is an open module", and
+/// `newOpenModule` is specified to build a descriptor whose modifiers contain
+/// `Modifier.OPEN`, so `modifiers().contains(OPEN)` and `isOpen()` are two
+/// spellings of one fact. `isOpen()` was already answered truthfully from
+/// `module_is_open`, so `modifiers()` disagreeing with it was an internal
+/// contradiction, not merely a missing feature — and it is fixed here from data
+/// the `NativeContext` already exposes.
+///
+/// The other three constants are NOT fabricated:
+///
+/// * `AUTOMATIC` — the registry knows this (`ModuleDescriptor::automatic`) but
+///   no `NativeContext` accessor surfaces it, so this native cannot ask. Note
+///   the same gap makes `isAutomatic()` itself a hardcoded `false` in
+///   `build_module_descriptor`; both want one new accessor, and the patch is in
+///   the W2-3 known-issues record.
+/// * `SYNTHETIC` / `MANDATED` — no module-level flag word survives
+///   `descriptor_from_module_attribute`, which extracts only `ACC_MODULE_OPEN`
+///   from the `Module` attribute's `flags`.
+///
+/// Leaving those out understates the set rather than inventing membership,
+/// which is the safe direction: a caller testing `contains(X)` gets a false
+/// negative, never a false positive.
+fn build_module_modifier_set(
+    ctx: &mut dyn NativeContext,
+    is_open: bool,
+) -> Result<ObjectRef, cratonvm_types::error::MethodCallFailed> {
+    // Hoisted for the same reason as in `build_requires_set`: `<clinit>` runs
+    // Java and can move the heap, so it must not run while `set` is live.
+    let modifier_enum = if is_open {
+        ctx.ensure_class_initialized(MODULE_MODIFIER_ENUM).ok()
+    } else {
+        None
+    };
+    let set = new_initialized_object(ctx, "java/util/HashSet", "()V", &[], "modifiers")?;
+    if let Some(enum_id) = modifier_enum {
+        if let Some(value) = enum_constant(ctx, enum_id, "OPEN") {
+            collection_add(ctx, set, value)?;
+        }
+    }
+    Ok(set)
+}
+
 /// Build the `Set<Requires>` for a whole module.
 ///
 /// `Requires` is `(Set mods, String name, Version compiledVersion, String
 /// rawCompiledVersion)`. `name()` is a plain field read, which is the accessor
-/// every caller in the corpus uses. `mods` is left EMPTY even for a
-/// `requires transitive` / `requires static` edge: the modifier set is an
-/// `EnumSet<Requires.Modifier>` and a native cannot mint enum constants here
-/// without reading the enum's statics, so `Requires.modifiers()` remains a
-/// known gap (recorded in the known-issues doc). The transitive/static bits are
-/// NOT lost to the VM — `ModuleRegistry::build_readability_graph` consumes them
-/// on the Rust side; they are only invisible through this Java mirror.
+/// every caller in the corpus uses, and `modifiers()` is a plain field read of
+/// `mods`.
+///
+/// `mods` used to be unconditionally empty, discarding the transitive/static
+/// bits `module_requires` already hands us — the registry has carried them the
+/// whole time (`ModuleRegistry::build_readability_graph` consumes them on the
+/// Rust side); they were simply dropped on the way into the Java mirror. They
+/// are now minted from the REAL enum's static constants, because `Enum.equals`
+/// is identity: a caller's `mods.contains(Requires.Modifier.TRANSITIVE)` can
+/// only answer true if the set holds the genuine singleton, and a fabricated
+/// stand-in would compare unequal and read as "not transitive" — a wrong answer
+/// dressed as a right one.
+///
+/// Still absent: `MANDATED` / `SYNTHETIC`. Those bits ARE parsed now
+/// (`ModuleRequiresEntry::{is_mandated,is_synthetic}`), but `module_requires`'
+/// `(String, bool, bool)` tuple has no room to carry them and widening it means
+/// editing `native-api` and `vm`, outside this lane's files — the exact patch is
+/// recorded in the W2-3 known-issues record. Until it lands `requires java.base`
+/// reports `[]` where HotSpot reports `[MANDATED]`: a NARROWING of the existing
+/// gap, not a new one.
 fn build_requires_set(
     ctx: &mut dyn NativeContext,
     entries: &[(String, bool, bool)],
 ) -> Result<ObjectRef, cratonvm_types::error::MethodCallFailed> {
+    // Resolve the modifier enum ONCE, before the first allocation below.
+    // `ensure_class_initialized` runs the enum's `<clinit>`, i.e. arbitrary
+    // Java, which can move the heap — doing it inside the loop would expose a
+    // live ref to a collection between a pin and its read. Skipped entirely
+    // when no entry carries a modifier, which is the overwhelmingly common
+    // shape (`requires <plain>`), so the ordinary path never drags the enum
+    // through initialization at all.
+    //
+    // An initialization failure is swallowed rather than propagated: this
+    // enum's `<clinit>` is four `new Modifier(int)` calls and an array, so it
+    // cannot realistically throw, and a descriptor missing its modifier set is
+    // a far better outcome than `getDescriptor()` itself failing.
+    let modifier_enum =
+        if entries.iter().any(|(_, transitive, is_static)| *transitive || *is_static) {
+            ctx.ensure_class_initialized(REQUIRES_MODIFIER_ENUM).ok()
+        } else {
+            None
+        };
+
     let set = new_initialized_object(ctx, "java/util/HashSet", "()V", &[], "requires")?;
     let pin = ctx.pin_native_root(set);
-    for (name, _transitive, _is_static) in entries {
+    for (name, transitive, is_static) in entries {
         let element =
-            alloc_concurrent_synthetic(ctx, "java/lang/module/ModuleDescriptor$Requires", 4);
+            try_alloc_concurrent_synthetic(ctx, "java/lang/module/ModuleDescriptor$Requires", 4)?;
         let element_pin = ctx.pin_native_root(element);
-        let mods = new_initialized_object(ctx, "java/util/HashSet", "()V", &[], "requires mods")?;
+
+        let mut mods = new_initialized_object(ctx, "java/util/HashSet", "()V", &[], "requires mods")?;
+        let mods_pin = ctx.pin_native_root(mods);
+        if let Some(enum_id) = modifier_enum {
+            for (wanted, constant) in [(*transitive, "TRANSITIVE"), (*is_static, "STATIC")] {
+                if !wanted {
+                    continue;
+                }
+                // Re-read the pin first: a previous `collection_add` re-entered
+                // Java (`Enum.hashCode`) and may have moved `mods`. Assigned
+                // back into the outer binding rather than shadowed inside the
+                // loop body, so the second iteration re-reads from the updated
+                // ref instead of handing `read_native_pin` a stale fallback.
+                mods = ctx.read_native_pin(mods_pin, mods);
+                if let Some(value) = enum_constant(ctx, enum_id, constant) {
+                    collection_add(ctx, mods, value)?;
+                }
+            }
+        }
+        let mods = ctx.read_native_pin(mods_pin, mods);
+        ctx.unpin_native_roots(mods_pin);
         let element = ctx.read_native_pin(element_pin, element);
         ctx.set_field_by_name(element, "mods", Value::Object(Some(mods)));
+
         let name_str = ctx.create_string(name);
         let element = ctx.read_native_pin(element_pin, element);
         ctx.set_field_by_name(element, "name", Value::Object(Some(name_str)));
@@ -1232,7 +1591,7 @@ pub(crate) fn build_module_descriptor(
         .collect();
     let requires = ctx.module_requires(module_name);
 
-    let desc = alloc_concurrent_synthetic(ctx, "java/lang/module/ModuleDescriptor", 16);
+    let desc = try_alloc_concurrent_synthetic(ctx, "java/lang/module/ModuleDescriptor", 16)?;
     let pin = ctx.pin_native_root(desc);
     let name = ctx.create_string(module_name);
     let desc = ctx.read_native_pin(pin, desc);
@@ -1255,11 +1614,31 @@ pub(crate) fn build_module_descriptor(
     }
     ctx.set_field_by_name(desc, "name", name_val);
     ctx.set_field_by_name(desc, "open", Value::Int(if is_open { 1 } else { 0 }));
+    // UNSOURCED, and knowingly so. The registry does record whether a module is
+    // automatic (`ModuleDescriptor::automatic`, set for a `module-info.class`
+    // found on the CLASS path), but no `NativeContext` accessor surfaces it, so
+    // this native cannot ask and writes the majority answer instead. That makes
+    // `RJdkModule`'s `check(!d.isAutomatic(), ...)` pass for the wrong reason —
+    // it would pass against a hardcoded `false` whatever the module really is.
+    // One accessor fixes this and `Modifier.AUTOMATIC` together; the patch is in
+    // the W2-3 known-issues record.
     ctx.set_field_by_name(desc, "automatic", Value::Int(0));
 
-    // `modifiers` has no registry backing (see `build_requires_set`), so it
-    // stays an empty set — but it must be a non-null one.
-    let modifiers = new_initialized_object(ctx, "java/util/HashSet", "()V", &[], "modifiers")?;
+    // `version`, `rawVersionString` and `mainClass` are deliberately LEFT NULL
+    // rather than set to anything. Real `ModuleDescriptor.version()` /
+    // `rawVersion()` / `mainClass()` are `Optional.ofNullable(field)`, so a null
+    // field already renders as `Optional.empty()` — the honest "nothing was
+    // recorded" answer, and the correct one for a module-info that carries no
+    // version. It is NOT correct for one that does: `descriptor_from_module_attribute`
+    // has always parsed the module version into `ModuleDescriptor::version`, and
+    // `requires`' compiled version is parsed as of this change, but neither
+    // crosses `NativeContext`. Writing a fabricated value here would turn a
+    // truthful empty into a false claim, so nothing is written.
+
+    // `modifiers` carries OPEN when the module is open; the remaining three
+    // constants have no data source reachable from here. See
+    // `build_module_modifier_set` for what is deliberately NOT fabricated.
+    let modifiers = build_module_modifier_set(ctx, is_open)?;
     let desc = ctx.read_native_pin(pin, desc);
     ctx.set_field_by_name(desc, "modifiers", Value::Object(Some(modifiers)));
 
@@ -1303,7 +1682,7 @@ fn build_boot_resolved_module(
     package_names: &[&str],
 ) -> Result<ObjectRef, cratonvm_types::error::MethodCallFailed> {
     let cfg_pin = ctx.pin_native_root(cfg);
-    let md = alloc_concurrent_synthetic(ctx, "java/lang/module/ModuleDescriptor", 16);
+    let md = try_alloc_concurrent_synthetic(ctx, "java/lang/module/ModuleDescriptor", 16)?;
     let md_pin = ctx.pin_native_root(md);
     let module_name = ctx.create_string(name);
     let md = ctx.read_native_pin(md_pin, md);
@@ -1349,12 +1728,12 @@ fn build_boot_resolved_module(
     ctx.unpin_native_roots(packages_pin);
     ctx.unpin_native_roots(exports_pin);
 
-    let mref = alloc_concurrent_synthetic(ctx, "jdk/internal/module/ModuleReferenceImpl", 8);
+    let mref = try_alloc_concurrent_synthetic(ctx, "jdk/internal/module/ModuleReferenceImpl", 8)?;
     let mref_pin = ctx.pin_native_root(mref);
     let md = ctx.read_native_pin(md_pin, md);
     ctx.set_field_by_name(mref, "descriptor", Value::Object(Some(md)));
 
-    let resolved = alloc_concurrent_synthetic(ctx, "java/lang/module/ResolvedModule", 2);
+    let resolved = try_alloc_concurrent_synthetic(ctx, "java/lang/module/ResolvedModule", 2)?;
     let cfg = ctx.read_native_pin(cfg_pin, cfg);
     let mref = ctx.read_native_pin(mref_pin, mref);
     ctx.set_field_by_name(resolved, "cf", Value::Object(Some(cfg)));
@@ -1406,7 +1785,7 @@ pub(crate) fn native_module_layer_configuration(
         }
     }
 
-    let cfg = alloc_concurrent_synthetic(ctx, "java/lang/module/Configuration", 5);
+    let cfg = try_alloc_concurrent_synthetic(ctx, "java/lang/module/Configuration", 5)?;
     let cfg_pin = ctx.pin_native_root(cfg);
 
     let parents = new_initialized_object(ctx, "java/util/ArrayList", "()V", &[], "parents")?;
@@ -1533,11 +1912,32 @@ fn native_module_add_exports0(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
     Ok(None)
 }
 
-/// `java.lang.Module.addExportsToAll0(Module from, String pkg)` and
-/// `addExportsToAllUnnamed0` — record an unqualified dynamic export.
+/// `java.lang.Module.addExportsToAll0(Module from, String pkg)` — record an
+/// unqualified dynamic export (`exports pkg;`, reaching every module).
 fn native_module_add_exports_to_all0(
     ctx: &mut dyn NativeContext,
     args: &[Value],
+) -> MethodCallResult {
+    native_module_add_exports_to0(ctx, args, "")
+}
+
+/// `java.lang.Module.addExportsToAllUnnamed0(Module from, String pkg)` —
+/// record an export qualified to the unnamed module.
+///
+/// Not the same edge as `addExportsToAll0`, which is what this used to share.
+/// `ALL-UNNAMED` reaches unnamed modules only, and HotSpot reports it as a
+/// qualified export: `Module.isExported(pkg)` stays **false** afterwards.
+fn native_module_add_exports_to_all_unnamed0(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    native_module_add_exports_to0(ctx, args, ALL_UNNAMED_TARGET)
+}
+
+fn native_module_add_exports_to0(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+    target: &str,
 ) -> MethodCallResult {
     let from = match args.first() {
         Some(Value::Object(Some(o))) => *o,
@@ -1548,7 +1948,7 @@ fn native_module_add_exports_to_all0(
         _ => return Ok(None),
     };
     let from_name = module_registry_name(ctx, from);
-    ctx.module_add_exports(&from_name, &pkg.replace('.', "/"), "");
+    ctx.module_add_exports(&from_name, &pkg.replace('.', "/"), target);
     Ok(None)
 }
 
@@ -1633,7 +2033,7 @@ pub fn register_jboss_jdkspecific(registry: &mut NativeMethodRegistry) {
     // `register_jboss_jdkspecific` at ~:9578 and registers
     // `java/lang/Module.getResourceAsStream` again at ~:18208). Until that site
     // was pointed at this callback, the encapsulation check above was DEAD CODE
-    // and every module resource was served unconditionally — `RJdkModule.java:198`
+    // and every module resource was served unconditionally — `RJdkModule.java:208`
     // ("a resource in a non-open package must NOT be readable from another
     // module") failed in both jdk modes while the three permissive checks around
     // it passed. Keeping this row means the gate is installed even if the lib.rs
@@ -1695,18 +2095,28 @@ pub fn register_jboss_jdkspecific(registry: &mut NativeMethodRegistry) {
         native_module_add_exports_to_all0,
         NativeKind::Bridge,
     );
-    // Export to the unnamed module (`--add-exports …=ALL-UNNAMED`). The
-    // unnamed module's registry name is the empty string
-    // (`classloading::module::UNNAMED_MODULE`), which `add_exports` already
-    // reads as the unqualified form — so this deliberately shares the
-    // `addExportsToAll0` implementation. That is a widening (we grant to all
-    // modules rather than only unnamed ones); the alternative, dropping the
-    // edge entirely, produced spurious IllegalAccessErrors.
+    // Export to the unnamed module (`--add-exports …=ALL-UNNAMED`).
+    //
+    // This shared `addExportsToAll0`'s implementation until 2026-08-10, i.e. it
+    // recorded an UNQUALIFIED export: the unnamed module's registry name is the
+    // empty string (`classloading::module::UNNAMED_MODULE`) and `add_exports`
+    // read an empty target as "to all modules". That was a deliberate widening
+    // at the time, because the only alternative considered was dropping the
+    // edge entirely, which produced spurious IllegalAccessErrors.
+    //
+    // The choice stopped being binary when `ALL_UNNAMED_TARGET` landed (it was
+    // added for the `--add-exports`/`--add-opens` CLI path, which had the
+    // identical conflation and was caught diffing `Module.isOpen` against
+    // Temurin 25 — probes/AddOpensFlagProbe.java). It resolves to a QUALIFIED
+    // edge naming the unnamed module: classpath code still gets its grant, so
+    // the IllegalAccessError vector stays closed, while named modules stop
+    // receiving one and `Module.isExported(pkg)` keeps answering false the way
+    // HotSpot does.
     registry.register_with_kind(
         m,
         "addExportsToAllUnnamed0",
         "(Ljava/lang/Module;Ljava/lang/String;)V",
-        native_module_add_exports_to_all0,
+        native_module_add_exports_to_all_unnamed0,
         NativeKind::Bridge,
     );
     registry.register(

@@ -1,16 +1,31 @@
-# `native-collections/` — natives on inheritance-intercepting base classes
+# Natives on inheritance-intercepting collection base classes
 
-**Status: 🟡 PARTIALLY FIXED 2026-08-01.** One handed-over item was a **false
-premise** and is closed by reading (`AbstractSet.hashCode`). The other was
-real but not in the way it was described: the interception is load-bearing and
-must stay, and the defect was that only *one* of the natives behind it had the
-receiver-agnostic fallback the other five claimed in their own comments. The
-same trap was then found on the argument side of four bulk operations. Fixed
-with nine regression tests. Four residuals are left with a recipe each.
+**Status:** Shipped (default on, in the plain real-JDK build) — this is load-
+bearing behaviour, not a legacy path.
 
-Companion to `docs/known-issues/c2/native-builtins-shim-audit.md`, which handed
-over *Cross-crate 1* and *Cross-crate 2* to this crate. **Do not re-derive the
-dispatch mechanism** — it is established there and only summarised below.
+## What it does today
+
+`register_collections_natives` is called from **three** places in
+`vm/src/vm/vm_init.rs`: the synthetic arm, the real arm inside
+`#[cfg(feature = "synthetic-jdk")]`, **and** the
+`#[cfg(not(feature = "synthetic-jdk"))]` block — i.e. the default
+`cratonvm-cli` build. So `AbstractCollection.toArray` / `.contains`,
+`AbstractSet.hashCode`, the `SET_CLASSES` loop and the `java/lang/Object`
+collector functions are all live in default real-JDK mode. The only
+feature-gating inside `native-collections` is on internal helpers, not on the
+registrar.
+
+The correctness gate is separate from registration:
+`set_drop_real_layout_synthetic(true)` runs in the real arms *before*
+registration and removes specific families (StringJoiner, Cleaner,
+Pattern/Matcher, EnumSet, StringReader/Writer, the `Executors` pool factories,
+`java/lang/String` bridges).
+
+**The interception must stay.** The recurring defect in this area is not that
+a native intercepts an inherited call — it is that only *some* of the natives
+behind the interception carry the receiver-agnostic fallback their own
+comments claim, on the receiver side and on the argument side of bulk
+operations alike.
 
 ## The mechanism, in one paragraph
 
@@ -56,181 +71,6 @@ rg -n 'let c = "|for c in |const .*CLASSES' native-collections/src/lib.rs
 `java/util/AbstractList`, `AbstractSequentialList`, `AbstractQueue` and
 `AbstractMap` carry **no** registrations in this crate. That is now pinned by
 a test rather than by this sentence.
-
-## What the two handed-over items actually were
-
-### Handed-over 1 — `AbstractSet.hashCode`: premise WRONG, closed by reading
-
-The audit recorded it as "points at `native_hs_hash_code`, a HashSet-layout
-reader". It is not one, and has not been one since the HIB-CV-25 fix. Read
-`native_hs_hash_code` (`native-collections/src/lib.rs:10647`):
-
-* the HashSet-layout read is behind `hs_backing_map` (`:10214`), which is
-  itself behind `is_hashset_native_backed` (`:10199`) — an explicit
-  `cid == HashSet || is_subclass(cid, HashSet)` (plus `CopyOnWriteArraySet`)
-  test. A `TreeSet`, an `EnumSet` or a user `extends AbstractSet` never reaches
-  the layout read;
-* everything else goes to `collect_collection_elements_or_real` (`:32509`),
-  which falls back to the receiver's own `size()` + `toArray()`;
-* the result is `h.wrapping_add(element_hash_code(e))` over the elements, and
-  `element_hash_code` (`:5684`) dispatches the element's **virtual**
-  `hashCode()`. That is exactly `Set.hashCode`'s specified sum.
-
-The 15-line comment above the function already documents this history — it
-names the receiver that broke it (Weld's `ImmutableTinySet$Doubleton`, elements
-in `element1`/`element2` fields, no backing map) and the symptom (a `0` hash,
-so a `Map<Set<..>,..>` keyed by such a set was unfindable).
-
-**Would deleting it be safe, as the sibling lane's `AbstractMap` deletion was?
-No — and the reason is worth keeping.** That deletion was safe because
-`AbstractMap.equals`/`hashCode` fall through to `java/lang/Object`'s natives,
-which are correct *for identity*. `hashCode` also exists on `Object`, so the
-same fallthrough exists here mechanically — but its answer is **not** correct
-here: identity hashing a Set breaks the `Set.hashCode` contract (two equal sets
-must hash equally), which is precisely the defect the `AbstractMap` deletion was
-fixing. Deletion would be correct only in the real-JDK arm, where
-`AbstractSet.hashCode`'s own bytecode would run. Keeping a native that computes
-the contract answer in both arms is strictly better. **Left as-is.**
-
-### Handed-over 2 — `AbstractCollection.toArray`×2 / `contains`: interception is load-bearing, two of the three were wrong
-
-The in-situ comments (`:3232`–`:3234`, `:3241`–`:3245`) say the interception is
-deliberate, and they are right. What it compensates for:
-
-* `EnumSet.allOf(..).toArray()` resolves to `AbstractCollection.toArray()`,
-  whose real bytecode loops `iterator()` — and the `Iterable.iterator` native
-  only models ArrayList layout, so it would iterate zero elements;
-* `ArrayList.toArray(T[])`'s real bytecode calls
-  `Arrays.copyOf(elementData, size, a.getClass())`, which NPEs on a synthetic
-  ArrayList because `a.getClass()` returns a mirror without the
-  array-component-type metadata. Spring Boot's fat-jar
-  `Launcher.createClassLoader(Collection)` does `c.toArray(new URL[0])` and
-  depends on this.
-
-So refusing is not available: **`toArray` and `contains` do not exist on
-`java/lang/Object`**, so dropping the registrations would surface a
-`NoSuchMethodError` in the synthetic arm rather than fall through to a correct
-implementation. The `AbstractMap` shape does not transfer. The only option is
-to answer correctly for the receiver we actually have.
-
-The defect was that only one of them did. All three registrations funnel into
-element collection, and `collect_collection_elements` (`:32545`) **must not**
-drive `iterator()` — the `iterator()` native snapshots *through* it, so it
-would recurse; its closing comment (`:33096`) states this and that an
-unmodelled layout therefore "materialise[s] empty". Empty is indistinguishable
-from genuinely-empty, so the fallback has to live in the caller. It lived in
-exactly one caller:
-
-| native | before | after |
-| --- | --- | --- |
-| `native_al_to_array` (`:3949`) | heuristics + null-hole guard + real `size()`/`iterator()` fallback, all inlined | unchanged behaviour, logic moved to the shared helper |
-| `native_al_to_array_typed` (`:4146`) | **heuristics only** | fallback |
-| `native_collection_to_array_generator` (`:4196`) | **heuristics only** | fallback |
-| `native_al_for_each` (`:13301`) | **heuristics only** | fallback |
-| `native_al_stream` (`:17505`) | **heuristics only** | fallback |
-| `native_al_contains` (`:3826`, non-list branch) | **heuristics only** | fallback |
-
-The four middle rows' own doc comments already claimed the fallback
-("*whose iterator fallback materialises everything else through the real
-`iterator()`*") — they were describing `native_al_to_array`'s inlined copy of
-it, not what they did. That is what made this survive: the code read as if it
-were already handled.
-
-**Who this actually hurt.** `AbstractCollection`'s documented minimal subclass
-contract is "implement `iterator()` and `size()`" — a subclass need expose no
-readable element storage at all, which is the exact shape
-`collect_collection_elements` cannot decode. For such a receiver, before this
-change:
-
-* `coll.toArray(new T[0])` returned a **zero-length array**;
-* `coll.contains(x)` returned **`false` for every `x`**, including present ones;
-* `coll.forEach(a)` visited **nothing**;
-* `coll.stream()` was **empty**;
-
-while `coll.toArray()` on the very same object returned the right elements.
-None of these fail loudly. `collect_collection_elements` has accumulated ~15
-hand-written per-class special cases (Kafka `ImplicitLinkedHashCollection`,
-Jetty `BlockingArrayQueue`, Hibernate `org.hibernate.collection.*`, Kotlin
-`ArrayAsCollection`, `RegularEnumSet`, `PriorityQueue`, `ArrayDeque`, MSC's
-`IdentityHashSet` …) — each one is a bug report from this family that was fixed
-by naming the class rather than by fixing the fallback.
-
-## What changed
-
-All in `native-collections/src/lib.rs`.
-
-1. **`al_or_collection_elements` (`:4113`) is now the layout-agnostic reader.**
-   It was a one-line alias for `collect_collection_elements`. It now runs the
-   sequence `native_al_to_array` used to inline: heuristic snapshot → if it
-   looks suspect (null holes in a non-`List`, `heuristic_snapshot_is_suspect`)
-   prefer a re-entrancy-guarded real-iterator walk → if the heuristics found
-   nothing, ask the receiver's own `size()` and only then walk its real
-   `iterator()`. The receiver is pinned across the virtual calls.
-   *Ordering is copied verbatim so the zero-arg `toArray()` path keeps its
-   exact behaviour, including its use of the unguarded
-   `collect_via_real_iterator` on the empty branch and the guarded
-   `collect_via_real_iterator_once` on the suspect branch.*
-2. **`native_al_to_array` (`:3949`) now calls that helper** instead of carrying
-   its own copy — so the five other natives intercepting the same receivers
-   inherit the fallback.
-3. **`native_al_contains` (`:3826`)** uses the helper on its non-list branch.
-4. Three stale doc comments corrected (`native_al_for_each`, `native_al_stream`,
-   `al_or_collection_elements`), each now saying when the claim became true.
-5. **The `java/lang/Object` collector-bridge comment (`:19464`)** claimed "the
-   callbacks still validate the receiver layout/tag". They do not — see
-   Residual 1. The comment now says so.
-6. **The same trap on the ARGUMENT side of four bulk operations.**
-   `collect_collection_elements_or_real` is the argument-side wrapper (it drives
-   the argument's `size()`/`toArray()`), and its own doc listed `removeAll` /
-   `retainAll` as callers — they were not. `native_al_remove_all`,
-   `native_al_retain_all`, `native_ll_add_all` and `native_ad_add_all` read
-   their argument through the bare heuristic reader, so a bulk op against an
-   unmodelled collection was a silent no-op that still returned `false`.
-   `retainAll` was worse than a no-op: an empty argument means "retain
-   nothing", i.e. it **cleared** the receiver. All four now use the wrapper;
-   `native_al_add_all` and the copy constructors already did. Its
-   recursion-safety paragraph is also corrected — `toArray()` now reaches
-   `al_or_collection_elements`, not `collect_collection_elements` directly, so
-   the deepest path gained one virtual call but still no cycle.
-
-**Recursion argument (why driving `iterator()` from these six is safe):** the
-`iterator()` native (`native_al_iterator`) snapshots through
-`collect_collection_elements`, which never drives `iterator()` and never calls
-`contains`/`toArray`/`forEach`/`stream`. So the deepest chain is
-`toArray → iterator() → native_al_iterator → collect_collection_elements`,
-which terminates. The suspect branch additionally uses the thread-local
-re-entrancy guard `collect_via_real_iterator_once`. `native_al_iterator`'s own
-call to `collect_collection_elements` (`:4368`) was deliberately **not**
-switched to the helper — that is the one call site where it would recurse.
-
-**Cost.** The fallback is behind an `is_empty()` check plus a `size()` probe, so
-a receiver whose layout is readable (every synthetic collection, every real
-`ArrayList`/`HashSet`/`TreeSet`/`LinkedList`/`ArrayDeque`/`PriorityQueue`) pays
-nothing and issues no virtual call. A genuinely empty foreign collection pays
-exactly one `size()` call. Both are pinned by test.
-
-### Tests
-
-`native-collections/tests/abstract_collection_interception.rs` (new, 9 tests).
-The fixture models the minimal `AbstractCollection` subclass: a zero-field
-receiver of an application class, with the JDK collection names interned first
-(the layout guards are *lenient* for names the class manager does not know, so
-a mock that never mentions `java/util/ArrayList` would let the foreign receiver
-through the ArrayList probe and stop testing anything).
-
-| test | what it pins |
-| --- | --- |
-| `to_array_typed_on_an_unmodelled_receiver_uses_its_real_iterator` | **fails before the fix** — the T[] overload returned a zero-length array |
-| `contains_on_an_unmodelled_receiver_finds_a_present_element` | **fails before the fix** — `contains` returned `false` |
-| `for_each_on_an_unmodelled_receiver_visits_every_element` | **fails before the fix** — `forEach` visited nothing |
-| `remove_all_reads_an_unmodelled_argument_collection` | **fails before the fix** — the argument-side gap; `removeAll` removed nothing and reported `false` |
-| `to_array_on_an_unmodelled_receiver_uses_its_real_iterator` | the zero-arg path, which already worked, is not regressed by the move |
-| `contains_on_an_unmodelled_receiver_still_rejects_an_absent_element` | negative control — "always true" would pass the positive test |
-| `an_empty_unmodelled_receiver_is_answered_from_size_alone` | the `size()` guard, by asserting the **absence** of the `iterator()` call; an empty result alone looks identical with or without the guard |
-| `a_readable_receiver_is_answered_from_its_layout_without_virtual_calls` | the fallback stays a fallback — a real ArrayList issues no `size()`/`iterator()` dispatch |
-| `abstract_collection_carries_exactly_the_three_audited_natives` | the census itself: the three `AbstractCollection` rows and the one `AbstractSet` row exist, `AbstractSet.equals` stays unregistered, and `AbstractList`/`AbstractSequentialList`/`AbstractQueue`/`AbstractMap` stay empty |
-
-Run: `cargo test -p cratonvm-native-collections --test abstract_collection_interception`.
 
 ## Residuals
 
@@ -306,25 +146,10 @@ O(2n) virtual dispatch. **Recipe:** pin the first snapshot's elements with
 `pin_value_slice` and re-read them through the pins after the allocation, the
 same shape `native_al_to_array` already uses, instead of re-collecting.
 
-## Cross-file changes this lane needed and could not make
-
-None. Everything in *What changed* is inside `native-collections/`.
-
-One observation for whoever owns the gate: `native-builtins`' new
-`shim_inheritance_guard.rs` test
-(`the_java_util_abstract_collection_bases_carry_no_natives_at_all`) asserts that
-`AbstractList`/`AbstractSet`/`AbstractCollection`/`AbstractSequentialList`/
-`AbstractQueue` carry **no** registrations — but it is scoped to the
-`native-builtins` registry only, and the statement is **false for the merged
-registry the VM actually builds**: `native-collections` puts four natives on
-two of those five names, all four intentional. If that gate is ever widened to
-the full registry it must gain those four rows, with this document as the
-reason. The equivalent assertion for this crate now lives in
-`abstract_collection_interception.rs`.
-
 ## Related
 
-* `docs/known-issues/c2/native-builtins-shim-audit.md` — the mechanism, and the
-  hand-over of *Cross-crate 1* / *Cross-crate 2* that this document answers.
+* `native-builtins/tests/shim_inheritance_guard.rs` — the executable inventory
+  of which shims exist and which base classes they intercept. The gate, not a
+  document, is the live list.
 * `docs/synthetic-vs-real-explained.md` — why a synthetic stub can win over a
   real JDK class.

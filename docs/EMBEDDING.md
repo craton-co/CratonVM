@@ -458,7 +458,7 @@ This is an evolving surface. Be aware of the following:
 
 ## GPU offload for embedders
 
-CratonVM's opt-in automatic GPU offload (`--gpu`, validated on real hardware 2026-07-11 — see
+CratonVM's opt-in automatic GPU offload (`--gpu`, validated on real hardware — see
 [`docs/gpu/README.md`](gpu/README.md) and [`ROADMAP.md`](../ROADMAP.md#gpu-offload)) is a
 `VmConfig` field + Cargo-feature surface today, not a `cratonvm_*` C API or JNI surface. What
 that means per embedding path:

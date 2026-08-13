@@ -33,14 +33,17 @@ set -uo pipefail
 export MSYS2_ARG_CONV_EXCL='*'
 export MSYS_NO_PATHCONV=1
 
-# --- locations (Windows-form paths: the VM and JVM need native paths) --------
-HERE="C:/craton/CratonVM/apps/hib-suite-runner"
+# --- locations ----------------------------------------------------------------
+# $HERE resolves to wherever THIS script actually lives, not a hardcoded
+# checkout path -- so a worktree with its own generated fixture data
+# ($COMMON, the test lists, the compiled runner -- none of them tracked in
+# git) is fully self-contained, while a copy of the script that still sits
+# next to the original fixture data keeps resolving there exactly as before.
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && { pwd -W 2>/dev/null || pwd; })"
 COMMON="$HERE/common.args"          # -cp + sysprops + junit timeout
 RUNNER_CLASS="CratonRunner"         # compiled in $HERE, already on the classpath
-# The fixture data ($COMMON, the test lists, the compiled runner) only ever
-# exists in the main checkout, hence the hardcoded $HERE. The override table is
-# different: it is tracked, so it also exists next to whichever copy of this
-# script is being executed. Prefer that one, fall back to $HERE.
+# The override table below is tracked, so it exists next to whichever copy of
+# this script is being executed -- same $SELF_DIR-vs-$HERE fallback shape.
 SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)"
 OVERRIDES="${HIB_CLASS_OVERRIDES:-}"
 if [ -z "$OVERRIDES" ]; then
@@ -52,6 +55,13 @@ BENIGN_ABORTS="${HIB_KNOWN_BENIGN_ABORTS:-}"
 if [ -z "$BENIGN_ABORTS" ]; then
   if [ -f "$SELF_DIR/known-benign-aborts.tsv" ]; then BENIGN_ABORTS="$SELF_DIR/known-benign-aborts.tsv"
   else BENIGN_ABORTS="$HERE/known-benign-aborts.tsv"; fi
+fi
+# ...and for the required-sysprops table, which exists because $COMMON itself is
+# generated and untracked and so can silently lose a load-bearing -D.
+REQ_SYSPROPS="${HIB_REQUIRED_SYSPROPS:-}"
+if [ -z "$REQ_SYSPROPS" ]; then
+  if [ -f "$SELF_DIR/required-sysprops.tsv" ]; then REQ_SYSPROPS="$SELF_DIR/required-sysprops.tsv"
+  else REQ_SYSPROPS="$HERE/required-sysprops.tsv"; fi
 fi
 
 # --- JDK autodetect ----------------------------------------------------------
@@ -66,7 +76,7 @@ detect_jdk() {
            "C:/Program Files/Java"/jdk-25* \
            "C:/Program Files/Eclipse Adoptium"/jdk-2* \
            "C:/Program Files/Java"/jdk-2*; do
-    [ -x "$c/bin/java.exe" ] && { printf '%s' "$c"; return 0; }
+    [ -x "$c/bin/java.exe" ] && { printf "%s" "$c"; return 0; }; [ -x "$c/bin/java" ] && { printf "%s" "$c"; return 0; }
   done
   return 1
 }
@@ -105,6 +115,7 @@ OPTIONS:
   --timeout <SEC>              per-class hang timeout (default: 300); per-class
                                overrides raise this as a floor, never lower it
   --no-overrides               ignore class-overrides.tsv entirely (A/B checks)
+  --no-sysprops                do not inject required-sysprops.tsv entries (A/B checks)
   --shards <N>                 parallel forks per mode (default: 6)
   --bin <path>                 cratonvm.exe (default: $CV_BIN env or hibtest release)
   --out <dir>                  output root (default: ./runs)
@@ -114,6 +125,8 @@ SUB-COMMANDS:
   run-hib.sh categorize        rebuild passed.txt / others.txt from a full run
   run-hib.sh overrides         print the loaded per-class override table and exit
   run-hib.sh benign-aborts     print the loaded known-benign-aborts table and exit
+  run-hib.sh sysprops          print required-sysprops.tsv and which entries this
+                               host's common.args is missing, then exit
 
 CATEGORIES (regenerate authoritatively with:  run-hib.sh categorize):
   passed.txt  / others.txt    in this folder
@@ -133,6 +146,13 @@ KNOWN-BENIGN ABORTS:
   its found/ok/aborted counts match the table EXACTLY, so a real regression
   on one of these classes still surfaces. Check it with
   `run-hib.sh benign-aborts`.
+
+REQUIRED SYSPROPS:
+  common.args is generated and untracked, so a -D the suite cannot run without
+  has no authoritative home and goes missing on a fresh host --
+  required-sysprops.tsv (tracked, next to this script) is that home. Any entry
+  the argfile does not already carry is injected ahead of it, and every run
+  prints `sysprops=N (M injected)`. Check it with `run-hib.sh sysprops`.
 
 ENV PASS-THROUGH:
   Any CRATONVM_* variable in your environment is inherited by the VM, e.g.
@@ -242,6 +262,59 @@ print_benign_aborts() {
   done
 }
 
+# --- required-sysprops table: -D lines $COMMON is not allowed to be missing ---
+# $COMMON is GENERATED and UNTRACKED (hand-built, or dumped by
+# cratonvm-dump.gradle -- which only ever emits a classpath, never sysprops), so
+# a sysprop the suite cannot run without has no authoritative home and is simply
+# absent on a fresh host. On 2026-08-11 that cost a whole 4579-class Azure Linux
+# run: FAIL=305 vs FAIL=4 on Windows, 246 of them one
+# `IllegalStateException: BytecodeEnhancedTestEngine is disabled` thrown by
+# Hibernate's own JUnit extension -- identical under real HotSpot, i.e. not a VM
+# bug at all. Inject every entry the argfile does not already carry, ahead of
+# the argfile, and SAY SO in the mode header rather than papering over it.
+declare -a INJECTED_SYSPROPS=()
+SYSPROPS_STATE="not loaded"
+USE_SYSPROPS="${USE_SYSPROPS:-1}"
+
+load_required_sysprops() {
+  INJECTED_SYSPROPS=()
+  if [ "$USE_SYSPROPS" != 1 ]; then SYSPROPS_STATE="disabled (--no-sysprops)"; return 0; fi
+  if [ ! -f "$REQ_SYSPROPS" ]; then
+    SYSPROPS_STATE="MISSING $REQ_SYSPROPS"
+    echo "WARNING: required-sysprops table not found: $REQ_SYSPROPS" >&2
+    echo "WARNING: if common.args is also missing one, whole test families fail for a config reason and look like VM bugs." >&2
+    return 0
+  fi
+  local key val _why total=0
+  while IFS=$'\t' read -r key val _why || [ -n "${key:-}" ]; do
+    key="${key%$'\r'}"; val="${val:-}"; val="${val%$'\r'}"
+    case "$key" in ''|\#*) continue;; esac
+    total=$((total+1))
+    # Already set in the argfile at ANY value? Leave it alone -- a deliberate
+    # local override must still win over this table.
+    if [ -f "$COMMON" ] && grep -q -- "-D$key=" "$COMMON" 2>/dev/null; then continue; fi
+    INJECTED_SYSPROPS+=("-D$key=$val")
+  done < "$REQ_SYSPROPS"
+  SYSPROPS_STATE="$total (${#INJECTED_SYSPROPS[@]} injected)"
+}
+
+print_required_sysprops() {
+  load_required_sysprops
+  echo "required-sysprops table: $REQ_SYSPROPS"
+  echo "argfile: $COMMON"
+  echo "state: $SYSPROPS_STATE"
+  local key val why
+  while IFS=$'\t' read -r key val why || [ -n "${key:-}" ]; do
+    key="${key%$'\r'}"; val="${val:-}"; val="${val%$'\r'}"; why="${why:-}"; why="${why%$'\r'}"
+    case "$key" in ''|\#*) continue;; esac
+    if [ -f "$COMMON" ] && grep -q -- "-D$key=" "$COMMON" 2>/dev/null; then
+      printf '  [in argfile] -D%s=%s\n' "$key" "$(grep -o -- "-D$key=[^ ]*" "$COMMON" | head -1 | cut -d= -f2-)"
+    else
+      printf '  [INJECTED  ] -D%s=%s\n      why: %s\n' "$key" "$val" "$why"
+    fi
+  done < "$REQ_SYSPROPS"
+}
+
 # --- categorize sub-command: (re)build passed.txt / others.txt ----------------
 if [ "${1:-}" = "categorize" ]; then
   echo "[categorize] running the full testlist once (JIT on, real JDK) to split passed/others ..."
@@ -253,12 +326,15 @@ fi
 # --- arg parse ---------------------------------------------------------------
 SHOW_OVERRIDES=0
 SHOW_BENIGN_ABORTS=0
+SHOW_SYSPROPS=0
 while [ $# -gt 0 ]; do
   case "$1" in
     categorize) shift;;
     overrides)  SHOW_OVERRIDES=1; shift;;
     benign-aborts) SHOW_BENIGN_ABORTS=1; shift;;
+    sysprops)   SHOW_SYSPROPS=1; shift;;
     --no-overrides) USE_OVERRIDES=0; shift;;
+    --no-sysprops)  USE_SYSPROPS=0; shift;;
     --category) CATEGORY="$2"; shift 2;;
     --count)    COUNT="$2"; shift 2;;
     --start)    START="$2"; shift 2;;
@@ -277,6 +353,7 @@ done
 load_overrides
 if [ "$SHOW_OVERRIDES" = 1 ]; then print_overrides; exit 0; fi
 if [ "$SHOW_BENIGN_ABORTS" = 1 ]; then print_benign_aborts; exit 0; fi
+if [ "$SHOW_SYSPROPS" = 1 ]; then print_required_sysprops; exit 0; fi
 
 # The forked VMs inherit this script's working directory, and Hibernate's own
 # test infrastructure resolves its JDBC URL through
@@ -295,7 +372,11 @@ cd "$HERE" || { echo "ERROR: cannot cd to fixture dir: $HERE" >&2; exit 1; }
 
 [ -f "$CV_BIN" ] || { echo "ERROR: cratonvm binary not found: $CV_BIN (set --bin or CV_BIN)" >&2; exit 1; }
 [ -f "$COMMON" ] || { echo "ERROR: common.args not found: $COMMON" >&2; exit 1; }
-[ -x "$JDK/bin/java.exe" ] || { echo "ERROR: real JDK not found: '${JDK:-<none detected>}' (set --jdk-home via JDK=... env)" >&2; exit 1; }
+load_required_sysprops
+if [ ${#INJECTED_SYSPROPS[@]} -gt 0 ]; then
+  echo "[sysprops] $COMMON is missing ${#INJECTED_SYSPROPS[@]} required -D; injecting: ${INJECTED_SYSPROPS[*]}" >&2
+fi
+[ -x "$JDK/bin/java.exe" ] || [ -x "$JDK/bin/java" ] || { echo "ERROR: real JDK not found: '${JDK:-<none detected>}' (set --jdk-home via JDK=... env)" >&2; exit 1; }
 mkdir -p "$OUTROOT"
 TS="$(date +%Y%m%d-%H%M%S)"
 
@@ -340,7 +421,24 @@ run_shard() {
         -Dcraton.batch=1 "$RUNNER_CLASS" "$cls" >"$tmp" 2>>"$RAW"; rc=$?
     cat "$tmp" >> "$RAW"
     local rline found ok failed aborted skipped ms status sig
-    rline=$(grep "^@@RESULT " "$tmp" | head -1)
+    # NOT anchored at line start, and matched against THIS class's name.
+    #
+    # `^@@RESULT ` was, and it silently converted a clean PASS into a CRASH.
+    # `CratonRunner` writes its result line to the same `System.out` the test
+    # bodies write to, and a test that ends with a newline-less write leaves the
+    # cursor mid-line: `bootstrap.scanning.JarVisitorTest` finishes with
+    # `System.out.printf("InputStream byte[] extraction algorithms; ...")` and
+    # no `%n`, so the run emits
+    #     InputStream byte[] extraction algorithms; old = `59`, new = `17`@@RESULT org.hibernate...
+    # The anchored grep found nothing, the row was recorded
+    # `CRASH ... process-died rc=0`, and a class that had just reported
+    # `found=9 ok=9 failed=0` was carried into a known-issues doc as a
+    # VM-vs-HotSpot divergence (2026-08-11 Azure Linux full suite). rc=0 with no
+    # result line is a PARSE failure far more often than a VM failure.
+    #
+    # Including `$cls` keeps `-o` from picking up a `@@RESULT`-looking string a
+    # test body printed for some other class.
+    rline=$(grep -o "@@RESULT $cls found=.*" "$tmp" | head -1)
     if [ -n "$rline" ]; then
       found=$(printf '%s' "$rline"|grep -o 'found=[0-9]*'|cut -d= -f2); ok=$(printf '%s' "$rline"|grep -o 'ok=[0-9]*'|cut -d= -f2)
       failed=$(printf '%s' "$rline"|grep -o 'failed=[0-9]*'|cut -d= -f2); aborted=$(printf '%s' "$rline"|grep -o 'aborted=[0-9]*'|cut -d= -f2)
@@ -373,8 +471,10 @@ run_mode() {
   VMFLAGS_BASE=(--java-home "$JDK" --Xmx "$CV_XMX")
   [ "$jit" = off ] && VMFLAGS_BASE+=(--nojit)
   [ "$jdk" = synthetic ] && VMFLAGS_BASE+=(--synthetic-jdk)
+  # Sysprops the argfile is missing go in ahead of it, same as a class override.
+  [ ${#INJECTED_SYSPROPS[@]} -gt 0 ] && VMFLAGS_BASE+=("${INJECTED_SYSPROPS[@]}")
   local n; n=$(grep -c '' "$SLICE")
-  echo "[$label] $n classes | jit=$jit jdk=$jdk shards=$SHARDS timeout=${TIMEOUT}s overrides=$OVERRIDES_STATE bin=$CV_BIN"
+  echo "[$label] $n classes | jit=$jit jdk=$jdk shards=$SHARDS timeout=${TIMEOUT}s overrides=$OVERRIDES_STATE sysprops=$SYSPROPS_STATE bin=$CV_BIN"
   local t0; t0=$(date +%s)
   local s pids=()
   for ((s=0; s<SHARDS; s++)); do awk -v n="$SHARDS" -v r="$s" 'NR%n==r' "$SLICE" > "$MODE/shard-$s.txt"; done
@@ -387,7 +487,7 @@ run_mode() {
   for ((s=0; s<SHARDS; s++)); do tail -n +2 "$MODE/shard-$s/results.tsv" 2>/dev/null; done >> "$MERGED"
   local rec; rec=$(( $(grep -c '' "$MERGED") - 1 ))
   {
-    echo "mode=$label jit=$jit jdk=$jdk classes=$n recorded=$rec wall_seconds=$secs ($((secs/60))m$((secs%60))s) overrides=$OVERRIDES_STATE"
+    echo "mode=$label jit=$jit jdk=$jdk classes=$n recorded=$rec wall_seconds=$secs ($((secs/60))m$((secs%60))s) overrides=$OVERRIDES_STATE sysprops=$SYSPROPS_STATE"
     awk -F'\t' 'NR>1{c[$3]++; tms+=$9} END{printf "status:"; for(k in c) printf " %s=%d",k,c[k]; printf "  sum_class_ms=%d\n",tms}' "$MERGED"
   } | tee "$MODE/SUMMARY.txt"
 }

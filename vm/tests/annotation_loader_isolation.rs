@@ -14,7 +14,7 @@
 //! `TypeNotPresentExceptionProxy`).
 //!
 //! The probe (`tests/resources/annprobe/AnnProbe.java`) prints
-//! `SUMMARY: S1=PASS S2=PASS S3=PASS S4=PASS` when:
+//! `SUMMARY: S1=PASS S2=PASS S3=PASS S4=PASS S5=PASS S6=PASS` when:
 //!   S1 the annotated class is loaded by the filtering loader,
 //!   S2 `getAnnotations()` does not throw,
 //!   S3 `value()` throws `TypeNotPresentException` with a `ClassNotFoundException` cause,
@@ -22,7 +22,14 @@
 //!      (no false `TypeNotPresentException`),
 //!   S5 a *child-eligible* Class member resolves through the declaring class's
 //!      loader, so `value().getClassLoader()` is that loader
-//!      (mirrors `MergedAnnotationClassLoaderTests.synthesizedUsesCorrectClassLoader`).
+//!      (mirrors `MergedAnnotationClassLoaderTests.synthesizedUsesCorrectClassLoader`),
+//!   S6 the SAME member read from an APPLICATION-loaded holder still answers
+//!      with the application copy, even though S5 has left the child loader as
+//!      the only one that has ever defined that name. A loader-blind
+//!      "whoever has this name" fallback answers with the child's copy there —
+//!      which is how an application-world log4j `@PluginAttribute` was handed a
+//!      forked `PluginAttributeVisitor` and dropped every `<Logger>` element of
+//!      its configuration.
 //!
 //! Runs the real-JDK `cratonvm` binary (this is a real-JDK class-loading +
 //! reflection path). Skips gracefully when the binary, compiled probe classes,
@@ -145,7 +152,7 @@ fn annotation_class_member_honors_declaring_loader_type_not_present() {
         return;
     };
     assert!(
-        stdout.contains("SUMMARY: S1=PASS S2=PASS S3=PASS S4=PASS S5=PASS"),
+        stdout.contains("SUMMARY: S1=PASS S2=PASS S3=PASS S4=PASS S5=PASS S6=PASS"),
         "annotation classloader-isolation probe did not pass.\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
 }

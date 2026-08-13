@@ -2771,6 +2771,45 @@ pub(super) fn execute_instruction(
                 (et, total_depth, array_class_name[total_depth..].to_string())
             };
 
+            // JVMS §4.9.1 static constraint: `dimensions` must not exceed the
+            // number of leading `[` in the referenced array class.
+            //
+            // SECURITY (defense-in-depth, same policy as `execute_ldc`'s
+            // `ClassFormatError` conversion): the type-state verifier does
+            // enforce this (`verify_insn.rs`, `Instruction::Multianewarray`),
+            // but that pass does NOT run for every class. Pass 3 is deferred
+            // wholesale for any class defined by a user-defined loader while
+            // `loader_aware_resolution()` is on — which is the default, and
+            // covers every Spring / WildFly / H2 application class — and the
+            // structural-only substitute (`verifier::verify_method_structural`)
+            // never looks at this operand. `-Xverify:none` removes it too.
+            //
+            // Without this guard `total_array_depth - d - 1` below underflows:
+            // in a release build (overflow-checks off) it wraps to `usize::MAX`,
+            // and `"[".repeat(usize::MAX)` then asks the allocator for
+            // `usize::MAX` bytes, which aborts the process rather than raising
+            // anything Java can catch.
+            if sizes.len() > total_array_depth {
+                let (cls, mname) = {
+                    let f = &thread.frames[frame_idx];
+                    (f.class_name().to_string(), f.method_name().to_string())
+                };
+                return Err(crate::runtime::exceptions::throw_linkage_error(
+                    shared,
+                    thread,
+                    LinkageError::VerifyError {
+                        class_name: cls,
+                        method_name: mname,
+                        message: format!(
+                            "multianewarray: dimensions {} exceeds array bracket count {} \
+                             of type at cp#{index}",
+                            sizes.len(),
+                            total_array_depth
+                        ),
+                    },
+                ));
+            }
+
             // Resolve the *component* class id for each allocated array level so
             // the array objects carry their precise class (e.g. the outer level
             // of `new String[8][8]` is a `[[Ljava/lang/String;` whose component
@@ -3174,7 +3213,15 @@ pub(super) fn execute_instruction(
                             .read()
                             .get_class(actual_class_id)
                             .map(|c| c.name.to_string())
-                            .unwrap_or_else(|| "?".to_string());
+                            // A bare `?` here cost a whole triage round: it is
+                            // the only thing the message says about a receiver
+                            // whose class id resolves to nothing, and "?" is
+                            // consistent with a reclaimed header, a foreign
+                            // layout domain, and the synthetic auto-box wrapper
+                            // alike. The id tells those apart on the first
+                            // sighting (`AUTOBOX_CLASS_ID` is `u32::MAX`), so
+                            // name it rather than counting the question marks.
+                            .unwrap_or_else(|| format!("?class_id={actual_class_id}"));
                         // Spring's ConfigurationClassParser reaches this cast
                         // only after requesting annotation attributes with
                         // `classValuesAsString=true`. Under its forked
@@ -3399,7 +3446,7 @@ pub(super) fn execute_instruction(
                         // reclaimed object usually surfaces as a failed CAST
                         // first, and that path reported nothing — so setting
                         // the flag and reproducing still produced silence. See
-                        // docs/gc/old-sweep-liveness.md section 7.
+                        // audits/old-sweep-liveness.md section 7.
                         // H2-CID0 follow-up (2026-08-01): the `ClassId(0)` gate
                         // below is too narrow. A block freed while still
                         // referenced only reads back as `java.lang.Object`
@@ -3897,13 +3944,14 @@ pub(super) fn execute_instruction(
             // acquire. If/when a paired `monitorexit` event is wired in, the
             // emission site must consult the snapshot itself — there's no
             // value in a dead pre-read here.
-            shared.threads.monitors.exit(obj_ref, thread.thread_id)?;
-            if !shared.threads.monitors.holds(obj_ref, thread.thread_id) {
-                shared
-                    .threads
-                    .thread_registry
-                    .remove_jmx_locked_monitor(thread.thread_id, obj_ref);
-            }
+            // Release + JMX retract as ONE call — see
+            // `vm_exec::monitor_exit_and_retract_jmx` for why the pairing is a
+            // function rather than a convention repeated at five sites.
+            crate::vm::vm_exec::monitor_exit_and_retract_jmx(
+                shared,
+                obj_ref,
+                thread.thread_id,
+            )?;
         }
 
         // -- Unsupported / deprecated --

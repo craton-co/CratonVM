@@ -1,7 +1,7 @@
 # Deoptimization metadata: what is emitted, what is proved, what is missing
 
 Scope: the P0 items *"Complete deoptimization metadata"* and *"Emit precise oop
-maps at every safepoint"* of `docs/feature-designs/c2/deep-research-vm-c2.md`.
+maps at every safepoint"* of the C2 review.
 
 Acceptance criteria under audit:
 
@@ -12,8 +12,13 @@ Acceptance criteria under audit:
 > objects and updates every reference.
 
 Neither is met today. This document records exactly which pieces exist, what
-`jit/src/deopt.rs` now proves before an artifact is installed, and the ordered
+`jit/src/deopt.rs` proves before an artifact is installed, and the ordered
 list of what is still missing.
+
+The standing rule over all of it: **if the metadata cannot describe a state
+exactly, refuse.** A deopt that reconstructs a *plausible* frame instead of the
+*correct* one produces a running program with silently wrong values, which is
+strictly worse than a bailout — a bailout only costs the optimizing tier.
 
 ---
 

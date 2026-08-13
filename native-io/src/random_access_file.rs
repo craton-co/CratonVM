@@ -265,6 +265,14 @@ fn native_open0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult
         None
     };
 
+    // HotSpot's `handleOpen` refuses a directory (EISDIR) for RAF exactly as it
+    // does for FileInputStream/FileOutputStream, so `new RandomAccessFile(dir,
+    // "r")` throws `FileNotFoundException: <path> (Is a directory)` there.
+    // Linux `open(2)` accepts a directory read-only, so the check has to be
+    // explicit — see `reject_directory_open` for why it is per-call-site and
+    // not in the fd table.
+    crate::reject_directory_open(&path_str)?;
+
     // Open through the global fd_table (a FileReadWrite entry) so the RAF and
     // any FileChannel from raf.getChannel() resolve the SAME fd. Any open
     // error surfaces as FileNotFoundException, matching open0's declared throws.
@@ -538,7 +546,7 @@ fn native_close0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
 // for it. (The earlier "8 of the 11" and the names `readBytes`, `length`,
 // `setLength` in this marker came from a static read of pre-JDK-19 spellings;
 // the census names the descriptors this crate actually registers.) Residuals:
-// docs/known-issues/jdk-only/l5-native-io-bridge-residuals.md
+// retired/l5-native-io-bridge-residuals-RETIRED-20260810.md
 pub fn register_random_access_file_natives(registry: &mut NativeMethodRegistry) {
     use cratonvm_native_api::NativeKind;
     let __prev_cat = registry.current_category();
@@ -580,7 +588,6 @@ pub fn register_random_access_file_natives(registry: &mut NativeMethodRegistry) 
     registry.register_with_kind(raf, "setLength0", "(J)V", native_setLength0, NativeKind::Bridge);
     // Not ACC_NATIVE — not declared by JDK 25's RandomAccessFile at all.
     // Left on the ambient category deliberately; see the marker above.
-    registry.register(raf, "close0", "()V", native_close0);
     registry.set_category(__prev_cat);
 }
 

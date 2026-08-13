@@ -1,22 +1,43 @@
 # Garbage Collection in CratonVM — architecture and current state
 
-*Last updated 2026-07-27. The historical four-wave G1/ZGC correctness
-audit is retained in
-the internal fixed-issue archive.*
-
-CratonVM ships three garbage-collector backends behind one dispatcher
+CratonVM has three garbage-collector backends behind one dispatcher
 (`gc/src/vm_heap.rs::VmHeap`). All are stop-the-world at the collection
 level; G1 additionally runs its marking phase concurrently. Selection is
 java-launcher-compatible:
 
 | Flag | Backend | One-liner |
 |---|---|---|
-| *(default)* | `GenerationalHeap` (`gc/src/gen_heap.rs`) | Semi-space young gen + free-list old gen with a concurrent old-gen mark-sweep cycle. Young collections are **moving by default**; each cycle diverts to the non-moving sweep only when its own root-coverage proof fails (see "Backend details" below). |
+| `-XX:+UseGenerationalGC` / `-XX:-UseZGC` | `GenerationalHeap` (`gc/src/gen_heap.rs`) | Semi-space young gen + free-list old gen with a concurrent old-gen mark-sweep cycle. Young collections are **moving by default**; each cycle diverts to the non-moving sweep only when its own root-coverage proof fails (see "Backend details" below). |
 | `-XX:+UseG1GC` | `G1Collector` (`gc/src/g1.rs`) | Region-based (1 MB regions, 2 MB above 4 GB heaps): young/mixed evacuation with remembered sets, SATB concurrent marking, humongous spans, region pinning. |
-| `-XX:+UseZGC` / `-XX:+UseZ` | `ZgcRealHeap` (`gc/src/zgc.rs`) | **Not a real ZGC**: a memory-backed, non-moving, whole-heap stop-the-world mark-sweep over one arena, with a hash-set allocation registry. No colored pointers, no load barriers, no concurrency, no compaction. The colored-pointer/`ZPage` code above it in `zgc.rs` (and `zgc_concurrent.rs`) is a metadata-only simulation with no production consumer. |
+| *(default)* / `-XX:+UseZGC` / `-XX:+UseZ` | `ZgcRealHeap` (`gc/src/zgc.rs`) | **Not a real ZGC**: a memory-backed, non-moving, whole-heap stop-the-world mark-sweep over one arena, with a hash-set allocation registry. No colored pointers, no load barriers, no concurrency, no compaction. The colored-pointer/`ZPage` code above it in `zgc.rs` (and `zgc_concurrent.rs`) is a metadata-only simulation with no production consumer. |
 
 Unrecognized `-XX:+Use*GC` selectors warn and fall back to Generational.
 Heap size comes from `-Xmx`/`-Xms` as usual.
+
+**ZGC became the DEFAULT on 2026-08-10**, and the `zgc` Cargo feature went
+default-ON with it (it gates the `GcAlgorithm::Zgc` variant, so the default
+cannot be `Zgc` without it). It is still **not a real ZGC** — everything the
+table says about it holds — and it was promoted on measured suite behaviour,
+not on maturity: on the 651-class Tomcat suite under all three backends on one
+commit, ZGC scored 604 PASS / 29 HANG / 0 CRASH in 247 min against
+Generational's 519 / 115 / 1 in 356 min, and 63 classes are non-PASS under
+Generational while passing under both other backends
+([record](known-issues/tomcat/gc-backend-3way-fullsuite-comparison-20260810.md)).
+
+Two consequences worth stating plainly:
+
+* **It costs heap.** No compaction means ~1.5x the generational footprint on
+  buffer-churning workloads — `ZipContentTests` OOMs at `-Xmx 2g` and passes
+  from 3g. Raise `-Xmx` before diagnosing a post-flip `OutOfMemoryError`.
+* **`-XX:+UseGenerationalGC` is the escape hatch**, in every build. A
+  `--no-default-features` build has no ZGC at all and defaults to Generational.
+
+The Spring Boot comparison (1860 PASS vs 1902, 49 HANG vs 18,
+record `fixed-suite-bugs/springboot/zgc-real-fullsuite-regression-RETIRED-20260808.md`)
+predates the two ZGC-only defects fixed on 2026-08-10 and has not been re-run;
+it is the measurement this flip still owes. The plan to make this a real,
+concurrent, generational, compacting ZGC is
+[`docs/feature-designs/zgc-production-implementation-plan.md`](feature-designs/zgc-production-implementation-plan.md).
 
 ## The VM ↔ GC protocol
 
@@ -27,7 +48,7 @@ each depositing a **root snapshot** first. Threads inside blocking
 natives are excluded from the arrival quota and covered by their
 deposited snapshot plus a wake-time fixup (`check_post_block_gc`).
 Threads stuck in compiled code that never polls are handled by the
-**cross-thread JIT takeover** (INT-3, all backends since 2026-07-11):
+**cross-thread JIT takeover** (INT-3, all backends):
 the initiator freezes them at OS level, conservatively scans their
 registers/stacks, publishes their un-retired TLAB tails as walker skip
 regions, and — under G1 — pins every region they can address so nothing
@@ -74,9 +95,8 @@ and also drives the G1 concurrent cycle forward.
 
 ## Current correctness state
 
-A systematic audit (2026-07-10/11: four parallel deep code reviews plus a
-deterministic differential probe kit diffed against HotSpot jdk25)
-found and fixed, in four merged waves: G1 humongous accounting/reclaim
+A systematic review, backed by a deterministic differential probe kit diffed
+against HotSpot JDK 25, found and fixed: G1 humongous accounting/reclaim
 (IHOP-blind humongous, decay-to-zero IHOP, last-ditch full cycle before
 OOM), TLAB gap-sentinel desync in every G1 region walker, initiator-only
 JIT pinning, SATB holes (statics side-table, thread-exit buffer loss,
@@ -88,11 +108,36 @@ liveness-unknown regions, kept-region coherence after evacuation
 failure, a Generational remark→sweep TAMS window, and the cross-thread
 JIT takeover for G1/ZGC (INT-3) including concurrent-mark pauses.
 
-**Verified invariants** (probe kit, re-run on the current tip): all of
+**Verified invariants** (probe kit): all of
 ChurnCheck / HumongousCheck / CopyChurn / MTChurn / RefCheck /
 RefCheckOld / SpinPoll / SpinPollMark produce HotSpot-identical output on
 Generational, G1 and ZGC at `-Xmx256m`; the gc crate's unit+integration
 suites are green.
+
+**Standing invariants the collectors are checked against.** These are asserted
+in `gc/`, not just documented:
+
+- The published TLAB skip-offset list is sorted, coalesced and disjoint. Two
+  partially overlapping spans would make the sweep walk resync twice and
+  silently skip every object between them.
+- A TLAB's published reserved tail starts 8-byte aligned. A non-aligned start
+  is rounded up (the fail-safe direction) rather than dropped.
+- A moving young collection **refuses to run** while a non-empty clipped tail
+  set is published: the cycle over-retains, spills to old gen and retries,
+  instead of relocating over a TLAB some mutator left un-retired.
+- `OldGen::free` returns exactly the extent `alloc` reserved. An unrounded
+  return would leave a remainder off the free list, and `walk_objects` derives
+  allocated extents from the gaps *between* free blocks, so the walk would
+  resume at a non-object-start and abandon the rest of the region.
+- The old-gen in-place sweep runs a live-set closure before its free loop, so
+  an unmarked block still referenced by a marked old-gen object is retained
+  transitively rather than handed back.
+- A conservative root that lands in a field or a mid-object spill is resolved
+  to the object that contains it. Both plausibility screens are exact-base
+  tests, so an interior root would otherwise mark nothing and let the sweep
+  free a live block under it. The compacting arm cannot honour an interior
+  root — a slid object leaves it dangling — and is downgraded to the in-place
+  sweep for that cycle.
 
 **Current limitations:**
 
@@ -163,10 +208,8 @@ is honoured, or if `System.gc()` requested a full cycle. A JIT-warm
 workload may legitimately spend most cycles non-moving — but that is a
 *measured* fallback rate, not a rule, and the running process states its
 own answer through `gc_metrics::collector_decision_report()`. (The older
-"any JIT frame ⇒ non-moving" rule was the pre-2026-07-26 behaviour and is
-reachable today only under `CRATONVM_NO_MOVING_YOUNG` or
-`CRATONVM_MOVING_YOUNG_NO_JIT=1`; the evidence is in
-[the TLAB/card audit §3.2](gc/tlab-and-card-audit.md).) That default young
+"any JIT frame ⇒ non-moving" rule is reachable today only under
+`CRATONVM_NO_MOVING_YOUNG` or `CRATONVM_MOVING_YOUNG_NO_JIT=1`.) That default young
 collection is PARALLEL in two phases. The transitive closure is drained
 by several workers over a lock-free mark bitmap (one bit per 8 bytes of
 from-space) — sound because the phase is pure and read-only on a frozen
@@ -187,8 +230,7 @@ attempt. This replaced a full-arena exact-base oracle walk costing ~240
 ms and 2 GiB walked per collection; the same grid, subsampled at
 `CRATONVM_GC_SWEEP_ANCHOR_STRIDE`, now costs ~0 ms and 4.7 MB walked,
 and the conservative-candidate oracle traverses only those anchor
-intervals that actually contain a candidate. The 2026-07-18
-truncated-oracle fail-safe survives as `verified_spans`: an interval
+intervals that actually contain a candidate. The truncated-oracle fail-safe survives as `verified_spans`: an interval
 counts as proved only if its chain lands EXACTLY on the next anchor, an
 unproved interval has its ranges discarded rather than trusted, and a
 candidate outside every proved span falls back to direct validation. Each chunk
@@ -234,8 +276,15 @@ Allocation failure escalates: young pause → synchronous full mark cycle
 registry of allocation bases. `needs_gc` triggers at 75 % occupancy with
 a post-sweep re-arm so a large live set cannot storm. The sweep prunes
 dead bases in place and feeds the exact dead list to the monitor
-registry. Non-moving ⇒ the pointer map is always empty and no barriers
-are needed; reference semantics come entirely from the VM-level
+registry. Non-moving ⇒ the pointer map is always empty (`zgc.rs:2464`) and
+no barriers are needed; reference semantics come entirely from the VM-level
 protocol. Mutators have no TLABs on this backend (every allocation takes
-the arena lock) — it is a correctness-first reference backend, not a
-throughput one.
+the arena lock, `vm_heap.rs:2114`) — it is a correctness-first reference
+backend, not a throughput one.
+
+The always-empty pointer map and the neutral `VmHeap::Zgc` arms that go
+with it are correct *only* while the collector is non-moving, and they fail
+silently rather than loudly if it ever moves an object. That is tracked as
+Phase 4 of
+[`docs/feature-designs/zgc-production-implementation-plan.md`](feature-designs/zgc-production-implementation-plan.md),
+which must land before any compaction does.

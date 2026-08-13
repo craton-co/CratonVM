@@ -145,6 +145,10 @@ pub fn compile(
         Vec::new(),
         Vec::new(),
         ldc2w_info,
+        // ldc_fp_pcs: with no constant pool there is no tag to carry, and the
+        // empty set makes `stack_kinds` keep answering `Unknown` for these
+        // sites — the pre-existing behaviour for a caller that resolved nothing.
+        FxHashSet::default(),
         branch_hints,
         loop_unroll_hints,
         helpers,
@@ -162,6 +166,9 @@ pub fn compile(
         PENDING_COMPACT_FIELD_INFO.with(|c| std::mem::take(&mut *c.borrow_mut())),
         "",         // method_key: legacy/test wrapper disables the per-bci de-spec consult
         Vec::new(), // indy_info: legacy/test wrapper passes no invokedynamic sites
+        // elidable_init_pcs: no constant pool here, so nothing is PROVEN empty
+        // and nothing may be elided. See the parameter's doc.
+        None,
     )
 }
 
@@ -319,6 +326,10 @@ pub fn compile_with_param_slots(
     // `ldc_string_info`.
     ldc_class_info: Vec<(usize, u32, u16)>,
     ldc2w_info: Vec<(usize, i64)>,
+    // The floating-point half of the `ldc`-family constant-pool tags — see
+    // `Compiler::ldc_fp_pcs`. Only the deopt operand-stack snapshot reads it;
+    // codegen still types these constants by their consuming opcode.
+    ldc_fp_pcs: FxHashSet<usize>,
     branch_hints: HashMap<usize, bool>,
     loop_unroll_hints: HashMap<usize, usize>,
     helpers: &JitRuntimeHelpers,
@@ -369,6 +380,30 @@ pub fn compile_with_param_slots(
     // test wrapper (which also passes no `indy_ops` to `jit_scan` callers, so
     // this is always consistent with an invokedynamic-free method there).
     indy_info: Vec<(usize, usize, u8, Vec<u8>, usize)>,
+    // Bytecode pcs of `invokespecial` sites whose target constructor the CALLER
+    // has PROVEN empty (`jit_bridge::is_elidable_construction` — a 5-byte
+    // `aload_0; invokespecial Object.<init>()V; return` body), reached here from
+    // `try_compile_inner`'s `cp_elidable_init_resolver`.
+    //
+    // This is the ONLY thing that may license eliding an `<init>`. It used to be
+    // re-derived from the descriptor (`method_name == "<init>" && descriptor ==
+    // "()V"`), which is a check on the SIGNATURE and says nothing about the
+    // body: every no-arg constructor passed, so a receiver whose constructor
+    // wrote global state was marked non-escaping, scalar-replaced, and its
+    // `<init>` call dropped together with the write. `EA.java` in the bug doc
+    // measures it — 1,000,000 `new` whose ctor does `++someStaticInt` left the
+    // counter at 0 with the JIT on and at 1,000,000 with `--nojit`.
+    //
+    // `None` means the caller proved nothing and NOTHING may be elided. That is
+    // the safe direction and the one the IR backend already reasons in
+    // ("Calling an `<init>` runs every side effect the elision path was allowed
+    // to skip"). The legacy/test `compile()` wrapper and the unroll fixture pass
+    // `None`; they have no constant pool to resolve against.
+    //
+    // Pcs are the ORIGINAL (pre-unroll) ones. A loop-unroll copy carries shifted
+    // pcs that are absent from this set, so copies simply keep their `<init>`
+    // calls — an optimisation left on the table, never a miscompile.
+    elidable_init_pcs: Option<std::collections::HashSet<usize>>,
 ) -> Option<CompiledMethod> {
     // The drift witness for `compile_gate`. Every production door must hold an
     // admission token when it gets here; this counts the entries that do not,
@@ -1213,12 +1248,19 @@ pub fn compile_with_param_slots(
             // are kept live by the caller for the whole compilation.
             let info = unsafe { &*info_ptr };
             if info.invoke_kind == 1 {
+                // The descriptor is NOT evidence of an empty body — see
+                // `elidable_init_pcs`. Only a pc the caller's resolver proved
+                // may be treated as a no-op here; everything else falls into
+                // `analyze_escapes`'s arg-bearing arm, which escapes the
+                // receiver and so keeps both the allocation and the call.
+                let proven_empty_init = elidable_init_pcs
+                    .as_ref()
+                    .is_some_and(|pcs| pcs.contains(&ipc));
                 invokespecial_shapes.insert(
                     ipc,
                     InvokeSpecialShape {
                         arg_slots: info.num_jit_args,
-                        is_trivial_void_init: info.method_name == "<init>"
-                            && info.descriptor == "()V",
+                        is_trivial_void_init: proven_empty_init,
                     },
                 );
             }
@@ -1616,6 +1658,7 @@ pub fn compile_with_param_slots(
     compiler.ldc_string_info = ldc_string_info;
     compiler.ldc_class_info = ldc_class_info;
     compiler.ldc2w_info = ldc2w_info;
+    compiler.ldc_fp_pcs = ldc_fp_pcs;
     compiler.fp_hoist_info = fp_hoist_info;
     compiler.fp_strength_reduction_pcs = fp_strength_reduction_pcs;
     compiler.simd_fp_loops = simd_fp_loops;
@@ -1798,6 +1841,32 @@ pub fn compile_with_param_slots(
     // The emit hot path records the overflow instead of panicking — bail to
     // the interpreter here rather than returning a truncated, unsafe method.
     if compiler.buf.overflowed() {
+        // A named codegen invariant break is NOT a sizing problem, and the two
+        // used to be indistinguishable here: every `mark_overflowed` site — a
+        // `rel8` displacement out of range, a frame offset with no ModRM form,
+        // a deopt stub with no register-save area — landed in the branch below
+        // and was reported as "code buffer estimate too small". Two costs, both
+        // paid in production: the printed diagnostic named a cause that was not
+        // the cause (with `wanted` UNDER `capacity`, contradicting itself), and
+        // because the shortfall site is `try_compile`'s one bail-list exemption
+        // the method was re-lowered in full on EVERY warmup-gate re-attempt,
+        // failing identically each time and never becoming compiled.
+        //
+        // A bigger buffer cannot encode a displacement that has no encoding, so
+        // these are permanent: name the reason and fall through to the ordinary
+        // (bail-listed) refusal.
+        if let Some(reason) = compiler.buf.codegen_failure_reason() {
+            tracing::warn!(
+                method = method_key,
+                code_len = code_len,
+                capacity = compiler.buf.capacity(),
+                wanted = compiler.buf.wanted(),
+                reason = reason,
+                "JIT compile bailed: codegen invariant cannot be encoded; method stays interpreted"
+            );
+            crate::note_jit_bail_site(reason);
+            return None;
+        }
         // Name the method and the shortfall. A silent bail here is
         // indistinguishable from "the JIT chose not to compile this", which is
         // how a whole class of invoke-heavy methods came to stop being compiled
@@ -1823,7 +1892,15 @@ pub fn compile_with_param_slots(
         // so the first overflow retired the method for the life of the process
         // — the estimate got exactly one chance and a method that needed more
         // was never compiled again. `try_compile` now exempts this one site.
-        crate::note_code_buffer_shortfall(method_key, compiler.buf.wanted());
+        crate::note_code_buffer_shortfall(
+            method_key,
+            compiler.buf.wanted(),
+            // The capacity that FAILED, so the next hint is strictly larger than
+            // it. Without this the doubled `wanted` could land at or below the
+            // heuristic, `estimated_size.max(hint)` re-allocated the same size,
+            // and the retry was a bit-identical repeat — forever.
+            compiler.buf.capacity(),
+        );
         crate::note_jit_bail_site(crate::CODE_BUFFER_TOO_SMALL_SITE);
         return None;
     }
@@ -1909,6 +1986,8 @@ pub fn compile_with_param_slots(
         // the JIT_THREAD TLS and bails with the i64::MIN sentinel; the entry
         // path must set the TLS and drain the pending exception.
         || compiler.emitted_checkcast_throw
+        // A refused `aastore` stashes an ArrayStoreException the same way.
+        || compiler.emitted_aastore_throw
         // BUG-1 companion — a direct (non-dispatch) self-recursive CALL site:
         // its stack guard stashes a catchable StackOverflowError near native
         // exhaustion and returns the i64::MIN sentinel, so the method MUST be

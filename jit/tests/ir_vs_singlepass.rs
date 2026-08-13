@@ -214,6 +214,7 @@ fn cached(
         is_synchronized: false,
         is_static: true,
         force_native_cache: std::sync::OnceLock::new(),
+            intercept_shape_cache: std::sync::OnceLock::new(),
         native_callback_cache: std::sync::OnceLock::new(),
         invoc_key: std::sync::OnceLock::new(),
         jit_probe_generation: std::sync::atomic::AtomicU64::new(0),
@@ -643,7 +644,7 @@ fn ir_vs_singlepass_long_ldc2w_constant() {
 // ── cov-01: `ldc` / `ldc_w` (0x12 / 0x13) ────────────────────────────────
 //
 // `ldc` + `ldc_w` + `getstatic` was 189 of the 273 opcode-gap events measured
-// on 2026-08-03 (`docs/feature-designs/c2/ir-coverage-survey-20260803.md`) — 69%
+// on 2026-08-03 (`feature-designs/c2/ir-coverage-survey-20260803.md`) — 69%
 // of every opcode `IrBuilder::build` had no arm for. Increment 1 is the
 // IMMEDIATE case: an `int` or `float` constant the caller's `cp_ldc_resolver`
 // already reduced to bits.
@@ -5141,7 +5142,7 @@ fn ir_vs_singlepass_arraylength_null_faults() {
 // because `<clinit>` is a side effect the constant owes on first touch.
 //
 // `getstatic` alone was 92 of the 273 opcode-gap events measured on 2026-08-03
-// (`docs/feature-designs/c2/ir-coverage-survey-20260803.md`) — the largest single
+// (`feature-designs/c2/ir-coverage-survey-20260803.md`) — the largest single
 // opcode in the survey.
 
 /// `jit_ldc_string(vm, bytes, len)` stand-in. Returns a value derived from BOTH

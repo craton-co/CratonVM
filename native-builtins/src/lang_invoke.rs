@@ -16,7 +16,7 @@ use cratonvm_types::error::{
 use cratonvm_types::{ArrayElementType, ClassId, ObjectKind, ObjectRef, Value};
 
 use crate::lang_class::{box_value, mirror_class_id, mirror_class_name};
-use crate::{alloc_concurrent_synthetic, obj_arg};
+use crate::{try_alloc_concurrent_synthetic, obj_arg};
 
 // ---------------------------------------------------------------------------
 // Hoisted descriptor / class-name string constants
@@ -62,7 +62,7 @@ const NAME_INVOKE: &str = "invoke";
 /// argument shape at the call site: for an array-element access the layout is
 /// always `[vh, array_object, index, ...]`. When args[1] is an array object
 /// and args[2] is an Int, treat the call as array-element access.
-fn vh_array_call(ctx: &mut dyn NativeContext, args: &[Value]) -> Option<(ObjectRef, usize)> {
+fn vh_array_call(ctx: &mut dyn NativeContext, args: &[Value]) -> Option<(ObjectRef, i32)> {
     let arr = match args.get(1) {
         Some(Value::Object(Some(a))) => *a,
         _ => return None,
@@ -71,10 +71,54 @@ fn vh_array_call(ctx: &mut dyn NativeContext, args: &[Value]) -> Option<(ObjectR
         return None;
     }
     let idx = match args.get(2) {
-        Some(Value::Int(i)) => *i as usize,
+        Some(Value::Int(i)) => *i,
         _ => return None,
     };
     Some((arr, idx))
+}
+
+/// Range-check an array-element VarHandle coordinate, then narrow it to the
+/// `usize` the heap accessors take.
+///
+/// EVERY array-element VarHandle access funnels through [`vh_array_call`] and
+/// then through here, which is the point: the bounds check belongs on the
+/// funnel, not on the individual accessors, because there are eight of them
+/// (`get`/`set`/`compareAndSet`/`compareAndExchange`/`getAndSet`/`getAndAdd`/
+/// `getAndBitwise*`/the ordering variants) and a check added to seven of them
+/// is a silent hole in the eighth.
+///
+/// Why it has to be here at all: the heap DOES range-check
+/// (`GenerationalHeap::get_array_element` returns `Err(index)` past the
+/// length), but `vm_exec.rs`'s `NativeContext` impl swallows the result —
+/// `get_array_element` ends in `.unwrap_or(Value::Int(0))` and
+/// `set_array_element` in `let _ = ...`. So `va.get(arr, 7)` on a 3-element
+/// array answered `0` and `va.set(arr, 7, x)` dropped the write, both without
+/// a whisper. HotSpot throws for every access mode; measured on JDK 25:
+///
+/// ```text
+/// va.get(arr, 7)          ArrayIndexOutOfBoundsException: Index 7 out of bounds for length 3
+/// va.get(arr, -1)         ArrayIndexOutOfBoundsException: Index -1 out of bounds for length 3
+/// va.set/getAndSet/CAS/getAndAdd at 7 or -1 — same exception, same wording
+/// ```
+///
+/// `RuntimeError::aioobe` is the constructor that produces exactly that text
+/// (it is `Preconditions.checkIndex`'s, character for character), so the
+/// message a caller catches and prints matches HotSpot's.
+///
+/// The negative case is the one that mattered most: the old code did
+/// `*i as usize`, so `-1` became `usize::MAX` and only the heap's own
+/// `index >= array_length` test stopped it from being a wild read.
+/// regression-suite `RJdkHandles:263-269` asserts the throw.
+fn vh_array_index(
+    ctx: &dyn NativeContext,
+    arr: ObjectRef,
+    idx: i32,
+) -> Result<usize, MethodCallFailed> {
+    let len = ctx.array_length(arr);
+    if idx < 0 || (idx as usize) >= len {
+        return Err(RuntimeError::aioobe(idx, len as i32).into());
+    }
+    Ok(idx as usize)
 }
 
 /// Read the VH_FIELD_DESC string from a VarHandle object. Prefers the
@@ -130,6 +174,37 @@ const VH_FIELD_INDEX: usize = 4; // Int
 /// Cached ClassId of the declaring class
 const VH_CLASS_ID: usize = 5; // Int (ClassId raw)
 const VH_FIELD_COUNT: usize = 6;
+
+// --- SHARED SLOT MAP: read this before adding a slot ------------------------
+//
+// `java/lang/invoke/VarHandle` is written by TWO files, and the slot numbers
+// above are only half the map. `phases_late/reflect_invoke.rs`
+// (`register_p59_varhandle`, synthetic-JDK only) imposes its own 3-slot
+// meaning on 0-2 and used to put its two describe-yourself `Class` mirrors at
+// 4 and 5 — the SAME slots as `VH_FIELD_INDEX` / `VH_CLASS_ID` here, with
+// incompatible types (`Object(Class)` vs `Int`).
+//
+// That collision never corrupted anything, because every read on both sides
+// is a tag match (`Value::Object(Some(_))` there, `Value::Int(_)` here) and
+// the heap stores tagged 16-byte cells that the collector walks by tag — a
+// cross-write degrades an answer to "unknown", it does not produce a
+// mis-typed value or a scanned-as-oop integer. It was still a landmine: the
+// two writers were one changed guard away from meeting on one object.
+//
+// So the two describe-yourself slots now live HERE, past everything this file
+// uses, and `reflect_invoke.rs` imports them instead of declaring its own.
+// One block, one map, and a `usize` that cannot silently mean two things.
+/// Slot 6 (`reflect_invoke.rs` only): the `Class` mirror of the variable the
+/// handle accesses — exactly what `varType()` must return.
+pub(crate) const VH_META_VAR_TYPE: usize = 6; // Object(Class)
+/// Slot 7 (`reflect_invoke.rs` only): the `Class` mirror of the handle's
+/// LEADING coordinate; `null` for a static-field handle, which has none.
+pub(crate) const VH_META_COORD0: usize = 7; // Object(Class)
+/// Allocation size for a VarHandle that carries the two slots above.
+/// (`reflect_invoke.rs` re-publishes this as its `VH_META_NUM_FIELDS`; the
+/// name differs here only so the two do not collide in `lib.rs`, which
+/// glob-imports `lang_invoke::*`.)
+pub(crate) const VH_META_SLOT_COUNT: usize = 8;
 
 const VH_KIND_INSTANCE: i32 = 0;
 const VH_KIND_STATIC: i32 = 1;
@@ -369,6 +444,51 @@ fn split_descriptor_params(desc: &str) -> Option<(Vec<String>, String)> {
     Some((params, desc[i + 1..].to_string()))
 }
 
+/// The heap array kind an array whose COMPONENT descriptor is `comp` must have.
+///
+/// Anything that is not one of the eight primitive tokens — including `[…` and
+/// `L…;` — is a reference array, which is also the safe default for a token
+/// this function does not recognise.
+fn array_element_type_of_descriptor(comp: &str) -> cratonvm_types::ArrayElementType {
+    use cratonvm_types::ArrayElementType as A;
+    match comp {
+        DESC_BOOLEAN => A::Boolean,
+        DESC_BYTE => A::Byte,
+        DESC_CHAR => A::Char,
+        DESC_SHORT => A::Short,
+        DESC_INT => A::Int,
+        DESC_LONG => A::Long,
+        DESC_FLOAT => A::Float,
+        DESC_DOUBLE => A::Double,
+        _ => A::Reference,
+    }
+}
+
+/// Apply JLS 5.3 method-invocation widening to one argument that is about to be
+/// stored into a primitive array slot whose component descriptor is `comp`.
+///
+/// This exists because CratonVM's `MethodHandle.asType` is a passthrough shim.
+/// On HotSpot the widening a collector needs is done by the `asType` the
+/// combinator installs, so `asCollector(long[].class, 3).invoke(1, 2, 3)`
+/// reaches the target with three `long`s; here the raw `int`s arrive at the
+/// array store, and `write_prim_element`'s `Long` arm matches only
+/// `Value::Long` and writes 0 for anything else. Narrowing is deliberately NOT
+/// performed: `Z`/`B`/`C`/`S`/`I` all travel as `Value::Int` and
+/// `write_prim_element` already truncates on the store, and a `long` handed to
+/// an `int[]` collector is a type error the JDK refuses rather than silently
+/// truncates.
+fn widen_primitive_to_descriptor(v: Value, comp: &str) -> Value {
+    match (comp, v) {
+        (DESC_LONG, Value::Int(i)) => Value::Long(i as i64),
+        (DESC_FLOAT, Value::Int(i)) => Value::Float(i as f32),
+        (DESC_FLOAT, Value::Long(l)) => Value::Float(l as f32),
+        (DESC_DOUBLE, Value::Int(i)) => Value::Double(i as f64),
+        (DESC_DOUBLE, Value::Long(l)) => Value::Double(l as f64),
+        (DESC_DOUBLE, Value::Float(f)) => Value::Double(f as f64),
+        _ => v,
+    }
+}
+
 /// Read a MethodType object's effective JVM descriptor by converting its
 /// `ptypes` (Class[]) and `rtype` (Class) mirrors back to descriptor tokens.
 fn methodtype_to_descriptor(ctx: &mut dyn NativeContext, mt: ObjectRef) -> Option<String> {
@@ -572,10 +692,10 @@ pub fn register_phase54_method_handle(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let ret = obj_arg(args, 0)?;
             let params = args.get(1).copied().unwrap_or(Value::Object(None));
-            let obj = alloc_concurrent_synthetic(ctx, "java/lang/invoke/MethodType", 6);
+            let obj = try_alloc_concurrent_synthetic(ctx, "java/lang/invoke/MethodType", 6)?;
             ctx.set_field(obj, 0, Value::Object(Some(ret)));
             ctx.set_field(obj, 1, params);
-            populate_method_type_form(ctx, obj);
+            populate_method_type_form(ctx, obj)?;
             Ok(Some(Value::Object(Some(obj))))
         },
     );
@@ -585,13 +705,13 @@ pub fn register_phase54_method_handle(r: &mut NativeMethodRegistry) {
         "(Ljava/lang/Class;)Ljava/lang/invoke/MethodType;",
         |ctx, args| {
             let ret = obj_arg(args, 0)?;
-            let obj = alloc_concurrent_synthetic(ctx, "java/lang/invoke/MethodType", 6);
+            let obj = try_alloc_concurrent_synthetic(ctx, "java/lang/invoke/MethodType", 6)?;
             ctx.set_field(obj, 0, Value::Object(Some(ret)));
             // Empty params — allocate a 0-length Class[] so `parameterCount()`
             // and the form-builder both see a non-null array.
             let empty = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0);
             ctx.set_field(obj, 1, Value::Object(Some(empty)));
-            populate_method_type_form(ctx, obj);
+            populate_method_type_form(ctx, obj)?;
             Ok(Some(Value::Object(Some(obj))))
         },
     );
@@ -604,10 +724,10 @@ pub fn register_phase54_method_handle(r: &mut NativeMethodRegistry) {
             let param = obj_arg(args, 1)?;
             let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 1);
             ctx.set_array_element(arr, 0, Value::Object(Some(param)));
-            let obj = alloc_concurrent_synthetic(ctx, "java/lang/invoke/MethodType", 6);
+            let obj = try_alloc_concurrent_synthetic(ctx, "java/lang/invoke/MethodType", 6)?;
             ctx.set_field(obj, 0, Value::Object(Some(ret)));
             ctx.set_field(obj, 1, Value::Object(Some(arr)));
-            populate_method_type_form(ctx, obj);
+            populate_method_type_form(ctx, obj)?;
             Ok(Some(Value::Object(Some(obj))))
         },
     );
@@ -633,10 +753,10 @@ pub fn register_phase54_method_handle(r: &mut NativeMethodRegistry) {
                     ctx.set_array_element(arr, 1 + i, elem);
                 }
             }
-            let obj = alloc_concurrent_synthetic(ctx, "java/lang/invoke/MethodType", 6);
+            let obj = try_alloc_concurrent_synthetic(ctx, "java/lang/invoke/MethodType", 6)?;
             ctx.set_field(obj, 0, Value::Object(Some(ret)));
             ctx.set_field(obj, 1, Value::Object(Some(arr)));
-            populate_method_type_form(ctx, obj);
+            populate_method_type_form(ctx, obj)?;
             Ok(Some(Value::Object(Some(obj))))
         },
     );
@@ -703,17 +823,17 @@ pub fn register_phase54_method_handle(r: &mut NativeMethodRegistry) {
         // `int` / `java.lang.String` -> `int` / `String`, which is what
         // `Class.getSimpleName()` yields and what the JDK's own `toString`
         // uses. Nested classes render after the last `$`, matching it.
-        fn simple_name(ctx: &dyn cratonvm_native_api::NativeContext, mirror: Value) -> String {
+        fn simple_name(ctx: &dyn cratonvm_native_api::NativeContext, mirror: Value) -> Result<String, MethodCallFailed> {
             let Value::Object(Some(m)) = mirror else {
-                return "?".to_string();
+                return Ok("?".to_string());
             };
             match resolve_class_name_robust(ctx, m) {
                 Some(name) => {
                     let name = name.replace('/', ".");
                     let tail = name.rsplit(['.', '$']).next().unwrap_or(&name);
-                    tail.to_string()
+                    Ok(tail.to_string())
                 }
-                None => "?".to_string(),
+                None => Ok("?".to_string()),
             }
         }
 
@@ -730,11 +850,11 @@ pub fn register_phase54_method_handle(r: &mut NativeMethodRegistry) {
                 if i > 0 {
                     out.push(',');
                 }
-                out.push_str(&simple_name(ctx, ctx.get_array_element(arr, i)));
+                out.push_str(&simple_name(ctx, ctx.get_array_element(arr, i))?);
             }
         }
         out.push(')');
-        let ret = simple_name(ctx, rtype);
+        let ret = simple_name(ctx, rtype)?;
         let s = if !ptypes_ok || ret == "?" {
             // A field could not be read — do not invent a signature.
             ctx.create_string(&format!("MethodType({param_count} params)"))
@@ -844,14 +964,41 @@ pub fn register_phase54_method_handle(r: &mut NativeMethodRegistry) {
         "()Ljava/lang/invoke/MethodHandles$Lookup;",
         |ctx, _args| {
             let lookup =
-                alloc_concurrent_synthetic(ctx, "java/lang/invoke/MethodHandles$Lookup", 1);
+                try_alloc_concurrent_synthetic(ctx, "java/lang/invoke/MethodHandles$Lookup", 1)?;
             Ok(Some(Value::Object(Some(lookup))))
         },
     );
     r.register(mhs, "privateLookupIn", "(Ljava/lang/Class;Ljava/lang/invoke/MethodHandles$Lookup;)Ljava/lang/invoke/MethodHandles$Lookup;", |ctx, _args| {
-        let lookup = alloc_concurrent_synthetic(ctx, "java/lang/invoke/MethodHandles$Lookup", 1);
+        let lookup = try_alloc_concurrent_synthetic(ctx, "java/lang/invoke/MethodHandles$Lookup", 1)?;
         Ok(Some(Value::Object(Some(lookup))))
     });
+
+    // NOT REGISTERED HERE: `MethodHandles.arrayElementVarHandle`.
+    //
+    // It is registered in `phases_late/reflect_invoke.rs`'s
+    // `register_p59_varhandle`, which reaches the registry only through
+    // `register_synthetic_overrides` — synthetic-JDK mode only. The obvious
+    // move is to mirror it onto this (live in every mode) path so `--jdk-only`
+    // gets a side-table entry for array handles. Measurement says do NOT:
+    //
+    //  * The real JDK bytecode for this factory ALREADY runs correctly in
+    //    real-JDK mode and hands back a genuine `VarHandleInts$Array`.
+    //    `vm/tests/clinit_first_call_compile_order.rs` is the witness — its
+    //    probe does `arrayElementVarHandle(int[].class)`, `vh.set(arr,3,42)`,
+    //    `vh.get(arr,3)` under `--java-home <real jdk>` and asserts `42`.
+    //  * The accessors do not need the side table for the array case: every
+    //    one of them routes through [`vh_array_call`], which recognises the
+    //    access from the ARGUMENT SHAPE (`[vh, array, int]`) and never reads a
+    //    synthetic slot off the receiver.
+    //  * That same probe exists because `arrayElementVarHandle` is the cheapest
+    //    trigger for the `VarForm` -> `MethodType` -> `sun/invoke/util/Wrapper`
+    //    -> `ConstantDescs.<clinit>` chain. A native here short-circuits the
+    //    chain and the regression test goes green while covering nothing.
+    //
+    // So the real object stays, and the two things it was missing are supplied
+    // without replacing it: the bounds check lives on the `vh_array_call`
+    // funnel, and `varType()`/`coordinateTypes()` read the real handle's own
+    // identity in [`real_array_var_handle_descriptors`].
 
     // byteArrayViewVarHandle(<T>[].class, ByteOrder) — view a byte[] as a wider
     // primitive at a BYTE index. The real JDK VarHandle's get/set route through
@@ -887,7 +1034,7 @@ pub fn register_phase54_method_handle(r: &mut NativeMethodRegistry) {
                 },
                 _ => true,
             };
-            let vh = alloc_concurrent_synthetic(ctx, "java/lang/invoke/VarHandle", VH_FIELD_COUNT);
+            let vh = try_alloc_concurrent_synthetic(ctx, "java/lang/invoke/VarHandle", VH_FIELD_COUNT)?;
             vh_meta_put(
                 ctx,
                 vh,
@@ -935,7 +1082,7 @@ pub fn register_phase54_method_handle(r: &mut NativeMethodRegistry) {
                 },
                 _ => true,
             };
-            let vh = alloc_concurrent_synthetic(ctx, "java/lang/invoke/VarHandle", VH_FIELD_COUNT);
+            let vh = try_alloc_concurrent_synthetic(ctx, "java/lang/invoke/VarHandle", VH_FIELD_COUNT)?;
             vh_meta_put(
                 ctx,
                 vh,
@@ -1014,6 +1161,38 @@ pub fn register_phase54_method_handle(r: &mut NativeMethodRegistry) {
         "accessModeTypeUncached",
         "(Ljava/lang/invoke/VarHandle$AccessType;)Ljava/lang/invoke/MethodType;",
         varhandle_access_mode_type_uncached,
+    );
+
+    // VarHandle.varType() / coordinateTypes() — the describe-yourself pair.
+    //
+    // Both are CONCRETE bytecode in JDK 25, so they need the `check_override`
+    // entry in `vm/src/vm/vm_exec.rs` (`class_name ==
+    // "java/lang/invoke/VarHandle" && ("varType", "()Ljava/lang/Class;") |
+    // ("coordinateTypes", "()Ljava/util/List;")`) to be consulted at all. The
+    // real bodies cannot run here: both call `accessModeType`, which reads
+    // `this.vform` and walks a `VarForm`/`MethodType` chain — and a CratonVM
+    // VarHandle is `alloc_concurrent_synthetic("java/lang/invoke/VarHandle",
+    // VH_FIELD_COUNT)` with CratonVM's own meaning imposed on the slots, so
+    // slot 0 (`vform`) holds an `Int` kind tag. See RJdkHandles:244-245.
+    //
+    // REGISTERED HERE, not in `phases_late/reflect_invoke.rs`'s
+    // `register_p59_varhandle`, and that is the whole point: `p59` reaches the
+    // registry only through `register_phase59_natives` ->
+    // `register_synthetic_overrides`, which `vm_init.rs` calls ONLY under
+    // `config.use_synthetic_jdk`. In `--real-jdk`/`--jdk-only` the live
+    // VarHandle surface is this file's (`register_phase54_method_handle` plus
+    // `register_p63_method_handles_lookup`, both called from the real-JDK arm),
+    // so a `varType` registered over there is dead in exactly the mode the
+    // strict corpus runs. The answers come from the WP4.2 side table
+    // (`VarHandleMeta`), which `findVarHandle`/`findStaticVarHandle` already
+    // populate with the field descriptor and the declaring class name — no
+    // layout change needed.
+    r.register(vh, "varType", "()Ljava/lang/Class;", varhandle_var_type);
+    r.register(
+        vh,
+        "coordinateTypes",
+        "()Ljava/util/List;",
+        varhandle_coordinate_types,
     );
 
     // VarHandle.toMethodHandle(AccessMode) -> MethodHandle.
@@ -1275,15 +1454,22 @@ fn vh_has_synthetic_layout(ctx: &mut dyn NativeContext, vh: ObjectRef) -> bool {
 }
 
 /// Allocate a VarHandle for an instance field.
+/// `field_index` is `i32`, not `usize`, because `-1` is a MEANINGFUL value here:
+/// it is the "not resolved yet" sentinel that `varhandle_get`/`varhandle_set`
+/// branch on to re-resolve the field BY NAME (see their `field_idx >= 0` test).
+/// Both call sites used to launder a failed `resolve_field_index` through
+/// `.unwrap_or(0)`, which is not "unresolved" — it is slot 0, a real field — so
+/// the by-name fallback could never run and every access silently hit the
+/// receiver's first field instead.
 pub(crate) fn alloc_instance_var_handle(
     ctx: &mut dyn NativeContext,
     class_name: &str,
     field_name: &str,
     field_desc: &str,
-    field_index: usize,
+    field_index: i32,
     class_id: cratonvm_types::ClassId,
-) -> ObjectRef {
-    let vh = alloc_concurrent_synthetic(ctx, "java/lang/invoke/VarHandle", VH_FIELD_COUNT);
+) -> Result<ObjectRef, MethodCallFailed> {
+    let vh = try_alloc_concurrent_synthetic(ctx, "java/lang/invoke/VarHandle", VH_FIELD_COUNT)?;
     // Only on OUR layout — see `vh_has_synthetic_layout`. On a real
     // `VarHandle` these six writes null `vform` and corrupt `exact`.
     if vh_has_synthetic_layout(ctx, vh) {
@@ -1294,7 +1480,7 @@ pub(crate) fn alloc_instance_var_handle(
         ctx.set_field(vh, VH_FIELD, Value::Object(Some(fld_s)));
         let desc_s = ctx.create_string(field_desc);
         ctx.set_field(vh, VH_FIELD_DESC, Value::Object(Some(desc_s)));
-        ctx.set_field(vh, VH_FIELD_INDEX, Value::Int(field_index as i32));
+        ctx.set_field(vh, VH_FIELD_INDEX, Value::Int(field_index));
         ctx.set_field(vh, VH_CLASS_ID, Value::Int(class_id.as_u32() as i32));
     }
     // WP4.2: also stash in the side table so the descriptor-aware setter
@@ -1307,11 +1493,11 @@ pub(crate) fn alloc_instance_var_handle(
             class_name: class_name.to_string(),
             field_name: field_name.to_string(),
             field_desc: field_desc.to_string(),
-            field_index: field_index as i32,
+            field_index,
             class_id: class_id.as_u32(),
         },
     );
-    vh
+    Ok(vh)
 }
 
 /// Allocate a VarHandle for a static field.
@@ -1320,8 +1506,8 @@ pub(crate) fn alloc_static_var_handle(
     class_name: &str,
     field_name: &str,
     field_desc: &str,
-) -> ObjectRef {
-    let vh = alloc_concurrent_synthetic(ctx, "java/lang/invoke/VarHandle", VH_FIELD_COUNT);
+) -> Result<ObjectRef, MethodCallFailed> {
+    let vh = try_alloc_concurrent_synthetic(ctx, "java/lang/invoke/VarHandle", VH_FIELD_COUNT)?;
     // Only on OUR layout — see `vh_has_synthetic_layout`.
     if vh_has_synthetic_layout(ctx, vh) {
         ctx.set_field(vh, VH_KIND, Value::Int(VH_KIND_STATIC));
@@ -1347,7 +1533,7 @@ pub(crate) fn alloc_static_var_handle(
             class_id: 0,
         },
     );
-    vh
+    Ok(vh)
 }
 
 /// Resolve a STATIC VarHandle's storage slot: `(class_id, static-block index)`.
@@ -1597,6 +1783,192 @@ fn p67_memory_segment_varhandle_descriptor(
     None
 }
 
+/// What a CratonVM VarHandle addresses, as JVM descriptors: the variable type
+/// and the coordinate types, plus whether the coordinates are the REAL ones.
+///
+/// Derived from the WP4.2 side table, falling back to the synthetic slots. One
+/// function so `accessModeType` and `varType`/`coordinateTypes` can never
+/// disagree about what a handle points at.
+///
+/// `coords_exact == false` means a coordinate had to be erased to
+/// `java/lang/Object` because the metadata does not record the real class.
+/// `accessModeType` tolerates that — an erased `MethodType` still dispatches —
+/// but `coordinateTypes()` must NOT, because there its answer would be a
+/// fabricated `Class` presented as fact.
+///
+/// `VH_KIND_ARRAY` used to be the standing example: its producer
+/// (`MethodHandles.arrayElementVarHandle`) was registered only in
+/// `phases_late/reflect_invoke.rs`, which does not run in real-JDK mode, so an
+/// array handle reached here with no side-table entry and the leading
+/// coordinate had to be erased. That factory is now registered on the live
+/// path in this file and records the array class, so the erasure fires only
+/// for a handle CratonVM did not mint — where refusing is the right answer.
+/// Read a `Class`-typed field off a REAL JDK object and return its descriptor.
+///
+/// The `Object(Some(_))` match is what separates "the field is there and holds
+/// a mirror" from "this is not the class I thought it was".
+///
+/// **Corrected 2026-08-07.** This used to say `get_field_by_name` answers
+/// `Int(0)` for a field that does not exist. It does not. PRODUCTION
+/// (`vm/src/vm/vm_exec.rs::get_field_by_name`) resolves the name in the
+/// hierarchy and returns **`Value::Object(None)`** when it cannot — the
+/// `Int(0)` is `MockNativeContext`'s (`native-builtins/src/test_utils.rs`) and
+/// nobody else's; `native-api/src/test_mock.rs` agrees with production. The
+/// code here is right either way (both `Object(None)` and `Int(0)` fall to the
+/// `_` arm), but the reasoning was not, and the sharper hazard the old note
+/// hid is that an absent field is INDISTINGUISHABLE from a real null: a
+/// `matches!(…, Value::Object(_))` layout discriminator matches BOTH. Never
+/// write one.
+fn vh_real_class_field_desc(
+    ctx: &mut dyn NativeContext,
+    obj: ObjectRef,
+    field: &str,
+) -> Option<String> {
+    match ctx.get_field_by_name(obj, field) {
+        Value::Object(Some(mirror)) => Some(mirror_to_descriptor(ctx, mirror).into_owned()),
+        _ => None,
+    }
+}
+
+/// `(element descriptor, coordinate descriptors)` for a REAL-JDK array-element
+/// VarHandle — the object `MethodHandles.arrayElementVarHandle` hands back when
+/// its own bytecode runs, which is what happens in `--real-jdk`/`--jdk-only`
+/// (this file registers no native for that factory; see the note next to
+/// `byteArrayViewVarHandle`). `None` for anything else.
+///
+/// Such a handle carries no WP4.2 side-table entry, so without this the
+/// describe-yourself accessors refuse — and they are FORCED to run by the
+/// `check_override` entry in `vm/src/vm/vm_exec.rs`, which pins
+/// `VarHandle.varType`/`coordinateTypes` to the registry for every receiver.
+/// The refusal would therefore replace an answer the real bytecode could have
+/// given, which is a worse outcome than the gap it was written for.
+///
+/// The real object knows its own type; the only question is where. Measured on
+/// JDK 25, `MethodHandles.arrayElementVarHandle(T[].class).getClass()`:
+///
+/// ```text
+/// int[]      VarHandleInts$Array       varType int      coords [class [I, int]
+/// long[]     VarHandleLongs$Array      varType long     coords [class [J, int]
+/// byte[]     VarHandleBytes$Array      varType byte     coords [class [B, int]
+/// short[]    VarHandleShorts$Array     varType short    coords [class [S, int]
+/// char[]     VarHandleChars$Array      varType char     coords [class [C, int]
+/// float[]    VarHandleFloats$Array     varType float    coords [class [F, int]
+/// double[]   VarHandleDoubles$Array    varType double   coords [class [D, int]
+/// boolean[]  VarHandleBooleans$Array   varType boolean  coords [class [Z, int]
+/// String[]   VarHandleReferences$Array varType String   coords [class [Ljava.lang.String;, int]
+/// int[][]    VarHandleReferences$Array varType [I       coords [class [[I, int]
+/// ```
+///
+/// Two facts drive the shape. `varType()` is the COMPONENT type, not the array
+/// type; and there are TWO coordinates, `{arrayClass, int}`, where a field
+/// handle has one. The primitive families encode the element type in the class
+/// NAME and declare only `abase`/`ashift`; `References$Array` is the sole
+/// family that cannot, and it declares `arrayType`/`componentType` `Class`
+/// fields instead (`javap -p`) — which is why it is the one arm that reads
+/// fields rather than parsing a name.
+fn real_array_var_handle_descriptors(
+    ctx: &mut dyn NativeContext,
+    vh: ObjectRef,
+) -> Option<(String, Vec<String>)> {
+    let class_id = ctx.class_id_of_object(vh);
+    let name = ctx.class_name_of_id(class_id)?;
+    let family = name.strip_prefix("java/lang/invoke/VarHandle")?;
+    let elem = match family {
+        "Ints$Array" => DESC_INT,
+        "Longs$Array" => DESC_LONG,
+        "Bytes$Array" => DESC_BYTE,
+        "Shorts$Array" => DESC_SHORT,
+        "Chars$Array" => DESC_CHAR,
+        "Floats$Array" => DESC_FLOAT,
+        "Doubles$Array" => DESC_DOUBLE,
+        "Booleans$Array" => DESC_BOOLEAN,
+        "References$Array" => {
+            // Both halves or neither: a coordinate list without a variable
+            // type (or the reverse) would let one accessor answer while the
+            // other invents.
+            let array_desc = vh_real_class_field_desc(ctx, vh, "arrayType")?;
+            let component_desc = vh_real_class_field_desc(ctx, vh, "componentType")?;
+            return Some((component_desc, vec![array_desc, DESC_INT.to_string()]));
+        }
+        _ => return None,
+    };
+    Some((
+        elem.to_string(),
+        vec![format!("[{elem}"), DESC_INT.to_string()],
+    ))
+}
+
+fn vh_value_and_coordinate_descriptors(
+    ctx: &mut dyn NativeContext,
+    vh: ObjectRef,
+) -> (i32, String, Vec<String>, bool) {
+    let meta = vh_meta_get(ctx, vh);
+    // A real-JDK array handle has no side-table entry and its slots belong to
+    // the real class, so the fallbacks below would read `vform` as a kind tag.
+    // Ask the object what it is instead. Checked only when the side table has
+    // nothing: a handle CratonVM minted is described by the metadata CratonVM
+    // recorded for it.
+    if meta.is_none() {
+        if let Some((value_desc, coords)) = real_array_var_handle_descriptors(ctx, vh) {
+            return (VH_KIND_ARRAY, value_desc, coords, true);
+        }
+    }
+    let kind = meta
+        .as_deref()
+        .map(|m| m.kind)
+        .or_else(|| ctx.get_field(vh, VH_KIND).as_int())
+        .unwrap_or(VH_KIND_INSTANCE);
+    let value_desc = meta
+        .as_deref()
+        .map(|m| Cow::Owned(m.field_desc.clone()))
+        .unwrap_or_else(|| vh_field_desc(ctx, vh));
+    let mut coords_exact = true;
+    let coords = match kind {
+        VH_KIND_STATIC => Vec::new(),
+        VH_KIND_ARRAY => {
+            // `class_name` is the ARRAY class's internal name (`[I`,
+            // `[Ljava/lang/String;`), written by this file's
+            // `arrayElementVarHandle`. Absent it, the leading coordinate would
+            // be an erasure rather than the `int[]`/`String[]` the JDK
+            // reports, and `coords_exact` goes false so `coordinateTypes()`
+            // refuses instead of naming `Object`.
+            let arr = meta
+                .as_deref()
+                .map(|m| m.class_name.as_str())
+                .filter(|n| !n.is_empty())
+                .map(|n| class_name_to_descriptor(n).into_owned());
+            match arr {
+                Some(a) => vec![a, DESC_INT.to_string()],
+                None => {
+                    coords_exact = false;
+                    vec![DESC_OBJECT.to_string(), DESC_INT.to_string()]
+                }
+            }
+        }
+        VH_KIND_BYTE_VIEW_LE | VH_KIND_BYTE_VIEW_BE => {
+            vec!["[B".to_string(), DESC_INT.to_string()]
+        }
+        VH_KIND_BYTE_BUFFER_VIEW_LE | VH_KIND_BYTE_BUFFER_VIEW_BE => {
+            vec!["Ljava/nio/ByteBuffer;".to_string(), DESC_INT.to_string()]
+        }
+        _ => {
+            let receiver = meta
+                .as_deref()
+                .map(|m| m.class_name.as_str())
+                .filter(|n| !n.is_empty())
+                .map(|n| class_name_to_descriptor(n).into_owned());
+            match receiver {
+                Some(r) => vec![r],
+                None => {
+                    coords_exact = false;
+                    vec![DESC_OBJECT.to_string()]
+                }
+            }
+        }
+    };
+    (kind, value_desc.into_owned(), coords, coords_exact)
+}
+
 fn varhandle_access_mode_type_uncached(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -1611,39 +1983,173 @@ fn varhandle_access_mode_type_uncached(
     let desc = if let Some(desc) = p67_memory_segment_varhandle_descriptor(ctx, this, access_type) {
         desc
     } else {
-        let meta = vh_meta_get(ctx, this);
-        let kind = meta
-            .as_deref()
-            .map(|m| m.kind)
-            .or_else(|| ctx.get_field(this, VH_KIND).as_int())
-            .unwrap_or(VH_KIND_INSTANCE);
-        let value_desc = meta
-            .as_deref()
-            .map(|m| Cow::Owned(m.field_desc.clone()))
-            .unwrap_or_else(|| vh_field_desc(ctx, this));
-        let coords = match kind {
-            VH_KIND_STATIC => Vec::new(),
-            VH_KIND_ARRAY => vec![DESC_OBJECT.to_string(), DESC_INT.to_string()],
-            VH_KIND_BYTE_VIEW_LE | VH_KIND_BYTE_VIEW_BE => {
-                vec!["[B".to_string(), DESC_INT.to_string()]
-            }
-            VH_KIND_BYTE_BUFFER_VIEW_LE | VH_KIND_BYTE_BUFFER_VIEW_BE => {
-                vec!["Ljava/nio/ByteBuffer;".to_string(), DESC_INT.to_string()]
-            }
-            _ => {
-                let receiver = meta
-                    .as_deref()
-                    .map(|m| class_name_to_descriptor(&m.class_name).into_owned())
-                    .unwrap_or_else(|| DESC_OBJECT.to_string());
-                vec![receiver]
-            }
-        };
+        let (_kind, value_desc, coords, _exact) = vh_value_and_coordinate_descriptors(ctx, this);
         vh_access_mode_descriptor(access_type, &coords, &value_desc)
     };
 
-    match build_method_type_from_descriptor(ctx, &desc) {
+    match build_method_type_from_descriptor(ctx, &desc)? {
         Some(mt) => Ok(Some(Value::Object(Some(mt)))),
         None => Ok(None),
+    }
+}
+
+/// The `Class` mirror for a JVM field descriptor — `"I"` → `int.class`,
+/// `"Ljava/lang/String;"` → `String.class`.
+///
+/// Both lookups are canonical caches (`primitive_mirrors` in `vm_object.rs`,
+/// `get_or_create_class_mirror` for reference types), which is what makes
+/// `vi.varType() == int.class` an IDENTITY match: the mirror the vector gets
+/// from `getstatic Integer.TYPE` and the one produced here are the same object.
+/// Same idiom as `build_method_type_from_descriptor` above.
+fn vh_descriptor_mirror(ctx: &mut dyn NativeContext, desc: &str) -> ObjectRef {
+    // An ARRAY descriptor has to go through `lang_class`, which knows to ask
+    // the class manager to intern `[I` and falls back to a synthetic mirror.
+    // The generic path below would end at `primitive_class_mirror("[I")` —
+    // a fabricated PRIMITIVE mirror named `[I`, which is not `int[].class`
+    // and would not compare equal to it. This matters for the array-element
+    // handle's leading coordinate (`coordinateTypes()[0]`), which HotSpot
+    // reports as the array class itself (measured: `[class [I, int]`).
+    if desc.starts_with('[') {
+        return crate::lang_class::descriptor_to_class_mirror(ctx, desc);
+    }
+    let name = descriptor_to_class_name(desc);
+    match ctx.class_id_by_name(&name) {
+        Some(cid) => ctx.get_class_mirror(cid),
+        None => ctx.primitive_class_mirror(&name),
+    }
+}
+
+/// The refusal both describe-yourself accessors raise when the receiver's
+/// metadata cannot name what it addresses.
+///
+/// There is no JDK failure mode here — every real VarHandle can describe
+/// itself — so any exception is a CratonVM deviation. It is still the right
+/// one: the alternative is inventing a `Class`, and a fabricated variable type
+/// is exactly the "plausible value where the VM does not know" shape the
+/// strict corpus exists to find. `UnsupportedOperationException` is catchable
+/// and cannot be mistaken for an answer.
+fn vh_undescribable(what: &str, kind: i32) -> MethodCallFailed {
+    RuntimeError::UnsupportedOperationException {
+        message: format!(
+            "VarHandle.{what}: this CratonVM VarHandle carries no variable/coordinate type \
+             metadata (kind {kind}); it was minted by a factory that does not record it, so \
+             the answer is unknown rather than absent"
+        ),
+    }
+    .into()
+}
+
+/// Build the `List<Class<?>>` that `coordinateTypes()` returns.
+///
+/// `List.of(Object[])` is the JDK-owned immutable-list construction, so the
+/// result `equals` the `List.of(...)` a caller compares it against
+/// (`RJdkHandles:245` asserts exactly that). `Arrays.asList` is the
+/// synthetic-JDK fallback, matching `lang_system.rs`'s `boxed_int_list`.
+///
+/// Every mirror is pinned across the allocations: `new_array` and the `List.of`
+/// invocation can both collect, and a raw `ObjectRef` held over a collection is
+/// stale.
+fn vh_class_list(ctx: &mut dyn NativeContext, descs: &[String]) -> Option<Value> {
+    let mut mirrors: Vec<ObjectRef> = Vec::with_capacity(descs.len());
+    let mut pins: Vec<usize> = Vec::with_capacity(descs.len());
+    let mut base: Option<usize> = None;
+    for d in descs {
+        // Re-read every earlier mirror: resolving this one can allocate.
+        for (i, h) in pins.iter().enumerate() {
+            mirrors[i] = ctx.read_native_pin(*h, mirrors[i]);
+        }
+        let m = vh_descriptor_mirror(ctx, d);
+        let h = ctx.pin_native_root(m);
+        if base.is_none() {
+            base = Some(h);
+        }
+        mirrors.push(m);
+        pins.push(h);
+    }
+    let array = ctx.new_array(ArrayElementType::Reference, descs.len());
+    let array_pin = ctx.pin_native_root(array);
+    if base.is_none() {
+        base = Some(array_pin);
+    }
+    let mut array = array;
+    for (i, h) in pins.iter().enumerate() {
+        let m = ctx.read_native_pin(*h, mirrors[i]);
+        array = ctx.read_native_pin(array_pin, array);
+        ctx.set_array_element(array, i, Value::Object(Some(m)));
+    }
+    array = ctx.read_native_pin(array_pin, array);
+    let list = ctx
+        .invoke(
+            "java/util/List",
+            "of",
+            "([Ljava/lang/Object;)Ljava/util/List;",
+            &[Value::Object(Some(array))],
+        )
+        .ok()
+        .flatten();
+    let list = match list {
+        Some(Value::Object(Some(_))) => list,
+        _ => {
+            let array = ctx.read_native_pin(array_pin, array);
+            ctx.invoke(
+                "java/util/Arrays",
+                "asList",
+                "([Ljava/lang/Object;)Ljava/util/List;",
+                &[Value::Object(Some(array))],
+            )
+            .ok()
+            .flatten()
+        }
+    };
+    if let Some(b) = base {
+        ctx.unpin_native_roots(b);
+    }
+    match list {
+        Some(Value::Object(Some(_))) => list,
+        _ => None,
+    }
+}
+
+/// Is this handle's metadata authoritative enough to describe itself?
+///
+/// The WP4.2 side table is "the canonical truth" (see its banner) — every
+/// factory in this file writes one. Without an entry, `vh_field_desc` falls
+/// back to `DESC_OBJECT`, which is a workable erasure for `accessModeType` but
+/// would make `varType()` report `Object` for, say, a real-JDK `int[]` handle
+/// that reached us without going through our factories. Reporting a fabricated
+/// `Class` is the one outcome these accessors must not produce.
+///
+/// A REAL-JDK array-element VarHandle is the documented second source of
+/// truth: it has no side-table entry, but it names its own element and array
+/// types (see [`real_array_var_handle_descriptors`]), and an answer read off
+/// the object is not a fabrication.
+fn vh_meta_is_authoritative(ctx: &mut dyn NativeContext, vh: ObjectRef) -> bool {
+    vh_meta_get(ctx, vh).is_some() || real_array_var_handle_descriptors(ctx, vh).is_some()
+}
+
+fn varhandle_var_type(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let (kind, value_desc, _coords, _exact) = vh_value_and_coordinate_descriptors(ctx, this);
+    // An empty or non-authoritative descriptor is "we never recorded one",
+    // not a type.
+    if value_desc.is_empty() || !vh_meta_is_authoritative(ctx, this) {
+        return Err(vh_undescribable("varType", kind));
+    }
+    let mirror = vh_descriptor_mirror(ctx, &value_desc);
+    Ok(Some(Value::Object(Some(mirror))))
+}
+
+fn varhandle_coordinate_types(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let (kind, _value_desc, coords, exact) = vh_value_and_coordinate_descriptors(ctx, this);
+    if !exact || !vh_meta_is_authoritative(ctx, this) {
+        return Err(vh_undescribable("coordinateTypes", kind));
+    }
+    match vh_class_list(ctx, &coords) {
+        Some(v) => Ok(Some(v)),
+        // Returning null here would be a null `coordinateTypes()`, which no
+        // real VarHandle ever answers.
+        None => Err(vh_undescribable("coordinateTypes", kind)),
     }
 }
 
@@ -1652,6 +2158,41 @@ fn varhandle_access_mode_type_uncached(
 /// `byteArrayViewVarHandle` get — distinct from an array-element access (which
 /// would return a single signed byte). CratonVM stores `byte[]` elements as
 /// signed `Value::Int`.
+/// Bounds-check a byte-array-view `VarHandle` access, JDK-style.
+///
+/// `MethodHandles.byteArrayViewVarHandle` checks the START index against
+/// `array.length - (width - 1)` — the number of positions a `width`-byte
+/// element can start at — and reports it that way:
+/// `Index -1 out of bounds for length 15` for a `short` view over a 16-byte
+/// array, not "for length 16". `RuntimeError::aioobe` formats the JDK's
+/// `Preconditions.checkIndex` wording, so the message matches character for
+/// character.
+///
+/// There was no check at all here. Both `get` and `set` took the raw `int`
+/// coordinate as `*i as usize`, so a negative index wrapped to an enormous
+/// `usize` and the per-byte loop below simply read zeros or dropped the writes
+/// — an out-of-bounds **write** that reported success. Nothing in the corpus
+/// caught it because netty only takes this path when `sun.misc.Unsafe` is
+/// unavailable, and CratonVM pinned `sun.misc.unsafe.memory.access` so netty
+/// never did; on stock HotSpot 25, which does not pin it, netty's heap
+/// `ByteBuf` reads and writes go through exactly this VarHandle.
+fn byte_view_check_index(
+    ctx: &dyn NativeContext,
+    arr: ObjectRef,
+    index: i32,
+    elem: u8,
+) -> Result<usize, MethodCallFailed> {
+    let width = i64::from(byte_view_width(elem) as u32);
+    let length = ctx.array_length(arr) as i64;
+    // Saturating at 0: an array shorter than one element has no valid start,
+    // and the JDK reports the (clamped) count, never a negative length.
+    let limit = (length - (width - 1)).max(0);
+    if i64::from(index) < 0 || i64::from(index) >= limit {
+        return Err(RuntimeError::aioobe(index, limit as i32).into());
+    }
+    Ok(index as usize)
+}
+
 fn byte_view_get(ctx: &dyn NativeContext, arr: ObjectRef, idx: usize, elem: u8, le: bool) -> Value {
     let w = byte_view_width(elem);
     let mut raw: u64 = 0;
@@ -1760,7 +2301,82 @@ fn byte_view_encode(elem: u8, le: bool, value: &Value) -> [u8; 8] {
     bytes
 }
 
+/// Bounds-check a byte-BUFFER-view `VarHandle` access.
+///
+/// The sibling of [`byte_view_check_index`]. HotSpot's contract differs in the
+/// exception TYPE: a buffer view raises plain `IndexOutOfBoundsException` where
+/// an array view raises `ArrayIndexOutOfBoundsException`. Both use
+/// `Preconditions.checkIndex`'s wording and both bound the START index by
+/// `length - (width - 1)` — for a buffer that length is its **limit**.
+/// Measured on JDK 25: `IndexOutOfBoundsException: Index -1 out of bounds for
+/// length 15` for a `short` view over a 16-byte buffer.
+///
+/// There was no check. Both call sites clamped a negative coordinate to `0`
+/// instead, so `get(buf, -1)` silently read element 0 and `set(buf, -1, v)`
+/// silently overwrote it — a wrong answer where the JDK throws, and on the
+/// `set` side a write to memory the caller never named.
+fn byte_buffer_view_check_index(
+    ctx: &mut dyn NativeContext,
+    bb: ObjectRef,
+    index: i32,
+    elem: u8,
+) -> Result<usize, MethodCallFailed> {
+    let width = i64::from(byte_view_width(elem) as u32);
+    let limit = match ctx.get_field_by_name(bb, "limit") {
+        Value::Int(l) => i64::from(l),
+        _ => 0,
+    };
+    let bound = (limit - (width - 1)).max(0);
+    if i64::from(index) < 0 || i64::from(index) >= bound {
+        return Err(RuntimeError::IndexOutOfBoundsException {
+            message: Some(cratonvm_types::error::out_of_bounds_message::check_index(
+                i64::from(index),
+                bound,
+            )),
+        }
+        .into());
+    }
+    Ok(index as usize)
+}
+
+/// Is this `ByteBuffer` a read-only view?
+///
+/// `VarHandle.set` through a byte-buffer view must raise
+/// `ReadOnlyBufferException`; CratonVM performed the write instead, so a
+/// `asReadOnlyBuffer()` handed to code that mutates it was not read-only at
+/// all. Two signals, because the field is not present on every buffer shape
+/// this VM can produce: the `isReadOnly` field when there is one, and
+/// otherwise the JDK's own naming — the read-only views are exactly
+/// `HeapByteBufferR` and `DirectByteBufferR`.
+fn byte_buffer_view_is_read_only(ctx: &mut dyn NativeContext, bb: ObjectRef) -> bool {
+    if let Value::Int(flag) = ctx.get_field_by_name(bb, "isReadOnly") {
+        if flag != 0 {
+            return true;
+        }
+    }
+    ctx.class_name_of_id(ctx.class_id_of_object(bb))
+        .map_or(false, |name| name.ends_with("ByteBufferR"))
+}
+
+/// The native address of a **direct** buffer's byte `idx`, or `None`.
+///
+/// The `hb == null` test is the whole point. `java.nio.Buffer.address` is NOT
+/// zero for a heap buffer on JDK 21+ — it holds the array base offset (16 on
+/// this platform) so that `Unsafe` accesses can use one code path for both
+/// kinds. Reading it as an absolute pointer therefore dereferenced address
+/// `16 + idx` for every heap buffer, which is a hard SIGSEGV, and the
+/// heap-array fallback below it was unreachable:
+///
+/// ```text
+/// SIGSEGV at pc=…, addr=0x10        # 0x10 == 16
+/// ```
+///
+/// `hb` (the backing `byte[]`) is the field that actually distinguishes the
+/// two: null on a direct buffer, non-null on a heap one.
 fn byte_buffer_view_addr(ctx: &mut dyn NativeContext, bb: ObjectRef, idx: usize) -> Option<i64> {
+    if matches!(ctx.get_field_by_name(bb, "hb"), Value::Object(Some(_))) {
+        return None;
+    }
     let base = match ctx.get_field_by_name(bb, "address") {
         Value::Long(a) if a > 0 => a,
         _ => return None,
@@ -1842,7 +2458,7 @@ fn byte_buffer_view_set(
 const SEGMENT_VAR_HANDLE_CLASS: &str = "java/lang/invoke/SegmentVarHandle";
 
 fn is_segment_var_handle(ctx: &mut dyn NativeContext, vh: ObjectRef) -> bool {
-    ctx.class_name_of_id(ctx.class_id_of_object(vh)).as_deref() == Some(SEGMENT_VAR_HANDLE_CLASS)
+    ctx.class_name_arc_of_id(ctx.class_id_of_object(vh)).as_deref() == Some(SEGMENT_VAR_HANDLE_CLASS)
 }
 
 /// A `SegmentVarHandle`'s own `enclosing` (the `ValueLayout` it was built
@@ -2276,6 +2892,98 @@ fn segment_vh_set(
     })())
 }
 
+/// The descriptor of the variable a `VarHandle` access reads or writes, for the
+/// call shape in `args`.
+///
+/// It answers the same question the access natives themselves answer when they
+/// pick a branch, in the SAME order, so the descriptor cannot disagree with the
+/// value the native produced:
+///
+/// 1. `vh_array_call` matches → the array's element type. Every RMW native
+///    probes this first (see `varhandle_get_and_set` / `_add` / `_bitwise` /
+///    `compare_and_exchange`), including for byte-array-view handles, which
+///    those natives do not special-case.
+/// 2. otherwise the handle's own `field_desc`, via the meta side table
+///    (`vh_type_desc`), which is what the instance/static branches read.
+///
+/// Falls back to `DESC_REF` when nothing resolves. That is deliberate and
+/// lossless: `box_value`'s catch-all arm returns the value untouched for a
+/// reference descriptor, so an unresolvable handle keeps exactly today's
+/// behaviour instead of guessing a wrapper class.
+fn vh_access_value_desc(ctx: &mut dyn NativeContext, args: &[Value]) -> Cow<'static, str> {
+    if let Some((arr, _)) = vh_array_call(ctx, args) {
+        return Cow::Borrowed(array_element_desc(ctx, arr));
+    }
+    match args.first() {
+        Some(Value::Object(Some(this))) => vh_type_desc(ctx, *this),
+        _ => Cow::Borrowed(DESC_REF),
+    }
+}
+
+/// THE boxing funnel for every `VarHandle` access mode that HANDS BACK the
+/// accessed variable.
+///
+/// # The defect this closes
+///
+/// Every such mode is registered under the erased
+/// `([Ljava/lang/Object;)Ljava/lang/Object;` descriptor, so the native's own
+/// contract is "return a reference". `varhandle_get` honoured it (it calls
+/// `box_value`); `getAndSet`, `getAndAdd`, `getAndBitwise*` and
+/// `compareAndExchange` returned the BARE primitive `Value`. Nothing
+/// downstream repairs that — `vm_exec.rs`'s `unbox_poly_return` passes
+/// `b'L' | b'['` through untouched — so a call site with no cast, whose
+/// descriptor therefore ends in `)Ljava/lang/Object;`, received a raw `Int`
+/// into a reference return slot. Measured: `System.out.println(
+/// va.getAndSet(arr, 1, 20))` printed `null` where HotSpot 25.0.3 prints `2`.
+/// The cast form `(int) va.getAndSet(...)` was correct only because its
+/// descriptor is then `([III)I` and the coercion path accepts a raw `Int`.
+///
+/// # Why the boxing has to be HERE and not at the poly-return boundary
+///
+/// `Value::Int` carries `boolean`, `byte`, `char`, `short` AND `int` (see
+/// `cratonvm_types::Value`), so the value's tag does not name its wrapper.
+/// Measured on the JDK 25 oracle, HotSpot boxes by the VARIABLE's type:
+/// `boolean[]` → `java.lang.Boolean` (prints `true`), `int[]` →
+/// `java.lang.Integer`. `unbox_poly_return` sees only the value and the
+/// call-site descriptor, and an erased call site says nothing but "Object" —
+/// boxing there would have to guess `Integer` and would print `1` for a
+/// `boolean[]`. The native is the only layer that knows the element/field
+/// descriptor, so this is the only layer that can be right.
+///
+/// # Idempotent by construction
+///
+/// A value that is already `Value::Object(_)` passes straight through. That
+/// covers `null`, a reference-typed variable, and `varhandle_get`'s own inline
+/// `box_value` calls, so routing a mode through this funnel can never
+/// double-box. It is also why `varhandle_get` keeps its inline boxing: the two
+/// cannot fight.
+///
+/// # Relationship to `varhandle_reference_return_mismatch` (vm_exec.rs)
+///
+/// That check fires when a BOXED primitive reaches a call site whose declared
+/// reference return type the wrapper is not assignable to — i.e. it can only
+/// ever see values this funnel produces, and it accepts `java/lang/Object` and
+/// every wrapper supertype. So the two agree by construction: this funnel makes
+/// `Object o = vh.getAndSet(...)` correct (the check declines — `Object` is a
+/// supertype), and makes `String s = (String) vh.getAndSet(...)` reach the
+/// check that HotSpot answers with `WrongMethodTypeException`. Before this fix
+/// the raw `Int` was not an object at all, so the check silently could not fire
+/// on the RMW modes; there is no shape where both act.
+fn vh_box_access_result(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+    result: MethodCallResult,
+) -> MethodCallResult {
+    let Some(value) = result? else {
+        return Ok(None);
+    };
+    if matches!(value, Value::Object(_)) {
+        return Ok(Some(value));
+    }
+    let desc = vh_access_value_desc(ctx, args);
+    Ok(Some(box_value(ctx, value, &desc)))
+}
+
 /// VarHandle.get(receiver) → value
 /// Signature-polymorphic: args arrive as individual values from the call-site,
 /// i.e. args = [vh_ref, receiver] for instance fields.
@@ -2303,10 +3011,11 @@ fn varhandle_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
             Some(Value::Object(Some(a))) => *a,
             _ => return Ok(Some(Value::Object(None))),
         };
-        let idx = match args.get(2) {
-            Some(Value::Int(i)) => *i as usize,
+        let index = match args.get(2) {
+            Some(Value::Int(i)) => *i,
             _ => 0,
         };
+        let idx = byte_view_check_index(ctx, arr, index, elem)?;
         let value = byte_view_get(ctx, arr, idx, elem, le);
         return Ok(Some(box_value(ctx, value, byte_view_desc(elem))));
     }
@@ -2315,10 +3024,11 @@ fn varhandle_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
             Some(Value::Object(Some(b))) => *b,
             _ => return Ok(Some(Value::Object(None))),
         };
-        let idx = match args.get(2) {
-            Some(Value::Int(i)) if *i >= 0 => *i as usize,
+        let index = match args.get(2) {
+            Some(Value::Int(i)) => *i,
             _ => 0,
         };
+        let idx = byte_buffer_view_check_index(ctx, bb, index, elem)?;
         let value = byte_buffer_view_get(ctx, bb, idx, elem, le).unwrap_or(Value::Object(None));
         return Ok(Some(box_value(ctx, value, byte_view_desc(elem))));
     }
@@ -2330,6 +3040,7 @@ fn varhandle_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
     // signature-polymorphic call-site descriptor steers it to the right
     // primitive return slot.
     if let Some((arr, idx)) = vh_array_call(ctx, args) {
+        let idx = vh_array_index(ctx, arr, idx)?;
         let desc = array_element_desc(ctx, arr);
         let value = ctx.get_array_element(arr, idx);
         return Ok(Some(box_value(ctx, value, desc)));
@@ -2413,7 +3124,15 @@ fn varhandle_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
                 Some(Value::Int(i)) => *i as usize,
                 _ => 0,
             };
-            Ok(Some(ctx.get_array_element(arr, idx)))
+            // W8-13: this branch returned the BARE element — the one
+            // unboxed return left in `varhandle_get`, and the same defect the
+            // RMW modes had. It is normally shadowed by the `vh_array_call`
+            // fast path above, which matches whenever args[2] is an `Int`; it
+            // is reachable only when the index coordinate is absent or not an
+            // `Int`, i.e. exactly the shape a partial fix would leave behind.
+            let value = ctx.get_array_element(arr, idx);
+            let desc = array_element_desc(ctx, arr);
+            Ok(Some(box_value(ctx, value, desc)))
         }
         _ => Ok(Some(Value::Object(None))),
     }
@@ -2439,10 +3158,11 @@ fn varhandle_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
     // SHA3/SHAKE-zeros bug.)
     if let Some((elem, le)) = byte_view_kind(meta.as_deref()) {
         if let Some(Value::Object(Some(arr))) = args.get(1) {
-            let idx = match args.get(2) {
-                Some(Value::Int(i)) => *i as usize,
+            let index = match args.get(2) {
+                Some(Value::Int(i)) => *i,
                 _ => 0,
             };
+            let idx = byte_view_check_index(ctx, *arr, index, elem)?;
             let value = args.get(3).cloned().unwrap_or(Value::Int(0));
             byte_view_set(ctx, *arr, idx, elem, le, &value);
         }
@@ -2450,10 +3170,14 @@ fn varhandle_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
     }
     if let Some((elem, le)) = byte_buffer_view_kind(meta.as_deref()) {
         if let Some(Value::Object(Some(bb))) = args.get(1) {
-            let idx = match args.get(2) {
-                Some(Value::Int(i)) if *i >= 0 => *i as usize,
+            let index = match args.get(2) {
+                Some(Value::Int(i)) => *i,
                 _ => 0,
             };
+            if byte_buffer_view_is_read_only(ctx, *bb) {
+                return Err(RuntimeError::ReadOnlyBufferException.into());
+            }
+            let idx = byte_buffer_view_check_index(ctx, *bb, index, elem)?;
             let value = args.get(3).cloned().unwrap_or(Value::Int(0));
             byte_buffer_view_set(ctx, *bb, idx, elem, le, &value);
         }
@@ -2462,6 +3186,7 @@ fn varhandle_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
     // C38: Array-element VarHandle.set — args = [vh, array, idx, value]. Handles
     // real-JDK VarHandleLongs$Array / VarHandleInts$Array / etc.
     if let Some((arr, idx)) = vh_array_call(ctx, args) {
+        let idx = vh_array_index(ctx, arr, idx)?;
         let value = args.get(3).cloned().unwrap_or(Value::Int(0));
         ctx.set_array_element(arr, idx, value);
         return Ok(None);
@@ -2534,6 +3259,7 @@ fn varhandle_compare_and_set(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
     let this = obj_arg(args, 0)?;
     // C38: Array-element CAS — args = [vh, array, idx, expected, new_value].
     if let Some((arr, idx)) = vh_array_call(ctx, args) {
+        let idx = vh_array_index(ctx, arr, idx)?;
         let expected = args.get(3).cloned().unwrap_or(Value::Int(0));
         let new_val = args.get(4).cloned().unwrap_or(Value::Int(0));
         // LOW-finding fix: atomic compare-and-set. The old get/compare/set was
@@ -2628,10 +3354,23 @@ fn varhandle_compare_and_set(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
 
 /// VarHandle.compareAndExchange(receiver, expected, new) → witness value
 /// Signature-polymorphic: args = [vh_ref, receiver, expected, new_value]
+///
+/// Boxes through [`vh_box_access_result`] — see there for why the erased
+/// `Object` call site needs it and why the boxing cannot live at the
+/// poly-return boundary.
 fn varhandle_compare_and_exchange(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let raw = varhandle_compare_and_exchange_raw(ctx, args);
+    vh_box_access_result(ctx, args, raw)
+}
+
+fn varhandle_compare_and_exchange_raw(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     // C38: Array-element compareAndExchange — args = [vh, array, idx, expected, new].
     if let Some((arr, idx)) = vh_array_call(ctx, args) {
+        let idx = vh_array_index(ctx, arr, idx)?;
         let expected = args.get(3).cloned().unwrap_or(Value::Int(0));
         let new_val = args.get(4).cloned().unwrap_or(Value::Int(0));
         // LOW-finding fix: atomic compare-and-exchange. The previous
@@ -2728,10 +3467,20 @@ fn varhandle_compare_and_exchange(ctx: &mut dyn NativeContext, args: &[Value]) -
 
 /// VarHandle.getAndSet(receiver, new) → old value
 /// Signature-polymorphic: args = [vh_ref, receiver, new_value]
+///
+/// Boxes through [`vh_box_access_result`] — see there for why the erased
+/// `Object` call site needs it and why the boxing cannot live at the
+/// poly-return boundary.
 fn varhandle_get_and_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let raw = varhandle_get_and_set_raw(ctx, args);
+    vh_box_access_result(ctx, args, raw)
+}
+
+fn varhandle_get_and_set_raw(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     // C38: Array-element getAndSet — args = [vh, array, idx, new_value].
     if let Some((arr, idx)) = vh_array_call(ctx, args) {
+        let idx = vh_array_index(ctx, arr, idx)?;
         let new_val = args.get(3).cloned().unwrap_or(Value::Int(0));
         // LOW-finding fix: atomic getAndSet via a bounded CAS retry loop
         // (was a non-atomic get-then-set → lost updates under contention).
@@ -2833,9 +3582,16 @@ fn varhandle_get_and_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
 /// - Instance kind: args = [vh, receiver, delta].
 /// - Static kind: args = [vh, delta].
 ///
-/// Delta can be Int, Long, Float, or Double. Returns previous value (unboxed to
-/// match the call-site descriptor; the polymorphic dispatch wraps it as needed).
+/// Delta can be Int, Long, Float, or Double. Returns the previous value BOXED
+/// through [`vh_box_access_result`], which the erased `Object` call site
+/// requires; `unbox_poly_return` then unwraps it for a primitive call site such
+/// as H2's `([III)I`.
 fn varhandle_get_and_add(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let raw = varhandle_get_and_add_raw(ctx, args);
+    vh_box_access_result(ctx, args, raw)
+}
+
+fn varhandle_get_and_add_raw(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
 
     fn add_values(current: &Value, delta: &Value) -> Value {
@@ -2879,6 +3635,7 @@ fn varhandle_get_and_add(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     // so real-JDK VarHandleLongs$Array / VarHandleInts$Array calls work even
     // when the VH's slot 0 is not our synthetic VH_KIND Int.
     if let Some((arr, idx)) = vh_array_call(ctx, args) {
+        let idx = vh_array_index(ctx, arr, idx)?;
         let delta = args.get(3).cloned().unwrap_or(Value::Int(0));
         return Ok(Some(array_get_and_add(ctx, arr, idx, &delta)));
     }
@@ -3001,7 +3758,20 @@ enum VhBitOp {
 /// field is updated with `STATE.getAndBitwiseOr(this, flag)` during
 /// connect/accept; without it the real-JDK Socket path throws
 /// `NoSuchMethodError`. See `reference_server_socket_gap`.
+///
+/// Boxes through [`vh_box_access_result`] — see there for why the erased
+/// `Object` call site needs it and why the boxing cannot live at the
+/// poly-return boundary.
 fn varhandle_get_and_bitwise(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+    op: VhBitOp,
+) -> MethodCallResult {
+    let raw = varhandle_get_and_bitwise_raw(ctx, args, op);
+    vh_box_access_result(ctx, args, raw)
+}
+
+fn varhandle_get_and_bitwise_raw(
     ctx: &mut dyn NativeContext,
     args: &[Value],
     op: VhBitOp,
@@ -3049,6 +3819,7 @@ fn varhandle_get_and_bitwise(
 
     // Array-element form — args = [vh, array, idx, mask].
     if let Some((arr, idx)) = vh_array_call(ctx, args) {
+        let idx = vh_array_index(ctx, arr, idx)?;
         let mask = args.get(3).cloned().unwrap_or(Value::Int(0));
         return Ok(Some(array_get_and_bitwise(ctx, arr, idx, &mask, op)));
     }
@@ -3352,37 +4123,121 @@ pub(crate) fn register_p60_callsite(r: &mut NativeMethodRegistry) {
 // Lookup = 2-field (lookupClass=0, allowedModes=1)
 // =============================================================================
 
+/// The slot the LEGACY synthetic `Lookup` layout puts `allowedModes` in
+/// (`lookupClass`=0, `allowedModes`=1). On the real JDK layout slot 1 is
+/// `prevLookupClass` — see [`lk_allowed_modes_slot`].
+const LK_SYNTHETIC_ALLOWED_MODES: usize = 1;
+
+/// The slot of the DECLARED `allowedModes` field, or `None` when the receiver
+/// does not carry the real `java.lang.invoke.MethodHandles$Lookup` layout.
+///
+/// The witness is CLASS-side, and that is the whole point. `get_field_by_name`
+/// answers `Int(0)` for an ABSENT field, which is indistinguishable from a
+/// genuine `allowedModes == 0` — and a FABRICATED Lookup stub has no
+/// `allowedModes` at all, it names its slots `_f0..`. The previous
+/// "by name first, synthetic slot second" reader therefore returned 0 for
+/// every synthetic Lookup and NEVER reached the slot-1 fallback below it: that
+/// fallback was unreachable code.
+///
+/// Asking the class separates "absent" from "present and zero" with no
+/// ambiguity, and is descriptor-safe — `resolve_field_index_by_class_id`
+/// resolves the declared `int allowedModes` on `MethodHandles$Lookup` rather
+/// than a same-named field of some other type in the hierarchy.
+///
+/// Measured layout (`javap -p java.lang.invoke.MethodHandles$Lookup`, OpenJDK
+/// 25.0.3): `lookupClass`(0), `prevLookupClass`(1), `allowedModes`(2),
+/// `cachedProtectionDomain`(3). Slot 1 is a REFERENCE.
+///
+/// This duplicates `classloader::lk_real_allowed_modes_slot` /
+/// `classloader::lk_modes_of`, which are private to that module. Collapsing
+/// the two needs a one-line `pub(crate)` on `classloader::lk_modes_of`; see
+/// the lane report.
+fn lk_allowed_modes_slot(ctx: &dyn NativeContext, obj: ObjectRef) -> Option<usize> {
+    ctx.resolve_field_index_by_class_id(ctx.class_id_of_object(obj), "allowedModes")
+}
+
 /// Write a `MethodHandles$Lookup`'s `allowedModes` so it lands on the correct
 /// field regardless of whether the object carries the **real** JDK 3-field
 /// layout (`lookupClass`, `prevLookupClass`, `allowedModes`) or the legacy
 /// **synthetic** 2-field layout (`lookupClass`=0, `allowedModes`=1).
 ///
-/// The old code wrote the modes int to fixed slot 1. In the real layout slot 1
-/// is the *reference* field `prevLookupClass`, so `lookupModes()` (real
+/// The original code wrote the modes int to fixed slot 1. In the real layout
+/// slot 1 is the *reference* field `prevLookupClass`, so `lookupModes()` (real
 /// bytecode reading the real `allowedModes` at slot 2) saw 0 — i.e. NO `PACKAGE`
 /// access — and Spring CGLIB's `ReflectUtils.defineClass` failed every concrete
-/// class proxy with "Lookup does not have PACKAGE access". Writing by name puts
-/// it in the real `allowedModes`; the slot-1 fallback only fires when the
-/// by-name write cannot resolve (pure synthetic class with no named fields).
+/// class proxy with "Lookup does not have PACKAGE access".
+///
+/// The two arms below are now mutually exclusive by construction, which the
+/// "by name, then slot 1 if the read-back disagrees" form was NOT:
+///
+/// * `modes == 0` on a fabricated Lookup read back as `Int(0)` from the absent
+///   field, so the write "landed" and the synthetic slot never got it;
+/// * any read-back disagreement on a REAL Lookup fell through to slot 1 and
+///   put an `Int` in the `prevLookupClass` reference slot — heap corruption
+///   the GC scans as an oop, not merely a wrong answer.
 fn lk_write_allowed_modes(ctx: &mut dyn NativeContext, obj: ObjectRef, modes: i32) {
-    ctx.set_field_by_name(obj, "allowedModes", Value::Int(modes));
-    let landed = matches!(ctx.get_field_by_name(obj, "allowedModes"), Value::Int(m) if m == modes);
-    if !landed {
-        // Synthetic layout: allowedModes lives at slot 1.
-        ctx.set_field(obj, 1, Value::Int(modes));
+    if let Some(slot) = lk_allowed_modes_slot(ctx, obj) {
+        ctx.set_field_by_name(obj, "allowedModes", Value::Int(modes));
+        if !matches!(ctx.get_field(obj, slot), Value::Int(m) if m == modes) {
+            // Named write did not land; go through the resolved index. Never
+            // through the synthetic slot — see the note above.
+            ctx.set_field(obj, slot, Value::Int(modes));
+        }
+        return;
     }
+    ctx.set_field(obj, LK_SYNTHETIC_ALLOWED_MODES, Value::Int(modes));
 }
 
-/// Read a `Lookup`'s `allowedModes`, by name first (real layout slot 2),
-/// falling back to synthetic slot 1.
+/// Read a `Lookup`'s `allowedModes` from whichever layout the receiver has.
+///
+/// See [`lk_allowed_modes_slot`] for why the class-side witness comes first:
+/// the previous by-name-first form answered 0 for every fabricated Lookup
+/// (absent field == `Int(0)`), which made `lookupModes()` report 0, made
+/// `lk_enforce_find_access` take its "modes unknown, stay permissive" valve,
+/// and — compounding with the old `Lookup.in` default — turned that 0 into
+/// FULL_POWER on the way out of `in()`.
 fn lk_read_allowed_modes(ctx: &dyn NativeContext, this: ObjectRef) -> i32 {
-    if let Value::Int(m) = ctx.get_field_by_name(this, "allowedModes") {
-        return m;
+    lk_read_allowed_modes_opt(ctx, this).unwrap_or(0)
+}
+
+/// [`lk_read_allowed_modes`], with "0" and "could not read" kept APART.
+///
+/// This is the distinction the whole access-control valve rests on.
+/// `lk_read_allowed_modes` collapses them to `0`, so every enforcement site had
+/// to treat `0` as "unknown, stay permissive" — and that is correct for a
+/// Lookup whose layout the VM does not model, but a genuine zero-mode Lookup is
+/// one the JDK refuses EVERYTHING, public members included:
+///
+/// ```text
+///   MethodHandles.lookup().dropLookupMode(PUBLIC).lookupModes()  ->  0
+///   …that Lookup .findStatic(<a public method of a public class>)
+///                                        ->  IllegalAccessException
+/// ```
+///
+/// Measured on OpenJDK 25.0.3. CratonVM admitted it, because the two zeroes
+/// were the same value. `Some(0)` is the JDK's zero and is refused; `None` is
+/// "this VM could not read the field" and stays permissive, which keeps the
+/// one failure mode a new refusal path must not have — turning every Lookup
+/// shape the VM does not model into an `IllegalAccessException`.
+///
+/// The two `None` arms are exactly the fall-throughs: a resolvable
+/// `allowedModes` slot that reads back as something other than an `Int`, and an
+/// object with no such field whose synthetic slot is likewise not an `Int`.
+/// Every other path returns a value the VM actually read.
+fn lk_read_allowed_modes_opt(ctx: &dyn NativeContext, this: ObjectRef) -> Option<i32> {
+    if let Some(slot) = lk_allowed_modes_slot(ctx, this) {
+        if let Value::Int(m) = ctx.get_field(this, slot) {
+            return Some(m);
+        }
+        if let Value::Int(m) = ctx.get_field_by_name(this, "allowedModes") {
+            return Some(m);
+        }
+        return None;
     }
-    if let Value::Int(m) = ctx.get_field(this, 1) {
-        return m;
+    if let Value::Int(m) = ctx.get_field(this, LK_SYNTHETIC_ALLOWED_MODES) {
+        return Some(m);
     }
-    0
+    None
 }
 
 // ---------------------------------------------------------------------------
@@ -3407,6 +4262,11 @@ const LK_MODE_PRIVATE: i32 = 0x02;
 const LK_MODE_PROTECTED: i32 = 0x04;
 const LK_MODE_PACKAGE: i32 = 0x08;
 const LK_MODE_MODULE: i32 = 0x10;
+/// `Lookup.UNCONDITIONAL`. The ONLY mode `publicLookup()` carries, and the one
+/// whose access rule is about the target CLASS rather than the member: an
+/// UNCONDITIONAL lookup reaches public members of PUBLIC types in
+/// unconditionally-exported packages, and nothing else.
+const LK_MODE_UNCONDITIONAL: i32 = 0x20;
 /// `FULL_POWER_MODES` = PUBLIC|PRIVATE|PROTECTED|PACKAGE|MODULE (no ORIGINAL,
 /// no UNCONDITIONAL).
 const LK_MODE_FULL_POWER: i32 =
@@ -3476,12 +4336,16 @@ fn lk_member_access_flags(
 ///   `private` needs PRIVATE, `protected` needs PRIVATE|PROTECTED|PACKAGE,
 ///   package-private needs PRIVATE|PACKAGE, and `public` needs nothing.
 ///
-/// Everything the JLS §6.6 / `Lookup` contract additionally requires —
-/// nestmate relationships, `protected`-receiver rules, module `exports`/
-/// `opens`, and the `UNCONDITIONAL` "public member of a public exported type"
-/// rule — is NOT enforced. That residual is one-directional: it can only
-/// admit something HotSpot would refuse, never refuse something HotSpot
-/// admits.
+/// One rule is NOT about the member at all and is enforced separately:
+/// `UNCONDITIONAL` (`publicLookup()`, 0x20) reaches public members of PUBLIC
+/// types only, so the target CLASS's own accessibility decides. That half is
+/// checked; the "unconditionally exported package" half is not, for want of a
+/// module graph.
+///
+/// Everything else the JLS §6.6 / `Lookup` contract requires — nestmate
+/// relationships, `protected`-receiver rules, module `exports`/`opens` — is NOT
+/// enforced. That residual is one-directional: it can only admit something
+/// HotSpot would refuse, never refuse something HotSpot admits.
 fn lk_enforce_find_access(
     ctx: &dyn NativeContext,
     args: &[Value],
@@ -3489,20 +4353,60 @@ fn lk_enforce_find_access(
     literal: Option<&str>,
     is_field: bool,
 ) -> Result<(), cratonvm_types::error::MethodCallFailed> {
-    use cratonvm_types::access_flags::{ACC_PRIVATE, ACC_PROTECTED, ACC_PUBLIC};
-
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(()),
     };
-    let modes = lk_read_allowed_modes(ctx, this);
-    if modes == 0 || (modes & LK_MODE_PRIVATE) != 0 {
+    // `None` is "could not read the modes" and stays permissive; `Some(0)` is
+    // the JDK's zero-mode Lookup, which is refused EVERY member including a
+    // public one. See `lk_read_allowed_modes_opt` for why the two must not be
+    // the same value here.
+    let modes = match lk_read_allowed_modes_opt(ctx, this) {
+        None => return Ok(()),
+        Some(m) => m,
+    };
+    if (modes & LK_MODE_PRIVATE) != 0 {
         return Ok(());
     }
     let target = match args.get(1) {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(()),
     };
+    if modes == 0 {
+        // Refuse before the member walk: a zero-mode Lookup's answer does not
+        // depend on the member's modifiers, and the walk allocates.
+        let owner = mirror_class_name(ctx, target).unwrap_or_else(|| "?".to_string());
+        return Err(cratonvm_types::error::RuntimeError::IllegalAccessException {
+            message: format!(
+                "no access: {} from Lookup with modes 0x0000 (no lookup modes remain)",
+                owner.replace('/', ".")
+            ),
+        }
+        .into());
+    }
+    // UNCONDITIONAL's rule is about the TARGET CLASS, not the member.
+    // `publicLookup()` reaches public members of PUBLIC types only, so a public
+    // member of a package-private class is refused — accessibility is the
+    // class's, not the member's. Measured on OpenJDK 25.0.3:
+    // `publicLookup().findStatic(<package-private class>, <a public static>)`
+    // raises `IllegalAccessException: symbolic reference class is not
+    // accessible`, while the same call against a public class succeeds.
+    //
+    // The other half of the JDK's rule — that the package be UNCONDITIONALLY
+    // EXPORTED — still is not enforced, because there is no module graph to ask.
+    // That residual stays one-directional (it can only admit what HotSpot
+    // refuses), and this half removes the case a program actually meets:
+    // publicLookup() over an application class that is not public.
+    if modes == LK_MODE_UNCONDITIONAL && !crate::lang_class::mirror_is_public(ctx, target) {
+        let owner = mirror_class_name(ctx, target).unwrap_or_else(|| "?".to_string());
+        return Err(cratonvm_types::error::RuntimeError::IllegalAccessException {
+            message: format!(
+                "symbolic reference class is not accessible: class {}, from public Lookup",
+                owner.replace('/', ".")
+            ),
+        }
+        .into());
+    }
     let name: String = match literal {
         Some(n) => n.to_string(),
         None => match args.get(name_idx) {
@@ -3517,17 +4421,8 @@ fn lk_enforce_find_access(
         Some(f) => f,
         None => return Ok(()),
     };
-    if (flags & ACC_PUBLIC) != 0 {
-        return Ok(());
-    }
-    let required = if (flags & ACC_PRIVATE) != 0 {
-        LK_MODE_PRIVATE
-    } else if (flags & ACC_PROTECTED) != 0 {
-        LK_MODE_PRIVATE | LK_MODE_PROTECTED | LK_MODE_PACKAGE
-    } else {
-        LK_MODE_PRIVATE | LK_MODE_PACKAGE
-    };
-    if (modes & required) != 0 {
+    let required = lk_modes_required_for_member(i32::from(flags));
+    if required == 0 || (modes & required) != 0 {
         return Ok(());
     }
     let kind = if is_field { "field" } else { "method" };
@@ -3544,11 +4439,265 @@ fn lk_enforce_find_access(
     .into())
 }
 
+/// Which `allowedModes` bits admit a member whose access flags are `flags`?
+/// **Any one** of the returned bits is enough. `0` means "no mode bit is
+/// required" — the member is `public`, and only the target class's own
+/// accessibility can still refuse it.
+///
+/// Shared by [`lk_enforce_find_access`] and [`lk_enforce_unreflect_access`] on
+/// purpose. `Lookup.findVirtual(C, "m", t)` and
+/// `Lookup.unreflect(C.getDeclaredMethod("m"))` are the same access question
+/// asked two ways — the JDK routes both into the same `getDirectMethod`
+/// (`MethodHandles.java`) — so the two gates must not be able to drift apart.
+/// Two predicates answering one question differently is the shape that produced
+/// several defects in this campaign.
+fn lk_modes_required_for_member(flags: i32) -> i32 {
+    use cratonvm_types::access_flags::{ACC_PRIVATE, ACC_PROTECTED, ACC_PUBLIC};
+    if (flags & i32::from(ACC_PUBLIC)) != 0 {
+        return 0;
+    }
+    if (flags & i32::from(ACC_PRIVATE)) != 0 {
+        LK_MODE_PRIVATE
+    } else if (flags & i32::from(ACC_PROTECTED)) != 0 {
+        LK_MODE_PRIVATE | LK_MODE_PROTECTED | LK_MODE_PACKAGE
+    } else {
+        LK_MODE_PRIVATE | LK_MODE_PACKAGE
+    }
+}
+
+/// How an `unreflect*` entry point treats the reflective object's
+/// `setAccessible` flag. The three arms are not a style choice — the JDK 25
+/// javadoc states a different rule for each, and the two that differ from the
+/// common case are stated explicitly *because* they differ.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LkUnreflectKind {
+    /// `unreflect(Method)`, `unreflectConstructor(Constructor)`,
+    /// `unreflectGetter(Field)`, `unreflectSetter(Field)`.
+    ///
+    /// > "If the method's `accessible` flag is not set, access checking is
+    /// > performed immediately on behalf of the lookup class."
+    ///
+    /// — and the implementation is the literal reading of that sentence:
+    /// `Lookup lookup = m.isAccessible() ? IMPL_LOOKUP : this;`. `IMPL_LOOKUP`
+    /// is the TRUSTED lookup, so a set flag does not soften the check, it
+    /// replaces the Lookup that performs it. Nothing is refused.
+    AccessibleWaives,
+    /// `unreflectVarHandle(Field)`.
+    ///
+    /// > "Access checking is performed immediately on behalf of the lookup
+    /// > class, **regardless of the value of the field's `accessible` flag**."
+    ///
+    /// The JDK body reads `f.isAccessible()` nowhere, unlike `unreflectField`
+    /// three methods above it.
+    AccessibleIgnored,
+    /// `unreflectSpecial(Method, Class)`.
+    ///
+    /// > "Before method resolution, if the explicitly specified caller class is
+    /// > not identical with the lookup class, or if this lookup object does not
+    /// > have private access privileges, the access fails."
+    ///
+    /// `checkSpecialCaller` runs before anything else and the body carries the
+    /// comment `// ignore m.isAccessible:  this is a new kind of access`. Only
+    /// the private-access half is enforced here — see the note in
+    /// [`lk_enforce_unreflect_access`] on why the `specialCaller` half is not.
+    Special,
+}
+
+/// Refuse an `unreflect*` conversion the Lookup's `allowedModes` does not
+/// permit — the reflection-shaped twin of [`lk_enforce_find_access`], and the
+/// gate the `unreflect` family never had.
+///
+/// ## Why this is a real hole and not a theoretical one
+///
+/// `Lookup.find*` has consulted `allowedModes` since the W4-1 fix, so
+/// `publicLookup().findVirtual(Holder.class, "secret", …)` is refused. The
+/// `unreflect` family reached the identical member with the identical Lookup
+/// and was admitted, because it never asked: one line of Java
+/// (`pub.unreflect(Holder.class.getDeclaredMethod("secret", int.class))`)
+/// walked around the whole check. The two entry points must answer alike; the
+/// JDK funnels them into the same `getDirectMethod`/`getDirectField`, which is
+/// where its own check lives.
+///
+/// ## The rule, and what it deliberately does not ask
+///
+/// **Mode bits only**, exactly as [`lk_enforce_find_access`], and sharing
+/// [`lk_modes_required_for_member`] so the two cannot drift:
+///
+/// * modes unreadable (`None`) -> allow. The valve. A Lookup shape this VM does
+///   not model must never become an `IllegalAccessException`.
+/// * `PRIVATE` set -> allow, before touching the member. `MethodHandles.lookup()`
+///   (0x5F), `privateLookupIn` (0x1F) and the JDK's TRUSTED lookup (-1) all land
+///   here, which is every Lookup Spring / Hibernate / Jackson / Groovy /
+///   ByteBuddy / `LambdaMetafactory` ever hold. They cannot be refused by this
+///   check at all.
+/// * the reflective object's `accessible` flag, for the arms whose javadoc says
+///   it waives the check -> allow.
+/// * `modes == 0` -> refuse everything, public members included (measured in
+///   [`lk_read_allowed_modes_opt`]: `lookup().dropLookupMode(PUBLIC)` is 0 and
+///   refuses a public method of a public class).
+/// * `UNCONDITIONAL` alone (`publicLookup()`, 0x20) -> the target CLASS must be
+///   public. Same rule, same measurement, as the find* gate.
+/// * otherwise the member's own modifier picks the required bit.
+/// * member modifiers unreadable -> allow.
+///
+/// **`lookupClass` is not consulted, here or in the find* gate.** Ours comes
+/// from a stack walk in the `MethodHandles.lookup()` native; a wrong answer
+/// there must never turn into a refusal. That is what keeps the whole nestmate
+/// / same-package / `protected`-receiver family out of this function, and it is
+/// also why `unreflectSpecial`'s `specialCaller != lookupClass()` conjunct is
+/// NOT enforced — only its `(lookupModes() & PRIVATE) == 0` half is. Both
+/// omissions are one-directional: they can admit something HotSpot refuses,
+/// never refuse something HotSpot admits.
+///
+/// **Mode scope: every mode.** This is JDK reflection semantics, not a
+/// strictness policy, so it is not gated on `--jdk-only` — the same reasoning
+/// under which the `find*` gate, the `setAccessible` gate and the `exports`
+/// gate all run unconditionally. In `Compatible` (`--real-jdk`) mode the only
+/// behaviour it can change is a case CratonVM answered differently from HotSpot
+/// 25, and the PRIVATE short-circuit above means no framework Lookup reaches
+/// the refusal. It cannot fire at all in `--synthetic-jdk`: there,
+/// `register_classloader_natives` runs LAST and its `lk_unreflect` /
+/// `lk_unreflect_special` win the registration, so these natives are not even
+/// the live ones (see the ordering note in
+/// `classloader.rs::register_classloader_natives`); the four this file alone
+/// registers still route here, and answer from the same mode bits.
+///
+/// Called as the FIRST statement of each native for the same reason
+/// [`lk_enforce_find_access`] is: `args` still holds the ObjectRefs the VM
+/// handed over and nothing has had a chance to allocate and move them. Every
+/// read below is a field/flags read; none allocates on the Java heap.
+fn lk_enforce_unreflect_access(
+    ctx: &dyn NativeContext,
+    args: &[Value],
+    kind: LkUnreflectKind,
+) -> Result<(), cratonvm_types::error::MethodCallFailed> {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(()),
+    };
+    // `None` is "could not read the modes" and stays permissive; `Some(0)` is
+    // the JDK's zero-mode Lookup, which refuses every member.
+    let modes = match lk_read_allowed_modes_opt(ctx, this) {
+        None => return Ok(()),
+        Some(m) => m,
+    };
+    // The overwhelmingly common answer, and the cheapest: short-circuit before
+    // reading anything off the reflective object.
+    if (modes & LK_MODE_PRIVATE) != 0 {
+        return Ok(());
+    }
+    let member = match args.get(1) {
+        Some(Value::Object(Some(o))) => *o,
+        // A null/absent member is the native's own error to raise (NPE on
+        // HotSpot); it is not an access decision.
+        _ => return Ok(()),
+    };
+
+    if kind == LkUnreflectKind::Special {
+        // `checkSpecialCaller`: `if (allowedModes == TRUSTED) return;` —
+        // covered by the PRIVATE short-circuit above, since TRUSTED is -1 —
+        // `if ((lookupModes() & PRIVATE) == 0 || …) throw`. Reaching here means
+        // the PRIVATE bit is clear, so the first disjunct has already decided.
+        let owner = match ctx.get_field_by_name(member, "clazz") {
+            Value::Object(Some(m)) => mirror_class_name(ctx, m).unwrap_or_default(),
+            _ => String::new(),
+        };
+        return Err(cratonvm_types::error::RuntimeError::IllegalAccessException {
+            message: format!(
+                "no private access for invokespecial: class {}, from Lookup with \
+                 modes 0x{modes:04x}",
+                owner.replace('/', ".")
+            ),
+        }
+        .into());
+    }
+
+    // JDK: `Lookup lookup = m.isAccessible() ? IMPL_LOOKUP : this;`. The flag
+    // does not weaken the check, it hands it to the TRUSTED lookup — so a set
+    // flag is an unconditional allow, and reading it is only worth doing on the
+    // arms whose javadoc says so.
+    if kind == LkUnreflectKind::AccessibleWaives
+        && crate::lang_class::accessible_override_is_set(ctx, member)
+    {
+        return Ok(());
+    }
+
+    let declaring = match ctx.get_field_by_name(member, "clazz") {
+        Value::Object(Some(m)) => Some(m),
+        _ => None,
+    };
+    let owner = || {
+        declaring
+            .and_then(|m| mirror_class_name(ctx, m))
+            .unwrap_or_else(|| "?".to_string())
+            .replace('/', ".")
+    };
+
+    if modes == 0 {
+        return Err(cratonvm_types::error::RuntimeError::IllegalAccessException {
+            message: format!(
+                "no access: {} from Lookup with modes 0x0000 (no lookup modes remain)",
+                owner()
+            ),
+        }
+        .into());
+    }
+    // UNCONDITIONAL's rule is about the TARGET CLASS, not the member:
+    // `publicLookup()` reaches public members of PUBLIC types only. Identical
+    // to the find* gate's arm, including its measurement.
+    if modes == LK_MODE_UNCONDITIONAL
+        && declaring.is_some_and(|m| !crate::lang_class::mirror_is_public(ctx, m))
+    {
+        return Err(cratonvm_types::error::RuntimeError::IllegalAccessException {
+            message: format!(
+                "symbolic reference class is not accessible: class {}, from public Lookup",
+                owner()
+            ),
+        }
+        .into());
+    }
+
+    // The member's own flags are already on the reflective object — no
+    // `declared_methods` walk, unlike the find* gate which only has a name.
+    // An unreadable `modifiers` slot is the same valve as an unresolvable
+    // member there: allow.
+    let Value::Int(flags) = ctx.get_field_by_name(member, "modifiers") else {
+        return Ok(());
+    };
+    let required = lk_modes_required_for_member(flags);
+    if required == 0 || (modes & required) != 0 {
+        return Ok(());
+    }
+    let member_name = match ctx.get_field_by_name(member, "name") {
+        // A `Constructor` has no `name` field; `get_field_by_name` answers
+        // `Object(None)` and the JDK's own name for the member is `<init>`.
+        Value::Object(Some(n)) => ctx.read_string(n).unwrap_or_else(|| "<init>".to_string()),
+        _ => "<init>".to_string(),
+    };
+    // A REAL `java.lang.IllegalAccessException` (checked) — what every
+    // `unreflect*` overload declares, and what callers catch.
+    Err(cratonvm_types::error::RuntimeError::IllegalAccessException {
+        message: format!(
+            "no access: {}.{member_name} (modifiers 0x{flags:04x}) \
+             from Lookup with modes 0x{modes:04x}",
+            owner()
+        ),
+    }
+    .into())
+}
+
 /// Do the two `Class` mirrors live in the same package?
 ///
 /// A mirror we cannot name answers `true` — "cannot tell, so do not narrow".
-/// The only caller is `Lookup.in`, where a wrong `false` would silently strip
-/// PRIVATE from a legitimate same-package lookup.
+///
+/// **Superseded and CALLER-FREE.** `Lookup.in` was its only caller and now uses
+/// `classloader::lk_class_relation`, which answers the same question plus the
+/// two this one cannot: is the target the lookup class itself, and is it a
+/// member of the same top-level class (`VerifyAccess.isSamePackageMember`).
+/// A same-package test ALONE cannot see the nestmate reduction, so anything
+/// wired back to this function will over-grant PRIVATE|PROTECTED — measured 31
+/// where OpenJDK 25.0.3 returns 25. Use `lk_class_relation` instead; this is
+/// kept only because two docs refer to it by name.
 fn lk_same_package(ctx: &dyn NativeContext, a: Value, b: Value) -> bool {
     fn package_of(ctx: &dyn NativeContext, v: Value) -> Option<String> {
         let m = match v {
@@ -3565,6 +4714,155 @@ fn lk_same_package(ctx: &dyn NativeContext, a: Value, b: Value) -> bool {
         (Some(x), Some(y)) => x == y,
         _ => true,
     }
+}
+
+/// `PRIVATE|MODULE` — the exact pair `MethodHandles.privateLookupIn` demands
+/// of its `caller` argument, and the pair whose absence produces the JDK's
+/// `"caller does not have PRIVATE and MODULE lookup mode"`.
+const LK_MODE_PRIVATE_AND_MODULE: i32 = LK_MODE_PRIVATE | LK_MODE_MODULE;
+
+/// The refusals `MethodHandles.privateLookupIn(targetClass, caller)` performs
+/// before it mints anything.
+///
+/// This native used to grant `0x1F` **unconditionally** — it never looked at
+/// `caller` at all — so every caller the JDK refuses got full private access
+/// to the target instead. Re-measured for this lane on OpenJDK 25.0.3
+/// (`p.PliProbe`, caller class `p.PliProbe` in the unnamed module):
+///
+/// ```text
+/// caller                       target                     answer
+/// ---------------------------- -------------------------- ---------------------------------------------
+/// lookup()            (95)     p.Mate                     OK modes=31 prev=null
+/// lookup()            (95)     p.PliProbe (own class)     OK modes=31 prev=null
+/// lookup()            (95)     p.PliProbe$Nested          OK modes=31 prev=null
+/// lookup()            (95)     q.Other (other package)    OK modes=31 prev=null
+/// dropLookupMode(PROTECTED)(27) p.Mate                    OK modes=31 prev=null   (27 still has PRIVATE|MODULE)
+/// dropLookupMode(PRIVATE) (25) p.Mate                     IllegalAccessException: caller does not have PRIVATE and MODULE lookup mode
+/// dropLookupMode(MODULE)   (1) p.Mate                     IllegalAccessException: (same)
+/// dropLookupMode(PACKAGE) (17) p.Mate                     IllegalAccessException: (same)
+/// dropLookupMode(PUBLIC)   (0) p.Mate                     IllegalAccessException: (same)
+/// publicLookup()          (32) p.Mate                     IllegalAccessException: (same)
+/// lookup().in(q.Other)    (17) q.Other                    IllegalAccessException: (same)
+/// lookup().in(String)      (1) p.Mate                     IllegalAccessException: (same)
+/// lookup()            (95)     java.lang.String           IllegalAccessException: module java.base does not open java.lang to unnamed module @8bcc55f
+/// lookup()            (95)     java.util.HashMap          IllegalAccessException: module java.base does not open java.util to unnamed module @8bcc55f
+/// lookup()            (95)     int.class / void.class     IllegalArgumentException: int is a primitive class
+/// lookup()            (95)     int[].class                IllegalArgumentException: class [I is an array class
+/// lookup()            (95)     p.Mate[].class             IllegalArgumentException: class [Lp.Mate; is an array class
+/// lookup()            (95)     null                       NullPointerException: Cannot invoke "java.lang.Class.isPrimitive()" because "targetClass" is null
+/// null                         p.Mate                     NullPointerException: Cannot read field "allowedModes" because "caller" is null
+/// lookup()            (95)     java.lang.String           OK modes=15 prev=p.PliProbe2   *with* --add-opens java.base/java.lang=ALL-UNNAMED
+/// ```
+///
+/// Two orderings fall straight out of the null cases and are reproduced here:
+/// `caller.allowedModes` is read FIRST (a null `caller` NPEs before the target
+/// is examined at all), and the primitive/array `IllegalArgumentException`s
+/// come BEFORE the mode check — measured, `publicLookup()` with `int.class`
+/// raises the primitive `IllegalArgumentException`, not the access one.
+///
+/// ## What is enforced, and the one deliberate hole
+///
+/// * `caller == null` / `targetClass == null` — the two NPEs above.
+/// * `allowedModes == -1` (`TRUSTED`) — the JDK returns `new Lookup(targetClass)`
+///   from the top of the method without running ANY of the checks below, so we
+///   short-circuit in the same place.
+/// * primitive / array target — `IllegalArgumentException`, JDK wording.
+/// * `(modes & PRIVATE|MODULE) != PRIVATE|MODULE` — `IllegalAccessException`,
+///   **except** when the mode word could not be read at all.
+///
+/// The valve is "could not read", not "reads zero", and the two used to be the
+/// same value: [`lk_read_allowed_modes`] answered 0 both for a Lookup that
+/// genuinely has no modes AND for one whose layout the VM does not model.
+/// Refusing the "cannot tell" 0 would turn every unmodelled Lookup into an
+/// `IllegalAccessException`, which is the one failure mode a new exception path
+/// on this method must not have; admitting the genuine 0 let
+/// `lookup().dropLookupMode(PUBLIC)` through, which HotSpot refuses.
+/// [`lk_read_allowed_modes_opt`] separates them, so the refusal now fires on a
+/// POSITIVELY read weak mode word — `publicLookup()` (0x20), an explicit
+/// `dropLookupMode` (including the 0 case), and a narrowing `Lookup.in`
+/// (0/1/17/25). All of them are cases HotSpot refuses too.
+///
+/// **Not enforced** (one-directional — can only admit what HotSpot refuses,
+/// never refuse what HotSpot admits): the module `canRead`/`isOpen` pair, and
+/// the cross-module success shape (`modes = 15`, `prevLookupClass = caller
+/// class`) it gates. CratonVM has no module graph to answer `isOpen` against —
+/// every class is effectively in the unnamed module here — so a faithful check
+/// would refuse `privateLookupIn(java.util.HashMap.class, lookup())`, which
+/// the VM's own machinery reaches. See the lane report.
+fn pli_enforce(
+    ctx: &mut dyn NativeContext,
+    target: Value,
+    caller: Value,
+) -> Result<(), MethodCallFailed> {
+    // (1) `caller.allowedModes` — the JDK's first dereference.
+    let caller_ref = match caller {
+        Value::Object(Some(o)) => o,
+        _ => {
+            return Err(RuntimeError::NullPointerException {
+                message: Some(
+                    "Cannot read field \"allowedModes\" because \"caller\" is null".to_string(),
+                ),
+            }
+            .into());
+        }
+    };
+    // `None` (unreadable) keeps the permissive valve; `Some(0)` is a real
+    // zero-mode Lookup and is refused. See `lk_read_allowed_modes_opt`.
+    let read_modes = lk_read_allowed_modes_opt(ctx, caller_ref);
+    let modes = read_modes.unwrap_or(0);
+    // (2) TRUSTED short-circuits the whole method, primitive/array included.
+    if modes == -1 {
+        return Ok(());
+    }
+    // (3) `targetClass.isPrimitive()`.
+    let target_ref = match target {
+        Value::Object(Some(o)) => o,
+        _ => {
+            return Err(RuntimeError::NullPointerException {
+                message: Some(
+                    "Cannot invoke \"java.lang.Class.isPrimitive()\" because \"targetClass\" is null"
+                        .to_string(),
+                ),
+            }
+            .into());
+        }
+    };
+    // Read the name before the `&mut` borrow below, and keep it: it is both the
+    // array discriminator and the text of both `IllegalArgumentException`s.
+    let target_name = mirror_class_name(ctx, target_ref);
+    let is_primitive = matches!(
+        crate::lang_class::native_class_is_primitive(ctx, &[Value::Object(Some(target_ref))]),
+        Ok(Some(Value::Int(1)))
+    );
+    if is_primitive {
+        // `Class.toString()` of a primitive is bare — "int", "void" — so the
+        // JDK's `targetClass + " is a primitive class"` has no "class " prefix.
+        let name = target_name.unwrap_or_else(|| "?".to_string());
+        return Err(RuntimeError::IllegalArgumentException {
+            message: format!("{name} is a primitive class"),
+        }
+        .into());
+    }
+    // (4) `targetClass.isArray()`. Array mirrors are the ones whose name starts
+    // with '[' (`lang_class::native_class_is_array` uses the same test).
+    // `Class.toString()` of an array IS prefixed, and prints the BINARY name:
+    // "class [I", "class [Lp.Mate;".
+    if let Some(name) = target_name {
+        if name.starts_with('[') {
+            return Err(RuntimeError::IllegalArgumentException {
+                message: format!("class {} is an array class", name.replace('/', ".")),
+            }
+            .into());
+        }
+    }
+    // (5) the mode gate, with the `modes == 0` valve documented above.
+    if read_modes.is_some() && (modes & LK_MODE_PRIVATE_AND_MODULE) != LK_MODE_PRIVATE_AND_MODULE {
+        return Err(RuntimeError::IllegalAccessException {
+            message: "caller does not have PRIVATE and MODULE lookup mode".to_string(),
+        }
+        .into());
+    }
+    Ok(())
 }
 
 pub fn register_p63_method_handles_lookup(r: &mut NativeMethodRegistry) {
@@ -3607,7 +4905,7 @@ pub fn register_p63_method_handles_lookup(r: &mut NativeMethodRegistry) {
             // Allocate with room for the real 3-field layout (lookupClass,
             // prevLookupClass, allowedModes) so the by-name `allowedModes`
             // write below actually lands.
-            let obj = alloc_concurrent_synthetic(ctx, "java/lang/invoke/MethodHandles$Lookup", 3);
+            let obj = try_alloc_concurrent_synthetic(ctx, "java/lang/invoke/MethodHandles$Lookup", 3)?;
             ctx.set_field_by_name(obj, "lookupClass", caller_class);
             ctx.set_field_by_name(obj, "prevLookupClass", Value::Object(None));
             // Slot-0 lookupClass fallback for the pure-synthetic layout.
@@ -3638,14 +4936,18 @@ pub fn register_p63_method_handles_lookup(r: &mut NativeMethodRegistry) {
             // Setting it to Object lets findVarHandle on widely visible
             // classes still resolve, while preventing access to
             // package-private members (enforced in
-            // `classloader::enforce_lookup_access`, which admits any public
-            // member regardless of the mode bits and requires PRIVATE for
-            // everything else — so dropping PUBLIC here changes nothing).
+            // `lk_enforce_find_access` in this file, which needs no mode bit
+            // for a public member of a public class and requires PRIVATE for a
+            // non-public one — so dropping PUBLIC here changes nothing, while
+            // KEEPING it would have skipped that gate's `modes ==
+            // UNCONDITIONAL` arm entirely). `classloader::enforce_lookup_access`,
+            // which this comment used to name, was never registered and was
+            // deleted 2026-08-12.
             let object_cid = ctx
                 .ensure_class_initialized("java/lang/Object")
                 .unwrap_or(cratonvm_types::ClassId::new(0));
             let object_mirror = ctx.get_class_mirror(object_cid);
-            let obj = alloc_concurrent_synthetic(ctx, "java/lang/invoke/MethodHandles$Lookup", 3);
+            let obj = try_alloc_concurrent_synthetic(ctx, "java/lang/invoke/MethodHandles$Lookup", 3)?;
             ctx.set_field_by_name(obj, "lookupClass", Value::Object(Some(object_mirror)));
             ctx.set_field(obj, 0, Value::Object(Some(object_mirror)));
             // JDK 9+ contract (verified against JDK 25 src.zip,
@@ -3671,12 +4973,40 @@ pub fn register_p63_method_handles_lookup(r: &mut NativeMethodRegistry) {
     );
     r.register(mh, "privateLookupIn", "(Ljava/lang/Class;Ljava/lang/invoke/MethodHandles$Lookup;)Ljava/lang/invoke/MethodHandles$Lookup;", |ctx, args| {
         let target = args.first().copied().unwrap_or(Value::Object(None));
-        let obj = alloc_concurrent_synthetic(ctx, "java/lang/invoke/MethodHandles$Lookup", 3);
+        let caller = args.get(1).copied().unwrap_or(Value::Object(None));
+        // Refuse BEFORE allocating anything — see [`pli_enforce`] for the
+        // measured JDK 25 contract and for the one check deliberately omitted.
+        pli_enforce(ctx, target, caller)?;
+        // `alloc_concurrent_synthetic` can run a moving GC, after which the
+        // `target` ObjectRef the VM handed us in `args` is stale. Same fix, and
+        // the same API, as `Lookup.ensureInitialized` further down; the old code
+        // wrote the pre-GC ref straight into `lookupClass`.
+        let pinned = match target {
+            Value::Object(Some(o)) => Some((ctx.pin_native_root(o), o)),
+            _ => None,
+        };
+        let obj = try_alloc_concurrent_synthetic(ctx, "java/lang/invoke/MethodHandles$Lookup", 3)?;
+        let target = match pinned {
+            Some((handle, o)) => {
+                let current = ctx.read_native_pin(handle, o);
+                ctx.unpin_native_roots(handle);
+                Value::Object(Some(current))
+            }
+            None => target,
+        };
         ctx.set_field_by_name(obj, "lookupClass", target);
+        // Slot 1 of the REAL layout is the `prevLookupClass` REFERENCE. Give it
+        // an explicit null so nothing downstream can read an unwritten slot as
+        // an Int, and so the same-module `prev == null` shape the JDK produces
+        // is what `previousLookupClass()` sees.
+        ctx.set_field_by_name(obj, "prevLookupClass", Value::Object(None));
+        // Slot-0 lookupClass fallback for the pure-synthetic layout.
         ctx.set_field(obj, 0, target);
         // privateLookupIn grants full private access but drops ORIGINAL:
         // PUBLIC|PRIVATE|PROTECTED|PACKAGE|MODULE = 0x1F (incl. PACKAGE 0x08,
-        // which Lookup.defineClass requires).
+        // which Lookup.defineClass requires). Measured: 31 for every target the
+        // JDK admits in the SAME module as the caller — which, with no module
+        // graph modelled, is every target we admit.
         lk_write_allowed_modes(ctx, obj, 0x1F);
         Ok(Some(Value::Object(Some(obj))))
     });
@@ -3750,38 +5080,76 @@ pub fn register_p63_method_handles_lookup(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let this = obj_arg(args, 0)?;
             let target_class = args.get(1).copied().unwrap_or(Value::Object(None));
-            // JDK 25 `Lookup.in(requestedLookupClass)`:
-            //   newModes = (allowedModes & FULL_POWER_MODES) & ~ORIGINAL
-            //   newModes &= ~(PACKAGE|PRIVATE|PROTECTED)  if not same package
-            //   newModes &= ~MODULE                        if not same module
-            // UNCONDITIONAL is never *gained* by `in()`. Measured on JDK 25,
-            // `MethodHandles.lookup().in(String.class).lookupModes()` == 1
-            // (PUBLIC). The old constant here was PUBLIC|UNCONDITIONAL (0x21)
-            // — a combination the JDK treats as impossible (`Lookup.toString`
-            // has a `case UNCONDITIONAL` arm and no `PUBLIC|UNCONDITIONAL`
-            // arm) — and, worse, it dropped PRIVATE even for a same-package
-            // `in()`, which the access check added alongside this would then
-            // have turned into a spurious IllegalAccessException.
+            // Before any mode arithmetic: `in` REJECTS a null, primitive or
+            // array target. Shared with `classloader`'s copy — see
+            // `lk_check_in_target` for the measured JDK behaviour and for why
+            // the test cannot live in one of the two registrations only.
+            crate::classloader::lk_check_in_target(ctx, target_class)?;
+            // `Lookup.in` applies FOUR reductions, not two. Re-measured for
+            // this lane on OpenJDK 25.0.3 (`p.LkProbe2`, receiver
+            // `MethodHandles.lookup()` == 95):
+            //
+            //   in(LkProbe2.class)         the lookup class itself   -> 95
+            //   in(LkProbe2$Nested.class)  a NESTMATE                -> 31
+            //   in(p.Mate.class)           same package, other file  -> 25
+            //   in(String.class)           other module              ->  1
+            //   receiver 32 (publicLookup()), any target             -> 32
+            //   receiver 25, same package / nestmate                 -> 25
+            //   receiver 25, other module                            ->  1
+            //   receiver  1, any target we model                     ->  1
+            //   receiver  0, any target INCLUDING its own class      ->  0
+            //
+            // Three defects lived here, each measurable:
+            //
+            //  (a) `if prev == 0 { FULL_POWER }` — `in()` GRANTING full-power
+            //      access to a lookup that had NONE. Compounded with the
+            //      `Int(0)`-for-an-absent-field trap in
+            //      `lk_read_allowed_modes` (fixed above), which made `prev` 0
+            //      for every fabricated Lookup, so the default fired routinely
+            //      rather than never.
+            //  (b) no `same_class` arm — `in(lookupClass())` returns `this` in
+            //      the JDK, ORIGINAL included (95), and answered 31 here.
+            //  (c) `if modes == 0 { PUBLIC }` — a floor manufacturing PUBLIC
+            //      where the JDK returns 0.
+            //
+            // And the reduction both copies of this method originally missed:
+            // `VerifyAccess.isSamePackageMember`. A same-package class that is
+            // not a member of the same top-level class is a "cousin" and loses
+            // PRIVATE|PROTECTED, so 95 -> &0x1F = 31 -> &~6 = 25. Returning 31
+            // handed a package-mate lookup PRIVATE access the JDK does not
+            // grant — the direction that turns a `find*` which SHOULD raise
+            // `IllegalAccessException` into a silent success. Verified: a
+            // 25-mode `p.Mate` lookup is refused `private LkProbe2.secret`.
+            //
+            // The arithmetic and the class-relation test are `classloader`'s,
+            // shared deliberately so the two competing `in` registrations (this
+            // one wins in real-JDK mode, `classloader`'s in synthetic-JDK mode)
+            // cannot drift apart again.
             let prev = lk_read_allowed_modes(ctx, this);
-            let base = if prev == 0 {
-                LK_MODE_FULL_POWER
-            } else {
-                prev & LK_MODE_FULL_POWER
-            };
             let lookup_class = ctx.get_field(this, 0);
-            let modes = if lk_same_package(ctx, lookup_class, target_class) {
-                base
-            } else {
-                LK_MODE_PUBLIC
+            let (same_class, same_package, same_nest) =
+                crate::classloader::lk_class_relation(ctx, lookup_class, target_class);
+            // A Lookup reporting 0 has no modes to narrow, and `in()` never
+            // GRANTS. Measured: `lookup().dropLookupMode(PUBLIC)` is 0 and its
+            // `.in(<own class>)` / `.in(<package mate>)` / `.in(String.class)`
+            // are all 0.
+            let target_is_public = match target_class {
+                Value::Object(Some(m)) => crate::lang_class::mirror_is_public(ctx, m),
+                _ => false,
             };
-            // Never store a bare 0: `lk_enforce_find_access` reads 0 as "modes
-            // unknown, stay permissive", and a genuinely powerless lookup must
-            // not inherit that valve. PUBLIC-only refuses every non-public
-            // member, which is the behaviour a 0-mode JDK Lookup has for
-            // everything we model.
-            let modes = if modes == 0 { LK_MODE_PUBLIC } else { modes };
+            let modes = if prev == 0 {
+                0
+            } else {
+                crate::classloader::lk_in_modes(
+                    prev,
+                    same_class,
+                    same_package,
+                    same_nest,
+                    target_is_public,
+                )
+            };
             let lookup =
-                alloc_concurrent_synthetic(ctx, "java/lang/invoke/MethodHandles$Lookup", 3);
+                try_alloc_concurrent_synthetic(ctx, "java/lang/invoke/MethodHandles$Lookup", 3)?;
             ctx.set_field_by_name(lookup, "lookupClass", target_class);
             ctx.set_field(lookup, 0, target_class); // lookupClass = targetClass
             lk_write_allowed_modes(ctx, lookup, modes);
@@ -3885,6 +5253,7 @@ pub fn register_p63_method_handles_lookup(r: &mut NativeMethodRegistry) {
         Ok(Some(Value::Object(Some(s))))
     });
     r.set_category(__prev_cat);
+    ()
 }
 
 // ---------------------------------------------------------------------------
@@ -3920,7 +5289,7 @@ fn lookup_find_virtual(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     let desc = descriptor_from_method_type(ctx, mt_obj);
     let loaded = ctx.ensure_class_initialized(&class).is_ok();
     lookup_require_method(ctx, loaded, &class, &name, &desc)?;
-    let mh = alloc_method_handle(ctx, &class, &name, &desc, MH_KIND_VIRTUAL);
+    let mh = alloc_method_handle(ctx, &class, &name, &desc, MH_KIND_VIRTUAL)?;
     Ok(Some(Value::Object(Some(mh))))
 }
 
@@ -4033,7 +5402,7 @@ fn lookup_find_static(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     let desc = descriptor_from_method_type(ctx, mt_obj);
     let loaded = ctx.ensure_class_initialized(&class).is_ok();
     lookup_require_method(ctx, loaded, &class, &name, &desc)?;
-    let mh = alloc_method_handle(ctx, &class, &name, &desc, MH_KIND_STATIC);
+    let mh = alloc_method_handle(ctx, &class, &name, &desc, MH_KIND_STATIC)?;
     Ok(Some(Value::Object(Some(mh))))
 }
 
@@ -4060,7 +5429,7 @@ fn lookup_find_constructor(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
     }
     // Ensure class is loaded so constructor resolution works at dispatch time
     let _ = ctx.ensure_class_initialized(&class);
-    let mh = alloc_method_handle(ctx, &class, "<init>", &desc, MH_KIND_CONSTRUCTOR);
+    let mh = alloc_method_handle(ctx, &class, "<init>", &desc, MH_KIND_CONSTRUCTOR)?;
     // Stash the ALREADY-RESOLVED ClassId (from the caller's own Class
     // mirror, class_obj) in the otherwise-unused MH_BOUND slot. Two
     // classes minted under different ClassLoaders can share the same
@@ -4138,7 +5507,7 @@ fn lookup_find_special(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     let loaded = ctx.ensure_class_initialized(&class).is_ok();
     ctx.unpin_native_roots(class_obj_pin);
     lookup_require_method(ctx, loaded, &class, &name, &desc)?;
-    let mh = alloc_method_handle(ctx, &class, &name, &desc, MH_KIND_SPECIAL);
+    let mh = alloc_method_handle(ctx, &class, &name, &desc, MH_KIND_SPECIAL)?;
     Ok(Some(Value::Object(Some(mh))))
 }
 
@@ -4204,7 +5573,7 @@ fn lookup_find_getter(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     // `findGetter` to SUCCEED as its fallback — it does, the field is there.)
     lookup_require_field(ctx, target_cid, &class, &name)?;
     let desc = format!("(L{class};){field_desc}");
-    let mh = alloc_method_handle(ctx, &class, &name, &desc, MH_KIND_GETTER);
+    let mh = alloc_method_handle(ctx, &class, &name, &desc, MH_KIND_GETTER)?;
     Ok(Some(Value::Object(Some(mh))))
 }
 
@@ -4235,7 +5604,7 @@ fn lookup_find_setter(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     // Same evidence rule as `lookup_find_getter` above.
     lookup_require_field(ctx, target_cid, &class, &name)?;
     let desc = format!("(L{class};{field_desc})V");
-    let mh = alloc_method_handle(ctx, &class, &name, &desc, MH_KIND_SETTER);
+    let mh = alloc_method_handle(ctx, &class, &name, &desc, MH_KIND_SETTER)?;
     Ok(Some(Value::Object(Some(mh))))
 }
 
@@ -4250,7 +5619,7 @@ fn lookup_find_static_getter(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
                 "",
                 "",
                 MH_KIND_GETTER,
-            )))));
+            )?))));
         }
     };
     let name_obj = match args.get(2) {
@@ -4262,7 +5631,7 @@ fn lookup_find_static_getter(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
                 "",
                 "",
                 MH_KIND_GETTER,
-            )))));
+            )?))));
         }
     };
     let type_obj = match args.get(3) {
@@ -4274,14 +5643,14 @@ fn lookup_find_static_getter(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
                 "",
                 "",
                 MH_KIND_GETTER,
-            )))));
+            )?))));
         }
     };
     let class = mirror_class_name(ctx, class_obj).unwrap_or_default();
     let name = ctx.read_string(name_obj).unwrap_or_default();
     let field_desc = field_descriptor_from_mirror(ctx, type_obj);
     let desc = format!("(){field_desc}");
-    let mh = alloc_method_handle(ctx, &class, &name, &desc, MH_KIND_GETTER);
+    let mh = alloc_method_handle(ctx, &class, &name, &desc, MH_KIND_GETTER)?;
     Ok(Some(Value::Object(Some(mh))))
 }
 
@@ -4296,7 +5665,7 @@ fn lookup_find_static_setter(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
                 "",
                 "",
                 MH_KIND_SETTER,
-            )))));
+            )?))));
         }
     };
     let name_obj = match args.get(2) {
@@ -4308,7 +5677,7 @@ fn lookup_find_static_setter(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
                 "",
                 "",
                 MH_KIND_SETTER,
-            )))));
+            )?))));
         }
     };
     let type_obj = match args.get(3) {
@@ -4320,14 +5689,14 @@ fn lookup_find_static_setter(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
                 "",
                 "",
                 MH_KIND_SETTER,
-            )))));
+            )?))));
         }
     };
     let class = mirror_class_name(ctx, class_obj).unwrap_or_default();
     let name = ctx.read_string(name_obj).unwrap_or_default();
     let field_desc = field_descriptor_from_mirror(ctx, type_obj);
     let desc = format!("({field_desc})V");
-    let mh = alloc_method_handle(ctx, &class, &name, &desc, MH_KIND_SETTER);
+    let mh = alloc_method_handle(ctx, &class, &name, &desc, MH_KIND_SETTER)?;
     Ok(Some(Value::Object(Some(mh))))
 }
 
@@ -4355,8 +5724,6 @@ fn lookup_find_var_handle(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
     let field_name = ctx.read_string(name_obj).unwrap_or_default();
     let field_desc = field_descriptor_from_mirror(ctx, type_obj);
 
-    // Resolve the field index
-    let field_index = ctx.resolve_field_index(&class, &field_name).unwrap_or(0);
     let class_id = match mirror_class_id(ctx, class_obj) {
         Some(id) => id,
         None => match ctx.class_id_by_name(&class) {
@@ -4370,10 +5737,26 @@ fn lookup_find_var_handle(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
             }
         },
     };
+    // HotSpot raises `NoSuchFieldException` from `findVarHandle` for a field
+    // that is not there. `findGetter`/`findSetter` two functions up already run
+    // this exact gate; `findVarHandle` did not, and the `.unwrap_or(0)` below
+    // then turned the miss into a handle onto SLOT 0 — so
+    // `findVarHandle(Point.class, "z", int.class).set(p, 42)` silently
+    // overwrote `Point.x`. `lookup_require_field` only refuses when it could
+    // actually enumerate the declared fields, which keeps the stub-class escape
+    // hatch its two existing callers depend on.
+    lookup_require_field(ctx, Some(class_id), &class, &field_name)?;
+    // `-1`, not `0`, is "unresolved" — see `alloc_instance_var_handle`. A `0`
+    // here is indistinguishable from a real first field, so the by-name
+    // re-resolution in `varhandle_get`/`varhandle_set` could never fire.
+    let field_index = match ctx.resolve_field_index(&class, &field_name) {
+        Some(idx) => idx as i32,
+        None => -1,
+    };
 
     let vh =
         alloc_instance_var_handle(ctx, &class, &field_name, &field_desc, field_index, class_id);
-    Ok(Some(Value::Object(Some(vh))))
+    Ok(Some(Value::Object(Some(vh?))))
 }
 
 fn lookup_find_static_var_handle(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -4401,7 +5784,7 @@ fn lookup_find_static_var_handle(ctx: &mut dyn NativeContext, args: &[Value]) ->
     let field_desc = field_descriptor_from_mirror(ctx, type_obj);
 
     let vh = alloc_static_var_handle(ctx, &class, &field_name, &field_desc);
-    Ok(Some(Value::Object(Some(vh))))
+    Ok(Some(Value::Object(Some(vh?))))
 }
 
 /// `MethodHandles.Lookup.revealDirect(MethodHandle)`
@@ -4481,7 +5864,7 @@ fn lookup_reveal_direct(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
 
     // Build the MemberName. Its declared layout is documented on the `MN_*`
     // constants next to `native_mhn_resolve`.
-    let mn = alloc_concurrent_synthetic(ctx, "java/lang/invoke/MemberName", MN_FIELD_COUNT);
+    let mn = try_alloc_concurrent_synthetic(ctx, "java/lang/invoke/MemberName", MN_FIELD_COUNT)?;
 
     // clazz: Class mirror of the declaring class. Fall back to a synthetic
     // mirror only if the class is genuinely unloadable.
@@ -4491,7 +5874,7 @@ fn lookup_reveal_direct(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
             let _ = ctx.ensure_class_initialized(&class);
             match ctx.class_id_by_name(&class) {
                 Some(cid) => ctx.get_class_mirror(cid),
-                None => alloc_concurrent_synthetic(ctx, "java/lang/Class", 1),
+                None => try_alloc_concurrent_synthetic(ctx, "java/lang/Class", 1)?,
             }
         }
     };
@@ -4515,10 +5898,12 @@ fn lookup_reveal_direct(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     // raw write is what a real one needs resolved on the receiver.
     let type_value = if kind_flag == IS_FIELD {
         let field_type_slice = field_type_from_desc(&desc, ref_kind);
-        Value::Object(Some(field_type_mirror(ctx, &field_type_slice)))
+        Value::Object(Some(field_type_mirror(ctx, &field_type_slice)?))
     } else {
-        let mt = build_method_type_from_descriptor(ctx, &desc)
-            .or_else(|| build_method_type_from_descriptor(ctx, "()V"));
+        let mt = match build_method_type_from_descriptor(ctx, &desc)? {
+            Some(mt) => Some(mt),
+            None => build_method_type_from_descriptor(ctx, "()V")?,
+        };
         Value::Object(mt)
     };
     mn_set(ctx, mn, "type", MN_TYPE, type_value);
@@ -4539,7 +5924,7 @@ fn lookup_reveal_direct(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     // bypass <init> assertions by direct field writes — they're disabled in
     // production JDKs anyway.
     let lookup_this = args.first().copied().unwrap_or(Value::Object(None));
-    let info = alloc_concurrent_synthetic(ctx, "java/lang/invoke/InfoFromMemberName", 2);
+    let info = try_alloc_concurrent_synthetic(ctx, "java/lang/invoke/InfoFromMemberName", 2)?;
     // Invoke the real constructor so any future-version field additions are
     // populated correctly. Falls back to direct field writes if invocation
     // fails (e.g. class not yet on the classpath in stripped runtimes).
@@ -4622,7 +6007,7 @@ fn field_type_from_desc(desc: &str, ref_kind: i32) -> String {
 }
 
 /// Build a Class mirror for a field-type descriptor slice (one JVM type).
-fn field_type_mirror(ctx: &mut dyn NativeContext, ty: &str) -> ObjectRef {
+fn field_type_mirror(ctx: &mut dyn NativeContext, ty: &str) -> Result<ObjectRef, MethodCallFailed> {
     // Primitive shortcuts: use a wrapper class mirror as a reasonable proxy.
     // Real JDK uses primitive-Class mirrors here; our wrapper substitutes
     // keep MemberName.getMethodType / getDeclaringClass consumers happy.
@@ -4639,18 +6024,18 @@ fn field_type_mirror(ctx: &mut dyn NativeContext, ty: &str) -> ObjectRef {
         Some('[') => return field_type_mirror_class(ctx, ty),
         _ => "java/lang/Object",
     };
-    field_type_mirror_class(ctx, class_name)
+    Ok(field_type_mirror_class(ctx, class_name)?)
 }
 
-fn field_type_mirror_class(ctx: &mut dyn NativeContext, class_name: &str) -> ObjectRef {
+fn field_type_mirror_class(ctx: &mut dyn NativeContext, class_name: &str) -> Result<ObjectRef, MethodCallFailed> {
     if let Some(cid) = ctx.class_id_by_name(class_name) {
-        return ctx.get_class_mirror(cid);
+        return Ok(ctx.get_class_mirror(cid));
     }
     let _ = ctx.ensure_class_initialized(class_name);
     if let Some(cid) = ctx.class_id_by_name(class_name) {
-        return ctx.get_class_mirror(cid);
+        return Ok(ctx.get_class_mirror(cid));
     }
-    alloc_concurrent_synthetic(ctx, "java/lang/Class", 1)
+    Ok(try_alloc_concurrent_synthetic(ctx, "java/lang/Class", 1)?)
 }
 
 // =============================================================================
@@ -4693,6 +6078,7 @@ pub(crate) fn register_array_element_accessor_bridges(r: &mut NativeMethodRegist
         |ctx, args| array_element_accessor_handle(ctx, args, true),
     );
     r.set_category(__prev_cat);
+    ()
 }
 
 /// Shared body of the `arrayElementGetter` / `arrayElementSetter` bridges.
@@ -4750,7 +6136,7 @@ fn array_element_accessor_handle(
     } else {
         (format!("({arr_desc}I){comp}"), MH_KIND_ARRAY_GET)
     };
-    let handle = alloc_method_handle(ctx, &arr_desc, factory, &desc, kind);
+    let handle = alloc_method_handle(ctx, &arr_desc, factory, &desc, kind)?;
     Ok(Some(Value::Object(Some(handle))))
 }
 
@@ -4786,13 +6172,14 @@ pub(crate) fn register_method_handles_constant_bridge(r: &mut NativeMethodRegist
                 _ => DESC_OBJECT.to_string(),
             };
             let desc = format!("(){ret_desc}");
-            let handle = alloc_method_handle(ctx, "", "", &desc, MH_KIND_CONSTANT);
+            let handle = alloc_method_handle(ctx, "", "", &desc, MH_KIND_CONSTANT)?;
             let value = args.get(1).copied().unwrap_or(Value::Object(None));
             ctx.set_field(handle, MH_BOUND, value);
             Ok(Some(Value::Object(Some(handle))))
         },
     );
     r.set_category(__prev_cat);
+    ()
 }
 
 /// `MethodHandles.identity(Class type)` — a *functional* shim returning an
@@ -4819,11 +6206,12 @@ pub(crate) fn register_method_handles_identity_bridge(r: &mut NativeMethodRegist
                 _ => DESC_OBJECT.to_string(),
             };
             let desc = format!("({ty}){ty}");
-            let handle = alloc_method_handle(ctx, "", "", &desc, MH_KIND_IDENTITY);
+            let handle = alloc_method_handle(ctx, "", "", &desc, MH_KIND_IDENTITY)?;
             Ok(Some(Value::Object(Some(handle))))
         },
     );
     r.set_category(__prev_cat);
+    ()
 }
 
 /// `CallSite.dynamicInvoker()` (concrete on `MutableCallSite` /
@@ -4856,13 +6244,14 @@ pub(crate) fn register_callsite_dynamic_invoker_bridge(r: &mut NativeMethodRegis
                 // nullary Object-returning type when the target is unreadable.
                 let desc =
                     callsite_target_desc(ctx, this).unwrap_or_else(|| format!("(){DESC_OBJECT}"));
-                let handle = alloc_method_handle(ctx, "", "", &desc, MH_KIND_DYNAMIC_INVOKER);
+                let handle = alloc_method_handle(ctx, "", "", &desc, MH_KIND_DYNAMIC_INVOKER)?;
                 ctx.set_field(handle, MH_BOUND, Value::Object(Some(this)));
                 Ok(Some(Value::Object(Some(handle))))
             },
         );
     }
     r.set_category(__prev_cat);
+    ()
 }
 
 fn make_drop_arguments_adapter(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -4902,7 +6291,7 @@ fn make_drop_arguments_adapter(ctx: &mut dyn NativeContext, args: &[Value]) -> M
     // and re-read the forwarded references before their next use.
     let orig_mh_pin = ctx.pin_native_root(orig_mh);
     let extra_classes_pin = ctx.pin_native_root(extra_classes);
-    let wrapper = alloc_method_handle(ctx, &pos_str, "drop", &widened_desc, MH_KIND_DROP);
+    let wrapper = alloc_method_handle(ctx, &pos_str, "drop", &widened_desc, MH_KIND_DROP)?;
     let orig_mh = ctx.read_native_pin(orig_mh_pin, orig_mh);
     let extra_classes = ctx.read_native_pin(extra_classes_pin, extra_classes);
     ctx.set_field(wrapper, MH_BOUND, Value::Object(Some(orig_mh)));
@@ -4938,12 +6327,12 @@ fn make_drop_arguments_adapter(ctx: &mut dyn NativeContext, args: &[Value]) -> M
             // GC-safety: `alloc_concurrent_synthetic` below can trigger a
             // collection that relocates `new_ptypes` (fully populated above,
             // read again once the new MethodType wraps it).
-            let new_mt = alloc_concurrent_synthetic(ctx, "java/lang/invoke/MethodType", 6);
+            let new_mt = try_alloc_concurrent_synthetic(ctx, "java/lang/invoke/MethodType", 6)?;
             let new_ptypes = ctx.read_native_pin(new_ptypes_pin, new_ptypes);
             ctx.unpin_native_roots(orig_ptypes_pin);
             ctx.set_field(new_mt, 0, ret);
             ctx.set_field(new_mt, 1, Value::Object(Some(new_ptypes)));
-            populate_method_type_form(ctx, new_mt);
+            populate_method_type_form(ctx, new_mt)?;
             ctx.set_field_by_name(wrapper, "type", Value::Object(Some(new_mt)));
         }
     }
@@ -4993,12 +6382,12 @@ pub(crate) fn register_method_handle_combinator_extras_bridge(r: &mut NativeMeth
                 _ => 0,
             };
             let values = args.get(2).copied().unwrap_or(Value::Object(None));
-            let wrapper = alloc_concurrent_synthetic(ctx, "__mh_insert_wrapper__", 3);
+            let wrapper = alloc_mh_carrier(ctx, "__mh_insert_wrapper__", 3);
             ctx.set_field(wrapper, 0, Value::Object(Some(target)));
             ctx.set_field(wrapper, 1, values);
             ctx.set_field(wrapper, 2, Value::Int(pos));
             let desc = mh_read_desc(ctx, target).unwrap_or_default();
-            let adapter = alloc_method_handle(ctx, "__adapter__", "insert", &desc, MH_KIND_INSERT);
+            let adapter = alloc_method_handle(ctx, "__adapter__", "insert", &desc, MH_KIND_INSERT)?;
             ctx.set_field(adapter, MH_BOUND, Value::Object(Some(wrapper)));
             // type(): insertArguments at `pos` REMOVES `values.length` parameters
             // (the bound ones) from the target's type. Chain off the target's
@@ -5019,7 +6408,7 @@ pub(crate) fn register_method_handle_combinator_extras_bridge(r: &mut NativeMeth
                             params.drain(p..end);
                         }
                         let new_desc = format!("({}){}", params.concat(), ret);
-                        if let Some(mt) = build_method_type_from_descriptor(ctx, &new_desc) {
+                        if let Ok(Some(mt)) = build_method_type_from_descriptor(ctx, &new_desc) {
                             ctx.set_field_by_name(adapter, "type", Value::Object(Some(mt)));
                         }
                     }
@@ -5040,12 +6429,27 @@ pub(crate) fn register_method_handle_combinator_extras_bridge(r: &mut NativeMeth
                 Some(Value::Int(c)) => *c,
                 _ => 0,
             };
-            let wrapper = alloc_concurrent_synthetic(ctx, "__mh_collect_wrapper__", 2);
+            // Slot 2 is the `arrayType` Class mirror, and it is the whole of
+            // W7-19's `asCollector` fix. Without it the `MH_KIND_COLLECT` arm
+            // has no way to learn the collector's ARRAY TYPE — the carrier
+            // held only (target, count) and the arm therefore gathered into an
+            // `Object[]` for every collector, so `sumAll(int[])
+            // .asCollector(int[].class, 3).invoke(1,2,3)` handed `sumAll` a
+            // reference array and answered 0 where HotSpot 25 answers 6.
+            // A mirror is a REFERENCE, so it goes in a carrier slot without
+            // the int-in-an-oop-slot hazard §5 is about; the alternative
+            // (an encoded element-type tag) would be exactly that hazard.
+            let arr_cls = match args.get(1) {
+                Some(Value::Object(Some(c))) => Some(*c),
+                _ => None,
+            };
+            let wrapper = alloc_mh_carrier(ctx, "__mh_collect_wrapper__", 3);
             ctx.set_field(wrapper, 0, Value::Object(Some(target)));
             ctx.set_field(wrapper, 1, Value::Int(count));
+            ctx.set_field(wrapper, 2, Value::Object(arr_cls));
             let desc = mh_read_desc(ctx, target).unwrap_or_default();
             let adapter =
-                alloc_method_handle(ctx, "__adapter__", "collect", &desc, MH_KIND_COLLECT);
+                alloc_method_handle(ctx, "__adapter__", "collect", &desc, MH_KIND_COLLECT)?;
             ctx.set_field(adapter, MH_BOUND, Value::Object(Some(wrapper)));
             // type(): asCollector REPLACES the trailing array parameter with
             // `count` parameters of the array's component type (HotSpot:
@@ -5072,7 +6476,7 @@ pub(crate) fn register_method_handle_combinator_extras_bridge(r: &mut NativeMeth
                         params.push(comp.clone());
                     }
                     let new_desc = format!("({}){}", params.concat(), ret);
-                    if let Some(mt) = build_method_type_from_descriptor(ctx, &new_desc) {
+                    if let Ok(Some(mt)) = build_method_type_from_descriptor(ctx, &new_desc) {
                         ctx.set_field_by_name(adapter, "type", Value::Object(Some(mt)));
                     }
                 }
@@ -5092,18 +6496,18 @@ pub(crate) fn register_method_handle_combinator_extras_bridge(r: &mut NativeMeth
                 Some(Value::Int(c)) => *c,
                 _ => 0,
             };
-            let wrapper = alloc_concurrent_synthetic(ctx, "__mh_spread_wrapper__", 2);
+            let wrapper = alloc_mh_carrier(ctx, "__mh_spread_wrapper__", 2);
             ctx.set_field(wrapper, 0, Value::Object(Some(target)));
             ctx.set_field(wrapper, 1, Value::Int(count));
             let desc = mh_read_desc(ctx, target).unwrap_or_default();
-            let adapter = alloc_method_handle(ctx, "__adapter__", "spread", &desc, MH_KIND_SPREAD);
+            let adapter = alloc_method_handle(ctx, "__adapter__", "spread", &desc, MH_KIND_SPREAD)?;
             ctx.set_field(adapter, MH_BOUND, Value::Object(Some(wrapper)));
             Ok(Some(Value::Object(Some(adapter))))
         },
     );
 
     // MethodHandle.asVarargsCollector(arrayType) / MethodHandle.asFixedArity()
-    // → the receiver, unchanged.
+    // → the receiver, with only the `MH_VARARGS` marking changed.
     //
     // Why the real bytecode cannot run here: `asVarargsCollector` wraps the
     // receiver in `MethodHandleImpl$AsVarargsCollector`, a
@@ -5126,28 +6530,82 @@ pub(crate) fn register_method_handle_combinator_extras_bridge(r: &mut NativeMeth
     // `invoke` that supplies more flat values than the target descriptor
     // declares into a fresh array of the array-typed parameter's component
     // type. That trigger is arity/shape driven, so a "this handle is a
-    // collector" marking adds nothing to it. `asFixedArity()` is the inverse
+    // collector" marking adds nothing to it — the `MH_VARARGS` bit below is
+    // answered to reflective callers and is never consulted by dispatch.
+    // `asFixedArity()` is the inverse
     // and is likewise the identity: `collect_trailing_varargs` returns an
     // already-packed call (exactly N args, an array in the array slot)
     // untouched, which is precisely fixed-arity behaviour.
     //
-    // Known deviation, deliberately not papered over: `isVarargsCollector()`
-    // keeps answering `false` (the base-class bytecode) because the marking is
-    // not stored anywhere. Recording it would need a sixth synthetic slot on
-    // every MethodHandle (`MH_BOUND + 1` is the allocated width today), and no
-    // caller in the corpus reads the flag back.
-    for (name, desc) in [
-        (
-            "asVarargsCollector",
-            "(Ljava/lang/Class;)Ljava/lang/invoke/MethodHandle;",
-        ),
-        ("asFixedArity", "()Ljava/lang/invoke/MethodHandle;"),
-    ] {
-        r.register("java/lang/invoke/MethodHandle", name, desc, |_ctx, args| {
-            // args[0] is the receiver; hand it straight back.
+    // W7-19 §5.2, the former "known deviation": `isVarargsCollector()` used to
+    // answer `false` for every handle, including one just returned by
+    // `asVarargsCollector`, because the marking was stored nowhere. It is now
+    // stored — in `MH_VARARGS`, the sixth synthetic slot, set here and cleared
+    // by `asFixedArity` — and read back by an `isVarargsCollector` native
+    // registered below. Both writers are width-guarded (see `MH_VARARGS`), so a
+    // handle minted by some other allocator is untouched and still answers
+    // `false`, exactly as before.
+    //
+    // DECLARED DEVIATION that survives, and it is a consequence of the identity
+    // shim above rather than of the marking: HotSpot's `asVarargsCollector`
+    // returns a NEW handle and leaves the receiver fixed-arity, so on HotSpot
+    // `h.isVarargsCollector()` stays false and `h.asVarargsCollector(t)
+    // .isVarargsCollector()` is true. Here there is only ONE handle, so the
+    // marking is visible through the receiver too, and `asFixedArity()` clears
+    // it on that same object. Minting a copy instead would have to reproduce all
+    // six synthetic slots plus the `type` field of an arbitrary handle kind, and
+    // dispatch is unaffected either way — `collect_trailing_varargs` derives
+    // varargs behaviour from arity, never from this bit. `RJdkHandles` therefore
+    // asserts the marking on the RESULT of `asVarargsCollector` and does not
+    // re-read the receiver afterwards; W7-19 §5.2 records why.
+    r.register(
+        "java/lang/invoke/MethodHandle",
+        "asVarargsCollector",
+        "(Ljava/lang/Class;)Ljava/lang/invoke/MethodHandle;",
+        |ctx, args| {
+            // args[0] is the receiver; hand it straight back, marked.
+            if let Some(Value::Object(Some(this))) = args.first() {
+                mh_set_varargs_collector(ctx, *this, true);
+            }
             Ok(Some(args.first().copied().unwrap_or(Value::Object(None))))
-        });
-    }
+        },
+    );
+    r.register(
+        "java/lang/invoke/MethodHandle",
+        "asFixedArity",
+        "()Ljava/lang/invoke/MethodHandle;",
+        |ctx, args| {
+            if let Some(Value::Object(Some(this))) = args.first() {
+                mh_set_varargs_collector(ctx, *this, false);
+            }
+            Ok(Some(args.first().copied().unwrap_or(Value::Object(None))))
+        },
+    );
+    // `MethodHandle.isVarargsCollector()` is CONCRETE in the real JDK — the base
+    // class returns `false` and `MethodHandleImpl$AsVarargsCollector` overrides
+    // it — so this registration shadows real bytecode. That is the default per
+    // `docs/architecture/natives-over-real-jdk-classes.md` §1: on the cold
+    // interpreter paths a registered native beats bytecode with no list
+    // consulted, and this block's ambient `NativeKind` is `Bridge`, which
+    // `--jdk-only` keeps. The warm/cached/JIT paths reinstate the preference
+    // from `vm_exec.rs`'s `check_override` mirror, which lists
+    // `asVarargsCollector`/`asFixedArity` but not this method; a lane that owns
+    // that file should add it, and until then the only cost is that a JIT-warm
+    // caller may read the base class's `false` instead of the marking. Answering
+    // `false` is what the whole VM did before this change, so the fallback is
+    // the old behaviour rather than a new wrong answer.
+    r.register(
+        "java/lang/invoke/MethodHandle",
+        "isVarargsCollector",
+        "()Z",
+        |ctx, args| {
+            let flagged = match args.first() {
+                Some(Value::Object(Some(this))) => mh_is_varargs_collector(ctx, *this),
+                _ => false,
+            };
+            Ok(Some(Value::Int(if flagged { 1 } else { 0 })))
+        },
+    );
 
     // MethodHandles.explicitCastArguments(target, newType) → passthrough that
     // stamps the new type (mirrors the `asType` shim). The real bytecode runs
@@ -5175,7 +6633,7 @@ pub(crate) fn register_method_handle_combinator_extras_bridge(r: &mut NativeMeth
         "makeUninitializedCallSite",
         "(Ljava/lang/invoke/MethodType;)Ljava/lang/invoke/MethodHandle;",
         |ctx, args| {
-            let handle = alloc_method_handle(ctx, "", "uninit", "", MH_KIND_CONSTANT);
+            let handle = alloc_method_handle(ctx, "", "uninit", "", MH_KIND_CONSTANT)?;
             if let Some(Value::Object(Some(mt))) = args.get(1) {
                 ctx.set_field_by_name(handle, "type", Value::Object(Some(*mt)));
             }
@@ -5212,6 +6670,7 @@ pub(crate) fn register_method_handle_combinator_extras_bridge(r: &mut NativeMeth
     }
 
     r.set_category(__prev_cat);
+    ()
 }
 
 /// Read a call site's current target MethodHandle descriptor (real
@@ -5249,7 +6708,7 @@ pub(crate) fn register_p65_method_handles_extra(r: &mut NativeMethodRegistry) {
         "(Ljava/lang/invoke/MethodType;)Ljava/lang/invoke/MethodHandle;",
         |ctx, args| {
             // C19: empty(mt) takes a MethodType — thread it into `type`.
-            let obj = alloc_concurrent_synthetic(ctx, "java/lang/invoke/MethodHandle", 17);
+            let obj = try_alloc_concurrent_synthetic(ctx, "java/lang/invoke/MethodHandle", 17)?;
             if let Some(Value::Object(Some(mt))) = args.first() {
                 ctx.set_field_by_name(obj, "type", Value::Object(Some(*mt)));
             }
@@ -5261,14 +6720,15 @@ pub(crate) fn register_p65_method_handles_extra(r: &mut NativeMethodRegistry) {
         "zero",
         "(Ljava/lang/Class;)Ljava/lang/invoke/MethodHandle;",
         |ctx, _args| {
-            let obj = alloc_concurrent_synthetic(ctx, "java/lang/invoke/MethodHandle", 17);
-            if let Some(mt) = build_method_type_from_descriptor(ctx, "()V") {
+            let obj = try_alloc_concurrent_synthetic(ctx, "java/lang/invoke/MethodHandle", 17)?;
+            if let Ok(Some(mt)) = build_method_type_from_descriptor(ctx, "()V") {
                 ctx.set_field_by_name(obj, "type", Value::Object(Some(mt)));
             }
             Ok(Some(Value::Object(Some(obj))))
         },
     );
     r.set_category(__prev_cat);
+    ()
 }
 
 // =============================================================================
@@ -5312,16 +6772,18 @@ pub fn register_p68_invoke_extras(r: &mut NativeMethodRegistry) {
     // MethodHandle itself. Answer them consistently off that, so
     // `isWrapperInstance(asInterfaceInstance(...))` is true and the two
     // accessors return the target and its type instead of null.
-    fn mhp_wrapper_handle(ctx: &mut dyn NativeContext, args: &[Value]) -> Option<ObjectRef> {
+    fn mhp_wrapper_handle(ctx: &mut dyn NativeContext, args: &[Value]) -> Result<Option<ObjectRef>, MethodCallFailed> {
         let Some(Value::Object(Some(obj))) = args.first().copied() else {
-            return None;
+            return Ok(None);
         };
-        let mh_class_id = ctx.class_id_by_name("java/lang/invoke/MethodHandle")?;
+        let Some(mh_class_id) = ctx.class_id_by_name("java/lang/invoke/MethodHandle") else {
+            return Ok(None);
+        };
         let obj_class_id = ctx.class_id_of_object(obj);
         if obj_class_id == mh_class_id || ctx.is_subclass(obj_class_id, mh_class_id) {
-            Some(obj)
+            Ok(Some(obj))
         } else {
-            None
+            Ok(None)
         }
     }
     r.register(
@@ -5329,7 +6791,7 @@ pub fn register_p68_invoke_extras(r: &mut NativeMethodRegistry) {
         "isWrapperInstance",
         "(Ljava/lang/Object;)Z",
         |ctx, args| {
-            let present = mhp_wrapper_handle(ctx, args).is_some();
+            let present = mhp_wrapper_handle(ctx, args)?.is_some();
             Ok(Some(Value::Int(if present { 1 } else { 0 })))
         },
     );
@@ -5337,7 +6799,7 @@ pub fn register_p68_invoke_extras(r: &mut NativeMethodRegistry) {
         mhp,
         "wrapperInstanceTarget",
         "(Ljava/lang/Object;)Ljava/lang/invoke/MethodHandle;",
-        |ctx, args| match mhp_wrapper_handle(ctx, args) {
+        |ctx, args| match mhp_wrapper_handle(ctx, args)? {
             // Real JDK throws IllegalArgumentException for a non-wrapper; we
             // keep the historical null there so an existing caller that never
             // checked `isWrapperInstance` first does not start throwing.
@@ -5440,7 +6902,7 @@ pub fn register_p68_invoke_extras(r: &mut NativeMethodRegistry) {
             // Preferred path: synthesise a genuine lambda proxy + factory MH so
             // `cs.getTarget().bindTo(..).invoke()` yields a working SAM instance
             // whose abstract method runs the impl method.
-            if let Some(ccs) = build_reflective_lambda_callsite(
+            if let Ok(Some(ccs)) = build_reflective_lambda_callsite(
                 ctx, invoked_type, &invoked_name, sam_type, impl_method, inst_type, false, &[],
             ) {
                 if key.impl_ != 0 {
@@ -5464,11 +6926,11 @@ pub fn register_p68_invoke_extras(r: &mut NativeMethodRegistry) {
                 if invoked_name.is_empty() { "apply" } else { invoked_name.as_str() },
                 "()Ljava/lang/Object;",
                 MH_KIND_STATIC,
-            );
+            )?;
             if let Some(Value::Object(Some(mt))) = args.get(2) {
                 ctx.set_field_by_name(noop, "type", Value::Object(Some(*mt)));
             }
-            Ok(Some(Value::Object(Some(alloc_frozen_constant_call_site(ctx, noop)))))
+            Ok(Some(Value::Object(Some(alloc_frozen_constant_call_site(ctx, noop)?))))
         });
     r.register(lmf, "altMetafactory",
         "(Ljava/lang/invoke/MethodHandles$Lookup;Ljava/lang/String;Ljava/lang/invoke/MethodType;[Ljava/lang/Object;)Ljava/lang/invoke/CallSite;",
@@ -5557,7 +7019,7 @@ pub fn register_p68_invoke_extras(r: &mut NativeMethodRegistry) {
                 Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
                 _ => String::new(),
             };
-            if let Some(ccs) = build_reflective_lambda_callsite(
+            if let Ok(Some(ccs)) = build_reflective_lambda_callsite(
                 ctx, invoked_type, &invoked_name, sam_type, impl_method, inst_type, ser_flag,
                 &marker_names,
             ) {
@@ -5577,11 +7039,11 @@ pub fn register_p68_invoke_extras(r: &mut NativeMethodRegistry) {
                 if invoked_name.is_empty() { "apply" } else { invoked_name.as_str() },
                 "()Ljava/lang/Object;",
                 MH_KIND_STATIC,
-            );
+            )?;
             if let Some(Value::Object(Some(mt))) = args.get(2) {
                 ctx.set_field_by_name(noop, "type", Value::Object(Some(*mt)));
             }
-            Ok(Some(Value::Object(Some(alloc_frozen_constant_call_site(ctx, noop)))))
+            Ok(Some(Value::Object(Some(alloc_frozen_constant_call_site(ctx, noop)?))))
         });
 
     // NB: an earlier draft added a short-circuit for
@@ -5627,6 +7089,114 @@ const MH_NAME: usize = MH_BASE + 1;
 const MH_DESC: usize = MH_BASE + 2;
 const MH_KIND: usize = MH_BASE + 3;
 const MH_BOUND: usize = MH_BASE + 4;
+
+/// The `asVarargsCollector` marking — `Int(1)` when this handle is a
+/// variable-arity collector, `Int(0)`/absent otherwise (W7-19 §5.2).
+///
+/// Sixth and last synthetic slot; `alloc_method_handle` and
+/// `alloc_string_concat_method_handle` allocate `MH_VARARGS + 1`.
+///
+/// **Never read it raw.** Not every `java/lang/invoke/MethodHandle` in this VM
+/// carries this layout: `MethodHandles.empty`/`zero` allocate 17 slots and
+/// `panama.rs` uses a compact layout whose field 0 is a native address, so a
+/// bare `get_field(mh, MH_VARARGS)` is an out-of-bounds read on a real
+/// receiver — the same shape as the inert `arrayElementGetter` handle recorded
+/// on [`MH_KIND_ARRAY_GET`], where slots 18 and 19 were read off the end of a
+/// 17-slot object. [`mh_is_varargs_collector`] and
+/// [`mh_set_varargs_collector`] width-guard with `object_num_fields` for that
+/// reason.
+const MH_VARARGS: usize = MH_BASE + 5;
+
+/// Is this handle marked a variable-arity collector? Width-guarded — see
+/// [`MH_VARARGS`]. A handle that is too narrow to carry the marking simply is
+/// not one, which is the pre-W7-19 answer for every handle.
+fn mh_is_varargs_collector(ctx: &dyn NativeContext, mh: ObjectRef) -> bool {
+    ctx.object_num_fields(mh) > MH_VARARGS && matches!(ctx.get_field(mh, MH_VARARGS), Value::Int(1))
+}
+
+/// Set or clear the marking, width-guarded — see [`MH_VARARGS`]. A handle
+/// narrower than the standard synthetic layout is left exactly as it was; the
+/// write is never allowed off the end of the object.
+fn mh_set_varargs_collector(ctx: &dyn NativeContext, mh: ObjectRef, on: bool) {
+    if ctx.object_num_fields(mh) > MH_VARARGS {
+        ctx.set_field(mh, MH_VARARGS, Value::Int(if on { 1 } else { 0 }));
+    }
+}
+
+/// Mint one of the `__mh_*_wrapper__` combinator carriers that `MH_BOUND`
+/// points at.
+///
+/// Ten of them exist (`insert`, `collect`, `collect_args`, `spread`, `fold`,
+/// `filter`, `retfilter`, `catch`, `permute`, `guard`) and not one is a
+/// stand-in for anything. Each is a 2- or 3-slot tuple holding the state one
+/// `MethodHandles` combinator captured — the target handle, a filter/guard
+/// handle or `MethodHandle[]`, and an `int` position or count — so the matching
+/// `MH_KIND_*` arm of `mh_dispatch` can apply the combinator at invoke time.
+/// No native is registered on any of these names, no bytecode ever names one,
+/// and no entry in the JDK 25 module image declares one (checked with `javap`
+/// and against the full `jimage list`, 2026-08-11).
+///
+/// # Why this is not `try_alloc_concurrent_synthetic`
+///
+/// That funnel is the **compatibility stand-in** door: it asks
+/// `try_ensure_synthetic_class`, which stamps `ClassOrigin::CompatibilityStub`,
+/// and a stand-in is the one thing `--jdk-only` forbids. Every carrier site
+/// used it, so a strict run recorded ten `compatibility-class-requested`
+/// violations reading *"VM-requested stand-in: ensure_synthetic_class called
+/// with no class file on any classpath entry"* and then threw
+/// `NoClassDefFoundError: __mh_insert_wrapper__` out of
+/// `MethodHandles.insertArguments`. The `NoClassDefFoundError` is only the
+/// FIRST carrier the workload reaches, never the only one: a probe that reaches
+/// each combinator independently, catching per step, named all ten on one run
+/// (2026-08-11) while `dropArguments` and `asVarargsCollector` — the two whose
+/// state is a single reference and which therefore need no carrier at all —
+/// passed.
+///
+/// The classification was simply wrong, and the census says so in its own
+/// `reason` string: there is no class file for these names on any classpath
+/// because there is no class. Contract §1 item 6 makes a class the VM creates
+/// without any class file legitimate in **both** modes, and
+/// `ensure_vm_internal_class` is its door — the same one
+/// `vm_exec::heap_alloc_object` takes for `cratonvm/synthetic/AnonymousObject$N`
+/// on word-for-word this reasoning ("a VM bookkeeping type, not a compatibility
+/// substitution"). That door is demonstrably open in strict mode rather than
+/// merely declared to be: a `--jdk-only` run of the shipped binary under
+/// `CRATONVM_DBG_ANONALLOC=1` minted 16 `AnonymousObject$N` and its census
+/// recorded a violation for none of them.
+///
+/// This is not a way around the policy. The question the trait declaration
+/// poses is whether the JVM specification says a class file must exist for the
+/// name; for a carrier CratonVM invented to hold its own combinator state, it
+/// does not.
+///
+/// # What each mode sees
+///
+/// * `JdkOnly` — the refusal disappears and the ten violations leave the
+///   census. This is the whole change.
+/// * `Compatible` — unchanged; that mode fabricates through either door. The
+///   two second-order differences both run the safe way: `fabricate_class`
+///   stops running a full-classpath rescan per carrier looking for real bytes
+///   that cannot exist, and the carriers stop being counted against a
+///   zero-stub census they were never evidence for.
+///
+/// Infallible because `ensure_vm_internal_class` is — the door that never
+/// refuses is the point — so the call sites drop the `?` they carried for a
+/// refusal that was never theirs to propagate.
+#[track_caller]
+fn alloc_mh_carrier(ctx: &mut dyn NativeContext, name: &str, num_fields: usize) -> ObjectRef {
+    let cid = ctx.ensure_vm_internal_class(name, num_fields);
+    // The width clamp is `try_alloc_concurrent_synthetic`'s, kept verbatim: if
+    // the resolved class declares MORE slots than this site asks for,
+    // allocating the smaller number leaves every carrier write past the
+    // requested width silently discarded. The carriers have no
+    // `synthetic_stub_fields` arm, so the class declares 0 and `max` is the
+    // caller's own number — the same arithmetic the old funnel performed for
+    // them, kept rather than simplified away because the day someone adds that
+    // arm is the day dropping it becomes a truncating write.
+    let n = num_fields.max(ctx.class_num_total_fields(cid));
+    ctx.try_alloc_object_gc_safe(cid, n)
+        .unwrap_or_else(|| ctx.alloc_object(cid, n))
+}
 
 /// Returns true if a method descriptor has exactly two parameters.
 /// Used to distinguish instance setters "(Lowner;value)V" (2 params)
@@ -6088,12 +7658,16 @@ pub(crate) fn alloc_method_handle(
     name: &str,
     desc: &str,
     kind: i32,
-) -> cratonvm_types::ObjectRef {
-    // C15: Allocate MH_BOUND+1 slots so our synthetic fields (at slots 16-20)
+) -> Result<cratonvm_types::ObjectRef, MethodCallFailed> {
+    // C15: Allocate MH_VARARGS+1 slots so our synthetic fields (at slots 16-21)
     // live PAST the real JDK's instance-field count (6). This prevents
     // `set_field_by_name(mh, "type", ...)` — which resolves to slot 0 — from
     // overwriting our class/name/desc/kind/bound data.
-    let mh = alloc_concurrent_synthetic(ctx, "java/lang/invoke/MethodHandle", MH_BOUND + 1);
+    // W7-19 §5.2 moved this from `MH_BOUND + 1` to `MH_VARARGS + 1` for the
+    // `asVarargsCollector` marking. Widening is safe in one direction only:
+    // handles minted HERE gain a slot, handles minted elsewhere do not, which
+    // is why every reader of `MH_VARARGS` width-guards.
+    let mh = try_alloc_concurrent_synthetic(ctx, "java/lang/invoke/MethodHandle", MH_VARARGS + 1)?;
     // GC-safety: the `create_string` calls below (and `build_method_type_
     // from_descriptor` further down) can trigger a collection that
     // relocates `mh`; `cls`/`nm` are each also read again after a LATER
@@ -6113,6 +7687,12 @@ pub(crate) fn alloc_method_handle(
     ctx.set_field(mh, MH_DESC, Value::Object(Some(dc)));
     ctx.set_field(mh, MH_KIND, Value::Int(kind));
     ctx.set_field(mh, MH_BOUND, Value::Object(None));
+    // Definitively NOT a varargs collector until `asVarargsCollector` says so.
+    // Written rather than left to the allocator so the read in
+    // `mh_is_varargs_collector` never has to interpret an unwritten slot: a raw
+    // slot can read back as stale padding, and "is this handle a collector"
+    // must not be answered from one.
+    ctx.set_field(mh, MH_VARARGS, Value::Int(0));
     // Populate the real-JDK MethodHandle.type:MethodType field at its
     // resolved slot (0) so `mh.type()` and JDK-internal reads (LambdaForm,
     // MemberName, Invokers, ObjectStreamClass) see a MethodType, not null.
@@ -6153,16 +7733,19 @@ pub(crate) fn alloc_method_handle(
     } else {
         desc
     };
-    let mt_opt = build_method_type_from_descriptor(ctx, type_desc)
-        .or_else(|| build_method_type_from_descriptor(ctx, "()V"));
+    let mt_opt = match build_method_type_from_descriptor(ctx, type_desc) {
+        Ok(Some(mt)) => Ok(Some(mt)),
+        Ok(None) => build_method_type_from_descriptor(ctx, "()V"),
+        Err(e) => Err(e),
+    };
     // `build_method_type_from_descriptor` allocates too; re-read `mh` once
     // more before its final use, then release the whole pinned batch.
     let mh = ctx.read_native_pin(mh_pin, mh);
-    if let Some(mt) = mt_opt {
+    if let Ok(Some(mt)) = mt_opt {
         ctx.set_field_by_name(mh, "type", Value::Object(Some(mt)));
     }
     ctx.unpin_native_roots(mh_pin);
-    mh
+    Ok(mh)
 }
 
 /// Round-9 perf: render a `Value` into its Java `String.valueOf(...)`
@@ -6247,11 +7830,11 @@ pub(crate) fn alloc_string_concat_method_handle(
     ctx: &mut dyn NativeContext,
     recipe: &str,
     constants: Option<cratonvm_types::ObjectRef>,
-) -> cratonvm_types::ObjectRef {
-    // Reuse the MethodHandle synthetic skeleton — same field layout as
-    // alloc_method_handle, but the class slot carries the recipe string
-    // instead of a class name.
-    let mh = alloc_concurrent_synthetic(ctx, "java/lang/invoke/MethodHandle", MH_BOUND + 1);
+) -> Result<cratonvm_types::ObjectRef, MethodCallFailed> {
+    // Reuse the MethodHandle synthetic skeleton — same field layout AND the
+    // same width as alloc_method_handle (W7-19 §5.2), but the class slot
+    // carries the recipe string instead of a class name.
+    let mh = try_alloc_concurrent_synthetic(ctx, "java/lang/invoke/MethodHandle", MH_VARARGS + 1)?;
     // GC-safety: see `alloc_method_handle` above -- the same triple-
     // `create_string` + subsequent-allocation shape, on the same
     // MethodHandle-skeleton object. Pin everything and re-read the
@@ -6269,9 +7852,11 @@ pub(crate) fn alloc_string_concat_method_handle(
     ctx.set_field(mh, MH_NAME, Value::Object(Some(nm)));
     ctx.set_field(mh, MH_DESC, Value::Object(Some(dc)));
     ctx.set_field(mh, MH_KIND, Value::Int(MH_KIND_STRING_CONCAT));
+    // Same reason as `alloc_method_handle`: never leave `MH_VARARGS` unwritten.
+    ctx.set_field(mh, MH_VARARGS, Value::Int(0));
     // Wrap the constants array in a 1-field holder so MH_BOUND is a single
     // ObjectRef (the rest of mh_dispatch assumes that shape).
-    let holder = alloc_concurrent_synthetic(ctx, "java/lang/invoke/StringConcatFactory$Const", 1);
+    let holder = try_alloc_concurrent_synthetic(ctx, "java/lang/invoke/StringConcatFactory$Const", 1)?;
     let mh = ctx.read_native_pin(mh_pin, mh);
     ctx.set_field(
         holder,
@@ -6286,11 +7871,11 @@ pub(crate) fn alloc_string_concat_method_handle(
     // `mh.type()` walks see a non-null MethodType.
     let mt_opt = build_method_type_from_descriptor(ctx, "()Ljava/lang/String;");
     let mh = ctx.read_native_pin(mh_pin, mh);
-    if let Some(mt) = mt_opt {
+    if let Ok(Some(mt)) = mt_opt {
         ctx.set_field_by_name(mh, "type", Value::Object(Some(mt)));
     }
     ctx.unpin_native_roots(mh_pin);
-    mh
+    Ok(mh)
 }
 
 /// Read the class name string from a MethodHandle (field MH_CLASS).
@@ -6411,12 +7996,12 @@ fn mh_kind_to_ref_kind(mh_kind: i32) -> u8 {
 fn alloc_frozen_constant_call_site(
     ctx: &mut dyn NativeContext,
     target_mh: cratonvm_types::ObjectRef,
-) -> cratonvm_types::ObjectRef {
-    let ccs = alloc_concurrent_synthetic(ctx, "java/lang/invoke/ConstantCallSite", 2);
+) -> Result<cratonvm_types::ObjectRef, MethodCallFailed> {
+    let ccs = try_alloc_concurrent_synthetic(ctx, "java/lang/invoke/ConstantCallSite", 2)?;
     ctx.set_field(ccs, 0, Value::Object(Some(target_mh)));
     ctx.set_field_by_name(ccs, "target", Value::Object(Some(target_mh)));
     ctx.set_field_by_name(ccs, "isFrozen", Value::Int(1));
-    ccs
+    Ok(ccs)
 }
 
 /// Build a real lambda-factory `CallSite` from the reflective
@@ -6442,13 +8027,19 @@ fn build_reflective_lambda_callsite(
     // `LambdaMetafactory.FLAG_MARKERS` interfaces (internal names), as passed by
     // a reflective `altMetafactory`. Always empty for plain `metafactory`.
     marker_interfaces: &[String],
-) -> Option<cratonvm_types::ObjectRef> {
-    let invoked_mt = invoked_type?;
-    let impl_mh = impl_method?;
+) -> Result<Option<cratonvm_types::ObjectRef>, MethodCallFailed> {
+    let Some(invoked_mt) = invoked_type else {
+        return Ok(None);
+    };
+    let Some(impl_mh) = impl_method else {
+        return Ok(None);
+    };
 
     // Factory signature: (captures...)FunctionalInterface.
     let invoked_desc = descriptor_from_method_type(ctx, invoked_mt);
-    let functional_interface = descriptor_return_internal_name(&invoked_desc)?;
+    let Some(functional_interface) = descriptor_return_internal_name(&invoked_desc) else {
+        return Ok(None);
+    };
     let capture_types = descriptor_param_chars(&invoked_desc);
 
     // SAM erased descriptor (default to the most common erasure if unreadable).
@@ -6462,9 +8053,11 @@ fn build_reflective_lambda_callsite(
     };
 
     // Implementation method coordinates from the impl MethodHandle object.
-    let impl_class = mh_read_class(ctx, impl_mh)?;
+    let Some(impl_class) = mh_read_class(ctx, impl_mh) else {
+        return Ok(None);
+    };
     if impl_class.is_empty() {
-        return None;
+        return Ok(None);
     }
     let impl_member = mh_read_name(ctx, impl_mh).unwrap_or_default();
     let impl_desc = mh_read_desc(ctx, impl_mh).unwrap_or_default();
@@ -6488,7 +8081,7 @@ fn build_reflective_lambda_callsite(
         serializable,
         );
         if proxy_cid == 0 {
-        return None;
+        return Ok(None);
     }
     // The proxy implements its functional interface PLUS every marker. That
     // list is not part of the SAM metadata above, so it rides a second
@@ -6504,7 +8097,7 @@ fn build_reflective_lambda_callsite(
         &invoked_desc,
         MH_KIND_LAMBDA_FACTORY,
     );
-    Some(alloc_frozen_constant_call_site(ctx, factory_mh))
+    Ok(Some(alloc_frozen_constant_call_site(ctx, factory_mh?)?))
 }
 
 /// Core dispatch: given a populated MethodHandle and argument list, invoke it.
@@ -6584,7 +8177,7 @@ fn make_fold_adapter(
     // before each use.
     let target_pin = ctx.pin_native_root(target);
     let combiner_pin = ctx.pin_native_root(combiner_ref);
-    let wrapper = alloc_concurrent_synthetic(ctx, "__mh_fold_wrapper__", 3);
+    let wrapper = alloc_mh_carrier(ctx, "__mh_fold_wrapper__", 3);
     let wrapper_pin = ctx.pin_native_root(wrapper);
     let target = ctx.read_native_pin(target_pin, target);
     let combiner_ref = ctx.read_native_pin(combiner_pin, combiner_ref);
@@ -6594,7 +8187,7 @@ fn make_fold_adapter(
     let desc = mh_type_descriptor(ctx, target)
         .or_else(|| mh_read_desc(ctx, target))
         .unwrap_or_default();
-    let adapter = alloc_method_handle(ctx, "__adapter__", "fold", &desc, MH_KIND_FOLD);
+    let adapter = alloc_method_handle(ctx, "__adapter__", "fold", &desc, MH_KIND_FOLD)?;
     let wrapper = ctx.read_native_pin(wrapper_pin, wrapper);
     ctx.unpin_native_roots(target_pin);
     ctx.set_field(adapter, MH_BOUND, Value::Object(Some(wrapper)));
@@ -6678,7 +8271,7 @@ fn make_collect_args_adapter(
     // each use.
     let target_pin = ctx.pin_native_root(target);
     let filter_pin = ctx.pin_native_root(filter_ref);
-    let wrapper = alloc_concurrent_synthetic(ctx, "__mh_collect_args_wrapper__", 3);
+    let wrapper = alloc_mh_carrier(ctx, "__mh_collect_args_wrapper__", 3);
     let wrapper_pin = ctx.pin_native_root(wrapper);
     let target = ctx.read_native_pin(target_pin, target);
     let filter_ref = ctx.read_native_pin(filter_pin, filter_ref);
@@ -6694,7 +8287,7 @@ fn make_collect_args_adapter(
         "collectargs",
         &desc,
         MH_KIND_COLLECT_ARGS,
-    );
+    )?;
     let wrapper = ctx.read_native_pin(wrapper_pin, wrapper);
     ctx.unpin_native_roots(target_pin);
     ctx.set_field(adapter, MH_BOUND, Value::Object(Some(wrapper)));
@@ -6905,7 +8498,7 @@ pub(crate) fn mh_dispatch(
     // foreign downcall. Those compact handles store the function address in
     // field 0 rather than the MethodHandle metadata slots, so dispatch them
     // directly before trying to decode the generic MethodHandle layout.
-    if ctx.class_name_of_id(ctx.class_id_of_object(mh)).as_deref()
+    if ctx.class_name_arc_of_id(ctx.class_id_of_object(mh)).as_deref()
         == Some("java/lang/foreign/DowncallHandle")
     {
         if crate::nbflags().dbg_mh_dispatch {
@@ -7516,8 +9109,22 @@ pub(crate) fn mh_dispatch(
         }
         MH_KIND_COLLECT => {
             // asCollector(arrayType, count): collect the trailing `count`
-            // incoming args into a fresh Object[] and append to the leading
-            // args, then dispatch target (whose last param is that array).
+            // incoming args into a fresh array OF THE COLLECTOR'S OWN ARRAY
+            // TYPE and append to the leading args, then dispatch target (whose
+            // last param is that array).
+            //
+            // W7-19: "of the collector's own array type" is the fix. This arm
+            // built an `Object[]` unconditionally, so every primitive-array
+            // collector handed its target a reference array where the target's
+            // bytecode expects `int[]`/`long[]`/… — `iaload` then read an oop
+            // as an int. Measured on the shipped `dev` binary under
+            // `--real-jdk`: `int[]`→0, `byte[]`/`short[]`/`char[]`/
+            // `boolean[]`→0, `float[]`→0.0, `double[]`→NaN, and `long[]`→
+            // -2527743864898872 (a raw heap pointer read as a `long`), against
+            // HotSpot 25's 6/6/60/131/2/3.75/7.0/6. `Object[]` and `String[]`
+            // were already right, which is why the one probe that reached this
+            // combinator did not see it — the same four-of-nine shape as the
+            // FFM carrier defect: one reachable carrier is not the surface.
             let wrapper = match bound {
                 Value::Object(Some(w)) => w,
                 _ => return Ok(Some(Value::Object(None))),
@@ -7531,33 +9138,100 @@ pub(crate) fn mh_dispatch(
                 _ => 0,
             };
             let leading = extra_args.len() - count;
-            let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, count);
+            // Slot 2 is the `arrayType` Class mirror the `asCollector` native
+            // captured. Absent (a carrier written before this field existed, or
+            // an `asCollector` call whose Class argument was not an object) the
+            // component descriptor stays `Ljava/lang/Object;` and this arm
+            // behaves exactly as it did before — the pre-existing `Object[]`
+            // path is the fallback, never a new failure mode.
+            let arr_mirror = match ctx.get_field(wrapper, 2) {
+                Value::Object(Some(m)) => Some(m),
+                _ => None,
+            };
+            let comp = match arr_mirror {
+                Some(m) => {
+                    let ad = mirror_to_descriptor(ctx, m);
+                    match ad.strip_prefix('[') {
+                        Some(rest) => rest.to_string(),
+                        // Not an array mirror at all. `asCollector` on a
+                        // non-array type is an `IllegalArgumentException` on
+                        // HotSpot and never reaches dispatch there; here it
+                        // keeps the old container rather than inventing a new
+                        // refusal at invoke time, which would be the wrong
+                        // place for it.
+                        None => DESC_OBJECT.to_string(),
+                    }
+                }
+                None => DESC_OBJECT.to_string(),
+            };
+            let elem_type = array_element_type_of_descriptor(&comp);
+            let arr = if elem_type == cratonvm_types::ArrayElementType::Reference {
+                // A typed reference array where the component class resolves
+                // (`String[]`, not `Object[]`), because the target's parameter
+                // is `String[]` and an `aastore`-checked or reflective consumer
+                // can tell the difference. `Object[]` remains the fallback.
+                let arr_cid = match arr_mirror {
+                    Some(m) => ctx.class_id_from_mirror(m),
+                    None => None,
+                };
+                let comp_cid = match arr_cid {
+                    Some(acid) => ctx.array_component_class_id(acid),
+                    None => None,
+                };
+                match comp_cid {
+                    Some(cid) => ctx.new_ref_array(cid, count),
+                    None => ctx.new_array(cratonvm_types::ArrayElementType::Reference, count),
+                }
+            } else {
+                ctx.new_array(elem_type, count)
+            };
             // GC-safety: `box_value` inside the loop below can trigger a
             // collection that relocates `arr` (created once, before the
             // loop, then written into on every iteration) and `target`
             // (captured earlier, dispatched only after the loop finishes).
             // Pin both and re-read the forwarded references before each use.
+            // The primitive branch allocates nothing per element, but it shares
+            // the loop and the pin costs a forwarding read, not a collection.
             let arr_pin = ctx.pin_native_root(arr);
             let target_pin = ctx.pin_native_root(target);
             for i in 0..count {
-                // Box primitive values into their wrappers — the collector
-                // gathers into an `Object[]`. The indy call site passes raw
-                // primitives (Groovy's `3 * 2` is `invoke(II)Object`), and the
-                // real JDK boxes them via the trailing `asType`; our `asType`
-                // shim is a passthrough, so box here. Without this, `selectMethod`
-                // receives raw `int`s in its `Object[] args` and Groovy's
-                // `args[0].getClass()` (Selector.setGuards) dereferences a raw
-                // int as an object → NPE.
                 let v = extra_args[leading + i];
-                let boxed = match v {
-                    Value::Int(_) => crate::lang_class::box_value(ctx, v, "I"),
-                    Value::Long(_) => crate::lang_class::box_value(ctx, v, "J"),
-                    Value::Float(_) => crate::lang_class::box_value(ctx, v, "F"),
-                    Value::Double(_) => crate::lang_class::box_value(ctx, v, "D"),
-                    other => other,
+                let elem = if elem_type == cratonvm_types::ArrayElementType::Reference {
+                    // Box primitive values into their wrappers — a reference
+                    // collector gathers into an `Object[]`. The indy call site
+                    // passes raw primitives (Groovy's `3 * 2` is
+                    // `invoke(II)Object`), and the real JDK boxes them via the
+                    // trailing `asType`; our `asType` shim is a passthrough, so
+                    // box here. Without this, `selectMethod` receives raw
+                    // `int`s in its `Object[] args` and Groovy's
+                    // `args[0].getClass()` (Selector.setGuards) dereferences a
+                    // raw int as an object → NPE.
+                    match v {
+                        Value::Int(_) => crate::lang_class::box_value(ctx, v, "I"),
+                        Value::Long(_) => crate::lang_class::box_value(ctx, v, "J"),
+                        Value::Float(_) => crate::lang_class::box_value(ctx, v, "F"),
+                        Value::Double(_) => crate::lang_class::box_value(ctx, v, "D"),
+                        other => other,
+                    }
+                } else {
+                    // The mirror image, for the same reason: a primitive
+                    // collector's element slot is raw, and an argument that
+                    // arrived boxed (`invokeWithArguments`, or an adapter chain
+                    // that spread an `Object[]`) must be unwrapped or
+                    // `write_prim_element` would see a `Value::Object` and
+                    // store the type's zero. Then apply the widening the JDK's
+                    // trailing `asType` would have applied — `asCollector
+                    // (long[], 3).invoke(1, 2, 3)` passes `int`s and HotSpot
+                    // widens them; our `asType` is a passthrough, so this is
+                    // the only place it can happen.
+                    let raw = match v {
+                        Value::Object(Some(o)) => crate::lang_class::unbox_value(ctx, o),
+                        other => other,
+                    };
+                    widen_primitive_to_descriptor(raw, &comp)
                 };
                 let arr = ctx.read_native_pin(arr_pin, arr);
-                ctx.set_array_element(arr, i, boxed);
+                ctx.set_array_element(arr, i, elem);
             }
             let arr = ctx.read_native_pin(arr_pin, arr);
             let target = ctx.read_native_pin(target_pin, target);
@@ -7845,7 +9519,7 @@ pub(crate) fn native_record_support_deserialization_ctr(
         "<init>",
         "([B[Ljava/lang/Object;)Ljava/lang/Object;",
         MH_KIND_RECORD_DESER,
-    );
+    )?;
     let desc = ctx.read_native_pin(desc_pin, desc);
     ctx.set_field(mh, MH_BOUND, Value::Object(Some(desc)));
     ctx.unpin_native_roots(desc_pin);
@@ -8413,7 +10087,7 @@ fn collect_trailing_varargs(
         let found = tail.iter().enumerate().find(|(i, v)| {
             !taken[*i]
                 && matches!(v, Value::Object(Some(o))
-                    if ctx.class_name_of_id(ctx.class_id_of_object(*o)).as_deref() == Some(want_class))
+                    if ctx.class_name_arc_of_id(ctx.class_id_of_object(*o)).as_deref() == Some(want_class))
         }).map(|(i, _)| i);
         let idx = found.or_else(|| (0..tail.len()).rev().find(|i| !taken[*i]));
         if let Some(i) = idx {
@@ -8791,6 +10465,62 @@ pub fn register_t4_method_handle_invoke(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let this = obj_arg(args, 0)?;
             let recv = args.get(1).copied().unwrap_or(Value::Object(None));
+            // W7-19: `bindTo` must REFUSE a target with no leading reference
+            // parameter. `MethodHandle.bindTo`'s javadoc: "@throws
+            // IllegalArgumentException if the target does not have a leading
+            // parameter type that is a reference type", implemented in
+            // `MethodType.leadingReferenceParameter()` as
+            //   if (ptypes.length == 0 || ptypes[0].isPrimitive())
+            //       throw newIllegalArgumentException("no leading reference parameter");
+            // — so the test is arity-and-primitiveness, nothing else, and the
+            // message is verbatim. Measured on the shipped binary under
+            // `--real-jdk`: `findStatic(…(String,int)int).bindTo("abc")
+            // .bindTo(2)` was ACCEPTED and answered 6, and `(int)int`
+            // .bindTo(3) was accepted too; HotSpot 25 raises
+            // `IllegalArgumentException: no leading reference parameter` for
+            // both. A missing refusal, not a wrong value.
+            //
+            // The parameter list is read from the `type` field ONLY, never
+            // from `mh_type_descriptor`'s `MH_DESC` fallback. That distinction
+            // is the whole safety of this check: `MH_DESC` on a
+            // virtual/special handle omits the receiver `alloc_method_handle`
+            // prepends to `type`, so `Holder.pub`'s `(I)I` would read as a
+            // primitive leading parameter and this would refuse a bind that
+            // HotSpot accepts. No `type` MethodType, or one whose mirrors do
+            // not render, means the leading parameter is UNKNOWN and the bind
+            // is allowed through — a refusal is only ever raised on a positive
+            // reading.
+            //
+            // NOT done here, and W7-19 §5.1 carries the reason: the JDK's one-line
+            // body is `type.leadingReferenceParameter().cast(x)`, so it also
+            // raises `ClassCastException` for a wrong REFERENCE type
+            // (`(String,int)int`.bindTo(Integer.valueOf(1))). The test below is
+            // syntactic — is the first descriptor token `L…;`/`[…` — and cannot
+            // be wrong for a reason outside its own two lines. A `cast` check is
+            // an assignability question, and the only predicate `NativeContext`
+            // offers is `is_subclass`, which answers FALSE for a fabricated
+            // stand-in against a real JDK interface (a fabricated class declares
+            // no interfaces, so every type test against one fails). `bindTo` is
+            // on the Groovy-indy / SpEL-FunctionReference / log4j-provider path
+            // in this tree, all of which bind interfaces and subtypes, so that
+            // false negative would be a FALSE `ClassCastException` on a hot path
+            // — a refusal of working code, which is worse than the wrong answer
+            // it replaces. It wants a lane that can run those workloads.
+            if let Value::Object(Some(mt)) = ctx.get_field_by_name(this, "type") {
+                if let Some(tdesc) = methodtype_to_descriptor(ctx, mt) {
+                    if let Some((params, _)) = split_descriptor_params(&tdesc) {
+                        let leading_is_reference = params
+                            .first()
+                            .is_some_and(|p| p.starts_with('L') || p.starts_with('['));
+                        if !leading_is_reference {
+                            return Err(RuntimeError::IllegalArgumentException {
+                                message: "no leading reference parameter".to_string(),
+                            }
+                            .into());
+                        }
+                    }
+                }
+            }
             // Clone the MH and set BOUND field
             let class = mh_read_class(ctx, this).unwrap_or_default();
             let name = mh_read_name(ctx, this).unwrap_or_default();
@@ -8814,12 +10544,12 @@ pub fn register_t4_method_handle_invoke(r: &mut NativeMethodRegistry) {
             {
                 let values = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 1);
                 ctx.set_array_element(values, 0, recv);
-                let wrapper = alloc_concurrent_synthetic(ctx, "__mh_insert_wrapper__", 3);
+                let wrapper = alloc_mh_carrier(ctx, "__mh_insert_wrapper__", 3);
                 ctx.set_field(wrapper, 0, Value::Object(Some(this)));
                 ctx.set_field(wrapper, 1, Value::Object(Some(values)));
                 ctx.set_field(wrapper, 2, Value::Int(0));
                 let adapter =
-                    alloc_method_handle(ctx, "__adapter__", "insert", &desc, MH_KIND_INSERT);
+                    alloc_method_handle(ctx, "__adapter__", "insert", &desc, MH_KIND_INSERT)?;
                 ctx.set_field(adapter, MH_BOUND, Value::Object(Some(wrapper)));
                 // Binding one value REMOVES the leading parameter from `this`'s
                 // type. The adapter's `type()` must reflect that (e.g. a fully
@@ -8835,14 +10565,14 @@ pub fn register_t4_method_handle_invoke(r: &mut NativeMethodRegistry) {
                             params.remove(0); // one value inserted at pos 0
                         }
                         let new_desc = format!("({}){}", params.concat(), ret);
-                        if let Some(mt) = build_method_type_from_descriptor(ctx, &new_desc) {
+                        if let Ok(Some(mt)) = build_method_type_from_descriptor(ctx, &new_desc) {
                             ctx.set_field_by_name(adapter, "type", Value::Object(Some(mt)));
                         }
                     }
                 }
                 return Ok(Some(Value::Object(Some(adapter))));
             }
-            let new_mh = alloc_method_handle(ctx, &class, &name, &desc, kind);
+            let new_mh = alloc_method_handle(ctx, &class, &name, &desc, kind)?;
             // `bindTo` captures the LEADING argument, so the bound handle's
             // `type()` must have that leading parameter REMOVED (HotSpot:
             // `(Recv,Object)int`.bindTo(r) -> `(Object)int`). For virtual/special
@@ -8852,10 +10582,15 @@ pub fn register_t4_method_handle_invoke(r: &mut NativeMethodRegistry) {
             // classes[] of the right length (was AIOOBE: classes longer than the
             // runtime args). STATIC-handle leading-arg drop is a separate path.
             if kind == MH_KIND_VIRTUAL || kind == MH_KIND_SPECIAL {
-                if let Some(mt) = build_method_type_from_descriptor(ctx, &desc) {
+                if let Ok(Some(mt)) = build_method_type_from_descriptor(ctx, &desc) {
                     ctx.set_field_by_name(new_mh, "type", Value::Object(Some(mt)));
                 }
-            } else if kind == MH_KIND_STATIC {
+            } else if kind == MH_KIND_STATIC
+                || kind == MH_KIND_GETTER
+                || kind == MH_KIND_SETTER
+                || kind == MH_KIND_ARRAY_GET
+                || kind == MH_KIND_ARRAY_SET
+            {
                 // STATIC `bindTo` captures the leading PARAMETER (not a receiver),
                 // so the bound handle's `type()` must drop that leading parameter
                 // — `(String,String[])R`.bindTo(s) -> `(String[])R`. The dispatch
@@ -8864,13 +10599,36 @@ pub fn register_t4_method_handle_invoke(r: &mut NativeMethodRegistry) {
                 // repackaging, and a chained `bindTo` (#messageStaticBound) derives
                 // its own arity from this one. Leaving the full type here left a
                 // stale extra parameter that mis-packed the varargs.
+                //
+                // W7-19 §5.3 added the four accessor kinds, which take the same
+                // drop for the same reason and were the only kinds left out.
+                // Measured on the shipped binary against HotSpot 25, same class
+                // file: `findGetter(H,"i",int)` bound to a receiver reported
+                // `(H)int` where HotSpot reports `()int`, and
+                // `arrayElementGetter(int[])` bound to an array reported
+                // `([I,int)int` where HotSpot reports `(int)int`. A getter's
+                // `type` is its raw descriptor `(LH;)I` — `alloc_method_handle`
+                // prepends a receiver only for VIRTUAL/SPECIAL — so slot 0 of the
+                // parameter list IS the value `bindTo` just captured, exactly as
+                // for STATIC. Static getters/setters (`()I`, `(I)V`) never reach
+                // here: the guard at the top of this native already refuses a
+                // zero-arity or primitive-leading target, which is what HotSpot
+                // does too.
+                //
+                // This TIGHTENS the guard above on those two shapes, and that is
+                // the point rather than a side effect: those were the only two
+                // rows in W7-19 §3.3's thirteen-shape census where CratonVM
+                // under-refused a second `bindTo` that HotSpot refuses. Before
+                // this, a second bind on a bound getter fell through to the
+                // allocation below and silently OVERWROTE the first capture;
+                // now it raises HotSpot's `IllegalArgumentException`.
                 if let Some(tdesc) = mh_type_descriptor(ctx, this) {
                     if let Some((mut params, ret)) = split_descriptor_params(&tdesc) {
                         if !params.is_empty() {
                             params.remove(0);
                         }
                         let new_desc = format!("({}){}", params.concat(), ret);
-                        if let Some(mt) = build_method_type_from_descriptor(ctx, &new_desc) {
+                        if let Ok(Some(mt)) = build_method_type_from_descriptor(ctx, &new_desc) {
                             ctx.set_field_by_name(new_mh, "type", Value::Object(Some(mt)));
                         }
                     }
@@ -8923,7 +10681,7 @@ pub fn register_t4_method_handle_invoke(r: &mut NativeMethodRegistry) {
             // void invokeExact into a silent no-op.
             if let Some(Value::Object(Some(this))) = args.first() {
                 if ctx
-                    .class_name_of_id(ctx.class_id_of_object(*this))
+                    .class_name_arc_of_id(ctx.class_id_of_object(*this))
                     .as_deref()
                     == Some("java/lang/foreign/DowncallHandle")
                 {
@@ -8964,10 +10722,10 @@ pub fn register_t4_method_handle_invoke(r: &mut NativeMethodRegistry) {
                 return Ok(Some(Value::Object(Some(mt))));
             }
             let desc = mh_read_desc(ctx, this).unwrap_or_default();
-            if let Some(mt) = build_method_type_from_descriptor(ctx, &desc) {
+            if let Ok(Some(mt)) = build_method_type_from_descriptor(ctx, &desc) {
                 return Ok(Some(Value::Object(Some(mt))));
             }
-            let mt = build_method_type_from_descriptor(ctx, "()V");
+            let mt = build_method_type_from_descriptor(ctx, "()V")?;
             Ok(Some(Value::Object(mt)))
         },
     );
@@ -8975,18 +10733,21 @@ pub fn register_t4_method_handle_invoke(r: &mut NativeMethodRegistry) {
     // Lookup.find* are already registered in register_p63_method_handles_lookup
     // with full descriptor resolution. No duplicate registration needed here.
     r.set_category(__prev_cat);
+    ()
 }
 
 /// Build a MethodType object from a JVM method descriptor string.
 pub fn build_method_type_from_descriptor(
     ctx: &mut dyn NativeContext,
     desc: &str,
-) -> Option<ObjectRef> {
+) -> Result<Option<ObjectRef>, MethodCallFailed> {
     if desc.is_empty() || !desc.starts_with('(') {
-        return None;
+        return Ok(None);
     }
 
-    let close = desc.find(')')?;
+    let Some(close) = desc.find(')') else {
+        return Ok(None);
+    };
     let params_str = &desc[1..close];
     let ret_str = &desc[close + 1..];
 
@@ -9030,15 +10791,15 @@ pub fn build_method_type_from_descriptor(
     // JDK MethodType field layout: rtype(0), ptypes(1), form(2), wrapAlt(3),
     // invokers(4), methodDescriptor(5). Allocate 6 slots so the JDK-resolved
     // `form` slot (2) lives within the synthetic object.
-    let mt = alloc_concurrent_synthetic(ctx, "java/lang/invoke/MethodType", 6);
+    let mt = try_alloc_concurrent_synthetic(ctx, "java/lang/invoke/MethodType", 6)?;
     let ret_mirror = ctx.read_native_pin(ret_mirror_pin, ret_mirror);
     let arr = ctx.read_native_pin(arr_pin, arr);
     ctx.unpin_native_roots(ret_mirror_pin);
     ctx.set_field(mt, 0, Value::Object(Some(ret_mirror)));
     ctx.set_field(mt, 1, Value::Object(Some(arr)));
 
-    populate_method_type_form(ctx, mt);
-    Some(mt)
+    populate_method_type_form(ctx, mt)?;
+    Ok(Some(mt))
 }
 
 /// C21: Build a synthetic MethodTypeForm and link it into `mt.form` so
@@ -9062,7 +10823,7 @@ pub fn build_method_type_from_descriptor(
 pub(crate) fn populate_method_type_form(
     ctx: &mut dyn NativeContext,
     mt: cratonvm_types::ObjectRef,
-) {
+) -> Result<(), MethodCallFailed> {
     let mut slot_count: i32 = 0;
     let mut primitive_count: i32 = 0;
     if let Value::Object(Some(arr)) = ctx.get_field(mt, 1) {
@@ -9085,7 +10846,7 @@ pub(crate) fn populate_method_type_form(
     // below can each trigger a collection that relocates `mt` and `form`.
     // Pin both and re-read the forwarded reference before every use.
     let mt_pin = ctx.pin_native_root(mt);
-    let form = alloc_concurrent_synthetic(ctx, "java/lang/invoke/MethodTypeForm", 7);
+    let form = try_alloc_concurrent_synthetic(ctx, "java/lang/invoke/MethodTypeForm", 7)?;
     let form_pin = ctx.pin_native_root(form);
     let mt = ctx.read_native_pin(mt_pin, mt);
     ctx.set_field(form, 0, Value::Int(slot_count));
@@ -9126,6 +10887,7 @@ pub(crate) fn populate_method_type_form(
     let mt = ctx.read_native_pin(mt_pin, mt);
     ctx.set_field(mt, 2, Value::Object(Some(form)));
     ctx.unpin_native_roots(mt_pin);
+    Ok(())
 }
 
 /// Length of the fabricated `MethodTypeForm.methodHandles` cache (slot 4).
@@ -9349,7 +11111,7 @@ pub fn register_t28_method_handle_completeness(r: &mut NativeMethodRegistry) {
                 // No filters → behaves like the identity wrapper over target.
                 _ => return Ok(Some(Value::Object(Some(target)))),
             };
-            let wrapper = alloc_concurrent_synthetic(ctx, "__mh_filter_wrapper__", 3);
+            let wrapper = alloc_mh_carrier(ctx, "__mh_filter_wrapper__", 3);
             ctx.set_field(wrapper, 0, Value::Object(Some(target)));
             ctx.set_field(wrapper, 1, Value::Object(Some(filters)));
             ctx.set_field(wrapper, 2, Value::Int(pos));
@@ -9358,7 +11120,7 @@ pub fn register_t28_method_handle_completeness(r: &mut NativeMethodRegistry) {
             let desc = mh_type_descriptor(ctx, target)
                 .or_else(|| mh_read_desc(ctx, target))
                 .unwrap_or_default();
-            let adapter = alloc_method_handle(ctx, "__adapter__", "filter", &desc, MH_KIND_FILTER);
+            let adapter = alloc_method_handle(ctx, "__adapter__", "filter", &desc, MH_KIND_FILTER)?;
             ctx.set_field(adapter, MH_BOUND, Value::Object(Some(wrapper)));
             Ok(Some(Value::Object(Some(adapter))))
         },
@@ -9383,7 +11145,7 @@ pub fn register_t28_method_handle_completeness(r: &mut NativeMethodRegistry) {
                 // No filter -> behaves like the identity wrapper over target.
                 _ => return Ok(Some(Value::Object(Some(target)))),
             };
-            let wrapper = alloc_concurrent_synthetic(ctx, "__mh_retfilter_wrapper__", 2);
+            let wrapper = alloc_mh_carrier(ctx, "__mh_retfilter_wrapper__", 2);
             ctx.set_field(wrapper, 0, Value::Object(Some(target)));
             ctx.set_field(wrapper, 1, Value::Object(Some(filter)));
             // The adapter's parameter types match the target's; its return
@@ -9401,7 +11163,7 @@ pub fn register_t28_method_handle_completeness(r: &mut NativeMethodRegistry) {
                 _ => target_desc,
             };
             let adapter =
-                alloc_method_handle(ctx, "__adapter__", "retfilter", &desc, MH_KIND_RETURN_FILTER);
+                alloc_method_handle(ctx, "__adapter__", "retfilter", &desc, MH_KIND_RETURN_FILTER)?;
             ctx.set_field(adapter, MH_BOUND, Value::Object(Some(wrapper)));
             Ok(Some(Value::Object(Some(adapter))))
         },
@@ -9449,14 +11211,14 @@ pub fn register_t28_method_handle_completeness(r: &mut NativeMethodRegistry) {
             };
             let catch_type = args.get(1).copied().unwrap_or(Value::Object(None));
             let handler = args.get(2).copied().unwrap_or(Value::Object(None));
-            let wrapper = alloc_concurrent_synthetic(ctx, "__mh_catch_wrapper__", 3);
+            let wrapper = alloc_mh_carrier(ctx, "__mh_catch_wrapper__", 3);
             ctx.set_field(wrapper, 0, Value::Object(Some(target)));
             ctx.set_field(wrapper, 1, catch_type);
             ctx.set_field(wrapper, 2, handler);
             let desc = mh_type_descriptor(ctx, target)
                 .or_else(|| mh_read_desc(ctx, target))
                 .unwrap_or_default();
-            let adapter = alloc_method_handle(ctx, "__adapter__", "catch", &desc, MH_KIND_CATCH);
+            let adapter = alloc_method_handle(ctx, "__adapter__", "catch", &desc, MH_KIND_CATCH)?;
             ctx.set_field(adapter, MH_BOUND, Value::Object(Some(wrapper)));
             if let Value::Object(Some(mt)) = ctx.get_field_by_name(target, "type") {
                 ctx.set_field_by_name(adapter, "type", Value::Object(Some(mt)));
@@ -9478,7 +11240,7 @@ pub fn register_t28_method_handle_completeness(r: &mut NativeMethodRegistry) {
         "exactInvoker",
         "(Ljava/lang/invoke/MethodType;)Ljava/lang/invoke/MethodHandle;",
         |ctx, args| {
-            let mh = alloc_method_handle(ctx, "", "", "", MH_KIND_INVOKER);
+            let mh = alloc_method_handle(ctx, "", "", "", MH_KIND_INVOKER)?;
             // C19: propagate the caller's MethodType into the real-JDK
             // `type` field so `mh.type()` / `parameterSlotCount` do not NPE.
             if let Some(Value::Object(Some(mt))) = args.first() {
@@ -9492,7 +11254,7 @@ pub fn register_t28_method_handle_completeness(r: &mut NativeMethodRegistry) {
         "invoker",
         "(Ljava/lang/invoke/MethodType;)Ljava/lang/invoke/MethodHandle;",
         |ctx, args| {
-            let mh = alloc_method_handle(ctx, "", "", "", MH_KIND_INVOKER);
+            let mh = alloc_method_handle(ctx, "", "", "", MH_KIND_INVOKER)?;
             if let Some(Value::Object(Some(mt))) = args.first() {
                 ctx.set_field_by_name(mh, "type", Value::Object(Some(*mt)));
             }
@@ -9504,7 +11266,7 @@ pub fn register_t28_method_handle_completeness(r: &mut NativeMethodRegistry) {
         "spreadInvoker",
         "(Ljava/lang/invoke/MethodType;I)Ljava/lang/invoke/MethodHandle;",
         |ctx, args| {
-            let mh = alloc_method_handle(ctx, "", "", "", MH_KIND_INVOKER);
+            let mh = alloc_method_handle(ctx, "", "", "", MH_KIND_INVOKER)?;
             if let Some(Value::Object(Some(mt))) = args.first() {
                 ctx.set_field_by_name(mh, "type", Value::Object(Some(*mt)));
             }
@@ -9521,6 +11283,7 @@ pub fn register_t28_method_handle_completeness(r: &mut NativeMethodRegistry) {
         },
     );
     r.set_category(__prev_cat);
+    ()
 }
 
 // ---------------------------------------------------------------------------
@@ -9530,6 +11293,8 @@ pub fn register_t28_method_handle_completeness(r: &mut NativeMethodRegistry) {
 // ---------------------------------------------------------------------------
 
 fn lookup_unreflect(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    // FIRST statement on purpose — see `lk_enforce_unreflect_access`.
+    lk_enforce_unreflect_access(ctx, args, LkUnreflectKind::AccessibleWaives)?;
     // args[0] = this (Lookup), args[1] = Method object
     let method_obj = match args.get(1) {
         Some(Value::Object(Some(m))) => *m,
@@ -9567,11 +11332,15 @@ fn lookup_unreflect(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     };
 
     let _ = ctx.ensure_class_initialized(&class_name);
-    let mh = alloc_method_handle(ctx, &class_name, &method_name, &descriptor, kind);
+    let mh = alloc_method_handle(ctx, &class_name, &method_name, &descriptor, kind)?;
     Ok(Some(Value::Object(Some(mh))))
 }
 
 fn lookup_unreflect_special(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    // FIRST statement on purpose — see `lk_enforce_unreflect_access`. This one
+    // needs PRIVATE and does NOT honour `m.isAccessible()`; the JDK body says
+    // so in as many words.
+    lk_enforce_unreflect_access(ctx, args, LkUnreflectKind::Special)?;
     // args[0] = Lookup, args[1] = Method, args[2] = specialCaller class
     let method_obj = match args.get(1) {
         Some(Value::Object(Some(m))) => *m,
@@ -9597,7 +11366,7 @@ fn lookup_unreflect_special(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     let descriptor = crate::lang_class::read_method_descriptor(ctx, method_obj).unwrap_or_default();
 
     let _ = ctx.ensure_class_initialized(&class_name);
-    let mh = alloc_method_handle(ctx, &class_name, &method_name, &descriptor, MH_KIND_SPECIAL);
+    let mh = alloc_method_handle(ctx, &class_name, &method_name, &descriptor, MH_KIND_SPECIAL)?;
     Ok(Some(Value::Object(Some(mh))))
 }
 
@@ -9640,6 +11409,8 @@ fn lookup_unreflect_getter(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
     // (clazz/name/type at hierarchy-adjusted slots 2/4/5) rather than on
     // our legacy synthetic-slot layout. See the C5 fix in
     // `lang_class.rs::create_field_object` for details.
+    // FIRST statement on purpose — see `lk_enforce_unreflect_access`.
+    lk_enforce_unreflect_access(ctx, args, LkUnreflectKind::AccessibleWaives)?;
     const ACC_STATIC: i32 = 0x0008;
     let field_obj = match args.get(1) {
         Some(Value::Object(Some(f))) => *f,
@@ -9670,11 +11441,20 @@ fn lookup_unreflect_getter(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
     } else {
         format!("(L{class_name};){field_desc}")
     };
-    let mh = alloc_method_handle(ctx, &class_name, &field_name, &desc, MH_KIND_GETTER);
+    let mh = alloc_method_handle(ctx, &class_name, &field_name, &desc, MH_KIND_GETTER)?;
     Ok(Some(Value::Object(Some(mh))))
 }
 
 fn lookup_unreflect_setter(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    // FIRST statement on purpose — see `lk_enforce_unreflect_access`.
+    //
+    // NOT enforced here, and still open: `unreflectSetter` must also refuse a
+    // TRUSTED-final field ("fields which are both `static` and `final` may
+    // never be set"). That is `MemberName.isTrustedFinalField`, a different
+    // question from lookup modes, and guessing at it would refuse the
+    // `setAccessible`-then-`unreflectSetter` idiom that deserialization
+    // frameworks depend on. Recorded in W6-8 rather than written blind.
+    lk_enforce_unreflect_access(ctx, args, LkUnreflectKind::AccessibleWaives)?;
     const ACC_STATIC: i32 = 0x0008;
     let field_obj = match args.get(1) {
         Some(Value::Object(Some(f))) => *f,
@@ -9705,12 +11485,17 @@ fn lookup_unreflect_setter(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
     } else {
         format!("(L{class_name};{field_desc})V")
     };
-    let mh = alloc_method_handle(ctx, &class_name, &field_name, &desc, MH_KIND_SETTER);
+    let mh = alloc_method_handle(ctx, &class_name, &field_name, &desc, MH_KIND_SETTER)?;
     Ok(Some(Value::Object(Some(mh))))
 }
 
 /// `MethodHandles.Lookup.unreflectVarHandle(Field)`.
 fn lookup_unreflect_var_handle(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    // FIRST statement on purpose — see `lk_enforce_unreflect_access`. This is
+    // the one arm that must NOT honour the `accessible` flag: "Access checking
+    // is performed immediately on behalf of the lookup class, regardless of the
+    // value of the field's `accessible` flag."
+    lk_enforce_unreflect_access(ctx, args, LkUnreflectKind::AccessibleIgnored)?;
     const ACC_STATIC: i32 = 0x0008;
     let field_obj = match args.get(1) {
         Some(Value::Object(Some(f))) => *f,
@@ -9738,9 +11523,17 @@ fn lookup_unreflect_var_handle(ctx: &mut dyn NativeContext, args: &[Value]) -> M
     }
     if (modifiers & ACC_STATIC) != 0 {
         let vh = alloc_static_var_handle(ctx, &class_name, &field_name, &field_desc);
-        return Ok(Some(Value::Object(Some(vh))));
+        return Ok(Some(Value::Object(Some(vh?))));
     }
-    let field_index = ctx.resolve_field_index(&class_name, &field_name).unwrap_or(0);
+    // `-1` is the "re-resolve by name at access time" sentinel; `0` is slot 0.
+    // The `Field` object proves the field EXISTS, so no `lookup_require_field`
+    // gate here — but `resolve_field_index` can still miss it (an inherited or
+    // otherwise not-directly-resolvable field), and answering slot 0 for that
+    // aliases an unrelated field of the receiver.
+    let field_index = match ctx.resolve_field_index(&class_name, &field_name) {
+        Some(idx) => idx as i32,
+        None => -1,
+    };
     let class_id = match class_mirror.and_then(|m| mirror_class_id(ctx, m)) {
         Some(id) => id,
         None => match ctx.class_id_by_name(&class_name) {
@@ -9759,7 +11552,7 @@ fn lookup_unreflect_var_handle(ctx: &mut dyn NativeContext, args: &[Value]) -> M
         field_index,
         class_id,
     );
-    Ok(Some(Value::Object(Some(vh))))
+    Ok(Some(Value::Object(Some(vh?))))
 }
 
 /// `VarHandle.toMethodHandle(AccessMode)` -- see the registration comment.
@@ -9836,7 +11629,7 @@ fn varhandle_to_method_handle(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
             },
         ));
     };
-    let mh = alloc_method_handle(ctx, &class, &field, &desc, kind);
+    let mh = alloc_method_handle(ctx, &class, &field, &desc, kind)?;
     Ok(Some(Value::Object(Some(mh))))
 }
 
@@ -9856,6 +11649,8 @@ fn access_mode_name(ctx: &mut dyn NativeContext, mode: ObjectRef) -> String {
 }
 
 fn lookup_unreflect_constructor(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    // FIRST statement on purpose — see `lk_enforce_unreflect_access`.
+    lk_enforce_unreflect_access(ctx, args, LkUnreflectKind::AccessibleWaives)?;
     // args[0] = Lookup, args[1] = java.lang.reflect.Constructor
     let ctor_obj = match args.get(1) {
         Some(Value::Object(Some(c))) => *c,
@@ -9877,7 +11672,7 @@ fn lookup_unreflect_constructor(ctx: &mut dyn NativeContext, args: &[Value]) -> 
     };
     let class_name = ctx.class_name_of_id(class_id).unwrap_or_default();
     let _ = ctx.ensure_class_initialized(&class_name);
-    let mh = alloc_method_handle(ctx, &class_name, "<init>", &desc, MH_KIND_CONSTRUCTOR);
+    let mh = alloc_method_handle(ctx, &class_name, "<init>", &desc, MH_KIND_CONSTRUCTOR)?;
     // See the matching comment in lookup_find_constructor: stash the
     // already-resolved class_id (from the Constructor reflection
     // object's own clazz mirror) so dispatch doesn't re-resolve class_name
@@ -9915,7 +11710,7 @@ fn mhs_permute_arguments(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     let target_pin = ctx.pin_native_root(target_mh);
     let reorder_pin = ctx.pin_native_root(reorder_arr);
     // Create a wrapper synthetic to hold (target_mh, reorder_arr)
-    let wrapper = alloc_concurrent_synthetic(ctx, "__mh_permute_wrapper__", 2);
+    let wrapper = alloc_mh_carrier(ctx, "__mh_permute_wrapper__", 2);
     let wrapper_pin = ctx.pin_native_root(wrapper);
     let target_mh = ctx.read_native_pin(target_pin, target_mh);
     let reorder_arr = ctx.read_native_pin(reorder_pin, reorder_arr);
@@ -9923,7 +11718,7 @@ fn mhs_permute_arguments(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     ctx.set_field(wrapper, 1, Value::Object(Some(reorder_arr)));
 
     // Create the adapter MH with kind=PERMUTE
-    let adapter = alloc_method_handle(ctx, "__adapter__", "permute", &new_desc, MH_KIND_PERMUTE);
+    let adapter = alloc_method_handle(ctx, "__adapter__", "permute", &new_desc, MH_KIND_PERMUTE)?;
     let wrapper = ctx.read_native_pin(wrapper_pin, wrapper);
     ctx.unpin_native_roots(target_pin);
     ctx.set_field(adapter, MH_BOUND, Value::Object(Some(wrapper)));
@@ -10004,7 +11799,7 @@ fn mhs_guard_with_test(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     let target_pin = ctx.pin_native_root(target_mh);
     let fallback_pin = ctx.pin_native_root(fallback_mh);
     // Create a wrapper synthetic to hold (test, target, fallback)
-    let wrapper = alloc_concurrent_synthetic(ctx, "__mh_guard_wrapper__", 3);
+    let wrapper = alloc_mh_carrier(ctx, "__mh_guard_wrapper__", 3);
     let wrapper_pin = ctx.pin_native_root(wrapper);
     let test_mh = ctx.read_native_pin(test_pin, test_mh);
     let target_mh = ctx.read_native_pin(target_pin, target_mh);
@@ -10017,7 +11812,7 @@ fn mhs_guard_with_test(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     // full (receiver-inclusive) param list, so alloc_method_handle installs a
     // `type` MethodType with the correct arity for the GUARD kind (which does
     // NOT itself prepend a receiver).
-    let adapter = alloc_method_handle(ctx, "__adapter__", "guard", &target_desc, MH_KIND_GUARD);
+    let adapter = alloc_method_handle(ctx, "__adapter__", "guard", &target_desc, MH_KIND_GUARD)?;
     let wrapper = ctx.read_native_pin(wrapper_pin, wrapper);
     ctx.unpin_native_roots(test_pin);
     ctx.set_field(adapter, MH_BOUND, Value::Object(Some(wrapper)));
@@ -10187,13 +11982,39 @@ pub(crate) fn native_mhn_resolve(ctx: &mut dyn NativeContext, args: &[Value]) ->
     // afterward); pin it and re-read the forwarded reference before use.
     let member_name_pin = ctx.pin_native_root(member_name);
     // Ensure the class is loaded
-    let _ = ctx.ensure_class_initialized(&class_name);
+    let resolved_class_id = ctx.ensure_class_initialized(&class_name).ok();
     let member_name = ctx.read_native_pin(member_name_pin, member_name);
 
     // Mark as resolved with the non-zero vmindex sentinel — on our fabricated
     // layout only. See `mn_set_vmindex`: a real `MemberName` has no vmindex
     // field, and slot 4 there is `method`.
     mn_set_vmindex(ctx, member_name, 1);
+
+    // The `ACC_*` half of `flags`, which resolution is what fills in.
+    //
+    // `MemberName.flags` is `refKind<<24 | IS_METHOD/IS_FIELD/IS_CONSTRUCTOR |
+    // ACC_*`. The Java-side constructors set the kind and the reference kind
+    // and pass `0` for the modifiers, exactly because HotSpot's
+    // `MHN_resolve_Mem` overwrites them with the resolved member's real access
+    // flags. CratonVM's resolve never did, so **every** MemberName resolved
+    // through this native reported `isStatic() == false`:
+    //
+    //     public MethodType getInvocationType() {
+    //         MethodType itype = getMethodOrFieldType();
+    //         ...
+    //         if (!isStatic())  return itype.insertParameterTypes(0, clazz);
+    //
+    // — a phantom receiver parameter prepended to every static method's type.
+    // Nothing read it back with assertions off, which is why it survived; with
+    // `-ea` the very first `NamedFunction` built this way trips
+    // `LambdaForm$Name`'s constructor during `java.lang.invoke` boot:
+    //
+    //     AssertionError: arity mismatch: arguments.length=1 ==
+    //       function.arity()=2 in t851:L=DirectMethodHandle.allocateInstance(a0:L)
+    //
+    // OR-ed in rather than assigned: the kind bit and reference kind already in
+    // `flags` are the caller's request and must survive resolution.
+    let mut resolved_access: Option<u16> = None;
 
     // If this is a method reference (refKind 5-9), verify the method exists
     if ref_kind >= 5 && ref_kind <= 9 {
@@ -10202,7 +12023,7 @@ pub(crate) fn native_mhn_resolve(ctx: &mut dyn NativeContext, args: &[Value]) ->
             let desc = descriptor_from_method_type(ctx, mt);
             if !name.is_empty() && !desc.is_empty() {
                 let exists = ctx.method_exists(&class_name, &name, &desc);
-                if !exists && !name.is_empty() {
+                if !exists {
                     // Method not found — for speculative resolve, return null
                     let speculative = matches!(args.get(3), Some(Value::Int(1)));
                     if speculative {
@@ -10210,12 +12031,111 @@ pub(crate) fn native_mhn_resolve(ctx: &mut dyn NativeContext, args: &[Value]) ->
                         return Ok(Some(Value::Object(None)));
                     }
                 }
+                // Not gated on `exists`. `method_exists` matches the exact
+                // descriptor, which a signature-polymorphic member never has —
+                // `MethodHandle.linkToSpecial` is declared `(Object...)Object`
+                // and the MemberName carries the call site's `(L,L)V`. Gating
+                // the modifier lookup on `exists` therefore skipped exactly the
+                // members that need the polymorphic fallback inside
+                // `declared_method_access_flags`, and left `linkToSpecial`
+                // without its `ACC_STATIC`.
+                if let Some(cid) = resolved_class_id {
+                    resolved_access = declared_method_access_flags(ctx, cid, &name, &desc);
+                }
             }
+        }
+    } else if (1..=4).contains(&ref_kind) {
+        // Field kinds. A field name is unique within its declaring class, so
+        // no descriptor match is needed — and `type` here is a Class mirror,
+        // not a MethodType, so there is no descriptor to read anyway.
+        if let Some(cid) = resolved_class_id {
+            if !name.is_empty() {
+                resolved_access = declared_field_access_flags(ctx, cid, &name);
+            }
+        }
+    }
+
+    // `declared_methods`/`declared_fields` allocate, so re-read through the pin
+    // before the write.
+    let member_name = ctx.read_native_pin(member_name_pin, member_name);
+    if let Some(access) = resolved_access {
+        let merged = flags | (i32::from(access) & 0xFFFF);
+        if merged != flags {
+            mn_set(ctx, member_name, "flags", MN_FLAGS, Value::Int(merged));
         }
     }
 
     ctx.unpin_native_roots(member_name_pin);
     Ok(Some(Value::Object(Some(member_name))))
+}
+
+/// Declared access flags of `name`+`descriptor`, searched from `class_id` up
+/// the superclass chain.
+///
+/// Superclasses only, no interface step: a `REF_invokeInterface` member names
+/// the interface itself as its declaring class, so the first hop already covers
+/// it, and a default method inherited from an interface is not something this
+/// native is asked to resolve against a class receiver.
+///
+/// Bounded, so a self-referential hierarchy in a fabricated/synthetic class
+/// cannot spin here.
+fn declared_method_access_flags(
+    ctx: &mut dyn NativeContext,
+    class_id: ClassId,
+    name: &str,
+    descriptor: &str,
+) -> Option<u16> {
+    let mut cur = Some(class_id);
+    for _ in 0..64 {
+        let cid = cur?;
+        let by_name: Vec<_> = ctx
+            .declared_methods(cid)
+            .into_iter()
+            .filter(|m| m.name == name)
+            .collect();
+        if let Some(m) = by_name.iter().find(|m| m.descriptor == descriptor) {
+            return Some(m.access_flags);
+        }
+        // Signature-polymorphic methods (`MethodHandle.invoke`, `invokeExact`,
+        // `invokeBasic`, `linkToStatic`, `linkToSpecial`, …) are DECLARED as
+        // `(Object...)Object`, but a `MemberName` for one carries the *call
+        // site's* type — `(L,L)V` and the like. There is no descriptor to match
+        // on, so the exact search above finds nothing, which left `linkToSpecial`
+        // without its `ACC_STATIC` and produced the second `arity mismatch`
+        // assertion after `allocateInstance`.
+        //
+        // A name declared exactly once in the class is unambiguous, so take it.
+        // Guarded on uniqueness deliberately: with real overloads present,
+        // "some overload's flags" would be a guess, and no flags at all is
+        // better than confidently wrong ones.
+        if by_name.len() == 1 {
+            return Some(by_name[0].access_flags);
+        }
+        cur = ctx.superclass_of(cid);
+    }
+    None
+}
+
+/// Declared access flags of the field `name`, searched from `class_id` up the
+/// superclass chain. See [`declared_method_access_flags`].
+fn declared_field_access_flags(
+    ctx: &mut dyn NativeContext,
+    class_id: ClassId,
+    name: &str,
+) -> Option<u16> {
+    let mut cur = Some(class_id);
+    for _ in 0..64 {
+        let cid = cur?;
+        if let Some(f) = ctx
+            .declared_fields(cid)
+            .into_iter()
+            .find(|f| f.name == name)
+        {
+            return Some(f.access_flags);
+        }
+        cur = ctx.superclass_of(cid);
+    }
+    None
 }
 
 /// `MethodHandleNatives.init(MemberName self, Object ref)`
@@ -10361,13 +12281,13 @@ pub(crate) fn native_mhn_init(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
             let ptypes_pin = ctx.pin_native_root(ptypes_ref);
             let void_mirror = ctx.primitive_class_mirror(NAME_VOID);
             let void_mirror_pin = ctx.pin_native_root(void_mirror);
-            let mt = alloc_concurrent_synthetic(ctx, "java/lang/invoke/MethodType", 6);
+            let mt = try_alloc_concurrent_synthetic(ctx, "java/lang/invoke/MethodType", 6)?;
             let void_mirror = ctx.read_native_pin(void_mirror_pin, void_mirror);
             let ptypes_ref = ctx.read_native_pin(ptypes_pin, ptypes_ref);
             ctx.unpin_native_roots(ptypes_pin);
             ctx.set_field(mt, 0, Value::Object(Some(void_mirror)));
             ctx.set_field(mt, 1, Value::Object(Some(ptypes_ref)));
-            populate_method_type_form(ctx, mt);
+            populate_method_type_form(ctx, mt)?;
             let member_name = ctx.read_native_pin(member_name_pin, member_name);
             mn_set(ctx, member_name, "type", MN_TYPE, Value::Object(Some(mt)));
         }
@@ -10452,7 +12372,7 @@ pub(crate) fn native_mhn_link_method(
         _ => MH_KIND_VIRTUAL,
     };
 
-    let mh = alloc_method_handle(ctx, &class_name, &name, &desc, mh_kind);
+    let mh = alloc_method_handle(ctx, &class_name, &name, &desc, mh_kind)?;
     Ok(Some(Value::Object(Some(mh))))
 }
 
@@ -10483,7 +12403,7 @@ pub(crate) fn native_mhn_link_call_site(
     };
 
     // Allocate a virtual MH as the linked target
-    let mh = alloc_method_handle(ctx, "", &name, &desc, MH_KIND_VIRTUAL);
+    let mh = alloc_method_handle(ctx, "", &name, &desc, MH_KIND_VIRTUAL)?;
 
     // If appendixResult array is provided, store the MH as appendix
     if let Some(Value::Object(Some(appendix_arr))) = args.get(5) {
@@ -10530,19 +12450,78 @@ pub(crate) fn native_mhn_get_member_vm_info(
 ) -> MethodCallResult {
     let member_name = crate::obj_arg(args, 0)?;
     let vmindex = mn_get_vmindex(ctx, member_name);
+
+    // The shape is dictated by the ONE caller in the whole JDK —
+    // `MemberName.vminfoIsConsistent`, which runs only under `assert`:
+    //
+    //     long vmindex = (Long) ((Object[])vminfo)[0];
+    //     Object vmtarget = ((Object[])vminfo)[1];
+    //     if (refKindIsField(refKind)) { assert(vmindex >= 0);
+    //                                    assert(vmtarget instanceof Class); }
+    //     else { assert(refKindDoesDispatch(refKind) ? vmindex >= 0
+    //                                                : vmindex < 0);
+    //            assert(vmtarget instanceof MemberName); }
+    //
+    // Because that is the only reader and it was unreachable while `-ea` was
+    // being discarded by the launcher, this native's answer was never checked
+    // by anything: it boxed an `Integer` where the cast demands a `Long`, and
+    // returned the MemberName as `vmtarget` for field kinds too. Both surfaced
+    // the moment `-ea` started working — a `ClassCastException: java.lang.Integer
+    // cannot be cast to java.lang.Long` out of `MemberName$Factory.resolve`,
+    // which killed the VM during `java.lang.invoke` boot.
+    let flags = match mn_get(ctx, member_name, "flags", MN_FLAGS) {
+        Value::Int(f) => f,
+        _ => 0,
+    };
+    // `MethodHandleNatives.Constants.MN_REFERENCE_KIND_SHIFT` / `_MASK`.
+    let ref_kind = (flags >> 24) & 0x0F;
+    // REF_getField(1) .. REF_putStatic(4) are the field kinds; REF_invokeVirtual(5)
+    // and REF_invokeInterface(9) are the two that dispatch.
+    let is_field = (1..=4).contains(&ref_kind);
+    let does_dispatch = ref_kind == 5 || ref_kind == 9;
+
+    // CratonVM resolves by name+descriptor and keeps no vtable/itable, so it has
+    // no index of HotSpot's kind to report. What it CAN report truthfully is the
+    // sign the encoding gives meaning to: "has a dispatch slot" (non-negative)
+    // versus "resolved to a single target" (negative). Reporting a non-negative
+    // index for an `invokestatic`-kind member would be the actively wrong
+    // answer; -1 is the same "no dispatch slot" HotSpot writes there.
+    let reported_index: i64 = if is_field || does_dispatch {
+        i64::from(vmindex.max(0))
+    } else {
+        -1
+    };
+
+    // For a field the JDK wants the DECLARING CLASS as `vmtarget`, not the
+    // MemberName — `clazz` is exactly that, and it is already a mirror.
+    let field_target = if is_field {
+        match mn_get(ctx, member_name, "clazz", MN_CLAZZ) {
+            Value::Object(Some(c)) => Some(c),
+            _ => None,
+        }
+    } else {
+        None
+    };
+
     let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 2);
     // GC-safety: `box_value` below can trigger a collection that relocates
-    // `arr`/`member_name` (both captured/produced above and read again
-    // afterward); pin them and re-read the forwarded references before use.
+    // `arr`/`member_name`/`field_target` (all captured or produced above and
+    // read again afterward); pin them and re-read the forwarded references
+    // before use. `boxed` is the last allocation, so nothing can move it.
     let arr_pin = ctx.pin_native_root(arr);
     let member_name_pin = ctx.pin_native_root(member_name);
-    // Box vmindex as Integer
-    let boxed = crate::lang_class::box_value(ctx, Value::Int(vmindex), "I");
+    let field_target_pin = field_target.map(|t| (ctx.pin_native_root(t), t));
+    let boxed = crate::lang_class::box_value(ctx, Value::Long(reported_index), "J");
     let arr = ctx.read_native_pin(arr_pin, arr);
     let member_name = ctx.read_native_pin(member_name_pin, member_name);
+    let field_target = field_target_pin.map(|(pin, t)| ctx.read_native_pin(pin, t));
     ctx.unpin_native_roots(arr_pin);
     ctx.set_array_element(arr, 0, boxed);
-    ctx.set_array_element(arr, 1, Value::Object(Some(member_name)));
+    ctx.set_array_element(
+        arr,
+        1,
+        Value::Object(Some(field_target.unwrap_or(member_name))),
+    );
     Ok(Some(Value::Object(Some(arr))))
 }
 
@@ -10580,19 +12559,18 @@ fn alloc_resolved_member_name(
     host_class: &str,
     name: &str,
     desc: &str,
-) -> ObjectRef {
-    let mn = alloc_concurrent_synthetic(ctx, "java/lang/invoke/MemberName", MN_FIELD_COUNT);
+) -> Result<ObjectRef, MethodCallFailed> {
+    let mn = try_alloc_concurrent_synthetic(ctx, "java/lang/invoke/MemberName", MN_FIELD_COUNT)?;
 
     // clazz: use the host class mirror (must be a valid Class mirror for
     // downstream `mn.getDeclaringClass()` reads).
     let host_cid = ctx.class_id_by_name(host_class);
-    let clazz_mirror = host_cid
-        .map(|cid| ctx.get_class_mirror(cid))
-        .unwrap_or_else(|| {
-            // Fallback: allocate a synthetic Class stub — should not normally
-            // happen since LambdaForm is always loaded before this path.
-            alloc_concurrent_synthetic(ctx, "java/lang/Class", 1)
-        });
+    let clazz_mirror = match host_cid.map(|cid| ctx.get_class_mirror(cid)) {
+        Some(m) => m,
+        // Fallback: allocate a synthetic Class stub — should not normally
+        // happen since LambdaForm is always loaded before this path.
+        None => try_alloc_concurrent_synthetic(ctx, "java/lang/Class", 1)?,
+    };
     mn_set(
         ctx,
         mn,
@@ -10606,9 +12584,12 @@ fn alloc_resolved_member_name(
     mn_set(ctx, mn, "name", MN_NAME, Value::Object(Some(name_str)));
 
     // type: MethodType built from desc (fall back to ()V if desc is garbage)
-    let mt = build_method_type_from_descriptor(ctx, desc)
-        .or_else(|| build_method_type_from_descriptor(ctx, "()V"));
-    if let Some(mt) = mt {
+    let mt = match build_method_type_from_descriptor(ctx, desc) {
+        Ok(Some(mt)) => Ok(Some(mt)),
+        Ok(None) => build_method_type_from_descriptor(ctx, "()V"),
+        Err(e) => Err(e),
+    };
+    if let Ok(Some(mt)) = mt {
         mn_set(ctx, mn, "type", MN_TYPE, Value::Object(Some(mt)));
     }
 
@@ -10623,7 +12604,7 @@ fn alloc_resolved_member_name(
     // `resolution == null` is what the real `MemberName.isResolved()` reads.
     mn_set(ctx, mn, "resolution", MN_RESOLUTION, Value::Object(None));
 
-    mn
+    Ok(mn)
 }
 
 /// C33: Native bypass for
@@ -10650,7 +12631,7 @@ pub(crate) fn native_ibg_generate_interpreter_entry_point(
         .unwrap_or('V');
     let name = format!("interpret_{}", ret_char);
     let mn = alloc_resolved_member_name(ctx, "java/lang/invoke/LambdaForm", &name, &desc);
-    Ok(Some(Value::Object(Some(mn))))
+    Ok(Some(Value::Object(Some(mn?))))
 }
 
 /// C33: Native bypass for
@@ -10670,7 +12651,7 @@ pub(crate) fn native_ibg_generate_customized_code(
         _ => DESC_DEFAULT_METHOD.to_string(),
     };
     let mn = alloc_resolved_member_name(ctx, "java/lang/invoke/LambdaForm", "MH", &desc);
-    Ok(Some(Value::Object(Some(mn))))
+    Ok(Some(Value::Object(Some(mn?))))
 }
 
 /// C33: Native bypass for
@@ -10686,7 +12667,80 @@ pub(crate) fn native_ibg_generate_named_function_invoker(
     // We don't read it — just return a resolved MemberName with ()V type.
     let _ = args;
     let mn = alloc_resolved_member_name(ctx, "java/lang/invoke/LambdaForm", "NFI", "()V");
-    Ok(Some(Value::Object(Some(mn))))
+    Ok(Some(Value::Object(Some(mn?))))
+}
+
+/// `MethodHandles.byteArrayViewVarHandle` bounds.
+///
+/// Measured against HotSpot JDK 25 with the same three-line probe: a `short`
+/// view over a 16-byte array reports `Index -1 out of bounds for length 15` —
+/// `15`, not `16`, because the length in the message is the number of valid
+/// START positions. CratonVM checked nothing at all, so `set(m, -1, v)` was an
+/// out-of-bounds write that reported success.
+#[cfg(test)]
+mod byte_array_view_bounds_tests {
+    use super::*;
+    use crate::test_utils::mock_ctx;
+    use cratonvm_native_api::NativeHeapAccess;
+
+    /// `(width, valid start positions)` for a 16-byte array.
+    const CASES: &[(u8, i32)] = &[
+        (b'S', 15),
+        (b'C', 15),
+        (b'I', 13),
+        (b'F', 13),
+        (b'J', 9),
+        (b'D', 9),
+    ];
+
+    #[test]
+    fn a_negative_index_is_refused_with_the_jdk_message() {
+        let mut ctx = mock_ctx();
+        let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, 16);
+        for (elem, limit) in CASES {
+            let err = byte_view_check_index(&ctx, arr, -1, *elem)
+                .expect_err("a negative index must be refused");
+            let text = format!("{err:?}");
+            assert!(
+                text.contains(&format!("Index -1 out of bounds for length {limit}")),
+                "elem {}: {text}",
+                *elem as char
+            );
+        }
+    }
+
+    #[test]
+    fn the_last_valid_start_is_accepted_and_the_next_one_is_not() {
+        let mut ctx = mock_ctx();
+        let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, 16);
+        for (elem, limit) in CASES {
+            assert!(
+                byte_view_check_index(&ctx, arr, limit - 1, *elem).is_ok(),
+                "elem {}: index {} must fit",
+                *elem as char,
+                limit - 1
+            );
+            assert!(
+                byte_view_check_index(&ctx, arr, *limit, *elem).is_err(),
+                "elem {}: index {} must not fit",
+                *elem as char,
+                limit
+            );
+        }
+    }
+
+    #[test]
+    fn an_array_too_short_for_one_element_admits_no_index() {
+        let mut ctx = mock_ctx();
+        // Four bytes cannot hold a long; the JDK reports "for length 0"
+        // rather than a negative length.
+        let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, 4);
+        let err = byte_view_check_index(&ctx, arr, 0, b'J').expect_err("no index can fit");
+        assert!(
+            format!("{err:?}").contains("Index 0 out of bounds for length 0"),
+            "{err:?}"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -10716,7 +12770,7 @@ mod tests {
             "identity",
             "(Ljava/lang/Object;)Ljava/lang/Object;",
             MH_KIND_IDENTITY,
-        );
+        ).unwrap();
         // Simulates `dropArguments(leaf, 1, [Object.class, Object.class])`:
         // a 3-param adapter where params[1..3] are dropped and param[0] is
         // the one forwarded to `leaf`. Built directly (bypassing
@@ -10728,15 +12782,15 @@ mod tests {
             "drop",
             "(Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
             MH_KIND_DROP,
-        );
+        ).unwrap();
         ctx.set_field(adapter, MH_BOUND, Value::Object(Some(leaf)));
 
         // Three distinct sentinel objects so a wrong-position bug (e.g. a
         // dropped arg silently reaching `leaf` instead of the kept one)
         // is unmistakable rather than accidentally passing.
-        let kept = alloc_concurrent_synthetic(&mut ctx, "java/lang/Object", 0);
-        let dropped1 = alloc_concurrent_synthetic(&mut ctx, "java/lang/Object", 0);
-        let dropped2 = alloc_concurrent_synthetic(&mut ctx, "java/lang/Object", 0);
+        let kept = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/Object", 0).unwrap();
+        let dropped1 = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/Object", 0).unwrap();
+        let dropped2 = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/Object", 0).unwrap();
         let args = [
             Value::Object(Some(kept)),
             Value::Object(Some(dropped1)),
@@ -10763,7 +12817,7 @@ mod tests {
             "parseInt",
             "(Ljava/lang/String;)I",
             MH_KIND_STATIC,
-        );
+        ).unwrap();
         // In the mock, `set_field_by_name("type", ...)` maps to slot 2
         // (see test_utils::mock_jdk_field_slot) — that's the same slot
         // the MH write-path targets, so reading it back yields the
@@ -10804,7 +12858,7 @@ mod tests {
     #[test]
     fn build_method_type_from_descriptor_non_null() {
         let mut ctx = MockNativeContext::new();
-        let mt = build_method_type_from_descriptor(&mut ctx, "(Ljava/lang/String;)I");
+        let mt = build_method_type_from_descriptor(&mut ctx, "(Ljava/lang/String;)I").unwrap();
         assert!(
             mt.is_some(),
             "MethodType should be non-null for a valid descriptor"
@@ -10815,8 +12869,12 @@ mod tests {
     #[test]
     fn build_method_type_from_descriptor_rejects_garbage() {
         let mut ctx = MockNativeContext::new();
-        assert!(build_method_type_from_descriptor(&mut ctx, "").is_none());
-        assert!(build_method_type_from_descriptor(&mut ctx, "not-a-descriptor").is_none());
+        assert!(build_method_type_from_descriptor(&mut ctx, "")
+            .unwrap()
+            .is_none());
+        assert!(build_method_type_from_descriptor(&mut ctx, "not-a-descriptor")
+            .unwrap()
+            .is_none());
     }
 
     #[test]
@@ -10828,7 +12886,7 @@ mod tests {
             "containsKey",
             "(Ljava/lang/Object;)Z",
             MH_KIND_VIRTUAL,
-        );
+        ).unwrap();
         let effective_desc =
             ctx.create_string("(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;");
         ctx.set_field(mh, MH_DESC, Value::Object(Some(effective_desc)));
@@ -10860,7 +12918,7 @@ mod tests {
             "containsKey",
             "(Ljava/lang/Object;)Z",
             MH_KIND_VIRTUAL,
-        );
+        ).unwrap();
         let result = box_direct_primitive_return(
             &mut ctx,
             mh,
@@ -10930,7 +12988,7 @@ mod tests {
             "java/lang/invoke/LambdaForm",
             "interpret_V",
             "()V",
-        );
+        ).unwrap();
         match mn_get(&mut ctx, mn, "clazz", MN_CLAZZ) {
             Value::Object(Some(_)) => {}
             other => panic!("expected clazz to be non-null, got {:?}", other),
@@ -10973,7 +13031,7 @@ mod tests {
     #[test]
     fn mn_synthetic_layout_predicate_is_true_without_a_method_field() {
         let mut ctx = MockNativeContext::new();
-        let mn = alloc_concurrent_synthetic(&mut ctx, "java/lang/invoke/MemberName", MN_FIELD_COUNT);
+        let mn = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/invoke/MemberName", MN_FIELD_COUNT).unwrap();
         assert!(
             mn_has_synthetic_layout(&mut ctx, mn),
             "a class declaring no instance field named `method` is not a real MemberName"
@@ -10985,7 +13043,9 @@ mod tests {
     #[test]
     fn c33_ibg_interpreter_entry_point_returns_non_null() {
         let mut ctx = MockNativeContext::new();
-        let mt = build_method_type_from_descriptor(&mut ctx, "(I)J").expect("MethodType");
+        let mt = build_method_type_from_descriptor(&mut ctx, "(I)J")
+            .unwrap()
+            .expect("MethodType");
         let result =
             native_ibg_generate_interpreter_entry_point(&mut ctx, &[Value::Object(Some(mt))]);
         match result {
@@ -10999,8 +13059,10 @@ mod tests {
         let mut ctx = MockNativeContext::new();
         // A LambdaForm and MethodType. Synthetic alloc for the form is fine
         // since the native doesn't read its fields.
-        let form = alloc_concurrent_synthetic(&mut ctx, "java/lang/invoke/LambdaForm", 8);
-        let mt = build_method_type_from_descriptor(&mut ctx, "()V").expect("MethodType");
+        let form = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/invoke/LambdaForm", 8).unwrap();
+        let mt = build_method_type_from_descriptor(&mut ctx, "()V")
+            .unwrap()
+            .expect("MethodType");
         let result = native_ibg_generate_customized_code(
             &mut ctx,
             &[Value::Object(Some(form)), Value::Object(Some(mt))],
@@ -11014,7 +13076,7 @@ mod tests {
     #[test]
     fn c33_ibg_named_function_invoker_returns_non_null() {
         let mut ctx = MockNativeContext::new();
-        let form = alloc_concurrent_synthetic(&mut ctx, "java/lang/invoke/MethodTypeForm", 6);
+        let form = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/invoke/MethodTypeForm", 6).unwrap();
         let result =
             native_ibg_generate_named_function_invoker(&mut ctx, &[Value::Object(Some(form))]);
         match result {
@@ -11038,9 +13100,57 @@ mod tests {
         vh
     }
 
+    /// A mock with a PRIVATE vm identity, for any test whose subject reaches
+    /// `box_value`.
+    ///
+    /// `box_value` allocates through `alloc_wrapper`, whose wrapper-`ClassId`
+    /// cache is PROCESS-GLOBAL and keyed by `(vm_identity, wrapper)`. Every
+    /// untouched `MockNativeContext` reports identity `0`, while each one's
+    /// `ClassId` counter is independent — so two such tests running in parallel
+    /// share one cache row, and the second would allocate its box under the
+    /// FIRST test's `ClassId`, making `class_name_of_id` name the wrong class.
+    /// (Same shape as the parallel-test crash already recorded against these
+    /// process-global native caches.) A per-test identity makes the row
+    /// private, so each test resolves the wrapper against its own class table.
+    fn boxing_ctx() -> MockNativeContext {
+        static NEXT: std::sync::atomic::AtomicUsize =
+            std::sync::atomic::AtomicUsize::new(0x5713_0000);
+        let ctx = MockNativeContext::new();
+        ctx.set_vm_identity(NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
+        ctx
+    }
+
+    /// W8-13: every value-returning `VarHandle` access mode is registered under
+    /// the erased `…)Ljava/lang/Object;` descriptor and must therefore hand back
+    /// a BOX, not a bare primitive — see [`vh_box_access_result`]. This asserts
+    /// both halves at once: the wrapper class the JDK 25 oracle names for the
+    /// variable's type, and the payload in slot 0.
+    ///
+    /// Written as an assertion rather than a bare unwrap on purpose: the four
+    /// tests below previously read `Some(Value::Int(n))` and so PASSED on the
+    /// unboxed shape that printed `null` at an `Object` call site.
+    fn expect_boxed(
+        ctx: &MockNativeContext,
+        result: MethodCallResult,
+        wrapper: &str,
+        payload: Value,
+    ) {
+        let obj = match result {
+            Ok(Some(Value::Object(Some(o)))) => o,
+            other => panic!("expected a boxed {wrapper}, got {other:?}"),
+        };
+        let cid = ctx.class_id_of_object(obj);
+        assert_eq!(
+            ctx.class_name_arc_of_id(cid).as_deref(),
+            Some(wrapper),
+            "boxed with the wrong wrapper class"
+        );
+        assert_eq!(ctx.get_field(obj, 0), payload, "boxed payload");
+    }
+
     #[test]
     fn get_and_add_resolves_via_meta_not_synthetic_kind() {
-        let mut ctx = MockNativeContext::new();
+        let mut ctx = boxing_ctx();
         let vh = vh_with_garbage_kind(&mut ctx);
         let recv = match ctx.new_object("Counter").unwrap() {
             Some(Value::Object(Some(o))) => o,
@@ -11067,13 +13177,9 @@ mod tests {
                 Value::Object(Some(recv)),
                 Value::Int(5),
             ],
-        )
-        .unwrap();
-        assert_eq!(
-            old,
-            Some(Value::Int(10)),
-            "must return old value via meta, not 0"
         );
+        // Old value via meta (not 0), boxed per the erased Object return.
+        expect_boxed(&ctx, old, "java/lang/Integer", Value::Int(10));
         assert_eq!(
             ctx.get_field(recv, 0),
             Value::Int(15),
@@ -11081,9 +13187,98 @@ mod tests {
         );
     }
 
+    /// W8-13, and the reason the boxing CANNOT live at the poly-return
+    /// boundary in `vm_exec.rs`.
+    ///
+    /// `Value::Int` carries `boolean`, `byte`, `char`, `short` and `int` alike,
+    /// so the value's tag does not name its wrapper. Only the native knows the
+    /// array's element type. Measured on the JDK 25 oracle, HotSpot prints
+    /// `true` for `System.out.println(booleanVh.getAndSet(arr, 1, false))` —
+    /// i.e. it boxes a `java.lang.Boolean`. A boundary fix that inferred the
+    /// wrapper from the `Value` tag would produce `java.lang.Integer` and print
+    /// `1`. This test is the falsifier for that design.
+    #[test]
+    fn get_and_set_on_boolean_array_boxes_boolean_not_integer() {
+        let mut ctx = boxing_ctx();
+        let vh = vh_with_garbage_kind(&mut ctx);
+        let arr = ctx.new_array(ArrayElementType::Boolean, 3);
+        ctx.set_array_element(arr, 1, Value::Int(1)); // true
+        let old = varhandle_get_and_set(
+            &mut ctx,
+            &[
+                Value::Object(Some(vh)),
+                Value::Object(Some(arr)),
+                Value::Int(1),
+                Value::Int(0), // false
+            ],
+        );
+        expect_boxed(&ctx, old, "java/lang/Boolean", Value::Int(1));
+        assert_eq!(
+            ctx.get_array_element(arr, 1),
+            Value::Int(0),
+            "element must hold the new value"
+        );
+    }
+
+    /// The same argument one type over: a `long[]` element must box to
+    /// `java.lang.Long`, which is what pins `getAndAdd`'s witness to the
+    /// element descriptor rather than to the `Value` tag.
+    #[test]
+    fn get_and_add_on_long_array_boxes_long() {
+        let mut ctx = boxing_ctx();
+        let vh = vh_with_garbage_kind(&mut ctx);
+        let arr = ctx.new_array(ArrayElementType::Long, 3);
+        ctx.set_array_element(arr, 1, Value::Long(7));
+        let old = varhandle_get_and_add(
+            &mut ctx,
+            &[
+                Value::Object(Some(vh)),
+                Value::Object(Some(arr)),
+                Value::Int(1),
+                Value::Long(5),
+            ],
+        );
+        expect_boxed(&ctx, old, "java/lang/Long", Value::Long(7));
+        assert_eq!(ctx.get_array_element(arr, 1), Value::Long(12), "old + delta");
+    }
+
+    /// A REFERENCE-typed variable must pass through the funnel untouched — the
+    /// idempotence property that lets `varhandle_get`'s own inline `box_value`
+    /// and this funnel coexist without double-boxing.
+    #[test]
+    fn get_and_set_on_reference_array_is_not_reboxed() {
+        let mut ctx = boxing_ctx();
+        let vh = vh_with_garbage_kind(&mut ctx);
+        let arr = ctx.new_array(ArrayElementType::Reference, 3);
+        let a = match ctx.new_object("Alpha").unwrap() {
+            Some(Value::Object(Some(o))) => o,
+            _ => unreachable!(),
+        };
+        let b = match ctx.new_object("Beta").unwrap() {
+            Some(Value::Object(Some(o))) => o,
+            _ => unreachable!(),
+        };
+        ctx.set_array_element(arr, 1, Value::Object(Some(a)));
+        let old = varhandle_get_and_set(
+            &mut ctx,
+            &[
+                Value::Object(Some(vh)),
+                Value::Object(Some(arr)),
+                Value::Int(1),
+                Value::Object(Some(b)),
+            ],
+        );
+        assert_eq!(
+            old.unwrap(),
+            Some(Value::Object(Some(a))),
+            "a reference witness must be returned as-is, never wrapped"
+        );
+        assert_eq!(ctx.get_array_element(arr, 1), Value::Object(Some(b)));
+    }
+
     #[test]
     fn get_and_set_resolves_via_meta_not_synthetic_kind() {
-        let mut ctx = MockNativeContext::new();
+        let mut ctx = boxing_ctx();
         let vh = vh_with_garbage_kind(&mut ctx);
         let recv = match ctx.new_object("Holder").unwrap() {
             Some(Value::Object(Some(o))) => o,
@@ -11110,13 +13305,9 @@ mod tests {
                 Value::Object(Some(recv)),
                 Value::Int(99),
             ],
-        )
-        .unwrap();
-        assert_eq!(
-            old,
-            Some(Value::Int(20)),
-            "must return old value via meta, not null"
         );
+        // Old value via meta (not null), boxed per the erased Object return.
+        expect_boxed(&ctx, old, "java/lang/Integer", Value::Int(20));
         assert_eq!(
             ctx.get_field(recv, 0),
             Value::Int(99),
@@ -11127,11 +13318,11 @@ mod tests {
     #[test]
     fn p67_memory_segment_varhandle_access_mode_type_uses_segment_and_offset_coordinates() {
         let mut ctx = MockNativeContext::new();
-        let vh = alloc_concurrent_synthetic(&mut ctx, "java/lang/invoke/VarHandle", 3);
+        let vh = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/invoke/VarHandle", 3).unwrap();
         register_p67_memory_segment_var_handle(&mut ctx, vh, 4);
 
         let access_type =
-            alloc_concurrent_synthetic(&mut ctx, "java/lang/invoke/VarHandle$AccessType", 2);
+            try_alloc_concurrent_synthetic(&mut ctx, "java/lang/invoke/VarHandle$AccessType", 2).unwrap();
         ctx.set_field(access_type, 1, Value::Int(0));
         let get_mt = match varhandle_access_mode_type_uncached(
             &mut ctx,
@@ -11167,7 +13358,7 @@ mod tests {
 
     #[test]
     fn compare_and_exchange_resolves_via_meta_not_synthetic_kind() {
-        let mut ctx = MockNativeContext::new();
+        let mut ctx = boxing_ctx();
         let vh = vh_with_garbage_kind(&mut ctx);
         let recv = match ctx.new_object("Cell").unwrap() {
             Some(Value::Object(Some(o))) => o,
@@ -11196,13 +13387,9 @@ mod tests {
                 Value::Int(30),
                 Value::Int(77),
             ],
-        )
-        .unwrap();
-        assert_eq!(
-            witness,
-            Some(Value::Int(30)),
-            "witness must be old value via meta"
         );
+        // Witness = old value via meta, boxed per the erased Object return.
+        expect_boxed(&ctx, witness, "java/lang/Integer", Value::Int(30));
         assert_eq!(
             ctx.get_field(recv, 0),
             Value::Int(77),
@@ -11218,7 +13405,7 @@ mod tests {
     // exercises the new linearizable path.
     #[test]
     fn compare_and_exchange_mismatch_does_not_write() {
-        let mut ctx = MockNativeContext::new();
+        let mut ctx = boxing_ctx();
         let vh = vh_with_garbage_kind(&mut ctx);
         let recv = match ctx.new_object("Cell").unwrap() {
             Some(Value::Object(Some(o))) => o,
@@ -11247,13 +13434,9 @@ mod tests {
                 Value::Int(99),
                 Value::Int(77),
             ],
-        )
-        .unwrap();
-        assert_eq!(
-            witness,
-            Some(Value::Int(30)),
-            "witness must be the current value on mismatch"
         );
+        // Witness = the current value on mismatch, boxed per the erased return.
+        expect_boxed(&ctx, witness, "java/lang/Integer", Value::Int(30));
         assert_eq!(
             ctx.get_field(recv, 0),
             Value::Int(30),
@@ -11324,6 +13507,273 @@ mod tests {
             ctx.get_field(recv, 0),
             Value::Int(42),
             "field must hold new value on success"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // `Lookup.find*` access control — the gate that RUNS
+    // -----------------------------------------------------------------------
+    //
+    // These arrived here on 2026-08-12 from `classloader.rs`, where five of
+    // them had been green since W3-1 aimed at `classloader::lk_find_virtual` /
+    // `lk_find_getter` — bodies no registrar ever registered, because
+    // `register_p63_method_handles_lookup` in THIS file owns all ten `find*`
+    // triples and `classloader.rs`'s registration site says in its own comment
+    // that it must not re-register them. So the check they asserted about was
+    // not the check the VM ran, and `publicLookup().findVirtual(_, <private>)`
+    // reached the private method while its own unit test said it could not.
+    // That is the shape W4-1-publiclookup-allowedmodes-never-checked.md is
+    // named after, and a test guarding the wrong copy is how it shipped.
+    //
+    // Re-pointed at [`lk_enforce_find_access`], the first statement of all ten
+    // `lookup_find_*`. Four arms the old tests could not express are added,
+    // and each exists because it is a way this gate can be wrong WITHOUT any
+    // of the others noticing:
+    //
+    //   * a real `publicLookup()` mode word. The old tests passed
+    //     `LK_PUBLIC` (0x01). `publicLookup()` is measured at **0x20**,
+    //     `UNCONDITIONAL` and nothing else — a lookup that does not carry the
+    //     `PUBLIC` bit at all. Every one of those five tests was therefore
+    //     asserting about a Lookup shape the JDK never hands out.
+    //   * the `UNCONDITIONAL` class rule: a PUBLIC member of a NON-public
+    //     class is refused, because that mode's rule is about the target class.
+    //   * a zero-mode Lookup, refused before the member walk.
+    //   * an UNREADABLE mode word, which must stay permissive. `Some(0)` and
+    //     `None` are different answers here and a gate that collapsed them
+    //     would still pass every other test in this block.
+    //
+    // And the positive private case, which `classloader.rs`'s test module
+    // carried a NOTE saying could not be exercised in-unit ("`lk_modes_of`
+    // always reports mode 0 under the mock"). It can: the mock has no
+    // `allowedModes` entry in `mock_field_slot` and no declared field for it,
+    // so the class-side witness answers `None` and the reader falls through to
+    // the synthetic slot the test wrote. The note described a reader that had
+    // already been replaced. W7-62-ratchets-and-dead-code.md
+
+    use cratonvm_native_api::{FieldMetadata, MethodMetadata};
+    use cratonvm_types::ClassId;
+
+    /// A target class carrying one method `secret` and one field `hidden` with
+    /// the given access flags, plus the CLASS's own access flags — public
+    /// unless a test says otherwise, because `UNCONDITIONAL` asks about the
+    /// class and the mock's default is 0 (package-private).
+    fn lk_target(
+        ctx: &mut MockNativeContext,
+        class_name: &str,
+        class_flags: u16,
+        method_flags: u16,
+        field_flags: u16,
+    ) -> ObjectRef {
+        let cls_id = ctx.ensure_class_initialized(class_name).unwrap();
+        ctx.set_class_access_flags(cls_id, class_flags);
+        ctx.set_declared_methods(
+            cls_id,
+            vec![MethodMetadata {
+                name: "secret".to_string(),
+                descriptor: "()V".to_string(),
+                access_flags: method_flags,
+                declaring_class_id: cls_id,
+                exceptions: Vec::new(),
+                signature: None,
+            }],
+        );
+        ctx.set_declared_fields(
+            cls_id,
+            vec![FieldMetadata {
+                name: "hidden".to_string(),
+                descriptor: "I".to_string(),
+                access_flags: field_flags,
+                slot_index: 0,
+                declaring_class_id: cls_id,
+                is_static: false,
+            }],
+        );
+        ctx.get_class_mirror(cls_id)
+    }
+
+    /// A `Lookup` receiver whose `allowedModes` reads back as `modes`.
+    ///
+    /// Writes the SYNTHETIC slot, which is what
+    /// [`lk_read_allowed_modes_opt`] falls through to when the class-side
+    /// witness finds no declared `allowedModes` — the fabricated-Lookup shape.
+    fn lk_with_modes(ctx: &mut MockNativeContext, modes: i32) -> ObjectRef {
+        let lk = ctx.alloc_object(ClassId::new(0), 4);
+        ctx.set_field(lk, LK_SYNTHETIC_ALLOWED_MODES, Value::Int(modes));
+        lk
+    }
+
+    /// `args` as `Lookup.findVirtual(refc, name, type)` hands them over.
+    fn lk_find_args(lk: ObjectRef, target: ObjectRef, name: ObjectRef) -> [Value; 4] {
+        [
+            Value::Object(Some(lk)),
+            Value::Object(Some(target)),
+            Value::Object(Some(name)),
+            Value::Object(None),
+        ]
+    }
+
+    const ACC_PUBLIC_U16: u16 = cratonvm_types::access_flags::ACC_PUBLIC;
+    const ACC_PRIVATE_U16: u16 = cratonvm_types::access_flags::ACC_PRIVATE;
+
+    /// THE DEFECT W4-1 IS NAMED AFTER. `publicLookup()` must not reach a
+    /// private method of a public class.
+    #[test]
+    fn publiclookup_is_refused_a_private_method() {
+        let mut ctx = MockNativeContext::new();
+        let target = lk_target(&mut ctx, "p/Target", ACC_PUBLIC_U16, ACC_PRIVATE_U16, ACC_PUBLIC_U16);
+        let lk = lk_with_modes(&mut ctx, LK_MODE_UNCONDITIONAL);
+        let name = ctx.create_string("secret");
+        let r = lk_enforce_find_access(&ctx, &lk_find_args(lk, target, name), 2, None, false);
+        assert!(
+            r.is_err(),
+            "publicLookup (modes 0x20) must not reach a private method; got {r:?}"
+        );
+    }
+
+    /// Calibration for the test above: the same lookup, the same class, a
+    /// PUBLIC method. Without this row a gate that refused everything would
+    /// look correct.
+    #[test]
+    fn publiclookup_reaches_a_public_method_of_a_public_class() {
+        let mut ctx = MockNativeContext::new();
+        let target = lk_target(&mut ctx, "p/Target", ACC_PUBLIC_U16, ACC_PUBLIC_U16, ACC_PUBLIC_U16);
+        let lk = lk_with_modes(&mut ctx, LK_MODE_UNCONDITIONAL);
+        let name = ctx.create_string("secret");
+        let r = lk_enforce_find_access(&ctx, &lk_find_args(lk, target, name), 2, None, false);
+        assert!(r.is_ok(), "a public member of a public class must resolve; got {r:?}");
+    }
+
+    /// `UNCONDITIONAL`'s rule is about the target CLASS. A public member of a
+    /// package-private class is refused — measured on OpenJDK 25.0.3 as
+    /// `IllegalAccessException: symbolic reference class is not accessible`.
+    #[test]
+    fn publiclookup_is_refused_a_public_member_of_a_non_public_class() {
+        let mut ctx = MockNativeContext::new();
+        // class flags 0 = package-private.
+        let target = lk_target(&mut ctx, "p/Packaged", 0, ACC_PUBLIC_U16, ACC_PUBLIC_U16);
+        let lk = lk_with_modes(&mut ctx, LK_MODE_UNCONDITIONAL);
+        let name = ctx.create_string("secret");
+        let r = lk_enforce_find_access(&ctx, &lk_find_args(lk, target, name), 2, None, false);
+        assert!(
+            r.is_err(),
+            "UNCONDITIONAL reaches public members of PUBLIC types only; got {r:?}"
+        );
+    }
+
+    /// The field half of the same boundary — `findGetter`/`findSetter` pass
+    /// `is_field = true`, and the two halves resolve members differently
+    /// (`lk_member_access_flags` walks superclasses for methods and not for
+    /// fields), so one passing does not imply the other.
+    #[test]
+    fn publiclookup_is_refused_a_private_field_getter() {
+        let mut ctx = MockNativeContext::new();
+        let target = lk_target(&mut ctx, "p/Target", ACC_PUBLIC_U16, ACC_PUBLIC_U16, ACC_PRIVATE_U16);
+        let lk = lk_with_modes(&mut ctx, LK_MODE_UNCONDITIONAL);
+        let name = ctx.create_string("hidden");
+        let r = lk_enforce_find_access(&ctx, &lk_find_args(lk, target, name), 2, None, true);
+        assert!(r.is_err(), "private field getter via publicLookup must throw; got {r:?}");
+    }
+
+    #[test]
+    fn publiclookup_reaches_a_public_field_getter() {
+        let mut ctx = MockNativeContext::new();
+        let target = lk_target(&mut ctx, "p/Target", ACC_PUBLIC_U16, ACC_PUBLIC_U16, ACC_PUBLIC_U16);
+        let lk = lk_with_modes(&mut ctx, LK_MODE_UNCONDITIONAL);
+        let name = ctx.create_string("hidden");
+        let r = lk_enforce_find_access(&ctx, &lk_find_args(lk, target, name), 2, None, true);
+        assert!(r.is_ok(), "public field getter must resolve; got {r:?}");
+    }
+
+    /// A full-power `MethodHandles.lookup()` reaches a private member. The
+    /// positive case `classloader.rs`'s test module said could not be
+    /// exercised in-unit.
+    #[test]
+    fn a_full_power_lookup_reaches_a_private_member() {
+        let mut ctx = MockNativeContext::new();
+        let target = lk_target(&mut ctx, "p/Target", ACC_PUBLIC_U16, ACC_PRIVATE_U16, ACC_PUBLIC_U16);
+        let lk = lk_with_modes(&mut ctx, LK_MODE_FULL_POWER);
+        let name = ctx.create_string("secret");
+        let r = lk_enforce_find_access(&ctx, &lk_find_args(lk, target, name), 2, None, false);
+        assert!(
+            r.is_ok(),
+            "a lookup holding PRIVATE must reach a private member; got {r:?}"
+        );
+    }
+
+    /// `lookup().dropLookupMode(PUBLIC)` is 0 on the real JDK, and a zero-mode
+    /// Lookup is refused EVERY member including a public one — before the
+    /// member walk, which is why the class is public and the member is public
+    /// here and it still throws.
+    #[test]
+    fn a_zero_mode_lookup_is_refused_even_a_public_member() {
+        let mut ctx = MockNativeContext::new();
+        let target = lk_target(&mut ctx, "p/Target", ACC_PUBLIC_U16, ACC_PUBLIC_U16, ACC_PUBLIC_U16);
+        let lk = lk_with_modes(&mut ctx, 0);
+        let name = ctx.create_string("secret");
+        let r = lk_enforce_find_access(&ctx, &lk_find_args(lk, target, name), 2, None, false);
+        assert!(r.is_err(), "a zero-mode Lookup must be refused; got {r:?}");
+    }
+
+    /// ...and the receiver whose mode word this VM CANNOT READ must stay
+    /// permissive. `Some(0)` and `None` are different answers, and collapsing
+    /// them turns every Lookup shape the VM does not model into an
+    /// `IllegalAccessException`. Every other test in this block would still
+    /// pass with them collapsed, which is why this row is here.
+    #[test]
+    fn an_unreadable_mode_word_stays_permissive() {
+        let mut ctx = MockNativeContext::new();
+        let target = lk_target(&mut ctx, "p/Target", ACC_PUBLIC_U16, ACC_PRIVATE_U16, ACC_PUBLIC_U16);
+        let lk = ctx.alloc_object(ClassId::new(0), 4);
+        // Not an `Int` in either place the reader looks: no declared
+        // `allowedModes` on this class, and a reference in the synthetic slot.
+        ctx.set_field(lk, LK_SYNTHETIC_ALLOWED_MODES, Value::Object(None));
+        let name = ctx.create_string("secret");
+        let r = lk_enforce_find_access(&ctx, &lk_find_args(lk, target, name), 2, None, false);
+        assert!(
+            r.is_ok(),
+            "an unreadable mode word must not become a refusal; got {r:?}"
+        );
+    }
+
+    /// A member whose flags cannot be resolved at all must be ALLOWED, so a
+    /// class this VM does not model is never spuriously refused.
+    #[test]
+    fn an_unresolvable_member_is_not_blocked() {
+        let mut ctx = MockNativeContext::new();
+        let cid = ctx.ensure_class_initialized("p/Opaque").unwrap();
+        ctx.set_class_access_flags(cid, ACC_PUBLIC_U16);
+        let target = ctx.get_class_mirror(cid);
+        let lk = lk_with_modes(&mut ctx, LK_MODE_UNCONDITIONAL);
+        let name = ctx.create_string("whatever");
+        let r = lk_enforce_find_access(&ctx, &lk_find_args(lk, target, name), 2, None, false);
+        assert!(r.is_ok(), "an unresolvable member must not be blocked; got {r:?}");
+    }
+
+    /// Methods resolve up the superclass chain; fields do not. Moved from
+    /// `classloader.rs`, where it exercised that module's own now-deleted copy
+    /// of this helper.
+    #[test]
+    fn lk_member_access_flags_walks_superclass_for_methods() {
+        let mut ctx = MockNativeContext::new();
+        let parent = ctx.ensure_class_initialized("p/Parent").unwrap();
+        ctx.set_declared_methods(
+            parent,
+            vec![MethodMetadata {
+                name: "inherited".to_string(),
+                descriptor: "()V".to_string(),
+                access_flags: ACC_PUBLIC_U16,
+                declaring_class_id: parent,
+                exceptions: Vec::new(),
+                signature: None,
+            }],
+        );
+        let child = ctx.ensure_class_initialized("p/Child").unwrap();
+        ctx.set_declared_methods(child, Vec::new());
+        ctx.set_superclass(child, parent);
+        let mirror = ctx.get_class_mirror(child);
+        assert_eq!(
+            lk_member_access_flags(&ctx, mirror, "inherited", false),
+            Some(ACC_PUBLIC_U16)
         );
     }
 }

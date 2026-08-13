@@ -72,8 +72,17 @@ public class RJdkJni {
         Object o = new Object();
         int viaReflection = (Integer) hashCode.invoke(o);
         check(viaReflection == o.hashCode(), "reflective native invoke must agree with direct");
+        // `> 0` was satisfied by a reflective path that answered a constant, or
+        // dropped through to a stub, without ever reaching the binding this
+        // line is named for. Bracketed by two DIRECT calls to the same native
+        // instead: relational, computed by the test, and it can only widen on a
+        // slower host. Not a wall-clock window -- no fixed duration appears.
+        long before = System.currentTimeMillis();
         long t = (Long) millis.invoke(null);
-        check(t > 0, "reflective static native invoke");
+        long after = System.currentTimeMillis();
+        check(t >= before && t <= after,
+                "reflective static native invoke returned " + t + ", outside ["
+                        + before + "," + after + "]");
 
         // arraycopy is a native with strict argument checks that must raise the
         // spec'd exception rather than corrupting memory.
@@ -200,6 +209,25 @@ public class RJdkJni {
         }
         check(loaded.equals("zip") || loaded.equals("net"),
                 "a JDK-shipped native library must be loadable, got: " + loaded);
+        // ...and WHICH one, which the line above cannot see. "zip" is exactly
+        // the answer a too-wide VM allowlist manufactures: main() runs
+        // zipNatives() first, so java.base has already boot-loaded zip into the
+        // BOOT loader by the time this runs, and the JDK refuses the same
+        // library file to a second class loader -- HotSpot 25 therefore throws
+        // here and falls through to the net probe. A VM answering "zip" is
+        // reporting success for a load the JDK forbids. Asserted rather than
+        // left to the cross-VM CK diff, because that diff is SKIPPED whenever
+        // no HotSpot is present on the host (run.sh says so), which is the
+        // configuration this line has to survive.
+        //
+        // It is also the trip-wire for the other direction: recording the boot
+        // loader's own libraries (jdk/internal/loader/BootLoader.loadLibrary is
+        // a no-op today) would claim "net" first, turning this into "none". See
+        // docs/known-issues/jdk-only/W5-1-loadlibrary-allowlist-too-wide.md and
+        // section 2.6 of that directory's README.
+        check(loaded.equals("net"),
+                "System.loadLibrary must FAIL for zip once java.util.zip has boot-loaded it"
+                        + " and fall through to net, got: " + loaded);
 
         // A library that does not exist must be a real UnsatisfiedLinkError. Its
         // MESSAGE embeds java.library.path, so only the type is asserted.
@@ -219,6 +247,58 @@ public class RJdkJni {
             threw = true;
         }
         check(threw, "System.load of a missing file must raise UnsatisfiedLinkError");
+
+        // ------------------------------------------------------------------
+        // The Runtime road, and the assertion that the NAME reaches the native.
+        //
+        // Runtime.load0/loadLibrary0 are INSTANCE methods, so a native body
+        // sees args[0] = the Runtime receiver, args[1] = the fromClass mirror
+        // and args[2] = the library name. A native that reads args[1] gets the
+        // Class, whose string form is empty, and then EVERY load fails with an
+        // empty name. Asserting only "it threw" cannot see that -- the wrong
+        // index throws too -- so what is asserted here is that the error NAMES
+        // the library the caller asked for. The message text still is not
+        // printed (it embeds java.library.path); only these predicates are.
+        String rtMissing = "cratonvm_no_such_library_20260812_runtime";
+        String rtMsg = null;
+        try {
+            Runtime.getRuntime().loadLibrary(rtMissing);
+        } catch (UnsatisfiedLinkError expected) {
+            rtMsg = String.valueOf(expected.getMessage());
+        }
+        check(rtMsg != null,
+                "Runtime.loadLibrary of a missing library must raise UnsatisfiedLinkError");
+        check(rtMsg.contains(rtMissing),
+                "Runtime.loadLibrary's UnsatisfiedLinkError must name the library asked for");
+
+        // Same, one road down: Runtime.load(String) of an absolute path. Both
+        // HotSpot's "Can't load library: <path>" and this VM's "no <path> in
+        // java.library.path" contain the path, which is what is asserted; the
+        // two SHAPES differ and that divergence is recorded separately.
+        String rtPath = new java.io.File("cratonvm-no-such-runtime.so").getAbsolutePath();
+        String rtLoadMsg = null;
+        try {
+            Runtime.getRuntime().load(rtPath);
+        } catch (UnsatisfiedLinkError expected) {
+            rtLoadMsg = String.valueOf(expected.getMessage());
+        }
+        check(rtLoadMsg != null,
+                "Runtime.load of a missing file must raise UnsatisfiedLinkError");
+        check(rtLoadMsg.contains(rtPath),
+                "Runtime.load's UnsatisfiedLinkError must name the file asked for");
+
+        // And the positive direction, which no "it threw" assertion can reach:
+        // whatever System.loadLibrary just loaded must also load through
+        // Runtime. Same VM, same class loader, same file, so the JDK answers
+        // out of this loader's own cache -- the cross-loader
+        // UnsatisfiedLinkError is not in range here.
+        boolean rtLoaded = true;
+        try {
+            Runtime.getRuntime().loadLibrary(loaded);
+        } catch (UnsatisfiedLinkError e) {
+            rtLoaded = false;
+        }
+        check(rtLoaded, "Runtime.loadLibrary must load what System.loadLibrary loaded: " + loaded);
 
         // mapLibraryName is pure and platform-shaped.
         String mapped = System.mapLibraryName("foo");

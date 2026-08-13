@@ -5723,7 +5723,7 @@ mod deopt_metadata_tests {
 }
 
 /// The soundness lanes added by the deopt-metadata audit
-/// (`docs/jit/deopt-metadata-audit.md`). Each test fails against the verifier
+/// (`audits/deopt-metadata-audit.md`). Each test fails against the verifier
 /// as it stood before that audit: every construct below passed verification.
 #[cfg(test)]
 mod deopt_metadata_soundness_tests {

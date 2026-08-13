@@ -124,7 +124,13 @@ public class RJdkServices {
 
         Optional<Greeting> found = ServiceLoader.load(Greeting.class, loader).findFirst();
         check(found.isPresent(), "findFirst");
-        check(found.get().greet().length() > 0, "findFirst product is usable");
+        // `.length() > 0` was satisfied by ANY non-empty string, including one
+        // from a fabricated stand-in that is not one of the three configured
+        // providers at all. The product has to be one of the greetings the
+        // discovery above already pinned by exact value.
+        check(greets.contains(found.get().greet()),
+                "findFirst product is not one of the discovered providers: "
+                        + found.get().greet());
 
         // Exhausted iterator behaviour.
         Iterator<Greeting> it = ServiceLoader.load(Greeting.class, loader).iterator();

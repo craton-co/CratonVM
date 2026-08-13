@@ -1770,11 +1770,22 @@ impl Compiler {
                 // null check. Array layout is compact 8-byte pointers (matches the already-
                 // inlined `aaload` path).
                 //
-                // ArrayStoreException note: the current `jit_aastore` helper does NOT enforce
-                // the ASE check (the interpreter does it via `set_array_element`). This inline
-                // path matches the helper's behavior exactly — no regression. Wiring an inline
-                // ASE check is a follow-up that needs type-narrowing infrastructure (not yet
-                // tracked in this JIT).
+                // ArrayStoreException: enforced here by calling
+                // `jit_aastore_type_check` before the store (see below).
+                //
+                // This note used to read "the current `jit_aastore` helper does
+                // NOT enforce the ASE check … no regression". That premise was
+                // true when written, and was falsified when the check landed in
+                // `jit_aastore` — silently, because this path had already
+                // stopped calling that helper and a premise in a comment is not
+                // a compile-time link. For the ~day it stood, a JIT-compiled
+                // `aastore` performed the store and raised nothing:
+                // `RExceptions` reads `cold=[java.lang.Integer] hot=[no-throw]`
+                // at i≈500, i.e. the tier-parity assertion caught it the moment
+                // the method tiered up. The claim that an inline ASE check
+                // "needs type-narrowing infrastructure" is also not so: type
+                // narrowing is what would let a check be ELIDED, not what makes
+                // one correct.
                 0x53 => {
                     self.flush_scratch_registers();
                     let val_slot = self.pop_stack();
@@ -1785,6 +1796,44 @@ impl Compiler {
                     // Round-8 CRIT fix: NPE on null array (JVMS §aastore).
                     self.emit_null_check_array_store_at(code, pc);
                     self.emit_bounds_check(pc);
+                    // JVMS §aastore covariance check, BEFORE anything mutates:
+                    // on a refusal no element may be written and no barrier may
+                    // run. `jit_aastore_type_check` answers 0 (legal) or the
+                    // i64::MIN sentinel, having stashed the
+                    // ArrayStoreException; `emit_post_invoke_exception_check`
+                    // routes the sentinel through the same drain
+                    // `jit_checkcast`'s ClassCastException uses.
+                    //
+                    // A null value is legal for every reference array, so it
+                    // branches over the call entirely — `arr[i] = null` keeps
+                    // costing a test and a not-taken jump. Everything else pays
+                    // one call, which is the price of the JVMS rule; the arm
+                    // already makes one (SATB) to two (card mark) helper calls.
+                    self.load_slot_to_reg(RDX, val_slot);
+                    self.buf.emit(&[0x48, 0x85, 0xD2]); // TEST RDX, RDX
+                    self.buf.emit(&[0x0F, 0x84]); // JZ rel32 -> past the call
+                    let ase_skip_patch = self.buf.pos();
+                    self.buf.emit(&[0x00, 0x00, 0x00, 0x00]);
+                    // Args: (vm_ptr, array_ptr, value_ptr).
+                    self.emit_load_local(ARG_REGS[0], self.heap_local_offset);
+                    self.load_slot_to_reg(ARG_REGS[1], array_slot);
+                    self.load_slot_to_reg(ARG_REGS[2], val_slot);
+                    // The refusal path allocates (it builds the throwable), so
+                    // spill and publish an oop map exactly as `checkcast` does.
+                    self.emit_pre_safepoint_spill();
+                    self.emit_call_absolute(self.helpers.aastore_type_check);
+                    self.emit_oop_map_for_safepoint();
+                    self.emit_post_invoke_exception_check(b'V');
+                    self.emitted_aastore_throw = true;
+                    {
+                        let here = self.buf.pos() as i32;
+                        let rel = here - (ase_skip_patch as i32 + 4);
+                        self.buf.try_patch_i32(ase_skip_patch, rel).ok();
+                    }
+                    // The call clobbers the scratch registers; re-establish
+                    // RAX=array / RCX=index for the SATB load below.
+                    self.load_slot_to_reg(RAX, array_slot);
+                    self.load_slot_to_reg(RCX, index_slot);
                     // Round-7 fix (CRIT, UAF in JIT): SATB pre-write barrier.
                     // Inline-load the OLD reference at the slot and pipe it
                     // through `jit_satb_pre_write_barrier(vm_ptr, old_ref)`
@@ -5557,36 +5606,85 @@ impl Compiler {
                             self.emit_test_r64_r64(RCX);
                             bail_patches.push(self.emit_jcc_rel32_patch(0x84)); // JZ
 
-                            // --- Guard 3: both are arrays (ObjectHeader.kind
-                            // at offset 4 == ObjectKind::Array == 1) ---
-                            // MOVZX EDX, BYTE [RAX + 4]  (src kind)
-                            self.buf.emit(&[0x0F, 0xB6, 0x50, 0x04]);
-                            // CMP EDX, 1
-                            self.buf.emit(&[0x83, 0xFA, 0x01]);
-                            bail_patches.push(self.emit_jcc_rel32_patch(0x85)); // JNE
-                                                                                // MOVZX EDX, BYTE [RCX + 4]  (dst kind)
-                            self.buf.emit(&[0x0F, 0xB6, 0x51, 0x04]);
-                            self.buf.emit(&[0x83, 0xFA, 0x01]);
+                            // --- Guards 3 and 4: both are arrays, of the SAME
+                            // PRIMITIVE element kind ---
+                            //
+                            // `kind` and `element_type` are BOTH in the one
+                            // byte at `KIND_TAGS_BYTE_OFFSET` — `kind` in bits
+                            // 0..2 (`KIND_TAG_BYTE_MASK`), `element_type` in
+                            // bits 2..6. They used to be separate bytes at
+                            // offsets 4 and 5, and this code still read those
+                            // two literals after the header shrank 24 -> 16 on
+                            // 2026-08-07 and the quartet moved into the mark
+                            // word.
+                            //
+                            // Offset 4 is now `shape` — an ARRAY'S LENGTH. The
+                            // same function reads the length from that very
+                            // offset (via `ARRAY_LENGTH_OFFSET`) forty lines
+                            // below, so the "is this an array" guard was
+                            // testing the length's low byte and the "element
+                            // type" was the next length byte. That does not
+                            // fail safe: for a length whose low byte is 1 and
+                            // whose second byte is >= 4 — 1025 = 0x0401 — both
+                            // tests PASS and the element width comes out as
+                            // `1 << ((4 - 4) & 3)` = one byte. `arraycopy` on a
+                            // `long[1025]` moved 1025 bytes instead of 8200 and
+                            // returned normally: no exception, no crash, a
+                            // silently truncated copy.
+                            // `probes/ArraycopyHeaderOffsetProbe.java` is the
+                            // repro — mismatch at index 128 for `long[1025]`
+                            // and 256 for `int[1025]`, while 1024 / 300 / 257
+                            // pass, which is why this hid.
+                            //
+                            // Read the constants, as every other header access
+                            // in this file already does.
+                            const KIND_TAGS: u8 = cratonvm_types::KIND_TAGS_BYTE_OFFSET as u8;
+
+                            // MOVZX EDX, BYTE [RAX + KIND_TAGS]  (src tags)
+                            self.buf.emit(&[0x0F, 0xB6, 0x50, KIND_TAGS]);
+                            // MOV R10D, EDX — keep the whole byte; EDX is about
+                            // to be masked down to the kind bits.
+                            self.buf.emit(&[0x41, 0x89, 0xD2]);
+                            // AND EDX, KIND_TAG_BYTE_MASK
+                            self.buf
+                                .emit(&[0x83, 0xE2, cratonvm_types::KIND_TAG_BYTE_MASK]);
+                            // CMP EDX, ObjectKind::Array
+                            self.buf
+                                .emit(&[0x83, 0xFA, cratonvm_types::ObjectKind::Array as u8]);
                             bail_patches.push(self.emit_jcc_rel32_patch(0x85)); // JNE
 
-                            // --- Guard 4: same element kind AND primitive ---
-                            // ObjectHeader.element_type is the byte at
-                            // offset 5. ArrayElementType: Reference=0,
-                            // Boolean=4, Char=5, Float=6, Double=7, Byte=8,
-                            // Short=9, Int=10, Long=11.
-                            // MOVZX EDX, BYTE [RAX + 5]  (src element_type)
-                            self.buf.emit(&[0x0F, 0xB6, 0x50, 0x05]);
-                            // MOVZX R10D, BYTE [RCX + 5] (dst element_type)
-                            self.buf.emit(&[0x44, 0x0F, 0xB6, 0x51, 0x05]);
-                            // CMP EDX, R10D  → element kinds must be equal
-                            self.buf.emit(&[0x44, 0x3B, 0xD2]);
+                            // MOVZX EDX, BYTE [RCX + KIND_TAGS]  (dst tags)
+                            self.buf.emit(&[0x0F, 0xB6, 0x51, KIND_TAGS]);
+                            // MOV R11D, EDX
+                            self.buf.emit(&[0x41, 0x89, 0xD3]);
+                            self.buf
+                                .emit(&[0x83, 0xE2, cratonvm_types::KIND_TAG_BYTE_MASK]);
+                            self.buf
+                                .emit(&[0x83, 0xFA, cratonvm_types::ObjectKind::Array as u8]);
                             bail_patches.push(self.emit_jcc_rel32_patch(0x85)); // JNE
-                                                                                // CMP EDX, 4 → primitive kinds are 4..=11; a
+
+                            // element_type = (tags >> 2) & 0xF. ArrayElementType:
+                            // Reference=0, Boolean=4, Char=5, Float=6, Double=7,
+                            // Byte=8, Short=9, Int=10, Long=11 — four bits.
+                            // SHR R10D, 2 ; AND R10D, 0xF   (src)
+                            self.buf.emit(&[0x41, 0xC1, 0xEA, 0x02]);
+                            self.buf.emit(&[0x41, 0x83, 0xE2, 0x0F]);
+                            // SHR R11D, 2 ; AND R11D, 0xF   (dst)
+                            self.buf.emit(&[0x41, 0xC1, 0xEB, 0x02]);
+                            self.buf.emit(&[0x41, 0x83, 0xE3, 0x0F]);
+                            // CMP R10D, R11D → element kinds must be equal
+                            self.buf.emit(&[0x45, 0x39, 0xDA]);
+                            bail_patches.push(self.emit_jcc_rel32_patch(0x85)); // JNE
+                                                                                // CMP R10D, 4 → primitive kinds are 4..=11; a
                                                                                 // value < 4 means Reference (0) — bail (the GC
                                                                                 // store barrier / ArrayStoreException make
                                                                                 // reference copies unsafe to inline).
-                            self.buf.emit(&[0x83, 0xFA, 0x04]);
+                            self.buf.emit(&[0x41, 0x83, 0xFA, 0x04]);
                             bail_patches.push(self.emit_jcc_rel32_patch(0x82)); // JB (unsigned <)
+                                                                                // MOV EDX, R10D — the shift math below operates
+                                                                                // on EDX, as it did when EDX held the element
+                                                                                // type directly.
+                            self.buf.emit(&[0x44, 0x89, 0xD2]);
 
                             // shift = (element_type - 4) & 3, where
                             //   width == 1 << shift  for every primitive
@@ -6421,8 +6519,30 @@ impl Compiler {
                             } else {
                                 ARG_REGS.len()
                             };
+                            // 5. The callee cannot stash a deopt frame.
+                            //
+                            // A sibling tail call REPLACES this frame, so the
+                            // callee returns straight to OUR caller — and if it
+                            // traps, the `i64::MIN` sentinel and the frame it
+                            // stashed under the CALLEE's key arrive at a call
+                            // site that invoked US. That site's identity gate
+                            // (`try_resume_trapped_callee`) correctly refuses a
+                            // stash naming a method it did not call, and the
+                            // frame becomes an orphan nobody can attribute.
+                            // A real CALL keeps this frame alive long enough
+                            // for `emit_inline_callee_deopt_check` below to
+                            // service the trap at the site that made it.
+                            //
+                            // `info_ptr.is_some()` IS the "can stash" test:
+                            // a `JitInvokeInfo` is registered for exactly the
+                            // sites whose callee is a compiled Java artifact
+                            // (plus `ArraycopyPrimitive`, the one intrinsic
+                            // that deopts). Inline-machine-code intrinsics and
+                            // the thin native helpers have no info and no way
+                            // to stash, so they keep the tail form.
                             let sibling_tail_ok = is_sibling_tail
                                 && arg_slots.len() <= sibling_reg_limit
+                                && info_ptr.is_none()
                                 && sp_tailcall_enabled();
                             if sibling_tail_ok {
                                 // Load args into ABI registers, tear
@@ -6488,6 +6608,13 @@ impl Compiler {
                             self.emit_stack_arg_cleanup(total_sub);
                             if let (Some(info), Some(args_base)) = (info_ptr, service_args_base) {
                                 self.emit_inline_callee_deopt_check(info as *const crate::JitInvokeInfo, arg_slots.len(), args_base);
+                            } else {
+                                self.dbg_unserviced_direct_call(
+                                    "invokestatic",
+                                    pc,
+                                    info_ptr.is_some(),
+                                    service_args_base.is_some(),
+                                );
                             }
 
                             // A directly-called compiled callee that throws
@@ -7234,6 +7361,141 @@ impl Compiler {
                         // unchanged plain direct-call path.
                         #[allow(unused_mut)]
                         let mut intrinsic_handled = false;
+
+                        // ===== INTRINSIC REGION BEGIN: ATOMIC_INT =====
+                        // `AtomicInteger` RMW family, emitted as ONE
+                        // `LOCK XADD [value], ECX`.
+                        //
+                        // `XADD` atomically adds the source register to the
+                        // destination and leaves the PRE-add value in the
+                        // source, which is exactly `getAndAdd` semantics; the
+                        // `*AndGet` forms add the delta back afterwards. That
+                        // replaces a full native dispatch (~250 ns/op measured)
+                        // with a single locked instruction.
+                        //
+                        // Soundness rests on three things:
+                        //   * the registered native keeps its state in the SAME
+                        //     memory (`get_field_volatile(this, 0)` /
+                        //     `compare_and_swap_field(this, 0, ..)`), so an
+                        //     interpreted caller and a compiled caller still
+                        //     agree on one location;
+                        //   * the receiver class-id guard below — AtomicInteger
+                        //     is not final, so a subclass override must NOT take
+                        //     this path;
+                        //   * the per-object COMPACT/LEGACY branch, the same one
+                        //     `emit_load_string_i32_field` uses, because a class
+                        //     with a registered `CompactLayout` may still have
+                        //     legacy-laid-out instances.
+                        // Every uncertain case (null receiver, class mismatch)
+                        // goes to the shared uncommon-trap stub and re-runs in
+                        // the interpreter, which reproduces the NPE exactly.
+                        if !intrinsic_handled {
+                            // (delta_imm, return_post_add, delta_is_arg)
+                            let plan: Option<(i32, bool, bool)> = if callee_entry
+                                == crate::JitIntrinsic::AtomicIntGetAndIncrement.as_entry()
+                            {
+                                Some((1, false, false))
+                            } else if callee_entry
+                                == crate::JitIntrinsic::AtomicIntGetAndDecrement.as_entry()
+                            {
+                                Some((-1, false, false))
+                            } else if callee_entry
+                                == crate::JitIntrinsic::AtomicIntIncrementAndGet.as_entry()
+                            {
+                                Some((1, true, false))
+                            } else if callee_entry
+                                == crate::JitIntrinsic::AtomicIntDecrementAndGet.as_entry()
+                            {
+                                Some((-1, true, false))
+                            } else if callee_entry
+                                == crate::JitIntrinsic::AtomicIntGetAndAdd.as_entry()
+                            {
+                                Some((0, false, true))
+                            } else if callee_entry
+                                == crate::JitIntrinsic::AtomicIntAddAndGet.as_entry()
+                            {
+                                Some((0, true, true))
+                            } else {
+                                None
+                            };
+                            if let Some((delta_imm, return_post_add, delta_is_arg)) = plan {
+                                // Recomputed from the same two inputs the
+                                // matcher used; `None` here cannot happen for a
+                                // registered site, and bailing keeps the plain
+                                // direct-call path rather than emitting a CALL
+                                // to an intrinsic sentinel.
+                                if let Some(layout) =
+                                    crate::AtomicIntFieldLayout::new(0, guard_class_id)
+                                {
+                                    self.flush_scratch_registers();
+                                    if crate::deopt_real_enabled() {
+                                        self.snapshot_pre_intrinsic_call(
+                                            pc,
+                                            crate::deopt::DeoptReason::ReceiverTypeChanged,
+                                        );
+                                    }
+                                    let mut bail: Vec<usize> = Vec::new();
+                                    // Operands: delta (if any) is shallower,
+                                    // the receiver is deepest.
+                                    let delta_slot =
+                                        if delta_is_arg { Some(self.pop_stack()) } else { None };
+                                    let recv_slot = self.pop_stack();
+
+                                    // RAX = receiver; null → deopt.
+                                    self.load_slot_to_reg(RAX, recv_slot);
+                                    self.emit_test_r64_r64(RAX);
+                                    bail.push(self.emit_jcc_rel32_patch(0x84)); // JZ
+
+                                    // Exact receiver class guard:
+                                    // CMP DWORD [RAX + 0], guard_class_id ; JNE
+                                    self.buf.emit(&[0x81, 0x78, 0x00]);
+                                    self.buf.emit(&guard_class_id.to_le_bytes());
+                                    bail.push(self.emit_jcc_rel32_patch(0x85)); // JNE
+
+                                    // EDX = delta (kept for the *AndGet fixup,
+                                    // since XADD overwrites its source with the
+                                    // pre-add value).
+                                    match delta_slot {
+                                        Some(slot) => self.load_slot_to_reg(RDX, slot),
+                                        None => {
+                                            self.buf.emit(&[0xBA]); // MOV EDX, imm32
+                                            self.buf.emit(&delta_imm.to_le_bytes());
+                                        }
+                                    }
+                                    self.buf.emit(&[0x89, 0xD1]); // MOV ECX, EDX
+
+                                    // Per-object layout branch.
+                                    self.emit_test_mem8_imm8(
+                                        RAX,
+                                        cratonvm_types::GC_FLAGS_BYTE_OFFSET as i32,
+                                        cratonvm_types::GC_FLAG_COMPACT,
+                                    );
+                                    let legacy = self.emit_jcc_rel32_patch(0x84); // JZ
+                                                                                  // LOCK XADD [RAX + compact], ECX
+                                    self.buf.emit(&[0xF0, 0x0F, 0xC1, 0x88]);
+                                    self.buf.emit(&layout.value_compact_offset.to_le_bytes());
+                                    let done = self.emit_jmp_rel32_patch();
+                                    self.patch_rel32_to_here(legacy);
+                                    // LOCK XADD [RAX + legacy], ECX
+                                    self.buf.emit(&[0xF0, 0x0F, 0xC1, 0x88]);
+                                    self.buf.emit(&layout.value_legacy_offset.to_le_bytes());
+                                    self.patch_rel32_to_here(done);
+
+                                    // ECX now holds the PRE-add value.
+                                    if return_post_add {
+                                        self.buf.emit(&[0x01, 0xD1]); // ADD ECX, EDX
+                                    }
+                                    self.buf.emit(&[0x48, 0x63, 0xC1]); // MOVSXD RAX, ECX
+                                    self.push_from_rax();
+
+                                    for p in bail {
+                                        self.deopt_stubs.push((p, pc, 6));
+                                    }
+                                    intrinsic_handled = true;
+                                }
+                            }
+                        }
+                        // ===== INTRINSIC REGION END: ATOMIC_INT =====
 
                         // ===== INTRINSIC REGION BEGIN: STRING_ACCESS =====
                         // java.lang.String access intrinsics (Phase 3a):
@@ -8516,6 +8778,13 @@ impl Compiler {
                             self.emit_stack_arg_cleanup(total_sub);
                             if let (Some(info), Some(args_base)) = (info_ptr, service_args_base) {
                                 self.emit_inline_callee_deopt_check(info as *const crate::JitInvokeInfo, arg_slots.len(), args_base);
+                            } else {
+                                self.dbg_unserviced_direct_call(
+                                    "invokespecial/virtual",
+                                    pc,
+                                    info_ptr.is_some(),
+                                    service_args_base.is_some(),
+                                );
                             }
 
                             // A directly-called compiled callee that throws (or
@@ -9896,7 +10165,7 @@ impl Compiler {
                                 "[cratonvm-jitc] compile-bail unresumable-indy-trap bci={pc}"
                             );
                         }
-                        self.buf.mark_overflowed();
+                        self.buf.mark_codegen_unencodable("unresumable-indy-trap");
                     }
 
                     let patch = self.emit_jmp_rel32_patch();

@@ -314,12 +314,143 @@ public class RJdkSecurity {
         System.out.println("CK RJdkSecurity providerSun=true");
     }
 
+    /**
+     * Advertised versus served: every name the provider chain publishes must be
+     * one the engine will hand over, and no name it refuses may be published.
+     *
+     * The three records this closes -- W4-3-security-getalgorithms-short-list.md,
+     * W7-29-jca-advertise-implement-gaps.md, W7-63-jca-advertise-vs-serve.md --
+     * had their fixes ratcheted only by Rust unit tests over the seed map and by
+     * a probe under probes/, which regression-suite/run.sh never runs. Every
+     * assertion here fails on the pre-fix behaviour:
+     *
+     *   MD2                 advertised by SUN and refused by getInstance
+     *   SHAKE128-256/256-512 neither implemented nor advertised
+     *   SHAKE128 / SHAKE256 the ALIAS half -- resolvable on HotSpot, refused
+     *                       here even after the primaries landed, because
+     *                       getInstance's only gate is the digest engine's own
+     *                       name table and nothing on that path reads the
+     *                       provider chain's alias rows
+     *   Signature           getInstance accepted EVERY string and deferred the
+     *                       failure to sign()/verify() as the wrong exception
+     *   getAlgorithms       returned a plain mutable HashSet
+     *
+     * Every vector is HotSpot 25's own answer, so this section holds on the
+     * oracle as well as on both CratonVM modes. Two knowing divergences are
+     * deliberately NOT asserted here because they would fail on HotSpot: SUN's
+     * KeyFactory no longer advertises the ML-DSA umbrella, and SunJCE's no
+     * longer advertises ML-KEM. The loops below assert the invariant those
+     * removals restore -- advertised implies serviceable -- which is true on
+     * both VMs by different routes.
+     */
+    static void advertisedVersusServed() throws Exception {
+        // MD2, RFC 1319. Advertised by SUN for three waves while getInstance
+        // refused it; implemented rather than de-advertised, because SunRsaSign
+        // and SunMSCAPI both advertise MD2withRSA, which resolves MD2
+        // internally. These are RFC 1319's own vectors, re-measured on HotSpot.
+        MessageDigest md2 = MessageDigest.getInstance("MD2");
+        check(md2.getDigestLength() == 16, "MD2 digest length: " + md2.getDigestLength());
+        String md2Empty = hex(md2.digest(new byte[0]));
+        check(md2Empty.equals("8350e5a3e24c153df2275c9f80692773"), "MD2 of empty: " + md2Empty);
+        String md2Abc = hex(md2.digest("abc".getBytes(java.nio.charset.StandardCharsets.UTF_8)));
+        check(md2Abc.equals("da853b0d3f88d99b30283a69e6ded6bb"), "MD2(abc): " + md2Abc);
+
+        // The two SHAKE XOFs read out to the fixed length their JDK name names.
+        MessageDigest shake128 = MessageDigest.getInstance("SHAKE128-256");
+        check(shake128.getDigestLength() == 32,
+                "SHAKE128-256 length: " + shake128.getDigestLength());
+        String s128 = hex(shake128.digest("abc".getBytes(
+                java.nio.charset.StandardCharsets.UTF_8)));
+        check(s128.equals("5881092dd818bf5cf8a3ddb793fbcba74097d5c526a6d35f97b83351940f2cc8"),
+                "SHAKE128-256(abc): " + s128);
+        MessageDigest shake256 = MessageDigest.getInstance("SHAKE256-512");
+        check(shake256.getDigestLength() == 64,
+                "SHAKE256-512 length: " + shake256.getDigestLength());
+        String s256 = hex(shake256.digest("abc".getBytes(
+                java.nio.charset.StandardCharsets.UTF_8)));
+        check(s256.equals("483366601360a8771c6863080cc4114d8db44530f8f1e1ee4f94ea37e78b5739"
+                        + "d5a15bef186a5386c75744c0527e1faa9f8726e462a12a4feb06bd8801e751e4"),
+                "SHAKE256-512(abc): " + s256);
+
+        // The alias half. Alg.Alias.MessageDigest.SHAKE128 = SHAKE128-256 on
+        // HotSpot: the bare spelling resolves and produces byte-identical
+        // output, while getAlgorithms lists only the hyphenated primary.
+        String alias128 = hex(MessageDigest.getInstance("SHAKE128").digest(
+                "abc".getBytes(java.nio.charset.StandardCharsets.UTF_8)));
+        check(alias128.equals(s128), "SHAKE128 is an alias of SHAKE128-256: " + alias128);
+        String alias256 = hex(MessageDigest.getInstance("SHAKE256").digest(
+                "abc".getBytes(java.nio.charset.StandardCharsets.UTF_8)));
+        check(alias256.equals(s256), "SHAKE256 is an alias of SHAKE256-512: " + alias256);
+
+        java.util.Set<String> digestNames = Security.getAlgorithms("MessageDigest");
+        check(digestNames.contains("MD2"), "MessageDigest algorithms must include MD2");
+        check(digestNames.contains("SHAKE128-256") && digestNames.contains("SHAKE256-512"),
+                "MessageDigest algorithms must include both SHAKE primaries: " + digestNames);
+        check(!digestNames.contains("SHAKE128") && !digestNames.contains("SHAKE256"),
+                "an ALIAS must not be advertised as an algorithm: " + digestNames);
+
+        // Advertised implies serviceable, in both engines whose lists drifted.
+        // One check each rather than one per name, so the count does not move
+        // with the size of the provider's list.
+        List<String> refusedDigests = new ArrayList<>();
+        for (String algo : digestNames) {
+            try {
+                MessageDigest.getInstance(algo);
+            } catch (NoSuchAlgorithmException refused) {
+                refusedDigests.add(algo);
+            }
+        }
+        check(refusedDigests.isEmpty(),
+                "every advertised MessageDigest must be serviceable, refused: " + refusedDigests);
+
+        List<String> refusedFactories = new ArrayList<>();
+        for (String algo : Security.getAlgorithms("KeyFactory")) {
+            try {
+                KeyFactory.getInstance(algo);
+            } catch (NoSuchAlgorithmException refused) {
+                refusedFactories.add(algo);
+            }
+        }
+        check(refusedFactories.isEmpty(),
+                "every advertised KeyFactory must be serviceable, refused: " + refusedFactories);
+
+        // Signature.getInstance used to answer EVERY string with an object
+        // whose getAlgorithm() was "Unknown", so a caller probing with
+        // catch (NoSuchAlgorithmException) concluded the algorithm was present
+        // and met a SignatureException much later instead.
+        for (String bogus : new String[] { "NO-SUCH-SIG", "AES", "HmacSHA256", "" }) {
+            boolean threw = false;
+            try {
+                Signature.getInstance(bogus);
+            } catch (NoSuchAlgorithmException expected) {
+                threw = true;
+            }
+            check(threw, "Signature.getInstance(\"" + bogus
+                    + "\") must raise NoSuchAlgorithmException");
+        }
+
+        // Last, because it mutates: the returned set is a view of platform
+        // state, not the caller's to edit. HotSpot answers
+        // Collections$UnmodifiableSet on every path including the empty ones.
+        boolean unmodifiable = false;
+        try {
+            digestNames.add("CRATONVM-NOT-AN-ALGORITHM");
+        } catch (UnsupportedOperationException expected) {
+            unmodifiable = true;
+        }
+        check(unmodifiable, "Security.getAlgorithms must return an unmodifiable set");
+
+        System.out.println("CK RJdkSecurity md2=" + md2Abc + " shake128=" + s128.substring(0, 16)
+                + " digests=" + digestNames.size());
+    }
+
     public static void main(String[] args) throws Exception {
         digests();
         secureRandoms();
         signatures();
         tls();
         providers();
+        advertisedVersusServed();
         System.out.println("CK RJdkSecurity checks=" + checks);
         System.out.println("PASS RJdkSecurity (" + checks + " checks)");
     }

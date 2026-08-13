@@ -530,12 +530,26 @@ mod tests {
         free_executable(ptr, size);
     }
 
+    /// A zero-length request must be REFUSED, on every platform we build for.
+    ///
+    /// The old name (`alloc_zero_returns_some`) was the lie: no backend can
+    /// satisfy it. `VirtualAlloc(NULL, 0, ...)` fails with
+    /// `ERROR_INVALID_PARAMETER` (87), and POSIX specifies `mmap` with
+    /// `len == 0` fails with `EINVAL` — so both `platform_alloc` bodies take
+    /// their null / `MAP_FAILED` arm and answer `None`. The failure is that a
+    /// caller ever gets a `Some` it would then write code into and hand to
+    /// `make_executable` on a zero-byte region.
+    ///
+    /// Was vacuous: `if let Some(ptr) = alloc_executable(0) { free… }` — the
+    /// interesting branch was the silent one, so deleting the `p.is_null()` /
+    /// `p == MAP_FAILED` check in `platform_alloc` (returning `Some(null)`)
+    /// stayed green.
     #[test]
-    fn alloc_zero_returns_some() {
-        // OS may round up to page size; should not fail.
-        if let Some(ptr) = alloc_executable(0) {
-            free_executable(ptr, 0);
-        }
+    fn alloc_zero_is_refused() {
+        assert!(
+            alloc_executable(0).is_none(),
+            "a zero-length JIT allocation must be refused, not handed back"
+        );
     }
 
     #[test]

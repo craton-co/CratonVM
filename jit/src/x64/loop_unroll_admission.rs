@@ -25,7 +25,7 @@
 //! INTERPRETER bcis, and an OSR entry lands on the steady-state copy — the
 //! fallback under versioning — rather than a peeled prefix or a guard.
 //!
-//! `docs/feature-designs/c2/loop-01-peeling-and-versioning.md` is the lane, and
+//! `feature-designs/c2/loop-01-peeling-and-versioning.md` is the lane, and
 //! `docs/jit/loop-rewriter-wiring.md` the wiring's status of record.
 
 use super::*;
@@ -1203,6 +1203,7 @@ fn compile_indy_fixture(code: &[u8]) -> Option<CompiledMethod> {
         Vec::new(),
         Vec::new(),
         Vec::new(),
+        Default::default(), // ldc_fp_pcs
         HashMap::new(),
         HashMap::new(),
         &JitRuntimeHelpers::default(),
@@ -1217,6 +1218,8 @@ fn compile_indy_fixture(code: &[u8]) -> Option<CompiledMethod> {
         "T.f:(I)I",
         // (pc, arg_slots, ret_type, arg_type_tags, concat_site)
         vec![(19, 0, b'I', Vec::new(), 0)],
+        // elidable_init_pcs: fixture resolves no constant pool.
+        None,
     )
 }
 

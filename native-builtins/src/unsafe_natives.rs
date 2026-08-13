@@ -1198,23 +1198,18 @@ pub(crate) fn native_unsafe_define_class(
         _ => 0,
     };
 
-    // ProtectionDomain (arg 6). If non-null, read its codeSource URL
-    // (synthetic-PD field 0 holds the URL string). Real-JDK PD has a
-    // CodeSource at field 0 with `location` at its field 0 — we
-    // probe both layouts so either path attributes the URL.
-    let mut pd_url: Option<String> = None;
-    if let Some(Value::Object(Some(pd))) = args.get(6) {
-        if let Value::Object(Some(cs)) = ctx.get_field(*pd, 0) {
-            // Try CodeSource.location at field 0 (URL object) → URL.toString().
-            if let Some(s) = ctx.read_string(cs) {
-                pd_url = Some(s);
-            } else if let Value::Object(Some(url)) = ctx.get_field(cs, 0) {
-                if let Some(s) = ctx.read_string(url) {
-                    pd_url = Some(s);
-                }
-            }
-        }
-    }
+    // The caller's ProtectionDomain, decoded through the ONE reader that
+    // understands both PD shapes. Six copies of an inline decode used to
+    // stand here, and all six read `CodeSource.location` with
+    // `read_string` -- which fails on a real `java.net.URL`, a different
+    // concrete class -- so every real-JDK-constructed CodeSource silently
+    // lost its URL and the defined class came back carrying the
+    // synthesised `file:/runtime-defined/<name>.class` instead of the
+    // caller's. See `extract_pd_code_source_url`.
+    let pd_url = match args.get(6) {
+        Some(Value::Object(Some(pd))) => crate::classloader::extract_pd_code_source_url(ctx, *pd),
+        _ => None,
+    };
 
     let slashed_name = name.replace('.', "/");
     // SECURITY FIX (V9): do NOT unconditionally skip verification.
@@ -1391,12 +1386,6 @@ pub fn register_unsafe_define_class(r: &mut NativeMethodRegistry) {
     register_consolidated_off_heap_store(r);
 
     // Legacy `sun.misc.Unsafe.defineClass`.
-    r.register(
-        u,
-        "defineClass",
-        "(Ljava/lang/String;[BIILjava/lang/ClassLoader;Ljava/security/ProtectionDomain;)Ljava/lang/Class;",
-        native_unsafe_define_class,
-    );
     // Modern `jdk.internal.misc.Unsafe.defineClass0` (post-JDK-9 rename).
     r.register(
         u2,
@@ -1415,12 +1404,6 @@ pub fn register_unsafe_define_class(r: &mut NativeMethodRegistry) {
     );
 
     // Legacy `defineAnonymousClass` — JDK 8 surface, ByteBuddy still emits.
-    r.register(
-        u,
-        "defineAnonymousClass",
-        "(Ljava/lang/Class;[B[Ljava/lang/Object;)Ljava/lang/Class;",
-        native_unsafe_define_anonymous_class,
-    );
     r.register(
         u2,
         "defineAnonymousClass",
@@ -1780,12 +1763,6 @@ pub(crate) fn register_unsafe_wp1_2(registry: &mut NativeMethodRegistry) {
     );
     // Legacy sun.misc.Unsafe naming (predates rename to Reference).
     registry.register(
-        u,
-        "weakCompareAndSetObject",
-        "(Ljava/lang/Object;JLjava/lang/Object;Ljava/lang/Object;)Z",
-        native_unsafe_weak_cas_object,
-    );
-    registry.register(
         u2,
         "weakCompareAndSetObject",
         "(Ljava/lang/Object;JLjava/lang/Object;Ljava/lang/Object;)Z",
@@ -1959,12 +1936,6 @@ pub(crate) fn register_unsafe_wp1_2(registry: &mut NativeMethodRegistry) {
     register_consolidated_off_heap_store(registry);
 
     // 6. Real defineClass replacing the stub.
-    registry.register(
-        u,
-        "defineClass",
-        "(Ljava/lang/String;[BIILjava/lang/ClassLoader;Ljava/security/ProtectionDomain;)Ljava/lang/Class;",
-        native_unsafe_define_class,
-    );
     registry.register_with_kind(
         u2,
         "defineClass0",

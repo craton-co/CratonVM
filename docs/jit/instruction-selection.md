@@ -4,8 +4,7 @@
 production pipeline calls it. See [Wiring](#wiring) for what the call site has
 to do, and
 `docs/feature-designs/jit-machine-level-and-instruction-selection.md` for the
-increment order that wiring should follow. As of **2026-08-04 there IS a
-production caller**, behind `CRATONVM_JIT=ir-isel-emit` (default off): §6
+increment order that wiring should follow. **There is a production caller**, behind `CRATONVM_JIT=ir-isel-emit` (default off): §6
 items 2, 5 and 9 are closed, and `ir_lower` emits `Rule::AluReg` tiles through
 this table with a byte-equality oracle over the whole compile.
 
@@ -14,9 +13,9 @@ banner. The memory-ordering rule it depends on is in `jit/src/ir_schedule.rs`.
 
 ---
 
-## 0. Read this first: compiled since 2026-08-01, still unwired
+## 0. Read this first: compiled, still unwired
 
-`pub mod isel;` is at `jit/src/x64.rs:136`. Until 2026-08-01 it was not there,
+`pub mod isel;` is at `jit/src/x64.rs:136`. It was once absent,
 so this file had **never been compiled** and none of its tests had ever run;
 the first compile surfaced a real cost-model bug — `Rule::Lea` beating the ALU
 form on a one-register address, caught by
@@ -27,7 +26,7 @@ to reason from is:
 * The declarative pattern table compiles.
 * Its tests — including the byte-for-byte equivalence sweep against `x64.rs`'s
   hand-written emitters, which is the entire basis for trusting the table —
-  run. Last verified 2026-08-03 on the Azure host at `a9241eed`:
+  run. Verified on the Azure host:
   `cargo test -p cratonvm-jit --lib isel` → **68 passed, 0 failed**.
 * What remains unverified is *execution of the selector's output*, not the
   table: nothing emits a tile, so no claim below about what selection would
@@ -42,7 +41,7 @@ joint statement of that gap.
 
 **Measured coverage, on real compiles.** Shadow selection
 (`CRATONVM_JIT=ir-isel-shadow`, default off, emits nothing) ran over 850 Spring
-Boot methods on 2026-08-03: `select_block` covers **15.7–19.0%** of scheduled
+Boot methods: `select_block` covers **15.7–19.0%** of scheduled
 data nodes; the rest fall to `Rule::Generic`. **`Rule::AluImm` and `Rule::Lea`
 fired ZERO times** — the table was 64-bit and Java arithmetic is 32-bit. Of the
 four rules that did fire, `TestBranch` (60 tiles) is byte-for-byte what
@@ -299,12 +298,12 @@ no narrowing of its own.
 
 Ordered by value.
 
-1. ~~**The module is not compiled.**~~ Done 2026-08-01 (§0). Its tests run and
+1. ~~**The module is not compiled.**~~ Done (§0). Its tests run and
    pass; everything below is now a claim about the table's *contents*, not
    about whether anything checked them.
 2. ~~**No 32-bit immediate or `LEA` rows.**~~ **Both closed** — the immediates
-   2026-08-03 (eight rows, anchored to `x64.rs`'s constant-folding fast path),
-   the `LEA` 2026-08-04 (`lea_r32_m`, anchored to `x64/arith.rs`'s
+   (eight rows, anchored to `x64.rs`'s constant-folding fast path),
+   the `LEA` (`lea_r32_m`, anchored to `x64/arith.rs`'s
    `emit_imul_const`: `8D 04 40` / `8D 04 80` / `8D 04 C0`). Both halves each
    time — `MInst::pattern_name` maps the new shape too, without which
    `require_encodable` discards the tile whatever the table holds.
@@ -326,7 +325,7 @@ Ordered by value.
    `ir_lower`'s knowledge. The selector proves the fold legal (the part that
    fails silently) and leaves the address shape to the lowering. Closing this
    means teaching `AddrSource::Expr` how `ir_lower` computes a field address.
-5. ~~**`Rule::Lea` refuses `Ty::I32`.**~~ **Closed 2026-08-04.** The proof the
+5. ~~**`Rule::Lea` refuses `Ty::I32`.**~~ **Closed.** The proof the
    item asked for turned out to be simpler than it expected and did not need to
    start at `Op::Return`: a 32-bit `LEA` zero-extends into the destination,
    which is the *same* high half `ADD EAX, ECX` leaves — and that is what
@@ -348,7 +347,7 @@ Ordered by value.
    R12 needing a SIB byte. Those are `Mem`'s job and the table already states
    them (`Constraint::IndexNotRsp`, `base_requires_sib`); the register
    allocator has to honour them when it lowers an `IrAddr`.
-9. ~~**No end-to-end byte comparison.**~~ **Closed 2026-08-04**, and it is
+9. ~~**No end-to-end byte comparison.**~~ **Closed**, and it is
    stronger than "same observable behaviour": `CRATONVM_JIT=ir-isel-verify`
    compiles through both paths and compares the **bytes**, per node, over a
    whole workload, refusing the compile on any disagreement. Scope is

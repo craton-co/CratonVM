@@ -18,7 +18,7 @@ as ceremony.
 
 ## 1. Status of the published numbers
 
-> **Re-measured 2026-08-05.** All seven CPU rows were re-taken in ONE
+> All seven CPU rows come from ONE
 > interleaved series on `dev` @ `ded183df8` — §2's isolation, pinning,
 > alternating-arm and no-discard rules, 9 pairs per phase, checksum verified
 > against HotSpot on every run, zero mismatches. The window opened only once
@@ -31,11 +31,11 @@ as ceremony.
 > gate's ceiling is 2.0 and the series drifted above it — so ratios remain the
 > durable content and absolutes are this host on this day.
 
-| Row | Ratio vs JDK 25 C2 (2026-08-05) | CratonVM CV | was | Status |
+| Row | Ratio vs JDK 25 C2 | CratonVM CV | earlier | Status |
 |---|---|---|---|---|
 | Arithmetic (2B ops) | 1.95x | 0.2% | 2.44x | re-measured in a quiet window |
 | Fibonacci(44) | 5.89x | 3.5% | 2.79x | re-measured; distance from the July figure is unattributed and is **not** `cov-*` (checked against a control) |
-| Sieve (100K x 20,000) | **0.99x** | 2.3% | 2.28x | re-measured — **parity**; the 6.50x of 2026-08-04 was a live regression, fixed |
+| Sieve (100K x 20,000) | **0.99x** | 2.3% | 2.28x | re-measured — **parity**; an earlier 6.50x reading was a live regression, since fixed |
 | Matrix 1280x1280 | **0.99x** | 0.2% | 2.93x | re-measured — parity with C2 |
 | HashMap (10M put/get) | 2.07x | 0.8% | 1.75x | re-measured; the July row this replaced had itself replaced a RETRACTED one |
 | String/Regex (100K) | 5.37x | 1.1% | 7.7x | re-measured — the first quiet-window number for this row since the session that produced 7.7x was discredited |
@@ -54,7 +54,7 @@ reason every check in the reliability gate exists:
 
 - **The retracted HashMap regression.** `BENCHMARK.md` used to record
   `22,077 ms` / `21.2x`, described as "CONFIRMED and bounded to
-  `a36b9d121..e57f0bc7d`". Re-run from scratch on 2026-07-30 it **did not
+  `a36b9d121..e57f0bc7d`". Re-run from scratch it **did not
   reproduce**: the same phase on the same tree measured 3,523 ms / 3.53x at
   n=10M, and 427 ms at n=1M against a recorded 3,084 ms. The bisect range it
   recommended has nothing in it. **Why the original readings were ~5x too slow
@@ -62,7 +62,7 @@ reason every check in the reliability gate exists:
   another session) was tested directly and showed no difference. Detail:
   `performance/hashmap-half-gap-20260730.md`.
 - **The un-re-measured String/Regex row.** The `7.7x` figure (from a `3.57x`
-  predecessor) comes from the *same 2026-07-25 session* as the retracted
+  predecessor) comes from the *same session* as the retracted
   HashMap number. It has never been re-measured. It survives in the table only
   because it was the smaller of the two claims, which is not a reason to
   believe it.
@@ -170,7 +170,7 @@ p99 from one means the same as a p99 from another.
 
 ### What a phase's numbers are evidence *about*
 
-Schema 2 (2026-08-03) added the **optimizing tier's reach**: per phase, how
+Schema 2 added the **optimizing tier's reach**: per phase, how
 many compile requests reached the admission chain, how many were admitted to
 the optimizing (C2/IR) pipeline, and how many bodies that pipeline actually
 produced. It is in `samples.tsv`/`summary.tsv` as `ir_requests` /

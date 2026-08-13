@@ -134,7 +134,7 @@ pub(crate) fn register_phase55_charset(r: &mut NativeMethodRegistry) {
             if normalized.is_empty() {
                 return Err(RuntimeError::IllegalArgumentException { message: raw_name }.into());
             }
-            let obj = alloc_concurrent_synthetic(ctx, "java/nio/charset/Charset", 1);
+            let obj = try_alloc_concurrent_synthetic(ctx, "java/nio/charset/Charset", 1)?;
             // Pin across the create_string below — a moving young GC there
             // would relocate the fresh Charset (native stale-local family).
             let obj_pin = ctx.pin_native_root(obj);
@@ -158,7 +158,7 @@ pub(crate) fn register_phase55_charset(r: &mut NativeMethodRegistry) {
         "defaultCharset",
         "()Ljava/nio/charset/Charset;",
         |ctx, _args| {
-            let obj = alloc_concurrent_synthetic(ctx, "java/nio/charset/Charset", 1);
+            let obj = try_alloc_concurrent_synthetic(ctx, "java/nio/charset/Charset", 1)?;
             // Pin across the create_string below — a moving young GC there
             // would relocate the fresh Charset (native stale-local family).
             let obj_pin = ctx.pin_native_root(obj);
@@ -218,7 +218,7 @@ pub(crate) fn register_phase55_charset(r: &mut NativeMethodRegistry) {
     // StandardCharsets — static fields returning Charset objects
     let sc = "java/nio/charset/StandardCharsets";
     r.register(sc, "UTF_8", "Ljava/nio/charset/Charset;", |ctx, _args| {
-        let obj = alloc_concurrent_synthetic(ctx, "java/nio/charset/Charset", 1);
+        let obj = try_alloc_concurrent_synthetic(ctx, "java/nio/charset/Charset", 1)?;
         // Pin across the create_string below — a moving young GC there would
         // relocate the fresh Charset (native stale-local family).
         let obj_pin = ctx.pin_native_root(obj);
@@ -233,7 +233,7 @@ pub(crate) fn register_phase55_charset(r: &mut NativeMethodRegistry) {
         "US_ASCII",
         "Ljava/nio/charset/Charset;",
         |ctx, _args| {
-            let obj = alloc_concurrent_synthetic(ctx, "java/nio/charset/Charset", 1);
+            let obj = try_alloc_concurrent_synthetic(ctx, "java/nio/charset/Charset", 1)?;
             // Pin across the create_string below — a moving young GC there
             // would relocate the fresh Charset (native stale-local family).
             let obj_pin = ctx.pin_native_root(obj);
@@ -249,7 +249,7 @@ pub(crate) fn register_phase55_charset(r: &mut NativeMethodRegistry) {
         "ISO_8859_1",
         "Ljava/nio/charset/Charset;",
         |ctx, _args| {
-            let obj = alloc_concurrent_synthetic(ctx, "java/nio/charset/Charset", 1);
+            let obj = try_alloc_concurrent_synthetic(ctx, "java/nio/charset/Charset", 1)?;
             // Pin across the create_string below — a moving young GC there
             // would relocate the fresh Charset (native stale-local family).
             let obj_pin = ctx.pin_native_root(obj);
@@ -261,7 +261,7 @@ pub(crate) fn register_phase55_charset(r: &mut NativeMethodRegistry) {
         },
     );
     r.register(sc, "UTF_16", "Ljava/nio/charset/Charset;", |ctx, _args| {
-        let obj = alloc_concurrent_synthetic(ctx, "java/nio/charset/Charset", 1);
+        let obj = try_alloc_concurrent_synthetic(ctx, "java/nio/charset/Charset", 1)?;
         // Pin across the create_string below — a moving young GC there would
         // relocate the fresh Charset (native stale-local family).
         let obj_pin = ctx.pin_native_root(obj);
@@ -276,7 +276,7 @@ pub(crate) fn register_phase55_charset(r: &mut NativeMethodRegistry) {
         "UTF_16BE",
         "Ljava/nio/charset/Charset;",
         |ctx, _args| {
-            let obj = alloc_concurrent_synthetic(ctx, "java/nio/charset/Charset", 1);
+            let obj = try_alloc_concurrent_synthetic(ctx, "java/nio/charset/Charset", 1)?;
             // Pin across the create_string below — a moving young GC there
             // would relocate the fresh Charset (native stale-local family).
             let obj_pin = ctx.pin_native_root(obj);
@@ -292,7 +292,7 @@ pub(crate) fn register_phase55_charset(r: &mut NativeMethodRegistry) {
         "UTF_16LE",
         "Ljava/nio/charset/Charset;",
         |ctx, _args| {
-            let obj = alloc_concurrent_synthetic(ctx, "java/nio/charset/Charset", 1);
+            let obj = try_alloc_concurrent_synthetic(ctx, "java/nio/charset/Charset", 1)?;
             // Pin across the create_string below — a moving young GC there
             // would relocate the fresh Charset (native stale-local family).
             let obj_pin = ctx.pin_native_root(obj);
@@ -365,7 +365,7 @@ pub fn register_p58_charset_coder(r: &mut NativeMethodRegistry) {
         "encode",
         "(Ljava/nio/CharBuffer;Ljava/nio/ByteBuffer;Z)Ljava/nio/charset/CoderResult;",
         |ctx, _args| {
-            let result = alloc_concurrent_synthetic(ctx, "java/nio/charset/CoderResult", 1);
+            let result = try_alloc_concurrent_synthetic(ctx, "java/nio/charset/CoderResult", 1)?;
             ctx.set_field(result, 0, Value::Int(0)); // 0 = UNDERFLOW (success)
             Ok(Some(Value::Object(Some(result))))
         },
@@ -375,7 +375,7 @@ pub fn register_p58_charset_coder(r: &mut NativeMethodRegistry) {
         "flush",
         "(Ljava/nio/ByteBuffer;)Ljava/nio/charset/CoderResult;",
         |ctx, _args| {
-            let result = alloc_concurrent_synthetic(ctx, "java/nio/charset/CoderResult", 1);
+            let result = try_alloc_concurrent_synthetic(ctx, "java/nio/charset/CoderResult", 1)?;
             ctx.set_field(result, 0, Value::Int(0));
             Ok(Some(Value::Object(Some(result))))
         },
@@ -410,7 +410,7 @@ pub fn register_p58_charset_coder(r: &mut NativeMethodRegistry) {
         "decode",
         "(Ljava/nio/ByteBuffer;Ljava/nio/CharBuffer;Z)Ljava/nio/charset/CoderResult;",
         |ctx, _args| {
-            let result = alloc_concurrent_synthetic(ctx, "java/nio/charset/CoderResult", 1);
+            let result = try_alloc_concurrent_synthetic(ctx, "java/nio/charset/CoderResult", 1)?;
             ctx.set_field(result, 0, Value::Int(0));
             Ok(Some(Value::Object(Some(result))))
         },
@@ -420,7 +420,7 @@ pub fn register_p58_charset_coder(r: &mut NativeMethodRegistry) {
         "flush",
         "(Ljava/nio/CharBuffer;)Ljava/nio/charset/CoderResult;",
         |ctx, _args| {
-            let result = alloc_concurrent_synthetic(ctx, "java/nio/charset/CoderResult", 1);
+            let result = try_alloc_concurrent_synthetic(ctx, "java/nio/charset/CoderResult", 1)?;
             ctx.set_field(result, 0, Value::Int(0));
             Ok(Some(Value::Object(Some(result))))
         },
@@ -526,7 +526,7 @@ pub fn register_p58_charset_coder(r: &mut NativeMethodRegistry) {
             };
             let avg = cratonvm_native_api::charset::average_bytes_per_char(&name);
             let max = cratonvm_native_api::charset::max_bytes_per_char(&name);
-            let enc_obj = alloc_concurrent_synthetic(ctx, "java/nio/charset/CharsetEncoder", 6);
+            let enc_obj = try_alloc_concurrent_synthetic(ctx, "java/nio/charset/CharsetEncoder", 6)?;
             ctx.set_field(enc_obj, 0, Value::Object(Some(this)));
             ctx.set_field(enc_obj, 1, Value::Float(avg));
             ctx.set_field(enc_obj, 2, Value::Float(max));
@@ -546,7 +546,7 @@ pub fn register_p58_charset_coder(r: &mut NativeMethodRegistry) {
             };
             let avg = cratonvm_native_api::charset::average_chars_per_byte(&name);
             let max = cratonvm_native_api::charset::max_chars_per_byte(&name);
-            let dec_obj = alloc_concurrent_synthetic(ctx, "java/nio/charset/CharsetDecoder", 6);
+            let dec_obj = try_alloc_concurrent_synthetic(ctx, "java/nio/charset/CharsetDecoder", 6)?;
             ctx.set_field(dec_obj, 0, Value::Object(Some(this)));
             ctx.set_field(dec_obj, 1, Value::Float(avg));
             ctx.set_field(dec_obj, 2, Value::Float(max));
@@ -573,7 +573,7 @@ pub(crate) fn register_p61_charset(r: &mut NativeMethodRegistry) {
     });
     r.register(cs, "aliases", "()Ljava/util/Set;", |ctx, _args| {
         // Return empty HashSet
-        let set = alloc_concurrent_synthetic(ctx, "java/util/HashSet", 3);
+        let set = try_alloc_concurrent_synthetic(ctx, "java/util/HashSet", 3)?;
         ctx.set_field(set, 0, Value::Object(None));
         ctx.set_field(set, 1, Value::Int(0));
         ctx.set_field(set, 2, Value::Int(16));
@@ -667,7 +667,7 @@ pub(crate) fn register_p61_charset(r: &mut NativeMethodRegistry) {
         "()Ljava/util/SortedMap;",
         |ctx, _args| {
             // Return a TreeMap with standard charsets
-            let tm = alloc_concurrent_synthetic(ctx, "java/util/TreeMap", 3);
+            let tm = try_alloc_concurrent_synthetic(ctx, "java/util/TreeMap", 3)?;
             let charsets = [
                 "ISO-8859-1",
                 "US-ASCII",
@@ -684,7 +684,7 @@ pub(crate) fn register_p61_charset(r: &mut NativeMethodRegistry) {
                 let key = ctx.create_string(name);
                 ctx.set_array_element(data_arr, i * 2, Value::Object(Some(key)));
                 // Create a Charset object for each
-                let cs_obj = alloc_concurrent_synthetic(ctx, "java/nio/charset/Charset", 2);
+                let cs_obj = try_alloc_concurrent_synthetic(ctx, "java/nio/charset/Charset", 2)?;
                 let n = ctx.create_string(name);
                 ctx.set_field(cs_obj, 0, Value::Object(Some(n)));
                 ctx.set_field(cs_obj, 1, Value::Int(0)); // flags
@@ -741,7 +741,7 @@ fn cb_synthetic_layout(ctx: &dyn NativeContext, buf: ObjectRef) -> bool {
 }
 
 /// The bare synthetic CharBuffer carrier's slot count — the `5` every
-/// `alloc_concurrent_synthetic(_, "java/nio/*CharBuffer", 5)` call site here
+/// `try_alloc_concurrent_synthetic(_, "java/nio/*CharBuffer", 5)?` call site here
 /// passes, named so [`cb_synthetic_layout`] and those sites cannot drift apart.
 pub(crate) const CB_SYNTHETIC_FIELD_COUNT: usize = 5;
 
@@ -1074,7 +1074,7 @@ pub(crate) fn register_p62_char_buffer(r: &mut NativeMethodRegistry) {
             }
             .into());
         }
-        let buf = p62_alloc_char_buffer(ctx, cap as usize);
+        let buf = p62_alloc_char_buffer(ctx, cap as usize)?;
         Ok(Some(Value::Object(Some(buf))))
     });
     // `CharBuffer.wrap(char[])` and `CharBuffer.wrap(CharSequence)` are
@@ -1121,7 +1121,7 @@ pub(crate) fn register_p62_char_buffer(r: &mut NativeMethodRegistry) {
             // HeapCharBuffer, NOT the abstract `java/nio/CharBuffer` — see the
             // comment above. Repro:
             // docs/known-issues/repros/charbuffer-address/CBSLICE.java
-            let buf = alloc_concurrent_synthetic(ctx, "java/nio/HeapCharBuffer", 5);
+            let buf = try_alloc_concurrent_synthetic(ctx, "java/nio/HeapCharBuffer", 5)?;
             let arr = ctx.read_native_pin(arr_pin, arr);
             ctx.unpin_native_roots(arr_pin);
             cb_write_hb(ctx, buf, arr, len as i32);
@@ -1167,7 +1167,7 @@ pub(crate) fn register_p62_char_buffer(r: &mut NativeMethodRegistry) {
                 // would relocate the backing array (native stale-local family).
                 let arr_pin = ctx.pin_native_root(arr);
                 // HeapCharBuffer for the same reason as `wrap([C)` above.
-                let buf = alloc_concurrent_synthetic(ctx, "java/nio/HeapCharBuffer", 5);
+                let buf = try_alloc_concurrent_synthetic(ctx, "java/nio/HeapCharBuffer", 5)?;
                 let arr = ctx.read_native_pin(arr_pin, arr);
                 ctx.unpin_native_roots(arr_pin);
                 cb_write_hb(ctx, buf, arr, chars.len() as i32);
@@ -1252,15 +1252,15 @@ pub(crate) fn register_p62_char_buffer(r: &mut NativeMethodRegistry) {
     r.register(cb, "order", "()Ljava/nio/ByteOrder;", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let ord = cb_native_order(ctx, this);
-        Ok(Some(Value::Object(Some(s2_byte_order_object(ctx, ord)))))
+        Ok(Some(Value::Object(Some(s2_byte_order_object(ctx, ord)?))))
     });
     fn cb_order_big(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
         use crate::servlet::s2_byte_order_object;
-        Ok(Some(Value::Object(Some(s2_byte_order_object(ctx, 0)))))
+        Ok(Some(Value::Object(Some(s2_byte_order_object(ctx, 0)?))))
     }
     fn cb_order_little(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
         use crate::servlet::s2_byte_order_object;
-        Ok(Some(Value::Object(Some(s2_byte_order_object(ctx, 1)))))
+        Ok(Some(Value::Object(Some(s2_byte_order_object(ctx, 1)?))))
     }
     for subclass in [
         "java/nio/ByteBufferAsCharBufferB",
@@ -1475,7 +1475,7 @@ pub(crate) fn register_p62_char_buffer(r: &mut NativeMethodRegistry) {
             // Pin across the buffer alloc below — a moving young GC there
             // would relocate the backing array (native stale-local family).
             let arr_pin = ctx.pin_native_root(arr);
-            let buf = alloc_concurrent_synthetic(ctx, "java/nio/HeapCharBuffer", 5);
+            let buf = try_alloc_concurrent_synthetic(ctx, "java/nio/HeapCharBuffer", 5)?;
             let arr = ctx.read_native_pin(arr_pin, arr);
             ctx.unpin_native_roots(arr_pin);
             ctx.set_field_by_name(buf, "hb", Value::Object(Some(arr)));
@@ -1750,20 +1750,21 @@ pub(crate) fn register_p62_char_buffer(r: &mut NativeMethodRegistry) {
         Ok(Some(ctx.get_field(this, 3)))
     });
     r.set_category(__prev_cat);
+    ()
 }
 
-pub(crate) fn p62_alloc_char_buffer(ctx: &mut dyn NativeContext, cap: usize) -> ObjectRef {
+pub(crate) fn p62_alloc_char_buffer(ctx: &mut dyn NativeContext, cap: usize) -> Result<ObjectRef, MethodCallFailed> {
     let arr = ctx.new_array(cratonvm_types::ArrayElementType::Char, cap);
     // Use HeapCharBuffer (concrete) not CharBuffer (abstract) so real-JDK
     // bytecode methods like compact() dispatch correctly.
     // Pin across the buffer alloc below — a moving young GC there would
     // relocate the backing array (native stale-local family).
     let arr_pin = ctx.pin_native_root(arr);
-    let buf = alloc_concurrent_synthetic(ctx, "java/nio/HeapCharBuffer", 5);
+    let buf = try_alloc_concurrent_synthetic(ctx, "java/nio/HeapCharBuffer", 5)?;
     let arr = ctx.read_native_pin(arr_pin, arr);
     ctx.unpin_native_roots(arr_pin);
     cb_write_hb(ctx, buf, arr, cap as i32);
-    buf
+    Ok(buf)
 }
 
 #[cfg(test)]

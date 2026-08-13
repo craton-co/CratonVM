@@ -108,6 +108,94 @@ pub(crate) mod rootprof {
             detail
         );
     }
+
+    // ── Conservative native-stack scan counters ────────────────────────────
+    //
+    // WHY THESE EXIST. `conservative_roots::scan_one_frame` and
+    // `native_stack_has_jit_frame` are the two functions that walk raw native
+    // stack memory a word at a time, and between them they were 3.3% of a
+    // `DefaultCatalogAndSchemaTest` profile. Attributing that to a CALLER took
+    // several rounds and never succeeded by sampling: the release build omits
+    // frame pointers so `perf --call-graph fp` yields nothing, and `dwarf`
+    // unwinding gives up on this VM's stack depths. Every candidate caller was
+    // then argued from static call sites — and the arguments kept being wrong,
+    // because the plausible drivers (`update_root_snapshot`, `collect_roots`,
+    // `deposit_root_snapshot`) run at wildly different rates and only counting
+    // separates them.
+    //
+    // So count. A relaxed `fetch_add` per CALL (never per word) is free next to
+    // the bulk loop it measures, and the word totals turn "this function is 2%
+    // of CPU" into "it is 2% because it reads N words of stack per second",
+    // which is the number that says whether to make the scan cheaper or to
+    // stop calling it.
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    pub static SCAN_FRAME_CALLS: AtomicU64 = AtomicU64::new(0);
+    pub static SCAN_FRAME_WORDS: AtomicU64 = AtomicU64::new(0);
+    pub static SCAN_FRAME_HITS: AtomicU64 = AtomicU64::new(0);
+    pub static JITPROBE_CALLS: AtomicU64 = AtomicU64::new(0);
+    pub static JITPROBE_WORDS: AtomicU64 = AtomicU64::new(0);
+
+    /// Fold one `scan_one_frame` pass into the counters, and print a cumulative
+    /// line every 4096 passes. No-op unless [`on`].
+    pub fn note_stack_scan(words: u64, hits: u64) {
+        if !on() {
+            return;
+        }
+        SCAN_FRAME_WORDS.fetch_add(words, Relaxed);
+        SCAN_FRAME_HITS.fetch_add(hits, Relaxed);
+        let n = SCAN_FRAME_CALLS.fetch_add(1, Relaxed) + 1;
+        if n % 4096 == 0 {
+            let w = SCAN_FRAME_WORDS.load(Relaxed);
+            eprintln!(
+                "[rootprof] conservative-scan calls={n} words={w} hits={} avg_words={} | jitprobe calls={} words={}",
+                SCAN_FRAME_HITS.load(Relaxed),
+                w / n,
+                JITPROBE_CALLS.load(Relaxed),
+                JITPROBE_WORDS.load(Relaxed),
+            );
+            let c = scan_caller_counts();
+            eprintln!(
+                "[rootprof] scan_active_jit_frames by caller: gc-roots={} safepoint={} blocked-deposit={}",
+                c[0], c[1], c[2],
+            );
+        }
+    }
+
+    /// Fold one `native_stack_has_jit_frame` probe into the counters.
+    pub fn note_jit_probe(words: u64) {
+        if !on() {
+            return;
+        }
+        JITPROBE_WORDS.fetch_add(words, Relaxed);
+        JITPROBE_CALLS.fetch_add(1, Relaxed);
+    }
+
+    /// Per-CALLER tally for `conservative_roots::scan_active_jit_frames`.
+    ///
+    /// Three call sites drive it and they run at rates three orders of
+    /// magnitude apart — `collect_roots` once per collection, the safepoint
+    /// `update_root_snapshot`, and `deposit_root_snapshot_inner` on every
+    /// blocked-region entry. Sampling cannot separate them here (no frame
+    /// pointers, dwarf unwinding fails on this VM's stack depths) and reading
+    /// the call sites did not either. Index: 0 = gc-roots, 1 = safepoint,
+    /// 2 = blocked-deposit.
+    pub static SCAN_BY_CALLER: [AtomicU64; 3] =
+        [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+
+    pub fn note_scan_caller(which: usize) {
+        if on() {
+            SCAN_BY_CALLER[which].fetch_add(1, Relaxed);
+        }
+    }
+
+    /// `[gc-roots, safepoint, blocked-deposit]` call counts.
+    pub fn scan_caller_counts() -> [u64; 3] {
+        [
+            SCAN_BY_CALLER[0].load(Relaxed),
+            SCAN_BY_CALLER[1].load(Relaxed),
+            SCAN_BY_CALLER[2].load(Relaxed),
+        ]
+    }
 }
 
 type VmScanFn = fn(&crate::vm::SharedVm, &mut Vec<ObjectRef>);
@@ -155,10 +243,42 @@ fn remap_lambda_singletons(shared: &crate::vm::SharedVm, map: &cratonvm_types::P
     crate::runtime::invokedynamic::gc_update_lambda_singleton_refs(shared.vm_identity, map);
 }
 fn scan_collection_overlays(shared: &crate::vm::SharedVm, roots: &mut Vec<ObjectRef>) {
-    let conditional = shared.config.gc_algorithm == crate::config::GcAlgorithm::Generational
-        && (cratonvm_gc::gc_quiescence::is_active()
-            || cratonvm_gc::gc_quiescence::unregistered_jit_frame_on_stack()
-            || cratonvm_gc::gc_quiescence::major_gc_requested());
+    // `young_marker_follows_side_tables()` is the canonical predicate for
+    // "this cycle's precise marker will do owner-based overlay propagation
+    // itself" -- the same one `VmHeap::mirror_pin_deferrable` uses for the
+    // analogous class-mirror case. The three-way OR this replaced
+    // (`is_active` / `unregistered_jit_frame_on_stack` / `major_gc_requested`)
+    // covered only the JIT-safety diversion reasons for non-moving young, not
+    // an explicit `System.gc()` reaching the non-moving sweep by the
+    // `explicit_full_gc` term `young_marker_follows_side_tables` already
+    // folds in -- so a plain, no-JIT-frame `System.gc()` (this test's exact
+    // shape) fell through to the unconditional scan, which roots every
+    // element of every overlay-backed collection with no reachability gate
+    // at all (see gc_and_alloc.rs's `scan_collection_overlay_roots` comment).
+    //
+    // ZGC unconditionally defers too (mirroring `mirror_pin_deferrable`'s own
+    // `VmHeap::Zgc(_) => true` arm): its single STW mark-sweep closure is
+    // always the precise, owner-based marker (`zgc.rs`'s `collect_garbage`
+    // mark loop now calls `external_roots_for_owner` from every confirmed-live
+    // object, the same shape as Generational's non-moving young marker and
+    // old-gen BFS), so there is no non-precise ZGC cycle to protect against.
+    let conditional = match shared.config.gc_algorithm {
+        crate::config::GcAlgorithm::Generational => {
+            cratonvm_gc::gc_quiescence::young_marker_follows_side_tables()
+        }
+        #[cfg(feature = "zgc")]
+        crate::config::GcAlgorithm::Zgc => true,
+        crate::config::GcAlgorithm::G1 => false,
+    };
+    if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_OVERLAY_GATE").is_some() {
+        eprintln!(
+            "[OVERLAYGATE] conditional={conditional} gc_algo={:?} major_gc_requested={} is_active={} unregistered_jit={}",
+            shared.config.gc_algorithm,
+            cratonvm_gc::gc_quiescence::major_gc_requested(),
+            cratonvm_gc::gc_quiescence::is_active(),
+            cratonvm_gc::gc_quiescence::unregistered_jit_frame_on_stack(),
+        );
+    }
     if !conditional {
         cratonvm_gc::external_roots::scan_external_roots(roots);
     }
@@ -253,7 +373,7 @@ fn remap_security_manager(shared: &crate::vm::SharedVm, map: &cratonvm_types::Po
 // heap's addresses to another heap's collector and rewriting one VM's entries
 // through another VM's relocation map. See `runtime::serialization::oscache`.
 fn scan_osc_cache(shared: &crate::vm::SharedVm, roots: &mut Vec<ObjectRef>) {
-    shared.classes.osc_cache.scan_roots(roots);
+    shared.classes.osc_cache.scan_roots(shared.vm_identity, roots);
 }
 fn remap_osc_cache(shared: &crate::vm::SharedVm, map: &cratonvm_types::PointerMap) {
     shared.classes.osc_cache.remap_roots(map);
@@ -289,11 +409,18 @@ fn scan_nio(_: &crate::vm::SharedVm, roots: &mut Vec<ObjectRef>) {
     cratonvm_native_io::nio_selector::gc_scan_selector_roots(roots);
     cratonvm_native_io::socket_channel::gc_scan_channel_roots(roots);
     cratonvm_native_io::socket_channel::gc_scan_ss_back_ref_roots(roots);
+    // `ServerSocketChannel.socket()`'s adaptor cache. It used to live in slot 5
+    // of the channel object — really `AbstractSelectableChannel.keys` — so it
+    // needed no roots and corrupted a JDK field instead; moving it to a side
+    // table is what makes these two lines necessary
+    // (W7-72-ssc-socket-and-filechannel.md).
+    cratonvm_native_io::socket_channel::gc_scan_ssc_socket_cache_roots(roots);
 }
 fn remap_nio(_: &crate::vm::SharedVm, map: &cratonvm_types::PointerMap) {
     cratonvm_native_io::nio_selector::sk_table_update_after_gc(map);
     cratonvm_native_io::socket_channel::channel_fields_update_after_gc(map);
     cratonvm_native_io::socket_channel::ss_back_ref_update_after_gc(map);
+    cratonvm_native_io::socket_channel::ssc_socket_cache_update_after_gc(map);
 }
 fn scan_server_ports(_: &crate::vm::SharedVm, roots: &mut Vec<ObjectRef>) {
     cratonvm_native_api::server_socket_ports::gc_scan_roots(roots);
@@ -433,10 +560,71 @@ pub fn scan_all_roots(shared: &crate::vm::SharedVm, roots: &mut Vec<ObjectRef>) 
         rootprof::report("scan_all_roots", t_all.elapsed().as_nanos(), &parts);
         return;
     }
+    if root_attribution_on() {
+        // CRATONVM_DBG_ROOT_SOURCE: remember which NAMED source contributed
+        // each root this cycle.
+        //
+        // The inventory has always had names and nothing has ever been able to
+        // answer "which of them rooted THIS object". The retention questions in
+        // this repo are almost always that question — the fourth
+        // `TestDefaultInstanceManager` recurrence spent four investigations
+        // eliminating root sources one at a time, by turning levers off and
+        // re-running, because there was no way to just ask. A `Vec` of
+        // (name, addr) built only under the flag turns that into one run.
+        let mut attribution = Vec::new();
+        for source in VM_ROOT_SOURCES {
+            let before = roots.len();
+            (source.scan)(shared, roots);
+            for r in &roots[before..] {
+                attribution.push((source.name, r.as_ptr() as usize));
+            }
+        }
+        set_root_attribution(attribution);
+        return;
+    }
     for source in VM_ROOT_SOURCES {
         debug_assert!(!source.name.is_empty());
         (source.scan)(shared, roots);
     }
+}
+
+/// `CRATONVM_DBG_ROOT_SOURCE` — record which named root source contributed
+/// each root, so a retained object can be attributed to one instead of having
+/// every source eliminated by bisection.
+pub fn root_attribution_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_ROOT_SOURCE").is_some()
+    })
+}
+
+/// Last cycle's (source name, root address) pairs. Diagnostic only; written
+/// once per collection and only when the flag is on.
+static ROOT_ATTRIBUTION: std::sync::OnceLock<parking_lot::Mutex<Vec<(&'static str, usize)>>> =
+    std::sync::OnceLock::new();
+
+fn root_attribution() -> &'static parking_lot::Mutex<Vec<(&'static str, usize)>> {
+    ROOT_ATTRIBUTION.get_or_init(|| parking_lot::Mutex::new(Vec::new()))
+}
+
+fn set_root_attribution(v: Vec<(&'static str, usize)>) {
+    *root_attribution().lock() = v;
+}
+
+/// Which named root source contributed `addr` as a root this cycle, if any.
+///
+/// `None` means no source handed this exact address to the marker — the object
+/// is reachable THROUGH something, not rooted directly, which is a different
+/// finding and wants a different fix.
+pub fn root_source_of(addr: usize) -> Option<&'static str> {
+    if !root_attribution_on() {
+        return None;
+    }
+    root_attribution()
+        .lock()
+        .iter()
+        .find(|&&(_, a)| a == addr)
+        .map(|&(n, _)| n)
 }
 
 pub fn remap_all_roots(shared: &crate::vm::SharedVm, pointer_map: &cratonvm_types::PointerMap) {

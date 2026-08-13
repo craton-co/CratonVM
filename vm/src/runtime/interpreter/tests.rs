@@ -3,6 +3,270 @@
 
 use super::*;
 
+/// Control for `aastore_element_assignable`, the predicate the interpreter
+/// opcode, the JIT's `jit_aastore` and (since e627cdff5) reflective
+/// `Array.set` all share.
+///
+/// # Why this needs to exist
+///
+/// That predicate is deliberately *additive*: it must never produce a FALSE
+/// `ArrayStoreException`, so it fails open along five separate arms. Nothing
+/// measured how much it still refuses, and `Array.set`'s refusal in particular
+/// had **no** coverage anywhere in the tree — grepping
+/// `array element type mismatch` found the throw site and two comments, and no
+/// test. A predicate that had degenerated into `true` would have satisfied the
+/// `Array.set` fix and broken nothing visible.
+///
+/// So this asserts the refusal and two of the fail-open arms **together**. The
+/// refusal alone would pass against a predicate that refuses everything; the
+/// lenient arms alone are what a degenerate `true` satisfies. Only the pair
+/// pins the shape.
+///
+/// # Why the class names are neutral
+///
+/// `synthetic_implements`, the last fail-open arm, is a table of specific name
+/// pairs (`HashMap$Entry` -> `Map$Entry`, `SystemLogger` -> `System$Logger`,
+/// …). Naming these classes after real JDK types could match it and make the
+/// control vacuously pass, so they are deliberately outside any table.
+///
+/// # Not covered here
+///
+/// The loader-split arm (same component name, two `ClassId`s) needs two
+/// same-named classes, which `ensure_synthetic_class` dedupes by name. That leg
+/// is characterised instead by
+/// `classloading::class::tests::a_proxy_is_assignable_to_the_other_loaders_copy_of_its_interface_by_name`.
+#[test]
+fn aastore_refuses_a_real_mismatch_and_still_fails_open_where_it_must() {
+    use cratonvm_reader::class_access_flags::ClassAccessFlags;
+    use cratonvm_types::ArrayElementType;
+
+    let shared =
+        std::sync::Arc::new(crate::vm::SharedVm::new(crate::config::VmConfig::default()));
+
+    let (alpha, beta, iface, proxy) = {
+        let mut cm = shared.classes.class_manager.write();
+        let alpha = cm.try_ensure_synthetic_class("cratonvm/test/AastoreAlpha", 0).expect("Compatible mode fabricates; this fixture never runs under --jdk-only");
+        let beta = cm.try_ensure_synthetic_class("cratonvm/test/AastoreBeta", 0).expect("Compatible mode fabricates; this fixture never runs under --jdk-only");
+        let iface = cm.try_ensure_synthetic_class("cratonvm/test/AastoreIface", 0).expect("Compatible mode fabricates; this fixture never runs under --jdk-only");
+        cm.class_store
+            .get_mut(iface)
+            .expect("just fabricated")
+            .access_flags |= ClassAccessFlags::INTERFACE;
+        // The name is the whole point: the predicate's proxy arm tests
+        // `contains("$Proxy")`, which is what admits `jdk/proxy3/$Proxy27` in
+        // the `AotIntegrationTests` case without consulting any interface list.
+        let proxy = cm.try_ensure_synthetic_class("jdk/proxy3/$Proxy27", 0).expect("Compatible mode fabricates; this fixture never runs under --jdk-only");
+        (alpha, beta, iface, proxy)
+    };
+
+    // A reference array's own class id IS its component class id (JVMS §4.4.1),
+    // which is how `array_descriptor_of` recovers the component name.
+    let alpha_arr = shared
+        .mem
+        .heap
+        .alloc_array(alpha, ArrayElementType::Reference, 1);
+    let iface_arr = shared
+        .mem
+        .heap
+        .alloc_array(iface, ArrayElementType::Reference, 1);
+    let beta_obj = shared.mem.heap.alloc_object(beta, 0);
+    let proxy_obj = shared.mem.heap.alloc_object(proxy, 0);
+
+    // THE CONTROL. Concrete component, unrelated concrete value: every
+    // fail-open arm must decline and the store must be refused. This is the
+    // assertion that fails if the predicate ever degenerates to `true`.
+    assert!(
+        !aastore_element_assignable(&shared, alpha_arr, beta_obj),
+        "AastoreBeta into AastoreAlpha[] must be refused — if this starts \
+         passing, the predicate has stopped refusing anything and both \
+         `aastore` and `Array.set` now accept every reference store",
+    );
+
+    // Documented lenience 1: an INTERFACE component. Proving a value implements
+    // an interface is unreliable here (dynamic/annotation proxies, synthetic
+    // classes implement them at runtime), so the predicate declines to throw.
+    assert!(
+        aastore_element_assignable(&shared, iface_arr, beta_obj),
+        "an interface component must fail open",
+    );
+
+    // Documented lenience 2: a `$Proxy`-named value. This is the arm that
+    // admits the `ContextConfiguration[] <- jdk/proxy3/$Proxy27` store that
+    // `TypeMappedAnnotation.adapt` makes through `Array.set`.
+    assert!(
+        aastore_element_assignable(&shared, alpha_arr, proxy_obj),
+        "a $Proxy-named value must fail open even against a concrete component",
+    );
+}
+
+/// The two loader-split arms of `aastore_element_assignable` — the ones that
+/// exist for `@CompileWithForkedClassLoader`, and the reason
+/// `AotIntegrationTests` reached this code at all.
+///
+/// Two scenarios, both arising when one class NAME carries two `ClassId`s:
+///
+/// 1. the value's class IS the component, under the other loader's copy;
+/// 2. the value is a SUBCLASS whose recorded superclass edge points at the
+///    other loader's copy of the component.
+///
+/// # One walk serves both arms
+///
+/// The predicate used to spell these as two consecutive checks: an explicit
+/// `value_class.name == comp_name && value_class_id != comp_id`, then a by-name
+/// superclass walk. **Mutation testing said only the walk was load-bearing.**
+/// Disabling the walk fails scenario 2 as expected; disabling the explicit
+/// same-name check changed nothing at all, because the walk starts at
+/// `value_class_id` itself, so its first iteration already tests
+/// `class.name == comp_name`. Anything the fast path accepted, the walk
+/// accepted one line later.
+///
+/// The fast path has since been removed and this test stayed green, which is
+/// the confirmation the equivalence argument needed. Both assertions below now
+/// run against the walk alone; scenario 1 is its first iteration and scenario 2
+/// is a later one. If a future change reintroduces a same-name early return,
+/// note that this test cannot tell the two apart — only mutating them can.
+///
+/// # Building the pathological state
+///
+/// `ensure_synthetic_class` dedupes by name, so a second copy cannot be
+/// fabricated directly — which is why this leg was left uncovered when the
+/// first control landed. The state is instead reached by fabricating under a
+/// distinct name and renaming the copy in place. That deliberately leaves
+/// `ClassManager`'s name index pointing at the old name, and that is fine
+/// *here*: the predicate reads `class.name` out of the store via `get_class`,
+/// and `comp_id` is recovered from the array's own class id, so no by-name
+/// lookup is consulted on this path. Do not copy this trick into a test that
+/// does exercise name resolution.
+///
+/// # Each arm is asserted against its own negative
+///
+/// A "same name, different id" acceptance is only meaningful if the exact
+/// check would have refused, so both arms assert `is_subclass_of` is `false`
+/// first. Otherwise the store could be passing legitimately and the arm under
+/// test would never have run.
+#[test]
+fn aastore_fails_open_across_a_split_loaders_two_copies_of_one_name() {
+    use cratonvm_types::ArrayElementType;
+
+    let shared =
+        std::sync::Arc::new(crate::vm::SharedVm::new(crate::config::VmConfig::default()));
+
+    const COMPONENT: &str = "cratonvm/test/SplitAlpha";
+
+    let (alpha, forked, child) = {
+        let mut cm = shared.classes.class_manager.write();
+        // The parent loader's copy — what the array was created with.
+        let alpha = cm.try_ensure_synthetic_class(COMPONENT, 0).expect("Compatible mode fabricates; this fixture never runs under --jdk-only");
+
+        // The forked loader's copy: fabricated under its own name, then renamed
+        // so the store holds two distinct ids for one name.
+        let forked = cm.try_ensure_synthetic_class("cratonvm/test/SplitAlpha$Forked", 0).expect("Compatible mode fabricates; this fixture never runs under --jdk-only");
+        cm.class_store
+            .get_mut(forked)
+            .expect("just fabricated")
+            .name = cratonvm_types::intern_arc(COMPONENT);
+
+        // A subclass of the FORKED copy, for arm 2. `set_superclass` rather than
+        // writing the field: the store maintains a subclass adjacency index that
+        // a raw field write would desynchronise.
+        let child = cm.try_ensure_synthetic_class("cratonvm/test/SplitChild", 0).expect("Compatible mode fabricates; this fixture never runs under --jdk-only");
+        cm.class_store.set_superclass(child, Some(forked));
+
+        (alpha, forked, child)
+    };
+    assert_ne!(alpha, forked, "the two copies must be distinct ClassIds");
+
+    let alpha_arr = shared
+        .mem
+        .heap
+        .alloc_array(alpha, ArrayElementType::Reference, 1);
+    let forked_obj = shared.mem.heap.alloc_object(forked, 0);
+    let child_obj = shared.mem.heap.alloc_object(child, 0);
+
+    {
+        let cm = shared.classes.class_manager.read();
+        assert!(
+            !cm.is_subclass_of(forked, alpha),
+            "identity must refuse the two copies — if it accepts, arm 1 is not \
+             what is being measured below",
+        );
+        assert!(
+            !cm.is_subclass_of(child, alpha),
+            "identity must refuse the child too: its superclass edge points at \
+             the FORKED copy, not at this one",
+        );
+    }
+
+    // Scenario 1: the value IS the component, under the other copy. Served by
+    // the by-name walk's first iteration (see the note above on why the
+    // explicit same-name fast path that used to precede it was subsumed).
+    assert!(
+        aastore_element_assignable(&shared, alpha_arr, forked_obj),
+        "the other loader's copy of the component must be storable — refusing \
+         it is the `array element type mismatch` that AotIntegrationTests hit",
+    );
+
+    // Scenario 2: a subclass reaching the other copy. This one is served ONLY
+    // by the walk — disabling it fails right here.
+    assert!(
+        aastore_element_assignable(&shared, alpha_arr, child_obj),
+        "a subclass whose superclass edge reaches a same-named copy must be \
+         storable",
+    );
+
+    // And the split is not a licence to accept anything: an unrelated class
+    // whose chain never reaches the component name is still refused. Without
+    // this, both assertions above would also pass against a predicate that had
+    // degenerated to `true`.
+    let unrelated = {
+        let mut cm = shared.classes.class_manager.write();
+        cm.try_ensure_synthetic_class("cratonvm/test/SplitUnrelated", 0).expect("Compatible mode fabricates; this fixture never runs under --jdk-only")
+    };
+    let unrelated_obj = shared.mem.heap.alloc_object(unrelated, 0);
+    assert!(
+        !aastore_element_assignable(&shared, alpha_arr, unrelated_obj),
+        "an unrelated class must still be refused even once same-named copies \
+         exist in the store",
+    );
+}
+
+/// The wiring the test above cannot see: reflective `Array.set` must actually
+/// route through that shared predicate rather than keep a private check.
+///
+/// `reflect_array_element_assignable` lives in `native-builtins`, whose test
+/// targets do not currently compile (~620 pre-existing errors from the
+/// in-flight fallibility migration), so a behavioural test cannot be hosted
+/// beside it. A source witness is the cheap stand-in for "this call must not
+/// quietly disappear" — matched on text, never on line numbers, so ordinary
+/// edits to the file cannot rot it.
+#[test]
+fn array_set_routes_through_the_shared_aastore_predicate() {
+    let src = include_str!("../../../../native-builtins/src/lib.rs");
+    let start = src
+        .find("fn reflect_array_element_assignable")
+        .expect("reflect_array_element_assignable must exist in native-builtins");
+    // Bound the search to this function so a coincidental match elsewhere in a
+    // 39k-line file cannot vouch for it.
+    let body = &src[start..];
+    // End at the next top-level `fn` rather than at a named neighbour: the
+    // function that follows this one has already changed once (a diagnostic
+    // helper was inserted between them), and a witness that has to be edited
+    // whenever a sibling is added is a witness that will one day be edited
+    // wrongly. `\nfn ` at column 0 cannot match an inner item.
+    let end = body[1..]
+        .find("\nfn ")
+        .expect("a top-level function must follow it")
+        + 1;
+    let body = &body[..end];
+    assert!(
+        body.contains("ctx.aastore_element_assignable(arr, value)"),
+        "Array.set must consult the same predicate as the `aastore` opcode. \
+         Without it the reflective path falls back to a ClassId-identity \
+         `is_subclass`, which refuses a proxy stored into the annotation-type \
+         array it was created from — the AotIntegrationTests failure.",
+    );
+}
+
 #[test]
 fn forced_generic_metadata_scan_reuses_the_callers_class_manager_guard() {
     let _guard_reusing_signature: fn(
@@ -11,6 +275,121 @@ fn forced_generic_metadata_scan_reuses_the_callers_class_manager_guard() {
         &[u8],
         usize,
     ) -> bool = jit_method_calls_forced_class_generic_metadata;
+}
+
+/// The `java.lang.Thread`-mirror recovery in `execute_invoke_kind` replaces the
+/// receiver with a live thread mirror when the receiver's address is in
+/// `former_mirror_addrs`. Its gate used to be `class_id_of(recv) == ClassId(0)`,
+/// justified in-comment as "the receiver header is genuinely all-zero".
+///
+/// It is not the same test. **Every primitive array reads `ClassId(0)`** —
+/// `Instruction::Newarray` allocates with `ClassId::new(0)` because an array
+/// header carries its COMPONENT class id (JVMS §4.4.1) and `long[]` has none —
+/// so a perfectly live `long[]` that landed on a recycled young address matched
+/// and was replaced by a `java.lang.Thread`. Measured on
+/// `org.h2.test.db.TestTempTables`: `Arrays.copyOf(long[], int)`'s
+/// `original.clone()` dispatching into the mirror's inherited `Thread.clone`,
+/// i.e. `CloneNotSupportedException`. See
+/// `fixed-suite-bugs/h2-suite-bugs/bug-h2-testtemptables-clonenotsupportedexception-thread-clone-frame-FIXED.md`.
+///
+/// Restoring the old gate (dropping the header term from
+/// `stale_mirror_recovery_applies`) fails the first assertion below.
+#[test]
+fn stale_mirror_recovery_skips_a_live_primitive_array() {
+    use super::invoke::stale_mirror_recovery_applies;
+    use cratonvm_gc::heap::ObjectHeader;
+    use cratonvm_types::{ArrayElementType, ObjectKind, HEADER_SIZE};
+
+    let header_bytes = |h: &ObjectHeader| -> [u8; HEADER_SIZE] {
+        // SAFETY: `ObjectHeader` is `#[repr(C)]` and exactly `HEADER_SIZE`
+        // bytes; this reads it exactly as the interpreter reads a header off a
+        // heap address.
+        unsafe { std::ptr::read(h as *const ObjectHeader as *const [u8; HEADER_SIZE]) }
+    };
+
+    // A live `long[1]` — `bits` in H2's `VersionedBitSet`, the witness shape.
+    let live_long_array = ObjectHeader::new(
+        ClassId::new(0),
+        ObjectKind::Array,
+        ArrayElementType::Long,
+        1,
+        1,
+    );
+    assert_eq!(
+        live_long_array.class_id,
+        ClassId::new(0),
+        "the trap itself: a primitive array's header carries no component class id"
+    );
+    assert!(
+        !stale_mirror_recovery_applies(live_long_array.class_id, &header_bytes(&live_long_array)),
+        "a live long[] must never be mistaken for a reclaimed span and replaced \
+         by a java.lang.Thread mirror"
+    );
+
+    // A live `Object[3]`. Its component class id is `java/lang/Object` =
+    // ClassId(0) too, and `ArrayElementType::Reference` is discriminant 0, so
+    // this one is separated from the wipe by `kind` and `shape` alone.
+    let live_ref_array = ObjectHeader::new(
+        ClassId::new(0),
+        ObjectKind::Array,
+        ArrayElementType::Reference,
+        3,
+        3,
+    );
+    assert!(
+        !stale_mirror_recovery_applies(live_ref_array.class_id, &header_bytes(&live_ref_array)),
+        "a live Object[] must not be mistaken for a reclaimed span either"
+    );
+
+    // What the recovery is actually for: the all-zero header a collector
+    // leaves over a span it reclaimed.
+    assert!(
+        stale_mirror_recovery_applies(ClassId::new(0), &[0u8; HEADER_SIZE]),
+        "the collector's own wipe must still reach the former-mirror lookup"
+    );
+}
+
+/// The header test above cannot close the recovery's last address-collision
+/// window on its own. On the 16-byte header a bare `new Object()` is ALSO
+/// all-zero — `class_id` 0, `shape` 0, `ObjectKind::Object` and
+/// `ArrayElementType::Reference` both discriminant 0, and the identity hash
+/// minted lazily into the mark word rather than stamped at allocation. So the
+/// second half of the gate asks a question the header cannot answer: could this
+/// CALL SITE be holding a thread mirror at all?
+///
+/// Two names can never be evidence of one, whatever the heap says, and
+/// admitting the second is what would leave the `new Object()` window open.
+#[test]
+fn only_a_call_site_that_could_hold_a_thread_mirror_admits_the_recovery() {
+    use super::invoke::call_site_type_can_hold_a_thread_mirror;
+
+    // An array type has no relationship to `java.lang.Thread` in either
+    // direction. This is the `Arrays.copyOf(long[], int)` witness's call site.
+    assert!(
+        !call_site_type_can_hold_a_thread_mirror("[J"),
+        "an array-typed call site can never legitimately hold a thread mirror"
+    );
+    assert!(!call_site_type_can_hold_a_thread_mirror(
+        "[Ljava/lang/Object;"
+    ));
+
+    // Bare `java/lang/Object` admits every mirror, so it is no evidence at all
+    // — and a zero-field `Object` receiver is header-identical to a reclaimed
+    // span, so nothing else could refuse it.
+    assert!(
+        !call_site_type_can_hold_a_thread_mirror("java/lang/Object"),
+        "an Object-typed call site carries no evidence the receiver was a mirror"
+    );
+
+    // The case the recovery exists for — Tomcat's `TaskThreadFactory.<init>`
+    // calling `Thread.currentThread().getThreadGroup()` — and an
+    // interface-typed use, both still admitted (assignability is then checked
+    // against the recovered mirror's real class).
+    assert!(call_site_type_can_hold_a_thread_mirror("java/lang/Thread"));
+    assert!(call_site_type_can_hold_a_thread_mirror("java/lang/Runnable"));
+    assert!(call_site_type_can_hold_a_thread_mirror(
+        "jdk/internal/misc/InnocuousThread"
+    ));
 }
 
 #[test]
@@ -1893,30 +2272,43 @@ fn liquibase_checksum_force_native_covers_status_hotpath_intrinsics() {
     ));
 }
 
+/// `group.shutdownGracefully()` must keep Netty's own semantics.
+///
+/// The MongoDB Reactive Streams lifecycle needs a zero quiet period, and gets
+/// one by calling `native_netty_event_executor_group_shutdown_gracefully`
+/// directly from the `destroy()` bridge that replaces the bean method. It was
+/// ALSO registered against `EventExecutorGroup`,
+/// `AbstractEventExecutorGroup` and `MultiThreadIoEventLoopGroup` and forced
+/// over their bytecode, on the stated premise that this restricted it to "that
+/// concrete Netty 4.2 group" — but `MultiThreadIoEventLoopGroup` is the group
+/// every Netty 4.2 application builds, so the premise was false and every
+/// shutdown in the process ran with quiet period 0.
+///
+/// A zero quiet period does not drain the event loop, and Netty runs channel
+/// deregistration — hence `handlerRemoved` — as a queued task. That silently
+/// truncated `PcapWriteHandler`'s capture (522 bytes of 732: every close
+/// packet missing) and would truncate any other graceful-shutdown-dependent
+/// teardown the same way.
 #[test]
-fn netty_mongodb_event_loop_shutdown_bridge_is_forced_at_each_resolved_owner() {
-    let descriptor = "()Lio/netty/util/concurrent/Future;";
+fn netty_group_shutdown_gracefully_is_not_forced_to_a_zero_quiet_period() {
     for class_name in [
         "io/netty/util/concurrent/EventExecutorGroup",
         "io/netty/util/concurrent/AbstractEventExecutorGroup",
         "io/netty/channel/MultiThreadIoEventLoopGroup",
+        "io/netty/channel/nio/NioEventLoopGroup",
     ] {
-        assert!(is_netty_event_executor_group_shutdown_native_override(
-            class_name,
-            "shutdownGracefully",
-            descriptor
-        ));
-        assert!(force_native_over_real_jdk_bytecode(
-            class_name,
-            "shutdownGracefully",
-            descriptor
-        ));
+        for descriptor in [
+            "()Lio/netty/util/concurrent/Future;",
+            "(JJLjava/util/concurrent/TimeUnit;)Lio/netty/util/concurrent/Future;",
+        ] {
+            assert!(
+                !force_native_over_real_jdk_bytecode(class_name, "shutdownGracefully", descriptor),
+                "{class_name}.shutdownGracefully{descriptor} must run Netty's own bytecode, \
+                 with Netty's own quiet period — a zero quiet period drops the queued \
+                 deregistration task that fires handlerRemoved"
+            );
+        }
     }
-    assert!(!is_netty_event_executor_group_shutdown_native_override(
-        "io/netty/util/concurrent/AbstractEventExecutorGroup",
-        "shutdownGracefully",
-        "(JJLjava/util/concurrent/TimeUnit;)Lio/netty/util/concurrent/Future;"
-    ));
 }
 
 #[test]
@@ -2849,7 +3241,7 @@ fn lambda_proxy_captures_read_correctly() {
         .classes
         .lambda_proxies
         .write()
-        .insert(proxy_class_id, call_site);
+        .insert(proxy_class_id, std::sync::Arc::new(call_site));
 
     // Allocate a proxy object with 3 captured values
     let proxy_ref = shared.mem.heap.alloc_object(proxy_class_id, 3);
@@ -3685,6 +4077,7 @@ fn t10_shared_resolution_read_hit_round_trip() {
         is_synchronized: false,
         is_static: false,
         force_native_cache: std::sync::OnceLock::new(),
+            intercept_shape_cache: std::sync::OnceLock::new(),
         native_callback_cache: std::sync::OnceLock::new(),
         invoc_key: std::sync::OnceLock::new(),
         jit_probe_generation: std::sync::atomic::AtomicU64::new(0),
@@ -4804,5 +5197,73 @@ fn b3_gate_scans_full_production_body_of_interpreter() {
         hits, 0,
         "B3: interpreter.rs production body has {hits} panic sites \
          across {scanned} scanned lines; it must be panic-free.",
+    );
+}
+
+/// `multianewarray` must reject `dimensions > <bracket count of the referenced
+/// array class>` *itself*, not lean on the verifier for it.
+///
+/// The type-state verifier does check it (`classloading/src/verify_insn.rs`,
+/// `Instruction::Multianewarray`), but that pass does not run for every class:
+/// `ClassManager::define_class_shared_with_options` sets
+/// `defer_loader_sensitive_pass3` for any class defined by a user-defined
+/// loader while `loader_aware_resolution()` is on — which is the default —
+/// and the structural-only substitute it runs instead
+/// (`verifier::verify_method_structural`) never looks at this operand.
+/// `-Xverify:none` removes the check too.
+///
+/// Without the guard the opcode arm computes `total_array_depth - d - 1` for
+/// `d` in `0..dimensions`. The first `d == total_array_depth` underflows
+/// `usize`: a release build (`[profile.release]` sets no `overflow-checks`, so
+/// it defaults off) wraps it to `usize::MAX`, and the very next statement is
+/// `"[".repeat(comp_brackets)` — `Vec::with_capacity(usize::MAX)`, which the
+/// allocator cannot satisfy and which aborts the process rather than raising
+/// anything Java can catch. `multianewarray #cp("java/lang/Object"), 1`
+/// underflows on the *first* iteration.
+///
+/// This is a source witness rather than an execution test: reaching the arm
+/// needs a full `Vm`, a hand-built classfile and a `skip_verification`/
+/// user-loader define, and there is no single-opcode harness in this module.
+/// It is anchored on code text, not line numbers, so it does not go stale the
+/// way a fixed line band would.
+#[test]
+fn multianewarray_arm_guards_the_component_bracket_subtraction() {
+    let src = std::fs::read_to_string(format!(
+        "{}/src/runtime/interpreter/opcodes.rs",
+        env!("CARGO_MANIFEST_DIR")
+    ))
+    .expect("read opcodes.rs");
+
+    let arm = src
+        .find("Instruction::Multianewarray { index, dimensions } =>")
+        .expect("the multianewarray arm must still exist");
+    // Anchor on the whole binding, not the bare expression: the guard's own
+    // explanatory comment quotes `total_array_depth - d - 1`, and matching that
+    // would find the comment (which sits *before* the guard) instead of the code.
+    let subtraction = src[arm..]
+        .find("let comp_brackets = total_array_depth - d - 1")
+        .map(|off| arm + off)
+        .expect(
+            "the component-bracket subtraction must still exist; if it was rewritten \
+             (e.g. to `checked_sub`), retarget this witness at the new form",
+        );
+
+    let guard = src[arm..subtraction].find("sizes.len() > total_array_depth");
+    assert!(
+        guard.is_some(),
+        "multianewarray: `total_array_depth - d - 1` is reached with no \
+         `sizes.len() > total_array_depth` rejection in front of it. A class \
+         whose Pass 3 was deferred (any user-defined loader, the default) can \
+         then underflow it to usize::MAX and abort the process in \
+         `\"[\".repeat(..)`."
+    );
+
+    // The guard must reject, not clamp: a silently-truncated dimension count
+    // would allocate the wrong shape instead of crashing, which is worse.
+    let guarded = &src[arm..subtraction];
+    assert!(
+        guarded.contains("LinkageError::VerifyError"),
+        "the multianewarray depth guard must raise a catchable VerifyError, \
+         not clamp the dimension count or fall through"
     );
 }

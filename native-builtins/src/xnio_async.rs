@@ -75,7 +75,7 @@ use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
 use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError};
 use cratonvm_types::{ObjectRef, Value};
 
-use crate::{alloc_concurrent_synthetic, obj_arg};
+use crate::{try_alloc_concurrent_synthetic, obj_arg};
 
 // ---------------------------------------------------------------------------
 // Synthetic field layouts
@@ -743,7 +743,7 @@ fn native_option_simple(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     if args.len() < 3 {
         return Err(iae("Option.simple expects 3 args"));
     }
-    let obj = alloc_concurrent_synthetic(ctx, "org/xnio/Option", 3);
+    let obj = try_alloc_concurrent_synthetic(ctx, "org/xnio/Option", 3)?;
     ctx.set_field(obj, OPT_DECLARING_CLASS, args[0]);
     ctx.set_field(obj, OPT_NAME, args[1]);
     ctx.set_field(obj, OPT_TYPE_CLASS, args[2]);
@@ -848,10 +848,10 @@ fn native_option_parse_value(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
 // Natives: OptionMap
 // ---------------------------------------------------------------------------
 
-fn alloc_option_map(ctx: &mut dyn NativeContext, inner: Arc<OptionMapInner>) -> ObjectRef {
-    let obj = alloc_concurrent_synthetic(ctx, "org/xnio/OptionMap", 2);
+fn alloc_option_map(ctx: &mut dyn NativeContext, inner: Arc<OptionMapInner>) -> Result<ObjectRef, MethodCallFailed> {
+    let obj = try_alloc_concurrent_synthetic(ctx, "org/xnio/OptionMap", 2)?;
     remember_option_map_inner(ctx, obj, inner);
-    obj
+    Ok(obj)
 }
 
 /// `OptionMap.<clinit>()V` — populate the public EMPTY static with a
@@ -859,7 +859,7 @@ fn alloc_option_map(ctx: &mut dyn NativeContext, inner: Arc<OptionMapInner>) -> 
 /// real-JDK field.
 fn native_option_map_clinit(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
     let obj = alloc_option_map(ctx, OptionMapInner::empty());
-    ctx.set_static_field_by_name("org/xnio/OptionMap", "EMPTY", Value::Object(Some(obj)));
+    ctx.set_static_field_by_name("org/xnio/OptionMap", "EMPTY", Value::Object(Some(obj?)));
     Ok(None)
 }
 
@@ -876,13 +876,13 @@ fn native_option_map_clinit(ctx: &mut dyn NativeContext, _args: &[Value]) -> Met
 /// library documents: equality, not identity.
 fn native_option_map_empty_get(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
     let obj = alloc_option_map(ctx, OptionMapInner::empty());
-    Ok(Some(Value::Object(Some(obj))))
+    Ok(Some(Value::Object(Some(obj?))))
 }
 
 /// `OptionMap.builder()Lorg/xnio/OptionMap$Builder;`
 fn native_option_map_builder(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
     let inner = Arc::new(BuilderInner::default());
-    let obj = alloc_concurrent_synthetic(ctx, "org/xnio/OptionMap$Builder", 2);
+    let obj = try_alloc_concurrent_synthetic(ctx, "org/xnio/OptionMap$Builder", 2)?;
     let h = register_builder(inner);
     write_handle_slot_if_present(ctx, obj, OMB_PENDING_HANDLE, h);
     remember_builder_handle(ctx, obj, h);
@@ -1032,7 +1032,7 @@ fn native_builder_get_map(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         entries: Mutex::new(entries),
     });
     let obj = alloc_option_map(ctx, inner);
-    Ok(Some(Value::Object(Some(obj))))
+    Ok(Some(Value::Object(Some(obj?))))
 }
 
 fn inner_from_map(
@@ -1407,7 +1407,7 @@ fn native_option_map_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
     let keys: Vec<OptionKey> = inner.entries.lock().keys().cloned().collect();
     let mut opts = Vec::with_capacity(keys.len());
     for key in &keys {
-        let opt = alloc_concurrent_synthetic(ctx, "org/xnio/Option", 3);
+        let opt = try_alloc_concurrent_synthetic(ctx, "org/xnio/Option", 3)?;
         let declaring = ctx.create_string(&key.declaring_class);
         ctx.set_field(opt, OPT_DECLARING_CLASS, Value::Object(Some(declaring)));
         let name = ctx.create_string(&key.name);
@@ -1537,7 +1537,7 @@ fn ensure_options_initialized(ctx: &mut dyn NativeContext) -> MethodCallResult {
     ];
     let declaring = ctx.create_string("org/xnio/Options");
     for (name, ty) in specs {
-        let opt = alloc_concurrent_synthetic(ctx, "org/xnio/Option", 3);
+        let opt = try_alloc_concurrent_synthetic(ctx, "org/xnio/Option", 3)?;
         ctx.set_field(opt, OPT_DECLARING_CLASS, Value::Object(Some(declaring)));
         let name_s = ctx.create_string(name);
         ctx.set_field(opt, OPT_NAME, Value::Object(Some(name_s)));
@@ -1676,8 +1676,8 @@ fn native_options_get_ssl_enabled(
 // Natives: IoFuture
 // ---------------------------------------------------------------------------
 
-fn alloc_io_future(ctx: &mut dyn NativeContext, inner: Arc<IoFutureInner>) -> ObjectRef {
-    let obj = alloc_concurrent_synthetic(ctx, "org/xnio/IoFuture", 3);
+fn alloc_io_future(ctx: &mut dyn NativeContext, inner: Arc<IoFutureInner>) -> Result<ObjectRef, MethodCallFailed> {
+    let obj = try_alloc_concurrent_synthetic(ctx, "org/xnio/IoFuture", 3)?;
     let h = register_future(inner.clone());
     ctx.set_field(
         obj,
@@ -1686,7 +1686,7 @@ fn alloc_io_future(ctx: &mut dyn NativeContext, inner: Arc<IoFutureInner>) -> Ob
     );
     ctx.set_field(obj, IOF_RESULT_SLOT, Value::Long(h));
     ctx.set_field(obj, IOF_NOTIFIER_LIST, Value::Long(h));
-    obj
+    Ok(obj)
 }
 
 fn inner_from_future(
@@ -1901,7 +1901,7 @@ fn native_future_result_get_future(
     let inner = inner_from_fr(ctx, this)?;
     // Rebuild a JVM IoFuture object pointing at the same Arc.
     let obj = alloc_io_future(ctx, inner);
-    Ok(Some(Value::Object(Some(obj))))
+    Ok(Some(Value::Object(Some(obj?))))
 }
 
 /// `FutureResult.setResult(Ljava/lang/Object;)Z`
@@ -1932,7 +1932,7 @@ fn native_future_result_set_result(
     inner.cv.notify_all();
 
     // Rebuild a JVM-facing IoFuture object for the fire path.
-    let fut_obj = alloc_io_future(ctx, inner.clone());
+    let fut_obj = alloc_io_future(ctx, inner.clone())?;
     for e in &notifiers {
         IoFutureInner::fire_notifier(ctx, fut_obj, e);
     }
@@ -1983,7 +1983,7 @@ fn native_future_result_set_exception(
     }
     let notifiers = inner.drain_notifiers();
     inner.cv.notify_all();
-    let fut_obj = alloc_io_future(ctx, inner.clone());
+    let fut_obj = alloc_io_future(ctx, inner.clone())?;
     for e in &notifiers {
         IoFutureInner::fire_notifier(ctx, fut_obj, e);
     }
@@ -2011,7 +2011,7 @@ fn native_future_result_set_cancelled(
     }
     let notifiers = inner.drain_notifiers();
     inner.cv.notify_all();
-    let fut_obj = alloc_io_future(ctx, inner.clone());
+    let fut_obj = alloc_io_future(ctx, inner.clone())?;
     for e in &notifiers {
         IoFutureInner::fire_notifier(ctx, fut_obj, e);
     }
@@ -2416,7 +2416,7 @@ mod tests {
 
     fn new_future(ctx: &mut crate::test_utils::MockNativeContext) -> (ObjectRef, ObjectRef) {
         // Allocate a FutureResult and init it; read back its future.
-        let fr = alloc_concurrent_synthetic(ctx, "org/xnio/FutureResult", 1);
+        let fr = try_alloc_concurrent_synthetic(ctx, "org/xnio/FutureResult", 1).unwrap();
         native_future_result_init(ctx, &[Value::Object(Some(fr))]).unwrap();
         let fut = match native_future_result_get_future(ctx, &[Value::Object(Some(fr))])
             .unwrap()
@@ -2781,7 +2781,7 @@ mod tests {
         let mut ctx = mock_ctx();
         let (fr, fut) = new_future(&mut ctx);
         // Build a synthetic IOException with a message field.
-        let exc = alloc_concurrent_synthetic(&mut ctx, "java/io/IOException", 2);
+        let exc = try_alloc_concurrent_synthetic(&mut ctx, "java/io/IOException", 2).unwrap();
         let msg = ctx.create_string("disk full");
         ctx.set_field(exc, 0, Value::Object(Some(msg)));
         native_future_result_set_exception(
@@ -2856,7 +2856,7 @@ mod tests {
         // Build a synthetic Notifier object. Our invoke() in MockNativeContext
         // always returns Ok(None) without dispatching, so we test the
         // wiring by observing the notifier list before/after completion.
-        let notifier = alloc_concurrent_synthetic(&mut ctx, "org/xnio/IoFuture$Notifier", 1);
+        let notifier = try_alloc_concurrent_synthetic(&mut ctx, "org/xnio/IoFuture$Notifier", 1).unwrap();
         // addNotifier while still WAITING → should stash.
         native_iof_add_notifier(
             &mut ctx,
@@ -2885,7 +2885,7 @@ mod tests {
 
         // addNotifier AFTER completion → fires synchronously (and the
         // list stays empty).
-        let n2 = alloc_concurrent_synthetic(&mut ctx, "org/xnio/IoFuture$Notifier", 1);
+        let n2 = try_alloc_concurrent_synthetic(&mut ctx, "org/xnio/IoFuture$Notifier", 1).unwrap();
         native_iof_add_notifier(
             &mut ctx,
             &[
@@ -3081,7 +3081,7 @@ mod tests {
             Arc::new(OptionMapInner {
                 entries: Mutex::new(entries),
             }),
-        );
+        ).unwrap();
 
         let got = native_option_map_get_bool(
             &mut ctx,
@@ -3112,7 +3112,7 @@ mod tests {
     fn t19_7_e_gc_scan_reports_pending_notifier_and_attachment() {
         let mut ctx = mock_ctx();
         let (_fr, fut) = new_future(&mut ctx);
-        let notifier = alloc_concurrent_synthetic(&mut ctx, "org/xnio/IoFuture$Notifier", 1);
+        let notifier = try_alloc_concurrent_synthetic(&mut ctx, "org/xnio/IoFuture$Notifier", 1).unwrap();
         let attachment = ctx.create_string("att");
         // addNotifier while WAITING stashes (notifier, attachment).
         native_iof_add_notifier(
@@ -3162,7 +3162,7 @@ mod tests {
     fn t19_7_e_gc_remap_repoints_notifier_attachment_and_result() {
         let mut ctx = mock_ctx();
         let (fr, fut) = new_future(&mut ctx);
-        let notifier = alloc_concurrent_synthetic(&mut ctx, "org/xnio/IoFuture$Notifier", 1);
+        let notifier = try_alloc_concurrent_synthetic(&mut ctx, "org/xnio/IoFuture$Notifier", 1).unwrap();
         let attachment = ctx.create_string("att");
         native_iof_add_notifier(
             &mut ctx,

@@ -1,10 +1,49 @@
 # An absent array element type is thrown as `NoClassDefFoundError`, so `catch (ClassNotFoundException)` misses it
 
-**Status:** ROOT-CAUSED, fix PARTIAL (the helper landed in
-`classloading/src/class_manager.rs`; the two one-line guard patches that consume
-it are in `native-builtins/`, which this lane does not own, and are recorded
-verbatim below). Unverified — no binary was built in the session that wrote
-this. Lane L16 of the jdk-wave2 pool.
+**Status (reconciled 2026-08-12 — W7-55-record-reconciliation.md):**
+
+* **Headline: CLOSED, and now verified.** The old status line — *"fix PARTIAL …
+  the two one-line guard patches that consume it are in `native-builtins/`,
+  which this lane does not own"* — was **stale**. Both guard patches are in the
+  tree, verbatim, since commit `f88feaef1`:
+  `native-builtins/src/classloader_real.rs:990-992` and
+  `native-builtins/src/classloader.rs:2939`. The helper they consume,
+  `array_descriptor_element_class`, is at
+  `classloading/src/class_manager.rs:20344` (commit `cb3134447`), re-exported at
+  `classloading/src/lib.rs:84`, with its unit test at `class_manager.rs:18753`.
+  The verification the record said it was missing was taken 2026-08-12 against
+  the dev binary at `ba65f1a19`: `RJdkFailure` runs to `PASS RJdkFailure
+  (43 checks)` in **both** `--jdk-only` and `--real-jdk`.
+* **Residual: CLOSED — the four "WRONG — latent" inventory rows.** All four
+  blockers this record filed as latent behind the L16 fix are fixed elsewhere:
+  case 14 `System.loadLibrary(absent)` returning normally — commit `ba50b498b`,
+  `native-builtins/src/lang_system.rs:2064` `load_library_or_throw`, raising
+  `UnsatisfiedLinkError` at `:2096-2099`; case 16 `ModuleLayer.boot()
+  .findModule(absent)` fabricating a Module — same commit,
+  `native-builtins/src/jboss_jdkspecific.rs:673`; case 21
+  `ModuleFinder.ofSystem().find(absent)` — commit `066856380`,
+  `native-builtins/src/reflect_annotations.rs:2055-2062`; case 23
+  `Cipher.getInstance("CRATONVM-NO-SUCH-CIPHER")` minting a synthetic `Cipher` —
+  commit `eb41d9730`, `native-builtins/src/jca/cipher.rs:887` / `:953`, with the
+  refusal asserted at `cipher.rs:4354`. Read the inventory tables below with
+  that correction applied.
+* **Residual: CLOSED IN SOURCE 2026-08-12, NOT BUILT AND NOT RUN, and it now
+  has a scheduled witness.** The residual was real and was re-verified before
+  it was touched: `cl_real_load_class_base_rooted`'s step-3 throw
+  (`native-builtins/src/classloader_real.rs`, `alloc_single_message_exception(
+  ctx, "java/lang/ClassNotFoundException", 1, &class_name)`) names the string
+  `loadClass` was given, and `native_class_for_name` handed it the array
+  descriptor and then propagated the result unchanged. `native_class_for_name`
+  now corrects the *name* on its way out instead of restructuring the
+  resolution — see "The residual, and how it was closed" below. The reason the
+  vector stayed green is likewise unchanged and is the sharper half of this
+  record: **`RJdkFailure` asserts the message only on the first, non-array
+  probe.** A vector that asserts a throwable's type and not its message cannot
+  see a message defect, which is why 43/43 never closed this. Exact Java for
+  the five missing `RJdkFailure` assertions is in "The residual, and how it was
+  closed"; the same contract is now also asserted in
+  `regression-suite/src/RExceptions.java`, which is in `CORE_CLASSES` and so
+  runs on a **default** invocation, not only under `--jdk-only`.
 
 ## The failure
 
@@ -187,7 +226,15 @@ non-array case keeps today's behaviour exactly.
 
 Unit test: `l16_array_descriptor_element_class_strips_every_dimension`.
 
-### Not landed — two guard patches this lane does not own
+### ~~Not landed~~ — LANDED. The two guard patches this lane did not own
+
+> **Reconciled 2026-08-12.** Both patches below are **in the tree, verbatim**,
+> and have been since commit `f88feaef1` *wip(jdk-only): array-descriptor forName
+> must throw CNFE, not NCDFE* — `native-builtins/src/classloader_real.rs:990-992`
+> (real-JDK mode) and `native-builtins/src/classloader.rs:2939` (synthetic-JDK
+> mode), each carrying the three-line predicate exactly as written below. The
+> heading is kept so the text stays findable; read the section as a record of
+> what landed, not as pending work.
 
 Both are the same edit, and both are recorded verbatim in the lane report. Each
 narrows the "a *different* class is missing, so a dependency must be absent"
@@ -216,17 +263,147 @@ if `[Lp/X;`'s element `p/X` exists but `p/X`'s own superclass is missing, the
 guard still lets `NoClassDefFoundError` name that superclass, which is what
 `Class.forName` should report.
 
-### Residual divergence, not fixed
+### ~~Residual divergence, not fixed~~ — the residual, and how it was closed
 
-After the patch our CNFE message is the **array descriptor**
+> **Superseded 2026-08-12.** Kept because the paragraph below states the
+> divergence exactly and the section that follows it states the fix. Read the
+> two together.
+
+After the guard patches our CNFE message is the **array descriptor**
 (`[Lcom.cratonvm.absent.NoSuchClass20260731;`), matching HotSpot's
 `ClassLoader.loadClass` shape; HotSpot's `Class.forName` reports the **element**
 name. `RJdkFailure` does not assert the message on this check (it asserts the
 message only on the first, non-array probe, line 136), so this does not affect
-the vector. Closing it properly means teaching `native_class_for_name` to strip
-`[`s and resolve the element itself — the HotSpot structure — rather than
-handing array descriptors to `loadClass` at all. That is a `lang_class.rs`
-change and a larger blast radius; recorded here, not attempted.
+the vector.
+
+## The residual, and how it was closed
+
+### The option that was NOT taken, and why
+
+The section above prescribed *"teaching `native_class_for_name` to strip `[`s
+and resolve the element itself — the HotSpot structure — rather than handing
+array descriptors to `loadClass` at all."* **That prescription is right about
+HotSpot's structure and wrong about the cost/benefit here, and it was declined.**
+Resolving the element separately means one extra `loader.loadClass` round trip
+on the success path of every array `Class.forName` — a path that today works —
+and then re-deriving the array `Class` from the element, which the loader-scoped
+`synthesize_array_class_for_loader` already does correctly a layer down. It buys
+nothing observable over correcting the name, and it puts a new
+arbitrary-Java dispatch on a working path. Recorded as declined rather than
+silently skipped, because the next reader will find the old prescription first.
+
+### What landed instead — `native-builtins/src/lang_class.rs`
+
+Two private helpers next to `validate_for_name_dotted`, and four call sites
+inside `native_class_for_name`:
+
+```rust
+fn for_name_cnfe_name(dotted_name: &str) -> String
+fn for_name_rename_array_cnfe(
+    ctx: &mut dyn NativeContext,
+    dotted_name: &str,
+    failed: MethodCallFailed,
+) -> MethodCallFailed
+```
+
+The first substitutes the element name when `dotted_name` is a reference-array
+descriptor, and is used at the two sites that *mint* a
+`RuntimeError::ClassNotFoundException` for the requested name — the
+`loadClass`-returned-null arm, and the terminal "could not be located on any
+classpath source" arm. The second re-mints a `ClassNotFoundException` that a
+loader or the global resolution *raised*, and is used at the two propagate-as-is
+arms. Both consume the existing `cratonvm_classloading::array_descriptor_element_class`,
+which was already in the tree for the guard patches and answers `None` for
+everything that is not a reference-array descriptor — so `[I`, plain class
+names, `[Lp/X` and `[L;` all keep today's name character for character.
+
+`for_name_rename_array_cnfe` is narrow on both axes, and each narrowing is the
+same one the guard patch made:
+
+* Only `java/lang/ClassNotFoundException` is rewritten, matched by exact class
+  name. **A `NoClassDefFoundError` is left alone**, which is the case the guard
+  patch deliberately did not widen past: if `[Lp/X;`'s element `p/X` exists but
+  `p/X`'s own supertype is missing, `load_class_visible_to`'s
+  `DependencyMissing` arm names that supertype and `Class.forName` should report
+  it.
+* Only a reference-array descriptor is rewritten.
+
+The replacement is a fresh `RuntimeError::ClassNotFoundException`, so it carries
+**no cause** — which is what HotSpot's array-form `Class.forName` miss reports
+(`cause=null`, measured above).
+
+One site was deliberately left alone: the explicit-null-loader refusal earlier
+in the same function (`explicit_bootstrap_loader && !is_bootstrap_class_name`).
+`Class.forName("[Ljava.lang.String;", false, null)` reaches it because
+`is_bootstrap_class_name` tests a package prefix and `[Ljava/lang/String;` has
+none, so that arm refuses an array form whose element **is** a bootstrap class.
+That is a *wrong refusal*, not a wrong message; renaming its message would make
+a wrong answer read more plausibly. Filed here as adjacent and not fixed.
+
+### The coverage, which is the half that kept this open
+
+`regression-suite/src/RExceptions.java` (`CORE_CLASSES`, so it runs on a default
+invocation) gains five checks — the file moves **13 → 25** counting the seven
+W7-37/W7-33 checks that landed in the same pass:
+the array `Class.forName` throws `ClassNotFoundException` and not
+`NoClassDefFoundError`; its message is the element; the two-dimensional form
+strips every dimension; and two controls asserting `Class.forName("[I")` and
+`Class.forName("[Ljava.lang.String;")` still resolve — the record's own cheap
+discriminator, so a "fix" that broke array resolution generally does not survive.
+The throwable is caught as `Throwable` and its type asserted, rather than caught
+as `ClassNotFoundException`, so a regression on the *shape* reports the type it
+got instead of dying uncaught.
+
+`RJdkFailure.java` was held by another lane in the wave that closed this, so its
+five assertions are recorded here as exact text rather than applied (43 → 48
+checks). They replace the block at `missingClass()`'s *"Same for an absent array
+element type"* comment:
+
+```java
+        // Same for an absent array element type and an absent nested class.
+        threw = false;
+        String arrayMessage = "";
+        try {
+            Class.forName("[L" + absent + ";");
+        } catch (ClassNotFoundException expected) {
+            threw = true;
+            arrayMessage = expected.getMessage();
+        }
+        check(threw, "an array of an absent class must also fail");
+        // L16 - HotSpot never hands an array descriptor to a class loader:
+        // JVMS 5.3.3 creates an array class from its ELEMENT type, so
+        // Class.forName strips the '[' itself and the name that reaches a
+        // loader - and therefore the CNFE message - is the element's.
+        check(absent.equals(arrayMessage),
+                "an array CNFE must name the element, not the descriptor: " + arrayMessage);
+
+        threw = false;
+        arrayMessage = "";
+        try {
+            Class.forName("[[L" + absent + ";");
+        } catch (ClassNotFoundException expected) {
+            threw = true;
+            arrayMessage = expected.getMessage();
+        }
+        check(threw, "a two-dimensional array of an absent class must also fail");
+        check(absent.equals(arrayMessage),
+                "every dimension is stripped before naming the element: " + arrayMessage);
+
+        // The OTHER shape, and the reason the fix went into Class.forName and
+        // not into the loader: ClassLoader.loadClass never resolves an array
+        // form at all, so its CNFE names the descriptor it was given.
+        threw = false;
+        String loaderArrayMessage = "";
+        try {
+            loader.loadClass("[L" + absent + ";");
+        } catch (ClassNotFoundException expected) {
+            threw = true;
+            loaderArrayMessage = expected.getMessage();
+        }
+        check(threw, "ClassLoader.loadClass of an array descriptor must throw");
+        check(("[L" + absent + ";").equals(loaderArrayMessage),
+                "loadClass names the descriptor it was asked for: " + loaderArrayMessage);
+```
 
 ## The inventory
 

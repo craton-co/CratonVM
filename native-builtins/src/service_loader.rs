@@ -373,9 +373,9 @@ pub fn impl_jars_load_class(
     ctx: &mut dyn NativeContext,
     defining_loader: Option<cratonvm_types::ObjectRef>,
     internal_name: &str,
-) -> Option<cratonvm_types::ObjectRef> {
+) -> Result<Option<cratonvm_types::ObjectRef>, MethodCallFailed> {
     let mut visited = std::collections::HashSet::new();
-    impl_jars_load_class_inner(ctx, defining_loader, internal_name, &mut visited)
+    Ok(impl_jars_load_class_inner(ctx, defining_loader, internal_name, &mut visited)?)
 }
 
 fn impl_jars_load_class_inner(
@@ -383,9 +383,9 @@ fn impl_jars_load_class_inner(
     defining_loader: Option<cratonvm_types::ObjectRef>,
     internal_name: &str,
     visited: &mut std::collections::HashSet<String>,
-) -> Option<cratonvm_types::ObjectRef> {
+) -> Result<Option<cratonvm_types::ObjectRef>, MethodCallFailed> {
     if !visited.insert(internal_name.to_owned()) {
-        return None;
+        return Ok(None);
     }
     let dotted = internal_name.replace('/', ".");
     let class_file = format!("{internal_name}.class");
@@ -402,7 +402,7 @@ fn impl_jars_load_class_inner(
         // that exact instance. Creating a fresh EmbeddedImplClassLoader here
         // would split the provider and its dependencies across two namespaces.
         if module_name == "x-content" && defining_loader.is_none() {
-            let app_loader = crate::classloader::get_or_create_app_loader(ctx);
+            let app_loader = crate::classloader::get_or_create_app_loader(ctx)?;
             // GC-safety: `create_string` below can trigger a moving GC;
             // `app_loader` (the shared application-classloader singleton) is
             // reused as an `invoke` argument afterward, unpinned otherwise.
@@ -423,7 +423,7 @@ fn impl_jars_load_class_inner(
                     "(Ljava/lang/String;)Ljava/lang/Class;",
                     &[Value::Object(Some(name_obj))],
                 ) {
-                    return Some(mirror);
+                    return Ok(Some(mirror));
                 }
             }
         }
@@ -474,12 +474,12 @@ fn impl_jars_load_class_inner(
                     if let Some(loader) = defining_loader {
                         crate::classloader::register_defining_loader(ctx.vm_identity(), cid.as_u32(), loader);
                     }
-                    return Some(ctx.get_class_mirror(cid));
+                    return Ok(Some(ctx.get_class_mirror(cid)));
                 }
             }
         }
     }
-    None
+    Ok(None)
 }
 
 /// If the ServiceLoader carries a non-builtin ClassLoader, return it so the
@@ -638,7 +638,7 @@ fn load_provider_class(
     ctx: &mut dyn NativeContext,
     fqn: &str,
     loader: Option<cratonvm_types::ObjectRef>,
-) -> Option<cratonvm_types::ObjectRef> {
+) -> Result<Option<cratonvm_types::ObjectRef>, MethodCallFailed> {
     if let Some(loader_r) = loader {
         // Both create_string calls can collect, so pin the module or custom
         // loader for the entire loadClass/findClass/fallback sequence.
@@ -653,7 +653,7 @@ fn load_provider_class(
         );
         if let Ok(Some(Value::Object(Some(c)))) = load_result {
             ctx.unpin_native_roots(loader_pin);
-            return Some(c);
+            return Ok(Some(c));
         }
         let find_name = ctx.create_string(fqn);
         let loader_r = ctx.read_native_pin(loader_pin, loader_r);
@@ -664,14 +664,14 @@ fn load_provider_class(
             &[Value::Object(Some(find_name))],
         ) {
             ctx.unpin_native_roots(loader_pin);
-            return Some(c);
+            return Ok(Some(c));
         }
         let loader_r = ctx.read_native_pin(loader_pin, loader_r);
         let from_loader_jars =
             load_provider_class_from_loader_jars(ctx, loader_r, &fqn.replace('.', "/"));
         ctx.unpin_native_roots(loader_pin);
         if let Some(c) = from_loader_jars {
-            return Some(c);
+            return Ok(Some(c));
         }
     }
     // No loader, or the loader couldn't resolve it — fall back to the
@@ -683,10 +683,10 @@ fn load_provider_class(
         "(Ljava/lang/String;)Ljava/lang/Class;",
         &[Value::Object(Some(name))],
     ) {
-        return Some(c);
+        return Ok(Some(c));
     }
     // Final fallback: IMPL-JARS nested-JAR scan.
-    impl_jars_load_class(ctx, None, &fqn.replace('.', "/"))
+    Ok(impl_jars_load_class(ctx, None, &fqn.replace('.', "/"))?)
 }
 
 /// Read provider FQNs for `sl.service` from every
@@ -906,10 +906,34 @@ fn discover_providers(
     };
     let loader_is_jboss_module = loader_ref_opt
         .map(|r| {
-            ctx.class_name_of_id(ctx.class_id_of_object(r)).as_deref()
+            ctx.class_name_arc_of_id(ctx.class_id_of_object(r)).as_deref()
                 == Some("org/jboss/modules/ModuleClassLoader")
         })
         .unwrap_or(false);
+
+    // Is the loader-scoped lookup below EXHAUSTIVE for this loader — i.e. may an
+    // empty result be taken at face value?
+    //
+    // The flat classpath scan further down unions the `META-INF/services/<svc>`
+    // descriptors of EVERY jar in the process, with no notion of any one
+    // loader's classpath. For a loader built specifically to hide a jar
+    // (Spring Boot's `ModifiedClassPathClassLoader` under
+    // `@ClassPathExclusions`), that scan re-adds the very provider registration
+    // the exclusion removed, while `loadClass` still refuses the class it names
+    // — so `ServiceLoader` reads a registration it cannot honour and raises
+    // `ServiceConfigurationError: <svc>: Provider <cn> not found` (the
+    // `loaded == 0 && !missing.is_empty()` arm below) where HotSpot simply
+    // discovers no providers.
+    //
+    // `loader_owns_complete_resource_view` is true only when the receiver is a
+    // `URLClassLoader`-family loader whose own URL list CratonVM can enumerate in
+    // full — exactly the condition under which `ucl_find_resources` returns an
+    // authoritative (possibly empty) answer. Every other loader keeps the flat
+    // scan, including one whose URLs were never recorded: there the loader-scoped
+    // lookup could not run at all, and an empty result means nothing.
+    let loader_view_is_exhaustive = loader_ref_opt.is_some_and(|r| {
+        crate::classloader::loader_owns_complete_resource_view(ctx, r) && !loader_is_jboss_module
+    });
 
     let diag_sl = crate::nbflags().diag_serviceloader;
 
@@ -1054,7 +1078,15 @@ fn discover_providers(
                             got = true;
                         }
                     }
-                    if !got {
+                    // Reading the named URL failed, so fall back to resolving its
+                    // entry path against the classpath. For an embedded/synthetic
+                    // loader that is the only way in. For a URLClassLoader whose
+                    // own URLs are known this is a process-wide union under a
+                    // loader-scoped name — the same exclusion leak as the flat
+                    // scan below — and its URLs are ordinary `jar:`/`file:` ones
+                    // the two readers above already handle, so there is nothing
+                    // here for it to recover.
+                    if !got && !loader_view_is_exhaustive {
                         let bytes_list = ctx.find_all_resource_bytes(&entry_path);
                         for bytes in &bytes_list {
                             parse_provider_lines(bytes, &mut providers);
@@ -1196,7 +1228,14 @@ fn discover_providers(
     // Flat classpath scan: providers listed directly at
     // META-INF/services/<svc> on the classpath (normal case for
     // non-embedded loaders and JDK built-in providers).
-    let descriptors = if loader_is_jboss_module {
+    //
+    // Skipped when the loader already answered exhaustively for itself — see
+    // `loader_view_is_exhaustive`. Note this is NOT gated on the loader-scoped
+    // pass having FOUND anything: an empty authoritative answer is the whole
+    // point, and supplementing it here is what leaked an excluded jar's
+    // registration back in.
+    let skip_flat_scan = loader_is_jboss_module || loader_view_is_exhaustive;
+    let descriptors = if skip_flat_scan {
         Vec::new()
     } else {
         ctx.find_all_resource_bytes(&resource)
@@ -1205,7 +1244,7 @@ fn discover_providers(
         parse_provider_lines(bytes, &mut providers);
     }
     // Test mocks may stub `find_resource` without populating the bytes list.
-    if descriptors.is_empty() && !loader_is_jboss_module {
+    if descriptors.is_empty() && !skip_flat_scan {
         if let Some(bytes) = ctx.find_resource(&resource) {
             parse_provider_lines(&bytes, &mut providers);
         }
@@ -1223,9 +1262,25 @@ fn discover_providers(
     // META-INF/services FQNs. Providers that fail to load/instantiate are
     // skipped by the iterator, so a module-declared provider CratonVM cannot
     // construct is harmless.
-    let service_slash = service_name.replace('.', "/");
-    for mp in ctx.service_providers_from_modules(&service_slash) {
-        providers.push(mp.replace('/', "."));
+    //
+    // `service_providers_from_modules` reads ONE VM-global module registry, with
+    // no notion of which loader is asking — the third flavour of the same
+    // exclusion leak. It is also not what a real JVM does here: a modular jar
+    // reached through the CLASS path is an unnamed-module citizen whose
+    // `module-info` the JDK ignores outright, so `ServiceLoader` sees only its
+    // `META-INF/services`. `logback-classic.jar` is exactly that — it declares
+    // `provides SLF4JServiceProvider with LogbackServiceProvider`, and CratonVM
+    // was handing that declaration to a loader built to exclude the jar.
+    //
+    // A loader with its own recorded URL list IS a class-path loader, so skip
+    // the module source for it. Every other caller — notably the null/builtin
+    // loader behind `ToolProvider.getSystemJavaCompiler()`, the case this source
+    // exists for — is untouched.
+    if !loader_view_is_exhaustive {
+        let service_slash = service_name.replace('.', "/");
+        for mp in ctx.service_providers_from_modules(&service_slash) {
+            providers.push(mp.replace('/', "."));
+        }
     }
 
     providers.sort();
@@ -1644,6 +1699,319 @@ fn service_accepts_type(
     }
 }
 
+/// `factoryMethod.toString()` — the exact text `ServiceLoader.fail(service,
+/// factoryMethod + " return type not a subtype")` interpolates, e.g.
+/// `public static java.lang.Object com.example.Bad.provider()`.
+///
+/// Measured against HotSpot 25.0.3.9 rather than inferred; the whole message is
+/// asserted verbatim by `regression-suite/src/RJdkModule.java`'s `Rejected`
+/// service, so a drift here is a red vector rather than a silent divergence.
+///
+/// Falls back to `<fqn>.provider()` when `Method.toString()` cannot be driven.
+/// That keeps the one part a reader has to have — which provider was refused —
+/// without inventing modifiers or a return type this VM did not actually read.
+fn factory_method_display(
+    ctx: &mut dyn NativeContext,
+    method: cratonvm_types::ObjectRef,
+    fqn: &str,
+) -> String {
+    let method_pin = ctx.pin_native_root(method);
+    let method_now = ctx.read_native_pin(method_pin, method);
+    let rendered = match ctx.invoke(
+        "java/lang/reflect/Method",
+        "toString",
+        "()Ljava/lang/String;",
+        &[Value::Object(Some(method_now))],
+    ) {
+        Ok(Some(Value::Object(Some(s)))) => ctx.read_string(s).unwrap_or_default(),
+        _ => String::new(),
+    };
+    ctx.unpin_native_roots(method_pin);
+    if rendered.is_empty() {
+        format!("{fqn}.provider()")
+    } else {
+        rendered
+    }
+}
+
+/// The verdict of `ServiceLoader.loadProvider`'s factory-form subtype gate.
+enum FactoryReturn {
+    /// A legal `provider()`. Carries the return-type mirror, which is what
+    /// `ProviderImpl` records as `type` and what `Provider.type()` answers.
+    /// The reference is UNPINNED — pin it before the next allocation, the same
+    /// contract `factory_return_type` and `load_provider_class` carry.
+    Accepted(cratonvm_types::ObjectRef),
+    /// `getReturnType()` could not be read at all. Historic behaviour is kept
+    /// (treat the provider as legal) for the same reason `service_accepts_type`
+    /// answers `true` on an unreadable `isAssignableFrom`: an interrogation
+    /// this VM cannot drive must never MANUFACTURE a refusal.
+    Unreadable,
+    /// Not a subtype of the service. Carries the `ServiceConfigurationError` to
+    /// raise, or `None` when the error object itself could not be built — the
+    /// contract `service_configuration_error` has always had, where the caller
+    /// drops the provider rather than pretending to have thrown.
+    Rejected(Option<MethodCallFailed>),
+}
+
+/// `ServiceLoader.loadProvider`'s factory-form gate, shared by BOTH provider
+/// paths:
+///
+/// ```text
+/// Class<?> returnType = factoryMethod.getReturnType();
+/// if (!service.isAssignableFrom(returnType))
+///     fail(service, factoryMethod + " return type not a subtype");
+/// ```
+///
+/// It is a function because it has to run in `native_sl_iterator` AND
+/// `native_sl_stream`. It was written inline on the iterator only, and the
+/// `stream()` path computed the return type without ever asking: an illegal
+/// module-declared factory raised from `iterator()` and was handed out by
+/// `stream()` as a `Provider` whose `get()` returns an object of the wrong type
+/// (measured: a `String` for a service interface). Nothing downstream catches
+/// that — `ProviderImpl.invokeFactoryMethod`'s `(S)` cast is erased — so this
+/// gate is the only gate there is. See W7-85-serviceloader-stream-validation.md.
+///
+/// PIN ORDER, which is the delicate part: every step allocates and re-enters
+/// Java, so no `ObjectRef` may be held raw across a call.
+///
+///  * `factory` is re-read through the caller's `factory_pin` before each use;
+///  * the service mirror is fetched with the NON-allocating `sl_service_mirror`
+///    AFTER `factory_return_type` has returned, never held across it;
+///  * the return mirror takes its own pin for the duration of
+///    `isAssignableFrom` and is read back through that pin before the pin
+///    drops, so `Accepted` names the forwarded address, not the pre-GC one;
+///  * `Method.toString()` and `sl_service_name` are driven while the caller's
+///    pins are still standing, i.e. before any of them is released.
+///
+/// The caller's `sl_pin` and `factory_pin` are left exactly as they were found.
+fn factory_return_is_subtype(
+    ctx: &mut dyn NativeContext,
+    sl_pin: usize,
+    sl: cratonvm_types::ObjectRef,
+    factory_pin: usize,
+    factory: cratonvm_types::ObjectRef,
+    fqn: &str,
+) -> FactoryReturn {
+    let factory_now = ctx.read_native_pin(factory_pin, factory);
+    let ret = match factory_return_type(ctx, factory_now) {
+        Some(ret) => ret,
+        None => return FactoryReturn::Unreadable,
+    };
+    let ret_pin = ctx.pin_native_root(ret);
+    let sl_now = ctx.read_native_pin(sl_pin, sl);
+    let ret_now = ctx.read_native_pin(ret_pin, ret);
+    let accepted = match sl_service_mirror(ctx, sl_now) {
+        Some(service) => service_accepts_type(ctx, service, ret_now),
+        // No readable service mirror: there is nothing to compare against, so
+        // keep the historic accept rather than refuse on an unasked question.
+        None => true,
+    };
+    if accepted {
+        let ret_now = ctx.read_native_pin(ret_pin, ret);
+        ctx.unpin_native_roots(ret_pin);
+        return FactoryReturn::Accepted(ret_now);
+    }
+    let factory_now = ctx.read_native_pin(factory_pin, factory);
+    let rendered = factory_method_display(ctx, factory_now, fqn);
+    let sl_now = ctx.read_native_pin(sl_pin, sl);
+    let service_name = sl_service_name(ctx, sl_now);
+    ctx.unpin_native_roots(ret_pin);
+    FactoryReturn::Rejected(service_configuration_error(
+        ctx,
+        &format!("{service_name}: {rendered} return type not a subtype"),
+    ))
+}
+
+/// `String.valueOf(clazz)` — the exact interpolation `ServiceLoader
+/// .loadProvider` performs in `fail(service, clazz + " not a subtype")`.
+///
+/// `Class.toString()` renders `class com.foo.Bar` / `interface com.foo.Bar`,
+/// NOT the bare binary name: the CLASSPATH iterator spells the same refusal
+/// `clazz.getName() + " not a subtype"`, so the JDK's two provider paths really
+/// do print different text for one rule. This helper follows `loadProvider`,
+/// which is the path being mirrored here.
+///
+/// Falls back to the FQN when `Class.toString()` cannot be driven — the one
+/// part a reader has to have is *which* provider was refused, and inventing a
+/// `class `/`interface ` prefix this VM did not read would be a fabrication.
+fn provider_class_display(
+    ctx: &mut dyn NativeContext,
+    class: cratonvm_types::ObjectRef,
+    fqn: &str,
+) -> String {
+    let class_pin = ctx.pin_native_root(class);
+    let class_now = ctx.read_native_pin(class_pin, class);
+    let rendered = match ctx.invoke(
+        "java/lang/Class",
+        "toString",
+        "()Ljava/lang/String;",
+        &[Value::Object(Some(class_now))],
+    ) {
+        Ok(Some(Value::Object(Some(s)))) => ctx.read_string(s).unwrap_or_default(),
+        _ => String::new(),
+    };
+    ctx.unpin_native_roots(class_pin);
+    if rendered.is_empty() {
+        fqn.to_string()
+    } else {
+        rendered
+    }
+}
+
+/// The verdict of `ServiceLoader.loadProvider`'s CONSTRUCTOR-form gates — the
+/// two rules that apply once `findStaticProviderMethod` has answered `null`.
+///
+/// Two states, not [`FactoryReturn`]'s three, and deliberately so: an
+/// interrogation this VM cannot drive is `Accepted`, folded into the same
+/// variant as a genuine pass. That is the same refusal-of-a-refusal
+/// `service_accepts_type` makes when `isAssignableFrom` is unreadable — **a
+/// widening into a throw must never fire on a question that went unanswered.**
+enum ConstructorForm {
+    /// Legal — or unanswerable, which is treated as legal.
+    Accepted,
+    /// One of the two rules is positively broken. `None` when the
+    /// `ServiceConfigurationError` itself could not be built; the caller then
+    /// drops the provider rather than pretending to have thrown, which is the
+    /// contract `service_configuration_error` has always carried.
+    Rejected(Option<MethodCallFailed>),
+}
+
+/// `ServiceLoader.loadProvider`'s constructor-form subtype gate:
+///
+/// ```text
+/// // no factory method so must be a subtype
+/// if (!service.isAssignableFrom(clazz))
+///     fail(service, clazz + " not a subtype");
+/// ```
+///
+/// Absent on BOTH provider paths until now — `W6-2`'s last live row, and the
+/// `none / none` row `W7-85`'s population sweep confirmed independently. It
+/// lands on both paths in one change for the reason that record exists: a guard
+/// installed on one of two siblings is validated by whichever fixture walks the
+/// other one, and reads green forever.
+///
+/// PIN ORDER: identical in shape to [`factory_return_is_subtype`]. `sl` and
+/// `class` are re-read through the caller's pins before *each* use, the service
+/// mirror is fetched with the non-allocating [`sl_service_mirror`] and handed
+/// straight to `service_accepts_type` (which takes its own pins), and the
+/// message is rendered while the caller's pins still stand. The caller's pins
+/// are left exactly as they were found.
+fn constructor_form_is_subtype(
+    ctx: &mut dyn NativeContext,
+    sl_pin: usize,
+    sl: cratonvm_types::ObjectRef,
+    class_pin: usize,
+    class: cratonvm_types::ObjectRef,
+    fqn: &str,
+) -> ConstructorForm {
+    let sl_now = ctx.read_native_pin(sl_pin, sl);
+    let service = match sl_service_mirror(ctx, sl_now) {
+        Some(service) => service,
+        // No readable service mirror: there is nothing to compare against, so
+        // keep the historic accept rather than refuse on an unasked question.
+        None => return ConstructorForm::Accepted,
+    };
+    let class_now = ctx.read_native_pin(class_pin, class);
+    if service_accepts_type(ctx, service, class_now) {
+        return ConstructorForm::Accepted;
+    }
+    let class_now = ctx.read_native_pin(class_pin, class);
+    let rendered = provider_class_display(ctx, class_now, fqn);
+    let sl_now = ctx.read_native_pin(sl_pin, sl);
+    let service_name = sl_service_name(ctx, sl_now);
+    ConstructorForm::Rejected(service_configuration_error(
+        ctx,
+        &format!("{service_name}: {rendered} not a subtype"),
+    ))
+}
+
+/// `Class.getConstructor()` searches **public** members only; this file asks
+/// `getDeclaredConstructor()`. So a provider whose no-arg constructor is
+/// private or package-private was found here, opened by
+/// [`grant_reflective_override`], and handed out — where `loadProvider` refuses
+/// it.
+///
+/// Answers `true` on an unreadable `getModifiers()`, for [`ConstructorForm`]'s
+/// stated reason.
+fn constructor_is_public(
+    ctx: &mut dyn NativeContext,
+    ctor_pin: usize,
+    ctor: cratonvm_types::ObjectRef,
+) -> bool {
+    const ACC_PUBLIC: i32 = 0x0001;
+    let ctor_now = ctx.read_native_pin(ctor_pin, ctor);
+    match ctx.invoke(
+        "java/lang/reflect/Constructor",
+        "getModifiers",
+        "()I",
+        &[Value::Object(Some(ctor_now))],
+    ) {
+        Ok(Some(Value::Int(mods))) => (mods & ACC_PUBLIC) != 0,
+        _ => true,
+    }
+}
+
+/// `ServiceLoader.getConstructor`'s failure:
+///
+/// ```text
+/// try { ctor = clazz.getConstructor(); }
+/// catch (Throwable x) {
+///     fail(service, cn + " Unable to get public no-arg constructor", x);
+/// }
+/// ```
+///
+/// Both illegal shapes arrive here — *no* no-arg constructor and a *non-public*
+/// one — because `getConstructor()` cannot see either, and both arrive carrying
+/// the `NoSuchMethodException` it throws, whose message is `<fqn>.<init>()`.
+///
+/// This is the **three**-argument `fail`, so unlike every other refusal in this
+/// file the error carries a CAUSE. Building it is therefore part of the fix, not
+/// decoration: `RJdkModule` asserts the cause is present, and a cause-less
+/// `ServiceConfigurationError` here would be a second, quieter divergence
+/// standing in for the one being closed. If the `NoSuchMethodException` cannot
+/// be built the cause-less form is raised anyway — losing the cause is better
+/// than losing the refusal.
+fn no_public_no_arg_ctor_error(
+    ctx: &mut dyn NativeContext,
+    sl_pin: usize,
+    sl: cratonvm_types::ObjectRef,
+    fqn: &str,
+) -> Option<MethodCallFailed> {
+    let sl_now = ctx.read_native_pin(sl_pin, sl);
+    let service_name = sl_service_name(ctx, sl_now);
+    let text = format!("{service_name}: {fqn} Unable to get public no-arg constructor");
+
+    let detail = ctx.create_string(&format!("{fqn}.<init>()"));
+    let detail_pin = ctx.pin_native_root(detail);
+    let detail = ctx.read_native_pin(detail_pin, detail);
+    let built_cause = ctx.new_object_initialized(
+        "java/lang/NoSuchMethodException",
+        "(Ljava/lang/String;)V",
+        &[Value::Object(Some(detail))],
+    );
+    ctx.unpin_native_roots(detail_pin);
+    let cause = match built_cause {
+        Ok(Some(Value::Object(Some(c)))) => c,
+        _ => return service_configuration_error(ctx, &text),
+    };
+    let cause_pin = ctx.pin_native_root(cause);
+    let message = ctx.create_string(&text);
+    let message_pin = ctx.pin_native_root(message);
+    let cause = ctx.read_native_pin(cause_pin, cause);
+    let message = ctx.read_native_pin(message_pin, message);
+    let built = ctx.new_object_initialized(
+        "java/util/ServiceConfigurationError",
+        "(Ljava/lang/String;Ljava/lang/Throwable;)V",
+        &[Value::Object(Some(message)), Value::Object(Some(cause))],
+    );
+    // Truncate-to-base: releasing `cause_pin` releases `message_pin` with it.
+    ctx.unpin_native_roots(cause_pin);
+    match built {
+        Ok(Some(Value::Object(Some(error)))) => Some(MethodCallFailed::ExceptionThrown(error)),
+        _ => None,
+    }
+}
+
 /// The JDK's own per-loader instance cache: `ServiceLoader.instantiatedProviders`.
 ///
 /// `initialize_real_service_loader_fields` allocates this list and
@@ -1802,7 +2170,7 @@ fn native_sl_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         // Bound outside the `match` so the shared borrow of `fqn` cannot outlive
         // the call into the arms, where `fqn` is moved into `missing`.
         let resolved = load_provider_class(ctx, &fqn, loader_cur);
-        let class = match resolved {
+        let class = match resolved? {
             Some(c) => c,
             None => {
                 if diag {
@@ -1827,36 +2195,18 @@ fn native_sl_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
                 let factory_pin = ctx.pin_native_root(factory);
                 // The JDK fails the load when the factory's return type is not a
                 // subtype of the service; a provider it may not legally hand out
-                // must not be quietly dropped instead.
+                // must not be quietly dropped instead. `native_sl_stream` runs
+                // the SAME call — see `factory_return_is_subtype`, which owns
+                // the pin order both paths depend on.
                 //
-                // Order matters: `factory_return_type` allocates, so the service
-                // mirror is read AFTER it (via the non-allocating
-                // `sl_service_mirror`) rather than being held across that call.
-                let factory_now = ctx.read_native_pin(factory_pin, factory);
-                let subtype_ok = match factory_return_type(ctx, factory_now) {
-                    Some(ret) => {
-                        let ret_pin = ctx.pin_native_root(ret);
-                        let sl_now = ctx.read_native_pin(sl_pin, sl);
-                        let ret_now = ctx.read_native_pin(ret_pin, ret);
-                        let ok = match sl_service_mirror(ctx, sl_now) {
-                            Some(service) => service_accepts_type(ctx, service, ret_now),
-                            None => true,
-                        };
-                        ctx.unpin_native_roots(ret_pin);
-                        ok
-                    }
-                    None => true,
-                };
-                if !subtype_ok {
+                // The error is built INSIDE that call, while `class_pin` and
+                // `factory_pin` are still standing, because rendering the
+                // message drives `Method.toString()`.
+                if let FactoryReturn::Rejected(error) =
+                    factory_return_is_subtype(ctx, sl_pin, sl, factory_pin, factory, &fqn)
+                {
                     ctx.unpin_native_roots(class_pin);
-                    let sl_now = ctx.read_native_pin(sl_pin, sl);
-                    let service_name = sl_service_name(ctx, sl_now);
-                    if let Some(error) = service_configuration_error(
-                        ctx,
-                        &format!(
-                            "{service_name}: provider() of {fqn} returns a type that is not a subtype"
-                        ),
-                    ) {
+                    if let Some(error) = error {
                         ctx.unpin_native_roots(sl_pin);
                         return Err(error);
                     }
@@ -1884,25 +2234,44 @@ fn native_sl_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
                         Value::Object(Some(empty_args)),
                     ],
                 );
-                ctx.unpin_native_roots(class_pin);
                 let inst = match invoked {
-                    Ok(Some(Value::Object(Some(o)))) => o,
+                    Ok(Some(Value::Object(Some(o)))) => {
+                        ctx.unpin_native_roots(class_pin);
+                        o
+                    }
                     // `ProviderImpl.invokeFactoryMethod` fails the load on a null
                     // return. Skipping the provider here would be a fabricated
                     // success for a configuration the spec rejects.
+                    //
+                    // The `stream()` path reports this through the REAL
+                    // `ProviderImpl.invokeFactoryMethod` bytecode at
+                    // `Provider.get()`, so it already carried the JDK's exact
+                    // wording. Render the same text here — the two paths
+                    // disagreeing about the message for the same provider is
+                    // the smaller sibling of the defect this whole record is
+                    // about, and `RJdkModule` now asserts they are equal.
+                    // `factory_pin` still stands at this point on purpose:
+                    // `Method.toString()` is an allocating invoke and
+                    // `class_pin` (taken first) would take it down with it.
                     Ok(_) => {
+                        let factory_now = ctx.read_native_pin(factory_pin, factory);
+                        let rendered = factory_method_display(ctx, factory_now, &fqn);
+                        ctx.unpin_native_roots(class_pin);
                         let sl_now = ctx.read_native_pin(sl_pin, sl);
                         let service_name = sl_service_name(ctx, sl_now);
                         if let Some(error) = service_configuration_error(
                             ctx,
-                            &format!("{service_name}: provider() of {fqn} returned null"),
+                            &format!("{service_name}: {rendered} returned null"),
                         ) {
                             ctx.unpin_native_roots(sl_pin);
                             return Err(error);
                         }
                         continue;
                     }
-                    Err(failure) => return Err(provider_construction_error(ctx, &fqn, failure)),
+                    Err(failure) => {
+                        ctx.unpin_native_roots(class_pin);
+                        return Err(provider_construction_error(ctx, &fqn, failure));
+                    }
                 };
                 list = ctx.read_native_pin(list_pin, list);
                 let inst_pin = ctx.pin_native_root(inst);
@@ -1923,6 +2292,36 @@ fn native_sl_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         }
         if built_via_factory {
             continue;
+        }
+
+        // --- JPMS constructor form -------------------------------------------
+        // Once `findStaticProviderMethod` has answered null, `loadProvider`
+        // applies two more rules before it constructs anything:
+        //
+        //     if (!service.isAssignableFrom(clazz))
+        //         fail(service, clazz + " not a subtype");
+        //     ctor = clazz.getConstructor();   // PUBLIC no-arg, or fail
+        //
+        // Neither was enforced on EITHER provider path — W6-2's last live row
+        // and the sibling W7-85's sweep found beside it. Both are gated on
+        // `module_declared` for the same reason the factory block above is:
+        // this is `loadProvider`, which serves the MODULE path. The classpath
+        // iterator (`LazyClassPathLookupIterator`) carries its own spelling of
+        // both rules and that copy stays unarmed — arming it would change
+        // Spring/Tomcat/Elasticsearch/WildFly boot, which walks hundreds of
+        // classpath providers and none module-declared.
+        let provider_is_module_declared = module_declared.iter().any(|m| m == &fqn);
+        if provider_is_module_declared {
+            if let ConstructorForm::Rejected(error) =
+                constructor_form_is_subtype(ctx, sl_pin, sl, class_pin, class, &fqn)
+            {
+                ctx.unpin_native_roots(class_pin);
+                if let Some(error) = error {
+                    ctx.unpin_native_roots(sl_pin);
+                    return Err(error);
+                }
+                continue;
+            }
         }
 
         let empty_types = ctx.new_ref_array(
@@ -1955,6 +2354,15 @@ fn native_sl_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
                 if diag {
                     eprintln!("[SL-DBG]   skip (no zero-arg ctor): {fqn}");
                 }
+                // For a module-declared provider `getConstructor()` THROWING is
+                // not a skip — `loadProvider` fails the whole load. A classpath
+                // provider keeps the historic silent skip.
+                if provider_is_module_declared {
+                    if let Some(error) = no_public_no_arg_ctor_error(ctx, sl_pin, sl, &fqn) {
+                        ctx.unpin_native_roots(sl_pin);
+                        return Err(error);
+                    }
+                }
                 continue;
             }
         };
@@ -1971,6 +2379,20 @@ fn native_sl_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         // itself was fixed — the Constructor object created there was fine;
         // it went stale HERE, one call site later).
         let ctor_pin = ctx.pin_native_root(ctor);
+        // `getConstructor()` is public-only and this file asked
+        // `getDeclaredConstructor()`, so a NON-public no-arg constructor got
+        // this far, was opened by `grant_reflective_override` below, and was
+        // handed out. `loadProvider` refuses it with the same error the absent
+        // case raises, because the JDK cannot tell the two apart: both are
+        // `getConstructor()` throwing `NoSuchMethodException`.
+        if provider_is_module_declared && !constructor_is_public(ctx, ctor_pin, ctor) {
+            ctx.unpin_native_roots(ctor_pin);
+            if let Some(error) = no_public_no_arg_ctor_error(ctx, sl_pin, sl, &fqn) {
+                ctx.unpin_native_roots(sl_pin);
+                return Err(error);
+            }
+            continue;
+        }
         // setAccessible(true). For a module-declared provider the constructor
         // lives in a package the module may neither export nor open, and the
         // caller-sensitive `setAccessible` invoke is REFUSED here (its result was
@@ -2315,7 +2737,7 @@ fn native_sl_stream(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
         // Class.forName(fqn) uses the flat classpath and won't find the class.
         // Pass the loader so load_provider_class can fall back to loadClass.
         let loader_cur = sl_non_builtin_loader(ctx, sl_cur);
-        let type_class = match load_provider_class(ctx, fqn, loader_cur) {
+        let type_class = match load_provider_class(ctx, fqn, loader_cur)? {
             Some(c) => c,
             None => {
                 if diag {
@@ -2347,20 +2769,71 @@ fn native_sl_stream(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
             let type_now = ctx.read_native_pin(type_pin, type_class);
             if let Some(method) = provider_factory_method(ctx, type_now) {
                 let method_pin = ctx.pin_native_root(method);
-                let method_now = ctx.read_native_pin(method_pin, method);
-                // Caller-insensitive `setAccessible(true)` so the real
-                // `ProviderImpl.invokeFactoryMethod` bytecode can call it —
-                // see `grant_reflective_override`.
-                grant_reflective_override(ctx, method_now);
-                let method_now = ctx.read_native_pin(method_pin, method);
-                match factory_return_type(ctx, method_now) {
-                    Some(ret) => {
+                // W7-85: the same `!service.isAssignableFrom(returnType)` gate
+                // `native_sl_iterator` applies. It was absent here and nowhere
+                // else, so an illegal module-declared factory raised
+                // `ServiceConfigurationError` from `iterator()` and was quietly
+                // handed out by `stream()` — a `Provider` whose `type()` is the
+                // wrong class and whose `get()` returns an object that is not
+                // of the service type. Nothing downstream catches that: the
+                // `(S)` cast in `ProviderImpl.invokeFactoryMethod` is erased.
+                match factory_return_is_subtype(ctx, sl_pin, sl, method_pin, method, fqn) {
+                    FactoryReturn::Accepted(ret) => {
                         let ret_pin = ctx.pin_native_root(ret);
+                        // Caller-insensitive `setAccessible(true)` so the real
+                        // `ProviderImpl.invokeFactoryMethod` bytecode can call
+                        // it — see `grant_reflective_override`. Granted only
+                        // once the return type is ACCEPTED: opening a factory
+                        // this loader is about to refuse would leave a door
+                        // ajar for a caller that must never exist.
+                        let method_now = ctx.read_native_pin(method_pin, method);
+                        grant_reflective_override(ctx, method_now);
                         factory = Some((method_pin, method, ret_pin, ret));
                     }
                     // Unreadable return type: fall back to the constructor
                     // flavour rather than build a half-formed wrapper.
-                    None => ctx.unpin_native_roots(method_pin),
+                    FactoryReturn::Unreadable => ctx.unpin_native_roots(method_pin),
+                    FactoryReturn::Rejected(error) => {
+                        // `type_pin` is this iteration's first pin, so
+                        // truncating to it also releases `method_pin` and
+                        // anything the gate took after it.
+                        ctx.unpin_native_roots(type_pin);
+                        match error {
+                            Some(error) => {
+                                ctx.unpin_native_roots(sl_pin);
+                                return Err(error);
+                            }
+                            // The error object itself could not be built. Drop
+                            // the provider rather than hand it out — handing it
+                            // out is the one outcome this gate exists to stop.
+                            None => continue,
+                        }
+                    }
+                }
+            }
+        }
+
+        // --- JPMS constructor form -------------------------------------------
+        // The two rules `native_sl_iterator` now applies once the factory form
+        // is out of the picture: `!service.isAssignableFrom(clazz)` and the
+        // PUBLIC no-arg constructor. They land on both provider paths in one
+        // change on purpose — installing a validation on one of two siblings,
+        // and letting a fixture that only ever walks the other one call it
+        // covered, is the defect W7-85 exists to document.
+        let provider_is_module_declared = module_declared.iter().any(|m| m == fqn);
+        if factory.is_none() && provider_is_module_declared {
+            if let ConstructorForm::Rejected(error) =
+                constructor_form_is_subtype(ctx, sl_pin, sl, type_pin, type_class, fqn)
+            {
+                // `type_pin` is this iteration's first pin, so truncating to it
+                // releases everything this iteration has taken.
+                ctx.unpin_native_roots(type_pin);
+                match error {
+                    Some(error) => {
+                        ctx.unpin_native_roots(sl_pin);
+                        return Err(error);
+                    }
+                    None => continue,
                 }
             }
         }
@@ -2395,11 +2868,32 @@ fn native_sl_stream(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
                     }
                     // Release this iteration's pins, keep sl + list.
                     ctx.unpin_native_roots(type_pin);
+                    // Same rule as `native_sl_iterator`: for a module-declared
+                    // provider this is `getConstructor()` throwing, which
+                    // `loadProvider` turns into a failed load, not a skip.
+                    if provider_is_module_declared {
+                        if let Some(error) = no_public_no_arg_ctor_error(ctx, sl_pin, sl, fqn) {
+                            ctx.unpin_native_roots(sl_pin);
+                            return Err(error);
+                        }
+                    }
                     continue;
                 }
             };
             ctx.unpin_native_roots(empty_types_pin);
             let ctor_pin = ctx.pin_native_root(ctor);
+            // A non-public no-arg constructor is invisible to
+            // `Class.getConstructor()`, so the JDK never reaches it; this file
+            // asked `getDeclaredConstructor()` and then opened it below.
+            if provider_is_module_declared && !constructor_is_public(ctx, ctor_pin, ctor) {
+                // `type_pin` precedes `ctor_pin`; truncating to it takes both.
+                ctx.unpin_native_roots(type_pin);
+                if let Some(error) = no_public_no_arg_ctor_error(ctx, sl_pin, sl, fqn) {
+                    ctx.unpin_native_roots(sl_pin);
+                    return Err(error);
+                }
+                continue;
+            }
             // setAccessible(true) so ProviderImpl.get()'s reflective newInstance
             // succeeds for non-public providers. A module-declared provider's
             // package may be neither exported nor opened, and the
@@ -3030,7 +3524,7 @@ fn drain_real_spliterator(
         );
     }
     let spl_pin = ctx.pin_native_root(spliterator);
-    let collector = crate::alloc_concurrent_synthetic(ctx, STREAM_COLLECTOR_CLASS, 2);
+    let collector = crate::try_alloc_concurrent_synthetic(ctx, STREAM_COLLECTOR_CLASS, 2)?;
     let col_pin = ctx.pin_native_root(collector);
     let initial = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 16);
     let initial_pin = ctx.pin_native_root(initial);
@@ -3378,6 +3872,150 @@ mod tests {
         let bytes = read_jar_url_entry(&synthetic_linux_url).unwrap();
         assert_eq!(bytes, b"com.acme.Provider\n");
     }
+    /// Build a `ModifiedClassPathClassLoader`-shaped receiver: a
+    /// `URLClassLoader` SUBCLASS (so it is not a builtin loader) whose own URL
+    /// list is a single directory — recorded, and deliberately not holding the
+    /// service descriptor.
+    fn modified_classpath_loader(
+        ctx: &mut crate::test_utils::MockNativeContext,
+        own_dir: &std::path::Path,
+    ) -> cratonvm_types::ObjectRef {
+        let url_cid = ctx
+            .ensure_class_initialized("java/net/URLClassLoader")
+            .expect("URLClassLoader class");
+        let mcpcl_cid = ctx
+            .ensure_class_initialized(
+                "org/springframework/boot/testsupport/classpath/ModifiedClassPathClassLoader",
+            )
+            .expect("ModifiedClassPathClassLoader class");
+        ctx.set_superclass(mcpcl_cid, url_cid);
+        // The mock resolves field names off an exact-class-name table, so a
+        // SUBCLASS of URLClassLoader needs its inherited `ucp` declared or
+        // `set_field_by_name` silently no-ops and the fixture would present a
+        // loader with no URLs at all.
+        ctx.set_declared_fields(
+            mcpcl_cid,
+            vec![cratonvm_native_api::FieldMetadata {
+                name: "ucp".to_string(),
+                descriptor: "Ljdk/internal/loader/URLClassPath;".to_string(),
+                access_flags: 0,
+                slot_index: 0,
+                declaring_class_id: mcpcl_cid,
+                is_static: false,
+            }],
+        );
+        let mut new_ref = |ctx: &mut crate::test_utils::MockNativeContext, name: &str| match ctx
+            .new_object(name)
+            .unwrap()
+        {
+            Some(Value::Object(Some(obj))) => obj,
+            other => panic!("expected {name} object, got {other:?}"),
+        };
+        let loader = new_ref(
+            ctx,
+            "org/springframework/boot/testsupport/classpath/ModifiedClassPathClassLoader",
+        );
+        let ucp = new_ref(ctx, "jdk/internal/loader/URLClassPath");
+        let url = new_ref(ctx, "java/net/URL");
+        let path = ctx.create_string(&own_dir.to_string_lossy());
+        ctx.set_field(url, 3, Value::Object(Some(path)));
+        ctx.set_field_by_name(loader, "ucp", Value::Object(Some(ucp)));
+        let urls = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 1);
+        ctx.set_array_element(urls, 0, Value::Object(Some(url)));
+        ctx.set_field(ucp, crate::classloader::UCP_STASHED_URLS, Value::Object(Some(urls)));
+        loader
+    }
+
+    fn service_loader_for(
+        ctx: &mut crate::test_utils::MockNativeContext,
+        service: &str,
+        loader: Value,
+    ) -> cratonvm_types::ObjectRef {
+        let service_id = ctx
+            .ensure_class_initialized(service)
+            .expect("create service class");
+        let service_mirror = ctx.get_class_mirror(service_id);
+        match build_service_loader(ctx, Value::Object(Some(service_mirror)), loader)
+            .expect("build ServiceLoader")
+        {
+            Some(Value::Object(Some(sl))) => sl,
+            other => panic!("expected ServiceLoader object, got {other:?}"),
+        }
+    }
+
+    /// The flat classpath scan must not re-add a provider registration that the
+    /// receiver's own (exclusion-filtered) URL list does not carry.
+    ///
+    /// This is the `@ClassPathExclusions` leak: the descriptor came back from a
+    /// process-wide scan, `loadClass` then correctly refused the class it named,
+    /// and `ServiceLoader` raised `ServiceConfigurationError: ... Provider ...
+    /// not found` where HotSpot discovers no providers at all.
+    #[test]
+    fn discover_providers_skips_flat_scan_for_a_loader_with_its_own_urls() {
+        const SVC: &str = "org.slf4j.spi.SLF4JServiceProvider";
+        let resource = format!("META-INF/services/{SVC}");
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        let mut ctx = mock_ctx();
+        // The process-wide classpath DOES carry the descriptor — without this
+        // the assertion below could not fail even if the scan still ran.
+        ctx.set_resource(
+            &resource,
+            b"ch.qos.logback.classic.spi.LogbackServiceProvider\n".to_vec(),
+        );
+        // `logback-classic.jar` also DECLARES this provider in its `module-info`.
+        // On a real JVM that declaration is invisible to a class-path loader; the
+        // VM-global module registry offered it to every caller, so the same
+        // provider leaked back through a second door after the flat scan closed.
+        ctx.set_module_providers(
+            "org/slf4j/spi/SLF4JServiceProvider",
+            vec!["ch/qos/logback/classic/spi/LogbackServiceProvider"],
+        );
+
+        let loader = modified_classpath_loader(&mut ctx, dir.path());
+        assert!(
+            crate::classloader::object_extends(&ctx, loader, "java/net/URLClassLoader"),
+            "fixture loader must extend URLClassLoader"
+        );
+        assert!(
+            crate::classloader::loader_owns_complete_resource_view(&ctx, loader),
+            "fixture must present a URLClassLoader-family loader with recorded URLs"
+        );
+        let sl = service_loader_for(&mut ctx, "org/slf4j/spi/SLF4JServiceProvider", Value::Object(Some(loader)));
+        // `discover_providers` reads the named `loader` field, then legacy slot 1.
+        assert!(
+            matches!(ctx.get_field_by_name(sl, "loader"), Value::Object(Some(_)))
+                || matches!(ctx.get_field(sl, 1), Value::Object(Some(_))),
+            "fixture must put the loader where discover_providers reads it"
+        );
+
+        let providers = discover_providers(&mut ctx, sl).expect("discover providers");
+        assert!(
+            providers.is_empty(),
+            "a loader whose own URL list excludes the jar must discover no \
+             providers from it; got {providers:?}"
+        );
+    }
+
+    /// Control for the test above: with no loader to answer for itself, the flat
+    /// classpath scan is still the discovery mechanism.
+    #[test]
+    fn discover_providers_keeps_flat_scan_without_a_scoped_loader() {
+        const SVC: &str = "com.acme.Service";
+        let resource = format!("META-INF/services/{SVC}");
+
+        let mut ctx = mock_ctx();
+        ctx.set_resource(&resource, b"com.acme.Provider\n".to_vec());
+        let sl = service_loader_for(&mut ctx, "com/acme/Service", Value::Object(None));
+
+        let providers = discover_providers(&mut ctx, sl).expect("discover providers");
+        assert_eq!(
+            providers,
+            vec!["com.acme.Provider"],
+            "the flat classpath scan must still serve loaders CratonVM has no URL view of"
+        );
+    }
+
     #[test]
     fn discover_providers_includes_jpms_module_provides_entries() {
         let mut ctx = mock_ctx();

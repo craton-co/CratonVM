@@ -44,7 +44,7 @@ pub const ACC_MANDATED: u16 = 0x8000;
 // ---------------------------------------------------------------------------
 
 /// A single `requires` directive in a module declaration.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ModuleRequiresEntry {
     /// Binary module name, e.g. `"java.base"`.
     pub module_name: String,
@@ -53,15 +53,49 @@ pub struct ModuleRequiresEntry {
     pub is_transitive: bool,
     /// True if this is `requires static` — dependency is compile-time only.
     pub is_static: bool,
+    /// True if `ACC_SYNTHETIC` (0x1000) is set on the directive — the class-file
+    /// spelling of `Requires.Modifier.SYNTHETIC`.
+    pub is_synthetic: bool,
+    /// True if `ACC_MANDATED` (0x8000) is set — `Requires.Modifier.MANDATED`.
+    ///
+    /// This is the one modifier bit that really occurs in the wild. Scanning
+    /// JDK 25's own module declarations (`javap -v --module <m> module-info`,
+    /// grepping the `Module:` section for `ACC_MANDATED`/`ACC_SYNTHETIC` across
+    /// java.base, java.desktop, java.logging, java.sql and jdk.jfr) finds it on
+    /// **`requires java.base`, in every module, and nowhere else** — zero hits
+    /// on any `exports` or `opens` directive. So dropping it here is the loss
+    /// that visibly disagrees with HotSpot: there `java.base`'s
+    /// `Requires.modifiers()` is `[MANDATED]`, and it was `[]` here.
+    pub is_mandated: bool,
+    /// The `requires_version` string recorded by the producer, if any
+    /// (`requires_version_index != 0`).
+    ///
+    /// Raw, unparsed text — which is precisely what
+    /// `Requires.rawCompiledVersion()` answers; `Requires.compiledVersion()`
+    /// is the same text through `ModuleDescriptor.Version.parse`. The index was
+    /// previously discarded at parse time, leaving both accessors with no data
+    /// source anywhere in the VM.
+    pub compiled_version: Option<String>,
 }
 
 /// A single `exports` directive.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ModuleExportsEntry {
     /// Exported package in slash format, e.g. `"java/lang"`.
     pub package_name: String,
     /// Qualified targets.  Empty ⇒ unqualified (exported to all modules).
     pub to_modules: Vec<String>,
+    /// `ACC_SYNTHETIC` on the directive — `Exports.Modifier.SYNTHETIC`.
+    ///
+    /// No JDK 25 module declaration sets this or [`is_mandated`](Self::is_mandated)
+    /// on an `exports` (see `ModuleRequiresEntry::is_mandated` for the scan), so
+    /// an empty `Exports.modifiers()` is the right answer for every `javac`- or
+    /// `jlink`-emitted directive. It is parsed anyway so that the empty set is a
+    /// *measured* zero rather than a hardcoded one: a producer that does set the
+    /// bit is now representable instead of silently flattened.
+    pub is_synthetic: bool,
+    /// `ACC_MANDATED` on the directive — `Exports.Modifier.MANDATED`.
+    pub is_mandated: bool,
 }
 
 impl ModuleExportsEntry {
@@ -72,12 +106,17 @@ impl ModuleExportsEntry {
 }
 
 /// A single `opens` directive.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ModuleOpensEntry {
     /// Opened package in slash format.
     pub package_name: String,
     /// Qualified targets.  Empty ⇒ unqualified open.
     pub to_modules: Vec<String>,
+    /// `ACC_SYNTHETIC` on the directive — `Opens.Modifier.SYNTHETIC`. Same
+    /// measured-zero rationale as [`ModuleExportsEntry::is_synthetic`].
+    pub is_synthetic: bool,
+    /// `ACC_MANDATED` on the directive — `Opens.Modifier.MANDATED`.
+    pub is_mandated: bool,
 }
 
 impl ModuleOpensEntry {
@@ -170,6 +209,43 @@ pub const UNNAMED_MODULE: &str = "";
 
 /// The `java.base` module — every named module implicitly reads it.
 pub const JAVA_BASE: &str = "java.base";
+
+/// The literal target token `--add-exports`/`--add-opens` accept to mean "every
+/// *unnamed* module".
+///
+/// It is deliberately NOT the same thing as an unqualified edge, and the
+/// distinction is observable: `--add-opens java.base/java.net=ALL-UNNAMED`
+/// leaves `Module.isOpen("java.net")` answering **false** on HotSpot, because
+/// the package is open to the unnamed module rather than to everyone. The
+/// launcher used to fold `ALL-UNNAMED` into the empty string on the way in, and
+/// the empty string is [`add_opens`](ModuleRegistry::add_opens)' unqualified
+/// marker, so the flag over-granted: it reached named modules too, and
+/// `isOpen(pkg)` answered true.
+///
+/// That is the same conflation, one layer up, that
+/// `UNRESOLVED_TARGET_MODULE` (native-builtins) already fixed for the
+/// `Module.addOpens(String, Module)` path after it broke
+/// `AotIntegrationTests#endToEndTestsForBeanOverrides`. [`add_opens`] and
+/// [`add_exports`](ModuleRegistry::add_exports) resolve this token to
+/// [`UNNAMED_MODULE`] as a *qualified* target, which grants exactly the
+/// classpath's unnamed module and nobody else.
+pub const ALL_UNNAMED_TARGET: &str = "ALL-UNNAMED";
+
+/// Resolve a raw dynamic-edge target string into the stored
+/// [`DynamicExport::to_module`].
+///
+/// * `""`             → `None`, genuinely unqualified (`opens p;`).
+/// * `"ALL-UNNAMED"`  → `Some("")`, qualified to the unnamed module only.
+/// * anything else    → `Some(name)`, qualified to that named module.
+fn resolve_edge_target(target: &str) -> Option<String> {
+    if target.is_empty() {
+        None
+    } else if target == ALL_UNNAMED_TARGET {
+        Some(UNNAMED_MODULE.to_string())
+    } else {
+        Some(target.to_string())
+    }
+}
 
 /// A dynamic export or open edge added at runtime via `Module.addExports()`,
 /// `Module.addOpens()`, or CLI `--add-exports`/`--add-opens`.
@@ -523,7 +599,7 @@ impl ModuleRegistry {
     ///   java.logging.canRead(unnamed)      = true
     /// ```
     ///
-    /// (`regression-suite/src/RJdkModule.java:114`,
+    /// (`regression-suite/src/RJdkModule.java:124`,
     /// `check(!svc.canRead(unnamed), "a named module must NOT implicitly read
     /// the unnamed module")`, failed in BOTH `--real-jdk` and `--jdk-only` on
     /// the symmetric rule.)
@@ -714,7 +790,8 @@ impl ModuleRegistry {
     }
 
     /// Add a dynamic export: `module_name` now exports `pkg` to `target`
-    /// (empty `target` = unqualified, to all modules).
+    /// (empty `target` = unqualified, to all modules;
+    /// [`ALL_UNNAMED_TARGET`] = the unnamed module only).
     ///
     /// Backing store for `java.lang.Module.addExports()` and `--add-exports`.
     pub fn add_exports(&mut self, module_name: &str, pkg: &str, target: &str) {
@@ -723,16 +800,13 @@ impl ModuleRegistry {
             .or_default()
             .push(DynamicExport {
                 package: pkg.to_string(),
-                to_module: if target.is_empty() {
-                    None
-                } else {
-                    Some(target.to_string())
-                },
+                to_module: resolve_edge_target(target),
             });
     }
 
     /// Add a dynamic open: `module_name` now opens `pkg` to `target`
-    /// (empty `target` = unqualified, to all modules).
+    /// (empty `target` = unqualified, to all modules;
+    /// [`ALL_UNNAMED_TARGET`] = the unnamed module only).
     ///
     /// Backing store for `java.lang.Module.addOpens()` and `--add-opens`.
     pub fn add_opens(&mut self, module_name: &str, pkg: &str, target: &str) {
@@ -741,11 +815,7 @@ impl ModuleRegistry {
             .or_default()
             .push(DynamicExport {
                 package: pkg.to_string(),
-                to_module: if target.is_empty() {
-                    None
-                } else {
-                    Some(target.to_string())
-                },
+                to_module: resolve_edge_target(target),
             });
     }
 
@@ -1017,7 +1087,7 @@ impl ModuleRegistry {
     ///
     /// # This function is NOT the reflection gate
     ///
-    /// `RJdkModule.java:172` (a public no-arg constructor on a public class in
+    /// `RJdkModule.java:182` (a public no-arg constructor on a public class in
     /// the one package the module neither exports nor opens must be refused
     /// with `IllegalAccessException`) does **not** route through here.
     /// `Constructor.newInstance` is served by
@@ -1165,6 +1235,12 @@ pub fn descriptor_from_module_attribute(
 
     let is_open = (flags & ACC_MODULE_OPEN) != 0;
 
+    // Every directive's flag word and the `requires` version index are carried
+    // through here. They used to be dropped on the floor, which is what left
+    // `Requires.modifiers()`, `Exports.modifiers()`, `Opens.modifiers()` and
+    // `Requires.{compiledVersion,rawCompiledVersion}()` with no data source
+    // anywhere in the VM — the Java mirror could only fabricate an empty answer
+    // because nothing upstream had kept the bits to answer with.
     let requires: Vec<ModuleRequiresEntry> = requires_raw
         .iter()
         .filter_map(|r| {
@@ -1173,6 +1249,17 @@ pub fn descriptor_from_module_attribute(
                 module_name,
                 is_transitive: (r.requires_flags & ACC_REQUIRES_TRANSITIVE) != 0,
                 is_static: (r.requires_flags & ACC_REQUIRES_STATIC) != 0,
+                is_synthetic: (r.requires_flags & ACC_SYNTHETIC) != 0,
+                is_mandated: (r.requires_flags & ACC_MANDATED) != 0,
+                // `requires_version_index` is a plain Utf8 index (JVMS §4.7.25),
+                // NOT one of the CONSTANT_Module/Package indirections the
+                // `resolve_name` helper above exists for, so it is read
+                // directly. 0 means "no version recorded".
+                compiled_version: if r.requires_version_index != 0 {
+                    cp.get_utf8(r.requires_version_index).map(|s| s.to_string())
+                } else {
+                    None
+                },
             })
         })
         .collect();
@@ -1189,6 +1276,8 @@ pub fn descriptor_from_module_attribute(
             Some(ModuleExportsEntry {
                 package_name,
                 to_modules,
+                is_synthetic: (e.exports_flags & ACC_SYNTHETIC) != 0,
+                is_mandated: (e.exports_flags & ACC_MANDATED) != 0,
             })
         })
         .collect();
@@ -1205,6 +1294,8 @@ pub fn descriptor_from_module_attribute(
             Some(ModuleOpensEntry {
                 package_name,
                 to_modules,
+                is_synthetic: (o.opens_flags & ACC_SYNTHETIC) != 0,
+                is_mandated: (o.opens_flags & ACC_MANDATED) != 0,
             })
         })
         .collect();
@@ -1646,7 +1737,7 @@ mod tests {
     /// UNNAMED_MODULE`, making the rule symmetric where JPMS makes it
     /// directional. Measured on HotSpot 25: `unnamed.canRead(java.logging)` is
     /// `true`, `java.logging.canRead(unnamed)` is `false`.
-    /// `regression-suite/src/RJdkModule.java:114` asserts exactly that and
+    /// `regression-suite/src/RJdkModule.java:124` asserts exactly that and
     /// failed in both `--real-jdk` and `--jdk-only`.
     #[test]
     fn named_module_does_not_implicitly_read_the_unnamed_module() {
@@ -1714,6 +1805,7 @@ mod tests {
             module_name: "modB".to_string(),
             is_transitive: false,
             is_static: false,
+            ..Default::default()
         });
         let desc_b = sample_desc("modB");
 
@@ -1734,6 +1826,7 @@ mod tests {
             module_name: "modB".to_string(),
             is_transitive: true,
             is_static: false,
+            ..Default::default()
         });
 
         let mut desc_c = sample_desc("modC");
@@ -1741,6 +1834,7 @@ mod tests {
             module_name: "modA".to_string(),
             is_transitive: false,
             is_static: false,
+            ..Default::default()
         });
 
         let mut reg = ModuleRegistry::new();
@@ -1771,6 +1865,7 @@ mod tests {
         desc.exports.push(ModuleExportsEntry {
             package_name: "com/foo".to_string(),
             to_modules: vec![],
+            ..Default::default()
         });
         assert!(desc.exports_package_to("com/foo", "modB"));
         assert!(desc.exports_package_to("com/foo", "modC"));
@@ -1783,6 +1878,7 @@ mod tests {
         desc.exports.push(ModuleExportsEntry {
             package_name: "com/foo".to_string(),
             to_modules: vec!["modB".to_string()],
+            ..Default::default()
         });
         assert!(desc.exports_package_to("com/foo", "modB"));
         assert!(!desc.exports_package_to("com/foo", "modC"));
@@ -1855,12 +1951,14 @@ mod tests {
             module_name: "modC".to_string(),
             is_transitive: true,
             is_static: false,
+            ..Default::default()
         });
         let mut desc_c = sample_desc("modC");
         desc_c.requires.push(ModuleRequiresEntry {
             module_name: "modD".to_string(),
             is_transitive: true,
             is_static: false,
+            ..Default::default()
         });
 
         let mut reg = ModuleRegistry::new();
@@ -1890,12 +1988,14 @@ mod tests {
             module_name: "modC".to_string(),
             is_transitive: true,
             is_static: false,
+            ..Default::default()
         });
         let mut desc_c = sample_desc("modC");
         desc_c.requires.push(ModuleRequiresEntry {
             module_name: "modB".to_string(),
             is_transitive: true,
             is_static: false,
+            ..Default::default()
         });
 
         let mut reg = ModuleRegistry::new();
@@ -1918,6 +2018,7 @@ mod tests {
             module_name: "modC".to_string(),
             is_transitive: true,
             is_static: true, // transitive + static → still compile-time only
+            ..Default::default()
         });
 
         let mut reg = ModuleRegistry::new();
@@ -1977,6 +2078,7 @@ mod tests {
             module_name: "modC".to_string(),
             is_transitive: true,
             is_static: false,
+            ..Default::default()
         });
 
         let mut reg = ModuleRegistry::new();
@@ -2005,6 +2107,7 @@ mod tests {
             module_name: "modB".to_string(),
             is_transitive: false,
             is_static: true,
+            ..Default::default()
         });
 
         let mut reg = ModuleRegistry::new();
@@ -2030,6 +2133,7 @@ mod tests {
             module_name: "modB".to_string(),
             is_transitive: false,
             is_static: false,
+            ..Default::default()
         });
 
         let mut reg = ModuleRegistry::new();
@@ -2047,6 +2151,7 @@ mod tests {
         desc.exports.push(ModuleExportsEntry {
             package_name: "com/internal".to_string(),
             to_modules: vec!["modB".to_string()], // only exported to modB
+            ..Default::default()
         });
         let mut reg = ModuleRegistry::new();
         reg.register(desc, vec!["com/internal".to_string()]);
@@ -2083,10 +2188,12 @@ mod tests {
         desc.exports.push(ModuleExportsEntry {
             package_name: "com/public".to_string(),
             to_modules: vec![], // unqualified
+            ..Default::default()
         });
         desc.exports.push(ModuleExportsEntry {
             package_name: "com/private".to_string(),
             to_modules: vec!["modB".to_string()], // qualified
+            ..Default::default()
         });
         let mut reg = ModuleRegistry::new();
         reg.register(desc, vec![]);
@@ -2102,6 +2209,7 @@ mod tests {
         desc.exports.push(ModuleExportsEntry {
             package_name: "com/foo".to_string(),
             to_modules: vec!["modB".to_string()],
+            ..Default::default()
         });
         let mut reg = ModuleRegistry::new();
         reg.register(desc, vec![]);
@@ -2138,6 +2246,7 @@ mod tests {
         desc.opens.push(ModuleOpensEntry {
             package_name: "com/reflect".to_string(),
             to_modules: vec![], // unqualified
+            ..Default::default()
         });
         let mut reg = ModuleRegistry::new();
         reg.register(desc, vec![]);
@@ -2222,6 +2331,7 @@ mod tests {
             module_name: "modB".to_string(),
             is_transitive: false,
             is_static: false,
+            ..Default::default()
         });
         let mut reg = ModuleRegistry::new();
         reg.register(desc_a, vec![]);
@@ -2237,12 +2347,14 @@ mod tests {
             module_name: "modB".to_string(),
             is_transitive: false,
             is_static: false,
+            ..Default::default()
         });
         let mut desc_b = sample_desc("modB");
         desc_b.requires.push(ModuleRequiresEntry {
             module_name: "modA".to_string(),
             is_transitive: false,
             is_static: false,
+            ..Default::default()
         });
         let mut reg = ModuleRegistry::new();
         reg.register(desc_a, vec![]);
@@ -2296,9 +2408,8 @@ mod tests {
 
     #[test]
     fn deep_reflection_unnamed_accessor_allowed_with_add_opens() {
-        // Same denied case, but `--add-opens modA/com.secret=ALL-UNNAMED`
-        // (represented here as dynamic add_opens with empty target) grants
-        // access to the unnamed accessor.
+        // Same denied case, but an unqualified `opens` (empty target) grants
+        // access to every accessor, the unnamed one included.
         let mut reg = ModuleRegistry::new();
         reg.register(sample_desc("modA"), vec!["com/secret".to_string()]);
         reg.build_readability_graph();
@@ -2307,8 +2418,81 @@ mod tests {
         assert!(
             reg.check_deep_reflection_access(UNNAMED_MODULE, "modA", "com/secret")
                 .is_ok(),
-            "--add-opens should grant unnamed accessor deep access"
+            "an unqualified open should grant unnamed accessor deep access"
         );
+    }
+
+    /// `--add-opens modA/com.secret=ALL-UNNAMED` grants the unnamed module and
+    /// **only** the unnamed module.
+    ///
+    /// The three assertions are one fact each, and the flag is only correct if
+    /// all three hold — a version that merely grants the unnamed accessor
+    /// (assertion 1) passes the reflection path while still lying to
+    /// `Module.isOpen` and over-granting every named module.
+    ///
+    /// Oracle: Temurin 25 under
+    /// `--add-opens=java.base/java.net=ALL-UNNAMED`, via
+    /// `probes/AddOpensFlagProbe.java` (2026-08-09) —
+    /// `open java.net unqualified=false`, `open java.net toSelf=true`.
+    #[test]
+    fn add_opens_all_unnamed_is_qualified_to_the_unnamed_module_only() {
+        let mut reg = ModuleRegistry::new();
+        reg.register(sample_desc("modA"), vec!["com/secret".to_string()]);
+        reg.register(sample_desc("modB"), vec![]);
+        reg.build_readability_graph();
+        reg.add_opens("modA", "com/secret", ALL_UNNAMED_TARGET);
+
+        assert!(
+            reg.check_deep_reflection_access(UNNAMED_MODULE, "modA", "com/secret")
+                .is_ok(),
+            "ALL-UNNAMED must grant the unnamed accessor deep access"
+        );
+        assert!(
+            !reg.is_package_open_unqualified("modA", "com/secret"),
+            "ALL-UNNAMED is a qualified open; Module.isOpen(pkg) must stay false"
+        );
+        assert!(
+            !reg.is_package_open_to("modA", "com/secret", "modB"),
+            "ALL-UNNAMED must not reach a named module"
+        );
+    }
+
+    /// The `--add-exports` half of the same token, so a later edit cannot fix
+    /// one direction and leave the other conflated.
+    #[test]
+    fn add_exports_all_unnamed_is_qualified_to_the_unnamed_module_only() {
+        let mut reg = ModuleRegistry::new();
+        reg.register(sample_desc("modA"), vec!["com/secret".to_string()]);
+        reg.register(sample_desc("modB"), vec![]);
+        reg.build_readability_graph();
+        reg.add_exports("modA", "com/secret", ALL_UNNAMED_TARGET);
+
+        assert!(
+            reg.is_package_exported_to("modA", "com/secret", UNNAMED_MODULE),
+            "ALL-UNNAMED must export to the unnamed module"
+        );
+        assert!(
+            !reg.is_package_exported_unqualified("modA", "com/secret"),
+            "ALL-UNNAMED is a qualified export; Module.isExported(pkg) must stay false"
+        );
+        assert!(
+            !reg.is_package_exported_to("modA", "com/secret", "modB"),
+            "ALL-UNNAMED must not reach a named module"
+        );
+    }
+
+    /// The launcher's parse and the registry's resolution have to agree on the
+    /// token. They live in different crates (`vm::config` and this one) and the
+    /// bug was precisely that they disagreed, so pin the spelling here too.
+    #[test]
+    fn all_unnamed_token_matches_the_jdk_spelling() {
+        assert_eq!(ALL_UNNAMED_TARGET, "ALL-UNNAMED");
+        assert_eq!(resolve_edge_target(""), None);
+        assert_eq!(
+            resolve_edge_target(ALL_UNNAMED_TARGET),
+            Some(UNNAMED_MODULE.to_string())
+        );
+        assert_eq!(resolve_edge_target("modB"), Some("modB".to_string()));
     }
 
     #[test]
@@ -2318,6 +2502,7 @@ mod tests {
             module_name: "modB".to_string(),
             is_transitive: false,
             is_static: false,
+            ..Default::default()
         });
         let desc_b = sample_desc("modB");
         let mut reg = ModuleRegistry::new();
@@ -2338,11 +2523,13 @@ mod tests {
             module_name: "modB".to_string(),
             is_transitive: false,
             is_static: false,
+            ..Default::default()
         });
         let mut desc_b = sample_desc("modB");
         desc_b.opens.push(ModuleOpensEntry {
             package_name: "com/secret".to_string(),
             to_modules: vec!["modA".to_string()],
+            ..Default::default()
         });
         let mut reg = ModuleRegistry::new();
         reg.register(desc_a, vec![]);
@@ -2361,6 +2548,7 @@ mod tests {
             module_name: "modB".to_string(),
             is_transitive: false,
             is_static: false,
+            ..Default::default()
         });
         let desc_b = sample_desc("modB");
         let mut reg = ModuleRegistry::new();
@@ -2391,6 +2579,7 @@ mod tests {
             module_name: "modB".to_string(),
             is_transitive: false,
             is_static: false,
+            ..Default::default()
         });
         let desc_b = sample_desc("modB"); // no exports
         let mut reg = ModuleRegistry::new();

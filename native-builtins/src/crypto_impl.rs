@@ -1105,7 +1105,7 @@ fn secure_random_entropy_seed() -> u64 {
 /// fallback is far stronger than the broken splitmix64 stream — ChaCha20 is a
 /// CSPRNG, not an invertible 64-bit mixer — and the primary path is always the
 /// OS CSPRNG.
-fn secure_random_fill(_key: i32, buf: &mut [u8]) {
+pub(crate) fn secure_random_fill(_key: i32, buf: &mut [u8]) {
     // Primary path: straight from the OS CSPRNG. Retry once on a transient
     // failure before degrading to the software fallback.
     if os_random_bytes(buf) {
@@ -1132,10 +1132,35 @@ fn secure_random_fill(_key: i32, buf: &mut [u8]) {
     chacha20_keystream_fill(&key, &nonce, buf);
 }
 
-/// ChaCha20 keystream generator (RFC 8439).  Used ONLY as the software fallback
-/// inside `secure_random_fill` when the OS CSPRNG is unavailable; it writes its
-/// raw keystream into `buf` (i.e. XOR against an implicit zero plaintext).
-fn chacha20_keystream_fill(key: &[u8; 32], nonce: &[u8; 12], buf: &mut [u8]) {
+/// RFC 8439 ChaCha20, XOR-ing the keystream into `buf` starting from block
+/// `initial_counter`.
+///
+/// This is the crate's ONE ChaCha20 core. It was previously
+/// `chacha20_keystream_fill`, which wrote its keystream instead of XOR-ing it
+/// and hard-coded the block counter to 0 — the two properties that stood
+/// between an already-correct RFC 8439 implementation and a usable stream
+/// cipher. Generalising in place rather than adding a second entry point is
+/// deliberate: `chacha20_keystream_fill` is now a wrapper over this function,
+/// so the RFC 7539 known-answer test below covers both callers, and there is
+/// no second ChaCha20 to drift.
+///
+/// The counter is the caller's because JCA's `ChaCha20ParameterSpec(nonce,
+/// counter)` lets the caller choose it. Verified against HotSpot 25's own
+/// SunJCE `Cipher.getInstance("ChaCha20")` — see
+/// `chacha20_xor_counter_one_matches_hotspot` — which also confirms the
+/// counter is a plain block index: the same key/nonce at counter 0 produces,
+/// in its second 64-byte block, exactly what counter 1 produces in its first.
+///
+/// Counter wrap is `wrapping_add`, matching the pre-existing behaviour. RFC
+/// 8439 §2.3 caps a single (key, nonce) message at 256 GiB, which this
+/// function does not enforce; no caller in this tree comes near it, and the
+/// only present caller is `secure_random_fill`'s one-shot fallback.
+pub(crate) fn chacha20_xor(
+    key: &[u8; 32],
+    nonce: &[u8; 12],
+    initial_counter: u32,
+    buf: &mut [u8],
+) {
     #[inline]
     fn quarter_round(s: &mut [u32; 16], a: usize, b: usize, c: usize, d: usize) {
         s[a] = s[a].wrapping_add(s[b]);
@@ -1166,7 +1191,7 @@ fn chacha20_keystream_fill(key: &[u8; 32], nonce: &[u8; 12], buf: &mut [u8]) {
             nonce[4 * i + 3],
         ]);
     }
-    let mut counter: u32 = 0;
+    let mut counter: u32 = initial_counter;
     let mut pos = 0;
     while pos < buf.len() {
         let mut working = state0;
@@ -1190,10 +1215,28 @@ fn chacha20_keystream_fill(key: &[u8; 32], nonce: &[u8; 12], buf: &mut [u8]) {
             block[4 * i..4 * i + 4].copy_from_slice(&word.to_le_bytes());
         }
         let to_copy = (buf.len() - pos).min(64);
-        buf[pos..pos + to_copy].copy_from_slice(&block[..to_copy]);
+        for i in 0..to_copy {
+            buf[pos + i] ^= block[i];
+        }
         pos += to_copy;
         counter = counter.wrapping_add(1);
     }
+}
+
+/// Raw ChaCha20 keystream from block 0, written over whatever `buf` held.
+///
+/// Used ONLY as the software fallback inside `secure_random_fill` when the OS
+/// CSPRNG is unavailable. Kept as a named wrapper rather than folded into its
+/// one call site so that the RFC 7539 known-answer test keeps testing the
+/// shape the fallback actually uses: zero the buffer first, so XOR-ing the
+/// keystream in is the same thing as writing it. Zeroing is not incidental —
+/// `secure_random_fill` hands us a caller's buffer whose prior contents are
+/// arbitrary, and entropy that depends on them is entropy nobody audited.
+fn chacha20_keystream_fill(key: &[u8; 32], nonce: &[u8; 12], buf: &mut [u8]) {
+    for b in buf.iter_mut() {
+        *b = 0;
+    }
+    chacha20_xor(key, nonce, 0, buf);
 }
 
 fn native_secure_random_next_bytes(
@@ -1249,73 +1292,29 @@ fn native_secure_random_generate_seed(
     Ok(Some(Value::Object(Some(arr))))
 }
 
-// nb-crypto-impl VULN(secrand-collision) [FIXED]: the setSeed / seeded-ctor
-// natives below NO LONGER mutate any per-instance, identity-hash-keyed DRBG
-// state (that state was the collision/aliasing hazard and has been removed).
-// Output is now drawn straight from the OS CSPRNG, which is already maximally
-// and freshly seeded, so a user-supplied seed can only *supplement* it — and
-// supplementing a CSPRNG that already has full entropy is a no-op. This matches
-// the `java.security.SecureRandom` contract precisely: `setSeed` "supplements"
-// the existing seed and is explicitly permitted not to weaken the source; we
-// never downgrade the OS-CSPRNG stream to honour a caller seed. (`java.util.
-// Random`'s bit-reproducible `setSeed` is a different class, handled in
-// `securerandom.rs`.) We still validate the argument shape so a malformed call
-// is a clean no-op rather than a panic.
-
-/// `java/security/SecureRandom.setSeed(J)V`.
-fn native_secure_random_set_seed_long(
-    _ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
-    match args.first() {
-        Some(Value::Object(Some(_))) => {}
-        _ => return Ok(None),
-    };
-    match args.get(1) {
-        Some(Value::Long(_)) => {}
-        _ => return Ok(None),
-    };
-    // Supplement-only against an OS CSPRNG → no state change (see note above).
-    Ok(None)
-}
-
-/// `java/security/SecureRandom.setSeed([B)V`.
-fn native_secure_random_set_seed_bytes(
-    _ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
-    match args.first() {
-        Some(Value::Object(Some(_))) => {}
-        _ => return Ok(None),
-    };
-    match args.get(1) {
-        Some(Value::Object(Some(_))) => {}
-        // setSeed(null) is an NPE in the JDK; the interpreter raises the NPE
-        // before reaching here for a real null deref. Nothing to do.
-        _ => return Ok(None),
-    };
-    // Supplement-only against an OS CSPRNG → no state change (see note above).
-    Ok(None)
-}
-
-/// `java/security/SecureRandom.<init>([B)V` — the seeded constructor. Per the
-/// JDK this equals the no-arg ctor followed by `setSeed(seed)`; the stream keeps
-/// its OS-entropy base and the user seed only supplements it.
-fn native_secure_random_init_seed_bytes(
-    _ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
-    match args.first() {
-        Some(Value::Object(Some(_))) => {}
-        _ => return Ok(None),
-    };
-    match args.get(1) {
-        Some(Value::Object(Some(_))) => {}
-        _ => return Ok(None),
-    };
-    // Supplement-only against an OS CSPRNG → no state change (see note above).
-    Ok(None)
-}
+// nb-crypto-impl VULN(secrand-collision) [FIXED]: the `nextBytes` /
+// `generateSeed` natives below NO LONGER mutate any per-instance,
+// identity-hash-keyed DRBG state (that state was the collision/aliasing hazard
+// and has been removed). Output is drawn straight from the OS CSPRNG, which is
+// already maximally and freshly seeded.
+//
+// The `setSeed(J)V`, `setSeed([B)V` and `<init>([B)V` natives that used to live
+// here were DELETED (L8 residual pass, 2026-08-12), bodies and registrations
+// alike. Each was a shape-checking no-op justified by "a caller seed cannot
+// weaken an already-fully-seeded OS CSPRNG". That argument is sound for entropy
+// and WRONG for replay: `securerandom.rs`'s `setSeed` bodies check
+// `secure_random_is_sha1prng` and route SHA1PRNG through real reseeding,
+// because `SecureRandom.getInstance("SHA1PRNG")` seeded twice alike yields
+// identical bytes on HotSpot — the one replay guarantee the JDK gives a
+// `SecureRandom`, and the property H2's `TestAll` depends on. The no-ops here
+// won by registration order in synthetic mode (see `register_crypto_impl_natives`)
+// and undid that wholesale. The seeded constructor went with them because its
+// body stamped neither `algorithm` nor `provider`, so `new SecureRandom(seed)`
+// answered `null` from `getAlgorithm()` and `getProvider()` in synthetic mode —
+// L8's own headline defect, surviving in one mode because a later registrar
+// overwrote the fix. `securerandom.rs` now serves all three triples in every
+// mode. (`java.util.Random`'s bit-reproducible `setSeed` is a different class,
+// also handled in `securerandom.rs`.)
 
 // nb-crypto-impl VULN(3): The single-shot MessageDigest/Cipher/Mac stubs that
 // formerly lived here have been DELETED outright. They were dead code (registered
@@ -1343,13 +1342,22 @@ pub(crate) fn register_crypto_impl_natives(r: &mut NativeMethodRegistry) {
     // splitmix64-predictability and identity-hash-collision aliasing hazards are
     // both closed (see VULN(secrand) / VULN(secrand-collision) in this file).
     //
-    // IMPORTANT (registration order): `register_crypto_impl_natives` runs AFTER
-    // `securerandom::register_random_and_securerandom_natives` (lib.rs phase
-    // ordering: register_security_natives ~line 9773 vs register_crypto_impl
-    // ~line 10010), so these last-write registrations WIN. The setSeed / seeded-
-    // ctor natives are registered HERE so the OS-CSPRNG output surface is owned
-    // in one place; they are supplement-only no-ops (a caller seed cannot weaken
-    // an already-fully-seeded OS CSPRNG — JDK setSeed semantics, never replaces).
+    // Registration order: both this registrar and
+    // `securerandom::register_random_and_securerandom_natives` are called from
+    // `register_synthetic_overrides`, this one SECOND, so these bodies win —
+    // `register()` is last-registration-wins. That scope is the whole story:
+    // `register_synthetic_overrides` is `#[cfg(feature = "synthetic-jdk")]`,
+    // the feature is in no crate's default set, and `vm_init` reaches it only
+    // when `config.use_synthetic_jdk` is also true. So none of this exists in a
+    // default CLI build, and `--real-jdk` / `--jdk-only` are served by
+    // `securerandom.rs` — see docs/architecture/natives-over-real-jdk-classes.md §2.
+    // Only `nextBytes` / `generateSeed` are registered here: both draw from the
+    // OS CSPRNG in either file, so the shadowing is behaviour-neutral. The
+    // `setSeed` and seeded-ctor rows were REMOVED (L8 residual pass, 2026-08-12)
+    // because their no-op bodies silently undid two fixes in `securerandom.rs`:
+    // SHA1PRNG reseeding, which HotSpot makes reproducible and which is the one
+    // replay guarantee the JDK gives a `SecureRandom`; and the `algorithm` /
+    // `provider` stamping that `getProvider()` returning null was fixed by.
     r.register(
         "java/security/SecureRandom",
         "nextBytes",
@@ -1361,24 +1369,6 @@ pub(crate) fn register_crypto_impl_natives(r: &mut NativeMethodRegistry) {
         "generateSeed",
         "(I)[B",
         native_secure_random_generate_seed,
-    );
-    r.register(
-        "java/security/SecureRandom",
-        "setSeed",
-        "(J)V",
-        native_secure_random_set_seed_long,
-    );
-    r.register(
-        "java/security/SecureRandom",
-        "setSeed",
-        "([B)V",
-        native_secure_random_set_seed_bytes,
-    );
-    r.register(
-        "java/security/SecureRandom",
-        "<init>",
-        "([B)V",
-        native_secure_random_init_seed_bytes,
     );
     r.set_category(__prev_cat);
 }
@@ -2323,6 +2313,39 @@ impl Rsa {
         matches!(Self::try_verify_sha256(key, message, signature), Ok(true))
     }
 
+    /// PKCS#1 v1.5 verification for an arbitrary digest, **fail-closed
+    /// `bool`** — [`Self::verify_sha256`] generalised.
+    ///
+    /// The certificate-chain verifier (`x509_manager::verify_one_signature`)
+    /// dispatches on the signature-algorithm OID, and every
+    /// `sha*WithRSAEncryption` differs from the next ONLY in which digest goes
+    /// into the DigestInfo. The core it delegates to has taken a
+    /// [`DigestAlgorithm`] all along, so the whole RSA family is this one
+    /// function rather than four near-copies — and in particular nothing here
+    /// touches the in-tree [`Self::pkcs1v15_encode`], whose DigestInfo prefix
+    /// is hard-coded to SHA-256.
+    ///
+    /// Same fail-closed collapse and the same reason as `verify_sha256`: the
+    /// caller (chain validation) has no exception channel, and a refusal and a
+    /// mismatch both mean "do not trust this chain".
+    pub fn verify_pkcs1_v15(
+        key: &RsaPublicKey,
+        digest: cratonvm_native_builtins_crypto::signature::DigestAlgorithm,
+        message: &[u8],
+        signature: &[u8],
+    ) -> bool {
+        matches!(
+            cratonvm_native_builtins_crypto::signature::verify_rsa_pkcs1_v15_checked(
+                &key.n.to_bytes_be(),
+                &key.e.to_bytes_be(),
+                digest,
+                message,
+                signature,
+            ),
+            Ok(true)
+        )
+    }
+
     /// Build the PKCS#1 v1.5 EMSA encoding (DigestInfo for SHA-256 wrapped in
     /// `00 01 FF.. 00 || T`).
     ///
@@ -2471,6 +2494,92 @@ impl RsaCipherPadding {
             _ => 32,
         }
     }
+
+    /// The largest plaintext this padding can carry under a `k`-byte modulus —
+    /// SunJCE's `RSAPadding.getMaxDataSize()`: `k - 11` for PKCS#1 v1.5,
+    /// `k - 2*hLen - 2` for OAEP. `None` when the modulus is too small to hold
+    /// the padding at all, which SunJCE reports from `RSAPadding.getInstance`
+    /// as an `InvalidKeyException` rather than as a data failure.
+    ///
+    /// This is the number the LENGTH refusal has to be measured against, and
+    /// keeping it here rather than inside `rsa_pkcs1_type2_pad` /
+    /// `rsa_oaep_pad` is deliberate: those two decide padding VALIDITY and
+    /// their error strings are held to a single opaque constant so they cannot
+    /// become a Bleichenbacher/Manger oracle. A length that does not fit is not
+    /// secret — the caller chose it — and it is a different JCA exception, so
+    /// it is decided before either of them is entered.
+    fn max_data_size(self, k: usize) -> Option<usize> {
+        let overhead = match self {
+            RsaCipherPadding::Pkcs1 => 11,
+            _ => 2 * self.hlen() + 2,
+        };
+        k.checked_sub(overhead).filter(|_| k > overhead)
+    }
+}
+
+/// Which JCA exception an RSA `Cipher` failure has to be raised as.
+///
+/// The two `Cipher.doFinal` DECLARES are both CHECKED members of
+/// `java.security.GeneralSecurityException`, and the class is the only thing a
+/// caller's `catch` selects on. `rsa_cipher_encrypt`/`rsa_cipher_decrypt`
+/// returned `Result<_, String>` and every caller collapsed the whole set into
+/// an unchecked `IllegalStateException`, so a caller who wrote the JDK's own
+/// `catch (BadPaddingException e)` around an RSA decrypt did NOT catch it: the
+/// failure escaped as an unchecked throw through code that believed it had
+/// handled it. This is the same species as `W7-41`'s `IllegalFormatException`
+/// subclasses and `W7-46`'s `ProcessBuilder("").start()`.
+///
+/// Measured on Temurin 25.0.3+9 (`probes/JcaExceptionTypeProbe.java`):
+///
+/// ```text
+/// OAEP / PKCS1 decrypt under the wrong private key   BadPaddingException: Padding error in decryption
+/// OAEP / PKCS1 decrypt of a corrupted ciphertext     BadPaddingException: Padding error in decryption
+/// PKCS1 decrypt of a SHORTER-than-modulus ciphertext BadPaddingException: Padding error in decryption
+/// PKCS1 decrypt of a LONGER-than-modulus ciphertext  IllegalBlockSizeException: Data must not be longer than 256 bytes
+/// PKCS1 encrypt of 246 bytes under RSA-2048          IllegalBlockSizeException: Data must not be longer than 245 bytes
+/// OAEP-SHA-256 encrypt of 191 bytes under RSA-2048   IllegalBlockSizeException: Data must not be longer than 190 bytes
+/// NoPadding encrypt of a value >= the modulus        BadPaddingException: Message is larger than modulus
+/// ```
+///
+/// Note the short-vs-long asymmetry, which is the row a length check written
+/// as `ct.len() != k` gets wrong in both directions at once: SunJCE's
+/// `RSACipher.doFinal` refuses only `bufOfs > buffer.length`, and a SHORTER
+/// ciphertext is simply a smaller integer that goes through the modexp and
+/// fails to unpad.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RsaCipherError {
+    /// A LENGTH failure — `javax.crypto.IllegalBlockSizeException`.
+    BlockSize(String),
+    /// A PADDING or integrity failure — `javax.crypto.BadPaddingException`.
+    Padding(String),
+    /// An unusable KEY — `java.security.InvalidKeyException`. SunJCE raises
+    /// this at `init`; this engine captures the key components at `init` and
+    /// can only discover an unusable one here, so the class is kept truthful
+    /// even though the point differs.
+    Key(String),
+}
+
+impl RsaCipherError {
+    /// The internal-form JCA class name to raise. Every one of the three is a
+    /// class the real JDK carries, so `throw_jca_exc` resolves it — raising a
+    /// name that does not resolve would convert a wrong-exception defect into a
+    /// `NoClassDefFoundError`, which is worse.
+    pub fn jca_class(&self) -> &'static str {
+        match self {
+            RsaCipherError::BlockSize(_) => "javax/crypto/IllegalBlockSizeException",
+            RsaCipherError::Padding(_) => "javax/crypto/BadPaddingException",
+            RsaCipherError::Key(_) => "java/security/InvalidKeyException",
+        }
+    }
+
+    /// The detail text.
+    pub fn message(&self) -> &str {
+        match self {
+            RsaCipherError::BlockSize(m)
+            | RsaCipherError::Padding(m)
+            | RsaCipherError::Key(m) => m,
+        }
+    }
 }
 
 /// Hash `data` with the OAEP padding's digest (SHA-1 or SHA-256).
@@ -2550,7 +2659,14 @@ fn rsa_pkcs1_type2_pad(msg: &[u8], k: usize) -> Result<Vec<u8>, String> {
 /// timing learns *which* structural check failed and can recover plaintext one
 /// query at a time. All padding failures now collapse to this one message and
 /// are decided by a single branch over a bitwise-accumulated failure mask.
-const RSA_PADDING_ERROR: &str = "RSA: decryption error";
+///
+/// The text is SunJCE's own, measured on Temurin 25.0.3+9 — `RSACipher.doFinal`
+/// raises `BadPaddingException("Padding error in decryption")` for the wrong
+/// key, for a corrupted ciphertext and for a short one alike. Matching it costs
+/// nothing (it is still exactly one constant, so it still distinguishes
+/// nothing) and it removes a second-order tell: an attacker who can see the
+/// message at all should not be able to tell which VM produced it.
+const RSA_PADDING_ERROR: &str = "Padding error in decryption";
 
 /// Constant-time non-zero test: returns `0xFF` if `x != 0`, else `0x00`,
 /// without a data-dependent branch.
@@ -2755,22 +2871,41 @@ fn rsa_oaep_unpad(pad: RsaCipherPadding, em: &[u8]) -> Result<Vec<u8>, String> {
 }
 
 /// RSA public-key encryption (ENCRYPT/WRAP): pad then `m^e mod n`.
+///
+/// The error type is `RsaCipherError`, not `String`: see that enum for why the
+/// CLASS is the whole point and what each variant was measured against.
 pub fn rsa_cipher_encrypt(
     n: &[u8],
     e: &[u8],
     pad: RsaCipherPadding,
     msg: &[u8],
-) -> Result<Vec<u8>, String> {
+) -> Result<Vec<u8>, RsaCipherError> {
     let n_big = BigUint::from_bytes_be(n);
     let e_big = BigUint::from_bytes_be(e);
     let k = (n_big.bit_length() + 7) / 8;
     if k == 0 {
-        return Err("RSA: invalid (zero) modulus".into());
+        return Err(RsaCipherError::Key("RSA: invalid (zero) modulus".into()));
+    }
+    // The length refusal, decided here and in HotSpot's own words. SunJCE sizes
+    // the encrypt buffer to `getMaxDataSize()` and reports an overflow of it as
+    // `IllegalBlockSizeException("Data must not be longer than N bytes")` — a
+    // CHECKED exception, and one a caller distinguishes from a padding failure
+    // because it means "re-chunk", not "this ciphertext is not for you".
+    let Some(max) = pad.max_data_size(k) else {
+        return Err(RsaCipherError::Key(format!(
+            "Key is too short for encryption using {pad:?} (modulus {k} bytes)"
+        )));
+    };
+    if msg.len() > max {
+        return Err(RsaCipherError::BlockSize(format!(
+            "Data must not be longer than {max} bytes"
+        )));
     }
     let em = match pad {
-        RsaCipherPadding::Pkcs1 => rsa_pkcs1_type2_pad(msg, k)?,
-        _ => rsa_oaep_pad(pad, msg, k)?,
-    };
+        RsaCipherPadding::Pkcs1 => rsa_pkcs1_type2_pad(msg, k),
+        _ => rsa_oaep_pad(pad, msg, k),
+    }
+    .map_err(RsaCipherError::Padding)?;
     let m = BigUint::from_bytes_be(&em);
     let c = m.modpow(&e_big, &n_big);
     Ok(c.to_bytes_be_padded(k))
@@ -2782,31 +2917,52 @@ pub fn rsa_cipher_decrypt(
     d: &[u8],
     pad: RsaCipherPadding,
     ct: &[u8],
-) -> Result<Vec<u8>, String> {
+) -> Result<Vec<u8>, RsaCipherError> {
     let n_big = BigUint::from_bytes_be(n);
     let d_big = BigUint::from_bytes_be(d);
     let k = (n_big.bit_length() + 7) / 8;
     if k == 0 {
-        return Err("RSA: invalid (zero) modulus".into());
+        return Err(RsaCipherError::Key("RSA: invalid (zero) modulus".into()));
     }
-    if ct.len() != k {
-        return Err(format!(
-            "RSA decrypt: ciphertext length {} != modulus size {}",
-            ct.len(),
-            k
-        ));
+    // ONE-SIDED, and the asymmetry is HotSpot's. `RSACipher.doFinal` refuses
+    // only `bufOfs > buffer.length`; a ciphertext SHORTER than the modulus is a
+    // smaller integer, goes through the modexp, and fails to unpad — measured
+    // `BadPaddingException: Padding error in decryption` for a 200-byte input
+    // to an RSA-2048 decrypt. The `ct.len() != k` check this replaced refused
+    // both directions with one unchecked `IllegalStateException`, so it got the
+    // class wrong on both and the side wrong on one.
+    if ct.len() > k {
+        return Err(RsaCipherError::BlockSize(format!(
+            "Data must not be longer than {k} bytes"
+        )));
     }
     let c = BigUint::from_bytes_be(ct);
+    // `RSACore.parseMsg`: a ciphertext numerically at or above the modulus is
+    // not a decryptable representative and SunJCE says so with a checked
+    // `BadPaddingException("Message is larger than modulus")`. Reachable only
+    // through `NoPadding`, where the caller supplies the integer directly.
+    if c.cmp(&n_big) != std::cmp::Ordering::Less {
+        return Err(RsaCipherError::Padding(
+            "Message is larger than modulus".into(),
+        ));
+    }
     // Blinded private exponentiation (VULN(2)): the `Cipher` decrypt path only
     // carries `(n, d)` — the public exponent `e` is not threaded here — so use
     // the no-`e` two-modpow blinding to remove the message-dependent (adaptive
     // ciphertext) timing channel that an RSA decryption-timing attacker probes.
     let m = rsa_private_modpow_blinded_no_e(&c, &d_big, &n_big);
     let em = m.to_bytes_be_padded(k);
+    // Every padding failure — wrong key, flipped byte, short ciphertext — has
+    // already been collapsed to the single opaque `RSA_PADDING_ERROR` string by
+    // `rsa_pkcs1_type2_unpad` / `rsa_oaep_unpad` (VULN(1)). Mapping the whole
+    // set to one variant preserves that: the CLASS a caller catches is the same
+    // for all of them, so widening the exception surface does not reopen the
+    // Bleichenbacher/Manger oracle those functions were rewritten to close.
     match pad {
         RsaCipherPadding::Pkcs1 => rsa_pkcs1_type2_unpad(&em),
         _ => rsa_oaep_unpad(pad, &em),
     }
+    .map_err(RsaCipherError::Padding)
 }
 
 /// Resolve a synthetic key's `crypto_impl` private components `(n, d)`.
@@ -5068,6 +5224,55 @@ mod tests {
             .collect()
     }
 
+    /// This registrar must claim `java/security/SecureRandom` for exactly two
+    /// triples, and it must NOT claim either `setSeed` or the seeded ctor.
+    ///
+    /// L8-securerandom-provider.md. It used to register five, and the extra
+    /// three were shape-checking no-ops. In `--synthetic-jdk` this registrar is
+    /// called from `register_synthetic_overrides` AFTER
+    /// `securerandom::register_random_and_securerandom_natives`, and
+    /// `register()` is last-registration-wins, so the no-ops silently replaced
+    /// two working fixes: `securerandom.rs`'s `setSeed` bodies check
+    /// `secure_random_is_sha1prng` and route SHA1PRNG through real reseeding
+    /// (`getInstance("SHA1PRNG")` seeded twice alike yields identical bytes on
+    /// HotSpot — the one replay guarantee the JDK gives a `SecureRandom`), and
+    /// its `<init>([B)V` stamps the `algorithm` and `provider` fields whose
+    /// absence is this record's headline defect.
+    ///
+    /// Asserted as a REGISTRATION census rather than a behavioural check
+    /// because the defect is a registration: the no-op bodies were each
+    /// individually defensible, and what made them wrong was which triple they
+    /// claimed and in what order. A behavioural test would also need a
+    /// `--synthetic-jdk` VM, which no scheduled corpus run builds.
+    #[test]
+    fn crypto_impl_registers_no_securerandom_seeding_triple() {
+        let mut r = NativeMethodRegistry::new();
+        register_crypto_impl_natives(&mut r);
+        let dump = r.dump_registrations();
+        let mut mine: Vec<String> = Vec::new();
+        for row in dump.iter() {
+            if row.0 == "java/security/SecureRandom" {
+                mine.push(format!("{}{}", row.1, row.2));
+            }
+        }
+        assert_eq!(
+            mine,
+            vec!["nextBytes([B)V".to_string(), "generateSeed(I)[B".to_string()],
+            "crypto_impl must own only the two OS-CSPRNG output triples; \
+             re-registering setSeed or <init>([B)V here shadows securerandom.rs \
+             in synthetic mode and undoes SHA1PRNG reseeding — L8"
+        );
+        // Stated separately so a future widening of the list above cannot
+        // quietly re-admit the two rows this record is about.
+        for row in dump.iter() {
+            assert!(
+                !(row.0 == "java/security/SecureRandom"
+                    && (row.1 == "setSeed" || row.1 == "<init>")),
+                "SecureRandom.setSeed / <init> must be served by securerandom.rs alone"
+            );
+        }
+    }
+
     // -----------------------------------------------------------------------
     // SHA-256 Tests
     // -----------------------------------------------------------------------
@@ -5863,6 +6068,102 @@ mod tests {
             "76b8e0ada0f13d90405d6ae55386bd28bdd219b8a08ded1aa836efcc8b770dc7\
              da41597c5157488d7724e03fb8d84a376a43b8f41518a11cc387b669b2ee6586"
         );
+    }
+
+    /// The vectors below were MEASURED, not recalled: HotSpot 25's own SunJCE
+    /// `Cipher.getInstance("ChaCha20")` was initialised with the stated key,
+    /// `ChaCha20ParameterSpec(nonce, counter)`, and asked to encrypt an
+    /// all-zero plaintext — which yields the raw keystream. Encrypting zeros is
+    /// the only way to read a stream cipher's keystream through the JCA API,
+    /// and it makes the oracle's output directly comparable with
+    /// `chacha20_xor` over a zero buffer.
+    ///
+    /// The zero-key vector above (`chacha20_keystream_rfc7539_zero_key`) was
+    /// re-derived from the same oracle in passing and matches this tree's
+    /// existing expectation byte for byte, which is independent evidence that
+    /// the pre-existing core was already correct — what it lacked was a
+    /// caller-supplied counter and an XOR, not a working permutation.
+    #[test]
+    fn chacha20_xor_counter_one_matches_hotspot() {
+        // key = 00..1f, nonce = 00 00 00 00 00 00 00 4a 00 00 00 00 (RFC 8439
+        // §2.4.2's key and nonce), block counter 1.
+        let mut key = [0u8; 32];
+        for (i, b) in key.iter_mut().enumerate() {
+            *b = i as u8;
+        }
+        let nonce = [0, 0, 0, 0, 0, 0, 0, 0x4a, 0, 0, 0, 0];
+        let mut out = [0u8; 128];
+        chacha20_xor(&key, &nonce, 1, &mut out);
+        assert_eq!(
+            hex(&out),
+            "224f51f3401bd9e12fde276fb8631ded8c131f823d2c06e27e4fcaec9ef3cf78\
+             8a3b0aa372600a92b57974cded2b9334794cba40c63e34cdea212c4cf07d41b7\
+             69a6749f3f630f4122cafe28ec4dc47e26d4346d70b98c73f3e9c53ac40c5945\
+             398b6eda1a832c89c167eacd901d7e2bf363740373201aa188fbbce83991c4ed"
+        );
+    }
+
+    /// The counter is a plain block index, and this is the observation that
+    /// proves it without trusting either implementation: the same key and nonce
+    /// at counter 0 must produce, as its SECOND 64-byte block, exactly what
+    /// counter 1 produces as its FIRST. HotSpot's output has this property;
+    /// so must ours. A core that ignored `initial_counter` would still pass
+    /// the vector test above if its expectation were taken from itself — this
+    /// one it could not pass.
+    #[test]
+    fn chacha20_xor_counter_is_a_block_index() {
+        let mut key = [0u8; 32];
+        for (i, b) in key.iter_mut().enumerate() {
+            *b = i as u8;
+        }
+        let nonce = [0, 0, 0, 0, 0, 0, 0, 0x4a, 0, 0, 0, 0];
+        let mut from_zero = [0u8; 128];
+        chacha20_xor(&key, &nonce, 0, &mut from_zero);
+        let mut from_one = [0u8; 64];
+        chacha20_xor(&key, &nonce, 1, &mut from_one);
+        assert_eq!(&from_zero[64..], &from_one[..]);
+        // …and the counter-0 stream is HotSpot's, so neither block is ours alone.
+        assert_eq!(
+            hex(&from_zero[..64]),
+            "af051e40bba0354981329a806a140eafd258a22a6dcb4bb9f6569cb3efe2deaf\
+             837bd87ca20b5ba12081a306af0eb35c41a239d20dfc74c81771560d9c9c1e4b"
+        );
+    }
+
+    /// A length that is not a multiple of the 64-byte block must stop mid-block
+    /// and must not touch the bytes past the end. HotSpot's 70-byte answer is
+    /// the 128-byte answer truncated, which is the property being pinned.
+    #[test]
+    fn chacha20_xor_partial_final_block() {
+        let mut key = [0u8; 32];
+        for (i, b) in key.iter_mut().enumerate() {
+            *b = i as u8;
+        }
+        let nonce = [0, 0, 0, 0, 0, 0, 0, 0x4a, 0, 0, 0, 0];
+        let mut out = [0u8; 70];
+        chacha20_xor(&key, &nonce, 1, &mut out);
+        assert_eq!(
+            hex(&out),
+            "224f51f3401bd9e12fde276fb8631ded8c131f823d2c06e27e4fcaec9ef3cf78\
+             8a3b0aa372600a92b57974cded2b9334794cba40c63e34cdea212c4cf07d41b7\
+             69a6749f3f63"
+        );
+    }
+
+    /// XOR, not write: running the same keystream over the same buffer twice
+    /// must restore the plaintext. This is the property that makes the function
+    /// a cipher rather than a generator, and the one the old
+    /// `copy_from_slice` body did not have.
+    #[test]
+    fn chacha20_xor_is_an_involution() {
+        let key = [0x5au8; 32];
+        let nonce = [0x3cu8; 12];
+        let plaintext: Vec<u8> = (0..200u32).map(|i| (i * 31) as u8).collect();
+        let mut buf = plaintext.clone();
+        chacha20_xor(&key, &nonce, 7, &mut buf);
+        assert_ne!(buf, plaintext, "ciphertext must differ from plaintext");
+        chacha20_xor(&key, &nonce, 7, &mut buf);
+        assert_eq!(buf, plaintext, "decrypting must restore the plaintext");
     }
 
     #[test]
@@ -6678,6 +6979,124 @@ mod tests {
             assert_eq!(ct.len(), 256, "{:?}: ciphertext is modulus-sized", pad);
             let pt = rsa_cipher_decrypt(&n, &d, pad, &ct).expect("decrypt");
             assert_eq!(pt, msg, "{:?}: round-trip", pad);
+        }
+    }
+
+    /// The exception CLASS every RSA failure mode must become, pinned against
+    /// SunJCE on Temurin 25.0.3+9 (`probes/JcaExceptionTypeProbe.expected.txt`).
+    ///
+    /// Every one of these used to be an unchecked `IllegalStateException` at the
+    /// `Cipher` layer, so a caller's `catch (BadPaddingException e)` — the
+    /// exception `doFinal` DECLARES — was dead. The class is the only thing a
+    /// `catch` selects on, so the class is what this asserts; the round-trip
+    /// test above cannot see any of it, because a round trip never fails.
+    #[test]
+    fn rsa_cipher_failures_carry_the_class_sunjce_raises() {
+        let (pk, sk) = Rsa::generate_keypair(2048);
+        let n = pk.n.to_bytes_be();
+        let e = pk.e.to_bytes_be();
+        let d = sk.d.to_bytes_be();
+        let (other_pk, other_sk) = Rsa::generate_keypair(2048);
+        let other_n = other_pk.n.to_bytes_be();
+        let other_d = other_sk.d.to_bytes_be();
+
+        let bad = "javax/crypto/BadPaddingException";
+        let size = "javax/crypto/IllegalBlockSizeException";
+
+        for pad in [
+            RsaCipherPadding::Pkcs1,
+            RsaCipherPadding::OaepSha1,
+            RsaCipherPadding::OaepSha256,
+        ] {
+            let ct = rsa_cipher_encrypt(&n, &e, pad, b"payload").expect("encrypt");
+
+            // The WRONG PRIVATE KEY and a CORRUPTED CIPHERTEXT are padding
+            // failures. This is the row the regression suite sampled.
+            let wrong_key = rsa_cipher_decrypt(&other_n, &other_d, pad, &ct)
+                .expect_err("the wrong private key must not decrypt");
+            assert_eq!(wrong_key.jca_class(), bad, "{pad:?}: wrong key");
+            let mut corrupt = ct.clone();
+            corrupt[200] ^= 0x01;
+            let flipped = rsa_cipher_decrypt(&n, &d, pad, &corrupt)
+                .expect_err("a flipped ciphertext byte must not decrypt");
+            assert_eq!(flipped.jca_class(), bad, "{pad:?}: corrupted ciphertext");
+
+            // Every padding failure must ALSO still carry the single opaque
+            // message the VULN(1) constant-time repair collapsed them to.
+            // Widening the exception surface must not reopen the
+            // Bleichenbacher/Manger oracle.
+            assert_eq!(wrong_key.message(), RSA_PADDING_ERROR, "{pad:?}");
+            assert_eq!(flipped.message(), RSA_PADDING_ERROR, "{pad:?}");
+
+            // A SHORTER-than-modulus ciphertext is a smaller integer that
+            // decrypts and fails to unpad, NOT a block-size failure. A LONGER
+            // one is the reverse. The asymmetry is SunJCE's, and a
+            // `ct.len() != k` check gets it wrong in one direction while
+            // getting the class wrong in both.
+            let short = rsa_cipher_decrypt(&n, &d, pad, &ct[1..])
+                .expect_err("a short ciphertext must not decrypt");
+            assert_eq!(short.jca_class(), bad, "{pad:?}: short ciphertext");
+            let mut long = ct.clone();
+            long.push(0);
+            let long_err = rsa_cipher_decrypt(&n, &d, pad, &long)
+                .expect_err("an over-long ciphertext must be refused");
+            assert_eq!(long_err.jca_class(), size, "{pad:?}: over-long ciphertext");
+            assert_eq!(
+                long_err.message(),
+                "Data must not be longer than 256 bytes",
+                "{pad:?}: SunJCE's own wording"
+            );
+
+            // Too much plaintext for the padding: 245 for PKCS#1 v1.5, 214 for
+            // OAEP-SHA-1, 190 for OAEP-SHA-256 under a 2048-bit modulus.
+            let max = pad.max_data_size(256).expect("2048-bit modulus fits");
+            assert!(
+                rsa_cipher_encrypt(&n, &e, pad, &vec![0u8; max]).is_ok(),
+                "{pad:?}: exactly max_data_size must still encrypt"
+            );
+            let too_long = rsa_cipher_encrypt(&n, &e, pad, &vec![0u8; max + 1])
+                .expect_err("one byte over the padding limit must be refused");
+            assert_eq!(too_long.jca_class(), size, "{pad:?}: plaintext too long");
+            assert_eq!(
+                too_long.message(),
+                format!("Data must not be longer than {max} bytes"),
+                "{pad:?}: SunJCE's own wording"
+            );
+        }
+
+        // The measured limits, so a change to `hlen` or to the overheads shows
+        // up here as a number rather than as a silently different refusal.
+        assert_eq!(RsaCipherPadding::Pkcs1.max_data_size(256), Some(245));
+        assert_eq!(RsaCipherPadding::OaepSha1.max_data_size(256), Some(214));
+        assert_eq!(RsaCipherPadding::OaepSha256.max_data_size(256), Some(190));
+        // A modulus too small to hold the padding is a KEY problem, not a data
+        // one — SunJCE raises InvalidKeyException from `RSAPadding.getInstance`.
+        assert_eq!(RsaCipherPadding::OaepSha256.max_data_size(66), None);
+        assert_eq!(RsaCipherPadding::Pkcs1.max_data_size(11), None);
+
+        // ANTI-VACUITY: the three variants must map to three DIFFERENT classes.
+        // A `jca_class` that answered `BadPaddingException` for everything
+        // would satisfy most of the assertions above and would be the same
+        // defect one level down.
+        assert_ne!(
+            RsaCipherError::BlockSize(String::new()).jca_class(),
+            RsaCipherError::Padding(String::new()).jca_class()
+        );
+        assert_ne!(
+            RsaCipherError::Key(String::new()).jca_class(),
+            RsaCipherError::Padding(String::new()).jca_class()
+        );
+        // And none of them may be an unchecked class — the whole point.
+        for e in [
+            RsaCipherError::BlockSize(String::new()),
+            RsaCipherError::Padding(String::new()),
+            RsaCipherError::Key(String::new()),
+        ] {
+            assert!(
+                !e.jca_class().starts_with("java/lang/"),
+                "{:?} must not be a java.lang (unchecked) exception",
+                e
+            );
         }
     }
 

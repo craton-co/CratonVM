@@ -199,7 +199,7 @@ fn antlr_names_for_class_name(name: &str) -> AntlrClassNames {
 
 #[inline]
 fn antlr_names_for_object(ctx: &mut dyn NativeContext, obj: ObjectRef) -> AntlrClassNames {
-    ctx.class_name_of_id(ctx.class_id_of_object(obj))
+    ctx.class_name_arc_of_id(ctx.class_id_of_object(obj))
         .as_deref()
         .map(antlr_names_for_class_name)
         .unwrap_or(ANTLR_NAMES)
@@ -686,7 +686,7 @@ fn native_antlr_array_prediction_context_init_singleton(
     let parent = antlr_singleton_parent(ctx, singleton);
     let return_state = antlr_singleton_return_state(ctx, singleton);
     let pc_name = match ctx
-        .class_name_of_id(ctx.class_id_of_object(this))
+        .class_name_arc_of_id(ctx.class_id_of_object(this))
         .as_deref()
         .map(|name| name.starts_with("groovyjarjarantlr4/v4/runtime/"))
     {
@@ -1022,7 +1022,7 @@ fn antlr_new_linked_hash_map(ctx: &mut dyn NativeContext) -> Result<ObjectRef, M
         Ok(Some(Value::Object(Some(map)))) => Ok(map),
         _ => {
             let mut scope = NativeHandleScope::new(ctx);
-            let map = alloc_concurrent_synthetic(&mut *scope, "java/util/HashMap", 3);
+            let map = try_alloc_concurrent_synthetic(&mut *scope, "java/util/HashMap", 3)?;
             let map_h = scope.root(map);
             let init_args = [Value::Object(Some(scope.get(&map_h)))];
             cratonvm_native_collections::native_map_init(&mut *scope, &init_args)?;
@@ -1261,7 +1261,7 @@ fn antlr_arraylist_append(
 }
 
 fn antlr_is_java_arraylist(ctx: &mut dyn NativeContext, obj: ObjectRef) -> bool {
-    ctx.class_name_of_id(ctx.class_id_of_object(obj)).as_deref() == Some("java/util/ArrayList")
+    ctx.class_name_arc_of_id(ctx.class_id_of_object(obj)).as_deref() == Some("java/util/ArrayList")
 }
 
 fn antlr_atn_state_transitions(
@@ -2146,7 +2146,7 @@ fn antlr_semantic_context_is_precedence_predicate(
     ctx: &mut dyn NativeContext,
     sem: ObjectRef,
 ) -> bool {
-    ctx.class_name_of_id(ctx.class_id_of_object(sem))
+    ctx.class_name_arc_of_id(ctx.class_id_of_object(sem))
         .as_deref()
         .map(|name| antlr_class_name_matches(name, "/atn/SemanticContext$PrecedencePredicate"))
         .unwrap_or(false)
@@ -2693,21 +2693,21 @@ fn antlr_dfa_start_rule(ctx: &mut dyn NativeContext, dfa: ObjectRef) -> Option<i
 }
 
 fn antlr_transition_is_action(ctx: &mut dyn NativeContext, transition: ObjectRef) -> bool {
-    ctx.class_name_of_id(ctx.class_id_of_object(transition))
+    ctx.class_name_arc_of_id(ctx.class_id_of_object(transition))
         .as_deref()
         .map(|name| antlr_class_name_matches(name, "/atn/ActionTransition"))
         .unwrap_or(false)
 }
 
 fn antlr_transition_is_rule(ctx: &mut dyn NativeContext, transition: ObjectRef) -> bool {
-    ctx.class_name_of_id(ctx.class_id_of_object(transition))
+    ctx.class_name_arc_of_id(ctx.class_id_of_object(transition))
         .as_deref()
         .map(|name| antlr_class_name_matches(name, "/atn/RuleTransition"))
         .unwrap_or(false)
 }
 
 fn antlr_transition_is_epsilon(ctx: &mut dyn NativeContext, transition: ObjectRef) -> bool {
-    ctx.class_name_of_id(ctx.class_id_of_object(transition))
+    ctx.class_name_arc_of_id(ctx.class_id_of_object(transition))
         .as_deref()
         .map(antlr_transition_is_epsilon_class)
         .unwrap_or(false)
@@ -5107,7 +5107,7 @@ fn antlr_new_arraylist_with_capacity(
     capacity: usize,
 ) -> Result<ObjectRef, MethodCallFailed> {
     let mut scope = NativeHandleScope::new(ctx);
-    let list = alloc_concurrent_synthetic(&mut *scope, "java/util/ArrayList", 2);
+    let list = try_alloc_concurrent_synthetic(&mut *scope, "java/util/ArrayList", 2)?;
     let list_h = scope.root(list);
     let data = scope.new_array(cratonvm_types::ArrayElementType::Reference, capacity.max(1));
     let list = scope.get(&list_h);
@@ -5128,7 +5128,7 @@ fn antlr_new_bitset_with_alts(
         .unwrap_or(0) as usize;
     let word_count = (max_alt / 64) + 1;
     let mut scope = NativeHandleScope::new(ctx);
-    let bitset = alloc_concurrent_synthetic(&mut *scope, "java/util/BitSet", 3);
+    let bitset = try_alloc_concurrent_synthetic(&mut *scope, "java/util/BitSet", 3)?;
     let bitset_h = scope.root(bitset);
     let words = scope.new_array(cratonvm_types::ArrayElementType::Long, word_count);
     let bitset = scope.get(&bitset_h);
@@ -6047,11 +6047,14 @@ fn antlr_alloc_common_token(
     let mut scope = NativeHandleScope::new(ctx);
     let source_h = antlr_root_value(&mut scope, source);
     let text_h = antlr_root_value(&mut scope, text);
-    let class_id = scope
-        .ensure_class_initialized(ANTLR_COMMON_TOKEN)
-        .or_else(|_| {
-            Ok::<ClassId, MethodCallFailed>(scope.ensure_synthetic_class(ANTLR_COMMON_TOKEN, 9))
-        })?;
+    let class_id = match scope.ensure_class_initialized(ANTLR_COMMON_TOKEN) {
+        Ok(id) => id,
+        // Fallible since 2026-08-10 (JDK-only wave 2, step 3). `org.antlr`'s
+        // `CommonToken` is a dependency class, not a JDK one, so under
+        // `--jdk-only` fabricating a stand-in for it is exactly the
+        // substitution contract §5 refuses.
+        Err(_) => crate::util_concurrent_ext::refused_class(&mut *scope, ANTLR_COMMON_TOKEN, 9)?,
+    };
     let field_count = scope.class_num_total_fields(class_id).max(9);
     let token = scope.alloc_object(class_id, field_count);
     let token_h = scope.root(token);
@@ -7119,7 +7122,7 @@ mod antlr_prediction_context_tests {
     fn antlr_double_key_map_insert_releases_temporary_native_pins() {
         let mut ctx = mock_ctx();
         let map = ctx.fresh_object_ref();
-        let data = alloc_concurrent_synthetic(&mut ctx, "java/util/HashMap", 3);
+        let data = try_alloc_concurrent_synthetic(&mut ctx, "java/util/HashMap", 3).unwrap();
         cratonvm_native_collections::native_map_init(&mut ctx, &[Value::Object(Some(data))])
             .unwrap();
         ctx.set_field(map, 0, Value::Object(Some(data)));

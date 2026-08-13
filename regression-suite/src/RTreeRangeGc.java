@@ -29,10 +29,14 @@ import java.util.TreeSet;
  * views, which reused an element read before the comparison that moved it.
  *
  * compareTo() allocates deliberately so the collection lands inside the native.
- * The suite runs this class with --Xmx 64m: on the default heap no collection
- * happens during the walk at all and the defect is invisible. (Unlike
- * RPriorityQueueGc this one does NOT need --nojit - it reproduces with the JIT
- * on, 3/3, as long as the heap is small enough to collect.)
+ *
+ * REQUIRED CratonVM ARGUMENT: --Xmx 64m, and only that (see run.sh
+ * class_cv_args). On the default heap no collection happens during the walk at
+ * all and the class passes on a broken VM. Unlike RPriorityQueueGc this one
+ * does NOT need --nojit - it reproduces with the JIT on, 3/3 (b2e13e441), so
+ * registering it leaves the default compiling configuration under test.
+ * HotSpot deliberately does not get the flag: it is a CratonVM spelling and
+ * the expected output does not depend on the heap size.
  */
 public class RTreeRangeGc {
 
@@ -83,7 +87,26 @@ public class RTreeRangeGc {
         }
     }
 
+    /**
+     * Count of assertions executed, published on a CK line so the cross-VM diff
+     * can see a run that silently asserted fewer things than the oracle (harness
+     * guard G3; see regression-suite/harness-guard.sh and
+     * docs/known-issues/jdk-only/W7-60-harness-extract-blindness.md).
+     *
+     * The UNIT is one check() call, the same unit every other vector in the
+     * suite publishes — deliberately not "one view" or "one phase". checkMap and
+     * checkSet assert per ELEMENT inside a walk, which is what makes the number
+     * load-bearing here rather than decorative: a range view that hands back
+     * FEWER entries than it should — the empty-view failure this vector exists
+     * to catch — runs fewer per-element checks and reports a smaller number, so
+     * it diverges from the oracle's count as well as tripping the local
+     * `seen == hi - lo` assertion. Every loop below is over a fixed-size
+     * collection, so on a healthy VM the number is a constant.
+     */
+    static int checks = 0;
+
     static void check(boolean cond, String what) {
+        checks++;
         if (!cond) {
             throw new AssertionError("RTreeRangeGc: " + what);
         }
@@ -163,10 +186,16 @@ public class RTreeRangeGc {
 
         // keySet / toString walk the same snapshot through allocating code.
         long keySum = 0;
+        int keyCount = 0;
         for (K k : m.keySet()) {
             check(k.payload == k.key * 3 + 1, "keySet: corrupted " + k);
             keySum += k.key;
+            keyCount++;
         }
+        // An empty keySet() would walk no elements, assert nothing, and print a
+        // CK line that only the HotSpot diff could catch - and run.sh skips that
+        // diff when no HotSpot is present.
+        check(keyCount == ENTRIES, "keySet yielded " + keyCount + " of " + ENTRIES);
         System.out.println("CK tm-keyset " + keySum);
         check(m.toString().length() > ENTRIES, "toString truncated");
 
@@ -183,6 +212,7 @@ public class RTreeRangeGc {
         setSum += checkSet("subSet(k,true,k,false)", ns, lo, hi);
         System.out.println("CK ts-range " + setSum);
 
-        System.out.println("PASS RTreeRangeGc");
+        System.out.println("CK RTreeRangeGc checks=" + checks);
+        System.out.println("PASS RTreeRangeGc (" + checks + " checks)");
     }
 }

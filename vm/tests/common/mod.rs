@@ -67,6 +67,81 @@ pub fn require_binary(found: Option<PathBuf>) -> Option<PathBuf> {
     found
 }
 
+/// The [`require_binary`] contract for a **checked-in Java fixture**.
+///
+/// # Why this is a third helper and not a third caller of `require_binary`
+///
+/// A missing `cratonvm` binary or a missing JDK is an absent *toolchain* — a
+/// contributor can legitimately have neither, so the default has to be a skip.
+/// A missing `.java` fixture is a different animal: it is a file this
+/// repository is supposed to CARRY. Its absence is a broken checkout, not a
+/// broken workstation, and it is the single largest source of vacuous greens
+/// in this suite.
+///
+/// The 2026-08-07 audit found 23 distinct `apps/<probe>/` fixtures referenced
+/// by `vm/tests/*.rs` that are absent from the tree. `apps/` is `.gitignore`d
+/// (line 12), so every fixture ever written there was untracked and vanished
+/// for everyone but its author. The tests that drive them all had the same
+/// shape:
+///
+/// ```ignore
+/// if !probe_dir.exists() { return; }        // cargo prints `ok` in 0.00s
+/// ```
+///
+/// # What this changes, and what it deliberately does not
+///
+/// It does **not** promote a missing fixture to an unconditional panic. Doing
+/// that in one lane would turn ~60 quiet tests red at once on every developer
+/// machine, and the fixtures cannot be reconstructed from the assertions
+/// alone. What it does:
+///
+/// * the skip becomes **LOUD** — an `eprintln!` naming every path that was
+///   searched, so `cargo test -- --nocapture` shows the fixture is gone
+///   instead of showing nothing at all;
+/// * [`REQUIRE_VAR`] promotes it to a panic, exactly as for a binary or a JDK,
+///   so CI can assert that a green run was a real one.
+///
+/// Returns the first candidate that exists, so a call site can use it as its
+/// lookup:
+///
+/// ```ignore
+/// let Some(src) = common::require_fixture(
+///     "wave4_a",
+///     "the AtomicProbe fixture",
+///     &[probe_dir().join("AtomicProbe.java")],
+/// ) else { return; };
+/// ```
+///
+/// `what` should name the fixture in the words the test's own diagnostics use;
+/// it is quoted verbatim in both the skip note and the panic.
+pub fn require_fixture(tag: &str, what: &str, candidates: &[PathBuf]) -> Option<PathBuf> {
+    for c in candidates {
+        if c.exists() {
+            return Some(c.clone());
+        }
+    }
+    let searched = candidates
+        .iter()
+        .map(|p| p.display().to_string())
+        .collect::<Vec<_>>()
+        .join("\n  ");
+    if require_e2e() {
+        panic!(
+            "[{tag}] {REQUIRE_VAR} is set, but {what} is MISSING, so this test would have skipped \
+             and still reported `ok`. Searched:\n  {searched}\n\nThis is a file the repository is \
+             supposed to carry, not an absent toolchain. Note `apps/` is gitignored (.gitignore \
+             line 12): a fixture placed there is untracked and disappears for every other \
+             checkout. `probes/` is the tracked home. Unset {REQUIRE_VAR} to go back to skipping."
+        );
+    }
+    eprintln!(
+        "[{tag}] SKIPPING: {what} is MISSING. Searched:\n  {searched}\nThis test asserts NOTHING \
+         in this state. Set {REQUIRE_VAR}=1 to turn it into a failure. `apps/` is gitignored, so \
+         a fixture written there is untracked — `probes/` is the tracked home."
+    );
+    None
+}
+
 /// The [`require_binary`] contract for a JDK home.
 pub fn require_jdk(found: Option<PathBuf>) -> Option<PathBuf> {
     if found.is_none() && require_e2e() {

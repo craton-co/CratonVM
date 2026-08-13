@@ -8,6 +8,399 @@
 | **CratonVM** | PASS since 2026-08-06 on the two classes this doc named; still slow (timing only — no wrong results, no crash) |
 | **Discovered** | 2026-08-03, after fixing the `seek0`/`ExpandWar` defect that had been masking it (`fixed-suite-bugs/tomcat/testmanagerwebapp-expandwar-seek0-bad-fd-FIXED.md`) |
 
+> **Update 2026-08-11 — every `--stack-sample-ms` profile on this page has
+> been read wrong, and the correction moves the target. Also: the 08-11
+> `JarFile` fix does NOT move this page, and criterion 2 is re-verified.**
+>
+> ### The reading error: `pc=0 last_pc=0` is the INVOKE, not the callee
+>
+> The sampling hook lives at the top of the interpreter's dispatch loop
+> (`vm/src/runtime/interpreter.rs`, the `stack_dump_pending()` block). An
+> `invokevirtual` resolves, coerces arguments, pushes the callee frame and
+> `continue`s — so the **first loop iteration that can observe a re-armed
+> sample request after an invoke sees the CALLEE, at `pc=0 last_pc=0`, having
+> executed nothing.** The invoke operation's own cost is therefore reported
+> against the callee's *entry*. Aggregating leaf frames by method — which is
+> what this page has done three times — files that cost under the callee's
+> name, where it reads as "this body is slow".
+>
+> Calibrated, not argued. `probes/InvokeAttributionProbe.java` puts a
+> three-bytecode `callee()` behind an `invokevirtual` in a loop, so nearly all
+> of the loop's cost is invoke overhead **by construction**, and prints the
+> per-iteration delta against the same loop with the call written out:
+>
+> | | |
+> |---|---|
+> | `withCall` | 388–512 ns/iteration |
+> | `noCall` (control) | 94–124 ns/iteration |
+> | **invoke delta** | **290–417 ns per interpreted invoke** |
+> | samples at `callee` `pc=0 last_pc=0` | **37 of 69 = 53.6%** |
+> | samples anywhere in `callee`'s body | 1 |
+>
+> A body-weighted profiler would put ~3/14 of that loop in `callee`. The entry
+> bucket alone takes 54%, and it tracks the timed invoke share. Confirmed.
+>
+> ### What this page's profile actually says
+>
+> Re-taken 2026-08-11 on `dev` `08c8e1891`, Windows, `AnnotationScanCostProbe`
+> over all 35 `output/build/lib` jars (38 s, `--stack-sample-ms 100`, 373 leaf
+> samples), split by whether the frame had executed anything:
+>
+> | bucket | samples | share |
+> |---|---:|---:|
+> | **`pc=0 last_pc=0` — the invoke that pushed the frame** | **197** | **52.8%** |
+> |   …of which `ConstantPool.getConstant(I,Class)` | 147 | 39.4% |
+> |   …of which `BufferedInputStream.read` | 34 | 9.1% |
+> | in-body, `BufferedInputStream.read1` | 83 | 22.3% |
+> | in-body, `ConstantPool.getConstant` | 37 | 9.9% |
+> | in-body, `ConstantPool.<init>` | 23 | 6.2% |
+>
+> **Over half of this workload's interpreted time is the invoke operation**,
+> and one call-site family — BCEL's per-constant-pool-access
+> `getConstant(int, Class)` — is 39% of it.
+>
+> That re-reads both profiles this page argued from:
+>
+> * § Handoff 2026-08-07's "**55.21% `ConstantPool.getConstant`**" is not
+>   `getConstant`'s body. It is the cost of *invoking* it, 1.77 M times.
+> * The 2026-08-06 update's "**78.3% of all interpreted time in five
+>   `BufferedInputStream` bodies**" is the same shape, and its conclusion —
+>   "none of them can compile … that is why every tier-up lever moved nothing"
+>   — reached the right verdict for the wrong reason. Compiling those bodies
+>   would not have helped, because the time is not in them.
+>
+> It also explains the negative result this page found most interesting: every
+> lever that compiled or admitted a *callee* moved nothing, because the cost is
+> **reaching** the callee. `CRATONVM_JIT=sync-methods`, `loop-work-tierup` and
+> `special-tierup` were all aimed one frame too deep.
+>
+> What is left is the interpreted invoke path itself, at ~350 ns against
+> HotSpot's interpreter at ~4 ns for the same operation. § The number that
+> actually sizes this reached ~260–490 ns independently, and is the one row on
+> this page that was already measuring the right thing. This is criterion 3's
+> project, now with a profile that points straight at it and an 8-second A/B
+> harness (`InvokeAttributionProbe`) to price candidate changes without paying
+> for a 35-second scan.
+>
+> ### The 2026-08-11 `JarFile`-accessor fix does not move this page
+>
+> Recorded so it is not assumed.
+> `fixed-bugs/jarfile-accessors-stat-the-file-on-every-call-FIXED-20260811.md`
+> removed a `std::fs::metadata` (20–54 us on Windows) from every `JarFile`
+> accessor call — worth 5–18x on a jar walk and −27% on
+> `TomcatServletWebServerFactoryTests`. On this probe it is **inside the
+> noise**. Four interleaved passes, arm order reversed on even passes, HotSpot
+> control every pass, `taglibs-standard-impl`, us/class:
+>
+> | arm | p1 | p2 | p3 | p4 | mean |
+> |---|---:|---:|---:|---:|---:|
+> | before (`dev` `e05bbe374`) | 854.1 | 730.8 | 593.0 | 668.6 | **711.6** |
+> | after (`dev` `08c8e1891`) | 876.3 | 680.0 | 524.6 | 850.8 | **732.9** |
+> | HotSpot 25 | 6.7 | 12.6 | 17.0 | 19.9 | **14.1** |
+>
+> Total overlap in both orders. The reason is structural rather than
+> surprising: the probe reports `parse` as `read+parse` minus `read`, and the
+> per-entry `getInputStream` the fix speeds up is paid in **both** terms, so it
+> cancels out of the headline. A real deploy cancels nothing, which is why the
+> same fix is large there and absent here — one more reason not to use this
+> probe as the profile of record (§ Methodological finding).
+>
+> ### Criterion 2, re-verified
+>
+> 711.6 / 732.9 us/class against the 813.5 us/class band set on 2026-08-06:
+> **within band, no regression.** The cross-VM ratio reads ~50x here against
+> the ~116x recorded on Azure, which is a host difference (this host's HotSpot
+> column is 6.7–19.9 us/class) and not progress. Take the
+> CratonVM-vs-CratonVM column, as § Measuring this at all already says.
+>
+> ### The ~350 ns invoke, decomposed under `perf` — with a control arm
+>
+> Azure `20.80.105.49`, `--nojit`, `perf record -F 997`, flat, load average 11
+> (so read the shares, not any wall clock). `InvokeAttributionProbe` reproduces
+> on Linux at **450–455 ns with the call, 94–101 ns without, delta 353–370 ns**,
+> matching the Windows figure.
+>
+> The point of the probe's two arms is that the **`nocall` arm is a control**,
+> and it is a remarkably clean one — three symbols and nothing else:
+>
+> | `nocall` (no invoke at all) | |
+> |---|---:|
+> | `execute_frame_from_index` | 77.40% |
+> | `safepoint_check` | 18.17% |
+> | `try_osr_with_backoff` | 3.07% |
+>
+> **So every other symbol in the `call` arm is the invoke path**, which is what
+> makes the following a decomposition rather than a list:
+>
+> | `call` arm symbol | share | group |
+> |---|---:|---|
+> | `execute_frame_from_index` | 25.67% | *(loop — also in the control)* |
+> | `execute_invokevirtual_cached` | 15.43% | dispatcher body |
+> | `pop_and_recycle_frame_with_reason` | 6.97% | frame lifecycle |
+> | `__memmove_avx512_unaligned_erms` | 6.43% | frame lifecycle |
+> | `safepoint_check` | 4.33% | *(control)* |
+> | `Frame::new_pooled_cached` | 4.25% | frame lifecycle |
+> | `CachedInvokeTarget::clone` | 2.55% | cache |
+> | `InvokeCache::get` | 2.46% | cache |
+> | `VmHeap::is_object_address` | 2.28% | receiver checks |
+> | `ZObjectStarts::contains` | 1.98% | receiver checks |
+> | `init_locals_from_parts` | 1.98% | frame lifecycle |
+> | `try_osr_with_backoff` | 1.70% | *(control)* |
+> | `copy_args_to_locals` | 1.69% | frame lifecycle |
+> | `CompactValue::decode_by_descriptor` | 1.65% | arg decode |
+> | `execute_invokevirtual_cached::{closure#9}` | 1.65% | dispatcher body |
+> | `OrderedPlRwLock<ClassManager>::try_read` / `::read` / guard drop | 1.53 / 1.14 / 0.99% | class-manager lock |
+> | `real_http_url_connection_native` | 1.50% | native-interception chain |
+> | `intercept_force_registered_native_cached` | 1.47% | native-interception chain |
+> | `drop_glue<FrameInner>` | 1.29% | frame lifecycle |
+> | `__memset_avx512_unaligned_erms` | 1.08% | frame lifecycle |
+> | `ValueStack::from_pooled` | 0.99% | frame lifecycle |
+> | `refresh_stale_object_args` | 0.92% | receiver checks |
+> | `VmHeap::class_id_of` / `load_and_forward` | 0.72 / 0.68% | receiver checks |
+> | `push_frame_and_fire_entry` | 0.72% | JVMTI |
+> | `pop_arg_for_descriptor_checked` | 0.63% | arg decode |
+>
+> Grouped, as a share of the whole `call` arm:
+>
+> | group | share |
+> |---|---:|
+> | **frame lifecycle** (construct, fill locals, move in, move out, drop) | **~24.7%** |
+> | dispatcher body (`execute_invokevirtual_cached` + its closure) | ~17.1% |
+> | receiver / heap checks | ~6.6% |
+> | inline-cache lookup + `CachedInvokeTarget::clone` | ~5.0% |
+> | class-manager `RwLock` read, per invoke | ~3.7% |
+> | native-interception chain | ~3.0% |
+> | argument decode | ~2.3% |
+>
+> **The largest single item is not the dispatcher, it is the frame.** A
+> call-graph run (`--call-graph=dwarf`) puts the `memcpy` under
+> `pop_and_recycle_frame_with_reason` → `Vec::pop<Frame>` and under
+> `push_frame_and_fire_entry`: `Frame` is a large by-value struct and it is
+> **moved on every push and every pop**. That is the shape of the remaining
+> gap, and it is a data-structure change to the interpreter's frame stack —
+> the "genuine interpreter rewrite" this page has been calling for, now with a
+> number on it.
+>
+> Two smaller items are ordinary defects rather than architecture, and are the
+> only things here a point fix could reach:
+>
+> * **The native-interception chain, ~3.0%, is per-call-site constant.**
+>   `real_http_url_connection_native` appearing at 1.50% in a probe whose only
+>   call is `int callee(int)` is the tell: a `(class, method, descriptor)`
+>   match chain runs on every inline-cache **hit**. § Correction: it is not
+>   `try_stackless_invoke` already identified this as "where the precomputed
+>   flags half of the project belongs" — it now has a price.
+> * **A class-manager `RwLock` read per invoke, ~3.7%**, the invoke-side twin
+>   of the field-path finding in § The clusters, by mechanism.
+>
+> ### First piece taken: the returning frame is recycled in place
+>
+> The return path opened with `if let Some(f) = thread.frames.pop()`, and `f`
+> then travelled into `recycle_frame_with_shared` and again into
+> `take_pool_parts` — **three moves of a ~300-byte `Frame` to arrive at four
+> `Vec` headers**. Nothing on that path needed the frame anywhere but where it
+> already was. It now reads the dying frame through a borrow, harvests the four
+> buffers by header (`std::mem::take`), and lets `FrameStack::truncate` drop
+> the husk where it lies.
+>
+> **The mechanism moved, and only the mechanism** — same probe, same host, both
+> binaries, `perf` shares (load-independent, which matters: the box was at load
+> 17):
+>
+> | symbol | before | after |
+> |---|---:|---:|
+> | `__memmove_avx512_unaligned_erms` | 5.75% | **2.64%** |
+> | `pop_and_recycle_frame_with_reason` | 6.10% | **3.92%** |
+> | `execute_invokevirtual_cached` | 15.21% | 14.82% |
+> | `Frame::new_pooled_cached` | 3.84% | 3.87% |
+> | `is_object_address` | 2.40% | 2.45% |
+> | `CachedInvokeTarget::clone` | 2.33% | 2.36% |
+> | `InvokeCache::get` | 2.12% | 2.17% |
+> | `init_locals_from_parts` | 1.88% | 1.89% |
+>
+> **−5.3 percentage points of the invoke arm**, entirely in the two symbols the
+> change targets; every other symbol is flat. A call-graph re-run confirms the
+> `memcpy` under `Vec::pop<Frame>` is gone — what remains is attributed to
+> `intercept_force_registered_native_cached`, i.e. the *other* item on the list
+> above.
+>
+> **On the workload it is ~2%, and this host cannot resolve that.** Four
+> interleaved passes, arms reversed on even passes, `taglibs-standard-impl`
+> us/class: before 579.6 / 699.8 / 751.2 / 846.5 (mean **719.3**), after
+> 673.7 / 703.2 / 724.7 / 717.3 (mean **704.7**), HotSpot 10.7–20.6. The means
+> differ by 2.0% and the ranges overlap, so **the workload figure is a
+> prediction from the mechanism, not a measurement** — which is what the
+> arithmetic says to expect: −5.3 pp of an invoke arm that is about half the
+> scan's interpreted time. The `after` column being much tighter (674–725
+> against 580–847) is suggestive, and is not evidence.
+>
+> Correctness: 2487 `cratonvm-vm` unit tests and the 38-class regression suite
+> green on the changed binary. `regression-suite/perf/c2-reach.sh` and a
+> CratonBench pass were **not** run and are not implicated — this change alters
+> no admission or tier-up decision, so nothing moves between the tiers those
+> gates watch.
+>
+> **What is left of the frame group.** `Frame::new_pooled_cached` (3.87%),
+> `init_locals_from_parts` (1.89%) and `copy_args_to_locals` (1.64%) are the
+> push side, and the symmetric fix — constructing into the slot rather than
+> moving into it — is **not** justified on this evidence:
+> `push_frame_and_fire_entry` no longer appears among the `memcpy` callers at
+> all after this change, so the push-side move is either already elided by the
+> compiler or below 0.5%. Re-measure before building it.
+>
+> ### Second piece taken: the interception chain is classified once per call site
+>
+> `intercept_force_registered_native_cached` runs on every inline-cache hit.
+> Below its memoized `force_native_cache` sat three arms still evaluated from
+> scratch every time, and **every one of their keys is a function of the call
+> site's own triple**:
+>
+> * a `ClassLoader` null-resource re-target — `(method_name, descriptor)`
+>   against three pairs;
+> * a `java/lang/Class` reflection re-target — the same pair against four more;
+> * `real_http_url_connection_native`, whose *entire* gate is `class_name`
+>   against five literals.
+>
+> `CachedBytecodeMethod` now carries an `intercept_shape_cache: OnceLock<u8>`
+> classifying the triple against all three, once. The argument- and
+> receiver-dependent halves are untouched: a set bit still runs the original
+> test in full, and a clear bit skips a test whose name-keyed half could not
+> have matched.
+>
+> | symbol | before | after |
+> |---|---:|---:|
+> | `intercept_force_registered_native_cached` | 1.44% | **0.99%** |
+> | `real_http_url_connection_native` | 1.29% | **absent** |
+> | **total** | **2.73%** | **0.99%** |
+>
+> **-1.74 percentage points, a 64% cut**, and one function leaves the hot path
+> entirely. Wall clock, four interleaved passes at load 20: before mean 318 ns
+> per invoke (303-344), after 300.5 (275-326) — the ranges overlap, so as with
+> the frame change the mechanism is the evidence and the wall clock is not.
+> 2490 unit tests and the 38-class regression suite green.
+>
+> **A recorded negative, because it is the interesting half.** The first
+> version added a `shape == 0` early return into a shared tail function, on the
+> reasoning that the common call site should not even step over three bit
+> tests. Measured, that was **worse than leaving the control flow alone**:
+> entry 1.05% + tail 1.12% = 2.17%, against 0.99% for the same string-work
+> removal with the arms guarded in place and no split. The function boundary
+> cost more than the three bit tests it skipped. The comment in
+> `intercept_force_registered_native_cached` says so, so the shortcut does not
+> get reinvented.
+>
+> ### Third piece: half the per-invoke class-manager lock, and a working instrument
+>
+> **The instrument first.** `--call-graph=dwarf` could not attribute this: it
+> named two inlined callers, `intercept_classloader_set_default_assertion_status`
+> and `init_locals_from_parts`, and **neither takes a lock** (checked against
+> the source). `--no-inline` collapsed the chains to the symbol itself with one
+> arm at a bare `0x18700000000` — the unwinder had no usable parents at all.
+> A rebuild with `RUSTFLAGS="-C force-frame-pointers=yes"` and
+> `perf record --call-graph=fp` named the caller immediately and correctly.
+> **Use a frame-pointer build for any call-graph question on this binary.**
+>
+> It put both acquisitions directly in `execute_invokevirtual_cached`:
+> `try_read` 1.85%, `read` 1.43%, read-guard `drop_glue` 1.28%.
+>
+> **What `try_read` was.** The virtual tier-up gate computed two predicates
+> into `let` bindings *above* the `if` that consumes them:
+> `has_registered_native` (a `NativeMethodRegistry` resolve) and
+> `receiver_is_java_util` (class-manager `try_read` + `get_class` +
+> `starts_with("java/util/")`). The `&&` chain below them is ordered cheapest-
+> first and short-circuits — but eager `let`s never see it. Under `--nojit`,
+> where `!disable_jit()` makes the chain fail several conditions earlier, the
+> work was done anyway, on **every cached invoke in the VM**, to decide an
+> optional tier-up that could not happen.
+>
+> Both are now closures called in place in the chain, and
+> `has_registered_native()` is ordered after the JIT kill-switch. Every
+> condition here is a pure predicate, so `&&` may order them freely.
+>
+> `try_read` **disappears from the profile entirely**. And with the host
+> finally quiet (load 3.5), six interleaved passes, arm order reversed each
+> pass, ns per interpreted invoke:
+>
+> | | p1 | p2 | p3 | p4 | p5 | p6 | mean |
+> |---|---:|---:|---:|---:|---:|---:|---:|
+> | before | 203 | 202 | 201 | 201 | 201 | 202 | **201.7** |
+> | after | 193 | 195 | 194 | 193 | 194 | 195 | **194.0** |
+>
+> **-3.8%, 6/6, and no overlap between the two columns** — the first fully
+> separated wall-clock reading in this whole sequence, which is what a quiet
+> host buys and nothing else does. 2490 unit tests and the 38-class regression
+> suite green.
+>
+> **The other half is now attributed, not fixed.** The remaining `::read`
+> (2.01%, same function) is `dispatch_virtual.rs`'s annotation-proxy gate: on
+> every non-`invokespecial` virtual invoke it takes the class-manager read
+> lock, calls `get_class(actual_class_id)` and compares the name against the
+> single literal `"java/lang/annotation/AnnotationProxy"`. Unlike the tier-up
+> predicates it is a **correctness** gate consumed immediately, so it cannot be
+> deferred — it has to become an identity test. Resolve that one class's
+> `ClassId` once and compare ids; a name comparison per invoke is also exactly
+> the shape `reference_class_name_shape_tests_are_dispatch_bugs` warns about.
+> It needs generation-aware memoization (a class defined later must not be
+> missed), which is why it is recorded here rather than guessed at.
+>
+> ### The annotation-proxy gate: scoped, and why it is a cache-population change
+>
+> The last named item, ~2.0% of the invoke arm. On every non-`invokespecial`
+> virtual invoke `execute_invokevirtual_cached` takes the class-manager read
+> lock, calls `get_class(actual_class_id)` and compares the name against one
+> literal, `"java/lang/annotation/AnnotationProxy"`, to decide whether to force
+> a `CacheMiss`.
+>
+> Two things were checked before proposing anything, and both change the answer:
+>
+> * **It cannot be memoized on `CachedBytecodeMethod`**, which is where the
+>   other two per-call-site memos on this path live
+>   (`force_native_cache`, `intercept_shape_cache`). That struct describes the
+>   resolved *target method*, whose declaring class is frequently a supertype —
+>   an `AnnotationProxy` receiver calling an inherited `Object` method shares
+>   its entry with every other receiver of that method. A bit cached there
+>   would answer for the wrong class.
+> * **It cannot be deferred** the way the tier-up predicates were. Those gate an
+>   optional promotion; this one is consumed immediately and decides
+>   correctness.
+>
+> What makes it tractable is the branch above it: when
+> `actual_class_id != receiver_class_id` the code either rebinds to the
+> polymorphic entry **for `actual_class_id`** or returns `CacheMiss`. So by the
+> time the gate runs, the live `CachedInvokeTarget::VirtualBytecode` is the
+> entry for exactly this receiver class — and "is this receiver class the
+> annotation proxy" is a **per-cache-entry constant**.
+>
+> **So the fix is to compute it once at cache-population time**
+> (`populate_virtual_invoke_cache` already holds the class manager) and store a
+> bool on the `VirtualBytecode` variant, leaving the hit path a field test.
+> Entry invalidation is already handled by `entry_gate.generation`, so this
+> needs no epoch key of its own — unlike the alternative of a global
+> `ClassId`-keyed memo, which would have to answer two questions this
+> investigation has not: whether that name can be defined under more than one
+> loader, and whether a `ClassId` can be recycled after class unloading
+> (`RClassUnloadSweep` says unloading exists). Guessing either one wrong in a
+> correctness gate is the failure mode this page already documents five times.
+>
+> It touches `CachedInvokeTarget` — a hot enum cloned on every cache hit — and
+> every site that constructs the variant, which is why it is scoped here rather
+> than done alongside the three smaller fixes above. `class_definition_epoch()`
+> (one `Acquire` load) is the right key if a global memo is chosen instead.
+>
+> **Coordinate first**: `fix/jdk-only-strict-annotation-proxy-20260811` was an
+> active worktree while this was written and is likely editing the same
+> predicate for policy reasons.
+>
+> **One caution about that call-graph run**, because it nearly cost a session:
+> `perf` also attributed a 3.16% `memcpy` arm to `dbg_loader_trace` inlined
+> inside `execute_invokevirtual_cached`, which would have been a spectacular
+> find — a debug predicate copying memory on every invoke. It is not real.
+> `dbg_loader_trace()` is `cached_is_ok!`, a memoised `MemoSlot` load that
+> cannot copy anything. `--call-graph=dwarf` mis-nests inlined frames, so an
+> inline attribution has to be checked against the source before it is
+> believed; the two non-inlined attributions in the same output
+> (`Vec::pop<Frame>`, `push_frame_and_fire_entry`) are the trustworthy ones.
+
 > **Update 2026-08-07 — I tried to close this and could not. Here is the
 > measured ceiling, three corrections to what is written below, and a re-scope.**
 >
@@ -146,6 +539,12 @@
 >    § Untaken levers already says. Setting a throughput number before that
 >    project scopes itself would be inventing one.
 >
+>    **2026-08-11: that project now has a measured target.** Over half of this
+>    workload's interpreted time is the invoke operation, ~350 ns of it, and
+>    the biggest piece is not dispatch logic but **moving a by-value `Frame`
+>    in and out of the frame stack** (~24.7% of the invoke arm). See the
+>    2026-08-11 update at the top for the control-arm decomposition.
+>
 > `probes/NativeBridgeCostProbe.java` (added with this update) is the tool for
 > the recurring "is this bridge worth it" question: it prices a registered
 > native against a byte-for-byte equivalent body that has no registration, in
@@ -165,7 +564,7 @@
 > `AnnotationScanCostProbe`) found three removable costs worth 4.04x on this
 > doc's own metric and 4.56x on the deploy the metric stands in for. Full
 > write-up, evidence and commits:
-> `../../internal/fixed-suite-bugs/tomcat/testmanagerwebapp-post-seek0fix-read-timeout-FIXED.md`.
+> `fixed-suite-bugs/tomcat/testmanagerwebapp-post-seek0fix-read-timeout-FIXED.md`.
 >
 > * **`jmx_locked_monitors` leaked, and the leak was quadratic — 14.9% of the
 >   run.** Two of the four `complete_jmx_monitor_enter` publishers never
@@ -410,7 +809,7 @@ It is the **per-byte I/O call chain**: ~376 ns for one
 more for the `DataInputStream.readUnsignedByte()` wrapper, against HotSpot's
 ~0.5 ns. That is exactly the frame the stack dump named all along, and it puts
 this doc in
-`../../internal/fixed-suite-bugs/tomcat/31-synchronized-code-never-jit-compiled-FIXED.md`'s
+`fixed-suite-bugs/tomcat/31-synchronized-code-never-jit-compiled-FIXED.md`'s
 territory plus the VM-wide per-call floor — not in admission-gate territory.
 
 The same probe used to **SIGSEGV on CratonVM** in its `arrayRead` stage on the
@@ -903,7 +1302,7 @@ they read as clean negatives:
 ## Prior art
 
 This is the same wall
-`../../internal/tomcat/04-embedded-server-throughput-wall-CLOSED.md`
+`tomcat/04-embedded-server-throughput-wall-CLOSED.md`
 measured on 2026-07-27 (it recorded 13–16 µs per byte for the identical
 `DataInputStream`/`BufferedInputStream` operation; today's
 `ByteReadCostProbe` reads 15.0 µs) and handed to

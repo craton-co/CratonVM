@@ -46,6 +46,7 @@ use crate::lang_class::{
 use crate::obj_arg;
 
 use std::sync::OnceLock;
+use cratonvm_types::error::MethodCallFailed;
 
 /// Cached `CRATONVM_DBG_METHOD_INVOKE_BOX` lookup. `Method.invoke`'s
 /// defensive-box wrap-up runs on every reflective call (and ByteBuddy /
@@ -176,6 +177,108 @@ pub(crate) fn native_accessible_set_accessible(
 // unaided. Skipping (2) made `canAccess` answer true for a private `java.base`
 // field the caller could not read — `probes/SetAccessibleModuleProbe.java`'s
 // `afterDenied isAccessible` line, where HotSpot 25 says false.
+//
+// Question (1) is not a `false`, though — it is an ARGUMENT error, and HotSpot
+// raises it before question (2) is asked at all. Measured on Temurin 25.0.3
+// (`probes/CanAccessReceiverProbe.java`, the full 28-row static x null x
+// wrong-type x right-type matrix):
+//
+//   instance member, obj == null        -> IAE "null object for <member>"
+//   instance member, not an instance    -> IAE "object is not an instance of <Class>"
+//   static member,   obj != null        -> IAE "non-null object for <member>"
+//   constructor,     obj != null        -> IAE "non-null object for <member>"
+//
+// and `Integer.value.canAccess("x")` THROWS rather than answering the `false`
+// its access check would produce, which is what pins the ordering. All four
+// answered a plain `false` here before this fix. `setAccessible(true)` does not
+// suppress any of them: the argument is validated whether or not the override
+// is set.
+
+/// Does this member require a `null` receiver? Static members do, and so do
+/// constructors — `Modifier.isStatic` is false for a constructor, but HotSpot
+/// groups it with the static arm (measured: `ctor.canAccess(anInstance)` throws
+/// `"non-null object for public Target()"`, it does not answer `false`).
+fn receiver_must_be_null(is_static: bool, is_constructor: bool) -> bool {
+    is_static || is_constructor
+}
+
+/// `member.toString()`, for the two messages that embed it.
+///
+/// Routed through the member's own `toString` rather than rebuilt from the
+/// modifiers and descriptor: the JDK's message is literally `"null object for "
+/// + member`, so reusing the same text keeps the two in step for free. Falls
+/// back to the empty string if the call fails — a message that is missing its
+/// tail is still the right exception, and inventing a DIFFERENT exception out
+/// of a `toString` failure would be worse than the divergence being fixed.
+fn member_display(ctx: &mut dyn NativeContext, member: ObjectRef) -> String {
+    match ctx.invoke_virtual(member, "toString", "()Ljava/lang/String;", &[]) {
+        Ok(Some(Value::Object(Some(s)))) => ctx.read_string(s).unwrap_or_default(),
+        _ => String::new(),
+    }
+}
+
+/// HotSpot's receiver-argument validation, run BEFORE any access decision.
+///
+/// `Ok(())` means the receiver is the right shape and the access half may run.
+fn check_can_access_receiver(
+    ctx: &mut dyn NativeContext,
+    member: ObjectRef,
+    obj_arg: Value,
+    must_be_null: bool,
+) -> Result<(), MethodCallFailed> {
+    if must_be_null {
+        if matches!(obj_arg, Value::Object(None)) {
+            return Ok(());
+        }
+        let shown = member_display(ctx, member);
+        return Err(crate::lang_class::illegal_arg_exc(format!(
+            "non-null object for {shown}"
+        )));
+    }
+
+    let Value::Object(Some(receiver)) = obj_arg else {
+        let shown = member_display(ctx, member);
+        return Err(crate::lang_class::illegal_arg_exc(format!(
+            "null object for {shown}"
+        )));
+    };
+
+    let Value::Object(Some(declaring)) = method_clazz_value(ctx, member) else {
+        // No declaring-class mirror to test against. Not knowable, so do not
+        // manufacture an argument error out of it; the access half will fail
+        // this member closed on its own.
+        return Ok(());
+    };
+    let Some(declaring_id) = mirror_class_id(ctx, declaring) else {
+        return Ok(());
+    };
+    let receiver_id = ctx.class_id_of_object(receiver);
+    // `is_subclass` is full assignability — it walks interfaces as well as
+    // superclasses, so a default method's declaring INTERFACE is matched by an
+    // implementing receiver, and lambda proxies route through
+    // `lambda_proxy_satisfies`. That is `Class.isInstance`, which is the test
+    // HotSpot makes.
+    if ctx.is_subclass(receiver_id, declaring_id) {
+        return Ok(());
+    }
+    // A negative from `is_subclass` is only trustworthy when the receiver's
+    // hierarchy is READABLE: `is_subclass_or_unreadable` returns false exactly
+    // when the superclass chain terminated at a real `java/lang/Object` without
+    // meeting the ancestor. Anything else is "cannot tell", and this throw is
+    // new on a path that previously only ever returned `false` — a fabricated
+    // stand-in with no modelled supertype chain must not be the thing that
+    // invents an exception.
+    if is_subclass_or_unreadable(ctx, receiver_id, declaring_id) {
+        return Ok(());
+    }
+    let name = ctx
+        .class_name_of_id(declaring_id)
+        .map(|n| crate::lang_class::dotted_binary_name(&n))
+        .unwrap_or_default();
+    Err(crate::lang_class::illegal_arg_exc(format!(
+        "object is not an instance of {name}"
+    )))
+}
 
 fn can_access_member(
     ctx: &mut dyn NativeContext,
@@ -183,44 +286,64 @@ fn can_access_member(
     obj_arg: Value,
     is_static: bool,
     modifiers: i32,
-) -> bool {
-    // Static member: receiver MUST be null per spec.
+) -> Result<bool, MethodCallFailed> {
+    // Field and Method only — `Constructor.canAccess` has its own entry point,
+    // because its rule is not derivable from `Modifier.isStatic`.
+    check_can_access_receiver(ctx, member, obj_arg, receiver_must_be_null(is_static, false))?;
+
+    // Static member: receiver is null, validated just above.
     if is_static {
-        if !matches!(obj_arg, Value::Object(None)) {
-            return false;
-        }
         let declaring_id = match method_clazz_value(ctx, member) {
             Value::Object(Some(m)) => mirror_class_id(ctx, m),
             _ => None,
         };
         let Some(declaring_id) = declaring_id else {
-            return false;
+            return Ok(false);
         };
-        return member_is_accessible_here(ctx, member, declaring_id, modifiers);
+        // `None` receiver: a static member has no target type, exactly as
+        // `Field.checkAccess` passes `null` for one. Measured on Temurin 25.0.3,
+        // the protected STATIC `java.io.PipedInputStream.PIPE_SIZE` reads OK
+        // through every receiver, so the refinement must not reach here.
+        return Ok(member_is_accessible_here(
+            ctx,
+            member,
+            declaring_id,
+            modifiers,
+            None,
+        ));
     }
 
-    // Instance member: receiver MUST be non-null AND assignable to the
-    // declaring class.
+    // Instance member: the receiver is non-null and an instance of the
+    // declaring class, both established by `check_can_access_receiver`.
     let receiver = match obj_arg {
         Value::Object(Some(r)) => r,
-        _ => return false,
+        _ => return Ok(false),
     };
 
     let declaring = match method_clazz_value(ctx, member) {
         Value::Object(Some(m)) => m,
-        _ => return false,
+        _ => return Ok(false),
     };
     let declaring_id = match mirror_class_id(ctx, declaring) {
         Some(id) => id,
-        None => return false,
+        None => return Ok(false),
     };
     let receiver_id = ctx.class_id_of_object(receiver);
-    // is_subclass(child, parent) returns true iff `child` is `parent` or a
-    // subclass of it; equivalently, `parent.isAssignableFrom(child)`.
-    if !ctx.is_subclass(receiver_id, declaring_id) {
-        return false;
-    }
-    member_is_accessible_here(ctx, member, declaring_id, modifiers)
+    // Carry the receiver's class on to the access half. `canAccess` must answer
+    // the question `Field.get` will actually answer, and JLS §6.6.2.1 makes that
+    // question receiver-dependent: measured on Temurin 25.0.3 from a classpath
+    // subclass of `java.io.ByteArrayOutputStream`, `buf.canAccess` is `true` for
+    // the caller's own instance and `false` for a bare superclass instance or a
+    // sibling subclass — the same three answers `Field.get` gives. Passing the
+    // ClassId rather than the ObjectRef keeps the whole subtree free of object
+    // references a moving GC could invalidate.
+    Ok(member_is_accessible_here(
+        ctx,
+        member,
+        declaring_id,
+        modifiers,
+        Some(receiver_id),
+    ))
 }
 
 /// The second half of `canAccess`: the override flag, else the unaided access
@@ -230,11 +353,12 @@ fn member_is_accessible_here(
     member: ObjectRef,
     declaring_id: cratonvm_types::ClassId,
     modifiers: i32,
+    receiver: Option<ClassId>,
 ) -> bool {
     if crate::lang_class::accessible_override_is_set(ctx, member) {
         return true;
     }
-    crate::lang_class::verify_member_access(ctx, declaring_id, modifiers)
+    crate::lang_class::verify_member_access(ctx, declaring_id, modifiers, receiver)
 }
 
 pub(crate) fn native_method_can_access(
@@ -248,7 +372,7 @@ pub(crate) fn native_method_can_access(
     };
     let is_static = (modifiers & 0x0008) != 0;
     let obj = args.get(1).copied().unwrap_or(Value::Object(None));
-    let ok = can_access_member(ctx, this, obj, is_static, modifiers);
+    let ok = can_access_member(ctx, this, obj, is_static, modifiers)?;
     Ok(Some(Value::Int(if ok { 1 } else { 0 })))
 }
 
@@ -263,7 +387,7 @@ pub(crate) fn native_field_can_access(
     };
     let is_static = (modifiers & 0x0008) != 0;
     let obj = args.get(1).copied().unwrap_or(Value::Object(None));
-    let ok = can_access_member(ctx, this, obj, is_static, modifiers);
+    let ok = can_access_member(ctx, this, obj, is_static, modifiers)?;
     Ok(Some(Value::Int(if ok { 1 } else { 0 })))
 }
 
@@ -272,21 +396,26 @@ pub(crate) fn native_constructor_can_access(
     args: &[Value],
 ) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
-    // Constructors are never static — receiver must be null per spec.
     let obj = args.get(1).copied().unwrap_or(Value::Object(None));
     let modifiers = match ctx.get_field_by_name(this, "modifiers") {
         Value::Int(v) => v,
         _ => 0,
     };
+    // `Modifier.isStatic` is false for a constructor, but HotSpot still
+    // requires a null receiver and raises `"non-null object for <ctor>"` for
+    // anything else rather than answering `false` — measured, not assumed.
+    check_can_access_receiver(ctx, this, obj, receiver_must_be_null(false, true))?;
     let declaring_id = match method_clazz_value(ctx, this) {
         Value::Object(Some(m)) => mirror_class_id(ctx, m),
         _ => None,
     };
-    let ok = matches!(obj, Value::Object(None))
-        && match declaring_id {
-            Some(id) => member_is_accessible_here(ctx, this, id, modifiers),
-            None => false,
-        };
+    let ok = match declaring_id {
+        // The receiver is required to be null (validated just above), so there
+        // is no receiver whose type could narrow JLS 6.6.2.1's protected rule.
+        // `None` is the only correct argument here, not a fallback.
+        Some(id) => member_is_accessible_here(ctx, this, id, modifiers, None),
+        None => false,
+    };
     Ok(Some(Value::Int(if ok { 1 } else { 0 })))
 }
 
@@ -700,7 +829,7 @@ pub(crate) fn native_class_get_enclosing_method_public(
     let methods = ctx.declared_methods(enc_class_id);
     for meta in &methods {
         if &*meta.name == method_name && &*meta.descriptor == method_desc {
-            let m = create_method_object(ctx, meta);
+            let m = create_method_object(ctx, meta)?;
             return Ok(Some(Value::Object(Some(m))));
         }
     }
@@ -742,7 +871,7 @@ pub(crate) fn native_class_get_enclosing_constructor_public(
     let methods = ctx.declared_methods(enc_class_id);
     for meta in &methods {
         if &*meta.name == "<init>" && &*meta.descriptor == method_desc {
-            let c = create_constructor_object(ctx, meta);
+            let c = create_constructor_object(ctx, meta)?;
             return Ok(Some(Value::Object(Some(c))));
         }
     }
@@ -800,7 +929,7 @@ pub(crate) fn native_method_get_default_value(
         Some(class_id),
         container_loader,
         Some(class_id),
-    )))
+    )?))
 }
 
 // ---------------------------------------------------------------------------
@@ -980,7 +1109,7 @@ pub(crate) fn native_method_get_generic_exception_types(
                     let _gscope = crate::generics::GenericDeclScope::new(decl);
                     let v = crate::generics::type_sig_to_java(ctx, t);
                     let arr = ctx.read_native_pin(arr_pin, arr);
-                    ctx.set_array_element(arr, i, v);
+                    ctx.set_array_element(arr, i, v?);
                 }
                 let arr = ctx.read_native_pin(arr_pin, arr);
                 ctx.unpin_native_roots(arr_pin);
@@ -1307,6 +1436,34 @@ fn runtime_package_of(ctx: &mut dyn NativeContext, class_id: ClassId) -> Option<
 /// The host is resolved with `class_id_by_name_near(.., class_id)` rather than
 /// the ambient `class_id_by_name` so a duplicate binary name defined by another
 /// loader cannot be substituted for the real host.
+///
+/// # The hidden-class arm
+///
+/// It mirrors `classloading::access_control::confirmed_nest_host`'s arm, and
+/// for that function's stated reason: a JEP 371 hidden class's `nest_host` is
+/// **not** read from its class file at all — `define_class_with_options`
+/// overwrites whatever the bytes claimed with the defining `Lookup`'s own
+/// class, and no `NestMembers` round-trip is possible because the host cannot
+/// name a class whose name no class file can spell. The claim is authoritative
+/// because only the defining call could have made it.
+///
+/// L15 recorded this arm as missing and unfixable, on the grounds that
+/// `NativeContext` had no hidden-class question to ask. **That was a grep for
+/// the wrong name.** There is no `is_hidden_class`, but there is
+/// `NativeContext::is_class_hidden` (`native-api/src/registry.rs`), backed by a
+/// real `ClassManager` read in `vm/src/vm/vm_exec.rs` and by the mock's
+/// `hidden_classes` set — not a defaulted `false`, so this arm is exercised
+/// rather than inert. Without it a hidden class always resolved to itself as
+/// host and never matched a nestmate, so `defineHiddenClass(.., NESTMATE)` and
+/// lambda-proxy classes were denied reflective access their bytecode already
+/// has. That failed CLOSED, which is why it was a divergence and not a hole;
+/// closing it only ever admits, and it cannot admit anything
+/// `access_control.rs` does not already admit at the bytecode level.
+///
+/// The W3-2 complement holds here unchanged: a hidden class defined WITHOUT
+/// `ClassOption::NESTMATE` has its class-file `NestHost` discarded at
+/// definition time, so it reaches the self-host arm above and this one never
+/// sees it.
 fn confirmed_nest_host_name(ctx: &mut dyn NativeContext, class_id: ClassId) -> Option<String> {
     let own = ctx.class_name_of_id(class_id)?;
     let claimed = match ctx.nest_host_name(class_id) {
@@ -1316,6 +1473,11 @@ fn confirmed_nest_host_name(ctx: &mut dyn NativeContext, class_id: ClassId) -> O
         Some(h) if h != own => h,
         _ => return Some(own),
     };
+    // Arm order matches `confirmed_nest_host`: self-host, then hidden, then the
+    // confirmation round-trip.
+    if ctx.is_class_hidden(class_id) {
+        return Some(claimed);
+    }
     let host_id = match ctx.class_id_by_name_near(&claimed, class_id) {
         Some(id) => id,
         // Host not loadable/loaded → claim unconfirmed → own host.
@@ -1344,6 +1506,12 @@ fn classes_are_nestmates(ctx: &mut dyn NativeContext, a: ClassId, b: ClassId) ->
 }
 
 /// Is `caller` a subclass of `declaring` (JLS §6.6.2, the `protected` arm)?
+///
+/// FAILS CLOSED, unlike [`is_subclass_or_unreadable`]: this arm only ever
+/// *widens* — its `false` leaves `caller_may_access_member` at the refusal it
+/// would have reached anyway — so an unreadable hierarchy costs nothing here.
+/// Every caller that turns a `false` into a NEW refusal must use the tri-state
+/// walk instead.
 fn caller_is_subclass_of(ctx: &mut dyn NativeContext, caller: ClassId, declaring: ClassId) -> bool {
     let mut cursor = caller;
     for _ in 0..MAX_SUPERCLASS_WALK {
@@ -1358,6 +1526,86 @@ fn caller_is_subclass_of(ctx: &mut dyn NativeContext, caller: ClassId, declaring
     false
 }
 
+/// Is `subject` `ancestor` or a subclass of it — answering "yes" whenever the
+/// hierarchy cannot be read?
+///
+/// This is the walk every rule needs when a `false` becomes a NEW refusal.
+/// `superclass_of` answering `None` is ambiguous: it is the truth for
+/// `java.lang.Object`, and it is equally what a fabricated synthetic-JDK
+/// stand-in with no modelled supertype answers. Only the first is evidence that
+/// the walk really did visit a whole hierarchy without meeting `ancestor`; the
+/// second is an unreadable input, and an unreadable input must not invent a
+/// denial. Same reasoning for exhausting [`MAX_SUPERCLASS_WALK`]: a chain that
+/// long is a cycle or a corrupt model, not a measured answer.
+///
+/// The synthetic-JDK mode is the concrete reason this matters rather than being
+/// theoretical: `--synthetic-jdk` fabricates stand-ins for real JDK classes and
+/// gives them supertypes only where a stub table declares them, so a class there
+/// routinely has a truncated chain that a real class file would never have. A
+/// rule about real class hierarchies must not catch it, and the synthetic-jdk vm
+/// gate is blocking at zero failures.
+///
+/// Note this is deliberately NOT `NativeContext::is_subclass`: that predicate is
+/// two-valued and reports a fabricated stand-in as "not a subclass", which is
+/// exactly the spurious refusal above.
+///
+/// Interfaces are not walked, and do not need to be: every rule that uses this
+/// asks about an INSTANCE relationship (a receiver's class, a caller's
+/// superclass chain), and instance fields and the `protected` arm of JLS §6.6.2
+/// are both class-only questions.
+pub(crate) fn is_subclass_or_unreadable(
+    ctx: &mut dyn NativeContext,
+    subject: ClassId,
+    ancestor: ClassId,
+) -> bool {
+    let mut cursor = subject;
+    for _ in 0..MAX_SUPERCLASS_WALK {
+        if cursor == ancestor {
+            return true;
+        }
+        match ctx.superclass_of(cursor) {
+            Some(s) => cursor = s,
+            None => {
+                // A chain that ended at a real `java/lang/Object` is a COMPLETE
+                // hierarchy that never met `ancestor` — deny. A chain that ended
+                // anywhere else ended somewhere unreadable — allow.
+                return !matches!(
+                    ctx.class_name_arc_of_id(cursor).as_deref(),
+                    Some("java/lang/Object")
+                );
+            }
+        }
+    }
+    true
+}
+
+/// JLS §6.6.2.1, the receiver refinement of the `protected` rule: once a
+/// foreign-package subclass has been admitted by `caller_is_subclass_of`, it
+/// may still only reach the member through a receiver whose class is `caller`
+/// itself or a subclass of `caller`.
+///
+/// `receiver == None` means the question does not arise — a `static` member has
+/// no receiver (HotSpot passes `null` for `targetClass` and
+/// `verifyMemberAccess` skips the refinement outright), and a call site that
+/// simply does not have the receiver in hand must not manufacture a denial from
+/// its absence.
+///
+/// FAILS OPEN on anything it cannot read, matching
+/// `lang_class::public_member_class_is_reachable` — the walk and its fail-open
+/// rule both live in [`is_subclass_or_unreadable`] so this rule, the
+/// `setAccessible` carve-out and the receiver-type check cannot drift on what
+/// "cannot tell" means.
+fn protected_receiver_is_permitted(
+    ctx: &mut dyn NativeContext,
+    caller: ClassId,
+    receiver: Option<ClassId>,
+) -> bool {
+    let Some(receiver) = receiver else {
+        return true;
+    };
+    is_subclass_or_unreadable(ctx, receiver, caller)
+}
+
 /// Decide whether `caller` is entitled — by the ordinary JLS §6.6.1 rules, with
 /// no `setAccessible(true)` override — to reflectively use a member of
 /// `declaring` whose access flags are `modifiers`.
@@ -1368,11 +1616,40 @@ fn caller_is_subclass_of(ctx: &mut dyn NativeContext, caller: ClassId, declaring
 /// checked after it by `lang_class::check_reflection_module_access`. Answering
 /// `true` here does not bypass the module check — see
 /// `docs/known-issues/jdk-only/L1-reflect-setaccessible-invoke.md`.
+///
+/// `receiver` is the JLS §6.6.2.1 *target type* — HotSpot's
+/// `Reflection.verifyMemberAccess(currentClass, memberClass, targetClass,
+/// modifiers)` third argument, which `Field.checkAccess` fills in as
+/// `Modifier.isStatic(modifiers) ? null : obj.getClass()`. It steers ONLY the
+/// `protected` arm; every other arm ignores it, and passing `None` reproduces
+/// this function's pre-receiver behaviour exactly.
+///
+/// Measured on Temurin 25.0.3 from a classpath subclass of
+/// `java.io.ByteArrayOutputStream`, reading the `protected` `buf`/`count` with
+/// no `setAccessible` and no flags — the four rows the refinement exists for:
+///
+/// | receiver                      | outcome                    |
+/// |-------------------------------|----------------------------|
+/// | the caller's own class        | OK                         |
+/// | a subclass of the caller      | OK                         |
+/// | the superclass (`BAOS` bare)  | `IllegalAccessException`   |
+/// | a SIBLING subclass of `BAOS`  | `IllegalAccessException`   |
+///
+/// The sibling row is the one that reads as surprising and is the point of the
+/// rule: being a subclass of the *declaring* class is not enough, the receiver
+/// must be under the *caller*. Neither `--add-exports java.base/java.io` nor
+/// `--add-opens java.base/java.io` moves any of the four — the refinement is
+/// pure JLS and orthogonal to JPMS. `protected static` is exempt: the same
+/// matrix on the `protected static` `java.io.PipedInputStream.PIPE_SIZE`
+/// answers OK for every receiver, including a sibling, a bare `Object` and
+/// `null`. Both halves are asserted in `regression-suite/src/
+/// RJdkFieldModule.java` sections 7 and 7b.
 pub(crate) fn caller_may_access_member(
     ctx: &mut dyn NativeContext,
     caller: ClassId,
     declaring: ClassId,
     modifiers: i32,
+    receiver: Option<ClassId>,
 ) -> bool {
     // A public member of an accessible class needs no caller analysis. (Call
     // sites short-circuit this already; keep it so the helper is safe alone.)
@@ -1388,6 +1665,13 @@ pub(crate) fn caller_may_access_member(
         return classes_are_nestmates(ctx, caller, declaring);
     }
     // `protected` and package-private both admit a same-runtime-package caller.
+    //
+    // This arm must stay AHEAD of the protected arm below, because the receiver
+    // refinement is skipped entirely when the caller and the declaring class
+    // share a runtime package (`verifyMemberAccess` guards it with
+    // `if (!isSameClassPackage)`). Witness on Temurin 25.0.3: a subclass in the
+    // SAME package as the declaring class reads the protected field through a
+    // bare superclass receiver with no complaint.
     let same_package = match (
         runtime_package_of(ctx, caller),
         runtime_package_of(ctx, declaring),
@@ -1399,8 +1683,12 @@ pub(crate) fn caller_may_access_member(
         return true;
     }
     if (modifiers & ACC_PROTECTED_MEMBER) != 0 {
-        // JLS §6.6.2: a subclass reaches inherited protected members.
-        return caller_is_subclass_of(ctx, caller, declaring);
+        // JLS §6.6.2: a subclass reaches inherited protected members...
+        if !caller_is_subclass_of(ctx, caller, declaring) {
+            return false;
+        }
+        // ...but §6.6.2.1 then narrows WHICH objects it may reach them on.
+        return protected_receiver_is_permitted(ctx, caller, receiver);
     }
     // Package-private with a foreign package: denied.
     false
@@ -1594,9 +1882,143 @@ fn native_method_invoke_boxed(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
 /// Register the WP2.1 net-new natives. Called from `register_essential_natives`
 /// AFTER the existing reflection registrations so these supplement (don't
 /// override) the historical layer.
+/// One `Type`-typed slot of a reflection object, read from EITHER
+/// representation: the synthetic stub keeps its members in positional slots,
+/// the real `sun.reflect.generics.reflectiveObjects.*Impl` in named fields.
+/// `None` means the receiver is not that kind of type at all - the callers
+/// read it as "not equal", the same fail-closed rule the `TypeVariable`
+/// natives above already use.
+fn reflect_type_slot(
+    ctx: &mut dyn NativeContext,
+    obj: cratonvm_types::ObjectRef,
+    stub_class: &str,
+    stub_slot: usize,
+    real_field: &str,
+) -> Option<Value> {
+    let cls = ctx
+        .class_name_of_id(ctx.class_id_of_object(obj))
+        .unwrap_or_default();
+    if cls == stub_class {
+        return Some(ctx.get_field(obj, stub_slot));
+    }
+    match ctx.get_field_by_name(obj, real_field) {
+        v @ Value::Object(_) => Some(v),
+        _ => None,
+    }
+}
+
+/// `Objects.equals(a, b)` over two `Type` references, dispatching to the
+/// receiver's own `equals` so a nested `TypeVariable` contributes its
+/// (declaration, name) identity rather than a rendered name.
+fn type_value_equals(
+    ctx: &mut dyn NativeContext,
+    a: Value,
+    b: Value,
+) -> Result<bool, cratonvm_types::error::MethodCallFailed> {
+    match (a, b) {
+        (Value::Object(None), Value::Object(None)) => Ok(true),
+        (Value::Object(Some(x)), Value::Object(Some(y))) => {
+            if x == y {
+                return Ok(true);
+            }
+            let r =
+                ctx.invoke_virtual(x, "equals", "(Ljava/lang/Object;)Z", &[Value::Object(Some(y))])?;
+            Ok(matches!(r, Some(Value::Int(v)) if v != 0))
+        }
+        _ => Ok(false),
+    }
+}
+
+/// `Objects.hashCode(t)` - 0 for null, the receiver's virtual `hashCode`
+/// otherwise.
+fn type_value_hash(
+    ctx: &mut dyn NativeContext,
+    v: Value,
+) -> Result<i32, cratonvm_types::error::MethodCallFailed> {
+    match v {
+        Value::Object(Some(o)) => Ok(match ctx.invoke_virtual(o, "hashCode", "()I", &[])? {
+            Some(Value::Int(h)) => h,
+            _ => 0,
+        }),
+        _ => Ok(0),
+    }
+}
+
+/// `Arrays.equals(Type[], Type[])`.
+fn type_array_equals(
+    ctx: &mut dyn NativeContext,
+    a: Value,
+    b: Value,
+) -> Result<bool, cratonvm_types::error::MethodCallFailed> {
+    let (Value::Object(oa), Value::Object(ob)) = (a, b) else {
+        return Ok(false);
+    };
+    let (Some(aa), Some(bb)) = (oa, ob) else {
+        return Ok(oa.is_none() && ob.is_none());
+    };
+    let n = ctx.array_length(aa);
+    if n != ctx.array_length(bb) {
+        return Ok(false);
+    }
+    for i in 0..n {
+        let x = ctx.get_array_element(aa, i);
+        let y = ctx.get_array_element(bb, i);
+        if !type_value_equals(ctx, x, y)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// `Arrays.hashCode(Type[])` - 0 for a null array, else the JDK fold.
+fn type_array_hash(
+    ctx: &mut dyn NativeContext,
+    v: Value,
+) -> Result<i32, cratonvm_types::error::MethodCallFailed> {
+    let Value::Object(Some(arr)) = v else {
+        return Ok(0);
+    };
+    let n = ctx.array_length(arr);
+    let mut h: i32 = 1;
+    for i in 0..n {
+        let e = ctx.get_array_element(arr, i);
+        h = h.wrapping_mul(31).wrapping_add(type_value_hash(ctx, e)?);
+    }
+    Ok(h)
+}
+
+/// The generic component type of a `GenericArrayType`, from either
+/// representation: the synthetic stub keeps it in slot 0, the real JDK
+/// `GenericArrayTypeImpl` in a named field. `None` means the receiver is not a
+/// generic array type at all (or carries no component), which the callers read
+/// as "not equal" / "hash 0" rather than guessing.
+fn generic_array_component(
+    ctx: &mut dyn NativeContext,
+    obj: cratonvm_types::ObjectRef,
+) -> Option<cratonvm_types::ObjectRef> {
+    let cls = ctx
+        .class_name_of_id(ctx.class_id_of_object(obj))
+        .unwrap_or_default();
+    let slot = if cls == "java/lang/reflect/GenericArrayType" {
+        ctx.get_field(obj, 0)
+    } else {
+        ctx.get_field_by_name(obj, "genericComponentType")
+    };
+    match slot {
+        Value::Object(Some(o)) => Some(o),
+        _ => None,
+    }
+}
+
 pub(crate) fn register_wp2_1_natives(registry: &mut NativeMethodRegistry) {
     let __prev_cat = registry.current_category();
     registry.set_category(cratonvm_native_api::NativeKind::Bridge);
+    // W7-77: publish the legacy `java/lang/reflect/Method` mirror map so the
+    // read-side sweep names the row instead of leaving it as a comment. This
+    // registrar is reached in BOTH modes (via `register_annotation_overrides`
+    // <- `register_essential_natives_with_shims`). Unconditional and
+    // idempotent-by-pointer, for the reason `declare_slot_map`'s own doc gives.
+    cratonvm_native_api::read_alias::declare_slot_map(&crate::lang_class::METHOD_LEGACY_SLOT_MAP);
     // --- Method.invoke return-boxing safety net (overrides the historical
     // registration in lib.rs::register_essential_natives because
     // register_wp2_1_natives is called AFTER it). See the comment on
@@ -2160,13 +2582,13 @@ pub(crate) fn register_wp2_1_natives(registry: &mut NativeMethodRegistry) {
         ctx: &mut dyn cratonvm_native_api::registry::NativeContext,
         this: cratonvm_types::ObjectRef,
         field: &str,
-    ) -> Value {
+    ) -> Result<Value, MethodCallFailed> {
         let raw = ctx.get_field_by_name(this, field);
         let Value::Object(Some(arr)) = raw else {
-            return raw;
+            return Ok(raw);
         };
         if ctx.heap_kind_of(arr) != cratonvm_types::ObjectKind::Array {
-            return raw;
+            return Ok(raw);
         }
         // A wildcard bound may itself be a type-variable USE (`? super T`, the
         // shape Kotlin emits for a suspending function's `Continuation`
@@ -2201,17 +2623,17 @@ pub(crate) fn register_wp2_1_natives(registry: &mut NativeMethodRegistry) {
                     // then to Object, if the shape isn't modellable.
                     let reified = jdk_tree_to_typesig(ctx, node)
                         .map(|ts| crate::generics::typesig_to_real_type(ctx, &ts))
-                        .filter(|v| !matches!(v, Value::Object(None)))
-                        .or_else(|| wti_tree_node_to_mirror(ctx, node, &cls))
+                        .filter(|v| !matches!(v, Ok(Value::Object(None))))
+                        .or_else(|| wti_tree_node_to_mirror(ctx, node, &cls).map(Ok))
                         .or_else(|| {
                             // Unresolvable exotic bound: degrade to Object
                             // (the JDK's implicit upper bound) rather than
                             // leaking a non-Type.
                             ctx.class_id_by_name("java/lang/Object")
-                                .map(|c| Value::Object(Some(ctx.get_class_mirror(c))))
+                                .map(|c| Ok(Value::Object(Some(ctx.get_class_mirror(c)))))
                         })
-                        .unwrap_or(Value::Object(None));
-                    out.push(reified);
+                        .unwrap_or(Ok(Value::Object(None)));
+                    out.push(reified?);
                     continue;
                 }
             }
@@ -2236,9 +2658,9 @@ pub(crate) fn register_wp2_1_natives(registry: &mut NativeMethodRegistry) {
                     .unwrap_or(cratonvm_types::ClassId::new(0));
                 let result = ctx.new_ref_array(type_cid, 0);
                 ctx.set_field_by_name(this, field, Value::Object(Some(result)));
-                return Value::Object(Some(result));
+                return Ok(Value::Object(Some(result)));
             }
-            return Value::Object(Some(arr));
+            return Ok(Value::Object(Some(arr)));
         }
         let type_cid = ctx
             .class_id_by_name("java/lang/reflect/Type")
@@ -2250,7 +2672,7 @@ pub(crate) fn register_wp2_1_natives(registry: &mut NativeMethodRegistry) {
         // Write back so subsequent reads (incl. real bytecode getfield) see
         // reified values — mirrors the lazy write-back in the real impl.
         ctx.set_field_by_name(this, field, Value::Object(Some(result)));
-        Value::Object(Some(result))
+        Ok(Value::Object(Some(result)))
     }
     // SB-02b — convert a real-JDK `sun.reflect.generics.tree.*` node into
     // CratonVM's `TypeSig` AST so `crate::generics::type_sig_to_java` can
@@ -2523,7 +2945,7 @@ pub(crate) fn register_wp2_1_natives(registry: &mut NativeMethodRegistry) {
         "()[Ljava/lang/reflect/Type;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            Ok(Some(wti_bounds_reified(ctx, this, "bounds")))
+            Ok(Some(wti_bounds_reified(ctx, this, "bounds")?))
         },
     );
     registry.register(
@@ -2558,7 +2980,7 @@ pub(crate) fn register_wp2_1_natives(registry: &mut NativeMethodRegistry) {
         "()[Ljava/lang/reflect/Type;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            Ok(Some(wti_bounds_reified(ctx, this, "upperBounds")))
+            Ok(Some(wti_bounds_reified(ctx, this, "upperBounds")?))
         },
     );
     registry.register(
@@ -2567,7 +2989,29 @@ pub(crate) fn register_wp2_1_natives(registry: &mut NativeMethodRegistry) {
         "()[Ljava/lang/reflect/Type;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            Ok(Some(wti_bounds_reified(ctx, this, "lowerBounds")))
+            Ok(Some(wti_bounds_reified(ctx, this, "lowerBounds")?))
+        },
+    );
+    // …and the two rendering accessors, which `pti_real`/`tvi_real` above both
+    // have and this one did not. In a synthetic-library build there is no
+    // `WildcardTypeImpl` bytecode to fall back on, so `wildcard.toString()`
+    // raised `NoSuchMethodError: …WildcardTypeImpl.getTypeName()` and printed
+    // `…WildcardTypeImpl@6`, where HotSpot prints `? extends java.lang.Number`.
+    // `render_type_name` knows the shape (it grew a matching arm for this
+    // class); route both names to it, exactly as `pti_real` does.
+    registry.register(wti_real, "toString", "()Ljava/lang/String;", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let s = crate::phases_late::render_type_name(ctx, &Value::Object(Some(this)));
+        Ok(Some(Value::Object(Some(ctx.create_string(&s)))))
+    });
+    registry.register(
+        wti_real,
+        "getTypeName",
+        "()Ljava/lang/String;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let s = crate::phases_late::render_type_name(ctx, &Value::Object(Some(this)));
+            Ok(Some(Value::Object(Some(ctx.create_string(&s)))))
         },
     );
     let gat_real = "sun/reflect/generics/reflectiveObjects/GenericArrayTypeImpl";
@@ -2775,6 +3219,200 @@ pub(crate) fn register_wp2_1_natives(registry: &mut NativeMethodRegistry) {
         |ctx, args| {
             let this = obj_arg(args, 0)?;
             Ok(Some(ctx.get_field(this, 0)))
+        },
+    );
+    // JDK `GenericArrayTypeImpl` compares by the generic COMPONENT type and
+    // nothing else - `equals` is `Objects.equals(component, other.component)`,
+    // `hashCode` is `Objects.hashCode(component)`. Without these two the
+    // synthetic `GenericArrayType` falls through to the `Object.equals` /
+    // `Object.hashCode` natives, which compare reflection stubs by their
+    // RENDERED TYPE NAME. A rendered name cannot tell `S[]` declared on one
+    // class from `S[]` declared on another: both render `S[]`, so they
+    // compared EQUAL and hashed alike, where HotSpot answers not-equal
+    // because the components are `TypeVariable`s carrying different generic
+    // declarations. The sibling `TypeVariable` natives above already do it
+    // the JDK way, which is why only the array wrapper was wrong.
+    //
+    // The blast radius is a cache. Spring's `SerializableTypeWrapper` keys
+    // every wrapped `Type` in a static map by the `Type` itself, so the
+    // collision served the FIRST `S[]`'s proxy for the SECOND's. The second
+    // resolver then held a type variable belonging to a class it knows
+    // nothing about, `S` stayed unresolved, and an `@Autowired S[]` field
+    // widened to `Object[]` - every bean in the factory got injected.
+    // `AutowiredAnnotationBeanPostProcessorTests
+    // .genericsBasedFieldInjectionWithSubstitutedVariables` is the witness: 4
+    // beans where 1 is expected, and ONLY when the method-injection test ran
+    // first in the same JVM, which is why it passes when run alone.
+    registry.register(
+        "java/lang/reflect/GenericArrayType",
+        "equals",
+        "(Ljava/lang/Object;)Z",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let other = match args.get(1) {
+                Some(Value::Object(Some(o))) => *o,
+                _ => return Ok(Some(Value::Int(0))),
+            };
+            if this == other {
+                return Ok(Some(Value::Int(1)));
+            }
+            // `other` is either another synthetic stub (component in slot 0) or
+            // the real `sun.reflect.generics.reflectiveObjects
+            // .GenericArrayTypeImpl` (named field). Anything without a readable
+            // component is not a generic array type: not equal, and no
+            // speculative virtual call that could leave an exception pending.
+            let (Some(a), Some(b)) = (
+                generic_array_component(ctx, this),
+                generic_array_component(ctx, other),
+            ) else {
+                return Ok(Some(Value::Int(0)));
+            };
+            if a == b {
+                return Ok(Some(Value::Int(1)));
+            }
+            let eq = ctx.invoke_virtual(a, "equals", "(Ljava/lang/Object;)Z", &[Value::Object(Some(b))])?;
+            Ok(Some(Value::Int(i32::from(
+                matches!(eq, Some(Value::Int(v)) if v != 0),
+            ))))
+        },
+    );
+    registry.register(
+        "java/lang/reflect/GenericArrayType",
+        "hashCode",
+        "()I",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            // `Objects.hashCode(component)` — 0 for a missing component, and
+            // a VIRTUAL call so a `TypeVariable` component contributes its
+            // (declaration, name) hash rather than an identity hash. Anything
+            // else would break the equals/hashCode contract this pair now
+            // establishes.
+            let Some(c) = generic_array_component(ctx, this) else {
+                return Ok(Some(Value::Int(0)));
+            };
+            let h = match ctx.invoke_virtual(c, "hashCode", "()I", &[])? {
+                Some(Value::Int(v)) => v,
+                _ => 0,
+            };
+            Ok(Some(Value::Int(h)))
+        },
+    );
+
+    // The same JDK contract for the other two synthetic type stubs. They shared
+    // the `GenericArrayType` defect for the same reason - no bytecode
+    // `equals`/`hashCode`, so `Object.equals` compared them by RENDERED NAME -
+    // and they are reached THROUGH the array wrapper: `Repository<S>[]` is a
+    // `GenericArrayType` whose component is a `ParameterizedType`, so fixing
+    // only the wrapper still let `Repository<S>` declared on one class compare
+    // equal to `Repository<S>` declared on another.
+    //
+    // `ParameterizedTypeImpl`: equal iff ownerType, rawType and the
+    // actualTypeArguments all match; hash is
+    // `Arrays.hashCode(args) ^ hash(owner) ^ hash(raw)`.
+    registry.register(
+        "java/lang/reflect/ParameterizedType",
+        "equals",
+        "(Ljava/lang/Object;)Z",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let other = match args.get(1) {
+                Some(Value::Object(Some(o))) => *o,
+                _ => return Ok(Some(Value::Int(0))),
+            };
+            if this == other {
+                return Ok(Some(Value::Int(1)));
+            }
+            const STUB: &str = "java/lang/reflect/ParameterizedType";
+            let (Some(ra), Some(rb)) = (
+                reflect_type_slot(ctx, this, STUB, 0, "rawType"),
+                reflect_type_slot(ctx, other, STUB, 0, "rawType"),
+            ) else {
+                return Ok(Some(Value::Int(0)));
+            };
+            if !type_value_equals(ctx, ra, rb)? {
+                return Ok(Some(Value::Int(0)));
+            }
+            let (Some(oa), Some(ob)) = (
+                reflect_type_slot(ctx, this, STUB, 2, "ownerType"),
+                reflect_type_slot(ctx, other, STUB, 2, "ownerType"),
+            ) else {
+                return Ok(Some(Value::Int(0)));
+            };
+            if !type_value_equals(ctx, oa, ob)? {
+                return Ok(Some(Value::Int(0)));
+            }
+            let (Some(aa), Some(ab)) = (
+                reflect_type_slot(ctx, this, STUB, 1, "actualTypeArguments"),
+                reflect_type_slot(ctx, other, STUB, 1, "actualTypeArguments"),
+            ) else {
+                return Ok(Some(Value::Int(0)));
+            };
+            Ok(Some(Value::Int(i32::from(type_array_equals(ctx, aa, ab)?))))
+        },
+    );
+    registry.register(
+        "java/lang/reflect/ParameterizedType",
+        "hashCode",
+        "()I",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            const STUB: &str = "java/lang/reflect/ParameterizedType";
+            let a = reflect_type_slot(ctx, this, STUB, 1, "actualTypeArguments")
+                .unwrap_or(Value::Object(None));
+            let o =
+                reflect_type_slot(ctx, this, STUB, 2, "ownerType").unwrap_or(Value::Object(None));
+            let r = reflect_type_slot(ctx, this, STUB, 0, "rawType").unwrap_or(Value::Object(None));
+            let h = type_array_hash(ctx, a)? ^ type_value_hash(ctx, o)? ^ type_value_hash(ctx, r)?;
+            Ok(Some(Value::Int(h)))
+        },
+    );
+    // `WildcardTypeImpl`: equal iff both bound arrays match; hash is
+    // `Arrays.hashCode(lower) ^ Arrays.hashCode(upper)`.
+    registry.register(
+        "java/lang/reflect/WildcardType",
+        "equals",
+        "(Ljava/lang/Object;)Z",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let other = match args.get(1) {
+                Some(Value::Object(Some(o))) => *o,
+                _ => return Ok(Some(Value::Int(0))),
+            };
+            if this == other {
+                return Ok(Some(Value::Int(1)));
+            }
+            const STUB: &str = "java/lang/reflect/WildcardType";
+            let (Some(ua), Some(ub)) = (
+                reflect_type_slot(ctx, this, STUB, 0, "upperBounds"),
+                reflect_type_slot(ctx, other, STUB, 0, "upperBounds"),
+            ) else {
+                return Ok(Some(Value::Int(0)));
+            };
+            if !type_array_equals(ctx, ua, ub)? {
+                return Ok(Some(Value::Int(0)));
+            }
+            let (Some(la), Some(lb)) = (
+                reflect_type_slot(ctx, this, STUB, 1, "lowerBounds"),
+                reflect_type_slot(ctx, other, STUB, 1, "lowerBounds"),
+            ) else {
+                return Ok(Some(Value::Int(0)));
+            };
+            Ok(Some(Value::Int(i32::from(type_array_equals(ctx, la, lb)?))))
+        },
+    );
+    registry.register(
+        "java/lang/reflect/WildcardType",
+        "hashCode",
+        "()I",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            const STUB: &str = "java/lang/reflect/WildcardType";
+            let u =
+                reflect_type_slot(ctx, this, STUB, 0, "upperBounds").unwrap_or(Value::Object(None));
+            let l =
+                reflect_type_slot(ctx, this, STUB, 1, "lowerBounds").unwrap_or(Value::Object(None));
+            let h = type_array_hash(ctx, l)? ^ type_array_hash(ctx, u)?;
+            Ok(Some(Value::Int(h)))
         },
     );
 

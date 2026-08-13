@@ -9,12 +9,22 @@ Machine implemented from scratch in Rust.
 
 Provides the heap, allocator, and collectors. Includes a generational
 heap (young + old gen with a card table for old→young write barriers),
-a G1-style region collector, an optional ZGC backend gated behind the
-`zgc` feature, thread-local allocation buffers (TLABs), SATB concurrent
-marking, weak / soft / phantom reference processing, compact and
-compressed object headers (narrow klass / narrow oop support), and
-class unloading. The `GarbageCollector` trait abstracts the backend so
-the VM can swap collectors at startup.
+a G1-style region collector, a `ZgcRealHeap` backend, thread-local
+allocation buffers (TLABs), SATB concurrent marking, weak / soft /
+phantom reference processing, compact and compressed object headers
+(narrow klass / narrow oop support), and class unloading. The
+`GarbageCollector` trait abstracts the backend so the VM can swap
+collectors at startup.
+
+`ZgcRealHeap` is a real, memory-backed collector and `-XX:+UseZGC`
+genuinely selects it (`GcAlgorithm::Zgc` → `GcBackend::Zgc` →
+`VmHeap::Zgc`) — but it is compiled in only behind the default-off `zgc`
+feature, so a stock build does not contain it and `-XX:+UseZGC` there
+warns and falls back to Generational. It is also not production ZGC: a
+stop-the-world, non-moving, whole-heap mark-sweep, with no colored
+pointers, load barriers, concurrency, or compaction. The colored-pointer
+code above it in `src/zgc.rs` is a metadata-only simulation with no
+production consumer.
 
 ## Non-goals
 

@@ -602,7 +602,7 @@ impl cratonvm_native_api::NativeInvokeAccess for MockCtx {
         }
         if m == "compare"
             && d == "(Ljava/lang/Object;Ljava/lang/Object;)I"
-            && self.class_name_of_id(self.class_id_of_object(r)).as_deref()
+            && self.class_name_arc_of_id(self.class_id_of_object(r)).as_deref()
                 == Some("test/LiquibaseTieComparator")
         {
             let order_of = |ctx: &MockCtx, v: Value| -> i32 {
@@ -1049,9 +1049,17 @@ impl cratonvm_native_api::NativeSystemAccess for MockCtx {
         None
     }
 
-    fn ensure_synthetic_class(&mut self, name: &str, _num_fields: usize) -> ClassId {
-        self.ensure_class_initialized(name)
-            .unwrap_or(ClassId::new(0))
+    fn try_ensure_synthetic_class(
+        &mut self,
+        name: &str,
+        _num_fields: usize,
+    ) -> Result<ClassId, cratonvm_native_api::ClassIdentityError> {
+        // The mock carries no compatibility policy, so it never refuses: it
+        // stands in for `Compatible` mode. It overrode the infallible spelling
+        // until JDK-only wave 2 step 3 deleted that (2026-08-10).
+        Ok(self
+            .ensure_class_initialized(name)
+            .unwrap_or(ClassId::new(0)))
     }
     fn is_interface_class(&self, _c: ClassId) -> bool {
         false

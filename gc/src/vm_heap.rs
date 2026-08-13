@@ -513,18 +513,59 @@ impl VmHeap {
 
     /// `[lo, hi)` envelope containing every address [`Self::is_object_address`]
     /// can possibly accept, or `None` when the backend cannot cheaply supply
-    /// one (ZGC keeps live bases in a registry, not a contiguous arena).
+    /// one.
     ///
     /// Purely an optimization hint for conservative stack scanning: a word
     /// outside the envelope is definitely not an object address, so the
     /// caller can skip the full per-word validator. A word inside it still
-    /// has to go through `is_object_address`.
+    /// has to go through `is_object_address` — the envelope is a **filter**,
+    /// never an answer. Rooting a word on the strength of the range test alone
+    /// would accept object *interiors* as bases, which is precisely the
+    /// unsoundness [`Self::is_addr_live`]'s ZGC arm was fixed for (see the
+    /// coalesced-free-block argument on that arm below).
     pub fn conservative_addr_span(&self) -> Option<(usize, usize)> {
         match self {
             VmHeap::Generational(h) => h.conservative_addr_span(),
             VmHeap::G1(h) => h.conservative_addr_span(),
+            // ZGC answers `None` — but NOT, as this doc used to claim, because
+            // "ZGC keeps live bases in a registry, not a contiguous arena".
+            // The registry is only the live-base *index*; `ZgcRealHeap` backs
+            // every object and array with one `Mutex<Arena>` (`zgc.rs:1464`)
+            // through the single chokepoint `alloc_raw` (`zgc.rs:1772`), and
+            // that arena is built once by `with_capacity` (`zgc.rs:1629`) and
+            // never grown (no `Arena::grow` call exists in `zgc.rs`). The
+            // envelope therefore EXISTS and is immutable for the heap's
+            // lifetime — `[Arena::base_ptr(), +Arena::capacity())` — it is
+            // simply not reachable from here: the field is private to the
+            // `zgc` module and the only bound it publishes is
+            // `heap_capacity()`, a length with no base.
+            //
+            // What the `None` costs: `conservative_roots.rs:4052-4064` hoists
+            // this envelope out of the JIT frame scan exactly so the
+            // overwhelming majority of stack words — return addresses, ints,
+            // native pointers — die on an inline compare. With `None` every
+            // 8-byte stack word instead calls `ZgcRealHeap::is_object_address`
+            // (`zgc.rs:1892`), whose first act is `self.registry.lock()`: one
+            // mutex acquire PER STACK WORD, per root-gathering pass, per
+            // thread. `audits/zgc-vmheap-arm-audit.md` §3.4 (AW-5) names this
+            // as a competing explanation for the 35 PASS→HANG classes in
+            // `fixed-suite-bugs/springboot/zgc-real-fullsuite-regression-RETIRED-20260807.md`,
+            // whose ApplicationContext boot/teardown shape is exactly deep
+            // stacks × many threads. `zgc.rs:1467-1474` records that the same
+            // shape already "read as a hang at scale" once — that fix covered
+            // only the exact-base probe, never the per-word lock.
+            //
+            // Landed 2026-08-07: `ZgcRealHeap::conservative_addr_span` now
+            // publishes the arena envelope, captured once in `with_capacity`
+            // as two plain `usize` fields and answered without taking the
+            // arena lock — the span exists to let the caller reject a word
+            // with a range compare and NO lock, so locking to answer it
+            // would defeat the point. Sound because the arena is never
+            // grown. The arm's old `None` was justified by "ZGC keeps live
+            // bases in a registry, not a contiguous arena" — a false
+            // premise, and the reason this went unfixed.
             #[cfg(feature = "zgc")]
-            VmHeap::Zgc(_) => None,
+            VmHeap::Zgc(h) => h.conservative_addr_span(),
         }
     }
 
@@ -611,8 +652,52 @@ impl VmHeap {
         match self {
             VmHeap::Generational(h) => h.is_heap_addr(addr),
             VmHeap::G1(h) => h.is_heap_addr(addr),
+            // ZGC: apply this method's own stated screen — *alignment* +
+            // containment — before entering the backend, because
+            // `ZgcRealHeap::is_heap_addr` (`zgc.rs:1902`) is the one
+            // implementation that performs neither test. Both shipping
+            // backends open with this exact line (`gen_heap.rs:3293`,
+            // `g1.rs:7601`); ZGC goes straight to `registry.lock()`.
+            //
+            // Why it matters more here than there: on ZGC a *miss* is not
+            // cheap. After the exact-base hash probe misses, `is_heap_addr`
+            // drops the registry lock, RE-TAKES it, and walks the entire live
+            // registry dereferencing each base's header to test extents —
+            // O(live) per probe, under the mutex (`zgc.rs:1908-1919`). The
+            // callers are per-slot conservative root scanners over ambiguous
+            // JVM-long-vs-jobject operand slots (`value_stack.rs:1301`,
+            // `:1587`, `memory/roots.rs:200`, `frame.rs:1831`,
+            // `interpreter/gc_and_alloc.rs:4260`), whose dominant population
+            // is zeros, small integers and long bit patterns — every one of
+            // which currently buys a full walk of the heap.
+            // `audits/zgc-vmheap-arm-audit.md` §3.4 (AW-5), one of the two
+            // instrument-separable hypotheses for the 35 PASS→HANG classes in
+            // `fixed-suite-bugs/springboot/zgc-real-fullsuite-regression-RETIRED-20260807.md`.
+            //
+            // Why it cannot lose a root. The guard only ever returns `None`
+            // sooner; it can never turn a `None` into a `Some`, so no interior
+            // address can be promoted to a base by it.
+            //   * `addr == 0`: no live base is 0 and `0 >= base` is false for
+            //     every base, so the extent walk already answered `None`. Pure
+            //     work elimination, bit-identical result.
+            //   * misaligned: every ZGC allocation base is 8-aligned
+            //     (`alloc_raw` calls `arena.alloc(size, 8)`, `zgc.rs:1775`),
+            //     so no *base* is reachable this way and none can be dropped.
+            //     Only a misaligned *interior* word could previously have been
+            //     rooted, and that is a word Generational and G1 have rejected
+            //     since this method existed — this arm converges on the
+            //     contract, it does not invent one.
+            //
+            // See the `TODO(zgc)` on `conservative_addr_span` above: once
+            // `ZgcRealHeap` publishes its arena envelope, the range compare
+            // belongs here too, ahead of the lock.
             #[cfg(feature = "zgc")]
-            VmHeap::Zgc(h) => h.is_heap_addr(addr),
+            VmHeap::Zgc(h) => {
+                if addr == 0 || addr & 0x7 != 0 {
+                    return None;
+                }
+                h.is_heap_addr(addr)
+            }
         }
     }
 
@@ -1006,7 +1091,13 @@ impl VmHeap {
     }
 
     /// Read an array element with auto-unboxing of wrapper types.
-    /// G1 falls back to plain get_array_element (no unboxing support yet).
+    ///
+    /// Only the generational collector needs a separate entry point: G1 and ZGC
+    /// un-box inside their own `get_array_element`, so routing them here would
+    /// double-decode nothing and the plain accessor already satisfies this
+    /// method's contract. Both arms below are therefore un-boxing reads, not
+    /// fallbacks — ZGC's was a genuine fallback until 2026-08-09, which is what
+    /// made `Stream.mapToLong(...).toArray()` return zeros under `-XX:+UseZGC`.
     pub fn get_array_element_unboxing(&self, obj: ObjectRef, index: usize) -> Result<Value, i32> {
         match self {
             VmHeap::Generational(h) => h.get_array_element_unboxing(obj, index),
@@ -1136,13 +1227,59 @@ impl VmHeap {
     /// allocates only from inside natives never reaches ANY safepoint and G1's
     /// infallible allocator aborts the process on a heap full of garbage (see
     /// `fixed-suite-bugs/g1-native-alloc-no-safepoint-oom-FIXED.md`).
+    ///
+    /// ZGC: the same defect was live here, verbatim. `ZgcRealHeap` is an
+    /// infallible allocator too — `alloc_object` and `alloc_array` end in
+    /// `eprintln!("FATAL: ZGC(real): out of heap space …"); std::process::abort()`
+    /// (`ZgcRealHeap`'s `GarbageCollector` impl) — and this arm answered a
+    /// hardwired `false`, so the one hook that can run a collection on behalf of
+    /// a native (`safe_native_call_impl`, `vm/src/vm/vm_exec.rs`) never fired on
+    /// this backend. An
+    /// allocate-only-from-natives workload therefore reached no safepoint at
+    /// all and died by `abort()` on a heap full of garbage, with no Java-visible
+    /// `OutOfMemoryError` ever thrown.
+    ///
+    /// 2026-08-07: this arm used to COMPUTE the signal from `h.needs_gc()`
+    /// alone, carrying a `TODO(zgc)` that asserted `ZgcRealHeap` had no pressure
+    /// field and that this file could not add one. That claim stopped being true
+    /// the same day, and the stale comment was the only thing keeping the gap
+    /// open: `zgc.rs` now owns a real `native_alloc_pressure: AtomicBool` on
+    /// `ZgcRealHeap` — armed in `alloc_raw`, disarmed at the end of
+    /// `collect_garbage` where `gc_rearm` is recomputed — behind the same
+    /// `native_alloc_pressure()` / `clear_native_alloc_pressure()` /
+    /// `note_native_alloc_pressure()` trio G1 exposes. The two halves of one fix
+    /// were written from opposite ends and never met; these three arms are the
+    /// join.
+    ///
+    /// The latch ADDS to the occupancy test rather than replacing it, which is
+    /// where this deliberately differs from the G1 arm above (a bare latch
+    /// read). G1 can afford that because `note_region_consumed_locked` re-arms
+    /// on every region consumption below the threshold. Here, dropping
+    /// `|| h.needs_gc()` would NARROW behaviour that is already load-bearing:
+    /// the consumer (`vm/src/vm/vm_exec.rs`) clears unconditionally after
+    /// acting — including when its own gates said no — so a just-cleared latch
+    /// would answer `false` over a heap that is genuinely over its trigger. The
+    /// disjunction keeps the `abort()` case covered by construction, and the
+    /// latch adds the edge the occupancy test cannot see (a caller that noted
+    /// pressure below the trigger).
+    ///
+    /// Neither term can recreate the `gc_rearm` GC storm. The latch is armed on
+    /// `needs_gc`'s predicate VERBATIM — `allocated >= gc_threshold &&
+    /// allocated >= gc_rearm`, inlined in `ZgcRealHeap::alloc_raw` — so it
+    /// inherits the re-arm floor each collection raises to
+    /// `live + max(headroom/4, 64 KiB)`, and can never ask for a collection
+    /// `needs_gc` would refuse. The second term IS `needs_gc`, i.e. exactly what
+    /// this arm answered before. And the consumer re-checks both
+    /// `gc_overhead_limit_exceeded` and `needs_gc` before running anything, so
+    /// even the externally-noted edge (which bypasses the heap's own predicate,
+    /// by design) buys at most one gate evaluation per note.
     #[inline]
     pub fn young_spill_pressure(&self) -> bool {
         match self {
             VmHeap::Generational(h) => h.young_spill_pressure(),
             VmHeap::G1(h) => h.native_alloc_pressure(),
             #[cfg(feature = "zgc")]
-            VmHeap::Zgc(_) => false,
+            VmHeap::Zgc(h) => h.native_alloc_pressure() || h.needs_gc(),
         }
     }
 
@@ -1152,8 +1289,16 @@ impl VmHeap {
         match self {
             VmHeap::Generational(h) => h.clear_young_spill_pressure(),
             VmHeap::G1(h) => h.clear_native_alloc_pressure(),
+            // 2026-08-07: was a no-op, on the (by then false) grounds that ZGC's
+            // signal was computed rather than latched and so had nothing to
+            // clear. `ZgcRealHeap` owns the latch now, so this is G1's plain
+            // delegation. Idempotent and cheap on purpose — the consumer clears
+            // unconditionally after acting, including when its own gates said
+            // no. Note this lowers only the LATCH; the `|| h.needs_gc()` half of
+            // [`Self::young_spill_pressure`] is the heap's own occupancy and
+            // clears itself when a collection actually runs.
             #[cfg(feature = "zgc")]
-            VmHeap::Zgc(_) => {}
+            VmHeap::Zgc(h) => h.clear_native_alloc_pressure(),
         }
     }
 
@@ -1164,8 +1309,28 @@ impl VmHeap {
         match self {
             VmHeap::Generational(h) => h.note_young_spill_pressure(),
             VmHeap::G1(h) => h.note_native_alloc_pressure(),
+            // 2026-08-07: was a no-op under a `TODO(zgc)` specifying the latch
+            // `ZgcRealHeap` should grow. It grew it (field + arming edge in
+            // `alloc_raw` + disarm in `collect_garbage` + the accessor trio), so
+            // the TODO is discharged and this is G1's plain delegation.
+            //
+            // What the no-op cost: `Self::young_spill_pressure` read the heap's
+            // own occupancy, which covers the case that actually aborts the
+            // process (the heap really is over the trigger) but NOT a caller
+            // that spilled BELOW the trigger and wants the next native boundary
+            // to collect anyway. That was a gap in the mechanism rather than a
+            // live defect — this method still has no call site outside `gc/` —
+            // but a silently-dropped signal is a bad thing to leave armed for
+            // the first caller that does appear.
+            //
+            // This edge deliberately bypasses the `gc_threshold` / `gc_rearm`
+            // predicate the heap applies to itself: the caller is asserting
+            // pressure the heap's counters cannot see. It cannot storm, because
+            // the consumer re-checks `gc_overhead_limit_exceeded` and
+            // `needs_gc` before collecting and clears the latch either way, so
+            // one note buys one gate evaluation.
             #[cfg(feature = "zgc")]
-            VmHeap::Zgc(_) => {}
+            VmHeap::Zgc(h) => h.note_native_alloc_pressure(),
         }
     }
 
@@ -1366,6 +1531,37 @@ impl VmHeap {
             VmHeap::G1(h) => h.allocated_bytes(),
             #[cfg(feature = "zgc")]
             VmHeap::Zgc(h) => h.allocated_bytes(),
+        }
+    }
+
+    /// Bytes currently COMMITTED for the Java heap — backing storage the VM
+    /// holds, whether or not anything lives in it. `Runtime.totalMemory()` and
+    /// the JMX heap `MemoryUsage.getCommitted()`; `freeMemory()` is this minus
+    /// [`Self::allocated_bytes`].
+    ///
+    /// **It must not track live bytes.** HotSpot's `totalMemory()` moves only
+    /// when the heap grows or shrinks, and callers rely on that: H2's
+    /// `Utils.collectGarbage()` has historically been written as "gc until
+    /// `totalMemory()` stops changing", so a value that moved on every
+    /// collection would turn one `System.gc()` into a fixed run of full ones.
+    /// Every arm below is therefore a CAPACITY, not an occupancy:
+    ///
+    /// * Generational — both young semi-spaces plus the old generation
+    ///   (`committed_heap_bytes`). This is the one arm that can move at all,
+    ///   and only when an arena actually grows.
+    /// * G1 — the single arena every region is carved from, allocated once and
+    ///   never reallocated.
+    /// * ZGC — the arena envelope captured at construction.
+    ///
+    /// The two fixed arms are not a placeholder: those collectors really do
+    /// commit their whole heap up front, so reporting it is the honest answer
+    /// and matches what `maxMemory()` already reports for them.
+    pub fn committed_bytes(&self) -> usize {
+        match self {
+            VmHeap::Generational(h) => h.committed_heap_bytes(),
+            VmHeap::G1(h) => h.committed_bytes(),
+            #[cfg(feature = "zgc")]
+            VmHeap::Zgc(h) => h.committed_bytes(),
         }
     }
 
@@ -1717,6 +1913,20 @@ impl VmHeap {
         matches!(self, VmHeap::G1(_))
     }
 
+    /// Returns whether this heap is the Generational collector — the only
+    /// backend with a MOVING YOUNG generation.
+    ///
+    /// Exists because "does moving-young apply here?" was being answered by
+    /// `conservative_roots::moving_young_enabled()`, which ANDs a JIT-side gate
+    /// with `flags().gc.moving_young` and consults the collector in neither. G1
+    /// evacuates by region and ZGC never moves anything, so on both of them the
+    /// precise-moving-young question — and the unmemoised full-stack probe that
+    /// answers it — is inert work. See the two `moving_young_precise_only`
+    /// sites.
+    pub fn is_generational(&self) -> bool {
+        matches!(self, VmHeap::Generational(_))
+    }
+
     /// Check if G1 should start concurrent marking (IHOP threshold crossed).
     pub fn g1_should_start_marking(&self) -> bool {
         match self {
@@ -1999,10 +2209,17 @@ impl VmHeap {
                 // but log that GC logging was requested.
                 tracing::info!("[GC] Verbose GC logging enabled (generational collector)");
             }
+            // 2026-08-07: this arm used to answer with an honest "unavailable"
+            // `tracing::info!` instead of enabling anything, because
+            // `ZgcRealHeap` had no toggle to flip and no gated statement to flip
+            // it for — so a user running `--verbose:gc -XX:+UseZGC` got nothing
+            // for the whole run. `zgc.rs` has since grown the `gc_log_enabled:
+            // AtomicBool` field, the `enable_gc_logging` / `disable_gc_logging`
+            // pair mirroring G1's, and the per-collection `eprintln!` in
+            // `collect_garbage` that reads the flag — so the honest answer is
+            // now a plain delegation, exactly like G1's arm above.
             #[cfg(feature = "zgc")]
-            VmHeap::Zgc(_) => {
-                tracing::info!("[GC] Verbose GC logging enabled (ZGC-real collector)");
-            }
+            VmHeap::Zgc(h) => h.enable_gc_logging(),
         }
     }
 
@@ -2013,6 +2230,25 @@ impl VmHeap {
     pub fn print_gc_summary(&self) {
         if let VmHeap::G1(g1) = self {
             g1.print_gc_summary();
+        }
+        // ZGC: the same unconditional-counts treatment the generational branch
+        // below gets, and for the same reason — without it a `--verbose:gc` run
+        // on this backend printed NOTHING at all (there is no ZGC branch in any
+        // logging path; `enable_gc_logging` above only ever emitted a claim),
+        // so "did this configuration collect more?" — the first question to ask
+        // about the open ZGC HANG/FAIL classes — could not be answered from a
+        // log. `occupancy` is the post-sweep live figure, because the sweep
+        // stores retained bytes back into `allocated` (`zgc.rs:2472`); it is
+        // therefore directly comparable across runs, unlike a bump cursor.
+        // Cheap: two relaxed loads and one arena lock at shutdown.
+        #[cfg(feature = "zgc")]
+        if let VmHeap::Zgc(h) = self {
+            eprintln!(
+                "[GC] zgc-real: collections={} occupancy={}/{} bytes",
+                h.gc_count(),
+                h.allocated_bytes(),
+                h.heap_capacity(),
+            );
         }
         // Collection COUNTS, unconditionally. Without these the summary is not
         // comparable across configurations: the moving-young line below only
@@ -2030,6 +2266,107 @@ impl VmHeap {
             // below divides by the CURRENT heap rather than by whatever the
             // last collection saw. Cheap: two arena locks at shutdown.
             h.publish_gc_metrics_occupancy();
+        }
+        // Young non-moving-sweep health, UNCONDITIONALLY (the H2-CID0 rule: a
+        // line printed only when non-zero cannot tell "clean" from "never
+        // ran", and here that is the whole question).
+        //
+        // `par_accepts` far below `par_attempts` means the parallel sweep
+        // prefix is being discarded and the entire arena is re-swept
+        // sequentially. Until 2026-08-12 that was the state on EVERY JIT-warm
+        // workload — `attempts=5 accepts=0` on the hibernate-reactive repro,
+        // every abort the benign empty-object zero run — and these counters
+        // said so the whole time with nobody to read them.
+        //
+        // `zero_empty_runs` is that benign shape, now stepped over on-grid: it
+        // is normal and often large, and is deliberately NOT summed with
+        // `zero_spans`, the residue that still forces an unwind.
+        // `phantom_extents` and `live_in_dead` are the two corruption guards —
+        // non-zero on either is a finding, not tuning.
+        if let VmHeap::Generational(_) = self {
+            use std::sync::atomic::Ordering as O;
+            eprintln!(
+                "[GC] young_sweep: par_attempts={} par_accepts={} zero_spans={} \
+                 zero_empty_runs={} phantom_extents={} live_in_dead={} \
+                 walk_overshoot={} anchor_not_a_base={}",
+                crate::gen_heap::PAR_SWEEP_ATTEMPTS.load(O::Relaxed),
+                crate::gen_heap::PAR_SWEEP_ACCEPTS.load(O::Relaxed),
+                crate::gen_heap::SWEEP_ZERO_SPAN_HITS.load(O::Relaxed),
+                crate::gen_heap::SWEEP_ZERO_SPAN_EMPTY_RUNS.load(O::Relaxed),
+                crate::gen_heap::SWEEP_PHANTOM_EXTENTS.load(O::Relaxed),
+                crate::gen_heap::LIVE_IN_DEAD_SPANS.load(O::Relaxed),
+                crate::gen_heap::SWEEP_WALK_OVERSHOOT_HITS.load(O::Relaxed),
+                crate::gen_heap::SWEEP_ANCHOR_NOT_A_BASE.load(O::Relaxed),
+            );
+            eprintln!(
+                "[GC] young_sweep_empty_runs: last_cycle_bytes={} young_used={}",
+                crate::gen_heap::EMPTY_RUN_BYTES_LAST.load(O::Relaxed),
+                crate::gen_heap::EMPTY_RUN_YOUNG_USED_LAST.load(O::Relaxed),
+            );
+            let l = &crate::gen_heap::LATE_WALK_ZERO_RUNS;
+            eprintln!(
+                "[GC] late_walk_zero_runs: mark_y2o={} fixup_yo={} walk_young={}",
+                l[0].load(O::Relaxed),
+                l[1].load(O::Relaxed),
+                l[2].load(O::Relaxed),
+            );
+            // Which check abandoned a chunk. `par_accepts` alone cannot say,
+            // and one `None` from any chunk discards the whole cycle's
+            // attempt. Legend is on `PAR_CHUNK_BAILS`; printed as a bare array
+            // so a soak log can be diffed without parsing seven key=value
+            // pairs, and unconditionally for the same reason as the line above.
+            let b = &crate::gen_heap::PAR_CHUNK_BAILS;
+            eprintln!(
+                "[GC] young_sweep_chunk_bails: overshoot={} gap_filler={} zero_span={} \
+                 bad_size={} hole_crossing={} phantom={} anchor_miss={}",
+                b[0].load(O::Relaxed),
+                b[1].load(O::Relaxed),
+                b[2].load(O::Relaxed),
+                b[3].load(O::Relaxed),
+                b[4].load(O::Relaxed),
+                b[5].load(O::Relaxed),
+                b[6].load(O::Relaxed),
+            );
+            // …and of the zero-span bails, which of the predicate's three
+            // conditions did the refusing. See `ZERO_RUN_REFUSALS`.
+            let z = &crate::gen_heap::ZERO_RUN_REFUSALS;
+            eprintln!(
+                "[GC] young_sweep_zero_refusals: misaligned={} live_inside={} \
+                 implausible_next={}",
+                z[0].load(O::Relaxed),
+                z[1].load(O::Relaxed),
+                z[2].load(O::Relaxed),
+            );
+            // Did the five walks that still carry the old rule even RUN? A
+            // zero anomaly count above means nothing without this. Legend on
+            // `YOUNG_WALK_ENTRIES`; `sp_*` is the selective-promotion census,
+            // which says whether the two passes inside it were reachable at
+            // all (`sp_selective` is the gate).
+            let w = &crate::gen_heap::YOUNG_WALK_ENTRIES;
+            let (sw, sel, defrag, cand, pin, unaged, evac, ofull) =
+                crate::gen_heap::selective_promotion_census();
+            eprintln!(
+                "[GC] young_walk_entries: evac_prepass={} fixup_3a={} mark_y2o={} \
+                 fixup_yo={} walk_young={} | sp_sweeps={sw} sp_selective={sel} \
+                 sp_defrag={defrag} sp_candidates={cand} sp_pinned={pin} \
+                 sp_unaged={unaged} sp_evacuated={evac} sp_old_full={ofull}",
+                w[0].load(O::Relaxed),
+                w[1].load(O::Relaxed),
+                w[2].load(O::Relaxed),
+                w[3].load(O::Relaxed),
+                w[4].load(O::Relaxed),
+            );
+            // …and when the evacuation pre-pass DID run, what stopped it.
+            let e = &crate::gen_heap::EVAC_UNWIND_REASONS;
+            eprintln!(
+                "[GC] evac_unwind: overshoot={} zero_span={} bad_size={} \
+                 hole_crossing={} candidates_dropped={}",
+                e[0].load(O::Relaxed),
+                e[1].load(O::Relaxed),
+                e[2].load(O::Relaxed),
+                e[3].load(O::Relaxed),
+                crate::gen_heap::EVAC_UNWIND_CANDIDATES.load(O::Relaxed),
+            );
         }
         // Old-gen free-list coalescing (the counterpart of the young sweep's
         // post-sweep coalescer). A large `merged` with compaction never having
@@ -2093,11 +2430,62 @@ impl VmHeap {
                 );
             }
         }
+        // The read-side companion to the line above: that one is a marking
+        // FAIL-OPEN, this one is a read FAIL-SILENT. Every path that hands Java
+        // a `null` for a slot that held bits — the interpreter's tagged decodes,
+        // the JIT read helpers, `read_prim_element`'s reference arm — feeds one
+        // process-wide per-source table in `cratonvm_types::compact_value`, and
+        // this prints the breakdown rather than the total because the sources do
+        // not mean the same thing:
+        //
+        //   * `interpreter` reads a TAGGED slot, so a count there can be a
+        //     primitive `long` whose verbatim bits collided into the object
+        //     sub-tag. That is benign and is exactly what the degrade exists for.
+        //   * `jit` and `array-element` read UNTAGGED reference words — the JVM
+        //     type system already says the slot is a reference — so there is no
+        //     long/object ambiguity to absorb. A non-zero count there means a
+        //     word that should have been a live pointer was handed to Java as
+        //     `null`, i.e. the GC root-coverage gap of commit `6a04b0e3c1` is
+        //     live in THIS run. `jit` is the most diagnostic of the three: a
+        //     JIT'd frame is the frame a deposited root snapshot misses.
+        //
+        // Printed only when non-zero, for the same reason as the line above.
+        //
+        // The total is summed from THIS snapshot rather than read via
+        // `object_degradation_count()`: that accessor is defined as the same sum
+        // but takes its own set of relaxed loads, so under concurrency the two
+        // could disagree and the printed line would not add up.
+        {
+            let breakdown = cratonvm_types::compact_value::object_degradation_breakdown();
+            let total: u64 = breakdown.iter().sum();
+            if total != 0 {
+                let rendered = cratonvm_types::compact_value::DegradationSource::ALL
+                    .iter()
+                    .map(|s| format!("{}={}", s.name(), breakdown[s.index()]))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                eprintln!(
+                    "[GC] object_degradations={total} ({rendered}) — READ FAIL-SILENT: \
+                     that many reference-shaped slots decoded to `null` instead of the \
+                     object they named; a non-zero `jit` or `array-element` count is a \
+                     live root-coverage failure, not a long/object collision"
+                );
+            }
+        }
         // What the collector actually did on the last cycle and why. This is
         // the line that settles the `docs/GC.md` ("young collections run
         // non-moving whenever any JIT frame is active") vs `ARCHITECTURE.md`
         // ("per-cycle coverage proof, moving is possible") disagreement for
-        // THIS run — see `docs/gc/tlab-and-card-audit.md` §3.
+        // THIS run — see `audits/tlab-and-card-audit.md` §3.
+        //
+        // Under G1 this used to be uninformative by construction:
+        // `G1Collector::collect_garbage` passed the constant
+        // `incomplete_reason::NONE`, so the record said "the backend always
+        // evacuates" and nothing else, whatever the root scan had found. It now
+        // carries the obligation that actually failed, and
+        // `collector_decision_report` appends the `[GC] g1 root coverage:` rate
+        // — which is what makes "was this pause's root set complete?" a
+        // question a log answers instead of a crash dump.
         eprintln!("{}", crate::gc_metrics::collector_decision_report());
         // Card / remembered-set costs, raw and normalized per allocated object
         // and per live byte.
@@ -2176,8 +2564,43 @@ impl VmHeap {
                 h.is_live_old_gen_addr(addr) || h.is_live_young_survivor(addr)
             }
             VmHeap::G1(h) => h.is_addr_in_live_region(addr),
+            // ZGC: the EXACT registry-base test (`zgc.rs:1715` — one hash
+            // probe), deliberately NOT the loose `is_heap_addr` this arm used
+            // to call. The two differ only in `is_heap_addr`'s interior
+            // fallback (`zgc.rs:1731-1743`), and that fallback is exactly what
+            // made this arm unsound.
+            //
+            // The ZGC sweep zeroes each dead object, returns its span to the
+            // arena free list, and then COALESCES adjacent free spans into
+            // maximal blocks. A later allocation carved from the head of a
+            // coalesced block therefore covers the interior of what used to be
+            // several dead objects — so a *dead* object's pre-GC base becomes
+            // an interior address of an innocent LIVE object, and the extent
+            // walk answered `true` for it. Reference processing then read that
+            // as "the referent survived", and because ZGC's `pointer_map` is
+            // always empty (`zgc.rs:2489`, non-moving) the consumer at
+            // `interpreter/gc_and_alloc.rs:2287` falls back to the stale
+            // address and does `set_field(obj, 0, Value::Object(None))` on it
+            // — a null written into the middle of a live object, and at the
+            // weak/phantom restore site a non-null reference written there.
+            // That is precisely the HIB-CV-32 stale-referent-write corruption
+            // shape the guard chain around `watched_pre_gc_addr_survived`
+            // exists to prevent, reproduced on this backend through a
+            // predicate whose own consumer doc (below, "registry lookup")
+            // already believed it was exact. It is exact now.
+            //
+            // Not merely a correctness fix: `is_heap_addr`'s fallback is
+            // O(live) *under the registry mutex*, and this predicate runs once
+            // per tracked reference per collection. `is_object_address` is one
+            // locked hash probe.
+            //
+            // Contrast G1's arm above, which IS deliberately loose
+            // (region-granular): G1 emits identity `pointer_map` entries for
+            // every self-forwarded live object, so the map hit fires first and
+            // the loose predicate is only a fallback. ZGC has no such map, so
+            // its predicate is load-bearing alone and must be exact.
             #[cfg(feature = "zgc")]
-            VmHeap::Zgc(h) => h.is_heap_addr(addr).is_some(),
+            VmHeap::Zgc(h) => h.is_object_address(addr).is_some(),
         }
     }
 
@@ -2402,7 +2825,36 @@ impl VmHeap {
             return false;
         }
         match self {
-            VmHeap::Generational(h) => h.is_in_young_either(addr as *const u8),
+            // "Young and unmapped" is NOT a death certificate. It proves death
+            // only for a MOVING young collection, where every survivor gets a
+            // `pointer_map` entry. The non-moving sweep keeps survivors in
+            // place and produces NO map entries at all, so this arm condemned
+            // every live young object the moment the moving collector fell
+            // back — and it falls back on every collection in any workload
+            // with a live JIT frame it cannot map
+            // (`reason=innermost-rbp-belongs-to-unguarded-callee`).
+            //
+            // What that cost: `process_references_after_gc` skips the enqueue
+            // when either the `Reference` or its `ReferenceQueue` "did not
+            // survive", so NO reference was ever enqueued — a `WeakReference`
+            // was cleared but never delivered, and no `Cleaner` action ever
+            // ran. `EnqProbe` reports `gc enqueued it = false` where HotSpot
+            // enqueues; H2 then grows without bound, and the UPDATE workload
+            // that used to run in `--Xmx 1g` dies with `Out of memory` at 4g.
+            //
+            // `is_live_young_survivor` is the discriminator built for exactly
+            // this (see its soundness argument: STW-window-only, zeroed-span
+            // discriminator, moving-collection compatible), and it is already
+            // what the strict sibling `watched_pre_gc_addr_survived` uses for
+            // its young arm — these two must not disagree about the same
+            // address. The conjunction keeps the original verdict everywhere
+            // it was right: a genuinely dead young address, and the abandoned
+            // old address of an object a moving collection relocated, both
+            // still answer "did not survive", which is the `bc math-ec 0x4`
+            // protection this predicate exists for.
+            VmHeap::Generational(h) => {
+                h.is_in_young_either(addr as *const u8) && !h.is_live_young_survivor(addr)
+            }
             VmHeap::G1(_) => !self.is_addr_live(addr),
             #[cfg(feature = "zgc")]
             VmHeap::Zgc(_) => !self.is_addr_live(addr),
@@ -3078,6 +3530,58 @@ mod concurrent_mark_controller_tests {
             0,
             "sub-megabyte headroom must read as zero free MB"
         );
+    }
+
+    /// `committed_bytes` is a CAPACITY, and `Runtime.totalMemory()` rests on
+    /// that: allocating must move `allocated_bytes` and leave `committed_bytes`
+    /// alone. A version that tracked occupancy would report a `totalMemory()`
+    /// that changes on every collection, which callers written as "gc until
+    /// totalMemory settles" read as "the heap is still resizing".
+    #[test]
+    fn committed_bytes_is_capacity_not_occupancy() {
+        for backend in [GcBackend::Generational, GcBackend::G1] {
+            let heap = VmHeap::new(backend, 64 * 1024 * 1024);
+            let committed_before = heap.committed_bytes();
+            let allocated_before = heap.allocated_bytes();
+            assert!(
+                committed_before > 0,
+                "{backend:?}: committed heap must be positive"
+            );
+            for _ in 0..4000 {
+                let _ = heap.try_alloc_object(cratonvm_types::ClassId::new(0), 8);
+            }
+            // Non-vacuity: if the allocations did not register, the equality
+            // below would hold for the wrong reason.
+            assert!(
+                heap.allocated_bytes() > allocated_before,
+                "{backend:?}: the fixture must actually allocate"
+            );
+            assert_eq!(
+                heap.committed_bytes(),
+                committed_before,
+                "{backend:?}: committed heap moved while only occupancy changed"
+            );
+            assert!(
+                heap.committed_bytes() >= heap.allocated_bytes(),
+                "{backend:?}: committed heap is below what is allocated in it"
+            );
+        }
+    }
+
+    /// The old `Runtime.totalMemory()` answered a hardcoded 64 MiB regardless
+    /// of `-Xmx`. Two heaps sized an order of magnitude apart must not report
+    /// the same committed bytes.
+    #[test]
+    fn committed_bytes_follows_the_configured_heap_size() {
+        for backend in [GcBackend::Generational, GcBackend::G1] {
+            let small = VmHeap::new(backend, 8 * 1024 * 1024).committed_bytes();
+            let large = VmHeap::new(backend, 128 * 1024 * 1024).committed_bytes();
+            assert!(
+                large > small,
+                "{backend:?}: committed heap did not follow the configured size \
+                 ({small} vs {large})"
+            );
+        }
     }
 
     #[test]

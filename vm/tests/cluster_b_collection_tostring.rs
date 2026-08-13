@@ -75,6 +75,14 @@ fn ensure_probe_compiled() -> bool {
     }
     let src = dir.join("CollProbe.java");
     if !src.exists() {
+        // A missing fixture is a broken checkout, not an absent toolchain. Report
+        // it loudly, and fail under CRATONVM_REQUIRE_E2E — see
+        // `common::require_fixture`.
+        let _ = common::require_fixture(
+            "cluster_b_collection_tostring",
+            "the Cluster B fixture `CollProbe.java`",
+            &[src.clone()],
+        );
         return false;
     }
     let compile = Command::new("javac")

@@ -128,6 +128,32 @@ pub struct Tlab {
     /// only updates `cursor`; the slow path (helper call) re-syncs the
     /// pressure tracker.
     pressure: TlabPressureTracker,
+    /// Cumulative bytes this **thread** has allocated, excluding whatever the
+    /// live TLAB has handed out so far — see [`Self::thread_allocated_bytes`],
+    /// which adds the live span back.
+    ///
+    /// This is the backing store for `com.sun.management.ThreadMXBean
+    /// .getThreadAllocatedBytes`, and it lives on the `Tlab` for one reason:
+    /// the TLAB cursor is the **only** allocation signal that sees the JIT's
+    /// inline bump. A counter incremented at the interpreter's allocation
+    /// sites would silently report a fraction of a compiled thread's true
+    /// allocation, which is exactly the shape of undercount that reads as
+    /// good news (a chunk-reuse assertion measuring "did we allocate less
+    /// than 8 MB" passes vacuously when the instrument sees nothing).
+    ///
+    /// Two contributions land here:
+    /// * [`Self::retire`] rolls in `cursor - start` before nulling the
+    ///   pointers, so a retired TLAB's consumption is not lost;
+    /// * [`Self::note_external_allocation`] records the bytes of allocations
+    ///   that bypassed the TLAB entirely (humongous objects and arrays go
+    ///   straight to the heap).
+    ///
+    /// `Tlab::new` builds a *fresh* struct at every refill, so the running
+    /// total must be carried across by the refill site — see
+    /// [`Self::adopt_allocation_total`]. Both refill sites do that; a new one
+    /// that forgets restarts the thread's counter at zero (monotonicity is
+    /// asserted by `thread_allocated_bytes_survives_refill`).
+    thread_alloc_carry: u64,
 }
 
 impl Tlab {
@@ -162,7 +188,7 @@ impl Tlab {
         if c == 0 || e == 0 || c >= e {
             return None;
         }
-        // TLAB AUDIT (docs/gc/tlab-and-card-audit.md): the consumer of this
+        // TLAB AUDIT (audits/tlab-and-card-audit.md): the consumer of this
         // pair, `GenerationalHeap::jit_tlab_skip_offsets`, SILENTLY DROPS any
         // region whose start is not 8-aligned. A dropped region is not a
         // conservative degrade — the sweep then walks the un-retired tail as if
@@ -217,6 +243,7 @@ impl Tlab {
             cursor: std::ptr::null_mut(),
             end: std::ptr::null_mut(),
             pressure: TlabPressureTracker::new(),
+            thread_alloc_carry: 0,
         }
     }
 
@@ -256,7 +283,46 @@ impl Tlab {
             cursor: ptr,
             end: aligned_end_addr as *mut u8,
             pressure,
+            // A fresh buffer knows nothing about what the thread allocated
+            // before it. The refill site carries the running total across
+            // with `adopt_allocation_total`.
+            thread_alloc_carry: 0,
         }
+    }
+
+    /// Carry a thread's running allocation total onto a freshly-built TLAB.
+    ///
+    /// Call this immediately after `thread.tlab = Tlab::new(…)`, passing the
+    /// **outgoing** TLAB's [`Self::thread_allocated_bytes`]. Skipping it
+    /// resets the thread's `getThreadAllocatedBytes` to zero at every refill,
+    /// which the JMM forbids (the counter is specified as monotonic for the
+    /// life of the thread).
+    pub fn adopt_allocation_total(&mut self, prior_total: u64) {
+        self.thread_alloc_carry = prior_total;
+    }
+
+    /// Record bytes allocated by this thread that never passed through the
+    /// TLAB — humongous objects and arrays, and every post-GC retry that goes
+    /// straight to the heap arena.
+    ///
+    /// Without this the counter would see only TLAB-sized allocations, and a
+    /// caller measuring a 1 MiB-per-iteration loop (netty's chunk-reuse
+    /// assertion is exactly that) would be told it allocated nothing.
+    #[inline]
+    pub fn note_external_allocation(&mut self, bytes: usize) {
+        self.thread_alloc_carry = self.thread_alloc_carry.saturating_add(bytes as u64);
+    }
+
+    /// Total bytes this thread has allocated since it started, in the sense
+    /// `com.sun.management.ThreadMXBean.getThreadAllocatedBytes` means it:
+    /// the carried total plus whatever the live TLAB has handed out.
+    ///
+    /// Reading the live span here (rather than only at retire) is what makes
+    /// the answer current *and* JIT-aware — compiled code bumps `cursor`
+    /// directly and tells no counter about it.
+    pub fn thread_allocated_bytes(&self) -> u64 {
+        self.thread_alloc_carry
+            .saturating_add(self.consumed_bytes() as u64)
     }
 
     /// Try to bump-allocate `size` bytes with 8-byte alignment from this TLAB.
@@ -363,7 +429,7 @@ impl Tlab {
     /// (`unsafe impl Send`, never shared). For TLABs that are already
     /// empty (start/cursor/end null), the filler call short-circuits via
     /// the leading null check inside `install_tail_filler`.
-    /// # Idempotence (TLAB audit, `docs/gc/tlab-and-card-audit.md`)
+    /// # Idempotence (TLAB audit, `audits/tlab-and-card-audit.md`)
     ///
     /// `retire` is idempotent and **must stay so**. Several transition paths can
     /// retire the same TLAB twice with no synchronisation between them — a
@@ -378,6 +444,13 @@ impl Tlab {
         unsafe {
             self.install_tail_filler(TLAB_FILLER_CLASS_ID);
         }
+        // Roll the consumed span into the thread's running total BEFORE the
+        // pointers are nulled — `consumed_bytes()` is `cursor - start` and
+        // reads 0 the instant either is null. Idempotent for the same reason:
+        // a second `retire()` adds 0.
+        self.thread_alloc_carry = self
+            .thread_alloc_carry
+            .saturating_add(self.consumed_bytes() as u64);
         self.start = std::ptr::null_mut();
         self.cursor = std::ptr::null_mut();
         self.end = std::ptr::null_mut();
@@ -589,7 +662,7 @@ impl Tlab {
     /// tracker distinguish "nobody allocated" from "the JIT allocated and did
     /// not tell you".
     pub fn next_refill_size(&mut self) -> usize {
-        // TLAB AUDIT (docs/gc/tlab-and-card-audit.md): "size first, THEN retire"
+        // TLAB AUDIT (audits/tlab-and-card-audit.md): "size first, THEN retire"
         // is a prose contract with a silent failure mode. `consumed_bytes()` is
         // `cursor - start`, and `retire()` nulls both — so a caller that
         // retires first gets `consumed == 0`, which is exactly the input that
@@ -1422,7 +1495,7 @@ mod tests {
     }
 
     // ---------------------------------------------------------------
-    // TLAB audit (docs/gc/tlab-and-card-audit.md) — retire / publish
+    // TLAB audit (audits/tlab-and-card-audit.md) — retire / publish
     // ---------------------------------------------------------------
 
     /// Helper: an 8-aligned span of exactly `bytes` usable bytes, plus the

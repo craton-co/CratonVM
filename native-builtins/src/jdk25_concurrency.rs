@@ -40,7 +40,7 @@ use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
 use cratonvm_types::error::MethodCallResult;
 use cratonvm_types::{ObjectRef, Value};
 
-use crate::{alloc_concurrent_synthetic, obj_arg};
+use crate::{try_alloc_concurrent_synthetic, obj_arg};
 
 // ===========================================================================
 // Field-index constants — ScopedValue (3 fields)
@@ -199,11 +199,50 @@ pub const SYNTHETIC_THREAD_VIRTUAL_SLOT: usize = 5;
 ///   slot 0 = name, slot 1 = priority, slot 2 = tid, slot 3 = Runnable,
 ///   slot 4 = `contextClassLoader` (REAL, shared with the image),
 ///   slot 5 = virtual flag.
+///
+/// W7-77-guarded-slot-maps.md, against `javap -p java.lang.Thread` on Eclipse
+/// Adoptium 25.0.3.9 (19 instance fields, static excluded, declaration order):
+///
+///     0 eetop  1 tid  2 name  3 interrupted  4 contextClassLoader  5 holder
+///
+/// so **four** of this run's five slots disagree with the real class, not one:
+/// `NAME`(0) is `eetop`, `PRIORITY`(1) is `tid`, `TARGET`(3) is `interrupted`,
+/// `VIRTUAL`(5) is `holder`. Only slot 4 agrees, and it agrees on purpose --
+/// that is the 2026-08-05 alignment the `SYNTHETIC_THREAD_VIRTUAL_SLOT` doc
+/// above describes.
+///
+/// W7-69-read-side-alias-instrument.md's census listed only slot 5 for this
+/// file, because its scraper keyed on the run containing
+/// `SYNTHETIC_THREAD_VIRTUAL_SLOT` and the `THREAD_FIELD_*` run is a separate
+/// one carrying no class name in its own comment. The three extra rows are not
+/// a new defect -- they are the same fabricated-layout map, and the same
+/// class-side `eetop` witness in `vm_exec.rs::thread_start` decides whether any
+/// of them may be applied. They are recorded because "the census listed one"
+/// reads as "the other four agree", and they do not.
 const THREAD_SYNTHETIC_NUM_FIELDS: usize = SYNTHETIC_THREAD_VIRTUAL_SLOT + 1;
 const THREAD_FIELD_NAME: usize = 0;
 const THREAD_FIELD_PRIORITY: usize = 1;
 const THREAD_FIELD_TARGET: usize = 3;
 const THREAD_FIELD_VIRTUAL: usize = SYNTHETIC_THREAD_VIRTUAL_SLOT;
+
+/// What the fabricated `java/lang/Thread` model believes, published for
+/// `read_alias::verify_declared_slot_maps` (W7-77).
+///
+/// States the BELIEF, not the real layout. Slot 4 is included even though it
+/// agrees: a census with no clean rows is an instrument that fires on
+/// everything, and this map's one deliberate agreement is worth sweeping.
+pub static SYNTHETIC_THREAD_SLOT_MAP: cratonvm_native_api::read_alias::SlotMap =
+    cratonvm_native_api::read_alias::SlotMap {
+        class: "java/lang/Thread",
+        slots: &[
+            (THREAD_FIELD_NAME, "name"),
+            (THREAD_FIELD_PRIORITY, "priority"),
+            (THREAD_FIELD_TARGET, "target"),
+            (4, "contextClassLoader"),
+            (THREAD_FIELD_VIRTUAL, "isVirtual"),
+        ],
+        origin: "native-builtins/src/jdk25_concurrency.rs THREAD_FIELD_*",
+    };
 
 // ===========================================================================
 // 15.1 — ScopedValue natives
@@ -294,7 +333,7 @@ fn native_sv_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
 
 /// `ScopedValue.newInstance()Ljava/lang/ScopedValue;` — factory.
 fn native_sv_new_instance(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    let obj = alloc_concurrent_synthetic(ctx, CLS_SCOPED_VALUE, SV_NUM_FIELDS);
+    let obj = try_alloc_concurrent_synthetic(ctx, CLS_SCOPED_VALUE, SV_NUM_FIELDS)?;
     ctx.set_field(obj, SV_FIELD_VALUE, Value::Object(None));
     ctx.set_field(obj, SV_FIELD_IS_BOUND, Value::Int(0));
     ctx.set_field(obj, SV_FIELD_HASH, Value::Int(0));
@@ -423,7 +462,7 @@ fn collect_carrier_bindings(
 fn native_sv_where_static(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let sv_val = args.get(0).copied().unwrap_or(Value::Object(None));
     let value_val = args.get(1).copied().unwrap_or(Value::Object(None));
-    let carrier = alloc_concurrent_synthetic(ctx, CLS_CARRIER, CARRIER_NUM_FIELDS);
+    let carrier = try_alloc_concurrent_synthetic(ctx, CLS_CARRIER, CARRIER_NUM_FIELDS)?;
     ctx.set_field(carrier, CARRIER_FIELD_SV_REF, sv_val);
     ctx.set_field(carrier, CARRIER_FIELD_VALUE_REF, value_val);
     ctx.set_field(carrier, CARRIER_FIELD_PARENT_REF, Value::Object(None));
@@ -435,7 +474,7 @@ fn native_carrier_where(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     let this = obj_arg(args, 0)?;
     let sv_val = args.get(1).copied().unwrap_or(Value::Object(None));
     let value_val = args.get(2).copied().unwrap_or(Value::Object(None));
-    let carrier = alloc_concurrent_synthetic(ctx, CLS_CARRIER, CARRIER_NUM_FIELDS);
+    let carrier = try_alloc_concurrent_synthetic(ctx, CLS_CARRIER, CARRIER_NUM_FIELDS)?;
     ctx.set_field(carrier, CARRIER_FIELD_SV_REF, sv_val);
     ctx.set_field(carrier, CARRIER_FIELD_VALUE_REF, value_val);
     ctx.set_field(carrier, CARRIER_FIELD_PARENT_REF, Value::Object(Some(this)));
@@ -535,7 +574,7 @@ fn native_carrier_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
 /// Captures the current scoped value binding count from the thread's binding
 /// stack and a monotonic timestamp for ordering.
 fn native_snapshot_capture(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    let snap = alloc_concurrent_synthetic(ctx, CLS_SNAPSHOT, SNAPSHOT_NUM_FIELDS);
+    let snap = try_alloc_concurrent_synthetic(ctx, CLS_SNAPSHOT, SNAPSHOT_NUM_FIELDS)?;
     static SNAPSHOT_COUNTER: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(1);
     let ts = SNAPSHOT_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     // Query the thread's current scoped value binding count
@@ -764,7 +803,7 @@ fn native_sts_init_name_factory(ctx: &mut dyn NativeContext, args: &[Value]) -> 
 
 /// `StructuredTaskScope.open()StructuredTaskScope` — static factory (JDK 25).
 fn native_sts_open(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    let scope = alloc_concurrent_synthetic(ctx, CLS_TASK_SCOPE, STS_NUM_FIELDS);
+    let scope = try_alloc_concurrent_synthetic(ctx, CLS_TASK_SCOPE, STS_NUM_FIELDS)?;
     sts_init_fields(ctx, scope, Value::Object(None), STS_POLICY_BASE);
     Ok(Some(Value::Object(Some(scope))))
 }
@@ -797,7 +836,7 @@ fn native_sts_fork(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
     ctx.set_field(this, STS_FIELD_TASK_COUNT, Value::Int(count + 1));
 
     // Allocate the subtask (returned to the caller immediately, UNAVAILABLE).
-    let subtask = alloc_concurrent_synthetic(ctx, CLS_SUBTASK, SUBTASK_NUM_FIELDS);
+    let subtask = try_alloc_concurrent_synthetic(ctx, CLS_SUBTASK, SUBTASK_NUM_FIELDS)?;
     ctx.set_field(subtask, SUBTASK_FIELD_CALLABLE, callable_val);
     ctx.set_field(
         subtask,
@@ -818,7 +857,7 @@ fn native_sts_fork(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
 
     // Build the runner Runnable that the worker thread will execute. It holds
     // the Callable + the Subtask and writes the outcome into the Subtask.
-    let runner = alloc_concurrent_synthetic(ctx, CLS_FORK_RUNNER, FORK_RUNNER_NUM_FIELDS);
+    let runner = try_alloc_concurrent_synthetic(ctx, CLS_FORK_RUNNER, FORK_RUNNER_NUM_FIELDS)?;
     ctx.set_field(runner, FORK_RUNNER_FIELD_CALLABLE, callable_val);
     ctx.set_field(
         runner,
@@ -828,7 +867,7 @@ fn native_sts_fork(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
 
     // Build a Thread whose Thread.run() dispatches to the runner, then start it
     // via the VM's real thread machinery. The worker is reaped by join().
-    let worker = alloc_concurrent_synthetic(ctx, "java/lang/Thread", THREAD_SYNTHETIC_NUM_FIELDS);
+    let worker = try_alloc_concurrent_synthetic(ctx, "java/lang/Thread", THREAD_SYNTHETIC_NUM_FIELDS)?;
     let name = ctx.create_string("StsFork");
     // Choose the field-set strategy by the object's actual layout. A synthetic
     // 5-slot Thread (num_fields <= 8, matching the VM's
@@ -851,7 +890,12 @@ fn native_sts_fork(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
     // synthetic layout that means leaving the slot-4 virtual flag at 0; for the
     // real-JDK layout it means NOT constructing a BaseVirtualThread subtype.
     let worker_fields = ctx.object_num_fields(worker);
-    let synthetic_thread = worker_fields <= 8;
+    // The shared cutoff, not a fourth copy of it. `<= 8` was open-coded here
+    // because `is_synthetic_thread_layout` was nested inside
+    // `register_essential_natives_with_shims` and unreachable from any other
+    // module; it is at module scope since 2026-08-12
+    // (W7-74-short-object-repairs.md). Same value, one declaration.
+    let synthetic_thread = crate::thread_mirror_is_synthetic_layout(worker_fields);
     if synthetic_thread {
         ctx.set_field(worker, THREAD_FIELD_NAME, Value::Object(Some(name)));
         ctx.set_field(worker, THREAD_FIELD_PRIORITY, Value::Int(5));
@@ -1266,7 +1310,7 @@ fn native_sof_init_name_factory(ctx: &mut dyn NativeContext, args: &[Value]) -> 
 
 /// `ShutdownOnFailure.open()ShutdownOnFailure` — static factory.
 fn native_sof_open(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    let scope = alloc_concurrent_synthetic(ctx, CLS_SHUTDOWN_ON_FAILURE, STS_NUM_FIELDS);
+    let scope = try_alloc_concurrent_synthetic(ctx, CLS_SHUTDOWN_ON_FAILURE, STS_NUM_FIELDS)?;
     sts_init_fields(
         ctx,
         scope,
@@ -1338,7 +1382,7 @@ fn native_sof_throw_if_failed_fn(ctx: &mut dyn NativeContext, args: &[Value]) ->
 fn native_sof_exception(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     let exc = ctx.get_field(this, STS_FIELD_EXCEPTION);
-    let opt = alloc_concurrent_synthetic(ctx, "java/util/Optional", OPTIONAL_NUM_FIELDS);
+    let opt = try_alloc_concurrent_synthetic(ctx, "java/util/Optional", OPTIONAL_NUM_FIELDS)?;
     match exc {
         Value::Object(Some(_)) => {
             // Optional.of(exception)
@@ -1378,7 +1422,7 @@ fn native_sos_init_name_factory(ctx: &mut dyn NativeContext, args: &[Value]) -> 
 
 /// `ShutdownOnSuccess.open()ShutdownOnSuccess` — static factory.
 fn native_sos_open(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    let scope = alloc_concurrent_synthetic(ctx, CLS_SHUTDOWN_ON_SUCCESS, STS_NUM_FIELDS);
+    let scope = try_alloc_concurrent_synthetic(ctx, CLS_SHUTDOWN_ON_SUCCESS, STS_NUM_FIELDS)?;
     sts_init_fields(
         ctx,
         scope,
@@ -1553,7 +1597,7 @@ fn unregister_scope_owner(scope: ObjectRef) {
 
 /// `Joiner.allSuccessfulOrThrow()` — static factory.
 fn native_joiner_all_successful(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    let joiner = alloc_concurrent_synthetic(ctx, CLS_JOINER, JOINER_NUM_FIELDS);
+    let joiner = try_alloc_concurrent_synthetic(ctx, CLS_JOINER, JOINER_NUM_FIELDS)?;
     ctx.set_field(
         joiner,
         JOINER_FIELD_POLICY,
@@ -1567,7 +1611,7 @@ fn native_joiner_all_successful(ctx: &mut dyn NativeContext, _args: &[Value]) ->
 
 /// `Joiner.anySuccessfulResultOrThrow()` — static factory.
 fn native_joiner_any_successful(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    let joiner = alloc_concurrent_synthetic(ctx, CLS_JOINER, JOINER_NUM_FIELDS);
+    let joiner = try_alloc_concurrent_synthetic(ctx, CLS_JOINER, JOINER_NUM_FIELDS)?;
     ctx.set_field(
         joiner,
         JOINER_FIELD_POLICY,
@@ -1584,7 +1628,7 @@ fn native_joiner_await_all_successful(
     ctx: &mut dyn NativeContext,
     _args: &[Value],
 ) -> MethodCallResult {
-    let joiner = alloc_concurrent_synthetic(ctx, CLS_JOINER, JOINER_NUM_FIELDS);
+    let joiner = try_alloc_concurrent_synthetic(ctx, CLS_JOINER, JOINER_NUM_FIELDS)?;
     ctx.set_field(
         joiner,
         JOINER_FIELD_POLICY,
@@ -1598,7 +1642,7 @@ fn native_joiner_await_all_successful(
 
 /// `Joiner.awaitAll()` — static factory.
 fn native_joiner_await_all(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    let joiner = alloc_concurrent_synthetic(ctx, CLS_JOINER, JOINER_NUM_FIELDS);
+    let joiner = try_alloc_concurrent_synthetic(ctx, CLS_JOINER, JOINER_NUM_FIELDS)?;
     ctx.set_field(
         joiner,
         JOINER_FIELD_POLICY,
@@ -1755,7 +1799,7 @@ fn native_joiner_policy(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
 /// `join()` returns.
 fn native_sts_open_with_joiner(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let joiner_val = args.get(0).copied().unwrap_or(Value::Object(None));
-    let scope = alloc_concurrent_synthetic(ctx, CLS_TASK_SCOPE, STS_NUM_FIELDS);
+    let scope = try_alloc_concurrent_synthetic(ctx, CLS_TASK_SCOPE, STS_NUM_FIELDS)?;
 
     // Determine policy from joiner
     let policy = if let Value::Object(Some(joiner)) = joiner_val {
@@ -1791,7 +1835,7 @@ fn native_config_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
 fn native_config_with_name(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     let name = args.get(1).copied().unwrap_or(Value::Object(None));
-    let config = alloc_concurrent_synthetic(ctx, CLS_CONFIG, CONFIG_NUM_FIELDS);
+    let config = try_alloc_concurrent_synthetic(ctx, CLS_CONFIG, CONFIG_NUM_FIELDS)?;
     // Copy existing fields
     let tf = ctx.get_field(this, CONFIG_FIELD_THREAD_FACTORY);
     let timeout = ctx.get_field(this, CONFIG_FIELD_TIMEOUT_MS);
@@ -1808,7 +1852,7 @@ fn native_config_with_thread_factory(
 ) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     let tf = args.get(1).copied().unwrap_or(Value::Object(None));
-    let config = alloc_concurrent_synthetic(ctx, CLS_CONFIG, CONFIG_NUM_FIELDS);
+    let config = try_alloc_concurrent_synthetic(ctx, CLS_CONFIG, CONFIG_NUM_FIELDS)?;
     let name = ctx.get_field(this, CONFIG_FIELD_NAME);
     let timeout = ctx.get_field(this, CONFIG_FIELD_TIMEOUT_MS);
     ctx.set_field(config, CONFIG_FIELD_NAME, name);
@@ -1836,7 +1880,7 @@ fn native_config_with_timeout(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
         }
         _ => 0,
     };
-    let config = alloc_concurrent_synthetic(ctx, CLS_CONFIG, CONFIG_NUM_FIELDS);
+    let config = try_alloc_concurrent_synthetic(ctx, CLS_CONFIG, CONFIG_NUM_FIELDS)?;
     let name = ctx.get_field(this, CONFIG_FIELD_NAME);
     let tf = ctx.get_field(this, CONFIG_FIELD_THREAD_FACTORY);
     ctx.set_field(config, CONFIG_FIELD_NAME, name);
@@ -1868,7 +1912,7 @@ fn native_config_get_thread_factory(
 
 /// `StructuredTaskScope.open()` with owner tracking.
 fn native_sts_open_owned(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    let scope = alloc_concurrent_synthetic(ctx, CLS_TASK_SCOPE, STS_NUM_FIELDS);
+    let scope = try_alloc_concurrent_synthetic(ctx, CLS_TASK_SCOPE, STS_NUM_FIELDS)?;
     sts_init_fields(ctx, scope, Value::Object(None), STS_POLICY_BASE);
     register_scope_owner(scope);
     Ok(Some(Value::Object(Some(scope))))
@@ -1938,7 +1982,7 @@ fn unregister_scope_joiner(scope: ObjectRef) {
 /// notification.
 fn native_sts_open_joiner_tracked(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let joiner_val = args.get(0).copied().unwrap_or(Value::Object(None));
-    let scope = alloc_concurrent_synthetic(ctx, CLS_TASK_SCOPE, STS_NUM_FIELDS);
+    let scope = try_alloc_concurrent_synthetic(ctx, CLS_TASK_SCOPE, STS_NUM_FIELDS)?;
 
     let policy = if let Value::Object(Some(joiner)) = joiner_val {
         let p = match ctx.get_field(joiner, JOINER_FIELD_POLICY) {
@@ -2002,6 +2046,16 @@ fn native_sts_close_joiner(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
 pub(crate) fn register_jdk25_concurrency_natives(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
+    // W7-77: publish the fabricated Thread model's map. This registrar is
+    // synthetic-only (`lib.rs:24110`, inside `register_synthetic_overrides`),
+    // and that is the right scope rather than a limitation: in real-JDK mode
+    // `vm_exec.rs::thread_start`'s `eetop` witness refuses the fabricated read
+    // outright, so a sweep row there would be noise. In SYNTHETIC mode the
+    // sweep asks the question that matters -- does the fabricated
+    // `java/lang/Thread` still declare what these constants believe? -- which
+    // is exactly the drift that put the virtual flag at slot 4 until
+    // 2026-08-05.
+    cratonvm_native_api::read_alias::declare_slot_map(&SYNTHETIC_THREAD_SLOT_MAP);
     // --- ScopedValue ---
     r.register(CLS_SCOPED_VALUE, "<init>", "()V", native_sv_init);
     r.register(
@@ -2163,6 +2217,50 @@ pub(crate) fn register_jdk25_concurrency_natives(r: &mut NativeMethodRegistry) {
     );
 
     // --- ShutdownOnFailure ---
+    //
+    // JDK-ONLY-NOTE (W7-18): every registration between here and the `Joiner`
+    // block below is on a class or a method that **no JDK 25 declares**, and
+    // that is measured rather than inferred. `javap` on Adoptium 25.0.3.9
+    // answers "class not found" for `StructuredTaskScope$ShutdownOnSuccess` and
+    // `$ShutdownOnFailure` — JEP 505 deleted both — and `Class.forName` answers
+    // `ClassNotFoundException` for each on HotSpot 25, `cratonvm --real-jdk` and
+    // `cratonvm --jdk-only` alike. `StructuredTaskScope$Config` is a name no JDK
+    // ever shipped (`$Configuration` is the real one, registered by
+    // `phases_late/concurrent.rs::register_p67_structured_task_scope_j25`), and
+    // `Joiner.policy()I` is not on the JDK's `Joiner` either. Transcript:
+    // docs/known-issues/jdk-only/W7-18-structured-task-scope-jep505.md §1/§3.
+    //
+    // WHY THEY ARE STILL HERE, named as a decision rather than left as an
+    // oversight. Two things have to be true at once for the deletion to be
+    // worth taking, and only one is:
+    //
+    //   * It cannot move either shipping mode. TRUE — this registrar is reached
+    //     only from `register_synthetic_overrides`, so in `--real-jdk` and
+    //     `--jdk-only` real JDK bytecode serves the whole API with zero
+    //     fabrication (W7-18 §5: `compatibility_classes: 0`,
+    //     `synthetic_stub_invocations: 0`, no StructuredTaskScope violation in
+    //     1,454). So the deletion is also worth exactly nothing there.
+    //   * The deletion is checkable. FALSE without a run. Roughly twenty
+    //     `#[test]`s in this file's own test module PIN these registrations by
+    //     triple — `test_register_sof_*` and `test_register_sos_*` (nine),
+    //     `test_all_shutdown_on_failure_methods_registered` and its
+    //     `_success_` twin, `s52_joiner_policy_registered`,
+    //     `s52_total_registration_count`, and the fork/join/close/shutdown
+    //     lists — and the only mode the change could be observed in —
+    //     `--synthetic-jdk` — has never been executed once. Deleting the
+    //     registrations therefore means rewriting a blocking gate's assertions
+    //     to match an unmeasured expectation, which is how a divergence gets
+    //     frozen in rather than removed.
+    //
+    // What DID land instead, because it was both checkable and load-bearing:
+    // `util_concurrent_ext.rs::register_pd_structured_concurrency` — the third
+    // registrar of these same classes, with an INCOMPATIBLE `$Subtask` slot
+    // convention — is retired to a tombstone. Read its doc comment: it explains
+    // why every triple it held was already overwritten by this registrar, and
+    // why leaving it in place was a landmine for whoever finally deletes the
+    // block below. See also `w7_18_jep505_surface_is_not_shadowed_here`, the
+    // ratchet that keeps this registrar from growing a second body for the JEP
+    // 505 triples that live in `phases_late/concurrent.rs`.
     r.register(CLS_SHUTDOWN_ON_FAILURE, "<init>", "()V", native_sof_init);
     r.register(
         CLS_SHUTDOWN_ON_FAILURE,
@@ -3462,8 +3560,8 @@ mod jdk25_concurrency_tests {
     fn p82_collect_carrier_bindings_empty_chain() {
         // A carrier with no parent should produce one binding
         let mut ctx = crate::test_utils::MockNativeContext::new();
-        let carrier = alloc_concurrent_synthetic(&mut ctx, CLS_CARRIER, CARRIER_NUM_FIELDS);
-        let sv = alloc_concurrent_synthetic(&mut ctx, CLS_SCOPED_VALUE, SV_NUM_FIELDS);
+        let carrier = try_alloc_concurrent_synthetic(&mut ctx, CLS_CARRIER, CARRIER_NUM_FIELDS).unwrap();
+        let sv = try_alloc_concurrent_synthetic(&mut ctx, CLS_SCOPED_VALUE, SV_NUM_FIELDS).unwrap();
         ctx.set_field(carrier, CARRIER_FIELD_SV_REF, Value::Object(Some(sv)));
         ctx.set_field(carrier, CARRIER_FIELD_VALUE_REF, Value::Int(42));
         ctx.set_field(carrier, CARRIER_FIELD_PARENT_REF, Value::Object(None));
@@ -3476,21 +3574,21 @@ mod jdk25_concurrency_tests {
     fn p82_collect_carrier_bindings_chain() {
         // A carrier chain of 3 produces 3 bindings
         let mut ctx = crate::test_utils::MockNativeContext::new();
-        let sv1 = alloc_concurrent_synthetic(&mut ctx, CLS_SCOPED_VALUE, SV_NUM_FIELDS);
-        let sv2 = alloc_concurrent_synthetic(&mut ctx, CLS_SCOPED_VALUE, SV_NUM_FIELDS);
-        let sv3 = alloc_concurrent_synthetic(&mut ctx, CLS_SCOPED_VALUE, SV_NUM_FIELDS);
+        let sv1 = try_alloc_concurrent_synthetic(&mut ctx, CLS_SCOPED_VALUE, SV_NUM_FIELDS).unwrap();
+        let sv2 = try_alloc_concurrent_synthetic(&mut ctx, CLS_SCOPED_VALUE, SV_NUM_FIELDS).unwrap();
+        let sv3 = try_alloc_concurrent_synthetic(&mut ctx, CLS_SCOPED_VALUE, SV_NUM_FIELDS).unwrap();
 
-        let c1 = alloc_concurrent_synthetic(&mut ctx, CLS_CARRIER, CARRIER_NUM_FIELDS);
+        let c1 = try_alloc_concurrent_synthetic(&mut ctx, CLS_CARRIER, CARRIER_NUM_FIELDS).unwrap();
         ctx.set_field(c1, CARRIER_FIELD_SV_REF, Value::Object(Some(sv1)));
         ctx.set_field(c1, CARRIER_FIELD_VALUE_REF, Value::Int(1));
         ctx.set_field(c1, CARRIER_FIELD_PARENT_REF, Value::Object(None));
 
-        let c2 = alloc_concurrent_synthetic(&mut ctx, CLS_CARRIER, CARRIER_NUM_FIELDS);
+        let c2 = try_alloc_concurrent_synthetic(&mut ctx, CLS_CARRIER, CARRIER_NUM_FIELDS).unwrap();
         ctx.set_field(c2, CARRIER_FIELD_SV_REF, Value::Object(Some(sv2)));
         ctx.set_field(c2, CARRIER_FIELD_VALUE_REF, Value::Int(2));
         ctx.set_field(c2, CARRIER_FIELD_PARENT_REF, Value::Object(Some(c1)));
 
-        let c3 = alloc_concurrent_synthetic(&mut ctx, CLS_CARRIER, CARRIER_NUM_FIELDS);
+        let c3 = try_alloc_concurrent_synthetic(&mut ctx, CLS_CARRIER, CARRIER_NUM_FIELDS).unwrap();
         ctx.set_field(c3, CARRIER_FIELD_SV_REF, Value::Object(Some(sv3)));
         ctx.set_field(c3, CARRIER_FIELD_VALUE_REF, Value::Int(3));
         ctx.set_field(c3, CARRIER_FIELD_PARENT_REF, Value::Object(Some(c2)));
@@ -3508,7 +3606,7 @@ mod jdk25_concurrency_tests {
     #[test]
     fn p82_sts_init_fields_sets_all_fields() {
         let mut ctx = crate::test_utils::MockNativeContext::new();
-        let scope = alloc_concurrent_synthetic(&mut ctx, CLS_TASK_SCOPE, STS_NUM_FIELDS);
+        let scope = try_alloc_concurrent_synthetic(&mut ctx, CLS_TASK_SCOPE, STS_NUM_FIELDS).unwrap();
         sts_init_fields(
             &mut ctx,
             scope,
@@ -3533,7 +3631,7 @@ mod jdk25_concurrency_tests {
     #[test]
     fn p82_sts_get_int_defaults_to_zero() {
         let mut ctx = crate::test_utils::MockNativeContext::new();
-        let scope = alloc_concurrent_synthetic(&mut ctx, CLS_TASK_SCOPE, STS_NUM_FIELDS);
+        let scope = try_alloc_concurrent_synthetic(&mut ctx, CLS_TASK_SCOPE, STS_NUM_FIELDS).unwrap();
         // Field is uninitialized (Object(None)), should default to 0
         assert_eq!(sts_get_int(&mut ctx, scope, STS_FIELD_STATE), 0);
     }
@@ -3543,7 +3641,7 @@ mod jdk25_concurrency_tests {
     #[test]
     fn p82_sv_or_else_throw_when_bound() {
         let mut ctx = crate::test_utils::MockNativeContext::new();
-        let sv = alloc_concurrent_synthetic(&mut ctx, CLS_SCOPED_VALUE, SV_NUM_FIELDS);
+        let sv = try_alloc_concurrent_synthetic(&mut ctx, CLS_SCOPED_VALUE, SV_NUM_FIELDS).unwrap();
         ctx.set_field(sv, SV_FIELD_IS_BOUND, Value::Int(1));
         ctx.set_field(sv, SV_FIELD_VALUE, Value::Int(99));
         // "Bound" now means bound *on this thread* — the object field alone is
@@ -3564,7 +3662,7 @@ mod jdk25_concurrency_tests {
     #[test]
     fn a_scoped_value_binding_is_not_visible_to_another_thread() {
         let mut ctx = crate::test_utils::MockNativeContext::new();
-        let sv = alloc_concurrent_synthetic(&mut ctx, CLS_SCOPED_VALUE, SV_NUM_FIELDS);
+        let sv = try_alloc_concurrent_synthetic(&mut ctx, CLS_SCOPED_VALUE, SV_NUM_FIELDS).unwrap();
         ctx.set_field(sv, SV_FIELD_IS_BOUND, Value::Int(1));
         ctx.set_field(sv, SV_FIELD_VALUE, Value::Int(100));
 
@@ -3596,7 +3694,7 @@ mod jdk25_concurrency_tests {
     #[test]
     fn p82_sv_or_else_throw_when_unbound_no_supplier() {
         let mut ctx = crate::test_utils::MockNativeContext::new();
-        let sv = alloc_concurrent_synthetic(&mut ctx, CLS_SCOPED_VALUE, SV_NUM_FIELDS);
+        let sv = try_alloc_concurrent_synthetic(&mut ctx, CLS_SCOPED_VALUE, SV_NUM_FIELDS).unwrap();
         ctx.set_field(sv, SV_FIELD_IS_BOUND, Value::Int(0));
 
         // No supplier provided — should throw NoSuchElementException
@@ -3610,7 +3708,7 @@ mod jdk25_concurrency_tests {
     #[test]
     fn p82_scope_lifecycle_open_join_close() {
         let mut ctx = crate::test_utils::MockNativeContext::new();
-        let scope = alloc_concurrent_synthetic(&mut ctx, CLS_TASK_SCOPE, STS_NUM_FIELDS);
+        let scope = try_alloc_concurrent_synthetic(&mut ctx, CLS_TASK_SCOPE, STS_NUM_FIELDS).unwrap();
         native_sts_init(&mut ctx, &[Value::Object(Some(scope))]).unwrap();
 
         // OPEN state
@@ -3634,7 +3732,7 @@ mod jdk25_concurrency_tests {
     #[test]
     fn p82_scope_close_without_join_empty_scope() {
         let mut ctx = crate::test_utils::MockNativeContext::new();
-        let scope = alloc_concurrent_synthetic(&mut ctx, CLS_TASK_SCOPE, STS_NUM_FIELDS);
+        let scope = try_alloc_concurrent_synthetic(&mut ctx, CLS_TASK_SCOPE, STS_NUM_FIELDS).unwrap();
         native_sts_init(&mut ctx, &[Value::Object(Some(scope))]).unwrap();
 
         // Close an empty scope without join should succeed (no tasks)
@@ -3645,7 +3743,7 @@ mod jdk25_concurrency_tests {
     #[test]
     fn p82_scope_shutdown_then_join_then_close() {
         let mut ctx = crate::test_utils::MockNativeContext::new();
-        let scope = alloc_concurrent_synthetic(&mut ctx, CLS_TASK_SCOPE, STS_NUM_FIELDS);
+        let scope = try_alloc_concurrent_synthetic(&mut ctx, CLS_TASK_SCOPE, STS_NUM_FIELDS).unwrap();
         native_sts_init(&mut ctx, &[Value::Object(Some(scope))]).unwrap();
 
         native_sts_shutdown(&mut ctx, &[Value::Object(Some(scope))]).unwrap();
@@ -3664,7 +3762,7 @@ mod jdk25_concurrency_tests {
     #[test]
     fn p82_fork_on_shutdown_returns_unavailable() {
         let mut ctx = crate::test_utils::MockNativeContext::new();
-        let scope = alloc_concurrent_synthetic(&mut ctx, CLS_TASK_SCOPE, STS_NUM_FIELDS);
+        let scope = try_alloc_concurrent_synthetic(&mut ctx, CLS_TASK_SCOPE, STS_NUM_FIELDS).unwrap();
         native_sts_init(&mut ctx, &[Value::Object(Some(scope))]).unwrap();
         native_sts_shutdown(&mut ctx, &[Value::Object(Some(scope))]).unwrap();
 
@@ -3680,7 +3778,7 @@ mod jdk25_concurrency_tests {
     #[test]
     fn p82_fork_on_closed_errors() {
         let mut ctx = crate::test_utils::MockNativeContext::new();
-        let scope = alloc_concurrent_synthetic(&mut ctx, CLS_TASK_SCOPE, STS_NUM_FIELDS);
+        let scope = try_alloc_concurrent_synthetic(&mut ctx, CLS_TASK_SCOPE, STS_NUM_FIELDS).unwrap();
         native_sts_init(&mut ctx, &[Value::Object(Some(scope))]).unwrap();
         native_sts_close(&mut ctx, &[Value::Object(Some(scope))]).unwrap();
 
@@ -3693,7 +3791,7 @@ mod jdk25_concurrency_tests {
     fn p82_fork_null_callable() {
         // Fork with null callable should succeed (null returns as result)
         let mut ctx = crate::test_utils::MockNativeContext::new();
-        let scope = alloc_concurrent_synthetic(&mut ctx, CLS_TASK_SCOPE, STS_NUM_FIELDS);
+        let scope = try_alloc_concurrent_synthetic(&mut ctx, CLS_TASK_SCOPE, STS_NUM_FIELDS).unwrap();
         native_sts_init(&mut ctx, &[Value::Object(Some(scope))]).unwrap();
 
         let result = native_sts_fork(&mut ctx, &[Value::Object(Some(scope)), Value::Object(None)]);
@@ -3717,11 +3815,11 @@ mod jdk25_concurrency_tests {
     #[test]
     fn nb25_fork_inline_fallback_captures_result() {
         let mut ctx = crate::test_utils::MockNativeContext::new();
-        let scope = alloc_concurrent_synthetic(&mut ctx, CLS_TASK_SCOPE, STS_NUM_FIELDS);
+        let scope = try_alloc_concurrent_synthetic(&mut ctx, CLS_TASK_SCOPE, STS_NUM_FIELDS).unwrap();
         native_sts_init(&mut ctx, &[Value::Object(Some(scope))]).unwrap();
 
         // A non-null callable so the runner calls invoke_virtual("call").
-        let callable = alloc_concurrent_synthetic(&mut ctx, "java/util/concurrent/Callable", 1);
+        let callable = try_alloc_concurrent_synthetic(&mut ctx, "java/util/concurrent/Callable", 1).unwrap();
         // Script the callable's result.
         ctx.set_invoke_virtual_result(Ok(Some(Value::Int(7))));
 
@@ -3755,7 +3853,7 @@ mod jdk25_concurrency_tests {
     #[test]
     fn nb25_fork_inline_fallback_captures_failure() {
         let mut ctx = crate::test_utils::MockNativeContext::new();
-        let scope = alloc_concurrent_synthetic(&mut ctx, CLS_TASK_SCOPE, STS_NUM_FIELDS);
+        let scope = try_alloc_concurrent_synthetic(&mut ctx, CLS_TASK_SCOPE, STS_NUM_FIELDS).unwrap();
         // ShutdownOnFailure policy so join() should record the failure.
         sts_init_fields(
             &mut ctx,
@@ -3764,8 +3862,8 @@ mod jdk25_concurrency_tests {
             STS_POLICY_SHUTDOWN_ON_FAILURE,
         );
 
-        let callable = alloc_concurrent_synthetic(&mut ctx, "java/util/concurrent/Callable", 1);
-        let exc = alloc_concurrent_synthetic(&mut ctx, "java/lang/RuntimeException", 1);
+        let callable = try_alloc_concurrent_synthetic(&mut ctx, "java/util/concurrent/Callable", 1).unwrap();
+        let exc = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/RuntimeException", 1).unwrap();
         ctx.set_invoke_virtual_result(Err(
             cratonvm_types::error::MethodCallFailed::ExceptionThrown(exc),
         ));
@@ -3807,11 +3905,11 @@ mod jdk25_concurrency_tests {
         // drop the per-scope tracking so a recycled scope pointer can't inherit
         // stale workers.
         let mut ctx = crate::test_utils::MockNativeContext::new();
-        let scope = alloc_concurrent_synthetic(&mut ctx, CLS_TASK_SCOPE, STS_NUM_FIELDS);
+        let scope = try_alloc_concurrent_synthetic(&mut ctx, CLS_TASK_SCOPE, STS_NUM_FIELDS).unwrap();
         native_sts_init(&mut ctx, &[Value::Object(Some(scope))]).unwrap();
-        let st = alloc_concurrent_synthetic(&mut ctx, CLS_SUBTASK, SUBTASK_NUM_FIELDS);
+        let st = try_alloc_concurrent_synthetic(&mut ctx, CLS_SUBTASK, SUBTASK_NUM_FIELDS).unwrap();
         let th =
-            alloc_concurrent_synthetic(&mut ctx, "java/lang/Thread", THREAD_SYNTHETIC_NUM_FIELDS);
+            try_alloc_concurrent_synthetic(&mut ctx, "java/lang/Thread", THREAD_SYNTHETIC_NUM_FIELDS).unwrap();
         register_scope_fork(scope, st, th);
         assert!(!peek_scope_forks(scope).is_empty());
 
@@ -3824,7 +3922,7 @@ mod jdk25_concurrency_tests {
     #[test]
     fn p82_join_on_closed_errors() {
         let mut ctx = crate::test_utils::MockNativeContext::new();
-        let scope = alloc_concurrent_synthetic(&mut ctx, CLS_TASK_SCOPE, STS_NUM_FIELDS);
+        let scope = try_alloc_concurrent_synthetic(&mut ctx, CLS_TASK_SCOPE, STS_NUM_FIELDS).unwrap();
         native_sts_init(&mut ctx, &[Value::Object(Some(scope))]).unwrap();
         native_sts_close(&mut ctx, &[Value::Object(Some(scope))]).unwrap();
 
@@ -3835,7 +3933,7 @@ mod jdk25_concurrency_tests {
     #[test]
     fn p82_close_idempotent() {
         let mut ctx = crate::test_utils::MockNativeContext::new();
-        let scope = alloc_concurrent_synthetic(&mut ctx, CLS_TASK_SCOPE, STS_NUM_FIELDS);
+        let scope = try_alloc_concurrent_synthetic(&mut ctx, CLS_TASK_SCOPE, STS_NUM_FIELDS).unwrap();
         native_sts_init(&mut ctx, &[Value::Object(Some(scope))]).unwrap();
         native_sts_close(&mut ctx, &[Value::Object(Some(scope))]).unwrap();
         // Second close should be idempotent
@@ -3846,7 +3944,7 @@ mod jdk25_concurrency_tests {
     #[test]
     fn p82_to_string_returns_name() {
         let mut ctx = crate::test_utils::MockNativeContext::new();
-        let scope = alloc_concurrent_synthetic(&mut ctx, CLS_TASK_SCOPE, STS_NUM_FIELDS);
+        let scope = try_alloc_concurrent_synthetic(&mut ctx, CLS_TASK_SCOPE, STS_NUM_FIELDS).unwrap();
         let name_val = Value::Int(12345); // synthetic name value
         native_sts_init_name(&mut ctx, &[Value::Object(Some(scope)), name_val]).unwrap();
 
@@ -3859,7 +3957,7 @@ mod jdk25_concurrency_tests {
     #[test]
     fn p82_sof_init_sets_failure_policy() {
         let mut ctx = crate::test_utils::MockNativeContext::new();
-        let scope = alloc_concurrent_synthetic(&mut ctx, CLS_SHUTDOWN_ON_FAILURE, STS_NUM_FIELDS);
+        let scope = try_alloc_concurrent_synthetic(&mut ctx, CLS_SHUTDOWN_ON_FAILURE, STS_NUM_FIELDS).unwrap();
         native_sof_init(&mut ctx, &[Value::Object(Some(scope))]).unwrap();
         assert_eq!(
             sts_get_int(&mut ctx, scope, STS_FIELD_POLICY),
@@ -3870,7 +3968,7 @@ mod jdk25_concurrency_tests {
     #[test]
     fn p82_sof_throw_if_failed_no_exception() {
         let mut ctx = crate::test_utils::MockNativeContext::new();
-        let scope = alloc_concurrent_synthetic(&mut ctx, CLS_SHUTDOWN_ON_FAILURE, STS_NUM_FIELDS);
+        let scope = try_alloc_concurrent_synthetic(&mut ctx, CLS_SHUTDOWN_ON_FAILURE, STS_NUM_FIELDS).unwrap();
         native_sof_init(&mut ctx, &[Value::Object(Some(scope))]).unwrap();
         // No exception — should succeed
         let result = native_sof_throw_if_failed(&mut ctx, &[Value::Object(Some(scope))]);
@@ -3880,10 +3978,10 @@ mod jdk25_concurrency_tests {
     #[test]
     fn p82_sof_throw_if_failed_with_exception() {
         let mut ctx = crate::test_utils::MockNativeContext::new();
-        let scope = alloc_concurrent_synthetic(&mut ctx, CLS_SHUTDOWN_ON_FAILURE, STS_NUM_FIELDS);
+        let scope = try_alloc_concurrent_synthetic(&mut ctx, CLS_SHUTDOWN_ON_FAILURE, STS_NUM_FIELDS).unwrap();
         native_sof_init(&mut ctx, &[Value::Object(Some(scope))]).unwrap();
         // Manually set exception
-        let exc = alloc_concurrent_synthetic(&mut ctx, "java/lang/RuntimeException", 1);
+        let exc = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/RuntimeException", 1).unwrap();
         ctx.set_field(scope, STS_FIELD_EXCEPTION, Value::Object(Some(exc)));
         let result = native_sof_throw_if_failed(&mut ctx, &[Value::Object(Some(scope))]);
         assert!(result.is_err());
@@ -3898,7 +3996,7 @@ mod jdk25_concurrency_tests {
     #[test]
     fn p82_sof_exception_returns_optional_empty() {
         let mut ctx = crate::test_utils::MockNativeContext::new();
-        let scope = alloc_concurrent_synthetic(&mut ctx, CLS_SHUTDOWN_ON_FAILURE, STS_NUM_FIELDS);
+        let scope = try_alloc_concurrent_synthetic(&mut ctx, CLS_SHUTDOWN_ON_FAILURE, STS_NUM_FIELDS).unwrap();
         native_sof_init(&mut ctx, &[Value::Object(Some(scope))]).unwrap();
         let result = native_sof_exception(&mut ctx, &[Value::Object(Some(scope))]).unwrap();
         // Should return Optional object (not None)
@@ -3913,9 +4011,9 @@ mod jdk25_concurrency_tests {
     #[test]
     fn p82_sof_exception_returns_optional_of() {
         let mut ctx = crate::test_utils::MockNativeContext::new();
-        let scope = alloc_concurrent_synthetic(&mut ctx, CLS_SHUTDOWN_ON_FAILURE, STS_NUM_FIELDS);
+        let scope = try_alloc_concurrent_synthetic(&mut ctx, CLS_SHUTDOWN_ON_FAILURE, STS_NUM_FIELDS).unwrap();
         native_sof_init(&mut ctx, &[Value::Object(Some(scope))]).unwrap();
-        let exc = alloc_concurrent_synthetic(&mut ctx, "java/lang/Exception", 1);
+        let exc = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/Exception", 1).unwrap();
         ctx.set_field(scope, STS_FIELD_EXCEPTION, Value::Object(Some(exc)));
         let result = native_sof_exception(&mut ctx, &[Value::Object(Some(scope))]).unwrap();
         assert!(matches!(result, Some(Value::Object(Some(_)))));
@@ -3930,7 +4028,7 @@ mod jdk25_concurrency_tests {
     #[test]
     fn p82_sos_init_sets_success_policy() {
         let mut ctx = crate::test_utils::MockNativeContext::new();
-        let scope = alloc_concurrent_synthetic(&mut ctx, CLS_SHUTDOWN_ON_SUCCESS, STS_NUM_FIELDS);
+        let scope = try_alloc_concurrent_synthetic(&mut ctx, CLS_SHUTDOWN_ON_SUCCESS, STS_NUM_FIELDS).unwrap();
         native_sos_init(&mut ctx, &[Value::Object(Some(scope))]).unwrap();
         assert_eq!(
             sts_get_int(&mut ctx, scope, STS_FIELD_POLICY),
@@ -3941,7 +4039,7 @@ mod jdk25_concurrency_tests {
     #[test]
     fn p82_sos_result_before_shutdown_errors() {
         let mut ctx = crate::test_utils::MockNativeContext::new();
-        let scope = alloc_concurrent_synthetic(&mut ctx, CLS_SHUTDOWN_ON_SUCCESS, STS_NUM_FIELDS);
+        let scope = try_alloc_concurrent_synthetic(&mut ctx, CLS_SHUTDOWN_ON_SUCCESS, STS_NUM_FIELDS).unwrap();
         native_sos_init(&mut ctx, &[Value::Object(Some(scope))]).unwrap();
         let result = native_sos_result(&mut ctx, &[Value::Object(Some(scope))]);
         assert!(result.is_err());
@@ -3950,11 +4048,11 @@ mod jdk25_concurrency_tests {
     #[test]
     fn p82_sos_result_after_shutdown_with_value() {
         let mut ctx = crate::test_utils::MockNativeContext::new();
-        let scope = alloc_concurrent_synthetic(&mut ctx, CLS_SHUTDOWN_ON_SUCCESS, STS_NUM_FIELDS);
+        let scope = try_alloc_concurrent_synthetic(&mut ctx, CLS_SHUTDOWN_ON_SUCCESS, STS_NUM_FIELDS).unwrap();
         native_sos_init(&mut ctx, &[Value::Object(Some(scope))]).unwrap();
         // Manually shutdown and store result
         ctx.set_field(scope, STS_FIELD_STATE, Value::Int(STS_STATE_SHUTDOWN));
-        let result_obj = alloc_concurrent_synthetic(&mut ctx, "java/lang/Integer", 1);
+        let result_obj = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/Integer", 1).unwrap();
         ctx.set_field(scope, STS_FIELD_EXCEPTION, Value::Object(Some(result_obj)));
         let result = native_sos_result(&mut ctx, &[Value::Object(Some(scope))]).unwrap();
         assert_eq!(result, Some(Value::Object(Some(result_obj))));
@@ -3963,7 +4061,7 @@ mod jdk25_concurrency_tests {
     #[test]
     fn p82_sos_result_after_shutdown_no_value_errors() {
         let mut ctx = crate::test_utils::MockNativeContext::new();
-        let scope = alloc_concurrent_synthetic(&mut ctx, CLS_SHUTDOWN_ON_SUCCESS, STS_NUM_FIELDS);
+        let scope = try_alloc_concurrent_synthetic(&mut ctx, CLS_SHUTDOWN_ON_SUCCESS, STS_NUM_FIELDS).unwrap();
         native_sos_init(&mut ctx, &[Value::Object(Some(scope))]).unwrap();
         ctx.set_field(scope, STS_FIELD_STATE, Value::Int(STS_STATE_SHUTDOWN));
         // No result stored (exception field is None)
@@ -3976,7 +4074,7 @@ mod jdk25_concurrency_tests {
     #[test]
     fn p82_subtask_get_success() {
         let mut ctx = crate::test_utils::MockNativeContext::new();
-        let subtask = alloc_concurrent_synthetic(&mut ctx, CLS_SUBTASK, SUBTASK_NUM_FIELDS);
+        let subtask = try_alloc_concurrent_synthetic(&mut ctx, CLS_SUBTASK, SUBTASK_NUM_FIELDS).unwrap();
         ctx.set_field(
             subtask,
             SUBTASK_FIELD_STATE,
@@ -3990,7 +4088,7 @@ mod jdk25_concurrency_tests {
     #[test]
     fn p82_subtask_get_failed_errors() {
         let mut ctx = crate::test_utils::MockNativeContext::new();
-        let subtask = alloc_concurrent_synthetic(&mut ctx, CLS_SUBTASK, SUBTASK_NUM_FIELDS);
+        let subtask = try_alloc_concurrent_synthetic(&mut ctx, CLS_SUBTASK, SUBTASK_NUM_FIELDS).unwrap();
         ctx.set_field(
             subtask,
             SUBTASK_FIELD_STATE,
@@ -4003,7 +4101,7 @@ mod jdk25_concurrency_tests {
     #[test]
     fn p82_subtask_get_unavailable_errors() {
         let mut ctx = crate::test_utils::MockNativeContext::new();
-        let subtask = alloc_concurrent_synthetic(&mut ctx, CLS_SUBTASK, SUBTASK_NUM_FIELDS);
+        let subtask = try_alloc_concurrent_synthetic(&mut ctx, CLS_SUBTASK, SUBTASK_NUM_FIELDS).unwrap();
         ctx.set_field(
             subtask,
             SUBTASK_FIELD_STATE,
@@ -4016,8 +4114,8 @@ mod jdk25_concurrency_tests {
     #[test]
     fn p82_subtask_exception_on_failed() {
         let mut ctx = crate::test_utils::MockNativeContext::new();
-        let subtask = alloc_concurrent_synthetic(&mut ctx, CLS_SUBTASK, SUBTASK_NUM_FIELDS);
-        let exc = alloc_concurrent_synthetic(&mut ctx, "java/lang/Exception", 1);
+        let subtask = try_alloc_concurrent_synthetic(&mut ctx, CLS_SUBTASK, SUBTASK_NUM_FIELDS).unwrap();
+        let exc = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/Exception", 1).unwrap();
         ctx.set_field(
             subtask,
             SUBTASK_FIELD_STATE,
@@ -4031,7 +4129,7 @@ mod jdk25_concurrency_tests {
     #[test]
     fn p82_subtask_exception_on_success_errors() {
         let mut ctx = crate::test_utils::MockNativeContext::new();
-        let subtask = alloc_concurrent_synthetic(&mut ctx, CLS_SUBTASK, SUBTASK_NUM_FIELDS);
+        let subtask = try_alloc_concurrent_synthetic(&mut ctx, CLS_SUBTASK, SUBTASK_NUM_FIELDS).unwrap();
         ctx.set_field(
             subtask,
             SUBTASK_FIELD_STATE,
@@ -4044,8 +4142,8 @@ mod jdk25_concurrency_tests {
     #[test]
     fn p82_subtask_task_returns_callable() {
         let mut ctx = crate::test_utils::MockNativeContext::new();
-        let subtask = alloc_concurrent_synthetic(&mut ctx, CLS_SUBTASK, SUBTASK_NUM_FIELDS);
-        let callable = alloc_concurrent_synthetic(&mut ctx, "java/util/concurrent/Callable", 1);
+        let subtask = try_alloc_concurrent_synthetic(&mut ctx, CLS_SUBTASK, SUBTASK_NUM_FIELDS).unwrap();
+        let callable = try_alloc_concurrent_synthetic(&mut ctx, "java/util/concurrent/Callable", 1).unwrap();
         ctx.set_field(
             subtask,
             SUBTASK_FIELD_CALLABLE,
@@ -4060,11 +4158,11 @@ mod jdk25_concurrency_tests {
     #[test]
     fn p82_join_until_past_deadline() {
         let mut ctx = crate::test_utils::MockNativeContext::new();
-        let scope = alloc_concurrent_synthetic(&mut ctx, CLS_TASK_SCOPE, STS_NUM_FIELDS);
+        let scope = try_alloc_concurrent_synthetic(&mut ctx, CLS_TASK_SCOPE, STS_NUM_FIELDS).unwrap();
         native_sts_init(&mut ctx, &[Value::Object(Some(scope))]).unwrap();
 
         // Create an Instant in the past (epoch second 0)
-        let instant = alloc_concurrent_synthetic(&mut ctx, "java/time/Instant", 2);
+        let instant = try_alloc_concurrent_synthetic(&mut ctx, "java/time/Instant", 2).unwrap();
         ctx.set_field(instant, 0, Value::Long(0)); // seconds = 0 (1970)
         ctx.set_field(instant, 1, Value::Int(0)); // nanos = 0
 
@@ -4079,7 +4177,7 @@ mod jdk25_concurrency_tests {
             Err(cratonvm_types::error::MethodCallFailed::ExceptionThrown(exc)) => {
                 let cid = ctx.class_id_of_object(exc);
                 assert_eq!(
-                    ctx.class_name_of_id(cid).as_deref(),
+                    ctx.class_name_arc_of_id(cid).as_deref(),
                     Some("java/util/concurrent/TimeoutException"),
                     "joinUntil past-deadline must throw a real TimeoutException"
                 );
@@ -4095,10 +4193,10 @@ mod jdk25_concurrency_tests {
         // and must time out. (Pre-fix the nanos field was dropped entirely; this
         // guards the read path against regressing to "seconds only".)
         let mut ctx = crate::test_utils::MockNativeContext::new();
-        let scope = alloc_concurrent_synthetic(&mut ctx, CLS_TASK_SCOPE, STS_NUM_FIELDS);
+        let scope = try_alloc_concurrent_synthetic(&mut ctx, CLS_TASK_SCOPE, STS_NUM_FIELDS).unwrap();
         native_sts_init(&mut ctx, &[Value::Object(Some(scope))]).unwrap();
 
-        let instant = alloc_concurrent_synthetic(&mut ctx, "java/time/Instant", 2);
+        let instant = try_alloc_concurrent_synthetic(&mut ctx, "java/time/Instant", 2).unwrap();
         ctx.set_field(instant, 0, Value::Long(0));
         ctx.set_field(instant, 1, Value::Int(500_000_000)); // 0.5s past the epoch — still long past
 
@@ -4115,11 +4213,11 @@ mod jdk25_concurrency_tests {
     #[test]
     fn p82_join_until_future_deadline_succeeds() {
         let mut ctx = crate::test_utils::MockNativeContext::new();
-        let scope = alloc_concurrent_synthetic(&mut ctx, CLS_TASK_SCOPE, STS_NUM_FIELDS);
+        let scope = try_alloc_concurrent_synthetic(&mut ctx, CLS_TASK_SCOPE, STS_NUM_FIELDS).unwrap();
         native_sts_init(&mut ctx, &[Value::Object(Some(scope))]).unwrap();
 
         // Create an Instant far in the future
-        let instant = alloc_concurrent_synthetic(&mut ctx, "java/time/Instant", 2);
+        let instant = try_alloc_concurrent_synthetic(&mut ctx, "java/time/Instant", 2).unwrap();
         ctx.set_field(instant, 0, Value::Long(i64::MAX / 2)); // far future
         ctx.set_field(instant, 1, Value::Int(0));
 
@@ -4138,10 +4236,10 @@ mod jdk25_concurrency_tests {
     #[test]
     fn p82_carrier_run_binds_and_unbinds() {
         let mut ctx = crate::test_utils::MockNativeContext::new();
-        let sv = alloc_concurrent_synthetic(&mut ctx, CLS_SCOPED_VALUE, SV_NUM_FIELDS);
+        let sv = try_alloc_concurrent_synthetic(&mut ctx, CLS_SCOPED_VALUE, SV_NUM_FIELDS).unwrap();
         ctx.set_field(sv, SV_FIELD_IS_BOUND, Value::Int(0));
 
-        let carrier = alloc_concurrent_synthetic(&mut ctx, CLS_CARRIER, CARRIER_NUM_FIELDS);
+        let carrier = try_alloc_concurrent_synthetic(&mut ctx, CLS_CARRIER, CARRIER_NUM_FIELDS).unwrap();
         ctx.set_field(carrier, CARRIER_FIELD_SV_REF, Value::Object(Some(sv)));
         ctx.set_field(carrier, CARRIER_FIELD_VALUE_REF, Value::Int(42));
         ctx.set_field(carrier, CARRIER_FIELD_PARENT_REF, Value::Object(None));
@@ -4159,10 +4257,10 @@ mod jdk25_concurrency_tests {
     #[test]
     fn p82_carrier_call_binds_and_unbinds() {
         let mut ctx = crate::test_utils::MockNativeContext::new();
-        let sv = alloc_concurrent_synthetic(&mut ctx, CLS_SCOPED_VALUE, SV_NUM_FIELDS);
+        let sv = try_alloc_concurrent_synthetic(&mut ctx, CLS_SCOPED_VALUE, SV_NUM_FIELDS).unwrap();
         ctx.set_field(sv, SV_FIELD_IS_BOUND, Value::Int(0));
 
-        let carrier = alloc_concurrent_synthetic(&mut ctx, CLS_CARRIER, CARRIER_NUM_FIELDS);
+        let carrier = try_alloc_concurrent_synthetic(&mut ctx, CLS_CARRIER, CARRIER_NUM_FIELDS).unwrap();
         ctx.set_field(carrier, CARRIER_FIELD_SV_REF, Value::Object(Some(sv)));
         ctx.set_field(carrier, CARRIER_FIELD_VALUE_REF, Value::Int(100));
         ctx.set_field(carrier, CARRIER_FIELD_PARENT_REF, Value::Object(None));
@@ -4181,11 +4279,11 @@ mod jdk25_concurrency_tests {
         // If a SV was already bound before carrier.run(), the previous binding
         // should be restored after run() completes
         let mut ctx = crate::test_utils::MockNativeContext::new();
-        let sv = alloc_concurrent_synthetic(&mut ctx, CLS_SCOPED_VALUE, SV_NUM_FIELDS);
+        let sv = try_alloc_concurrent_synthetic(&mut ctx, CLS_SCOPED_VALUE, SV_NUM_FIELDS).unwrap();
         ctx.set_field(sv, SV_FIELD_IS_BOUND, Value::Int(1));
         ctx.set_field(sv, SV_FIELD_VALUE, Value::Int(999));
 
-        let carrier = alloc_concurrent_synthetic(&mut ctx, CLS_CARRIER, CARRIER_NUM_FIELDS);
+        let carrier = try_alloc_concurrent_synthetic(&mut ctx, CLS_CARRIER, CARRIER_NUM_FIELDS).unwrap();
         ctx.set_field(carrier, CARRIER_FIELD_SV_REF, Value::Object(Some(sv)));
         ctx.set_field(carrier, CARRIER_FIELD_VALUE_REF, Value::Int(42));
         ctx.set_field(carrier, CARRIER_FIELD_PARENT_REF, Value::Object(None));
@@ -4205,10 +4303,10 @@ mod jdk25_concurrency_tests {
     #[test]
     fn p82_nested_scopes() {
         let mut ctx = crate::test_utils::MockNativeContext::new();
-        let outer = alloc_concurrent_synthetic(&mut ctx, CLS_TASK_SCOPE, STS_NUM_FIELDS);
+        let outer = try_alloc_concurrent_synthetic(&mut ctx, CLS_TASK_SCOPE, STS_NUM_FIELDS).unwrap();
         native_sts_init(&mut ctx, &[Value::Object(Some(outer))]).unwrap();
 
-        let inner = alloc_concurrent_synthetic(&mut ctx, CLS_TASK_SCOPE, STS_NUM_FIELDS);
+        let inner = try_alloc_concurrent_synthetic(&mut ctx, CLS_TASK_SCOPE, STS_NUM_FIELDS).unwrap();
         native_sts_init(&mut ctx, &[Value::Object(Some(inner))]).unwrap();
 
         // Close inner first, then outer
@@ -4369,7 +4467,85 @@ mod jdk25_concurrency_tests {
     fn s52_joiner_policy_registered() {
         let mut r = NativeMethodRegistry::new();
         register_jdk25_concurrency_natives(&mut r);
+        // NOTE (W7-18): `policy()I` is not on JDK 25's `Joiner`. This test pins
+        // a triple no JDK declares; see the JDK-ONLY-NOTE at the
+        // `ShutdownOnFailure` registration block for why it is still here.
         assert!(r.find(CLS_JOINER, "policy", "()I").is_some());
+    }
+
+    /// RATCHET (W7-18 patch B), not a coverage claim: this registrar must not
+    /// grow a second body for the JEP 505 triples that
+    /// `phases_late/concurrent.rs::register_p67_structured_task_scope_j25` owns.
+    ///
+    /// The hazard is an ordering one and it is silent. All three
+    /// `StructuredTaskScope` registrars sit inside `register_synthetic_overrides`,
+    /// and the call order there is `register_phase67_natives` (which reaches the
+    /// JEP 505 registrar), then `register_phase_d_natives`, then
+    /// `register_jdk25_concurrency_natives` — this one, LAST. `register()` is
+    /// last-registration-wins (docs/architecture/natives-over-real-jdk-classes.md
+    /// §3), so any triple added here silently replaces the JEP 505 body with the
+    /// JDK-21-shaped one, with no warning, no duplicate-registration row, and no
+    /// visible diff at the call site. That is the exact mechanism this record's
+    /// residual names as the dangerous one.
+    ///
+    /// Checked as of 2026-08-12 by comparing the two triple sets: the JEP 505
+    /// surface is NOT shadowed today. This test is what keeps that true.
+    #[test]
+    fn w7_18_jep505_surface_is_not_shadowed_here() {
+        let mut r = NativeMethodRegistry::new();
+        register_jdk25_concurrency_natives(&mut r);
+        let owned_by_the_jep505_registrar: &[(&str, &str, &str)] = &[
+            (CLS_TASK_SCOPE, "join", "()Ljava/lang/Object;"),
+            (CLS_TASK_SCOPE, "isCancelled", "()Z"),
+            (
+                CLS_TASK_SCOPE,
+                "fork",
+                "(Ljava/lang/Runnable;)Ljava/util/concurrent/StructuredTaskScope$Subtask;",
+            ),
+            (
+                CLS_TASK_SCOPE,
+                "open",
+                "(Ljava/util/concurrent/StructuredTaskScope$Joiner;Ljava/util/function/Function;)Ljava/util/concurrent/StructuredTaskScope;",
+            ),
+            (
+                CLS_JOINER,
+                "allUntil",
+                "(Ljava/util/function/Predicate;)Ljava/util/concurrent/StructuredTaskScope$Joiner;",
+            ),
+            (
+                CLS_JOINER,
+                "onFork",
+                "(Ljava/util/concurrent/StructuredTaskScope$Subtask;)Z",
+            ),
+            (
+                "java/util/concurrent/StructuredTaskScope$Configuration",
+                "withName",
+                "(Ljava/lang/String;)Ljava/util/concurrent/StructuredTaskScope$Configuration;",
+            ),
+            (
+                "java/util/concurrent/StructuredTaskScope$Configuration",
+                "withThreadFactory",
+                "(Ljava/util/concurrent/ThreadFactory;)Ljava/util/concurrent/StructuredTaskScope$Configuration;",
+            ),
+            (
+                "java/util/concurrent/StructuredTaskScope$Configuration",
+                "withTimeout",
+                "(Ljava/time/Duration;)Ljava/util/concurrent/StructuredTaskScope$Configuration;",
+            ),
+        ];
+        for (cls, name, desc) in owned_by_the_jep505_registrar {
+            assert!(
+                r.find(cls, name, desc).is_none(),
+                "W7-18: `{}.{}{}` is registered HERE as well. This registrar runs \
+                 LAST inside `register_synthetic_overrides`, so it silently \
+                 replaces the JEP 505 body in \
+                 `phases_late/concurrent.rs::register_p67_structured_task_scope_j25`. \
+                 Either delete this registration or move the implementation.",
+                cls,
+                name,
+                desc
+            );
+        }
     }
 
     // -- 52.3: Joiner.onComplete behavior --
@@ -4377,7 +4553,7 @@ mod jdk25_concurrency_tests {
     #[test]
     fn s52_joiner_on_complete_all_successful_counts() {
         let mut ctx = crate::test_utils::MockNativeContext::new();
-        let joiner = alloc_concurrent_synthetic(&mut ctx, CLS_JOINER, JOINER_NUM_FIELDS);
+        let joiner = try_alloc_concurrent_synthetic(&mut ctx, CLS_JOINER, JOINER_NUM_FIELDS).unwrap();
         ctx.set_field(
             joiner,
             JOINER_FIELD_POLICY,
@@ -4388,7 +4564,7 @@ mod jdk25_concurrency_tests {
         ctx.set_field(joiner, JOINER_FIELD_COMPLETED, Value::Int(0));
 
         // Create a successful subtask
-        let subtask = alloc_concurrent_synthetic(&mut ctx, CLS_SUBTASK, SUBTASK_NUM_FIELDS);
+        let subtask = try_alloc_concurrent_synthetic(&mut ctx, CLS_SUBTASK, SUBTASK_NUM_FIELDS).unwrap();
         ctx.set_field(
             subtask,
             SUBTASK_FIELD_STATE,
@@ -4409,7 +4585,7 @@ mod jdk25_concurrency_tests {
     #[test]
     fn s52_joiner_on_complete_all_successful_stores_failure() {
         let mut ctx = crate::test_utils::MockNativeContext::new();
-        let joiner = alloc_concurrent_synthetic(&mut ctx, CLS_JOINER, JOINER_NUM_FIELDS);
+        let joiner = try_alloc_concurrent_synthetic(&mut ctx, CLS_JOINER, JOINER_NUM_FIELDS).unwrap();
         ctx.set_field(
             joiner,
             JOINER_FIELD_POLICY,
@@ -4419,8 +4595,8 @@ mod jdk25_concurrency_tests {
         ctx.set_field(joiner, JOINER_FIELD_EXCEPTION, Value::Object(None));
         ctx.set_field(joiner, JOINER_FIELD_COMPLETED, Value::Int(0));
 
-        let exc = alloc_concurrent_synthetic(&mut ctx, "java/lang/Exception", 1);
-        let subtask = alloc_concurrent_synthetic(&mut ctx, CLS_SUBTASK, SUBTASK_NUM_FIELDS);
+        let exc = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/Exception", 1).unwrap();
+        let subtask = try_alloc_concurrent_synthetic(&mut ctx, CLS_SUBTASK, SUBTASK_NUM_FIELDS).unwrap();
         ctx.set_field(
             subtask,
             SUBTASK_FIELD_STATE,
@@ -4442,7 +4618,7 @@ mod jdk25_concurrency_tests {
     #[test]
     fn s52_joiner_on_complete_any_successful_short_circuits() {
         let mut ctx = crate::test_utils::MockNativeContext::new();
-        let joiner = alloc_concurrent_synthetic(&mut ctx, CLS_JOINER, JOINER_NUM_FIELDS);
+        let joiner = try_alloc_concurrent_synthetic(&mut ctx, CLS_JOINER, JOINER_NUM_FIELDS).unwrap();
         ctx.set_field(
             joiner,
             JOINER_FIELD_POLICY,
@@ -4452,7 +4628,7 @@ mod jdk25_concurrency_tests {
         ctx.set_field(joiner, JOINER_FIELD_EXCEPTION, Value::Object(None));
         ctx.set_field(joiner, JOINER_FIELD_COMPLETED, Value::Int(0));
 
-        let subtask = alloc_concurrent_synthetic(&mut ctx, CLS_SUBTASK, SUBTASK_NUM_FIELDS);
+        let subtask = try_alloc_concurrent_synthetic(&mut ctx, CLS_SUBTASK, SUBTASK_NUM_FIELDS).unwrap();
         ctx.set_field(
             subtask,
             SUBTASK_FIELD_STATE,
@@ -4473,7 +4649,7 @@ mod jdk25_concurrency_tests {
     #[test]
     fn s52_joiner_on_complete_await_all_ignores_failures() {
         let mut ctx = crate::test_utils::MockNativeContext::new();
-        let joiner = alloc_concurrent_synthetic(&mut ctx, CLS_JOINER, JOINER_NUM_FIELDS);
+        let joiner = try_alloc_concurrent_synthetic(&mut ctx, CLS_JOINER, JOINER_NUM_FIELDS).unwrap();
         ctx.set_field(
             joiner,
             JOINER_FIELD_POLICY,
@@ -4483,7 +4659,7 @@ mod jdk25_concurrency_tests {
         ctx.set_field(joiner, JOINER_FIELD_EXCEPTION, Value::Object(None));
         ctx.set_field(joiner, JOINER_FIELD_COMPLETED, Value::Int(0));
 
-        let subtask = alloc_concurrent_synthetic(&mut ctx, CLS_SUBTASK, SUBTASK_NUM_FIELDS);
+        let subtask = try_alloc_concurrent_synthetic(&mut ctx, CLS_SUBTASK, SUBTASK_NUM_FIELDS).unwrap();
         ctx.set_field(
             subtask,
             SUBTASK_FIELD_STATE,
@@ -4508,13 +4684,13 @@ mod jdk25_concurrency_tests {
     #[test]
     fn s52_joiner_result_all_successful_throws_on_failure() {
         let mut ctx = crate::test_utils::MockNativeContext::new();
-        let joiner = alloc_concurrent_synthetic(&mut ctx, CLS_JOINER, JOINER_NUM_FIELDS);
+        let joiner = try_alloc_concurrent_synthetic(&mut ctx, CLS_JOINER, JOINER_NUM_FIELDS).unwrap();
         ctx.set_field(
             joiner,
             JOINER_FIELD_POLICY,
             Value::Int(JOINER_POLICY_ALL_SUCCESSFUL),
         );
-        let exc = alloc_concurrent_synthetic(&mut ctx, "java/lang/Exception", 1);
+        let exc = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/Exception", 1).unwrap();
         ctx.set_field(joiner, JOINER_FIELD_EXCEPTION, Value::Object(Some(exc)));
 
         let result = native_joiner_result(&mut ctx, &[Value::Object(Some(joiner))]);
@@ -4529,7 +4705,7 @@ mod jdk25_concurrency_tests {
     #[test]
     fn s52_joiner_result_all_successful_returns_on_success() {
         let mut ctx = crate::test_utils::MockNativeContext::new();
-        let joiner = alloc_concurrent_synthetic(&mut ctx, CLS_JOINER, JOINER_NUM_FIELDS);
+        let joiner = try_alloc_concurrent_synthetic(&mut ctx, CLS_JOINER, JOINER_NUM_FIELDS).unwrap();
         ctx.set_field(
             joiner,
             JOINER_FIELD_POLICY,
@@ -4546,7 +4722,7 @@ mod jdk25_concurrency_tests {
     #[test]
     fn s52_joiner_result_any_successful_returns_first() {
         let mut ctx = crate::test_utils::MockNativeContext::new();
-        let joiner = alloc_concurrent_synthetic(&mut ctx, CLS_JOINER, JOINER_NUM_FIELDS);
+        let joiner = try_alloc_concurrent_synthetic(&mut ctx, CLS_JOINER, JOINER_NUM_FIELDS).unwrap();
         ctx.set_field(
             joiner,
             JOINER_FIELD_POLICY,
@@ -4561,7 +4737,7 @@ mod jdk25_concurrency_tests {
     #[test]
     fn s52_joiner_result_any_successful_throws_when_none() {
         let mut ctx = crate::test_utils::MockNativeContext::new();
-        let joiner = alloc_concurrent_synthetic(&mut ctx, CLS_JOINER, JOINER_NUM_FIELDS);
+        let joiner = try_alloc_concurrent_synthetic(&mut ctx, CLS_JOINER, JOINER_NUM_FIELDS).unwrap();
         ctx.set_field(
             joiner,
             JOINER_FIELD_POLICY,
@@ -4577,7 +4753,7 @@ mod jdk25_concurrency_tests {
     #[test]
     fn s52_joiner_result_await_all_returns_void() {
         let mut ctx = crate::test_utils::MockNativeContext::new();
-        let joiner = alloc_concurrent_synthetic(&mut ctx, CLS_JOINER, JOINER_NUM_FIELDS);
+        let joiner = try_alloc_concurrent_synthetic(&mut ctx, CLS_JOINER, JOINER_NUM_FIELDS).unwrap();
         ctx.set_field(
             joiner,
             JOINER_FIELD_POLICY,
@@ -4591,7 +4767,7 @@ mod jdk25_concurrency_tests {
     #[test]
     fn s52_joiner_result_await_all_successful_returns_void() {
         let mut ctx = crate::test_utils::MockNativeContext::new();
-        let joiner = alloc_concurrent_synthetic(&mut ctx, CLS_JOINER, JOINER_NUM_FIELDS);
+        let joiner = try_alloc_concurrent_synthetic(&mut ctx, CLS_JOINER, JOINER_NUM_FIELDS).unwrap();
         ctx.set_field(
             joiner,
             JOINER_FIELD_POLICY,
@@ -4608,7 +4784,7 @@ mod jdk25_concurrency_tests {
     #[test]
     fn s52_joiner_policy_accessor() {
         let mut ctx = crate::test_utils::MockNativeContext::new();
-        let joiner = alloc_concurrent_synthetic(&mut ctx, CLS_JOINER, JOINER_NUM_FIELDS);
+        let joiner = try_alloc_concurrent_synthetic(&mut ctx, CLS_JOINER, JOINER_NUM_FIELDS).unwrap();
         ctx.set_field(
             joiner,
             JOINER_FIELD_POLICY,
@@ -4624,7 +4800,7 @@ mod jdk25_concurrency_tests {
     #[test]
     fn s52_config_init() {
         let mut ctx = crate::test_utils::MockNativeContext::new();
-        let config = alloc_concurrent_synthetic(&mut ctx, CLS_CONFIG, CONFIG_NUM_FIELDS);
+        let config = try_alloc_concurrent_synthetic(&mut ctx, CLS_CONFIG, CONFIG_NUM_FIELDS).unwrap();
         native_config_init(&mut ctx, &[Value::Object(Some(config))]).unwrap();
         assert_eq!(
             ctx.get_field(config, CONFIG_FIELD_NAME),
@@ -4643,7 +4819,7 @@ mod jdk25_concurrency_tests {
     #[test]
     fn s52_config_with_name() {
         let mut ctx = crate::test_utils::MockNativeContext::new();
-        let config = alloc_concurrent_synthetic(&mut ctx, CLS_CONFIG, CONFIG_NUM_FIELDS);
+        let config = try_alloc_concurrent_synthetic(&mut ctx, CLS_CONFIG, CONFIG_NUM_FIELDS).unwrap();
         native_config_init(&mut ctx, &[Value::Object(Some(config))]).unwrap();
 
         let new_config =
@@ -4659,9 +4835,9 @@ mod jdk25_concurrency_tests {
     #[test]
     fn s52_config_with_thread_factory() {
         let mut ctx = crate::test_utils::MockNativeContext::new();
-        let config = alloc_concurrent_synthetic(&mut ctx, CLS_CONFIG, CONFIG_NUM_FIELDS);
+        let config = try_alloc_concurrent_synthetic(&mut ctx, CLS_CONFIG, CONFIG_NUM_FIELDS).unwrap();
         native_config_init(&mut ctx, &[Value::Object(Some(config))]).unwrap();
-        let tf = alloc_concurrent_synthetic(&mut ctx, "java/util/concurrent/ThreadFactory", 1);
+        let tf = try_alloc_concurrent_synthetic(&mut ctx, "java/util/concurrent/ThreadFactory", 1).unwrap();
 
         let new_config = native_config_with_thread_factory(
             &mut ctx,
@@ -4681,7 +4857,7 @@ mod jdk25_concurrency_tests {
     #[test]
     fn s52_config_get_name() {
         let mut ctx = crate::test_utils::MockNativeContext::new();
-        let config = alloc_concurrent_synthetic(&mut ctx, CLS_CONFIG, CONFIG_NUM_FIELDS);
+        let config = try_alloc_concurrent_synthetic(&mut ctx, CLS_CONFIG, CONFIG_NUM_FIELDS).unwrap();
         ctx.set_field(config, CONFIG_FIELD_NAME, Value::Int(99));
         let result = native_config_get_name(&mut ctx, &[Value::Object(Some(config))]).unwrap();
         assert_eq!(result, Some(Value::Int(99)));
@@ -4690,7 +4866,7 @@ mod jdk25_concurrency_tests {
     #[test]
     fn s52_config_get_thread_factory_null() {
         let mut ctx = crate::test_utils::MockNativeContext::new();
-        let config = alloc_concurrent_synthetic(&mut ctx, CLS_CONFIG, CONFIG_NUM_FIELDS);
+        let config = try_alloc_concurrent_synthetic(&mut ctx, CLS_CONFIG, CONFIG_NUM_FIELDS).unwrap();
         native_config_init(&mut ctx, &[Value::Object(Some(config))]).unwrap();
         let result =
             native_config_get_thread_factory(&mut ctx, &[Value::Object(Some(config))]).unwrap();
@@ -4735,7 +4911,7 @@ mod jdk25_concurrency_tests {
     #[test]
     fn s52_open_with_any_successful_joiner_sets_success_policy() {
         let mut ctx = crate::test_utils::MockNativeContext::new();
-        let joiner = alloc_concurrent_synthetic(&mut ctx, CLS_JOINER, JOINER_NUM_FIELDS);
+        let joiner = try_alloc_concurrent_synthetic(&mut ctx, CLS_JOINER, JOINER_NUM_FIELDS).unwrap();
         ctx.set_field(
             joiner,
             JOINER_FIELD_POLICY,
@@ -4757,7 +4933,7 @@ mod jdk25_concurrency_tests {
     #[test]
     fn s52_open_with_all_successful_joiner_sets_failure_policy() {
         let mut ctx = crate::test_utils::MockNativeContext::new();
-        let joiner = alloc_concurrent_synthetic(&mut ctx, CLS_JOINER, JOINER_NUM_FIELDS);
+        let joiner = try_alloc_concurrent_synthetic(&mut ctx, CLS_JOINER, JOINER_NUM_FIELDS).unwrap();
         ctx.set_field(
             joiner,
             JOINER_FIELD_POLICY,
@@ -4779,7 +4955,7 @@ mod jdk25_concurrency_tests {
     #[test]
     fn s52_open_with_await_all_joiner_sets_base_policy() {
         let mut ctx = crate::test_utils::MockNativeContext::new();
-        let joiner = alloc_concurrent_synthetic(&mut ctx, CLS_JOINER, JOINER_NUM_FIELDS);
+        let joiner = try_alloc_concurrent_synthetic(&mut ctx, CLS_JOINER, JOINER_NUM_FIELDS).unwrap();
         ctx.set_field(
             joiner,
             JOINER_FIELD_POLICY,
@@ -4816,7 +4992,7 @@ mod jdk25_concurrency_tests {
     #[test]
     fn s52_scope_owner_join_succeeds_on_owner_thread() {
         let mut ctx = crate::test_utils::MockNativeContext::new();
-        let scope = alloc_concurrent_synthetic(&mut ctx, CLS_TASK_SCOPE, STS_NUM_FIELDS);
+        let scope = try_alloc_concurrent_synthetic(&mut ctx, CLS_TASK_SCOPE, STS_NUM_FIELDS).unwrap();
         native_sts_init(&mut ctx, &[Value::Object(Some(scope))]).unwrap();
         register_scope_owner(scope);
 
@@ -4828,7 +5004,7 @@ mod jdk25_concurrency_tests {
     #[test]
     fn s52_scope_owner_close_unregisters() {
         let mut ctx = crate::test_utils::MockNativeContext::new();
-        let scope = alloc_concurrent_synthetic(&mut ctx, CLS_TASK_SCOPE, STS_NUM_FIELDS);
+        let scope = try_alloc_concurrent_synthetic(&mut ctx, CLS_TASK_SCOPE, STS_NUM_FIELDS).unwrap();
         native_sts_init(&mut ctx, &[Value::Object(Some(scope))]).unwrap();
         register_scope_owner(scope);
 
@@ -4844,7 +5020,7 @@ mod jdk25_concurrency_tests {
     fn s52_fork_with_joiner_notifies_on_complete() {
         let mut ctx = crate::test_utils::MockNativeContext::new();
         // Create a joiner
-        let joiner = alloc_concurrent_synthetic(&mut ctx, CLS_JOINER, JOINER_NUM_FIELDS);
+        let joiner = try_alloc_concurrent_synthetic(&mut ctx, CLS_JOINER, JOINER_NUM_FIELDS).unwrap();
         ctx.set_field(
             joiner,
             JOINER_FIELD_POLICY,
@@ -4855,7 +5031,7 @@ mod jdk25_concurrency_tests {
         ctx.set_field(joiner, JOINER_FIELD_COMPLETED, Value::Int(0));
 
         // Open scope with joiner
-        let scope = alloc_concurrent_synthetic(&mut ctx, CLS_TASK_SCOPE, STS_NUM_FIELDS);
+        let scope = try_alloc_concurrent_synthetic(&mut ctx, CLS_TASK_SCOPE, STS_NUM_FIELDS).unwrap();
         sts_init_fields(&mut ctx, scope, Value::Object(None), STS_POLICY_BASE);
         register_scope_joiner(scope, joiner);
 
@@ -4875,8 +5051,8 @@ mod jdk25_concurrency_tests {
     #[test]
     fn s52_close_joiner_cleans_up() {
         let mut ctx = crate::test_utils::MockNativeContext::new();
-        let joiner = alloc_concurrent_synthetic(&mut ctx, CLS_JOINER, JOINER_NUM_FIELDS);
-        let scope = alloc_concurrent_synthetic(&mut ctx, CLS_TASK_SCOPE, STS_NUM_FIELDS);
+        let joiner = try_alloc_concurrent_synthetic(&mut ctx, CLS_JOINER, JOINER_NUM_FIELDS).unwrap();
+        let scope = try_alloc_concurrent_synthetic(&mut ctx, CLS_TASK_SCOPE, STS_NUM_FIELDS).unwrap();
         sts_init_fields(&mut ctx, scope, Value::Object(None), STS_POLICY_BASE);
         register_scope_owner(scope);
         register_scope_joiner(scope, joiner);
@@ -5057,7 +5233,7 @@ mod jdk25_concurrency_tests {
     #[test]
     fn s52_config_chaining() {
         let mut ctx = crate::test_utils::MockNativeContext::new();
-        let config = alloc_concurrent_synthetic(&mut ctx, CLS_CONFIG, CONFIG_NUM_FIELDS);
+        let config = try_alloc_concurrent_synthetic(&mut ctx, CLS_CONFIG, CONFIG_NUM_FIELDS).unwrap();
         native_config_init(&mut ctx, &[Value::Object(Some(config))]).unwrap();
 
         // Chain: config.withName("test").withThreadFactory(tf)
@@ -5069,7 +5245,7 @@ mod jdk25_concurrency_tests {
             _ => panic!("Expected config"),
         };
 
-        let tf = alloc_concurrent_synthetic(&mut ctx, "java/util/concurrent/ThreadFactory", 1);
+        let tf = try_alloc_concurrent_synthetic(&mut ctx, "java/util/concurrent/ThreadFactory", 1).unwrap();
         let c2 = native_config_with_thread_factory(
             &mut ctx,
             &[Value::Object(Some(c1_ref)), Value::Object(Some(tf))],

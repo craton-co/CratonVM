@@ -791,8 +791,8 @@ fn native_lock_support_get_blocker(
     Ok(Some(Value::Object(None)))
 }
 
-/// Report a caller that imposes its own small field layout on a class which
-/// already has a bigger one.
+/// Report a caller that imposes its own field layout on a class which already
+/// has a different one — in EITHER direction.
 ///
 /// `alloc_concurrent_synthetic` does NOT truncate: both it and
 /// `NativeContext::alloc_object` clamp the slot count UP to the resolved
@@ -810,94 +810,127 @@ fn native_lock_support_get_blocker(
 /// came back empty (see
 /// runtime-exec-returned-a-process-with-no-streams-FIXED-20260806.md).
 ///
-/// `num_fields < real` is a self-discriminating test for it: a class this call
+/// `num_fields != real` is a self-discriminating test for it: a class this call
 /// FABRICATED would declare exactly `num_fields` fields, so `real == num_fields`
-/// and nothing is reported. A smaller request means somebody else -- the real
-/// class file, or another native fabricating a wider shape -- already owns the
+/// and nothing is reported. Any inequality means somebody else -- the real class
+/// file, or another native fabricating a different shape -- already owns the
 /// layout.
 ///
-/// Deduplicated by (class, requested, caller) so a hot allocation loop reports
-/// once, not once per object.
+/// **Both directions are reported, and the OVER direction is the dangerous one.**
+/// Until 2026-08-11 the test was `num_fields < real`, so the instrument was blind
+/// to exactly the half `docs/architecture/natives-over-real-jdk-classes.md` §5
+/// calls out: *"a slot index against a real layout is not a wrong answer -- it is
+/// heap corruption"*. A request WIDER than the class is the caller stating, in
+/// the one place it is machine-readable, that it holds a slot map with more
+/// entries than the class has fields. Two consequences, and neither is visible
+/// at the allocation:
+///
+/// * The object comes back with `num_fields` slots while its class declares
+///   `real`, so its header disagrees with `num_total_fields`. That is precisely
+///   the condition `vm/src/memory/gc.rs::validate_object_sizes`
+///   (`CRATONVM_DBG_VALIDATE_NEW=1`) prints as `BAD ... num_slots=N EXPECTED=M`
+///   -- it was written for a JIT `new` with a wrong-size header, and this funnel
+///   manufactures the same shape deliberately.
+/// * The same class is then allocated in TWO widths: `real` by every real
+///   bytecode `new` and by the JIT, `num_fields` here. The wide slot map is not
+///   restricted to the objects this funnel made. Any native that applies it to a
+///   receiver it did NOT allocate -- and these natives do receive real-JDK
+///   objects, see `native_cf_complete`'s slot-1 type discriminator below -- reads
+///   or writes past the end of that object.
+///
+/// It is reported, not refused, and one sub-population is why. `jca/kem.rs`,
+/// `jca/signature.rs`, `jca/key_factory.rs` and `jca/key_agreement.rs`
+/// over-allocate ON PURPOSE, through `synthetic_base_offset` (27 uses): it asks
+/// `class_num_total_fields` for the real width and appends private slots ABOVE
+/// it, *"so reference writes never land on a slot the real layout declares with
+/// an incompatible descriptor"*. That is the correct remedy for this species,
+/// and it necessarily shows up here as `over`. This funnel cannot tell it apart
+/// from a hard-coded wide guess -- both arrive as one integer -- so the census
+/// names both and the reader subtracts. See the ENABLED note in the body for
+/// what a follow-up must measure before this could be made fatal.
+///
+/// `real == 0` was excluded from BOTH directions until 2026-08-12, on the
+/// argument that 0 is overloaded: it means "class not loaded yet" (the reason
+/// the `max` below exists at all) and it also means "genuinely no instance
+/// fields" -- every interface, and `java/lang/Object`. This funnel is routinely
+/// asked for interface names (`java/util/concurrent/locks/Condition`,
+/// `java/util/concurrent/Flow$Subscription`), where a non-zero request is the
+/// intended fabrication and not an alias.
+///
+/// **The argument was sound and the exclusion was still wrong**, because 0 is
+/// also the ONLY value of `real` for which the `max` below does nothing -- and
+/// therefore the only case in which the object handed back is genuinely NARROWER
+/// than the class it is handed out as. Every `under` row describes an object the
+/// clamp already widened; the short objects were all in the excluded bucket.
+/// Those sites now report `direction=undeclared`, which says "this instrument
+/// cannot adjudicate this allocation" instead of saying nothing, because saying
+/// nothing is what a consumer reads as clean. See
+/// W7-73-short-object-blind-spot.md.
+///
+/// Deduplicated by (class, requested, declared, site) so a hot allocation loop
+/// reports once, not once per object. The site is IN the key on purpose: two
+/// natives making the same mistake on the same class are two findings.
 ///
 /// `#[track_caller]` so the site reported is the NATIVE that asked for the
 /// shape: `alloc_concurrent_synthetic` is itself `#[track_caller]`, so the
 /// attribute chains through it to the original call site. Without it every
 /// report would name this file.
+///
+/// # This is a forwarder, not an implementation
+///
+/// The counting, the flag, the dedup key and the output channel moved to
+/// `cratonvm_native_api::layout_alias` on 2026-08-12 (W7-59). They had to: this
+/// funnel is busy but it is not the only allocator, and the ~200 production
+/// `alloc_object` call sites in `native-builtins`, `native-io` and
+/// `native-collections` that bypass it were never censused — including the live
+/// owner of the widest over-allocation in the workspace. See
+/// W7-59-layout-detector-coverage.md and W7-49-slot-index-recensus.md.
+///
+/// **Why this call still exists after the base allocator was instrumented.**
+/// The base allocator sees the count this funnel passes it, and that count is
+/// already clamped: `n = num_fields.max(real)`. An UNDER-request therefore
+/// arrives there as `n == real` and is invisible. Reporting here, before the
+/// clamp, is the only place the under direction survives. Dropping this line
+/// would make the detector quieter in the direction it has reported since it
+/// was written.
 #[track_caller]
 fn report_layout_alias(class_name: &str, num_fields: usize, real: usize) {
-    use std::collections::HashSet;
-    use std::sync::OnceLock;
-
-    // OFF by default, and deliberately so. Measured over a 30-class random
-    // sample of the real Tomcat suite this fires for 49 distinct JDK classes
-    // from 75 call sites, and the SAME runs produced zero out-of-bounds field
-    // reads -- so the shape is pervasive and, on that corpus, harmless: the
-    // clamp keeps every access in bounds, and no second native reads a wider
-    // layout for any of those classes. An always-on warning would be 75 lines
-    // of boot noise for a risk register, not a bug list.
-    //
-    // It becomes a BUG when a class has two layouts and someone reads the
-    // wider one. That is `java.lang.Process`, and the discriminator is cheap:
-    // a class appearing in BOTH this census and the `cratonvm::gc::guard`
-    // out-of-bounds reads has a live defect. Turn this on, run the failing
-    // workload, and intersect the two lists.
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    if !*ENABLED.get_or_init(|| {
-        cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_LAYOUT_ALIAS").is_some()
-    }) {
-        return;
-    }
-    // `OrderedPlMutex`, not a raw `parking_lot::Mutex`: `native-builtins` runs
-    // a lock-discipline ratchet over this crate and a raw construction fails
-    // it. `LockLevel::Scratch` (L0, "acquires nothing") is the honest level —
-    // the guard below lives for exactly one `insert` and nothing is taken while
-    // it is held, which is what makes a future violation a checker failure
-    // rather than a hang. This census re-enters the VM through `tracing::warn!`
-    // right after, so that property is worth stating rather than assuming.
-    static SEEN: OnceLock<
-        cratonvm_types::lock_order::OrderedPlMutex<
-            HashSet<(String, usize, &'static str, u32)>,
-        >,
-    > = OnceLock::new();
-    let site = std::panic::Location::caller();
-    let key = (
-        class_name.to_string(),
-        num_fields,
-        site.file(),
-        site.line(),
-    );
-    let seen = SEEN.get_or_init(|| {
-        cratonvm_types::lock_order::OrderedPlMutex::new(
-            HashSet::new(),
-            cratonvm_types::lock_order::LockLevel::Scratch,
-        )
-    });
-    if !seen.lock().insert(key) {
-        return;
-    }
-    tracing::warn!(
-        class = class_name,
-        requested_fields = num_fields,
-        real_fields = real,
-        site = %site,
-        "native allocated a class under its own SMALLER field layout; the slot \
-         count is clamped up to the real one, so these writes alias the real \
-         class's own fields and any native reading a wider layout for this \
-         class reads past the object"
-    );
+    // `observe_from_rust` is `#[track_caller]` and so is this function, so the
+    // location that reaches the census is the NATIVE that asked for the shape,
+    // not this forwarding line and not `alloc_concurrent_synthetic` in between.
+    let _ = cratonvm_native_api::layout_alias::observe_from_rust(class_name, num_fields, real);
 }
 
+// The infallible `alloc_concurrent_synthetic` twin is DELETED (JDK-only wave 2,
+// step 3, 2026-08-10). Its 1,904 call sites moved to the fallible spelling on
+// 2026-08-07 (attempt 5), leaving one straggler in `lookup_define.rs`; with that
+// migrated it survived only as a way back to `ensure_synthetic_class`, which is
+// the entry point step 3 removes.
+
+/// Allocate a synthetic object through the workspace's busiest fabrication
+/// funnel, with the refusal `--jdk-only` requires.
+///
+/// The deleted infallible twin reached `ensure_synthetic_class`, whose signature
+/// had no error channel, so under `--jdk-only` it recorded a
+/// `CompatibilityClassRequested` violation and fabricated anyway. This one goes
+/// through `try_ensure_synthetic_class`, so the refusal reaches the caller as a
+/// `NoClassDefFoundError` naming the class.
+///
+/// Under the default `Compatible` mode this is byte-for-byte what the twin did.
+///
+/// Every native returning `MethodCallResult` should prefer this spelling;
+/// `ClassIdentityError` converts with `?`.
+///
 /// `#[track_caller]` so the class-origin census's `requested_by` names the
 /// native that wanted the shape, not this one forwarding line — see the
-/// matching note on `NativeContext::ensure_synthetic_class`. This is the
-/// single busiest fabrication funnel in the workspace (~2,000 call sites), so
-/// without it the census cannot name a single one of them.
+/// matching note on `NativeContext::try_ensure_synthetic_class`. This funnel has
+/// ~2,000 call sites, so without it the census cannot name a single one.
 #[track_caller]
-pub(crate) fn alloc_concurrent_synthetic(
+pub(crate) fn try_alloc_concurrent_synthetic(
     ctx: &mut dyn NativeContext,
     class_name: &str,
     num_fields: usize,
-) -> ObjectRef {
+) -> Result<ObjectRef, MethodCallFailed> {
     match ctx.ensure_class_initialized(class_name) {
         Ok(class_id) => {
             let resolved_name = ctx.class_name_of_id(class_id).unwrap_or_default();
@@ -908,99 +941,145 @@ pub(crate) fn alloc_concurrent_synthetic(
                 // ClassId for helper/interface-like synthetic classes. Keep
                 // the requested identity so field writes and native dispatch
                 // use the helper layout instead of Object's zero-slot layout.
-                ctx.class_id_by_name(class_name)
-                    .unwrap_or_else(|| ctx.ensure_synthetic_class(class_name, num_fields))
-            };
-            // In real-JDK mode the loaded class's actual instance-field
-            // count often exceeds the synthetic-mode hard-coded number.
-            // Allocating with too few slots causes out-of-bounds field
-            // access later (KC16 bootstrap tripped this on ClassId
-            // 355/359 with index=4 vs num_slots=3).  Use the larger of
-            // the two so both paths have enough room.  0 means the class
-            // isn't loaded yet — keep the caller's requested size.
-            let real = ctx.class_num_total_fields(cid);
-            if num_fields > 0 && num_fields < real {
-                report_layout_alias(class_name, num_fields, real);
-            }
-            let n = num_fields.max(real);
-            // `try_alloc_object_gc_safe` first (proactively collects, then
-            // walks young -> old gen without aborting): this is the shared
-            // allocator behind `java.net.URI`, `HttpURLConnection`, and many
-            // other synthetic native objects -- a gdb backtrace confirmed
-            // TestResponsePerformance's doUri() hot loop (`new URI(...)` x
-            // 1,000,000) hard-aborted the whole process here on young-gen
-            // exhaustion. Falling back to the aborting `alloc_object` only
-            // if the GC-safe path still reports genuine exhaustion (both
-            // generations full even after a fresh collection) preserves
-            // today's behavior for that now much narrower case, with no
-            // signature change for this function's many other callers. See
-            // docs/known-issues/tomcat-08-07/silent-hang-no-signature-cluster.md.
-            ctx.try_alloc_object_gc_safe(cid, n)
-                .unwrap_or_else(|| ctx.alloc_object(cid, n))
-        }
-        Err(_) => {
-            // The real `.class` file could not be loaded. Allocating with
-            // `ClassId::new(0)` (`java/lang/Object`, zero declared fields)
-            // but a non-zero slot count produces an "undersized object
-            // layout" object — the GC's `get_field` bounds guard rejects
-            // every field access on it (class declares 0 fields, object has
-            // `num_fields` slots). Register a synthetic class declaring
-            // `num_fields` instance fields so the header's `class_id`
-            // matches the allocated slot count.
-            let cid = ctx.ensure_synthetic_class(class_name, num_fields);
-            ctx.alloc_object(cid, num_fields)
-        }
-    }
-}
-
-/// The fallible spelling of [`alloc_concurrent_synthetic`] — same operation,
-/// with the refusal `--jdk-only` requires.
-///
-/// [`alloc_concurrent_synthetic`] reaches `ensure_synthetic_class`, whose
-/// signature has no error channel, so under `--jdk-only` it records a
-/// `CompatibilityClassRequested` violation and fabricates anyway. This one goes
-/// through `try_ensure_synthetic_class`, so the refusal reaches the caller as a
-/// `ClassNotFoundException` naming the class.
-///
-/// Under the default `Compatible` mode the two are byte-for-byte identical.
-///
-/// Every native returning `MethodCallResult` should prefer this spelling;
-/// `ClassIdentityError` converts with `?`.
-#[track_caller]
-pub(crate) fn try_alloc_concurrent_synthetic(
-    ctx: &mut dyn NativeContext,
-    class_name: &str,
-    num_fields: usize,
-) -> Result<ObjectRef, MethodCallFailed> {
-    // Structurally identical to the infallible spelling above; only the two
-    // `ensure_synthetic_class` arms differ, and only in that they ask the
-    // policy rather than override it.
-    match ctx.ensure_class_initialized(class_name) {
-        Ok(class_id) => {
-            let resolved_name = ctx.class_name_of_id(class_id).unwrap_or_default();
-            let cid = if resolved_name == class_name || class_name == "java/lang/Object" {
-                class_id
-            } else {
                 match ctx.class_id_by_name(class_name) {
                     Some(id) => id,
                     None => refused_class(ctx, class_name, num_fields)?,
                 }
             };
+            // In real-JDK mode the loaded class's actual instance-field count
+            // often exceeds the synthetic-mode hard-coded number. Allocating
+            // with too few slots causes out-of-bounds field access later (KC16
+            // bootstrap tripped this on ClassId 355/359 with index=4 vs
+            // num_slots=3). Use the larger of the two so both paths have enough
+            // room. 0 means the class isn't loaded yet — keep the caller's
+            // requested size.
             let real = ctx.class_num_total_fields(cid);
-            if num_fields > 0 && num_fields < real {
+            // `!=`, not `<`, since 2026-08-11 (JDK-only lane W4-4).
+            //
+            // Call the SHARED rule; do not re-derive it. This line read
+            // `if num_fields > 0 && real > 0 && num_fields != real` until
+            // 2026-08-12, which is `layout_alias::classify` open-coded — a second
+            // implementation of the one primitive
+            // W7-59-layout-detector-coverage.md said it had eliminated ("there is
+            // one implementation here"). It had eliminated the second copy of the
+            // reporting MACHINERY and left a second copy of the DECISION, and the
+            // two then drifted on the case that matters: `real > 0` is exactly
+            // the `declared == 0` exclusion W7-73-short-object-blind-spot.md
+            // removed, so this funnel — the busiest allocator in the workspace —
+            // would have stayed blind to the short-object species after
+            // `classify` learned to report it.
+            //
+            // Strictly louder: `classify` returns `Some` for every input this
+            // predicate accepted, plus `Undeclared` for `real == 0`.
+            if cratonvm_native_api::layout_alias::classify(num_fields, real).is_some() {
                 report_layout_alias(class_name, num_fields, real);
             }
+            // ALLOCATION IS UNCHANGED by the widening above: still `max`, so an
+            // over-request still gets the slots it asked for and an under-request
+            // is still clamped up. Reporting and refusing are separate changes and
+            // this lane makes only the first -- the over-allocating population has
+            // never been counted (see the ENABLED note), and a funnel with ~2,000
+            // call sites is not where you discover that number by failing.
             let n = num_fields.max(real);
+            // `try_alloc_object_gc_safe` first (proactively collects, then walks
+            // young -> old gen without aborting): this is the shared allocator
+            // behind `java.net.URI`, `HttpURLConnection`, and many other
+            // synthetic native objects — a gdb backtrace confirmed
+            // TestResponsePerformance's doUri() hot loop (`new URI(...)` x
+            // 1,000,000) hard-aborted the whole process here on young-gen
+            // exhaustion. Falling back to the aborting `alloc_object` only if
+            // the GC-safe path still reports genuine exhaustion (both
+            // generations full even after a fresh collection) keeps that now
+            // much narrower case behaving as it did.
             Ok(ctx
                 .try_alloc_object_gc_safe(cid, n)
                 .unwrap_or_else(|| ctx.alloc_object(cid, n)))
         }
         Err(_) => {
+            // The real `.class` file could not be loaded. Allocating with
+            // `ClassId::new(0)` (`java/lang/Object`, zero declared fields) but a
+            // non-zero slot count produces an "undersized object layout" object
+            // — the GC's `get_field` bounds guard rejects every field access on
+            // it. Ask the policy for a synthetic class declaring `num_fields`
+            // instance fields, so the header's `class_id` matches the allocated
+            // slot count; under `--jdk-only` that ask is refused instead.
             let cid = refused_class(ctx, class_name, num_fields)?;
             Ok(ctx.alloc_object(cid, num_fields))
         }
     }
 }
+
+/// Where a native's PRIVATE slot map starts on an instance of `class_name`.
+///
+/// Zero when the class is a fabricated stub (its fields are `_f0.._fN` and the
+/// synthetic map IS the layout); otherwise the real class's transitive declared
+/// field count, so every private slot lands ABOVE every field the real layout
+/// declares. This is the idiom `jca/kem.rs::synthetic_base_offset` uses, with
+/// the stub arm added: without it the base RATCHETS in synthetic-JDK mode,
+/// because the first allocation fabricates a class declaring `base + width`
+/// fields and the next call reads that number back as the new base, so two
+/// objects of one class end up with two different slot maps in one run.
+/// `is_class_synthetic_stub` is stable under that — a stub stays a stub.
+///
+/// Read W7-49-slot-index-recensus.md for why the alternative — guessing the
+/// layout from the object's own slot count — cannot work for a receiver this
+/// native did not allocate.
+///
+/// **The body moved to `cratonvm_native_api::appended_slots` on 2026-08-12**
+/// and this is now a forwarder, not a second copy. W7-68-live-under-allocations.md
+/// found the `under` direction's live cases in `native-io`
+/// (`java/nio/channels/FileChannel`, `java/nio/MappedByteBuffer`), which cannot
+/// reach a `pub(crate)` helper in this crate; copying it here would have made
+/// it the sixteenth private re-implementation of a primitive
+/// W7-59-layout-detector-coverage.md §2.1 already counted fifteen copies of.
+/// Kept as a name because this crate's call sites read better with it and
+/// because deleting it would churn them for nothing.
+pub(crate) fn appended_slot_base_for_class(
+    ctx: &mut dyn NativeContext,
+    class_name: &str,
+) -> usize {
+    cratonvm_native_api::appended_slots::base_for_class(ctx, class_name)
+}
+
+/// Allocate `class_name` carrying `width` private slots appended above the real
+/// layout, and hand back the base those slots start at.
+///
+/// The pair (object, base) is what makes the write in-bounds AND non-aliasing:
+/// the object is `base + width` slots wide, so `base + i` for `i < width` is
+/// inside it, and no `base + i` collides with a field the real class declares.
+/// Contrast the shape this replaces — allocate `width` slots on a class that
+/// declares `real > 0` fields and write `0..width`, which puts the native's
+/// `Int` into whatever reference the real layout declares at slot 0.
+#[track_caller]
+pub(crate) fn try_alloc_with_appended_slots(
+    ctx: &mut dyn NativeContext,
+    class_name: &str,
+    width: usize,
+) -> Result<(ObjectRef, usize), MethodCallFailed> {
+    let base = appended_slot_base_for_class(ctx, class_name);
+    let obj = try_alloc_concurrent_synthetic(ctx, class_name, base + width)?;
+    let carried = ctx.object_num_fields(obj);
+    debug_assert!(
+        carried >= base + width,
+        "appended-slot allocation of {class_name} came back with {carried} \
+         slots, needed base {base} + width {width}"
+    );
+    Ok((obj, base))
+}
+
+// NOT PROVIDED, and the omission is deliberate: a `base_for_this_receiver`
+// companion (W7-49, 2026-08-12). It was written, its only caller was reverted,
+// and it is not left here unused — but the reason it cannot exist usefully is
+// worth keeping, because it is the first thing the next reader will reach for.
+//
+// Given an object this native did NOT allocate, "how many private slots does it
+// carry" is not answerable from its width. A real-layout instance of the exact
+// class is narrow and can be refused; a real SUBCLASS instance is wide, for its
+// own reasons, and `width - real` lands squarely inside its own fields. So such
+// a helper can only ever refuse the narrow case, which is the easy half. The
+// sound remedy for foreign receivers is a side table keyed on object identity —
+// `jca/key_factory.rs` already runs one, with the GC-stable key that lane had to
+// invent when the raw `ObjectRef` address aliased across a young collection.
 
 /// `try_ensure_synthetic_class`, with the refusal converted to a **catchable**
 /// Java throwable.
@@ -1009,8 +1088,15 @@ pub(crate) fn try_alloc_concurrent_synthetic(
 /// exception model defines as uncatchable and fatal — the wrong shape for a
 /// policy refusal. Contract §5 asks for the specification's
 /// `NoClassDefFoundError`, which is what `refusal_to_java_failure` builds.
+///
+/// `pub(crate)` since 2026-08-10 (JDK-only wave 2, step 3): the crate's
+/// remaining direct `ensure_synthetic_class` callers — the enterprise-shim
+/// `alloc_object_for` helpers, `alloc_impl`, the array-element class lookups in
+/// `lang_string`/`keystore`/`regex_matcher` — each needed the same three lines,
+/// and three per-site copies of a conversion is how the two spellings drift
+/// apart. One idiom, one place.
 #[track_caller]
-fn refused_class(
+pub(crate) fn refused_class(
     ctx: &mut dyn NativeContext,
     class_name: &str,
     num_fields: usize,
@@ -1019,6 +1105,55 @@ fn refused_class(
         Ok(id) => Ok(id),
         Err(err) => Err(cratonvm_native_api::refusal_to_java_failure(ctx, err)),
     }
+}
+
+/// The synthetic `java.util.concurrent.CyclicBarrier` surface.
+///
+/// Registered from TWO places, because two different conditions need it and
+/// neither can see the other:
+///
+///  * [`register_concurrent_natives`], when `CRATONVM_SYNTHETIC_AQS` is set —
+///    the real `CyclicBarrier` bytecode is present but its `ReentrantLock` /
+///    `Condition` are being served synthetically, so the barrier is served
+///    synthetically too;
+///  * `vm_init`'s synthetic-JDK arm, where there IS no real bytecode. This one
+///    was missing. `67c5e048c` narrowed the whole surface to the env flag, on
+///    the reasoning that the default real-JDK build should run the real class —
+///    correct for that build, but synthetic-JDK mode has only a 3-field
+///    compatibility STUB for `CyclicBarrier` (`class_manager`'s
+///    `synthetic_stub_fields`) and no method bodies at all, so it lost the
+///    constructor outright: all four `JucComplete` barrier fixtures went to
+///    `NoSuchMethodError: java.util.concurrent.CyclicBarrier.<init>(I)V` while
+///    the TCK table still listed them as passing. A flag is not a mode
+///    ([`crate::nbflags`] cannot see the JDK mode; `vm_init` can), which is
+///    exactly why the call lives there and not behind another `nbflags` test.
+///
+/// Deleting these natives instead — the standing preference for synthetic
+/// shadows of pure-Java JDK classes — is not available for the same reason:
+/// synthetic-JDK mode has nothing to fall back to.
+pub fn register_cyclic_barrier_natives(registry: &mut NativeMethodRegistry) {
+    let __prev_cat = registry.current_category();
+    registry.set_category(cratonvm_native_api::NativeKind::SyntheticStub);
+    let cb = "java/util/concurrent/CyclicBarrier";
+    registry.register(cb, "<init>", "(I)V", native_cb_init);
+    registry.register(
+        cb,
+        "<init>",
+        "(ILjava/lang/Runnable;)V",
+        native_cb_init_action,
+    );
+    registry.register(cb, "await", "()I", native_cb_await);
+    registry.register(
+        cb,
+        "await",
+        "(JLjava/util/concurrent/TimeUnit;)I",
+        native_cb_await_timeout,
+    );
+    registry.register(cb, "getParties", "()I", native_cb_get_parties);
+    registry.register(cb, "getNumberWaiting", "()I", native_cb_get_number_waiting);
+    registry.register(cb, "isBroken", "()Z", native_cb_is_broken);
+    registry.register(cb, "reset", "()V", native_cb_reset);
+    registry.set_category(__prev_cat);
 }
 
 pub fn register_concurrent_natives(registry: &mut NativeMethodRegistry) {
@@ -1085,25 +1220,21 @@ pub fn register_concurrent_natives(registry: &mut NativeMethodRegistry) {
     // alongside the lock ones; both are registered together above.
 
     // --- CyclicBarrier ---
-    let cb = "java/util/concurrent/CyclicBarrier";
-    registry.register(cb, "<init>", "(I)V", native_cb_init);
-    registry.register(
-        cb,
-        "<init>",
-        "(ILjava/lang/Runnable;)V",
-        native_cb_init_action,
-    );
-    registry.register(cb, "await", "()I", native_cb_await);
-    registry.register(
-        cb,
-        "await",
-        "(JLjava/util/concurrent/TimeUnit;)I",
-        native_cb_await_timeout,
-    );
-    registry.register(cb, "getParties", "()I", native_cb_get_parties);
-    registry.register(cb, "getNumberWaiting", "()I", native_cb_get_number_waiting);
-    registry.register(cb, "isBroken", "()Z", native_cb_is_broken);
-    registry.register(cb, "reset", "()V", native_cb_reset);
+    //
+    // Synthetic-AQS mode only HERE. With real AQS (the default) the real JDK
+    // `CyclicBarrier` — ReentrantLock + Condition + an identity-compared
+    // `Generation` — is correct and needs no help, exactly as for
+    // ReentrantLock/Lock/Condition and Semaphore above. The constructors are
+    // gated with the rest, not separately: `native_cb_init` stores its state
+    // holder in the receiver's slot 0, which is the real layout's `lock` field,
+    // so registering only the constructors while `await()` runs real bytecode
+    // would hand that bytecode a barrier whose `lock` is an array.
+    //
+    // Synthetic-JDK mode registers the same set from `vm_init`, where the mode
+    // is known — see [`register_cyclic_barrier_natives`].
+    if !real_aqs {
+        register_cyclic_barrier_natives(registry);
+    }
     registry.set_category(__prev_cat);
 
     // --- CopyOnWriteArrayList (M18) ---
@@ -2122,7 +2253,7 @@ pub(crate) fn register_m18_concurrent_fixes(registry: &mut NativeMethodRegistry)
                     _ => 0,
                 };
                 let unit_ordinal = match args.get(2) {
-                    Some(Value::Object(Some(u))) => ctx.get_field(*u, 0).as_int().unwrap_or(2),
+                    Some(Value::Object(Some(u))) => time_unit_ordinal(ctx, *u),
                     _ => 2,
                 };
                 let timeout_ms = convert_time_unit_to_millis(timeout_val, unit_ordinal);
@@ -2273,7 +2404,7 @@ pub(crate) fn register_m18_concurrent_fixes(registry: &mut NativeMethodRegistry)
             let arr = match ctx.get_field(this, 0) {
                 Value::Object(Some(a)) => a,
                 _ => {
-                    let iter = alloc_concurrent_synthetic(ctx, "java/util/ArrayList$Itr", 3);
+                    let iter = try_alloc_concurrent_synthetic(ctx, "java/util/ArrayList$Itr", 3)?;
                     ctx.set_field(iter, 0, Value::Int(0));
                     ctx.set_field(iter, 1, Value::Int(0));
                     return Ok(Some(Value::Object(Some(iter))));
@@ -2283,7 +2414,7 @@ pub(crate) fn register_m18_concurrent_fixes(registry: &mut NativeMethodRegistry)
             for i in 0..size {
                 ctx.set_array_element(snap, i, ctx.get_array_element(arr, i));
             }
-            let iter = alloc_concurrent_synthetic(ctx, "java/util/ArrayList$Itr", 3);
+            let iter = try_alloc_concurrent_synthetic(ctx, "java/util/ArrayList$Itr", 3)?;
             ctx.set_field(iter, 0, Value::Object(Some(snap)));
             ctx.set_field(iter, 1, Value::Int(size as i32));
             ctx.set_field(iter, 2, Value::Int(0));
@@ -2507,7 +2638,7 @@ pub(crate) fn register_m18_concurrent_fixes(registry: &mut NativeMethodRegistry)
                     _ => 0,
                 };
                 let unit_ordinal = match args.get(2) {
-                    Some(Value::Object(Some(u))) => ctx.get_field(*u, 0).as_int().unwrap_or(2),
+                    Some(Value::Object(Some(u))) => time_unit_ordinal(ctx, *u),
                     _ => 2,
                 };
                 let timeout_ms = convert_time_unit_to_millis(timeout_val, unit_ordinal);
@@ -3212,7 +3343,7 @@ pub(crate) fn register_t31_concurrent_extras(registry: &mut NativeMethodRegistry
                     _ => 0,
                 };
                 let unit_ordinal = match args.get(2) {
-                    Some(Value::Object(Some(u))) => ctx.get_field(*u, 0).as_int().unwrap_or(2),
+                    Some(Value::Object(Some(u))) => time_unit_ordinal(ctx, *u),
                     _ => 2,
                 };
                 let timeout_ms = convert_time_unit_to_millis(timeout_val, unit_ordinal);
@@ -3316,7 +3447,7 @@ pub(crate) fn register_t31_concurrent_extras(registry: &mut NativeMethodRegistry
                 // 0 = cancelled flag, 1 = accumulated demand (Long). The second
                 // slot is what makes `request(n)` above observable.
                 let sub =
-                    alloc_concurrent_synthetic(ctx, "java/util/concurrent/Flow$Subscription", 2);
+                    try_alloc_concurrent_synthetic(ctx, "java/util/concurrent/Flow$Subscription", 2)?;
                 ctx.set_field(sub, 0, Value::Int(0)); // cancelled flag
                 ctx.set_field(sub, 1, Value::Long(0)); // demand
                 let _ = ctx.invoke_virtual(
@@ -3554,7 +3685,7 @@ pub(crate) fn native_rl_try_lock_timeout(
         _ => 0,
     };
     let unit_ord = match args.get(2) {
-        Some(Value::Object(Some(u))) => ctx.get_field(*u, 0).as_int().unwrap_or(2),
+        Some(Value::Object(Some(u))) => time_unit_ordinal(ctx, *u),
         _ => 2,
     };
     let timeout_ms = convert_time_unit_to_millis(timeout_val, unit_ord);
@@ -3655,7 +3786,7 @@ pub(crate) fn native_rl_new_condition(
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
     };
-    let cond = alloc_concurrent_synthetic(ctx, "java/util/concurrent/locks/Condition", 1);
+    let cond = try_alloc_concurrent_synthetic(ctx, "java/util/concurrent/locks/Condition", 1)?;
     ctx.set_field(cond, COND_FIELD_LOCK, Value::Object(Some(this)));
     Ok(Some(Value::Object(Some(cond))))
 }
@@ -3764,7 +3895,7 @@ pub(crate) fn native_cond_await_timeout(
         _ => 0,
     };
     let unit_ordinal = match args.get(2) {
-        Some(Value::Object(Some(u))) => ctx.get_field(*u, 0).as_int().unwrap_or(2),
+        Some(Value::Object(Some(u))) => time_unit_ordinal(ctx, *u),
         _ => 2,
     };
     let timeout_ms = convert_time_unit_to_millis(timeout_raw, unit_ordinal).max(0) as u64;
@@ -4431,7 +4562,7 @@ pub(crate) fn native_sem_try_acquire_timeout(
         _ => 0,
     };
     let unit_ordinal = match args.get(2) {
-        Some(Value::Object(Some(u))) => ctx.get_field(*u, 0).as_int().unwrap_or(2),
+        Some(Value::Object(Some(u))) => time_unit_ordinal(ctx, *u),
         _ => 2, // MILLISECONDS
     };
     let timeout_ms = convert_time_unit_to_millis(timeout_val, unit_ordinal);
@@ -4730,7 +4861,7 @@ pub(crate) fn register_executor_natives(registry: &mut NativeMethodRegistry) {
             Some(Value::Object(Some(c))) => *c,
             _ => return Ok(Some(Value::Object(None))),
         };
-        let list = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
+        let list = try_alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2)?;
         cratonvm_native_collections::native_al_init(ctx, &[Value::Object(Some(list))])?;
         let task_count =
             match cratonvm_native_collections::native_al_size(ctx, &[Value::Object(Some(coll))])? {
@@ -5038,7 +5169,7 @@ pub(crate) fn register_completable_future_natives(registry: &mut NativeMethodReg
     );
     registry.register(ft, "isDone", "()Z", native_fut_is_done);
     // Synthetic FutureTask uses the same (result=0, done=1) layout — see the
-    // `alloc_concurrent_synthetic(.., "java/util/concurrent/FutureTask", 2)`
+    // `try_alloc_concurrent_synthetic(.., "java/util/concurrent/FutureTask", 2)?`
     // call sites in phases_late/net_channels.rs. Nothing else registers
     // FutureTask.cancel/isCancelled, so the old constant `false` pair was the
     // live answer: `FutureTask.cancel(true)` could never succeed and a
@@ -5106,7 +5237,7 @@ fn native_fut_get_timed(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         _ => 0,
     };
     let unit_ord = match args.get(2) {
-        Some(Value::Object(Some(u))) => ctx.get_field(*u, 0).as_int().unwrap_or(2),
+        Some(Value::Object(Some(u))) => time_unit_ordinal(ctx, *u),
         _ => 2,
     };
     let timeout_ms = convert_time_unit_to_millis(timeout_val, unit_ord).max(0) as u64;
@@ -5144,14 +5275,14 @@ fn native_cf_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
 
 fn native_cf_completed(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let val = args.first().copied().unwrap_or(Value::Object(None));
-    let cf = alloc_concurrent_synthetic(ctx, "java/util/concurrent/CompletableFuture", 4);
+    let cf = try_alloc_concurrent_synthetic(ctx, "java/util/concurrent/CompletableFuture", 4)?;
     ctx.set_field(cf, FUT_FIELD_RESULT, val);
     ctx.set_field(cf, FUT_FIELD_DONE, Value::Int(1));
     Ok(Some(Value::Object(Some(cf))))
 }
 
 fn native_cf_supply_async(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let cf = alloc_concurrent_synthetic(ctx, "java/util/concurrent/CompletableFuture", 4);
+    let cf = try_alloc_concurrent_synthetic(ctx, "java/util/concurrent/CompletableFuture", 4)?;
     if let Some(Value::Object(Some(supplier))) = args.first() {
         let result = ctx.invoke_virtual(*supplier, "get", "()Ljava/lang/Object;", &[])?;
         ctx.set_field(cf, FUT_FIELD_RESULT, result.unwrap_or(Value::Object(None)));
@@ -5310,7 +5441,7 @@ pub(crate) fn native_cf_then_apply(
         Value::Int(d) => d,
         _ => 0,
     };
-    let cf = alloc_concurrent_synthetic(ctx, "java/util/concurrent/CompletableFuture", 4);
+    let cf = try_alloc_concurrent_synthetic(ctx, "java/util/concurrent/CompletableFuture", 4)?;
     // RD.8: propagate exceptional/cancelled state without invoking the Function.
     if done == 2 || done == 3 {
         ctx.set_field(cf, FUT_FIELD_RESULT, ctx.get_field(this, FUT_FIELD_RESULT));
@@ -5365,7 +5496,7 @@ pub(crate) fn native_cf_then_accept(
         Value::Int(d) => d,
         _ => 0,
     };
-    let cf = alloc_concurrent_synthetic(ctx, "java/util/concurrent/CompletableFuture", 4);
+    let cf = try_alloc_concurrent_synthetic(ctx, "java/util/concurrent/CompletableFuture", 4)?;
     if done == 2 || done == 3 {
         ctx.set_field(cf, FUT_FIELD_RESULT, ctx.get_field(this, FUT_FIELD_RESULT));
         ctx.set_field(cf, FUT_FIELD_DONE, Value::Int(done));
@@ -5612,23 +5743,23 @@ fn aqls_state_table() -> &'static parking_lot::Mutex<
 fn aqls_state_slot(
     ctx: &mut dyn NativeContext,
     synchronizer: ObjectRef,
-) -> std::sync::Arc<std::sync::atomic::AtomicI64> {
+) -> Result<std::sync::Arc<std::sync::atomic::AtomicI64>, MethodCallFailed> {
     let key = gc_stable_lock_key(ctx, synchronizer);
     let mut table = aqls_state_table().lock();
-    table
-        .entry(key)
+    Ok(table
+        .entry(key?)
         // AbstractQueuedLongSynchronizer initializes `state` to zero. Every
         // later Java-side transition goes through the three forced natives
         // registered below, including deserialization's `setState` path.
         .or_insert_with(|| std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0)))
-        .clone()
+        .clone())
 }
 
 fn native_aqls_get_state(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let Some(Value::Object(Some(synchronizer))) = args.first() else {
         return Ok(Some(Value::Long(0)));
     };
-    let state = aqls_state_slot(ctx, *synchronizer).load(std::sync::atomic::Ordering::SeqCst);
+    let state = aqls_state_slot(ctx, *synchronizer)?.load(std::sync::atomic::Ordering::SeqCst);
     Ok(Some(Value::Long(state)))
 }
 
@@ -5638,7 +5769,7 @@ fn native_aqls_set_state(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     else {
         return Ok(None);
     };
-    aqls_state_slot(ctx, *synchronizer).store(*state, std::sync::atomic::Ordering::SeqCst);
+    aqls_state_slot(ctx, *synchronizer)?.store(*state, std::sync::atomic::Ordering::SeqCst);
     Ok(None)
 }
 
@@ -5654,7 +5785,7 @@ fn native_aqls_compare_and_set_state(
     else {
         return Ok(Some(Value::Int(0)));
     };
-    let swapped = aqls_state_slot(ctx, *synchronizer)
+    let swapped = aqls_state_slot(ctx, *synchronizer)?
         .compare_exchange(
             *expected,
             *new_state,
@@ -5746,10 +5877,10 @@ pub fn register_synthetic_rwlock_natives(registry: &mut NativeMethodRegistry) {
     // view obtained before a GC must unlock against the SAME slot afterwards;
     // `parent.as_ptr()` shifts under a moving collector and the lock/unlock
     // pair would diverge, deadlocking the lock or corrupting a neighbour slot.
-    fn rwl_parent_addr(ctx: &mut dyn NativeContext, this: ObjectRef) -> Option<usize> {
+    fn rwl_parent_addr(ctx: &mut dyn NativeContext, this: ObjectRef) -> Result<Option<usize>, MethodCallFailed> {
         match ctx.get_field(this, 0) {
-            Value::Object(Some(parent)) => Some(gc_stable_lock_key(ctx, parent)),
-            _ => None,
+            Value::Object(Some(parent)) => Ok(Some(gc_stable_lock_key(ctx, parent)?)),
+            _ => Ok(None),
         }
     }
 
@@ -5758,7 +5889,7 @@ pub fn register_synthetic_rwlock_natives(registry: &mut NativeMethodRegistry) {
             Some(Value::Object(Some(o))) => *o,
             _ => return Ok(None),
         };
-        if let Some(addr) = rwl_parent_addr(ctx, this) {
+        if let Ok(Some(addr)) = rwl_parent_addr(ctx, this) {
             // GC-blocking audit (STW takeover 5-class cluster, 2026-07-13):
             // rw_read_lock's internal contended wait is a raw
             // parking_lot::Condvar::wait with NO GC-blocking-region bracket
@@ -5778,7 +5909,7 @@ pub fn register_synthetic_rwlock_natives(registry: &mut NativeMethodRegistry) {
             Some(Value::Object(Some(o))) => *o,
             _ => return Ok(None),
         };
-        if let Some(addr) = rwl_parent_addr(ctx, this) {
+        if let Ok(Some(addr)) = rwl_parent_addr(ctx, this) {
             crate::stamped_lock::rw_read_unlock(addr, ctx.thread_id());
         }
         Ok(None)
@@ -5788,7 +5919,7 @@ pub fn register_synthetic_rwlock_natives(registry: &mut NativeMethodRegistry) {
             Some(Value::Object(Some(o))) => *o,
             _ => return Ok(Some(Value::Int(0))),
         };
-        let ok = match rwl_parent_addr(ctx, this) {
+        let ok = match rwl_parent_addr(ctx, this)? {
             Some(a) => crate::stamped_lock::rw_try_read_lock(a, ctx.thread_id()),
             None => false,
         };
@@ -5806,7 +5937,7 @@ pub fn register_synthetic_rwlock_natives(registry: &mut NativeMethodRegistry) {
                 Some(Value::Object(Some(o))) => *o,
                 _ => return Ok(Some(Value::Int(0))),
             };
-            let ok = match rwl_parent_addr(ctx, this) {
+            let ok = match rwl_parent_addr(ctx, this)? {
                 Some(a) => crate::stamped_lock::rw_try_read_lock(a, ctx.thread_id()),
                 None => false,
             };
@@ -5818,7 +5949,7 @@ pub fn register_synthetic_rwlock_natives(registry: &mut NativeMethodRegistry) {
             Some(Value::Object(Some(o))) => *o,
             _ => return Ok(None),
         };
-        if let Some(addr) = rwl_parent_addr(ctx, this) {
+        if let Ok(Some(addr)) = rwl_parent_addr(ctx, this) {
             // GC-blocking audit — see the plain `lock()` registration above.
             ctx.begin_blocking_region();
             crate::stamped_lock::rw_read_lock(addr, ctx.thread_id());
@@ -5834,7 +5965,7 @@ pub fn register_synthetic_rwlock_natives(registry: &mut NativeMethodRegistry) {
             Some(Value::Object(Some(o))) => *o,
             _ => return Ok(None),
         };
-        if let Some(addr) = rwl_parent_addr(ctx, this) {
+        if let Ok(Some(addr)) = rwl_parent_addr(ctx, this) {
             // GC-blocking audit (STW takeover 5-class cluster, 2026-07-13):
             // rw_write_lock's internal contended wait is a raw
             // parking_lot::Condvar::wait with NO GC-blocking-region bracket
@@ -5856,7 +5987,7 @@ pub fn register_synthetic_rwlock_natives(registry: &mut NativeMethodRegistry) {
             Some(Value::Object(Some(o))) => *o,
             _ => return Ok(None),
         };
-        if let Some(addr) = rwl_parent_addr(ctx, this) {
+        if let Ok(Some(addr)) = rwl_parent_addr(ctx, this) {
             crate::stamped_lock::rw_write_unlock(addr, ctx.thread_id());
         }
         Ok(None)
@@ -5866,7 +5997,7 @@ pub fn register_synthetic_rwlock_natives(registry: &mut NativeMethodRegistry) {
             Some(Value::Object(Some(o))) => *o,
             _ => return Ok(Some(Value::Int(0))),
         };
-        let ok = match rwl_parent_addr(ctx, this) {
+        let ok = match rwl_parent_addr(ctx, this)? {
             Some(a) => crate::stamped_lock::rw_try_write_lock(a, ctx.thread_id()),
             None => false,
         };
@@ -5881,7 +6012,7 @@ pub fn register_synthetic_rwlock_natives(registry: &mut NativeMethodRegistry) {
                 Some(Value::Object(Some(o))) => *o,
                 _ => return Ok(Some(Value::Int(0))),
             };
-            let ok = match rwl_parent_addr(ctx, this) {
+            let ok = match rwl_parent_addr(ctx, this)? {
                 Some(a) => crate::stamped_lock::rw_try_write_lock(a, ctx.thread_id()),
                 None => false,
             };
@@ -5893,7 +6024,7 @@ pub fn register_synthetic_rwlock_natives(registry: &mut NativeMethodRegistry) {
             Some(Value::Object(Some(o))) => *o,
             _ => return Ok(None),
         };
-        if let Some(addr) = rwl_parent_addr(ctx, this) {
+        if let Ok(Some(addr)) = rwl_parent_addr(ctx, this) {
             // GC-blocking audit — see the plain `lock()` registration above.
             ctx.begin_blocking_region();
             crate::stamped_lock::rw_write_lock(addr, ctx.thread_id());
@@ -5906,7 +6037,7 @@ pub fn register_synthetic_rwlock_natives(registry: &mut NativeMethodRegistry) {
             Some(Value::Object(Some(o))) => *o,
             _ => return Ok(Some(Value::Int(0))),
         };
-        let held = match rwl_parent_addr(ctx, this) {
+        let held = match rwl_parent_addr(ctx, this)? {
             Some(a) => crate::stamped_lock::rw_write_is_held(a, ctx.thread_id()),
             None => false,
         };
@@ -5938,6 +6069,40 @@ pub fn register_synthetic_rwlock_natives(registry: &mut NativeMethodRegistry) {
 /// `stampedlock-surface-must-be-complete-not-partial` asks for; a *partial*
 /// surface is the failure mode there, and an ambient tag that depends on call
 /// order is exactly how you get one.
+///
+/// CALLED THREE TIMES PER BOOT, AND THAT IS FINE — verified W7-15, 2026-08-07.
+/// The census will show every triple below repeated; the repeats are these:
+///
+///   1. `lib.rs::register_essential_natives_with_shims` calls it directly;
+///   2. the very next line there calls [`register_rwlock_natives`], which
+///      calls it again on BOTH of its arms (real-AQS returns early through it,
+///      synthetic AQS reaches it at the end of `register_synthetic_rwlock_natives`);
+///   3. `vm/src/vm/vm_init.rs` calls it directly, in both mode arms.
+///
+/// A `synthetic-jdk` feature build adds a fourth via
+/// `register_synthetic_overrides` -> [`register_rwlock_natives`].
+///
+/// IDEMPOTENT FOR DISPATCH. Each repeat re-registers the identical triples with
+/// the identical named-`fn` callbacks; this function states its own category, so
+/// unlike the pre-2026-08-06 behaviour described above there is no ambient-kind
+/// disagreement between callers, and `current_leaf` is `false` at all of them.
+/// `NativeMethodRegistry::register` updates the EXISTING slot in place for a key
+/// it has already seen — same callback, same `SyntheticStub` kind, same leaf
+/// claim — and does not append a slot or a `slot_invocations` counter, so
+/// already-issued `NativeMethodId`s stay valid and nothing observable changes.
+///
+/// NOT idempotent for the two per-registration LOGS, which is where the repeats
+/// become visible and why they must not be read as a defect:
+///
+///   * `registrations` / `categories` / `kind_stated` / `category_chosen_log` /
+///     `provenance` each gain a row per repeat, with
+///     `provenance.overwrote == Some(SyntheticStub)` — i.e. this surface shadows
+///     ITSELF. Those are the ~62 self-shadowed `StampedLock` rows in the
+///     duplicate-registration census, not 62 lost registrations.
+///   * under `CompatibilityMode::JdkOnly` the refusal arm returns *before*
+///     inserting, so all 31 triples are pushed onto `refused` once per call.
+///     A `--jdk-only` gate that counts refusal ROWS therefore counts this
+///     surface three times; count distinct triples instead.
 pub fn register_stamped_lock_natives(registry: &mut NativeMethodRegistry) {
     let __prev_cat = registry.current_category();
     registry.set_category(cratonvm_native_api::NativeKind::SyntheticStub);
@@ -6018,6 +6183,14 @@ pub fn register_stamped_lock_natives(registry: &mut NativeMethodRegistry) {
         "(JLjava/util/concurrent/TimeUnit;)J",
         native_stamped_try_write_lock_timed,
     );
+    // `isLocked()` is a DELIBERATE completion of the synthetic surface: JDK 25's
+    // `StampedLock` declares `isReadLocked`/`isWriteLocked` and no `isLocked`,
+    // so the dead-everywhere sweep scores this row "method nowhere on any
+    // image" and listed it for deletion. It must NOT be deleted —
+    // `native-builtins/tests/registry_contracts.rs` pins it, and under
+    // `--synthetic-jdk` it is the only implementation there is. A row a contract
+    // test pins is gated by that fact alone, which is what the sweep's new
+    // `--pinned` input carries.
     registry.register(sl, "isLocked", "()Z", native_stamped_is_locked);
     registry.register(sl, "isWriteLocked", "()Z", native_stamped_is_write_locked);
     registry.register(sl, "isReadLocked", "()Z", native_stamped_is_read_locked);
@@ -6050,10 +6223,10 @@ pub fn register_stamped_lock_natives(registry: &mut NativeMethodRegistry) {
 // Pattern-A fix (bug nb-lib-gckeys §1): key the StampedLock state table by a
 // GC-stable identity (see `gc_stable_lock_key`) instead of the raw, moving
 // heap address that the lock/unlock pair could disagree on across a GC.
-fn stamped_addr(ctx: &mut dyn NativeContext, args: &[Value]) -> Option<usize> {
+fn stamped_addr(ctx: &mut dyn NativeContext, args: &[Value]) -> Result<Option<usize>, MethodCallFailed> {
     match args.first() {
-        Some(Value::Object(Some(o))) => Some(gc_stable_lock_key(ctx, *o)),
-        _ => None,
+        Some(Value::Object(Some(o))) => Ok(Some(gc_stable_lock_key(ctx, *o)?)),
+        _ => Ok(None),
     }
 }
 
@@ -6064,8 +6237,8 @@ fn stamped_obj(args: &[Value]) -> Option<ObjectRef> {
     }
 }
 
-fn stamped_addr_for_obj(ctx: &mut dyn NativeContext, obj: ObjectRef) -> usize {
-    gc_stable_lock_key(ctx, obj)
+fn stamped_addr_for_obj(ctx: &mut dyn NativeContext, obj: ObjectRef) -> Result<usize, MethodCallFailed> {
+    Ok(gc_stable_lock_key(ctx, obj)?)
 }
 
 fn stamped_view_parent(ctx: &mut dyn NativeContext, args: &[Value]) -> Option<ObjectRef> {
@@ -6078,7 +6251,7 @@ fn stamped_view_parent(ctx: &mut dyn NativeContext, args: &[Value]) -> Option<Ob
 
 fn native_stamped_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     if let Some(obj) = stamped_obj(args) {
-        let addr = stamped_addr_for_obj(ctx, obj);
+        let addr = stamped_addr_for_obj(ctx, obj)?;
         crate::stamped_lock::stamped_init(addr);
         mirror_stamped_state(ctx, obj, addr);
     }
@@ -6090,7 +6263,7 @@ fn native_stamped_write_lock(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
         Some(o) => o,
         None => return Ok(Some(Value::Long(0))),
     };
-    let addr = stamped_addr_for_obj(ctx, obj);
+    let addr = stamped_addr_for_obj(ctx, obj)?;
     // GC-blocking audit (STW takeover 5-class cluster, 2026-07-13):
     // stamped_write_lock's contended wait is a raw parking_lot::Condvar::wait
     // with NO GC-blocking-region bracket — same missing-bracket bug as
@@ -6111,7 +6284,7 @@ fn native_stamped_read_lock(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
         Some(o) => o,
         None => return Ok(Some(Value::Long(0))),
     };
-    let addr = stamped_addr_for_obj(ctx, obj);
+    let addr = stamped_addr_for_obj(ctx, obj)?;
     // GC-blocking audit — see `native_stamped_write_lock` above.
     ctx.begin_blocking_region();
     let stamp = crate::stamped_lock::stamped_read_lock(addr);
@@ -6125,7 +6298,7 @@ fn native_stamped_try_read_lock(ctx: &mut dyn NativeContext, args: &[Value]) -> 
         Some(o) => o,
         None => return Ok(Some(Value::Long(0))),
     };
-    let addr = stamped_addr_for_obj(ctx, obj);
+    let addr = stamped_addr_for_obj(ctx, obj)?;
     let stamp = crate::stamped_lock::stamped_try_read_lock(addr);
     mirror_stamped_state(ctx, obj, addr);
     Ok(Some(Value::Long(stamp)))
@@ -6136,7 +6309,7 @@ fn native_stamped_try_write_lock(ctx: &mut dyn NativeContext, args: &[Value]) ->
         Some(o) => o,
         None => return Ok(Some(Value::Long(0))),
     };
-    let addr = stamped_addr_for_obj(ctx, obj);
+    let addr = stamped_addr_for_obj(ctx, obj)?;
     let stamp = crate::stamped_lock::stamped_try_write_lock(addr);
     mirror_stamped_state(ctx, obj, addr);
     Ok(Some(Value::Long(stamp)))
@@ -6146,7 +6319,7 @@ fn native_stamped_write_view_lock(ctx: &mut dyn NativeContext, args: &[Value]) -
     let Some(parent) = stamped_view_parent(ctx, args) else {
         return Ok(None);
     };
-    let addr = stamped_addr_for_obj(ctx, parent);
+    let addr = stamped_addr_for_obj(ctx, parent)?;
     // GC-blocking audit — see `native_stamped_write_lock` above.
     ctx.begin_blocking_region();
     crate::stamped_lock::stamped_write_lock(addr);
@@ -6162,7 +6335,7 @@ fn native_stamped_write_view_try_lock(
     let Some(parent) = stamped_view_parent(ctx, args) else {
         return Ok(Some(Value::Int(0)));
     };
-    let addr = stamped_addr_for_obj(ctx, parent);
+    let addr = stamped_addr_for_obj(ctx, parent)?;
     let stamp = crate::stamped_lock::stamped_try_write_lock(addr);
     mirror_stamped_state(ctx, parent, addr);
     Ok(Some(Value::Int(i32::from(stamp != 0))))
@@ -6175,7 +6348,7 @@ fn native_stamped_write_view_unlock(
     let Some(parent) = stamped_view_parent(ctx, args) else {
         return Ok(None);
     };
-    let addr = stamped_addr_for_obj(ctx, parent);
+    let addr = stamped_addr_for_obj(ctx, parent)?;
     if !crate::stamped_lock::stamped_try_unstamped_unlock_write(addr) {
         return Err(RuntimeError::IllegalMonitorStateException {
             message: "StampedLock write lock not held".to_string(),
@@ -6190,7 +6363,7 @@ fn native_stamped_read_view_lock(ctx: &mut dyn NativeContext, args: &[Value]) ->
     let Some(parent) = stamped_view_parent(ctx, args) else {
         return Ok(None);
     };
-    let addr = stamped_addr_for_obj(ctx, parent);
+    let addr = stamped_addr_for_obj(ctx, parent)?;
     // GC-blocking audit — see `native_stamped_write_lock` above.
     ctx.begin_blocking_region();
     crate::stamped_lock::stamped_read_lock(addr);
@@ -6206,7 +6379,7 @@ fn native_stamped_read_view_try_lock(
     let Some(parent) = stamped_view_parent(ctx, args) else {
         return Ok(Some(Value::Int(0)));
     };
-    let addr = stamped_addr_for_obj(ctx, parent);
+    let addr = stamped_addr_for_obj(ctx, parent)?;
     let stamp = crate::stamped_lock::stamped_try_read_lock(addr);
     mirror_stamped_state(ctx, parent, addr);
     Ok(Some(Value::Int(i32::from(stamp != 0))))
@@ -6219,7 +6392,7 @@ fn native_stamped_read_view_unlock(
     let Some(parent) = stamped_view_parent(ctx, args) else {
         return Ok(None);
     };
-    let addr = stamped_addr_for_obj(ctx, parent);
+    let addr = stamped_addr_for_obj(ctx, parent)?;
     if !crate::stamped_lock::stamped_try_unstamped_unlock_read(addr) {
         return Err(RuntimeError::IllegalMonitorStateException {
             message: "StampedLock read lock not held".to_string(),
@@ -6231,7 +6404,7 @@ fn native_stamped_read_view_unlock(
 }
 
 fn native_stamped_optimistic(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let addr = match stamped_addr(ctx, args) {
+    let addr = match stamped_addr(ctx, args)? {
         Some(a) => a,
         None => return Ok(Some(Value::Long(STAMPED_ORIGIN))),
     };
@@ -6245,7 +6418,7 @@ fn native_stamped_validate(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         Some(Value::Long(v)) => *v,
         _ => return Ok(Some(Value::Int(0))),
     };
-    let addr = match stamped_addr(ctx, args) {
+    let addr = match stamped_addr(ctx, args)? {
         Some(a) => a,
         None => return Ok(Some(Value::Int(0))),
     };
@@ -6253,20 +6426,59 @@ fn native_stamped_validate(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
     Ok(Some(Value::Int(i32::from(valid))))
 }
 
+/// The stamp argument of a `(J)V` / `(J)Z` StampedLock native, or `None`
+/// when the frame did not carry one.
+fn stamped_arg(args: &[Value]) -> Option<i64> {
+    match args.get(1) {
+        Some(Value::Long(v)) => Some(*v),
+        _ => None,
+    }
+}
+
+/// `unlockRead(long stamp)`.
+///
+/// The stamp is CHECKED, not ignored: the JDK throws
+/// `IllegalMonitorStateException` when the stamp is not a read stamp, when
+/// its version has moved on, or when no read hold is outstanding. Verified
+/// against HotSpot 25.0.3 (`SLBits.java` rows `J.unlockReadBogus = IMSE`).
 fn native_stamped_unlock_read(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    if let Some(obj) = stamped_obj(args) {
-        let addr = stamped_addr_for_obj(ctx, obj);
-        crate::stamped_lock::stamped_unlock_read(addr);
-        mirror_stamped_state(ctx, obj, addr);
+    let Some(obj) = stamped_obj(args) else {
+        return Ok(None);
+    };
+    let stamp = stamped_arg(args).unwrap_or(0);
+    let addr = stamped_addr_for_obj(ctx, obj)?;
+    let released = crate::stamped_lock::stamped_unlock_read(addr, stamp);
+    mirror_stamped_state(ctx, obj, addr);
+    if !released {
+        return Err(RuntimeError::IllegalMonitorStateException {
+            message: format!("unlockRead: stamp {stamp} does not hold this lock"),
+        }
+        .into());
     }
     Ok(None)
 }
 
+/// `unlockWrite(long stamp)`.
+///
+/// The JDK guard is `if (state != stamp || (stamp & WBIT) == 0L) throw` — an
+/// EXACT state-word match, so a stale stamp cannot release a later writer's
+/// hold. This used to ignore the stamp and release whatever was held, which
+/// silently broke mutual exclusion whenever a caller passed the wrong stamp
+/// (which the `isWriteLockStamp` encoding bug made routine). Verified
+/// against HotSpot (`J.doubleUnlockWrite = IMSE`).
 fn native_stamped_unlock_write(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    if let Some(obj) = stamped_obj(args) {
-        let addr = stamped_addr_for_obj(ctx, obj);
-        crate::stamped_lock::stamped_unlock_write(addr);
-        mirror_stamped_state(ctx, obj, addr);
+    let Some(obj) = stamped_obj(args) else {
+        return Ok(None);
+    };
+    let stamp = stamped_arg(args).unwrap_or(0);
+    let addr = stamped_addr_for_obj(ctx, obj)?;
+    let released = crate::stamped_lock::stamped_unlock_write(addr, stamp);
+    mirror_stamped_state(ctx, obj, addr);
+    if !released {
+        return Err(RuntimeError::IllegalMonitorStateException {
+            message: format!("unlockWrite: stamp {stamp} does not hold this lock"),
+        }
+        .into());
     }
     Ok(None)
 }
@@ -6284,40 +6496,43 @@ fn native_stamped_unlock_write(ctx: &mut dyn NativeContext, args: &[Value]) -> M
 /// dead code, never called from anywhere in the tree. The live shadower was
 /// `native-collections`, which wins by running after `register_builtins`.
 ///
-/// Spec: release whichever mode the stamp represents, and throw
-/// `IllegalMonitorStateException` if the stamp does not match the lock's
-/// current state. Our backend encodes a write hold as the low bit of the
-/// stamp (`STAMPED_ORIGIN` is even), so an odd stamp is a write stamp and
-/// an even non-zero stamp is a read stamp — mirroring the JDK's own
-/// `WBIT` test without depending on the JDK's exact bit layout.
+/// Spec, transcribed from JDK 25 `StampedLock.unlock`:
+///
+/// ```java
+/// public void unlock(long stamp) {
+///     if ((stamp & WBIT) != 0L) unlockWrite(stamp);
+///     else                      unlockRead(stamp);
+/// }
+/// ```
+///
+/// so it is a pure re-dispatch, and the `IllegalMonitorStateException` comes
+/// from the callee. Note this arm tests `(stamp & WBIT) != 0`, NOT
+/// `isWriteLockStamp`'s `(stamp & ABITS) == WBIT`.
+///
+/// Until 2026-08-07 this read the write flag as `stamp & 1` and the read
+/// flag as `stamp & 2` — a private encoding this backend no longer uses; see
+/// the constant block in `stamped_lock` for why the JDK's own layout is now
+/// mandatory. It also released the hold WITHOUT checking the stamp's
+/// version, so a stale stamp released a live hold belonging to someone else.
 fn native_stamped_unlock_by_stamp(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let Some(obj) = stamped_obj(args) else {
         return Ok(None);
     };
-    let stamp = match args.get(1) {
-        Some(Value::Long(v)) => *v,
+    let Some(stamp) = stamped_arg(args) else {
         // The verifier guarantees a long here; anything else means the call
         // did not come through `unlock(J)V`, so refuse rather than guess.
-        _ => {
-            return Err(RuntimeError::IllegalMonitorStateException {
-                message: "unlock: missing stamp argument".to_string(),
-            }
-            .into())
+        return Err(RuntimeError::IllegalMonitorStateException {
+            message: "unlock: missing stamp argument".to_string(),
         }
+        .into());
     };
-    let addr = stamped_addr_for_obj(ctx, obj);
-    let released = if stamp == 0 {
-        // Stamp 0 is the JDK's "acquisition failed" sentinel and can never
-        // name a held lock.
-        false
-    } else if stamp & 1 != 0 {
-        crate::stamped_lock::stamped_try_unstamped_unlock_write(addr)
-    } else if stamp & 2 != 0 {
-        crate::stamped_lock::stamped_try_unstamped_unlock_read(addr)
+    let addr = stamped_addr_for_obj(ctx, obj)?;
+    let released = if stamp & crate::stamped_lock::JDK_WBIT != 0 {
+        crate::stamped_lock::stamped_unlock_write(addr, stamp)
     } else {
-        // Neither mode bit set: an OPTIMISTIC observation stamp, which holds
-        // nothing. The JDK throws IllegalMonitorStateException for it too.
-        false
+        // Everything else -- read stamps, optimistic stamps and the zero
+        // sentinel -- goes to unlockRead, which rejects the last two.
+        crate::stamped_lock::stamped_unlock_read(addr, stamp)
     };
     if !released {
         return Err(RuntimeError::IllegalMonitorStateException {
@@ -6334,7 +6549,7 @@ fn native_stamped_unstamped_unlock_read(
     args: &[Value],
 ) -> MethodCallResult {
     if let Some(obj) = stamped_obj(args) {
-        let addr = stamped_addr_for_obj(ctx, obj);
+        let addr = stamped_addr_for_obj(ctx, obj)?;
         if !crate::stamped_lock::stamped_try_unstamped_unlock_read(addr) {
             return Err(RuntimeError::IllegalMonitorStateException {
                 message: "StampedLock read lock not held".to_string(),
@@ -6351,7 +6566,7 @@ fn native_stamped_unstamped_unlock_write(
     args: &[Value],
 ) -> MethodCallResult {
     if let Some(obj) = stamped_obj(args) {
-        let addr = stamped_addr_for_obj(ctx, obj);
+        let addr = stamped_addr_for_obj(ctx, obj)?;
         if !crate::stamped_lock::stamped_try_unstamped_unlock_write(addr) {
             return Err(RuntimeError::IllegalMonitorStateException {
                 message: "StampedLock write lock not held".to_string(),
@@ -6367,7 +6582,7 @@ fn native_stamped_try_unlock_read(ctx: &mut dyn NativeContext, args: &[Value]) -
     let Some(obj) = stamped_obj(args) else {
         return Ok(Some(Value::Int(0)));
     };
-    let addr = stamped_addr_for_obj(ctx, obj);
+    let addr = stamped_addr_for_obj(ctx, obj)?;
     let unlocked = crate::stamped_lock::stamped_try_unstamped_unlock_read(addr);
     mirror_stamped_state(ctx, obj, addr);
     Ok(Some(Value::Int(i32::from(unlocked))))
@@ -6380,7 +6595,7 @@ fn native_stamped_try_unlock_write(
     let Some(obj) = stamped_obj(args) else {
         return Ok(Some(Value::Int(0)));
     };
-    let addr = stamped_addr_for_obj(ctx, obj);
+    let addr = stamped_addr_for_obj(ctx, obj)?;
     let unlocked = crate::stamped_lock::stamped_try_unstamped_unlock_write(addr);
     mirror_stamped_state(ctx, obj, addr);
     Ok(Some(Value::Int(i32::from(unlocked))))
@@ -6398,7 +6613,7 @@ fn native_stamped_try_convert_to_write(
         Some(o) => o,
         None => return Ok(Some(Value::Long(0))),
     };
-    let addr = stamped_addr_for_obj(ctx, obj);
+    let addr = stamped_addr_for_obj(ctx, obj)?;
     let converted = crate::stamped_lock::stamped_try_convert_to_write(addr, stamp);
     mirror_stamped_state(ctx, obj, addr);
     Ok(Some(Value::Long(converted)))
@@ -6416,7 +6631,7 @@ fn native_stamped_try_convert_to_read(
         Some(o) => o,
         None => return Ok(Some(Value::Long(0))),
     };
-    let addr = stamped_addr_for_obj(ctx, obj);
+    let addr = stamped_addr_for_obj(ctx, obj)?;
     let converted = crate::stamped_lock::stamped_try_convert_to_read(addr, stamp);
     mirror_stamped_state(ctx, obj, addr);
     Ok(Some(Value::Long(converted)))
@@ -6436,7 +6651,7 @@ fn native_stamped_try_convert_to_optimistic(
         Some(o) => o,
         None => return Ok(Some(Value::Long(0))),
     };
-    let addr = stamped_addr_for_obj(ctx, obj);
+    let addr = stamped_addr_for_obj(ctx, obj)?;
     let converted = crate::stamped_lock::stamped_try_convert_to_optimistic(addr, stamp);
     mirror_stamped_state(ctx, obj, addr);
     if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_STAMPED").is_some() {
@@ -6492,7 +6707,7 @@ fn native_stamped_try_read_lock_timed(
         None => return Ok(Some(Value::Long(0))),
     };
     let nanos = stamped_timeout_nanos(ctx, args);
-    let addr = stamped_addr_for_obj(ctx, obj);
+    let addr = stamped_addr_for_obj(ctx, obj)?;
     ctx.begin_blocking_region();
     let stamp = crate::stamped_lock::stamped_try_read_lock_timed(addr, nanos);
     ctx.end_blocking_region();
@@ -6509,7 +6724,7 @@ fn native_stamped_try_write_lock_timed(
         None => return Ok(Some(Value::Long(0))),
     };
     let nanos = stamped_timeout_nanos(ctx, args);
-    let addr = stamped_addr_for_obj(ctx, obj);
+    let addr = stamped_addr_for_obj(ctx, obj)?;
     ctx.begin_blocking_region();
     let stamp = crate::stamped_lock::stamped_try_write_lock_timed(addr, nanos);
     ctx.end_blocking_region();
@@ -6518,7 +6733,7 @@ fn native_stamped_try_write_lock_timed(
 }
 
 fn native_stamped_is_locked(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let addr = match stamped_addr(ctx, args) {
+    let addr = match stamped_addr(ctx, args)? {
         Some(a) => a,
         None => return Ok(Some(Value::Int(0))),
     };
@@ -6528,7 +6743,7 @@ fn native_stamped_is_locked(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
 }
 
 fn native_stamped_is_write_locked(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let addr = match stamped_addr(ctx, args) {
+    let addr = match stamped_addr(ctx, args)? {
         Some(a) => a,
         None => return Ok(Some(Value::Int(0))),
     };
@@ -6540,7 +6755,7 @@ fn native_stamped_is_write_locked(ctx: &mut dyn NativeContext, args: &[Value]) -
 }
 
 fn native_stamped_is_read_locked(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let addr = match stamped_addr(ctx, args) {
+    let addr = match stamped_addr(ctx, args)? {
         Some(a) => a,
         None => return Ok(Some(Value::Int(0))),
     };
@@ -6553,7 +6768,7 @@ fn native_stamped_get_read_lock_count(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
-    let addr = match stamped_addr(ctx, args) {
+    let addr = match stamped_addr(ctx, args)? {
         Some(a) => a,
         None => return Ok(Some(Value::Int(0))),
     };
@@ -7939,7 +8154,7 @@ fn native_asr_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
     // Store a real Pair object in the single `pair` field (slot 0). No write to
     // slot 1 — the ASR object itself has only one slot.
     let pair = asr_alloc_pair(ctx, r, stamp);
-    ctx.set_field(this, 0, Value::Object(Some(pair)));
+    ctx.set_field(this, 0, Value::Object(Some(pair?)));
     Ok(None)
 }
 
@@ -7988,7 +8203,7 @@ fn native_asr_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
     // JDK `set` allocates a fresh Pair only when reference or stamp differ; we
     // always install a fresh Pair (semantically identical, slightly simpler).
     let pair = asr_alloc_pair(ctx, r, stamp);
-    ctx.set_field(this, 0, Value::Object(Some(pair)));
+    ctx.set_field(this, 0, Value::Object(Some(pair?)));
     Ok(None)
 }
 
@@ -8006,7 +8221,7 @@ fn native_asr_attempt_stamp(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     if values_ref_equal(current_ref, expected_ref) {
         // Swap in a new Pair carrying the (unchanged) reference + new stamp.
         let pair = asr_alloc_pair(ctx, current_ref, new_stamp);
-        ctx.set_field(this, 0, Value::Object(Some(pair)));
+        ctx.set_field(this, 0, Value::Object(Some(pair?)));
         Ok(Some(Value::Int(1)))
     } else {
         Ok(Some(Value::Int(0)))
@@ -8034,7 +8249,7 @@ fn native_asr_cas(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
         // JDK fast-path: when both are identical it skips the casPair entirely).
         if !values_ref_equal(current_ref, new_ref) || current_stamp != new_stamp {
             let pair = asr_alloc_pair(ctx, new_ref, new_stamp);
-            ctx.set_field(this, 0, Value::Object(Some(pair)));
+            ctx.set_field(this, 0, Value::Object(Some(pair?)));
         }
         Ok(Some(Value::Int(1)))
     } else {
@@ -8086,239 +8301,58 @@ pub(crate) fn register_atomic_markable_ref_natives(r: &mut NativeMethodRegistry)
     r.set_category(__prev_cat);
 }
 
-pub(crate) fn register_pd_structured_concurrency(r: &mut NativeMethodRegistry) {
-    let scope = "java/util/concurrent/StructuredTaskScope";
-
-    r.register(scope, "<init>", "()V", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        pd_init_scope(ctx, this);
-        Ok(None)
-    });
-    r.register(
-        scope,
-        "<init>",
-        "(Ljava/lang/String;Ljava/util/concurrent/ThreadFactory;)V",
-        |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            pd_init_scope(ctx, this);
-            Ok(None)
-        },
-    );
-
-    r.register(
-        scope,
-        "fork",
-        "(Ljava/util/concurrent/Callable;)Ljava/util/concurrent/StructuredTaskScope$Subtask;",
-        |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            let callable = args.get(1).copied().unwrap_or(Value::Object(None));
-            pd_fork_callable(ctx, this, callable)
-        },
-    );
-
-    r.register(
-        scope,
-        "join",
-        "()Ljava/util/concurrent/StructuredTaskScope;",
-        |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            // Do not downgrade an already shut-down / closed scope (state 2):
-            // `shutdown(); join();` must leave isShutdown() == true.
-            if !matches!(ctx.get_field(this, 1), Value::Int(2)) {
-                ctx.set_field(this, 1, Value::Int(1));
-            }
-            Ok(Some(Value::Object(Some(this))))
-        },
-    );
-    r.register(
-        scope,
-        "joinUntil",
-        "(Ljava/time/Instant;)Ljava/util/concurrent/StructuredTaskScope;",
-        |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            if !matches!(ctx.get_field(this, 1), Value::Int(2)) {
-                ctx.set_field(this, 1, Value::Int(1));
-            }
-            Ok(Some(Value::Object(Some(this))))
-        },
-    );
-    r.register(scope, "close", "()V", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        ctx.set_field(this, 1, Value::Int(2));
-        Ok(None)
-    });
-    // shutdown() must be observable by isShutdown() below (which tests
-    // field 1 == 2). The former no-op meant `scope.shutdown();
-    // scope.isShutdown()` answered false, so ShutdownOn*-style loops that
-    // poll for the shutdown flag never saw it and kept forking subtasks.
-    r.register(scope, "shutdown", "()V", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        ctx.set_field(this, 1, Value::Int(2));
-        Ok(None)
-    });
-    r.register(scope, "isShutdown", "()Z", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        Ok(Some(Value::Int(
-            if matches!(ctx.get_field(this, 1), Value::Int(2)) {
-                1
-            } else {
-                0
-            },
-        )))
-    });
-
-    let subtask = "java/util/concurrent/StructuredTaskScope$Subtask";
-    r.register(subtask, "get", "()Ljava/lang/Object;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        match ctx.get_field(this, 3) {
-            Value::Int(1) => Ok(Some(ctx.get_field(this, 1))),
-            Value::Int(2) => Err(RuntimeError::IllegalStateException {
-                message: "Subtask failed".into(),
-            }
-            .into()),
-            _ => Err(RuntimeError::IllegalStateException {
-                message: "Subtask result is unavailable".into(),
-            }
-            .into()),
-        }
-    });
-    r.register(
-        subtask,
-        "state",
-        "()Ljava/util/concurrent/StructuredTaskScope$Subtask$State;",
-        |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            Ok(Some(ctx.get_field(this, 3)))
-        },
-    );
-    r.register(
-        subtask,
-        "exception",
-        "()Ljava/lang/Throwable;",
-        |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            Ok(Some(ctx.get_field(this, 2)))
-        },
-    );
-
-    // --- ShutdownOnFailure ---
-    let sof = "java/util/concurrent/StructuredTaskScope$ShutdownOnFailure";
-    r.register(sof, "<init>", "()V", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        pd_init_scope(ctx, this);
-        Ok(None)
-    });
-    r.register(
-        sof,
-        "fork",
-        "(Ljava/util/concurrent/Callable;)Ljava/util/concurrent/StructuredTaskScope$Subtask;",
-        |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            let c = args.get(1).copied().unwrap_or(Value::Object(None));
-            pd_fork_callable(ctx, this, c)
-        },
-    );
-    r.register(
-        sof,
-        "join",
-        "()Ljava/util/concurrent/StructuredTaskScope$ShutdownOnFailure;",
-        |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            ctx.set_field(this, 1, Value::Int(1));
-            Ok(Some(Value::Object(Some(this))))
-        },
-    );
-    r.register(sof, "close", "()V", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        ctx.set_field(this, 1, Value::Int(2));
-        Ok(None)
-    });
-    r.register(sof, "throwIfFailed", "()V", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        if pd_has_failure(ctx, this) {
-            return Err(RuntimeError::IllegalStateException {
-                message: "Subtask failed".into(),
-            }
-            .into());
-        }
-        Ok(None)
-    });
-    r.register(
-        sof,
-        "throwIfFailed",
-        "(Ljava/util/function/Function;)V",
-        |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            if pd_has_failure(ctx, this) {
-                return Err(RuntimeError::IllegalStateException {
-                    message: "Subtask failed".into(),
-                }
-                .into());
-            }
-            Ok(None)
-        },
-    );
-
-    // --- ShutdownOnSuccess ---
-    let sos = "java/util/concurrent/StructuredTaskScope$ShutdownOnSuccess";
-    r.register(sos, "<init>", "()V", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        pd_init_scope(ctx, this);
-        Ok(None)
-    });
-    r.register(
-        sos,
-        "fork",
-        "(Ljava/util/concurrent/Callable;)Ljava/util/concurrent/StructuredTaskScope$Subtask;",
-        |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            let c = args.get(1).copied().unwrap_or(Value::Object(None));
-            pd_fork_callable(ctx, this, c)
-        },
-    );
-    r.register(
-        sos,
-        "join",
-        "()Ljava/util/concurrent/StructuredTaskScope$ShutdownOnSuccess;",
-        |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            ctx.set_field(this, 1, Value::Int(1));
-            Ok(Some(Value::Object(Some(this))))
-        },
-    );
-    r.register(sos, "close", "()V", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        ctx.set_field(this, 1, Value::Int(2));
-        Ok(None)
-    });
-    r.register(sos, "result", "()Ljava/lang/Object;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        pd_first_success(ctx, this)
-            .map(|v| Ok(Some(v)))
-            .unwrap_or_else(|| {
-                Err(RuntimeError::IllegalStateException {
-                    message: "No successful subtask".into(),
-                }
-                .into())
-            })
-    });
-    r.register(
-        sos,
-        "result",
-        "(Ljava/util/function/Function;)Ljava/lang/Object;",
-        |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            pd_first_success(ctx, this)
-                .map(|v| Ok(Some(v)))
-                .unwrap_or_else(|| {
-                    Err(RuntimeError::IllegalStateException {
-                        message: "No successful subtask".into(),
-                    }
-                    .into())
-                })
-        },
-    );
-}
+/// RETIRED 2026-08-12 (W7-18 patch B). Registers nothing, on purpose, and the
+/// function is kept only because its call site is in another lane's file
+/// (`lib.rs`'s `register_phase_d_natives`).
+///
+/// This was the *third* registrar of `java/util/concurrent/StructuredTaskScope`,
+/// and every triple it held was either dead or a landmine:
+///
+/// * **Provably inert.** All three registrars sit inside
+///   `register_synthetic_overrides`, and the call order there is
+///   `register_phase67_natives` (`phases_late/concurrent.rs`), then
+///   `register_phase_d_natives` (this one), then
+///   `register_jdk25_concurrency_natives`. `register()` is
+///   last-registration-wins (docs/architecture/natives-over-real-jdk-classes.md
+///   §3), and `jdk25_concurrency.rs` registers a superset of this function's
+///   `StructuredTaskScope` and `$Subtask` triples — so every one of them was
+///   overwritten before boot finished. The only registrations here that ever
+///   *won* were the two covariant-return `join()`s,
+///   `$ShutdownOnFailure.join()L…$ShutdownOnFailure;` and
+///   `$ShutdownOnSuccess.join()L…$ShutdownOnSuccess;`, which `jdk25_concurrency`
+///   spelled with the base `L…StructuredTaskScope;` return and therefore did not
+///   collide with. Both are on classes **JEP 505 deleted**: `javap` and
+///   `Class.forName` answer "not found" on Adoptium 25.0.3.9, `--real-jdk` and
+///   `--jdk-only` alike (docs/known-issues/jdk-only/W7-18-structured-task-scope-jep505.md §3).
+///
+/// * **A landmine, which is why it is retired rather than left alone.** These
+///   bodies used a DIFFERENT `$Subtask` slot convention from the registrar that
+///   owns the readers. Here, `state` was read and written at **slot 3** (`1` =
+///   success, `2` = failed) and the result at slot 1. In
+///   `jdk25_concurrency.rs`, which wins `Subtask.get/state/exception`, the
+///   layout is `SUBTASK_FIELD_STATE = 0`, `RESULT = 1`, `EXCEPTION = 2`,
+///   **`CALLABLE = 3`** — so this file's `state` write landed on the callable
+///   REFERENCE slot: an `Int` in a slot the collector scans as an oop, which is
+///   heap corruption rather than a wrong answer
+///   (docs/architecture/natives-over-real-jdk-classes.md §5). It never fired
+///   only because every one of those triples was overwritten. The day anyone
+///   deletes a JDK-21-shaped triple from the winning registrar, this becomes
+///   live. `t3_impl.rs::register_t31_structured_concurrency` is already a
+///   tombstone for exactly this defect ("registering them here caused the
+///   canonical 8-field layout to be overridden with the earlier 2-field stubs,
+///   silently breaking `close()`, `result()`, and `throwIfFailed()`"); this is
+///   the copy that pass missed.
+///
+/// Scope of the change: **synthetic-JDK mode only**, and structurally so. All
+/// three registrars are reachable only from `register_synthetic_overrides`,
+/// which is `#[cfg(feature = "synthetic-jdk")]` and called only on the
+/// `use_synthetic_jdk` arm of `vm_init`. In `--real-jdk` and `--jdk-only` real
+/// JDK bytecode serves this API end to end, measured at
+/// `compatibility_classes: 0` / `synthetic_stub_invocations: 0` with zero
+/// StructuredTaskScope violations (W7-18 §5), so nothing here can move either
+/// shipping mode by any amount, and nothing here can move a ratchet taken in
+/// Compatible mode.
+pub(crate) fn register_pd_structured_concurrency(_r: &mut NativeMethodRegistry) {}
 
 // ===========================================================================
 // Concurrency primitive tests & Unsafe.setMemory test
@@ -8389,7 +8423,7 @@ mod concurrency_tests {
         let _guard = stamped_test_lock();
         let mut ctx = make_ctx();
         let lock =
-            alloc_concurrent_synthetic(&mut ctx, "java/util/concurrent/locks/ReentrantLock", 3);
+            try_alloc_concurrent_synthetic(&mut ctx, "java/util/concurrent/locks/ReentrantLock", 3).unwrap();
         native_rl_init(&mut ctx, &[Value::Object(Some(lock))]).unwrap();
 
         // Lock: hold count should become 1
@@ -8408,7 +8442,7 @@ mod concurrency_tests {
         let _guard = stamped_test_lock();
         let mut ctx = make_ctx();
         let lock =
-            alloc_concurrent_synthetic(&mut ctx, "java/util/concurrent/locks/ReentrantLock", 3);
+            try_alloc_concurrent_synthetic(&mut ctx, "java/util/concurrent/locks/ReentrantLock", 3).unwrap();
         native_rl_init(&mut ctx, &[Value::Object(Some(lock))]).unwrap();
 
         let result = native_rl_try_lock(&mut ctx, &[Value::Object(Some(lock))]).unwrap();
@@ -8421,7 +8455,7 @@ mod concurrency_tests {
         let _guard = stamped_test_lock();
         let mut ctx = make_ctx();
         let lock =
-            alloc_concurrent_synthetic(&mut ctx, "java/util/concurrent/locks/ReentrantLock", 3);
+            try_alloc_concurrent_synthetic(&mut ctx, "java/util/concurrent/locks/ReentrantLock", 3).unwrap();
         native_rl_init(&mut ctx, &[Value::Object(Some(lock))]).unwrap();
 
         // Lock twice -- should increment hold count to 2
@@ -8447,7 +8481,7 @@ mod concurrency_tests {
         let _guard = stamped_test_lock();
         let mut ctx = make_ctx();
         let lock =
-            alloc_concurrent_synthetic(&mut ctx, "java/util/concurrent/locks/ReentrantLock", 3);
+            try_alloc_concurrent_synthetic(&mut ctx, "java/util/concurrent/locks/ReentrantLock", 3).unwrap();
         native_rl_init(&mut ctx, &[Value::Object(Some(lock))]).unwrap();
 
         native_rl_lock(&mut ctx, &[Value::Object(Some(lock))]).unwrap();
@@ -8465,7 +8499,7 @@ mod concurrency_tests {
         let _guard = stamped_test_lock();
         let mut ctx = make_ctx();
         let lock =
-            alloc_concurrent_synthetic(&mut ctx, "java/util/concurrent/locks/ReentrantLock", 3);
+            try_alloc_concurrent_synthetic(&mut ctx, "java/util/concurrent/locks/ReentrantLock", 3).unwrap();
         native_rl_init(&mut ctx, &[Value::Object(Some(lock))]).unwrap();
         native_rl_lock(&mut ctx, &[Value::Object(Some(lock))]).unwrap();
 
@@ -8491,7 +8525,7 @@ mod concurrency_tests {
         let _guard = stamped_test_lock();
         let mut ctx = make_ctx();
         let lock =
-            alloc_concurrent_synthetic(&mut ctx, "java/util/concurrent/locks/ReentrantLock", 3);
+            try_alloc_concurrent_synthetic(&mut ctx, "java/util/concurrent/locks/ReentrantLock", 3).unwrap();
         native_rl_init(&mut ctx, &[Value::Object(Some(lock))]).unwrap();
         native_rl_lock(&mut ctx, &[Value::Object(Some(lock))]).unwrap();
 
@@ -8520,7 +8554,7 @@ mod concurrency_tests {
     #[test]
     fn cdl_countdown_to_zero_triggers_notify() {
         let mut ctx = make_ctx();
-        let cdl = alloc_concurrent_synthetic(&mut ctx, "java/util/concurrent/CountDownLatch", 1);
+        let cdl = try_alloc_concurrent_synthetic(&mut ctx, "java/util/concurrent/CountDownLatch", 1).unwrap();
         native_cdl_init(&mut ctx, &[Value::Object(Some(cdl)), Value::Int(2)]).unwrap();
 
         assert_eq!(cdl_count(&mut ctx, cdl), 2);
@@ -8536,7 +8570,7 @@ mod concurrency_tests {
     #[test]
     fn cdl_await_returns_when_count_is_zero() {
         let mut ctx = make_ctx();
-        let cdl = alloc_concurrent_synthetic(&mut ctx, "java/util/concurrent/CountDownLatch", 1);
+        let cdl = try_alloc_concurrent_synthetic(&mut ctx, "java/util/concurrent/CountDownLatch", 1).unwrap();
         // Init with count=0 means await should return immediately
         native_cdl_init(&mut ctx, &[Value::Object(Some(cdl)), Value::Int(0)]).unwrap();
 
@@ -8548,7 +8582,7 @@ mod concurrency_tests {
     #[test]
     fn cdl_countdown_below_zero_stays_at_zero() {
         let mut ctx = make_ctx();
-        let cdl = alloc_concurrent_synthetic(&mut ctx, "java/util/concurrent/CountDownLatch", 1);
+        let cdl = try_alloc_concurrent_synthetic(&mut ctx, "java/util/concurrent/CountDownLatch", 1).unwrap();
         native_cdl_init(&mut ctx, &[Value::Object(Some(cdl)), Value::Int(1)]).unwrap();
 
         native_cdl_count_down(&mut ctx, &[Value::Object(Some(cdl))]).unwrap();
@@ -8566,7 +8600,7 @@ mod concurrency_tests {
     #[test]
     fn sem_acquire_decrements_permits() {
         let mut ctx = make_ctx();
-        let sem = alloc_concurrent_synthetic(&mut ctx, "java/util/concurrent/Semaphore", 2);
+        let sem = try_alloc_concurrent_synthetic(&mut ctx, "java/util/concurrent/Semaphore", 2).unwrap();
         native_sem_init(&mut ctx, &[Value::Object(Some(sem)), Value::Int(3)]).unwrap();
 
         assert_eq!(sem_permits(&mut ctx, sem), 3);
@@ -8578,7 +8612,7 @@ mod concurrency_tests {
     #[test]
     fn sem_acquire_uninterruptibly_n_decrements_requested_permits() {
         let mut ctx = make_ctx();
-        let sem = alloc_concurrent_synthetic(&mut ctx, "java/util/concurrent/Semaphore", 2);
+        let sem = try_alloc_concurrent_synthetic(&mut ctx, "java/util/concurrent/Semaphore", 2).unwrap();
         native_sem_init(&mut ctx, &[Value::Object(Some(sem)), Value::Int(3)]).unwrap();
 
         native_sem_acquire_n(&mut ctx, &[Value::Object(Some(sem)), Value::Int(3)]).unwrap();
@@ -8588,7 +8622,7 @@ mod concurrency_tests {
     #[test]
     fn sem_release_increments_and_notifies() {
         let mut ctx = make_ctx();
-        let sem = alloc_concurrent_synthetic(&mut ctx, "java/util/concurrent/Semaphore", 2);
+        let sem = try_alloc_concurrent_synthetic(&mut ctx, "java/util/concurrent/Semaphore", 2).unwrap();
         native_sem_init(&mut ctx, &[Value::Object(Some(sem)), Value::Int(1)]).unwrap();
 
         // Release adds a permit (calls monitor_notify internally)
@@ -8599,7 +8633,7 @@ mod concurrency_tests {
     #[test]
     fn sem_try_acquire_with_no_permits_returns_zero() {
         let mut ctx = make_ctx();
-        let sem = alloc_concurrent_synthetic(&mut ctx, "java/util/concurrent/Semaphore", 2);
+        let sem = try_alloc_concurrent_synthetic(&mut ctx, "java/util/concurrent/Semaphore", 2).unwrap();
         native_sem_init(&mut ctx, &[Value::Object(Some(sem)), Value::Int(0)]).unwrap();
 
         let result = native_sem_try_acquire(&mut ctx, &[Value::Object(Some(sem))]).unwrap();
@@ -8610,7 +8644,7 @@ mod concurrency_tests {
     #[test]
     fn sem_try_acquire_with_permits_succeeds() {
         let mut ctx = make_ctx();
-        let sem = alloc_concurrent_synthetic(&mut ctx, "java/util/concurrent/Semaphore", 2);
+        let sem = try_alloc_concurrent_synthetic(&mut ctx, "java/util/concurrent/Semaphore", 2).unwrap();
         native_sem_init(&mut ctx, &[Value::Object(Some(sem)), Value::Int(5)]).unwrap();
 
         let result = native_sem_try_acquire(&mut ctx, &[Value::Object(Some(sem))]).unwrap();
@@ -8739,9 +8773,9 @@ mod concurrency_tests {
         let a = ctx.alloc_object(ClassId::new(0), 1);
         let b = ctx.alloc_object(ClassId::new(0), 1);
 
-        let ka1 = gc_stable_lock_key(&mut ctx, a);
-        let ka2 = gc_stable_lock_key(&mut ctx, a);
-        let kb = gc_stable_lock_key(&mut ctx, b);
+        let ka1 = gc_stable_lock_key(&mut ctx, a).unwrap();
+        let ka2 = gc_stable_lock_key(&mut ctx, a).unwrap();
+        let kb = gc_stable_lock_key(&mut ctx, b).unwrap();
 
         // (a) stable for the same object across calls
         assert_eq!(ka1, ka2, "key must be stable for the same lock object");
@@ -8767,8 +8801,12 @@ mod concurrency_tests {
         let stamp = native_stamped_write_lock(&mut ctx, &[Value::Object(Some(sl))])
             .unwrap()
             .unwrap();
-        assert!(matches!(stamp, Value::Long(v) if v & 1 != 0));
-        native_stamped_unlock_write(&mut ctx, &[Value::Object(Some(sl)), Value::Long(0)]).unwrap();
+        // Real JDK layout: a write stamp's mode field is WBIT (128). It used
+        // to be bit 0, which made `StampedLock.isWriteLockStamp` — real JDK
+        // bytecode, since nothing registers it — call this a READ stamp.
+        assert!(matches!(stamp, Value::Long(v) if v & 255 == 128), "got {stamp:?}");
+        // `unlockWrite` now CHECKS its stamp, so it must be the real one.
+        native_stamped_unlock_write(&mut ctx, &[Value::Object(Some(sl)), stamp]).unwrap();
 
         // After unlock the lock must NOT report write-locked — i.e. the unlock
         // hit the SAME slot the lock established (would fail under the old
@@ -8928,7 +8966,7 @@ mod concurrency_tests {
     }
 
     #[test]
-    fn m18_stamped_write_lock_returns_odd_stamp() {
+    fn m18_stamped_write_lock_returns_wbit_stamp() {
         let _guard = stamped_test_lock();
         let mut ctx = make_ctx();
         let sl = ctx.alloc_object(ClassId::new(0), 1);
@@ -8939,7 +8977,8 @@ mod concurrency_tests {
             .unwrap();
         match stamp {
             Value::Long(v) => {
-                assert!(v & 1 != 0, "write stamp should be odd, got {}", v);
+                // JDK `isWriteLockStamp`: `(stamp & ABITS) == WBIT`.
+                assert_eq!(v & 255, 128, "write stamp mode field must be WBIT, got {v}");
             }
             _ => panic!("expected Long stamp"),
         }
@@ -8975,8 +9014,10 @@ mod concurrency_tests {
         let before = native_stamped_optimistic(&mut ctx, &[Value::Object(Some(sl))])
             .unwrap()
             .unwrap();
-        native_stamped_write_lock(&mut ctx, &[Value::Object(Some(sl))]).unwrap();
-        native_stamped_unlock_write(&mut ctx, &[Value::Object(Some(sl)), Value::Long(0)]).unwrap();
+        let stamp = native_stamped_write_lock(&mut ctx, &[Value::Object(Some(sl))])
+            .unwrap()
+            .unwrap();
+        native_stamped_unlock_write(&mut ctx, &[Value::Object(Some(sl)), stamp]).unwrap();
         let after = native_stamped_optimistic(&mut ctx, &[Value::Object(Some(sl))])
             .unwrap()
             .unwrap();
@@ -8989,7 +9030,8 @@ mod concurrency_tests {
                     b,
                     a
                 );
-                assert!(a & 1 == 0, "stamp should be even after unlock, got {}", a);
+                // JDK `isOptimisticReadStamp`: `(stamp & ABITS) == 0`.
+                assert_eq!(a & 255, 0, "post-unlock stamp must be optimistic, got {a}");
             }
             _ => panic!("expected Long stamps"),
         }
@@ -9032,8 +9074,10 @@ mod concurrency_tests {
             _ => panic!("expected Long"),
         };
         // Perform a write lock/unlock cycle — stamp advances
-        native_stamped_write_lock(&mut ctx, &[Value::Object(Some(sl))]).unwrap();
-        native_stamped_unlock_write(&mut ctx, &[Value::Object(Some(sl)), Value::Long(0)]).unwrap();
+        let wstamp = native_stamped_write_lock(&mut ctx, &[Value::Object(Some(sl))])
+            .unwrap()
+            .unwrap();
+        native_stamped_unlock_write(&mut ctx, &[Value::Object(Some(sl)), wstamp]).unwrap();
         // Old stamp should now be invalid
         let valid =
             native_stamped_validate(&mut ctx, &[Value::Object(Some(sl)), Value::Long(stamp)])
@@ -9059,7 +9103,7 @@ mod concurrency_tests {
     }
 
     #[test]
-    fn m18_stamped_read_lock_returns_even_stamp() {
+    fn m18_stamped_read_lock_returns_reader_count_stamp() {
         let _guard = stamped_test_lock();
         let mut ctx = make_ctx();
         let sl = ctx.alloc_object(ClassId::new(0), 1);
@@ -9069,7 +9113,9 @@ mod concurrency_tests {
             .unwrap()
             .unwrap();
         match stamp {
-            Value::Long(v) => assert!(v & 1 == 0, "read stamp should be even, got {}", v),
+            // JDK `isReadLockStamp`: `(stamp & RBITS) != 0`. The low 7 bits
+            // are the READER COUNT, so the sole reader's stamp ends in 1.
+            Value::Long(v) => assert_eq!(v & 255, 1, "read stamp mode field must be 1, got {v}"),
             _ => panic!("expected Long"),
         }
     }
@@ -9125,13 +9171,15 @@ mod concurrency_tests {
             .unwrap();
         assert_eq!(locked, Value::Int(0));
 
-        native_stamped_write_lock(&mut ctx, &[Value::Object(Some(sl))]).unwrap();
+        let stamp = native_stamped_write_lock(&mut ctx, &[Value::Object(Some(sl))])
+            .unwrap()
+            .unwrap();
         let locked = native_stamped_is_write_locked(&mut ctx, &[Value::Object(Some(sl))])
             .unwrap()
             .unwrap();
         assert_eq!(locked, Value::Int(1));
 
-        native_stamped_unlock_write(&mut ctx, &[Value::Object(Some(sl)), Value::Long(0)]).unwrap();
+        native_stamped_unlock_write(&mut ctx, &[Value::Object(Some(sl)), stamp]).unwrap();
         let locked = native_stamped_is_write_locked(&mut ctx, &[Value::Object(Some(sl))])
             .unwrap()
             .unwrap();
@@ -9256,7 +9304,8 @@ mod concurrency_tests {
         match read_stamp {
             Value::Long(v) => {
                 assert!(v != 0, "conversion to read should succeed");
-                assert!(v & 1 == 0, "read stamp should be even after conversion");
+                // Downgrade leaves exactly one reader, so `& ABITS == 1`.
+                assert_eq!(v & 255, 1, "converted read stamp must be a read stamp, got {v}");
             }
             _ => panic!("expected Long"),
         }
@@ -9279,7 +9328,7 @@ mod concurrency_tests {
         // Verify that ReentrantLock lock/unlock cycle works with monitor-based contention
         let mut ctx = make_ctx();
         let lock =
-            alloc_concurrent_synthetic(&mut ctx, "java/util/concurrent/locks/ReentrantLock", 3);
+            try_alloc_concurrent_synthetic(&mut ctx, "java/util/concurrent/locks/ReentrantLock", 3).unwrap();
         native_rl_init(&mut ctx, &[Value::Object(Some(lock))]).unwrap();
 
         native_rl_lock(&mut ctx, &[Value::Object(Some(lock))]).unwrap();
@@ -9298,7 +9347,7 @@ mod concurrency_tests {
         // In single-threaded mock, monitor_wait returns immediately → not timed out
         let mut ctx = make_ctx();
         let lock =
-            alloc_concurrent_synthetic(&mut ctx, "java/util/concurrent/locks/ReentrantLock", 3);
+            try_alloc_concurrent_synthetic(&mut ctx, "java/util/concurrent/locks/ReentrantLock", 3).unwrap();
         native_rl_init(&mut ctx, &[Value::Object(Some(lock))]).unwrap();
         native_rl_lock(&mut ctx, &[Value::Object(Some(lock))]).unwrap();
 
@@ -9325,7 +9374,7 @@ mod concurrency_tests {
     fn m18_cond_await_nanos_returns_remaining() {
         let mut ctx = make_ctx();
         let lock =
-            alloc_concurrent_synthetic(&mut ctx, "java/util/concurrent/locks/ReentrantLock", 3);
+            try_alloc_concurrent_synthetic(&mut ctx, "java/util/concurrent/locks/ReentrantLock", 3).unwrap();
         native_rl_init(&mut ctx, &[Value::Object(Some(lock))]).unwrap();
         native_rl_lock(&mut ctx, &[Value::Object(Some(lock))]).unwrap();
 
@@ -9359,7 +9408,7 @@ mod concurrency_tests {
         // CopyOnWriteArrayList iterator should see a snapshot, not live data
         let mut ctx = make_ctx();
         let cowal =
-            alloc_concurrent_synthetic(&mut ctx, "java/util/concurrent/CopyOnWriteArrayList", 2);
+            try_alloc_concurrent_synthetic(&mut ctx, "java/util/concurrent/CopyOnWriteArrayList", 2).unwrap();
         cratonvm_native_collections::native_al_init(&mut ctx, &[Value::Object(Some(cowal))])
             .unwrap();
 
@@ -9437,9 +9486,10 @@ mod concurrency_tests {
 
         let mut prev_stamp = STAMPED_ORIGIN;
         for _ in 0..5 {
-            native_stamped_write_lock(&mut ctx, &[Value::Object(Some(sl))]).unwrap();
-            native_stamped_unlock_write(&mut ctx, &[Value::Object(Some(sl)), Value::Long(0)])
+            let stamp = native_stamped_write_lock(&mut ctx, &[Value::Object(Some(sl))])
+                .unwrap()
                 .unwrap();
+            native_stamped_unlock_write(&mut ctx, &[Value::Object(Some(sl)), stamp]).unwrap();
             let cur = match native_stamped_optimistic(&mut ctx, &[Value::Object(Some(sl))])
                 .unwrap()
                 .unwrap()
@@ -9448,7 +9498,7 @@ mod concurrency_tests {
                 _ => panic!("expected Long"),
             };
             assert!(cur > prev_stamp, "stamp should monotonically increase");
-            assert!(cur & 1 == 0, "stamp should be even after unlock");
+            assert_eq!(cur & 255, 0, "stamp must be optimistic after unlock, got {cur}");
             prev_stamp = cur;
         }
     }
@@ -9471,7 +9521,7 @@ mod concurrency_tests {
         let reg = register_atomics();
         let ai = "java/util/concurrent/atomic/AtomicInteger";
         let mut ctx = make_ctx();
-        let obj = alloc_concurrent_synthetic(&mut ctx, ai, 1);
+        let obj = try_alloc_concurrent_synthetic(&mut ctx, ai, 1).unwrap();
 
         let init = reg.find(ai, "<init>", "(I)V").unwrap();
         init(&mut ctx, &[Value::Object(Some(obj)), Value::Int(10)]).unwrap();
@@ -9533,7 +9583,7 @@ mod concurrency_tests {
         let reg = register_atomics();
         let al = "java/util/concurrent/atomic/AtomicLong";
         let mut ctx = make_ctx();
-        let obj = alloc_concurrent_synthetic(&mut ctx, al, 1);
+        let obj = try_alloc_concurrent_synthetic(&mut ctx, al, 1).unwrap();
 
         let init = reg.find(al, "<init>", "(J)V").unwrap();
         init(&mut ctx, &[Value::Object(Some(obj)), Value::Long(i64::MAX)]).unwrap();
@@ -9623,7 +9673,7 @@ mod concurrency_tests {
         let reg = register_atomics();
         let ar = "java/util/concurrent/atomic/AtomicReference";
         let mut ctx = make_ctx();
-        let obj = alloc_concurrent_synthetic(&mut ctx, ar, 1);
+        let obj = try_alloc_concurrent_synthetic(&mut ctx, ar, 1).unwrap();
         let value = ctx.create_string("CLOSED");
 
         let init = reg.find(ar, "<init>", "(Ljava/lang/Object;)V").unwrap();
@@ -9647,7 +9697,7 @@ mod concurrency_tests {
         let reg = register_atomics();
         let ar = "java/util/concurrent/atomic/AtomicReference";
         let mut ctx = make_ctx();
-        let obj = alloc_concurrent_synthetic(&mut ctx, ar, 1);
+        let obj = try_alloc_concurrent_synthetic(&mut ctx, ar, 1).unwrap();
 
         let s_a1 = ctx.create_string("hello");
         let s_a2 = ctx.create_string("hello");
@@ -9703,7 +9753,7 @@ mod concurrency_tests {
         let _guard = stamped_test_lock();
         let mut ctx = make_ctx();
         let lock =
-            alloc_concurrent_synthetic(&mut ctx, "java/util/concurrent/locks/ReentrantLock", 3);
+            try_alloc_concurrent_synthetic(&mut ctx, "java/util/concurrent/locks/ReentrantLock", 3).unwrap();
         native_rl_init(&mut ctx, &[Value::Object(Some(lock))]).unwrap();
 
         native_rl_lock(&mut ctx, &[Value::Object(Some(lock))]).unwrap();
@@ -9739,7 +9789,7 @@ mod concurrency_tests {
         let _guard = stamped_test_lock();
         let mut ctx = make_ctx();
         let lock =
-            alloc_concurrent_synthetic(&mut ctx, "java/util/concurrent/locks/ReentrantLock", 3);
+            try_alloc_concurrent_synthetic(&mut ctx, "java/util/concurrent/locks/ReentrantLock", 3).unwrap();
         native_rl_init(&mut ctx, &[Value::Object(Some(lock))]).unwrap();
         native_rl_lock(&mut ctx, &[Value::Object(Some(lock))]).unwrap();
 
@@ -9777,7 +9827,7 @@ mod concurrency_tests {
     #[test]
     fn rd8_completable_future_exceptional_passthrough() {
         let mut ctx = make_ctx();
-        let cf = alloc_concurrent_synthetic(&mut ctx, "java/util/concurrent/CompletableFuture", 4);
+        let cf = try_alloc_concurrent_synthetic(&mut ctx, "java/util/concurrent/CompletableFuture", 4).unwrap();
         let err_msg = ctx.create_string("boom");
         ctx.set_field(cf, FUT_FIELD_RESULT, Value::Object(Some(err_msg)));
         ctx.set_field(cf, FUT_FIELD_DONE, Value::Int(2));
@@ -10182,7 +10232,7 @@ fn rwl_view(
     // ARG — the pin is remapped, this Rust local is not. Re-read it through a
     // pin around the allocation.
     let this_pin = ctx.pin_native_root(this);
-    let view = alloc_concurrent_synthetic(ctx, class_name, 1);
+    let view = try_alloc_concurrent_synthetic(ctx, class_name, 1)?;
     let view_pin = ctx.pin_native_root(view);
     let this = ctx.read_native_pin(this_pin, this);
     let view = ctx.read_native_pin(view_pin, view);

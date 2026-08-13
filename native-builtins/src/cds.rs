@@ -12,10 +12,10 @@
 //! without changing the public registration surface.
 
 use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
-use cratonvm_types::error::MethodCallResult;
+use cratonvm_types::error::{MethodCallFailed, MethodCallResult};
 use cratonvm_types::{ObjectRef, Value};
 
-use crate::{alloc_concurrent_synthetic, native_noop, native_noop_with_this, obj_arg};
+use crate::{try_alloc_concurrent_synthetic, native_noop, native_noop_with_this, obj_arg};
 
 // ---------------------------------------------------------------------------
 // Archive format constants
@@ -598,8 +598,11 @@ pub fn format_class_list(classes: &[String]) -> String {
 ///  3  archive_load_time_ms       (Long)
 ///  4  archive_path               (Object / String)
 /// ```
-fn alloc_cds_metrics_obj(ctx: &mut dyn NativeContext, metrics: &CdsMetrics) -> ObjectRef {
-    let obj = alloc_concurrent_synthetic(ctx, "sun/management/CDSMetrics", 5);
+fn alloc_cds_metrics_obj(
+    ctx: &mut dyn NativeContext,
+    metrics: &CdsMetrics,
+) -> Result<ObjectRef, MethodCallFailed> {
+    let obj = try_alloc_concurrent_synthetic(ctx, "sun/management/CDSMetrics", 5)?;
     ctx.set_field(obj, 0, Value::Int(metrics.total_classes_in_archive as i32));
     ctx.set_field(
         obj,
@@ -610,19 +613,19 @@ fn alloc_cds_metrics_obj(ctx: &mut dyn NativeContext, metrics: &CdsMetrics) -> O
     ctx.set_field(obj, 3, Value::Long(metrics.archive_load_time_ms as i64));
     let path_obj = ctx.create_string(&metrics.archive_path);
     ctx.set_field(obj, 4, Value::Object(Some(path_obj)));
-    obj
+    Ok(obj)
 }
 
 /// Allocate a synthetic `java.util.Properties` object (2 fields: backing
 /// array + size).  The object is empty; callers may add entries via
 /// `ctx.set_field` if needed.
-fn alloc_properties_obj(ctx: &mut dyn NativeContext) -> ObjectRef {
+fn alloc_properties_obj(ctx: &mut dyn NativeContext) -> Result<ObjectRef, MethodCallFailed> {
     use cratonvm_types::ClassId;
-    let obj = alloc_concurrent_synthetic(ctx, "java/util/Properties", 2);
+    let obj = try_alloc_concurrent_synthetic(ctx, "java/util/Properties", 2)?;
     let backing = ctx.new_ref_array(ClassId::new(0), 0);
     ctx.set_field(obj, 0, Value::Object(Some(backing)));
     ctx.set_field(obj, 1, Value::Int(0));
-    obj
+    Ok(obj)
 }
 
 // ---------------------------------------------------------------------------
@@ -633,7 +636,7 @@ fn alloc_properties_obj(ctx: &mut dyn NativeContext) -> ObjectRef {
 
 fn native_get_cds_metrics(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
     let metrics = CdsMetrics::disabled();
-    let obj = alloc_cds_metrics_obj(ctx, &metrics);
+    let obj = alloc_cds_metrics_obj(ctx, &metrics)?;
     Ok(Some(Value::Object(Some(obj))))
 }
 
@@ -695,7 +698,7 @@ fn native_vm_is_booted(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodC
 }
 
 fn native_vm_saved_props(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    let props = alloc_properties_obj(ctx);
+    let props = alloc_properties_obj(ctx)?;
     Ok(Some(Value::Object(Some(props))))
 }
 

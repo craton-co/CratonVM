@@ -51,7 +51,7 @@ use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
 use cratonvm_types::error::{MethodCallResult, RuntimeError};
 use cratonvm_types::{ArrayElementType, ClassId, ObjectRef, Value};
 
-use crate::alloc_concurrent_synthetic;
+use crate::try_alloc_concurrent_synthetic;
 use crate::crypto_impl;
 
 // `java.security.Signature` (JDK 25) extends `SignatureSpi` and declares
@@ -92,7 +92,7 @@ const SIG_PRIVATE_SLOTS: usize = 6;
 // `types/src/value.rs`).  When the GC relocates a `Signature` instance during
 // compaction every entry becomes orphaned: `Signature.sign()` after GC then
 // reports `state == 0` (`UNINIT`) from the side-table miss and the fallback
-// slot read also returns `Object(None)`, throwing `IllegalStateException`.
+// slot read also returns `Object(None)`, throwing the checked `SignatureException`.
 // `NativeContext::identity_hash_code` is GC-stable
 // (`HashCodeTable::update_after_gc`, `gc/src/compact_header.rs`).  All
 // accessors therefore thread `&mut dyn NativeContext`.  Mirrors the pattern
@@ -148,7 +148,7 @@ fn sig_keyid_table() -> &'static parking_lot::Mutex<rustc_hash::FxHashMap<SigKey
 /// process-global with no VM scope, so two VMs in one process could append
 /// to — and `take` — each other's buffers: VM B's `sign()` would consume the
 /// bytes VM A had accumulated (and leave VM A's `sign()` to fail the
-/// `take_data` `None` check with `IllegalStateException`).  The payload lives
+/// `take_data` `None` check, now a checked `SignatureException`).  The payload lives
 /// here instead, under the same `(vm_identity, identity_hash)` key as the
 /// sibling tables above.  `Vec<u8>` — no `ObjectRef`s, so no GC hooks.
 fn sig_payload_table() -> &'static parking_lot::Mutex<rustc_hash::FxHashMap<SigKey, Vec<u8>>> {
@@ -422,7 +422,7 @@ fn append_data(ctx: &mut dyn NativeContext, this: ObjectRef, data: &[u8]) {
 
 /// Remove the receiver's accumulated payload from the side table.
 ///
-/// Returns `Err(IllegalStateException)` when the side-table entry is
+/// Returns `Err(SignatureException)` when the side-table entry is
 /// missing — i.e. the receiver was never `init*`-ed through this
 /// registrar (so `clear_data` never seeded an empty buffer).  Should
 /// also catch any future regression to a GC-orphaning key scheme.
@@ -439,19 +439,25 @@ fn take_data(
     ctx.set_field(this, base + SIG_OFF_PENDING, Value::Int(0));
     let key = sig_key(ctx, this);
     let taken = sig_payload_table().lock().remove(&key);
-    taken.ok_or_else(|| {
-        RuntimeError::IllegalStateException {
-            message: "Signature payload missing post-GC or init*() never called".into(),
-        }
-        .into()
-    })
+    match taken {
+        Some(bytes) => Ok(bytes),
+        // Reached only from `sign`/`verify`, both of which declare
+        // `SignatureException`, so the checked class is the catchable one.
+        // HotSpot cannot produce this state at all — it means `init*()` never
+        // ran through this registrar — but the caller's handler is the same
+        // handler either way, and an unchecked throw skips it.
+        None => Err(refuse_uninitialized(
+            ctx,
+            "object not initialized for signature or verification              (Signature payload missing post-GC or init*() never called)",
+        )),
+    }
 }
 
 fn clear_data(ctx: &mut dyn NativeContext, this: ObjectRef) {
     let key = sig_key(ctx, this);
     // Seed an *empty* buffer rather than removing the entry: `take_data`
     // distinguishes "init*() ran, no update() bytes" (Some(empty)) from
-    // "never initialised / entry lost" (None → IllegalStateException).
+    // "never initialised / entry lost" (None → SignatureException).
     sig_payload_table().lock().insert(key, Vec::new());
 }
 
@@ -512,6 +518,40 @@ fn natively_dispatched(alg: i32) -> bool {
 /// `catch (SignatureException)` that signature-verifying code is written
 /// around).
 const SIGNATURE_EXCEPTION: &str = "java/security/SignatureException";
+
+/// Refuse an operation on a `Signature` that is not in the state it needs.
+///
+/// **Every one of these used to be an unchecked `IllegalStateException`, and
+/// every one of them is `SignatureException` on HotSpot.** Measured on Temurin
+/// 25.0.3+9:
+///
+/// ```text
+/// sign()   on a fresh object      SignatureException: object not initialized for signing
+/// sign()   after initVerify       SignatureException: object not initialized for signing
+/// verify() on a fresh object      SignatureException: object not initialized for verification
+/// verify() after initSign         SignatureException: object not initialized for verification
+/// update() on a fresh object      SignatureException: object not initialized for signature or verification
+/// sign(byte[],int,int) too small  SignatureException: partial signatures not returned
+/// ```
+///
+/// This is the same defect species as the RSA `BadPaddingException` one door
+/// away in `jca/cipher.rs`: `Signature.sign()`, `verify()` and `update()` all
+/// DECLARE `SignatureException`, so a caller's `catch (SignatureException e)`
+/// is already written and was simply dead against this VM — the failure escaped
+/// as an unchecked throw through code that believed it had handled it. Raising
+/// the checked class cannot break a caller that compiles today; it can only
+/// make a dead handler start working.
+///
+/// Contrast `javax.crypto.Mac`, where `IllegalStateException` is what HotSpot
+/// raises and is what `doFinal` DECLARES (measured:
+/// `IllegalStateException: MAC not initialized`). Unchecked is not wrong by
+/// itself — it is wrong when the JDK's own signature says otherwise.
+fn refuse_uninitialized(
+    ctx: &mut dyn NativeContext,
+    msg: &str,
+) -> cratonvm_types::error::MethodCallFailed {
+    crate::phases_early::throw_jca_exc(ctx, SIGNATURE_EXCEPTION, msg)
+}
 
 /// Refuse a `sign`/`verify` whose dispatch returned `None`.
 ///
@@ -669,10 +709,10 @@ fn drive_real_signature_spi(
     let key = match ctx.get_field(this, base + SIG_OFF_KEYOBJ) {
         Value::Object(Some(o)) => o,
         _ => {
-            return Err(RuntimeError::IllegalStateException {
-                message: "Signature not initialized (no EC key)".into(),
-            }
-            .into())
+            return Err(refuse_uninitialized(
+                ctx,
+                "object not initialized for signature or verification (no EC key)",
+            ))
         }
     };
     let data = take_data(ctx, this)?;
@@ -815,10 +855,10 @@ fn drive_real_mldsa(
     let key = match ctx.get_field(this, base + SIG_OFF_KEYOBJ) {
         Value::Object(Some(o)) => o,
         _ => {
-            return Err(RuntimeError::IllegalStateException {
-                message: "Signature not initialized (no ML-DSA key)".into(),
-            }
-            .into())
+            return Err(refuse_uninitialized(
+                ctx,
+                "object not initialized for signature or verification (no ML-DSA key)",
+            ))
         }
     };
     // Resolve the parameter-set SPI before consuming the payload, so a closed
@@ -894,6 +934,66 @@ fn drive_real_mldsa(
 // Native methods
 // ---------------------------------------------------------------------------
 
+/// Whether `Signature.getInstance` may hand back a receiver for `name`.
+///
+/// `Signature.getInstance` used to accept **every string**. Measured against a
+/// running binary in both arms (W7-29-jca-advertise-implement-gaps.md
+/// residual 5): `getInstance("ML-KEM")`, `("AES")`, `("HmacSHA256")`,
+/// `("NO-SUCH-SIG")` and `("")` all returned a live object whose
+/// `getAlgorithm()` was the sentinel `"Unknown"`, where HotSpot 25 raises
+/// `NoSuchAlgorithmException: <name> Signature not available` for each.
+///
+/// This is not the `Cipher`/`Mac` species — the engine does not fabricate a
+/// cryptographic result, because `sign_dispatch`/`verify_dispatch` refuse an
+/// unrecognised index and `refuse_unanswerable` converts that into a
+/// `SignatureException` rather than an empty signature or a bare `false`. It
+/// is a **deferred and mistyped refusal**, which is its own harm: a caller
+/// writing the ordinary
+///
+/// ```java
+/// try { s = Signature.getInstance(name); } catch (NoSuchAlgorithmException e) { fallback(); }
+/// ```
+///
+/// takes the wrong branch, concludes the algorithm is available, and meets the
+/// failure much later at a point where its `catch` clauses are written for a
+/// bad signature rather than a missing algorithm. Probing an engine for a name
+/// it may not have is ordinary library behaviour.
+///
+/// **The gate is a DISJUNCTION, and W7-29's prescription — gate on
+/// `find_service_provider("Signature", algo)` alone — would have been a
+/// regression.** The registry is seeded with friendly names only, while
+/// `algo_idx` deliberately also carries the signature-algorithm OIDs
+/// (`1.2.840.113549.1.1.11` and neighbours) because X.509 `cert.verify()`
+/// resolves `Signature.getInstance(signatureAlgorithm.getId())` by OID, not by
+/// friendly name. A registry-only gate refuses every one of those at
+/// `getInstance` and breaks certificate verification outright — the same
+/// shape as this record's other correction, where a record's observation is
+/// right and its prescribed fix has been overtaken.
+///
+/// So: accept a name this engine has a concept of (`idx >= 0`), OR a name some
+/// provider in the live chain advertises. Nothing else. That closes both
+/// directions at once — no unadvertised-and-unimplemented name is served, and
+/// no advertised name is refused, which is what
+/// `every_advertised_signature_name_is_offered_by_get_instance` ratchets.
+///
+/// A name that is advertised but has no `algo_idx` arm (`SHA3-256withRSA` and
+/// eight neighbours on `SunRsaSign`) still gets a receiver and still fails at
+/// `sign()`/`verify()` with the checked `SignatureException`. That is an
+/// ordinary unimplemented-algorithm gap and NOT this record's species — the
+/// name is real, the advertisement is truthful, and the failure is closed and
+/// catchable. Narrowing it belongs to whoever implements those arms.
+/// W7-63-jca-advertise-vs-serve.md.
+fn signature_name_is_offered(idx: i32, name: &str) -> bool {
+    idx >= 0 || crate::jca::provider_chain::find_service_provider("Signature", name).is_some()
+}
+
+/// The same gate, by name only, for the provider-chain ratchet — which owns
+/// the seed lists and the `#[cfg(test)]` lock that serialises the process-wide
+/// service map, so the test has to live over there.
+pub(crate) fn get_instance_offers(name: &str) -> bool {
+    signature_name_is_offered(algo_idx(name), name)
+}
+
 fn sig_get_instance(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // Shared by all three `getInstance` overloads — see `check_named_provider_arg`.
     crate::jca::provider_chain::check_named_provider_arg(
@@ -912,8 +1012,14 @@ fn sig_get_instance(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
         crate::jca::provider_chain::ProviderArgWording::Shared,
     )?;
     let idx = algo_idx(&alg);
+    if !signature_name_is_offered(idx, &alg) {
+        return Err(crate::jca::provider_chain::throw_no_such_algorithm_public(
+            ctx,
+            &format!("{alg} Signature not available"),
+        ));
+    }
     let base = synthetic_base_offset(ctx, "java/security/Signature");
-    let obj = alloc_concurrent_synthetic(ctx, "java/security/Signature", base + SIG_PRIVATE_SLOTS);
+    let obj = try_alloc_concurrent_synthetic(ctx, "java/security/Signature", base + SIG_PRIVATE_SLOTS)?;
     // SigProbe fix: side-table is the authoritative store; the base-offset
     // slot writes remain for any synthetic-mode caller that goes through
     // slot indexing.  C15: keyed on identity hash code so GC compaction
@@ -969,6 +1075,13 @@ fn sig_init_verify(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
 
 fn sig_update_byte(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = this_arg(args)?;
+    // `Signature.update` DECLARES `SignatureException`, and HotSpot raises it
+    // here: measured `SignatureException: object not initialized for signature
+    // or verification` for every `update` overload on a fresh object. This VM
+    // appended the bytes and returned — it raised NOTHING — so an
+    // update-before-init went unnoticed until `sign()` produced a signature
+    // over data the caller never meant to sign.
+    require_initialized_for_update(ctx, this)?;
     let b = match args.get(1) {
         Some(Value::Int(v)) => *v as u8,
         _ => 0,
@@ -979,6 +1092,13 @@ fn sig_update_byte(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
 
 fn sig_update_bytes(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = this_arg(args)?;
+    // `Signature.update` DECLARES `SignatureException`, and HotSpot raises it
+    // here: measured `SignatureException: object not initialized for signature
+    // or verification` for every `update` overload on a fresh object. This VM
+    // appended the bytes and returned — it raised NOTHING — so an
+    // update-before-init went unnoticed until `sign()` produced a signature
+    // over data the caller never meant to sign.
+    require_initialized_for_update(ctx, this)?;
     if let Some(Value::Object(Some(arr))) = args.get(1) {
         let buf = read_byte_array_full(ctx, *arr);
         append_data(ctx, this, &buf);
@@ -988,6 +1108,13 @@ fn sig_update_bytes(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
 
 fn sig_update_bytes_off_len(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = this_arg(args)?;
+    // `Signature.update` DECLARES `SignatureException`, and HotSpot raises it
+    // here: measured `SignatureException: object not initialized for signature
+    // or verification` for every `update` overload on a fresh object. This VM
+    // appended the bytes and returned — it raised NOTHING — so an
+    // update-before-init went unnoticed until `sign()` produced a signature
+    // over data the caller never meant to sign.
+    require_initialized_for_update(ctx, this)?;
     if let Some(Value::Object(Some(arr))) = args.get(1) {
         let off = match args.get(2) {
             Some(Value::Int(n)) => *n as usize,
@@ -1011,7 +1138,7 @@ fn sig_update_bytebuffer(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
 }
 
 /// C15: convert a missing side-table state lookup into a loud
-/// `IllegalStateException` instead of silently degrading to a slot-read
+/// `SignatureException` instead of silently degrading to a slot-read
 /// that the real-JDK layout will return as `Object(None)`.  After the
 /// identity-hash-code key migration, a miss here means the receiver was
 /// either never produced by our `getInstance` or — pre-fix — was orphaned
@@ -1024,10 +1151,31 @@ fn require_sig_state(
     if let Some(st) = get_sig_state(ctx, this) {
         return Ok(st);
     }
-    Err(RuntimeError::IllegalStateException {
-        message: "Signature state missing post-GC or never initialized".into(),
+    Err(refuse_uninitialized(
+        ctx,
+        "object not initialized for signature or verification          (Signature state missing post-GC or never initialized)",
+    ))
+}
+
+/// `update()` is legal only after `initSign`/`initVerify`.
+///
+/// HotSpot's `Signature.update` is `if (state == UNINITIALIZED) throw new
+/// SignatureException("object not initialized for signature or verification")`,
+/// and both of the states it admits are admitted here for the same reason: the
+/// bytes are accumulated identically for signing and for verifying, so which
+/// one it is does not matter until `sign()`/`verify()`.
+fn require_initialized_for_update(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+) -> Result<(), cratonvm_types::error::MethodCallFailed> {
+    let state = require_sig_state(ctx, this)?;
+    if state == STATE_SIGN || state == STATE_VERIFY {
+        return Ok(());
     }
-    .into())
+    Err(refuse_uninitialized(
+        ctx,
+        "object not initialized for signature or verification",
+    ))
 }
 
 fn require_sig_algo(
@@ -1037,20 +1185,17 @@ fn require_sig_algo(
     if let Some(a) = get_sig_algo(ctx, this) {
         return Ok(a);
     }
-    Err(RuntimeError::IllegalStateException {
-        message: "Signature state missing post-GC or never initialized".into(),
-    }
-    .into())
+    Err(refuse_uninitialized(
+        ctx,
+        "object not initialized for signature or verification          (Signature state missing post-GC or never initialized)",
+    ))
 }
 
 fn sig_sign(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = this_arg(args)?;
     let state = require_sig_state(ctx, this)?;
     if state != STATE_SIGN {
-        return Err(RuntimeError::IllegalStateException {
-            message: "Signature object not initialized for signing".into(),
-        }
-        .into());
+        return Err(refuse_uninitialized(ctx, "object not initialized for signing"));
     }
     let alg = require_sig_algo(ctx, this)?;
     // EC: drive the real SunEC ECDSASignature SPI (real key, real DER output).
@@ -1069,7 +1214,7 @@ fn sig_sign(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
         return drive_real_mldsa(ctx, this, alg, None);
     }
     let key_id = key_id_of(ctx, this);
-    // C18: surface a missing payload as IllegalStateException rather than
+    // C18: surface a missing payload as the checked SignatureException rather than
     // silently signing/verifying `b""` (the pre-fix raw-pointer keying
     // could orphan the buffer after GC compaction and the empty-fallback
     // produced an apparent success).
@@ -1090,14 +1235,11 @@ fn sig_sign_into(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
     let this = this_arg(args)?;
     let state = require_sig_state(ctx, this)?;
     if state != STATE_SIGN {
-        return Err(RuntimeError::IllegalStateException {
-            message: "Signature object not initialized for signing".into(),
-        }
-        .into());
+        return Err(refuse_uninitialized(ctx, "object not initialized for signing"));
     }
     let alg = require_sig_algo(ctx, this)?;
     let key_id = key_id_of(ctx, this);
-    // C18: surface a missing payload as IllegalStateException rather than
+    // C18: surface a missing payload as the checked SignatureException rather than
     // silently signing/verifying `b""` (the pre-fix raw-pointer keying
     // could orphan the buffer after GC compaction and the empty-fallback
     // produced an apparent success).
@@ -1118,7 +1260,21 @@ fn sig_sign_into(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
         Some(Value::Int(n)) => *n as usize,
         _ => sig_bytes.len(),
     };
-    let written = sig_bytes.len().min(max_len);
+    // A signature that does not FIT is not a shorter signature. HotSpot:
+    // `SignatureException: partial signatures not returned` (measured, a
+    // 4-byte window for an RSA-2048 signature). This used to write
+    // `min(len, max_len)` bytes and RETURN THAT COUNT, so a caller with a
+    // too-small buffer was handed the first four bytes of a 256-byte signature
+    // and told the operation succeeded — a wrong answer with no exception at
+    // all, which is worse than the wrong exception class this record is about.
+    if max_len < sig_bytes.len() {
+        return Err(crate::phases_early::throw_jca_exc(
+            ctx,
+            SIGNATURE_EXCEPTION,
+            "partial signatures not returned",
+        ));
+    }
+    let written = sig_bytes.len();
     if let Some(Value::Object(Some(out))) = args.get(1) {
         for (i, &b) in sig_bytes.iter().take(written).enumerate() {
             ctx.set_array_element(*out, off + i, Value::Int(b as i8 as i32));
@@ -1131,10 +1287,7 @@ fn sig_verify(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = this_arg(args)?;
     let state = require_sig_state(ctx, this)?;
     if state != STATE_VERIFY {
-        return Err(RuntimeError::IllegalStateException {
-            message: "Signature object not initialized for verification".into(),
-        }
-        .into());
+        return Err(refuse_uninitialized(ctx, "object not initialized for verification"));
     }
     let alg = require_sig_algo(ctx, this)?;
     // EC: drive the real SunEC ECDSASignature SPI (real key, real DER verify).
@@ -1169,7 +1322,7 @@ fn sig_verify(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
         return drive_real_mldsa(ctx, this, alg, Some(provided));
     }
     let key_id = key_id_of(ctx, this);
-    // C18: surface a missing payload as IllegalStateException rather than
+    // C18: surface a missing payload as the checked SignatureException rather than
     // silently signing/verifying `b""` (the pre-fix raw-pointer keying
     // could orphan the buffer after GC compaction and the empty-fallback
     // produced an apparent success).
@@ -1195,14 +1348,11 @@ fn sig_verify_off_len(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     let this = this_arg(args)?;
     let state = require_sig_state(ctx, this)?;
     if state != STATE_VERIFY {
-        return Err(RuntimeError::IllegalStateException {
-            message: "Signature object not initialized for verification".into(),
-        }
-        .into());
+        return Err(refuse_uninitialized(ctx, "object not initialized for verification"));
     }
     let alg = require_sig_algo(ctx, this)?;
     let key_id = key_id_of(ctx, this);
-    // C18: surface a missing payload as IllegalStateException rather than
+    // C18: surface a missing payload as the checked SignatureException rather than
     // silently signing/verifying `b""` (the pre-fix raw-pointer keying
     // could orphan the buffer after GC compaction and the empty-fallback
     // produced an apparent success).
@@ -1249,8 +1399,39 @@ fn sig_set_parameter(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCal
     Ok(None)
 }
 
-fn sig_get_provider_null(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    Ok(Some(Value::Object(None)))
+/// `Signature.getProvider()`.
+///
+/// Returned a bare `null`, which a real `Signature.getProvider()` never does: a
+/// `Signature` you successfully obtained always has one. Callers write
+/// `sig.getProvider().getName()` — JSSE and the JDK's own JAR verification do —
+/// so `null` is an immediate `NullPointerException: … because the return value
+/// of "java.security.Signature.getProvider()" is null`.
+///
+/// Answer with the provider HotSpot 25 resolves each family to, keyed off this
+/// engine's own algorithm index so the name cannot drift from what
+/// `getAlgorithm()` reports. An algorithm this module does not recognise keeps
+/// returning `null` rather than being assigned a fabricated provider.
+fn sig_get_provider_null(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let Ok(this) = this_arg(args) else {
+        return Ok(Some(Value::Object(None)));
+    };
+    let base = synthetic_base_offset(ctx, "java/security/Signature");
+    let idx =
+        get_sig_algo(ctx, this).unwrap_or_else(|| match ctx.get_field(this, base + SIG_OFF_ALGO) {
+            Value::Int(i) => i,
+            _ => -1,
+        });
+    // Measured on jdk-25: *withECDSA and the Edwards curves → SunEC,
+    // *withDSA and ML-DSA → SUN, anything RSA (incl. PSS) → SunRsaSign.
+    let name = match algo_name(idx) {
+        a if a.ends_with("ECDSA") => "SunEC",
+        "Ed25519" | "Ed448" | "EdDSA" => "SunEC",
+        a if a.ends_with("DSA") || a.starts_with("ML-DSA") => "SUN",
+        a if a.contains("RSA") => "SunRsaSign",
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let p = crate::jca::make_named_provider(ctx, name)?;
+    Ok(Some(Value::Object(Some(p))))
 }
 
 // ---------------------------------------------------------------------------
@@ -1559,16 +1740,13 @@ mod tests {
         let sig = make_inited_sig(&mut ctx, "ML-DSA-65", None, false);
         let err = sig_sign(&mut ctx, &[Value::Object(Some(sig))])
             .expect_err("ML-DSA sign with no key must fail closed");
-        use cratonvm_types::error::{MethodCallFailed, VmError};
-        assert!(
-            matches!(
-                err,
-                MethodCallFailed::InternalError(VmError::Runtime(
-                    RuntimeError::IllegalStateException { .. }
-                ))
-            ),
-            "expected IllegalStateException (no ML-DSA key), got {err:?}"
-        );
+        // The refusal is the CHECKED `SignatureException` that `sign()`
+        // declares, not the unchecked `IllegalStateException` this used to
+        // raise. `assert_signature_exception` accepts `throw_jca_exc`'s
+        // fallback arm as well, because whether the mock context can build a
+        // real JDK class is a property of the mock and not of this refusal —
+        // what it will not accept is a success.
+        assert_signature_exception(&mut ctx, err);
     }
 
     /// Routing proof: an ML-DSA `sign()` WITH an init key is dispatched into the
@@ -1802,7 +1980,7 @@ mod tests {
             MethodCallFailed::ExceptionThrown(exc) => {
                 let cid = ctx.class_id_of_object(exc);
                 assert_eq!(
-                    ctx.class_name_of_id(cid).as_deref(),
+                    ctx.class_name_arc_of_id(cid).as_deref(),
                     Some(SIGNATURE_EXCEPTION),
                     "the refusal must be the exception sign()/verify() declare"
                 );

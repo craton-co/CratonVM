@@ -534,6 +534,32 @@ fn closed_selector() -> MethodCallFailed {
     .into()
 }
 
+/// A genuine `java.nio.channels.ClosedSelectorException`, for the public
+/// entry points that must raise one.
+///
+/// `closed_selector()` above builds an `IOException` whose MESSAGE is the string
+/// "ClosedSelectorException", which is a different thing in every way that
+/// matters. `ClosedSelectorException` extends `IllegalStateException` and is
+/// UNCHECKED; `IOException` is checked. Measured on jdk-25, `selectNow()` on a
+/// closed selector throws `java.nio.channels.ClosedSelectorException` — a caller
+/// with `catch (IOException)` around its select loop does NOT catch that and is
+/// meant not to, while here it caught it and carried on. `keys()` throws the
+/// same and is not declared to throw `IOException` at all, so it could not
+/// report the condition through `closed_selector()` even in principle — which is
+/// why it silently returned an empty set instead.
+///
+/// The ctx-less internal helpers keep `closed_selector()`: by the time they run,
+/// the entry point below has already checked, so their raise is a race guard
+/// rather than the reported condition.
+fn closed_selector_typed(ctx: &mut dyn NativeContext) -> MethodCallFailed {
+    if let Ok(Some(Value::Object(Some(exc)))) =
+        ctx.new_object_initialized("java/nio/channels/ClosedSelectorException", "()V", &[])
+    {
+        return MethodCallFailed::ExceptionThrown(exc);
+    }
+    closed_selector()
+}
+
 // ---------------------------------------------------------------------------
 // Public API — lifecycle
 // ---------------------------------------------------------------------------
@@ -588,12 +614,15 @@ pub fn selector_close(id: i32) {
 /// Wakeup a concurrently-blocked select.
 pub fn selector_wakeup(id: i32) -> Result<(), MethodCallFailed> {
     let regs = selectors().read();
+    // A closed or unknown selector is a NO-OP, matching jdk-25 — see
+    // `selector_wakeup_native` for the measurement and for what raising here
+    // cost (a `vertx.close()` that never completes).
     let Some(s) = regs.get(&id) else {
-        return Err(closed_selector());
+        return Ok(());
     };
     let mut st = s.lock();
     if !st.open {
-        return Err(closed_selector());
+        return Ok(());
     }
     st.woken = true;
     if sel_dbg_enabled() {
@@ -641,6 +670,57 @@ pub fn selector_wakeup(id: i32) -> Result<(), MethodCallFailed> {
 /// it's used to cross-match against `sk_table` rows in cancel /
 /// interest-op updates without dereferencing `key_obj` (which may have
 /// been relocated by the GC between registration and the next lookup).
+/// Re-point every live registration for `net_fd` at the channel's CURRENT
+/// socket.
+///
+/// Called after `DatagramChannel.bind()` swaps a channel's socket (see
+/// `FdTable::udp_rebind`). The registration keeps its `net_fd` key, its
+/// interest ops and its `SelectionKey` object — only the polled handle
+/// changes — so a `SelectionKey` netty is already holding stays valid and
+/// starts reporting readiness on the bound socket.
+///
+/// A channel with no registration (the ordinary `DatagramChannel.open();
+/// bind()` sequence) matches nothing and this is a no-op.
+pub fn selector_refresh_udp(net_fd: i32, fresh: &UdpSocket) {
+    let ids: Vec<i32> = {
+        let regs = selectors().read();
+        regs.iter()
+            .filter(|(_, s)| {
+                let st = s.lock();
+                st.open && st.keys.get(&net_fd).is_some_and(|k| !k.cancelled)
+            })
+            .map(|(id, _)| *id)
+            .collect()
+    };
+    for id in ids {
+        let previous = {
+            let regs = selectors().read();
+            regs.get(&id).and_then(|s| {
+                let st = s.lock();
+                st.keys
+                    .get(&net_fd)
+                    .map(|k| (k.interest_ops, k.key_obj, k.key_hash))
+            })
+        };
+        let Some((interest_ops, key_obj, key_hash)) = previous else {
+            continue;
+        };
+        let Ok(clone) = fresh.try_clone() else {
+            continue;
+        };
+        // Re-run the ordinary registration path rather than reaching into the
+        // state: it is what keeps the epoll set in step with the new fd.
+        let _ = selector_register(
+            id,
+            net_fd,
+            interest_ops,
+            key_obj,
+            key_hash,
+            Some(SelectableKind::Udp(clone)),
+        );
+    }
+}
+
 pub fn selector_register(
     id: i32,
     net_fd: i32,
@@ -2120,6 +2200,64 @@ fn selector_open_native(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodC
     Ok(Some(Value::Object(Some(obj))))
 }
 
+/// `Selector.provider()` — the ninth abstract on `java.nio.channels.Selector`,
+/// and until 2026-08-12 the only one of the nine with no native anywhere in the
+/// tree (docs/known-issues/jdk-only/W7-9-minted-interface-abstract-methods.md §6).
+///
+/// **The blocker W7-9 §8.2 recorded does not exist.** That section says the fix
+/// waits on a `NativeContext::invoke_static`, "which `native-api` does not
+/// have". `NativeContext::invoke(class, method, descriptor, args)` IS that
+/// method — it resolves by name and dispatches with no receiver — and
+/// `native-collections`' `drain_spliterator_via_real_iterator` has been calling
+/// the public static `java.util.Spliterators.iterator(Spliterator)` through it
+/// on the `--jdk-only` path all along. The record's grep was for the name, not
+/// for the capability.
+///
+/// It must answer the SAME provider the real JDK would, which is why this
+/// delegates rather than fabricating: `native-io/src/lib.rs` registers
+/// `openDatagramChannel` against the concrete `sun/nio/ch/SelectorProviderImpl`
+/// and `WEPollSelectorProvider` names, and `socket_channel.rs` registers the
+/// channel factories against the same three, so a fabricated carrier would miss
+/// every one of them. Returning `null` was the other option and is worse than
+/// the `AbstractMethodError` it replaces — `sel.provider().openSocketChannel()`
+/// becomes an NPE at a site that no longer names the cause (W3-7's shape). A
+/// genuine failure inside `SelectorProvider.provider()` therefore PROPAGATES;
+/// swallowing it to `null` would reintroduce exactly that.
+///
+/// Registered on `java/nio/channels/Selector` **and** `sun/nio/ch/SelectorImpl`,
+/// which is the established idiom for every other public `Selector` entry point
+/// in `register_nio_selector_real`, and it is load-bearing for two different
+/// receivers:
+///
+/// * class == `java/nio/channels/Selector` (the `servlet.rs` /
+///   `phases_late/net_channels.rs` synthetic mints): `provider()` is abstract
+///   there, so today the `!has_code` arm raises `AbstractMethodError`. This is
+///   the row W7-9 §6 asked for.
+/// * class == `sun/nio/ch/SelectorImpl` (what `selector_open_native` allocates,
+///   and therefore EVERY selector in a CratonVM process): the walk would find
+///   `AbstractSelector.provider()`'s real, `final` bytecode, which returns the
+///   `provider` field — and `selector_open_native` uses `new_object`, so no
+///   constructor ever set it. `Selector.open().provider()` answers **null**
+///   today, in Compatible mode as well as strict. That half is a live defect
+///   W7-9 did not see, because it reasoned about the abstract declaration and
+///   not about which class the mint actually wears.
+///
+/// The shadow that registering on `sun/nio/ch/SelectorImpl` implies (W7-9 §2's
+/// "registering a concrete method would be found by the walk on a real
+/// `WEPollSelectorImpl`") is bounded: `Selector.open()` and `openSelector()` on
+/// all three provider classes are intercepted above, so no real
+/// `WEPollSelectorImpl` is ever constructed here — and if one were, the default
+/// provider this returns is the same object its own `provider` field would hold,
+/// unless the application installed a custom `SelectorProvider`.
+fn selector_provider_native(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+    ctx.invoke(
+        "java/nio/channels/spi/SelectorProvider",
+        "provider",
+        "()Ljava/nio/channels/spi/SelectorProvider;",
+        &[],
+    )
+}
+
 /// `SelectorImpl.close0()` — release native state.
 fn selector_close_native(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let Some(Value::Object(Some(obj))) = args.first().copied() else {
@@ -2147,12 +2285,32 @@ fn selector_close_native(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
 }
 
 /// `SelectorImpl.wakeup0()` — no args beyond `this`.
+///
+/// **`wakeup()` on a CLOSED selector is a no-op, not an error.** Measured on
+/// jdk-25 (`SelectorWakeupProbe`): `Selector.open(); close(); wakeup()` returns
+/// normally, twice, while `selectNow()` and `keys()` on the same closed selector
+/// both raise `ClosedSelectorException`. The javadoc agrees — `wakeup()`
+/// declares no exception at all, and `AbstractSelector` deliberately keeps it
+/// safe after close so a shutdown path can wake a selector it is racing with.
+///
+/// Raising here instead cost a hang, not an error. Netty's
+/// `SingleThreadEventExecutor.shutdown0()` calls `wakeup()` on an event loop
+/// whose selector the loop thread may already have closed; the throw escaped
+/// through `NioIoHandler.wakeup` into
+/// `MultithreadEventExecutorGroup.shutdownGracefully`, which runs as a
+/// `DefaultPromise` LISTENER. A listener that throws is logged and DROPPED, so
+/// Vert.x's `VertxImpl$2.operationComplete` never finished shutting down the
+/// remaining event-loop groups and its close promise never completed —
+/// `vertx.close()` blocked forever. In the hibernate-reactive suite that
+/// surfaced as classes timing out in `RunTestOnContext.cleanUp`, one leaked
+/// Postgres container each, with the actual `IOException` swallowed by the
+/// logger delegate.
 fn selector_wakeup_native(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let Some(Value::Object(Some(obj))) = args.first().copied() else {
         return Ok(None);
     };
     if !open_flag(ctx, obj) {
-        return Err(closed_selector());
+        return Ok(None);
     }
     let id = selector_id_from_obj(ctx, obj);
     if id != 0 {
@@ -2263,7 +2421,7 @@ fn selector_select_native(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         return Ok(Some(Value::Int(0)));
     };
     if !open_flag(ctx, obj) {
-        return Err(closed_selector());
+        return Err(closed_selector_typed(ctx));
     }
     let timeout = match args.get(1) {
         Some(Value::Long(v)) => *v,
@@ -2398,7 +2556,7 @@ fn selector_select_now_native(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
         return Ok(Some(Value::Int(0)));
     };
     if !open_flag(ctx, obj) {
-        return Err(closed_selector());
+        return Err(closed_selector_typed(ctx));
     }
     let id = selector_id_from_obj(ctx, obj);
     if id == 0 {
@@ -3040,6 +3198,13 @@ fn selector_keys(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
     let Some(Value::Object(Some(obj))) = args.first().copied() else {
         return Ok(Some(Value::Object(None)));
     };
+    // Measured on jdk-25: `keys()` on a closed selector raises
+    // `ClosedSelectorException`. Answering an empty set instead reports "this
+    // selector has no registered channels", which is a legitimate state — so a
+    // caller draining keys after an unnoticed close saw a clean, wrong answer.
+    if !open_flag(ctx, obj) {
+        return Err(closed_selector_typed(ctx));
+    }
     let id = selector_id_from_obj(ctx, obj);
     let key_objs: Vec<ObjectRef> = if id == 0 {
         Vec::new()
@@ -3633,12 +3798,6 @@ pub fn register_nio_selector_real(r: &mut NativeMethodRegistry) {
         "()Ljava/nio/channels/Selector;",
         selector_open_native,
     );
-    r.register(
-        sel,
-        "open0",
-        "()Lsun/nio/ch/SelectorImpl;",
-        selector_open_native,
-    );
     // JDK 21+ on Windows defaults to `sun.nio.ch.WEPollSelectorProvider`, whose
     // `openSelector()` builds a `WEPollSelectorImpl` backed by the native
     // `sun.nio.ch.WEPoll` (a wepoll/epoll-emulation layer) that CratonVM does
@@ -3664,18 +3823,8 @@ pub fn register_nio_selector_real(r: &mut NativeMethodRegistry) {
             selector_open_native,
         );
     }
-    r.register(sel, "close0", "()V", selector_close_native);
-    r.register(sel, "wakeup0", "()V", selector_wakeup_native);
-    r.register(sel, "select0", "(J)I", selector_select_native);
-    r.register(sel, "selectNow0", "()I", selector_select_now_native);
 
     // SelectableChannel.register.
-    r.register(
-        "java/nio/channels/SelectableChannel",
-        "register0",
-        "(Ljava/nio/channels/Selector;ILjava/lang/Object;)Ljava/nio/channels/SelectionKey;",
-        channel_register_native,
-    );
     r.register(
         "java/nio/channels/SelectableChannel",
         "register",
@@ -3725,8 +3874,6 @@ pub fn register_nio_selector_real(r: &mut NativeMethodRegistry) {
 
     // SelectionKeyImpl.
     let ski = "sun/nio/ch/SelectionKeyImpl";
-    r.register(ski, "interestOps0", "(I)V", key_set_interest_ops_native);
-    r.register(ski, "cancel0", "()V", key_cancel_native);
 
     // SelectionKey accessors. The real-JDK abstract methods on
     // java.nio.channels.SelectionKey have no Code attribute, and the
@@ -3790,6 +3937,17 @@ pub fn register_nio_selector_real(r: &mut NativeMethodRegistry) {
         );
         r.register(c, "close", "()V", selector_close_native);
         r.register(c, "isOpen", "()Z", selector_is_open_native);
+        // W7-9 §6 / §8.2 — the ninth abstract. See `selector_provider_native`
+        // for why this delegates to the real static factory, why the §8.2
+        // blocker ("no `NativeContext::invoke_static`") was a false negative,
+        // and why the `sun/nio/ch/SelectorImpl` half is the live defect rather
+        // than the `java/nio/channels/Selector` half.
+        r.register(
+            c,
+            "provider",
+            "()Ljava/nio/channels/spi/SelectorProvider;",
+            selector_provider_native,
+        );
         // SelectorImpl.lockAndDoSelect bypass: route directly to our select.
         r.register(
             c,
@@ -3864,12 +4022,6 @@ pub fn register_nio_selector_real(r: &mut NativeMethodRegistry) {
         epoll_data_offset_native,
         NativeKind::Bridge,
     );
-    r.register(
-        "sun/nio/ch/EPoll",
-        "epollCreate",
-        "()I",
-        epoll_create_native,
-    );
     r.register_with_kind(
         "sun/nio/ch/EPoll",
         "create",
@@ -3877,19 +4029,12 @@ pub fn register_nio_selector_real(r: &mut NativeMethodRegistry) {
         epoll_create_native,
         NativeKind::Bridge,
     );
-    r.register("sun/nio/ch/EPoll", "epollCtl", "(IIII)I", epoll_ctl_native);
     r.register_with_kind(
         "sun/nio/ch/EPoll",
         "ctl",
         "(IIII)I",
         epoll_ctl_native,
         NativeKind::Bridge,
-    );
-    r.register(
-        "sun/nio/ch/EPoll",
-        "epollWait",
-        "(IJII)I",
-        epoll_wait_native,
     );
     r.register_with_kind(
         "sun/nio/ch/EPoll",

@@ -196,6 +196,22 @@ types evaluated are `dNSName`, `rfc822Name`, `uniformResourceIdentifier` (host),
 byte-exact per RDN (no attribute-value string normalisation); and CRL revocation
 checking remains gated off by default.
 
+### Resolved native-crash classes
+
+The historical real-`RandomAccessFile` JIT crash was not evidence that real JDK
+bytecode is inherently unsafe. It exposed two VM defect classes, both of which
+now carry targeted regression coverage:
+
+1. JIT/native transitions that did not consistently publish every live object
+   reference to the collector.
+2. Cached compiled call targets that could survive a class or redefinition
+   state change which invalidated their assumptions.
+
+Real `RandomAccessFile` is the default path; `CRATONVM_SYNTHETIC_RAF=1` exists
+only as a diagnostic compatibility fallback. A new native crash belongs in
+`docs/known-issues/` with a minimal reproducer — do not reopen this historical
+umbrella without evidence that one of the two mechanisms above has regressed.
+
 ## Limitations / what's not done
 
 - **No formal audit.** Nothing here has been independently security-reviewed.

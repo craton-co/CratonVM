@@ -557,13 +557,19 @@ const CHECKPOINT_TYPE_ID: u64 = 1;
 ///     external tools cannot parse this metadata block, so they cannot render
 ///     typed event/field views from our files.
 ///
-/// FOLLOW-UP (not done here — large, separate task): implement a real
-/// stock-JFR metadata writer (binary element tree + constant-pool string
-/// references) so the produced files are JMC/`jfr`-loadable. That is a pure
-/// format-fidelity upgrade; it does not change which events are captured. The
-/// internal-recorder use case this crate serves does not require it, which is
-/// why the simplified encoding is retained for now. Any such change MUST keep
-/// the in-crate round-trip tests green (or migrate the reader in lockstep).
+/// FOLLOW-UP — **DONE 2026-08-13, as a second writer rather than a rewrite.**
+/// [`crate::jdk_chunk`] emits the stock format (binary element-tree metadata,
+/// 68-byte header, unsigned-LEB128 integers) and every operator-visible dump
+/// now goes through it: `FlightRecorder::dump_recording` — the single path
+/// behind `jdk.jfr.Recording.dump`, the `JFR.dump` jcmd and the CLI's
+/// exit-time dump — and `phase::write_jfr_report`. Verified against the JDK's
+/// own `RecordingFile`, `jfr summary` and `jfr print`.
+///
+/// This writer was NOT migrated, because it is one half of a matching pair with
+/// [`read_events`] and the fuzz target, and nothing in production writes it any
+/// more. **Do not add a new production writer here**: a `.jfr` an operator or an
+/// external tool will open belongs in `jdk_chunk`. If this format's remaining
+/// in-crate round trip is ever retired, delete the pair together.
 /// ========================================================================
 ///
 /// LIMITATION (S2, 2026-06-10): the per-type `has_stacktrace` flag is written

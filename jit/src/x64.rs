@@ -446,6 +446,12 @@ struct Compiler {
     /// as [`Self::emitted_alloc_oom_check`]); without the dispatch-aware
     /// entry the helper silently degrades to the legacy null-return.
     emitted_checkcast_throw: bool,
+    /// Set when an `aastore` site emitted the element-type check call.
+    /// `jit_aastore_type_check` builds the `ArrayStoreException` through the
+    /// JIT_THREAD TLS and bails with the `i64::MIN` sentinel, so the method
+    /// must be entered through the dispatch-aware path — same requirement,
+    /// and the same reason, as `emitted_checkcast_throw`.
+    emitted_aastore_throw: bool,
     /// Forward branch patches: (native offset of rel32, target bytecode PC).
     forward_patches: Vec<(usize, usize)>,
     /// Jump table patches: (native offset of i32 entry, table_base_native_offset, target bytecode PC).
@@ -691,6 +697,17 @@ struct Compiler {
     ldc_class_info: Vec<(usize, u32, u16)>,
     /// Resolved ldc2_w constants: (bytecode_pc, i64 value).
     ldc2w_info: Vec<(usize, i64)>,
+    /// `ldc`-family pcs whose constant is floating-point — `CONSTANT_Float` for
+    /// `ldc`/`ldc_w`, `CONSTANT_Double` for `ldc2_w`.
+    ///
+    /// `ldc_info`/`ldc2w_info` carry only the bits, because the codegen that
+    /// consumes them lets the CONSUMING opcode pick the width. The deopt
+    /// operand-stack snapshot has no consuming opcode to ask, so it needs the
+    /// constant-pool tag the resolver already read; without it `x64::stack_kinds`
+    /// answered `Unknown` for every numeric `ldc`, the snapshot recorded
+    /// `Unsupported`, and `osr_exit_policy` then refused OSR entry for the whole
+    /// artifact. See `osr-refused-for-a-loop-inline-in-main-20260810`.
+    ldc_fp_pcs: FxHashSet<usize>,
     /// Runtime helper function pointers for JIT callbacks.
     helpers: JitRuntimeHelpers,
     /// Expected simulated-stack depth at each forward branch target.
@@ -939,6 +956,16 @@ struct Compiler {
     /// `call jit_frame_record`. Cached from `inline_rbp_tls_disp()` at
     /// construction so codegen reads it once.
     inline_rbp_tls_disp: usize,
+    /// Segment-relative displacement of the compile-id mirror — the identity
+    /// half of the frame record, written beside `inline_rbp_tls_disp` so the GC
+    /// can name the method owning the innermost RBP without decoding the call
+    /// that created the frame. 0 when unavailable → nothing is published and
+    /// the scan keeps its old decode path.
+    inline_cm_tls_disp: usize,
+    /// This compilation's identity, reserved BEFORE codegen because the
+    /// immediate must be encoded into the prologue while the `CompiledMethod`
+    /// that will own it does not exist yet. 0 → publish nothing.
+    compile_id: u32,
     /// Step 1 debug self-check (`CRATONVM_DBG_VERIFY_INLINE_FRAME_RECORD`) —
     /// when set AND inline frame-record is active, also emit the verify call.
     verify_inline_frame_record: bool,
@@ -1900,6 +1927,19 @@ impl Compiler {
         } else {
             0
         };
+        // Identity is only publishable where the RBP mirror is: the pair is
+        // what makes `(rbp, id)` describe one frame. Reserve the id here, at
+        // the start of this compilation, so the prologue can encode it.
+        let inline_cm_tls_disp = if inline_rbp_tls_disp != 0 {
+            crate::x64::inline_cm_tls_disp()
+        } else {
+            0
+        };
+        let compile_id = if inline_cm_tls_disp != 0 {
+            crate::reserve_compile_id()
+        } else {
+            0
+        };
         let verify_inline_frame_record = verify_inline_frame_record_enabled();
         let shadow_enabled = shadow_stack_maps_enabled();
         // SB-CRASH-04 (register-invisibility): blind-spill used callee-saved
@@ -2256,6 +2296,7 @@ impl Compiler {
             synthetic_guard_span: None,
             emitted_alloc_oom_check: false,
             emitted_checkcast_throw: false,
+            emitted_aastore_throw: false,
             forward_patches: Vec::new(),
             jump_table_patches: Vec::new(),
             self_call_patches: Vec::new(),
@@ -2305,6 +2346,7 @@ impl Compiler {
             ldc_string_info: Vec::new(),
             ldc_class_info: Vec::new(),
             ldc2w_info: Vec::new(),
+            ldc_fp_pcs: FxHashSet::default(),
             branch_target_stack_depth: FxHashMap::default(),
             branch_target_stack_oop_marks: FxHashMap::default(),
             failed: false,
@@ -2345,6 +2387,8 @@ impl Compiler {
             slot_mirror_suppressed: false,
             precise_maps,
             inline_rbp_tls_disp,
+            inline_cm_tls_disp,
+            compile_id,
             verify_inline_frame_record,
             sp_id_slot_off,
             safepoint_reg_spill,

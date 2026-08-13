@@ -174,7 +174,7 @@ fn native_inflater_input_stream_init(
         }
     };
     if ctx
-        .class_name_of_id(ctx.class_id_of_object(source))
+        .class_name_arc_of_id(ctx.class_id_of_object(source))
         .as_deref()
         != Some("java/io/ByteArrayInputStream")
     {
@@ -514,7 +514,7 @@ pub(crate) fn register_p58_gzip_streams(r: &mut NativeMethodRegistry) {
             // the one that is actually read. A 2-field entry left
             // `getCompressedSize()`/`getCrc()` reading past the object, and
             // `getSize()` returning an `Int` from a `()J` accessor.
-            let ze = alloc_concurrent_synthetic(ctx, "java/util/zip/ZipEntry", 4);
+            let ze = try_alloc_concurrent_synthetic(ctx, "java/util/zip/ZipEntry", 4)?;
             let name_val = read_pinned_object_value(ctx, name_pin, name_val);
             let this = ctx.read_native_pin(this_pin, this);
             if let Some((h, _)) = name_pin {
@@ -596,8 +596,14 @@ pub(crate) fn register_p58_gzip_streams(r: &mut NativeMethodRegistry) {
         // The wrapped stream is `in` (this is an INPUT stream); the previous
         // `get_field_by_name(this, "out")` never resolved on any layout, so the
         // propagation documented above silently never happened.
+        //
+        // …and the propagation is a real propagation: every link on that
+        // chain (`ZipInputStream.close` → `InflaterInputStream.close` →
+        // `FilterInputStream.close` → `in.close()`) declares
+        // `throws IOException` and catches nothing, so a failed close comes
+        // OUT. W7-57-close-flush-swallow-sweep.md
         if let Some(underlying) = iis_underlying(ctx, this) {
-            let _ = ctx.invoke_virtual(underlying, "close", "()V", &[]);
+            ctx.invoke_virtual(underlying, "close", "()V", &[])?;
         }
         ctx.set_field(this, 1, Value::Object(None));
         ctx.set_field(this, 2, Value::Object(None));
@@ -684,7 +690,7 @@ pub(crate) fn register_p58_gzip_streams(r: &mut NativeMethodRegistry) {
     r.register(zo, "write", "([BII)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
         if !zo_real_fast_active(ctx, this) {
-            return ctx.invoke_virtual_bytecode_only(this, "write", "([BII)V", &args[1..]);
+            return Ok(ctx.invoke_virtual_bytecode_only(this, "write", "([BII)V", &args[1..])?);
         }
         if let Some(Value::Object(Some(src))) = args.get(1) {
             // Validate signed off/len against the array length BEFORE casting to
@@ -725,7 +731,7 @@ pub(crate) fn register_p58_gzip_streams(r: &mut NativeMethodRegistry) {
     r.register(zo, "write", "(I)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
         if !zo_real_fast_active(ctx, this) {
-            return ctx.invoke_virtual_bytecode_only(this, "write", "(I)V", &args[1..]);
+            return Ok(ctx.invoke_virtual_bytecode_only(this, "write", "(I)V", &args[1..])?);
         }
         let b = args.get(1).and_then(|v| v.as_int()).unwrap_or(0) as u8;
         if let Some(state) = zo_real_fast_state(ctx, this) {
@@ -736,7 +742,7 @@ pub(crate) fn register_p58_gzip_streams(r: &mut NativeMethodRegistry) {
     r.register(zo, "write", "([B)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
         if !zo_real_fast_active(ctx, this) {
-            return ctx.invoke_virtual_bytecode_only(this, "write", "([B)V", &args[1..]);
+            return Ok(ctx.invoke_virtual_bytecode_only(this, "write", "([B)V", &args[1..])?);
         }
         if let Some(Value::Object(Some(src))) = args.get(1) {
             let len = ctx.array_length(*src);
@@ -755,7 +761,7 @@ pub(crate) fn register_p58_gzip_streams(r: &mut NativeMethodRegistry) {
     r.register(zo, "closeEntry", "()V", |ctx, args| {
         let this = obj_arg(args, 0)?;
         if !zo_real_fast_active(ctx, this) {
-            return ctx.invoke_virtual_bytecode_only(this, "closeEntry", "()V", &[]);
+            return Ok(ctx.invoke_virtual_bytecode_only(this, "closeEntry", "()V", &[])?);
         }
         zo_finalize_current_entry(ctx, this);
         Ok(None)
@@ -763,7 +769,7 @@ pub(crate) fn register_p58_gzip_streams(r: &mut NativeMethodRegistry) {
     r.register(zo, "finish", "()V", |ctx, args| {
         let this = obj_arg(args, 0)?;
         if !zo_real_fast_active(ctx, this) {
-            return ctx.invoke_virtual_bytecode_only(this, "finish", "()V", &[]);
+            return Ok(ctx.invoke_virtual_bytecode_only(this, "finish", "()V", &[])?);
         }
         // Finalize any open entry
         zo_finalize_current_entry(ctx, this);
@@ -774,16 +780,29 @@ pub(crate) fn register_p58_gzip_streams(r: &mut NativeMethodRegistry) {
     r.register(zo, "close", "()V", |ctx, args| {
         let this = obj_arg(args, 0)?;
         if !zo_real_fast_active(ctx, this) {
-            return ctx.invoke_virtual_bytecode_only(this, "close", "()V", &[]);
+            return Ok(ctx.invoke_virtual_bytecode_only(this, "close", "()V", &[])?);
         }
         zo_finalize_current_entry(ctx, this);
         zo_write_zip(ctx, this)?;
-        if let Some(underlying) = dos_underlying(ctx, this) {
-            let _ = ctx.invoke_virtual(underlying, "close", "()V", &[]);
-        }
+        // `ZipOutputStream.close()` is `super.close()` =
+        // `DeflaterOutputStream.close()`, whose `finally` ends in a bare
+        // `out.close()` under `throws IOException`. Nothing catches, so the
+        // delegated failure PROPAGATES — and this is the site where dropping
+        // it costs the most: the whole archive has just been written into the
+        // sink and only `close()` can report that it did not land.
+        // W7-57-close-flush-swallow-sweep.md
+        //
+        // The per-stream state drop runs either way (our own bookkeeping,
+        // keyed by a recyclable address), then the failure is reported.
+        let closed = if let Some(underlying) = dos_underlying(ctx, this) {
+            ctx.invoke_virtual(underlying, "close", "()V", &[]).map(|_| ())
+        } else {
+            Ok(())
+        };
         let key = zo_buf_key(ctx, this);
         zo_real_states().lock().unwrap().remove(&key);
         zo_forget_fast_thread_cache(key);
+        closed?;
         Ok(None)
     });
 
@@ -903,14 +922,26 @@ pub(crate) fn register_p58_gzip_streams(r: &mut NativeMethodRegistry) {
                 }
             }
             let this = ctx.read_native_pin(this_pin, this);
-            if let Value::Object(Some(underlying)) = ctx.get_field_by_name(this, "in") {
-                let _ = ctx.invoke_virtual(underlying, "close", "()V", &[]);
-            }
+            // `InflaterInputStream.close()` is `if (!closed) { if
+            // (usesDefaultInflater) inf.end(); in.close(); closed = true; }`
+            // under `throws IOException` with no `catch`, so the delegated
+            // close PROPAGATES. Reported after the pin is released and the
+            // side tables are dropped — those are our own bookkeeping and
+            // leaving an entry on a recyclable address is its own defect.
+            // W7-57-close-flush-swallow-sweep.md
+            let closed = if let Value::Object(Some(underlying)) =
+                ctx.get_field_by_name(this, "in")
+            {
+                ctx.invoke_virtual(underlying, "close", "()V", &[]).map(|_| ())
+            } else {
+                Ok(())
+            };
             inflater_fast_states()
                 .lock()
                 .unwrap()
                 .remove(&zo_buf_key(ctx, this));
             ctx.unpin_native_roots(this_pin);
+            closed?;
             Ok(None)
         },
     );
@@ -930,6 +961,7 @@ pub(crate) fn register_p58_gzip_streams(r: &mut NativeMethodRegistry) {
     r.register(dos, "flush", "()V", dos_flush);
     r.register(dos, "close", "()V", dos_close);
     r.set_category(__prev_cat);
+    ()
 }
 
 /// Register the bulk stream-transfer helper used by Spring's `StreamUtils`.
@@ -1504,7 +1536,7 @@ fn native_input_stream_transfer_to(
     );
     if byte_array_stream_layout
         && ctx
-            .class_name_of_id(ctx.class_id_of_object(output))
+            .class_name_arc_of_id(ctx.class_id_of_object(output))
             .as_deref()
             == Some("java/io/OutputStream$1")
     {
@@ -1597,7 +1629,29 @@ fn try_direct_file_to_stored_zip_output(
     let Value::Object(Some(entry)) = ctx.get_field_by_name(current, "entry") else {
         return Ok(None);
     };
-    if !matches!(ctx.get_field_by_name(entry, "method"), Value::Int(0)) {
+    // Take the raw-copy path ONLY on a positively-identified STORED entry.
+    // `ZipEntry.method` is `int` (javap: `int method`, JDK-initialized to -1
+    // until `setMethod`/the read path assigns it); `ZipEntry.STORED` is 0, so
+    // `Some(0)` is the only value for which copying the input bytes through
+    // verbatim -- no deflate -- reproduces what the JDK `ZipOutputStream.write`
+    // would have appended.
+    //
+    // The previous form was `!matches!(ctx.get_field_by_name(entry, "method"),
+    // Value::Int(0))`. Production and `MockNativeContext` disagree about the
+    // absent case and take OPPOSITE arms through it: production's by-name read
+    // answers `Object(None)` for an unresolvable name (vm_exec.rs:10613-10623),
+    // which does not match `Int(0)`, so production bailed out to the general
+    // virtual-dispatch path -- the SAFE arm, but only by accident. The mock
+    // answers `Int(0)`, so under test the guard fell THROUGH into the raw copy
+    // and a DEFLATED-or-unknown entry would have been written as stored bytes,
+    // corrupting the archive. A test of this fast path was therefore proving
+    // nothing about production. `int_field_strict` reads by resolved slot and
+    // yields `None` for absent/out-of-range/wrong-tag, so both agree on the
+    // safe arm and the test can actually exercise it.
+    if !matches!(
+        crate::field_read::int_field_strict(ctx, entry, "method"),
+        Some(0)
+    ) {
         return Ok(None);
     }
     let Value::Object(Some(underlying)) = ctx.get_field_by_name(output, "out") else {
@@ -2835,10 +2889,14 @@ pub(crate) fn dos_finish(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
 /// `flush()` deflates pending input only for a `syncFlush` stream; the
 /// public constructors leave that false, so the spec-correct behaviour is to
 /// flush the sink and leave the deflater buffer alone.
+///
+/// `DeflaterOutputStream.flush()` ends in a bare `out.flush()` under
+/// `throws IOException` with no `catch`, so the delegated failure PROPAGATES.
+/// W7-57-close-flush-swallow-sweep.md
 pub(crate) fn dos_flush(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     if let Some(underlying) = dos_underlying(ctx, this) {
-        let _ = ctx.invoke_virtual(underlying, "flush", "()V", &[]);
+        ctx.invoke_virtual(underlying, "flush", "()V", &[])?;
     }
     Ok(None)
 }
@@ -2853,10 +2911,17 @@ pub(crate) fn dos_close(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .remove(&key);
-    if let Some(underlying) = dos_underlying(ctx, this) {
-        let _ = ctx.invoke_virtual(underlying, "close", "()V", &[]);
-    }
+    // `DeflaterOutputStream.close()` runs `out.close()` in its `finally` under
+    // `throws IOException` and catches nothing (its only `catch (IOException)`
+    // is around `finish()`, and it rethrows). The delegated failure
+    // PROPAGATES. W7-57-close-flush-swallow-sweep.md
+    let closed = if let Some(underlying) = dos_underlying(ctx, this) {
+        ctx.invoke_virtual(underlying, "close", "()V", &[]).map(|_| ())
+    } else {
+        Ok(())
+    };
     ctx.unpin_native_roots(this_pin);
+    closed?;
     Ok(None)
 }
 
@@ -2981,8 +3046,12 @@ pub(crate) fn p58_gzip_out_flush(ctx: &mut dyn NativeContext, args: &[Value]) ->
     if is_real_layout(ctx, this, "crc") {
         return ctx.invoke_virtual_bytecode_only(this, "flush", "()V", &[]);
     }
+    // `GZIPOutputStream` does not declare `flush()`, so it inherits
+    // `DeflaterOutputStream.flush()` — a bare `out.flush()` under
+    // `throws IOException` with no `catch`. The delegated failure PROPAGATES.
+    // W7-57-close-flush-swallow-sweep.md
     if let Some(underlying) = dos_underlying(ctx, this) {
-        let _ = ctx.invoke_virtual(underlying, "flush", "()V", &[]);
+        ctx.invoke_virtual(underlying, "flush", "()V", &[])?;
     }
     Ok(None)
 }
@@ -3002,10 +3071,21 @@ pub(crate) fn p58_gzip_out_close(ctx: &mut dyn NativeContext, args: &[Value]) ->
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .remove(&key);
-    if let Some(underlying) = dos_underlying(ctx, this) {
-        let _ = ctx.invoke_virtual(underlying, "close", "()V", &[]);
-    }
+    // `GZIPOutputStream` inherits `DeflaterOutputStream.close()`: `finish()` in
+    // a `try`, `out.close()` in the `finally`, nothing caught that is not
+    // rethrown. The delegated close PROPAGATES.
+    //
+    // Precedence follows the JDK: when both fail, the JDK's `finally` throws
+    // the CLOSE exception with the finish exception attached as suppressed, so
+    // the close is reported here too. (We do not reproduce the `addSuppressed`
+    // link — recorded as a residual in W7-57-close-flush-swallow-sweep.md.)
+    let closed = if let Some(underlying) = dos_underlying(ctx, this) {
+        ctx.invoke_virtual(underlying, "close", "()V", &[]).map(|_| ())
+    } else {
+        Ok(())
+    };
     ctx.unpin_native_roots(this_pin);
+    closed?;
     finish?;
     Ok(None)
 }
@@ -3065,6 +3145,7 @@ pub(crate) fn register_p62_zip_entry(r: &mut NativeMethodRegistry) {
         Ok(Some(ctx.get_field(this, 0)))
     });
     r.set_category(__prev_cat);
+    ()
 }
 
 // =============================================================================
@@ -3852,8 +3933,8 @@ fn zip_entry_alloc(
     size: i64,
     csize: i64,
     crc: i64,
-) -> ObjectRef {
-    let ze = alloc_concurrent_synthetic(ctx, "java/util/zip/ZipEntry", 4);
+) -> Result<ObjectRef, MethodCallFailed> {
+    let ze = try_alloc_concurrent_synthetic(ctx, "java/util/zip/ZipEntry", 4)?;
     // Pin across `create_string` — a moving young GC there would relocate the
     // fresh entry (native stale-local family).
     let ze_pin = ctx.pin_native_root(ze);
@@ -3864,7 +3945,7 @@ fn zip_entry_alloc(
     ctx.set_field(ze, 2, Value::Long(csize));
     ctx.set_field(ze, 3, Value::Long(crc));
     ctx.unpin_native_roots(ze_pin);
-    ze
+    Ok(ze)
 }
 
 pub(crate) fn register_p71_zip_extras(r: &mut NativeMethodRegistry) {
@@ -3985,7 +4066,7 @@ pub(crate) fn register_p71_zip_extras(r: &mut NativeMethodRegistry) {
             match found {
                 Some((n, size, csize, crc)) => Ok(Some(Value::Object(Some(zip_entry_alloc(
                     ctx, &n, size, csize, crc,
-                ))))),
+                )?)))),
                 None => Ok(Some(Value::Object(None))),
             }
         },
@@ -4012,7 +4093,7 @@ pub(crate) fn register_p71_zip_extras(r: &mut NativeMethodRegistry) {
         // young GC there would relocate the array (native stale-local family).
         let arr_pin = ctx.pin_native_root(arr);
         for (i, (n, size, csize, crc)) in metas.iter().enumerate() {
-            let ze = zip_entry_alloc(ctx, n, *size, *csize, *crc);
+            let ze = zip_entry_alloc(ctx, n, *size, *csize, *crc)?;
             let arr = ctx.read_native_pin(arr_pin, arr);
             ctx.set_array_element(arr, i, Value::Object(Some(ze)));
         }
@@ -4192,4 +4273,5 @@ pub(crate) fn register_p71_zip_extras(r: &mut NativeMethodRegistry) {
         Ok(None)
     });
     r.set_category(__prev_cat);
+    ()
 }

@@ -88,15 +88,39 @@ fn java_home() -> Option<PathBuf> {
     None
 }
 
+/// True when `class_file` exists and is at least as new as `src`.
+///
+/// A `.class` older than its `.java` is a standing trap here: reusing it means
+/// the run exercises a stale fixture, so a landed source change shows up in no
+/// log. When the mtimes cannot prove freshness, recompile.
+fn up_to_date(class_file: &Path, src: &Path) -> bool {
+    let (Ok(c), Ok(s)) = (class_file.metadata(), src.metadata()) else {
+        return false;
+    };
+    match (c.modified(), s.modified()) {
+        (Ok(c), Ok(s)) => c >= s,
+        // No mtime on this filesystem: recompile rather than trust a stale class.
+        _ => false,
+    }
+}
+
 fn ensure_chm_scale_compiled() -> bool {
     let dir = chm_basic_dir();
     let class_file = dir.join("ChmScale.class");
-    if class_file.exists() {
-        return true;
-    }
     let source = dir.join("ChmScale.java");
     if !source.exists() {
+        // A missing fixture is a broken checkout, not an absent toolchain. Report
+        // it loudly, and fail under CRATONVM_REQUIRE_E2E — see
+        // `common::require_fixture`.
+        let _ = common::require_fixture(
+            "wave2_chm",
+            "the Wave 2 CHM fixture `ChmScale.java`",
+            &[source.clone()],
+        );
         return false;
+    }
+    if up_to_date(&class_file, &source) {
+        return true;
     }
     let compile = Command::new("javac")
         .arg("--release")

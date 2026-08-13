@@ -59,7 +59,7 @@ use cratonvm_types::{ObjectRef, Value};
 use parking_lot::RwLock;
 
 use crate::jboss_msc::{alloc_java_service_name, global_container, Mode, ServiceName};
-use crate::{alloc_concurrent_synthetic, obj_arg};
+use crate::{try_alloc_concurrent_synthetic, obj_arg};
 
 // ===========================================================================
 // JNDI-name types + allowlist
@@ -526,40 +526,40 @@ const BIND_INFO_NUM_SLOTS: usize = 4;
 /// correctly. The detail message is written through `detailMessage` by name
 /// (real-JDK `Throwable` layout) with a slot-1 fallback for the
 /// synthetic-stub layout.
-fn throw_naming(ctx: &mut dyn NativeContext, exc_class: &str, msg: &str) -> MethodCallFailed {
+fn throw_naming(ctx: &mut dyn NativeContext, exc_class: &str, msg: &str) -> Result<MethodCallFailed, MethodCallFailed> {
     // `NamingException` and subclasses extend `Throwable` (message, cause,
     // and JNDI-specific `resolvedName` / `remainingName` / `rootException`
     // / `resolvedObj`). Reserve a generous slot count; the real class load
     // will pad to its true field count anyway.
-    let exc = alloc_concurrent_synthetic(ctx, exc_class, 6);
+    let exc = try_alloc_concurrent_synthetic(ctx, exc_class, 6)?;
     let msg_str = ctx.create_string(msg);
     // Real-JDK Throwable stores the message in `detailMessage`. Writing by
     // name resolves the slot through the class hierarchy.
     ctx.set_field_by_name(exc, "detailMessage", Value::Object(Some(msg_str)));
-    MethodCallFailed::ExceptionThrown(exc)
+    Ok(MethodCallFailed::ExceptionThrown(exc))
 }
 
-fn throw_name_not_found(ctx: &mut dyn NativeContext, msg: &str) -> MethodCallFailed {
-    throw_naming(ctx, "javax/naming/NameNotFoundException", msg)
+fn throw_name_not_found(ctx: &mut dyn NativeContext, msg: &str) -> Result<MethodCallFailed, MethodCallFailed> {
+    Ok(throw_naming(ctx, "javax/naming/NameNotFoundException", msg)?)
 }
 
-fn throw_no_initial_context(ctx: &mut dyn NativeContext, msg: &str) -> MethodCallFailed {
-    throw_naming(ctx, "javax/naming/NoInitialContextException", msg)
+fn throw_no_initial_context(ctx: &mut dyn NativeContext, msg: &str) -> Result<MethodCallFailed, MethodCallFailed> {
+    Ok(throw_naming(ctx, "javax/naming/NoInitialContextException", msg)?)
 }
 
-fn throw_naming_exception(ctx: &mut dyn NativeContext, msg: &str) -> MethodCallFailed {
-    throw_naming(ctx, "javax/naming/NamingException", msg)
+fn throw_naming_exception(ctx: &mut dyn NativeContext, msg: &str) -> Result<MethodCallFailed, MethodCallFailed> {
+    Ok(throw_naming(ctx, "javax/naming/NamingException", msg)?)
 }
 
-fn throw_invalid_name(ctx: &mut dyn NativeContext, msg: &str) -> MethodCallFailed {
-    throw_naming(ctx, "javax/naming/InvalidNameException", msg)
+fn throw_invalid_name(ctx: &mut dyn NativeContext, msg: &str) -> Result<MethodCallFailed, MethodCallFailed> {
+    Ok(throw_naming(ctx, "javax/naming/InvalidNameException", msg)?)
 }
 
 /// Map a `Result<_, String>` error message from the flat-store helpers
 /// (`lookup_value`, `bind_value`, …) onto the matching catchable
 /// `javax.naming.*` exception, keying off the message prefix the helper
 /// produced.
-fn flat_store_error(ctx: &mut dyn NativeContext, msg: &str) -> MethodCallFailed {
+fn flat_store_error(ctx: &mut dyn NativeContext, msg: &str) -> Result<MethodCallFailed, MethodCallFailed> {
     if msg.starts_with("InvalidNameException") {
         throw_invalid_name(ctx, msg)
     } else if msg.starts_with("NameNotFoundException") {
@@ -818,7 +818,7 @@ fn native_initial_context_get_environment(
             return Err(throw_no_initial_context(
                 ctx,
                 "Need to specify class name in environment or system property: java.naming.factory.initial",
-            ))
+            )?)
         }
     };
     let env = environment_with_property(ctx, incoming, "java.naming.factory.initial", &factory);
@@ -1039,7 +1039,7 @@ fn native_context_lookup(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     let this = obj_arg(args, 0)?;
     let name = match read_string_arg(ctx, args, 1) {
         Some(n) => n,
-        None => return Err(throw_invalid_name(ctx, "null name")),
+        None => return Err(throw_invalid_name(ctx, "null name")?),
     };
     do_context_lookup(ctx, this, &name)
 }
@@ -1065,7 +1065,7 @@ fn native_context_lookup_name(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
     let this = obj_arg(args, 0)?;
     let name = match name_arg_to_string(ctx, args, 1)? {
         Some(n) => n,
-        None => return Err(throw_invalid_name(ctx, "null name")),
+        None => return Err(throw_invalid_name(ctx, "null name")?),
     };
     do_context_lookup(ctx, this, &name)
 }
@@ -1134,9 +1134,9 @@ fn do_context_lookup(ctx: &mut dyn NativeContext, this: ObjectRef, name: &str) -
             Err(throw_no_initial_context(
                 ctx,
                 "Need to specify class name in environment or system property: java.naming.factory.initial",
-            ))
+            )?)
         }
-        Err(msg) => Err(flat_store_error(ctx, &msg)),
+        Err(msg) => Err(flat_store_error(ctx, &msg)?),
     }
 }
 
@@ -1163,7 +1163,7 @@ fn native_context_bind(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     let this = obj_arg(args, 0)?;
     let name = match read_string_arg(ctx, args, 1) {
         Some(n) => n,
-        None => return Err(throw_invalid_name(ctx, "null name")),
+        None => return Err(throw_invalid_name(ctx, "null name")?),
     };
     let value = match args.get(2).copied() {
         Some(Value::Object(Some(o))) => o,
@@ -1171,7 +1171,7 @@ fn native_context_bind(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
             return Err(throw_naming_exception(
                 ctx,
                 "bind: null value not supported",
-            ))
+            )?)
         }
     };
 
@@ -1237,7 +1237,7 @@ fn native_context_bind(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         .class_name_of_id(ctx.class_id_of_object(value))
         .unwrap_or_else(|| "java/lang/Object".to_string());
     let result = if let Err(msg) = bind_value(&name, &class_name, value) {
-        Err(flat_store_error(ctx, &msg))
+        Err(flat_store_error(ctx, &msg)?)
     } else {
         Ok(None)
     };
@@ -1249,7 +1249,7 @@ fn native_context_rebind(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     let this = obj_arg(args, 0)?;
     let name = match read_string_arg(ctx, args, 1) {
         Some(n) => n,
-        None => return Err(throw_invalid_name(ctx, "null name")),
+        None => return Err(throw_invalid_name(ctx, "null name")?),
     };
     let value = match args.get(2).copied() {
         Some(Value::Object(Some(o))) => o,
@@ -1257,7 +1257,7 @@ fn native_context_rebind(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
             return Err(throw_naming_exception(
                 ctx,
                 "rebind: null value not supported",
-            ))
+            )?)
         }
     };
 
@@ -1312,7 +1312,7 @@ fn native_context_rebind(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         .class_name_of_id(ctx.class_id_of_object(value))
         .unwrap_or_else(|| "java/lang/Object".to_string());
     let result = if let Err(msg) = rebind_value(&name, &class_name, value) {
-        Err(flat_store_error(ctx, &msg))
+        Err(flat_store_error(ctx, &msg)?)
     } else {
         Ok(None)
     };
@@ -1324,7 +1324,7 @@ fn native_context_unbind(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     let this = obj_arg(args, 0)?;
     let name = match read_string_arg(ctx, args, 1) {
         Some(n) => n,
-        None => return Err(throw_invalid_name(ctx, "null name")),
+        None => return Err(throw_invalid_name(ctx, "null name")?),
     };
 
     if let Some(deleg) = builder_initial_context(ctx, this)? {
@@ -1360,7 +1360,7 @@ fn native_context_unbind(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     }
 
     if let Err(msg) = unbind_value(&name) {
-        return Err(flat_store_error(ctx, &msg));
+        return Err(flat_store_error(ctx, &msg)?);
     }
     Ok(None)
 }
@@ -1372,7 +1372,7 @@ fn native_context_create_subcontext(
     let this = obj_arg(args, 0)?;
     let name = match read_string_arg(ctx, args, 1) {
         Some(n) => n,
-        None => return Err(throw_invalid_name(ctx, "null name")),
+        None => return Err(throw_invalid_name(ctx, "null name")?),
     };
 
     if is_java_url_scheme(&name) {
@@ -1389,10 +1389,10 @@ fn native_context_create_subcontext(
     }
 
     if let Err(msg) = create_subcontext(&name) {
-        return Err(flat_store_error(ctx, &msg));
+        return Err(flat_store_error(ctx, &msg)?);
     }
     // Return a fresh synthetic Context so the caller can chain bind().
-    let sub = alloc_concurrent_synthetic(ctx, "javax/naming/InitialContext", INIT_CTX_NUM_SLOTS);
+    let sub = try_alloc_concurrent_synthetic(ctx, "javax/naming/InitialContext", INIT_CTX_NUM_SLOTS)?;
     Ok(Some(Value::Object(Some(sub))))
 }
 
@@ -1403,7 +1403,7 @@ fn native_context_destroy_subcontext(
     let this = obj_arg(args, 0)?;
     let name = match read_string_arg(ctx, args, 1) {
         Some(n) => n,
-        None => return Err(throw_invalid_name(ctx, "null name")),
+        None => return Err(throw_invalid_name(ctx, "null name")?),
     };
 
     if is_java_url_scheme(&name) {
@@ -1420,7 +1420,7 @@ fn native_context_destroy_subcontext(
     }
 
     if let Err(msg) = destroy_subcontext(&name) {
-        return Err(flat_store_error(ctx, &msg));
+        return Err(flat_store_error(ctx, &msg)?);
     }
     Ok(None)
 }
@@ -1435,8 +1435,8 @@ fn alloc_java_binding(
     name: &str,
     class_name: &str,
     object: ObjectRef,
-) -> ObjectRef {
-    let obj = alloc_concurrent_synthetic(ctx, "javax/naming/Binding", BINDING_NUM_SLOTS);
+) -> Result<ObjectRef, MethodCallFailed> {
+    let obj = try_alloc_concurrent_synthetic(ctx, "javax/naming/Binding", BINDING_NUM_SLOTS)?;
     // GC-SAFETY: `obj` (the freshly-allocated Binding) and `object` (the
     // caller-supplied bound value) are both used again after the two
     // `create_string` calls below, which can each trigger a moving GC. Pin
@@ -1453,14 +1453,14 @@ fn alloc_java_binding(
     ctx.set_field(obj, BINDING_FIELD_CLASS_NAME, Value::Object(Some(cn_s)));
     ctx.set_field(obj, BINDING_FIELD_OBJECT, Value::Object(Some(object)));
     ctx.unpin_native_roots(obj_pin);
-    obj
+    Ok(obj)
 }
 
 fn native_context_list_bindings(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     let name = match read_string_arg(ctx, args, 1) {
         Some(n) => n,
-        None => return Err(throw_invalid_name(ctx, "null name")),
+        None => return Err(throw_invalid_name(ctx, "null name")?),
     };
 
     if is_java_url_scheme(&name) {
@@ -1487,13 +1487,17 @@ fn native_context_list_bindings(ctx: &mut dyn NativeContext, args: &[Value]) -> 
 
     let children = match list_bindings(&name) {
         Ok(c) => c,
-        Err(msg) => return Err(flat_store_error(ctx, &msg)),
+        Err(msg) => return Err(flat_store_error(ctx, &msg)?),
     };
     // Build a reference-array of `Binding` objects as the
     // NamingEnumeration backing.
     let binding_cid = match ctx.ensure_class_initialized("javax/naming/Binding") {
         Ok(cid) => cid,
-        Err(_) => ctx.ensure_synthetic_class("javax/naming/Binding", 8),
+        // Fallible since 2026-08-10 (JDK-only wave 2, step 3): `javax.naming`
+        // is an enterprise namespace, so a fabricated `Binding` stand-in is the
+        // substitution contract §5 refuses. On a run that has JNDI on the
+        // classpath the `Ok` arm is what runs.
+        Err(_) => crate::util_concurrent_ext::refused_class(ctx, "javax/naming/Binding", 8)?,
     };
     let arr = ctx.new_ref_array(binding_cid, children.len());
     for (i, (k, v)) in children.iter().enumerate() {
@@ -1505,7 +1509,7 @@ fn native_context_list_bindings(ctx: &mut dyn NativeContext, args: &[Value]) -> 
             placeholder
         });
         let binding = alloc_java_binding(ctx, child_name, v.class_name.as_ref(), obj);
-        ctx.set_array_element(arr, i, Value::Object(Some(binding)));
+        ctx.set_array_element(arr, i, Value::Object(Some(binding?)));
     }
     Ok(Some(Value::Object(Some(arr))))
 }
@@ -1518,17 +1522,17 @@ fn native_service_based_naming_store_bind(
     let _this = obj_arg(args, 0)?;
     let name = match read_string_arg(ctx, args, 1) {
         Some(n) => n,
-        None => return Err(throw_invalid_name(ctx, "null name")),
+        None => return Err(throw_invalid_name(ctx, "null name")?),
     };
     let value = match args.get(2).copied() {
         Some(Value::Object(Some(o))) => o,
-        _ => return Err(throw_naming_exception(ctx, "bind: null value")),
+        _ => return Err(throw_naming_exception(ctx, "bind: null value")?),
     };
     let class_name = ctx
         .class_name_of_id(ctx.class_id_of_object(value))
         .unwrap_or_else(|| "java/lang/Object".to_string());
     if let Err(msg) = bind_value(&name, &class_name, value) {
-        return Err(flat_store_error(ctx, &msg));
+        return Err(flat_store_error(ctx, &msg)?);
     }
     Ok(None)
 }
@@ -1540,11 +1544,11 @@ fn native_service_based_naming_store_lookup(
     let _this = obj_arg(args, 0)?;
     let name = match read_string_arg(ctx, args, 1) {
         Some(n) => n,
-        None => return Err(throw_invalid_name(ctx, "null name")),
+        None => return Err(throw_invalid_name(ctx, "null name")?),
     };
     match lookup_value(&name) {
         Ok(v) => Ok(Some(Value::Object(Some(v)))),
-        Err(msg) => Err(flat_store_error(ctx, &msg)),
+        Err(msg) => Err(flat_store_error(ctx, &msg)?),
     }
 }
 
@@ -1555,17 +1559,17 @@ fn native_context_names_bind_info_for(
     // static ContextNames.bindInfoFor(String absolute) -> BindInfo
     let absolute = match read_string_arg(ctx, args, 0) {
         Some(n) => n,
-        None => return Err(throw_invalid_name(ctx, "null absolute name")),
+        None => return Err(throw_invalid_name(ctx, "null absolute name")?),
     };
     let info = match context_names_bind_info_for(&absolute) {
         Ok(i) => i,
-        Err(msg) => return Err(throw_invalid_name(ctx, &msg)),
+        Err(msg) => return Err(throw_invalid_name(ctx, &msg)?),
     };
-    let obj = alloc_concurrent_synthetic(
+    let obj = try_alloc_concurrent_synthetic(
         ctx,
         "org/jboss/as/naming/deployment/ContextNames$BindInfo",
         BIND_INFO_NUM_SLOTS,
-    );
+    )?;
     // GC-SAFETY: each of `obj`/`parent_obj`/`binder_obj`/`bind_name_s` is
     // captured well before its own `set_field_by_name` use below, and every
     // intervening `alloc_java_service_name`/`create_string` call can trigger
@@ -1574,9 +1578,9 @@ fn native_context_names_bind_info_for(
     let obj_pin = ctx.pin_native_root(obj);
     // Mirror ContextNames$BindInfo's real field layout exactly: parent
     // ServiceName, binder ServiceName, bindName String, absolute name String.
-    let parent_obj = alloc_java_service_name(ctx, &info.parent_context_service_name);
+    let parent_obj = alloc_java_service_name(ctx, &info.parent_context_service_name)?;
     let parent_pin = ctx.pin_native_root(parent_obj);
-    let binder_obj = alloc_java_service_name(ctx, &info.binder_service_name);
+    let binder_obj = alloc_java_service_name(ctx, &info.binder_service_name)?;
     let binder_pin = ctx.pin_native_root(binder_obj);
     let bind_name_s = ctx.create_string(info.binding_name.as_ref());
     let bind_name_pin = ctx.pin_native_root(bind_name_s);

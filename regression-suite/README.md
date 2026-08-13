@@ -32,7 +32,9 @@ REGRESSION SUITE: 8 passed, 0 failed
 The script exits non-zero if any class fails, so it is CI-ready.
 
 **Env overrides:** `CV=<cratonvm.exe>` · `JDK=<jdk home>` ·
-`ONLY="RJitGc RCrypto"` (run a subset) · `TIMEOUT=<seconds>`.
+`ONLY="RJitGc RCrypto"` (run a subset) · `TIMEOUT=<seconds>` ·
+`STRICT_COVERAGE=1` (make an unscheduled vector a failure — see
+[Coverage census](#coverage-census)).
 
 ## JDK-only corpus
 
@@ -50,16 +52,36 @@ SUITE=all RELEASES="17 21 25" bash regression-suite/run.sh
 
 **Additional env overrides:** `CRATONVM_ARGS="--jdk-only"` (extra launcher args;
 empty by default, in which case the CratonVM invocation is unchanged) ·
-`SUITE=core|jdk-only|all` (default `core` — the historical set, unchanged) ·
+`SUITE=core|jdk-only|all` (default `core` — the historical set, unchanged;
+`jdk-only` runs the corpus *instead of* core, `all` runs both; an unrecognised
+value is a hard error) · `JDK_ONLY=1` (additive: core *plus* the corpus) ·
 `RELEASES="17 21 25"` (javac `--release` matrix; empty by default, i.e. one
 pass with no `--release` flag) · `JDK17=` / `JDK21=` / `JDK25=` (optional
 per-release JDK homes; a release with no usable javac is skipped with a
 message, not failed).
 
+> **`SUITE` was documented here for months before `run.sh` implemented it**
+> (fixed 2026-08-07). Until then `SUITE=jdk-only bash run.sh` and
+> `SUITE=all RELEASES=…` quietly ran the CORE list and reported green — a
+> documented invocation whose result said nothing about the corpus it named.
+> Only the `CRATONVM_ARGS="--jdk-only"` spelling ever selected the corpus,
+> because that one is matched separately. Any green `SUITE=` result recorded
+> before that date should be re-run.
+
 `regression-suite/modules/` holds a real named module built into
 `build-modules/` for `RJdkModule`; `regression-suite/resources/` is staged into
 `build/` so `RJdkServices` discovers its providers through a real
 `META-INF/services` resource.
+
+`regression-suite/modules-overlay/` is a SECOND javac pass, run over
+`build-modules/` on a plain classpath after the module is compiled. It exists
+because javac refuses to compile a `provides` clause whose provider declares a
+`provider()` returning a non-subtype of the service -- which is exactly the
+shape `ServiceLoader.loadProvider` carries a RUNTIME check for, and therefore
+exactly the shape a negative vector has to reproduce. `compile_modules`
+ground-truths the overlay with `javap` and fails the build if it did not land,
+because a missing overlay would fail RJdkModule on BOTH VMs and read as a VM
+defect.
 
 ## How a class passes
 
@@ -80,6 +102,44 @@ in that mode. No such golden is shipped today; the single mode-divergent vector
 Each source file is self-contained (default package, only JDK classes) and
 runnable on its own: `cratonvm -cp build RJitGc`.
 
+### Things that count as FAILURE, not as absence
+
+The suite's job is to be un-fool-able, so every ambiguity resolves to failure:
+
+- a **class-list entry with no `src/*.java`** — `LIST ERROR`, one failure each.
+  This used to be filtered out in silence, so renaming a vector deleted its
+  coverage and only lowered the "N passed" count, which nobody diffs;
+- a **run that schedules nothing** (`ONLY=" "`, an emptied list, `SUITE=jdk-only`
+  against a checkout with no `RJdk*` sources) — hard error, exit 3. "0 passed,
+  0 failed" must never exit green;
+- an **unrecognised `SUITE` value** — hard error, exit 3, never a fall-back to
+  core;
+- a **compile failure** (suite or module) — exit 3, or one failure per
+  `--release` level in matrix mode;
+- a **timeout** — `timeout` returns 124, which is a non-zero rc, which is a
+  FAIL;
+- a **`RELEASES=` run where every level was skipped** — exit 3.
+
+Absent HotSpot is the one genuine weakening left, and the runner now says so
+out loud (`NOTE: no HotSpot at … — cross-VM output diff SKIPPED`): checks
+(1)–(3) still run, but the byte-for-byte diff that catches a miscompiled
+checksum does not.
+
+### Coverage census
+
+`run.sh` compiles **all** of `src/*.java` but runs only what a class list
+names, so a vector can exist, compile, and never execute — coverage that isn't.
+That is how `RJdkPhaser` (240 checks) and `RJdkFieldModule` (75 checks) arrived
+inert. The runner now cross-checks the two sets on every run:
+
+- a `src/*.java` in no list and not in `UNREGISTERED_CLASSES` → `COVERAGE
+  WARNING` by default, `COVERAGE ERROR` (a failure) under `STRICT_COVERAGE=1`.
+  It is a warning by default only because vectors land here from several
+  branches at once and the lane that lands next must not inherit someone
+  else's red. **CI should set `STRICT_COVERAGE=1`.**
+- an `UNREGISTERED_CLASSES` entry whose source is gone → `LIST ERROR`, a
+  failure, so the exemption list cannot rot.
+
 ## What each class covers
 
 | Class | Area |
@@ -95,7 +155,26 @@ runnable on its own: `cratonvm -cp build RJitGc`.
 | `RPrivateLambdaOwner` | private lambda bodies remain bound to their resolved declaring class when a child has the same synthetic lambda name |
 | `RLambdaDefaultOverload` | lambda SAM dispatch preserves same-named default overloads, including null arguments |
 | `RJitGc` | hot int/long/float/double loops (JIT+OSR), **binary-tree alloc + GC churn**, megamorphic dispatch, array bounds — all checksum-diffed vs HotSpot |
-| `RConcurrent` | threads, atomics, locks, `ConcurrentHashMap`, executors, futures, latches — **not in the default set** (see Known gaps) |
+| `RJitStringLayout` | two general x64-backend codegen defects found behind the H2 `org/h2/` JIT ban |
+| `RJitArrayTypecheck` | BUG-JIT-ARRAY-INSTANCEOF-20260726: the JIT typecheck helper honoured only a *positive* array-descriptor answer |
+| `RArraysMismatch` | `Arrays.mismatch`/`equals`/`compare` over every primitive array type, asserted only **after** the helper behind them is JIT-compiled |
+| `RExecutorShutdown` | BUG-EXEC-SHUTDOWN-INTERRUPTS-RUNNING-TASK-20260726: `shutdown()` is orderly — only *idle* workers are interrupted |
+| `RBlockingQueue` | synthetic blocking-queue natives must not be applied to real JDK queue objects (a four-slot side layout the bytecode cannot see) |
+| `RChmKeySetView` | `ConcurrentHashMap.newKeySet()` must return a real `KeySetView`, not a plain `HashSet` |
+| `RChannelInterrupt` | BUG-NIO-NULL-INTERRUPTOR-20260726 (part 1) + the blocked-reader-never-wakes defect in the `java.net.Socket` stream path |
+| `RSocketChannelInterrupt` | the same pair on the NIO socket path |
+| `RAtomicArray` | atomicity of `AtomicInteger`/`Long`/`ReferenceArray`, whose operations CratonVM serves from natives over a plain Java array |
+| `RDirectBufferElem` | per-element `DirectByteBuffer` `get`/`put`, served from `native-io/src/direct_buffer.rs` rather than real-JDK bytecode |
+| `RMapResizeGc` | HIB-MAPRESIZE-STALE.1: the native `HashMap.put` resize walk under GC pressure |
+| `RMapGcStress` | every map native that walks a bucket chain must keep the chain rooted across the Java callbacks it dispatches |
+| `RForNameGcStress` | `Class.forName(name, init, loader)` must keep the name `String` and the loader rooted across `loader.loadClass` |
+| `ROverlaySystemGcStress` | the in-place old-gen sweep must not free an object the same cycle just promoted |
+| `RFileTimes` | file and ZIP-entry timestamp round-trips — the Spring Boot `jarmode-tools` extract pipeline reduced to its timestamp steps |
+| `RNioNoFollow` | `LinkOption.NOFOLLOW_LINKS` in `Files.write*` / `new*Stream` / `open` varargs when the final component is a symlink |
+| `RSyncMethodJit` | an `ACC_SYNCHRONIZED` method must keep excluding after the JIT compiles it (compiled bodies carry no monitor prologue) |
+| `RFieldSiteCache` | the per-thread resolved-**field** site cache must never answer one field reference with another site's answer |
+| `RMethodSiteCache` | the per-thread resolved-**method** site cache must never answer one call site with another site's descriptor |
+| `RDataInputFastPull` | `DataInputStream` typed reads must observe the same stream position as everything else on the underlying stream |
 
 ### JDK-only corpus (`SUITE=jdk-only`)
 
@@ -109,12 +188,14 @@ runnable on its own: `cratonvm -cp build RJitGc`.
 | `RJdkProxy` | proxy generation, invocation handlers, `invokeDefault`, exception wrapping, loader identity and caching |
 | `RJdkHidden` | `Lookup.defineHiddenClass`, NESTMATE vs non-nestmate, nestmate private access, nest shape |
 | `RJdkReflect` | members, `setAccessible`, the **reflection inflation/accessor** path, annotations, serialization incl. `Externalizable` |
+| `RJdkFieldModule` | the JPMS half of `Field.get`/`set` and the typed `getInt`/`setLong` family: `exports` vs `opens`, public field of an unexported package, public field of a non-public class, cross-module protected read from a subclass — every ALLOW row paired with a DENY row |
 | `RJdkJmx` | `ObjectName` canonicalisation, MBean register/attributes/operations/notifications/queries, platform MXBeans — named P0 |
 | `RJdkServices` | class-path `ServiceLoader`: `META-INF/services` discovery, `stream()`, `reload()`, `ServiceConfigurationError` |
-| `RJdkModule` | a real named module on `--module-path`: descriptor, reads, exports vs opens, encapsulated resources, module service providers |
+| `RJdkModule` | a real named module on `--module-path`: descriptor, reads, exports vs opens, encapsulated resources, module service providers -- including the two ILLEGAL `provider()` factory shapes, which must raise `ServiceConfigurationError` from `iterator()` and `stream()` alike |
 | `RJdkExecutors` | fixed pool, futures, cancellation, `invokeAll`/`invokeAny`, thread factory, rejection policies, scheduled executor, interruption, `CompletableFuture` |
 | `RJdkForkJoin` | `RecursiveTask`/`RecursiveAction`/`CountedCompleter`, parallel streams, worker exceptions, quiescence |
 | `RJdkAqs` | `ReentrantLock` (hold counts, `lockInterruptibly`), `Condition`, `ReentrantReadWriteLock`, `StampedLock`, a custom `AbstractQueuedSynchronizer` |
+| `RJdkPhaser` | `Phaser` against its real `volatile long state`: `arriveAndDeregister` lowering parties and unarrived together, the terminated phase as `phase \| MIN_VALUE` (not `-1`), inertness after termination, tiering, `onAdvance` on a real subclass |
 | `RJdkProcess` | `ProcessHandle` current/parent/children/info/liveness/`onExit`, child process exit code and forcible kill — named P1 |
 | `RJdkNio` | `Files`/`Path`, `RandomAccessFile`, `FileChannel` incl. **memory mapping** and locks, buffers, `Selector`, **asynchronous close** |
 | `RJdkNet` | DNS, loopback TCP echo, socket options, `SO_TIMEOUT`, close-during-read, loopback UDP |
@@ -123,13 +204,58 @@ runnable on its own: `cratonvm -cp build RJitGc`.
 | `RJdkFailure` | missing class, **real `NoSuchMethodError`/`NoClassDefFoundError`** (via a same-length constant-pool patch into a hidden class), missing native, missing module, unsupported platform services |
 | `RJdkStrict` | mode-**divergent** probes: no fabricated `org.jboss`/`io.quarkus`/`io.smallrye` classes, no `Function$Identity` stand-in, real `ProcessHandle` bytes, bytecode beats native — **`--jdk-only` only** |
 
+### Unregistered vectors (`UNREGISTERED_CLASSES` in `run.sh`)
+
+These exist under `src/` and are scheduled by **no** list. They are named
+explicitly so "not scheduled" stays distinguishable from "forgotten"; the
+coverage census fails if one of them disappears, and warns about any *other*
+unscheduled vector.
+
+| Class | Why it is not scheduled |
+|-------|-------------------------|
+| `RConcurrent` | Heavy multi-threaded execution; trips the documented cross-thread JIT-frame root-scan gap (see Known gaps) and flakes. Run with `ONLY="RConcurrent"`. |
+| `RPriorityQueueGc` | Needs **both** `--nojit` **and** `--Xmx 64m` — a live JIT frame downgrades the young generation to a non-moving sweep, under which the stale reference still resolves and the defect hides; the small heap is what makes a collection happen inside the native at all. With `--nojit` alone the vector **passes on a broken VM**. Wired into `class_cv_args`. |
+| `RTreeRangeGc` | Needs a small heap (`--Xmx 64m`) or no collection happens during the range-view walk at all. It must **not** get `--nojit`: it reproduces with the JIT on, so registering it keeps the compiling configuration under test. Wired into `class_cv_args`. |
+
+> Both GC vectors *were* registered and validated FAIL-then-PASS under this
+> runner when their fixes landed (`6cd01bcba`, `b2e13e441`). A later `run.sh`
+> merge resolution silently discarded the registrations and the argument hook —
+> that is why they are unregistered today, not because they were never run.
+
+Both GC vectors pass on HotSpot 25 with byte-identical output over repeated
+runs, so the vectors themselves are sound; what is missing is a CratonVM run
+under the arguments their own doc comments already assume the suite supplies.
+Registering them is a task for a lane that can build and run the VM. The
+per-vector **CratonVM-only** argument hook they need is `class_cv_args()` in
+`run.sh`, kept deliberately separate from `class_args()`: `class_args` is
+handed to HotSpot too, and a `--nojit` there would make the oracle exit
+non-zero, return empty key lines, and fail the cross-VM diff for a reason that
+has nothing to do with the VM.
+
 ## Extending
 
 Add a `src/RFoo.java` that prints `PASS RFoo (<n> checks)` on success (throw /
 `System.exit(1)` on failure; print any cross-VM-verified values on `CK …`
-lines), then add `RFoo` to the `CLASSES_CORE` list in `run.sh` (or
-`CLASSES_JDKONLY` for a strict-mode vector). Keep each class fast (well under a
-second) and deterministic.
+lines), then add `RFoo` to the **`CORE_CLASSES`** list in `run.sh` (or
+**`JDKONLY_CLASSES`** for a strict-mode vector). Keep each class fast (well
+under a second) and deterministic.
+
+**Adding the source is not adding the vector.** `run.sh` globs `src/*.java`
+into `javac` but runs only what a list names, so a file that is not in a list
+compiles on every run and never executes. If a vector genuinely should not be
+scheduled, put it in `UNREGISTERED_CLASSES` with a reason instead — the
+coverage census treats anything in neither place as a defect.
+
+Which list:
+
+- **`CORE_CLASSES`** is the default green baseline. A vector goes here only
+  once it is known to pass on CratonVM. Adding a never-run vector here turns
+  the plain `bash run.sh` red for everyone who lands next.
+- **`JDKONLY_CLASSES`** is scheduled only under `SUITE=jdk-only`/`all`,
+  `JDK_ONLY=1`, or `CRATONVM_ARGS="--jdk-only"`, and is documented as
+  *expected* to fail where `--real-jdk` passes. A vector written to expose a
+  gap that is not fixed yet belongs here, where its red is informative rather
+  than blocking.
 
 **Determinism is not optional** — the suite diffs two VMs byte for byte, so any
 wall-clock value, pid, port, host name, absolute path, unsorted hash-map
@@ -156,6 +282,20 @@ to-do list — when one is fixed, re-enable the corresponding check:
   cross-thread JIT-frame root scanning at a stop-the-world GC pause (there is a
   `fix/multithread-jit-roots-stw` branch for this). Excluded from the default
   set; run it once the gap is closed with `ONLY="RConcurrent"`.
+- **Receiver-typed `protected` field access** (JLS 6.6.2.1) — a subclass caller
+  may read an inherited `protected` field only *through a receiver of its own
+  type*. HotSpot throws `IllegalAccessException` for
+  `buf.get(new ByteArrayOutputStream())` from a subclass; CratonVM's
+  `caller_may_access_member` takes no receiver and allows it. `RJdkFieldModule`
+  documents this and deliberately does **not** assert it — the divergence is
+  masked today by the module gate that vector is fixing, so closing the module
+  gap unmasks it.
+- **`RELEASES="17 …"` does not compile** — `run.sh` compiles all of
+  `src/*.java` in one `javac` call, so one vector above the level takes the
+  whole level down. Today that is `RChmKeySetView`
+  (`Executors.newVirtualThreadPerTaskExecutor()`, Java 21; `ExecutorService`
+  in try-with-resources, Java 19). Levels 21 and 25 are clean. This is counted
+  as a failure, not skipped.
 
 ## Performance gate (CratonBench) — mandatory
 

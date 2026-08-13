@@ -44,3 +44,21 @@ HotSpot: TestRemoteProcessException  Tests run: 1, Failures: 1
 
 Both fail on stock HotSpot 25.0.3 with Tomcat's own JVM args, confirming the
 root cause is this host's network/multicast configuration, not CratonVM.
+
+## Update 2026-08-13 — confirmed identical under all 3 GC backends
+
+Complete 651-class Tomcat suite run under Generational, G1, and ZGC
+(2026-08-12/13) shows all 4 classes in this family failing the same way on
+every backend, and a 93-class cross-GC non-passed union rerun under ZGC
+alone reconfirms them there too. Consistent with this page's own
+environmental characterization: the failure is about this host's network,
+not any collector's behavior, so backend-independence is exactly what's
+expected. The `TestDataIntegrity` **NOSUMMARY** flagged as an open question
+in `gc-backend-3way-fullsuite-comparison-20260810.md` ("a VM abort with no
+JUnit summary at all is a stronger symptom than this family's usual
+assertion failures... not yet checked whether this is a distinct VM-abort
+defect") was **not** seen in this run — `TestDataIntegrity` reported a normal
+FAIL with a JUnit summary on all 3 backends, so whatever produced that one
+NOSUMMARY on 08-10 did not reproduce here. Left unresolved as a one-off
+rather than chased further, since the family's baseline failure mode is
+otherwise unchanged and this page's core diagnosis stands.

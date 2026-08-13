@@ -74,6 +74,16 @@ fn ensure_probe_compiled() -> bool {
         return true;
     }
     if !java_file.exists() {
+        // `apps/executor_probe/ExecProbe.java` IS tracked (force-added past the
+        // `.gitignore` `apps/` rule), so its absence means a broken checkout, not
+        // an absent toolchain. Loud, and a failure under CRATONVM_REQUIRE_E2E —
+        // see `common::require_fixture`.
+        let _ = common::require_fixture(
+            "wave1_c_executor",
+            "the Wave 1 Task C fixture `ExecProbe.java` (tracked at \
+             apps/executor_probe/ExecProbe.java despite the `apps/` gitignore rule)",
+            &[java_file.clone()],
+        );
         return false;
     }
     let compile = Command::new("javac")

@@ -182,16 +182,39 @@ fn line_number_for_bci_picks_largest_start_leq_bci() {
     assert_eq!(lookup(1000), Some(30));
 }
 
+/// `StackWalker.getInstance()` must return a non-null walker.
+///
+/// # Why this is `#[ignore]`d rather than fixed in place
+///
+/// The body was a closure that was DEFINED and never CALLED:
+///
+/// ```ignore
+/// let _ = |_ctx: &mut dyn NativeContext| { /* compile-time guard only */ };
+/// ```
+///
+/// It could only fail by failing to compile, so it reported `ok` unconditionally
+/// — one of the ~60 vacuous greens the 2026-08-07 audit found. It cannot be
+/// repaired at this level: invoking the native needs a `&mut dyn NativeContext`,
+/// and the only implementors of that trait live inside the interpreter. An
+/// integration test in `vm/tests/` has no way to construct one.
+///
+/// Marked `#[ignore]` so `cargo test` reports it as **ignored** instead of
+/// **ok** — which is the truth. The real coverage is in
+/// `native-builtins/src/stack_walker.rs::tests`, which runs in-crate and can
+/// build a context; `native_stack_walker_boot_natives_registered` above already
+/// pins that `getInstance` is registered under both descriptors.
+///
+/// To un-ignore this, drive it end-to-end through a `Vm` (as the log4j probes
+/// further down this file do) rather than through the native directly.
 #[test]
+#[ignore = "cannot construct a `&mut dyn NativeContext` from vm/tests; real coverage is \
+            native-builtins/src/stack_walker.rs::tests"]
 fn stack_walker_default_never_returns_null() {
-    // Smoke: `StackWalker.getInstance()` native builds a synthetic walker
-    // object with a freshly allocated options Set. The returned value must
-    // be a non-null object ref.
-    use cratonvm_native_api::NativeContext;
-    let _ = |_ctx: &mut dyn NativeContext| {
-        // Compile-time guard only — runtime verification lives in
-        // native-builtins/src/stack_walker.rs::tests.
-    };
+    unimplemented!(
+        "WP1.9: no in-tree way to invoke the StackWalker.getInstance native from an integration \
+         test. See this function's doc comment. Do not replace this with a body that cannot fail \
+         — that is what it was before."
+    );
 }
 
 #[test]

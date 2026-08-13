@@ -508,7 +508,35 @@ pub trait NativeClassAccess {
     fn load_class(&mut self, name: &str) -> MethodCallResult;
 
     /// Get the class name for a ClassId.
+    ///
+    /// Allocates. Prefer [`Self::class_name_arc_of_id`] unless an owned
+    /// `String` is genuinely what the caller needs.
     fn class_name_of_id(&self, class_id: ClassId) -> Option<String>;
+
+    /// The class name for a `ClassId`, **without allocating**.
+    ///
+    /// The VM stores a class's name as an `Arc<str>` and
+    /// [`Self::class_name_of_id`] copies it into a fresh `String` on every
+    /// call. That copy is pure waste at the overwhelmingly common shape —
+    /// `ctx.class_name_arc_of_id(cid).as_deref() == Some("java/util/HashMap")`
+    /// — where the name is compared and dropped. This hands back a clone of the
+    /// `Arc` instead: one refcount increment, no allocation, no copy. And
+    /// `Option<Arc<str>>::as_deref()` yields exactly the `Option<&str>` the old
+    /// shape did, so converting a call site is a drop-in the compiler checks.
+    ///
+    /// `native-collections` measured what the `String` costs: its receiver
+    /// classification paid 5-6 of these per `HashMap.put`, which is part of the
+    /// 21.2x row against JDK 25 C2 that its `RECEIVER_FACTS` / `RECEIVER_NAMES`
+    /// memos exist to remove. Those memos also remove the `class_manager` read
+    /// lock, which this does NOT — a caller on a path hot enough to care about
+    /// the lock still wants a memo, and this is not a substitute for one.
+    ///
+    /// Default-implemented in terms of `class_name_of_id` so every existing
+    /// `NativeContext` (six test mocks among them) keeps compiling unchanged;
+    /// the VM overrides it with an `Arc::clone`.
+    fn class_name_arc_of_id(&self, class_id: ClassId) -> Option<Arc<str>> {
+        self.class_name_of_id(class_id).map(Arc::from)
+    }
 
     /// Get the class id of a heap object.
     fn class_id_of_object(&self, obj: ObjectRef) -> ClassId;
@@ -641,6 +669,32 @@ pub trait NativeClassAccess {
 
     /// Get the superclass ClassId. Returns None for java/lang/Object.
     fn superclass_of(&self, class_id: ClassId) -> Option<ClassId>;
+
+    /// JVMS §aastore covariance: may the non-null `value` be stored into the
+    /// reference array `array`? `None` when this context cannot answer.
+    ///
+    /// This exists so `java.lang.reflect.Array.set` can enforce **the same rule
+    /// as the `aastore` bytecode**, which is what HotSpot does — they are one
+    /// check there, and were two here. The VM's implementation
+    /// (`vm::runtime::interpreter::typecheck::aastore_element_assignable`) is
+    /// already shared by the interpreter opcode and the JIT's `jit_aastore`
+    /// helper; a reflective store is simply its third caller.
+    ///
+    /// The difference is not academic. That predicate is deliberately
+    /// *additive*: it must never produce a FALSE `ArrayStoreException`, so it
+    /// fails open for an interface component, for a `$Proxy`/`AnnotationProxy`
+    /// value, for a synthetic class id, and for a same-named component that
+    /// resolved to a different `ClassId` under another loader. Every one of
+    /// those hedges was paid for by a real regression. A `ClassId`-identity
+    /// check reproduces none of them.
+    ///
+    /// `None` (the default) means "no VM hierarchy here" — mocks and the
+    /// fabricated-class harnesses — and leaves the caller on its own exact
+    /// check rather than silently widening it.
+    fn aastore_element_assignable(&self, array: ObjectRef, value: ObjectRef) -> Option<bool> {
+        let _ = (array, value);
+        None
+    }
 
     /// Get the ClassId for a loaded class by name. Returns None if not loaded.
     ///
@@ -1481,6 +1535,17 @@ pub trait NativeClassAccess {
     fn module_is_registered(&self, module_name: &str) -> bool {
         let _ = module_name;
         false
+    }
+
+    /// Every module name the VM's module registry knows, in no defined order.
+    ///
+    /// The registry is small by construction — `java.base` plus whatever
+    /// `--module-path` supplied — because only two sites populate it, so
+    /// callers may enumerate it eagerly. An empty vector means "this context
+    /// does not model modules", exactly as [`module_is_registered`] returning
+    /// `false` does, and must not be read as "no modules exist".
+    fn module_names(&self) -> Vec<String> {
+        vec![]
     }
 
     /// `exports` directives declared by `module_name`, as
@@ -2785,6 +2850,37 @@ pub trait NativeHeapAccess: NativeInvokeAccess {
     /// Returns the total number of bytes allocated on the heap.
     fn heap_allocated_bytes(&self) -> usize;
 
+    /// Cumulative bytes the **calling** thread has allocated since it started,
+    /// or `None` when the VM cannot account for it.
+    ///
+    /// This is the source for `com.sun.management.ThreadMXBean
+    /// .getCurrentThreadAllocatedBytes` / `getThreadAllocatedBytes(long)`.
+    /// `None` is the honest answer a mock or a thread-less context gives, and
+    /// the bean turns it into the JMM's documented `-1` plus
+    /// `isThreadAllocatedMemorySupported() == false` — a "not supported" that
+    /// callers already handle, rather than a fabricated number.
+    ///
+    /// The VM implementation reads `Tlab::thread_allocated_bytes`, which is
+    /// live-cursor based and therefore sees compiled code's inline allocation
+    /// as well as the interpreter's.
+    fn current_thread_allocated_bytes(&self) -> Option<u64> {
+        None
+    }
+
+    /// Bytes currently COMMITTED for the Java heap — backing storage the VM
+    /// holds whether or not anything lives in it. `Runtime.totalMemory()`, the
+    /// JMX heap `MemoryUsage.getCommitted()`, and (minus
+    /// [`Self::heap_allocated_bytes`]) `Runtime.freeMemory()`.
+    ///
+    /// Capacity, never occupancy: `totalMemory()` is expected to move only when
+    /// the heap grows or shrinks. See `gc::vm_heap::VmHeap::committed_bytes`.
+    ///
+    /// The default is the historical `Runtime.totalMemory()` stub, kept for
+    /// mock/test contexts that have no heap; the VM overrides it.
+    fn committed_heap_bytes(&self) -> usize {
+        64 * 1024 * 1024
+    }
+
     // -- ObjectStreamClass descriptor cache (WP0.2) --
     //
     // Backs `java.io.ObjectStreamClass.lookup(Class)`. See
@@ -2997,6 +3093,27 @@ pub trait NativeHeapAccess: NativeInvokeAccess {
     /// test the referent WITHOUT keeping it alive. The default no-op keeps
     /// mock/test contexts compiling.
     fn gc_reference_keep_alive(&mut self, _referent: ObjectRef) {}
+
+    /// Notify the GC's reference processor that a `Reference.enqueue()` call
+    /// just enqueued this reference itself (the application's own explicit
+    /// enqueue, as opposed to the GC discovering the referent dead).
+    ///
+    /// PGJDBC-PHANTOM-GHOST (2026-08-07): without this, a `Reference` that the
+    /// application manually retires while its referent is STILL reachable
+    /// (e.g. pgjdbc's `SimpleQuery.unprepare()`/`setCleanupRef()`, which
+    /// `clear()`s and `enqueue()`s the *previous* `PhantomReference` when a
+    /// long-lived, reused `SimpleQuery` gets re-prepared) leaves a stale
+    /// `enqueued: false` bookkeeping entry in the GC's registry. If that same
+    /// referent is later shared with a NEW Reference (as in the pgjdbc
+    /// pattern) and eventually dies for real, the GC's own weak/phantom
+    /// processing rediscovers the stale entry and delivers it a SECOND time —
+    /// a ghost the application already fully drained and forgot, so its own
+    /// removal bookkeeping (e.g. a `HashMap.remove(ref)`) returns null. See
+    /// `ReferenceProcessor::mark_manually_enqueued`'s doc for the full
+    /// mechanism. The VM overrides this to retire the registry entry so it is
+    /// never rediscovered; the default no-op keeps mock/test contexts
+    /// compiling.
+    fn mark_reference_manually_enqueued(&mut self, _reference_obj: ObjectRef) {}
 }
 
 pub trait NativeThreadAccess: NativeHeapAccess {
@@ -3842,14 +3959,22 @@ pub trait NativeSystemAccess: NativeThreadAccess {
     /// forwards the call — which is what the 2026-08-05 census found (all
     /// seven native-minted classes attributed to `vm_exec.rs:13670`). The
     /// attribute is free at runtime for callers that never fabricate.
-    #[track_caller]
-    fn ensure_synthetic_class(&mut self, name: &str, num_fields: usize) -> ClassId {
-        self.try_ensure_synthetic_class(name, num_fields)
-            .unwrap_or(ClassId::new(0))
-    }
-
-    /// The fallible spelling of [`Self::ensure_synthetic_class`] — same
-    /// operation, with a channel for the two answers that are not a `ClassId`.
+    ///
+    /// # The infallible spelling is GONE
+    ///
+    /// `ensure_synthetic_class` — same operation, no error channel — was
+    /// deleted on 2026-08-10 by JDK-only wave 2 step 3, along with
+    /// `ClassManager::ensure_synthetic_class` behind it. It recorded the
+    /// `--jdk-only` violation and then fabricated anyway, so a strict run
+    /// reported a violation while continuing in the exact state contract §5
+    /// forbids, and no signature in the workspace could say otherwise. Every
+    /// caller now either propagates the refusal, absorbs it at a site that
+    /// documents why, or — if what it wants is a VM-generated shape rather than
+    /// a compatibility stand-in — asks [`Self::ensure_vm_internal_class`],
+    /// which is a different question with a different answer.
+    ///
+    /// This is the fallible spelling: the same operation, with a channel for
+    /// the two answers that are not a `ClassId`.
     ///
     /// # The ambiguity contract
     ///
@@ -3859,7 +3984,7 @@ pub trait NativeSystemAccess: NativeThreadAccess {
     /// `?`, or re-ask with an initiating loader
     /// ([`NativeClassAccess::class_id_by_name_and_loader`],
     /// [`NativeClassAccess::class_id_by_name_via_referencing_class`]) if it has
-    /// one. It must not fall back to `ensure_synthetic_class`, to
+    /// one. It must not fall back to a fabrication, to
     /// `ClassId::new(0)`, or to any same-named class of its own choosing:
     /// every one of those is the guess the refusal exists to prevent, and two
     /// distinct classes treated as one is type confusion — it defeats the
@@ -3879,13 +4004,10 @@ pub trait NativeSystemAccess: NativeThreadAccess {
     ///
     /// # Default implementation
     ///
-    /// `Ok(ClassId::new(0))` — the same answer the infallible default has
-    /// always given, so mocks and non-VM contexts are unaffected. A context
-    /// that overrides only `ensure_synthetic_class` (several test harnesses
-    /// do) keeps working: this default is what *its* callers get, unchanged
-    /// from before this method existed.
+    /// `Ok(ClassId::new(0))` — the answer the deleted infallible default always
+    /// gave, so mocks and non-VM contexts are unaffected.
     ///
-    /// `#[track_caller]` for the same reason as the infallible spelling above.
+    /// `#[track_caller]` for the reason stated above.
     #[track_caller]
     fn try_ensure_synthetic_class(
         &mut self,
@@ -3894,6 +4016,37 @@ pub trait NativeSystemAccess: NativeThreadAccess {
     ) -> Result<ClassId, ClassIdentityError> {
         let _ = (name, num_fields);
         Ok(ClassId::new(0))
+    }
+
+    /// Register (or look up) a **VM-generated** class — the other half of the
+    /// §5 API boundary, and the reason deleting the infallible compatibility
+    /// spelling did not have to break dynamic proxies.
+    ///
+    /// [`Self::try_ensure_synthetic_class`] mints *compatibility stand-ins*,
+    /// the one thing `--jdk-only` forbids. This mints the classes a conforming
+    /// JVM creates without any class file — array-adjacent shapes, lambda and
+    /// proxy implementation classes and their superclasses, reflection
+    /// accessors, and the VM's own internal allocation shapes. Contract §1 item
+    /// 6 permits those in every mode, so **this never refuses and never records
+    /// a violation**, and it is infallible for that reason rather than by
+    /// oversight.
+    ///
+    /// **Do not reach for it to silence a refusal.** Contract §11's
+    /// zero-stub census becomes unfalsifiable if a compatibility stand-in is
+    /// minted through this door: the substitution continues and the report goes
+    /// green. `ClassManager::ensure_generated_class` behind it `debug_assert`s
+    /// on a `CompatibilityStub` origin, which a release build will not catch —
+    /// the assertion is a backstop, not the decision. The decision is whether
+    /// the JVM specification says a class file must exist for this name.
+    ///
+    /// # Default implementation
+    ///
+    /// `ClassId::new(0)`, matching the fallible sibling's default, so mocks and
+    /// non-VM contexts compile unchanged. Real VM contexts override it.
+    #[track_caller]
+    fn ensure_vm_internal_class(&mut self, name: &str, num_fields: usize) -> ClassId {
+        let _ = (name, num_fields);
+        ClassId::new(0)
     }
 
     /// Check if a ClassId represents an interface.
@@ -4057,8 +4210,52 @@ pub trait NativeSystemAccess: NativeThreadAccess {
         false
     }
 
-    /// Record one Java jdk.jfr.Event.commit() through the VM recorder.
-    fn jfr_emit_java_event(&mut self, _event_class: &str, _start_ns: u64, _duration_ns: u64) {}
+    /// Record one Java `jdk.jfr.Event.commit()` through the VM recorder.
+    ///
+    /// `event_name` is the **JFR event name** — the `@Name` value when the
+    /// event class carries one, else its binary class name — not the internal
+    /// class name. That is what a consumer sees from
+    /// `RecordedEvent.getEventType().getName()` and what
+    /// `RecordingStream.onEvent(String, …)` matches on, so the name has to be
+    /// canonicalised on the way in rather than decorated here.
+    ///
+    /// `fields` carries `(field name, JVM field descriptor, current value)` in
+    /// the order the event type declares them. The descriptor is what lets the
+    /// VM register the right JFR field type — `Value::Int` alone cannot
+    /// distinguish a `boolean` from an `int` — and a `String` field arrives as
+    /// its `Value::Object` because only the VM side can read the characters
+    /// out of the heap.
+    fn jfr_emit_java_event(
+        &mut self,
+        _event_name: &str,
+        _fields: &[(String, String, Value)],
+        _start_ns: u64,
+        _duration_ns: u64,
+    ) {
+    }
+
+    /// Apply the settings a `jdk.jfr.Recording` carries to the VM recording the
+    /// Java boundary is driving.
+    ///
+    /// `enabled_names` is the set of JFR event names the Java side enabled.
+    /// `None` means "no name filter" — record everything, which is what
+    /// CratonVM's own recordings want. `Some(&[])` means **record nothing**, and
+    /// that distinction is the point: a `new Recording()` with no `enable(...)`
+    /// call records no events on HotSpot, so an empty list cannot be allowed to
+    /// mean "everything".
+    ///
+    /// `thresholds` is `(event name, minimum duration in nanoseconds)`; an event
+    /// shorter than its threshold is dropped.
+    ///
+    /// Both are keyed by NAME because the Java side knows which events are
+    /// enabled before any of them has been committed, and a CratonVM event type
+    /// gets its id at first commit.
+    fn jfr_configure_java_recording(
+        &mut self,
+        _enabled_names: Option<&[String]>,
+        _thresholds: &[(String, u64)],
+    ) {
+    }
 
     /// Remember the output requested by the JDK recorder so stopping it can
     /// flush the VM recording to the same path.
@@ -4548,7 +4745,7 @@ pub struct NativeCensusEntry {
     ///
     /// This is the fourth distinct way this census has been misread; the other
     /// three are in
-    /// `docs/known-issues/jdk-only/census-asks-one-class-on-one-platform.md`.
+    /// `fixed-bugs/jdk-only-census-one-class-one-platform-FIXED-20260810.md`.
     pub owns_slot: bool,
     /// Whether [`Self::kind`] was **stated at this registration site**
     /// (`register_with_kind`) or inherited from an ambient `set_category` in
@@ -5327,6 +5524,21 @@ impl NativeMethodRegistry {
         self.drop_real_layout_synthetic = drop;
     }
 
+    /// Whether this registry is being populated for a REAL-JDK arm.
+    ///
+    /// Read this at a registration SITE when a cluster has no working
+    /// real-bytecode fallback to drop to and so cannot be expressed as a rule
+    /// in `register` — the synthetic `FileInputStream`/`FileOutputStream`
+    /// `<init>` block in `native-io` is the case this exists for. A
+    /// `#[cfg(feature = "synthetic-jdk")]` guard is NOT equivalent and must
+    /// not be used for this: the Cargo feature decides what is COMPILED, the
+    /// launcher flag decides which CLASS LIBRARY loads, and a feature-enabled
+    /// binary run `--real-jdk` satisfies the cfg while facing real JDK
+    /// classes.
+    pub fn drops_real_layout_synthetic(&self) -> bool {
+        self.drop_real_layout_synthetic
+    }
+
     /// Set the category applied to all subsequent `register()` calls until
     /// changed again. Prefer [`with_category`](Self::with_category) for a
     /// scoped set/restore.
@@ -5599,8 +5811,60 @@ impl NativeMethodRegistry {
     /// caller two words of `&'static Location` at the call, not a `format!`.
     /// The string is built only if [`census`](Self::census) or the JDK-only
     /// refusal path actually needs it.
+    ///
+    /// # The one kind decision made here rather than at the site
+    ///
+    /// A `Bridge` whose receiver class no supported JDK image declares cannot
+    /// bind to an `ACC_NATIVE` method — §1.5's whole definition — so it is
+    /// re-tagged [`NativeKind::SyntheticStub`] before any of the policy arms
+    /// below run, and reports `kind_stated`, because a measurement adjudicated
+    /// it. See [`crate::no_image_receiver`] for the measurement, the six images
+    /// it was taken against, and why the reviewed VM services are excluded.
+    ///
+    /// Ordering is load-bearing: the re-tag has to happen before the `JdkOnly`
+    /// arm, or strict mode keeps admitting exactly the rows the re-tag exists to
+    /// exclude.
     #[track_caller]
     pub fn register(
+        &mut self,
+        class_name: &str,
+        method_name: &str,
+        descriptor: &str,
+        callback: NativeCallback,
+    ) {
+        // Two measured, centrally-applied kind decisions, in one arm because
+        // they have the same shape and the same reason: a fact about the JDK
+        // image that no registration site can know, adjudicated once.
+        //
+        //  * the receiver class no supported image declares (§1.5 has no target
+        //    to bind to), and
+        //  * a triple RETIRED as a §1.4 shadow, subsystem by subsystem, each
+        //    against a strict-corpus measurement. See `crate::retired_shadow`.
+        if self.effective_category() == NativeKind::Bridge
+            && (crate::no_image_receiver::receiver_declared_by_no_supported_image(class_name)
+                || crate::retired_shadow::triple_is_retired_shadow(
+                    class_name,
+                    method_name,
+                    descriptor,
+                ))
+        {
+            let prev = self.current_category;
+            let prev_stated = self.next_kind_stated;
+            self.current_category = Some(NativeKind::SyntheticStub);
+            self.next_kind_stated = true;
+            self.register_inner(class_name, method_name, descriptor, callback);
+            self.current_category = prev;
+            self.next_kind_stated = prev_stated;
+            return;
+        }
+        self.register_inner(class_name, method_name, descriptor, callback);
+    }
+
+    /// [`register`](Self::register)'s body. Split out only so the re-tag above
+    /// can set/restore around it: this function has a dozen early returns, and
+    /// restoring at each of them is the shape that eventually misses one.
+    #[track_caller]
+    fn register_inner(
         &mut self,
         class_name: &str,
         method_name: &str,
@@ -5866,6 +6130,13 @@ impl NativeMethodRegistry {
                     // `join()` ran its body and returned a value. Must stay in
                     // step with `is_forkjoin_native_override`.
                     | ("completeExceptionally", "(Ljava/lang/Throwable;)V")
+                    // W6-9 §7.2: the only method on the class that CLEARS a
+                    // status bit. Unregistered, real bytecode reset the real
+                    // `status`/`aux`, which nothing here reads — the side-table
+                    // completion survived and the next `join()` replayed the
+                    // stale result. Must stay in step with
+                    // `is_forkjoin_native_override`.
+                    | ("reinitialize", "()V")
                     // L12: the STATIC `invokeAll` overloads. JDK 25's
                     // `invokeAll(t1, t2)` runs one task inline and then blocks
                     // in `awaitDone` for the FORKED sibling — which the lazy
@@ -6049,6 +6320,52 @@ impl NativeMethodRegistry {
                     | "java/nio/charset/CharsetEncoder"
                     | "java/nio/charset/CharsetDecoder"
             )
+        {
+            return;
+        }
+        // Real-JDK mode: drop the synthetic `FileChannel.open` FACTORY.
+        //
+        // `native_fc_open` (native-io) is the THIRD producer of an abstract
+        // `java/nio/channels/FileChannel` instance, and the one the suite's
+        // `RChannelInterrupt` actually reaches. The other two —
+        // `FileSystemProvider.newFileChannel`'s fallback and
+        // `RandomAccessFile.getChannel` — were audited first and are not on
+        // this path; that audit is why this took two rounds to find.
+        //
+        // It does `alloc_object(FileChannel, 2)` and writes an fd id and a
+        // position into slots 0/1. So `FileChannel.open(p, WRITE).getClass()`
+        // was `java.nio.channels.FileChannel` itself where HotSpot 25 answers
+        // `sun.nio.ch.FileChannelImpl`, and every method with no native to
+        // intercept it resolved to an ABSTRACT declaration:
+        // `AbstractMethodError: FileChannel.write(Ljava/nio/ByteBuffer;J)I has
+        // no Code attribute`. Only the no-position `write(ByteBuffer)` had a
+        // native at all. The same object also has no `interruptor`, which is
+        // the field `AbstractInterruptibleChannel.begin()` dereferences — the
+        // very defect `RChannelInterrupt` was written for.
+        //
+        // It is also wrong in a quieter way: the implementation is documented
+        // "simplified" and calls `open_read`, IGNORING the `OpenOption[]`
+        // entirely. `FileChannel.open(p, WRITE)` handed back a READ-ONLY fd.
+        //
+        // Dropping it is the whole fix because the real path is already built
+        // and already forced: `FileChannel.open` bytecode calls
+        // `FileSystemProvider.newFileChannel`, which is force-listed in
+        // `native_override.rs` and routed to the base-class registration, and
+        // that shim's RECONCILE-WITH-REAL block constructs a genuine
+        // `sun.nio.ch.FileChannelImpl` via its 7-arg `open`. Instrumenting that
+        // block previously produced NO output on this path — because
+        // `native_fc_open` intercepted the call before the provider was ever
+        // consulted. Its synthetic fallback stays in place, so a host where the
+        // real construction fails keeps exactly today's behaviour.
+        //
+        // Scoped to `open` BY NAME. The instance natives on this class
+        // (`read`/`write`/`position`/`size`/`close`) still serve that fallback
+        // object; they do not intercept a real `FileChannelImpl`, whose own
+        // declarations win because native dispatch keys on the resolved
+        // method's declaring class.
+        if self.drop_real_layout_synthetic
+            && class_name == "java/nio/channels/FileChannel"
+            && method_name == "open"
         {
             return;
         }

@@ -1,3 +1,4 @@
+import java.lang.reflect.Method;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
@@ -10,6 +11,7 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
+import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 
@@ -114,7 +116,14 @@ public class RChmKeySetView {
                 (ConcurrentHashMap.KeySetView<String, Boolean>) o;
         check(Boolean.TRUE.equals(view.getMappedValue()),
                 "getMappedValue()=" + view.getMappedValue());
-        check(view.getMap() != null, "getMap() is null");
+        // `!= null` alone is satisfied by a fresh map minted per call. The
+        // three lines below already prove the add reaches SOME map the getter
+        // returns; what they cannot see is that it is ONE map, held by the
+        // view, and empty before the add. Both halves are read from the same
+        // object at run time -- no host constant.
+        ConcurrentHashMap<String, Boolean> backing = view.getMap();
+        check(backing != null && backing.isEmpty() && backing == view.getMap(),
+                "getMap() must be one stable, initially empty backing map, got " + backing);
         view.add("a");
         check(view.getMap().containsKey("a"), "add() did not reach the backing map");
         check(Boolean.TRUE.equals(view.getMap().get("a")),
@@ -196,29 +205,65 @@ public class RChmKeySetView {
         check(view.contains("q"), "keySet(v) is a detached snapshot, not a live view");
     }
 
-    /** The blast radius: try-with-resources on a thread-per-task executor. */
+    /**
+     * The blast radius: closing a thread-per-task executor.
+     *
+     * Reached REFLECTIVELY, and closed through an `AutoCloseable` cast rather
+     * than try-with-resources, because this tree is also compiled at
+     * `--release 17` (regression-suite/run.sh, RELEASES) and all three of
+     * `Executors.newVirtualThreadPerTaskExecutor`, `newThreadPerTaskExecutor`
+     * and `ExecutorService extends AutoCloseable` are Java 19/21 API. A cast
+     * between two interface types is legal at every source level and reaches
+     * exactly the `close()` that try-with-resources would emit, so what is
+     * exercised is unchanged. A RUNTIME older than 21 has no such executor to
+     * exercise at all; that is said on the CK line instead of being counted as
+     * a check that did not run.
+     */
     static void executorClose() throws Exception {
+        Method newVirtual;
+        Method newPlatform;
+        try {
+            newVirtual = Executors.class.getMethod("newVirtualThreadPerTaskExecutor");
+            newPlatform = Executors.class.getMethod("newThreadPerTaskExecutor", ThreadFactory.class);
+        } catch (NoSuchMethodException e) {
+            // Absent on a real JDK 17 runtime; absent on a Java 21+ runtime it
+            // is the defect, not a level, so do not let it pass in silence.
+            check(Runtime.version().feature() < 21,
+                    "Java " + Runtime.version().feature() + " lacks " + e.getMessage());
+            System.out.println("CK thread-per-task=absent");
+            return;
+        }
+        System.out.println("CK thread-per-task=present");
+
         List<Future<Integer>> fs = new ArrayList<>();
-        try (ExecutorService es = Executors.newVirtualThreadPerTaskExecutor()) {
+        ExecutorService virt = (ExecutorService) newVirtual.invoke(null);
+        try {
             for (int i = 0; i < 16; i++) {
                 final int k = i;
-                fs.add(es.submit(() -> k * k));
+                fs.add(virt.submit(() -> k * k));
             }
             int sum = 0;
             for (Future<Integer> f : fs) {
                 sum += f.get();
             }
             check(sum == 1240, "virtual-thread tasks summed to " + sum);
+        } finally {
+            // Returning from this at all is the assertion: `close()` is
+            // `shutdown()` plus an UNBOUNDED `awaitTermination`, and
+            // `ThreadPerTaskExecutor.tryTerminate()` only advances
+            // SHUTDOWN -> TERMINATED once its `newKeySet()` of live threads
+            // reports empty. A view that never does hangs here forever rather
+            // than failing.
+            ((AutoCloseable) virt).close();
         }
-        // Reaching here at all is the assertion: close() is shutdown() plus an
-        // UNBOUNDED awaitTermination, so a view that never reports empty hangs
-        // the thread forever rather than failing.
-        ExecutorService es = Executors.newThreadPerTaskExecutor(Thread.ofPlatform().factory());
+
+        ExecutorService plat =
+                (ExecutorService) newPlatform.invoke(null, Executors.defaultThreadFactory());
         for (int i = 0; i < 8; i++) {
-            es.submit(() -> 1);
+            plat.submit(() -> 1);
         }
-        es.shutdown();
-        check(es.awaitTermination(60, TimeUnit.SECONDS),
+        plat.shutdown();
+        check(plat.awaitTermination(60, TimeUnit.SECONDS),
                 "newThreadPerTaskExecutor did not reach TERMINATED");
     }
 

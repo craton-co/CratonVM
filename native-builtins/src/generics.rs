@@ -14,6 +14,7 @@ use cratonvm_types::{ClassId, ObjectRef, Value};
 use std::cell::Cell;
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
+use cratonvm_types::error::MethodCallFailed;
 
 thread_local! {
     /// The `GenericDeclaration` (Class / Method / Constructor mirror) that owns
@@ -400,7 +401,7 @@ pub use cratonvm_reader::signature::{
     TypeArg, TypeParam, TypeSig,
 };
 
-use crate::alloc_concurrent_synthetic;
+use crate::try_alloc_concurrent_synthetic;
 
 /// Build the JVM internal name for an array whose component is a concrete
 /// (non-generic) type sig. Returns None for type-variable components, wildcards,
@@ -428,7 +429,7 @@ fn component_array_name(sig: &TypeSig) -> Option<String> {
 }
 
 /// Convert a TypeSig into a java.lang.reflect.Type runtime object.
-pub fn type_sig_to_java(ctx: &mut dyn NativeContext, sig: &TypeSig) -> Value {
+pub fn type_sig_to_java(ctx: &mut dyn NativeContext, sig: &TypeSig) -> Result<Value, MethodCallFailed> {
     match sig {
         TypeSig::Base(ch) => {
             // Primitive types -> Class mirror for the primitive.
@@ -450,10 +451,10 @@ pub fn type_sig_to_java(ctx: &mut dyn NativeContext, sig: &TypeSig) -> Value {
                 'S' => "short",
                 'Z' => "boolean",
                 'V' => "void",
-                _ => return Value::Object(None),
+                _ => return Ok(Value::Object(None)),
             };
             let mirror = ctx.primitive_class_mirror(prim_name);
-            Value::Object(Some(mirror))
+            Ok(Value::Object(Some(mirror)))
         }
         TypeSig::Class {
             name,
@@ -472,9 +473,9 @@ pub fn type_sig_to_java(ctx: &mut dyn NativeContext, sig: &TypeSig) -> Value {
             // initialization.
             if let Some(cid) = resolve_class_id_in_generic_scope(ctx, name) {
                 let mirror = ctx.get_class_mirror(cid);
-                Value::Object(Some(mirror))
+                Ok(Value::Object(Some(mirror)))
             } else {
-                Value::Object(None)
+                Ok(Value::Object(None))
             }
         }
         TypeSig::Class {
@@ -509,7 +510,7 @@ pub fn type_sig_to_java(ctx: &mut dyn NativeContext, sig: &TypeSig) -> Value {
             // use, matching the established `create_annotation_proxy`
             // pattern. `args_arr` gets the same treatment across its own
             // fill loop (mirrors `build_mirror_array`).
-            let pt = alloc_concurrent_synthetic(ctx, "java/lang/reflect/ParameterizedType", 3);
+            let pt = try_alloc_concurrent_synthetic(ctx, "java/lang/reflect/ParameterizedType", 3)?;
             let pt_pin = ctx.pin_native_root(pt);
             let raw_val = if let Some(cid) = resolve_class_id_in_generic_scope(ctx, name) {
                 let m = ctx.get_class_mirror(cid);
@@ -525,7 +526,7 @@ pub fn type_sig_to_java(ctx: &mut dyn NativeContext, sig: &TypeSig) -> Value {
                 let mut args_arr = new_type_array(ctx, type_args.len());
                 let args_pin = ctx.pin_native_root(args_arr);
                 for (i, arg) in type_args.iter().enumerate() {
-                    let val = type_arg_to_java(ctx, arg);
+                    let val = type_arg_to_java(ctx, arg)?;
                     // ParameterizedType arguments are never null in the JDK
                     // reflection contract. An absent optional dependency is
                     // represented by its erased Object type instead.
@@ -546,12 +547,12 @@ pub fn type_sig_to_java(ctx: &mut dyn NativeContext, sig: &TypeSig) -> Value {
             // Owner type (field 2): reify the enclosing type node, or null.
             let owner_val = match owner {
                 Some(o) => type_sig_to_java(ctx, o),
-                None => Value::Object(None),
-            };
+                None => Ok(Value::Object(None)),
+            }?;
             let pt = ctx.read_native_pin(pt_pin, pt);
             ctx.set_field(pt, 2, owner_val);
             ctx.unpin_native_roots(pt_pin);
-            Value::Object(Some(pt))
+            Ok(Value::Object(Some(pt)))
         }
         TypeSig::TypeVar(name) => {
             // A type-variable USE (`T` inside `ConstraintValidator<Max, T>`)
@@ -581,14 +582,56 @@ pub fn type_sig_to_java(ctx: &mut dyn NativeContext, sig: &TypeSig) -> Value {
                 let mut scope = decl;
                 for _ in 0..16 {
                     if let Some(real) = resolve_declared_type_variable(ctx, scope, name) {
-                        return real;
+                        return Ok(real);
                     }
-                    match ctx.invoke_virtual(scope, "getDeclaringClass", "()Ljava/lang/Class;", &[])
-                    {
+                    // Climb one lexical level. `getDeclaringClass` is the right
+                    // question for a method/constructor decl and for a MEMBER
+                    // class, but it answers NULL for an ANONYMOUS or LOCAL class
+                    // (JLS: those are not members of their enclosing class), so
+                    // the walk used to stop dead on the first anonymous scope and
+                    // fall through to the synthetic stand-in below — whose
+                    // `genericDeclaration` is then the anonymous class itself
+                    // rather than the class that actually declares the variable.
+                    // `new U<E>() { }` inside `class V<E>` is exactly that shape:
+                    // HotSpot reports `E`'s declaration as `V`, CratonVM reported
+                    // the anonymous `V$1`. netty's
+                    // `ReflectionUtil.resolveTypeParameter` then asks
+                    // `V$1.isAssignableFrom(V$1)` (true instead of false), loops,
+                    // walks off the end of the superclass chain and throws
+                    // "cannot determine the type of the type parameter 'E'" —
+                    // `io.netty.util.internal.TypeParameterMatcherTest.testInnerClass`.
+                    //
+                    // Only consulted when `getDeclaringClass` yields nothing, so a
+                    // `Method`/`Constructor` scope (which always has a declaring
+                    // class, and has no `getEnclosingClass`) never reaches it.
+                    let next = match ctx.invoke_virtual(
+                        scope,
+                        "getDeclaringClass",
+                        "()Ljava/lang/Class;",
+                        &[],
+                    ) {
                         Ok(Some(Value::Object(Some(enclosing)))) if enclosing != scope => {
-                            scope = enclosing;
+                            Some(enclosing)
                         }
-                        _ => break,
+                        _ => None,
+                    };
+                    let next = match next {
+                        Some(n) => Some(n),
+                        None => match ctx.invoke_virtual(
+                            scope,
+                            "getEnclosingClass",
+                            "()Ljava/lang/Class;",
+                            &[],
+                        ) {
+                            Ok(Some(Value::Object(Some(enclosing)))) if enclosing != scope => {
+                                Some(enclosing)
+                            }
+                            _ => None,
+                        },
+                    };
+                    match next {
+                        Some(enclosing) => scope = enclosing,
+                        None => break,
                     }
                 }
             }
@@ -616,14 +659,14 @@ pub fn type_sig_to_java(ctx: &mut dyn NativeContext, sig: &TypeSig) -> Value {
             // fixed-suite-bugs/springboot/thymeleaf-groovy-layoutdialect-metaclass-introspection-hang-FIXED.md.
             if let Value::Object(Some(decl)) = current_generic_decl() {
                 if let Some(cached) = cached_building_type_parameter(ctx, decl, name) {
-                    return cached;
+                    return Ok(cached);
                 }
             }
             // GC-safety (2026-07-16): same unrooted-across-allocation pattern
             // as the ParameterizedType arm above — pin `tv` immediately and
             // re-read the forwarded reference after each allocating call
             // (`create_string`, the `bounds_arr` allocation) before using it.
-            let tv = alloc_concurrent_synthetic(ctx, "java/lang/reflect/TypeVariable", 3);
+            let tv = try_alloc_concurrent_synthetic(ctx, "java/lang/reflect/TypeVariable", 3)?;
             let tv_pin = ctx.pin_native_root(tv);
             let name_str = ctx.create_string(name);
             let tv = ctx.read_native_pin(tv_pin, tv);
@@ -654,7 +697,7 @@ pub fn type_sig_to_java(ctx: &mut dyn NativeContext, sig: &TypeSig) -> Value {
                 mark_placeholder_type_parameter(ctx, decl, name);
             }
             ctx.unpin_native_roots(tv_pin);
-            Value::Object(Some(tv))
+            Ok(Value::Object(Some(tv)))
         }
         TypeSig::Array(component) => {
             // For concrete component types (primitive or non-generic class), the
@@ -669,22 +712,22 @@ pub fn type_sig_to_java(ctx: &mut dyn NativeContext, sig: &TypeSig) -> Value {
             let array_name = component_array_name(component);
             if let Some(name) = array_name {
                 if let Some(cid) = ctx.class_id_by_name(&name) {
-                    return Value::Object(Some(ctx.get_class_mirror(cid)));
+                    return Ok(Value::Object(Some(ctx.get_class_mirror(cid))));
                 }
                 if let Ok(Some(v)) = ctx.load_class(&name) {
-                    return v;
+                    return Ok(v);
                 }
             }
             // Fallback: GenericArrayType for unresolvable / type-variable components.
             // GC-safety: `gat` held across the recursive (allocating)
             // `type_sig_to_java` call — pin/re-read as above.
-            let gat = alloc_concurrent_synthetic(ctx, "java/lang/reflect/GenericArrayType", 1);
+            let gat = try_alloc_concurrent_synthetic(ctx, "java/lang/reflect/GenericArrayType", 1)?;
             let gat_pin = ctx.pin_native_root(gat);
             let comp_val = type_sig_to_java(ctx, component);
             let gat = ctx.read_native_pin(gat_pin, gat);
-            ctx.set_field(gat, 0, comp_val);
+            ctx.set_field(gat, 0, comp_val?);
             ctx.unpin_native_roots(gat_pin);
-            Value::Object(Some(gat))
+            Ok(Value::Object(Some(gat)))
         }
     }
 }
@@ -711,7 +754,7 @@ fn new_type_array(ctx: &mut dyn NativeContext, len: usize) -> cratonvm_types::Ob
 }
 
 /// Convert a TypeArg into a Type object.
-fn type_arg_to_java(ctx: &mut dyn NativeContext, arg: &TypeArg) -> Value {
+fn type_arg_to_java(ctx: &mut dyn NativeContext, arg: &TypeArg) -> Result<Value, MethodCallFailed> {
     match arg {
         TypeArg::Exact(sig) => {
             let value = type_sig_to_java(ctx, sig);
@@ -721,10 +764,10 @@ fn type_arg_to_java(ctx: &mut dyn NativeContext, arg: &TypeArg) -> Value {
             // Type entry: callers dereference every argument. Erasure to
             // Object is the conservative non-null representation when the
             // referenced class cannot be resolved.
-            if matches!(value, Value::Object(None)) {
-                ctx.class_id_by_name("java/lang/Object")
+            if matches!(value, Ok(Value::Object(None))) {
+                Ok(ctx.class_id_by_name("java/lang/Object")
                     .map(|id| Value::Object(Some(ctx.get_class_mirror(id))))
-                    .unwrap_or(value)
+                    .unwrap_or(value?))
             } else {
                 value
             }
@@ -738,13 +781,13 @@ fn type_arg_to_java(ctx: &mut dyn NativeContext, arg: &TypeArg) -> Value {
         // matching the established `pin_native_root` contract.
         TypeArg::Extends(sig) => {
             // WildcardType: field 0 = upperBounds, field 1 = lowerBounds
-            let wt = alloc_concurrent_synthetic(ctx, "java/lang/reflect/WildcardType", 2);
+            let wt = try_alloc_concurrent_synthetic(ctx, "java/lang/reflect/WildcardType", 2)?;
             let wt_pin = ctx.pin_native_root(wt);
             let upper = new_type_array(ctx, 1);
             let upper_pin = ctx.pin_native_root(upper);
             let bound_val = typesig_to_real_type(ctx, sig);
             let upper = ctx.read_native_pin(upper_pin, upper);
-            ctx.set_array_element(upper, 0, bound_val);
+            ctx.set_array_element(upper, 0, bound_val?);
             let wt = ctx.read_native_pin(wt_pin, wt);
             let upper = ctx.read_native_pin(upper_pin, upper);
             ctx.set_field(wt, 0, Value::Object(Some(upper)));
@@ -752,10 +795,10 @@ fn type_arg_to_java(ctx: &mut dyn NativeContext, arg: &TypeArg) -> Value {
             let wt = ctx.read_native_pin(wt_pin, wt);
             ctx.set_field(wt, 1, Value::Object(Some(lower)));
             ctx.unpin_native_roots(wt_pin);
-            Value::Object(Some(wt))
+            Ok(Value::Object(Some(wt)))
         }
         TypeArg::Super(sig) => {
-            let wt = alloc_concurrent_synthetic(ctx, "java/lang/reflect/WildcardType", 2);
+            let wt = try_alloc_concurrent_synthetic(ctx, "java/lang/reflect/WildcardType", 2)?;
             let wt_pin = ctx.pin_native_root(wt);
             let upper = new_type_array(ctx, 1);
             let upper_pin = ctx.pin_native_root(upper);
@@ -771,16 +814,16 @@ fn type_arg_to_java(ctx: &mut dyn NativeContext, arg: &TypeArg) -> Value {
             let lower_pin = ctx.pin_native_root(lower);
             let bound_val = typesig_to_real_type(ctx, sig);
             let lower = ctx.read_native_pin(lower_pin, lower);
-            ctx.set_array_element(lower, 0, bound_val);
+            ctx.set_array_element(lower, 0, bound_val?);
             let wt = ctx.read_native_pin(wt_pin, wt);
             let lower = ctx.read_native_pin(lower_pin, lower);
             ctx.set_field(wt, 1, Value::Object(Some(lower)));
             ctx.unpin_native_roots(wt_pin);
-            Value::Object(Some(wt))
+            Ok(Value::Object(Some(wt)))
         }
         TypeArg::Unbounded => {
             // ? => WildcardType with upper=Object, lower=empty
-            let wt = alloc_concurrent_synthetic(ctx, "java/lang/reflect/WildcardType", 2);
+            let wt = try_alloc_concurrent_synthetic(ctx, "java/lang/reflect/WildcardType", 2)?;
             let wt_pin = ctx.pin_native_root(wt);
             let upper = new_type_array(ctx, 1);
             let upper_pin = ctx.pin_native_root(upper);
@@ -796,7 +839,7 @@ fn type_arg_to_java(ctx: &mut dyn NativeContext, arg: &TypeArg) -> Value {
             let wt = ctx.read_native_pin(wt_pin, wt);
             ctx.set_field(wt, 1, Value::Object(Some(lower)));
             ctx.unpin_native_roots(wt_pin);
-            Value::Object(Some(wt))
+            Ok(Value::Object(Some(wt)))
         }
     }
 }
@@ -813,7 +856,7 @@ pub fn type_param_to_java(
     ctx: &mut dyn NativeContext,
     tp: &TypeParam,
     generic_decl: Value,
-) -> Value {
+) -> Result<Value, MethodCallFailed> {
     // Bounds may reference type variables (e.g. `<T extends Comparable<T>>`);
     // their declaration is this same generic declaration.
     let _scope = GenericDeclScope::new(generic_decl);
@@ -843,7 +886,7 @@ pub fn type_param_to_java(
     };
     let tv = match placeholder {
         Some(existing) => existing,
-        None => alloc_concurrent_synthetic(ctx, "java/lang/reflect/TypeVariable", 3),
+        None => try_alloc_concurrent_synthetic(ctx, "java/lang/reflect/TypeVariable", 3)?,
     };
     let tv_pin = ctx.pin_native_root(tv);
     let name_str = ctx.create_string(&tp.name);
@@ -873,7 +916,7 @@ pub fn type_param_to_java(
         let mut bounds_arr = new_type_array(ctx, bound_sigs.len());
         let bounds_pin = ctx.pin_native_root(bounds_arr);
         for (i, bs) in bound_sigs.iter().enumerate() {
-            let val = typesig_to_real_type(ctx, bs);
+            let val = typesig_to_real_type(ctx, bs)?;
             bounds_arr = ctx.read_native_pin(bounds_pin, bounds_arr);
             ctx.set_array_element(bounds_arr, i, val);
         }
@@ -892,7 +935,7 @@ pub fn type_param_to_java(
         clear_placeholder_type_parameter(ctx, decl, &tp.name);
     }
     ctx.unpin_native_roots(tv_pin);
-    Value::Object(Some(tv))
+    Ok(Value::Object(Some(tv)))
 }
 
 /// Build a REAL `sun.reflect.generics.reflectiveObjects.*` Type from a `TypeSig`.
@@ -908,7 +951,7 @@ pub fn type_param_to_java(
 /// identically to HotSpot. Non-parameterized / type-variable / array / primitive
 /// shapes fall back to [`type_sig_to_java`] (a raw `Class<?>` mirror renders
 /// fine; a synthetic `TypeVariable` is resolved via the generic-decl scope).
-pub(crate) fn typesig_to_real_type(ctx: &mut dyn NativeContext, sig: &TypeSig) -> Value {
+pub(crate) fn typesig_to_real_type(ctx: &mut dyn NativeContext, sig: &TypeSig) -> Result<Value, MethodCallFailed> {
     match sig {
         TypeSig::Class {
             name,
@@ -939,7 +982,7 @@ pub(crate) fn typesig_to_real_type(ctx: &mut dyn NativeContext, sig: &TypeSig) -
             for (i, a) in type_args.iter().enumerate() {
                 let v = typearg_to_real_type(ctx, a);
                 args = ctx.read_native_pin(args_pin, args);
-                ctx.set_array_element(args, i, v);
+                ctx.set_array_element(args, i, v?);
             }
             args = ctx.read_native_pin(args_pin, args);
             if crate::nbflags().trace_pti_args {
@@ -966,7 +1009,7 @@ pub(crate) fn typesig_to_real_type(ctx: &mut dyn NativeContext, sig: &TypeSig) -
             // interface (Create.I versus Search.I).
             let owner_val = match owner {
                 Some(o) => typesig_to_real_type(ctx, o),
-                None => match slashed.rsplit_once('$') {
+                None => Ok(match slashed.rsplit_once('$') {
                     Some((outer, _)) => {
                         let owner_id = resolve_class_id_in_generic_scope(ctx, outer);
                         owner_id
@@ -974,8 +1017,8 @@ pub(crate) fn typesig_to_real_type(ctx: &mut dyn NativeContext, sig: &TypeSig) -
                             .unwrap_or(Value::Object(None))
                     }
                     None => Value::Object(None),
-                },
-            };
+                }),
+            }?;
             let owner_pin = match owner_val {
                 Value::Object(Some(owner)) => Some(ctx.pin_native_root(owner)),
                 _ => None,
@@ -994,35 +1037,35 @@ pub(crate) fn typesig_to_real_type(ctx: &mut dyn NativeContext, sig: &TypeSig) -
             ctx.set_field_by_name(pti, "actualTypeArguments", Value::Object(Some(args)));
             ctx.set_field_by_name(pti, "ownerType", owner_val);
             ctx.unpin_native_roots(raw_pin);
-            Value::Object(Some(pti))
+            Ok(Value::Object(Some(pti)))
         }
         _ => type_sig_to_java(ctx, sig),
     }
 }
 
 /// Build the REAL `Type` for a single `TypeArg` (used by [`typesig_to_real_type`]).
-fn typearg_to_real_type(ctx: &mut dyn NativeContext, arg: &TypeArg) -> Value {
+fn typearg_to_real_type(ctx: &mut dyn NativeContext, arg: &TypeArg) -> Result<Value, MethodCallFailed> {
     match arg {
         TypeArg::Exact(sig) => {
             let value = typesig_to_real_type(ctx, sig);
             // Optional signature-only dependencies can be absent at runtime.
             // Real reflective Type arrays must contain a non-null entry.
-            if matches!(value, Value::Object(None)) {
-                object_class_mirror(ctx)
+            if matches!(value, Ok(Value::Object(None))) {
+                Ok(object_class_mirror(ctx))
             } else {
                 value
             }
         }
         TypeArg::Extends(sig) => {
             let b = typesig_to_real_type(ctx, sig);
-            real_wildcard_type(ctx, vec![b], vec![])
+            Ok(real_wildcard_type(ctx, vec![b?], vec![]))
         }
         TypeArg::Super(sig) => {
             // GC-safety (2026-07-16): `b` is computed before `obj`
             // (`object_class_mirror` can allocate a lazily-created mirror),
             // so it sits unrooted in a Rust local across that call. Pin it
             // immediately and re-read the forwarded reference before use.
-            let b = typesig_to_real_type(ctx, sig);
+            let b = typesig_to_real_type(ctx, sig)?;
             let b_pin = match b {
                 Value::Object(Some(r)) => Some(ctx.pin_native_root(r)),
                 _ => None,
@@ -1034,11 +1077,11 @@ fn typearg_to_real_type(ctx: &mut dyn NativeContext, arg: &TypeArg) -> Value {
                 }
                 _ => b,
             };
-            real_wildcard_type(ctx, vec![obj], vec![b])
+            Ok(real_wildcard_type(ctx, vec![obj], vec![b]))
         }
         TypeArg::Unbounded => {
             let obj = object_class_mirror(ctx);
-            real_wildcard_type(ctx, vec![obj], vec![])
+            Ok(real_wildcard_type(ctx, vec![obj], vec![]))
         }
     }
 }

@@ -65,8 +65,10 @@ hardware) express how the limits *would* be applied.
 When you do **not** pass `-Xmx`, the launcher calls `ergonomic_default_max_heap()`
 instead of using the fixed `256m` library default:
 
-* **Fraction:** max heap = **1/4 of physical RAM**
-  (approximating stock JDK `-XX:MaxRAMPercentage=25`).
+* **Fraction:** max heap = **1/4 of `min(physical RAM, cgroup memory limit)`**
+  (approximating stock JDK `-XX:MaxRAMPercentage=25`, which applies to the
+  container limit rather than the host total). The cgroup half is dropped when
+  container support is off or nothing is containerized.
 * **Floor:** 256 MiB — this only ever *raises* the heap above the historical
   baseline, never lowers it.
 * **Cap:** 4 GiB (`MAX_ERGONOMIC_HEAP`). The cap exists because CratonVM's
@@ -135,38 +137,43 @@ CRATONVM_DEFAULT_HEAP_ERGONOMICS=0 cratonvm -cp /app Main
 
 ## Status / what's wired
 
-Be honest about the seams here:
-
-* **Detector + bridge helper — implemented, not yet wired.** `detect_container()`,
-  `effective_memory_limit()`, and `effective_available_processors()` are present
-  and unit-tested in `vm/src/runtime/container.rs`. A container-aware bridge,
-  **`suggested_default_max_heap(&ContainerInfo, fallback)`**, also exists there —
-  it derives a default max-heap of **1/4 of the cgroup memory limit**, floored at
-  16 MiB and capped at 8 GiB, returning the `fallback` when not containerized.
-  But at the time of writing these have **no production callers** (the helper is
-  exercised only by its tests): the cgroup memory limit does **not** yet feed the
-  launcher's heap sizer, and the cgroup CPU count does **not** yet back
-  `Runtime.availableProcessors()`. Wiring `suggested_default_max_heap` into the
-  launcher's `--Xmx`-default path is the documented follow-up.
-* **Ergonomic default heap uses physical RAM, not the cgroup limit.**
-  `ergonomic_default_max_heap()` calls `physical_ram_bytes()` (which on Linux
-  reads `/proc/meminfo` `MemTotal`, i.e. the *host* total), **not**
-  `ContainerInfo::memory_limit`. Inside a memory-constrained container the
-  default can therefore overshoot the cgroup limit — wiring
-  `effective_memory_limit` into this path is the documented TODO.
+* **Detector — wired.** `detect_container()` runs in the launcher unless
+  `-XX:-UseContainerSupport` was given; its memory limit feeds the heap sizer and
+  its CPU count feeds `config.container_effective_processors`, which is what
+  `Runtime.availableProcessors()` and the JMX OS bean report.
+* **One heap sizer, not two.** Until 2026-08-10 there were two, and they
+  disagreed. `vm-cli::ergonomic_default_max_heap` sized off
+  `min(physical RAM, cgroup limit)`, capped at 4 GiB, floored at 256 MB;
+  `SharedVm::new`'s `suggested_default_max_heap` sized off the cgroup limit
+  alone, capped at 8 GiB, floored at 16 MiB, with none of the env knobs. The same
+  container therefore got two different default heaps depending on which entry
+  point started the VM. Both now clamp through
+  `vm::runtime::container::clamp_ergonomic_heap`, and a test asserts they agree
+  across six container sizes.
+* **The remaining launcher/embedder difference is deliberate.** An *uncontained*
+  embedder still gets the fixed 256 MB library default rather than a quarter of
+  host RAM. The launcher owns the process it sizes; an embedded VM shares an
+  application's address space and commits its arenas eagerly, so claiming a
+  quarter of the machine there is not a library's decision. A cgroup limit **is**
+  an explicit statement about the process's budget, which is why that case is
+  sized and the bare-metal case is not. An embedder that wants launcher
+  ergonomics calls `ergonomic_default_max_heap()` itself and passes the result to
+  `VmConfig::with_max_heap_size`.
 * **`-XX:+/-UseContainerSupport`.** Only the *disable* form
   (`-XX:-UseContainerSupport`) is a real launcher flag; it flips
-  `use_container_support` to `false` on the config. Container support is on by
-  default, but because the detector is not yet wired in, this toggle currently
-  has no effect on heap or CPU sizing — it is accepted for HotSpot
-  command-line parity.
+  `use_container_support` to `false` and skips detection entirely, so every limit
+  reverts to host values. The enable form is accepted for HotSpot
+  command-line parity — support is on by default.
 
 ### Recommendation
 
-Until the detector is wired into the heap sizer, **set `-Xmx` explicitly** for
-memory-constrained containers (e.g. `-Xmx` ≈ 50–75% of `--memory`), or cap the
-ergonomic default with `CRATONVM_DEFAULT_HEAP_MAX_MB`. Don't rely on automatic
-cgroup-derived heap sizing yet.
+The ergonomic default is 1/4 of `min(physical RAM, cgroup limit)`, capped at
+4 GiB and floored at 256 MB — the same shape HotSpot's `MaxRAMPercentage` gives
+under `-XX:+UseContainerSupport`. For a workload with a known working set,
+**setting `-Xmx` explicitly** is still the better answer (e.g. `-Xmx` ≈ 50–75%
+of `--memory`); the cap can also be moved with `CRATONVM_DEFAULT_HEAP_MAX_MB`.
+Note that the heap commits its arenas eagerly, so the default is charged to the
+cgroup whether or not the program uses it.
 
 ### Limitations
 

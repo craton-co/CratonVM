@@ -109,7 +109,7 @@ of unwrapping is what's actually needed here).
 
 ## Related
 
-- `../../../known-issues/hibernate/postgres-scram-sha256-pbkdf2-hmacsha384-missing-20260807.md`
-  — a separate, still-open crypto/auth gap found in the same real-database
-  investigation session (Postgres SCRAM auth, not TLS-upgrade socket
-  handling — different mechanism, same investigation).
+- `postgres-scram-sha256-pbkdf2-hmacsha384-missing-20260807-FIXED.md`
+  — a separate crypto/auth gap found in the same real-database investigation
+  session (Postgres SCRAM auth, not TLS-upgrade socket handling — different
+  mechanism, same investigation). Closed 2026-08-12.

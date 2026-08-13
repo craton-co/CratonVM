@@ -396,7 +396,61 @@ pub struct ClassRealm {
     /// Lambda proxy registry: maps synthetic proxy ClassId → LambdaCallSite metadata.
     /// Used by the interpreter to dispatch method calls on lambda proxy objects.
     /// T10.9.B: FxHashMap — ClassId-keyed.
-    pub lambda_proxies: RwLock<FxHashMap<ClassId, LambdaCallSite>>,
+    ///
+    /// Held behind an `Arc` because `try_lambda_dispatch` must take an owned
+    /// copy out from under the `RwLock` before it can run the lambda body (the
+    /// body can itself register proxies, so the read guard cannot be held
+    /// across it). With a bare `LambdaCallSite` that copy was a DEEP CLONE on
+    /// every lambda call — six `Arc<str>` refcount pairs plus a fresh
+    /// `Vec<char>` — and the clone/drop/`mi_free`/`memmove` around it measured
+    /// ~27% of a lambda-only `perf` profile. As an `Arc` the same line is one
+    /// refcount bump.
+    pub lambda_proxies: RwLock<FxHashMap<ClassId, Arc<LambdaCallSite>>>,
+
+    /// Cache of the synthesized `java.lang.reflect.Method` (with its
+    /// `parameterTypes`/`exceptionTypes` arrays and name/signature strings
+    /// already populated) that `proxy_invoke_handler_shared` builds for every
+    /// `InvocationHandler.invoke(proxy, method, args)` dispatch. Keyed by
+    /// (proxy's ClassId, method name, descriptor) — real JDK dynamic-proxy
+    /// classes build this Method object ONCE per interface method in their
+    /// static initializer, not per call; before this cache, CratonVM rebuilt
+    /// it (a fresh object + two arrays + two strings) on every single
+    /// reflective dispatch, which on allocation-heavy reflection-driven
+    /// workloads (e.g. ByteBuddy's `JavaDispatcher.INVOKER`) generated enough
+    /// short-lived garbage to fragment the non-compacting old-gen arena and
+    /// OOM even though most of the heap was nominally free.
+    /// Grow-only, bounded by the number of distinct (proxy class, method)
+    /// pairs an application actually exercises — not user-input-sized.
+    /// Rooted unconditionally in `memory::roots` alongside `class_mirrors`
+    /// since these Method objects, like class mirrors, are meant to outlive
+    /// any single call and be shared across every future dispatch to the
+    /// same proxy method.
+    pub proxy_method_cache: RwLock<FxHashMap<(ClassId, String, String), ObjectRef>>,
+
+    /// Resolved implementation-owner `ClassId` for each lambda proxy id, on the
+    /// **globally-resolved** path only.
+    ///
+    /// `try_lambda_dispatch` used to re-resolve its target *by name* on every
+    /// single SAM call — `invoke_shared`'s `load_class_concurrent` for the
+    /// `InvokeStatic` arm, and a `class_manager.write()` + `load_class` for the
+    /// `InvokeSpecial` / `NewInvokeSpecial` arms. `CRATONVM_DBG=lambda-prof`
+    /// priced it: of ~3,000-3,900 ns per dispatch of an **empty** lambda,
+    /// **2,300-3,080 ns was the target invoke** — and with a no-op body, that is
+    /// all resolution — against ~130 ns for the proxy-table lookup and ~230-300
+    /// ns for argument coercion. It is what made a lambda's interface call cost
+    /// ~4,200 ns against ~18 ns for the identical call on a named class, and why
+    /// the JIT was worth only 17% on Spring context startup: the cost sits in
+    /// Rust dispatch machinery that compiled Java bodies never enter.
+    ///
+    /// Only the *global* answer is memoised. The loader-faithful override
+    /// (`lambda_impl_dispatch_override_driven`) is still consulted first on
+    /// every call and is not cached here, so a user-loader-local copy keeps
+    /// winning exactly as before; this table is only ever reached once that
+    /// override has declined, which means the by-name answer is the stable
+    /// global copy. Grow-only, for the same reason `initiating_resolution_cache`
+    /// is: CratonVM does not unload classes, and in-place `redefine_class` keeps
+    /// the `ClassId`.
+    pub lambda_impl_owner_memo: RwLock<FxHashMap<ClassId, ClassId>>,
 
     /// Defining class (the class whose `invokedynamic` created this lambda /
     /// method-ref) for each lambda proxy id — what HotSpot names the proxy after

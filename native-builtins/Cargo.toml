@@ -17,7 +17,12 @@ categories.workspace = true
 # Default build is synthetic-stub-free: real bytecode runs, or a clear
 # unimplemented error is thrown. See docs/synthetic-vs-real-explained.md.
 default = []
-synthetic-jdk = []
+# Propagated to `cratonvm-classloading` because the two halves of the java.io
+# Reader/Writer split must agree: this crate's `bw_synthetic_fd` reads slot 0
+# only under this feature, and `synthetic_stub_fields` must be naming that slot
+# `_vm0` in the same build. Enabling one without the other is a model that says
+# `writeBuffer` while a native parks an fd there.
+synthetic-jdk = ["cratonvm-classloading/synthetic-jdk"]
 # Compatibility shims that are intentionally default-off. Declaring these keeps
 # source cfgs and downstream feature requests visible to Cargo's check-cfg.
 app-stubs = []

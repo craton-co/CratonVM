@@ -39,7 +39,7 @@ a knob with an on/off sense.
 | `CRATONVM_JAVA_HOME` | JDK to boot from; overrides `JAVA_HOME` for the boot probe. |
 | `CRATONVM_BIN` | Path to the `cratonvm` binary, for harnesses that re-exec it. |
 | `CRATONVM_MAVEN_REPO_LOCAL` | Local Maven repository root. |
-| `CRATONVM_ENABLE_ASSERTIONS` | Evaluate Java `assert` statements (the `-ea` analog). |
+| `CRATONVM_ENABLE_ASSERTIONS` | Evaluate Java `assert` statements. Set for you by an unscoped `-ea` on the command line; setting it directly is only needed for a launcher that cannot pass VM flags. |
 | `CRATONVM_DISABLE_JIT` | Interpreter-only execution. Also set by `--nojit`. |
 
 ## Legacy names
@@ -59,11 +59,12 @@ export inherited from a parent shell.
 
 ## `CRATONVM_DBG`
 
-419 tokens.
+437 tokens.
 
 | Token | Expands to |
 | --- | --- |
 | `a2` | `CRATONVM_DBG_A2` |
+| `a5-census` | `CRATONVM_DBG_A5_CENSUS` |
 | `sweep-liveness` | `CRATONVM_DBG_SWEEP_LIVENESS` |
 | `callee-deopt` | `CRATONVM_DBG_CALLEE_DEOPT` |
 | `layout-alias` | `CRATONVM_DBG_LAYOUT_ALIAS` |
@@ -84,6 +85,7 @@ export inherited from a parent shell.
 | `aioobe3` | `CRATONVM_DBG_AIOOBE3` |
 | `altrace` | `CRATONVM_DBG_ALTRACE` |
 | `ann-proxy-dispatch-trace` | `CRATONVM_ANN_PROXY_DISPATCH_TRACE` |
+| `ann-proxy-prof` | `CRATONVM_DBG_ANN_PROXY_PROF` |
 | `ann-trace` | `CRATONVM_ANN_TRACE` |
 | `annproxy-wrap` | `CRATONVM_DBG_ANNPROXY_WRAP` |
 | `anonalloc` | `CRATONVM_DBG_ANONALLOC` |
@@ -135,6 +137,7 @@ export inherited from a parent shell.
 | `debug-stack-tag` | `CRATONVM_DEBUG_STACK_TAG` |
 | `debug-stackwalk` | `CRATONVM_DEBUG_STACKWALK` |
 | `define` | `CRATONVM_DBG_DEFINE` |
+| `define-census` | `CRATONVM_DBG_DEFINE_CENSUS` |
 | `deflate` | `CRATONVM_DBG_DEFLATE` |
 | `deopt` | `CRATONVM_DBG_DEOPT` |
 | `deopt-eager` | `CRATONVM_DEOPT_EAGER` |
@@ -153,11 +156,13 @@ export inherited from a parent shell.
 | `dispatch-tally` | `CRATONVM_DBG_DISPATCH_TALLY` |
 | `dopriv` | `CRATONVM_DBG_DOPRIV` |
 | `dropped-stubs` | `CRATONVM_DBG_DROPPED_STUBS` |
+| `dupdef` | `CRATONVM_DBG_DUPDEF` |
 | `dump-jit` | `CRATONVM_DBG_DUMP_JIT` |
 | `dupcall-filter` | `CRATONVM_DBG_DUPCALL_FILTER` |
 | `dupclass` | `CRATONVM_DBG_DUPCLASS` |
 | `dupclass-bt` | `CRATONVM_DBG_DUPCLASS_BT` |
 | `dupclass-filter` | `CRATONVM_DBG_DUPCLASS_FILTER` |
+| `typecheck-filter` | `CRATONVM_DBG_TYPECHECK_FILTER` |
 | `dupx-methods` | `CRATONVM_DBG_DUPX_METHODS` |
 | `ecwatch` | `CRATONVM_DBG_ECWATCH` |
 | `ecwatch-native` | `CRATONVM_DBG_ECWATCH_NATIVE` |
@@ -176,18 +181,20 @@ export inherited from a parent shell.
 | `fieldaddr` | `CRATONVM_DBG_FIELDADDR` |
 | `force-moving` | `CRATONVM_DBG_FORCE_MOVING` |
 | `forname-trace` | `CRATONVM_FORNAME_TRACE` |
-| `fjp-eager-fork` | `CRATONVM_FJP_EAGER_FORK` |
 | `frame-trace` | `CRATONVM_FRAME_TRACE` |
 | `fsp` | `CRATONVM_DBG_FSP` |
 | `fullstack-scan` | `CRATONVM_DBG_FULLSTACK_SCAN` |
+| `fwdwalk` | `CRATONVM_DBG_FWDWALK` |
 | `fwdguard` | `CRATONVM_DBG_FWDGUARD` |
 | `g1-dbg-headers` | `CRATONVM_G1_DBG_HEADERS` |
 | `g1-dbg-pins` | `CRATONVM_G1_DBG_PINS` |
 | `g1-dbg-reach` | `CRATONVM_G1_DBG_REACH` |
 | `g1-dbg-rootcensus` | `CRATONVM_G1_DBG_ROOTCENSUS` |
+| `gdm-prof` | `CRATONVM_DBG_GDM_PROF` |
 | `g1-dbg-zero` | `CRATONVM_G1_DBG_ZERO` |
 | `g1diag` | `CRATONVM_DBG_G1DIAG` |
 | `gc-array-guard-bt` | `CRATONVM_GC_ARRAY_GUARD_BT` |
+| `gc-fallback-reasons` | `CRATONVM_DBG_GC_FALLBACK_REASONS` |
 | `gc-overhead` | `CRATONVM_DBG_GC_OVERHEAD` |
 | `gc-stats` | `CRATONVM_GC_STATS` |
 | `gc-stress` | `CRATONVM_DBG_GC_STRESS` |
@@ -258,6 +265,7 @@ export inherited from a parent shell.
 | `field-site` | `CRATONVM_DBG_FIELD_SITE` |
 | `jit-method-stats` | `CRATONVM_DBG_JIT_METHOD_STATS` |
 | `jit-mic` | `CRATONVM_DBG_JIT_MIC` |
+| `jit-scan-prof` | `CRATONVM_DBG_JIT_SCAN_PROF` |
 | `jit-names` | `CRATONVM_DBG_JIT_NAMES` |
 | `jit-pin` | `CRATONVM_DBG_JIT_PIN` |
 | `jit-putfield` | `CRATONVM_DBG_JIT_PUTFIELD` |
@@ -271,6 +279,7 @@ export inherited from a parent shell.
 | `lambda` | `CRATONVM_DBG_LAMBDA` |
 | `lambda-dispatch` | `CRATONVM_DBG_LAMBDA_DISPATCH` |
 | `lambda-generic` | `CRATONVM_DBG_LAMBDA_GENERIC` |
+| `lambda-prof` | `CRATONVM_DBG_LAMBDA_PROF` |
 | `layout` | `CRATONVM_DBG_LAYOUT` |
 | `ldc-classref-trace` | `CRATONVM_LDC_CLASSREF_TRACE` |
 | `letsgo` | `CRATONVM_DBG_LETSGO` |
@@ -282,6 +291,7 @@ export inherited from a parent shell.
 | `loadclass` | `CRATONVM_DBG_LOADCLASS` |
 | `loader-chain` | `CRATONVM_DBG_LOADER_CHAIN` |
 | `loader-trace` | `CRATONVM_DBG_LOADER_TRACE` |
+| `load-transform-no-memo` | `CRATONVM_DBG_LOAD_TRANSFORM_NO_MEMO` |
 | `logprov` | `CRATONVM_DBG_LOGPROV` |
 | `longroot` | `CRATONVM_DBG_LONGROOT` |
 | `lookup` | `CRATONVM_DBG_LOOKUP` |
@@ -294,6 +304,11 @@ export inherited from a parent shell.
 | `mh-dispatch` | `CRATONVM_DBG_MH_DISPATCH` |
 | `mh-stack` | `CRATONVM_DBG_MH_STACK` |
 | `mic-prof` | `CRATONVM_DBG_MIC_PROF` |
+| `mic-method` | `CRATONVM_DBG_MIC_METHOD` |
+| `mark-why-class` | `CRATONVM_DBG_MARK_WHY_CLASS` |
+| `mirrorpin-why` | `CRATONVM_DBG_MIRRORPIN_WHY` |
+| `root-source` | `CRATONVM_DBG_ROOT_SOURCE` |
+| `mic-trace` | `CRATONVM_DBG_MIC_TRACE` |
 | `minvoke` | `CRATONVM_DBG_MINVOKE` |
 | `mirrorpin` | `CRATONVM_DBG_MIRRORPIN` |
 | `modprov` | `CRATONVM_DBG_MODPROV` |
@@ -307,6 +322,7 @@ export inherited from a parent shell.
 | `moving-young-verify` | `CRATONVM_MOVING_YOUNG_VERIFY` |
 | `msc` | `CRATONVM_DBG_MSC` |
 | `mtroots` | `CRATONVM_DBG_MTROOTS` |
+| `nativelibraries-load-ok` | `CRATONVM_DBG_NATIVELIBRARIES_LOAD_OK` |
 | `ncdfe` | `CRATONVM_DBG_NCDFE` |
 | `needs-exact-trace` | `CRATONVM_NEEDS_EXACT_TRACE` |
 | `net` | `CRATONVM_DBG_NET` |
@@ -335,6 +351,7 @@ export inherited from a parent shell.
 | `oom-bt` | `CRATONVM_DBG_OOM_BT` |
 | `oop-span-probe` | `CRATONVM_OOP_SPAN_PROBE` |
 | `osr` | `CRATONVM_DBG_OSR` |
+| `overlay-gate` | `CRATONVM_DBG_OVERLAY_GATE` |
 | `owner-filter` | `CRATONVM_DBG_OWNER_FILTER` |
 | `osr-exit-after` | `CRATONVM_OSR_EXIT_AFTER` |
 | `osr-exit-test` | `CRATONVM_OSR_EXIT_TEST` |
@@ -379,6 +396,7 @@ export inherited from a parent shell.
 | `rootsnap` | `CRATONVM_DBG_ROOTSNAP` |
 | `rootsnap-every` | `CRATONVM_DBG_ROOTSNAP_EVERY` |
 | `rootsnap-verify` | `CRATONVM_DBG_ROOTSNAP_VERIFY` |
+| `rootprof` | `CRATONVM_DBG_ROOTPROF` |
 | `rset-audit` | `CRATONVM_DBG_RSET_AUDIT` |
 | `rset-audit-young-scan` | `CRATONVM_DBG_RSET_AUDIT_YOUNG_SCAN` |
 | `rterr` | `CRATONVM_DBG_RTERR` |
@@ -486,7 +504,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_JIT`
 
-169 tokens.
+172 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -527,6 +545,8 @@ export inherited from a parent shell.
 | `enable-inline-new` | `CRATONVM_JIT_ENABLE_INLINE_NEW` |
 | `exc-table-c2` | `CRATONVM_JIT_NO_EXC_TABLE_C2` |
 | `force-c2` | `CRATONVM_JIT_FORCE_C2` |
+| `native-shadow-interface-blind` | `CRATONVM_JIT_NATIVE_SHADOW_INTERFACE_BLIND` |
+| `native-shadow-caller-seal` | `CRATONVM_JIT_NATIVE_SHADOW_CALLER_SEAL` |
 | `full-self-call-spill` | `CRATONVM_JIT_FULL_SELF_CALL_SPILL` |
 | `gc-inert-selfrec` | `CRATONVM_JIT_GC_INERT_SELFREC` |
 | `getfield-helper` | `CRATONVM_JIT_GETFIELD_HELPER` |
@@ -553,6 +573,7 @@ export inherited from a parent shell.
 | `ir-isel-emit` | `CRATONVM_JIT_IR_ISEL_EMIT` |
 | `ir-isel-verify` | `CRATONVM_JIT_IR_ISEL_VERIFY` |
 | `precise-field-ops` | `CRATONVM_JIT_NO_PRECISE_FIELD_OPS` |
+| `precise-getstatic-checkcast` | `CRATONVM_JIT_NO_PRECISE_GETSTATIC_CHECKCAST` |
 | `ir-linear-scan` | `CRATONVM_JIT_IR_LINEAR_SCAN` |
 | `ir-long` | `CRATONVM_JIT_IR_LONG` |
 | `ir-reloc-emit` | `CRATONVM_JIT_IR_RELOC_EMIT` |
@@ -662,7 +683,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_GC`
 
-37 tokens.
+40 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -675,6 +696,7 @@ export inherited from a parent shell.
 | `default-heap-max-mb` | `CRATONVM_DEFAULT_HEAP_MAX_MB` |
 | `defrag-promote` | `CRATONVM_NO_DEFRAG_PROMOTE` |
 | `exact-refproc-survival` | `CRATONVM_NO_EXACT_REFPROC_SURVIVAL` |
+| `g1-coverage-pin` | `CRATONVM_G1_COVERAGE_PIN` |
 | `g1-evac-retry` | `CRATONVM_G1_NO_EVAC_RETRY` |
 | `g1-parallel-evac` | `CRATONVM_G1_PARALLEL_EVAC` |
 | `g1-workers` | `CRATONVM_G1_WORKERS` |
@@ -702,14 +724,17 @@ export inherited from a parent shell.
 | `tlab-gc-trigger` | `CRATONVM_TLAB_GC_TRIGGER` |
 | `weakref-clear` | `CRATONVM_WEAKREF_CLEAR` |
 | `youngscan-stride` | `CRATONVM_YOUNGSCAN_STRIDE` |
+| `zgc-startbits` | `CRATONVM_ZGC_STARTBITS` |
+| `zgc-tlab` | `CRATONVM_ZGC_TLAB` |
 | `young-pause-goal-ms` | `CRATONVM_GC_YOUNG_PAUSE_MS` |
 
 ## `CRATONVM_REAL`
 
-24 tokens.
+27 tokens.
 
 | Token | Expands to |
 | --- | --- |
+| `bytebuffer-intrinsic` | `CRATONVM_BYTEBUFFER_INTRINSIC` |
 | `agroal` | `CRATONVM_REAL_AGROAL / CRATONVM_SYNTHETIC_AGROAL` |
 | `annotations` | `CRATONVM_REAL_ANNOTATIONS / CRATONVM_SYNTHETIC_ANNOTATIONS` |
 | `aqs` | `CRATONVM_REAL_AQS / CRATONVM_SYNTHETIC_AQS` |
@@ -719,7 +744,9 @@ export inherited from a parent shell.
 | `filewriter` | `CRATONVM_SYNTHETIC_FILEWRITER` |
 | `forkjoinpool` | `CRATONVM_REAL_FORKJOINPOOL / CRATONVM_SYNTHETIC_FORKJOINPOOL` |
 | `jca` | `CRATONVM_REAL_JCA` |
+| `memoryusage-tostring` | `CRATONVM_SYNTHETIC_MEMORYUSAGE_TOSTRING` |
 | `msc-real-start` | `CRATONVM_MSC_REAL_START` |
+| `mxbean-mapping` | `CRATONVM_SYNTHETIC_MXBEAN_MAPPING` |
 | `net-sockets` | `CRATONVM_REAL_NET_SOCKETS / CRATONVM_SYNTHETIC_NET_SOCKETS` |
 | `pqc` | `CRATONVM_SYNTHETIC_PQC` |
 | `proxy` | `CRATONVM_REAL_PROXY` |
@@ -786,16 +813,18 @@ export inherited from a parent shell.
 | `default-watchdog-sec` | `CRATONVM_DEFAULT_WATCHDOG_SEC` |
 | `eqe-sync-execute` | `CRATONVM_EQE_SYNC_EXECUTE` |
 | `exec-depth-ceiling` | `CRATONVM_EXEC_DEPTH_CEILING` |
+| `fjp-eager-fork` | `CRATONVM_FJP_EAGER_FORK` |
 | `inherit-thread-ccl` | `CRATONVM_INHERIT_THREAD_CCL` |
 | `inherit-tl-workaround` | `CRATONVM_INHERIT_TL_WORKAROUND` |
 | `lock-order-check` | `CRATONVM_LOCK_ORDER_CHECK` |
 | `stress-thread-states` | `CRATONVM_STRESS_THREAD_STATES` |
 | `striped-counters` | `CRATONVM_STRIPED_COUNTERS_OFF` |
+| `thread-containers` | `CRATONVM_THREAD_CONTAINERS` |
 | `thread-start-grace-ms` | `CRATONVM_THREAD_START_GRACE_MS` |
 
 ## `CRATONVM_SECURITY`
 
-11 tokens.
+12 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -807,13 +836,14 @@ export inherited from a parent shell.
 | `confine-io` | `CRATONVM_CONFINE_IO` |
 | `harden-manifest-classpath` | `CRATONVM_HARDEN_MANIFEST_CLASSPATH` |
 | `noncrypto-sslengine` | `CRATONVM_ALLOW_NONCRYPTO_SSLENGINE` |
+| `reflect-export-gate` | `CRATONVM_REFLECT_NO_EXPORT_GATE` |
 | `require-policy` | `CRATONVM_REQUIRE_POLICY` |
 | `trust-pem` | `CRATONVM_TRUST_PEM` |
 | `untrusted-code` | `CRATONVM_UNTRUSTED_CODE` |
 
 ## `CRATONVM_COMPAT`
 
-12 tokens.
+13 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -829,6 +859,7 @@ export inherited from a parent shell.
 | `mockito-legacy-selectors` | `CRATONVM_MOCKITO_LEGACY_SELECTORS` |
 | `strict-swallows` | `CRATONVM_STRICT_SWALLOWS` |
 | `tomcat-mapper-natives` | `CRATONVM_TOMCAT_MAPPER_NATIVES` |
+| `vh-strict-reference-return` | `CRATONVM_VH_STRICT_REFERENCE_RETURN` |
 
 ## `CRATONVM_TEST`
 

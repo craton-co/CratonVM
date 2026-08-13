@@ -20,21 +20,35 @@ pub(crate) fn p67_layout_object(
     class_name: &str,
     byte_size: i64,
     byte_alignment: i64,
-) -> ObjectRef {
-    let obj = alloc_concurrent_synthetic(ctx, class_name, 4);
+) -> Result<ObjectRef, MethodCallFailed> {
+    let obj = try_alloc_concurrent_synthetic(ctx, class_name, 4)?;
     ctx.set_field(obj, 0, Value::Long(byte_size));
     ctx.set_field(obj, 1, Value::Long(byte_alignment));
-    ctx.set_field(obj, 2, Value::Int(0));
+    // Slot 2 is the little-endian flag, and every `java.lang.foreign` layout
+    // this factory stands in for is built by the JDK from
+    // `ByteOrder.nativeOrder()`. It used to be a hard-coded `Int(0)` — "big
+    // endian" — for every layout on every host, and nothing noticed because
+    // `p67_layout_is_little` short-circuited on a FIELD COUNT: the FFM preseed
+    // hands out two-slot objects, and `object_num_fields <= 2` answered
+    // "little" before the flag was ever read. Measured 2026-08-10 by
+    // `probes/W2ValueLayoutProbe` the moment that preseed stopped running:
+    // every constant reported `order() == BIG_ENDIAN` while
+    // `ByteOrder.nativeOrder()` two lines above answered LITTLE_ENDIAN.
+    ctx.set_field(
+        obj,
+        2,
+        Value::Int(i32::from(cfg!(target_endian = "little"))),
+    );
     ctx.set_field(obj, 3, Value::Object(None));
-    obj
+    Ok(obj)
 }
 
-pub(crate) fn p67_optional(ctx: &mut dyn NativeContext, value: Value) -> ObjectRef {
+pub(crate) fn p67_optional(ctx: &mut dyn NativeContext, value: Value) -> Result<ObjectRef, MethodCallFailed> {
     let pinned = match value {
         Value::Object(Some(obj)) => Some((ctx.pin_native_root(obj), obj)),
         _ => None,
     };
-    let opt = alloc_concurrent_synthetic(ctx, "java/util/Optional", 1);
+    let opt = try_alloc_concurrent_synthetic(ctx, "java/util/Optional", 1)?;
     let value = match pinned {
         Some((pin, obj)) => {
             let obj = ctx.read_native_pin(pin, obj);
@@ -44,7 +58,7 @@ pub(crate) fn p67_optional(ctx: &mut dyn NativeContext, value: Value) -> ObjectR
         None => Value::Object(None),
     };
     ctx.set_field(opt, 0, value);
-    opt
+    Ok(opt)
 }
 
 pub(crate) fn p67_layout_name_value(ctx: &dyn NativeContext, layout: ObjectRef) -> Value {
@@ -64,7 +78,7 @@ pub(crate) fn p67_layout_name_value(ctx: &dyn NativeContext, layout: ObjectRef) 
 pub(crate) fn p67_layout_name(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     let name = p67_layout_name_value(ctx, this);
-    Ok(Some(Value::Object(Some(p67_optional(ctx, name)))))
+    Ok(Some(Value::Object(Some(p67_optional(ctx, name)?))))
 }
 
 pub(crate) fn p67_layout_carrier_name(class_name: &str) -> &'static str {
@@ -93,19 +107,19 @@ pub(crate) fn p67_layout_carrier_name(class_name: &str) -> &'static str {
     }
 }
 
-pub(crate) fn p67_class_mirror(ctx: &mut dyn NativeContext, class_name: &str) -> ObjectRef {
+pub(crate) fn p67_class_mirror(ctx: &mut dyn NativeContext, class_name: &str) -> Result<ObjectRef, MethodCallFailed> {
     match class_name {
         "boolean" | "byte" | "char" | "short" | "int" | "long" | "float" | "double" | "void" => {
-            ctx.primitive_class_mirror(class_name)
+            Ok(ctx.primitive_class_mirror(class_name))
         }
         _ => {
             if let Some(cid) = ctx.class_id_by_name(class_name) {
-                return ctx.get_class_mirror(cid);
+                return Ok(ctx.get_class_mirror(cid));
             }
             if let Ok(cid) = ctx.ensure_class_initialized(class_name) {
-                return ctx.get_class_mirror(cid);
+                return Ok(ctx.get_class_mirror(cid));
             }
-            alloc_concurrent_synthetic(ctx, "java/lang/Class", 2)
+            try_alloc_concurrent_synthetic(ctx, "java/lang/Class", 2)
         }
     }
 }
@@ -119,7 +133,7 @@ pub(crate) fn p67_layout_carrier(ctx: &mut dyn NativeContext, args: &[Value]) ->
     Ok(Some(Value::Object(Some(p67_class_mirror(
         ctx,
         carrier_name,
-    )))))
+    )?))))
 }
 
 pub(crate) fn p67_layout_with_name(
@@ -143,7 +157,7 @@ pub(crate) fn p67_layout_with_name(
         Value::Object(Some(obj)) => Some((ctx.pin_native_root(obj), obj)),
         _ => None,
     };
-    let cloned = alloc_concurrent_synthetic(ctx, &class_name, clone_fields);
+    let cloned = try_alloc_concurrent_synthetic(ctx, &class_name, clone_fields)?;
     let this = ctx.read_native_pin(this_pin, this);
     for i in 0..field_count {
         ctx.set_field(cloned, i, ctx.get_field(this, i));
@@ -171,7 +185,7 @@ pub(crate) fn p67_address_layout_target_layout(
     } else {
         Value::Object(None)
     };
-    Ok(Some(Value::Object(Some(p67_optional(ctx, target)))))
+    Ok(Some(Value::Object(Some(p67_optional(ctx, target)?))))
 }
 
 pub(crate) fn p67_address_layout_with_target_layout(
@@ -190,7 +204,7 @@ pub(crate) fn p67_address_layout_with_target_layout(
         Value::Object(Some(obj)) => Some((ctx.pin_native_root(obj), obj)),
         _ => None,
     };
-    let cloned = alloc_concurrent_synthetic(ctx, &class_name, clone_fields);
+    let cloned = try_alloc_concurrent_synthetic(ctx, &class_name, clone_fields)?;
     let this = ctx.read_native_pin(this_pin, this);
     for i in 0..field_count {
         ctx.set_field(cloned, i, ctx.get_field(this, i));
@@ -214,13 +228,14 @@ pub(crate) fn p67_set_value_layout_static(
     class_name: &str,
     byte_size: i64,
     byte_alignment: i64,
-) {
-    let obj = p67_layout_object(ctx, class_name, byte_size, byte_alignment);
+) -> Result<(), MethodCallFailed> {
+    let obj = p67_layout_object(ctx, class_name, byte_size, byte_alignment)?;
     ctx.set_static_field_by_name(
         "java/lang/foreign/ValueLayout",
         field_name,
         Value::Object(Some(obj)),
     );
+    Ok(())
 }
 
 pub(crate) fn p67_value_layout_clinit(
@@ -320,9 +335,29 @@ pub(crate) fn p67_value_layout_clinit(
             1_i64,
         ),
     ] {
-        p67_set_value_layout_static(ctx, field_name, class_name, byte_size, byte_alignment);
+        p67_set_value_layout_static(ctx, field_name, class_name, byte_size, byte_alignment)?;
     }
     Ok(None)
+}
+
+/// `(byteSize, byteAlignment)` of a layout carrier.
+///
+/// Every layout this file mints keeps the same two-slot prefix —
+/// `[0]=byteSize, [1]=byteAlignment` — see [`p67_layout_object`]. The
+/// alignment fallback is `size` because that is what a `ValueLayout`'s natural
+/// alignment is; a zero would make the rounding below divide by zero.
+pub(crate) fn p67_layout_size_align(ctx: &mut dyn NativeContext, layout: ObjectRef) -> (i64, i64) {
+    let size = match ctx.get_field(layout, 0) {
+        Value::Long(v) => v,
+        Value::Int(v) => i64::from(v),
+        _ => 0,
+    };
+    let align = match ctx.get_field(layout, 1) {
+        Value::Long(v) if v > 0 => v,
+        Value::Int(v) if v > 0 => i64::from(v),
+        _ => size.max(1),
+    };
+    (size.max(0), align.max(1))
 }
 
 pub(crate) fn p67_layout_byte_size(
@@ -349,14 +384,68 @@ pub(crate) fn p67_return_this(_ctx: &mut dyn NativeContext, args: &[Value]) -> M
     Ok(Some(args.first().copied().unwrap_or(Value::Object(None))))
 }
 
+/// JDK-ONLY-LAYOUT (kind 2): converted from a raw slot-2 read behind a FIELD
+/// COUNT to a by-NAME read on the receiver.
+///
+/// Slot 2 is CratonVM's fabricated `(byteSize, byteAlignment, littleEndianFlag,
+/// name)` value-layout model. On a real `jdk.internal.foreign.layout.
+/// ValueLayouts$AbstractValueLayout` the first two coincide -- `AbstractLayout`
+/// declares `byteSize` and `byteAlignment` in that order -- and slot 2 does
+/// NOT: it is `name:Optional<String>`, with `carrier` and the real `order` at 3
+/// and 4.
+///
+/// The `object_num_fields(layout) <= 2` test in front of it was the SIXTH
+/// count-based layout guard this family has produced, and like the other five
+/// it stopped an out-of-range read rather than a wrong-field one. It answered
+/// correctly only because the FFM preseed hands out exactly two slots; the
+/// moment a real `ValueLayout.<clinit>` builds the constants instead (which is
+/// what `--jdk-only` does since 2026-08-10) the object has six fields, the read
+/// lands on an unwritten `Optional` reference, and the R-niche rule decodes
+/// that as `Int(0)` -- so every layout reported **BIG_ENDIAN** on a
+/// little-endian host while `ByteOrder.nativeOrder()` next to it said
+/// LITTLE_ENDIAN. Measured against Temurin 25.0.3 by
+/// `probes/W2ValueLayoutProbe`.
 pub(crate) fn p67_layout_is_little(ctx: &dyn NativeContext, layout: ObjectRef) -> bool {
+    // Real layout: it declares `order`, a `java.nio.ByteOrder` reference, and
+    // that object declares `name`.
+    if let Value::Object(Some(order_obj)) = ctx.get_field_by_name(layout, "order") {
+        if let Value::Object(Some(name_obj)) = ctx.get_field_by_name(order_obj, "name") {
+            if let Some(n) = ctx.read_string(name_obj) {
+                return n != "BIG_ENDIAN";
+            }
+        }
+        // A FABRICATED `java.nio.ByteOrder` carries the flag as an Int at slot
+        // 0 instead of a name -- see `p67_byte_order_object`, which writes both
+        // when the class declares `name` and only the flag when it does not.
+        if let Some(v) = ctx.get_field(order_obj, 0).as_int() {
+            return v != 0;
+        }
+    }
+    // Fabricated layout: slot 2 is the flag, and only OUR model has one. Asked
+    // by NAME, not by count: a real value layout declares `carrier`.
+    let class_id = ctx.class_id_of_object(layout);
+    let is_real = ctx
+        .declared_fields(class_id)
+        .iter()
+        .any(|f| !f.is_static && (f.name == "carrier" || f.name == "order"));
+    if is_real {
+        // A real layout with no readable `order` says nothing about byte order;
+        // every JDK constant is built from `ByteOrder.nativeOrder()`.
+        return cfg!(target_endian = "little");
+    }
+    // BOUNDS check, not a layout guard — the layout question was already
+    // settled by name above. The FFM preseed hands out objects sized
+    // `num_total_fields.max(2)`, which have no slot 2 to read; answering the
+    // host's native order is what `p67_layout_object` would have written had
+    // there been room. Keeping the two kinds of test apart is the point: the
+    // old `<= 2` here was doing BOTH jobs, and the layout half of it was wrong.
     if ctx.object_num_fields(layout) <= 2 {
-        return true;
+        return cfg!(target_endian = "little");
     }
     ctx.get_field(layout, 2)
         .as_int()
         .map(|v| v != 0)
-        .unwrap_or(true)
+        .unwrap_or(cfg!(target_endian = "little"))
 }
 
 /// A `java.nio.ByteOrder` for `MemoryLayout.order()`.
@@ -378,8 +467,8 @@ pub(crate) fn p67_layout_is_little(ctx: &dyn NativeContext, layout: ObjectRef) -
 /// `java.nio.ByteOrder` resolves `name` to slot 0 and gets the String;
 /// a shape where the resolved index is out of range is skipped rather than
 /// written out of bounds.
-pub(crate) fn p67_byte_order_object(ctx: &mut dyn NativeContext, little_endian: bool) -> ObjectRef {
-    let obj = alloc_concurrent_synthetic(ctx, "java/nio/ByteOrder", 1);
+pub(crate) fn p67_byte_order_object(ctx: &mut dyn NativeContext, little_endian: bool) -> Result<ObjectRef, MethodCallFailed> {
+    let obj = try_alloc_concurrent_synthetic(ctx, "java/nio/ByteOrder", 1)?;
     ctx.set_field(obj, 0, Value::Int(if little_endian { 1 } else { 0 }));
     let cid = ctx.class_id_of_object(obj);
     // Bound before the `if let` so the immutable reborrow of `ctx` ends here
@@ -398,10 +487,10 @@ pub(crate) fn p67_byte_order_object(ctx: &mut dyn NativeContext, little_endian: 
             let obj = ctx.read_native_pin(obj_pin, obj);
             ctx.unpin_native_roots(obj_pin);
             ctx.set_field(obj, slot, Value::Object(Some(name)));
-            return obj;
+            return Ok(obj);
         }
     }
-    obj
+    Ok(obj)
 }
 
 pub(crate) fn p67_layout_order(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -410,7 +499,7 @@ pub(crate) fn p67_layout_order(ctx: &mut dyn NativeContext, args: &[Value]) -> M
     Ok(Some(Value::Object(Some(p67_byte_order_object(
         ctx,
         little_endian,
-    )))))
+    )?))))
 }
 
 pub(crate) fn p67_layout_with_order(
@@ -431,7 +520,7 @@ pub(crate) fn p67_layout_with_order(
         Value::Int(v) => v as i64,
         _ => byte_size,
     };
-    let obj = p67_layout_object(ctx, &class_name, byte_size, byte_alignment);
+    let obj = p67_layout_object(ctx, &class_name, byte_size, byte_alignment)?;
     ctx.set_field(
         obj,
         2,
@@ -449,13 +538,19 @@ pub(crate) fn p67_layout_with_order(
 //
 // Every session native is force-dispatched over real bytecode
 // (`interpreter::force_native_over_real_jdk_bytecode`), so this model is the
-// ONLY lifetime bookkeeping FFM has in either mode. Slots, as written by
+// ONLY lifetime bookkeeping FFM has in either mode. Four words, as written by
 // [`p67_memory_session`]:
 //
-//   0 = state: `Int(1)` open, `Int(0)` closed
-//   1 = acquire count (`Int`): clients currently inside `whileAlive`/`acquire0`
-//   2 = owning `Thread` of a confined session, null for shared/global/implicit
-//   3 = close actions: `Object[]` of `Runnable`/`ResourceCleanup`, or null
+//   state    = `Int(1)` open, `Int(0)` closed
+//   acquires = clients currently inside `whileAlive`/`acquire0` (`Int`)
+//   owner    = owning `Thread` of a confined session, null otherwise
+//   actions  = close actions: `Object[]` of `Runnable`/`ResourceCleanup`, null
+//
+// Their SLOTS are NOT fixed — see [`P67SessionSlots`]. They were, at 0..3, and
+// that is the W7-89 defect: in Compatible mode the carrier is the real loaded
+// `MemorySessionImpl`, so slots 0..3 already belong to that class's own four
+// fields and two of them are declared REFERENCES. Everything below reads the
+// map rather than an index.
 // The synthetic `java.lang.foreign.Arena` (an instance of the INTERFACE class —
 // in real-JDK mode `Arena.ofConfined()` never reaches `jdk.internal.foreign
 // .ArenaImpl`, because this file's factories are what run). Slot 1 carries the
@@ -477,17 +572,104 @@ const P67_SESSION_OWNER: usize = 2;
 const P67_SESSION_ACTIONS: usize = 3;
 const P67_SESSION_SLOTS: usize = 4;
 
-pub(crate) fn p67_memory_session(ctx: &mut dyn NativeContext) -> Value {
-    let obj = alloc_concurrent_synthetic(
+/// Where one particular session object keeps the model's four words.
+///
+/// **This indirection is the W7-89 repair.** The four constants above were used
+/// as absolute slot indices, and in Compatible mode that is wrong: the carrier
+/// class `jdk/internal/foreign/MemorySessionImpl` is the REAL, loaded JDK class,
+/// which declares exactly four instance fields — `resourceList` and `owner` are
+/// references, `state` and `acquireCount` are ints. Writing the model's `Int`
+/// state word into slot 0 therefore wrote a primitive into a slot the class
+/// types as a REFERENCE, and such a write does not read back as a `Value::Int`
+/// (that family is W7-84-primitive-in-reference-store.md). So
+/// [`p67_session_modelled`] — whose discriminator is exactly "slot 0 reads back
+/// as an `Int`" — answered **false for every session this VM mints**, and with
+/// it the whole FFM lifetime model went inert: `close()` recorded nothing,
+/// `isAlive()` answered true forever, thread confinement never fired, and every
+/// validity gate returned `Ok(())`. `panama.rs`'s twin (`pe_session_modelled`)
+/// reads the same slot and was dead for the same reason.
+///
+/// That was **measured, not deduced**: `probes/MemorySessionIdentityProbe.java`
+/// reports `arena.scope() == arena.scope()` as FALSE on CratonVM and true on
+/// HotSpot 25.0.3.9. `Arena.scope()` is [`p67_receiver_session`], which can only
+/// mint a fresh session when [`p67_arena_session`] rejects the one it is handed,
+/// and every other predicate in that chain is separately measured true (the
+/// arena is 2 slots wide, its class name is `java/lang/foreign/Arena`, slot 1
+/// holds the session, and the session's class name is `MemorySessionImpl` with
+/// four declared fields). `p67_session_modelled` is the only remaining candidate.
+///
+/// Resolving BY NAME rather than permuting the constants is deliberate: it does
+/// not depend on the real class's field ORDER, and it makes every write
+/// type-correct — the model's two ints land in the two int fields and its two
+/// references in the two reference fields, whichever slots those turn out to be.
+/// All four names must resolve or none is used, so the two maps can never be
+/// mixed.
+#[derive(Clone, Copy)]
+pub(crate) struct P67SessionSlots {
+    pub(crate) state: usize,
+    pub(crate) acquires: usize,
+    pub(crate) owner: usize,
+    pub(crate) actions: usize,
+}
+
+impl P67SessionSlots {
+    /// The map for a carrier that declares no fields of its own — the
+    /// `--synthetic-jdk` stub, and the `ClassId(0)` fallback arm. There the
+    /// slots are untyped, the model owns them outright, and any `Value` round
+    /// trips.
+    const SYNTHETIC: Self = Self {
+        state: P67_SESSION_STATE,
+        acquires: P67_SESSION_ACQUIRES,
+        owner: P67_SESSION_OWNER,
+        actions: P67_SESSION_ACTIONS,
+    };
+
+    /// How many slots an object must carry for all four indices to be in bounds.
+    pub(crate) fn required_width(self) -> usize {
+        1 + self
+            .state
+            .max(self.acquires)
+            .max(self.owner)
+            .max(self.actions)
+    }
+}
+
+/// The slot map for `session`. See [`P67SessionSlots`].
+///
+/// The names are `MemorySessionImpl`'s own: `state` and `acquireCount` are the
+/// two ints, `owner` is the confining `Thread`, and `resourceList` is the
+/// close-action list — which is what the model's `actions` array IS, so the
+/// mapping is semantic and not merely kind-compatible.
+pub(crate) fn p67_session_slots(ctx: &dyn NativeContext, session: ObjectRef) -> P67SessionSlots {
+    let class_id = ctx.class_id_of_object(session);
+    match (
+        ctx.resolve_field_index_by_class_id(class_id, "state"),
+        ctx.resolve_field_index_by_class_id(class_id, "acquireCount"),
+        ctx.resolve_field_index_by_class_id(class_id, "owner"),
+        ctx.resolve_field_index_by_class_id(class_id, "resourceList"),
+    ) {
+        (Some(state), Some(acquires), Some(owner), Some(actions)) => P67SessionSlots {
+            state,
+            acquires,
+            owner,
+            actions,
+        },
+        _ => P67SessionSlots::SYNTHETIC,
+    }
+}
+
+pub(crate) fn p67_memory_session(ctx: &mut dyn NativeContext) -> Result<Value, MethodCallFailed> {
+    let obj = try_alloc_concurrent_synthetic(
         ctx,
         "jdk/internal/foreign/MemorySessionImpl",
         P67_SESSION_SLOTS,
-    );
-    ctx.set_field(obj, P67_SESSION_STATE, Value::Int(1));
-    ctx.set_field(obj, P67_SESSION_ACQUIRES, Value::Int(0));
-    ctx.set_field(obj, P67_SESSION_OWNER, Value::Object(None));
-    ctx.set_field(obj, P67_SESSION_ACTIONS, Value::Object(None));
-    Value::Object(Some(obj))
+    )?;
+    let slots = p67_session_slots(ctx, obj);
+    ctx.set_field(obj, slots.state, Value::Int(1));
+    ctx.set_field(obj, slots.acquires, Value::Int(0));
+    ctx.set_field(obj, slots.owner, Value::Object(None));
+    ctx.set_field(obj, slots.actions, Value::Object(None));
+    Ok(Value::Object(Some(obj)))
 }
 
 /// The session a segment or arena already owns, or a fresh one if it has none.
@@ -500,16 +682,16 @@ pub(crate) fn p67_memory_session(ctx: &mut dyn NativeContext) -> Value {
 /// `ArenaImpl.session`) — and that field holds one of OUR sessions, because the
 /// `createConfined`/`createShared` factories are force-dispatched here. A
 /// synthetic receiver has no such field; there, a fresh session is all there is.
-fn p67_receiver_session(ctx: &mut dyn NativeContext, receiver: ObjectRef) -> Value {
+fn p67_receiver_session(ctx: &mut dyn NativeContext, receiver: ObjectRef) -> Result<Value, MethodCallFailed> {
     // A real-JDK receiver carries it in a named field.
     for name in ["scope", "session"] {
         if let Value::Object(Some(session)) = ctx.get_field_by_name(receiver, name) {
-            return Value::Object(Some(session));
+            return Ok(Value::Object(Some(session)));
         }
     }
     // The receiver is itself a synthetic Arena.
     if let Some(session) = p67_arena_session(ctx, receiver) {
-        return Value::Object(Some(session));
+        return Ok(Value::Object(Some(session)));
     }
     // The receiver is a synthetic MemorySegment: slot 2 names the arena that
     // allocated it, and the answer is that arena's session — this is what makes
@@ -517,11 +699,11 @@ fn p67_receiver_session(ctx: &mut dyn NativeContext, receiver: ObjectRef) -> Val
     if ctx.object_num_fields(receiver) > P67_SEGMENT_ARENA {
         if let Value::Object(Some(arena)) = ctx.get_field(receiver, P67_SEGMENT_ARENA) {
             if let Some(session) = p67_arena_session(ctx, arena) {
-                return Value::Object(Some(session));
+                return Ok(Value::Object(Some(session)));
             }
         }
     }
-    p67_memory_session(ctx)
+    Ok(p67_memory_session(ctx)?)
 }
 
 /// The session stored on a synthetic Arena, if this object is one.
@@ -543,12 +725,12 @@ fn p67_arena_session(ctx: &dyn NativeContext, arena: ObjectRef) -> Option<Object
 /// lifetime. `confined` records the calling thread as the session owner, which
 /// is what lets an off-thread access raise `WrongThreadException`; a shared or
 /// automatic arena leaves the owner null.
-fn p67_new_arena(ctx: &mut dyn NativeContext, confined: bool) -> ObjectRef {
-    let arena = alloc_concurrent_synthetic(ctx, "java/lang/foreign/Arena", P67_ARENA_SLOTS);
+fn p67_new_arena(ctx: &mut dyn NativeContext, confined: bool) -> Result<ObjectRef, MethodCallFailed> {
+    let arena = try_alloc_concurrent_synthetic(ctx, "java/lang/foreign/Arena", P67_ARENA_SLOTS)?;
     // The session allocation below can move the fresh arena (native stale-local
     // family).
     let arena_pin = ctx.pin_native_root(arena);
-    let session_value = p67_memory_session(ctx);
+    let session_value = p67_memory_session(ctx)?;
     let arena = ctx.read_native_pin(arena_pin, arena);
     ctx.unpin_native_roots(arena_pin);
     ctx.set_field(arena, P67_ARENA_OPEN, Value::Int(1));
@@ -556,10 +738,11 @@ fn p67_new_arena(ctx: &mut dyn NativeContext, confined: bool) -> ObjectRef {
     if confined {
         if let Value::Object(Some(session)) = session_value {
             let owner = ctx.current_thread_object();
-            ctx.set_field(session, P67_SESSION_OWNER, Value::Object(Some(owner)));
+            let slots = p67_session_slots(ctx, session);
+            ctx.set_field(session, slots.owner, Value::Object(Some(owner)));
         }
     }
-    arena
+    Ok(arena)
 }
 
 /// Allocate a synthetic segment owned by `arena`.
@@ -571,15 +754,15 @@ fn p67_new_arena(ctx: &mut dyn NativeContext, confined: bool) -> ObjectRef {
 /// `p67_segment_byte_size`, `p67_segment_address`, and `panama_libffi
 /// ::segment_address`) — a 3-field segment takes the same branches a 2-field
 /// one did.
-fn p67_arena_segment(ctx: &mut dyn NativeContext, arena: ObjectRef, size: i64) -> ObjectRef {
+fn p67_arena_segment(ctx: &mut dyn NativeContext, arena: ObjectRef, size: i64) -> Result<ObjectRef, MethodCallFailed> {
     let arena_pin = ctx.pin_native_root(arena);
-    let segment = alloc_concurrent_synthetic(ctx, "java/lang/foreign/MemorySegment", 3);
+    let segment = try_alloc_concurrent_synthetic(ctx, "java/lang/foreign/MemorySegment", 3)?;
     let arena = ctx.read_native_pin(arena_pin, arena);
     ctx.unpin_native_roots(arena_pin);
     ctx.set_field(segment, 0, Value::Long(size));
     ctx.set_field(segment, 1, Value::Long(0)); // address
     p67_stamp_segment_arena(ctx, segment, arena);
-    segment
+    Ok(segment)
 }
 
 /// Stamp `arena` onto a freshly allocated synthetic segment so the segment can
@@ -606,7 +789,7 @@ fn p67_session_is_real(ctx: &dyn NativeContext, session: ObjectRef) -> bool {
     let class_id = ctx.class_id_of_object(session);
     ctx.resolve_field_index_by_class_id(class_id, "state")
         .is_some()
-        && ctx.class_name_of_id(class_id).as_deref()
+        && ctx.class_name_arc_of_id(class_id).as_deref()
             != Some("jdk/internal/foreign/MemorySessionImpl")
 }
 
@@ -660,8 +843,27 @@ fn p67_segment_check_scope(
     if let Value::Object(Some(scope)) = ctx.get_field_by_name(segment, "scope") {
         if p67_session_is_real(ctx, scope) {
             ctx.invoke_virtual_bytecode_only(scope, "checkValidState", "()V", &[])?;
+            return Ok(());
         }
-        return Ok(());
+        // W7-89: a REAL segment can carry one of OUR sessions. The
+        // `createConfined`/`createShared`/`createHeap` factories are
+        // force-dispatched into this file, so `MemorySegment.ofArray(...)`
+        // builds a genuine `HeapMemorySegmentImpl` whose `scope` field holds a
+        // synthetic `MemorySessionImpl` — measured, `MemorySessionShapeProbe`
+        // reports `heap.field.scope = jdk.internal.foreign.MemorySessionImpl` on
+        // CratonVM against `GlobalSession$HeapSession` on HotSpot. Returning
+        // unconditionally here was a second fail-open: the one shape that
+        // resolves a session was the one shape that skipped the check.
+        if p67_session_modelled(ctx, scope) {
+            p67_session_check_valid(ctx, scope)?;
+            return Ok(());
+        }
+        // Neither — so this is not a scope at all, and accepting it would be a
+        // third fail-open. `get_field_by_name` resolves an index in the LOADED
+        // class's hierarchy, and a synthetic segment is stamped with the
+        // `MemorySegment` INTERFACE, so the name can land on a slot this model
+        // owns rather than on a real `AbstractMemorySegmentImpl.scope`. Fall
+        // through to the arena, which is self-validating.
     }
     // Synthetic segment: slot 2 names the owning arena. Deliberately NOT
     // `p67_receiver_session`, which mints a fresh (always-open) session when it
@@ -679,25 +881,40 @@ fn p67_segment_check_scope(
 /// Whether `session` carries the layout [`p67_memory_session`] writes.
 ///
 /// The session natives are force-dispatched, so a session that real
-/// `ConfinedSession`/`SharedSession` bytecode constructed can reach them too —
-/// and there slot 0 is a genuine reference field, not our state word. Anything
-/// we did not build is left strictly alone: it is neither interpreted (so we
-/// never throw on a shape we misread) nor overwritten (so we never corrupt a
-/// real object's fields).
+/// `ConfinedSession`/`SharedSession` bytecode constructed can reach them too.
+/// Anything we did not build is left strictly alone: it is neither interpreted
+/// (so we never throw on a shape we misread) nor overwritten (so we never
+/// corrupt a real object's fields).
+///
+/// **The real-session exclusion is now explicit** (W7-89). It used to be a side
+/// effect of the slot-0 read: on a real `ConfinedSession` slot 0 is a reference
+/// field, so the `Value::Int` test failed. Now that the state word is resolved
+/// by NAME, a real session resolves `state` too — and its encoding is the JDK's
+/// (`OPEN = 0`, `CLOSED = -1`, `NONCLOSEABLE = 1`), the exact inverse of this
+/// model's `1 = open`. Interpreting one with the other's encoding would report
+/// every live real session as closed, which is the over-correction this repair
+/// must not commit. [`p67_session_is_real`] is the same test the delegation path
+/// already uses, so the two agree by construction.
 fn p67_session_modelled(ctx: &dyn NativeContext, session: ObjectRef) -> bool {
-    ctx.object_num_fields(session) >= P67_SESSION_SLOTS
-        && matches!(ctx.get_field(session, P67_SESSION_STATE), Value::Int(_))
+    if p67_session_is_real(ctx, session) {
+        return false;
+    }
+    let slots = p67_session_slots(ctx, session);
+    ctx.object_num_fields(session) >= slots.required_width()
+        && matches!(ctx.get_field(session, slots.state), Value::Int(_))
 }
 
 fn p67_session_state(ctx: &dyn NativeContext, session: ObjectRef) -> i32 {
-    match ctx.get_field(session, P67_SESSION_STATE) {
+    let slots = p67_session_slots(ctx, session);
+    match ctx.get_field(session, slots.state) {
         Value::Int(state) => state,
         _ => 1,
     }
 }
 
 fn p67_session_acquires(ctx: &dyn NativeContext, session: ObjectRef) -> i32 {
-    match ctx.get_field(session, P67_SESSION_ACQUIRES) {
+    let slots = p67_session_slots(ctx, session);
+    match ctx.get_field(session, slots.acquires) {
         Value::Int(count) => count,
         _ => 0,
     }
@@ -733,7 +950,8 @@ fn p67_session_check_valid(
     if !p67_session_modelled(ctx, session) {
         return Ok(());
     }
-    let owner = match ctx.get_field(session, P67_SESSION_OWNER) {
+    let slots = p67_session_slots(ctx, session);
+    let owner = match ctx.get_field(session, slots.owner) {
         Value::Object(Some(owner)) => Some(owner),
         _ => None,
     };
@@ -758,11 +976,8 @@ fn p67_session_acquire(
     p67_session_check_valid(ctx, session)?;
     if p67_session_modelled(ctx, session) {
         let count = p67_session_acquires(ctx, session);
-        ctx.set_field(
-            session,
-            P67_SESSION_ACQUIRES,
-            Value::Int(count.saturating_add(1)),
-        );
+        let slots = p67_session_slots(ctx, session);
+        ctx.set_field(session, slots.acquires, Value::Int(count.saturating_add(1)));
     }
     Ok(())
 }
@@ -775,11 +990,8 @@ fn p67_session_release(ctx: &mut dyn NativeContext, session: ObjectRef) {
         return;
     }
     let count = p67_session_acquires(ctx, session);
-    ctx.set_field(
-        session,
-        P67_SESSION_ACQUIRES,
-        Value::Int((count - 1).max(0)),
-    );
+    let slots = p67_session_slots(ctx, session);
+    ctx.set_field(session, slots.acquires, Value::Int((count - 1).max(0)));
 }
 
 /// Append one close action to the session's `Object[]`, growing it by one.
@@ -788,7 +1000,11 @@ fn p67_session_release(ctx: &mut dyn NativeContext, session: ObjectRef) {
 /// copy-on-append array costs less than standing up a synthetic `ArrayList`
 /// and keeps the whole list walkable by the GC as an ordinary reference array.
 fn p67_session_push_action(ctx: &mut dyn NativeContext, session: ObjectRef, action: ObjectRef) {
-    let previous = match ctx.get_field(session, P67_SESSION_ACTIONS) {
+    // Resolved once: the map is a property of the CLASS, so it is unaffected by
+    // the moving collection `new_array` below can trigger and by the `session`
+    // rebind that follows it.
+    let slots = p67_session_slots(ctx, session);
+    let previous = match ctx.get_field(session, slots.actions) {
         Value::Object(Some(actions)) => Some(actions),
         _ => None,
     };
@@ -811,7 +1027,7 @@ fn p67_session_push_action(ctx: &mut dyn NativeContext, session: ObjectRef, acti
         }
     }
     ctx.set_array_element(grown, len, Value::Object(Some(action)));
-    ctx.set_field(session, P67_SESSION_ACTIONS, Value::Object(Some(grown)));
+    ctx.set_field(session, slots.actions, Value::Object(Some(grown)));
     ctx.unpin_native_roots(session_pin);
 }
 
@@ -827,11 +1043,12 @@ fn p67_session_run_close_actions(
     if !p67_session_modelled(ctx, session) {
         return Ok(());
     }
-    let actions = match ctx.get_field(session, P67_SESSION_ACTIONS) {
+    let slots = p67_session_slots(ctx, session);
+    let actions = match ctx.get_field(session, slots.actions) {
         Value::Object(Some(actions)) => actions,
         _ => return Ok(()),
     };
-    ctx.set_field(session, P67_SESSION_ACTIONS, Value::Object(None));
+    ctx.set_field(session, slots.actions, Value::Object(None));
     // Each `run()` re-enters the interpreter and can move the array.
     let actions_pin = ctx.pin_native_root(actions);
     let mut failure: Option<MethodCallFailed> = None;
@@ -874,7 +1091,8 @@ fn p67_session_just_close(
         }
         .into());
     }
-    ctx.set_field(session, P67_SESSION_STATE, Value::Int(0));
+    let slots = p67_session_slots(ctx, session);
+    ctx.set_field(session, slots.state, Value::Int(0));
     Ok(())
 }
 
@@ -1000,10 +1218,10 @@ pub(crate) fn p67_memory_layout_path_target(
     current
 }
 
-pub(crate) fn p67_var_handle_for_layout(ctx: &mut dyn NativeContext, layout: ObjectRef) -> Value {
+pub(crate) fn p67_var_handle_for_layout(ctx: &mut dyn NativeContext, layout: ObjectRef) -> Result<Value, MethodCallFailed> {
     let width = p67_layout_width_obj(ctx, layout);
     let little_endian = p67_layout_is_little(ctx, layout);
-    let vh = alloc_concurrent_synthetic(ctx, "java/lang/invoke/VarHandle", VH_NUM_FIELDS);
+    let vh = try_alloc_concurrent_synthetic(ctx, "java/lang/invoke/VarHandle", VH_NUM_FIELDS)?;
     ctx.set_field(
         vh,
         VH_CLASS_OR_TARGET,
@@ -1012,18 +1230,18 @@ pub(crate) fn p67_var_handle_for_layout(ctx: &mut dyn NativeContext, layout: Obj
     ctx.set_field(vh, VH_FIELD_INDEX, Value::Int(width));
     ctx.set_field(vh, VH_IS_STATIC, Value::Int(VH_KIND_MEMORY_SEGMENT));
     crate::lang_invoke::register_p67_memory_segment_var_handle(ctx, vh, width);
-    Value::Object(Some(vh))
+    Ok(Value::Object(Some(vh)))
 }
 
-pub(crate) fn p67_var_handle(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
+pub(crate) fn p67_var_handle(ctx: &mut dyn NativeContext, args: &[Value]) -> Result<Value, MethodCallFailed> {
     match args.first() {
         Some(Value::Object(Some(layout))) => p67_var_handle_for_layout(ctx, *layout),
         _ => {
-            let vh = alloc_concurrent_synthetic(ctx, "java/lang/invoke/VarHandle", VH_NUM_FIELDS);
+            let vh = try_alloc_concurrent_synthetic(ctx, "java/lang/invoke/VarHandle", VH_NUM_FIELDS)?;
             ctx.set_field(vh, VH_CLASS_OR_TARGET, Value::Int(1));
             ctx.set_field(vh, VH_FIELD_INDEX, Value::Int(1));
             ctx.set_field(vh, VH_IS_STATIC, Value::Int(VH_KIND_MEMORY_SEGMENT));
-            Value::Object(Some(vh))
+            Ok(Value::Object(Some(vh)))
         }
     }
 }
@@ -1037,7 +1255,7 @@ pub(crate) fn p67_memory_layout_var_handle(
         Some(Value::Object(Some(path_arr))) => p67_memory_layout_path_target(ctx, this, *path_arr),
         _ => this,
     };
-    Ok(Some(p67_var_handle_for_layout(ctx, target_layout)))
+    Ok(Some(p67_var_handle_for_layout(ctx, target_layout)?))
 }
 
 pub(crate) fn p67_segment_parts(
@@ -1577,25 +1795,25 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
         arena,
         "ofConfined",
         "()Ljava/lang/foreign/Arena;",
-        |ctx, _args| Ok(Some(Value::Object(Some(p67_new_arena(ctx, true))))),
+        |ctx, _args| Ok(Some(Value::Object(Some(p67_new_arena(ctx, true)?)))),
     );
     r.register(
         arena,
         "ofAuto",
         "()Ljava/lang/foreign/Arena;",
-        |ctx, _args| Ok(Some(Value::Object(Some(p67_new_arena(ctx, false))))),
+        |ctx, _args| Ok(Some(Value::Object(Some(p67_new_arena(ctx, false)?)))),
     );
     r.register(
         arena,
         "ofShared",
         "()Ljava/lang/foreign/Arena;",
-        |ctx, _args| Ok(Some(Value::Object(Some(p67_new_arena(ctx, false))))),
+        |ctx, _args| Ok(Some(Value::Object(Some(p67_new_arena(ctx, false)?)))),
     );
     r.register(
         arena,
         "global",
         "()Ljava/lang/foreign/Arena;",
-        |ctx, _args| Ok(Some(Value::Object(Some(p67_new_arena(ctx, false))))),
+        |ctx, _args| Ok(Some(Value::Object(Some(p67_new_arena(ctx, false)?)))),
     );
     r.register(
         arena,
@@ -1607,7 +1825,7 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
                 Some(Value::Long(v)) => *v,
                 _ => 0,
             };
-            let segment = p67_arena_segment(ctx, this, size);
+            let segment = p67_arena_segment(ctx, this, size)?;
             Ok(Some(Value::Object(Some(segment))))
         },
     );
@@ -1621,24 +1839,23 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
                 Some(Value::Long(v)) => *v,
                 _ => 0,
             };
-            let segment = p67_arena_segment(ctx, this, size);
+            let segment = p67_arena_segment(ctx, this, size)?;
             Ok(Some(Value::Object(Some(segment))))
         },
     );
+    // `allocateFrom(String)` allocates REAL memory and writes the string into
+    // it. It used to hand back a `p67_arena_segment` — a stand-in whose address
+    // is 0 and which `panama_libffi::segment_byte_size` decodes as size 0, so
+    // `Arena.allocateFrom("abc").byteSize()` answered 0 where HotSpot answers 4,
+    // and the bytes were never written at all. `Arena.allocate` was already
+    // routed to the real allocator; this is the sibling that was left behind,
+    // and it is the second half of residual 3 in
+    // `ffm-elements-spliterator-and-allocatefrom-gaps-20260813`.
     r.register(
         arena,
         "allocateFrom",
         "(Ljava/lang/String;)Ljava/lang/foreign/MemorySegment;",
-        |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            let len = match args.get(1) {
-                Some(Value::Object(Some(s))) => {
-                    ctx.read_string(*s).map(|t| t.len() as i64 + 1).unwrap_or(1)
-                }
-                _ => 1,
-            };
-            Ok(Some(Value::Object(Some(p67_arena_segment(ctx, this, len)))))
-        },
+        crate::panama::pe_arena_allocate_from_string,
     );
     r.register(arena, "close", "()V", |ctx, args| {
         let this = obj_arg(args, 0)?;
@@ -1658,7 +1875,7 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
         "()Ljava/lang/foreign/MemorySegment$Scope;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            Ok(Some(p67_receiver_session(ctx, this)))
+            Ok(Some(p67_receiver_session(ctx, this)?))
         },
     );
     let session = "jdk/internal/foreign/MemorySessionImpl";
@@ -1669,7 +1886,7 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             // Static: arg 0 is the Arena whose session is being unwrapped.
             let arena = obj_arg(args, 0)?;
-            Ok(Some(p67_receiver_session(ctx, arena)))
+            Ok(Some(p67_receiver_session(ctx, arena)?))
         },
     );
     r.register(
@@ -1685,12 +1902,13 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
                 _ => None,
             };
             let owner_pin = owner.map(|owner| ctx.pin_native_root(owner));
-            let value = p67_memory_session(ctx);
+            let value = p67_memory_session(ctx)?;
             if let (Value::Object(Some(new_session)), Some(owner), Some(pin)) =
                 (value, owner, owner_pin)
             {
                 let owner = ctx.read_native_pin(pin, owner);
-                ctx.set_field(new_session, P67_SESSION_OWNER, Value::Object(Some(owner)));
+                let slots = p67_session_slots(ctx, new_session);
+                ctx.set_field(new_session, slots.owner, Value::Object(Some(owner)));
             }
             if let Some(pin) = owner_pin {
                 ctx.unpin_native_roots(pin);
@@ -1702,19 +1920,19 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
         session,
         "createShared",
         "()Ljdk/internal/foreign/MemorySessionImpl;",
-        |ctx, _args| Ok(Some(p67_memory_session(ctx))),
+        |ctx, _args| Ok(Some(p67_memory_session(ctx)?)),
     );
     r.register(
         session,
         "createImplicit",
         "(Ljava/lang/ref/Cleaner;)Ljdk/internal/foreign/MemorySessionImpl;",
-        |ctx, _args| Ok(Some(p67_memory_session(ctx))),
+        |ctx, _args| Ok(Some(p67_memory_session(ctx)?)),
     );
     r.register(
         session,
         "createHeap",
         "(Ljava/lang/Object;)Ljdk/internal/foreign/MemorySessionImpl;",
-        |ctx, _args| Ok(Some(p67_memory_session(ctx))),
+        |ctx, _args| Ok(Some(p67_memory_session(ctx)?)),
     );
     r.register(
         session,
@@ -1815,7 +2033,8 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
             }
             let this = obj_arg(args, 0)?;
             if p67_session_modelled(ctx, this) {
-                if let Value::Object(Some(owner)) = ctx.get_field(this, P67_SESSION_OWNER) {
+                let slots = p67_session_slots(ctx, this);
+                if let Value::Object(Some(owner)) = ctx.get_field(this, slots.owner) {
                     return Ok(Some(Value::Object(Some(owner))));
                 }
             }
@@ -1836,7 +2055,8 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
             }
             let this = obj_arg(args, 0)?;
             if p67_session_modelled(ctx, this) {
-                if let Value::Object(Some(owner)) = ctx.get_field(this, P67_SESSION_OWNER) {
+                let slots = p67_session_slots(ctx, this);
+                if let Value::Object(Some(owner)) = ctx.get_field(this, slots.owner) {
                     let accessible =
                         matches!(args.get(1), Some(Value::Object(Some(t))) if *t == owner);
                     return Ok(Some(Value::Int(i32::from(accessible))));
@@ -1874,10 +2094,22 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
         "checkValidState",
         "(Ljava/lang/foreign/MemorySegment;)V",
         |ctx, args| {
-            // The segment argument only names what is being accessed; validity
-            // is a property of the session receiver.
-            let this = obj_arg(args, 0)?;
-            p67_session_check_valid(ctx, this)?;
+            // W7-89 (found by W7-86-static-native-arity.md §4.1 row 6). This
+            // overload is `public STATIC void checkValidState(MemorySegment)`,
+            // so `args[0]` is the SEGMENT, not a session receiver — the comment
+            // that used to sit here ("validity is a property of the session
+            // receiver") described the zero-argument instance overload above.
+            // The body handed the segment to `p67_session_check_valid`, which
+            // begins `if !p67_session_modelled(session) { return Ok(()) }`; a
+            // segment is not a modelled session, so the check returned `Ok(())`
+            // for every input. It validated nothing.
+            //
+            // The JDK's own body is
+            //   ((AbstractMemorySegmentImpl) segment).sessionImpl().checkValidState();
+            // i.e. resolve the segment's session, then check THAT — which is
+            // exactly `p67_segment_check_scope`.
+            let segment = obj_arg(args, 0)?;
+            p67_segment_check_scope(ctx, segment)?;
             Ok(None)
         },
     );
@@ -1986,7 +2218,7 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
                     Value::Long(v) => v,
                     _ => 0,
                 };
-                let seg = alloc_concurrent_synthetic(ctx, "java/lang/foreign/MemorySegment", 6);
+                let seg = try_alloc_concurrent_synthetic(ctx, "java/lang/foreign/MemorySegment", 6)?;
                 ctx.set_field(seg, 0, Value::Long(base_ptr));
                 ctx.set_field(seg, 1, Value::Long(size));
                 ctx.set_field(seg, 2, ctx.get_field(this, 2));
@@ -1995,7 +2227,7 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
                 ctx.set_field(seg, 5, Value::Long(base_off + offset));
                 Ok(Some(Value::Object(Some(seg))))
             } else {
-                let seg = alloc_concurrent_synthetic(ctx, "java/lang/foreign/MemorySegment", 2);
+                let seg = try_alloc_concurrent_synthetic(ctx, "java/lang/foreign/MemorySegment", 2)?;
                 ctx.set_field(seg, 0, Value::Long(size));
                 ctx.set_field(seg, 1, Value::Long(offset));
                 Ok(Some(Value::Object(Some(seg))))
@@ -2053,7 +2285,7 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
         "()Ljava/lang/foreign/MemorySegment$Scope;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            Ok(Some(p67_receiver_session(ctx, this)))
+            Ok(Some(p67_receiver_session(ctx, this)?))
         },
     );
     r.register(
@@ -2061,7 +2293,7 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
         "NULL",
         "Ljava/lang/foreign/MemorySegment;",
         |ctx, _args| {
-            let seg = alloc_concurrent_synthetic(ctx, "java/lang/foreign/MemorySegment", 2);
+            let seg = try_alloc_concurrent_synthetic(ctx, "java/lang/foreign/MemorySegment", 2)?;
             ctx.set_field(seg, 0, Value::Long(0));
             ctx.set_field(seg, 1, Value::Long(0));
             Ok(Some(Value::Object(Some(seg))))
@@ -2115,7 +2347,7 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
             "()Ljava/lang/foreign/MemorySegment$Scope;",
             |ctx, args| {
                 let this = obj_arg(args, 0)?;
-                Ok(Some(p67_receiver_session(ctx, this)))
+                Ok(Some(p67_receiver_session(ctx, this)?))
             },
         );
     }
@@ -2128,7 +2360,7 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
         "JAVA_BYTE",
         "Ljava/lang/foreign/ValueLayout$OfByte;",
         |ctx, _args| {
-            let obj = p67_layout_object(ctx, "java/lang/foreign/ValueLayout$OfByte", 1, 1);
+            let obj = p67_layout_object(ctx, "java/lang/foreign/ValueLayout$OfByte", 1, 1)?;
             Ok(Some(Value::Object(Some(obj))))
         },
     );
@@ -2137,7 +2369,7 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
         "JAVA_BOOLEAN",
         "Ljava/lang/foreign/ValueLayout$OfBoolean;",
         |ctx, _args| {
-            let obj = p67_layout_object(ctx, "java/lang/foreign/ValueLayout$OfBoolean", 1, 1);
+            let obj = p67_layout_object(ctx, "java/lang/foreign/ValueLayout$OfBoolean", 1, 1)?;
             Ok(Some(Value::Object(Some(obj))))
         },
     );
@@ -2146,7 +2378,7 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
         "JAVA_CHAR",
         "Ljava/lang/foreign/ValueLayout$OfChar;",
         |ctx, _args| {
-            let obj = p67_layout_object(ctx, "java/lang/foreign/ValueLayout$OfChar", 2, 2);
+            let obj = p67_layout_object(ctx, "java/lang/foreign/ValueLayout$OfChar", 2, 2)?;
             Ok(Some(Value::Object(Some(obj))))
         },
     );
@@ -2155,7 +2387,7 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
         "JAVA_SHORT",
         "Ljava/lang/foreign/ValueLayout$OfShort;",
         |ctx, _args| {
-            let obj = p67_layout_object(ctx, "java/lang/foreign/ValueLayout$OfShort", 2, 2);
+            let obj = p67_layout_object(ctx, "java/lang/foreign/ValueLayout$OfShort", 2, 2)?;
             Ok(Some(Value::Object(Some(obj))))
         },
     );
@@ -2164,7 +2396,7 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
         "JAVA_INT",
         "Ljava/lang/foreign/ValueLayout$OfInt;",
         |ctx, _args| {
-            let obj = p67_layout_object(ctx, "java/lang/foreign/ValueLayout$OfInt", 4, 4);
+            let obj = p67_layout_object(ctx, "java/lang/foreign/ValueLayout$OfInt", 4, 4)?;
             Ok(Some(Value::Object(Some(obj))))
         },
     );
@@ -2173,7 +2405,7 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
         "JAVA_LONG",
         "Ljava/lang/foreign/ValueLayout$OfLong;",
         |ctx, _args| {
-            let obj = p67_layout_object(ctx, "java/lang/foreign/ValueLayout$OfLong", 8, 8);
+            let obj = p67_layout_object(ctx, "java/lang/foreign/ValueLayout$OfLong", 8, 8)?;
             Ok(Some(Value::Object(Some(obj))))
         },
     );
@@ -2182,7 +2414,7 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
         "JAVA_FLOAT",
         "Ljava/lang/foreign/ValueLayout$OfFloat;",
         |ctx, _args| {
-            let obj = p67_layout_object(ctx, "java/lang/foreign/ValueLayout$OfFloat", 4, 4);
+            let obj = p67_layout_object(ctx, "java/lang/foreign/ValueLayout$OfFloat", 4, 4)?;
             Ok(Some(Value::Object(Some(obj))))
         },
     );
@@ -2191,7 +2423,7 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
         "JAVA_DOUBLE",
         "Ljava/lang/foreign/ValueLayout$OfDouble;",
         |ctx, _args| {
-            let obj = p67_layout_object(ctx, "java/lang/foreign/ValueLayout$OfDouble", 8, 8);
+            let obj = p67_layout_object(ctx, "java/lang/foreign/ValueLayout$OfDouble", 8, 8)?;
             Ok(Some(Value::Object(Some(obj))))
         },
     );
@@ -2200,7 +2432,7 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
         "ADDRESS",
         "Ljava/lang/foreign/AddressLayout;",
         |ctx, _args| {
-            let obj = p67_layout_object(ctx, "java/lang/foreign/AddressLayout", 8, 8);
+            let obj = p67_layout_object(ctx, "java/lang/foreign/AddressLayout", 8, 8)?;
             Ok(Some(Value::Object(Some(obj))))
         },
     );
@@ -2225,7 +2457,7 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
             class,
             "varHandle",
             "()Ljava/lang/invoke/VarHandle;",
-            |ctx, args| Ok(Some(p67_var_handle(ctx, args))),
+            |ctx, args| Ok(Some(p67_var_handle(ctx, args)?)),
         );
     }
     for (class, specific_desc) in [
@@ -2519,7 +2751,7 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
             }
             let total_size = ((offset + max_align - 1) / max_align) * max_align;
             let members_pin = ctx.pin_native_root(members);
-            let obj = alloc_concurrent_synthetic(ctx, "java/lang/foreign/StructLayout", 4);
+            let obj = try_alloc_concurrent_synthetic(ctx, "java/lang/foreign/StructLayout", 4)?;
             let members = ctx.read_native_pin(members_pin, members);
             ctx.set_field(obj, 0, Value::Long(total_size));
             ctx.set_field(obj, 1, Value::Long(max_align));
@@ -2529,6 +2761,14 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(Some(obj))))
         },
     );
+    // The three carriers below used to be ONE slot wide, holding the
+    // constructor's own argument — the element COUNT for a sequence, a
+    // hard-coded 0 for a union — while every reader in the tree expects the
+    // `[0]=byteSize, [1]=byteAlignment` prefix `p67_layout_object` defines. So
+    // `MemoryLayout.sequenceLayout(4, JAVA_INT).byteSize()` did not merely
+    // answer wrong, it answered `AbstractMethodError: MemoryLayout.byteSize()
+    // has no Code attribute` — no `byteSize` was registered for these classes
+    // at all, and a one-slot object could not have served one.
     r.register(
         ml,
         "sequenceLayout",
@@ -2538,8 +2778,31 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
                 Some(Value::Long(v)) => *v,
                 _ => 0,
             };
-            let obj = alloc_concurrent_synthetic(ctx, "java/lang/foreign/SequenceLayout", 1);
-            ctx.set_field(obj, 0, Value::Long(count));
+            let element = match args.get(1) {
+                Some(Value::Object(Some(obj))) => Some(*obj),
+                _ => None,
+            };
+            let (elem_size, elem_align) = element.map_or((0, 1), |e| p67_layout_size_align(ctx, e));
+            let element_pin = element.map(|e| (ctx.pin_native_root(e), e));
+            // Six slots: the standard four plus the element layout and count,
+            // so `elementLayout()`/`elementCount()` have somewhere to read from
+            // when they are implemented.
+            let obj = try_alloc_concurrent_synthetic(ctx, "java/lang/foreign/SequenceLayout", 6)?;
+            let element = element_pin.map(|(pin, e)| {
+                let e = ctx.read_native_pin(pin, e);
+                ctx.unpin_native_roots(pin);
+                e
+            });
+            ctx.set_field(obj, 0, Value::Long(count.max(0).saturating_mul(elem_size)));
+            ctx.set_field(obj, 1, Value::Long(elem_align));
+            ctx.set_field(
+                obj,
+                2,
+                Value::Int(i32::from(cfg!(target_endian = "little"))),
+            );
+            ctx.set_field(obj, 3, Value::Object(None));
+            ctx.set_field(obj, 4, Value::Object(element));
+            ctx.set_field(obj, 5, Value::Long(count));
             Ok(Some(Value::Object(Some(obj))))
         },
     );
@@ -2547,9 +2810,26 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
         ml,
         "unionLayout",
         "([Ljava/lang/foreign/MemoryLayout;)Ljava/lang/foreign/UnionLayout;",
-        |ctx, _args| {
-            let obj = alloc_concurrent_synthetic(ctx, "java/lang/foreign/UnionLayout", 1);
-            ctx.set_field(obj, 0, Value::Long(0));
+        |ctx, args| {
+            // A union is as large as its largest member, rounded up to the
+            // strictest member alignment — not zero, which is what this
+            // returned for every union regardless of its members.
+            let members = match args.first() {
+                Some(Value::Object(Some(arr))) => Some(*arr),
+                _ => None,
+            };
+            let (mut size, mut align) = (0_i64, 1_i64);
+            if let Some(members) = members {
+                for i in 0..ctx.array_length(members) {
+                    if let Value::Object(Some(member)) = ctx.get_array_element(members, i) {
+                        let (m_size, m_align) = p67_layout_size_align(ctx, member);
+                        size = size.max(m_size);
+                        align = align.max(m_align);
+                    }
+                }
+            }
+            let size = ((size + align - 1) / align).saturating_mul(align);
+            let obj = p67_layout_object(ctx, "java/lang/foreign/UnionLayout", size, align)?;
             Ok(Some(Value::Object(Some(obj))))
         },
     );
@@ -2562,8 +2842,20 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
                 Some(Value::Long(v)) => *v,
                 _ => 0,
             };
-            let obj = alloc_concurrent_synthetic(ctx, "java/lang/foreign/PaddingLayout", 1);
-            ctx.set_field(obj, 0, Value::Long(size));
+            // `MemoryLayout.paddingLayout` rejects a non-positive size at the
+            // FACTORY: `IllegalArgumentException: Invalid byte size: 0`. Letting
+            // a zero-size layout through produced one that every consumer had
+            // to re-check — `spliterator(paddingLayout(0))` reported the failure
+            // one call later and with a different message than HotSpot's.
+            if size <= 0 {
+                return Err(RuntimeError::IllegalArgumentException {
+                    message: format!("Invalid byte size: {}", size),
+                }
+                .into());
+            }
+            // Padding has no alignment constraint of its own — the JDK's
+            // `PaddingLayoutImpl` is byte-aligned.
+            let obj = p67_layout_object(ctx, "java/lang/foreign/PaddingLayout", size, 1)?;
             Ok(Some(Value::Object(Some(obj))))
         },
     );
@@ -2580,6 +2872,66 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
         p67_memory_layout_var_handle,
     );
     r.register(ml, "name", "()Ljava/util/Optional;", p67_layout_name);
+
+    // `byteSize()`/`byteAlignment()` on the INTERFACE, not only on the
+    // concrete layout classes.
+    //
+    // CratonVM fabricates every `java.lang.foreign` object as an instance of
+    // the interface it implements (`ValueLayout.JAVA_INT.getClass()` is
+    // `java.lang.foreign.ValueLayout$OfInt`, where HotSpot has
+    // `jdk.internal.foreign.layout.ValueLayouts$OfIntImpl`), and an
+    // `invokeinterface MemoryLayout.byteSize()` against such a carrier resolves
+    // to the interface method — not to the per-class registration. Real JDK
+    // bytecode reaches it that way constantly: `SegmentAllocator.allocateFrom
+    // (JAVA_INT, 1, 2, 3)` failed with `MemoryLayout.byteSize() has no Code
+    // attribute` even though `JAVA_INT.byteSize()` answered 4 one line earlier.
+    //
+    // Safe to register on the interface for the same reason the rest of this
+    // file does: a non-static interface method's native only reaches receivers
+    // whose class IS the interface, i.e. exactly these carriers. The uniform
+    // `[0]=byteSize, [1]=byteAlignment` prefix is what makes one registration
+    // serve all of them.
+    r.register(ml, "byteSize", "()J", p67_layout_byte_size);
+    r.register(ml, "byteAlignment", "()J", p67_layout_byte_alignment);
+    for layout_class in [
+        "java/lang/foreign/SequenceLayout",
+        "java/lang/foreign/PaddingLayout",
+        "java/lang/foreign/UnionLayout",
+    ] {
+        r.register(layout_class, "byteSize", "()J", p67_layout_byte_size);
+        r.register(
+            layout_class,
+            "byteAlignment",
+            "()J",
+            p67_layout_byte_alignment,
+        );
+    }
+
+    // `SequenceLayout`'s own two accessors. The factory above already keeps the
+    // element layout at slot 4 and the count at slot 5 "so `elementLayout()`/
+    // `elementCount()` have somewhere to read from when they are implemented" —
+    // this is that.
+    r.register(
+        "java/lang/foreign/SequenceLayout",
+        "elementLayout",
+        "()Ljava/lang/foreign/MemoryLayout;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            Ok(Some(ctx.get_field(this, 4)))
+        },
+    );
+    r.register(
+        "java/lang/foreign/SequenceLayout",
+        "elementCount",
+        "()J",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            Ok(Some(match ctx.get_field(this, 5) {
+                v @ Value::Long(_) => v,
+                _ => Value::Long(0),
+            }))
+        },
+    );
 
     // Linker
     let gl = "java/lang/foreign/GroupLayout";
@@ -2608,7 +2960,7 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
                     .resolve_field_index("java/util/ArrayList", "size")
                     .unwrap_or(1);
                 let n_fields = std::cmp::max(data_slot, size_slot) + 1;
-                let list = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", n_fields);
+                let list = try_alloc_concurrent_synthetic(ctx, "java/util/ArrayList", n_fields)?;
                 let members = ctx.read_native_pin(members_pin, members);
                 ctx.set_field(list, data_slot, Value::Object(Some(members)));
                 ctx.set_field(list, size_slot, Value::Int(len as i32));
@@ -2673,7 +3025,7 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
                 Some(Value::Long(size)) => *size,
                 _ => 0,
             };
-            let seg = alloc_concurrent_synthetic(ctx, "java/lang/foreign/MemorySegment", 6);
+            let seg = try_alloc_concurrent_synthetic(ctx, "java/lang/foreign/MemorySegment", 6)?;
             ctx.set_field(seg, 0, ctx.get_field(this, 0));
             ctx.set_field(seg, 1, Value::Long(size));
             ctx.set_field(seg, 2, ctx.get_field(this, 2));
@@ -2745,7 +3097,7 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
         "nativeLinker",
         "()Ljava/lang/foreign/Linker;",
         |ctx, _args| {
-            let obj = alloc_concurrent_synthetic(ctx, "java/lang/foreign/Linker", 0);
+            let obj = try_alloc_concurrent_synthetic(ctx, "java/lang/foreign/Linker", 0)?;
             Ok(Some(Value::Object(Some(obj))))
         },
     );
@@ -2754,7 +3106,7 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
         "defaultLookup",
         "()Ljava/lang/foreign/SymbolLookup;",
         |ctx, _args| {
-            let obj = alloc_concurrent_synthetic(ctx, "java/lang/foreign/SymbolLookup", 2);
+            let obj = try_alloc_concurrent_synthetic(ctx, "java/lang/foreign/SymbolLookup", 2)?;
             ctx.set_field(obj, 0, Value::Long(-1)); // -1 = default/system lookup
             Ok(Some(Value::Object(Some(obj))))
         },
@@ -2801,7 +3153,7 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
                     args.get(3).is_some()
                 );
             }
-            let dh = alloc_concurrent_synthetic(ctx, "java/lang/foreign/DowncallHandle", 5);
+            let dh = try_alloc_concurrent_synthetic(ctx, "java/lang/foreign/DowncallHandle", 5)?;
             ctx.set_field(dh, 0, Value::Long(fn_addr));
             ctx.set_field(dh, 1, Value::Object(Some(descriptor)));
             ctx.set_field(dh, 2, Value::Long(variadic_fixed));
@@ -2848,7 +3200,7 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
                 Some(Value::Object(Some(arr))) => *arr,
                 _ => ctx.new_array(ArrayElementType::Reference, 0),
             };
-            let obj = alloc_concurrent_synthetic(ctx, "java/lang/foreign/FunctionDescriptor", 2);
+            let obj = try_alloc_concurrent_synthetic(ctx, "java/lang/foreign/FunctionDescriptor", 2)?;
             ctx.set_field(obj, 0, Value::Object(Some(return_layout)));
             ctx.set_field(obj, 1, Value::Object(Some(params)));
             Ok(Some(Value::Object(Some(obj))))
@@ -2863,7 +3215,7 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
                 Some(Value::Object(Some(arr))) => *arr,
                 _ => ctx.new_array(ArrayElementType::Reference, 0),
             };
-            let obj = alloc_concurrent_synthetic(ctx, "java/lang/foreign/FunctionDescriptor", 2);
+            let obj = try_alloc_concurrent_synthetic(ctx, "java/lang/foreign/FunctionDescriptor", 2)?;
             ctx.set_field(obj, 0, Value::Object(None));
             ctx.set_field(obj, 1, Value::Object(Some(params)));
             Ok(Some(Value::Object(Some(obj))))
@@ -2897,4 +3249,5 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
     // `.or()` compose over a lie ("yes, a library IS loaded") instead of a
     // clean unavailable signal.
     r.set_category(__prev_cat);
+    ()
 }

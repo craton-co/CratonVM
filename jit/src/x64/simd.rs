@@ -194,7 +194,7 @@ impl Compiler {
         let b_disp8 = Disp::encode(b_disp as i64).ok().and_then(Disp::as_disp8);
         let a_disp8 = Disp::encode(a_disp as i64).ok().and_then(Disp::as_disp8);
         let (Some(b_disp8), Some(a_disp8)) = (b_disp8, a_disp8) else {
-            self.buf.mark_overflowed();
+            self.buf.mark_codegen_unencodable("simd-disp8-unencodable");
             return;
         };
         if narrow_oops_enabled() {

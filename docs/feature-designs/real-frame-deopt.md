@@ -1,98 +1,46 @@
-# Real-Frame Deoptimization (the keystone)
+# Real-frame deoptimization
 
-> **Increment landed — object/ref resume now fires LIVE on BOTH call paths.**
-> The type source's *jit half* (typed slot locations in `jit/src/deopt.rs`:
-> `FrameValue::StackSlotRef(i32)`→`Object(word)` and `FrameValue::Unsupported`;
-> `typed_stack_slot` in `jit/src/ir_lower.rs`) was on dev, but its **VM half had
-> never been committed** — a concurrent session swept it before commit (see
-> [[shared-worktree-dev-switches-under-you]]). Three pieces were missing, so the
-> object arm was inert *and latently unsound*: `ir_deopt_frame_values` still
-> returned `None` for `Object` (forcing re-run), the claimed vm test and the
-> `PRECISE/FALLBACK` diagnostic did not exist, and — the load-bearing gap — the
-> **producer never tagged ref slots `Ref`** on the default path (`set_param_types`
-> was gated behind the default-OFF long flag), so an instance method's `this` was
-> typed `Int` → would have resumed as a *truncated pointer*. This increment
-> finishes the type source and makes it live:
-> - **VM resume** (`vm/src/runtime/interpreter.rs`): `ir_deopt_frame_values` maps
->   `Object(w)`→`Value::Object` (`0`→null, else the raw word IS the `ObjectRef`
->   pointer), keeps `Int`/`Undefined`, returns `None`→re-run for
->   `Unsupported`/`Float`/`VirtualObject`/unresolved. GC-safe with no temporary
->   root: `refill_pools_from_shared` only recycles Rust buffers, so no Java
->   alloc/GC runs between the in-stub oop capture and the frame push. `resume_from_ir_deopt`
->   now populates the operand stack **before** `push_frame_and_fire_entry` (adversarial-
->   review hardening) so that when the JVMTI MethodEntry callback fires — the one
->   alloc-capable step in the window — *both* locals and operand-stack reconstructed
->   oops are already in GC-scanned frame slots, not held only in a Rust `Vec`.
-> - **Producer ref-typing** (`jit/src/lib.rs`): `set_param_types`
->   (descriptor→`IrType`; `this`/`L`/`[`→`Ref`) is now applied **unconditionally**
->   on the IR path. Layout-identical for a cat-1 signature (only the node *type*
->   changes); codegen-neutral — spills/reloads are 64-bit REX.W so a pointer is
->   never truncated, the `ty==Int` arms are arithmetic-only (never a `Ref` param),
->   and escape analysis / the optimizer don't branch on the tag and already test
->   `Ref` params. This is what makes a ref local reconstruct as `StackSlotRef`→
->   `Object` instead of a truncated `Int`.
-> - **Both deopt sinks resume** (`interpreter.rs`): precise resume is now wired
->   into `execute_jit_call_decoded` (the instance-method invocation-tier-up path),
->   not just `execute_jit_call` (the static MIC path) — the design's step-4 "apply
->   the identical branch at the slow sink". Safe because the decoded path's caller
->   (`execute_invokevirtual_cached`) already popped the operand-stack args (so a
->   resume frame pushes onto a clean stack), and `resume_from_ir_deopt` bails
->   side-effect-free before any frame mutation (so falling through to re-run after
->   an unmappable frame double-pushes nothing).
-> - **Diagnostic:** `CRATONVM_DBG_DEOPT` now traces each resume decision as
->   `PRECISE resume <m> at bci=<n> locals=[..]` or `FALLBACK re-run <m> (<reason>)`.
-> - **Validation.** 819 jit lib tests green (the producer change is codegen-neutral;
->   the lone failing `intrinsic_arraycopy` integration test fails *identically on
->   base dev* — pre-existing, exercises `x64::compile` directly, untouched here) +
->   vm `ir_deopt_frame_values_maps_object_and_int`. **Live end-to-end PROOF**
->   (debug binary, JDK 25, `CRATONVM_IR_DEOPT_RESUME=1 CRATONVM_DBG_DEOPT=1`):
->   a STATIC `sd(LBox;I)I` (invokestatic → fast `execute_jit_call` sink) AND an
->   INSTANCE `d(I)I` (invokevirtual → `execute_jit_call_decoded` sink) both
->   div-by-zero deopt and **precisely resume at the `idiv` bci** with the ref
->   param/receiver reconstructed as `Object(Some(ObjectRef{..}))` — NOT a
->   truncated `Int` — throwing `ArithmeticException` correctly. Object/ref resume
->   is now **live-exercised on both call paths**, not merely unit-validated.
-> - **Still gated default-OFF** (`CRATONVM_IR_DEOPT_RESUME`); production re-runs
->   (correct for the side-effect-free div trigger today). **Remaining follow-ups:**
->   **FP/XMM-slot resolution** (needs `SavedRegisters.xmm[16]` + a width source).
->   `materialize_virtual_objects` (Phase B, GC-backed; consumer built in
->   `vm/src/runtime/deopt_materialize.rs`) — **the IR producer is now WIRED**: the
->   guard-surviving scalar-replacement producer (`ir_lower::frame_value_for_object`,
->   gated `CRATONVM_SCALAR_DEOPT` + `CRATONVM_DEOPT_REAL`) emits
->   `FrameValue::VirtualObject` for a scalar-replaced object live at a deopt point,
->   `resolve_value` resolves its machine-form fields, and the IR method sets
->   `can_deopt_resume` so `resume_real_ir_deopt` re-materializes it. Validated live
->   (producer emit + `materialize_virtual_objects` fire on a real method; div-deopt
->   `== HotSpot`). See `activate-ir-optimizer.md` "Increment 37".
->   Inlined-frame chains + monitor re-entry (no inliner exists yet). The x64
->   single-pass backport ([`real-frame-deopt-x64-backport.md`](real-frame-deopt-x64-backport.md)),
->   whose remaining blocker is the **primitive/width source** (StackMapTable
->   threading) — the IR path gets widths free from each node's `IrType`.
->
-> **Follow-up increment — cat-2 (`long`) resume on the IR path.** The builder now
-> lowers `ldiv`/`lrem` (`Op::Div`/`Op::Rem` `IrType::Long`; the lowerer already
-> emitted 64-bit `IDIV`+guards), so a `long`-div method (no int-div, no double)
-> compiles on the IR path under `CRATONVM_JIT_IR_LONG` and its long div-by-zero
-> guard is the first cat-2 deopt trigger. cat-2 resume implemented:
-> `FrameValue::Long` (const) + `FrameValue::StackSlotLong` (slot → reads the full
-> 64-bit word) in `deopt.rs`; `typed_stack_slot(Long)`→`StackSlotLong` +
-> `frame_value_for` long-const→`Long` in `ir_lower.rs`; VM `fv_to_value` maps
-> `Long`→`Value::Long` and a new `ir_deopt_locals` produces a COMPACT arg list
-> (the operand stack is one compact slot per value, but JVM locals are two-slot —
-> the snapshot's reserved upper-half `Undefined` after each `Long` is skipped so
-> `copy_args_to_locals` re-expands cat-2 correctly). **Live PROOF**
-> (`CRATONVM_JIT_IR_LONG=1 CRATONVM_IR_DEOPT_RESUME=1`): `sd(JJ)J` with `b==0`
-> deopts and `PRECISE resume … at bci=2 locals=[Long(123456789012345), Long(0)]`,
-> full 64-bit precision, throwing `ArithmeticException`; holds under
-> `CRATONVM_GC_STRESS`; default (resume OFF) re-runs. 823 jit lib tests + the vm
-> mapping/compaction tests green. (`double` stays `Unsupported`→re-run — the IR
-> path does not compile double/float; that is the FP/XMM follow-up.)
+**Status:** Shipped (default on; `CRATONVM_DEOPT_REAL=0` opts out).
 
-Status: design / not started. XL. **This is the keystone** — almost every
-other aggressive JIT optimization (speculative guards, aggressive inlining,
-scalar replacement that survives a guard failure) is unsafe until the JIT can
-rebuild a *precise* interpreter frame at the exact trapping bci. Until then the
-JIT is limited to optimizations that are provably correct without a fallback.
+## What it does today
+
+A failed speculative guard **resumes the interpreter at the trapping bci**
+rather than re-running the whole method from its entry.
+
+- **Metadata.** `jit/src/deopt.rs` carries `DeoptimizationPoint`, `FrameState`
+  and `FrameValue`, including the typed slot locations `StackSlotRef`,
+  `StackSlotLong`, `StackSlotFloat`, `StackSlotDouble`, plus `VirtualObject`
+  and `MaterializationRequired`, and the `DeoptVerifier` / `InvalidationManager`
+  pair.
+- **Production codegen sets the per-method gate.** The single-pass x64 driver
+  (`jit/src/x64/driver.rs`) sets `can_deopt_resume` from
+  `!deopt_points.is_empty() && !has_elided_monitor`, and `can_osr_exit`
+  likewise. This is the shipping backend, not a dormant IR path.
+- **Both dispatch sinks consume it.**
+  `vm/src/runtime/interpreter/jit_bridge.rs` calls
+  `real_frame_deopt_resume_and_despeculate` when the gate is on; the resume
+  itself (epoch staleness guard, de-speculation, cat-2/FP/ref slot
+  reconstruction) is in `vm/src/runtime/interpreter/deopt_resume.rs`.
+- Call-site canonical-boundary guard snapshots (`snapshot_pre_intrinsic_call`)
+  are emitted from `jit/src/x64/bytecode_walk.rs`, with reason routing in
+  `jit/src/x64/deopt_stubs.rs`.
+
+**Cost:** a JIT frame reserves an extra 256 B for the `SavedRegisters` deopt
+region while the feature is on.
+
+Companion default-off diagnostics and experiments, all opt-in:
+`CRATONVM_DEOPT_VERIFY` (structural/oop verifier), `CRATONVM_DEOPT_EAGER`
+(force the reconstruct+resume path on every loop), `CRATONVM_SCALAR_DEOPT`
+(guard-surviving scalar replacement), `CRATONVM_OSR_EXIT_TRANSFER`.
+
+## What is not built yet
+
+- **Guard-surviving scalar replacement** is default-off and refuses
+  monitor-bearing graphs; see
+  [`activate-ir-optimizer.md`](activate-ir-optimizer.md).
+- **aarch64 parity is unaudited.** The gates and stubs live under
+  `jit/src/x64/`; whether the aarch64 backend carries an equivalent has not
+  been established.
 
 ## Goal
 
@@ -106,62 +54,6 @@ re-running the whole method from entry.
 Concretely: replace the current "return the `i64::MIN` sentinel → interpreter
 re-executes the method from bci 0" model with HotSpot-style frame
 materialization.
-
-## Current state (cited)
-
-The deopt *data model* already exists and is well-shaped; what's missing is the
-machine-state → frame plumbing and the actual mid-method resume.
-
-- **The sentinel re-run model.** A JIT method signals deopt by returning
-  `i64::MIN` and setting an out-of-band flag. The interpreter consumes it in
-  two places and falls back by **re-running the method from entry**:
-  - `vm/src/runtime/interpreter.rs:16966` takes `take_jit_deopt_pending()`;
-    `:17043` `if result == i64::MIN && deopt_signaled { ... }` drops into the
-    interpreter slow path.
-  - `vm/src/runtime/interpreter.rs:17322` `if result == i64::MIN &&
-    deopt_signaled { return Ok(None); }` — `Ok(None)` means "no JIT value
-    produced, run it interpreted". Re-execution starts at the method's first
-    bytecode. The surrounding comments explicitly note that **re-running a
-    method with side effects double-executes them** (`:17042`, `:17319`), which
-    is exactly why today's JIT cannot speculate past any side-effecting bc.
-  - The signal helpers live in `vm/src/jit/helpers.rs`
-    (`take_jit_deopt_pending`, `take_jit_pending_exception`,
-    `take_jit_pending_npe`, `take_jit_pending_aioobe`).
-- **The frame data model (`jit/src/deopt.rs`).** Already defines everything a
-  real deopt needs, but it is **not fed by the codegen** and **not consumed by
-  a resume path**:
-  - `FrameValue` (`deopt.rs:73`) with `Register(u8)`, `StackSlot(i32)`,
-    `Object(u64)`, `Int`, `Float`, and `VirtualObject(VirtualObjectState)`.
-    The `Register`/`StackSlot` variants are exactly the "value lives in machine
-    state" cases that frame materialization must resolve.
-  - `FrameState` (`deopt.rs:107`): `method_key`, `bci`, `locals`, `stack`,
-    `monitors`, and a `caller: Option<Box<FrameState>>` chain for inlined
-    frames.
-  - `DeoptimizationPoint` (`deopt.rs:128`): `native_offset`, `bci`, `reason`,
-    `action`, `speculation_id`, `frame_state`. This is the per-safepoint record
-    that must be emitted by codegen and indexed by native PC.
-  - `reconstruct_frame` / `reconstruct_frame_owned` (`deopt.rs:565` / `:615`)
-    already walk a `FrameState` (+ inlined caller chain) into a
-    `ReconstructedFrame`. **But they assume the `FrameValue`s are already
-    resolved constants** — there is no register/stack-slot reader.
-  - `materialize_virtual_objects` (`deopt.rs:704` test-only, `:734`
-    panicking stub) is **explicitly unwired** and hard-gated: the non-test body
-    `panic!`s rather than mint fake heap addresses. Its doc comment
-    (`deopt.rs:680`) is the canonical spec for GC-backed re-materialization:
-    allocate via the live TLAB (may GC — the deopt frame must already be a
-    valid root set), write the header, recursively materialize fields, patch
-    cyclic back-references.
-  - `DeoptimizationLog` (`deopt.rs:159`) records events and drives the
-    give-up-after-N-deopts policy (`should_give_up`, `most_common_reason`) —
-    this part is live-usable today.
-- **Tiered hook (`jit/src/tiered.rs`).** `CompilationTier` (`:40`) and the
-  C1↔C2↔Interpreter transition graph (`:18`) describe deopt as the C2→C1 /
-  C2→Interpreter edge. The manager is consulted at
-  `interpreter.rs:14181` (`on_method_invocation`) but its tier recommendation
-  is dropped (`let _recommended_tier = ...`). See `wire-tiered-manager.md`.
-
-So today: data types exist, codegen emits none of them, resume is "re-run from
-bci 0".
 
 ## Design
 
@@ -249,31 +141,6 @@ path or decline the optimization:
   guard failure would need it — `VirtualObject` re-materializes it on deopt.
   This is the second front in `activate-ir-optimizer.md`.
 
-## Implementation steps (ordered)
-
-1. **Abstract-state tracking in the IR lowerer.** Make `ir_lower.rs` carry the
-   interpreter locals[]/stack[] shadow and, at each candidate safepoint, snapshot
-   each slot's provenance into a `FrameState`. No behavior change yet (emit +
-   discard).
-2. **Safepoint table on `CompiledMethod`.** Store the `Vec<DeoptimizationPoint>`
-   sorted by `native_offset`; add a PC→point lookup. Verify offsets against the
-   final assembled code (relocations).
-3. **Deopt trampoline + register save.** Add the stub and the
-   `jit_integration` entry point; route one *non-speculative* guard (e.g. an
-   existing `jit_uncommon_trap`) through it and confirm it reconstructs the
-   frame and resumes at the right bci with a trivial method (no virtuals, no
-   inlining).
-4. **GC-backed `materialize_virtual_objects`.** Replace the `deopt.rs:734`
-   panic with the real allocator-threaded implementation; root the half-built
-   frame. Gate behind `CRATONVM_DEOPT_REAL` while it soaks.
-5. **Inlined-frame reconstruction.** Handle the `FrameState.caller` chain →
-   multiple interpreter frames.
-6. **Flip the first real speculation.** Convert null-check elision (or the
-   monomorphic inline cache) to guard+deopt; measure deopt rate via
-   `DeoptimizationLog`.
-7. **Retire the `i64::MIN` re-run path** once parity is proven; keep it as the
-   fallback for methods whose safepoint maps can't be built.
-
 ## Risks
 
 - **GC root correctness during materialization** is the sharpest edge: a GC
@@ -289,9 +156,3 @@ path or decline the optimization:
 - **Inlined monitor balance**: held monitors across an inline boundary must be
   re-entered in the right order.
 
-## Effort
-
-XL. Realistically 3 landable phases: (A) safepoint maps + trampoline + simple
-resume (no virtuals, no inlining) — large; (B) GC-backed virtual-object
-materialization — medium but GC-coupled; (C) inlined-frame chains + flipping
-real speculations — large. (A) alone is the gate for everything else.

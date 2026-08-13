@@ -21,7 +21,7 @@ use cratonvm_types::ClassId;
 use cratonvm_types::{ArrayElementType, ObjectRef, Value};
 
 use crate::{
-    alloc_concurrent_synthetic, jul_logger_handlers_get, jul_logger_handlers_set,
+    try_alloc_concurrent_synthetic, jul_logger_handlers_get, jul_logger_handlers_set,
     jul_logger_parent_get, jul_logger_parent_set, native_noop, native_noop_with_this, obj_arg,
 };
 use crate::{native_cf_then_accept, native_cf_then_apply};
@@ -63,6 +63,7 @@ pub mod jar_manifest;
 pub mod jdbc;
 pub mod management;
 pub mod net_channels;
+pub mod nio_buffer;
 pub mod nio_file;
 pub mod reflect_invoke;
 pub mod ssl_security;
@@ -414,6 +415,30 @@ fn bw_delegate_out(ctx: &mut dyn NativeContext, this: ObjectRef) -> Option<Objec
     }
 }
 
+/// The file descriptor a **`synthetic-jdk`** `java/io/BufferedWriter` is backed
+/// by, or `None`.
+///
+/// JDK-ONLY-LAYOUT (kind 3). The `BufferedWriter` write/flush/close natives all
+/// carried their own `match ctx.get_field(this, 0) { Value::Int(fd) => … }` fd
+/// fast path, reached whenever [`bw_delegate_out`] finds no wrapped `out`. In
+/// the DEFAULT build that read only ever addresses `java.io.Writer.writeBuffer`
+/// — a `char[]` the JDK owns and lazily allocates for `Writer.write(String)` —
+/// because nothing has parked an fd in a BufferedWriter since
+/// `Files.newBufferedWriter`'s fd path was deleted on 2026-08-05.
+///
+/// Gated to the build where slot 0 belongs to the fabricated model, which is
+/// the same gate `bw_delegate_out` already carries and the reason the model can
+/// stop spelling that slot `_vm0` in the default build: with no writer AND no
+/// reader left, there is no overlay to count.
+#[allow(unused_variables)]
+pub(crate) fn bw_synthetic_fd(ctx: &mut dyn NativeContext, this: ObjectRef) -> Option<u32> {
+    #[cfg(feature = "synthetic-jdk")]
+    if let Value::Int(fd) = ctx.get_field(this, 0) {
+        return Some(fd as u32);
+    }
+    None
+}
+
 // ── Keycloak Gap 6: real `@ConfigMapping` resolution via SmallRye ─────────────
 //
 // `SmallRyeConfig.getConfigMapping(Class, String)` returns the config-mapping
@@ -748,7 +773,7 @@ fn cm_construct_via_context(
 fn cm_fallback_alloc(ctx: &mut dyn NativeContext, cls: ObjectRef) -> MethodCallResult {
     match crate::lang_class::mirror_class_name(ctx, cls) {
         Some(n) => {
-            let obj = alloc_concurrent_synthetic(ctx, &n, 0);
+            let obj = try_alloc_concurrent_synthetic(ctx, &n, 0)?;
             Ok(Some(Value::Object(Some(obj))))
         }
         None => Ok(Some(Value::Object(None))),
@@ -1253,7 +1278,7 @@ const PB_FIELD_ENVIRONMENT: usize = 2;
 // this file registers ITS `native_process_builder_start`.
 //
 // The layout was allocated with
-// `alloc_concurrent_synthetic(ctx, "java/lang/Process", PROC_FIELD_COUNT)`,
+// `try_alloc_concurrent_synthetic(ctx, "java/lang/Process", PROC_FIELD_COUNT)?`,
 // which in real-JDK mode yields the REAL six-field `java.lang.Process`: the
 // four extra slots did not exist, so every write to them was dropped and every
 // read of them returned nothing. The same shape on the `Runtime.exec` route is
@@ -1477,7 +1502,7 @@ pub(crate) fn register_phase57_process(r: &mut NativeMethodRegistry) {
         let mut map = match ctx.new_object_initialized("java/util/HashMap", "()V", &[]) {
             Ok(Some(Value::Object(Some(m)))) => m,
             _ => {
-                let m = alloc_concurrent_synthetic(ctx, "java/util/HashMap", 3);
+                let m = try_alloc_concurrent_synthetic(ctx, "java/util/HashMap", 3)?;
                 cratonvm_native_collections::native_map_init(ctx, &[Value::Object(Some(m))])?;
                 m
             }
@@ -1555,7 +1580,7 @@ pub(crate) fn register_phase57_process(r: &mut NativeMethodRegistry) {
         "PIPE",
         "()Ljava/lang/ProcessBuilder$Redirect;",
         |ctx, _args| {
-            let r = alloc_concurrent_synthetic(ctx, "java/lang/ProcessBuilder$Redirect", 1);
+            let r = try_alloc_concurrent_synthetic(ctx, "java/lang/ProcessBuilder$Redirect", 1)?;
             ctx.set_field(r, 0, Value::Int(0)); // PIPE
             Ok(Some(Value::Object(Some(r))))
         },
@@ -1565,7 +1590,7 @@ pub(crate) fn register_phase57_process(r: &mut NativeMethodRegistry) {
         "INHERIT",
         "()Ljava/lang/ProcessBuilder$Redirect;",
         |ctx, _args| {
-            let r = alloc_concurrent_synthetic(ctx, "java/lang/ProcessBuilder$Redirect", 1);
+            let r = try_alloc_concurrent_synthetic(ctx, "java/lang/ProcessBuilder$Redirect", 1)?;
             ctx.set_field(r, 0, Value::Int(1)); // INHERIT
             Ok(Some(Value::Object(Some(r))))
         },
@@ -1590,6 +1615,28 @@ pub(crate) fn register_phase57_process(r: &mut NativeMethodRegistry) {
     // implementation: this triple is registered from BOTH registrars and the
     // two must not answer differently depending on which ran last — the same
     // contract the `isAlive` registration below already carries.
+    //
+    // `SyntheticStub`, stated, for these three triples, on the reasoning
+    // `register_p60_process_handle` sets out at length. The tag has to be
+    // restated HERE as well as there, and that is what this scope is for.
+    // `NativeKind` is ambient; `register()` is last-write-wins for the
+    // CALLBACK; and under `--jdk-only` a `SyntheticStub` registration is
+    // REFUSED, returning before it can overwrite anything. So had this
+    // registrar — reached early, from `register_essential_natives_with_shims` —
+    // left the three as `Bridge` while only the later
+    // `register_p60_process_handle` restated them, strict mode would accept the
+    // `Bridge` rows here, refuse the corrected rows there, and go on
+    // dispatching the very bodies the re-tag exists to drop. An unstated
+    // re-registration does not downgrade the kind quietly; it decides it.
+    //
+    // `javap java.lang.ProcessHandle` (Eclipse Adoptium jdk-25.0.3.9-hotspot,
+    // `javap -version` 25.0.3): `current()` is `ACC_PUBLIC, ACC_STATIC` and
+    // carries `Code` (`invokestatic ProcessHandleImpl.current`); `pid()` and
+    // `isAlive()` are `ACC_PUBLIC, ACC_ABSTRACT`. None of the three is
+    // `ACC_NATIVE`, so none is a bridge under §1.5, and `current()` shadows
+    // real bytecode besides (§1.4).
+    let __ph_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::SyntheticStub);
     r.register(
         "java/lang/ProcessHandle",
         "current",
@@ -1606,6 +1653,7 @@ pub(crate) fn register_phase57_process(r: &mut NativeMethodRegistry) {
     // registered from BOTH registrars and the two must not answer differently
     // depending on which ran last.
     r.register("java/lang/ProcessHandle", "isAlive", "()Z", p60_handle_is_alive);
+    r.set_category(__ph_cat);
     r.set_category(__prev_cat);
 }
 
@@ -1768,13 +1816,13 @@ fn p58_make_concat(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
         Some(Value::Object(Some(arr))) => Some(*arr),
         _ => None,
     };
-    let mh = crate::lang_invoke::alloc_string_concat_method_handle(ctx, &recipe, constants);
+    let mh = crate::lang_invoke::alloc_string_concat_method_handle(ctx, &recipe, constants)?;
     // Set the call-site type from the caller-supplied MethodType so JDK
     // arity-validation reads see the real shape.
     if let Some(Value::Object(Some(mt))) = args.get(2) {
         ctx.set_field_by_name(mh, "type", Value::Object(Some(*mt)));
     }
-    let cs = alloc_concurrent_synthetic(ctx, "java/lang/invoke/ConstantCallSite", 2);
+    let cs = try_alloc_concurrent_synthetic(ctx, "java/lang/invoke/ConstantCallSite", 2)?;
     ctx.set_field(cs, 0, Value::Object(Some(mh)));
     ctx.set_field_by_name(cs, "target", Value::Object(Some(mh)));
     Ok(Some(Value::Object(Some(cs))))
@@ -1799,11 +1847,11 @@ fn p58_make_concat_simple(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         }
     }
     let recipe: String = std::iter::repeat('\u{0001}').take(arity).collect();
-    let mh = crate::lang_invoke::alloc_string_concat_method_handle(ctx, &recipe, None);
+    let mh = crate::lang_invoke::alloc_string_concat_method_handle(ctx, &recipe, None)?;
     if let Some(Value::Object(Some(mt))) = args.get(2) {
         ctx.set_field_by_name(mh, "type", Value::Object(Some(*mt)));
     }
-    let cs = alloc_concurrent_synthetic(ctx, "java/lang/invoke/ConstantCallSite", 2);
+    let cs = try_alloc_concurrent_synthetic(ctx, "java/lang/invoke/ConstantCallSite", 2)?;
     ctx.set_field(cs, 0, Value::Object(Some(mh)));
     ctx.set_field_by_name(cs, "target", Value::Object(Some(mh)));
     Ok(Some(Value::Object(Some(cs))))
@@ -2207,7 +2255,7 @@ fn p60_process_handle_current(ctx: &mut dyn NativeContext, _args: &[Value]) -> M
     ) {
         Ok(Some(Value::Object(Some(real)))) => real,
         _ => {
-            let synth = alloc_concurrent_synthetic(ctx, "java/lang/ProcessHandle", 1);
+            let synth = try_alloc_concurrent_synthetic(ctx, "java/lang/ProcessHandle", 1)?;
             ctx.set_field(synth, 0, Value::Long(pid));
             synth
         }
@@ -2321,19 +2369,183 @@ fn p60_handle_destroy(
     }
 }
 
-fn p60_process_parent(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+/// Rebuild a MINTED bare-`java/lang/ProcessHandle` receiver as the real
+/// `java.lang.ProcessHandleImpl` for the same pid, or `None` when the image has
+/// no such class.
+///
+/// **Who reaches the bodies below.** Every *instance* registration on
+/// `java/lang/ProcessHandle` in this file is reachable only from a receiver
+/// whose runtime class IS the interface. All three native-shadow hierarchy
+/// walks in the tree are `superclass` walks and none of them walks interfaces
+/// (`vm/src/runtime/interpreter/invoke.rs`'s step-1 `or_else`, and
+/// `dispatch_virtual.rs`'s vtable fast path plus `populate_virtual_invoke_cache`
+/// — the rule is `docs/architecture/natives-over-real-jdk-classes.md` §1). An
+/// interface cannot be instantiated, so such a receiver is always one this VM
+/// minted: `try_alloc_concurrent_synthetic(…, "java/lang/ProcessHandle", 1)`
+/// here, or `alloc_process_handle` in `native-io/src/process.rs`. A real
+/// `ProcessHandleImpl` never reaches them; it runs the JDK's own bytecode.
+///
+/// **Why that made the bodies fabrications.** A mint carries exactly one fact,
+/// the pid in slot 0. `children`, `descendants`, `parent` and `info` are OS
+/// measurements, and slot 0 is not one — so those bodies answered plausible
+/// constants (an empty stream, this VM's own `getppid()`, a fieldless `Info`)
+/// that are indistinguishable from true answers. The measurements do exist, in
+/// `native-io/src/process.rs`'s `getProcessPids0` / `parent0` / `Info.info0`
+/// natives, and the supported way to reach them is the JDK's own
+/// `ProcessHandleImpl` bytecode. So rebuild the receiver and delegate, rather
+/// than growing a second implementation of the same process table that can
+/// disagree with the first.
+///
+/// **Why `getInternal` and not the `(JJ)V` constructor.** `javap -p
+/// java.lang.ProcessHandleImpl` (JDK 25.0.3) declares
+/// `static ProcessHandleImpl getInternal(long)`, whose body is
+/// `new ProcessHandleImpl(pid, isAlive0(pid))`. That second argument is the
+/// whole point: a hardcoded `0` there is `STARTTIME_ANY`, which
+/// `ProcessHandleImpl$Info.info(long, long)` does NOT honour — it compares with
+/// a bare `!=` and, on a mismatch, wipes every field `info0` has just written.
+/// Passing the constructor a start time this file computes separately is how
+/// W5-2 happened; taking it from `isAlive0` makes the two agree by
+/// construction and leaves nothing for a later edit to get out of step.
+/// docs/known-issues/jdk-only/W5-2-two-silently-skipped-process-checks.md.
+///
+/// `None` means there is no `java.lang.ProcessHandleImpl` in the image at all —
+/// synthetic-JDK mode, where `java/lang/ProcessHandle` is itself a carrier
+/// `ClassManager` fabricates (`is_native_backed_jdk_stub`,
+/// `classloading/src/class_manager.rs`). Callers fall back to the historical
+/// answer there and nowhere else.
+fn p60_real_handle_for(ctx: &mut dyn NativeContext, args: &[Value]) -> Option<ObjectRef> {
+    let pid = p60_handle_pid(ctx, args)?;
+    match ctx.invoke(
+        "java/lang/ProcessHandleImpl",
+        "getInternal",
+        "(J)Ljava/lang/ProcessHandleImpl;",
+        &[Value::Long(pid)],
+    ) {
+        Ok(Some(Value::Object(Some(real)))) => Some(real),
+        _ => None,
+    }
+}
+
+/// Answer one of a minted handle's OS queries from the real
+/// `ProcessHandleImpl`; `None` when there is no real class to delegate to.
+///
+/// The inner `MethodCallResult` is returned UNTOUCHED, exceptions included, and
+/// that is the half that matters. `ProcessHandleImpl.children(long)` funnels
+/// into `getProcessPids0`, which `native-io/src/process.rs` raises a
+/// `java.lang.RuntimeException` from when the enumeration syscall fails —
+/// the same thing HotSpot's `ProcessHandleImpl_md.c` and
+/// `ProcessHandleImpl_unix.c` do. Catching that here and answering an empty
+/// stream would reinstate exactly the fabricated success this change removes,
+/// one layer further down.
+///
+/// GC: `real` is used only as the receiver of the call that immediately
+/// follows it, with no allocation in between, so there is no window for the
+/// stale-native-local hazard `p60_process_parent` pins against below.
+fn p60_delegate_to_real_handle(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+    method_name: &str,
+    descriptor: &str,
+) -> Option<MethodCallResult> {
+    let real = p60_real_handle_for(ctx, args)?;
+    Some(ctx.invoke_virtual(real, method_name, descriptor, &[]))
+}
+
+/// The empty `Stream<ProcessHandle>` the synthetic-JDK fallback answers with —
+/// and the one place the fabrication left in this block is written down rather
+/// than implied.
+///
+/// It IS a fabrication. `children()`'s javadoc carries no absence clause:
+/// *"@return a sequential Stream of ProcessHandles for processes that are
+/// direct children of the process"* (`ProcessHandle.java`, JDK 25 `src.zip`).
+/// An empty stream therefore states "this process has no children", which is a
+/// measurement. Contrast `parent()`, whose javadoc says the Optional *"is empty
+/// if the child process does not have a parent or if the parent is not
+/// available, possibly due to operating system limitations"*, and `Info`, whose
+/// *"attributes … are not available in all implementations"*. Those two may
+/// honestly answer empty when nothing can be measured; this one may not.
+///
+/// It survives because synthetic-JDK mode has no process table this VM can
+/// consult through a supported route and no `ProcessHandleImpl` to delegate to
+/// — the whole `java/lang/ProcessHandle` carrier is fabricated there. In
+/// real-JDK mode the delegation above answers instead, and under `--jdk-only`
+/// the `SyntheticStub` tag means this function is not reachable at all, because
+/// the registration that would call it is refused. Removing the last of it
+/// needs a process enumerator `native-builtins` can call without a real JDK;
+/// see the record.
+///
+/// `make_stream_from_elements` rather than the hand-rolled allocation this
+/// replaces: that one built a ONE-field `java/util/stream/Stream`, and
+/// `STREAM_NUM_FIELDS` in `native-collections` is 2 — slot 1 holds the
+/// `BaseStream.onClose` handler array. Every slot-1 reader guards on the field
+/// count, so a 1-field stream is not a crash; it is silently a stream that can
+/// never carry a close handler.
+fn p60_unmeasurable_process_tree(ctx: &mut dyn NativeContext) -> MethodCallResult {
+    cratonvm_native_collections::make_stream_from_elements(ctx, &[])
+}
+
+/// The pid a minted `java/lang/ProcessHandle$Info` carries in slot 0.
+///
+/// Separate from [`p60_handle_pid`] because the guard is different: an `Info`
+/// minted by an older path (or by anything that copies the previous ZERO-field
+/// allocation) has no slot 0 at all, and reading past the end of an object is
+/// the one failure mode worth spending a branch on. Interfaces declare no
+/// instance fields, so `try_alloc_concurrent_synthetic`'s `num_fields.max(real)`
+/// leaves slot 0 ours — the slot-index species (W4-4 / W6-3) cannot bite here.
+fn p60_info_pid(ctx: &mut dyn NativeContext, args: &[Value]) -> Option<i64> {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return None,
+    };
+    if ctx.object_num_fields(this) == 0 {
+        return None;
+    }
+    match ctx.get_field(this, 0) {
+        Value::Long(pid) if pid > 0 => Some(pid),
+        Value::Int(pid) if pid > 0 => Some(pid as i64),
+        _ => None,
+    }
+}
+
+/// `java/lang/ProcessHandle.parent()`.
+///
+/// This used to ignore the receiver entirely and answer `getppid()` — this
+/// VM's own parent — for a handle to *any* process on the machine, wrapped in a
+/// fresh bare-interface mint. Two fabrications in four lines: the pid was not
+/// the receiver's parent, and the object handed back could not answer anything
+/// about the process it named either.
+///
+/// Delegating gets the real `parent0(pid, startTime)` measurement AND a real
+/// `ProcessHandleImpl` in the `Optional`, so the handle the caller walks to
+/// next is a working one. It also removes the second-largest source of
+/// bare-interface mints in the tree.
+fn p60_process_parent(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    if let Some(result) = p60_delegate_to_real_handle(ctx, args, "parent", "()Ljava/util/Optional;")
+    {
+        return result;
+    }
+    // Synthetic-JDK fallback. `getppid()` answers for exactly one receiver —
+    // this process — and for any other pid there is nothing here that can
+    // measure a parent. Empty is the specified answer for that, verbatim:
+    // "the {@code Optional} is empty if the child process does not have a
+    // parent or if the parent is not available, possibly due to operating
+    // system limitations". Answering this VM's parent for someone else's
+    // process is not.
+    if p60_handle_pid(ctx, args) != Some(std::process::id() as i64) {
+        return p60_empty_optional(ctx, &[]);
+    }
     let parent_pid = p60_parent_pid();
     if parent_pid <= 0 {
         return p60_empty_optional(ctx, &[]);
     }
-    let parent = alloc_concurrent_synthetic(ctx, "java/lang/ProcessHandle", 1);
+    let parent = try_alloc_concurrent_synthetic(ctx, "java/lang/ProcessHandle", 1)?;
     ctx.set_field(parent, 0, Value::Long(parent_pid));
     // GC-SAFETY (native stale-local family): `parent` is not yet reachable
     // from any Java root, and the `Optional` allocation below is a collection
     // point that can relocate it. Holding it in a bare local across that call
     // and then storing it is the use-after-move that corrupts the heap.
     let parent_pin = ctx.pin_native_root(parent);
-    let optional = alloc_concurrent_synthetic(ctx, "java/util/Optional", 1);
+    let optional = try_alloc_concurrent_synthetic(ctx, "java/util/Optional", 1)?;
     let parent = ctx.read_native_pin(parent_pin, parent);
     ctx.unpin_native_roots(parent_pin);
     ctx.set_field(optional, 0, Value::Object(Some(parent)));
@@ -2342,9 +2554,71 @@ fn p60_process_parent(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCal
 
 /// Register the native-backed ProcessHandle surface in both synthetic- and
 /// real-JDK modes. SmallRye invokes `current().info()` during class init.
+///
+/// # The surface, from the image
+///
+/// `javap java.lang.ProcessHandle` / `javap 'java.lang.ProcessHandle$Info'` on
+/// Eclipse Adoptium jdk-25.0.3.9-hotspot (`javap -version` 25.0.3):
+///
+/// * `ProcessHandle` — **13 abstract** (`pid`, `parent`, `children`,
+///   `descendants`, `info`, `onExit`, `supportsNormalTermination`, `destroy`,
+///   `destroyForcibly`, `isAlive`, `hashCode`, `equals(Object)`,
+///   `compareTo(ProcessHandle)`), **3 static** (`of(J)`, `current()`,
+///   `allProcesses()`), **1 default** (the `compareTo(Object)` bridge).
+/// * `ProcessHandle$Info` — **6 abstract** (`command`, `commandLine`,
+///   `arguments`, `startInstant`, `totalCpuDuration`, `user`), no default, no
+///   static.
+///
+/// # `SyntheticStub`, stated for the whole block
+///
+/// **Not one method on either interface is `ACC_NATIVE`** — every flags line is
+/// `ACC_PUBLIC, ACC_ABSTRACT` or `ACC_PUBLIC, ACC_STATIC`. §1.5 defines a
+/// bridge as what an `ACC_NATIVE` method *on the image* binds to, so the
+/// ambient `Bridge` this block used to carry was a misstatement on every row,
+/// not just the arguable ones. Two distinct arguments, both landing here:
+///
+/// * `current()` is a **§1.4 shadow**: `acc_native: false, has_code: true`, and
+///   its real body is `invokestatic ProcessHandleImpl.current` — a `getstatic`
+///   of the class's own singleton. Static interface methods keep the native
+///   check in real-JDK mode, so unlike the abstract rows this one really does
+///   intercept live pipelines, and what it intercepts is *better than what it
+///   substitutes*: the memo below mints its own `ProcessHandleImpl` through the
+///   private `(JJ)V` constructor, which is not `ProcessHandleImpl.current`, so
+///   `ProcessHandle.current() != ProcessHandleImpl.current()` for the rest of
+///   the run. Refused under strict, the real `getstatic` answers and the
+///   identity is the JDK's. Same shape, same reasoning and same disposition as
+///   `native-io/src/process.rs`'s `ProcessBuilder.start()`.
+/// * The **abstract instance rows** (this interface's 11, `$Info`'s 6) bind to
+///   no image method at all, and the only receiver that can reach them is one
+///   this VM minted — an interface cannot be instantiated. A registration whose
+///   entire receiver population is fabricated is a compatibility shim by the
+///   review's own disposition table ("No real method/class + compatibility
+///   behaviour -> CompatibilityShim"), whatever it answers.
+///
+/// The `Bridge` tag was not baseless, and knowing why matters for the next
+/// reader: in **synthetic-JDK mode** these classes have no class file and
+/// `ClassManager::is_native_backed_jdk_stub` fabricates a carrier whose methods
+/// it marks `MethodAccessFlags::NATIVE` (`classloading/src/class_manager.rs`).
+/// On that carrier the rows *are* `ACC_NATIVE`. But the carrier is not the
+/// image, §1.5 asks about the image, and a single ambient tag cannot say "true
+/// in one mode". `SyntheticStub` is the tag that makes both modes coherent:
+/// Compatible keeps every registration and is unchanged, strict refuses them
+/// and the real JDK answers.
+///
+/// **Strict mode loses nothing by the refusal.** After the delegation fixes
+/// below, no path in the tree mints a bare-interface handle when
+/// `java.lang.ProcessHandleImpl` is loadable: `current()` builds a real one,
+/// `parent()` returns the real one `parent0` found, and
+/// `native-io::build_process_handle` prefers a real one for `Process.toHandle`.
+/// A residual mint under strict would raise `AbstractMethodError` naming the
+/// exact triple — which is the outcome strict mode is for, and strictly better
+/// than a silent fabricated answer.
+///
+/// Restated in `register_phase57_process` for the three triples it shares; see
+/// the note there for why both sites have to say it.
 pub fn register_p60_process_handle(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
-    r.set_category(cratonvm_native_api::NativeKind::Bridge);
+    r.set_category(cratonvm_native_api::NativeKind::SyntheticStub);
     let ph = "java/lang/ProcessHandle";
     r.register(
         ph,
@@ -2357,27 +2631,34 @@ pub fn register_p60_process_handle(r: &mut NativeMethodRegistry) {
         Ok(Some(ctx.get_field(this, 0)))
     });
     r.register(ph, "isAlive", "()Z", p60_handle_is_alive);
-    r.register(
-        ph,
-        "children",
-        "()Ljava/util/stream/Stream;",
-        |ctx, _args| {
-            // Return empty stream
-            let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0);
-            let stream = alloc_concurrent_synthetic(ctx, "java/util/stream/Stream", 1);
-            ctx.set_field(stream, 0, Value::Object(Some(arr)));
-            Ok(Some(Value::Object(Some(stream))))
-        },
-    );
+    // `children()` and `descendants()` answered a hardcoded empty stream — the
+    // fabricated success this campaign is named for. "This process has no
+    // children" and "this VM cannot enumerate processes" are different facts,
+    // only one of them is ever true, and the empty stream says the first while
+    // meaning the second. Delegating routes both through
+    // `ProcessHandleImpl.children(long)` -> `getProcessPids0`, which is the
+    // same probe the `ProcessHandleImpl` natives in `native-io/src/process.rs`
+    // already answer with — so the two cannot report different process trees —
+    // and which THROWS on a failed scan the way HotSpot does.
+    r.register(ph, "children", "()Ljava/util/stream/Stream;", |ctx, args| {
+        if let Some(result) =
+            p60_delegate_to_real_handle(ctx, args, "children", "()Ljava/util/stream/Stream;")
+        {
+            return result;
+        }
+        p60_unmeasurable_process_tree(ctx)
+    });
     r.register(
         ph,
         "descendants",
         "()Ljava/util/stream/Stream;",
-        |ctx, _args| {
-            let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0);
-            let stream = alloc_concurrent_synthetic(ctx, "java/util/stream/Stream", 1);
-            ctx.set_field(stream, 0, Value::Object(Some(arr)));
-            Ok(Some(Value::Object(Some(stream))))
+        |ctx, args| {
+            if let Some(result) =
+                p60_delegate_to_real_handle(ctx, args, "descendants", "()Ljava/util/stream/Stream;")
+            {
+                return result;
+            }
+            p60_unmeasurable_process_tree(ctx)
         },
     );
     r.register(
@@ -2385,7 +2666,7 @@ pub fn register_p60_process_handle(r: &mut NativeMethodRegistry) {
         "onExit",
         "()Ljava/util/concurrent/CompletableFuture;",
         |ctx, _args| {
-            let cf = p58_new_cf(ctx, Value::Object(None), true);
+            let cf = p58_new_cf(ctx, Value::Object(None), true)?;
             Ok(Some(Value::Object(Some(cf))))
         },
     );
@@ -2429,13 +2710,29 @@ pub fn register_p60_process_handle(r: &mut NativeMethodRegistry) {
         },
     );
 
-    // ProcessHandle.Info = 0-field synthetic
+    // `info()` minted a ZERO-field `ProcessHandle$Info` — an object carrying no
+    // fact about any process, whose six accessors therefore had nothing to
+    // answer from and answered constants. Delegating produces a real
+    // `java.lang.ProcessHandleImpl$Info` filled by `info0(pid)`, which serves
+    // all six from one measurement, including `commandLine()`, which this file
+    // could not have supplied at all (see its registration below).
+    //
+    // The synthetic fallback now carries the pid in slot 0. That is one fact
+    // rather than none, and it is what lets `command()` below tell "this VM's
+    // own executable" apart from "some other process's, which I do not know".
     r.register(
         ph,
         "info",
         "()Ljava/lang/ProcessHandle$Info;",
-        |ctx, _args| {
-            let info = alloc_concurrent_synthetic(ctx, "java/lang/ProcessHandle$Info", 0);
+        |ctx, args| {
+            if let Some(result) =
+                p60_delegate_to_real_handle(ctx, args, "info", "()Ljava/lang/ProcessHandle$Info;")
+            {
+                return result;
+            }
+            let pid = p60_handle_pid(ctx, args).unwrap_or(0);
+            let info = try_alloc_concurrent_synthetic(ctx, "java/lang/ProcessHandle$Info", 1)?;
+            ctx.set_field(info, 0, Value::Long(pid));
             Ok(Some(Value::Object(Some(info))))
         },
     );
@@ -2445,10 +2742,27 @@ pub fn register_p60_process_handle(r: &mut NativeMethodRegistry) {
     // `PathMatchingResourcePatternResolverTests$ClassPathManifestEntries` does
     // exactly that, and an empty Optional there is an immediate
     // `NoSuchElementException: No value present`. Report this VM's own
-    // executable, the way the real `ProcessHandleImpl.Info` does.
+    // executable when — and only when — the receiver describes this VM.
+    //
+    // That pid gate is the correction. `current_exe()` is
+    // a real measurement of exactly ONE process — this one — and the `Info` it
+    // was being answered from could describe any process on the machine, so for
+    // every other pid it was a fabricated command line dressed as a
+    // measurement. `Optional.empty()` is what the interface specifies for a
+    // value it cannot supply: "The attributes of a process vary by operating
+    // system and are not available in all implementations. … The return types
+    // are {@code Optional<T>} allowing explicit tests and actions if the value
+    // is available" (`ProcessHandle.Info`, JDK 25 `src.zip`).
+    //
+    // In real-JDK mode `info()` above no longer reaches this at all — the real
+    // `ProcessHandleImpl$Info` answers `command()` from `info0`, for the right
+    // process, so the Spring case is served better than it was here.
     r.register(phi, "command", "()Ljava/util/Optional;", |ctx, args| {
-        let Ok(exe) = std::env::current_exe() else {
+        if p60_info_pid(ctx, args) != Some(std::process::id() as i64) {
             return p60_empty_optional(ctx, args);
+        }
+        let Ok(exe) = std::env::current_exe() else {
+            return Ok(p60_empty_optional(ctx, args)?);
         };
         // GC-SAFETY (native stale-local family): `text` is freshly allocated
         // and reachable from no Java root, and the `Optional` allocation below
@@ -2456,7 +2770,7 @@ pub fn register_p60_process_handle(r: &mut NativeMethodRegistry) {
         // re-read the forwarded ref before the (allocation-free) field write.
         let text = ctx.create_string(&exe.to_string_lossy());
         let text_pin = ctx.pin_native_root(text);
-        let optional = alloc_concurrent_synthetic(ctx, "java/util/Optional", 1);
+        let optional = try_alloc_concurrent_synthetic(ctx, "java/util/Optional", 1)?;
         let text = ctx.read_native_pin(text_pin, text);
         ctx.unpin_native_roots(text_pin);
         ctx.set_field(optional, 0, Value::Object(Some(text)));
@@ -2481,7 +2795,37 @@ pub fn register_p60_process_handle(r: &mut NativeMethodRegistry) {
         "()Ljava/util/Optional;",
         p60_empty_optional,
     );
+    // `commandLine()` — the SIXTH abstract on `java.lang.ProcessHandle$Info`
+    // (`javap 'java.lang.ProcessHandle$Info'`, JDK 25.0.3: six abstract, no
+    // default, no static), and until now registered nowhere in the tree. On a
+    // minted receiver an abstract declaration has no `Code` to fall back on, so
+    // this triple was an `AbstractMethodError` waiting for its first caller —
+    // and `regression-suite/src/RJdkProcess.java:128` already calls
+    // `info.commandLine()`, so "waiting" is the only accurate word.
+    //
+    // It reached nobody because the five siblings around it were the only rows
+    // anything exercised, and W5-2 read that silence as evidence the `$Info`
+    // stubs do not intercept. An absence used as evidence is still an absence:
+    // what it actually showed is that `current()` already produced a real
+    // `ProcessHandleImpl`, so no caller had ever held a minted `Info`.
+    //
+    // Registered, and registered EMPTY, deliberately. The minted `Info` carries
+    // a pid and nothing else; `commandLine()` is `command()` and `arguments()`
+    // joined, or failing that "a best-effort, platform dependent representation
+    // of the command line" — neither of which this file can measure for an
+    // arbitrary process without reimplementing `info0`. `Optional.empty()` is
+    // the specified answer for a value that is not available, and it is what
+    // the four siblings beside it already answer for the same reason. In
+    // real-JDK mode `info()` returns the real `ProcessHandleImpl$Info` and this
+    // row is never reached.
+    //
+    // Registration ORDER: this registrar is the last writer for every
+    // `java/lang/ProcessHandle*` triple in both boot arms (`vm_init.rs:1901`
+    // and `:2406`, after `register_io_natives`), so nothing overwrites it. It
+    // is also a NEW triple — no prior slot, so last-write-wins does not apply.
+    r.register(phi, "commandLine", "()Ljava/util/Optional;", p60_empty_optional);
     r.set_category(__prev_cat);
+    ()
 }
 
 
@@ -2532,7 +2876,7 @@ pub(crate) fn register_p61_logging(r: &mut NativeMethodRegistry) {
             let handlers = match jul_logger_handlers_get(ctx, this) {
                 Some(list) => list,
                 None => {
-                    let list = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
+                    let list = try_alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2)?;
                     cratonvm_native_collections::native_al_init(ctx, &[Value::Object(Some(list))])?;
                     jul_logger_handlers_set(ctx, this, list);
                     list
@@ -2695,31 +3039,159 @@ pub(crate) fn register_p61_logging(r: &mut NativeMethodRegistry) {
                 String::new()
             };
 
-            // Format and write to stream
+            // Format and write to stream.
+            //
+            // REPORTED since W7-64. `StreamHandler.publish` wraps its whole
+            // write region in `catch (Exception ex) { reportError(null, ex,
+            // ErrorManager.WRITE_FAILURE); }` — a handler whose sink refuses
+            // the record says so through the `ErrorManager`, it does not throw
+            // and it does not go quiet. One report for the whole record, as in
+            // HotSpot, so the loop stops at the first failure rather than
+            // reporting once per byte.
+            // W7-64-printstream-trouble-and-errormanager.md
             let formatted = format!("[{}] {}\n", level_str, message);
+            let mut write_failure = None;
             for &b in formatted.as_bytes() {
                 let stream = ctx.read_native_pin(stream_pin, stream);
-                let _ = ctx.invoke_virtual(stream, "write", "(I)V", &[Value::Int(b as i32)]);
+                let wrote = ctx.invoke_virtual(stream, "write", "(I)V", &[Value::Int(b as i32)]);
+                match cratonvm_native_api::print_error_state::take_absorbed(
+                    &*ctx,
+                    wrote,
+                    "java/lang/Exception",
+                ) {
+                    Ok(None) => {}
+                    Ok(Some(ex)) => {
+                        write_failure = Some(ex);
+                        break;
+                    }
+                    // An `Error` is not what `catch (Exception ex)` names, so
+                    // it leaves `publish` the way it leaves HotSpot's — but
+                    // the pin has to come off first.
+                    Err(e) => {
+                        ctx.unpin_native_roots(stream_pin);
+                        return Err(e);
+                    }
+                }
+            }
+            // Reported while the pin is still held: `reportError` runs
+            // arbitrary Java (an application `ErrorManager`) and can move
+            // anything unpinned, and the loop's `stream` local is dead by
+            // here, so only `ex` is live across it — and it is passed straight
+            // in as an argument, which the invoke pins itself.
+            if let Some(ex) = write_failure {
+                cratonvm_native_api::print_error_state::report_handler_error(
+                    ctx,
+                    this,
+                    ex,
+                    cratonvm_native_api::print_error_state::ERROR_MANAGER_WRITE_FAILURE,
+                );
             }
             ctx.unpin_native_roots(stream_pin);
             Ok(None)
         },
     );
+    // KEPT SWALLOW, NARROWED — and the width here is `Exception`, not
+    // `IOException`. `java.util.logging.StreamHandler.flush()` is
+    //
+    //     try { writer.flush(); }
+    //     catch (Exception ex) {
+    //         // We don't want to throw an exception here, but we
+    //         // report the exception to any registered ErrorManager.
+    //         reportError(null, ex, ErrorManager.FLUSH_FAILURE);
+    //     }
+    //
+    // and `close()` → `flushAndClose()` wraps `writer.flush(); writer.close();`
+    // in the same `catch (Exception)` with `CLOSE_FAILURE`. `Handler.flush()`
+    // and `Handler.close()` declare no checked exception, so propagating would
+    // be a fresh divergence. `catch (Exception)` does not catch an `Error`,
+    // so a `NoSuchMethodError` out of our own dispatch now comes out.
+    // W7-57-close-flush-swallow-sweep.md
+    //
+    // REPORTED since W7-64. That `catch` body is not empty: it is
+    // `reportError(null, ex, ErrorManager.<CODE>)`, and the `ErrorManager` is
+    // where a `Handler` failure is *supposed* to end up — the whole reason
+    // `Handler` absorbs instead of throwing. Dropping it is not the same as
+    // the JDK dropping it. Measured on HotSpot 25.0.3.9: a `StreamHandler`
+    // over a sink whose `flush()` raises an `IOException` calls its
+    // `ErrorManager` with `code=2` (`FLUSH_FAILURE`) and that exact
+    // `IOException`; the `close()` path reports `code=3` (`CLOSE_FAILURE`).
+    // An `Error` reaches the `ErrorManager` in NEITHER case — it propagates,
+    // because `catch (Exception)` does not name it.
+    // W7-64-printstream-trouble-and-errormanager.md
     r.register(sh, "flush", "()V", |ctx, args| {
         let this = obj_arg(args, 0)?;
         if let Value::Object(Some(stream)) = ctx.get_field(this, 0) {
-            let _ = ctx.invoke_virtual(stream, "flush", "()V", &[]);
+            let flushed = ctx.invoke_virtual(stream, "flush", "()V", &[]);
+            if let Some(ex) = cratonvm_native_api::print_error_state::take_absorbed(
+                &*ctx,
+                flushed,
+                "java/lang/Exception",
+            )? {
+                cratonvm_native_api::print_error_state::report_handler_error(
+                    ctx,
+                    this,
+                    ex,
+                    cratonvm_native_api::print_error_state::ERROR_MANAGER_FLUSH_FAILURE,
+                );
+            }
         }
         Ok(None)
     });
     r.register(sh, "close", "()V", |ctx, args| {
         let this = obj_arg(args, 0)?;
         if let Value::Object(Some(stream)) = ctx.get_field(this, 0) {
-            let _ = ctx.invoke_virtual(stream, "flush", "()V", &[]);
-            let _ = ctx.invoke_virtual(stream, "close", "()V", &[]);
+            // `flushAndClose` runs both inside ONE `try`, so in HotSpot a
+            // failing flush skips the close — and reports ONE `CLOSE_FAILURE`
+            // for whichever of the two failed first. The close is attempted
+            // either way here, which for a logging sink is the safer of the
+            // two; the report is still the first failure only, which is the
+            // part a caller's `ErrorManager` observes.
+            // W7-57-close-flush-swallow-sweep.md
+            //
+            // GC SAFETY: the flush failure is reported BEFORE the close is
+            // attempted rather than held in a local across it. An absorbed
+            // throwable is a bare `ObjectRef`, and `close()` is arbitrary Java
+            // bytecode that can move it (the native stale-local family). This
+            // ordering also gives the JDK's answer for free: exactly one
+            // report, naming whichever failure came first.
+            let close_failure =
+                cratonvm_native_api::print_error_state::ERROR_MANAGER_CLOSE_FAILURE;
+            let flushed = ctx.invoke_virtual(stream, "flush", "()V", &[]);
+            let flush_failed = match cratonvm_native_api::print_error_state::take_absorbed(
+                &*ctx,
+                flushed,
+                "java/lang/Exception",
+            )? {
+                Some(ex) => {
+                    cratonvm_native_api::print_error_state::report_handler_error(
+                        ctx,
+                        this,
+                        ex,
+                        close_failure,
+                    );
+                    true
+                }
+                None => false,
+            };
+            let closed = ctx.invoke_virtual(stream, "close", "()V", &[]);
+            if let Some(ex) = cratonvm_native_api::print_error_state::take_absorbed(
+                &*ctx,
+                closed,
+                "java/lang/Exception",
+            )? {
+                if !flush_failed {
+                    cratonvm_native_api::print_error_state::report_handler_error(
+                        ctx,
+                        this,
+                        ex,
+                        close_failure,
+                    );
+                }
+            }
         }
         Ok(None)
     });
+    register_p61_handler_error_manager(r);
 
     // --- FileHandler: see `register_p61_file_handler` below, also called
     // directly from real-JDK mode's init path (vm_init.rs) since this
@@ -2733,7 +3205,7 @@ pub(crate) fn register_p61_logging(r: &mut NativeMethodRegistry) {
         "getLogManager",
         "()Ljava/util/logging/LogManager;",
         |ctx, _args| {
-            let mgr = alloc_concurrent_synthetic(ctx, "java/util/logging/LogManager", 1);
+            let mgr = try_alloc_concurrent_synthetic(ctx, "java/util/logging/LogManager", 1)?;
             ctx.set_field(mgr, 0, Value::Object(None));
             Ok(Some(Value::Object(Some(mgr))))
         },
@@ -2766,11 +3238,11 @@ pub(crate) fn register_p61_logging(r: &mut NativeMethodRegistry) {
         "()Ljava/util/Enumeration;",
         |ctx, _args| {
             // Return empty enumeration stub
-            let e = alloc_concurrent_synthetic(
+            let e = try_alloc_concurrent_synthetic(
                 ctx,
                 "java/util/logging/LogManager$LoggerEnumeration",
                 1,
-            );
+            )?;
             ctx.set_field(e, 0, Value::Int(0));
             Ok(Some(Value::Object(Some(e))))
         },
@@ -2778,6 +3250,160 @@ pub(crate) fn register_p61_logging(r: &mut NativeMethodRegistry) {
     r.set_category(__prev_cat);
 }
 
+
+/// `java.util.logging.Handler`'s `ErrorManager` surface, and the default
+/// `ErrorManager` itself.
+///
+/// SYNTHETIC-JDK ONLY — reached only through `register_p61_logging` ->
+/// `register_phase61_natives` -> `register_synthetic_overrides`. Compatible
+/// mode runs the real `java.logging` bytecode for all five of these, over the
+/// real `Handler.errorManager` field, and shadowing it would be a
+/// contract-1.4 shadow on working code.
+///
+/// Why it exists at all: `Handler`'s whole absorb contract is
+/// `catch (Exception ex) { reportError(null, ex, ErrorManager.<CODE>); }` —
+/// the error is not discarded, it is *delivered somewhere*. Without a
+/// `reportError` to dispatch to, the synthetic `StreamHandler.flush`/`close`
+/// natives above would take the absorbed exception and have nowhere to put
+/// it, which is the exact defect this lane is chartered on one level down.
+/// W7-64-printstream-trouble-and-errormanager.md
+///
+/// State lives in `logging_shims`' identity-hash side table, not a field slot:
+/// the synthetic `StreamHandler` is a 2-field object (stream=0, formatter=1)
+/// with no room for it, and a raw slot 2 on a real-JDK `Handler` would land on
+/// `formatter`/`logLevel` — the same trap `register_p61_file_handler`'s doc
+/// comment records for `FileHandler`.
+fn register_p61_handler_error_manager(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
+    let h = "java/util/logging/Handler";
+    let em = "java/util/logging/ErrorManager";
+
+    // `public synchronized void setErrorManager(ErrorManager em)` — the JDK
+    // throws NPE on null before storing.
+    r.register(h, "setErrorManager", "(Ljava/util/logging/ErrorManager;)V", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        // `Handler.setErrorManager` is `if (em == null) throw new
+        // NullPointerException();` before the store — the same idiom this file
+        // already uses for a null argument a JDK method refuses.
+        let Some(Value::Object(Some(manager))) = args.get(1).copied() else {
+            return Err(RuntimeError::NullPointerException { message: None }.into());
+        };
+        crate::jul_handler_error_manager_set(ctx, this, manager);
+        Ok(None)
+    });
+
+    // `public ErrorManager getErrorManager()`. The JDK's field initializer is
+    // `= new ErrorManager()`, i.e. every Handler has one from construction and
+    // this never returns null. Minting on first read is observably the same:
+    // the identity is stable once minted, and nothing can observe the object
+    // before something asks for it.
+    r.register(h, "getErrorManager", "()Ljava/util/logging/ErrorManager;", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        if let Some(existing) = crate::jul_handler_error_manager_get(ctx, this) {
+            return Ok(Some(Value::Object(Some(existing))));
+        }
+        let minted = try_alloc_concurrent_synthetic(ctx, "java/util/logging/ErrorManager", 1)?;
+        // Slot 0 is `reported` — see the `error` body below.
+        ctx.set_field(minted, 0, Value::Int(0));
+        crate::jul_handler_error_manager_set(ctx, this, minted);
+        Ok(Some(Value::Object(Some(minted))))
+    });
+
+    // `protected void reportError(String msg, Exception ex, int code)`:
+    //     try { errorManager.error(msg, ex, code); }
+    //     catch (Exception ex2) { System.err.println("Handler.reportError caught:");
+    //                             ex2.printStackTrace(); }
+    // The inner call is VIRTUAL, so an application's own ErrorManager subclass
+    // is what runs — which is the whole point of the surface.
+    r.register(h, "reportError", "(Ljava/lang/String;Ljava/lang/Exception;I)V", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let msg = args.get(1).copied().unwrap_or(Value::Object(None));
+        let ex = args.get(2).copied().unwrap_or(Value::Object(None));
+        let code = match args.get(3) {
+            Some(Value::Int(c)) => *c,
+            _ => 0,
+        };
+        let Ok(Some(Value::Object(Some(manager)))) = ctx.invoke_virtual(
+            this,
+            "getErrorManager",
+            "()Ljava/util/logging/ErrorManager;",
+            &[],
+        ) else {
+            return Ok(None);
+        };
+        // The JDK's own `catch (Exception ex2)` around this call: reporting a
+        // failure must not become a second, different failure on the caller.
+        let reported = ctx.invoke_virtual(
+            manager,
+            "error",
+            "(Ljava/lang/String;Ljava/lang/Exception;I)V",
+            &[msg, ex, Value::Int(code)],
+        );
+        cratonvm_native_api::delegated_close::absorb_exception(&*ctx, reported)?;
+        Ok(None)
+    });
+
+    // `java.util.logging.ErrorManager` itself = 1 field (`reported`).
+    r.register(em, "<init>", "()V", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        ctx.set_field(this, 0, Value::Int(0));
+        Ok(None)
+    });
+
+    // The default `ErrorManager.error`:
+    //     synchronized (this) { if (reported) return; reported = true; }
+    //     String text = "java.util.logging.ErrorManager: " + code;
+    //     if (msg != null) text = text + ": " + msg;
+    //     System.err.println(text);
+    //     if (ex != null) ex.printStackTrace();
+    // The first-call-only latch is not decoration — it is what keeps a broken
+    // sink from filling the console, and a version without it would be a
+    // visibly different VM under any handler that fails repeatedly.
+    r.register(em, "error", "(Ljava/lang/String;Ljava/lang/Exception;I)V", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        if matches!(ctx.get_field(this, 0), Value::Int(v) if v != 0) {
+            return Ok(None);
+        }
+        ctx.set_field(this, 0, Value::Int(1));
+        let code = match args.get(3) {
+            Some(Value::Int(c)) => *c,
+            _ => 0,
+        };
+        let mut text = format!("java.util.logging.ErrorManager: {code}");
+        if let Some(Value::Object(Some(msg))) = args.get(1).copied() {
+            if let Some(msg) = ctx.read_string(msg) {
+                text.push_str(": ");
+                text.push_str(&msg);
+            }
+        }
+        // Route through the live Java `System.err` rather than the host's
+        // stderr: a test that redirected `System.err` (Spring Boot's
+        // `OutputCaptureExtension`, Tomcat's log capture) must see this, and
+        // the JDK writes it with `System.err.println`.
+        if let Some(err) = ctx.get_system_stream("err") {
+            let line = ctx.create_string(&text);
+            let _ = ctx.invoke_virtual(
+                err,
+                "println",
+                "(Ljava/lang/String;)V",
+                &[Value::Object(Some(line))],
+            );
+        }
+        if let Some(Value::Object(Some(ex))) = args.get(2).copied() {
+            let _ = ctx.invoke_virtual(ex, "printStackTrace", "()V", &[]);
+        }
+        Ok(None)
+    });
+
+    // NOT done here: `ErrorManager`'s six `public static final int` codes.
+    // A synthetic class has no static field table to put them in, so
+    // `ErrorManager.FLUSH_FAILURE` still does not resolve under
+    // `--synthetic-jdk`. The codes this VM *passes* are correct (2 and 3,
+    // measured), and `probes/CloseFlushSwallowProbe.java` compares against the
+    // literals for exactly that reason. Named, not silently skipped.
+    r.set_category(__prev_cat);
+}
 
 // =============================================================================
 // java.lang.ClassLoader — resource loading, findResource, loadClass
@@ -2959,7 +3585,7 @@ pub(crate) fn register_p61_classloader(r: &mut NativeMethodRegistry) {
             } else {
                 return Ok(Some(Value::Object(None)));
             };
-            let url_obj = alloc_concurrent_synthetic(ctx, "java/net/URL", 6);
+            let url_obj = try_alloc_concurrent_synthetic(ctx, "java/net/URL", 6)?;
             let full = ctx.create_string(&url_str);
             ctx.set_field(url_obj, 0, Value::Object(Some(full)));
             ctx.set_field(url_obj, 5, Value::Object(Some(full)));
@@ -2974,11 +3600,11 @@ pub(crate) fn register_p61_classloader(r: &mut NativeMethodRegistry) {
             let name_obj = match args.get(1) {
                 Some(Value::Object(Some(o))) => *o,
                 _ => {
-                    let e = alloc_concurrent_synthetic(
+                    let e = try_alloc_concurrent_synthetic(
                         ctx,
                         "java/util/Collections$EmptyEnumeration",
                         0,
-                    );
+                    )?;
                     return Ok(Some(Value::Object(Some(e))));
                 }
             };
@@ -2990,7 +3616,7 @@ pub(crate) fn register_p61_classloader(r: &mut NativeMethodRegistry) {
             }
             let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, urls.len());
             for (i, u) in urls.iter().enumerate() {
-                let url_obj = alloc_concurrent_synthetic(ctx, "java/net/URL", 6);
+                let url_obj = try_alloc_concurrent_synthetic(ctx, "java/net/URL", 6)?;
                 let full = ctx.create_string(u);
                 ctx.set_field(url_obj, 0, Value::Object(Some(full)));
                 ctx.set_field(url_obj, 5, Value::Object(Some(full)));
@@ -3017,7 +3643,7 @@ pub(crate) fn register_p61_classloader(r: &mut NativeMethodRegistry) {
             match ctx.find_resource(resource_name) {
                 None => Ok(Some(Value::Object(None))),
                 Some(bytes) => Ok(Some(Value::Object(Some(
-                    crate::lang_class::t19_h10_alloc_byte_array_input_stream(ctx, &bytes),
+                    crate::lang_class::t19_h10_alloc_byte_array_input_stream(ctx, &bytes)?,
                 )))),
             }
         },
@@ -3042,7 +3668,7 @@ pub(crate) fn register_p61_classloader(r: &mut NativeMethodRegistry) {
             } else {
                 return Ok(Some(Value::Object(None)));
             };
-            let url_obj = alloc_concurrent_synthetic(ctx, "java/net/URL", 6);
+            let url_obj = try_alloc_concurrent_synthetic(ctx, "java/net/URL", 6)?;
             let full = ctx.create_string(&url_str);
             ctx.set_field(url_obj, 0, Value::Object(Some(full)));
             ctx.set_field(url_obj, 5, Value::Object(Some(full)));
@@ -3120,7 +3746,7 @@ pub(crate) fn register_p61_classloader(r: &mut NativeMethodRegistry) {
         "getPlatformClassLoader",
         "()Ljava/lang/ClassLoader;",
         |ctx, _args| {
-            let loader = alloc_concurrent_synthetic(ctx, "java/lang/ClassLoader", 1);
+            let loader = try_alloc_concurrent_synthetic(ctx, "java/lang/ClassLoader", 1)?;
             ctx.set_field(loader, 0, Value::Object(None));
             Ok(Some(Value::Object(Some(loader))))
         },
@@ -3156,6 +3782,7 @@ pub(crate) fn register_p61_classloader(r: &mut NativeMethodRegistry) {
         Ok(Some(Value::Int(val)))
     });
     r.set_category(__prev_cat);
+    ()
 }
 
 
@@ -3293,7 +3920,7 @@ pub(crate) fn register_p63_service_loader(r: &mut NativeMethodRegistry) {
         "(Ljava/lang/Class;)Ljava/util/ServiceLoader;",
         |ctx, args| {
             let class_ref = args.first().copied().unwrap_or(Value::Object(None));
-            let obj = alloc_concurrent_synthetic(ctx, "java/util/ServiceLoader", 2);
+            let obj = try_alloc_concurrent_synthetic(ctx, "java/util/ServiceLoader", 2)?;
             // Try to discover providers for this service class
             let class_name = match class_ref {
                 Value::Object(Some(cls)) => {
@@ -3308,7 +3935,7 @@ pub(crate) fn register_p63_service_loader(r: &mut NativeMethodRegistry) {
                 .get(class_name.as_str())
                 .copied()
                 .unwrap_or(&[]);
-            let al = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
+            let al = try_alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2)?;
             let arr = ctx.new_array(
                 cratonvm_types::ArrayElementType::Reference,
                 providers.len().max(1),
@@ -3330,7 +3957,7 @@ pub(crate) fn register_p63_service_loader(r: &mut NativeMethodRegistry) {
         "(Ljava/lang/Class;Ljava/lang/ClassLoader;)Ljava/util/ServiceLoader;",
         |ctx, args| {
             let class_ref = args.first().copied().unwrap_or(Value::Object(None));
-            let obj = alloc_concurrent_synthetic(ctx, "java/util/ServiceLoader", 2);
+            let obj = try_alloc_concurrent_synthetic(ctx, "java/util/ServiceLoader", 2)?;
             let class_name = match class_ref {
                 Value::Object(Some(cls)) => {
                     match ctx.invoke_virtual(cls, "getName", "()Ljava/lang/String;", &[]) {
@@ -3344,7 +3971,7 @@ pub(crate) fn register_p63_service_loader(r: &mut NativeMethodRegistry) {
                 .get(class_name.as_str())
                 .copied()
                 .unwrap_or(&[]);
-            let al = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
+            let al = try_alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2)?;
             let arr = ctx.new_array(
                 cratonvm_types::ArrayElementType::Reference,
                 providers.len().max(1),
@@ -3363,7 +3990,7 @@ pub(crate) fn register_p63_service_loader(r: &mut NativeMethodRegistry) {
     r.register(sl, "iterator", "()Ljava/util/Iterator;", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let services = ctx.get_field(this, 0);
-        let itr = alloc_concurrent_synthetic(ctx, "java/util/ServiceLoader$Itr", 2);
+        let itr = try_alloc_concurrent_synthetic(ctx, "java/util/ServiceLoader$Itr", 2)?;
         ctx.set_field(itr, 0, services); // the ArrayList
         ctx.set_field(itr, 1, Value::Int(0)); // current index
         Ok(Some(Value::Object(Some(itr))))
@@ -3377,19 +4004,19 @@ pub(crate) fn register_p63_service_loader(r: &mut NativeMethodRegistry) {
                 for i in 0..len {
                     ctx.set_array_element(stream_arr, i, ctx.get_array_element(arr, i));
                 }
-                let stream = alloc_concurrent_synthetic(ctx, "java/util/stream/Stream", 1);
+                let stream = try_alloc_concurrent_synthetic(ctx, "java/util/stream/Stream", 1)?;
                 ctx.set_field(stream, 0, Value::Object(Some(stream_arr)));
                 return Ok(Some(Value::Object(Some(stream))));
             }
         }
         let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0);
-        let stream = alloc_concurrent_synthetic(ctx, "java/util/stream/Stream", 1);
+        let stream = try_alloc_concurrent_synthetic(ctx, "java/util/stream/Stream", 1)?;
         ctx.set_field(stream, 0, Value::Object(Some(arr)));
         Ok(Some(Value::Object(Some(stream))))
     });
     r.register(sl, "findFirst", "()Ljava/util/Optional;", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let opt = alloc_concurrent_synthetic(ctx, "java/util/Optional", 1);
+        let opt = try_alloc_concurrent_synthetic(ctx, "java/util/Optional", 1)?;
         if let Value::Object(Some(al)) = ctx.get_field(this, 0) {
             let len = ctx.get_field(al, 1).as_int().unwrap_or(0);
             if len > 0 {
@@ -3487,7 +4114,7 @@ pub(crate) fn register_p64_hex_format(r: &mut NativeMethodRegistry) {
     let hf = "java/util/HexFormat";
 
     r.register(hf, "of", "()Ljava/util/HexFormat;", |ctx, _args| {
-        let obj = alloc_concurrent_synthetic(ctx, "java/util/HexFormat", 2);
+        let obj = try_alloc_concurrent_synthetic(ctx, "java/util/HexFormat", 2)?;
         let empty = ctx.create_string("");
         ctx.set_field(obj, 0, Value::Object(Some(empty))); // delimiter
         let empty2 = ctx.create_string("");
@@ -3499,7 +4126,7 @@ pub(crate) fn register_p64_hex_format(r: &mut NativeMethodRegistry) {
         "ofDelimiter",
         "(Ljava/lang/String;)Ljava/util/HexFormat;",
         |ctx, args| {
-            let obj = alloc_concurrent_synthetic(ctx, "java/util/HexFormat", 2);
+            let obj = try_alloc_concurrent_synthetic(ctx, "java/util/HexFormat", 2)?;
             ctx.set_field(obj, 0, args.first().copied().unwrap_or(Value::Object(None)));
             let empty = ctx.create_string("");
             ctx.set_field(obj, 1, Value::Object(Some(empty)));
@@ -3602,7 +4229,7 @@ pub(crate) fn register_p64_hex_format(r: &mut NativeMethodRegistry) {
         "(Ljava/lang/String;)Ljava/util/HexFormat;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            let obj = alloc_concurrent_synthetic(ctx, "java/util/HexFormat", 2);
+            let obj = try_alloc_concurrent_synthetic(ctx, "java/util/HexFormat", 2)?;
             ctx.set_field(obj, 0, ctx.get_field(this, 0)); // keep delimiter
             ctx.set_field(obj, 1, args.get(1).copied().unwrap_or(Value::Object(None)));
             Ok(Some(Value::Object(Some(obj))))
@@ -3738,7 +4365,7 @@ pub(crate) fn register_p64_random_generator(r: &mut NativeMethodRegistry) {
         "current",
         "()Ljava/util/concurrent/ThreadLocalRandom;",
         |ctx, _args| {
-            let obj = alloc_concurrent_synthetic(ctx, "java/util/concurrent/ThreadLocalRandom", 2);
+            let obj = try_alloc_concurrent_synthetic(ctx, "java/util/concurrent/ThreadLocalRandom", 2)?;
             ctx.set_field(obj, 0, Value::Long(p64_simple_random() as i64));
             ctx.set_field(obj, 1, Value::Int(0));
             Ok(Some(Value::Object(Some(obj))))
@@ -4156,7 +4783,7 @@ pub(crate) fn register_p65_pattern_additions(r: &mut NativeMethodRegistry) {
                 Some(Value::Object(Some(r))) => *r,
                 _ => {
                     let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0);
-                    let stream = alloc_concurrent_synthetic(ctx, "java/util/stream/Stream", 1);
+                    let stream = try_alloc_concurrent_synthetic(ctx, "java/util/stream/Stream", 1)?;
                     ctx.set_field(stream, 0, Value::Object(Some(arr)));
                     return Ok(Some(Value::Object(Some(stream))));
                 }
@@ -4180,7 +4807,7 @@ pub(crate) fn register_p65_pattern_additions(r: &mut NativeMethodRegistry) {
                 let s = ctx.create_string(part);
                 ctx.set_array_element(arr, i, Value::Object(Some(s)));
             }
-            let stream = alloc_concurrent_synthetic(ctx, "java/util/stream/Stream", 1);
+            let stream = try_alloc_concurrent_synthetic(ctx, "java/util/stream/Stream", 1)?;
             ctx.set_field(stream, 0, Value::Object(Some(arr)));
             Ok(Some(Value::Object(Some(stream))))
         },
@@ -4338,7 +4965,7 @@ pub(crate) fn register_p67_string_template(r: &mut NativeMethodRegistry) {
         "of",
         "(Ljava/lang/String;)Ljava/lang/StringTemplate;",
         |ctx, args| {
-            let obj = alloc_concurrent_synthetic(ctx, "java/lang/StringTemplate", 2);
+            let obj = try_alloc_concurrent_synthetic(ctx, "java/lang/StringTemplate", 2)?;
             ctx.set_field(obj, 0, args.first().copied().unwrap_or(Value::Object(None))); // fragments
             ctx.set_field(obj, 1, Value::Object(None)); // values
             Ok(Some(Value::Object(Some(obj))))
@@ -4363,7 +4990,7 @@ pub(crate) fn register_p67_string_template(r: &mut NativeMethodRegistry) {
         "STR",
         "Ljava/lang/StringTemplate$Processor;",
         |ctx, _args| {
-            let obj = alloc_concurrent_synthetic(ctx, "java/lang/StringTemplate$Processor", 0);
+            let obj = try_alloc_concurrent_synthetic(ctx, "java/lang/StringTemplate$Processor", 0)?;
             Ok(Some(Value::Object(Some(obj))))
         },
     );
@@ -4373,7 +5000,7 @@ pub(crate) fn register_p67_string_template(r: &mut NativeMethodRegistry) {
         "RAW",
         "Ljava/lang/StringTemplate$Processor;",
         |ctx, _args| {
-            let obj = alloc_concurrent_synthetic(ctx, "java/lang/StringTemplate$Processor", 0);
+            let obj = try_alloc_concurrent_synthetic(ctx, "java/lang/StringTemplate$Processor", 0)?;
             Ok(Some(Value::Object(Some(obj))))
         },
     );
@@ -4400,7 +5027,7 @@ pub(crate) fn register_p67_string_template(r: &mut NativeMethodRegistry) {
         "FMT",
         "Ljava/lang/StringTemplate$Processor;",
         |ctx, _args| {
-            let obj = alloc_concurrent_synthetic(ctx, "java/lang/StringTemplate$Processor", 0);
+            let obj = try_alloc_concurrent_synthetic(ctx, "java/lang/StringTemplate$Processor", 0)?;
             Ok(Some(Value::Object(Some(obj))))
         },
     );
@@ -4560,7 +5187,7 @@ pub(crate) fn register_p67_misc(r: &mut NativeMethodRegistry) {
         "getInstance",
         "()Ljava/lang/StackWalker;",
         |ctx, _args| {
-            let obj = alloc_concurrent_synthetic(ctx, "java/lang/StackWalker", 0);
+            let obj = try_alloc_concurrent_synthetic(ctx, "java/lang/StackWalker", 0)?;
             Ok(Some(Value::Object(Some(obj))))
         },
     );
@@ -4569,7 +5196,7 @@ pub(crate) fn register_p67_misc(r: &mut NativeMethodRegistry) {
         "getInstance",
         "(Ljava/lang/StackWalker$Option;)Ljava/lang/StackWalker;",
         |ctx, _args| {
-            let obj = alloc_concurrent_synthetic(ctx, "java/lang/StackWalker", 0);
+            let obj = try_alloc_concurrent_synthetic(ctx, "java/lang/StackWalker", 0)?;
             Ok(Some(Value::Object(Some(obj))))
         },
     );
@@ -4593,6 +5220,28 @@ pub(crate) fn register_p67_misc(r: &mut NativeMethodRegistry) {
     );
 
     // StackWalker.Option enum
+    //
+    // DEAD REGISTRATIONS — measured, not inferred (2026-08-12; see
+    // docs/known-issues/jdk-only/W7-93-stackwalker-option-constants-null.md).
+    // These three name a FIELD descriptor in the METHOD registry's descriptor
+    // slot, so the triple they key is one no dispatch can ever produce: a
+    // `getstatic` resolves through the class's static-field storage and never
+    // consults the native method registry, and no call site invokes a method
+    // named `RETAIN_CLASS_REFERENCE`. Confirmed under `--jdk-only`: the values
+    // a program actually reads back out of these statics are the objects
+    // `stack_walker::native_option_clinit` allocated (identity-checked), and
+    // `values()[0] == Option.RETAIN_CLASS_REFERENCE` holds — so nothing here
+    // ran.
+    //
+    // They are worse than merely inert: `p57_alloc_enum` allocates a FRESH
+    // instance per call, so if a future dispatch change ever made them live
+    // they would hand back constants that are NOT `==` to the ones in
+    // `$VALUES`, breaking `Enum.valueOf`, `EnumSet` and every `==` comparison
+    // an enum switch compiles to. Do not treat them as the place to fix an
+    // `Option` constant; the initialiser is `native_option_clinit`. They are
+    // left in place only because deleting registrations moves
+    // `scripts/baselines/jdk-only-bridge-ratchet.json`, which needs a build to
+    // re-freeze.
     let swo = "java/lang/StackWalker$Option";
     r.register(
         swo,
@@ -4893,6 +5542,7 @@ pub fn gc_scan_classvalue_cache_roots(
                     .and_then(cratonvm_types::loader_pin::loader_pin_addr)
                 {
                     cratonvm_types::metadata_pin::add_metadata_pin(
+                        vm_identity,
                         loader,
                         entry.value.as_ptr() as usize,
                     );
@@ -5321,7 +5971,7 @@ pub(crate) fn register_p69_cleaner(r: &mut NativeMethodRegistry) {
         "create",
         "()Ljava/lang/ref/Cleaner;",
         |ctx, _args| {
-            let cleaner = alloc_concurrent_synthetic(ctx, "java/lang/ref/Cleaner", CLEANER_FIELDS);
+            let cleaner = try_alloc_concurrent_synthetic(ctx, "java/lang/ref/Cleaner", CLEANER_FIELDS)?;
             // The previous version allocated a bare 1-slot object and stopped
             // there, so `register` had nowhere to keep its Cleanables alive
             // and every registered cleanup action was collectible before it
@@ -5380,7 +6030,7 @@ pub(crate) fn register_p69_cleaner(r: &mut NativeMethodRegistry) {
             let cleaner = cleaner_reserve(ctx, cleaner);
 
             let cleanable_class = "java/lang/ref/Cleaner$Cleanable";
-            let cleanable = alloc_concurrent_synthetic(ctx, cleanable_class, CLEANABLE_FIELDS);
+            let cleanable = try_alloc_concurrent_synthetic(ctx, cleanable_class, CLEANABLE_FIELDS)?;
 
             let cleaner = ctx.read_native_pin(pin_base, cleaner);
             let referent = match (referent, referent_pin) {
@@ -5799,25 +6449,60 @@ pub(crate) fn register_p69_misc(r: &mut NativeMethodRegistry) {
         |_ctx, args| Ok(Some(args.first().copied().unwrap_or(Value::Object(None)))),
     );
 
-    // java.util.Map.entry (Java 9) — create immutable entry
-    r.register(
+    // java.util.Map.entry (Java 9) — create immutable entry.
+    //
+    // The class is `java/util/KeyValueHolder`, which is what HotSpot answers
+    // for `Map.entry(..).getClass()`, and giving it a class of its own is the
+    // whole fix for the permissive `setValue` this lane carried as a residual.
+    // While this minted `java/util/Map$Entry` the name had two contradictory
+    // contracts on it — the entry-set views mint the same name with a third
+    // write-through `sourceMap` slot so `setValue` writes back into the map —
+    // and an immutable `setValue` registered for this one could only ever win
+    // the last-write-wins race by breaking every `entrySet()` write-through.
+    // A separate class removes the race instead of choosing a side of it.
+    //
+    // `SyntheticStub`, not this registrar's ambient `Bridge` — the GATE the
+    // record asked for in place of the deletion `21cfa930f` made.
+    // `java.util.Map.entry` is a static interface method with ordinary bytecode
+    // in `java.base` and JDK 25 declares no `ACC_NATIVE` on it, so contract
+    // §1.5 cannot call this a bridge. Tagged this way, `--jdk-only` drops it
+    // and the real bytecode mints the real `KeyValueHolder`; `Compatible` and
+    // `--synthetic-jdk` keep the native, which is what makes deleting it
+    // unnecessary — the reason the deletion cost anything was that it served
+    // one mode only.
+    r.register_with_kind(
         "java/util/Map",
         "entry",
         "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/util/Map$Entry;",
         |ctx, args| {
-            let entry = alloc_concurrent_synthetic(ctx, "java/util/Map$Entry", 2);
-            ctx.set_field(
-                entry,
-                0,
-                args.first().copied().unwrap_or(Value::Object(None)),
-            );
-            ctx.set_field(
-                entry,
-                1,
-                args.get(1).copied().unwrap_or(Value::Object(None)),
-            );
+            let key = args.first().copied().unwrap_or(Value::Object(None));
+            let value = args.get(1).copied().unwrap_or(Value::Object(None));
+            // `KeyValueHolder`'s constructor is two `Objects.requireNonNull`
+            // calls, so `Map.entry(null, v)` is an NPE on HotSpot rather than
+            // an entry with a null component. Checked before the allocation so
+            // the throw happens where the JDK's does.
+            if matches!(key, Value::Object(None)) || matches!(value, Value::Object(None)) {
+                return Err(RuntimeError::NullPointerException { message: None }.into());
+            }
+            // GC-safety: the allocation below can complete a moving young GC,
+            // so the bare `key`/`value` copies would be pre-move addresses by
+            // the time they are stored — publishing dangling references into a
+            // live object. Pin both across it and re-read at the stores.
+            let key_pin = pinned_object_value(ctx, key);
+            let value_pin = pinned_object_value(ctx, value);
+            let entry = try_alloc_concurrent_synthetic(ctx, "java/util/KeyValueHolder", 2)?;
+            let key = read_pinned_object_value(ctx, key_pin, key);
+            let value = read_pinned_object_value(ctx, value_pin, value);
+            if let Some((handle, _)) = key_pin {
+                ctx.unpin_native_roots(handle);
+            } else if let Some((handle, _)) = value_pin {
+                ctx.unpin_native_roots(handle);
+            }
+            ctx.set_field(entry, 0, key);
+            ctx.set_field(entry, 1, value);
             Ok(Some(Value::Object(Some(entry))))
         },
+        cratonvm_native_api::NativeKind::SyntheticStub,
     );
 
     // java.lang.CharSequence.compare (Java 11)
@@ -5948,7 +6633,26 @@ pub(crate) fn register_phase71_natives(registry: &mut NativeMethodRegistry) {
 // Wrapper utility extras (Integer, Long, Double, Float)
 // =============================================================================
 
-fn p71_fmt_radix(mut v: u64, radix: u32) -> String {
+/// Unsigned magnitude to a radix string, for the `toUnsignedString(…, int)`
+/// pair below.
+///
+/// Takes the RAW Java `int` radix and normalizes it here, through the single
+/// shared `crate::java_radix_or_ten`. The callers used to pre-chew it with
+/// `(*r as u32).clamp(2, 36)`, which was wrong twice over:
+///
+/// * `clamp` is not the JDK rule. Measured against real JDK 25,
+///   `Integer.toUnsignedString(255, 0)` is `"255"` — radix 10 is SUBSTITUTED
+///   for an out-of-range radix, never clamped. `clamp(2, 36)` turned radix 0
+///   into radix 2 and answered `"11111111"`.
+/// * `*r as u32` reinterprets a negative radix as a huge unsigned value, so
+///   `clamp` sent radix -1 to 36 rather than to 10.
+///
+/// Normalizing inside also makes this function total: `D[(v % radix)]` would
+/// index out of bounds (panic) for radix > 36, loop forever for radix 1, and
+/// divide by zero for radix 0. It is no longer possible to call it with any
+/// of those.
+fn p71_fmt_radix(mut v: u64, radix: i32) -> String {
+    let radix = crate::java_radix_or_ten(radix);
     if v == 0 {
         return "0".to_string();
     }
@@ -6013,8 +6717,9 @@ pub(crate) fn register_p71_wrapper_extras(r: &mut NativeMethodRegistry) {
                 Some(Value::Int(i)) => *i as u32,
                 _ => 0,
             };
+            // Raw radix: `p71_fmt_radix` applies the JDK's substitute-10 rule.
             let rad = match args.get(1) {
-                Some(Value::Int(r)) => (*r as u32).clamp(2, 36),
+                Some(Value::Int(r)) => *r,
                 _ => 10,
             };
             let s = ctx.create_string(&p71_fmt_radix(v as u64, rad));
@@ -6090,9 +6795,21 @@ pub(crate) fn register_p71_wrapper_extras(r: &mut NativeMethodRegistry) {
                 Some(Value::Object(Some(o))) => ctx.read_string(*o).unwrap_or_default(),
                 _ => "0".into(),
             };
+            // The `parse*` family THROWS on an out-of-range radix (measured:
+            // "radix 0 less than Character.MIN_RADIX"); it does NOT substitute
+            // 10 the way `toString`/`toUnsignedString` do. The previous
+            // `clamp(2, 36)` silently parsed under the wrong base — and the
+            // clamp was load-bearing for memory safety too, since
+            // `u32::from_str_radix` PANICS outside 2..=36.
             let rad = match args.get(1) {
-                Some(Value::Int(r)) => (*r as u32).clamp(2, 36),
+                Some(Value::Int(r)) => *r,
                 _ => 10,
+            };
+            let rad = match crate::lang_math::java_parse_radix_or_nfe(rad) {
+                Ok(r) => r,
+                Err(message) => {
+                    return Err(RuntimeError::NumberFormatException { message }.into())
+                }
             };
             Ok(Some(Value::Int(
                 u32::from_str_radix(s.trim(), rad).unwrap_or(0) as i32,
@@ -6194,8 +6911,9 @@ pub(crate) fn register_p71_wrapper_extras(r: &mut NativeMethodRegistry) {
                 Some(Value::Long(l)) => *l as u64,
                 _ => 0,
             };
+            // Raw radix: `p71_fmt_radix` applies the JDK's substitute-10 rule.
             let rad = match args.get(1) {
-                Some(Value::Int(r)) => (*r as u32).clamp(2, 36),
+                Some(Value::Int(r)) => *r,
                 _ => 10,
             };
             let s = ctx.create_string(&p71_fmt_radix(v, rad));
@@ -6254,9 +6972,17 @@ pub(crate) fn register_p71_wrapper_extras(r: &mut NativeMethodRegistry) {
                 Some(Value::Object(Some(o))) => ctx.read_string(*o).unwrap_or_default(),
                 _ => "0".into(),
             };
+            // See `parseUnsignedInt` above: throwing contract, and the clamp
+            // was also all that kept `u64::from_str_radix` from panicking.
             let rad = match args.get(1) {
-                Some(Value::Int(r)) => (*r as u32).clamp(2, 36),
+                Some(Value::Int(r)) => *r,
                 _ => 10,
+            };
+            let rad = match crate::lang_math::java_parse_radix_or_nfe(rad) {
+                Ok(r) => r,
+                Err(message) => {
+                    return Err(RuntimeError::NumberFormatException { message }.into())
+                }
             };
             Ok(Some(Value::Long(
                 u64::from_str_radix(s.trim(), rad).unwrap_or(0) as i64,
@@ -6733,7 +7459,7 @@ pub(crate) fn register_p71_biginteger_extras(r: &mut NativeMethodRegistry) {
             let a = bi_read(ctx, obj_arg(args, 0)?);
             let b = bi_read(ctx, obj_arg(args, 1)?);
             let g = bi_gcd_str(&a, &b);
-            Ok(Some(Value::Object(Some(bi_alloc(ctx, &g)))))
+            Ok(Some(Value::Object(Some(bi_alloc(ctx, &g)?))))
         },
     );
     r.register(bi, "isProbablePrime", "(I)Z", |ctx, args| {
@@ -6756,7 +7482,7 @@ pub(crate) fn register_p71_biginteger_extras(r: &mut NativeMethodRegistry) {
         } else {
             v.shr(n.unsigned_abs())
         };
-        Ok(Some(Value::Object(Some(bi_alloc_int(ctx, &res)))))
+        Ok(Some(Value::Object(Some(bi_alloc_int(ctx, &res)?))))
     });
     r.register(
         bi,
@@ -6773,7 +7499,7 @@ pub(crate) fn register_p71_biginteger_extras(r: &mut NativeMethodRegistry) {
             } else {
                 v.shl(n.unsigned_abs())
             };
-            Ok(Some(Value::Object(Some(bi_alloc_int(ctx, &res)))))
+            Ok(Some(Value::Object(Some(bi_alloc_int(ctx, &res)?))))
         },
     );
     // Bitwise and/or/xor/not via limb BigInt with FULL two's-complement
@@ -6789,7 +7515,7 @@ pub(crate) fn register_p71_biginteger_extras(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let a = bi_read_int(ctx, obj_arg(args, 0)?);
             let b = bi_read_int(ctx, obj_arg(args, 1)?);
-            Ok(Some(Value::Object(Some(bi_alloc_int(ctx, &a.and(&b))))))
+            Ok(Some(Value::Object(Some(bi_alloc_int(ctx, &a.and(&b))?))))
         },
     );
     r.register(
@@ -6799,7 +7525,7 @@ pub(crate) fn register_p71_biginteger_extras(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let a = bi_read_int(ctx, obj_arg(args, 0)?);
             let b = bi_read_int(ctx, obj_arg(args, 1)?);
-            Ok(Some(Value::Object(Some(bi_alloc_int(ctx, &a.or(&b))))))
+            Ok(Some(Value::Object(Some(bi_alloc_int(ctx, &a.or(&b))?))))
         },
     );
     r.register(
@@ -6809,12 +7535,12 @@ pub(crate) fn register_p71_biginteger_extras(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let a = bi_read_int(ctx, obj_arg(args, 0)?);
             let b = bi_read_int(ctx, obj_arg(args, 1)?);
-            Ok(Some(Value::Object(Some(bi_alloc_int(ctx, &a.xor(&b))))))
+            Ok(Some(Value::Object(Some(bi_alloc_int(ctx, &a.xor(&b))?))))
         },
     );
     r.register(bi, "not", "()Ljava/math/BigInteger;", |ctx, args| {
         let a = bi_read_int(ctx, obj_arg(args, 0)?);
-        Ok(Some(Value::Object(Some(bi_alloc_int(ctx, &a.not())))))
+        Ok(Some(Value::Object(Some(bi_alloc_int(ctx, &a.not())?))))
     });
     r.register(bi, "testBit", "(I)Z", |ctx, args| {
         let v = bi_read_int(ctx, obj_arg(args, 0)?);
@@ -6968,7 +7694,7 @@ pub(crate) fn register_p71_biginteger_extras(r: &mut NativeMethodRegistry) {
             if !exp_int.is_neg() {
                 let base_int = bi_read_int(ctx, obj_arg(args, 0)?);
                 let res = base_int.modpow(&exp_int, &m_int);
-                return Ok(Some(Value::Object(Some(bi_alloc_int(ctx, &res)))));
+                return Ok(Some(Value::Object(Some(bi_alloc_int(ctx, &res)?))));
             }
             // Negative exponent is rare (modInverse-based); keep the decimal
             // path until step 5 lands a limb modInverse.
@@ -6982,7 +7708,7 @@ pub(crate) fn register_p71_biginteger_extras(r: &mut NativeMethodRegistry) {
             })?;
             let pos_exp = exp.trim_start_matches('-');
             let res = bi_mod_pow_str(&inv, pos_exp, &m);
-            Ok(Some(Value::Object(Some(bi_alloc(ctx, &res)))))
+            Ok(Some(Value::Object(Some(bi_alloc(ctx, &res)?))))
         },
     );
     r.register(
@@ -6999,7 +7725,7 @@ pub(crate) fn register_p71_biginteger_extras(r: &mut NativeMethodRegistry) {
                 .into());
             }
             match a.mod_inverse(&m) {
-                Some(inv) => Ok(Some(Value::Object(Some(bi_alloc_int(ctx, &inv))))),
+                Some(inv) => Ok(Some(Value::Object(Some(bi_alloc_int(ctx, &inv)?)))),
                 None => Err(RuntimeError::ArithmeticException {
                     message: "BigInteger not invertible.".into(),
                 }
@@ -7024,7 +7750,7 @@ pub(crate) fn register_p71_biginteger_extras(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let a = bi_read_int(ctx, obj_arg(args, 0)?);
             let b = bi_read_int(ctx, obj_arg(args, 1)?);
-            Ok(Some(Value::Object(Some(bi_alloc_int(ctx, &a.mul(&b))))))
+            Ok(Some(Value::Object(Some(bi_alloc_int(ctx, &a.mul(&b))?))))
         },
     );
     r.register(
@@ -7034,7 +7760,7 @@ pub(crate) fn register_p71_biginteger_extras(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let a = bi_read_int(ctx, obj_arg(args, 0)?);
             let b = bi_read_int(ctx, obj_arg(args, 1)?);
-            Ok(Some(Value::Object(Some(bi_alloc_int(ctx, &a.add(&b))))))
+            Ok(Some(Value::Object(Some(bi_alloc_int(ctx, &a.add(&b))?))))
         },
     );
     r.register(
@@ -7044,7 +7770,7 @@ pub(crate) fn register_p71_biginteger_extras(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let a = bi_read_int(ctx, obj_arg(args, 0)?);
             let b = bi_read_int(ctx, obj_arg(args, 1)?);
-            Ok(Some(Value::Object(Some(bi_alloc_int(ctx, &a.sub(&b))))))
+            Ok(Some(Value::Object(Some(bi_alloc_int(ctx, &a.sub(&b))?))))
         },
     );
     r.register(
@@ -7060,7 +7786,7 @@ pub(crate) fn register_p71_biginteger_extras(r: &mut NativeMethodRegistry) {
                 }
                 .into());
             }
-            Ok(Some(Value::Object(Some(bi_alloc_int(ctx, &a.modulo(&m))))))
+            Ok(Some(Value::Object(Some(bi_alloc_int(ctx, &a.modulo(&m))?))))
         },
     );
     r.register(
@@ -7076,7 +7802,7 @@ pub(crate) fn register_p71_biginteger_extras(r: &mut NativeMethodRegistry) {
                 }
                 .into());
             }
-            Ok(Some(Value::Object(Some(bi_alloc_int(ctx, &a.rem(&b))))))
+            Ok(Some(Value::Object(Some(bi_alloc_int(ctx, &a.rem(&b))?))))
         },
     );
     r.register(
@@ -7092,7 +7818,7 @@ pub(crate) fn register_p71_biginteger_extras(r: &mut NativeMethodRegistry) {
                 }
                 .into());
             }
-            Ok(Some(Value::Object(Some(bi_alloc_int(ctx, &a.div(&b))))))
+            Ok(Some(Value::Object(Some(bi_alloc_int(ctx, &a.div(&b))?))))
         },
     );
 
@@ -7128,6 +7854,7 @@ pub(crate) fn register_p71_biginteger_extras(r: &mut NativeMethodRegistry) {
     let _ = bi_add_str; // keep import alive in case future ops want it
     let _ = bi_cmp_unsigned;
     r.set_category(__prev_cat);
+    ()
 }
 
 /// Divide an unsigned decimal string by 2^32, returning (quotient, remainder).
@@ -8274,12 +9001,40 @@ mod nb_phases_late_robustness_fix_tests {
         assert_eq!(un.len(), 1024);
     }
 
+    /// The default cap must be the documented size and must be ENABLED —
+    /// `None` means the compression-bomb guard is switched off.
+    ///
+    /// Was vacuous: `assert!(cap.map(|c| c > 0).unwrap_or(true))` accepted
+    /// `None`, so making the no-override branch of `gzip_max_inflated_bytes()`
+    /// return `None` (or making an unparseable value disable the cap) left the
+    /// test green. Driven through thread-scoped flag overrides so the ambient
+    /// process environment cannot decide the outcome.
     #[test]
     fn gzip_max_inflated_default_is_positive() {
-        // With no env override the default cap is a sane positive value.
-        // (Reads process env; default branch returns Some(default).)
-        let cap = gzip_max_inflated_bytes();
-        assert!(cap.map(|c| c > 0).unwrap_or(true));
+        use cratonvm_types::flags::with_thread_overrides;
+        const VAR: &str = "CRATONVM_MAX_INFLATED_BYTES";
+
+        assert_eq!(GZIP_DEFAULT_MAX_INFLATED, 256 * 1024 * 1024);
+        // No override → the documented default, cap ON.
+        with_thread_overrides(&[(VAR, None)], || {
+            assert_eq!(
+                gzip_max_inflated_bytes(),
+                Some(GZIP_DEFAULT_MAX_INFLATED),
+                "the default cap must be enabled at the documented size"
+            );
+        });
+        // An explicit byte count wins.
+        with_thread_overrides(&[(VAR, Some("4096"))], || {
+            assert_eq!(gzip_max_inflated_bytes(), Some(4096));
+        });
+        // Garbage falls back to the default rather than disabling the guard.
+        with_thread_overrides(&[(VAR, Some("not-a-number"))], || {
+            assert_eq!(gzip_max_inflated_bytes(), Some(GZIP_DEFAULT_MAX_INFLATED));
+        });
+        // Only an explicit `0` disables it.
+        with_thread_overrides(&[(VAR, Some("0"))], || {
+            assert_eq!(gzip_max_inflated_bytes(), None);
+        });
     }
 }
 
@@ -8365,6 +9120,60 @@ mod cert_verify_bounds_security_tests {
         assert!(!bad(0, 0, 0));
     }
 
+    /// Every PUBLIC method of `javax.crypto.Mac` must be registered — not most
+    /// of them.
+    ///
+    /// `Mac` keeps its state off-object in `mac_state_table`, so the real
+    /// instance fields (`initialized`, `spi`, `provider`, `lock`) are never
+    /// written. An overload left unregistered therefore runs the REAL JDK body
+    /// against uninitialised state and throws `IllegalStateException("MAC not
+    /// initialized")` — on a Mac that `init` + `update` + `doFinal()` just
+    /// demonstrated works.
+    ///
+    /// That is exactly how `doFinal([BI)V` went missing: it broke every
+    /// SCRAM-SHA-256 login (hibernate-reactive / Vert.x reactive Postgres saw
+    /// `FATAL: expected SASL response, got message type 88` — 88 is 'X', the
+    /// client sending Terminate after `com.ongres.scram`'s PBKDF2 loop died on
+    /// iteration 2 of 4096), while every other Mac caller in the tree stayed
+    /// green. A per-descriptor census is the only thing that catches the next
+    /// one.
+    #[test]
+    fn every_public_mac_method_is_registered() {
+        let mut r = NativeMethodRegistry::new();
+        register_p68_crypto_mac(&mut r);
+        for (name, desc) in [
+            ("getInstance", "(Ljava/lang/String;)Ljavax/crypto/Mac;"),
+            (
+                "getInstance",
+                "(Ljava/lang/String;Ljava/lang/String;)Ljavax/crypto/Mac;",
+            ),
+            ("getAlgorithm", "()Ljava/lang/String;"),
+            ("getProvider", "()Ljava/security/Provider;"),
+            ("getMacLength", "()I"),
+            ("init", "(Ljava/security/Key;)V"),
+            (
+                "init",
+                "(Ljava/security/Key;Ljava/security/spec/AlgorithmParameterSpec;)V",
+            ),
+            ("update", "(B)V"),
+            ("update", "([B)V"),
+            ("update", "([BII)V"),
+            ("update", "(Ljava/nio/ByteBuffer;)V"),
+            ("doFinal", "()[B"),
+            ("doFinal", "([B)[B"),
+            ("doFinal", "([BI)V"),
+            ("reset", "()V"),
+            ("clone", "()Ljava/lang/Object;"),
+        ] {
+            assert!(
+                r.find("javax/crypto/Mac", name, desc).is_some(),
+                "javax/crypto/Mac.{name}{desc} is not registered — it will run the \
+                 real JDK body against never-initialised instance fields and throw \
+                 \"MAC not initialized\""
+            );
+        }
+    }
+
     #[test]
     fn mac_and_zip_byterange_natives_remain_registered() {
         let mut r = NativeMethodRegistry::new();
@@ -8400,11 +9209,11 @@ mod ffm_p67_layout_tests {
         let mut ctx = mock_ctx();
 
         let ptr_name = ctx.create_string("ptr");
-        let ptr_layout = p67_layout_object(&mut ctx, "java/lang/foreign/AddressLayout", 8, 8);
+        let ptr_layout = p67_layout_object(&mut ctx, "java/lang/foreign/AddressLayout", 8, 8).unwrap();
         ctx.set_field(ptr_layout, 3, Value::Object(Some(ptr_name)));
 
         let size_name = ctx.create_string("size");
-        let size_layout = p67_layout_object(&mut ctx, "java/lang/foreign/ValueLayout$OfLong", 8, 8);
+        let size_layout = p67_layout_object(&mut ctx, "java/lang/foreign/ValueLayout$OfLong", 8, 8).unwrap();
         ctx.set_field(size_layout, 3, Value::Object(Some(size_name)));
 
         let members = ctx.new_array(ArrayElementType::Reference, 2);
@@ -8427,7 +9236,7 @@ mod ffm_p67_layout_tests {
 
         let path_name = ctx.create_string("size");
         let path_elem =
-            alloc_concurrent_synthetic(&mut ctx, "java/lang/foreign/MemoryLayout$PathElement", 2);
+            try_alloc_concurrent_synthetic(&mut ctx, "java/lang/foreign/MemoryLayout$PathElement", 2).unwrap();
         ctx.set_field(path_elem, 0, Value::Object(Some(path_name)));
         ctx.set_field(path_elem, 1, Value::Int(0));
         let path = ctx.new_array(ArrayElementType::Reference, 1);
@@ -8561,5 +9370,194 @@ mod essential_vs_synthetic_jdk_coverage_audit {
                 report
             );
         }
+    }
+}
+
+/// `Integer.toUnsignedString(int, int)` / `Long.toUnsignedString(long, int)`
+/// and `parseUnsigned*(String, int)` radix conformance.
+///
+/// These four sites used `(*r as u32).clamp(2, 36)`. The clamp did keep them
+/// out of the panic (`p71_fmt_radix` indexes a 36-entry table;
+/// `from_str_radix` asserts 2..=36), but it answered the wrong question in
+/// both directions: `toUnsignedString` must SUBSTITUTE radix 10, and
+/// `parseUnsigned*` must THROW. Every expectation was read off real JDK
+/// 25.0.3, not derived from this implementation.
+#[cfg(test)]
+mod unsigned_radix_tests {
+    use super::*;
+    use crate::test_utils::mock_ctx;
+    // NativeHeapAccess carries `read_string`; without it in scope, method
+    // resolution on the concrete MockNativeContext fails.
+    use cratonvm_native_api::{NativeContext, NativeHeapAccess, NativeMethodRegistry};
+
+    fn registry() -> NativeMethodRegistry {
+        let mut r = NativeMethodRegistry::new();
+        register_p71_wrapper_extras(&mut r);
+        r
+    }
+
+    fn int_unsigned(v: i32, radix: i32) -> String {
+        let r = registry();
+        let f = r
+            .find(
+                "java/lang/Integer",
+                "toUnsignedString",
+                "(II)Ljava/lang/String;",
+            )
+            .expect("Integer.toUnsignedString(II) must be registered");
+        let mut ctx = mock_ctx();
+        match f(&mut ctx, &[Value::Int(v), Value::Int(radix)]).expect("never throws") {
+            Some(Value::Object(Some(o))) => ctx.read_string(o).expect("a readable String"),
+            other => panic!("expected a String, got {other:?}"),
+        }
+    }
+
+    fn long_unsigned(v: i64, radix: i32) -> String {
+        let r = registry();
+        let f = r
+            .find("java/lang/Long", "toUnsignedString", "(JI)Ljava/lang/String;")
+            .expect("Long.toUnsignedString(JI) must be registered");
+        let mut ctx = mock_ctx();
+        match f(&mut ctx, &[Value::Long(v), Value::Int(radix)]).expect("never throws") {
+            Some(Value::Object(Some(o))) => ctx.read_string(o).expect("a readable String"),
+            other => panic!("expected a String, got {other:?}"),
+        }
+    }
+
+    /// The exact case `clamp(2, 36)` got wrong: radix 0 clamps UP to 2 and
+    /// prints binary, where the JDK substitutes 10 and prints "255".
+    #[test]
+    fn out_of_range_radix_substitutes_ten_and_never_clamps() {
+        for bad in [0, 1, -1, 37, 40, i32::MIN, i32::MAX] {
+            assert_eq!(int_unsigned(255, bad), "255", "radix {bad}");
+            assert_eq!(int_unsigned(5, bad), "5", "radix {bad}");
+            assert_eq!(int_unsigned(0, bad), "0", "radix {bad}");
+            // Unsigned: -1 is 2^32-1, and MIN_VALUE is 2^31 — no "-" sign.
+            assert_eq!(int_unsigned(-1, bad), "4294967295", "radix {bad}");
+            assert_eq!(int_unsigned(i32::MIN, bad), "2147483648", "radix {bad}");
+            assert_eq!(long_unsigned(255, bad), "255", "radix {bad}");
+            assert_eq!(
+                long_unsigned(-1, bad),
+                "18446744073709551615",
+                "radix {bad}"
+            );
+            assert_eq!(
+                long_unsigned(i64::MIN, bad),
+                "9223372036854775808",
+                "radix {bad}"
+            );
+        }
+        // The two answers the old clamp produced, named so they cannot come
+        // back looking plausible: radix 0 -> 2, radix -1 -> 36.
+        assert_ne!(int_unsigned(255, 0), "11111111");
+        assert_ne!(int_unsigned(255, -1), "73");
+    }
+
+    /// Legal radices, including both boundaries and the unsigned wrap.
+    #[test]
+    fn legal_radices_including_both_boundaries() {
+        assert_eq!(int_unsigned(255, 2), "11111111");
+        assert_eq!(int_unsigned(255, 8), "377");
+        assert_eq!(int_unsigned(255, 16), "ff");
+        assert_eq!(int_unsigned(255, 36), "73");
+        assert_eq!(int_unsigned(-1, 16), "ffffffff");
+        assert_eq!(int_unsigned(-1, 36), "1z141z3");
+        assert_eq!(int_unsigned(i32::MIN, 36), "zik0zk");
+        assert_eq!(long_unsigned(-1, 16), "ffffffffffffffff");
+        assert_eq!(long_unsigned(-1, 36), "3w5e11264sgsf");
+        assert_eq!(long_unsigned(255, 2), "11111111");
+        assert_eq!(long_unsigned(255, 36), "73");
+    }
+
+    /// BOUNDED ON PURPOSE. `p71_fmt_radix` indexes a 36-byte digit table with
+    /// `v % radix`, divides by `radix`, and loops while `v > 0`: radix > 36
+    /// panics on the index, radix 0 divides by zero, radix 1 never terminates.
+    /// The old `clamp` was the only thing standing between ordinary Java code
+    /// and all three, and it is now gone — so this drives them on a worker
+    /// against a deadline, where a hang is a timeout and an abort is a channel
+    /// disconnect rather than a wedged suite.
+    #[test]
+    fn hostile_radices_terminate_within_a_deadline() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let out = vec![
+                p71_fmt_radix(255, 0),
+                p71_fmt_radix(255, 1),
+                p71_fmt_radix(255, -1),
+                p71_fmt_radix(255, 37),
+                p71_fmt_radix(255, i32::MIN),
+                p71_fmt_radix(255, i32::MAX),
+                p71_fmt_radix(0, 1),
+                p71_fmt_radix(u64::MAX, 1),
+                int_unsigned(255, 0),
+                int_unsigned(255, 1),
+                long_unsigned(255, 40),
+            ];
+            let _ = tx.send(out);
+        });
+        let out = rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("radix 0/1/negative/>36 must terminate and must not abort");
+        assert_eq!(
+            out,
+            vec![
+                "255",
+                "255",
+                "255",
+                "255",
+                "255",
+                "255",
+                "0",
+                "18446744073709551615",
+                "255",
+                "255",
+                "255",
+            ]
+        );
+        worker.join().expect("worker thread panicked");
+    }
+
+    /// `parseUnsignedInt` / `parseUnsignedLong` invert the rule: an
+    /// out-of-range radix is a `NumberFormatException`, not a substitution.
+    /// Bounded because the clamp that was removed here was also what kept
+    /// `from_str_radix`'s 2..=36 assertion from firing.
+    #[test]
+    fn parse_unsigned_rejects_hostile_radices_within_a_deadline() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let r = registry();
+            let pi = r
+                .find("java/lang/Integer", "parseUnsignedInt", "(Ljava/lang/String;I)I")
+                .expect("Integer.parseUnsignedInt(String,int) must be registered");
+            let pl = r
+                .find("java/lang/Long", "parseUnsignedLong", "(Ljava/lang/String;I)J")
+                .expect("Long.parseUnsignedLong(String,int) must be registered");
+            let mut ctx = mock_ctx();
+            let s = ctx.create_string("5");
+            let mut threw = Vec::new();
+            for radix in [0, 1, -1, 37, 40, i32::MIN, i32::MAX] {
+                let args = [Value::Object(Some(s)), Value::Int(radix)];
+                threw.push(pi(&mut ctx, &args).is_err());
+                threw.push(pl(&mut ctx, &args).is_err());
+            }
+            // Legal radices still parse.
+            let legal = [2i32, 10, 36]
+                .iter()
+                .map(|&radix| {
+                    let args = [Value::Object(Some(s)), Value::Int(radix)];
+                    pi(&mut ctx, &args).is_ok() && pl(&mut ctx, &args).is_ok()
+                })
+                .collect::<Vec<_>>();
+            let _ = tx.send((threw, legal));
+        });
+        let (threw, legal) = rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("parseUnsigned* with a bad radix must return Err, not abort");
+        assert!(
+            threw.iter().all(|&t| t),
+            "every out-of-range radix must throw NumberFormatException, got {threw:?}"
+        );
+        assert_eq!(legal, vec![true, true, true], "legal radices must still parse");
+        worker.join().expect("worker thread panicked");
     }
 }

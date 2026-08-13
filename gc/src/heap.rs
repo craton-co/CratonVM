@@ -8,10 +8,15 @@
 //! [ObjectHeader (HEADER_SIZE bytes)] [field0] [field1] ... [fieldN]
 //! ```
 //!
-//! [`HEADER_SIZE`] is 32 today. It is written symbolically here on purpose:
-//! a shrink to 24 is mapped out in
-//! `arch-2026-07-26/header-shrink.md`, and a baked "32" in a doc
-//! comment is exactly the kind of staleness that document's §6.9 catalogues.
+//! [`HEADER_SIZE`] is **16** today — the authority is
+//! `cratonvm_types::HEADER_SIZE` (`types/src/heap_types.rs`), never a literal
+//! written here. It is used symbolically throughout this file on purpose: the
+//! header has already shrunk twice, 32 -> 24 (2026-08-06) and 24 -> 16
+//! (completed 2026-08-07), and until 2026-08-07 this very paragraph still read
+//! "32 today, a shrink to 24 is mapped out in `arch-2026-07-26/header-shrink.md`"
+//! — i.e. it was itself an instance of the staleness that document's §6.9
+//! catalogues, wrong about both the current value and the pending one. Anything
+//! below that needs the number must read the constant.
 //!
 //! Field cell width depends on the field's type:
 //!
@@ -29,8 +34,8 @@
 //! `long`/`double`, and `REF_ELEMENT_SIZE` (8) for reference elements. See
 //! [`element_byte_size`] and [`array_data_size`], which are the authority:
 //! ```text
-//! [ObjectHeader (32 bytes)] [elem0] [elem1] ... [elemN]   // element_byte_size(elem_type) each,
-//!                                                        // data area rounded up to 8 bytes
+//! [ObjectHeader (HEADER_SIZE bytes)] [elem0] [elem1] ... [elemN]   // element_byte_size(elem_type) each,
+//!                                                                  // data area rounded up to 8 bytes
 //! ```
 //!
 //! The heap uses two arenas (from-space and to-space) for a semi-space
@@ -655,16 +660,73 @@ impl Heap {
             cratonvm_types::compact_object_field_storage(self.get_header(obj_ref), index)
         {
             let ptr = unsafe { obj_ref.as_ptr().add(HEADER_SIZE + offset) };
-            return unsafe {
+            let v = unsafe {
                 cratonvm_types::read_compact_field(
                     ptr,
                     storage,
                     std::sync::atomic::Ordering::Relaxed,
                 )
             };
+            if !storage.is_reference() {
+                return v;
+            }
+            // Un-box the wrapper `set_field` installs for a non-reference value
+            // stored into a declared-REFERENCE slot — the field half of what
+            // `get_array_element_unboxing` already does for elements. This
+            // accessor used to hand such a value to `write_compact_field`,
+            // whose `FieldStorageKind::Reference` arm maps every non-`Object`
+            // value to raw 0, so the write was silently dropped to null
+            // (W7-84-primitive-in-reference-store.md).
+            return crate::autobox::unbox_reference_slot(
+                v,
+                |r| {
+                    if !self.is_valid_heap_object(r) {
+                        return None;
+                    }
+                    // SAFETY: `is_valid_heap_object` confirmed `r` points to an
+                    // 8-byte-aligned address inside one of this heap's arenas,
+                    // so reading its `ObjectHeader` is valid memory.
+                    Some(unsafe { (*(r.as_ptr() as *const ObjectHeader)).class_id })
+                },
+                |r| self.get_field(r, 0),
+            );
+        }
+        // HIB-DCAST-LATEPHASE.1 (mutator side), the fourth accessor family.
+        // `compact_object_field_storage` answers `None` for TWO reasons and
+        // only the first licenses the fall-through below: (1) "this is a
+        // legacy object" — its contract, and the uniform 16-byte `Value` cell
+        // is the right read; (2) "this IS a compact object (`GC_FLAG_COMPACT`,
+        // set at allocation by `alloc_object`, which sized the body with
+        // `compact_object_body_size`) whose `(class_id, num_slots)` no longer
+        // resolves to a registered layout" — a redefinition that changed the
+        // field count, or a foreign `layout_domain`.
+        //
+        // In case (2) `num_slots()` is the FIELD COUNT, not a count of 16-byte
+        // cells, so the `index < num_slots` assert above does NOT bound
+        // `HEADER_SIZE + index * SLOT_SIZE` and an entirely in-range index
+        // still reads past the allocation.
+        //
+        // `g1::get_field`, `gen_heap::get_field` and `ZgcRealHeap::get_field`
+        // all carry this guard; this accessor was the one that did not. Degrade
+        // exactly as they do (benign null, loud `cratonvm::gc::guard` record,
+        // no panic — a racing redefinition must not abort the JVM).
+        if cratonvm_types::is_compact_object(self.get_header(obj_ref)) {
+            tracing::warn!(
+                target: "cratonvm::gc::guard",
+                obj = ?obj_ref.as_ptr(),
+                index,
+                class_id = ?self.get_header(obj_ref).class_id,
+                "heap::get_field: compact receiver has no registered layout for \
+                 its (class_id, field_count) — returning null rather than \
+                 striding its packed compact body as legacy 16-byte cells \
+                 (HIB-DCAST-LATEPHASE.1)",
+            );
+            return Value::Object(None);
         }
         // SAFETY: `obj_ref` is a live heap object. The assert above
-        // confirms `index < num_slots`. `slot_ptr` computes
+        // confirms `index < num_slots`, and the guard above confirms the
+        // object is NOT compact, so its body really is `num_slots` uniform
+        // 16-byte cells. `slot_ptr` computes
         // `obj_ref + HEADER_SIZE + index * SLOT_SIZE`, which is within the
         // allocated block. `read_slot` reads a `Value` from that pointer.
         unsafe {
@@ -687,6 +749,23 @@ impl Heap {
         if let Some((offset, storage)) =
             cratonvm_types::compact_object_field_storage(self.get_header(obj_ref), index)
         {
+            // A non-reference value into a declared-REFERENCE slot: box it,
+            // rather than let `write_compact_field`'s `Reference` arm map it to
+            // raw 0 and drop the write to null. This is the field half of what
+            // `set_array_element` below has always done for elements
+            // (W7-84-primitive-in-reference-store.md).
+            let value = if storage.is_reference() {
+                let class_id = self.get_header(obj_ref).class_id;
+                crate::autobox::box_for_reference_slot(value, class_id, index, |v| {
+                    let wrapper = self.alloc_object(AUTOBOX_CLASS_ID, 1);
+                    self.set_field(wrapper, 0, v);
+                    wrapper
+                })
+            } else {
+                value
+            };
+            // Recomputed AFTER the boxing closure: it may have allocated, and
+            // this is a semi-space copying heap.
             let ptr = unsafe { obj_ref.as_ptr().add(HEADER_SIZE + offset) };
             unsafe {
                 cratonvm_types::write_compact_field(
@@ -698,8 +777,27 @@ impl Heap {
             };
             return;
         }
-        // SAFETY: same invariant as `get_field` — index is within bounds,
-        // and the slot pointer is within the allocated object block.
+        // HIB-DCAST-LATEPHASE.1, write half — see the long note on the matching
+        // guard in `get_field`. This half is the more damaging of the two: the
+        // legacy stride does not merely read past a compact-sized body, it
+        // *writes* a 16-byte `Value` cell over whatever follows the object.
+        if cratonvm_types::is_compact_object(self.get_header(obj_ref)) {
+            tracing::warn!(
+                target: "cratonvm::gc::guard",
+                obj = ?obj_ref.as_ptr(),
+                index,
+                class_id = ?self.get_header(obj_ref).class_id,
+                value = ?value,
+                "heap::set_field: compact receiver has no registered layout for \
+                 its (class_id, field_count) — dropping the write rather than \
+                 striding its packed compact body as legacy 16-byte cells \
+                 (HIB-DCAST-LATEPHASE.1)",
+            );
+            return;
+        }
+        // SAFETY: same invariant as `get_field` — index is within bounds, the
+        // object is not compact, and the slot pointer is within the allocated
+        // object block.
         unsafe {
             let ptr = slot_ptr(obj_ref, index);
             write_slot(ptr, value);
@@ -949,6 +1047,10 @@ impl Heap {
                     _ => {
                         let wrapper = self.alloc_object(AUTOBOX_CLASS_ID, 1);
                         self.set_field(wrapper, 0, value);
+                        // Arm the process-wide wrapper latch — see the matching
+                        // note in `GenerationalHeap::set_array_element` and
+                        // `crate::autobox`.
+                        crate::autobox::note_wrapper_created();
                         write_prim_element(
                             base,
                             index,
@@ -1650,6 +1752,188 @@ unsafe fn write_slot(ptr: *mut u8, value: Value) {
 // Compact primitive array element access
 // ---------------------------------------------------------------------------
 
+// --- Reference-element decode chokepoint for `read_prim_element` ------------
+//
+// WHY THIS EXISTS. `read_prim_element`'s `Reference` arm ended commit
+// `6a04b0e3c1` (2026-06-29, "degrade stale references to null at every decode
+// boundary") applying `cratonvm_types::plausible_heap_pointer` to the loaded
+// word and, on failure, returning `Value::Object(None)` — handing Java a `null`
+// where the slot held bits. That commit's own message records what the filter
+// is: defense-in-depth for an *unfixed* GC defect (live blocked-thread frame
+// objects swept by the non-moving young sweep; observed as 8000+ all-zero-header
+// stale `Thread` receivers, then `0x77..` / `": contex"` buffer bytes read back
+// through this arm), not an integrity guard on trusted data. Two failure modes
+// hid behind the bare `else`:
+//
+// (1) THE DEGRADE WAS SILENT — and its interpreter twin is not. The same commit
+//     put the same filter on `cratonvm_types`' own decode paths (`decode_value`
+//     `VTAG_OBJECT`, `CompactValue::to_value` SUB_OBJECT), where it feeds a
+//     process-wide counter and a one-shot stderr line (`note_object_degradation`,
+//     types/src/compact_value.rs:330, read back via the `pub`
+//     `cratonvm_types::compact_value::object_degradation_count`). THIS arm fed
+//     nothing at all. `read_prim_element` is the array-element read for EVERY
+//     collector — `Heap::get_array_element` / `get_array_element_unboxing` above,
+//     `GenerationalHeap`'s twins (gc/src/gen_heap.rs:4072, :4092, :3518) and
+//     `zgc.rs:2601` all funnel through it — so on the DEFAULT (Generational)
+//     collector a live `Object[]` element could be nulled with no trace
+//     anywhere: no counter, no log, no assert, and `object_degradation_count()`
+//     reading a reassuring 0. That is an observability bug today, independent of
+//     ZGC, and [`ref_element_degradation_count`] closes it.
+//
+//     NULL IS NOT A DEGRADATION. `plausible_heap_pointer(0)` is `false`, so an
+//     ordinary null element — by far the common case for `Object[]` — reaches
+//     the cold arm too. Counting it would put the counter in the millions on a
+//     clean run and make "non-zero means a live object was nulled" false on
+//     first use. That test is load-bearing, not a micro-optimisation, and it
+//     now lives in the shared sink
+//     (`cratonvm_types::compact_value::note_ref_word_degradation`) rather than
+//     in this file — see [`ref_element_degradation_count`].
+//
+// (2) A ZGC COLORED WORD IS NOT CORRUPTION, and must never take the degrade.
+//     `gc/src/zgc/vaddr.rs` sets bit 63 (`Z_COLORED_TAG`) on every non-null
+//     colored word *precisely so* it fails `plausible_heap_pointer`'s 47-bit
+//     test and is caught loudly rather than dereferenced as a wild pointer. The
+//     bare `else` did the exact opposite of loud: it converted "the load barrier
+//     has not run on this word" into a null handed to Java, i.e. an NPE or a
+//     silently dropped store at an arbitrary point far from the cause. Under a
+//     relocating collector that is silent heap corruption, which
+//     `docs/feature-designs/zgc-jit-load-barrier.md` (risk J1) rates worse than
+//     a clean SIGSEGV; `docs/feature-designs/zgc-reference-slot-representation.md`
+//     names this arm as the most dangerous unmigrated read in the tree, and
+//     `gc/src/zgc/census.rs` reads raw words rather than call it for exactly
+//     this reason.
+//
+//     The fix is NOT to weaken `plausible_heap_pointer` — both studies say so
+//     explicitly — it is to make the caller barrier the word first. Until that
+//     lands, a *structurally well-formed* colored word is an invariant violation
+//     and fails loudly instead of fabricating a null. Genuine garbage keeps the
+//     old degrade: `0x8D8D8D8D8D8D8D8D` has bit 63 set but fails
+//     `vaddr::is_well_formed` (which additionally demands bits 62-46 clear and
+//     exactly one metadata bit), so a `--features zgc` build running
+//     Generational or G1 behaves as before.
+
+/// Read the process-wide count of **non-null** array reference elements
+/// [`read_prim_element`] degraded to `null` because they failed
+/// [`cratonvm_types::plausible_heap_pointer`].
+///
+/// The read-side companion to [`COMPACT_OOP_MAP_MISSING`]: that one is a
+/// marking FAIL-OPEN, this one is a read FAIL-SILENT. Non-zero means Java was
+/// handed `null` for a slot that held bits — i.e. the GC root-coverage gap
+/// recorded in commit `6a04b0e3c1` is live in this run. Expected to be ZERO;
+/// zero is the only good value.
+///
+/// # This is one slot of the shared counter, not a private one
+///
+/// It used to be a `pub static REF_ELEMENT_DEGRADATIONS: AtomicU64` in this
+/// file, because the sink it belonged in
+/// (`cratonvm_types::compact_value::note_object_degradation`) was `pub(crate)`
+/// and this crate could not reach it. That produced the exact failure the
+/// counter exists to prevent: a triager reading
+/// `cratonvm_types::compact_value::object_degradation_count()` saw a reassuring
+/// `0` while this path was nulling live elements, because the total did not
+/// include them. The sink is now `pub` and source-tagged, so this reads
+/// [`DegradationSource::ArrayElement`]'s slot of the one process-wide table and
+/// the total genuinely totals. `vm::jit::helpers::jit_ref_degradation_count`
+/// (the `Jit` slot) was merged the same way.
+///
+/// Advisory and `Relaxed`: it carries no happens-before relationship with the
+/// slot it counts.
+#[inline]
+pub fn ref_element_degradation_count() -> u64 {
+    cratonvm_types::compact_value::object_degradation_count_from(
+        cratonvm_types::compact_value::DegradationSource::ArrayElement,
+    )
+}
+
+/// Decode a raw reference word read out of an array element slot into the
+/// `Value` the interpreter expects, degrading a provably-impossible pointer to
+/// `Value::Object(None)`.
+///
+/// The fast path is byte-for-byte the predicate the `Reference` arm used before
+/// this chokepoint existed: `plausible_heap_pointer(raw)` and nothing else.
+/// Everything new lives in the `#[cold]`, `#[inline(never)]` callee, which is
+/// only reached once that predicate has *already* failed — so this costs
+/// nothing per element read on any build or any collector. See the block
+/// comment above for why the callee exists.
+///
+/// # Safety
+/// Nothing beyond `ObjectRef::from_raw`'s contract, and `raw` has passed
+/// [`cratonvm_types::plausible_heap_pointer`] before it is wrapped.
+#[inline(always)]
+unsafe fn decode_ref_element_word(raw: u64) -> Value {
+    if cratonvm_types::plausible_heap_pointer(raw) {
+        Value::Object(Some(ObjectRef::from_raw(raw as usize as *mut u8)))
+    } else {
+        ref_element_word_implausible(raw)
+    }
+}
+
+/// Cold arm of [`decode_ref_element_word`]: the word cannot be a live heap
+/// pointer. Separates the three reasons a word lands here, which the previous
+/// bare `else { Value::Object(None) }` conflated into one silent answer:
+///
+/// * **`raw == 0`** — an ordinary null element. Not a degradation, not counted;
+///   the slot said null and the caller gets null. See the block comment above:
+///   counting this would destroy the counter's meaning on the first clean run.
+///   The test is no longer written here: it lives inside
+///   [`cratonvm_types::compact_value::note_ref_word_degradation`], which exists
+///   because this arm and the JIT's twin each had to discover the rule
+///   separately. Stated once, where the next raw-word path cannot miss it.
+/// * **A structurally well-formed ZGC colored word** — legitimate data that has
+///   simply not been through the load barrier. Nulling it is the silent-null
+///   corruption of `zgc-jit-load-barrier.md` J1; returning the colored word is a
+///   wild-pointer deref. Neither is acceptable, so this is a hard failure that
+///   names the missing barrier.
+/// * **Stale/garbage bits** (the `0x8D8D..` class from commit `6a04b0e3c1`) —
+///   genuinely not a pointer. Keeps the existing degrade-to-null contract,
+///   now counted.
+///
+/// The ZGC arm is `#[cfg(feature = "zgc")]`, so a default build does not merely
+/// behave identically — the branch is not compiled. `crate::zgc` is itself
+/// `#[cfg(feature = "zgc")]` in `gc/src/lib.rs`, so the path is only nameable
+/// under that cfg.
+#[cold]
+#[inline(never)]
+fn ref_element_word_implausible(raw: u64) -> Value {
+    #[cfg(feature = "zgc")]
+    {
+        // TODO(zgc): once the load barrier runs AHEAD of this decode (see the
+        // TODO in `read_prim_element`'s `Reference` arm) this branch becomes
+        // unreachable, because the word arriving here will already be a plain
+        // address. The barrier entry point is
+        // `crate::zgc::barrier::z_load(slot: &std::sync::atomic::AtomicU64,
+        // ctx: &C) -> u64` where `C: crate::zgc::barrier::ZBarrierContext +
+        // ?Sized` (gc/src/zgc/barrier.rs, `pub fn z_load`, line 1233 as of
+        // 2026-08-07). It must be applied to the element SLOT before any
+        // plausibility test, and the test must then ask about the barrier's
+        // UNMASKED address, never about the colored word. Do not weaken
+        // `plausible_heap_pointer` to admit colored words. Keep this panic as
+        // the tripwire for a caller that was missed.
+        if crate::zgc::vaddr::is_colored_word(raw) && crate::zgc::vaddr::is_well_formed(raw) {
+            panic!(
+                "ZGC colored word {raw:#018x} reached `read_prim_element`'s \
+                 Reference arm with no load barrier: bit 63 (Z_COLORED_TAG) is \
+                 set by gc/src/zgc/vaddr.rs, so this word is a legitimate \
+                 reference that has not been unmasked, not corruption. Barrier \
+                 it via crate::zgc::barrier::z_load and plausibility-check the \
+                 UNMASKED address; do not degrade it to null (that is the silent \
+                 heap corruption of zgc-jit-load-barrier.md J1) and do not weaken \
+                 plausible_heap_pointer to admit it."
+            );
+        }
+    }
+    // Counts the event and emits the one-shot "array-element" diagnostic, or
+    // returns `false` and does neither for `raw == 0`. See
+    // `ref_element_degradation_count` for why this is the shared table's
+    // `ArrayElement` slot rather than a static in this file.
+    cratonvm_types::compact_value::note_ref_word_degradation(
+        raw,
+        cratonvm_types::compact_value::DegradationSource::ArrayElement,
+        "gc::heap::read_prim_element",
+    );
+    Value::Object(None)
+}
+
 /// Read an array element from compact storage.
 ///
 /// # Safety
@@ -1688,6 +1972,18 @@ pub unsafe fn read_prim_element(base: *mut u8, index: usize, et: ArrayElementTyp
             let offset = index
                 .checked_mul(ref_element_size())
                 .expect("array ref element offset overflow");
+            // TODO(zgc): this is a raw reference-array element load — Category A
+            // in `docs/feature-designs/zgc-jit-load-barrier.md` §2.3, and entry
+            // 13 of `zgc-reference-slot-representation.md`'s migration table.
+            // Under `VmHeap::Zgc` the word must go through
+            // `crate::zgc::barrier::z_load(slot: &std::sync::atomic::AtomicU64,
+            // ctx: &C)` (gc/src/zgc/barrier.rs, `pub fn z_load`, line 1233 as of
+            // 2026-08-07) HERE — between `read_ref_slot` and the decode below —
+            // and the plausibility test inside `decode_ref_element_word` must
+            // then be applied to the barrier's unmasked address rather than to
+            // the colored word. Until that lands,
+            // `ref_element_word_implausible` fails loudly on a well-formed
+            // colored word instead of nulling it.
             let raw: u64 = read_ref_slot(base.add(offset));
             // Defense-in-depth reference-slot decode. Mirrors the VTAG_OBJECT
             // degrade in `cratonvm_types::decode_value` (operand/local SoA path)
@@ -1695,23 +1991,17 @@ pub unsafe fn read_prim_element(base: *mut u8, index: usize, et: ArrayElementTyp
             // this hot heap-read path previously bypassed by wrapping ANY
             // non-zero bits verbatim. A non-null reference slot whose bits are
             // unaligned, inside the null-guard page, or outside the 47-bit
-            // user-address range is provably NOT a live object pointer: it is
-            // reused/garbage memory surfaced through a STALE reference (a GC
-            // root-coverage gap that swept-then-reused the young slot this ref
-            // still points at — observed as 8000+ all-zero-header stale `Thread`
-            // receivers, then `0x77..`/`": contex"` buffer bytes read back here).
+            // user-address range is provably NOT a live object pointer.
             // Fabricating an `ObjectRef` from such bits SIGSEGVs on its next
-            // deref, or panics in `CompactValue::object` for >47-bit bits
-            // (compact_value.rs:502). Degrade to null instead — the field/array
-            // read callers already normalise `Object(None)`, matching HotSpot's
-            // "you get a null, not a VM crash". Pure bit ops (no heap probe), so
-            // it is safe on this hot path and never rejects a valid pointer
-            // (every real object is 8-aligned, above the guard page, ≤47-bit).
-            if cratonvm_types::plausible_heap_pointer(raw) {
-                Value::Object(Some(ObjectRef::from_raw(raw as usize as *mut u8)))
-            } else {
-                Value::Object(None)
-            }
+            // deref, or panics in `CompactValue::object` for >47-bit bits.
+            // Degrade to null instead — the field/array read callers already
+            // normalise `Object(None)`, matching HotSpot's "you get a null, not
+            // a VM crash". Pure bit ops (no heap probe), so it is safe on this
+            // hot path and never rejects a valid pointer (every real object is
+            // 8-aligned, above the guard page, <=47-bit). The degrade is now
+            // COUNTED rather than silent — see the chokepoint block comment
+            // above `ref_element_degradation_count` for the failure that closes.
+            decode_ref_element_word(raw)
         }
     }
 }
@@ -1742,6 +2032,41 @@ static DYNAMIC_WATCH: std::sync::atomic::AtomicUsize = std::sync::atomic::Atomic
 #[inline]
 pub fn set_dynamic_watch(addr: usize) {
     DYNAMIC_WATCH.store(addr, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// `CRATONVM_DBG_MARK_WHY_CLASS=<internal/class/Name>` — the address whose
+/// young-mark REASON should be reported. Armed at runtime.
+///
+/// "Why is this object still alive after a collection that should have
+/// reclaimed it" is not answerable from outside the marker. Every root source
+/// can be eliminated one at a time — the `TestDefaultInstanceManager` chain has
+/// now done that four times — and still leave the question open, because the
+/// retaining edge may be a SIDE TABLE (`loader_pin`, `mirror_pin`,
+/// `metadata_pin`, an overlay owner edge). Those are invisible to a referrer
+/// walk, absent from the root vector, and followed only inside the marker.
+///
+/// The old-gen BFS already labels each such edge (`mark_and_push_old_gen`'s
+/// `reason`). The young precise marker did not — so on the `System.gc()` path,
+/// which is exactly the non-moving young sweep, nothing recorded WHICH edge did
+/// the marking. That asymmetry is why the question kept being answered by
+/// elimination instead of by evidence.
+///
+/// Armed from `vm_object`'s `add_mirror_pin` hook: the interesting address (a
+/// JSP `ClassLoader`) is not known until its class is defined. Snapshotted into
+/// `YoungMarkCtx` once per collection, so the per-edge cost is a compare
+/// against a struct field, not an atomic load. `0` = disabled.
+static YOUNG_MARK_WATCH: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// See [`YOUNG_MARK_WATCH`].
+#[inline]
+pub fn set_young_mark_watch(addr: usize) {
+    YOUNG_MARK_WATCH.store(addr, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// See [`YOUNG_MARK_WATCH`].
+#[inline]
+pub fn young_mark_watch() -> usize {
+    YOUNG_MARK_WATCH.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// See [`DYNAMIC_WATCH`].
@@ -1815,9 +2140,23 @@ pub unsafe fn write_prim_element(base: *mut u8, index: usize, et: ArrayElementTy
             };
             std::ptr::write_unaligned(base.add(index * 8) as *mut f64, v);
         }
-        ArrayElementType::Byte | ArrayElementType::Boolean => {
+        ArrayElementType::Byte => {
             let v = match value {
                 Value::Int(i) => i as u8,
+                _ => 0,
+            };
+            std::ptr::write(base.add(index), v);
+        }
+        // JVMS `bastore`: a store into a *boolean* array narrows to one bit
+        // (`value & 1`), not to a byte — the opcode serves `byte[]` and
+        // `boolean[]` both, and the verifier permits either. `read_prim_element`
+        // zero-extends whatever is here, so a truncated 2 reads back as 2 and
+        // tests `true`, where HotSpot stores 0 and tests `false`. Reachable via
+        // hand-written `bastore` on a `boolean[]` and via
+        // `Unsafe.putByte`/`putBoolean`; not via javac output.
+        ArrayElementType::Boolean => {
+            let v = match value {
+                Value::Int(i) => (i & 1) as u8,
                 _ => 0,
             };
             std::ptr::write(base.add(index), v);
@@ -1860,6 +2199,48 @@ mod tests {
         assert_eq!(std::mem::size_of::<ObjectHeader>(), HEADER_SIZE);
     }
 
+    /// `HIB-DCAST-LATEPHASE.1`, mutator side — the fourth accessor family.
+    ///
+    /// `compact_object_field_storage` answers `None` both for a legacy object
+    /// and for a genuinely compact one whose `(class_id, field_count)` no
+    /// longer resolves to a registered layout, and `Heap::get_field` /
+    /// `Heap::set_field` fell through to the uniform `index * SLOT_SIZE` stride
+    /// in *both* cases. On a real instance of the second state `alloc_object`
+    /// sized the body with `compact_object_body_size` and `num_slots()` is the
+    /// FIELD COUNT, so the `index < num_slots` assert does not bound that
+    /// stride: the read escapes the allocation and the write puts a 16-byte
+    /// `Value` cell past it. `g1.rs`, `gen_heap.rs` and `zgc.rs` all grew the
+    /// `is_compact_object` guard; this one did not.
+    #[test]
+    fn field_accessors_refuse_a_compact_object_with_no_registered_layout() {
+        let heap = Heap::new();
+        // No layout is registered for this class id, so the allocation is
+        // LEGACY and the cells written below are real, readable cells. Setting
+        // the header bit afterwards reproduces the racing state (header says
+        // compact, registry cannot serve it) without a live redefinition.
+        let obj = heap.alloc_object(ClassId::new(999_997), 4);
+        heap.set_field(obj, 0, Value::Int(1));
+        heap.set_field(obj, 1, Value::Int(2));
+
+        let header = heap.get_header(obj);
+        header.add_gc_flags(cratonvm_types::GC_FLAG_COMPACT);
+
+        assert!(
+            matches!(heap.get_field(obj, 0), Value::Object(None)),
+            "an unresolvable compact receiver must read as null, not as the \
+             legacy 16-byte cell at index * SLOT_SIZE"
+        );
+
+        // The write must be dropped, not striped over the legacy cell.
+        heap.set_field(obj, 1, Value::Int(77));
+
+        header.clear_gc_flags(cratonvm_types::GC_FLAG_COMPACT);
+        assert!(
+            matches!(heap.get_field(obj, 1), Value::Int(2)),
+            "the dropped write must not have reached the object at all"
+        );
+    }
+
     #[test]
     fn value_size_fits_slot() {
         assert!(
@@ -1867,6 +2248,195 @@ mod tests {
             "Value ({} bytes) exceeds SLOT_SIZE ({SLOT_SIZE} bytes)!",
             std::mem::size_of::<Value>()
         );
+    }
+
+    /// Serialises every test that reads `ref_element_degradation_count`
+    /// against every test that *increments* it.
+    ///
+    /// Still sufficient after the merge into `cratonvm_types`' shared
+    /// per-source table: that accessor reads only the
+    /// `DegradationSource::ArrayElement` slot, and
+    /// `ref_element_word_implausible` in this file is that slot's only writer
+    /// in the whole tree. A `cratonvm_types` test bumping `Interpreter`, or a
+    /// `vm` test bumping `Jit`, is both in a different test binary AND in a
+    /// different slot.
+    ///
+    /// The counter is process-wide and `cargo test` runs this crate's tests in
+    /// one process, in parallel — so a test that merely triggers a degradation
+    /// perturbs a concurrently-running test that measures one. Same reasoning
+    /// (and same mistake, already paid for once) as
+    /// `cratonvm_types::compact_value::degrade_counter_test_lock`. Deltas, never
+    /// absolute counts, and never a reset: a reset would destroy whatever window
+    /// a concurrent observer had already opened.
+    fn ref_degrade_test_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// A null reference element is NOT a degradation.
+    ///
+    /// `plausible_heap_pointer(0)` is `false`, so an ordinary null `Object[]`
+    /// element takes the same cold arm as genuine garbage. If that arm counted
+    /// it, [`ref_element_degradation_count`] would read in the millions on a
+    /// clean run and "non-zero means a live object was nulled" would be false on
+    /// first use — the counter would be worse than none at all.
+    #[test]
+    fn null_ref_element_is_not_counted_as_a_degradation() {
+        let _guard = ref_degrade_test_lock();
+        let before = ref_element_degradation_count();
+        for _ in 0..1000 {
+            assert_eq!(
+                ref_element_word_implausible(0),
+                Value::Object(None),
+                "a null element must still decode to null"
+            );
+        }
+        assert_eq!(
+            ref_element_degradation_count() - before,
+            0,
+            "reading null elements must not move the degradation counter"
+        );
+    }
+
+    /// The degrade stopped being silent.
+    ///
+    /// Before this counter existed, `read_prim_element` handing Java a `null`
+    /// for a slot that held bits left no trace anywhere — no counter, no log, no
+    /// assert — while `cratonvm_types`' `object_degradation_count()` reported a
+    /// reassuring 0 because it only sees the interpreter's SoA/compact decode
+    /// paths, never this one.
+    #[test]
+    fn implausible_ref_element_degrades_to_null_and_is_counted() {
+        let _guard = ref_degrade_test_lock();
+        // The `0x8D8D..` class from commit `6a04b0e3c1`, plus an unaligned word
+        // and a >47-bit word. None can be a live object pointer.
+        let garbage: [u64; 3] = [0x8D8D_8D8D_8D8D_8D8D, 0x1001, 0x0001_0000_0000_0000];
+        let before = ref_element_degradation_count();
+        for raw in garbage {
+            assert!(
+                !cratonvm_types::plausible_heap_pointer(raw),
+                "{raw:#018x} must fail the plausibility test for this test to mean anything"
+            );
+            assert_eq!(
+                ref_element_word_implausible(raw),
+                Value::Object(None),
+                "garbage bits must still degrade to null, not fabricate an ObjectRef"
+            );
+        }
+        assert_eq!(
+            ref_element_degradation_count() - before,
+            garbage.len() as u64,
+            "every non-null degrade must be counted exactly once"
+        );
+    }
+
+    /// An array-element degrade must move the SHARED total, not just this
+    /// path's own slot.
+    ///
+    /// This is the assertion the other tests in this file cannot make. They all
+    /// measure deltas on `ref_element_degradation_count`, so they passed just as
+    /// happily when that read a `static REF_ELEMENT_DEGRADATIONS` private to
+    /// this file — and that arrangement was itself the bug: a triager reading
+    /// `cratonvm_types::compact_value::object_degradation_count()` (the name the
+    /// interpreter's twin publishes, and the one a crash report reaches for) saw
+    /// `0` while this path was nulling live elements. Re-privatising the counter
+    /// must fail a test, not merely go unnoticed.
+    ///
+    /// Deltas on the total are asserted as a LOWER bound, deliberately. The
+    /// total sums all three sources and `ref_degrade_test_lock` only serialises
+    /// this one, so a concurrently-running test in this binary that trips a
+    /// `cratonvm_types` `Interpreter` decode may add to it. `>= n` still fails
+    /// closed for the regression this guards (a private counter moves the total
+    /// by 0 while the slot moves by `n`), and does not flake.
+    #[test]
+    fn an_array_element_degrade_is_visible_in_the_shared_process_wide_total() {
+        use cratonvm_types::compact_value::{
+            object_degradation_breakdown, object_degradation_count, DegradationSource,
+        };
+        let _guard = ref_degrade_test_lock();
+        let garbage: [u64; 3] = [0x8D8D_8D8D_8D8D_8D8D, 0x1001, 0x0001_0000_0000_0000];
+        let n = garbage.len() as u64;
+
+        let before_slot = ref_element_degradation_count();
+        let before_total = object_degradation_count();
+        for raw in garbage {
+            assert_eq!(ref_element_word_implausible(raw), Value::Object(None));
+        }
+
+        assert_eq!(
+            ref_element_degradation_count() - before_slot,
+            n,
+            "the ArrayElement slot must count every non-null degrade exactly once",
+        );
+        assert!(
+            object_degradation_count() - before_total >= n,
+            "an array-element degrade was invisible to object_degradation_count() — \
+             this path is back on a counter of its own",
+        );
+        assert_eq!(
+            object_degradation_breakdown()[DegradationSource::ArrayElement.index()],
+            ref_element_degradation_count(),
+            "ref_element_degradation_count must BE the ArrayElement slot, not a \
+             parallel tally that happens to agree",
+        );
+    }
+
+    /// The fast path is unchanged: a plausible word still decodes verbatim and
+    /// costs nothing (it never reaches the cold arm, so it never touches the
+    /// counter).
+    #[test]
+    fn plausible_ref_element_decodes_verbatim_without_counting() {
+        let _guard = ref_degrade_test_lock();
+        let heap = Heap::new();
+        let obj = heap.alloc_object(ClassId::new(9), 1);
+        let raw: u64 = obj.as_ptr() as usize as u64;
+        assert!(cratonvm_types::plausible_heap_pointer(raw));
+        let before = ref_element_degradation_count();
+        // SAFETY: `raw` is the address of a live object just allocated above.
+        let decoded = unsafe { decode_ref_element_word(raw) };
+        match decoded {
+            Value::Object(Some(r)) => assert_eq!(r.as_ptr(), obj.as_ptr()),
+            other => panic!("a live object pointer must decode verbatim, got {other:?}"),
+        }
+        assert_eq!(
+            ref_element_degradation_count() - before,
+            0,
+            "the fast path must not touch the counter"
+        );
+    }
+
+    /// A well-formed ZGC colored word is legitimate data that has not been
+    /// through the load barrier — nulling it is silent heap corruption
+    /// (`zgc-jit-load-barrier.md` J1), so the cold arm must fail loudly instead.
+    #[cfg(feature = "zgc")]
+    #[test]
+    #[should_panic(expected = "with no load barrier")]
+    fn well_formed_colored_word_panics_instead_of_degrading() {
+        use crate::zgc::vaddr;
+        // Tagged (bit 63), reserved bits 62-46 clear, exactly one metadata bit.
+        let colored: u64 = vaddr::Z_COLORED_TAG | vaddr::Z_MARKED0 | 0x40;
+        assert!(vaddr::is_well_formed(colored));
+        assert!(!cratonvm_types::plausible_heap_pointer(colored));
+        let _ = ref_element_word_implausible(colored);
+    }
+
+    /// ...but garbage that merely happens to have bit 63 set is NOT a colored
+    /// word, and must keep the old degrade even in a `--features zgc` build
+    /// running Generational or G1. `0x8D8D..` sets bit 63 and fails
+    /// `is_well_formed` (reserved bits set, several metadata bits set).
+    #[cfg(feature = "zgc")]
+    #[test]
+    fn stale_garbage_with_bit63_still_degrades_under_the_zgc_feature() {
+        let _guard = ref_degrade_test_lock();
+        let raw: u64 = 0x8D8D_8D8D_8D8D_8D8D;
+        assert!(crate::zgc::vaddr::is_colored_word(raw));
+        assert!(
+            !crate::zgc::vaddr::is_well_formed(raw),
+            "if this ever becomes well-formed the panic arm would fire on real garbage"
+        );
+        let before = ref_element_degradation_count();
+        assert_eq!(ref_element_word_implausible(raw), Value::Object(None));
+        assert_eq!(ref_element_degradation_count() - before, 1);
     }
 
     #[test]
@@ -1898,18 +2468,43 @@ mod tests {
         assert_eq!(heap.identity_hash_code(obj), hash, "must be stable");
     }
 
+    /// `alloc_object` allocates through `alloc_zeroed`, and an all-zero slot
+    /// decodes as `Value::Int(0)` (the discriminant-0 variant of `Value`; see
+    /// `alloc_object_with_descriptors`, which exists precisely because that is
+    /// NOT `Object(None)`). Every field of a fresh object must read back as
+    /// that zero, including one carved out of arena bytes a previous object
+    /// has already written to.
+    ///
+    /// Was vacuous: three `let _ = heap.get_field(obj, n);` and "just verify no
+    /// crash". Swapping `alloc_zeroed` for a non-zeroing bump in
+    /// `alloc_object`, so a recycled/dirty slot is handed back as-is, stayed
+    /// green.
     #[test]
     fn alloc_object_fields_zero_initialized() {
         let heap = Heap::new();
         let obj = heap.alloc_object(ClassId::new(0), 3);
 
-        // All fields should read as zero (which is Value::Uninitialized from zeroed memory,
-        // or more precisely, whatever zero bits represent for Value).
-        // In practice, we set fields before reading in real code.
-        // Just verify no crash.
-        let _ = heap.get_field(obj, 0);
-        let _ = heap.get_field(obj, 1);
-        let _ = heap.get_field(obj, 2);
+        for i in 0..3 {
+            assert_eq!(
+                heap.get_field(obj, i),
+                Value::Int(0),
+                "field {i} of a fresh object must read as the zeroed slot"
+            );
+        }
+
+        // Dirty this object, then allocate another: the new one's slots must
+        // still be zero rather than whatever the arena last held.
+        heap.set_field(obj, 0, Value::Long(-1));
+        heap.set_field(obj, 1, Value::Double(1.5));
+        heap.set_field(obj, 2, Value::Object(Some(obj)));
+        let obj2 = heap.alloc_object(ClassId::new(0), 3);
+        for i in 0..3 {
+            assert_eq!(
+                heap.get_field(obj2, i),
+                Value::Int(0),
+                "field {i} of a later object must be zeroed too"
+            );
+        }
     }
 
     #[test]
@@ -2561,7 +3156,12 @@ mod tests {
         let v_long = Value::Long(f64::to_bits(std::f64::consts::PI) as i64);
         let coerced = coerce_field_value_by_descriptor(v_long, b'D');
         match coerced {
-            Value::Double(d) => assert!((d - std::f64::consts::PI).abs() < 1e-12),
+            // Bit equality, not a tolerance. This asserts a REINTERPRETATION:
+            // the whole claim is that the 64 bits survive, and a tolerance of
+            // 1e-12 admits ~5,100 ulps of drift in a value that cannot legally
+            // drift at all — it would pass a slot that silently narrowed the
+            // double to f32 and back.
+            Value::Double(d) => assert_eq!(d.to_bits(), std::f64::consts::PI.to_bits()),
             other => panic!("expected Double, got {other:?}"),
         }
     }

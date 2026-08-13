@@ -75,6 +75,43 @@ pub(crate) fn native_output_stream_writer_init(
 /// System.out/System.err streams (1-field objects) work correctly in real JDK
 /// mode, particularly when System.initPhase1() has not completed successfully.
 /// The fallbacks simply write to the host process stdout/stderr via fd_table.
+///
+/// # These are contract §1.4 SHADOWS, and the two classes have opposite verdicts
+///
+/// Every `java/io/Print*` registration below stands in front of image bytecode
+/// that carries a `Code` attribute — 36 of the census's 6,066
+/// `bridge_shadows_bytecode` rows are this one function. They were measured
+/// triple by triple on 2026-08-11 with `CRATONVM_ENFORCE_NATIVE_SHADOW`
+/// scoped to one class at a time, HotSpot 25.0.3 as the control, and the two
+/// halves came out differently for a reason that is entirely about the
+/// receiver:
+///
+/// * **`java/io/PrintWriter` (7 triples) is retirable.** Verdict-neutral on a
+///   `ByteArrayOutputStream`, on a `StringWriter`, and wrapping `System.out`,
+///   and — the arm that matters — verdict-neutral when the receiver was built
+///   by the NATIVE constructor while the methods yielded. That works because
+///   `native_printwriter_init_outputstream` chains into the real
+///   `PrintWriter(OutputStream, boolean)` (see its `invoke_special`), so
+///   `lock`/`out`/`charOut`/`textOut` are populated by JDK bytecode whichever
+///   construction path ran.
+/// * **`java/io/PrintStream` (29 triples) is BLOCKED**, on `System.out` and
+///   `System.err` specifically. Over a user-constructed stream whose ctor
+///   yielded too, 26 of 26 triples are verdict-neutral; over the VM-minted
+///   `System.out`, *every* output triple silently produces nothing. Silently,
+///   because real `writeln` calls `ensureOpen()`, which throws
+///   `IOException("Stream closed")` on the null `out` the comment further down
+///   describes, and `writeln`'s own exception table catches `IOException` and
+///   sets `trouble = true`. A suite asserting only on exceptions reads green
+///   while the VM prints nothing.
+///
+/// So the fd-backed `System.out`/`System.err` have to be CONSTRUCTED rather
+/// than fabricated before this class's shadows can go, and
+/// `native_printstream_init_outputstream` has to chain to a real ctor the way
+/// the PrintWriter one does — retiring the methods while it does not
+/// reproduces `close()` NPEing on a null `textOut`, which is what the
+/// measurement caught. The full per-row table, the field-by-field diff against
+/// HotSpot, and the `retired_shadow.rs` patch for the PrintWriter half are in
+/// docs/known-issues/jdk-only/W7-22-shadow-retirement-logging-and-time.md.
 pub(crate) fn register_printstream_fallback_natives(registry: &mut NativeMethodRegistry) {
     // census-tag: PrintStream/PrintWriter natives bridge host stdout/stderr.
     let __prev_cat = registry.current_category();
@@ -165,6 +202,23 @@ pub(crate) fn register_printstream_fallback_natives(registry: &mut NativeMethodR
         "(Ljava/lang/String;[Ljava/lang/Object;)Ljava/io/PrintStream;",
         native_printf,
     );
+    // The locale-taking overloads. `javap java.io.PrintStream` lists four
+    // format entry points, not two; only the two above were registered, so the
+    // other two fell through to real `Formatter`-over-`Appendable` bytecode and
+    // printed NOTHING — silently, beside a working sibling. See
+    // `native_printf_locale`.
+    registry.register(
+        "java/io/PrintStream",
+        "printf",
+        "(Ljava/util/Locale;Ljava/lang/String;[Ljava/lang/Object;)Ljava/io/PrintStream;",
+        native_printf_locale,
+    );
+    registry.register(
+        "java/io/PrintStream",
+        "format",
+        "(Ljava/util/Locale;Ljava/lang/String;[Ljava/lang/Object;)Ljava/io/PrintStream;",
+        native_printf_locale,
+    );
     // PrintStream writer-path entries. JUnit's ConsoleLauncher wraps
     // `System.out` (a PrintStream) in a `PrintWriter`; `PrintWriter.write`
     // delegates `out.write(String,int,int)` straight onto the PrintStream
@@ -189,6 +243,12 @@ pub(crate) fn register_printstream_fallback_natives(registry: &mut NativeMethodR
         "(Ljava/lang/String;)V",
         native_printstream_write_string,
     );
+    // HELD BACK from any future §1.4 retirement, by name. JDK 25 does not
+    // DECLARE this overload — the census row reads `declared: false` against
+    // the image, so there is no bytecode for it to yield to and refusing it
+    // would replace a working native with a `NoSuchMethodError`, which is the
+    // shape `retired_shadow.rs` holds `Logger.log(Level, Supplier, Throwable)`
+    // back for. It is not one of the 29 shadow rows on this class.
     registry.register(
         "java/io/PrintStream",
         "write",
@@ -284,9 +344,16 @@ pub(crate) fn register_printstream_fallback_natives(registry: &mut NativeMethodR
     // The real-JDK `PrintStream.flush()`/`close()` bytecode dereferences that
     // null `out` (`out.flush()`) → NPE ("Cannot invoke flush on null") for any
     // program that calls `System.out.flush()`. Route both through the fd-aware
-    // natives instead: flush drains the fd's buffer, close is a no-op (we must
-    // never close the process stdout/stderr). Mirrors the synthetic-mode
-    // PrintStream registration and the long-standing fd-stream flush contract.
+    // natives instead. Mirrors the synthetic-mode PrintStream registration and
+    // the long-standing fd-stream flush contract.
+    //
+    // Both triples are registered UNCONDITIONALLY, so both natives run for
+    // every `PrintStream` in the VM and not only for the console pair this
+    // comment describes. `close` used to be a bare no-op on that reading, which
+    // meant `new PrintStream(fileOutputStream).close()` delivered no bytes and
+    // released no handle; it now performs the receiver test the comment was
+    // asserting — a null `out` IS the console — and closes everything else.
+    // W7-70-printstream-close-noop.md
     registry.register(
         "java/io/PrintStream",
         "flush",
@@ -301,6 +368,16 @@ pub(crate) fn register_printstream_fallback_natives(registry: &mut NativeMethodR
     );
     // PrintWriter — use dedicated variants that route through the underlying
     // Writer when the backing is non-fd (e.g. StringWriter in ModelNode.toString()).
+    //
+    // The seven registrations from here to the end of this function are the
+    // §1.4 shadows measured RETIRABLE (see this function's doc comment). They
+    // are kept as `Bridge` only because the retirement is a re-tag in
+    // `native-api/src/retired_shadow.rs`, which the measuring lane did not own;
+    // the exact table entries are in
+    // docs/known-issues/jdk-only/W7-22-shadow-retirement-logging-and-time.md.
+    // Anything ADDED here is a new shadow on a class already adjudicated
+    // retirable, so it needs a row in that table too or the class retires
+    // half-way — the shape that made `close()` NPE on the PrintStream side.
     registry.register(
         "java/io/PrintWriter",
         "write",
@@ -410,6 +487,61 @@ pub(crate) fn jul_logger_handlers_set(
         .unwrap()
         .insert(key, handle);
     ctx.unpin_native_roots(logger_pin);
+}
+
+/// GC-safe side table for `java.util.logging.Handler`'s `ErrorManager`, keyed
+/// by `identity_hash_code` — same pattern, and for the same reason, as
+/// `jul_logger_handlers_table`.
+///
+/// `java.util.logging.Handler` declares
+/// `private volatile ErrorManager errorManager = new ErrorManager();` and
+/// every `Handler` in the JDK routes its absorbed `Exception` there through
+/// `reportError`. CratonVM's SYNTHETIC `StreamHandler` is a 2-field object
+/// (stream=0, formatter=1) with no slot for it, so keying by identity sidesteps
+/// the layout the way the handler-list table already does — and, unlike a
+/// fixed slot, cannot collide with whatever a real-JDK `Handler` keeps there.
+///
+/// Compatible mode never reaches this: `Handler.reportError`,
+/// `Handler.setErrorManager` and `StreamHandler.flush`/`close` all run real
+/// bytecode there, over the real `errorManager` field.
+/// W7-64-printstream-trouble-and-errormanager.md
+fn jul_handler_error_manager_table(vm: usize) -> &'static std::sync::Mutex<std::collections::HashMap<i32, usize>> {
+    static T: OnceLock<std::sync::Mutex<std::collections::HashMap<usize, &'static std::sync::Mutex<std::collections::HashMap<i32, usize>>>>> =
+        OnceLock::new();
+    crate::logmanager::per_vm_table(&T, vm)
+}
+
+pub(crate) fn jul_handler_error_manager_get(
+    ctx: &mut dyn NativeContext,
+    handler: ObjectRef,
+) -> Option<ObjectRef> {
+    let vm = ctx.vm_identity();
+    let key = ctx.identity_hash_code(handler);
+    let handle = *jul_handler_error_manager_table(vm).lock().unwrap().get(&key)?;
+    ctx.resolve_global_root(handle)
+}
+
+pub(crate) fn jul_handler_error_manager_set(
+    ctx: &mut dyn NativeContext,
+    handler: ObjectRef,
+    manager: ObjectRef,
+) {
+    let vm = ctx.vm_identity();
+    // Adding a global root may grow the root table and collect. The handler is
+    // keyed immediately afterward, so retain it across that allocation. Same
+    // hazard, and same fix, as `jul_logger_handlers_set`.
+    let handler_pin = ctx.pin_native_root(handler);
+    let handle = ctx.add_global_root(manager);
+    let handler = ctx.read_native_pin(handler_pin, handler);
+    let key = ctx.identity_hash_code(handler);
+    if let Some(previous) = jul_handler_error_manager_table(vm)
+        .lock()
+        .unwrap()
+        .insert(key, handle)
+    {
+        ctx.remove_global_root(previous);
+    }
+    ctx.unpin_native_roots(handler_pin);
 }
 
 pub(crate) fn jul_logger_handlers_clear(ctx: &mut dyn NativeContext, logger: ObjectRef) {
@@ -659,7 +791,7 @@ pub(crate) fn emit_framework_log(ctx: &mut dyn NativeContext, text: &str) {
         // `NoSuchMethodError` into whatever Java frame invoked the logging
         // native (observed killing the WildFly boot thread outright).
         let receiver_classed = matches!(
-            ctx.class_name_of_id(ctx.class_id_of_object(out)).as_deref(),
+            ctx.class_name_arc_of_id(ctx.class_id_of_object(out)).as_deref(),
             Some(n) if n != "java/lang/Object"
         );
         // WildFly's `org.jboss.stdio` override streams REDIRECT stdout back
@@ -673,7 +805,7 @@ pub(crate) fn emit_framework_log(ctx: &mut dyn NativeContext, text: &str) {
         // output). Route framework records straight to the canonical fd-backed
         // stream for these redirect streams.
         let is_stdio_redirect = matches!(
-            ctx.class_name_of_id(ctx.class_id_of_object(out)).as_deref(),
+            ctx.class_name_arc_of_id(ctx.class_id_of_object(out)).as_deref(),
             Some(n) if n.starts_with("org/jboss/stdio/")
         );
         if !is_canonical && receiver_classed && !is_stdio_redirect && depth < 2 {
@@ -930,21 +1062,41 @@ pub(crate) fn native_printwriter_printf(
                 // Prefer Writer.write(String) which is the canonical PrintWriter
                 // sink. If that isn't registered we fall through to the
                 // OutputStream byte path so BAOS-backed writers still work.
-                let wrote_string = ctx
-                    .invoke_virtual(
-                        backing,
-                        "write",
-                        "(Ljava/lang/String;)V",
-                        &[Value::Object(Some(s))],
-                    )
-                    .is_ok();
-                if !wrote_string && !backing_is_writer {
+                // RECORDED since W7-64. `PrintWriter.format` is
+                // `try { ensureOpen(); …formatter.format(…); }
+                //  catch (InterruptedIOException x) { …interrupt(); }
+                //  catch (IOException x) { trouble = true; }` — the same two
+                // clauses as `write`, so the same recording policy.
+                // W7-64-printstream-trouble-and-errormanager.md
+                let wrote = ctx.invoke_virtual(
+                    backing,
+                    "write",
+                    "(Ljava/lang/String;)V",
+                    &[Value::Object(Some(s))],
+                );
+                // ROUTED, not DELIVERED — the same distinction W7-81 drew in
+                // `route_write_through_out`, and the same defect if it is
+                // missed. The retry below exists for the case the comment
+                // above names: `write(String)` "isn't registered", i.e. a
+                // `NoSuchMethodError` — `DelegatedWrite::Refused`. An absorbed
+                // `IOException` is not that. HotSpot's `catch` has run, the
+                // characters are gone, and re-sending them through the byte
+                // overload on the SAME backing is a double write on a sink the
+                // JDK already gave up on. `record_write_failure`'s `bool`
+                // cannot tell those apart, which is exactly why it must not be
+                // the gate on a retry.
+                // W7-81-write-route-three-way.md
+                let routed = cratonvm_native_api::print_error_state::classify_write_failure(
+                    ctx, this, wrote,
+                )
+                .routed();
+                if !routed && !backing_is_writer {
                     let bytes = text.as_bytes();
                     let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, bytes.len());
                     for (i, b) in bytes.iter().enumerate() {
                         ctx.set_array_element(arr, i, Value::Int(*b as i8 as i32));
                     }
-                    let _ = ctx.invoke_virtual(
+                    let wrote_bytes = ctx.invoke_virtual(
                         backing,
                         "write",
                         "([BII)V",
@@ -953,6 +1105,11 @@ pub(crate) fn native_printwriter_printf(
                             Value::Int(0),
                             Value::Int(bytes.len() as i32),
                         ],
+                    );
+                    cratonvm_native_api::print_error_state::record_write_failure(
+                        ctx,
+                        this,
+                        wrote_bytes,
                     );
                 }
             }
@@ -968,11 +1125,39 @@ pub(crate) fn native_printstream_flush(
     // User/Tee streams: propagate flush() to the real underlying stream so a
     // redirected file (e.g. DaCapo stdout.log) is durable before its digest is
     // read. Canonical synthetic out/err (out==null) flush the fd directly.
-    if let Some(Value::Object(Some(this))) = args.first() {
-        if let Value::Object(Some(out)) = ctx.get_field_by_name(*this, "out") {
-            let _ = ctx.invoke_virtual(out, "flush", "()V", &[]);
+    //
+    // KEPT SWALLOW, NARROWED. `java.io.PrintStream.flush()` is
+    // `synchronized (this) { try { ensureOpen(); out.flush(); }
+    // catch (IOException x) { trouble = true; } }` — the absorb is the JDK's,
+    // and `PrintStream` declares no checked exception, so propagating
+    // everything would be a fresh divergence. That `catch` names `IOException`
+    // and nothing wider, so an `Error` — a `NoSuchMethodError` from our own
+    // dispatch above all — now comes out.
+    // W7-57-close-flush-swallow-sweep.md
+    //
+    // RECORDED since W7-64. The `catch` body is `trouble = true`, and
+    // `checkError()` is that field's only reader — absorbing without setting
+    // it made the failure *unobservable* rather than merely unthrown, which is
+    // strictly worse than the swallow this narrowing removed. Parity, not a
+    // behaviour change: HotSpot sets `trouble` at exactly this point.
+    // W7-64-printstream-trouble-and-errormanager.md
+    if let Some(Value::Object(Some(this))) = args.first().copied() {
+        if let Value::Object(Some(out)) = ctx.get_field_by_name(this, "out") {
+            let flushed = ctx.invoke_virtual(out, "flush", "()V", &[]);
+            cratonvm_native_api::print_error_state::absorb_io_exception_recording(
+                &*ctx, this, flushed,
+            )?;
             return Ok(None);
         }
+        // The fd path below is `PrintStream.flush()` over the process console.
+        // A failing `write`/`flush` on the fd is exactly the `IOException` the
+        // JDK's `catch` names, so it records too — see `stream_write`.
+        if let Some(fd) = stream_fd(ctx, args) {
+            if ctx.fd_table().flush(fd).is_err() {
+                cratonvm_native_api::print_error_state::set_trouble(&*ctx, this);
+            }
+        }
+        return Ok(None);
     }
     if let Some(fd) = stream_fd(ctx, args) {
         let _ = ctx.fd_table().flush(fd);
@@ -980,11 +1165,121 @@ pub(crate) fn native_printstream_flush(
     Ok(None)
 }
 
+/// `java.io.PrintStream.close()` — flush the sink, then close it.
+///
+/// This was a bare `Ok(None)` with the comment "Don't actually close
+/// stdout/stderr". That is a correct reason for a receiver test the body never
+/// performed: the triple is registered unconditionally in BOTH registrars, so
+/// the no-op applied to every `PrintStream` in the VM, and
+/// `new PrintStream(new FileOutputStream(f)).close()` neither delivered the
+/// buffered bytes nor released the file handle. A `try`-with-resources over
+/// one saw a clean exit — lost data reported as success, the same fault shape
+/// W7-57-close-flush-swallow-sweep.md exists for.
+///
+/// **The JDK body**, `lib/src.zip` from JDK 25.0.3.9:
+///
+/// ```java
+/// public void close() {
+///     synchronized (this) {
+///         if (!closing) {
+///             closing = true;
+///             try {
+///                 textOut.close();
+///                 out.close();
+///             }
+///             catch (IOException x) { trouble = true; }
+///             textOut = null; charOut = null; out = null;
+///         }
+///     }
+/// }
+/// ```
+///
+/// **What the SINK sees**, measured on HotSpot 25.0.3.9 rather than inferred
+/// from that source — because `textOut.close()` does not look like a flush and
+/// is one. `charOut` is `new OutputStreamWriter(this, charset)`, so closing the
+/// character layer bottoms out in `StreamEncoder.implClose`, whose `out` is
+/// `this`: it calls `this.flush()` (which is `out.flush()` on the real sink)
+/// and then `this.close()` (a no-op, caught by the `closing` latch). The
+/// observable contract on the sink is therefore exactly:
+///
+/// | case | sink ops | close() throws | `checkError()` |
+/// |---|---|---|---|
+/// | clean | `[flush, close]` | none | `false` |
+/// | sink `flush` throws `IOException` | `[flush, close]` | none | `true` |
+/// | sink `flush` throws `Error` | `[flush]` — **close is skipped** | the `Error` | — |
+/// | sink `close` throws `IOException` | `[flush, close]` | none | `true` |
+/// | sink `close` throws `Error` | `[flush, close]` | the `Error` | `false` |
+/// | second `close()` | nothing more | none | unchanged |
+///
+/// Every row is an assertion in `probes/CloseFlushSwallowProbe.java`.
+/// The flush-first-then-close pair with `?` between them reproduces all six,
+/// including the one that is easy to get wrong: a propagated `Error` out of the
+/// flush must skip the close, which is what the `?` does.
+///
+/// **`textOut`/`charOut` are deliberately not driven.** They are null on every
+/// `PrintStream` this VM constructs (`native_printstream_init_outputstream`
+/// sets only `out`, and `ensure_system_streams` allocates a zeroed object), and
+/// where a real ctor we do not shadow does populate them the character layer is
+/// still empty, because our own `print`/`println`/`write` natives write to
+/// `out` directly and never buffer into `textOut`. Closing it as well would
+/// drive the sink's `flush` twice. If the `native_osw_init`/`native_bw_init`
+/// lane ever makes a real `textOut` load-bearing, this is the site to revisit.
+///
+/// **The console still cannot be closed**, and now for a reason the code
+/// states: `System.out`/`System.err` are fd-backed with a NULL `out`
+/// (`ensure_system_streams` never populates it — that is the same invariant
+/// `route_write_through_out` and `native_printstream_flush` already branch on),
+/// so there is no sink object to close and the fd is flushed instead. A
+/// `PrintStream` that WRAPS `System.out` delegates its close to it and lands on
+/// that same branch; and `FdTable::close` refuses fd < 3 outright. Three
+/// independent guards, none of which is a name test.
+///
+/// KEPT SWALLOW, NARROWED, RECORDED — the same three-part policy as
+/// `native_printstream_flush` above and `native_printwriter_close`. The JDK's
+/// `catch` names `IOException` and `close()` declares no checked exception, so
+/// an `IOException` is absorbed into `trouble`; an `Error` — a
+/// `NoSuchMethodError` out of our own dispatch above all — is not named by that
+/// `catch` and comes out. W7-57-close-flush-swallow-sweep.md,
+/// W7-64-printstream-trouble-and-errormanager.md,
+/// W7-70-printstream-close-noop.md
 pub(crate) fn native_printstream_close(
-    _ctx: &mut dyn NativeContext,
-    _args: &[Value],
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
 ) -> MethodCallResult {
-    // Don't actually close stdout/stderr
+    let Some(Value::Object(Some(this))) = args.first().copied() else {
+        return Ok(None);
+    };
+    // `if (!closing)`. Never cleared, so this is both the recursion guard the
+    // JDK's comment names and what makes a second close a total no-op.
+    if cratonvm_native_api::print_error_state::is_closing(&*ctx, this) {
+        return Ok(None);
+    }
+    // The sink, by the JDK's own field name. A non-object here — including the
+    // `Value::Int` fd tag `ensure_system_streams` parks in the legacy
+    // synthetic layout's slot 0 — is "no Java sink", i.e. the console.
+    // Bound to a local first, so the `&*ctx` read is fully over before the
+    // `&mut ctx` dispatch below starts — the nested-reborrow shape that had to
+    // be split once already in this file's neighbour.
+    let out_field = ctx.get_field_by_name(this, "out");
+    let Value::Object(Some(sink)) = out_field else {
+        // The process console. HotSpot really would close it; we must not, so
+        // the closest useful behaviour is the flush its close would have
+        // performed. `closing` is deliberately NOT latched here: it means "this
+        // stream's sink has been closed", and nothing on this branch closed
+        // one — so a second `System.out.close()` still drains the console
+        // rather than silently skipping it.
+        if let Some(fd) = stream_fd(ctx, args) {
+            if ctx.fd_table().flush(fd).is_err() {
+                cratonvm_native_api::print_error_state::set_trouble(&*ctx, this);
+            }
+        }
+        return Ok(None);
+    };
+    cratonvm_native_api::print_error_state::latch_closing(&*ctx, this);
+    let flushed = ctx.invoke_virtual(sink, "flush", "()V", &[]);
+    cratonvm_native_api::print_error_state::absorb_io_exception_recording(&*ctx, this, flushed)?;
+    let closed = ctx.invoke_virtual(sink, "close", "()V", &[]);
+    cratonvm_native_api::print_error_state::absorb_io_exception_recording(&*ctx, this, closed)?;
     Ok(None)
 }
 
@@ -1019,9 +1314,11 @@ pub(crate) fn native_printstream_write(
         && !route_write_through_out(ctx, args, &buf)
     {
         if let Some(fd) = stream_fd(ctx, args) {
-            with_stdio_print_lock(|| {
-                let _ = ctx.fd_table().write_bytes(fd, &buf);
-            });
+            let ok = with_stdio_print_lock(|| ctx.fd_table().write_bytes(fd, &buf));
+            // RECORDED since W7-64 — see `stream_write` in native-builtins/src/lib.rs.
+            if let Some(Value::Object(Some(this))) = args.first().copied() {
+                cratonvm_native_api::print_error_state::record_host_io_failure(&*ctx, this, ok);
+            }
         }
     }
     Ok(None)
@@ -1044,9 +1341,11 @@ pub(crate) fn native_printstream_write_int(
         && !route_write_through_out(ctx, args, &buf)
     {
         if let Some(fd) = stream_fd(ctx, args) {
-            with_stdio_print_lock(|| {
-                let _ = ctx.fd_table().write_bytes(fd, &buf);
-            });
+            let ok = with_stdio_print_lock(|| ctx.fd_table().write_bytes(fd, &buf));
+            // RECORDED since W7-64 — see `stream_write` in native-builtins/src/lib.rs.
+            if let Some(Value::Object(Some(this))) = args.first().copied() {
+                cratonvm_native_api::print_error_state::record_host_io_failure(&*ctx, this, ok);
+            }
         }
     }
     Ok(None)
@@ -1188,11 +1487,18 @@ fn native_printwriter_write_string(
             if let Some(Value::Object(Some(s))) = args.get(1).copied() {
                 if let Some(text) = ctx.read_string(s) {
                     let len = text.encode_utf16().count() as i32;
-                    let _ = ctx.invoke_virtual(
+                    let written = ctx.invoke_virtual(
                         this,
                         "write",
                         "(Ljava/lang/String;II)V",
                         &[Value::Object(Some(s)), Value::Int(0), Value::Int(len)],
+                    );
+                    // RECORDED since W7-64 — `PrintWriter.write(String,int,int)`
+                    // ends `catch (IOException x) { trouble = true; }`, and
+                    // `checkError()` is that field's only reader.
+                    // W7-64-printstream-trouble-and-errormanager.md
+                    cratonvm_native_api::print_error_state::record_write_failure(
+                        ctx, this, written,
                     );
                     return Ok(None);
                 }
@@ -1208,8 +1514,27 @@ fn native_printwriter_write_string(
             // create_string allocates, potentially triggering a compacting GC that moves
             // `out_obj` before it is passed to invoke_virtual).
             let str_val = args.get(1).cloned().unwrap_or(Value::Object(None));
-            let _ = ctx.invoke_virtual(out_obj, "write", "(Ljava/lang/String;)V", &[str_val]);
-            return Ok(None);
+            let written =
+                ctx.invoke_virtual(out_obj, "write", "(Ljava/lang/String;)V", &[str_val]);
+            // RECORDED since W7-64 — see the sibling range overload below.
+            //
+            // ROUTED since W7-81. This native resolves `out` itself and never
+            // reaches `route_write_through_out`, so the three-way answer has to
+            // be made here too or this receiver shape keeps the defect the
+            // routing helper just lost: a `Refused` call — a `NoSuchMethodError`
+            // out of our own dispatch — used to `return Ok(None)` and the text
+            // vanished with no fallback at all. Falling through instead reaches
+            // the shared path, which has the console fallback. An `Absorbed`
+            // `IOException` still returns here, because HotSpot wrote the
+            // characters nowhere and re-sending them would be a double write.
+            // W7-81-write-route-three-way.md
+            let routed = cratonvm_native_api::print_error_state::classify_write_failure(
+                ctx, this, written,
+            )
+            .routed();
+            if routed {
+                return Ok(None);
+            }
         }
     }
     native_printstream_write_string(ctx, args)
@@ -1227,13 +1552,29 @@ fn native_printwriter_write_string_range(
             let str_val = args.get(1).cloned().unwrap_or(Value::Object(None));
             let off_val = args.get(2).cloned().unwrap_or(Value::Int(0));
             let len_val = args.get(3).cloned().unwrap_or(Value::Int(0));
-            let _ = ctx.invoke_virtual(
+            let written = ctx.invoke_virtual(
                 out_obj,
                 "write",
                 "(Ljava/lang/String;II)V",
                 &[str_val, off_val, len_val],
             );
-            return Ok(None);
+            // RECORDED since W7-64. `java.io.PrintWriter.write(String,int,int)`
+            // is `synchronized (lock) { try { ensureOpen(); out.write(s, off,
+            // len); } catch (InterruptedIOException x) { …interrupt(); }
+            // catch (IOException x) { trouble = true; } }` — the absorb was
+            // already here, the record was not.
+            // W7-64-printstream-trouble-and-errormanager.md
+            //
+            // ROUTED since W7-81 — see the sibling `write(String)` overload
+            // above for why this native needs the three-way answer of its own.
+            // W7-81-write-route-three-way.md
+            let routed = cratonvm_native_api::print_error_state::classify_write_failure(
+                ctx, this, written,
+            )
+            .routed();
+            if routed {
+                return Ok(None);
+            }
         }
     }
     native_printstream_write_string_range(ctx, args)
@@ -1250,7 +1591,20 @@ pub(crate) fn native_printwriter_write_int(
     if let Some(Value::Object(Some(this))) = args.first().copied() {
         if let Some(out_obj) = printwriter_get_backing_writer(ctx, this) {
             let ch = args.get(1).cloned().unwrap_or(Value::Int(0));
-            let _ = ctx.invoke_virtual(out_obj, "write", "(I)V", &[ch]);
+            let written = ctx.invoke_virtual(out_obj, "write", "(I)V", &[ch]);
+            // RECORDED since W7-64 — `PrintWriter.write(int)` ends
+            // `catch (IOException x) { trouble = true; }`.
+            //
+            // NOT routed three ways, unlike its two `write(String…)` siblings
+            // above, and the difference is deliberate: they have a fallthrough
+            // to hand a REFUSED call to (`native_printstream_write_string…`,
+            // which owns the console fallback) and this one has none — it is
+            // the end of its own path. Giving it one means inventing a
+            // `stream_write` call for a single char, which is a different
+            // change from the one W7-81 made and needs its own justification.
+            // So a `NoSuchMethodError` from `out.write(int)` still loses the
+            // character silently here. W7-81-write-route-three-way.md
+            cratonvm_native_api::print_error_state::record_write_failure(ctx, this, written);
             return Ok(None);
         }
     }
@@ -1460,7 +1814,7 @@ pub(crate) fn register_logging_natives(registry: &mut NativeMethodRegistry) {
             let handlers = match ctx.get_field(*this, 2) {
                 Value::Object(Some(list)) => list,
                 _ => {
-                    let list = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
+                    let list = try_alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2)?;
                     cratonvm_native_collections::native_al_init(ctx, &[Value::Object(Some(list))])?;
                     ctx.set_field(*this, 2, Value::Object(Some(list)));
                     list
@@ -1710,7 +2064,7 @@ pub fn register_slf4j_binder_stubs_pub(registry: &mut NativeMethodRegistry) {
                     }
                 }
             }
-            let s = alloc_concurrent_synthetic(ctx, "org/slf4j/impl/StaticMDCBinder", 1);
+            let s = try_alloc_concurrent_synthetic(ctx, "org/slf4j/impl/StaticMDCBinder", 1)?;
             Ok(Some(Value::Object(Some(s))))
         },
     );
@@ -1732,7 +2086,7 @@ pub fn register_slf4j_binder_stubs_pub(registry: &mut NativeMethodRegistry) {
                     }
                 }
             }
-            let a = alloc_concurrent_synthetic(ctx, "org/slf4j/helpers/BasicMDCAdapter", 0);
+            let a = try_alloc_concurrent_synthetic(ctx, "org/slf4j/helpers/BasicMDCAdapter", 0)?;
             Ok(Some(Value::Object(Some(a))))
         },
     );
@@ -1807,7 +2161,7 @@ pub fn register_slf4j_binder_stubs_pub(registry: &mut NativeMethodRegistry) {
                     }
                 }
             }
-            let s = alloc_concurrent_synthetic(ctx, "org/slf4j/impl/StaticLoggerBinder", 1);
+            let s = try_alloc_concurrent_synthetic(ctx, "org/slf4j/impl/StaticLoggerBinder", 1)?;
             Ok(Some(Value::Object(Some(s))))
         },
     );
@@ -1854,7 +2208,7 @@ pub fn register_slf4j_binder_stubs_pub(registry: &mut NativeMethodRegistry) {
                     return Ok(Some(Value::Object(Some(context))));
                 }
             }
-            let f = alloc_concurrent_synthetic(ctx, "org/slf4j/ILoggerFactory", 0);
+            let f = try_alloc_concurrent_synthetic(ctx, "org/slf4j/ILoggerFactory", 0)?;
             Ok(Some(Value::Object(Some(f))))
         },
     );
@@ -1881,7 +2235,7 @@ pub fn register_slf4j_binder_stubs_pub(registry: &mut NativeMethodRegistry) {
         "getSingleton",
         "()Lorg/slf4j/impl/StaticMarkerBinder;",
         |ctx, _| {
-            let s = alloc_concurrent_synthetic(ctx, "org/slf4j/impl/StaticMarkerBinder", 1);
+            let s = try_alloc_concurrent_synthetic(ctx, "org/slf4j/impl/StaticMarkerBinder", 1)?;
             Ok(Some(Value::Object(Some(s))))
         },
     );
@@ -1909,7 +2263,7 @@ pub fn register_slf4j_binder_stubs_pub(registry: &mut NativeMethodRegistry) {
             } else {
                 fallback
             };
-            let f = alloc_concurrent_synthetic(ctx, chosen, 0);
+            let f = try_alloc_concurrent_synthetic(ctx, chosen, 0)?;
             let _ = ctx.invoke_special(chosen, "<init>", "()V", &[Value::Object(Some(f))]);
             Ok(Some(Value::Object(Some(f))))
         },
@@ -2003,7 +2357,7 @@ pub fn register_slf4j_binder_stubs_pub(registry: &mut NativeMethodRegistry) {
         "(Ljava/lang/String;)Lorg/slf4j/Logger;",
         |ctx, args| {
             let name = args.get(1).copied().unwrap_or(Value::Object(None));
-            let logger = alloc_concurrent_synthetic(ctx, "org/slf4j/Logger", 2);
+            let logger = try_alloc_concurrent_synthetic(ctx, "org/slf4j/Logger", 2)?;
             // Best-effort dual-write: name-by-name (real layout) +
             // name-at-slot-0 (synthetic layout).
             ctx.set_field_by_name(logger, "name", name);
@@ -2308,7 +2662,7 @@ pub(crate) fn register_slf4j_natives(registry: &mut NativeMethodRegistry) {
         "(Ljava/lang/String;)Lorg/slf4j/Logger;",
         |ctx, args| {
             let name = args.first().copied().unwrap_or(Value::Object(None));
-            let logger = alloc_concurrent_synthetic(ctx, "org/slf4j/Logger", 2);
+            let logger = try_alloc_concurrent_synthetic(ctx, "org/slf4j/Logger", 2)?;
             ctx.set_field(logger, SLF4J_NAME, name);
             ctx.set_field(logger, SLF4J_LEVEL, Value::Int(1)); // default: DEBUG
             Ok(Some(Value::Object(Some(logger))))
@@ -2321,21 +2675,36 @@ pub(crate) fn register_slf4j_natives(registry: &mut NativeMethodRegistry) {
         "getLogger",
         "(Ljava/lang/Class;)Lorg/slf4j/Logger;",
         |ctx, args| {
-            // Extract class name from the Class mirror
+            // JDK-ONLY-LAYOUT: the class name comes from `mirror_class_name`,
+            // not from raw slot 0.
+            //
+            // This read used to be `match get_field(mirror, 0) {
+            // Value::Object(Some(n)) => n, _ => "unknown" }` — it expected a
+            // name String at slot 0, which no mirror this VM builds has ever
+            // held: `get_or_create_class_mirror` puts `Int(class_id)` there and
+            // the name at whatever index `java.lang.Class` declares `name` at.
+            // So the match fell through on EVERY call and every logger obtained
+            // through `getLogger(Foo.class)` was named "unknown". Silent, and
+            // the wrong-field read is the whole family this marker names.
             let name_val = match args.first() {
-                Some(Value::Object(Some(class_mirror))) => match ctx.get_field(*class_mirror, 0) {
-                    Value::Object(Some(n)) => Value::Object(Some(n)),
-                    _ => {
-                        let s = ctx.create_string("unknown");
-                        Value::Object(Some(s))
+                Some(Value::Object(Some(class_mirror))) => {
+                    match crate::lang_class::mirror_class_name(ctx, *class_mirror) {
+                        Some(n) => {
+                            let s = ctx.create_string(&n.replace('/', "."));
+                            Value::Object(Some(s))
+                        }
+                        None => {
+                            let s = ctx.create_string("unknown");
+                            Value::Object(Some(s))
+                        }
                     }
-                },
+                }
                 _ => {
                     let s = ctx.create_string("unknown");
                     Value::Object(Some(s))
                 }
             };
-            let logger = alloc_concurrent_synthetic(ctx, "org/slf4j/Logger", 2);
+            let logger = try_alloc_concurrent_synthetic(ctx, "org/slf4j/Logger", 2)?;
             ctx.set_field(logger, SLF4J_NAME, name_val);
             ctx.set_field(logger, SLF4J_LEVEL, Value::Int(1)); // DEBUG
             Ok(Some(Value::Object(Some(logger))))
@@ -2348,7 +2717,7 @@ pub(crate) fn register_slf4j_natives(registry: &mut NativeMethodRegistry) {
         "getILoggerFactory",
         "()Lorg/slf4j/ILoggerFactory;",
         |ctx, _| {
-            let factory = alloc_concurrent_synthetic(ctx, "org/slf4j/ILoggerFactory", 0);
+            let factory = try_alloc_concurrent_synthetic(ctx, "org/slf4j/ILoggerFactory", 0)?;
             Ok(Some(Value::Object(Some(factory))))
         },
     );
@@ -2568,7 +2937,7 @@ pub(crate) fn register_slf4j_natives(registry: &mut NativeMethodRegistry) {
         "(Ljava/lang/String;)Lorg/slf4j/Marker;",
         |ctx, args| {
             let name = args.first().copied().unwrap_or(Value::Object(None));
-            let m = alloc_concurrent_synthetic(ctx, "org/slf4j/Marker", 1);
+            let m = try_alloc_concurrent_synthetic(ctx, "org/slf4j/Marker", 1)?;
             ctx.set_field(m, 0, name);
             Ok(Some(Value::Object(Some(m))))
         },
@@ -2587,7 +2956,7 @@ pub(crate) fn register_slf4j_natives(registry: &mut NativeMethodRegistry) {
         "(Ljava/lang/String;)Ljava/util/logging/Logger;",
         |ctx, args| {
             let name = args.first().copied().unwrap_or(Value::Object(None));
-            let logger = alloc_concurrent_synthetic(ctx, "java/util/logging/Logger", 3);
+            let logger = try_alloc_concurrent_synthetic(ctx, "java/util/logging/Logger", 3)?;
             ctx.set_field(logger, 0, name);
             ctx.set_field(logger, 1, Value::Int(800)); // INFO level
             Ok(Some(Value::Object(Some(logger))))
@@ -2599,7 +2968,7 @@ pub(crate) fn register_slf4j_natives(registry: &mut NativeMethodRegistry) {
         "()Ljava/util/logging/Logger;",
         |ctx, _| {
             let name = ctx.create_string("global");
-            let logger = alloc_concurrent_synthetic(ctx, "java/util/logging/Logger", 3);
+            let logger = try_alloc_concurrent_synthetic(ctx, "java/util/logging/Logger", 3)?;
             ctx.set_field(logger, 0, Value::Object(Some(name)));
             ctx.set_field(logger, 1, Value::Int(800));
             Ok(Some(Value::Object(Some(logger))))
@@ -2675,7 +3044,7 @@ pub(crate) fn register_slf4j_natives(registry: &mut NativeMethodRegistry) {
         "getLevel",
         "()Ljava/util/logging/Level;",
         |ctx, _| {
-            let level = alloc_concurrent_synthetic(ctx, "java/util/logging/Level", 2);
+            let level = try_alloc_concurrent_synthetic(ctx, "java/util/logging/Level", 2)?;
             let name = ctx.create_string("INFO");
             ctx.set_field(level, 0, Value::Object(Some(name)));
             ctx.set_field(level, 1, Value::Int(800));
@@ -2718,7 +3087,7 @@ pub(crate) fn register_slf4j_natives(registry: &mut NativeMethodRegistry) {
                 let handlers = match ctx.get_field(this, 2) {
                     Value::Object(Some(lst)) => lst,
                     _ => {
-                        let lst = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
+                        let lst = try_alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2)?;
                         cratonvm_native_collections::native_al_init(
                             ctx,
                             &[Value::Object(Some(lst))],
@@ -2768,7 +3137,7 @@ pub(crate) fn register_slf4j_natives(registry: &mut NativeMethodRegistry) {
         "(Ljava/lang/String;)Ljava/util/logging/Level;",
         |ctx, args| {
             let name = args.first().copied().unwrap_or(Value::Object(None));
-            let lvl = alloc_concurrent_synthetic(ctx, "java/util/logging/Level", 2);
+            let lvl = try_alloc_concurrent_synthetic(ctx, "java/util/logging/Level", 2)?;
             ctx.set_field(lvl, 0, name);
             ctx.set_field(lvl, 1, Value::Int(800));
             Ok(Some(Value::Object(Some(lvl))))
@@ -2782,7 +3151,7 @@ pub(crate) fn register_slf4j_natives(registry: &mut NativeMethodRegistry) {
         "getLogManager",
         "()Ljava/util/logging/LogManager;",
         |ctx, _| {
-            let mgr = alloc_concurrent_synthetic(ctx, "java/util/logging/LogManager", 0);
+            let mgr = try_alloc_concurrent_synthetic(ctx, "java/util/logging/LogManager", 0)?;
             Ok(Some(Value::Object(Some(mgr))))
         },
     );
@@ -2792,7 +3161,7 @@ pub(crate) fn register_slf4j_natives(registry: &mut NativeMethodRegistry) {
         "(Ljava/lang/String;)Ljava/util/logging/Logger;",
         |ctx, args| {
             let name = args.first().copied().unwrap_or(Value::Object(None));
-            let logger = alloc_concurrent_synthetic(ctx, "java/util/logging/Logger", 2);
+            let logger = try_alloc_concurrent_synthetic(ctx, "java/util/logging/Logger", 2)?;
             ctx.set_field(logger, 0, name);
             ctx.set_field(logger, 1, Value::Int(800));
             Ok(Some(Value::Object(Some(logger))))
@@ -2814,20 +3183,28 @@ pub(crate) fn register_slf4j_natives(registry: &mut NativeMethodRegistry) {
         "getLogger",
         "(Ljava/lang/Class;)Lorg/apache/logging/log4j/Logger;",
         |ctx, args| {
+            // JDK-ONLY-LAYOUT: same wrong-field read as the slf4j shim above,
+            // and the same fix — slot 0 of a Class mirror is the VM's ClassId
+            // Int (or, on a real layout, `cachedConstructor`), never a name.
             let name_val = match args.first() {
-                Some(Value::Object(Some(mirror))) => match ctx.get_field(*mirror, 0) {
-                    Value::Object(Some(n)) => Value::Object(Some(n)),
-                    _ => {
-                        let s = ctx.create_string("unknown");
-                        Value::Object(Some(s))
+                Some(Value::Object(Some(mirror))) => {
+                    match crate::lang_class::mirror_class_name(ctx, *mirror) {
+                        Some(n) => {
+                            let s = ctx.create_string(&n.replace('/', "."));
+                            Value::Object(Some(s))
+                        }
+                        None => {
+                            let s = ctx.create_string("unknown");
+                            Value::Object(Some(s))
+                        }
                     }
-                },
+                }
                 _ => {
                     let s = ctx.create_string("unknown");
                     Value::Object(Some(s))
                 }
             };
-            let logger = alloc_concurrent_synthetic(ctx, "org/apache/logging/log4j/Logger", 2);
+            let logger = try_alloc_concurrent_synthetic(ctx, "org/apache/logging/log4j/Logger", 2)?;
             ctx.set_field(logger, 0, name_val);
             ctx.set_field(logger, 1, Value::Int(2)); // INFO
             Ok(Some(Value::Object(Some(logger))))
@@ -2839,7 +3216,7 @@ pub(crate) fn register_slf4j_natives(registry: &mut NativeMethodRegistry) {
         "(Ljava/lang/String;)Lorg/apache/logging/log4j/Logger;",
         |ctx, args| {
             let name = args.first().copied().unwrap_or(Value::Object(None));
-            let logger = alloc_concurrent_synthetic(ctx, "org/apache/logging/log4j/Logger", 2);
+            let logger = try_alloc_concurrent_synthetic(ctx, "org/apache/logging/log4j/Logger", 2)?;
             ctx.set_field(logger, 0, name);
             ctx.set_field(logger, 1, Value::Int(2)); // INFO
             Ok(Some(Value::Object(Some(logger))))
@@ -2851,7 +3228,7 @@ pub(crate) fn register_slf4j_natives(registry: &mut NativeMethodRegistry) {
         "()Lorg/apache/logging/log4j/Logger;",
         |ctx, _| {
             let name = ctx.create_string("ROOT");
-            let logger = alloc_concurrent_synthetic(ctx, "org/apache/logging/log4j/Logger", 2);
+            let logger = try_alloc_concurrent_synthetic(ctx, "org/apache/logging/log4j/Logger", 2)?;
             ctx.set_field(logger, 0, Value::Object(Some(name)));
             ctx.set_field(logger, 1, Value::Int(2));
             Ok(Some(Value::Object(Some(logger))))
@@ -3030,7 +3407,7 @@ fn mdc_copy_of_context_map(ctx: &mut dyn NativeContext, _args: &[Value]) -> Meth
     if snapshot.is_empty() {
         return Ok(Some(Value::Object(None)));
     }
-    let map = alloc_concurrent_synthetic(ctx, "java/util/HashMap", 3);
+    let map = try_alloc_concurrent_synthetic(ctx, "java/util/HashMap", 3)?;
     cratonvm_native_collections::native_map_init(ctx, &[Value::Object(Some(map))]).ok();
     for (k, v) in snapshot {
         let key_obj = ctx.create_string(&k);

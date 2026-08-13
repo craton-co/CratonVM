@@ -63,7 +63,7 @@ use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError};
 use cratonvm_types::{ArrayElementType, ObjectRef, Value};
 use parking_lot::RwLock;
 
-use crate::alloc_concurrent_synthetic;
+use crate::try_alloc_concurrent_synthetic;
 use crate::crypto_impl;
 
 // ---------------------------------------------------------------------------
@@ -2450,7 +2450,7 @@ pub(crate) fn engine_get_key(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
         // store_id + alias hash in a registry so the TLS layer can pull the
         // DER through `keystore_get_private_key()` rather than needing to
         // round-trip through this object.
-        let pk = alloc_concurrent_synthetic(ctx, "java/security/PrivateKey", 4);
+        let pk = try_alloc_concurrent_synthetic(ctx, "java/security/PrivateKey", 4)?;
         let algo_idx = detect_algo_idx(key_der);
         ctx.set_field(pk, 0, Value::Int(algo_idx));
         ctx.set_field(pk, 1, Value::Int((key_der.len() as i32).saturating_mul(8)));
@@ -2501,7 +2501,7 @@ pub(crate) fn engine_get_key(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
         // SmallRye asks `Key.getEncoded()`, whose real interface method has no
         // code body. `SecretKeySpec` has registered accessors and preserves
         // the raw key bytes in field 0.
-        let key = alloc_concurrent_synthetic(ctx, "javax/crypto/spec/SecretKeySpec", 2);
+        let key = try_alloc_concurrent_synthetic(ctx, "javax/crypto/spec/SecretKeySpec", 2)?;
         let bytes = ctx.new_array(cratonvm_types::ArrayElementType::Byte, key_bytes.len());
         for (i, byte) in key_bytes.iter().enumerate() {
             ctx.set_array_element(bytes, i, Value::Int(*byte as i8 as i32));
@@ -2582,7 +2582,7 @@ pub(crate) fn engine_get_certificate(
 
     Ok(Some(Value::Object(Some(make_x509_mirror(
         ctx, &alias, &cert_der,
-    )))))
+    )?))))
 }
 
 pub(crate) fn engine_get_certificate_chain(
@@ -2611,12 +2611,20 @@ pub(crate) fn engine_get_certificate_chain(
 
     let cls_id = match ctx.ensure_class_initialized("java/security/cert/X509Certificate") {
         Ok(c) => c,
-        Err(_) => ctx.ensure_synthetic_class("java/security/cert/X509Certificate", 8),
+        // Fallible since 2026-08-10 (JDK-only wave 2, step 3): this is the
+        // element class of the returned `Certificate[]`, and a fabricated
+        // stand-in for a `java.security.cert` class is the compatibility
+        // substitution contract §5 refuses. On a complete image the `Ok` arm is
+        // what runs, so this changes nothing outside `--jdk-only` on a broken
+        // image.
+        Err(_) => {
+            crate::util_concurrent_ext::refused_class(ctx, "java/security/cert/X509Certificate", 8)?
+        }
     };
     let arr = ctx.new_ref_array(cls_id, chain.len());
     for (i, der) in chain.iter().enumerate() {
         let mirror = make_x509_mirror(ctx, &alias, der);
-        ctx.set_array_element(arr, i, Value::Object(Some(mirror)));
+        ctx.set_array_element(arr, i, Value::Object(Some(mirror?)));
     }
     Ok(Some(Value::Object(Some(arr))))
 }
@@ -2635,7 +2643,11 @@ pub(crate) fn engine_aliases(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
 
     let cls_id = match ctx.ensure_class_initialized("java/lang/String") {
         Ok(c) => c,
-        Err(_) => ctx.ensure_synthetic_class("java/lang/String", 8),
+        // Fallible since 2026-08-10 (JDK-only wave 2, step 3). `java.lang.String`
+        // is in every image, so the `Ok` arm is what runs; a run that reaches
+        // this one has no `java.base` at all and fabricating a `String` stand-in
+        // is not a recovery, it is a second failure wearing the first one's name.
+        Err(_) => crate::util_concurrent_ext::refused_class(ctx, "java/lang/String", 8)?,
     };
     let arr = ctx.new_ref_array(cls_id, aliases.len());
     for (i, a) in aliases.iter().enumerate() {
@@ -2643,10 +2655,32 @@ pub(crate) fn engine_aliases(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
         ctx.set_array_element(arr, i, Value::Object(Some(s)));
     }
 
-    let en = alloc_concurrent_synthetic(ctx, "java/util/IteratorEnumeration", 2);
-    ctx.set_field(en, 0, Value::Object(Some(arr)));
-    ctx.set_field(en, 1, Value::Int(0));
-    Ok(Some(Value::Object(Some(en))))
+    // Under `--jdk-only` this fabrication is refused; fall back to an
+    // enumeration the JDK builds itself (`Arrays$ArrayList` +
+    // `Collections.enumeration`), the same landing `Enumeration$Impl` uses.
+    // Without it the refusal surfaces as NoClassDefFoundError out of
+    // `KeyStore.aliases()` and takes the whole `security` section of
+    // `JdkOnlyPlatformProbe` with it. `Compatible` mode is unchanged: the
+    // fallback is only reachable from the refusal arm.
+    let arr_pin = ctx.pin_native_root(arr);
+    let en = match try_alloc_concurrent_synthetic(ctx, "java/util/IteratorEnumeration", 2) {
+        Ok(en) => {
+            let arr = ctx.read_native_pin(arr_pin, arr);
+            ctx.set_field(en, 0, Value::Object(Some(arr)));
+            ctx.set_field(en, 1, Value::Int(0));
+            Ok(en)
+        }
+        Err(refusal) => {
+            let arr = ctx.read_native_pin(arr_pin, arr);
+            match crate::classloader::real_snapshot_enumeration(ctx, arr) {
+                Ok(Some(en)) => Ok(en),
+                Ok(None) => Err(refusal),
+                Err(err) => Err(err),
+            }
+        }
+    };
+    ctx.unpin_native_roots(arr_pin);
+    Ok(Some(Value::Object(Some(en?))))
 }
 
 /// Public `KeyStore.aliases()` is intercepted by the early security shim in
@@ -2745,7 +2779,7 @@ fn engine_get_creation_date(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
 
     // java/util/Date has a single `fastTime` long field in real-JDK layout
     // (slot 0 in our synthetic mirror).
-    let date = alloc_concurrent_synthetic(ctx, "java/util/Date", 1);
+    let date = try_alloc_concurrent_synthetic(ctx, "java/util/Date", 1)?;
     ctx.set_field(date, 0, Value::Long(ms));
     Ok(Some(Value::Object(Some(date))))
 }
@@ -3603,7 +3637,7 @@ pub(crate) fn make_x509_mirror(
     ctx: &mut dyn NativeContext,
     alias: &str,
     cert_der: &[u8],
-) -> ObjectRef {
+) -> Result<ObjectRef, MethodCallFailed> {
     // Build the DER byte[] once — used either as the ctor arg for the real cert
     // or stashed in the synthetic-mirror fallback.
     let arr = ctx.new_array(ArrayElementType::Byte, cert_der.len());
@@ -3621,11 +3655,11 @@ pub(crate) fn make_x509_mirror(
         "([B)V",
         &[Value::Object(Some(arr))],
     ) {
-        return real;
+        return Ok(real);
     }
     // Fallback: synthetic mirror (subject/issuer = alias, DER in slot 3). Reached
     // only if the real DER parse fails (e.g. an unimplemented DerValue native).
-    let cert_obj = alloc_concurrent_synthetic(ctx, "java/security/cert/X509Certificate", 4);
+    let cert_obj = try_alloc_concurrent_synthetic(ctx, "java/security/cert/X509Certificate", 4)?;
     // `arr` and `cert_obj` are both live across `create_string` below, which
     // allocates and can therefore relocate either of them under a moving young
     // collection — pin both and re-read through the pins. Same Family-1 shape
@@ -3651,7 +3685,7 @@ pub(crate) fn make_x509_mirror(
     let arr = ctx.read_native_pin(arr_pin, arr);
     ctx.set_field(cert_obj, 3, Value::Object(Some(arr)));
     ctx.unpin_native_roots(arr_pin);
-    cert_obj
+    Ok(cert_obj)
 }
 
 /// Identity-keyed fallback for the store-id, used when the KeyStoreSpi object

@@ -1171,6 +1171,45 @@ impl Frame {
         )
     }
 
+    /// [`Self::take_pool_parts`] without consuming the frame — harvest the four
+    /// pooled `Vec`s out of a frame that is still sitting in its
+    /// [`FrameStack`] slot, leaving an empty husk the caller then drops in
+    /// place.
+    ///
+    /// # Why this exists
+    ///
+    /// `Frame` is a ~300-byte by-value struct, and the return path used to
+    /// move it three times: out of the buffer (`FrameStack::pop`), into
+    /// `recycle_frame_with_shared`, and again into `take_pool_parts`. `perf`
+    /// on the interpreted-invoke probe put `memcpy` under `Vec::pop<Frame>`
+    /// and `pop_and_recycle_frame_with_reason` at 6.97% of the invoke arm,
+    /// inside a frame-lifecycle group that was ~24.7% of it — see
+    /// `known-issues/tomcat/!webapp-deploy-annotation-scan-interpreted-226x.md`.
+    /// Nothing on that path needed the frame moved anywhere; it needed four
+    /// `Vec` headers out of it.
+    ///
+    /// Every buffer is swapped out by header (`std::mem::take`), so the
+    /// pointed-to allocations are untouched and the pool sees exactly what
+    /// `take_pool_parts` gave it. The husk left behind holds four empty
+    /// `Vec`s, and `FrameStack::truncate` runs its `Drop` where it lies.
+    ///
+    /// The `kinds` half of the operand stack is cleared here for the same
+    /// reason [`ValueStack::into_inner`] clears it: the pool's contract is
+    /// that the tag vector comes back **empty** (capacity retained), and
+    /// `from_pooled` clears-and-resizes it on reuse. Returning stale marks
+    /// would break the round-trip that `into_inner_preserves_capacity` pins.
+    pub fn take_pool_parts_in_place(&mut self) -> (Vec<u64>, Vec<u8>, Vec<u64>, Vec<u8>) {
+        let (stack_vals, stack_tags) = self.stack.take_inner_in_place();
+        let locals = std::mem::take(&mut self.locals);
+        let local_kinds = std::mem::take(&mut self.local_kinds);
+        (
+            compact_vec_to_u64(locals),
+            local_kinds,
+            stack_vals,
+            stack_tags,
+        )
+    }
+
     // ── Cold-path accessors (method metadata, exception table) ──────────
 
     /// Access the class name (cold path — error messages, stack traces).
@@ -2582,6 +2621,7 @@ mod tests {
             is_synchronized: false,
             is_static: true,
             force_native_cache: std::sync::OnceLock::new(),
+            intercept_shape_cache: std::sync::OnceLock::new(),
             native_callback_cache: std::sync::OnceLock::new(),
             invoc_key: std::sync::OnceLock::new(),
             jit_probe_generation: std::sync::atomic::AtomicU64::new(0),
@@ -2759,8 +2799,16 @@ mod tests {
         assert_eq!(frame.get_local(0).as_int(), Some(42));
         // Long via the context-aware compact accessor.
         assert_eq!(frame.get_local_compact(1).as_long(), Some(9999999999));
-        assert!((frame.get_local(2).as_float().unwrap() - 3.15).abs() < 1e-6);
-        assert!((frame.get_local(3).as_double().unwrap() - 2.719).abs() < 1e-9);
+        // Bit equality, like the int/long/object slots asserted beside them:
+        // a local read back is a round trip with no arithmetic on the path.
+        assert_eq!(
+            frame.get_local(2).as_float().unwrap().to_bits(),
+            3.15f32.to_bits()
+        );
+        assert_eq!(
+            frame.get_local(3).as_double().unwrap().to_bits(),
+            2.719f64.to_bits()
+        );
         assert!(frame.get_local(4).is_null());
         assert_eq!(frame.get_local(5), Value::Uninitialized);
         if let Value::ReturnAddress(a) = frame.get_local(6) {

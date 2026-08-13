@@ -263,6 +263,16 @@ pub const EMBEDDED_DEFAULT_COMPATIBILITY_MODE: CompatibilityMode = Compatibility
 /// call [`require_synthetic_jdk`]) before honouring a synthetic request.
 pub const SYNTHETIC_JDK_COMPILED_IN: bool = cfg!(feature = "synthetic-jdk");
 
+/// Whether this build actually contains the JDWP debug server.
+///
+/// Same shape as [`SYNTHETIC_JDK_COMPILED_IN`], and for the same reason: the
+/// server is started from a `#[cfg(feature = "experimental-debug")]` block in
+/// `vm/src/vm/vm_init.rs`, and that feature is not in `cratonvm-vm`'s default
+/// set nor enabled by `cratonvm-cli`. Without this constant `--jdwp-port` is
+/// accepted and does nothing in every shipped launcher binary, and the only
+/// symptom is a debugger that never connects.
+pub const JDWP_SERVER_COMPILED_IN: bool = cfg!(feature = "experimental-debug");
+
 /// obsaudit D12 (2026-07-26) — settings for `-XX:StartFlightRecording`.
 /// Parsed by `vm-cli/src/main.rs`, consumed by `Vm::new`
 /// (`vm/src/vm/vm_init.rs`) to start a real JFR recording at boot.
@@ -629,11 +639,28 @@ pub enum AotMode {
 ///                  `sun/`, `com/sun/`). This is HotSpot's default.
 ///   - **All**    — verify boot classes too. Useful for compliance testing.
 ///
-/// cratonvm currently runs Pass 2 (structural) on every class and Pass 3
-/// (typestate) on non-boot classes by default; selecting `All` is honoured
-/// by the verifier dispatcher in `vm/src/vm/vm_util.rs`. `None` is wired
-/// through `skip_verification` for backward compatibility with the existing
-/// `--noverify` CLI flag.
+/// cratonvm runs Pass 2 (structural) on every class and Pass 3 (typestate) on
+/// non-boot classes. `None` is wired through [`Self::skips_verification`] into
+/// `skip_verification`, which the verifier dispatcher in `vm/src/vm/vm_util.rs`
+/// reads.
+///
+/// `All` is propagated to `ClassManager::set_strict_verification` at VM init
+/// (`vm_init`, before any class is loaded) and withdraws three shortcuts:
+///
+/// * `bytecode_verifier::class_is_bootstrap_trusted` stops earning the lenient
+///   branch-target path, so the boot image is checked against the spec-literal
+///   JVMS §4.10.1 rule via `verify_bytecode_strict` — which is what that
+///   function was documented as being for, and now actually is;
+/// * `class_manager`'s `defer_loader_sensitive_pass3` stops withholding the
+///   Pass-3 type-state verdict for user-loader classes, i.e. for every
+///   Spring / Tomcat / H2 application class;
+/// * `vm_util::verifier_skip_eligible` stops skipping link-time Pass 2 for
+///   bootstrap classes.
+///
+/// This is genuinely stricter than the default and can reject class files
+/// HotSpot's own `-Xverify:all` also rejects, plus — until the verifier's
+/// remaining gaps close — some it does not. That is the point of the flag, and
+/// it is why `Remote` remains the default.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum XverifyMode {
     /// Equivalent to `-Xverify:none` / `-noverify`.
@@ -719,6 +746,28 @@ impl Default for VmConfig {
             system_properties: Vec::new(),
             skip_verification: false,
             xverify_mode: XverifyMode::Remote,
+            // ZGC is the default collector as of 2026-08-10. The evidence is
+            // the 651-class Tomcat suite under all three backends on one
+            // commit: ZGC 604 PASS / 29 HANG / 0 CRASH in 247 min against
+            // Generational's 519 / 115 / 1 in 356 min, and the 63 classes that
+            // are non-PASS under Generational while passing under BOTH other
+            // backends — 62 of which log `[moving-young] fallback`, against 9%
+            // of the classes that pass on that arm. See
+            // `docs/known-issues/tomcat/gc-backend-3way-fullsuite-comparison-20260810.md`.
+            //
+            // The known cost, accepted deliberately: ZGC does not compact, so
+            // it needs roughly 1.5x the heap on buffer-churning workloads
+            // (`ZipContentTests` OOMs at `-Xmx 2g` and passes from 3g, where
+            // the generational collector passes at 2g). `docs/gc-tuning.md`
+            // says so where operators will read it.
+            //
+            // `-XX:+UseGenerationalGC` is the escape hatch, available in every
+            // build — including `--no-default-features`, which takes the
+            // `cfg(not(...))` arm because the `Zgc` variant does not exist
+            // there.
+            #[cfg(feature = "zgc")]
+            gc_algorithm: GcAlgorithm::Zgc,
+            #[cfg(not(feature = "zgc"))]
             gc_algorithm: GcAlgorithm::Generational,
             g1_ihop_percent: None,
             g1_region_size: None,
@@ -1078,21 +1127,33 @@ impl VmConfig {
     /// Parse an `--add-exports` or `--add-opens` value:
     /// `"module/package=target_module"`.
     ///
-    /// `target_module` may be `ALL-UNNAMED` (the JDK convention), which we
-    /// store as an empty string (our unnamed-module sentinel).
-    /// Multiple targets can be comma-separated.
+    /// `target_module` may be `ALL-UNNAMED` (the JDK convention). It is passed
+    /// through **verbatim**, not folded into the empty string: the empty string
+    /// is `ModuleRegistry`'s *unqualified* marker — open to every module in the
+    /// process — and `ALL-UNNAMED` opens to the unnamed module only.
+    /// `ModuleRegistry::add_opens` resolves the token
+    /// (`classloading::module::ALL_UNNAMED_TARGET`).
+    ///
+    /// Folding it here was a real over-grant, measured 2026-08-09 by
+    /// `probes/AddOpensFlagProbe.java` against Temurin 25: under
+    /// `--add-opens=java.base/java.net=ALL-UNNAMED`, HotSpot answers
+    /// `Module.isOpen("java.net")` **false** and CratonVM answered **true**,
+    /// and any *named* module got the deep-reflection grant along with the
+    /// unnamed one. Same conflation the `Module.addOpens(String, Module)`
+    /// native already had to fix with its own sentinel — see
+    /// `native-builtins/.../reflect_invoke.rs`'s `UNRESOLVED_TARGET_MODULE`.
+    ///
+    /// Note this is deliberately NOT symmetric with `parse_add_reads`, which
+    /// does map `ALL-UNNAMED` to the empty string: a *read* edge names a source
+    /// module rather than a target set, and `""` is the unnamed module's own
+    /// name there, not a wildcard.
     pub fn parse_add_exports(s: &str) -> Option<(String, String, String)> {
         let (left, target) = s.split_once('=')?;
         let (module, pkg) = left.split_once('/')?;
-        let target = if target.trim() == "ALL-UNNAMED" {
-            String::new()
-        } else {
-            target.trim().to_string()
-        };
         Some((
             module.trim().to_string(),
             pkg.trim().replace('.', "/"),
-            target,
+            target.trim().to_string(),
         ))
     }
 }
@@ -1717,7 +1778,14 @@ mod tests {
         assert!(config.boot_classpath.is_empty());
         assert!(config.ext_classpath.is_empty());
         assert!(config.java_home.is_none());
-        // Generational is the default and the safety net during G1 maturation.
+        // ZGC is the default collector as of 2026-08-10 (see `VmConfig::default`
+        // for the measurement behind the flip). A `--no-default-features` build
+        // has no `Zgc` variant at all and falls back to `Generational`, so this
+        // assertion is cfg'd the same way the field is — otherwise it would be
+        // asserting on a value that cannot exist in that configuration.
+        #[cfg(feature = "zgc")]
+        assert_eq!(config.gc_algorithm, GcAlgorithm::Zgc);
+        #[cfg(not(feature = "zgc"))]
         assert_eq!(config.gc_algorithm, GcAlgorithm::Generational);
     }
 
@@ -2196,13 +2264,17 @@ mod tests {
 
     #[test]
     fn parse_add_exports_all_unnamed() {
+        // `ALL-UNNAMED` survives parsing verbatim. Collapsing it to `""` here
+        // is what made `--add-opens ...=ALL-UNNAMED` an unqualified open, so
+        // this assertion is the guard on the over-grant, not a formatting
+        // preference: `""` is `ModuleRegistry`'s open-to-everyone marker.
         let result = VmConfig::parse_add_exports("java.base/java.lang=ALL-UNNAMED");
         assert_eq!(
             result,
             Some((
                 "java.base".to_string(),
                 "java/lang".to_string(),
-                String::new()
+                "ALL-UNNAMED".to_string()
             ))
         );
     }

@@ -206,6 +206,21 @@ pub fn unload_dead_class_metadata(
         });
 
     cratonvm_native_builtins::classloader::forget_unloaded_classes(shared.vm_identity, &raw_ids);
+    // The generated-`$ProxyN` cache holds `ClassId`s on BOTH sides of its
+    // rows and nothing else invalidates it, so its rows outlive the classes
+    // they name. A `$ProxyN` unloaded with its loader was handed straight back
+    // out of that cache on the next `Proxy.newProxyInstance` with the same
+    // (loader-namespace, interfaces) key, and the instance was allocated
+    // against a `ClassId` this function had already removed from the class
+    // store — after which its class resolves to nothing and the cast at the
+    // call site fails with `ClassCastException: ? cannot be cast to …`.
+    //
+    // Deliberately here on the ONLY path that actually removed classes, not
+    // inside `forget_unloaded_classes`: the two early exits above call that
+    // helper with the *hints* on paths where nothing was unloaded, and
+    // purging valid rows there would just churn a fresh `$ProxyN` per
+    // collection for classes that are still perfectly alive.
+    cratonvm_native_builtins::forget_unloaded_proxy_classes(shared.vm_identity, &raw_ids);
     shared
         .debug
         .diagnostic_counters
@@ -236,7 +251,11 @@ pub fn unload_dead_class_metadata(
 /// be cleared. Safe to call unconditionally (including with
 /// `CRATONVM_LOADER_UNLOAD=0`): every entry is still rooted in that mode, so
 /// `is_marked` is always true and nothing is pruned.
-pub fn reconcile_class_mirrors(shared: &crate::vm::SharedVm, is_marked: &dyn Fn(usize) -> bool) {
+pub fn reconcile_class_mirrors(
+    shared: &crate::vm::SharedVm,
+    is_marked: &dyn Fn(usize) -> bool,
+    cycle_roots: Option<&[ObjectRef]>,
+) {
     let dbg = cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_MIRRORPIN").is_some();
     let mut mirrors = shared.classes.class_mirrors.write();
     if dbg {
@@ -254,6 +273,194 @@ pub fn reconcile_class_mirrors(shared: &crate::vm::SharedVm, is_marked: &dyn Fn(
                 addr,
                 is_marked(addr)
             );
+        }
+        // TEMP-DIAG: for a still-marked JSP mirror, name the chain that is
+        // keeping it alive. "Still marked" alone cannot distinguish a direct
+        // root from a live heap edge, and this test has been closed three times
+        // on the direct-root half of that fork.
+        if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_MIRRORPIN_WHY").is_some() {
+            for (&class_id, obj_ref) in mirrors.iter() {
+                let name = cm
+                    .get_class(class_id)
+                    .map(|c| c.name.to_string())
+                    .unwrap_or_default();
+                if !name.starts_with("org/apache/jsp/") {
+                    continue;
+                }
+                let addr = obj_ref.as_ptr() as usize;
+                // WHICH ARM of the survivor verdict says "live"? Every rooting
+                // lever is inert and the object has no referrer, no instance
+                // and no root, so the live possibility is that the mirror is
+                // genuinely dead and the VERDICT is wrong.
+                let (old_alloc, young_surv, region) = shared.mem.heap.liveness_arms(addr);
+                eprintln!(
+                    "[MIRRORWHY] {name} mirror={addr:#x} is_marked={} region={region} \
+                     old_gen_allocated={old_alloc} young_survivor={young_surv}",
+                    is_marked(addr)
+                );
+                if let Some(loader) = cratonvm_native_builtins::classloader::defining_loader_for(
+                    shared.vm_identity,
+                    class_id.as_u32(),
+                ) {
+                    let la = loader.as_ptr() as usize;
+                    let (lo, ly, lr) = shared.mem.heap.liveness_arms(la);
+                    eprintln!(
+                        "[MIRRORWHY] {name} loader={la:#x} is_marked={} region={lr} \
+                         old_gen_allocated={lo} young_survivor={ly}",
+                        is_marked(la)
+                    );
+                }
+                if !is_marked(addr) {
+                    continue;
+                }
+                // `root_held_paths` stops a branch only at a zero-referrer
+                // node — a genuine GC root and a side-table-propagated
+                // object (mirror_pin/loader_pin/metadata_pin/an overlay
+                // owner edge) both have zero heap referrers and land in the
+                // exact same bucket, so a "no heap referrer, root=<not-a-
+                // direct-root>" line can never tell them apart: it is what
+                // BOTH a legitimately-live control loader and a wrongly-
+                // retained one print. `cycle_roots` is this collection's
+                // OWN root vector (the one actually handed to the marker,
+                // threaded down from the `collect_roots` call site that
+                // started this cycle) -- checking membership in it directly
+                // is the one predicate that can actually say which of the
+                // two this is.
+                let real_root_addrs: std::collections::HashSet<usize> = cycle_roots
+                    .map(|roots| roots.iter().map(|r| r.as_ptr() as usize).collect())
+                    .unwrap_or_default();
+                let is_real_root = |a: usize| real_root_addrs.contains(&a);
+                let render = |paths: &Vec<Vec<(usize, u32)>>, tag: &str| {
+                    eprintln!("[MIRRORWHY] {name} {tag} root_held_paths={}", paths.len());
+                    for path in paths.iter().take(8) {
+                        let rendered: Vec<String> = path
+                            .iter()
+                            .map(|&(a, cid)| {
+                                let n = cm
+                                    .get_class(cratonvm_types::ClassId::new(cid))
+                                    .map(|c| c.name.to_string())
+                                    .unwrap_or_else(|| format!("cid{cid}"));
+                                format!("{n}@{a:#x}")
+                            })
+                            .collect();
+                        // Name the ROOT SOURCE that put the head of this path
+                        // in the root set (`CRATONVM_DBG_ROOT_SOURCE=1`).
+                        // Without it the path says what holds the object and
+                        // stops exactly where the answer is: a head with no
+                        // parent is a root, and "which root" is the whole
+                        // question. `<not-a-direct-root>` used to be printed
+                        // for BOTH a genuine root this table doesn't name (a
+                        // thread frame, a static field, a class mirror/lock)
+                        // AND a side-table-propagated object with no heap
+                        // referrer at all — `verified_root` below (this
+                        // cycle's actual root vector, not an inference) is
+                        // what tells those apart.
+                        let head_addr = path.first().map(|&(a, _)| a);
+                        let verified_root = head_addr.is_some_and(is_real_root);
+                        let src = head_addr
+                            .and_then(crate::memory::native_roots::root_source_of)
+                            .unwrap_or(if verified_root {
+                                "<root-not-named-by-VM_ROOT_SOURCES>"
+                            } else {
+                                "<NOT-A-ROOT-no-heap-referrer>"
+                            });
+                        eprintln!(
+                            "[MIRRORWHY]   [root={src} verified_root={verified_root}] {}",
+                            rendered.join(" -> ")
+                        );
+                    }
+                };
+                render(
+                    &shared.mem.heap.retention_paths(addr, &is_real_root, 200_000, 8),
+                    &format!("mirror={addr:#x}"),
+                );
+                // The mirror has no heap referrer; it is marked because
+                // `mirror_pin` propagates from its LOADER. So the real
+                // question is what keeps the LOADER alive.
+                if let Some(loader) = cratonvm_native_builtins::classloader::defining_loader_for(
+                    shared.vm_identity,
+                    class_id.as_u32(),
+                ) {
+                    let laddr = loader.as_ptr() as usize;
+                    eprintln!(
+                        "[MIRRORWHY] {name} loader={laddr:#x} loader_marked={}",
+                        is_marked(laddr)
+                    );
+                    render(
+                        &shared.mem.heap.retention_paths(laddr, &is_real_root, 200_000, 8),
+                        &format!("loader={laddr:#x}"),
+                    );
+                } else {
+                    eprintln!("[MIRRORWHY] {name} loader=NONE (defining_loader_for pruned)");
+                }
+                // The mirror/loader having no heap referrer is EXPECTED and
+                // says nothing: instance->class is the header's class_id, not
+                // a ref slot, and instance->loader is `loader_pin`, a side
+                // table. Both are invisible to a ref-slot walk. What actually
+                // pins the loader is a live INSTANCE of one of its classes, so
+                // enumerate those and say who holds them.
+                let mut live_instances: Vec<(usize, u32)> = Vec::new();
+                for (obj_ptr, _size) in shared.mem.heap.walk_objects() {
+                    // SAFETY: walk_objects yields live object starts.
+                    let cid = unsafe { &*(obj_ptr as *const cratonvm_gc::ObjectHeader) }
+                        .class_id
+                        .as_u32();
+                    if cratonvm_types::loader_pin::loader_pin_addr(cid)
+                        == cratonvm_native_builtins::classloader::defining_loader_for(
+                            shared.vm_identity,
+                            class_id.as_u32(),
+                        )
+                        .map(|l| l.as_ptr() as usize)
+                    {
+                        live_instances.push((obj_ptr as usize, cid));
+                    }
+                }
+                eprintln!(
+                    "[MIRRORWHY] {name} live_instances_of_this_loader={}",
+                    live_instances.len()
+                );
+                // Zero live instances does not mean "nothing propagates to
+                // it": the owner-based collection-overlay edge (fixed this
+                // session, `external_roots_for_owner`) is invisible to both
+                // `retention_paths`'s heap-field-only reverse walk AND to
+                // the live-instance enumeration above, because it is a
+                // native side-table edge, not a Java object field. Ask
+                // directly whether the mirror/loader address is currently
+                // an ELEMENT of any overlay-backed collection at all — the
+                // unconditional scan sees every element regardless of which
+                // owner (if any) is still alive, so a hit here says "some
+                // overlay holds this," not yet "and that owner is live,"
+                // but it is the one thing neither check above can rule out.
+                let mut all_overlay_elems: Vec<crate::types::ObjectRef> = Vec::new();
+                cratonvm_gc::external_roots::scan_external_roots(&mut all_overlay_elems);
+                let mirror_in_overlay = all_overlay_elems.iter().any(|r| r.as_ptr() as usize == addr);
+                eprintln!(
+                    "[MIRRORWHY] {name} mirror_is_overlay_element={mirror_in_overlay} \
+                     total_overlay_elements={}",
+                    all_overlay_elems.len()
+                );
+                if let Some(loader) = cratonvm_native_builtins::classloader::defining_loader_for(
+                    shared.vm_identity,
+                    class_id.as_u32(),
+                ) {
+                    let laddr = loader.as_ptr() as usize;
+                    let loader_in_overlay =
+                        all_overlay_elems.iter().any(|r| r.as_ptr() as usize == laddr);
+                    eprintln!(
+                        "[MIRRORWHY] {name} loader_is_overlay_element={loader_in_overlay}"
+                    );
+                }
+                for &(iaddr, icid) in live_instances.iter().take(4) {
+                    let iname = cm
+                        .get_class(cratonvm_types::ClassId::new(icid))
+                        .map(|c| c.name.to_string())
+                        .unwrap_or_else(|| format!("cid{icid}"));
+                    render(
+                        &shared.mem.heap.retention_paths(iaddr, &is_real_root, 200_000, 4),
+                        &format!("instance {iname}@{iaddr:#x}"),
+                    );
+                }
+            }
         }
     }
     mirrors.retain(|_class_id, obj_ref| is_marked(obj_ref.as_ptr() as usize));
@@ -286,7 +493,7 @@ pub fn rebuild_mirror_pins(shared: &crate::vm::SharedVm, pointer_map: &cratonvm_
         }
     }
     drop(class_mirrors);
-    cratonvm_types::mirror_pin::replace_mirror_pins(&entries);
+    cratonvm_types::mirror_pin::replace_mirror_pins(shared.vm_identity, &entries);
 }
 
 /// Update all root locations in the VM state after a GC collection.
@@ -395,7 +602,7 @@ pub(crate) fn remap_handle_slots(
 /// spent its life as a `Cell<Option<ObjectRef>>` inside the `JIT_SIGNALS`
 /// `thread_local!` in `jit/helpers.rs`, where neither half could reach it — TLS
 /// belongs to the mutator, and every `VM_ROOT_SOURCES` callback runs on the
-/// collector. See `docs/jit-signals-root-gap.md`.
+/// collector. See `fixed-bugs/jit-signals-root-gap.md`.
 pub(crate) fn remap_thread_object_slots(
     thread: &mut crate::threading::jvm_thread::JvmThread,
     pointer_map: &cratonvm_types::PointerMap,

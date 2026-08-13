@@ -561,7 +561,7 @@ impl Compiler {
     /// checks retained are the per-object compact flag (synthetic allocations
     /// can still use legacy cells) and old-generation bit (allocation spill).
     ///
-    /// G1-2 (`docs/gc/g1-audit.md` §8.1): "a young compact receiver needs no
+    /// G1-2 (`audits/g1-audit.md` §8.1): "a young compact receiver needs no
     /// barrier" is a GENERATIONAL claim. This emitter used to state it with no
     /// receiver guard whatsoever — not even the null test its two sibling
     /// emitters have — so on a backend that publishes no region bounds it wrote

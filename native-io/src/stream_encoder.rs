@@ -80,7 +80,7 @@
 
 use cratonvm_native_api::charset as engine;
 use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
-use cratonvm_types::error::MethodCallResult;
+use cratonvm_types::error::{MethodCallFailed, MethodCallResult};
 use cratonvm_types::{ArrayElementType, ClassId, ObjectRef, Value};
 
 /// Per-encoder pending-bytes buffer plus the canonical charset name,
@@ -289,7 +289,7 @@ pub(crate) fn alloc_stream_encoder(
     ctx: &mut dyn NativeContext,
     os: ObjectRef,
     charset_name: &str,
-) -> ObjectRef {
+) -> Result<ObjectRef, MethodCallFailed> {
     // GC-safety: `os` is a Rust local the caller extracted from its own args
     // slice before calling in, and `ensure_class_initialized` below runs
     // `<clinit>` bytecode — arbitrary, allocating — before `os` is finally
@@ -305,11 +305,15 @@ pub(crate) fn alloc_stream_encoder(
         // falling back to it here would mint an encoder object with no
         // usable "out"/"closed" fields and no real `write`/`flush` methods,
         // the write-side sibling of the readLine `NoSuchMethodError:
-        // java/lang/Object.read([CII)I` bug. `ensure_synthetic_class` retries
+        // java/lang/Object.read([CII)I` bug. The synthetic fallback retries
         // loading the real class first (this always succeeds for a real JDK
         // bootstrap class like this one) and only degrades to a stub with
         // the requested field count as a last resort.
-        Err(_) => ctx.ensure_synthetic_class("sun/nio/cs/StreamEncoder", 12),
+        //
+        // Fallible since 2026-08-10 (JDK-only wave 2, step 3); see the
+        // matching note in `stream_decoder.rs` for why the race this arm
+        // exists for is unaffected.
+        Err(_) => crate::refused_class(ctx, "sun/nio/cs/StreamEncoder", 12)?,
     };
     // `alloc_object` clamps the slot count up to the resolved real class's
     // total declared instance-field count, so `0` here is fine — the object
@@ -333,7 +337,7 @@ pub(crate) fn alloc_stream_encoder(
     );
     // No pending high surrogate yet (real-field carry, cleared explicitly).
     clear_pending(ctx, obj);
-    obj
+    Ok(obj)
 }
 
 /// `forOutputStreamWriter(OutputStream, Object, String) -> StreamEncoder`.
@@ -356,7 +360,7 @@ fn native_se_for_osw_name(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         }
         None => "UTF-8".to_string(),
     };
-    let se = alloc_stream_encoder(ctx, os, &name);
+    let se = alloc_stream_encoder(ctx, os, &name)?;
     Ok(Some(Value::Object(Some(se))))
 }
 
@@ -368,7 +372,7 @@ fn native_se_for_osw_charset(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
     };
     let charset = obj_arg(args, 2);
     let name = resolve_name(ctx, charset);
-    let se = alloc_stream_encoder(ctx, os, &name);
+    let se = alloc_stream_encoder(ctx, os, &name)?;
     Ok(Some(Value::Object(Some(se))))
 }
 
@@ -396,7 +400,7 @@ fn native_se_for_osw_encoder(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
         },
         None => "UTF-8".to_string(),
     };
-    let se = alloc_stream_encoder(ctx, os, &name);
+    let se = alloc_stream_encoder(ctx, os, &name)?;
     if let Some(e) = enc {
         // Real `encoder` field (distinct from the synthetic SE_OUTPUT/SE_NAME/
         // SE_CLOSED scratch slots): write_bytes reads its error actions.
@@ -769,9 +773,14 @@ fn native_se_flush(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
     // the underlying stream, or `flush()` would be a no-op from the caller's
     // point of view (real `StreamEncoder.implFlush` does the same:
     // `implFlushBuffer()` then `out.flush()`).
+    // …and `implFlush` propagates that `out.flush()` — it is a two-line body
+    // under `throws IOException` with no `catch`. Dropping the failure here
+    // was the worst possible place for it: the caller flushed precisely to
+    // learn whether the encoded bytes reached the sink.
+    // W7-57-close-flush-swallow-sweep.md
     flush_pending_buffer(ctx, this)?;
     if let Value::Object(Some(os)) = ctx.get_field_by_name(this, "out") {
-        let _ = ctx.invoke_virtual(os, "flush", "()V", &[]);
+        ctx.invoke_virtual(os, "flush", "()V", &[])?;
     }
     Ok(None)
 }
@@ -796,14 +805,32 @@ fn native_se_close(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
     // the last partial batch (< buffer capacity) would be silently dropped
     // on close, matching real `StreamEncoder.implClose`'s final
     // `implFlushBuffer()` before closing `out`.
+    //
+    // Both delegations PROPAGATE. `StreamEncoder.implClose()` is
+    // `try (out) { …; out.flush(); } catch (IOException x) { encoder.reset();
+    // throw x; }` — the `catch` rethrows, and the `try`-with-resources runs
+    // `out.close()` on both paths, suppressing its own failure into the body's
+    // when there was one. `close()` wraps that in `try { implClose(); }
+    // finally { closed = true; }`, so the closed marker is set either way.
+    // Dropping the failures here reported a truncated file as a clean close.
+    // W7-57-close-flush-swallow-sweep.md
+    //
+    // (The `addSuppressed` link between the two is not reproduced; recorded as
+    // a residual in that record.)
     flush_pending_buffer(ctx, this)?;
-    if let Value::Object(Some(os)) = ctx.get_field_by_name(this, "out") {
-        let _ = ctx.invoke_virtual(os, "flush", "()V", &[]);
-        let _ = ctx.invoke_virtual(os, "close", "()V", &[]);
-    }
+    let (flushed, closed) = if let Value::Object(Some(os)) = ctx.get_field_by_name(this, "out") {
+        let flushed = ctx.invoke_virtual(os, "flush", "()V", &[]).map(|_| ());
+        // Attempted regardless, exactly as the `try`-with-resources does.
+        let closed = ctx.invoke_virtual(os, "close", "()V", &[]).map(|_| ());
+        (flushed, closed)
+    } else {
+        (Ok(()), Ok(()))
+    };
     ctx.set_field_by_name(this, "closed", Value::Int(1));
     ctx.set_field_by_name(this, "out", Value::Object(None));
     se_table().lock().unwrap().remove(&se_key(ctx, this));
+    flushed?;
+    closed?;
     Ok(None)
 }
 

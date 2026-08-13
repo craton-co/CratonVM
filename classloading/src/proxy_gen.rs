@@ -198,6 +198,29 @@ pub struct ProxyMethod {
     /// the descriptor's parameter slot count (long/double = 1 here, NOT
     /// raw JVM slot count).
     pub param_class_names: Vec<String>,
+    /// Internal name of the DECLARED interface (an entry of
+    /// [`ProxyClassSpec::interfaces`]) through which this method is reachable.
+    /// `iface_owner` may be a *super*-interface of it, or `java/lang/Object`.
+    ///
+    /// This exists so `<clinit>` can obtain the owner `Class` mirror from the
+    /// generated class's OWN `getInterfaces()` instead of from a constant-pool
+    /// `LDC class <iface_owner>`. Constant-pool class resolution is by NAME
+    /// through the flat global store, so when two class loaders each hold a
+    /// copy of the interface, `<clinit>` could bind the other world's copy —
+    /// and `Method.equals` compares declaring classes by IDENTITY, so every
+    /// `Map<Method, …>` lookup the caller makes against its own
+    /// `getMethods()` then misses. Byte Buddy's `JavaDispatcher` is exactly
+    /// such a map; the miss surfaced as
+    /// `IllegalStateException: No proxy target found for …Executable.isInstance(Object)`
+    /// and took Mockito's inline mock maker down with it whenever a second
+    /// loader world (Spring Boot's `ModifiedClassPathClassLoader`) had already
+    /// loaded Byte Buddy. `getInterfaces()` is loader-faithful by construction:
+    /// the generated class is defined with `force_loader_faithful_linking`.
+    ///
+    /// `None` (or a name absent from the emitted `interfaces[]`) falls back to
+    /// the constant-pool form — correct whenever only one copy exists, and the
+    /// only option for `java/lang/Object` methods.
+    pub iface_root: Option<String>,
     /// Internal names of declared exception types (for UndeclaredThrowable
     /// checking in the dispatch helper). Empty if none. Populated by
     /// `native_builtins::build_proxy_spec_for` from
@@ -398,6 +421,8 @@ pub fn emit_proxy_classfile(spec: &ProxyClassSpec) -> Result<Vec<u8>, ClassFileE
         &mut cp,
         code_attr_name_idx,
         &m_field_refs,
+        &spec.gen_class_name,
+        &interfaces,
     )?);
 
     // 3) One body per declared method.
@@ -895,6 +920,7 @@ mod op {
     pub const POP: u8 = 0x57;
     pub const ANEWARRAY: u8 = 0xBD;
     pub const AASTORE: u8 = 0x53;
+    pub const AALOAD: u8 = 0x32;
     pub const CHECKCAST: u8 = 0xC0;
     pub const INVOKESTATIC: u8 = 0xB8;
     pub const INVOKESPECIAL: u8 = 0xB7;
@@ -1020,6 +1046,10 @@ impl CodeBuilder {
 
     pub fn emit_aastore(&mut self) {
         self.bytes.push(op::AASTORE);
+    }
+
+    pub fn emit_aaload(&mut self) {
+        self.bytes.push(op::AALOAD);
     }
 
     pub fn emit_aconst_null(&mut self) {
@@ -1359,11 +1389,32 @@ fn emit_proxy_method(
 }
 
 /// Emit `<clinit>()V` populating each `m_<i>` static slot via
-/// `Class.forName(iface).getMethod(name, paramTypes)`.
+/// `<owner Class>.getMethod(name, paramTypes)`.
+///
+/// The owner `Class` comes from the generated class's own `getInterfaces()`
+/// whenever [`ProxyMethod::iface_root`] names one of the emitted interfaces:
+///
+/// ```text
+/// LDC class "<gen_class_name>"                      ; this proxy class
+/// INVOKEVIRTUAL Class.getInterfaces()               ; [Ljava/lang/Class;
+/// ICONST_<k> ; AALOAD                               ; the exact interface
+/// ```
+///
+/// `getMethod` searches super-interfaces, so a method declared on a
+/// super-interface is still found through its declared root and comes back
+/// with that world's declaring class. A constant-pool `LDC class
+/// <iface_owner>` cannot do this: CP class resolution is by NAME through the
+/// flat global store, so with two loader worlds holding the same interface it
+/// can bind the wrong copy. `Method.equals` compares declaring classes by
+/// IDENTITY, so the caller's own `Map<Method, …>` — Byte Buddy's
+/// `JavaDispatcher` is one — then misses on every lookup.
+///
+/// Falls back to the constant-pool form for `java/lang/Object` methods and for
+/// any root not present in `interfaces`.
 ///
 /// Per-method shape (JVMS §5.5 class initialization):
 /// ```text
-/// LDC class "<iface_owner>"                         ; Ljava/lang/Class;
+/// <owner Class push, see above>                     ; Ljava/lang/Class;
 /// LDC "<method.name>"                               ; Ljava/lang/String;
 /// ICONST_<paramCount> ; ANEWARRAY java/lang/Class   ; param Class[]
 /// (per param j with class_name P_j:
@@ -1388,6 +1439,8 @@ fn emit_clinit(
     cp: &mut CpBuilder,
     code_attr_name_idx: u16,
     m_field_refs: &[u16],
+    gen_class_name: &str,
+    interfaces: &[&str],
 ) -> Result<Vec<u8>, ClassFileError> {
     // Up-front constants used across every method.
     let class_class_idx = cp.add_class("java/lang/Class");
@@ -1396,14 +1449,35 @@ fn emit_clinit(
         "getMethod",
         "(Ljava/lang/String;[Ljava/lang/Class;)Ljava/lang/reflect/Method;",
     );
+    let self_class_idx = cp.add_class(gen_class_name);
+    let get_interfaces_ref =
+        cp.add_methodref("java/lang/Class", "getInterfaces", "()[Ljava/lang/Class;");
 
     let mut code = CodeBuilder::new();
     let mut max_stack: u16 = 0;
 
     for (i, m) in methods.iter().enumerate() {
-        // 1) Push iface Class mirror via LDC class.
-        let iface_class_idx = cp.add_class(&m.iface_owner);
-        code.emit_ldc_w(iface_class_idx);
+        // 1) Push the owner Class mirror. Prefer this class's own
+        //    `getInterfaces()` entry (loader-faithful) over an `LDC class`
+        //    of the owner's NAME (loader-blind) — see this function's doc.
+        let root_index = m.iface_root.as_deref().and_then(|root| {
+            interfaces
+                .iter()
+                .position(|declared| *declared == root)
+                .filter(|_| m.iface_owner != "java/lang/Object")
+        });
+        match root_index {
+            Some(k) => {
+                code.emit_ldc_w(self_class_idx);
+                code.emit_invokevirtual(get_interfaces_ref);
+                code.emit_iconst(checked_iconst_usize(k, "proxy <clinit> interface index")?);
+                code.emit_aaload();
+            }
+            None => {
+                let iface_class_idx = cp.add_class(&m.iface_owner);
+                code.emit_ldc_w(iface_class_idx);
+            }
+        }
         // 2) Push method name as String.
         let name_str_idx = cp.add_string(&m.name);
         code.emit_ldc_w(name_str_idx);
@@ -1666,6 +1740,7 @@ mod tests {
                 iface_owner: "java/util/function/Supplier".to_string(),
                 param_class_names: vec![],
                 exception_types: vec![],
+                iface_root: None,
             }],
         }
     }
@@ -1804,6 +1879,7 @@ mod tests {
                 iface_owner: "java/lang/Runnable".to_string(),
                 param_class_names: vec![],
                 exception_types: vec![],
+                iface_root: None,
             }],
         };
         let bytes = emit_proxy_classfile(&spec).expect("emitter must succeed");
@@ -1915,6 +1991,7 @@ mod tests {
                     iface_owner: "java/lang/Runnable".to_string(),
                     param_class_names: vec![],
                     exception_types: vec![],
+                    iface_root: None,
                 },
                 ProxyMethod {
                     name: "call".to_string(),
@@ -1923,6 +2000,7 @@ mod tests {
                     iface_owner: "java/util/concurrent/Callable".to_string(),
                     param_class_names: vec![],
                     exception_types: vec!["java/lang/Exception".to_string()],
+                    iface_root: None,
                 },
             ],
         };
@@ -2036,6 +2114,7 @@ mod tests {
                 iface_owner: "x/ManyArgs".to_string(),
                 param_class_names: vec!["java/lang/Integer".to_string(); param_count],
                 exception_types: vec![],
+                iface_root: None,
             }],
         };
         let err = emit_proxy_classfile(&spec).expect_err("local slot overflow must be rejected");
@@ -2060,6 +2139,7 @@ mod tests {
                 iface_owner: "x/Y".to_string(),
                 param_class_names: vec!["java/lang/Integer".to_string()],
                 exception_types: vec![],
+                iface_root: None,
             }],
         };
         let bytes = emit_proxy_classfile(&spec).expect("emitter must succeed");
@@ -2087,6 +2167,7 @@ mod tests {
                 iface_owner: "java/lang/Runnable".to_string(),
                 param_class_names: vec![],
                 exception_types: vec![],
+                iface_root: None,
             }],
         };
         let bytes = emit_proxy_classfile(&spec).expect("emitter must succeed");
@@ -2133,6 +2214,133 @@ mod tests {
         );
     }
 
+    /// `<clinit>` must take the owner `Class` off the generated class's own
+    /// `getInterfaces()` — NOT off a constant-pool `LDC class <owner name>`.
+    ///
+    /// CP class resolution is by NAME through the flat global store, so with
+    /// two loader worlds holding the same interface it can bind the other
+    /// world's copy. `Method.equals` compares declaring classes by IDENTITY,
+    /// so the caller's own `Map<Method, …>` built from `getMethods()` then
+    /// misses every lookup — Byte Buddy's `JavaDispatcher` throwing
+    /// `No proxy target found for …Executable.isInstance(Object)`, which took
+    /// Mockito's inline mock maker down in
+    /// `HikariDataSourceConfigurationTests`.
+    ///
+    /// Also pins the fallback: a method whose owner is `java/lang/Object` has
+    /// no declared-interface root and keeps the `LDC class` form.
+    #[test]
+    fn clinit_resolves_owner_through_get_interfaces_not_by_name() {
+        use cratonvm_reader::attribute::Attribute;
+
+        let spec = ProxyClassSpec {
+            gen_class_name: "pkg/$ProxyRoot".to_string(),
+            super_class: "java/lang/reflect/Proxy$Instance".to_string(),
+            interfaces: vec!["pkg/A".to_string(), "pkg/B".to_string()],
+            methods: vec![
+                // Declared directly on the second interface.
+                ProxyMethod {
+                    name: "b".to_string(),
+                    descriptor: "()V".to_string(),
+                    is_default: false,
+                    iface_owner: "pkg/B".to_string(),
+                    param_class_names: vec![],
+                    exception_types: vec![],
+                    iface_root: Some("pkg/B".to_string()),
+                },
+                // Inherited from a SUPER-interface of the first — the root is
+                // still a declared interface, and `getMethod` searches
+                // super-interfaces, so index 0 is the right lookup receiver.
+                ProxyMethod {
+                    name: "inherited".to_string(),
+                    descriptor: "()V".to_string(),
+                    is_default: false,
+                    iface_owner: "pkg/SuperOfA".to_string(),
+                    param_class_names: vec![],
+                    exception_types: vec![],
+                    iface_root: Some("pkg/A".to_string()),
+                },
+                // Object method — no interface root, keeps `LDC class`.
+                ProxyMethod {
+                    name: "hashCode".to_string(),
+                    descriptor: "()I".to_string(),
+                    is_default: false,
+                    iface_owner: "java/lang/Object".to_string(),
+                    param_class_names: vec![],
+                    exception_types: vec![],
+                    iface_root: None,
+                },
+            ],
+        };
+
+        let bytes = emit_proxy_classfile(&spec).expect("emitter must succeed");
+        let mut cf = read_class(&bytes).expect("emitted class file must round-trip");
+        let cp = &cf.constant_pool;
+        for m in &mut cf.methods {
+            for attr in &mut m.attributes {
+                attr.decode(cp).expect("method attribute must decode");
+            }
+        }
+        let clinit = cf
+            .methods
+            .iter()
+            .find(|m| &*m.name == "<clinit>")
+            .expect("emitter must produce <clinit>");
+        let code = clinit
+            .attributes
+            .iter()
+            .find_map(|a| match a.as_decoded() {
+                Some(Attribute::Code(c)) => Some(c),
+                _ => None,
+            })
+            .expect("<clinit> must have a Code attribute");
+
+        // Two interface-rooted methods => two `getInterfaces()` call sites,
+        // and neither `pkg/B` nor `pkg/SuperOfA` may be reached by name.
+        let get_interfaces_calls = code
+            .code
+            .iter()
+            .filter(|b| **b == op::INVOKEVIRTUAL)
+            .count();
+        assert!(
+            get_interfaces_calls >= 2,
+            "expected a getInterfaces() call per interface-rooted method, \
+             found {get_interfaces_calls} INVOKEVIRTUAL bytes"
+        );
+        assert!(
+            code.code.contains(&op::AALOAD),
+            "<clinit> must index getInterfaces() with AALOAD"
+        );
+
+        // The owner names of interface-rooted methods must NOT appear as
+        // constant-pool Class entries — that is the loader-blind form.
+        let class_names = constant_pool_class_names(&cf);
+        assert!(
+            !class_names.iter().any(|n| n == "pkg/SuperOfA"),
+            "super-interface owner must not be resolved by name, cp classes: {class_names:?}"
+        );
+        assert!(
+            class_names.iter().any(|n| n == "pkg/$ProxyRoot"),
+            "the generated class itself must be an LDC-able Class constant"
+        );
+        // The Object fallback still resolves by name, which is safe: there is
+        // exactly one `java/lang/Object`.
+        assert!(
+            class_names.iter().any(|n| n == "java/lang/Object"),
+            "Object-owner methods keep the LDC class form"
+        );
+    }
+
+    /// Every `CONSTANT_Class` name in the emitted class file.
+    fn constant_pool_class_names(cf: &cratonvm_reader::ClassFile) -> Vec<String> {
+        let mut out = Vec::new();
+        for i in 1..cf.constant_pool.len() {
+            if let Some(name) = cf.constant_pool.get_class_name(i as u16) {
+                out.push(name.to_string());
+            }
+        }
+        out
+    }
+
     /// WP2.5-v3 item 4 audit: every emitted method body is straight-line
     /// (no branches, no exception handlers) — the precondition that lets
     /// us drop `skip_verification: true` in the bridge. Scans every Code
@@ -2163,6 +2371,7 @@ mod tests {
                         "java/lang/String".to_string(),
                     ],
                     exception_types: vec![],
+                    iface_root: None,
                 }],
             },
             // Each primitive return — exercises CHECKCAST + unbox tail.
@@ -2178,6 +2387,7 @@ mod tests {
                         iface_owner: "x/Z".into(),
                         param_class_names: vec![],
                         exception_types: vec![],
+                        iface_root: None,
                     },
                     ProxyMethod {
                         name: "j".into(),
@@ -2186,6 +2396,7 @@ mod tests {
                         iface_owner: "x/Z".into(),
                         param_class_names: vec![],
                         exception_types: vec![],
+                        iface_root: None,
                     },
                     ProxyMethod {
                         name: "f".into(),
@@ -2194,6 +2405,7 @@ mod tests {
                         iface_owner: "x/Z".into(),
                         param_class_names: vec![],
                         exception_types: vec![],
+                        iface_root: None,
                     },
                     ProxyMethod {
                         name: "d".into(),
@@ -2202,6 +2414,7 @@ mod tests {
                         iface_owner: "x/Z".into(),
                         param_class_names: vec![],
                         exception_types: vec![],
+                        iface_root: None,
                     },
                 ],
             },
@@ -2324,6 +2537,7 @@ mod tests {
                     iface_owner: "java/lang/Object".to_string(),
                     param_class_names: vec!["java/lang/Object".to_string()],
                     exception_types: vec![],
+                    iface_root: None,
                 },
                 ProxyMethod {
                     name: "hashCode".to_string(),
@@ -2332,6 +2546,7 @@ mod tests {
                     iface_owner: "java/lang/Object".to_string(),
                     param_class_names: vec![],
                     exception_types: vec![],
+                    iface_root: None,
                 },
                 ProxyMethod {
                     name: "hello".to_string(),
@@ -2340,6 +2555,7 @@ mod tests {
                     iface_owner: "pkg/Greeter".to_string(),
                     param_class_names: vec!["java/lang/String".to_string()],
                     exception_types: vec![],
+                    iface_root: None,
                 },
                 ProxyMethod {
                     name: "toString".to_string(),
@@ -2348,6 +2564,7 @@ mod tests {
                     iface_owner: "java/lang/Object".to_string(),
                     param_class_names: vec![],
                     exception_types: vec![],
+                    iface_root: None,
                 },
             ],
         }
@@ -2363,9 +2580,9 @@ mod tests {
         // handler / interfaces / identity-hash) and the proxied interface
         // so `define_class_with_options` can resolve both at link time —
         // exactly what `define_or_get_proxy_class` does via
-        // `ctx.ensure_synthetic_class(...)` before defining the proxy.
-        cm.ensure_synthetic_class("java/lang/reflect/Proxy$Instance", 3);
-        cm.ensure_synthetic_class("pkg/Greeter", 0);
+        // `ctx.try_ensure_synthetic_class(...).expect("Compatible mode fabricates; this fixture never runs under --jdk-only")` before defining the proxy.
+        cm.try_ensure_synthetic_class("java/lang/reflect/Proxy$Instance", 3).expect("Compatible mode fabricates; this fixture never runs under --jdk-only");
+        cm.try_ensure_synthetic_class("pkg/Greeter", 0).expect("Compatible mode fabricates; this fixture never runs under --jdk-only");
 
         let spec = canonical_single_iface_spec();
         let bytes = emit_proxy_classfile(&spec).expect("canonical proxy emit must succeed");
@@ -2459,8 +2676,8 @@ mod tests {
         // `Proxy$Instance.<init>(InvocationHandler, Class[])V` method entry to
         // `synthetic_stub_ctor_methods`, so the stub's method table now
         // carries the ctor the generated `$ProxyN.<init>` resolves against.
-        let super_id = cm.ensure_synthetic_class("java/lang/reflect/Proxy$Instance", 3);
-        cm.ensure_synthetic_class("pkg/Greeter", 0);
+        let super_id = cm.try_ensure_synthetic_class("java/lang/reflect/Proxy$Instance", 3).expect("Compatible mode fabricates; this fixture never runs under --jdk-only");
+        cm.try_ensure_synthetic_class("pkg/Greeter", 0).expect("Compatible mode fabricates; this fixture never runs under --jdk-only");
         let super_cls = cm
             .get_class(super_id)
             .expect("synthetic Proxy$Instance must be registered");

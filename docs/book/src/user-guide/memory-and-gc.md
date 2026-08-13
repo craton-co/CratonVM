@@ -67,9 +67,22 @@ With `--verbose:gc`, the chosen default is printed at startup, e.g.:
 |-----------|---------------|--------|
 | **Generational** (default) | (default) or `-XX:+UseGenerationalGC` | Stable. Young/old generations, write barriers, card table. Moving (Cheney) young copy plus non-moving sweep with selective promotion. |
 | **G1** (region-based) | `-XX:+UseG1GC` | **Experimental.** Region-based collector; the generational collector remains the safety net during its maturation. |
+| **ZGC** | `-XX:+UseZGC` (or `--XX:UseGc ZGC`) — **only in a build with the `zgc` feature** | **Not in a stock build.** Real and fully selectable where it is compiled in, but not a real ZGC: a memory-backed, non-moving, whole-heap stop-the-world mark-sweep. Research backend — do not depend on it in production. |
 
-A `zgc` collector exists only as a feature-gated stub and is not selectable as a
-production collector.
+The ZGC backend is compiled in only behind the default-off `zgc` Cargo feature,
+so a stock `cratonvm` does not have it and `-XX:+UseZGC` there warns and falls
+back to Generational, like any unknown collector name. Build a ZGC-capable
+launcher with:
+
+```bash
+cargo build --release -p cratonvm-cli --features zgc
+```
+
+It is default-off for pass-rate parity, not because it is unfinished: on the
+1975-class Spring Boot suite it measures 1860 PASS against the default
+collector's 1902 (and 49 hangs against 18). It also has none of production
+ZGC's properties — no colored pointers, no load barriers, no concurrency, no
+compaction, no generations, no TLABs.
 
 ```bash
 # Default (generational)

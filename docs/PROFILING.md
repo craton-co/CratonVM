@@ -87,8 +87,8 @@ cargo bench
 - **Ratio = 1.0x**: Performance parity with HotSpot.
 - **Ratio > 1.0x**: CratonVM is slower by that factor.
 
-Historical 2026-07-02 snapshot vs JDK 25.0.1 C2 on Windows 11, before the
-2026-07-04 OSR default flip: default QuickBench is 46.2x slower; with
+An older snapshot vs JDK 25.0.1 C2 on Windows 11, taken before back-edge OSR
+became the default: default QuickBench is 46.2x slower; with
 `CRATONVM_JIT_OSR=1 CRATONVM_JIT_THRESHOLD=1`,
 QuickBench is 8.25x slower overall, with Arithmetic/Sieve/Matrix near
 1.30x-1.55x and Fibonacci still 13.8x slower. See the README and the mdBook

@@ -313,6 +313,100 @@ pub(super) fn resolved_private_invokevirtual_target(
 /// interface stash so the default-method rescue at the NSME emit site never
 /// fires for non-interface dispatch (which could otherwise re-route to a
 /// stale receiver class on Java-exception unwinding through unrelated invokes).
+/// May the stale-`java.lang.Thread`-mirror recovery consult the former-mirror
+/// address table for a receiver with this class id and this header?
+///
+/// **`class_id == 0` on its own is not the question**, and getting that wrong
+/// is what made the recovery substitute a thread mirror for a live `long[]`.
+/// Three unrelated things wear `ClassId(0)` (see `memory::reclaim_guard`):
+///
+/// * a span the collector reclaimed and zeroed — the case the recovery exists
+///   for, and the only one where the former-address table's identity argument
+///   holds;
+/// * a genuine `new Object()` — since H1, one with a non-zero identity hash;
+/// * **every primitive array.** An array header carries its COMPONENT class id
+///   (JVMS §4.4.1) and `long[]`/`int[]`/`byte[]` have none, so `Newarray`
+///   stamps `ClassId::new(0)`.
+///
+/// Only the first has an all-zero header: an array has a non-zero `kind`,
+/// `element_type` and `shape`, and a live object has a non-zero identity hash.
+/// Same 16 bytes, and the same test, as `execute_invoke_kind`'s own
+/// stale-pointer detector further down.
+#[inline]
+pub(super) fn stale_mirror_recovery_applies(
+    class_id: ClassId,
+    header: &[u8; cratonvm_types::HEADER_SIZE],
+) -> bool {
+    class_id == ClassId::new(0) && *header == [0u8; cratonvm_types::HEADER_SIZE]
+}
+
+/// Can a call site whose constant pool names `cp_class_name` be holding a
+/// `java.lang.Thread` mirror at all?
+///
+/// The second half of the stale-mirror recovery's gate, and the half that does
+/// not depend on the header. Two names are refused outright:
+///
+/// * **an array type.** `[J` has no relationship to `java.lang.Thread` in
+///   either direction, so a mirror there is wrong by construction — no heap
+///   state can make it right;
+/// * **bare `java/lang/Object`.** Every mirror is assignable to it, so it
+///   carries no evidence that the receiver was ever a mirror. Admitting it is
+///   exactly what would leave the `new Object()` window open: a zero-field
+///   `Object` has an all-zero header, so the header test cannot separate it
+///   from a reclaimed span, and an `Object`-typed call site cannot either.
+///
+/// Everything else is admitted only if the recovered mirror really is an
+/// instance of the named type. The check is by NAME and walks supers *and*
+/// interfaces ([`Class::is_assignable_to_name`]), so a `Runnable.run()` site on
+/// a `Thread` still recovers, and a site typed `MyThread` refuses a plain
+/// `java.lang.Thread` mirror — correctly, because a vacated address identified
+/// ONE thread's mirror and if that mirror is not of the site's type the
+/// substitution was going to be wrong anyway.
+///
+/// This narrows the recovery. The case it exists for —
+/// `Thread.currentThread().getThreadGroup()` in Tomcat's
+/// `TaskThreadFactory.<init>`, see
+/// `fixed-suite-bugs/gc-blocked-thread-frame-stale-thread-mirror-RESOLVED.md`
+/// — names `java/lang/Thread` and is unaffected. An `Object`-typed use of a
+/// stale mirror now reads the zeroed object instead of being repaired; that
+/// degrades a `toString`, where admitting it risks corrupting a live object's
+/// identity.
+fn mirror_is_plausible_at_call_site(
+    shared: &SharedVm,
+    cp_class_name: &str,
+    mirror: ObjectRef,
+) -> bool {
+    if !call_site_type_can_hold_a_thread_mirror(cp_class_name) {
+        return false;
+    }
+    let mirror_cid = shared.mem.heap.class_id_of(mirror);
+    let cm = shared.classes.class_manager.read();
+    cm.get_class(mirror_cid)
+        .is_some_and(|c| c.is_assignable_to_name(cp_class_name, &cm.class_store))
+}
+
+/// The name-only half of [`mirror_is_plausible_at_call_site`] — the two
+/// call-site types that can never be evidence of a thread mirror, whatever the
+/// heap says.
+#[inline]
+pub(super) fn call_site_type_can_hold_a_thread_mirror(cp_class_name: &str) -> bool {
+    !cp_class_name.starts_with('[') && cp_class_name != "java/lang/Object"
+}
+
+/// [`stale_mirror_recovery_applies`] against a live receiver, reading its
+/// header only after confirming the address is inside a heap region.
+fn receiver_is_a_reclaimed_span(shared: &SharedVm, recv: ObjectRef) -> bool {
+    if shared.mem.heap.is_heap_addr(recv.as_ptr() as usize).is_none() {
+        return false;
+    }
+    // SAFETY: `is_heap_addr` just confirmed the address is inside a heap
+    // region, and every heap object begins with a readable header at least
+    // 16 bytes long.
+    let header: [u8; cratonvm_types::HEADER_SIZE] =
+        unsafe { std::ptr::read(recv.as_ptr() as *const [u8; cratonvm_types::HEADER_SIZE]) };
+    stale_mirror_recovery_applies(shared.mem.heap.class_id_of(recv), &header)
+}
+
 pub(super) fn execute_invoke_kind(
     shared: &SharedVm,
     thread: &mut JvmThread,
@@ -329,7 +423,7 @@ pub(super) fn execute_invoke_kind(
         resolve_method_ref(shared, current_class_id, cp_index)?;
     let method_owner_name = Arc::clone(&method_class_name);
 
-    // PGO-01 (docs/feature-designs/c2/pgo-01-call-site-evidence-gap.md):
+    // PGO-01 (feature-designs/c2/pgo-01-call-site-evidence-gap.md):
     // call-site evidence for invokespecial. invokevirtual/invokeinterface are
     // NOT recorded here — they are covered by the receiver-type profile
     // instead (see MethodProfile's doc comment on `receivers` vs
@@ -449,9 +543,48 @@ pub(super) fn execute_invoke_kind(
     // dereferences the stale receiver (or a stale object argument) while
     // resolving/invoking the callee. Refresh while the forwarding header is
     // still available, before any class lookup or native call can touch it.
+    // The receiver exactly as the operand stack handed it over, before the
+    // barrier above may have rewritten it. Kept so the invariant check further
+    // down can say WHICH of the two is the bad one: a receiver that was already
+    // wrong on the stack is a root-remap gap, whereas one that only became
+    // wrong here means `load_and_forward` redirected a live reference through a
+    // forwarding word it should not have trusted. Nothing but a `Copy` of an
+    // already-materialised `Value`; no allocation, no branch on the hot path.
+    let recv_before_refresh = match args.first() {
+        Some(Value::Object(Some(o))) => Some(*o),
+        _ => None,
+    };
     for value in &mut args {
         if let Value::Object(Some(obj)) = value {
+            let before = *obj;
+            // The word the barrier is about to decide on, read once here so a
+            // later report can quote it. The barrier itself re-loads it; a
+            // disagreement between the two is itself the finding.
+            // SAFETY: `before` is a reference popped from the operand stack and
+            // is about to be dereferenced by `load_and_forward` anyway;
+            // `MARK_WORD_OFFSET` is inside the header of any heap object.
+            let mark = if shared
+                .mem
+                .heap
+                .is_heap_addr(before.as_ptr() as usize)
+                .is_some()
+            {
+                unsafe {
+                    std::ptr::read(
+                        before.as_ptr().add(cratonvm_types::MARK_WORD_OFFSET) as *const u64
+                    )
+                }
+            } else {
+                0
+            };
             *obj = shared.mem.heap.load_and_forward(*obj);
+            if obj.as_ptr() != before.as_ptr() {
+                crate::memory::reclaim_guard::note_barrier_rewrite(
+                    before.as_ptr() as usize,
+                    mark,
+                    obj.as_ptr() as usize,
+                );
+            }
         }
     }
     let args_root_guard = InvokeArgsRootGuard::new(thread, &args);
@@ -681,15 +814,56 @@ pub(super) fn execute_invoke_kind(
     //
     // Precise / no false substitutions: the former-address table is populated
     // *only* by GC mirror relocations, and we consult it *only* when the
-    // receiver header is genuinely all-zero (`class_id == 0`). A from-space
-    // slot reused for a live object has a non-zero class_id and never reaches
-    // the lookup; a vacated address uniquely identified one thread's mirror,
-    // so identity is preserved. We additionally verify the recovered mirror is
-    // itself live before substituting.
+    // receiver header is genuinely all-zero. A vacated address uniquely
+    // identified one thread's mirror, so identity is preserved, and we
+    // additionally verify the recovered mirror is itself live before
+    // substituting.
+    //
+    // "Genuinely all-zero" is a **16-byte header comparison, not
+    // `class_id == 0`**, and the difference is this whole recovery's
+    // correctness. `class_id == 0` is worn by three unrelated things (see
+    // `memory::reclaim_guard`), and one of them is not stale at all:
+    //
+    //   **every primitive array.** `Instruction::Newarray` allocates with
+    //   `ClassId::new(0)` because an array header carries its COMPONENT class
+    //   id (JVMS §4.4.1) and `long[]`/`int[]`/`byte[]` have none.
+    //
+    // So the `class_id == 0` form matched a perfectly live `long[]` whose
+    // address happened to appear in `former_mirror_addrs` — the young allocator
+    // re-serves vacated addresses constantly — and replaced the receiver with a
+    // `java.lang.Thread`. Measured on `org.h2.test.db.TestTempTables`: 5
+    // occurrences in ~50 `--nojit` runs, every one of them
+    // `java/util/Arrays.copyOf(long[], int)`'s `original.clone()` dispatching
+    // into a thread mirror, surfacing as
+    // `CloneNotSupportedException` from a `java/lang/Thread.clone` frame (the
+    // mirror's inherited `Thread.clone` body) and costing two sessions on a
+    // hunt for a GC bug that was not there. The substituted class was
+    // `java/lang/Thread`, `jdk/internal/misc/InnocuousThread` and
+    // `org/h2/mvstore/FileStore$BackgroundWriterThread` on different runs —
+    // whichever mirror had previously occupied the address.
+    // See `fixed-suite-bugs/h2-suite-bugs/
+    // bug-h2-testtemptables-clonenotsupportedexception-thread-clone-frame-FIXED.md`.
+    //
+    // The all-zero test is exactly what the recovery was written for — the
+    // Tomcat `TestDigestAuthenticator` case dispatches on a *zeroed* object —
+    // and it is the same test the stale-pointer detector further down this
+    // function already applies. An array cannot pass it: it carries a non-zero
+    // `kind`, `element_type` and `shape`.
+    //
+    // The header test alone still leaves one address-collision window, and the
+    // second filter below closes it. On the 16-byte header a bare
+    // `new Object()` IS all-zero — `class_id` 0, `shape` 0 (no fields),
+    // `ObjectKind::Object` and `ArrayElementType::Reference` both discriminant
+    // 0, and the identity hash is minted lazily into the mark word rather than
+    // stamped at allocation. So a zero-field `Object` sitting on a vacated
+    // mirror address would still be swapped for a thread. That is far narrower
+    // than "every primitive array", but it is the same defect, and it is closed
+    // here by asking a question the header cannot answer: **is the recovered
+    // mirror something this CALL SITE could legitimately be holding?**
     if !is_special {
         let recovered: Option<ObjectRef> = if let Value::Object(Some(recv)) = &args[0] {
             let recv = *recv;
-            if shared.mem.heap.class_id_of(recv) == ClassId::new(0) {
+            if receiver_is_a_reclaimed_span(shared, recv) {
                 shared
                     .threads
                     .thread_registry
@@ -697,6 +871,7 @@ pub(super) fn execute_invoke_kind(
                     .filter(|live| {
                         live.as_ptr() != recv.as_ptr()
                             && shared.mem.heap.class_id_of(*live) != ClassId::new(0)
+                            && mirror_is_plausible_at_call_site(shared, &method_class_name, *live)
                     })
             } else {
                 None
@@ -846,6 +1021,31 @@ pub(super) fn execute_invoke_kind(
         None
     };
 
+    // An array-typed call site whose receiver is not an array is a provable
+    // invariant violation: the verifier guarantees the operand is `[J`, and
+    // nothing in a well-formed heap turns a `[J` into a plain object. Report it
+    // where both facts are still in hand — the dispatch below no longer looks at
+    // the receiver's header at such a site, so without this the corruption would
+    // pass through silently and surface later as a `ClassCastException` on the
+    // `checkcast` that follows `clone()`.
+    //
+    // Costs one byte compare per non-special invoke on a name the caller has
+    // already resolved; the body is reached only when the invariant is broken.
+    if !is_special && method_class_name.starts_with('[') {
+        if let Some(Value::Object(Some(recv))) = args.first().copied() {
+            if shared.mem.heap.kind_of(recv) != cratonvm_types::ObjectKind::Array {
+                crate::memory::reclaim_guard::report_impossible_dispatch_terminal(
+                    shared,
+                    thread,
+                    recv,
+                    "array-typed call site, non-array receiver",
+                    &format!("{method_class_name}.{method_name}{method_descriptor}"),
+                    recv_before_refresh,
+                );
+            }
+        }
+    }
+
     // Determine the class to invoke on.
     // invoke_class: Arc<str> — cheap clone, derefs to &str for all downstream calls.
     let invoke_class: Arc<str> = if is_special {
@@ -862,6 +1062,37 @@ pub(super) fn execute_invoke_kind(
         )
     } else if let Some((_declaring_id, declaring_name)) = &private_virtual_target {
         Arc::clone(declaring_name)
+    } else if method_class_name.starts_with('[') {
+        // The call SITE names an array type, so JVMS §4.4.1 settles the target
+        // statically: an array class declares no methods of its own and its
+        // method table is `java.lang.Object`'s. There is no subclass of `[J`
+        // that could override `clone()`, so the receiver's header has nothing
+        // to contribute and must not be consulted.
+        //
+        // The receiver-driven branch below reaches the same answer for a
+        // receiver whose header says `kind == Array`, and that is the whole
+        // 2026-07-31 fix. What it cannot do is answer correctly for a receiver
+        // whose header does NOT say array — a block reclaimed while still
+        // referenced and then re-served now describes whatever occupies it, and
+        // `class_id_of` then picks that occupant's `clone()` body. That is how
+        // `java/util/Arrays.copyOf(long[], int)`'s `original.clone()` — an
+        // `invokevirtual "[J".clone:()Ljava/lang/Object;` — reached
+        // `java.lang.Thread.clone`, whose body is `throw new
+        // CloneNotSupportedException()` and nothing else, in
+        // `bug-h2-testtemptables-clonenotsupportedexception-thread-clone-frame`.
+        // Deciding from the call site instead of from the header removes that
+        // route by construction, for every array-typed call site and every
+        // reason a header might lie.
+        //
+        // A non-Object member at an array-typed call site cannot come from real
+        // javac output; keep the CP name for it so the S111r8 synthetic-shape
+        // rescue below (and `try_stackless_invoke`'s `[`-prefix rewrite) behave
+        // exactly as before.
+        if crate::vm::is_object_member(&method_name, &method_descriptor) {
+            Arc::from("java/lang/Object")
+        } else {
+            method_class_name.clone()
+        }
     } else {
         match &args[0] {
             Value::Object(Some(obj_ref)) => {
@@ -1056,12 +1287,53 @@ pub(super) fn execute_invoke_kind(
                                     }
                                 }
                             }
+                            // A bare `new Object()` IS all-zero, legitimately.
+                            //
+                            // `ObjectHeader::new` documents the mark word as
+                            // "no identity hash installed", `MARK_NEUTRAL`,
+                            // `ObjectKind::Object` and `ArrayElementType::
+                            // Reference` are all `0`, and a no-field `Object`
+                            // has `class_id = 0` and `shape = 0` — so every one
+                            // of the 16 bytes this detector reads is zero for a
+                            // healthy, freshly allocated `java.lang.Object`.
+                            // The comment on `init_object_header` still claims
+                            // a fix that made this impossible ("identity_hash_
+                            // code is now eagerly assigned at allocation time,
+                            // caller passes next_identity_hash()"), but the
+                            // 2026-08-06/07 header shrink folded the hash into
+                            // the mark word and left `ObjectHeader::new` with no
+                            // hash parameter at all, so the fast path cannot
+                            // assign one and the false positive is back.
+                            //
+                            // It fires on `new Object()` used as a lock or
+                            // sentinel — six lines of Java reproduce it, on all
+                            // four collectors — and the cost is not the log
+                            // line: this warning is the tripwire for the
+                            // reclaimed-live-receiver family (CRATONVM_DBG_BUG03
+                            // / _SWEEP_ZERO / _STALE_RECV all hang off it), and
+                            // a tripwire that fires on healthy code is one
+                            // nobody reads.
+                            //
+                            // Demoted, not deleted, and only when the CP class
+                            // is `java/lang/Object` itself — i.e. an
+                            // `Object`-declared call site (hashCode/equals/
+                            // toString/...), where the fallback the detector
+                            // takes is the CORRECT dispatch for a real bare
+                            // `Object` anyway. The trade is explicit: a
+                            // genuinely stale receiver at an `Object`-declared
+                            // site now logs at debug instead of warn. That is
+                            // worth it against a 100% false-positive rate here,
+                            // and it is exactly the call already made two lines
+                            // below for `java/lang/ClassLoader`.
+                            //
                             // WildFly / JBoss Modules often hits this path on
                             // `ClassLoader`-typed invokevirtual sites when a
                             // receiver lost its header but CP resolution is
                             // already `java/lang/ClassLoader`; the CP fallback
                             // succeeds and a WARN was mostly noise.
-                            if method_class_name.as_ref() == "java/lang/ClassLoader" {
+                            if method_class_name.as_ref() == "java/lang/Object"
+                                || method_class_name.as_ref() == "java/lang/ClassLoader"
+                            {
                                 tracing::debug!(
                                     "Stale pointer detected in invokevirtual receiver \
                                      (ptr={:p}, all-zero header) — falling back to CP class {}",
@@ -1726,23 +1998,13 @@ pub(super) fn execute_invoke_kind(
         && &*method_descriptor == "()Ljava/lang/Object;"
     {
         if let Some(Value::Object(Some(recv))) = args.first().copied() {
-            let addr = recv.as_ptr() as usize;
-            tracing::error!(
-                target: "cratonvm::gc::guard",
-                obj = format!("{addr:#x}"),
-                receiver_kind = ?shared.mem.heap.kind_of(recv),
-                receiver_class_id = shared.mem.heap.class_id_of(recv).as_u32(),
-                "clone() dispatched to java.lang.Thread.clone, which only ever throws. \
-                 The receiver's header does not describe what the caller is holding — \
-                 either an array dispatched through its COMPONENT class id, or a block \
-                 that was reclaimed while still referenced and then re-served.",
-            );
-            crate::memory::reclaim_guard::report_reclaimed_receiver(
+            crate::memory::reclaim_guard::report_impossible_dispatch_terminal(
                 shared,
-                addr,
+                thread,
+                recv,
                 "Thread.clone dispatch",
                 "java/lang/Thread.clone()Ljava/lang/Object;",
-                shared.mem.heap.class_id_of(recv).as_u32(),
+                None,
             );
         }
     }
@@ -2272,8 +2534,46 @@ pub(super) fn execute_invoke_kind(
 /// is a single descriptor token such as "I", "J", "Ljava/lang/Integer;", or
 /// "[Ljava/lang/String;".
 pub fn split_method_descriptor(descriptor: &str) -> (Vec<String>, String) {
+    let (params, ret) = split_method_descriptor_ref(descriptor);
+    (
+        params.into_iter().map(str::to_string).collect(),
+        ret.to_string(),
+    )
+}
+
+/// Borrowing twin of [`split_method_descriptor`]: the parameter tokens and the
+/// return token as slices of `descriptor`, so a caller that only reads them
+/// pays one `Vec` allocation instead of one `String` per parameter plus one for
+/// the return type.
+///
+/// Use this on any per-call path. The lambda dispatcher reached
+/// `split_method_descriptor` four to six times per lambda INVOCATION — twice in
+/// `try_lambda_dispatch` purely to read a return-type character, twice more in
+/// `coerce_lambda_args`, again in `checkcast_lambda_instantiated_args` — and
+/// `mi_malloc`/`mi_free`/`__memmove` were ~36% of a lambda-only `perf` profile
+/// before those sites moved here.
+/// The return-type token of a method descriptor, without parsing (or
+/// allocating for) the parameter list.
+///
+/// A descriptor has exactly one `')'`, so the return type is everything after
+/// it. Two of the lambda dispatcher's `split_method_descriptor` calls wanted
+/// only this and paid a full parameter walk plus a `Vec` for it on every lambda
+/// invocation. Returns `""` for a descriptor with no `')'` (malformed), which
+/// every consumer already treats as "not `V`, not a match".
+#[inline]
+pub fn descriptor_return_ref(descriptor: &str) -> &str {
+    match descriptor.as_bytes().iter().position(|&b| b == b')') {
+        Some(close) => &descriptor[close + 1..],
+        None => "",
+    }
+}
+
+pub fn split_method_descriptor_ref(descriptor: &str) -> (Vec<&str>, &str) {
     let bytes = descriptor.as_bytes();
-    let mut params: Vec<String> = Vec::new();
+    // Pre-size from the `(...)` span: one token is at least one byte, and no
+    // real descriptor holds more than a handful. Without this the per-call Vec
+    // reallocated through `RawVec::grow_one` on the lambda path.
+    let mut params: Vec<&str> = Vec::with_capacity(8);
     let mut i = 1; // skip '('
     while i < bytes.len() && bytes[i] != b')' {
         let start = i;
@@ -2295,14 +2595,13 @@ pub fn split_method_descriptor(descriptor: &str) -> (Vec<String>, String) {
                 i += 1; // single-char primitive
             }
         }
-        params.push(descriptor[start..i].to_string());
+        params.push(&descriptor[start..i]);
     }
     // Skip ')'
     if i < bytes.len() && bytes[i] == b')' {
         i += 1;
     }
-    let ret = descriptor[i..].to_string();
-    (params, ret)
+    (params, &descriptor[i..])
 }
 
 /// Non-allocating equivalent of `split_method_descriptor(d).0[n].as_bytes().first()`:
@@ -2448,6 +2747,11 @@ pub(super) fn coerce_arg(
     impl_tok: &str,
     v: Value,
 ) -> Result<Value, MethodCallFailed> {
+    // LOAD-BEARING BEYOND THIS FUNCTION: `coerce_lambda_args` skips its whole
+    // body — descriptor walks, pin pushes, the `checkcast` replay — for a
+    // non-capturing lambda whose three descriptors are identical, and that
+    // shortcut is only equivalent because equal tokens coerce to the identity
+    // HERE. If this arm ever has to do work, drop that fast path with it.
     if sam_tok == impl_tok {
         return Ok(v);
     }
@@ -2714,10 +3018,18 @@ pub(super) fn try_stackless_invoke(
     // this exact shape for enum-typed arrays) or the stale/reclaimed-ObjectRef
     // family seen through `clone()` instead of through a `checkcast`.
     //
-    // `java.lang.Thread.clone()` has the identical property and its own,
-    // richer reporter earlier in this file (site "Thread.clone dispatch",
-    // landed 2026-08-03) -- deliberately NOT repeated here, so a real event
-    // produces one verdict rather than two.
+    // `java.lang.Thread.clone()` has the identical property and is reported
+    // here too. It also has a reporter in `execute_invoke_kind`, and that used
+    // to be the only one — which left the route that matters UNCOVERED: a
+    // JIT-compiled call site reaches `invoke_or_native` ->
+    // `invoke_on_class_shared_inner` -> here, and never passes through
+    // `execute_invoke_kind` at all. The H2 suite sweep that reopened
+    // `bug-h2-testtemptables-clonenotsupportedexception-thread-clone-frame`
+    // ran on a binary that already carried the `execute_invoke_kind` reporter
+    // and quoted no verdict with the trace, and the suite runner's default mode
+    // is JIT-on. A duplicate verdict on the interpreter route costs one extra
+    // rate-limited log line; a missing one on the JIT route costs the session.
+    // The `site` string distinguishes them.
     //
     // This closes what the retired
     // `bug-h2-testmultithread-concurrent-update-timeout` write-up asked for:
@@ -2732,14 +3044,15 @@ pub(super) fn try_stackless_invoke(
     //
     // Cost on a healthy run: one `&str` comparison per stackless invoke, which
     // fails on length for every method whose name is not five bytes.
-    if method_name == "clone" && class_name == "java/lang/Enum" {
+    if method_name == "clone" && matches!(class_name, "java/lang/Enum" | "java/lang/Thread") {
         if let Some(Value::Object(Some(recv))) = args.first().copied() {
-            crate::memory::reclaim_guard::report_reclaimed_receiver(
+            crate::memory::reclaim_guard::report_impossible_dispatch_terminal(
                 shared,
-                recv.as_ptr() as usize,
-                "Enum.clone dispatch",
+                thread,
+                recv,
+                "impossible clone (stackless invoke)",
                 &format!("{class_name}.{method_name}{descriptor}"),
-                shared.mem.heap.class_id_of(recv).as_u32(),
+                None,
             );
         }
     }
@@ -3802,7 +4115,11 @@ pub(super) fn try_stackless_invoke(
     if thread.frames.len() >= shared.config.max_stack_depth {
         dump_stack_on_soe(thread);
         if let Some(obj) = monitor_obj {
-            let _ = shared.threads.monitors.exit(obj, thread.thread_id);
+            // `monitor_enter_synchronized_method` above published JMX
+            // ownership; this bail must retract it or the entry outlives the
+            // acquisition. See `vm_exec::monitor_exit_and_retract_jmx`.
+            let _ =
+                crate::vm::vm_exec::monitor_exit_and_retract_jmx(shared, obj, thread.thread_id);
         }
         return Err(MethodCallFailed::InternalError(VmError::Runtime(
             RuntimeError::StackOverflowError,

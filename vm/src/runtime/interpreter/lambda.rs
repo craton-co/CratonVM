@@ -23,6 +23,68 @@
 
 use super::*;
 
+/// Per-phase timing for [`try_lambda_dispatch`], armed by
+/// `CRATONVM_DBG=lambda-prof`.
+///
+/// Exists because a lambda's SAM call measures ~4.2 us on this VM against ~18 ns
+/// for the *identical* interface call on a named class (monomorphic call sites,
+/// both measurement orders — see the `LambdaProbe2` numbers in the WebFlux
+/// throughput record) — a ~220x penalty HotSpot does not have, and large enough
+/// to dominate lambda-dense workloads such as Spring context startup. Naming the
+/// term needs the total and the parts measured in the same run: reading the
+/// source offers four plausible candidates (the call-site clone, argument
+/// coercion, the by-name class resolution, the target invoke) and cannot rank
+/// them.
+///
+/// Off by default and behind a `OnceLock`, so an unprofiled run pays one relaxed
+/// load per dispatch.
+pub(crate) mod lambda_prof {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::OnceLock;
+
+    pub(crate) static CALLS: AtomicU64 = AtomicU64::new(0);
+    /// Whole `try_lambda_dispatch`, entry to return.
+    pub(crate) static TOTAL_NS: AtomicU64 = AtomicU64::new(0);
+    /// The `lambda_proxies` read + `LambdaCallSite` clone.
+    pub(crate) static LOOKUP_NS: AtomicU64 = AtomicU64::new(0);
+    /// Everything between the lookup and the target invoke: descriptor splits,
+    /// capture prepending, `coerce_lambda_args`.
+    pub(crate) static PREP_NS: AtomicU64 = AtomicU64::new(0);
+    /// The target invoke itself — the impl body plus whatever class resolution
+    /// the chosen invoke entry point does on the way in.
+    pub(crate) static TARGET_NS: AtomicU64 = AtomicU64::new(0);
+
+    pub(crate) fn on() -> bool {
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| cratonvm_types::flags::runtime_var("CRATONVM_DBG_LAMBDA_PROF").is_ok())
+    }
+
+    pub(crate) fn add(counter: &AtomicU64, ns: u64) {
+        counter.fetch_add(ns, Ordering::Relaxed);
+    }
+
+    /// How often to print. Every N dispatches, so a profile lands even on a run
+    /// that is killed at a timeout rather than exiting cleanly.
+    pub(crate) const REPORT_EVERY: u64 = 200_000;
+
+    pub(crate) fn report() {
+        let calls = CALLS.load(Ordering::Relaxed).max(1);
+        let total = TOTAL_NS.load(Ordering::Relaxed);
+        let lookup = LOOKUP_NS.load(Ordering::Relaxed);
+        let prep = PREP_NS.load(Ordering::Relaxed);
+        let target = TARGET_NS.load(Ordering::Relaxed);
+        let other = total.saturating_sub(lookup + prep + target);
+        eprintln!(
+            "[LAMBDA-PROF] calls={calls} total={}ns/call  lookup={}  prep={}  target={}  other={}",
+            total / calls,
+            lookup / calls,
+            prep / calls,
+            target / calls,
+            other / calls,
+        );
+    }
+}
+
 /// LambdaMetafactory argument adaptation (`samMethodType` → `instantiatedMethodType`).
 ///
 /// When a functional-interface SAM has erased parameters (commonly `Object`,
@@ -49,8 +111,8 @@ pub(super) fn checkcast_lambda_instantiated_args(
     args: &[Value],
     num_captures: usize,
 ) -> Result<(), MethodCallFailed> {
-    let (sam_params, _) = split_method_descriptor(sam_desc);
-    let (inst_params, _) = split_method_descriptor(inst_desc);
+    let (sam_params, _) = split_method_descriptor_ref(sam_desc);
+    let (inst_params, _) = split_method_descriptor_ref(inst_desc);
     for (sam_idx, inst_tok) in inst_params.iter().enumerate() {
         // Only a reference instantiated param can carry a checkcast.
         if !is_reference_desc(inst_tok) {
@@ -93,7 +155,11 @@ pub(super) fn checkcast_lambda_instantiated_args(
                 .read()
                 .get_class(shared.mem.heap.class_id_of(obj_ref))
                 .map(|c| c.name.to_string())
-                .unwrap_or_else(|| "?".to_string());
+                // Name the id, not just "?" — see the matching note on the
+                // `checkcast` opcode's fallback.
+                .unwrap_or_else(|| {
+                    format!("?class_id={}", shared.mem.heap.class_id_of(obj_ref))
+                });
             let obj_display_name = cce_display_class_name(shared, obj_ref, &obj_class_name);
             let target_binary = inst_tok
                 .strip_prefix('L')
@@ -466,8 +532,28 @@ pub fn coerce_lambda_args(
     receiver_present: bool,
     num_captures: usize,
 ) -> Result<(), MethodCallFailed> {
-    let (sam_params, _sam_ret) = split_method_descriptor(sam_desc);
-    let (impl_params, _impl_ret) = split_method_descriptor(impl_desc);
+    // Provable no-op fast path, taken by every non-capturing lambda whose SAM,
+    // implementation and instantiated types agree — `x -> x + 1`, `Foo::bar`,
+    // and the overwhelming majority of the lambdas a reactive stack executes.
+    //
+    // With all three descriptors identical, `num_captures == 0` and no receiver,
+    // `args` lines up token-for-token with both parameter lists, so:
+    //   * every `coerce_arg(tok, tok, v)` returns `v` untouched (its first line
+    //     is `if sam_tok == impl_tok { return Ok(v) }`), and
+    //   * `checkcast_lambda_instantiated_args` skips every parameter, because it
+    //     only casts where the instantiated type NARROWS the erased SAM type.
+    // The work below is therefore pure overhead here: two descriptor walks, a
+    // `handles` vector, and one pin push/truncate per argument, on every call.
+    if num_captures == 0
+        && !receiver_present
+        && sam_desc == impl_desc
+        && sam_desc == inst_desc
+    {
+        return Ok(());
+    }
+
+    let (sam_params, _sam_ret) = split_method_descriptor_ref(sam_desc);
+    let (impl_params, _impl_ret) = split_method_descriptor_ref(impl_desc);
 
     // The SAM's params correspond to args[num_captures..].
     // The impl's params correspond to args[receiver_skip..] where
@@ -538,18 +624,18 @@ pub fn coerce_lambda_args(
         // args (i >= num_captures), use sam_params[i - num_captures]. For
         // capture args (i < num_captures), we assume they match impl type
         // already (captures are erased at capture time).
-        let sam_tok: String = if i >= num_captures {
+        let sam_tok: &str = if i >= num_captures {
             let sam_idx = i - num_captures;
             if sam_idx < sam_params.len() {
-                sam_params[sam_idx].clone()
+                sam_params[sam_idx]
             } else {
-                impl_non_recv[impl_idx].clone()
+                impl_non_recv[impl_idx]
             }
         } else {
-            impl_non_recv[impl_idx].clone()
+            impl_non_recv[impl_idx]
         };
-        let impl_tok = &impl_non_recv[impl_idx];
-        let coerced = match coerce_arg(shared, thread, &sam_tok, impl_tok, args[i]) {
+        let impl_tok = impl_non_recv[impl_idx];
+        let coerced = match coerce_arg(shared, thread, sam_tok, impl_tok, args[i]) {
             Ok(v) => v,
             Err(e) => {
                 thread.native_pin_roots.truncate(pin_base);
@@ -601,7 +687,7 @@ pub(crate) fn lambda_args_sam_compatible(
     sam_descriptor: &str,
     args: &[Value],
 ) -> bool {
-    let (params, _ret) = split_method_descriptor(sam_descriptor);
+    let (params, _ret) = split_method_descriptor_ref(sam_descriptor);
     for (i, pd) in params.iter().enumerate() {
         if pd.starts_with('[') {
             // Array-typed SAM param. This was previously covered by the
@@ -633,7 +719,7 @@ pub(crate) fn lambda_args_sam_compatible(
             }
             continue; // null / missing / genuinely an array -- don't second-guess further
         }
-        if !pd.starts_with('L') || pd.as_str() == "Ljava/lang/Object;" {
+        if !pd.starts_with('L') || *pd == "Ljava/lang/Object;" {
             continue; // generic/erased or non-reference param -- never second-guess
         }
         let arg = match args.get(i) {
@@ -689,6 +775,24 @@ pub(crate) fn lambda_impl_dispatch_override(
     if !crate::runtime::env_cache::loader_aware_resolution() {
         return None;
     }
+    // Nothing to override when no user-defined loader has ever defined a class
+    // in this process: `lookup_loader_initiated` below already returns `None`
+    // unless `get_loader_id(host)` is `UserDefined(_)`, and this atomic is
+    // exactly the "could that ever be true" question — `register_defining_loader`
+    // is called whenever any `ClassId` is assigned a `UserDefined` identity, so
+    // `false` guarantees no class anywhere has one. Behaviour-preserving; the
+    // same short-circuit, for the same reason, already sits inside
+    // `lookup_loader_initiated`.
+    //
+    // Hoisted here because the lambda path reached it only AFTER a
+    // `lambda_proxy_hosts` read lock + hash, and paid that per LAMBDA CALL.
+    // Measured on a lambda-only profile: this function plus its `_driven`
+    // sibling plus `lambda_global_impl_owner` were 11.3% of the run, essentially
+    // all of it re-deriving a per-proxy constant that is `None` for every
+    // program without a custom classloader.
+    if !cratonvm_native_builtins::classloader::any_defining_loader_registered() {
+        return None;
+    }
     let host = *shared
         .classes
         .lambda_proxy_hosts
@@ -741,6 +845,14 @@ pub(crate) fn lambda_impl_dispatch_override_driven(
     if !crate::runtime::env_cache::loader_aware_resolution() {
         return None;
     }
+    // Same short-circuit as the passive sibling, and here it subsumes the
+    // `UserDefined(_)` test four lines below: if no class in the process has a
+    // user-defined defining loader, `get_loader_id(host)` cannot return one.
+    // Without it this arm took a SECOND `lambda_proxy_hosts` read lock and a
+    // `class_manager` read lock per lambda call, to reach that same verdict.
+    if !cratonvm_native_builtins::classloader::any_defining_loader_registered() {
+        return None;
+    }
     let host = *shared
         .classes
         .lambda_proxy_hosts
@@ -754,6 +866,94 @@ pub(crate) fn lambda_impl_dispatch_override_driven(
     }
     let name = &call_site.impl_handle.class_name;
     drive_defining_loader_load(shared, thread, host, name).filter(|cid| *cid != ClassId::new(0))
+}
+
+/// The memoised global implementation-owner `ClassId` for `call_site`, or
+/// `None` on the first dispatch (before anything has resolved it).
+///
+/// See `ClassRealm::lambda_impl_owner_memo` for why this exists — in short, the
+/// by-name resolution it replaces was measured at ~2,300-3,080 ns of a
+/// ~3,000-3,900 ns lambda dispatch. Callers must consult
+/// [`lambda_impl_dispatch_override_driven`] FIRST: this table holds only the
+/// answer the loader-blind path would produce, and must never pre-empt a
+/// loader-faithful one.
+#[inline]
+fn lambda_global_impl_owner(
+    shared: &SharedVm,
+    call_site: &crate::classloading::resolution::LambdaCallSite,
+) -> Option<ClassId> {
+    shared
+        .classes
+        .lambda_impl_owner_memo
+        .read()
+        .get(&call_site.proxy_class_id)
+        .copied()
+}
+
+/// Record the global implementation owner for `call_site` after a by-name
+/// dispatch has already succeeded through it.
+///
+/// Resolves the name through the *loaded* table only (never a load): the call
+/// that just returned proves the class is loaded and initialised, so a miss here
+/// means something raced or the name is not globally visible, and the right
+/// answer is to memoise nothing and let the next call take the slow path again.
+fn record_lambda_global_impl_owner(
+    shared: &SharedVm,
+    call_site: &crate::classloading::resolution::LambdaCallSite,
+) {
+    if lambda_global_impl_owner(shared, call_site).is_some() {
+        return;
+    }
+    let resolved = shared
+        .classes
+        .class_manager
+        .read()
+        .get_loaded_class_id(&call_site.impl_handle.class_name);
+    let Some(cid) = resolved.filter(|c| *c != ClassId::new(0)) else {
+        return;
+    };
+    shared
+        .classes
+        .lambda_impl_owner_memo
+        .write()
+        .insert(call_site.proxy_class_id, cid);
+}
+
+/// The implementation-owner `ClassId` for `call_site`: the loader-faithful
+/// override when one applies, otherwise the global by-name answer — resolved
+/// once, then served from `lambda_impl_owner_memo`.
+///
+/// Replaces four identical `class_manager.write().load_class(name)` sites, one
+/// per lambda kind that needs an owner up front (`InvokeSpecial`,
+/// `NewInvokeSpecial`, `GetStatic`, `PutStatic`). Each of them took the VM-wide
+/// class-manager **write** lock on every dispatch; `load_class` is idempotent
+/// for an already-loaded name, so from the second dispatch onward that lock was
+/// being held to re-derive a constant — and holding a global write lock per
+/// lambda call serialises every other thread against it.
+fn lambda_impl_owner_class_id(
+    shared: &SharedVm,
+    thread: &mut JvmThread,
+    call_site: &crate::classloading::resolution::LambdaCallSite,
+) -> Result<ClassId, MethodCallFailed> {
+    if let Some(cid) = lambda_impl_dispatch_override_driven(shared, thread, call_site) {
+        return Ok(cid);
+    }
+    if let Some(cid) = lambda_global_impl_owner(shared, call_site) {
+        return Ok(cid);
+    }
+    let cid = shared
+        .classes
+        .class_manager
+        .write()
+        .load_class(&call_site.impl_handle.class_name)?;
+    if cid != ClassId::new(0) {
+        shared
+            .classes
+            .lambda_impl_owner_memo
+            .write()
+            .insert(call_site.proxy_class_id, cid);
+    }
+    Ok(cid)
 }
 
 /// Resolve a lambda implementation that is private in its declaring class.
@@ -878,7 +1078,7 @@ pub(super) fn try_lambda_default_method_dispatch(
 /// guards against redefinition, not against identity collision; only the key
 /// can do the latter.
 ///
-/// See `docs/feature-designs/vm-process-global-state-round-2.md`.
+/// See `feature-designs/vm-process-global-state-round-2.md`.
 type VmScopedClassPairKey = (usize, u32, u32);
 
 thread_local! {
@@ -1044,12 +1244,24 @@ pub(super) fn try_invoke_cached_lambda_impl(
             {
                 return Ok(None);
             }
-            if method.is_static() || method.is_synchronized() || method.is_native() {
+            // `synchronized` needs the monitor enter/exit this frame builder does
+            // not do, and `native` has no bytecode to cache. `static` used to be
+            // refused here too, which excluded the single most common lambda
+            // shape in Java: javac compiles a NON-capturing lambda body to a
+            // private *static* synthetic method, so every `() -> ...` that
+            // captures nothing missed this fast path and took the generic
+            // by-name invoke on every single call. Statics are cacheable — the
+            // frame builder is receiver-agnostic (`init_locals_pooled` copies
+            // `args` into locals from slot 0, which is already how both shapes
+            // arrive) — provided the class is initialised, which the caller
+            // guarantees by only reaching here after a full dispatch has run.
+            if method.is_synchronized() || method.is_native() {
                 return Ok(None);
             }
             let Some(code_attr) = method.code() else {
                 return Ok(None);
             };
+            let is_static = method.is_static();
             let c = Arc::new(CachedBytecodeMethod {
                 declaring_class_id: declaring_id,
                 class_name: Arc::clone(&class.name),
@@ -1062,8 +1274,9 @@ pub(super) fn try_invoke_cached_lambda_impl(
                 max_locals: code_attr.max_locals,
                 num_params: count_method_params(descriptor) as u16,
                 is_synchronized: false,
-                is_static: false,
+                is_static,
                 force_native_cache: std::sync::OnceLock::new(),
+            intercept_shape_cache: std::sync::OnceLock::new(),
                 native_callback_cache: std::sync::OnceLock::new(),
                 invoc_key: std::sync::OnceLock::new(),
                 jit_probe_generation: std::sync::atomic::AtomicU64::new(0),
@@ -1077,14 +1290,17 @@ pub(super) fn try_invoke_cached_lambda_impl(
             c
         }
     };
-    if args.len() != cached.num_params as usize + 1 {
+    // An instance impl takes the receiver in `args[0]`; a static one does not.
+    let expected_args = cached.num_params as usize + usize::from(!cached.is_static);
+    if args.len() != expected_args {
         return Ok(None);
     }
     // TDigest's lambda adapter repeatedly invokes the concrete array accessor
     // `(I)D`. When that leaf is already compiled and has no dispatch helpers,
     // enter it directly instead of materializing an interpreter frame per get.
     // Other lambda implementations retain the generic cached-frame path below.
-    if !matches!(thread.kind, crate::threading::ThreadKind::Virtual)
+    if !cached.is_static
+        && !matches!(thread.kind, crate::threading::ThreadKind::Virtual)
         && &*cached.method_name == "get"
         && &*cached.method_descriptor == "(I)D"
     {
@@ -1215,7 +1431,27 @@ pub(crate) fn try_lambda_dispatch(
     LAMBDA_DISPATCH_DEPTH.with(|depth| depth.set(depth.get() + 1));
     let _lambda_dispatch_guard = LambdaDispatchGuard;
 
+    // `CRATONVM_DBG=lambda-prof` — see [`lambda_prof`]. The guard measures the
+    // whole call on every exit path (including the `return Ok(None)` fallthroughs
+    // that hand the call back to ordinary interface dispatch), because a term
+    // that only shows up on one arm would otherwise be invisible.
+    let prof = lambda_prof::on();
+    let prof_entry = prof.then(std::time::Instant::now);
+    struct ProfTotalGuard(Option<std::time::Instant>);
+    impl Drop for ProfTotalGuard {
+        fn drop(&mut self) {
+            let Some(t0) = self.0 else { return };
+            lambda_prof::add(&lambda_prof::TOTAL_NS, t0.elapsed().as_nanos() as u64);
+            let n = lambda_prof::CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            if n % lambda_prof::REPORT_EVERY == 0 {
+                lambda_prof::report();
+            }
+        }
+    }
+    let _prof_total_guard = ProfTotalGuard(prof_entry);
+
     // Look up the lambda proxy metadata for this ClassId.
+    let lookup_start = prof.then(std::time::Instant::now);
     let call_site = {
         let proxies = shared.classes.lambda_proxies.read();
         match proxies.get(&obj_class_id) {
@@ -1223,6 +1459,14 @@ pub(crate) fn try_lambda_dispatch(
             None => return Ok(None), // Not a lambda proxy
         }
     };
+    if let Some(t) = lookup_start {
+        lambda_prof::add(&lambda_prof::LOOKUP_NS, t.elapsed().as_nanos() as u64);
+    }
+    // Marks the end of "prep" and the start of "target" for whichever
+    // MethodHandleKind arm runs below; each arm stamps it immediately before its
+    // own invoke. Left `None` on the arms that are not instrumented, which then
+    // report their whole cost under `other`.
+    let prep_start = prof.then(std::time::Instant::now);
     if crate::runtime::env_cache::lambda_dbg() {
         eprintln!(
             "[cratonvm-dbg] lambda dispatch entry: cid={} sam={}.{} impl={}.{}{} kind={:?}",
@@ -1548,8 +1792,12 @@ pub(crate) fn try_lambda_dispatch(
     let sam_desc = call_site.sam_descriptor.clone();
     let impl_desc = call_site.impl_handle.descriptor.clone();
     let inst_desc = call_site.instantiated_descriptor.clone();
-    let (_sam_params_tmp, sam_ret) = split_method_descriptor(&sam_desc);
-    let (_impl_params_tmp, impl_ret) = split_method_descriptor(&impl_desc);
+    // Only the RETURN token is read here. This used to be two
+    // `split_method_descriptor` calls, i.e. a full parameter walk plus a `Vec`
+    // plus a `String` per parameter of both descriptors, allocated and dropped
+    // on every lambda invocation, for two `&str`s.
+    let sam_ret = descriptor_return_ref(&sam_desc);
+    let impl_ret = descriptor_return_ref(&impl_desc);
     match call_site.impl_handle.kind {
         MethodHandleKind::InvokeStatic => {
             // Static method: all args are parameters (no receiver).
@@ -1572,6 +1820,10 @@ pub(crate) fn try_lambda_dispatch(
                     full_args.len(),
                 );
             }
+            let target_start = prep_start.map(|t| {
+                lambda_prof::add(&lambda_prof::PREP_NS, t.elapsed().as_nanos() as u64);
+                std::time::Instant::now()
+            });
             let result = if let Some(impl_cid) =
                 lambda_impl_dispatch_override_driven(shared, thread, &call_site)
             {
@@ -1587,16 +1839,57 @@ pub(crate) fn try_lambda_dispatch(
                     &call_site.impl_handle.descriptor,
                     &full_args,
                 )?
+            } else if let Some(owner) = lambda_global_impl_owner(shared, &call_site) {
+                // Steady state. Reaching here at all means a previous dispatch
+                // already went through `invoke_shared` below, which loaded the
+                // class, ran `<clinit>`, and dispatched — so from the second call
+                // on, everything `invoke_shared` does before the actual invoke is
+                // re-derivation of a constant, and `lambda-prof` measured that
+                // re-derivation plus the by-name method lookup at ~2.8 us of a
+                // ~3.6 us dispatch.
+                //
+                // The cached-bytecode path is the same one the
+                // Virtual/Interface arm already uses; it enters the impl body
+                // with a pooled prebuilt frame and no name lookup at all. It
+                // declines (`Ok(None)`) for anything it cannot serve — a native
+                // shadow, a `synchronized` or abstract body, an arity mismatch, a
+                // redefined class — and then the generic path below runs.
+                match try_invoke_cached_lambda_impl(
+                    shared,
+                    thread,
+                    obj_class_id,
+                    owner,
+                    &call_site.impl_handle.member_name,
+                    &call_site.impl_handle.descriptor,
+                    &full_args,
+                )? {
+                    Some(v) => v,
+                    None => invoke_on_class_shared(
+                        shared,
+                        thread,
+                        owner,
+                        &call_site.impl_handle.member_name,
+                        &call_site.impl_handle.descriptor,
+                        &full_args,
+                    )?,
+                }
             } else {
-                invoke_shared(
+                let r = invoke_shared(
                     shared,
                     thread,
                     &call_site.impl_handle.class_name,
                     &call_site.impl_handle.member_name,
                     &call_site.impl_handle.descriptor,
                     &full_args,
-                )?
+                )?;
+                // Only after it succeeded: a name that failed to resolve or
+                // whose `<clinit>` threw must not be remembered as an answer.
+                record_lambda_global_impl_owner(shared, &call_site);
+                r
             };
+            if let Some(t) = target_start {
+                lambda_prof::add(&lambda_prof::TARGET_NS, t.elapsed().as_nanos() as u64);
+            }
             if crate::runtime::env_cache::lambda_dbg() {
                 eprintln!(
                     "[cratonvm-dbg] lambda static-post-invoke: {}.{}{} result={:?}",
@@ -1921,14 +2214,7 @@ pub(crate) fn try_lambda_dispatch(
             )?;
             // Loader-faithful owner resolution (gated): prefer the enclosing
             // loader's copy of the impl class when it diverges from the global.
-            let class_id = match lambda_impl_dispatch_override_driven(shared, thread, &call_site) {
-                Some(cid) => cid,
-                None => shared
-                    .classes
-                    .class_manager
-                    .write()
-                    .load_class(&call_site.impl_handle.class_name)?,
-            };
+            let class_id = lambda_impl_owner_class_id(shared, thread, &call_site)?;
             // A REF_invokeSpecial lambda target is statically bound to its
             // implementation owner.  In particular, an Interface.crate::runtime::m
             // method reference must reach that interface default method even
@@ -1965,14 +2251,7 @@ pub(crate) fn try_lambda_dispatch(
             // the same loader-blind fallback and minted an Application-loader
             // copy instead of the fork's own. (Independently fixed upstream on
             // origin/dev with the same shape; kept in sync here.)
-            let class_id = match lambda_impl_dispatch_override_driven(shared, thread, &call_site) {
-                Some(cid) => cid,
-                None => shared
-                    .classes
-                    .class_manager
-                    .write()
-                    .load_class(&call_site.impl_handle.class_name)?,
-            };
+            let class_id = lambda_impl_owner_class_id(shared, thread, &call_site)?;
             // Array-constructor reference (`SomeType[]::new`, e.g. as an
             // `IntFunction<SomeType[]>` — the mechanism behind
             // `Collection.toArray(SomeType[]::new)` and any direct user code).
@@ -2114,14 +2393,7 @@ pub(crate) fn try_lambda_dispatch(
             }
         }
         MethodHandleKind::GetStatic => {
-            let class_id = match lambda_impl_dispatch_override_driven(shared, thread, &call_site) {
-                Some(cid) => cid,
-                None => shared
-                    .classes
-                    .class_manager
-                    .write()
-                    .load_class(&call_site.impl_handle.class_name)?,
-            };
+            let class_id = lambda_impl_owner_class_id(shared, thread, &call_site)?;
             ensure_class_initialized_shared(shared, thread, class_id)?;
             let field_index = {
                 let cm = shared.classes.class_manager.read();
@@ -2185,14 +2457,7 @@ pub(crate) fn try_lambda_dispatch(
                 }
                 .into());
             }
-            let class_id = match lambda_impl_dispatch_override_driven(shared, thread, &call_site) {
-                Some(cid) => cid,
-                None => shared
-                    .classes
-                    .class_manager
-                    .write()
-                    .load_class(&call_site.impl_handle.class_name)?,
-            };
+            let class_id = lambda_impl_owner_class_id(shared, thread, &call_site)?;
             ensure_class_initialized_shared(shared, thread, class_id)?;
             let field_index = {
                 let cm = shared.classes.class_manager.read();

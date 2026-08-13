@@ -10,6 +10,13 @@
 
 use super::*;
 
+// W7-75. Imported rather than spelled `cratonvm_native_api::layout_alias::…` at
+// the call sites: `native-api/tests/read_alias_coverage.rs`'s
+// `every_read_side_observation_is_gated_and_observation_only` scans for the
+// literal `if layout_alias::enabled() {` above every `read_alias::observe_read(`,
+// so a fully-qualified gate reads as ungated to the instrument's own gate.
+use cratonvm_native_api::{layout_alias, read_alias};
+
 // ---------------------------------------------------------------------------
 // java.util.concurrent — Executors, Future, Callable, ExecutorService
 // ExecutorService = 4-field synthetic:
@@ -164,7 +171,7 @@ pub(crate) fn register_phase55_executors(r: &mut NativeMethodRegistry) {
             };
             let val_pin = pinned_object_value(ctx, val);
             let mut future =
-                alloc_concurrent_synthetic(ctx, "java/util/concurrent/CompletableFuture", 3);
+                try_alloc_concurrent_synthetic(ctx, "java/util/concurrent/CompletableFuture", 3)?;
             let future_pin = ctx.pin_native_root(future);
             match result {
                 Ok(_) => {
@@ -210,7 +217,7 @@ pub(crate) fn register_phase55_executors(r: &mut NativeMethodRegistry) {
             };
             let val_pin = pinned_object_value(ctx, val);
             let mut future =
-                alloc_concurrent_synthetic(ctx, "java/util/concurrent/CompletableFuture", 3);
+                try_alloc_concurrent_synthetic(ctx, "java/util/concurrent/CompletableFuture", 3)?;
             let future_pin = ctx.pin_native_root(future);
             match result {
                 Ok(_) => {
@@ -259,7 +266,7 @@ pub(crate) fn register_phase55_executors(r: &mut NativeMethodRegistry) {
                 return Err(result.unwrap_err());
             }
             let mut future =
-                alloc_concurrent_synthetic(ctx, "java/util/concurrent/CompletableFuture", 3);
+                try_alloc_concurrent_synthetic(ctx, "java/util/concurrent/CompletableFuture", 3)?;
             // Pin across the create_string in the Err branch below — a moving
             // young GC there would relocate the fresh CF (native stale-local
             // family).
@@ -298,7 +305,7 @@ pub(crate) fn register_phase55_executors(r: &mut NativeMethodRegistry) {
                 return Err(result.unwrap_err());
             }
             let mut future =
-                alloc_concurrent_synthetic(ctx, "java/util/concurrent/CompletableFuture", 3);
+                try_alloc_concurrent_synthetic(ctx, "java/util/concurrent/CompletableFuture", 3)?;
             // Pin across the create_string in the Err branch below — a moving
             // young GC there would relocate the fresh CF (native stale-local
             // family).
@@ -360,7 +367,7 @@ pub(crate) fn register_phase55_executors(r: &mut NativeMethodRegistry) {
                 _ => None,
             };
             let mut future =
-                alloc_concurrent_synthetic(ctx, "java/util/concurrent/CompletableFuture", 3);
+                try_alloc_concurrent_synthetic(ctx, "java/util/concurrent/CompletableFuture", 3)?;
             let future_pin = ctx.pin_native_root(future);
             // Check if any constituent CF has an exception
             let mut has_exception = false;
@@ -406,11 +413,11 @@ pub(crate) fn register_phase55_executors(r: &mut NativeMethodRegistry) {
                     // would relocate them (native stale-local family).
                     let result_pin = pinned_object_value(ctx, result);
                     let exc_pin = pinned_object_value(ctx, exc);
-                    let future = alloc_concurrent_synthetic(
+                    let future = try_alloc_concurrent_synthetic(
                         ctx,
                         "java/util/concurrent/CompletableFuture",
                         3,
-                    );
+                    )?;
                     let result = read_pinned_object_value(ctx, result_pin, result);
                     let exc = read_pinned_object_value(ctx, exc_pin, exc);
                     ctx.set_field(future, 0, result);
@@ -423,7 +430,7 @@ pub(crate) fn register_phase55_executors(r: &mut NativeMethodRegistry) {
                 }
             }
             let future =
-                alloc_concurrent_synthetic(ctx, "java/util/concurrent/CompletableFuture", 3);
+                try_alloc_concurrent_synthetic(ctx, "java/util/concurrent/CompletableFuture", 3)?;
             ctx.set_field(future, 0, Value::Object(None));
             ctx.set_field(future, 1, Value::Int(1));
             ctx.set_field(future, 2, Value::Object(None));
@@ -440,7 +447,7 @@ pub(crate) fn register_phase55_executors(r: &mut NativeMethodRegistry) {
             // relocate it (native stale-local family).
             let value_pin = pinned_object_value(ctx, value);
             let future =
-                alloc_concurrent_synthetic(ctx, "java/util/concurrent/CompletableFuture", 3);
+                try_alloc_concurrent_synthetic(ctx, "java/util/concurrent/CompletableFuture", 3)?;
             let value = read_pinned_object_value(ctx, value_pin, value);
             ctx.set_field(future, 0, value);
             ctx.set_field(future, 1, Value::Int(1));
@@ -461,7 +468,7 @@ pub(crate) fn register_phase55_executors(r: &mut NativeMethodRegistry) {
             // relocate it (native stale-local family).
             let exc_pin = pinned_object_value(ctx, exc);
             let future =
-                alloc_concurrent_synthetic(ctx, "java/util/concurrent/CompletableFuture", 3);
+                try_alloc_concurrent_synthetic(ctx, "java/util/concurrent/CompletableFuture", 3)?;
             let exc = read_pinned_object_value(ctx, exc_pin, exc);
             ctx.set_field(future, 0, Value::Object(None));
             ctx.set_field(future, 1, Value::Int(1));
@@ -523,7 +530,7 @@ pub(crate) fn register_phase55_executors(r: &mut NativeMethodRegistry) {
                 // relocate `this` (native stale-local family).
                 let this_pin = ctx.pin_native_root(this);
                 let new_cf =
-                    alloc_concurrent_synthetic(ctx, "java/util/concurrent/CompletableFuture", 3);
+                    try_alloc_concurrent_synthetic(ctx, "java/util/concurrent/CompletableFuture", 3)?;
                 let this = ctx.read_native_pin(this_pin, this);
                 ctx.set_field(new_cf, 0, Value::Object(None));
                 ctx.set_field(new_cf, 1, Value::Int(1));
@@ -563,7 +570,7 @@ pub(crate) fn register_phase55_executors(r: &mut NativeMethodRegistry) {
                 let result = result.unwrap_or(Value::Object(None));
                 let result_pin = pinned_object_value(ctx, result);
                 let new_cf =
-                    alloc_concurrent_synthetic(ctx, "java/util/concurrent/CompletableFuture", 3);
+                    try_alloc_concurrent_synthetic(ctx, "java/util/concurrent/CompletableFuture", 3)?;
                 let result = read_pinned_object_value(ctx, result_pin, result);
                 ctx.set_field(new_cf, 0, result);
                 ctx.set_field(new_cf, 1, Value::Int(1));
@@ -599,7 +606,7 @@ pub(crate) fn register_phase55_executors(r: &mut NativeMethodRegistry) {
             let result = result.unwrap_or(Value::Object(None));
             let result_pin = pinned_object_value(ctx, result);
             let new_cf =
-                alloc_concurrent_synthetic(ctx, "java/util/concurrent/CompletableFuture", 3);
+                try_alloc_concurrent_synthetic(ctx, "java/util/concurrent/CompletableFuture", 3)?;
             let result = read_pinned_object_value(ctx, result_pin, result);
             ctx.set_field(new_cf, 0, result);
             ctx.set_field(new_cf, 1, Value::Int(1));
@@ -645,7 +652,7 @@ pub(crate) fn register_phase55_executors(r: &mut NativeMethodRegistry) {
         "newSingleThreadExecutor",
         "()Ljava/util/concurrent/ExecutorService;",
         |ctx, _args| {
-            let es = alloc_concurrent_synthetic(ctx, "java/util/concurrent/ExecutorService", 4);
+            let es = try_alloc_concurrent_synthetic(ctx, "java/util/concurrent/ExecutorService", 4)?;
             // Pin across the queue alloc below — a moving young GC there would
             // relocate the fresh executor (native stale-local family).
             let es_pin = ctx.pin_native_root(es);
@@ -665,7 +672,7 @@ pub(crate) fn register_phase55_executors(r: &mut NativeMethodRegistry) {
         "(I)Ljava/util/concurrent/ExecutorService;",
         |ctx, args| {
             let pool_size = args.first().and_then(|v| v.as_int()).unwrap_or(4);
-            let es = alloc_concurrent_synthetic(ctx, "java/util/concurrent/ExecutorService", 4);
+            let es = try_alloc_concurrent_synthetic(ctx, "java/util/concurrent/ExecutorService", 4)?;
             // Pin across the queue alloc below — a moving young GC there would
             // relocate the fresh executor (native stale-local family).
             let es_pin = ctx.pin_native_root(es);
@@ -684,7 +691,7 @@ pub(crate) fn register_phase55_executors(r: &mut NativeMethodRegistry) {
         "newCachedThreadPool",
         "()Ljava/util/concurrent/ExecutorService;",
         |ctx, _args| {
-            let es = alloc_concurrent_synthetic(ctx, "java/util/concurrent/ExecutorService", 4);
+            let es = try_alloc_concurrent_synthetic(ctx, "java/util/concurrent/ExecutorService", 4)?;
             // Pin across the queue alloc below — a moving young GC there would
             // relocate the fresh executor (native stale-local family).
             let es_pin = ctx.pin_native_root(es);
@@ -703,7 +710,7 @@ pub(crate) fn register_phase55_executors(r: &mut NativeMethodRegistry) {
         "newCachedThreadPool",
         "(Ljava/util/concurrent/ThreadFactory;)Ljava/util/concurrent/ExecutorService;",
         |ctx, _args| {
-            let es = alloc_concurrent_synthetic(ctx, "java/util/concurrent/ExecutorService", 4);
+            let es = try_alloc_concurrent_synthetic(ctx, "java/util/concurrent/ExecutorService", 4)?;
             // Pin across the queue alloc below — a moving young GC there would
             // relocate the fresh executor (native stale-local family).
             let es_pin = ctx.pin_native_root(es);
@@ -724,7 +731,7 @@ pub(crate) fn register_phase55_executors(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let pool_size = args.first().and_then(|v| v.as_int()).unwrap_or(1);
             let es =
-                alloc_concurrent_synthetic(ctx, "java/util/concurrent/ScheduledExecutorService", 4);
+                try_alloc_concurrent_synthetic(ctx, "java/util/concurrent/ScheduledExecutorService", 4)?;
             // Pin across the queue alloc below — a moving young GC there would
             // relocate the fresh executor (native stale-local family).
             let es_pin = ctx.pin_native_root(es);
@@ -743,7 +750,7 @@ pub(crate) fn register_phase55_executors(r: &mut NativeMethodRegistry) {
         "newVirtualThreadPerTaskExecutor",
         "()Ljava/util/concurrent/ExecutorService;",
         |ctx, _args| {
-            let es = alloc_concurrent_synthetic(ctx, "java/util/concurrent/ExecutorService", 4);
+            let es = try_alloc_concurrent_synthetic(ctx, "java/util/concurrent/ExecutorService", 4)?;
             // Pin across the queue alloc below — a moving young GC there would
             // relocate the fresh executor (native stale-local family).
             let es_pin = ctx.pin_native_root(es);
@@ -810,7 +817,7 @@ pub(crate) fn register_phase55_executors(r: &mut NativeMethodRegistry) {
             // Pin across the list alloc below — a moving young GC there would
             // relocate the fresh array (native stale-local family).
             let empty_pin = ctx.pin_native_root(empty);
-            let list = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
+            let list = try_alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2)?;
             let empty = ctx.read_native_pin(empty_pin, empty);
             ctx.set_field(list, 0, Value::Object(Some(empty)));
             ctx.set_field(list, 1, Value::Int(0));
@@ -835,7 +842,7 @@ pub(crate) fn register_phase55_executors(r: &mut NativeMethodRegistry) {
             }
         }
         ctx.set_field(this, 3, Value::Int(0));
-        let list = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
+        let list = try_alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2)?;
         let pending = ctx.read_native_pin(pending_pin, pending);
         ctx.set_field(list, 0, Value::Object(Some(pending)));
         ctx.set_field(list, 1, Value::Int(task_count as i32));
@@ -911,7 +918,7 @@ pub(crate) fn register_phase55_executors(r: &mut NativeMethodRegistry) {
             let this_pin = ctx.pin_native_root(this);
             let callable_pin = ctx.pin_native_root(callable);
             // Create a Future with the task stored for lazy execution
-            let future = alloc_concurrent_synthetic(ctx, "java/util/concurrent/Future", 4);
+            let future = try_alloc_concurrent_synthetic(ctx, "java/util/concurrent/Future", 4)?;
             let this = ctx.read_native_pin(this_pin, this);
             let callable = ctx.read_native_pin(callable_pin, callable);
             ctx.set_field(future, 0, Value::Object(None)); // result (not yet computed)
@@ -949,7 +956,7 @@ pub(crate) fn register_phase55_executors(r: &mut NativeMethodRegistry) {
             // relocate `this`/`runnable` (native stale-local family).
             let this_pin = ctx.pin_native_root(this);
             let runnable_pin = ctx.pin_native_root(runnable);
-            let future = alloc_concurrent_synthetic(ctx, "java/util/concurrent/Future", 4);
+            let future = try_alloc_concurrent_synthetic(ctx, "java/util/concurrent/Future", 4)?;
             let this = ctx.read_native_pin(this_pin, this);
             let runnable = ctx.read_native_pin(runnable_pin, runnable);
             ctx.set_field(future, 0, Value::Object(None));
@@ -998,7 +1005,7 @@ pub(crate) fn register_phase55_executors(r: &mut NativeMethodRegistry) {
         "NANOSECONDS",
         "Ljava/util/concurrent/TimeUnit;",
         |ctx, _args| {
-            let obj = alloc_concurrent_synthetic(ctx, "java/util/concurrent/TimeUnit", 1);
+            let obj = try_alloc_concurrent_synthetic(ctx, "java/util/concurrent/TimeUnit", 1)?;
             crate::phases_early::tu_set_ordinal(ctx, obj, 0);
             Ok(Some(Value::Object(Some(obj))))
         },
@@ -1008,7 +1015,7 @@ pub(crate) fn register_phase55_executors(r: &mut NativeMethodRegistry) {
         "MICROSECONDS",
         "Ljava/util/concurrent/TimeUnit;",
         |ctx, _args| {
-            let obj = alloc_concurrent_synthetic(ctx, "java/util/concurrent/TimeUnit", 1);
+            let obj = try_alloc_concurrent_synthetic(ctx, "java/util/concurrent/TimeUnit", 1)?;
             crate::phases_early::tu_set_ordinal(ctx, obj, 1);
             Ok(Some(Value::Object(Some(obj))))
         },
@@ -1018,7 +1025,7 @@ pub(crate) fn register_phase55_executors(r: &mut NativeMethodRegistry) {
         "MILLISECONDS",
         "Ljava/util/concurrent/TimeUnit;",
         |ctx, _args| {
-            let obj = alloc_concurrent_synthetic(ctx, "java/util/concurrent/TimeUnit", 1);
+            let obj = try_alloc_concurrent_synthetic(ctx, "java/util/concurrent/TimeUnit", 1)?;
             crate::phases_early::tu_set_ordinal(ctx, obj, 2);
             Ok(Some(Value::Object(Some(obj))))
         },
@@ -1028,7 +1035,7 @@ pub(crate) fn register_phase55_executors(r: &mut NativeMethodRegistry) {
         "SECONDS",
         "Ljava/util/concurrent/TimeUnit;",
         |ctx, _args| {
-            let obj = alloc_concurrent_synthetic(ctx, "java/util/concurrent/TimeUnit", 1);
+            let obj = try_alloc_concurrent_synthetic(ctx, "java/util/concurrent/TimeUnit", 1)?;
             crate::phases_early::tu_set_ordinal(ctx, obj, 3);
             Ok(Some(Value::Object(Some(obj))))
         },
@@ -1038,7 +1045,7 @@ pub(crate) fn register_phase55_executors(r: &mut NativeMethodRegistry) {
         "MINUTES",
         "Ljava/util/concurrent/TimeUnit;",
         |ctx, _args| {
-            let obj = alloc_concurrent_synthetic(ctx, "java/util/concurrent/TimeUnit", 1);
+            let obj = try_alloc_concurrent_synthetic(ctx, "java/util/concurrent/TimeUnit", 1)?;
             crate::phases_early::tu_set_ordinal(ctx, obj, 4);
             Ok(Some(Value::Object(Some(obj))))
         },
@@ -1048,7 +1055,7 @@ pub(crate) fn register_phase55_executors(r: &mut NativeMethodRegistry) {
         "HOURS",
         "Ljava/util/concurrent/TimeUnit;",
         |ctx, _args| {
-            let obj = alloc_concurrent_synthetic(ctx, "java/util/concurrent/TimeUnit", 1);
+            let obj = try_alloc_concurrent_synthetic(ctx, "java/util/concurrent/TimeUnit", 1)?;
             crate::phases_early::tu_set_ordinal(ctx, obj, 5);
             Ok(Some(Value::Object(Some(obj))))
         },
@@ -1058,12 +1065,13 @@ pub(crate) fn register_phase55_executors(r: &mut NativeMethodRegistry) {
         "DAYS",
         "Ljava/util/concurrent/TimeUnit;",
         |ctx, _args| {
-            let obj = alloc_concurrent_synthetic(ctx, "java/util/concurrent/TimeUnit", 1);
+            let obj = try_alloc_concurrent_synthetic(ctx, "java/util/concurrent/TimeUnit", 1)?;
             crate::phases_early::tu_set_ordinal(ctx, obj, 6);
             Ok(Some(Value::Object(Some(obj))))
         },
     );
     r.set_category(__prev_cat);
+    ()
 }
 
 // =============================================================================
@@ -1251,7 +1259,7 @@ pub(crate) fn register_p58_completable_future(r: &mut NativeMethodRegistry) {
                 _ => 0,
             };
             let delay_ms = scheduled_convert_to_millis(ctx, delay, args.get(1));
-            let exec = alloc_concurrent_synthetic(ctx, "java/util/concurrent/Executor", 1);
+            let exec = try_alloc_concurrent_synthetic(ctx, "java/util/concurrent/Executor", 1)?;
             ctx.set_field(exec, 0, Value::Long(delay_ms));
             Ok(Some(Value::Object(Some(exec))))
         },
@@ -1267,7 +1275,7 @@ pub(crate) fn register_p58_completable_future(r: &mut NativeMethodRegistry) {
                 _ => 0,
             };
             let delay_ms = scheduled_convert_to_millis(ctx, delay, args.get(1));
-            let exec = alloc_concurrent_synthetic(ctx, "java/util/concurrent/Executor", 1);
+            let exec = try_alloc_concurrent_synthetic(ctx, "java/util/concurrent/Executor", 1)?;
             ctx.set_field(exec, 0, Value::Long(delay_ms));
             Ok(Some(Value::Object(Some(exec))))
         },
@@ -1332,13 +1340,14 @@ pub(crate) fn register_p58_completable_future(r: &mut NativeMethodRegistry) {
         },
     );
     r.set_category(__prev_cat);
+    ()
 }
 
-pub(crate) fn p58_new_cf(ctx: &mut dyn NativeContext, result: Value, done: bool) -> ObjectRef {
+pub(crate) fn p58_new_cf(ctx: &mut dyn NativeContext, result: Value, done: bool) -> Result<ObjectRef, MethodCallFailed> {
     // Pin across the CF alloc below — a moving young GC there would relocate
     // the result value (native stale-local family).
     let result_pin = pinned_object_value(ctx, result);
-    let cf = alloc_concurrent_synthetic(ctx, "java/util/concurrent/CompletableFuture", 2);
+    let cf = try_alloc_concurrent_synthetic(ctx, "java/util/concurrent/CompletableFuture", 2)?;
     ctx.set_field(
         cf,
         FUT_FIELD_RESULT,
@@ -1348,7 +1357,7 @@ pub(crate) fn p58_new_cf(ctx: &mut dyn NativeContext, result: Value, done: bool)
     if let Some((h, _)) = result_pin {
         ctx.unpin_native_roots(h);
     }
-    cf
+    Ok(cf)
 }
 
 /// DF07: a COMPLETED `Future` for the synchronous async-channel ops. Returns a
@@ -1464,10 +1473,10 @@ pub(crate) fn p58_cf_then_compose(ctx: &mut dyn NativeContext, args: &[Value]) -
     if let Some(Value::Object(Some(inner_cf))) = inner {
         let inner_result = ctx.get_field(inner_cf, FUT_FIELD_RESULT);
         let inner_done = ctx.get_field(inner_cf, FUT_FIELD_DONE);
-        let cf = p58_new_cf(ctx, inner_result, inner_done == Value::Int(1));
+        let cf = p58_new_cf(ctx, inner_result, inner_done == Value::Int(1))?;
         Ok(Some(Value::Object(Some(cf))))
     } else {
-        let cf = p58_new_cf(ctx, Value::Object(None), true);
+        let cf = p58_new_cf(ctx, Value::Object(None), true)?;
         Ok(Some(Value::Object(Some(cf))))
     }
 }
@@ -1476,7 +1485,7 @@ pub(crate) fn p58_cf_then_run(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
     let _this = obj_arg(args, 0)?;
     let runnable = obj_arg(args, 1)?;
     let _ = ctx.invoke_virtual(runnable, "run", "()V", &[]);
-    let cf = p58_new_cf(ctx, Value::Object(None), true);
+    let cf = p58_new_cf(ctx, Value::Object(None), true)?;
     Ok(Some(Value::Object(Some(cf))))
 }
 
@@ -1529,7 +1538,7 @@ pub(crate) fn p58_cf_when_complete(
         ctx.unpin_native_roots(h);
     }
     // Return new CF with same result
-    let cf = p58_new_cf(ctx, result, true);
+    let cf = p58_new_cf(ctx, result, true)?;
     Ok(Some(Value::Object(Some(cf))))
 }
 
@@ -1559,7 +1568,7 @@ pub(crate) fn p58_cf_handle(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
         &[result, Value::Object(None)],
     )?;
     let val = new_result.unwrap_or(Value::Object(None));
-    let cf = p58_new_cf(ctx, val, true);
+    let cf = p58_new_cf(ctx, val, true)?;
     Ok(Some(Value::Object(Some(cf))))
 }
 
@@ -1583,7 +1592,7 @@ pub(crate) fn p58_cf_exceptionally(
     }
     // No exception in our eager model — just pass through
     let result = ctx.get_field(this, FUT_FIELD_RESULT);
-    let cf = p58_new_cf(ctx, result, true);
+    let cf = p58_new_cf(ctx, result, true)?;
     Ok(Some(Value::Object(Some(cf))))
 }
 
@@ -1620,7 +1629,7 @@ pub(crate) fn p58_cf_all_of(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
         }
     }
     // All futures are already complete in our eager model
-    let cf = p58_new_cf(ctx, Value::Object(None), true);
+    let cf = p58_new_cf(ctx, Value::Object(None), true)?;
     Ok(Some(Value::Object(Some(cf))))
 }
 
@@ -1630,12 +1639,12 @@ pub(crate) fn p58_cf_any_of(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
         if ctx.array_length(*arr) > 0 {
             if let Value::Object(Some(first)) = ctx.get_array_element(*arr, 0) {
                 let result = ctx.get_field(first, FUT_FIELD_RESULT);
-                let cf = p58_new_cf(ctx, result, true);
+                let cf = p58_new_cf(ctx, result, true)?;
                 return Ok(Some(Value::Object(Some(cf))));
             }
         }
     }
-    let cf = p58_new_cf(ctx, Value::Object(None), true);
+    let cf = p58_new_cf(ctx, Value::Object(None), true)?;
     Ok(Some(Value::Object(Some(cf))))
 }
 
@@ -1652,7 +1661,7 @@ pub(crate) fn p58_cf_then_combine(ctx: &mut dyn NativeContext, args: &[Value]) -
         &[r1, r2],
     )?;
     let val = combined.unwrap_or(Value::Object(None));
-    let cf = p58_new_cf(ctx, val, true);
+    let cf = p58_new_cf(ctx, val, true)?;
     Ok(Some(Value::Object(Some(cf))))
 }
 
@@ -1671,7 +1680,7 @@ pub(crate) fn p58_cf_apply_to_either(
         &[result],
     )?;
     let val = new_result.unwrap_or(Value::Object(None));
-    let cf = p58_new_cf(ctx, val, true);
+    let cf = p58_new_cf(ctx, val, true)?;
     Ok(Some(Value::Object(Some(cf))))
 }
 
@@ -1690,7 +1699,7 @@ pub(crate) fn p58_cf_then_accept_both(
         "(Ljava/lang/Object;Ljava/lang/Object;)V",
         &[r1, r2],
     );
-    let cf = p58_new_cf(ctx, Value::Object(None), true);
+    let cf = p58_new_cf(ctx, Value::Object(None), true)?;
     Ok(Some(Value::Object(Some(cf))))
 }
 
@@ -1701,7 +1710,7 @@ pub(crate) fn p58_cf_run_after_both(
     let _this = obj_arg(args, 0)?;
     let runnable = obj_arg(args, 2)?;
     let _ = ctx.invoke_virtual(runnable, "run", "()V", &[]);
-    let cf = p58_new_cf(ctx, Value::Object(None), true);
+    let cf = p58_new_cf(ctx, Value::Object(None), true)?;
     Ok(Some(Value::Object(Some(cf))))
 }
 
@@ -1712,7 +1721,7 @@ pub(crate) fn p58_cf_run_after_either(
     let _this = obj_arg(args, 0)?;
     let runnable = obj_arg(args, 2)?;
     let _ = ctx.invoke_virtual(runnable, "run", "()V", &[]);
-    let cf = p58_new_cf(ctx, Value::Object(None), true);
+    let cf = p58_new_cf(ctx, Value::Object(None), true)?;
     Ok(Some(Value::Object(Some(cf))))
 }
 
@@ -1721,7 +1730,7 @@ pub(crate) fn p58_cf_failed_future(
     args: &[Value],
 ) -> MethodCallResult {
     let throwable = args.first().copied().unwrap_or(Value::Object(None));
-    let cf = p58_new_cf(ctx, throwable, true);
+    let cf = p58_new_cf(ctx, throwable, true)?;
     Ok(Some(Value::Object(Some(cf))))
 }
 
@@ -1852,7 +1861,7 @@ pub(crate) fn register_p58_synchronous_queue(r: &mut NativeMethodRegistry) {
         // Empty iterator
         use cratonvm_types::ArrayElementType;
         let arr = ctx.new_array(ArrayElementType::Reference, 0);
-        let itr = alloc_concurrent_synthetic(ctx, "java/util/concurrent/SynchronousQueue$Itr", 2);
+        let itr = try_alloc_concurrent_synthetic(ctx, "java/util/concurrent/SynchronousQueue$Itr", 2)?;
         ctx.set_field(itr, 0, Value::Object(Some(arr)));
         ctx.set_field(itr, 1, Value::Int(0));
         Ok(Some(Value::Object(Some(itr))))
@@ -2324,12 +2333,12 @@ pub(crate) fn p58_sq_clear(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
 /// `ArrayList`-style 2-field synthetic: field 0 = ref array, field 1 = Int
 /// count) when the publisher's field 0 is null. `this` is pinned by the caller
 /// or pinned here across the allocation. Returns the (post-alloc) wrapper ref.
-pub(crate) fn sp_wrapper_ensure(ctx: &mut dyn NativeContext, this: ObjectRef) -> ObjectRef {
+pub(crate) fn sp_wrapper_ensure(ctx: &mut dyn NativeContext, this: ObjectRef) -> Result<ObjectRef, MethodCallFailed> {
     if let Value::Object(Some(w)) = ctx.get_field(this, 0) {
-        return w;
+        return Ok(w);
     }
     let this_pin = ctx.pin_native_root(this);
-    let wrapper = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
+    let wrapper = try_alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2)?;
     let w_pin = ctx.pin_native_root(wrapper);
     let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 8);
     let wrapper = ctx.read_native_pin(w_pin, wrapper);
@@ -2339,7 +2348,7 @@ pub(crate) fn sp_wrapper_ensure(ctx: &mut dyn NativeContext, this: ObjectRef) ->
     let wrapper = ctx.read_native_pin(w_pin, wrapper);
     ctx.set_field(this, 0, Value::Object(Some(wrapper)));
     ctx.unpin_native_roots(this_pin);
-    wrapper
+    Ok(wrapper)
 }
 
 /// Read `(backing_array, count)` from a publisher's subscriber-list wrapper, or
@@ -2373,10 +2382,10 @@ pub(crate) fn sp_append_subscriber(
     ctx: &mut dyn NativeContext,
     this: ObjectRef,
     subscriber: ObjectRef,
-) {
+) -> Result<(), MethodCallFailed> {
     let this_pin = ctx.pin_native_root(this);
     let sub_pin = ctx.pin_native_root(subscriber);
-    let wrapper = sp_wrapper_ensure(ctx, this);
+    let wrapper = sp_wrapper_ensure(ctx, this)?;
     let w_pin = ctx.pin_native_root(wrapper);
     let (arr, cap, count) = match ctx.get_field(wrapper, 0) {
         Value::Object(Some(a)) => {
@@ -2413,6 +2422,7 @@ pub(crate) fn sp_append_subscriber(
     let wrapper = ctx.read_native_pin(w_pin, wrapper);
     ctx.set_field(wrapper, 1, Value::Int((count + 1) as i32));
     ctx.unpin_native_roots(this_pin);
+    Ok(())
 }
 
 /// Deliver one item to every registered subscriber via `onNext`. Returns the
@@ -2603,13 +2613,13 @@ pub(crate) fn register_p60_flow(r: &mut NativeMethodRegistry) {
             // Build a Flow.Subscription (cancelled=0, demand=1) and hand it to
             // the subscriber so it can establish demand.
             let subscription =
-                alloc_concurrent_synthetic(ctx, "java/util/concurrent/Flow$Subscription", 2);
+                try_alloc_concurrent_synthetic(ctx, "java/util/concurrent/Flow$Subscription", 2)?;
             let sub_pin = ctx.pin_native_root(subscription);
             ctx.set_field(subscription, 0, Value::Int(0));
             ctx.set_field(subscription, 1, Value::Long(0));
             let this = ctx.read_native_pin(pin, this);
             let subscriber = ctx.read_native_pin(sub_arg_pin, subscriber);
-            sp_append_subscriber(ctx, this, subscriber);
+            sp_append_subscriber(ctx, this, subscriber)?;
             let subscriber = ctx.read_native_pin(sub_arg_pin, subscriber);
             let subscription = ctx.read_native_pin(sub_pin, subscription);
             let _ = ctx.invoke_virtual(
@@ -3023,11 +3033,11 @@ pub(crate) fn register_p63_scheduled_executor(r: &mut NativeMethodRegistry) {
     fn build_sf(
         ctx: &mut dyn cratonvm_native_api::NativeContext,
         id: u64,
-    ) -> cratonvm_types::ObjectRef {
-        let sf = alloc_concurrent_synthetic(ctx, "java/util/concurrent/ScheduledFuture", 2);
+    ) -> Result<cratonvm_types::ObjectRef, MethodCallFailed> {
+        let sf = try_alloc_concurrent_synthetic(ctx, "java/util/concurrent/ScheduledFuture", 2)?;
         ctx.set_field(sf, 0, Value::Long(id as i64));
         ctx.set_field(sf, 1, Value::Int(0));
-        sf
+        Ok(sf)
     }
 
     r.register(stpe, "schedule", "(Ljava/lang/Runnable;JLjava/util/concurrent/TimeUnit;)Ljava/util/concurrent/ScheduledFuture;", |ctx, args| {
@@ -3048,7 +3058,7 @@ pub(crate) fn register_p63_scheduled_executor(r: &mut NativeMethodRegistry) {
         // sleep (e.g. zero-delay `schedule(r, 0, MILLIS)`) still get the
         // single fire they expect synchronously.
         crate::scheduled_pump::registry().pump(ctx);
-        Ok(Some(Value::Object(Some(build_sf(ctx, task.id)))))
+        Ok(Some(Value::Object(Some(build_sf(ctx, task.id)?))))
     });
     // scheduleAtFixedRate — periodic firing driven by the pump.
     r.register(stpe, "scheduleAtFixedRate", "(Ljava/lang/Runnable;JJLjava/util/concurrent/TimeUnit;)Ljava/util/concurrent/ScheduledFuture;", |ctx, args| {
@@ -3074,7 +3084,7 @@ pub(crate) fn register_p63_scheduled_executor(r: &mut NativeMethodRegistry) {
         // Initial pump for zero-delay schedules so the first fire happens
         // before the caller's first `Thread.sleep`.
         crate::scheduled_pump::registry().pump(ctx);
-        Ok(Some(Value::Object(Some(build_sf(ctx, task.id)))))
+        Ok(Some(Value::Object(Some(build_sf(ctx, task.id)?))))
     });
     // scheduleWithFixedDelay — pump-driven, fixed-delay variant.
     r.register(stpe, "scheduleWithFixedDelay", "(Ljava/lang/Runnable;JJLjava/util/concurrent/TimeUnit;)Ljava/util/concurrent/ScheduledFuture;", |ctx, args| {
@@ -3098,7 +3108,7 @@ pub(crate) fn register_p63_scheduled_executor(r: &mut NativeMethodRegistry) {
         let period_ms = scheduled_convert_to_millis(ctx, period, args.get(4)).max(1) as u64;
         let task = crate::scheduled_pump::registry().register(runnable, initial_ms, period_ms, true);
         crate::scheduled_pump::registry().pump(ctx);
-        Ok(Some(Value::Object(Some(build_sf(ctx, task.id)))))
+        Ok(Some(Value::Object(Some(build_sf(ctx, task.id)?))))
     });
     // ScheduledFuture.cancel(boolean) — flip the cancelled flag and
     // return whether this call performed the transition. The call is
@@ -3176,7 +3186,7 @@ pub(crate) fn register_p63_scheduled_executor(r: &mut NativeMethodRegistry) {
         // is empty in our synthetic model.
         crate::scheduled_pump::registry().cancel_all();
         crate::scheduled_pump::registry().gc();
-        let al = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
+        let al = try_alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2)?;
         ctx.set_field(al, 0, Value::Object(None));
         ctx.set_field(al, 1, Value::Int(0));
         Ok(Some(Value::Object(Some(al))))
@@ -3251,7 +3261,7 @@ pub(crate) fn register_p63_scheduled_executor(r: &mut NativeMethodRegistry) {
             }
         }
         let _ = ctx.invoke_virtual(runnable, "run", "()V", &[]);
-        let cf = p58_new_cf(ctx, Value::Object(None), true);
+        let cf = p58_new_cf(ctx, Value::Object(None), true)?;
         Ok(Some(Value::Object(Some(cf))))
     });
     r.register(ses, "shutdown", "()V", |ctx, args| {
@@ -3271,13 +3281,14 @@ pub(crate) fn register_p63_scheduled_executor(r: &mut NativeMethodRegistry) {
                 Some(Value::Int(v)) => *v,
                 _ => 1,
             };
-            let obj = stpe_new_executor(ctx, cores).unwrap_or_else(|| {
-                alloc_concurrent_synthetic(
+            let obj = match stpe_new_executor(ctx, cores) {
+                Some(obj) => obj,
+                None => try_alloc_concurrent_synthetic(
                     ctx,
                     "java/util/concurrent/ScheduledThreadPoolExecutor",
                     2,
-                )
-            });
+                )?,
+            };
             Ok(Some(Value::Object(Some(obj))))
         },
     );
@@ -3286,13 +3297,14 @@ pub(crate) fn register_p63_scheduled_executor(r: &mut NativeMethodRegistry) {
         "newSingleThreadScheduledExecutor",
         "()Ljava/util/concurrent/ScheduledExecutorService;",
         |ctx, _args| {
-            let obj = stpe_new_executor(ctx, 1).unwrap_or_else(|| {
-                alloc_concurrent_synthetic(
+            let obj = match stpe_new_executor(ctx, 1) {
+                Some(obj) => obj,
+                None => try_alloc_concurrent_synthetic(
                     ctx,
                     "java/util/concurrent/ScheduledThreadPoolExecutor",
                     2,
-                )
-            });
+                )?,
+            };
             Ok(Some(Value::Object(Some(obj))))
         },
     );
@@ -3951,7 +3963,7 @@ fn ecs_run_and_record(
         _ => {
             ctx.unpin_native_roots(this_pin);
             let value = runnable_result.unwrap_or(Value::Object(None));
-            let cf = p58_new_cf(ctx, value, true);
+            let cf = p58_new_cf(ctx, value, true)?;
             return Ok(Some(Value::Object(Some(cf))));
         }
     };
@@ -3967,7 +3979,7 @@ fn ecs_run_and_record(
     // borrows `ctx` immutably (`read_pinned_object_value`) inside a call that
     // already borrows it mutably (`p58_new_cf`).
     let forwarded = read_pinned_object_value(ctx, value_pin, value);
-    let cf = p58_new_cf(ctx, forwarded, true);
+    let cf = p58_new_cf(ctx, forwarded, true)?;
     if let Some((h, _)) = value_pin {
         ctx.unpin_native_roots(h);
     }
@@ -4123,7 +4135,7 @@ pub(crate) fn register_p66_thread_builder(r: &mut NativeMethodRegistry) {
         "ofVirtual",
         "()Ljava/lang/Thread$Builder;",
         |ctx, _args| {
-            let obj = alloc_concurrent_synthetic(ctx, "java/lang/Thread$Builder", 2);
+            let obj = try_alloc_concurrent_synthetic(ctx, "java/lang/Thread$Builder", 2)?;
             ctx.set_field(obj, 0, Value::Object(None)); // name
             ctx.set_field(obj, 1, Value::Int(1)); // virtual=true
             Ok(Some(Value::Object(Some(obj))))
@@ -4134,7 +4146,7 @@ pub(crate) fn register_p66_thread_builder(r: &mut NativeMethodRegistry) {
         "ofPlatform",
         "()Ljava/lang/Thread$Builder;",
         |ctx, _args| {
-            let obj = alloc_concurrent_synthetic(ctx, "java/lang/Thread$Builder", 2);
+            let obj = try_alloc_concurrent_synthetic(ctx, "java/lang/Thread$Builder", 2)?;
             ctx.set_field(obj, 0, Value::Object(None));
             ctx.set_field(obj, 1, Value::Int(0)); // virtual=false
             Ok(Some(Value::Object(Some(obj))))
@@ -4146,7 +4158,7 @@ pub(crate) fn register_p66_thread_builder(r: &mut NativeMethodRegistry) {
         "(Ljava/lang/Runnable;)Ljava/lang/Thread;",
         |ctx, args| {
             let runnable = args.first().copied().unwrap_or(Value::Object(None));
-            let thr = alloc_concurrent_synthetic(ctx, "java/lang/Thread", 5);
+            let thr = try_alloc_concurrent_synthetic(ctx, "java/lang/Thread", 5)?;
             let name = ctx.create_string("virtual-thread");
             ctx.set_field(thr, 0, Value::Object(Some(name)));
             ctx.set_field(thr, 1, Value::Int(5)); // NORM_PRIORITY
@@ -4200,7 +4212,7 @@ pub(crate) fn register_p66_thread_builder(r: &mut NativeMethodRegistry) {
             let this = obj_arg(args, 0)?;
             let runnable = args.get(1).copied().unwrap_or(Value::Object(None));
             let is_virtual = matches!(ctx.get_field(this, 1), Value::Int(1));
-            let thr = alloc_concurrent_synthetic(ctx, "java/lang/Thread", 5);
+            let thr = try_alloc_concurrent_synthetic(ctx, "java/lang/Thread", 5)?;
             // Use builder's stored name or default
             let name_val = ctx.get_field(this, 0);
             if matches!(name_val, Value::Object(Some(_))) {
@@ -4228,7 +4240,7 @@ pub(crate) fn register_p66_thread_builder(r: &mut NativeMethodRegistry) {
             let this = obj_arg(args, 0)?;
             let runnable = args.get(1).copied().unwrap_or(Value::Object(None));
             let is_virtual = matches!(ctx.get_field(this, 1), Value::Int(1));
-            let thr = alloc_concurrent_synthetic(ctx, "java/lang/Thread", 5);
+            let thr = try_alloc_concurrent_synthetic(ctx, "java/lang/Thread", 5)?;
             let name_val = ctx.get_field(this, 0);
             if matches!(name_val, Value::Object(Some(_))) {
                 ctx.set_field(thr, 0, name_val);
@@ -4250,7 +4262,7 @@ pub(crate) fn register_p66_thread_builder(r: &mut NativeMethodRegistry) {
             // Return a ThreadFactory that delegates to the builder.
             // The factory is a 1-field object: field 0 = the builder reference.
             let this = obj_arg(args, 0)?;
-            let factory = alloc_concurrent_synthetic(ctx, "java/util/concurrent/ThreadFactory", 1);
+            let factory = try_alloc_concurrent_synthetic(ctx, "java/util/concurrent/ThreadFactory", 1)?;
             ctx.set_field(factory, 0, Value::Object(Some(this)));
             Ok(Some(Value::Object(Some(factory))))
         },
@@ -4268,7 +4280,7 @@ pub(crate) fn register_p66_thread_builder(r: &mut NativeMethodRegistry) {
                 Value::Object(Some(b)) => b,
                 _ => {
                     // No builder stored — create a default platform thread
-                    let thr = alloc_concurrent_synthetic(ctx, "java/lang/Thread", 5);
+                    let thr = try_alloc_concurrent_synthetic(ctx, "java/lang/Thread", 5)?;
                     let name = ctx.create_string("factory-thread");
                     ctx.set_field(thr, 0, Value::Object(Some(name)));
                     ctx.set_field(thr, 1, Value::Int(5));
@@ -4278,7 +4290,7 @@ pub(crate) fn register_p66_thread_builder(r: &mut NativeMethodRegistry) {
                 }
             };
             let is_virtual = matches!(ctx.get_field(builder_ref, 1), Value::Int(1));
-            let thr = alloc_concurrent_synthetic(ctx, "java/lang/Thread", 5);
+            let thr = try_alloc_concurrent_synthetic(ctx, "java/lang/Thread", 5)?;
             let name_val = ctx.get_field(builder_ref, 0);
             if matches!(name_val, Value::Object(Some(_))) {
                 ctx.set_field(thr, 0, name_val);
@@ -4345,16 +4357,16 @@ const INCUBATOR_SUBTASK_FAILED: i32 = 3;
 /// Wrap `value` in a synthetic `java.util.Optional` (1 field; null == empty).
 /// `Optional`-returning methods must never hand back a bare null — callers
 /// immediately dereference the result with `isPresent()`/`orElse(..)`.
-fn sts_optional_of(ctx: &mut dyn NativeContext, value: Value) -> ObjectRef {
+fn sts_optional_of(ctx: &mut dyn NativeContext, value: Value) -> Result<ObjectRef, MethodCallFailed> {
     // Pin the payload across the Optional allocation (native stale-local family).
     let value_pin = pinned_object_value(ctx, value);
-    let opt = alloc_concurrent_synthetic(ctx, "java/util/Optional", 1);
+    let opt = try_alloc_concurrent_synthetic(ctx, "java/util/Optional", 1)?;
     let value = read_pinned_object_value(ctx, value_pin, value);
     ctx.set_field(opt, 0, value);
     if let Some((h, _)) = value_pin {
         ctx.unpin_native_roots(h);
     }
-    opt
+    Ok(opt)
 }
 
 /// The Throwable behind a failed call, when the failure was a Java exception
@@ -4379,17 +4391,17 @@ fn incubator_fork_subtask(
     ctx: &mut dyn NativeContext,
     scope: Option<ObjectRef>,
     callable: Option<ObjectRef>,
-) -> (Option<ObjectRef>, ObjectRef) {
-    let subtask = alloc_concurrent_synthetic(
+) -> Result<(Option<ObjectRef>, ObjectRef), MethodCallFailed> {
+    let subtask = try_alloc_concurrent_synthetic(
         ctx,
         "jdk/incubator/concurrent/StructuredTaskScope$Subtask",
         3,
-    );
+    )?;
     ctx.set_field(subtask, 0, Value::Int(INCUBATOR_SUBTASK_UNAVAILABLE));
     ctx.set_field(subtask, 1, Value::Object(None));
     ctx.set_field(subtask, 2, Value::Object(None));
     let Some(callable) = callable else {
-        return (scope, subtask);
+        return Ok((scope, subtask));
     };
     let base = ctx.pin_native_root(subtask);
     let scope_pin = scope.map(|s| (ctx.pin_native_root(s), s));
@@ -4410,12 +4422,30 @@ fn incubator_fork_subtask(
         }
     }
     ctx.unpin_native_roots(base);
-    (scope, subtask)
+    Ok((scope, subtask))
 }
 
 pub(crate) fn register_p67_structured_task_scope(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
+    // EVERYTHING UNDER `jdk/incubator/concurrent/` BELOW IS BOUND TO A PACKAGE
+    // JDK 25 DOES NOT SHIP. Measured, not assumed — `javap
+    // jdk.incubator.concurrent.StructuredTaskScope` on Adoptium 25.0.3.9 answers
+    // `class not found`, and `probes/StructuredTaskScopeProbe`'s `deadJdk21Names`
+    // section prints `ClassNotFoundException` for all four incubator names on
+    // HotSpot, `--real-jdk` and `--jdk-only` alike. The API left the incubator
+    // for `java.util.concurrent` in Java 21 and was then REDESIGNED by JEP 505
+    // for 25, so these bodies are two generations stale.
+    //
+    // Not deleted here, and the reason is the same one
+    // docs/known-issues/jdk-only/W7-14-fjp-common-factory-bound-by-name.md gave
+    // for `SynchronousQueue$Itr`: a registration on a class the image never
+    // declares is inert rather than wrong, and the ~30 of them here belong to
+    // the never-shipped-registrar census
+    // (docs/known-issues/jdk-only/W7-5-registrars-that-never-shipped.md), which
+    // already counts this registrar, not to a lane fixing the JDK 25 shape. What
+    // this comment buys is that the next reader does not have to re-run `javap`
+    // to find out they are dead.
     let sts = "jdk/incubator/concurrent/StructuredTaskScope";
 
     r.register(sts, "<init>", "()V", |ctx, args| {
@@ -4446,7 +4476,7 @@ pub(crate) fn register_p67_structured_task_scope(r: &mut NativeMethodRegistry) {
                 Some(Value::Object(Some(c))) => Some(*c),
                 _ => None,
             };
-            let (_, subtask) = incubator_fork_subtask(ctx, None, callable);
+            let (_, subtask) = incubator_fork_subtask(ctx, None, callable)?;
             Ok(Some(Value::Object(Some(subtask))))
         },
     );
@@ -4564,7 +4594,7 @@ pub(crate) fn register_p67_structured_task_scope(r: &mut NativeMethodRegistry) {
                 Some(Value::Object(Some(c))) => Some(*c),
                 _ => None,
             };
-            let (this, subtask) = incubator_fork_subtask(ctx, Some(this), callable);
+            let (this, subtask) = incubator_fork_subtask(ctx, Some(this), callable)?;
             // ShutdownOnSuccess captures the first successful result.
             if let Some(this) = this {
                 let succeeded =
@@ -4614,7 +4644,7 @@ pub(crate) fn register_p67_structured_task_scope(r: &mut NativeMethodRegistry) {
         } else {
             Value::Object(None)
         };
-        Ok(Some(Value::Object(Some(sts_optional_of(ctx, exc)))))
+        Ok(Some(Value::Object(Some(sts_optional_of(ctx, exc)?))))
     });
     r.register(sof, "throwIfFailed", "()V", |ctx, args| {
         // If the scope captured an exception (field 2), wrap it in ExecutionException and throw.
@@ -4656,7 +4686,7 @@ pub(crate) fn register_p67_structured_task_scope(r: &mut NativeMethodRegistry) {
                 Some(Value::Object(Some(c))) => Some(*c),
                 _ => None,
             };
-            let (this, subtask) = incubator_fork_subtask(ctx, Some(this), callable);
+            let (this, subtask) = incubator_fork_subtask(ctx, Some(this), callable)?;
             if let Some(this) = this {
                 let failed =
                     matches!(ctx.get_field(subtask, 0), Value::Int(s) if s == INCUBATOR_SUBTASK_FAILED);
@@ -4694,33 +4724,78 @@ pub(crate) fn register_p67_structured_task_scope(r: &mut NativeMethodRegistry) {
         Ok(None)
     });
 
-    // Also register under Java 25 final package: java.util.concurrent.StructuredTaskScope
+    // Also register under Java 25's package: java.util.concurrent.StructuredTaskScope
     register_p67_structured_task_scope_j25(r);
     r.set_category(__prev_cat);
+    ()
 }
 
 // =============================================================================
-// StructuredTaskScope — Java 25 final API, 8-field synthetic layout (T16.4)
+// StructuredTaskScope — the JEP 505 shape (fifth preview, JDK 25)
 //
-// Field 0 = name (Object, nullable String)
-// Field 1 = state (Int): OPEN=0, SHUTDOWN=1, CLOSED=2
+// WHAT CHANGED, AND WHY IT IS NOT A RENAME. Through JDK 21-24 this was an
+// abstract CLASS you subclassed, and the completion policy was the subclass:
+// `ShutdownOnSuccess` and `ShutdownOnFailure`. JEP 505 deleted both. JDK 25
+// declares (measured with `javap` on Adoptium 25.0.3.9, transcript in
+// docs/known-issues/jdk-only/W7-18-structured-task-scope-jep505.md):
+//
+//   public sealed interface StructuredTaskScope<T,R> extends AutoCloseable
+//     static <T,R> open(Joiner<? super T,? extends R>, Function<Configuration,Configuration>)
+//     static <T,R> open(Joiner<? super T,? extends R>)
+//     static <T>   open()
+//     abstract Subtask<U> fork(Callable<? extends U>)
+//     abstract Subtask<U> fork(Runnable)          // NEW in JEP 505
+//     abstract R          join() throws InterruptedException   // returns R, not `this`
+//     abstract boolean    isCancelled()           // replaced isShutdown()
+//     abstract void       close()
+//
+// with the policy moved into `Joiner` (five static factories: `awaitAll`,
+// `awaitAllSuccessfulOrThrow`, `allSuccessfulOrThrow`, `anySuccessfulResultOrThrow`,
+// `allUntil(Predicate)`), configuration into `Configuration` (three withers), and
+// `Subtask`/`Subtask.State`/`FailedException`/`TimeoutException` unchanged in name.
+// There is no `<init>`, no `joinUntil`, no `shutdown`, no `isShutdown`, and no
+// `$Config` — `STS.constructors=0` in the probe.
+//
+// WHERE THIS CODE APPLIES, WHICH IS NARROWER THAN IT LOOKS. This registrar is
+// reachable only from `register_synthetic_overrides` (see
+// docs/architecture/natives-over-real-jdk-classes.md §2), so in `--real-jdk` and
+// `--jdk-only` NONE of it registers and the real JDK bytecode serves the whole
+// API — measured: `--jdk-only` reports `compatibility_classes: 0` and not one
+// StructuredTaskScope violation while running the probe end to end. That is the
+// right outcome and this file must not compete with it. Everything below is the
+// synthetic-JDK library, where there is no JDK bytecode to defer to.
+//
+// FORK IS SYNCHRONOUS HERE, DELIBERATELY. The task runs on the forking thread
+// before `fork` returns, so `join()` has nothing left to wait for and cannot
+// block. That is the point: a structured-concurrency API that HANGS is worse
+// than one that fails, and a `join()` waiting on a task no thread will run is
+// the exact shape behind this tree's recorded `ForkJoinTask.invokeAll`/
+// `awaitDone` hangs. The cost is that `isCancelled()` can never be observed mid
+// flight; the benefit is that no code path here has an unbounded wait.
+//
+// LAYOUT — 8 slots, and the count is not this file's to change. `classloading/
+// src/class_manager.rs` pins `java/util/concurrent/StructuredTaskScope` at
+// `instance_fields(8)` and `native-builtins/src/jdk25_concurrency.rs` allocates
+// against the same eight. Writing a ninth index would be heap corruption rather
+// than a wrong answer (docs/architecture/natives-over-real-jdk-classes.md §5),
+// so the JEP 505 state is mapped ONTO these:
+//
+// Field 0 = name (Object, nullable String) — `Configuration.withName`
+// Field 1 = state (Int): OPEN=0, SHUTDOWN=1, CLOSED=2 — `isCancelled` reads it
 // Field 2 = task_count (Int) — total forked tasks
 // Field 3 = completed_count (Int) — subtasks that reached SUCCESS/FAILED
-// Field 4 = exception (Object, nullable Throwable; reused as result-cache
-//           on ShutdownOnSuccess)
-// Field 5 = policy (Int): BASE=0, SHUTDOWN_ON_SUCCESS=1, SHUTDOWN_ON_FAILURE=2
+// Field 4 = exception (Object, nullable Throwable; doubles as the result cache
+//           for the value-returning joiner, which is what `ShutdownOnSuccess`
+//           used it for before)
+// Field 5 = joiner kind (Int) — the field that USED to be "which subclass".
+//           JEP 505 turned the policy from a type into a value, and this slot is
+//           where that value already lived, so the redesign costs no slot.
 // Field 6 = joined (Int): 0/1
 // Field 7 = suppressed_count (Int) — subtasks rejected after shutdown
 //
 // Subtask field 0 = state: UNAVAILABLE=0, SUCCESS=2, FAILED=3
 // Subtask field 1 = result
-//
-// T16.4: fork runs the callable synchronously. Callers that want a threaded
-// subtask route through `invoke_virtual`, which on the real interpreter goes
-// through the same ephemeral-thread/invocation path that Gamma's
-// `SharedVmBridge` uses for JDWP.  For the synthetic-JDK tests the callable
-// arg is null, so fork just ticks task_count/completed_count and returns
-// a Subtask in the UNAVAILABLE state (no real Callable invocation path).
+// Subtask field 2 = exception (Throwable of a FAILED subtask)
 // =============================================================================
 
 pub(crate) const J25_STS_NAME: usize = 0;
@@ -4745,11 +4820,41 @@ pub(crate) const J25_STS_STATE_SHUTDOWN: i32 = 1;
 
 pub(crate) const J25_STS_STATE_CLOSED: i32 = 2;
 
+// Slot 5's three values, kept at their historical numbering because they are
+// WRITTEN by `jdk25_concurrency::native_sts_open_joiner_tracked` (which runs
+// after this registrar and owns `open(Joiner)`) and read here. Renumbering them
+// would be a silent cross-module miscompile, so the JEP 505 meaning is attached
+// to the existing numbers instead:
+//
+//   0 — `Joiner.awaitAll()`: wait for every subtask, never cancel, `join()` -> null
+//   1 — `Joiner.anySuccessfulResultOrThrow()`: what `ShutdownOnSuccess` WAS
+//   2 — `Joiner.awaitAllSuccessfulOrThrow()`: what `ShutdownOnFailure` WAS
+//
+// The names still say `POLICY_SHUTDOWN_ON_*` for exactly one reason: they name
+// slot 5's numeric contract with another module, and that contract did not move
+// when the Java types did. Renaming them here without renaming the writer would
+// leave two spellings of one number, which is how the JDK-21 names survived this
+// long in the first place.
 pub(crate) const J25_STS_POLICY_BASE: i32 = 0;
 
 pub(crate) const J25_STS_POLICY_SHUTDOWN_ON_SUCCESS: i32 = 1;
 
 pub(crate) const J25_STS_POLICY_SHUTDOWN_ON_FAILURE: i32 = 2;
+
+/// `Joiner`'s own 4-slot layout, slot 0. Mirrored from
+/// `jdk25_concurrency.rs`'s `JOINER_POLICY_*` because `Joiner.allUntil` is
+/// minted here and read THERE (`native_joiner_result`, `native_joiner_on_complete`)
+/// — the two modules agree by value, not by import, and this is the only
+/// spelling of that agreement on this side.
+pub(crate) const J25_JOINER_FIELD_KIND: usize = 0;
+
+/// `Joiner.awaitAll()`'s kind in the joiner object — see `J25_JOINER_FIELD_KIND`.
+pub(crate) const J25_JOINER_KIND_AWAIT_ALL: i32 = 3;
+
+/// The joiner carrier's declared width. `classloading/src/class_manager.rs`
+/// fabricates `StructuredTaskScope$Joiner` with `instance_fields(4)`; allocating
+/// any other count here trips `report_layout_alias`.
+pub(crate) const J25_JOINER_NUM_FIELDS: usize = 4;
 
 pub(crate) const J25_SUBTASK_STATE_UNAVAILABLE: i32 = 0;
 
@@ -4802,120 +4907,118 @@ pub(crate) fn j25_sts_inc_field(ctx: &mut dyn NativeContext, this: ObjectRef, id
     ctx.set_field(this, idx, Value::Int(cur + 1));
 }
 
-/// Invoke a Callable synchronously and populate the Subtask fields.
-pub(crate) enum SubtaskOutcome {
-    Success(Value),
-    Failed,
-}
-
-pub(crate) fn j25_run_callable_into_subtask(
+/// Run a task body and record the outcome on a Subtask, the one place this
+/// module calls back into user bytecode.
+///
+/// GC DISCIPLINE, and it is not optional: the body is arbitrary user code, so it
+/// allocates and can safepoint, and a moving young collection there relocates
+/// both the subtask and the scope (the native stale-local family). Both are
+/// pinned across the call and re-read from the pin afterwards; the caller gets
+/// the post-call handles back because its own copies are stale.
+///
+/// `method`/`descriptor` are the caller's because JEP 505 forks two shapes —
+/// `Callable.call()Ljava/lang/Object;` and `Runnable.run()V` — onto one subtask
+/// contract. A `Runnable` reaching SUCCESS with a null result is a RESULT, not
+/// an absence; `Subtask.get()` on it must answer null rather than throw.
+fn j25_run_task_into_subtask(
     ctx: &mut dyn NativeContext,
+    scope: ObjectRef,
     subtask: ObjectRef,
-    callable: Option<ObjectRef>,
-) -> SubtaskOutcome {
-    let Some(callable) = callable else {
-        // Null callable — mark as SUCCESS with null result (the test harness
-        // passes null callables; no Java NPE is raised by the synthetic fork
-        // contract, the subtask simply has no observable value).
+    task: Option<ObjectRef>,
+    method: &str,
+    descriptor: &str,
+) -> (ObjectRef, ObjectRef, bool) {
+    let Some(task) = task else {
+        // A null task is not reachable from JDK 25 bytecode — both `fork`
+        // overloads begin `Objects.requireNonNull(task)` — but the synthetic
+        // harnesses do pass null, and a panic here would be a worse answer than
+        // an empty SUCCESS.
         ctx.set_field(subtask, 0, Value::Int(J25_SUBTASK_STATE_SUCCESS));
         ctx.set_field(subtask, 1, Value::Object(None));
-        return SubtaskOutcome::Success(Value::Object(None));
+        return (scope, subtask, true);
     };
-    match ctx.invoke_virtual(
-        callable,
-        "call",
-        "()Ljava/lang/Object;",
-        &[Value::Object(Some(callable))],
-    ) {
-        Ok(Some(result)) => {
+    let scope_pin = ctx.pin_native_root(scope);
+    let subtask_pin = ctx.pin_native_root(subtask);
+    // `invoke_virtual` prepends the receiver, so `args` must NOT repeat it.
+    let outcome = ctx.invoke_virtual(task, method, descriptor, &[]);
+    let scope = ctx.read_native_pin(scope_pin, scope);
+    let subtask = ctx.read_native_pin(subtask_pin, subtask);
+    let succeeded = match outcome {
+        Ok(value) => {
             ctx.set_field(subtask, 0, Value::Int(J25_SUBTASK_STATE_SUCCESS));
-            ctx.set_field(subtask, 1, result);
-            SubtaskOutcome::Success(result)
+            ctx.set_field(subtask, 1, value.unwrap_or(Value::Object(None)));
+            true
         }
-        Ok(None) => {
-            ctx.set_field(subtask, 0, Value::Int(J25_SUBTASK_STATE_SUCCESS));
-            ctx.set_field(subtask, 1, Value::Object(None));
-            SubtaskOutcome::Success(Value::Object(None))
-        }
-        Err(_) => {
+        Err(err) => {
             ctx.set_field(subtask, 0, Value::Int(J25_SUBTASK_STATE_FAILED));
             ctx.set_field(subtask, 1, Value::Object(None));
-            SubtaskOutcome::Failed
+            // Slot 2 carries the cause. `Subtask.exception()` and the scope's
+            // own captured-failure slot both read it, and a FAILED subtask whose
+            // cause was dropped is the defect this slot was added to close.
+            if ctx.object_num_fields(subtask) > 2 {
+                ctx.set_field(subtask, 2, thrown_object(&err));
+            }
+            false
         }
-    }
+    };
+    ctx.unpin_native_roots(scope_pin);
+    (scope, subtask, succeeded)
 }
 
-// --- Policy-dispatched init trampolines (fn pointers, no captures) ---
-
-pub(crate) fn j25_sts_init_base(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+/// `StructuredTaskScope.fork(Runnable)Subtask` — NEW in JEP 505.
+///
+/// The JDK implements it as `fork(() -> { task.run(); return null; })`, i.e. a
+/// Callable fork whose result is null. Same here, minus the lambda: run the
+/// Runnable and record a null result, so `Subtask.get()` answers null on success
+/// rather than throwing "result is unavailable".
+///
+/// Nothing else in the tree registers this triple — `jdk25_concurrency.rs`
+/// registers only the `Callable` overload, which is the JDK-21 surface — so this
+/// is a genuine gap rather than a second body for a method that already has one.
+fn j25_sts_fork_runnable(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
-    j25_sts_init_fields(ctx, this, J25_STS_POLICY_BASE);
-    Ok(None)
+    let task = match args.get(1) {
+        Some(Value::Object(Some(t))) => Some(*t),
+        _ => None,
+    };
+    j25_sts_fork_common(ctx, this, task, "run", "()V")
 }
 
-pub(crate) fn j25_sts_init_sos(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = obj_arg(args, 0)?;
-    j25_sts_init_fields(ctx, this, J25_STS_POLICY_SHUTDOWN_ON_SUCCESS);
-    Ok(None)
-}
-
-pub(crate) fn j25_sts_init_sof(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = obj_arg(args, 0)?;
-    j25_sts_init_fields(ctx, this, J25_STS_POLICY_SHUTDOWN_ON_FAILURE);
-    Ok(None)
-}
-
-pub(crate) fn j25_sts_init_named_base(
+/// The shared body behind both `fork` overloads' bookkeeping.
+///
+/// A scope that is no longer OPEN does not run the task: JEP 505 specifies that
+/// forking into a cancelled scope still HANDS BACK a Subtask (so the caller's
+/// code shape is unchanged) but leaves it UNAVAILABLE forever. Counting those
+/// separately in slot 7 is what makes "the scope refused it" distinguishable
+/// from "the task ran and produced nothing".
+fn j25_sts_fork_common(
     ctx: &mut dyn NativeContext,
-    args: &[Value],
+    this: ObjectRef,
+    task: Option<ObjectRef>,
+    method: &str,
+    descriptor: &str,
 ) -> MethodCallResult {
-    let this = obj_arg(args, 0)?;
-    j25_sts_init_fields(ctx, this, J25_STS_POLICY_BASE);
-    if ctx.object_num_fields(this) > J25_STS_NAME {
-        let name = args.get(1).copied().unwrap_or(Value::Object(None));
-        ctx.set_field(this, J25_STS_NAME, name);
-    }
-    Ok(None)
-}
-
-pub(crate) fn j25_sts_init_named_sos(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
-    let this = obj_arg(args, 0)?;
-    j25_sts_init_fields(ctx, this, J25_STS_POLICY_SHUTDOWN_ON_SUCCESS);
-    if ctx.object_num_fields(this) > J25_STS_NAME {
-        let name = args.get(1).copied().unwrap_or(Value::Object(None));
-        ctx.set_field(this, J25_STS_NAME, name);
-    }
-    Ok(None)
-}
-
-pub(crate) fn j25_sts_init_named_sof(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
-    let this = obj_arg(args, 0)?;
-    j25_sts_init_fields(ctx, this, J25_STS_POLICY_SHUTDOWN_ON_FAILURE);
-    if ctx.object_num_fields(this) > J25_STS_NAME {
-        let name = args.get(1).copied().unwrap_or(Value::Object(None));
-        ctx.set_field(this, J25_STS_NAME, name);
-    }
-    Ok(None)
-}
-
-pub(crate) fn j25_sts_fork_impl(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-    policy: i32,
-) -> MethodCallResult {
-    let this = obj_arg(args, 0)?;
     let subtask_cls = "java/util/concurrent/StructuredTaskScope$Subtask";
-    let state = j25_sts_state(ctx, this);
-    if state != J25_STS_STATE_OPEN {
-        let subtask = alloc_concurrent_synthetic(ctx, subtask_cls, 2);
-        ctx.set_field(subtask, 0, Value::Int(J25_SUBTASK_STATE_UNAVAILABLE));
-        ctx.set_field(subtask, 1, Value::Object(None));
+    // The scope AND the task are pinned across the subtask allocation. Both are
+    // read after it — the scope for its state and counters, the task as the
+    // receiver of the invoke — and an allocation is a collection point. This is
+    // the failure that leaves a counter incremented on the object that used to be
+    // at that address.
+    let this_pin = ctx.pin_native_root(this);
+    let task_pin = task.map(|t| (ctx.pin_native_root(t), t));
+    // 3 slots: state, result, exception. `class_manager.rs` fabricates Subtask
+    // at `instance_fields(5)`; `try_alloc_concurrent_synthetic` clamps up to the
+    // declared width, so asking for 3 is safe and asking for more is not.
+    let subtask = try_alloc_concurrent_synthetic(ctx, subtask_cls, 3)?;
+    let this = ctx.read_native_pin(this_pin, this);
+    let task = task_pin.map(|(h, t)| ctx.read_native_pin(h, t));
+    ctx.unpin_native_roots(this_pin);
+    ctx.set_field(subtask, 0, Value::Int(J25_SUBTASK_STATE_UNAVAILABLE));
+    ctx.set_field(subtask, 1, Value::Object(None));
+    if ctx.object_num_fields(subtask) > 2 {
+        ctx.set_field(subtask, 2, Value::Object(None));
+    }
+    if j25_sts_state(ctx, this) != J25_STS_STATE_OPEN {
         if ctx.object_num_fields(this) > J25_STS_SUPPRESSED {
             j25_sts_inc_field(ctx, this, J25_STS_SUPPRESSED);
         }
@@ -4924,25 +5027,42 @@ pub(crate) fn j25_sts_fork_impl(
     if ctx.object_num_fields(this) > J25_STS_TASK_COUNT {
         j25_sts_inc_field(ctx, this, J25_STS_TASK_COUNT);
     }
-    let subtask = alloc_concurrent_synthetic(ctx, subtask_cls, 2);
-    let callable = match args.get(1) {
-        Some(Value::Object(Some(c))) => Some(*c),
-        _ => None,
-    };
-    let outcome = j25_run_callable_into_subtask(ctx, subtask, callable);
+    let (this, subtask, succeeded) =
+        j25_run_task_into_subtask(ctx, this, subtask, task, method, descriptor);
     if ctx.object_num_fields(this) > J25_STS_COMPLETED {
         j25_sts_inc_field(ctx, this, J25_STS_COMPLETED);
     }
-    match (policy, &outcome) {
-        (J25_STS_POLICY_SHUTDOWN_ON_SUCCESS, SubtaskOutcome::Success(v)) => {
+    // Apply the joiner's cancellation rule. This is the JEP 505 redesign in four
+    // lines: the branch used to be chosen by WHICH SUBCLASS the receiver was, and
+    // is now chosen by a value the scope carries.
+    let kind = match ctx.get_field(this, J25_STS_POLICY) {
+        Value::Int(v) => v,
+        _ => J25_STS_POLICY_BASE,
+    };
+    match (kind, succeeded) {
+        (J25_STS_POLICY_SHUTDOWN_ON_SUCCESS, true) => {
+            // `anySuccessfulResultOrThrow`: first success wins and cancels the
+            // scope. Slot 4 doubles as the result cache — first writer keeps it,
+            // matching "the result of the FIRST subtask to complete successfully".
             if ctx.object_num_fields(this) > J25_STS_EXCEPTION
                 && matches!(ctx.get_field(this, J25_STS_EXCEPTION), Value::Object(None))
             {
-                ctx.set_field(this, J25_STS_EXCEPTION, *v);
+                let result = ctx.get_field(subtask, 1);
+                ctx.set_field(this, J25_STS_EXCEPTION, result);
             }
             ctx.set_field(this, J25_STS_STATE, Value::Int(J25_STS_STATE_SHUTDOWN));
         }
-        (J25_STS_POLICY_SHUTDOWN_ON_FAILURE, SubtaskOutcome::Failed) => {
+        (J25_STS_POLICY_SHUTDOWN_ON_FAILURE, false) => {
+            // `awaitAllSuccessfulOrThrow`: first failure cancels, and the cause
+            // has to survive to `join()` or the FailedException it raises has
+            // nothing under it.
+            if ctx.object_num_fields(this) > J25_STS_EXCEPTION
+                && matches!(ctx.get_field(this, J25_STS_EXCEPTION), Value::Object(None))
+                && ctx.object_num_fields(subtask) > 2
+            {
+                let cause = ctx.get_field(subtask, 2);
+                ctx.set_field(this, J25_STS_EXCEPTION, cause);
+            }
             ctx.set_field(this, J25_STS_STATE, Value::Int(J25_STS_STATE_SHUTDOWN));
         }
         _ => {}
@@ -4950,257 +5070,436 @@ pub(crate) fn j25_sts_fork_impl(
     Ok(Some(Value::Object(Some(subtask))))
 }
 
-pub(crate) fn j25_sts_fork_base(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    j25_sts_fork_impl(ctx, args, J25_STS_POLICY_BASE)
-}
-
-pub(crate) fn j25_sts_fork_sos(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    j25_sts_fork_impl(ctx, args, J25_STS_POLICY_SHUTDOWN_ON_SUCCESS)
-}
-
-pub(crate) fn j25_sts_fork_sof(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    j25_sts_fork_impl(ctx, args, J25_STS_POLICY_SHUTDOWN_ON_FAILURE)
-}
-
-pub(crate) fn j25_sts_join_impl(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+/// `StructuredTaskScope.join()Ljava/lang/Object;` — the JEP 505 descriptor.
+///
+/// THE DESCRIPTOR IS THE WHOLE POINT. Through JDK 24 `join()` returned `this`,
+/// so its descriptor was `()Ljava/util/concurrent/StructuredTaskScope;` — which
+/// is what `jdk25_concurrency.rs` still registers. JEP 505 made it return `R`,
+/// the joiner's result, so javac emits `()Ljava/lang/Object;` and the old
+/// registration is bound to a triple no JDK 25 call site can produce. The two do
+/// not collide: they are different methods with the same name.
+///
+/// Cannot block. `fork` above ran the task before returning, so by the time this
+/// is reached every subtask has already completed — there is nothing to wait on
+/// and therefore no way to wait forever.
+fn j25_sts_join_result(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     if j25_sts_state(ctx, this) == J25_STS_STATE_CLOSED {
         return Err(RuntimeError::IllegalStateException {
-            message: "StructuredTaskScope is closed".into(),
+            message: "Already joined or scope is closed".into(),
         }
         .into());
     }
     if ctx.object_num_fields(this) > J25_STS_JOINED {
+        if matches!(ctx.get_field(this, J25_STS_JOINED), Value::Int(1)) {
+            // HotSpot 25, measured: `state.joinTwice=java.lang.IllegalStateException:
+            // Already joined or scope is closed`. A second join succeeding is the
+            // permissive shape that makes a state machine untestable.
+            return Err(RuntimeError::IllegalStateException {
+                message: "Already joined or scope is closed".into(),
+            }
+            .into());
+        }
         ctx.set_field(this, J25_STS_JOINED, Value::Int(1));
     }
-    Ok(Some(Value::Object(Some(this))))
-}
-
-pub(crate) fn j25_sts_shutdown(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = obj_arg(args, 0)?;
-    if j25_sts_state(ctx, this) != J25_STS_STATE_CLOSED {
-        ctx.set_field(this, J25_STS_STATE, Value::Int(J25_STS_STATE_SHUTDOWN));
+    let kind = match ctx.get_field(this, J25_STS_POLICY) {
+        Value::Int(v) => v,
+        _ => J25_STS_POLICY_BASE,
+    };
+    let captured = if ctx.object_num_fields(this) > J25_STS_EXCEPTION {
+        ctx.get_field(this, J25_STS_EXCEPTION)
+    } else {
+        Value::Object(None)
+    };
+    match kind {
+        J25_STS_POLICY_SHUTDOWN_ON_SUCCESS => match captured {
+            // `anySuccessfulResultOrThrow` -> the winning result, or a throw.
+            Value::Object(None) => Err(RuntimeError::IllegalStateException {
+                message: "no successful result".into(),
+            }
+            .into()),
+            v => Ok(Some(v)),
+        },
+        J25_STS_POLICY_SHUTDOWN_ON_FAILURE => match captured {
+            // `awaitAllSuccessfulOrThrow` -> Void, unless a subtask failed, in
+            // which case the ORIGINAL cause is rethrown. Rethrowing the cause
+            // rather than a fresh IllegalStateException is what lets a caller's
+            // `catch` see what actually went wrong; wrapping it in
+            // `StructuredTaskScope$FailedException` the way HotSpot does needs
+            // that class constructed, which is the residual noted in the record.
+            Value::Object(Some(exc)) => Err(MethodCallFailed::ExceptionThrown(exc)),
+            _ => Ok(Some(Value::Object(None))),
+        },
+        // `awaitAll` -> Void. Also the answer for the two Stream-returning
+        // joiners, which is WRONG for them and is the one unimplemented piece of
+        // this surface — `allSuccessfulOrThrow` and `allUntil` must return a
+        // `Stream<Subtask<T>>`, and the 8-slot layout has nowhere to keep the
+        // subtask list that stream is built from. Recorded, with the patch, in
+        // docs/known-issues/jdk-only/W7-18-structured-task-scope-jep505.md; not
+        // faked here, because a fabricated empty Stream reads as a pass to every
+        // caller that only iterates.
+        _ => Ok(Some(Value::Object(None))),
     }
-    Ok(None)
 }
 
-pub(crate) fn j25_sts_close(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = obj_arg(args, 0)?;
-    ctx.set_field(this, J25_STS_STATE, Value::Int(J25_STS_STATE_CLOSED));
-    Ok(None)
-}
-
-pub(crate) fn j25_sts_is_shutdown(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+/// `StructuredTaskScope.isCancelled()Z` — JEP 505's replacement for `isShutdown()`.
+///
+/// Not a rename with the same body: `isShutdown()` asked "has shutdown been
+/// requested", `isCancelled()` asks whether the scope was cancelled, which
+/// `close()` also makes true (measured on HotSpot:
+/// `state.isCancelledAfterClose=true`). Reading "state is not OPEN" gives both.
+fn j25_sts_is_cancelled(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     let state = j25_sts_state(ctx, this);
-    Ok(Some(Value::Int(if state != J25_STS_STATE_OPEN {
-        1
-    } else {
-        0
-    })))
+    Ok(Some(Value::Int(i32::from(state != J25_STS_STATE_OPEN))))
 }
 
-/// Register core `fork/join/joinUntil/shutdown/close/isShutdown` methods
-/// for a given scope class using static trampolines selected by policy.
-pub(crate) fn j25_register_scope_common(
-    r: &mut NativeMethodRegistry,
-    cls: &'static str,
-    policy: i32,
-    join_ret: &'static str,
-    fork_ret: &'static str,
-) {
-    // <init>()V and <init>(String, ThreadFactory)V — pick the policy-specific trampoline.
-    let (init_nullary, init_named) = match policy {
-        J25_STS_POLICY_SHUTDOWN_ON_SUCCESS => (
-            j25_sts_init_sos as cratonvm_native_api::NativeCallback,
-            j25_sts_init_named_sos as cratonvm_native_api::NativeCallback,
-        ),
-        J25_STS_POLICY_SHUTDOWN_ON_FAILURE => (
-            j25_sts_init_sof as cratonvm_native_api::NativeCallback,
-            j25_sts_init_named_sof as cratonvm_native_api::NativeCallback,
-        ),
-        _ => (
-            j25_sts_init_base as cratonvm_native_api::NativeCallback,
-            j25_sts_init_named_base as cratonvm_native_api::NativeCallback,
-        ),
+/// `StructuredTaskScope.open(Joiner, Function<Configuration,Configuration>)`.
+///
+/// The Function is APPLIED, not ignored — the JDK calls it with the default
+/// Configuration and uses whatever comes back, so a native that skips the call
+/// silently drops every `withName`/`withThreadFactory`/`withTimeout` the caller
+/// wrote. The probe prints `configuration.applied`, which is exactly the line
+/// that catches skipping it.
+///
+/// The returned Configuration's THREAD FACTORY and TIMEOUT are read and then
+/// deliberately not used: fork is synchronous here (see the banner), so there is
+/// no thread to create with the factory and no window in which a timeout could
+/// fire. Storing them would be worse than dropping them — it would look like
+/// support. The name IS used; it is observable through `toString()`.
+fn j25_sts_open_with_config(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    // STATIC method: args[0] = Joiner, args[1] = Function. There is no receiver.
+    let joiner = match args.first() {
+        Some(Value::Object(Some(j))) => Some(*j),
+        _ => None,
     };
-    r.register(cls, "<init>", "()V", init_nullary);
-    r.register(
-        cls,
-        "<init>",
-        "(Ljava/lang/String;Ljava/util/concurrent/ThreadFactory;)V",
-        init_named,
+    let config_fn = match args.get(1) {
+        Some(Value::Object(Some(f))) => Some(*f),
+        _ => None,
+    };
+    // Read the joiner's kind BEFORE anything allocates — it is an Int, so once
+    // it is out of the object no collection can invalidate it, and that removes
+    // the joiner from everything below.
+    let kind = j25_scope_kind_for_joiner(ctx, joiner);
+
+    // The Function is pinned across the Configuration allocation: it is the
+    // receiver of the invoke below, and the allocation is a collection point.
+    let fn_pin = config_fn.map(|f| (ctx.pin_native_root(f), f));
+    // Build the default Configuration first, so the Function receives the same
+    // shape the JDK hands it.
+    let config = try_alloc_concurrent_synthetic(
+        ctx,
+        "java/util/concurrent/StructuredTaskScope$Configuration",
+        J25_CONFIG_NUM_FIELDS,
+    )?;
+    let config_fn = fn_pin.map(|(h, f)| ctx.read_native_pin(h, f));
+    if let Some((h, _)) = fn_pin {
+        ctx.unpin_native_roots(h);
+    }
+    ctx.set_field(config, J25_CONFIG_NAME, Value::Object(None));
+    ctx.set_field(config, J25_CONFIG_THREAD_FACTORY, Value::Object(None));
+    // `Object(None)`, NOT `Long(0)`: this slot holds a `java.time.Duration`
+    // REFERENCE, and the collector scans reference slots as oops. Seeding it with
+    // an integer and later overwriting it with an object is the mixed-type slot
+    // that docs/architecture/natives-over-real-jdk-classes.md §5 describes — an
+    // Int sitting where the GC expects a pointer is heap corruption, not a wrong
+    // answer. "No timeout" is absence, and absence here is null.
+    ctx.set_field(config, J25_CONFIG_TIMEOUT, Value::Object(None));
+
+    // Applying the Function is a call into user bytecode: pin across it.
+    let mut effective = config;
+    if let Some(f) = config_fn {
+        let config_pin = ctx.pin_native_root(config);
+        let applied = ctx.invoke_virtual(
+            f,
+            "apply",
+            "(Ljava/lang/Object;)Ljava/lang/Object;",
+            &[Value::Object(Some(config))],
+        );
+        let config = ctx.read_native_pin(config_pin, config);
+        ctx.unpin_native_roots(config_pin);
+        effective = match applied {
+            // A Function that returns null (or something that is not a
+            // Configuration) leaves the default in force rather than producing a
+            // scope with a null config — the JDK would NPE, but NPE-ing out of a
+            // factory is the least useful of the available answers here.
+            Ok(Some(Value::Object(Some(c)))) => c,
+            Ok(_) => config,
+            Err(e) => return Err(e),
+        };
+    }
+
+    // The name is a String REFERENCE and the scope allocation below can collect,
+    // so it is pinned across it and re-read from the pin. Reading it first and
+    // storing it afterwards without the pin is the native stale-local family:
+    // the write lands, silently, pointing at where the String used to be.
+    let name = ctx.get_field(effective, J25_CONFIG_NAME);
+    let name_pin = pinned_object_value(ctx, name);
+    let scope = try_alloc_concurrent_synthetic(ctx, "java/util/concurrent/StructuredTaskScope", 8)?;
+    let name = read_pinned_object_value(ctx, name_pin, name);
+    j25_sts_init_fields(ctx, scope, kind);
+    if ctx.object_num_fields(scope) > J25_STS_NAME {
+        ctx.set_field(scope, J25_STS_NAME, name);
+    }
+    if let Some((h, _)) = name_pin {
+        ctx.unpin_native_roots(h);
+    }
+    Ok(Some(Value::Object(Some(scope))))
+}
+
+/// Map a `Joiner` to the scope's slot-5 kind.
+///
+/// Same mapping `jdk25_concurrency::native_sts_open_joiner_tracked` performs for
+/// the one-argument `open`, restated rather than shared because the two live in
+/// different modules and the constants are the interface between them. If that
+/// mapping ever changes, both sides move or neither does — which is why both
+/// spellings name the same three constants instead of open-coding 0/1/2.
+fn j25_scope_kind_for_joiner(ctx: &mut dyn NativeContext, joiner: Option<ObjectRef>) -> i32 {
+    let Some(joiner) = joiner else {
+        return J25_STS_POLICY_BASE;
+    };
+    match ctx.get_field(joiner, J25_JOINER_FIELD_KIND) {
+        // `jdk25_concurrency.rs`'s JOINER_POLICY_ANY_SUCCESSFUL.
+        Value::Int(1) => J25_STS_POLICY_SHUTDOWN_ON_SUCCESS,
+        // JOINER_POLICY_ALL_SUCCESSFUL / JOINER_POLICY_AWAIT_ALL_SUCCESSFUL.
+        Value::Int(0) | Value::Int(2) => J25_STS_POLICY_SHUTDOWN_ON_FAILURE,
+        _ => J25_STS_POLICY_BASE,
+    }
+}
+
+// `StructuredTaskScope$Configuration` — 3 slots. The name matters: JDK 25
+// declares `$Configuration`, while `jdk25_concurrency.rs` fabricates `$Config`,
+// a name no JDK has ever shipped (measured — `forName` on it answers
+// ClassNotFoundException on HotSpot 25, `--real-jdk` and `--jdk-only` alike). So
+// this is not a second carrier for the same thing; it is the first one bound to
+// a name the specification publishes, which is the rule
+// docs/known-issues/jdk-only/W7-14-fjp-common-factory-bound-by-name.md landed.
+//
+// WHICH DOOR THIS ALLOCATION USES, since two lanes this session got it wrong in
+// the other direction: `try_alloc_concurrent_synthetic` mints a
+// `ClassOrigin::CompatibilityStub`, and that is CORRECT here rather than
+// something to route around with `ClassOrigin::VmInternal`. VmInternal is for
+// carriers the VM invents for its own bookkeeping; `$Configuration` is a real
+// JDK 25 type this implementation is standing in for, which is precisely what a
+// compatibility stub means. `--jdk-only` forbidding it is also moot: this whole
+// registrar is reachable only from `register_synthetic_overrides` and strict
+// mode implies `--real-jdk`, where none of it registers.
+pub(crate) const J25_CONFIG_NAME: usize = 0;
+pub(crate) const J25_CONFIG_THREAD_FACTORY: usize = 1;
+/// Slot 2 holds the caller's `java.time.Duration` OBJECT, not a millisecond
+/// count — see the seeding note in `j25_sts_open_with_config`.
+pub(crate) const J25_CONFIG_TIMEOUT: usize = 2;
+pub(crate) const J25_CONFIG_NUM_FIELDS: usize = 3;
+
+/// The three `Configuration` withers. Each returns a NEW Configuration — the
+/// interface is specified to be immutable and the probe asserts it
+/// (`configuration.withName.returnsNewInstance=true` on HotSpot), so a wither
+/// that mutated in place would be observably wrong even though every caller that
+/// only chains would pass.
+fn j25_config_copy_with(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    slot: usize,
+    value: Value,
+) -> MethodCallResult {
+    // BOTH the receiver and the incoming value are pinned across the allocation.
+    // The receiver is read from AFTER the allocation and the value is written
+    // after it, so an unpinned copy of either is the native stale-local family —
+    // and the failure is silent both ways: a stale receiver copies whatever now
+    // occupies its old address, a stale value writes a pointer to nothing.
+    let this_pin = ctx.pin_native_root(this);
+    let value_pin = pinned_object_value(ctx, value);
+    let copy = try_alloc_concurrent_synthetic(
+        ctx,
+        "java/util/concurrent/StructuredTaskScope$Configuration",
+        J25_CONFIG_NUM_FIELDS,
+    )?;
+    let this = ctx.read_native_pin(this_pin, this);
+    let value = read_pinned_object_value(ctx, value_pin, value);
+    for s in [J25_CONFIG_NAME, J25_CONFIG_THREAD_FACTORY, J25_CONFIG_TIMEOUT] {
+        let v = if ctx.object_num_fields(this) > s {
+            ctx.get_field(this, s)
+        } else {
+            Value::Object(None)
+        };
+        ctx.set_field(copy, s, v);
+    }
+    ctx.set_field(copy, slot, value);
+    // `unpin_native_roots` releases from its handle ONWARD, so the earlier of the
+    // two handles frees both — pinning the receiver first is what makes one call
+    // sufficient.
+    ctx.unpin_native_roots(this_pin);
+    Ok(Some(Value::Object(Some(copy))))
+}
+
+fn j25_config_with_name(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let name = args.get(1).copied().unwrap_or(Value::Object(None));
+    j25_config_copy_with(ctx, this, J25_CONFIG_NAME, name)
+}
+
+fn j25_config_with_thread_factory(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let tf = args.get(1).copied().unwrap_or(Value::Object(None));
+    j25_config_copy_with(ctx, this, J25_CONFIG_THREAD_FACTORY, tf)
+}
+
+fn j25_config_with_timeout(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    // The Duration is stored as the object it is rather than decoded to millis:
+    // nothing here consumes it (fork is synchronous, so no timeout can fire) and
+    // decoding it would invent a precision claim this implementation does not
+    // back. Keeping the reference means a future timeout implementation reads
+    // the caller's actual Duration instead of a lossy copy.
+    let d = args.get(1).copied().unwrap_or(Value::Object(None));
+    j25_config_copy_with(ctx, this, J25_CONFIG_TIMEOUT, d)
+}
+
+/// `Joiner.allUntil(Predicate)` — the fifth factory, and the only one
+/// `jdk25_concurrency.rs` does not already register.
+///
+/// THE PREDICATE IS NOT CONSULTED, and that is a deliberate under-approximation
+/// rather than an oversight. `class_manager.rs` fabricates
+/// `StructuredTaskScope$Joiner` with four slots, all four of which
+/// `jdk25_concurrency.rs` already uses (kind, results, exception, completed), so
+/// there is nowhere to keep the Predicate; and the obvious workaround — a Rust
+/// side table keyed on the joiner's address — is the hazard this tree has
+/// already recorded twice (a table keyed by a raw address inherits a dead
+/// object's state when the allocator reuses it).
+///
+/// So this mints an `awaitAll` joiner, which is `allUntil` with a predicate that
+/// never fires: it waits for every subtask and never cancels early. That
+/// over-waits rather than under-waits, which is the safe direction here — every
+/// subtask has already run by the time anything asks — and it is strictly better
+/// than the alternative of not registering the factory at all, which would give
+/// a `NoSuchMethodError` at the call site instead of a conservative answer.
+fn j25_joiner_all_until(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+    let joiner = try_alloc_concurrent_synthetic(
+        ctx,
+        "java/util/concurrent/StructuredTaskScope$Joiner",
+        J25_JOINER_NUM_FIELDS,
+    )?;
+    ctx.set_field(
+        joiner,
+        J25_JOINER_FIELD_KIND,
+        Value::Int(J25_JOINER_KIND_AWAIT_ALL),
     );
-
-    let fork_cb: cratonvm_native_api::NativeCallback = match policy {
-        J25_STS_POLICY_SHUTDOWN_ON_SUCCESS => j25_sts_fork_sos,
-        J25_STS_POLICY_SHUTDOWN_ON_FAILURE => j25_sts_fork_sof,
-        _ => j25_sts_fork_base,
-    };
-    let fork_desc: &'static str =
-        Box::leak(format!("(Ljava/util/concurrent/Callable;){fork_ret}").into_boxed_str());
-    r.register(cls, "fork", fork_desc, fork_cb);
-
-    let join_desc: &'static str = Box::leak(format!("(){join_ret}").into_boxed_str());
-    r.register(cls, "join", join_desc, j25_sts_join_impl);
-
-    let joinuntil_desc: &'static str =
-        Box::leak(format!("(Ljava/time/Instant;){join_ret}").into_boxed_str());
-    r.register(cls, "joinUntil", joinuntil_desc, j25_sts_join_impl);
-
-    r.register(cls, "shutdown", "()V", j25_sts_shutdown);
-    r.register(cls, "close", "()V", j25_sts_close);
-    r.register(cls, "isShutdown", "()Z", j25_sts_is_shutdown);
+    // Slot for slot what `jdk25_concurrency::native_joiner_await_all` writes, and
+    // the TYPES matter as much as the values: slots 1 and 2 are references the
+    // collector scans as oops, slot 3 is a counter its `onComplete` reads as
+    // `Value::Int`. Blanket-nulling all three would leave an `Object(None)` where
+    // that reader expects an Int, which is the shape where a present-but-wrongly-
+    // typed slot silently takes a fallback branch instead of failing.
+    ctx.set_field(joiner, 1, Value::Object(None));
+    ctx.set_field(joiner, 2, Value::Object(None));
+    ctx.set_field(joiner, 3, Value::Int(0));
+    Ok(Some(Value::Object(Some(joiner))))
 }
 
+/// `Joiner.onFork(Subtask)Z` — a DEFAULT method on the interface, so the JDK's
+/// own body would serve it if there were one to run. In synthetic mode there is
+/// not, and its absence is a `NoSuchMethodError` from any Joiner implemented in
+/// user code that calls `super`-style through the interface.
+///
+/// `false` is the specified default: "do not cancel the scope on fork". The
+/// cancellation decision belongs to `onComplete`, which `jdk25_concurrency.rs`
+/// already registers.
+fn j25_joiner_on_fork(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+    Ok(Some(Value::Int(0)))
+}
+
+/// Register the JEP 505 surface for `java.util.concurrent.StructuredTaskScope`.
+///
+/// WHAT THIS REGISTRAR DOES **NOT** DO, and why the list is short. Every triple
+/// below is one that nothing else in the tree registers. The overlapping half of
+/// the API — `open()`, `fork(Callable)`, `close()`, `Subtask.get/state/exception`,
+/// and the four other `Joiner` factories — is registered by
+/// `jdk25_concurrency::register_jdk25_concurrency_natives`, which
+/// `register_synthetic_overrides` calls AFTER this one, and `register()` is
+/// last-registration-wins (docs/architecture/natives-over-real-jdk-classes.md §3).
+/// A second body for any of those would be dead on arrival: registered, never
+/// reached, and indistinguishable from working code to anyone reading the file.
+/// The previous version of this function registered nine such triples plus two
+/// classes JDK 25 does not declare, which is why it could be deleted with no
+/// behaviour change.
+///
+/// THE TWO DELETED CLASSES. `StructuredTaskScope$ShutdownOnSuccess` and
+/// `$ShutdownOnFailure` had ~16 registrations here. JEP 505 deleted both types;
+/// `javap` answers `class not found` for each on Adoptium 25.0.3.9 and
+/// `Class.forName` answers `ClassNotFoundException` on HotSpot, `--real-jdk` and
+/// `--jdk-only`. A registration on a class no JDK declares is not a bug that
+/// fires, it is coverage that is not there — the shape censused in
+/// docs/known-issues/jdk-only/W7-5-registrars-that-never-shipped.md. Their
+/// BEHAVIOUR is not lost: JEP 505 turned each into a `Joiner`
+/// (`ShutdownOnSuccess` -> `anySuccessfulResultOrThrow`, `ShutdownOnFailure` ->
+/// `awaitAllSuccessfulOrThrow`), and `j25_sts_fork_common`/`j25_sts_join_result`
+/// implement both under those names, off slot 5.
 pub(crate) fn register_p67_structured_task_scope_j25(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let sts = "java/util/concurrent/StructuredTaskScope";
-    j25_register_scope_common(
-        r,
+
+    // `join()R`. Not a duplicate of the `join()StructuredTaskScope` registered
+    // elsewhere — see `j25_sts_join_result`: JEP 505 changed the return type, so
+    // javac emits a different descriptor and these are two different methods.
+    r.register(sts, "join", "()Ljava/lang/Object;", j25_sts_join_result);
+    r.register(sts, "isCancelled", "()Z", j25_sts_is_cancelled);
+    r.register(
         sts,
-        J25_STS_POLICY_BASE,
-        "Ljava/util/concurrent/StructuredTaskScope;",
-        "Ljava/util/concurrent/StructuredTaskScope$Subtask;",
+        "fork",
+        "(Ljava/lang/Runnable;)Ljava/util/concurrent/StructuredTaskScope$Subtask;",
+        j25_sts_fork_runnable,
     );
-
-    // Subtask accessors
-    let sub = "java/util/concurrent/StructuredTaskScope$Subtask";
-    r.register(sub, "get", "()Ljava/lang/Object;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        if !matches!(ctx.get_field(this, 0), Value::Int(s) if s == J25_SUBTASK_STATE_SUCCESS) {
-            return Err(RuntimeError::IllegalStateException {
-                message: "Subtask not completed successfully".into(),
-            }
-            .into());
-        }
-        Ok(Some(ctx.get_field(this, 1)))
-    });
     r.register(
-        sub,
-        "state",
-        "()Ljava/util/concurrent/StructuredTaskScope$Subtask$State;",
-        |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            let state = match ctx.get_field(this, 0) {
-                Value::Int(v) => v,
-                _ => J25_SUBTASK_STATE_UNAVAILABLE,
-            };
-            let name = match state {
-                J25_SUBTASK_STATE_SUCCESS => "SUCCESS",
-                J25_SUBTASK_STATE_FAILED => "FAILED",
-                _ => "UNAVAILABLE",
-            };
-            p57_alloc_enum(
-                ctx,
-                "java/util/concurrent/StructuredTaskScope$Subtask$State",
-                name,
-                state,
-            )
-        },
+        sts,
+        "open",
+        "(Ljava/util/concurrent/StructuredTaskScope$Joiner;Ljava/util/function/Function;)\
+         Ljava/util/concurrent/StructuredTaskScope;",
+        j25_sts_open_with_config,
     );
-    // SUPERSEDED, kept correct-by-construction: `jdk25_concurrency::
-    // register_jdk25_concurrency_natives` re-registers the whole
-    // `java/util/concurrent/StructuredTaskScope$Subtask` surface (get/state/
-    // exception/task) over its canonical 8-field layout and runs LAST in
-    // `register_synthetic_overrides`, so the live `exception()` is that one.
-    // The constant null here is still wrong on its own terms — the JDK throws
-    // IllegalStateException unless the subtask FAILED — so it is fixed rather
-    // than left as a landmine for a future ordering change.
-    r.register(sub, "exception", "()Ljava/lang/Throwable;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        if !matches!(ctx.get_field(this, 0), Value::Int(s) if s == J25_SUBTASK_STATE_FAILED) {
-            return Err(RuntimeError::IllegalStateException {
-                message: "Subtask did not complete with an exception".into(),
-            }
-            .into());
-        }
-        if ctx.object_num_fields(this) > 2 {
-            Ok(Some(ctx.get_field(this, 2)))
-        } else {
-            Ok(Some(Value::Object(None)))
-        }
-    });
 
-    // ShutdownOnSuccess
-    let sos = "java/util/concurrent/StructuredTaskScope$ShutdownOnSuccess";
-    j25_register_scope_common(
-        r,
-        sos,
-        J25_STS_POLICY_SHUTDOWN_ON_SUCCESS,
-        "Ljava/util/concurrent/StructuredTaskScope$ShutdownOnSuccess;",
-        "Ljava/util/concurrent/StructuredTaskScope$Subtask;",
-    );
-    r.register(sos, "result", "()Ljava/lang/Object;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let state = j25_sts_state(ctx, this);
-        if state == J25_STS_STATE_OPEN {
-            return Err(RuntimeError::IllegalStateException {
-                message: "ShutdownOnSuccess.result() requires join()/shutdown()".into(),
-            }
-            .into());
-        }
-        if ctx.object_num_fields(this) > J25_STS_EXCEPTION {
-            Ok(Some(ctx.get_field(this, J25_STS_EXCEPTION)))
-        } else {
-            Ok(Some(Value::Object(None)))
-        }
-    });
-
-    // ShutdownOnFailure
-    let sof = "java/util/concurrent/StructuredTaskScope$ShutdownOnFailure";
-    j25_register_scope_common(
-        r,
-        sof,
-        J25_STS_POLICY_SHUTDOWN_ON_FAILURE,
-        "Ljava/util/concurrent/StructuredTaskScope$ShutdownOnFailure;",
-        "Ljava/util/concurrent/StructuredTaskScope$Subtask;",
-    );
-    // exception(): an Optional-returning method must not answer bare null —
-    // `scope.exception().isPresent()` NPEs on it. Report the scope's captured
-    // cause (J25_STS_EXCEPTION) wrapped in a synthetic Optional; an empty
-    // Optional when there was no failure. (Also superseded by
-    // `jdk25_concurrency` — see the Subtask note above.)
-    r.register(sof, "exception", "()Ljava/util/Optional;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let exc = if ctx.object_num_fields(this) > J25_STS_EXCEPTION {
-            ctx.get_field(this, J25_STS_EXCEPTION)
-        } else {
-            Value::Object(None)
-        };
-        Ok(Some(Value::Object(Some(sts_optional_of(ctx, exc)))))
-    });
-    r.register(sof, "throwIfFailed", "()V", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        if ctx.object_num_fields(this) > J25_STS_EXCEPTION {
-            if let Value::Object(Some(_exc)) = ctx.get_field(this, J25_STS_EXCEPTION) {
-                return Err(RuntimeError::IllegalStateException {
-                    message: "StructuredTaskScope subtask failed".into(),
-                }
-                .into());
-            }
-        }
-        Ok(None)
-    });
+    // `Joiner`'s fifth factory and its `onFork` default.
+    let joiner = "java/util/concurrent/StructuredTaskScope$Joiner";
     r.register(
-        sof,
-        "throwIfFailed",
-        "(Ljava/util/function/Function;)V",
-        |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            if ctx.object_num_fields(this) > J25_STS_EXCEPTION {
-                if let Value::Object(Some(_exc)) = ctx.get_field(this, J25_STS_EXCEPTION) {
-                    return Err(RuntimeError::IllegalStateException {
-                        message: "StructuredTaskScope subtask failed".into(),
-                    }
-                    .into());
-                }
-            }
-            Ok(None)
-        },
+        joiner,
+        "allUntil",
+        "(Ljava/util/function/Predicate;)Ljava/util/concurrent/StructuredTaskScope$Joiner;",
+        j25_joiner_all_until,
     );
+    r.register(
+        joiner,
+        "onFork",
+        "(Ljava/util/concurrent/StructuredTaskScope$Subtask;)Z",
+        j25_joiner_on_fork,
+    );
+
+    // `Configuration`, under the name JDK 25 actually declares.
+    let config = "java/util/concurrent/StructuredTaskScope$Configuration";
+    r.register(
+        config,
+        "withName",
+        "(Ljava/lang/String;)Ljava/util/concurrent/StructuredTaskScope$Configuration;",
+        j25_config_with_name,
+    );
+    r.register(
+        config,
+        "withThreadFactory",
+        "(Ljava/util/concurrent/ThreadFactory;)\
+         Ljava/util/concurrent/StructuredTaskScope$Configuration;",
+        j25_config_with_thread_factory,
+    );
+    r.register(
+        config,
+        "withTimeout",
+        "(Ljava/time/Duration;)Ljava/util/concurrent/StructuredTaskScope$Configuration;",
+        j25_config_with_timeout,
+    );
+
     r.set_category(__prev_cat);
+    ()
 }
 
 // =============================================================================
@@ -5217,7 +5516,7 @@ pub(crate) fn register_p67_scoped_value(r: &mut NativeMethodRegistry) {
         "newInstance",
         "()Ljava/lang/ScopedValue;",
         |ctx, _args| {
-            let obj = alloc_concurrent_synthetic(ctx, "java/lang/ScopedValue", 2);
+            let obj = try_alloc_concurrent_synthetic(ctx, "java/lang/ScopedValue", 2)?;
             ctx.set_field(obj, 0, Value::Object(None));
             ctx.set_field(obj, 1, Value::Int(0)); // not bound
             Ok(Some(Value::Object(Some(obj))))
@@ -5279,7 +5578,7 @@ pub(crate) fn register_p67_scoped_value(r: &mut NativeMethodRegistry) {
         "where",
         "(Ljava/lang/ScopedValue;Ljava/lang/Object;)Ljava/lang/ScopedValue$Carrier;",
         |ctx, args| {
-            let carrier = alloc_concurrent_synthetic(ctx, "java/lang/ScopedValue$Carrier", 2);
+            let carrier = try_alloc_concurrent_synthetic(ctx, "java/lang/ScopedValue$Carrier", 2)?;
             ctx.set_field(
                 carrier,
                 0,
@@ -5302,7 +5601,7 @@ pub(crate) fn register_p67_scoped_value(r: &mut NativeMethodRegistry) {
         "(Ljava/lang/ScopedValue;Ljava/lang/Object;)Ljava/lang/ScopedValue$Carrier;",
         |ctx, args| {
             // Chain — for simplicity, create new carrier (overwrites)
-            let c = alloc_concurrent_synthetic(ctx, "java/lang/ScopedValue$Carrier", 2);
+            let c = try_alloc_concurrent_synthetic(ctx, "java/lang/ScopedValue$Carrier", 2)?;
             ctx.set_field(c, 0, args.get(1).copied().unwrap_or(Value::Object(None)));
             ctx.set_field(c, 1, args.get(2).copied().unwrap_or(Value::Object(None)));
             Ok(Some(Value::Object(Some(c))))
@@ -6098,6 +6397,15 @@ pub(crate) fn register_p71_thread_extras(r: &mut NativeMethodRegistry) {
                 }
                 _ => "RUNNABLE".into(),
             };
+            // Enum identity is the contract: hand back the object the class's
+            // own static field holds, never a fresh one. Falls through to the
+            // minting body below only for a fabricated synthetic-JDK stand-in,
+            // which has no static field to read. W7-93 §8.
+            if let Some(v) =
+                crate::lang_system::canonical_enum_constant(ctx, "java/lang/Thread$State", &name)
+            {
+                return Ok(Some(v));
+            }
             let ord = match name.as_str() {
                 "NEW" => 0,
                 "RUNNABLE" => 1,
@@ -6111,6 +6419,13 @@ pub(crate) fn register_p71_thread_extras(r: &mut NativeMethodRegistry) {
         },
     );
     r.register(ts, "values", "()[Ljava/lang/Thread$State;", |ctx, _args| {
+        // Real `values()` is `$VALUES.clone()`: a fresh array of the CANONICAL
+        // constants. Minting six new ones broke `values()[0] == State.NEW`.
+        // W7-93 §8.
+        if let Some(arr) = crate::lang_system::canonical_enum_values(ctx, "java/lang/Thread$State")
+        {
+            return Ok(Some(Value::Object(Some(arr))));
+        }
         let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 6);
         // Pin across the per-state allocs below — a moving young GC there
         // would relocate the fresh array/states (native stale-local family).
@@ -6127,7 +6442,7 @@ pub(crate) fn register_p71_thread_extras(r: &mut NativeMethodRegistry) {
         .iter()
         .enumerate()
         {
-            let e = alloc_concurrent_synthetic(ctx, "java/lang/Thread$State", 2);
+            let e = try_alloc_concurrent_synthetic(ctx, "java/lang/Thread$State", 2)?;
             let e_pin = ctx.pin_native_root(e);
             let n = ctx.create_string(name);
             let e = ctx.read_native_pin(e_pin, e);
@@ -6570,6 +6885,12 @@ pub(crate) fn register_p71_thread_extras(r: &mut NativeMethodRegistry) {
 /// 2 = state: 0 = NEW, 1 = RUNNING, 2 = YIELDED, 3 = DONE
 /// 3 = pin_count (int) — incremented by `pin()`, decremented by `unpin()`
 /// 4 = preempted (int) — set to 1 if `tryPreempt` succeeded
+///
+/// **This map is the FALLBACK, not the answer.** On the real JDK 25 class it
+/// disagrees in every slot — see `NEW15_CONT_SLOT_MAP` below and [`ContSlots`]
+/// — so every production access resolves the field by NAME on the receiver's
+/// own class first and reaches these indices only when that fails (the
+/// synthetic `jdk/internal/vm/Continuation`, whose fields are `_f0.._f4`).
 pub(crate) const NEW15_CONT_FIELDS: usize = 5;
 
 pub(crate) const NEW15_CONT_SCOPE: usize = 0;
@@ -6610,6 +6931,261 @@ pub(crate) const NEW15_FJP_ACTIVE: usize = 1;
 /// `ForkJoinPool.commonPool()` (into `NEW15_FJP_PARALLELISM`) and the static
 /// `ForkJoinPool.getCommonPoolParallelism()`, which the JDK specifies as equal.
 pub(crate) const NEW15_COMMON_POOL_PARALLELISM: i32 = 1;
+
+// ---------------------------------------------------------------------------
+// W7-75 — the two slot maps above, published, and resolved by NAME per receiver
+// ---------------------------------------------------------------------------
+//
+// W7-69-read-side-alias-instrument.md §6 lists these as the two UNGUARDED LIVE
+// rows of its first census: a native reading slot `k` of an object it did not
+// allocate, where `k` means something else on the loaded class. No width
+// instrument can see that — the read is in bounds, so `layout_alias` (which
+// compares slot COUNTS) and the `cratonvm::gc::guard` out-of-bounds
+// discriminator both miss.
+//
+// The real JDK 25 layouts, `javap -p` against Eclipse Adoptium 25.0.3.9,
+// counted transitively over the superclass chain with `static` excluded — the
+// convention W4-4-slot-index-species-sweep.md, W7-49-slot-index-recensus.md,
+// W7-59-layout-detector-coverage.md and W7-69 all use:
+//
+//   jdk/internal/vm/Continuation   (superclass java/lang/Object, 10 fields)
+//     0 target   1 scope   2 parent  3 child   4 tail
+//     5 done     6 mounted 7 yieldInfo 8 preempted 9 scopedValueCache
+//
+//   java/util/concurrent/ForkJoinPool
+//     (superclass java/util/concurrent/AbstractExecutorService, which declares
+//      NO instance field — its only member is the static `$assertionsDisabled`
+//      — so ForkJoinPool's own 16 are the whole chain)
+//     0 termination  1 saturate  2 factory   3 ueh      4 container
+//     5 workerNamePrefix 6 poolName 7 delayScheduler 8 queues 9 runState
+//     10 keepAlive 11 config 12 stealCount 13 threadIds 14 ctl 15 parallelism
+//
+// Both reproduce W7-69's table exactly, including the swapped `scope`/`target`
+// pair and `state` landing on `parent`.
+//
+// The maps are PUBLISHED rather than renumbered, exactly as `native-io`'s
+// `BB_SLOT_MAP` is: renumbering fixes one reader and can break another that
+// agreed with the old numbering, and a synthetic receiver still needs the old
+// indices. What changed is that every production access now resolves by NAME on
+// the receiver's own class first (`ContSlots` / `FjpSlots` below), so on a real
+// receiver these indices are the fallback rather than the answer — the standing
+// W4-4 remedy.
+
+/// The synthetic `Continuation` slot map, as `(slot, field the native believes
+/// is there)`. Every entry disagrees with the real class; that is the census
+/// row, and it stays visible on purpose.
+pub static NEW15_CONT_SLOT_MAP: read_alias::SlotMap =
+    read_alias::SlotMap {
+        class: "jdk/internal/vm/Continuation",
+        slots: &[
+            (NEW15_CONT_SCOPE, "scope"),
+            (NEW15_CONT_TARGET, "target"),
+            (NEW15_CONT_STATE, "state"),
+            (NEW15_CONT_PIN, "pin"),
+            (NEW15_CONT_PREEMPT, "preempted"),
+        ],
+        origin: "native-builtins/src/phases_late/concurrent.rs NEW15_CONT_*",
+    };
+
+/// The synthetic `ForkJoinPool` common-pool proxy map. Slot 0 is `termination`
+/// and slot 1 is `saturate` on the real class.
+pub static NEW15_FJP_SLOT_MAP: read_alias::SlotMap =
+    read_alias::SlotMap {
+        class: "java/util/concurrent/ForkJoinPool",
+        slots: &[
+            (NEW15_FJP_PARALLELISM, "parallelism"),
+            (NEW15_FJP_ACTIVE, "active"),
+        ],
+        origin: "native-builtins/src/phases_late/concurrent.rs NEW15_FJP_*",
+    };
+
+/// Where this receiver's `Continuation` fields actually live.
+///
+/// Resolved per receiver, from the receiver's OWN `ClassId`, because that is
+/// the only thing that can tell a real `jdk.internal.vm.Continuation` from the
+/// synthetic one — a slot COUNT cannot identify a layout, which is the lesson
+/// `vm/src/vm/vm_exec.rs`'s `thread_start` records against its own
+/// `SYNTHETIC_THREAD_VIRTUAL_SLOT` guard and the exemplar W7-69 §4.4 names.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ContSlots {
+    /// `scope` — real index 1, synthetic 0.
+    pub(crate) scope: usize,
+    /// `target` — real index 0, synthetic 1.
+    pub(crate) target: usize,
+    /// Completion. Real index 5 (`done`, a `boolean`); synthetic 2 (the 4-value
+    /// `state` int). `real` says which encoding to use.
+    pub(crate) done: usize,
+    /// The pin counter. `None` on the real class, which declares no such field
+    /// at all — pinning is VM state there (`Continuation.pin()` is `static
+    /// native`). Writing the count anyway would stamp an `Int` over `child`, a
+    /// `Continuation` reference: the very species this lane closes.
+    pub(crate) pin: Option<usize>,
+    /// `preempted` — real index 8 (`boolean`), synthetic 4.
+    pub(crate) preempted: usize,
+    /// True when the receiver carries the REAL layout, i.e. its class declares
+    /// the JDK's own field names.
+    pub(crate) real: bool,
+}
+
+/// The synthetic fallback — used verbatim when the receiver's class declares
+/// none of the real names.
+const CONT_SLOTS_SYNTHETIC: ContSlots = ContSlots {
+    scope: NEW15_CONT_SCOPE,
+    target: NEW15_CONT_TARGET,
+    done: NEW15_CONT_STATE,
+    pin: Some(NEW15_CONT_PIN),
+    preempted: NEW15_CONT_PREEMPT,
+    real: false,
+};
+
+/// Resolve [`ContSlots`] for `this`.
+///
+/// The witness is `scope` AND `target` AND `done` AND `preempted` all resolving
+/// on the receiver's class. Requiring all four rather than any one is
+/// deliberate: a partially-named layout would otherwise mix real and synthetic
+/// indices inside one object, which is worse than either.
+pub(crate) fn cont_slots(ctx: &dyn NativeContext, this: ObjectRef) -> ContSlots {
+    let cid = ctx.class_id_of_object(this);
+    let at = |n: &str| ctx.resolve_field_index_by_class_id(cid, n);
+    if let (Some(scope), Some(target), Some(done), Some(preempted)) =
+        (at("scope"), at("target"), at("done"), at("preempted"))
+    {
+        return ContSlots {
+            scope,
+            target,
+            done,
+            // Absent on the real class; present if some future synthetic grows
+            // one. Asking rather than assuming costs one lookup on a cold path.
+            pin: at("pin"),
+            preempted,
+            real: true,
+        };
+    }
+    // W7-69, observation only, no `else` — the fallback below is returned
+    // whatever this answers.
+    //
+    // It is deliberately NOT unconditional, and the reason is W7-69 §5.1's own
+    // lesson in the other direction: an instrument that fires on every read is
+    // a probe that cannot fail. A wholly synthetic receiver's fields are
+    // `_f0.._f4` (`class_manager.rs`'s `instance_fields`), so observing there
+    // would print five `scope → _f0`-shaped rows on every synthetic run — true
+    // statements, and pure noise, because on a fabricated class the native's
+    // slot map IS the class's truth. The interesting state is the one that
+    // cannot happen by construction: a receiver that carries SOME real JDK
+    // field name and still failed the four-name witness above, i.e. a
+    // partially-real layout being read through the synthetic map. `parent` is
+    // the discriminator because it is a real-JDK-only name — no synthetic
+    // Continuation shape in this tree declares it.
+    if layout_alias::enabled() {
+        let rows: &[(usize, &str)] =
+            if ctx.resolve_field_index_by_class_id(cid, "parent").is_some() {
+                NEW15_CONT_SLOT_MAP.slots
+            } else {
+                &[]
+            };
+        for (slot, expected) in rows {
+            read_alias::observe_read(
+                ctx,
+                this,
+                *slot,
+                expected,
+                "native-builtins/src/phases_late/concurrent.rs::cont_slots",
+            );
+        }
+    }
+    CONT_SLOTS_SYNTHETIC
+}
+
+/// Has this continuation completed?
+///
+/// **This is the guard W7-69 §6(1) records as never firing.** The synthetic map
+/// reads slot 2 as an `int` state; slot 2 of a real `Continuation` is `parent`,
+/// a `Continuation` REFERENCE, so the `Value::Int` match fell through to the
+/// `_ => NEW` arm and `run()` could never refuse a second run. HotSpot throws
+/// `IllegalStateException` there (measured — `probes/ContinuationForkJoinPoolAliasProbe.java`
+/// on Adoptium 25.0.3.9 prints `CONT second-run=THREW:java.lang.IllegalStateException`).
+pub(crate) fn cont_is_done(ctx: &dyn NativeContext, this: ObjectRef, s: ContSlots) -> bool {
+    match ctx.get_field(this, s.done) {
+        // Real: `done` is a `boolean`, so any non-zero means done. Synthetic:
+        // the 4-value state, where only DONE counts.
+        Value::Int(v) => {
+            if s.real {
+                v != 0
+            } else {
+                v == NEW15_CONT_STATE_DONE
+            }
+        }
+        _ => false,
+    }
+}
+
+/// Write the completion flag in whichever encoding this receiver uses.
+pub(crate) fn cont_set_done(ctx: &dyn NativeContext, this: ObjectRef, s: ContSlots, done: bool) {
+    let v = if s.real {
+        i32::from(done)
+    } else if done {
+        NEW15_CONT_STATE_DONE
+    } else {
+        NEW15_CONT_STATE_RUNNING
+    };
+    ctx.set_field(this, s.done, Value::Int(v));
+}
+
+/// Where this receiver's `ForkJoinPool` fields actually live.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct FjpSlots {
+    /// `parallelism` — real index 15 (and a genuine `int` there), synthetic 0.
+    pub(crate) parallelism: usize,
+    /// The active-thread counter. `None` on the real class, which has no such
+    /// field; its slot 1 is `saturate`, a `Predicate` reference.
+    pub(crate) active: Option<usize>,
+}
+
+/// Resolve [`FjpSlots`] for `pool`.
+///
+/// `parallelism` is the witness because the real class declares it under
+/// exactly that name — the one place the synthetic map and the real layout
+/// agree on the MEANING of a field while disagreeing on its index.
+pub(crate) fn fjp_slots(ctx: &dyn NativeContext, pool: ObjectRef) -> FjpSlots {
+    let cid = ctx.class_id_of_object(pool);
+    if let Some(parallelism) = ctx.resolve_field_index_by_class_id(cid, "parallelism") {
+        return FjpSlots {
+            parallelism,
+            active: ctx.resolve_field_index_by_class_id(cid, "active"),
+        };
+    }
+    // W7-69, observation only, no `else`. Same discriminator argument as
+    // `cont_slots`: the synthetic `ForkJoinPool` shape
+    // (`class_manager.rs`: `instance_fields(1)`) names its field `_f0`, and
+    // reporting `parallelism → _f0` on every synthetic run is noise, not a
+    // finding. `termination` is the real-JDK-only name that says this receiver
+    // is real enough to have failed the `parallelism` witness for some other
+    // reason — which cannot happen by construction and is exactly what is worth
+    // printing if it does.
+    if layout_alias::enabled() {
+        let rows: &[(usize, &str)] = if ctx
+            .resolve_field_index_by_class_id(cid, "termination")
+            .is_some()
+        {
+            NEW15_FJP_SLOT_MAP.slots
+        } else {
+            &[]
+        };
+        for (slot, expected) in rows {
+            read_alias::observe_read(
+                ctx,
+                pool,
+                *slot,
+                expected,
+                "native-builtins/src/phases_late/concurrent.rs::fjp_slots",
+            );
+        }
+    }
+    FjpSlots {
+        parallelism: NEW15_FJP_PARALLELISM,
+        active: Some(NEW15_FJP_ACTIVE),
+    }
+}
 
 // ---------------------------------------------------------------------------
 // L12 — the STATIC `ForkJoinTask.invokeAll` family
@@ -7025,6 +7601,222 @@ pub(crate) fn register_forkjointask_quietly_bridge(r: &mut NativeMethodRegistry)
 }
 
 // ---------------------------------------------------------------------------
+// W6-9 §7 — the residual divergences the `complete(V)` lane left open
+// ---------------------------------------------------------------------------
+//
+// W6-9 stopped `complete(V)` erasing the abnormal record and registered
+// `completeExceptionally`; its §7 listed four divergences it left standing
+// because each needed its own measurement. Three of them are closable from
+// here:
+//
+//   * `getException()` answered null for a CANCELLED task while
+//     `isCompletedAbnormally()` answered `true` — one task, two accessors,
+//     opposite verdicts on whether anything went wrong;
+//   * `reinitialize()` was registered nowhere, so a reused task kept its
+//     side-table completion and the next `join()` replayed the STALE result
+//     instead of recomputing;
+//   * `RecursiveAction.complete(Object)` was registered on neither boot path.
+//
+// The fourth — `complete(v)` on a cancelled task must still perform the
+// `setRawResult(v)` half — needed a write inside `fjp_complete_body`
+// (`native-builtins/src/phases_early.rs`), outside this lane's files. It
+// LANDED on 2026-08-11 as `fjp_state_set_raw_result`, called before
+// `fjp_state_set_done` on the side-table arm. W7-48 then measured that arm and
+// found it has no reachable caller: all three class names it tests are
+// ABSTRACT, and `method_exists` walks the superclass chain, so every Java
+// receiver takes the virtual-`setRawResult` arm instead. The patch is correct
+// and is defence in depth — see `fjt_has_own_raw_result_slot`'s header, which
+// carries the measurement.
+//
+// WHY THESE CAN LIVE HERE. `NativeMethodRegistry::register` UPDATES AN EXISTING
+// TRIPLE'S SLOT IN PLACE (the `match prior_slot` arm), and this registrar rides
+// the same two hooks as `register_forkjointask_eager_fork_gate` below:
+// `register_new15_loom` runs after `phases_early::register_forkjoin_natives`,
+// and `register_t19_k3_forkjoinpool_common` is called immediately after
+// `phases_early::register_real_jdk_forkjoin_essentials` in
+// `register_essential_natives`. Whichever of those two registrars ran, one of
+// these hooks runs after it, so `fjt_get_exception` below SUPERSEDES the
+// `getException` slot installed in `register_real_jdk_forkjoin_essentials`.
+// That body was then unreachable, and the patch deleting it landed on
+// 2026-08-11: `register_real_jdk_forkjoin_essentials` now keeps only the
+// `completeExceptionally` registration in that loop, with a pointer here. So
+// the tree no longer holds two registrars for the `getException` triple.
+//
+// ALLOW-LISTS. `("getException", "()Ljava/lang/Throwable;")` and
+// `("complete", "(Ljava/lang/Object;)V")` are already named in both
+// (`keep_real_forkjointask_bridge`, native-api/src/registry.rs;
+// `is_forkjoin_native_override`, vm/src/runtime/interpreter/native_override.rs),
+// for all three task classes, so those two registrations are live in every
+// mode. `("reinitialize", "()V")` is now named in BOTH as well — it was in
+// NEITHER when this block was written, which on the default real-ForkJoinPool
+// path would have left the registration below live only under
+// `CRATONVM_SYNTHETIC_FORKJOINPOOL`, because `registry.rs` DROPS any Bridge on
+// these classes whose triple `keep_real_forkjointask_bridge` does not name.
+// Both one-line entries landed on 2026-08-11 and each carries a comment
+// pointing at the other; keep them in step. A registration present in neither
+// list is the `awaitQuiescence` failure mode, and half a fix that reads as a
+// whole one is what this campaign keeps finding.
+
+/// `ForkJoinTask.getException()` — the recorded throwable, or a FRESH
+/// `CancellationException` for a task that is abnormal with nothing recorded.
+///
+/// `javap -p -c java.util.concurrent.ForkJoinTask` (JDK 25.0.3.9). The public
+/// `final getException()` is `return getException(false);`, and that method is
+///
+/// ```text
+///    1: getfield status; 6: ifge 16           //  status >= 0          -> null
+///   10: ldc 65536;  iand; 13: ifne 18         // (status&ABNORMAL)==0  -> null
+///   19: ldc 131072; iand; 22: ifeq 45         // (status&THROWN)==0    -> 45
+///   32: aux ifnull 45;    42: aux.ex ifnonnull 53
+///   45: new java/util/concurrent/CancellationException; <init>()V; areturn
+/// ```
+///
+/// Branch 45 is what every CANCELLED task reaches: `trySetCancelled` ORs
+/// `DONE|ABNORMAL` into the status word and never touches `aux`, so there is no
+/// recorded throwable and the real answer is a `CancellationException` — never
+/// null. The registration this supersedes returned `fjp_state_thrown` or null,
+/// which left `isCompletedAbnormally() == true` beside `getException() == null`
+/// on the same task. Both now answer the same predicate,
+/// `done && (cancelled || threw)`, in the real method's own branch order.
+///
+/// The synthesised exception is deliberately NOT written back into the side
+/// table. Nothing would read it — `fjp_state_set_thrown` refuses to record on a
+/// cancelled entry anyway, and `isCompletedAbnormally`/`isCompletedNormally`
+/// read the `cancelled` bit directly — while a recorded throwable IS replayed
+/// by `fjp_state_get_for_join`, so writing one here would change what
+/// `join()`/`get()` raise as a side effect of calling an accessor. Fresh per
+/// call, exactly like the real `new CancellationException()`.
+///
+/// `this` is not touched after the allocation, so it needs no pin; the answer
+/// is read out of the side table first. A VM that cannot construct the class at
+/// all falls back to null — the pre-fix answer, not a new one — the same
+/// degrade `fjp_complete_exceptionally_body` takes when its wrapper constructor
+/// is missing.
+fn fjt_get_exception(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    if let Some(recorded) = crate::phases_early::fjp_state_thrown(this) {
+        return Ok(Some(Value::Object(Some(recorded))));
+    }
+    let (done, cancelled) = crate::phases_early::fjp_state_flags(this);
+    if !(done && cancelled) {
+        return Ok(Some(Value::Object(None)));
+    }
+    match ctx.new_object_initialized("java/util/concurrent/CancellationException", "()V", &[]) {
+        Ok(Some(fresh @ Value::Object(Some(_)))) => Ok(Some(fresh)),
+        _ => Ok(Some(Value::Object(None))),
+    }
+}
+
+/// `ForkJoinTask.reinitialize()` — drop the side-table completion so the next
+/// `join()` recomputes.
+///
+/// ```text
+/// public void reinitialize();
+///    0: aload_0; 1: aconst_null; 2: putfield aux
+///    5: aload_0; 6: dup; 7: getfield status
+///   10: ldc int 16777216; 12: iand; 13: putfield status
+/// ```
+///
+/// It is the ONLY method on the class that ever CLEARS a status bit —
+/// `setDone`, `trySetCancelled` and `trySetThrown` are all OR-into-a-write-once
+/// word — and the one bit it keeps is `1<<24`, the pool-submit marker.
+/// Unregistered, real bytecode cleared the real `status`/`aux`, which this
+/// model never reads: the `fjp_state` entry survived untouched, so the next
+/// `join()` handed back the STALE result of the previous run and
+/// `isDone()` still answered `true` for a task the caller had just reset.
+/// Latent when W6-9 measured it (no caller in the tree), but the reason it is
+/// latent is that nothing calls it, not that calling it works.
+///
+/// The entry is REMOVED, not reset in place. "Never seen" is exactly the state
+/// this restores — every reader already treats a missing key and a fresh entry
+/// identically — and it is the only one that keeps `fjp_queued_task_count()`
+/// honest: that count is over `!done` entries, so a reset-in-place entry would
+/// report a task sitting in nobody's queue as forked-and-pending. The `1<<24`
+/// bit the real method preserves has no reader in this model. Dropping the key
+/// drops a GC root, which is safe here and nowhere else in this family: the
+/// caller is executing a method ON the task, so the task is live on its stack.
+fn fjt_reinitialize(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    crate::phases_early::fjp_state()
+        .lock()
+        .remove(&crate::phases_early::fjp_key(this));
+    Ok(None)
+}
+
+/// Register the three W6-9 §7 residuals. Called from BOTH boot paths, exactly
+/// like [`register_forkjointask_quietly_bridge`] and
+/// [`register_forkjointask_eager_fork_gate`].
+pub(crate) fn register_forkjointask_w6_9_residual_bridge(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
+
+    // Both on all three class names, mirroring the `getException` shape
+    // `register_real_jdk_forkjoin_essentials` already used: `getException()` is
+    // `public final` and `reinitialize()` is `public` (NOT final, per `javap`),
+    // so in real-JDK mode the resolved declaring class is `ForkJoinTask` for
+    // both unless a subclass overrides `reinitialize` — but synthetic-mode
+    // lookup is per class name, and this is the belt-and-braces W3-4 argued
+    // for. `NativeKind::Bridge` is restated on every call because the kind is
+    // ambient: an unstated re-registration would downgrade the slot and
+    // `keep_real_forkjointask_bridge` only keeps Bridges.
+    for task_class in [
+        "java/util/concurrent/ForkJoinTask",
+        "java/util/concurrent/RecursiveTask",
+        "java/util/concurrent/RecursiveAction",
+    ] {
+        r.register_with_kind(
+            task_class,
+            "getException",
+            "()Ljava/lang/Throwable;",
+            fjt_get_exception,
+            cratonvm_native_api::NativeKind::Bridge,
+        );
+        r.register_with_kind(
+            task_class,
+            "reinitialize",
+            "()V",
+            fjt_reinitialize,
+            cratonvm_native_api::NativeKind::Bridge,
+        );
+    }
+
+    // `RecursiveAction.complete(Object)V` — `setDone()` and nothing else.
+    //
+    // `javap -p java.util.concurrent.RecursiveAction` (JDK 25.0.3.9):
+    //
+    //   public final java.lang.Void getRawResult();
+    //   protected final void setRawResult(java.lang.Void);
+    //
+    // Both FINAL, and `setRawResult`'s body is empty. No subclass can give a
+    // `RecursiveAction` a raw-result slot and `getRawResult()` is null for
+    // every one of them, so the real `complete(v)` —
+    // `setRawResult(v); setDone();` — reduces on this receiver to exactly
+    // `setDone()`, which is `fjp_state_set_done_preserving_thrown` (W6-7): OR
+    // the done bit, leave any recorded throwable alone. Routing it through
+    // `fjp_complete_body` instead would park `v` in the side table where
+    // nothing can read it back, because `RecursiveAction.getRawResult()` is a
+    // constant-null registration on both boot paths.
+    //
+    // Only the synthetic path had the hole. In real-JDK mode `RecursiveAction`
+    // does not declare `complete`, so the resolved declaring class is
+    // `ForkJoinTask` and that registration already covers an `ra` receiver —
+    // which is also why this costs no allow-list entry.
+    r.register_with_kind(
+        "java/util/concurrent/RecursiveAction",
+        "complete",
+        "(Ljava/lang/Object;)V",
+        |_ctx, args| {
+            let this = obj_arg(args, 0)?;
+            crate::phases_early::fjp_state_set_done_preserving_thrown(this);
+            Ok(None)
+        },
+        cratonvm_native_api::NativeKind::Bridge,
+    );
+
+    r.set_category(__prev_cat);
+}
+
+// ---------------------------------------------------------------------------
 // L19 — `CountedCompleter` starves under a lazy `fork()`; the gated eager fork
 // ---------------------------------------------------------------------------
 //
@@ -7070,12 +7862,16 @@ pub(crate) fn register_forkjointask_quietly_bridge(r: &mut NativeMethodRegistry)
 // the JDK can also produce.
 //
 // It is nevertheless an ORDERING change for every workload that forks, so it
-// is OFF by default and selected per run by `CRATONVM_FJP_EAGER_FORK`
-// (grouped spelling `CRATONVM_THREADS=fjp-eager-fork=...`):
+// shipped behind `CRATONVM_FJP_EAGER_FORK` (grouped spelling
+// `CRATONVM_THREADS=fjp-eager-fork=...`). The default FLIPPED on 2026-08-07
+// after the A/B `fjt_fork_mode` records below — the narrow `CountedCompleter`
+// cure is now what an unset environment gets, and lazy is the opt-out:
 //
-//   unset / `0` / anything unrecognised  today's lazy fork (DEFAULT)
-//   `1` / `cc` / `counted`               eager ONLY for a CountedCompleter
-//                                        receiver — the narrow cure
+//   unset                                eager for a CountedCompleter receiver
+//                                        (DEFAULT since 2026-08-07)
+//   `0` / anything unrecognised          the historical lazy fork — the
+//                                        OPT-OUT, and the bisection knob
+//   `1` / `cc` / `counted`               the default, stated explicitly
 //   `all`                                eager for every ForkJoinTask — the
 //                                        broad variant, for measuring the
 //                                        ordering blast radius
@@ -7248,9 +8044,11 @@ fn fjt_fork_always_eager(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
 /// `register_t19_k3_forkjoinpool_common` inside `register_essential_natives`),
 /// so this wins in both.
 ///
-/// In `Lazy` mode it returns without touching the registry at all — the
-/// default path is not merely equivalent to today's, it is untouched, kind and
-/// slot included.
+/// In `Lazy` mode it returns without touching the registry at all, so the
+/// opt-out arm is not merely equivalent to the pre-L19 path, it IS that path,
+/// kind and slot included. Since the 2026-08-07 default flip that arm is
+/// reached only by `CRATONVM_FJP_EAGER_FORK=0` (or an unrecognised value), not
+/// by an unset environment.
 pub(crate) fn register_forkjointask_eager_fork_gate(r: &mut NativeMethodRegistry) {
     let mode = fjt_fork_mode();
     let callback: cratonvm_native_api::NativeCallback = match mode {
@@ -7290,8 +8088,14 @@ pub(crate) fn register_new15_loom(r: &mut NativeMethodRegistry) {
     // `doExec()` + `awaitDone()`. Rides the same hook as the static
     // `invokeAll` overloads for the same reason.
     register_forkjointask_quietly_bridge(r);
-    // L19: no-op unless CRATONVM_FJP_EAGER_FORK is set. Must stay AFTER
-    // `phases_early::register_forkjoin_natives`, which it is —
+    // W6-9 §7: `getException` on a cancelled task, `reinitialize`, and the
+    // missing `RecursiveAction.complete`. Rides this hook for the ordering
+    // reason spelled out above the registrar — it must run after
+    // `phases_early::register_forkjoin_natives`, which it does.
+    register_forkjointask_w6_9_residual_bridge(r);
+    // L19: re-registers `fork()` in every mode except the opt-out
+    // `CRATONVM_FJP_EAGER_FORK=0` (since the 2026-08-07 default flip). Must
+    // stay AFTER `phases_early::register_forkjoin_natives`, which it is —
     // `register_phase51_natives` runs earlier in `register_builtins`.
     register_forkjointask_eager_fork_gate(r);
     register_wp4_8_continuation_support(r);
@@ -7319,9 +8123,15 @@ pub fn register_t19_k3_forkjoinpool_common(r: &mut NativeMethodRegistry) {
     // are the LAST real-bytecode routes from this VM's side-table completion
     // model into `awaitDone()`, which no worker thread exists to satisfy.
     register_forkjointask_quietly_bridge(r);
-    // L19: no-op unless CRATONVM_FJP_EAGER_FORK is set. Must stay AFTER
-    // `phases_early::register_real_jdk_forkjoin_essentials`, which it is —
-    // `register_essential_natives` calls that first (native-builtins/src/lib.rs).
+    // W6-9 §7, on the same real-JDK essentials hook. `getException` here
+    // SUPERSEDES the slot `register_real_jdk_forkjoin_essentials` installed one
+    // call earlier — that is the whole mechanism, see the registrar's header.
+    register_forkjointask_w6_9_residual_bridge(r);
+    // L19: re-registers `fork()` in every mode except the opt-out
+    // `CRATONVM_FJP_EAGER_FORK=0` (since the 2026-08-07 default flip). Must
+    // stay AFTER `phases_early::register_real_jdk_forkjoin_essentials`, which
+    // it is — `register_essential_natives` calls that first
+    // (native-builtins/src/lib.rs).
     register_forkjointask_eager_fork_gate(r);
     r.set_category(__prev_cat);
 }
@@ -7490,7 +8300,8 @@ fn cont_stacks() -> &'static parking_lot::Mutex<std::collections::HashMap<u64, V
 /// Mark `this` as mounted on the current thread; returns the global-root handle
 /// that [`cont_pop`] must be given.
 fn cont_push(ctx: &mut dyn NativeContext, this: ObjectRef) -> usize {
-    let scope_hash = match ctx.get_field(this, NEW15_CONT_SCOPE) {
+    let scope_slot = cont_slots(&*ctx, this).scope;
+    let scope_hash = match ctx.get_field(this, scope_slot) {
         Value::Object(Some(s)) => ctx.identity_hash_code(s),
         _ => 0,
     };
@@ -7556,6 +8367,14 @@ pub(crate) fn register_new15_continuation(r: &mut NativeMethodRegistry) {
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let cls = "jdk/internal/vm/Continuation";
 
+    // W7-75. Publish the slot map for `verify_declared_slot_maps`, unconditional
+    // and outside the flag check on purpose — one `&'static` push per process,
+    // and gating it would leave a run that enables the flag later with nothing
+    // to sweep. `register_new15_loom` is called in BOTH arms of `vm_init`'s
+    // `if config.use_synthetic_jdk` fork, so the map is published in Compatible
+    // mode too, which is exactly the mode this census is about.
+    read_alias::declare_slot_map(&NEW15_CONT_SLOT_MAP);
+
     // Constructor: Continuation(ContinuationScope, Runnable)
     r.register(
         cls,
@@ -7586,11 +8405,16 @@ pub(crate) fn register_new15_continuation(r: &mut NativeMethodRegistry) {
             }
             // Ensure the target object has at least NEW15_CONT_FIELDS slots.
             // The class loader synthesizes this for `jdk/internal/vm/Continuation`.
-            ctx.set_field(this, NEW15_CONT_SCOPE, scope);
-            ctx.set_field(this, NEW15_CONT_TARGET, target);
-            ctx.set_field(this, NEW15_CONT_STATE, Value::Int(NEW15_CONT_STATE_NEW));
-            ctx.set_field(this, NEW15_CONT_PIN, Value::Int(0));
-            ctx.set_field(this, NEW15_CONT_PREEMPT, Value::Int(0));
+            let s = cont_slots(&*ctx, this);
+            ctx.set_field(this, s.scope, scope);
+            ctx.set_field(this, s.target, target);
+            // NEW. `NEW15_CONT_STATE_NEW` and the real `done = false` are both
+            // 0, so this one write serves both encodings.
+            ctx.set_field(this, s.done, Value::Int(NEW15_CONT_STATE_NEW));
+            if let Some(pin) = s.pin {
+                ctx.set_field(this, pin, Value::Int(0));
+            }
+            ctx.set_field(this, s.preempted, Value::Int(0));
             Ok(None)
         },
     );
@@ -7601,11 +8425,17 @@ pub(crate) fn register_new15_continuation(r: &mut NativeMethodRegistry) {
         // Guard against re-running a completed continuation. The JDK allows
         // re-running a yielded continuation; since we never yield, any non-NEW
         // state means DONE or an illegal reentrant call.
-        let prev_state = match ctx.get_field(this, NEW15_CONT_STATE) {
-            Value::Int(s) => s,
-            _ => NEW15_CONT_STATE_NEW,
-        };
-        if prev_state == NEW15_CONT_STATE_DONE {
+        //
+        // W7-75. This guard could not fire on a real receiver until the slots
+        // were resolved by name: it read slot 2, which on a real
+        // `jdk.internal.vm.Continuation` is `parent` — a `Continuation`
+        // reference — so the `Value::Int` match fell straight through to the
+        // "never ran" arm. HotSpot throws `IllegalStateException` here, and
+        // that is measured, not assumed:
+        // `probes/ContinuationForkJoinPoolAliasProbe.java` on Adoptium
+        // 25.0.3.9 prints `CONT second-run=THREW:java.lang.IllegalStateException`.
+        let s = cont_slots(&*ctx, this);
+        if cont_is_done(&*ctx, this, s) {
             return Err(cratonvm_types::error::MethodCallFailed::InternalError(
                 cratonvm_types::error::VmError::Runtime(
                     cratonvm_types::error::RuntimeError::IllegalStateException {
@@ -7614,12 +8444,12 @@ pub(crate) fn register_new15_continuation(r: &mut NativeMethodRegistry) {
                 ),
             ));
         }
-        ctx.set_field(this, NEW15_CONT_STATE, Value::Int(NEW15_CONT_STATE_RUNNING));
+        cont_set_done(&*ctx, this, s, false);
 
-        let target = match ctx.get_field(this, NEW15_CONT_TARGET) {
+        let target = match ctx.get_field(this, s.target) {
             Value::Object(Some(obj)) => obj,
             _ => {
-                ctx.set_field(this, NEW15_CONT_STATE, Value::Int(NEW15_CONT_STATE_DONE));
+                cont_set_done(&*ctx, this, s, true);
                 return Ok(None);
             }
         };
@@ -7638,7 +8468,14 @@ pub(crate) fn register_new15_continuation(r: &mut NativeMethodRegistry) {
         // Always transition to DONE regardless of whether run() threw; this
         // matches Continuation.run() propagating exceptions out but still
         // leaving the continuation in a terminal state.
-        ctx.set_field(this, NEW15_CONT_STATE, Value::Int(NEW15_CONT_STATE_DONE));
+        //
+        // Re-resolve rather than reusing `s`: the nested invoke above can
+        // relocate `this`, and `cont_pop` hands back the CURRENT reference. The
+        // slot indices themselves cannot change (they are a property of the
+        // class, not the object), but re-resolving from the post-GC reference
+        // is the cheap way to keep that true if the receiver is ever swapped.
+        let s = cont_slots(&*ctx, this);
+        cont_set_done(&*ctx, this, s, true);
         result.map(|_| None)
     });
 
@@ -7684,17 +8521,15 @@ pub(crate) fn register_new15_continuation(r: &mut NativeMethodRegistry) {
     // isDone()Z
     r.register(cls, "isDone", "()Z", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let done = matches!(
-            ctx.get_field(this, NEW15_CONT_STATE),
-            Value::Int(NEW15_CONT_STATE_DONE)
-        );
+        let done = cont_is_done(&*ctx, this, cont_slots(&*ctx, this));
         Ok(Some(Value::Int(if done { 1 } else { 0 })))
     });
 
     // isPreempted()Z
     r.register(cls, "isPreempted", "()Z", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let v = matches!(ctx.get_field(this, NEW15_CONT_PREEMPT), Value::Int(1));
+        let slot = cont_slots(&*ctx, this).preempted;
+        let v = matches!(ctx.get_field(this, slot), Value::Int(1));
         Ok(Some(Value::Int(if v { 1 } else { 0 })))
     });
 
@@ -7705,46 +8540,66 @@ pub(crate) fn register_new15_continuation(r: &mut NativeMethodRegistry) {
         "()Ljdk/internal/vm/ContinuationScope;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            Ok(Some(ctx.get_field(this, NEW15_CONT_SCOPE)))
+            let slot = cont_slots(&*ctx, this).scope;
+            Ok(Some(ctx.get_field(this, slot)))
         },
     );
 
-    // pin() — increment pin count on the continuation AND on the live
-    // JvmThread so that any subsequent sleep/park emits `VirtualThreadPinned`.
-    r.register_with_kind(cls, "pin", "()V", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let cur = match ctx.get_field(this, NEW15_CONT_PIN) {
-            Value::Int(i) => i,
-            _ => 0,
-        };
-        ctx.set_field(this, NEW15_CONT_PIN, Value::Int(cur.saturating_add(1)));
-        ctx.vt_pin("Continuation.pin");
-        Ok(None)
-    }, cratonvm_native_api::NativeKind::Bridge);
+    // W7-86. `pin()` and `unpin()` are **`public static native void`** on the
+    // real class — `javap -p --module java.base jdk.internal.vm.Continuation`
+    // against Adoptium 25.0.3.9 — and their descriptor is `()V`, so a call site
+    // is an `invokestatic` with zero operands and the native is handed an
+    // EMPTY `args`. Both bodies opened `obj_arg(args, 0)?`, which on an empty
+    // slice returns `NullPointerException("null object argument")`.
+    //
+    // That is not a source-level inference. Measured, on this Windows host,
+    // `probes/StaticNativeArityProbe.java`:
+    //
+    //   HotSpot 25.0.3.9   B1 Continuation.pin()  = returned
+    //   CratonVM (default) B1 Continuation.pin()  = THREW:java.lang.NullPointerException:null object argument
+    //
+    // and `--dump-native-registry` on that same run shows the registration
+    // below with `owns_slot: true`, `invocations: 1`, and the real class's
+    // method `acc_native: true, has_code: false` — this native is the only
+    // implementation there is, so nothing else could have answered.
+    //
+    // The on-object pin counter that used to live here is gone rather than made
+    // conditional: a static has no receiver under EITHER compatibility mode
+    // (the interpreter pops exactly the descriptor's parameters), so the
+    // counter was unreachable in both, in this shape and in every shape this
+    // pair has had. Nothing outside the pair ever read it; `vt_pin`/`vt_unpin`
+    // are the whole observable and they are unchanged. `ContSlots::pin` stays —
+    // it is the fallback map's honest description of the synthetic layout, and
+    // `cont_slots` is still what every OTHER native on this class uses.
+    //
+    // Mode: this repairs Compatible (`--real-jdk`, the default) and is a
+    // HotSpot-parity fix — HotSpot returns normally, CratonVM threw. Synthetic
+    // mode is unchanged in observable behaviour: the counter it wrote could
+    // never be written there either.
+    r.register_with_kind(
+        cls,
+        "pin",
+        "()V",
+        |ctx, _args| {
+            ctx.vt_pin("Continuation.pin");
+            Ok(None)
+        },
+        cratonvm_native_api::NativeKind::Bridge,
+    );
 
-    // unpin()
-    r.register_with_kind(cls, "unpin", "()V", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let cur = match ctx.get_field(this, NEW15_CONT_PIN) {
-            Value::Int(i) => i,
-            _ => 0,
-        };
-        let next = if cur > 0 { cur - 1 } else { 0 };
-        ctx.set_field(this, NEW15_CONT_PIN, Value::Int(next));
-        ctx.vt_unpin();
-        Ok(None)
-    }, cratonvm_native_api::NativeKind::Bridge);
+    // unpin() — see `pin` above; same arity, same repair.
+    r.register_with_kind(
+        cls,
+        "unpin",
+        "()V",
+        |ctx, _args| {
+            ctx.vt_unpin();
+            Ok(None)
+        },
+        cratonvm_native_api::NativeKind::Bridge,
+    );
 
     // isPinned()Z — static in the real JDK; both forms register.
-    r.register(
-        cls,
-        "isPinned",
-        "(Ljdk/internal/vm/ContinuationScope;)I",
-        |ctx, _args| {
-            let pinned = if ctx.vt_pin_count() > 0 { 1 } else { 0 };
-            Ok(Some(Value::Int(pinned)))
-        },
-    );
 
     // static getCurrentContinuation(ContinuationScope) — the innermost
     // continuation of `scope` mounted on the calling thread. `run()` above now
@@ -7794,6 +8649,12 @@ pub(crate) fn register_new15_forkjoinpool_common(r: &mut NativeMethodRegistry) {
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let cls = "java/util/concurrent/ForkJoinPool";
 
+    // W7-75. See the matching call in `register_new15_continuation` for why this
+    // is unconditional. `declare_slot_map` is idempotent by pointer, and this
+    // registrar runs twice on the real-JDK path
+    // (`register_t19_k3_forkjoinpool_common` then `register_new15_loom`).
+    read_alias::declare_slot_map(&NEW15_FJP_SLOT_MAP);
+
     // static commonPool()Ljava/util/concurrent/ForkJoinPool;
     //
     // Returns a synthetic ForkJoinPool object whose `parallelism` field is
@@ -7806,11 +8667,11 @@ pub(crate) fn register_new15_forkjoinpool_common(r: &mut NativeMethodRegistry) {
         "commonPool",
         "()Ljava/util/concurrent/ForkJoinPool;",
         |ctx, _args| {
-            let obj = alloc_concurrent_synthetic(
+            let obj = try_alloc_concurrent_synthetic(
                 ctx,
                 "java/util/concurrent/ForkJoinPool",
                 NEW15_FJP_FIELDS,
-            );
+            )?;
             // T16.7: the JDK formula is `max(1, availableProcessors() - 1)`,
             // but tests run in parallel on multi-core hosts, so the common-pool
             // proxy is clamped to 1 for determinism (`forkjoin_pool_basic`
@@ -7819,12 +8680,25 @@ pub(crate) fn register_new15_forkjoinpool_common(r: &mut NativeMethodRegistry) {
             // so user code that wants real parallelism should query that pool.
             // `getCommonPoolParallelism()` below MUST report the same number —
             // the JDK specifies the two as equal — hence the shared constant.
+            //
+            // W7-75: by NAME. `parallelism` is index 15 on the real class and a
+            // genuine `int` there, so on a real receiver this write now lands
+            // where `ForkJoinPool.toString()` — real JDK bytecode — reads it.
+            // It used to go to slot 0, which is `termination`, a
+            // `CountDownLatch` reference.
+            let s = fjp_slots(&*ctx, obj);
             ctx.set_field(
                 obj,
-                NEW15_FJP_PARALLELISM,
+                s.parallelism,
                 Value::Int(NEW15_COMMON_POOL_PARALLELISM),
             );
-            ctx.set_field(obj, NEW15_FJP_ACTIVE, Value::Int(0));
+            // The real class has no `active` counter, so there is nothing to
+            // initialise on a real receiver — its slot 1 is `saturate`, a
+            // `Predicate` reference. `getActiveThreadCount` below answers 0
+            // when the field is absent, which is what this write said anyway.
+            if let Some(active) = s.active {
+                ctx.set_field(obj, active, Value::Int(0));
+            }
             // T19_K3_FJP_FACTORY_POPULATE: when the real ForkJoinPool class
             // is loaded (e.g. KC26 boot path that walks the JDK class
             // hierarchy), it has an instance field `factory` that
@@ -7841,7 +8715,7 @@ pub(crate) fn register_new15_forkjoinpool_common(r: &mut NativeMethodRegistry) {
             //   "io.quarkus.bootstrap.forkjoin.QuarkusForkJoinWorkerThreadFactory"
             // before delegating to KeycloakMain.main, so we must populate
             // the field with an instance of that class.
-            populate_common_factory(ctx, obj);
+            populate_common_factory(ctx, obj)?;
             Ok(Some(Value::Object(Some(obj))))
         },
     );
@@ -7854,10 +8728,21 @@ pub(crate) fn register_new15_forkjoinpool_common(r: &mut NativeMethodRegistry) {
         Ok(Some(Value::Int(NEW15_COMMON_POOL_PARALLELISM)))
     });
 
-    // getParallelism()I — instance method, reads field 0 of `this`.
+    // getParallelism()I — instance method, reads the receiver's `parallelism`.
+    //
+    // W7-75: BY NAME, and this is the live read-side alias, not a latent one.
+    // `vm/src/runtime/interpreter/native_override.rs::is_forkjoin_native_override`
+    // FORCES this native ahead of real bytecode, and the matching keep-list in
+    // `native-api/src/registry.rs` keeps the registration alive on the default
+    // real-ForkJoinPool path — so `new ForkJoinPool(4).getParallelism()`, a pool
+    // this native never allocated, came here, read slot 0 (`termination`, a null
+    // `CountDownLatch`), missed the `Value::Int` arm and answered the fallback 1.
+    // HotSpot answers 4 and its own `toString()` says 4; measured, both, in
+    // `probes/ContinuationForkJoinPoolAliasProbe.java`.
     r.register(cls, "getParallelism", "()I", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        match ctx.get_field(this, NEW15_FJP_PARALLELISM) {
+        let slot = fjp_slots(&*ctx, this).parallelism;
+        match ctx.get_field(this, slot) {
             Value::Int(i) => Ok(Some(Value::Int(i))),
             _ => Ok(Some(Value::Int(1))),
         }
@@ -7865,9 +8750,19 @@ pub(crate) fn register_new15_forkjoinpool_common(r: &mut NativeMethodRegistry) {
 
     // getActiveThreadCount()I — always reports 0; the real carrier pool is
     // tracked by `SharedVm.threads.virtual_scheduler`, not by this synthetic proxy.
+    //
+    // On a real receiver there is no `active` field to read (slot 1 is
+    // `saturate`, a `Predicate`), so the answer is the same 0 without touching
+    // it. Note this triple is DROPPED by `registry.rs`'s real-ForkJoinPool
+    // filter — it is not on the keep list — so on the default path it never
+    // runs at all; the synthetic arm (`CRATONVM_SYNTHETIC_FORKJOINPOOL`) is the
+    // only one that reaches it, and there `active` resolves to the legacy slot.
     r.register(cls, "getActiveThreadCount", "()I", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        match ctx.get_field(this, NEW15_FJP_ACTIVE) {
+        let Some(slot) = fjp_slots(&*ctx, this).active else {
+            return Ok(Some(Value::Int(0)));
+        };
+        match ctx.get_field(this, slot) {
             Value::Int(i) => Ok(Some(Value::Int(i))),
             _ => Ok(Some(Value::Int(0))),
         }
@@ -7910,7 +8805,7 @@ pub(crate) fn register_new15_forkjoinpool_common(r: &mut NativeMethodRegistry) {
                 }
             }
             // No factory yet — allocate one matching the system property.
-            let factory = alloc_common_factory(ctx);
+            let factory = alloc_common_factory(ctx)?;
             if let Some(Value::Object(Some(this))) = args.first() {
                 ctx.set_field_by_name(*this, "factory", Value::Object(Some(factory)));
             }
@@ -7918,6 +8813,7 @@ pub(crate) fn register_new15_forkjoinpool_common(r: &mut NativeMethodRegistry) {
         },
     );
     r.set_category(__prev_cat);
+    ()
 }
 
 /// T19_K3 — Whitelist for the
@@ -7954,9 +8850,17 @@ pub(crate) fn is_safe_factory_class_name(s: &str) -> bool {
 /// T19_K3 — Resolve the desired factory-class internal name
 /// (slash-separated form) from the JVM's system properties.
 ///
-/// Returns the JDK-default
-/// `java/util/concurrent/ForkJoinPool$DefaultCommonPoolForkJoinWorkerThreadFactory`
-/// when the property is unset or fails the allowlist check.
+/// Returns `java/util/concurrent/ForkJoinPool$DefaultCommonPool` +
+/// `ForkJoinWorkerThreadFactory` when the property is unset or fails the
+/// allowlist check.
+///
+/// **That fallback is a JDK-21-era name and it is wrong on JDK 25** — see
+/// `common_factory_from_image` below for the measurement and the fix. It is
+/// deliberately still returned here: `Compatible` fabricates a class under this
+/// name today, and callers observe it through
+/// `getFactory().getClass().getName()`. Correcting the string would change that
+/// answer in `Compatible`, which is not this lane's call to make (contract
+/// §5/§10). `alloc_common_factory` repairs it on the `--jdk-only` path only.
 pub(crate) fn resolve_common_factory_internal_name(ctx: &dyn NativeContext) -> String {
     let sf = ctx
         .get_system_property("java.util.concurrent.ForkJoinPool.common.threadFactory")
@@ -7968,6 +8872,56 @@ pub(crate) fn resolve_common_factory_internal_name(ctx: &dyn NativeContext) -> S
     }
 }
 
+/// W7-14 — Ask the **image** for the common pool's factory instead of naming
+/// it: read the `defaultForkJoinWorkerThreadFactory` static field off the
+/// loaded `java/util/concurrent/ForkJoinPool`.
+///
+/// This is the substance of the fix, and it is not "update the string".
+/// `resolve_common_factory_internal_name`'s fallback is a *nested* JDK-internal
+/// class name from the JDK 21 era, when the common pool had its own
+/// permission-clearing factory. `javap` on JDK 25 (Adoptium 25.0.3.9) says the
+/// image declares exactly five nested classes and `…$DefaultCommonPool` +
+/// `ForkJoinWorkerThreadFactory` is not among them — it went out with the
+/// security manager. Substituting today's sibling name would buy one release
+/// and then rot the same way, which is the shape five separate defects in this
+/// campaign reduced to: never bind by name.
+///
+/// The field does not rot, for two reasons worth stating separately:
+///
+/// * `ForkJoinPool.defaultForkJoinWorkerThreadFactory` is **public API**
+///   (`public static final`, since Java 7), not an internal nested class. A
+///   name the specification publishes is a different risk class from a name the
+///   implementation happens to use this year.
+/// * On HotSpot 25 it is not merely the same *class* as the common pool's
+///   factory, it is the same *instance*. Measured on this host:
+///   `commonPool().getFactory() == ForkJoinPool.defaultForkJoinWorkerThreadFactory`
+///   is `true`, and both report
+///   `java.util.concurrent.ForkJoinPool$DefaultForkJoinWorkerThreadFactory`.
+///
+/// So returning the singleton rather than allocating a fresh instance is more
+/// faithful, not less: it reproduces HotSpot's reference identity as well as
+/// its class identity. `getFactory()` then caches it into `factory` exactly as
+/// before.
+///
+/// Returns `None` — never an error — when the class, the field, or the value is
+/// missing, so the caller keeps its existing fallback intact. A JDK that stops
+/// publishing the field degrades to the old behaviour instead of failing.
+fn common_factory_from_image(ctx: &mut dyn NativeContext) -> Option<cratonvm_types::ObjectRef> {
+    // `ensure_class_initialized`, not `class_id_by_name`: the field is written
+    // by `ForkJoinPool.<clinit>`, so an uninitialized class reads null and we
+    // would fall back for no reason. Re-entering initialization from a native
+    // on this very class is the ordinary already-initializing no-op.
+    let cid = ctx
+        .ensure_class_initialized("java/util/concurrent/ForkJoinPool")
+        .ok()?;
+    let idx = ctx.static_field_index_by_name(cid, "defaultForkJoinWorkerThreadFactory")?;
+    match ctx.get_static_field(cid, idx) {
+        Value::Object(Some(factory)) => Some(factory),
+        // Null or a non-reference: a synthetic-JDK build has no such field.
+        _ => None,
+    }
+}
+
 /// T19_K3 — Allocate a synthetic
 /// `ForkJoinPool$ForkJoinWorkerThreadFactory` instance whose class
 /// identity matches the configured common-pool factory name.
@@ -7976,14 +8930,59 @@ pub(crate) fn resolve_common_factory_internal_name(ctx: &dyn NativeContext) -> S
 /// `getFactory()` registration to ensure
 /// `getFactory().getClass().getName()` round-trips to the system
 /// property's dot-form.
-pub(crate) fn alloc_common_factory(ctx: &mut dyn NativeContext) -> cratonvm_types::ObjectRef {
+pub(crate) fn alloc_common_factory(ctx: &mut dyn NativeContext) -> Result<cratonvm_types::ObjectRef, MethodCallFailed> {
     let target = resolve_common_factory_internal_name(ctx);
     match ctx.ensure_class_initialized(&target) {
         Ok(cid) => {
             let nfields = ctx.class_num_total_fields(cid).max(1);
-            ctx.alloc_object(cid, nfields)
+            Ok(ctx.alloc_object(cid, nfields))
         }
-        Err(_) => alloc_concurrent_synthetic(ctx, &target, 1),
+        Err(_) => {
+            // W7-14 — `target` is not in the image. Under `--jdk-only` the
+            // fabrication below is *refused*, and that refusal costs the whole
+            // call: `RJdkForkJoin` dies at `parallelStreams():209` with
+            // `NoClassDefFoundError: java/util/concurrent/ForkJoinPool$Default`
+            // `CommonPoolForkJoinWorkerThreadFactory` on the first
+            // `ForkJoinPool.commonPool()` — nothing in that vector is about
+            // factories. Pre-existing rather than a regression; the control
+            // measurement is in
+            // docs/known-issues/jdk-only/W7-11-strict-baseline-remeasured.md.
+            //
+            // ORDER IS THE CONTRACT HERE. The recovery runs *after*
+            // `try_alloc_concurrent_synthetic`, not before it, so that
+            // `Compatible` is untouched by construction rather than by
+            // argument: where fabrication is available it still succeeds, still
+            // succeeds first, and still returns the same object built by the
+            // same call — the operator's own `…common.threadFactory` class
+            // included, which is what Keycloak/Quarkus's
+            // `getFactory().getClass().getName().equals(property)` check reads.
+            // Probing the policy *first* (the variant recorded in W6-12) would
+            // mint the class one call earlier and route `Compatible`'s
+            // allocation through a different entry point; that is a smaller
+            // change than it sounds and still not one this lane may make.
+            //
+            // The price of this order is paid only on the refusing path: the
+            // discarded `Err` is a `NoClassDefFoundError` that was allocated
+            // and is now garbage. `getFactory()` caches into `factory`, so it
+            // happens about once per process, and a throwable per process is
+            // the right trade for a mode that cannot change.
+            match try_alloc_concurrent_synthetic(ctx, &target, 1) {
+                Ok(factory) => Ok(factory),
+                // Refused. Ask the image what it actually has. Falling back to
+                // the default factory when the requested one cannot be produced
+                // is also what real `ForkJoinPool.<clinit>` does — it catches
+                // the property-named factory's failure and keeps
+                // `defaultForkJoinWorkerThreadFactory` — so this is the
+                // specified behaviour, not a strict-mode-only concession.
+                Err(refusal) => match common_factory_from_image(ctx) {
+                    Some(factory) => Ok(factory),
+                    // No image either (synthetic-JDK build): the original
+                    // refusal is still the honest answer, so re-raise it
+                    // unchanged rather than inventing a second one.
+                    None => Err(refusal),
+                },
+            }
+        }
     }
 }
 
@@ -7993,13 +8992,14 @@ pub(crate) fn alloc_common_factory(ctx: &mut dyn NativeContext) -> cratonvm_type
 pub(crate) fn populate_common_factory(
     ctx: &mut dyn NativeContext,
     pool: cratonvm_types::ObjectRef,
-) {
-    let factory = alloc_common_factory(ctx);
+) -> Result<(), MethodCallFailed> {
+    let factory = alloc_common_factory(ctx)?;
     // Set by name so we work whether the class is the real JDK shape
     // (with `factory` at some non-zero index) or a synthetic placeholder
     // (where the field doesn't exist — set_field_by_name is silent on
     // missing fields).
     ctx.set_field_by_name(pool, "factory", Value::Object(Some(factory)));
+    Ok(())
 }
 
 #[cfg(test)]
@@ -8093,9 +9093,19 @@ pub(crate) mod new15_tests {
         assert!(is_safe_factory_class_name(
             "io.quarkus.bootstrap.forkjoin.QuarkusForkJoinWorkerThreadFactory"
         ));
-        // JDK default factory name with $ inner-class separator.
+        // A nested class name, i.e. one carrying the `$` separator. W7-14: this
+        // asserts the *syntax* validator accepts `$`, nothing about which class
+        // the JDK declares — the name below is the JDK-21-era one that JDK 25
+        // dropped, and reading this case as "the JDK default" is how that name
+        // kept looking load-bearing. Both spellings are exercised so the
+        // distinction cannot quietly collapse again.
         assert!(is_safe_factory_class_name(
             "java.util.concurrent.ForkJoinPool$DefaultCommonPoolForkJoinWorkerThreadFactory"
+        ));
+        // What JDK 25 actually declares, and what HotSpot 25 answers from
+        // `commonPool().getFactory().getClass().getName()`.
+        assert!(is_safe_factory_class_name(
+            "java.util.concurrent.ForkJoinPool$DefaultForkJoinWorkerThreadFactory"
         ));
     }
 
@@ -8159,6 +9169,272 @@ pub(crate) mod new15_tests {
         assert_ne!(NEW15_CONT_STATE_NEW, NEW15_CONT_STATE_RUNNING);
         assert_ne!(NEW15_CONT_STATE_RUNNING, NEW15_CONT_STATE_YIELDED);
         assert_ne!(NEW15_CONT_STATE_YIELDED, NEW15_CONT_STATE_DONE);
+    }
+
+    // -----------------------------------------------------------------------
+    // W7-75 — the read-side slot alias, and the guard that could not fire
+    // -----------------------------------------------------------------------
+
+    /// The real JDK 25 `jdk.internal.vm.Continuation` layout, `javap -p`
+    /// against Eclipse Adoptium 25.0.3.9, in declaration order with `static`
+    /// excluded. Superclass is `java.lang.Object`, which declares none, so this
+    /// is the whole transitive chain.
+    const REAL_CONT_FIELDS: &[(&str, &str)] = &[
+        ("target", "Ljava/lang/Runnable;"),
+        ("scope", "Ljdk/internal/vm/ContinuationScope;"),
+        ("parent", "Ljdk/internal/vm/Continuation;"),
+        ("child", "Ljdk/internal/vm/Continuation;"),
+        ("tail", "Ljdk/internal/vm/StackChunk;"),
+        ("done", "Z"),
+        ("mounted", "Z"),
+        ("yieldInfo", "Ljava/lang/Object;"),
+        ("preempted", "Z"),
+        ("scopedValueCache", "[Ljava/lang/Object;"),
+    ];
+
+    /// The real JDK 25 `java.util.concurrent.ForkJoinPool` layout, same oracle.
+    /// Its superclass `AbstractExecutorService` declares NO instance field (its
+    /// only member is the static `$assertionsDisabled`), so ForkJoinPool's own
+    /// sixteen are the whole chain — which is what makes `parallelism` 15 and
+    /// not 15-plus-something.
+    const REAL_FJP_FIELDS: &[(&str, &str)] = &[
+        ("termination", "Ljava/util/concurrent/CountDownLatch;"),
+        ("saturate", "Ljava/util/function/Predicate;"),
+        (
+            "factory",
+            "Ljava/util/concurrent/ForkJoinPool$ForkJoinWorkerThreadFactory;",
+        ),
+        ("ueh", "Ljava/lang/Thread$UncaughtExceptionHandler;"),
+        ("container", "Ljdk/internal/vm/SharedThreadContainer;"),
+        ("workerNamePrefix", "Ljava/lang/String;"),
+        ("poolName", "Ljava/lang/String;"),
+        ("delayScheduler", "Ljava/util/concurrent/DelayScheduler;"),
+        ("queues", "[Ljava/util/concurrent/ForkJoinPool$WorkQueue;"),
+        ("runState", "J"),
+        ("keepAlive", "J"),
+        ("config", "J"),
+        ("stealCount", "J"),
+        ("threadIds", "J"),
+        ("ctl", "J"),
+        ("parallelism", "I"),
+    ];
+
+    /// The synthetic shapes, exactly as `ClassManager::instance_fields(n)`
+    /// fabricates them: anonymous `_f0..`, all `Ljava/lang/Object;`. This is
+    /// what makes the fallback tests real — a fabricated class declares NONE of
+    /// the JDK's names, which is precisely the witness `cont_slots` keys on.
+    const ANON_FIELD_NAMES: &[&str] = &["_f0", "_f1", "_f2", "_f3", "_f4"];
+
+    /// Teach the mock a class with this exact instance-field layout and hand
+    /// back a fresh instance of it. The mock resolves a name only through the
+    /// metadata a test declares (its `mock_field_slot` fallback table names
+    /// none of the fields used here — checked), so the witness is falsifiable.
+    fn instance_of(
+        ctx: &mut crate::test_utils::MockNativeContext,
+        class_name: &str,
+        fields: &[(&str, &str)],
+    ) -> ObjectRef {
+        let cid = ctx
+            .ensure_class_initialized(class_name)
+            .expect("mock always resolves");
+        ctx.set_declared_fields(
+            cid,
+            fields
+                .iter()
+                .enumerate()
+                .map(|(slot_index, (name, descriptor))| {
+                    cratonvm_native_api::FieldMetadata {
+                        name: (*name).to_string(),
+                        descriptor: (*descriptor).to_string(),
+                        access_flags: 0,
+                        slot_index,
+                        declaring_class_id: cid,
+                        is_static: false,
+                    }
+                })
+                .collect(),
+        );
+        ctx.alloc_object(cid, fields.len())
+    }
+
+    fn anon_fields(count: usize) -> Vec<(&'static str, &'static str)> {
+        ANON_FIELD_NAMES[..count]
+            .iter()
+            .map(|name| (*name, "Ljava/lang/Object;"))
+            .collect()
+    }
+
+    /// What W7-69 §6(1) recorded, asserted rather than described: every entry
+    /// of the synthetic map names a different field than the real class has at
+    /// that index, and `scope`/`target` are SWAPPED — the shape where both
+    /// resolve and neither complains.
+    #[test]
+    fn the_synthetic_continuation_map_disagrees_with_the_real_class_in_every_slot() {
+        let at = |i: usize| REAL_CONT_FIELDS[i].0;
+        assert_eq!(at(NEW15_CONT_SCOPE), "target");
+        assert_eq!(at(NEW15_CONT_TARGET), "scope");
+        assert_eq!(at(NEW15_CONT_STATE), "parent");
+        assert_eq!(at(NEW15_CONT_PIN), "child");
+        assert_eq!(at(NEW15_CONT_PREEMPT), "tail");
+        // And the two that are swapped really are the same pair, not two
+        // unrelated wrongs: the map's `scope` is the class's `target` and vice
+        // versa. That is the `AsynchronousSocketChannel` shape W7-49 §5 names.
+        assert_eq!(at(NEW15_CONT_SCOPE), "target");
+        assert_eq!(at(NEW15_CONT_TARGET), "scope");
+        // Real `parallelism` is a genuine `int`; slot 0 and 1 are references.
+        assert_eq!(REAL_FJP_FIELDS[NEW15_FJP_PARALLELISM].0, "termination");
+        assert_eq!(REAL_FJP_FIELDS[NEW15_FJP_ACTIVE].0, "saturate");
+        assert_eq!(REAL_FJP_FIELDS[15], ("parallelism", "I"));
+    }
+
+    #[test]
+    fn cont_slots_resolves_the_real_layout_by_name() {
+        let mut ctx = crate::test_utils::MockNativeContext::new();
+        let this = instance_of(&mut ctx, "jdk/internal/vm/Continuation", REAL_CONT_FIELDS);
+        let s = cont_slots(&ctx, this);
+        assert!(s.real, "the four-name witness must hold on the real layout");
+        assert_eq!(s.target, 0);
+        assert_eq!(s.scope, 1);
+        assert_eq!(s.done, 5);
+        assert_eq!(s.preempted, 8);
+        assert_eq!(
+            s.pin, None,
+            "the real class declares no pin counter; writing one would stamp \
+             an Int over `child`, a Continuation reference"
+        );
+        // None of those is the synthetic index it replaced.
+        assert_ne!(s.scope, NEW15_CONT_SCOPE);
+        assert_ne!(s.target, NEW15_CONT_TARGET);
+        assert_ne!(s.done, NEW15_CONT_STATE);
+    }
+
+    #[test]
+    fn cont_slots_falls_back_to_the_synthetic_map_on_an_anonymous_class() {
+        let mut ctx = crate::test_utils::MockNativeContext::new();
+        let fields = anon_fields(NEW15_CONT_FIELDS);
+        let this = instance_of(&mut ctx, "jdk/internal/vm/Continuation", &fields);
+        let s = cont_slots(&ctx, this);
+        assert!(!s.real);
+        assert_eq!(s, CONT_SLOTS_SYNTHETIC);
+    }
+
+    /// **The RED.** The completed-continuation guard, on a real receiver,
+    /// against the predicate it used to be.
+    ///
+    /// The old predicate is reproduced here verbatim rather than described,
+    /// because "the guard is fixed" is exactly the claim a test that only
+    /// checks the new path cannot make: both would pass. It reads slot 2 —
+    /// `parent` — and a fresh `Continuation`'s `parent` is null, so the
+    /// `Value::Int` match falls through to `NEW` and DONE is unreachable no
+    /// matter how many times `run()` completed.
+    #[test]
+    fn the_completed_guard_fires_on_the_real_layout_and_the_old_predicate_did_not() {
+        let mut ctx = crate::test_utils::MockNativeContext::new();
+        let this = instance_of(&mut ctx, "jdk/internal/vm/Continuation", REAL_CONT_FIELDS);
+        // `parent` as the real class leaves it on a fresh instance.
+        ctx.set_field(this, 2, Value::Object(None));
+        let s = cont_slots(&ctx, this);
+
+        assert!(!cont_is_done(&ctx, this, s), "NEW is not done");
+        cont_set_done(&ctx, this, s, false); // run() marks it running
+        assert!(!cont_is_done(&ctx, this, s), "RUNNING is not done");
+        cont_set_done(&ctx, this, s, true); // run() completes
+
+        assert!(
+            cont_is_done(&ctx, this, s),
+            "the guard must see the completion it just recorded"
+        );
+
+        // The old predicate, verbatim: `match get_field(this, NEW15_CONT_STATE)
+        // { Value::Int(v) => v, _ => NEW } == DONE`.
+        let old_verdict = match ctx.get_field(this, NEW15_CONT_STATE) {
+            Value::Int(v) => v,
+            _ => NEW15_CONT_STATE_NEW,
+        } == NEW15_CONT_STATE_DONE;
+        assert!(
+            !old_verdict,
+            "the old slot-2 predicate must NOT fire here — if it does, this \
+             test is not measuring the defect it is named after"
+        );
+    }
+
+    /// The same guard on a synthetic receiver keeps its old four-value
+    /// encoding, so the fallback is not a behaviour change for the mode that
+    /// was already correct.
+    #[test]
+    fn the_completed_guard_keeps_the_state_int_encoding_on_a_synthetic_receiver() {
+        let mut ctx = crate::test_utils::MockNativeContext::new();
+        let fields = anon_fields(NEW15_CONT_FIELDS);
+        let this = instance_of(&mut ctx, "jdk/internal/vm/Continuation", &fields);
+        let s = cont_slots(&ctx, this);
+        cont_set_done(&ctx, this, s, false);
+        assert_eq!(
+            ctx.get_field(this, NEW15_CONT_STATE),
+            Value::Int(NEW15_CONT_STATE_RUNNING)
+        );
+        assert!(!cont_is_done(&ctx, this, s));
+        cont_set_done(&ctx, this, s, true);
+        assert_eq!(
+            ctx.get_field(this, NEW15_CONT_STATE),
+            Value::Int(NEW15_CONT_STATE_DONE)
+        );
+        assert!(cont_is_done(&ctx, this, s));
+    }
+
+    /// `getParallelism()` on a pool the native did not allocate. HotSpot
+    /// answers the pool's own `parallelism`; the synthetic index answered a
+    /// reference slot and fell back to 1.
+    #[test]
+    fn fjp_parallelism_resolves_to_the_real_int_field_not_termination() {
+        let mut ctx = crate::test_utils::MockNativeContext::new();
+        let pool = instance_of(&mut ctx, "java/util/concurrent/ForkJoinPool", REAL_FJP_FIELDS);
+        // What real `ForkJoinPool(4)` bytecode leaves behind: parallelism at
+        // its own index, `termination` a null latch.
+        ctx.set_field(pool, 15, Value::Int(4));
+        ctx.set_field(pool, NEW15_FJP_PARALLELISM, Value::Object(None));
+
+        let s = fjp_slots(&ctx, pool);
+        assert_eq!(s.parallelism, 15);
+        assert_eq!(
+            s.active, None,
+            "the real class has no `active`; slot 1 is `saturate`, a Predicate"
+        );
+        assert_eq!(ctx.get_field(pool, s.parallelism), Value::Int(4));
+
+        // The old read, verbatim, against the same object.
+        let old = match ctx.get_field(pool, NEW15_FJP_PARALLELISM) {
+            Value::Int(i) => i,
+            _ => 1,
+        };
+        assert_eq!(
+            old, 1,
+            "slot 0 is `termination` — the old read could only ever answer its \
+             fallback here, which is the whole finding"
+        );
+    }
+
+    #[test]
+    fn fjp_slots_falls_back_to_the_synthetic_map_on_an_anonymous_class() {
+        let mut ctx = crate::test_utils::MockNativeContext::new();
+        let fields = anon_fields(NEW15_FJP_FIELDS);
+        let pool = instance_of(&mut ctx, "java/util/concurrent/ForkJoinPool", &fields);
+        let s = fjp_slots(&ctx, pool);
+        assert_eq!(s.parallelism, NEW15_FJP_PARALLELISM);
+        assert_eq!(s.active, Some(NEW15_FJP_ACTIVE));
+    }
+
+    /// Both published maps must name the class they are about, or
+    /// `verify_declared_slot_maps` sweeps them against the wrong one — the
+    /// `PB_FIELD_*` misattribution W7-69 §4.4 had to correct by hand.
+    #[test]
+    fn the_published_slot_maps_name_their_own_classes() {
+        assert_eq!(NEW15_CONT_SLOT_MAP.class, "jdk/internal/vm/Continuation");
+        assert_eq!(NEW15_CONT_SLOT_MAP.slots.len(), NEW15_CONT_FIELDS);
+        assert_eq!(
+            NEW15_FJP_SLOT_MAP.class,
+            "java/util/concurrent/ForkJoinPool"
+        );
+        assert_eq!(NEW15_FJP_SLOT_MAP.slots.len(), NEW15_FJP_FIELDS);
     }
 }
 

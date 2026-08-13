@@ -765,12 +765,25 @@ fn resolve_native_for_dispatch(
         method_name,
         method_descriptor,
         Some((callback, kind)),
-        // JDK-ONLY-WAVE2: hard-coded `true` reproduces the pre-§7 "a registered
-        // native unconditionally wins here" of the `find` calls this replaces.
-        // Wave 2 replaces it with the real per-site compatibility verdict once
+        // JDK-ONLY-WAVE2 §10 — AUDITED 2026-08-06, not a live defect, and
+        // deliberately still a constant.
+        //
+        // The `true` reproduces the pre-§7 "a registered native unconditionally
+        // wins here" of the `find` calls this adapter replaced, and that is
+        // faithful rather than lazy: `resolve_native_dispatch_wave1` uses the
+        // flag only to choose between "the site preferred bytecode" and the
+        // kind-based ladder, and this site never preferred bytecode. The
+        // `NativeShadowsBytecode` observation a `false` would have produced is
+        // still recorded — by the `Bridge if bytecode_available` arm one level
+        // down — so nothing is lost from the report either.
+        //
+        // The record asks for "the real per-site compatibility verdict once
         // `force_native_over_real_jdk_bytecode` and the forced-native `String`
-        // list (both in `vm/src/runtime/interpreter/invoke.rs` /
-        // `vm/src/vm/vm_exec.rs`) are unified.
+        // list are unified". That unification is §11's exercise, not this
+        // site's: until those name lists collapse there is no per-site verdict
+        // to read, and inventing one here would be a THIRD answer for methods
+        // that already have two. Revisit when §11's Compatible-mode deletion
+        // lands; under `JdkOnly` the chain is already not consulted.
         true,
         bytecode_available,
     ) {
@@ -1624,8 +1637,45 @@ pub fn execute(
         // this process (mirrors the `mark_jit_bail_listed` invariant this
         // same session's other fix relies on), so none of this is needed
         // when `already_skipped` is true — skip straight to cheap defaults.
+        // The POSITIVE half of the same short-circuit. `already_skipped` covers
+        // methods that FAIL this gate; a method that PASSES was recorded
+        // nowhere, so it re-ran the whole computation on every `execute()`
+        // entry — forever, and *before* the `JitCache` consult in the `else`
+        // branch below, so a fully compiled hot method paid it too. The
+        // expensive term is `jit_method_calls_native_shadowed`: an
+        // O(method-bytecode) decode with a three-string-hash `slot_for_exact`
+        // probe per invoke instruction in the body. Measured on netty
+        // `AdaptiveByteBufAllocatorTest`, that scan reached 2.15% of CPU
+        // through `slot_for_exact` alone while only 637 methods were ever
+        // sealed for the reason it computes — it was re-running, not running
+        // once per method.
+        //
+        // Stamped with `redefine_epoch()` because a stale PASS is unsafe in a
+        // way a stale seal is not: see `JitRealm::jit_gate_pass`.
+        // Keyed on `ClassId`, not on the class name the negative set uses — see
+        // `JitRealm::jit_gate_pass` for why the name is safe there and unsafe
+        // here. The two `Arc` clones are refcount bumps, not allocations.
+        let gate_pass_key = (skip_key.1.clone(), skip_key.2.clone());
+        let gate_pass_memo = if already_skipped || !crate::runtime::env_cache::jit_gate_pass_memo() {
+            None
+        } else {
+            let epoch = cratonvm_jit::redefine_epoch();
+            shared
+                .jit
+                .jit_gate_pass
+                .read()
+                .get(&(class_id, gate_pass_key.0.clone(), gate_pass_key.1.clone()))
+                .copied()
+                .and_then(|(e, iface)| (e == epoch).then_some(iface))
+        };
         let (is_interface_default, static_skip_reason, fjp_skip, native_skip) = if already_skipped {
             (false, None, false, false)
+        } else if let Some(is_interface_default) = gate_pass_memo {
+            // Recorded eligible under the current redefine epoch: all three
+            // skip reasons were false when it was recorded, and each is a pure
+            // function of this method's static bytecode and metadata.
+            cratonvm_jit::note_jit_gate_pass_hit();
+            (is_interface_default, None, false, false)
         } else {
             // Static eligibility check — see vm/src/jit/skip_list.rs for the full
             // policy mapping (each entry is documented against a roadmap item in
@@ -1680,6 +1730,27 @@ pub fn execute(
                 .is_some()
             {
                 true
+            } else if !crate::runtime::env_cache::jit_native_shadow_caller_seal() {
+                // MEASUREMENT LEVER ONLY — `CRATONVM_JIT=-native-shadow-caller-seal`.
+                //
+                // This seal is a CORRECTNESS guard: a compiled direct call
+                // bypasses the interpreter's native-vs-bytecode decision, so a
+                // caller compiled in spite of it can enter JDK bytecode the VM
+                // deliberately replaced. Running with it off is expected to
+                // MISBEHAVE, and it must never be a shipping configuration.
+                //
+                // It exists because the seal excludes 1,281 methods from the JIT
+                // on a Spring Boot context startup — more than the 1,155 that
+                // reach C2 — and the per-arm census shows the population is
+                // dominated by PRECISE hits (`direct=1015`), not by the
+                // class-blind arm (169, whose removal was measured worth
+                // nothing). So the question is no longer "is the detection too
+                // wide" but "is the per-METHOD granularity worth replacing with
+                // per-SITE", and that is a large compiler change. Pricing the
+                // ceiling first is cheaper than building it: if the whole seal
+                // is worth ~0 on this workload, the change should not be
+                // attempted at all.
+                false
             } else {
                 jit_method_calls_native_shadowed(
                     shared,
@@ -1688,6 +1759,23 @@ pub fn execute(
                     code_attr.code.len(),
                 )
             };
+            // Record the ELIGIBLE verdict so the next entry short-circuits.
+            // Scoped to exactly the three static per-method facts the seal
+            // block below scopes itself to — `env_disable_jit` /
+            // `redefine_jit_quiesced` / `gpu_gate_skip` / `clinit_skip` are
+            // runtime or call-site-dependent and are deliberately NOT folded
+            // in, in either direction.
+            if crate::runtime::env_cache::jit_gate_pass_memo()
+                && static_skip_reason.is_none()
+                && !fjp_skip
+                && !native_skip
+            {
+                cratonvm_jit::note_jit_gate_pass_fill();
+                shared.jit.jit_gate_pass.write().insert(
+                    (class_id, gate_pass_key.0.clone(), gate_pass_key.1.clone()),
+                    (cratonvm_jit::redefine_epoch(), is_interface_default),
+                );
+            }
             (
                 is_interface_default,
                 static_skip_reason,
@@ -1851,7 +1939,30 @@ pub fn execute(
             // rarely pays — but leaving it out would make `already_skipped`
             // unreachable for it, which is the trap this seal exists to avoid.)
             if static_skip_reason.is_some() || fjp_skip || native_skip || clinit_skip {
-                note_jit_skip_seal("static-policy-or-native-shadow", &skip_key);
+                // Name WHICH of the four fired. The single label
+                // `static-policy-or-native-shadow` covered all of them, and a
+                // Spring Boot context startup seals 856 methods through here —
+                // more than the 69 whose compile was attempted and refused —
+                // with no way to tell a policy-table entry from a native-shadow
+                // scan hit. Those want opposite fixes: one is a list somebody
+                // can shorten, the other is a scan that may be over-matching.
+                // Priority order, not a set: the reasons can co-occur, and the
+                // first one listed is the one that would still seal the method
+                // if every other were lifted.
+                let seal_site = if static_skip_reason.is_some() {
+                    "static-policy-table"
+                } else if native_skip {
+                    "calls-native-shadowed-method"
+                } else if fjp_skip {
+                    "forkjointask-subclass"
+                } else {
+                    "clinit"
+                };
+                note_jit_skip_seal(seal_site, &skip_key);
+                // Counted as well as traced: `CRATONVM_DBG_JITC` produces ~1 GB
+                // on a Spring startup, so the census has to be readable from the
+                // one-line `jit-method-stats` dump instead.
+                cratonvm_jit::note_jit_skip_seal_reason(seal_site);
                 shared.jit.jit_skip_set.write().insert(skip_key.clone());
             }
         } else {
@@ -2057,9 +2168,20 @@ pub fn execute(
                             // in thread-locals that outlive the compiled
                             // method, so a recycled address would answer for
                             // the class that used to live there. See
-                            // `cratonvm_jit::intern_typecheck_class_name`.
+                            // `cratonvm_jit::intern_typecheck_target`.
+                            //
+                            // Resolved here through THIS class's own defining
+                            // loader, exactly as the interpreter's constant-pool
+                            // resolution would, and interned under that
+                            // identity. The class dictionary is keyed by
+                            // `(ClassLoaderId, name)`, so handing the runtime
+                            // helper a bare name left it guessing between two
+                            // loaders' same-named copies.
+                            let target_id = cm_lock
+                                .find_class_by_name_for_class(class_name, class_id)
+                                .map(|id| id.as_u32());
                             let (ptr, len) =
-                                cratonvm_jit::intern_typecheck_class_name(class_name);
+                                cratonvm_jit::intern_typecheck_target(class_name, target_id);
                             typecheck_info.push((pc, ptr, len));
                         }
                     }
@@ -2324,6 +2446,13 @@ pub fn execute(
                     // freshly zeroed object if the elision somehow did not fire —
                     // is identical to running `C.<init>`.)
                     let dbg_ctor = cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_CTOR_FIX").is_some();
+                    // Pcs whose `<init>()V` target `is_elidable_construction` PROVED empty. The
+                    // backend may elide only these; a no-arg constructor that is NOT proven empty
+                    // keeps both its allocation and its call, because eliding it would drop
+                    // whatever the body writes to global state (see
+                    // docs/known-issues/netty/jit-elided-constructor-side-effects-20260812.md).
+                    let mut elidable_init_pcs: std::collections::HashSet<usize> =
+                        std::collections::HashSet::new();
                     for (pc, tclass, pcount) in pending_ctor_sites {
                         let elidable = shared
                             .load_class_concurrent(&tclass)
@@ -2333,6 +2462,9 @@ pub fn execute(
                                 is_elidable_construction(shared, &cm2, tid)
                             })
                             .unwrap_or(false);
+                        if elidable {
+                            elidable_init_pcs.insert(pc);
+                        }
                         if dbg_ctor {
                             eprintln!(
                                 "[ctor-fix] {}.{}{} ctor site pc={} target={} elidable={}",
@@ -2604,6 +2736,12 @@ pub fn execute(
                     let mut ldc_info_early: Vec<(usize, i64)> = Vec::new();
                     let mut ldc_string_info_early: Vec<(usize, *const u8, usize)> = Vec::new();
                     let mut ldc_class_info_early: Vec<(usize, u32, u16)> = Vec::new();
+                    // The `ldc`-family pcs whose constant is floating-point.
+                    // Codegen types these by their consuming opcode, but the
+                    // deopt operand-stack snapshot has no consuming opcode to
+                    // ask — see `x64::Compiler::ldc_fp_pcs`.
+                    let mut ldc_fp_pcs_early: rustc_hash::FxHashSet<usize> =
+                        rustc_hash::FxHashSet::default();
                     let mut has_unsupported_ldc = false;
                     if !scan.ldc_ops.is_empty() {
                         let cm_lock = shared.classes.class_manager.read();
@@ -2618,6 +2756,7 @@ pub fn execute(
                                     Some(ConstantPoolEntry::Float(v)) => {
                                         ldc_info_early.push((pc_ldc, v.to_bits() as i64));
                                         // Cast: JIT ABI -- float bits to i64
+                                        ldc_fp_pcs_early.insert(pc_ldc);
                                     }
                                     Some(ConstantPoolEntry::StringReference { string_index })
                                         if class
@@ -2688,7 +2827,10 @@ pub fn execute(
                             for &(pc_ldc, cp_idx) in &scan.ldc2w_ops {
                                 let val = match class.constant_pool.get(cp_idx) {
                                     Some(ConstantPoolEntry::Long(v)) => *v,
-                                    Some(ConstantPoolEntry::Double(v)) => v.to_bits() as i64, // Cast: JIT ABI -- float bits to i64
+                                    Some(ConstantPoolEntry::Double(v)) => {
+                                        ldc_fp_pcs_early.insert(pc_ldc);
+                                        v.to_bits() as i64 // Cast: JIT ABI -- float bits to i64
+                                    }
                                     _ => continue,
                                 };
                                 ldc2w_info_early.push((pc_ldc, val));
@@ -2787,6 +2929,7 @@ pub fn execute(
                         // StringReference arm in the ldc resolver above.
                         ldc_class_info_early,
                         ldc2w_info_early,
+                        ldc_fp_pcs_early,
                         std::collections::HashMap::new(), // branch_hints
                         std::collections::HashMap::new(), // loop_unroll_hints
                         &helpers,
@@ -2804,6 +2947,7 @@ pub fn execute(
                         // de-spec consult (inert in production).
                         &format!("{class_name_arc}.{method_name_arc}:{descriptor_arc}"),
                         indy_info,
+                        Some(elidable_init_pcs),
                     )?;
                     // Attach owned metadata to compiled method
                     cm._jit_strings = owned_jit_strings;
@@ -3114,6 +3258,7 @@ pub fn execute(
                                         is_synchronized,
                                         is_static,
                                         force_native_cache: std::sync::OnceLock::new(),
+            intercept_shape_cache: std::sync::OnceLock::new(),
                                         native_callback_cache: std::sync::OnceLock::new(),
                                         invoc_key: std::sync::OnceLock::new(),
                                         jit_probe_generation: std::sync::atomic::AtomicU64::new(0),
@@ -3342,22 +3487,6 @@ pub fn execute(
                                         .find(|dp| dp.bci == rframe_for_despec.bci)
                                         .map(|dp| dp.reason)
                                         .unwrap_or(cratonvm_jit::deopt::DeoptReason::UnreachedCode);
-                                    let _ =
-                                        crate::jit::helpers::DeoptimizationController::deoptimize(
-                                            shared,
-                                            &class_name_str,
-                                            method_name,
-                                            method_descriptor,
-                                            deopt_reason,
-                                            rframe_for_despec.bci,
-                                        );
-                                    // This first-call tier-up sink historically
-                                    // discarded the reconstructed frame and
-                                    // restarted the method at bci 0. That
-                                    // duplicates every side effect committed
-                                    // before the guard. Build the same cached
-                                    // metadata the hot callsites use and resume
-                                    // the captured frame directly.
                                     // Which of the three independent gates
                                     // refused is the whole diagnosis, and they
                                     // need completely different fixes — record
@@ -3369,6 +3498,68 @@ pub fn execute(
                                         method_name,
                                         method_descriptor,
                                     );
+                                    // De-speculate THIS method only when the
+                                    // frame is this method's. It used to run
+                                    // unconditionally, so a stash belonging to
+                                    // a nested compiled callee blacklisted the
+                                    // innocent method whose tier-up happened to
+                                    // be running — while the `!key_matches`
+                                    // branch below ALSO de-speculated the
+                                    // frame's real owner. Two methods made
+                                    // not-compilable per foreign frame, one of
+                                    // them for no reason: on `TestScript` that
+                                    // is `StringFunction1.getValue`, a
+                                    // per-row expression evaluator.
+                                    if key_matches {
+                                        let _ = crate::jit::helpers::DeoptimizationController::deoptimize(
+                                            shared,
+                                            &class_name_str,
+                                            method_name,
+                                            method_descriptor,
+                                            deopt_reason,
+                                            rframe_for_despec.bci,
+                                        );
+                                    }
+                                    // This first-call tier-up sink historically
+                                    // discarded the reconstructed frame and
+                                    // restarted the method at bci 0. That
+                                    // duplicates every side effect committed
+                                    // before the guard. Build the same cached
+                                    // metadata the hot callsites use and resume
+                                    // the captured frame directly.
+                                    // The stash belongs to a DIFFERENT method — a
+                                    // nested compiled callee whose sentinel bubbled
+                                    // out to here because the call site that invoked
+                                    // it emitted no callee-deopt service check (the
+                                    // statically-bound JIT-to-JIT direct-call gap
+                                    // fixed in jit/src/lib.rs; it was NOT inlining —
+                                    // the x64 inliner rolls back any body that
+                                    // publishes deopt metadata, and an inlined deopt
+                                    // point carries the CALLER's method_key anyway).
+                                    // THIS method never trapped, so the
+                                    // "refusing side-effecting replay" arm below does
+                                    // not apply to it: that refusal is about a frame
+                                    // proving OUR OWN native code ran past bci 0, and
+                                    // a foreign frame proves nothing of the sort.
+                                    //
+                                    // Raising a fatal `InternalError` here also made
+                                    // an orphan permanent in a second way: the frame
+                                    // had already been TAKEN, so every later
+                                    // `has_last_deopt()` was clean, but only because
+                                    // the VM had died. Before the take it poisoned the
+                                    // sentinel disambiguation
+                                    // (`jit_dispatch_threw`) for unrelated call sites.
+                                    //
+                                    // Do what the sibling tier-up sink
+                                    // (`jit-callsite-b`, jit_bridge.rs) already does
+                                    // for exactly this case: de-speculate the frame's
+                                    // real owner so it stops re-trapping, drop the
+                                    // frame, and fall through to interpreted
+                                    // execution of this (innocent) method. Measured on
+                                    // `org.h2.test.scripts.TestScript`, which the
+                                    // fatal error killed at ~212 s with
+                                    // `stashed key "org/h2/util/StringUtils.cache:..."`
+                                    // while running `StringFunction1.getValue`.
                                     let mut materialize_failed = false;
                                     if resume_gate_ok && key_matches {
                                         let cached = Arc::new(CachedBytecodeMethod {
@@ -3390,6 +3581,7 @@ pub fn execute(
                                             is_synchronized,
                                             is_static,
                                             force_native_cache: std::sync::OnceLock::new(),
+            intercept_shape_cache: std::sync::OnceLock::new(),
                                             native_callback_cache: std::sync::OnceLock::new(),
                                             invoc_key: std::sync::OnceLock::new(),
                                             jit_probe_generation: std::sync::atomic::AtomicU64::new(
@@ -3421,6 +3613,51 @@ pub fn execute(
                                         }
                                         thread.native_pin_roots.truncate(pin_base);
                                     }
+                                    if !key_matches {
+                                        // The stash is a DIFFERENT method's — a
+                                        // nested compiled callee whose sentinel
+                                        // bubbled out to here because the call site
+                                        // that invoked it had no callee-deopt service
+                                        // check, so `try_resume_trapped_callee` never
+                                        // ran there and the frame kept travelling
+                                        // outward looking for the "outer consumer that
+                                        // CAN attribute it" — which, once the sentinel
+                                        // has passed through the callee's own caller,
+                                        // no longer exists. This arm is now defence in
+                                        // depth: the emission gap it was written for
+                                        // is fixed in jit/src/lib.rs.
+                                        //
+                                        // The refusal below does NOT apply to it: it
+                                        // exists because a frame belonging to THIS
+                                        // method proves this method's native code ran
+                                        // past bci 0, and a foreign frame proves
+                                        // nothing about this method at all. Raising a
+                                        // fatal `InternalError` for someone else's
+                                        // orphan killed the whole VM run — measured on
+                                        // `org.h2.test.scripts.TestScript`, dead at
+                                        // ~212 s with `stashed key
+                                        // "org/h2/util/StringUtils.cache:(...)"`
+                                        // while running
+                                        // `StringFunction1.getValue`, and on
+                                        // `TestCrashAPI` the same way.
+                                        //
+                                        // Do exactly what the sibling tier-up sink
+                                        // already does for this case
+                                        // (`jit-callsite-b`, jit_bridge.rs): the
+                                        // frame's real owner is de-speculated above
+                                        // via `DeoptimizationController::deoptimize`
+                                        // so it stops re-trapping, the orphan is
+                                        // dropped (it was taken at the top of this
+                                        // block, which is also what stops it
+                                        // poisoning `has_last_deopt`'s sentinel
+                                        // disambiguation at unrelated later call
+                                        // sites), and this innocent method falls
+                                        // through to interpreted execution.
+                                        despeculate_stashed_frame_method(
+                                            shared,
+                                            &rframe_for_despec,
+                                        );
+                                    } else {
                                     // Precise reconstruction is a correctness
                                     // requirement once native code has executed
                                     // past bci 0. Refuse a whole-method replay:
@@ -3429,8 +3666,6 @@ pub fn execute(
                                     let why = if !resume_gate_ok {
                                         "can_deopt_resume=false (no deopt points, \
                                          or an elided monitor)"
-                                    } else if !key_matches {
-                                        "the stashed frame belongs to a different method"
                                     } else if materialize_failed {
                                         "the frame could not be materialised from its map"
                                     } else {
@@ -3454,6 +3689,7 @@ pub fn execute(
                                             ),
                                         },
                                     ));
+                                    }
                                 }
                                 // Deoptimized — pending-NPE drain was hoisted above the
                                 // i64::MIN branch (round-8 CRIT fix); fall through to
@@ -3960,7 +4196,17 @@ pub fn pop_and_recycle_frame_with_reason(
     }
     // T17.Δ.5 — JVMTI FramePop before the frame vanishes.
     fire_jvmti_frame_pop_if_requested(shared.vm_identity, thread, was_popped_by_exception);
-    if let Some(f) = thread.frames.pop() {
+    // The dying frame is read THROUGH THE STACK, not moved out of it.
+    //
+    // This block used to open with `if let Some(f) = thread.frames.pop()`, and
+    // `f` then travelled into `recycle_frame_with_shared` and again into
+    // `take_pool_parts` — three moves of a ~300-byte `Frame` to arrive at four
+    // `Vec` headers. `perf` on the interpreted-invoke probe put `memcpy` under
+    // `Vec::pop<Frame>` here, inside a frame-lifecycle group worth ~24.7% of
+    // the invoke arm (see the annotation-scan known-issues page). Nothing below
+    // needs the frame anywhere but where it already is.
+    let depth = thread.frames.len();
+    if depth > 0 {
         // Root-snapshot cache correctness: the frame that becomes the top again
         // (the caller this return/unwind exposes) is about to RE-EXECUTE and may
         // reassign its locals. Bump its `exec_epoch` so the `(seq, exec_epoch)`
@@ -3970,9 +4216,15 @@ pub fn pop_and_recycle_frame_with_reason(
         // the `Frame::seq` / `exec_epoch` docs. Cheap: one add on the (cold)
         // return/unwind path. `wrapping_add` so a (practically impossible) u64
         // overflow can never alias a live cache key into a false match.
-        if let Some(caller) = thread.frames.last_mut() {
+        //
+        // Hoisted above the borrow of the dying frame: with that frame still on
+        // the stack the caller is at `depth - 2`, and the bump needs `&mut`.
+        if depth >= 2 {
+            let caller = &mut thread.frames[depth - 2];
             caller.exec_epoch = caller.exec_epoch.wrapping_add(1);
         }
+        let thread_id = thread.thread_id;
+        let f = &thread.frames[depth - 1];
         // Harvest this activation's loop work towards the method's tier-up
         // counter. This is the ONLY point at which the count is complete and
         // still attributable: `Frame::backward_count` is reset on every reuse,
@@ -4056,24 +4308,21 @@ pub fn pop_and_recycle_frame_with_reason(
             // but silently swallowing loses diagnostics on monitor-state
             // corruption (e.g. user code that manually `monitorexit`ed past
             // the sync method's own counter). Log via tracing for visibility.
-            if let Err(e) = shared.threads.monitors.exit(obj, thread.thread_id) {
+            if let Err(e) = crate::vm::vm_exec::monitor_exit_and_retract_jmx(shared, obj, thread_id)
+            {
                 tracing::warn!(
                     class = %f.class_name(),
                     method = %f.method_name(),
                     descriptor = %f.method_descriptor(),
-                    thread_id = ?thread.thread_id,
+                    thread_id = ?thread_id,
                     error = ?e,
                     "implicit monitorexit on synchronized-method-frame-pop failed"
                 );
             }
-            if !shared.threads.monitors.holds(obj, thread.thread_id) {
-                shared
-                    .threads
-                    .thread_registry
-                    .remove_jmx_locked_monitor(thread.thread_id, obj);
-            }
         }
-        thread.recycle_frame_with_shared(f, &shared.mem.operand_stack_pool, &shared.mem.tag_pool);
+        // Harvest the four pooled `Vec`s out of the frame where it lies and let
+        // `truncate` drop the husk in place — no `Frame` is moved.
+        thread.recycle_top_frame_in_place(&shared.mem.operand_stack_pool, &shared.mem.tag_pool);
     }
 }
 
@@ -4310,6 +4559,19 @@ pub(crate) fn try_osr_with_backoff(
             // Strictly a waste-elimination change: it removes compiles, never
             // adds compiled execution. The loop runs interpreted either way.
             if crate::jit::tiered::is_osr_denied(&key) || published_but_unenterable {
+                // Counted, because this path is why `osr_entered=0` can appear
+                // next to `osr_refused_entry=0` and a non-zero `osr=` compile
+                // count — a combination that reads like "OSR was never even
+                // tried" when in fact an artifact was built and found
+                // un-enterable at this pc. `osr_refused_entry` is only recorded
+                // inside `try_osr`, which this arm returns before reaching, so
+                // without these two the whole OSR lifecycle line is silent about
+                // the most common way OSR fails to happen.
+                cratonvm_jit::metrics::record_osr_event(if published_but_unenterable {
+                    "osr_published_but_unenterable"
+                } else {
+                    "osr_method_denied"
+                });
                 thread.frames[*frame_idx].record_osr_rejection(entry_pc);
                 return OsrBackoffOutcome::Skip;
             }
@@ -4578,6 +4840,20 @@ fn execute_frame_from_index(
         // resulting "profile" ranks methods by call count rather than by time
         // (a cheap method entered 100k times outranks the one that actually
         // burned the wall clock).
+        //
+        // What the sample POSITION means, because three profiles on
+        // docs/known-issues/tomcat/!webapp-deploy-annotation-scan-interpreted-226x.md
+        // were read wrong: this hook is the first thing a loop iteration does,
+        // and an invoke pushes the callee frame and `continue`s. So the time
+        // an expensive INVOKE burns is reported against the callee at
+        // `pc=0 last_pc=0` — a frame that has executed nothing. Anyone
+        // aggregating leaf frames by method name files invoke cost under the
+        // callee's name, where it reads as a slow body. Bucket
+        // `pc == 0 && last_pc == 0` separately.
+        // `probes/InvokeAttributionProbe.java` is the calibration: a
+        // three-bytecode callee behind an `invokevirtual` takes 54% of the
+        // samples at its entry and one sample anywhere in its body, and that
+        // share tracks the separately-timed invoke delta (290-417 ns).
         if (!stack_dump_emitted || shared.stack_sample_mode()) && shared.stack_dump_pending() {
             shared.dump_current_thread_frames(thread);
             if shared.stack_sample_mode() {

@@ -79,7 +79,8 @@ impl Compiler {
     /// for emitters that cannot return a `Result`.
     pub(super) fn modrm_rbp_disp(&mut self, reg: u8, disp: i32) {
         let Ok(d) = Disp::encode_for_base(-(disp as i64), RBP) else {
-            self.buf.mark_overflowed();
+            self.buf
+                .mark_codegen_unencodable("frame-displacement-unencodable");
             return;
         };
         self.buf.emit_byte(d.modrm(reg, RBP));
@@ -148,7 +149,8 @@ impl Compiler {
     /// truncated instruction behind.
     pub(super) fn emit_movq_mem_rbp_from_xmm(&mut self, offset: i32, xmm: u8) {
         let Ok(d) = Disp::encode_for_base(-(offset as i64), RBP) else {
-            self.buf.mark_overflowed();
+            self.buf
+                .mark_codegen_unencodable("frame-displacement-unencodable");
             return;
         };
         self.buf.emit_byte(0x66);
@@ -176,7 +178,8 @@ impl Compiler {
         // Round-9 LOW fix: see `emit_movq_mem_rbp_from_xmm` — the hand-written
         // `(-127..=128)` guard is now the shared checked encoder.
         let Ok(d) = Disp::encode_for_base(-(offset as i64), RBP) else {
-            self.buf.mark_overflowed();
+            self.buf
+                .mark_codegen_unencodable("frame-displacement-unencodable");
             return;
         };
         self.buf.emit_byte(0xF3);
@@ -782,6 +785,32 @@ impl Compiler {
         self.buf.emit(&disp32.to_le_bytes());
     }
 
+    /// The identity half of the frame record — store this method's compile id
+    /// into the mirror slot beside the one `emit_mov_tls_disp32_rbp` writes, so
+    /// the GC can name the method owning the innermost RBP instead of decoding
+    /// the call that created the frame (`jit::reserve_compile_id`).
+    ///
+    /// **32-bit store, no scratch register.** That is the whole reason the id
+    /// is a dense `u32` rather than a `CompiledMethod` pointer: the post-call
+    /// republish sites run with the callee's return value live in RAX and
+    /// document that they must not disturb it. A 64-bit immediate would need a
+    /// register and put a push/pop back on every JIT->JIT call site.
+    ///
+    /// Encoding (11 bytes): `<seg> C7 04 25 <disp32-le> <imm32-le>`
+    ///   * `<seg>`    — GS (`65`) or FS (`64`) segment override prefix.
+    ///   * `C7 /0`    — MOV r/m32, imm32. No REX: the store is 32-bit and the
+    ///                  upper half of the slot is never read.
+    ///   * `04`       — ModRM mod=00 reg=/0 r/m=100(SIB).
+    ///   * `25`       — SIB scale=0 index=none(4) base=none(5) → [disp32].
+    pub(super) fn emit_mov_tls_disp32_imm32(&mut self, disp32: u32, imm32: u32) {
+        self.buf.emit_byte(inline_rbp_tls_segment_prefix());
+        self.buf.emit_byte(0xC7); // MOV r/m32, imm32
+        self.buf.emit_byte(0x04); // ModRM: /0, r/m=SIB
+        self.buf.emit_byte(0x25); // SIB: [disp32] absolute
+        self.buf.emit(&disp32.to_le_bytes());
+        self.buf.emit(&imm32.to_le_bytes());
+    }
+
     /// Task #60 — emit `MOV r64, imm64` in the fixed-length 10-byte form
     /// regardless of `imm` value.
     ///
@@ -1141,11 +1170,11 @@ impl Compiler {
         // today) — bail rather than emit an instruction addressing via a
         // fabricated SIB.
         if base_requires_sib(base) {
-            self.buf.mark_overflowed();
+            self.buf.mark_codegen_unencodable("mem8-base-requires-sib");
             return;
         }
         let Ok(d) = Disp::encode_for_base(disp as i64, base) else {
-            self.buf.mark_overflowed();
+            self.buf.mark_codegen_unencodable("mem8-displacement-unencodable");
             return;
         };
         // This form has always emitted an explicit displacement byte, including

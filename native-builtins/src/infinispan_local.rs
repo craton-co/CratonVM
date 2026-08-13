@@ -82,7 +82,7 @@ use std::time::{Duration, Instant};
 use parking_lot::{Mutex, RwLock};
 
 use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
-use cratonvm_types::error::{MethodCallResult, RuntimeError};
+use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError};
 use cratonvm_types::{ClassId, ObjectRef, Value};
 
 // ---------------------------------------------------------------------------
@@ -824,17 +824,27 @@ fn reap_cache(cache: &CacheInner) {
 // Native callbacks.
 // ---------------------------------------------------------------------------
 
-fn alloc_object_for(ctx: &mut dyn NativeContext, class_name: &str, min_slots: usize) -> ObjectRef {
+fn alloc_object_for(
+    ctx: &mut dyn NativeContext,
+    class_name: &str,
+    min_slots: usize,
+) -> Result<ObjectRef, MethodCallFailed> {
     // Fall back to a synthetic class (declaring `min_slots` fields) rather
     // than `ClassId::new(0)` when the real class can't be loaded: an object
     // allocated with `java/lang/Object`'s id but a non-zero slot count is an
     // undersized layout the GC's `get_field` bounds guard rejects.
+    //
+    // The fallback is the FALLIBLE spelling (JDK-only wave 2, step 3): under
+    // `--jdk-only` the policy refuses to fabricate rather than recording the
+    // violation and fabricating anyway, and the refusal arrives as the
+    // catchable `NoClassDefFoundError` contract §5 names rather than the
+    // uncatchable `MethodCallFailed::InternalError` the `?` conversion builds.
     let cid = match ctx.ensure_class_initialized(class_name) {
         Ok(cid) => cid,
-        Err(_) => ctx.ensure_synthetic_class(class_name, min_slots),
+        Err(_) => crate::util_concurrent_ext::refused_class(ctx, class_name, min_slots)?,
     };
     let n = ctx.class_num_total_fields(cid).max(min_slots);
-    ctx.alloc_object(cid, n)
+    Ok(ctx.alloc_object(cid, n))
 }
 
 fn obj_arg(args: &[Value], idx: usize) -> Option<ObjectRef> {
@@ -923,7 +933,7 @@ fn native_dcm_get_cache(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     };
     // Allocate a Java-side Cache object. Tuck the Rust Arc pointer in
     // slot 0 as a long handle so follow-up natives can re-hydrate.
-    let cache_obj = alloc_object_for(ctx, CLS_CACHE_IMPL, CACHE_NUM_FIELDS);
+    let cache_obj = alloc_object_for(ctx, CLS_CACHE_IMPL, CACHE_NUM_FIELDS)?;
     let handle = Arc::into_raw(cache.clone()) as i64;
     ctx.set_field(cache_obj, CACHE_FIELD_HANDLE, Value::Long(handle));
     let name_str = ctx.create_string(&name);
@@ -964,7 +974,7 @@ fn native_dcm_get_cache_names(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
     // this method with no null guard.
     let names = global_manager().cache_names();
     let key_objs: Vec<ObjectRef> = names.iter().map(|n| ctx.create_string(n)).collect();
-    let set = crate::build_real_layout_string_hashset(ctx, &key_objs);
+    let set = crate::build_real_layout_string_hashset(ctx, &key_objs)?;
     Ok(Some(Value::Object(Some(set))))
 }
 
@@ -1454,7 +1464,7 @@ fn is_real_cache(ctx: &dyn NativeContext, this: ObjectRef) -> bool {
     match ctx.get_field(this, CACHE_FIELD_MANAGER) {
         Value::Object(Some(mgr)) => {
             let cid = ctx.class_id_of_object(mgr);
-            ctx.class_name_of_id(cid).as_deref() != Some(CLS_MANAGER)
+            ctx.class_name_arc_of_id(cid).as_deref() != Some(CLS_MANAGER)
         }
         _ => true,
     }
@@ -2629,7 +2639,7 @@ mod tests {
             other => panic!("expected builder passed to putConfiguration, got {other:?}"),
         };
         assert_eq!(
-            ctx.class_name_of_id(ctx.class_id_of_object(builder))
+            ctx.class_name_arc_of_id(ctx.class_id_of_object(builder))
                 .as_deref(),
             Some(CLS_CONFIG_BUILDER)
         );

@@ -23,7 +23,7 @@
 //! [`JIT_HELPERS_ABI_VERSION`] when you do — [`helpers_abi::ABI_REVISIONS`]
 //! makes that a compile error to forget. The full contract, the per-field
 //! signatures, and the per-field nullability rules live in [`helpers_abi`];
-//! `docs/jit/helper-abi-audit.md` lists which invariants have tripwires, which
+//! `docs/jit/helper-abi.md` lists which invariants have tripwires, which
 //! do not, and the procedure for adding a slot.
 //!
 //! ## `gpu-lowering` feature status
@@ -258,6 +258,42 @@ pub struct CachedBytecodeMethod {
     /// cell. Until then it turns ~55 string comparisons per cached dispatch
     /// into an O(1) read.
     pub force_native_cache: std::sync::OnceLock<bool>,
+    /// Which of `intercept_force_registered_native_cached`'s three *special-case*
+    /// arms this call site's triple can possibly reach, as `INTERCEPT_SHAPE_*`
+    /// bits. Zero — the answer for almost every call site in a program — means
+    /// none of them, and the hot path skips straight to
+    /// [`Self::force_native_cache`].
+    ///
+    /// # Why this exists
+    ///
+    /// `force_native_cache` above memoizes the ~55-comparison
+    /// `force_native_over_real_jdk_bytecode` gauntlet, but it sits **below**
+    /// three earlier arms that were still evaluated from scratch on every
+    /// cached-invoke hit:
+    ///
+    /// * a `ClassLoader` null-resource re-target, keyed on
+    ///   `(method_name, method_descriptor)` against three pairs;
+    /// * a `java/lang/Class` reflection re-target, keyed on the same pair
+    ///   against four more;
+    /// * `real_http_url_connection_native`, whose entire gate is `class_name`
+    ///   against five literals.
+    ///
+    /// Every one of those keys is a **function of this entry's own triple**,
+    /// which never changes — so they were per-call-site constants re-derived
+    /// per call. `perf` on `probes/InvokeAttributionProbe.java` — whose only
+    /// call is `int callee(int)`, matching none of them — put
+    /// `intercept_force_registered_native_cached` at 1.67% and
+    /// `real_http_url_connection_native` at **1.50%** of the interpreted-invoke
+    /// arm, with a `memcpy` arm underneath (`str::eq` bottoms out in `memcmp`).
+    /// See `known-issues/tomcat/!webapp-deploy-annotation-scan-interpreted-226x.md`.
+    ///
+    /// The *argument*- and *receiver*-dependent halves of those arms are NOT
+    /// memoized and must not be: a null second argument, an Objenesis-shaped
+    /// receiver and a redefined class are per-call state. This cell answers
+    /// only "could this triple ever reach that arm", so a set bit still runs
+    /// the original test in full, and a clear bit skips a test whose
+    /// name-keyed half could not have matched anyway.
+    pub intercept_shape_cache: std::sync::OnceLock<u8>,
     /// Per-call-site native-dispatch memo. **Read it through
     /// [`Self::native_call_site`], never directly.**
     ///
@@ -404,6 +440,11 @@ impl Clone for CachedBytecodeMethod {
             is_synchronized: self.is_synchronized,
             is_static: self.is_static,
             force_native_cache: self.force_native_cache.clone(),
+            // Same reasoning as `force_native_cache`: the cell is a pure
+            // function of the triple, and the clone's triple is `Arc`-shared
+            // with this one, so carrying the memo forward answers for the same
+            // question.
+            intercept_shape_cache: self.intercept_shape_cache.clone(),
             // `NativeCallSite: Clone` snapshots the memo word. Carrying it
             // forward is sound for the same reason `jit_probe_generation`'s
             // snapshot is: the memo is generation-keyed, so a clone that
@@ -1082,6 +1123,16 @@ pub struct JitRuntimeHelpers {
     /// behaviour. Appended at the END of the struct so all prior golden
     /// offsets stay stable.
     pub ldc_class_cp: usize,
+
+    /// `aastore` element-type check — JVMS §aastore covariance.
+    ///
+    /// Returns 0 when the store is legal and the `i64::MIN` deopt sentinel
+    /// when it is not, having stashed a real `ArrayStoreException` through the
+    /// JIT_THREAD TLS. The x64 emitter lowers `aastore` inline (null check,
+    /// bounds check, SATB barrier, store, card mark) and so never reaches
+    /// [`Self::aastore`]; this is the one piece of that helper the inline path
+    /// cannot do for itself, because the answer needs the class manager.
+    pub aastore_type_check: usize,
 }
 
 /// Classifies each field of [`JitRuntimeHelpers`] for the validator.
@@ -1255,6 +1306,7 @@ helper_fields! {
     // Optional: 0 makes the single-pass backend refuse an `ldc <Class>` site
     // and bail the compile — the pre-fix behaviour.
     (ldc_class_cp,                   FieldKind::OptionalPtr),
+    (aastore_type_check,             FieldKind::RequiredPtr),
 }
 
 // Compile-time integrity check: the macro-generated NUM_FIELDS must
@@ -1280,7 +1332,7 @@ const _: () = assert!(
 // struct field AND its macro entry simultaneously would still satisfy
 // the ratio assert above and silently change the JIT ABI.
 const _: () = assert!(
-    JitRuntimeHelpers::NUM_FIELDS == 63,
+    JitRuntimeHelpers::NUM_FIELDS == 64,
     "JitRuntimeHelpers field count changed — bump the literal here and update \
      the golden-offset test in mod tests if the change is intentional",
 );
@@ -1384,6 +1436,7 @@ mod tests {
             is_synchronized: false,
             is_static: false,
             force_native_cache: std::sync::OnceLock::new(),
+            intercept_shape_cache: std::sync::OnceLock::new(),
             native_callback_cache: std::sync::OnceLock::new(),
             invoc_key: std::sync::OnceLock::new(),
             jit_probe_generation: std::sync::atomic::AtomicU64::new(0),
@@ -1672,6 +1725,7 @@ mod tests {
             monitor_enter: 0x11A8,
             monitor_exit: 0x11B0,
             ldc_class_cp: 0x11B8,
+            aastore_type_check: 0x11C0,
         }
     }
 
@@ -1907,6 +1961,7 @@ mod tests {
             monitor_enter: 0,
             monitor_exit: 0,
             ldc_class_cp: 0,
+            aastore_type_check: 0,
         };
         assert_eq!(h.newarray, 0);
         assert_eq!(h.write_barrier, 0);
@@ -2082,8 +2137,8 @@ mod tests {
             std::mem::size_of::<JitRuntimeHelpers>(),
             JitRuntimeHelpers::NUM_FIELDS * FIELD_WIDTH,
         );
-        // And the macro-driven count is the canonical 63.
-        assert_eq!(JitRuntimeHelpers::NUM_FIELDS, 63);
+        // And the macro-driven count is the canonical 64.
+        assert_eq!(JitRuntimeHelpers::NUM_FIELDS, 64);
     }
 
     #[test]
@@ -2396,6 +2451,11 @@ mod tests {
                 "ldc_class_cp",
                 std::mem::offset_of!(JitRuntimeHelpers, ldc_class_cp),
             ),
+            (
+                63,
+                "aastore_type_check",
+                std::mem::offset_of!(JitRuntimeHelpers, aastore_type_check),
+            ),
         ];
 
         // (a) Each field is at its documented sequential byte offset.
@@ -2449,7 +2509,7 @@ mod tests {
             .filter(|e| e.kind == FieldKind::OptionalPtr)
             .count();
         let off = f.iter().filter(|e| e.kind == FieldKind::Offset).count();
-        assert_eq!(req, 42, "required-pointer count drifted");
+        assert_eq!(req, 43, "required-pointer count drifted");
         assert_eq!(opt, 12, "optional-pointer count drifted");
         assert_eq!(off, 9, "offset-field count drifted");
         assert_eq!(req + opt + off, JitRuntimeHelpers::NUM_FIELDS);
@@ -2493,7 +2553,7 @@ mod tests {
             .filter(|e| e.kind == FieldKind::RequiredPtr)
             .map(|e| e.name)
             .collect();
-        assert_eq!(names.len(), 42);
+        assert_eq!(names.len(), 43);
         for name in names {
             let mut h = make_helpers();
             // Zero the field by name via a match — the macro doesn't
@@ -2539,7 +2599,7 @@ mod tests {
             .filter(|e| e.kind == FieldKind::RequiredPtr)
             .map(|e| e.name)
             .collect();
-        assert_eq!(required.len(), 42, "expected 42 required pointers");
+        assert_eq!(required.len(), 43, "expected 43 required pointers");
         // throw_exception is the round-10 addition — pin it explicitly so
         // a regression that drops it from the required set is caught here
         // and not just by the count.
@@ -2654,6 +2714,7 @@ mod tests {
             "jit_drem" => h.jit_drem = 0,
             "ldc_string" => h.ldc_string = 0,
             "set_throw_bci" => h.set_throw_bci = 0,
+            "aastore_type_check" => h.aastore_type_check = 0,
             other => panic!("unknown required-pointer field name in test: {}", other),
         }
     }

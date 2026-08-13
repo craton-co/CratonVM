@@ -78,7 +78,7 @@ use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
 use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError};
 use cratonvm_types::{ArrayElementType, ObjectRef, Value};
 
-use crate::alloc_concurrent_synthetic;
+use crate::try_alloc_concurrent_synthetic;
 
 // ---------------------------------------------------------------------------
 // Class / field name constants
@@ -203,6 +203,23 @@ fn singleton_cell(vm: usize) -> &'static Mutex<Option<u64>> {
     static INSTANCE: OnceLock<Mutex<HashMap<usize, &'static Mutex<Option<u64>>>>> =
         OnceLock::new();
     per_vm_table(&INSTANCE, vm)
+}
+
+/// Whether this VM has performed the primordial configuration read, per VM.
+///
+/// The JDK's `LogManager.ensureLogManagerInitialized()` finishes by calling
+/// `readPrimordialConfiguration()`, which is what puts the `ConsoleHandler`
+/// from `$java.home/conf/logging.properties` on the root logger. Ours never
+/// did, so a fresh VM had `root.handlers=0` where HotSpot has 1 — and
+/// `Logger.getLogger("x").info("hello")` printed NOTHING, silently, because a
+/// record with no handler anywhere up the parent chain is simply dropped.
+///
+/// Latched so the read happens exactly once per VM, and latched BEFORE the
+/// read runs: `read_configuration_no_arg_impl` instantiates handler classes,
+/// which can re-enter `getLogManager()`.
+fn primordial_config_done(vm: usize) -> &'static Mutex<bool> {
+    static DONE: OnceLock<Mutex<HashMap<usize, &'static Mutex<bool>>>> = OnceLock::new();
+    per_vm_table(&DONE, vm)
 }
 
 /// Name -> `Logger` ObjectRef (as raw u64), per VM. Populated on first
@@ -385,16 +402,101 @@ unsafe fn object_from_u64(addr: u64) -> ObjectRef {
 /// `org.jboss.logmanager.LogManager`). The two share the same synthetic
 /// field layout — the difference is purely the `getClass()` mirror the
 /// bytecode observes.
-fn allocate_log_manager(ctx: &mut dyn NativeContext, class_name: &str) -> ObjectRef {
-    let obj = alloc_concurrent_synthetic(ctx, class_name, LM_NUM_FIELDS);
+///
+/// # This is the state that blocks `java/util/logging`'s retirement
+///
+/// The singleton is ALLOCATED here and never CONSTRUCTED: `<init>` does not
+/// run, and only four of its fourteen slots are written. Measured against
+/// HotSpot 25.0.3 on 2026-08-11 (`--add-opens
+/// java.logging/java.util.logging=ALL-UNNAMED`, reflecting the object
+/// `LogManager.getLogManager()` returns), eight reference fields are null here
+/// and real there: `props`, `systemContext`, `userContext`, `rootLogger`,
+/// `configurationLock`, `closeOnResetLoggers`, `listeners`, `loggerRefQueue`.
+///
+/// That was survivable for as long as every accessor was a native, and it is
+/// still what this function produces. What it is NOT is the cause of the
+/// strict-mode `Logger.getLogger` regression, and the correction matters
+/// because the obvious repair here — "run `<init>` on the singleton" — is
+/// inert.
+///
+/// # This object is not on the `--jdk-only` path at all
+///
+/// Measured 2026-08-11 against `target/release/cratonvm.exe` with
+/// `--explain-jdk-only --dump-native-registry`, reading the `registered_by` /
+/// `overwrote` chain the schema-4 census exists to expose:
+///
+/// ```text
+/// LogManager.getLogManager()  Compatible          --jdk-only
+///   phases_early.rs:20272     intrinsic           intrinsic   <- SURVIVES, wins
+///   lib.rs:16964              overwrote intrinsic  (refused)
+///   logmanager.rs:5472        overwrote s-stub, WINS  (refused)
+/// ```
+///
+/// Three registrars hold that one triple. In `Compatible` the last one — this
+/// file's, which caches through `ensure_singleton` — overwrites the other two
+/// and wins. Under `--jdk-only` the retirement refuses this file's and
+/// `lib.rs`'s, because both are `Bridge`s over real bytecode; **a refusal does
+/// not remove the earlier registration it was going to overwrite**, so what is
+/// left holding the triple is `phases_early.rs`'s, which was registered
+/// `Intrinsic` and is therefore exempt from the retirement. Its body is a bare
+/// `try_alloc_concurrent_synthetic(ctx, "java/util/logging/LogManager", 0)`
+/// with no cache, so strict-mode `getLogManager()` mints a FRESH,
+/// unconstructed manager on every call — measured, `identityHashCode` 11, 12,
+/// 13 on three successive calls, versus a stable value in `Compatible` and on
+/// HotSpot.
+///
+/// So `Logger.getLogger` does not NPE because the singleton below is
+/// unconstructed. It NPEs because it never sees the singleton below.
+///
+/// # And the state the retirement wanted is ALREADY REAL
+///
+/// `LogManager.<init>()V` is itself a retired shadow, so under `--jdk-only`
+/// the real ctor runs and the static `LogManager.manager` — the object real
+/// `getLogManager()` bytecode returns — comes out fully built. Measured with
+/// `--add-opens java.logging/java.util.logging=ALL-UNNAMED`, reflecting the
+/// static rather than the value `getLogManager()` handed back:
+///
+/// ```text
+///   props Properties · systemContext SystemLoggerContext · userContext
+///   LoggerContext · configurationLock ReentrantLock · closeOnResetLoggers
+///   CopyOnWriteArrayList · listeners SynchronizedMap · loggerRefQueue
+///   ReferenceQueue · rootLogger null
+/// ```
+///
+/// Seven of the eight, and `rootLogger` is null on purpose: the JDK writes it
+/// only from `ensureLogManagerInitialized`, which no-ops unless the receiver
+/// is the static `manager` — which this one IS, so the null is instead the
+/// `initializationDone` handshake not having run, and every consumer on the
+/// `getLogger` path is guarded for it (`requiresDefaultLoggers`,
+/// `ensureDefaultLogger`, `processParentHandlers`, all read off `javap`).
+///
+/// **Therefore the §1.4-correct fix adds no state-building code at all**: stop
+/// `phases_early.rs`'s `Intrinsic` from shadowing the triple, and strict mode
+/// returns the already-real static. Adding an `<init>` call to this function
+/// was written, measured to be inert in BOTH modes — never reached under
+/// `--jdk-only`, and in `Compatible` the `<init>` triple resolves to
+/// `native_jboss_init`, a bare `Ok(None)` — and reverted rather than landed as
+/// a fix that moves nothing. The patch, and why the interim hold-back is also
+/// out of reach from this file, are in
+/// docs/known-issues/jdk-only/W7-25-jul-getlogger-regression.md.
+///
+/// Do not "simplify" the nulls away without reading that: they are what this
+/// file's own `Compatible`-mode natives are written around.
+fn allocate_log_manager(ctx: &mut dyn NativeContext, class_name: &str) -> Result<ObjectRef, MethodCallFailed> {
+    let obj = try_alloc_concurrent_synthetic(ctx, class_name, LM_NUM_FIELDS)?;
     // Leave slot 0 as `null` — a properly-initialized `Properties` would
     // round-trip through synthetic HashMap natives, but most Quarkus/JBoss
-    // code reads it via accessors we no-op, so null is safe.
+    // code reads it via accessors we no-op, so null is safe. That argument
+    // holds because this object is only ever reached in COMPATIBLE mode,
+    // where every accessor is still a native; under `--jdk-only` this
+    // function is not on the path at all. See the doc comment — the
+    // difference matters, because "run `<init>` here" reads like the fix and
+    // was measured to change nothing.
     ctx.set_field(obj, LM_FIELD_PROPERTIES, Value::Object(None));
     ctx.set_field(obj, LM_FIELD_LOGGER_REGISTRY, Value::Object(None));
     ctx.set_field(obj, LM_FIELD_ROOT_LOGGER, Value::Object(None));
     ctx.set_field(obj, LM_FIELD_READY, Value::Int(1));
-    obj
+    Ok(obj)
 }
 
 /// Block 2B — try to allocate a custom subclass instance based on the
@@ -420,21 +522,23 @@ fn allocate_log_manager(ctx: &mut dyn NativeContext, class_name: &str) -> Object
 /// logging extension checks that the active singleton's concrete class is the
 /// JBoss manager, so allocate our synthetic JBoss-classed singleton directly
 /// instead of invoking the real constructor.
-fn try_allocate_property_log_manager(ctx: &mut dyn NativeContext) -> Option<ObjectRef> {
-    let prop = ctx.get_system_property("java.util.logging.manager")?;
+fn try_allocate_property_log_manager(ctx: &mut dyn NativeContext) -> Result<Option<ObjectRef>, MethodCallFailed> {
+    let Some(prop) = ctx.get_system_property("java.util.logging.manager") else {
+        return Ok(None);
+    };
     let dotted = prop.trim();
     if dotted.is_empty() {
-        return None;
+        return Ok(None);
     }
     // Built-in aliases use our synthetic singleton layout; calling
     // `<init>` on them through the bytecode path would either re-enter
     // this function or trip the `native_jboss_init` no-op contract.
     let internal = dotted.replace('.', "/");
     if internal == CLS_JUL_LOG_MANAGER {
-        return None;
+        return Ok(None);
     }
     if internal == CLS_JBOSS_LOG_MANAGER {
-        return Some(allocate_log_manager(ctx, CLS_JBOSS_LOG_MANAGER));
+        return Ok(Some(allocate_log_manager(ctx, CLS_JBOSS_LOG_MANAGER)?));
     }
 
     // SECURITY FIX: validate the *class name* with a dedicated
@@ -453,7 +557,7 @@ fn try_allocate_property_log_manager(ctx: &mut dyn NativeContext) -> Option<Obje
             class = %dotted,
             "java.util.logging.manager: rejecting suspicious class name"
         );
-        return None;
+        return Ok(None);
     }
 
     // Step 1: load + init via the unified loader. This is the path that
@@ -469,7 +573,7 @@ fn try_allocate_property_log_manager(ctx: &mut dyn NativeContext) -> Option<Obje
             "java.util.logging.manager: class not loadable via unified loader, \
              falling back to JDK default"
         );
-        return None;
+        return Ok(None);
     }
 
     // Step 2: allocate without invoking `<init>` so we control the
@@ -484,7 +588,7 @@ fn try_allocate_property_log_manager(ctx: &mut dyn NativeContext) -> Option<Obje
                 class = %dotted,
                 "java.util.logging.manager: new_object failed, falling back"
             );
-            return None;
+            return Ok(None);
         }
     };
     if let Err(e) = ctx.invoke(&internal, "<init>", "()V", &[Value::Object(Some(obj))]) {
@@ -493,9 +597,9 @@ fn try_allocate_property_log_manager(ctx: &mut dyn NativeContext) -> Option<Obje
             error = ?e,
             "java.util.logging.manager: <init> threw, falling back"
         );
-        return None;
+        return Ok(None);
     }
-    Some(obj)
+    Ok(Some(obj))
 }
 
 /// Return (or lazily allocate) the process-wide `LogManager` singleton
@@ -509,7 +613,7 @@ fn try_allocate_property_log_manager(ctx: &mut dyn NativeContext) -> Option<Obje
 /// unified system loader so `-c` paths are visible). Without the
 /// property, the JDK-default class is used as before — see
 /// `try_allocate_property_log_manager` for the loader-bypass rationale.
-fn ensure_singleton(ctx: &mut dyn NativeContext, class_name: &str) -> ObjectRef {
+fn ensure_singleton(ctx: &mut dyn NativeContext, class_name: &str) -> Result<ObjectRef, MethodCallFailed> {
     let vm = ctx.vm_identity();
     // Fast path: already cached.
     {
@@ -518,7 +622,7 @@ fn ensure_singleton(ctx: &mut dyn NativeContext, class_name: &str) -> ObjectRef 
             if addr != 0 {
                 // SAFETY: the cached address was produced by `alloc_object`
                 // earlier in this process. Singleton lifetime == process lifetime.
-                return unsafe { object_from_u64(addr) };
+                return unsafe { Ok(object_from_u64(addr)) };
             }
         }
     }
@@ -529,11 +633,11 @@ fn ensure_singleton(ctx: &mut dyn NativeContext, class_name: &str) -> ObjectRef 
     let chose_property_class = if class_name == CLS_JUL_LOG_MANAGER {
         try_allocate_property_log_manager(ctx)
     } else {
-        None
+        Ok(None)
     };
-    let obj = match chose_property_class {
+    let obj = match chose_property_class? {
         Some(o) => o,
-        None => allocate_log_manager(ctx, class_name),
+        None => allocate_log_manager(ctx, class_name)?,
     };
     let mut guard = singleton_cell(vm).lock().unwrap_or_else(|e| e.into_inner());
     if let Some(addr) = *guard {
@@ -541,11 +645,11 @@ fn ensure_singleton(ctx: &mut dyn NativeContext, class_name: &str) -> ObjectRef 
             // Another thread beat us; drop our allocation on the floor
             // (we have no external references to it yet) and adopt
             // theirs.
-            return unsafe { object_from_u64(addr) };
+            return unsafe { Ok(object_from_u64(addr)) };
         }
     }
     *guard = Some(obj.as_ptr() as u64);
-    obj
+    Ok(obj)
 }
 
 /// Resolve one of the 9 standard `java.util.logging.Level` singletons
@@ -570,13 +674,13 @@ pub(crate) fn resolve_standard_level(ctx: &mut dyn NativeContext, name: &str) ->
 /// of chasing a permanently-null parent. The root logger ("") has no
 /// parent but is seeded with the JDK-default `Level.INFO` so those same
 /// walks stop at the root instead of dereferencing a null level.
-fn allocate_logger(ctx: &mut dyn NativeContext, name: &str) -> ObjectRef {
+fn allocate_logger(ctx: &mut dyn NativeContext, name: &str) -> Result<ObjectRef, MethodCallFailed> {
     // Ensure the wildfly_core registry also learns about this name so
     // log-level overrides and credential redaction apply uniformly. The
     // wildfly layer returns an `Arc<LoggerMirror>` — we don't need the
     // Arc itself here, just the side-effect of interning the name.
     let _mirror = crate::wildfly_core::get_logger(name);
-    let obj = alloc_concurrent_synthetic(ctx, CLS_JUL_LOGGER, LOGGER_NUM_FIELDS);
+    let obj = try_alloc_concurrent_synthetic(ctx, CLS_JUL_LOGGER, LOGGER_NUM_FIELDS)?;
     // GC SAFETY: every step below (`create_string`, `Level.<clinit>` via
     // `resolve_standard_level`, the recursive parent demand-creation) can
     // allocate and therefore move `obj`. Keep the fresh Logger rooted and
@@ -612,7 +716,7 @@ fn allocate_logger(ctx: &mut dyn NativeContext, name: &str) -> ObjectRef {
         // `Logger.getLogger("com.example.Foo").getParent()` answer with a
         // `com.example` logger HotSpot never creates (it answers with the root).
         let parent_name = nearest_existing_ancestor_name(ctx.vm_identity(), name);
-        let parent = get_or_create_logger(ctx, &parent_name);
+        let parent = get_or_create_logger(ctx, &parent_name)?;
         let parent_pin = ctx.pin_native_root(parent);
         obj = ctx.read_native_pin(obj_pin, obj);
         let parent = ctx.read_native_pin(parent_pin, parent);
@@ -621,7 +725,7 @@ fn allocate_logger(ctx: &mut dyn NativeContext, name: &str) -> ObjectRef {
     }
     obj = ctx.read_native_pin(obj_pin, obj);
     ctx.unpin_native_roots(obj_pin);
-    obj
+    Ok(obj)
 }
 
 /// The name of the nearest ancestor of `name` that already has a `Logger`
@@ -754,25 +858,25 @@ fn populate_real_logger_bundle(
 /// anonymous Logger that isn't registered so the caller still receives
 /// a non-null Logger for the `.info()` / `.warning()` fallback but the
 /// bad name never enters the registry.
-pub(crate) fn get_or_create_logger(ctx: &mut dyn NativeContext, name: &str) -> ObjectRef {
+pub(crate) fn get_or_create_logger(ctx: &mut dyn NativeContext, name: &str) -> Result<ObjectRef, MethodCallFailed> {
     let vm = ctx.vm_identity();
     if !is_valid_logger_name(name) {
         tracing::warn!(
             rejected_name = %name,
             "LogManager.getLogger: rejected suspicious logger name, returning anonymous logger"
         );
-        return allocate_logger(ctx, "");
+        return Ok(allocate_logger(ctx, "")?);
     }
     {
         let reg = logger_registry(vm).lock().unwrap_or_else(|e| e.into_inner());
         if let Some(&addr) = reg.get(name) {
             if addr != 0 {
                 // SAFETY: singleton-style lifetime.
-                return unsafe { object_from_u64(addr) };
+                return unsafe { Ok(object_from_u64(addr)) };
             }
         }
     }
-    let obj = allocate_logger(ctx, name);
+    let obj = allocate_logger(ctx, name)?;
     // Descendants that were parented to a HIGHER ancestor (or to the root)
     // before this node existed must now point at it -- JUL does the same in
     // `LogNode.walkAndSetParent` when `addLogger` inserts an intermediate node.
@@ -784,7 +888,7 @@ pub(crate) fn get_or_create_logger(ctx: &mut dyn NativeContext, name: &str) -> O
         // no external references yet).
         if let Some(&addr) = reg.get(name) {
             if addr != 0 {
-                return unsafe { object_from_u64(addr) };
+                return unsafe { Ok(object_from_u64(addr)) };
             }
         }
         reg.insert(name.to_string(), obj.as_ptr() as u64);
@@ -816,7 +920,7 @@ pub(crate) fn get_or_create_logger(ctx: &mut dyn NativeContext, name: &str) -> O
         let child = unsafe { object_from_u64(addr) };
         ctx.set_field(child, LOGGER_FIELD_PARENT, Value::Object(Some(obj)));
     }
-    obj
+    Ok(obj)
 }
 
 /// The one place that knows where a `java.util.logging.Logger` keeps its name.
@@ -860,7 +964,7 @@ pub(crate) fn jul_logger_name_object(
     // `ConfigurationData`.
     if let Value::Object(Some(name_obj)) = ctx.get_field(logger, 0) {
         if ctx
-            .class_name_of_id(ctx.class_id_of_object(name_obj))
+            .class_name_arc_of_id(ctx.class_id_of_object(name_obj))
             .as_deref()
             == Some("java/lang/String")
         {
@@ -876,7 +980,7 @@ pub(crate) fn jul_logger_name_object(
     // The `logmanager` synthetic layout.
     if let Value::Object(Some(name_obj)) = ctx.get_field(logger, LOGGER_FIELD_NAME) {
         if ctx
-            .class_name_of_id(ctx.class_id_of_object(name_obj))
+            .class_name_arc_of_id(ctx.class_id_of_object(name_obj))
             .as_deref()
             == Some("java/lang/String")
         {
@@ -935,14 +1039,14 @@ fn tomcat_context_loader_key(ctx: &mut dyn NativeContext) -> i32 {
 /// context class loader.  Calling `getLogger("")` is safe here: JULI creates
 /// and configures that root as part of its own class-loader-info bootstrap;
 /// unlike `addLogger(child)`, it does not recurse through parent logger names.
-fn tomcat_juli_root_logger(ctx: &mut dyn NativeContext) -> Option<ObjectRef> {
-    let manager = ensure_singleton(ctx, CLS_JUL_LOG_MANAGER);
+fn tomcat_juli_root_logger(ctx: &mut dyn NativeContext) -> Result<Option<ObjectRef>, MethodCallFailed> {
+    let manager = ensure_singleton(ctx, CLS_JUL_LOG_MANAGER)?;
     if ctx
-        .class_name_of_id(ctx.class_id_of_object(manager))
+        .class_name_arc_of_id(ctx.class_id_of_object(manager))
         .as_deref()
         != Some("org/apache/juli/ClassLoaderLogManager")
     {
-        return None;
+        return Ok(None);
     }
     let manager_pin = ctx.pin_native_root(manager);
     let root_name = ctx.create_string("");
@@ -958,23 +1062,23 @@ fn tomcat_juli_root_logger(ctx: &mut dyn NativeContext) -> Option<ObjectRef> {
         .flatten();
     ctx.unpin_native_roots(manager_pin);
     match root {
-        Some(Value::Object(Some(root))) => Some(root),
-        _ => None,
+        Some(Value::Object(Some(root))) => Ok(Some(root)),
+        _ => Ok(None),
     }
 }
 
-fn get_or_create_tomcat_juli_logger(ctx: &mut dyn NativeContext, name: &str) -> ObjectRef {
+fn get_or_create_tomcat_juli_logger(ctx: &mut dyn NativeContext, name: &str) -> Result<ObjectRef, MethodCallFailed> {
     let vm = ctx.vm_identity();
     if !is_valid_logger_name(name) {
-        return allocate_logger(ctx, "");
+        return Ok(allocate_logger(ctx, "")?);
     }
     // The JUL root is a real logger installed by ClassLoaderLogManager while
     // it reads the current webapp's logging.properties. Returning it directly
     // preserves the configured root level instead of manufacturing a second,
     // unconfigured synthetic root.
     if name.is_empty() {
-        if let Some(root) = tomcat_juli_root_logger(ctx) {
-            return root;
+        if let Ok(Some(root)) = tomcat_juli_root_logger(ctx) {
+            return Ok(root);
         }
     }
     let context_loader_key = tomcat_context_loader_key(ctx);
@@ -985,10 +1089,10 @@ fn get_or_create_tomcat_juli_logger(ctx: &mut dyn NativeContext, name: &str) -> 
         .get(&key)
     {
         if address != 0 {
-            return unsafe { object_from_u64(address) };
+            return unsafe { Ok(object_from_u64(address)) };
         }
     }
-    let logger = allocate_logger(ctx, name);
+    let logger = allocate_logger(ctx, name)?;
     // This factory re-enters real JULI bytecode and allocates handler state.
     // Keep its new Logger rooted throughout, refreshing it after every
     // GC-capable boundary before it is stored or returned.
@@ -998,10 +1102,10 @@ fn get_or_create_tomcat_juli_logger(ctx: &mut dyn NativeContext, name: &str) -> 
     // current context-class-loader configuration, wires its parent chain and
     // instantiates any per-logger handlers. Bypassing this path was why the
     // per-webapp FileHandler and root level disappeared.
-    let manager = ensure_singleton(ctx, CLS_JUL_LOG_MANAGER);
+    let manager = ensure_singleton(ctx, CLS_JUL_LOG_MANAGER)?;
     logger = ctx.read_native_pin(logger_pin, logger);
     if ctx
-        .class_name_of_id(ctx.class_id_of_object(manager))
+        .class_name_arc_of_id(ctx.class_id_of_object(manager))
         .as_deref()
         == Some("org/apache/juli/ClassLoaderLogManager")
     {
@@ -1017,7 +1121,7 @@ fn get_or_create_tomcat_juli_logger(ctx: &mut dyn NativeContext, name: &str) -> 
         logger = ctx.read_native_pin(logger_pin, logger);
         ctx.unpin_native_roots(manager_pin);
     }
-    if let Some(root) = tomcat_juli_root_logger(ctx) {
+    if let Ok(Some(root)) = tomcat_juli_root_logger(ctx) {
         logger = ctx.read_native_pin(logger_pin, logger);
         if let Some(handlers) = crate::jul_logger_handlers_get(ctx, root) {
             // `publish_to_jul_handlers` is intentionally compact and does not
@@ -1038,7 +1142,7 @@ fn get_or_create_tomcat_juli_logger(ctx: &mut dyn NativeContext, name: &str) -> 
                 .cloned()
                 .unwrap_or_default();
             if !root_handlers.is_empty() {
-                let list = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
+                let list = try_alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2)?;
                 let _ =
                     cratonvm_native_collections::native_al_init(ctx, &[Value::Object(Some(list))]);
                 for address in root_handlers {
@@ -1061,12 +1165,12 @@ fn get_or_create_tomcat_juli_logger(ctx: &mut dyn NativeContext, name: &str) -> 
     if let Some(&address) = registry.get(&key) {
         if address != 0 {
             ctx.unpin_native_roots(logger_pin);
-            return unsafe { object_from_u64(address) };
+            return unsafe { Ok(object_from_u64(address)) };
         }
     }
     registry.insert(key, logger.as_ptr() as u64);
     ctx.unpin_native_roots(logger_pin);
-    logger
+    Ok(logger)
 }
 
 fn tomcat_classloader_log_manager_requested(ctx: &dyn NativeContext) -> bool {
@@ -1085,14 +1189,14 @@ fn native_jul_static_get_logger(ctx: &mut dyn NativeContext, args: &[Value]) -> 
     };
     if jboss_log_manager_requested(ctx) {
         let logger = get_or_create_jboss_logger(ctx, &name);
-        return Ok(Some(Value::Object(Some(logger))));
+        return Ok(Some(Value::Object(Some(logger?))));
     }
     if tomcat_classloader_log_manager_requested(ctx) {
         let logger = get_or_create_tomcat_juli_logger(ctx, &name);
-        return Ok(Some(Value::Object(Some(logger))));
+        return Ok(Some(Value::Object(Some(logger?))));
     }
     let logger = get_or_create_logger(ctx, &name);
-    Ok(Some(Value::Object(Some(logger))))
+    Ok(Some(Value::Object(Some(logger?))))
 }
 
 /// `Logger.getLogger(name, resourceBundleName)`.
@@ -1219,6 +1323,9 @@ pub(crate) fn reset_state_for_tests() {
     if let Ok(mut m) = attachments(TEST_VM).lock() {
         m.clear();
     }
+    if let Ok(mut d) = primordial_config_done(TEST_VM).lock() {
+        *d = false;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1226,7 +1333,46 @@ pub(crate) fn reset_state_for_tests() {
 // ---------------------------------------------------------------------------
 
 fn native_get_log_manager(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    let obj = ensure_singleton(ctx, CLS_JUL_LOG_MANAGER);
+    let obj = ensure_singleton(ctx, CLS_JUL_LOG_MANAGER)?;
+    // Real `LogManager.ensureLogManagerInitialized()` finishes by adding TWO
+    // loggers to the root context: the root logger `""` and `Logger.global`.
+    // Ours demand-created the root on first use and never registered `global`
+    // at all, so `getLoggerNames()` came back one short of HotSpot —
+    // `[, namesprobe.one]` against `[, global, namesprobe.one]` (measured).
+    //
+    // `Logger.getGlobal()` still ANSWERED, because our `getLogger` demand-
+    // creates any name; what was missing is the REGISTRATION, and only an
+    // enumeration of the registry can see the difference. That is the whole
+    // reason regression-suite RJdkLogging prints `loggerNames=` instead of
+    // only asserting `contains(...)`: a registry that fabricates on demand
+    // satisfies every membership test and still has the wrong contents.
+    let _ = get_or_create_logger(ctx, "");
+    let _ = get_or_create_logger(ctx, "global");
+    // ...and then reads the configuration. `readPrimordialConfiguration` is
+    // the step that installs the `ConsoleHandler` named by
+    // `$java.home/conf/logging.properties`; without it `root.handlers` was 0
+    // against HotSpot's 1, and every `Logger.info(..)` on a default-configured
+    // VM was dropped on the floor with no handler to publish it.
+    //
+    // Latch FIRST. `read_configuration_no_arg_impl` instantiates the handler
+    // classes named by the file, and a handler constructor is free to call
+    // `LogManager.getLogManager()` — which is this function.
+    let first_time = {
+        let mut done = primordial_config_done(ctx.vm_identity())
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let first = !*done;
+        *done = true;
+        first
+    };
+    if first_time {
+        // A missing or unreadable file is not fatal in the JDK either, and
+        // `read_configuration_no_arg_impl` already returns `Ok(None)` for it.
+        // Swallow a hard error too rather than failing `getLogManager()`: the
+        // JDK's own primordial read is wrapped so that a broken config file
+        // leaves you with a usable (if unconfigured) LogManager.
+        let _ = read_configuration_no_arg_impl(ctx, &[]);
+    }
     Ok(Some(Value::Object(Some(obj))))
 }
 
@@ -1237,7 +1383,7 @@ fn native_get_jboss_log_manager(ctx: &mut dyn NativeContext, _args: &[Value]) ->
     // singleton regardless of the concrete class. Using the same slot
     // keeps pointer-identity stable.
     let obj = ensure_singleton(ctx, CLS_JBOSS_LOG_MANAGER);
-    Ok(Some(Value::Object(Some(obj))))
+    Ok(Some(Value::Object(Some(obj?))))
 }
 
 fn native_jboss_init(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
@@ -1257,7 +1403,7 @@ fn native_get_logger(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
         _ => String::new(),
     };
     let logger = get_or_create_logger(ctx, &name);
-    Ok(Some(Value::Object(Some(logger))))
+    Ok(Some(Value::Object(Some(logger?))))
 }
 
 fn native_add_logger(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -1599,7 +1745,7 @@ fn apply_jul_config_entries(
         })
         .unwrap_or_default();
 
-    let root = get_or_create_logger(ctx, "");
+    let root = get_or_create_logger(ctx, "")?;
     let root_pin = ctx.pin_native_root(root);
     // A fresh config replaces whatever handlers a previous
     // `readConfiguration` call (or explicit `addHandler`) installed on the
@@ -1709,12 +1855,70 @@ fn apply_jul_config_entries(
     Ok(None)
 }
 
+/// `LogManager.reset()`.
+///
+/// # It must NOT drop the loggers
+///
+/// This used to `clear()` the logger registry, on the reading that "reset"
+/// means "forget everything". `java.util.logging.LogManager.reset()` says
+/// otherwise, and so does the JDK, measured on HotSpot 25:
+///
+/// ```text
+///   before: names=[, a.b.c, bar, baz, d.e.f, foo, global]
+///           a.level=FINEST  a.handlers=1  root.level=INFO  root.handlers=1
+///   after : names=[, a.b.c, bar, baz, d.e.f, foo, global]   <-- UNCHANGED
+///           a.level=null    a.handlers=0  root.level=INFO   root.handlers=0
+///           Logger.getLogger("reset.probe.a") == the pre-reset object -> true
+/// ```
+///
+/// So `reset()` resets CONFIGURATION — handlers off, levels back to
+/// "inherit", root pinned at INFO — and the registry itself is untouched.
+///
+/// Dropping the registry was not merely an over-broad `getLoggerNames()`. Our
+/// `getLogger` demand-creates any name, so after a `reset()` the next
+/// `Logger.getLogger("x")` minted a DIFFERENT object from the one the
+/// application was still holding. Two live `Logger`s for one name is a silent
+/// split: `setLevel`/`addHandler` on either is invisible to the other, and the
+/// JDK guarantees the identity that makes them the same object. Nothing failed
+/// loudly, which is why a unit test asserting the registry came back EMPTY sat
+/// green over it.
 fn native_reset(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
     let vm = ctx.vm_identity();
-    // Drop all logger bindings but keep the manager singleton alive.
-    if let Ok(mut r) = logger_registry(vm).lock() {
-        r.clear();
+    // Resolve INFO BEFORE snapshotting: `resolve_standard_level` can run
+    // `Level.<clinit>` and therefore allocate, and the snapshot below holds
+    // raw logger addresses that a collection could invalidate. Nothing in the
+    // loop allocates, so one resolve up front is also the only one needed.
+    let info_level = resolve_standard_level(ctx, "INFO");
+    let loggers: Vec<(String, ObjectRef)> = {
+        let reg = logger_registry(vm)
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        reg.iter()
+            .filter(|(_, &addr)| addr != 0)
+            // SAFETY: same singleton-style lifetime `get_or_create_logger`
+            // relies on when it hands these addresses back out.
+            .map(|(name, &addr)| (name.clone(), unsafe { object_from_u64(addr) }))
+            .collect()
+    };
+    for (name, logger) in loggers {
+        // "removes ... all Handlers" — the handler list lives in an
+        // identity-keyed side table, not a slot, so dropping the row is the
+        // removal. NOT ALSO CLOSED: the JDK closes them here, and doing that
+        // means invoking Java `Handler.close()` per handler from inside the
+        // manager, which allocates and re-enters logging. Consequence, stated
+        // rather than hidden: a buffered `StreamHandler` is not flushed by
+        // `reset()` alone. Callers that need the flush call `Handler.close()`
+        // or `flush()` themselves, which is what the JULI and jboss paths in
+        // this module already do.
+        crate::logging_shims::jul_logger_handlers_clear(ctx, logger);
+        // "(except for the root logger) sets the level to null. The root
+        // logger's level is set to Level.INFO."
+        let level = if name.is_empty() { info_level } else { None };
+        ctx.set_field(logger, LOGGER_FIELD_LEVEL, Value::Object(level));
     }
+    // The Tomcat JULI mirrors are per-classloader caches of the above rather
+    // than a separate namespace, so they are rebuilt on next use and clearing
+    // them costs no identity.
     if let Ok(mut r) = tomcat_juli_logger_registry(vm).lock() {
         r.clear();
     }
@@ -1743,7 +1947,7 @@ fn native_get_logger_names(ctx: &mut dyn NativeContext, _args: &[Value]) -> Meth
         ctx.set_array_element(arr, i, Value::Object(Some(s)));
     }
 
-    let enumeration = alloc_concurrent_synthetic(ctx, CLS_LOGGER_ENUMERATION, 2);
+    let enumeration = try_alloc_concurrent_synthetic(ctx, CLS_LOGGER_ENUMERATION, 2)?;
     ctx.set_field(enumeration, 0, Value::Object(Some(arr)));
     ctx.set_field(enumeration, 1, Value::Int(0));
     Ok(Some(Value::Object(Some(enumeration))))
@@ -1892,7 +2096,7 @@ fn jboss_log_context_singleton(vm: usize) -> &'static Mutex<Option<u64>> {
     per_vm_table(&INSTANCE, vm)
 }
 
-fn ensure_jboss_log_context(ctx: &mut dyn NativeContext) -> ObjectRef {
+fn ensure_jboss_log_context(ctx: &mut dyn NativeContext) -> Result<ObjectRef, MethodCallFailed> {
     let vm = ctx.vm_identity();
     {
         let g = jboss_log_context_singleton(vm)
@@ -1900,15 +2104,15 @@ fn ensure_jboss_log_context(ctx: &mut dyn NativeContext) -> ObjectRef {
             .unwrap_or_else(|e| e.into_inner());
         if let Some(addr) = *g {
             if addr != 0 {
-                return unsafe { object_from_u64(addr) };
+                return unsafe { Ok(object_from_u64(addr)) };
             }
         }
     }
-    let obj = alloc_concurrent_synthetic(ctx, "org/jboss/logmanager/LogContext", 1);
+    let obj = try_alloc_concurrent_synthetic(ctx, "org/jboss/logmanager/LogContext", 1)?;
     // Real LogContext.addCloseHandler synchronizes on treeLock. Most LogContext
     // methods are native-overridden below, but initializing the monitor keeps
     // any remaining real bytecode null-safe.
-    let tree_lock = alloc_concurrent_synthetic(ctx, "java/lang/Object", 0);
+    let tree_lock = try_alloc_concurrent_synthetic(ctx, "java/lang/Object", 0)?;
     ctx.set_field_by_name(obj, "treeLock", Value::Object(Some(tree_lock)));
     if ctx
         .resolve_field_index("org/jboss/logmanager/LogContext", "treeLock")
@@ -1921,25 +2125,25 @@ fn ensure_jboss_log_context(ctx: &mut dyn NativeContext) -> ObjectRef {
         .unwrap_or_else(|e| e.into_inner());
     if let Some(addr) = *g {
         if addr != 0 {
-            return unsafe { object_from_u64(addr) };
+            return unsafe { Ok(object_from_u64(addr)) };
         }
     }
     *g = Some(obj.as_ptr() as u64);
-    obj
+    Ok(obj)
 }
 
 fn native_jboss_logger_get_log_context(
     ctx: &mut dyn NativeContext,
     _args: &[Value],
 ) -> MethodCallResult {
-    Ok(Some(Value::Object(Some(ensure_jboss_log_context(ctx)))))
+    Ok(Some(Value::Object(Some(ensure_jboss_log_context(ctx)?))))
 }
 
 fn native_jboss_log_context_get_log_context(
     ctx: &mut dyn NativeContext,
     _args: &[Value],
 ) -> MethodCallResult {
-    Ok(Some(Value::Object(Some(ensure_jboss_log_context(ctx)))))
+    Ok(Some(Value::Object(Some(ensure_jboss_log_context(ctx)?))))
 }
 
 fn native_jboss_log_context_get_logger_if_exists(
@@ -1962,28 +2166,29 @@ fn jboss_logger_registry(vm: usize) -> &'static Mutex<HashMap<String, u64>> {
     per_vm_table(&INSTANCE, vm)
 }
 
-fn attach_minimal_jboss_logger_node(ctx: &mut dyn NativeContext, logger: ObjectRef) {
+fn attach_minimal_jboss_logger_node(ctx: &mut dyn NativeContext, logger: ObjectRef) -> Result<(), MethodCallFailed> {
     // Some JIT/real-bytecode paths still execute JBoss Logger methods directly
     // before the native override gate can short-circuit them. Those methods all
     // start by dereferencing `this.loggerNode`. We do not model the full
     // LoggerNode graph, but a tiny node with INFO effective level is enough for
     // getEffectiveLevel/isLoggable-style reads to be null-safe and conservative.
-    let node = alloc_concurrent_synthetic(ctx, "org/jboss/logmanager/LoggerNode", 16);
+    let node = try_alloc_concurrent_synthetic(ctx, "org/jboss/logmanager/LoggerNode", 16)?;
     ctx.set_field_by_name(node, "effectiveLevel", Value::Int(800));
     ctx.set_field_by_name(node, "effectiveMinLevel", Value::Int(i32::MIN));
     ctx.set_field_by_name(node, "useParentHandlers", Value::Int(1));
     ctx.set_field_by_name(node, "useParentFilter", Value::Int(1));
     ctx.set_field_by_name(logger, "loggerNode", Value::Object(Some(node)));
+    Ok(())
 }
 
-fn get_or_create_jboss_logger(ctx: &mut dyn NativeContext, name: &str) -> ObjectRef {
+fn get_or_create_jboss_logger(ctx: &mut dyn NativeContext, name: &str) -> Result<ObjectRef, MethodCallFailed> {
     let vm = ctx.vm_identity();
     if !is_valid_logger_name(name) {
-        let obj = alloc_concurrent_synthetic(ctx, "org/jboss/logmanager/Logger", LOGGER_NUM_FIELDS);
+        let obj = try_alloc_concurrent_synthetic(ctx, "org/jboss/logmanager/Logger", LOGGER_NUM_FIELDS)?;
         let name_obj = ctx.create_string("");
         ctx.set_field(obj, LOGGER_FIELD_NAME, Value::Object(Some(name_obj)));
-        attach_minimal_jboss_logger_node(ctx, obj);
-        return obj;
+        attach_minimal_jboss_logger_node(ctx, obj)?;
+        return Ok(obj);
     }
     {
         let reg = jboss_logger_registry(vm)
@@ -1991,26 +2196,26 @@ fn get_or_create_jboss_logger(ctx: &mut dyn NativeContext, name: &str) -> Object
             .unwrap_or_else(|e| e.into_inner());
         if let Some(&addr) = reg.get(name) {
             if addr != 0 {
-                return unsafe { object_from_u64(addr) };
+                return unsafe { Ok(object_from_u64(addr)) };
             }
         }
     }
-    let obj = alloc_concurrent_synthetic(ctx, "org/jboss/logmanager/Logger", LOGGER_NUM_FIELDS);
+    let obj = try_alloc_concurrent_synthetic(ctx, "org/jboss/logmanager/Logger", LOGGER_NUM_FIELDS)?;
     let name_obj = ctx.create_string(name);
     ctx.set_field(obj, LOGGER_FIELD_NAME, Value::Object(Some(name_obj)));
     ctx.set_field(obj, LOGGER_FIELD_LEVEL, Value::Object(None));
     ctx.set_field(obj, LOGGER_FIELD_PARENT, Value::Object(None));
-    attach_minimal_jboss_logger_node(ctx, obj);
+    attach_minimal_jboss_logger_node(ctx, obj)?;
     let mut reg = jboss_logger_registry(vm)
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     if let Some(&addr) = reg.get(name) {
         if addr != 0 {
-            return unsafe { object_from_u64(addr) };
+            return unsafe { Ok(object_from_u64(addr)) };
         }
     }
     reg.insert(name.to_string(), obj.as_ptr() as u64);
-    obj
+    Ok(obj)
 }
 
 fn native_jboss_log_context_get_logger(
@@ -2028,7 +2233,7 @@ fn native_jboss_log_context_get_logger(
         _ => String::new(),
     };
     let logger = get_or_create_jboss_logger(ctx, &name);
-    Ok(Some(Value::Object(Some(logger))))
+    Ok(Some(Value::Object(Some(logger?))))
 }
 
 /// `java.util.logging.Level.parse(String)` — static factory that resolves a
@@ -2229,7 +2434,7 @@ fn native_jboss_log_context_get_close_handlers(
     ) {
         return Ok(Some(set));
     }
-    let set = alloc_concurrent_synthetic(ctx, "java/util/Collections$EmptySet", 0);
+    let set = try_alloc_concurrent_synthetic(ctx, "java/util/Collections$EmptySet", 0)?;
     Ok(Some(Value::Object(Some(set))))
 }
 
@@ -3459,7 +3664,7 @@ fn native_jul_logger_add_handler(ctx: &mut dyn NativeContext, args: &[Value]) ->
     let side_list = match crate::jul_logger_handlers_get(ctx, logger) {
         Some(list) => list,
         None => {
-            let list = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
+            let list = try_alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2)?;
             let list_pin = ctx.pin_native_root(list);
             cratonvm_native_collections::native_al_init(ctx, &[Value::Object(Some(list))])?;
             let list = ctx.read_native_pin(list_pin, list);
@@ -3568,6 +3773,7 @@ fn notify_jul_logger_filter(
     let message = ctx.read_native_pin(message_pin, message);
     ctx.set_field_by_name(record, "level", Value::Object(Some(level)));
     ctx.set_field_by_name(record, "message", Value::Object(Some(message)));
+    stamp_inferred_caller(ctx, record);
     let _ = ctx.invoke_virtual(
         record,
         "setLevel",
@@ -3666,6 +3872,7 @@ fn publish_jul_handlers_src(
         let record_pin = ctx.pin_native_root(record);
         ctx.set_field_by_name(record, "level", Value::Object(Some(level)));
         ctx.set_field_by_name(record, "message", Value::Object(Some(message)));
+        stamp_inferred_caller(ctx, record);
         // Real JDK LogRecord's instance layout is level, sequenceNumber,
         // sourceClassName, sourceMethodName, message. Keep a slot fallback for
         // the private-field resolver path used by compact allocations.
@@ -4032,6 +4239,80 @@ fn jul_trace_marker(ctx: &mut dyn NativeContext, args: &[Value], marker: &str) -
     Ok(None)
 }
 
+/// Stamp a bridge-built `LogRecord` with the class and method that called the
+/// log method, the way `java.util.logging.LogRecord.inferCaller()` does.
+///
+/// Neither record site in this file ran it, so the pair stayed null on every
+/// `logger.warning("...")`-shaped call — only the `logp` family, whose caller
+/// hands the pair in, ever carried one. That is not a silent gap:
+/// `SimpleFormatter`'s default pattern renders the source pair and falls back
+/// to the LOGGER NAME when there is none, so the JDK's own formatter papers
+/// over it and the output merely looks wrong. HotSpot renders
+/// `RJdkLogging formattedOutputIsRealBytes`; CratonVM rendered
+/// `rjdklogging.stream` (regression-suite RJdkLogging,
+/// `formattedOutputIsRealBytes`).
+///
+/// EAGER, where the JDK is lazy, and the reason is measured rather than
+/// stylistic. `inferCaller` can afford to run inside `getSourceClassName()`
+/// because on HotSpot the frames it walks — `Logger.warning`, `Logger.log`,
+/// `doLog` — are Java frames still on the stack when the formatter asks. On
+/// CratonVM that whole chain is NATIVE, so a stack captured from the accessor
+/// holds only `[caller…, Handler.publish]` with no `java/util/logging` frame
+/// in it at all (measured: `frames=2 stack=["SrcProbe2.main",
+/// "SrcProbe2$Cap.publish"]`), and the JDK's "skip the logging frames, take
+/// the next one" latch can never trip. Here, at record construction, the
+/// innermost Java frame IS the caller.
+///
+/// Known divergence, deliberate: reading the pair AFTER the log call has
+/// returned yields the caller here and `null` on HotSpot, because HotSpot's
+/// inference is lazy and fails once its frames are gone. Nothing rests on that
+/// null — `SimpleFormatter` reads during `publish`, where both now answer
+/// identically — and being deterministic is the better failure mode.
+fn stamp_inferred_caller(ctx: &mut dyn NativeContext, record: ObjectRef) {
+    let frames = ctx.capture_stack_trace(0);
+    // Outermost-first, so the innermost frame — the direct caller of the log
+    // method — is the LAST one. Skip any logging/reflection frame a re-entrant
+    // log call could have left on top.
+    let Some(frame) = frames.iter().rev().find(|f| {
+        let c = f.class_name.as_ref();
+        !c.starts_with("java/util/logging/")
+            && !c.starts_with("sun/util/logging/")
+            && !c.starts_with("java/lang/reflect/")
+            && !c.starts_with("jdk/internal/reflect/")
+    }) else {
+        return;
+    };
+    let class = frame.class_name.replace('/', ".");
+    let method = frame.method_name.as_ref().to_string();
+    let record_pin = ctx.pin_native_root(record);
+    let cls_obj = ctx.create_string(&class);
+    let cls_pin = ctx.pin_native_root(cls_obj);
+    let mth_obj = ctx.create_string(&method);
+    let cls_obj = ctx.read_native_pin(cls_pin, cls_obj);
+    let record = ctx.read_native_pin(record_pin, record);
+    ctx.set_field_by_name(record, "sourceClassName", Value::Object(Some(cls_obj)));
+    ctx.set_field_by_name(record, "sourceMethodName", Value::Object(Some(mth_obj)));
+    // The real setters clear this; stamping the fields directly must too, or
+    // the pair is written into a record that still believes it owes an
+    // inference. That was inert while `getSourceClassName` was a shadow doing a
+    // bare field read, but those four triples are retired under `--jdk-only`
+    // since 2026-08-12 (native-api/src/retired_shadow.rs), so the REAL getter —
+    // `if (needToInferCaller) inferCaller(); return sourceClassName;` — now
+    // runs there and would overwrite this stamp with whatever its own walk
+    // found. Every `java/util/logging/` entry point into this file is itself
+    // retired in strict mode, so today that is reachable only via a non-JUL
+    // receiver (e.g. the `org/jboss/logmanager/` bridges, which are not in the
+    // retirement table); write the flag rather than rely on that staying true.
+    //
+    // Inert in `Compatible`, where the four accessors still dispatch as natives
+    // and none of them reads this flag. W7-56-infercaller-strict.md
+    if crate::log_record_real_layout(ctx, record) {
+        ctx.set_field_by_name(record, "needToInferCaller", Value::Int(0));
+    }
+    ctx.unpin_native_roots(cls_pin);
+    ctx.unpin_native_roots(record_pin);
+}
+
 /// Real JUL keeps `useParentHandlers` inside the private
 /// `Logger$ConfigurationData` (`config`), which our natively-constructed
 /// loggers never materialize — and the compact synthetic shape has no such
@@ -4041,7 +4322,35 @@ fn jul_trace_marker(ctx: &mut dyn NativeContext, args: &[Value], marker: &str) -
 ///
 /// Deliberately a pure field read: dispatching `getUseParentHandlers()` would
 /// re-enter real bytecode that dereferences the same unmaterialized `config`.
+///
+/// FIRST CHOICE is `lib.rs`'s `jul_logger_use_parent_handlers_table`, which is
+/// where `Logger.setUseParentHandlers(Z)V` records the flag. That write and
+/// this read used to be in different modules and never met: the setter stored
+/// into the side table, this walked `config.useParentHandlers`, and `config` is
+/// null on every logger this bridge mints — so the `false` was accepted, read
+/// back correctly by `getUseParentHandlers()`, and then ignored by the only
+/// consumer that matters. An accessor agreeing with itself is not evidence the
+/// consumer agrees with it. Measured in `Compatible` before this change:
+/// `setUseParentHandlers(false)` then `info(...)` still reached the parent's
+/// Handler (`[INFO:not-up-to-parent]`), where HotSpot delivers nothing; under
+/// `--jdk-only` no native holds either triple, real bytecode runs, and the walk
+/// already stopped. So this closes a `Compatible`-only divergence and leaves
+/// strict mode byte-identical. See
+/// docs/known-issues/jdk-only/W7-35-jul-supplier-and-payload-residuals.md.
+///
+/// An ABSENT entry is not `false`: it means nothing ever called the setter, so
+/// fall through to the `config` read and its JDK default (`true`) rather than
+/// letting a logger nobody configured silence its ancestors' handlers.
 fn jul_use_parent_handlers(ctx: &dyn NativeContext, logger: ObjectRef) -> bool {
+    let key = ctx.identity_hash_code(logger);
+    if let Some(flag) = crate::jul_logger_use_parent_handlers_table()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&key)
+        .copied()
+    {
+        return flag;
+    }
     match ctx.get_field_by_name(logger, "config") {
         Value::Object(Some(config)) => !matches!(
             ctx.get_field_by_name(config, "useParentHandlers"),
@@ -4058,9 +4367,9 @@ fn jul_use_parent_handlers(ctx: &dyn NativeContext, logger: ObjectRef) -> bool {
 /// GC: the ancestor walk demand-creates loggers and therefore allocates, so
 /// callers MUST re-derive every reference they still hold — including `logger`
 /// itself — from its pin after this returns.
-fn resolve_jul_handler_list(ctx: &mut dyn NativeContext, logger: ObjectRef) -> Option<ObjectRef> {
+fn resolve_jul_handler_list(ctx: &mut dyn NativeContext, logger: ObjectRef) -> Result<Option<ObjectRef>, MethodCallFailed> {
     if let Some(handlers) = crate::jul_logger_handlers_get(ctx, logger) {
-        return Some(handlers);
+        return Ok(Some(handlers));
     }
     // Only our legacy synthetic logger stores its parent/handler
     // fallback at raw slot 2.  On a real JDK Logger that slot is the
@@ -4069,7 +4378,7 @@ fn resolve_jul_handler_list(ctx: &mut dyn NativeContext, logger: ObjectRef) -> O
     // ClassLoaderLogManager creates a real per-webapp logger.
     let synthetic_layout = matches!(ctx.get_field(logger, LOGGER_FIELD_NAME),
         Value::Object(Some(name))
-            if ctx.class_name_of_id(ctx.class_id_of_object(name)).as_deref()
+            if ctx.class_name_arc_of_id(ctx.class_id_of_object(name)).as_deref()
                 == Some("java/lang/String"));
     if synthetic_layout {
         // `allocate_logger` now populates this same slot with a real parent
@@ -4077,11 +4386,11 @@ fn resolve_jul_handler_list(ctx: &mut dyn NativeContext, logger: ObjectRef) -> O
         // don't misread it as one.
         if let Value::Object(Some(list)) = ctx.get_field(logger, LOGGER_FIELD_PARENT) {
             if ctx
-                .class_name_of_id(ctx.class_id_of_object(list))
+                .class_name_arc_of_id(ctx.class_id_of_object(list))
                 .as_deref()
                 != Some(CLS_JUL_LOGGER)
             {
-                return Some(list);
+                return Ok(Some(list));
             }
         }
     }
@@ -4093,20 +4402,20 @@ fn resolve_jul_handler_list(ctx: &mut dyn NativeContext, logger: ObjectRef) -> O
     // installed on the root logger by `readConfiguration`.
     let logger_name = read_jul_logger_name(ctx, logger);
     if !jul_use_parent_handlers(ctx, logger) {
-        return None;
+        return Ok(None);
     }
     let mut candidate: &str = &logger_name;
     loop {
         if candidate.is_empty() {
-            return None;
+            return Ok(None);
         }
         candidate = match candidate.rfind('.') {
             Some(idx) => &candidate[..idx],
             None => "",
         };
         let ancestor = get_or_create_logger(ctx, candidate);
-        if let Some(h) = crate::jul_logger_handlers_get(ctx, ancestor) {
-            return Some(h);
+        if let Some(h) = crate::jul_logger_handlers_get(ctx, ancestor?) {
+            return Ok(Some(h));
         }
     }
 }
@@ -4124,7 +4433,7 @@ fn publish_existing_record_to_jul_handlers(
 ) -> bool {
     let logger_pin = ctx.pin_native_root(logger);
     let record_pin = ctx.pin_native_root(record);
-    let Some(handlers) = resolve_jul_handler_list(ctx, logger) else {
+    let Ok(Some(handlers)) = resolve_jul_handler_list(ctx, logger) else {
         ctx.unpin_native_roots(logger_pin);
         return false;
     };
@@ -4179,6 +4488,20 @@ fn publish_existing_record_to_jul_handlers(
         {
             delivered = true;
         }
+        // KEPT SWALLOW. HotSpot's `Logger.log` does not call `Handler.flush()`
+        // at all — this flush is OURS, added so the native publication bridge
+        // reaches the same durability the JDK gets by other means. There is no
+        // JDK `catch` to copy, and turning a failure in work HotSpot never
+        // performs into a Java-visible throw HotSpot never raises would be a
+        // fresh divergence. `Handler.flush()` declares no checked exception,
+        // and `StreamHandler.flush()` absorbs `Exception` into its
+        // `ErrorManager` anyway.
+        //
+        // Residual: an `Error` is absorbed here too. This helper returns
+        // `bool`, so narrowing it is a signature change, not a one-liner —
+        // unlike its sibling in `publish_to_jul_handlers_full` below, which
+        // returns a `Result` and IS narrowed.
+        // W7-57-close-flush-swallow-sweep.md
         let handler = ctx.read_native_pin(handler_pin, handler);
         let _ = ctx.invoke_virtual(handler, "flush", "()V", &[]);
     }
@@ -4225,6 +4548,51 @@ fn publish_to_jul_handlers_src(
 /// Returns `true` when at least one handler accepted the record, so callers
 /// can keep the console-sink fallback for loggers that have no handler chain
 /// at all instead of silently dropping the line.
+/// The `(sourceClassName, sourceMethodName)` pair a `LogRecord` published from
+/// this bridge should carry, in DOTTED form, or `None` when the stack offers no
+/// caller (bootstrap, or a log driven entirely from native code).
+///
+/// This is `LogRecord$CallerFinder`'s job, ADAPTED rather than transcribed, and
+/// the difference is the whole reason it works. Real `CallerFinder` starts with
+/// `lookingForLogger = true` and returns nothing until it has SEEN a
+/// `java.util.logging.Logger` frame — correct on HotSpot, where the record is
+/// built by `Logger.doLog` with those frames live on the stack. In `Compatible`
+/// this native IS the `Logger` frame and no Java frame is pushed for it, so a
+/// literal transcription would look for a marker that is never present and
+/// return `None` every time — a helper that cannot fire, which is how this
+/// campaign's vacuous fixes have looked. Measured: the whole `Logger.log`/
+/// `doLog`/`warning` run is absent from a `Compatible` capture taken inside a
+/// Handler (`[RJdkLogging$Cap.publish, RJdkLogging.main]` against HotSpot's
+/// `[…publish, Logger.log, Logger.doLog, Logger.log, Logger.warning, main]`).
+///
+/// So: take the INNERMOST Java frame, skipping any `Logger` frames that do
+/// happen to be present. The skip is not dead code — real `Logger` bytecode can
+/// still be on the stack on the mixed paths (`Logger.log(LogRecord)` reaching a
+/// native handler, a convenience overload that resolved to bytecode), and
+/// without it the record would name `java.util.logging.Logger` as its own
+/// caller. The two class names are exactly the two `isLoggerImplFrame` admits;
+/// deliberately not widened, because a name this predicate wrongly skips
+/// silently attributes the record to its caller's caller.
+///
+/// `StackTraceEntry::class_name` is INTERNAL (slash) form — the same form
+/// `lang_class`'s reflection-frame filter matches on — while
+/// `sourceClassName` is read back by Java as a normal dotted class name, so the
+/// winner is converted on the way out.
+fn infer_jul_caller_source(ctx: &mut dyn NativeContext) -> Option<(String, String)> {
+    // Outermost-first: `frames[0]` is `main`, the last entry is the innermost
+    // Java frame. Documented on `capture_stack_trace` and relied on the same
+    // way by `locale_resources::caller_bundle_class_loader`.
+    let frames = ctx.capture_stack_trace(0);
+    frames
+        .iter()
+        .rev()
+        .find(|f| {
+            &*f.class_name != "java/util/logging/Logger"
+                && !f.class_name.starts_with("sun/util/logging/PlatformLogger")
+        })
+        .map(|f| (f.class_name.replace('/', "."), f.method_name.to_string()))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn publish_to_jul_handlers_full(
     ctx: &mut dyn NativeContext,
@@ -4246,7 +4614,7 @@ fn publish_to_jul_handlers_full(
     let thrown_pin = thrown.map(|o| (ctx.pin_native_root(o), o));
     let result: Result<bool, MethodCallFailed> = (|| {
         let logger = ctx.read_native_pin(base_pin, logger);
-        let Some(handlers) = resolve_jul_handler_list(ctx, logger) else {
+        let Ok(Some(handlers)) = resolve_jul_handler_list(ctx, logger) else {
             return Ok(false);
         };
         let handlers_pin = ctx.pin_native_root(handlers);
@@ -4301,6 +4669,7 @@ fn publish_to_jul_handlers_full(
         // surface explicit just as the direct-handler bridge does.
         ctx.set_field_by_name(record, "level", Value::Object(Some(level)));
         ctx.set_field_by_name(record, "message", Value::Object(Some(message)));
+        stamp_inferred_caller(ctx, record);
         ctx.set_field(record, 4, Value::Object(Some(message)));
         // FIX (logbackloggingsystemtests-julbridge-loggername-null): this
         // synthetic `LogRecord` bypasses `Logger.log(LogRecord)`'s real
@@ -4333,6 +4702,60 @@ fn publish_to_jul_handlers_full(
             let src = ctx.read_native_pin(pin, obj);
             ctx.set_field_by_name(record, "sourceMethodName", Value::Object(Some(src)));
         }
+        // No caller-supplied pair (only `logp` has one): infer it, the way real
+        // `LogRecord.getSourceClassName()` does on first read. `SimpleFormatter`'s
+        // DEFAULT pattern renders this pair as `%2$s` and falls back to the
+        // logger NAME when it is null, so without this every JUL line CratonVM
+        // formats reads `<logger.name>` where HotSpot reads `Class method` —
+        // measured, `Compatible`: `psrc.y` vs `PSrc main`.
+        //
+        // Only reached once a handler chain exists (see the early return
+        // above), so a handler-less logger on the console-fallback path — the
+        // pre-`readConfiguration` Tomcat/Spring Boot state — still pays no
+        // stack capture at all. That bound matters: HotSpot's cost is deferred
+        // to whoever calls `getSourceClassName()`, and this is the nearest
+        // equivalent placement we can reach from a native.
+        //
+        // A FALLBACK, not the primary inference. `stamp_inferred_caller` above
+        // already stamped the pair (and cleared `needToInferCaller`), and this
+        // block used to run unconditionally afterwards — so it took a SECOND
+        // `capture_stack_trace` on every published record and then overwrote the
+        // first answer with its own, which is the weaker of the two predicates.
+        // Adjudicated against the JDK 25 source rather than by preference:
+        // `LogRecord$CallerFinder.test` has TWO stages, a latch that skips until
+        // it sees `java.util.logging.Logger` / `sun.util.logging.PlatformLogger*`
+        // (`isLoggerImplFrame`) and then a FILTER,
+        // `jdk.internal.logger.SurrogateLogger.isFilteredFrame` → `Formatting.
+        // isFilteredFrame`, which skips all of `java.util.logging.`,
+        // `sun.util.logging.`, `jdk.internal.logger.`,
+        // `java.lang.invoke.MethodHandle*`, `java.security.AccessController` and
+        // anything implementing `System.Logger`. `infer_jul_caller_source` skips
+        // only the two LATCH names, so it can name `java.util.logging.Handler`
+        // or a reflection frame as the caller; `stamp_inferred_caller`'s wider
+        // skip set is the analogue of the filter stage and is the faithful one.
+        // Kept as the last resort for the case the wider set rejects every
+        // frame, where a narrow answer beats a null pair.
+        // W7-35-jul-supplier-and-payload-residuals.md
+        if src_cls_pin.is_none()
+            && src_mth_pin.is_none()
+            && !matches!(
+                ctx.get_field_by_name(record, "sourceClassName"),
+                Value::Object(Some(_))
+            )
+        {
+            if let Some((cls, mth)) = infer_jul_caller_source(ctx) {
+                let cls_obj = ctx.create_string(&cls);
+                let cls_pin = ctx.pin_native_root(cls_obj);
+                let mth_obj = ctx.create_string(&mth);
+                // Both `create_string`s allocate; re-derive the record and the
+                // first string before either is written.
+                let cls_obj = ctx.read_native_pin(cls_pin, cls_obj);
+                let record = ctx.read_native_pin(record_pin, record);
+                ctx.set_field_by_name(record, "sourceClassName", Value::Object(Some(cls_obj)));
+                ctx.set_field_by_name(record, "sourceMethodName", Value::Object(Some(mth_obj)));
+            }
+        }
+        let record = ctx.read_native_pin(record_pin, record);
         // `getParameters()` / `getThrown()` are as much a part of the record's
         // public surface as the message is: HotSpot's `log(Level, String,
         // Object)` / `log(Level, String, Object[])` / `log(Level, String,
@@ -4435,8 +4858,18 @@ fn publish_to_jul_handlers_full(
             // bytecode that can GC; refresh `handler` from its pin before
             // reusing it for `flush` below (same hazard class as the
             // `record`/`message` fix above this loop).
+            //
+            // KEPT SWALLOW, NARROWED. HotSpot's `Logger.log` makes no
+            // `Handler.flush()` call at all, so there is no JDK `catch` to
+            // copy and a Java-visible throw from work HotSpot never performs
+            // would be a fresh divergence. What is NOT that is an `Error`: a
+            // `NoSuchMethodError` here means our own dispatch failed to find
+            // `flush`, which is a broken VM, not a busy log file.
+            // `vm_only_best_effort` absorbs `Exception` and returns the rest.
+            // W7-57-close-flush-swallow-sweep.md
             let handler = ctx.read_native_pin(handler_pin, handler);
-            let _ = ctx.invoke_virtual(handler, "flush", "()V", &[]);
+            let flushed = ctx.invoke_virtual(handler, "flush", "()V", &[]);
+            cratonvm_native_api::delegated_close::vm_only_best_effort(&*ctx, flushed)?;
         }
         Ok(delivered)
     })();
@@ -4469,7 +4902,7 @@ fn jul_is_throwable(ctx: &dyn NativeContext, o: ObjectRef) -> bool {
     let mut cid = ctx.class_id_of_object(o);
     // Depth guard: a corrupt or self-referential chain must not spin here.
     for _ in 0..64 {
-        match ctx.class_name_of_id(cid).as_deref() {
+        match ctx.class_name_arc_of_id(cid).as_deref() {
             Some("java/lang/Throwable") => return true,
             // `Object` terminates the chain; `None` means the id is not a
             // real loaded class (synthetic lambda proxy, stale ref).
@@ -4581,6 +5014,18 @@ fn jul_level_tag(ctx: &mut dyn NativeContext, level_obj: Option<ObjectRef>) -> S
 /// JUnit's `ListenerRegistry.notifyEach` logs swallowed listener exceptions
 /// exactly this way, so any such error was invisible. Identify the throwable
 /// by `instanceof Throwable` and render it with a short stack trace.
+///
+/// **The level gate below is the twin of the one in
+/// `native_jul_logger_log_supplier`, and is here for the same measurement.**
+/// On a logger at `INFO`, HotSpot 25.0.3 evaluates neither
+/// `log(Level.FINEST, throwable, supplier)` nor `log(Level.FINEST, supplier)`;
+/// CratonVM `Compatible` evaluated and emitted both (measured 2026-08-11,
+/// counting supplier invocations: HotSpot `0/0`, CratonVM `1/1`). Fixing one
+/// of the pair and leaving the other is the exact "right in the members with
+/// one implementation, wrong in the members with the other" shape this family
+/// keeps producing, so both close together. `(Level, String, Throwable)` rides
+/// the same native and gains the same gate, which is what its `(Level, String)`
+/// sibling has always done.
 pub(crate) fn native_jul_logger_log_throwable(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -4593,6 +5038,16 @@ pub(crate) fn native_jul_logger_log_throwable(
         Some(Value::Object(o)) => *o,
         _ => None,
     };
+    // Gate BEFORE the supplier is resolved: not paying for a suppressed
+    // supplier is the whole point of the overload. Shares the sibling
+    // overloads' threshold walk rather than restating it — see the note on
+    // `native_jul_logger_log_supplier`.
+    if matches!(
+        native_jul_logger_is_loggable(ctx, args)?,
+        Some(Value::Int(0))
+    ) {
+        return Ok(None);
+    }
     // `jul_resolve_msg` may invoke Java supplier code and allocate. Keep the
     // receiver/level rooted while identifying the throwable so the later
     // record never receives an old moving-GC address.
@@ -4666,6 +5121,46 @@ pub(crate) fn native_jul_logger_log_throwable(
 /// `java/util/logging/Logger.log(Level, Supplier<String>)` — message-supplier
 /// overload with no throwable. Resolve the supplier and emit (otherwise the
 /// synthetic JUL drops it, since the real LogRecord/handler path isn't wired).
+///
+/// **Two defects fixed here, both measured 2026-08-11 against HotSpot 25.0.3
+/// with a `Handler` of the caller's own and a counting supplier.**
+///
+/// 1. *The record reached no handler.* This was the one `log` overload that
+///    wrote the console sink WITHOUT first fanning the record out to the
+///    logger's installed `Handler`s, so an application that installed one saw
+///    seven of the eight `log` overloads — right in the members with one
+///    implementation, wrong in the members with the other:
+///
+///    ```text
+///    HotSpot          [INFO:i, WARNING:w, SEVERE:s, FINE:f, INFO:L, INFO:sup]
+///    CratonVM compat  [INFO:i, WARNING:w, SEVERE:s, FINE:f, INFO:L]
+///    ```
+///
+/// 2. *The level was never consulted, so the supplier ALWAYS ran.* Measured on
+///    a logger at `FINE`, `log(Level.FINEST, supplier)` evaluated the supplier
+///    and emitted a console line; HotSpot does neither. This is the worse half:
+///    not evaluating a filtered-out supplier is the entire reason the overload
+///    exists, and a caller whose supplier has a cost (or a side effect) paid it
+///    on every suppressed call. The `(Level, String)` sibling has always gated
+///    correctly, so this was also an inconsistency inside one family.
+///
+/// Both close by routing through the two pieces that already existed rather
+/// than by growing a second implementation: [`native_jul_logger_is_loggable`]
+/// is the level gate the sibling overloads use, and [`jul_log_parameterized`]
+/// is the publish-then-fall-back-to-console path the other seven use.
+///
+/// **`Compatible`-mode effect, stated per case, because this is a
+/// Compatible-visible behaviour change.** A logger with NO handler is
+/// byte-for-byte unchanged: `jul_log_parameterized`'s console fallback formats
+/// `{tag} [{name}] {text}`, the exact string this function used to build. A
+/// logger WITH a handler now delivers the record and suppresses the duplicate
+/// console line — which is what the other seven overloads already do. A
+/// filtered-out call now emits nothing and evaluates nothing, where it used to
+/// emit a console line; that line was not HotSpot's and not the sibling
+/// overloads'.
+///
+/// Recorded in docs/known-issues/jdk-only/W7-25-jul-getlogger-regression.md;
+/// found by W7-22 §4.1, which measured the fan-out half only.
 fn native_jul_logger_log_supplier(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(o)) => *o,
@@ -4675,19 +5170,42 @@ fn native_jul_logger_log_supplier(ctx: &mut dyn NativeContext, args: &[Value]) -
         Some(Value::Object(o)) => *o,
         _ => None,
     };
+    // GATE BEFORE RESOLVING. `native_jul_logger_is_loggable` reads args[0] and
+    // args[1] and ignores the rest, so it takes this call's own args — and
+    // sharing it rather than restating the threshold walk is deliberate: that
+    // walk is 60 lines of Level-shape fallbacks (real `config.levelObject`,
+    // synthetic slot 1, the ancestor override table) and a second copy would
+    // answer differently the first time one of those shapes changed.
+    if matches!(
+        native_jul_logger_is_loggable(ctx, args)?,
+        Some(Value::Int(0))
+    ) {
+        return Ok(None);
+    }
+    // GC SAFETY: `jul_resolve_msg` INVOKES the supplier — arbitrary Java that
+    // allocates — so the receiver and the level can both move across it. Same
+    // pin/re-derive discipline as `native_jul_logger_log_throwable`, which
+    // resolves a supplier for the throwable-carrying overloads.
+    let this_pin = this.map(|o| (ctx.pin_native_root(o), o));
+    let level_pin = level_obj.map(|o| (ctx.pin_native_root(o), o));
+    let base_pin = this_pin.map(|(p, _)| p).or_else(|| level_pin.map(|(p, _)| p));
     let msg = match args.get(2) {
         Some(Value::Object(Some(o))) => jul_resolve_msg(ctx, *o),
         _ => String::new(),
     };
-    let logger_name = this
-        .and_then(|o| match ctx.get_field(o, LOGGER_FIELD_NAME) {
-            Value::Object(Some(s)) => ctx.read_string(s),
-            _ => None,
-        })
-        .unwrap_or_default();
-    let tag = jul_level_tag(ctx, level_obj);
-    crate::emit_framework_log(ctx, &format!("{tag} [{logger_name}] {msg}"));
-    Ok(None)
+    let message_obj = ctx.create_string(&msg);
+    let message_pin = ctx.pin_native_root(message_obj);
+    // `jul_resolve_msg`/`create_string` both allocate: re-derive everything.
+    let this = this_pin.map(|(pin, obj)| ctx.read_native_pin(pin, obj));
+    let level_obj = level_pin.map(|(pin, obj)| ctx.read_native_pin(pin, obj));
+    let message_obj = ctx.read_native_pin(message_pin, message_obj);
+    let result = jul_log_parameterized(ctx, this, level_obj, Some(message_obj), None, None);
+    if let Some(base) = base_pin {
+        ctx.unpin_native_roots(base);
+    } else {
+        ctx.unpin_native_roots(message_pin);
+    }
+    result
 }
 
 /// `java/util/logging/Logger.log(LogRecord)` — the overload many wrappers
@@ -4696,6 +5214,21 @@ fn native_jul_logger_log_supplier(ctx: &mut dyn NativeContext, args: &[Value]) -
 /// chain, so the record — and any THROWABLE it carries — was silently
 /// dropped, hiding errors callers log-and-swallow. Read `level`/`message`/
 /// `thrown` off the record by field name and emit.
+///
+/// **The level gate is the first statement of the real body and was missing
+/// here.** JDK 25's `Logger.log(LogRecord record)` opens with
+/// `if (!isLoggable(record.getLevel())) return;` — so a `FINEST` record handed
+/// to a logger at `INFO` is dropped, not published. Without the gate this
+/// overload was the one member of the eight-overload `log` family that
+/// published unconditionally: the same "right in the members with one
+/// implementation, wrong in the members with the other" split
+/// [`native_jul_logger_log_supplier`] documents, one overload along. It shares
+/// [`native_jul_logger_is_loggable`] rather than restating the threshold walk,
+/// for the reason stated there — that walk is 60 lines of `Level`-shape
+/// fallbacks and a second copy would drift the first time one shape changed.
+/// It reads no field the body below does not already read, and allocates
+/// nothing, so it sits above the pin/publish block.
+/// docs/known-issues/jdk-only/W7-25-jul-getlogger-regression.md §7.
 fn native_jul_logger_log_record(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(o)) => *o,
@@ -4705,6 +5238,27 @@ fn native_jul_logger_log_record(ctx: &mut dyn NativeContext, args: &[Value]) -> 
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(None),
     };
+    // The record's own level is the one to gate on — `log(LogRecord)` takes no
+    // `Level` argument, so `args` cannot be forwarded to `is_loggable` the way
+    // the `(Level, …)` overloads forward theirs. A record with no readable
+    // `level` is left alone: `is_loggable` would score it as the INFO default
+    // and could suppress a record whose level we simply failed to read.
+    // Read out of the `if let` scrutinee on purpose: a method call there keeps
+    // its receiver reborrow alive for the whole block, and the gate below needs
+    // `ctx` mutably.
+    let record_level = match ctx.get_field_by_name(rec, "level") {
+        Value::Object(Some(level)) => Some(level),
+        _ => None,
+    };
+    if let (Some(logger), Some(level)) = (this, record_level) {
+        let gate_args = [Value::Object(Some(logger)), Value::Object(Some(level))];
+        if matches!(
+            native_jul_logger_is_loggable(ctx, &gate_args)?,
+            Some(Value::Int(0))
+        ) {
+            return Ok(None);
+        }
+    }
     // Real `Logger.log(LogRecord)` fans the record out to the logger's own
     // handlers and then its ancestors'. Do that first — this is also the tail
     // of the real-JDK `throwing`/`entering` bytecode (via `doLog`), so a
@@ -6487,8 +7041,8 @@ mod tests {
         let _g = test_lock().lock().unwrap_or_else(|e| e.into_inner());
         reset_state_for_tests();
         let mut ctx = mock_ctx();
-        let logger = allocate_logger(&mut ctx, "org.example.capture");
-        let handler = alloc_concurrent_synthetic(&mut ctx, "java/util/logging/Handler", 0);
+        let logger = allocate_logger(&mut ctx, "org.example.capture").unwrap();
+        let handler = try_alloc_concurrent_synthetic(&mut ctx, "java/util/logging/Handler", 0).unwrap();
         native_jul_logger_add_handler(
             &mut ctx,
             &[Value::Object(Some(logger)), Value::Object(Some(handler))],
@@ -6503,7 +7057,7 @@ mod tests {
             Some(1)
         );
 
-        let record = alloc_concurrent_synthetic(&mut ctx, "java/util/logging/LogRecord", 5);
+        let record = try_alloc_concurrent_synthetic(&mut ctx, "java/util/logging/LogRecord", 5).unwrap();
         ctx.set_field(record, 1, Value::Long(42));
         log_record_messages()
             .lock()
@@ -6574,7 +7128,7 @@ mod tests {
         let _g = test_lock().lock().unwrap_or_else(|e| e.into_inner());
         reset_state_for_tests();
         let mut ctx = mock_ctx();
-        let log_context = ensure_jboss_log_context(&mut ctx);
+        let log_context = ensure_jboss_log_context(&mut ctx).unwrap();
         assert!(
             matches!(ctx.get_field(log_context, 0), Value::Object(Some(_))),
             "real LogContext.addCloseHandler synchronizes on treeLock"
@@ -6665,7 +7219,7 @@ mod tests {
         let _g = test_lock().lock().unwrap_or_else(|e| e.into_inner());
         reset_state_for_tests();
         let mut ctx = mock_ctx();
-        let logger = get_or_create_jboss_logger(&mut ctx, "com.example.App");
+        let logger = get_or_create_jboss_logger(&mut ctx, "com.example.App").unwrap();
         let handlers =
             match native_jboss_logger_get_handlers(&mut ctx, &[Value::Object(Some(logger))])
                 .unwrap()
@@ -6687,7 +7241,7 @@ mod tests {
             _ => panic!(),
         };
         // Build a Logger manually.
-        let logger = alloc_concurrent_synthetic(&mut ctx, CLS_JUL_LOGGER, LOGGER_NUM_FIELDS);
+        let logger = try_alloc_concurrent_synthetic(&mut ctx, CLS_JUL_LOGGER, LOGGER_NUM_FIELDS).unwrap();
         let name_obj = ctx.create_string("dup.logger");
         ctx.set_field(logger, LOGGER_FIELD_NAME, Value::Object(Some(name_obj)));
 
@@ -6777,7 +7331,7 @@ mod tests {
             "foo\tbar",
             "foo\u{0000}bar",
         ] {
-            let logger = alloc_concurrent_synthetic(&mut ctx, CLS_JUL_LOGGER, LOGGER_NUM_FIELDS);
+            let logger = try_alloc_concurrent_synthetic(&mut ctx, CLS_JUL_LOGGER, LOGGER_NUM_FIELDS).unwrap();
             let name_obj = ctx.create_string(bad);
             ctx.set_field(logger, LOGGER_FIELD_NAME, Value::Object(Some(name_obj)));
             let r = native_add_logger(
@@ -6824,8 +7378,15 @@ mod tests {
         );
     }
 
+    /// `reset()` keeps every logger and resets their CONFIGURATION.
+    ///
+    /// This test used to assert the opposite — that `reset()` empties the
+    /// registry — and passed, because the native did exactly that. HotSpot
+    /// 25 disagrees (see `native_reset`'s doc for the measurement): the name
+    /// list is byte-identical across `reset()`, and
+    /// `Logger.getLogger(name)` still answers the SAME object.
     #[test]
-    fn t19_h3_reset_clears_logger_registry_but_keeps_singleton() {
+    fn t19_h3_reset_keeps_loggers_and_resets_their_configuration() {
         let _g = test_lock().lock().unwrap_or_else(|e| e.into_inner());
         reset_state_for_tests();
         let mut ctx = mock_ctx();
@@ -6858,15 +7419,69 @@ mod tests {
                 .unwrap_or_else(|e| e.into_inner());
             let mut names: Vec<&str> = reg.keys().map(|k| k.as_str()).collect();
             names.sort_unstable();
-            assert_eq!(names, ["", "a.b.c", "d.e.f"]);
+            assert_eq!(names, ["", "a.b.c", "d.e.f", "global"]);
         }
+        // Configure two of them, so "reset the configuration" has something
+        // to reset — and configure the ROOT too, so "the root keeps a level"
+        // is distinguishable from "the root was left alone".
+        //
+        // A marker object rather than a real `Level`: this crate's mock
+        // context does not implement `static_field_index_by_name`, so
+        // `resolve_standard_level` answers `None` for every name here. A
+        // `Level.FINEST` assertion would be measuring the mock. Any object is
+        // enough for the property under test, which is that the slot is
+        // OVERWRITTEN.
+        let marker = ctx.create_string("configured-level-marker");
+        let a_before = get_or_create_logger(&mut ctx, "a.b.c").unwrap();
+        ctx.set_field(a_before, LOGGER_FIELD_LEVEL, Value::Object(Some(marker)));
+        let root_before = get_or_create_logger(&mut ctx, "").unwrap();
+        ctx.set_field(root_before, LOGGER_FIELD_LEVEL, Value::Object(Some(marker)));
+
         native_reset(&mut ctx, &[Value::Object(Some(mgr))]).unwrap();
-        assert!(
-            logger_registry(TEST_VM)
+
+        {
+            let reg = logger_registry(TEST_VM)
                 .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .is_empty(),
-            "reset() must clear the logger registry"
+                .unwrap_or_else(|e| e.into_inner());
+            let mut names: Vec<&str> = reg.keys().map(|k| k.as_str()).collect();
+            names.sort_unstable();
+            assert_eq!(
+                names,
+                ["", "a.b.c", "d.e.f", "global"],
+                "reset() must NOT drop loggers — HotSpot's name list is unchanged"
+            );
+        }
+        // Identity survives: the application's own reference is still the
+        // registry's. This is the half that made the old behaviour a silent
+        // config split rather than just a short `getLoggerNames()`.
+        let a_after = get_or_create_logger(&mut ctx, "a.b.c").unwrap();
+        assert_eq!(
+            a_before, a_after,
+            "getLogger(name) must answer the same object across reset()"
+        );
+        // A named logger's level goes back to null (inherit).
+        assert_eq!(
+            ctx.get_field(a_after, LOGGER_FIELD_LEVEL),
+            Value::Object(None),
+            "reset() sets a named logger's level to null"
+        );
+        // The root's is re-derived from `Level.INFO` rather than left as the
+        // caller set it. Both halves are asserted: it is no longer the marker
+        // (so reset() did touch the root), and it is exactly what
+        // `resolve_standard_level("INFO")` yields on this context — which is
+        // the same expression `native_reset` uses, so the row stays true on a
+        // real VM where that resolves to the actual `Level.INFO` singleton.
+        let root_after = get_or_create_logger(&mut ctx, "").unwrap();
+        let root_level = ctx.get_field(root_after, LOGGER_FIELD_LEVEL);
+        assert_ne!(
+            root_level,
+            Value::Object(Some(marker)),
+            "reset() must re-derive the root logger's level, not leave it configured"
+        );
+        assert_eq!(
+            root_level,
+            Value::Object(resolve_standard_level(&mut ctx, "INFO")),
+            "reset() sets the root logger's level from Level.INFO"
         );
         // Singleton identity preserved.
         let again = match native_get_log_manager(&mut ctx, &[]).unwrap().unwrap() {
@@ -6924,11 +7539,18 @@ mod tests {
         // and real `LogManager.getLoggerNames()` likewise always enumerates
         // the root. These three names have no dots, so "" is the only
         // ancestor added.
+        //
+        // `global` is present because `getLogManager()` registers it, which is
+        // what the JDK does — `LogManager.ensureLogManagerInitialized` adds
+        // both the root and `Logger.global`. Measured on HotSpot 25: a fresh
+        // manager enumerates `[, global]`, and this set enumerates
+        // `[, bar, baz, foo, global]`.
         let mut expected = vec![
             String::new(),
             "bar".to_string(),
             "baz".to_string(),
             "foo".to_string(),
+            "global".to_string(),
         ];
         expected.sort();
         assert_eq!(observed, expected);
@@ -6980,11 +7602,22 @@ mod tests {
             l1, l2,
             "bad names must not be cached (each call allocates a throw-away Logger)"
         );
-        // Registry untouched.
-        assert!(logger_registry(TEST_VM)
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .is_empty());
+        // Registry untouched — it still holds exactly what `getLogManager()`
+        // put there (the root and `global`, as the JDK does), and the rejected
+        // name was not added under any spelling.
+        //
+        // Asserting the CONTENTS rather than `is_empty()` is what keeps this
+        // test meaning what it says now that `getLogManager()` registers
+        // `global`: an emptiness check would have had to be RELAXED to keep
+        // passing, while this one gets stricter.
+        {
+            let reg = logger_registry(TEST_VM)
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let mut names: Vec<&str> = reg.keys().map(|k| k.as_str()).collect();
+            names.sort_unstable();
+            assert_eq!(names, ["", "global"]);
+        }
     }
 
     #[test]
@@ -7191,9 +7824,9 @@ mod tests {
         .unwrap();
         let _ = ensure_jboss_log_context(&mut ctx);
         let recv =
-            alloc_concurrent_synthetic(&mut ctx, "org/jboss/logmanager/Logger", LOGGER_NUM_FIELDS);
-        let key = alloc_concurrent_synthetic(&mut ctx, "java/lang/Object", 1);
-        let val = alloc_concurrent_synthetic(&mut ctx, "java/lang/Object", 1);
+            try_alloc_concurrent_synthetic(&mut ctx, "org/jboss/logmanager/Logger", LOGGER_NUM_FIELDS).unwrap();
+        let key = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/Object", 1).unwrap();
+        let val = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/Object", 1).unwrap();
         let _ = native_jboss_logger_attach(
             &mut ctx,
             &[
@@ -7243,9 +7876,9 @@ mod tests {
         .unwrap();
         let _ = ensure_jboss_log_context(&mut ctx);
         let recv =
-            alloc_concurrent_synthetic(&mut ctx, "org/jboss/logmanager/Logger", LOGGER_NUM_FIELDS);
-        let key = alloc_concurrent_synthetic(&mut ctx, "java/lang/Object", 1);
-        let val = alloc_concurrent_synthetic(&mut ctx, "java/lang/Object", 1);
+            try_alloc_concurrent_synthetic(&mut ctx, "org/jboss/logmanager/Logger", LOGGER_NUM_FIELDS).unwrap();
+        let key = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/Object", 1).unwrap();
+        let val = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/Object", 1).unwrap();
         let _ = native_jboss_logger_attach(
             &mut ctx,
             &[

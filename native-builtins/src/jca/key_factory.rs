@@ -57,7 +57,7 @@ use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
 use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError};
 use cratonvm_types::{ArrayElementType, ClassId, ObjectRef, Value};
 
-use crate::alloc_concurrent_synthetic;
+use crate::try_alloc_concurrent_synthetic;
 use crate::crypto_impl;
 
 const ALGO_RSA: i32 = 6;
@@ -1444,6 +1444,21 @@ fn kf_algo_idx(name: &str) -> i32 {
     }
 }
 
+/// Whether `KeyFactory.getInstance` will hand back a receiver for `name` —
+/// `kf_get_instance` throws `NoSuchAlgorithmException` on a negative index.
+///
+/// Exposed for `provider_chain`'s
+/// `every_advertised_key_factory_name_is_serviceable` ratchet, which owns the
+/// seed lists this has to stay equal to. The `ML-DSA` UMBRELLA name was
+/// advertised by the `SUN` `KeyFactory` seed and refused here for several
+/// waves — while `signature::algo_idx` carried the same umbrella arm, so two
+/// engines disagreed about one name. De-advertising it for `KeyFactory` only,
+/// and pinning the pair with that test, is what closed it.
+/// W7-63-jca-advertise-vs-serve.md.
+pub(crate) fn get_instance_offers(name: &str) -> bool {
+    kf_algo_idx(name) >= 0
+}
+
 fn alloc_byte_array(ctx: &mut dyn NativeContext, bytes: &[u8]) -> ObjectRef {
     let arr = ctx.new_array(ArrayElementType::Byte, bytes.len());
     for (i, &b) in bytes.iter().enumerate() {
@@ -1470,15 +1485,15 @@ fn alloc_public_key(
     bits: i32,
     der: &[u8],
     key_id: u64,
-) -> ObjectRef {
-    let obj = alloc_concurrent_synthetic(ctx, "java/security/PublicKey", 5);
+) -> Result<ObjectRef, MethodCallFailed> {
+    let obj = try_alloc_concurrent_synthetic(ctx, "java/security/PublicKey", 5)?;
     ctx.set_field(obj, KEY_FIELD_ALGO, Value::Int(algo));
     ctx.set_field(obj, KEY_FIELD_BITS, Value::Int(bits));
     ctx.set_field(obj, KEY_FIELD_ENCLEN, Value::Int(der.len() as i32));
     ctx.set_field(obj, KEY_FIELD_KEYID, Value::Long(key_id as i64));
     let arr = alloc_byte_array(ctx, der);
     ctx.set_field(obj, KEY_FIELD_DER, Value::Object(Some(arr)));
-    obj
+    Ok(obj)
 }
 
 fn alloc_private_key(
@@ -1487,22 +1502,22 @@ fn alloc_private_key(
     bits: i32,
     der: &[u8],
     key_id: u64,
-) -> ObjectRef {
-    let obj = alloc_concurrent_synthetic(ctx, "java/security/PrivateKey", 5);
+) -> Result<ObjectRef, MethodCallFailed> {
+    let obj = try_alloc_concurrent_synthetic(ctx, "java/security/PrivateKey", 5)?;
     ctx.set_field(obj, KEY_FIELD_ALGO, Value::Int(algo));
     ctx.set_field(obj, KEY_FIELD_BITS, Value::Int(bits));
     ctx.set_field(obj, KEY_FIELD_ENCLEN, Value::Int(der.len() as i32));
     ctx.set_field(obj, KEY_FIELD_KEYID, Value::Long(key_id as i64));
     let arr = alloc_byte_array(ctx, der);
     ctx.set_field(obj, KEY_FIELD_DER, Value::Object(Some(arr)));
-    obj
+    Ok(obj)
 }
 
-fn alloc_keypair(ctx: &mut dyn NativeContext, pubk: ObjectRef, privk: ObjectRef) -> ObjectRef {
-    let kp = alloc_concurrent_synthetic(ctx, "java/security/KeyPair", 2);
+fn alloc_keypair(ctx: &mut dyn NativeContext, pubk: ObjectRef, privk: ObjectRef) -> Result<ObjectRef, MethodCallFailed> {
+    let kp = try_alloc_concurrent_synthetic(ctx, "java/security/KeyPair", 2)?;
     ctx.set_field(kp, 0, Value::Object(Some(pubk)));
     ctx.set_field(kp, 1, Value::Object(Some(privk)));
-    kp
+    Ok(kp)
 }
 
 /// Construct and throw a real JCA exception of `class_name` (internal form,
@@ -1689,11 +1704,11 @@ fn kpg_get_instance(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
 
     let is_bc = is_bc_provider(&provider_name);
     let base = synthetic_base_offset(ctx, "java/security/KeyPairGenerator");
-    let kpg = alloc_concurrent_synthetic(
+    let kpg = try_alloc_concurrent_synthetic(
         ctx,
         "java/security/KeyPairGenerator",
         base + KPG_PRIVATE_SLOTS,
-    );
+    )?;
     // SigProbe fix: the JDK 25 `KeyPairGenerator` class declares
     // `String algorithm` at the inherited `KeyPairGeneratorSpi` layout
     // boundary. The side table (keyed on the receiver ObjectRef) carries
@@ -1875,8 +1890,8 @@ fn kpg_generate_key_pair(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         let pub_obj = alloc_public_key(ctx, ALGO_RSA, bits as i32, &pk_der, key_id);
         let priv_obj = alloc_private_key(ctx, ALGO_RSA, bits as i32, &sk_der, key_id);
         return Ok(Some(Value::Object(Some(alloc_keypair(
-            ctx, pub_obj, priv_obj,
-        )))));
+            ctx, pub_obj?, priv_obj?,
+        )?))));
     }
 
     if algo == ALGO_EC {
@@ -1904,8 +1919,8 @@ fn kpg_generate_key_pair(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         let pub_obj = alloc_public_key(ctx, ALGO_EC, 256, &pk_der, key_id);
         let priv_obj = alloc_private_key(ctx, ALGO_EC, 256, &sk_bytes, key_id);
         return Ok(Some(Value::Object(Some(alloc_keypair(
-            ctx, pub_obj, priv_obj,
-        )))));
+            ctx, pub_obj?, priv_obj?,
+        )?))));
     }
 
     if algo == ALGO_DSA && crate::route_dsa_to_real() {
@@ -1986,7 +2001,7 @@ fn kf_get_instance(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
         ));
     }
     let base = synthetic_base_offset(ctx, "java/security/KeyFactory");
-    let kf = alloc_concurrent_synthetic(ctx, "java/security/KeyFactory", base + KF_PRIVATE_SLOTS);
+    let kf = try_alloc_concurrent_synthetic(ctx, "java/security/KeyFactory", base + KF_PRIVATE_SLOTS)?;
     set_kf_algo(ctx, kf, idx);
     ctx.set_field(kf, base + KF_OFF_ALGO, Value::Int(idx));
     Ok(Some(Value::Object(Some(kf))))
@@ -2186,7 +2201,7 @@ fn kf_generate_public(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
             }
             return Ok(Some(Value::Object(Some(alloc_public_key(
                 ctx, ALGO_RSA, 2048, &pk_der, key_id,
-            )))));
+            )?))));
         }
     }
     if algo == ALGO_EC {
@@ -2204,7 +2219,7 @@ fn kf_generate_public(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
             );
             return Ok(Some(Value::Object(Some(alloc_public_key(
                 ctx, ALGO_EC, 256, &pk_der, key_id,
-            )))));
+            )?))));
         }
     }
 
@@ -2979,12 +2994,6 @@ pub fn register(r: &mut NativeMethodRegistry) {
     // <clinit> shim for sun.security.jca.GetInstance — the bytecode-side
     // helper that throws our NPE.  No-opping is safe because we never
     // dispatch into this class once getInstance() is intercepted.
-    r.register(
-        "sun/security/jca/GetInstance",
-        "<clinit>",
-        "()V",
-        clinit_noop,
-    );
     r.register("sun/security/jca/JCAUtil", "<clinit>", "()V", clinit_noop);
 
     // Signature also goes through `Signature.<clinit>` -> Debug; shim it
@@ -3125,7 +3134,7 @@ mod tests {
             let der = pkcs8_stub(oid);
             let arr = alloc_byte_array(&mut ctx, &der);
             let spec =
-                alloc_concurrent_synthetic(&mut ctx, "java/security/spec/PKCS8EncodedKeySpec", 1);
+                try_alloc_concurrent_synthetic(&mut ctx, "java/security/spec/PKCS8EncodedKeySpec", 1).unwrap();
             ctx.set_field(spec, 0, Value::Object(Some(arr)));
             let generic = if expected == ALGO_X25519 || expected == ALGO_X448 {
                 ALGO_XDH_GENERIC
@@ -3142,7 +3151,7 @@ mod tests {
         let mut ctx = crate::test_utils::MockNativeContext::new();
         let arr = alloc_byte_array(&mut ctx, &[]);
         let spec =
-            alloc_concurrent_synthetic(&mut ctx, "java/security/spec/PKCS8EncodedKeySpec", 1);
+            try_alloc_concurrent_synthetic(&mut ctx, "java/security/spec/PKCS8EncodedKeySpec", 1).unwrap();
         ctx.set_field(spec, 0, Value::Object(Some(arr)));
         assert_eq!(
             resolve_curve_algo(&mut ctx, ALGO_ED25519, spec, true),
@@ -3181,7 +3190,7 @@ mod tests {
         };
         let store_id = crate::keystore::keystore_register(store);
         let mut ctx = crate::test_utils::MockNativeContext::new();
-        let key = alloc_concurrent_synthetic(&mut ctx, "java/security/PrivateKey", 4);
+        let key = try_alloc_concurrent_synthetic(&mut ctx, "java/security/PrivateKey", 4).unwrap();
         let alias_hash = alias.as_bytes().iter().fold(0x811c_9dc5_u32, |hash, byte| {
             (hash ^ u32::from(*byte)).wrapping_mul(0x0100_0193)
         });
@@ -3332,7 +3341,7 @@ mod tests {
             Value::Object(Some(o)) => o,
             other => panic!("expected KeyFactory, got {other:?}"),
         };
-        let spec = alloc_concurrent_synthetic(ctx, "java/security/spec/X509EncodedKeySpec", 1);
+        let spec = try_alloc_concurrent_synthetic(ctx, "java/security/spec/X509EncodedKeySpec", 1)?;
         let der_arr = alloc_byte_array(ctx, der);
         ctx.set_field(spec, 0, Value::Object(Some(der_arr)));
         method(

@@ -235,7 +235,7 @@ fn loaded_class_for_requesting_loader(
             }
             None
         }
-        ClassLoaderId::UserDefined(_) => {
+        ClassLoaderId::UserDefined(ns) => {
             if user_own_first {
                 if let Some(id) = loaded_classes_probe(map, requesting_loader, name) {
                     return Some(id);
@@ -249,7 +249,28 @@ fn loaded_class_for_requesting_loader(
             if let Some(id) = loaded_class_via_parent_chain(map, requesting_loader, name) {
                 return Some(id);
             }
-            for loader_id in BUILTIN_LOADER_DELEGATION_CHAIN {
+            // The built-in chain this loader's delegation may reach is
+            // bounded by its OWN recorded terminal parent, not always the
+            // whole chain. A `ModifiedClassPathClassLoader` (parent =
+            // platform/Extension, specifically to exclude Application — e.g.
+            // Spring's `@ClassPathExclusions`) must stop at Extension: probing
+            // Application anyway resolves a same-named class through the
+            // wrong loader, which is how a `PropertiesPropertySource` built
+            // by isolated-loader code ended up an `Application`-loaded
+            // instance while its own compiled `checkcast` site (correctly)
+            // named the isolated loader's `EnumerablePropertySource` —
+            // `ClassCastException` between two genuinely different classes.
+            // `None` (parent unrecorded, or the chain did not bottom out) is
+            // the permissive default: probe every built-in loader, as before.
+            let reachable: &[ClassLoaderId] =
+                match crate::loaders::user_loader_builtin_parent(ns) {
+                    Some(terminal) => {
+                        let end = (terminal as usize + 1).min(BUILTIN_LOADER_DELEGATION_CHAIN.len());
+                        &BUILTIN_LOADER_DELEGATION_CHAIN[..end]
+                    }
+                    None => BUILTIN_LOADER_DELEGATION_CHAIN,
+                };
+            for loader_id in reachable {
                 if let Some(id) = loaded_classes_probe(map, *loader_id, name) {
                     return Some(id);
                 }
@@ -1864,7 +1885,7 @@ pub struct RedefineOptions {
 /// *loaded* class store the same question and therefore answers only for classes
 /// the run happened to touch. See
 /// [`ClassManager::adjudicate_natives_against_image`] for why both exist.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ImageMethodVerdict {
     /// The class path (CDS, then bootstrap, extension, application) yields bytes
     /// for this name. `false` means the image has no such class — which for a
@@ -1880,7 +1901,99 @@ pub struct ImageMethodVerdict {
     /// attribute, so a lazy-attribute decode state cannot masquerade as a fact
     /// about the class.
     pub has_code: bool,
+    /// The SUPERTYPE that declares this method, when the named class does not.
+    ///
+    /// `declared: false` used to be the whole answer, and reading it as "this
+    /// registration targets nothing" is wrong for three quarters of the bucket.
+    /// CratonVM's dispatch is receiver-driven: a native registered on
+    /// `sun/nio/ch/FileDispatcherImpl.read0` intercepts a receiver of that class
+    /// even though `read0` is declared a frame up on `UnixFileDispatcherImpl`.
+    /// Nineteen such rows are `ACC_NATIVE` on a supertype — genuine §1.5 bridges
+    /// the census used to score as unadjudicated — and roughly 1,600 more
+    /// inherit concrete bytecode, i.e. are §1.4 shadows no `has_code` column
+    /// could see.
+    ///
+    /// `None` means either "the named class declares it" (read `declared`) or
+    /// "no class in the hierarchy does". The three `inherited_*` flags are false
+    /// in both of those cases, so a reader never has to tell them apart to
+    /// score a row.
+    ///
+    /// Resolution order is JVMS §5.4.3.3: the class, then its superclass chain,
+    /// then its superinterfaces. That is also CratonVM's dispatch order, which
+    /// is what makes the answer a statement about what would actually run.
+    pub inherited_from: Option<Arc<str>>,
+    /// The inherited declaration is `ACC_NATIVE`. A `Bridge` row with this set
+    /// is correctly stated — contract §1.5's target exists, on a supertype.
+    pub inherited_acc_native: bool,
+    /// The inherited declaration carries `Code`: a §1.4 shadow of INHERITED
+    /// bytecode.
+    pub inherited_has_code: bool,
+    /// The inherited declaration is abstract, so the registration intercepts
+    /// every implementor rather than shadowing anything.
+    pub inherited_abstract: bool,
 }
+
+impl ImageMethodVerdict {
+    /// "Some class in the hierarchy declares this triple `ACC_NATIVE`" — the
+    /// contract §1.5 question, asked of the whole hierarchy rather than of one
+    /// class name. Every gate that scores a `Bridge` row should ask this and not
+    /// [`Self::acc_native`]; the difference is the nineteen rows the census used
+    /// to miscount in the dangerous direction.
+    pub fn acc_native_anywhere(&self) -> bool {
+        self.acc_native || self.inherited_acc_native
+    }
+
+    /// "Some class in the hierarchy declares this triple with a `Code`
+    /// attribute" — the §1.4 shadow question over the whole hierarchy.
+    pub fn has_code_anywhere(&self) -> bool {
+        self.has_code || self.inherited_has_code
+    }
+
+    /// The verdict for a class the image does not have at all.
+    fn absent() -> Self {
+        Self {
+            image_has_class: false,
+            declared: false,
+            acc_native: false,
+            has_code: false,
+            inherited_from: None,
+            inherited_acc_native: false,
+            inherited_has_code: false,
+            inherited_abstract: false,
+        }
+    }
+}
+
+/// One image class, reduced to what the native adjudication has to ask of it.
+///
+/// Parsed once per DISTINCT registered class (the registry has thousands of
+/// rows over roughly a thousand classes) and then re-read once per row and once
+/// per hierarchy walk that passes through it.
+#[derive(Default)]
+struct ImageClassShape {
+    /// `(name, descriptor) -> (acc_native, has_code)`.
+    methods: FxHashMap<(Arc<str>, Arc<str>), (bool, bool)>,
+    super_class: Option<Arc<str>>,
+    interfaces: Vec<Arc<str>>,
+}
+
+impl ImageClassShape {
+    fn find(&self, name: &str, descriptor: &str) -> Option<(bool, bool)> {
+        self.methods
+            .iter()
+            .find(|((n, d), _)| &**n == name && &**d == descriptor)
+            .map(|(_, flags)| *flags)
+    }
+}
+
+/// How deep [`ClassManager::adjudicate_natives_against_image`] walks before it
+/// gives up on a hierarchy.
+///
+/// A malformed image could describe a cycle, and this pass runs on a diagnostic
+/// path where a hang is far worse than an unresolved row. The deepest chain in
+/// JDK 25's `java.base` is under a dozen; 64 is past anything real and still
+/// bounded.
+const IMAGE_HIERARCHY_MAX_DEPTH: usize = 64;
 
 /// Manages class loading for the VM.
 ///
@@ -2173,6 +2286,14 @@ pub struct ClassManager {
     /// to [`CompatibilityMode::Compatible`], which is today's behaviour
     /// byte-for-byte.
     compatibility_mode: CompatibilityMode,
+
+    /// `-Xverify:all` — verify every class strictly, boot image included.
+    ///
+    /// A field for the same reason `compatibility_mode` is: verification policy
+    /// is per-VM, and two VMs in one process must be able to differ. Defaults
+    /// to `false`, which is `-Xverify:remote` — HotSpot's default and today's
+    /// behaviour byte-for-byte. See [`Self::set_strict_verification`].
+    strict_verification: bool,
 
     /// Class-fabrication violations recorded this run, in first-observation
     /// order.
@@ -2684,6 +2805,9 @@ impl ClassManager {
             // (`--jdk-only`), never inferred from a build feature or a stray
             // env var — see contract §6.
             compatibility_mode: CompatibilityMode::Compatible,
+            // `-Xverify:remote`, HotSpot's default. `vm_init` raises it to
+            // `all` when the launcher was given `-Xverify:all`.
+            strict_verification: false,
             origin_violations: Vec::new(),
             origin_violations_seen: FxHashSet::default(),
             origin_requesters: FxHashMap::default(),
@@ -2777,6 +2901,36 @@ impl ClassManager {
     /// The compatibility policy in force for this manager.
     pub fn compatibility_mode(&self) -> CompatibilityMode {
         self.compatibility_mode
+    }
+
+    /// Install `-Xverify:all` — verify EVERY class strictly, including the
+    /// bootstrap image and classes from user-defined loaders.
+    ///
+    /// Call once at VM init before any class is loaded, exactly like
+    /// [`Self::set_compatibility_mode`]; `vm_init` propagates
+    /// `VmConfig::xverify_mode` here. Per-manager rather than process-global so
+    /// two VMs in one process can run under different verification policies.
+    ///
+    /// Three things change when this is on, all of them "stop taking a
+    /// shortcut":
+    ///
+    /// * `class_is_bootstrap_trusted` stops earning the lenient branch-target
+    ///   path, so the JDK image is checked against the spec-literal rule
+    ///   (`bytecode_verifier::verify_bytecode_strict`, which until now had no
+    ///   production caller at all despite being documented as this flag's entry
+    ///   point);
+    /// * `defer_loader_sensitive_pass3` stops deferring the Pass-3 type-state
+    ///   verdict for user-loader classes — i.e. for every Spring / Tomcat / H2
+    ///   application class;
+    /// * `vm_util::verifier_skip_eligible` stops skipping link-time Pass 2 for
+    ///   bootstrap classes.
+    pub fn set_strict_verification(&mut self, strict: bool) {
+        self.strict_verification = strict;
+    }
+
+    /// Whether `-Xverify:all` is in force for this manager.
+    pub fn strict_verification(&self) -> bool {
+        self.strict_verification
     }
 
     /// The `--dump-class-origins` census: one row per class currently in the
@@ -3388,104 +3542,73 @@ impl ClassManager {
         }]
     }
 
-    /// Register a minimal synthetic class with the given name and field count.
+    /// Register a minimal synthetic class with the given name and field count —
+    /// the **compatibility stand-in** entry point, and the only one.
     ///
     /// If a class with this name is already loaded, returns its existing
     /// ClassId. Otherwise allocates a new ClassId, creates a minimal
     /// `Class` struct, and registers it in the class store.
     ///
-    /// Used by the VM bootstrap to create shim classes (e.g.
-    /// `java/io/PrintStream` for System.out) that dispatch through
-    /// native registrations rather than real JDK bytecode.
-    ///
     /// Prefer real `.class` files for application-visible types; see `docs/jvm-no-synthetic-stubs.md`.
-    ///
-    /// # JDK-only mode
-    ///
-    /// This entry point **records** a `CompatibilityClassRequested` violation
-    /// but fabricates anyway, even under [`CompatibilityMode::JdkOnly`]. That
-    /// is deliberate and temporary.
-    ///
-    // JDK-ONLY-WAVE2: `ensure_synthetic_class` returns a bare `ClassId` — there
-    // is no error channel — and it has ~70 callers across ~33 files, almost all
-    // of them inside `native-builtins` allocation helpers such as
-    // `alloc_concurrent_synthetic`, which likewise return a value rather than a
-    // `Result`. Making this signature fallible in wave 1 would mean rewriting
-    // every one of those call chains in the same change as the policy itself,
-    // in files owned by other agents. So wave 1 measures here and enforces at
-    // the other end: `load_class` → `create_synthetic_stub` is where classes
-    // that genuinely have no bytes anywhere arrive, and that path *does*
-    // refuse. Migration recipe for wave 2, per call site:
-    //   1. If the caller is generating a legitimate VM class (a lambda, a
-    //      proxy, a reflection accessor, an internal allocation shape), switch
-    //      it to [`Self::ensure_generated_class`] with the matching
-    //      [`ClassOrigin`] — it is never refused, in either mode.
-    //   2. If the caller is standing in for a class whose real bytes should
-    //      have been found, switch it to [`Self::try_ensure_synthetic_class`]
-    //      and propagate the `ClassNotFoundException` up through the native's
-    //      own error path.
-    //   3. When no caller remains, delete this method.
-    ///
-    /// # Behaviour when the name is ambiguous
-    ///
-    /// This signature cannot report a failure, and the one failure it can now
-    /// meet is a name that two or more **distinct** classes already carry (see
-    /// [`Self::classify_loaded_name`]). Fabricating for such a name is the
-    /// defect this method is being retired for: the stub lands under
-    /// `(Bootstrap, name)`, the bootstrap loader is probed first, and the stub
-    /// therefore outranks *every* real class that made the name ambiguous.
-    ///
-    /// So the ambiguous case does **not** mint a stub under `name`. It returns
-    /// an [`Self::ambiguity_stand_in`] instead: a distinctly-named,
-    /// correctly-sized `cratonvm/synthetic/AmbiguousName$…` class registered
-    /// under a name nothing else resolves. The caller gets a `ClassId` it can
-    /// allocate against without corrupting the heap, the real classes keep
-    /// resolving, and any `checkcast` / `instanceof` / method lookup against
-    /// the *requested* name fails — loudly, and naming the stand-in. That is a
-    /// refusal wearing an infallible signature; a caller that can do better
-    /// should use [`Self::try_ensure_synthetic_class`], which says so in a
-    /// `Result`.
-    #[track_caller]
-    pub fn ensure_synthetic_class(&mut self, name: &str, num_fields: usize) -> ClassId {
-        let fabricated = self.fabricate_class(
-            name,
-            num_fields,
-            fabricated_origin_for_name(name),
-            // Record the `--jdk-only` violation, then fabricate anyway — there
-            // is no error channel on this signature. NOTE: `enforce` governs
-            // only the jdk-only refusal. The ambiguity refusal added below is
-            // unconditional (it is a correctness gate, not a policy one), so an
-            // `Err` can still arrive here, and `.expect`ing it would turn a
-            // recoverable identity conflict into a VM abort.
-            false,
-        );
-        match fabricated {
-            Ok(id) => id,
-            Err(_) => self.ambiguity_stand_in(name, num_fields),
-        }
-    }
-
-    /// The enforcing sibling of [`Self::ensure_synthetic_class`].
     ///
     /// Under [`CompatibilityMode::JdkOnly`] this refuses to fabricate and
     /// returns `ClassNotFoundException`, recording a
     /// [`JdkOnlyViolation::CompatibilityClassRequested`]. Under
-    /// [`CompatibilityMode::Compatible`] it behaves exactly like
-    /// `ensure_synthetic_class`.
+    /// [`CompatibilityMode::Compatible`] it fabricates, exactly as the VM
+    /// always has.
     ///
-    /// This is the entry point for compatibility stand-ins whose caller *can*
-    /// report a failure — chiefly the `java/util/function/Function$Identity`
-    /// stand-in minted by the stream/function natives.
+    /// # The infallible twin is GONE — JDK-only wave 2, step 3, 2026-08-10
+    ///
+    /// `ensure_synthetic_class` returned a bare `ClassId`, passed `enforce:
+    /// false`, and so **recorded** the `CompatibilityClassRequested` violation
+    /// and then fabricated anyway. A `--jdk-only` run therefore reported a
+    /// violation while continuing in the exact state contract §5 forbids, and
+    /// no signature in the chain could say otherwise. Wave 1 measured here and
+    /// enforced only at the other end (`load_class` → `create_synthetic_stub`);
+    /// wave 2 migrated the call sites and the three allocation funnels
+    /// (`native-collections::alloc_synthetic`, `native-io::alloc_synthetic`,
+    /// `native-builtins::alloc_concurrent_synthetic`, ~2,300 callers between
+    /// them); step 3 deleted the entry point.
+    ///
+    /// Each surviving caller took one of three shapes, and the shape is the
+    /// decision — a grep of the call name never was:
+    ///
+    ///   1. **A legitimately-generated VM class** (a lambda, a proxy or its
+    ///      `Proxy$Instance` superclass, a reflection accessor, an array
+    ///      shape): [`Self::ensure_generated_class`] with the matching
+    ///      [`ClassOrigin`]. Never refused, in either mode, per contract §1
+    ///      item 6. Natives reach it as
+    ///      `NativeContext::ensure_vm_internal_class`.
+    ///   2. **A stand-in for a class whose real bytes should have been found**:
+    ///      this method, with the refusal propagated up the native's own error
+    ///      path. `native_api::refusal_to_java_failure` turns it into the
+    ///      catchable `NoClassDefFoundError` §5 asks for rather than the
+    ///      uncatchable `MethodCallFailed::InternalError` a bare `?` produces.
+    ///   3. **A caller with no error channel at all** — the VM bootstrap block,
+    ///      a JNI entry point, a `-> Option<..>` helper. Those absorb the
+    ///      refusal at a site that says so and warns, naming the class:
+    ///      `vm_init::ensure_bootstrap_compat_class` and
+    ///      `jni::jni_class_or_refuse` are the two shapes.
+    ///
+    /// # Behaviour when the name is ambiguous
+    ///
+    /// A name that two or more **distinct** classes already carry (see
+    /// [`Self::classify_loaded_name`]) is refused in **both** modes, and that
+    /// is a correctness gate rather than a policy one. Fabricating for such a
+    /// name is the second defect the deleted twin carried: the stub lands under
+    /// `(Bootstrap, name)`, the bootstrap loader is probed first, and the stub
+    /// therefore outranks *every* real class that made the name ambiguous.
+    /// A caller that genuinely has no error channel and must allocate something
+    /// can ask [`Self::ambiguity_stand_in`] for a distinctly-named,
+    /// correctly-sized `cratonvm/synthetic/AmbiguousName$…` class: the heap
+    /// stays well-formed, the real classes keep resolving, and any `checkcast`
+    /// / `instanceof` / method lookup against the *requested* name fails
+    /// loudly, naming the stand-in.
     ///
     /// # Two distinct refusals
     ///
     /// 1. **Policy** — `--jdk-only` forbids compatibility stand-ins at all.
     ///    `ClassFileError::ClassNotFound`. Only under `JdkOnly`.
-    ///    *Migrating a call site from [`Self::ensure_synthetic_class`] to this
-    ///    method therefore also opts that call site into `--jdk-only`
-    ///    enforcement — which is step 2 of the wave-2 recipe above, but it is a
-    ///    second behaviour change riding along with the first, and under the
-    ///    default `Compatible` mode it changes nothing.*
     /// 2. **Identity** — the name is already carried by two or more distinct
     ///    classes, so a stand-in filed under `(Bootstrap, name)` would shadow
     ///    all of them. `LinkageError::IncompatibleClassChangeError`, in **both**
@@ -4826,59 +4949,158 @@ impl ClassManager {
         &self,
         triples: &[(String, String, String)],
     ) -> Vec<ImageMethodVerdict> {
-        use std::collections::hash_map::Entry;
-
-        // class name -> (present, methods it declares). `None` for the map
-        // means "bytes absent"; parsing failure yields an empty method set.
-        let mut parsed: FxHashMap<String, Option<FxHashMap<(Arc<str>, Arc<str>), (bool, bool)>>> =
-            FxHashMap::default();
+        let mut parsed: FxHashMap<String, Option<ImageClassShape>> = FxHashMap::default();
 
         triples
             .iter()
             .map(|(class, name, descriptor)| {
-                let entry = match parsed.entry(class.clone()) {
-                    Entry::Occupied(e) => e.into_mut(),
-                    Entry::Vacant(v) => {
-                        let decoded = self.find_class_bytes_delegated(class).ok().map(|(bytes, _)| {
-                            match cratonvm_reader::class_reader::read_class(&bytes) {
-                                Ok(cf) => cf
-                                    .methods
-                                    .iter()
-                                    .map(|m| {
-                                        (
-                                            (m.name.clone(), m.descriptor.clone()),
-                                            (m.is_native(), !m.is_native() && !m.is_abstract()),
-                                        )
-                                    })
-                                    .collect(),
-                                Err(_) => FxHashMap::default(),
-                            }
-                        });
-                        v.insert(decoded)
-                    }
+                let Some(shape) = self.image_class_shape(&mut parsed, class) else {
+                    return ImageMethodVerdict::absent();
                 };
-                match entry {
-                    None => ImageMethodVerdict {
-                        image_has_class: false,
+                if let Some((acc_native, has_code)) = shape.find(name, descriptor) {
+                    return ImageMethodVerdict {
+                        image_has_class: true,
+                        declared: true,
+                        acc_native,
+                        has_code,
+                        inherited_from: None,
+                        inherited_acc_native: false,
+                        inherited_has_code: false,
+                        inherited_abstract: false,
+                    };
+                }
+                // Not declared here. Ask the hierarchy, in the order both JVMS
+                // §5.4.3.3 and CratonVM's dispatch use: superclass chain, then
+                // superinterfaces.
+                let inherited = self.resolve_in_image_hierarchy(&mut parsed, class, name, descriptor);
+                match inherited {
+                    Some((declarer, acc_native, has_code)) => ImageMethodVerdict {
+                        image_has_class: true,
                         declared: false,
                         acc_native: false,
                         has_code: false,
+                        inherited_acc_native: acc_native,
+                        inherited_has_code: has_code,
+                        inherited_abstract: !acc_native && !has_code,
+                        inherited_from: Some(declarer),
                     },
-                    Some(methods) => {
-                        let found = methods
-                            .iter()
-                            .find(|((n, d), _)| &**n == name.as_str() && &**d == descriptor.as_str())
-                            .map(|(_, flags)| *flags);
-                        ImageMethodVerdict {
-                            image_has_class: true,
-                            declared: found.is_some(),
-                            acc_native: found.is_some_and(|(is_native, _)| is_native),
-                            has_code: found.is_some_and(|(_, has_code)| has_code),
-                        }
-                    }
+                    None => ImageMethodVerdict {
+                        image_has_class: true,
+                        declared: false,
+                        acc_native: false,
+                        has_code: false,
+                        inherited_from: None,
+                        inherited_acc_native: false,
+                        inherited_has_code: false,
+                        inherited_abstract: false,
+                    },
                 }
             })
             .collect()
+    }
+
+    /// Parse `class`'s image bytes once and memoise the shape the adjudication
+    /// needs. `None` means the image has no bytes for the name; a parse failure
+    /// yields a shape with no methods and no supertypes, which is deliberately
+    /// indistinguishable from "declares nothing and extends nothing" — both mean
+    /// "the image gives this registration no target", the only question asked.
+    fn image_class_shape<'a>(
+        &self,
+        parsed: &'a mut FxHashMap<String, Option<ImageClassShape>>,
+        class: &str,
+    ) -> Option<&'a ImageClassShape> {
+        use std::collections::hash_map::Entry;
+        let entry = match parsed.entry(class.to_string()) {
+            Entry::Occupied(e) => e.into_mut(),
+            Entry::Vacant(v) => {
+                let decoded = self.find_class_bytes_delegated(class).ok().map(|(bytes, _)| {
+                    match cratonvm_reader::class_reader::read_class(&bytes) {
+                        Ok(cf) => ImageClassShape {
+                            methods: cf
+                                .methods
+                                .iter()
+                                .map(|m| {
+                                    (
+                                        (m.name.clone(), m.descriptor.clone()),
+                                        (m.is_native(), !m.is_native() && !m.is_abstract()),
+                                    )
+                                })
+                                .collect(),
+                            super_class: cf.super_class.clone(),
+                            interfaces: cf.interfaces.clone(),
+                        },
+                        Err(_) => ImageClassShape::default(),
+                    }
+                });
+                v.insert(decoded)
+            }
+        };
+        entry.as_ref()
+    }
+
+    /// Find the SUPERTYPE declaration of `(name, descriptor)` for a class that
+    /// does not declare it itself. Returns `(declaring class, acc_native,
+    /// has_code)`.
+    ///
+    /// Superclasses first and interfaces after, breadth-first, which is JVMS
+    /// §5.4.3.3's order and also the order a receiver-driven dispatch would
+    /// reach them. Bounded by [`IMAGE_HIERARCHY_MAX_DEPTH`] *and* by a visited
+    /// set, so neither a cycle nor a diamond can make this quadratic.
+    fn resolve_in_image_hierarchy(
+        &self,
+        parsed: &mut FxHashMap<String, Option<ImageClassShape>>,
+        class: &str,
+        name: &str,
+        descriptor: &str,
+    ) -> Option<(Arc<str>, bool, bool)> {
+        // Superclass chain first: a concrete override on a superclass wins over
+        // an abstract interface declaration, which is what dispatch does too.
+        let mut visited: rustc_hash::FxHashSet<String> = rustc_hash::FxHashSet::default();
+        visited.insert(class.to_string());
+        let mut interface_queue: Vec<Arc<str>> = self
+            .image_class_shape(parsed, class)
+            .map(|s| s.interfaces.clone())
+            .unwrap_or_default();
+
+        let mut current: Option<Arc<str>> = self
+            .image_class_shape(parsed, class)
+            .and_then(|s| s.super_class.clone());
+        let mut depth = 0usize;
+        while let Some(sup) = current {
+            depth += 1;
+            if depth > IMAGE_HIERARCHY_MAX_DEPTH || !visited.insert(sup.to_string()) {
+                break;
+            }
+            let Some(shape) = self.image_class_shape(parsed, &sup) else {
+                break;
+            };
+            let found = shape.find(name, descriptor);
+            let next = shape.super_class.clone();
+            interface_queue.extend(shape.interfaces.iter().cloned());
+            if let Some((acc_native, has_code)) = found {
+                return Some((sup, acc_native, has_code));
+            }
+            current = next;
+        }
+
+        // Then superinterfaces, breadth-first.
+        let mut head = 0usize;
+        while head < interface_queue.len() && head < IMAGE_HIERARCHY_MAX_DEPTH * 64 {
+            let iface = interface_queue[head].clone();
+            head += 1;
+            if !visited.insert(iface.to_string()) {
+                continue;
+            }
+            let Some(shape) = self.image_class_shape(parsed, &iface) else {
+                continue;
+            };
+            let found = shape.find(name, descriptor);
+            interface_queue.extend(shape.interfaces.iter().cloned());
+            if let Some((acc_native, has_code)) = found {
+                return Some((iface, acc_native, has_code));
+            }
+        }
+        None
     }
 
     /// Find class bytes using parent delegation.
@@ -4990,6 +5212,9 @@ impl ClassManager {
         loader_id: ClassLoaderId,
         options: DefineClassOptions,
     ) -> Result<ClassId, VmError> {
+        // Every class definition in the process funnels through here, so this
+        // is the one place the count can be taken. See `define_census`.
+        crate::define_census::note(name);
         if loader_flags().dbg_define
             && (name.contains("TestNGTestEngine") || name.contains("IsTestNGTestClass"))
         {
@@ -5046,6 +5271,39 @@ impl ClassManager {
 
         // Parse the class file
         let mut class_file = cratonvm_reader::read_class_shared(bytes.clone()).map_err(|e| {
+            // A version rejection is `UnsupportedClassVersionError` on HotSpot,
+            // not the bare `ClassFormatError` every other reader error maps to.
+            // The reader cannot build the message itself: HotSpot's wording
+            // embeds the class name, and `this_class` is not read until after
+            // the constant pool — long after the version check. `name` is
+            // already the internal (slash) form HotSpot prints.
+            //
+            // An empty `name` means the caller supplied none and the class
+            // manager is about to derive it from `this_class` — which the
+            // version check runs before. HotSpot has the same ordering problem
+            // and prints a placeholder; measured on Adoptium 25.0.3.9 via
+            // `ClassLoader.defineClass(null, bytes, 0, len)` of a 69.65535
+            // class file:
+            //
+            //   Preview features are not enabled for <Unknown> (class file
+            //   version 69.65535). Try running with '--enable-preview'
+            //
+            // `<Unknown>` is generic, not preview-specific: it appears in all
+            // five of HotSpot's version messages, with and without the flag.
+            // One knowing inaccuracy — HotSpot distinguishes a null name from
+            // an explicitly empty one (`defineClass("", ...)` really does print
+            // the doubled space), but `read_optional_internal_name` folds Java
+            // `null` and `""` into the same Rust `""`, so CratonVM cannot tell
+            // them apart here. Null is the reachable case (JNI DefineClass and
+            // `ClassLoader.defineClass(null, ..)`); `""` is a caller passing a
+            // deliberate empty name, and it gets null's message.
+            let reported = if name.is_empty() { "<Unknown>" } else { name };
+            if let Some(message) = e.unsupported_class_version_message(reported) {
+                return VmError::Linkage(LinkageError::UnsupportedClassVersionError {
+                    class_name: name.to_string(),
+                    message,
+                });
+            }
             VmError::Linkage(LinkageError::ClassFormatError {
                 class_name: name.to_string(),
                 message: e.to_string(),
@@ -5907,8 +6165,16 @@ impl ClassManager {
         // areturn/checkcast VerifyErrors for otherwise valid forked bytecode.
         // Keep structural validation and defer that loader-sensitive Pass 3,
         // matching the link-time verifier policy in vm_util.
-        let defer_loader_sensitive_pass3 =
-            loader_aware_resolution() && matches!(class.loader_id, ClassLoaderId::UserDefined(_));
+        //
+        // `-Xverify:all` withdraws the deferral. The deferral trades a
+        // type-state verdict for loader fidelity, and that trade is exactly
+        // what a deployment asking for maximum scrutiny is refusing to make —
+        // it is also how a `multianewarray` with more dimensions than its
+        // descriptor has brackets reached the interpreter unchallenged from
+        // every Spring/Tomcat/H2 application class (fixed in a01ccc442).
+        let defer_loader_sensitive_pass3 = !self.strict_verification
+            && loader_aware_resolution()
+            && matches!(class.loader_id, ClassLoaderId::UserDefined(_));
         // TYPE MAPS (arch-2026-07-26/access-control-and-map-coverage): the
         // deferral above is about the verifier's *load decision*, not about
         // its type maps. Deferring the whole of Pass 3 also deferred the
@@ -5976,9 +6242,12 @@ impl ClassManager {
                      structural bytecode verification enforced",
                 );
                 crate::verifier::publish_deferred_class_type_maps(&class, &hierarchy);
-            } else if let Err(verify_err) =
-                crate::verifier::verify_class(&class, &self.class_store, &hierarchy)
-            {
+            } else if let Err(verify_err) = crate::verifier::verify_class_with_strictness(
+                &class,
+                &self.class_store,
+                &hierarchy,
+                self.strict_verification,
+            ) {
                 // Verifier rejected the bytecode. Drop the guard set
                 // entry so retry attempts are not erroneously blocked.
                 self.loading_guard.remove(name);
@@ -6064,6 +6333,7 @@ impl ClassManager {
         // its name, the two layouts are now both known and can be diffed once,
         // here, instead of guessed at per access.
         self.report_shadow_layout(id);
+        self.check_safe_positional_claims(id);
 
         // T10.5 — Build this class's vtable descriptor layout, cache it on
         // `self.vtable_descriptors`, and fire the install hook so the VM
@@ -6570,6 +6840,39 @@ impl ClassManager {
             return;
         }
         eprint!("{}", diff.render());
+    }
+
+    /// Re-check every `JDK-ONLY-LAYOUT: safe` positional claim about a class
+    /// that has just been defined from real bytes.
+    ///
+    /// Wave-2 step 4. A `safe` verdict is an assertion about one specific JDK
+    /// image, made once by a person reading `javap`, and nothing in the build
+    /// re-checked it -- so a JDK upgrade that reordered a private field would
+    /// not fail a test, it would silently corrupt an object.
+    ///
+    /// Deliberately NOT behind `CRATONVM_DBG_OVERLAY`, unlike the census next
+    /// door. The census is a research instrument you switch on when you are
+    /// already looking for something; this is a tripwire, and a tripwire that
+    /// only fires while you are watching is not one. It costs a name compare
+    /// against a six-row table per class definition, and only a class named in
+    /// that table walks any fields at all.
+    ///
+    /// `debug_assert` on top of the log, so a broken claim fails the test suite
+    /// rather than merely printing during it.
+    fn check_safe_positional_claims(&self, id: ClassId) {
+        let broken = crate::shadow_layout::check_positional_claims(&self.class_store, id);
+        for message in &broken {
+            tracing::error!(
+                target: "cratonvm::layout",
+                "JDK-ONLY-LAYOUT `safe` claim broken by this image: {message}"
+            );
+            eprintln!("[LAYOUT-CLAIM] BROKEN: {message}");
+        }
+        debug_assert!(
+            broken.is_empty(),
+            "a JDK-ONLY-LAYOUT `safe` claim does not hold for the loaded image:\n{}",
+            broken.join("\n")
+        );
     }
 
     /// Re-parent a loaded class.
@@ -8503,6 +8806,20 @@ impl ClassManager {
         key: (ClassLoaderId, Arc<str>),
         id: ClassId,
     ) -> Option<ClassId> {
+        if let Ok(filter) = cratonvm_types::flags::runtime_var("CRATONVM_DBG_DEFINE_FILTER") {
+            if !filter.is_empty() && key.1.contains(filter.as_str()) {
+                eprintln!(
+                    "[DBG_DEFINE] insert name={} loader={:?} id={}",
+                    key.1, key.0, id.as_u32()
+                );
+                if matches!(key.0, ClassLoaderId::Application) {
+                    eprintln!(
+                        "[DBG_DEFINE_BT] {}",
+                        std::backtrace::Backtrace::force_capture()
+                    );
+                }
+            }
+        }
         let name = Arc::clone(&key.1);
         let displaced = self.loaded_classes.insert(key, id);
         bump_class_definition_epoch();
@@ -8766,6 +9083,15 @@ impl ClassManager {
                 | "java/util/Collections$EmptyEnumeration"
                 | "java/util/ArrayList$Itr"
                 | "java/util/ArrayList$ListItr"
+                // `Arrays.asList(T...)`'s fixed-size view. Concrete, and
+                // instantiated: `native_arrays_as_list` allocates one per call
+                // and the accessors read its `a` slot. Left to the `$`
+                // heuristic it was fabricated as an ABSTRACT INTERFACE, so the
+                // one field it needs could never be stored — every
+                // `Arrays.asList(...)` answered `size() == 0`, which is what
+                // `KNOWN_SYNTHETIC_JDK_GAPS` pinned as a missing
+                // `Arrays.asList`.
+                | "java/util/Arrays$ArrayList"
                 | "java/util/function/Function$Identity"
         );
         // LETSGO_S1: Curated list of well-known JDK interfaces whose names
@@ -9240,6 +9566,37 @@ impl ClassManager {
             cratonvm_types::intern_arc(leaf_descriptor)
         };
 
+        // JDK-ONLY-NOTE (W4-2): an array class's module is its COMPONENT
+        // type's module. This was a hardcoded `Some("java.base")` for every
+        // array class regardless of component type, so
+        // `MyAppClass[].class.getModule()` answered `java.base` where HotSpot
+        // answers the unnamed module. Measured on Temurin 25.0.3:
+        //
+        //   int[].class.getModule()        module java.base
+        //   String[].class.getModule()     module java.base
+        //   ArrProbe[].class.getModule()   unnamed module @691a7f8f
+        //
+        // `Class.getModule()`'s javadoc says it directly: "If this class
+        // represents an array type then this method returns the Module for
+        // the element type." A primitive component has no `ClassId` in the
+        // store (`component_id == None`) and its element type's module is
+        // java.base, which is the one case the old hardcode got right. A
+        // multi-dimensional array reaches here with `component_id` naming the
+        // inner ARRAY class, whose own module was computed by this same rule
+        // one recursion down, so `[[Lp/X;` inherits `p/X`'s module through
+        // `[Lp/X;` exactly as it already inherits its defining loader.
+        //
+        // `None` is the unnamed module (see `Class::module_name`), so a
+        // classpath component type produces an array class in the unnamed
+        // module rather than one falsely claiming java.base.
+        let array_module_name: Option<String> = match component_id {
+            Some(component) => self
+                .class_store
+                .get(component)
+                .and_then(|component_class| component_class.module_name.clone()),
+            None => Some("java.base".to_string()),
+        };
+
         let class = Class {
             id,
             loader_id: array_loader,
@@ -9274,7 +9631,7 @@ impl ClassManager {
             inner_classes: Vec::new(),
             enclosing_method: None,
             hidden: false,
-            module_name: Some("java.base".to_string()),
+            module_name: array_module_name,
             // Crucially: an array class is NOT a synthetic stub — it is a
             // fully-formed array class produced by the VM itself.
             // Marking it stub would (a) emit a misleading log line and
@@ -9406,18 +9763,57 @@ impl ClassManager {
 
         // Load superclass (may already be loaded). `super_class` is now
         // `Option<Arc<str>>`; deref for the `&str` parameter.
+        //
+        // W7-26 — these two were `.ok()` and `filter_map(… .ok())`, and both
+        // laundered a supertype resolution failure into a WRONG LAYOUT rather
+        // than into a failed upgrade:
+        //
+        //   * `superclass_id = None` says "this class has no superclass" when
+        //     its own class file says it has one, and `compute_field_layout`
+        //     below reads exactly that bit — so every inherited field slot
+        //     collapses and `first_field_index` becomes 0. That is the
+        //     slot-index species (`docs/architecture/natives-over-real-jdk-classes.md`
+        //     §5: a slot index against a real layout is heap corruption), not a
+        //     missing diagnostic.
+        //   * `filter_map` silently SHORTENS the interface list, so
+        //     `instanceof` answers false for a type the class file declares and
+        //     the itable is built one entry short.
+        //
+        // Neither has a fallback to fall through to, and
+        // `define_class_with_options` — the sibling that defines the same
+        // class from the same bytes — propagates both (`return Err(e)` on its
+        // `resolve_supertype` and on `resolved_interfaces`). This function was
+        // the outlier. All three callers already handle the `Err`: two log it
+        // at `debug` and keep the un-upgraded stub, which is strictly better
+        // than installing a stub whose layout claims a hierarchy it does not
+        // have, and the third (`define_class_with_options`) propagates.
+        //
+        // The `loading_guard` entry MUST be removed on every exit or the name
+        // is permanently seen as circular by `load_class`; that is why these
+        // are written as explicit `match`es rather than `?`.
         self.loading_guard.insert(name.to_string());
         let superclass_id = match class_file.super_class {
-            Some(ref super_name) => self.load_class(&**super_name).ok(),
+            Some(ref super_name) => match self.load_class(&**super_name) {
+                Ok(id) => Some(id),
+                Err(e) => {
+                    self.loading_guard.remove(name);
+                    return Err(e);
+                }
+            },
             None => None,
         };
 
         // Load interfaces. `iface_name: &Arc<str>` derefs to `&str`.
-        let interface_ids: Vec<ClassId> = class_file
-            .interfaces
-            .iter()
-            .filter_map(|iface_name| self.load_class(iface_name).ok())
-            .collect();
+        let mut interface_ids: Vec<ClassId> = Vec::with_capacity(class_file.interfaces.len());
+        for iface_name in class_file.interfaces.iter() {
+            match self.load_class(iface_name) {
+                Ok(id) => interface_ids.push(id),
+                Err(e) => {
+                    self.loading_guard.remove(name);
+                    return Err(e);
+                }
+            }
+        }
         self.loading_guard.remove(name);
 
         // Compute field layout from real class file
@@ -9650,7 +10046,7 @@ impl ClassManager {
         // report a duplicate-define `LinkageError` where it currently mints a
         // second copy. That is arguably the JVMS-correct outcome, but it is a
         // behaviour change on the hottest path in the VM and is out of scope
-        // here — see `docs/feature-designs/classloading-identity-audit.md`.
+        // here — see `feature-designs/classloading-identity-audit.md`.
         if let (Some(previous_loader_id), Some(registered_name)) =
             (previous_loader_id, registered_name)
         {
@@ -9801,6 +10197,7 @@ impl ClassManager {
         // The ClassId is deliberately reused, so every native holding a
         // positional index for the old model now addresses the new one.
         self.report_shadow_layout(id);
+        self.check_safe_positional_claims(id);
 
         Ok(())
     }
@@ -10028,6 +10425,19 @@ fn jdk_superclass(name: &str) -> &'static str {
         "java/lang/Exception" => "java/lang/Throwable",
         "java/io/IOException" => "java/lang/Exception",
         "java/io/FileNotFoundException" => "java/io/IOException",
+        // Serialization's own IOException subtree. Needed as soon as anything
+        // throws one of these by class rather than as a plain `IOException`
+        // carrying the name in its message: without the chain a fabricated
+        // `NotSerializableException` extends `java.lang.Object`, so
+        // `catch (IOException)` — and even `catch (Exception)` — does not
+        // match it, and the throw escapes the handler that was written for it.
+        "java/io/ObjectStreamException" => "java/io/IOException",
+        "java/io/NotSerializableException"
+        | "java/io/InvalidClassException"
+        | "java/io/InvalidObjectException"
+        | "java/io/StreamCorruptedException"
+        | "java/io/OptionalDataException"
+        | "java/io/WriteAbortedException" => "java/io/ObjectStreamException",
 
         // RuntimeException hierarchy
         "java/lang/RuntimeException" => "java/lang/Exception",
@@ -10071,6 +10481,12 @@ fn jdk_superclass(name: &str) -> &'static str {
         // java.util exceptions
         "java/util/NoSuchElementException"
         | "java/util/ConcurrentModificationException"
+        // `EmptyStackException` extends `RuntimeException` DIRECTLY, not
+        // `NoSuchElementException` — see types/src/error.rs's
+        // `RuntimeError::EmptyStackException`, whose doc says the same thing for
+        // the same reason: a `catch (NoSuchElementException)` must NOT catch it.
+        // docs/known-issues/jdk-only/W7-33-differential-dead-sections.md
+        | "java/util/EmptyStackException"
         | "java/util/InputMismatchException" => "java/lang/RuntimeException",
 
         // Linkage errors
@@ -10105,12 +10521,43 @@ fn jdk_superclass(name: &str) -> &'static str {
         | "java/security/DigestException"
         | "java/security/SignatureException"
         | "java/security/InvalidAlgorithmParameterException"
-        | "java/security/UnrecoverableKeyException"
         | "java/security/UnrecoverableEntryException"
+        | "java/security/spec/InvalidKeySpecException"
         | "java/security/cert/CertificateException" => "java/security/GeneralSecurityException",
-        "java/security/InvalidKeyException" | "java/security/InvalidKeySpecException" => {
-            "java/security/KeyException"
-        }
+        // `UnrecoverableKeyException extends UnrecoverableEntryException`, not
+        // `GeneralSecurityException` directly — measured on Temurin 25.0.3+9,
+        // `probes/JcaExceptionTypeProbe.java` section H. Listing it one level
+        // too high still reached `GeneralSecurityException` transitively, so
+        // "is it a Throwable" stayed right and only the one question in between
+        // — does `catch (UnrecoverableEntryException)` match — came out wrong.
+        "java/security/UnrecoverableKeyException" => "java/security/UnrecoverableEntryException",
+        "java/security/InvalidKeyException" => "java/security/KeyException",
+        // `InvalidKeySpecException` lives in `java.security.spec`, so the
+        // `java/security/InvalidKeySpecException` key this arm used to carry
+        // named a class that does not exist and could never be looked up, while
+        // the real name was absent from the table entirely. Its superclass is
+        // `GeneralSecurityException`, not `KeyException` — measured.
+        //
+        // THE `javax.crypto` HALF OF THE SAME HIERARCHY was absent entirely, so
+        // this fallback answered "not a subclass" for `BadPaddingException` /
+        // `IllegalBlockSizeException` / `ShortBufferException` against
+        // `GeneralSecurityException`, and `static_common_superclass_lookup`
+        // widened any two of them to `Object`. Every one is a class this VM now
+        // RAISES from the RSA, AES-GCM and key-wrap paths, so a classfile
+        // catching them is exactly the caller W7-71 exists to unblock.
+        //
+        // `AEADBadTagException` is deliberately NOT flattened to
+        // `GeneralSecurityException`: it extends `BadPaddingException`, and
+        // that link is what makes `catch (BadPaddingException)` catch a GCM tag
+        // failure. Collapsing it would repeat the `UnrecoverableKeyException`
+        // mistake above on the one class where the intermediate step is the
+        // whole point.
+        "javax/crypto/BadPaddingException"
+        | "javax/crypto/IllegalBlockSizeException"
+        | "javax/crypto/NoSuchPaddingException"
+        | "javax/crypto/ShortBufferException"
+        | "javax/crypto/ExemptionMechanismException" => "java/security/GeneralSecurityException",
+        "javax/crypto/AEADBadTagException" => "javax/crypto/BadPaddingException",
         "java/security/AccessControlException" | "java/security/ProviderException" => {
             "java/lang/RuntimeException"
         }
@@ -10344,6 +10791,20 @@ fn jdk_interfaces(name: &str) -> &'static [&'static str] {
         // checkcast/instanceof honest — what this table is for — without
         // putting an aliased field layout into the dispatch chain.
         "cratonvm/synthetic/Process" => &["java/lang/Process"],
+        // The platform MXBean *extension* interfaces. `ManagementFactory
+        // .getThreadMXBean()` / `.getOperatingSystemMXBean()` fabricate their
+        // beans under these names so that `instanceof com.sun.management.…`
+        // answers true, the way it does on every real JVM (see
+        // `native-builtins/src/jmx.rs::alloc_extension_mxbean`). In real-JDK
+        // mode the extends-relation comes from the loaded class file; in
+        // synthetic-JDK mode there is no class file, so without these entries
+        // the fabricated stub would satisfy the extension `instanceof` and
+        // FAIL the base one — trading one broken type test for another, in the
+        // direction that breaks existing callers.
+        "com/sun/management/ThreadMXBean" => &["java/lang/management/ThreadMXBean"],
+        "com/sun/management/OperatingSystemMXBean" => {
+            &["java/lang/management/OperatingSystemMXBean"]
+        }
         "java/lang/String" => &[
             "java/io/Serializable",
             "java/lang/Comparable",
@@ -10423,6 +10884,25 @@ fn jdk_interfaces(name: &str) -> &'static [&'static str] {
         "java/util/AbstractMap$SimpleEntry" | "java/util/AbstractMap$SimpleImmutableEntry" => {
             &["java/util/Map$Entry", "java/io/Serializable"]
         }
+        // `Map.entry(k, v)`'s product. HotSpot answers `java.util.KeyValueHolder`
+        // for `Map.entry(..).getClass()`, and the reason it has a class of its
+        // own is exactly the one CratonVM ran into: `Map.entry`'s entry is
+        // immutable and `setValue` must throw, while the entry-set views mint
+        // `java/util/Map$Entry` with a third write-through `sourceMap` slot so
+        // that `setValue` writes back into the map. One name cannot carry both
+        // contracts, and last-write-wins decided which one shipped.
+        //
+        // NOT `Serializable`: `Map.entry`'s return is specified as not
+        // serializable, unlike `AbstractMap$SimpleImmutableEntry` above, and
+        // `KeyValueHolder` implements `Map.Entry` only. The interface link is
+        // load-bearing rather than cosmetic — `Map.Entry.equals` is specified
+        // against any other `Map.Entry`, so both `native_entry_equals`
+        // (native-collections) and `register_entry_value_semantics`
+        // (native-builtins) open with an `instanceof Map.Entry` test. Without
+        // this arm a `KeyValueHolder` would compare unequal to an equal
+        // `SimpleEntry` in one direction and equal in the other, which is the
+        // asymmetry that blocked this class from landing on 2026-08-06.
+        "java/util/KeyValueHolder" => &["java/util/Map$Entry"],
         "java/util/AbstractQueue" => &[
             "java/util/Queue",
             "java/util/Collection",
@@ -10498,6 +10978,56 @@ fn jdk_interfaces(name: &str) -> &'static [&'static str] {
         // `AbstractList` (itself `implements List`) and separately
         // `implements RandomAccess`.
         "cratonvm/internal/ArrayListSubList" => &["java/util/List", "java/util/RandomAccess"],
+        // The object `linkedList.listIterator()` hands back. Same reason as the
+        // entry above, as `java/util/ArrayList$ListItr` two entries up, and as
+        // `cratonvm/synthetic/Process`: with no arm here it fell to this
+        // match's `_ => &[]`, so the carrier declared NO interfaces at all —
+        // `instanceof ListIterator` was `false` and every erased-type
+        // `(ListIterator) x` raised
+        // `ClassCastException: cratonvm.internal.LinkedListSnapshotListItr
+        // cannot be cast to java.util.ListIterator`.
+        //
+        // `AbstractList.equals`/`hashCode`/`indexOf` never trip it, because
+        // their receiver is already typed `ListIterator` and javac emits no
+        // `checkcast` — which is exactly why the family worked at all and why
+        // this went unnoticed. It is user code assigning through `Object` (or
+        // any erased generic) that meets it.
+        //
+        // Recorded HERE rather than as a `superclass` link, unlike
+        // `SSLSocketInputStream`/`OutputStream` which solve the same
+        // checkcast problem that way: `java.util.ListIterator` is an interface
+        // with no fields, so there is no layout to alias and nothing to gain
+        // from the heavier mechanism.
+        //
+        // `Iterator` is listed explicitly even though `ListIterator extends
+        // Iterator` and `is_assignable_to_name_inner` walks super-interfaces
+        // transitively. It costs one `load_class` and it means an
+        // `(Iterator) x` cast does not depend on the image having resolved
+        // `ListIterator`'s own hierarchy — the same belt-and-braces the
+        // `java/util/ArrayList$ListItr` arm above already uses.
+        //
+        // This arm reaches the carrier through `fabricate_class`, which is the
+        // shared body of ALL THREE `ensure_*_class` entry points, so it applies
+        // to the `ClassOrigin::VmInternal` door the carrier is minted through
+        // since 6ae3ca634 as much as it did to the compatibility door before
+        // it. That matters: the mint landing in strict mode without this arm is
+        // what took the ClassCastException from Compatible-only to reachable in
+        // BOTH modes.
+        //
+        // HotSpot parity, and therefore permitted in Compatible mode under the
+        // contract's §5 freeze: real `java.util.LinkedList$ListItr` implements
+        // `ListIterator`, so every cast this admits is one HotSpot admits.
+        // It does NOT make `listIterator().getClass()` answer
+        // `java.util.LinkedList$ListItr`, and it does not touch the
+        // native-owned-`LinkedList`-state defect behind the carrier
+        // (`ListItr.remove()` leaves `size` stale) — those are a collections
+        // reclassification, not an interface list.
+        // W7-16-arraydeque-and-linkedlist-residuals.md
+        // W7-20-refusal-laundered-into-wrong-answer.md
+        // W7-62-ratchets-and-dead-code.md
+        "cratonvm/internal/LinkedListSnapshotListItr" => {
+            &["java/util/ListIterator", "java/util/Iterator"]
+        }
         "java/util/Dictionary" => &[],
         "java/util/ArrayDeque" => &[
             "java/util/Deque",
@@ -10524,6 +11054,68 @@ fn jdk_interfaces(name: &str) -> &'static [&'static str] {
         "java/lang/Class" => &[
             "java/io/Serializable",
             "java/lang/reflect/GenericDeclaration",
+            "java/lang/reflect/Type",
+            "java/lang/reflect/AnnotatedElement",
+        ],
+        // ---- sun.reflect.generics reified types ----
+        //
+        // `Field.getGenericType()`, `Class.getGenericSuperclass()` and the
+        // rest of the WP2.8 reifier deliberately hand back a REAL
+        // `sun.reflect.generics.reflectiveObjects.*Impl` rather than the bare
+        // interface name, so `getTypeName()`/`toString()` render like HotSpot
+        // (`generics::typesig_to_real_type`, `build_wildcard_type`). In a
+        // synthetic-library build those `*Impl` names have no class file, so
+        // they were fabricated here — and, with no arm in this table, they
+        // were fabricated implementing NOTHING. `getGenericType()` then
+        // returned an object that answered `false` to `instanceof
+        // ParameterizedType`, which is the check every consumer of the API
+        // opens with:
+        //
+        //     Type t = f.getGenericType();
+        //     if (!(t instanceof ParameterizedType)) return 0;   // taken
+        //
+        // So the four `GenericReflectionTest` entries pinned in
+        // `KNOWN_SYNTHETIC_JDK_GAPS` ("`getGenericType` / `getGenericSuper-
+        // class` never surface `ParameterizedType` or `WildcardType`") were
+        // not a missing reifier: the reifier ran, produced the right raw type
+        // and the right actual type arguments, and handed them back on an
+        // object no `instanceof` could recognise. Measured under
+        // `--synthetic-jdk`, the object's `getClass().getName()` was already
+        // `sun.reflect.generics.reflectiveObjects.ParameterizedTypeImpl` while
+        // `t instanceof ParameterizedType` was `false`.
+        //
+        // `java/lang/reflect/Type` is listed on each explicitly: these classes
+        // are fabricated with `java/lang/Object` as their superclass, so they
+        // inherit no interface, and code that erases to `Type` (every `Type[]`
+        // element store, `getActualTypeArguments`, `getBounds`) needs the
+        // supertype to be true of them.
+        "sun/reflect/generics/reflectiveObjects/ParameterizedTypeImpl" => &[
+            "java/lang/reflect/ParameterizedType",
+            "java/lang/reflect/Type",
+        ],
+        "sun/reflect/generics/reflectiveObjects/WildcardTypeImpl" => &[
+            "java/lang/reflect/WildcardType",
+            "java/lang/reflect/Type",
+        ],
+        "sun/reflect/generics/reflectiveObjects/TypeVariableImpl" => &[
+            "java/lang/reflect/TypeVariable",
+            "java/lang/reflect/GenericDeclaration",
+            "java/lang/reflect/AnnotatedElement",
+            "java/lang/reflect/Type",
+        ],
+        "sun/reflect/generics/reflectiveObjects/GenericArrayTypeImpl" => &[
+            "java/lang/reflect/GenericArrayType",
+            "java/lang/reflect/Type",
+        ],
+        // The bare-interface synthetics the same reifier mints on its
+        // fallback paths (`generics::type_sig_to_java`) are `instanceof`-
+        // correct for their own name for free, but nothing linked them to
+        // `Type` — the erased element type of every array they are stored
+        // into.
+        "java/lang/reflect/ParameterizedType"
+        | "java/lang/reflect/WildcardType"
+        | "java/lang/reflect/GenericArrayType" => &["java/lang/reflect/Type"],
+        "java/lang/reflect/TypeVariable" => &[
             "java/lang/reflect/Type",
             "java/lang/reflect/AnnotatedElement",
         ],
@@ -10819,6 +11411,131 @@ pub(crate) fn is_vm_proxy_supertype_name(name: &str) -> bool {
     name == "java/lang/reflect/Proxy$Instance"
 }
 
+/// This VM's own invented carrier for an annotation's captured member values.
+///
+/// `java/lang/annotation/AnnotationProxy` is the 4-slot tuple (type descriptor,
+/// type mirror, element names, element values) that
+/// `native-builtins/src/lang_class.rs::create_annotation_proxy_with_type`
+/// mints as the invocation handler behind every generated annotation
+/// `$ProxyN`. It plays the role HotSpot gives to
+/// `sun.reflect.annotation.AnnotationInvocationHandler`, under a name of this
+/// VM's own choosing: `javap java.lang.annotation.AnnotationProxy` against the
+/// JDK 25 image answers "class not found", so no class file can ever back it
+/// and it is a *generation artefact*, not a stand-in for bytes that should
+/// have been found. Exactly the argument one function up, for exactly the same
+/// species — see `docs/known-issues/jdk-only/W7-12-strict-annotation-proxy.md`
+/// and `W7-17-vm-internal-door-sweep.md`.
+///
+/// # Yes, this binds by NAME. Read this before "fixing" it.
+///
+/// This campaign's most expensive rule is *never bind by name* — an
+/// `invokestatic` owner, a `$ProxyN`'s interface, a reflect stub's rendered
+/// name, a MIC's owner and a shape test on a class name were six separate
+/// defects, all of the same shape: a **same-named class from another loader**
+/// was the correct answer and the string picked the wrong one. That failure
+/// mode is unreachable here, and not by luck:
+///
+/// * **There is no other copy to confuse this with.**
+///   [`ClassManager::fabricated_origin_for_name`] is consulted only from
+///   [`ClassManager::try_ensure_synthetic_class`] →
+///   [`ClassManager::fabricate_class`], which by then has already had
+///   `get_loaded_class_id` answer `None` *and* `find_class_bytes_delegated`
+///   fail. The name resolves to nothing, in any loader, on any classpath
+///   entry. Every one of the six defects was a decision taken while two live
+///   classes existed; this one is taken only when none does.
+/// * **No other party may occupy the name.** `java/lang/annotation/` is a
+///   package no non-bootstrap loader is permitted to define into, and the
+///   bootstrap loader defines only what the image declares — which, per the
+///   `javap` above, is not this. The string is not a guess at an identity, it
+///   is the identity.
+/// * **It classifies, it does not dispatch.** The six defects all *bound* a
+///   call, a cast or a field to a class. This answers "what provenance does a
+///   class the VM is about to invent deserve", the question this function
+///   exists for and whose only input is the invented name.
+///
+/// # What binding by name here does cost, stated plainly
+///
+/// [`ClassManager::fabricate_class`] runs its ambiguity gate
+/// (`classify_loaded_name` → `ambiguous_stand_in_refused`) **only** for
+/// compatibility-stub origins, so a name routed here skips it — deliberately,
+/// per that gate's own comment about `ensure_generated_class` minting under a
+/// name it just constructed. For this name that is inert for the second reason
+/// above: the package cannot hold a second definition. Any future entry added
+/// beside it must be able to make the same statement, or it is trading a
+/// census label for the type confusion the ambiguity gate exists to stop.
+pub(crate) fn is_vm_annotation_carrier_name(name: &str) -> bool {
+    name == "java/lang/annotation/AnnotationProxy"
+}
+
+/// This VM's reserved `CratonVM$…` namespace for the small carriers it invents
+/// to hold state between two of its own natives.
+///
+/// Two names live here today, both 1–2 slot `Runnable`s with a native `run()V`
+/// and nothing else:
+///
+/// * `CratonVM$HttpServerLoop` — `native-builtins/src/net_phase_e.rs`, minted
+///   once per `HS_DISPATCHER_POOL` dispatcher to carry a `server_id` from
+///   `re10_spawn_dispatcher` to `re10_serve_loop_run`. This is the class
+///   `W7-17-vm-internal-door-sweep.md` §6A measured taking
+///   `HttpServer.start()` down under `--jdk-only` with
+///   `NoClassDefFoundError: CratonVM$HttpServerLoop`.
+/// * `CratonVM$StsForkRunner` — `native-builtins/src/jdk25_concurrency.rs`,
+///   the JEP 505 `StructuredTaskScope.fork()` worker body carrying the
+///   `Callable` and the `Subtask`. It is minted with a bare
+///   `try_alloc_concurrent_synthetic` and has **no** `ensure_vm_internal_class`
+///   pre-mint of its own, so before this arm it was the same door defect one
+///   file over, unrecorded.
+///
+/// # Why the prefix is admissible where a name usually is not
+///
+/// `is_vm_annotation_carrier_name` above carries this campaign's *never bind
+/// by name* argument in full; the same three statements hold here and the
+/// second is the one that changes shape, so it is restated rather than
+/// referenced:
+///
+/// * **There is no other copy to confuse this with.**
+///   [`fabricated_origin_for_name`] is reached only from
+///   [`ClassManager::try_ensure_synthetic_class`] →
+///   [`ClassManager::fabricate_class`], by which point `get_loaded_class_id`
+///   has answered `None` **and** `find_class_bytes_delegated` has failed. If an
+///   application really did put a `CratonVM$…` class on its classpath, the
+///   bytes would have been found and this function would never run.
+/// * **No other party is minting into it.** `java/lang/annotation/` is closed
+///   by the JVM's package rules; `CratonVM$` is closed by convention instead —
+///   it is this VM's own prefix, every use of it in the workspace is one of the
+///   two names above, and neither is a JDK name (`javap CratonVM$HttpServerLoop`
+///   against the JDK 25 image answers "class not found"; the string is in no
+///   JDK namespace at all). That is a weaker guarantee than the package rule
+///   and it is why the statement is written down: **anything added under this
+///   prefix must be a carrier the VM invents, never a stand-in for bytes some
+///   image declares.**
+/// * **It classifies, it does not dispatch.** Same as above — the only input is
+///   the invented name, and the answer is a provenance label.
+///
+/// # Gate 2 is already open for both, which is what makes this sufficient
+///
+/// `W7-17` §3's rule is that the door is only half the refusal: a class whose
+/// natives strict mode also drops buys an `UnsatisfiedLinkError` at the first
+/// call instead of a `NoClassDefFoundError` at the mint. Checked per name, not
+/// by analogy — neither appears in any table in
+/// `native-api/src/no_image_receiver.rs`, and
+/// `receiver_declared_by_no_supported_image` returns `false` for a name on
+/// none of them, so nothing re-tags either class's `run()V` `SyntheticStub`.
+///
+/// # Cost, stated as `is_vm_annotation_carrier_name` requires
+///
+/// A name routed to [`ClassOrigin::VmInternal`] skips
+/// [`ClassManager::fabricate_class`]'s ambiguity gate, which runs only for
+/// compatibility-stub origins. Inert here for the first bullet's reason: the
+/// gate exists to refuse a stand-in for a name several live classes already
+/// hold, and this path is reached only when no supplier answered at all.
+/// [`ClassManager::classify_defined_origin`]'s asymmetry does not arise either
+/// — no class file can ever back these names, so they never arrive with real
+/// bytes for the two paths to disagree about.
+pub(crate) fn is_vm_reserved_namespace_name(name: &str) -> bool {
+    name.starts_with("CratonVM$")
+}
+
 /// The origin a **fabricated** class deserves on the strength of its name
 /// alone.
 ///
@@ -10836,6 +11553,22 @@ pub(crate) fn is_vm_proxy_supertype_name(name: &str) -> bool {
 ///   dispatch consequences of the flip are handled by
 ///   [`Class::dispatch_lacks_class_file`](crate::Class::dispatch_lacks_class_file),
 ///   which is what the three read sites that can observe this class now ask.
+/// * `java/lang/annotation/AnnotationProxy` → [`ClassOrigin::VmInternal`], the
+///   same species and the same argument one class later — see
+///   [`is_vm_annotation_carrier_name`], which carries the "yes, this binds by
+///   name" justification for both. `GeneratedProxy` is as wrong for it as for
+///   the supertype above, and for the same reason: it carries an `interfaces`
+///   list a carrier has no value for. The authoritative half of this fix is at
+///   the mint site (`lang_class.rs`, which now pre-mints through
+///   `ensure_vm_internal_class`); this arm exists so a second minting route
+///   cannot silently re-acquire the wrong label, which is precisely the
+///   pairing `Proxy$Instance` already has.
+/// * `CratonVM$…` → [`ClassOrigin::VmInternal`] — see
+///   [`is_vm_reserved_namespace_name`], which carries the prefix argument and
+///   the per-name gate-2 check. This is the pairing `W7-17` §6A left optional;
+///   it is taken because a SECOND minting route exists and has no pre-mint of
+///   its own (`CratonVM$StsForkRunner`, `jdk25_concurrency.rs`), so here the
+///   arm is not belt-and-braces — it is the only thing covering that name.
 /// * the three generated-name families — a fabricated `$$Lambda` / `$ProxyN` /
 ///   `Generated*Accessor*` is what generated it, exactly as
 ///   [`ClassManager::classify_defined_origin`] already reports for the same
@@ -10853,6 +11586,12 @@ pub(crate) fn is_vm_proxy_supertype_name(name: &str) -> bool {
 /// with its producer named, not a place to invent metadata.
 fn fabricated_origin_for_name(name: &str) -> ClassOrigin {
     if is_vm_proxy_supertype_name(name) {
+        return ClassOrigin::VmInternal;
+    }
+    if is_vm_annotation_carrier_name(name) {
+        return ClassOrigin::VmInternal;
+    }
+    if is_vm_reserved_namespace_name(name) {
         return ClassOrigin::VmInternal;
     }
     if is_generated_lambda_name(name) {
@@ -11134,6 +11873,11 @@ fn synthetic_stub_fields(name: &str) -> Vec<cratonvm_reader::field::ClassFileFie
         | "java/lang/OutOfMemoryError"
         | "java/lang/VerifyError"
         | "java/util/NoSuchElementException"
+        // W7-33's synthetic-mode residual: without a field arm the fabricated
+        // carrier gets no slots, and the two `Throwable` slots every other
+        // exception here relies on (message, cause) are what a `getMessage()` on
+        // a caught `EmptyStackException` reads.
+        | "java/util/EmptyStackException"
         | "java/util/InputMismatchException"
         | "java/io/IOException"
         | "java/io/FileNotFoundException"
@@ -11270,6 +12014,53 @@ fn synthetic_stub_fields(name: &str) -> Vec<cratonvm_reader::field::ClassFileFie
         }],
         "java/util/Collections$EmptyEnumeration" => vec![],
         "java/util/ArrayList$Itr" | "java/util/ArrayList$ListItr" => instance_fields(5),
+        // `Arrays.asList(T...)`'s fixed-size view. The real nested class has
+        // exactly one field, `private final E[] a`, and derives `size()` from
+        // `a.length` — which is what `native_arrays_as_list` and the
+        // `Arrays$ArrayList` accessors in `native-collections` are written
+        // against (`arrays_array_list_backing` looks the slot up BY NAME).
+        // Without this arm the fabricated stub had zero slots, so the array
+        // could not be stored at all: `size()` answered 0 for every list and
+        // `Arrays.asList` was pinned as a synthetic-JDK gap.
+        "java/util/Arrays$ArrayList" => vec![named_field("a", "[Ljava/lang/Object;")],
+        // ---- sun.reflect.generics reified types ----
+        //
+        // The WP2.8 reifier allocates these by name and populates them with
+        // `set_field_by_name`, and every accessor native in
+        // `native-builtins/src/lang_reflect.rs` reads them back BY NAME. With
+        // no arm here the fabricated stubs had zero declared slots, so
+        // `class_num_total_fields` was 0, the `.max(2)`/`.max(3)` floors gave
+        // the objects anonymous `_fN` slots instead, and every
+        // `set_field_by_name` write was silently discarded: `getRawType()`
+        // answered null and `getActualTypeArguments()` answered null on an
+        // object whose raw type and arguments had just been computed
+        // correctly.
+        //
+        // Declaration ORDER matters and is the JDK's own — see the
+        // `pti_real` note in `lang_reflect.rs`, which records the real
+        // `ParameterizedTypeImpl` layout as `actualTypeArguments[0],
+        // rawType[1], ownerType[2]`. The `java/lang/reflect/ParameterizedType`
+        // interface natives registered beside it read slots 0/1/2 POSITIONALLY
+        // for the bare-interface synthetic (rawType at 0, arguments at 1,
+        // owner at 2), which is a different object and a different order; do
+        // not "unify" the two.
+        "sun/reflect/generics/reflectiveObjects/ParameterizedTypeImpl" => vec![
+            named_field("actualTypeArguments", "[Ljava/lang/reflect/Type;"),
+            named_field("rawType", "Ljava/lang/Class;"),
+            named_field("ownerType", "Ljava/lang/reflect/Type;"),
+        ],
+        "sun/reflect/generics/reflectiveObjects/WildcardTypeImpl" => vec![
+            named_field("upperBounds", "[Ljava/lang/reflect/Type;"),
+            named_field("lowerBounds", "[Ljava/lang/reflect/Type;"),
+        ],
+        "sun/reflect/generics/reflectiveObjects/TypeVariableImpl" => vec![
+            named_field("genericDeclaration", "Ljava/lang/reflect/GenericDeclaration;"),
+            named_field("name", "Ljava/lang/String;"),
+            named_field("bounds", "[Ljava/lang/Object;"),
+        ],
+        "sun/reflect/generics/reflectiveObjects/GenericArrayTypeImpl" => {
+            vec![named_field("genericComponentType", "Ljava/lang/reflect/Type;")]
+        }
         // Collections: ArrayList/Vector/Stack/CopyOnWriteArrayList = 2 fields (data, size)
         "java/util/ArrayList"
         | "java/util/Vector"
@@ -11314,6 +12105,16 @@ fn synthetic_stub_fields(name: &str) -> Vec<cratonvm_reader::field::ClassFileFie
                 named_field("value", "Ljava/lang/Object;"),
             ]
         }
+        // `java.util.KeyValueHolder` — the JDK's own two `final` fields, in the
+        // JDK's own order, which is the layout `Map.entry`'s native writes.
+        // Declared for the same reason the two entries above are: a bytecode
+        // `new` sizes its object from `num_total_fields`, so an undeclared
+        // layout allocates a 0-slot object and every `set_field` is dropped by
+        // the heap's bounds guard, in silence apart from a WARN.
+        "java/util/KeyValueHolder" => vec![
+            named_field("key", "Ljava/lang/Object;"),
+            named_field("value", "Ljava/lang/Object;"),
+        ],
         // LinkedList = 3 fields (head, tail, size)
         "java/util/LinkedList" => instance_fields(3),
         // LinkedHashMap = 5 fields
@@ -11388,51 +12189,83 @@ fn synthetic_stub_fields(name: &str) -> Vec<cratonvm_reader::field::ClassFileFie
         }
         "java/io/FilterInputStream" => vec![named_field("in", "Ljava/io/InputStream;")],
         "java/io/FilterOutputStream" => vec![named_field("out", "Ljava/io/OutputStream;")],
-        // A real `InputStreamReader` declares ONE field, `sd`, and inherits
-        // `lock` and `skipBuffer` from `java.io.Reader`. There is no `in` on it
-        // anywhere — the wrapped stream lives inside the `StreamDecoder`. The
-        // model used to name slot 0 `in`, which is `Reader.lock`.
+        // ── the java.io Reader/Writer chain, and why slot 0 is spelled two
+        //    different ways in the two builds ────────────────────────────────
         //
-        // The synthetic ISR natives (`native_isr_init` and friends, all
-        // `#[cfg(feature = "synthetic-jdk")]`) park an fd-or-stream at slot 0
-        // and the raw stream at slot 1, so neither slot can be named honestly:
-        // both are `_vmN`. That keeps them in the census as kind 3 rather than
-        // silently agreeing with `lock`/`skipBuffer`.
+        // A real `InputStreamReader` declares ONE field, `sd`, and inherits
+        // `lock` and `skipBuffer` from `java.io.Reader`; a real
+        // `OutputStreamWriter` declares `se` under `writeBuffer` and `lock`;
+        // `BufferedReader` and `BufferedWriter` put `in`/`out` at index 2 for
+        // the same reason. Naming any of them at 0 puts it on `Reader.lock` or
+        // `Writer.writeBuffer`, which is what these four models used to do.
+        //
+        // Slot 0 — and, for `InputStreamReader`, slot 1 — is ALSO where the
+        // synthetic Reader/Writer natives park an fd or a wrapped stream. That
+        // is kind 3: a VM-internal value with no real JDK field to live in.
+        // Every one of those writers is `#[cfg(feature = "synthetic-jdk")]`,
+        // the build in which these classes are ALWAYS fabricated stubs and slot
+        // 0 belongs to nobody else. So the honest model differs by build, and
+        // it is split here rather than papered over with one spelling that is
+        // wrong in one of them:
+        //
+        // * under `synthetic-jdk` the slots stay `_vmN`, which is what keeps
+        //   the overlay COUNTED — an anonymous `_fN` reads as an innocuous
+        //   `pad`, and that is how `Files.newBufferedWriter`'s fd hid inside
+        //   `Writer.writeBuffer` for a day;
+        // * in the default build there is no writer AND no reader. The last
+        //   reader was the `BufferedWriter` natives' fd fast path, and it moved
+        //   behind the same gate `bw_delegate_out` already carried (see
+        //   `native-builtins`'s `phases_late::bw_synthetic_fd`). So the model
+        //   names the real fields, and the census is clean because nothing is
+        //   parked there — not because the model stopped saying so.
+        //
+        // Ungating a registration without moving its slot cannot pass silently
+        // as a result: the natives read slot 0 only under the feature, and this
+        // table is what `shadow_layout`'s production-model test diffs against
+        // the JDK's declaration order.
+        #[cfg(not(feature = "synthetic-jdk"))]
+        "java/io/InputStreamReader" => vec![
+            named_field("lock", "Ljava/lang/Object;"),
+            named_field("skipBuffer", "[C"),
+            named_field("sd", "Lsun/nio/cs/StreamDecoder;"),
+        ],
+        #[cfg(feature = "synthetic-jdk")]
         "java/io/InputStreamReader" => vec![
             vm_internal_field(0),
             vm_internal_field(1),
             named_field("sd", "Lsun/nio/cs/StreamDecoder;"),
         ],
-        // `in` is at 2 on a real `BufferedReader`: `java.io.Reader` declares
-        // `lock` and `skipBuffer` ahead of it. Naming it at 0 put it on `lock`.
-        // Slot 0 is where `native_br_init` copies the wrapped reader's fd, so it
-        // is `_vm0`, not anonymous.
+        #[cfg(not(feature = "synthetic-jdk"))]
+        "java/io/BufferedReader" => vec![
+            named_field("lock", "Ljava/lang/Object;"),
+            named_field("skipBuffer", "[C"),
+            named_field("in", "Ljava/io/Reader;"),
+        ],
+        #[cfg(feature = "synthetic-jdk")]
         "java/io/BufferedReader" => vec![
             vm_internal_field(0),
             named_field("skipBuffer", "[C"),
             named_field("in", "Ljava/io/Reader;"),
         ],
-        // Same shape as `InputStreamReader`: a real `OutputStreamWriter`
-        // declares only `se`, and inherits `writeBuffer` and `lock` from
-        // `java.io.Writer`. `native_osw_init` writes an fd Int at slot 0 —
-        // `writeBuffer`, a `char[]` — and `native_osw_write/flush/close` all
-        // read it back expecting an `Int`, returning silently when it is not.
+        #[cfg(not(feature = "synthetic-jdk"))]
+        "java/io/OutputStreamWriter" => vec![
+            named_field("writeBuffer", "[C"),
+            named_field("lock", "Ljava/lang/Object;"),
+            named_field("se", "Lsun/nio/cs/StreamEncoder;"),
+        ],
+        #[cfg(feature = "synthetic-jdk")]
         "java/io/OutputStreamWriter" => vec![
             vm_internal_field(0),
             named_field("lock", "Ljava/lang/Object;"),
             named_field("se", "Lsun/nio/cs/StreamEncoder;"),
         ],
-        // `out` is at 2 on a real `BufferedWriter`: `java.io.Writer` declares
-        // `writeBuffer` and `lock` ahead of it. Naming it at 0 put it on
-        // `writeBuffer`, a `char[]`.
-        //
-        // Slot 0 is `_vm0`, not `writeBuffer` and not anonymous:
-        // `Files.newBufferedWriter` parks a VM-internal fd there and
-        // `bw_delegate_out` uses "is slot 0 an Int?" to tell its own fd-backed
-        // object from a real one. That overlay is a separate defect (kind 3 —
-        // a VM value with no real field, which belongs in a side table); naming
-        // the slot `_vm0` is what keeps it *counted* until it is fixed. It spent
-        // a day as an anonymous `_f0`, which reads as an innocuous `pad`.
+        #[cfg(not(feature = "synthetic-jdk"))]
+        "java/io/BufferedWriter" => vec![
+            named_field("writeBuffer", "[C"),
+            named_field("lock", "Ljava/lang/Object;"),
+            named_field("out", "Ljava/io/Writer;"),
+        ],
+        #[cfg(feature = "synthetic-jdk")]
         "java/io/BufferedWriter" => vec![
             vm_internal_field(0),
             named_field("lock", "Ljava/lang/Object;"),
@@ -11440,8 +12273,56 @@ fn synthetic_stub_fields(name: &str) -> Vec<cratonvm_reader::field::ClassFileFie
         ],
         "java/io/DataInputStream" | "java/io/DataOutputStream" => instance_fields(1),
         "java/io/FileDescriptor" => instance_fields(4),
-        // PrintStream/PrintWriter = 1 field (fd)
-        "java/io/PrintStream" | "java/io/PrintWriter" => instance_fields(1),
+        // ── PrintStream / PrintWriter ────────────────────────────────────────
+        //
+        // `_f0` is the fd tag (declared slot 0; ABSOLUTE slot 1 for
+        // `PrintStream`, which inherits `FilterOutputStream.out` at absolute
+        // 0 — the print natives read the fd through `out`/raw slot 0, so the
+        // comment this replaces, "= 1 field (fd)", named the wrong slot).
+        //
+        // `trouble` is the JDK's own field, not a VM-internal one, so it is
+        // spelled with its real name rather than `_vmN`: it is what
+        // `checkError()` returns, and `PrintStream`/`PrintWriter`'s
+        // `catch (IOException x) { trouble = true; }` bodies are the only
+        // things that set it. Without a slot for it, a synthetic-mode
+        // `checkError()` has nothing to read and the absorbed failure is
+        // unobservable rather than merely unthrown.
+        // W7-64-printstream-trouble-and-errormanager.md
+        //
+        // Its INDEX is not the real image's — the real `java.io.PrintStream`
+        // declares `trouble` at absolute 4, behind `out`/`closed`/`closeLock`/
+        // `autoFlush`. That divergence is real and `shadow_layout`'s
+        // `diff_against_model` is right to report it under
+        // `CRATONVM_DBG_OVERLAY`; it is harmless because nothing addresses
+        // `trouble` positionally. Every reader and writer goes through
+        // `native-api`'s `print_error_state`, which resolves it BY NAME —
+        // landing on the real slot in Compatible mode and on this one in
+        // synthetic mode, with no `#[cfg]` at the call sites.
+        //
+        // `closing` is `PrintStream`'s and only `PrintStream`'s: the real
+        // class declares `private boolean closing` ("to avoid recursive
+        // closing") and `java.io.PrintWriter` declares no such field — it uses
+        // `out == null` as its closed marker instead. So the one arm the two
+        // classes used to share is split here rather than growing a field one
+        // of them does not have: `print_error_state::is_closing` would then
+        // answer for a `PrintWriter` too, while `native_printwriter_close`
+        // deliberately latches nothing. `closing` carries the JDK's own name
+        // for the same reason `trouble` does, and is likewise resolved BY NAME
+        // at every reader and writer, so its index here diverging from the
+        // real image's is a true report for `diff_against_model` to make and
+        // harmless in fact.
+        // W7-70-printstream-close-noop.md
+        "java/io/PrintStream" => {
+            let mut fields = instance_fields(1);
+            fields.push(named_field("trouble", "Z"));
+            fields.push(named_field("closing", "Z"));
+            fields
+        }
+        "java/io/PrintWriter" => {
+            let mut fields = instance_fields(1);
+            fields.push(named_field("trouble", "Z"));
+            fields
+        }
         // T1.10 — corrected StringReader/StringWriter shapes to match
         // the real native init code in `native-io/src/lib.rs`:
         //   StringReader = 3 fields (content, pos, length) per
@@ -11814,7 +12695,7 @@ fn synthetic_stub_fields(name: &str) -> Vec<cratonvm_reader::field::ClassFileFie
         // one way no value-tag census can see: a `ThreadGroup` reference over a
         // `String` reference and an `int` over an `int` both type-check. The
         // L4 shadow-layout diff reported all four
-        // (`docs/known-issues/jdk-only/fabricated-object-layouts-leak-into-native-code.md`).
+        // (`fixed-bugs/jdk-only-fabricated-object-layouts-FIXED-20260810.md`).
         //
         // The natives in `native-builtins/src/phases_late/concurrent.rs`
         // resolve these by NAME first and only fall back to a hard-coded index,
@@ -11848,15 +12729,17 @@ fn synthetic_stub_fields(name: &str) -> Vec<cratonvm_reader::field::ClassFileFie
                 attributes: vec![],
             },
         ],
-        // ThreadLocal native semantics live in side tables, but slot 0 remains
-        // part of the synthetic compatibility layout.
+        // ThreadLocal native semantics live in side tables keyed by identity
+        // hash; the object itself carries nothing.
+        //
+        // The model used to name slot 0 `value:Ljava/lang/Object;`, which a
+        // real `java.lang.ThreadLocal` declares as `threadLocalHashCode:I` --
+        // its ONE instance field, and the int the real `ThreadLocalMap` hashes
+        // with. Naming the real field is what it is: the fabricated stub gets
+        // one unused int, and the shadow-layout diff agrees with the image
+        // instead of reporting a slot nobody uses.
         "java/lang/ThreadLocal" | "java/lang/InheritableThreadLocal" => {
-            vec![ClassFileField {
-                access_flags: FieldAccessFlags::empty(),
-                name: cratonvm_types::intern_arc("value"),
-                descriptor: cratonvm_types::intern_arc("Ljava/lang/Object;"),
-                attributes: vec![],
-            }]
+            vec![named_field("threadLocalHashCode", "I")]
         }
         "java/lang/Thread$State" => pad_to(
             vec![
@@ -11925,12 +12808,29 @@ fn synthetic_stub_fields(name: &str) -> Vec<cratonvm_reader::field::ClassFileFie
             2,
         ),
 
-        // Atomic types: 1 field (value=0)
-        "java/util/concurrent/atomic/AtomicInteger"
-        | "java/util/concurrent/atomic/AtomicLong"
-        | "java/util/concurrent/atomic/AtomicBoolean"
-        | "java/util/concurrent/atomic/AtomicReference"
-        | "java/util/concurrent/atomic/AtomicStampedReference"
+        // Atomic types: 1 field at slot 0, and it is `value` — the name and
+        // descriptor the real classes declare, not an `_f0` placeholder.
+        //
+        // The slot INDEX is unchanged, so every native that addresses it
+        // positionally is unaffected; what changes is that a by-NAME lookup
+        // now resolves. `findVarHandle(AtomicLong.class, "value", long.class)`
+        // used to be answered by a by-name fallback that laundered a failed
+        // resolution (removed in a01ccc442), and once that laundering was gone
+        // the honest answer here was `NoSuchFieldException` — because the stub
+        // declared no field by that name to find.
+        //
+        // `AtomicStampedReference` / `AtomicMarkableReference` keep the
+        // placeholder: their real single field is `pair`, a reference to a
+        // private `Pair` record this VM does not model, so naming the slot
+        // `value` would be a fabrication rather than a correction.
+        "java/util/concurrent/atomic/AtomicInteger" => vec![named_field("value", "I")],
+        "java/util/concurrent/atomic/AtomicLong" => vec![named_field("value", "J")],
+        // Real `AtomicBoolean.value` is an `int`, not a `boolean`.
+        "java/util/concurrent/atomic/AtomicBoolean" => vec![named_field("value", "I")],
+        "java/util/concurrent/atomic/AtomicReference" => {
+            vec![named_field("value", "Ljava/lang/Object;")]
+        }
+        "java/util/concurrent/atomic/AtomicStampedReference"
         | "java/util/concurrent/atomic/AtomicMarkableReference" => instance_fields(1),
         // Atomic arrays: 2 fields (array=0, length=1)
         "java/util/concurrent/atomic/AtomicIntegerArray"
@@ -14296,6 +15196,32 @@ fn synthetic_stub_fields(name: &str) -> Vec<cratonvm_reader::field::ClassFileFie
         // arrayMapping.
         "com/sun/jmx/mbeanserver/MappedMXBeanType" => instance_fields(4),
 
+        // Throwable-family fallback: the three slots every Throwable native in
+        // `native-builtins::lang_misc` addresses when a synthetic receiver
+        // resolves neither a cached field index nor a field NAME —
+        // `synthetic_throwable_slot`'s map, which is
+        // `[0] = detailMessage, [1] = cause, [2] = suppressedExceptions`.
+        //
+        // Without this arm those classes reach `_ => vec![]`, i.e. ZERO instance
+        // fields, and every one of those writes is dropped by its own
+        // `slot < object_num_fields(this)` guard. A synthetic stub's superclass
+        // is a blanket `java/lang/Object` unless special-cased (see
+        // `synthetic_superclass`), so a throwable stub does NOT inherit
+        // `java.lang.Throwable`'s layout the way the real hierarchy would.
+        //
+        // Measured: with the constructors registered but this arm absent,
+        // `new ParseException("bad", 5).getMessage()` answered null on a VM that
+        // had just been handed "bad" — the constructor ran and stored nothing.
+        // The classes that already worked (`IllegalStateException`, `IOException`)
+        // are the ones with an explicit entry above; ordering matters, so this
+        // arm must stay LAST and catch only what nothing else claimed.
+        name if name == "java/lang/Throwable"
+            || name.ends_with("Exception")
+            || name.ends_with("Error") =>
+        {
+            instance_fields(3)
+        }
+
         _ => vec![],
     }
 }
@@ -14334,6 +15260,182 @@ fn native_constant_surface_raw_slot_layout_audit() {
     }
 }
 
+/// The four constructor descriptors a throwable-family class is ASSUMED to have
+/// when this table has not measured it.
+///
+/// They are the `Throwable` set, and for a class that really does declare all
+/// four (`Exception`, `RuntimeException`, `IOException`, …) they are exactly
+/// right. The assumption is what [`throwable_ctor_descriptors`] exists to stop
+/// applying to classes where it is false.
+pub const THROWABLE_DEFAULT_CTORS: &[&str] = &[
+    "()V",
+    "(Ljava/lang/String;)V",
+    "(Ljava/lang/String;Ljava/lang/Throwable;)V",
+    "(Ljava/lang/Throwable;)V",
+];
+
+/// The PUBLIC constructor descriptors JDK 25 declares for a throwable-family
+/// class — measured, not assumed.
+///
+/// # Why this table exists
+///
+/// Both the synthetic stub's method table (below) and the native registry
+/// (`native-builtins::register_throwable_subclass_natives`) used to declare the
+/// same blanket four: `()V`, `(String)V`, `(String,Throwable)V`, `(Throwable)V`.
+/// Reflected against JDK 25 across the 62 classes that registrar names, those
+/// four are **not a public constructor 103 times**, and **16 public
+/// constructors javac actually emits were absent**.
+///
+/// Both halves of that are bugs, and they are different bugs:
+///
+/// * A **missing** descriptor is a `NoSuchMethodError` at a call site that
+///   compiles fine. The worst is `java.lang.AssertionError`: its `(String)V` is
+///   PRIVATE, and both `throw new AssertionError(msg)` and `assert cond : msg`
+///   compile to `<init>:(Ljava/lang/Object;)V` — which was neither registered
+///   nor declared. It is the single most reachable gap in the census: the error
+///   path of anything using `assert`.
+/// * A **dead** descriptor is a fabricated constructor that the real class does
+///   not have. It can only ever win a race it should lose — shadowing real JDK
+///   bytecode in Compatible mode, or, in synthetic-JDK mode, letting code
+///   compile against a shape the JDK would have rejected.
+///
+/// # One table, two consumers
+///
+/// The stub's method table and the registry MUST agree about which constructors
+/// exist, or a call resolves against a declaration with no implementation (or
+/// the reverse). They are in different crates, so the list lives here — the
+/// crate `native-builtins` already depends on — and both read it.
+///
+/// # The default is deliberate
+///
+/// `None`/unknown falls back to [`THROWABLE_DEFAULT_CTORS`]. The caller's
+/// `is_throwable_like` test is a NAME heuristic (`ends_with("Exception")`),
+/// so it fires for application classes this table has never seen; those still
+/// need the common four. Only the classes measured against a real JDK get an
+/// exact answer.
+///
+/// Measured 2026-08-13 with `probes/ThrowableCtorCensusProbe.java` against
+/// JDK 25 (`/data/toolchain/jdk-25`) by reflecting `getDeclaredConstructors()`
+/// and keeping the public ones. Re-run it after a JDK bump.
+pub fn throwable_ctor_descriptors(name: &str) -> &'static [&'static str] {
+    match name {
+        // -- the full four, genuinely --
+        "java/lang/Throwable"
+        | "java/lang/Exception"
+        | "java/lang/RuntimeException"
+        | "java/lang/Error"
+        | "java/lang/SecurityException"
+        | "java/lang/ReflectiveOperationException"
+        | "java/lang/IllegalArgumentException"
+        | "java/lang/IllegalStateException"
+        | "java/lang/UnsupportedOperationException"
+        | "java/util/NoSuchElementException"
+        | "java/io/IOException"
+        | "java/util/ConcurrentModificationException"
+        | "java/util/concurrent/RejectedExecutionException"
+        | "java/lang/InternalError" => THROWABLE_DEFAULT_CTORS,
+
+        // -- message-only families: no cause-taking constructor at all --
+        "java/lang/NoClassDefFoundError"
+        | "java/lang/NoSuchMethodError"
+        | "java/lang/NoSuchFieldError"
+        | "java/lang/NoSuchMethodException"
+        | "java/lang/NoSuchFieldException"
+        | "java/lang/CloneNotSupportedException"
+        | "java/lang/InstantiationException"
+        | "java/lang/IllegalAccessException"
+        | "java/lang/reflect/InaccessibleObjectException"
+        | "java/lang/InterruptedException"
+        | "java/lang/NullPointerException"
+        | "java/lang/ArithmeticException"
+        | "java/lang/ClassCastException"
+        | "java/lang/StackOverflowError"
+        | "java/lang/OutOfMemoryError"
+        | "java/util/InputMismatchException"
+        | "java/io/FileNotFoundException"
+        | "java/io/NotSerializableException"
+        | "java/io/EOFException"
+        | "java/io/UnsupportedEncodingException"
+        | "java/net/MalformedURLException"
+        | "java/net/UnknownHostException"
+        | "java/lang/NumberFormatException"
+        | "java/util/concurrent/TimeoutException"
+        | "java/util/concurrent/CancellationException"
+        | "java/util/concurrent/BrokenBarrierException"
+        | "java/lang/NegativeArraySizeException"
+        | "java/lang/IncompatibleClassChangeError"
+        | "java/lang/IllegalAccessError"
+        | "java/lang/VerifyError"
+        | "java/lang/AbstractMethodError"
+        | "java/lang/UnsatisfiedLinkError" => &["()V", "(Ljava/lang/String;)V"],
+
+        "java/lang/LinkageError" => &[
+            "()V",
+            "(Ljava/lang/String;)V",
+            "(Ljava/lang/String;Ljava/lang/Throwable;)V",
+        ],
+        "java/lang/ClassNotFoundException" => &[
+            "()V",
+            "(Ljava/lang/String;)V",
+            "(Ljava/lang/String;Ljava/lang/Throwable;)V",
+        ],
+        "java/lang/ExceptionInInitializerError" => {
+            &["()V", "(Ljava/lang/String;)V", "(Ljava/lang/Throwable;)V"]
+        }
+
+        // -- cause-only --
+        "java/util/concurrent/CompletionException" | "java/util/concurrent/ExecutionException" => {
+            &[
+                "(Ljava/lang/Throwable;)V",
+                "(Ljava/lang/String;Ljava/lang/Throwable;)V",
+            ]
+        }
+        "java/lang/TypeNotPresentException" | "java/lang/MatchException" => {
+            &["(Ljava/lang/String;Ljava/lang/Throwable;)V"]
+        }
+        "java/util/FormatterClosedException" => &["()V"],
+
+        // -- the index families: an `int`/`long` overload nobody registered --
+        "java/lang/ArrayIndexOutOfBoundsException"
+        | "java/lang/StringIndexOutOfBoundsException" => {
+            &["()V", "(Ljava/lang/String;)V", "(I)V"]
+        }
+        "java/lang/IndexOutOfBoundsException" => {
+            &["()V", "(Ljava/lang/String;)V", "(I)V", "(J)V"]
+        }
+
+        // -- `AssertionError`: the headline. `(String)V` and `(Throwable)V` are
+        //    NOT public; `(Object)V` is what `assert x : msg` compiles to.
+        "java/lang/AssertionError" => &[
+            "()V",
+            "(Ljava/lang/Object;)V",
+            "(Z)V",
+            "(C)V",
+            "(I)V",
+            "(J)V",
+            "(F)V",
+            "(D)V",
+            "(Ljava/lang/String;Ljava/lang/Throwable;)V",
+        ],
+
+        // -- classes where ALL FOUR blanket descriptors are dead --
+        "java/io/UncheckedIOException" => &[
+            "(Ljava/io/IOException;)V",
+            "(Ljava/lang/String;Ljava/io/IOException;)V",
+        ],
+        "java/util/MissingResourceException" => {
+            &["(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)V"]
+        }
+        "java/text/ParseException" => &["(Ljava/lang/String;I)V"],
+        "java/lang/reflect/InvocationTargetException" => &[
+            "(Ljava/lang/Throwable;)V",
+            "(Ljava/lang/Throwable;Ljava/lang/String;)V",
+        ],
+
+        _ => THROWABLE_DEFAULT_CTORS,
+    }
+}
+
 fn synthetic_stub_ctor_methods(name: &str) -> Vec<ClassFileMethod> {
     let mut out = Vec::new();
     let mk_ctor = |descriptor: &str| ClassFileMethod {
@@ -14345,12 +15447,11 @@ fn synthetic_stub_ctor_methods(name: &str) -> Vec<ClassFileMethod> {
     let is_throwable_like =
         name == "java/lang/Throwable" || name.ends_with("Exception") || name.ends_with("Error");
     if is_throwable_like {
-        out.extend([
-            mk_ctor("()V"),
-            mk_ctor("(Ljava/lang/String;)V"),
-            mk_ctor("(Ljava/lang/Throwable;)V"),
-            mk_ctor("(Ljava/lang/String;Ljava/lang/Throwable;)V"),
-        ]);
+        // Per class, from the table above — NOT a blanket four. This half and
+        // `native-builtins::register_throwable_subclass_natives` read the same
+        // list on purpose: a declaration here with no registration there is a
+        // method that resolves and then has no body.
+        out.extend(throwable_ctor_descriptors(name).iter().map(|d| mk_ctor(d)));
     }
     if name == "java/lang/reflect/InvocationTargetException" {
         let mk = |method: &str, descriptor: &str| ClassFileMethod {
@@ -14598,8 +15699,19 @@ fn synthetic_stub_ctor_methods(name: &str) -> Vec<ClassFileMethod> {
             descriptor: cratonvm_types::intern_arc(descriptor),
             attributes: vec![],
         };
+        // All SIX abstracts `javap 'java.lang.ProcessHandle$Info'` declares on
+        // JDK 25 — `commandLine` included. It was the one this list omitted, and
+        // the omission was load-bearing rather than cosmetic: a name absent here
+        // fails at RESOLUTION, before native dispatch is reached, so
+        // `phases_late.rs`'s `commandLine` registration (W7-10 §4) could only
+        // ever be reached on a real JDK. `regression-suite/src/RJdkStrict.java`
+        // asserts this surface as an exact six-name list, which is the assertion
+        // that goes red when a seventh abstract appears on a future image or a
+        // row is dropped from here again.
+        // docs/known-issues/jdk-only/W7-10-processhandle-interface-stub-bodies.md
         out.extend([
             mk("command", "()Ljava/util/Optional;"),
+            mk("commandLine", "()Ljava/util/Optional;"),
             mk("arguments", "()Ljava/util/Optional;"),
             mk("user", "()Ljava/util/Optional;"),
             mk("startInstant", "()Ljava/util/Optional;"),
@@ -16096,6 +17208,121 @@ mod tests {
         ConstantPool::new(vec![ConstantPoolEntry::Tombstone])
     }
 
+    /// The JCA exception hierarchy in the verifier's static fallback table,
+    /// pinned against the HotSpot 25 transcript in
+    /// `probes/JcaExceptionTypeProbe.expected.txt` section H.
+    ///
+    /// Written as a ratchet rather than a spot check because the table is a
+    /// FALLBACK: a wrong or missing row does not fail loudly, it silently
+    /// widens a merge to `Object` or answers "not a subclass" — which is how
+    /// the whole `javax.crypto` half came to be absent while the `java.security`
+    /// half was present and mostly right. The `javax.crypto` classes are the
+    /// ones W7-71 made this VM raise from the RSA, AES-GCM and key-wrap paths.
+    #[test]
+    fn jca_exception_hierarchy_matches_hotspot() {
+        // (child, immediate superclass) — every pair MEASURED, not inferred.
+        let direct = [
+            ("java/security/GeneralSecurityException", "java/lang/Exception"),
+            (
+                "javax/crypto/BadPaddingException",
+                "java/security/GeneralSecurityException",
+            ),
+            (
+                "javax/crypto/AEADBadTagException",
+                "javax/crypto/BadPaddingException",
+            ),
+            (
+                "javax/crypto/IllegalBlockSizeException",
+                "java/security/GeneralSecurityException",
+            ),
+            (
+                "javax/crypto/NoSuchPaddingException",
+                "java/security/GeneralSecurityException",
+            ),
+            (
+                "javax/crypto/ShortBufferException",
+                "java/security/GeneralSecurityException",
+            ),
+            ("java/security/InvalidKeyException", "java/security/KeyException"),
+            (
+                "java/security/UnrecoverableKeyException",
+                "java/security/UnrecoverableEntryException",
+            ),
+            (
+                "java/security/spec/InvalidKeySpecException",
+                "java/security/GeneralSecurityException",
+            ),
+            (
+                "java/security/SignatureException",
+                "java/security/GeneralSecurityException",
+            ),
+            (
+                "java/security/DigestException",
+                "java/security/GeneralSecurityException",
+            ),
+            (
+                "java/security/InvalidAlgorithmParameterException",
+                "java/security/GeneralSecurityException",
+            ),
+        ];
+        for (child, parent) in direct {
+            assert_eq!(
+                jdk_superclass(child),
+                parent,
+                "{child} must extend {parent} exactly (HotSpot 25, measured)"
+            );
+        }
+
+        // The transitive question the fallback actually gets asked. Each of
+        // these answered FALSE before the `javax.crypto` rows existed.
+        for child in [
+            "javax/crypto/BadPaddingException",
+            "javax/crypto/AEADBadTagException",
+            "javax/crypto/IllegalBlockSizeException",
+            "javax/crypto/ShortBufferException",
+            "java/security/SignatureException",
+            "java/security/UnrecoverableKeyException",
+            "java/security/spec/InvalidKeySpecException",
+        ] {
+            assert!(
+                jdk_name_is_subclass(child, "java/security/GeneralSecurityException"),
+                "{child} must be catchable as GeneralSecurityException"
+            );
+            assert!(
+                jdk_name_is_subclass(child, "java/lang/Exception"),
+                "{child} must be a checked Exception, not an Error"
+            );
+        }
+
+        // THE AEAD LINK, on its own. Flattening `AEADBadTagException` straight
+        // to `GeneralSecurityException` would satisfy every assertion above and
+        // break the one relationship that decides whether a GCM tag failure is
+        // caught by `catch (BadPaddingException)`.
+        assert!(
+            jdk_name_is_subclass(
+                "javax/crypto/AEADBadTagException",
+                "javax/crypto/BadPaddingException"
+            ),
+            "a GCM tag failure must be catchable as BadPaddingException"
+        );
+
+        // Anti-vacuity: the walk must be able to say NO. Two siblings are not
+        // each other's ancestors, and a JCA exception is not a RuntimeException
+        // — the latter is the whole distinction W7-71 is about.
+        assert!(!jdk_name_is_subclass(
+            "javax/crypto/BadPaddingException",
+            "javax/crypto/IllegalBlockSizeException"
+        ));
+        assert!(!jdk_name_is_subclass(
+            "javax/crypto/BadPaddingException",
+            "java/lang/RuntimeException"
+        ));
+        assert!(!jdk_name_is_subclass(
+            "java/security/SignatureException",
+            "java/lang/RuntimeException"
+        ));
+    }
+
     fn make_field(name: &str, is_static: bool) -> cratonvm_reader::field::ClassFileField {
         let flags = if is_static {
             FieldAccessFlags::STATIC
@@ -16353,14 +17580,14 @@ mod tests {
 
         // Object must be loaded before any synthetic object is allocated;
         // mirror that ordering here.
-        let object_id = cm.ensure_synthetic_class("java/lang/Object", 0);
+        let object_id = cm.try_ensure_synthetic_class("java/lang/Object", 0).expect("Compatible mode fabricates; this fixture never runs under --jdk-only");
         assert_eq!(
             cm.get_class(object_id).and_then(|c| c.superclass),
             None,
             "java/lang/Object must not have a superclass"
         );
 
-        let anon_id = cm.ensure_synthetic_class("cratonvm/synthetic/AnonymousObject$4", 4);
+        let anon_id = cm.try_ensure_synthetic_class("cratonvm/synthetic/AnonymousObject$4", 4).expect("Compatible mode fabricates; this fixture never runs under --jdk-only");
         assert_ne!(anon_id, object_id, "AnonymousObject is a distinct class");
         assert_eq!(
             cm.get_class(anon_id).and_then(|c| c.superclass),
@@ -16375,8 +17602,8 @@ mod tests {
     #[test]
     fn exact_user_class_unload_preserves_live_siblings_in_the_same_namespace() {
         let mut cm = ClassManager::new(&[], &[], &[]);
-        let dead = cm.ensure_synthetic_class("test/proxy/Dead", 0);
-        let live = cm.ensure_synthetic_class("test/proxy/Live", 0);
+        let dead = cm.try_ensure_synthetic_class("test/proxy/Dead", 0).expect("Compatible mode fabricates; this fixture never runs under --jdk-only");
+        let live = cm.try_ensure_synthetic_class("test/proxy/Live", 0).expect("Compatible mode fabricates; this fixture never runs under --jdk-only");
         let namespace = ClassLoaderId::UserDefined(77);
         cm.class_store.get_mut(dead).unwrap().loader_id = namespace;
         cm.class_store.get_mut(live).unwrap().loader_id = namespace;
@@ -16399,8 +17626,8 @@ mod tests {
     fn synthetic_array_stub_has_no_superclass() {
         // Array synthetic stubs are special-cased and keep `superclass = None`.
         let mut cm = ClassManager::new(&[], &[], &[]);
-        cm.ensure_synthetic_class("java/lang/Object", 0);
-        let arr_id = cm.ensure_synthetic_class("[Lcratonvm/synthetic/Foo;", 0);
+        cm.try_ensure_synthetic_class("java/lang/Object", 0).expect("Compatible mode fabricates; this fixture never runs under --jdk-only");
+        let arr_id = cm.try_ensure_synthetic_class("[Lcratonvm/synthetic/Foo;", 0).expect("Compatible mode fabricates; this fixture never runs under --jdk-only");
         assert_eq!(cm.get_class(arr_id).and_then(|c| c.superclass), None);
     }
 
@@ -16466,10 +17693,10 @@ mod tests {
     #[test]
     fn synthetic_function_identity_implements_function() {
         let mut cm = ClassManager::new(&[], &[], &[]);
-        cm.ensure_synthetic_class("java/lang/Object", 0);
-        let function_id = cm.ensure_synthetic_class("java/util/function/Function", 0);
-        cm.ensure_synthetic_class("java/util/function/UnaryOperator", 0);
-        let identity_id = cm.ensure_synthetic_class("java/util/function/Function$Identity", 0);
+        cm.try_ensure_synthetic_class("java/lang/Object", 0).expect("Compatible mode fabricates; this fixture never runs under --jdk-only");
+        let function_id = cm.try_ensure_synthetic_class("java/util/function/Function", 0).expect("Compatible mode fabricates; this fixture never runs under --jdk-only");
+        cm.try_ensure_synthetic_class("java/util/function/UnaryOperator", 0).expect("Compatible mode fabricates; this fixture never runs under --jdk-only");
+        let identity_id = cm.try_ensure_synthetic_class("java/util/function/Function$Identity", 0).expect("Compatible mode fabricates; this fixture never runs under --jdk-only");
 
         let identity = cm
             .get_class(identity_id)
@@ -17247,7 +18474,7 @@ mod tests {
     #[test]
     fn synthetic_upgrade_resets_embedded_initialization_fast_path() {
         let mut manager = ClassManager::new(&[], &[], &[]);
-        let class_id = manager.ensure_synthetic_class("Foo", 0);
+        let class_id = manager.try_ensure_synthetic_class("Foo", 0).expect("Compatible mode fabricates; this fixture never runs under --jdk-only");
         manager.set_class_init_state(class_id, CLASS_INIT_INITIALIZED);
 
         manager
@@ -17286,7 +18513,7 @@ mod tests {
     #[test]
     fn a_user_loader_upgrading_a_bootstrap_stub_takes_the_map_key_with_it() {
         let mut mgr = ClassManager::new(&[], &[], &[]);
-        let id = mgr.ensure_synthetic_class("Foo", 0);
+        let id = mgr.try_ensure_synthetic_class("Foo", 0).expect("Compatible mode fabricates; this fixture never runs under --jdk-only");
 
         // Precondition: the stub really is bootstrap-keyed.
         assert_eq!(
@@ -17356,7 +18583,7 @@ mod tests {
         let first = ClassLoaderId::UserDefined(0x5EED_0002);
         let second = ClassLoaderId::UserDefined(0x5EED_0003);
 
-        let id_a = mgr.ensure_synthetic_class("Foo", 0);
+        let id_a = mgr.try_ensure_synthetic_class("Foo", 0).expect("Compatible mode fabricates; this fixture never runs under --jdk-only");
         mgr.upgrade_synthetic_class(id_a, "Foo", v1.clone().into(), first)
             .expect("first loader upgrades the stub");
 
@@ -17497,12 +18724,18 @@ mod tests {
         );
     }
 
-    /// The infallible spelling has no channel for the refusal, so it must
-    /// degrade to something that is still a *miss*: a distinctly-named,
-    /// correctly-sized stand-in. What it must never do is the thing it used to
-    /// do — mint a stub under the ambiguous name itself.
+    /// A caller with no channel for the refusal has to degrade to something
+    /// that is still a *miss*: a distinctly-named, correctly-sized stand-in.
+    /// What it must never do is the thing the deleted `ensure_synthetic_class`
+    /// used to do — mint a stub under the ambiguous name itself.
+    ///
+    /// The entry point is gone (JDK-only wave 2, step 3, 2026-08-10) and the
+    /// degradation is not: `ensure_generated_class` still reaches it, and so
+    /// does any future caller that genuinely cannot report a failure. This
+    /// exercises `ambiguity_stand_in` directly for that reason — the property
+    /// belongs to the stand-in, not to the spelling that used to ask for it.
     #[test]
-    fn ensure_synthetic_class_hands_back_a_stand_in_not_a_shadowing_stub() {
+    fn the_ambiguity_stand_in_is_a_miss_not_a_shadowing_stub() {
         let v1 = include_bytes!("../tests/fixtures/wp2_4b_redefine/Foo.v1.class").to_vec();
         let mut mgr = ClassManager::new(&[], &[], &[]);
         let first = ClassLoaderId::UserDefined(0x5EED_0012);
@@ -17510,7 +18743,10 @@ mod tests {
         let id_a = mgr.define_class("Foo", &v1, first).expect("loader A");
         let id_b = mgr.define_class("Foo", &v1, second).expect("loader B");
 
-        let stand_in = mgr.ensure_synthetic_class("Foo", 3);
+        // The fallible spelling refuses outright — that is the row above this
+        // test. This is what a caller that cannot carry the refusal gets.
+        assert!(mgr.try_ensure_synthetic_class("Foo", 3).is_err());
+        let stand_in = mgr.ambiguity_stand_in("Foo", 3);
 
         assert_ne!(stand_in, id_a);
         assert_ne!(stand_in, id_b);
@@ -17555,10 +18791,10 @@ mod tests {
 
         // Idempotent: the same request returns the same stand-in rather than
         // minting one per allocation.
-        assert_eq!(mgr.ensure_synthetic_class("Foo", 3), stand_in);
+        assert_eq!(mgr.ambiguity_stand_in("Foo", 3), stand_in);
         // A different requested shape gets its own stand-in, so a later,
         // larger request is not served an undersized layout.
-        let wider = mgr.ensure_synthetic_class("Foo", 9);
+        let wider = mgr.ambiguity_stand_in("Foo", 9);
         assert_ne!(wider, stand_in);
         assert_eq!(
             mgr.get_class(wider).expect("wider stand-in").num_total_fields,
@@ -17574,13 +18810,13 @@ mod tests {
         let mut mgr = ClassManager::new(&[], &[], &[]);
 
         // Absent → fabricate, filed under the bootstrap loader, memoized.
-        let id = mgr.ensure_synthetic_class("p/Absent", 2);
+        let id = mgr.try_ensure_synthetic_class("p/Absent", 2).expect("Compatible mode fabricates; this fixture never runs under --jdk-only");
         assert_eq!(&*mgr.get_class(id).expect("minted").name, "p/Absent");
         assert_eq!(
             loaded_classes_probe(&mgr.loaded_classes, ClassLoaderId::Bootstrap, "p/Absent"),
             Some(id),
         );
-        assert_eq!(mgr.ensure_synthetic_class("p/Absent", 2), id);
+        assert_eq!(mgr.try_ensure_synthetic_class("p/Absent", 2).expect("Compatible mode fabricates; this fixture never runs under --jdk-only"), id);
         assert_eq!(
             mgr.classify_loaded_name("p/Absent"),
             NameResolution::Unique(id),
@@ -17856,7 +19092,7 @@ mod tests {
 
         // Legacy state: the array is synthesised while its component is still
         // a bootstrap-keyed synthetic stub.
-        let component = mgr.ensure_synthetic_class("Foo", 0);
+        let component = mgr.try_ensure_synthetic_class("Foo", 0).expect("Compatible mode fabricates; this fixture never runs under --jdk-only");
         let array = mgr
             .load_class("[LFoo;")
             .expect("array synthesis without I/O");
@@ -18288,6 +19524,31 @@ mod tests {
             );
         }
 
+        // The `$Info` carrier must declare ALL SIX of the image's abstracts. A
+        // name missing here fails at resolution, before native dispatch, so the
+        // matching `phases_late.rs` registration is unreachable — which is
+        // exactly what happened to `commandLine` until 2026-08-12 (W7-10 §7.3).
+        // Asserted as an exact set, not a `contains` sweep, because the failure
+        // mode is an omission and a `contains` loop over five names cannot see a
+        // sixth going missing. Mirrors `RJdkStrict.processHandleInfo`.
+        let mut info_methods: Vec<String> = synthetic_stub_ctor_methods("java/lang/ProcessHandle$Info")
+            .iter()
+            .map(|m| m.name.to_string())
+            .collect();
+        info_methods.sort();
+        assert_eq!(
+            info_methods,
+            vec![
+                "arguments".to_string(),
+                "command".to_string(),
+                "commandLine".to_string(),
+                "startInstant".to_string(),
+                "totalCpuDuration".to_string(),
+                "user".to_string(),
+            ],
+            "the fabricated ProcessHandle$Info must declare the image's six abstracts",
+        );
+
         let mut manager = ClassManager::new(&[], &[], &[]);
         let handle_id = manager
             .load_class("java/lang/ProcessHandle")
@@ -18333,7 +19594,7 @@ mod tests {
         // generated proxy — carries the ctor in its method table, so the
         // super-ctor resolution that previously failed now succeeds.
         let mut cm = ClassManager::new(&[], &[], &[]);
-        let super_id = cm.ensure_synthetic_class("java/lang/reflect/Proxy$Instance", 3);
+        let super_id = cm.try_ensure_synthetic_class("java/lang/reflect/Proxy$Instance", 3).expect("Compatible mode fabricates; this fixture never runs under --jdk-only");
         let registered = cm
             .get_class(super_id)
             .expect("synthetic Proxy$Instance must be registered");
@@ -19222,7 +20483,7 @@ mod tests {
     #[test]
     fn synthetic_stub_has_no_vtable_and_no_dispatchable_body() {
         let mut mgr = ClassManager::new(&[], &[], &[]);
-        let id = mgr.ensure_synthetic_class("java/lang/Throwable", 2);
+        let id = mgr.try_ensure_synthetic_class("java/lang/Throwable", 2).expect("Compatible mode fabricates; this fixture never runs under --jdk-only");
 
         assert!(
             mgr.class_store

@@ -31,7 +31,7 @@ use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
 use cratonvm_types::error::MethodCallResult;
 use cratonvm_types::Value;
 
-use crate::alloc_concurrent_synthetic;
+use crate::try_alloc_concurrent_synthetic;
 
 /// Process-wide demand counter for `Flow.Subscription.request(long)`.
 ///
@@ -261,6 +261,20 @@ fn register_basestream_mode_overrides(registry: &mut NativeMethodRegistry) {
 /// `Stream` interface object that lost its concrete pipeline class — the
 /// original Round-63 case for Spring's `stream().iterator()` default-method
 /// path) do we fall back to a fresh empty `Collections$EmptyIterator`.
+///
+/// THIS IS NOT THE ONLY IMPLEMENTATION OF THIS DESCRIPTOR, and for the two
+/// registrations that matter most it is not the one that runs. This function is
+/// registered on all five of `BaseStream`/`Stream`/`IntStream`/`LongStream`/
+/// `DoubleStream`, but `native-collections`' `native_stream_iterator`
+/// re-registers `BaseStream` and `Stream` and native-collections registers
+/// AFTER native-builtins (last-writer-wins, see `vm/src/vm/vm_init.rs`), so
+/// those two land there instead. Measured, not inferred: under `--jdk-only`,
+/// `((BaseStream<?,?>) IntStream.rangeClosed(1,3)).iterator()` returns a
+/// `java.util.Arrays$ArrayItr` — native-collections' landing — and never the
+/// `java/util/ServiceLoader$Itr` this function builds. So a boxing fix applied
+/// only here (as W7-2 §9.2 first did) leaves the reachable half untouched;
+/// `box_primitive_stream_elements` is that function's counterpart and both must
+/// stay. See W7-2 §9.5.
 fn native_stream_empty_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // When the receiver carries its backing element array at field slot 0
     // (every CratonVM synthetic Stream/IntStream/... — the same array
@@ -282,11 +296,29 @@ fn native_stream_empty_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> 
             // no backing array → empty iterator.
             _ => ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0),
         };
+        // W7-2 §3: this same registration serves `IntStream`/`LongStream`/
+        // `DoubleStream`, whose backing array is a PRIMITIVE `int[]`/`long[]`/
+        // `double[]` (`make_int_stream` allocates one deliberately, because a
+        // reference array coerces `Value::Int` to null). `ServiceLoader$Itr.next`
+        // is declared `()Ljava/lang/Object;`, so handing those elements straight
+        // back puts a bare `Value::Int` where the caller — and the GC — expects
+        // a reference: the primitive-in-a-reference-store species of W7-84, not
+        // a wrong answer but an untyped word. Box first.
+        //
+        // The record predicted "answers EMPTY" here; that is STALE — the
+        // Hibernate `JoinedList` fix already made this read the backing array.
+        // What survived is the boxing half.
+        //
+        // Scanned rather than copied unconditionally: a reference stream (the
+        // overwhelmingly common receiver, and the Hibernate case this function
+        // exists for) finds no primitive and keeps its own array with no
+        // allocation at all.
+        let arr = box_primitive_iterator_source(ctx, arr)?;
         // Allocating the iterator and storing either field can collect. Root
         // the backing array and iterator shell and reread both after every
         // allocation-capable operation.
         let arr_pin = ctx.pin_native_root(arr);
-        let itr = alloc_concurrent_synthetic(ctx, "java/util/ServiceLoader$Itr", 2);
+        let itr = try_alloc_concurrent_synthetic(ctx, "java/util/ServiceLoader$Itr", 2)?;
         let itr_pin = ctx.pin_native_root(itr);
         let itr_cur = ctx.read_native_pin(itr_pin, itr);
         let arr_cur = ctx.read_native_pin(arr_pin, arr);
@@ -297,8 +329,91 @@ fn native_stream_empty_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> 
         ctx.unpin_native_roots(arr_pin);
         return Ok(Some(Value::Object(Some(itr_cur))));
     }
-    let iter = alloc_concurrent_synthetic(ctx, "java/util/Collections$EmptyIterator", 0);
+    let iter = try_alloc_concurrent_synthetic(ctx, "java/util/Collections$EmptyIterator", 0)?;
     Ok(Some(Value::Object(Some(iter))))
+}
+
+/// If `arr` holds any primitive element, return a fresh REFERENCE array of the
+/// same elements boxed through `Integer`/`Long`/`Double`.`valueOf`; otherwise
+/// return `arr` unchanged.
+///
+/// Used by [`native_stream_empty_iterator`] to make the
+/// `iterator()Ljava/util/Iterator;` bridge safe on the three primitive streams,
+/// whose backing store is a primitive array (W7-2 §3). `Iterator.next()` is
+/// declared to return a reference; a `Value::Int` there is an untyped word on
+/// the operand stack, which is the shape `W7-84-primitive-in-reference-store`
+/// is about — and it is silent, because the value only misbehaves at the
+/// caller's `checkcast` or `intValue()`, one frame away.
+///
+/// GC-SAFETY: `Integer.valueOf` and friends run real bytecode and allocate, so
+/// `arr` and every wrapper produced so far can move. `arr` is pinned and
+/// re-read each iteration, and each wrapper is stored into the output array
+/// IMMEDIATELY — nothing is accumulated in a Rust `Vec` across an allocation.
+/// The output array is pinned for the same reason.
+fn box_primitive_iterator_source(
+    ctx: &mut dyn NativeContext,
+    arr: cratonvm_types::ObjectRef,
+) -> Result<cratonvm_types::ObjectRef, cratonvm_types::error::MethodCallFailed> {
+    let len = ctx.array_length(arr);
+    let mut needs_boxing = false;
+    for i in 0..len {
+        if matches!(
+            ctx.get_array_element(arr, i),
+            Value::Int(_) | Value::Long(_) | Value::Double(_) | Value::Float(_)
+        ) {
+            needs_boxing = true;
+            break;
+        }
+    }
+    if !needs_boxing {
+        return Ok(arr);
+    }
+    let arr_pin = ctx.pin_native_root(arr);
+    let out = ctx.new_array(cratonvm_types::ArrayElementType::Reference, len);
+    let out_pin = ctx.pin_native_root(out);
+    for i in 0..len {
+        let src = ctx.read_native_pin(arr_pin, arr);
+        let elem = ctx.get_array_element(src, i);
+        let boxed = match elem {
+            Value::Int(v) => ctx.invoke(
+                "java/lang/Integer",
+                "valueOf",
+                "(I)Ljava/lang/Integer;",
+                &[Value::Int(v)],
+            ),
+            Value::Long(v) => ctx.invoke(
+                "java/lang/Long",
+                "valueOf",
+                "(J)Ljava/lang/Long;",
+                &[Value::Long(v)],
+            ),
+            Value::Double(v) => ctx.invoke(
+                "java/lang/Double",
+                "valueOf",
+                "(D)Ljava/lang/Double;",
+                &[Value::Double(v)],
+            ),
+            Value::Float(v) => ctx.invoke(
+                "java/lang/Float",
+                "valueOf",
+                "(F)Ljava/lang/Float;",
+                &[Value::Float(v)],
+            ),
+            other => Ok(Some(other)),
+        };
+        let boxed = match boxed {
+            Ok(v) => v.unwrap_or(Value::Object(None)),
+            Err(e) => {
+                ctx.unpin_native_roots(arr_pin);
+                return Err(e);
+            }
+        };
+        let dst = ctx.read_native_pin(out_pin, out);
+        ctx.set_array_element(dst, i, boxed);
+    }
+    let out = ctx.read_native_pin(out_pin, out);
+    ctx.unpin_native_roots(arr_pin);
+    Ok(out)
 }
 
 /// Native helper: return `this` (the first argument). Used by

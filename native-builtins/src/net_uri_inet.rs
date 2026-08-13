@@ -355,7 +355,7 @@ pub(crate) fn register_net_natives(registry: &mut NativeMethodRegistry) {
         "getLoopbackAddress",
         "()Ljava/net/InetAddress;",
         |ctx, _args| {
-            let ia = alloc_concurrent_synthetic(ctx, "java/net/InetAddress", 2);
+            let ia = try_alloc_concurrent_synthetic(ctx, "java/net/InetAddress", 2)?;
             let host = ctx.create_string("localhost");
             let addr = ctx.create_string("127.0.0.1");
             ctx.set_field(ia, 0, Value::Object(Some(host)));
@@ -527,11 +527,29 @@ pub(crate) fn url_parse(ctx: &mut dyn NativeContext, this: ObjectRef, url_str: &
             .map(|fragment| ctx.create_string(fragment));
         let proto_obj = ctx.create_string("file");
         let host_empty = ctx.create_string("");
-        ctx.set_field(this, URL_FIELD_PROTOCOL, Value::Object(Some(proto_obj)));
-        ctx.set_field(this, URL_FIELD_HOST, Value::Object(Some(host_empty)));
-        ctx.set_field(this, URL_FIELD_PORT, Value::Int(-1));
-        ctx.set_field(this, URL_FIELD_PATH, Value::Object(Some(path_obj)));
-        ctx.set_field(this, URL_FIELD_QUERY, Value::Object(query_obj));
+        // Raw slots only on OUR layout — the same guard the generic path below
+        // carries, which this arm was missing. `native_uri_init` reaches here
+        // with a REAL `java.net.URI` receiver for every `file:` URI (a
+        // `Path.toUri()`, a code source, a Spring Boot launcher URL), where
+        // `URL_FIELD_PORT` (slot 2) put `Int(-1)` on `URI.authority` — the one
+        // `set_field` row for `java/net/URI` in the 2026-08-10 census, and the
+        // reason `getAuthority()` answered null on a real image.
+        if has_synthetic_url_layout(ctx, this) {
+            ctx.set_field(this, URL_FIELD_PROTOCOL, Value::Object(Some(proto_obj)));
+            ctx.set_field(this, URL_FIELD_HOST, Value::Object(Some(host_empty)));
+            ctx.set_field(this, URL_FIELD_PORT, Value::Int(-1));
+            ctx.set_field(this, URL_FIELD_PATH, Value::Object(Some(path_obj)));
+            ctx.set_field(this, URL_FIELD_QUERY, Value::Object(query_obj));
+        } else {
+            // Real layout: the same values under the names the real class
+            // declares. `set_field_by_name` is a no-op for a name the class
+            // does not declare, so one list serves `java.net.URL` (`protocol`)
+            // and `java.net.URI` (`scheme`) alike.
+            ctx.set_field_by_name(this, "protocol", Value::Object(Some(proto_obj)));
+            ctx.set_field_by_name(this, "scheme", Value::Object(Some(proto_obj)));
+            ctx.set_field_by_name(this, "host", Value::Object(Some(host_empty)));
+            ctx.set_field_by_name(this, "port", Value::Int(-1));
+        }
         ctx.set_field_by_name(this, "file", Value::Object(Some(file_obj)));
         ctx.set_field_by_name(this, "path", Value::Object(Some(path_obj)));
         ctx.set_field_by_name(this, "query", Value::Object(query_obj));
@@ -837,8 +855,12 @@ fn native_url_to_uri(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
             nfields, full
         );
     }
-    let uri = alloc_concurrent_synthetic(ctx, "java/net/URI", 6);
+    let uri = try_alloc_concurrent_synthetic(ctx, "java/net/URI", 6)?;
     url_parse(ctx, uri, &full);
+    // `url_parse` writes the URL-shaped names; a `java.net.URI` additionally
+    // needs `string`, `schemeSpecificPart` and `authority`, and those are what
+    // `uri_raw_string` and `getAuthority` read on a real layout.
+    net_phase_e::uri_publish_named(ctx, uri, &full, None);
     Ok(Some(Value::Object(Some(uri))))
 }
 
@@ -1018,6 +1040,27 @@ pub(crate) fn uri_store_named(ctx: &mut dyn NativeContext, this: ObjectRef, full
     // instead of "redirect:account" and ViewResolutionResultHandlerTests'
     // defaultViewNameWithRedirectPrefixFails saw onComplete() instead of the
     // expected resolution error.
+    // `authority`, `query` and `fragment` under the names the real class
+    // declares. They were the components with neither a named write here nor a
+    // registered accessor, so on a real image `URI.getAuthority()` ran real
+    // bytecode against a field nothing had written and answered **null** for
+    // every URI whose authority is not just its host — measured 2026-08-10:
+    // `new URI("http://user:pw@example.com:8080/a/b?q=1#frag")` answered null
+    // where HotSpot answers `user:pw@example.com:8080`. `getAuthority` /
+    // `getRawAuthority` are registered natives now as well; this write is what
+    // keeps the OBJECT right for the real bytecode that reads the field
+    // directly (`URI.equals`, `URI.hashCode`, `URI.toString`).
+    let (_, authority, _, query, fragment) = net_phase_e::uri_split(full);
+    let mut store_named = |ctx: &mut dyn NativeContext, name: &str, v: &Option<String>| {
+        if let Some(v) = v.as_deref().filter(|v| !v.is_empty()) {
+            let s = ctx.create_string(v);
+            ctx.set_field_by_name(this, name, Value::Object(Some(s)));
+        }
+    };
+    store_named(ctx, "authority", &authority);
+    store_named(ctx, "query", &query);
+    store_named(ctx, "fragment", &fragment);
+
     if let Some(colon) = net_phase_e::uri_scheme_colon(full) {
         let scheme = &full[..colon];
         let raw_ssp = &full[colon + 1..];
@@ -1488,7 +1531,7 @@ fn native_uri_create(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
         Some(Value::Object(Some(o))) => ctx.read_string(*o).unwrap_or_default(),
         _ => String::new(),
     };
-    let uri = alloc_concurrent_synthetic(ctx, "java/net/URI", 6);
+    let uri = try_alloc_concurrent_synthetic(ctx, "java/net/URI", 6)?;
     url_parse(ctx, uri, &url_str);
     // `url_parse` populates the synthetic *URL* slot layout (by index).
     // `java.net.URI` getters (`getScheme`/`getPath`/`getRawSchemeSpecificPart`)
@@ -1503,7 +1546,7 @@ fn native_uri_create(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
 fn native_inet_localhost(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
     let hostname = resolve_real_hostname();
     let ip = resolve_primary_ipv4(&hostname);
-    let ia = alloc_concurrent_synthetic(ctx, "java/net/InetAddress", 2);
+    let ia = try_alloc_concurrent_synthetic(ctx, "java/net/InetAddress", 2)?;
     let host_ref = ctx.create_string(&hostname);
     let addr_ref = ctx.create_string(&ip);
     ctx.set_field(ia, 0, Value::Object(Some(host_ref)));
@@ -1555,7 +1598,7 @@ fn native_inet_get_by_name(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
 
     // Handle null/localhost/loopback
     if hostname.is_empty() || hostname == "localhost" {
-        let ia = alloc_concurrent_synthetic(ctx, "java/net/InetAddress", 2);
+        let ia = try_alloc_concurrent_synthetic(ctx, "java/net/InetAddress", 2)?;
         let host = ctx.create_string("localhost");
         let addr = ctx.create_string("127.0.0.1");
         ctx.set_field(ia, 0, Value::Object(Some(host)));
@@ -1567,7 +1610,7 @@ fn native_inet_get_by_name(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
     if hostname.parse::<std::net::Ipv4Addr>().is_ok()
         || hostname.parse::<std::net::Ipv6Addr>().is_ok()
     {
-        let ia = alloc_concurrent_synthetic(ctx, "java/net/InetAddress", 2);
+        let ia = try_alloc_concurrent_synthetic(ctx, "java/net/InetAddress", 2)?;
         let host = ctx.create_string(&hostname);
         let addr = ctx.create_string(&hostname);
         ctx.set_field(ia, 0, Value::Object(Some(host)));
@@ -1579,7 +1622,7 @@ fn native_inet_get_by_name(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
     let lookup = format!("{}:0", hostname);
     if let Ok(mut addrs) = std::net::ToSocketAddrs::to_socket_addrs(&lookup.as_str()) {
         if let Some(socket_addr) = addrs.next() {
-            let ia = alloc_concurrent_synthetic(ctx, "java/net/InetAddress", 2);
+            let ia = try_alloc_concurrent_synthetic(ctx, "java/net/InetAddress", 2)?;
             let host = ctx.create_string(&hostname);
             let addr = ctx.create_string(&socket_addr.ip().to_string());
             ctx.set_field(ia, 0, Value::Object(Some(host)));
@@ -1611,7 +1654,7 @@ fn native_inet_get_all_by_name(ctx: &mut dyn NativeContext, args: &[Value]) -> M
     let mut results = Vec::new();
     if let Ok(addrs) = std::net::ToSocketAddrs::to_socket_addrs(&lookup.as_str()) {
         for sa in addrs {
-            let ia = alloc_concurrent_synthetic(ctx, "java/net/InetAddress", 2);
+            let ia = try_alloc_concurrent_synthetic(ctx, "java/net/InetAddress", 2)?;
             let host = ctx.create_string(&hostname);
             let addr = ctx.create_string(&sa.ip().to_string());
             ctx.set_field(ia, 0, Value::Object(Some(host)));
@@ -1621,7 +1664,7 @@ fn native_inet_get_all_by_name(ctx: &mut dyn NativeContext, args: &[Value]) -> M
     }
     if results.is_empty() {
         // At least return localhost
-        let ia = alloc_concurrent_synthetic(ctx, "java/net/InetAddress", 2);
+        let ia = try_alloc_concurrent_synthetic(ctx, "java/net/InetAddress", 2)?;
         let host = ctx.create_string(&hostname);
         let addr = ctx.create_string("127.0.0.1");
         ctx.set_field(ia, 0, Value::Object(Some(host)));
@@ -1800,7 +1843,7 @@ mod new2_net_tests {
     /// Helper: allocate a minimal `InetAddress` synthetic carrying a
     /// hostname / address pair. Mirrors what the real natives produce.
     fn alloc_inet(ctx: &mut MockNativeContext, host: &str, addr: &str) -> ObjectRef {
-        let ia = alloc_concurrent_synthetic(ctx, "java/net/InetAddress", 2);
+        let ia = try_alloc_concurrent_synthetic(ctx, "java/net/InetAddress", 2).unwrap();
         let h = ctx.create_string(host);
         let a = ctx.create_string(addr);
         ctx.set_field(ia, 0, Value::Object(Some(h)));

@@ -28,10 +28,19 @@ import java.util.concurrent.atomic.AtomicInteger;
  * barrier and the whole VM wedged.
  *
  * compareTo() allocates deliberately here so the collection lands inside the
- * native, making both shapes reproducible rather than load-dependent. The suite
- * runs this class with --nojit so the young generation is an actual copying
- * collector (a live JIT frame downgrades it to a non-moving sweep, under which
- * a stale reference still resolves and the defect hides).
+ * native, making both shapes reproducible rather than load-dependent.
+ *
+ * REQUIRED CratonVM ARGUMENTS: --nojit --Xmx 64m (BOTH; see run.sh
+ * class_cv_args). --nojit makes the young generation an actual copying
+ * collector - a live JIT frame downgrades it to a non-moving sweep, under which
+ * the stale reference still resolves and the defect hides. --Xmx 64m is what
+ * makes a collection happen inside the native at all; on the default heap the
+ * walk finishes without one and the class passes on a broken VM. Both flags
+ * together are what 6cd01bcba registered this class with and validated
+ * FAIL-then-PASS under; a later run.sh merge dropped the registration and the
+ * hook alike, so whoever re-registers it must check that class_cv_args names
+ * BOTH and not just --nojit. HotSpot deliberately gets NEITHER - they are
+ * CratonVM spellings and the expected output does not depend on them.
  */
 public class RPriorityQueueGc {
 
@@ -42,7 +51,32 @@ public class RPriorityQueueGc {
 
     static volatile Object sink;
 
+    /**
+     * Count of assertions whose EXECUTION COUNT is deterministic, published on a
+     * CK line so the cross-VM diff can see a run that silently asserted fewer
+     * things than the oracle (harness guard G3; see
+     * regression-suite/harness-guard.sh and
+     * docs/known-issues/jdk-only/W7-60-harness-extract-blindness.md).
+     */
+    static int checks = 0;
+
     static void check(boolean cond, String what) {
+        checks++;
+        if (!cond) {
+            throw new AssertionError("RPriorityQueueGc: " + what);
+        }
+    }
+
+    /**
+     * Same assertion, deliberately NOT counted. Used only inside the concurrent
+     * drain loop, whose trip count is how many of the workers' interleaved
+     * poll()s happened to find a non-empty queue — scheduling-dependent, and
+     * therefore different on two VMs that are both correct. `checks` is printed
+     * on a line the runner diffs against HotSpot, so folding these in would make
+     * a CORRECT VM go red at random. The count stays a constant for a healthy
+     * run and moves only when an arm stops executing, which is what G3 is for.
+     */
+    static void checkDyn(boolean cond, String what) {
         if (!cond) {
             throw new AssertionError("RPriorityQueueGc: " + what);
         }
@@ -77,7 +111,8 @@ public class RPriorityQueueGc {
     public static void main(String[] args) throws Exception {
         singleThreaded();
         concurrent();
-        System.out.println("PASS RPriorityQueueGc");
+        System.out.println("CK RPriorityQueueGc checks=" + checks);
+        System.out.println("PASS RPriorityQueueGc (" + checks + " checks)");
     }
 
     // ---- 1. sorted insert survives a GC inside compareTo -------------------
@@ -113,6 +148,10 @@ public class RPriorityQueueGc {
         final PriorityBlockingQueue<Item> q = new PriorityBlockingQueue<Item>();
         final AtomicInteger errors = new AtomicInteger();
         final AtomicInteger net = new AtomicInteger();
+        // Counts offers that actually happened. Without it a run in which every
+        // worker died on its first statement leaves drained == net == 0 and
+        // errors == 0, and this phase reports "ok" having exercised nothing.
+        final AtomicInteger offered = new AtomicInteger();
         Thread[] ts = new Thread[THREADS];
         for (int t = 0; t < THREADS; t++) {
             final int base = t * PER_THREAD;
@@ -120,6 +159,7 @@ public class RPriorityQueueGc {
                 public void run() {
                     for (int i = 0; i < PER_THREAD; i++) {
                         q.offer(new Item((base + i) * 7919L % 100003L));
+                        offered.incrementAndGet();
                         net.incrementAndGet();
                         if ((i & 7) == 0) {
                             Object o = q.poll();
@@ -151,14 +191,19 @@ public class RPriorityQueueGc {
         long prev = Long.MIN_VALUE;
         Object o;
         while ((o = q.poll()) != null) {
-            check(o instanceof Item, "drain returned " + o.getClass().getName());
+            checkDyn(o instanceof Item, "drain returned " + o.getClass().getName());
             Item it = (Item) o;
-            check(it.payload == it.key * 3 + 1, "drain corrupted: " + it);
-            check(it.key >= prev, "drain out of order: " + it.key + " after " + prev);
+            checkDyn(it.payload == it.key * 3 + 1, "drain corrupted: " + it);
+            checkDyn(it.key >= prev, "drain out of order: " + it.key + " after " + prev);
             prev = it.key;
             drained++;
         }
         check(errors.get() == 0, errors.get() + " concurrent reader error(s)");
+        // An erroring worker returns early, so this would also be short - but
+        // the errors check above has already fired by then, which is why it
+        // comes first.
+        check(offered.get() == THREADS * PER_THREAD,
+                "workers offered " + offered.get() + " of " + (THREADS * PER_THREAD));
         check(drained == net.get(), "drained " + drained + " but net offered " + net.get());
         // Deliberately not the drained count: how many of the interleaved
         // poll()s find a non-empty queue is scheduling-dependent, and this line

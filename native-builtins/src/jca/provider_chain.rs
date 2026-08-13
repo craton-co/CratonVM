@@ -17,7 +17,7 @@
 //!
 //! ## Provider object layout
 //!
-//! Allocated through `alloc_concurrent_synthetic("java/security/Provider", N)`,
+//! Allocated through `try_alloc_concurrent_synthetic("java/security/Provider", N)?`,
 //! which calls `ensure_class_initialized` and uses the *larger* of the
 //! requested field count and `class_num_total_fields` (so the real JDK
 //! field map — `name`, `info`, `version`, `versionStr`, … — is fully
@@ -43,7 +43,7 @@ use cratonvm_types::{ObjectRef, Value};
 
 use rustc_hash::FxHashMap;
 
-use crate::{alloc_concurrent_synthetic, obj_arg};
+use crate::{try_alloc_concurrent_synthetic, obj_arg};
 
 // ---------------------------------------------------------------------------
 // Provider chain — process-wide mutable list mirroring HotSpot's default
@@ -250,7 +250,7 @@ pub(crate) fn make_provider(
     name: &str,
     version: f64,
     coverage: &str,
-) -> ObjectRef {
+) -> Result<ObjectRef, MethodCallFailed> {
     // `alloc_concurrent_synthetic` upsizes to the real-JDK field count
     // (Provider has > 10 instance fields counting inherited Properties
     // slots), so writing to slots 0/1/2 stays in bounds even when our
@@ -273,7 +273,7 @@ pub(crate) fn make_provider(
     // backs any algorithm — particularly important for unbacked
     // entries like SunPKCS11 / SunMSCAPI / SunPCSC that look real but
     // never resolve a Service.
-    let p = alloc_concurrent_synthetic(ctx, "java/security/Provider", 8);
+    let p = try_alloc_concurrent_synthetic(ctx, "java/security/Provider", 8)?;
     let n = ctx.create_string(name);
     let info_str = format!("{} security provider (cratonvm) — {}", name, coverage);
     let info = ctx.create_string(&info_str);
@@ -315,7 +315,7 @@ pub(crate) fn make_provider(
     ctx.set_field(p, 0, Value::Object(Some(n)));
     ctx.set_field(p, 1, Value::Double(version));
     ctx.set_field(p, 2, Value::Object(Some(info)));
-    p
+    Ok(p)
 }
 
 // ---------------------------------------------------------------------------
@@ -466,7 +466,7 @@ fn security_get_providers(ctx: &mut dyn NativeContext, _args: &[Value]) -> Metho
     let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, chain.len());
     for (i, (name, ver, coverage)) in chain.iter().enumerate() {
         let p = make_provider(ctx, name, *ver, coverage);
-        ctx.set_array_element(arr, i, Value::Object(Some(p)));
+        ctx.set_array_element(arr, i, Value::Object(Some(p?)));
     }
     Ok(Some(Value::Object(Some(arr))))
 }
@@ -491,7 +491,7 @@ fn security_get_providers_filtered(ctx: &mut dyn NativeContext, args: &[Value]) 
     let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, matches.len());
     for (i, (name, ver, coverage)) in matches.iter().enumerate() {
         let provider = make_provider(ctx, name, *ver, coverage);
-        ctx.set_array_element(arr, i, Value::Object(Some(provider)));
+        ctx.set_array_element(arr, i, Value::Object(Some(provider?)));
     }
     Ok(Some(Value::Object(Some(arr))))
 }
@@ -504,7 +504,7 @@ fn security_get_provider(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     match find(&name_str) {
         Some((ver, coverage)) => {
             let p = make_provider(ctx, &name_str, ver, coverage);
-            Ok(Some(Value::Object(Some(p))))
+            Ok(Some(Value::Object(Some(p?))))
         }
         // JDK contract: return null for unknown name.
         None => Ok(Some(Value::Object(None))),
@@ -1085,11 +1085,50 @@ fn put_service(provider: &str, type_str: &str, algorithm: &str, value: &str) {
 /// make the same provider-service decision as the JDK.
 fn seed_direct_native_engine_services() {
     const SUN: &str = "SUN";
-    for algorithm in ["MD2", "MD5", "SHA-1", "SHA-224", "SHA-256", "SHA-384", "SHA-512", "SHA-512/224", "SHA-512/256", "SHA3-224", "SHA3-256", "SHA3-384", "SHA3-512"] {
+    // Every name here must be one `message_digest::algorithm_supported`
+    // accepts. `MD2` sat in this literal and was refused by `getInstance` for
+    // three waves; `SHAKE128-256` / `SHAKE256-512` were the opposite omission,
+    // deliberately withheld while unimplemented. Both were closed on
+    // 2026-08-12 by implementing the digest and then adding the name, in that
+    // order. `every_advertised_sun_message_digest_is_serviceable` is now the
+    // ratchet that keeps this array and that predicate one set.
+    // W7-63-jca-advertise-vs-serve.md.
+    for algorithm in ["MD2", "MD5", "SHA-1", "SHA-224", "SHA-256", "SHA-384", "SHA-512", "SHA-512/224", "SHA-512/256", "SHA3-224", "SHA3-256", "SHA3-384", "SHA3-512", "SHAKE128-256", "SHAKE256-512"] {
         put_service(SUN, "MessageDigest", algorithm, "sun.security.provider.Native");
     }
     put_alias(SUN, "MessageDigest", "SHA256", "SHA-256");
-    for algorithm in ["DSA", "ML-DSA", "ML-DSA-44", "ML-DSA-65", "ML-DSA-87"] {
+    // ALIASES, not services. HotSpot's SUN carries
+    // `Alg.Alias.MessageDigest.SHAKE128 = SHAKE128-256`, so
+    // `MessageDigest.getInstance("SHAKE128")` resolves and returns bytes
+    // identical to the hyphenated primary (measured, §C of
+    // probes/JcaAdvertisedVsServedProbe.expected.txt) while
+    // `Security.getAlgorithms("MessageDigest")` does NOT list it — aliases are
+    // excluded from that walk, see `algorithms_for_service`. Registering these
+    // as services instead would make the advertised set 17 where HotSpot
+    // answers 15.
+    put_alias(SUN, "MessageDigest", "SHAKE128", "SHAKE128-256");
+    put_alias(SUN, "MessageDigest", "SHAKE256", "SHAKE256-512");
+    // `ML-DSA` — the UMBRELLA name — is deliberately absent from this
+    // `KeyFactory` list while the three parameter-set names stay. HotSpot's
+    // SUN does advertise and serve it, so this is a knowing divergence in the
+    // under-advertising direction, and it is the safe one: this VM's
+    // `key_factory::kf_algo_idx` has arms only for `ML-DSA-44/65/87`, falls to
+    // `-1`, and `kf_get_instance` throws. Advertised-and-refused.
+    //
+    // The alternative — add an umbrella arm resolving the parameter set from
+    // the key spec, as `signature::mldsa_spi_class` does from the init key —
+    // was declined rather than deferred, because W7-29 RAN the three names
+    // that already resolve and found the objects partly unusable one accessor
+    // in (`KeyFactory.getInstance("ML-DSA-44").getProvider()` raises
+    // `NullPointerException: Cannot enter synchronized block because
+    // "this.lock" is null`, where HotSpot answers `SUN version 25`). Widening
+    // a surface that is already broken is not a fix. Note that
+    // `signature::algo_idx` DOES carry the umbrella arm, so `Signature`
+    // continues to advertise and serve `ML-DSA` — the two engines disagreed
+    // about the same name, and this makes each engine's advertisement match
+    // its own implementation rather than making them agree with each other.
+    // W7-63-jca-advertise-vs-serve.md.
+    for algorithm in ["DSA", "ML-DSA-44", "ML-DSA-65", "ML-DSA-87"] {
         put_service(SUN, "KeyFactory", algorithm, "sun.security.provider.Native");
     }
     for algorithm in ["DRBG", "SHA1PRNG"] {
@@ -1121,19 +1160,137 @@ fn seed_direct_native_engine_services() {
     }
 
     const JCE: &str = "SunJCE";
-    // The generic Cipher.AES service owns standard AES transformations; the
-    // Cipher native separately rejects unsupported transformations such as CCM.
+    // The generic Cipher.AES service owns the AES transformations whose mode
+    // lives in an attribute rather than the service name (ECB/CBC/CFB/OFB); the
+    // fully-spelled names below are separate services on HotSpot and are
+    // separate services here. `jca::cipher::classify_transformation` decides
+    // which mode/padding combinations each one really admits, and this list is
+    // kept equal to what that function can COMPUTE — advertised and implemented
+    // are one set, walked in both directions.
+    //
+    // Four names came OUT of this list in the W7-15 lane, each measured against
+    // jdk-25.0.3.9-hotspot before removal — and all four went back IN on
+    // 2026-08-11 once they were implemented. Removing them was the correct
+    // answer to "advertised but not computable"; it was never the preferred
+    // one, and the preferred one is now available:
+    //
+    //   * `ChaCha20` and `ChaCha20-Poly1305` — no ChaCha20 implementation was
+    //     reachable from `Cipher` at all. Advertising them was not an
+    //     aspiration, it was wrong crypto: the engine's mode-only dispatch
+    //     turned both into AES-256-ECB, byte-identically to
+    //     `AES/ECB/PKCS5Padding`, discarding the nonce and (for the AEAD name)
+    //     producing no tag, so a tampered ciphertext decrypted without an
+    //     authentication failure. An AEAD that cannot fail on a bad tag is
+    //     worse than no AEAD, because callers build integrity guarantees on it.
+    //     **RFC 8439 is now implemented in `native-builtins/src/chacha20.rs`**,
+    //     pinned by the RFC's own vectors and a differential test against the
+    //     `chacha20poly1305` crate, and `regression-suite/src/RChaCha20Cipher.java`
+    //     matches HotSpot byte-for-byte in both modes.
+    //   * `AES/KW/PKCS5Padding` and `AES/KWP/NoPadding` — no path implemented
+    //     either. KWP is RFC 5649, a different padded-wrap scheme with its own
+    //     ICV and length prefix, not RFC 3394 with a padding bolted on;
+    //     `aes_key_wrap` computed RFC 3394 only. **Both are now implemented**
+    //     (`aes_key_wrap_with_padding` for RFC 5649, PKCS#5 at an eight-byte
+    //     block size for the other), against SunJCE's own wrap vectors.
+    //
+    // What went IN is the other direction of the same census — code that works
+    // and was never advertised, which is the quieter half of the same defect:
+    // `DES`/`DESede` (computed through the real SunJCE SPI; measured
+    // byte-identical to HotSpot for `DESede/CBC/PKCS5Padding`), the two
+    // `PBEWithHmacSHA224AndAES_*` names `jca::cipher::pbes2_aes_params` has
+    // always derived, and the size-pinned `AES_128/192/256` transformations,
+    // which now enforce their key length at `init`.
     for algorithm in [
-        "AES", "AES/GCM/NoPadding", "AES/KW/NoPadding", "AES/KW/PKCS5Padding", "AES/KWP/NoPadding",
-        "ChaCha20", "ChaCha20-Poly1305", "RSA", "PBEWithHmacSHA1AndAES_128",
-        "PBEWithHmacSHA1AndAES_256", "PBEWithHmacSHA256AndAES_128", "PBEWithHmacSHA256AndAES_256",
+        "AES",
+        "AES/GCM/NoPadding",
+        "AES/KW/NoPadding",
+        "AES/KW/PKCS5Padding",
+        "AES/KWP/NoPadding",
+        // W7-39, 2026-08-12. Both were removed from this list on 2026-08-11
+        // while `Cipher.getInstance` served them as AES-128-ECB — the right
+        // move then, because a wrong cipher is worse than a missing one. They
+        // are back because they are now COMPUTED, by the real SunJCE
+        // `BlowfishCipher` / `ARCFOURCipher` SPI (`jca::cipher::
+        // drive_real_ecb_cipher`), byte-identically to HotSpot 25. `ARCFOUR` is
+        // the service and `RC4` its alias, which is HotSpot's own arrangement
+        // and the reason `Security.getAlgorithms("Cipher")` names only one.
+        //
+        // RC4 is broken cryptography and nothing here recommends it. It is
+        // advertised for the same reason DES is: a workload that asks for it on
+        // HotSpot gets bytes, and on this VM it got a hard failure. Refusing an
+        // algorithm the platform implements is a portability defect, not a
+        // security control — a caller who must not use RC4 is not stopped by
+        // this VM lacking it.
+        "ARCFOUR",
+        "Blowfish",
+        "ChaCha20",
+        "ChaCha20-Poly1305",
+        // Spelled in full, where HotSpot lists the bare `DES` / `DESede` and
+        // carries the mode set in a `SupportedModes` attribute. The divergence
+        // is deliberate: this engine routes only CBC to the real SunJCE SPI, and
+        // the bare name defaults to ECB — so advertising `DESede` would name a
+        // transformation `getInstance` refuses. Every entry in this list is one
+        // the engine computes; that invariant is worth more than matching
+        // HotSpot's grouping, and it is what
+        // `every_advertised_sunjce_cipher_is_serviceable` pins.
+        "DES/CBC/NoPadding",
+        "DES/CBC/PKCS5Padding",
+        "DESede/CBC/NoPadding",
+        "DESede/CBC/PKCS5Padding",
+        "RSA",
+        "PBEWithHmacSHA1AndAES_128",
+        "PBEWithHmacSHA1AndAES_256",
+        "PBEWithHmacSHA224AndAES_128",
+        "PBEWithHmacSHA224AndAES_256",
+        "PBEWithHmacSHA256AndAES_128",
+        "PBEWithHmacSHA256AndAES_256",
     ] {
         put_service(JCE, "Cipher", algorithm, "com.sun.crypto.provider.Native");
     }
-    for algorithm in ["ML-KEM", "ML-KEM-512", "ML-KEM-768", "ML-KEM-1024"] {
+    // The size-pinned family. HotSpot registers the same shape — one service
+    // per (size, mode) with `NoPadding` spelled in the name, and NO bare
+    // `AES_128` service (measured: `Cipher.getInstance("AES_128")` raises while
+    // `AES_128/CBC/NoPadding` resolves). `KWP` and `KW/PKCS5Padding` are in
+    // HotSpot's set and deliberately absent from ours, for the reason above.
+    for size in ["AES_128", "AES_192", "AES_256"] {
+        for mode in ["CBC", "CFB", "ECB", "GCM", "KW", "OFB"] {
+            put_service(
+                JCE,
+                "Cipher",
+                &format!("{size}/{mode}/NoPadding"),
+                "com.sun.crypto.provider.Native",
+            );
+        }
+    }
+    // The `ML-KEM` UMBRELLA is absent for the same reason `ML-DSA` is absent
+    // from the `SUN` `KeyFactory` list above, and it was found by the census
+    // rather than by either record: `key_factory::algo_idx` has arms for
+    // `ML-KEM-512/768/1024` only, falls to `-1`, and `kf_get_instance` throws,
+    // so `Security.getAlgorithms("KeyFactory")` named `ML-KEM` while
+    // `KeyFactory.getInstance("ML-KEM")` raised `NoSuchAlgorithmException`.
+    // Advertised-and-refused, a seventh instance of the species in the same
+    // seed function, and note that the SPI class name here is a REAL JDK class
+    // — that does not help, because `kf_get_instance` intercepts natively and
+    // never reaches `build_jca_impl`. A real class name in a service row is
+    // not evidence the row is serviceable.
+    // W7-63-jca-advertise-vs-serve.md.
+    for algorithm in ["ML-KEM-512", "ML-KEM-768", "ML-KEM-1024"] {
         put_service(JCE, "KeyFactory", algorithm, "com.sun.crypto.provider.ML_KEM_Impls$KF");
     }
+    // SunJCE's own aliases. Aliases are excluded from
+    // `Security.getAlgorithms` (their property key is `Alg.Alias.Cipher.X`, not
+    // `Cipher.X`), so these widen `getInstance`/`getService` resolution without
+    // lengthening the advertised list — which is exactly their role on HotSpot.
     put_alias(JCE, "Cipher", "AESWrap", "AES/KW/NoPadding");
+    put_alias(JCE, "Cipher", "AESWrap_128", "AES_128/KW/NoPadding");
+    put_alias(JCE, "Cipher", "AESWrap_192", "AES_192/KW/NoPadding");
+    put_alias(JCE, "Cipher", "AESWrap_256", "AES_256/KW/NoPadding");
+    put_alias(JCE, "Cipher", "TripleDES", "DESede/CBC/PKCS5Padding");
+    // `Alg.Alias.Cipher.RC4 = ARCFOUR` on SunJCE. Measured on HotSpot 25: both
+    // spellings resolve, both answer `getProvider()=SunJCE`, and both encrypt
+    // the same 16-byte plaintext to `27ca482b161e3ab93f812659b904df95` — while
+    // `Security.getAlgorithms("Cipher")` lists ARCFOUR alone.
+    put_alias(JCE, "Cipher", "RC4", "ARCFOUR");
 
     // Windows only — the provider itself is absent from the seed chain on
     // every other platform (see `provider_chain`), and seeding its services
@@ -1190,31 +1347,116 @@ fn seed_direct_native_engine_services() {
 ///     succeeds, so seeding a name we do not implement would fabricate a
 ///     working PRNG. The set stays non-empty either way, which is all
 ///     Tomcat's `SessionIdGeneratorBase.<clinit>` needs.
-///   * `MessageDigest` `SHAKE128-256`/`SHAKE256-512` — real on HotSpot, but
-///     `message_digest::algorithm_supported` does not implement them, and
-///     advertising a digest that `getInstance` then refuses is a worse lie
-///     than a 13-name list.
+///
+/// A third exclusion used to stand here: `MessageDigest` `SHAKE128-256` /
+/// `SHAKE256-512`, declined because `message_digest::algorithm_supported` did
+/// not implement them and — in the words of the comment this replaces —
+/// "advertising a digest that `getInstance` then refuses is a worse lie than
+/// a 13-name list". That reasoning is exactly right and is the rule this file
+/// runs on. Its PREMISE expired on 2026-08-12, when both were implemented
+/// against the HotSpot and NIST vectors; they are now seeded in
+/// `seed_direct_native_engine_services` beside the other SUN digests, and
+/// their bare `SHAKE128`/`SHAKE256` spellings are ALIASES there, not
+/// services, so the advertised count lands on HotSpot's 15 rather than 17. A
+/// comment outlives its defect. W7-63-jca-advertise-vs-serve.md.
 fn seed_retired_getalgorithms_literals() {
     const JCE: &str = "SunJCE";
+    // Every class name below is MEASURED — `getServices()` enumerated per
+    // provider on jdk-25.0.3.9-hotspot and printed as
+    // `type|algorithm|className`, not read off a javap of the provider's
+    // `<clinit>` and not recalled. `Mac.getInstance` is natively intercepted
+    // (`phases_late::ssl_security`), so for this type the class name is
+    // documentation rather than a load target; it is still worth being right,
+    // because the same row answers `Provider.Service.getClassName()`.
     for (algorithm, class_name) in [
         ("HmacMD5", "com.sun.crypto.provider.HmacMD5"),
         ("HmacSHA1", "com.sun.crypto.provider.HmacSHA1"),
+        // W7-39: `HmacSHA224` is implemented by `ssl_security::mac_compute_hmac`
+        // as of 2026-08-12 and must be advertised in the same commit. The
+        // reverse drift — implemented but unadvertised — is the quiet half of
+        // this defect species, because nothing asks for a name nobody publishes.
+        ("HmacSHA224", "com.sun.crypto.provider.HmacCore$HmacSHA224"),
         ("HmacSHA256", "com.sun.crypto.provider.HmacCore$HmacSHA256"),
         ("HmacSHA384", "com.sun.crypto.provider.HmacCore$HmacSHA384"),
         ("HmacSHA512", "com.sun.crypto.provider.HmacCore$HmacSHA512"),
+        // The two FIPS 180-4 §5.3.6 truncations and the SHA-3 family. Added
+        // alongside the matching `mac_compute_hmac` arms, never ahead of them:
+        // this list and `phases_late::ssl_security::mac_algorithm_supported`
+        // must answer the same set, which
+        // `mac_supported_set_matches_the_advertised_sunjce_services` asserts.
+        (
+            "HmacSHA512/224",
+            "com.sun.crypto.provider.HmacCore$HmacSHA512_224",
+        ),
+        (
+            "HmacSHA512/256",
+            "com.sun.crypto.provider.HmacCore$HmacSHA512_256",
+        ),
+        ("HmacSHA3-224", "com.sun.crypto.provider.HmacCore$HmacSHA3_224"),
+        ("HmacSHA3-256", "com.sun.crypto.provider.HmacCore$HmacSHA3_256"),
+        ("HmacSHA3-384", "com.sun.crypto.provider.HmacCore$HmacSHA3_384"),
+        ("HmacSHA3-512", "com.sun.crypto.provider.HmacCore$HmacSHA3_512"),
     ] {
         put_service(JCE, "Mac", algorithm, class_name);
     }
+    // `KeyGenerator` is NOT natively intercepted in `--real-jdk` mode: the real
+    // `KeyGenerator.getInstance` reaches `sun.security.jca.GetInstance`, which
+    // this module answers from the registry below and then INSTANTIATES the
+    // named class. So every row here has to be a class the real image really
+    // ships with a public no-arg ctor — the SunJCE key generators all are,
+    // being reflectively constructed by the provider itself — and the bytes a
+    // caller gets are the JDK's own, not a reimplementation.
+    //
+    // The list was `[AES, DESede, HmacSHA256]` until 2026-08-12, which made
+    // `KeyGenerator.getInstance("Blowfish")` — and `DES`, `ChaCha20`, and every
+    // Hmac name but one — answer `NoSuchAlgorithmException: <name> KeyGenerator
+    // not available` (measured) where HotSpot hands back a key. That was the
+    // advertised-vs-implemented gap in its quiet direction twice over:
+    // `phases_early::keygen_default_bits` (the `--synthetic-jdk` path) already
+    // implemented all of these, and the real image implements all of them too;
+    // only the registry the two modes share disagreed.
     for (algorithm, class_name) in [
         ("AES", "com.sun.crypto.provider.AESKeyGenerator"),
+        ("ARCFOUR", "com.sun.crypto.provider.KeyGeneratorCore$ARCFOURKeyGenerator"),
+        ("Blowfish", "com.sun.crypto.provider.BlowfishKeyGenerator"),
+        ("ChaCha20", "com.sun.crypto.provider.KeyGeneratorCore$ChaCha20KeyGenerator"),
+        ("DES", "com.sun.crypto.provider.DESKeyGenerator"),
         ("DESede", "com.sun.crypto.provider.DESedeKeyGenerator"),
+        ("HmacMD5", "com.sun.crypto.provider.HmacMD5KeyGenerator"),
+        ("HmacSHA1", "com.sun.crypto.provider.HmacSHA1KeyGenerator"),
+        (
+            "HmacSHA224",
+            "com.sun.crypto.provider.KeyGeneratorCore$HmacKG$SHA224",
+        ),
         (
             "HmacSHA256",
             "com.sun.crypto.provider.KeyGeneratorCore$HmacKG$SHA256",
         ),
+        (
+            "HmacSHA384",
+            "com.sun.crypto.provider.KeyGeneratorCore$HmacKG$SHA384",
+        ),
+        (
+            "HmacSHA512",
+            "com.sun.crypto.provider.KeyGeneratorCore$HmacKG$SHA512",
+        ),
+        ("RC2", "com.sun.crypto.provider.KeyGeneratorCore$RC2KeyGenerator"),
     ] {
         put_service(JCE, "KeyGenerator", algorithm, class_name);
     }
+    // SunJCE's own `KeyGenerator` alias, and the reason `keygen_default_bits`
+    // spells both: `RC4` is not a service, it is
+    // `Alg.Alias.KeyGenerator.RC4 = ARCFOUR`. Aliases stay out of
+    // `Security.getAlgorithms` (their property key is `Alg.Alias.…`), which is
+    // why HotSpot's own list names ARCFOUR and not RC4.
+    put_alias(JCE, "KeyGenerator", "RC4", "ARCFOUR");
+    // Deliberately NOT seeded, and each for a checkable reason rather than an
+    // oversight: `HmacSHA3-{224,256,384,512}` and `HmacSHA512/{224,256}`,
+    // because `keygen_default_bits` has no arm for them and the
+    // `--synthetic-jdk` path would refuse a name this list published; and the
+    // five `SunTls*` generators, which are TLS-internal KDFs driven by
+    // `sun.security.ssl` and take `TlsKeyMaterialParameterSpec`-family specs
+    // this engine's `init` surface does not carry.
     put_service(
         "SunRsaSign",
         "KeyPairGenerator",
@@ -1959,7 +2201,7 @@ fn make_service(
     prov: ObjectRef,
 ) -> Result<ObjectRef, MethodCallFailed> {
     let prov_pin = ctx.pin_native_root(prov);
-    let svc0 = alloc_concurrent_synthetic(ctx, "java/security/Provider$Service", 7);
+    let svc0 = try_alloc_concurrent_synthetic(ctx, "java/security/Provider$Service", 7)?;
     let svc_pin = ctx.pin_native_root(svc0);
     let type_s0 = ctx.create_string(&entry.type_str);
     let type_pin = ctx.pin_native_root(type_s0);
@@ -2092,9 +2334,13 @@ fn provider_get_services_native(ctx: &mut dyn NativeContext, args: &[Value]) -> 
         }
     }
     let set = ctx.read_native_pin(set_pin, set);
+    // As in `security_get_algorithms`: wrap while still pinned, then unpin
+    // both. HotSpot answers `Collections$UnmodifiableSet` here too (n=65 for
+    // SUN, measured) and `add(null)` raises `UnsupportedOperationException`.
+    let view = wrap_unmodifiable(ctx, set);
     ctx.unpin_native_roots(set_pin);
     ctx.unpin_native_roots(this_pin);
-    Ok(Some(Value::Object(Some(set))))
+    Ok(Some(Value::Object(Some(view))))
 }
 
 fn provider_service_string_field(
@@ -2216,7 +2462,7 @@ fn resolve_service(
     provider: &str,
     type_str: &str,
     algo: &str,
-) -> Option<ObjectRef> {
+) -> Result<Option<ObjectRef>, MethodCallFailed> {
     let entry = get_service_entry(provider, type_str, algo);
     if crate::nbflags().diag_jca {
         match &entry {
@@ -2242,10 +2488,12 @@ fn resolve_service(
             }
         }
     }
-    let entry = entry?;
+    let Some(entry) = entry else {
+        return Ok(None);
+    };
     let (ver, coverage) = find(provider).unwrap_or((25.0, USER_PROVIDER_COVERAGE));
-    let prov_obj = make_provider(ctx, provider, ver, coverage);
-    Some(make_service(ctx, &entry, prov_obj).ok()?)
+    let prov_obj = make_provider(ctx, provider, ver, coverage)?;
+    Ok(Some(make_service(ctx, &entry, prov_obj)?))
 }
 
 /// `sun.security.jca.GetInstance.getService(String type, String algorithm,
@@ -2259,7 +2507,7 @@ fn getinstance_get_service_provider(
     let type_str = read_arg_string(ctx, args, 0);
     let algo = read_arg_string(ctx, args, 1);
     let provider = read_arg_string(ctx, args, 2);
-    match resolve_service(ctx, &provider, &type_str, &algo) {
+    match resolve_service(ctx, &provider, &type_str, &algo)? {
         Some(svc) => Ok(Some(Value::Object(Some(svc)))),
         None => Err(cratonvm_types::error::RuntimeError::NotImplemented {
             feature: format!(
@@ -2277,7 +2525,7 @@ fn getinstance_get_service_search(ctx: &mut dyn NativeContext, args: &[Value]) -
     let type_str = read_arg_string(ctx, args, 0);
     let algo = read_arg_string(ctx, args, 1);
     for (name, _, _) in snapshot() {
-        if let Some(svc) = resolve_service(ctx, &name, &type_str, &algo) {
+        if let Ok(Some(svc)) = resolve_service(ctx, &name, &type_str, &algo) {
             return Ok(Some(Value::Object(Some(svc))));
         }
     }
@@ -2586,12 +2834,11 @@ pub(crate) fn ssl_context_protocol_supported(protocol: &str) -> bool {
 ///     reproduced rather than "fixed" so the two agree;
 ///   * a null, empty, or `.`-terminated service name yields the EMPTY set.
 ///
-/// Deliberate divergence, recorded: HotSpot wraps the result in
-/// `Collections.unmodifiableSet` (probe: `add` throws
-/// `UnsupportedOperationException`). The caller here gets a plain `HashSet`,
-/// matching what `provider_get_services_native` already returns, because the
-/// wrapper would add a Java round-trip through a synthetic view whose
-/// `contains` this lane could not measure. See the known-issues note.
+/// (A "Deliberate divergence, recorded" paragraph stood here saying the caller
+/// gets a plain `HashSet` where HotSpot returns `Collections.unmodifiableSet`.
+/// That divergence is closed — `security_get_algorithms` and
+/// `provider_get_services_native` both wrap through `wrap_unmodifiable` now.
+/// A comment outlives its defect. W7-63-jca-advertise-vs-serve.md.)
 pub(crate) fn algorithms_for_service(service_name: &str) -> Vec<String> {
     if service_name.is_empty() || service_name.ends_with('.') {
         return Vec::new();
@@ -2628,6 +2875,82 @@ pub(crate) fn algorithms_for_service(service_name: &str) -> Vec<String> {
     out
 }
 
+/// Wrap `set` in `Collections.unmodifiableSet`, which is what HotSpot returns
+/// from BOTH `Security.getAlgorithms` and `Provider.getServices` — measured on
+/// jdk-25.0.3.9-hotspot and recorded in
+/// probes/JcaAdvertisedVsServedProbe.expected.txt §D:
+/// `java.util.Collections$UnmodifiableSet`, with `add`, `remove` and
+/// `iterator().remove()` all raising `UnsupportedOperationException`.
+///
+/// This is not a missing guard, it is a missing STATEMENT.
+/// `Collections.unmodifiableSet` is how the JDK tells a caller "this is a view
+/// of platform state, not yours to edit". A plain `HashSet` is an invitation:
+/// a caller that mutates it and hands it on has manufactured an algorithm list
+/// no provider backs, and nothing downstream can tell it from a real one.
+///
+/// Applied on EVERY path including the empty ones — `getAlgorithms` for an
+/// unknown engine type answers an IMMUTABLE EMPTY set on HotSpot, never a
+/// throw. HotSpot distinguishes `Collections$UnmodifiableSet` (unknown engine
+/// type) from `Collections$EmptySet` (`""`, `"Foo."`, `null`); that split is
+/// not reproduced, because both are immutable and both are size 0, which is
+/// the entire observable contract.
+///
+/// Each HotSpot call returns a DISTINCT object (measured: two calls are not
+/// `==`), so this must be built per call and must not be cached.
+///
+/// GC: `unmodifiableSet` allocates the view, so `set` must be a freshly
+/// re-read reference and only the RETURN value may be used afterwards.
+///
+/// On failure the plain set is returned rather than propagating the error: an
+/// immutability wrapper is not worth converting a correct answer into a thrown
+/// exception. The `Ok(None)` / `Ok(Some(null))` fallback should be unreachable.
+///
+/// **Mode caveat, and it is a vacuous-green trap for whoever verifies this.**
+/// `java.util.Collections.unmodifiableSet` has THREE registrations in this
+/// tree and registration is last-write-wins:
+///
+///   * `native-collections`'s `register_collections_extras_natives` binds it to
+///     `native_collections_unmodifiable_set`, which allocates a genuine
+///     read-only view. Live in real-JDK and `--jdk-only`, where it is what
+///     this call reaches (in real-JDK mode real JDK bytecode is available
+///     too — either way the result is immutable).
+///   * `phases_early::register_collections_extras_natives` AND
+///     `phases_early::register_core_stdlib_extras` both bind it to
+///     `native_return_first_arg` — the IDENTITY function. Both are reached
+///     only from `lib::register_synthetic_overrides`, which runs after the
+///     essential registrars, so **in `--synthetic-jdk` the identity wins and
+///     this wrapper is inert**: the caller gets the same mutable `HashSet`
+///     back and `add` still succeeds.
+///
+/// So a probe run under `--synthetic-jdk` will report
+/// `class=java.util.HashSet add=SUCCEEDED` here and that is NOT evidence this
+/// change failed to land — it is a separate defect one layer down, recorded in
+/// W7-63-jca-advertise-vs-serve.md §8. An "unmodifiable" wrapper that returns
+/// its argument is the same species as everything else in that record: an API
+/// whose whole contract is a refusal, quietly not refusing.
+fn wrap_unmodifiable(ctx: &mut dyn NativeContext, set: ObjectRef) -> ObjectRef {
+    match ctx.invoke(
+        "java/util/Collections",
+        "unmodifiableSet",
+        "(Ljava/util/Set;)Ljava/util/Set;",
+        &[Value::Object(Some(set))],
+    ) {
+        Ok(Some(Value::Object(Some(view)))) => view,
+        _ => set,
+    }
+}
+
+/// `wrap_unmodifiable` for the `--synthetic-jdk` `Security.getAlgorithms`
+/// override in `phases_early`, which deliberately shadows the registry-backed
+/// registration in that mode and therefore has to make the same answer in the
+/// same shape.
+pub(crate) fn wrap_unmodifiable_public(
+    ctx: &mut dyn NativeContext,
+    set: ObjectRef,
+) -> ObjectRef {
+    wrap_unmodifiable(ctx, set)
+}
+
 fn security_get_algorithms(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // `Security.getAlgorithms(null)` returns the EMPTY set on HotSpot (the
     // real body's first branch), it does not NPE — measured.
@@ -2660,8 +2983,12 @@ fn security_get_algorithms(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         }
     }
     let set = ctx.read_native_pin(set_pin, set);
+    // Wrap BEFORE unpinning: `wrap_unmodifiable` invokes Java, which can move
+    // `set`, and the pin is what keeps the just-re-read reference valid across
+    // that call. Only the returned view may be used afterwards.
+    let view = wrap_unmodifiable(ctx, set);
     ctx.unpin_native_roots(set_pin);
-    Ok(Some(Value::Object(Some(set))))
+    Ok(Some(Value::Object(Some(view))))
 }
 
 /// Resolve `name` to the best available `Provider` object: the REAL
@@ -2670,12 +2997,12 @@ fn security_get_algorithms(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
 /// the caller's own `Provider` constructor set — otherwise a fresh synthetic
 /// built from the seed-list entry (or a generic `USER_PROVIDER_COVERAGE`
 /// synthetic if `name` isn't in the seed list at all).
-pub(crate) fn resolve_or_make_provider(ctx: &mut dyn NativeContext, name: &str) -> ObjectRef {
+pub(crate) fn resolve_or_make_provider(ctx: &mut dyn NativeContext, name: &str) -> Result<ObjectRef, MethodCallFailed> {
     if let Some(real) = resolve_real_provider(ctx, name) {
-        return real;
+        return Ok(real);
     }
     let (ver, coverage) = find(name).unwrap_or((1.0, USER_PROVIDER_COVERAGE));
-    make_provider(ctx, name, ver, coverage)
+    Ok(make_provider(ctx, name, ver, coverage)?)
 }
 
 pub(crate) fn build_jca_impl(
@@ -2743,9 +3070,11 @@ fn build_jca_instance(
     provider: &str,
     type_str: &str,
     algo: &str,
-) -> Option<MethodCallResult> {
-    let impl_result = build_jca_impl(ctx, provider, type_str, algo)?;
-    Some((|| {
+) -> Result<Option<MethodCallResult>, MethodCallFailed> {
+    let Some(impl_result) = build_jca_impl(ctx, provider, type_str, algo) else {
+        return Ok(None);
+    };
+    Ok(Some((|| {
         let impl_ref = match impl_result? {
             Some(Value::Object(Some(o))) => o,
             _ => {
@@ -2760,7 +3089,7 @@ fn build_jca_instance(
         // Pin the SPI across the Provider allocation below (which can GC).
         let pin = ctx.pin_native_root(impl_ref);
         let (ver, coverage) = find(provider).unwrap_or((25.0, USER_PROVIDER_COVERAGE));
-        let prov_obj = make_provider(ctx, provider, ver, coverage);
+        let prov_obj = make_provider(ctx, provider, ver, coverage)?;
         let impl_ref = ctx.read_native_pin(pin, impl_ref);
         // 2. Build GetInstance$Instance(provider, impl) via its real ctor.
         let inst = ctx.new_object_initialized(
@@ -2770,7 +3099,7 @@ fn build_jca_instance(
         );
         ctx.unpin_native_roots(pin);
         inst
-    })())
+    })()))
 }
 
 fn getinstance_instance_provider(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -2785,7 +3114,7 @@ fn getinstance_instance_provider(ctx: &mut dyn NativeContext, args: &[Value]) ->
             ProviderArgWording::Shared,
         ));
     }
-    match build_jca_instance(ctx, &provider, &type_str, &algo) {
+    match build_jca_instance(ctx, &provider, &type_str, &algo)? {
         Some(r) => r,
         None => Err(throw_no_such_algorithm(
             ctx,
@@ -2810,7 +3139,7 @@ fn getinstance_instance_provider_obj(
             .unwrap_or_default(),
         _ => String::new(),
     };
-    match build_jca_instance(ctx, &provider, &type_str, &algo) {
+    match build_jca_instance(ctx, &provider, &type_str, &algo)? {
         Some(r) => r,
         None => Err(throw_no_such_algorithm(
             ctx,
@@ -2839,7 +3168,7 @@ fn getinstance_get_services(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     ctx.invoke(al, "<init>", "()V", &[Value::Object(Some(list))])?;
     let pin = ctx.pin_native_root(list);
     for (name, _, _) in snapshot() {
-        if let Some(svc) = resolve_service(ctx, &name, &type_str, &algo) {
+        if let Ok(Some(svc)) = resolve_service(ctx, &name, &type_str, &algo) {
             list = ctx.read_native_pin(pin, list);
             ctx.invoke(
                 al,
@@ -2865,7 +3194,7 @@ fn getinstance_instance_search(ctx: &mut dyn NativeContext, args: &[Value]) -> M
     let type_str = read_arg_string(ctx, args, 0);
     let algo = read_arg_string(ctx, args, 2);
     for (name, _, _) in snapshot() {
-        if let Some(r) = build_jca_instance(ctx, &name, &type_str, &algo) {
+        if let Ok(Some(r)) = build_jca_instance(ctx, &name, &type_str, &algo) {
             return r;
         }
     }
@@ -2917,12 +3246,14 @@ fn getinstance_instance_search(ctx: &mut dyn NativeContext, args: &[Value]) -> M
 pub(crate) fn try_build_real_certificate_factory(
     ctx: &mut dyn NativeContext,
     args: &[Value],
-) -> Option<ObjectRef> {
+) -> Result<Option<ObjectRef>, MethodCallFailed> {
     let algo = read_arg_string(ctx, args, 0);
-    let provider = find_service_provider("CertificateFactory", &algo)?;
-    let impl_ref = match build_jca_impl(ctx, &provider, "CertificateFactory", &algo)? {
-        Ok(Some(Value::Object(Some(o)))) => o,
-        _ => return None,
+    let Some(provider) = find_service_provider("CertificateFactory", &algo) else {
+        return Ok(None);
+    };
+    let impl_ref = match build_jca_impl(ctx, &provider, "CertificateFactory", &algo) {
+        Some(Ok(Some(Value::Object(Some(o))))) => o,
+        _ => return Ok(None),
     };
     let pin = ctx.pin_native_root(impl_ref);
     let provider_obj = resolve_or_make_provider(ctx, &provider);
@@ -2933,14 +3264,14 @@ pub(crate) fn try_build_real_certificate_factory(
         "(Ljava/security/cert/CertificateFactorySpi;Ljava/security/Provider;Ljava/lang/String;)V",
         &[
             Value::Object(Some(impl_ref)),
-            Value::Object(Some(provider_obj)),
+            Value::Object(Some(provider_obj?)),
             Value::Object(Some(algo_str)),
         ],
     );
     ctx.unpin_native_roots(pin);
     match result {
-        Ok(Some(Value::Object(Some(o)))) => Some(o),
-        _ => None,
+        Ok(Some(Value::Object(Some(o)))) => Ok(Some(o)),
+        _ => Ok(None),
     }
 }
 
@@ -3144,7 +3475,30 @@ pub(crate) fn register(r: &mut NativeMethodRegistry) {
     // asymmetric provider to configure for real (so EC services register and
     // KeyPairGenerator/Signature("EC","BC") resolve real BC SPIs). Skip these
     // no-ops in that mode; the WildFly-era no-ops stay the default.
-    if !crate::real_jca_mode() {
+    //
+    // 2026-08-13: they are no longer the default, because the blocker the
+    // Round-87 comment above describes is gone. Re-measured on this host: with
+    // the no-ops lifted, `new BouncyCastleProvider()` + all six asymmetric
+    // `$Mappings.configure` calls complete in well under a second, and BC's EC
+    // family registers its 343 algorithms — no ~5-minute `ECNamedCurveTable`
+    // walk, no operand-stack tag mismatch. What changed since Round 87 is the
+    // EC routing this VM now does by default (`route_ec_to_real`, with the
+    // `sunec_intpoly`/`sunec_point` intrinsics behind it), which is also what
+    // makes the curve tables cheap.
+    //
+    // What the no-op cost, measured the same day: `bc.getService("KeyFactory",
+    // "EC")` answered `null`, so BouncyCastle could not convert an EC key at
+    // all. netty's `BouncyCastlePemReader` — which netty tries BEFORE the JDK
+    // parser for every PEM private key — failed with `PEMException: unable to
+    // convert key pair: no such algorithm: EC for provider BC` and returned
+    // null, and the JDK fallback cannot read a SEC1 `EC PRIVATE KEY` block at
+    // all. That is netty `SslContextBuilderTest.
+    // testCombinedPemFileClientContextJdk`'s `IllegalArgumentException: Input
+    // stream does not contain valid private key.`, three layers downstream.
+    //
+    // The kill-switch is `CRATONVM_SYNTHETIC_EC=1` (it turns
+    // `route_ec_to_real` off), which restores the Round-87 behaviour exactly.
+    if !crate::real_jca_mode() && !crate::route_ec_to_real() {
         r.register(
             "org/bouncycastle/jcajce/provider/asymmetric/EC",
             "<clinit>",
@@ -3868,6 +4222,425 @@ mod tests {
         assert!(get_service_entry("SunJCE", "Cipher", "AESWrap").is_some());
     }
 
+    /// W7-15 ratchet: every `Cipher` transformation this provider ADVERTISES
+    /// must be one `jca::cipher` can actually COMPUTE.
+    ///
+    /// The census that opened this lane found the two lists disagreeing in both
+    /// directions simultaneously — `ChaCha20` / `ChaCha20-Poly1305` advertised
+    /// and silently served as AES-256-ECB, `AES/KW/PKCS5Padding` and
+    /// `AES/KWP/NoPadding` advertised and served by nothing, `DES` / `DESede`
+    /// computed correctly and never advertised at all. Both directions are
+    /// defects and only one of them is loud: an advertised-but-absent algorithm
+    /// raises at `getInstance`, while a served-but-unadvertised one is
+    /// whatever the default arm felt like doing.
+    ///
+    /// A census run by hand drifts again by the next wave. This is the same
+    /// closure the bridge-wave population used: the measurement becomes a test,
+    /// so the next person to add a name to either list has to add it to both.
+    #[test]
+    fn every_advertised_sunjce_cipher_is_serviceable() {
+        let _lock = reset_service_state_for_tests();
+        seed_direct_native_engine_services();
+        let advertised: Vec<String> = services()
+            .lock()
+            .get("SunJCE")
+            .expect("the SunJCE seed must have run")
+            .values()
+            .filter(|e| e.type_str == "Cipher")
+            .map(|e| e.algorithm.clone())
+            .collect();
+        assert!(
+            advertised.len() >= 12,
+            "the SunJCE Cipher seed looks empty: {advertised:?}"
+        );
+        for algorithm in &advertised {
+            assert!(
+                crate::jca::cipher::transformation_is_serviceable(algorithm),
+                "SunJCE advertises Cipher.{algorithm}, but Cipher.getInstance refuses it — \
+                 advertising an algorithm the engine cannot compute is the defect W7-15 closed"
+            );
+        }
+        // And the reverse direction for the names that were the actual bug.
+        // They were removed on 2026-08-11 while unimplemented and put back the
+        // same day once implemented, so what this asserts is the INVARIANT —
+        // advertised and computable are one set — rather than a fixed verdict
+        // about these four names. The loop above already proves each is
+        // serviceable; this proves the seed did not quietly drop them.
+        for implemented in [
+            "ChaCha20",
+            "ChaCha20-Poly1305",
+            "AES/KW/PKCS5Padding",
+            "AES/KWP/NoPadding",
+            // W7-39, 2026-08-12: same history, one wave later. Both were pulled
+            // from the seed on 08-11 while `getInstance` served them as
+            // AES-128-ECB, and both are back now that `jca::cipher::
+            // drive_real_ecb_cipher` computes them through the real SunJCE SPI.
+            "ARCFOUR",
+            "Blowfish",
+        ] {
+            assert!(
+                get_service_entry("SunJCE", "Cipher", implemented).is_some(),
+                "{implemented} is implemented but no longer advertised: the two lists have drifted, which is the defect this test exists for"
+            );
+            assert!(
+                crate::jca::cipher::transformation_is_serviceable(implemented),
+                "{implemented} is advertised but Cipher.getInstance refuses it"
+            );
+        }
+        // An ALIAS is resolvable without being advertised — that is the whole
+        // point of one — so `RC4` has to be checked through the alias map rather
+        // than through the advertised list, which is where the loop above would
+        // never have looked. Measured on HotSpot 25: `Cipher.getInstance("RC4")`
+        // resolves, answers `getProvider()=SunJCE`, and produces the same bytes
+        // as `ARCFOUR`, while `Security.getAlgorithms("Cipher")` names only
+        // ARCFOUR.
+        //
+        // `TripleDES` is deliberately NOT in this loop. It resolves through the
+        // alias map like the two below, but `Cipher.getInstance("TripleDES")` is
+        // still refused, because SunJCE maps it to the BARE `DESede` and a bare
+        // DESede defaults to ECB — a mode this engine does not route. That is a
+        // real divergence from HotSpot and it predates W7-39; asserting
+        // serviceability for it here would red the test for a gap this lane did
+        // not open and does not close.
+        for (alias, canonical) in [("RC4", "ARCFOUR"), ("AESWrap", "AES/KW/NoPadding")] {
+            assert!(
+                get_service_entry("SunJCE", "Cipher", alias).is_some(),
+                "{alias} must resolve through the alias map to {canonical}"
+            );
+            assert!(
+                !advertised.iter().any(|a| a.eq_ignore_ascii_case(alias)),
+                "{alias} is an ALIAS and must stay out of Security.getAlgorithms, \
+                 which is where HotSpot keeps it"
+            );
+            assert!(
+                crate::jca::cipher::transformation_is_serviceable(alias),
+                "{alias} resolves as a service but Cipher.getInstance refuses it"
+            );
+        }
+    }
+
+    /// Collect every algorithm `provider` advertises for `type_str` straight
+    /// out of the seed map.
+    ///
+    /// Deliberately not via `algorithms_for_service`: that walks the live
+    /// PROVIDER CHAIN, and the chain's coverage here is not what the seed
+    /// wrote, so a chain-based read could answer a shorter set and the loops
+    /// below would pass by iterating less than they think. Each caller also
+    /// asserts a minimum row count before looping, because a loop over nothing
+    /// is a probe that cannot fail.
+    fn advertised_for(provider: &str, type_str: &str) -> Vec<String> {
+        services()
+            .lock()
+            .get(provider)
+            .map(|m| {
+                m.values()
+                    .filter(|e| e.type_str == type_str)
+                    .map(|e| e.algorithm.clone())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Every `(provider, algorithm)` the seed advertises for `type_str`,
+    /// across EVERY provider in the map.
+    ///
+    /// The hardcoded provider list this replaces would have missed the
+    /// `SunJCE` `KeyFactory` `ML-KEM` umbrella entirely — an
+    /// advertised-and-refused name that neither originating record lists and
+    /// that only the census found. A ratchet that checks a subset of the
+    /// population is a ratchet with a hole in exactly the place nobody is
+    /// looking.
+    fn all_advertised(type_str: &str) -> Vec<(String, String)> {
+        let providers: Vec<String> = services().lock().keys().cloned().collect();
+        let mut out = Vec::new();
+        for provider in providers {
+            for algorithm in advertised_for(&provider, type_str) {
+                out.push((provider.clone(), algorithm));
+            }
+        }
+        out
+    }
+
+    /// W7-63 ratchet: every `MessageDigest` name `SUN` advertises must be one
+    /// `MessageDigest.getInstance` will serve, and every digest this VM
+    /// implements must be advertised.
+    ///
+    /// Both directions, because this pair drifted in both at once and only one
+    /// of them was loud. `MD2` sat in the advertised array for three waves
+    /// while `algorithm_supported` refused it — three lines above a comment
+    /// declining to advertise SHAKE for exactly that reason. `SHAKE128-256`
+    /// and `SHAKE256-512` were the quiet direction: correctly withheld while
+    /// unimplemented, and then still withheld after the dependency to
+    /// implement them was already in the tree. A census run by hand finds one
+    /// of those and drifts again by the next wave; a test finds both and
+    /// cannot.
+    #[test]
+    fn every_advertised_sun_message_digest_is_serviceable() {
+        let _lock = reset_service_state_for_tests();
+        seed_direct_native_engine_services();
+        let advertised = all_advertised("MessageDigest");
+        assert!(
+            advertised.len() >= 15,
+            "the MessageDigest seed looks empty: {advertised:?}"
+        );
+        for (provider, algorithm) in &advertised {
+            assert!(
+                crate::jca::message_digest::algorithm_supported_public(algorithm),
+                "{provider} advertises MessageDigest.{algorithm}, but \
+                 MessageDigest.getInstance refuses it — advertising a digest the engine \
+                 cannot compute is the defect W7-63 closed"
+            );
+        }
+        // The reverse direction. These are the three names the two records
+        // were actually about; the loop above proves each is serviceable, this
+        // proves the seed did not quietly drop it.
+        for implemented in ["MD2", "SHAKE128-256", "SHAKE256-512"] {
+            assert!(
+                get_service_entry("SUN", "MessageDigest", implemented).is_some(),
+                "{implemented} is implemented but not advertised: the two lists have drifted, \
+                 which is the defect this test exists for"
+            );
+        }
+        // And the ALIAS half, which decides whether the advertised count lands
+        // on HotSpot's 15 or on 17. `SHAKE128` / `SHAKE256` resolve through
+        // `getInstance` (measured on HotSpot 25: byte-identical digests to the
+        // hyphenated primaries) while `Security.getAlgorithms("MessageDigest")`
+        // must NOT list them. An alias registered as a service would pass
+        // every other assertion in this test.
+        for (alias, canonical) in [("SHAKE128", "SHAKE128-256"), ("SHAKE256", "SHAKE256-512")] {
+            assert!(
+                get_service_entry("SUN", "MessageDigest", alias).is_some(),
+                "{alias} must resolve through the alias map to {canonical}"
+            );
+            assert!(
+                !advertised.iter().any(|(_, a)| a.eq_ignore_ascii_case(alias)),
+                "{alias} is an ALIAS and must stay out of Security.getAlgorithms, \
+                 which is where HotSpot keeps it"
+            );
+        }
+    }
+
+    /// W7-63 ratchet: no advertised `Signature` name may be refused at
+    /// `getInstance`.
+    ///
+    /// Only this direction is asserted, and the asymmetry is the point.
+    /// `Signature.getInstance` used to accept EVERY string and defer the
+    /// failure to `sign()`/`verify()` as a `SignatureException`, so a caller
+    /// probing with `catch (NoSuchAlgorithmException)` took the wrong branch.
+    /// The gate that closed it (`signature::signature_name_is_offered`) is a
+    /// disjunction — a name this engine has an index for, OR a name some
+    /// provider advertises — so it can only fail in one direction, and this is
+    /// that direction.
+    ///
+    /// It deliberately does NOT assert that every advertised name can compute.
+    /// Nine `SunRsaSign` names (`MD2withRSA`, `SHA3-*withRSA`,
+    /// `SHA512/224withRSA` and friends) have no `sign_dispatch` arm and fail
+    /// at `sign()` with a checked, catchable `SignatureException`. That is an
+    /// ordinary unimplemented-algorithm gap, not this record's species: the
+    /// name is real, the advertisement is truthful, and the failure is closed.
+    /// Asserting serviceability here would red the test for a gap W7-63 did
+    /// not open and does not close.
+    #[test]
+    fn every_advertised_signature_name_is_offered_by_get_instance() {
+        let _lock = reset_service_state_for_tests();
+        seed_direct_native_engine_services();
+        let advertised = all_advertised("Signature");
+        assert!(
+            advertised.len() >= 20,
+            "the Signature seed looks empty ({} rows): a loop over nothing \
+             passes vacuously",
+            advertised.len()
+        );
+        for (provider, algorithm) in &advertised {
+            assert!(
+                crate::jca::signature::get_instance_offers(algorithm),
+                "{provider} advertises Signature.{algorithm}, but \
+                 Signature.getInstance refuses it"
+            );
+        }
+        // The anti-vacuity half: prove the gate can say NO. Without this the
+        // loop above is satisfied by a predicate that returns `true`
+        // unconditionally, which is exactly what `sig_get_instance` used to do.
+        for bogus in ["NO-SUCH-SIG", "ML-KEM", "AES", "HmacSHA256", ""] {
+            assert!(
+                !crate::jca::signature::get_instance_offers(bogus),
+                "Signature.getInstance must refuse {bogus:?} — HotSpot 25 raises \
+                 NoSuchAlgorithmException for it, measured"
+            );
+        }
+    }
+
+    /// W7-63 ratchet: every `KeyFactory` name the seed advertises must be one
+    /// `KeyFactory.getInstance` will serve.
+    ///
+    /// The `SUN` seed advertised the `ML-DSA` UMBRELLA name while
+    /// `key_factory::kf_algo_idx` had arms only for `ML-DSA-44/65/87` and
+    /// `kf_get_instance` threw on the negative index — advertised and refused.
+    /// `signature::algo_idx` carries the umbrella arm, so the two engines
+    /// disagreed about one name. The umbrella is now absent from the
+    /// `KeyFactory` seed and still present in the `Signature` seed, which
+    /// makes each engine's advertisement match ITS OWN implementation rather
+    /// than making the two engines agree with each other — that is the
+    /// correct invariant, and it is what this asserts.
+    #[test]
+    fn every_advertised_key_factory_name_is_serviceable() {
+        let _lock = reset_service_state_for_tests();
+        seed_direct_native_engine_services();
+        let advertised = all_advertised("KeyFactory");
+        assert!(
+            advertised.len() >= 12,
+            "the KeyFactory seed looks empty ({} rows): a loop over nothing \
+             passes vacuously",
+            advertised.len()
+        );
+        for (provider, algorithm) in &advertised {
+            assert!(
+                crate::jca::key_factory::get_instance_offers(algorithm),
+                "{provider} advertises KeyFactory.{algorithm}, but \
+                 KeyFactory.getInstance refuses it"
+            );
+        }
+        // Both umbrellas are STOP-ADVERTISING fixes, not implementations, so
+        // pin both halves of each: absent where the engine refuses them,
+        // present where it does not. Either half alone would let the pair
+        // drift back. `ML-KEM` was found by the census, not by either
+        // originating record — the loop above is what catches the next one.
+        for (provider, umbrella) in [("SUN", "ML-DSA"), ("SunJCE", "ML-KEM")] {
+            assert!(
+                get_service_entry(provider, "KeyFactory", umbrella).is_none(),
+                "{provider} must not advertise the {umbrella} umbrella for KeyFactory \
+                 while kf_algo_idx refuses it — either implement the umbrella arm or \
+                 leave the name out, but never both"
+            );
+        }
+        assert!(
+            get_service_entry("SUN", "Signature", "ML-DSA").is_some(),
+            "Signature DOES implement the ML-DSA umbrella (signature::algo_idx \
+             carries SIG_MLDSA) and must keep advertising it — the two engines are \
+             each truthful about THEMSELVES, which is the invariant, not that they \
+             agree with each other"
+        );
+        for param_set in [
+            "ML-DSA-44",
+            "ML-DSA-65",
+            "ML-DSA-87",
+        ] {
+            assert!(
+                get_service_entry("SUN", "KeyFactory", param_set).is_some(),
+                "{param_set} is serviceable and must stay advertised"
+            );
+        }
+        for param_set in ["ML-KEM-512", "ML-KEM-768", "ML-KEM-1024"] {
+            assert!(
+                get_service_entry("SunJCE", "KeyFactory", param_set).is_some(),
+                "{param_set} is serviceable and must stay advertised"
+            );
+        }
+    }
+
+    /// The same ratchet for `Mac`, in the shape
+    /// `every_advertised_sunjce_cipher_is_serviceable` established — and for the
+    /// same reason: `Mac` is where the wrong-algorithm defect was WORST, because
+    /// a MAC that verifies is itself the security decision, and two peers
+    /// computing the same wrong MAC interoperate happily.
+    ///
+    /// This reads the advertised set out of the registry rather than restating
+    /// it, so the list cannot be updated on one side only. `HmacSHA224` was
+    /// added to both sides on 2026-08-12; a census written by hand would have
+    /// been the thing that went stale.
+    #[test]
+    fn every_advertised_sunjce_mac_is_computable() {
+        let _lock = reset_service_state_for_tests();
+        seed_direct_native_engine_services();
+        let advertised: Vec<String> = services()
+            .lock()
+            .get("SunJCE")
+            .expect("the SunJCE seed must have run")
+            .values()
+            .filter(|e| e.type_str == "Mac")
+            .map(|e| e.algorithm.clone())
+            .collect();
+        assert!(
+            advertised.len() >= 12,
+            "the SunJCE Mac seed looks empty: {advertised:?}"
+        );
+        for algorithm in &advertised {
+            let bytes = crate::phases_late::ssl_security::mac_compute_hmac(algorithm, b"k", b"d");
+            let len = crate::phases_late::ssl_security::mac_output_length(algorithm);
+            assert!(
+                bytes.is_some(),
+                "SunJCE advertises Mac.{algorithm}, but mac_compute_hmac produces nothing — \
+                 advertising a MAC the engine cannot compute is the W4-3 defect"
+            );
+            assert_eq!(
+                len,
+                bytes.as_ref().map(Vec::len),
+                "Mac.{algorithm}: getMacLength() and the bytes doFinal returns must agree — \
+                 the retired `_ => 32` arm made them agree with each other and with nothing else"
+            );
+        }
+        // The reverse direction, which is the one a census does not enumerate:
+        // implemented but unadvertised. Every name `mac_compute_hmac` answers
+        // must have a service row, or `Security.getAlgorithms("Mac")` under-
+        // reports what `Mac.getInstance` will actually serve.
+        for implemented in [
+            "HmacMD5",
+            "HmacSHA1",
+            "HmacSHA224",
+            "HmacSHA256",
+            "HmacSHA384",
+            "HmacSHA512",
+        ] {
+            assert!(
+                get_service_entry("SunJCE", "Mac", implemented).is_some(),
+                "{implemented} is computed by mac_compute_hmac but not advertised: the two \
+                 lists have drifted, which is the defect this test exists for"
+            );
+        }
+    }
+
+    /// And for `KeyGenerator`, which is where the drift was widest: the seed
+    /// carried three names while `phases_early::keygen_default_bits` implemented
+    /// fourteen, so `KeyGenerator.getInstance("Blowfish")` answered
+    /// `NoSuchAlgorithmException: Blowfish KeyGenerator not available` —
+    /// measured on this tree's own binary — for an algorithm BOTH modes could
+    /// serve.
+    ///
+    /// The check runs in the implemented→advertised direction only, on purpose.
+    /// The other direction is not this test's to make: in `--real-jdk` mode
+    /// `KeyGenerator.getInstance` resolves through this registry and then
+    /// INSTANTIATES the named class out of the real image, so an advertised row
+    /// is serviceable if and only if that class loads — which no unit test in
+    /// this crate can observe. `keygen_default_bits` is the `--synthetic-jdk`
+    /// half, and it is the half a Rust test can hold to account.
+    #[test]
+    fn every_keygenerator_the_engine_implements_is_advertised() {
+        let _lock = reset_service_state_for_tests();
+        seed_direct_native_engine_services();
+        for implemented in [
+            "AES", "ARCFOUR", "Blowfish", "ChaCha20", "DES", "DESede", "HmacMD5", "HmacSHA1",
+            "HmacSHA224", "HmacSHA256", "HmacSHA384", "HmacSHA512", "RC2",
+        ] {
+            assert!(
+                get_service_entry("SunJCE", "KeyGenerator", implemented).is_some(),
+                "phases_early::keygen_default_bits generates a {implemented} key, but SunJCE \
+                 does not advertise it — implemented-but-unadvertised is the quiet half of \
+                 this defect, because nothing asks for a name nobody publishes"
+            );
+        }
+        // `RC4` is the alias, `ARCFOUR` the service, exactly as on SunJCE.
+        assert!(get_service_entry("SunJCE", "KeyGenerator", "RC4").is_some());
+        // Deliberately absent, and asserted so that adding one without an arm in
+        // `keygen_default_bits` reds here rather than at a caller: the synthetic
+        // path would refuse a name this registry published.
+        for unimplemented in ["HmacSHA3-256", "HmacSHA512/256", "SunTlsPrf"] {
+            assert!(
+                get_service_entry("SunJCE", "KeyGenerator", unimplemented).is_none(),
+                "{unimplemented} has no keygen_default_bits arm and must not be advertised"
+            );
+        }
+    }
+
     /// W3-7. Every name the platform JDK 25 SunJSSE provider registers must be
     /// accepted, in the spellings a caller actually writes. `RJdkSecurity.tls`
     /// only probes the negative half; the positive half is what breaks every
@@ -4274,8 +5047,8 @@ fn key_store_get_instance_with_provider(
         let provider_ref = if provider_name.is_empty() {
             resolve_or_make_provider(ctx, "SUN")
         } else {
-            provider_ref
-        };
+            Ok(provider_ref)
+        }?;
         ctx.new_object_initialized(
             "java/security/KeyStore",
             "(Ljava/security/KeyStoreSpi;Ljava/security/Provider;Ljava/lang/String;)V",

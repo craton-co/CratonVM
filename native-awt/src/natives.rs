@@ -576,7 +576,7 @@ fn get_double(args: &[Value], idx: usize) -> f64 {
 // Per-group verdicts are annotated on each `register_*_natives` below and were
 // derived from `javap -p -s` against JDK 25; they are static evidence only and
 // must be confirmed with schema-v2 `invocations` counts before any group is
-// retagged. See docs/jdk-only-ambient-category-audit.md.
+// retagged. See audits/jdk-only-ambient-category-audit.md.
 pub fn register_all(registry: &mut NativeMethodRegistry) {
     register_toolkit_natives(registry);
     register_headless_natives(registry);
@@ -804,9 +804,16 @@ fn register_toolkit_natives(registry: &mut NativeMethodRegistry) {
 // two apart from a defect. The three siblings that ARE declared here have
 // concrete bytecode — they restate a policy the real bytecode already derives —
 // so they are shadows under §1.4, not §1.5 bridges. The split this marker asked
-// for has been made in evidence rather than in code; retagging still needs a
-// Windows-image census. See
-// docs/known-issues/jdk-only/l5-native-io-bridge-residuals.md.
+// for has been made in evidence rather than in code.
+//
+// The Windows-image census this was waiting on was taken on 2026-08-05 and a
+// macOS one on 2026-08-10 (CratonVM adjudicates by parsing class bytes, so an
+// unpacked image on any host answers). Both declare `hasDisplays0` ACC_NATIVE,
+// and it states its kind. `ABSENT` here meant "not measured on this platform",
+// never "dead" — which is why `scripts/jdk-only-dead-sweep.py` now refuses an
+// image set that omits one.
+//
+// See retired/l5-native-io-bridge-residuals-RETIRED-20260810.md.
 fn register_headless_natives(registry: &mut NativeMethodRegistry) {
     // sun.awt.PlatformGraphicsInfo.getDefaultHeadlessProperty()Z — the JDK
     // consults this when `java.awt.headless` is unset. On a host with no
@@ -3372,12 +3379,6 @@ fn register_swing_natives(registry: &mut NativeMethodRegistry) {
     // Headless behaviour: with no display to type into, the input dialog
     // returns an empty string without blocking. This is a fixed
     // no-interaction result, not a real prompt.
-    registry.register(
-        "javax/swing/JOptionPane",
-        "showInputDialog",
-        "(Ljava/awt/Component;Ljava/lang/Object;)Ljava/lang/Object;",
-        |ctx, _args| obj_ok(ctx.create_string("")),
-    );
 
     registry.register(
         "javax/swing/SwingUtilities",

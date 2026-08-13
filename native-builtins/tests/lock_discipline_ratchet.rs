@@ -36,6 +36,19 @@
 //! drops the guard before touching `ctx`, so none is held across a re-entry
 //! into the VM. That is the standard the rest of the backlog has to meet.
 //!
+//! Four more on 2026-08-10 — `ds_side_table`, `ds_peer_table` and
+//! `ssc_side_table` in `src/net_phase_e.rs`, and `pending_connect_sockets` in
+//! `src/phases_late/ssl_security.rs`, all at `LockLevel::Scratch` — paying back
+//! the four raw locks that had landed since the last freeze. Each met the same
+//! standard: every acquisition site read, no `ctx` call under the guard.
+//!
+//! Not converted, and worth naming so the next person does not re-derive it:
+//! `boot_layer_memo` (`src/jboss_jdkspecific.rs`) and `p60_current_handle_memo`
+//! (`src/phases_late.rs`) both hold their guard across `ctx.add_global_root`,
+//! which is exactly the re-entrant shape a level is supposed to forbid. They
+//! need the publish restructured before a level can honestly be stamped on
+//! them, so they stay in the §A6 backlog rather than being given one.
+//!
 //! ## Why this gate ratchets instead of converting
 //!
 //! Converting all 440 mechanically would be worse engineering than this gate,
@@ -76,6 +89,14 @@ use std::path::{Path, PathBuf};
 /// and the change removes no lock construction at all. Recorded here rather than
 /// silently adjusted, because a baseline moved by someone other than the author
 /// of the improvement is the bookkeeping this ratchet exists to keep honest.
+///
+/// Held at 432 on 2026-08-11 while converting one lock. `jar_manifest`'s
+/// `mtime_memo` landed as a raw `Mutex` on 2026-08-10 (14f3eb6e0) and took the
+/// count to 433, i.e. `dev` was red; converting it to `OrderedPlMutex` at
+/// `LockLevel::Scratch` pays that back exactly. So this number is unchanged and
+/// the ratchet is green again — a conversion that lowered it would have been
+/// the wrong bookkeeping, because no lock has been retired below the frozen
+/// figure.
 const BASELINE_RAW_LOCKS: usize = 432;
 
 /// Minimum number of source lines the scan must see before its count means

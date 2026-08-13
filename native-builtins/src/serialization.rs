@@ -15,9 +15,9 @@ use crate::lang_class::{
     create_constructor_object, create_method_object, read_constructor_descriptor,
 };
 use crate::lang_invoke::alloc_method_handle;
-use crate::{alloc_concurrent_synthetic, native_noop, obj_arg};
+use crate::{try_alloc_concurrent_synthetic, native_noop, obj_arg};
 use cratonvm_native_api::{MethodMetadata, NativeContext, NativeMethodRegistry};
-use cratonvm_types::error::{MethodCallResult, RuntimeError};
+use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError};
 use cratonvm_types::{ArrayElementType, ClassId, ObjectKind, ObjectRef, Value};
 
 fn serialization_not_supported(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
@@ -25,6 +25,34 @@ fn serialization_not_supported(_ctx: &mut dyn NativeContext, _args: &[Value]) ->
         message: "Java object serialization is not yet supported".into(),
     }
     .into())
+}
+
+/// A real `java.io.NotSerializableException` for `class_name`, thrown as an
+/// object rather than as an `IOException` that names the class in its text.
+///
+/// HotSpot's `ObjectOutputStream.writeObject0` ends with
+/// `throw new NotSerializableException(cl.getName())`, and the message is the
+/// class name alone. Code catching it does so BY CLASS
+/// (`catch (NotSerializableException e)`), which no `IOException` carrying the
+/// name in a string can satisfy.
+///
+/// Falls back to the old `IOException` shape if the exception class cannot be
+/// constructed: the write must fail either way, and a wrong-classed failure is
+/// strictly better than a silent success.
+fn not_serializable_exception(ctx: &mut dyn NativeContext, class_name: &str) -> MethodCallFailed {
+    let dotted = class_name.replace('/', ".");
+    let msg = ctx.create_string(&dotted);
+    match ctx.new_object_initialized(
+        "java/io/NotSerializableException",
+        "(Ljava/lang/String;)V",
+        &[Value::Object(Some(msg))],
+    ) {
+        Ok(Some(Value::Object(Some(exc)))) => MethodCallFailed::ExceptionThrown(exc),
+        _ => RuntimeError::IOException {
+            message: format!("java.io.NotSerializableException: {dotted}"),
+        }
+        .into(),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1089,8 +1117,11 @@ fn read_field_value(ctx: &mut dyn NativeContext, addr: usize, type_code: char) -
 }
 
 /// Allocate a stub ObjectStreamClass with default values.
-fn alloc_stream_class_stub(ctx: &mut dyn NativeContext, class_name: &str) -> ObjectRef {
-    let desc = alloc_concurrent_synthetic(ctx, "java/io/ObjectStreamClass", 6);
+fn alloc_stream_class_stub(
+    ctx: &mut dyn NativeContext,
+    class_name: &str,
+) -> Result<ObjectRef, MethodCallFailed> {
+    let desc = try_alloc_concurrent_synthetic(ctx, "java/io/ObjectStreamClass", 6)?;
     let name = ctx.create_string(class_name);
     ctx.set_field(desc, 0, Value::Object(Some(name)));
     ctx.set_field(desc, 1, Value::Long(compute_default_svuid(class_name)));
@@ -1098,7 +1129,7 @@ fn alloc_stream_class_stub(ctx: &mut dyn NativeContext, class_name: &str) -> Obj
     ctx.set_field(desc, 3, Value::Int(SC_SERIALIZABLE as i32));
     ctx.set_field(desc, 4, Value::Int(0));
     ctx.set_field(desc, 5, Value::Int(0));
-    desc
+    Ok(desc)
 }
 
 /// Map a JVM field descriptor to its serialization type code.
@@ -1395,15 +1426,16 @@ fn oos_write_value(ctx: &mut dyn NativeContext, addr: usize, val: &Value) -> Met
         return Ok(None);
     }
 
-    // Reject non-Serializable classes the way the JDK does.
+    // Reject non-Serializable classes the way the JDK does — as a real
+    // `java.io.NotSerializableException` whose message is the offending class
+    // name, not as a plain `IOException` that merely NAMES that class in its
+    // text. `catch (NotSerializableException)` and any `instanceof` test are
+    // written against the class, and both answered "no" to the message form.
+    // `java/io/NotSerializableException` extends `ObjectStreamException`
+    // extends `IOException` in `jdk_superclass`, so the coarser handlers still
+    // match.
     if !class_is_serializable(ctx, class_id) {
-        return Err(RuntimeError::IOException {
-            message: format!(
-                "java.io.NotSerializableException: {}",
-                class_name.replace('/', ".")
-            ),
-        }
-        .into());
+        return Err(not_serializable_exception(ctx, &class_name));
     }
 
     // Assign the wire handle *before* writing fields so a self-referential
@@ -1659,6 +1691,14 @@ fn register_object_output_stream(r: &mut NativeMethodRegistry) {
         ctx.set_field(this, 4, Value::Int(1)); // block_mode on
         ctx.set_field(this, 5, Value::Int(0)); // enable_replace off
         let addr = this.as_ptr() as usize;
+        // Same recycled-address hazard as `ObjectInputStream.<init>` (see the
+        // note there): `write_stream_header` APPENDS through `oos_buf_write`,
+        // so without this reset a stream constructed at an address a previous,
+        // collected stream used would emit that stream's bytes ahead of its
+        // own magic — a second `AC ED 00 05` in the middle of the wire form.
+        // The handle table below was already re-initialised; the byte buffer
+        // was not.
+        oos_buf_reset(addr);
         write_stream_header(addr);
         // Initialize handle tracking for this stream
         {
@@ -2043,11 +2083,27 @@ fn register_object_output_stream(r: &mut NativeMethodRegistry) {
     });
     r.register(cls, "close", "()V", |ctx, args| {
         // Flush internal buffer to underlying stream, then close it.
+        //
+        // `ObjectOutputStream.close()` is `flush(); clear(); bout.close();`
+        // under `throws IOException` with no `catch` anywhere on the chain
+        // (`flush()` is a bare `bout.flush()`), so BOTH delegations PROPAGATE.
+        // Dropping them turned a failed serialization flush — a full disk, a
+        // broken socket — into a clean `try`-with-resources exit over a
+        // truncated stream. W7-57-close-flush-swallow-sweep.md
+        //
+        // The per-stream side-table drop still runs on the failing path: it is
+        // our own bookkeeping, not part of the JDK body, and leaving an entry
+        // behind on a recycled address is its own defect. The first failure is
+        // the one reported, matching the JDK's straight-line order.
         let this = obj_arg(args, 0)?;
         let addr = this.as_ptr() as usize;
-        let _ = ctx.invoke_virtual(this, "flush", "()V", &[]);
-        if let Value::Object(Some(stream)) = ctx.get_field(this, 0) {
-            let _ = ctx.invoke_virtual(stream, "close", "()V", &[]);
+        let mut outcome = ctx.invoke_virtual(this, "flush", "()V", &[]).map(|_| ());
+        if outcome.is_ok() {
+            // Skipped when the flush threw — the JDK body is straight-line, so
+            // `bout.close()` is not reached either.
+            if let Value::Object(Some(stream)) = ctx.get_field(this, 0) {
+                outcome = ctx.invoke_virtual(stream, "close", "()V", &[]).map(|_| ());
+            }
         }
         // Drop per-stream writer state so a reused address starts clean.
         oos_stream_refs()
@@ -2055,6 +2111,7 @@ fn register_object_output_stream(r: &mut NativeMethodRegistry) {
             .unwrap_or_else(|e| e.into_inner())
             .remove(&addr);
         cur_clear(addr);
+        outcome?;
         Ok(None)
     });
 
@@ -2122,7 +2179,7 @@ fn register_object_output_stream(r: &mut NativeMethodRegistry) {
         "putFields",
         "()Ljava/io/ObjectOutputStream$PutField;",
         |ctx, _args| {
-            let obj = alloc_concurrent_synthetic(ctx, "java/io/ObjectOutputStream$PutField", 2);
+            let obj = try_alloc_concurrent_synthetic(ctx, "java/io/ObjectOutputStream$PutField", 2)?;
             ctx.set_field(obj, 0, Value::Int(0)); // field count
             ctx.set_field(obj, 1, Value::Int(0)); // written flag
             Ok(Some(Value::Object(Some(obj))))
@@ -2329,7 +2386,15 @@ fn ois_read_object(ctx: &mut dyn NativeContext, addr: usize) -> Value {
             .max(serialized_count);
         ctx.alloc_object(class_id, class_field_count)
     } else {
-        alloc_concurrent_synthetic(ctx, &desc.class_name, serialized_count)
+        // `ois_read_value`/`ois_read_object`/`ois_read_array` are a mutually
+        // recursive `-> Value` family with no error channel, and every other
+        // unresolvable-descriptor path in this function answers
+        // `Value::Object(None)`. Under `--jdk-only` the fabrication is refused;
+        // answer the same null rather than widening the whole family here.
+        match try_alloc_concurrent_synthetic(ctx, &desc.class_name, serialized_count) {
+            Ok(o) => o,
+            Err(_) => return Value::Object(None),
+        }
     };
 
     // Cross-call GC-safety fix (2026-07-07, same shape + pattern as
@@ -2618,6 +2683,28 @@ fn register_object_input_stream(r: &mut NativeMethodRegistry) {
     // <init>(InputStream)V — if wrapping a ByteArrayInputStream, pre-load data
     r.register(cls, "<init>", "(Ljava/io/InputStream;)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
+        // Every side table in this module is keyed by the stream object's raw
+        // ADDRESS, and an address is recycled: the heap reuses one after the
+        // previous `ObjectInputStream` there is collected, and a test process
+        // that builds hundreds of VMs recycles whole arenas. So a fresh stream
+        // can inherit a DEAD stream's state unless construction wipes it.
+        //
+        // The wire-handle table is the one that bites: `ois_handles` maps
+        // handle → already-materialised object, so a stale table makes a
+        // `TC_REFERENCE` resolve to an object from the previous stream. Seen
+        // as `ClassCastException: cratonvm.SerializeBasic$Nested cannot be
+        // cast to cratonvm.SerializeBasic` — `SerializeBasic.testNestedObject`
+        // ran first, its `Nested` stayed behind under handle 0, and
+        // `testSimpleRoundTrip` read it back. Isolated, both pass; only the
+        // full corpus recycles the address.
+        //
+        // Clear on CONSTRUCTION rather than only on `close()`: a stream that
+        // is never closed (both of those fixtures, and most real code that
+        // wraps a `ByteArrayInputStream`) never reaches the close path at all.
+        let addr = this.as_ptr() as usize;
+        ois_clear_handles(addr);
+        ois_clear_filter_state(addr);
+        ois_buf_load(addr, Vec::new());
         if let Some(Value::Object(Some(stream))) = args.get(1) {
             ctx.set_field(this, 0, Value::Object(Some(*stream)));
             // Bridge: load bytes from ByteArrayInputStream into OIS buffer
@@ -2739,7 +2826,7 @@ fn register_object_input_stream(r: &mut NativeMethodRegistry) {
             }
             TC_OBJECT => {
                 skip_class_desc(addr);
-                let obj = alloc_concurrent_synthetic(ctx, "java/lang/Object", 2);
+                let obj = try_alloc_concurrent_synthetic(ctx, "java/lang/Object", 2)?;
                 Value::Object(Some(obj))
             }
             _ => Value::Object(None),
@@ -2853,7 +2940,7 @@ fn register_object_input_stream(r: &mut NativeMethodRegistry) {
         "readFields",
         "()Ljava/io/ObjectInputStream$GetField;",
         |ctx, _args| {
-            let obj = alloc_concurrent_synthetic(ctx, "java/io/ObjectInputStream$GetField", 2);
+            let obj = try_alloc_concurrent_synthetic(ctx, "java/io/ObjectInputStream$GetField", 2)?;
             ctx.set_field(obj, 0, Value::Int(0));
             ctx.set_field(obj, 1, Value::Int(0));
             Ok(Some(Value::Object(Some(obj))))
@@ -2912,7 +2999,7 @@ fn register_object_input_stream(r: &mut NativeMethodRegistry) {
         "readClassDescriptor",
         "()Ljava/io/ObjectStreamClass;",
         |ctx, _args| {
-            let desc = alloc_stream_class_stub(ctx, "java/lang/Object");
+            let desc = alloc_stream_class_stub(ctx, "java/lang/Object")?;
             Ok(Some(Value::Object(Some(desc))))
         },
     );
@@ -3257,8 +3344,8 @@ fn build_object_stream_field(
     ctx: &mut dyn NativeContext,
     field_name: &str,
     field_descriptor: &str,
-) -> ObjectRef {
-    let osf = alloc_concurrent_synthetic(ctx, "java/io/ObjectStreamField", 4);
+) -> Result<ObjectRef, MethodCallFailed> {
+    let osf = try_alloc_concurrent_synthetic(ctx, "java/io/ObjectStreamField", 4)?;
     let name = ctx.create_string(field_name);
     ctx.set_field(osf, 0, Value::Object(Some(name)));
     let tc: char = match field_descriptor.chars().next() {
@@ -3275,7 +3362,7 @@ fn build_object_stream_field(
     ctx.set_field_by_name(osf, "type", Value::Object(None));
     ctx.set_field_by_name(osf, "signature", Value::Object(Some(ts)));
     ctx.set_field_by_name(osf, "offset", Value::Int(0));
-    osf
+    Ok(osf)
 }
 
 /// Build a fully-populated `ObjectStreamClass` for `class_id`. This is
@@ -3289,13 +3376,15 @@ fn build_object_stream_class(
     ctx: &mut dyn NativeContext,
     class_id: ClassId,
     include_non_serializable: bool,
-) -> Option<ObjectRef> {
+) -> Result<Option<ObjectRef>, MethodCallFailed> {
     // Fast-path: cached descriptor already exists for this class.
     if let Some(cached) = ctx.osc_cache_get(class_id) {
-        return Some(cached);
+        return Ok(Some(cached));
     }
 
-    let class_name = ctx.class_name_of_id(class_id)?;
+    let Some(class_name) = ctx.class_name_of_id(class_id) else {
+        return Ok(None);
+    };
     let serializable_id = ctx.class_id_by_name("java/io/Serializable");
     let externalizable_id = ctx.class_id_by_name("java/io/Externalizable");
     let is_serializable = serializable_id
@@ -3308,7 +3397,7 @@ fn build_object_stream_class(
 
     if !is_serializable && !include_non_serializable {
         // lookup(cls) returns null for non-Serializable classes.
-        return None;
+        return Ok(None);
     }
 
     // ----- Allocate the descriptor object -----
@@ -3316,7 +3405,7 @@ fn build_object_stream_class(
     // mode `alloc_concurrent_synthetic` bumps this to the real-JDK
     // field count if larger, so named-field writes below still hit the
     // right slots either way.
-    let desc = alloc_concurrent_synthetic(ctx, "java/io/ObjectStreamClass", 8);
+    let desc = try_alloc_concurrent_synthetic(ctx, "java/io/ObjectStreamClass", 8)?;
 
     // ----- Legacy indexed-slot population (preserved for back-compat) -----
     let name_obj = ctx.create_string(&class_name);
@@ -3396,7 +3485,7 @@ fn build_object_stream_class(
     // (length 0) is fine for non-Serializable / lookupAny lookups.
     let osf_arr = ctx.new_ref_array(ClassId::new(0), owned_osf_fields.len());
     for (i, (fname, fdesc)) in owned_osf_fields.iter().enumerate() {
-        let osf = build_object_stream_field(ctx, fname, fdesc);
+        let osf = build_object_stream_field(ctx, fname, fdesc)?;
         ctx.set_array_element(osf_arr, i, Value::Object(Some(osf)));
     }
     ctx.set_field(desc, 6, Value::Object(Some(osf_arr)));
@@ -3437,7 +3526,7 @@ fn build_object_stream_class(
     // behavior) whenever we can find one.
     if let Some((anc_id, ctor_meta)) = find_serializable_constructor(ctx, class_id) {
         let _ = anc_id;
-        let ctor_obj = create_constructor_object(ctx, &ctor_meta);
+        let ctor_obj = create_constructor_object(ctx, &ctor_meta)?;
         ctx.set_field_by_name(desc, "cons", Value::Object(Some(ctor_obj)));
         ctx.set_field_by_name(
             desc,
@@ -3467,16 +3556,19 @@ fn build_object_stream_class(
         "writeObject",
         "(Ljava/io/ObjectOutputStream;)V",
     )
-    .map(|m| create_method_object(ctx, &m));
+    .map(|m| create_method_object(ctx, &m))
+        .transpose()?;
     let ro = find_private_method(
         ctx,
         class_id,
         "readObject",
         "(Ljava/io/ObjectInputStream;)V",
     )
-    .map(|m| create_method_object(ctx, &m));
+    .map(|m| create_method_object(ctx, &m))
+        .transpose()?;
     let rond = find_private_method(ctx, class_id, "readObjectNoData", "()V")
-        .map(|m| create_method_object(ctx, &m));
+        .map(|m| create_method_object(ctx, &m))
+        .transpose()?;
     ctx.set_field_by_name(desc, "writeObjectMethod", Value::Object(wo));
     ctx.set_field_by_name(desc, "readObjectMethod", Value::Object(ro));
     ctx.set_field_by_name(desc, "readObjectNoDataMethod", Value::Object(rond));
@@ -3484,15 +3576,17 @@ fn build_object_stream_class(
     // writeReplaceMethod / readResolveMethod — inheritable, any
     // accessibility. `findInheritableMethod` walks up the hierarchy.
     let wr = find_inheritable_method(ctx, class_id, "writeReplace", "()Ljava/lang/Object;")
-        .map(|m| create_method_object(ctx, &m));
+        .map(|m| create_method_object(ctx, &m))
+        .transpose()?;
     let rr = find_inheritable_method(ctx, class_id, "readResolve", "()Ljava/lang/Object;")
-        .map(|m| create_method_object(ctx, &m));
+        .map(|m| create_method_object(ctx, &m))
+        .transpose()?;
     ctx.set_field_by_name(desc, "writeReplaceMethod", Value::Object(wr));
     ctx.set_field_by_name(desc, "readResolveMethod", Value::Object(rr));
 
     // Install in the cache so the next call returns this same ref.
     let cached = ctx.osc_cache_put(class_id, desc);
-    Some(cached)
+    Ok(Some(cached))
 }
 
 /// Helper: resolve `Class` mirror arg to its `ClassId`. Falls back to
@@ -3539,7 +3633,7 @@ fn native_sun_reflection_factory_get(
     ctx: &mut dyn NativeContext,
     _args: &[Value],
 ) -> MethodCallResult {
-    let obj = alloc_concurrent_synthetic(ctx, "sun/reflect/ReflectionFactory", 1);
+    let obj = try_alloc_concurrent_synthetic(ctx, "sun/reflect/ReflectionFactory", 1)?;
     Ok(Some(Value::Object(Some(obj))))
 }
 
@@ -3547,7 +3641,7 @@ fn native_jdk_reflection_factory_get(
     ctx: &mut dyn NativeContext,
     _args: &[Value],
 ) -> MethodCallResult {
-    let obj = alloc_concurrent_synthetic(ctx, "jdk/internal/reflect/ReflectionFactory", 1);
+    let obj = try_alloc_concurrent_synthetic(ctx, "jdk/internal/reflect/ReflectionFactory", 1)?;
     Ok(Some(Value::Object(Some(obj))))
 }
 
@@ -3587,7 +3681,7 @@ fn reflection_factory_hook_handle(
         &method.name,
         &method.descriptor,
         MH_KIND_SPECIAL_FOR_SERIALIZATION_HOOK,
-    );
+    )?;
     Ok(Some(Value::Object(Some(mh))))
 }
 
@@ -3721,21 +3815,21 @@ fn install_serialization_constructor_accessor(
     ctx: &mut dyn NativeContext,
     ctor_obj: ObjectRef,
     target_mirror: ObjectRef,
-) {
+) -> Result<(), MethodCallFailed> {
     let base_pin = ctx.pin_native_root(ctor_obj);
     let target_mirror_pin = ctx.pin_native_root(target_mirror);
 
     let target =
-        alloc_concurrent_synthetic(ctx, "java/lang/invoke/DirectMethodHandle$Constructor", 1);
+        try_alloc_concurrent_synthetic(ctx, "java/lang/invoke/DirectMethodHandle$Constructor", 1)?;
     let target_pin = ctx.pin_native_root(target);
     let target_mirror = ctx.read_native_pin(target_mirror_pin, target_mirror);
     ctx.set_field_by_name(target, "instanceClass", Value::Object(Some(target_mirror)));
 
-    let accessor = alloc_concurrent_synthetic(
+    let accessor = try_alloc_concurrent_synthetic(
         ctx,
         "jdk/internal/reflect/DirectConstructorHandleAccessor",
         1,
-    );
+    )?;
     let target = ctx.read_native_pin(target_pin, target);
     let ctor_obj = ctx.read_native_pin(base_pin, ctor_obj);
     ctx.set_field_by_name(accessor, "target", Value::Object(Some(target)));
@@ -3745,6 +3839,7 @@ fn install_serialization_constructor_accessor(
         Value::Object(Some(accessor)),
     );
     ctx.unpin_native_roots(base_pin);
+    Ok(())
 }
 
 fn constructor_meta_from_constructor_object(
@@ -3792,16 +3887,16 @@ fn native_reflection_factory_new_constructor_for_serialization(
     let ctor_obj = match args.get(2) {
         Some(Value::Object(Some(ctor))) => {
             match constructor_meta_from_constructor_object(ctx, *ctor) {
-                Some(meta) => create_constructor_object(ctx, &meta),
+                Some(meta) => create_constructor_object(ctx, &meta)?,
                 None => return Ok(Some(Value::Object(None))),
             }
         }
         _ => match find_serializable_constructor(ctx, class_id) {
-            Some((_, ctor_meta)) => create_constructor_object(ctx, &ctor_meta),
+            Some((_, ctor_meta)) => create_constructor_object(ctx, &ctor_meta)?,
             None => return Ok(Some(Value::Object(None))),
         },
     };
-    install_serialization_constructor_accessor(ctx, ctor_obj, target_mirror);
+    install_serialization_constructor_accessor(ctx, ctor_obj, target_mirror)?;
     Ok(Some(Value::Object(Some(ctor_obj))))
 }
 
@@ -3818,7 +3913,7 @@ fn native_reflection_factory_new_constructor_for_externalization(
     if (ctor_meta.access_flags & ACC_PUBLIC) == 0 {
         return Ok(Some(Value::Object(None)));
     }
-    let ctor_obj = create_constructor_object(ctx, &ctor_meta);
+    let ctor_obj = create_constructor_object(ctx, &ctor_meta)?;
     Ok(Some(Value::Object(Some(ctor_obj))))
 }
 
@@ -3958,7 +4053,7 @@ fn register_object_stream_class(r: &mut NativeMethodRegistry) {
                 Some(id) => id,
                 None => return Ok(Some(Value::Object(None))),
             };
-            match build_object_stream_class(ctx, class_id, false) {
+            match build_object_stream_class(ctx, class_id, false)? {
                 Some(desc) => Ok(Some(Value::Object(Some(desc)))),
                 None => Ok(Some(Value::Object(None))), // non-Serializable -> null
             }
@@ -3979,7 +4074,7 @@ fn register_object_stream_class(r: &mut NativeMethodRegistry) {
                 Some(id) => id,
                 None => return Ok(Some(Value::Object(None))),
             };
-            match build_object_stream_class(ctx, class_id, true) {
+            match build_object_stream_class(ctx, class_id, true)? {
                 Some(desc) => Ok(Some(Value::Object(Some(desc)))),
                 None => Ok(Some(Value::Object(None))),
             }
@@ -4554,13 +4649,13 @@ fn osc_class_name(ctx: &dyn NativeContext, desc: ObjectRef) -> Option<String> {
     }
 }
 
-fn alloc_filter(ctx: &mut dyn NativeContext, status: i32) -> ObjectRef {
-    let filter = alloc_concurrent_synthetic(ctx, "java/io/ObjectInputFilter", 4);
+fn alloc_filter(ctx: &mut dyn NativeContext, status: i32) -> Result<ObjectRef, MethodCallFailed> {
+    let filter = try_alloc_concurrent_synthetic(ctx, "java/io/ObjectInputFilter", 4)?;
     ctx.set_field(filter, 0, Value::Int(status));
     ctx.set_field(filter, 1, Value::Int(256));
     ctx.set_field(filter, 2, Value::Int(10000));
     ctx.set_field(filter, 3, Value::Long(0));
-    filter
+    Ok(filter)
 }
 
 fn register_object_input_filter(r: &mut NativeMethodRegistry) {
@@ -4577,7 +4672,7 @@ fn register_object_input_filter(r: &mut NativeMethodRegistry) {
                 Value::Int(s) => s,
                 _ => 0,
             };
-            let status_obj = alloc_concurrent_synthetic(ctx, "java/io/ObjectInputFilter$Status", 1);
+            let status_obj = try_alloc_concurrent_synthetic(ctx, "java/io/ObjectInputFilter$Status", 1)?;
             ctx.set_field(status_obj, 0, Value::Int(status));
             Ok(Some(Value::Object(Some(status_obj))))
         },
@@ -4587,14 +4682,14 @@ fn register_object_input_filter(r: &mut NativeMethodRegistry) {
     r.register(
         cls, "allowFilter",
         "(Ljava/util/function/Predicate;Ljava/io/ObjectInputFilter$Status;)Ljava/io/ObjectInputFilter;",
-        |ctx, _args| Ok(Some(Value::Object(Some(alloc_filter(ctx, 1))))),
+        |ctx, _args| Ok(Some(Value::Object(Some(alloc_filter(ctx, 1)?)))),
     );
 
     // rejectFilter (static)
     r.register(
         cls, "rejectFilter",
         "(Ljava/util/function/Predicate;Ljava/io/ObjectInputFilter$Status;)Ljava/io/ObjectInputFilter;",
-        |ctx, _args| Ok(Some(Value::Object(Some(alloc_filter(ctx, 2))))),
+        |ctx, _args| Ok(Some(Value::Object(Some(alloc_filter(ctx, 2)?)))),
     );
 
     // merge (static)
@@ -4602,7 +4697,7 @@ fn register_object_input_filter(r: &mut NativeMethodRegistry) {
         cls,
         "merge",
         "(Ljava/io/ObjectInputFilter;Ljava/io/ObjectInputFilter;)Ljava/io/ObjectInputFilter;",
-        |ctx, _args| Ok(Some(Value::Object(Some(alloc_filter(ctx, 0))))),
+        |ctx, _args| Ok(Some(Value::Object(Some(alloc_filter(ctx, 0)?)))),
     );
 
     // Config.getSerialFilter (static) — returns the previously-installed
@@ -4853,19 +4948,31 @@ fn register_stream_corrupted_exception(r: &mut NativeMethodRegistry) {
 // Registration entry point
 // ---------------------------------------------------------------------------
 
-/// REACHABILITY (traced wave 4 — read this before judging anything above).
+/// REACHABILITY (traced wave 4; the second gate came off 2026-08-11 — read
+/// this before judging anything above).
 ///
 /// This function has exactly one call site outside tests,
-/// `native-builtins/src/lib.rs`, and it is gated TWICE:
-///   * `#[cfg(feature = "experimental-serialization")]` — default-off; and
-///   * it sits inside `register_synthetic_overrides`, which is itself
-///     `#[cfg(feature = "synthetic-jdk")]`.
-/// So every registration below is dead in the default real-JDK build, and live
-/// only under `--synthetic-jdk` **plus** `experimental-serialization`. The one
-/// entry point of this module on the real-JDK path is
+/// `native-builtins/src/lib.rs`, and it is now gated ONCE: it sits inside
+/// `register_synthetic_overrides`, which is `#[cfg(feature =
+/// "synthetic-jdk")]`. So every registration below is dead in the default
+/// real-JDK build and live in every synthetic-library build.
+///
+/// It used to carry a second `#[cfg(feature = "experimental-serialization")]`
+/// at that call site, and the pair was a hole rather than a policy. In a
+/// synthetic build `java/io/ObjectOutputStream` and `ObjectInputStream` are
+/// fabricated stubs with no bytecode behind them, so withholding the natives
+/// left them present-but-INERT rather than absent: `writeObject` wrote
+/// nothing, `readObject` handed back a blank instance whose every field read
+/// null, and writing a non-`Serializable` raised nothing. That is precisely
+/// what `KNOWN_SYNTHETIC_JDK_GAPS` pinned as four "serialization gaps" in the
+/// class library — with the 7.6k lines of implementation they were said to be
+/// missing already compiled into the same binary (this module's own `#[cfg]`
+/// is `any(experimental-serialization, synthetic-jdk)`).
+///
+/// The one entry point of this module on the real-JDK path is
 /// `register_reflection_factory_serialization`, called from
-/// `register_essential_natives_with_shims` — and that call is
-/// `experimental-serialization`-gated too.
+/// `register_essential_natives_with_shims` — and that call is still
+/// `experimental-serialization`-gated.
 ///
 /// `register_byte_array_output_stream` is the near-exception: it is called a
 /// second time from lib.rs WITHOUT the serialization feature gate, but still
@@ -7183,7 +7290,7 @@ mod wp02_tests {
             .ensure_class_initialized("java/lang/reflect/Constructor")
             .unwrap();
         let incoming =
-            create_constructor_object(&mut ctx, &mm("<init>", "()V", ACC_PUBLIC, target));
+            create_constructor_object(&mut ctx, &mm("<init>", "()V", ACC_PUBLIC, target)).unwrap();
         let target_mirror = ctx.get_class_mirror(target);
 
         let result = native_reflection_factory_new_constructor_for_serialization(
@@ -7251,6 +7358,7 @@ mod wp02_tests {
     fn osc_lookup_returns_non_null_for_serializable() {
         let (mut ctx, foo) = build_foo_ctx();
         let desc = build_object_stream_class(&mut ctx, foo, false)
+            .unwrap()
             .expect("lookup of a Serializable class must return a descriptor");
         // Slot 2 is field_count = 3 (a, b, c — skip is transient).
         assert_eq!(ctx.get_field(desc, 2), Value::Int(3));
@@ -7266,7 +7374,7 @@ mod wp02_tests {
     fn osc_lookup_returns_none_for_non_serializable() {
         let (mut ctx, _foo) = build_foo_ctx();
         let base = ctx.class_id_by_name("Base").unwrap();
-        let result = build_object_stream_class(&mut ctx, base, false);
+        let result = build_object_stream_class(&mut ctx, base, false).unwrap();
         assert!(
             result.is_none(),
             "lookup(non-Serializable) must return None"
@@ -7278,6 +7386,7 @@ mod wp02_tests {
         let (mut ctx, _foo) = build_foo_ctx();
         let base = ctx.class_id_by_name("Base").unwrap();
         let desc = build_object_stream_class(&mut ctx, base, true)
+            .unwrap()
             .expect("lookupAny must return a descriptor even for non-Serializable");
         // field_count == 0 for non-Serializable lookupAny.
         assert_eq!(ctx.get_field(desc, 2), Value::Int(0));
@@ -7287,7 +7396,9 @@ mod wp02_tests {
     #[test]
     fn osc_fields_are_in_declaration_order() {
         let (mut ctx, foo) = build_foo_ctx();
-        let desc = build_object_stream_class(&mut ctx, foo, false).unwrap();
+        let desc = build_object_stream_class(&mut ctx, foo, false)
+            .unwrap()
+            .expect("descriptor");
         let arr = match ctx.get_field(desc, 6) {
             Value::Object(Some(a)) => a,
             other => panic!("expected fields[] array, got {:?}", other),
@@ -7314,8 +7425,12 @@ mod wp02_tests {
     #[test]
     fn osc_cache_identity_two_lookups_same_ref() {
         let (mut ctx, foo) = build_foo_ctx();
-        let d1 = build_object_stream_class(&mut ctx, foo, false).unwrap();
-        let d2 = build_object_stream_class(&mut ctx, foo, false).unwrap();
+        let d1 = build_object_stream_class(&mut ctx, foo, false)
+            .unwrap()
+            .expect("descriptor");
+        let d2 = build_object_stream_class(&mut ctx, foo, false)
+            .unwrap()
+            .expect("descriptor");
         assert_eq!(
             d1, d2,
             "two lookup(cls) calls for the same class must return the same ObjectRef"
@@ -7359,7 +7474,9 @@ mod wp02_tests {
     #[test]
     fn osc_has_write_object_slot_set_when_present() {
         let (mut ctx, foo) = build_foo_ctx();
-        let desc = build_object_stream_class(&mut ctx, foo, false).unwrap();
+        let desc = build_object_stream_class(&mut ctx, foo, false)
+            .unwrap()
+            .expect("descriptor");
         assert_eq!(ctx.get_field(desc, 4), Value::Int(1)); // has_write_object
         assert_eq!(ctx.get_field(desc, 5), Value::Int(0)); // has_read_object
     }
@@ -7367,7 +7484,9 @@ mod wp02_tests {
     #[test]
     fn osc_for_class_returns_class_mirror() {
         let (mut ctx, foo) = build_foo_ctx();
-        let desc = build_object_stream_class(&mut ctx, foo, false).unwrap();
+        let desc = build_object_stream_class(&mut ctx, foo, false)
+            .unwrap()
+            .expect("descriptor");
         let mirror_val = ctx.get_field(desc, 7);
         assert!(
             matches!(mirror_val, Value::Object(Some(_))),
@@ -7506,11 +7625,21 @@ mod marshal_tests {
 
         let err = oos_write_value(&mut ctx, addr, &Value::Object(Some(obj)))
             .expect_err("non-Serializable must raise NotSerializableException");
-        let msg = format!("{:?}", err);
+        // The rejection is a THROWN `java.io.NotSerializableException` object
+        // now, not an `IOException` naming the class in its text, so assert on
+        // the class of what was thrown. `{:?}` on `ExceptionThrown` prints
+        // `ExceptionThrown(ObjectRef { ptr: 0x… })` — an address with no class
+        // — so a `msg.contains("NotSerializableException")` check would pass
+        // only for the fallback shape and silently accept a wrong class.
+        let thrown_class = match &err {
+            MethodCallFailed::ExceptionThrown(exc) => ctx
+                .class_name_of_id(ctx.class_id_of_object(*exc))
+                .unwrap_or_default(),
+            other => format!("{other:?}"),
+        };
         assert!(
-            msg.contains("NotSerializableException"),
-            "error should be NotSerializableException: {}",
-            msg
+            thrown_class.contains("NotSerializableException"),
+            "error should be NotSerializableException, got: {thrown_class}"
         );
     }
 

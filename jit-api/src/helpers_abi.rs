@@ -63,7 +63,7 @@
 //! [`JitRuntimeHelpers::validate_abi`], [`JitRuntimeHelpers::validate`] or
 //! [`JitRuntimeHelpers::null_pointers`] — the runtime half of this contract
 //! exists and is tested, but never runs in a real VM. See
-//! `docs/jit/helper-abi-audit.md`.
+//! `docs/jit/helper-abi.md`.
 //!
 //! # ABI contract
 //!
@@ -114,7 +114,7 @@ use crate::JitRuntimeHelpers;
 /// (Revision `2` shipped the 60-field table; the `monitor_enter`/`monitor_exit`
 /// append that made it 62 did not bump this constant, because at the time
 /// nothing checked it. `ABI_REVISIONS` is that check.)
-pub const JIT_HELPERS_ABI_VERSION: u32 = 4;
+pub const JIT_HELPERS_ABI_VERSION: u32 = 5;
 
 /// Size in bytes of the helper table under [`JIT_HELPERS_ABI_VERSION`].
 ///
@@ -264,7 +264,7 @@ impl HelperRetAbi for *mut c_void {
 ///
 /// Everything here is *derived from the `HelperFn*` alias*, not transcribed:
 /// there is no second list to keep in step. What the emitter does with it is
-/// still on the emitter — see `docs/jit/helper-abi-audit.md` for the check
+/// still on the emitter — see `docs/jit/helper-abi.md` for the check
 /// that belongs in `jit/` and cannot live in this crate.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct HelperFnSig {
@@ -681,6 +681,9 @@ helper_fn_slots! {
     // shape as `new_object_cp` and for the same reason; see
     // `JitRuntimeHelpers::ldc_class_cp`.
     HelperFnLdcClassCp, ldc_class_cp, ldc_class_cp_fn, (i64, i64, i64) -> i64;
+    // `(vm_ptr, array_ptr, value_ptr) -> 0 | i64::MIN`. See
+    // `JitRuntimeHelpers::aastore_type_check`.
+    HelperFnAastoreTypeCheck, aastore_type_check, aastore_type_check_fn, (i64, i64, i64) -> i64;
 }
 
 // ---------------------------------------------------------------------
@@ -794,6 +797,7 @@ helper_field_table! {
     (monitor_exit,                   Function, false),
     // Optional: 0 makes the single-pass backend refuse an `ldc <Class>` site.
     (ldc_class_cp,                   Function, false),
+    (aastore_type_check,             Function, true),
 }
 
 // ---------------------------------------------------------------------
@@ -814,7 +818,7 @@ const _: () = assert!(
 
 // Pin the literal count so a *removal* also has to touch this line.
 const _: () = assert!(
-    NUM_HELPER_FIELDS == 63,
+    NUM_HELPER_FIELDS == 64,
     "JitRuntimeHelpers field count changed — bump JIT_HELPERS_ABI_VERSION, the \
      literal here, and the size literal below",
 );
@@ -822,8 +826,8 @@ const _: () = assert!(
 // Pin the literal size and alignment. The JIT bakes `disp32` offsets derived
 // from this layout into RWX memory; a silent change here is a wild call.
 const _: () = assert!(
-    JIT_HELPERS_ABI_SIZE == 504,
-    "JitRuntimeHelpers size changed (expected 63 * 8 = 504) — the JIT's baked \
+    JIT_HELPERS_ABI_SIZE == 512,
+    "JitRuntimeHelpers size changed (expected 64 * 8 = 512) — the JIT's baked \
      helper offsets are now wrong; bump JIT_HELPERS_ABI_VERSION deliberately",
 );
 const _: () = assert!(
@@ -874,7 +878,7 @@ const _: () = {
          alias (or vice versa) — add it to helper_fn_slots! in helpers_abi.rs",
     );
     assert!(
-        required == 42,
+        required == 43,
         "the required-slot count changed — a helper was promoted or demoted; \
          confirm the backend really does (not) CALL it unconditionally",
     );
@@ -982,6 +986,7 @@ pub const GOLDEN_HELPER_OFFSETS: [(&str, usize); NUM_HELPER_FIELDS] = [
     ("monitor_enter", 480),
     ("monitor_exit", 488),
     ("ldc_class_cp", 496),
+    ("aastore_type_check", 504),
 ];
 
 // Every golden row must name the descriptor row at the same index AND agree
@@ -1068,6 +1073,15 @@ pub const ABI_REVISIONS: &[HelperAbiRevision] = &[
         version: 4,
         num_fields: 63,
         size: 504,
+    },
+    // v5 — appended `aastore_type_check`, so that a JIT-compiled `aastore`
+    // throws `ArrayStoreException` at all. The x64 emitter lowers `aastore`
+    // inline and therefore never calls `aastore`; the covariance check is the
+    // one part of that helper the inline path cannot do for itself.
+    HelperAbiRevision {
+        version: 5,
+        num_fields: 64,
+        size: 512,
     },
 ];
 
@@ -1276,7 +1290,7 @@ const _: () = {
         }
         i += 1;
     }
-    assert!(functions == 54, "callable-slot count changed");
+    assert!(functions == 55, "callable-slot count changed");
     assert!(
         offsets == 4,
         "the number of displacement slots changed — an Offset slot is baked as \
@@ -1289,7 +1303,7 @@ const _: () = {
          as data and is NOT range-checked by validate_with, so misclassifying \
          a displacement as one silently removes its only sanity check",
     );
-    assert!(required == 42, "required-slot count changed");
+    assert!(required == 43, "required-slot count changed");
     assert!(
         optional_fns == 12,
         "the optional-callable count changed — every optional slot MUST have a \
@@ -1635,6 +1649,7 @@ mod tests {
             ("monitor_enter", offset_of!(H, monitor_enter)),
             ("monitor_exit", offset_of!(H, monitor_exit)),
             ("ldc_class_cp", offset_of!(H, ldc_class_cp)),
+            ("aastore_type_check", offset_of!(H, aastore_type_check)),
         ];
 
         assert_eq!(HELPER_FIELDS.len(), probes.len());
@@ -1665,15 +1680,15 @@ mod tests {
     /// loudly rather than be absorbed by a computed expression.
     #[test]
     fn helper_table_size_and_align_are_the_literal_abi_numbers() {
-        assert_eq!(core::mem::size_of::<H>(), 504);
+        assert_eq!(core::mem::size_of::<H>(), 512);
         assert_eq!(core::mem::align_of::<H>(), 8);
-        assert_eq!(JIT_HELPERS_ABI_SIZE, 504);
+        assert_eq!(JIT_HELPERS_ABI_SIZE, 512);
         assert_eq!(JIT_HELPERS_ABI_ALIGN, 8);
         assert_eq!(HELPER_FIELD_STRIDE, 8);
-        assert_eq!(NUM_HELPER_FIELDS, 63);
-        assert_eq!(H::NUM_FIELDS, 63);
-        assert_eq!(H::NUM_HELPER_FN_FIELDS, 54);
-        assert_eq!(JIT_HELPERS_ABI_VERSION, 4);
+        assert_eq!(NUM_HELPER_FIELDS, 64);
+        assert_eq!(H::NUM_FIELDS, 64);
+        assert_eq!(H::NUM_HELPER_FN_FIELDS, 55);
+        assert_eq!(JIT_HELPERS_ABI_VERSION, 5);
     }
 
     /// The golden table is the only name→offset binding in the crate written
@@ -1698,7 +1713,7 @@ mod tests {
         }
         // The last golden offset plus one stride is the whole table.
         let (last_name, last_offset) = GOLDEN_HELPER_OFFSETS[H::NUM_FIELDS - 1];
-        assert_eq!(last_name, "ldc_class_cp");
+        assert_eq!(last_name, "aastore_type_check");
         assert_eq!(last_offset + HELPER_FIELD_STRIDE, JIT_HELPERS_ABI_SIZE);
     }
 
@@ -1711,9 +1726,9 @@ mod tests {
         assert_eq!(
             last,
             HelperAbiRevision {
-                version: 4,
-                num_fields: 63,
-                size: 504,
+                version: 5,
+                num_fields: 64,
+                size: 512,
             },
         );
         // Append-only history: each revision strictly grows the table.
@@ -1902,10 +1917,10 @@ mod tests {
             .filter(|d| d.kind == HelperKind::Constant)
             .count();
         let required = HELPER_FIELDS.iter().filter(|d| d.required).count();
-        assert_eq!(functions, 54, "callable slots");
+        assert_eq!(functions, 55, "callable slots");
         assert_eq!(offsets, 4, "displacement slots");
         assert_eq!(constants, 5, "baked-address slots");
-        assert_eq!(required, 42, "required slots");
+        assert_eq!(required, 43, "required slots");
         assert_eq!(functions - required, 12, "optional callable slots");
         assert_eq!(functions + offsets + constants, H::NUM_FIELDS);
     }
@@ -2060,13 +2075,13 @@ mod tests {
     fn as_words_matches_the_struct_fields() {
         let mut h = H::default();
         h.newarray = 1;
-        // The LAST field, whatever it currently is — `ldc_class_cp`
-        // since the class-`ldc` helper was appended.
-        h.ldc_class_cp = 2;
+        // The LAST field, whatever it currently is — `aastore_type_check`
+        // since the aastore element-type check was appended.
+        h.aastore_type_check = 2;
         let w = h.as_words();
         assert_eq!(w[0], 1, "first slot");
         assert_eq!(w[H::NUM_FIELDS - 1], 2, "last slot");
-        assert_eq!(w.len(), 63);
+        assert_eq!(w.len(), 64);
     }
 
     /// Build a table with every *required* slot non-zero and every optional

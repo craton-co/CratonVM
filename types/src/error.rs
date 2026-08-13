@@ -821,6 +821,27 @@ pub enum LinkageError {
     #[error("class format error in {class_name}: {message}")]
     ClassFormatError { class_name: String, message: String },
 
+    /// JVMS §4.1: the class file's `major.minor` pair is not loadable — too
+    /// old, too new, a non-zero minor below the preview encoding, a preview
+    /// class file at the wrong major, or a preview class file without
+    /// `--enable-preview`.
+    ///
+    /// Distinct from [`ClassFormatError`](Self::ClassFormatError) only in the
+    /// throwable it becomes: `java.lang.UnsupportedClassVersionError` extends
+    /// `ClassFormatError`, so an application `catch (ClassFormatError)` fires
+    /// either way — what diverged before this variant existed was
+    /// `e.getClass().getName()` and the text. See
+    /// docs/known-issues/jdk-only/W7-28-preview-classfile-gating.md.
+    ///
+    /// `message` is HotSpot's wording verbatim, built by
+    /// `ClassReaderError::unsupported_class_version_message`. It already
+    /// contains the class name, in internal (slash) form, in the middle of the
+    /// sentence — so nothing downstream may prepend the name again the way the
+    /// `ClassFormatError` arm does. `class_name` is carried alongside for
+    /// callers that need it structurally, not for rendering.
+    #[error("{message}")]
+    UnsupportedClassVersionError { class_name: String, message: String },
+
     #[error("verification error in {class_name}.{method_name}: {message}")]
     VerifyError {
         class_name: String,
@@ -833,6 +854,30 @@ pub enum LinkageError {
 
     #[error("incompatible class change: {message}")]
     IncompatibleClassChangeError { message: String },
+
+    /// JVMS §5.3.5: a class loader that has already defined a class of this
+    /// name must not define another one. HotSpot raises
+    /// `java.lang.LinkageError` ITSELF here, not a subclass — measured on
+    /// OpenJDK 25.0.4:
+    ///
+    /// ```text
+    /// java.lang.LinkageError: loader DupProbe$L @1dbd16a6 attempted duplicate
+    /// class definition for Dp1. (Dp1 is in unnamed module of loader
+    /// DupProbe$L @1dbd16a6, parent loader 'bootstrap')
+    /// ```
+    ///
+    /// Distinct from [`IncompatibleClassChangeError`](Self::IncompatibleClassChangeError),
+    /// which the class-manager backend raises for the same underlying
+    /// condition: that one is a VM-internal signal the `defineClass` natives
+    /// interpret, and it can also fire when a name collides inside a namespace
+    /// two DIFFERENT loaders share (CratonVM's flat store). Only this variant
+    /// means "the same loader object, twice", which is the one shape HotSpot
+    /// refuses.
+    ///
+    /// The parenthetical module tail is deliberately not reproduced: it carries
+    /// an identity hash, so no test could assert it.
+    #[error("loader {loader} attempted duplicate class definition for {class_name}")]
+    DuplicateClassDefinition { class_name: String, loader: String },
 
     #[error("no such field: {class_name}.{field_name}")]
     NoSuchFieldError {
@@ -1039,6 +1084,18 @@ pub enum RuntimeError {
 
     #[error("NoSuchElementException: {message}")]
     NoSuchElementException { message: String },
+
+    /// `java.util.EmptyStackException`. NOT a `NoSuchElementException` — it
+    /// extends `RuntimeException` **directly**, so a `catch (EmptyStackException)`
+    /// in application code does not fire when the wrong one is raised, and the
+    /// caller falls through to whatever handler comes next. `java.util.Stack`'s
+    /// `pop`/`peek` are the only throwers in the JDK and the only ones here.
+    ///
+    /// Field-less because the real class declares only a no-arg constructor and
+    /// sets no detail message; `getMessage()` is null on HotSpot.
+    /// See W7-33-differential-dead-sections R2.
+    #[error("EmptyStackException")]
+    EmptyStackException,
 
     /// `java.nio.BufferUnderflowException` — a relative `get` was attempted on
     /// a buffer with no elements remaining. Distinct from IllegalStateException
@@ -1571,6 +1628,9 @@ impl RuntimeError {
             RuntimeError::NoSuchElementException { message } => {
                 ("java/util/NoSuchElementException", Some(message.as_str()))
             }
+            // `None`, like `ConcurrentModificationException` above: the real
+            // class has a no-arg constructor only.
+            RuntimeError::EmptyStackException => ("java/util/EmptyStackException", None),
             RuntimeError::BufferUnderflowException => ("java/nio/BufferUnderflowException", None),
             RuntimeError::BufferOverflowException => ("java/nio/BufferOverflowException", None),
             RuntimeError::ReadOnlyBufferException => ("java/nio/ReadOnlyBufferException", None),
@@ -1657,6 +1717,7 @@ mod tests {
             RuntimeError::BufferOverflowException,
             RuntimeError::ReadOnlyBufferException,
             RuntimeError::ConcurrentModificationException,
+            RuntimeError::EmptyStackException,
         ] {
             let (_, msg) = err.as_java_throwable().expect("is a Java throwable");
             assert!(msg.is_none(), "{err:?} must have a null detail message");

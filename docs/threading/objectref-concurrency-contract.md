@@ -1,6 +1,6 @@
 # The `ObjectRef` concurrency contract
 
-*Last updated 2026-07-31. Supersedes the "sound by accident of the
+*Supersedes the "sound by accident of the
 single-threaded scheduler" rationale that used to sit above
 `unsafe impl Send for ObjectRef` in `types/src/value.rs`.*
 
@@ -111,7 +111,7 @@ Direct pointer mutation is never performed outside the GC." The first half is
 false for the overwhelmingly common case: non-volatile `getfield`/`putfield`
 takes **no lock at all**. What actually prevents a torn/spliced pointer is
 per-word atomicity in `read_value_atomic`/`write_value_atomic`, added by the
-2026-07-06 "PLAIN-SLOT TEARING FIX" (`gc/src/heap.rs:1542-1574`). The second
+"PLAIN-SLOT TEARING FIX" (`gc/src/heap.rs:1542-1574`). The second
 half is also false: the JIT's inline `jit_putfield_*` fast paths write slots
 directly (`value.rs:1255-1259`) — which is exactly why the atomic helpers had
 to exist on both sides.
@@ -147,7 +147,7 @@ protocol rewrites, per holder class:
 | Initiator's frames + ~21 shared root families | `update_all_roots` | `vm/src/memory/roots.rs::collect_roots` ↔ `vm/src/memory/gc.rs::update_all_roots` |
 | Cooperatively parked mutators | `apply_pointer_map_to_thread` after `arrive_and_wait_auto` returns the map | `interpreter.rs:4341-4356`, `:4394` |
 | Threads parked in a blocking native | initiator folds the map into a per-thread chained `fixup` + `slot_origins`; the thread applies it on wake in `check_post_block_gc_refs` | `thread_registry.rs::fold_pointer_map_into_blocked` (called from `memory/gc.rs:1059`), `vm_exec.rs:3636` |
-| Parked virtual-thread continuations | same blocked-region protocol — the registry entry shares the continuation's `Arc<GcBlockState>` / `root_snapshot` (`spawn_thread`'s `is_virtual` arm), and the remount drains it | `vm_exec.rs:2753-2790`; `arch-2026-07-26/vt-resume-gc-fixup.md` |
+| Parked virtual-thread continuations | same blocked-region protocol — the registry entry shares the continuation's `Arc<GcBlockState>` / `root_snapshot` (`spawn_thread`'s `is_virtual` arm), and the remount drains it | `vm_exec.rs:2753-2790`; the virtual-thread resume GC-fixup record |
 | JNI local handles | `update_local_refs_after_gc` on the resuming thread | `interpreter.rs:4405` |
 | JNI array-critical pins | root splice + `pinned::update_after_gc` re-keys the pin table | `gc/src/pinned.rs:131-170` |
 | Frozen in-JIT peers | **not rewritten** — cannot be. The collection must therefore not move: each contributing pass calls `gc_quiescence::mark_moving_young_coverage_incomplete_because`, and under G1 every region such a peer can address is pinned out of the collection set | `xt_root_scan.rs:46-70`; `interpreter.rs:1444` |

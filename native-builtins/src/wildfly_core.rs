@@ -60,7 +60,7 @@ use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError, Vm
 use cratonvm_types::Value;
 
 use crate::jboss_msc::{alloc_java_service_name, ServiceName};
-use crate::{alloc_concurrent_synthetic, obj_arg};
+use crate::{try_alloc_concurrent_synthetic, obj_arg};
 
 // ===========================================================================
 // DeploymentUnit — the per-archive unit of work.
@@ -127,7 +127,7 @@ fn native_path_address_from_elements(
     let arr_pin = ctx.pin_native_root(arr);
     let list = match ctx.new_object_initialized("java/util/ArrayList", "()V", &[])? {
         Some(Value::Object(Some(list))) => list,
-        _ => alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2),
+        _ => try_alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2)?,
     };
     let arr = ctx.read_native_pin(arr_pin, arr);
     // `list` is a live ObjectRef that survives multiple GC-triggering calls
@@ -282,9 +282,9 @@ fn capability_service_name_value(
     ctx: &mut dyn NativeContext,
     base_name: &str,
     dynamic_parts: &[String],
-) -> Value {
+) -> Result<Value, MethodCallFailed> {
     let name = capability_service_name(base_name, dynamic_parts);
-    Value::Object(Some(alloc_java_service_name(ctx, &name)))
+    Ok(Value::Object(Some(alloc_java_service_name(ctx, &name)?)))
 }
 
 /// `OperationContext.getCapabilityServiceName(String, Class)` fallback.
@@ -304,7 +304,7 @@ fn native_operation_context_get_capability_service_name(
             message: Some("capabilityName must not be null".to_string()),
         })
     })?;
-    Ok(Some(capability_service_name_value(ctx, &base, &[])))
+    Ok(Some(capability_service_name_value(ctx, &base, &[])?))
 }
 
 /// `OperationContext.getCapabilityServiceName(String, String, Class)`.
@@ -321,7 +321,7 @@ fn native_operation_context_get_capability_service_name_dynamic(
     if let Some(part) = read_string_arg(ctx, args.get(2)) {
         parts.push(part);
     }
-    Ok(Some(capability_service_name_value(ctx, &base, &parts)))
+    Ok(Some(capability_service_name_value(ctx, &base, &parts)?))
 }
 
 /// `OperationContext.getCapabilityServiceName(String, Class, String...)`.
@@ -344,7 +344,7 @@ fn native_operation_context_get_capability_service_name_varargs(
             }
         }
     }
-    Ok(Some(capability_service_name_value(ctx, &base, &parts)))
+    Ok(Some(capability_service_name_value(ctx, &base, &parts)?))
 }
 
 // ===========================================================================
@@ -677,7 +677,7 @@ fn native_jboss_thread_factory_new_thread(
         return Ok(Some(Value::Object(Some(thread))));
     }
 
-    let thread = alloc_concurrent_synthetic(ctx, "org/jboss/threads/JBossThread", 5);
+    let thread = try_alloc_concurrent_synthetic(ctx, "org/jboss/threads/JBossThread", 5)?;
     let name = ctx.create_string("jboss-thread");
     ctx.set_field(thread, 0, Value::Object(Some(name)));
     ctx.set_field(thread, 1, Value::Int(5));
@@ -1091,7 +1091,7 @@ fn native_services_deployment_unit_name(
     let sn = wildfly_deployment_unit_name(&name);
     // R80: must populate `name` + `hashCode` (not just `canonicalName`) so
     // JDK `ServiceName.equals` does not NPE on `this.name == null`.
-    let obj = crate::jboss_msc::alloc_java_service_name(ctx, &sn);
+    let obj = crate::jboss_msc::alloc_java_service_name(ctx, &sn)?;
     // FIX: `alloc_java_service_name` writes the full dotted name via
     // `set_field_by_name(obj, "canonicalName", ..)` and the leaf segment via
     // `set_field_by_name(obj, "name", ..)`. The canonical-state slot for a
@@ -1138,7 +1138,7 @@ fn native_deployment_unit_get_service_name(
                 _ => String::new(),
             };
             let sn = wildfly_deployment_unit_name(&name);
-            let obj = crate::jboss_msc::alloc_java_service_name(ctx, &sn);
+            let obj = crate::jboss_msc::alloc_java_service_name(ctx, &sn)?;
             // FIX: same canonical-slot truncation as in
             // `native_services_deployment_unit_name` — anchor the full dotted
             // name into the canonical slot so readers of slot 1 see
@@ -1157,7 +1157,7 @@ fn native_log_manager_get_logger(ctx: &mut dyn NativeContext, args: &[Value]) ->
         _ => String::new(),
     };
     let _mirror = get_logger(&name); // Ensure the mirror is registered.
-    let obj = alloc_concurrent_synthetic(ctx, "org/jboss/logmanager/Logger", LOG_NUM_FIELDS);
+    let obj = try_alloc_concurrent_synthetic(ctx, "org/jboss/logmanager/Logger", LOG_NUM_FIELDS)?;
     let name_obj = ctx.create_string(&name);
     ctx.set_field(obj, LOG_FIELD_NAME, Value::Object(Some(name_obj)));
     Ok(Some(Value::Object(Some(obj))))
@@ -1229,7 +1229,7 @@ fn native_logger_level_helper(
 }
 
 fn native_level_get(ctx: &mut dyn NativeContext, level: JulLevel) -> MethodCallResult {
-    let obj = alloc_concurrent_synthetic(ctx, "org/jboss/logmanager/Level", LVL_NUM_FIELDS);
+    let obj = try_alloc_concurrent_synthetic(ctx, "org/jboss/logmanager/Level", LVL_NUM_FIELDS)?;
     let name = ctx.create_string(level.name());
     ctx.set_field(obj, LVL_FIELD_NAME, Value::Object(Some(name)));
     ctx.set_field(obj, LVL_FIELD_VALUE, Value::Int(level.int_value()));
@@ -1395,11 +1395,11 @@ fn native_exec_builder_build(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
     let _exec = get_or_create_pool(&name);
     // Build the Java-side mirror object; we don't expose the Rust
     // handle — subsequent calls rely on the pool registry keyed by name.
-    let obj = alloc_concurrent_synthetic(
+    let obj = try_alloc_concurrent_synthetic(
         ctx,
         "org/jboss/threads/EnhancedQueueExecutor",
         EXEC_NUM_FIELDS,
-    );
+    )?;
     let name_obj = ctx.create_string(&cfg.name);
     ctx.set_field(obj, EXEC_FIELD_NAME, Value::Object(Some(name_obj)));
     ctx.set_field(obj, EXEC_FIELD_CORE, Value::Int(cfg.core_size as i32));

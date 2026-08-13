@@ -1068,19 +1068,32 @@ impl Class {
     ///
     /// Exists for JIT `checkcast`/`instanceof` (`jit_typecheck_resolve` in
     /// `vm/src/jit/helpers.rs`): the compiled artifact carries only the target
-    /// class NAME, and resolving it through the flat global
-    /// `find_class_by_name` can land on a *different* `ClassId` than the
-    /// receiver's when the same class got defined twice by two loaders (e.g.
-    /// Spring's AOT-processing/`CompileWithForkedClassLoader` child loaders
-    /// re-defining app classes — the exact shape behind
-    /// `SpringBootContextLoaderAotTests`' Residual 6, where a JIT-compiled
-    /// `checkcast org/codehaus/groovy/reflection/ClassInfo` refused the cast
-    /// between two same-named `ClassInfo` copies and silently nulled Groovy's
-    /// registry lookups). Same accepted tradeoff as
-    /// [`Self::is_subclass_of_by_name`]: in CratonVM's flat class store,
-    /// treating identically-named classes as assignable is far less harmful
-    /// than failing a cast the interpreter's loader-faithful CP resolution
-    /// would have passed.
+    /// class NAME, and resolving that name at run time can land on a
+    /// *different* `ClassId` than the receiver's when the same class got
+    /// defined twice by two loaders (e.g. Spring's
+    /// AOT-processing/`CompileWithForkedClassLoader` child loaders re-defining
+    /// app classes — the exact shape behind `SpringBootContextLoaderAotTests`'
+    /// Residual 6, where a JIT-compiled `checkcast
+    /// org/codehaus/groovy/reflection/ClassInfo` refused the cast between two
+    /// same-named `ClassInfo` copies and silently nulled Groovy's registry
+    /// lookups).
+    ///
+    /// **This is now the LAST resort, not the first.** The justification used
+    /// to be "CratonVM has a flat global class store, so identically-named
+    /// classes may as well be the same class". That premise is gone: the class
+    /// dictionary is keyed by `(ClassLoaderId, name)`, and the JIT compiler
+    /// resolves each type-check site's `CONSTANT_Class` entry through the
+    /// compiling class's own loader and interns the site under the resulting
+    /// `ClassId` (`cratonvm_jit::intern_typecheck_target`). A site with a
+    /// recorded target answers by identity and never reaches this function —
+    /// so a same-named class from a different loader is refused, which is what
+    /// loader isolation means.
+    ///
+    /// What still reaches here is a site whose target was NOT loaded when the
+    /// method was compiled, so the compiler had no id to record. For those the
+    /// old tradeoff stands: accepting an identically-named class is less
+    /// harmful than failing a cast the interpreter's loader-faithful CP
+    /// resolution would have passed.
     pub fn is_assignable_to_name(&self, target_name: &str, store: &ClassStore) -> bool {
         let mut visited: FxHashSet<ClassId> = FxHashSet::default();
         self.is_assignable_to_name_inner(target_name, store, 0, &mut visited)
@@ -2199,6 +2212,105 @@ mod tests {
             "declaration order is the control: it must still cost 24"
         );
         assert_eq!(declared.field_offsets, vec![0, 8, 12, 16]);
+    }
+
+    /// Characterises the split-loader shape these two predicates disagree on,
+    /// using the `AotIntegrationTests` case as the concrete example: a proxy
+    /// implementing an interface whose `ClassId` is the child loader's copy,
+    /// tested against the parent loader's copy of the same name.
+    ///
+    /// `is_subclass_of` must answer `false` — the ids genuinely differ, and
+    /// that is the honest answer to the question it was asked.
+    /// `is_assignable_to_name` must answer `true`, because it is asked the
+    /// question a flat class store can actually answer. Both arms are asserted
+    /// against the same pair so a regression that collapses one into the other
+    /// cannot read as a pass, and a negative pins that the name walk has not
+    /// rotted into "everything is assignable".
+    ///
+    /// The interface leg is the part `is_subclass_of_by_name` cannot do: an
+    /// annotation type is an interface, so a proxy reaches it through
+    /// `interfaces`, never through `superclass`. Five callers depend on this
+    /// distinction — exception `catch_type` matching, JIT
+    /// `checkcast`/`instanceof`, the recovered-mirror receiver check,
+    /// `VarHandle` return coercion and the `Serializable` probe — and none of
+    /// them had a test that built the two-copy hierarchy explicitly.
+    #[test]
+    fn a_proxy_is_assignable_to_the_other_loaders_copy_of_its_interface_by_name() {
+        let mut store = ClassStore::new();
+
+        // The parent loader's copy — the one the `ContextConfiguration[]` array
+        // was created with.
+        let parent_iface = store.next_id();
+        store.add(make_class(
+            parent_iface,
+            "org/springframework/test/context/ContextConfiguration",
+            None,
+            vec![],
+            vec![],
+            vec![],
+            0,
+            0,
+        ));
+
+        // The forked loader's copy: same name, different id. This is the whole
+        // defect in one line.
+        let forked_iface = store.next_id();
+        store.add(make_class(
+            forked_iface,
+            "org/springframework/test/context/ContextConfiguration",
+            None,
+            vec![],
+            vec![],
+            vec![],
+            0,
+            0,
+        ));
+        assert_ne!(parent_iface, forked_iface);
+
+        // `jdk/proxy3/$Proxy27`, synthesized against the FORKED copy.
+        let proxy = store.next_id();
+        store.add(make_class(
+            proxy,
+            "jdk/proxy3/$Proxy27",
+            None,
+            vec![forked_iface],
+            vec![],
+            vec![],
+            0,
+            0,
+        ));
+
+        let proxy_class = store.get(proxy).expect("proxy present");
+
+        // Exact-identity: correctly false against the parent's copy, true
+        // against its own. Neither is a bug; the bug is stopping there.
+        assert!(
+            !proxy_class.is_subclass_of(parent_iface, &store),
+            "the two copies have different ids, so identity must not match — if \
+             this starts passing, the loader split itself was fixed and the \
+             fallback below is no longer the thing under test",
+        );
+        assert!(proxy_class.is_subclass_of(forked_iface, &store));
+
+        // Name-based: reaches the interface through the DAG and answers the
+        // question HotSpot would have, where there is only one copy.
+        assert!(
+            proxy_class.is_assignable_to_name(
+                "org/springframework/test/context/ContextConfiguration",
+                &store,
+            ),
+            "the name walk must cross the loader split — a proxy created FROM \
+             an annotation type must not read as unrelated to it just because \
+             a forked loader owns the copy it was built against",
+        );
+
+        // ...and it is still a real check: an unrelated name is refused, so
+        // `ArrayStoreException` fidelity survives for the case the check exists
+        // for (a String into a Runnable[]).
+        assert!(
+            !proxy_class.is_assignable_to_name("java/lang/Runnable", &store),
+            "the fallback must not degrade into 'everything is assignable'",
+        );
     }
 
     /// Reordering must not disturb which *index* names which field: the storage

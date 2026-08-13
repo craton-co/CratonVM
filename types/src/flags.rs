@@ -59,7 +59,7 @@
 //!
 //! There is no single answer in this tree to "what does `CRATONVM_FOO=false`
 //! mean": the [`parse`] module carries five *different* boolean parsers because
-//! five different ones are in use today. `docs/flag-census.md` §10 has
+//! five different ones are in use today. `audits/flag-census.md` §10 has
 //! the full matrix. Unifying them is a behaviour change and is deliberately not
 //! part of this refactor; naming each parser at each field is what makes the
 //! divergence visible enough to retire later, flag by flag, with benchmarks.
@@ -385,7 +385,7 @@ pub mod parse {
     /// `matches!(var(NAME).as_deref(), Ok("1") | Ok("true") | Ok("yes"))` —
     /// exact, lowercase-only, untrimmed; `"on"` is **false** here, unlike
     /// [`affirmative_word`]. Truth table 8 (see the module docs and
-    /// `docs/flag-census.md` §10). Lifted from
+    /// `audits/flag-census.md` §10). Lifted from
     /// `native_builtins::service_loader`'s `CRATONVM_DIAG_SERVICELOADER`.
     #[inline]
     pub fn one_true_yes_exact(src: &dyn FlagSource, name: &str) -> bool {
@@ -708,6 +708,26 @@ pub struct GcFlags {
     pub g1_parallel_evac: bool,
     /// `CRATONVM_G1_NO_EVAC_RETRY` — do not retry a failed evacuation.
     pub g1_no_evac_retry: bool,
+    /// `CRATONVM_G1_COVERAGE_PIN` — **diagnostic bisection lever, default
+    /// OFF.** Make G1 refuse to evacuate on any pause whose JIT root set is
+    /// recorded as incomplete, by forcing an empty collection set.
+    ///
+    /// This is NOT a shipped safety default, and the reason is measured: on
+    /// `probes/MovingYoungConcurrentProbe 6 400 2000` under `-XX:+UseG1GC`,
+    /// 330263 of 330264 pauses report incomplete coverage, because the flag
+    /// means "this collection's JIT roots are not REWRITABLE" — the normal
+    /// state whenever any thread is in compiled code — not "this collection's
+    /// JIT roots were not ENUMERATED". Refusing on it starves reclamation: the
+    /// same run needed ONE collection with the lever off and took 330264 no-op
+    /// pauses with it on.
+    ///
+    /// What it is for: deciding whether a G1-only crash is a root-coverage
+    /// defect at all. Under this lever G1 moves nothing, so a crash that
+    /// survives it is not caused by a relocation the root set failed to cover.
+    /// See `G1Collector::root_coverage_incomplete_reason`, whose DETECTION is
+    /// deliberately not gated on this flag — the counters report the rate in
+    /// both arms.
+    pub g1_coverage_pin: bool,
     /// `CRATONVM_G1_WORKERS` — override the G1 worker count, clamped to `>= 1`.
     /// [`parse::usize_min1`].
     pub g1_workers: Option<usize>,
@@ -878,6 +898,7 @@ impl GcFlags {
             old_sweep_jit: on_unless_zero(src, "CRATONVM_OLD_SWEEP_JIT"),
             g1_parallel_evac: one_or_true(src, "CRATONVM_G1_PARALLEL_EVAC"),
             g1_no_evac_retry: present(src, "CRATONVM_G1_NO_EVAC_RETRY"),
+            g1_coverage_pin: present(src, "CRATONVM_G1_COVERAGE_PIN"),
             g1_workers: usize_min1(src, "CRATONVM_G1_WORKERS"),
             gc_sweep_anchor_stride: usize_opt(src, "CRATONVM_GC_SWEEP_ANCHOR_STRIDE")
                 .filter(|&n| n >= 64)
@@ -1016,6 +1037,16 @@ pub struct LoaderFlags {
     pub dbg_classpath: bool,
     /// `CRATONVM_DBG_DEFINE` — [`parse::present_utf8`].
     pub dbg_define: bool,
+    /// `CRATONVM_DBG_DEFINE_CENSUS` — dump a per-class tally of every class
+    /// DEFINITION at exit, hottest first. [`parse::present_utf8`].
+    ///
+    /// Exists because "what is still defining classes in steady state?" had no
+    /// instrument at all. `runtime::diagnostics::classes_loaded` was declared,
+    /// reset, formatted and unit-tested, and incremented by nothing — so it
+    /// reported a confident zero, while `JitCache::invalidate_for_class`, which
+    /// runs ONLY on a class definition, sat at ~1% of an H2 profile taken long
+    /// past warm-up with nothing able to say what was calling it.
+    pub dbg_define_census: bool,
     /// `CRATONVM_DBG_DUPCLASS` — [`parse::present_utf8`].
     pub dbg_dupclass: bool,
     /// `CRATONVM_DBG_DUPCLASS_BT`
@@ -1023,6 +1054,18 @@ pub struct LoaderFlags {
     /// `CRATONVM_DBG_DUPCLASS_FILTER` -- [`parse::utf8`]. Restricts the
     /// `CRATONVM_DBG_DUPCLASS` trace to class names containing this substring.
     pub dbg_dupclass_filter: Option<String>,
+    /// `CRATONVM_DBG_TYPECHECK_FILTER` -- [`parse::utf8`]. Traces every compiled
+    /// `checkcast`/`instanceof` whose TARGET class name contains this substring,
+    /// naming the branch that decided it and the ids it compared.
+    ///
+    /// A compiled type check that disagrees with the interpreter has no other
+    /// witness. The bytecode has already collapsed to a taken/not-taken branch
+    /// by the time anything observable happens, so the only symptom is a wrong
+    /// answer somewhere downstream — `Spr15042`-style bean errors, or a
+    /// `super.` call that should never have been reached.
+    /// `CRATONVM_JIT_DENY=<Class>.<method>` localises WHICH method miscompiles;
+    /// this says WHY.
+    pub dbg_typecheck_filter: Option<String>,
     /// `CRATONVM_DBG_FBCGLIB`
     pub dbg_fbcglib: bool,
     /// `CRATONVM_DBG_GETRESOURCES` — [`parse::non_empty_non_zero`].
@@ -1065,9 +1108,11 @@ impl LoaderFlags {
             dbg_access: present_utf8(src, "CRATONVM_DBG_ACCESS"),
             dbg_classpath: present(src, "CRATONVM_DBG_CLASSPATH"),
             dbg_define: present_utf8(src, "CRATONVM_DBG_DEFINE"),
+            dbg_define_census: present_utf8(src, "CRATONVM_DBG_DEFINE_CENSUS"),
             dbg_dupclass: present_utf8(src, "CRATONVM_DBG_DUPCLASS"),
             dbg_dupclass_bt: present(src, "CRATONVM_DBG_DUPCLASS_BT"),
             dbg_dupclass_filter: utf8(src, "CRATONVM_DBG_DUPCLASS_FILTER"),
+            dbg_typecheck_filter: utf8(src, "CRATONVM_DBG_TYPECHECK_FILTER"),
             dbg_fbcglib: present(src, "CRATONVM_DBG_FBCGLIB"),
             dbg_getresources: non_empty_non_zero(src, "CRATONVM_DBG_GETRESOURCES"),
             dbg_layout: present(src, "CRATONVM_DBG_LAYOUT"),
@@ -1673,6 +1718,19 @@ pub struct NativeFlags {
     /// `CRATONVM_SYNTHETIC_FORKJOINPOOL`
     pub synthetic_forkjoinpool: bool,
 
+    /// `CRATONVM_SYNTHETIC_MEMORYUSAGE_TOSTRING=1|true|yes` — answer
+    /// `java.lang.management.MemoryUsage.toString()` from the shim instead of
+    /// the class's own bytecode. On a real-JDK run the real bytecode is the
+    /// default. [`parse::one_true_yes_exact`].
+    pub synthetic_memoryusage_tostring: bool,
+
+    /// `CRATONVM_SYNTHETIC_MXBEAN_MAPPING=1|true|yes` — opt back into the
+    /// synthetic JMX MXBean type mapping that types every unrecognised Java
+    /// type as `SimpleType.STRING` and converts nothing. The real JDK
+    /// machinery is the default; consumers want
+    /// `!synthetic_mxbean_mapping`. [`parse::one_true_yes_exact`].
+    pub synthetic_mxbean_mapping: bool,
+
     /// `CRATONVM_SYNTHETIC_PQC`
     pub synthetic_pqc: bool,
 
@@ -1863,6 +1921,14 @@ impl NativeFlags {
             synthetic_ec: present(src, "CRATONVM_SYNTHETIC_EC"),
             synthetic_eqe: present_utf8(src, "CRATONVM_SYNTHETIC_EQE"),
             synthetic_forkjoinpool: present(src, "CRATONVM_SYNTHETIC_FORKJOINPOOL"),
+            synthetic_memoryusage_tostring: one_true_yes_exact(
+                src,
+                "CRATONVM_SYNTHETIC_MEMORYUSAGE_TOSTRING",
+            ),
+            synthetic_mxbean_mapping: one_true_yes_exact(
+                src,
+                "CRATONVM_SYNTHETIC_MXBEAN_MAPPING",
+            ),
             synthetic_pqc: present(src, "CRATONVM_SYNTHETIC_PQC"),
             synthetic_quarkus_start: present(src, "CRATONVM_SYNTHETIC_QUARKUS_START"),
             synthetic_rsa: present(src, "CRATONVM_SYNTHETIC_RSA"),
@@ -1948,8 +2014,29 @@ impl VmFlags {
     /// instead of mutating `environ` after argument parsing: once any
     /// CratonVM flag is read, the process configuration is immutable.
     pub fn from_env_with_overrides(overrides: MapSource) -> Self {
+        Self::from_env_with_overrides_and_unsets(overrides, &[])
+    }
+
+    /// [`from_env_with_overrides`](Self::from_env_with_overrides), plus names to
+    /// resolve as if they had **never been exported**.
+    ///
+    /// An overlay can only add or replace, and the majority parser
+    /// ([`parse::present`]) reads *any* value — including `0` and the empty
+    /// string — as **on**. So a launcher translating an explicit off-switch
+    /// (`java -da` against an inherited `CRATONVM_ENABLE_ASSERTIONS`) cannot say
+    /// what it means with an override alone; `.with(name, "0")` would turn the
+    /// flag *on*. The unset list is applied after the overrides, so a name in
+    /// both ends up absent.
+    ///
+    /// Same shape as [`from_env_with_edits`](Self::from_env_with_edits), which
+    /// exists for tests; this one keeps the builder-style `MapSource` the
+    /// launcher already assembles.
+    pub fn from_env_with_overrides_and_unsets(overrides: MapSource, unset: &[&str]) -> Self {
         let mut raw = MapSource::from_process_env();
         raw.0.extend(overrides.0);
+        for name in unset {
+            raw.0.remove(*name);
+        }
         Self::from_source(&crate::flag_groups::resolve(&raw))
     }
 
@@ -2414,6 +2501,43 @@ mod tests {
             Some(OsString::from("enabled"))
         );
         assert_eq!(f.legacy_var_os("CRATONVM_DBG_AIOOBE"), None);
+    }
+
+    /// `synthetic_memoryusage_tostring` is served by the snapshot, and reads
+    /// the same three truth words its siblings do.
+    ///
+    /// `native-builtins`' `memoryusage_tostring_shim_enabled` read this name
+    /// with a raw `std::env::var` and a bespoke `Ok("1") | Ok("true")` table
+    /// when it landed, so the value the VM acted on came from the live process
+    /// environment — invisible to `with_thread_overrides`, unreachable from
+    /// `CRATONVM_REAL=-memoryusage-tostring`, and silently the developer's
+    /// ambient environment in any test that tried to arrange it. This pins the
+    /// parse; `flag_groups::tests::the_20260811_declarations_expand_from_their_group_spelling`
+    /// pins the grouped spelling that feeds it.
+    #[test]
+    fn synthetic_memoryusage_tostring_is_snapshot_backed_and_reads_one_true_yes() {
+        assert!(
+            !VmFlags::from_source(&MapSource::empty())
+                .natives
+                .synthetic_memoryusage_tostring,
+            "the real JDK bytecode is the default",
+        );
+        for word in ["1", "true", "yes"] {
+            assert!(
+                VmFlags::from_source(&src(&[("CRATONVM_SYNTHETIC_MEMORYUSAGE_TOSTRING", word)]))
+                    .natives
+                    .synthetic_memoryusage_tostring,
+                "`{word}` must turn the shim back on",
+            );
+        }
+        for word in ["0", "false", "no", ""] {
+            assert!(
+                !VmFlags::from_source(&src(&[("CRATONVM_SYNTHETIC_MEMORYUSAGE_TOSTRING", word)]))
+                    .natives
+                    .synthetic_memoryusage_tostring,
+                "`{word}` must leave the default alone",
+            );
+        }
     }
 
     #[test]

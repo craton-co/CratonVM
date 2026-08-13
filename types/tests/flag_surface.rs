@@ -70,7 +70,7 @@ fn the_surface_users_have_to_learn_is_fifteen_names() {
     assert_eq!(
         user_facing, 15,
         "the documented surface changed size; docs/CONFIG.md and \
-         docs/flag-census.md have to change with it"
+         audits/flag-census.md have to change with it"
     );
     assert!(
         fixture().len() > 400,

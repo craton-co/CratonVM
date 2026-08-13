@@ -1,19 +1,35 @@
 # Foreign-thread attach with safepoint participation
 
-Status: **IMPLEMENTED (Steps 1–7, branch `feat/foreign-thread-attach`).** A
-foreign (non-VM-created) OS thread is now a first-class, GC-safe Java thread:
-`AttachCurrentThread` / `AttachCurrentThreadAsDaemon` register it, it participates
-in stop-the-world via the existing barrier (counted mutator while running a call,
-idle-blocked between calls), and `DetachCurrentThread` reclaims it. Real
-registration is the default; `CRATONVM_FOREIGN_ATTACH=0` is the opt-out. Goal:
-make `libcratonvm` a credible `libjvm` drop-in for hosts that drive the VM from
-their own threads. See the **Implementation status** note below §4 for what
-landed (and two discoveries: a latent `JNIEnv*` indirection bug in the old attach
-stub, and the idle-creating-thread caveat).
+**Status:** Shipped (default on; `CRATONVM_FOREIGN_ATTACH=0` restores the old
+env-only stub).
 
-Related docs: [`embedding-api.md`](embedding-api.md) (the `JNI_CreateJavaVM` /
-flat-C surface this builds on), and the precise/conservative-roots material
-referenced from `vm/src/jit/conservative_roots.rs`.
+## What it does today
+
+A foreign — non-VM-created — OS thread is a first-class, GC-safe Java thread.
+`AttachCurrentThread` / `AttachCurrentThreadAsDaemon` register it,
+`DetachCurrentThread` reclaims it, and in between it participates in
+stop-the-world through the existing barrier: a counted mutator while it is
+running a call, idle-blocked between calls.
+
+`attach_current_thread_impl` (`vm/src/native/jni.rs`) does real registration —
+`attach_foreign_thread` / `detach_foreign_thread` build a `JvmThread`, register
+it with the `ThreadRegistry`, publish its TLAB and thread address for
+stop-the-world scanning, model an idle-attached thread as GC-blocked, and
+refuse a detach with a call still in flight. The gate is
+`foreign_attach_enabled()`, declared in `types/src/flag_groups.rs` under the
+compatibility group as token `foreign-attach`.
+
+A multi-threaded soak with K foreign threads plus a forced stop-the-world lives
+in `libcratonvm`'s test module.
+
+## Known limit
+
+Resolution goes through the process-global `PROCESS_VM` cell
+(`vm/src/native/jni.rs`), so **attach ignores which `JavaVM*` the caller
+passes**. That is a real multi-VM limitation, not a diagnostic gap.
+
+Related: [`embedding-api.md`](embedding-api.md) — the `JNI_CreateJavaVM` and
+flat-C surface this builds on.
 
 ---
 

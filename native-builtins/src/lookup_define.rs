@@ -52,6 +52,7 @@ use cratonvm_types::error::{MethodCallResult, RuntimeError};
 use cratonvm_types::{ObjectRef, Value};
 
 use crate::obj_arg;
+use cratonvm_types::error::MethodCallFailed;
 
 const LK_CLASS: &str = "java/lang/invoke/MethodHandles$Lookup";
 /// Slot index of the lookup class reference within the synthetic Lookup
@@ -139,9 +140,7 @@ fn lookup_class_code_source(ctx: &mut dyn NativeContext, this_lookup: ObjectRef)
         },
     };
     // CodeSource.location is a URL — try `getLocation` style by-name
-    // first, fall back to slot 0. The URL itself stringifies via
-    // `URL.toString` which for our synthetic URLs is just the stored
-    // string.
+    // first, fall back to slot 0.
     let url_obj_or_str = match ctx.get_field_by_name(cs, "location") {
         Value::Object(Some(u)) => u,
         _ => match ctx.get_field(cs, 0) {
@@ -149,18 +148,15 @@ fn lookup_class_code_source(ctx: &mut dyn NativeContext, this_lookup: ObjectRef)
             _ => return None,
         },
     };
-    // If it's already a String mirror, read directly. Otherwise try
-    // reading slot 0 of a URL object (synthetic URL stores the string
-    // form there).
-    if let Some(s) = ctx.read_string(url_obj_or_str) {
-        return Some(s);
-    }
-    if let Value::Object(Some(s)) = ctx.get_field(url_obj_or_str, 0) {
-        if let Some(s) = ctx.read_string(s) {
-            return Some(s);
-        }
-    }
-    None
+    // Stringify through the shared reader. The previous code read slot 0 of
+    // the location and, if that was a String, returned it — which is right
+    // only for the LEGACY 6-slot synthetic URL that cached the whole spec
+    // there. On a real `java.net.URL` slot 0 is `protocol`, also a String, so
+    // `read_string` SUCCEEDED and a real ProtectionDomain's CodeSource
+    // stringified to `"file"` or `"jar"`. Not hypothetical: this sits behind
+    // a by-name `Class.protectionDomain` -> `codesource` lookup, so it fires
+    // precisely when the mirror carries a REAL ProtectionDomain.
+    crate::classloader::url_to_external_form(ctx, url_obj_or_str)
 }
 
 /// Resolve the loader_id to use when defining a class on behalf of the
@@ -229,29 +225,53 @@ fn inherit_lookup_loader(ctx: &mut dyn NativeContext, this_lookup: ObjectRef) ->
 /// defined under the generated class's own namespace. Passing the resolved
 /// identities through `DefineClassFull` prevents the class manager's
 /// name-only fallback from selecting an unrelated same-named copy.
+/// W7-26 R1 — the two `Err(_) => return (None, None)` arms below used to catch
+/// **any** failure from the lookup loader's resolution, including a real
+/// pending Java throwable. `(None, None)` is the documented fall-through (the
+/// class manager's name-only resolution), so a `VerifyError`, a
+/// `ClassFormatError`, an `ExceptionInInitializerError` from a supertype's
+/// `<clinit>`, or an `OutOfMemoryError` all read as "resolve the supertype by
+/// name instead" and the generated class was defined against whatever the
+/// name-only lookup found — the wrong-answer half of the species, on the path
+/// every ByteBuddy/CGLIB/Hibernate proxy define takes.
+///
+/// `Lookup.defineClass` and `Lookup.defineHiddenClass` both declare
+/// `throws LinkageError` and neither absorbs a loader's throwable, so
+/// propagating is HotSpot parity. `absorb_class_absent` keeps exactly the
+/// "this name is not reachable from here" half absorbed —
+/// `ClassNotFoundException`, `NoClassDefFoundError`, and (see its own residual)
+/// `MethodCallFailed::InternalError`, which is what the resolver returns for a
+/// plain classpath miss and what an isolated loader's legitimate refusal
+/// arrives as. Those are every case this helper's fallback was written for.
 fn resolve_lookup_supertypes(
     ctx: &mut dyn NativeContext,
     this_lookup: ObjectRef,
     class_bytes: &[u8],
-) -> (
-    Option<cratonvm_types::ClassId>,
-    Option<Vec<cratonvm_types::ClassId>>,
-) {
+) -> Result<
+    (
+        Option<cratonvm_types::ClassId>,
+        Option<Vec<cratonvm_types::ClassId>>,
+    ),
+    MethodCallFailed,
+> {
     let lookup_mirror = match ctx.get_field(this_lookup, LK_LOOKUP_CLASS_REF) {
         Value::Object(Some(mirror)) => mirror,
-        _ => return (None, None),
+        _ => return Ok((None, None)),
     };
     let Some(lookup_class_id) = crate::lang_class::mirror_class_id(ctx, lookup_mirror) else {
-        return (None, None);
+        return Ok((None, None));
     };
     let Ok(class_file) = cratonvm_reader::read_class(class_bytes) else {
-        return (None, None);
+        return Ok((None, None));
     };
 
     let superclass_id = match class_file.super_class.as_deref() {
         Some(name) => match ctx.class_id_by_name_via_referencing_class(lookup_class_id, name) {
             Ok(id) => Some(id),
-            Err(_) => return (None, None),
+            Err(failed) => {
+                crate::classloader_real::absorb_class_absent(&*ctx, failed)?;
+                return Ok((None, None));
+            }
         },
         None => None,
     };
@@ -259,17 +279,20 @@ fn resolve_lookup_supertypes(
     for name in &class_file.interfaces {
         match ctx.class_id_by_name_via_referencing_class(lookup_class_id, name) {
             Ok(id) => interface_ids.push(id),
-            Err(_) => return (None, None),
+            Err(failed) => {
+                crate::classloader_real::absorb_class_absent(&*ctx, failed)?;
+                return Ok((None, None));
+            }
         }
     }
-    (superclass_id, Some(interface_ids))
+    Ok((superclass_id, Some(interface_ids)))
 }
 
 /// Allocate a fresh Lookup synthetic with full-power modes pointing at
 /// the given mirror. Mirrors `classloader.rs::alloc_lookup` but uses
 /// only the public `NativeContext` surface so this module stays
 /// independent of `classloader.rs`.
-fn alloc_lookup_for(ctx: &mut dyn NativeContext, lookup_mirror: ObjectRef) -> ObjectRef {
+fn alloc_lookup_for(ctx: &mut dyn NativeContext, lookup_mirror: ObjectRef) -> Result<ObjectRef, MethodCallFailed> {
     // FULL_POWER = PUBLIC | PRIVATE | PROTECTED | PACKAGE | MODULE | ORIGINAL
     //            = 0x01 | 0x02 | 0x04 | 0x08 | 0x10 | 0x40
     //            = 0x5F
@@ -297,28 +320,40 @@ fn alloc_lookup_for(ctx: &mut dyn NativeContext, lookup_mirror: ObjectRef) -> Ob
     // access check reads as powerless.
     //
     // Write by NAME on the real layout; keep the index writes as the
-    // synthetic-only fallback. The discriminator is the wave-3 one: an ABSENT
-    // field answers `Int(0)` from `get_field_by_name`, so a `Value::Object`
-    // answer for `prevLookupClass` means the real JDK class is what we
-    // allocated.
+    // synthetic-only fallback. The discriminator is a CLASS-side witness:
+    // `resolve_field_index_by_class_id` asks the CLASS whether it declares
+    // `prevLookupClass`. A fabricated stub names its fields `_f0.._fN`
+    // (`ensure_synthetic_class`), so it misses there and the synthetic arm
+    // runs.
     //
-    // W6-3 hardening, two additions:
+    // It used to be a DISJUNCTION of that witness with the older value-shape
+    // test, `matches!(get_field_by_name(obj, "prevLookupClass"),
+    // Value::Object(_))`, kept on the stated grounds that an absent field
+    // answers `Int(0)` and so a `Value::Object` answer proved the real layout.
+    // **That premise is false, and the disjunct inverted the discriminator.**
+    // Production `get_field_by_name` (`vm/src/vm/vm_exec.rs`) returns
+    // `Value::Object(None)` for a name it cannot resolve — the trait spells it
+    // out (`native-api/src/registry.rs`: "Returns `Value::Object(None)` if the
+    // field is not found"). `Int(0)` is `test_utils::MockNativeContext`'s
+    // answer, which is why the unit tests below never saw this. `Object(None)`
+    // matches `Value::Object(_)`, so in production the disjunct was
+    // UNCONDITIONALLY TRUE and the synthetic arm was unreachable: on a
+    // fabricated Lookup both `set_field_by_name` calls silently no-op, the
+    // verify below then finds `allowedModes` unlanded, and the real arm's
+    // `resolve_field_index_by_class_id` misses too — so the mode word was
+    // written NOWHERE and `defineHiddenClass` handed back a Lookup reporting 0
+    // modes. That is precisely the powerless-Lookup failure the verify step
+    // was added to prevent, reintroduced through the discriminator.
     //
-    //  1. A POSITIVE class-side witness. `resolve_field_index_by_class_id` asks
-    //     the CLASS whether it declares the field, so unlike the value-shape
-    //     test it does not have to distinguish "absent" (`Int(0)`) from "a real
-    //     reference field that is currently null" (`Object(None)`) — the two
-    //     answers a fresh object of either layout can give. A fabricated stub
-    //     names its fields `_f0.._fN`, so this misses there and the synthetic
-    //     arm still runs; the old value-shape test is kept as a disjunct so
-    //     this is a strict superset of the previous condition.
+    // Absent and present-but-null are not merely hard to tell apart from the
+    // value — they are identical. Only the class can answer.
     //
-    //  2. The by-name write is VERIFIED. Pinning only the positive half is what
-    //     made the original bug invisible: a `Lookup` whose `allowedModes` never
-    //     received the value reads back 0 — "no access at all" — and throws
-    //     nothing. If the named write did not land, fall through to the
-    //     synthetic indices rather than returning a powerless Lookup.
-    let obj = crate::alloc_concurrent_synthetic(ctx, LK_CLASS, 4);
+    // The by-name write is still VERIFIED below. Pinning only the positive half
+    // is what made the original bug invisible: a `Lookup` whose `allowedModes`
+    // never received the value reads back 0 — "no access at all" — and throws
+    // nothing. If the named write did not land, fall through to the synthetic
+    // indices rather than returning a powerless Lookup.
+    let obj = crate::try_alloc_concurrent_synthetic(ctx, LK_CLASS, 4)?;
     // Slot 0 is `lookupClass` in BOTH layouts.
     ctx.set_field(obj, LK_LOOKUP_CLASS_REF, Value::Object(Some(lookup_mirror)));
     ctx.set_field_by_name(obj, "lookupClass", Value::Object(Some(lookup_mirror)));
@@ -326,10 +361,6 @@ fn alloc_lookup_for(ctx: &mut dyn NativeContext, lookup_mirror: ObjectRef) -> Ob
         let cid = ctx.class_id_of_object(obj);
         ctx.resolve_field_index_by_class_id(cid, "prevLookupClass")
             .is_some()
-            || matches!(
-                ctx.get_field_by_name(obj, "prevLookupClass"),
-                Value::Object(_)
-            )
     };
     if real_layout {
         ctx.set_field_by_name(obj, "prevLookupClass", Value::Object(None));
@@ -341,15 +372,32 @@ fn alloc_lookup_for(ctx: &mut dyn NativeContext, lookup_mirror: ObjectRef) -> Ob
         // REFERENCE slot — an integer the GC would have scanned as an oop.
     }
     // Negative half: a named write that silently did not land leaves a Lookup
-    // reporting zero modes. Re-assert on the synthetic indices in that case.
+    // reporting zero modes. Re-assert — but on the layout the object ACTUALLY
+    // has.
+    //
+    // W7-7: the re-assert used to run the synthetic indices unconditionally.
+    // On the real layout that is not a wrong answer, it is heap corruption:
+    // slot 1 is `prevLookupClass` and slot 3 is `cachedProtectionDomain`, both
+    // REFERENCES the GC scans as oops, so `Int(0x5F)` in either is a bogus
+    // pointer for the collector to mark and move. It is the same defect the
+    // block above was written to fix, reintroduced through the failure branch —
+    // pinning only the positive half a second time. On the real layout, resolve
+    // the DECLARED slot instead and write that; never a fixed index.
     let modes_landed =
         matches!(ctx.get_field_by_name(obj, "allowedModes"), Value::Int(m) if m == LK_FULL_POWER);
     if !modes_landed {
-        ctx.set_field(obj, 1, Value::Int(LK_FULL_POWER));
-        ctx.set_field(obj, 2, Value::Object(None));
-        ctx.set_field(obj, 3, Value::Int(LK_FULL_POWER));
+        if real_layout {
+            let cid = ctx.class_id_of_object(obj);
+            if let Some(slot) = ctx.resolve_field_index_by_class_id(cid, "allowedModes") {
+                ctx.set_field(obj, slot, Value::Int(LK_FULL_POWER));
+            }
+        } else {
+            ctx.set_field(obj, 1, Value::Int(LK_FULL_POWER));
+            ctx.set_field(obj, 2, Value::Object(None));
+            ctx.set_field(obj, 3, Value::Int(LK_FULL_POWER));
+        }
     }
-    obj
+    Ok(obj)
 }
 
 // ---------------------------------------------------------------------------
@@ -376,7 +424,7 @@ fn lk_define_class_b(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     // Application namespace and CGLIB's WeakCacheKey lookup misses.
     let loader_id = inherit_lookup_loader(ctx, this_lookup);
     let (superclass_id_override, interface_id_overrides) =
-        resolve_lookup_supertypes(ctx, this_lookup, &class_bytes);
+        resolve_lookup_supertypes(ctx, this_lookup, &class_bytes)?;
 
     let opts = cratonvm_native_api::DefineClassFull {
         skip_verification: true,
@@ -503,7 +551,7 @@ fn lk_define_hidden_class_full(ctx: &mut dyn NativeContext, args: &[Value]) -> M
     // lookup class, which it cannot if the loaders differ.
     let loader_id = inherit_lookup_loader(ctx, this_lookup);
     let (superclass_id_override, interface_id_overrides) =
-        resolve_lookup_supertypes(ctx, this_lookup, &class_bytes);
+        resolve_lookup_supertypes(ctx, this_lookup, &class_bytes)?;
     // Keep the lookup class name only as the FALLBACK label.
     let nest_host_class_name_for_label = lookup_name;
 
@@ -550,7 +598,7 @@ fn lk_define_hidden_class_full(ctx: &mut dyn NativeContext, args: &[Value]) -> M
     // Return a fresh Lookup whose lookup class is the new hidden class.
     let mirror = ctx.get_class_mirror(cid);
     let lookup = alloc_lookup_for(ctx, mirror);
-    Ok(Some(Value::Object(Some(lookup))))
+    Ok(Some(Value::Object(Some(lookup?))))
 }
 
 // ---------------------------------------------------------------------------
@@ -590,9 +638,16 @@ const CLASS_OPTION_FLAG_NESTMATE: i32 = 0x01;
 ///
 /// Each step below decides only on POSITIVE evidence and otherwise falls
 /// through, so an unrecognised shape degrades to the historical behaviour
-/// rather than guessing. In particular a by-name read of an ABSENT field
-/// answers `Int(0)`, which is why the flag step requires a non-zero value:
-/// both real constants have one (`NESTMATE = 0x1`, `STRONG = 0x4`).
+/// rather than guessing. The flag step requiring a NON-ZERO value is part of
+/// that, though not for the reason this note used to give ("a by-name read of
+/// an ABSENT field answers `Int(0)`" — that is `MockNativeContext`; production
+/// answers `Value::Object(None)`, which the `Value::Int` pattern rejects
+/// outright). The reason that survives both contexts is that a PRESENT but
+/// never-written `int` slot decodes as `Int(0)`, and so does a fabricated
+/// stub's slot under the mock — while both real constants carry a non-zero
+/// flag (`NESTMATE = 0x1`, `STRONG = 0x4`). So `Int(0)` is never positive
+/// evidence, and step 3 below is the one that reads a zero, deliberately, as
+/// the synthetic ORDINAL rather than as a flag.
 fn class_option_is_nestmate(ctx: &mut dyn NativeContext, opt: ObjectRef) -> bool {
     // 1. Real-JDK layout, primary witness: the enum constant's own name.
     if let Value::Object(Some(name_ref)) = ctx.get_field_by_name(opt, "name") {
@@ -722,7 +777,7 @@ fn lk_define_hidden_class_with_class_data(
     // and CGLIB classData-bound proxies both rely on it.
     let loader_id = inherit_lookup_loader(ctx, this_lookup);
     let (superclass_id_override, interface_id_overrides) =
-        resolve_lookup_supertypes(ctx, this_lookup, &class_bytes);
+        resolve_lookup_supertypes(ctx, this_lookup, &class_bytes)?;
     let nest_host_class_name_for_label = lookup_name;
 
     // Same rule as the plain variant: the label comes from the class file's
@@ -772,7 +827,7 @@ fn lk_define_hidden_class_with_class_data(
 
     let mirror = ctx.get_class_mirror(cid);
     let lookup = alloc_lookup_for(ctx, mirror);
-    Ok(Some(Value::Object(Some(lookup))))
+    Ok(Some(Value::Object(Some(lookup?))))
 }
 
 // ---------------------------------------------------------------------------
@@ -1399,7 +1454,7 @@ mod tests {
 
         let host_cid = ctx.ensure_class_initialized("p/Host").expect("host cid");
         let mirror = ctx.get_class_mirror(host_cid);
-        let lookup = alloc_lookup_for(&mut ctx, mirror);
+        let lookup = alloc_lookup_for(&mut ctx, mirror).unwrap();
 
         assert!(
             matches!(ctx.get_field(lookup, 0), Value::Object(Some(m)) if m == mirror),
@@ -1429,12 +1484,20 @@ mod tests {
     /// fabricated stub (`_f0.._f3`), the by-name lookups all miss, and the
     /// synthetic indices must still be written — `allowedModes` at slot 1.
     /// A by-name-only fix would have left this arm powerless.
+    ///
+    /// This test was GREEN while production took the opposite arm. The mock's
+    /// `get_field_by_name` answers `Int(0)` for an unresolvable name;
+    /// production answers `Value::Object(None)`, which the discriminator's old
+    /// `matches!(.., Value::Object(_))` disjunct accepted as proof of the real
+    /// layout. The discriminator is now the class-side witness alone, which
+    /// both contexts answer identically, so this assertion means in production
+    /// what it means here.
     #[test]
     fn alloc_lookup_for_still_writes_the_synthetic_indices() {
         let mut ctx = MockNativeContext::new();
         let host_cid = ctx.ensure_class_initialized("p/Host").expect("host cid");
         let mirror = ctx.get_class_mirror(host_cid);
-        let lookup = alloc_lookup_for(&mut ctx, mirror);
+        let lookup = alloc_lookup_for(&mut ctx, mirror).unwrap();
         assert!(
             matches!(ctx.get_field(lookup, 0), Value::Object(Some(m)) if m == mirror),
             "synthetic slot 0 is lookupClass"

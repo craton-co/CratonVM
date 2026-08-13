@@ -6,21 +6,69 @@
 //! Provides the NativeContext trait, NativeMethodRegistry, FFI types,
 //! and FileDescriptorTable used by all native method crates.
 
+/// Where a native's PRIVATE slot map may start on a real JDK class, so that no
+/// private slot collides with a field the class declares. One implementation;
+/// `native-builtins` forwards to it. See W7-68-live-under-allocations.md and
+/// W7-49-slot-index-recensus.md §8.
+pub mod appended_slots;
 pub mod capability;
 pub mod charset;
 /// Class-identity answers a native can act on: the ambiguous-vs-absent
 /// distinction, and the refusal a by-name lookup is allowed to return.
 pub mod class_identity;
+/// Failure policy for a Java call a native **delegates** to (`close`, `flush`,
+/// …): which throwables the JDK method we stand in for actually catches, and
+/// which have to come out. See `delegated_close` for why a blanket
+/// `let _ = ctx.invoke_virtual(…)` is not that policy.
+pub mod delegated_close;
 pub mod fd_table;
 pub mod ffi;
 pub mod init_level;
 pub mod intrinsic;
+/// The layout-alias census — the one detector that sees every native object
+/// allocation, not only the fabrication funnel's.
+///
+/// It lives here, beside the `NativeContext::alloc_object` declaration it
+/// observes, because both of its callers (`vm`'s implementation of that method
+/// and `native-builtins`' fabrication funnel) depend on this crate and neither
+/// depends on the other. See the module header for why that is one detector
+/// with two observation points and not two detectors.
+pub mod layout_alias;
 pub mod native_id;
 pub mod native_ring;
+/// Receiver classes no supported JDK image declares — the measured table that
+/// decides which `Bridge` registrations are `SyntheticStub` by §1.5.
+pub mod no_image_receiver;
+/// Where an absorbed failure is **recorded** — `PrintStream`/`PrintWriter`'s
+/// `trouble` flag (read back by `checkError()`) and a `Handler`'s
+/// `ErrorManager`. Sibling of `delegated_close`: that module decides which
+/// throwables a JDK `catch` swallows, this one runs the BODY of the same
+/// `catch`. Absorbing without recording is not JDK parity — it is silence.
+pub mod print_error_state;
+// Registrations retired as contract-1.4 shadows, one measured subsystem at a
+// time. Sibling of `no_image_receiver`: both are class/triple-scoped kind
+// decisions made centrally because they are MEASUREMENTS against a JDK image
+// that no registration site can know.
+pub mod retired_shadow;
 pub mod plain_server_socket;
+/// The READ-side half of the slot-index census: a native reading slot `k` of a
+/// real JDK object it did not allocate, where slot `k` on the loaded class
+/// means a different field.
+///
+/// Sibling of `layout_alias`, not an extension of it, and deliberately so:
+/// that instrument's whole vocabulary is a slot COUNT, so it cannot say "slot 0
+/// is `mark`, not `hb`" — see W7-59-layout-detector-coverage.md section 6 and
+/// W7-69-read-side-alias-instrument.md. It reuses `layout_alias`'s flag,
+/// because the two are two halves of one species.
+pub mod read_alias;
 pub mod registry;
 pub mod server_socket_ports;
 pub mod socket_input_stream_read;
+/// The synthetic `java.nio.channels.FileChannel` private slot map. Lives here,
+/// not in a native crate, because `native-io` and `native-builtins` both own
+/// accessors for it and a map with two owners drifts —
+/// W7-72-ssc-socket-and-filechannel.md.
+pub mod synthetic_file_channel;
 pub mod vm_scoped;
 
 /// Lightweight `NativeContext` mock available to tests and to other
@@ -43,7 +91,15 @@ pub use capability::{
     CapabilitySet, CapabilityUse, PortSpec, Scope, VmId,
 };
 pub use class_identity::{refusal_to_java_failure, ClassIdentityError, NameLookup};
+pub use delegated_close::{
+    absorb_exception, absorb_io_exception, absorb_thrown, vm_only_best_effort,
+};
 pub use intrinsic::InterpIntrinsic;
+pub use print_error_state::{
+    absorb_io_exception_recording, absorb_write_exception_recording, classify_write_failure,
+    clear_trouble, is_trouble, record_host_io_failure, record_write_failure, report_handler_error,
+    set_trouble, take_absorbed, DelegatedWrite,
+};
 /// Native-dispatch call-site memoization: resolve once, then index.
 ///
 /// `NativeMethodRegistry::find` hashes all three of class/method/descriptor on
@@ -259,7 +315,7 @@ pub trait ClassDiscriminator {
 
     /// `true` iff `class_id` is **exactly** `which` — no superclass walk, no
     /// interface check. This is the direct replacement for
-    /// `ctx.class_name_of_id(id).as_deref() == Some("java/util/TreeMap")`.
+    /// `ctx.class_name_arc_of_id(id).as_deref() == Some("java/util/TreeMap")`.
     fn class_is(&self, class_id: ClassId, which: WellKnownClass) -> bool {
         self.well_known_class_id(which) == Some(class_id)
     }

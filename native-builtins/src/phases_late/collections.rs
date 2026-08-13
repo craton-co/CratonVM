@@ -83,7 +83,7 @@ pub(crate) fn register_phase55_collection_extras(r: &mut NativeMethodRegistry) {
             // Pin across the set/array allocs below — a moving young GC there
             // would relocate them (native stale-local family).
             let elem_pin = pinned_object_value(ctx, elem);
-            let set = alloc_concurrent_synthetic(ctx, "java/util/HashSet", 3);
+            let set = try_alloc_concurrent_synthetic(ctx, "java/util/HashSet", 3)?;
             let set_pin = ctx.pin_native_root(set);
             let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 16);
             let set = ctx.read_native_pin(set_pin, set);
@@ -108,7 +108,7 @@ pub(crate) fn register_phase55_collection_extras(r: &mut NativeMethodRegistry) {
             // Pin across the list/array allocs below — a moving young GC there
             // would relocate them (native stale-local family).
             let elem_pin = pinned_object_value(ctx, elem);
-            let list = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
+            let list = try_alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2)?;
             let list_pin = ctx.pin_native_root(list);
             let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 1);
             let list = ctx.read_native_pin(list_pin, list);
@@ -131,7 +131,7 @@ pub(crate) fn register_phase55_collection_extras(r: &mut NativeMethodRegistry) {
             // there would relocate them (native stale-local family).
             let key_pin = pinned_object_value(ctx, key);
             let val_pin = pinned_object_value(ctx, val);
-            let map = alloc_concurrent_synthetic(ctx, "java/util/HashMap", 3);
+            let map = try_alloc_concurrent_synthetic(ctx, "java/util/HashMap", 3)?;
             let map_pin = ctx.pin_native_root(map);
             let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 16);
             let arr_pin = ctx.pin_native_root(arr);
@@ -140,7 +140,7 @@ pub(crate) fn register_phase55_collection_extras(r: &mut NativeMethodRegistry) {
             ctx.set_field(map, 1, Value::Int(0));
             ctx.set_field(map, 2, Value::Int(16));
             // Simple: put at bucket 0
-            let node = alloc_concurrent_synthetic(ctx, "java/util/HashMap$Node", 4);
+            let node = try_alloc_concurrent_synthetic(ctx, "java/util/HashMap$Node", 4)?;
             let key = read_pinned_object_value(ctx, key_pin, key);
             let val = read_pinned_object_value(ctx, val_pin, val);
             let map = ctx.read_native_pin(map_pin, map);
@@ -169,7 +169,7 @@ pub(crate) fn register_phase55_collection_extras(r: &mut NativeMethodRegistry) {
             // Pin across the list/array allocs below — a moving young GC there
             // would relocate them (native stale-local family).
             let elem_pin = pinned_object_value(ctx, elem);
-            let list = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
+            let list = try_alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2)?;
             let list_pin = ctx.pin_native_root(list);
             let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, n);
             let list = ctx.read_native_pin(list_pin, list);
@@ -320,7 +320,7 @@ pub(crate) fn register_p60_abstract_map(r: &mut NativeMethodRegistry) {
         let s = ctx.create_string(&format!("{{size={size}}}"));
         Ok(Some(Value::Object(Some(s))))
     });
-    // SHIM-AUDIT (docs/feature-designs/native-builtins-shim-audit.md, row
+    // SHIM-AUDIT (feature-designs/native-builtins-shim-audit.md, row
     // `java/util/AbstractMap`) — `equals`/`hashCode` are DELIBERATELY NOT
     // registered here. They used to be, as:
     //
@@ -639,14 +639,14 @@ pub(crate) fn p62_tm_entry_at(
     ctx: &mut dyn NativeContext,
     data: ObjectRef,
     idx: Option<usize>,
-) -> Value {
+) -> Result<Value, MethodCallFailed> {
     match idx {
         Some(i) => {
             let k = ctx.get_array_element(data, i * 2);
             let v = ctx.get_array_element(data, i * 2 + 1);
-            Value::Object(Some(p64_make_entry(ctx, k, v)))
+            Ok(Value::Object(Some(p64_make_entry(ctx, k, v)?)))
         }
-        None => Value::Object(None),
+        None => Ok(Value::Object(None)),
     }
 }
 
@@ -670,7 +670,7 @@ pub(crate) fn p62_tm_floor_entry(ctx: &mut dyn NativeContext, args: &[Value]) ->
             break;
         }
     }
-    Ok(Some(p62_tm_entry_at(ctx, data, found)))
+    Ok(Some(p62_tm_entry_at(ctx, data, found)?))
 }
 
 pub(crate) fn p62_tm_ceiling_entry(
@@ -690,7 +690,7 @@ pub(crate) fn p62_tm_ceiling_entry(
     for i in 0..size {
         let k = ctx.get_array_element(data, i * 2);
         if natural_compare_values(k, key) >= 0 {
-            return Ok(Some(p62_tm_entry_at(ctx, data, Some(i))));
+            return Ok(Some(p62_tm_entry_at(ctx, data, Some(i))?));
         }
     }
     Ok(Some(Value::Object(None)))
@@ -716,7 +716,7 @@ pub(crate) fn p62_tm_lower_entry(ctx: &mut dyn NativeContext, args: &[Value]) ->
             break;
         }
     }
-    Ok(Some(p62_tm_entry_at(ctx, data, found)))
+    Ok(Some(p62_tm_entry_at(ctx, data, found)?))
 }
 
 pub(crate) fn p62_tm_higher_entry(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -733,7 +733,7 @@ pub(crate) fn p62_tm_higher_entry(ctx: &mut dyn NativeContext, args: &[Value]) -
     for i in 0..size {
         let k = ctx.get_array_element(data, i * 2);
         if natural_compare_values(k, key) > 0 {
-            return Ok(Some(p62_tm_entry_at(ctx, data, Some(i))));
+            return Ok(Some(p62_tm_entry_at(ctx, data, Some(i))?));
         }
     }
     Ok(Some(Value::Object(None)))
@@ -1087,27 +1087,65 @@ pub(crate) fn register_p62_abstract_map_entries(r: &mut NativeMethodRegistry) {
     // their own class's natives. And all three read only slots 0 and 1, which
     // both shapes of this class agree on.
     //
-    // `setValue` is deliberately NOT registered here, and that is the
+    // `setValue` is deliberately NOT registered on this name, and that is the
     // interesting half. `java/util/Map$Entry` is also minted as a THREE-field
     // entry — `key@0, value@1, sourceMap@2` — by the entry-set views in
     // native-collections and properties_sidetable, precisely so that
     // `Entry.setValue` WRITES THROUGH to the backing map, which
-    // `entrySet()` iteration requires. `Map.entry`'s entry is 2-field and
-    // must throw. One synthetic class name, two contradictory contracts,
-    // resolved by last-write-wins.
-    //
-    // An immutable `setValue` registered here loses that race today — and it
-    // must: if it ever won, every `entrySet()` write-through would break,
-    // which is far worse than `Map.entry(...).setValue(v)` being permissive.
-    // Registering a native whose correctness depends on losing a race is the
-    // landmine this lane keeps stepping on, so it is not registered at all.
-    //
-    // Fixing the residual properly means giving `Map.entry` a class of its
-    // own — HotSpot returns `java.util.KeyValueHolder` for exactly this
-    // reason. Measured and rejected as a drive-by: re-pointing the allocation
-    // at `SimpleImmutableEntry` moved the differential from 4 diverging lines
-    // to 6.
+    // `entrySet()` iteration requires. That is the only contract this NAME
+    // carries now.
     register_entry_value_semantics(r, "java/util/Map$Entry");
+
+    // `Map.entry(k, v)` has a class of its own — `java/util/KeyValueHolder`,
+    // which is what HotSpot answers for `Map.entry(..).getClass()`.
+    //
+    // Until it did, `Map.entry`'s 2-field immutable entry and the entry-set
+    // views' 3-field write-through entry were the same synthetic class name
+    // wearing two contradictory contracts, and `setValue` was decided by
+    // last-write-wins. An immutable `setValue` could only ever win that race
+    // by breaking every `entrySet()` write-through, so it was not registered
+    // at all and `Map.entry(..).setValue(v)` stayed permissive — the last
+    // diverging line of `probes/ShadowDifferentialProbe.java` under
+    // `--synthetic-jdk`. A separate class removes the race rather than
+    // choosing a side of it.
+    //
+    // `--real-jdk` is untouched: `java.util.Map.entry` is ordinary bytecode in
+    // `java.base`, so the registry drops the `Map.entry` registration and the
+    // JDK mints its own `KeyValueHolder`, which never reaches these natives.
+    //
+    // `SyntheticStub` rather than this registrar's ambient `Bridge`: the real
+    // `java.util.KeyValueHolder` in `java.base` declares no `ACC_NATIVE`
+    // method, so contract §1.5 cannot call these bridges, and under
+    // `--jdk-only` they must drop so the JDK's own final `key`/`value` fields
+    // and its own `setValue` throw are what run.
+    let kvh_prev = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::SyntheticStub);
+    let kvh = "java/util/KeyValueHolder";
+    r.register(kvh, "getKey", "()Ljava/lang/Object;", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        Ok(Some(ctx.get_field(this, 0)))
+    });
+    r.register(kvh, "getValue", "()Ljava/lang/Object;", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        Ok(Some(ctx.get_field(this, 1)))
+    });
+    r.register(
+        kvh,
+        "setValue",
+        "(Ljava/lang/Object;)Ljava/lang/Object;",
+        |_ctx, _args| {
+            // `KeyValueHolder.setValue` throws unconditionally in the JDK, and
+            // the silent-success this replaces was the dangerous half: a caller
+            // defensively mutating a copy got no signal that it had mutated
+            // something nobody would read.
+            Err(RuntimeError::UnsupportedOperationException {
+                message: "not supported".into(),
+            }
+            .into())
+        },
+    );
+    register_entry_value_semantics(r, kvh);
+    r.set_category(kvh_prev);
     r.set_category(__prev_cat);
 }
 
@@ -1175,14 +1213,14 @@ pub(crate) fn register_p63_weak_hash_map(r: &mut NativeMethodRegistry) {
     });
     r.register(whm, "keySet", "()Ljava/util/Set;", |ctx, _args| {
         // Return empty HashSet stub
-        let set = alloc_concurrent_synthetic(ctx, "java/util/HashSet", 3);
+        let set = try_alloc_concurrent_synthetic(ctx, "java/util/HashSet", 3)?;
         ctx.set_field(set, 0, Value::Object(None));
         ctx.set_field(set, 1, Value::Int(0));
         ctx.set_field(set, 2, Value::Int(16));
         Ok(Some(Value::Object(Some(set))))
     });
     r.register(whm, "values", "()Ljava/util/Collection;", |ctx, _args| {
-        let al = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
+        let al = try_alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2)?;
         ctx.set_field(al, 0, Value::Object(None));
         ctx.set_field(al, 1, Value::Int(0));
         Ok(Some(Value::Object(Some(al))))
@@ -1232,7 +1270,7 @@ pub(crate) fn register_p63_enumeration(r: &mut NativeMethodRegistry) {
         "emptyEnumeration",
         "()Ljava/util/Enumeration;",
         |ctx, _args| {
-            let e = alloc_concurrent_synthetic(ctx, "java/util/Collections$EmptyEnumeration", 0);
+            let e = try_alloc_concurrent_synthetic(ctx, "java/util/Collections$EmptyEnumeration", 0)?;
             Ok(Some(Value::Object(Some(e))))
         },
     );
@@ -1286,7 +1324,7 @@ pub(crate) fn register_p63_enumeration(r: &mut NativeMethodRegistry) {
         Ok(Some(elem))
     });
     r.register(en, "asIterator", "()Ljava/util/Iterator;", |ctx, _args| {
-        let itr = alloc_concurrent_synthetic(ctx, "java/util/Collections$EmptyItr", 2);
+        let itr = try_alloc_concurrent_synthetic(ctx, "java/util/Collections$EmptyItr", 2)?;
         ctx.set_field(itr, 0, Value::Object(None));
         ctx.set_field(itr, 1, Value::Int(0));
         Ok(Some(Value::Object(Some(itr))))
@@ -1567,14 +1605,14 @@ pub(crate) fn native_p64_al_reversed(
     let arr = match ctx.get_field(this, 0) {
         Value::Object(Some(a)) => a,
         _ => {
-            let new_al = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
+            let new_al = try_alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2)?;
             let new_arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0);
             ctx.set_field(new_al, 0, Value::Object(Some(new_arr)));
             ctx.set_field(new_al, 1, Value::Int(0));
             return Ok(Some(Value::Object(Some(new_al))));
         }
     };
-    let new_al = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
+    let new_al = try_alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2)?;
     let new_arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, size);
     for i in 0..size {
         let elem = ctx.get_array_element(arr, size - 1 - i);
@@ -1621,7 +1659,7 @@ pub(crate) fn native_p64_ll_reversed(
         elements.push(elem);
     }
     // Build new ArrayList with reversed elements
-    let new_al = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
+    let new_al = try_alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2)?;
     let new_arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, elements.len());
     for (i, elem) in elements.iter().enumerate() {
         ctx.set_array_element(new_arr, i, *elem);
@@ -1732,12 +1770,12 @@ pub(crate) fn native_p64_ll_get_last(
 // --- SequencedMap helpers ---
 
 // Helper: create Map$Entry from key + value
-pub(crate) fn p64_make_entry(ctx: &mut dyn NativeContext, key: Value, value: Value) -> ObjectRef {
+pub(crate) fn p64_make_entry(ctx: &mut dyn NativeContext, key: Value, value: Value) -> Result<ObjectRef, MethodCallFailed> {
     // Pin across the entry alloc below — a moving young GC there would
     // relocate the key/value (native stale-local family).
     let key_pin = pinned_object_value(ctx, key);
     let value_pin = pinned_object_value(ctx, value);
-    let entry = alloc_concurrent_synthetic(ctx, "java/util/HashMap$Entry", 2);
+    let entry = try_alloc_concurrent_synthetic(ctx, "java/util/HashMap$Entry", 2)?;
     let key = read_pinned_object_value(ctx, key_pin, key);
     let value = read_pinned_object_value(ctx, value_pin, value);
     ctx.set_field(entry, 0, key);
@@ -1745,7 +1783,7 @@ pub(crate) fn p64_make_entry(ctx: &mut dyn NativeContext, key: Value, value: Val
     if let Some((h, _)) = key_pin.or(value_pin) {
         ctx.unpin_native_roots(h);
     }
-    entry
+    Ok(entry)
 }
 
 // SequencedMap interface fallbacks (return null for non-LinkedHashMap)
@@ -1861,7 +1899,7 @@ pub(crate) fn native_p64_lhm_seq_key_set(
         cur = ctx.get_field(node, 5); // after
     }
     // Return as ArrayList (simplification — real Java returns a Set view)
-    let al = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
+    let al = try_alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2)?;
     let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, keys.len());
     for (i, k) in keys.iter().enumerate() {
         ctx.set_array_element(arr, i, *k);
@@ -1882,7 +1920,7 @@ pub(crate) fn native_p64_lhm_seq_values(
         vals.push(ctx.get_field(node, 1)); // value
         cur = ctx.get_field(node, 5);
     }
-    let al = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
+    let al = try_alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2)?;
     let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, vals.len());
     for (i, v) in vals.iter().enumerate() {
         ctx.set_array_element(arr, i, *v);
@@ -1902,10 +1940,10 @@ pub(crate) fn native_p64_lhm_seq_entry_set(
     while let Value::Object(Some(node)) = cur {
         let key = ctx.get_field(node, 0);
         let val = ctx.get_field(node, 1);
-        entries.push(p64_make_entry(ctx, key, val));
+        entries.push(p64_make_entry(ctx, key, val)?);
         cur = ctx.get_field(node, 5);
     }
-    let al = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
+    let al = try_alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2)?;
     let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, entries.len());
     for (i, e) in entries.iter().enumerate() {
         ctx.set_array_element(arr, i, Value::Object(Some(*e)));
@@ -1931,7 +1969,7 @@ pub(crate) fn native_p64_lhm_reversed(
     }
     // Build new LinkedHashMap with reversed insertion order
     // Use native put to insert each entry
-    let new_lhm = alloc_concurrent_synthetic(ctx, "java/util/LinkedHashMap", 5);
+    let new_lhm = try_alloc_concurrent_synthetic(ctx, "java/util/LinkedHashMap", 5)?;
     let init_cap = 16i32;
     let buckets = ctx.new_array(
         cratonvm_types::ArrayElementType::Reference,
@@ -2093,13 +2131,13 @@ pub(crate) fn register_p70_misc(r: &mut NativeMethodRegistry) {
         "(Ljava/util/EnumSet;)Ljava/util/EnumSet;",
         |ctx, _args| {
             // Use same layout as existing EnumSet: field 0 = ArrayList backing, field 1 = type
-            let set = alloc_concurrent_synthetic(ctx, "java/util/EnumSet", 2);
+            let set = try_alloc_concurrent_synthetic(ctx, "java/util/EnumSet", 2)?;
             // Pin across the array/backing allocs below — a moving young GC
             // there would relocate them (native stale-local family).
             let set_pin = ctx.pin_native_root(set);
             let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0);
             let arr_pin = ctx.pin_native_root(arr);
-            let backing = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
+            let backing = try_alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2)?;
             let set = ctx.read_native_pin(set_pin, set);
             let arr = ctx.read_native_pin(arr_pin, arr);
             ctx.set_field(backing, 0, Value::Object(Some(arr)));

@@ -224,7 +224,7 @@ pub(crate) fn register_annotation_overrides(registry: &mut NativeMethodRegistry)
             let handlers = match jul_logger_handlers_get(ctx, logger) {
                 Some(list) => list,
                 None => {
-                    let list = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
+                    let list = try_alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2)?;
                     cratonvm_native_collections::native_al_init(ctx, &[Value::Object(Some(list))])?;
                     jul_logger_handlers_set(ctx, logger, list);
                     list
@@ -310,6 +310,47 @@ pub(crate) fn register_annotation_overrides(registry: &mut NativeMethodRegistry)
             );
         }
         ctx.set_field_by_name(*this, "filter", Value::Object(None));
+        // `java.util.logging.Handler`'s third field initializer is
+        // `private volatile ErrorManager errorManager = new ErrorManager();`
+        // — and a native `<init>` replaces the real constructor wholesale, so
+        // NONE of the JDK's field initializers run. Two of the three were
+        // already reconstructed above; this one was not, which left
+        // `errorManager` null on every `Handler` in Compatible mode. HotSpot's
+        // is never null (its own javadoc: "there is a default ErrorManager
+        // installed"), and `Handler.reportError` — the destination of every
+        // absorbed `Exception` in the whole `Handler` family — dereferences it
+        // unguarded, so an absorbed flush/close failure NPE'd inside the
+        // reporting path and came out as `reportError`'s own
+        // `catch (Exception ex2)` message instead of the failure.
+        //
+        // COMPATIBLE-MODE PARITY, not a behaviour change: it converges on what
+        // HotSpot's constructor does. Guarded on null so a real ctor that DID
+        // run (or a `setErrorManager` that already landed) is never clobbered.
+        // W7-64-printstream-trouble-and-errormanager.md
+        //
+        // The `resolve_field_index_by_class_id` guard is not belt-and-braces:
+        // `get_field_by_name` answers `Object(None)` for "null" and for "no
+        // such field" alike, and a SYNTHETIC `Handler` has no such field — so
+        // without it this would allocate one dead `ErrorManager` per handler
+        // and drop it into a `set_field_by_name` that is documented to no-op.
+        // The synthetic arm gets its `ErrorManager` from
+        // `register_p61_handler_error_manager` instead.
+        let handler_class = ctx.class_id_of_object(*this);
+        let has_error_manager_field = ctx
+            .resolve_field_index_by_class_id(handler_class, "errorManager")
+            .is_some();
+        if has_error_manager_field
+            && matches!(
+                ctx.get_field_by_name(*this, "errorManager"),
+                Value::Object(None)
+            )
+        {
+            if let Ok(Some(Value::Object(Some(em)))) =
+                ctx.new_object("java/util/logging/ErrorManager")
+            {
+                ctx.set_field_by_name(*this, "errorManager", Value::Object(Some(em)));
+            }
+        }
         Ok(None)
     });
     registry.register(
@@ -517,6 +558,35 @@ pub(crate) fn register_annotation_overrides(registry: &mut NativeMethodRegistry)
     // identity/return-this no-ops are available without the JIT/interpreter
     // having to resolve the override on the receiver's pipeline class.
     crate::streams::register_stream_overrides(registry);
+    // `IntStream/LongStream/DoubleStream.summaryStatistics()` are ABSTRACT on
+    // the real JDK 25 interfaces (`javap java.util.stream.IntStream`), and
+    // `native-collections` mints its primitive streams as instances of those
+    // interfaces themselves (`try_alloc_synthetic(ctx, "java/util/stream/
+    // IntStream", ..)` in `make_int_stream`). With no native for the exact
+    // triple the call resolves to the bodiless interface declaration and dies
+    // with `AbstractMethodError: … has no Code attribute` — the same shape that
+    // `LongStream.mapToObj` and `Stream.forEachOrdered` already hit. The only
+    // registration of these three lived in `register_phase56_stream_extras`,
+    // which is reachable solely from `register_synthetic_overrides` and so is
+    // compiled out of the default CLI entirely; a Cargo feature is a build-time
+    // answer to a runtime question (docs/architecture/natives-over-real-jdk-classes.md
+    // §2). `register_phase56_primitive_stream_terminals` is the NARROWED
+    // registrar carrying just the terminal operations that are safe on the
+    // real-JDK path — the parent registrar cannot be wired wholesale, because
+    // it also registers STATIC interface methods (`Stream.iterate/generate/
+    // ofNullable`, `{Int,Long,Double}Stream.concat`) that keep the native check
+    // in real-JDK mode and would hand real pipelines our 1-field eager stream.
+    // See docs/known-issues/jdk-only/W7-5-registrars-that-never-shipped.md.
+    //
+    // ORDERING: safe in both directions. No triple registered here is
+    // registered by any live registrar (checked against the whole live
+    // registration set — the three `summaryStatistics` triples appear nowhere
+    // else), so this cannot take over a key something else is serving. And
+    // `register_annotation_overrides` runs from `register_essential_natives`,
+    // i.e. before `register_collections_natives` in `vm_init`, so even a future
+    // overlap would be resolved in native-collections' favour by
+    // last-registration-wins rather than against it.
+    crate::phases_late::register_phase56_primitive_stream_terminals(registry);
     // Predicate's compositional defaults are invokedynamic captures in the
     // real JDK. Register the GC-visible bridge implementations in real-JDK
     // mode as well so field-filter composition does not retain a stale capture
@@ -896,7 +966,7 @@ pub(crate) fn register_annotation_overrides(registry: &mut NativeMethodRegistry)
             let _map = map;
             let cap = 16usize;
             // Backing HashMap: slot 0 = buckets, slot 1 = size, slot 2 = capacity.
-            let backing = crate::alloc_concurrent_synthetic(ctx, "java/util/HashMap", 3);
+            let backing = crate::try_alloc_concurrent_synthetic(ctx, "java/util/HashMap", 3)?;
             let buckets = ctx.new_array(cratonvm_types::ArrayElementType::Reference, cap);
             for i in 0..cap {
                 ctx.set_array_element(buckets, i, Value::Object(None));
@@ -905,7 +975,7 @@ pub(crate) fn register_annotation_overrides(registry: &mut NativeMethodRegistry)
             ctx.set_field(backing, 1, Value::Int(0));
             ctx.set_field(backing, 2, Value::Int(cap as i32));
             // HashSet: slot 0 = backing HashMap.
-            let set = crate::alloc_concurrent_synthetic(ctx, "java/util/HashSet", 1);
+            let set = crate::try_alloc_concurrent_synthetic(ctx, "java/util/HashSet", 1)?;
             ctx.set_field(set, 0, Value::Object(Some(backing)));
             Ok(Some(Value::Object(Some(set))))
         },
@@ -1227,15 +1297,15 @@ fn module_builder_alloc_with_named_fields(
     ctx: &mut dyn NativeContext,
     class_name: &str,
     fields: &[(&str, Value)],
-) -> ObjectRef {
+) -> Result<ObjectRef, MethodCallFailed> {
     // Allocate enough slots for the named fields plus a safety margin;
     // `alloc_concurrent_synthetic` widens to the real-JDK field count
     // when the class is loaded.
-    let obj = alloc_concurrent_synthetic(ctx, class_name, fields.len().max(4));
+    let obj = try_alloc_concurrent_synthetic(ctx, class_name, fields.len().max(4))?;
     for (name, value) in fields {
         ctx.set_field_by_name(obj, name, *value);
     }
-    obj
+    Ok(obj)
 }
 
 fn module_builder_empty_set(ctx: &mut dyn NativeContext) -> Result<Value, MethodCallFailed> {
@@ -1409,7 +1479,7 @@ fn native_module_builder_new_exports_qualified(
         "java/lang/module/ModuleDescriptor$Exports",
         &[("mods", mods), ("source", source), ("targets", targets)],
     );
-    Ok(Some(Value::Object(Some(obj))))
+    Ok(Some(Value::Object(Some(obj?))))
 }
 
 fn native_module_builder_new_exports_unqualified(
@@ -1426,7 +1496,7 @@ fn native_module_builder_new_exports_unqualified(
         "java/lang/module/ModuleDescriptor$Exports",
         &[("mods", mods), ("source", source), ("targets", targets)],
     );
-    Ok(Some(Value::Object(Some(obj))))
+    Ok(Some(Value::Object(Some(obj?))))
 }
 
 fn native_module_builder_new_opens_qualified(
@@ -1443,7 +1513,7 @@ fn native_module_builder_new_opens_qualified(
         "java/lang/module/ModuleDescriptor$Opens",
         &[("mods", mods), ("source", source), ("targets", targets)],
     );
-    Ok(Some(Value::Object(Some(obj))))
+    Ok(Some(Value::Object(Some(obj?))))
 }
 
 fn native_module_builder_new_opens_unqualified(
@@ -1459,7 +1529,7 @@ fn native_module_builder_new_opens_unqualified(
         "java/lang/module/ModuleDescriptor$Opens",
         &[("mods", mods), ("source", source), ("targets", targets)],
     );
-    Ok(Some(Value::Object(Some(obj))))
+    Ok(Some(Value::Object(Some(obj?))))
 }
 
 fn native_module_builder_new_requires_versioned(
@@ -1476,7 +1546,7 @@ fn native_module_builder_new_requires_versioned(
         "java/lang/module/ModuleDescriptor$Requires",
         &[("mods", mods), ("name", mn), ("compiledVersion", compiled)],
     );
-    Ok(Some(Value::Object(Some(obj))))
+    Ok(Some(Value::Object(Some(obj?))))
 }
 
 fn native_module_builder_new_requires_short(
@@ -1492,7 +1562,7 @@ fn native_module_builder_new_requires_short(
         "java/lang/module/ModuleDescriptor$Requires",
         &[("mods", mods), ("name", mn)],
     );
-    Ok(Some(Value::Object(Some(obj))))
+    Ok(Some(Value::Object(Some(obj?))))
 }
 
 fn native_module_builder_new_provides(
@@ -1507,7 +1577,7 @@ fn native_module_builder_new_provides(
         "java/lang/module/ModuleDescriptor$Provides",
         &[("service", service), ("providers", providers)],
     );
-    Ok(Some(Value::Object(Some(obj))))
+    Ok(Some(Value::Object(Some(obj?))))
 }
 
 fn native_module_builder_new_version(
@@ -1521,7 +1591,7 @@ fn native_module_builder_new_version(
         "java/lang/module/ModuleDescriptor$Version",
         &[("version", v)],
     );
-    Ok(Some(Value::Object(Some(obj))))
+    Ok(Some(Value::Object(Some(obj?))))
 }
 
 fn module_descriptor_version_text(ctx: &dyn NativeContext, obj: ObjectRef) -> String {
@@ -1599,7 +1669,7 @@ fn native_module_builder_build(ctx: &mut dyn NativeContext, args: &[Value]) -> M
     // is null in our boot. Allocate a synthetic ModuleDescriptor and copy
     // over the readable Builder state into matching named fields.
     let this = args.first().copied().unwrap_or(Value::Object(None));
-    let md = alloc_concurrent_synthetic(ctx, "java/lang/module/ModuleDescriptor", 16);
+    let md = try_alloc_concurrent_synthetic(ctx, "java/lang/module/ModuleDescriptor", 16)?;
     let md_pin = ctx.pin_native_root(md);
     if let Value::Object(Some(builder)) = this {
         for f in [
@@ -1950,11 +2020,11 @@ pub(crate) fn register_module_builder_overrides(registry: &mut NativeMethodRegis
         "ofSystem",
         "()Ljava/lang/module/ModuleFinder;",
         |ctx, _args| {
-            let finder = alloc_concurrent_synthetic(
+            let finder = try_alloc_concurrent_synthetic(
                 ctx,
                 "jdk/internal/module/SystemModuleFinders$SystemModuleFinder",
                 4,
-            );
+            )?;
             Ok(Some(Value::Object(Some(finder))))
         },
     );
@@ -1971,11 +2041,11 @@ pub(crate) fn register_module_builder_overrides(registry: &mut NativeMethodRegis
                 first_pin = Some(first_pin.map_or(name_pin, |pin: usize| pin.min(name_pin)));
 
                 let mref =
-                    alloc_concurrent_synthetic(ctx, "jdk/internal/module/ModuleReferenceImpl", 8);
+                    try_alloc_concurrent_synthetic(ctx, "jdk/internal/module/ModuleReferenceImpl", 8)?;
                 let mref_pin = ctx.pin_native_root(mref);
                 first_pin = Some(first_pin.map_or(mref_pin, |pin: usize| pin.min(mref_pin)));
 
-                let md = alloc_concurrent_synthetic(ctx, "java/lang/module/ModuleDescriptor", 16);
+                let md = try_alloc_concurrent_synthetic(ctx, "java/lang/module/ModuleDescriptor", 16)?;
                 let name = ctx.read_native_pin(name_pin, name);
                 ctx.set_field_by_name(md, "name", Value::Object(Some(name)));
                 let mref = ctx.read_native_pin(mref_pin, mref);
@@ -2036,8 +2106,8 @@ pub(crate) fn register_module_builder_overrides(registry: &mut NativeMethodRegis
             // name and whose `readerSupplier` is left null — `open()` below
             // detects the null supplier and builds a SystemModuleReader.
             let mref =
-                alloc_concurrent_synthetic(ctx, "jdk/internal/module/ModuleReferenceImpl", 8);
-            let md = alloc_concurrent_synthetic(ctx, "java/lang/module/ModuleDescriptor", 16);
+                try_alloc_concurrent_synthetic(ctx, "jdk/internal/module/ModuleReferenceImpl", 8)?;
+            let md = try_alloc_concurrent_synthetic(ctx, "java/lang/module/ModuleDescriptor", 16)?;
             ctx.set_field_by_name(md, "name", Value::Object(Some(name)));
             ctx.set_field_by_name(mref, "descriptor", Value::Object(Some(md)));
             ctx.invoke(
@@ -2067,11 +2137,11 @@ pub(crate) fn register_module_builder_overrides(registry: &mut NativeMethodRegis
             },
             _ => return Ok(Some(Value::Object(None))),
         };
-        let reader = alloc_concurrent_synthetic(
+        let reader = try_alloc_concurrent_synthetic(
             ctx,
             "jdk/internal/module/SystemModuleFinders$SystemModuleReader",
             4,
-        );
+        )?;
         ctx.set_field_by_name(reader, "module", Value::Object(Some(name)));
         ctx.set_field_by_name(reader, "closed", Value::Int(0));
         Ok(Some(Value::Object(Some(reader))))
@@ -2105,7 +2175,7 @@ pub(crate) fn register_module_builder_overrides(registry: &mut NativeMethodRegis
         // `exports()`, `uses()`, `provides()`, and hash/equals methods without
         // tripping on partially initialized descriptor state. Cache it on the
         // ModuleReference instance.
-        let md = alloc_concurrent_synthetic(ctx, "java/lang/module/ModuleDescriptor", 16);
+        let md = try_alloc_concurrent_synthetic(ctx, "java/lang/module/ModuleDescriptor", 16)?;
         let md_pin = ctx.pin_native_root(md);
         let name_str = ctx.create_string("synthetic");
         let md = ctx.read_native_pin(md_pin, md);
@@ -2240,7 +2310,7 @@ fn native_attrs_new_map(ctx: &mut dyn NativeContext) -> Result<ObjectRef, Method
     match ctx.new_object_initialized("java/util/HashMap", "()V", &[])? {
         Some(Value::Object(Some(map))) => Ok(map),
         _ => {
-            let map = alloc_concurrent_synthetic(ctx, "java/util/HashMap", 3);
+            let map = try_alloc_concurrent_synthetic(ctx, "java/util/HashMap", 3)?;
             cratonvm_native_collections::native_map_init(ctx, &[Value::Object(Some(map))])?;
             Ok(map)
         }
@@ -2269,20 +2339,20 @@ fn native_attrs_name_text(ctx: &dyn NativeContext, name_obj: ObjectRef) -> Optio
     }
 }
 
-fn native_attrs_make_name(ctx: &mut dyn NativeContext, name: &str) -> ObjectRef {
-    let obj = alloc_concurrent_synthetic(ctx, "java/util/jar/Attributes$Name", 1);
+fn native_attrs_make_name(ctx: &mut dyn NativeContext, name: &str) -> Result<ObjectRef, MethodCallFailed> {
+    let obj = try_alloc_concurrent_synthetic(ctx, "java/util/jar/Attributes$Name", 1)?;
     let obj_pin = ctx.pin_native_root(obj);
     let s = ctx.create_string(name);
     let obj = ctx.read_native_pin(obj_pin, obj);
     ctx.set_field(obj, 0, Value::Object(Some(s)));
     ctx.unpin_native_roots(obj_pin);
-    obj
+    Ok(obj)
 }
 
-fn native_attrs_key_for_value(ctx: &mut dyn NativeContext, key: ObjectRef) -> ObjectRef {
+fn native_attrs_key_for_value(ctx: &mut dyn NativeContext, key: ObjectRef) -> Result<ObjectRef, MethodCallFailed> {
     match ctx.read_string(key) {
         Some(name) => native_attrs_make_name(ctx, &name),
-        None => key,
+        None => Ok(key),
     }
 }
 
@@ -2321,7 +2391,7 @@ pub(crate) fn native_attrs_put_value(
     let map = native_attrs_ensure_map(ctx, this)?;
     let map_pin = ctx.pin_native_root(map);
     let key = ctx.read_native_pin(key_pin, key);
-    let map_key = native_attrs_key_for_value(ctx, key);
+    let map_key = native_attrs_key_for_value(ctx, key)?;
     let map_key_pin = ctx.pin_native_root(map_key);
     let value = match value_pin {
         Some(value_pin) => Value::Object(Some(ctx.read_native_pin(
@@ -2368,7 +2438,7 @@ pub(crate) fn native_attrs_get_value(
     let map = native_attrs_ensure_map(ctx, this)?;
     let map_pin = ctx.pin_native_root(map);
     let key = ctx.read_native_pin(key_pin, key);
-    let map_key = native_attrs_key_for_value(ctx, key);
+    let map_key = native_attrs_key_for_value(ctx, key)?;
     let map_key_pin = ctx.pin_native_root(map_key);
     let map = ctx.read_native_pin(map_pin, map);
     let map_key = ctx.read_native_pin(map_key_pin, map_key);
@@ -2539,7 +2609,7 @@ pub(crate) fn native_attrs_name_constant(
     ctx: &mut dyn NativeContext,
     name: &'static str,
 ) -> MethodCallResult {
-    let obj = alloc_concurrent_synthetic(ctx, "java/util/jar/Attributes$Name", 1);
+    let obj = try_alloc_concurrent_synthetic(ctx, "java/util/jar/Attributes$Name", 1)?;
     let obj_pin = ctx.pin_native_root(obj);
     let s = ctx.create_string(name);
     let obj = ctx.read_native_pin(obj_pin, obj);
@@ -3115,7 +3185,7 @@ fn native_proxy_new_instance(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
                 (ctx.alloc_object(cid, n), use_real_super, Some(cid))
             }
             ProxyClassOutcome::Degrade => (
-                alloc_concurrent_synthetic(ctx, "java/lang/reflect/Proxy$Instance", 3),
+                try_alloc_concurrent_synthetic(ctx, "java/lang/reflect/Proxy$Instance", 3)?,
                 false,
                 None,
             ),
@@ -3128,7 +3198,7 @@ fn native_proxy_new_instance(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
                     return Err(throw_proxy_failure(ctx, stage));
                 }
                 (
-                    alloc_concurrent_synthetic(ctx, "java/lang/reflect/Proxy$Instance", 3),
+                    try_alloc_concurrent_synthetic(ctx, "java/lang/reflect/Proxy$Instance", 3)?,
                     false,
                     None,
                 )
@@ -3287,6 +3357,30 @@ fn annotation_member_return_descriptor(
 }
 
 fn native_proxy_dispatch_invoke(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    // `CRATONVM_DBG=ann-proxy-prof` counts this entry too.
+    //
+    // The first version of that profiler instrumented only
+    // `annotation_proxy_dispatch_impl` — the INTERPRETER's hook — and reported
+    // ~100k dispatches on a Spring context startup, which would have made the
+    // whole annotation path worth <0.5s of a 305s run. But this native is a
+    // SECOND call site with its own AnnotationProxy routing (see the comment
+    // below: the by-name path here deliberately does not reach the interpreter
+    // hook's arms), so a workload whose proxies are reached through generated
+    // `$ProxyN` bodies is invisible to that counter. Counting one branch of a
+    // two-branch funnel is how a ceiling gets under-reported by the exact factor
+    // that matters.
+    let prof = crate::proxy_dispatch_prof_on();
+    let prof_entry = prof.then(std::time::Instant::now);
+    struct ProxyDispatchProfGuard(Option<std::time::Instant>);
+    impl Drop for ProxyDispatchProfGuard {
+        fn drop(&mut self) {
+            if let Some(t0) = self.0 {
+                crate::note_proxy_dispatch_ns(t0.elapsed().as_nanos() as u64);
+            }
+        }
+    }
+    let _proxy_dispatch_prof_guard = ProxyDispatchProfGuard(prof_entry);
+
     let proxy = match args.first() {
         Some(Value::Object(Some(p))) => *p,
         _ => {
@@ -3384,7 +3478,7 @@ fn native_proxy_dispatch_invoke(ctx: &mut dyn NativeContext, args: &[Value]) -> 
                 // `CHECKCAST Integer; Integer.intValue()`, so the result must be a
                 // real boxed Integer, not a raw `Value::Int` (which isn't a valid
                 // object reference and CHECKCAST/unbox turns into null).
-                let hash = crate::lang_class::ctx_annotation_proxy_hash_code(ctx, handler);
+                let hash = crate::lang_class::ctx_annotation_proxy_hash_code(ctx, handler)?;
                 return Ok(Some(crate::lang_class::box_value(
                     ctx,
                     Value::Int(hash),
@@ -3415,7 +3509,7 @@ fn native_proxy_dispatch_invoke(ctx: &mut dyn NativeContext, args: &[Value]) -> 
                                     ctx,
                                     handler,
                                     Value::Object(Some(other_handler)),
-                                );
+                                )?;
                                 let flag = Value::Int(if eq { 1 } else { 0 });
                                 return Ok(Some(crate::lang_class::box_value(ctx, flag, "Z")));
                             }
@@ -3462,12 +3556,12 @@ fn native_proxy_dispatch_invoke(ctx: &mut dyn NativeContext, args: &[Value]) -> 
                         return Ok(Some(crate::lang_class::box_value(ctx, Value::Int(0), "Z")));
                     }
                 }
-                let eq = crate::lang_class::ctx_annotation_proxy_equals(ctx, handler, other);
+                let eq = crate::lang_class::ctx_annotation_proxy_equals(ctx, handler, other)?;
                 let flag = Value::Int(if eq { 1 } else { 0 });
                 return Ok(Some(crate::lang_class::box_value(ctx, flag, "Z")));
             }
             "toString" => {
-                let s = crate::lang_class::ctx_annotation_proxy_to_string(ctx, handler);
+                let s = crate::lang_class::ctx_annotation_proxy_to_string(ctx, handler)?;
                 let result = ctx.create_string(&s);
                 return Ok(Some(Value::Object(Some(result))));
             }
@@ -3500,6 +3594,29 @@ fn native_proxy_dispatch_invoke(ctx: &mut dyn NativeContext, args: &[Value]) -> 
             }
             // Routing into the AnnotationProxy interception is by class+name;
             // the descriptor governs result coercion.
+            //
+            // "By class+name" is the whole mechanism, and worth naming exactly
+            // because W7-12 depends on it. `ctx.invoke` is `invoke_shared`
+            // (`vm/src/vm/vm_exec.rs`), which loads the class, finds an EMPTY
+            // method table on it, and reaches the terminal-miss
+            // annotation-proxy rescue — keyed on the receiver's runtime class
+            // NAME (`&*c.name == "java/lang/annotation/AnnotationProxy"`),
+            // never on its `ClassOrigin`. Every other door into this class is
+            // name-keyed the same way: `invoke_or_native`'s `effective_class`
+            // arm, `execute_invoke_kind`'s S111r18 arm
+            // (`vm/src/runtime/interpreter/invoke.rs`), the three
+            // `dispatch_virtual.rs` arms, and the JIT retarget in
+            // `vm/src/jit/helpers.rs`.
+            //
+            // Measured 2026-08-11 (`--dump-native-registry`, real-JDK boot):
+            // **zero** natives are registered under this class name, against
+            // two under `java/lang/reflect/Proxy$Instance`. So the
+            // provenance-keyed "prefer a native registered under the receiver's
+            // own exact name" branches this class currently takes cannot answer
+            // any call on it — which is what lets W7-12 re-label the class
+            // `VmInternal` (so `--jdk-only` stops refusing to mint it, see
+            // docs/known-issues/jdk-only/W7-12-strict-annotation-proxy.md)
+            // without moving this call off its route.
             //
             // `()Ljava/lang/Object;` is right for every member the proxy stores
             // — those are already boxed — but NOT for the one case it does not
@@ -3767,10 +3884,20 @@ pub(crate) fn define_or_get_proxy_class(
     // `Proxy$Instance` (no generated member bodies) → annotation accessors hit
     // `AbstractMethodError: <Ann>.value() has no Code` / `NoSuchMethodError
     // Proxy$Instance.value()`. (Every proxy AFTER the first worked, because the
-    // fallback's allocation registered the stub.) `ensure_synthetic_class`
-    // never fails — it registers the 3-field stub (handler/interfaces/identity)
-    // directly — so `$Proxy0` now generates a real proxy exactly like `$Proxy1+`.
-    let _ = ctx.ensure_synthetic_class("java/lang/reflect/Proxy$Instance", 3);
+    // fallback's allocation registered the stub.) Registering the 3-field stub
+    // (handler/interfaces/identity) directly makes `$Proxy0` generate a real
+    // proxy exactly like `$Proxy1+`.
+    //
+    // `ensure_vm_internal_class`, not the compatibility door (JDK-only wave 2,
+    // step 3, 2026-08-10). `java/lang/reflect/Proxy$Instance` is the SUPERCLASS
+    // OF A GENERATED PROXY, which contract §1 item 6 lists among the shapes the
+    // VM legitimately mints and which are never refused in either mode — the
+    // proxy classes that extend it are generated too. Routing it through the
+    // compatibility entry point was the mislabel: it made a §1-item-6 shape
+    // look like a §5 substitution, and refusing it under `--jdk-only` would
+    // break every dynamic proxy with a failure that reads as "strict mode
+    // doesn't work" (the first entry in this record's *Blast radius*).
+    ctx.ensure_vm_internal_class("java/lang/reflect/Proxy$Instance", 3);
 
     // Failure mode (1): spec build. `build_proxy_spec_for` returns `None`
     // only when an interface ClassId fails to resolve to a name (a
@@ -3824,6 +3951,31 @@ pub(crate) fn define_or_get_proxy_class(
         // `ClassLoader`, independent of annotations. See "Residual issue B" in
         // fixed-suite-bugs/mergedannotationstests-proxy-class-identity-reflection-vs-synthesize.md.
         force_loader_faithful_linking: true,
+        // …and, for the interfaces, do not even ask the loader-faithful
+        // *search* to find them: hand over the exact `ClassId`s.
+        //
+        // `force_loader_faithful_linking` only makes `resolve_supertype` PREFER
+        // the defining loader's namespace, and it falls through to the
+        // loader-blind `load_class(name)` when that namespace has no entry —
+        // which is routine, because a child loader's class is registered under
+        // its own namespace only for the copies it defined itself. A proxy over
+        // an interface a child loader merely *sees* therefore linked the
+        // application loader's same-named copy, and `getInterfaces()[0]` was
+        // then a different `Class` object from the one the caller passed to
+        // `newProxyInstance`. Everything downstream compares `Class` by
+        // identity: the generated `<clinit>`'s `getMethod` produced `Method`s
+        // declared by the wrong copy, so Byte Buddy's `JavaDispatcher` — a
+        // `Map<Method, Dispatcher>` keyed off its own `getMethods()` — missed
+        // every lookup and threw `No proxy target found for
+        // …Executable.isInstance(Object)`, taking Mockito's inline mock maker
+        // down with it in `HikariDataSourceConfigurationTests`.
+        //
+        // There is no ambiguity to resolve here: `Proxy.newProxyInstance` was
+        // handed the `Class` objects themselves. The order and length must
+        // match the emitted `interfaces[]`, which `emit_proxy_classfile` dedups
+        // BY NAME (two loaders' same-named interfaces collapse to one entry),
+        // so apply the same name-dedup to the id list.
+        interface_id_overrides: Some(dedup_iface_ids_by_name(&ordered, &spec.interfaces)),
         ..Default::default()
     };
     // Failure mode (3): class definition through the normal loader
@@ -3946,6 +4098,29 @@ pub(crate) fn resolve_serialized_proxy_class(
 /// public abstract + default instance methods, deduplicated by
 /// `(name, descriptor)`. Returns `None` if any ClassId fails to resolve to
 /// a name.
+/// Project `ordered` (deduped by `ClassId`) onto `iface_names` (the spec's
+/// interface names, same order) with the NAME dedup `emit_proxy_classfile`
+/// applies, keeping the first `ClassId` per name.
+///
+/// `DefineClassOptions::interface_id_overrides` is positional against the
+/// emitted `interfaces[]`, and the emitter collapses two loaders' same-named
+/// interfaces into one entry (JVMS §4.1 forbids a repeated interface), so a
+/// raw id list would be rejected for a count mismatch in exactly that case.
+fn dedup_iface_ids_by_name(
+    ordered: &[cratonvm_types::ClassId],
+    iface_names: &[String],
+) -> Vec<cratonvm_types::ClassId> {
+    let mut seen: Vec<&str> = Vec::with_capacity(iface_names.len());
+    let mut ids = Vec::with_capacity(iface_names.len());
+    for (id, name) in ordered.iter().zip(iface_names.iter()) {
+        if !seen.iter().any(|s| *s == name.as_str()) {
+            seen.push(name.as_str());
+            ids.push(*id);
+        }
+    }
+    ids
+}
+
 fn build_proxy_spec_for(
     ctx: &mut dyn NativeContext,
     loader_id: u32,
@@ -4012,10 +4187,19 @@ fn build_proxy_spec_for(
     // same `(name, descriptor)` key appears with both flavours.
     let mut visited: std::collections::HashSet<cratonvm_types::ClassId> =
         std::collections::HashSet::new();
-    let mut work: Vec<cratonvm_types::ClassId> = ordered_ifaces.to_vec();
+    // Each work item carries the DECLARED interface it was reached from, so a
+    // method inherited from a super-interface still records a root that is an
+    // entry of `ProxyClassSpec::interfaces`. `<clinit>` needs that root to take
+    // the owner `Class` off the generated class's own `getInterfaces()` rather
+    // than off a by-name constant-pool entry — see `ProxyMethod::iface_root`.
+    let mut work: Vec<(cratonvm_types::ClassId, String)> = ordered_ifaces
+        .iter()
+        .zip(iface_names.iter())
+        .map(|(cid, name)| (*cid, name.clone()))
+        .collect();
     let mut by_key: std::collections::HashMap<(String, String), ProxyMethod> =
         std::collections::HashMap::new();
-    while let Some(cid) = work.pop() {
+    while let Some((cid, root)) = work.pop() {
         if !visited.insert(cid) {
             continue;
         }
@@ -4043,6 +4227,7 @@ fn build_proxy_spec_for(
                 iface_owner: owner.clone(),
                 param_class_names,
                 exception_types,
+                iface_root: Some(root.clone()),
             });
             if !is_default {
                 entry.is_default = false;
@@ -4050,7 +4235,7 @@ fn build_proxy_spec_for(
         }
         for super_iface in ctx.class_interfaces(cid) {
             if !visited.contains(&super_iface) {
-                work.push(super_iface);
+                work.push((super_iface, root.clone()));
             }
         }
     }
@@ -4084,6 +4269,7 @@ fn build_proxy_spec_for(
                 iface_owner: "java/lang/Object".to_string(),
                 param_class_names: params,
                 exception_types: Vec::new(),
+                iface_root: None,
             });
     }
 

@@ -319,3 +319,55 @@ only at its own already-tracked, unrelated `RootReference` residual (see
 force_native_over_real_jdk_bytecode` run was attempted but got OOM-killed
 by the host's memory pressure before completing — not evaluated, worth
 re-running by whoever picks this up next on a less contended host.
+
+## Follow-up (2026-08-10): the gap is now MEASURED per query, and CratonVM straddles the 100 ms budget
+
+Found while triaging the H2 three-GC-variant sweep's GC-independent FAILs.
+`TestBnf` and `TestWeb` are two of exactly three classes that FAIL under all
+three collectors and PASS on an **idle** HotSpot 25 control — so this page owns
+2/3 of that residue. (The third is `TestTransaction`, a different budget; see
+`internal/fixed-suite-bugs/h2-suite-bugs/gc-variant-fullsuite-crashes-hangs-fails-20260810-FIXED.md` §4.)
+
+A probe replicating `testProcedures`' completion half verbatim, timing each
+`getNextTokenList` (`org.h2.test.unit.TestBnfTiming`), idle host:
+
+| query | HotSpot | CratonVM | verdict |
+|---|---:|---:|---|
+| `Bnf.getInstance` + `updateTopic`×2 + `linkStatements` (setup) | 69 ms | **1282 ms** | 18.6x |
+| `SELECT CUSTOM_PR` (first query) | 57 | **230** | **MISS** — n=3, `INT` absent |
+| `create table "test" as (sel` | 0 | 64 | ok |
+| `create table test as (sel` | 0 | 57 | ok |
+| `select 1\|\|f` | 4 | 99 | ok |
+| `select 1 \|\| 2 ` | 2 | 50 | ok |
+| `SELECT LEAS` | 3 | 91 | ok |
+| `SELECT CUSTOM_PRINT(` | 4 | 107 | ok |
+| `select 'abc` | 2 | 96 | ok |
+
+Three things this changes about the page's framing:
+
+1. **Only the FIRST query fails, and it fails because it is cold.** 230 ms
+   against a 100 ms budget; every later query runs 50-107 ms on the same warmed
+   code. The page's earlier ~900 ms figure for `select 'abc` was measuring a
+   cold path; warm, that same query is now 96 ms and **passes**.
+2. **CratonVM straddles the budget.** 89-125 ms across repeats against a
+   hardcoded 100 ms means `TestBnf`/`TestWeb` are coin-flips, not steady
+   failures — which is exactly why an earlier HotSpot control taken on a
+   *loaded* host showed HotSpot failing `TestWeb` too, and an idle one shows it
+   passing. Any measurement of these two classes has to state host load.
+3. **The target is ~1.3-2x, not "broad throughput work".** The page's 2026-07-23
+   follow-up landed three real fixes for ~1.5-1.7x and concluded the rest needed
+   an open-ended programme. Per-query numbers say the remaining distance is
+   small and concentrated: clear the cold first query (230 → <100) and pull the
+   warm ones off the 100 ms line.
+
+And one lever result, so nobody re-runs it: **the JIT tier-up threshold is inert
+here.** First query 222 ms (threshold 500), 206 ms (500 000), 252 ms
+(`--nojit`); warm queries 48-125 ms on all three arms. So unlike
+`TestTransaction` — which IS an instance of
+`../vm/jit-net-negative-on-call-dense-classes-20260810.md` and moves 20% on that
+lever — this class is raw interpreter/runtime throughput and the admission
+policy is not implicated.
+
+Probe: `org.h2.test.unit.TestBnfTiming`, ~8 s per run, deterministic on the
+MISS. It must call `linkStatements()` — see this page's own 2026-07-22 warning
+about the repro that skipped it.

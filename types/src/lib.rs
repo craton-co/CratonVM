@@ -12,6 +12,7 @@ mod class_id;
 pub mod compact_value;
 pub mod compat;
 pub mod error;
+pub mod fdlibm;
 pub mod field_layout;
 pub mod field_watch;
 pub mod flag_groups;

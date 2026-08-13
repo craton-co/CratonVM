@@ -84,7 +84,7 @@ moved.
 | after the fix | 314 ns/call | 361 ns/call | **1×** |
 
 Retired to
-[`../mockito-redefine-makes-every-call-40us-20260726.md`](../mockito-redefine-makes-every-call-40us-20260726.md),
+[`../fixed-suite-bugs/mockito-redefine-makes-every-call-40us-20260726.md`](../fixed-suite-bugs/mockito-redefine-makes-every-call-40us-20260726.md),
 with a Mockito-free reproducer at `docs/known-issues/repros/redefine-call-cost/`
 and a correctness probe that fails if a recompilation ever picks up the
 pre-redefine body.
@@ -383,7 +383,7 @@ explicit order for re-promoting it. The honest caveat above still applies: with
 CI step 1 red, none of these jobs has ever run to completion anyway.
 
 **P1 — Stub ratchet.** 2000-with-16-slack became 157-with-zero-slack, and the
-`docs/internal/stub-ratchet.md` the source pointed at now exists (as a redirect)
+`../fixed-suite-bugs/stub-ratchet.md` the source pointed at now exists (as a redirect)
 with the maintained copy public at `docs/contributing/stub-ratchet.md`.
 
 The denominator needed pinning too. "157 of 9,320" is a ratio argument, and only
@@ -406,7 +406,7 @@ the merge gates" claim.
 
 **P0 — Broken doc graph.** `docs/RELEASE_READINESS.md`,
 `docs/real-raf-segv-root-cause.md`, `docs/synthetic-vs-real-explained.md` and
-`docs/internal/stub-ratchet.md` now exist.
+`../fixed-suite-bugs/stub-ratchet.md` now exist.
 
 `tools/check_markdown_links.py` originally covered the repository root, the
 *top level* of `docs/`, and the mdBook tree — 98 files out of 1,644. Every

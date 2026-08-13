@@ -87,13 +87,21 @@ java.lang.AbstractMethodError: method java/nio/file/spi/FileSystemProvider.setAt
     has no Code attribute
 ```
 
-— `Files.setAttribute` reaching the *abstract* declaration instead of
-`WindowsFileSystemProvider`'s override. 3/3, on all three prefixes tried. That is
-a separate, Windows-only defect and has nothing to do with positional I/O; it is
-filed as `docs/known-issues/h2/bug-h2-windows-files-setattribute-abstract.md`.
-Note what it means for this page, though: on Windows `TestFileSystem` cannot
-currently reach `testConcurrent`'s later iterations at all, so a Windows report
-of the `pread0` refusal would have to predate that blocker.
+— 3/3, on all three prefixes tried. That is a separate defect with nothing to do
+with positional I/O.
+
+**Update 2026-08-07:** it was **not** `Files.setAttribute` reaching the abstract
+declaration *instead of* an override, and it was **not** Windows-only. The
+default provider object is stamped with the abstract class and
+`setAttribute` had no implementation registered at all, on any platform; H2 only
+reaches it on Windows because `FilePathDisk.setReadOnly` takes the
+`Files.setPosixFilePermissions` branch on Linux. Fixed the same day — see
+[`bug-h2-files-setattribute-abstract-provider-FIXED-20260807.md`](bug-h2-files-setattribute-abstract-provider-FIXED-20260807.md)
+and its follow-on
+[`bug-nio-filesystemprovider-abstract-surface-residuals-FIXED-20260807.md`](bug-nio-filesystemprovider-abstract-surface-residuals-FIXED-20260807.md).
+Until that fix, Windows `TestFileSystem` could not reach `testConcurrent`'s later
+iterations at all, so a Windows report of the `pread0` refusal would have to
+predate that blocker.
 
 ## Reproducing (if it returns)
 

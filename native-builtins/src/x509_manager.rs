@@ -113,7 +113,7 @@ use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError};
 use cratonvm_types::{ObjectRef, Value};
 use parking_lot::RwLock;
 
-use crate::alloc_concurrent_synthetic;
+use crate::try_alloc_concurrent_synthetic;
 use crate::keystore;
 
 // ---------------------------------------------------------------------------
@@ -458,6 +458,32 @@ const GN_TAG_DIRECTORY: u8 = 0xa4;
 const OID_SIG_SHA256_RSA: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x0b];
 ///   1.2.840.10045.4.3.2 — ecdsa-with-SHA256 (P-256 most common)
 const OID_SIG_ECDSA_SHA256: &[u8] = &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x03, 0x02];
+///   1.2.840.113549.1.1.5 — sha1WithRSAEncryption
+///
+/// **Deliberate widening, recorded as such.** Accepting SHA-1 makes chains
+/// that previously failed CLOSED verifiable. That is the HotSpot-parity
+/// answer — HotSpot's `SunJSSE` validates these chains, and every JDK ships
+/// `SHA1withRSA` — and it is what
+/// `io.netty.handler.ssl.SslContextTrustManagerTest` (all 4 tests) needs: its
+/// test CAs are SHA-1-signed, so CratonVM rejected them with
+/// `signature-algorithm OID at index 0 not implemented`. SHA-1 is
+/// collision-broken for *chosen-prefix* attacks against a CA that still signs
+/// with it; this verifier's job is to agree with the platform it emulates, not
+/// to impose a stricter policy the platform does not (a stricter policy that
+/// only CratonVM enforces reads to an application as "this VM cannot do TLS").
+const OID_SIG_SHA1_RSA: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x05];
+///   1.2.840.113549.1.1.12 — sha384WithRSAEncryption
+const OID_SIG_SHA384_RSA: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x0c];
+///   1.2.840.113549.1.1.13 — sha512WithRSAEncryption
+const OID_SIG_SHA512_RSA: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x0d];
+///   1.2.840.10045.4.3.3 — ecdsa-with-SHA384
+const OID_SIG_ECDSA_SHA384: &[u8] = &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x03, 0x03];
+///   1.2.840.10045.4.3.4 — ecdsa-with-SHA512
+const OID_SIG_ECDSA_SHA512: &[u8] = &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x03, 0x04];
+///   1.2.840.10045.4.3.1 — ecdsa-with-SHA224 (recognised, see below)
+const OID_SIG_ECDSA_SHA224: &[u8] = &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x03, 0x01];
+///   1.2.840.113549.1.1.14 — sha224WithRSAEncryption (recognised, see below)
+const OID_SIG_SHA224_RSA: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x0e];
 
 // --- Signature-algorithm OIDs we deliberately do NOT support yet. ---
 //
@@ -472,6 +498,10 @@ const OID_SIG_ECDSA_SHA256: &[u8] = &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x03, 
 //     SEQUENCE)
 //   * 1.3.101.112 — id-Ed25519 (pure EdDSA over Curve25519, separate
 //     verify path — no SHA-256 preimage)
+//   * 1.2.840.113549.1.1.14 / 1.2.840.10045.4.3.1 — the SHA-224 pair. Named
+//     here rather than left to the catch-all so the error says "known and
+//     unimplemented"; SHA-224 is the one member of the SHA-2 family this tree
+//     has no engine for, and no CA in the corpus issues with it.
 ///   1.2.840.10040.4.3 — id-dsa-with-sha1
 const OID_SIG_DSA_SHA1: &[u8] = &[0x2a, 0x86, 0x48, 0xce, 0x38, 0x04, 0x03];
 ///   1.2.840.113549.1.1.10 — id-RSASSA-PSS
@@ -2011,39 +2041,73 @@ fn verify_one_signature(
     cert: &ParsedCert,
     issuer_spki: &[u8],
 ) -> Result<(), TrustError> {
-    use crate::crypto_impl::{parse_ecdsa_public_key, parse_rsa_public_key, Ecdsa, Rsa, Sha256};
+    use crate::crypto_impl::{
+        parse_ecdsa_public_key, parse_rsa_public_key, Ecdsa, Rsa, Sha256, Sha384, Sha512,
+    };
+    use cratonvm_native_builtins_crypto::signature::DigestAlgorithm;
 
     let oid = cert.signature_algorithm_oid.as_slice();
     let sig = cert.signature_value.as_slice();
     let tbs = cert.tbs_bytes.as_slice();
 
-    if oid == OID_SIG_SHA256_RSA {
-        // PKCS#1 v1.5 RSA-SHA256: hash(tbs) → EMSA-PKCS1-v1_5 envelope, then
-        // s^e mod n and byte-equality compare.
+    // PKCS#1 v1.5 RSA, digest chosen by OID. The verification core
+    // (`crypto::signature::verify_rsa_pkcs1_v15_checked`) is already
+    // digest-parameterised, so this is a dispatch table rather than a copy per
+    // algorithm — the in-tree `Rsa::pkcs1v15_encode`, whose DigestInfo prefix
+    // IS hard-coded to SHA-256, is not on this path.
+    let rsa_digest = if oid == OID_SIG_SHA256_RSA {
+        Some(DigestAlgorithm::Sha256)
+    } else if oid == OID_SIG_SHA1_RSA {
+        Some(DigestAlgorithm::Sha1)
+    } else if oid == OID_SIG_SHA384_RSA {
+        Some(DigestAlgorithm::Sha384)
+    } else if oid == OID_SIG_SHA512_RSA {
+        Some(DigestAlgorithm::Sha512)
+    } else {
+        None
+    };
+
+    if let Some(digest_alg) = rsa_digest {
         let pk = match parse_rsa_public_key(issuer_spki) {
             Some(k) => k,
             None => return Err(TrustError::BadSignature { at }),
         };
-        if Rsa::verify_sha256(&pk, tbs, sig) {
+        if Rsa::verify_pkcs1_v15(&pk, digest_alg, tbs, sig) {
             Ok(())
         } else {
             Err(TrustError::BadSignature { at })
         }
-    } else if oid == OID_SIG_ECDSA_SHA256 {
-        // ECDSA-with-SHA256 over P-256: DER-decoded (r, s), check u1*G +
-        // u2*Q.x ≡ r (mod n). `verify_with_digest` takes a pre-hashed
-        // digest so we hash the TBS once here.
+    } else if oid == OID_SIG_ECDSA_SHA256
+        || oid == OID_SIG_ECDSA_SHA384
+        || oid == OID_SIG_ECDSA_SHA512
+    {
+        // ECDSA: DER-decoded (r, s), check u1*G + u2*Q.x ≡ r (mod n).
+        // `verify_with_digest` takes a PRE-HASHED digest and truncates it to
+        // the curve order's bit length itself (FIPS 186-4 §6.4), which is
+        // exactly why SHA-384/512 need no separate verify path — only the
+        // right hash over the TBS.
         let pk = match parse_ecdsa_public_key(issuer_spki) {
             Some(k) => k,
             None => return Err(TrustError::BadSignature { at }),
         };
-        let digest = Sha256::digest(tbs);
+        let digest: Vec<u8> = if oid == OID_SIG_ECDSA_SHA384 {
+            Sha384::digest(tbs).to_vec()
+        } else if oid == OID_SIG_ECDSA_SHA512 {
+            Sha512::digest(tbs).to_vec()
+        } else {
+            Sha256::digest(tbs).to_vec()
+        };
         if Ecdsa::verify_with_digest(&pk, &digest, sig) {
             Ok(())
         } else {
             Err(TrustError::BadSignature { at })
         }
-    } else if oid == OID_SIG_DSA_SHA1 || oid == OID_SIG_RSA_PSS || oid == OID_SIG_ED25519 {
+    } else if oid == OID_SIG_DSA_SHA1
+        || oid == OID_SIG_RSA_PSS
+        || oid == OID_SIG_ED25519
+        || oid == OID_SIG_SHA224_RSA
+        || oid == OID_SIG_ECDSA_SHA224
+    {
         // Known-but-unimplemented. See OID const block for the rationale —
         // each of these needs additional parsing (PSS parameters) or a
         // distinct primitive (DSA, EdDSA) we don't expose at this layer yet.
@@ -3125,6 +3189,34 @@ fn register_trust_manager(r: &mut NativeMethodRegistry, fqn: &'static str) {
         "([Ljava/security/cert/X509Certificate;Ljava/lang/String;)V",
         check_server_trusted,
     );
+    // The `X509ExtendedTrustManager` overloads. `X509TrustManagerImpl` extends
+    // that class, so real bytecode — and, since 2026-08-13, this crate's own
+    // `t27_tls::engine_run_trust_check` — reaches these four rather than the
+    // two above whenever the manager is used with an `SSLEngine` or `Socket`.
+    //
+    // Registering only the two-argument pair left the object half-shimmed: the
+    // objects this module hands out are built with
+    // `try_alloc_concurrent_synthetic`, so no constructor ever ran and every
+    // instance field is null. The moment a three-argument call fell through to
+    // the real JDK body it died on
+    // `NullPointerException: Cannot invoke "ReentrantLock.lock()" because
+    // "this.validatorLock" is null`, which the caller then reported as
+    // `SSLHandshakeException: TrustManager rejected the peer certificate
+    // chain` — measured on netty's `SniHandlerTest.testSniWithAlpnHandler`,
+    // whose `X509TrustManagerWrapper` delegates the engine-flavoured overload
+    // straight through.
+    //
+    // The extra `Socket`/`SSLEngine` argument is advisory in JSSE (it exists so
+    // an implementation CAN consult the connection); the chain and authType are
+    // the whole input to the decision this module makes, so both overloads
+    // share the two-argument handlers, which ignore any surplus argument.
+    for desc in [
+        "([Ljava/security/cert/X509Certificate;Ljava/lang/String;Ljava/net/Socket;)V",
+        "([Ljava/security/cert/X509Certificate;Ljava/lang/String;Ljavax/net/ssl/SSLEngine;)V",
+    ] {
+        r.register(fqn, "checkClientTrusted", desc, check_client_trusted);
+        r.register(fqn, "checkServerTrusted", desc, check_server_trusted);
+    }
     r.register(
         fqn,
         "getAcceptedIssuers",
@@ -3137,18 +3229,6 @@ fn register_pkix_validator(r: &mut NativeMethodRegistry) {
     // engineValidate(Certificate[] chain) -> Certificate[]  (the validated
     // path, leaf-first). Real-JDK has a longer overload too; the single-arg
     // form is what Keycloak / EJBCA actually call.
-    r.register(
-        FQN_PKIX_VALIDATOR,
-        "engineValidate",
-        "([Ljava/security/cert/Certificate;)[Ljava/security/cert/Certificate;",
-        pkix_engine_validate,
-    );
-    r.register(
-        FQN_PKIX_VALIDATOR,
-        "engineValidate",
-        "([Ljava/security/cert/Certificate;Ljava/util/Collection;Ljava/security/AlgorithmConstraints;Ljava/lang/Object;)[Ljava/security/cert/Certificate;",
-        pkix_engine_validate,
-    );
 }
 
 fn register_kmf(r: &mut NativeMethodRegistry) {
@@ -3815,8 +3895,8 @@ fn read_keystore_id(ctx: &mut dyn NativeContext, ks: ObjectRef) -> i32 {
 /// `sun.security.x509.X509CertImpl` (real bytecode, so `toString()` and
 /// friends work correctly) parsed from the DER first, only falling back to
 /// a bare synthetic mirror if that construction itself fails.
-fn make_x509_mirror(ctx: &mut dyn NativeContext, alias: &str, der: &[u8]) -> ObjectRef {
-    crate::keystore::make_x509_mirror(ctx, alias, der)
+fn make_x509_mirror(ctx: &mut dyn NativeContext, alias: &str, der: &[u8]) -> Result<ObjectRef, MethodCallFailed> {
+    Ok(crate::keystore::make_x509_mirror(ctx, alias, der)?)
 }
 
 fn make_private_key_mirror(
@@ -3824,8 +3904,8 @@ fn make_private_key_mirror(
     key_der: &[u8],
     km_id: i32,
     alias: &str,
-) -> ObjectRef {
-    let pk = alloc_concurrent_synthetic(ctx, "java/security/PrivateKey", 4);
+) -> Result<ObjectRef, MethodCallFailed> {
+    let pk = try_alloc_concurrent_synthetic(ctx, "java/security/PrivateKey", 4)?;
     // Same packing convention keystore.rs uses so the TLS path can decode
     // the (km_id, alias_hash) pair.
     let alias_hash = fnv1a_32(alias.as_bytes());
@@ -3841,7 +3921,7 @@ fn make_private_key_mirror(
     ctx.set_field(pk, 1, Value::Int((key_der.len() as i32).saturating_mul(8)));
     ctx.set_field(pk, 2, Value::Int(key_der.len() as i32));
     ctx.set_field(pk, 3, Value::Long(composite));
-    pk
+    Ok(pk)
 }
 
 /// Decode the `km_id` half of the `(km_id, alias_hash)` composite
@@ -3878,6 +3958,15 @@ pub(crate) fn km_alias_material(km_id: i32, alias: &str) -> Option<(Vec<Vec<u8>>
 }
 
 fn classify_key_type_from_pkcs8(key_der: &[u8]) -> &'static str {
+    // Structural read first: walk PrivateKeyInfo to its AlgorithmIdentifier OID
+    // rather than searching the whole DER for OID bytes, which can also match
+    // key material that happens to contain them. The needle scan below stays as
+    // the fallback for encodings that walk fails on, and "RSA" remains the
+    // last-resort default this function has always returned -- callers here
+    // treat it as a hint, not a verdict.
+    if let Some(name) = crate::t27_tls::pkcs8_algorithm_name(key_der) {
+        return name;
+    }
     // PKCS#8 PrivateKeyInfo ::= SEQUENCE { version, AlgorithmIdentifier, OCTET STRING }
     let needles: &[(&[u8], &'static str)] = &[
         (
@@ -3926,8 +4015,58 @@ fn fnv1a_32(b: &[u8]) -> u32 {
     h
 }
 
-fn cert_exception(message: String) -> MethodCallFailed {
-    RuntimeError::IOException { message }.into()
+/// Throw a REAL `java.security.cert.CertificateException` for a failed PKIX
+/// check, rather than an `IOException` whose *message* merely names one.
+///
+/// `X509TrustManager.checkServerTrusted`/`checkClientTrusted` declare
+/// `throws CertificateException`, and **callers discriminate on the TYPE**:
+/// a TLS stack catches `CertificateException` to turn a validation failure
+/// into a handshake alert, and a test catches it to assert that an untrusted
+/// chain was in fact rejected. An `IOException` matches neither, so it sails
+/// straight through the `catch` that exists to handle exactly this.
+///
+/// `io.netty.handler.ssl.SslContextTrustManagerTest` is the witness: its two
+/// mixed-expectation tests (`testUsingCAsOneAandB`, `testUsingCAsOneAandTwo`)
+/// call `checkServerTrusted` inside `catch (CertificateException)` and assert
+/// the negative case was rejected. With an `IOException` the negative case
+/// escaped the catch and failed the test, while the two all-positive tests
+/// passed — so the symptom looked like "some chains do not validate" when the
+/// validation verdict was right and only its exception class was wrong.
+///
+/// Falls back to the historic `IOException` when the class cannot be
+/// constructed, so no configuration loses the failure entirely — the one
+/// thing that must never happen here is a silently-trusted connection.
+fn cert_exception(ctx: &mut dyn NativeContext, message: String) -> MethodCallFailed {
+    cert_exception_of(ctx, "java/security/cert/CertificateException", message)
+}
+
+/// [`cert_exception`] for a specific exception class — `CertPathValidatorException`
+/// on the `PKIXValidator.engineValidate` path, which declares that type rather
+/// than `CertificateException`.
+/// `pub(crate)` re-export of [`cert_exception`] for `tls.rs`'s
+/// `checkServerTrusted` path, so both trust-check entry points raise the same
+/// exception CLASS rather than agreeing only on the message text.
+pub(crate) fn cert_exception_external(
+    ctx: &mut dyn NativeContext,
+    message: String,
+) -> MethodCallFailed {
+    cert_exception(ctx, message)
+}
+
+fn cert_exception_of(
+    ctx: &mut dyn NativeContext,
+    class_name: &str,
+    message: String,
+) -> MethodCallFailed {
+    let msg = ctx.create_string(&message);
+    match ctx.new_object_initialized(
+        class_name,
+        "(Ljava/lang/String;)V",
+        &[Value::Object(Some(msg))],
+    ) {
+        Ok(Some(Value::Object(Some(exc)))) => MethodCallFailed::ExceptionThrown(exc),
+        _ => RuntimeError::IOException { message }.into(),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -4001,7 +4140,7 @@ fn get_certificate_chain(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     let arr = ctx.new_ref_array(cls_id, chain.len());
     for (i, der) in chain.iter().enumerate() {
         let mirror = make_x509_mirror(ctx, &alias, der);
-        ctx.set_array_element(arr, i, Value::Object(Some(mirror)));
+        ctx.set_array_element(arr, i, Value::Object(Some(mirror?)));
     }
     Ok(Some(Value::Object(Some(arr))))
 }
@@ -4019,7 +4158,7 @@ fn get_private_key(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
         }
     };
     let pk = make_private_key_mirror(ctx, &key_der, id, &alias);
-    Ok(Some(Value::Object(Some(pk))))
+    Ok(Some(Value::Object(Some(pk?))))
 }
 
 fn get_server_aliases(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -4087,7 +4226,7 @@ fn do_check_trusted(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     };
     let chain = read_chain_arg(ctx, &chain_val);
     if chain.is_empty() {
-        return Err(cert_exception("certificate chain is empty".into()));
+        return Err(cert_exception(ctx, "certificate chain is empty".into()));
     }
 
     let (trust, hit) = {
@@ -4116,7 +4255,7 @@ fn do_check_trusted(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
 
     match validate_chain(&chain, &trust) {
         Ok(()) => Ok(None),
-        Err(e) => Err(cert_exception(format!("CertificateException: {}", e))),
+        Err(e) => Err(cert_exception(ctx, e.to_string())),
     }
 }
 
@@ -4142,7 +4281,7 @@ fn get_accepted_issuers(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     let arr = ctx.new_ref_array(cls_id, ders.len());
     for (i, der) in ders.iter().enumerate() {
         let mirror = make_x509_mirror(ctx, "trust-anchor", der);
-        ctx.set_array_element(arr, i, Value::Object(Some(mirror)));
+        ctx.set_array_element(arr, i, Value::Object(Some(mirror?)));
     }
     Ok(Some(Value::Object(Some(arr))))
 }
@@ -4157,7 +4296,7 @@ fn pkix_engine_validate(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     let _this = this_arg(args)?;
     let chain_val = match args.get(1) {
         Some(v) => v.clone(),
-        None => return Err(cert_exception("null chain".into())),
+        None => return Err(cert_exception(ctx, "null chain".into())),
     };
     let chain = read_chain_arg(ctx, &chain_val);
     let trust = build_trust_manager_state(0);
@@ -4171,7 +4310,11 @@ fn pkix_engine_validate(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
             };
             Ok(Some(Value::Object(Some(chain_arr))))
         }
-        Err(e) => Err(cert_exception(format!("CertPathValidatorException: {}", e))),
+        Err(e) => Err(cert_exception_of(
+            ctx,
+            "java/security/cert/CertPathValidatorException",
+            e.to_string(),
+        )),
     }
 }
 
@@ -4220,7 +4363,7 @@ fn kmf_engine_get_key_managers(ctx: &mut dyn NativeContext, args: &[Value]) -> M
         .ensure_class_initialized("javax/net/ssl/KeyManager")
         .unwrap_or(cratonvm_types::ClassId::new(0));
     let arr = ctx.new_ref_array(cls_id, 1);
-    let km = alloc_concurrent_synthetic(ctx, FQN_SUN_X509_KM, 2);
+    let km = try_alloc_concurrent_synthetic(ctx, FQN_SUN_X509_KM, 2)?;
     set_km_id(ctx, km, id);
     ctx.set_array_element(arr, 0, Value::Object(Some(km)));
     Ok(Some(Value::Object(Some(arr))))
@@ -4262,7 +4405,7 @@ fn tmf_engine_get_trust_managers(ctx: &mut dyn NativeContext, args: &[Value]) ->
         .ensure_class_initialized("javax/net/ssl/TrustManager")
         .unwrap_or(cratonvm_types::ClassId::new(0));
     let arr = ctx.new_ref_array(cls_id, 1);
-    let tm = alloc_concurrent_synthetic(ctx, FQN_X509_TM, 2);
+    let tm = try_alloc_concurrent_synthetic(ctx, FQN_X509_TM, 2)?;
     set_tm_id(ctx, tm, id);
     if crate::nbflags().dbg_tls_auth_ok {
         eprintln!(

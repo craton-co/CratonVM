@@ -5,7 +5,7 @@ immediates, addressing, clobbers, flags, fixed registers, constraints, cost and
 encoding — plus a matcher over it and tests generated from it.
 
 **Why this exists.** The C2 review
-(`docs/feature-designs/c2/deep-research-vm-c2.md`, "Implement instruction selection,
+("Implement instruction selection,
 scheduling, and register allocation") has a P0 lane:
 
 > Create declarative instruction patterns — describe operation, types,
@@ -243,7 +243,7 @@ land in either order; each makes the other cheaper.
 One thing to do *before* wave 1, and it is not a code change to `x64.rs`'s
 emitters:
 
-1. ~~Declare the module.~~ **Done 2026-08-01** — `pub mod isel;` is at
+1. ~~Declare the module.~~ **Done** — `pub mod isel;` is at
    `x64.rs:136`, in the shape given under [Wiring](#wiring) below. Its 68 tests
    run and pass.
 2. Decide whether `select` or `encode_named` is the call-site API. The
@@ -254,7 +254,7 @@ emitters:
 
 ## Wiring
 
-**Landed 2026-08-01.** `jit/src/x64.rs:136` carries the line below, immediately
+**Landed.** `jit/src/x64.rs:136` carries the line below, immediately
 after the `disp` re-export and before the `// SIMD loop analysis and
 vectorization` banner. Kept here because the rationale under it is still the
 reason the module is `pub mod` and not `mod` + glob:

@@ -7,7 +7,7 @@ use cratonvm_native_api::{NativeContext, NativeKind, NativeMethodRegistry};
 use cratonvm_types::error::{LinkageError, MethodCallFailed, MethodCallResult, RuntimeError};
 use cratonvm_types::{ObjectRef, Value};
 
-use crate::{alloc_concurrent_synthetic, obj_arg, platform_lib_name};
+use crate::{try_alloc_concurrent_synthetic, obj_arg, platform_lib_name};
 
 // ---------------------------------------------------------------------------
 // System.exit / Runtime.exit pre-termination hook.
@@ -107,6 +107,49 @@ pub fn set_pre_exit_hook(hook: PreExitHook) {
 fn invoke_pre_exit_hook(code: i32) {
     if let Some(hook) = PRE_EXIT_HOOK.get() {
         hook(code);
+    }
+}
+
+/// W7-90: the read-side slot-map sweep's **exit-path** trigger.
+///
+/// The launcher sweeps immediately after `main(String[])` returns, which is the
+/// point in the process with the most classes loaded. Nothing on that path is
+/// reached when the application terminates itself — and the fixtures this
+/// instrument is aimed at (SbRunner, Surefire, every Spring Boot app) end in
+/// `System.exit`, `Runtime.exit` or `Runtime.halt`. A sweep wired only to the
+/// return path would report nothing on exactly the runs that matter, which is
+/// the same "detector that never runs" shape W7-69 §7.2 filed and this lane is
+/// closing. All three natives call this immediately before
+/// `std::process::exit`, after their soft-return escape hatches, so a
+/// soft-returned exit does not consume the census the launcher would print
+/// later.
+///
+/// `pub(crate)` since 2026-08-12, and the reason is the third exit door.
+/// `std::process::exit` has **seven** call sites in this crate, not three: four
+/// triples on `org/apache/maven/surefire/booter/ForkedBooter` are registered
+/// from `register_essential_natives_with_shims` — LIVE in **both** modes — onto
+/// three bodies in `test_frameworks.rs` that each terminate on their own and
+/// never reach `native_system_exit`. Registration is the gate, so real
+/// `ForkedBooter` bytecode never runs: on a Surefire fork the launcher's
+/// post-`main` line is skipped **and** these three natives are skipped, and the
+/// sweep printed nothing at all on precisely the corpus this trigger was
+/// written for. Those three bodies call this helper rather than open-coding a
+/// fourth gate — one gated block with no `else`, one place to read. See
+/// W7-90-slot-map-sweep-caller.md §2.2.1.
+///
+/// Gated with **no `else`** and observation-only: the report is printed by the
+/// sweep and dropped here. With the flag off it is one `OnceLock` load and a
+/// branch, on a path that runs once per process.
+///
+/// One limit, stated rather than hidden: the per-slot rows go through
+/// `tracing::warn!` and `std::process::exit` does not unwind or flush a
+/// subscriber, so a hard exit can print the stderr summary and lose the rows.
+/// The fix is not a second emitter — two detectors on one primitive drift and
+/// then disagree — it is to prefer the launcher's post-`main` trigger when a
+/// workload can be made to return.
+pub(crate) fn sweep_declared_slot_maps_before_exit(ctx: &dyn NativeContext, trigger: &str) {
+    if cratonvm_native_api::layout_alias::enabled() {
+        let _ = cratonvm_native_api::read_alias::sweep_declared_slot_maps_at(ctx, trigger);
     }
 }
 
@@ -880,6 +923,85 @@ pub(crate) fn native_thread_get_state(
     Ok(Some(Value::Object(None)))
 }
 
+/// The canonical constant that `class_name`'s own static field `name` holds,
+/// or `None` when the loaded class does not declare it / has not published it.
+///
+/// A native that answers an enum constant must hand back **the object the
+/// class's own `<clinit>` stored**, never a fresh allocation. Enum identity is
+/// the whole contract: `==` comparison, the `tableswitch` an enum `switch`
+/// compiles to, `EnumSet`/`EnumMap`'s ordinal indexing and `Enum.compareTo` all
+/// assume exactly one instance per constant. A minting native satisfies every
+/// null-check and every `name()`/`ordinal()` check while breaking all of them —
+/// see W7-93 §"Second cause".
+///
+/// `None` is the honest answer for a fabricated synthetic-JDK stand-in, which
+/// has no static field to read; callers fall back to their own construction
+/// there. `ensure_class_initialized` can itself fabricate rather than fail (it
+/// returns `Ok` for a class it invented), so the static-field lookup — not the
+/// `Result` — is what decides whether a real class answered.
+pub(crate) fn canonical_enum_constant(
+    ctx: &mut dyn NativeContext,
+    class_name: &str,
+    name: &str,
+) -> Option<Value> {
+    let cid = ctx.ensure_class_initialized(class_name).ok()?;
+    let idx = ctx.static_field_index_by_name(cid, name)?;
+    match ctx.get_static_field(cid, idx) {
+        v @ Value::Object(Some(_)) => Some(v),
+        _ => None,
+    }
+}
+
+/// A fresh array holding `class_name`'s canonical enum constants in ordinal
+/// order — what the real `values()` bytecode (`$VALUES.clone()`) returns.
+///
+/// **Ask the class, never a hard-coded list.** A javac-generated enum declares
+/// one static field of its OWN type per constant in source order, which is
+/// ordinal order; the synthetic `$VALUES` has the ARRAY descriptor and so
+/// filters itself out. That is the same derivation
+/// `stack_walker::option_constant_names` uses, and it is what keeps this
+/// version-proof when a JDK adds a constant.
+///
+/// Returns `None` — so the caller keeps its existing behaviour — unless the
+/// class declares at least one constant AND every one of them reads back
+/// non-null, because a partially initialised class must not be turned into an
+/// array with null holes (`ImmutableCollections$Set12.<init>` NPEs on one).
+///
+/// GC-SAFETY: `new_ref_array` is the only allocation, and it happens before the
+/// array reference is live; `get_static_field` and `set_array_element` do not
+/// allocate, so nothing can move underneath the fill loop. Each element is read
+/// out of its static — a GC root — rather than cached from the scan above.
+pub(crate) fn canonical_enum_values(
+    ctx: &mut dyn NativeContext,
+    class_name: &str,
+) -> Option<ObjectRef> {
+    let cid = ctx.ensure_class_initialized(class_name).ok()?;
+    let self_descriptor = format!("L{class_name};");
+    let names: Vec<String> = ctx
+        .declared_fields(cid)
+        .into_iter()
+        .filter(|f| f.is_static && f.descriptor == self_descriptor)
+        .map(|f| f.name)
+        .collect();
+    if names.is_empty() {
+        return None;
+    }
+    let mut slots = Vec::with_capacity(names.len());
+    for name in &names {
+        let idx = ctx.static_field_index_by_name(cid, name)?;
+        if !matches!(ctx.get_static_field(cid, idx), Value::Object(Some(_))) {
+            return None;
+        }
+        slots.push(idx);
+    }
+    let arr = ctx.new_ref_array(cid, slots.len());
+    for (i, idx) in slots.into_iter().enumerate() {
+        let published = ctx.get_static_field(cid, idx);
+        ctx.set_array_element(arr, i, published);
+    }
+    Some(arr)
+}
+
 pub(crate) fn native_thread_is_alive(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -900,6 +1022,40 @@ pub(crate) fn native_thread_start0(
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(None),
     };
+    // JVMS / `java.lang.Thread`: `start()` on a thread that has already been
+    // started must throw `IllegalThreadStateException`. We did not, and the
+    // consequence was worse than a missing exception — MEASURED 2026-08-12, a
+    // second `start()` RE-RAN the body and spawned a second OS thread for a
+    // retired `Runnable`.
+    //
+    // The real `Thread.start()` branches on `holder.threadStatus`, and that
+    // field is INERT on this VM: measured NEW=0 / terminated=0 here against
+    // HotSpot's NEW=0 / terminated=2. A guard reading it would never fire.
+    // `native_thread_get_state` says the same in its own doc comment and
+    // computes from the registry instead, which retains dead entries
+    // (`mark_dead` only flips `alive`), so present-but-not-alive is
+    // TERMINATED and missing is NEW.
+    //
+    // Two readers because only one lookup route is aliasing-proof: a real-JDK
+    // mirror resolves through the process-unique `Thread.tid` index, while a
+    // fabricated mirror has no `tid` field and would fall back to an unguarded
+    // pointer walk, so it reads the on-mirror marker `vm_exec::thread_start`
+    // writes instead. This native is the convergence point of all four
+    // registrations and of the container route, including the `--jdk-only`
+    // case where the real `start()` bytecode runs; a refusal here does not
+    // leak a container registration, because that bytecode's `finally` calls
+    // `container.onExit(this)`. See W7-27-thread-exit-java-cleanup.md §13.
+    let already_started = if crate::has_real_jdk_thread_layout(ctx, this) {
+        ctx.thread_run_state(this) != 0
+    } else {
+        ctx.object_num_fields(this) > 2 && matches!(ctx.get_field(this, 2), Value::Long(_))
+    };
+    if already_started {
+        return Err(RuntimeError::IllegalThreadStateException {
+            message: "Thread.start: this thread has already been started".to_string(),
+        }
+        .into());
+    }
     // Round-7 CRIT fix #3: snapshot the parent's `InheritableThreadLocal`
     // entries and queue them against the child's Java Thread identity
     // hash. The child's first `ThreadLocal.get/set/remove` will drain
@@ -1321,6 +1477,7 @@ pub(crate) fn native_system_exit(ctx: &mut dyn NativeContext, args: &[Value]) ->
     // otherwise be invisible. Log to stderr directly since tracing may not be
     // flushed before process::exit.
     eprintln!("[cratonvm] System.exit({code}) called вЂ” process terminating");
+    sweep_declared_slot_maps_before_exit(&*ctx, "System.exit");
     invoke_pre_exit_hook(code);
     std::process::exit(code);
 }
@@ -1445,60 +1602,241 @@ pub(crate) fn register_runtime_natives(registry: &mut NativeMethodRegistry) {
     );
 
     // Runtime.loadLibrary(String) / Runtime.load(String) вЂ” JNI library loading
-    registry.register(
-        "java/lang/Runtime",
-        "loadLibrary0",
-        "(Ljava/lang/Class;Ljava/lang/String;)V",
-        |ctx, args| {
-            let name_obj = match args.get(1) {
-                Some(Value::Object(Some(o))) => *o,
-                _ => return Ok(None),
-            };
-            let name = ctx.read_string(name_obj).unwrap_or_default();
-            crate::security_manager::check_host_native_access_or_throw(ctx, &name)?;
-            // Map bare library name to platform-specific filename.
-            // resolve_library_path() in NativeContextImpl will search java.library.path.
-            load_library_or_throw(ctx, &name, LibrarySpelling::BareName)
-        },
-    );
-    registry.register(
-        "java/lang/Runtime",
-        "load0",
-        "(Ljava/lang/Class;Ljava/lang/String;)V",
-        |ctx, args| {
-            let path_obj = match args.get(1) {
-                Some(Value::Object(Some(o))) => *o,
-                _ => return Ok(None),
-            };
-            let path = ctx.read_string(path_obj).unwrap_or_default();
-            crate::security_manager::check_host_native_access_or_throw(ctx, &path)?;
-            load_library_or_throw(ctx, &path, LibrarySpelling::AbsolutePath)
-        },
-    );
+    //
+    // JDK-ONLY-WAVE2 (loader-scoped `loadedLibraryNames`): these four triples
+    // are registered TWICE over, once per compatibility mode, and each triple
+    // exactly once per registry — not re-registered on top of itself, which
+    // would leave a self-shadow row in the duplicate-registration census for a
+    // change that shadows nothing.
+    //
+    // The mode is readable here because `vm_init.rs` calls
+    // `set_compatibility_mode` BEFORE the `register_*` population pass, and
+    // says so structurally (the call sits above the `#[cfg(feature =
+    // "synthetic-jdk")]` fork so there is no reachable point between `new()`
+    // and the first `register_*` where the mode is unset). Registration is also
+    // where this campaign's own precedent puts a mode decision — §1.4's lever
+    // is registration, not dispatch. A native BODY cannot ask: `NativeCallback`
+    // is a bare `fn` pointer, so it captures nothing, and `NativeContext`
+    // exposes no policy accessor (deliberately — `CompatibilityMode` is a
+    // per-registry FIELD, not a process global).
+    //
+    // The `else` arm keeps `LoaderScoping::Off`, which makes every success arm
+    // of `load_library_or_throw` return the `Ok(None)` it returns today — the
+    // cross-loader `loadedLibraryNames` rule stays strict-only. What it no
+    // longer keeps is the `args.get(1)` read on the two `Runtime` sites: since
+    // 2026-08-12 both arms decode the argument vector through
+    // `runtime_load_args`. See that function for the measurement.
+    if registry.compatibility_mode().is_jdk_only() {
+        registry.register(
+            "java/lang/Runtime",
+            "loadLibrary0",
+            "(Ljava/lang/Class;Ljava/lang/String;)V",
+            |ctx, args| {
+                let (from_class, name) = runtime_load_args(&*ctx, args);
+                crate::security_manager::check_host_native_access_or_throw(ctx, &name)?;
+                // Map bare library name to platform-specific filename.
+                // resolve_library_path() in NativeContextImpl will search java.library.path.
+                load_library_or_throw(
+                    ctx,
+                    &name,
+                    LibrarySpelling::BareName,
+                    from_class,
+                    LoaderScoping::On,
+                )
+            },
+        );
+        registry.register(
+            "java/lang/Runtime",
+            "load0",
+            "(Ljava/lang/Class;Ljava/lang/String;)V",
+            |ctx, args| {
+                let (from_class, path) = runtime_load_args(&*ctx, args);
+                crate::security_manager::check_host_native_access_or_throw(ctx, &path)?;
+                load_library_or_throw(
+                    ctx,
+                    &path,
+                    LibrarySpelling::AbsolutePath,
+                    from_class,
+                    LoaderScoping::On,
+                )
+            },
+        );
+        // System.loadLibrary / System.load вЂ” delegate to the same machinery.
+        // Both are STATIC and `@CallerSensitive`: the real bytecode would pass
+        // `Reflection.getCallerClass()` down to `Runtime.load*0`, but the
+        // interception is above that, so there is no `fromClass` argument here
+        // and the caller is recovered from the frame stack instead.
+        registry.register(
+            "java/lang/System",
+            "loadLibrary",
+            "(Ljava/lang/String;)V",
+            |ctx, args| {
+                let name_obj = obj_arg(args, 0)?;
+                let name = ctx.read_string(name_obj).unwrap_or_default();
+                crate::security_manager::check_host_native_access_or_throw(ctx, &name)?;
+                load_library_or_throw(ctx, &name, LibrarySpelling::BareName, None, LoaderScoping::On)
+            },
+        );
+        registry.register(
+            "java/lang/System",
+            "load",
+            "(Ljava/lang/String;)V",
+            |ctx, args| {
+                let path_obj = obj_arg(args, 0)?;
+                let path = ctx.read_string(path_obj).unwrap_or_default();
+                crate::security_manager::check_host_native_access_or_throw(ctx, &path)?;
+                load_library_or_throw(
+                    ctx,
+                    &path,
+                    LibrarySpelling::AbsolutePath,
+                    None,
+                    LoaderScoping::On,
+                )
+            },
+        );
+    } else {
+        registry.register(
+            "java/lang/Runtime",
+            "loadLibrary0",
+            "(Ljava/lang/Class;Ljava/lang/String;)V",
+            |ctx, args| {
+                // `args[2]`, not `args[1]` — instance method, so `args[0]` is
+                // the `Runtime` receiver and `args[1]` the `fromClass` mirror.
+                // `_from_class` is discarded rather than threaded because
+                // `LoaderScoping::Off` makes `loaded_by` early-return before it
+                // is read; keeping the discard makes the mode difference one
+                // axis wide.
+                let (_from_class, name) = runtime_load_args(&*ctx, args);
+                crate::security_manager::check_host_native_access_or_throw(ctx, &name)?;
+                // Map bare library name to platform-specific filename.
+                // resolve_library_path() in NativeContextImpl will search java.library.path.
+                load_library_or_throw(
+                    ctx,
+                    &name,
+                    LibrarySpelling::BareName,
+                    None,
+                    LoaderScoping::Off,
+                )
+            },
+        );
+        registry.register(
+            "java/lang/Runtime",
+            "load0",
+            "(Ljava/lang/Class;Ljava/lang/String;)V",
+            |ctx, args| {
+                // `args[2]` — see the `loadLibrary0` note directly above.
+                let (_from_class, path) = runtime_load_args(&*ctx, args);
+                crate::security_manager::check_host_native_access_or_throw(ctx, &path)?;
+                load_library_or_throw(
+                    ctx,
+                    &path,
+                    LibrarySpelling::AbsolutePath,
+                    None,
+                    LoaderScoping::Off,
+                )
+            },
+        );
 
-    // System.loadLibrary / System.load вЂ” delegate to the same machinery
-    registry.register(
-        "java/lang/System",
-        "loadLibrary",
-        "(Ljava/lang/String;)V",
-        |ctx, args| {
-            let name_obj = obj_arg(args, 0)?;
-            let name = ctx.read_string(name_obj).unwrap_or_default();
-            crate::security_manager::check_host_native_access_or_throw(ctx, &name)?;
-            load_library_or_throw(ctx, &name, LibrarySpelling::BareName)
-        },
-    );
-    registry.register(
-        "java/lang/System",
-        "load",
-        "(Ljava/lang/String;)V",
-        |ctx, args| {
-            let path_obj = obj_arg(args, 0)?;
-            let path = ctx.read_string(path_obj).unwrap_or_default();
-            crate::security_manager::check_host_native_access_or_throw(ctx, &path)?;
-            load_library_or_throw(ctx, &path, LibrarySpelling::AbsolutePath)
-        },
-    );
+        // System.loadLibrary / System.load вЂ” delegate to the same machinery
+        registry.register(
+            "java/lang/System",
+            "loadLibrary",
+            "(Ljava/lang/String;)V",
+            |ctx, args| {
+                let name_obj = obj_arg(args, 0)?;
+                let name = ctx.read_string(name_obj).unwrap_or_default();
+                crate::security_manager::check_host_native_access_or_throw(ctx, &name)?;
+                load_library_or_throw(
+                    ctx,
+                    &name,
+                    LibrarySpelling::BareName,
+                    None,
+                    LoaderScoping::Off,
+                )
+            },
+        );
+        registry.register(
+            "java/lang/System",
+            "load",
+            "(Ljava/lang/String;)V",
+            |ctx, args| {
+                let path_obj = obj_arg(args, 0)?;
+                let path = ctx.read_string(path_obj).unwrap_or_default();
+                crate::security_manager::check_host_native_access_or_throw(ctx, &path)?;
+                load_library_or_throw(
+                    ctx,
+                    &path,
+                    LibrarySpelling::AbsolutePath,
+                    None,
+                    LoaderScoping::Off,
+                )
+            },
+        );
+    }
+}
+
+/// Decode `Runtime.load0(Class,String)` / `Runtime.loadLibrary0(Class,String)`
+/// into the JDK's own `(fromClass, name)` pair.
+///
+/// **Both are INSTANCE methods.** `javap -p java.lang.Runtime` on JDK 25.0.3:
+///
+/// ```text
+///   public void load(java.lang.String);
+///   void load0(java.lang.Class<?>, java.lang.String);
+///   public void loadLibrary(java.lang.String);
+///   void loadLibrary0(java.lang.Class<?>, java.lang.String);
+/// ```
+///
+/// so a native body sees `args[0]` = the `Runtime` receiver, `args[1]` = the
+/// `fromClass` mirror `Runtime.loadLibrary(String)` resolved with
+/// `Reflection.getCallerClass()`, and `args[2]` = the library name. That
+/// convention is stated all over this crate for the same registry — the
+/// `Runtime.addShutdownHook` registration forty lines above says "args[0] = the
+/// `Runtime` receiver, args[1] = the hook `Thread`", and `vm_exec.rs`'s native
+/// argument marshalling describes its inline buffer as "receiver plus a couple
+/// of operands".
+///
+/// The pre-existing bodies read `args.get(1)` as the NAME. That is the
+/// `fromClass` mirror, and `read_string` of a non-`String` object is `None`
+/// (`vm_object.rs::read_string_non_string_object`), so the name arrives empty
+/// and `Runtime.getRuntime().loadLibrary(x)` fails for every `x` with
+/// `no  in java.library.path` — a wrong answer with a right *shape*, which is
+/// why no vector caught it: the regression suite reaches library loading only
+/// through `System.load`/`System.loadLibrary`
+/// (`RJdkJni.java:189-217`, `RJdkFailure.java:257`), never through `Runtime`.
+///
+/// **The index was not deduced, it was measured** — 2026-08-12, one binary at
+/// dev `87809196b`, HotSpot 25.0.3 beside it, `Runtime.getRuntime()
+/// .loadLibrary(x)` for a name that cannot exist and for `"net"` which does:
+///
+/// ```text
+/// HotSpot          no cratonvm_probe_zzz in java.library.path: ...   /  net LOADED
+/// --jdk-only       no cratonvm_probe_zzz in java.library.path       /  net LOADED
+/// --real-jdk       no  in java.library.path                         /  net "no  in java.library.path"
+/// ```
+///
+/// The strict arm reads `args[2]` and the name arrives; the `Compatible` arm
+/// read `args[1]` and the name arrived EMPTY, with the double space that is the
+/// signature of the bug, for every argument including one HotSpot loads. That
+/// is the discriminator: a probe asserting only "it threw" passes against
+/// either index, because the wrong index throws too.
+///
+/// Corrected on the strict arm 2026-08-11 and on the `Compatible` arm
+/// 2026-08-12 — a `loadLibrary` that fails for EVERY argument is a
+/// HotSpot-parity bug rather than a compatibility-layer substitution, which is
+/// the one thing the `Compatible` freeze admits. Blast radius and the callers
+/// that could depend on the always-failing behaviour are in
+/// W7-79-loadlibrary-compatible-arm.md.
+fn runtime_load_args(ctx: &dyn NativeContext, args: &[Value]) -> (Option<ObjectRef>, String) {
+    let from_class = match args.get(1) {
+        Some(Value::Object(Some(o))) => Some(*o),
+        _ => None,
+    };
+    let name = match args.get(2) {
+        Some(Value::Object(Some(o))) => ctx.read_string(*o).unwrap_or_default(),
+        _ => String::new(),
+    };
+    (from_class, name)
 }
 
 /// Which of the two JDK spellings the caller used. `System.loadLibrary("zip")`
@@ -1510,6 +1848,211 @@ pub(crate) fn register_runtime_natives(registry: &mut NativeMethodRegistry) {
 enum LibrarySpelling {
     BareName,
     AbsolutePath,
+}
+
+// ---------------------------------------------------------------------------
+// Per-class-loader `loadedLibraryNames`.
+//
+// THE JDK RULE, from `jdk.internal.loader.NativeLibraries` in JDK 25.0.3's
+// `lib/src.zip` (Eclipse Adoptium build; the same file `javap -p
+// jdk.internal.loader.NativeLibraries` describes structurally). The class doc
+// on `newInstance(ClassLoader)` states it as a numbered restriction:
+//
+//     3. Restriction on a native library that can only be loaded by one class
+//        loader. Each class loader manages its own set of native libraries.
+//        The same JNI native library cannot be loaded into more than one class
+//        loader.
+//
+// and `loadLibrary(Class,String,boolean)` enforces it in two steps, in this
+// order, under `acquireNativeLibraryLock(name)`:
+//
+//     NativeLibrary cached = libraries.get(name);       // THIS loader's map
+//     if (cached != null) return cached;                //  -> silent success
+//     if (loadedLibraryNames.contains(name)) {          // ANY loader's names
+//         throw new UnsatisfiedLinkError("Native Library " + name +
+//                 " already loaded in another classloader");
+//     }
+//
+// The two structures are not the same shape: `libraries` is an INSTANCE field
+// of a `NativeLibraries` that `ClassLoader` holds one of per loader
+// (`private final NativeLibraries libraries = NativeLibraries.newInstance(this)`,
+// reached by `ClassLoader.nativeLibrariesFor(loader)`, with
+// `BootLoader.getNativeLibraries()` standing in for the null loader), while
+// `loadedLibraryNames` is a static `Set<String>`. A same-loader repeat is a
+// success that returns the SAME library; a cross-loader repeat is an error.
+// One process-wide set of names cannot tell those apart, because it answers
+// with a string key and no loader identity — which is precisely the
+// bind-by-NAME species this repository has now paid for five separate times
+// (the `docs/known-issues/jdk-only/README.md` loader-identity cluster).
+//
+// WHY THIS HAS TO LIVE HERE AT ALL. On HotSpot the rule is enforced by
+// `ClassLoader.loadLibrary` bytecode, which is where W6-6 correctly says the
+// `NativeLibraries.load` native must NOT duplicate it. But CratonVM intercepts
+// the whole road above that: `System.load`, `System.loadLibrary`,
+// `Runtime.load0` and `Runtime.loadLibrary0` are all registered natives, so
+// `ClassLoader.loadLibrary` -> `NativeLibraries.loadLibrary` never runs for
+// them and the JDK's own bookkeeping is never consulted OR populated. A VM that
+// replaces the bytecode that enforced a rule inherits the rule.
+//
+// SHAPE. One `VmScoped` table, `loader id -> keys`, and both JDK queries are
+// answered from it: "does THIS loader hold it" is a row lookup, "does ANY
+// loader hold it" is the union over rows. Not two structures, and not a process
+// global — jdk-only-mode.md §2 forbids process globals for this feature's
+// state, and this repo has already shipped the failure that protects against
+// (native caches leaking across two `SharedVm`s in one test process; see
+// `cratonvm_native_api::vm_scoped`). Keyed by `vm_identity` and torn down from
+// `forget_vm_system_singletons`, like `SYSTEM_ENV`/`SYSTEM_PROPS` below.
+//
+// No `ObjectRef` is stored — a loader id is an `i32` and a key is a `String` —
+// so unlike those two this table needs no GC root scan and no post-collection
+// remap. Storing the loader MIRROR would have needed both, and would have
+// keyed loader identity on an object whose address moves.
+// ---------------------------------------------------------------------------
+
+/// Whether the per-loader rule above is in force at this registration.
+///
+/// `Off` on every `Compatible` registration: contract §5/§10 requires
+/// `Compatible` to stay byte-for-byte, and this rule can only ever turn a
+/// success into an `UnsatisfiedLinkError`, which is a behaviour change for
+/// every caller written around a `catch (UnsatisfiedLinkError)` fallback.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LoaderScoping {
+    Off,
+    On,
+}
+
+/// `loader id -> the library keys that loader has been told it holds`, one row
+/// per VM. `BTreeMap`/`BTreeSet` rather than hash maps because the rows are
+/// tiny (a JVM loads a handful of JNI libraries) and a deterministic iteration
+/// order makes the "which loader owns it" answer reproducible when a key has
+/// somehow been recorded twice.
+static LOADED_LIBRARIES: VmScoped<
+    std::collections::BTreeMap<i32, std::collections::BTreeSet<String>>,
+> = VmScoped::new();
+
+/// Claim `key` for `loader`, or report the loader that already holds it.
+///
+/// ONE table acquisition, deliberately: `contains` followed by a separate
+/// `insert` lets two threads loading the same library concurrently both see
+/// "unclaimed" and both claim it, and HotSpot closes exactly that window by
+/// running its `libraries.get` / `loadedLibraryNames.contains` / put sequence
+/// inside `acquireNativeLibraryLock(name)`.
+///
+/// `Some(owner)` means the key was already held — by `loader` itself (a
+/// same-loader repeat, which the JDK answers with the cached library) or by
+/// another loader (the `UnsatisfiedLinkError`). `None` means it is now
+/// `loader`'s.
+///
+/// The closure touches only this map: no allocation, no Java dispatch, no
+/// second `VmScoped` lock, per the lock discipline in
+/// `cratonvm_native_api::vm_scoped`.
+fn claim_library(vm_identity: usize, loader: i32, key: &str) -> Option<i32> {
+    LOADED_LIBRARIES.with(vm_identity, |rows| {
+        if let Some((owner, _)) = rows.iter().find(|(_, keys)| keys.contains(key)) {
+            return Some(*owner);
+        }
+        rows.entry(loader).or_default().insert(key.to_string());
+        None
+    })
+}
+
+/// Which class loader is asking for this library, as a loader IDENTITY —
+/// `NativeContext::loader_id_of_class`'s `0` bootstrap / `1` platform /
+/// `2` application / `3+` user-defined — never a loader name. Two loaders can
+/// share a name; that is the whole species this record belongs to.
+///
+/// Two sources, in the JDK's own order of authority:
+///
+/// 1. `from_class`, when the entry point had one. `Runtime.load0` and
+///    `Runtime.loadLibrary0` are handed the caller by `Reflection
+///    .getCallerClass()` in real `Runtime` bytecode, and `ClassLoader
+///    .loadLibrary(Class,String)` derives the loader from exactly that:
+///    `ClassLoader loader = (fromClass == null) ? null : fromClass.getClassLoader()`.
+///    Taking the argument means agreeing with the JDK by construction.
+///
+/// 2. Otherwise the frame stack. `System.load`/`System.loadLibrary` are static
+///    and `@CallerSensitive`, and the interception sits above the point where
+///    the JDK would have resolved the caller, so the caller has to be recovered
+///    the same way `latest_user_defined_loader_class` and
+///    `class_for_name_one_arg_caller_loader` do: `frame_class_ids()`, which
+///    hands back each live frame's already-resolved `ClassId` innermost first.
+///    NOT a name re-resolution of a captured stack trace — that collapses two
+///    same-named classes from different loaders onto whichever the global class
+///    table saw first, which would answer this exact question with the wrong
+///    loader.
+///
+///    The `java/lang/System` and `java/lang/Runtime` frames skipped here are
+///    the intercepted native's own frame and the `Runtime.loadLibrary` ->
+///    `loadLibrary0` hop; they are the frames `Reflection.getCallerClass()`
+///    skips for the same reason, both methods being `@CallerSensitive`.
+///
+/// `None` is the honest answer when neither source names a class — a library
+/// load with no Java frame under it (an embedder or a JNI `JNI_OnLoad`
+/// re-entry). See `loaded_by` for what is done with it, which is deliberately
+/// nothing.
+fn requesting_loader_id(ctx: &mut dyn NativeContext, from_class: Option<ObjectRef>) -> Option<i32> {
+    if let Some(mirror) = from_class {
+        if let Some(class_id) = ctx.class_id_from_mirror(mirror) {
+            return Some(ctx.loader_id_of_class(class_id));
+        }
+    }
+    for class_id in ctx.frame_class_ids() {
+        match ctx.class_name_arc_of_id(class_id).as_deref() {
+            Some("java/lang/System") | Some("java/lang/Runtime") => continue,
+            Some(_) => return Some(ctx.loader_id_of_class(class_id)),
+            None => return None,
+        }
+    }
+    None
+}
+
+/// The success return of `load_library_or_throw`, after the per-loader rule
+/// has had its say.
+///
+/// `key` is the library identity. HotSpot's is `file.getCanonicalPath()` for
+/// anything not statically linked into libjvm (`NativeLibraries.loadLibrary
+/// (Class,File)` sets `name = file.getCanonicalPath()` before handing it to the
+/// checks above), so on HotSpot `System.loadLibrary("zip")` and
+/// `System.load("<java.home>/bin/zip.dll")` collide. Here the key is the string
+/// the caller spelled. That is narrower, and NOT rounded up to a fabricated
+/// path: `NativeContext::load_native_library` returns a library-table INDEX,
+/// not the path it resolved, so a bare name that was found somewhere on
+/// `java.library.path` cannot be canonicalised back to a file without redoing
+/// the search — and a key invented by redoing it would not be the file that was
+/// actually opened. Named residual in
+/// W5-1-loadlibrary-allowlist-too-wide.md; two spellings of one file are
+/// two keys here.
+fn loaded_by(
+    ctx: &mut dyn NativeContext,
+    key: &str,
+    from_class: Option<ObjectRef>,
+    scoping: LoaderScoping,
+) -> MethodCallResult {
+    if scoping == LoaderScoping::Off {
+        return Ok(None);
+    }
+    // No caller, no claim. Recording this under a stand-in loader id would make
+    // the NEXT load — the one from the real owner — throw, manufacturing the
+    // very error this models; throwing here would manufacture it immediately.
+    // Both are fabrications, and a missed error is the one that leaves a
+    // caller's own `catch (UnsatisfiedLinkError)` fallback reachable.
+    let Some(loader) = requesting_loader_id(ctx, from_class) else {
+        return Ok(None);
+    };
+    match claim_library(ctx.vm_identity(), loader, key) {
+        // Freshly claimed, or a same-loader repeat: the JDK returns the cached
+        // `NativeLibrary` for the repeat, which is a plain success here since
+        // nothing above consumes the handle on this road.
+        None => Ok(None),
+        Some(owner) if owner == loader => Ok(None),
+        // Message reproduced verbatim from `NativeLibraries.loadLibrary`. The
+        // exception carries no other detail, so the text is the whole of what a
+        // caller — or a HotSpot-versus-CratonVM transcript diff — can see.
+        Some(_) => Err(RuntimeError::UnsatisfiedLinkError {
+            message: format!("Native Library {key} already loaded in another classloader"),
+        }
+        .into()),
+    }
 }
 
 /// The bare library names whose ENTIRE native surface this VM supplies from
@@ -1565,12 +2108,17 @@ enum LibrarySpelling {
 /// `net` probe (`RJdkJni.java:189-202`). This is a test-produced state, not a
 /// file-layout fact, so it holds identically on Linux.
 ///
-/// KNOWN RESIDUAL: the same dynamic rule applies to `net`/`nio`/`prefs`, and
-/// this list cannot model it — there is no class-loader-scoped
-/// `loadedLibraryNames` bookkeeping anywhere in this VM. A program that uses
-/// `java.net` and then calls `System.loadLibrary("net")` gets a silent success
-/// here where HotSpot throws. `net` stays on the list because the measured
-/// oracle needs it: `RJdkJni` never touches `java.net` before line 195.
+/// THE DYNAMIC RULE IS NO LONGER UNMODELLED, but this list is still not what
+/// models it. Under `LoaderScoping::On` (strict mode) [`loaded_by`] keeps the
+/// per-class-loader record HotSpot keeps, so a second load of the same library
+/// from a DIFFERENT loader now throws. What that record cannot see is a library
+/// the BOOT loader holds, because `jdk/internal/loader/BootLoader.loadLibrary`
+/// is registered as a no-op in `native-builtins/src/lib.rs` — the one event
+/// that would tell us `java.base` had taken `net`/`nio`/`prefs` for itself
+/// never reaches any bookkeeping. See [`record_boot_loader_library`], which is
+/// written and deliberately unarmed. `net` therefore stays on this list, and
+/// the measured oracle still needs it there: `RJdkJni` never touches
+/// `java.net` before line 195.
 pub(crate) fn is_vm_provided_jdk_library(name: &str) -> bool {
     // Ships as a real, separately-present shared object in the JDK 25 image on
     // every platform, and cold-loads on HotSpot.
@@ -1676,24 +2224,35 @@ fn jdk_image_ships_library(ctx: &dyn NativeContext, name: &str) -> bool {
 /// The load is still attempted first, so a library that really is on
 /// `java.library.path` still loads and `JNI_OnLoad` still runs. Only the failure
 /// path changed, and only for names outside [`is_vm_provided_jdk_library`].
+///
+/// `scoping` selects whether the per-class-loader rule above [`LoaderScoping`]
+/// applies. All three SUCCESS arms below route through [`loaded_by`], not
+/// through a bare `Ok(None)`: on HotSpot the "already loaded in another
+/// classloader" check sits above the load attempt, so it governs a JDK-image
+/// library reported loaded from the allowlist exactly as it governs a
+/// third-party `.so` this VM really opened. Two web applications with their own
+/// loaders probing one `tcnative` is the shape that reaches this first, and it
+/// needs no boot-loader bookkeeping to fire.
 fn load_library_or_throw(
     ctx: &mut dyn NativeContext,
     requested: &str,
     spelling: LibrarySpelling,
+    from_class: Option<ObjectRef>,
+    scoping: LoaderScoping,
 ) -> MethodCallResult {
     let target = match spelling {
         LibrarySpelling::BareName => platform_lib_name(requested),
         LibrarySpelling::AbsolutePath => requested.to_string(),
     };
     if ctx.load_native_library(&target).is_ok() {
-        return Ok(None);
+        return loaded_by(ctx, requested, from_class, scoping);
     }
     // A JDK-image library whose natives this VM already provides is not a
     // failure — see `is_vm_provided_jdk_library`. Only a bare name can name
     // one; `System.load("/some/path/libzip.so")` names a FILE, and a file that
     // is not there is an error however it is spelled.
     if spelling == LibrarySpelling::BareName && is_vm_provided_jdk_library(requested) {
-        return Ok(None);
+        return loaded_by(ctx, requested, from_class, scoping);
     }
     // Same reasoning, decided by measurement instead of by list: a library that
     // SHIPS IN THE JDK IMAGE is one HotSpot loads, so refusing it here would be
@@ -1701,7 +2260,7 @@ fn load_library_or_throw(
     // to fix. Restricted to the image directory on purpose -- a library the
     // user put on `java.library.path` that we failed to open is a real failure.
     if spelling == LibrarySpelling::BareName && jdk_image_ships_library(&*ctx, requested) {
-        return Ok(None);
+        return loaded_by(ctx, requested, from_class, scoping);
     }
     // NOT memoised as a failure: the JDK re-attempts the lookup on every call
     // (`RJdkFailure.java:269` asserts the second attempt throws too), and a
@@ -1718,7 +2277,11 @@ pub(crate) fn native_runtime_get_runtime(
 ) -> MethodCallResult {
     let class_id = match ctx.ensure_class_initialized("java/lang/Runtime") {
         Ok(id) => id,
-        Err(_) => ctx.ensure_synthetic_class("java/lang/Runtime", 8),
+        // Fallible since 2026-08-10 (JDK-only wave 2, step 3): `java.lang.Runtime`
+        // is in every image, so the `Ok` arm is what runs; handing back a
+        // fabricated `Runtime` on a broken one substitutes for `java.base`
+        // rather than reporting that it is missing.
+        Err(_) => crate::util_concurrent_ext::refused_class(ctx, "java/lang/Runtime", 8)?,
     };
     let obj = ctx.alloc_object(class_id, 0);
     Ok(Some(Value::Object(Some(obj))))
@@ -1743,18 +2306,58 @@ pub(crate) fn native_runtime_max_memory(
     Ok(Some(Value::Long(ctx.max_heap_bytes())))
 }
 
+/// `Runtime.totalMemory()` — bytes currently committed for the Java heap.
+///
+/// These two were hardcoded 64 MiB / 32 MiB and never moved: not on
+/// allocation, not across `Runtime.gc()`. That left the VM giving two different
+/// answers for one quantity — `maxMemory()` already returned the real `-Xmx`,
+/// and the JMX heap `MemoryUsage` already reported a real `used` from
+/// `heap_allocated_bytes()` — and any application that sizes a cache or buffer
+/// from the free heap got a constant. H2's `Utils.getMemoryUsed()` is
+/// `totalMemory() - freeMemory()`, so `TestLIRSMemoryConsumption` printed a
+/// memory delta of exactly 0 on every row where HotSpot prints real numbers.
+///
+/// `committed_heap_bytes` is a CAPACITY and must stay one — see
+/// `gc::vm_heap::VmHeap::committed_bytes` for why a value that moved on every
+/// collection would be a behavioural change for callers that gc until
+/// `totalMemory()` settles.
 pub(crate) fn native_runtime_total_memory(
-    _ctx: &mut dyn NativeContext,
+    ctx: &mut dyn NativeContext,
     _args: &[Value],
 ) -> MethodCallResult {
-    Ok(Some(Value::Long(64 * 1024 * 1024))) // 64 MB estimate
+    Ok(Some(Value::Long(runtime_committed_heap(ctx))))
 }
 
+/// `Runtime.freeMemory()` — committed minus used, both from the live heap.
+///
+/// Saturating: `heap_allocated_bytes` and `committed_heap_bytes` are sampled
+/// separately and without a lock, so a concurrent allocation can make used
+/// exceed the committed figure read a moment earlier. HotSpot never reports a
+/// negative free heap; report 0 rather than a wrapped `Long`.
 pub(crate) fn native_runtime_free_memory(
-    _ctx: &mut dyn NativeContext,
+    ctx: &mut dyn NativeContext,
     _args: &[Value],
 ) -> MethodCallResult {
-    Ok(Some(Value::Long(32 * 1024 * 1024))) // 32 MB estimate
+    let committed = runtime_committed_heap(ctx);
+    let used = ctx.heap_allocated_bytes() as i64;
+    Ok(Some(Value::Long(committed.saturating_sub(used).max(0))))
+}
+
+/// Committed heap for the `Runtime` accessors, clamped into `[used, -Xmx]`.
+///
+/// Two clamps, both for the same reason — a report that contradicts one of the
+/// VM's OWN other answers is worse than a coarse one:
+///
+/// * never below `used`, so `freeMemory()` cannot be 0 while the heap is
+///   plainly serving allocations (a collector that reports a fixed arena is
+///   already above `used`; the clamp is for the growable one, sampled mid-grow);
+/// * never above `maxMemory()`, which is the configured `-Xmx` and is the
+///   ceiling every caller compares against.
+fn runtime_committed_heap(ctx: &mut dyn NativeContext) -> i64 {
+    let used = ctx.heap_allocated_bytes() as i64;
+    let max = ctx.max_heap_bytes();
+    let committed = ctx.committed_heap_bytes() as i64;
+    committed.max(used).min(max.max(used))
 }
 
 /// The four real `java.lang.Runtime$Version` field values, parsed out of a
@@ -1972,7 +2575,7 @@ pub(crate) fn native_runtime_version(
     if let Some(cached) = runtime_version_cached(ctx) {
         return Ok(Some(Value::Object(Some(cached))));
     }
-    let version = alloc_concurrent_synthetic(ctx, "java/lang/Runtime$Version", 4);
+    let version = try_alloc_concurrent_synthetic(ctx, "java/lang/Runtime$Version", 4)?;
     let parts = runtime_version_parts(ctx);
     let pin = ctx.pin_native_root(version);
     let mut version = version;
@@ -2148,6 +2751,7 @@ pub(crate) fn native_runtime_exit(ctx: &mut dyn NativeContext, args: &[Value]) -
 
     // B6: Surface Runtime.exit calls so silent shutdowns are visible.
     eprintln!("[cratonvm] Runtime.exit({code}) called вЂ” process terminating");
+    sweep_declared_slot_maps_before_exit(&*ctx, "Runtime.exit");
     invoke_pre_exit_hook(code);
     std::process::exit(code);
 }
@@ -2161,7 +2765,7 @@ pub(crate) fn native_runtime_exit(ctx: &mut dyn NativeContext, args: &[Value]) -
 /// dump-on-exit) still fires — it is not a Java shutdown hook, and its own
 /// comment already claims to cover `Runtime.halt`.
 pub(crate) fn native_shutdown_halt0(
-    _ctx: &mut dyn NativeContext,
+    ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
     let code = match args.first() {
@@ -2183,6 +2787,7 @@ pub(crate) fn native_shutdown_halt0(
     // Plain ASCII dash on purpose: the neighbouring exit messages carry a
     // mojibake em-dash from an old encoding mishap and print as garbage.
     eprintln!("[cratonvm] Runtime.halt({code}) called - process terminating");
+    sweep_declared_slot_maps_before_exit(&*ctx, "Runtime.halt");
     invoke_pre_exit_hook(code);
     std::process::exit(code);
 }
@@ -2331,7 +2936,7 @@ fn checked_cmdarray(
 ///
 ///   * **The object had nowhere to put those slots.** In real-JDK mode
 ///     `java.lang.Process` is a REAL loaded class with six fields of its own,
-///     so `alloc_concurrent_synthetic("java/lang/Process", 3)` produced a
+///     so `try_alloc_concurrent_synthetic("java/lang/Process", 3)?` produced a
 ///     real-layout six-slot object and slots 0..2 aliased `java.lang.Process`'s
 ///     own reader/writer caches.
 ///   * **Nothing downstream spoke that layout.** `getInputStream()` and its
@@ -2705,6 +3310,59 @@ pub fn gc_update_system_singleton_refs(
 pub fn forget_vm_system_singletons(vm_identity: usize) {
     SYSTEM_ENV.forget(vm_identity);
     SYSTEM_PROPS.forget(vm_identity);
+    // Same reason, different table: a `vm_identity` is reused, and a second VM
+    // inheriting the first's loaded-library rows would refuse a load the first
+    // VM made — an `UnsatisfiedLinkError` naming a loader that no longer
+    // exists. See `LOADED_LIBRARIES`.
+    LOADED_LIBRARIES.forget(vm_identity);
+}
+
+/// Record that the BOOT loader holds `name`, so a later app-loader
+/// `System.loadLibrary(name)` gets the JDK's "already loaded in another
+/// classloader" error instead of a success.
+///
+/// **THIS HAS NO CALLER IN THE TREE. It is a written-down hand-off, not a live
+/// path — do not read its presence as the feature being on.** The one call site
+/// it is for is the `jdk/internal/loader/BootLoader.loadLibrary` registration in
+/// `native-builtins/src/lib.rs`, which is a deliberate `|_ctx, _args| Ok(None)`
+/// no-op (that short-circuit is what stops real `NativeLibraries` bytecode from
+/// blocking on the JDK's native-library lock during Linux boot-class `<clinit>`,
+/// so it must stay a no-op *for the load*; only the bookkeeping is missing).
+/// The patch is one line inside that closure — `BootLoader.loadLibrary(String)`
+/// is static, so `args[0]` is the name:
+///
+/// ```ignore
+/// |ctx, args| {
+///     if let Some(Value::Object(Some(o))) = args.first() {
+///         let name = ctx.read_string(*o).unwrap_or_default();
+///         crate::lang_system::record_boot_loader_library(ctx, &name);
+///     }
+///     Ok(None)
+/// }
+/// ```
+///
+/// UNARMED ON PURPOSE, and the reason is measurable rather than cautious:
+/// arming it makes `System.loadLibrary("net")` throw for any program that has
+/// already reached a `java.net` boot class, which is exactly HotSpot's answer
+/// and exactly what `RJdkJni.libraryLoading` depends on NOT happening — its
+/// `zip` probe falls through to a `net` probe that must succeed
+/// (`RJdkJni.java:189-202`), and `run.sh` compares `CK` lines. Whether CratonVM
+/// reaches `BootLoader.loadLibrary("net")` before that line cannot be settled
+/// from source; it is one A/B on a built binary in both modes with the HotSpot
+/// oracle beside it. Nothing here has been built or run.
+///
+/// Recording is inert under `Compatible` regardless: nothing reads
+/// `LOADED_LIBRARIES` unless a `LoaderScoping::On` registration is in force,
+/// and only the strict arm installs one.
+pub fn record_boot_loader_library(ctx: &mut dyn NativeContext, name: &str) {
+    if name.is_empty() {
+        return;
+    }
+    // Loader id 0 is the bootstrap loader — `NativeContext::loader_id_of_class`'s
+    // own encoding, and the loader `BootLoader.loadLibrary` loads on behalf of
+    // by definition. Any existing owner is left alone: this native returns void
+    // and reports nothing, so there is no shape in which to raise the conflict.
+    let _existing_owner = claim_library(ctx.vm_identity(), 0, name);
 }
 
 pub(crate) fn native_system_getenv_all(
@@ -2823,7 +3481,16 @@ pub(crate) fn native_system_getenv_all(
         ctx.set_field(map, f_loadfactor, Value::Float(0.75));
         ctx.set_field(map, f_entryset, Value::Object(None));
 
-        let node_class_id = ctx.ensure_synthetic_class("java/util/HashMap$Node", node_n_fields);
+        // Fallible since 2026-08-10 (JDK-only wave 2, step 3). This arm is the
+        // REAL-layout path — every field index above came from the real
+        // `java.util.HashMap`/`HashMap$Node` — so `HashMap$Node` is already
+        // loaded here and the ask resolves to the real class rather than
+        // fabricating. The refusal only fires on an image where it is not.
+        let node_class_id = crate::util_concurrent_ext::refused_class(
+            ctx,
+            "java/util/HashMap$Node",
+            node_n_fields,
+        )?;
 
         for (key, value) in std::env::vars() {
             let key_obj = ctx.create_string(&key);
@@ -2859,8 +3526,16 @@ pub(crate) fn native_system_getenv_all(
     // A failed real-class initialization yields ClassId(0), whose Object layout
     // has zero slots. This fallback writes map and node fields, so both need
     // named synthetic layouts even when the real classes cannot initialize.
-    let fallback_map_class_id = ctx.ensure_synthetic_class("java/util/HashMap", 3);
-    let fallback_node_class_id = ctx.ensure_synthetic_class("java/util/HashMap$Node", 4);
+    //
+    // Fallible since 2026-08-10 (JDK-only wave 2, step 3): a 3-field synthetic
+    // `java/util/HashMap` IS the compatibility substitution — the comment above
+    // says as much — so under `--jdk-only` it is refused and `System.getenv()`
+    // raises `NoClassDefFoundError` naming the class instead of handing back a
+    // map whose layout `java.base`'s own `HashMap` bytecode cannot read.
+    let fallback_map_class_id =
+        crate::util_concurrent_ext::refused_class(ctx, "java/util/HashMap", 3)?;
+    let fallback_node_class_id =
+        crate::util_concurrent_ext::refused_class(ctx, "java/util/HashMap$Node", 4)?;
     let map = ctx.alloc_object(fallback_map_class_id, 3); // MAP_NUM_FIELDS = 3
     ctx.set_field(map, 0, Value::Object(Some(buckets))); // MAP_FIELD_BUCKETS
     ctx.set_field(map, 1, Value::Int(0)); // MAP_FIELD_SIZE
@@ -2923,13 +3598,13 @@ pub(crate) fn native_pb_command(ctx: &mut dyn NativeContext, args: &[Value]) -> 
 pub(crate) fn build_stack_trace_element_array(
     ctx: &mut dyn NativeContext,
     trace: &[cratonvm_native_api::StackTraceEntry],
-) -> cratonvm_types::ObjectRef {
+) -> Result<cratonvm_types::ObjectRef, MethodCallFailed> {
     let arr = ctx.new_ref_array(cratonvm_types::ClassId::new(0), trace.len());
     // The captured trace is outermost-first (frame[0] = bottom of stack);
     // getStackTrace()/getAllStackTraces() want index 0 = the innermost (current)
     // call, so materialize reversed вЂ” matching HotSpot ordering.
     for (i, e) in trace.iter().rev().enumerate() {
-        let ste = crate::alloc_concurrent_synthetic(ctx, "java/lang/StackTraceElement", 4);
+        let ste = crate::try_alloc_concurrent_synthetic(ctx, "java/lang/StackTraceElement", 4)?;
         let cls_dotted = match ctx.class_id_by_name(&e.class_name) {
             Some(cid) => crate::lang_class::dotted_class_name(ctx.vm_identity(), cid, &e.class_name),
             None => std::sync::Arc::from(e.class_name.replace('/', ".")),
@@ -2945,7 +3620,7 @@ pub(crate) fn build_stack_trace_element_array(
         );
         ctx.set_array_element(arr, i, Value::Object(Some(ste)));
     }
-    arr
+    Ok(arr)
 }
 
 /// `Thread.getStackTrace0()` вЂ” the live stack of the receiver thread (or, for
@@ -2964,7 +3639,7 @@ pub(crate) fn native_thread_get_stack_trace(
     };
     let trace = ctx.thread_stack_trace(this);
     let arr = build_stack_trace_element_array(ctx, &trace);
-    Ok(Some(Value::Object(Some(arr))))
+    Ok(Some(Value::Object(Some(arr?))))
 }
 
 // ---------------------------------------------------------------------------
@@ -3813,7 +4488,16 @@ fn bb_define_layout(ctx: &dyn NativeContext, bb: ObjectRef) -> BbDefineLayout {
     }
 }
 
-fn read_byte_buffer_define_class_slice(
+/// `pub(crate)`: this is the ONLY `defineClass2` ByteBuffer decoder in the
+/// crate. `classloader::cl_define_class2` — which SHADOWS this module's
+/// `defineClass2` registration in synthetic-JDK mode, because
+/// `register_classloader_natives` runs after `register_essential_natives` and
+/// `NativeMethodRegistry::register` is last-wins — used to carry a second,
+/// unhardened copy that hardcoded slot 0 as the backing array and CLAMPED
+/// out-of-range `(off, len)` instead of rejecting them. Both entry points now
+/// call this one, so the layout witness above and the `checked_add` bounds
+/// below cannot be in effect for one caller and inert for the other.
+pub(crate) fn read_byte_buffer_define_class_slice(
     ctx: &dyn NativeContext,
     bb: ObjectRef,
     offset: usize,
@@ -4062,7 +4746,7 @@ pub(crate) fn preload_isolated_loader_supertypes(
                 );
                 ctx.unpin_native_roots(loader_pin);
                 return Err(cratonvm_types::error::MethodCallFailed::ExceptionThrown(
-                    exception,
+                    exception?,
                 ));
             }
         }
@@ -4071,28 +4755,147 @@ pub(crate) fn preload_isolated_loader_supertypes(
     Ok(())
 }
 
-fn same_loader_already_defined_mirror(
+/// What a backend "already defined" failure means for the `defineClass` call
+/// that provoked it.
+///
+/// The backend probe is keyed on `(loader_id, name)` where `loader_id` is a
+/// synthetic NAMESPACE number
+/// (`class_manager.rs::define_class_shared_with_options`), so the error alone
+/// cannot tell the two cases below apart. Only the DEFINING LOADER OBJECT can.
+enum DuplicateDefine {
+    /// Not an "already defined" failure — the caller keeps its own error path.
+    NotDuplicate,
+    /// **This exact loader object has already defined this name.** JVMS §5.3.5
+    /// forbids it and HotSpot raises `java.lang.LinkageError`.
+    SameLoaderObject,
+    /// A class of this name exists and this loader did NOT define it — a
+    /// namespace collision inside CratonVM's flat store, or a delegation gap
+    /// that re-reached `findClass`. Serve the existing mirror.
+    ServeExisting(ObjectRef),
+}
+
+/// Decide which of the two an "already defined" backend error is.
+///
+/// # Why this exists, and why it is not simply "delete the tolerance"
+///
+/// Until 2026-08-11 every "already defined" error served the existing mirror,
+/// so `defineClass` NEVER raised the `LinkageError` HotSpot raises for a
+/// duplicate definition — measured in both modes with a `ClassLoader` subclass
+/// calling `defineClass(name, bytes, 0, len)` twice.
+///
+/// The tolerance is not decoration, though, and the case it covers is real:
+/// during a Tomcat webapp stop/start loop the ~14th `WebappClassLoader` in a
+/// process began colliding with an earlier, already-finished one over
+/// `org/apache/catalina/loader/JdbcLeakPrevention`, and surfacing the backend
+/// error there broke the container lifecycle. On HotSpot those are two
+/// DIFFERENT loaders, each entitled to its own copy; what collided was
+/// CratonVM's namespace numbering, not the loaders.
+///
+/// So the discriminator is loader-OBJECT identity, and the two shapes separate
+/// cleanly:
+///
+/// | shape | HotSpot | here |
+/// |---|---|---|
+/// | same loader object defines a name twice | `LinkageError` | `SameLoaderObject` |
+/// | two distinct loaders, one namespace | both succeed | `ServeExisting` |
+///
+/// # The bias, stated
+///
+/// `SameLoaderObject` is only ever returned on a POSITIVE identification. The
+/// defining-loader record is an `ObjectRef` and a moving collection can leave a
+/// stale pointer, so "not recorded" and "recorded elsewhere" both fall to
+/// `ServeExisting`. A missed `LinkageError` is what this VM did yesterday; a
+/// spurious one is a new way to break a workload that was working.
+fn classify_duplicate_define(
     ctx: &mut dyn NativeContext,
     loader_obj: ObjectRef,
     internal_name: &str,
     loader_id: u32,
     msg: &str,
-) -> Option<ObjectRef> {
+) -> DuplicateDefine {
     if internal_name.is_empty() || !msg.contains("already defined") {
-        return None;
+        return DuplicateDefine::NotDuplicate;
     }
-    if let Some(mirror) =
-        crate::classloader::find_loaded_class_for_loader(ctx, loader_obj, internal_name)
+    // `CRATONVM_DBG_DUPDEF=1` -- name every "already defined" backend error and
+    // the verdict it got. This exists because the two verdicts are otherwise
+    // indistinguishable from outside: a workload that never reaches
+    // `ServeExisting` proves nothing about the tolerance still working, and one
+    // that never reaches `SameLoaderObject` proves nothing about the refusal.
+    // Both arms print, so a probe can assert it exercised the arm it claims to.
+    let dbg = cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_DUPDEF").is_some();
+    // THE one question that may raise: did this exact object define it?
+    if crate::classloader::class_defined_by_this_loader_object(ctx, loader_obj, internal_name)
+        .is_some()
     {
-        return Some(mirror);
+        if dbg {
+            eprintln!("[DUPDEF] SameLoaderObject {internal_name} loader_id={loader_id}");
+        }
+        return DuplicateDefine::SameLoaderObject;
     }
+    // A namespace hit whose recorded defining loader IS this object is the same
+    // fact reached the other way round — the record can be keyed by namespace
+    // before the object association is made.
     if loader_id != 0 {
         if let Some(class_id) = ctx.class_id_defined_by_loader_exact(internal_name, loader_id) {
-            crate::classloader::register_defining_loader(ctx.vm_identity(), class_id.as_u32(), loader_obj);
-            return Some(ctx.get_class_mirror(class_id));
+            let same = crate::classloader::defining_loader_for(ctx.vm_identity(), class_id.as_u32())
+                .is_some_and(|def| def.as_ptr() == loader_obj.as_ptr());
+            if same {
+                if dbg {
+                    eprintln!(
+                        "[DUPDEF] SameLoaderObject(via namespace) {internal_name} loader_id={loader_id}"
+                    );
+                }
+                return DuplicateDefine::SameLoaderObject;
+            }
+            // A namespace hit this loader did not define: the collision shape.
+            if dbg {
+                eprintln!(
+                    "[DUPDEF] ServeExisting(namespace collision) {internal_name} loader_id={loader_id}"
+                );
+            }
+            crate::classloader::register_defining_loader(
+                ctx.vm_identity(),
+                class_id.as_u32(),
+                loader_obj,
+            );
+            return DuplicateDefine::ServeExisting(ctx.get_class_mirror(class_id));
         }
     }
-    None
+    match crate::classloader::find_loaded_class_for_loader(ctx, loader_obj, internal_name) {
+        Some(mirror) => {
+            if dbg {
+                eprintln!("[DUPDEF] ServeExisting(visible) {internal_name} loader_id={loader_id}");
+            }
+            DuplicateDefine::ServeExisting(mirror)
+        }
+        None => {
+            if dbg {
+                eprintln!("[DUPDEF] NotDuplicate {internal_name} loader_id={loader_id}");
+            }
+            DuplicateDefine::NotDuplicate
+        }
+    }
+}
+
+/// The `LinkageError` a duplicate definition raises, named after the loader the
+/// way HotSpot names it.
+fn duplicate_define_error(
+    ctx: &mut dyn NativeContext,
+    loader_obj: ObjectRef,
+    internal_name: &str,
+) -> MethodCallFailed {
+    // HotSpot prints `<loader class name> @<identity hash>`. The class name is
+    // the part that identifies the loader to a reader; the hash is why no test
+    // may assert the whole string.
+    let loader = ctx
+        .class_name_of_id(ctx.class_id_of_object(loader_obj))
+        .map(|n| n.replace('/', "."))
+        .unwrap_or_else(|| "<unknown>".to_string());
+    LinkageError::DuplicateClassDefinition {
+        class_name: internal_name.to_string(),
+        loader,
+    }
+    .into()
 }
 
 pub(crate) fn native_classloader_define_class1(
@@ -4108,6 +4911,14 @@ pub(crate) fn native_classloader_define_class1(
         }
         _ => String::new(),
     };
+    if let Ok(filter) = cratonvm_types::flags::runtime_var("CRATONVM_DBG_DEFINE_STACK_FILTER") {
+        if !filter.is_empty() && name.contains(filter.as_str()) {
+            eprintln!("[DBG_DEFINE_STACK] defineClass1({name})");
+            for entry in ctx.capture_stack_trace(0) {
+                eprintln!("    at {}.{}", entry.class_name, entry.method_name);
+            }
+        }
+    }
 
     let byte_array = match args.get(2) {
         Some(Value::Object(Some(arr))) => *arr,
@@ -4154,19 +4965,18 @@ pub(crate) fn native_classloader_define_class1(
         }
         _ => 0,
     };
-    // Optional PD at arg 5.
-    let mut pd_url: Option<String> = None;
-    if let Some(Value::Object(Some(pd))) = args.get(5) {
-        if let Value::Object(Some(cs)) = ctx.get_field(*pd, 0) {
-            if let Some(s) = ctx.read_string(cs) {
-                pd_url = Some(s);
-            } else if let Value::Object(Some(url)) = ctx.get_field(cs, 0) {
-                if let Some(s) = ctx.read_string(url) {
-                    pd_url = Some(s);
-                }
-            }
-        }
-    }
+    // The caller's ProtectionDomain, decoded through the ONE reader that
+    // understands both PD shapes. Six copies of an inline decode used to
+    // stand here, and all six read `CodeSource.location` with
+    // `read_string` -- which fails on a real `java.net.URL`, a different
+    // concrete class -- so every real-JDK-constructed CodeSource silently
+    // lost its URL and the defined class came back carrying the
+    // synthesised `file:/runtime-defined/<name>.class` instead of the
+    // caller's. See `extract_pd_code_source_url`.
+    let pd_url = match args.get(5) {
+        Some(Value::Object(Some(pd))) => crate::classloader::extract_pd_code_source_url(ctx, *pd),
+        _ => None,
+    };
 
     // JVMS В§5.3.5 вЂ” resolve direct supertypes through the DEFINING loader before
     // linking. `define_class_full` resolves the superclass/interfaces only via the
@@ -4195,10 +5005,14 @@ pub(crate) fn native_classloader_define_class1(
         }
         Err(msg) => {
             if let Some(Value::Object(Some(loader_obj))) = args.first() {
-                if let Some(mirror) =
-                    same_loader_already_defined_mirror(ctx, *loader_obj, &name, loader_id, &msg)
-                {
-                    return Ok(Some(Value::Object(Some(mirror))));
+                match classify_duplicate_define(ctx, *loader_obj, &name, loader_id, &msg) {
+                    DuplicateDefine::SameLoaderObject => {
+                        return Err(duplicate_define_error(ctx, *loader_obj, &name));
+                    }
+                    DuplicateDefine::ServeExisting(mirror) => {
+                        return Ok(Some(Value::Object(Some(mirror))));
+                    }
+                    DuplicateDefine::NotDuplicate => {}
                 }
             }
             tracing::warn!("ClassLoader.defineClass1({name}) failed: {msg}");
@@ -4247,18 +5061,18 @@ pub(crate) fn native_classloader_define_class2(
         _ => 0,
     };
 
-    let mut pd_url: Option<String> = None;
-    if let Some(Value::Object(Some(pd))) = args.get(5) {
-        if let Value::Object(Some(cs)) = ctx.get_field(*pd, 0) {
-            if let Some(s) = ctx.read_string(cs) {
-                pd_url = Some(s);
-            } else if let Value::Object(Some(url)) = ctx.get_field(cs, 0) {
-                if let Some(s) = ctx.read_string(url) {
-                    pd_url = Some(s);
-                }
-            }
-        }
-    }
+    // The caller's ProtectionDomain, decoded through the ONE reader that
+    // understands both PD shapes. Six copies of an inline decode used to
+    // stand here, and all six read `CodeSource.location` with
+    // `read_string` -- which fails on a real `java.net.URL`, a different
+    // concrete class -- so every real-JDK-constructed CodeSource silently
+    // lost its URL and the defined class came back carrying the
+    // synthesised `file:/runtime-defined/<name>.class` instead of the
+    // caller's. See `extract_pd_code_source_url`.
+    let pd_url = match args.get(5) {
+        Some(Value::Object(Some(pd))) => crate::classloader::extract_pd_code_source_url(ctx, *pd),
+        _ => None,
+    };
 
     if let Some(Value::Object(Some(loader_obj))) = args.first() {
         preload_supertypes_via_loader(ctx, *loader_obj, &bytes);
@@ -4279,10 +5093,14 @@ pub(crate) fn native_classloader_define_class2(
         }
         Err(msg) => {
             if let Some(Value::Object(Some(loader_obj))) = args.first() {
-                if let Some(mirror) =
-                    same_loader_already_defined_mirror(ctx, *loader_obj, &name, loader_id, &msg)
-                {
-                    return Ok(Some(Value::Object(Some(mirror))));
+                match classify_duplicate_define(ctx, *loader_obj, &name, loader_id, &msg) {
+                    DuplicateDefine::SameLoaderObject => {
+                        return Err(duplicate_define_error(ctx, *loader_obj, &name));
+                    }
+                    DuplicateDefine::ServeExisting(mirror) => {
+                        return Ok(Some(Value::Object(Some(mirror))));
+                    }
+                    DuplicateDefine::NotDuplicate => {}
                 }
             }
             tracing::warn!("ClassLoader.defineClass2({name}) failed: {msg}");
@@ -4338,19 +5156,18 @@ pub(crate) fn native_classloader_define_class0(
         _ => 0,
     };
 
-    // PD at arg 6.
-    let mut pd_url: Option<String> = None;
-    if let Some(Value::Object(Some(pd))) = args.get(6) {
-        if let Value::Object(Some(cs)) = ctx.get_field(*pd, 0) {
-            if let Some(s) = ctx.read_string(cs) {
-                pd_url = Some(s);
-            } else if let Value::Object(Some(url)) = ctx.get_field(cs, 0) {
-                if let Some(s) = ctx.read_string(url) {
-                    pd_url = Some(s);
-                }
-            }
-        }
-    }
+    // The caller's ProtectionDomain, decoded through the ONE reader that
+    // understands both PD shapes. Six copies of an inline decode used to
+    // stand here, and all six read `CodeSource.location` with
+    // `read_string` -- which fails on a real `java.net.URL`, a different
+    // concrete class -- so every real-JDK-constructed CodeSource silently
+    // lost its URL and the defined class came back carrying the
+    // synthesised `file:/runtime-defined/<name>.class` instead of the
+    // caller's. See `extract_pd_code_source_url`.
+    let pd_url = match args.get(6) {
+        Some(Value::Object(Some(pd))) => crate::classloader::extract_pd_code_source_url(ctx, *pd),
+        _ => None,
+    };
 
     // `init` (boolean) at arg 7: run <clinit> after define.
     let initialize = matches!(args.get(7), Some(Value::Int(v)) if *v != 0);
@@ -4411,16 +5228,26 @@ pub(crate) fn native_classloader_define_class0(
             Ok(Some(Value::Object(Some(mirror))))
         }
         Err(msg) => {
+            // `hidden` is excluded on purpose and always was: a hidden class
+            // is never registered under its name, so "already defined" cannot
+            // be about it, and JVMS §5.3.5's rule does not apply to a class
+            // that has no binary name in any loader's namespace.
             if !hidden {
                 if let Some(Value::Object(Some(loader_obj))) = args.first() {
-                    if let Some(mirror) = same_loader_already_defined_mirror(
+                    match classify_duplicate_define(
                         ctx,
                         *loader_obj,
                         &effective_name,
                         loader_id,
                         &msg,
                     ) {
-                        return Ok(Some(Value::Object(Some(mirror))));
+                        DuplicateDefine::SameLoaderObject => {
+                            return Err(duplicate_define_error(ctx, *loader_obj, &effective_name));
+                        }
+                        DuplicateDefine::ServeExisting(mirror) => {
+                            return Ok(Some(Value::Object(Some(mirror))));
+                        }
+                        DuplicateDefine::NotDuplicate => {}
                     }
                 }
             }
@@ -4486,10 +5313,23 @@ pub(crate) fn native_perf_create_byte_array(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
-    // createByteArray(String name, int variability, int units, byte[] value, int maxLength)
-    //   -> ByteBuffer
-    // Allocate a direct buffer sized to the requested maxLength (or 0 if missing/negative).
-    let max_length = match args.get(4) {
+    // W7-86. `createByteArray` is `public native ByteBuffer createByteArray(
+    // String, int, int, byte[], int)` — an INSTANCE method (`javap -p --module
+    // java.base jdk.internal.perf.Perf`, Adoptium 25.0.3.9) — so `args[0]` is
+    // the `Perf` receiver and `maxLength`, the fifth PARAMETER, sits at
+    // `args[5]`. The comment this replaces listed the parameters in their
+    // STATIC positions and then indexed by them: `args[4]` is the `byte[]`
+    // value, a `Value::Object`, which missed the `Value::Int` arm and left
+    // `max_length` at its 0 default — so every perf byte-array counter got a
+    // ZERO-length direct buffer instead of the size the caller asked for.
+    //
+    // Not observable from ordinary Java: `jdk.internal.perf.Perf` is exported
+    // to nobody and `Perf.getPerf()` is itself gated, so there is no probe for
+    // this row and none is pretended. What is measured is the registration:
+    // `--dump-native-registry` on a default run shows it owning its slot, and
+    // the real method is `acc_native` with no code, so nothing else answers it.
+    // Compatible mode (`--real-jdk`, default).
+    let max_length = match args.get(5) {
         Some(Value::Int(v)) if *v >= 0 => *v,
         _ => 0,
     };
@@ -5178,7 +6018,7 @@ mod checkexec_security_tests {
     fn denying_security_manager_blocks_check_exec() {
         let _guard = security_state_test_lock();
         let mut ctx = mock_ctx();
-        let sm = alloc_concurrent_synthetic(&mut ctx, "java/lang/SecurityManager", 0);
+        let sm = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/SecurityManager", 0).unwrap();
         let prev = set_security_manager_for_test(&ctx, Some(sm));
 
         // Pre-arm the mock so the next invoke_virtual returns a SecurityException.
@@ -5208,7 +6048,7 @@ mod checkexec_security_tests {
         // if the SM check is skipped the spawn would attempt the path and
         // surface IOException, not SecurityException.
         let mut ctx = mock_ctx();
-        let sm = alloc_concurrent_synthetic(&mut ctx, "java/lang/SecurityManager", 0);
+        let sm = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/SecurityManager", 0).unwrap();
         let prev = set_security_manager_for_test(&ctx, Some(sm));
         unsafe {
             *ctx.invoke_virtual_result.get() = Some(Err(MethodCallFailed::InternalError(
@@ -5219,7 +6059,7 @@ mod checkexec_security_tests {
         }
 
         // args[0] = Runtime instance (irrelevant here), args[1] = command.
-        let runtime_instance = alloc_concurrent_synthetic(&mut ctx, "java/lang/Runtime", 0);
+        let runtime_instance = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/Runtime", 0).unwrap();
         let cmd = ctx.create_string("/path/to/definitely-nonexistent-binary-xyz");
         let result = native_runtime_exec_string(
             &mut ctx,
@@ -5249,7 +6089,7 @@ mod checkexec_security_tests {
         // and this test fails.
         install_spawn_policy_hook();
         let mut ctx = mock_ctx();
-        let sm = alloc_concurrent_synthetic(&mut ctx, "java/lang/SecurityManager", 0);
+        let sm = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/SecurityManager", 0).unwrap();
         let prev = set_security_manager_for_test(&ctx, Some(sm));
         unsafe {
             *ctx.invoke_virtual_result.get() = Some(Err(MethodCallFailed::InternalError(
@@ -5264,7 +6104,7 @@ mod checkexec_security_tests {
         // command[0] = "/bin/anything", a path that does not exist -- so if the
         // gate ever fails to refuse, the spawn fails with an IOException rather
         // than running something, and the assertion below still catches it.
-        let pb = alloc_concurrent_synthetic(&mut ctx, "java/lang/ProcessBuilder", 4);
+        let pb = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/ProcessBuilder", 4).unwrap();
         let cmd_arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 1);
         let prog = ctx.create_string("/bin/anything");
         ctx.set_array_element(cmd_arr, 0, Value::Object(Some(prog)));
@@ -5295,7 +6135,7 @@ mod checkexec_security_tests {
     fn allow_listed_sm_lets_specific_paths_through() {
         let _guard = security_state_test_lock();
         let mut ctx = mock_ctx();
-        let sm = alloc_concurrent_synthetic(&mut ctx, "java/lang/SecurityManager", 0);
+        let sm = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/SecurityManager", 0).unwrap();
         let prev = set_security_manager_for_test(&ctx, Some(sm));
 
         // First call: simulate a denial for the disallowed binary.

@@ -54,6 +54,13 @@ applogs/
 __pycache__/
 
 # regression-suite.sh generated artifacts (per-run, machine-specific)
+# .selfcheck is harness-selfcheck.sh's scratch tree (kept only under KEEP=1);
+# .guard-tmp holds one vector's captured oracle output while run.sh's harness
+# guards inspect it. Both are deleted on a normal exit and are listed here so an
+# interrupted run cannot leave a staged directory behind.
+regression-suite/.selfcheck/
+regression-suite/.guard-tmp/
+regression-suite/.mut/
 test-infra/_regression-cratonvm-shim.bat
 test-infra/suite-results/_cm-*.log
 /target-gpu/
@@ -105,3 +112,9 @@ probes/out/
 # …including a probe compiled in place: the rule above only covers `out/`, so
 # `javac probes/Foo.java` left a `probes/Foo.class` that `git add -A` tracked.
 probes/*.class
+
+# local run artifacts
+dim4-*.log*
+build-win.log
+cv-url.txt
+hs-url.txt

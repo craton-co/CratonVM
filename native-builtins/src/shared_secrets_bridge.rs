@@ -48,10 +48,10 @@ use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 
 use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
-use cratonvm_types::error::{MethodCallResult, RuntimeError};
+use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError};
 use cratonvm_types::{ArrayElementType, ObjectRef, Value};
 
-use crate::alloc_concurrent_synthetic;
+use crate::try_alloc_concurrent_synthetic;
 
 /// WP1.4 — Re-export of the canonical concrete-class mapping.
 /// Mirrors `vm/src/runtime/shared_secrets.rs::SharedSecretsInterface`
@@ -188,20 +188,33 @@ fn alloc_owner_instance(ctx: &mut dyn NativeContext, owner_class: &str) -> Optio
     Some(ctx.alloc_object(cid, real_fields.max(1)))
 }
 
-fn alloc_named_synthetic_singleton(ctx: &mut dyn NativeContext, owner_class: &str) -> ObjectRef {
-    let cid = ctx.ensure_synthetic_class(owner_class, 1);
+/// Fallible since 2026-08-10 (JDK-only wave 2, step 3). This is only reached
+/// when NEITHER real `java.nio.Buffer$2` nor `Buffer$1` is loadable, i.e. on an
+/// image with no `java.base`; fabricating a `java/nio/Buffer$2` stand-in there
+/// is the compatibility substitution contract §5 refuses, so a strict run gets
+/// the `NoClassDefFoundError` instead.
+fn alloc_named_synthetic_singleton(
+    ctx: &mut dyn NativeContext,
+    owner_class: &str,
+) -> Result<ObjectRef, MethodCallFailed> {
+    let cid = crate::util_concurrent_ext::refused_class(ctx, owner_class, 1)?;
     let fields = ctx.class_num_total_fields(cid).max(1);
-    ctx.alloc_object(cid, fields)
+    Ok(ctx.alloc_object(cid, fields))
 }
 
-fn alloc_java_nio_access_singleton(ctx: &mut dyn NativeContext) -> ObjectRef {
+fn alloc_java_nio_access_singleton(
+    ctx: &mut dyn NativeContext,
+) -> Result<ObjectRef, MethodCallFailed> {
     // JDK 25 implements JavaNioAccess as Buffer$2; JDK 17 implements it as
     // Buffer$1. If neither class is loadable, keep a named owner so
     // invokeinterface resolves against registered JavaNioAccess bridge methods
     // instead of the generic AnonymousObject$1 fallback.
-    alloc_owner_instance(ctx, "java/nio/Buffer$2")
+    match alloc_owner_instance(ctx, "java/nio/Buffer$2")
         .or_else(|| alloc_owner_instance(ctx, "java/nio/Buffer$1"))
-        .unwrap_or_else(|| alloc_named_synthetic_singleton(ctx, "java/nio/Buffer$2"))
+    {
+        Some(obj) => Ok(obj),
+        None => alloc_named_synthetic_singleton(ctx, "java/nio/Buffer$2"),
+    }
 }
 
 /// Register the `SharedSecrets.getJavaXxxAccess()` factories.
@@ -261,7 +274,7 @@ fn make_factory_callback(owner_class: &'static str) -> cratonvm_native_api::Nati
     gen_factory!(f_jurb, "java/util/ResourceBundle$1");
 
     fn f_jnio(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-        let obj = alloc_java_nio_access_singleton(ctx);
+        let obj = alloc_java_nio_access_singleton(ctx)?;
         Ok(Some(Value::Object(Some(obj))))
     }
 
@@ -490,7 +503,7 @@ fn jla_get_enum_constants_shared(ctx: &mut dyn NativeContext, args: &[Value]) ->
 fn jla_define_unnamed_module(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
     // Mirror `Class.getModule()` shape: 2-field synthetic Module, field 0 =
     // name (None = unnamed).
-    let m_obj = alloc_concurrent_synthetic(ctx, "java/lang/Module", 2);
+    let m_obj = try_alloc_concurrent_synthetic(ctx, "java/lang/Module", 2)?;
     ctx.set_field(m_obj, 0, Value::Object(None));
     Ok(Some(Value::Object(Some(m_obj))))
 }
@@ -680,27 +693,180 @@ fn jla_get_constant_pool(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     crate::lang_class::native_class_get_constant_pool(ctx, &[class_obj])
 }
 
+/// Whether this VM takes a terminating thread back out of its `ThreadContainer`.
+///
+/// **This is now `true`, because the de-registration half landed.** The
+/// constant is not a policy dial; it is a factual statement about the VM, and
+/// the fact changed. `vm/src/vm/vm_exec.rs::run_thread_exit_shared` invokes
+/// `java/lang/Thread.exit()V` on the terminating thread from both worker-death
+/// paths (normal return and after the uncaught-exception dispatch), which is
+/// what reaches `container.remove(this)` —
+/// docs/known-issues/jdk-only/W7-27-thread-exit-java-cleanup.md.
+///
+/// Why the pairing is not optional. `jdk.internal.misc.ThreadFlock.awaitAll()`
+/// is
+///
+/// ```java
+///     if (threadCount == 0) return true;
+///     while (threadCount > 0 && !permit) { ... LockSupport.park(); }
+/// ```
+///
+/// so a container that is only ever added to does not leak quietly — it hangs
+/// every `join()`/`close()` built on it. HotSpot gets the decrement from
+/// `Thread.exit()` (JDK 25 `Thread.java`, `private void exit()`):
+///
+/// ```java
+///     ThreadContainer container = threadContainer();
+///     if (container != null) {
+///         container.remove(this);
+///     }
+/// ```
+///
+/// MEASURED against `target/release/cratonvm.exe` (2026-08-11), i.e. the binary
+/// that had NEITHER half, under `--real-jdk`, by invoking the JDK's own
+/// package-private `Thread.start(ThreadContainer)` reflectively — the exact body
+/// the enabled branch below reaches — on a live `StructuredTaskScope`'s flock:
+///
+/// ```text
+///                                       HotSpot 25    cratonvm --real-jdk
+///   flock threads after start                1              1
+///   flock threads after the worker died      0              1   <- not removed
+///   join() called after the worker died   0-1 ms        never returned (3/3)
+/// ```
+///
+/// That table is why this constant existed: the add half alone turns today's
+/// "join() waits for nothing" into "join() waits forever", which is strictly
+/// worse. With `Thread.exit()` wired up, the right-hand column is the thing
+/// this flip is expected to move to `0` / a number.
+///
+/// **WHAT A WRONG FLIP LOOKS LIKE, so a suite run can be read.** The failure
+/// mode is a HANG, not a wrong answer, and it has one signature per consumer:
+///
+/// * A vector that opens a `StructuredTaskScope` (or anything reaching
+///   `ThreadFlock`) never finishes: no `FAIL` line, no `PASS` line, the run
+///   stops mid-transcript and the harness times out. `join()`/`close()` are
+///   parked in `LockSupport.park()` on a `threadCount` that never fell. Note
+///   that a suite timeout in this tree is more often a crash with no result
+///   line than a real wait, so check the process is still alive before reading
+///   a timeout as this: here it IS a live park, not a fault.
+/// * With `-ea`, `ThreadFlock.onExit`'s `assert removed` fires instead: that is
+///   the OPPOSITE regression — a thread removed twice, or removed from a
+///   container it was never added to.
+/// * `WARN … Thread.exit() failed on terminating thread …` on every thread
+///   death means `exit()` is being reached and throwing inside real JDK
+///   bytecode; the container is then still held and the first bullet follows.
+/// * Jetty/Tomcat thread pools use `SharedThreadContainer`, which never waits
+///   on a count, so they cannot show this. Do not read a green Jetty arm as
+///   evidence the flip is sound.
+///
+/// The escape hatch is `CRATONVM_THREAD_CONTAINERS=0`, which restores the
+/// pre-flip behaviour in the same binary; `=1` forces it on. Bisect with that
+/// rather than by rebuilding.
+const VM_REMOVES_THREADS_FROM_CONTAINERS: bool = true;
+
+/// Read once per process: the constant above, overridable by
+/// `CRATONVM_THREAD_CONTAINERS` (`1` on, `0` off).
+///
+/// Read through `flags::runtime_var`, not `std::env::var`. A raw `getenv` is
+/// served live and is therefore invisible to `flags::with_thread_overrides`,
+/// so a test selecting an arm through the supported hook would silently have
+/// measured the developer's ambient environment instead — which is exactly the
+/// A/B this pair prescribes. The token is declared `THREADS/thread-containers`
+/// in `types/src/flag_groups.rs`; `flag_declaration_guard.rs` fails the build
+/// for any `CRATONVM_*` name that is read but declared nowhere.
+fn thread_container_registration_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(
+        || match cratonvm_types::flags::runtime_var("CRATONVM_THREAD_CONTAINERS").as_deref() {
+            Ok("1") => true,
+            Ok("0") => false,
+            _ => VM_REMOVES_THREADS_FROM_CONTAINERS,
+        },
+    )
+}
+
 /// `JavaLangAccess.start(Thread, ThreadContainer)` -> `void`.
 ///
-/// `jdk.internal.vm.SharedThreadContainer.start(Thread)` (structured-
-/// concurrency / virtual-thread executor plumbing — e.g. Jetty's thread
-/// pool) calls this via `invokeinterface JavaLangAccess` to start a thread
-/// while registering it with a container that tracks its children. Without
-/// it, `NoSuchMethodError` here aborted every thread-pool-backed HTTP
-/// client (Jetty) at startup. CratonVM does not model thread containers
-/// (no structured-concurrency introspection), so — like the
-/// `defineUnnamedModule`/`addEnableNativeAccess` bridges above — this is a
-/// behavioral passthrough: just start the thread for real.
+/// `jdk.internal.vm.SharedThreadContainer.start(Thread)` (Jetty's thread pool)
+/// and `jdk.internal.misc.ThreadFlock.start(Thread)` (every structured-
+/// concurrency `fork`) call this via `invokeinterface JavaLangAccess` to start
+/// a thread *and register it with the container that tracks it*. Without the
+/// registration at all, `NoSuchMethodError` here aborted every thread-pool-
+/// backed HTTP client (Jetty) at startup, which is why the bridge exists.
+///
+/// The container is not introspection. `ThreadFlock.awaitAll()` returns
+/// immediately while `threadCount == 0`, and `StructuredTaskScopeImpl.join()`
+/// is `flock.awaitAll()`, so dropping `args[2]` is what makes JEP 505's
+/// `join()` wait for nothing —
+/// docs/known-issues/jdk-only/W7-18-structured-task-scope-jep505.md measured 15
+/// divergent lines, and three CratonVM runs re-taken today disagreed with each
+/// other on eight — all downstream of this one dropped argument, because a
+/// `join()` that does not wait turns the whole API into a race. The registry has
+/// several other consumers (`ThreadContainers.root()` enumeration, thread
+/// dumps, JFR), and they are enumerated in
+/// docs/known-issues/jdk-only/W7-23-thread-container-registration.md.
+///
+/// It is no longer dropped by default: `VM_REMOVES_THREADS_FROM_CONTAINERS` is
+/// `true` now that `Thread.exit()` runs on both worker-death paths. Read that
+/// constant's doc comment before changing anything here — it carries the
+/// measured hang the interlock existed for, and the runtime signature of a
+/// wrong flip. `CRATONVM_THREAD_CONTAINERS=0` restores the drop in the same
+/// binary, and the drop is still announced once per process so the wrong answer
+/// is not silent when it is selected.
 ///
 /// INSTANCE method: args[0] = receiver (System$1), args[1] = Thread,
-/// args[2] = ThreadContainer (ignored).
+/// args[2] = ThreadContainer.
 fn jla_start_in_container(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let thread_obj = match args.get(1) {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(None),
     };
+    let container = args.get(2).copied().unwrap_or(Value::Object(None));
+
+    if matches!(container, Value::Object(Some(_))) {
+        if thread_container_registration_enabled() {
+            // `Thread.start(Ljdk/internal/vm/ThreadContainer;)V` is a DIFFERENT
+            // triple from `Thread.start()V` (which `lib.rs` shadows with
+            // `native_thread_start0`), and nothing registers a native on it, so
+            // this reaches the JDK's own bytecode: `setThreadContainer(container)`
+            // + `container.add(this)` + `start0()`. `start0()V` *is* registered
+            // on the real-JDK path, so the spawn is still CratonVM's own — this
+            // adds the bookkeeping the passthrough skipped, it does not move the
+            // thread onto a different spawn mechanism. Measured to land the
+            // registration: the flock's thread set goes 0 -> 1 across this call.
+            //
+            // Real-JDK bytecode only. In synthetic mode `java/lang/Thread` has a
+            // fabricated layout with no such method, and the synthetic
+            // `StructuredTaskScope` runs `fork` on the forking thread anyway
+            // (W7-18 §6), so there is no flock to keep a count in.
+            ctx.invoke_virtual(
+                thread_obj,
+                "start",
+                "(Ljdk/internal/vm/ThreadContainer;)V",
+                &[container],
+            )?;
+            return Ok(None);
+        }
+        warn_thread_container_dropped_once();
+    }
+
     ctx.invoke_virtual(thread_obj, "start", "()V", &[])?;
     Ok(None)
+}
+
+/// One line per process, not per thread: Jetty starts hundreds of pool threads
+/// through this bridge and a per-call warning would bury the run it is trying
+/// to explain.
+fn warn_thread_container_dropped_once() {
+    static WARNED: OnceLock<()> = OnceLock::new();
+    WARNED.get_or_init(|| {
+        tracing::warn!(
+            "JavaLangAccess.start: thread started WITHOUT registering it with its \
+             jdk.internal.vm.ThreadContainer. StructuredTaskScope.join(), \
+             ThreadFlock.awaitAll() and ThreadContainers.root() enumeration will \
+             not see it (see W7-23-thread-container-registration)."
+        );
+    });
 }
 
 /// `JavaLangAccess.join(String prefix, String suffix, String delimiter,
@@ -863,6 +1029,201 @@ fn jla_get_declared_public_methods(
     } else {
         Ok(Some(Value::Object(None)))
     }
+}
+
+/// `JavaLangAccess.getDeclaredPublicMethods(Class<?> klass, String name,
+/// Class<?>... parameterTypes)` -> `List<Method>`.
+///
+/// A DIFFERENT method from the array-returning overload above, and it was
+/// pointed at the same handler, so it answered a `Method[]` of EVERY declared
+/// method where the JDK declares a `List<Method>` filtered to the public
+/// declarations named `name` with exactly `parameterTypes`.
+///
+/// What that broke, found 2026-08-07 once `--jdk-only` could finally reach it:
+/// `java.util.ServiceLoader.findStaticProviderMethod` is
+///
+/// ```java
+/// List<Method> methods = LANG_ACCESS.getDeclaredPublicMethods(clazz, "provider");
+/// ```
+///
+/// so the module-path `provider()` STATIC FACTORY form could never be found.
+/// `loadProvider` then fell through to its constructor branch and reported
+/// `ServiceConfigurationError: ... FactoryGreeter not a subtype`, which is true
+/// and beside the point: a factory provider deliberately does not implement the
+/// service. Measured on `regression-suite/src/RJdkModule.java:223`.
+///
+/// The filters are all three load-bearing:
+///
+/// * **public** - `getDeclaredPublicMethods` is public-only, and a private
+///   `provider()` must NOT be honoured;
+/// * **name** - the caller passes `"provider"` and expects nothing else back;
+/// * **parameter types** - the varargs are an EXACT match, and
+///   `findStaticProviderMethod` passes none, meaning the no-arg method. A
+///   `provider(String)` overload must not satisfy it.
+///
+/// `parameterTypes` compares by `Class.getName()` rather than by identity: the
+/// comparison spans `invoke` calls that can move objects, and a name is stable
+/// across a GC where an `ObjectRef` is not.
+fn jla_get_declared_public_methods_list(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    // INSTANCE method: args[0] = receiver (System$1), args[1] = the Class,
+    // args[2] = the name, args[3] = the Class[] of parameter types.
+    let cls = match args.get(1) {
+        Some(Value::Object(Some(c))) => *c,
+        _ => return new_empty_list(ctx),
+    };
+    let want_name = match args.get(2) {
+        Some(Value::Object(Some(s))) => ctx.read_string(*s),
+        _ => None,
+    };
+    let want_params: Option<Vec<String>> = match args.get(3) {
+        Some(Value::Object(Some(arr))) => {
+            let arr = *arr;
+            let n = ctx.array_length(arr);
+            let mut v = Vec::with_capacity(n);
+            for i in 0..n {
+                match ctx.get_array_element(arr, i) {
+                    Value::Object(Some(c)) => {
+                        let name = class_name_via_get_name(ctx, c);
+                        v.push(name);
+                    }
+                    _ => v.push(String::new()),
+                }
+            }
+            Some(v)
+        }
+        _ => None,
+    };
+
+    let list = match new_array_list(ctx) {
+        Some(l) => l,
+        None => return Ok(Some(Value::Object(None))),
+    };
+    let list_pin = ctx.pin_native_root(list);
+
+    let methods = match ctx.invoke(
+        "java/lang/Class",
+        "getDeclaredMethods",
+        "()[Ljava/lang/reflect/Method;",
+        &[Value::Object(Some(cls))],
+    ) {
+        Ok(Some(Value::Object(Some(arr)))) => arr,
+        _ => {
+            let list = ctx.read_native_pin(list_pin, list);
+            ctx.unpin_native_roots(list_pin);
+            return Ok(Some(Value::Object(Some(list))));
+        }
+    };
+    let arr_pin = ctx.pin_native_root(methods);
+    let len = ctx.array_length(methods);
+
+    const ACC_PUBLIC: i32 = 0x0001;
+    for i in 0..len {
+        let methods = ctx.read_native_pin(arr_pin, methods);
+        let m = match ctx.get_array_element(methods, i) {
+            Value::Object(Some(m)) => m,
+            _ => continue,
+        };
+        let m_pin = ctx.pin_native_root(m);
+
+        let m_ref = ctx.read_native_pin(m_pin, m);
+        let name_ok = match ctx.invoke_virtual(m_ref, "getName", "()Ljava/lang/String;", &[]) {
+            Ok(Some(Value::Object(Some(s)))) => match (&want_name, ctx.read_string(s)) {
+                (Some(want), Some(got)) => *want == got,
+                (None, _) => true,
+                _ => false,
+            },
+            _ => false,
+        };
+        if !name_ok {
+            ctx.unpin_native_roots(m_pin);
+            continue;
+        }
+
+        let m_ref = ctx.read_native_pin(m_pin, m);
+        let is_public = matches!(
+            ctx.invoke_virtual(m_ref, "getModifiers", "()I", &[]),
+            Ok(Some(Value::Int(v))) if (v & ACC_PUBLIC) != 0
+        );
+        if !is_public {
+            ctx.unpin_native_roots(m_pin);
+            continue;
+        }
+
+        if let Some(want) = &want_params {
+            let m_ref = ctx.read_native_pin(m_pin, m);
+            let got: Vec<String> =
+                match ctx.invoke_virtual(m_ref, "getParameterTypes", "()[Ljava/lang/Class;", &[]) {
+                    Ok(Some(Value::Object(Some(pt)))) => {
+                        let n = ctx.array_length(pt);
+                        let mut v = Vec::with_capacity(n);
+                        for j in 0..n {
+                            match ctx.get_array_element(pt, j) {
+                                Value::Object(Some(c)) => {
+                                    let name = class_name_via_get_name(ctx, c);
+                                    v.push(name);
+                                }
+                                _ => v.push(String::new()),
+                            }
+                        }
+                        v
+                    }
+                    _ => Vec::new(),
+                };
+            if got != *want {
+                ctx.unpin_native_roots(m_pin);
+                continue;
+            }
+        }
+
+        let list_ref = ctx.read_native_pin(list_pin, list);
+        let m_ref = ctx.read_native_pin(m_pin, m);
+        let _ = ctx.invoke_virtual(
+            list_ref,
+            "add",
+            "(Ljava/lang/Object;)Z",
+            &[Value::Object(Some(m_ref))],
+        );
+        ctx.unpin_native_roots(m_pin);
+    }
+
+    let list = ctx.read_native_pin(list_pin, list);
+    ctx.unpin_native_roots(arr_pin);
+    ctx.unpin_native_roots(list_pin);
+    Ok(Some(Value::Object(Some(list))))
+}
+
+/// `cls.getName()` as a Rust `String`, empty when it cannot be read.
+fn class_name_via_get_name(ctx: &mut dyn NativeContext, cls: ObjectRef) -> String {
+    match ctx.invoke_virtual(cls, "getName", "()Ljava/lang/String;", &[]) {
+        Ok(Some(Value::Object(Some(s)))) => ctx.read_string(s).unwrap_or_default(),
+        _ => String::new(),
+    }
+}
+
+/// An empty `java.util.List`, for the early-out paths above.
+fn new_empty_list(ctx: &mut dyn NativeContext) -> MethodCallResult {
+    Ok(Some(Value::Object(new_array_list(ctx))))
+}
+
+/// A constructed, empty `java.util.ArrayList`.
+///
+/// Allocate-then-`<init>` rather than a bare allocation: the list is handed to
+/// real JDK bytecode, which reads `elementData`/`size`, and an object whose
+/// constructor never ran has neither.
+fn new_array_list(ctx: &mut dyn NativeContext) -> Option<ObjectRef> {
+    let cid = ctx.ensure_class_initialized("java/util/ArrayList").ok()?;
+    let list = ctx.alloc_object(cid, ctx.class_num_total_fields(cid).max(4));
+    ctx.invoke(
+        "java/util/ArrayList",
+        "<init>",
+        "()V",
+        &[Value::Object(Some(list))],
+    )
+    .ok()?;
+    Some(list)
 }
 
 fn jla_get_methods_or_null(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -1180,7 +1541,7 @@ fn register_java_lang_access(registry: &mut NativeMethodRegistry) {
         owner,
         "getDeclaredPublicMethods",
         "(Ljava/lang/Class;Ljava/lang/String;[Ljava/lang/Class;)Ljava/util/List;",
-        jla_get_declared_public_methods,
+        jla_get_declared_public_methods_list,
     );
     registry.register(
         owner,
@@ -2008,7 +2369,7 @@ fn jnio_page_size(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallRe
 /// spec-compatible: the legacy interface only documents the value
 /// shape, not strict per-call accuracy of the counters.
 fn jnio_get_direct_buffer_pool(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    let pool = alloc_concurrent_synthetic(ctx, "jdk/internal/misc/VM$BufferPool", 4);
+    let pool = try_alloc_concurrent_synthetic(ctx, "jdk/internal/misc/VM$BufferPool", 4)?;
     Ok(Some(Value::Object(Some(pool))))
 }
 
@@ -2443,6 +2804,26 @@ fn register_java_util_resource_bundle_access(registry: &mut NativeMethodRegistry
 /// every concrete-class interface method.  Called from the
 /// native-builtins initialisation path (both synthetic-jdk and
 /// real-JDK modes).
+///
+/// # Why an image census cannot adjudicate anything in this file
+///
+/// Every owner here is one of the JDK's own anonymous `Java*Access`
+/// implementations — `java/lang/System$1`, `java/net/InetAddress$1`,
+/// `java/lang/invoke/MethodHandleImpl$1` — and their methods are **ordinary
+/// bytecode** on every image, never `ACC_NATIVE`. The registrations here are
+/// CratonVM's stand-ins for that bytecode, so `image_declaring_method` scores
+/// every one of them `method-nowhere`, which is exactly what a dead
+/// registration also looks like.
+///
+/// `dc55e8057` deleted thirteen of them on that evidence and
+/// `representative_method_registered_per_owner` went red — one owner per run,
+/// because it reports the first gap it finds, so the restore took three rounds.
+/// Restored 2026-08-10.
+///
+/// **If a sweep proposes deleting a row in this file, the sweep is wrong.** The
+/// per-owner test below is the statement of intent the census cannot see, and
+/// `scripts/jdk-only-dead-sweep.py --pinned` is how that intent is fed back to
+/// it.
 pub fn register_wp1_4_shared_secrets(registry: &mut NativeMethodRegistry) {
     let __prev_cat = registry.current_category();
     registry.set_category(cratonvm_native_api::NativeKind::Bridge);

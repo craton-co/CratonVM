@@ -62,6 +62,27 @@
 //!   months, and the week-number family, whose rules depend on
 //!   `TimeZone`-provided strings or the calendar's `firstDayOfWeek` /
 //!   `minimalDaysInFirstWeek`.
+//!
+//! # Not a contract §1.4 shadow, and it should stop being re-argued
+//!
+//! This module's single registration —
+//! `java/text/DateFormat.format(Ljava/util/Date;)Ljava/lang/String;`, the only
+//! row a census attributes to this file — is a native in front of image
+//! bytecode, which is the shape §1.4 calls a shadow. It is nonetheless
+//! `NativeKind::Intrinsic` rather than `Bridge`, deliberately, and so is
+//! outside the `bridge_shadows_bytecode` population and exempt from the
+//! `--jdk-only` yield.
+//!
+//! The reason is the "faithfulness is CHECKED" section above, restated as the
+//! property a retirement wave needs: **this native cannot give an answer the
+//! bytecode would not.** Every unsupported shape falls through to the bytecode
+//! and every supported one is cross-checked against it, with a mismatch
+//! returning the BYTECODE answer and disabling the fast path for good. So
+//! retiring it changes no observable and costs the 557x it was written to
+//! close. Confirmed against a 2026-08-11 census (`kind: intrinsic`, one row);
+//! recorded so the next wave does not re-derive it from the "native in front
+//! of `Code`" predicate alone. See
+//! docs/known-issues/jdk-only/W7-22-shadow-retirement-logging-and-time.md §5.
 
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::sync::OnceLock;
@@ -520,7 +541,7 @@ fn obj_slot(ctx: &mut dyn NativeContext, obj: ObjectRef, slot: usize) -> Option<
 }
 
 fn class_name_is(ctx: &dyn NativeContext, obj: ObjectRef, want: &str) -> bool {
-    ctx.class_name_of_id(ctx.class_id_of_object(obj))
+    ctx.class_name_arc_of_id(ctx.class_id_of_object(obj))
         .as_deref()
         == Some(want)
 }
