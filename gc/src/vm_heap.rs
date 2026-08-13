@@ -2325,13 +2325,14 @@ impl VmHeap {
             use std::sync::atomic::Ordering as O;
             eprintln!(
                 "[GC] young_sweep: par_attempts={} par_accepts={} zero_spans={} \
-                 zero_empty_runs={} phantom_extents={} live_in_dead={} \
-                 walk_overshoot={} anchor_not_a_base={}",
+                 zero_empty_runs={} phantom_extents={} phantom_nonbase_marks={} \
+                 live_in_dead={} walk_overshoot={} anchor_not_a_base={}",
                 crate::gen_heap::PAR_SWEEP_ATTEMPTS.load(O::Relaxed),
                 crate::gen_heap::PAR_SWEEP_ACCEPTS.load(O::Relaxed),
                 crate::gen_heap::SWEEP_ZERO_SPAN_HITS.load(O::Relaxed),
                 crate::gen_heap::SWEEP_ZERO_SPAN_EMPTY_RUNS.load(O::Relaxed),
                 crate::gen_heap::SWEEP_PHANTOM_EXTENTS.load(O::Relaxed),
+                crate::gen_heap::SWEEP_PHANTOM_INTERIOR_MARKS.load(O::Relaxed),
                 crate::gen_heap::LIVE_IN_DEAD_SPANS.load(O::Relaxed),
                 crate::gen_heap::SWEEP_WALK_OVERSHOOT_HITS.load(O::Relaxed),
                 crate::gen_heap::SWEEP_ANCHOR_NOT_A_BASE.load(O::Relaxed),
@@ -3205,6 +3206,132 @@ mod concurrent_mark_controller_tests {
             VmHeap::G1(s) => Some(s),
             _ => None,
         }
+    }
+
+    /// **R6, the `VmHeap::Zgc` arm audit, verified against a cycle that
+    /// actually moves an object.**
+    ///
+    /// The production plan's R6 row says: *"58 arms plus a macro; the
+    /// affirmative ones (`true`, `(0,0)`) assert facts that are only true for
+    /// a non-moving collector, and none of them will fail loudly when they
+    /// become wrong."* Compaction (`CRATONVM_ZGC_RELOCATE=1`, 2026-08-13) is
+    /// the change that can make them wrong, so the audit is no longer
+    /// theoretical.
+    ///
+    /// The audit's finding is that the two arms which genuinely take a
+    /// **pre-GC address** — `watched_pre_gc_addr_survived` and
+    /// `pre_gc_addr_did_not_survive` — are already correct, because both
+    /// consult the `pointer_map` *before* they reach their ZGC arm. That is a
+    /// property worth a test rather than a reading: the ZGC arms themselves
+    /// (`is_addr_live`, a registry lookup) answer about the address as it is
+    /// *now*, and after a slide the old address holds zeroed bytes. Without
+    /// the map check, a survivor that moved would be reported dead at its old
+    /// address, and `process_references_after_gc` would drop every reference
+    /// to it — the exact H2/HIB-CV-32 shape those predicates were written for.
+    ///
+    /// The exact edit that trips this: delete either
+    /// `pointer_map.contains_key(&addr)` early return.
+    #[cfg(feature = "zgc")]
+    #[test]
+    fn the_pre_gc_address_predicates_are_correct_for_an_object_compaction_moved() {
+        let heap = VmHeap::Zgc(crate::zgc::ZgcRealHeap::with_capacity(256 * 1024));
+        let VmHeap::Zgc(z) = &heap else {
+            unreachable!("constructed as Zgc")
+        };
+        z.set_tlab_enabled(false);
+        // Garbage below, so the survivor has somewhere to slide to.
+        for _ in 0..8 {
+            z.alloc_object(ClassId::new(1), 4);
+        }
+        let survivor = z.alloc_object(ClassId::new(1), 0);
+        let old_addr = survivor.as_ptr() as usize;
+
+        let live = [old_addr];
+        let (moved, _reclaimed, map) = z.relocate_stw_for_test(&live);
+        assert_eq!(moved, 1, "the fixture must actually move the survivor");
+        assert!(map.contains_key(&old_addr));
+
+        // The address as it is NOW: nothing live is there any more.
+        assert!(
+            !heap.is_addr_live(old_addr),
+            "the old address must not read as live once the object has left it"
+        );
+
+        // ...and yet both pre-GC predicates must get the answer RIGHT, because
+        // each consults the pointer map before its ZGC arm.
+        assert!(
+            heap.watched_pre_gc_addr_survived(old_addr, &map),
+            "a survivor that MOVED must still count as having survived; \
+             without the pointer-map check this reads as death and every \
+             reference to it is dropped"
+        );
+        assert!(
+            !heap.pre_gc_addr_did_not_survive(old_addr, &map),
+            "and its negation must agree — these two must never disagree \
+             about the same address"
+        );
+    }
+
+    /// The same two predicates must still report a genuinely dead address as
+    /// dead when a compacting cycle ran.
+    ///
+    /// Without this, the test above is satisfied by a predicate that answers
+    /// "survived" for everything -- which would disable the stale-pointer
+    /// protection entirely rather than fix it.
+    ///
+    /// This one goes through the real `collect_garbage` rather than calling
+    /// the relocator directly, and it has to: an object is only *dead* once
+    /// the sweep has removed it from the registry, and `is_addr_live` is a
+    /// registry lookup. Driving the relocator alone leaves every allocation
+    /// still registered, so a "dead" address reads as live and the test fails
+    /// for a fixture reason that says nothing about the predicate. That was
+    /// this test's first draft.
+    /// Monitor-cleanup stub for the compaction fixtures.
+    #[cfg(feature = "zgc")]
+    struct R6NoMonitors;
+    #[cfg(feature = "zgc")]
+    impl MonitorCleanup for R6NoMonitors {
+        fn remap_after_gc(&self, _map: &cratonvm_types::PointerMap) {}
+        fn prune_dead(&self, _dead: &[usize]) {}
+    }
+
+    #[cfg(feature = "zgc")]
+    #[test]
+    fn a_genuinely_dead_address_is_still_dead_after_a_compacting_cycle() {
+        let _serialise = crate::zgc::tests::tests_overlay_lock();
+        cratonvm_types::flags::with_thread_overrides(
+            &[("CRATONVM_ZGC_RELOCATE", Some("1"))],
+            || {
+                let heap = VmHeap::Zgc(crate::zgc::ZgcRealHeap::with_capacity(256 * 1024));
+                let VmHeap::Zgc(z) = &heap else {
+                    unreachable!("constructed as Zgc")
+                };
+                z.set_tlab_enabled(false);
+                let mut dead_addrs = Vec::new();
+                for _ in 0..8 {
+                    dead_addrs.push(z.alloc_object(ClassId::new(1), 4).as_ptr() as usize);
+                }
+                let survivor = z.alloc_object(ClassId::new(1), 0);
+                let dead = *dead_addrs.last().expect("fixture allocated garbage");
+
+                let mut roots = [survivor];
+                // SAFETY: these unit tests run the heap single-threaded.
+                let stw = unsafe { crate::collector::StopTheWorldToken::new() };
+                let result = z.collect_garbage(&stw, &mut roots, &R6NoMonitors);
+                let map = result.pointer_map;
+
+                assert!(
+                    !map.contains_key(&dead),
+                    "a dead object is not relocated, so it gets no map entry"
+                );
+                assert!(
+                    !heap.watched_pre_gc_addr_survived(dead, &map),
+                    "a dead address must still read as dead -- otherwise the \
+                     stale-pointer protection is off rather than fixed"
+                );
+                assert!(heap.pre_gc_addr_did_not_survive(dead, &map));
+            },
+        );
     }
 
     /// **The `VmHeap::satb_barrier` ZGC arm actually reaches the collector.**
