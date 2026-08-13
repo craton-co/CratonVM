@@ -51,38 +51,145 @@ PY
 ```
 java.io.IOException: with_client_auth_cert failed: invalid peer certificate:
     Other(OtherError(UnsupportedCertVersion))
+java.io.IOException: ServerConfig with_single_cert failed: …    (same cause, server side)
 ```
 
 * 36 `SSLEngineTest.rethrowIfNotNull` (via `testMutualAuthInvalidClientCertSucceed`)
 * 24 `SSLEngineTest.testMutualAuthClientCertFail`
 * 12 `SSLEngineTest.testClientHostnameValidationFail`
 
-netty's mutual-auth fixtures are **X.509 version 1**, confirmed directly:
+#### What is actually v1
 
-```
-mutual_auth_invalid_client.p12   Version: 1 (0x0)
-mutual_auth_client.p12           Version: 1 (0x0)
-mutual_auth_server.p12           Version: 1 (0x0)
-mutual_auth_ca.pem               Version: 3 (0x2)   <- the anchor is fine
-```
+Every **end-entity** certificate in these fixtures; the anchor is not.
 
-`rustls-webpki` refuses them **by policy**, not by accident —
-`rustls-webpki-0.103.12/src/cert.rs:257`:
+| fixture | leaf | intermediate | root (anchor) |
+|---|---|---|---|
+| `mutual_auth_client.p12` | **v1** `CN=NettyTestClient` | v3 `NettyTestIntermediate` | v3 `NettyTestRoot` |
+| `mutual_auth_invalid_client.p12` | **v1** `CN=NettyTestInvalidClient` | **v1** `NettyTestInvalidIntermediate` | v3 `NettyTestRoot` |
+| `mutual_auth_server.p12` | **v1** `CN=NettyTestServer` | — | v3 `NettyTestRoot` |
+| `localhost_server.pem` | **v1** `CN=localhost` | — | v3 `NettyTestRoot` |
+
+The v1 *intermediate* in `mutual_auth_invalid_client.p12` is deliberate — it is
+what makes that fixture "invalid", and the test asserts the connection succeeds
+anyway because client auth is OPTIONAL. **Do not make that chain validate.** A
+v1 CA has no `basicConstraints`, so refusing it is correct under RFC 5280 and
+is what the fixture exists to exercise.
+
+#### There are two gates, and only the first one has been measured
+
+**Gate 1 — installing your OWN identity.** This is where all 72 die, and it
+involves no trust decision at all. `ClientConfig::with_client_auth_cert` /
+`ServerConfig::with_single_cert` call `CertifiedKey::from_der`, which calls
+`keys_match()`:
 
 ```rust
-// mozilla::pkix supports v1, v2, v3, and v4, including both the implicit
-// (correct) and explicit (incorrect) encoding of v1. We allow only v3.
-fn version3(input: &mut untrusted::Reader<'_>) -> Result<(), Error> { … }
+// rustls-cbc/src/crypto/signer.rs
+pub fn from_der(…) -> Result<Self, Error> {
+    let private_key = provider.key_provider.load_private_key(key)?;
+    let certified_key = Self::new(cert_chain, private_key);
+    match certified_key.keys_match() {
+        // Don't treat unknown consistency as an error
+        Ok(()) | Err(Error::InconsistentKeys(InconsistentKeys::Unknown)) => Ok(certified_key),
+        Err(err) => Err(err),
+    }
+}
+
+pub fn keys_match(&self) -> Result<(), Error> {
+    let Some(key_spki) = self.key.public_key() else {
+        return Err(InconsistentKeys::Unknown.into());
+    };
+    let cert = ParsedCertificate::try_from(self.end_entity_cert()?)?;   // <- webpki
+    match key_spki == cert.subject_public_key_info() { … }
+}
 ```
 
-The JDK's PKIX accepts v1 end-entity certificates, which is why HotSpot passes.
+`ParsedCertificate::try_from` is webpki's `Cert::from_der`, which calls
+`version3()` (`rustls-webpki-0.103.12/src/cert.rs:257`). A v1 cert makes the
+**SPKI extraction** fail, and that failure escapes as
+`InvalidCertificate(Other(UnsupportedCertVersion))` instead of being folded into
+the `InconsistentKeys::Unknown` arm the surrounding code already tolerates.
 
-**This is a decision, not a bug fix.** Closing it means vendoring and patching
-`rustls-webpki` the way `rustls-cbc` was vendored — a deliberate relaxation of a
-certificate parser's version policy, with its own review. Do not fold it into an
-unrelated change. The narrower alternative worth costing first: accept v1 only
-for the **end-entity** certificate and keep the v3 requirement for anchors and
-intermediates, which is what the JDK effectively does.
+So: rustls will not let this VM **present** a v1 certificate as its own
+identity, because a best-effort self-consistency check cannot parse it. JSSE
+has no such restriction.
+
+**Gate 2 — verifying the PEER's chain.** webpki's path building parses every
+certificate through the same `Cert::from_der`, so a v1 leaf would be rejected
+there too. **This is currently unmeasured — gate 1 masks it.** Whether gate 2
+bites at all is the first thing to establish, because it decides whether any of
+the vendoring options below are needed.
+
+Note webpki already exempts one position: `anchor_from_trusted_cert` catches
+`UnsupportedCertVersion` and re-parses with a v1-only parser, with the reasoning
+that a v1 cert "doesn't allow extensions, so there's no need to worry about
+embedded name constraints". The v3-only rule is a path-building policy, not a
+parser limitation.
+
+#### Variants
+
+**V0 — do nothing.** 72 failures stay. CratonVM is stricter than the JDK for any
+application whose own identity is a v1 certificate, which is a legacy-PKI and
+test-fixture shape rather than a modern one. Cost: nothing. Records a known
+divergence.
+
+**V1 — stop calling `keys_match` at the five identity-install sites. No
+vendoring.** Replace `with_client_auth_cert(chain, key)` /
+`with_single_cert(chain, key)` with the resolver form built on
+`CertifiedKey::new(chain, signing_key)`, which skips the consistency check.
+Every API used is public rustls; nothing is vendored or patched.
+
+*Precedent already in the tree:* `t27_tls.rs:1712`
+(`SniCertResolver::certified_key_from_pem`) already builds its `CertifiedKey`
+this way, so the multi-tenant SNI server path accepts a v1 certificate today
+while the five single-cert paths do not. V1 makes them consistent.
+
+*What it gives up:* the early "your certificate and private key do not match"
+error. That becomes a handshake-time failure instead of a config-time one. Note
+rustls itself treats this check as best-effort — a key provider that cannot
+expose a public key already skips it — and CratonVM's own `repair_ec_key_for_ring`
+path deliberately reconstructs keys, so the check is not load-bearing here.
+
+*Unknown it resolves:* whether gate 2 exists. **Do this first and re-measure.**
+If the 72 clear, there is no vendoring decision to make.
+
+**V2 — vendor `rustls-webpki`, relax v1 at the END-ENTITY position only.** Only
+if V1 leaves gate-2 failures. Add a `Cert::from_der_end_entity` that tolerates
+v1/v2 and use it exactly where an end-entity is parsed; leave intermediates and
+the v3 requirement for CAs untouched. This matches the JDK's effective
+behaviour, and it keeps `NettyTestInvalidIntermediate` rejected, which the
+fixture wants.
+
+*Cost:* a second vendored crypto crate alongside `rustls-cbc`, with the same
+maintenance obligation (pin the version, record the delta, re-base on upgrade).
+That is the real price — not the diff, which is small.
+
+**V3 — vendor and relax v1 everywhere.** Not recommended. Accepting a v1
+*intermediate* means accepting a CA with no `basicConstraints`, so any leaf can
+sign for any other. It would also flip the meaning of
+`testMutualAuthInvalidClientCertSucceed`.
+
+**V4 — bypass webpki for peer verification.** Route client-auth to the existing
+`PassthroughClientCertVerifier` (`t27_tls.rs:3381`) and let the Java
+`TrustManager` decide, which `engine_run_trust_check` already consults
+post-handshake. *Cost:* rustls then performs no chain validation for that
+connection and correctness rests entirely on this VM's own `x509_manager` path,
+which is less exercised. It also cannot be scoped to v1 — the decision has to be
+made at config-build time, before any peer certificate exists. Only worth it if
+V2 is rejected on maintenance grounds.
+
+**V5 — upstream it.** Ask `rustls-webpki` for an opt-in policy knob for v1
+end-entity certificates, in the shape of the existing
+`UnknownExtensionPolicy`. Slow and uncertain, but it is the only variant that
+ends with nothing vendored. Worth filing in parallel with V1 either way.
+
+#### Recommended order
+
+1. **V1**, then re-run `JdkSslEngineTest` and re-bucket. It is cheap, reversible,
+   consistent with code already in the tree, and it answers the gate-2 question
+   that every other variant depends on.
+2. If gate-2 failures remain, **V2**, as its own change with its own review —
+   not folded into unrelated work.
+3. **V5** in parallel, so the vendored delta has an exit.
 
 ### B. client-side mTLS material never reaches the session — 84 failures
 
