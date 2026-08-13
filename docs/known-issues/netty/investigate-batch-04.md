@@ -34,7 +34,7 @@ instances of the abstract `java.nio.channels.*` class while `channel.socket()`
 returns the real `sun.nio.ch.*Adaptor`**, so the adaptor's own JDK bytecode
 calls `*Impl`-declared methods that do not exist →
 `NoSuchMethodError`/`AbstractMethodError`. See
-[nio-channels-are-abstract-classed…](nio-channels-are-abstract-classed-so-jdk-adaptors-miss-impl-methods-20260812.md).
+[nio-channels-are-abstract-classed…](../../internal/fixed-suite-bugs/netty/nio-channels-abstract-classed-adaptor-bridges-FIXED-20260813.md).
 
 ## Classes
 
@@ -48,7 +48,7 @@ Legend: ✅ matches HotSpot · ⚪ fails on HotSpot too · ❌ CratonVM defect
 | `io.netty.channel.nio.NioIoHandlerEventCountTest` | FAIL | ✅ **3/3** |
 | `io.netty.channel.oio.OioEventLoopTest` | FAIL | ✅ **3/3** |
 | `io.netty.channel.pool.FixedChannelPoolMapDeadlockTest` | FAIL | ✅ **2/2** |
-| `io.netty.channel.socket.nio.NioDatagramChannelTest` | FAIL | ❌ 1/4 → [abstract-classed NIO channels](nio-channels-are-abstract-classed-so-jdk-adaptors-miss-impl-methods-20260812.md). `localAddress()` fixed; the no-arg `openDatagramChannel()` and the `getOption`/`setOption`/`supportedOptions` surface must land together |
+| `io.netty.channel.socket.nio.NioDatagramChannelTest` | FAIL | ✅ **FIXED 2026-08-13, 4/4** → [abstract-classed NIO channels — retired](../../internal/fixed-suite-bugs/netty/nio-channels-abstract-classed-adaptor-bridges-FIXED-20260813.md). The no-arg `openDatagramChannel()` bridge and the `getOption`/`setOption`/`supportedOptions` surface landed together, as this row said they had to |
 | `io.netty.channel.socket.nio.NioServerDomainSocketChannelTest` | FAIL | ❌ 6/7 — `testNioChannelOption`'s `SO_REUSEADDR` round-trip returns `0`; same generic `SocketOption` surface, UNIX-family server channel |
 | `io.netty.channel.socket.nio.NioSocketChannelTest` | FAIL | ✅ **8/8** |
 | `io.netty.channel.unix.NativeInetAddressTest` | FAIL | ❌ 1/2 → [Inet6Address drops the scope id](inet6address-drops-the-scope-id-20260812.md) — and drops a **non-zero** `%7` too, not just `%0` |
@@ -62,7 +62,7 @@ Legend: ✅ matches HotSpot · ⚪ fails on HotSpot too · ❌ CratonVM defect
 
 * `docs/internal/fixed-suite-bugs/datagramchannel-localaddress-bridge-FIXED-20260812.md`
   — the fix, and why the descriptor differs from SocketChannel's.
-* [`nio-channels-are-abstract-classed-so-jdk-adaptors-miss-impl-methods-20260812.md`](nio-channels-are-abstract-classed-so-jdk-adaptors-miss-impl-methods-20260812.md)
+* [`nio-channels-abstract-classed-adaptor-bridges-FIXED-20260813.md` (retired — ✅ FIXED 2026-08-13)](../../internal/fixed-suite-bugs/netty/nio-channels-abstract-classed-adaptor-bridges-FIXED-20260813.md)
   — the umbrella. Includes the four-line `openDatagramChannel()` patch that was
   written, measured and **backed out**, with the measurement showing why it
   cannot land without the option surface.

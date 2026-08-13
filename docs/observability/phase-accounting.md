@@ -342,9 +342,16 @@ than printing zeroes.)
 ## 8. The JFR sink
 
 `phase::write_jfr_report` builds its own `EventTypeRegistry` and calls
-`dump::dump_to_file` directly, so a phase report can be produced by a run that
-never started a flight recording — which, per the LIVENESS block in
+`jdk_chunk::dump_to_file` directly, so a phase report can be produced by a run
+that never started a flight recording — which, per the LIVENESS block in
 `jfr/src/lib.rs`, is every run today.
+
+The bytes are the **JDK's own** chunk format, which is what makes the JMC
+caveat below meaningful. Until 2026-08-13 this called `dump::dump_to_file` —
+CratonVM's internal format — and the JMC user this section is written for got
+`IOException: Unknown string encoding 17` instead of a timeline. `jfr/src/dump.rs`
+still owns that internal format and its matching Rust reader; see the module
+docs at the top of `jfr/src/jdk_chunk.rs` for why the two coexist.
 
 Three event types:
 
@@ -368,9 +375,12 @@ growing the built-in registry would change the metadata section of every
 existing recording (and `jfr/src/builtin.rs`'s `t6_total_event_count_47`).
 
 `the_jfr_sink_writes_a_readable_chunk` round-trips the file through
-`read_jfr_header` + `read_events` and asserts every decoded event has a
-registered type — the same invariant `fuzz/fuzz_targets/fuzz_jfr_chunk.rs`
-asserts against adversarial input.
+`jdk_chunk::read_chunk` and asserts every decoded event names a registered type —
+the same invariant `fuzz/fuzz_targets/fuzz_jfr_chunk.rs` asserts against
+adversarial input for the internal format. `read_chunk` is a real decoder for the
+JDK's format, not a mirror of the writer: the writer is separately validated
+against the JDK's own `RecordingFile` and `jfr summary`, so a `cargo test` with
+no JDK present still checks content rather than only self-consistency.
 
 ---
 

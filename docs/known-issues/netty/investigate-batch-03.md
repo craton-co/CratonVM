@@ -48,7 +48,7 @@ fails under shard contention
 | class | status seen | explained by |
 |---|---|---|
 | `io.netty.buffer.ReadOnlyDirectByteBufferBufTest` | FAIL | ✅ **60/60** |
-| `io.netty.buffer.ReadOnlyUnsafeDirectByteBufferBufTest` | FAIL | ✅ **60/60** vs the Unsafe-enabled HotSpot oracle 60/60 (plain HotSpot starts 0 of 57 — see the [unsafe property](unsafe-memory-access-property-flips-netty-to-unsafe-paths-20260812.md) page for why, and use `--sun-misc-unsafe-memory-access=allow` on the oracle) |
+| `io.netty.buffer.ReadOnlyUnsafeDirectByteBufferBufTest` | FAIL | ✅ **60/60** vs the Unsafe-enabled HotSpot oracle 60/60 (plain HotSpot starts 0 of 57 — see the unsafe property (retired: `unsafe-memory-access-property-flips-netty-to-unsafe-paths-20260812`) page for why, and use `--sun-misc-unsafe-memory-access=allow` on the oracle) |
 | `io.netty.buffer.RetainedDuplicatedByteBufTest` | FAIL/HANG | ✅ **416/416** |
 | `io.netty.buffer.RetainedSlicedByteBufTest` | FAIL | ✅ 410 ok / 6 aborted — **byte-identical to HotSpot** |
 | `io.netty.buffer.SimpleLeakAwareByteBufTest` | HANG | ✅ **425/425** |

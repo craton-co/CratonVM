@@ -2729,6 +2729,9 @@ fn os_process_user(pid: i64) -> Option<String> {
         .next()?
         .parse()
         .ok()?;
+    // SAFETY: `libc::passwd` is a plain C struct of pointers and integers, for
+    // which an all-zero bit pattern is a valid (null/0) value. It is only read
+    // after `getpwuid_r` below reports success, which is what fills it in.
     let mut pwd: libc::passwd = unsafe { std::mem::zeroed() };
     let mut buf = vec![0 as libc::c_char; 4096];
     let mut found: *mut libc::passwd = std::ptr::null_mut();

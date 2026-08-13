@@ -825,6 +825,25 @@ enum Syn {
 struct ChanState {
     object: ObjectRef,
     fields: [Syn; N_FIELDS],
+    /// Every `setOption` value Java has requested on this channel, by option
+    /// name.
+    ///
+    /// `F_REUSEADDR` above is the one-option ancestor of this map, and its doc
+    /// explains why the option state cannot live in `tcp_option_state()` alone:
+    /// that table is keyed by the `tcp_registry` id, so a channel that has not
+    /// been bound or connected yet — which is every channel at the moment its
+    /// options are configured — has nowhere to record. The single field covered
+    /// `SO_REUSEADDR`; every other option was still dropped, which is what made
+    /// a `setOption(SO_RCVBUF, n)` / `getOption(SO_RCVBUF)` round-trip on an
+    /// unbound channel answer the pre-set value (netty
+    /// `NioServerDomainSocketChannelTest.testNioChannelOption`, whose
+    /// `assertNotEquals(value1, value4)` reported "expected: not equal but was:
+    /// <0>" — both reads were the `else { 0 }` fallback).
+    ///
+    /// Keyed by name rather than by an enum so an option this shim does not
+    /// otherwise model still round-trips, which is what the generic
+    /// `SocketOption<T>` API promises.
+    opts: HashMap<String, i32>,
 }
 
 fn chan_fields() -> &'static RwLock<HashMap<i32, Vec<ChanState>>> {
@@ -857,8 +876,44 @@ fn cf_set(ctx: &mut dyn NativeContext, obj: ObjectRef, idx: usize, v: Value) {
         bucket.push(ChanState {
             object: obj,
             fields,
+            opts: HashMap::new(),
         });
     }
+}
+
+/// Record `value` for socket option `name` on this channel. See
+/// [`ChanState::opts`] for why the channel — not the registry id — owns it.
+fn cf_opt_set(ctx: &dyn NativeContext, obj: ObjectRef, name: &str, value: i32) {
+    if name.is_empty() {
+        return;
+    }
+    let key = ctx.identity_hash_code(obj);
+    let mut t = chan_fields().write();
+    let bucket = t.entry(key).or_default();
+    if let Some(state) = bucket.iter_mut().find(|state| state.object == obj) {
+        state.opts.insert(name.to_string(), value);
+    } else {
+        let mut opts = HashMap::new();
+        opts.insert(name.to_string(), value);
+        bucket.push(ChanState {
+            object: obj,
+            fields: default_syn(),
+            opts,
+        });
+    }
+}
+
+/// The value Java last set for socket option `name` on this channel, if any.
+fn cf_opt_get(ctx: &dyn NativeContext, obj: ObjectRef, name: &str) -> Option<i32> {
+    let key = ctx.identity_hash_code(obj);
+    chan_fields()
+        .read()
+        .get(&key)?
+        .iter()
+        .find(|state| state.object == obj)?
+        .opts
+        .get(name)
+        .copied()
 }
 
 /// Default synthetic state for a channel object before its `open()`/`accept()`
@@ -1046,6 +1101,27 @@ fn new_unix_socket_address(ctx: &mut dyn NativeContext, path: &str) -> MethodCal
 /// Decode a `java.net.ProtocolFamily` argument into an `F_FAMILY` value.
 /// Anything other than `StandardProtocolFamily.UNIX` (including a null or
 /// unreadable argument) maps to the INET default.
+/// The `ProtocolFamily` argument of an `open(ProtocolFamily)` native, whichever
+/// slot it occupies.
+///
+/// The same body is registered on TWO shapes: the STATIC factory
+/// `ServerSocketChannel.open(ProtocolFamily)`, where the family is `args[0]`,
+/// and the INSTANCE method `provider.openServerSocketChannel(ProtocolFamily)`,
+/// where `args[0]` is the provider and the family is `args[1]`. Both call sites
+/// hard-coded index 0, so on the provider path `decode_protocol_family` asked
+/// the *provider* for its `name()`, never got "UNIX", and stamped every
+/// provider-opened Unix-domain channel as INET.
+///
+/// That was invisible while nothing consumed `F_FAMILY` — and it stopped being
+/// invisible the moment `supportedOptions()` started answering per family:
+/// `provider.openServerSocketChannel(StandardProtocolFamily.UNIX)`, which is
+/// exactly what netty's `NioServerDomainSocketChannel.newChannel` calls, was
+/// answering the INET option set. The family is the LAST argument in both
+/// shapes, which is the one rule that fits both.
+fn protocol_family_arg(args: &[Value]) -> usize {
+    args.len().saturating_sub(1)
+}
+
 fn decode_protocol_family(ctx: &mut dyn NativeContext, args: &[Value], idx: usize) -> i32 {
     let Some(fam) = obj_or_none(args, idx) else {
         return 0;
@@ -1336,7 +1412,7 @@ fn sc_open_family_value(ctx: &mut dyn NativeContext, family: i32) -> MethodCallR
 /// remembered here — an AF_UNIX socket is created by `connect()`, exactly as
 /// the INET path defers its socket to `connect()`.
 fn sc_open_family(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let family = decode_protocol_family(ctx, args, 0);
+    let family = decode_protocol_family(ctx, args, protocol_family_arg(args));
     if family == FAMILY_UNIX && !crate::uds::is_supported() {
         return Err(unsupported_uds());
     }
@@ -3676,21 +3752,71 @@ fn apply_option(stream: &TcpStream, name: &str, val: i32) -> Result<(), std::io:
     }
 }
 
-fn read_option(stream: &TcpStream, name: &str) -> Result<i32, std::io::Error> {
+/// What the SOCKET itself can be asked. `None` means "this shim cannot read
+/// that option off a live stream" — the caller then falls back to what Java
+/// requested (`channel_option_fallback`), which is a better answer than a
+/// fabricated one and, for anything set before the bind, the only correct one.
+///
+/// It used to answer `64 * 1024` for the buffer sizes and `0` for everything
+/// else, unconditionally and ahead of any record of what Java had set — so a
+/// pre-bind `setOption(SO_RCVBUF, n)` read back as 64 KiB once the channel was
+/// connected. The 64 KiB default did not go away; it moved to the fallback,
+/// where it applies only when nothing better is known.
+fn read_option(stream: &TcpStream, name: &str) -> Result<Option<i32>, std::io::Error> {
     match name {
-        "TCP_NODELAY" => Ok(if stream.nodelay()? { 1 } else { 0 }),
-        // Keep an intentionally conservative non-zero fallback for channels
-        // whose options are inspected before Java has set them. A zero buffer
-        // size is not a valid Socket API result and causes NIO frameworks to
-        // allocate zero-capacity codec buffers.
-        "SO_RCVBUF" | "SO_SNDBUF" => Ok(64 * 1024),
-        _ => Ok(0),
+        "TCP_NODELAY" => Ok(Some(if stream.nodelay()? { 1 } else { 0 })),
+        _ => Ok(None),
     }
+}
+
+/// The name of a `java.net.SocketOption` argument.
+///
+/// Reads the `name` FIELD first — `java.net.StandardSocketOptions$StdSocketOption`
+/// declares one, and that covers the overwhelmingly common case without a Java
+/// call — and falls back to the interface method `name()`.
+///
+/// The fallback is not defensive padding; it is a real bug fix. Not every
+/// `SocketOption` the JDK's own adaptors pass is a `StdSocketOption`:
+/// `sun.nio.ch.SocketAdaptor.getOOBInline()` passes
+/// `sun.nio.ch.ExtendedSocketOption.SO_OOBINLINE`, whose implementation class
+/// has no `name` field. The old reader fell through to `read_string(option)`,
+/// got nothing, and asked `box_socket_option` to box under the EMPTY name — so
+/// the `SocketOption<Boolean>` came back as an `Integer` and the adaptor's own
+/// cast threw:
+///
+/// ```text
+///   ClassCastException: class java.lang.Integer cannot be cast to
+///                       class java.lang.Boolean
+/// ```
+///
+/// i.e. every non-standard `SocketOption` was silently the wrong TYPE, not
+/// merely the wrong value. Found by `AdaptorAudit`.
+pub(crate) fn socket_option_name(ctx: &mut dyn NativeContext, option: Option<ObjectRef>) -> String {
+    let Some(option) = option else {
+        return String::new();
+    };
+    if let Value::Object(Some(s)) = ctx.get_field_by_name(option, "name") {
+        if let Some(name) = ctx.read_string(s) {
+            if !name.is_empty() {
+                return name;
+            }
+        }
+    }
+    if let Ok(Some(Value::Object(Some(s)))) =
+        ctx.invoke_virtual(option, "name", "()Ljava/lang/String;", &[])
+    {
+        if let Some(name) = ctx.read_string(s) {
+            if !name.is_empty() {
+                return name;
+            }
+        }
+    }
+    ctx.read_string(option).unwrap_or_default()
 }
 
 /// `SocketChannel.setOption` is erased to `(SocketOption, Object)`, so real
 /// JDK callers provide a boxed Integer or Boolean rather than a raw int.
-fn socket_option_value(ctx: &mut dyn NativeContext, value: Value) -> i32 {
+pub(crate) fn socket_option_value(ctx: &mut dyn NativeContext, value: Value) -> i32 {
     match value {
         Value::Int(v) => v,
         Value::Object(Some(object)) => {
@@ -3716,13 +3842,7 @@ fn sc_set_option(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
         Some(o) => o,
         None => return Ok(Some(Value::Object(None))),
     };
-    let opt_name = match obj_or_none(args, 1) {
-        Some(o) => match ctx.get_field_by_name(o, "name") {
-            Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
-            _ => ctx.read_string(o).unwrap_or_default(),
-        },
-        None => String::new(),
-    };
+    let opt_name = socket_option_name(ctx, obj_or_none(args, 1));
     // Accept either Int or Boolean payloads — both arrive as Value::Int here.
     let val = socket_option_value(ctx, args.get(2).copied().unwrap_or(Value::Int(0)));
 
@@ -3733,6 +3853,10 @@ fn sc_set_option(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
     if opt_name == "SO_REUSEADDR" {
         cf_set(ctx, this, F_REUSEADDR, Value::Int(val));
     }
+    // …and every OTHER option has the same problem, with no `ssc_finish_bind`
+    // to rescue it. Record them all against the channel so `sc_get_option`
+    // below can answer what Java set even when there is still no socket to ask.
+    cf_opt_set(ctx, this, &opt_name, val);
 
     if let Some(id) = read_reg_id(ctx, this) {
         tcp_option_state()
@@ -3758,13 +3882,7 @@ fn sc_get_option(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
         Some(o) => o,
         None => return Ok(Some(Value::Int(0))),
     };
-    let opt_name = match obj_or_none(args, 1) {
-        Some(o) => match ctx.get_field_by_name(o, "name") {
-            Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
-            _ => ctx.read_string(o).unwrap_or_default(),
-        },
-        None => String::new(),
-    };
+    let opt_name = socket_option_name(ctx, obj_or_none(args, 1));
     // `SocketChannel.getOption` is declared `<T> T getOption(SocketOption<T>)`,
     // so the native MUST return a *boxed* object (Boolean/Integer), not a raw
     // `Value::Int` — a primitive returned for an object-typed method coerces to
@@ -3780,8 +3898,17 @@ fn sc_get_option(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
         } else {
             let map = tcp_registry().read();
             match map.get(&id) {
-                Some(TcpHandle::Stream(s)) => read_option(s, &opt_name).unwrap_or(0),
-                Some(TcpHandle::Bound(s)) => read_option(s, &opt_name).unwrap_or(0),
+                // Two arms, not one `|` pattern: `Stream` holds an
+                // `Arc<TcpStream>` and `Bound` a bare `TcpStream`, so the
+                // binding cannot have one type across both alternatives.
+                Some(TcpHandle::Stream(s)) => match read_option(s, &opt_name) {
+                    Ok(Some(v)) => v,
+                    _ => channel_option_fallback(ctx, this, &opt_name),
+                },
+                Some(TcpHandle::Bound(s)) => match read_option(s, &opt_name) {
+                    Ok(Some(v)) => v,
+                    _ => channel_option_fallback(ctx, this, &opt_name),
+                },
                 // A LISTENER is not a TcpStream, so `read_option` cannot see
                 // it. Ask the OS directly for the one option that is meaningful
                 // on a listener, and only fall back to what Java requested when
@@ -3793,23 +3920,47 @@ fn sc_get_option(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
                         None => cf_get(ctx, this, F_REUSEADDR).as_int().unwrap_or(0),
                     }
                 }
-                _ => 0,
+                // A listener has no `TcpStream` for `read_option` to inspect,
+                // so anything else it is asked for falls through to the
+                // channel-scoped record below rather than to a fabricated 0.
+                _ => channel_option_fallback(ctx, this, &opt_name),
             }
         }
-    } else if opt_name == "SO_REUSEADDR" {
+    } else {
         // Unbound channel: there is no socket to ask, so the honest answer is
         // what Java last set. Returning 0 here is what made a `setOption(true)`
-        // read back `false`.
-        cf_get(ctx, this, F_REUSEADDR).as_int().unwrap_or(0)
-    } else {
-        0
+        // read back `false` — for SO_REUSEADDR first, and for every other
+        // option until `cf_opt_get` existed.
+        channel_option_fallback(ctx, this, &opt_name)
     };
     box_socket_option(ctx, &opt_name, raw)
 }
 
+/// The answer for an option no live socket can be asked about: what Java last
+/// set, else the same conservative default `read_option` uses.
+///
+/// The buffer-size default is not cosmetic. A zero SO_RCVBUF is not a value any
+/// Socket API ever reports, and NIO frameworks size codec buffers from it —
+/// which is the reason `read_option` has carried the identical fallback for the
+/// connected case since long before this path existed.
+fn channel_option_fallback(ctx: &dyn NativeContext, this: ObjectRef, opt_name: &str) -> i32 {
+    if let Some(v) = cf_opt_get(ctx, this, opt_name) {
+        return v;
+    }
+    match opt_name {
+        "SO_REUSEADDR" => cf_get(ctx, this, F_REUSEADDR).as_int().unwrap_or(0),
+        "SO_RCVBUF" | "SO_SNDBUF" => 64 * 1024,
+        _ => 0,
+    }
+}
+
 /// Box a socket-option value as the JDK type the `SocketOption<T>` declares:
 /// `Boolean` for the flag options, otherwise `Integer`.
-fn box_socket_option(ctx: &mut dyn NativeContext, opt_name: &str, raw: i32) -> MethodCallResult {
+pub(crate) fn box_socket_option(
+    ctx: &mut dyn NativeContext,
+    opt_name: &str,
+    raw: i32,
+) -> MethodCallResult {
     let is_bool = matches!(
         opt_name,
         "TCP_NODELAY"
@@ -3818,6 +3969,11 @@ fn box_socket_option(ctx: &mut dyn NativeContext, opt_name: &str, raw: i32) -> M
             | "SO_REUSEPORT"
             | "SO_BROADCAST"
             | "SO_OOBINLINE"
+            // `IP_MULTICAST_LOOP` is `SocketOption<Boolean>`; it reaches this
+            // helper from the DatagramChannel side (`dc_get_option`), and an
+            // Integer here is the null-coerce → NPE this function exists to
+            // prevent.
+            | "IP_MULTICAST_LOOP"
     );
     if is_bool {
         ctx.invoke(
@@ -3839,7 +3995,10 @@ fn box_socket_option(ctx: &mut dyn NativeContext, opt_name: &str, raw: i32) -> M
 /// Resolve `java.net.StandardSocketOptions.<FIELD>`'s static value (a real
 /// `SocketOption<?>` singleton instance), or `None` if the field can't be
 /// resolved (defensive — should not happen for a real boot class).
-fn standard_socket_option(ctx: &mut dyn NativeContext, field_name: &str) -> Option<Value> {
+pub(crate) fn standard_socket_option(
+    ctx: &mut dyn NativeContext,
+    field_name: &str,
+) -> Option<Value> {
     let cid = ctx
         .ensure_class_initialized("java/net/StandardSocketOptions")
         .ok()?;
@@ -3874,6 +4033,10 @@ fn standard_socket_option(ctx: &mut dyn NativeContext, field_name: &str) -> Opti
 /// (callers that skip a `setOption` call when it's unlisted would otherwise
 /// just silently skip it instead of silently no-op-ing it) — the real fix
 /// is simply that this method must never throw.
+///
+/// This generic set is now only the ASYNCHRONOUS channels' answer; the
+/// stream/server channels answer per receiver — see
+/// [`supported_options_for_receiver`].
 fn supported_socket_options(ctx: &mut dyn NativeContext) -> MethodCallResult {
     let names = [
         "SO_RCVBUF",
@@ -3883,6 +4046,15 @@ fn supported_socket_options(ctx: &mut dyn NativeContext) -> MethodCallResult {
         "SO_LINGER",
         "TCP_NODELAY",
     ];
+    supported_options_set(ctx, &names)
+}
+
+/// Build the real `Set<SocketOption<?>>` for `names`, skipping any field the
+/// running JDK does not declare.
+pub(crate) fn supported_options_set(
+    ctx: &mut dyn NativeContext,
+    names: &[&str],
+) -> MethodCallResult {
     let mut values = Vec::with_capacity(names.len());
     for name in names {
         if let Some(v) = standard_socket_option(ctx, name) {
@@ -3901,8 +4073,68 @@ fn supported_socket_options(ctx: &mut dyn NativeContext) -> MethodCallResult {
     )
 }
 
-fn sc_supported_options(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    supported_socket_options(ctx)
+/// `supportedOptions()` differs per channel KIND and per protocol FAMILY, and
+/// answering one blanket set for all four is a wrong answer in both directions.
+///
+/// Measured on HotSpot JDK 25 / Linux (`UdsQ` probe), restricted to the options
+/// `java.net.StandardSocketOptions` declares — the `jdk.net.ExtendedSocketOptions`
+/// entries HotSpot also lists (`TCP_KEEPIDLE`, `SO_INCOMING_NAPI_ID`,
+/// `SO_PEERCRED`, …) are deliberately not advertised, because nothing here
+/// implements them:
+///
+/// ```text
+///   ServerSocketChannel UNIX  [SO_RCVBUF]
+///   SocketChannel       UNIX  [SO_LINGER, SO_RCVBUF, SO_SNDBUF]
+///   ServerSocketChannel INET  [SO_RCVBUF, SO_REUSEADDR, SO_REUSEPORT]
+///   SocketChannel       INET  [IP_TOS, SO_KEEPALIVE, SO_LINGER, SO_OOBINLINE,
+///                              SO_RCVBUF, SO_REUSEADDR, SO_REUSEPORT,
+///                              SO_SNDBUF, TCP_NODELAY]
+/// ```
+///
+/// The old blanket set claimed `TCP_NODELAY`, `SO_KEEPALIVE` and `SO_LINGER`
+/// on a listening channel (HotSpot lists none of them there) and claimed
+/// `SO_REUSEADDR` on a Unix-domain channel, which HotSpot rejects outright with
+/// `UnsupportedOperationException`. That over-claim is not cosmetic: netty's
+/// `NioChannelOption.setOption` uses `supportedOptions().contains(...)` as its
+/// ONLY gate, so an option listed here but unsupported by the socket is
+/// reported to the caller as successfully set.
+fn supported_options_for_receiver(
+    ctx: &mut dyn NativeContext,
+    this: Option<ObjectRef>,
+) -> MethodCallResult {
+    let Some(this) = this else {
+        return supported_socket_options(ctx);
+    };
+    let server = ctx
+        .class_name_of_id(ctx.class_id_of_object(this))
+        .unwrap_or_default()
+        .contains("ServerSocket");
+    let unix = is_unix_family(ctx, this);
+    match (server, unix) {
+        (true, true) => supported_options_set(ctx, &["SO_RCVBUF"]),
+        (false, true) => supported_options_set(ctx, &["SO_LINGER", "SO_RCVBUF", "SO_SNDBUF"]),
+        (true, false) => {
+            supported_options_set(ctx, &["SO_RCVBUF", "SO_REUSEADDR", "SO_REUSEPORT"])
+        }
+        (false, false) => supported_options_set(
+            ctx,
+            &[
+                "IP_TOS",
+                "SO_KEEPALIVE",
+                "SO_LINGER",
+                "SO_OOBINLINE",
+                "SO_RCVBUF",
+                "SO_REUSEADDR",
+                "SO_REUSEPORT",
+                "SO_SNDBUF",
+                "TCP_NODELAY",
+            ],
+        ),
+    }
+}
+
+fn sc_supported_options(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    supported_options_for_receiver(ctx, obj_or_none(args, 0))
 }
 
 /// Same set for the asynchronous channels — see `async_socket::
@@ -3939,7 +4171,7 @@ fn ssc_open_family_value(ctx: &mut dyn NativeContext, family: i32) -> MethodCall
 /// configured with `unixDomainSocketPath`. Only the family is recorded; the
 /// AF_UNIX socket itself is created by `bind()`, mirroring the INET path.
 fn ssc_open_family(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let family = decode_protocol_family(ctx, args, 0);
+    let family = decode_protocol_family(ctx, args, protocol_family_arg(args));
     if family == FAMILY_UNIX && !crate::uds::is_supported() {
         return Err(unsupported_uds());
     }

@@ -3242,8 +3242,13 @@ pub(super) fn tlab_alloc_shaped_inner(
     }
     if let Some((buf, size)) = refill {
         shared.mem.tlab_refill_count.fetch_add(1, Ordering::Relaxed);
+        // Read the outgoing TLAB's running per-thread allocation total before
+        // the struct is replaced — `Tlab::new` starts a fresh one at zero, and
+        // `getThreadAllocatedBytes` must not go backwards at a refill.
+        let carried = thread.tlab.thread_allocated_bytes();
         // SAFETY: buf and size were just returned by the arena allocator and the memory is zeroed.
         thread.tlab = unsafe { cratonvm_gc::Tlab::new(buf, size) };
+        thread.tlab.adopt_allocation_total(carried);
         // Start the new refill-window timer so `next_refill_size`
         // measures this TLAB's lifetime from the moment we installed it.
         thread.tlab.begin_refill(size);
@@ -3326,6 +3331,10 @@ pub(crate) fn alloc_object_shared(
             .mem
             .bytes_allocated_total
             .fetch_add(total_size as u64, std::sync::atomic::Ordering::Relaxed);
+        // Same bytes, per thread — the counter behind
+        // `com.sun.management.ThreadMXBean.getThreadAllocatedBytes`. It cannot
+        // come from the TLAB cursor here, because this object never touched it.
+        thread.tlab.note_external_allocation(total_size);
         return Ok(obj);
     }
     // Retire TLAB before GC — its memory is in the arena that will be collected
@@ -3358,12 +3367,13 @@ pub(crate) fn alloc_object_shared(
             .bytes_allocated_total
             // Widening: smaller integer -> 64-bit (zero/sign-extended, value preserved)
             .fetch_add(total_size as u64, std::sync::atomic::Ordering::Relaxed);
+        thread.tlab.note_external_allocation(total_size);
         return Ok(obj);
     }
     // G1 last-ditch: see `gc_alloc_array` — dead Old/humongous spans need a
     // completed mark cycle's cleanup; run one synchronously and retry once.
     g1_force_full_cycle(shared, thread);
-    shared
+    let obj = shared
         .mem
         .heap
         .try_alloc_object_full(class_id, num_fields)
@@ -3380,7 +3390,9 @@ pub(crate) fn alloc_object_shared(
             MethodCallFailed::InternalError(VmError::Runtime(RuntimeError::OutOfMemoryError {
                 message: format!("Java heap space (alloc_object with {} fields)", num_fields),
             }))
-        })
+        })?;
+    thread.tlab.note_external_allocation(total_size);
+    Ok(obj)
 }
 
 /// T1.7.7 — write an HPROF heap dump when allocation fails and the
@@ -3520,11 +3532,19 @@ pub(super) fn gc_alloc_array(
     if let Some(arr) = tlab_alloc_array(thread, shared, class_id, element_type, length) {
         return Ok(arr);
     }
+    // Everything below this line bypasses the TLAB, so the thread's allocation
+    // counter (`Tlab::thread_allocated_bytes`, read by
+    // `com.sun.management.ThreadMXBean.getThreadAllocatedBytes`) sees none of
+    // it from the cursor. Record it explicitly — arrays are precisely the
+    // shape that skips the TLAB, so an unrecorded array path would make the
+    // counter report a small fraction of a buffer-allocating workload.
+    let external_bytes = external_array_bytes(element_type, length);
     if let Some(arr) = shared
         .mem
         .heap
         .try_alloc_array_full(class_id, element_type, length)
     {
+        thread.tlab.note_external_allocation(external_bytes);
         return Ok(arr);
     }
     // Retire TLAB before GC
@@ -3545,13 +3565,14 @@ pub(super) fn gc_alloc_array(
         .heap
         .try_alloc_array_full(class_id, element_type, length)
     {
+        thread.tlab.note_external_allocation(external_bytes);
         return Ok(arr);
     }
     // G1 last-ditch: the young pause above cannot reclaim dead Old/humongous
     // spans — only a completed mark cycle's cleanup can. Run one
     // synchronously and retry once before surfacing OOM.
     g1_force_full_cycle(shared, thread);
-    shared
+    let arr = shared
         .mem
         .heap
         .try_alloc_array_full(class_id, element_type, length)
@@ -3560,7 +3581,23 @@ pub(super) fn gc_alloc_array(
             MethodCallFailed::InternalError(VmError::Runtime(RuntimeError::OutOfMemoryError {
                 message: format!("Java heap space (alloc_array length {})", length),
             }))
-        })
+        })?;
+    thread.tlab.note_external_allocation(external_bytes);
+    Ok(arr)
+}
+
+/// Footprint, in bytes, of an array that is about to be allocated outside the
+/// TLAB — header plus payload, computed the same way [`tlab_alloc_array`]
+/// computes `total_size`.
+///
+/// Saturating rather than checked: this feeds a monitoring counter, and an
+/// array whose data size overflows `usize` is about to fail its allocation
+/// anyway. Reporting the clamped figure keeps this off the error path.
+#[inline]
+fn external_array_bytes(element_type: ArrayElementType, length: usize) -> usize {
+    use cratonvm_gc::heap::ARRAY_DATA_OFFSET;
+    let data = cratonvm_gc::heap::array_data_size_checked(length, element_type).unwrap_or(0);
+    ARRAY_DATA_OFFSET.saturating_add(data)
 }
 
 /// Update the thread's root snapshot with current frame ObjectRefs.

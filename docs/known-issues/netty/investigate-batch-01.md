@@ -78,13 +78,13 @@ skipped · ⏱ wall-clock only, passes solo
 | `io.netty.buffer.AdaptiveBigEndianDirectByteBufTest` | HANG | ✅ fixes 1+2+3 → **415/417 solo in 70 s**, same as HotSpot. Its `testInternalNioBuffer()` only trips JUnit's 120 s per-test cap under shard contention → [throughput](adaptive-bytebuf-allocator-throughput-20260812.md) |
 | `io.netty.buffer.AdaptiveBigEndianHeapByteBufTest` | HANG | ✅ **415/417** (2 skipped) — same as HotSpot |
 | `io.netty.buffer.AdaptiveByteBufAllocatorGrowthTest` | HANG | ⏱ **400/400 solo** in 829 s vs HotSpot 11 s → [throughput](adaptive-bytebuf-allocator-throughput-20260812.md) |
-| `io.netty.buffer.AdaptiveByteBufAllocatorTest` | HANG | ⏱ **126/127, 0 failures, solo** in 500 s vs HotSpot 6 s → [throughput](adaptive-bytebuf-allocator-throughput-20260812.md). ⚠ the 1 skip is [ThreadMXBean](threadmxbean-not-com-sun-extension-20260812.md) |
+| `io.netty.buffer.AdaptiveByteBufAllocatorTest` | HANG | ⏱ **126/127, 0 failures, solo** in 500 s vs HotSpot 6 s → [throughput](adaptive-bytebuf-allocator-throughput-20260812.md). ⚠ the 1 skip is [ThreadMXBean](../../internal/fixed-bugs/mxbean-not-com-sun-extension-FIXED-20260813.md) — FIXED 2026-08-13, now 127/127 |
 | `io.netty.buffer.AdaptiveByteBufAllocatorUseCacheForNonEventLoopThreadsTest` | HANG | ⏱ **127/128, 0 failures, solo** in 437 s; same 1 skip as above |
 | `io.netty.buffer.AdaptiveLittleEndianDirectByteBufTest` | HANG | ✅ **415/417** — same as HotSpot |
 | `io.netty.buffer.AdaptiveLittleEndianHeapByteBufTest` | HANG | ✅ **415/417** — same as HotSpot |
 | `io.netty.buffer.AdvancedLeakAwareByteBufTest` | HANG | ✅ **426/426** — same as HotSpot |
 | `io.netty.buffer.AdvancedLeakAwareCompositeByteBufTest` | HANG | ✅ ok=497 aborted=9 — **byte-identical to HotSpot** |
-| `io.netty.buffer.AlignedPooledByteBufAllocatorTest` | HANG | ⚠ no failures, but runs 28 tests HotSpot skips → [unsafe-property](unsafe-memory-access-property-flips-netty-to-unsafe-paths-20260812.md) |
+| `io.netty.buffer.AlignedPooledByteBufAllocatorTest` | HANG | ⚠ no failures, but runs 28 tests HotSpot skips → unsafe-property (retired: `unsafe-memory-access-property-flips-netty-to-unsafe-paths-20260812`) |
 | `io.netty.buffer.BigEndianCompositeByteBufTest` | HANG | ✅ ok=487 aborted=9 — **byte-identical to HotSpot** |
 | `io.netty.buffer.BigEndianDirectByteBufTest` | HANG | ✅ **413/413** — same as HotSpot |
 | `io.netty.buffer.BigEndianHeapByteBufTest` | FAIL/HANG | ✅ **414/414** — same as HotSpot |
@@ -99,12 +99,12 @@ skipped · ⏱ wall-clock only, passes solo
   early on a different defect), and `AdaptivePoolingAllocator` carries no
   penalty of its own — it is the same per-call cost at 23× the call density.
   Read the corrected page, not this summary.
-* [`unsafe-memory-access-property-flips-netty-to-unsafe-paths-20260812.md`](unsafe-memory-access-property-flips-netty-to-unsafe-paths-20260812.md)
+* the retired `unsafe-memory-access-property-flips-netty-to-unsafe-paths-20260812` write-up (retired: `unsafe-memory-access-property-flips-netty-to-unsafe-paths-20260812`)
   — CratonVM pins `sun.misc.unsafe.memory.access=allow`, so netty takes its
   Unsafe fast paths on CratonVM and its safe paths on HotSpot 25. **Read this
   before triaging any other netty batch page**: the two VMs are not running the
   same netty code.
-* [`memorysegment-asbytebuffer-unimplemented-20260812.md`](memorysegment-asbytebuffer-unimplemented-20260812.md)
+* the retired `memorysegment-asbytebuffer-unimplemented-20260812` write-up (retired: `memorysegment-asbytebuffer-unimplemented-20260812`)
   — `MemorySegment.asByteBuffer()` throws `AbstractMethodError`, which is why
   netty's HotSpot-25-default allocator (`CleanerJava25`, FFM-`Arena`-backed)
   cannot allocate at all on CratonVM, and why the property above cannot simply
@@ -115,7 +115,7 @@ skipped · ⏱ wall-clock only, passes solo
   more defects in the same native that the first record did not name: no
   generation (so reuse deadlocked) and a flag-not-mode registration gate that
   had left synthetic-JDK mode with no `CyclicBarrier` constructor at all.
-* [`threadmxbean-not-com-sun-extension-20260812.md`](threadmxbean-not-com-sun-extension-20260812.md)
+* [`mxbean-not-com-sun-extension-FIXED-20260813.md`](../../internal/fixed-bugs/mxbean-not-com-sun-extension-FIXED-20260813.md) — FIXED 2026-08-13
   — `ManagementFactory.getThreadMXBean()` / `getOperatingSystemMXBean()` do not
   implement their `com.sun.management` extensions, so feature-detecting callers
   take their fallback path.

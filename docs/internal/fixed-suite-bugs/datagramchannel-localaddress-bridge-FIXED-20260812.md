@@ -21,7 +21,7 @@ CratonVM fabricates NIO channels as instances of the **abstract**
 `sun.nio.ch.DatagramSocketAdaptor`. That adaptor is real JDK bytecode and calls
 `DatagramChannelImpl.localAddress()` — a method the abstract class does not
 declare. The umbrella issue is
-[nio-channels-are-abstract-classed…](../../known-issues/netty/nio-channels-are-abstract-classed-so-jdk-adaptors-miss-impl-methods-20260812.md).
+[nio-channels-abstract-classed-adaptor-bridges (retired, FIXED 2026-08-13)](netty/nio-channels-abstract-classed-adaptor-bridges-FIXED-20260813.md).
 
 The tree's established answer is to register the Impl-declared method on the
 abstract class as a native, and **`SocketChannel` and `ServerSocketChannel`
