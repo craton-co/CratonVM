@@ -1093,6 +1093,40 @@ fn host_input_is_numeric_literal(input: &str) -> bool {
     !unscoped.is_empty() && unscoped.parse::<IpAddr>().is_ok()
 }
 
+/// The `%scope` of a textual address literal, if it carries one.
+///
+/// `InetAddress.getByName("fe80::1%1")` and `getByName("fe80::1%eth0")` both
+/// produce an `Inet6Address` whose `getScopeId()`/`getHostAddress()` remember
+/// the scope on HotSpot. [`resolve_host`] answers with a bare
+/// `std::net::IpAddr`, which cannot carry one, so the scope must be taken from
+/// the INPUT text and threaded to the allocator separately.
+pub(crate) fn host_input_scope(input: &str) -> Option<&str> {
+    let bare = input
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(input);
+    match bare.split_once('%') {
+        Some((_, scope)) if !scope.is_empty() => Some(scope),
+        _ => None,
+    }
+}
+
+/// Split a possibly-scoped numeric address text into `(address, scope)`.
+///
+/// The `InetAddress` side table stores the scope glued onto the address text
+/// (`fe80:0:0:0:0:0:0:1%eth0`) because it is the only per-mirror store that is
+/// already a scanned + remapped GC root. Every consumer of the ADDRESS goes
+/// through [`inet_addr_resolve`], which splits here and hands back the bare
+/// half, so the storage choice is invisible to them: `getAddress()`, `equals`,
+/// `hashCode` and the `native-io` bind/connect decoders keep parsing a plain
+/// `IpAddr`. Only [`inet6_scope_suffix`] reads the other half.
+fn split_addr_scope(text: &str) -> (&str, Option<&str>) {
+    match text.split_once('%') {
+        Some((addr, scope)) if !scope.is_empty() => (addr, Some(scope)),
+        _ => (text, None),
+    }
+}
+
 /// `pub(crate)` re-export of [`resolve_host`] for sibling modules that need
 /// to resolve a hostname/literal to an IP string without duplicating the
 /// IPv4/IPv6-literal-then-DNS-fallback logic (used by `phases_early.rs`'s
@@ -1120,6 +1154,19 @@ pub(crate) fn inet_addr_resolve_external(
 /// `phases_early.rs` can consult the same table — otherwise they would read
 /// the (now intentionally unpopulated) instance slots and return null.
 pub(crate) fn inet_addr_get(this: ObjectRef) -> Option<(String, String)> {
+    // The stored address text may carry an IPv6 `%scope` (see
+    // [`split_addr_scope`]). Strip it here so EVERY consumer of this
+    // accessor — `net_channels`' channel decoders, `plain_socket`'s connect
+    // target, `InetSocketAddress.getHostString()` — keeps receiving the bare
+    // numeric form it parses today. Only [`inet6_scope_suffix`] reads the raw
+    // entry.
+    let (host, ip) = inet_addr_get_raw(this)?;
+    let (bare, _) = split_addr_scope(&ip);
+    Some((host, bare.to_string()))
+}
+
+/// The side-table entry exactly as stored, scope suffix included.
+fn inet_addr_get_raw(this: ObjectRef) -> Option<(String, String)> {
     inet_addr_side_table().lock().get(&this).cloned()
 }
 
@@ -1254,6 +1301,8 @@ fn populate_inet_holder(
     ia: ObjectRef,
     host: &str,
     ip: &str,
+    // NOT named `scope`: the local `NativeHandleScope` below owns that name.
+    scope_arg: Option<&str>,
 ) -> Result<ObjectRef, MethodCallFailed> {
     // Cross-call GC-safety (2026-08-04). Every `alloc_concurrent_synthetic` /
     // `create_string` / `new_array` below ALLOCATES, and the first one is
@@ -1336,12 +1385,32 @@ fn populate_inet_holder(
         let h6_cur = scope.get(&h6_h);
         let arr_cur = scope.get(&arr_h);
         scope.set_field_by_name(h6_cur, "ipaddress", Value::Object(Some(arr_cur)));
-        // Loopback / global addresses carry no scope; link-local scope ids are
-        // not recoverable from a bare `Ipv6Addr`, so leave scope_id unset (0).
+        // Loopback / global addresses carry no scope. When the caller DID
+        // supply one it must reach `holder6`, because `Inet6Address
+        // .getScopeId()` is un-intercepted real-JDK bytecode reading exactly
+        // this field: leaving it 0 made `getByName("fe80::1%1").getScopeId()`
+        // answer 0 where HotSpot answers 1. An interface NAME is resolved to
+        // its kernel index the way the JDK's own `Inet6Address(String, byte[],
+        // NetworkInterface)` ctor does; `scope_ifname` itself stays null
+        // because minting a `NetworkInterface` here would recurse through
+        // `re8_make_interface`, which allocates `InetAddress`es of its own.
+        // The rendered `%eth0` form comes from the side table instead — see
+        // [`inet6_scope_suffix`].
+        let scope_id = scope_arg
+            .and_then(|s| s.parse::<i32>().ok().or_else(|| Some(re8_iface_index(s))))
+            .filter(|id| *id > 0);
+        let (id, id_set) = match scope_id {
+            Some(id) => (id, 1),
+            // A `%name` we could not resolve still means "scoped": the flag
+            // drives HotSpot's `%` rendering, and the side table supplies the
+            // text, so dropping it here would silently unscope the address.
+            None if scope_arg.is_some() => (0, 1),
+            None => (0, 0),
+        };
         let h6_cur = scope.get(&h6_h);
-        scope.set_field_by_name(h6_cur, "scope_id", Value::Int(0));
+        scope.set_field_by_name(h6_cur, "scope_id", Value::Int(id));
         let h6_cur = scope.get(&h6_h);
-        scope.set_field_by_name(h6_cur, "scope_id_set", Value::Int(0));
+        scope.set_field_by_name(h6_cur, "scope_id_set", Value::Int(id_set));
         let ia_cur = scope.get(&ia_h);
         let h6_cur = scope.get(&h6_h);
         scope.set_field_by_name(ia_cur, "holder6", Value::Object(Some(h6_cur)));
@@ -1359,6 +1428,122 @@ fn inet_addr_field(ctx: &mut dyn NativeContext, this: ObjectRef, which: usize) -
         return Value::Object(Some(ctx.create_string(&s)));
     }
     ctx.get_field(this, which)
+}
+
+/// The `%…` suffix HotSpot's `Inet6Address$Inet6AddressHolder.getHostAddress()`
+/// appends, or `None` for an address that carries no scope.
+///
+/// The JDK's own body is
+///
+/// ```java
+/// String s = numericToTextFormat(ipaddress);
+/// if (scope_ifname != null) s = s + "%" + scope_ifname.getName();
+/// else if (scope_id_set)    s = s + "%" + scope_id;
+/// ```
+///
+/// — note the ORDER (a named interface wins over the numeric id) and note that
+/// the numeric branch is gated on `scope_id_set`, **not** on `scope_id != 0`.
+/// `Inet6AddressHolder.init` sets the flag for any `scope_id >= 0`, so
+/// `Inet6Address.getByAddress(host, addr, 0)` — exactly what
+/// `io.netty.channel.unix.NativeInetAddress.address()` calls for a link-local
+/// peer — must render `%0`, while `getByAddress(host, addr, -1)` must render no
+/// suffix at all. A `scope_id != 0` test gets that pair backwards in both
+/// directions.
+///
+/// Only the SUFFIX is produced here; the numeric text itself stays in the
+/// side table / `holder6` unscoped, because every other reader of it
+/// (`getAddress()`, `equals`, `hashCode`, `isLoopbackAddress`, and the
+/// `native-io` bind/connect decoders) parses it as a bare `IpAddr` and a
+/// `%scope` suffix would make that parse fail.
+fn inet6_scope_suffix(ctx: &mut dyn NativeContext, this: ObjectRef) -> Option<String> {
+    // A CratonVM-minted mirror carries its scope in the side table, glued to
+    // the address text: it is built from a textual literal (`getByName
+    // ("fe80::1%eth0")`) or from `getifaddrs`, neither of which produces the
+    // `NetworkInterface` object `holder6.scope_ifname` would need — and
+    // building one here would recurse, since `re8_make_interface` mints
+    // `InetAddress`es of its own.
+    if let Some((_, ip)) = inet_addr_get_raw(this) {
+        if let (_, Some(scope)) = split_addr_scope(&ip) {
+            return Some(scope.to_string());
+        }
+    }
+    let holder6 = match ctx.get_field_by_name(this, "holder6") {
+        Value::Object(Some(h)) => h,
+        _ => return None,
+    };
+    // A named scope interface wins, exactly as the JDK orders it. Read the
+    // `name` FIELD rather than calling `getName()`: every `NetworkInterface`
+    // this VM hands out is a REAL-layout object built through the JDK's own
+    // `(String,int,InetAddress[])` constructor (see `re8_make_interface`), so
+    // the field is there — and an `invoke_virtual` here would run Java, hence
+    // possibly a moving collection, in the middle of a caller that is holding
+    // a Java `String` reference for the base address text.
+    if let Value::Object(Some(nif)) = ctx.get_field_by_name(holder6, "scope_ifname") {
+        if let Value::Object(Some(s)) = ctx.get_field_by_name(nif, "name") {
+            if let Some(name) = ctx.read_string(s) {
+                if !name.is_empty() {
+                    return Some(name);
+                }
+            }
+        }
+    }
+    match ctx.get_field_by_name(holder6, "scope_id_set") {
+        Value::Int(set) if set != 0 => match ctx.get_field_by_name(holder6, "scope_id") {
+            Value::Int(id) => Some(id.to_string()),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// The numeric text of an InetAddress mirror WITH the IPv6 scope suffix —
+/// i.e. what `getHostAddress()` must answer.
+///
+/// Every public renderer goes through here: `getHostAddress()` on all three
+/// registered classes, the `getHostName()` no-name fallback (HotSpot reaches
+/// the same place by failing a reverse lookup and returning `getHostAddress()`)
+/// and `toString()`'s right-hand half. They previously each read `IA_ADDR`
+/// directly and so each dropped the scope independently.
+///
+/// `pub(crate)` for the `phases_early.rs` duplicates of the same three natives.
+pub(crate) fn inet_addr_scoped_text(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    default: &str,
+) -> String {
+    let ip = inet_addr_field_string_or(ctx, this, IA_ADDR, default);
+    match inet6_scope_suffix(ctx, this) {
+        // `contains('%')` guards the (currently unreachable) case of a mirror
+        // whose stored text is already scoped — never append twice.
+        Some(scope) if !ip.is_empty() && !ip.contains('%') => format!("{ip}%{scope}"),
+        _ => ip,
+    }
+}
+
+/// `getHostAddress()` for every InetAddress class we register it on.
+///
+/// `pub(crate)` because the duplicate registration in `phases_early.rs` must
+/// answer identically — `getHostName` had six registrations and the winning
+/// pair was on the concrete subclasses (see
+/// `docs/internal/fixed-suite-bugs/inetaddress-tostring-hostname-literal-addresses-FIXED.md`),
+/// so a scope fix applied to only one of them is invisible half the time.
+pub(crate) fn inet_addr_host_address_value(ctx: &mut dyn NativeContext, this: ObjectRef) -> Value {
+    // `inet_addr_field` keeps the legacy fallback: an address object we never
+    // recorded and that has no `holder` still answers from its raw slot.
+    let base = inet_addr_field(ctx, this, IA_ADDR);
+    let Some(scope) = inet6_scope_suffix(ctx, this) else {
+        return base;
+    };
+    let Value::Object(Some(s)) = base else {
+        return base;
+    };
+    match ctx.read_string(s) {
+        // `contains('%')` never appends twice.
+        Some(text) if !text.is_empty() && !text.contains('%') => {
+            Value::Object(Some(ctx.create_string(&format!("{text}%{scope}"))))
+        }
+        _ => base,
+    }
 }
 
 /// `InetAddress.getHostName()` / `getCanonicalHostName()`.
@@ -1384,7 +1569,11 @@ fn inet_addr_host_name_value(ctx: &mut dyn NativeContext, this: ObjectRef) -> Va
     if !name.is_empty() {
         return Value::Object(Some(ctx.create_string(&name)));
     }
-    let ip = inet_addr_field_string_or(ctx, this, IA_ADDR, "");
+    // The no-name fallback is `getHostAddress()`, scope suffix and all —
+    // `io.netty.channel.unix.NativeInetAddressTest.testLinkOnlyAddressIncludeScopeId`
+    // asserts exactly this through `getHostName()`, not through
+    // `getHostAddress()`.
+    let ip = inet_addr_scoped_text(ctx, this, "");
     Value::Object(Some(ctx.create_string(&ip)))
 }
 
@@ -2120,12 +2309,24 @@ fn ipv6_uncompressed_text(v6: &std::net::Ipv6Addr) -> String {
 }
 
 fn alloc_inet_address(ctx: &mut dyn NativeContext, host: &str, ip: &str) -> Result<ObjectRef, MethodCallFailed> {
+    // An IPv6 `%scope` travels with the address text through every caller
+    // (`getByName("fe80::1%eth0")`, the `getifaddrs` interface enumeration).
+    // Split it off before normalising — `hotspot_ip_string` parses the text,
+    // and a scoped literal parses as nothing, which used to silently classify
+    // the mirror as an `Inet4Address`.
+    let (ip_bare, scope) = split_addr_scope(ip);
     // Canonicalise the address string to HotSpot's exact textual form (v4-mapped
     // fold + uncompressed IPv6) — see [`hotspot_ip_string`] — so the mirror is an
     // `Inet4Address` with a 4-byte `getAddress()` where appropriate and
     // `getHostAddress()` is byte-identical to HotSpot.
-    let ip_norm = hotspot_ip_string(ip);
+    let ip_norm = hotspot_ip_string(ip_bare);
     let ip = ip_norm.as_str();
+    // A scope only exists on IPv6. A v4-mapped address folded to a dotted quad
+    // above is an `Inet4Address` now and must not keep one.
+    let scope = match ip.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V6(_)) => scope,
+        _ => None,
+    };
     // Allocate the *concrete* address class so `instanceof Inet4Address`
     // checks (e.g. Hazelcast's `DefaultAddressPicker`) and virtual dispatch
     // resolve correctly. A bare `InetAddress` is abstract in real-JDK.
@@ -2140,7 +2341,14 @@ fn alloc_inet_address(ctx: &mut dyn NativeContext, host: &str, ip: &str) -> Resu
     // there poisons real-JDK InetAddress bytecode dispatch (bogus
     // `NoSuchMethodError java/lang/String.getHostName()`). See
     // `inet_addr_side_table()` for the full rationale.
-    inet_addr_set(ia, host, ip);
+    //
+    // The scope goes back onto the stored text; `inet_addr_resolve` splits it
+    // off again for every address consumer, and only `inet6_scope_suffix`
+    // reads it (see [`split_addr_scope`]).
+    match scope {
+        Some(s) => inet_addr_set(ia, host, &format!("{ip}%{s}")),
+        None => inet_addr_set(ia, host, ip),
+    }
     // Additionally populate a *real* `InetAddress$InetAddressHolder` so any
     // un-overridden real-JDK `InetAddress` / `Inet4Address` bytecode (the
     // `final` `getHostName()` accessor, `toString()`, …) reads a consistent
@@ -2152,7 +2360,7 @@ fn alloc_inet_address(ctx: &mut dyn NativeContext, host: &str, ip: &str) -> Resu
     // on the pre-GC identity, but that table is a scanned+remapped root
     // (`gc_scan_inet_addr_roots` / `gc_update_inet_addr_refs`), so it follows
     // the relocation on its own.
-    Ok(populate_inet_holder(ctx, ia, host, ip)?)
+    Ok(populate_inet_holder(ctx, ia, host, ip, scope)?)
 }
 
 /// `InetAddress.getByAddress(byte[])` — construct a concrete, layout-correct
@@ -6292,7 +6500,15 @@ fn register_re3_inet_address(r: &mut NativeMethodRegistry) {
             // the name "localhost". A numeric literal carries none — HotSpot's
             // `getByName("127.0.0.1").toString()` is `/127.0.0.1` — which is
             // what `alloc_inet_address_for_input` decides.
-            let obj = alloc_inet_address_for_input(ctx, &name, &ip.to_string())?;
+            //
+            // `resolve_host` answers with a bare `IpAddr`, which cannot carry
+            // an IPv6 `%scope`; take it back off the input text so
+            // `getByName("fe80::1%1").getScopeId()` is 1 rather than 0.
+            let ip_text = match host_input_scope(&name) {
+                Some(scope) if ip.is_ipv6() => format!("{ip}%{scope}"),
+                _ => ip.to_string(),
+            };
+            let obj = alloc_inet_address_for_input(ctx, &name, &ip_text)?;
             Ok(Some(Value::Object(Some(obj))))
         },
     );
@@ -6340,9 +6556,16 @@ fn register_re3_inet_address(r: &mut NativeMethodRegistry) {
             } else {
                 host
             };
+            // Same rule as `getByName` above: `to_socket_addrs` cannot carry an
+            // IPv6 `%scope`, so take it back off the input text.
+            let scope = host_input_scope(&name).map(str::to_string);
             for (i, ip) in addrs.iter().enumerate() {
+                let text = match scope.as_deref() {
+                    Some(s) if ip.contains(':') => format!("{ip}%{s}"),
+                    _ => ip.clone(),
+                };
                 // Same rule as `getByName` above: a literal keeps no name.
-                let obj = alloc_inet_address_for_input(ctx, &name, ip)?;
+                let obj = alloc_inet_address_for_input(ctx, &name, &text)?;
                 ctx.set_array_element(arr, i, Value::Object(Some(obj)));
             }
             Ok(Some(Value::Object(Some(arr))))
@@ -6375,7 +6598,7 @@ fn register_re3_inet_address(r: &mut NativeMethodRegistry) {
 
     r.register(ia, "getHostAddress", "()Ljava/lang/String;", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        Ok(Some(inet_addr_field(ctx, this, IA_ADDR)))
+        Ok(Some(inet_addr_host_address_value(ctx, this)))
     });
     r.register(ia, "getHostName", "()Ljava/lang/String;", |ctx, args| {
         let this = obj_arg(args, 0)?;
@@ -6457,7 +6680,7 @@ fn register_re3_inet_address(r: &mut NativeMethodRegistry) {
             "()Ljava/lang/String;",
             |ctx, args| {
                 let this = obj_arg(args, 0)?;
-                Ok(Some(inet_addr_field(ctx, this, IA_ADDR)))
+                Ok(Some(inet_addr_host_address_value(ctx, this)))
             },
         );
         // These CONCRETE-subclass registrations are the ones that actually
@@ -6553,8 +6776,11 @@ fn register_inet_address_object_methods(r: &mut NativeMethodRegistry, cls: &'sta
     r.register(cls, "toString", "()Ljava/lang/String;", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let host = inet_addr_field_string_or(ctx, this, IA_HOST, "");
-        let ip = inet_addr_field_string_or(ctx, this, IA_ADDR, "");
-        // Real-JDK `InetAddress.toString()` => `hostName + "/" + ipString`.
+        // Real-JDK `InetAddress.toString()` is
+        // `Objects.toString(holder().getHostName(), "") + "/" + getHostAddress()`
+        // — the right-hand half is `getHostAddress()`, so it carries the IPv6
+        // scope suffix too.
+        let ip = inet_addr_scoped_text(ctx, this, "");
         let s = ctx.create_string(&format!("{host}/{ip}"));
         Ok(Some(Value::Object(Some(s))))
     });
@@ -6564,11 +6790,23 @@ fn register_inet_address_object_methods(r: &mut NativeMethodRegistry, cls: &'sta
         // Real-JDK `Inet4Address.hashCode()` returns the packed address int.
         let h = match ip.parse::<IpAddr>() {
             Ok(IpAddr::V4(v4)) => i32::from_be_bytes(v4.octets()),
+            // `Inet6Address.hashCode()` is a wrapping SUM of the four 4-byte
+            // groups, each accumulated as `(component << 8) + ipaddress[i]`
+            // over SIGNED bytes — not an XOR, and not over unsigned bytes.
+            // Both differences are observable: for
+            // `fe80:3030:3030:3030:3030:3030:3030:3031` the JDK answers
+            // -1911504703 where the XOR-of-unsigned form answered something
+            // else entirely, so an `Inet6Address` used as a HashMap key
+            // hashed to a different bucket than an equal one obtained from
+            // real-JDK bytecode.
             Ok(IpAddr::V6(v6)) => {
-                let o = v6.octets();
                 let mut h = 0i32;
-                for chunk in o.chunks(4) {
-                    h ^= i32::from_be_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+                for chunk in v6.octets().chunks(4) {
+                    let mut component = 0i32;
+                    for b in chunk {
+                        component = component.wrapping_shl(8).wrapping_add(i32::from(*b as i8));
+                    }
+                    h = h.wrapping_add(component);
                 }
                 h
             }
@@ -14594,6 +14832,30 @@ fn re8_scan_host_ifaces() -> Vec<Re8HostIface> {
     // SAFETY: `head` came from the successful `getifaddrs` above, is still the
     // list head (the walk advanced a copy), and is freed exactly once.
     unsafe { libc::freeifaddrs(head) };
+    // The JDK's Linux enumeration CREATES a `NetworkInterface` from an
+    // address, so an interface carrying none is not in `getAll0()`'s output at
+    // all: HotSpot JDK 25 on this host reports five interfaces where the
+    // `AF_PACKET` entries `getifaddrs` also returns would make six (`ens1` is
+    // configured but address-less). Reporting the extra one gave
+    // `getNetworkInterfaces()` a member `getByName` on HotSpot answers `null`
+    // for, and put an interface with an empty `getInetAddresses()` in front of
+    // any "pick an interface and take its address" scan.
+    out.retain(|iface| !iface.addrs.is_empty());
+    // The JDK builds its interface list by PREPENDING each newly seen
+    // interface, so `getNetworkInterfaces()` hands them back in the reverse of
+    // the order it enumerated them, and `lo` — first out of the kernel — comes
+    // last. Reversing matches that shape, and on this host it makes the
+    // IPv4-carrying tail (`docker0`, `eth0`, `lo`) identical to HotSpot's.
+    //
+    // It does NOT reproduce HotSpot's order exactly, and cannot: the JDK's
+    // Linux IPv6 pass reads `/proc/net/if_inet6`, whose row order is a kernel
+    // hash-table walk, not the ascending-index order `getifaddrs` returns.
+    // With 14 veth interfaces present, HotSpot's block was
+    // 3422, 2845, 3427, 3424, … and ours is strictly descending. `Enumeration`
+    // order is unspecified by the API, so this is a difference rather than a
+    // defect — but do not read a probe row that names "the first non-loopback
+    // interface" as a divergence: it is naming whichever one came first.
+    out.reverse();
     for iface in &mut out {
         iface.index = re8_iface_index(&iface.name);
         iface.mtu = re8_sys_attr(&iface.name, "mtu").and_then(|t| t.parse::<i32>().ok());
@@ -14788,10 +15050,27 @@ fn re8_scan_host_ifaces() -> Vec<Re8HostIface> {
 /// us about that interface".
 fn re8_host_iface_by_name(name: &str) -> Option<Re8HostIface> {
     if let Some(text) = re8_sys_attr(name, "flags") {
-        let flags = text
+        let mut flags = text
             .strip_prefix("0x")
             .and_then(|hex| u32::from_str_radix(hex, 16).ok())
             .or_else(|| text.parse::<u32>().ok())?;
+        // `/sys/class/net/<if>/flags` is the kernel's `dev->flags`, which
+        // NEVER carries IFF_RUNNING (0x40) — that bit is synthesised by
+        // `dev_get_flags()` for `SIOCGIFFLAGS`/`getifaddrs` from the device's
+        // operational state. Measured on this host: `lo` reads 0x9 and `eth0`
+        // reads 0x1003, so `isUp0`'s faithful `IFF_UP && IFF_RUNNING` test was
+        // false for EVERY interface and `NetworkInterface.isUp()` answered
+        // false across the board — where HotSpot answers true for all five.
+        // Anything that picks "the first non-loopback interface that is up"
+        // found nothing at all. Re-derive the bit the way the kernel does.
+        if flags & RE8_IFF_UP != 0 {
+            let oper = re8_sys_attr(name, "operstate").unwrap_or_default();
+            // `netif_oper_up()`: IF_OPER_UP or IF_OPER_UNKNOWN. `lo` reports
+            // "unknown" and is nonetheless running.
+            if oper.is_empty() || oper == "up" || oper == "unknown" {
+                flags |= RE8_IFF_RUNNING;
+            }
+        }
         return Some(Re8HostIface {
             name: name.to_string(),
             index: re8_iface_index(name),
@@ -14885,16 +15164,34 @@ fn re8_make_interface(ctx: &mut dyn NativeContext, host: &Re8HostIface) -> Resul
     // First pin of the batch: `unpin_native_roots(base_pin)` at the end
     // releases this and every pin taken after it.
     let base_pin = ctx.pin_native_root(addrs);
-    let hostname = hostname_string();
     for (i, ip) in host.addrs.iter().enumerate() {
-        let label = if ip.is_loopback() {
-            "localhost"
-        } else {
-            hostname.as_str()
+        // NO name. The JDK's `getAll0` builds these addresses from raw octets
+        // and never supplies a hostName, so HotSpot prints `/127.0.0.1` and
+        // `/fe80:…%eth0` for every row of `getInetAddresses()`. Labelling them
+        // `localhost` / `<hostname>` — which this loop used to do — is the
+        // exact divergence
+        // `docs/internal/fixed-suite-bugs/inetaddress-tostring-hostname-literal-addresses-FIXED.md`
+        // removed everywhere else; this call site was missed. `getHostName()`
+        // still answers the numeric text, because that is its no-name
+        // fallback.
+        let label = NO_HOST_NAME;
+        // EVERY IPv6 address reached through an interface is scoped to that
+        // interface, not just the link-local ones. Measured against HotSpot
+        // JDK 25 on this host: `lo`'s address is `0:0:0:0:0:0:0:1%lo` with
+        // `getScopeId() == 1`, even though `getifaddrs` reports
+        // `sin6_scope_id == 0` for it. The JDK's Linux enumeration reads
+        // `/proc/net/if_inet6` and stores the interface INDEX as the scope for
+        // every row, then `createNetworkInterface` attaches the interface as
+        // `scope_ifname` whenever that scope is non-zero — so the suffix is
+        // the interface NAME and the id is its index. Deriving the suffix from
+        // `sin6_scope_id` instead would leave `::1%lo` unscoped.
+        let text = match ip {
+            IpAddr::V6(_) => format!("{ip}%{}", host.name),
+            IpAddr::V4(_) => ip.to_string(),
         };
         // Allocates several objects, so re-read the array through its pin
         // before storing into it (native stale-local family).
-        let addr = alloc_inet_address(ctx, label, &ip.to_string());
+        let addr = alloc_inet_address(ctx, label, &text);
         addrs = ctx.read_native_pin(base_pin, addrs);
         ctx.set_array_element(addrs, i, Value::Object(Some(addr?)));
     }
@@ -14922,6 +15219,28 @@ fn re8_make_interface(ctx: &mut dyn NativeContext, host: &Re8HostIface) -> Resul
             Value::Object(Some(addrs)),
         ],
     );
+    // `Inet6Address.getScopedInterface()` is un-intercepted real-JDK bytecode
+    // reading `holder6.scope_ifname`, and HotSpot's `createNetworkInterface`
+    // sets it to the very interface being built. It can only be written HERE,
+    // after the carrier exists: `alloc_inet_address` cannot mint one for its
+    // own address (this function is what mints interfaces, and it allocates
+    // addresses — the recursion has no base case). The rendered `%eth0` suffix
+    // does not depend on this (the side table supplies it), but
+    // `getScopedInterface()` answered null without it, and the JDK's own
+    // `Inet6Address(String, byte[], NetworkInterface)` constructor reads
+    // `getScopeId()` off these addresses to derive a scope for a new one.
+    //
+    // No allocation happens in this loop, so the pinned handles stay valid
+    // throughout.
+    let addrs_now = ctx.read_native_pin(base_pin, addrs);
+    let iface_now = ctx.read_native_pin(iface_pin, iface0);
+    for i in 0..ctx.array_length(addrs_now) {
+        if let Value::Object(Some(a)) = ctx.get_array_element(addrs_now, i) {
+            if let Value::Object(Some(h6)) = ctx.get_field_by_name(a, "holder6") {
+                ctx.set_field_by_name(h6, "scope_ifname", Value::Object(Some(iface_now)));
+            }
+        }
+    }
     // The package-private ctor leaves `childs` null and
     // `NetworkInterface.getSubInterfaces()`'s anonymous Enumeration reads
     // `childs.length` — see the note in `re8_make_loopback_interface`.
