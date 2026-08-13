@@ -2356,6 +2356,26 @@ pub struct ZgcRealHeap {
     /// left empty while [`Self::mark_active`] is false, so a non-concurrent
     /// run pays for the buckets and nothing else.
     mark_ingress: mark::ZMarkIngress,
+    /// Phase 4: the barrier's good mask, and the phase machine behind it.
+    ///
+    /// `Z_REMAPPED` — "no mark parity is good; addresses are plain" — until a
+    /// cycle arms it. The barrier gates on this and needs no separate
+    /// activation flag; see `zgc::barrier::ZBarrierContext::good_mask`.
+    barrier_good_mask: AtomicU64,
+    /// Phase 4: whether a relocating cycle is in progress. Distinct from
+    /// [`Self::mark_active`] because the barrier's mark and relocate slow
+    /// paths are separately armed.
+    relocate_active: AtomicBool,
+    /// Phase 4: `from_offset -> to_offset` for objects this cycle has moved.
+    ///
+    /// A plain map rather than `zgc::forwarding::ZForwardingTable` on purpose:
+    /// that table is per-page and this collector has one arena and no pages,
+    /// so its page-id keying would carry no information here. The table
+    /// becomes the right structure when `zgc::page` is adopted, which is the
+    /// step after this one.
+    forwarding: Mutex<FxHashMap<u64, u64>>,
+    /// Barrier counters — slow-path entries, heals, forward lookups.
+    barrier_stats: barrier::ZBarrierStats,
     /// Addresses this barrier has published since the cycle began. Telemetry
     /// for the adoption work — it is how you tell "the barrier is wired" from
     /// "the barrier is wired and the workload actually overwrites references",
@@ -2641,6 +2661,10 @@ impl ZgcRealHeap {
             mark_active: AtomicBool::new(false),
             mark_ingress: mark::ZMarkIngress::new(),
             mark_ingress_pushes: AtomicUsize::new(0),
+            barrier_good_mask: AtomicU64::new(vaddr::Z_REMAPPED),
+            relocate_active: AtomicBool::new(false),
+            forwarding: Mutex::new(FxHashMap::default()),
+            barrier_stats: barrier::ZBarrierStats::default(),
             headroom_low: AtomicBool::new(false),
             gc_count: AtomicUsize::new(0),
             gc_log_enabled: AtomicBool::new(false),
@@ -3043,6 +3067,177 @@ impl ZgcRealHeap {
         report.stats
         // `coordinator` drops here; its Drop stops and JOINS every worker, so
         // no thread holding a clone of `bridge` outlives this borrow of `self`.
+    }
+
+    /// Is the default-off stop-the-world compaction sub-flag set?
+    ///
+    /// `CRATONVM_ZGC_RELOCATE=1`. This is the sub-flag the production plan's
+    /// R5 row insists on, and which that row's own wording made stale: it said
+    /// "default-off within the already-default-off `zgc` feature", and `zgc`
+    /// has been default-ON since 2026-08-10. This switch is no longer
+    /// belt-and-braces; it IS the belt.
+    ///
+    /// Deliberately NOT `zgc_relocation_permitted`. That gate answers a
+    /// *safety* question (is the JIT off?) and lives in `vm_init`; this one
+    /// answers an *intent* question and lives here. A caller needs both.
+    fn relocation_requested(&self) -> bool {
+        match cratonvm_types::flags::runtime_var_os("CRATONVM_ZGC_RELOCATE") {
+            Some(raw) => {
+                let v = raw.to_string_lossy().trim().to_ascii_lowercase();
+                matches!(v.as_str(), "1" | "on" | "true" | "yes")
+            }
+            None => false,
+        }
+    }
+
+    /// Compact the low end of the arena at a stop-the-world, after the mark.
+    /// Phase 4 of the ZGC maturity plan.
+    ///
+    /// # What it does
+    ///
+    /// Slides every marked survivor in the small-object region down into the
+    /// lowest free space, in address order; then rewrites **every reference
+    /// slot in every survivor** through the resulting `from -> to` map; then
+    /// drops the bump cursor to the end of the compacted region. That last
+    /// step is the entire point -- a non-compacting arena's cursor is a
+    /// one-way ratchet, and this is the only operation that can return the
+    /// middle of the heap to one contiguous run.
+    ///
+    /// Returns `(objects_moved, bytes_reclaimed, pointer_map)`.
+    ///
+    /// # Three gates, all of which must be open
+    ///
+    /// 1. `CRATONVM_ZGC_RELOCATE=1` -- *intent* ([`Self::relocation_requested`]).
+    /// 2. `zgc_relocation_permitted` -- *safety*. **Refuses whenever the JIT is
+    ///    enabled**: JIT-compiled code loads reference fields with no ZGC load
+    ///    barrier, so a moving cycle would hand it stale pointers into
+    ///    evacuated objects. That gate lives in `vm_init` and is now tested.
+    /// 3. A stop-the-world token, held by the caller for the whole call.
+    ///
+    /// # What it deliberately is not
+    ///
+    /// Not *concurrent* relocation. Every mutator is stopped, so no load
+    /// barrier is needed to observe the move -- which is exactly why this step
+    /// is reachable before barrier emission lands, and why it is an honest
+    /// first cut rather than a stand-in for `zgc::relocate`.
+    ///
+    /// **The high end is not compacted.** Large objects bump down from
+    /// capacity with their own free list; moving them needs the same slide in
+    /// the opposite direction against a different free structure. Left out on
+    /// purpose -- the low end is where TLAB chunks fragment, which is the
+    /// measured problem.
+    ///
+    /// # The caller's remaining obligation
+    ///
+    /// The returned `PointerMap` is **non-empty**, and `VmHeap::Zgc`'s arms
+    /// assert non-moving throughout. Every consumer of a raw heap address
+    /// outside this heap -- JIT frame maps, monitor tables, external root
+    /// providers, native side tables -- must be remapped through it, exactly as
+    /// the generational and G1 paths already do. Auditing those arms is the
+    /// reason this stays behind a default-off flag instead of being wired into
+    /// `collect_garbage`'s normal path.
+    /// # Why the live set is a PARAMETER
+    ///
+    /// It reads mark bits in no version of this function, and that is
+    /// deliberate. The first draft filtered `registered` by `GC_FLAG_MARKED`
+    /// and moved **nothing**, because the sweep clears every survivor's mark
+    /// bit before returning -- so by the time a post-sweep compaction runs,
+    /// the marks it wanted are gone. Taking the set explicitly makes the
+    /// caller say which objects are live instead of inferring it from state
+    /// another phase owns: `collect_garbage` passes the post-sweep registry
+    /// (everything the sweep did not reclaim), and a test passes whatever it
+    /// built.
+    fn relocate_stw(&self, live: &[usize]) -> (usize, usize, cratonvm_types::PointerMap) {
+        let mut pointer_map = cratonvm_types::PointerMap::default();
+        let mut moved = 0usize;
+        let mut fwd: FxHashMap<usize, usize> = FxHashMap::default();
+        let reclaimed;
+
+        {
+            let mut arena = self.arena.lock();
+            let base = arena.base_ptr() as usize;
+            let low_end = base + arena.used_low_for_compaction();
+
+            // Survivors in ADDRESS order. The slide requires it: an object may
+            // only be copied into space a lower-addressed survivor has already
+            // vacated. Out-of-order copying overwrites a survivor that has not
+            // moved yet -- silent heap corruption, not a failed assert.
+            let mut survivors: Vec<usize> =
+                live.iter().copied().filter(|b| *b >= base && *b < low_end).collect();
+            survivors.sort_unstable();
+
+            let mut dest = base;
+            for from in survivors {
+                let Some(size) = Self::alloc_size(self.header_ref(from as *mut u8)) else {
+                    // A header this collector cannot size cannot be moved, and
+                    // nothing above it may move either or the slide would run
+                    // over it. Stop here rather than guess.
+                    tracing::warn!(
+                        target: "cratonvm::gc::guard",
+                        addr = from,
+                        "zgc relocate: unsizable survivor stops the slide"
+                    );
+                    dest = from;
+                    break;
+                };
+                let to = (dest + 7) & !7;
+                debug_assert!(to <= from, "the slide must never move an object UP");
+                if to < from {
+                    // SAFETY: `size` bytes are live at `from`, `to` is inside
+                    // the arena and strictly below `from`, and the regions may
+                    // overlap -- `copy` is memmove, correct in that direction.
+                    unsafe { std::ptr::copy(from as *const u8, to as *mut u8, size) };
+                    fwd.insert(from, to);
+                    pointer_map.insert(from, to);
+                    moved += 1;
+                }
+                dest = to + size;
+            }
+            reclaimed = arena.compact_low_to(dest - base);
+        }
+
+        if moved == 0 {
+            return (0, reclaimed, pointer_map);
+        }
+
+        // ---- Rewrite every reference slot in every surviving object -------
+        //
+        // AFTER the whole slide, not during it: a slot in an already-moved
+        // object may point at an object that has not moved yet, so rewriting
+        // as we go resolves half the graph against a half-built map.
+        let live_now: Vec<usize> = live
+            .iter()
+            .map(|b| fwd.get(b).copied().unwrap_or(*b))
+            .collect();
+        for obj in &live_now {
+            let mut rewrites: Vec<(u64, u64)> = Vec::new();
+            {
+                use census::ZCensusHeapView;
+                self.reference_slots(*obj as u64, &mut |slot| {
+                    let raw = slot.raw_word as usize;
+                    if raw == 0 {
+                        return;
+                    }
+                    if let Some(to) = fwd.get(&raw) {
+                        rewrites.push((slot.slot_addr, *to as u64));
+                    }
+                });
+            }
+            for (slot_addr, to) in rewrites {
+                // SAFETY: `slot_addr` is an 8-byte-aligned reference word
+                // inside a live object, as reported by `reference_slots`, and
+                // the world is stopped.
+                unsafe { std::ptr::write(slot_addr as *mut u64, to) };
+            }
+        }
+
+        // ---- Rebuild the object-start registry ----------------------------
+        for (from, to) in &fwd {
+            self.registry.remove(*from);
+            self.registry.insert(*to);
+        }
+
+        (moved, reclaimed, pointer_map)
     }
 
     /// Free share of the arena in permille — test support for the
@@ -5834,6 +6029,86 @@ impl mark::ZMarkContext for ZHeapMarkBridge {
     }
 }
 
+/// Phase 4 of the ZGC maturity plan: the load-barrier seam.
+///
+/// # What this is, and what it is emphatically not
+///
+/// This is the `ZBarrierContext` the built-and-unadopted `zgc::barrier` module
+/// has been waiting for. Implementing it makes the barrier *drivable* against
+/// this heap. It does **not** put a barrier on any read path: no interpreter
+/// `getfield`, no JIT-emitted load and no native accessor calls
+/// `load_barrier_fast` today, so in a normal run every method below is
+/// unreachable and `good_mask` never leaves `Z_REMAPPED`.
+///
+/// That distinction is the whole discipline of this phase and it is why the
+/// relocation refusal gate (`zgc_relocation_permitted`) stays shut with the
+/// JIT on: a colored slot that a JIT-compiled load reads without a barrier is
+/// a use-after-free, and no amount of correctness *here* changes that.
+impl barrier::ZBarrierContext for ZgcRealHeap {
+    fn good_mask(&self) -> u64 {
+        self.barrier_good_mask.load(Ordering::Acquire)
+    }
+
+    fn is_marking(&self) -> bool {
+        self.mark_active.load(Ordering::Relaxed)
+    }
+
+    fn is_relocating(&self) -> bool {
+        self.relocate_active.load(Ordering::Relaxed)
+    }
+
+    /// Map a heap **offset** to where that object lives now.
+    ///
+    /// Identity for anything this cycle has not moved, which is every object
+    /// while `relocate_active` is false — so a caller that reaches the slow
+    /// path outside a relocating cycle gets its own offset back rather than a
+    /// `None` the barrier would turn into
+    /// [`on_forward_failure`](barrier::ZBarrierContext::on_forward_failure)'s
+    /// panic.
+    ///
+    /// Returns a **bare offset**, never an address: `is_bare_offset` on the
+    /// barrier's slow path checks exactly that, in release builds too, because
+    /// returning an address here was the shape that made this method's return
+    /// type `Option<u64>` in the first place.
+    fn forward(&self, addr: u64) -> Option<u64> {
+        if !self.relocate_active.load(Ordering::Relaxed) {
+            return Some(addr);
+        }
+        Some(
+            self.forwarding
+                .lock()
+                .get(&addr)
+                .copied()
+                .unwrap_or(addr),
+        )
+    }
+
+    /// Publish `addr` (an offset) to the concurrent marker.
+    ///
+    /// Shares the ingress `satb_pre_barrier` feeds — one queue per heap, so a
+    /// cycle drains mutator-published work from the store barrier and the load
+    /// barrier together rather than needing two drains that could disagree
+    /// about when they are empty.
+    fn mark_live(&self, addr: u64) {
+        if addr == 0 {
+            return;
+        }
+        let Some(base) = <Self as mark::ZMarkContext>::heap_base(self) else {
+            return;
+        };
+        let absolute = base.wrapping_add(addr) as usize;
+        if !self.registry.contains(absolute) {
+            return;
+        }
+        self.mark_ingress.push(absolute >> 3, absolute as u64);
+        self.mark_ingress_pushes.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn stats(&self) -> &barrier::ZBarrierStats {
+        &self.barrier_stats
+    }
+}
+
 impl mark::ZMarkContext for ZgcRealHeap {
     /// [`vaddr::Z_REMAPPED`] — the quiescent good mask, unconditionally.
     ///
@@ -6044,6 +6319,25 @@ impl mark::ZMarkContext for ZgcRealHeap {
         // and charging a 1 TiB sentinel to the live set would make every
         // occupancy figure derived from it meaningless.
         Self::alloc_size(self.header_ref(addr as usize as *mut u8)).unwrap_or(0)
+    }
+
+    /// The arena's base address, so a colored word's 42-bit **offset** can be
+    /// turned back into the address `try_mark` and `is_in_heap` expect.
+    ///
+    /// This defaults to `None` in the trait, and the default's own doc explains
+    /// why: `ZgcRealHeap`'s slots hold raw pointers and are never coloured, so
+    /// `None` was "the *honest* answer for it today". That stopped being true
+    /// when this heap grew a `ZBarrierContext` (Phase 4), because the barrier
+    /// speaks offsets and `mark_live` must convert — with `None` it would have
+    /// returned early on every call, i.e. a barrier wired to a marker that
+    /// silently discards everything it is handed.
+    ///
+    /// The promise the trait extracts for `Some(base)` is that `base + offset`
+    /// is an address this context's own `try_mark`/`is_in_heap` accept, and it
+    /// holds here by construction: both go through `self.registry`, which is
+    /// keyed by the same arena addresses `base_ptr` is the start of.
+    fn heap_base(&self) -> Option<u64> {
+        Some(self.arena.lock().base_ptr() as u64)
     }
 
     // `on_worker_start` / `on_worker_end` are left at their defaults on
@@ -6921,9 +7215,52 @@ impl GarbageCollector for ZgcRealHeap {
             );
         }
 
-        // Non-moving: no object changed address, so roots and external
-        // references need no fix-up and the pointer map is empty.
-        let pointer_map: cratonvm_types::PointerMap = cratonvm_types::PointerMap::default();
+        // ---- COMPACTION (opt-in, Phase 4) --------------------------------
+        //
+        // Normally non-moving: no object changes address, roots and external
+        // references need no fix-up, and the pointer map is empty. That is
+        // still what every default run does.
+        //
+        // With `CRATONVM_ZGC_RELOCATE=1` the sweep is followed by a
+        // stop-the-world slide that compacts the small-object end and returns
+        // a NON-EMPTY pointer map. Three things make that safe to have here:
+        //
+        //  * the sub-flag, which is the only thing keeping it off a user's
+        //    machine now that the `zgc` Cargo feature is default-ON;
+        //  * `zgc_relocation_permitted` in `vm_init`, which refuses whenever
+        //    the JIT is enabled -- compiled code loads reference fields with
+        //    no load barrier and would be handed stale pointers;
+        //  * the caller's `StopTheWorldToken`, already proven above.
+        //
+        // The `roots` slice is rewritten in place here, because a root that
+        // still names a pre-slide address is a dangling pointer the moment
+        // this function returns -- and unlike a field slot, nothing downstream
+        // would rewrite it.
+        let mut pointer_map: cratonvm_types::PointerMap = cratonvm_types::PointerMap::default();
+        if self.relocation_requested() {
+            // The POST-sweep registry: the sweep has already removed every
+            // dead base from it, so what remains is exactly the live set --
+            // and unlike the mark bits, it is still there. `registered` (the
+            // pre-sweep snapshot) would include the objects just reclaimed.
+            let live_now: Vec<usize> = self.registry.snapshot().bases();
+            let (moved, reclaimed, map) = self.relocate_stw(&live_now);
+            if moved > 0 {
+                for r in roots.iter_mut() {
+                    if let Some(to) = map.get(&(r.as_ptr() as usize)) {
+                        // SAFETY: `to` is an object base this slide just wrote,
+                        // inside the arena, 8-byte aligned by construction.
+                        *r = unsafe { ObjectRef::from_raw(*to as *mut u8) };
+                    }
+                }
+                tracing::debug!(
+                    target: "zgc",
+                    moved,
+                    reclaimed,
+                    "zgc STW compaction complete"
+                );
+            }
+            pointer_map = map;
+        }
         monitors.remap_after_gc(&pointer_map);
         // ZGC-3: `remap_after_gc` early-returns on the (always-empty) map,
         // so hand the collector's EXACT dead-address list to the registry
@@ -8671,6 +9008,194 @@ mod tests {
         assert!(
             Z_PARMARK_MAX_WORKERS >= 1,
             "the cap must admit at least one worker"
+        );
+    }
+
+    // -- Phase 4: stop-the-world compaction --------------------------------
+
+    /// **The object graph must survive a compaction.**
+    ///
+    /// A slide that moves objects but does not rewrite the references between
+    /// them leaves every survivor pointing at where its neighbour used to be
+    /// -- addresses that `compact_low_to` has just zeroed. This is the test
+    /// that says the rewrite happened, and it checks the FIELD, not just that
+    /// something moved.
+    #[test]
+    fn compaction_moves_survivors_and_rewrites_the_references_between_them() {
+        let heap = ZgcRealHeap::with_capacity(256 * 1024);
+        heap.set_tlab_enabled(false);
+
+        // Garbage first, so the survivors above it have somewhere to slide to.
+        for _ in 0..8 {
+            heap.alloc_object(ClassId::new(1), 4);
+        }
+        let parent = heap.alloc_object(ClassId::new(1), 1);
+        let child = heap.alloc_object(ClassId::new(1), 0);
+        heap.set_field(parent, 0, Value::Object(Some(child)));
+        assert_eq!(heap.get_field(parent, 0), Value::Object(Some(child)));
+
+        let live = [parent.as_ptr() as usize, child.as_ptr() as usize];
+        let (moved, reclaimed, map) = heap.relocate_stw(&live);
+
+        assert!(moved >= 2, "both survivors should have slid down; moved={moved}");
+        assert!(reclaimed > 0, "the cursor must come back down");
+        assert!(!map.is_empty(), "a moving cycle must publish a pointer map");
+
+        let new_parent = map
+            .get(&(parent.as_ptr() as usize))
+            .copied()
+            .expect("parent moved, so it must be in the map");
+        let new_child = map
+            .get(&(child.as_ptr() as usize))
+            .copied()
+            .expect("child moved, so it must be in the map");
+        assert!(new_parent < parent.as_ptr() as usize, "objects slide DOWN");
+
+        // THE ASSERTION THIS TEST EXISTS FOR: the parent's reference field
+        // must name the child's NEW address, not its old one.
+        let moved_parent = unsafe { ObjectRef::from_raw(new_parent as *mut u8) };
+        assert_eq!(
+            heap.get_field(moved_parent, 0),
+            Value::Object(Some(unsafe { ObjectRef::from_raw(new_child as *mut u8) })),
+            "the reference between two moved survivors was not rewritten"
+        );
+    }
+
+    /// A compaction with nothing dead below the survivors moves nothing, and
+    /// says so with an empty map rather than a map of identity entries.
+    ///
+    /// An identity entry is worse than no entry: every consumer of the map
+    /// would rewrite a slot to the value it already held, and `is_empty()` --
+    /// which is how a caller decides whether to run the remap at all --
+    /// would answer `false` for a cycle that moved nothing.
+    #[test]
+    fn a_compaction_with_no_garbage_below_the_survivors_moves_nothing() {
+        let heap = ZgcRealHeap::with_capacity(256 * 1024);
+        heap.set_tlab_enabled(false);
+        let a = heap.alloc_object(ClassId::new(1), 0);
+        let b = heap.alloc_object(ClassId::new(1), 0);
+        let live = [a.as_ptr() as usize, b.as_ptr() as usize];
+        let (moved, _reclaimed, map) = heap.relocate_stw(&live);
+
+        assert_eq!(moved, 0, "nothing below them died, so nothing can slide");
+        assert!(
+            map.is_empty(),
+            "a cycle that moved nothing must publish an EMPTY map, not identity entries"
+        );
+        assert_eq!(heap.get_field(a, 0), Value::Object(None));
+    }
+
+    /// Compaction actually reclaims: the largest servable block after a
+    /// compaction must exceed what the same heap could serve before it.
+    ///
+    /// This is the property the whole phase exists for -- Gap B in the
+    /// maturity assessment -- so it is asserted directly rather than inferred
+    /// from a byte count.
+    #[test]
+    fn compaction_restores_a_contiguous_run_the_sweep_alone_cannot() {
+        let heap = ZgcRealHeap::with_capacity(256 * 1024);
+        heap.set_tlab_enabled(false);
+        // Alternate garbage and survivors so the free space is genuinely
+        // interleaved -- the shape a non-moving sweep cannot repair.
+        let mut survivors = Vec::new();
+        for _ in 0..16 {
+            heap.alloc_object(ClassId::new(1), 8); // garbage
+            survivors.push(heap.alloc_object(ClassId::new(1), 0));
+        }
+        let live: Vec<usize> = survivors.iter().map(|o| o.as_ptr() as usize).collect();
+
+        let before = heap.arena.lock().largest_free_block();
+        let (moved, reclaimed, _map) = heap.relocate_stw(&live);
+        let after = {
+            let a = heap.arena.lock();
+            a.remaining().saturating_sub(a.free_list_bytes())
+        };
+
+        assert!(moved > 0, "interleaved garbage must let survivors slide");
+        assert!(reclaimed > 0);
+        assert!(
+            after > before,
+            "compaction must leave a bigger contiguous run than the free list \
+             held before it: after={after} before={before}"
+        );
+    }
+
+    /// **End to end: a full `collect_garbage` with compaction on keeps the
+    /// graph intact and rewrites the caller's roots.**
+    ///
+    /// The unit tests above drive `relocate_stw` directly. This one goes
+    /// through the real entry point with `CRATONVM_ZGC_RELOCATE=1`, which is
+    /// the only way to cover the two things the wiring adds and the unit
+    /// tests cannot see: that the `roots` slice is rewritten in place -- a
+    /// root still naming a pre-slide address is a dangling pointer the instant
+    /// `collect_garbage` returns, and nothing downstream would fix it -- and
+    /// that the returned `PointerMap` is non-empty so callers actually run
+    /// their remap.
+    ///
+    /// Serialised against the other flag-sensitive fixtures, since the
+    /// override is process-wide.
+    #[test]
+    fn collect_garbage_with_compaction_on_rewrites_roots_and_keeps_the_graph() {
+        let _guard = OVERLAY_TEST_LOCK.lock();
+        cratonvm_types::flags::with_thread_overrides(
+            &[("CRATONVM_ZGC_RELOCATE", Some("1"))],
+            || {
+                let heap = ZgcRealHeap::with_capacity(256 * 1024);
+                heap.set_tlab_enabled(false);
+                assert!(
+                    heap.relocation_requested(),
+                    "the override must reach the heap or this test proves nothing"
+                );
+
+                // Garbage below, so the survivors have somewhere to slide.
+                for _ in 0..8 {
+                    heap.alloc_object(ClassId::new(1), 4);
+                }
+                let parent = heap.alloc_object(ClassId::new(1), 1);
+                let child = heap.alloc_object(ClassId::new(1), 0);
+                heap.set_field(parent, 0, Value::Object(Some(child)));
+
+                let old_parent = parent.as_ptr() as usize;
+                let mut roots = [parent];
+                // SAFETY: these unit tests run the heap single-threaded.
+                let stw = unsafe { StopTheWorldToken::new() };
+                let result = heap.collect_garbage(&stw, &mut roots, &NoMonitors);
+
+                assert!(
+                    !result.pointer_map.is_empty(),
+                    "a compacting cycle must publish a non-empty pointer map"
+                );
+                assert!(
+                    (roots[0].as_ptr() as usize) < old_parent,
+                    "collect_garbage must rewrite the caller's root to the new address"
+                );
+                // ...and the graph the root leads to is still intact.
+                match heap.get_field(roots[0], 0) {
+                    Value::Object(Some(c)) => {
+                        assert!(
+                            heap.registry.contains(c.as_ptr() as usize),
+                            "the child reference must name a live, registered object"
+                        );
+                    }
+                    other => {
+                        panic!("the parent's reference was lost by compaction: {other:?}")
+                    }
+                }
+            },
+        );
+    }
+
+    /// The intent sub-flag is off unless asked for.
+    ///
+    /// It is the ONLY thing keeping compaction off a user's machine now that
+    /// the `zgc` Cargo feature -- which the production plan's R5 row assumed
+    /// was the outer default-off gate -- is default-ON.
+    #[test]
+    fn compaction_is_off_unless_its_own_sub_flag_is_set() {
+        let heap = ZgcRealHeap::with_capacity(64 * 1024);
+        assert!(
+            !heap.relocation_requested(),
+            "compaction must be opt-in; this flag is the belt, not the braces"
         );
     }
 

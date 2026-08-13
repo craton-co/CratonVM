@@ -59,7 +59,7 @@ leaves an operator unable to tell what they are running.
 | How do I switch collector at runtime? | `-XX:+UseGenerationalGC` (or `-XX:-UseZGC`); `-XX:+UseG1GC` for G1. Available in every build | `parse_gc_algorithm`, `vm/src/config.rs` |
 | Does ZGC move objects? | **No.** Non-moving, non-generational, whole-heap stop-the-world mark-sweep over one arena | `ZgcRealHeap::collect_garbage`, `gc/src/zgc.rs` |
 | Does ZGC have TLABs? | **Yes, default-on.** Not through `VmHeap::refill_tlab` (which returns `None` here) but inside the backend. Kill switch `CRATONVM_ZGC_TLAB=0` or `CRATONVM_GC=-zgc-tlab` | `ZgcRealHeap::alloc_raw_tlab`, `gc/src/zgc/tlab.rs` |
-| Is it concurrent, generational or compacting? | **None of the three.** The machinery for all of them is written and unit-tested but not adopted | [maturity assessment](feature-designs/zgc-maturity-assessment-and-plan-20260813.md) |
+| Is it concurrent, generational or compacting? | **None of the three by default.** Two opt-in switches exist as of 2026-08-13 and both are off unless you set them: `CRATONVM_ZGC_PARMARK=<n>` runs the mark phase on parallel workers (still stop-the-world), and `CRATONVM_ZGC_RELOCATE=1` compacts the small-object end at the end of a collection — the latter additionally **refuses to run with the JIT enabled**, because compiled code loads reference fields without a load barrier | [maturity assessment](feature-designs/zgc-maturity-assessment-and-plan-20260813.md) |
 | What does it cost me? | Headroom. Not compacting means free memory can be plentiful and still too broken up to serve one large array | the sizing notes below |
 
 | Backend | Module | Status | Best for |
