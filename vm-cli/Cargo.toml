@@ -107,10 +107,16 @@ java-bin-alias = []
 synthetic-jdk = ["cratonvm-vm/synthetic-jdk"]
 # Memory-backed ZGC-real collector, selected at runtime with `-XX:+UseZGC`
 # (see `cratonvm_vm::config::parse_gc_algorithm`). Plain pass-through to
-# `cratonvm-vm/zgc`, which forwards to `cratonvm-gc/zgc`. Build a ZGC-capable
-# launcher with:
+# `cratonvm-vm/zgc`, which forwards to `cratonvm-gc/zgc`.
+#
+# It is in `default` (line 94) as of 2026-08-10, so the command below is now a
+# no-op rather than the only way to get a ZGC-capable launcher:
 #
 #     cargo build --release -p cratonvm-cli --features zgc
+#
+# The reverse is the one that changes anything now:
+#
+#     cargo build --release -p cratonvm-cli --no-default-features --features mimalloc
 #
 # It exists so that command works at all. Before it, the only way to reach the
 # collector from this crate was `--features cratonvm-vm/zgc`, and no CI job

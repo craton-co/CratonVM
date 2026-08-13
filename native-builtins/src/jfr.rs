@@ -338,14 +338,17 @@ const JFR_FIELD_DESCRIPTORS: [&str; 9] = [
     "Ljava/lang/String;",
 ];
 
-/// JFR event names, keyed by the event class's internal name.
+/// Per-event-class JFR facts — `(@Name value, @Enabled default)` — keyed by the
+/// event class's internal name.
 ///
-/// The `@Name` annotation is immutable class-file data, so one read per class
-/// is enough — and `commit()` is hot enough that re-deriving it per event would
-/// be visible.
-fn event_names() -> &'static Mutex<HashMap<String, String>> {
-    static NAMES: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
-    NAMES.get_or_init(|| Mutex::new(HashMap::new()))
+/// Both are immutable class-file data, so one read per class is enough — and
+/// `commit()` is hot enough that re-deriving them per event would be visible.
+/// They share one row (and therefore one lock acquisition) because every caller
+/// wants both: the name to record under, and whether the type is recorded at
+/// all.
+fn event_types() -> &'static Mutex<HashMap<String, (String, bool)>> {
+    static TYPES: OnceLock<Mutex<HashMap<String, (String, bool)>>> = OnceLock::new();
+    TYPES.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 /// The JFR name of an event class: its `@Name` value when it declares one,
@@ -358,8 +361,27 @@ fn event_names() -> &'static Mutex<HashMap<String, String>> {
 /// that: `FreeBufferEvent` and `AllocateBufferEvent` share a superclass and
 /// carry different names.
 fn jfr_event_name(ctx: &mut dyn NativeContext, class_id: ClassId) -> String {
+    jfr_event_type_facts(ctx, class_id).0
+}
+
+/// The JFR name of an event class and whether its TYPE is recorded by default.
+///
+/// **Name** — `@Name` when the class declares one, else the binary class name;
+/// read from the exact class and deliberately not inherited (see
+/// [`jfr_event_name`]).
+///
+/// **Default** — `jdk.jfr.Enabled` defaults to `true`, so a user event class
+/// that says nothing is on, which is why a bare `new Recording()` records
+/// custom events (see [`java_event_enabled`]). A class annotated
+/// `@Enabled(false)` is the other half of that rule and was missing: the
+/// default was hard-coded to `true`, so an explicitly-disabled type fired
+/// anyway. netty's `JfrEventSafeTest.enableDefaults` asserts exactly that it
+/// does not. Unlike `jdk.jfr.Name`, `jdk.jfr.Enabled` **is** `@Inherited`, so
+/// this half of the walk continues into superclasses until the annotation is
+/// found or the JFR base class is reached.
+fn jfr_event_type_facts(ctx: &mut dyn NativeContext, class_id: ClassId) -> (String, bool) {
     let internal = ctx.class_name_of_id(class_id).unwrap_or_default();
-    if let Some(cached) = event_names()
+    if let Some(cached) = event_types()
         .lock()
         .unwrap_or_else(|poison| poison.into_inner())
         .get(&internal)
@@ -381,12 +403,42 @@ fn jfr_event_name(ctx: &mut dyn NativeContext, class_id: ClassId) -> String {
             }
         }
     }
-    event_names()
+    let mut enabled = true;
+    let mut current = Some(class_id);
+    'walk: while let Some(cid) = current {
+        let cname = ctx.class_name_of_id(cid).unwrap_or_default();
+        if cname == "jdk/jfr/Event"
+            || cname == "jdk/internal/event/Event"
+            || cname == "java/lang/Object"
+        {
+            break;
+        }
+        for annotation in ctx.class_annotations(cid) {
+            if annotation.type_descriptor != "Ljdk/jfr/Enabled;" {
+                continue;
+            }
+            // A boolean element arrives as `Int`; `@Enabled` with no element
+            // at all is the annotation's own default, which is `true`.
+            enabled = annotation
+                .elements
+                .iter()
+                .find(|(element, _)| element == "value")
+                .map_or(true, |(_, value)| match value {
+                    AnnotationElementValue::Int(flag) => *flag != 0,
+                    _ => true,
+                });
+            break 'walk;
+        }
+        current = ctx.superclass_of(cid);
+    }
+    let facts = (name, enabled);
+    event_types()
         .lock()
         .unwrap_or_else(|poison| poison.into_inner())
-        .insert(internal, name.clone());
-    name
+        .insert(internal, facts.clone());
+    facts
 }
+
 
 /// The event's field values as `(name, descriptor, value)`, superclass fields
 /// first — the order JFR itself declares inherited fields in.
@@ -822,20 +874,27 @@ fn publish_java_recording_settings(ctx: &mut dyn NativeContext) {
 ///
 ///   * explicitly `enable`d by any recording → yes;
 ///   * otherwise explicitly `disable`d → no;
-///   * otherwise **yes**, because `jdk.jfr.Enabled` defaults to `true` and a
-///     user event class carries no metadata that turns it off. An earlier
-///     version of this function defaulted to *no*, which made a
-///     `new Recording()` record nothing and disagreed with HotSpot on three of
-///     the probe's rows.
+///   * otherwise the TYPE's own default, `type_default_enabled` — which is
+///     `true` for a user event class that says nothing, because
+///     `jdk.jfr.Enabled` defaults to `true`, and `false` for one annotated
+///     `@Enabled(false)`. An earlier version of this function defaulted to
+///     *no*, which made a `new Recording()` record nothing and disagreed with
+///     HotSpot on three of the probe's rows; the version after that hard-coded
+///     *yes*, which fired `@Enabled(false)` events. See
+///     [`jfr_event_type_facts`].
 ///
 /// A `true` answer also ADMITS the name (see [`java_events_admitted`]), which is
 /// what lets the VM-side allow-list keep CratonVM's built-in events out while
 /// letting Java's in.
 ///
-/// With no Java recording open at all the answer is `true` and nothing is
-/// admitted: the recorder then has no name filter, which is what CratonVM's own
-/// recordings need.
-fn java_event_enabled(ctx: &mut dyn NativeContext, event_name: &str) -> bool {
+/// With no Java recording open at all the answer is the type's own default and
+/// nothing is admitted: the recorder then has no name filter, which is what
+/// CratonVM's own recordings need.
+fn java_event_enabled(
+    ctx: &mut dyn NativeContext,
+    event_name: &str,
+    type_default_enabled: bool,
+) -> bool {
     let vm = ctx.vm_identity();
 
     // `admits` is the per-recording answer OR-ed together, which is HotSpot's
@@ -852,7 +911,9 @@ fn java_event_enabled(ctx: &mut dyn NativeContext, event_name: &str) -> bool {
         let mut admits = false;
         for entry in table.iter().filter(|entry| entry.vm == vm) {
             any_recording = true;
-            if entry.enabled.contains(event_name) || !entry.disabled.contains(event_name) {
+            if entry.enabled.contains(event_name)
+                || (type_default_enabled && !entry.disabled.contains(event_name))
+            {
                 admits = true;
                 break;
             }
@@ -860,7 +921,7 @@ fn java_event_enabled(ctx: &mut dyn NativeContext, event_name: &str) -> bool {
         (any_recording, admits)
     };
     if !any_recording {
-        return true;
+        return type_default_enabled;
     }
     if admits {
         admit_java_event(ctx, vm, event_name);
@@ -901,7 +962,9 @@ fn java_event_enabled(ctx: &mut dyn NativeContext, event_name: &str) -> bool {
         let mut admits = false;
         for entry in table.iter().filter(|entry| entry.vm == vm) {
             any_recording = true;
-            if entry.enabled.contains(event_name) || !entry.disabled.contains(event_name) {
+            if entry.enabled.contains(event_name)
+                || (type_default_enabled && !entry.disabled.contains(event_name))
+            {
                 admits = true;
                 break;
             }
@@ -1516,10 +1579,11 @@ pub fn register_jfr_natives(registry: &mut NativeMethodRegistry) {
                 return Ok(Some(Value::Int(1)));
             };
             let event_class = ctx.class_id_of_object(event);
-            let event_name = jfr_event_name(ctx, event_class);
+            let (event_name, type_default) = jfr_event_type_facts(ctx, event_class);
             Ok(Some(Value::Int(i32::from(java_event_enabled(
                 ctx,
                 &event_name,
+                type_default,
             )))))
         });
     }
@@ -1554,10 +1618,10 @@ pub fn register_jfr_natives(registry: &mut NativeMethodRegistry) {
         let event = scope.root(event);
         let receiver = scope.get(&event);
         let event_class = scope.class_id_of_object(receiver);
-        let event_name = jfr_event_name(&mut *scope, event_class);
+        let (event_name, type_default) = jfr_event_type_facts(&mut *scope, event_class);
         // An application may call `commit()` without asking `shouldCommit()`
         // first; a disabled event type must not be recorded either way.
-        if !java_event_enabled(&mut *scope, &event_name) {
+        if !java_event_enabled(&mut *scope, &event_name, type_default) {
             return Ok(None);
         }
         let receiver = scope.get(&event);
