@@ -88,6 +88,10 @@ pub use class_manager::synthetic_stub_instance_field_count;
 // the follow-up `audits/jdk-only-object-layout-audit.md` §"A gate worth adding"
 // asks for — would want the same table.
 pub use class_manager::synthetic_stub_field_model;
+// The per-class constructor descriptors the synthetic stub declares. Exported
+// because `native-builtins` must register natives for exactly this list —
+// the stub's method table and the registry cannot be allowed to disagree.
+pub use class_manager::{throwable_ctor_descriptors, THROWABLE_DEFAULT_CTORS};
 pub use class_manager::{
     any_class_redefined,
     class_definition_epoch,
