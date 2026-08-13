@@ -9,8 +9,8 @@
 
 CORPUS_DESC="Bouncy Castle core (provider + lightweight API) and its tests"
 CORPUS_KIND=junit
-CORPUS_CONFIDENCE=probable
-CORPUS_NOTE="classes verified present; workload not exercised by this lane"
+CORPUS_CONFIDENCE=verified
+CORPUS_NOTE="JUnit arm exercised 2026-08-12 (B7). Use the 18 'AllTests' aggregators as the workload list -- most '*Test' names are non-JUnit SimpleTests and correctly report tests=0. See docs/known-issues/jdk-only/P4A-CORPORA-20260812.md."
 
 CORPUS_ROOT_CANDIDATES="C:/craton/apps/bc-java C:/craton/cratonvm/apps/bc-java"
 

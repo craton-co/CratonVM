@@ -148,6 +148,7 @@ org.apache.groovy:groovy:5.0.6
 org.apache.groovy:groovy-jsr223:5.0.6
 org.apache.groovy:groovy-xml:5.0.6
 org.slf4j:slf4j-api:2.0.17
+com.thoughtworks.qdox:qdox:2.2.0
 "
 
 corpus_is_built() {
