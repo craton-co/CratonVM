@@ -1391,8 +1391,8 @@ applies to `flag_env_mutation_guard.rs`.
 | `CRATONVM_XT_PEER_DEADLINE_MS` | JIT | `CRATONVM_JIT=xt-peer-deadline-ms` | opt-in | off | behaviour | snapshot | vm |
 | `CRATONVM_XT_PEER_TOTAL_MS` | JIT | `CRATONVM_JIT=xt-peer-total-ms` | opt-in | off | behaviour | snapshot | vm |
 | `CRATONVM_YOUNGSCAN_STRIDE` | GC | `CRATONVM_GC=youngscan-stride` | opt-in | off | behaviour | snapshot | vm |
-| `CRATONVM_ZGC_PARMARK` | GC | `CRATONVM_GC=zgc-parmark` | opt-in | off | behaviour | snapshot | gc |
-| `CRATONVM_ZGC_RELOCATE` | GC | `CRATONVM_GC=zgc-relocate` | opt-in | off | behaviour | snapshot | gc |
+| `CRATONVM_ZGC_PARMARK` | GC | `CRATONVM_GC=zgc-parmark` | default-on | on | behaviour | snapshot | gc |
+| `CRATONVM_ZGC_RELOCATE` | GC | `CRATONVM_GC=zgc-relocate` | default-on | on | behaviour | snapshot | gc |
 | `CRATONVM_ZGC_STARTBITS` | GC | `CRATONVM_GC=zgc-startbits` | default-on | on | behaviour | snapshot | gc |
 | `CRATONVM_ZGC_TLAB` | GC | `CRATONVM_GC=zgc-tlab` | default-on | on | behaviour | snapshot | gc |
 | `CRATONVM_ZIP_MAX_ENTRY_BYTES` | IO | `CRATONVM_IO=zip-max-entry-bytes` | opt-in | off | behaviour | snapshot | types |

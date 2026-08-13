@@ -1141,8 +1141,13 @@ pub const INVENTORY: &[E] = &[
     // that field is how a reader tells a default-ON knob from a default-OFF
     // one, which is exactly the confusion that made both ZGC rows below wrong
     // until 2026-08-13.
-    E { group: Group::GC, token: "zgc-parmark", on_key: Some("CRATONVM_ZGC_PARMARK"), off_key: None, off_word: None },
-    E { group: Group::GC, token: "zgc-relocate", on_key: Some("CRATONVM_ZGC_RELOCATE"), off_key: None, off_word: None },
+    // BOTH became DEFAULT-ON on 2026-08-13, so both grew an `off_word` -- the
+    // same correction the two rows below needed, for the same reason: without
+    // it `CRATONVM_GC=-zgc-parmark` expands to UNSETTING the key, and an unset
+    // key now means ON. `parmark` is a worker count whose parser reads 0 as
+    // serial; `relocate` reads 0/off/false/no as off.
+    E { group: Group::GC, token: "zgc-parmark", on_key: Some("CRATONVM_ZGC_PARMARK"), off_key: None, off_word: Some("0") },
+    E { group: Group::GC, token: "zgc-relocate", on_key: Some("CRATONVM_ZGC_RELOCATE"), off_key: None, off_word: Some("0") },
     E { group: Group::GC, token: "zgc-startbits", on_key: Some("CRATONVM_ZGC_STARTBITS"), off_key: None, off_word: Some("0") },
     E { group: Group::GC, token: "zgc-tlab", on_key: Some("CRATONVM_ZGC_TLAB"), off_key: None, off_word: Some("0") },
     // Declared 2026-08-06 with the DBG/JIT block: a millisecond goal that
@@ -2509,6 +2514,11 @@ mod tests {
         for (token, key) in [
             ("zgc-tlab", "CRATONVM_ZGC_TLAB"),
             ("zgc-startbits", "CRATONVM_ZGC_STARTBITS"),
+            // Both joined the default-ON set on 2026-08-13 and hit the same
+            // trap on the way in: declared as opt-ins, so `-token` expanded to
+            // unsetting a key whose unset meaning had just become ON.
+            ("zgc-parmark", "CRATONVM_ZGC_PARMARK"),
+            ("zgc-relocate", "CRATONVM_ZGC_RELOCATE"),
         ] {
             let e = lookup(Group::GC, token).unwrap_or_else(|| panic!("{token} is undeclared"));
             assert_eq!(e.on_key, Some(key));

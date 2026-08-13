@@ -3078,19 +3078,30 @@ impl ZgcRealHeap {
     /// `0` and `1` both mean "do not go parallel" — the caller falls back to
     /// the serial loop, which has no pool to spawn and no join to pay for.
     fn parallel_mark_workers(&self) -> usize {
+        // DEFAULT-ON since 2026-08-13, for the gauntlet. Unset means "pick a
+        // count"; `0` is the kill switch and still means serial.
+        //
+        // The default is deliberately not `cores`: this is a stop-the-world
+        // phase on a machine that is also running the suite harness and, on
+        // the Windows box, several sibling worktrees' builds. Half the cores
+        // capped at 4 leaves the box usable and still gets most of the
+        // available parallelism on a mark, which is memory-bound long before
+        // it is core-bound.
+        let cores = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1);
         let requested = match cratonvm_types::flags::runtime_var("CRATONVM_ZGC_PARMARK") {
             Ok(v) => v.trim().parse::<usize>().unwrap_or(0),
-            Err(_) => 0,
+            Err(_) => (cores / 2).clamp(1, 4),
         };
-        if requested == 0 {
+        if requested <= 1 {
+            // 0 = explicit kill switch, 1 = a pool of one is strictly worse
+            // than the serial loop (same work, plus a spawn and a join).
             return 0;
         }
         // Never more workers than the machine has cores to run them on: this
         // is a stop-the-world phase, so oversubscription buys nothing and
         // costs context switches inside the pause it is meant to shorten.
-        let cores = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(1);
         requested.min(cores).min(Z_PARMARK_MAX_WORKERS)
     }
 
@@ -3414,12 +3425,29 @@ impl ZgcRealHeap {
     /// *safety* question (is the JIT off?) and lives in `vm_init`; this one
     /// answers an *intent* question and lives here. A caller needs both.
     fn relocation_requested(&self) -> bool {
+        // DEFAULT-ON since 2026-08-13, for the gauntlet.
+        //
+        // `CRATONVM_ZGC_RELOCATE=0` (or `off`/`false`/`no`) is the kill switch
+        // and restores the non-moving behaviour byte for byte -- the sweep
+        // simply returns an empty `PointerMap` as it always did, so the A/B is
+        // a re-run and not a rebuild.
+        //
+        // **What to watch on the first gauntlet.** This is the first
+        // configuration in which a ZGC cycle returns a NON-EMPTY pointer map,
+        // so every consumer of one now runs for this collector: JIT frame
+        // maps, monitor tables, external root providers and native side
+        // tables. Those consumers are collector-agnostic and already run for
+        // the generational moving-young path, and the two `VmHeap::Zgc`
+        // predicates that take a pre-GC address were audited and tested (R6) --
+        // but "already runs for another collector" is not "has run for this
+        // one". A crash or a stale-reference warning that appears only with
+        // this flag on is this change, and `=0` is the bisect.
         match cratonvm_types::flags::runtime_var_os("CRATONVM_ZGC_RELOCATE") {
             Some(raw) => {
                 let v = raw.to_string_lossy().trim().to_ascii_lowercase();
-                matches!(v.as_str(), "1" | "on" | "true" | "yes")
+                !matches!(v.as_str(), "0" | "off" | "false" | "no")
             }
-            None => false,
+            None => true,
         }
     }
 
@@ -7309,7 +7337,25 @@ impl GarbageCollector for ZgcRealHeap {
         let mut wild_skipped = 0usize;
         if parallel_workers > 1 {
             let root_addrs: Vec<u64> = roots.iter().map(|r| r.as_ptr() as u64).collect();
+            // OPEN THE CYCLE FIRST. `mark_parallel_stw`'s doc calls this "the
+            // caller's contract" and this caller violated it until 2026-08-13.
+            //
+            // Without the snapshot, `visit_refs` has no skip set and traces
+            // slot 0 of every `Reference` as a STRONG edge — so every weak,
+            // soft, phantom and final referent is reachable through its own
+            // `Reference` and can never be cleared. `WeakReference` and
+            // `Cleaner` silently stop working; it is a leak, not a crash, and
+            // the only signal is a one-shot warning nobody reads.
+            //
+            // It stayed hidden because parallel marking was opt-in and no test
+            // drove `collect_garbage` with it on. Turning it on by default is
+            // what surfaced it, via `real_weak_ref_cleared_when_referent_dies`
+            // — the serial path builds its own `ref_skip_objs` a few lines
+            // below, so the two marking paths disagreed about the one thing
+            // that must not differ between them.
+            let _skip = self.begin_concurrent_mark_cycle();
             let stats = self.mark_parallel_stw(&root_addrs, parallel_workers);
+            self.end_concurrent_mark_cycle();
             // `off_head_children` is this loop's `wild_skipped` under another
             // name — the engine's own doc says so.
             wild_skipped = stats.off_heap_children as usize;
@@ -9510,26 +9556,89 @@ pub(crate) mod tests {
         );
     }
 
-    /// `parallel_mark_workers` refuses to go parallel unless asked, and caps
-    /// what it is asked for.
+    /// Parallel marking is **on by default** as of 2026-08-13, and `0` is the
+    /// kill switch.
     ///
-    /// The cap is the Phase 2.3 rule applied to this constant: the value it
+    /// A pool of one is refused deliberately: it does the same work as the
+    /// serial loop plus a spawn and a join, so `1` and `0` both mean serial.
+    /// The cap is the Phase 2.3 rule applied to this constant — the value it
     /// bounds is a user-supplied integer, i.e. unbounded, and spawning it
     /// inside a safepoint is the failure mode.
     #[test]
-    fn the_parallel_mark_worker_count_is_off_by_default_and_capped() {
+    fn parallel_marking_is_on_by_default_and_zero_is_the_kill_switch() {
         let heap = ZgcRealHeap::with_capacity(64 * 1024);
-        // Unset in this process: off.
-        assert_eq!(
-            heap.parallel_mark_workers(),
-            0,
-            "parallel marking must be opt-in"
+        let cores = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1);
+
+        let n = cratonvm_types::flags::with_thread_overrides(
+            &[("CRATONVM_ZGC_PARMARK", None)],
+            || heap.parallel_mark_workers(),
         );
-        // And the ceiling exists regardless of what is asked for.
-        assert!(
-            Z_PARMARK_MAX_WORKERS >= 1,
-            "the cap must admit at least one worker"
-        );
+        if cores >= 4 {
+            assert!(n > 1, "unset must mean parallel on a multi-core box; got {n}");
+            assert!(n <= Z_PARMARK_MAX_WORKERS.min(cores));
+        } else {
+            // A 1-2 core box legitimately computes a pool of one, which is
+            // refused. Asserting "> 1" there would fail for the right reason
+            // and look like a defect.
+            assert_eq!(n, 0, "a pool of one must fall back to serial");
+        }
+
+        for off in ["0", "1"] {
+            let n = cratonvm_types::flags::with_thread_overrides(
+                &[("CRATONVM_ZGC_PARMARK", Some(off))],
+                || heap.parallel_mark_workers(),
+            );
+            assert_eq!(n, 0, "CRATONVM_ZGC_PARMARK={off} must mean serial");
+        }
+    }
+
+    /// **The parallel mark path must open a mark cycle, or no weak reference
+    /// can ever be cleared.**
+    ///
+    /// `visit_refs` without a skip-set snapshot traces slot 0 of every
+    /// `Reference` as a STRONG edge, so the referent is reachable through its
+    /// own `Reference` — a leak, not a crash, whose only signal is a one-shot
+    /// warning. `collect_garbage`'s parallel branch did exactly that until
+    /// 2026-08-13, and it stayed hidden because the path was opt-in and no
+    /// test drove `collect_garbage` with it on.
+    ///
+    /// The serial branch builds its own `ref_skip_objs`. This asserts the two
+    /// paths agree about the one thing that must not differ between them.
+    ///
+    /// The exact edit that trips it: drop the `begin_concurrent_mark_cycle`
+    /// call from the parallel branch.
+    #[test]
+    fn the_parallel_mark_path_clears_a_weak_reference_like_the_serial_one() {
+        for workers in ["0", "4"] {
+            let heap = ZgcRealHeap::new();
+            let weak = heap.alloc_object(ClassId::new(1), 1);
+            let referent = heap.alloc_object(ClassId::new(2), 0);
+            heap.set_field(weak, 0, Value::Object(Some(referent)));
+            heap.discover_reference(ReferenceType::Weak, weak, referent, None);
+
+            let mut roots = [weak];
+            cratonvm_types::flags::with_thread_overrides(
+                &[
+                    ("CRATONVM_ZGC_PARMARK", Some(workers)),
+                    // Isolate the marking question from the moving one.
+                    ("CRATONVM_ZGC_RELOCATE", Some("0")),
+                ],
+                || {
+                    // SAFETY: these unit tests run the heap single-threaded.
+                    let stw = unsafe { StopTheWorldToken::new() };
+                    heap.collect_garbage(&stw, &mut roots, &NoMonitors);
+                },
+            );
+
+            assert_eq!(
+                heap.get_field(roots[0], 0),
+                Value::Object(None),
+                "CRATONVM_ZGC_PARMARK={workers}: the referent must be cleared \
+                 on BOTH marking paths"
+            );
+        }
     }
 
     // -- Phase 4: stop-the-world compaction --------------------------------
@@ -10066,18 +10175,29 @@ pub(crate) mod tests {
         assert!(!disarmed, "and disarming must let the inline arms back on");
     }
 
-    /// The intent sub-flag is off unless asked for.
+    /// Compaction is **on by default** as of 2026-08-13, with
+    /// `CRATONVM_ZGC_RELOCATE=0` as the kill switch.
     ///
-    /// It is the ONLY thing keeping compaction off a user's machine now that
-    /// the `zgc` Cargo feature -- which the production plan's R5 row assumed
-    /// was the outer default-off gate -- is default-ON.
+    /// The kill switch restores the non-moving behaviour byte for byte — the
+    /// sweep returns an empty `PointerMap` exactly as it always did — so the
+    /// A/B is a re-run and not a rebuild. That property is what makes this
+    /// flag usable as a bisect when something only breaks with a moving
+    /// collector.
     #[test]
-    fn compaction_is_off_unless_its_own_sub_flag_is_set() {
+    fn compaction_is_on_by_default_and_zero_is_the_kill_switch() {
         let heap = ZgcRealHeap::with_capacity(64 * 1024);
-        assert!(
-            !heap.relocation_requested(),
-            "compaction must be opt-in; this flag is the belt, not the braces"
+        let on = cratonvm_types::flags::with_thread_overrides(
+            &[("CRATONVM_ZGC_RELOCATE", None)],
+            || heap.relocation_requested(),
         );
+        assert!(on, "compaction must be on by default");
+        for off in ["0", "off", "false", "no"] {
+            let v = cratonvm_types::flags::with_thread_overrides(
+                &[("CRATONVM_ZGC_RELOCATE", Some(off))],
+                || heap.relocation_requested(),
+            );
+            assert!(!v, "CRATONVM_ZGC_RELOCATE={off} must be a kill switch");
+        }
     }
 
     #[test]
