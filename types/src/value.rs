@@ -319,9 +319,27 @@ fn provenance_leaf_alloc(slot: &AtomicPtr<AtomicU64>) -> *mut AtomicU64 {
     }
 }
 
+/// Ways in the per-thread provenance memo.
+///
+/// It was ONE entry, which is exactly right for the shape it was written for —
+/// a TLAB bump-allocating through a single 4 KiB block for ~100 consecutive
+/// objects — and exactly wrong for the other common shape: a native that reads
+/// two or three long-lived objects in a row. An `ArrayList` and its backing
+/// array are separate allocations in separate blocks, so `size()` alternated
+/// between two `block` values and every single call evicted the other's entry
+/// and took the slow path. `record_object_ref_payload_slow` measured **3.3%**
+/// of a flat profile of an `ArrayList.size()` loop, which touches exactly those
+/// two blocks (2026-08-13).
+///
+/// Eight ways is ~128 bytes per thread and covers the working set of a native
+/// walking a small object graph. Direct-mapped on the low bits of `block`:
+/// a collision costs a slow-path visit, never a wrong answer, because each way
+/// stores the `block` it was filled for and is only trusted on an exact match.
+const PROVENANCE_MEMO_WAYS: usize = 8;
+
 thread_local! {
-    /// Per-thread memo for [`record_object_ref_payload`]: `(block, bits)`,
-    /// where `block` is `raw >> 12` — the 4 KiB span one leaf `u64` covers
+    /// Per-thread memo for [`record_object_ref_payload`]: `(block, bits)` per
+    /// way, where `block` is `raw >> 12` — the 4 KiB span one leaf `u64` covers
     /// (64 granules x 64 bytes) — and `bits` is a subset of that word's
     /// granule bits this thread has already observed *set* in the global
     /// bitmap.
@@ -340,8 +358,18 @@ thread_local! {
     /// Bits are recorded here only after the global bit is known set, and
     /// `PROVENANCE_L1` leaves are never freed and bits never cleared, so a
     /// hit cannot be stale. It is thread-local, so it adds no cross-thread
-    /// obligations to the ordering argument below.
-    static PROVENANCE_MEMO: std::cell::Cell<(u64, u64)> = const { std::cell::Cell::new((u64::MAX, 0)) };
+    /// obligations to the ordering argument below. Widening it to several ways
+    /// changes none of that: each way carries the same invariant on its own.
+    static PROVENANCE_MEMO: [std::cell::Cell<(u64, u64)>; PROVENANCE_MEMO_WAYS] =
+        const { [const { std::cell::Cell::new((u64::MAX, 0)) }; PROVENANCE_MEMO_WAYS] };
+}
+
+/// Direct-mapped way for `block`. The empty marker is `u64::MAX`, which no real
+/// `raw >> PROVENANCE_WORD_COVER_SHIFT` can equal, so an untouched way cannot
+/// be mistaken for a hit.
+#[inline(always)]
+fn provenance_memo_way(block: u64) -> usize {
+    (block as usize) & (PROVENANCE_MEMO_WAYS - 1)
 }
 
 /// log2 of the address span one leaf `u64` word covers (64 granules x 64 B).
@@ -361,18 +389,19 @@ pub(crate) fn record_object_ref_payload(ptr: *mut u8) {
     }
     let block = raw >> PROVENANCE_WORD_COVER_SHIFT;
     let bit = 1u64 << ((raw >> PROVENANCE_GRANULE_SHIFT) & 63);
-    let memo = PROVENANCE_MEMO.with(|memo| memo.get());
+    let way = provenance_memo_way(block);
+    let memo = PROVENANCE_MEMO.with(|memo| memo[way].get());
     if memo.0 == block && memo.1 & bit != 0 {
         return;
     }
-    record_object_ref_payload_slow(raw, block, bit, memo);
+    record_object_ref_payload_slow(raw, block, bit, memo, way);
 }
 
 /// Out-of-line remainder of [`record_object_ref_payload`]: consult (and, if
 /// needed, allocate) the real bitmap leaf, then refresh the per-thread memo
 /// with every granule bit that word already has set.
 #[inline(never)]
-fn record_object_ref_payload_slow(raw: u64, block: u64, bit: u64, memo: (u64, u64)) {
+fn record_object_ref_payload_slow(raw: u64, block: u64, bit: u64, memo: (u64, u64), way: usize) {
     let (l1, word, _) = provenance_indices(raw);
     let slot = &PROVENANCE_L1[l1];
     let mut leaf = slot.load(Ordering::Acquire);
@@ -410,7 +439,7 @@ fn record_object_ref_payload_slow(raw: u64, block: u64, bit: u64, memo: (u64, u6
     // Remember every bit this word already carries, not just ours: within a
     // TLAB the next ~100 object references land in this same word.
     let carried = if memo.0 == block { memo.1 } else { 0 };
-    PROVENANCE_MEMO.with(|m| m.set((block, carried | observed)));
+    PROVENANCE_MEMO.with(|m| m[way].set((block, carried | observed)));
 }
 
 #[inline]

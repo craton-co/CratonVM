@@ -241,7 +241,7 @@ dispatch-dominated (`execute_frame_from_index` 5.4 %,
 combined, then a long tail of JIT-bridge helpers). `jit_entries` = 75,913,815.
 
 Re-filed as a measured section on
-[the netty per-call throughput page](../../known-issues/netty/adaptive-bytebuf-allocator-throughput-20260812.md),
+[the netty per-call throughput page](../performance/netty-per-call-throughput-20260813.md),
 which owns this cost. **It is still a red test under load** — retiring this page
 does not make it green, and it should not be read as claiming so. The margin is
 16 s of a 120 s budget, so a ~15 % win on that path removes it entirely.
