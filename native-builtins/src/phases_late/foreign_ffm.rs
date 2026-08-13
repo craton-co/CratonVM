@@ -1843,20 +1843,19 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(Some(segment))))
         },
     );
+    // `allocateFrom(String)` allocates REAL memory and writes the string into
+    // it. It used to hand back a `p67_arena_segment` — a stand-in whose address
+    // is 0 and which `panama_libffi::segment_byte_size` decodes as size 0, so
+    // `Arena.allocateFrom("abc").byteSize()` answered 0 where HotSpot answers 4,
+    // and the bytes were never written at all. `Arena.allocate` was already
+    // routed to the real allocator; this is the sibling that was left behind,
+    // and it is the second half of residual 3 in
+    // `ffm-elements-spliterator-and-allocatefrom-gaps-20260813`.
     r.register(
         arena,
         "allocateFrom",
         "(Ljava/lang/String;)Ljava/lang/foreign/MemorySegment;",
-        |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            let len = match args.get(1) {
-                Some(Value::Object(Some(s))) => {
-                    ctx.read_string(*s).map(|t| t.len() as i64 + 1).unwrap_or(1)
-                }
-                _ => 1,
-            };
-            Ok(Some(Value::Object(Some(p67_arena_segment(ctx, this, len)?))))
-        },
+        crate::panama::pe_arena_allocate_from_string,
     );
     r.register(arena, "close", "()V", |ctx, args| {
         let this = obj_arg(args, 0)?;
@@ -2896,6 +2895,32 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
             p67_layout_byte_alignment,
         );
     }
+
+    // `SequenceLayout`'s own two accessors. The factory above already keeps the
+    // element layout at slot 4 and the count at slot 5 "so `elementLayout()`/
+    // `elementCount()` have somewhere to read from when they are implemented" —
+    // this is that.
+    r.register(
+        "java/lang/foreign/SequenceLayout",
+        "elementLayout",
+        "()Ljava/lang/foreign/MemoryLayout;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            Ok(Some(ctx.get_field(this, 4)))
+        },
+    );
+    r.register(
+        "java/lang/foreign/SequenceLayout",
+        "elementCount",
+        "()J",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            Ok(Some(match ctx.get_field(this, 5) {
+                v @ Value::Long(_) => v,
+                _ => Value::Long(0),
+            }))
+        },
+    );
 
     // Linker
     let gl = "java/lang/foreign/GroupLayout";
