@@ -84,7 +84,7 @@ skipped · ⏱ wall-clock only, passes solo
 | `io.netty.buffer.AdaptiveLittleEndianHeapByteBufTest` | HANG | ✅ **415/417** — same as HotSpot |
 | `io.netty.buffer.AdvancedLeakAwareByteBufTest` | HANG | ✅ **426/426** — same as HotSpot |
 | `io.netty.buffer.AdvancedLeakAwareCompositeByteBufTest` | HANG | ✅ ok=497 aborted=9 — **byte-identical to HotSpot** |
-| `io.netty.buffer.AlignedPooledByteBufAllocatorTest` | HANG | ⚠ no failures, but runs 28 tests HotSpot skips → [unsafe-property](unsafe-memory-access-property-flips-netty-to-unsafe-paths-20260812.md) |
+| `io.netty.buffer.AlignedPooledByteBufAllocatorTest` | HANG | ⚠ no failures, but runs 28 tests HotSpot skips → unsafe-property (retired: `unsafe-memory-access-property-flips-netty-to-unsafe-paths-20260812`) |
 | `io.netty.buffer.BigEndianCompositeByteBufTest` | HANG | ✅ ok=487 aborted=9 — **byte-identical to HotSpot** |
 | `io.netty.buffer.BigEndianDirectByteBufTest` | HANG | ✅ **413/413** — same as HotSpot |
 | `io.netty.buffer.BigEndianHeapByteBufTest` | FAIL/HANG | ✅ **414/414** — same as HotSpot |
@@ -99,12 +99,12 @@ skipped · ⏱ wall-clock only, passes solo
   early on a different defect), and `AdaptivePoolingAllocator` carries no
   penalty of its own — it is the same per-call cost at 23× the call density.
   Read the corrected page, not this summary.
-* [`unsafe-memory-access-property-flips-netty-to-unsafe-paths-20260812.md`](unsafe-memory-access-property-flips-netty-to-unsafe-paths-20260812.md)
+* the retired `unsafe-memory-access-property-flips-netty-to-unsafe-paths-20260812` write-up (retired: `unsafe-memory-access-property-flips-netty-to-unsafe-paths-20260812`)
   — CratonVM pins `sun.misc.unsafe.memory.access=allow`, so netty takes its
   Unsafe fast paths on CratonVM and its safe paths on HotSpot 25. **Read this
   before triaging any other netty batch page**: the two VMs are not running the
   same netty code.
-* [`memorysegment-asbytebuffer-unimplemented-20260812.md`](memorysegment-asbytebuffer-unimplemented-20260812.md)
+* the retired `memorysegment-asbytebuffer-unimplemented-20260812` write-up (retired: `memorysegment-asbytebuffer-unimplemented-20260812`)
   — `MemorySegment.asByteBuffer()` throws `AbstractMethodError`, which is why
   netty's HotSpot-25-default allocator (`CleanerJava25`, FFM-`Arena`-backed)
   cannot allocate at all on CratonVM, and why the property above cannot simply

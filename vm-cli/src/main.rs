@@ -1657,6 +1657,32 @@ fn normalize_java_launcher_argv(args: Vec<String>) -> Vec<String> {
             // name (see the comment above).
             i += 1;
         }
+        // `--sun-misc-unsafe-memory-access=<mode>` (JEP 498). HotSpot's launcher
+        // does exactly this rewrite: the flag's only effect is to set the
+        // `sun.misc.unsafe.memory.access` system property, and when the flag is
+        // absent HotSpot sets NOTHING — the effective mode is still "allow with
+        // a warning", but `System.getProperty` answers null.
+        //
+        // That null is load-bearing for more than tidiness. netty 4.2 disables
+        // `sun.misc.Unsafe` by default on Java 25+ *unless* this property is
+        // set, so a VM that pins it — which CratonVM did, unconditionally, in
+        // `vm_init.rs` — silently puts netty and every other Unsafe-aware
+        // library on a different code path than a stock JDK 25 run, and makes
+        // any CratonVM-vs-HotSpot comparison over them a comparison of two
+        // different code paths rather than two VMs.
+        //
+        // Rewriting to `-D` here rather than parsing it later gives the
+        // property exactly one source: the user.
+        else if let Some(mode) = a.strip_prefix("--sun-misc-unsafe-memory-access=") {
+            if std::env::var_os("CRATONVM_DBG_ARGS").is_some() {
+                eprintln!(
+                    "[cratonvm] --sun-misc-unsafe-memory-access={mode} -> \
+                     -Dsun.misc.unsafe.memory.access={mode}"
+                );
+            }
+            out.push(format!("-Dsun.misc.unsafe.memory.access={mode}"));
+            i += 1;
+        }
         // HotSpot VM-selection flags. Modern HotSpot accepts `-server` and
         // `-client` for compatibility (the server VM is effectively the only
         // implementation on current JDKs). WildFly's HostController launch
@@ -6949,6 +6975,80 @@ mod tests {
         let expanded = expand_aggregate_jars(vec![missing.clone()]);
         assert_eq!(expanded, vec![missing]);
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    // -----------------------------------------------------------------------
+    // `--sun-misc-unsafe-memory-access=<mode>` (JEP 498).
+    //
+    // The flag's whole effect is the system property it sets, and the property
+    // is the single input netty 4.2 keys its Unsafe-vs-FFM decision on. A
+    // default run must leave it UNSET, exactly as HotSpot does — CratonVM used
+    // to pin it to `allow` in `vm_init`, which silently put netty and every
+    // other Unsafe-aware library on a different code path than a stock JDK 25.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn unsafe_memory_access_flag_becomes_the_system_property() {
+        let out = normalize_java_launcher_argv(argv(&[
+            "java",
+            "--sun-misc-unsafe-memory-access=allow",
+            "Main",
+        ]));
+        assert_eq!(
+            out,
+            argv(&["java", "-Dsun.misc.unsafe.memory.access=allow", "Main"])
+        );
+    }
+
+    #[test]
+    fn every_unsafe_memory_access_mode_round_trips() {
+        for mode in ["allow", "warn", "debug", "deny"] {
+            let out = normalize_java_launcher_argv(argv(&[
+                "java",
+                &format!("--sun-misc-unsafe-memory-access={mode}"),
+                "Main",
+            ]));
+            assert_eq!(
+                out,
+                argv(&[
+                    "java",
+                    &format!("-Dsun.misc.unsafe.memory.access={mode}"),
+                    "Main"
+                ]),
+                "mode {mode}"
+            );
+        }
+    }
+
+    #[test]
+    fn no_unsafe_memory_access_flag_leaves_the_property_unset() {
+        // The load-bearing half: a plain command line must not introduce the
+        // property, because `System.getProperty(...) == null` is what makes
+        // netty take the same path it takes on a stock JDK 25.
+        let out = normalize_java_launcher_argv(argv(&["java", "-Xmx1g", "Main"]));
+        assert!(
+            !out.iter().any(|a| a.contains("sun.misc.unsafe.memory.access")),
+            "a default command line must not mention the property: {out:?}"
+        );
+    }
+
+    #[test]
+    fn an_unsafe_memory_access_flag_after_the_separator_is_the_programs_own() {
+        let out = normalize_java_launcher_argv(argv(&[
+            "java",
+            "Main",
+            "--",
+            "--sun-misc-unsafe-memory-access=allow",
+        ]));
+        assert_eq!(
+            out,
+            argv(&[
+                "java",
+                "Main",
+                "--",
+                "--sun-misc-unsafe-memory-access=allow"
+            ])
+        );
     }
 
     // -----------------------------------------------------------------------
