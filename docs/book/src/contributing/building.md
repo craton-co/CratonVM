@@ -37,7 +37,7 @@ cargo build --workspace --all-targets
 | `gpu` / `gpu-driver` | `cratonvm-cli` | Enable GPU offload plumbing (stub) / real CUDA driver. See [GPU Offload](../gpu/overview.md). |
 | `mimalloc` | `cratonvm-cli` | Use mimalloc as the global allocator (on by default; faster on Windows). |
 | `awt` | `vm` | AWT/Swing/Java2D natives (on by default). |
-| `zgc` | `cratonvm-cli` → `vm` → `gc` | Compile the ZGC backend in, so `-XX:+UseZGC` actually selects it. Off by default: a stock build has no `GcAlgorithm::Zgc` variant at all, and `-XX:+UseZGC` warns and falls back to Generational. It is a stop-the-world non-moving mark-sweep, not production ZGC — see [The Garbage Collector](../internals/garbage-collector.md#collectors). |
+| `zgc` | `cratonvm-cli` → `vm` → `gc` | Compile the ZGC backend in. **On by default since 2026-08-10**, because it gates the `GcAlgorithm::Zgc` variant and that variant is now the default collector. Turning it off (`--no-default-features`) leaves a launcher where `-XX:+UseZGC` warns and falls back to Generational. It is a stop-the-world non-moving mark-sweep, not production ZGC — see [The Garbage Collector](../internals/garbage-collector.md#collectors). |
 
 ```bash
 # A java[.exe] alias alongside cratonvm
@@ -46,8 +46,10 @@ cargo build --release -p cratonvm-cli --features java-bin-alias
 # GPU offload with the real CUDA driver
 cargo build --release -p cratonvm-cli --features gpu-driver
 
-# A ZGC-capable launcher (`-XX:+UseZGC` is inert without this)
-cargo build --release -p cratonvm-cli --features zgc
+# A launcher with NO ZGC at all: Generational becomes the default and
+# `-XX:+UseZGC` warns and falls back. `--no-default-features` also drops
+# `mimalloc`, so name it back unless you mean to drop that too.
+cargo build --release -p cratonvm-cli --no-default-features --features mimalloc
 ```
 
 The default `cargo build` produces a CPU-only JVM with **no** GPU code linked.

@@ -590,6 +590,31 @@ pub static SWEEP_PHANTOM_EXTENTS: AtomicU64 = AtomicU64::new(0);
 /// Bounded report counter for [`SWEEP_PHANTOM_EXTENTS`].
 static SWEEP_PHANTOM_REPORTS: AtomicU64 = AtomicU64::new(0);
 
+/// Marks subsumed by a reported phantom extent that may NOT be object bases.
+///
+/// [`SWEEP_PHANTOM_EXTENTS`] rests on "`side_sorted` holds object BASES, and
+/// live objects never nest". The first half has one documented exception: when
+/// no anchor interval resolves a CONSERVATIVE candidate, `mark_young`'s
+/// fallback side-marks the RAW candidate address, which is a base only if the
+/// candidate happened to be one. A conservative candidate is frequently an
+/// object-INTERIOR word (a field address, a derived pointer, a spilled register
+/// mid-object), and the late-resolution pass that marks the real base cannot
+/// unmark the raw address — so `side_sorted` can carry both.
+///
+/// An interior mark of a perfectly VALID object satisfies the phantom check's
+/// premise exactly, which would make the verdict a false positive that unwinds
+/// every reclamation since the last anchor: a throughput cost, not a
+/// correctness one (`live_in_dead` stayed 0 throughout the 2026-08-13 finding).
+///
+/// This counter does not change the verdict — it says whether that explanation
+/// is the right one. `unresolved_snapshot` is exactly the set of marks that may
+/// not be bases; everything else came from a precise ref-slot value (a base by
+/// construction) or from `resolve_candidate_bases`. Read it beside
+/// `phantom_extents`: equal counts say the guard is firing on interior marks,
+/// zero says the subsumed marks were real bases and the walk really did leave
+/// the object grid.
+pub static SWEEP_PHANTOM_INTERIOR_MARKS: AtomicU64 = AtomicU64::new(0);
+
 /// H2-CID0 — reclaim spans the sweep refused to publish because they already
 /// overlapped a free block. Publishing one is a double free: the allocator can
 /// hand the same bytes to two objects, and the second allocation zeroes them
@@ -10346,6 +10371,25 @@ impl GenerationalHeap {
                     .is_some_and(|&a| a < abs + total_size)
                 {
                     let victim = side_sorted[live_probe];
+                    // Are the subsumed marks object BASES? See
+                    // `SWEEP_PHANTOM_INTERIOR_MARKS` — this classifies, it does
+                    // not gate. Bounded by the marks inside this one extent.
+                    let mut nonbase_inside = 0u64;
+                    let mut probe = live_probe;
+                    while let Some(&a) = side_sorted.get(probe) {
+                        if a >= abs + total_size {
+                            break;
+                        }
+                        if unresolved_snapshot.binary_search(&a).is_ok() {
+                            nonbase_inside += 1;
+                        }
+                        probe += 1;
+                    }
+                    if nonbase_inside != 0 {
+                        SWEEP_PHANTOM_INTERIOR_MARKS.fetch_add(nonbase_inside, Ordering::Relaxed);
+                    }
+                    let victim_is_unresolved_raw =
+                        unresolved_snapshot.binary_search(&victim).is_ok();
                     SWEEP_PHANTOM_EXTENTS.fetch_add(1, Ordering::Relaxed);
                     if SWEEP_PHANTOM_REPORTS.fetch_add(1, Ordering::Relaxed) < 8 {
                         tracing::error!(
@@ -10362,6 +10406,14 @@ impl GenerationalHeap {
                             num_slots = header.num_slots(),
                             victim = format!("{victim:#x}"),
                             victim_interior_offset = victim - abs,
+                            // The discriminator: `true` means this "live
+                            // object" is an unresolved RAW conservative
+                            // candidate, i.e. possibly an interior word of the
+                            // very object being sized here, and the verdict is
+                            // then a false positive. See
+                            // `SWEEP_PHANTOM_INTERIOR_MARKS`.
+                            victim_is_unresolved_raw,
+                            nonbase_marks_inside = nonbase_inside,
                             // Where the walk last stood on ground truth, and the
                             // stride that took it from there to here. The break is
                             // upstream of the detection: if `prev_*` sizes an object
@@ -12974,6 +13026,34 @@ impl GenerationalHeap {
                     .min(used);
                 let run_end = zero_run_end(base, cursor, limit);
                 if run_end - cursor >= HEADER_SIZE {
+                    // A run of EMPTY objects is not a desync, and the second
+                    // half of the argument is what carries it here, exactly as
+                    // in `mark_young_to_old_refs`: an empty object has NO
+                    // FIELDS, so a run of them holds no reference into old gen
+                    // for this pass to rewrite. Stepping over it cannot strand
+                    // one at a stale pre-compaction address.
+                    //
+                    // There is no young live set to hand the predicate — this
+                    // walk is given a from-space, not a mark result — so `&[]`
+                    // is all there is and the no-marked-base-inside condition
+                    // is vacuous. The alignment and plausible-next-header
+                    // conditions still establish that `resume` is on-grid.
+                    //
+                    // The arm below is not free: it re-anchors at the next free
+                    // block and falls back to `rewrite_stretch_conservatively`
+                    // over everything skipped, which rewrites any aligned word
+                    // that merely EQUALS a moved object's old address — a
+                    // primitive included — and gives up the precise parse of
+                    // every real object in the stretch.
+                    if let Some(resume) =
+                        zero_run_empty_object_resume(base, cursor, run_end, used, &[])
+                    {
+                        SWEEP_ZERO_SPAN_EMPTY_RUNS.fetch_add(1, Ordering::Relaxed);
+                        EMPTY_RUN_BYTES_CYCLE
+                            .fetch_add((resume - cursor) as u64, Ordering::Relaxed);
+                        cursor = resume;
+                        continue;
+                    }
                     LATE_WALK_ZERO_RUNS[1].fetch_add(1, Ordering::Relaxed);
                     anomaly = true;
                 }
@@ -14313,6 +14393,37 @@ impl GenerationalHeap {
                         .min(used);
                     let run_end = zero_run_end(base, offset, limit);
                     if run_end - offset >= HEADER_SIZE {
+                        // A run of EMPTY objects is not a desync. This walk has
+                        // no live set either (it enumerates a from-space, live
+                        // and dead alike), so what carries it is again that an
+                        // empty object has NO FIELDS.
+                        //
+                        // That is exactly what this walk's callers consume.
+                        // `collect_young_to_old_roots` reads REF SLOTS to build
+                        // the concurrent old-gen marker's young->old roots,
+                        // which the call site calls mandatory — "a missed mark
+                        // root here = cleanup frees a live object" — and a run
+                        // of empty objects contributes none. Whereas the arm
+                        // below re-anchors at the next free block and so drops
+                        // every REAL object between the run and that anchor
+                        // from the enumeration, roots and all. Resuming on-grid
+                        // strictly reduces what is lost.
+                        //
+                        // The run's own members are skipped rather than emitted
+                        // as HEADER_SIZE entries: `hprof::dump_heap` is the
+                        // other caller, and a multi-megabyte run of dead empty
+                        // objects would balloon the dump for no fidelity a
+                        // consumer relies on. Today's arm omits them too, along
+                        // with everything after them.
+                        if let Some(resume) =
+                            zero_run_empty_object_resume(base, offset, run_end, used, &[])
+                        {
+                            SWEEP_ZERO_SPAN_EMPTY_RUNS.fetch_add(1, Ordering::Relaxed);
+                            EMPTY_RUN_BYTES_CYCLE
+                                .fetch_add((resume - offset) as u64, Ordering::Relaxed);
+                            offset = resume;
+                            continue;
+                        }
                         LATE_WALK_ZERO_RUNS[2].fetch_add(1, Ordering::Relaxed);
                         anomaly = true;
                     }
@@ -16794,6 +16905,26 @@ fn zero_run_verdict(
     }
 }
 
+/// `CRATONVM_GC_NO_EMPTY_OBJECT_RUN=1` — treat every all-zero run as a walk
+/// desync again, i.e. restore the pre-2026-08-12 behaviour in which a run of
+/// EMPTY objects took the unwind-and-resync path.
+///
+/// This exists because the empty-object-run recovery is the kind of fix whose
+/// ABSENCE is invisible: without it the sweep still completes, still reports a
+/// walk that ran to `used`, and simply throws away almost every reclaim
+/// decision it made — 40 724 of 40 746 in the case it was written for. Two
+/// separate investigations (`young-sweep-empty-object-run-unwind-20260812`, and
+/// `TestDefaultInstanceManager`'s fourth recurrence) spent rounds on symptoms of
+/// exactly that, and neither could A/B the mechanism in one binary because
+/// there was no way to turn it off. Now there is, and the cross-run comparison
+/// that "prices the box" instead of the change is not the only option.
+///
+/// NOT `OnceLock`-cached: this is read once per zero RUN, not per object, and
+/// caching it would make the flag racy against whichever sweep runs first.
+fn empty_object_run_recovery_disabled() -> bool {
+    cratonvm_types::flags::runtime_var_os("CRATONVM_GC_NO_EMPTY_OBJECT_RUN").is_some()
+}
+
 /// `Some(resume)` when the run is a run of EMPTY objects and the walk may step
 /// to `resume`; `None` when it is evidence the walk left the object grid.
 fn zero_run_empty_object_resume(
@@ -16803,6 +16934,9 @@ fn zero_run_empty_object_resume(
     used: usize,
     side_sorted: &[usize],
 ) -> Option<usize> {
+    if empty_object_run_recovery_disabled() {
+        return None;
+    }
     match zero_run_verdict(base, cursor, run_end, used, side_sorted) {
         ZeroRunVerdict::EmptyObjects { resume } => Some(resume),
         _ => None,
@@ -17793,6 +17927,61 @@ mod tests {
     fn small_gen_heap() -> GenerationalHeap {
         // 4KB young semi-space, 8KB old gen
         GenerationalHeap::with_sizes(4 * 1024, 8 * 1024)
+    }
+
+    /// A run of swept empty objects must not hide the objects AFTER it.
+    ///
+    /// This is the behavioural half of the `zero_run_empty_object_resume`
+    /// unit tests, at the one call site that is `pub` and so can be driven
+    /// directly. Without the predicate, `word0 == 0` over a stretch at least
+    /// `HEADER_SIZE` long is read as a walk desync, and the recovery arm
+    /// re-anchors at the next FREE BLOCK — dropping every real object between
+    /// the run and that anchor from the returned enumeration.
+    ///
+    /// What makes that a correctness bug rather than a diagnostic wart is who
+    /// consumes the enumeration: `collect_young_to_old_roots` turns it into
+    /// the concurrent old-gen marker's young->old roots, which its call site
+    /// in `maybe_concurrent_gc` calls mandatory — "a missed mark root here =
+    /// cleanup frees a live object".
+    #[test]
+    fn a_run_of_swept_empty_objects_does_not_hide_the_young_objects_after_it() {
+        let heap = small_gen_heap();
+
+        let first = heap.alloc_object(ClassId::new(1), 1);
+        // Four objects that a non-moving sweep has reclaimed. Zeroed is
+        // exactly what a dead `new Object()` looks like afterwards, and it is
+        // also what a LIVE one looks like before its mark word is written:
+        // ClassId(0), shape 0, MARK_NEUTRAL, ObjectKind::Object and
+        // ArrayElementType::Reference are all the all-zero encoding.
+        let holes: Vec<_> = (0..4)
+            .map(|_| heap.alloc_object(ClassId::new(7), 0))
+            .collect();
+        let last = heap.alloc_object(ClassId::new(2), 1);
+
+        for h in &holes {
+            // SAFETY: each `h` is a live young object of exactly HEADER_SIZE
+            // bytes (`num_slots == 0`), so this writes only its own header.
+            unsafe { std::ptr::write_bytes(h.as_ptr(), 0, HEADER_SIZE) };
+        }
+
+        let walked: Vec<usize> = heap
+            .walk_young_objects()
+            .into_iter()
+            .map(|(p, _)| p as usize)
+            .collect();
+
+        assert!(
+            walked.contains(&(first.as_ptr() as usize)),
+            "the object BEFORE the run must still be walked (walked {} objects)",
+            walked.len(),
+        );
+        assert!(
+            walked.contains(&(last.as_ptr() as usize)),
+            "a run of swept empty objects must not hide the object after it — \
+             this enumeration is the concurrent marker's mandatory young→old \
+             root set (walked {} objects)",
+            walked.len(),
+        );
     }
 
     /// fork6 GC_STRESS fix — a young object's reference to an old-gen object

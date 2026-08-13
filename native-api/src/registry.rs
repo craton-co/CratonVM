@@ -7129,8 +7129,14 @@ impl NativeMethodRegistry {
         method_name: &str,
         descriptor: &str,
     ) -> Option<(NativeCallback, NativeKind)> {
-        if let Some(slot) = self.slot_for_exact(class_name, method_name, descriptor) {
-            return Some((slot.callback, slot.kind));
+        // One prefilter for both halves — see `find`.
+        let class_state = self.class_prefilter(class_name)?;
+        if let Some(idx) =
+            self.slot_index_from_state(class_state, class_name, method_name, descriptor)
+        {
+            if let Some(slot) = self.slots.get(idx as usize) {
+                return Some((slot.callback, slot.kind));
+            }
         }
         // Cold descriptor-quirk path. Semantics deliberately preserved from the
         // pre-memoization implementation: the kind is looked up with the
@@ -7191,7 +7197,20 @@ impl NativeMethodRegistry {
         method_name: &str,
         descriptor: &str,
     ) -> Option<NativeMethodId> {
-        let key = native_method_hash(class_name, method_name, descriptor);
+        // PERF (2026-08-13, netty `io.netty.buffer` throughput). This is the
+        // lookup `try_stackless_invoke`'s step 1 goes through — the one on the
+        // interpreter's EVERY-invoke path — and it was the only entry point
+        // that never consulted the class prefilter. It hashed the full triple,
+        // missed, and then entered the descriptor-quirk path, for classes like
+        // `io/netty/buffer/AdaptiveByteBuf` that register nothing at all. A
+        // flat profile of `AdaptiveByteBufAllocatorTest` put `slot_for_exact`
+        // at 8.2% and `resolve_id_with_descriptor_quirks` — the `#[cold]` arm —
+        // at another 1.8%, the largest family in the run.
+        //
+        // Answering from the prefix state also removes the second walk over the
+        // class name that `native_method_hash` did.
+        let class_state = self.class_prefilter(class_name)?;
+        let key = native_method_hash_from(class_state, method_name, descriptor);
         if let Some(idx) = self.slot_index_for_key(key, class_name, method_name, descriptor) {
             return Some(NativeMethodId::from_u32(idx));
         }
@@ -7219,6 +7238,9 @@ impl NativeMethodRegistry {
         {
             return Some(NativeMethodId::from_u32(idx));
         }
+        // No prefilter here on purpose: the caller already saved the digest,
+        // so a class hash would be NEW work on this path, and the quirk arm
+        // below opens with its own cheap descriptor precheck.
         self.resolve_id_with_descriptor_quirks(class_name, method_name, descriptor)
     }
 
@@ -7366,6 +7388,25 @@ impl NativeMethodRegistry {
         Some((slot.callback, slot.kind))
     }
 
+    /// The class-name prefilter: `Some(prefix_state)` when this class MIGHT
+    /// register a native, `None` when it provably registers none.
+    ///
+    /// One-sided by construction, in the safe direction. `classes_with_natives`
+    /// holds the digest of every registered class name, so a registered class
+    /// can never be absent; an unregistered class whose digest collides with a
+    /// registered one merely falls through to the full path and misses there.
+    ///
+    /// Returning the prefix state rather than a bool is what lets the caller
+    /// finish the digest without re-walking the class name — see
+    /// [`native_class_hash`].
+    #[inline]
+    fn class_prefilter(&self, class_name: &str) -> Option<(u64, u64)> {
+        let class_state = native_class_hash(class_name);
+        self.classes_with_natives
+            .contains(&class_state)
+            .then_some(class_state)
+    }
+
     /// Slot lookup by exact triple (no descriptor rewriting).
     #[inline]
     fn slot_for_exact(
@@ -7377,13 +7418,31 @@ impl NativeMethodRegistry {
         // Prefilter on the class name alone before finishing the digest: see
         // `native_class_hash`. Exact for a miss, may false-positive into the
         // full path.
-        let class_state = native_class_hash(class_name);
-        if !self.classes_with_natives.contains(&class_state) {
-            return None;
-        }
+        let class_state = self.class_prefilter(class_name)?;
         let key = native_method_hash_from(class_state, method_name, descriptor);
         let idx = self.slot_index_for_key(key, class_name, method_name, descriptor)?;
         self.slots.get(idx as usize)
+    }
+
+    /// Slot index for an exact triple, given the class prefix state the caller
+    /// already obtained from [`class_prefilter`](Self::class_prefilter).
+    ///
+    /// Exists so an entry point can prefilter ONCE and still reach both the
+    /// exact lookup and the quirk fallback. `find` and `find_with_kind` used to
+    /// call `slot_for_exact` (which prefilters) and then, on a miss, a second
+    /// prefilter to decide whether the quirk path was worth entering — hashing
+    /// the class name twice for every miss on a class that DOES register
+    /// natives, which is the common miss on a collection-heavy workload.
+    #[inline]
+    fn slot_index_from_state(
+        &self,
+        class_state: (u64, u64),
+        class_name: &str,
+        method_name: &str,
+        descriptor: &str,
+    ) -> Option<u32> {
+        let key = native_method_hash_from(class_state, method_name, descriptor);
+        self.slot_index_for_key(key, class_name, method_name, descriptor)
     }
 
     /// The one place a 128-bit digest is turned into a slot index — and the one
@@ -7428,8 +7487,15 @@ impl NativeMethodRegistry {
         method_name: &str,
         descriptor: &str,
     ) -> Option<NativeCallback> {
-        if let Some(slot) = self.slot_for_exact(class_name, method_name, descriptor) {
-            return Some(slot.callback);
+        // One prefilter for both the exact lookup and the quirk fallback: a
+        // class that registers nothing cannot be rescued by a descriptor
+        // rewrite either, since every variant is looked up under the SAME class
+        // name and that class has no key in `slot_by_key` under any descriptor.
+        let class_state = self.class_prefilter(class_name)?;
+        if let Some(idx) =
+            self.slot_index_from_state(class_state, class_name, method_name, descriptor)
+        {
+            return self.slots.get(idx as usize).map(|slot| slot.callback);
         }
 
         // AUDIT 2026-05-17 (Fix 4): the compatibility-variants path was
@@ -7474,13 +7540,27 @@ impl NativeMethodRegistry {
         // Cheap precheck: if the descriptor has none of the quirks the
         // rewrites target, there are no variants to try — bail before
         // touching the allocator.
-        let has_whitespace_or_nul = descriptor
-            .bytes()
-            .any(|b| b.is_ascii_whitespace() || b == b'\0');
-        let object_return_quirk = match descriptor.rfind(')') {
-            Some(rparen) => {
-                let ret = &descriptor[rparen + 1..];
-                ret.starts_with('L') && !ret.ends_with(';')
+        //
+        // One backward byte pass answers both questions. `descriptor.rfind(')')`
+        // went through `core::str::pattern::CharSearcher`, whose UTF-8 reverse
+        // search showed up as its own 0.73% line in a flat profile of
+        // `AdaptiveByteBufAllocatorTest` — for a byte that is ASCII by
+        // definition in a JVM descriptor (JVMS 4.3.3).
+        let bytes = descriptor.as_bytes();
+        let mut has_whitespace_or_nul = false;
+        let mut rparen = None;
+        for (i, &b) in bytes.iter().enumerate() {
+            if b.is_ascii_whitespace() || b == b'\0' {
+                has_whitespace_or_nul = true;
+            }
+            if b == b')' {
+                rparen = Some(i);
+            }
+        }
+        let object_return_quirk = match rparen {
+            Some(i) => {
+                let ret = &bytes[i + 1..];
+                ret.first() == Some(&b'L') && ret.last() != Some(&b';')
             }
             None => false,
         };
