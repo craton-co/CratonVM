@@ -10723,6 +10723,18 @@ fn jdk_superclass(name: &str) -> &'static str {
         "java/util/concurrent/ConcurrentHashMap$KeySetView" => "java/util/AbstractSet",
         "java/util/concurrent/ConcurrentSkipListSet" => "java/util/AbstractSet",
 
+        // The carrier classes a map's `values()`/`entrySet()` view is minted
+        // under (native-collections' `MAP_VIEW_CARRIERS`). In the real JDK
+        // every one of them extends `AbstractCollection`; with no class file
+        // the default `java/lang/Object` arm below would leave the view
+        // outside the Collection dispatch chain entirely.
+        "java/util/HashMap$Values"
+        | "java/util/LinkedHashMap$LinkedValues"
+        | "java/util/TreeMap$Values"
+        | "java/util/TreeMap$EntrySet"
+        | "java/util/Hashtable$ValueCollection"
+        | "java/util/concurrent/ConcurrentHashMap$ValuesView" => "java/util/AbstractCollection",
+
         // Concrete List/Queue hierarchy:
         "java/util/ArrayList" => "java/util/AbstractList",
         "java/util/LinkedList" => "java/util/AbstractSequentialList",
@@ -10831,6 +10843,22 @@ fn jdk_interfaces(name: &str) -> &'static [&'static str] {
             "java/util/Collection",
             "java/lang/Iterable",
             "java/io/Serializable",
+        ],
+        // A map view is a `Collection`, and deliberately NOT a `List` — that
+        // divergence (`hashMap.values() instanceof List` answering true) is
+        // half of what giving these views their own carrier class fixes. The
+        // `EntrySet` carrier is a `Set` for the same reason its JDK twin is.
+        "java/util/HashMap$Values"
+        | "java/util/LinkedHashMap$LinkedValues"
+        | "java/util/TreeMap$Values"
+        | "java/util/Hashtable$ValueCollection"
+        | "java/util/concurrent/ConcurrentHashMap$ValuesView" => {
+            &["java/util/Collection", "java/lang/Iterable"]
+        }
+        "java/util/TreeMap$EntrySet" => &[
+            "java/util/Set",
+            "java/util/Collection",
+            "java/lang/Iterable",
         ],
         "java/util/HashMap"
         | "java/util/LinkedHashMap"

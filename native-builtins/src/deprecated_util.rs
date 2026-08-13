@@ -1177,7 +1177,7 @@ fn make_hashtable_enumeration(
     // FIX: allocate 3 fields (was 2) so the type marker in field 2 has a
     // backing slot; fields 0/1 (array, cursor) keep the layout that
     // `register_enumeration_impl_natives` reads.
-    let en = try_alloc_concurrent_synthetic(ctx, "java/util/Enumeration$Impl", 3)?;
+    let en = try_alloc_concurrent_synthetic(ctx, "java/util/Enumeration$Impl", 4)?;
     ctx.set_field(en, 0, Value::Object(Some(arr)));
     ctx.set_field(en, 1, Value::Int(0));
     // FIX: stamp the keys/values discriminator into field 2.

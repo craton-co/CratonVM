@@ -1098,7 +1098,15 @@ fn native_xml_entity_scanner_scan_qname(
             }
         })?;
         let chars_pin = ctx.pin_native_root(chars);
-        let chars_table = xmlchar_chars_array(ctx);
+        // The `XMLChar.CHARS` table is a heap array like every other local
+        // here, and this scan loop calls back into Java (`load`,
+        // `invokeListeners`, `addSymbol`) — each of which can allocate and so
+        // move it. Every other object in this function is already held through
+        // a pin and re-read after such a call; the table was the one raw
+        // `ObjectRef` left, and a stale one reads garbage masks, which is
+        // indistinguishable from "this character is not a name character".
+        // `unpin_native_roots(scanner_pin)` at the end covers this pin too.
+        let chars_table_pin = xmlchar_chars_array(ctx).map(|t| (ctx.pin_native_root(t), t));
         scanner = ctx.read_native_pin(scanner_pin, scanner);
         entity = object_field_ref(ctx, scanner, "fCurrentEntity").ok_or_else(|| {
             RuntimeError::NullPointerException {
@@ -1107,6 +1115,7 @@ fn native_xml_entity_scanner_scan_qname(
         })?;
         chars = ctx.read_native_pin(chars_pin, chars);
         let first = xml_entity_scanner_char_at(ctx, chars, offset)?;
+        let chars_table = chars_table_pin.map(|(pin, t)| ctx.read_native_pin(pin, t));
         if !xerces_is_name_start_unit(ctx, chars_table, first) {
             return Ok(Some(Value::Int(0)));
         }
@@ -1199,6 +1208,7 @@ fn native_xml_entity_scanner_scan_qname(
                 break;
             }
             let c = xml_entity_scanner_char_at(ctx, chars, position)?;
+            let chars_table = chars_table_pin.map(|(pin, t)| ctx.read_native_pin(pin, t));
             if !xerces_is_name_unit(ctx, chars_table, c) {
                 break;
             }
@@ -1358,6 +1368,7 @@ fn native_xml_entity_scanner_scan_qname(
             let local_length = length.wrapping_sub(prefix_length).wrapping_sub(1);
             let local_start = index.wrapping_add(1);
             let local_first = xml_entity_scanner_char_at(ctx, chars, local_start)?;
+            let chars_table = chars_table_pin.map(|(pin, t)| ctx.read_native_pin(pin, t));
             if !xerces_is_ncname_start_unit(ctx, chars_table, local_first) {
                 // The JDK reports IllegalQName here and still finishes the scan.
                 // The cold error-reporting path is left to interpreted Xerces.
@@ -1774,7 +1785,9 @@ fn native_xml_entity_scanner_scan_content(
             return Ok(Some(Value::Int(-1)));
         }
 
-        let chars_table = xmlchar_chars_array(ctx);
+        // Same stale-local rule as `scanQName` above: this loop invokes Java
+        // (`load`, `invokeListeners`) while holding the table.
+        let chars_table_pin = xmlchar_chars_array(ctx).map(|t| (ctx.pin_native_root(t), t));
         this = ctx.read_native_pin(root_base, this);
         xml_string = ctx.read_native_pin(xml_string_pin, xml_string);
         entity = object_field_ref(ctx, this, "fCurrentEntity").ok_or_else(|| {
@@ -1793,6 +1806,7 @@ fn native_xml_entity_scanner_scan_content(
             let slot = position as usize;
             let unit = ctx.get_array_element(ch, slot).as_int().unwrap_or(0);
             position = position.wrapping_add(1);
+            let chars_table = chars_table_pin.map(|(pin, t)| ctx.read_native_pin(pin, t));
             let is_content = if let Some(table) = chars_table {
                 xmlchar_has_mask_in_table(ctx, table, unit, XMLCHAR_MASK_CONTENT)
             } else {

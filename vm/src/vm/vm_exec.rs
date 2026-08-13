@@ -22838,6 +22838,43 @@ fn invoke_on_class_shared_inner(
                                     | "hashCode"
                                     | "equals"
                             ))
+                        // As of 2026-08-13 a view is no longer minted as an
+                        // `ArrayList` but under its own carrier class
+                        // (native-collections' `MAP_VIEW_CARRIERS`), so the
+                        // arm above no longer covers it. These are REAL JDK
+                        // classes whose own bodies read `this$0` — null on a
+                        // CratonVM view, whose state lives in ArrayList's
+                        // `elementData`/`size` slots — so every method they
+                        // declare must reach the registered native.
+                        // `equals`/`hashCode` are omitted on purpose: the JDK
+                        // views inherit `AbstractCollection`'s identity
+                        // semantics and no native is registered for them here.
+                        // Companion entry in
+                        // native_override::force_native_over_real_jdk_bytecode.
+                        || (matches!(
+                                class_name,
+                                "java/util/HashMap$Values"
+                                    | "java/util/LinkedHashMap$LinkedValues"
+                                    | "java/util/TreeMap$Values"
+                                    | "java/util/TreeMap$EntrySet"
+                                    | "java/util/Hashtable$ValueCollection"
+                                    | "java/util/concurrent/ConcurrentHashMap$ValuesView"
+                            )
+                            && matches!(
+                                method_name,
+                                "size"
+                                    | "isEmpty"
+                                    | "contains"
+                                    | "iterator"
+                                    | "toArray"
+                                    | "toString"
+                                    | "remove"
+                                    | "clear"
+                                    | "forEach"
+                                    | "stream"
+                                    | "removeIf"
+                                    | "spliterator"
+                            ))
                         // Surefire ForkedBooter: ManagementFactory.getRuntimeMXBean() /
                         // getThreadMXBean() — the real-JDK code path delegates
                         // through `getPlatformMXBean(Class)` + PlatformComponent
