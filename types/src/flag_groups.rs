@@ -1129,6 +1129,17 @@ pub const INVENTORY: &[E] = &[
     // generated `flag-inventory.md` row said `opt-in | off` about a default-ON
     // knob. Same defect, same fix and the same reasoning as
     // `young-pause-goal-ms` two rows below.
+    // Phase 3/4 of the ZGC maturity plan. Both are default-OFF opt-ins and so
+    // carry NO `off_word` -- unlike their two neighbours below, which gate
+    // default-ON machinery. `parmark` is a WORKER COUNT parsed with
+    // `parse::<usize>()`, so unsetting it is the off state; `relocate` is
+    // presence-and-value (`1`/`on`/`true`/`yes`), and an `off_word` of "0"
+    // would be read as false by that parser anyway -- it stays `None` because
+    // that field is how a reader tells a default-ON knob from a default-OFF
+    // one, which is exactly the confusion that made both ZGC rows below wrong
+    // until 2026-08-13.
+    E { group: Group::GC, token: "zgc-parmark", on_key: Some("CRATONVM_ZGC_PARMARK"), off_key: None, off_word: None },
+    E { group: Group::GC, token: "zgc-relocate", on_key: Some("CRATONVM_ZGC_RELOCATE"), off_key: None, off_word: None },
     E { group: Group::GC, token: "zgc-startbits", on_key: Some("CRATONVM_ZGC_STARTBITS"), off_key: None, off_word: Some("0") },
     E { group: Group::GC, token: "zgc-tlab", on_key: Some("CRATONVM_ZGC_TLAB"), off_key: None, off_word: Some("0") },
     // Declared 2026-08-06 with the DBG/JIT block: a millisecond goal that
