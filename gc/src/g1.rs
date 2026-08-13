@@ -218,6 +218,27 @@ fn array_element_to_bytes(element_type: ArrayElementType, value: Value, raw: &mu
 /// `mixed_collection` dispatch on this flag to `*_parallel`. What is still true
 /// is the DEFAULT: off, and the serial path remains the supported one while
 /// G1-9 is open.
+/// Object budget for the post-evacuation CSet verification pass in a build
+/// where it is not already unbounded (audit §9 item 2).
+///
+/// `CRATONVM_G1_VERIFY_BUDGET=<n>`; `0` disables the pass. The default is
+/// deliberately small enough to be affordable on every pause rather than large
+/// enough to feel thorough: the pass is a SAMPLER whose start region rotates,
+/// so its value comes from running always and accumulating coverage, not from
+/// any single pause being complete. A 4096-object budget is on the order of a
+/// hundred microseconds of pointer chasing, against pauses measured in
+/// milliseconds.
+fn verify_budget() -> usize {
+    use std::sync::OnceLock;
+    static BUDGET: OnceLock<usize> = OnceLock::new();
+    *BUDGET.get_or_init(|| {
+        match cratonvm_types::flags::runtime_var("CRATONVM_G1_VERIFY_BUDGET") {
+            Ok(v) => v.trim().parse::<usize>().unwrap_or(4096),
+            Err(_) => 4096,
+        }
+    })
+}
+
 fn parallel_evac_enabled() -> bool {
     gc_flags().g1_parallel_evac
 }
@@ -1536,6 +1557,12 @@ pub struct G1Collector {
     /// after (empty on every normal cycle) — the G1 counterpart of
     /// [`crate::gen_heap::GenerationalHeap::set_jit_tlab_skip_regions`].
     jit_tlab_skip_regions: Mutex<Vec<(usize, usize)>>,
+    /// Rotating start region for the BUDGETED post-evacuation CSet
+    /// verification (audit §9 item 2). Only read/written by that pass, which
+    /// runs on the collecting thread under the regions lock, so `Relaxed` is
+    /// the whole ordering requirement: a torn or stale value costs coverage
+    /// fairness for one pause, never correctness.
+    cset_verify_cursor: AtomicUsize,
 
     /// Adaptive `needs_gc` Free-fraction threshold, in percent (baseline 25).
     /// Raised (up to 50) after any collection that recorded an evacuation
@@ -1875,6 +1902,7 @@ impl G1Collector {
             arena,
             regions: Mutex::new(regions),
             jit_tlab_skip_regions: Mutex::new(Vec::new()),
+            cset_verify_cursor: AtomicUsize::new(0),
             current_eden: AtomicUsize::new(usize::MAX), // no eden yet
             next_hash_code: AtomicI32::new(1),
             needs_gc_free_percent: AtomicUsize::new(25),
@@ -2603,6 +2631,7 @@ impl G1Collector {
         }
 
         self.recompute_old_gen_bytes(&regions);
+        self.publish_occupancy_metrics(&regions);
 
         monitors.remap_after_gc(&pointer_map);
         // INT-8: carry the referent-slot skip set across this pause
@@ -2989,6 +3018,7 @@ impl G1Collector {
         // Relaxed ordering: this is a statistics counter read only by IHOP heuristics;
         // exact inter-thread visibility ordering is not required.
         self.recompute_old_gen_bytes(&regions);
+        self.publish_occupancy_metrics(&regions);
 
         // Remap monitors
         monitors.remap_after_gc(&pointer_map);
@@ -3415,6 +3445,7 @@ impl G1Collector {
 
         // Relaxed ordering: statistics counter for IHOP heuristics only.
         self.recompute_old_gen_bytes(&regions);
+        self.publish_occupancy_metrics(&regions);
 
         monitors.remap_after_gc(&pointer_map);
         // INT-8: carry the referent-slot skip set across this pause
@@ -3914,6 +3945,7 @@ impl G1Collector {
         }
 
         self.recompute_old_gen_bytes(&regions);
+        self.publish_occupancy_metrics(&regions);
 
         monitors.remap_after_gc(&pointer_map);
         // INT-8: carry the referent-slot skip set across this pause
@@ -4090,6 +4122,7 @@ impl G1Collector {
         }
 
         self.recompute_old_gen_bytes(&regions);
+        self.publish_occupancy_metrics(&regions);
 
         monitors.remap_after_gc(&pointer_map);
         // INT-8: carry the referent-slot skip set across this pause
@@ -5328,10 +5361,55 @@ impl G1Collector {
         cset: &std::collections::HashSet<usize>,
         pointer_map: &cratonvm_types::PointerMap,
     ) {
-        let verify = cfg!(debug_assertions) || self.gc_log_enabled.load(Ordering::Relaxed);
-        if !verify {
+        // I-6 COVERAGE (audit §9 item 2). This is the only direct check that
+        // the remembered set was complete enough for the pause that just ran,
+        // and it is the check that caught G1-9. It used to run ONLY under
+        // `debug_assertions` or the verify flag — i.e. never in a shipping
+        // build — so the invariant it guards was a review claim everywhere it
+        // actually mattered.
+        //
+        // It now always runs, at one of two budgets:
+        //
+        //   * UNBOUNDED, when `debug_assertions` or the verify flag is on:
+        //     every object of every surviving region, exactly as before. Tests
+        //     and verify runs keep their whole-heap guarantee.
+        //   * BUDGETED otherwise: at most `verify_budget()` objects, starting
+        //     from a cursor that ROTATES across pauses, so consecutive pauses
+        //     sweep different regions and coverage accumulates over a run
+        //     instead of re-checking the same prefix forever.
+        //
+        // The budgeted pass is a sampler, and the metrics say so: a pause that
+        // stops on its budget is counted as `truncated`, and the objects it
+        // did walk are published, because "no dangling references found" is
+        // only meaningful against the number of objects that statement covers.
+        // Set `CRATONVM_G1_VERIFY_BUDGET=0` to opt out entirely.
+        let unbounded = cfg!(debug_assertions) || self.gc_log_enabled.load(Ordering::Relaxed);
+        let budget = if unbounded { usize::MAX } else { verify_budget() };
+        if budget == 0 {
             return;
         }
+        self.verify_no_dangling_into_cset_within(regions, cset, pointer_map, budget);
+    }
+
+    /// The walk itself, with the object budget as a PARAMETER rather than a
+    /// build-configuration decision.
+    ///
+    /// Split out so the budgeted arm is testable. The wrapper's budget is
+    /// `usize::MAX` under `debug_assertions`, which is every unit-test build,
+    /// so a test that goes through the wrapper can only ever exercise the
+    /// unbounded sweep — it would assert on the sampler's rotation without
+    /// running the sampler. Tests call this directly with a small budget.
+    fn verify_no_dangling_into_cset_within(
+        &self,
+        regions: &[G1Region],
+        cset: &std::collections::HashSet<usize>,
+        pointer_map: &cratonvm_types::PointerMap,
+        budget: usize,
+    ) {
+        let unbounded = budget == usize::MAX;
+        let mut objects_walked = 0usize;
+        let mut dangling_found = 0u64;
+        let mut truncated = false;
 
         // Closure: classify a referent address. Returns true if `addr`
         // is a dangling pointer into a (now-freed) CSet region.
@@ -5350,9 +5428,24 @@ impl G1Collector {
         };
 
         let jit_skips = self.jit_tlab_skip_spans();
-        for i in 0..regions.len() {
+        // Rotate the starting region so a budgeted run does not verify the same
+        // low-numbered regions every pause and call the heap checked. The
+        // cursor advances by whatever this pass consumed, so over enough pauses
+        // the sampler sweeps the whole heap.
+        let nregions = regions.len();
+        let start = if unbounded {
+            0
+        } else {
+            self.cset_verify_cursor.load(Ordering::Relaxed) % nregions.max(1)
+        };
+        for step in 0..nregions {
+            let i = (start + step) % nregions;
             if cset.contains(&i) || regions[i].region_type == RegionType::Free {
                 continue;
+            }
+            if objects_walked >= budget {
+                truncated = true;
+                break;
             }
 
             let cursor = regions[i].cursor;
@@ -5387,21 +5480,52 @@ impl G1Collector {
                             let slot_ptr = unsafe { data_start.add(k * 8) };
                             let raw: u64 = unsafe { std::ptr::read(slot_ptr as *const u64) };
                             if is_dangling(raw as usize) {
+                                dangling_found += 1;
                                 self.report_dangling_cset_ref(i, obj_ptr as usize, raw as usize);
                             }
                         }
                     }
                 } else {
+                    let mut found = 0u64;
                     for_each_flat_object_reference(obj_ptr, header, 0, |_, raw, _| {
                         if is_dangling(raw) {
+                            found += 1;
                             self.report_dangling_cset_ref(i, obj_ptr as usize, raw);
                         }
                     });
+                    dangling_found += found;
                 }
 
+                objects_walked += 1;
                 offset += obj_size;
+                // Budget is counted in OBJECTS, not regions: one humongous
+                // reference array can hold more slots than a thousand ordinary
+                // objects, so a region-granular budget would have wildly
+                // different costs per unit. Break mid-region rather than
+                // overrun — the cursor below resumes at the next region, so
+                // the unscanned tail is picked up by a later pause.
+                if objects_walked >= budget {
+                    truncated = true;
+                    break;
+                }
+            }
+            if truncated {
+                // Resume past this region next pause.
+                self.cset_verify_cursor
+                    .store(i.wrapping_add(1), Ordering::Relaxed);
+                break;
             }
         }
+        if !truncated {
+            // A complete sweep: restart the rotation so the next budgeted pass
+            // does not begin mid-heap for no reason.
+            self.cset_verify_cursor.store(0, Ordering::Relaxed);
+        }
+        crate::gc_metrics::record_g1_cset_verify(
+            objects_walked as u64,
+            dangling_found,
+            truncated,
+        );
     }
 
     /// SECURITY FIX (V7b): report a detected dangling-into-CSet slot.
@@ -7181,6 +7305,7 @@ impl G1Collector {
         // `g1_should_start_marking` immediately re-fire a pointless
         // back-to-back mark cycle against stale occupancy.
         self.recompute_old_gen_bytes(&regions);
+        self.publish_occupancy_metrics(&regions);
 
         // Audit fix (HIGH-3): clear any stragglers from the gray set and
         // deactivate the SATB write barrier — the cycle is fully done.
@@ -7718,6 +7843,42 @@ impl G1Collector {
     /// A `HumongousStart` region's `cursor` is the FULL object size (its
     /// continuations carry `cursor = 0`), so summing both types counts each
     /// humongous object exactly once.
+    /// Publish the occupancy denominators the normalized `gc_metrics` view
+    /// divides by (audit §9 item 5).
+    ///
+    /// Item 5 says the rset question is decided on `rset_bytes_per_live_byte`
+    /// and that "nothing has measured it yet". The reason is narrower than
+    /// "nobody ran the workload": `record_heap_occupancy` had exactly one
+    /// caller in the tree, `GenerationalHeap`, so under `-XX:+UseG1GC` the
+    /// DENOMINATOR was never published and every per-live-byte ratio was
+    /// structurally `0.000000` no matter what ran. The number could not be
+    /// measured, not merely had not been.
+    ///
+    /// `live` here is the post-pause occupancy of the surviving regions — the
+    /// sum of their bump cursors — which is an over-estimate of live bytes by
+    /// whatever garbage survived this pause uncollected. That is the honest
+    /// denominator available at a young pause: true liveness is only known
+    /// after a mark cycle, and a ratio that appears only after marking would
+    /// leave the young-only runs exactly as unmeasured as they are now. It is
+    /// an over-estimate, so `rset_bytes_per_live_byte` reads LOW, which is the
+    /// fail-safe direction for a number used to argue the set is small enough.
+    fn publish_occupancy_metrics(&self, regions: &[G1Region]) {
+        let live: usize = regions
+            .iter()
+            .filter(|r| r.region_type != RegionType::Free)
+            .map(|r| r.cursor)
+            .sum();
+        // G1 keeps no allocated-object/byte totals of its own, so those two
+        // stay at whatever they were rather than being clobbered with a zero
+        // that would read as "nothing was allocated".
+        let raw = crate::gc_metrics::gc_metrics_raw();
+        crate::gc_metrics::record_heap_occupancy(
+            raw.allocated_objects,
+            raw.allocated_bytes,
+            live as u64,
+        );
+    }
+
     fn recompute_old_gen_bytes(&self, regions: &[G1Region]) {
         let old_bytes: usize = regions
             .iter()
@@ -14804,6 +14965,86 @@ mod tests {
                 .unwrap();
         }
         arr
+    }
+
+    /// Audit §9 item 2: the post-evacuation CSet verification must run in a
+    /// build that ships, and must SAY how much of the heap it looked at.
+    ///
+    /// The unit-test build has `debug_assertions`, so the pass here is the
+    /// unbounded one — which is the point of this test: it pins that the
+    /// metering happens on the path tests actually take, so a future change
+    /// that stops publishing coverage fails here rather than silently making
+    /// the release sampler's numbers the only ones anybody sees.
+    #[test]
+    fn cset_verification_publishes_its_coverage() {
+        let before = crate::gc_metrics::gc_metrics_raw();
+        let gc = make_collector();
+
+        // A small live graph in a surviving region, so the verifier has
+        // something to walk after the pause.
+        let arr = gc.alloc_array(ClassId::new(0), ArrayElementType::Reference, 32);
+        for i in 0..32 {
+            let o = gc.alloc_object(ClassId::new(1), 1);
+            gc.set_field(o, 0, Value::Int(i as i32));
+            gc.set_array_element(arr, i, Value::Object(Some(o))).unwrap();
+        }
+        let mut roots = vec![arr];
+        gc.young_collection(&mut roots, &NoopMonitors);
+
+        let after = crate::gc_metrics::gc_metrics_raw();
+        assert!(
+            after.cset_verify_pauses > before.cset_verify_pauses,
+            "the pause must record a verification pass"
+        );
+        assert!(
+            after.cset_verify_objects > before.cset_verify_objects,
+            "the pass must publish the number of objects it walked — a zero \
+             `dangling` is not a claim about anything without it"
+        );
+        assert_eq!(
+            after.cset_verify_dangling, before.cset_verify_dangling,
+            "a correct collection leaves no dangling reference into a freed CSet region"
+        );
+    }
+
+    /// The budgeted (release-shaped) pass must stop AT its budget and leave a
+    /// cursor, so coverage accumulates across pauses instead of re-walking the
+    /// same prefix of the heap forever.
+    ///
+    /// Calls the inner walk directly with a small budget: the wrapper's budget
+    /// is `usize::MAX` under `debug_assertions`, so going through it would
+    /// assert on the sampler's behaviour while running the unbounded sweep.
+    /// An empty CSet is deliberate -- nothing was freed, so there is nothing to
+    /// report, and what is under test is the budget and the cursor.
+    #[test]
+    fn budgeted_cset_verification_stops_at_its_budget_and_leaves_a_cursor() {
+        let gc = make_collector();
+        for i in 0..64 {
+            let o = gc.alloc_object(ClassId::new(1), 2);
+            gc.set_field(o, 0, Value::Int(i));
+        }
+
+        let regions = gc.regions.lock();
+        let empty_cset: std::collections::HashSet<usize> = std::collections::HashSet::new();
+        let empty_map = cratonvm_types::PointerMap::default();
+
+        let before = crate::gc_metrics::gc_metrics_raw();
+        gc.cset_verify_cursor.store(0, Ordering::Relaxed);
+        gc.verify_no_dangling_into_cset_within(&regions, &empty_cset, &empty_map, 4);
+        let after = crate::gc_metrics::gc_metrics_raw();
+
+        let walked = after.cset_verify_objects - before.cset_verify_objects;
+        assert!(walked <= 4, "the budget is a ceiling on objects walked, got {walked}");
+        assert_eq!(
+            after.cset_verify_truncated - before.cset_verify_truncated,
+            1,
+            "a pass that stopped on its budget must be counted as truncated, or a              partial sweep reads like a whole-heap verification"
+        );
+
+        // A budget large enough to reach the end resets the rotation, so the
+        // next pass does not begin mid-heap for no reason.
+        gc.verify_no_dangling_into_cset_within(&regions, &empty_cset, &empty_map, usize::MAX);
+        assert_eq!(gc.cset_verify_cursor.load(Ordering::Relaxed), 0);
     }
 
     /// G1-9 regression: the parallel evacuator must scan a COMPACT object's

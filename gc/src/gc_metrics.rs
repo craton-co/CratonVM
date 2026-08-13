@@ -94,6 +94,25 @@ struct Counters {
     /// Old→young reference slots discovered by the dirty-card scan, summed
     /// over every scan. Ungated.
     old_to_young_edges: AtomicU64,
+    /// G1 post-evacuation CSet verification (audit I-6 / §9 item 2). Objects
+    /// the verifier actually walked, summed over every pause; the pauses it
+    /// ran in; and the number of dangling-into-freed-CSet references it found.
+    ///
+    /// These exist so "the remembered set is complete" stops being a review
+    /// claim. The verifier used to run only under `debug_assertions` or the
+    /// verify flag, i.e. never in a shipping build, which meant the one direct
+    /// check of I-6 produced no evidence at all in the configuration anyone
+    /// actually runs. `objects` against `live_bytes` is what says how much of
+    /// that claim a given run has actually tested.
+    cset_verify_objects: AtomicU64,
+    cset_verify_pauses: AtomicU64,
+    cset_verify_dangling: AtomicU64,
+    /// Pauses in which the verifier hit its budget and stopped early, so the
+    /// pass covered only part of the heap. Coverage accumulates across pauses
+    /// via a rotating start cursor, but a run whose budget is always exhausted
+    /// has never verified the whole heap in one pause, and the difference
+    /// matters when reading a zero `cset_verify_dangling`.
+    cset_verify_truncated: AtomicU64,
     /// Nanoseconds spent in card refinement (flush + drain + dirty-card scan).
     /// Ungated.
     refinement_nanos: AtomicU64,
@@ -117,6 +136,10 @@ impl Counters {
             duplicate_card_marks: AtomicU64::new(0),
             remembered_set_bytes: AtomicU64::new(0),
             old_to_young_edges: AtomicU64::new(0),
+            cset_verify_objects: AtomicU64::new(0),
+            cset_verify_pauses: AtomicU64::new(0),
+            cset_verify_dangling: AtomicU64::new(0),
+            cset_verify_truncated: AtomicU64::new(0),
             refinement_nanos: AtomicU64::new(0),
             refinement_passes: AtomicU64::new(0),
             allocated_objects: AtomicU64::new(0),
@@ -283,6 +306,26 @@ pub fn record_remembered_set_bytes(bytes: u64) {
     });
 }
 
+/// Record one G1 post-evacuation CSet verification pass.
+///
+/// `objects` is how many objects the pass actually walked, `dangling` how many
+/// references into a freed CSet region with no forwarding entry it found, and
+/// `truncated` whether it stopped on its budget rather than on the end of the
+/// heap. See the counter docs for why a *coverage* number is the point: a zero
+/// `dangling` from a pass that walked 300 objects of a 2 M-object heap is not
+/// the same statement as a zero from a full sweep, and before this the two were
+/// indistinguishable because neither was published.
+pub fn record_g1_cset_verify(objects: u64, dangling: u64, truncated: bool) {
+    with_counters(|c| {
+        c.cset_verify_objects.fetch_add(objects, Ordering::Relaxed);
+        c.cset_verify_pauses.fetch_add(1, Ordering::Relaxed);
+        c.cset_verify_dangling.fetch_add(dangling, Ordering::Relaxed);
+        if truncated {
+            c.cset_verify_truncated.fetch_add(1, Ordering::Relaxed);
+        }
+    });
+}
+
 /// Record one refinement pass of `nanos` nanoseconds (card buffer flush +
 /// pending drain + dirty-card scan).
 pub fn record_refinement(nanos: u64) {
@@ -338,6 +381,10 @@ pub struct GcMetricsRaw {
     pub duplicate_card_marks: u64,
     pub remembered_set_bytes: u64,
     pub old_to_young_edges: u64,
+    pub cset_verify_objects: u64,
+    pub cset_verify_pauses: u64,
+    pub cset_verify_dangling: u64,
+    pub cset_verify_truncated: u64,
     pub refinement_nanos: u64,
     pub refinement_passes: u64,
     pub allocated_objects: u64,
@@ -492,6 +539,10 @@ pub fn gc_metrics_raw() -> GcMetricsRaw {
         duplicate_card_marks: c.duplicate_card_marks.load(Ordering::Relaxed),
         remembered_set_bytes: c.remembered_set_bytes.load(Ordering::Relaxed),
         old_to_young_edges: c.old_to_young_edges.load(Ordering::Relaxed),
+        cset_verify_objects: c.cset_verify_objects.load(Ordering::Relaxed),
+        cset_verify_pauses: c.cset_verify_pauses.load(Ordering::Relaxed),
+        cset_verify_dangling: c.cset_verify_dangling.load(Ordering::Relaxed),
+        cset_verify_truncated: c.cset_verify_truncated.load(Ordering::Relaxed),
         refinement_nanos: c.refinement_nanos.load(Ordering::Relaxed),
         refinement_passes: c.refinement_passes.load(Ordering::Relaxed),
         allocated_objects: c.allocated_objects.load(Ordering::Relaxed),
@@ -903,6 +954,23 @@ pub fn collector_decision_report() -> String {
             100.0 * g1_incomplete as f64 / g1_pauses as f64,
         ));
     }
+    // I-6 coverage. Printed whenever the verifier ran at all, including the
+    // budgeted release pass, because the interesting reading is `objects`: a
+    // zero `dangling` means nothing without the number of objects it is a
+    // statement about. `budget_truncated` says how often the budget, rather
+    // than the end of the heap, is what ended the pass.
+    let verify = gc_metrics_raw();
+    if verify.cset_verify_pauses > 0 {
+        s.push('\n');
+        s.push_str(&format!(
+            "[GC] g1 cset-verify: pauses={} objects={} dangling={} budget_truncated={} (objects/pause={:.1})",
+            verify.cset_verify_pauses,
+            verify.cset_verify_objects,
+            verify.cset_verify_dangling,
+            verify.cset_verify_truncated,
+            verify.cset_verify_objects as f64 / verify.cset_verify_pauses as f64,
+        ));
+    }
     s
 }
 
@@ -1213,6 +1281,13 @@ mod tests {
             duplicate_card_marks: 150,
             remembered_set_bytes: 2_048,
             old_to_young_edges: 200,
+            // The CSet-verify counters are pure observability: they take no
+            // part in any normalization below, so this literal pins them at
+            // zero to say so rather than to exercise them.
+            cset_verify_objects: 0,
+            cset_verify_pauses: 0,
+            cset_verify_dangling: 0,
+            cset_verify_truncated: 0,
             refinement_nanos: 4_000_000,
             refinement_passes: 4,
             allocated_objects: 1_000,
