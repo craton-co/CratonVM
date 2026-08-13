@@ -19509,82 +19509,28 @@ pub fn register_essential_natives_with_shims(
         });
     }
 
-    // S111r15 — Character.toLowerCase / toUpperCase native overrides for
-    // real-JDK mode. The JDK bytecode delegates `(C)C` to `(I)I`, which
-    // walks `CharacterData.of(I)CharacterData` and an invokevirtual on the
-    // returned subclass. After ~2000 invocations the JIT compiles `build()`
-    // (or any caller of `Character.toLowerCase`) and the resulting machine
-    // code returns 0 for most inputs — corrupting Spring's
-    // `BeanPropertyName.toDashedForm`: `bannerMode` becomes
-    // `r\0\0\0\0\0\0\0-\0\0\0\0\0\0`, tripping
-    // `InvalidConfigurationPropertyNameException` in SportMe boot.
-    // Routing the (C)C / (I)I forms through Rust's `char::to_lowercase` /
-    // `char::to_uppercase` defeats the JIT path entirely. Symmetric
-    // registration of all four forms keeps the native-shadow guard on
-    // every JIT entry point (callee_compiler / try_jit_compile_callee /
-    // try_jit_upgrade_with_gate / first-call / OSR) honored uniformly.
-    registry.register(
-        "java/lang/Character",
-        "toLowerCase",
-        "(C)C",
-        |_ctx, args| {
-            let ch = match args.first() {
-                Some(Value::Int(v)) => *v as u32,
-                _ => 0,
-            };
-            let result = char::from_u32(ch)
-                .and_then(|c| c.to_lowercase().next())
-                .unwrap_or('\0') as u32;
-            Ok(Some(Value::Int(result as i32)))
-        },
-    );
-    registry.register(
-        "java/lang/Character",
-        "toUpperCase",
-        "(C)C",
-        |_ctx, args| {
-            let ch = match args.first() {
-                Some(Value::Int(v)) => *v as u32,
-                _ => 0,
-            };
-            let result = char::from_u32(ch)
-                .and_then(|c| c.to_uppercase().next())
-                .unwrap_or('\0') as u32;
-            Ok(Some(Value::Int(result as i32)))
-        },
-    );
-    registry.register(
-        "java/lang/Character",
-        "toLowerCase",
-        "(I)I",
-        |_ctx, args| {
-            let cp = match args.first() {
-                Some(Value::Int(v)) => *v,
-                _ => 0,
-            };
-            let result = char::from_u32(cp as u32)
-                .and_then(|c| c.to_lowercase().next())
-                .map(|c| c as u32 as i32)
-                .unwrap_or(cp);
-            Ok(Some(Value::Int(result)))
-        },
-    );
-    registry.register(
-        "java/lang/Character",
-        "toUpperCase",
-        "(I)I",
-        |_ctx, args| {
-            let cp = match args.first() {
-                Some(Value::Int(v)) => *v,
-                _ => 0,
-            };
-            let result = char::from_u32(cp as u32)
-                .and_then(|c| c.to_uppercase().next())
-                .map(|c| c as u32 as i32)
-                .unwrap_or(cp);
-            Ok(Some(Value::Int(result)))
-        },
-    );
+    // The four `Character.toLowerCase`/`toUpperCase` overrides that lived here
+    // were DELETED on 2026-08-12. They were verbatim `Bridge` copies of the
+    // `Intrinsic` bodies in `lang_math.rs`, and being registered later they WON
+    // under last-write-wins. Measured with `--dump-native-registry`: the
+    // `lang_math.rs` rows read `owns=false, invocations=0` while these read
+    // `owns=true, invocations=32, overwrote:intrinsic`. Every fix applied to
+    // the intrinsic bodies was therefore inert until this block went.
+    //
+    // Their stated reason -- a JIT miscompile of `CharacterData.of(I)` that
+    // returned 0 and corrupted Spring's `BeanPropertyName.toDashedForm` -- has
+    // since been fixed at its root in `jit/src/x64/driver.rs`
+    // (`has_dispatch` / `set_jit_thread`). Re-measured 2026-08-12: 6,000,000
+    // cold-vs-hot invocations each of the UNSHADOWED `getType`, `toTitleCase`,
+    // `isSpaceChar`, `isAlphabetic` and `getDirectionality` -- 0 mismatches,
+    // byte-identical to HotSpot. The workaround outlived its defect.
+    //
+    // They were also wrong on their own terms. `char::to_lowercase()` yields
+    // the Unicode FULL mapping (SpecialCasing) where Java specifies the SIMPLE
+    // one (UnicodeData field 12), and `char::from_u32(surrogate)` is `None`, so
+    // `.unwrap_or(cp)` answered NUL for a lone surrogate -- a legal `char`.
+    // A BMP sweep over all 65,536 code points measured 2,051 wrong
+    // `toLowerCase` answers and 2,153 wrong `toUpperCase`.
 
     // ParameterFormatter-fix: real-JDK mode bypass for ZoneId.systemDefault.
     //
