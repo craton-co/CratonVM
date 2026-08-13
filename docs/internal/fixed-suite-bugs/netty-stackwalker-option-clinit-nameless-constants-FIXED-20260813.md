@@ -1,5 +1,25 @@
 # `StackWalker$Option.<clinit>` fabricated nameless constants — every Mockito-backed test failed
 
+**Status:** ✅ RESOLVED. Retired to `docs/internal/` on 2026-08-13 after
+re-running the classes this page was opened for, on a build from `origin/dev`:
+
+```
+Http2ConnectionHandlerTest           found=44 ok=44 failed=0     (was ok=0 failed=44)
+DefaultHttp2LocalFlowControllerTest  found=19 ok=19 failed=0     (was ok=0 failed=19)
+```
+
+Both hardening follow-ups this page asked for are in the shipped code and were
+re-read before the move: `native_option_clinit` roots every constant in a
+`NativeHandleScope` for the whole clinit, and the unit test asserts each
+constant's `name`/`ordinal` and `$VALUES` ordering for both the JDK 22+
+four-constant class and the pre-22 three-constant one. The fix itself
+(`67c5e048c`) is unchanged; nothing below is new.
+
+The page is kept verbatim from here down, because its *Blast radius* section is
+still the live instruction for the remaining `investigate-batch-*` pages.
+
+---
+
 **Status:** FIXED (2026-08-12). The defect was found and fixed twice the same
 day by two sessions working different pages of
 [investigate-INDEX.md](investigate-INDEX.md), from opposite ends of the netty

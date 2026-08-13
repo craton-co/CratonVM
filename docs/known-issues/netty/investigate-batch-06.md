@@ -20,7 +20,7 @@ triage on the Azure Linux host (`20.80.105.49`), binary built from `origin/dev`
 **The `http2` cluster is green.** All seven `io.netty.handler.codec.http2`
 classes on this page were recorded FAIL and now pass — 74/74, 51/51, 50/50,
 42/42, 23/23, 7/7, 2/2 — which is the batch-07
-[`StackWalker$Option` fix](stackwalker-option-clinit-nameless-constants-20260812.md)
+[`StackWalker$Option` fix](../../internal/fixed-suite-bugs/netty-stackwalker-option-clinit-nameless-constants-FIXED-20260813.md)
 landing, exactly as that page predicted (the broken `Enum.valueOf` sat on the
 interception path of every Mockito mock). Same for all three `websocketx`
 classes.

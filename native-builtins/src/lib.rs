@@ -4742,8 +4742,23 @@ mod context_class_loader_tests {
         assert_eq!(got, Some(Value::Object(None)));
     }
 
+    /// The zero-quiet-period shutdown must NOT be registered against Netty's
+    /// event executor groups.
+    ///
+    /// It was, on the premise that naming `MultiThreadIoEventLoopGroup`
+    /// restricted it to MongoDB Reactive Streams' driver group — but that is
+    /// the ordinary group every Netty 4.2 application constructs, so the
+    /// registration turned every `group.shutdownGracefully()` in the process
+    /// into `shutdownGracefully(0, 0, MILLISECONDS)`. A zero quiet period does
+    /// not drain the event loop, and Netty runs channel deregistration (and
+    /// therefore `handlerRemoved`) as a queued task: `PcapWriteHandler`'s
+    /// capture came out 522 bytes of 732, with every TCP close packet missing.
+    ///
+    /// The Mongo lifecycle still gets its zero quiet period — its `destroy()`
+    /// bridge calls `native_netty_event_executor_group_shutdown_gracefully`
+    /// directly, which is the scoping that actually holds.
     #[test]
-    fn essential_registers_netty_event_executor_shutdown_bridge() {
+    fn essential_does_not_register_a_zero_quiet_period_netty_group_shutdown() {
         let mut registry = NativeMethodRegistry::new();
         register_essential_natives(&mut registry);
         for class_name in [
@@ -4751,14 +4766,25 @@ mod context_class_loader_tests {
             "io/netty/util/concurrent/AbstractEventExecutorGroup",
             "io/netty/channel/MultiThreadIoEventLoopGroup",
         ] {
-            assert!(registry
-                .find(
-                    class_name,
-                    "shutdownGracefully",
-                    "()Lio/netty/util/concurrent/Future;"
-                )
-                .is_some());
+            assert!(
+                registry
+                    .find(
+                        class_name,
+                        "shutdownGracefully",
+                        "()Lio/netty/util/concurrent/Future;"
+                    )
+                    .is_none(),
+                "{class_name}.shutdownGracefully() must keep Netty's own quiet period"
+            );
         }
+        // The Mongo lifecycle bridge that DOES need it is still installed.
+        assert!(registry
+            .find(
+                "org/springframework/boot/mongodb/autoconfigure/MongoReactiveAutoConfiguration$NettyDriverMongoClientSettingsBuilderCustomizer",
+                "destroy",
+                "()V"
+            )
+            .is_some());
     }
 
     #[test]
@@ -20979,33 +21005,30 @@ pub fn register_essential_natives_with_shims(
         Ok(Some(Value::Int(system_ephemeral_port_range().1)))
     }, NativeKind::Bridge);
 
-    // MongoDB Reactive Streams 5.7 uses Netty 4.2's
-    // MultiThreadIoEventLoopGroup for its driver lifecycle. After a Mongo
-    // client has closed, a monitor callback can keep re-enqueuing work in
-    // CratonVM's event-loop implementation, so Netty's ordinary two-second
-    // quiet period never becomes quiet and Spring's context destroy callback
-    // waits indefinitely. Restrict the bridge to that concrete Netty 4.2
-    // group: it invokes Netty's own three-argument shutdown bytecode with a
-    // zero quiet period. Other EventExecutorGroup implementations retain
-    // their original no-argument bytecode unchanged.
-    registry.register(
-        "io/netty/util/concurrent/EventExecutorGroup",
-        "shutdownGracefully",
-        "()Lio/netty/util/concurrent/Future;",
-        native_netty_event_executor_group_shutdown_gracefully,
-    );
-    registry.register(
-        "io/netty/util/concurrent/AbstractEventExecutorGroup",
-        "shutdownGracefully",
-        "()Lio/netty/util/concurrent/Future;",
-        native_netty_event_executor_group_shutdown_gracefully,
-    );
-    registry.register(
-        "io/netty/channel/MultiThreadIoEventLoopGroup",
-        "shutdownGracefully",
-        "()Lio/netty/util/concurrent/Future;",
-        native_netty_event_executor_group_shutdown_gracefully,
-    );
+    // NOT registered here: `EventExecutorGroup.shutdownGracefully()`.
+    //
+    // The zero-quiet-period shutdown that MongoDB Reactive Streams' lifecycle
+    // needs lives in `native_netty_event_executor_group_shutdown_gracefully`,
+    // and `native_springboot_mongo_reactive_customizer_destroy` — itself a
+    // full native replacement of the one Spring bean method that hung — calls
+    // it DIRECTLY. Registering it against `EventExecutorGroup`,
+    // `AbstractEventExecutorGroup` and `MultiThreadIoEventLoopGroup` as well
+    // was meant to be "restricted to that concrete Netty 4.2 group", but
+    // `MultiThreadIoEventLoopGroup` is the ordinary group every Netty 4.2
+    // application constructs, so the restriction admitted everything: EVERY
+    // `group.shutdownGracefully()` in the process became
+    // `shutdownGracefully(0, 0, MILLISECONDS)`.
+    //
+    // A zero quiet period does not drain. Netty runs a closed channel's
+    // deregistration — and therefore `ChannelHandler.handlerRemoved` — as a
+    // task on the event loop, so with the quiet period gone the loop
+    // terminated with that task still queued. `PcapWriteHandler` writes its
+    // fake TCP FIN/FIN-ACK/ACK sequence from `handlerRemoved`, so the capture
+    // came out byte-exact through the last data packet and then simply
+    // stopped: 522 bytes instead of 732 (docs/known-issues/netty/
+    // pcap-write-handler-three-residuals-20260812.md, residual 2). Anything
+    // that relies on graceful shutdown actually being graceful had the same
+    // hole. Ordinary groups keep their own bytecode, and their own defaults.
     registry.register(
         "org/springframework/boot/mongodb/autoconfigure/MongoReactiveAutoConfiguration$NettyDriverMongoClientSettingsBuilderCustomizer",
         "customize",

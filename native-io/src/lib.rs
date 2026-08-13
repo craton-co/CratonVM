@@ -21374,17 +21374,44 @@ fn native_dc_bind(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
         _ => "0.0.0.0:0".to_string(),
     };
 
-    // Close old socket and open a new one bound to the address
-    if let Some(old_fd) = dc_fd(ctx, this) {
-        let _ = ctx.fd_table().close(old_fd);
-    }
+    // `SO_REUSEADDR` is a PRE-bind option, so whatever was applied to the
+    // socket being replaced does not carry over — reapply what Java asked for.
+    // `dc_option_get` is the record `native_dc_set_option` keeps for exactly
+    // the cases where the socket cannot answer for itself.
+    let reuse = dc_option_get(ctx, this, "SO_REUSEADDR").unwrap_or(0) != 0;
 
-    let fd_id =
+    // Bind the socket this channel ALREADY has, keeping its fd id.
+    //
+    // This used to `close(old_fd)` and `open_udp(addr)`, which handed the
+    // channel a NEW fd id. The id is the channel's identity everywhere else in
+    // the VM — most importantly it is the key the NIO selector registers under
+    // — and netty registers before it binds (`AbstractChannel.register0` runs
+    // `javaChannel().register(selector, 0)`; `doBind` comes after). So the
+    // registration was left keyed on a dead id, holding a dup of the discarded
+    // socket, and `NioDatagramChannel` never received a single datagram: the
+    // bind succeeded, the send worked, and inbound traffic simply never
+    // reached the event loop. `PcapWriteHandlerTest`'s `udpV4*` cases and
+    // `io.netty.resolver.dns`'s transport are the visible half of that.
+    if let Some(existing) = dc_fd(ctx, this) {
         ctx.fd_table()
-            .open_udp(Some(&addr_str))
+            .udp_rebind(existing, Some(&addr_str), reuse)
             .map_err(|e| RuntimeError::IOException {
                 message: format!("DatagramChannel.bind: {e}"),
             })?;
+        if let Ok(fresh) = ctx.fd_table().udp_try_clone(existing) {
+            crate::nio_selector::selector_refresh_udp(existing as i32, &fresh);
+        }
+        return Ok(Some(Value::Object(Some(this))));
+    }
+
+    let fd_id = if reuse {
+        ctx.fd_table().open_udp_reuse(Some(&addr_str))
+    } else {
+        ctx.fd_table().open_udp(Some(&addr_str))
+    }
+    .map_err(|e| RuntimeError::IOException {
+        message: format!("DatagramChannel.bind: {e}"),
+    })?;
 
     set_dc_fd(ctx, this, fd_id);
     Ok(Some(Value::Object(Some(this))))

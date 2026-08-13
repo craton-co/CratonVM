@@ -300,3 +300,61 @@ one `ByteBuffer.get()` at a time) have the same cause and pass in a solo run.
 
 This doc supersedes the one-sample "~12x" estimate in
 `../../internal/fixed-bugs/netty-jni-native-codec-sigsegv-FIXED-20260812.md`.
+
+## Second workload, same cost: `PcapWriteHandlerTest.writePcapGreaterThan4Gb`
+
+Added 2026-08-13, from the
+[`PcapWriteHandlerTest` residual-3 separation](../../internal/fixed-suite-bugs/netty-pcap-write-handler-udp-bind-and-tcp-close-FIXED-20260813.md#4-residual-3--correct-slow-and-re-filed-where-it-belongs).
+The other two residuals on that page were real VM defects and are fixed; this
+one is **not a defect at all**, and it belongs here rather than on a pcap page.
+
+The test moves 8 GiB (2 × 4 GiB, ~262 k iterations of a 65,495-byte payload)
+through an `EmbeddedChannel` to exercise the pcap length-field rollover. Run
+with **no JUnit timeout** — the class instantiated directly, so nothing clips it
+— it **passes** on CratonVM:
+
+| | wall | ratio |
+|---|---|---|
+| HotSpot JDK 25 (C2) | 1.15 s | 1× |
+| HotSpot JDK 25 `-Xint` | 41.0 s | 36× |
+| CratonVM (quiet box) | 104 s | 90× vs C2, **2.5× vs `-Xint`** |
+
+**Quote the `-Xint` ratio, not the C2 one.** 90× is a statement about having no
+optimising compiler; 2.5× is the statement about this VM.
+
+`CRATONVM_DBG=jit-scan-prof`: `jit_entries = 75,913,815`, i.e. ~290 entries per
+iteration and **1371 ns/entry** — far above the 302–517 ns band the
+`io.netty.buffer` classes above sit in. That is not a different defect: those
+classes' entries are per-call on tiny bodies, while each entry here covers a
+65 KB traversal. **`ns ÷ entries` is only comparable between workloads of
+similar call granularity**, which is worth stating because this page's table
+invites exactly that comparison.
+
+`perf record -F 199 -g` over a full run agrees there is nothing workload-shaped
+to fix — the profile is flat and dispatch-dominated, with no pcap or ByteBuf
+symbol anywhere near the top:
+
+| self | symbol |
+|---|---|
+| 5.35 % | `interpreter::execute_frame_from_index` |
+| 3.20 % | `NativeMethodRegistry::slot_for_exact` |
+| 2.79 % | `__memcmp_evex_movbe` |
+| 2.64 % | `interpreter::jit_bridge::try_jit_compile_callee` |
+| 2.58 % | `dispatch_virtual::execute_invokevirtual_cached` |
+| 2.24 % | `ZObjectStarts::contains` |
+| 2.18 % | `jit::helpers::jit_invoke_virtual_mic` |
+| 1.25 % | `NativeMethodRegistry::slot_index_for_key` |
+
+One thing on that list is a lead rather than a law: **native-registry lookup is
+~7.2 % of the whole run** (`slot_for_exact` + `slot_index_for_key` + the
+`memcmp` they drive). That is a per-native-call string-keyed lookup on a
+workload that makes hundreds of millions of them — the same *shape* as the
+`ArrayList` slot-layout re-derivation that batch 03 found and fixed, and it has
+not been measured on its own. Nobody has tried memoising it.
+
+**Suite consequence:** the method needs ~104 s standing still against the
+harness's 120 s per-method timeout. On a quiet box it just clears it and
+`PcapWriteHandlerTest` is 25/25; under load it does not, and the class is
+24 ok / 1 failed with this as the 1. That margin — 16 s of a 120 s budget —
+is the whole of it, so a ~15 % throughput win on this path would take the
+test out of the flaky column entirely.
