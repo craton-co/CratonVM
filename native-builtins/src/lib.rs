@@ -6614,11 +6614,48 @@ fn populate_real_thread_holder(
     let group = match group {
         Value::Object(Some(_)) => group,
         _ => {
-            let cur = ctx.current_thread_object();
-            let g = ctx.get_field_by_name(cur, "holder");
-            match g {
-                Value::Object(Some(h)) => ctx.get_field_by_name(h, "group"),
-                _ => Value::Object(None),
+            // A thread created with no group of its own takes the installed
+            // SecurityManager's `getThreadGroup()` first, and only then the
+            // creating thread's group. That is the JDK's rule up to 23; JDK 24
+            // dropped it along with the SecurityManager itself (JEP 486).
+            //
+            // CratonVM deliberately did NOT adopt JEP 486 — `System
+            // .setSecurityManager` still installs, because the exec and Panama
+            // gates consult the installed manager for real (see
+            // `security_manager::register_system_security`). Keeping the
+            // manager alive but ignoring the one hook it has over thread
+            // construction left it half-alive: netty's
+            // `DefaultThreadFactoryTest
+            // .testDefaultThreadFactoryInheritsThreadGroupFromSecurityManager`
+            // installs a manager whose `getThreadGroup()` returns a sticky
+            // group and got the creating thread's group instead.
+            //
+            // This branch cannot introduce a divergence from HotSpot 25: it is
+            // reachable only once a SecurityManager is installed, which on
+            // HotSpot 25 cannot happen at all. The default
+            // `SecurityManager.getThreadGroup()` body is
+            // `Thread.currentThread().getThreadGroup()`, i.e. exactly the
+            // fallback below, so an unremarkable manager changes nothing.
+            let from_manager = match crate::security_manager::get_security_manager(&*ctx) {
+                Some(sm) => {
+                    match ctx.invoke_virtual(sm, "getThreadGroup", "()Ljava/lang/ThreadGroup;", &[])
+                    {
+                        Ok(Some(Value::Object(Some(g)))) => Some(g),
+                        _ => None,
+                    }
+                }
+                None => None,
+            };
+            match from_manager {
+                Some(g) => Value::Object(Some(g)),
+                None => {
+                    let cur = ctx.current_thread_object();
+                    let g = ctx.get_field_by_name(cur, "holder");
+                    match g {
+                        Value::Object(Some(h)) => ctx.get_field_by_name(h, "group"),
+                        _ => Value::Object(None),
+                    }
+                }
             }
         }
     };
