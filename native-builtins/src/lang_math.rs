@@ -2895,24 +2895,23 @@ pub(crate) fn native_math_get_exponent_double(
         Some(Value::Double(v)) => *v,
         _ => 0.0,
     };
+    // The JDK is ONE expression with no special cases (Math.java):
+    //
+    //     ((int)((doubleToRawLongBits(d) & EXP_BIT_MASK) >> 52)) - 1023
+    //
+    // so a SUBNORMAL reports the same -1023 as zero: `getExponent` returns the
+    // unbiased exponent FIELD, not the value's mathematical exponent. The
+    // hand-written branches here computed the latter for subnormals --
+    // MEASURED 2026-08-13 (scratchpad/orch/Exp.java):
+    // `getExponent(Double.MIN_VALUE)` was -1074 where HotSpot answers -1023.
+    // The float form has no native at all and runs the real JDK bytecode,
+    // which is why it was already right; this one had a hand-rolled twin.
+    // Every other case the branches enumerated (zero, NaN, Infinity,
+    // MIN_NORMAL, 1.0) falls out of the same subtraction, verified against the
+    // oracle -- so they were not merely redundant, they were the only reason
+    // the wrong branch looked plausible.
     let bits = v.to_bits();
-    let biased = ((bits >> 52) & 0x7FF) as i32;
-    let result = if biased == 0x7FF {
-        // NaN or Infinity → MAX_EXPONENT + 1
-        1024
-    } else if biased == 0 {
-        if (bits & 0x000F_FFFF_FFFF_FFFF) == 0 {
-            // zero → MIN_EXPONENT - 1
-            -1023
-        } else {
-            // subnormal: count leading zeros of significand
-            let sig = bits & 0x000F_FFFF_FFFF_FFFF;
-            let lz = sig.leading_zeros() as i32 - 12; // 12 bits for sign+exponent
-            -1023 - lz
-        }
-    } else {
-        biased - 1023
-    };
+    let result = (((bits >> 52) & 0x7FF) as i32) - 1023;
     Ok(Some(Value::Int(result)))
 }
 

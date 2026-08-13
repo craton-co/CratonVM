@@ -53197,16 +53197,32 @@ fn native_collections_swap(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(None),
     };
+    // MEASURED 2026-08-13 (scratchpad/orch/Exp.java): out-of-range is
+    // IndexOutOfBoundsException with the JDK's ArrayList text. Two defects
+    // here: there was NO bounds check at all, and `*v as usize` turned a
+    // NEGATIVE index into a huge one, so `swap(l, -1, 0)` was silently
+    // accepted rather than refused. Bound against the list SIZE, not the
+    // backing array capacity -- an ArrayList over-allocates, so the array
+    // length would admit indices past the end.
     let i = match args.get(1) {
-        Some(Value::Int(v)) => *v as usize,
+        Some(Value::Int(v)) => *v,
         _ => return Ok(None),
     };
     let j = match args.get(2) {
-        Some(Value::Int(v)) => *v as usize,
+        Some(Value::Int(v)) => *v,
         _ => return Ok(None),
     };
-    let (data, _) = al_state(ctx, list);
+    let (data, size) = al_state(ctx, list);
+    for idx in [i, j] {
+        if idx < 0 || idx >= size {
+            return Err(RuntimeError::IndexOutOfBoundsException {
+                message: Some(format!("Index {idx} out of bounds for length {size}")),
+            }
+            .into());
+        }
+    }
     if let Some(d) = data {
+        let (i, j) = (i as usize, j as usize);
         let a = ctx.get_array_element(d, i);
         let b = ctx.get_array_element(d, j);
         ctx.set_array_element(d, i, b);
