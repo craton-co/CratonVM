@@ -4073,26 +4073,90 @@ fn run() -> Result<()> {
             }
         }
 
-        // WP1.3: initPhase2 / initPhase3 are pure-Java methods on
-        // `java.lang.System` that finalise modules + classpath and
-        // install `ClassLoader.scl`.  We don't run them end-to-end in
-        // cratonvm (the real-JDK module graph resolution pulls in
-        // subsystems we don't implement), but many callers key on
-        // `initLevel() >= 3` to decide whether
-        // `ClassLoader.getSystemClassLoader()` may read the `scl`
-        // field directly.  We leave the level at 2 here — bumping
-        // past it would send those callers down a null-deref path.
-        // The CLI bumps to 4 below, just before `main()`, once the
-        // initPhase2 gate no longer matters.
+        // Initialise the module system. This is HotSpot's `System.initPhase2`
+        // slot in the boot sequence, and it is the only place it belongs.
         //
-        // INTENTIONAL (reviewed): skipping initPhase2/3 here is a deliberate
-        // boot-sequencing choice, NOT a silent wrong-result stub. The
-        // level-management contract is preserved end-to-end (level held at 2
-        // until the gate is moot, then advanced to 3→4 below and the real
-        // `jdk.internal.misc.VM.initLevel(4)` field is set), so observers see a
-        // consistent boot state rather than a fabricated value. Running the
-        // real initPhase2/3 is gated on module-system subsystems we do not yet
-        // implement; if/when those land this skip should be revisited.
+        // WP1.3: initPhase2 / initPhase3 are pure-Java methods on
+        // `java.lang.System`. `initPhase2(boolean, boolean)` is
+        // `ModuleBootstrap.boot()` plus `VM.initLevel(2)`; `initPhase3`
+        // installs `ClassLoader.scl` and sets the TCCL. We do not invoke
+        // either, and the reason for initPhase2 is now a MEASUREMENT rather
+        // than a policy — see docs/known-issues/jdk-only/W7-97-initphase2-skipped.md.
+        //
+        // Measured 2026-08-12, one process per arm, by invoking
+        // `System.initPhase2` reflectively inside the VM under test: it
+        // reaches `ModuleBootstrap.boot()` → `SystemModuleFinders.ofSystem()`
+        // → `ofModuleInfos()` → `ImageReader.getModuleNames()` and dies inside
+        // `ImageReader$SharedImageReader.imageFileAttributes()` with
+        // `UncheckedIOException` / `NoSuchFileException: ` — an EMPTY path —
+        // returning JNI_ERR (-1) and changing NOTHING: the provider counts
+        // below stay at 0. So running it is not a fix we merely have not
+        // written; it is a route that is currently closed.
+        //
+        // WHY it is closed, precisely, because that is the durable part:
+        // `ImageReaderFactory` is boot-loader-defined, so it builds the
+        // runtime-image path with
+        // `sun.nio.fs.DefaultFileSystemProvider.theFileSystem().getPath(...)`
+        // rather than `FileSystems.getDefault()`. In CratonVM those are two
+        // DIFFERENT `WindowsFileSystem` instances (HotSpot: one, identity-equal),
+        // and `Path`s minted by the boot-loader one are inert — `Files.exists`
+        // answers false, `readAttributes` throws `NoSuchFileException`, and
+        // `equals` against the same path from the default filesystem is false,
+        // for a `Path` whose own `toString()` is correct. Repairing that is the
+        // prerequisite for ever running the real `initPhase2`, and it is not in
+        // this file.
+        //
+        // What DOES initialise the module system here is `ModuleLayer.boot()`.
+        // Its native (`register_jboss_jdkspecific`, last-writer-wins over the
+        // `phases_late` stub, both `NativeKind::Bridge` so strict mode keeps
+        // them) runs `build_boot_layer` → `populate_boot_layer_modules` →
+        // `ServicesCatalog.getServicesCatalog(scl).register(module)` for every
+        // registered module. That IS this VM's `ModuleBootstrap.boot()`. Like
+        // the JDK's it runs exactly once, and it runs HERE — before the level
+        // advances below — because `VM.initLevel(4)` wakes every
+        // `awaitInitLevel` waiter, and a thread woken at SYSTEM_BOOTED is
+        // entitled to assume the module system came up at level 2. Its one
+        // externally ordered dependency is `ClassLoader.getSystemClassLoader()`,
+        // which is a native with no init-level gate, so it does not need the
+        // bump that follows.
+        //
+        // Until this runs, `ServiceLoader` returns ZERO module-declared
+        // providers while classpath `META-INF/services` providers keep working
+        // — which is exactly why a `ServiceLoader` probe reads green and this
+        // stayed hidden. Measured under `--jdk-only`:
+        // `java.nio.file.spi.FileSystemProvider` 2 → 0,
+        // `java.util.spi.ToolProvider` 9 → 0, `javax.tools.JavaCompiler` 1 → 0,
+        // and `ToolProvider.getSystemJavaCompiler()` null, which sent H2's
+        // `SourceCompiler` down a `com.sun.tools.javac` path HotSpot never
+        // takes. In `--real-jdk` the `SyntheticStub` `ServiceLoader` natives
+        // covered the gap; `--jdk-only` refuses that kind at registration, so
+        // the same omission stopped being invisible and became a wrong answer.
+        //
+        // The failure is NOT swallowed. HotSpot treats a non-zero `initPhase2`
+        // as fatal to VM creation. We warn rather than abort because this
+        // substitute is narrower than the JDK's phase — an application that
+        // never looks up a service is unharmed — but the operator is told,
+        // because from here on every module-declared provider is silently
+        // absent.
+        match vm.invoke("java/lang/ModuleLayer", "boot", "()Ljava/lang/ModuleLayer;", &[]) {
+            Ok(Some(Value::Object(Some(_)))) => {
+                tracing::info!("module system initialised (ModuleLayer.boot)");
+            }
+            Ok(_) => {
+                tracing::warn!(
+                    "module-system init produced no boot layer — every module-declared \
+                     ServiceLoader provider will be missing (HotSpot aborts VM creation \
+                     when System.initPhase2 returns non-zero)"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "module-system init failed ({e:?}) — every module-declared \
+                     ServiceLoader provider will be missing (HotSpot aborts VM creation \
+                     when System.initPhase2 returns non-zero)"
+                );
+            }
+        }
     }
 
     // WP1.3: right before `main()` starts, advance to level 4 —
@@ -4128,37 +4192,11 @@ fn run() -> Result<()> {
         );
     }
 
-    // Materialise the boot module layer.
-    //
-    // Measured 2026-08-12: without this, the FIRST `ServiceLoader.load()` in a
-    // process returns **zero** module-declared providers under `--jdk-only`.
-    // Every `provides` clause in the JDK image is lost —
-    // `java.nio.file.spi.FileSystemProvider` 2 -> 0,
-    // `java.util.spi.ToolProvider` 9 -> 0, `javax.tools.JavaCompiler` 1 -> 0 —
-    // while classpath `META-INF/services` providers keep working, which is why
-    // a `ServiceLoader` probe reads green and this stays hidden. Controlled:
-    // three consecutive `load` calls with no `ModuleLayer` touch return 0 every
-    // time, so it is the boot call and not warm-up.
-    //
-    // Consequence found in the corpus, not in a probe: H2's `SourceCompiler`
-    // branches on `ToolProvider.getSystemJavaCompiler()`, which is null ONLY
-    // under `--jdk-only`, so it silently takes a `com.sun.tools.javac` path
-    // HotSpot never runs.
-    //
-    // Root cause is upstream of here — `System.initPhase2` is deliberately
-    // skipped. In `--real-jdk` a `SyntheticStub` ServiceLoader native covers
-    // for that; `--jdk-only` correctly refuses the stub, and the skip becomes a
-    // silent WRONG ANSWER rather than a refusal. This is a behavioural patch
-    // over that gap, not the principled fix: the principled fix is to run
-    // `initPhase2`, and it is recorded as such.
-    if vm.shared.config.java_home.is_some() {
-        let _ = vm.invoke(
-            "java/lang/ModuleLayer",
-            "boot",
-            "()Ljava/lang/ModuleLayer;",
-            &[],
-        );
-    }
+    // The boot module layer is materialised in the `System.initPhase2` slot
+    // above, before the level advances — NOT here. It used to be invoked at
+    // this point as a behavioural patch; that placement left a window in which
+    // `VM.initLevel(4)` had already woken every `awaitInitLevel` waiter while
+    // the services catalog was still empty. There is exactly one such call.
 
     // Pre-allocate the singleton java.lang.OutOfMemoryError while the heap is
     // still fresh, so a later 100%-full-heap OOM (in either user code or a

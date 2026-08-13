@@ -3054,27 +3054,247 @@ pub(crate) fn native_wrapper_int_value(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Java's integer grammar
+//
+// `str::parse` is NOT `Integer.parseInt`. The two differ in BOTH directions,
+// and every difference is a silently wrong answer rather than an error:
+//
+//   * Rust's parser rejects the non-ASCII decimal digits `Character.digit`
+//     accepts. Measured on JDK 25:
+//     `Integer.parseInt("\u{661}\u{662}") == 12` (ARABIC-INDIC ONE TWO).
+//   * A `.trim()` in front of the parse invents an acceptance Java does not
+//     have. `Integer.parseInt("  1")`, `("1 ")`, `("1\n")` all throw
+//     `NumberFormatException` on a real JDK; we answered 1. The `.trim()` is
+//     `Double.parseDouble`'s contract — whose grammar really does skip
+//     `[\x00-\x20]*` on both ends — borrowed onto the integer one, where it
+//     does not belong.
+//
+// Both directions matter for input validation: code that calls `parseInt` in
+// a `try` to reject junk was getting junk accepted.
+// ---------------------------------------------------------------------------
+
+/// The non-ASCII runs of `Character.digit`, generated from JDK 25 itself by
+/// walking every code point and recording each maximal run over which
+/// `Character.digit(cp, 36)` increases by one. Entries are
+/// `(first, last, value_at_first)`.
+///
+/// BMP only, deliberately. `Integer.parseInt` walks the string with `charAt`
+/// and calls the `char` overload of `Character.digit`, so a SUPPLEMENTARY
+/// decimal digit arrives as a surrogate pair and matches nothing. Measured on
+/// JDK 25: `Integer.parseInt(new String(Character.toChars(0x104A0)))` throws
+/// even though `Character.digit(0x104A0, 10) == 0`. Adding the supplementary
+/// runs here would make us MORE permissive than Java, not less.
+const JAVA_DIGIT_RUNS: &[(u32, u32, u32)] = &[
+    (0x0660, 0x0669, 0),
+    (0x06F0, 0x06F9, 0),
+    (0x07C0, 0x07C9, 0),
+    (0x0966, 0x096F, 0),
+    (0x09E6, 0x09EF, 0),
+    (0x0A66, 0x0A6F, 0),
+    (0x0AE6, 0x0AEF, 0),
+    (0x0B66, 0x0B6F, 0),
+    (0x0BE6, 0x0BEF, 0),
+    (0x0C66, 0x0C6F, 0),
+    (0x0CE6, 0x0CEF, 0),
+    (0x0D66, 0x0D6F, 0),
+    (0x0DE6, 0x0DEF, 0),
+    (0x0E50, 0x0E59, 0),
+    (0x0ED0, 0x0ED9, 0),
+    (0x0F20, 0x0F29, 0),
+    (0x1040, 0x1049, 0),
+    (0x1090, 0x1099, 0),
+    (0x17E0, 0x17E9, 0),
+    (0x1810, 0x1819, 0),
+    (0x1946, 0x194F, 0),
+    (0x19D0, 0x19D9, 0),
+    (0x1A80, 0x1A89, 0),
+    (0x1A90, 0x1A99, 0),
+    (0x1B50, 0x1B59, 0),
+    (0x1BB0, 0x1BB9, 0),
+    (0x1C40, 0x1C49, 0),
+    (0x1C50, 0x1C59, 0),
+    (0xA620, 0xA629, 0),
+    (0xA8D0, 0xA8D9, 0),
+    (0xA900, 0xA909, 0),
+    (0xA9D0, 0xA9D9, 0),
+    (0xA9F0, 0xA9F9, 0),
+    (0xAA50, 0xAA59, 0),
+    (0xABF0, 0xABF9, 0),
+    (0xFF10, 0xFF19, 0),
+    (0xFF21, 0xFF3A, 10),
+    (0xFF41, 0xFF5A, 10),
+];
+
+/// `Character.digit(char, radix)` — the `char` overload, which is the one the
+/// `parse*` family calls.
+///
+/// This is NOT `char::to_digit`: that handles only ASCII `0-9A-Za-z` and, for
+/// a radix above 36, PANICS. This returns `None` instead of panicking and
+/// covers the Unicode decimal runs above.
+fn java_char_digit(c: char, radix: u32) -> Option<u32> {
+    let cp = c as u32;
+    // Fast path: the ASCII runs, which is all any hot call site ever sees.
+    let v = if cp.wrapping_sub('0' as u32) < 10 {
+        cp - '0' as u32
+    } else if cp.wrapping_sub('a' as u32) < 26 {
+        cp - 'a' as u32 + 10
+    } else if cp.wrapping_sub('A' as u32) < 26 {
+        cp - 'A' as u32 + 10
+    } else if cp < JAVA_DIGIT_RUNS[0].0 {
+        return None;
+    } else {
+        let mut found = None;
+        for &(first, last, base) in JAVA_DIGIT_RUNS {
+            if cp >= first && cp <= last {
+                found = Some(base + (cp - first));
+                break;
+            }
+        }
+        found?
+    };
+    if v < radix {
+        Some(v)
+    } else {
+        None
+    }
+}
+
+/// Outcome of a Java integer parse, split because the JDK raises two DIFFERENT
+/// `NumberFormatException` detail messages and only `Byte`/`Short` use the
+/// second one.
+pub(crate) enum JavaIntParse {
+    Ok(i64),
+    /// Not a well-formed `Signopt Digit+` in this radix.
+    Malformed,
+    /// Well-formed, but outside `[min, max]`.
+    OutOfRange,
+}
+
+/// The `Integer.parseInt` / `Long.parseLong` grammar:
+///
+/// ```text
+/// Signopt Digit+
+/// ```
+///
+/// where `Digit` is anything `Character.digit(c, radix)` accepts. No
+/// whitespace is permitted anywhere — not leading, not trailing, not either.
+///
+/// Accumulation is in `i128` against a signed magnitude limit, so
+/// `MIN_VALUE` (whose magnitude is one larger than `MAX_VALUE`'s) parses
+/// exactly and nothing can overflow: once the accumulator passes the limit we
+/// stop accumulating but KEEP SCANNING, because a later non-digit still makes
+/// the whole string malformed rather than out-of-range.
+pub(crate) fn java_parse_signed(text: &str, radix: u32, min: i64, max: i64) -> JavaIntParse {
+    let mut chars = text.chars();
+    let Some(first) = chars.next() else {
+        return JavaIntParse::Malformed; // ""
+    };
+    let (neg, mut pending) = match first {
+        '+' => (false, None),
+        '-' => (true, None),
+        c => (false, Some(c)),
+    };
+    let limit: i128 = if neg { -(min as i128) } else { max as i128 };
+    let mut acc: i128 = 0;
+    let mut digits = 0usize;
+    let mut over = false;
+    loop {
+        let c = match pending.take() {
+            Some(c) => c,
+            None => match chars.next() {
+                Some(c) => c,
+                None => break,
+            },
+        };
+        let Some(d) = java_char_digit(c, radix) else {
+            return JavaIntParse::Malformed;
+        };
+        digits += 1;
+        if !over {
+            acc = acc * radix as i128 + d as i128;
+            if acc > limit {
+                over = true;
+            }
+        }
+    }
+    if digits == 0 {
+        return JavaIntParse::Malformed; // "+", "-"
+    }
+    if over {
+        return JavaIntParse::OutOfRange;
+    }
+    let signed: i128 = if neg { -acc } else { acc };
+    JavaIntParse::Ok(signed as i64)
+}
+
+/// The JDK's `NumberFormatException.forInputString` detail message. The
+/// ` under radix N` tail is present for every radix except 10.
+fn java_nfe_for_input(text: &str, radix: u32) -> cratonvm_types::error::MethodCallFailed {
+    let message = if radix == 10 {
+        format!("For input string: \"{text}\"")
+    } else {
+        format!("For input string: \"{text}\" under radix {radix}")
+    };
+    cratonvm_types::error::RuntimeError::NumberFormatException { message }.into()
+}
+
+/// The JDK's `Byte.parseByte` / `Short.parseShort` out-of-range message, which
+/// is NOT the `forInputString` one.
+fn java_nfe_out_of_range(text: &str, radix: u32) -> cratonvm_types::error::MethodCallFailed {
+    cratonvm_types::error::RuntimeError::NumberFormatException {
+        message: format!("Value out of range. Value:\"{text}\" Radix:{radix}"),
+    }
+    .into()
+}
+
+/// Read argument 0 as a non-null `String`, raising the JDK's
+/// `NumberFormatException("Cannot parse null string")` for a null receiver —
+/// which is what the integer family throws. (The FLOATING-point family throws
+/// `NullPointerException` instead; see `read_string_arg_npe`.)
+fn read_string_arg_nfe(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> Result<String, cratonvm_types::error::MethodCallFailed> {
+    match args.first() {
+        Some(Value::Object(Some(obj))) => Ok(ctx.read_string(*obj).unwrap_or_default()),
+        _ => Err(cratonvm_types::error::RuntimeError::NumberFormatException {
+            message: "Cannot parse null string".to_string(),
+        }
+        .into()),
+    }
+}
+
+/// Shared body for the whole signed `parse*(String[, int])` family.
+///
+/// `range_message` selects which of the JDK's two detail messages an
+/// out-of-range value gets: `Integer`/`Long` report `forInputString`,
+/// `Byte`/`Short` report `Value out of range`.
+fn java_parse_into(
+    text: &str,
+    radix: u32,
+    min: i64,
+    max: i64,
+    range_message: bool,
+) -> Result<i64, cratonvm_types::error::MethodCallFailed> {
+    match java_parse_signed(text, radix, min, max) {
+        JavaIntParse::Ok(v) => Ok(v),
+        JavaIntParse::Malformed => Err(java_nfe_for_input(text, radix)),
+        JavaIntParse::OutOfRange => Err(if range_message {
+            java_nfe_out_of_range(text, radix)
+        } else {
+            java_nfe_for_input(text, radix)
+        }),
+    }
+}
+
 pub(crate) fn native_integer_parse_int(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
-    let s_obj = match args.first() {
-        Some(Value::Object(Some(obj))) => *obj,
-        _ => {
-            return Err(cratonvm_types::error::RuntimeError::NumberFormatException {
-                message: "null".to_string(),
-            }
-            .into())
-        }
-    };
-    let text = ctx.read_string(s_obj).unwrap_or_default();
-    match text.trim().parse::<i32>() {
-        Ok(v) => Ok(Some(Value::Int(v))),
-        Err(_) => Err(cratonvm_types::error::RuntimeError::NumberFormatException {
-            message: format!("For input string: \"{text}\""),
-        }
-        .into()),
-    }
+    let text = read_string_arg_nfe(ctx, args)?;
+    let v = java_parse_into(&text, 10, i32::MIN as i64, i32::MAX as i64, false)?;
+    Ok(Some(Value::Int(v as i32)))
 }
 
 /// Validate a `parse*(String, int)` radix the way the JDK's `Integer.parseInt`
@@ -3121,73 +3341,48 @@ pub(crate) fn native_integer_parse_int_radix(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
-    let s_obj = match args.first() {
-        Some(Value::Object(Some(obj))) => *obj,
-        _ => {
-            return Err(cratonvm_types::error::RuntimeError::NumberFormatException {
-                message: "null".to_string(),
-            }
-            .into())
-        }
-    };
+    let text = read_string_arg_nfe(ctx, args)?;
     let radix = parse_radix_arg(args)?;
-    let text = ctx.read_string(s_obj).unwrap_or_default();
-    match i32::from_str_radix(text.trim(), radix) {
-        Ok(v) => Ok(Some(Value::Int(v))),
-        Err(_) => Err(cratonvm_types::error::RuntimeError::NumberFormatException {
-            message: format!("For input string: \"{text}\""),
-        }
-        .into()),
-    }
+    let v = java_parse_into(&text, radix, i32::MIN as i64, i32::MAX as i64, false)?;
+    Ok(Some(Value::Int(v as i32)))
 }
 
 // --- Byte.parseByte ---
+
+/// `Byte.parseByte` / `Short.parseShort` are two-step in the JDK: they call
+/// `Integer.parseInt` and THEN range-check. That ordering is observable in the
+/// detail message — a value outside `int` reports `forInputString`, while one
+/// that fits an `int` but not the narrower type reports `Value out of range`.
+fn java_parse_narrow(
+    text: &str,
+    radix: u32,
+    min: i64,
+    max: i64,
+) -> Result<i64, cratonvm_types::error::MethodCallFailed> {
+    let v = java_parse_into(text, radix, i32::MIN as i64, i32::MAX as i64, false)?;
+    if v < min || v > max {
+        return Err(java_nfe_out_of_range(text, radix));
+    }
+    Ok(v)
+}
 
 pub(crate) fn native_byte_parse_byte(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
-    let s_obj = match args.first() {
-        Some(Value::Object(Some(obj))) => *obj,
-        _ => {
-            return Err(cratonvm_types::error::RuntimeError::NumberFormatException {
-                message: "null".to_string(),
-            }
-            .into())
-        }
-    };
-    let text = ctx.read_string(s_obj).unwrap_or_default();
-    match text.trim().parse::<i8>() {
-        Ok(v) => Ok(Some(Value::Int(v as i32))),
-        Err(_) => Err(cratonvm_types::error::RuntimeError::NumberFormatException {
-            message: format!("For input string: \"{text}\""),
-        }
-        .into()),
-    }
+    let text = read_string_arg_nfe(ctx, args)?;
+    let v = java_parse_narrow(&text, 10, i8::MIN as i64, i8::MAX as i64)?;
+    Ok(Some(Value::Int(v as i32)))
 }
 
 pub(crate) fn native_byte_parse_byte_radix(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
-    let s_obj = match args.first() {
-        Some(Value::Object(Some(obj))) => *obj,
-        _ => {
-            return Err(cratonvm_types::error::RuntimeError::NumberFormatException {
-                message: "null".to_string(),
-            }
-            .into())
-        }
-    };
+    let text = read_string_arg_nfe(ctx, args)?;
     let radix = parse_radix_arg(args)?;
-    let text = ctx.read_string(s_obj).unwrap_or_default();
-    match i8::from_str_radix(text.trim(), radix) {
-        Ok(v) => Ok(Some(Value::Int(v as i32))),
-        Err(_) => Err(cratonvm_types::error::RuntimeError::NumberFormatException {
-            message: format!("For input string: \"{text}\""),
-        }
-        .into()),
-    }
+    let v = java_parse_narrow(&text, radix, i8::MIN as i64, i8::MAX as i64)?;
+    Ok(Some(Value::Int(v as i32)))
 }
 
 // --- Short.parseShort ---
