@@ -88,6 +88,10 @@ pub use class_manager::synthetic_stub_instance_field_count;
 // the follow-up `audits/jdk-only-object-layout-audit.md` §"A gate worth adding"
 // asks for — would want the same table.
 pub use class_manager::synthetic_stub_field_model;
+// The per-class constructor descriptors the synthetic stub declares. Exported
+// because `native-builtins` must register natives for exactly this list —
+// the stub's method table and the registry cannot be allowed to disagree.
+pub use class_manager::{throwable_ctor_descriptors, THROWABLE_DEFAULT_CTORS};
 pub use class_manager::{
     any_class_redefined,
     class_definition_epoch,
@@ -169,8 +173,8 @@ pub use loaders::{BUILTIN_LOADER_DELEGATION_CHAIN, MAX_BUILTIN_LOADER_DEPTH};
 // them instead of falling through to the loader-blind global path.
 pub use loaders::{
     dbg_loader_chain, has_user_loader_parents, loader_parent_chain_enabled,
-    register_user_loader_parent, user_loader_ancestors, user_loader_parent_known,
-    MAX_USER_LOADER_DEPTH,
+    register_user_loader_parent, user_loader_ancestors, user_loader_builtin_parent,
+    user_loader_parent_known, MAX_USER_LOADER_DEPTH,
 };
 pub use module::{
     descriptor_from_module_attribute, package_of, ModuleDescriptor, ModuleRegistry, JAVA_BASE,

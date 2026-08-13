@@ -8694,6 +8694,7 @@ impl GenerationalHeap {
             // each header before any write lands on it.
             let mut age_bumps: Vec<usize> = Vec::new();
             {
+                YOUNG_WALK_ENTRIES[0].fetch_add(1, Ordering::Relaxed);
                 // PERF: reuse the once-computed sorted free-block snapshot.
                 let mut free_iter = sweep_free_blocks.iter().peekable();
                 let used = sweep_used;
@@ -8716,6 +8717,8 @@ impl GenerationalHeap {
                 ) {
                     age_bumps.truncate(age_wm);
                     if fwd_installs.len() > fwd_wm {
+                        EVAC_UNWIND_CANDIDATES
+                            .fetch_add((fwd_installs.len() - fwd_wm) as u64, Ordering::Relaxed);
                         let n = SWEEP_PROMOTION_ABORT_HITS.fetch_add(1, Ordering::Relaxed);
                         if n < 8 {
                             tracing::warn!(
@@ -8738,6 +8741,7 @@ impl GenerationalHeap {
                             // mis-sized: candidates since the last anchor are
                             // suspect. The cursor now sits at the block end —
                             // a fresh anchor.
+                            EVAC_UNWIND_REASONS[0].fetch_add(1, Ordering::Relaxed);
                             unwind_evac(
                                 &mut fwd_installs,
                                 &mut evacuated,
@@ -8787,7 +8791,28 @@ impl GenerationalHeap {
                             .unwrap_or(used)
                             .min(used);
                         let run_end = zero_run_end(from_base, cursor, limit);
-                        if run_end - cursor >= HEADER_SIZE {
+                        let vouched_live = side_sorted.binary_search(&(from_base + cursor)).is_ok();
+                        if run_end - cursor >= HEADER_SIZE && !vouched_live {
+                            // A run of EMPTY objects is not a desync. Stepping
+                            // over it is doubly safe here: an empty object has
+                            // no fields, so there is nothing in the run to
+                            // promote and nothing to age. Unwinding instead
+                            // discards every promotion candidate collected
+                            // since the last anchor — 69 194 of them in one
+                            // measured run at `--Xmx 320m` — and under a
+                            // permanent non-moving sweep promotion is the young
+                            // generation's ONLY exit for live data.
+                            if let Some(resume) = zero_run_empty_object_resume(
+                                from_base,
+                                cursor,
+                                run_end,
+                                used,
+                                &side_sorted,
+                            ) {
+                                SWEEP_ZERO_SPAN_EMPTY_RUNS.fetch_add(1, Ordering::Relaxed);
+                                cursor = resume;
+                                continue;
+                            }
                             anomaly = true;
                         }
                     }
@@ -8797,6 +8822,8 @@ impl GenerationalHeap {
                         gen_object_total_size(header)
                     };
                     if anomaly || total_size < HEADER_SIZE || cursor + total_size > used {
+                        EVAC_UNWIND_REASONS[if anomaly { 1 } else { 2 }]
+                            .fetch_add(1, Ordering::Relaxed);
                         unwind_evac(
                             &mut fwd_installs,
                             &mut evacuated,
@@ -8817,6 +8844,7 @@ impl GenerationalHeap {
                     // last anchor are suspect.
                     if let Some(&&(foff, _fsz)) = free_iter.peek() {
                         if foff > cursor && foff < cursor + total_size {
+                            EVAC_UNWIND_REASONS[3].fetch_add(1, Ordering::Relaxed);
                             unwind_evac(
                                 &mut fwd_installs,
                                 &mut evacuated,
@@ -9066,6 +9094,7 @@ impl GenerationalHeap {
                 // robust traversal; on an (unexpected) anomaly, re-anchor at
                 // the next free block and keep fixing up rather than break.
                 {
+                    YOUNG_WALK_ENTRIES[1].fetch_add(1, Ordering::Relaxed);
                     // PERF: reuse the once-computed sorted free-block snapshot.
                     let mut free_iter = sweep_free_blocks.iter().peekable();
                     let used = sweep_used;
@@ -9126,7 +9155,26 @@ impl GenerationalHeap {
                                 .unwrap_or(used)
                                 .min(used);
                             let run_end = zero_run_end(from_base, cursor, limit);
-                            if run_end - cursor >= HEADER_SIZE {
+                            let vouched_live =
+                                side_sorted.binary_search(&(from_base + cursor)).is_ok();
+                            if run_end - cursor >= HEADER_SIZE && !vouched_live {
+                                // Same as the evacuation pre-pass above, and
+                                // with the same second reason: an empty object
+                                // has no reference slots, so a run of them
+                                // holds nothing for this pass to rewrite. The
+                                // anomaly arm instead hands the whole stretch
+                                // to `rewrite_stretch`'s conservative rewrite.
+                                if let Some(resume) = zero_run_empty_object_resume(
+                                    from_base,
+                                    cursor,
+                                    run_end,
+                                    used,
+                                    &side_sorted,
+                                ) {
+                                    SWEEP_ZERO_SPAN_EMPTY_RUNS.fetch_add(1, Ordering::Relaxed);
+                                    cursor = resume;
+                                    continue;
+                                }
                                 anomaly = true;
                             }
                         }
@@ -12479,6 +12527,7 @@ impl GenerationalHeap {
         young_skips: &[(usize, usize)],
         worklist: &mut Vec<*mut u8>,
     ) {
+        YOUNG_WALK_ENTRIES[2].fetch_add(1, Ordering::Relaxed);
         // Skip the zeroed holes the non-moving sweep leaves in from-space.
         // Without this, this linear walk strides into a reclaimed hole, decodes
         // its zeroed bytes as a `num_slots=0` (40-byte) object, and desyncs off
@@ -12736,6 +12785,7 @@ impl GenerationalHeap {
         compact_map: &cratonvm_types::PointerMap,
         young_skips: &[(usize, usize)],
     ) {
+        YOUNG_WALK_ENTRIES[3].fetch_add(1, Ordering::Relaxed);
         // Skip non-moving-sweep holes — same rationale as `mark_young_to_old_refs`:
         // a linear from-space walk must not stride into a reclaimed zeroed hole
         // (it would desync off the object grid and misread a live object's
@@ -14126,6 +14176,7 @@ impl GenerationalHeap {
     /// Returns a Vec of (raw pointer, total byte size) for each object.
     /// Must be called during a GC safepoint (all mutator threads paused).
     pub fn walk_young_objects(&self) -> Vec<(*mut u8, usize)> {
+        YOUNG_WALK_ENTRIES[4].fetch_add(1, Ordering::Relaxed);
         let mut result = Vec::new();
 
         // Walk young generation (from-space only — to-space is GC scratch).
@@ -16571,6 +16622,39 @@ pub enum ZeroRunVerdict {
 /// Refusals by [`ZeroRunVerdict`], index = discriminant order minus the
 /// accepting variant: `0` Misaligned, `1` LiveInside, `2` ImplausibleNext.
 /// Printed beside the chunk-bail split; see `PAR_CHUNK_BAILS`.
+/// Entries to each young from-space walk that still treats an all-zero run as
+/// a desync (the five `zero_run_end` callers left over after the 2026-08-13
+/// work). A zero anomaly count means one of two opposite things — the walk ran
+/// and the shape was absent, or the walk never ran — and only this separates
+/// them. One relaxed increment per WALK, not per object.
+///
+/// Index: `0` selective-promotion evacuation pre-pass, `1` the (3a) survivor
+/// fixup pass, `2` `mark_young_to_old_refs`, `3` `fixup_young_old_refs`,
+/// `4` `walk_young_objects`.
+/// Why the selective-promotion evacuation pre-pass unwound its candidates.
+/// Index: `0` free-block overshoot, `1` unlisted zero span, `2` implausible
+/// header size, `3` extent crosses a free hole. The aggregate
+/// [`SWEEP_PROMOTION_ABORT_HITS`] cannot say, and the four mean different
+/// things — only `1` is the benign-shape family, the rest are grid evidence.
+pub static EVAC_UNWIND_REASONS: [AtomicU64; 4] = [
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+];
+
+/// Candidates dropped by those unwinds, summed. The count per event is what
+/// makes this expensive (37 354 in one, measured), not the number of events.
+pub static EVAC_UNWIND_CANDIDATES: AtomicU64 = AtomicU64::new(0);
+
+pub static YOUNG_WALK_ENTRIES: [AtomicU64; 5] = [
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+];
+
 pub static ZERO_RUN_REFUSALS: [AtomicU64; 3] =
     [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
 

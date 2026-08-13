@@ -7353,6 +7353,80 @@ pub struct StringFieldLayout {
     pub string_class_id: u32,
 }
 
+/// Where `java.util.concurrent.atomic.AtomicInteger.value` lives, for the
+/// ATOMIC_INT intrinsic region.
+///
+/// Same two-offsets-per-field discipline as [`StringFieldLayout`], and for the
+/// same reason: a class with a registered `CompactLayout` may still have
+/// LEGACY-laid-out instances, so the codegen dispatches per object on the
+/// `GC_FLAG_COMPACT` header bit rather than assuming one layout.
+///
+/// `value` is an `int`, so both arms address a 4-byte payload — there is no
+/// reference/narrow-oop case to get wrong here, which is why this layout is a
+/// good deal simpler than the String one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AtomicIntFieldLayout {
+    /// Abstract field slot index of `AtomicInteger.value`.
+    pub value_field_index: usize,
+    /// Byte offset of `value`'s 4-byte payload in a COMPACT instance.
+    pub value_compact_offset: i32,
+    /// Byte offset of `value`'s 4-byte payload in a LEGACY instance.
+    pub value_legacy_offset: i32,
+    /// `ObjectHeader` class id of `java/util/concurrent/atomic/AtomicInteger`,
+    /// used as the receiver guard. `AtomicInteger` is not final and its methods
+    /// are not final, so a subclass could override them — the guard is what
+    /// makes inlining the field access sound, and a mismatch falls back to
+    /// ordinary dispatch (which runs the override).
+    pub class_id: u32,
+}
+
+impl AtomicIntFieldLayout {
+    /// Build a layout from the raw field index, precomputing the COMPACT and
+    /// LEGACY payload addresses exactly the way [`StringFieldLayout::new`]
+    /// does for its `hash` field (the identical shape: a 4-byte `int`).
+    ///
+    /// Returns `None` when no compact layout is registered AND the legacy
+    /// address cannot be formed — the caller then simply does not offer the
+    /// intrinsic and the call keeps its native dispatch.
+    pub fn new(value_field_index: usize, class_id: u32) -> Option<Self> {
+        if class_id == 0 {
+            return None;
+        }
+        // LEGACY: uniform 16-byte `Value` cell, 4-byte int payload inside it.
+        let legacy = (cratonvm_types::HEADER_SIZE
+            + value_field_index * cratonvm_types::SLOT_SIZE) as i32
+            + cratonvm_types::FIELD_CELL_PAYLOAD32_OFFSET as i32;
+        // COMPACT: the registered `CompactLayout` body offset IS the payload
+        // address. Same fallback rule as `StringFieldLayout::new` — with no
+        // registered layout no instance can carry `GC_FLAG_COMPACT`, so
+        // pointing the compact arm at the legacy address keeps it harmless
+        // rather than wild if that invariant ever slips.
+        //
+        // REFUSE anything that is not exactly 4 bytes wide: this intrinsic
+        // emits a 32-bit `LOCK XADD`, so a narrower or wider storage width
+        // would read and write the wrong bytes. Falling back to `None` here
+        // keeps the call on native dispatch instead.
+        let mut compact = legacy;
+        if cratonvm_types::compact_ref_fields_enabled() {
+            match cratonvm_types::compact_field_storage(class_id, value_field_index) {
+                Some((body_off, storage)) => {
+                    if storage.size_runtime() != 4 {
+                        return None;
+                    }
+                    compact = (cratonvm_types::HEADER_SIZE + body_off) as i32;
+                }
+                None => {}
+            }
+        }
+        Some(Self {
+            value_field_index,
+            value_compact_offset: compact,
+            value_legacy_offset: legacy,
+            class_id,
+        })
+    }
+}
+
 impl StringFieldLayout {
     /// Build a layout from raw field indices, precomputing, for each of
     /// `value`/`coder`/`hash`, the two byte offsets the codegen needs: the
@@ -7596,6 +7670,36 @@ pub enum JitIntrinsic {
     LongRotateLeft,
     LongRotateRight,
     // ===== INTRINSIC REGION END: LONG_BITS =====
+
+    // ===== INTRINSIC REGION BEGIN: ATOMIC_INT =====
+    // `java.util.concurrent.atomic.AtomicInteger` read-modify-write family.
+    //
+    // All six are ONE instruction — `LOCK XADD [value], r32` — differing only
+    // in the addend and in whether the result is the pre- or post-add value.
+    // `XADD` returns the OLD value in the source register, so the `*AndGet`
+    // forms just add the delta back afterwards.
+    //
+    // Why these matter: `getAndIncrement` is a REGISTERED NATIVE
+    // (`native-builtins/src/phases_early.rs`), so every increment from compiled
+    // code paid a full native dispatch — measured at ~250 ns/op against
+    // HotSpot's ~11 ns, i.e. one uncontended `lock xadd` behind ~1000x of call
+    // overhead. See
+    // `docs/known-issues/netty/fastthreadlocal-2e9-iteration-throughput-wall-20260812.md`.
+    //
+    // The native keeps its state in the receiver's field slot 0 via
+    // `get_field_volatile` / `compare_and_swap_field` — the SAME memory this
+    // intrinsic addresses — so an interpreted caller and a compiled caller
+    // still agree. That is what makes the swap sound; if the native had used a
+    // side table these could not be intrinsified at all.
+    //
+    // Variant ordering within this region is local and not externally observed.
+    AtomicIntGetAndIncrement,  // getAndIncrement()I  -> old
+    AtomicIntGetAndDecrement,  // getAndDecrement()I  -> old
+    AtomicIntIncrementAndGet,  // incrementAndGet()I  -> old + 1
+    AtomicIntDecrementAndGet,  // decrementAndGet()I  -> old - 1
+    AtomicIntGetAndAdd,        // getAndAdd(I)I       -> old
+    AtomicIntAddAndGet,        // addAndGet(I)I       -> old + delta
+    // ===== INTRINSIC REGION END: ATOMIC_INT =====
 
     // ===== INTRINSIC REGION BEGIN: ARRAYCOPY =====
     /// `java.lang.System.arraycopy(Object,int,Object,int,int)` (Phase 2).
@@ -8673,6 +8777,86 @@ pub fn try_resolve_intrinsic(
 /// "registered" decision and the codegen's "can emit" decision are always
 /// consistent within one compilation — a registered String sentinel is
 /// never left for the plain direct-call path to mis-`CALL`.
+/// Matcher for the ATOMIC_INT region.
+///
+/// Mirrors [`try_resolve_string_intrinsic`]: returns the intrinsic entry, the
+/// parameter count (excluding the receiver), the return type tag, and the
+/// receiver class id to guard on. Returns `None` — leaving the call to ordinary
+/// native dispatch — whenever the layout did not resolve.
+///
+/// The guard is ALWAYS emitted for this family. Unlike `java/lang/String`,
+/// `AtomicInteger` is not final, so a receiver could be a subclass that
+/// overrides `getAndIncrement`; only an exact class-id match may take the
+/// inline path.
+/// Number of call sites the ATOMIC_INT matcher has admitted this process.
+/// `CRATONVM_DBG_ATOMIC_INTRINSIC=1` prints each one. A perf claim about this
+/// family is not believable without checking that this is non-zero — the
+/// intrinsic answering the same values as the native it replaced proves
+/// nothing about whether it actually ran.
+pub static ATOMIC_INTRINSIC_SITES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// `CRATONVM_JIT_NO_ATOMIC_INTRINSIC=1` — keep every `AtomicInteger` RMW call
+/// on ordinary native dispatch. The kill switch for bisecting a suspected
+/// miscompile, and the B arm of an in-binary A/B (cross-run wall time on a
+/// shared host is not a measurement).
+fn atomic_intrinsic_disabled() -> bool {
+    cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_ATOMIC_INTRINSIC").is_some()
+}
+
+pub fn try_resolve_atomic_intrinsic(
+    class: &str,
+    name: &str,
+    descriptor: &str,
+    guard_class_id: u32,
+) -> Option<(usize, usize, u8, u32)> {
+    if class != "java/util/concurrent/atomic/AtomicInteger" {
+        return None;
+    }
+    if atomic_intrinsic_disabled() {
+        return None;
+    }
+    // The layout is derived from the SITE's declared class id (via
+    // `cp_invoke_class_id_resolver`) and field slot 0 — the same slot the
+    // registered native addresses (`get_field_volatile(this, 0)`). Deriving it
+    // here and again in the codegen from the same two inputs keeps the
+    // matcher's "registered" decision and the codegen's "can emit" decision
+    // from ever disagreeing, without threading a layout through `try_compile`.
+    //
+    // `AtomicIntFieldLayout::new` returns `None` when the compact storage
+    // width is not exactly 4 bytes, so a layout this 32-bit `LOCK XADD` could
+    // not address never reaches codegen — the call keeps its native dispatch.
+    let layout = AtomicIntFieldLayout::new(0, guard_class_id)?;
+    if layout.class_id == 0 {
+        return None;
+    }
+    // ===== INTRINSIC REGION BEGIN: ATOMIC_INT =====
+    let hit: Option<(JitIntrinsic, usize)> = match (name, descriptor) {
+        ("getAndIncrement", "()I") => Some((JitIntrinsic::AtomicIntGetAndIncrement, 0)),
+        ("getAndDecrement", "()I") => Some((JitIntrinsic::AtomicIntGetAndDecrement, 0)),
+        ("incrementAndGet", "()I") => Some((JitIntrinsic::AtomicIntIncrementAndGet, 0)),
+        ("decrementAndGet", "()I") => Some((JitIntrinsic::AtomicIntDecrementAndGet, 0)),
+        ("getAndAdd", "(I)I") => Some((JitIntrinsic::AtomicIntGetAndAdd, 1)),
+        ("addAndGet", "(I)I") => Some((JitIntrinsic::AtomicIntAddAndGet, 1)),
+        _ => None,
+    };
+    // ===== INTRINSIC REGION END: ATOMIC_INT =====
+    let (intrinsic, num_params) = hit?;
+    ATOMIC_INTRINSIC_SITES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_ATOMIC_INTRINSIC").is_some() {
+        eprintln!(
+            "[atomic-intrinsic] {}.{}{} class_id={} compact_off={} legacy_off={}",
+            class,
+            name,
+            descriptor,
+            layout.class_id,
+            layout.value_compact_offset,
+            layout.value_legacy_offset,
+        );
+    }
+    Some((intrinsic.as_entry(), num_params, b'I', layout.class_id))
+}
+
 pub fn try_resolve_string_intrinsic(
     class: &str,
     name: &str,
@@ -18178,6 +18362,34 @@ fn try_compile_inner(
                         continue;
                     }
                 }
+                // ===== INTRINSIC REGION BEGIN: ATOMIC_INT =====
+                // `AtomicInteger` read-modify-write family. Registered only
+                // with a resolved receiver class id: `AtomicInteger` is not
+                // final and its methods are not final, so the inline field
+                // access is sound only behind an exact class-id guard, and
+                // without one the site must keep ordinary dispatch (which runs
+                // any subclass override).
+                if let Some((entry, num_params, ret, guard_class_id)) = cp_invoke_class_id_resolver
+                    .and_then(|r| r(cp_idx))
+                    .and_then(|cid| {
+                        try_resolve_atomic_intrinsic(&class_name, &method_name, &descriptor, cid)
+                    })
+                {
+                    needs_heap = true;
+                    direct_calls.push((
+                        pc,
+                        JitDirectCall {
+                            entry,
+                            needs_context: false,
+                            num_params,
+                            return_type: ret,
+                            guard_class_id,
+                        },
+                    ));
+                    continue;
+                }
+                // ===== INTRINSIC REGION END: ATOMIC_INT =====
+
                 // Then the `java/lang/String` intrinsics — registered only
                 // when the String field layout has resolved (and carries a
                 // `coder` field). `string_layout` is resolved ONCE per
@@ -27342,7 +27554,17 @@ mod layout_constant_inventory {
         // `cell()` closure it replaced biased BOTH branches by payload64 and
         // never mentioned payload32, which is precisely how the compact arm
         // ended up 4 bytes past `coder` and `hash`.
-        ("lib.rs", [3, 1, 2, 1, 0, 0, 1, 1]),
+        //
+        // 2026-08-12: `AtomicIntFieldLayout::new` (the ATOMIC_INT intrinsic
+        // region) adds the same two-offsets-per-field pair as the String one,
+        // for `AtomicInteger.value`: `HEADER_SIZE` 3 -> 5, `SLOT_SIZE` 2 -> 3
+        // and `FIELD_CELL_PAYLOAD32_OFFSET` 1 -> 2 (the legacy arm's
+        // header-plus-cell-plus-payload32 address), and `HEADER_SIZE` again
+        // for the compact arm's header-plus-body-offset. `value` is an `int`,
+        // so there is no payload64 arm and no ref/narrow-oop case. Both sites
+        // are disp32 in the emitted `LOCK XADD [RAX+disp32], ECX`, so neither
+        // shares the disp8 hazard.
+        ("lib.rs", [5, 1, 3, 1, 0, 0, 2, 1]),
         // ir_lower.rs: the `use` list, the three compile-time invariants
         // restated at the top of that file, two disp32 field-address
         // computations, two disp8 float array element accesses, and the disp8

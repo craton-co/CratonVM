@@ -2842,6 +2842,17 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
                 Some(Value::Long(v)) => *v,
                 _ => 0,
             };
+            // `MemoryLayout.paddingLayout` rejects a non-positive size at the
+            // FACTORY: `IllegalArgumentException: Invalid byte size: 0`. Letting
+            // a zero-size layout through produced one that every consumer had
+            // to re-check — `spliterator(paddingLayout(0))` reported the failure
+            // one call later and with a different message than HotSpot's.
+            if size <= 0 {
+                return Err(RuntimeError::IllegalArgumentException {
+                    message: format!("Invalid byte size: {}", size),
+                }
+                .into());
+            }
             // Padding has no alignment constraint of its own — the JDK's
             // `PaddingLayoutImpl` is byte-aligned.
             let obj = p67_layout_object(ctx, "java/lang/foreign/PaddingLayout", size, 1)?;

@@ -96,12 +96,54 @@ asynchronous semantics.
   until the stream closes; here it performs the transition and returns. That is
   still a strict improvement on what it did before, which was to reach
   `directoryStream.start` and spin a core forever.
-* **`Recording.enable(...)`/`disable(...)` settings are still not consumed by
-  the Rust recorder** (an unchanged, separately documented gap). A Java-owned
-  recording therefore captures every event CratonVM emits, not the enabled
-  subset — so an "empty" `Recording` dumps whatever built-in events the VM
-  produced while it was open, where HotSpot's would be empty. Delivery to
-  `onEvent` is unaffected: it matches on the event name.
+* ~~**`Recording.enable(...)`/`disable(...)` settings are still not consumed by
+  the Rust recorder.** A Java-owned recording therefore captures every event
+  CratonVM emits, not the enabled subset.~~ **Closed later the same day** — see
+  the settings section below.
+
+## Settings, closed 2026-08-13
+
+`enable(...)`/`disable(...)`/`withThreshold(...)` were accepted and stored by the
+JDK and read by nobody: `disable` did nothing, a threshold did nothing, and a
+Java-owned recording swept up whatever built-in events the VM emitted while it
+was open. All of that is now honoured, and every row of a nine-case probe agrees
+with HotSpot JDK 25.
+
+**The rule was measured, and the first draft of the fix had it backwards.** It is
+tempting to read "no `enable(...)` call" as "record nothing"; HotSpot records
+BOTH of a probe's custom events for a bare `new Recording()`, and none of its own
+`jdk.*` types. `jdk.jfr.Enabled` defaults to `true` for a user event class, while
+the JDK ships most built-in types with `enabled=false`. So:
+
+* a Java event class is recorded **unless** a recording explicitly disables it;
+* a CratonVM built-in is recorded **only if** a recording explicitly enables it;
+* "disabled" needs *every* open recording to have said so — one that does not
+  mention the name applies the type's default, and HotSpot's per-type answer is
+  the union across running recordings.
+
+A draft that defaulted Java events to *off* disagreed with HotSpot on three of
+the nine rows. The oracle run is what caught it; the write-up's own framing of
+the gap ("an empty `Recording` dumps 1 event where HotSpot's dumps 0") had
+pointed at the right symptom for the wrong reason — the extra event was a
+CratonVM built-in, not a defaulting rule.
+
+Two mechanics worth knowing when reading `native-builtins/src/jfr.rs`:
+
+* `Recording.enable(Class)` does **not** store the class name. It stores
+  `String.valueOf(Type.getTypeId(eventClass))`, so a settings key reads
+  `545#enabled` and the only way back to `io.netty.AllocateChunk` is a table
+  `JVM.getTypeId(Class)` fills as it hands the ids out — the `Class` mirror is
+  the one thing that knows the `@Name`.
+* The settings are read at `start()`/`startAsync()`. A change *after* start is
+  legal but its only funnel is a private `Recording.setSetting`, so the first
+  refusal of an event name re-reads the settings before answering no, and that
+  answer is then memoized per VM (otherwise a disabled event would re-read the
+  map on every commit).
+
+Still not consumed, and skipped at a visible `continue` rather than silently:
+`stackTrace`, `period`, `cutoff`, `throttle`, `level` and the per-event control
+classes, none of which the Rust recorder models. Delivery to `onEvent` is
+unaffected by any of this — it matches on the event name.
 
 ## Original report (2026-08-12)
 
