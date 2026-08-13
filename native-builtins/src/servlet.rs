@@ -4,6 +4,13 @@
 //! NIO, HTTP client, and resource loading natives.
 
 use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
+// The ONE copy of the `hasArray`/`array`/`arrayOffset` three-way rule and of
+// the two one-liners that feed it. `cratonvm-native-builtins` depends on
+// `cratonvm-native-io` (`Cargo.toml`) and not the reverse, so `native-io` is
+// the only crate whose copy this file and `phases_late/charset_buffers.rs` can
+// both import — which is why F14-1 made them `pub` there rather than moving
+// them here. Record: F14-1 N1, landed by F21-1.
+use cratonvm_native_io::{buffer_array_access, BufferArrayAccess};
 use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError};
 // The heap's own object-kind discriminant. `s2_bb_arr` uses it to refuse a
 // `java.nio.Buffer.segment` that is a `MemorySegment` rather than a backing
@@ -3058,17 +3065,23 @@ pub(crate) fn bb_write_hb(ctx: &mut dyn NativeContext, buf: ObjectRef, arr: Obje
     // full field layout, so without this seed the named `bigEndian` slot
     // reads back Int(0) — which `s2_bb_order` would decode as
     // LITTLE_ENDIAN by default.
-    ctx.set_field_by_name(buf, "bigEndian", Value::Int(1));
-    ctx.set_field_by_name(
-        buf,
-        "nativeByteOrder",
-        Value::Int(if cfg!(target_endian = "big") { 1 } else { 0 }),
-    );
+    //
+    // CONVERGED (F26-1, closing the two-of-five sites of
+    // W7-76-bytebuffer-alias-residuals.md §8.2 that this lane owns). This was
+    // one of five byte-identical transcriptions of the same two writes, with
+    // "nothing to make them agree"; it is now a delegation to
+    // `native_io::seed_buffer_byte_order`, for the same reason and by the same
+    // crate-direction argument as `s2_bb_is_read_only` above. The remaining
+    // three sites are F26-1 §6 nominations.
+    cratonvm_native_io::seed_buffer_byte_order(ctx, buf);
     // Real HeapByteBuffer seeds Buffer.address to ARRAY_BYTE_BASE_OFFSET +
     // offset (16 for a fresh, zero-offset heap buffer). Bulk get/put
     // bytecode routes through ScopedMemoryAccess and expects this
-    // base-offset-relative value when copying from/to hb.
-    ctx.set_field_by_name(buf, "address", Value::Long(16));
+    // base-offset-relative value when copying from/to hb. `bb_write_hb` writes
+    // `offset = 0` four lines up, so the offset term is 0 — spelled through
+    // this file's `ARRAY_BYTE_BASE_OFFSET`, which is now DEFINED AS
+    // native-io's, so the two crates cannot disagree about the value.
+    ctx.set_field_by_name(buf, "address", Value::Long(ARRAY_BYTE_BASE_OFFSET));
     // Synthetic-mode indexed fallback — ONLY for the bare synthetic layout
     // (no real Buffer/ByteBuffer field metadata). On a real-JDK-shaped
     // object these indices alias real fields (mark@0, address@4,
@@ -3606,7 +3619,13 @@ fn s2_bb_heap_base(ctx: &dyn NativeContext, buf: ObjectRef) -> usize {
 /// JDK's own `HeapByteBuffer` ctor adds to its array-base `offset`. Element 0
 /// of a `byte[]` sits at this unsafe offset, so subtracting it turns a
 /// `Buffer.address` back into a plain byte index.
-const ARRAY_BYTE_BASE_OFFSET: i64 = 16;
+///
+/// **DEFINED AS native-io's, not beside it (F26-1).** Two crates screening the
+/// same `Buffer.address` values against two independently-spelled `16`s is the
+/// W7-76 §8.2 shape; a `const` initialised from the other crate's `pub const`
+/// is const-evaluated, costs nothing, leaves all nine use sites in this file
+/// untouched, and makes drift impossible.
+const ARRAY_BYTE_BASE_OFFSET: i64 = cratonvm_native_io::ARRAY_BYTE_BASE_OFFSET;
 
 /// Backing array + byte index of element 0 for a real-JDK
 /// `java/nio/ByteBufferAs<T>Buffer{B,L}` — the concrete view class
@@ -3725,9 +3744,79 @@ fn s2_bb_read_window(
 /// True when the buffer's real-JDK `isReadOnly` flag is set (layouts with
 /// no such field — bare synthetics, typed views — always report writable,
 /// matching this family's historic behaviour).
+///
+/// CONVERGED (F14-1 N1). This was one of THREE byte-identical transcriptions of
+/// the same one-line field read — this, `charset_buffers.rs::cb_is_read_only`,
+/// and `native-io`'s. It is now a delegation to the `native-io` copy: the crate
+/// dependency runs `cratonvm-native-builtins` → `cratonvm-native-io` and not
+/// the reverse, so that is the only one of the three the other two can import.
+/// The local name is kept because it is the name fifteen call sites in this
+/// file already use, and because a delegation is one implementation whichever
+/// name it wears — what F14-1 objected to was three BODIES that can drift, not
+/// three names.
 #[inline]
 fn s2_bb_is_read_only(ctx: &dyn NativeContext, buf: ObjectRef) -> bool {
-    matches!(ctx.get_field_by_name(buf, "isReadOnly"), Value::Int(v) if v != 0)
+    cratonvm_native_io::buffer_is_read_only(ctx, buf)
+}
+
+/// The WRITE half of [`s2_bb_is_read_only`], for the four view producers.
+///
+/// `slice()`, `slice(int,int)` and `duplicate()` inherit the source's flag and
+/// `asReadOnlyBuffer()` sets it unconditionally — MEASURED across all seven
+/// buffer families on jdk-25.0.3+9
+/// (`scratchpad/f21/F21ViewContagionProbe.java`); read-only-ness is contagious
+/// and `asReadOnlyBuffer()` is one-way with no operation anywhere that clears
+/// it. Each of those four had heap and direct arms that carried `ro`
+/// correctly and a copying fallback arm that did not, and the fallback runs
+/// `bb_write_hb`, which writes `isReadOnly = 0` — so the flag was actively
+/// cleared rather than merely left alone. This exists so the corrected arms
+/// name the operation instead of open-coding a fifth `set_field_by_name`.
+///
+/// Deliberately by NAME and not through `BB_*`: `isReadOnly` is a real-JDK
+/// `ByteBuffer` field with no slot in the bare 6-slot synthetic layout, so on a
+/// carrier that has no such field this is a no-op — which is the same
+/// behaviour, and the same reason, as `bb_write_hb`'s own `isReadOnly` write
+/// one screen up.
+#[inline]
+fn s2_bb_set_read_only(ctx: &mut dyn NativeContext, buf: ObjectRef, read_only: bool) {
+    ctx.set_field_by_name(buf, "isReadOnly", Value::Int(i32::from(read_only)));
+}
+
+/// `throw new UnsupportedOperationException()` — the NO-ARGUMENT constructor,
+/// so `getMessage()` is null exactly as HotSpot's is.
+///
+/// The `array()` / `arrayOffset()` arms below raised this with a
+/// `"direct buffer has no backing array"` detail message. The CLASS was right,
+/// so no `catch` and no class-name assertion could see the difference — only a
+/// message-exact differential can, which is why it survived W7-83 §7.1.
+/// MEASURED on `openjdk 25.0.3 2026-04-21 LTS (25.0.3+9-LTS)`, all four UOE
+/// arms of this family report `getMessage() == null`:
+///
+/// ```text
+/// directByteBuffer.array        java.lang.UnsupportedOperationException  getMessage=null
+/// directByteBuffer.arrayOffset  java.lang.UnsupportedOperationException  getMessage=null
+/// charView.array                java.lang.UnsupportedOperationException  getMessage=null
+/// stringCharBuffer.array        java.lang.UnsupportedOperationException  getMessage=null
+/// new UOE().getMessage          OK null
+/// ```
+///
+/// The EMPTY string is the documented spelling for "no message" in
+/// `types/src/error.rs`, which maps `""` to `None` so the `()V` ctor is used;
+/// `Some("")` would set a non-null empty detail message. Same spelling as
+/// `charset_buffers.rs::cb_no_backing_array` and
+/// `native-io/src/lib.rs::buffer_no_backing_array` — this WAS the third and
+/// last copy in the family. Record: F14-1 N3.
+///
+/// CONVERGED (F14-1 N1): now a delegation to the `native-io` copy, for the same
+/// dependency-edge reason as [`s2_bb_is_read_only`]. The empty-string spelling
+/// is precisely the detail a fourth transcription would get wrong, and the
+/// existing test on this arm matches
+/// `RuntimeError::UnsupportedOperationException { .. }`, which is blind to the
+/// message by construction — the message-reading test lives beside the single
+/// remaining body.
+#[inline]
+fn s2_bb_no_backing_array() -> MethodCallFailed {
+    cratonvm_native_io::buffer_no_backing_array()
 }
 
 /// The canonical `java.nio.ByteOrder` object for `ord` (0=BIG_ENDIAN,
@@ -4860,6 +4949,26 @@ macro_rules! s2_view_buf_fn {
             // accessors (the source may be real-layout: order in `bigEndian`).
             let ord = s2_bb_order(ctx, this);
             s2_bb_set_order(ctx, vb, ord);
+            // …and the source's read-only-ness, which is F21-1 N3's other
+            // half and had never been propagated. `ByteBuffer.asIntBuffer()`
+            // &c. are registered HERE AND NOWHERE ELSE (`native-io` registers
+            // no `as<T>Buffer` descriptor), so unlike `$slice`/`$dup` in the
+            // macro below this arm is the LIVE one in every mode.
+            //
+            // MEASURED, jdk-25.0.3+9 (`scratchpad/f37/F37TypedAliasProbe.java`):
+            // `ByteBuffer.allocate(64).asReadOnlyBuffer().asIntBuffer()` is a
+            // `java.nio.ByteBufferAsIntBufferRB` with `isReadOnly() == true`,
+            // its `array()` raises `UnsupportedOperationException` (array-less
+            // is asked FIRST — it is not a `ReadOnlyBufferException` row), and
+            // its `.slice()` is read-only too. Identical for Long/Short/Float/
+            // Double/Char and for the direct twin `DirectIntBufferRS`.
+            //
+            // Without this the typed views' new `$put` guard could be walked
+            // straight around: take a read-only ByteBuffer, ask it for an
+            // `asIntBuffer()` view, and write through the view into the
+            // read-only buffer's own backing array.
+            let src_read_only = s2_bb_is_read_only(ctx, this);
+            s2_bb_set_read_only(ctx, vb, src_read_only);
             Ok(Some(Value::Object(Some(vb))))
         }
     };
@@ -4972,7 +5081,14 @@ fn s2_bb_as_char_buffer(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
             // back to the ARRAY_BYTE_BASE_OFFSET seeding `bb_write_hb` uses.
             _ => 16,
         };
-        let read_only = matches!(ctx.get_field_by_name(this, "isReadOnly"), Value::Int(1));
+        // Was an open-coded `matches!(…, Value::Int(1))` — the FIFTH
+        // transcription of the `isReadOnly` field read, and the only one that
+        // tested `== 1` rather than `!= 0`, so a flag written as any other
+        // non-zero value made this arm disagree with `hasArray`/`array`/
+        // `arrayOffset` about one receiver. Routed through the converged
+        // `s2_bb_is_read_only` (F14-1 N1 / F21-1 §3). Nothing writes such a
+        // value today: a latent divergence closed, not a flip.
+        let read_only = s2_bb_is_read_only(ctx, this);
         let vb = try_alloc_concurrent_synthetic(ctx, view_cls, 0)?;
         ctx.set_field_by_name(vb, "bb", Value::Object(Some(this)));
         ctx.set_field_by_name(vb, "mark", Value::Int(-1));
@@ -4998,6 +5114,13 @@ fn s2_bb_as_char_buffer(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         };
         ctx.set_array_element(chars_arr, i, Value::Int(ch));
     }
+    // Read the source's read-only flag BEFORE the allocation below. `this` is
+    // an `ObjectRef` and `try_alloc_concurrent_synthetic` can trigger a
+    // collection that RELOCATES it; carrying a `bool` across the allocation is
+    // something no collector can move, which is the same reason
+    // `native-io`'s `buf_write_read_only` takes a `bool` rather than the
+    // source. (The `if let` arm above already reads it before its own alloc.)
+    let src_read_only = s2_bb_is_read_only(ctx, this);
     // GC-safety: `alloc_concurrent_synthetic` below allocates and can
     // trigger a collection that relocates `chars_arr` (written into the
     // new CharBuffer's fields further below); pin it and re-read.
@@ -5010,7 +5133,15 @@ fn s2_bb_as_char_buffer(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     // JDK bytecode reading `hb` / `hasArray` / `array` sees the char[]).
     ctx.set_field_by_name(vb, "hb", Value::Object(Some(chars_arr)));
     ctx.set_field_by_name(vb, "offset", Value::Int(0));
-    ctx.set_field_by_name(vb, "isReadOnly", Value::Int(0));
+    // Was a flat `Int(0)`, i.e. this fallback arm ACTIVELY CLEARED the flag —
+    // the same shape F21-1 §6.2 found in `slice`/`slice(II)`/`duplicate`'s
+    // copying arms, in the one member of the family nobody had re-read.
+    // `roBB.asCharBuffer()` is a `java.nio.ByteBufferAsCharBufferRB` with
+    // `isReadOnly() == true` on HotSpot (MEASURED), and the arm above already
+    // propagates; only this one did not. A copy is not the JDK's shape either
+    // way, but a WRITABLE copy of a read-only buffer's contents is the strictly
+    // worse of the two answers available here.
+    ctx.set_field_by_name(vb, "isReadOnly", Value::Int(i32::from(src_read_only)));
     ctx.set_field_by_name(vb, "position", Value::Int(0));
     ctx.set_field_by_name(vb, "limit", Value::Int(rem_chars as i32));
     ctx.set_field_by_name(vb, "capacity", Value::Int(rem_chars as i32));
@@ -5923,23 +6054,25 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
     // array / hasArray / isDirect / isReadOnly / arrayOffset — all
     // storage/flag-aware now (previously hardcoded heap-and-writable, so a
     // direct or read-only receiver answered wrong on every one of these).
+    //
+    // CONVERGED (F14-1 N1): the three-way decision is
+    // `cratonvm_native_io::buffer_array_access`, the one copy of it the
+    // dependency edge lets this crate import. The behaviour is unchanged —
+    // `Accessible`/`ReadOnly` are the two arms that were here, and `Absent`
+    // keeps this file's FOURTH arm (the storage-less synthetic's historic
+    // benign null), which is a CratonVM-only state the JDK's two-valued
+    // `hb == null` question has no cell for.
     r.register(bb, "array", "()[B", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        match s2_bb_arr(ctx, this) {
-            Some(arr) => {
-                if s2_bb_is_read_only(ctx, this) {
-                    return Err(RuntimeError::ReadOnlyBufferException.into());
-                }
-                Ok(Some(Value::Object(Some(arr))))
-            }
-            None if s2_bb_direct_addr(ctx, this).is_some() => {
-                Err(RuntimeError::UnsupportedOperationException {
-                    message: "direct buffer has no backing array".to_string(),
-                }
-                .into())
+        let arr = s2_bb_arr(ctx, this);
+        match buffer_array_access(arr.is_some(), s2_bb_is_read_only(ctx, this)) {
+            BufferArrayAccess::Accessible => Ok(Some(Value::Object(arr))),
+            BufferArrayAccess::ReadOnly => Err(RuntimeError::ReadOnlyBufferException.into()),
+            BufferArrayAccess::Absent if s2_bb_direct_addr(ctx, this).is_some() => {
+                Err(s2_bb_no_backing_array())
             }
             // Storage-less synthetic: keep the historic benign null.
-            None => Ok(Some(Value::Object(None))),
+            BufferArrayAccess::Absent => Ok(Some(Value::Object(None))),
         }
     });
     // `arrayOffset()` has the SAME two refusals as `array()` eighteen lines
@@ -5964,28 +6097,32 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
     // the window's base still has to come through. Record: W7-83 §7.1.
     r.register(bb, "arrayOffset", "()I", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        match s2_bb_arr(ctx, this) {
-            Some(_) => {
-                if s2_bb_is_read_only(ctx, this) {
-                    return Err(RuntimeError::ReadOnlyBufferException.into());
-                }
-                Ok(Some(Value::Int(s2_bb_heap_base(ctx, this) as i32)))
-            }
-            None if s2_bb_direct_addr(ctx, this).is_some() => {
-                Err(RuntimeError::UnsupportedOperationException {
-                    message: "direct buffer has no backing array".to_string(),
-                }
-                .into())
+        match buffer_array_access(
+            s2_bb_arr(ctx, this).is_some(),
+            s2_bb_is_read_only(ctx, this),
+        ) {
+            BufferArrayAccess::Accessible => Ok(Some(Value::Int(s2_bb_heap_base(ctx, this) as i32))),
+            BufferArrayAccess::ReadOnly => Err(RuntimeError::ReadOnlyBufferException.into()),
+            BufferArrayAccess::Absent if s2_bb_direct_addr(ctx, this).is_some() => {
+                Err(s2_bb_no_backing_array())
             }
             // Storage-less synthetic: keep the historic benign zero, for the
             // same reason `array()` keeps its historic benign null.
-            None => Ok(Some(Value::Int(s2_bb_heap_base(ctx, this) as i32))),
+            BufferArrayAccess::Absent => Ok(Some(Value::Int(s2_bb_heap_base(ctx, this) as i32))),
         }
     });
+    // `(hb != null) && !isReadOnly` — the SAME decision as the two arms above,
+    // so it is the same call. Written out as a conjunction here, it was the
+    // fifth transcription of a rule the JDK writes once.
     r.register(bb, "hasArray", "()Z", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let has = s2_bb_arr(ctx, this).is_some() && !s2_bb_is_read_only(ctx, this);
-        Ok(Some(Value::Int(has as i32)))
+        let access = buffer_array_access(
+            s2_bb_arr(ctx, this).is_some(),
+            s2_bb_is_read_only(ctx, this),
+        );
+        Ok(Some(Value::Int(i32::from(
+            access == BufferArrayAccess::Accessible,
+        ))))
     });
     r.register(bb, "isDirect", "()Z", |ctx, args| {
         let this = obj_arg(args, 0)?;
@@ -6103,6 +6240,15 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
     let buf = try_alloc_concurrent_synthetic(ctx, cls, 6)?;
             bb_write_hb(ctx, buf, new_arr, rem);
             s2_bb_set_order(ctx, buf, ord);
+            // `ro` was computed above and used ONLY by the two aliasing arms
+            // below, so this copying arm dropped it. `bb_write_hb` writes
+            // `isReadOnly = 0` unconditionally, so the flag was not merely
+            // left unset — it was actively cleared, which is the wrong
+            // CAPABILITY: the returned slice answers `hasArray() == true` and
+            // hands its backing array over. MEASURED, jdk-25.0.3+9, all seven
+            // families: `<fam>.ro.slice.isReadOnly OK true`. Written AFTER
+            // `bb_write_hb` for exactly that reason.
+            s2_bb_set_read_only(ctx, buf, ro);
             return Ok(Some(Value::Object(Some(buf))));
         }
         let buf = match s2_bb_storage(ctx, this) {
@@ -6125,6 +6271,7 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
                 let cls = s2_bb_heap_class(ctx, false);
     let buf = try_alloc_concurrent_synthetic(ctx, cls, 6)?;
                 bb_write_hb(ctx, buf, new_arr, rem);
+                s2_bb_set_read_only(ctx, buf, ro);
                 Ok(buf)
             }
         };
@@ -6179,6 +6326,7 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
     let buf = try_alloc_concurrent_synthetic(ctx, cls, 6)?;
                 bb_write_hb(ctx, buf, new_arr, length);
                 s2_bb_set_order(ctx, buf, ord);
+                s2_bb_set_read_only(ctx, buf, ro);
                 Ok(buf)
             }
         };
@@ -6214,6 +6362,7 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
                     ctx.set_field(buf, BB_MARK, Value::Int(mark));
                 }
                 ctx.set_field(buf, BB_ORDER, Value::Int(ord));
+                s2_bb_set_read_only(ctx, buf, ro);
                 Ok(buf)
             }
         };
@@ -6245,12 +6394,22 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
                         ctx.set_field_by_name(buf, "position", Value::Int(pos));
                         ctx.set_field_by_name(buf, "limit", Value::Int(lim));
                         ctx.set_field_by_name(buf, "mark", Value::Int(mark));
-                        ctx.set_field_by_name(buf, "isReadOnly", Value::Int(1));
                         ctx.set_field(buf, BB_POS, Value::Int(pos));
                         ctx.set_field(buf, BB_LIMIT, Value::Int(lim));
                         ctx.set_field(buf, BB_MARK, Value::Int(mark));
                     }
                     ctx.set_field(buf, BB_ORDER, Value::Int(ord));
+                    // MOVED OUT of the `if let` above, which is the whole
+                    // change on this arm: `asReadOnlyBuffer()` on a receiver
+                    // with no resolvable backing array returned a buffer with
+                    // `isReadOnly` never written — a WRITABLE result from the
+                    // one method whose entire contract is that its result is
+                    // not writable. It still has to follow `bb_write_hb`,
+                    // which writes `isReadOnly = 0`. MEASURED, jdk-25.0.3+9:
+                    // `asReadOnlyBuffer().isReadOnly()` is `true` for every
+                    // receiver in all seven families, and there is no receiver
+                    // for which it is conditional.
+                    s2_bb_set_read_only(ctx, buf, true);
                     Ok(buf)
                 }
             };
@@ -6444,19 +6603,67 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
                 },
             )))
         });
-        // `isReadOnly` — KEEP, but the wave-3 justification was also wrong:
-        // `asReadOnlyBuffer` IS registered for all five view classes (see the
-        // `s2_typed_buffer_view_fns!` expansions below), it just aliases
-        // `duplicate` and therefore hands back a WRITABLE buffer. So no
-        // read-only view of an s2 buffer can exist, and `false` is exact for
-        // every receiver that can reach here — not because the method is
-        // missing, but because the only producer of a read-only view does not
-        // produce one. FOLLOW-UP for whoever makes `$ro` real: it needs a
-        // read-only flag on the view (the 6-slot synthetic is full — slots
-        // 0..5 are array/pos/limit/cap/byte-start-marker/segment — so this
-        // needs a wider allocation), `put`/`compact` must then throw
-        // `ReadOnlyBufferException`, and THIS registration must read the flag.
-        r.register(cls, "isReadOnly", "()Z", |_, _| Ok(Some(Value::Int(0))));
+        // `isReadOnly` — NO LONGER A CONSTANT (F26-1, closing F21-1's N3).
+        //
+        // The comment this replaces argued the `Int(0)` was EXACT, and its
+        // argument was sound when written: `$ro` aliased `$dup` and so could
+        // not mint a read-only view, therefore no receiver reaching here could
+        // be read-only. **F21 falsified the premise from the other crate.**
+        // `native-io`'s `tb_abstract_view_fns!` `$ro_fn` now stamps
+        // `isReadOnly = 1` by name, and `register_io_natives` runs AFTER
+        // `register_essential_natives_with_shims` in both `vm_init` real-JDK
+        // arms (VERIFIED: `vm/src/vm/vm_init.rs` L2055 < L2252 and L2593 <
+        // L2788; registration is last-write-wins), so it is native-io's
+        // `asReadOnlyBuffer` that answers for these five classes and read-only
+        // typed views DO now exist.
+        //
+        // Left alone the constant reproduced, in the sibling, exactly the
+        // impossible state that got `native_bb_is_read_only` fixed: `array()`
+        // and `arrayOffset()` raise `ReadOnlyBufferException` and `hasArray()`
+        // answers `false` (all three read the flag via
+        // `native_io::buffer_array_access`), while `isReadOnly()` said the
+        // buffer was writable — so a caller that branches on `isReadOnly()`
+        // instead of `hasArray()` is steered straight into the throw.
+        // MEASURED, jdk-25.0.3+9 (`scratchpad/f26/F26AliasProbe.java` §7):
+        // `allocate(32).asReadOnlyBuffer().asIntBuffer()` is a
+        // `java.nio.ByteBufferAsIntBufferRB` with `isReadOnly() == true`, and
+        // the same holds for Long/Short/Float/Double/Char and for the direct
+        // twin (`DirectIntBufferRS`, also `true`).
+        //
+        // **THE WIDTH CLAIM, CHECKED RATHER THAN INHERITED.** The old comment
+        // said this needs "a wider allocation" because "the 6-slot synthetic is
+        // full". That is true of the SYNTHETIC layout and irrelevant to this
+        // registration, in both directions:
+        //
+        //   * Real-JDK mode: `java.nio.IntBuffer` DECLARES `boolean isReadOnly`
+        //     (VERIFIED, `javap -p java.nio.IntBuffer` on 25.0.3+9: `int[] hb;
+        //     int offset; boolean isReadOnly;` — identical on Long/Short/Float/
+        //     Double), and `VmExec::alloc_object` clamps a native allocator's
+        //     requested slot count UP to the resolved class's declared field
+        //     count (VERIFIED, `vm/src/vm/vm_exec.rs` "Layout-mismatch guard").
+        //     So the field is present on every one of these receivers and the
+        //     by-name read resolves. Nothing needs widening.
+        //   * Synthetic-JDK mode: there is no such field, `get_field_by_name`
+        //     yields a non-`Int`, and `s2_bb_is_read_only` answers `false` —
+        //     byte-for-byte the constant this replaces. So this is a no-op in
+        //     the mode the width argument was about.
+        //
+        // Reads the same FIELD through the same converged helper as
+        // `hasArray`/`array`/`arrayOffset`, so the four accessors on one
+        // receiver cannot disagree.
+        //
+        // DISCLOSED RESIDUAL, deliberately not fixed here: the `$put` /
+        // `$put_abs` / `$compact` arms of `s2_typed_buffer_view_fns!` still do
+        // not consult the flag, so a write through a read-only typed view
+        // succeeds where HotSpot raises `ReadOnlyBufferException` (MEASURED:
+        // `allocate(32).asReadOnlyBuffer().asIntBuffer().put(0,1)` →
+        // `java.nio.ReadOnlyBufferException`). Making this accessor honest is
+        // strictly a step toward that and cannot be a step away from it: it
+        // moves one more accessor onto the flag the enforcement will read.
+        r.register(cls, "isReadOnly", "()Z", |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            Ok(Some(Value::Int(i32::from(s2_bb_is_read_only(ctx, this)))))
+        });
     }
 
     // `order`/`slice`/`slice(int,int)`/`duplicate`/`asReadOnlyBuffer` are
@@ -6512,8 +6719,26 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
                 let raw = $read(ctx, this, off);
                 Ok(Some(($to_value)(raw)))
             }
+            /// `put(x)` — F37-1 §3, landing F26-1 §9.2 / F21-1 N3's residual.
+            ///
+            /// The read-only check is FIRST, before the overflow check, and
+            /// that ordering is MEASURED, not assumed: JDK 25's
+            /// `ByteBufferAsIntBufferRB.put(int)` is a bare
+            /// `throw new ReadOnlyBufferException();` with no bounds test
+            /// above it (`jdk25src/.../ByteBufferAsIntBufferRB.java:166`), so
+            /// a read-only view at `position == limit` answers
+            /// `ReadOnlyBufferException`, not `BufferOverflowException`.
+            ///
+            /// MEASURED, jdk-25.0.3+9 (`scratchpad/f37/F37TypedAliasProbe.java`):
+            /// `allocate(64).asReadOnlyBuffer().asIntBuffer().put(1)` →
+            /// `java.nio.ReadOnlyBufferException`, `getMessage()` null, and the
+            /// same for all five families and for the direct twin
+            /// (`DirectIntBufferRS`).
             fn $put(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
                 let this = obj_arg(args, 0)?;
+                if s2_bb_is_read_only(ctx, this) {
+                    return Err(RuntimeError::ReadOnlyBufferException.into());
+                }
                 let v = args.get(1).cloned().unwrap_or(Value::Int(0));
                 let pos = s2_bb_pos(ctx, this);
                 if pos >= s2_bb_limit(ctx, this) {
@@ -6528,8 +6753,12 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
                 ctx.set_field(this, BB_POS, Value::Int(pos + 1));
                 Ok(Some(Value::Object(Some(this))))
             }
+            /// `put(index, x)` — see `$put`. Same class, same null message.
             fn $put_abs(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
                 let this = obj_arg(args, 0)?;
+                if s2_bb_is_read_only(ctx, this) {
+                    return Err(RuntimeError::ReadOnlyBufferException.into());
+                }
                 let idx = args.get(1).and_then(|v| v.as_int()).unwrap_or(0);
                 let v = args.get(2).cloned().unwrap_or(Value::Int(0));
                 let bs = s2_typed_view_byte_start(ctx, this);
@@ -6585,6 +6814,23 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
                 ctx.set_field(vb, BB_CAP, Value::Int(remaining));
                 let ord = s2_bb_order(ctx, this);
                 s2_bb_set_order(ctx, vb, ord);
+                // Read-only is CONTAGIOUS: `slice()`, `slice(int,int)` and
+                // `duplicate()` INHERIT the source's flag (MEASURED, all seven
+                // families, F21-1 §1.1; `<fam>.ro.slice.isReadOnly` true,
+                // `<fam>.w.slice.isReadOnly` false). Landed together with the
+                // `$put`/`$put_abs`/`$put_bulk`/`$compact` guards above, and it
+                // has to be: a guard on the receiver that a `slice()` one call
+                // later hands back writable is not a guard, it is a delay. Same
+                // "the capability re-opens one call later" shape F21-1 closed
+                // for ByteBuffer, and it would have been re-opened HERE by the
+                // very change that closed the direct route.
+                //
+                // `s2_bb_set_read_only` writes by NAME, so on a bare 6-slot
+                // synthetic carrier — which is what `try_alloc_concurrent_
+                // synthetic($cls, 6)` mints in synthetic-JDK mode — it is a
+                // no-op and nothing observable changes there.
+                let src_read_only = s2_bb_is_read_only(ctx, this);
+                s2_bb_set_read_only(ctx, vb, src_read_only);
                 Ok(Some(Value::Object(Some(vb))))
             }
             fn $slice2(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -6617,6 +6863,23 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
                 ctx.set_field(vb, BB_CAP, Value::Int(length));
                 let ord = s2_bb_order(ctx, this);
                 s2_bb_set_order(ctx, vb, ord);
+                // Read-only is CONTAGIOUS: `slice()`, `slice(int,int)` and
+                // `duplicate()` INHERIT the source's flag (MEASURED, all seven
+                // families, F21-1 §1.1; `<fam>.ro.slice.isReadOnly` true,
+                // `<fam>.w.slice.isReadOnly` false). Landed together with the
+                // `$put`/`$put_abs`/`$put_bulk`/`$compact` guards above, and it
+                // has to be: a guard on the receiver that a `slice()` one call
+                // later hands back writable is not a guard, it is a delay. Same
+                // "the capability re-opens one call later" shape F21-1 closed
+                // for ByteBuffer, and it would have been re-opened HERE by the
+                // very change that closed the direct route.
+                //
+                // `s2_bb_set_read_only` writes by NAME, so on a bare 6-slot
+                // synthetic carrier — which is what `try_alloc_concurrent_
+                // synthetic($cls, 6)` mints in synthetic-JDK mode — it is a
+                // no-op and nothing observable changes there.
+                let src_read_only = s2_bb_is_read_only(ctx, this);
+                s2_bb_set_read_only(ctx, vb, src_read_only);
                 Ok(Some(Value::Object(Some(vb))))
             }
             fn $dup(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -6643,13 +6906,61 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
                 ctx.set_field(vb, BB_CAP, Value::Int(cap));
                 let ord = s2_bb_order(ctx, this);
                 s2_bb_set_order(ctx, vb, ord);
+                // Read-only is CONTAGIOUS: `slice()`, `slice(int,int)` and
+                // `duplicate()` INHERIT the source's flag (MEASURED, all seven
+                // families, F21-1 §1.1; `<fam>.ro.slice.isReadOnly` true,
+                // `<fam>.w.slice.isReadOnly` false). Landed together with the
+                // `$put`/`$put_abs`/`$put_bulk`/`$compact` guards above, and it
+                // has to be: a guard on the receiver that a `slice()` one call
+                // later hands back writable is not a guard, it is a delay. Same
+                // "the capability re-opens one call later" shape F21-1 closed
+                // for ByteBuffer, and it would have been re-opened HERE by the
+                // very change that closed the direct route.
+                //
+                // `s2_bb_set_read_only` writes by NAME, so on a bare 6-slot
+                // synthetic carrier — which is what `try_alloc_concurrent_
+                // synthetic($cls, 6)` mints in synthetic-JDK mode — it is a
+                // no-op and nothing observable changes there.
+                let src_read_only = s2_bb_is_read_only(ctx, this);
+                s2_bb_set_read_only(ctx, vb, src_read_only);
                 Ok(Some(Value::Object(Some(vb))))
             }
+            /// `asReadOnlyBuffer()` — F37-1 §3, landing F26-1 §9.4 item 1.
+            ///
+            /// **This was a plain `$dup(ctx, args)`**, i.e. the one method
+            /// whose entire contract is that its result cannot be written
+            /// returned a WRITABLE alias. That was self-consistent only while
+            /// nothing on these classes consulted the flag; `$put`/`$put_abs`/
+            /// `$put_bulk`/`$compact` above now do, so leaving it would have
+            /// produced the state F21-1 §6.1 named — a read-only view that
+            /// still accepts writes — in the sibling registrar rather than
+            /// closing it.
+            ///
+            /// `ForceReadOnly`, not `Inherit`: MEASURED, `asReadOnlyBuffer()`
+            /// is unconditional and one-way in all seven families
+            /// (`<fam>.w.aro.isReadOnly` true, `<fam>.ro.aro.isReadOnly` true,
+            /// and there is no `asWritableBuffer` anywhere in java.nio). The
+            /// write goes AFTER `$dup` returns, because `$dup` mints a fresh
+            /// 6-slot carrier and now stamps `Inherit` on it.
             fn $ro(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-                $dup(ctx, args)
+                let result = $dup(ctx, args)?;
+                if let Some(Value::Object(Some(view))) = result {
+                    s2_bb_set_read_only(ctx, view, true);
+                }
+                Ok(result)
             }
+            /// `compact()` — see `$put`. `compact` is a WRITE (it moves the
+            /// remaining elements down to index 0), so a read-only receiver
+            /// refuses it: MEASURED
+            /// `allocate(64).asReadOnlyBuffer().asIntBuffer().compact()` →
+            /// `java.nio.ReadOnlyBufferException`. The sibling
+            /// `ByteBuffer.compact()` registration in this file has had this
+            /// guard since F5; the typed views never did.
             fn $compact(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
                 let this = obj_arg(args, 0)?;
+                if s2_bb_is_read_only(ctx, this) {
+                    return Err(RuntimeError::ReadOnlyBufferException.into());
+                }
                 let pos = s2_bb_pos(ctx, this);
                 let lim = s2_bb_limit(ctx, this);
                 let cap = s2_bb_cap(ctx, this);
@@ -6712,8 +7023,26 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
                 ctx.set_field(this, BB_POS, Value::Int(pos + len));
                 Ok(Some(Value::Object(Some(this))))
             }
+            /// `put(T[], off, len)` — see `$put`.
+            ///
+            /// **This is the one write path of the four that is NOT shadowed**,
+            /// and therefore the one whose repair is reachable today.
+            /// `register_io_natives` runs after `register_essential_natives_
+            /// with_shims` in every `vm_init` arm (VERIFIED: real-JDK L2252 >
+            /// L2055 and L2834 > L2639; synthetic L1935 > L1934, since
+            /// `register_builtins` reaches essentials through
+            /// `register_essential_natives`), and `native-io` re-registers
+            /// `put(X)` / `put(I X)` / `compact()` for all five classes — but
+            /// NOT the bulk `put([XII)`. So `$put`/`$put_abs`/`$compact` above
+            /// are corrected-but-shadowed and this one is corrected-and-live.
+            /// The three are landed anyway: a family half-fixed is the
+            /// inconsistency, and `native-io`'s registrations are what a future
+            /// reordering would remove.
             fn $put_bulk(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
                 let this = obj_arg(args, 0)?;
+                if s2_bb_is_read_only(ctx, this) {
+                    return Err(RuntimeError::ReadOnlyBufferException.into());
+                }
                 let src = obj_arg(args, 1)?;
                 let off = args.get(2).and_then(|v| v.as_int()).unwrap_or(0);
                 let len = args.get(3).and_then(|v| v.as_int()).unwrap_or(0);
@@ -8288,6 +8617,29 @@ mod tests {
             "a typed buffer view's backing array lives at slot 5 and must \
              still resolve"
         );
+    }
+
+    /// F14-1 N3. The test above matches the UOE variant with `{ .. }`, which is
+    /// precisely why a wrong detail message survived: the CLASS was right, so
+    /// no `catch`, no class-name assertion and no variant-shaped `matches!`
+    /// could see it. This one reads the message.
+    ///
+    /// MEASURED, jdk-25.0.3+9: `ByteBuffer.allocateDirect(8).array()` and
+    /// `.arrayOffset()` both report `getMessage() == null`, as does
+    /// `new UnsupportedOperationException()`.
+    #[test]
+    fn s2_bb_no_backing_array_has_a_null_detail_message() {
+        match s2_bb_no_backing_array() {
+            MethodCallFailed::InternalError(cratonvm_types::error::VmError::Runtime(
+                RuntimeError::UnsupportedOperationException { message },
+            )) => assert!(
+                message.is_empty(),
+                "the EMPTY string is what types/src/error.rs maps to the ()V ctor, i.e. a \
+                 null getMessage(). The old \"direct buffer has no backing array\" gave \
+                 getMessage() a value HotSpot does not have. Got {message:?}"
+            ),
+            other => panic!("must be UnsupportedOperationException, got {other:?}"),
+        }
     }
 
     #[test]

@@ -256,7 +256,20 @@ pub(crate) fn alloc_char_buffer(ctx: &mut dyn NativeContext, chars: &[u16]) -> R
     // ByteBuffer default order is BIG_ENDIAN (`bigEndian=true`); a 0 default
     // would make multi-byte views little-endian. Harmless for byte get/array
     // but kept correct for `asCharBuffer`/`getInt` consumers.
-    ctx.set_field_by_name(obj, "bigEndian", Value::Int(1));
+    //
+    // CONVERGED (F37-1 §4, landing F26-1's N2 and closing the third of W7-76
+    // §8.2's five sites). This site wrote `bigEndian` and **not**
+    // `nativeByteOrder` — the drift §8.2 predicted, and it was already here
+    // before anyone looked. `java.nio.CharBuffer`'s field initialisers are
+    // `bigEndian = true` and `nativeByteOrder = (ByteOrder.nativeOrder() ==
+    // BIG_ENDIAN)`; javac compiles BOTH into every constructor and this
+    // allocator runs no constructor, so the missing one stayed at the Java
+    // default `false`. That is the same value a little-endian host wants, so
+    // the omission was inert HERE and would stop being inert the moment a
+    // reader consults `nativeByteOrder` (as `ByteBuffer`'s bulk paths do) or a
+    // big-endian target appears. Closed by construction rather than by a fourth
+    // literal: one helper, one pair of writes, no site that can drift again.
+    cratonvm_native_io::seed_buffer_byte_order(ctx, obj);
     Ok(obj)
 }
 
