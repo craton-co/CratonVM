@@ -263,8 +263,19 @@ distinct phase so the collector is *correct and selectable* before it is *fast*,
 
 **Sequencing caveat (hard):** parallel evacuation must NOT land — even gated — on a base with an
 open moving-GC memory-safety bug. The single-threaded evacuator must first be proven memory-safe
-across the gauntlet; the **gpu-bench-cpu G1 SIGSEGV** (Step 8 finding, `task_b53503fd`) is the
-current blocker.
+across the gauntlet; the **gpu-bench-cpu G1 SIGSEGV** (Step 8 finding, `task_b53503fd`) was named
+here as the current blocker.
+
+**Status of that blocker, 2026-08-13 — NOT reproduced, and NOT confirmed fixed.** Two things are
+now true and neither is "it is gone". First, the internal record tree's `gaps/README.md` records `gpu-bench-cpu`
+as PASS/PASS in three separate suite runs, which is inconsistent with the line above being current.
+Second, an attempt to reproduce it directly failed for a different reason: `GpuDotBench` under
+`-XX:+UseG1GC -Xmx512m` panics in `jit_thread_mut: aliasing &mut JvmThread borrow detected`
+(`vm/src/jit/helpers.rs`) — and it panics identically under the DEFAULT generational collector, so
+whatever that is, it is not a moving-GC memory-safety bug and not this blocker. The class the
+finding names, `CpuOnlyBench`, does not exist in the tree, so the original harness could not be
+re-run. Re-establishing this blocker's status needs that harness; until then it should not be cited
+as gating anything, and the JIT aliasing panic is its own defect.
 
 **Foundation already landed (Step 9, behaviour-identical):** `evacuate_object` now returns
 `(new_ptr, fresh)`, where `fresh` is the dedup signal — `true` iff this call performed the copy.
