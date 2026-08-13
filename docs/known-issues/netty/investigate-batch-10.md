@@ -2,7 +2,7 @@
 
 **TRIAGED 2026-08-12, filed not fixed.** All 15 classes measured against a stock
 HotSpot JDK 25 baseline; full record in
-[netty-tls-batch10-provider-routing-and-close-notify-FIXED-20260813.md](../../internal/fixed-suite-bugs/netty-tls-batch10-provider-routing-and-close-notify-FIXED-20260813.md) (FIXED 2026-08-13); the survivors are in [tls-batch10-residuals-20260813.md](tls-batch10-residuals-20260813.md).
+[netty-tls-batch10-provider-routing-and-close-notify-FIXED-20260813.md](../../internal/fixed-suite-bugs/netty-tls-batch10-provider-routing-and-close-notify-FIXED-20260813.md) (FIXED 2026-08-13); its residuals were then fixed too — R1-R5, R7, R8 — and recorded in [netty-tls-batch10-residuals-FIXED-20260813.md](../../internal/fixed-suite-bugs/netty-tls-batch10-residuals-FIXED-20260813.md) (FIXED 2026-08-13). Every class in this batch now matches or beats the HotSpot 25 oracle except `JdkSslEngineTest`, whose remaining engine-level gaps are in [jdksslenginetest-engine-level-gaps-20260813.md](jdksslenginetest-engine-level-gaps-20260813.md).
 This page is the largest so far — nine classes have real CratonVM gaps and they
 are **four independent causes**, not one, which is why it is filed rather than
 fixed in a single pass.

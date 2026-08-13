@@ -204,7 +204,7 @@ both are visible only under TLS 1.2:
 
 Eleven failures survive, all **different defects** that this triage surfaced
 rather than caused, plus `JdkSslEngineTest`. They are recorded in
-[`docs/known-issues/netty/tls-batch10-residuals-20260813.md`](../../known-issues/netty/tls-batch10-residuals-20260813.md):
+[`netty-tls-batch10-residuals-FIXED-20260813.md`](netty-tls-batch10-residuals-FIXED-20260813.md) (all fixed 2026-08-13, except `JdkSslEngineTest`'s engine-level gaps — [`jdksslenginetest-engine-level-gaps-20260813.md`](../../known-issues/netty/jdksslenginetest-engine-level-gaps-20260813.md)):
 `TrustManagerFactorySpi` dispatch resolving against `KeyStore`, PBES2
 `AlgorithmParameters` decoding, a caller-supplied `SecureRandom` being ignored,
 combined cert+key PEM files, a `TrustManager` that throws an `Error`, and
