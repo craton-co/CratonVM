@@ -16082,6 +16082,9 @@ fn try_compile_inner(
                 let call_eligible = scan.anewarray_ops.is_empty();
                 if call_eligible {
                     let mut info_map = std::collections::HashMap::new();
+                    // See `builder.set_object_init_pcs` below.
+                    let mut object_init_pcs: std::collections::HashSet<usize> =
+                        std::collections::HashSet::new();
                     let mut all_emittable = true;
                     // cov-04 census: which site, and which of the five
                     // conditions below, turned `all_emittable` off. Only built
@@ -16511,6 +16514,20 @@ fn try_compile_inner(
                         let info_ptr = &*info as *const JitInvokeInfo as usize;
                         ir_call_infos.push(info);
                         info_map.insert(pc, (info_ptr, num_args, ret));
+                        // Read off the names this iteration already resolved,
+                        // via the boxed `JitInvokeInfo` (the `cn`/`mn`/`desc`
+                        // locals were moved into it above).
+                        if is_special {
+                            // SAFETY: `info_ptr` addresses the box just pushed
+                            // into `ir_call_infos`, which outlives this loop.
+                            let this_info = unsafe { &*(info_ptr as *const JitInvokeInfo) };
+                            if this_info.class_name == "java/lang/Object"
+                                && this_info.method_name == "<init>"
+                                && this_info.descriptor == "()V"
+                            {
+                                object_init_pcs.insert(pc);
+                            }
+                        }
                     }
                     if all_emittable && !info_map.is_empty() {
                         if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_IR_CALL").is_some() {
@@ -16524,6 +16541,16 @@ fn try_compile_inner(
                             );
                         }
                         builder.set_invoke_info(info_map);
+                        // The terminal `super()` of every constructor chain.
+                        // Collected from the SAME resolved names this loop
+                        // already built `invoke_info` from, so it cannot
+                        // disagree with what would otherwise be dispatched.
+                        // Eliding it is the single-pass backend's long-standing
+                        // rule (`x64::bytecode_walk`'s 0xb7 arm); the IR tier
+                        // had no equivalent, so a compiled constructor paid a
+                        // `jit_invoke_dispatch` round trip per allocation for a
+                        // method whose body is `return`.
+                        builder.set_object_init_pcs(object_init_pcs);
                     } else {
                         // A non-emittable invoke is present → leave `invoke_info`
                         // unset (the builder bails on every invoke → single-pass)
