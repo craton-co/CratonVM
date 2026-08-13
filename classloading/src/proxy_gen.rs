@@ -7,13 +7,28 @@
 //! # v1 design
 //!
 //! Each generated class:
-//! 1. Extends `java/lang/reflect/Proxy$Instance` (the synthetic super
-//!    introduced before WP2.5-A — it owns the `handler`, `interfaces`, and
-//!    `hashSeed` fields, plus the `<init>(InvocationHandler, Class[])`
-//!    constructor that populates them). The interpreter's existing
-//!    cast/dispatch hooks generalise via "is the receiver an instance of
-//!    (a subclass of) Proxy$Instance?" so we don't need to register a
-//!    per-class hook.
+//! 1. Extends whatever `native_builtins::reflect_annotations::
+//!    proxy_super_class_name()` returns, which the caller writes into
+//!    [`ProxyClassSpec::super_class`]. **By default that is the real
+//!    `java/lang/reflect/Proxy`, not `Proxy$Instance`** —
+//!    `CRATONVM_REAL_PROXY_SUPER` is `truthy_word_default_true`. The
+//!    synthetic `java/lang/reflect/Proxy$Instance` (which owns the
+//!    `handler`, `interfaces` and `hashSeed` fields plus the
+//!    `<init>(InvocationHandler, Class[])` constructor that populates them)
+//!    is the *opt-out* super, and is also what the
+//!    `ProxyClassOutcome::Degrade`/`Failed` fallbacks allocate.
+//!
+//!    Corrected 2026-08-13 (lane F32). This item used to say the super was
+//!    always `Proxy$Instance` and that "the interpreter's existing
+//!    cast/dispatch hooks generalise via *is the receiver an instance of (a
+//!    subclass of) Proxy$Instance?*". That sentence is the premise the
+//!    interpreter's vtable fast path was written against, and it stopped
+//!    being true when the real-super gate landed default-on: the inlined
+//!    chain walk at `vm/src/runtime/interpreter/dispatch_virtual.rs:478`
+//!    still matches `Proxy$Instance` alone, so it recognises no shipped
+//!    proxy. `typecheck.rs`'s `class_name_is_proxy_super` is the predicate
+//!    that asks the question correctly; see
+//!    `docs/known-issues/jdk-only/F32-1-the-proxy-route-and-the-drifted-twin-20260813.md`.
 //! 2. Declares the iface set in `interfaces[]`.
 //! 3. Emits one method body per declared interface method (abstract or
 //!    default). The body boxes args and routes through
@@ -164,7 +179,13 @@ use cratonvm_types::error::ClassFileError;
 pub struct ProxyClassSpec {
     /// Internal name, e.g. `"java/lang/reflect/$Proxy0"`.
     pub gen_class_name: String,
-    /// Internal name of super class, normally `"java/lang/reflect/Proxy$Instance"`.
+    /// Internal name of super class. **By default this is the real
+    /// `"java/lang/reflect/Proxy"`**, written by
+    /// `native_builtins::build_proxy_spec_for` from `proxy_super_class_name()`;
+    /// `"java/lang/reflect/Proxy$Instance"` is the `CRATONVM_REAL_PROXY_SUPER=0`
+    /// opt-out. This string is what every "is the receiver a proxy?" name test
+    /// in the interpreter has to agree with — see
+    /// `vm/src/runtime/interpreter/typecheck.rs::class_name_is_proxy_super`.
     pub super_class: String,
     /// Internal names of interfaces this proxy implements.
     pub interfaces: Vec<String>,
@@ -244,8 +265,126 @@ fn invalid_proxy_classfile(class_name: &str, message: impl Into<String>) -> Clas
     }
 }
 
+// ---------------------------------------------------------------------------
+// Emission census — so a silent degrade stops being silent
+// ---------------------------------------------------------------------------
+
+/// Generated classfiles emitted successfully, split by the super the spec
+/// asked for. The split is the point: `real_proxy_super()` decides which
+/// name a generated `$ProxyN` carries on its chain, and every "is this a
+/// proxy?" predicate in the VM is a name test against one or both of those
+/// names. An instrument that sees `real=N, synthetic=0` and a proxy-guard
+/// counter of 0 has the whole diagnosis in two numbers.
+static PROXY_EMIT_OK_REAL_SUPER: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+static PROXY_EMIT_OK_SYNTHETIC_SUPER: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+/// Emission failures — the classifier's `Failed("emit")` arm, which in the
+/// default (non-strict) configuration degrades to a different boxing
+/// implementation with no exception and no log.
+static PROXY_EMIT_FAILED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// `(ok_real_super, ok_synthetic_super, failed)` since process start.
+///
+/// A reader exists deliberately. A `pub static` counter with a `fetch_add`
+/// and no reader is a write-only counter — the shape that hid
+/// `PAR_SWEEP_ACCEPTS` — so this pair ships together and the accessor is
+/// what a `--jdk-only-report` row or a test would call.
+pub fn proxy_emit_counts() -> (u64, u64, u64) {
+    use std::sync::atomic::Ordering::Acquire;
+    (
+        PROXY_EMIT_OK_REAL_SUPER.load(Acquire),
+        PROXY_EMIT_OK_SYNTHETIC_SUPER.load(Acquire),
+        PROXY_EMIT_FAILED.load(Acquire),
+    )
+}
+
+/// Which census bucket an emitted class belongs to.
+///
+/// Classified from the super the spec actually names, **not** by re-reading
+/// `real_proxy_super()`: this crate cannot see `native-builtins`' flags, and
+/// the spec is in any case the authority on what was emitted — the
+/// `Degrade`/`Failed` fallbacks allocate the synthetic shim regardless of
+/// what the gate says, so a flag read would mislabel exactly the rows that
+/// matter. Split out as a pure fn so it can be tested without touching the
+/// process-global counters (which several other tests in this module bump).
+fn emitted_super_is_the_synthetic_shim(super_class: &str) -> bool {
+    super_class == "java/lang/reflect/Proxy$Instance"
+}
+
 /// Emit a JVM classfile for the given proxy spec.
+///
+/// # Why this wrapper exists
+///
+/// `native_builtins::define_or_get_proxy_class` classifies a failure here as
+/// `ProxyClassOutcome::Failed("emit")`, and its caller
+/// (`native_proxy_new_instance`) then checks `real_proxy_strict()` — which is
+/// `affirmative_word(src, "CRATONVM_REAL_PROXY_STRICT")`, i.e. **OFF by
+/// default**. In the shipping configuration an emission failure therefore
+/// allocates the synthetic `Proxy$Instance` shim instead and returns a
+/// perfectly ordinary-looking proxy. Nothing throws, nothing is logged
+/// (`define_or_get_proxy_class`'s `FALLBACK(emit)` line is behind
+/// `CRATONVM_DBG_PROXY`, which is off), and the two implementations do not
+/// agree: the emitted bytecode boxes arguments with real `X.valueOf`
+/// invokestatic (canonical, measured `true` on HotSpot for all of
+/// `proxy.int/char/bool/boolTRUE/long/byte/short`), while the shim's
+/// `vm_exec::proxy_box_value_for_desc` allocates fresh wrappers for five of
+/// its seven arms. A capability that quietly degrades to a *different answer*
+/// is the shape that hides defects.
+///
+/// So the failure is made loud **unconditionally** — it is not a debug event,
+/// it is a capability loss — and both outcomes are counted so an instrument
+/// can see the degrade without reading stderr. The log costs nothing on a
+/// healthy run because the branch is only taken on a genuine `Err`, which
+/// `emit_proxy_classfile_inner` produces only for a malformed descriptor or a
+/// constant-pool/local-slot overflow.
+///
+/// **Not done here, and deliberately:** the default is NOT flipped to strict.
+/// See `docs/known-issues/jdk-only/F32-1-the-proxy-route-and-the-drifted-twin-20260813.md`
+/// §5 for what flipping it would break — briefly, `Failed("spec")` and
+/// `Failed("define")` are reachable for reasons that are not the caller's
+/// fault (an interface ClassId that will not resolve to a name; a duplicate
+/// define; a non-public interface forcing a prohibited package), and under
+/// strict mode each becomes an `IllegalArgumentException` out of
+/// `Proxy.newProxyInstance` where the app previously got a working proxy.
+/// That is a behaviour change, and it needs the proxy soak, not this lane.
 pub fn emit_proxy_classfile(spec: &ProxyClassSpec) -> Result<Vec<u8>, ClassFileError> {
+    use std::sync::atomic::Ordering::AcqRel;
+    match emit_proxy_classfile_inner(spec) {
+        Ok(bytes) => {
+            if emitted_super_is_the_synthetic_shim(&spec.super_class) {
+                PROXY_EMIT_OK_SYNTHETIC_SUPER.fetch_add(1, AcqRel);
+            } else {
+                PROXY_EMIT_OK_REAL_SUPER.fetch_add(1, AcqRel);
+            }
+            Ok(bytes)
+        }
+        Err(e) => {
+            let n = PROXY_EMIT_FAILED.fetch_add(1, AcqRel) + 1;
+            eprintln!(
+                "[cratonvm] PROXY GENERATION FAILED (emit) for {} extends {} \
+                 with {} interface(s), {} method(s): {:?} — this is failure #{} \
+                 this process. CRATONVM_REAL_PROXY_STRICT is off by default, so \
+                 the caller will SILENTLY fall back to the synthetic \
+                 java/lang/reflect/Proxy$Instance shim, whose argument boxing is \
+                 a different implementation (fresh wrappers where the generated \
+                 bytecode uses the canonical X.valueOf). Re-run with \
+                 CRATONVM_REAL_PROXY_STRICT=1 to make this throw \
+                 IllegalArgumentException as the JDK does, or CRATONVM_DBG_PROXY=1 \
+                 for the other two failure stages.",
+                spec.gen_class_name,
+                spec.super_class,
+                spec.interfaces.len(),
+                spec.methods.len(),
+                e,
+                n
+            );
+            Err(e)
+        }
+    }
+}
+
+fn emit_proxy_classfile_inner(spec: &ProxyClassSpec) -> Result<Vec<u8>, ClassFileError> {
     // ── Structural de-duplication (JVMS §4.1 / §4.6) ─────────────────────
     //
     // Two classfile invariants the emitter is responsible for, because a
@@ -2070,6 +2209,61 @@ mod tests {
         assert!(descriptor_param_slots("(Ljava/lang/String)V").is_err());
         assert!(descriptor_return("()Q").is_err());
         assert!(descriptor_return("()Ljava/lang/String").is_err());
+    }
+
+    /// The emission census must be able to see a degrade.
+    ///
+    /// Two properties, split so neither depends on the other and neither is
+    /// flaky under `cargo test`'s parallel threads: the counters are
+    /// monotonic and reachable (a `fetch_add` with no reader is a write-only
+    /// counter, which is the shape this instrument exists to avoid), and the
+    /// real/synthetic classification is a pure function of the spec.
+    ///
+    /// `>=` rather than `==` is deliberate and is what makes this sound:
+    /// several sibling tests in this module also call `emit_proxy_classfile`,
+    /// the counters are process-global, and they never decrease — so "our own
+    /// call added at least one" is true regardless of what else ran.
+    #[test]
+    fn the_emission_census_counts_both_outcomes_and_can_be_read() {
+        let (ok_real_0, ok_syn_0, failed_0) = super::proxy_emit_counts();
+
+        // A successful emission is counted.
+        let good = supplier_spec();
+        emit_proxy_classfile(&good).expect("the canonical spec must emit");
+        let (ok_real_1, ok_syn_1, _) = super::proxy_emit_counts();
+        assert!(
+            (ok_real_1 + ok_syn_1) >= (ok_real_0 + ok_syn_0) + 1,
+            "a successful emit must bump an ok bucket: before=({ok_real_0},{ok_syn_0}) \
+             after=({ok_real_1},{ok_syn_1})"
+        );
+
+        // A failure is counted TOO — the whole point. Without this the
+        // instrument reports a healthy `ok` count while every proxy in the
+        // process is silently the shim.
+        let mut bad = supplier_spec();
+        // A bad RETURN byte rather than a bad parameter: it fails in
+        // `descriptor_return` with the spec's `param_class_names` still
+        // consistent (both empty), so the test exercises the error PATH and
+        // not some downstream length mismatch.
+        bad.methods[0].descriptor = "()Q".to_string();
+        emit_proxy_classfile(&bad).expect_err("a malformed descriptor must fail to emit");
+        let (_, _, failed_1) = super::proxy_emit_counts();
+        assert!(
+            failed_1 >= failed_0 + 1,
+            "a failed emit must bump the failure counter: before={failed_0} after={failed_1}"
+        );
+
+        // Classification, tested purely so no global count is involved.
+        assert!(super::emitted_super_is_the_synthetic_shim(
+            "java/lang/reflect/Proxy$Instance"
+        ));
+        assert!(
+            !super::emitted_super_is_the_synthetic_shim("java/lang/reflect/Proxy"),
+            "the REAL base class is the default super — bucketing it as the \
+             synthetic shim would make the census report a degrade on every \
+             healthy proxy, which is worse than not counting at all"
+        );
+        assert!(!super::emitted_super_is_the_synthetic_shim("jdk/proxy1/$Proxy0"));
     }
 
     #[test]

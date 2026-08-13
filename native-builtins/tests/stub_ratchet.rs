@@ -326,6 +326,15 @@ use cratonvm_types::compat::CompatibilityMode;
 /// `SyntheticStub` on the way back in. The other 49 restored rows are `Bridge`
 /// and show up on L6's ratchet instead.
 ///
+/// (This paragraph is PROSE, not an assertion — F17-1 read it as a pin blocking
+/// the `AccessController$1` deletion, and F24-1 corrected that. It is history
+/// and stays as written. For the record: two of the sixteen,
+/// `AccessController$1.doIntersectionPrivilege` and `.getProtectDomains`, were
+/// deleted outright on 2026-08-13 — JEP 486 removed the interface, the
+/// implementation class and the accessor, so the restore was correct at the time
+/// and the rows had nothing left to stand in front of. See cause (d) on
+/// [`BASELINE_SYNTHETIC_STUBS_MANAGEMENT`].)
+///
 /// What the census could not see, in three shapes:
 ///
 ///  * **A stand-in for a bytecode method is `method-nowhere` by construction.**
@@ -487,9 +496,35 @@ use cratonvm_types::compat::CompatibilityMode;
 ///    `bridge_shadows_bytecode` and the kind map — which must be re-frozen in
 ///    ONE commit from ONE Linux census. Do not re-freeze this constant "for"
 ///    the retirement before the retirement exists.
+///  * **(d) F33-1, 2026-08-13: net +2, both halves attributed.** Two changes in
+///    `native-builtins/src/shared_secrets_bridge.rs`, in opposite directions:
 ///
-/// Anything the run reports beyond (a) is a finding to attribute, not slack to
-/// absorb: 182 commits separate the freeze from HEAD.
+///    **+4.** The four `SharedSecrets` accessors whose owner is a
+///    `cratonvm/internal/ss/…$1` stand-in (`javaUtilJarAccess`,
+///    `getJavaNetUriAccess`, `getJavaNetHttpCookieAccess`,
+///    `getJavaIORandomAccessFileAccess`) move `Bridge` → `SyntheticStub` on
+///    `jdk/internal/access/SharedSecrets`, so `--jdk-only` refuses a factory
+///    whose owner it already dropped. Their `jdk/internal/misc/SharedSecrets`
+///    twins move by **zero** — that class is in `NO_IMAGE_JDK_RECEIVERS`, so
+///    `register()` was already re-tagging them. This is the (a) direction: a
+///    fake being *labelled*, not a fake being added.
+///
+///    **−2.** `register_java_security_access` is deleted, taking
+///    `java/security/AccessController$1.doIntersectionPrivilege` and
+///    `.getProtectDomains` out of the population. Those are two of the sixteen
+///    the 923 → 939 note above restored, so that paragraph's arithmetic is now
+///    fourteen; it is left as written because it is history, and rewriting a
+///    recount narrative to match a later tree is how a ratchet's provenance
+///    stops being checkable.
+///
+///    Derived, NOT measured — this lane may not run `cargo`. So **+2 is a
+///    prediction to check against the printed line, not a number to paste**, and
+///    it composes with the +6/+8 of (a) rather than replacing it. Predicted
+///    totals: no-management 1261 + 2 = **1263**, management 1271 + 2 = **1273**.
+///    F33-1-a-factory-and-its-owner-must-share-one-kind-20260813.md
+///
+/// Anything the run reports beyond (a) and (d) is a finding to attribute, not
+/// slack to absorb: 182 commits separate the freeze from HEAD.
 const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 1263;
 
 /// The default `-p cratonvm-native-builtins` resolve: ten `jmx::*` registrars
@@ -1161,5 +1196,142 @@ fn strict_mode_refuses_nothing() {
          Zero refusals is the real end state: it means the stubs were reclassified \
          or deleted at the source, not merely filtered out of the table on the way \
          in. See this test's doc comment for the three steps that must land first."
+    );
+}
+
+/// F24-1 found it, F33-1 fixed it (both 2026-08-13) — **no `SharedSecrets`
+/// factory may outlive the owner `--jdk-only` drops out from under it.**
+///
+/// `register_wp1_4_shared_secrets` sets one ambient kind, `Bridge`, for the
+/// whole registrar (`shared_secrets_bridge.rs`). `NativeMethodRegistry::register`
+/// then re-tags by RECEIVER CLASS, via
+/// `no_image_receiver::receiver_declared_by_no_supported_image` — and the
+/// receiver of a *factory* registration is `SharedSecrets`, not the object the
+/// factory hands out. Those two facts split one registrar down the middle:
+///
+///  * the factories go on `jdk/internal/access/SharedSecrets`, a real JDK class
+///    on no table, so they stayed `Bridge` and **survived `--jdk-only`**;
+///  * the four `cratonvm/internal/ss/…$1` owners are in
+///    `VM_MINTED_STAND_IN_RECEIVERS`, so every method on them is re-tagged
+///    `SyntheticStub` and **is dropped in `--jdk-only`**.
+///
+/// So strict mode kept four natives shadowing real JDK bytecode getters that
+/// handed back a carrier with no implementation on it — and silently, because
+/// `alloc_singleton`'s `Err` arm returns a `ClassId(0)` object rather than
+/// failing. `register_factories` now derives the factory's kind from the OWNER,
+/// so the two halves refuse or survive together.
+///
+/// # What this test pins, and why it is not the unit test
+///
+/// `factory_kind_follows_the_owner_it_hands_out` (in `shared_secrets_bridge.rs`)
+/// checks the same rule against a hand-built registry. This one checks it
+/// against the **boot registry in `CompatibilityMode::JdkOnly`** — the table an
+/// operator's `--jdk-only` run actually holds — so it also covers the ways a row
+/// can come back that a unit test cannot see: a second registrar re-registering
+/// the same triple under a `Bridge` scope (the shape
+/// `no_fake_survives_strict_mode_as_someone_elses_bridge` exists for), or a
+/// `set_compatibility_mode` ordering change. The rule is stated in two places on
+/// purpose, at two scopes; that is not duplication.
+///
+/// The premise is asserted rather than assumed, because this ratchet has had a
+/// scope hole twice: `register_wp1_4_shared_secrets` reaches
+/// [`register_boot_path`] only *transitively*, through
+/// `register_essential_natives_with_shims` (`native-builtins/src/lib.rs:10063`).
+/// A grep of the boot-path replay for `shared_secrets` finds nothing, so the day
+/// that indirection changes, every assertion below would pass on an empty set.
+///
+/// **What replaced what, and why the old shape had to go.** F24-1 froze the
+/// ORPHAN SET — the owners strict mode leaves with no registered method — at
+/// these four, so that growth reddened it and a fix reddened it too. That was
+/// right for a defect nobody could yet fix, and it is wrong now for a reason
+/// worth writing down: **the fix does not change the orphan set.** Refusing the
+/// four factories leaves those four owners exactly as method-less in strict mode
+/// as they were, so the old assertion stays GREEN across the repair and pins
+/// nothing about it. What actually changed is the PAIRING, so the pairing is
+/// what this asserts.
+#[test]
+fn no_shared_secrets_factory_outlives_the_owner_strict_mode_drops() {
+    use std::collections::BTreeSet;
+
+    let rows = strict_rows();
+    let live_classes: BTreeSet<&str> = rows.iter().map(|(c, _, _, _)| c.as_str()).collect();
+
+    assert!(
+        live_classes.contains("jdk/internal/access/SharedSecrets"),
+        "the SharedSecrets factories are not in this ratchet's scope any more, so \
+         this test — and the SyntheticStub count — just went blind to ~250 \
+         registrations. Re-check `register_essential_natives_with_shims`."
+    );
+
+    let owners: Vec<&'static str> =
+        cratonvm_native_builtins::shared_secrets_bridge::owner_classes().collect();
+    assert!(
+        !owners.is_empty(),
+        "owner_classes() is empty; the projection this test reads is gone"
+    );
+
+    // Which factory methods `--jdk-only` still serves, whatever their kind.
+    let live_factories: BTreeSet<&str> = rows
+        .iter()
+        .filter(|(c, _, _, _)| c.as_str() == "jdk/internal/access/SharedSecrets")
+        .map(|(_, m, _, _)| m.as_str())
+        .collect();
+
+    let mut mismatched: Vec<String> = Vec::new();
+    let mut refused_factories: Vec<&'static str> = Vec::new();
+    for (method, owner) in
+        cratonvm_native_builtins::shared_secrets_bridge::factory_methods_and_owners()
+    {
+        let factory_lives = live_factories.contains(method);
+        let owner_lives = live_classes.contains(owner);
+        if factory_lives != owner_lives {
+            mismatched.push(format!(
+                "SharedSecrets.{method}() {} but its owner `{owner}` {}",
+                if factory_lives {
+                    "SURVIVES"
+                } else {
+                    "is refused"
+                },
+                if owner_lives {
+                    "keeps its methods"
+                } else {
+                    "has every method dropped"
+                },
+            ));
+        }
+        if !factory_lives {
+            refused_factories.push(method);
+        }
+    }
+
+    assert!(
+        mismatched.is_empty(),
+        "{} SharedSecrets factory/owner pair(s) disagree about `--jdk-only`. A \
+         surviving factory over a dropped owner shadows the real JDK getter and \
+         returns a carrier with no methods — `alloc_singleton`'s `Err` arm makes \
+         that a WRONG-CLASS RECEIVER, not an error, so nothing reports it. A \
+         refused factory over a live owner removes a working bridge for nothing. \
+         Fix the kind derivation in `register_factories`; do not relax this. See \
+         docs/known-issues/jdk-only/F33-1-a-factory-and-its-owner-must-share-one-kind-20260813.md\n  {}",
+        mismatched.len(),
+        mismatched.join("\n  "),
+    );
+
+    refused_factories.sort_unstable();
+    assert_eq!(
+        refused_factories,
+        [
+            "getJavaIORandomAccessFileAccess",
+            "getJavaNetHttpCookieAccess",
+            "getJavaNetUriAccess",
+            "javaUtilJarAccess",
+        ],
+        "the set of SharedSecrets accessors `--jdk-only` refuses has changed. \
+         GROWTH means a new fabricated owner, or a real owner newly added to \
+         `NO_IMAGE_JDK_RECEIVERS`; the assertion above already forced its factory \
+         to follow, so this line is where you say you meant it. SHRINKAGE means a \
+         carrier was retargeted onto the JDK's own implementation class — a real \
+         fix — and this list shrinks with it. Note `javaUtilJarAccess` has no \
+         `get` prefix; that is the JDK's spelling (F24-1), not a typo."
     );
 }

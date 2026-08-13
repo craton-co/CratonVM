@@ -127,6 +127,55 @@
 /// They are kept here rather than left implicit: they are the precedent this
 /// table generalises, and a list that silently omitted the two rows everybody
 /// agrees about would be harder to check, not easier.
+///
+/// # F24-1 (2026-08-13): re-measured on one image, and one candidate NOT added
+///
+/// All 49 entries were re-checked with `javap -p <name>` on Microsoft
+/// **25.0.3+9-LTS**, windows/x64: **zero** are declared. That is one of the six
+/// images, so it can only corroborate, never complete, the claim — but it is
+/// the direction that matters, because a *positive* hit is what demotes a real
+/// bridge (the 2026-07-14 `java.util.Properties` shape) and there were none.
+/// The sweep was run with positive controls (`sun.management.VMManagementImpl`,
+/// `com.sun.jmx.mbeanserver.MXBeanMapping`, `jdk.internal.ref.CleanerFactory`,
+/// `sun.nio.ch.FileDispatcherImpl`, …) so that "javap cannot see the module" is
+/// distinguishable from "the class is absent" — without them a sweep of this
+/// shape reports its own reach.
+///
+/// **`java/security/AccessController$1` STAYS, and as of 2026-08-13 it is
+/// INERT — which is the end state, not a leftover.** The history is worth one
+/// paragraph because the entry looks deletable and is not:
+///
+///  * F17-1 deleted the `getJavaSecurityAccess` factory (JEP 486 removed
+///    `jdk.internal.access.JavaSecurityAccess` outright) but kept
+///    `register_java_security_access`'s two registrations on this class. This
+///    entry was then **the only thing tagging them `SyntheticStub`**, and
+///    deleting the line would have promoted two fabricated natives to `Bridge`
+///    and admitted them to `--jdk-only` — the exact inversion of the intent.
+///  * F33-1 deleted those registrations (`native-builtins/src/shared_secrets_bridge.rs`,
+///    see the `// JavaSecurityAccess — DELETED` note there). **Only then** did
+///    this row become inert, and the ORDER was the whole difficulty: the row had
+///    to outlive the registrations, not the other way round.
+///
+/// It is kept because the image fact is TRUE and independently re-measured —
+/// `javap -p 'java.security.AccessController$1'` → `class not found` on
+/// Microsoft 25.0.3+9-LTS — so `scripts/jdk-only-no-image-receivers.py` should
+/// go on checking it. An entry whose registrations are gone costs one `&str` in
+/// a binary search and buys the next author the same protection F17-1's
+/// successor needed.
+///
+/// **`java/io/ObjectInputStream$1` is a candidate and is deliberately NOT added
+/// here.** It meets the rule on the one image measured — absent on 25.0.3, and
+/// `jdk25src/java.base/java/io/ObjectInputStream.java:4039` shows why
+/// (`SharedSecrets.setJavaObjectInputStreamAccess(ObjectInputStream::checkArray)`
+/// is a method reference, so the access object is an `invokedynamic` call site
+/// and there is no anonymous class) — and `register_java_object_input_stream_access`
+/// registers on it today, `Bridge`, surviving strict. But this table's threshold
+/// is **all six** images and no JDK 21 image or source is available on this
+/// host, so a one-image add would be the under-measurement the module docs warn
+/// about, in the direction that breaks things. Run
+/// `scripts/jdk-only-no-image-receivers.py` when a 21 image is at hand. The rows
+/// are inert meanwhile: the bridge registers no factory for this owner, and no
+/// bytecode can produce a receiver of a class that does not exist.
 pub const NO_IMAGE_JDK_RECEIVERS: &[&str] = &[
     "com/sun/jmx/mbeanserver/MappedMXBeanType",
     "com/sun/jmx/mbeanserver/OpenConverter",
@@ -193,6 +242,59 @@ pub const NO_IMAGE_JDK_RECEIVERS: &[&str] = &[
 /// `cratonvm/internal/UnmodifiableList` and friends, `cratonvm/internal/
 /// StreamCollector`, `cratonvm/synthetic/Process*` — which is the evidence
 /// that this is one family with one answer and not a new policy.
+///
+/// # A third way to land half a fix: re-tag the owner, leave its factory
+///
+/// F24-1 found it (2026-08-13); F33-1 fixed it the same day. Kept in full,
+/// because the *rule* at the end is the reusable part and the next
+/// `cratonvm/…` entry will need it.
+///
+/// [`VM_SERVICE_RECEIVERS`] warns about re-tagging without minting and minting
+/// without re-tagging. The four `cratonvm/internal/ss/…$1` entries below were a
+/// third shape: something else still handed out the receiver.
+///
+/// `shared_secrets_bridge.rs`'s `register_wp1_4_shared_secrets` sets one ambient
+/// `Bridge` for the whole registrar. `register` then re-tags by receiver class,
+/// and **the receiver of a factory registration is `SharedSecrets`, not the
+/// object the factory returns** — so the split fell inside that one registrar:
+///
+/// | registered on | in a table here? | kind | `--jdk-only` |
+/// |---|---|---|---|
+/// | `jdk/internal/access/SharedSecrets` (the factories) | no — real JDK class | `Bridge` | **survived** |
+/// | `cratonvm/internal/ss/JavaUtilJarAccess$1` (the methods) | yes, below | `SyntheticStub` | **dropped** |
+///
+/// So strict mode kept a native that shadows the real
+/// `SharedSecrets.javaUtilJarAccess()` bytecode and returned a carrier on which
+/// it had just dropped every method — and because `alloc_singleton`'s fallback
+/// is `ClassId(0)`, the symptom was a **wrong-class receiver, not an error**.
+/// Note `jdk/internal/misc/SharedSecrets` IS in [`NO_IMAGE_JDK_RECEIVERS`] and
+/// the `jdk/internal/access/` spelling is not, correctly — only the legacy alias
+/// is absent from the image — which is why the factory half was not caught here.
+///
+/// **THE RULE: adding a `cratonvm/…` stand-in to this table is not complete on
+/// its own.** Ask what mints the receiver and what returns it to Java, and give
+/// that the same kind. This table adjudicates a *class*; a factory is
+/// adjudicated by the class it RETURNS.
+///
+/// `register_factories` now applies that rule mechanically — it asks
+/// [`receiver_declared_by_no_supported_image`] about the owner rather than
+/// about `SharedSecrets`, so a factory and its owner are refused together or
+/// kept together, with no second list to drift. Adding a `cratonvm/internal/ss/`
+/// name here is therefore now sufficient *for that family*; it is still not
+/// sufficient in general, because no other minting site derives its kind this
+/// way. Pinned from the other side by
+/// `factory_kind_follows_the_owner_it_hands_out` and
+/// `every_fabricated_factory_owner_is_a_listed_stand_in` in
+/// `native-builtins/src/shared_secrets_bridge.rs`, and by
+/// `no_shared_secrets_factory_outlives_the_owner_strict_mode_drops` in
+/// `native-builtins/tests/stub_ratchet.rs`.
+///
+/// Records:
+/// `docs/known-issues/jdk-only/F24-1-sharedsecrets-spellings-and-the-list-that-checked-itself-20260813.md`
+/// (the finding) and
+/// `docs/known-issues/jdk-only/F33-1-a-factory-and-its-owner-must-share-one-kind-20260813.md`
+/// (the fix, and why "make the carriers work" was not the disposition: two of
+/// the four carry no method their interface declares, on any mode).
 pub const VM_MINTED_STAND_IN_RECEIVERS: &[&str] = &[
     "cratonvm/internal/ArrayListSubList",
     // `cratonvm/internal/LinkedListSnapshotListItr` was here until 2026-08-11.

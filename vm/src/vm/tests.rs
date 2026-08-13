@@ -31306,6 +31306,131 @@ use std::sync::Arc;
         }
     }
 
+    /// F31 — the three `(unscaled, scale)` roads that used to abort the VM,
+    /// end to end through the registered natives.
+    ///
+    /// These use the SYNTHETIC-stub layout (slot 0 = decimal `String`, slot 1 =
+    /// `scale`), which is what `bd_layout` falls back to when the real
+    /// `java.math.BigDecimal` is not loaded — the only layout reachable from
+    /// this module. That is enough for all three roads, because every guard
+    /// added by F31 sits between `bd_unscaled_bigint` and the arithmetic, and
+    /// `bd_unscaled_bigint` reads those two slots.
+    ///
+    /// MEASURED on `openjdk 25.0.3 2026-04-21 LTS (25.0.3+9-LTS)` (Microsoft
+    /// build), `scratchpad/f31/{Bd,Bd2}.java`:
+    ///
+    /// ```text
+    /// new BigDecimal(ONE, MIN).intValue()      = 0                        [0 ms]
+    /// new BigDecimal(ONE, MIN).longValue()     = 0                        [0 ms]
+    /// new BigDecimal(ONE, MIN).toBigInteger() !! ArithmeticException: Underflow   [0 ms]
+    /// new BigDecimal(ONE, MIN).add(new BigDecimal(ONE, MAX))
+    ///                                         !! ArithmeticException: Underflow   [0 ms]
+    /// ```
+    ///
+    /// What each row was before, in this VM: `intValue()` negated `i32::MIN`
+    /// (debug panic; release wrapped, took `bigint_mul_pow10`'s `n <= 0` arm
+    /// and answered **1**); `toBigInteger()` did the same and could not refuse
+    /// at all; `add` computed `i32::MAX - i32::MIN` in `i32`. A Rust panic is
+    /// not a Java throwable — it takes the VM down and no `catch` sees it.
+    #[test]
+    fn bigdecimal_extreme_scale_refusals_f31() {
+        let shared = Arc::new(SharedVm::new(VmConfig::default()));
+        let mut thread = JvmThread::new(ThreadId(0), "test");
+
+        // `new BigDecimal(BigInteger.ONE, Integer.MIN_VALUE)`.
+        let a = shared.mem.heap.alloc_object(ClassId::new(0), 3);
+        let one = create_java_string(&shared, "1");
+        shared.mem.heap.set_field(a, 0, Value::Object(Some(one)));
+        shared.mem.heap.set_field(a, 1, Value::Int(i32::MIN));
+        shared.mem.heap.set_field(a, 2, Value::Int(0));
+
+        // The two narrowing conversions must ANSWER, and answer 0 — the JDK
+        // fast-paths `scale <= -64` before it ever considers `10^scale`.
+        let iv = call_native(
+            &shared,
+            &mut thread,
+            "java/math/BigDecimal",
+            "intValue",
+            "()I",
+            &[Value::Object(Some(a))],
+        )
+        .expect("intValue must not refuse: HotSpot answers 0 in 0 ms")
+        .unwrap();
+        assert_eq!(
+            iv,
+            Value::Int(0),
+            "new BigDecimal(ONE, Integer.MIN_VALUE).intValue() is 0 on HotSpot; \
+             a guard on the shared truncation helper would refuse here, and the \
+             pre-F31 body answered 1"
+        );
+        let lv = call_native(
+            &shared,
+            &mut thread,
+            "java/math/BigDecimal",
+            "longValue",
+            "()J",
+            &[Value::Object(Some(a))],
+        )
+        .expect("longValue must not refuse: HotSpot answers 0 in 0 ms")
+        .unwrap();
+        assert_eq!(lv, Value::Long(0));
+
+        // `toBigInteger()` is `setScale(0, DOWN)` and DOES refuse the same
+        // receiver — with the clamping `checkScale`'s word, "Underflow".
+        let tbi = call_native(
+            &shared,
+            &mut thread,
+            "java/math/BigDecimal",
+            "toBigInteger",
+            "()Ljava/math/BigInteger;",
+            &[Value::Object(Some(a))],
+        )
+        .expect_err("toBigInteger must refuse where HotSpot refuses");
+        assert!(
+            matches!(
+                &tbi,
+                crate::error::MethodCallFailed::InternalError(
+                    cratonvm_types::error::VmError::Runtime(
+                        cratonvm_types::error::RuntimeError::ArithmeticException { message }
+                    )
+                ) if message.as_str() == "Underflow"
+            ),
+            "toBigInteger() at scale Integer.MIN_VALUE is \
+             ArithmeticException(\"Underflow\") — the CLAMPING instance \
+             checkScale, not toPlainString's casting checkScaleNonZero, which \
+             says \"Overflow\" for the same scale. Got {tbi:?}"
+        );
+
+        // `add` aligns to `max(sa, sb)`; that difference does not fit an `i32`.
+        let b = shared.mem.heap.alloc_object(ClassId::new(0), 3);
+        let one_b = create_java_string(&shared, "1");
+        shared.mem.heap.set_field(b, 0, Value::Object(Some(one_b)));
+        shared.mem.heap.set_field(b, 1, Value::Int(i32::MAX));
+        shared.mem.heap.set_field(b, 2, Value::Int(0));
+        let sum = call_native(
+            &shared,
+            &mut thread,
+            "java/math/BigDecimal",
+            "add",
+            "(Ljava/math/BigDecimal;)Ljava/math/BigDecimal;",
+            &[Value::Object(Some(a)), Value::Object(Some(b))],
+        )
+        .expect_err("the scale alignment overflows i32 and HotSpot refuses it");
+        assert!(
+            matches!(
+                &sum,
+                crate::error::MethodCallFailed::InternalError(
+                    cratonvm_types::error::VmError::Runtime(
+                        cratonvm_types::error::RuntimeError::ArithmeticException { message }
+                    )
+                ) if message.as_str() == "Underflow"
+            ),
+            "add() across Integer.MIN_VALUE/MAX_VALUE scales is \
+             ArithmeticException(\"Underflow\"); the old body computed \
+             `s - sa` in i32. Got {sum:?}"
+        );
+    }
+
     #[test]
     fn bigdecimal_add_and_subtract() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
@@ -50957,25 +51082,39 @@ use std::sync::Arc;
         .unwrap();
         assert!(matches!(logger, Value::Object(Some(_))));
 
-        // isLoggable — DIVERGENCE PIN, NOT A CORRECTNESS ASSERTION (E40-1 §1).
+        // isLoggable — WAS A DIVERGENCE PIN, IS NOW AN ASSERTION OF THE
+        // REFUSAL (F31, 2026-08-13; the fix is F20-1 §7's
+        // `system_logger_require_level` in `native-builtins/src/lib.rs`).
         //
-        // This row answers `true` for every level, and this assertion is here
-        // to make that visible, not to bless it. Measured on the oracle (JDK
-        // 25.0.3+9-LTS), `System.getLogger("test.logger")` is a
-        // `sun.util.logging.internal.LoggingProviderImpl$JULWrapper` and:
+        // The pin that stood here asserted `Value::Int(1)` and called it "a
+        // fabricated unconditional `true`". Two things about that text were
+        // wrong, and both are worth keeping visible because they are the shape
+        // a pin goes stale in (F20-1 §7.3):
         //
-        //     isLoggable(ALL)=false   isLoggable(TRACE)=false
-        //     isLoggable(DEBUG)=false isLoggable(INFO)=true
-        //     isLoggable(WARNING)=true isLoggable(ERROR)=true
-        //     isLoggable(OFF)=true
-        //     isLoggable(null) -> NullPointerException: Cannot invoke
+        //   * It was never unconditional. `system_logger_is_loggable` does
+        //     compare severities; this row read as unconditional only because
+        //     the call passes a null RECEIVER *and* a null LEVEL, and a null
+        //     level fell through to an `INFO` default.
+        //   * "the severity comparison this VM has nowhere to do yet" was
+        //     already false when it was written — the comparison is that
+        //     function's last line.
+        //
+        // What the oracle actually answers for THIS call (JDK 25.0.3+9-LTS,
+        // `System.getLogger(…)` is a
+        // `sun.util.logging.internal.LoggingProviderImpl$JULWrapper`):
+        //
+        //     isLoggable(null) !! NullPointerException: Cannot invoke
         //       "java.util.logging.Level.intValue()" because "level" is null
         //
-        // So the JDK answers `false` for the three levels below the default,
-        // and THROWS for the argument this call actually passes. Fixing that
-        // needs the severity comparison this VM has nowhere to do yet — see the
-        // `Level` note below — so the answer is left as it is and labelled.
-        // Nominated: E40-1 §5 N3.
+        // Both JDK implementations agree: `JULWrapper` reaches
+        // `java.util.logging.Level.intValue()` and `SimpleConsoleLogger`
+        // reaches `PlatformLogger.Level.ordinal()`. They disagree only about
+        // `OFF`, which is a different row and is recorded, not asserted, at
+        // `system_logger_is_loggable`.
+        //
+        // This asserts the REFUSAL, so a fabricated permission cannot come
+        // back silently. NOTE the shape: the native now returns `Err`, so the
+        // old `.unwrap().unwrap()` would PANIC here, not assert-fail.
         let loggable = call_native(
             &shared,
             &mut thread,
@@ -50984,15 +51123,22 @@ use std::sync::Arc;
             "(Ljava/lang/System$Logger$Level;)Z",
             &[Value::Object(None), Value::Object(None)],
         )
-        .unwrap()
-        .unwrap();
-        assert_eq!(
-            loggable,
-            Value::Int(1),
-            "isLoggable is a fabricated unconditional `true`; HotSpot answers \
-             false for ALL/TRACE/DEBUG on a default logger and NPEs on a null \
-             level. Change this only together with the fix, not to match a \
-             different fabrication"
+        .expect_err("a null Level must not be answered with a permission");
+        assert!(
+            matches!(
+                &loggable,
+                crate::error::MethodCallFailed::InternalError(
+                    cratonvm_types::error::VmError::Runtime(
+                        cratonvm_types::error::RuntimeError::NullPointerException {
+                            message: Some(_)
+                        }
+                    )
+                )
+            ),
+            "isLoggable(null) must raise NullPointerException — HotSpot NPEs on \
+             a null level on both the JULWrapper and the SimpleConsoleLogger \
+             road, and the permissive answer is the one a caller cannot see. \
+             Got {loggable:?}"
         );
 
         // NO `System$Logger$Level` ASSERTION HERE, DELIBERATELY (E40-1 §1,
@@ -64425,53 +64571,337 @@ use std::sync::Arc;
         }
     }
 
+    /// WAS A REGISTRATION CENSUS, IS NOW AN ORACLE DIFF (F31, 2026-08-13 —
+    /// E40-1 NOMINATION N6, the `BigInteger` member).
+    ///
+    /// What stood here was thirteen assertions of the form
+    ///
+    /// ```ignore
+    /// assert!(registry.find(bi, "gcd", "(L…BigInteger;)L…BigInteger;").is_some());
+    /// ```
+    ///
+    /// — the tree checked against itself. Such a test cannot fail for any
+    /// reason a caller would care about: it goes red only when someone deletes
+    /// a registration, and it would be deleted in the same commit as the row it
+    /// guards. It never once looked at an ANSWER, so all thirteen natives could
+    /// have returned zero and it would have stayed green.
+    ///
+    /// It is also fully subsumed: `call_native` panics with
+    /// `"<class>.<method><descriptor> not registered"` when a triple is
+    /// missing, so every row below asserts the registration *and* the answer.
+    ///
+    /// Every expectation is MEASURED on `openjdk 25.0.3 2026-04-21 LTS
+    /// (25.0.3+9-LTS)` (Microsoft build), `scratchpad/f31/{Bi13,Mp}.java`:
+    ///
+    /// ```text
+    /// gcd(48,18)=6   gcd(-48,18)=6   gcd(0,0)=0
+    /// (255).bitLength()=8   (256).bitLength()=9   (-1).bitLength()=0   (-256).bitLength()=8
+    /// (255).bitCount()=8    (-1).bitCount()=0     (-256).bitCount()=8
+    /// (5).testBit(0)=true   (5).testBit(1)=false  (-1).testBit(99)=true
+    /// (5).testBit(-1)      !! ArithmeticException: Negative bit address
+    /// (3).shiftLeft(4)=48   (-3).shiftLeft(4)=-48
+    /// (9).shiftRight(1)=4   (-9).shiftRight(1)=-5 (3).shiftRight(-4)=48
+    /// (12).and(10)=8    (-12).and(10)=0
+    /// (12).or(10)=14    (-12).or(10)=-2
+    /// (12).xor(10)=6    (-12).xor(10)=-2
+    /// (0).not()=-1      (-1).not()=0      (12).not()=-13
+    /// (7).isProbablePrime(10)=true   (9).isProbablePrime(10)=false
+    /// (4).isProbablePrime(0)=true    (4).isProbablePrime(-1)=true
+    /// (3).modPow(4,7)=4   (2).modPow(-1,7)=4
+    /// (2).modPow(3,0)     !! ArithmeticException: BigInteger: modulus not positive
+    /// (3).modInverse(7)=5
+    /// (2).modInverse(8)   !! ArithmeticException: BigInteger not invertible.
+    /// ```
+    ///
+    /// Four of these rows are the ones a census could never have held, because
+    /// each is a *rule* rather than a registration: `(-1).bitLength()` is `0`
+    /// and not `1` (the JDK counts bits of the two's-complement value, not of
+    /// the magnitude); `(-1).bitCount()` is `0` for the same reason;
+    /// `shiftRight(-4)` is a LEFT shift by 4 and not an error; and
+    /// `isProbablePrime(0)` is `true` for a composite, because the JDK's first
+    /// line is `if (certainty <= 0) return true;`.
+    ///
+    /// NOTE which bodies this reaches. `register_builtins` runs
+    /// `register_essential_natives` and then `register_synthetic_overrides`,
+    /// and `register()` is last-write-wins, so `math_bignum`'s
+    /// `register_biginteger_natives` wins for every triple it still registers
+    /// (`gcd`, `isProbablePrime`, `modPow`, `modInverse`), while the triples
+    /// E38-1/F2 deleted from it (`bitLength`, `bitCount`, `testBit`,
+    /// `shiftLeft`, `shiftRight`, `and`, `or`, `xor`, `not`) resolve to
+    /// `phases_late::register_p71_biginteger_extras`. Both are the VM's, and
+    /// this is a VM-level test module — but a lane editing one of those two
+    /// files should know which rows it owns.
     #[test]
-    fn g12_biginteger_new_natives_registered() {
-        let registry = {
-            let mut r = crate::native::registry::NativeMethodRegistry::new();
-            crate::native::builtins::register_builtins(&mut r);
-            r
-        };
-        let bi = "java/math/BigInteger";
-        assert!(registry
-            .find(bi, "gcd", "(Ljava/math/BigInteger;)Ljava/math/BigInteger;")
-            .is_some());
-        assert!(registry.find(bi, "bitLength", "()I").is_some());
-        assert!(registry.find(bi, "bitCount", "()I").is_some());
-        assert!(registry.find(bi, "testBit", "(I)Z").is_some());
-        assert!(registry
-            .find(bi, "shiftLeft", "(I)Ljava/math/BigInteger;")
-            .is_some());
-        assert!(registry
-            .find(bi, "shiftRight", "(I)Ljava/math/BigInteger;")
-            .is_some());
-        assert!(registry
-            .find(bi, "and", "(Ljava/math/BigInteger;)Ljava/math/BigInteger;")
-            .is_some());
-        assert!(registry
-            .find(bi, "or", "(Ljava/math/BigInteger;)Ljava/math/BigInteger;")
-            .is_some());
-        assert!(registry
-            .find(bi, "xor", "(Ljava/math/BigInteger;)Ljava/math/BigInteger;")
-            .is_some());
-        assert!(registry
-            .find(bi, "not", "()Ljava/math/BigInteger;")
-            .is_some());
-        assert!(registry.find(bi, "isProbablePrime", "(I)Z").is_some());
-        assert!(registry
-            .find(
-                bi,
-                "modPow",
-                "(Ljava/math/BigInteger;Ljava/math/BigInteger;)Ljava/math/BigInteger;"
+    fn g12_biginteger_new_natives_answer_hotspot() {
+        fn mint(shared: &Arc<SharedVm>, thread: &mut JvmThread, v: i64) -> Value {
+            call_native(
+                shared,
+                thread,
+                "java/math/BigInteger",
+                "valueOf",
+                "(J)Ljava/math/BigInteger;",
+                &[Value::Long(v)],
             )
-            .is_some());
-        assert!(registry
-            .find(
-                bi,
-                "modInverse",
-                "(Ljava/math/BigInteger;)Ljava/math/BigInteger;"
+            .expect("BigInteger.valueOf must not refuse")
+            .expect("BigInteger.valueOf must answer a reference")
+        }
+        /// Synthetic-stub layout: slot 0 holds the decimal `String`.
+        fn dec(shared: &Arc<SharedVm>, v: Value) -> String {
+            match v {
+                Value::Object(Some(o)) => match shared.mem.heap.get_field(o, 0) {
+                    Value::Object(Some(s)) => read_java_string(&shared.mem.heap, s)
+                        .expect("BigInteger slot 0 must hold a readable decimal String"),
+                    other => panic!("BigInteger slot 0 must hold its String, got {other:?}"),
+                },
+                other => panic!("expected a BigInteger reference, got {other:?}"),
+            }
+        }
+        fn binary(
+            shared: &Arc<SharedVm>,
+            thread: &mut JvmThread,
+            method: &str,
+            x: i64,
+            y: i64,
+        ) -> String {
+            let a = mint(shared, thread, x);
+            let b = mint(shared, thread, y);
+            let r = call_native(
+                shared,
+                thread,
+                "java/math/BigInteger",
+                method,
+                "(Ljava/math/BigInteger;)Ljava/math/BigInteger;",
+                &[a, b],
             )
-            .is_some());
+            .unwrap_or_else(|e| panic!("{method}({x},{y}) must answer, got {e:?}"))
+            .unwrap();
+            dec(shared, r)
+        }
+        fn shift(
+            shared: &Arc<SharedVm>,
+            thread: &mut JvmThread,
+            method: &str,
+            x: i64,
+            n: i32,
+        ) -> String {
+            let a = mint(shared, thread, x);
+            let r = call_native(
+                shared,
+                thread,
+                "java/math/BigInteger",
+                method,
+                "(I)Ljava/math/BigInteger;",
+                &[a, Value::Int(n)],
+            )
+            .unwrap_or_else(|e| panic!("{method}({x},{n}) must answer, got {e:?}"))
+            .unwrap();
+            dec(shared, r)
+        }
+        fn int_of(shared: &Arc<SharedVm>, thread: &mut JvmThread, method: &str, x: i64) -> i32 {
+            let a = mint(shared, thread, x);
+            match call_native(shared, thread, "java/math/BigInteger", method, "()I", &[a])
+                .unwrap_or_else(|e| panic!("{method}({x}) must answer, got {e:?}"))
+            {
+                Some(Value::Int(v)) => v,
+                other => panic!("{method}({x}) must answer an int, got {other:?}"),
+            }
+        }
+        fn int_arg_bool(
+            shared: &Arc<SharedVm>,
+            thread: &mut JvmThread,
+            method: &str,
+            x: i64,
+            n: i32,
+        ) -> crate::error::MethodCallResult {
+            let a = mint(shared, thread, x);
+            call_native(
+                shared,
+                thread,
+                "java/math/BigInteger",
+                method,
+                "(I)Z",
+                &[a, Value::Int(n)],
+            )
+        }
+        fn arith_message(e: &crate::error::MethodCallFailed) -> String {
+            match e {
+                crate::error::MethodCallFailed::InternalError(
+                    cratonvm_types::error::VmError::Runtime(
+                        cratonvm_types::error::RuntimeError::ArithmeticException { message },
+                    ),
+                ) => message.clone(),
+                other => panic!("expected an ArithmeticException, got {other:?}"),
+            }
+        }
+
+        let shared = Arc::new(SharedVm::new(VmConfig::default()));
+        let mut thread = JvmThread::new(ThreadId(0), "test");
+
+        // gcd — always non-negative, and gcd(0,0) is 0.
+        assert_eq!(binary(&shared, &mut thread, "gcd", 48, 18), "6");
+        assert_eq!(binary(&shared, &mut thread, "gcd", -48, 18), "6");
+        assert_eq!(binary(&shared, &mut thread, "gcd", 0, 0), "0");
+
+        // bitLength / bitCount are TWO'S-COMPLEMENT counts, so both are 0 for -1.
+        assert_eq!(int_of(&shared, &mut thread, "bitLength", 255), 8);
+        assert_eq!(int_of(&shared, &mut thread, "bitLength", 256), 9);
+        assert_eq!(
+            int_of(&shared, &mut thread, "bitLength", -1),
+            0,
+            "(-1).bitLength() is 0 on HotSpot — the excess of the two's-complement \
+             value over its sign bit, not the magnitude's bit count"
+        );
+        assert_eq!(int_of(&shared, &mut thread, "bitLength", -256), 8);
+        assert_eq!(int_of(&shared, &mut thread, "bitCount", 255), 8);
+        assert_eq!(
+            int_of(&shared, &mut thread, "bitCount", -1),
+            0,
+            "(-1).bitCount() counts bits DIFFERING from the sign bit"
+        );
+        assert_eq!(int_of(&shared, &mut thread, "bitCount", -256), 8);
+
+        // testBit, including the refusal a census cannot see.
+        assert_eq!(
+            int_arg_bool(&shared, &mut thread, "testBit", 5, 0).unwrap(),
+            Some(Value::Int(1))
+        );
+        assert_eq!(
+            int_arg_bool(&shared, &mut thread, "testBit", 5, 1).unwrap(),
+            Some(Value::Int(0))
+        );
+        assert_eq!(
+            int_arg_bool(&shared, &mut thread, "testBit", -1, 99).unwrap(),
+            Some(Value::Int(1)),
+            "(-1) is all ones in two's complement, at every bit index"
+        );
+        let neg_bit = int_arg_bool(&shared, &mut thread, "testBit", 5, -1)
+            .expect_err("testBit(-1) must refuse");
+        assert_eq!(arith_message(&neg_bit), "Negative bit address");
+
+        // shifts — a NEGATIVE count reverses the direction; it is not an error.
+        assert_eq!(shift(&shared, &mut thread, "shiftLeft", 3, 4), "48");
+        assert_eq!(shift(&shared, &mut thread, "shiftLeft", -3, 4), "-48");
+        assert_eq!(shift(&shared, &mut thread, "shiftRight", 9, 1), "4");
+        assert_eq!(
+            shift(&shared, &mut thread, "shiftRight", -9, 1),
+            "-5",
+            "an arithmetic shift rounds toward NEGATIVE infinity: -9 >> 1 is -5, not -4"
+        );
+        assert_eq!(
+            shift(&shared, &mut thread, "shiftRight", 3, -4),
+            "48",
+            "shiftRight(-4) is a left shift by 4 on HotSpot"
+        );
+
+        // Bitwise ops, both signs — these are two's-complement, not magnitude.
+        assert_eq!(binary(&shared, &mut thread, "and", 12, 10), "8");
+        assert_eq!(binary(&shared, &mut thread, "and", -12, 10), "0");
+        assert_eq!(binary(&shared, &mut thread, "or", 12, 10), "14");
+        assert_eq!(binary(&shared, &mut thread, "or", -12, 10), "-2");
+        assert_eq!(binary(&shared, &mut thread, "xor", 12, 10), "6");
+        assert_eq!(binary(&shared, &mut thread, "xor", -12, 10), "-2");
+
+        // not(x) == -(x+1)
+        for (input, want) in [(0i64, "-1"), (-1, "0"), (12, "-13")] {
+            let a = mint(&shared, &mut thread, input);
+            let r = call_native(
+                &shared,
+                &mut thread,
+                "java/math/BigInteger",
+                "not",
+                "()Ljava/math/BigInteger;",
+                &[a],
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(dec(&shared, r), want, "({input}).not()");
+        }
+
+        // isProbablePrime — and `certainty <= 0` is an unconditional `true`,
+        // composite or not (`BigInteger.java`'s first line in that method).
+        assert_eq!(
+            int_arg_bool(&shared, &mut thread, "isProbablePrime", 7, 10).unwrap(),
+            Some(Value::Int(1))
+        );
+        assert_eq!(
+            int_arg_bool(&shared, &mut thread, "isProbablePrime", 9, 10).unwrap(),
+            Some(Value::Int(0))
+        );
+        assert_eq!(
+            int_arg_bool(&shared, &mut thread, "isProbablePrime", 4, 0).unwrap(),
+            Some(Value::Int(1)),
+            "(4).isProbablePrime(0) is TRUE on HotSpot: `if (certainty <= 0) return true;`"
+        );
+        assert_eq!(
+            int_arg_bool(&shared, &mut thread, "isProbablePrime", 4, -1).unwrap(),
+            Some(Value::Int(1))
+        );
+
+        // modPow — including a negative exponent (legal: invert, then raise)
+        // and a non-positive modulus (refused).
+        let three = mint(&shared, &mut thread, 3);
+        let four = mint(&shared, &mut thread, 4);
+        let seven = mint(&shared, &mut thread, 7);
+        let mp = call_native(
+            &shared,
+            &mut thread,
+            "java/math/BigInteger",
+            "modPow",
+            "(Ljava/math/BigInteger;Ljava/math/BigInteger;)Ljava/math/BigInteger;",
+            &[three, four, seven],
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(dec(&shared, mp), "4", "3^4 mod 7");
+
+        let two = mint(&shared, &mut thread, 2);
+        let minus_one = mint(&shared, &mut thread, -1);
+        let seven2 = mint(&shared, &mut thread, 7);
+        let inv_pow = call_native(
+            &shared,
+            &mut thread,
+            "java/math/BigInteger",
+            "modPow",
+            "(Ljava/math/BigInteger;Ljava/math/BigInteger;)Ljava/math/BigInteger;",
+            &[two, minus_one, seven2],
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            dec(&shared, inv_pow),
+            "4",
+            "a NEGATIVE exponent is legal: 2^-1 mod 7 is modInverse(2,7) = 4"
+        );
+
+        let two2 = mint(&shared, &mut thread, 2);
+        let three2 = mint(&shared, &mut thread, 3);
+        let zero = mint(&shared, &mut thread, 0);
+        let bad_mod = call_native(
+            &shared,
+            &mut thread,
+            "java/math/BigInteger",
+            "modPow",
+            "(Ljava/math/BigInteger;Ljava/math/BigInteger;)Ljava/math/BigInteger;",
+            &[two2, three2, zero],
+        )
+        .expect_err("a zero modulus must refuse");
+        assert_eq!(arith_message(&bad_mod), "BigInteger: modulus not positive");
+
+        // modInverse — the answer, and the message when gcd != 1. Note the
+        // trailing '.' : HotSpot's text is "BigInteger not invertible."
+        assert_eq!(binary(&shared, &mut thread, "modInverse", 3, 7), "5");
+        let a = mint(&shared, &mut thread, 2);
+        let m = mint(&shared, &mut thread, 8);
+        let not_inv = call_native(
+            &shared,
+            &mut thread,
+            "java/math/BigInteger",
+            "modInverse",
+            "(Ljava/math/BigInteger;)Ljava/math/BigInteger;",
+            &[a, m],
+        )
+        .expect_err("gcd(2,8) != 1, so there is no inverse");
+        assert_eq!(arith_message(&not_inv), "BigInteger not invertible.");
     }
 
     // ---- M5: JIT compiles user code (no longer skipped) ----

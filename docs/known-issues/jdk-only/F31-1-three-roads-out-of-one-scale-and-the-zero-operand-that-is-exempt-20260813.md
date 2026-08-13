@@ -6,7 +6,7 @@ source files this lane edited are `native-builtins/src/math_bignum.rs` and
 CratonVM**: every CratonVM "after" below is explicitly **PREDICTED**, and every
 "before" is a fact read out of the working tree. Every HotSpot value is
 **MEASURED** on this host against `openjdk 25.0.3 2026-04-21 LTS (25.0.3+9-LTS)`
-(Microsoft build), from `scratchpad/f31/{Bd,Bd2,Bd3,Bd4,Bd5}.java`, before any
+(Microsoft build), from `scratchpad/f31/{Bd,Bd2,Bd3,Bd4,Bd5,Bd6,Bd7,Bi13,Mp}.java`, before any
 guard was written.
 
 Notation throughout: `bd(u,s)` is `new BigDecimal(BigInteger.valueOf(u), s)`,
@@ -19,13 +19,15 @@ Notation throughout: `bd(u,s)` is `new BigDecimal(BigInteger.valueOf(u), s)`,
 | | |
 |---|---|
 | F20-1 N1 — `bigint_mul_pow10`'s three unguarded call sites | **all three closed**, as three genuinely different edits (§3, §4) |
-| F20-1 N2 — `bd_read` must be able to refuse | **closed.** `bd_read` is now `Result<String, MethodCallFailed>`; 13 call sites, all in this file, all one `?` (§5) |
+| F20-1 N2 — `bd_read` must be able to refuse | **closed.** `bd_read` is `Result<String, MethodCallFailed>` with **one** caller; the other twelve take `bd_read_unchecked`, and §5.4 is why that is not a shortcut |
 | F20-1 N3 — the `isLoggable` divergence pin | **closed**, and its `.unwrap()` panic with it (§6) |
 | a claim in the brief this lane **falsified** | "`apply_scale` currently computes `-i32::MIN`, a guaranteed VM abort" — F20 had already landed `unsigned_abs` in `lib.rs`; the abort was gone, the *divergence* was not (§5.1) |
 | a claim in F20-1 N1(a)'s proposed patch text this lane **falsified** | it would have refused **four** rows HotSpot answers, because it guards the *raise* and not the *raised operand* (§4.2) |
+| a mistake this lane made and then caught by measuring | the first cut of N2 put a `?` on all 13 `bd_read` call sites. **Twelve of them are methods HotSpot never refuses** — that would have been 12 fresh divergences (§5.4) |
+| task 4 — one more open record landing in these files | E40-1 **N6**, the `BigInteger` member: 13 `registry.find(…).is_some()` assertions replaced with a 30-row oracle diff (§8.1) |
 | a boundary F20-1 got right and this lane re-measured rather than inherited | `TEN.pow` refuses at `n >= 715_827_883` and not below (§2) |
 | an argument-driven allocation found by grepping the SHAPE, not on the brief | `bd_set_scale_impl`'s drop divisor — 4th copy of `"1" + "0"*n` → `from_decimal` (§7) |
-| NOMINATIONS raised | **2**, both doc-only, neither blocks compilation (§9) |
+| NOMINATIONS raised | **3**; two doc-only, one a live VM abort in a helper with call sites in two files this lane does not own. **None blocks compilation** (§9) |
 
 ---
 
@@ -202,13 +204,11 @@ than through a guess.
 ## 5. Task 2 — `bd_read` is fallible
 
 `bd_read` is now `Result<String, MethodCallFailed>` and calls
-`bd_plain_string_check(&unscaled, scale)?` before `apply_scale`. Thirteen call
-sites, **all in this file**, all one `?`: `native_bd_divide`,
-`native_bd_divide_scale`, `native_bd_compare_to` (×2 each),
-`native_bd_equals` (×2), `native_bd_to_plain_string`, `native_bd_double_value`,
-`native_bd_float_value`, `native_bd_strip_zeros`, `native_bd_hash_code`. Every
-one is already a `MethodCallResult` native, so nothing outside this file moves
-and **nothing blocks compilation elsewhere**.
+`bd_plain_string_check(&unscaled, scale)?` before `apply_scale`. It has
+**exactly one caller**, `native_bd_to_plain_string`. The other twelve call sites
+take a new `bd_read_unchecked`, which is the old body — see §5.4, which is the
+part of this section that matters. Nothing outside this file moves and
+**nothing blocks compilation elsewhere**.
 
 ### 5.1 The brief's premise was already stale
 
@@ -246,6 +246,44 @@ whatever models array limits, not to this file. **PREDICTED** for these rows:
 CratonVM builds a ~2.1 GB Rust `String` and then meets its own allocator. The
 size is bounded by `i32::MAX` and no longer by `usize` (that was the
 `-i32::MIN` sign-extension F20 removed), but it is a real allocation.
+
+### 5.4 The first cut of this was wrong, and measuring caught it
+
+F20-1 N2 says "make `bd_read` fallible, which its own callers force". The
+obvious reading — one fallible `bd_read`, thirteen `?` — is what this lane
+wrote first. Then the callers were measured, and **only one of the thirteen is a
+method HotSpot ever refuses**. `scratchpad/f31/{Bd6,Bd7}.java`, on the very
+receivers `bd_plain_string_check` refuses:
+
+```text
+bd(1,MIN).equals(bd(1,MIN))     = true            [0 ms]
+bd(1,MIN).hashCode()            = -2147483617     [0 ms]
+bd(1,MIN).doubleValue()         = Infinity        [0 ms]   bd(1,MAX).doubleValue()  = 0.0
+bd(-1,MIN).doubleValue()        = -Infinity       [0 ms]   bd(-1,MAX).doubleValue() = -0.0
+bd(1,MIN).floatValue()          = Infinity        [0 ms]   bd(1,MAX).floatValue()   = 0.0
+bd(1,MIN).stripTrailingZeros()  = 1E+2147483648   [5 ms]
+bd(1,MIN).compareTo(bd(1,MAX))  = 1               [0 ms]   bd(1,MAX).compareTo(bd(1,MAX)) = 0
+bd(1,MIN).divide(bd(1,MIN))     = 1               [0 ms]   bd(1,MAX).divide(bd(1,MAX))    = 1
+bd(1,MIN).divide(bd(2,0),2,HALF_UP) = 0.01        [0 ms]
+
+bd(1,MIN).toPlainString()      !! ArithmeticException: Overflow                     [0 ms]
+```
+
+Because none of those methods renders the value: `equals` compares `scale` then
+the unscaled `BigInteger`, `hashCode` is `31*intVal.hashCode() + scale`,
+`doubleValue` has its own fast paths, `compareTo` compares magnitudes. Only
+`toPlainString` builds a string, so only `toPlainString` can hit a string-size
+screen.
+
+**A `?` on all thirteen would have been twelve new divergences** — the exact
+failure mode this lane spent §4.2 documenting in someone else's proposed patch,
+arriving one level out in its own. The split is `bd_read` (fallible, one caller)
+and `bd_read_unchecked` (the old body, twelve callers), with both names carrying
+the transcript.
+
+What the split does *not* fix is that those twelve still build the
+`scale`-sized string HotSpot never builds. That residual is §10; it cannot be
+closed by refusing, only by not rendering.
 
 ---
 
@@ -354,6 +392,7 @@ written.
 | `narrowing_conversions_match_hotspot` | 24 rows of `intValue`/`longValue`, composed exactly as the natives compose them; the `-64`/`-63` line; the upper-bound row of §3.1 |
 | `add_scale_alignment_matches_hotspot` | 14 rows; the five refusals, the four zero-operand exemptions of §4.2, and two ordinary alignments |
 | `bigdecimal_extreme_scale_refusals_f31` (`vm/src/vm/tests.rs`) | the three roads end-to-end through the registry (§6.2) |
+| `g12_biginteger_new_natives_answer_hotspot` (`vm/src/vm/tests.rs`) | ~30 `BigInteger` rows that replace 13 `registry.find(…).is_some()` assertions (§8.1) |
 
 **Mutation checks** (what goes red if a rule is removed), reasoned per rule:
 
@@ -368,6 +407,53 @@ written.
 | use the unsigned digit length (drop the `'-'`) on the negative `toPlainString` road | `plain("-1", -2147483646)` |
 | add the unscaled digits to the positive road's `len` | `plain("1", 2147483645)` |
 | short-circuit `unscaled == "0"` for positive scales too | `plain("0", i32::MAX)` |
+
+### 8.1 Task 4 — E40-1 NOMINATION N6, the `BigInteger` member
+
+`vm/src/vm/tests.rs`'s `g12_biginteger_new_natives_registered` was thirteen
+assertions of the form
+
+```rust
+assert!(registry.find(bi, "gcd", "(L…BigInteger;)L…BigInteger;").is_some());
+```
+
+— the tree checked against itself. E40-1 §4a censused 24 such tests (130
+`is_some()` / 12 `is_none()` assertions) and its N6 asked for exactly this
+conversion; F9-1 confirmed N6 still open. It is the same defect class as Task 3,
+one notch worse: a divergence pin at least *records* an answer, whereas an
+existence check never looks at one. All thirteen natives could have returned zero
+and it would have stayed green.
+
+It is now `g12_biginteger_new_natives_answer_hotspot`, ~30 measured rows
+(`scratchpad/f31/{Bi13,Mp}.java`). The conversion loses nothing: `call_native`
+panics with `"<class>.<method><descriptor> not registered"` when a triple is
+missing, so every row asserts the registration *and* the answer.
+
+Four rows are rules a census could not have held, and each is a plausible thing
+to get wrong:
+
+```text
+(-1).bitLength()        = 0      (not 1 — two's-complement excess over the sign bit)
+(-1).bitCount()         = 0      (bits DIFFERING from the sign bit)
+(3).shiftRight(-4)      = 48     (a negative count reverses direction; not an error)
+(4).isProbablePrime(0)  = true   (`if (certainty <= 0) return true;` — for a composite)
+```
+
+plus three refusals with their exact text: `testBit(-1)` →
+`ArithmeticException: Negative bit address`, `modPow(2,3,0)` →
+`ArithmeticException: BigInteger: modulus not positive`, `modInverse(2,8)` →
+`ArithmeticException: BigInteger not invertible.` (note the trailing period).
+
+**Which bodies the rows reach was checked, not assumed.** `register_builtins` is
+`register_essential_natives` then `register_synthetic_overrides`, and
+`register()` is last-write-wins, so `math_bignum::register_biginteger_natives`
+wins for the four triples it still registers (`gcd`, `isProbablePrime`,
+`modPow`, `modInverse`) and the nine E38-1/F2 deleted from it resolve to
+`phases_late::register_p71_biginteger_extras`. Both bodies were read before the
+expectations were written — in particular `phases_late`'s `testBit` already
+raises `Negative bit address`, so W8-F7-1 §4's note about that arm answering
+`false` is about the **unregistered** `bi_test_bit_str` helper, not the live
+path.
 
 **Not covered by any test in this lane**, because it needs a running VM: whether
 these refusals reach Java as catchable `ArithmeticException`/`OutOfMemoryError`
@@ -439,6 +525,91 @@ list points at F20-1 for the missing refusal. The first is now refused by
 ///    `docs/known-issues/jdk-only/F31-1-three-roads-out-of-one-scale-and-the-zero-operand-that-is-exempt-20260813.md`.
 ```
 
+### N3 — `native-builtins/src/math_bignum.rs` + two files this lane does not own: a `panic!` in a `pub(crate)` helper
+
+**This one is a live VM abort, not a doc fix**, and it is nominated only because
+closing it properly changes a signature with call sites in `bigint.rs` and
+`phases_late.rs`. E38-1 §3 found it and left it "flagged":
+
+```rust
+// native-builtins/src/math_bignum.rs, in `bi_mod_pow_str`
+if e_neg {
+    // …
+    panic!("bi_mod_pow_str: negative exponent — caller must compute modInverse first");
+}
+```
+
+Its own comment says it chose to "panic to be loud". A Rust panic is not a Java
+throwable: it is the loudest possible thing and the least catchable. All five
+call sites strip the sign first today (`math_bignum:1141` Miller-Rabin,
+`math_bignum`'s `modPow` native, `phases_late:8802`, and two differential tests
+in `bigint.rs`), so it is a landmine rather than a live defect — but a
+`pub(crate)` helper with five callers is one careless sixth away.
+
+MEASURED, `scratchpad/f31/Mp.java` — a negative exponent is perfectly legal
+`BigInteger`:
+
+```text
+2.modPow(-1, 7)   = 4        3.modPow(-2, 10) = 9       2.modPow(-3, 7) = 1
+2.modPow(-1, 8)  !! ArithmeticException: BigInteger not invertible.
+0.modPow(-5, 7)  !! ArithmeticException: BigInteger not invertible.
+2.modPow(3, 0)   !! ArithmeticException: BigInteger: modulus not positive
+2.modPow(-1, -7) !! ArithmeticException: BigInteger: modulus not positive
+```
+
+So there is exactly one shape a `-> String` signature cannot express: a negative
+exponent over a non-invertible base. The fix is `-> Option<String>` (`None` for
+that one case), with the negative-exponent branch doing what `modPow` does —
+`bi_mod_inverse_str` is thirty lines further down the same file.
+
+*File:* `native-builtins/src/math_bignum.rs`
+*exact literal old text:*
+```rust
+    // exp must be non-negative for plain modPow.
+    let (e_neg, e_abs) = bi_parse_sign(exp);
+    if e_neg {
+        // Caller is responsible for inverting base first.
+        // Fallback: treat as |exp| (consistent with our previous buggy
+        // wrapping_mul behavior is not OK; instead return 0 sentinel — but
+        // returning 0 is itself a synthetic stub, so panic to be loud).
+        panic!("bi_mod_pow_str: negative exponent — caller must compute modInverse first");
+    }
+```
+*exact literal new text:*
+```rust
+    // A negative exponent is LEGAL `BigInteger` — `modPow` inverts the base and
+    // raises the inverse to |exp| (`BigInteger.java:2916-2918`). MEASURED on
+    // 25.0.3+9: `2.modPow(-1,7)` = 4, `3.modPow(-2,10)` = 9, and
+    // `2.modPow(-1,8)` !! `ArithmeticException: BigInteger not invertible.`
+    // This used to `panic!` here "to be loud"; a Rust panic is not a Java
+    // throwable, so it was the one failure mode no `catch` could ever see.
+    let (e_neg, e_abs) = bi_parse_sign(exp);
+    if e_neg {
+        let inv = bi_mod_inverse_str(&b, m_abs)?;
+        return bi_mod_pow_str(&inv, e_abs, m);
+    }
+```
+(with the signature becoming
+`pub(crate) fn bi_mod_pow_str(base: &str, exp: &str, m: &str) -> Option<String>`,
+`return "0".to_string()` → `return Some("0".to_string())` and the final
+`result` → `Some(result)`.)
+
+**Ripple — three call sites outside this file.** Each is a `?` or an `.expect`,
+and **the change does block compilation until all three land**, which is why it
+was not taken here:
+
+* `native-builtins/src/phases_late.rs:8802` — `let res = bi_mod_pow_str(&inv, pos_exp, &m);`
+  → `let Some(res) = bi_mod_pow_str(&inv, pos_exp, &m) else { return Err(RuntimeError::ArithmeticException { message: "BigInteger not invertible.".to_string() }.into()); };`
+  (the exponent there is already positive, so the `else` is unreachable and the
+  message is the JDK's for the shape that would reach it).
+* `native-builtins/src/bigint.rs:1071` — `let want = bi_mod_pow_str(ba, e, m);`
+  → `let want = bi_mod_pow_str(ba, e, m).expect("positive exponent");`
+* `native-builtins/src/bigint.rs:1090` — `bi_mod_pow_str(&ba, &e, &m),`
+  → `bi_mod_pow_str(&ba, &e, &m).expect("positive exponent"),`
+
+The two `math_bignum.rs` call sites (`:1141`, and the `modPow` native's two
+arms) are this file's own and would land with it.
+
 ---
 
 ## 10. Residuals
@@ -456,6 +627,20 @@ list points at F20-1 for the missing refusal. The first is now refused by
   did not return in 240 s on HotSpot), and this lane reproduced the same wall:
   `bd(1,0).add(bd(1,715827882))` did not return inside a 400 s cap either.
   Refusing where HotSpot merely takes forever would be a divergence.
+* **`bd_read_unchecked`'s twelve callers still render a `scale`-sized string**
+  (§5.4) — `equals`, `hashCode`, `compareTo`, `divide`, `divide(…,scale,…)`,
+  `doubleValue`, `floatValue`, `stripTrailingZeros`. HotSpot answers all of them
+  in 0 ms without rendering anything, so this **cannot be closed by refusing**;
+  it closes by not rendering. Concretely: `equals` wants `scale` then the
+  unscaled `BigInt` (the file already has `bd_scale_of` and
+  `bd_unscaled_bigint`); the four `f64` consumers want the value computed from
+  `(unscaled, scale)`, where the adjusted exponent alone decides every case
+  outside `±10^±400` (`> 400` is `±Infinity`, `< -400` is `±0.0` — both
+  provable, not guessed, since `f64::MAX` is `1.8e308`), which bounds the
+  rendering at roughly `2·digits + 400` characters; `hashCode` wants the JDK's
+  `31*intVal.hashCode() + scale`. Not taken here: those are precision-axis
+  changes to natives this lane has no oracle sweep for, and a blind rewrite of
+  `compareTo` is a worse trade than a recorded DoS.
 * **`native_bd_compare_to` / `native_bd_divide` / `doubleValue` / `floatValue`
   still route through `f64`.** `compareTo` therefore ties for two `BigDecimal`s
   that differ past ~15-16 significant digits, where the exact `(unscaled, scale)`

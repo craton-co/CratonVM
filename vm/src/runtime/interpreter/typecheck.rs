@@ -927,6 +927,58 @@ pub(crate) fn aastore_element_assignable(
 // Helper: walk a class's superclass chain by name to detect Proxy$Instance
 // ---------------------------------------------------------------------------
 
+/// Does `name` name a class that a dynamic-proxy receiver can sit under?
+///
+/// **The two names are not alternatives — which one matches is decided by a
+/// flag, and the flag defaults to the SECOND.** `native_builtins::
+/// reflect_annotations::proxy_super_class_name()` (`:3767`) returns
+/// `"java/lang/reflect/Proxy"` when `real_proxy_super()` is true and
+/// `"java/lang/reflect/Proxy$Instance"` otherwise, and `real_proxy_super` is
+/// `truthy_word_default_true(src, "CRATONVM_REAL_PROXY_SUPER")`
+/// (`types/src/flags.rs:1907`). `build_proxy_spec_for` writes exactly that
+/// string into `ProxyClassSpec::super_class` (`reflect_annotations.rs:4303`).
+/// So in the SHIPPING configuration a generated `$ProxyN` extends the real
+/// `java/lang/reflect/Proxy` and `Proxy$Instance` appears nowhere on its
+/// chain: matching only `Proxy$Instance` recognises **no proxy at all**.
+///
+/// That is why this is a shared `fn` and not two `const`s copied per site.
+/// The wide match is **required**, not lenient — the question "is this an
+/// over-match?" has the answer "the second arm IS the default arm". The
+/// `Proxy$Instance` arm is the one that is now conditional: it serves
+/// `CRATONVM_REAL_PROXY_SUPER=0`, the `ProxyClassOutcome::Degrade`/`Failed`
+/// fallbacks (which allocate the 3-slot shim *regardless* of the gate,
+/// `reflect_annotations.rs:3187`), and synthetic-JDK mode, where the real
+/// `java/lang/reflect/Proxy` is a fabricated stub. Both must stay: asking
+/// "what serves the class per mode" gives two different answers here, and a
+/// narrowing that keeps either one alone breaks the other mode silently.
+///
+/// **Name-only, and deliberately so.** The one caller that cannot use
+/// [`class_chain_reaches_proxy_instance`] is the vtable fast path in
+/// `dispatch_virtual.rs`, which holds a live `class_manager` read guard: a
+/// nested second read acquisition self-deadlocks under parking_lot's
+/// writer-preferring fairness. This predicate takes no lock, so that caller
+/// can walk the chain with its own guard and still ask the one question.
+///
+/// **Known drifted twin, 2026-08-13 (F32).** `dispatch_virtual.rs:478`
+/// inlines this walk with `const PROXY_INSTANCE` **only**. It was written
+/// 2026-07-02 (`b6805d3df`, "proxy default-method dispatch") when
+/// `Proxy$Instance` was the only super, and it was not moved when the
+/// real-super gate landed default-on. Consequence, by reading: for a
+/// real-super `$ProxyN` that guard computes `is_proxy = false`, so the vtable
+/// fast path does **not** cede to `execute_invoke_kind`'s `is_proxy_dispatch`
+/// — it resolves the generated method on the receiver's own class and
+/// installs a `CachedInvokeTarget::VirtualBytecode`. See
+/// `docs/known-issues/jdk-only/F32-1-the-proxy-route-and-the-drifted-twin-20260813.md`.
+pub(super) fn class_name_is_proxy_super(name: &str) -> bool {
+    // The synthetic 3-slot shim: `CRATONVM_REAL_PROXY_SUPER=0`, the
+    // degrade/failed fallbacks, and synthetic-JDK mode.
+    const PROXY_INSTANCE: &str = "java/lang/reflect/Proxy$Instance";
+    // The real JDK base class — the DEFAULT super of every generated
+    // `$ProxyN`, and the only name on a shipped proxy's chain.
+    const REAL_PROXY_BASE: &str = "java/lang/reflect/Proxy";
+    name == PROXY_INSTANCE || name == REAL_PROXY_BASE
+}
+
 /// WP2.5 — walks the superclass chain of `class_id` looking for
 /// `java/lang/reflect/Proxy$Instance` or the real-JDK
 /// `java/lang/reflect/Proxy` base class. Returns `true` if found within
@@ -948,8 +1000,6 @@ pub(crate) fn aastore_element_assignable(
 /// in user-loaded class graphs.
 pub(crate) fn class_chain_reaches_proxy_instance(shared: &SharedVm, class_id: ClassId) -> bool {
     const MAX_DEPTH: usize = 32;
-    const PROXY_INSTANCE: &str = "java/lang/reflect/Proxy$Instance";
-    const REAL_PROXY_BASE: &str = "java/lang/reflect/Proxy";
 
     let cm = shared.classes.class_manager.read();
     let mut current = Some(class_id);
@@ -962,7 +1012,7 @@ pub(crate) fn class_chain_reaches_proxy_instance(shared: &SharedVm, class_id: Cl
             Some(c) => c,
             None => return false,
         };
-        if &*class.name == PROXY_INSTANCE || &*class.name == REAL_PROXY_BASE {
+        if class_name_is_proxy_super(&class.name) {
             return true;
         }
         // Stop early once we hit Object — Proxy$Instance sits below it
@@ -1426,4 +1476,173 @@ pub(super) fn synthetic_implements(shared: &SharedVm, obj_class_id: ClassId, tar
     }
 
     false
+}
+
+/// Pure, allocation-free predicates from this file, pinned in-tree.
+///
+/// Both functions below decide admissions for the whole VM and neither had a
+/// single in-tree assertion before 2026-08-13 (lane F32; verified with
+/// `grep -rn simple_name_has_word --include=*.rs`, which returned only the
+/// definition and its five call sites). `simple_name_has_word`'s only guard
+/// was `scratchpad/c16/verify.rs`, which is not in the repository — so the
+/// 20,772-cell measurement its doc comment quotes could not fail anything
+/// here. These are the cheap half of that probe: the rows a regression would
+/// move first, taken verbatim from the two records.
+#[cfg(test)]
+mod f32_pure_predicate_tests {
+    use super::{class_name_is_proxy_super, simple_name_has_word};
+
+    /// The two names are decided by `CRATONVM_REAL_PROXY_SUPER`, which
+    /// defaults ON — so `java/lang/reflect/Proxy` is the arm a shipped
+    /// generated `$ProxyN` matches, and `Proxy$Instance` is the arm that
+    /// serves the opt-out, the degrade fallbacks and synthetic-JDK mode.
+    /// Dropping EITHER breaks a mode with no build error.
+    #[test]
+    fn both_proxy_supers_are_recognised_and_nothing_else_is() {
+        assert!(
+            class_name_is_proxy_super("java/lang/reflect/Proxy"),
+            "the real base class is the DEFAULT super of every generated \
+             $ProxyN (proxy_super_class_name(), real_proxy_super()=true); \
+             dropping this arm recognises no proxy at all in the shipping \
+             configuration"
+        );
+        assert!(
+            class_name_is_proxy_super("java/lang/reflect/Proxy$Instance"),
+            "the synthetic shim is still the allocated shape under \
+             CRATONVM_REAL_PROXY_SUPER=0, under ProxyClassOutcome::Degrade \
+             and ::Failed, and in synthetic-JDK mode"
+        );
+        // Not a prefix/suffix/contains test. A generated proxy is recognised
+        // by its SUPER, never by its own name — `jdk/proxy1/$Proxy0` is a
+        // measured JDK 25.0.3 proxy class name and must NOT match here, or
+        // the chain walk would answer before it has walked anything.
+        for name in [
+            "jdk/proxy1/$Proxy0",
+            "java/lang/reflect/ProxyGenerator",
+            "java/lang/reflect/Proxy$ProxyBuilder",
+            "java/lang/annotation/AnnotationProxy",
+            "java/lang/Object",
+            "",
+        ] {
+            assert!(
+                !class_name_is_proxy_super(name),
+                "{name} is not a proxy SUPERCLASS"
+            );
+        }
+    }
+
+    /// `simple_name_has_word` is `synthetic_implements`' whole collection
+    /// heuristic and had no in-tree assertion at all. Only OVER-ADMISSIONS
+    /// are defects (the function runs after `is_subclass_of` has declined, so
+    /// a `false` is "no opinion"), which is why the negative rows carry the
+    /// weight and the positive rows exist only to stop a
+    /// `fn(_,_) -> false` from passing.
+    ///
+    /// **Every row's verdict is MEASURED on HotSpot 25.0.3+9-LTS**
+    /// (`X.class.isAssignableFrom(Y)` over `java.base`'s real nested class
+    /// names, enumerated with `getDeclaredClasses` rather than recalled).
+    ///
+    /// **Mutation-checked**, by re-running this exact row set against four
+    /// hand-made variants of the function under plain `rustc`. Failing-row
+    /// counts, measured:
+    ///
+    /// ```text
+    ///   PRISTINE                                    0
+    ///   drop the `ends_with("Iterator")` arm        5   (all `cursor` rows)
+    ///   `simple` := the full `obj_name`             1   (ConcurrentSkipListMap$Values)
+    ///   full name AND plain `contains` (historical) 7
+    ///   drop the uppercase/digit word test          2   (`word` rows)
+    /// ```
+    ///
+    /// The `1` is the honest number and worth keeping: the simple-name rule
+    /// and the word rule overlap almost completely, because a container name
+    /// usually ends in a lower-case letter (`…Collections$`) which the word
+    /// test already refuses. `ConcurrentSkipListMap$Values` is the one
+    /// measured row that separates them (`…SkipListMap` puts `List` in front
+    /// of a capital `M`), so deleting it would leave the simple-name rule
+    /// with no coverage of its own.
+    #[test]
+    fn a_container_never_lends_its_name_and_a_cursor_is_never_a_collection() {
+        // 1. A container lends its name to every member — and must not
+        //    (W8-C4-2, W8-C16-2). All MEASURED false on HotSpot.
+        for (name, term) in [
+            ("java/util/ImmutableCollections$Map1", "Collection"),
+            ("java/util/ImmutableCollections$MapN", "Collection"),
+            ("java/util/ImmutableCollections$StableMap", "Collection"),
+            (
+                "java/util/ImmutableCollections$StableMap$StableEntry",
+                "Collection",
+            ),
+            ("java/util/concurrent/ConcurrentSkipListMap$Values", "List"),
+            (
+                "java/util/concurrent/ConcurrentSkipListMap$KeySpliterator",
+                "List",
+            ),
+        ] {
+            assert!(
+                !simple_name_has_word(name, term),
+                "{name} is not a {term} — its ENCLOSING class is"
+            );
+        }
+        // 2. A cursor is not the thing it walks. Every row here has the term
+        //    IN its simple name, so each one really does reach the iterator
+        //    arm; a row like `ArrayList$Itr`/`List` would pass vacuously
+        //    (simple name `Itr` contains no `List`) and is deliberately not
+        //    used. All MEASURED false on HotSpot.
+        for (name, term) in [
+            ("java/util/ImmutableCollections$SetN$SetNIterator", "Set"),
+            ("java/util/ImmutableCollections$ListItr", "List"),
+            ("java/util/ArrayList$ListItr", "List"),
+            ("java/util/LinkedList$ListItr", "List"),
+            ("java/util/ArrayList$ArrayListSpliterator", "List"),
+        ] {
+            assert!(
+                !simple_name_has_word(name, term),
+                "{name} is a cursor OVER a {term}, not a {term}"
+            );
+        }
+        // 3. "contains" is not "is". Both MEASURED false on HotSpot.
+        assert!(
+            !simple_name_has_word("java/util/concurrent/locks/AbstractQueuedSynchronizer", "Queue"),
+            "AbstractQueuedSynchronizer contains \"Queue\" and is not one"
+        );
+        assert!(
+            !simple_name_has_word("java/util/TooManyListenersException", "List"),
+            "TooManyListenersException contains \"List\" and is not one"
+        );
+        // 4. The admissions that must SURVIVE, covering all three closing
+        //    shapes the word test allows. All MEASURED true on HotSpot.
+        assert!(
+            simple_name_has_word("java/util/ArrayList", "List"),
+            "the term ENDS the simple name"
+        );
+        assert!(
+            simple_name_has_word(
+                "java/util/ImmutableCollections$StableMap$StableMapEntrySet",
+                "Set"
+            ),
+            "…EntrySet is a Set (measured true) and is nested two deep inside \
+             a Map — the container rule must not swallow it"
+        );
+        assert!(
+            simple_name_has_word("java/util/ImmutableCollections$SetN", "Set"),
+            "the term is followed by another capitalised word"
+        );
+        assert!(
+            simple_name_has_word("java/util/ImmutableCollections$List12", "List"),
+            "a digit closes the word too"
+        );
+        assert!(simple_name_has_word("java/util/HashSet", "Set"));
+        assert!(simple_name_has_word("java/util/ArrayDeque", "Deque"));
+        // NOT asserted, and the reason is a correction to this function's own
+        // doc comment: it cites `WorkQueue` and `ListResourceBundle` as
+        // admissions the word rule is careful not to lose. MEASURED on
+        // HotSpot 25.0.3+9, both are FALSE —
+        // `Queue.class.isAssignableFrom(ForkJoinPool$WorkQueue)` and
+        // `List.class.isAssignableFrom(ListResourceBundle)` are both `false`.
+        // They are over-admissions this heuristic knowingly keeps (it can
+        // only ADMIT), not correct admissions it preserves, so pinning them
+        // green would pin the wrong claim. See
+        // docs/known-issues/jdk-only/F32-1-the-proxy-route-and-the-drifted-twin-20260813.md §6.
+    }
 }
