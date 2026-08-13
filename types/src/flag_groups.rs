@@ -1159,6 +1159,11 @@ pub const INVENTORY: &[E] = &[
     // and `pqc` do not — the ON side is the default, not a variable.
     E { group: Group::REAL, token: "mxbean-mapping", on_key: None, off_key: Some("CRATONVM_SYNTHETIC_MXBEAN_MAPPING"), off_word: None },
     E { group: Group::REAL, token: "net-sockets", on_key: Some("CRATONVM_REAL_NET_SOCKETS"), off_key: Some("CRATONVM_SYNTHETIC_NET_SOCKETS"), off_word: None },
+    // Declared 2026-08-13. Netty's real `netty_tcnative` library became the
+    // default that day (its `JNI_OnLoad` runs and the
+    // `io/netty/internal/tcnative` stubs stand down); this is its opt-out, so
+    // it has no `on_key` for the same reason `raf` and `pqc` do not.
+    E { group: Group::REAL, token: "netty-tcnative", on_key: None, off_key: Some("CRATONVM_SYNTHETIC_NETTY_TCNATIVE"), off_word: None },
     E { group: Group::REAL, token: "pqc", on_key: None, off_key: Some("CRATONVM_SYNTHETIC_PQC"), off_word: None },
     E { group: Group::REAL, token: "proxy", on_key: Some("CRATONVM_REAL_PROXY"), off_key: None, off_word: Some("0") },
     E { group: Group::REAL, token: "proxy-strict", on_key: Some("CRATONVM_REAL_PROXY_STRICT"), off_key: None, off_word: None },

@@ -36,8 +36,11 @@ here beyond the summary counts. Whatever changed to put BouncyCastle on the
 classpath (a dependency version bump? a `common.args` change?) should be
 identified first, since it may explain other classpath-dependent deltas
 noticed the same day (e.g. `SslContextBuilderTest`'s HotSpot baseline moving
-from documented 9 ok/9 fail to a fresh 21/21 — see
-`ssl-cert-validation-residuals-20260813.md`).
+from documented 9 ok/9 fail to a fresh 21/21). **Answered 2026-08-13:** that
+particular shift was netty-tcnative reaching the classpath, so HotSpot gained an
+OpenSSL provider CratonVM refused to load — see the retired
+`ssl-cert-validation-residuals` write-up. It does not explain BouncyCastle, so
+the question this doc asks is still open for BC.
 
 ## Repro
 
@@ -52,7 +55,7 @@ bash run-netty-suite.sh --list /tmp/one.txt --hotspot --shards 1 --timeout 180 -
 
 - `docs/internal/fixed-suite-bugs/netty-batch11-inet6-and-sha1-oid-CLOSED-20260812.md`
   — cause 6, the now-stale "not a defect" verdict this doc supersedes.
-- `docs/known-issues/netty/ssl-cert-validation-residuals-20260813.md` —
-  another class (`SslContextBuilderTest`) whose HotSpot baseline moved the
-  same way, suggesting a shared classpath/environment change rather than
-  two unrelated coincidences.
+- the retired `ssl-cert-validation-residuals` write-up — another class
+  (`SslContextBuilderTest`) whose HotSpot baseline moved the same way. Its
+  cause was found (netty-tcnative on the classpath) and fixed on 2026-08-13;
+  BouncyCastle's appearance is still unexplained.

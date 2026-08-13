@@ -16250,12 +16250,28 @@ impl<'a> NativeSystemAccess for NativeContextImpl<'a> {
         // This allows the library to register its native methods via RegisterNatives.
         // Safety: JNI_OnLoad has a fixed, well-known signature.
         //
-        // Windows: Apache `tcnative-*.dll` and Netty `*tcnative*.dll` often fault
-        // inside `JNI_OnLoad` / `RegisterNatives` when paired with CratonVM. We keep
-        // the DLL loaded (classpath / Tomcat may probe for its presence) but skip
-        // `JNI_OnLoad` — Java entry points are satisfied via Rust stubs and
-        // `find_jni_native` / `resolve_jni_native_in_libraries` blocks for
-        // `org/apache/tomcat/jni/**` and `io/netty/internal/tcnative/**`.
+        // Windows: Apache `tcnative-*.dll` faults inside `JNI_OnLoad` /
+        // `RegisterNatives` when paired with CratonVM. We keep the DLL loaded
+        // (classpath / Tomcat may probe for its presence) but skip `JNI_OnLoad`
+        // — Java entry points are satisfied by Rust stubs and `find_jni_native`
+        // / `resolve_jni_native_in_libraries` blocks for
+        // `org/apache/tomcat/jni/**`.
+        //
+        // Netty's `netty_tcnative_*` USED to be skipped by the same rule. It no
+        // longer is: that blanket skip was written when `RegisterNatives` could
+        // not serve the `FindClass` + `RegisterNatives` idiom every `JNI_OnLoad`
+        // uses at all (see `native/jni.rs`'s index-215 note — `FindClass`
+        // returned NULL, so the whole path was dead and any library that tried
+        // it produced an `UnsatisfiedLinkError` at best). With that fixed, the
+        // skip has one visible consequence and no remaining benefit:
+        // `OpenSsl.isAvailable()` is permanently false, so netty's own suites
+        // silently stop generating every `SslProvider.OPENSSL` /
+        // `OPENSSL_REFCNT` parameter — `ParameterizedSslHandlerTest` enumerated
+        // 7 of HotSpot's 63 tests, `SslErrorTest` 0 of 72 — and the
+        // `SslContextBuilder`/`CloseNotify`/`OpenSslKeyMaterialManager` classes
+        // fail the OpenSSL half outright. Measured against HotSpot 25 with the
+        // same classpath; see the retired `ssl-suite-test-discovery-undercounts`
+        // write-up.
         let basename_lc = std::path::Path::new(resolved.as_str())
             .file_name()
             .and_then(|s| s.to_str())
@@ -16274,9 +16290,27 @@ impl<'a> NativeSystemAccess for NativeContextImpl<'a> {
         // CratonVM's own TLS surface (`t27_tls.rs`), and the Java entry
         // points conscrypt's Java-side classes call into are satisfied by
         // `register_conscrypt_native_bridges` in native-builtins/src/tls.rs.
-        let skip_jni_onload_tcnative =
-            basename_lc.contains("tcnative") || basename_lc.contains("conscrypt_openjdk_jni");
+        // Netty ships its binding as `netty_tcnative_<os>_<arch>` (and extracts
+        // it under that name), Tomcat's APR binding as `tcnative-1`. Matching on
+        // the `netty` prefix is what keeps the two apart — a bare `tcnative`
+        // substring matches both.
+        let is_netty_tcnative = basename_lc.contains("netty_tcnative");
+        // Escape hatch for a host whose netty tcnative build does fault under
+        // our JNI ABI: `CRATONVM_SYNTHETIC_NETTY_TCNATIVE=1` restores the
+        // stub-only behaviour, and `OpenSsl.isAvailable()` goes back to `false`.
+        let netty_tcnative_opt_out = cratonvm_types::flags::flags()
+            .io
+            .synthetic_netty_tcnative_forced;
+        let skip_jni_onload_tcnative = (basename_lc.contains("tcnative")
+            && (!is_netty_tcnative || netty_tcnative_opt_out))
+            || basename_lc.contains("conscrypt_openjdk_jni");
 
+        // Whether `JNI_OnLoad` actually ran to completion for a netty tcnative
+        // library. Only that flips `netty_tcnative_real` — the library being on
+        // disk proves nothing, and dropping the stubs for a package whose real
+        // entry points were never registered would turn a working stub surface
+        // into `UnsatisfiedLinkError`s.
+        let mut netty_tcnative_onload_ran = false;
         unsafe {
             type JniOnLoad = extern "C" fn(
                 crate::native::jni::JavaVM,
@@ -16296,11 +16330,40 @@ impl<'a> NativeSystemAccess for NativeContextImpl<'a> {
                     // Safety: `self.thread` is the live `&mut JvmThread` borrowed
                     // for this call; it outlives `_jni_guard` per `set_jni_thread`.
                     let _jni_guard = JniContextGuard::install(self.shared, self.thread as *mut _);
-                    let _version = sym(crate::native::jni::get_java_vm(), std::ptr::null_mut());
+                    let version = sym(crate::native::jni::get_java_vm(), std::ptr::null_mut());
                     // `_jni_guard` clears the TLS context on scope exit (normal or
                     // unwind).
+                    //
+                    // netty_jni_util returns the requested JNI version on success
+                    // and `JNI_ERR` (-1) when any of its `FindClass` /
+                    // `RegisterNatives` steps failed. Treating -1 as success would
+                    // retire the stubs for a package with nothing behind it.
+                    netty_tcnative_onload_ran = is_netty_tcnative && version > 0;
                 }
             }
+        }
+        if netty_tcnative_onload_ran {
+            self.shared
+                .natives
+                .netty_tcnative_real
+                .store(true, std::sync::atomic::Ordering::Release);
+            // Retire the `SyntheticStub` stand-ins for this package in ONE
+            // place — the registry's own lookup — rather than at the dispatch
+            // sites. `vm_exec`'s general `is_native` arm is only one of several
+            // routes into the registry: `try_stackless_invoke`'s
+            // `resolve_step1_native` reaches it first for a plain zero-arg
+            // static, which is exactly the shape of
+            // `Library.initialize0()Z`. Suppressing only the `vm_exec` site
+            // produced a half-real package that ran real `aprVersionString`
+            // (1.7.5) and real `SSL.versionString` (BoringSSL) but a stubbed
+            // `initialize0` returning `true` without calling `apr_initialize`
+            // — so `tcn_global_pool` stayed NULL and the first real
+            // `SSLContext.make` took a SIGSEGV inside `apr_pool_create_ex`
+            // with a NULL parent pool.
+            self.shared
+                .natives
+                .native_methods
+                .mute_netty_tcnative_stubs();
         }
 
         let mut libs = self.shared.natives.native_libraries.lock();
@@ -25579,8 +25642,18 @@ fn invoke_on_class_shared_inner(
         // `dispatch_jni_native` on Windows — using `find_jni_native` / dlsym
         // resolution here would bypass the Rust stub registry and fault with
         // 0xC0000005 during Spring Boot startup.
+        //
+        // `io/netty/internal/tcnative/**` is only refused while the real
+        // library has NOT been loaded — i.e. while the Rust stubs above are the
+        // only thing behind the package. Once `netty_tcnative_real` is set the
+        // stubs have stood down, so refusing here too would leave the package
+        // with nothing at all.
         let skip_jni_incompatible_host_lib = class_name.starts_with("org/apache/tomcat/jni/")
-            || class_name.starts_with("io/netty/internal/tcnative/");
+            || (class_name.starts_with("io/netty/internal/tcnative/")
+                && !shared
+                    .natives
+                    .netty_tcnative_real
+                    .load(std::sync::atomic::Ordering::Acquire));
 
         if let Some(callback) = registry_native {
             // CAPABILITY GATE, dispatch site 3 of 3 — the general

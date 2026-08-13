@@ -94,4 +94,55 @@ pub struct NativeRealm {
     /// whether this VM's class manager has concrete bytecode for the triple.
     /// Contract §2 forbids a process global for exactly that kind of state.
     pub matcher_leaf_admission: [std::sync::atomic::AtomicU64; 8],
+
+    /// Set once Netty's `netty_tcnative` shared library has been loaded AND its
+    /// `JNI_OnLoad` has run, i.e. the real BoringSSL/OpenSSL binding is live in
+    /// this VM.
+    ///
+    /// Two dispatch decisions read it, and both must flip together or the
+    /// package ends up half-real:
+    ///
+    /// * `vm_exec`'s `skip_jni_incompatible_host_lib` stops refusing
+    ///   `io/netty/internal/tcnative/**` symbol resolution, so the
+    ///   `RegisterNatives` pointers the library just published are reachable;
+    /// * the `SyntheticStub` registrations from
+    ///   `register_netty_internal_tcnative_natives` step aside, because the
+    ///   registry arm is checked BEFORE the JNI arm — leaving them in place
+    ///   would serve `SSL.initialize`/`SSL.version`/every
+    ///   `NativeStaticallyReferencedJniMethods` constant from the stub table
+    ///   while the rest of the package ran against real BoringSSL state.
+    ///
+    /// Per-VM rather than a `static` for the same reason `jni_native_methods`
+    /// is (Contract §2): a sibling VM in this process may not have loaded the
+    /// library at all, and must keep getting the stubs.
+    pub netty_tcnative_real: std::sync::atomic::AtomicBool,
+}
+
+/// A loaded JNI library outlives the VM that loaded it — deliberately.
+///
+/// `libloading::Library`'s `Drop` is a `dlclose`/`FreeLibrary`, and dropping the
+/// realm would issue one for every library still in the vector. That is not
+/// merely wasteful, it is unsound in the same way the explicit-unload path
+/// already documents (`NativeSystemAccess::unload_native_library` tombstones an
+/// index rather than dropping the handle): code the process is still going to
+/// execute lives in that mapping.
+///
+/// The concrete failure is a `pthread` thread-specific-data destructor.
+/// BoringSSL and APR — reached through `netty_tcnative` — register their
+/// per-thread cleanup with `pthread_key_create`, and glibc runs those
+/// destructors in `__nptl_deallocate_tsd` as the thread *finishes exiting*,
+/// which is after `run()` has returned and the realm has been dropped. With the
+/// library unmapped, the destructor address is dangling and the VM took a
+/// SIGSEGV at `0x…` in the unmapped range on every OpenSSL-touching netty class
+/// — after `@@RESULT` had already been printed, so it read as a mystery
+/// post-run crash rather than a teardown bug.
+///
+/// HotSpot has the same rule: a JNI library, once loaded, is never `dlclose`d
+/// for the life of the process. Leaking the handle is the fix, not a workaround.
+impl Drop for NativeRealm {
+    fn drop(&mut self) {
+        for lib in self.native_libraries.get_mut().drain(..) {
+            std::mem::forget(lib);
+        }
+    }
 }

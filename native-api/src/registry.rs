@@ -5017,6 +5017,10 @@ const REGISTRY_EPOCH_STRIDE: u32 = 1 << 20;
 static NEXT_REGISTRY_EPOCH: std::sync::atomic::AtomicU32 =
     std::sync::atomic::AtomicU32::new(REGISTRY_EPOCH_STRIDE);
 
+/// The one package whose registrations can be retired at runtime — see
+/// [`NativeMethodRegistry::mute_netty_tcnative_stubs`].
+const NETTY_TCNATIVE_PACKAGE: &str = "io/netty/internal/tcnative/";
+
 /// One entry of the registry's dense slot table — the single place a resolved
 /// native lives.
 ///
@@ -5123,6 +5127,29 @@ pub struct NativeMethodRegistry {
     /// `REGISTRY_EPOCH_STRIDE`-wide range makes that a re-resolve instead of a
     /// wrong answer.
     registry_epoch: u32,
+    /// Set once this VM has loaded Netty's real `netty_tcnative` library and run
+    /// its `JNI_OnLoad`; from then on every lookup under
+    /// `io/netty/internal/tcnative/` misses, so dispatch falls through to the
+    /// `RegisterNatives` pointers the library published.
+    ///
+    /// This lives on the registry rather than at a dispatch site because the
+    /// registry is the only choke point all the routes share. `vm_exec`'s
+    /// general `is_native` arm, `try_stackless_invoke`'s `resolve_step1_native`,
+    /// and `dispatch_static`'s skip-clinit probe each reach the table
+    /// independently, and a stub retired at one of them is still live at the
+    /// others — which is not a cosmetic difference: it left
+    /// `Library.initialize0()Z` (a plain zero-arg static, so the stackless path
+    /// claims it) answering `true` without ever calling `apr_initialize`, while
+    /// the rest of the package ran against the real library. The first real
+    /// `SSLContext.make` then dereferenced the never-created `tcn_global_pool`
+    /// and took a SIGSEGV.
+    ///
+    /// The registry is per-`SharedVm`, so muting is per-VM: a sibling VM that
+    /// never loaded the library keeps its stubs.
+    ///
+    /// Only ever set, never cleared — a `dlclose` cannot un-publish the
+    /// function pointers `find_jni_native` already holds.
+    netty_tcnative_muted: std::sync::atomic::AtomicBool,
     /// Append-only registration log: the original `(class, method, descriptor)`
     /// triples, kept as `Box<str>` rather than `String` to minimize per-entry
     /// overhead. This replaces the previous `FxHashMap<u64, String>` reverse map
@@ -5372,6 +5399,7 @@ impl NativeMethodRegistry {
             ),
             registry_epoch: NEXT_REGISTRY_EPOCH
                 .fetch_add(REGISTRY_EPOCH_STRIDE, std::sync::atomic::Ordering::Relaxed),
+            netty_tcnative_muted: std::sync::atomic::AtomicBool::new(false),
             registrations: Vec::with_capacity(BOOT_REGISTRATION_HINT),
             provenance: Vec::with_capacity(BOOT_REGISTRATION_HINT),
             by_method_desc: FxHashMap::with_capacity_and_hasher(
@@ -7356,6 +7384,25 @@ impl NativeMethodRegistry {
         self.slots.get(idx as usize)
     }
 
+    /// Retire this registry's `io/netty/internal/tcnative/**` stand-ins,
+    /// permanently, for this VM.
+    ///
+    /// Called from the library-load path the moment Netty's real
+    /// `netty_tcnative` `JNI_OnLoad` has run. See the
+    /// [`netty_tcnative_muted`](Self) field doc for why the decision cannot
+    /// live at a dispatch site.
+    pub fn mute_netty_tcnative_stubs(&self) {
+        self.netty_tcnative_muted
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Whether [`mute_netty_tcnative_stubs`](Self::mute_netty_tcnative_stubs)
+    /// has been called on this registry.
+    pub fn netty_tcnative_stubs_muted(&self) -> bool {
+        self.netty_tcnative_muted
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// The one place a 128-bit digest is turned into a slot index — and the one
     /// place the full name is verified.
     ///
@@ -7383,6 +7430,20 @@ impl NativeMethodRegistry {
         let slot = self.slots.get(idx as usize)?;
         let (c, m, d) = self.registrations.get(slot.reg_index as usize)?;
         if c.as_ref() == class_name && m.as_ref() == method_name && d.as_ref() == descriptor {
+            // Retired stand-ins (see `netty_tcnative_muted`). This is the one
+            // place every resolution route — `slot_for_exact`, the
+            // descriptor-quirk rewrite, and the precomputed-digest
+            // `resolve_id_by_key` — turns a digest into a slot, so a single
+            // check here cannot be routed around. It sits on the confirmed-hit
+            // edge, past the `slot_by_key` probe, so a miss (the overwhelmingly
+            // common case) never even loads the flag.
+            if self
+                .netty_tcnative_muted
+                .load(std::sync::atomic::Ordering::Relaxed)
+                && class_name.starts_with(NETTY_TCNATIVE_PACKAGE)
+            {
+                return None;
+            }
             Some(idx)
         } else {
             None

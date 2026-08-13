@@ -3792,6 +3792,7 @@ impl SharedVm {
                 matcher_leaf_admission: std::array::from_fn(|_| {
                     std::sync::atomic::AtomicU64::new(0)
                 }),
+                netty_tcnative_real: std::sync::atomic::AtomicBool::new(false),
             },
 
             threads: crate::vm::realms::ThreadRealm {
