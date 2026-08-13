@@ -1,9 +1,10 @@
 # netty — investigate batch 02 of 13
 
-**Status: TRIAGED 2026-08-12. 14 of 15 classes match HotSpot; the 15th is
-blocked by a known JFR feature gap.** No CratonVM fix was needed on this page —
-its assertion failures were already cleared by the batch-01 and batch-07 fixes
-that landed on `dev` first.
+**Status: CLOSED 2026-08-13. 15 of 15 classes match HotSpot.** Triaged
+2026-08-12 at 14 of 15, with no CratonVM fix needed on this page — its assertion
+failures were already cleared by the batch-01 and batch-07 fixes that landed on
+`dev` first. The 15th, `JfrEventsTest`, was blocked by a JFR feature gap and is
+now 10/10; see [the update below](#update-2026-08-13--both-jfr-pages-are-closed).
 
 Part of a 184-class FAIL/HANG list split across 13 pages (see
 [investigate-INDEX.md](investigate-INDEX.md)) so work doesn't overlap. This page
