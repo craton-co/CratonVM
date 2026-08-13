@@ -12657,6 +12657,37 @@ impl GenerationalHeap {
                     .min(used);
                 let run_end = zero_run_end(base, cursor, limit);
                 if run_end - cursor >= HEADER_SIZE {
+                    // A run of EMPTY objects is not a desync, and here the
+                    // second half of the argument is what carries it: an empty
+                    // object has NO FIELDS, so a run of them contains no
+                    // young->old reference for this pass to find. Stepping over
+                    // it cannot miss a ref.
+                    //
+                    // That matters because this walk has no young live set to
+                    // hand the predicate — a major cycle retains young
+                    // conservatively and deliberately walks live and dead
+                    // objects alike, so there is nothing to pass but `&[]` and
+                    // the no-marked-base-inside condition is vacuous. The
+                    // alignment and plausible-next-header conditions still
+                    // apply, and they are the two that establish that `resume`
+                    // is on-grid.
+                    //
+                    // The anomaly arm below is not free: it re-anchors at the
+                    // next free block and falls back to a CONSERVATIVE scan of
+                    // the skipped stretch, marking every word that looks like an
+                    // old-gen base. Measured on `probes/GcWalkProbe.java`, it
+                    // fired on 4 of 4 entries — i.e. every major cycle seeded
+                    // young->old from a conservative scan rather than a parse.
+                    if let Some(resume) =
+                        zero_run_empty_object_resume(base, cursor, run_end, used, &[])
+                    {
+                        SWEEP_ZERO_SPAN_EMPTY_RUNS.fetch_add(1, Ordering::Relaxed);
+                        EMPTY_RUN_BYTES_CYCLE
+                            .fetch_add((resume - cursor) as u64, Ordering::Relaxed);
+                        cursor = resume;
+                        continue;
+                    }
+                    LATE_WALK_ZERO_RUNS[0].fetch_add(1, Ordering::Relaxed);
                     anomaly = true;
                 }
             }
@@ -12943,6 +12974,7 @@ impl GenerationalHeap {
                     .min(used);
                 let run_end = zero_run_end(base, cursor, limit);
                 if run_end - cursor >= HEADER_SIZE {
+                    LATE_WALK_ZERO_RUNS[1].fetch_add(1, Ordering::Relaxed);
                     anomaly = true;
                 }
             }
@@ -14281,6 +14313,7 @@ impl GenerationalHeap {
                         .min(used);
                     let run_end = zero_run_end(base, offset, limit);
                     if run_end - offset >= HEADER_SIZE {
+                        LATE_WALK_ZERO_RUNS[2].fetch_add(1, Ordering::Relaxed);
                         anomaly = true;
                     }
                 }
@@ -16672,6 +16705,17 @@ pub static EVAC_UNWIND_REASONS: [AtomicU64; 4] = [
 /// Candidates dropped by those unwinds, summed. The count per event is what
 /// makes this expensive (37 354 in one, measured), not the number of events.
 pub static EVAC_UNWIND_CANDIDATES: AtomicU64 = AtomicU64::new(0);
+
+/// Zero-run anomaly hits at the three walks that still carry the old rule,
+/// indexed as [`YOUNG_WALK_ENTRIES`] `2`..`4`: `0` `mark_young_to_old_refs`,
+/// `1` `fixup_young_old_refs`, `2` `walk_young_objects`. Separate from the
+/// entry counts because "ran and did not see the shape" and "never ran" are
+/// different answers and both are worth being able to prove.
+pub static LATE_WALK_ZERO_RUNS: [AtomicU64; 3] = [
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+];
 
 pub static YOUNG_WALK_ENTRIES: [AtomicU64; 5] = [
     AtomicU64::new(0),
