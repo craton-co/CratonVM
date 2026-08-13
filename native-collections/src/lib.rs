@@ -3873,6 +3873,24 @@ enum AlLayout {
 }
 
 impl AlLayout {
+    /// `true` when the receiver's class alone rules out every wrapper/view
+    /// route a `native_al_*` entry point checks before doing its own work.
+    ///
+    /// `ksv_route` asks whether the receiver is a
+    /// `ConcurrentHashMap$KeySetView`; `unmod_receiver_backing` whether it is
+    /// one of the `cratonvm/internal/Unmodifiable*` views. Neither can be an
+    /// `ArrayList`, a `Vector` or a map-view carrier — they are named classes
+    /// with their own layouts, so they classify as [`AlLayout::Foreign`]. Every
+    /// `native_al_*` entry point ran both anyway, on every ordinary list, at a
+    /// combined 3.5% of a flat `ArrayList.size()` profile (`ksv_route` 1.3%,
+    /// `unmod_receiver_backing` 1.0%, and the `class_name_rc` it drives 1.3%).
+    /// This answers both from the memo the operation is about to consult for
+    /// its slot layout anyway.
+    #[inline]
+    fn rules_out_wrapper_routes(self) -> bool {
+        matches!(self, AlLayout::ArrayList | AlLayout::Vector)
+    }
+
     /// The verdict [`al_is_list_layout`] returns for an object of this class.
     /// `n_fields` is the receiver's own field count, which every caller has
     /// already read for the slot bounds check.
@@ -4803,6 +4821,16 @@ fn unmod_list_oob_error(
 }
 
 fn unmod_receiver_backing(ctx: &mut dyn NativeContext, this: ObjectRef) -> Option<ObjectRef> {
+    // The receiver's CLASS answers this outright for every ordinary list, from
+    // a memo the operation is about to consult anyway — see
+    // `AlLayout::rules_out_wrapper_routes`. Without it this function ran a
+    // `class_id_of_object`, a `class_name_rc` and a `starts_with` on every
+    // `size()`/`get()`/`isEmpty()` of every `ArrayList` in the process, for an
+    // answer the class had already settled: 1.0% of a flat `ArrayList.size()`
+    // profile here plus the 1.3% `class_name_rc` it drives.
+    if al_slots_and_layout_for(&*ctx, this).1.rules_out_wrapper_routes() {
+        return None;
+    }
     // `class_name_rc` is the memoized reader; `class_name_of_id` takes the
     // class-manager read lock and allocates a fresh `String` on EVERY call.
     // This runs on the hot path of every `native_al_*` entry point.
