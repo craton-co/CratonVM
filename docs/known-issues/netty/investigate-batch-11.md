@@ -22,7 +22,7 @@ The seven causes, best entry points first:
    (hangs; `NoSuchMethodError: DatagramChannel.localAddress()` kills the
    resolver thread) and `DnsNameResolverTest`. The signature matches the
    **already-filed** [`NioDatagramChannel.bind()` throwing
-   `StacklessClosedChannelException`](pcap-write-handler-three-residuals-20260812.md)
+   `StacklessClosedChannelException`, **RESOLVED 2026-08-13**](../../internal/fixed-suite-bugs/netty-pcap-write-handler-udp-bind-and-tcp-close-FIXED-20260813.md)
    from batch 09. Try that fix first — it may clear three classes here and
    three there.
 2. **`Inet6Address.getByAddress` folds an IPv4-mapped address to 4 bytes**

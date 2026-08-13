@@ -5,7 +5,7 @@
 with a null `Enum.name()`, so `Enum.valueOf` could never match one — which
 broke `org.mockito.internal.debugging.Java9PlusLocationImpl.<clinit>`, and with
 it every Mockito-backed test in netty's http2 module. Full analysis in
-[stackwalker-option-clinit-nameless-constants-20260812.md](stackwalker-option-clinit-nameless-constants-20260812.md).
+[stackwalker-option-clinit-nameless-constants — **RESOLVED**](../../internal/fixed-suite-bugs/netty-stackwalker-option-clinit-nameless-constants-FIXED-20260813.md).
 All 15 classes now pass on the Linux host, matching stock HotSpot
 test-for-test (343 tests, 0 failures).
 

@@ -32,7 +32,10 @@ path reads `.../native-image/null/null/...`. Not VM defects.
 a ~50-line repro needing no netty test), TCP close packets that are never
 written although `handlerRemoved` demonstrably runs, and a >4 GB test that
 times out. See
-[pcap-write-handler-three-residuals-20260812.md](pcap-write-handler-three-residuals-20260812.md).
+[pcap-write-handler-three-residuals — **RESOLVED 2026-08-13**](../../internal/fixed-suite-bugs/netty-pcap-write-handler-udp-bind-and-tcp-close-FIXED-20260813.md).
+All three residuals are dispositioned there: two were VM defects (the UDP one
+three defects deep) and the third is the per-call throughput gap, re-filed on
+[the throughput page](adaptive-bytebuf-allocator-throughput-20260812.md).
 
 Original triage notes follow.
 

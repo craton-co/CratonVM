@@ -2679,13 +2679,6 @@ pub(super) fn force_native_over_real_jdk_bytecode(
     {
         return true;
     }
-    if is_netty_event_executor_group_shutdown_native_override(
-        class_name,
-        method_name,
-        method_descriptor,
-    ) {
-        return true;
-    }
     if is_springboot_mongo_reactive_customizer_destroy_native_override(
         class_name,
         method_name,
@@ -5037,24 +5030,6 @@ pub(super) fn is_jfr_metadata_native_override(
             | ("jdk/jfr/Recording", "stop", "()Z")
             | ("jdk/jfr/Recording", "dump", "(Ljava/nio/file/Path;)V")
     )
-}
-
-/// Keep MongoDB Reactive Streams' Netty 4.2 group teardown bounded when a
-/// closed monitor callback keeps its default graceful-shutdown quiet period
-/// alive. The native checks the receiver class, so unrelated Netty executors
-/// continue through their original bytecode.
-pub(crate) fn is_netty_event_executor_group_shutdown_native_override(
-    class_name: &str,
-    method_name: &str,
-    method_descriptor: &str,
-) -> bool {
-    matches!(
-        class_name,
-        "io/netty/util/concurrent/EventExecutorGroup"
-            | "io/netty/util/concurrent/AbstractEventExecutorGroup"
-            | "io/netty/channel/MultiThreadIoEventLoopGroup"
-    ) && method_name == "shutdownGracefully"
-        && method_descriptor == "()Lio/netty/util/concurrent/Future;"
 }
 
 /// Spring Boot's Mongo reactive lifecycle bean waits indefinitely on a Netty
