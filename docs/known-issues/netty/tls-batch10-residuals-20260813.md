@@ -99,31 +99,35 @@ JSSE does not catch `Error`s there; a JUnit assertion failure inside a
 test method fails on HotSpot too (a port collision), so closing R5 changes the
 cause, not necessarily the count.
 
-## R6 — `JdkSslEngineTest` is SLOW, not hung — ~25×
+## R6 — `JdkSslEngineTest`: not a hang, and a 481-failure residual
 
-821 tests, **178 s on HotSpot**. Separated 2026-08-13 by counting `@@TEST`
-events against the clock on an idle host, which is what tells a stall from a
-slowdown:
+The retired page recorded this class as `rc=124` and wondered whether "at 178 s
+on HotSpot it may need nothing but a bigger cap". It needs a bigger cap **and**
+it is the largest single block of unexplained failures left in this suite.
 
-| | tests seen | elapsed | rate |
-|---|---|---|---|
-| HotSpot 25 | 821 (all) | 178 s | ~277 / min |
-| CratonVM | 274 | 1512 s | ~11 / min |
+Run to completion on an idle host, 2026-08-13:
 
-It keeps advancing the whole time, so it is **not** the `ParameterizedSslHandlerTest`
-species of hang that this batch's other timeout turned out to be — that one
-sat on a promise that could never complete, and is fixed. At the measured rate
-this class needs roughly **75 minutes**, so the retired page's guess that "at
-178 s on HotSpot it may need nothing but a bigger cap" is right about the
-mechanism and wrong about the size: 600 s and 1200 s are both far too small.
+| | tests | ok | failed | aborted | wall |
+|---|---|---|---|---|---|
+| HotSpot 25 | 821 | 755 | **0** | 66 | 96 s |
+| CratonVM | 821 | 274 | **481** | 66 | 1984 s |
 
-The rate is not uniform — a 240 s window early in the run covered 47 tests
-(~12 / min) and a later 400 s window covered 7 (~1 / min) — so specific
-parameterisations are pathologically slow rather than the whole class being
-uniformly heavy. Those are the ones to isolate first.
+So: **not a hang** — it finishes, and the earlier 600 s / 1200 s caps were
+simply too small. Both VMs abort the same 66 (netty-tcnative absent). What is
+left is 481 CratonVM failures against HotSpot's zero, and a **20.7x**
+wall-clock gap.
 
-Many of the tests it does reach also FAIL, so a completed run is still needed
-before this class's real failure count can be compared with HotSpot's.
+Two separate questions live here, and they should not be conflated:
+
+* **Correctness.** 481 failures across a parameterised matrix of
+  `{Heap, Direct, Mixed} x {TLSv1.2, TLSv1.3} x {cipher} x {delegate}`. The
+  parameterisation is the lever: comparing which *axis values* fail should
+  collapse this to a small number of causes rather than 481.
+* **Throughput.** 20.7x is not explained by the failures — a failing test is
+  usually faster, not slower. Measure it separately.
+
+Nothing on this page is a prerequisite for that work; this class was never part
+of the two root causes that were fixed.
 
 ## Repro (Linux host)
 
