@@ -3860,70 +3860,196 @@ fn cache_field_descriptor(shared: &SharedVm, key: (ClassId, usize), byte: u8) {
     cache.insert(key, byte);
 }
 
-/// Address of an `int` field's 4-byte payload — the ONE location the
-/// interpreter, the natives and the JIT's ATOMIC_INT intrinsic must all agree
-/// on, and all reach with the SAME primitive.
+/// `CRATONVM_DBG_HW_ATOMIC=1` — announce the first hardware field atomic of
+/// each kind. A perf or soundness claim about this path is not checkable
+/// without it: every guard in `hw_atomic_addr` fails CLOSED to the lock path,
+/// so a silently-never-taken fast path looks exactly like a working one.
+fn hw_atomic_dbg() -> bool {
+    static G: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *G.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_HW_ATOMIC").is_some()
+    })
+}
+
+static HW_ATOMIC_SEEN: [std::sync::atomic::AtomicBool; 3] = [
+    std::sync::atomic::AtomicBool::new(false),
+    std::sync::atomic::AtomicBool::new(false),
+    std::sync::atomic::AtomicBool::new(false),
+];
+
+/// Which payload a caller wants to touch with a hardware atomic, and how to
+/// prove the field really holds one.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum HwAtomicKind {
+    Int,
+    Long,
+    Reference,
+}
+
+impl HwAtomicKind {
+    fn matches_descriptor(self, d: u8) -> bool {
+        match self {
+            HwAtomicKind::Int => d == b'I',
+            HwAtomicKind::Long => d == b'J',
+            HwAtomicKind::Reference => d == b'L' || d == b'[',
+        }
+    }
+
+    /// The `Value` discriminant a LEGACY cell must ALREADY carry.
+    ///
+    /// Pinned by `field_cell_layout_matches_value_enum`: Int 0, Long 1,
+    /// Object 4. Null and non-null references share tag 4 — a JVM null is a
+    /// zero payload word, not a different tag — so a reference CAS across
+    /// null never has to rewrite the tag.
+    fn legacy_tag(self) -> u32 {
+        match self {
+            HwAtomicKind::Int => 0,
+            HwAtomicKind::Long => 1,
+            HwAtomicKind::Reference => 4,
+        }
+    }
+
+    fn payload_offset(self) -> usize {
+        match self {
+            HwAtomicKind::Int => cratonvm_types::FIELD_CELL_PAYLOAD32_OFFSET,
+            _ => cratonvm_types::FIELD_CELL_PAYLOAD64_OFFSET,
+        }
+    }
+
+    fn width(self) -> usize {
+        match self {
+            HwAtomicKind::Int => 4,
+            _ => 8,
+        }
+    }
+}
+
+/// Address of a field payload that may be updated with a HARDWARE atomic — the
+/// one location the interpreter, the natives and the JIT must all agree on, and
+/// all reach with the same primitive.
 ///
-/// Why this exists: `compare_and_swap_field` takes `monitors.with_cas_lock`
-/// plus the collector's `volatile_stripe_lock`. Those make the native path
-/// atomic against ITSELF, not against a hardware atomic issued from compiled
-/// code, so a compiled `LOCK XADD` racing an interpreted read-compare-write
-/// loses updates. Routing both through one aligned hardware atomic on this
-/// address is what makes the two modes atomic against EACH OTHER.
+/// Why this exists: `compare_and_swap_field` used to get its atomicity from
+/// `monitors.with_cas_lock` plus the collector's `volatile_stripe_lock`. Those
+/// make the native path atomic against ITSELF, not against a hardware atomic
+/// issued from compiled code, so a compiled `LOCK XADD` racing an interpreted
+/// read-compare-write lost updates (24,908 of 600,000, measured). Routing both
+/// through one aligned hardware atomic here is what makes the two modes atomic
+/// against EACH OTHER.
 ///
-/// The offsets come from [`cratonvm_jit::AtomicIntFieldLayout`], the same type
-/// the JIT computes its baked displacement from, and the COMPACT/LEGACY choice
-/// is made per OBJECT on the `GC_FLAG_COMPACT` header bit exactly as the
-/// codegen does — a class with a registered compact layout may still have
-/// legacy-laid-out instances. If the layout ever moves, both sides move
-/// together.
+/// Offsets come from [`cratonvm_jit::AtomicIntFieldLayout`], the same type the
+/// JIT bakes its displacement from, and the COMPACT/LEGACY arm is chosen per
+/// OBJECT on the `GC_FLAG_COMPACT` header bit exactly as the codegen does — a
+/// class with a registered compact layout may still have legacy-laid-out
+/// instances. If that layout moves, both sides move together.
 ///
-/// `None` means some precondition did not hold and the caller MUST fall back to
-/// the lock-based `Value`-cell path. Callers must pass an already
-/// forwarded `obj` (see `load_and_forward`).
-fn hw_atomic_int_addr(shared: &SharedVm, obj: ObjectRef, index: usize) -> Option<*mut i32> {
+/// `None` means a precondition did not hold and the caller MUST fall back to
+/// the lock-based `Value`-cell path. Callers pass an already-forwarded `obj`.
+fn hw_atomic_addr(
+    shared: &SharedVm,
+    obj: ObjectRef,
+    index: usize,
+    kind: HwAtomicKind,
+) -> Option<*mut u8> {
     // Arrays have no field layout; their elements keep the existing path.
     if shared.mem.heap.kind_of(obj) == cratonvm_types::ObjectKind::Array {
         return None;
     }
     let class_id = shared.mem.heap.class_id_of(obj);
-    // The slot must really be an `int`. This doubles as the bounds proof: the
-    // descriptor only resolves for a declared field index of this class.
-    if resolve_field_descriptor_byte_cached(shared, class_id, index)? != b'I' {
+    // The slot must really be of the requested type. This doubles as the bounds
+    // proof: the descriptor only resolves for a declared field of this class.
+    if !kind.matches_descriptor(resolve_field_descriptor_byte_cached(shared, class_id, index)?) {
         return None;
     }
     let header = shared.mem.heap.get_header(obj);
     let compact = header.gc_flags() & cratonvm_types::GC_FLAG_COMPACT != 0;
-    if !compact && index >= header.num_slots() as usize {
-        return None;
-    }
-    let layout = cratonvm_jit::AtomicIntFieldLayout::new(index, class_id.as_u32())?;
-    let off = if compact {
-        layout.value_compact_offset
+    let base = obj.as_ptr() as usize;
+
+    let addr = if compact {
+        // A compact body offset IS the payload address; there is no tag word,
+        // so there is nothing to guard. Refuse any width this atomic cannot
+        // address (a narrow reference, say) rather than tearing it.
+        let (body_off, storage) =
+            cratonvm_types::compact_field_storage(class_id.as_u32(), index)?;
+        if storage.size_runtime() as usize != kind.width() {
+            return None;
+        }
+        base.checked_add(cratonvm_types::HEADER_SIZE)?
+            .checked_add(body_off)?
     } else {
-        layout.value_legacy_offset
+        if index >= header.num_slots() as usize {
+            return None;
+        }
+        let cell = base
+            .checked_add(cratonvm_types::HEADER_SIZE)?
+            .checked_add(index.checked_mul(cratonvm_types::SLOT_SIZE)?)?;
+        // TAG GUARD. A LEGACY cell carries its type in the tag word, and
+        // `values_equal_for_cas` deliberately treats an uninitialized slot
+        // (which reads as `Object(None)`) as equal to a typed zero. Writing
+        // only the payload of such a cell would leave the tag saying `Object`,
+        // and the next descriptor-coercing read would hand back the coerced
+        // zero — losing the write. Take the hardware path only when the cell is
+        // already a properly tagged cell of this type; everything else falls
+        // back to the lock path, which keeps that coercion behaviour.
+        if cell % std::mem::align_of::<u32>() != 0 {
+            return None;
+        }
+        // SAFETY: `cell` is the start of a live 16-byte `Value` slot.
+        let tag = unsafe {
+            (*(cell as *const std::sync::atomic::AtomicU32))
+                .load(std::sync::atomic::Ordering::Relaxed)
+        };
+        if tag != kind.legacy_tag() {
+            return None;
+        }
+        cell.checked_add(kind.payload_offset())?
     };
-    if off < 0 {
-        return None;
-    }
-    let addr = (obj.as_ptr() as usize).checked_add(off as usize)?;
+
     // A hardware atomic requires natural alignment; anything else would be a
     // torn access rather than a slow one, so refuse instead of degrading.
-    if addr % std::mem::align_of::<i32>() != 0 {
+    if addr % kind.width() != 0 {
         return None;
     }
-    Some(addr as *mut i32)
+    if hw_atomic_dbg() {
+        let slot = match kind {
+            HwAtomicKind::Int => 0usize,
+            HwAtomicKind::Long => 1,
+            HwAtomicKind::Reference => 2,
+        };
+        if !HW_ATOMIC_SEEN[slot].swap(true, std::sync::atomic::Ordering::Relaxed) {
+            eprintln!(
+                "[hw-atomic] first {:?} field atomic: class_id={} index={} layout={}",
+                kind,
+                class_id.as_u32(),
+                index,
+                if compact { "compact" } else { "legacy" },
+            );
+        }
+    }
+    Some(addr as *mut u8)
 }
 
-/// Borrow the payload as an `AtomicI32`.
-///
 /// # Safety
-/// `addr` must come from [`hw_atomic_int_addr`] for a live, already-forwarded
-/// object, and the caller must not let the object move for the duration of the
-/// borrow. Natives run without reaching a safepoint, so a relocating collector
-/// cannot move the object underneath a single atomic op.
-unsafe fn hw_atomic_int<'a>(addr: *mut i32) -> &'a std::sync::atomic::AtomicI32 {
+/// `addr` must come from [`hw_atomic_addr`] with the matching [`HwAtomicKind`]
+/// for a live, already-forwarded object. Natives run without reaching a
+/// safepoint, so a relocating collector cannot move the object underneath a
+/// single atomic op.
+unsafe fn hw_atomic_i32<'a>(addr: *mut u8) -> &'a std::sync::atomic::AtomicI32 {
     &*(addr as *const std::sync::atomic::AtomicI32)
+}
+
+/// # Safety
+/// See [`hw_atomic_i32`].
+unsafe fn hw_atomic_i64<'a>(addr: *mut u8) -> &'a std::sync::atomic::AtomicI64 {
+    &*(addr as *const std::sync::atomic::AtomicI64)
+}
+
+/// # Safety
+/// See [`hw_atomic_i32`]. The payload word of a reference cell is the raw
+/// pointer (or zero for a JVM null), which is what `values_equal_for_cas`
+/// compares references by, so a bit-level CAS here matches the lock path's
+/// semantics exactly.
+unsafe fn hw_atomic_usize<'a>(addr: *mut u8) -> &'a std::sync::atomic::AtomicUsize {
+    &*(addr as *const std::sync::atomic::AtomicUsize)
 }
 
 fn resolve_field_descriptor_byte_cached(
@@ -12289,11 +12415,11 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
         delta: i32,
     ) -> Result<i32, MethodCallFailed> {
         let obj = self.shared.mem.heap.load_and_forward(obj);
-        if let Some(addr) = hw_atomic_int_addr(self.shared, obj, index) {
-            // SAFETY: `addr` is a live, forwarded, 4-byte-aligned `int` payload
-            // (see `hw_atomic_int_addr`); this single atomic cannot reach a
-            // safepoint, so the object cannot move under it.
-            let cell = unsafe { hw_atomic_int(addr) };
+        if let Some(addr) = hw_atomic_addr(self.shared, obj, index, HwAtomicKind::Int) {
+            // SAFETY: `addr` is a live, forwarded, aligned `int` payload in a
+            // correctly tagged cell (see `hw_atomic_addr`); this single atomic
+            // cannot reach a safepoint, so the object cannot move under it.
+            let cell = unsafe { hw_atomic_i32(addr) };
             return Ok(cell.fetch_add(delta, std::sync::atomic::Ordering::SeqCst));
         }
         // Fall back to the trait's CAS retry loop for anything the hardware
@@ -12321,6 +12447,44 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
         }
     }
 
+    /// Hardware `fetch_add` on a `long` field — the `AtomicLong` analogue of
+    /// [`Self::atomic_fetch_add_int`], and unified for the same reason: a
+    /// future 64-bit atomic intrinsic must be in the same domain as this.
+    fn atomic_fetch_add_long(
+        &mut self,
+        obj: ObjectRef,
+        index: usize,
+        delta: i64,
+    ) -> Result<i64, MethodCallFailed> {
+        let obj = self.shared.mem.heap.load_and_forward(obj);
+        if let Some(addr) = hw_atomic_addr(self.shared, obj, index, HwAtomicKind::Long) {
+            // SAFETY: see `atomic_fetch_add_int`.
+            let cell = unsafe { hw_atomic_i64(addr) };
+            return Ok(cell.fetch_add(delta, std::sync::atomic::Ordering::SeqCst));
+        }
+        loop {
+            let current = self.get_field_volatile(obj, index);
+            let old = match current {
+                Value::Long(v) => v,
+                other => {
+                    return Err(MethodCallFailed::InternalError(
+                        RuntimeError::IllegalArgumentException {
+                            message: format!(
+                                "atomic_fetch_add_long: field {} on object is not Long: {:?}",
+                                index, other
+                            ),
+                        }
+                        .into(),
+                    ));
+                }
+            };
+            let new_val = Value::Long(old.wrapping_add(delta));
+            if self.compare_and_swap_field(obj, index, current, new_val) {
+                return Ok(old);
+            }
+        }
+    }
+
     fn compare_and_swap_field(
         &mut self,
         obj: ObjectRef,
@@ -12334,20 +12498,69 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
         // lock-based read-compare-write is not. No SATB pre-barrier and no
         // write barrier here — the payload is primitive, so no reference is
         // overwritten and none escapes.
-        if let (Value::Int(exp), Value::Int(new)) = (expected, new_val) {
-            let fwd = self.shared.mem.heap.load_and_forward(obj);
-            if let Some(addr) = hw_atomic_int_addr(self.shared, fwd, index) {
-                // SAFETY: see `atomic_fetch_add_int`.
-                let cell = unsafe { hw_atomic_int(addr) };
-                return cell
-                    .compare_exchange(
-                        exp,
-                        new,
-                        std::sync::atomic::Ordering::SeqCst,
-                        std::sync::atomic::Ordering::SeqCst,
-                    )
-                    .is_ok();
+        let fwd = self.shared.mem.heap.load_and_forward(obj);
+        match (expected, new_val) {
+            (Value::Int(exp), Value::Int(new)) => {
+                if let Some(addr) = hw_atomic_addr(self.shared, fwd, index, HwAtomicKind::Int) {
+                    // SAFETY: see `atomic_fetch_add_int`.
+                    let cell = unsafe { hw_atomic_i32(addr) };
+                    return cell
+                        .compare_exchange(
+                            exp,
+                            new,
+                            std::sync::atomic::Ordering::SeqCst,
+                            std::sync::atomic::Ordering::SeqCst,
+                        )
+                        .is_ok();
+                }
             }
+            (Value::Long(exp), Value::Long(new)) => {
+                if let Some(addr) = hw_atomic_addr(self.shared, fwd, index, HwAtomicKind::Long) {
+                    // SAFETY: see `atomic_fetch_add_int`.
+                    let cell = unsafe { hw_atomic_i64(addr) };
+                    return cell
+                        .compare_exchange(
+                            exp,
+                            new,
+                            std::sync::atomic::Ordering::SeqCst,
+                            std::sync::atomic::Ordering::SeqCst,
+                        )
+                        .is_ok();
+                }
+            }
+            (Value::Object(exp), Value::Object(new)) => {
+                if let Some(addr) = hw_atomic_addr(self.shared, fwd, index, HwAtomicKind::Reference)
+                {
+                    // The payload word of a reference cell IS the raw pointer,
+                    // zero for a JVM null, and `values_equal_for_cas` compares
+                    // references by exactly that pointer — so a bit-level CAS
+                    // keeps the lock path's semantics.
+                    let exp_raw = exp.map_or(0usize, |r| r.as_ptr() as usize);
+                    let new_raw = new.map_or(0usize, |r| r.as_ptr() as usize);
+                    // SATB pre-barrier BEFORE the store, preserving (pre,
+                    // store, post) ordering. Firing it on `expected` rather
+                    // than on a re-read is what HotSpot does for a CAS: on
+                    // success `expected` IS the overwritten value, and on
+                    // failure the extra enqueue only over-approximates the
+                    // live set, which SATB is allowed to do.
+                    self.shared.mem.heap.satb_barrier(expected);
+                    // SAFETY: see `atomic_fetch_add_int`.
+                    let cell = unsafe { hw_atomic_usize(addr) };
+                    let swapped = cell
+                        .compare_exchange(
+                            exp_raw,
+                            new_raw,
+                            std::sync::atomic::Ordering::SeqCst,
+                            std::sync::atomic::Ordering::SeqCst,
+                        )
+                        .is_ok();
+                    if swapped {
+                        self.shared.mem.heap.write_barrier(fwd, new_val);
+                    }
+                    return swapped;
+                }
+            }
+            _ => {}
         }
         // T19_H6: descriptor-aware CAS read+write so a long instance field
         // (`J`) always decodes as `Value::Long`, never as `Value::Double`.
