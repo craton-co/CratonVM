@@ -3185,7 +3185,7 @@ fn java_char_digit(c: char, radix: u32) -> Option<u32> {
     } else {
         let mut found = None;
         for &(first, last, base) in JAVA_DIGIT_RUNS {
-            if cp >= first && cp <= last {
+            if (first..=last).contains(&cp) {
                 found = Some(base + (cp - first));
                 break;
             }
@@ -3399,7 +3399,7 @@ fn java_parse_narrow(
     max: i64,
 ) -> Result<i64, cratonvm_types::error::MethodCallFailed> {
     let v = java_parse_into(text, radix, i32::MIN as i64, i32::MAX as i64, false)?;
-    if v < min || v > max {
+    if !(min..=max).contains(&v) {
         return Err(java_nfe_out_of_range(text, radix));
     }
     Ok(v)
@@ -3721,6 +3721,29 @@ pub(crate) fn native_character_value_of(
     Ok(Some(Value::Object(Some(obj))))
 }
 
+/// `Character.isDigit` — Unicode general category `Nd`, not `is_ascii_digit`.
+///
+/// W7-98(a). The old body answered ASCII-only, so every non-ASCII decimal digit
+/// answered `false` where HotSpot answers `true`: measured over the whole BMP
+/// against HotSpot 25, **360 of 65,536** code points disagreed (ARABIC-INDIC
+/// `U+0660..U+0669`, EXTENDED ARABIC-INDIC `U+06F0..`, DEVANAGARI `U+0966..`,
+/// FULLWIDTH `U+FF10..`, and 34 more runs).
+///
+/// [`java_char_digit`] is the fix and it was **already in this file** — a table
+/// of the non-ASCII digit runs generated from JDK 25 itself by walking every
+/// code point (see `JAVA_DIGIT_RUNS`) — but it had exactly ONE caller,
+/// `java_parse_signed`. So `Integer.parseInt("٦٦")` answered 66 while
+/// `Character.isDigit('٦')` answered false, in the same VM, from the same
+/// module. Verified over all 65,536 BMP code points:
+/// `java_char_digit(c, 10).is_some()` reproduces `Character.isDigit(char)` with
+/// **zero** mismatches.
+///
+/// RESIDUAL, and deliberate: this triple is registered for `(I)Z` as well, and
+/// `JAVA_DIGIT_RUNS` is BMP-only by design (see its doc comment). A
+/// SUPPLEMENTARY decimal digit — `U+1D7CE` MATHEMATICAL BOLD DIGIT ZERO, and
+/// the rest of `U+1D7CE..U+1E959` — still answers `false` where HotSpot answers
+/// `true`. That is unchanged from before this fix, not a regression, and it is
+/// only reachable through the `int` overload.
 pub(crate) fn native_character_is_digit(
     _ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -3729,10 +3752,32 @@ pub(crate) fn native_character_is_digit(
         Some(Value::Int(v)) => *v as u32,
         _ => 0,
     };
-    let result = char::from_u32(ch).is_some_and(|c| c.is_ascii_digit());
+    let result = char::from_u32(ch).is_some_and(|c| java_char_digit(c, 10).is_some());
     Ok(Some(Value::Int(if result { 1 } else { 0 })))
 }
 
+/// `Character.isLetter` — KNOWN WRONG, and not fixable from Rust's std tables.
+///
+/// W7-98(a), the one predicate in this family with no in-tree answer. Java's
+/// `isLetter` is the general categories `Lu|Ll|Lt|Lm|Lo`. Rust's
+/// `char::is_alphabetic` is the Unicode **Alphabetic** property, which is
+/// `L* ∪ Nl ∪ Other_Alphabetic` — a strictly larger set. Measured over the
+/// whole BMP against HotSpot 25: **957 of 65,536** code points disagree, all in
+/// the same direction (we answer `true`, Java answers `false`) — `U+2160`
+/// ROMAN NUMERAL ONE and `U+3007` IDEOGRAPHIC NUMBER ZERO (`Nl`), and the
+/// combining marks carrying `Other_Alphabetic` (`U+0345`, `U+0483..`,
+/// `U+05B0..`, …).
+///
+/// Rust's std exposes no `Nl` and no `Other_Alphabetic`, so no derivation from
+/// what is available is exact — the closest,
+/// `is_alphabetic() && !is_numeric()`, still misses 892, because it removes
+/// `Nl` but not the marks. Deliberately NOT applied: it trades an exact,
+/// explainable rule for a marginally smaller wrong number.
+///
+/// The exact fix is to stop shadowing `java.lang.Character` here and let
+/// `CharacterData` answer — `Character.getType` is unshadowed today and matches
+/// HotSpot on **all 65,536** BMP code points, so the route is known-good. See
+/// docs/known-issues/jdk-only/W7-98-character-unicode.md.
 pub(crate) fn native_character_is_letter(
     _ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -3936,6 +3981,20 @@ pub(crate) fn native_character_to_upper_case_int(
     Ok(Some(Value::Int(character_case_map(cp as u32, true) as i32)))
 }
 
+/// `Character.isLetterOrDigit` — literally `isLetter(c) || isDigit(c)`, which
+/// is the JDK's own one-line definition.
+///
+/// W7-98(a). The old body used `char::is_alphanumeric`, which is
+/// `Alphabetic ∪ N*` — so on top of [`native_character_is_letter`]'s `Nl` and
+/// `Other_Alphabetic` error it independently added `No`: `U+00B2` SUPERSCRIPT
+/// TWO and `U+00BD` VULGAR FRACTION ONE HALF answered `true` where Java answers
+/// `false`. Measured over the whole BMP against HotSpot 25, that was **1,257 of
+/// 65,536** wrong.
+///
+/// Composing the two predicates the way the JDK does drops it to **957** —
+/// exactly [`native_character_is_letter`]'s count, i.e. this method now
+/// contributes NO error of its own and inherits precisely one documented
+/// residual instead of carrying a second, independent one.
 pub(crate) fn native_character_is_letter_or_digit(
     _ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -3944,7 +4003,8 @@ pub(crate) fn native_character_is_letter_or_digit(
         Some(Value::Int(v)) => *v as u32,
         _ => 0,
     };
-    let result = char::from_u32(ch).is_some_and(|c| c.is_alphanumeric());
+    let result = char::from_u32(ch)
+        .is_some_and(|c| c.is_alphabetic() || java_char_digit(c, 10).is_some());
     Ok(Some(Value::Int(if result { 1 } else { 0 })))
 }
 
@@ -4518,6 +4578,14 @@ pub(crate) fn native_wrapper_double_equals(
 /// `char::to_digit`, which PANICS for a radix above 36 — so `Character.digit`
 /// with a negative radix (which became a huge `u32`) or any radix > 36 aborted
 /// the VM from ordinary Java code.
+/// `Character.digit(char, int)`.
+///
+/// W7-98(a). `char::to_digit` is ASCII-only, so this answered `-1` for every
+/// non-ASCII decimal digit: **360 of 65,536** BMP code points disagreed with
+/// HotSpot 25. Route it through [`java_char_digit`] — the JDK-25-generated run
+/// table that was already in this file and had only one caller — which
+/// reproduces `Character.digit(char, 10)` over the entire BMP with **zero**
+/// mismatches.
 pub(crate) fn native_character_digit(
     _ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -4534,7 +4602,7 @@ pub(crate) fn native_character_digit(
         return Ok(Some(Value::Int(-1)));
     }
     let result = char::from_u32(ch)
-        .and_then(|c| c.to_digit(radix as u32))
+        .and_then(|c| java_char_digit(c, radix as u32))
         .map(|d| d as i32)
         .unwrap_or(-1);
     Ok(Some(Value::Int(result)))
@@ -4569,6 +4637,27 @@ pub(crate) fn native_character_for_digit(
     Ok(Some(Value::Int(result)))
 }
 
+/// `Character.getNumericValue(char)`.
+///
+/// W7-98(a). PARTIAL FIX, and the residual is stated rather than hidden.
+///
+/// The old body used `char::to_digit(36)`, which is ASCII-only: **784 of
+/// 65,536** BMP code points disagreed with HotSpot 25. Routing through
+/// [`java_char_digit`] picks up every non-ASCII `Nd` run and takes that to
+/// **372**.
+///
+/// The 372 that remain are the part `JAVA_DIGIT_RUNS` does not model, because
+/// `Character.digit` does not either:
+///
+/// * `Nl`/`No` numeric values — `U+2160` ROMAN NUMERAL ONE is `1`, `U+00B2`
+///   SUPERSCRIPT TWO is `2`; both answer `-1` here.
+/// * the `-2` sentinel Java returns for a code point with a numeric value that
+///   is not a non-negative integer (`U+00BD` VULGAR FRACTION ONE HALF); we
+///   answer `-1`.
+///
+/// Both need the JDK's own numeric-value table, which is `CharacterData`'s to
+/// own — the exact fix is to stop shadowing it. See
+/// docs/known-issues/jdk-only/W7-98-character-unicode.md.
 pub(crate) fn native_character_get_numeric_value(
     _ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -4578,7 +4667,7 @@ pub(crate) fn native_character_get_numeric_value(
         _ => return Ok(Some(Value::Int(-1))),
     };
     let result = char::from_u32(ch)
-        .and_then(|c| c.to_digit(36))
+        .and_then(|c| java_char_digit(c, 36))
         .map(|d| d as i32)
         .unwrap_or(-1);
     Ok(Some(Value::Int(result)))
@@ -5187,6 +5276,22 @@ fn java_hex_grammar(b: &str) -> Option<(Vec<u8>, usize, i64)> {
 /// `prec` is the significand width in bits (53 for `double`, 24 for `float`)
 /// and `emax` the maximum normal exponent (1023 / 127), from which the bias
 /// and the minimum normal exponent `1 - emax` follow.
+///
+/// SHIFT INVARIANT — read before touching the early returns. This is the one
+/// place in this file where a Java-supplied string drives a shift COUNT
+/// (`Double.parseDouble("0x…p…")` reaches here with a caller-chosen binary
+/// exponent), and Rust panics — aborting the VM — on a shift at or above the
+/// integer width. Three guards interlock to keep every shift in range:
+///
+///   * `e > emax + 1` and `e < qmin - 2` bound `e`, hence bound `shift` to
+///     roughly `nb`;
+///   * `shift > nb` returns early, so `shift <= nb <= 128`;
+///   * the `sh >= 128` arms below handle the single surviving `shift == 128`
+///     case, where `m >> 128` would panic.
+///
+/// Together these also keep `-shift` under `prec` on the left-shift arm.
+/// Loosening any one of them can reintroduce a shift-overflow abort reachable
+/// from ordinary bytecode.
 fn round_binary(m: u128, sticky: bool, exp2: i64, prec: u32, emax: i64) -> u64 {
     let inf_bits = ((2 * emax + 1) as u64) << (prec - 1);
     if m == 0 {

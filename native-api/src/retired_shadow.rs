@@ -263,29 +263,93 @@
 //! `toArray` and `ArrayList(Collection)` all funnel through it — so the five
 //! `ArrayList` retirements above DEPEND on it staying a `Bridge`.
 //!
-//! ## What holds it, and it is not doubt about the eight
+//! ## The acceptance measurement — taken 2026-08-12, one binary, five arms
 //!
-//! Two things, and the first is the `java/io/PrintWriter` hold above, verbatim:
-//! `java/util` is Compatible-visible, so eight rows moving
-//! `Bridge` -> `SyntheticStub` move `BASELINE_SYNTHETIC_STUBS_*` (`SLACK = 0`),
-//! `bridge_shadows_bytecode` and the per-row kind freeze, all three keyed
-//! `25/linux`, all three re-frozen from ONE Linux census in the SAME commit.
-//! Both baselines are ALREADY stale and say so in their own bodies, so the
-//! predicted deltas (+8 on the stub ratchet, -8 on four bridge counters, exactly
-//! eight kind-map rows) are deltas on a base nobody has taken. The derivation is
-//! §4 of the P2 record; **it is a diff to check, not a number to paste.**
+//! `CRATONVM_ENFORCE_NATIVE_SHADOW` takes a prefix list and yields on the same
+//! §1.4 predicate a retirement uses, so it simulates this exact change with no
+//! rebuild — the way the `java/util/logging/` wave was accepted. Windows host,
+//! JDK 25.0.3, `SUITE=jdk-only CRATONVM_ARGS=--jdk-only bash regression-suite/run.sh`:
 //!
-//! The second is new, and is the reason this is held rather than merely
-//! sequenced. **The acceptance measurement has not been run, and it needs no
-//! source edit at all.** `CRATONVM_ENFORCE_NATIVE_SHADOW` takes a prefix list
-//! and yields on the same §1.4 predicate a retirement uses, so
-//! `=java/util/ArrayList,java/util/Arrays$ArrayList,java/util/Collections`
-//! under `--jdk-only` simulates this exact change with no rebuild — the way the
-//! `java/util/logging/` wave was accepted. Three negative controls
-//! (`java/util/TreeMap`, `java/util/ArrayDeque`,
-//! `java/util/concurrent/ConcurrentHashMap`) must go RED in the same session; if
-//! one comes back verdict-neutral, the state-model reading above is wrong for
-//! that family and the eight are not safe either.
+//! ```text
+//!   baseline (dial off)                         32 passed /  4 failed
+//!   A  ArrayList,Arrays$ArrayList,Collections   32 passed /  4 failed   <- the eight
+//!   B  List,Collection,Iterator (§2.2 doors)    32 passed /  4 failed
+//!   C1 TreeMap,TreeSet                          10 passed / 51 failed   RED
+//!   C2 ArrayDeque                               32 passed /  4 failed   see below
+//!   C3 concurrent/ConcurrentHashMap             28 passed / 12 failed   RED
+//!   failing set unchanged in A and B: RJdkProxyIface RJdkForeign RJdkEnumerations
+//! ```
+//!
+//! Verdict-neutral is the criterion, not green: those three fail with the dial
+//! off, for reasons that have nothing to do with collections.
+//!
+//! **C2 came back verdict-neutral, and that is the probe's reach, not a
+//! refutation of §3.5.** The `RJdk*` corpus only pushes and pops a deque's
+//! ENDS, and real `ArrayDeque.addLast`/`pollFirst` never call `delete(i)` — the
+//! method whose two writers §3.5 names. A probe that does (40 `addLast`s, a
+//! middle `remove(Object)`, `Iterator.remove`, then a drain) turns C2 red on
+//! the same binary and the same dial:
+//!
+//! ```text
+//!   size after 40 addLast  39 (want 40)      toArray length  34 (want 39)
+//!   size after 4 It.remove 39 (want 35)      drained count   41 (want 35)
+//!   pollFirst after reuse  null (want "z")
+//! ```
+//!
+//! The same probe under arm A answers HotSpot-identically on every ArrayList,
+//! `Arrays.asList` and `synchronizedMap` line, and turns `TreeMap.firstKey`
+//! (wrong key), `TreeSet` (half its elements) and `ConcurrentHashMap.size`
+//! (1 for a two-entry map) red under C1/C3.
+//!
+//! **The H2 corpus is the adjudicator for a Phase 2 retirement, and it moved
+//! nothing.** 14 discovered classes, `--mode jdk-only`, dial off then dial at
+//! arm A: every class that was adjudicated in both arms kept its verdict. The
+//! one exception, `org.h2.test.db.TestBackup`, was re-run ABBA from a private
+//! working directory and produced `MVStoreException: Chunk 2 not found` with
+//! the dial **OFF** as well as on (OFF pass / ON fail / ON pass / OFF fail), so
+//! it is a pre-existing flake in that class and not attributable to the change.
+//! `TestCluster` also timed out in the corpus arm and passes in 161-183 s
+//! standalone in BOTH arms — the corpus's `CV-TIMEOUT` is a wall-clock verdict
+//! on a shared host, which is the one column that record's own header says is
+//! non-metric.
+//!
+//! **Read arm A as an UPPER BOUND, not as this change.** The dial cannot go
+//! finer than a class name, so it also yields `ArrayList.size`/`get`/`iterator`/
+//! `stream`/`sort` — the `Map.values()`-entangled rows §3.2 holds back. A green
+//! A is therefore strictly stronger evidence than these eight rows need; the
+//! converse does not hold, and narrowing below a class name is the point at
+//! which the table, not the dial, becomes the instrument.
+//!
+//! ## What the census says, and what it cannot say
+//!
+//! All seven triples are actually-taken `native-shadows-bytecode` rows on an
+//! ordinary collections workload, so none of them is an inert entry.
+//!
+//! One measured consequence deserves its own line, because it confirms §3.3 by
+//! experiment rather than by reading: arming arm A makes
+//! `java/util/Arrays.copyOf([Ljava/lang/Object;I)` APPEAR in the taken-shadow
+//! set, where the dial-off run does not reach it at all. That is real
+//! `ArrayList.grow` funnelling through it the moment the native constructors
+//! yield — the dependency that makes `Arrays.copyOf` a hard keep.
+//!
+//! Note what the per-run census does NOT distinguish: with the dial armed the
+//! yielding row is still recorded `native-shadows-bytecode` (the record is
+//! written on the yield path too), so the census cannot tell you whether the
+//! dial engaged. The behavioural probe is the instrument for that. After this
+//! table lands the rows change population for a different reason — a
+//! `SyntheticStub` is refused at the door and never reaches step 1.
+//!
+//! ## What is NOT measured here, and must be re-frozen in the landing commit
+//!
+//! The `java/io/PrintWriter` hold above, verbatim: `java/util` is
+//! Compatible-visible, so eight rows moving `Bridge` -> `SyntheticStub` move
+//! `BASELINE_SYNTHETIC_STUBS_*` (`SLACK = 0`), `bridge_shadows_bytecode` and
+//! the per-row kind freeze, all three keyed `25/linux`, all three re-frozen
+//! from ONE Linux census in the SAME commit. Both baselines are ALREADY stale
+//! and say so in their own bodies, so the predicted deltas (+8 on the stub
+//! ratchet, -8 on four bridge counters, exactly eight kind-map rows) are deltas
+//! on a base nobody has taken. The derivation is §4 of the P2 record; **it is a
+//! diff to check, not a number to paste.** A ninth kind-map row is a finding.
 //!
 //! ## The door this table cannot close, and the inert-entry trap
 //!
@@ -308,13 +372,17 @@
 //! `LogRecord.<init>(Level,String)` for a day; see the source-pair section
 //! above, and read the census kind rather than `CRATONVM_DBG_DROPPED_STUBS`.
 //!
-//! ## Widening the discriminator is half of it
+//! ## Widening the discriminator was half of it
 //!
-//! [`triple_is_retired_shadow`] answers `false` for anything outside
+//! [`triple_is_retired_shadow`] used to answer `false` for anything outside
 //! `java/util/logging/`. All seven keys are under `java/util/`, so ONE prefix
-//! covers both populations — but an entry added without that widening reads as
-//! "not retired" and is invisible. `every_entry_is_reachable_through_the_predicate`
-//! is the test that catches it, and it already works; no new test is needed.
+//! covers both populations, and the discriminator moved to `java/util/` in the
+//! same edit — an entry added without that widening reads as "not retired" and
+//! is invisible. `every_entry_is_reachable_through_the_predicate` is the test
+//! that catches it, and
+//! `the_held_collection_families_are_not_retired` is the one that says the
+//! wider prefix admits sixty more families to a binary search without changing
+//! any of their answers.
 //!
 //! # Why this is applied centrally
 //!

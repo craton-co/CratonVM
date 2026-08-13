@@ -14,9 +14,15 @@ and from doc comments that record earlier measurements. Where a claim is a
 reading rather than a measurement it says so. §6 is the measurement recipe,
 which needs nobody's permission and no source edit at all.
 
-**Nothing was retired.** §5 explains why adding the entries without the three
-frozen artefacts is the one edit that does damage, and that is the same reason
-the `java/io/PrintWriter` retirement has been held since 2026-08-11.
+> **UPDATE 2026-08-12, a later lane with a current binary.** §6 has been RUN and
+> **the eight are landed** in `RETIRED_SHADOW_TRIPLES`, with the discriminator
+> widened to `java/util/`. §8 is the transcript. Read it before §5's "nothing
+> was retired": the hold in §5.1 was never doubt about the eight, and the three
+> frozen artefacts it names still have to be re-frozen from one Linux census in
+> the landing commit — that part is unchanged and is the open obligation.
+> §6's arm C as written is also **not sufficient on its own**: the `ArrayDeque`
+> control comes back verdict-neutral against the `RJdk*` corpus and needs a
+> workload that calls `delete(i)` before it goes red. §8.2.
 
 ---
 
@@ -619,7 +625,48 @@ pair** with the table entry; neither half alone is useful and the deletion is a
 list. Both directions are anomalies. Neither is this lane's to fix, but a
 collections retirement will walk into both.
 
-### 7.5 Not adjudicated here
+### 7.5 A `CV-TIMEOUT` is a wall-clock verdict on a host that cannot support one
+
+The corpus runner's own header says the `ms` column is non-metric, and its
+`--timeout` is the only reason it can say `CV-BROKEN` at all. On this shared
+Windows host, with three sessions running, the same 14-class H2 run produced
+five `CV-TIMEOUT` rows at a 200 s cap while HotSpot itself needed 86 s and 74 s
+on two of them; two of those five (`TestCluster`, `TestCompatibility`) then
+completed standalone well inside 200 s of CPU with nothing changed. A
+`CV-TIMEOUT` therefore has to be re-taken standalone before it enters any
+before/after comparison. See §8.3.
+
+### 7.6 `run-corpus.sh` reports `rundir: unbound variable` on any non-zero run
+
+Observed twice, verbatim:
+
+```text
+corpus=h2 mode=jdk-only  AGREE=9 DIVERGE=0 CV-BROKEN=5 UNADJUDICATED=0
+results: .../results.tsv
+regression-suite/corpus/run-corpus.sh: line 549: rundir: unbound variable
+```
+
+`rundir` is `local` to `cmd_run` (`:420`) and the reported line is `return 1`
+(`:549`), so a run that legitimately exits 1 because something was `CV-BROKEN`
+ends with a shell error on the way out. It does not change the verdict, and it
+does make an honest non-zero exit read like a harness fault. Not this lane's
+file to edit.
+
+### 7.7 `org.h2.test.db.TestBackup` is flaky on CratonVM independently of anything
+
+ABBA from a private working directory (`rm -rf data` before each run), one
+binary, `--jdk-only`:
+
+```text
+  A1 dial-OFF  rc=0            B1 dial-ON  rc=1  MVStoreException: Chunk 2 not found
+  B2 dial-ON   rc=0            A2 dial-OFF rc=1  MVStoreException: Chunk 2 not found
+```
+
+Both arms produce both outcomes, so the failure is attributable to neither. It
+needs its own record; a one-shot corpus run will keep attributing it to
+whatever change happens to be under test.
+
+### 7.8 Not adjudicated here
 
 `ArrayList.sort(Comparator)` and `ArrayList.stream()` (held for measurement,
 §3.2); the `HashSet.iterator` improvement blocked only by door 2; the
