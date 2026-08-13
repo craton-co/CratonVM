@@ -1104,6 +1104,7 @@ pub const INVENTORY: &[E] = &[
     // `off_word` must stay `None`.
     E { group: Group::GC, token: "innermost-callee-resolve", on_key: None, off_key: Some("CRATONVM_GC_NO_CALLEE_RESOLVE"), off_word: None },
     E { group: Group::GC, token: "old-interior-pins", on_key: None, off_key: Some("CRATONVM_GC_NO_OLD_INTERIOR_PINS"), off_word: None },
+    E { group: Group::GC, token: "empty-object-run", on_key: None, off_key: Some("CRATONVM_GC_NO_EMPTY_OBJECT_RUN"), off_word: None },
     E { group: Group::GC, token: "oldgen-coalesce", on_key: None, off_key: Some("CRATONVM_NO_OLDGEN_COALESCE"), off_word: None },
     E { group: Group::GC, token: "oldgen-compact", on_key: Some("CRATONVM_OLDGEN_COMPACT"), off_key: None, off_word: None },
     E { group: Group::GC, token: "overhead-limit", on_key: Some("CRATONVM_GC_OVERHEAD_LIMIT"), off_key: None, off_word: None },
