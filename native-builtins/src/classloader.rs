@@ -5360,6 +5360,44 @@ fn deduplicate_rooted_urls(ctx: &mut dyn NativeContext, urls: &mut Vec<RootedUrl
     *urls = unique;
 }
 
+/// A `getResources` enumeration that builds each `java.net.URL` only when the
+/// caller asks for it.
+///
+/// The array holds the spec strings the classpath walk produced; slot 2 of the
+/// enumeration marks them as such, so `nextElement` runs
+/// `build_synthetic_url` per element handed out rather than per element found.
+/// See [`ENUM_ELEMENTS_URL_SPECS`] for the measurement that motivated it.
+///
+/// Falls back to the eager form when the fabricated `Enumeration$Impl` is
+/// refused (`--jdk-only`), since the real `java.util.Enumeration` that lands
+/// there has no slot to carry the marker and no native to act on it.
+fn lazy_enumeration_from_url_strings(
+    ctx: &mut dyn NativeContext,
+    urls: &[String],
+) -> Result<ObjectRef, MethodCallFailed> {
+    let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, urls.len());
+    // GC-safety: `create_string` allocates, and `arr` is written across every
+    // iteration, so it has to be read back through the pin each time.
+    let arr_pin = ctx.pin_native_root(arr);
+    for (i, u) in urls.iter().enumerate() {
+        let spec = ctx.create_string(u);
+        let arr = ctx.read_native_pin(arr_pin, arr);
+        ctx.set_array_element(arr, i, Value::Object(Some(spec)));
+    }
+    let out = match try_alloc_concurrent_synthetic(ctx, ENUMERATION_IMPL_CLASS, 4) {
+        Ok(enm) => {
+            let arr = ctx.read_native_pin(arr_pin, arr);
+            ctx.set_field(enm, 0, Value::Object(Some(arr)));
+            ctx.set_field(enm, 1, Value::Int(0));
+            ctx.set_field(enm, 3, Value::Int(ENUM_ELEMENTS_URL_SPECS));
+            Ok(enm)
+        }
+        Err(_) => enumeration_from_url_strings(ctx, urls),
+    };
+    ctx.unpin_native_roots(arr_pin);
+    out
+}
+
 fn enumeration_from_url_strings(ctx: &mut dyn NativeContext, urls: &[String]) -> Result<ObjectRef, MethodCallFailed> {
     let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, urls.len());
     // GC-safety: `build_synthetic_url` per iteration allocates (transitively
@@ -5765,7 +5803,7 @@ fn cl_get_resources_impl(
     // are registered unconditionally by `register_enumeration_impl_natives`
     // so this works in both synthetic-JDK and real-JDK modes without
     // relying on java.util.Vector's internal layout.
-    let enm = enumeration_from_url_strings(ctx, &urls)?;
+    let enm = lazy_enumeration_from_url_strings(ctx, &urls)?;
     Ok(Some(Value::Object(Some(enm))))
 }
 
@@ -6096,6 +6134,39 @@ pub fn register_url_class_path_safe_stubs(r: &mut NativeMethodRegistry) {
 /// §1.1 violation the policy refuses, which is why it needs the landing below.
 pub(crate) const ENUMERATION_IMPL_CLASS: &str = "java/util/Enumeration$Impl";
 
+/// Slot 3 of [`ENUMERATION_IMPL_CLASS`]: element slot 0 holds the values the
+/// enumeration yields, verbatim. Every producer except `getResources` uses
+/// this, and it is what a zero-initialized instance already means, so an
+/// `Enumeration$Impl` built by `new_object` (which writes no slots) behaves
+/// exactly as it did before slot 3 existed.
+///
+/// Slot 3, not slot 2: `Hashtable.keys()`/`elements()` already stamp a
+/// keys-vs-values discriminator into slot 2, and 1 is its `keys` value — so a
+/// marker there turned every `Hashtable` key into a `java.net.URL`
+/// (`ClassCastException: java.net.URL cannot be cast to java.lang.String`,
+/// xerces reading SAX features, PomProfileReposEffectivePomTest).
+pub(crate) const ENUM_ELEMENTS_AS_IS: i32 = 0;
+
+/// Slot 3 of [`ENUMERATION_IMPL_CLASS`]: element slot 0 holds URL *spec
+/// strings*, and each is turned into a `java.net.URL` by `nextElement`/`next`
+/// at the moment it is handed out.
+///
+/// `ClassLoader.getResources` is the one producer whose consumers routinely
+/// stop early. The JDK's own enumeration is lazy per element, so
+/// `classLoader.resources(name).anyMatch(..)` — SmallRye Config's
+/// `isInClassloader`, and the shape behind every `findFirst`/`anyMatch` over
+/// `resources()` — materializes only as far as the first match. CratonVM's
+/// native answered eagerly, building a `java.net.URL` (a 13-slot synthetic
+/// plus three `String`s) for EVERY match before the caller looked at one.
+///
+/// On the Quarkus full-reactor harness that meant 1843 URLs built 1388 times
+/// — 2.5M URL objects, ~12M allocations — where HotSpot built about eight per
+/// call. Deferring construction to `nextElement` restores the short-circuit
+/// without changing what the enumeration yields: the strings were already
+/// computed by the classpath walk, and `build_synthetic_url` is the same
+/// function the eager path called.
+pub(crate) const ENUM_ELEMENTS_URL_SPECS: i32 = 1;
+
 /// A real `java.util.Enumeration` over `array`, or `None` when this image
 /// cannot build one.
 ///
@@ -6153,11 +6224,12 @@ pub(crate) fn make_snapshot_enumeration(
     // both and read it back through the pin, the same contract
     // `make_iterator_from_array` documents.
     let pin = ctx.pin_native_root(array);
-    let out = match try_alloc_concurrent_synthetic(ctx, ENUMERATION_IMPL_CLASS, 2) {
+    let out = match try_alloc_concurrent_synthetic(ctx, ENUMERATION_IMPL_CLASS, 4) {
         Ok(enm) => {
             let array = ctx.read_native_pin(pin, array);
             ctx.set_field(enm, 0, Value::Object(Some(array)));
             ctx.set_field(enm, 1, Value::Int(0));
+            ctx.set_field(enm, 3, Value::Int(ENUM_ELEMENTS_AS_IS));
             Ok(enm)
         }
         Err(refusal) => {
@@ -6174,6 +6246,43 @@ pub(crate) fn make_snapshot_enumeration(
     };
     ctx.unpin_native_roots(pin);
     out
+}
+
+/// `Enumeration$Impl.nextElement()` / `.next()` — one body, because the two
+/// have always been the same code and only one of them may now materialize.
+///
+/// Slot 3 says how to read slot 0's element: verbatim
+/// ([`ENUM_ELEMENTS_AS_IS`], what every producer but `getResources` stores and
+/// what a zero-initialized instance already means) or as a URL spec string to
+/// be turned into a `java.net.URL` right here ([`ENUM_ELEMENTS_URL_SPECS`]).
+fn enum_impl_next_element(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let idx = ctx.get_field(this, 1).as_int().unwrap_or(0) as usize;
+    let arr = match ctx.get_field(this, 0) {
+        Value::Object(Some(a)) => a,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let len = ctx.array_length(arr);
+    if idx >= len {
+        return Ok(Some(Value::Object(None)));
+    }
+    let elem = ctx.get_array_element(arr, idx);
+    ctx.set_field(this, 1, Value::Int((idx + 1) as i32));
+    if ctx.get_field(this, 3).as_int().unwrap_or(ENUM_ELEMENTS_AS_IS) != ENUM_ELEMENTS_URL_SPECS {
+        return Ok(Some(elem));
+    }
+    let Value::Object(Some(spec_obj)) = elem else {
+        return Ok(Some(elem));
+    };
+    let Some(spec) = ctx.read_string(spec_obj) else {
+        return Ok(Some(elem));
+    };
+    // GC-safety: `build_synthetic_url` allocates (a 13-slot URL plus three
+    // `String`s), so nothing raw may be held across it. `this` is not read
+    // again after this point and the cursor was already advanced, so there is
+    // nothing left to re-read through a pin.
+    let url = crate::jboss_module_loader::build_synthetic_url(ctx, &spec)?;
+    Ok(Some(Value::Object(Some(url))))
 }
 
 pub fn register_enumeration_impl_natives(r: &mut NativeMethodRegistry) {
@@ -6193,21 +6302,7 @@ pub fn register_enumeration_impl_natives(r: &mut NativeMethodRegistry) {
         let len = ctx.array_length(arr);
         Ok(Some(Value::Int(if idx < len { 1 } else { 0 })))
     });
-    r.register(enm, "nextElement", "()Ljava/lang/Object;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let idx = ctx.get_field(this, 1).as_int().unwrap_or(0) as usize;
-        let arr = match ctx.get_field(this, 0) {
-            Value::Object(Some(a)) => a,
-            _ => return Ok(Some(Value::Object(None))),
-        };
-        let len = ctx.array_length(arr);
-        if idx >= len {
-            return Ok(Some(Value::Object(None)));
-        }
-        let elem = ctx.get_array_element(arr, idx);
-        ctx.set_field(this, 1, Value::Int((idx + 1) as i32));
-        Ok(Some(elem))
-    });
+    r.register(enm, "nextElement", "()Ljava/lang/Object;", enum_impl_next_element);
     r.register(enm, "hasNext", "()Z", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let idx = ctx.get_field(this, 1).as_int().unwrap_or(0) as usize;
@@ -6218,21 +6313,7 @@ pub fn register_enumeration_impl_natives(r: &mut NativeMethodRegistry) {
         let len = ctx.array_length(arr);
         Ok(Some(Value::Int(if idx < len { 1 } else { 0 })))
     });
-    r.register(enm, "next", "()Ljava/lang/Object;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let idx = ctx.get_field(this, 1).as_int().unwrap_or(0) as usize;
-        let arr = match ctx.get_field(this, 0) {
-            Value::Object(Some(a)) => a,
-            _ => return Ok(Some(Value::Object(None))),
-        };
-        let len = ctx.array_length(arr);
-        if idx >= len {
-            return Ok(Some(Value::Object(None)));
-        }
-        let elem = ctx.get_array_element(arr, idx);
-        ctx.set_field(this, 1, Value::Int((idx + 1) as i32));
-        Ok(Some(elem))
-    });
+    r.register(enm, "next", "()Ljava/lang/Object;", enum_impl_next_element);
     let anon_enm = "cratonvm/synthetic/AnonymousObject$2";
     // `SyntheticStub`, stated for this block. The receiver is the VM's
     // anonymous-object fallback class — minted here, on no image — so §1.5's

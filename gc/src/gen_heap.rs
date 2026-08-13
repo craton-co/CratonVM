@@ -12974,6 +12974,34 @@ impl GenerationalHeap {
                     .min(used);
                 let run_end = zero_run_end(base, cursor, limit);
                 if run_end - cursor >= HEADER_SIZE {
+                    // A run of EMPTY objects is not a desync, and the second
+                    // half of the argument is what carries it here, exactly as
+                    // in `mark_young_to_old_refs`: an empty object has NO
+                    // FIELDS, so a run of them holds no reference into old gen
+                    // for this pass to rewrite. Stepping over it cannot strand
+                    // one at a stale pre-compaction address.
+                    //
+                    // There is no young live set to hand the predicate — this
+                    // walk is given a from-space, not a mark result — so `&[]`
+                    // is all there is and the no-marked-base-inside condition
+                    // is vacuous. The alignment and plausible-next-header
+                    // conditions still establish that `resume` is on-grid.
+                    //
+                    // The arm below is not free: it re-anchors at the next free
+                    // block and falls back to `rewrite_stretch_conservatively`
+                    // over everything skipped, which rewrites any aligned word
+                    // that merely EQUALS a moved object's old address — a
+                    // primitive included — and gives up the precise parse of
+                    // every real object in the stretch.
+                    if let Some(resume) =
+                        zero_run_empty_object_resume(base, cursor, run_end, used, &[])
+                    {
+                        SWEEP_ZERO_SPAN_EMPTY_RUNS.fetch_add(1, Ordering::Relaxed);
+                        EMPTY_RUN_BYTES_CYCLE
+                            .fetch_add((resume - cursor) as u64, Ordering::Relaxed);
+                        cursor = resume;
+                        continue;
+                    }
                     LATE_WALK_ZERO_RUNS[1].fetch_add(1, Ordering::Relaxed);
                     anomaly = true;
                 }
@@ -14313,6 +14341,37 @@ impl GenerationalHeap {
                         .min(used);
                     let run_end = zero_run_end(base, offset, limit);
                     if run_end - offset >= HEADER_SIZE {
+                        // A run of EMPTY objects is not a desync. This walk has
+                        // no live set either (it enumerates a from-space, live
+                        // and dead alike), so what carries it is again that an
+                        // empty object has NO FIELDS.
+                        //
+                        // That is exactly what this walk's callers consume.
+                        // `collect_young_to_old_roots` reads REF SLOTS to build
+                        // the concurrent old-gen marker's young->old roots,
+                        // which the call site calls mandatory — "a missed mark
+                        // root here = cleanup frees a live object" — and a run
+                        // of empty objects contributes none. Whereas the arm
+                        // below re-anchors at the next free block and so drops
+                        // every REAL object between the run and that anchor
+                        // from the enumeration, roots and all. Resuming on-grid
+                        // strictly reduces what is lost.
+                        //
+                        // The run's own members are skipped rather than emitted
+                        // as HEADER_SIZE entries: `hprof::dump_heap` is the
+                        // other caller, and a multi-megabyte run of dead empty
+                        // objects would balloon the dump for no fidelity a
+                        // consumer relies on. Today's arm omits them too, along
+                        // with everything after them.
+                        if let Some(resume) =
+                            zero_run_empty_object_resume(base, offset, run_end, used, &[])
+                        {
+                            SWEEP_ZERO_SPAN_EMPTY_RUNS.fetch_add(1, Ordering::Relaxed);
+                            EMPTY_RUN_BYTES_CYCLE
+                                .fetch_add((resume - offset) as u64, Ordering::Relaxed);
+                            offset = resume;
+                            continue;
+                        }
                         LATE_WALK_ZERO_RUNS[2].fetch_add(1, Ordering::Relaxed);
                         anomaly = true;
                     }
@@ -17816,6 +17875,61 @@ mod tests {
     fn small_gen_heap() -> GenerationalHeap {
         // 4KB young semi-space, 8KB old gen
         GenerationalHeap::with_sizes(4 * 1024, 8 * 1024)
+    }
+
+    /// A run of swept empty objects must not hide the objects AFTER it.
+    ///
+    /// This is the behavioural half of the `zero_run_empty_object_resume`
+    /// unit tests, at the one call site that is `pub` and so can be driven
+    /// directly. Without the predicate, `word0 == 0` over a stretch at least
+    /// `HEADER_SIZE` long is read as a walk desync, and the recovery arm
+    /// re-anchors at the next FREE BLOCK — dropping every real object between
+    /// the run and that anchor from the returned enumeration.
+    ///
+    /// What makes that a correctness bug rather than a diagnostic wart is who
+    /// consumes the enumeration: `collect_young_to_old_roots` turns it into
+    /// the concurrent old-gen marker's young->old roots, which its call site
+    /// in `maybe_concurrent_gc` calls mandatory — "a missed mark root here =
+    /// cleanup frees a live object".
+    #[test]
+    fn a_run_of_swept_empty_objects_does_not_hide_the_young_objects_after_it() {
+        let heap = small_gen_heap();
+
+        let first = heap.alloc_object(ClassId::new(1), 1);
+        // Four objects that a non-moving sweep has reclaimed. Zeroed is
+        // exactly what a dead `new Object()` looks like afterwards, and it is
+        // also what a LIVE one looks like before its mark word is written:
+        // ClassId(0), shape 0, MARK_NEUTRAL, ObjectKind::Object and
+        // ArrayElementType::Reference are all the all-zero encoding.
+        let holes: Vec<_> = (0..4)
+            .map(|_| heap.alloc_object(ClassId::new(7), 0))
+            .collect();
+        let last = heap.alloc_object(ClassId::new(2), 1);
+
+        for h in &holes {
+            // SAFETY: each `h` is a live young object of exactly HEADER_SIZE
+            // bytes (`num_slots == 0`), so this writes only its own header.
+            unsafe { std::ptr::write_bytes(h.as_ptr(), 0, HEADER_SIZE) };
+        }
+
+        let walked: Vec<usize> = heap
+            .walk_young_objects()
+            .into_iter()
+            .map(|(p, _)| p as usize)
+            .collect();
+
+        assert!(
+            walked.contains(&(first.as_ptr() as usize)),
+            "the object BEFORE the run must still be walked (walked {} objects)",
+            walked.len(),
+        );
+        assert!(
+            walked.contains(&(last.as_ptr() as usize)),
+            "a run of swept empty objects must not hide the object after it — \
+             this enumeration is the concurrent marker's mandatory young→old \
+             root set (walked {} objects)",
+            walked.len(),
+        );
     }
 
     /// fork6 GC_STRESS fix — a young object's reference to an old-gen object

@@ -5935,9 +5935,28 @@ fn cmstateset_same_set(ctx: &dyn NativeContext, a: ObjectRef, b: ObjectRef) -> b
 }
 
 fn xmlchar_chars_array(ctx: &mut dyn NativeContext) -> Option<ObjectRef> {
-    let class_id = ctx
-        .class_id_by_name(XERCES_XMLCHAR)
-        .or_else(|| ctx.ensure_class_initialized(XERCES_XMLCHAR).ok())?;
+    // LOADED is not enough — the class must be INITIALIZED.
+    //
+    // `XMLChar.<clinit>` assigns `CHARS = new byte[0x10000]` first and spends
+    // the rest of its body filling it. A reader that accepts "the class id
+    // resolves" (which `class_id_by_name` answers for a merely-loaded class)
+    // can therefore read the array reference while another thread is still
+    // filling it, and every character it asks about below the fill point comes
+    // back with a zero mask. `isNameStart('c')` then answers false and xerces
+    // rejects `<component-set>` with "The markup in the document preceding the
+    // root element must be well-formed" at [1,2].
+    //
+    // Ordinary bytecode cannot hit this: the `getstatic XMLChar.CHARS` inside
+    // `XMLEntityScanner.scanQName` carries the initialization barrier. It is
+    // reachable only because CratonVM replaces that scanner with a native, so
+    // the barrier the bytecode would have run is gone unless this asks for it.
+    let class_id = match ctx.class_id_by_name(XERCES_XMLCHAR) {
+        Some(id) => {
+            ctx.ensure_class_initialized_with_class_id(id).ok()?;
+            id
+        }
+        None => ctx.ensure_class_initialized(XERCES_XMLCHAR).ok()?,
+    };
     let field_index = ctx.static_field_index_by_name(class_id, "CHARS")?;
     match ctx.get_static_field(class_id, field_index) {
         Value::Object(Some(chars)) => Some(chars),
