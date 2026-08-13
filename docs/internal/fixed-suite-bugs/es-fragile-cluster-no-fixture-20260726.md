@@ -16,7 +16,7 @@ No Elasticsearch checkout exists on this host
 `/data/data/cratonvm-worktrees/20260708-191002-es-nonpassed-rerun/apps/elasticsearch`
 and a sibling `.../20260710-093821-es-tdigest-sortingdigest/apps/elasticsearch`
 — neither directory exists anymore, presumably pruned by this host's periodic
-space-reclaim sweep). `apps/elasticsearch-suite-runner/run-elasticsearch-suite.ps1`
+space-reclaim sweep). `../../../apps/elasticsearch-suite-runner/run-elasticsearch-suite.ps1`
 is itself Windows-oriented (`C:\craton\CratonVM\apps\elasticsearch` default
 root) and depends on a prebuilt `libvec.so` native fixture that also isn't
 present here.

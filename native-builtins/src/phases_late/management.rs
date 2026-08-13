@@ -669,12 +669,14 @@ pub(crate) fn p59_get_thread_mxbean(
     ctx: &mut dyn NativeContext,
     _args: &[Value],
 ) -> MethodCallResult {
-    // `crate::jmx` is behind the `management` Cargo feature, so this
-    // delegation only compiles when that feature is on. Without the gate the
-    // whole crate fails to build under any feature set that omits it — which is
-    // what CI's `--features synthetic-jdk` job uses, and why its blocking test
-    // step could not run. The fallback is this function's own pre-delegation
-    // behaviour: six slots, the width the count getters read by index.
+    // `crate::jmx` is `#[cfg(feature = "management")]`, and this call was not
+    // — so `cargo check -p cratonvm-native-builtins` (the crate's own default
+    // features, which do not include `management`) did not compile at all, and
+    // with it every `cargo test` for this crate. Invisible from the CLI binary,
+    // which does enable the feature. The plain synthetic bean is what this
+    // function returned before it started delegating; keeping it as the
+    // feature-off arm restores the build without changing the answer on any
+    // configuration that could observe one.
     #[cfg(feature = "management")]
     let bean = crate::jmx::alloc_thread_mxbean(ctx)?;
     #[cfg(not(feature = "management"))]
@@ -693,8 +695,7 @@ pub(crate) fn p59_get_runtime_mxbean(
 /// Delegates to `jmx.rs` — same reasoning as [`p59_get_thread_mxbean`]: the
 /// extension type and the five slots `getName`/`getArch`/… read by index.
 pub(crate) fn p59_get_os_mxbean(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    // Same `management`-feature gate as `p59_get_thread_mxbean`; the fallback
-    // is the five slots `getName`/`getArch`/… read by index.
+    // See `p59_get_thread_mxbean` for why the delegation is feature-gated.
     #[cfg(feature = "management")]
     let bean = crate::jmx::alloc_os_mxbean(ctx)?;
     #[cfg(not(feature = "management"))]

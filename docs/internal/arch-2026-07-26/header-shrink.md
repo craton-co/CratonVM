@@ -349,6 +349,14 @@ audit the shrink was planned from:
 - `ir_lower.rs:1186` (added 2026-07-31) — `(HEADER_SIZE + packed_body_offset) as i32`,
   the guarded inline compact `getfield` cell address (disp32, so no disp8 hazard;
   it is here because it bakes the header size into emitted machine code)
+- `jit/src/lib.rs::AtomicIntFieldLayout::new` (added 2026-08-12) — the ATOMIC_INT
+  intrinsic's two `AtomicInteger.value` addresses, compact
+  (`HEADER_SIZE + body_off`) and legacy
+  (`HEADER_SIZE + idx * SLOT_SIZE + FIELD_CELL_PAYLOAD32_OFFSET`). Both are
+  emitted as the disp32 of a `LOCK XADD [RAX+disp32], ECX`, so no disp8 hazard;
+  they are listed because they bake the header size into machine code. The
+  codegen picks between them per OBJECT on the `GC_FLAG_COMPACT` header bit, so
+  a smaller header must move BOTH or the legacy arm reads the wrong cell.
 - `ir_lower.rs::emit_inline_getstatic` (added 2026-08-03, cov-01) — the direct
   `getstatic` read: `field_index * SLOT_SIZE + FIELD_CELL_PAYLOAD{32,64}_OFFSET`
   as a disp32, from the class's **statics block** base. It bakes the field-cell

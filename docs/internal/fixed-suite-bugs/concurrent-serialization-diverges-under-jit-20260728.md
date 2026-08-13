@@ -41,5 +41,5 @@ After the final current-`origin/dev` merge, b14 (SHA-256
 `cf044b03c2ae652a56686b12ab2d2c869e8a7d78c47564e3f31bacaa110ec4ac`)
 re-ran that exact class: 1/1 JIT and 1/1 `--nojit`, each `OK (10 tests)`.
 
-The issue is retired from `docs/known-issues` because the exact reproducer and
+The issue is retired from `../../known-issues` because the exact reproducer and
 the linked residual classes are green in both execution modes.

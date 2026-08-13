@@ -6503,15 +6503,6 @@ mod ec_pkcs8_v1_identity_tests {
 
 #[cfg(test)]
 mod tests {
-    /// `engine_take_pending_trust_check` grew an engine-id parameter in
-    /// `c961e92da` and the three call sites in this module were not updated,
-    /// so the whole `cratonvm-native-builtins` LIB TEST target stopped
-    /// compiling — which is why CI's blocking `Test native-builtins
-    /// (synthetic-jdk)` step could not run either. The id is only copied into
-    /// `PendingTrustCheck.engine_id`; these tests assert on the other fields,
-    /// so any stable value serves.
-    const TEST_ENGINE_ID: i32 = 1;
-
     #[allow(unused_imports)]
     use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::test_fixtures::*;
@@ -7716,7 +7707,7 @@ mod tests {
         //    exactly as cheap as before this fix.
         client.trust_check_done = false;
         client.endpoint_id_alg = None;
-        assert!(super::engine_take_pending_trust_check(TEST_ENGINE_ID, &mut client).is_none());
+        assert!(super::engine_take_pending_trust_check(0, &mut client).is_none());
 
         // 2. HTTPS configured: a pending check appears even with no
         //    TrustManager attached, because JSSE's own default manager is what
@@ -7725,7 +7716,7 @@ mod tests {
         client.endpoint_id_alg = Some("HTTPS".to_string());
         client.peer_host = Some("localhost".to_string());
         let pending =
-            super::engine_take_pending_trust_check(TEST_ENGINE_ID, &mut client).expect("identity check pending");
+            super::engine_take_pending_trust_check(0, &mut client).expect("identity check pending");
         assert!(pending.trust_ctx_key.is_none());
         assert_eq!(
             pending.endpoint_identity,
@@ -7751,7 +7742,7 @@ mod tests {
         //    is configured on it.
         client.trust_check_done = false;
         client.is_client = false;
-        let pending = super::engine_take_pending_trust_check(TEST_ENGINE_ID, &mut client);
+        let pending = super::engine_take_pending_trust_check(0, &mut client);
         assert!(pending.is_none(), "server engines do not identify endpoints");
     }
 

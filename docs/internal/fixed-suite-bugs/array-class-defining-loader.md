@@ -1,6 +1,6 @@
 # Array classes were always bootstrap-defined — JVMS §5.3.3
 
-**Status: 🟢 FIXED 2026-08-01** in `../../classloading` and in the two `../../vm` entry
+**Status: 🟢 FIXED 2026-08-01** in `../../../classloading` and in the two `../../../vm` entry
 points this lane owns, with seven regression tests. One interpreter call site
 and four `native-builtins` consumers remain — each with a recipe below.
 
@@ -48,7 +48,7 @@ about the **defining loader**.
 
 **The in-situ comment was wrong. The audit's reading was right.**
 
-`../../classloading/src/class_manager.rs`, immediately above the `loaded_classes`
+`../../../classloading/src/class_manager.rs`, immediately above the `loaded_classes`
 insert in `synthesize_array_class`, read (pre-fix):
 
 > Round 7 audit fix (CRIT #2): per JVMS §5.3.3, array classes are *created* by
@@ -70,14 +70,14 @@ the first half is not.
 Corroborating evidence that the bug was real and already being worked around by
 hand, rather than merely theoretical:
 
-* `../../native-builtins/src/lib.rs` (`Object.getClass()` on an array) contains an
+* `../../../native-builtins/src/lib.rs` (`Object.getClass()` on an array) contains an
   explicit escape hatch — when the array object's component class has a
   user-defined loader (`loader_id_of_class(class_id) >= 3`) it abandons the
   `ClassId`-backed array mirror entirely and mints a *separate* descriptor-only
   mirror with the loader stapled on, commented "Do not collapse that identity
   when exposing `getClass()` for an array whose component was defined by an
   isolated loader".
-* `../../native-builtins/src/lang_class.rs` `native_class_get_component_type` does the
+* `../../../native-builtins/src/lang_class.rs` `native_class_get_component_type` does the
   same in reverse, reading `Class.classLoader` as a side channel because the
   array `Class` itself could not carry the answer.
 
@@ -106,7 +106,7 @@ loader to ask got the first loader's array class.
 
 Legend: ✅ fixed here · ⚠️ open, recipe below · ➖ verified not affected.
 
-### `../../classloading`
+### `../../../classloading`
 
 | site | what it did | status |
 | --- | --- | --- |
@@ -120,7 +120,7 @@ Legend: ✅ fixed here · ⚠️ open, recipe below · ➖ verified not affected
 | `class_manager.rs` `unload_user_classes` (GC-driven) | collects only the `ClassId`s GC proved dead | ⚠️ does not sweep array classes over a dead component — see *Remaining 3* |
 | `class.rs` `is_subclass_of_by_name` / `is_assignable_to_name` | name-keyed | ➖ deliberately loader-blind, documented in situ and in the identity audit; out of scope |
 
-### `../../vm`
+### `../../../vm`
 
 | site | what it did | status |
 | --- | --- | --- |
@@ -138,7 +138,7 @@ Legend: ✅ fixed here · ⚠️ open, recipe below · ➖ verified not affected
 | `jit/helpers.rs` `jit_aastore` | delegates to `aastore_element_assignable` | ➖ same |
 | `runtime/hprof.rs` `array_class_name_for` | builds a display name for a heap dump | ➖ diagnostic only |
 
-### `../../native-builtins` (read-only for this lane)
+### `../../../native-builtins` (read-only for this lane)
 
 | site | what it does | status |
 | --- | --- | --- |
@@ -230,7 +230,7 @@ reference is invalidated.
 
 ## 7. Regression tests
 
-All in `../../classloading/src/class_manager.rs`; all fail before the fix.
+All in `../../../classloading/src/class_manager.rs`; all fail before the fix.
 
 | test | pins |
 | --- | --- |
