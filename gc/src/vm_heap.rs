@@ -2299,6 +2299,36 @@ impl VmHeap {
                 z[1].load(O::Relaxed),
                 z[2].load(O::Relaxed),
             );
+            // Did the five walks that still carry the old rule even RUN? A
+            // zero anomaly count above means nothing without this. Legend on
+            // `YOUNG_WALK_ENTRIES`; `sp_*` is the selective-promotion census,
+            // which says whether the two passes inside it were reachable at
+            // all (`sp_selective` is the gate).
+            let w = &crate::gen_heap::YOUNG_WALK_ENTRIES;
+            let (sw, sel, defrag, cand, pin, unaged, evac, ofull) =
+                crate::gen_heap::selective_promotion_census();
+            eprintln!(
+                "[GC] young_walk_entries: evac_prepass={} fixup_3a={} mark_y2o={} \
+                 fixup_yo={} walk_young={} | sp_sweeps={sw} sp_selective={sel} \
+                 sp_defrag={defrag} sp_candidates={cand} sp_pinned={pin} \
+                 sp_unaged={unaged} sp_evacuated={evac} sp_old_full={ofull}",
+                w[0].load(O::Relaxed),
+                w[1].load(O::Relaxed),
+                w[2].load(O::Relaxed),
+                w[3].load(O::Relaxed),
+                w[4].load(O::Relaxed),
+            );
+            // …and when the evacuation pre-pass DID run, what stopped it.
+            let e = &crate::gen_heap::EVAC_UNWIND_REASONS;
+            eprintln!(
+                "[GC] evac_unwind: overshoot={} zero_span={} bad_size={} \
+                 hole_crossing={} candidates_dropped={}",
+                e[0].load(O::Relaxed),
+                e[1].load(O::Relaxed),
+                e[2].load(O::Relaxed),
+                e[3].load(O::Relaxed),
+                crate::gen_heap::EVAC_UNWIND_CANDIDATES.load(O::Relaxed),
+            );
         }
         // Old-gen free-list coalescing (the counterpart of the young sweep's
         // post-sweep coalescer). A large `merged` with compaction never having
