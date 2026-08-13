@@ -235,7 +235,7 @@ fn loaded_class_for_requesting_loader(
             }
             None
         }
-        ClassLoaderId::UserDefined(_) => {
+        ClassLoaderId::UserDefined(ns) => {
             if user_own_first {
                 if let Some(id) = loaded_classes_probe(map, requesting_loader, name) {
                     return Some(id);
@@ -249,7 +249,28 @@ fn loaded_class_for_requesting_loader(
             if let Some(id) = loaded_class_via_parent_chain(map, requesting_loader, name) {
                 return Some(id);
             }
-            for loader_id in BUILTIN_LOADER_DELEGATION_CHAIN {
+            // The built-in chain this loader's delegation may reach is
+            // bounded by its OWN recorded terminal parent, not always the
+            // whole chain. A `ModifiedClassPathClassLoader` (parent =
+            // platform/Extension, specifically to exclude Application — e.g.
+            // Spring's `@ClassPathExclusions`) must stop at Extension: probing
+            // Application anyway resolves a same-named class through the
+            // wrong loader, which is how a `PropertiesPropertySource` built
+            // by isolated-loader code ended up an `Application`-loaded
+            // instance while its own compiled `checkcast` site (correctly)
+            // named the isolated loader's `EnumerablePropertySource` —
+            // `ClassCastException` between two genuinely different classes.
+            // `None` (parent unrecorded, or the chain did not bottom out) is
+            // the permissive default: probe every built-in loader, as before.
+            let reachable: &[ClassLoaderId] =
+                match crate::loaders::user_loader_builtin_parent(ns) {
+                    Some(terminal) => {
+                        let end = (terminal as usize + 1).min(BUILTIN_LOADER_DELEGATION_CHAIN.len());
+                        &BUILTIN_LOADER_DELEGATION_CHAIN[..end]
+                    }
+                    None => BUILTIN_LOADER_DELEGATION_CHAIN,
+                };
+            for loader_id in reachable {
                 if let Some(id) = loaded_classes_probe(map, *loader_id, name) {
                     return Some(id);
                 }
@@ -8752,6 +8773,20 @@ impl ClassManager {
         key: (ClassLoaderId, Arc<str>),
         id: ClassId,
     ) -> Option<ClassId> {
+        if let Ok(filter) = cratonvm_types::flags::runtime_var("CRATONVM_DBG_DEFINE_FILTER") {
+            if !filter.is_empty() && key.1.contains(filter.as_str()) {
+                eprintln!(
+                    "[DBG_DEFINE] insert name={} loader={:?} id={}",
+                    key.1, key.0, id.as_u32()
+                );
+                if matches!(key.0, ClassLoaderId::Application) {
+                    eprintln!(
+                        "[DBG_DEFINE_BT] {}",
+                        std::backtrace::Backtrace::force_capture()
+                    );
+                }
+            }
+        }
         let name = Arc::clone(&key.1);
         let displaced = self.loaded_classes.insert(key, id);
         bump_class_definition_epoch();

@@ -169,8 +169,8 @@ pub use loaders::{BUILTIN_LOADER_DELEGATION_CHAIN, MAX_BUILTIN_LOADER_DEPTH};
 // them instead of falling through to the loader-blind global path.
 pub use loaders::{
     dbg_loader_chain, has_user_loader_parents, loader_parent_chain_enabled,
-    register_user_loader_parent, user_loader_ancestors, user_loader_parent_known,
-    MAX_USER_LOADER_DEPTH,
+    register_user_loader_parent, user_loader_ancestors, user_loader_builtin_parent,
+    user_loader_parent_known, MAX_USER_LOADER_DEPTH,
 };
 pub use module::{
     descriptor_from_module_attribute, package_of, ModuleDescriptor, ModuleRegistry, JAVA_BASE,

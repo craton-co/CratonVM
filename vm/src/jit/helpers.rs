@@ -7198,18 +7198,23 @@ fn jit_typecheck_trace(
         .get_class(obj_class_id)
         .map(|c| c.name.to_string())
         .unwrap_or_else(|| "<unknown>".to_string());
+    let obj_loader = cm
+        .get_class(obj_class_id)
+        .map(|c| format!("{:?}", c.loader_id))
+        .unwrap_or_else(|| "<unknown>".to_string());
     let target_desc = match target {
         Some(t) => format!(
-            "{} (id={})",
+            "{} (id={} loader={:?})",
             cm.get_class(t)
                 .map(|c| c.name.to_string())
                 .unwrap_or_else(|| "<unknown>".to_string()),
-            t.as_u32()
+            t.as_u32(),
+            cm.get_class(t).map(|c| c.loader_id)
         ),
         None => "<none>".to_string(),
     };
     eprintln!(
-        "[DBG_TYPECHECK] {stage}: target_name={class_name} lenient={lenient} recv={obj_name} (id={}) resolved_target={target_desc}",
+        "[DBG_TYPECHECK] {stage}: target_name={class_name} lenient={lenient} recv={obj_name} (id={} loader={obj_loader}) resolved_target={target_desc}",
         obj_class_id.as_u32()
     );
 }
