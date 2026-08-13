@@ -5935,9 +5935,28 @@ fn cmstateset_same_set(ctx: &dyn NativeContext, a: ObjectRef, b: ObjectRef) -> b
 }
 
 fn xmlchar_chars_array(ctx: &mut dyn NativeContext) -> Option<ObjectRef> {
-    let class_id = ctx
-        .class_id_by_name(XERCES_XMLCHAR)
-        .or_else(|| ctx.ensure_class_initialized(XERCES_XMLCHAR).ok())?;
+    // LOADED is not enough — the class must be INITIALIZED.
+    //
+    // `XMLChar.<clinit>` assigns `CHARS = new byte[0x10000]` first and spends
+    // the rest of its body filling it. A reader that accepts "the class id
+    // resolves" (which `class_id_by_name` answers for a merely-loaded class)
+    // can therefore read the array reference while another thread is still
+    // filling it, and every character it asks about below the fill point comes
+    // back with a zero mask. `isNameStart('c')` then answers false and xerces
+    // rejects `<component-set>` with "The markup in the document preceding the
+    // root element must be well-formed" at [1,2].
+    //
+    // Ordinary bytecode cannot hit this: the `getstatic XMLChar.CHARS` inside
+    // `XMLEntityScanner.scanQName` carries the initialization barrier. It is
+    // reachable only because CratonVM replaces that scanner with a native, so
+    // the barrier the bytecode would have run is gone unless this asks for it.
+    let class_id = match ctx.class_id_by_name(XERCES_XMLCHAR) {
+        Some(id) => {
+            ctx.ensure_class_initialized_with_class_id(id).ok()?;
+            id
+        }
+        None => ctx.ensure_class_initialized(XERCES_XMLCHAR).ok()?,
+    };
     let field_index = ctx.static_field_index_by_name(class_id, "CHARS")?;
     match ctx.get_static_field(class_id, field_index) {
         Value::Object(Some(chars)) => Some(chars),
@@ -6595,11 +6614,48 @@ fn populate_real_thread_holder(
     let group = match group {
         Value::Object(Some(_)) => group,
         _ => {
-            let cur = ctx.current_thread_object();
-            let g = ctx.get_field_by_name(cur, "holder");
-            match g {
-                Value::Object(Some(h)) => ctx.get_field_by_name(h, "group"),
-                _ => Value::Object(None),
+            // A thread created with no group of its own takes the installed
+            // SecurityManager's `getThreadGroup()` first, and only then the
+            // creating thread's group. That is the JDK's rule up to 23; JDK 24
+            // dropped it along with the SecurityManager itself (JEP 486).
+            //
+            // CratonVM deliberately did NOT adopt JEP 486 — `System
+            // .setSecurityManager` still installs, because the exec and Panama
+            // gates consult the installed manager for real (see
+            // `security_manager::register_system_security`). Keeping the
+            // manager alive but ignoring the one hook it has over thread
+            // construction left it half-alive: netty's
+            // `DefaultThreadFactoryTest
+            // .testDefaultThreadFactoryInheritsThreadGroupFromSecurityManager`
+            // installs a manager whose `getThreadGroup()` returns a sticky
+            // group and got the creating thread's group instead.
+            //
+            // This branch cannot introduce a divergence from HotSpot 25: it is
+            // reachable only once a SecurityManager is installed, which on
+            // HotSpot 25 cannot happen at all. The default
+            // `SecurityManager.getThreadGroup()` body is
+            // `Thread.currentThread().getThreadGroup()`, i.e. exactly the
+            // fallback below, so an unremarkable manager changes nothing.
+            let from_manager = match crate::security_manager::get_security_manager(&*ctx) {
+                Some(sm) => {
+                    match ctx.invoke_virtual(sm, "getThreadGroup", "()Ljava/lang/ThreadGroup;", &[])
+                    {
+                        Ok(Some(Value::Object(Some(g)))) => Some(g),
+                        _ => None,
+                    }
+                }
+                None => None,
+            };
+            match from_manager {
+                Some(g) => Value::Object(Some(g)),
+                None => {
+                    let cur = ctx.current_thread_object();
+                    let g = ctx.get_field_by_name(cur, "holder");
+                    match g {
+                        Value::Object(Some(h)) => ctx.get_field_by_name(h, "group"),
+                        _ => Value::Object(None),
+                    }
+                }
             }
         }
     };

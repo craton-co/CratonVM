@@ -65,7 +65,39 @@ The machinery is not missing — it is *unadopted*. Counting symbol uses of each
 | `adapters` | **0** | no |
 
 Six of twelve, and the six that are missing are exactly the moving,
-generational and concurrent halves. Three specific facts make this concrete:
+generational and concurrent halves.
+
+> **Re-counted 2026-08-13, after Phases 3 and 4: eight of twelve.** Same
+> method, same command, `zgc.rs` outside its `mod tests`:
+>
+> | submodule | uses, 08-13 morning | uses, after this work |
+> |---|---:|---:|
+> | `census` | 24 | 25 |
+> | `mark` | 16 | 25 |
+> | `tlab` | 11 | 13 |
+> | `vaddr` | 9 | 8 |
+> | `forwarding` | **0** | **7** |
+> | `barrier` | **0** | **6** |
+> | `page` | 2 | 2 |
+> | `metrics` | 1 | 1 |
+> | `generation` | 0 | **0** |
+> | `relocate` | 0 | **0** |
+> | `remembered` | 0 | **0** |
+> | `adapters` | 0 | **0** |
+>
+> `forwarding` is adopted for its **relocation-set selector**, which now
+> decides what compaction moves; `barrier` for its `ZBarrierContext`, which is
+> drivable but on no read path. The four still at zero are the honest remainder
+> and each is blocked on the same thing: **`zgc::page`'s allocator**.
+> `relocate`'s machinery is the *concurrent* evacuator and wants real pages to
+> evacuate; `generation` and `remembered` want pages to age and to record
+> cross-generational edges between. Replacing `Arena` with the page allocator
+> is a rewrite of the allocation path, not an increment, and it is the single
+> next thing that unblocks all four. The logical-page grid this work imposed
+> over the arena (`Z_LOGICAL_PAGE_BYTES`) is deliberately an *accounting* view
+> only — enough for the selector, not a substitute for the allocator.
+
+Three specific facts make this concrete:
 
 * **Relocation is hard-coded off.** `vm/src/vm/vm_init.rs:1713` —
   `const RELOCATION_REQUESTED: bool = false;`
@@ -143,7 +175,7 @@ what makes the maturity question hard to answer at all. As of this commit:
 |---|---|---|
 | "Why it is **default-off**" | `zgc-production-implementation-plan.md` | **Stale.** ZGC has been the default `GcAlgorithm` since 2026-08-10 (`vm/src/config.rs:769`). |
 | ZGC "has **no TLABs** (every allocation takes the arena lock)" | `gc-tuning.md` | **Stale.** The ZGC TLAB is default-ON (`CRATONVM_ZGC_TLAB`, `zgc_tlab_enabled_by_default`) and `alloc_raw_tlab` is the funnel for every object and array. |
-| "ZGC is **opt-in and experimental**" | `docs/internal/audits/gc-crate-audit.md:319` | **Stale** in the same way. |
+| "ZGC is **opt-in and experimental**" | `audits/gc-crate-audit.md` (internal) | **Stale** in the same way. |
 | Spring Boot "1860 PASS vs Generational's 1902, 49 HANG vs 18" | `gc-tuning.md` | **Stale in ZGC's disfavour**, and the page says so: the numbers predate two ZGC-only fixes from 2026-08-10 and the suite has not been re-run under ZGC since. |
 
 A default collector documented as an opt-in experiment is a governance
@@ -158,7 +190,7 @@ Five phases. Each has an exit criterion that is a **measurement**, not a
 merge — the standing lesson from this tree is that a landed change with no
 re-measurement is indistinguishable from an inert one.
 
-### Phase 0 — Say what is actually shipping *(days; no collector work)*
+### Phase 0 — Say what is actually shipping *(days; no collector work)* — **DONE 2026-08-13**
 
 Close Gap C. Reconcile `gc-tuning.md`, `zgc-production-implementation-plan.md`
 and `gc-crate-audit.md` with the tree: ZGC is the default, it has TLABs, it is
@@ -168,7 +200,26 @@ reserve to the tuning page as an operator-visible property.
 **Exit:** no page describes ZGC as default-off or TLAB-less; a reader can
 determine the shipping configuration from `gc-tuning.md` alone.
 
-### Phase 1 — Re-establish the empirical baseline *(one suite cycle)*
+**Done.** `gc-tuning.md` gained a *What is actually shipping, in one place*
+table — eight questions, each with the file that decides it — and the book's
+`memory-and-gc.md`, `internals/garbage-collector.md` and `contributing/building.md`
+were rewritten: all three still said ZGC was absent from a stock build. `GC.md`,
+`concurrent-gc-maturation.md`, the production plan's §1 header and the 2026-07-10
+gc-audit page were corrected or date-scoped rather than edited away.
+
+**Phase 0 also turned up a live defect, which is the argument for doing it
+first.** `zgc-tlab` and `zgc-startbits` are kill switches for default-ON
+machinery, and both were declared in `flag_groups::INVENTORY` with
+`off_word: None` — the shape reserved for a default-OFF opt-in. `resolve` turns
+`-token` into *unsetting* the key for such a row, and both parsers read an unset
+key as **on**, so `CRATONVM_GC=-zgc-tlab` was accepted, reported no unknown
+token, and left the TLAB running. The same wrong shape is what made the
+generated `flag-inventory.md` describe both as `opt-in | off`. Both now carry
+`off_word: Some("0")`, with a test that fails if either reverts. This is the
+`young-pause-goal-ms` defect (two rows away in the same file) for the second
+time: **the documentation drift and the inert switch were the same edit.**
+
+### Phase 1 — Re-establish the empirical baseline *(one suite cycle)* — **DONE 2026-08-13, except the one run that needs a machine**
 
 The default flip rests on one Tomcat run and a Spring Boot number that is five
 days stale and known to be measured on a binary without two of its own fixes.
@@ -179,6 +230,38 @@ under ZGC and Generational on the same commit, same host, interleaved.
 Generational, that is the finding and the default should be revisited — the
 comparison page's own warning that single-day cross-backend gaps are perishable
 cuts both ways.
+
+**Delivered as
+[`zgc-phase1-empirical-baseline-20260813.md`](zgc-phase1-empirical-baseline-20260813.md)**,
+built entirely from data already in the repository — five suites, not two, and
+no suite re-run. Three findings, in descending order of how much they change:
+
+1. **The Tomcat margin the shipping docs quote is superseded by its own
+   source.** `gc-tuning.md` and `GC.md` cite ZGC 604/29/0 against Generational
+   519/115/1 (2026-08-10). The same record re-ran all three arms on 2026-08-11
+   and got **629/11/0 against 628/11/0** — a one-class lead. Both pages now
+   carry the newer row.
+2. **Widening past the two suites the phase asked for makes the case
+   stronger, not weaker.** Spring Framework (2848 classes), H2 and Hibernate
+   Reactive all already had per-collector sweeps; ZGC is at parity on all
+   three, and H2 is the only suite where a collector separated itself — G1,
+   with 4 crashes.
+3. **The Spring Boot deficit cannot be closed from existing data, and that is
+   the honest answer.** No full-suite ZGC run exists after 2026-08-08. It is
+   the oldest number in the table, measured without two ZGC-only fixes, one of
+   which silently zeroed primitive arrays — a shape that manufactures FAILs
+   wherever it occurs. Treat it as **unmeasured**, not as evidence against ZGC.
+
+**The evidence record had been deleted from the tree.** `ad3393f7c` ("new netty
+bug docs") removed
+`known-issues/tomcat/gc-backend-3way-fullsuite-comparison-20260810.md`,
+touching no other GC file and leaving six pages — `gc-tuning.md` and `GC.md`
+among them — citing a path that no longer existed. Restored unmodified from
+`ad3393f7c^`. **A default flip whose justification can be deleted by an
+unrelated commit without anything noticing is a governance problem of the same
+family as Gap C**, and it is worth stating that Phase 1 found it only because
+the phase was run under a constraint (use existing data) that forced someone to
+go and read the source.
 
 ### Phase 2 — Make the non-compacting collector defensible on its own terms *(weeks)*
 
@@ -212,6 +295,49 @@ independently valuable and none of it needs a barrier:
 **Exit:** no suite class OOMs at a heap where Generational passes, and the
 fragmentation gauge is green over a full Tomcat run.
 
+**Status 2026-08-13: 2.1 landed earlier; 2.2, 2.3 and 2.4 landed with this
+document. The exit criterion is NOT met** — it names a suite run, and this
+session was scoped to build the mechanisms without re-running suites. What
+exists now is the instrument the exit criterion needs.
+
+* **2.2 — the gauge is built and reported.** Every collection takes one
+  post-sweep reading and the shutdown line carries
+  `[GC] zgc-frag: frag_samples=… worst_largest_free_permille=… free_permille_at_worst=…`,
+  which is one grep per class. Two design points are load-bearing and each has
+  a test that fails without it. **A full heap is not a fragmented heap**, so a
+  collection leaving under 25% free is not sampled at all — without that the
+  gauge would fire on the most ordinary workload there is, get muted, and be
+  worth nothing on the day it was right. And the metric is the largest
+  *servable* run, not the largest free-list block: the un-bumped middle between
+  the two cursors is on no free list, so scoring the list alone reads a pristine
+  1 MiB arena as **0 permille fragmented**. That second one was found by the
+  test, not by review.
+* **2.3 — the audit is written**, as
+  [`zgc-allocator-constant-audit-20260813.md`](zgc-allocator-constant-audit-20260813.md).
+  Thirteen constants; ten sound, two newly derived, one standing "No"
+  (`zgc_headroom_margin`, which bounds "a typical allocation" and is used as a
+  proxy for "this allocation" — and the request size it stands in front of is
+  unbounded). `ZGC_ADDRESS_BITS` is flagged as not yet load-bearing and owed a
+  re-derivation in Phase 4.
+* **2.4 — closed, but not the way this plan predicted, and the difference is
+  the finding.** The plan assumed the fix needed "a safe collection point
+  reachable from inside a native". Collecting inside the allocation wrapper is
+  not merely hard — **it is forbidden**: `vm_exec.rs` states that the wrappers
+  "must stay GC-free mid-callback, since their callers hold unrooted local
+  `ObjectRef`s". I wrote that version first and backed it out; it would have
+  been a use-after-free, not a fix.
+  The real defect was one level up. `alloc_raw` already latched on a refusal,
+  with a comment arguing that a failed request "is stronger evidence that a
+  cycle is due than the `allocated >= gc_threshold` predicate, which counts
+  LIVE bytes and therefore cannot see the bump space this heap never rewinds" —
+  and the boundary consumer then discarded that latch unless `needs_gc()`, the
+  very predicate being argued against, agreed. **The arming site and the
+  consuming site contradicted each other and the consuming site won**, silently,
+  in exactly the state the mechanism was written for. A separate
+  `hard_alloc_failure` latch now carries a genuine refusal to the one place a
+  collection is safe — the native boundary, where every argument is pinned and
+  remapped — without loosening the soft path.
+
 ### Phase 3 — Adopt concurrency before relocation *(weeks-months)*
 
 Concurrent marking is the half of ZGC that does **not** need a load barrier for
@@ -227,6 +353,101 @@ rather than corrupting the heap.
 
 **Exit:** `zgc_concurrent`'s coordinator drives a real collection; pause time
 falls measurably on a heap with a large live set; no suite regression.
+
+**Status 2026-08-13: the mutator ingress is built and wired. The exit criterion
+is NOT met — no coordinator drives a real collection.** What follows is what
+was found, because two of this phase's three named blockers turned out not to
+be what the plan described.
+
+**Blocker 1 (`ZMarkContext` for `ZgcRealHeap`) was already gone.**
+`zgc_concurrent.rs`'s module doc still said "**No `ZMarkContext`
+implementation for `ZgcRealHeap` exists**" — it does, in `gc/src/zgc.rs`, and
+it satisfies the requirement list in that same doc, including the atomic
+`try_mark` (through `ObjectHeader::try_add_gc_flags`, a CAS loop). Doc
+corrected.
+
+**Blocker 2 (the mutator barrier) needed one match arm, not three code
+generators.** The plan asked for "a mutator write barrier feeding
+`mark::ZMarkIngress`", and `zgc_concurrent.rs` describes the gap as "nothing
+calls `ZMarkHandle::mark_live_offset` from a `getfield`". Both readings point
+at new emission work across the interpreter, the x64 JIT and the natives.
+Neither is what was actually missing: **`VmHeap::satb_barrier` is already
+called before every reference store in this VM** — interpreter `putfield` and
+`aastore`, the JIT's `aastore` and `putfield` helpers, `deopt_materialize`,
+`vm_init` — because G1 needs it. Its ZGC arm was `{}`.
+
+That arm now reaches `ZgcRealHeap::satb_pre_barrier`, which publishes the
+overwritten reference into the heap's own `ZMarkIngress` when a cycle is armed.
+Cost while nothing is marking: **one relaxed load of a never-written cache
+line**, which is the reason `mark_active` is a separate flag and not an
+`Option` probe or a lock. Six tests, including the one that matters —
+`the_vm_heap_satb_arm_reaches_the_zgc_barrier`, which is the only one that can
+tell a wired barrier from an inert one, since every test that calls
+`satb_pre_barrier` directly would still pass with the arm back to `{}`.
+
+**This substitutes SATB for the load barrier, and that is a real design
+decision, not a shortcut.** Recorded here and at both sites so nobody
+rediscovers it: `zgc_concurrent.rs`'s termination design is built on ZGC's
+*read*-barrier discipline, where every mutator is a producer until stopped and
+"all queues empty" is a fixed point rather than a completion — hence the
+restart loop. Snapshot-at-the-beginning has a **bounded** producer set, so
+`try_end_mark` should reach `Complete` after the mark-end flush rather than
+looping. The restart loop stays correct and stays necessary (the flush can
+still produce work), but a `Restart` under SATB means the flush found buffered
+work, not that a mutator raced the marker. SATB is also *conservative* — an
+object dying mid-cycle survives to the next one — which is a throughput cost
+and not a correctness one, i.e. the right side to be wrong on for a first
+adoption.
+
+**Blocker 3, the real one, is ownership, and the plan does not name it.**
+`ZMarkCoordinator::new` takes an `Arc<dyn ZMarkContext>` and spawns persistent
+worker threads. `ZgcRealHeap` is held **by value** inside `VmHeap`, so there is
+no `Arc` to hand it and no safe way to mint one. Every route to adoption goes
+through this and each has a cost worth stating before one is chosen:
+
+* put the heap in an `Arc` — touches every `VmHeap` arm and every caller;
+* a raw-pointer bridge, with the coordinator constructed and `shutdown()` (which
+  joins) inside one `collect_garbage` call so no worker can outlive `&self` —
+  sound, but pays N thread spawns per collection;
+* a scoped parallel driver reusing `ZMarkStripeSet` + `ZMarkTerminator` (both
+  standalone, neither needs the `Arc`) under `std::thread::scope` — no `unsafe`,
+  but it reimplements `ZMarkWorker::run`, and a hand-copied termination loop is
+  the one piece of this engine where a mistake is a use-after-free rather than a
+  slowdown.
+
+**The intermediate step: stop-the-world *parallel* marking before *concurrent*
+marking — LANDED 2026-08-13, opt-in via `CRATONVM_ZGC_PARMARK=<n>`.** It needs
+no barrier at all (mutators are stopped), and it is the first time the
+coordinator, the striped queues, the work stealing and the termination
+handshake have run against a real heap and a real object graph rather than
+`TestMarkContext`.
+
+The ownership problem is solved by `ZHeapMarkBridge`, whose soundness rests on
+three facts and needs all three: the bridge is created, used and destroyed
+inside one `mark_parallel_stw` call taking `&self`; `ZMarkCoordinator`'s `Drop`
+**joins** every worker (unusually for this crate — it does not detach, and its
+own doc says so), which covers the panic path as well as the normal one; and
+the heap cannot move while `&self` is live. The price is a pool spawn and join
+per collection, which is why it is opt-in — caching the pool would require the
+heap to be `Arc`-owned, the larger change this deliberately does not make.
+
+**Adopting the context surfaced a live defect in it.** `ZMarkContext::visit_refs`
+did not report the **collection-overlay edge** that `collect_garbage`'s serial
+loop pushes (`external_roots_for_owner`). Invisible while the serial loop is the
+only marker; a use-after-free the moment a coordinator drives a collection,
+because a native overlay is reachable *only* through the Java object that owns
+it — so the marker would sweep live contents out from under a surviving owner.
+Fixed, with two tests that were verified to fail without it.
+
+Four more tests pin the parallel marker against the serial one: identical mark
+set, reaches a grandchild (so it is not passing because everything is a root),
+leaves an unreachable object unmarked (so it is not marking everything), and
+the worker count is off by default and capped. Three of the four were verified
+to fail against a marker given no roots.
+
+**Still not done, and this is what the exit criterion needs:** the pause-time
+measurement on a heap with a large live set. `CRATONVM_ZGC_PARMARK` exists so
+that measurement can be taken; taking it is a suite run.
 
 ### Phase 4 — Relocation, gated behind the JIT barrier *(months)*
 
@@ -249,6 +470,122 @@ is forced:
 **Exit:** relocation on, JIT on, both suites at parity, and the ~1.5x heap
 premium gone — which is the only outcome that actually retires Gap B rather
 than mitigating it.
+
+**Status 2026-08-13: not started, and correctly so — it is gated on Phase 3.
+One precondition is done: the seven value-degrading sites are no longer
+uncaught.**
+
+`gc/tests/zgc_colored_word_degradation.rs` (8 tests) pins what each site does
+today with a word that has bit 63 set. It deliberately does **not** assert the
+degradation is wrong — today it is right, and `vaddr.rs` designs it that way, so
+that an un-barriered read path fails loudly with a null dereference instead of
+quietly with a wild pointer. What the file changes is that the behaviour is now
+*enumerated and load-bearing*: each assertion is a checklist entry naming the
+file to change, and **a passing test after the barrier lands is a bug report**.
+
+Writing them surfaced two things the plan's one-line summary does not carry:
+
+* **Site 4 is a trap, not a site.** Widening `plausible_heap_pointer` to admit
+  bit 63 would "fix" all seven at once, and it is the wrong lever: it un-guards
+  every read path that has not been migrated yet, converting each from a loud
+  null into a wild pointer. The tripwire says so where someone would try it.
+* **Sites 6 and 7 cannot be edited, only branched.** `read_prim_element`'s
+  reference arm is shared with Generational and G1, so teaching it about colored
+  words changes those collectors too. It needs a ZGC-aware branch.
+
+**The refusal gate is now tested, and it was not.** `zgc_relocation_permitted`
+is the single thing standing between a relocating cycle and heap corruption —
+JIT-compiled code loads reference fields with no ZGC load barrier, so a moving
+cycle hands it stale pointers into evacuated memory with no error path — and it
+had **no test at all**. A gate accidentally inverted or short-circuited would
+have compiled, passed every suite (nothing requests relocation today) and armed
+the corruption for whoever first flipped `RELOCATION_REQUESTED`. Two tests now
+pin it; the one that matters was verified to fail against a gate short-circuited
+to always permit.
+
+One of the two is deliberately recorded as **weaker than it looks**: in a
+JIT-enabled test process the `!requested` early return and the JIT refusal both
+answer `false`, so it cannot distinguish them and deleting the early return
+leaves it passing. Separating those two branches needs a `--nojit` test process,
+which this crate's suite does not run. Said in the test rather than left for
+someone to discover.
+
+Also flagged from the Phase 2.3 audit: `ZGC_ADDRESS_BITS` (42, "4 TB heap max")
+is **not yet load-bearing** — `vaddr` is adopted only as an enum today — and
+must be re-derived in this phase against this arena's actual address range
+rather than inherited from OpenJDK's.
+
+**Landed 2026-08-13: the barrier seam, and a stop-the-world compaction.**
+
+*The barrier seam.* `impl ZBarrierContext for ZgcRealHeap` makes the
+built-and-unadopted `zgc::barrier` module drivable against this heap. It puts a
+barrier on **no read path** — no interpreter `getfield`, no JIT-emitted load,
+no native accessor calls `load_barrier_fast` — so in a normal run every method
+is unreachable and the good mask never leaves `Z_REMAPPED`. Writing it forced
+`ZMarkContext::heap_base`, which had been sitting at its `None` default with a
+doc explaining that `None` was "the *honest* answer" for this heap. It stopped
+being honest the moment the heap had a barrier: the barrier speaks 42-bit
+offsets and `mark_live` must convert, so `None` would have wired a barrier to a
+marker that silently discarded everything handed to it.
+
+*Compaction.* `relocate_stw` slides every live survivor in the small-object
+region down in address order, rewrites **every reference slot in every
+survivor** through the resulting `from -> to` map, drops the bump cursor, and
+returns a non-empty `PointerMap`; `collect_garbage` rewrites the caller's roots
+through it. That last part is not optional — a root still naming a pre-slide
+address is a dangling pointer the instant the call returns, and nothing
+downstream would fix it. The high end is deliberately not compacted: large
+objects bump *down* from capacity against a different free structure, and the
+low end is where TLAB chunks fragment, which is the measured problem.
+
+Three gates, all required: `CRATONVM_ZGC_RELOCATE=1` (intent),
+`zgc_relocation_permitted` (safety — refuses whenever the JIT is on), and the
+caller's stop-the-world token. **The sub-flag is now the only thing keeping
+this off a user's machine**, because the `zgc` Cargo feature that R5 assumed
+was the outer default-off gate has been default-ON since 2026-08-10.
+
+**Two mistakes worth keeping.** The first draft filtered survivors by
+`GC_FLAG_MARKED` and moved *nothing*: the sweep clears every survivor's mark
+bit before returning, so a post-sweep compaction needs a liveness source the
+sweep does not consume. The live set is now an explicit parameter and
+`collect_garbage` passes the post-sweep registry — precisely the set the sweep
+did not reclaim. And both new flags were added *undeclared*;
+`flag_declaration_guard` caught them, with the reason that matters: an
+undeclared flag is served by a live `getenv` rather than the latched snapshot,
+so `CRATONVM_GC=token` cannot reach it and a flag-dependent test silently
+measures the developer's ambient environment.
+
+**What still genuinely remains:** colored slots through the seven sites, the
+interpreter/native barrier and x64 barrier emission (~6-7 instructions), then
+`zgc::relocate`'s *concurrent* machinery and `forwarding`'s per-page table —
+which only become the right structures once `zgc::page` is adopted, since a
+single arena with no pages carries no information in a page-keyed table — then
+`generation` + `remembered`. **R6's `VmHeap::Zgc` arm audit is DONE (2026-08-13).**
+
+R6 said: *"58 arms plus a macro; the affirmative ones (`true`, `(0,0)`) assert
+facts that are only true for a non-moving collector, and none of them will fail
+loudly when they become wrong."* Compaction is the change that can make them
+wrong, so the audit stopped being theoretical the moment it landed.
+
+Result: of the 28 `VmHeap::Zgc` arms that return a value, exactly **two** take
+a *pre-GC address* and therefore have a moving-collector answer —
+`watched_pre_gc_addr_survived` and `pre_gc_addr_did_not_survive` — and **both
+are already correct**, because each consults the `pointer_map` before it
+reaches its ZGC arm. That is not a reading, it is now a test: the ZGC arms
+themselves are `is_addr_live`, a registry lookup, which after a slide answers
+about zeroed bytes at the old address. Delete either map check and a survivor
+that moved is reported dead at its old address, and
+`process_references_after_gc` drops every reference to it — the H2/HIB-CV-32
+shape those predicates were written for. Verified by deleting the check.
+
+The other arms are about *reachability walking* (`metadata_pin_deferrable`,
+`mirror_pin_deferrable`), *generational structure this backend does not have*
+(`old_gen_needs_gc`, `is_in_young_addr`), or *G1 machinery* — none of which a
+slide changes. The remaining reason compaction stays behind a default-off flag
+is therefore no longer this audit but the consumers OUTSIDE `gc/`: JIT frame
+maps, monitor tables, external root providers and native side tables all take
+the pointer map, and none has been exercised against a ZGC cycle that returns
+a non-empty one.
 
 ---
 

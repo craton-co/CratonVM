@@ -465,6 +465,13 @@ fn security_get_providers(ctx: &mut dyn NativeContext, _args: &[Value]) -> Metho
     let chain = snapshot();
     let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, chain.len());
     for (i, (name, ver, coverage)) in chain.iter().enumerate() {
+        // Same identity rule as `security_get_provider`: an entry the
+        // application registered is handed back as the object it registered,
+        // not as a same-named stand-in.
+        if let Some(real) = resolve_real_provider(ctx, name) {
+            ctx.set_array_element(arr, i, Value::Object(Some(real)));
+            continue;
+        }
         let p = make_provider(ctx, name, *ver, coverage);
         ctx.set_array_element(arr, i, Value::Object(Some(p?)));
     }
@@ -503,6 +510,23 @@ fn security_get_provider(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     };
     match find(&name_str) {
         Some((ver, coverage)) => {
+            // A provider the application registered itself must come back as
+            // THE SAME OBJECT it passed to `Security.addProvider`. The JDK's
+            // provider list stores the instance, so code that installs a
+            // provider and reads it back compares by identity or by class:
+            // netty's `BouncyCastleUtilTest` asserts `assertSame(added,
+            // Security.getProvider("BC"))`, and `BouncyCastleUtil` decides
+            // whether BouncyCastle is present by testing the answer with
+            // `instanceof BouncyCastleProvider`. Handing back a fresh
+            // `make_provider` synthetic failed both: the caller saw a bare
+            // `java.security.Provider` where it had registered a
+            // `BouncyCastleProvider`, and any provider-private state (BC's own
+            // service/creator maps) was unreachable through it. The registered
+            // object is already pinned by `remember_real_provider`, so
+            // preferring it costs no extra rooting.
+            if let Some(real) = resolve_real_provider(ctx, &name_str) {
+                return Ok(Some(Value::Object(Some(real))));
+            }
             let p = make_provider(ctx, &name_str, ver, coverage);
             Ok(Some(Value::Object(Some(p?))))
         }

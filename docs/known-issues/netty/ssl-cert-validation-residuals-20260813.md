@@ -33,18 +33,25 @@ changes the read on CratonVM's numbers: `SslContextBuilderTest`'s 9/21 was
 previously *dismissed* as "matches a crippled HotSpot," but with HotSpot now
 fully capable, CratonVM's 9/21 is a real, uncontested gap — not
 environment-explained anymore. Same logic for `CloseNotifyTest`'s 2/4.
-Worth checking what changed in the environment (see
-`bouncycastleutiltest-no-longer-a-non-defect-20260813.md`, which independently
-noticed the same kind of shift for a different class) before assuming these
-are new regressions rather than newly-exposed pre-existing gaps.
+Worth checking what changed in the environment before assuming these are new
+regressions rather than newly-exposed pre-existing gaps. The sibling
+`BouncyCastleUtilTest` page noticed the same kind of shift for a different
+class, and its outcome supports the "newly exposed, not new" reading: the
+premise change was real, and the defect it exposed had simply been
+unobservable. That class is **fixed** (2/2) — see the retired
+`bouncycastleutiltest-security-getprovider-identity` write-up. Its fix
+(`Security.getProvider` returning the registered `Provider` object rather than a
+stand-in) was re-measured against the rows on this page and changes none of
+them.
 
 ## Not yet done
 
 No stack traces beyond the `sig` column captured for most of these; no
 attempt to find a shared cause across the OCSP/BouncyCastle-adjacent
-classes (`OcspClientTest`, `OcspServerCertificateValidatorTest`,
-`BouncyCastleUtilTest` in the sibling doc) even though they're plausibly
-related given BouncyCastle's own presence-on-classpath shift. HotSpot
+classes (`OcspClientTest`, `OcspServerCertificateValidatorTest`) even though
+they're plausibly related given BouncyCastle's own presence-on-classpath shift.
+`BouncyCastleUtilTest`, the third member of that group, has since been fixed
+and is **not** a shared cause with these rows. HotSpot
 cross-check is done for all rows; CratonVM raw logs were not individually
 read past the `sig` column extracted by the harness.
 
@@ -59,8 +66,9 @@ bash run-netty-suite.sh --list /tmp/ssl-residuals.txt --hotspot --shards 1 --tim
 
 ## Related
 
-- `docs/known-issues/netty/bouncycastleutiltest-no-longer-a-non-defect-20260813.md`
-  — same-day, same-shape environment-premise shift for a different class.
+- The retired `bouncycastleutiltest-security-getprovider-identity` write-up
+  — same-day, same-shape environment-premise shift for a different class, since
+  root-caused and fixed.
 - `docs/known-issues/netty/ssl-suite-test-discovery-undercounts-20260813.md`
   — a structurally different problem (discovery-time undercounting) found
   in the same triage pass, do not conflate the two.

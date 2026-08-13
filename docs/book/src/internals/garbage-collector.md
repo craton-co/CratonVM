@@ -9,22 +9,29 @@ Collection](../user-guide/memory-and-gc.md).
 
 | Collector | Selection | Status |
 |-----------|-----------|--------|
-| **Generational** | default / `-XX:+UseGenerationalGC` | The default. Young/old generations with write barriers and a card table. The default young path is non-moving mark/sweep with selective promotion; moving evacuation is opt-in and fail-closed on incomplete root coverage. |
+| **ZGC** (`ZgcRealHeap`, `gc/src/zgc.rs`) | default / `-XX:+UseZGC` | **The default since 2026-08-10.** Real and wired end to end — `GcAlgorithm::Zgc` → `GcBackend::Zgc` → `VmHeap::Zgc` — but **not** a real ZGC: one two-ended `Arena`, a non-moving whole-heap stop-the-world mark-sweep, non-generational. It has its own thread-local allocation buffers (`gc/src/zgc/tlab.rs`, default-on). The colored-pointer / `ZPage` code alongside it in the same file (`ZgcCollector`, `ColoredPointer`, `LoadBarrier`, `GenerationalZgc`) is a metadata-only simulation with no production consumer. |
+| **Generational** | `-XX:+UseGenerationalGC` / `-XX:-UseZGC` | The former default, and the fallback in any build without the `zgc` feature. Young/old generations with write barriers and a card table. The default young path is non-moving mark/sweep with selective promotion; moving evacuation is opt-in and fail-closed on incomplete root coverage. |
 | **G1** (region-based) | `-XX:+UseG1GC` | Experimental. The generational collector remains the safety net during its maturation. |
-| **ZGC** (`ZgcRealHeap`, `gc/src/zgc.rs:1396`) | `-XX:+UseZGC`, in a build with the default-off `zgc` Cargo feature | Real and wired end to end — `GcAlgorithm::Zgc` → `GcBackend::Zgc` → `VmHeap::Zgc` — but **not** a real ZGC: one `Arena`, a non-moving whole-heap stop-the-world mark-sweep, no TLABs. Absent from a stock build. The colored-pointer / `ZPage` code alongside it in the same file (`ZgcCollector`, `ColoredPointer`, `LoadBarrier`, `GenerationalZgc`) is a metadata-only simulation with no production consumer. |
 
 > **On the `zgc` row.** `gc/src/vm_heap.rs` does `use crate::zgc::ZgcRealHeap`
 > and carries `VmHeap::Zgc` arms behind the same cfg, and `cratonvm-vm` forwards
-> the feature, so `-XX:+UseZGC` really selects it. The feature is
-> **default-off** — a stock build compiles only two backends, and
-> `cargo build --release -p cratonvm-cli --features zgc` is what produces a
-> ZGC-capable launcher. It stays default-off for pass-rate parity, not for want
-> of a consumer: on the 1975-class Spring Boot suite, same binary with only the
-> collector toggled, ZGC measures 1860 PASS / 49 HANG / 22 FAIL against the
-> default collector's 1902 / 18 / 11
-> (record `fixed-suite-bugs/springboot/zgc-real-fullsuite-regression-RETIRED-20260808.md`). The path to
-> a genuinely concurrent, generational, compacting ZGC is
-> [`docs/feature-designs/zgc-production-implementation-plan.md`](../../../feature-designs/zgc-production-implementation-plan.md).
+> the feature. The feature is **on by default** — it gates the
+> `GcAlgorithm::Zgc` variant itself, so the default could not be `Zgc` without
+> it — and only `--no-default-features` produces a launcher with no ZGC at all.
+>
+> **Two properties of this row are load-bearing and easy to misread.**
+> *It is non-moving*, which is why `VmHeap::Zgc`'s pointer map is always empty
+> and no barriers are needed — correct only while it stays non-moving, and the
+> arms fail silently rather than loudly if it ever moves an object.
+> *It has TLABs*, but not through `VmHeap::refill_tlab`, which still returns
+> `None` here; the buffers live inside the backend (`ZgcRealHeap::alloc_raw_tlab`
+> over `gc/src/zgc/tlab.rs`) and a TLAB chunk is **reserved** space that no
+> collection can reclaim while its owning thread lives.
+>
+> The path to a genuinely concurrent, generational, compacting ZGC is
+> [`zgc-production-implementation-plan.md`](../../../feature-designs/zgc-production-implementation-plan.md);
+> what is and is not built today, with the plan to close it, is
+> [`zgc-maturity-assessment-and-plan-20260813.md`](../../../feature-designs/zgc-maturity-assessment-and-plan-20260813.md).
 
 ## Generational design
 

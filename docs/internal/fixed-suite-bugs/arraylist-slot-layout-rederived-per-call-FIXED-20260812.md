@@ -113,7 +113,7 @@ preserving the DF08 Vector/ArrayList separation the function exists for.
 **`SearchProcessorTest` passes solo but still fails under the suite's 3-way
 sharding** (135 s, tripping the same 120 s per-test cap). The remaining ~12×
 over the plain-Java equivalent is structural and is filed as
-[`arraylist-native-overhead-and-the-view-carrier-class`](../../known-issues/netty/arraylist-native-overhead-and-the-view-carrier-class-20260812.md):
+[`arraylist-native-overhead-and-view-carrier`](netty/arraylist-native-overhead-and-view-carrier-FIXED-20260813.md):
 CratonVM returns `map.values()` as an object whose class **is exactly
 `java.util.ArrayList`**, so the natives cannot take an exact-class fast path
 and must run the view/wrapper discrimination chain on every call. That page

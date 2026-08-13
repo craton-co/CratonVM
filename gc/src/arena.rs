@@ -1851,6 +1851,53 @@ impl Arena {
     /// cursor (or the conservative root scanner is replaced with a precise
     /// stack map). The audit-flagged "perf bug" is a real cost, but the
     /// correctness hazard outweighs it.
+    /// Drop the low bump cursor to `new_cursor` after an external compaction
+    /// has slid every low-end survivor below it. Returns the bytes reclaimed.
+    ///
+    /// # Why this is not `retract_cursor_into_free_tail`
+    ///
+    /// That method is careful and incremental: it hands back only a free span
+    /// that ends exactly AT the cursor, because on a non-moving heap anything
+    /// else may still be live. This one is the compacting twin — the caller
+    /// asserts that everything above `new_cursor` at the low end is now dead,
+    /// which is a claim only a relocator that has just moved the survivors can
+    /// make. It is `pub(crate)` so that claim stays inside this crate.
+    ///
+    /// The low free list is dropped wholesale rather than filtered: after a
+    /// slide every low hole is inside the reclaimed span by construction, so a
+    /// surviving entry would name bytes that are now un-bumped tail and would
+    /// hand them out twice.
+    ///
+    /// The **high end is untouched**. Large objects live above `high_cursor`
+    /// with their own free list, and this compaction does not move them; that
+    /// is a deliberate first cut, not an oversight — see
+    /// `ZgcRealHeap::relocate_stw`.
+    /// Bytes of the low region a compaction may consider -- the bump cursor.
+    ///
+    /// Not [`Self::used`], which folds in the large-object region at the other
+    /// end and would send a compactor walking addresses above `high_cursor`.
+    pub(crate) fn used_low_for_compaction(&self) -> usize {
+        self.cursor
+    }
+
+    pub(crate) fn compact_low_to(&mut self, new_cursor: usize) -> usize {
+        assert!(
+            new_cursor <= self.cursor,
+            "compaction must not raise the cursor: {new_cursor} > {}",
+            self.cursor
+        );
+        let reclaimed = self.cursor - new_cursor;
+        // Zero the vacated span. A slid-down survivor leaves its old bytes
+        // behind verbatim, including a valid-looking `ObjectHeader`, and a
+        // conservative scanner that met one would resurrect a corpse.
+        self.data[new_cursor..self.cursor].fill(0);
+        self.cursor = new_cursor;
+        self.clear_low_free_list();
+        // Every recorded low object start just moved.
+        self.clear_alloc_anchors();
+        reclaimed
+    }
+
     pub fn reset(&mut self) {
         // stw-residual-close forensics: record the wipe range before zeroing
         // (site 2 = from-space reset). Gated; no-op unless the env is set.

@@ -327,7 +327,9 @@ sound.
    runs if explicitly asked.)
 2. **Doc truth-up.** Reconcile `ARCHITECTURE.md` vs `README.md`/`CONTRIBUTING.md`: describe
    Generational as default, G1 as opt-in/experimental-but-real, and ZGC-real as built and
-   dispatched but compiled in only behind the default-off `zgc` Cargo feature.
+   dispatched but compiled in only behind the `zgc` Cargo feature — which was
+   default-off when this was written and has been **default-ON since
+   2026-08-10**, because the default `GcAlgorithm` is now the variant it gates.
    (Docs-only; full-review docs-governance row.) This is the only step that may touch files outside
    the design doc, and is pure documentation.
 

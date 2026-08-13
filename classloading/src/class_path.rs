@@ -342,6 +342,12 @@ pub struct ClassPath {
     /// [`CanonicalizeCache`]). Long-running processes that probe many
     /// distinct paths can no longer grow this map without bound.
     canonicalize_cache: Mutex<CanonicalizeCache>,
+    /// Memoized `fs::canonicalize` for **classpath roots** only — see
+    /// [`ClassPath::canonicalize_root`] for why these cannot share the
+    /// bounded FIFO above. Unbounded by construction, because its key set is
+    /// exactly the entry list: one insert per `Directory`/`JarFile` root the
+    /// scan has touched, never a caller-supplied probe path.
+    root_canonical_cache: Mutex<HashMap<PathBuf, PathBuf>>,
     /// Specs handed to [`ClassPath::add_path`], with a use count.
     ///
     /// `URLClassLoader.close()` must stop a closed loader serving new classes,
@@ -1238,6 +1244,44 @@ impl ClassPath {
     ///
     /// Errors are NOT cached — a transient `ENOENT` should not be
     /// remembered as a fail-closed verdict for the rest of the process.
+    /// Canonicalize a **classpath root** — the `dir` of a
+    /// [`ClassPathEntry::Directory`] or the `path` of a
+    /// [`ClassPathEntry::JarFile`] — through an unbounded memo.
+    ///
+    /// This exists because the bounded [`Self::canonicalize_cached`] FIFO
+    /// cannot serve a scan whose working set IS the classpath. Every
+    /// `getResources` probe walks every entry and canonicalizes each root it
+    /// touches; once the classpath is larger than [`CANONICALIZE_CACHE_CAP`]
+    /// that cyclic access pattern evicts each root exactly before it is next
+    /// needed, so the hit rate collapses to zero and every probe re-runs
+    /// `realpath` on every root. Measured on the Quarkus full-reactor harness
+    /// (4230 entries, 1676 of them directories): 6.79M `readlink` calls for a
+    /// single test class — half of a 110 s run — against 66.5K on HotSpot for
+    /// the same work.
+    ///
+    /// The cap was added (Round 7 audit, HIGH #4) to stop an unbounded map
+    /// growing on arbitrary *probe* paths, and that concern is untouched:
+    /// probe paths still go through [`Self::canonicalize_cached`]. Roots are a
+    /// different population — the key set here is bounded by `self.entries`,
+    /// i.e. by the classpath the launcher was already given — so this map
+    /// cannot grow past a size the process has already paid for. It is
+    /// cleared alongside the bounded cache whenever a root is retracted.
+    ///
+    /// Errors are NOT cached, for the same reason as `canonicalize_cached`.
+    fn canonicalize_root(&self, path: &Path) -> std::io::Result<PathBuf> {
+        {
+            let guard = self.root_canonical_cache.lock();
+            if let Some(canon) = guard.get(path) {
+                return Ok(canon.clone());
+            }
+        }
+        let canon = fs::canonicalize(path)?;
+        self.root_canonical_cache
+            .lock()
+            .insert(path.to_path_buf(), canon.clone());
+        Ok(canon)
+    }
+
     fn canonicalize_cached(&self, path: &Path) -> std::io::Result<PathBuf> {
         {
             let guard = self.canonicalize_cache.lock();
@@ -1317,7 +1361,7 @@ impl ClassPath {
         full_path: &Path,
         name: &str,
     ) -> Option<PathBuf> {
-        let canon_dir = match self.canonicalize_cached(dir) {
+        let canon_dir = match self.canonicalize_root(dir) {
             Ok(p) => p,
             Err(e) => {
                 debug!(
@@ -1570,6 +1614,7 @@ impl ClassPath {
         Self {
             entries,
             canonicalize_cache: Mutex::new(CanonicalizeCache::new()),
+            root_canonical_cache: Mutex::new(HashMap::new()),
             dynamic_specs: HashMap::new(),
             static_len: None,
         }
@@ -2354,6 +2399,7 @@ impl ClassPath {
             // now absent again, and vice versa for anything memoized while it
             // was present.
             self.canonicalize_cache.lock().clear();
+            self.root_canonical_cache.lock().clear();
             debug!("Dynamic classpath: retracted {removed} entrie(s) for {path}");
         }
         removed
@@ -2497,7 +2543,7 @@ impl ClassPath {
                         // classpath root is identical across every
                         // probe and resolved-file paths repeat once a
                         // class is reloaded by JVMTI / instrumentation.
-                        let canon_dir = self.canonicalize_cached(dir).map_err(|e| {
+                        let canon_dir = self.canonicalize_root(dir).map_err(|e| {
                             debug!(
                                 "Refusing to load {class_name}: cannot canonicalize \
                                  classpath root {}: {e}",
@@ -2822,7 +2868,7 @@ impl ClassPath {
                     if full_path.exists() {
                         // Directories are never signed.
                         let abs = self
-                            .canonicalize_cached(dir)
+                            .canonicalize_root(dir)
                             .unwrap_or_else(|_| dir.to_path_buf());
                         let p = abs.to_string_lossy().replace('\\', "/");
                         let p = p.strip_prefix("//?/").unwrap_or(&p).to_string();
@@ -2853,7 +2899,7 @@ impl ClassPath {
                     };
                     if found {
                         let abs = self
-                            .canonicalize_cached(path)
+                            .canonicalize_root(path)
                             .unwrap_or_else(|_| path.clone());
                         let p = abs.to_string_lossy().replace('\\', "/");
                         let p = p.strip_prefix("//?/").unwrap_or(&p).to_string();
@@ -3404,7 +3450,7 @@ impl ClassPath {
                         // this entry (`continue`) so other classpath
                         // entries may still answer the probe, but this
                         // specific filesystem read does NOT proceed.
-                        let canon_dir = match self.canonicalize_cached(dir) {
+                        let canon_dir = match self.canonicalize_root(dir) {
                             Ok(p) => p,
                             Err(e) => {
                                 debug!(
@@ -3738,7 +3784,7 @@ impl ClassPath {
                     // symlink an attacker can plant such that one of
                     // these canonicalize calls fails is now skipped
                     // rather than read.
-                    let canon_dir = match self.canonicalize_cached(dir) {
+                    let canon_dir = match self.canonicalize_root(dir) {
                         Ok(p) => p,
                         Err(_) => continue,
                     };
@@ -4011,6 +4057,36 @@ impl ClassPath {
                         }
                         continue;
                     }
+                    // `getResources("")` names the classpath root ITSELF, and
+                    // the generic path below answers it the expensive way:
+                    // `dir.join("")` is `dir` with a trailing separator, so it
+                    // costs an `exists()` statx, a `canonicalize` of `dir`, a
+                    // SECOND `canonicalize` of the trailing-slash spelling
+                    // (a distinct cache key), and an `is_dir()` statx — per
+                    // directory entry, per call.
+                    //
+                    // That is not a hypothetical shape. SmallRye Config's
+                    // `AbstractLocationConfigSourceLoader.isInClassloader` is
+                    // exactly `classLoader.resources(uri.getPath()).anyMatch(..)`
+                    // with an empty path, and Quarkus's config bootstrap runs
+                    // it once per discovered config source per profile — 1388
+                    // times over a 4230-entry classpath for ONE test class,
+                    // which is where 4.43M `statx` calls came from against
+                    // HotSpot's 11.9K for the same run.
+                    //
+                    // A `Directory` entry is a directory that is on the
+                    // classpath; both facts were established when it was
+                    // admitted. Re-deriving them from the filesystem on every
+                    // probe buys nothing, so answer from the memoized root.
+                    if name.is_empty() {
+                        if let Ok(canon_dir) = self.canonicalize_root(dir) {
+                            let p = canon_dir.to_string_lossy().replace('\\', "/");
+                            let p = p.strip_prefix("//?/").unwrap_or(&p);
+                            let p = p.trim_start_matches('/').trim_end_matches('/');
+                            urls.push(format!("file:/{}/", encode_path_for_url(p)));
+                        }
+                        continue;
+                    }
                     let full_path = dir.join(Path::new(name));
                     if full_path.exists() {
                         // C35 audit fix (HIGH security): fail-CLOSED on
@@ -4023,7 +4099,7 @@ impl ClassPath {
                         // enumeration (even though the matching
                         // `find_class` path correctly rejected the same
                         // symlink).
-                        let canon_dir = match self.canonicalize_cached(dir) {
+                        let canon_dir = match self.canonicalize_root(dir) {
                             Ok(p) => p,
                             Err(_) => continue,
                         };
@@ -4107,7 +4183,7 @@ impl ClassPath {
                         }
                         if !candidates.is_empty() {
                             let abs = self
-                                .canonicalize_cached(path)
+                                .canonicalize_root(path)
                                 .unwrap_or_else(|_| path.clone());
                             let p = abs.to_string_lossy().replace('\\', "/");
                             let p = p.strip_prefix("//?/").unwrap_or(&p);
@@ -4165,7 +4241,7 @@ impl ClassPath {
                     // exactly "push no URL" — the arm the bool already took.
                     if let Some(suffix) = selected_entry {
                         let abs = self
-                            .canonicalize_cached(path)
+                            .canonicalize_root(path)
                             .unwrap_or_else(|_| path.clone());
                         let p = abs.to_string_lossy().replace('\\', "/");
                         // Strip UNC prefix \\?\ that canonicalize produces on Windows.
