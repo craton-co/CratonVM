@@ -252,6 +252,23 @@ and buys back a hang.
 arena and its reserve, 3 for the recycled-chunk decision, 2 for the reservation
 budget.
 
+**The throughput cost, measured rather than assumed.** `TestTomcat` (an
+ordinary, non-thread-heavy class), interleaved base/branch, two rounds each on
+the same loaded host:
+
+| | round 1 | round 2 | mean |
+|---|---:|---:|---:|
+| baseline | 32.7 s | 36.8 s | 34.8 s |
+| this branch | 34.3 s | 38.4 s | 36.4 s |
+
+**~4.6% slower**, and the branch is slower in both rounds, so it is probably
+real rather than host noise — the earlier-firing `headroom_low` is the likely
+cause. That is the price of the trade and it is worth stating plainly: this
+class does not have enough threads for the chunk to shrink at all (the clamp
+binds below ~256 threads), so what it is paying for is the trigger, not the
+TLAB change. A wider re-measurement belongs with the suite re-baseline in
+feature-designs/zgc-maturity-assessment-and-plan-20260813.md, Phase 1.
+
 Every new test was watched to **fail before it passed**: stubbing `alloc_high`
 to delegate to `alloc` fails all five region tests; stubbing the high retraction
 to `0` fails two; the recycled-chunk tests were written against the literal 96.
