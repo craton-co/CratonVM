@@ -182,9 +182,7 @@ pub fn generate_all(config: &OpcodeCorpusConfig) -> Vec<OpcodeProgram> {
                         &body,
                     )),
                 ),
-                Recipe::Unreachable(reason) => {
-                    (OpcodeSupport::UnreachableFromSource(reason), None)
-                }
+                Recipe::Unreachable(reason) => (OpcodeSupport::UnreachableFromSource(reason), None),
                 Recipe::Skipped(reason) => (OpcodeSupport::Skipped(reason), None),
             };
             OpcodeProgram {
@@ -214,10 +212,11 @@ pub fn generator_index(config: &OpcodeCorpusConfig) -> GeneratorIndex {
         .map(|p| {
             let status = match p.support {
                 OpcodeSupport::Generated => GeneratorStatus::Generated,
-                OpcodeSupport::UnreachableFromSource(reason)
-                | OpcodeSupport::Skipped(reason) => GeneratorStatus::Unreachable {
-                    reason: reason.to_string(),
-                },
+                OpcodeSupport::UnreachableFromSource(reason) | OpcodeSupport::Skipped(reason) => {
+                    GeneratorStatus::Unreachable {
+                        reason: reason.to_string(),
+                    }
+                }
             };
             (p.opcode, status)
         })
@@ -408,10 +407,18 @@ fn recipe(opcode: u8, config: &OpcodeCorpusConfig) -> Recipe {
 
         // -- the _N short forms: parameters pinned to slots 0..3 -------------
         0x1a..=0x1d => emit(
-            &helper("i4", "int a, int b, int c, int d", "", "s += a + b + c + d;"),
+            &helper(
+                "i4",
+                "int a, int b, int c, int d",
+                "",
+                "s += a + b + c + d;",
+            ),
             "mix(i4(i, i + 1, i + 2, i + 3));",
         ),
-        0x1e..=0x21 => emit(&long_slot_helpers(), "mix(l02(i, i + 1) + l13(i, i, i + 1));"),
+        0x1e..=0x21 => emit(
+            &long_slot_helpers(),
+            "mix(l02(i, i + 1) + l13(i, i, i + 1));",
+        ),
         0x22..=0x25 => emit(
             &helper(
                 "f4",
@@ -659,7 +666,10 @@ fn recipe(opcode: u8, config: &OpcodeCorpusConfig) -> Recipe {
         0xab => emit("", LOOKUPSWITCH_BODY),
 
         // -- returns --------------------------------------------------------
-        0xac => emit(&typed_return("int", "int", "s += p + k;"), "mix(retint(i));"),
+        0xac => emit(
+            &typed_return("int", "int", "s += p + k;"),
+            "mix(retint(i));",
+        ),
         0xad => emit(
             &typed_return("long", "long", "s += p + k;"),
             "mix(retlong(i));",
@@ -885,7 +895,12 @@ fn double_slot_helpers() -> String {
 fn long_store_helpers() -> String {
     format!(
         "{}\n\n{}",
-        helper("ls02", "long a, long b", "", "a = k;\nb = k + 1;\ns += a + b;"),
+        helper(
+            "ls02",
+            "long a, long b",
+            "",
+            "a = k;\nb = k + 1;\ns += a + b;"
+        ),
         helper(
             "ls13",
             "int p, long a, long b",
