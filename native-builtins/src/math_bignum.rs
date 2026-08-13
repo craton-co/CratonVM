@@ -3766,10 +3766,57 @@ fn native_bd_value_of_double(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
         Some(Value::Double(v)) => *v,
         _ => 0.0,
     };
-    let s = format!("{}", d);
-    let scale = s.find('.').map(|p| (s.len() - p - 1) as i32).unwrap_or(0);
-    let result = bd_alloc(ctx, &s, scale);
-    Ok(Some(Value::Object(Some(result?))))
+    // The JDK specifies this EXACTLY: `valueOf(double) = new BigDecimal(
+    // Double.toString(val))`. The old body used `format!("{}", d)`, which is
+    // Rust's Display and NOT Double.toString -- Rust prints `10000000` where
+    // Java prints `1.0E7` -- and then derived the scale by looking for a '.',
+    // which cannot see an exponent at all. MEASURED 2026-08-13
+    // (scratchpad/orch/Vb.java), six rows wrong at once:
+    //
+    //   valueOf(1e7)   HotSpot 1.0E+7     was 10000000
+    //   valueOf(1e6)   HotSpot 1000000.0  was 1000000
+    //   valueOf(1e-7)  HotSpot 1.0E-7     was 1E-7
+    //   valueOf(1e-6)  HotSpot 0.0000010  was 0.000001
+    //   valueOf(0.0)   HotSpot 0.0        was 0
+    //   valueOf(1e21)  HotSpot 1.0E+21    was 1000000000000000000000
+    //
+    // `new BigDecimal(String)` has no native and runs real JDK bytecode, so it
+    // was already right -- only this entry point was wrong.
+    if !d.is_finite() {
+        return Err(RuntimeError::NumberFormatException {
+            message: "Infinite or NaN".into(),
+        }
+        .into());
+    }
+    // Ask Java for the canonical text rather than reproducing Double.toString.
+    let text = match ctx.invoke(
+        "java/lang/Double",
+        "toString",
+        "(D)Ljava/lang/String;",
+        &[Value::Double(d)],
+    ) {
+        Ok(Some(Value::Object(Some(s)))) => ctx.read_string(s).unwrap_or_default(),
+        _ => String::new(),
+    };
+    let text = if text.is_empty() {
+        // No real class library (synthetic mode): keep a plain rendering rather
+        // than failing the call. Scientific notation is what differs, and a
+        // synthetic run has no JDK formatter to disagree with.
+        format!("{d}")
+    } else {
+        text
+    };
+    // Decompose `[-]D.DDD[E[-]X]` into unscaled digits and a scale, the way
+    // BigDecimal(String) does: scale = (fraction digits) - exponent.
+    let (mantissa, exp) = match text.split_once(['E', 'e']) {
+        Some((m, e)) => (m, e.parse::<i32>().unwrap_or(0)),
+        None => (text.as_str(), 0),
+    };
+    let frac_len = mantissa.split_once('.').map_or(0, |(_, f)| f.len() as i32);
+    let digits = mantissa.replace('.', "");
+    let scale = frac_len - exp;
+    let result = bd_alloc(ctx, &digits, scale)?;
+    Ok(Some(Value::Object(Some(result))))
 }
 
 fn bd_unscaled_bigint(ctx: &dyn NativeContext, this: ObjectRef) -> (crate::bigint::BigInt, i32) {
