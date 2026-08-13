@@ -202,7 +202,7 @@ CORE_CLASSES="RCollections RStrings RNumbers RSerial RCrypto RExceptions RReflec
 # on CratonVM until the fix lands — that is the gate doing its job, not a bad
 # registration.
 # docs/known-issues/jdk-only/D1-R11-SERVICELOADER-DOUBLE-SOURCE-20260813.md
-JDKONLY_CLASSES="RJdkHello RJdkStrict RJdkCollections RJdkLambdas RJdkHandles RJdkProxy RJdkReflect RJdkFieldModule RJdkRecords RJdkHidden RJdkModule RJdkServices RJdkAqs RJdkPhaser RJdkExecutors RJdkForkJoin RJdkNio RJdkNet RJdkProcess RJdkSecurity RJdkJmx RJdkJni RJdkFailure RJdkStampedStamps RJdkLookupIn RJdkDefineClass RJdkX509Intercept RJdkLogging RJdkSqlPackage RJdkEnvMap RJdkProxyIface RJdkFunctionCombinators RJdkForeign RJdkEnumerations RJdkAsyncChannel RJdkMapViews RServiceLoaderDoubleSource"
+JDKONLY_CLASSES="RJdkHello RJdkStrict RJdkCollections RJdkLambdas RJdkHandles RJdkProxy RJdkReflect RJdkFieldModule RJdkRecords RJdkHidden RJdkModule RJdkServices RJdkAqs RJdkPhaser RJdkExecutors RJdkForkJoin RJdkNio RJdkNet RJdkProcess RJdkSecurity RJdkJmx RJdkJni RJdkFailure RJdkStampedStamps RJdkLookupIn RJdkDefineClass RJdkX509Intercept RJdkLogging RJdkSqlPackage RJdkEnvMap RJdkProxyIface RJdkFunctionCombinators RJdkForeign RJdkEnumerations RJdkAsyncChannel RJdkMapViews RServiceLoaderDoubleSource RJdkReflBox"
 
 # Vectors that deliberately belong to NO class list. Every entry needs a
 # reason, because "not scheduled" is indistinguishable from "forgotten" once
@@ -468,126 +468,29 @@ compile_suite() {
   return 0
 }
 
-# Launcher arguments a specific vector needs, in a spelling BOTH VMs accept —
-# these are handed to HotSpot too, so the oracle runs the same shape. Emitted
-# as a word list, consumed unquoted.
-class_args() {
-  case "$1" in
-    RJdkModule)
-      [ -n "$HAVE_MODULE" ] && printf '%s' "--module-path $MODBUILD --add-modules $JDKONLY_MODULE"
-      ;;
-    # The three properties that name the modular class-path entry
-    # class_cp_extra() supplies. Handed to BOTH VMs (CratonVM's launcher parses
-    # -D into system properties the same way; vm-cli/src/main.rs), because the
-    # oracle has to see the identical configuration or the diff is meaningless.
-    #
-    # This arm must NEVER grow a --module-path: the vector asserts
-    # `System.getProperty("jdk.module.path") == null` as a PRECONDITION, since a
-    # --module-path module IS resolved into the boot layer and IS defined to the
-    # application loader on a real JVM — supplying both would make the vector
-    # measure its own command line instead of the VM.
-    RServiceLoaderDoubleSource)
-      [ -n "$HAVE_MODULE" ] && printf '%s' \
-        "-Dcratonvm.rt.cpmodule=$JDKONLY_MODULE -Dcratonvm.rt.cpclass=com.cratonvm.jdkonly.svc.Greeter -Dcratonvm.rt.cpservice=com.cratonvm.jdkonly.svc.Greeter"
-      ;;
-    *) : ;;
-  esac
-}
-
-# Extra CLASS-PATH entries a vector needs, appended to $BUILD, separator
-# included so an empty answer is a literal no-op. Handed to BOTH VMs.
+# class_args(), class_cp_extra() and class_cv_args() USED TO BE DEFINED HERE.
+# They now have ONE definition, in harness-guard.sh, which this script sources
+# at the top (search for `. "$HERE/harness-guard.sh"`) and which
+# harness-selfcheck.sh sources too. Deleted 2026-08-13 (lane F9), applying
+# W8-E30-1 NOM-3.
 #
-# RServiceLoaderDoubleSource needs a MODULAR artefact (here: the exploded module
-# regression-suite/modules/ already compiles for RJdkModule) on the CLASS path,
-# and it must be there WHEN THE VM STARTS — CratonVM scans the application class
-# path for module-info.class inside ClassManager::new, before main, so a jar the
-# vector built itself would be scanned by nobody. That is the whole reason this
-# hook exists and the reason the vector could not simply be added to a list.
+# The copies were behaviourally identical to the shared ones, not merely
+# similar: W8-E30-1 §3.1's H1 guard compared them over 3 hooks x 95 classes x 4
+# environments (HAVE_MODULE set/unset x CRATONVM_ARGS with/without
+# --jdk-only — the four axes the three hooks actually branch on) = 1,140 rows,
+# and got 1,140 identical answers. That is why the deletion is pure: the
+# definitions that took over are the ones the matrix already proved equal, and
+# H1 goes silent by itself with nothing left to compare rather than needing to
+# be deleted alongside.
 #
-# The same directory must NOT also reach class_args() as a --module-path: see
-# the note there.
+# Do not re-add a copy here to "override" the shared one for one vector. The
+# later definition wins silently, which is exactly the drift that let this
+# script and harness-selfcheck.sh disagree about RJdkModule until the hooks
+# were unified. Add the arm to harness-guard.sh, where both callers see it.
 #
-# If compile_modules could not build the module, $HAVE_MODULE is empty and this
-# emits nothing — the vector then fails on its own first assertion with
-# "-Dcratonvm.rt.cpmodule=<module name> is REQUIRED … a green result would mean
-# nothing". That is deliberate and is the vector's own design: a precondition
-# that silently disarms the only discriminating check is how a gate becomes
-# green-forever. The same absence already makes RJdkModule meaningless, so it is
-# a tree-level fault either way, and it is loud in both places.
-class_cp_extra() {
-  case "$1" in
-    RServiceLoaderDoubleSource)
-      [ -n "$HAVE_MODULE" ] && printf '%s' "$CPSEP$MODBUILD/$JDKONLY_MODULE"
-      ;;
-    *) : ;;
-  esac
-}
-
-# CratonVM-ONLY arguments for a vector: launcher flags in CratonVM's own
-# spelling, which HotSpot would reject outright. Kept separate from class_args
-# for exactly that reason — a `--nojit` in class_args would make the oracle
-# exit non-zero, its key lines come back empty, and every such vector would
-# fail the cross-VM diff for a reason that has nothing to do with the VM.
-#
-# The two entries below are the reproduction conditions their vectors' own doc
-# comments already claim the suite supplies. Both vectors are in CORE_CLASSES as
-# of 2026-08-11, so these arguments are now load-bearing on every default run.
-#
-# BOTH GATES ARE INERT WITHOUT THEIR ARGUMENT — they do not merely lose
-# sensitivity, they PASS ON A BROKEN VM, which is worse than not running at all
-# because it reads as coverage. The two mechanisms, from the internal records
-# fixed-suite-bugs/h2-suite-bugs/bug-h2-priorityblockingqueue-stale-objectref-classcastexception-FIXED.md
-# and fixed-suite-bugs/treemap-treeset-range-snapshot-stale-objectref-FIXED.md:
-#
-#   * on the default heap no collection happens during the walk at all, so the
-#     stale ObjectRef is never created; and
-#   * with a live JIT frame on the stack the young generation falls back to a
-#     non-moving sweep, under which a stale reference still resolves and the
-#     defect hides entirely.
-#
-# Hence --Xmx 64m for both, and --nojit for RPriorityQueueGc only. RTreeRangeGc
-# must NOT get --nojit: it reproduces with the JIT on (3/3, b2e13e441), so
-# withholding the flag is what keeps the default compiling configuration under
-# test. Do not "make the two entries consistent" by adding it.
-#
-# Do not drop these again. A previous merge resolution did, silently. Nothing
-# caught it: a vector that stops being scheduled does not turn a run red, it
-# only makes the pass count smaller, and nobody diffs the pass count. The
-# UNREGISTERED_CLASSES census and the COVERAGE ERROR below exist because of
-# this — they are what makes the next such drop visible.
-class_cv_args() {
-  case "$1" in
-    RPriorityQueueGc) printf '%s' "--nojit --Xmx 64m" ;;
-    RTreeRangeGc)     printf '%s' "--Xmx 64m" ;;
-    # CratonVM's Panama gate is default-CLOSED (NATIVE_ACCESS_POLICY in
-    # native-builtins/src/panama.rs; only --enable-native-access opens it).
-    # Without this every downcall in RJdkForeign raises IllegalCallerException
-    # and the vector reddens for a reason that is not the thing it tests.
-    # HotSpot needs no counterpart: on JDK 25 the restricted-method call only
-    # WARNS, and the warning goes to stderr, which the cross-VM PASS/CK diff
-    # does not read. `--enable-native-access` is declared require_equals, so
-    # the `=` spelling is the safe one.
-    RJdkForeign)      printf '%s' "--enable-native-access=ALL-UNNAMED" ;;
-    # RJdkSqlPackage is a --jdk-only POLICY vector and is RED without the flag:
-    # its nonVolatileRejected() arm asserts HotSpot's IllegalArgumentException
-    # ("Must be volatile type"), which the Compatible-mode native in
-    # native-builtins/src/atomic_updater.rs does not implement (it rejects
-    # static and final, not plain non-volatile). `SUITE=all` with no
-    # CRATONVM_ARGS runs JDKONLY_CLASSES in Compatible mode, so pin it here.
-    # MEASURED, and it corrects an earlier claim in this file: repeating the
-    # flag is NOT harmless. `cratonvm --jdk-only --jdk-only` exits 2 with
-    # "the argument '--jdk-only' cannot be used multiple times" — clap's derive
-    # for a bool does not imply an idempotent SetTrue. So emit it only when
-    # CRATONVM_ARGS has not already supplied it.
-    RJdkSqlPackage)
-      case " ${CRATONVM_ARGS:-} " in
-        *" --jdk-only "*) : ;;
-        *) printf '%s' "--jdk-only" ;;
-      esac
-      ;;
-    *) : ;;
-  esac
-}
+# run.sh's own CPSEP is computed BEFORE the source and still wins;
+# harness-guard.sh defaults CPSEP only when the caller left it unset, so there
+# is exactly one value either way.
 
 # Can $1 (a javac) actually target `--release $2`? Probed with a throwaway
 # compile rather than by parsing --help: javac accepts the option and then

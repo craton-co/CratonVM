@@ -110,13 +110,45 @@ const FACTORIES: &[(&str, &str, &str)] = &[
         "Ljdk/internal/access/JavaNioAccess;",
         "java/nio/Buffer$2",
     ),
+    // F17-1 (2026-08-13): `getJavaSecurityAccess` USED TO BE HERE AND IS GONE.
+    // Do not re-add it. JEP 486 removed the Security Manager and took
+    // `jdk.internal.access.JavaSecurityAccess` with it, so there is no
+    // differently-spelled equivalent to correct this to — the whole interface is
+    // absent, not just the getter. Measured on Microsoft 25.0.3+9-LTS:
+    //
+    //     $ javap jdk.internal.access.JavaSecurityAccess
+    //     Error: class not found: jdk.internal.access.JavaSecurityAccess
+    //     $ javap jdk.internal.access.SharedSecrets | grep -c getJavaSecurityAccess
+    //     0
+    //
+    // `getJavaxSecurityAccess()Ljdk/internal/access/JavaxSecurityAccess;` IS on
+    // the JDK 25 surface and looks like a near-miss for it in a name-keyed
+    // search. It is a different interface (`javax.security.auth.Subject`
+    // plumbing), not a rename of this one — see
+    // scripts/baselines/jdk25-jdk.internal.access.SharedSecrets.tsv, which lists
+    // both `getJavaxSecurityAccess` and `setJavaxSecurityAccess` and neither
+    // spelling of the `Java`-prefixed pair.
+    //
+    // Nothing dispatched to the deleted triple: no `.java` in this tree names
+    // `SharedSecrets.getJavaSecurityAccess`, and no JDK 25 bytecode can call a
+    // method its own `SharedSecrets` does not declare, so `call_native` had no
+    // reachable path to it in any mode. `register_java_security_access` below is
+    // deliberately KEPT — see its doc comment.
+    //
+    // `javaUtilJarAccess` — NOT `getJavaUtilJarAccess`. This one is a spelling
+    // correction, not a deletion: the interface exists and the descriptor was
+    // already right, but the real method has never carried the `get` prefix.
+    //
+    //     $ javap jdk.internal.access.SharedSecrets | grep JarAccess
+    //       public static ...JavaUtilJarAccess javaUtilJarAccess();
+    //       (and setJavaUtilJarAccess(JavaUtilJarAccess) — the setter DOES have
+    //        the prefix, which is how the getter's spelling got invented)
+    //
+    // `getJavaUtilJarAccess` was measured dead everywhere before this change
+    // (scripts/baselines/jdk-only-dead-everywhere.tsv:192, bucket
+    // `method-nowhere`) precisely because no caller could ever name it.
     (
-        "getJavaSecurityAccess",
-        "Ljdk/internal/access/JavaSecurityAccess;",
-        "java/security/AccessController$1",
-    ),
-    (
-        "getJavaUtilJarAccess",
+        "javaUtilJarAccess",
         "Ljdk/internal/access/JavaUtilJarAccess;",
         "cratonvm/internal/ss/JavaUtilJarAccess$1",
     ),
@@ -2594,6 +2626,26 @@ fn jsec_get_protect_domains(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     }
 }
 
+/// F17-1 (2026-08-13): the factory that used to hand out this owner
+/// (`SharedSecrets.getJavaSecurityAccess`) was deleted from `FACTORIES` above —
+/// JEP 486 removed `jdk.internal.access.JavaSecurityAccess` entirely. These two
+/// registrations are therefore unreachable *through this bridge*, and the owner
+/// class is fabricated too: `javap java.security.AccessController$1` answers
+/// `class not found` on Microsoft 25.0.3+9-LTS (JDK 25's `AccessController` has
+/// no anonymous inner classes left — `javap -p` lists only the `doPrivileged`
+/// family, `getContext`, `checkPermission` and `<clinit>`).
+///
+/// KEPT ANYWAY, as a decision rather than an oversight: the owner-class *name*
+/// is pinned by two files this lane does not own —
+/// `native-api/src/no_image_receiver.rs:143` lists it, and
+/// `native-builtins/tests/stub_ratchet.rs:325` asserts on that listing — so
+/// deleting the registrations here without moving those in the same commit
+/// would redden a ratchet for a change with no behavioural effect (this whole
+/// registrar's fabricated half is unreachable in `--jdk-only`, where §7 step 3
+/// answers `Bytecode` for every concrete method and no bytecode names these
+/// triples). The removal is nominated in
+/// docs/known-issues/jdk-only/F17-1-cds-sharedsecrets-fabrications-20260813.md
+/// §NOMINATIONS so it can land as one atomic change.
 fn register_java_security_access(registry: &mut NativeMethodRegistry) {
     let owner = "java/security/AccessController$1";
     registry.register(
@@ -2861,16 +2913,97 @@ mod tests {
     fn all_factories_listed() {
         // getJavaObjectInputStreamAccess removed: JDK 25 uses an invokedynamic
         // lambda (no ObjectInputStream$1), so the real getter must run.
-        assert_eq!(FACTORIES.len(), 15);
+        //
+        // F17-1 (2026-08-13): 15 -> 14. `getJavaSecurityAccess` was deleted —
+        // JEP 486 removed `jdk.internal.access.JavaSecurityAccess` and the
+        // getter with it. See the comment at the deletion site in `FACTORIES`.
+        assert_eq!(FACTORIES.len(), 14);
     }
 
+    /// F17-1 (2026-08-13) — REPLACES a guard that could not fail.
+    ///
+    /// The previous body of this test was, in full:
+    ///
+    /// ```ignore
+    /// for (method, ret, _) in FACTORIES {
+    ///     assert!(method.starts_with("getJava"));
+    ///     assert!(method.ends_with("Access"));
+    ///     assert!(ret.contains("Access;"));
+    /// }
+    /// ```
+    ///
+    /// Every name in `FACTORIES` was written to that shape, so the test checked
+    /// the list against itself: it had no way to distinguish a JDK-true getter
+    /// from an invented one, and it passed on both `getJavaSecurityAccess` (a
+    /// method JDK 25 does not declare at all) and `getJavaUtilJarAccess` (a
+    /// misspelling of `javaUtilJarAccess`) for as long as both were listed.
+    /// Worse, its `starts_with("getJava")` clause actively *punished* the
+    /// correct spelling: `javaUtilJarAccess` has no `get` prefix, so repairing
+    /// the table would have reddened the guard that was supposed to protect it.
+    ///
+    /// The oracle is now external: the JDK 25 class surface as walked out of the
+    /// runtime image by `scripts/jdk-baseline/generate.py` and frozen in
+    /// `scripts/baselines/jdk25-jdk.internal.access.SharedSecrets.tsv`.
+    ///
+    /// SOUNDNESS OF THIS PARTICULAR ORACLE, because it is not sound everywhere:
+    /// the generator keeps only rows whose flags contain `public`
+    /// (`generate.py:175`), so a baseline is blind to package-private, private
+    /// and `private static native` members. That blindness is why the same
+    /// baseline mis-reports `jdk.internal.misc.CDS.logLambdaFormInvoker` (see
+    /// `cds.rs`). It does not bite here: every member of `SharedSecrets` is
+    /// `public static`, so its 65 baseline rows are its whole surface, and
+    /// `javap jdk.internal.access.SharedSecrets` returns the same set.
     #[test]
-    fn every_factory_returns_access_interface() {
+    fn every_factory_is_declared_by_jdk25_shared_secrets() {
+        let baseline = crate::jdk_baseline::parse(crate::jdk_baseline::SHARED_SECRETS);
         for (method, ret, _) in FACTORIES {
-            assert!(method.starts_with("getJava"));
-            assert!(method.ends_with("Access"));
-            assert!(ret.contains("Access;"));
+            let desc = format!("(){ret}");
+            assert!(
+                baseline.declares(method, &desc),
+                "SharedSecrets bridge registers `{method}{desc}`, which JDK 25's \
+                 jdk.internal.access.SharedSecrets does not declare. Candidate \
+                 descriptors the JDK does declare under that name: {:?}. If the \
+                 list is empty the member is absent outright (delete the entry); \
+                 if it is non-empty you have the descriptor wrong. Oracle: \
+                 scripts/baselines/jdk25-jdk.internal.access.SharedSecrets.tsv.",
+                baseline.descriptors_named(method),
+            );
         }
+    }
+
+    /// Mutation check for the guard above: it must actually reject the two
+    /// spellings F17-1 removed, not merely accept the ones that survived.
+    ///
+    /// Without this, `every_factory_is_declared_by_jdk25_shared_secrets` would
+    /// be one silent `parse()` change away from being as vacuous as the test it
+    /// replaced (a `Baseline` that parsed to zero rows would make `declares`
+    /// return `false` for everything — but an empty `FACTORIES` loop would still
+    /// pass). Asserting a KNOWN-BAD name is rejected and a KNOWN-GOOD one is
+    /// accepted pins both directions.
+    #[test]
+    fn jdk25_baseline_rejects_the_two_spellings_f17_1_removed() {
+        let baseline = crate::jdk_baseline::parse(crate::jdk_baseline::SHARED_SECRETS);
+        assert!(
+            !baseline.declares(
+                "getJavaSecurityAccess",
+                "()Ljdk/internal/access/JavaSecurityAccess;"
+            ),
+            "JEP 486 removed JavaSecurityAccess; nothing declares this getter"
+        );
+        assert!(
+            !baseline.declares(
+                "getJavaUtilJarAccess",
+                "()Ljdk/internal/access/JavaUtilJarAccess;"
+            ),
+            "the real spelling has never carried the `get` prefix"
+        );
+        assert!(
+            baseline.declares(
+                "javaUtilJarAccess",
+                "()Ljdk/internal/access/JavaUtilJarAccess;"
+            ),
+            "…and the corrected spelling must be the one the JDK declares"
+        );
     }
 
     #[test]
@@ -2880,8 +3013,8 @@ mod tests {
             assert!(seen.insert(owner), "duplicate owner class: {owner}");
         }
         // Every factory has a distinct owner class, so the unique-owner count
-        // tracks FACTORIES.len() (15 after `getJavaObjectInputStreamAccess` was
-        // removed — see `all_factories_listed`). Derive it so the two stay in
+        // tracks FACTORIES.len() (14 since F17-1 removed `getJavaSecurityAccess`
+        // — see `all_factories_listed`). Derive it so the two stay in
         // lock-step instead of drifting on the next factory add/remove.
         assert_eq!(seen.len(), FACTORIES.len());
     }
@@ -2911,6 +3044,17 @@ mod tests {
         // For each of the 15 owner classes, probe for one
         // representative method we know is registered. This is
         // a sanity check that every `register_*` call landed.
+        //
+        // F17-1 (2026-08-13): 15 here is NOT `FACTORIES.len()` (now 14) and must
+        // not be re-derived from it — the two lists have never had the same
+        // membership, and now they do not even have the same length. Measured
+        // against the current tree, the owners probed below that have NO entry
+        // in `FACTORIES` are `java/io/ObjectInputStream$1` (deliberately not
+        // intercepted, so the real invokedynamic getter runs — see the note in
+        // `FACTORIES`) and, as of F17-1, `java/security/AccessController$1`
+        // (whose getter went with JEP 486); and the factory owner NOT probed
+        // below is `java/io/FileDescriptor$1`. Reading either count as the other
+        // is how the two drift with nothing noticing.
         let mut r = NativeMethodRegistry::new();
         register_wp1_4_shared_secrets(&mut r);
         let expected: &[(&str, &str, &str)] = &[

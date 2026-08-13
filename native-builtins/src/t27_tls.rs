@@ -7786,47 +7786,65 @@ mod tests {
     }
 
     /// DOOR 1 of `regression-suite/src/RSslNullSession.java`, without a VM:
-    /// the 3-field session `ssl_security::new13_alloc_null_ssl_session` mints
-    /// for an `SSLSocket` that was never connected (`tls_id = -1`).
+    /// the session `ssl_security::new13_alloc_null_ssl_session` mints for an
+    /// `SSLSocket` that was never connected (`tls_id = -1`).
     ///
     /// `getId` and `isValid` are the two this file decides and the two the
     /// nominated patch would have missed — a field-count-only test treats
     /// every shape narrower than 7 as "negotiated", which is exactly this one.
+    ///
+    /// E42 — **run at BOTH widths, and 4 is the one that ships.**
+    /// `NEW13_SSL_SESS_FIELDS` went 3 -> 4 so `putValue` would stop writing
+    /// over slot 2, which moved the live null session onto
+    /// `session_has_negotiated`'s `_ => true` arm. Width 3 stays here because
+    /// the merged `3 | 4` arm still answers it defensively and a regression
+    /// dropping either half would otherwise be invisible from this crate;
+    /// `ssl_security::new13_tests` holds the same line from the other side.
     #[test]
     fn the_null_socket_session_has_no_id_and_is_not_valid() {
         use crate::test_utils::MockNativeContext;
         let r = session_registry();
         let mut ctx = MockNativeContext::new();
-        // [0]=proto [1]=cipher [2]=tls_id, tls_id = -1 => never connected.
-        let sess = ctx.alloc_object(cratonvm_types::ClassId::new(0), 3);
-        let p = ctx.create_string(crate::phases_late::ssl_security::JSSE_NULL_PROTOCOL);
-        let c = ctx.create_string(crate::phases_late::ssl_security::JSSE_NULL_CIPHER_SUITE);
-        ctx.set_field(sess, 0, Value::Object(Some(p)));
-        ctx.set_field(sess, 1, Value::Object(Some(c)));
-        ctx.set_field(sess, 2, Value::Int(-1));
-        let this = &[Value::Object(Some(sess))];
 
         let get_id = r
             .find("javax/net/ssl/SSLSession", "getId", "()[B")
             .expect("getId registered");
-        match get_id(&mut ctx, this) {
-            Ok(Some(Value::Object(Some(a)))) => assert_eq!(
-                ctx.array_length(a),
-                0,
-                "HotSpot answers byte[0] for a session that negotiated nothing; \
-                 Tomcat's JSSESupport.java:171 tests `length == 0` exactly"
-            ),
-            other => panic!("getId must return an array, got {other:?}"),
-        }
-
         let is_valid = r
             .find("javax/net/ssl/SSLSession", "isValid", "()Z")
             .expect("isValid registered");
-        assert_eq!(
-            is_valid(&mut ctx, this).unwrap(),
-            Some(Value::Int(0)),
-            "HotSpot 25.0.3+9-LTS, unconnected SSLSocket: isValid() = false"
-        );
+
+        // [0]=proto [1]=cipher [2]=tls_id, tls_id = -1 => never connected.
+        // Width 4 adds [3]=attrs, which is the whole reason it is 4.
+        for width in [3usize, 4] {
+            let sess = ctx.alloc_object(cratonvm_types::ClassId::new(0), width);
+            let p = ctx.create_string(crate::phases_late::ssl_security::JSSE_NULL_PROTOCOL);
+            let c = ctx.create_string(crate::phases_late::ssl_security::JSSE_NULL_CIPHER_SUITE);
+            ctx.set_field(sess, 0, Value::Object(Some(p)));
+            ctx.set_field(sess, 1, Value::Object(Some(c)));
+            ctx.set_field(sess, 2, Value::Int(-1));
+            if width > 3 {
+                ctx.set_field(sess, 3, Value::Object(None));
+            }
+            let this = &[Value::Object(Some(sess))];
+
+            match get_id(&mut ctx, this) {
+                Ok(Some(Value::Object(Some(a)))) => assert_eq!(
+                    ctx.array_length(a),
+                    0,
+                    "width {width}: HotSpot answers byte[0] for a session that \
+                     negotiated nothing; Tomcat's JSSESupport.java:171 tests \
+                     `length == 0` exactly"
+                ),
+                other => panic!("getId must return an array, got {other:?}"),
+            }
+
+            assert_eq!(
+                is_valid(&mut ctx, this).unwrap(),
+                Some(Value::Int(0)),
+                "width {width}: HotSpot 25.0.3+9-LTS, unconnected SSLSocket: \
+                 isValid() = false"
+            );
+        }
     }
 
     /// MUTATION CHECK for the test above. Without it, `getId` could return
@@ -7843,9 +7861,27 @@ mod tests {
         let r = session_registry();
         let mut ctx = MockNativeContext::new();
 
-        // 3-field accept/connect shape with a real stream id.
+        // 3-field connect shape (retired by E42; the merged arm still answers
+        // it) with a real stream id.
         let live = ctx.alloc_object(cratonvm_types::ClassId::new(0), 3);
         ctx.set_field(live, 2, Value::Int(0)); // id 0 is a VALID stream id
+        // E42 — the 4-field accept/NEW-13 shape, which is what the tree mints
+        // TODAY. Two rows, because `>= 0` is the boundary and `0` is on it:
+        // `SSLServerSocket.accept` writes `RUSTLS_SOCK_ID_BASE + stream_id`, so
+        // its ids are large, while `invalidate()`/`close()` bugs in this family
+        // have historically produced exactly `Int(0)`. Both must read as
+        // negotiated, which is what makes the merged arm a NO-OP for the accept
+        // shape rather than a change to it.
+        let live4 = ctx.alloc_object(cratonvm_types::ClassId::new(0), 4);
+        ctx.set_field(live4, 2, Value::Int(0));
+        ctx.set_field(live4, 3, Value::Object(None));
+        let live4_accept = ctx.alloc_object(cratonvm_types::ClassId::new(0), 4);
+        ctx.set_field(
+            live4_accept,
+            2,
+            Value::Int(crate::servlet::RUSTLS_SOCK_ID_BASE + 3),
+        );
+        ctx.set_field(live4_accept, 3, Value::Object(None));
         // 8-field engine shape, slot 2 = the isValid flag, set.
         let engine_ok = ctx.alloc_object(cratonvm_types::ClassId::new(0), 8);
         ctx.set_field(engine_ok, 2, Value::Int(1));
@@ -7862,6 +7898,8 @@ mod tests {
 
         for (what, sess, want_len, want_valid) in [
             ("3-field, stream id 0", live, 32usize, 1i32),
+            ("4-field, stream id 0", live4, 32, 1),
+            ("4-field, accept-shaped offset id", live4_accept, 32, 1),
             ("8-field, negotiated", engine_ok, 32, 1),
             ("8-field, pre-handshake", engine_pre, 0, 0),
         ] {
@@ -7938,8 +7976,8 @@ mod tests {
     /// E31 — THE SLOT COLLISION, as a test rather than as a nomination.
     ///
     /// `putValue` used to write its `java.util.HashMap` into
-    /// `num_fields - 1`, which on the 3-field null-session shape is the STREAM
-    /// ID. That is the slot `session_has_negotiated` reads, so a single
+    /// `num_fields - 1`, which on the then-3-field null-session shape was the
+    /// STREAM ID. That is the slot `session_has_negotiated` reads, so a single
     /// `putValue` turned `Int(-1)` into an object reference, took the
     /// predicate's defensive `_ => true` arm, and handed the session back its
     /// 32-byte fabricated id and `isValid() == true`.
@@ -8004,7 +8042,605 @@ mod tests {
         );
     }
 
-    /// MUTATION CHECK for the test above. Without it, `putValue` could no-op
+    /// E42 — THE SAME QUESTION AT THE WIDTH THAT SHIPS.
+    ///
+    /// The test above pins the retired 3-field shape, where the fix was to
+    /// REFUSE (`sslsess_attrs_slot` -> `None`). `NEW13_SSL_SESS_FIELDS` is 4
+    /// now, so the live null session takes the *other* branch: slot 3 is a real
+    /// attribute slot, the write happens, and the thing that must not move is
+    /// slot 2. That makes this the executable form of the whole E42 bargain —
+    /// the API works AND the stream id survives it — and it is a different
+    /// assertion from the width-3 one, not a rename of it.
+    ///
+    /// The three follow-up assertions are the measured consequences that were
+    /// reported when the widening landed without `session_has_negotiated`'s arm
+    /// merge: a `putValue` flipped `isValid()` back to `true` and `getId()`
+    /// back to 32 fabricated bytes through an unrelated API. Note they would
+    /// pass here for the WRONG reason if the arm merge were reverted — slot 2
+    /// still reads `Int(-1)` — which is why
+    /// `the_null_socket_session_has_no_id_and_is_not_valid` runs at width 4
+    /// too. That test is the one that fails on a reverted arm; this one is the
+    /// one that fails if the attribute slot regresses onto slot 2.
+    #[test]
+    fn a_widened_null_session_put_value_does_not_touch_the_stream_id() {
+        use crate::test_utils::MockNativeContext;
+        let r = session_registry();
+        let mut ctx = MockNativeContext::new();
+        // The width-4 DOOR 1 shape: [0]=proto [1]=cipher [2]=tls_id = -1,
+        // [3]=attrs.
+        let sess = ctx.alloc_object(cratonvm_types::ClassId::new(0), 4);
+        ctx.set_field(sess, 2, Value::Int(-1));
+        ctx.set_field(sess, 3, Value::Object(None));
+
+        let name = ctx.create_string("org.eclipse.jetty.sni.host");
+        let value = ctx.create_string("example.test");
+        let put = r
+            .find(
+                "javax/net/ssl/SSLSession",
+                "putValue",
+                "(Ljava/lang/String;Ljava/lang/Object;)V",
+            )
+            .expect("putValue registered");
+        put(
+            &mut ctx,
+            &[
+                Value::Object(Some(sess)),
+                Value::Object(Some(name)),
+                Value::Object(Some(value)),
+            ],
+        )
+        .expect("putValue must not fail");
+
+        assert!(
+            matches!(ctx.get_field(sess, 3), Value::Object(Some(_))),
+            "slot 3 IS the attribute slot at NEW13_SSL_SESS_FIELDS = 4 — the \
+             widening exists so this write has somewhere to land; if it is \
+             None, `sslsess_attrs_slot`'s `4 => Some(3)` row has regressed"
+        );
+        assert_eq!(
+            ctx.get_field(sess, 2),
+            Value::Int(-1),
+            "and it must NOT have landed on the stream id. `num_fields - 1` is \
+             3 here as well, so a reader who 'simplifies' `sslsess_attrs_slot` \
+             back to that spelling passes this — the guard is the 6-field row, \
+             not this one"
+        );
+
+        let this = &[Value::Object(Some(sess))];
+        let get_id = r
+            .find("javax/net/ssl/SSLSession", "getId", "()[B")
+            .expect("getId registered");
+        match get_id(&mut ctx, this) {
+            Ok(Some(Value::Object(Some(a)))) => assert_eq!(
+                ctx.array_length(a),
+                0,
+                "a putValue must not give an unhandshaked session an id"
+            ),
+            other => panic!("getId must return an array, got {other:?}"),
+        }
+        let is_valid = r
+            .find("javax/net/ssl/SSLSession", "isValid", "()Z")
+            .expect("isValid registered");
+        assert_eq!(
+            is_valid(&mut ctx, this).unwrap(),
+            Some(Value::Int(0)),
+            "a putValue must not make an unhandshaked session valid"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // F18 — the four doors that had no real-mode registration, the one bit
+    // behind `isValid()`, and the width table that stops a session reading
+    // another connection's certificate chain
+    // -----------------------------------------------------------------------
+
+    /// **A registration census, not a behaviour test.** Each of these four was
+    /// absent from real-JDK mode entirely, and the failure mode of an absent
+    /// registration on `javax/net/ssl/SSLSession` is not a wrong answer — it is
+    /// `AbstractMethodError`, because the interface declaration carries no Code
+    /// attribute. A body cannot be tested until it exists, so this asserts that
+    /// it exists.
+    ///
+    /// `invalidate` is F10-1 NOMINATION 3; `getPeerHost`/`getPeerPort` are the
+    /// accessor half of E12-1's residual 4 (which recorded the *producer* and
+    /// did not notice the accessor was missing); `getSessionContext` had zero
+    /// registrations anywhere in the crate, in either mode.
+    #[test]
+    fn the_four_unregistered_real_mode_session_doors_are_registered() {
+        let r = session_registry();
+        let cls = "javax/net/ssl/SSLSession";
+        for (name, desc) in [
+            ("invalidate", "()V"),
+            ("getPeerHost", "()Ljava/lang/String;"),
+            ("getPeerPort", "()I"),
+            ("getSessionContext", "()Ljavax/net/ssl/SSLSessionContext;"),
+        ] {
+            assert!(
+                r.find(cls, name, desc).is_some(),
+                "{cls}.{name}{desc} has no real-JDK-mode registration. It is an \
+                 abstract interface declaration with no Code attribute, so an \
+                 un-intercepted call is an AbstractMethodError in the mode \
+                 --jdk-only runs — not a wrong value, a thrown Error. \
+                 See docs/known-issues/jdk-only/F18-1-*.md."
+            );
+        }
+    }
+
+    /// **The marker-collision invariant, mechanised in the file that now
+    /// depends on it.**
+    ///
+    /// `net_phase_e::HTTPS_CLIENT_SESSION_MARKER` is written into slot 2 of
+    /// every HTTPS client session so `session_has_negotiated` reads it as
+    /// "negotiated". `peer_certs_for_session` also reads slot 2 — as a
+    /// `servlet` registry KEY. The two uses are only compatible while the
+    /// marker cannot name a real socket: if it ever could, one connection
+    /// would be handed another connection's peer certificate chain, which is a
+    /// far worse failure than the `isValid()` one F10 fixed.
+    ///
+    /// F10-1 §4.1 argued this from the constants. This asserts it, so that
+    /// moving any one of the four numbers fails a build instead of a comment.
+    #[test]
+    fn the_https_session_marker_can_never_name_a_real_socket() {
+        use crate::net_phase_e::HTTPS_CLIENT_SESSION_MARKER as M;
+        assert!(
+            M > 0,
+            "the marker must be >= 0 or `session_has_negotiated` reads it as \
+             'never negotiated' — the defect F10-1 fixed"
+        );
+        for (name, base) in [
+            (
+                "PENDING_CONNECT_SOCK_ID_BASE",
+                crate::servlet::PENDING_CONNECT_SOCK_ID_BASE,
+            ),
+            (
+                "PENDING_LAYERED_SOCK_ID_BASE",
+                crate::servlet::PENDING_LAYERED_SOCK_ID_BASE,
+            ),
+            ("RUSTLS_SOCK_ID_BASE", crate::servlet::RUSTLS_SOCK_ID_BASE),
+        ] {
+            assert!(
+                M < base,
+                "HTTPS_CLIENT_SESSION_MARKER ({M:#x}) must stay strictly below \
+                 servlet::{name} ({base:#x}), or an HTTPS session's slot 2 \
+                 names a real socket id and `peer_certs_for_session` hands it \
+                 THAT socket's peer certificate chain"
+            );
+        }
+    }
+
+    /// The width table behind `session_stream_id`, which is the fix for the
+    /// cross-connection read E31-1 NOMINATION 4 (re-raising E22-1 NOMINATION B)
+    /// recorded and nobody had landed.
+    ///
+    /// The old test was `> NEW13_SESS_TLSID` — "three or more fields" — so on
+    /// the 8-field engine session slot 2, the `isValid` FLAG, was looked up in
+    /// the socket registry. `servlet::s2_next_free_id` starts its counter at
+    /// `1`, so a valid engine session asked the registry for the chain of the
+    /// FIRST socket the process ever opened.
+    #[test]
+    fn slot_two_is_only_a_stream_id_on_the_widths_where_it_is_one() {
+        use crate::test_utils::MockNativeContext;
+        let mut ctx = MockNativeContext::new();
+
+        // Width 4 — the NEW-13 shape and `SSLServerSocket.accept`'s shape.
+        // Slot 2 IS a stream id here, and this is the ONLY width that ships.
+        let four = ctx.alloc_object(cratonvm_types::ClassId::new(0), 4);
+        ctx.set_field(four, 2, Value::Int(7));
+        assert_eq!(super::session_stream_id(&ctx, four), Some(7));
+
+        // ... and `-1`, every minter's "never connected" sentinel, is not one.
+        ctx.set_field(four, 2, Value::Int(-1));
+        assert_eq!(super::session_stream_id(&ctx, four), None);
+
+        // Width 8 — the engine session. Slot 2 is the `isValid` flag. Both of
+        // its values are plausible registry keys, and BOTH must be refused.
+        for flag in [0, 1] {
+            let eight = ctx.alloc_object(cratonvm_types::ClassId::new(0), 8);
+            ctx.set_field(eight, 2, Value::Int(flag));
+            assert_eq!(
+                super::session_stream_id(&ctx, eight),
+                None,
+                "slot 2 of the 8-field engine shape is the isValid flag, not a \
+                 stream id; reading it as one looks up socket id {flag} and \
+                 `s2_next_free_id` hands out id 1 first"
+            );
+        }
+
+        // Width 6 — `tls.rs`'s shape, where slot 2 is `tls.rs::SES_VALID`.
+        let six = ctx.alloc_object(cratonvm_types::ClassId::new(0), 6);
+        ctx.set_field(six, 2, Value::Int(1));
+        assert_eq!(super::session_stream_id(&ctx, six), None);
+    }
+
+    /// `invalidate()` moves `isValid()` — the whole point of registering it —
+    /// and moves NOTHING else. MEASURED, HotSpot 25.0.3+9-LTS, on a session
+    /// that genuinely negotiated (`scratchpad/f18/F18SessionContract.java`,
+    /// three runs byte-identical): after `invalidate()` the id keeps its 32
+    /// bytes *and its exact contents*, and the cipher and protocol survive.
+    ///
+    /// The id half is the assertion that matters, because it is the one a
+    /// plausible "simplification" breaks: gating `getId` on `isValid` instead
+    /// of on `session_has_negotiated` would make `invalidate()` erase the id,
+    /// trading a new divergence for the fixed one.
+    #[test]
+    fn invalidate_moves_is_valid_and_nothing_else() {
+        use crate::test_utils::MockNativeContext;
+        let r = session_registry();
+        let mut ctx = MockNativeContext::new();
+
+        // A width-4 session that DID negotiate: slot 2 is a real stream id.
+        let sess = ctx.alloc_object(cratonvm_types::ClassId::new(0), 4);
+        ctx.set_field(sess, 2, Value::Int(11));
+        ctx.set_field(sess, 3, Value::Object(None));
+        let this = &[Value::Object(Some(sess))];
+
+        let is_valid = r
+            .find("javax/net/ssl/SSLSession", "isValid", "()Z")
+            .expect("isValid registered");
+        let get_id = r
+            .find("javax/net/ssl/SSLSession", "getId", "()[B")
+            .expect("getId registered");
+        let invalidate = r
+            .find("javax/net/ssl/SSLSession", "invalidate", "()V")
+            .expect("invalidate registered");
+
+        assert_eq!(
+            is_valid(&mut ctx, this).unwrap(),
+            Some(Value::Int(1)),
+            "a session carrying stream id 11 negotiated, and nothing has \
+             invalidated it yet"
+        );
+        let id_before = match get_id(&mut ctx, this) {
+            Ok(Some(Value::Object(Some(a)))) => (0..ctx.array_length(a))
+                .map(|i| ctx.get_array_element(a, i))
+                .collect::<Vec<_>>(),
+            other => panic!("getId must return an array, got {other:?}"),
+        };
+        assert_eq!(id_before.len(), 32, "a negotiated session has a 32-byte id");
+
+        invalidate(&mut ctx, this).expect("invalidate must not fail");
+
+        assert_eq!(
+            is_valid(&mut ctx, this).unwrap(),
+            Some(Value::Int(0)),
+            "invalidate() must move isValid() to false — at THIS width. Before \
+             F18 the only `invalidate` in the crate was `tls.rs`'s, gated \
+             `> SES_CREATION_TIME`, so it no-opped here and the session stayed \
+             valid after being invalidated"
+        );
+        let id_after = match get_id(&mut ctx, this) {
+            Ok(Some(Value::Object(Some(a)))) => (0..ctx.array_length(a))
+                .map(|i| ctx.get_array_element(a, i))
+                .collect::<Vec<_>>(),
+            other => panic!("getId must return an array, got {other:?}"),
+        };
+        assert_eq!(
+            id_before, id_after,
+            "MEASURED on HotSpot: invalidate() leaves the session id byte-for-byte \
+             intact. `getId` is gated on `session_has_negotiated` ALONE and must \
+             not be 'simplified' onto `session_is_valid`"
+        );
+
+        // Idempotent, as measured.
+        invalidate(&mut ctx, this).expect("second invalidate must not fail");
+        assert_eq!(is_valid(&mut ctx, this).unwrap(), Some(Value::Int(0)));
+    }
+
+    /// MUTATION CHECK for the test above, in both directions the invalidated
+    /// bit could be wrong.
+    ///
+    /// Without this, `session_is_valid` could answer `false` for everything —
+    /// or `session_mark_invalidated` could mark every session in the process —
+    /// and `invalidate_moves_is_valid_and_nothing_else` would still pass,
+    /// because it only ever looks at one object.
+    #[test]
+    fn invalidating_one_session_does_not_invalidate_another() {
+        use crate::test_utils::MockNativeContext;
+        let r = session_registry();
+        let mut ctx = MockNativeContext::new();
+
+        let a = ctx.alloc_object(cratonvm_types::ClassId::new(0), 4);
+        ctx.set_field(a, 2, Value::Int(21));
+        let b = ctx.alloc_object(cratonvm_types::ClassId::new(0), 4);
+        ctx.set_field(b, 2, Value::Int(22));
+
+        let is_valid = r
+            .find("javax/net/ssl/SSLSession", "isValid", "()Z")
+            .expect("isValid registered");
+        let invalidate = r
+            .find("javax/net/ssl/SSLSession", "invalidate", "()V")
+            .expect("invalidate registered");
+
+        invalidate(&mut ctx, &[Value::Object(Some(a))]).expect("invalidate");
+        assert_eq!(
+            is_valid(&mut ctx, &[Value::Object(Some(a))]).unwrap(),
+            Some(Value::Int(0))
+        );
+        assert_eq!(
+            is_valid(&mut ctx, &[Value::Object(Some(b))]).unwrap(),
+            Some(Value::Int(1)),
+            "the invalidated bit is per SESSION. HotSpot: invalidating one \
+             connection's session leaves a second, untouched connection's \
+             session valid (MEASURED, F18SessionContract ARM D)"
+        );
+    }
+
+    /// The null session is where `invalidate()` must do NOTHING, and this
+    /// pins that the newly-registered door did not become a way to *change*
+    /// it. MEASURED on HotSpot: on an unconnected `SSLSocket`'s session and a
+    /// pre-handshake `SSLEngine`'s alike, every accessor reads identically
+    /// before and after `invalidate()`.
+    ///
+    /// This is also the cheapest regression test for the whole F18 change
+    /// against the failure mode F10-1 §7 names: if any edit here loosened
+    /// `session_has_negotiated`, the null session would report `isValid()` and
+    /// a 32-byte id again — the fabrication E12/E22/E31/E42 removed.
+    #[test]
+    fn invalidate_changes_nothing_on_a_session_that_negotiated_nothing() {
+        use crate::test_utils::MockNativeContext;
+        let r = session_registry();
+        let mut ctx = MockNativeContext::new();
+
+        let sess = ctx.alloc_object(cratonvm_types::ClassId::new(0), 4);
+        ctx.set_field(sess, 2, Value::Int(-1));
+        ctx.set_field(sess, 3, Value::Object(None));
+        let this = &[Value::Object(Some(sess))];
+
+        let is_valid = r
+            .find("javax/net/ssl/SSLSession", "isValid", "()Z")
+            .expect("isValid registered");
+        let get_id = r
+            .find("javax/net/ssl/SSLSession", "getId", "()[B")
+            .expect("getId registered");
+        let invalidate = r
+            .find("javax/net/ssl/SSLSession", "invalidate", "()V")
+            .expect("invalidate registered");
+
+        assert_eq!(is_valid(&mut ctx, this).unwrap(), Some(Value::Int(0)));
+        let len_before = match get_id(&mut ctx, this) {
+            Ok(Some(Value::Object(Some(arr)))) => ctx.array_length(arr),
+            other => panic!("getId must return an array, got {other:?}"),
+        };
+        assert_eq!(len_before, 0);
+
+        invalidate(&mut ctx, this).expect("invalidate must not fail");
+
+        assert_eq!(
+            is_valid(&mut ctx, this).unwrap(),
+            Some(Value::Int(0)),
+            "still false — there was nothing to invalidate"
+        );
+        let len_after = match get_id(&mut ctx, this) {
+            Ok(Some(Value::Object(Some(arr)))) => ctx.array_length(arr),
+            other => panic!("getId must return an array, got {other:?}"),
+        };
+        assert_eq!(
+            len_after, 0,
+            "and still byte[0]. An invalidate() that gave the null session an \
+             id would be the E42-era slot-2 corruption with a new writer"
+        );
+    }
+
+    /// `getSessionContext()` answers `null`, and `null` is a value the
+    /// interface's own contract permits ("This context may be unavailable in
+    /// some environments, in which case this method returns null" —
+    /// jdk25src/java.base/javax/net/ssl/SSLSession.java:77-84). This VM has no
+    /// session cache, so "unavailable" is true of it.
+    ///
+    /// Pinned because the tempting "fix" is a fabricated context object, which
+    /// would answer every subsequent question on it wrongly — the shape
+    /// `--jdk-only` exists to refuse.
+    #[test]
+    fn get_session_context_answers_null_rather_than_fabricating_one() {
+        use crate::test_utils::MockNativeContext;
+        let r = session_registry();
+        let mut ctx = MockNativeContext::new();
+        let get_ctx = r
+            .find(
+                "javax/net/ssl/SSLSession",
+                "getSessionContext",
+                "()Ljavax/net/ssl/SSLSessionContext;",
+            )
+            .expect("getSessionContext registered");
+        // Both a negotiated and a never-negotiated shape: HotSpot's answer
+        // differs between them (SSLSessionContextImpl vs null) and this VM's
+        // does not, which is the under-report the registration's comment
+        // records rather than hides.
+        for tls_id in [-1, 5] {
+            let sess = ctx.alloc_object(cratonvm_types::ClassId::new(0), 4);
+            ctx.set_field(sess, 2, Value::Int(tls_id));
+            assert_eq!(
+                get_ctx(&mut ctx, &[Value::Object(Some(sess))]).unwrap(),
+                Some(Value::Object(None))
+            );
+        }
+    }
+
+    /// `getPeerHost`/`getPeerPort` must not read slot 3 and 4 on a shape where
+    /// they are not the host and port.
+    ///
+    /// This is the E31-1 §2 defect, which was live in `tls.rs`'s copies: on the
+    /// width-4 shape slot 3 is the ATTRIBUTE MAP, so a width-blind
+    /// `getPeerHost` returns a `java.util.HashMap` through a
+    /// `()Ljava/lang/String;` descriptor as soon as anything has called
+    /// `putValue` — and Jetty's `SecureRequestCustomizer.retrieveSni()` does,
+    /// on every SSL request. The new registrations use `session_cipher_slot`'s
+    /// `>= 6` boundary so this file has one width line and not two.
+    ///
+    /// HotSpot's measured answers for a session that negotiated nothing are
+    /// `null` and `-1`, which is what the width-4 shape with no registry entry
+    /// falls through to here.
+    #[test]
+    fn peer_host_and_port_do_not_read_the_attribute_slot() {
+        use crate::test_utils::MockNativeContext;
+        let r = session_registry();
+        let mut ctx = MockNativeContext::new();
+
+        // Width 4 with a populated attribute slot — the Jetty state.
+        let sess = ctx.alloc_object(cratonvm_types::ClassId::new(0), 4);
+        ctx.set_field(sess, 2, Value::Int(-1));
+        let map = ctx.alloc_object(cratonvm_types::ClassId::new(0), 1);
+        ctx.set_field(sess, 3, Value::Object(Some(map)));
+        let this = &[Value::Object(Some(sess))];
+
+        let host = r
+            .find(
+                "javax/net/ssl/SSLSession",
+                "getPeerHost",
+                "()Ljava/lang/String;",
+            )
+            .expect("getPeerHost registered");
+        let port = r
+            .find("javax/net/ssl/SSLSession", "getPeerPort", "()I")
+            .expect("getPeerPort registered");
+
+        assert_eq!(
+            host(&mut ctx, this).unwrap(),
+            Some(Value::Object(None)),
+            "slot 3 is the ATTRIBUTE MAP at width 4, not the peer host. \
+             Returning it would hand a java.util.HashMap back through a \
+             ()Ljava/lang/String; descriptor"
+        );
+        assert_eq!(
+            port(&mut ctx, this).unwrap(),
+            Some(Value::Int(-1)),
+            "HotSpot's measured answer for a session that negotiated nothing"
+        );
+    }
+
+    /// MUTATION CHECK for the test above: without it, both accessors could
+    /// return the sentinel for EVERY shape and still pass. The 6-/8-field
+    /// shapes DO carry a peer host at slot 3 and a port at slot 4, and must
+    /// report them.
+    #[test]
+    fn peer_host_and_port_are_read_on_the_shapes_that_carry_them() {
+        use crate::test_utils::MockNativeContext;
+        let r = session_registry();
+        let mut ctx = MockNativeContext::new();
+
+        let host = r
+            .find(
+                "javax/net/ssl/SSLSession",
+                "getPeerHost",
+                "()Ljava/lang/String;",
+            )
+            .expect("getPeerHost registered");
+        let port = r
+            .find("javax/net/ssl/SSLSession", "getPeerPort", "()I")
+            .expect("getPeerPort registered");
+
+        for width in [6, 8] {
+            let sess = ctx.alloc_object(cratonvm_types::ClassId::new(0), width);
+            let h = ctx.create_string("example.test");
+            ctx.set_field(sess, 3, Value::Object(Some(h)));
+            ctx.set_field(sess, 4, Value::Int(8443));
+            let this = &[Value::Object(Some(sess))];
+            assert_eq!(
+                host(&mut ctx, this).unwrap(),
+                Some(Value::Object(Some(h))),
+                "slot 3 IS the peer host at width {width}"
+            );
+            assert_eq!(port(&mut ctx, this).unwrap(), Some(Value::Int(8443)));
+        }
+    }
+
+    /// `tls.rs::init_ssl_session_fields` seeds the peer-host slot with
+    /// `Int(0)`, not a String reference. A `getPeerHost` that returned the raw
+    /// slot would hand an `Int` back through a `()Ljava/lang/String;`
+    /// descriptor — the same descriptor violation as the attribute-map case,
+    /// from the opposite direction.
+    ///
+    /// The port half is the same defect with a quieter symptom: `http2.rs`'s
+    /// 6-field session writes NO slot, so slot 4 is the allocator's zero fill,
+    /// and `0` returned through `()I` is a *plausible* value HotSpot never
+    /// produces — the shape this directory keeps recording as worse than a
+    /// loud one.
+    #[test]
+    fn an_unwritten_peer_host_slot_is_null_and_an_unwritten_port_is_minus_one() {
+        use crate::test_utils::MockNativeContext;
+        let r = session_registry();
+        let mut ctx = MockNativeContext::new();
+        let sess = ctx.alloc_object(cratonvm_types::ClassId::new(0), 6);
+        ctx.set_field(sess, 3, Value::Int(0));
+        ctx.set_field(sess, 4, Value::Int(0));
+        let this = &[Value::Object(Some(sess))];
+        let host = r
+            .find(
+                "javax/net/ssl/SSLSession",
+                "getPeerHost",
+                "()Ljava/lang/String;",
+            )
+            .expect("getPeerHost registered");
+        let port = r
+            .find("javax/net/ssl/SSLSession", "getPeerPort", "()I")
+            .expect("getPeerPort registered");
+        assert_eq!(host(&mut ctx, this).unwrap(), Some(Value::Object(None)));
+        assert_eq!(
+            port(&mut ctx, this).unwrap(),
+            Some(Value::Int(-1)),
+            "HotSpot's measured answer when there is no peer. A connected peer \
+             never reports port 0, so mapping the zero fill to -1 cannot mask \
+             a real port"
+        );
+    }
+
+    /// The two peer-identity doors must see ONE chain.
+    ///
+    /// `t27_tls::getPeerCertificates` and `ssl_security::getPeerPrincipal` are
+    /// registered by different registrars and used to read different sources —
+    /// the object-keyed table and the socket registry. HotSpot's contract makes
+    /// disagreement impossible by construction: MEASURED, the principal IS the
+    /// leaf certificate's subject
+    /// (`getPeerPrincipal().equals(peerCerts[0].getSubjectX500Principal())`).
+    ///
+    /// This pins the half a unit test can reach without a TLS peer: that the
+    /// chain an HTTPS client session was given via `record_client_peer_chain`
+    /// is visible through `peer_certs_for_session`, which is now the only
+    /// function either door consults. The width-4 HTTPS session carries
+    /// `HTTPS_CLIENT_SESSION_MARKER` in slot 2 and has NO socket-registry
+    /// entry, so before F18 the principal door found nothing here.
+    #[test]
+    fn the_object_keyed_chain_is_visible_to_the_one_resolver() {
+        use crate::test_utils::MockNativeContext;
+        let mut ctx = MockNativeContext::new();
+        let sess = ctx.alloc_object(cratonvm_types::ClassId::new(0), 4);
+        ctx.set_field(
+            sess,
+            2,
+            Value::Int(crate::net_phase_e::HTTPS_CLIENT_SESSION_MARKER),
+        );
+        assert!(
+            super::peer_certs_for_session(&ctx, sess).is_empty(),
+            "nothing recorded yet"
+        );
+        super::record_client_peer_chain(&ctx, sess, vec![vec![0x30, 0x82, 0x01]]);
+        assert_eq!(
+            super::peer_certs_for_session(&ctx, sess),
+            vec![vec![0x30u8, 0x82, 0x01]],
+            "the HTTPS client session's chain lives in the OBJECT-keyed table; \
+             its slot 2 marker deliberately misses the socket registry, so a \
+             resolver that consulted only the registry — which is what \
+             getPeerPrincipal did — throws SSLPeerUnverifiedException on a \
+             completed handshake. F10-1 NOMINATION 2"
+        );
+    }
+
+    /// MUTATION CHECK for the test above: without it, `peer_certs_for_session`
+    /// could return a non-empty chain for anything and still pass. A session
+    /// nobody recorded a chain for must resolve to empty, because that is what
+    /// makes `getPeerCertificates`/`getPeerPrincipal` throw
+    /// `SSLPeerUnverifiedException` — the refusal `RSslNullSession` asserts.
+    #[test]
+    fn a_session_with_no_recorded_chain_resolves_to_empty() {
+        use crate::test_utils::MockNativeContext;
+        let mut ctx = MockNativeContext::new();
+        let sess = ctx.alloc_object(cratonvm_types::ClassId::new(0), 4);
+        ctx.set_field(sess, 2, Value::Int(-1));
+        assert!(super::peer_certs_for_session(&ctx, sess).is_empty());
+    }
+
+    /// MUTATION CHECK for `a_widened_null_session_put_value_does_not_touch_the_stream_id`.
+    /// Without it, `putValue` could no-op
     /// for EVERY shape and the collision test would still pass — the classic
     /// "measured the refusal, called it coverage" shape. The 8-field engine
     /// session has a dedicated attribute slot and must still round-trip.
@@ -12143,9 +12779,12 @@ pub fn register_sslengine_real(r: &mut NativeMethodRegistry) {
 }
 
 /// Register `javax/net/ssl/SSLSession` accessor natives for the REAL-mode
-/// session objects the VM hands out — the 7-field session from
-/// `SSLEngineImpl.getSession()` (see ~line 3263) and the 3-field session from
-/// `SSLServerSocket.accept()` (see ~line 1014). Both objects carry the bare
+/// session objects the VM hands out — the 8-field session from
+/// `SSLEngineImpl.getSession()` (see ~line 3263) and the 4-field session from
+/// `SSLServerSocket.accept()` (see ~line 1014). E42: these two numbers were
+/// "7" and "3", the identical off-by-one `session_cipher_slot`'s comment
+/// records having carried; the widths are and always were 8 and 4. Both
+/// objects carry the bare
 /// interface `javax/net/ssl/SSLSession` as their runtime class, so a virtual
 /// call resolves to the abstract interface declaration (no Code) and the
 /// interpreter's no-Code rescue then looks for a native registered on that
@@ -12214,6 +12853,221 @@ pub(crate) fn record_client_peer_chain(
         .insert(gc_stable_objref_key(ctx, session), chain_der);
 }
 
+/// The TLS STREAM ID recorded in a session's slot 2, for the widths on which
+/// slot 2 *is* a stream id — and `None` on every other width.
+///
+/// F18. This exists because two accessors were reading slot 2 as a `servlet`
+/// registry key on any shape with three or more fields, and slot 2 does not
+/// mean the same thing at every width. The table is
+/// [`session_has_negotiated`]'s, restated as the question these callers
+/// actually ask:
+///
+/// | width | minted by | slot 2 | is it a stream id? |
+/// |---|---|---|---|
+/// | 3 | (retired — E42) | stream id | n/a, nothing mints it |
+/// | 4 | `ssl_security`'s NEW-13 shape; `SSLServerSocket.accept` | stream id (or `-1`, or `HTTPS_CLIENT_SESSION_MARKER`) | **yes** |
+/// | 6 | `tls.rs::init_ssl_session_fields`; `http2.rs` | `tls.rs::SES_VALID` | **no** |
+/// | 8 | `build_synthetic_ssl_session` | the `isValid` flag | **no** |
+///
+/// **The bug this closes, which is a cross-connection one.**
+/// `ssl_security::getPeerPrincipal` gated on `> NEW13_SESS_TLSID`, i.e. width
+/// >= 3, so on an 8-field engine session it read the *`isValid` flag* — `0` or
+/// `1` — and looked that up in `servlet::s2_tls_peer_cert_chain_der`. Ids `0`
+/// and `1` are not unreachable: `s2_next_free_id` starts its counter at `1`
+/// (`servlet.rs`), so id `1` is the FIRST id the socket registry hands out.
+/// An engine session that happened to be valid could therefore be handed the
+/// peer certificate chain of an unrelated socket. E31-1 NOMINATION 4, which
+/// re-raised E22-1 NOMINATION B.
+///
+/// Ids below zero are rejected here rather than at the call sites: `-1` is the
+/// "never connected" sentinel every minter writes, and a negative registry key
+/// is meaningless in every table that consumes one.
+pub(crate) fn session_stream_id(ctx: &dyn NativeContext, session: ObjectRef) -> Option<i32> {
+    match ctx.object_num_fields(session) {
+        3 | 4 => match ctx.get_field(session, 2) {
+            Value::Int(id) if id >= 0 => Some(id),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// **The one resolver for "what certificate chain did this session's peer
+/// present".** Every door that answers a question about the peer's identity
+/// must come through here.
+///
+/// F18. `SSLSession.getPeerCertificates` (this file) and
+/// `SSLSession.getPeerPrincipal` (`phases_late::ssl_security`) are registered
+/// by different registrars and, until now, read *different sources* for the
+/// same fact:
+///
+/// * `getPeerCertificates` read [`session_peer_certs_table`], keyed on the
+///   session OBJECT;
+/// * `getPeerPrincipal` read `servlet::s2_tls_peer_cert_chain_der(slot2)`,
+///   keyed on the TLS STREAM ID.
+///
+/// MEASURED on HotSpot 25.0.3+9-LTS (this host,
+/// `scratchpad/f18/F18SessionContract.java`, loopback `HttpsServer` +
+/// `HttpsURLConnection`, three runs byte-identical): on a completed handshake
+/// the two agree, and `getPeerPrincipal()` is exactly the leaf certificate's
+/// subject —
+/// `getPeerPrincipal().equals(peerCerts[0].getSubjectX500Principal())` is
+/// `true`. On CratonVM they disagreed: an HTTPS client session is registered
+/// in the object table by `record_client_peer_chain` and has NO entry in the
+/// socket registry, so `getPeerCertificates()` returned the chain while
+/// `getPeerPrincipal()` on the SAME OBJECT, in the same call sequence, threw
+/// `SSLPeerUnverifiedException`. F10-1 NOMINATION 2.
+///
+/// **Order is load-bearing, and it shrinks a collision surface rather than
+/// widening one.** The object table is consulted FIRST. That table is the one
+/// populated for HTTPS client sessions, whose slot 2 carries
+/// `net_phase_e::HTTPS_CLIENT_SESSION_MARKER` — a value chosen to MISS the
+/// socket registry. Trying the object table first means the common HTTPS case
+/// never reaches the id lookup at all, so the marker's miss is now a
+/// second-line guarantee instead of the only one. It still has to hold, and it
+/// does: the marker is `0x0800_0000`, strictly below
+/// `servlet::PENDING_CONNECT_SOCK_ID_BASE` (`0x1000_0000`),
+/// `PENDING_LAYERED_SOCK_ID_BASE` (`0x2000_0000`) and `RUSTLS_SOCK_ID_BASE`
+/// (`0x4000_0000`), and far above the monotonic `s2_next_free_id` counter that
+/// starts at `1` — re-verified against `servlet.rs` for F18, not taken on
+/// trust. Being below `RUSTLS_SOCK_ID_BASE` also keeps it off
+/// `s2_tls_peer_cert_chain_der`'s rustls redirect.
+///
+/// **Not implemented by calling `getPeerCertificates` through the interpreter.**
+/// That was F10-1 NOMINATION 2's suggested shape and it is the more expensive
+/// one: it would build `X509CertImpl` mirrors only for `getPeerPrincipal` to
+/// pull a subject string back out of them. Sharing the DER resolver gives the
+/// same single-source-of-truth property — the two doors cannot see different
+/// chains, because there is only one function that decides — without the round
+/// trip.
+pub(crate) fn peer_certs_for_session(ctx: &dyn NativeContext, session: ObjectRef) -> Vec<Vec<u8>> {
+    if let Some(chain) = session_peer_certs_table()
+        .lock()
+        .get(&gc_stable_objref_key(ctx, session))
+        .cloned()
+    {
+        if !chain.is_empty() {
+            return chain;
+        }
+    }
+    if let Some(id) = session_stream_id(ctx, session) {
+        if let Some(chain) = servlet::s2_tls_peer_cert_chain_der(id) {
+            return chain;
+        }
+    }
+    Vec::new()
+}
+
+/// The set of `javax/net/ssl/SSLSession` objects on which `invalidate()` has
+/// been called, keyed the same GC-stable way as
+/// [`session_peer_certs_table`] and `session_local_certs_table`.
+///
+/// F18 — **why a side table and not a field.** `SSLSession.invalidate()` had
+/// no real-JDK-mode registration at all (`grep` over the whole crate returned
+/// exactly one, in `tls.rs`, whose registrar is `#[cfg(feature =
+/// "synthetic-jdk")]`), so in the mode `--jdk-only` runs the interface
+/// declaration with no Code attribute was what ran: an `AbstractMethodError`.
+/// F10-1 NOMINATION 3 split the fix in two and called the second half blocked,
+/// because recording an `invalidated` bit "needs a slot this shape does not
+/// have" and both F6-1 §4 and E42-1 §2 reject widening the shape again.
+///
+/// That premise is true and the conclusion does not follow: this file already
+/// carries two per-session facts that no slot holds, in exactly this form. The
+/// bit does not need to live in the object.
+///
+/// **Why widening would have been the worse fix, stated rather than implied.**
+/// The width of a session shape is what every reader in this file uses to
+/// decide what its slots MEAN (`session_cipher_slot`, `session_proto_slot`,
+/// `sslsess_attrs_slot`, [`session_stream_id`], `session_has_negotiated`).
+/// Widening the NEW-13 shape from 4 to 5 would move it across the `n >= 6`
+/// boundary's near side and re-open the co-requisite E42-1 records as BLOCKING.
+/// A side table changes no width and therefore no reader.
+///
+/// **This table is inert until an application calls `invalidate()`.** It is
+/// empty in every process that never does, so [`session_is_valid`] answers
+/// exactly what `session_has_negotiated` alone answered before F18 — which is
+/// the property that makes this change safe to land without a TLS fixture.
+///
+/// **Growth is bounded by `invalidate()` calls, not by session mints.** F10-1
+/// §8.5 records that `session_peer_certs_table` grows once per minted session
+/// and is never pruned, which on the HTTPS path is once per accessor call.
+/// This table is only written by the one door, so it does not inherit that
+/// rate. It does inherit the 32-bit key width: `gc_stable_objref_key` is
+/// `identity_hash_code(o) as u32`, so a birthday collision here would report a
+/// *live* session as invalidated. That is the same exposure the two cert
+/// tables already carry and it is not made worse by a table that is empty in
+/// the common case; the key width is a separate fix for all three.
+fn session_invalidated_table() -> &'static Mutex<std::collections::HashSet<u64>> {
+    static T: OnceLock<Mutex<std::collections::HashSet<u64>>> = OnceLock::new();
+    T.get_or_init(|| Mutex::new(std::collections::HashSet::new()))
+}
+
+/// Record that `invalidate()` was called on this session. Crate-visible so
+/// `tls.rs`'s `--synthetic-jdk` copy writes the same state this file's
+/// real-mode copy reads — one bit, one owner, both modes.
+///
+/// **Deliberately a no-op for a session that negotiated nothing**, and that is
+/// HotSpot's behaviour rather than an optimisation. MEASURED, HotSpot
+/// 25.0.3+9-LTS (`scratchpad/f18/F18SessionContract.java`, three runs
+/// byte-identical), on the unconnected `SSLSocket`'s session and on the
+/// pre-handshake `SSLEngine`'s alike: every accessor reads identically before
+/// and after `invalidate()`, because `isValid()` was already `false` and there
+/// was nothing else to invalidate. Since [`session_is_valid`] is
+/// `negotiated && !invalidated`, recording the bit for a never-negotiated
+/// session could not change an answer either — so the gate costs no fidelity
+/// and keeps the table from growing on the one door that mints sessions
+/// nobody handshaked.
+pub(crate) fn session_mark_invalidated(ctx: &dyn NativeContext, session: ObjectRef) {
+    if !session_has_negotiated(ctx, session) {
+        return;
+    }
+    session_invalidated_table()
+        .lock()
+        .insert(gc_stable_objref_key(ctx, session));
+}
+
+/// **The one predicate behind `SSLSession.isValid()`, in both modes.**
+///
+/// F18. HotSpot's `isValid()` is `SSLSessionImpl.isRejoinable()`, which is
+/// `sessionId.length() != 0 && !invalidated && ...`
+/// (`sun/security/ssl/SSLSessionImpl.java:788`) — TWO pieces of state. Before
+/// F18 this VM modelled only the first, because nothing in the shipping mode
+/// could write the second.
+///
+/// MEASURED, HotSpot 25.0.3+9-LTS, on a session that GENUINELY negotiated (a
+/// completed loopback `HttpsURLConnection` handshake — the population F10 made
+/// reachable, and the first time this contract has been measured on one rather
+/// than on a null session), `scratchpad/f18/F18SessionContract.java`, three
+/// runs byte-identical:
+///
+/// ```text
+///   before invalidate()  isValid=true   id=byte[32]  cipher=TLS_AES_256_GCM_SHA384
+///                        protocol=TLSv1.3  peerPrincipal=CN=localhost,...
+///                        peerCerts=1  sessionContext=SSLSessionContextImpl
+///   after  invalidate()  isValid=FALSE  id=byte[32]  cipher=TLS_AES_256_GCM_SHA384
+///                        protocol=TLSv1.3  peerPrincipal=CN=localhost,...
+///                        peerCerts=1  sessionContext=NULL
+///   invalidate() twice   isValid=false            (idempotent)
+///   a second, untouched connection's session      isValid=true, unaffected
+/// ```
+///
+/// So `invalidate()` moves `isValid()` — and, a detail F10 did not report and
+/// this lane measured, `getSessionContext()`, which drops to `null`. It moves
+/// NOTHING else: the id keeps its 32 bytes and its exact contents, and the
+/// cipher, protocol, peer principal and peer chain all survive. That is why
+/// `getId()` is deliberately gated on `session_has_negotiated` ALONE and not
+/// on this function — tying the id to validity would make `invalidate()` erase
+/// the id, a new divergence traded for an old one. `getSessionContext()`'s
+/// half of the contract is free here: this VM answers `null` in every state
+/// (see its registration), so it is already on the right side of the
+/// invalidated case and merely under-reports the live one.
+pub(crate) fn session_is_valid(ctx: &dyn NativeContext, session: ObjectRef) -> bool {
+    session_has_negotiated(ctx, session)
+        && !session_invalidated_table()
+            .lock()
+            .contains(&gc_stable_objref_key(ctx, session))
+}
+
 /// Did the `javax/net/ssl/SSLSession` object `this` actually negotiate
 /// anything?
 ///
@@ -12231,24 +13085,31 @@ pub(crate) fn record_client_peer_chain(
 ///
 /// Keeping the two in one function is deliberate. E3-1's recorded lesson in
 /// this same family is that a rule spread over N call sites drifts, and this
-/// rule now has to hold across FIVE different widths of synthetic
+/// rule now has to hold across THREE different widths of synthetic
 /// `SSLSession` — the "nothing negotiated" signal lives in a different place
 /// in each, so the field count is the discriminator (the same convention
 /// `getProtocol`/`getCipherSuite` already use):
 ///
 /// | width | minted by | slot 2 holds | negotiated when |
 /// |---|---|---|---|
-/// | 2 | `phases_late::ssl_security`'s `SSLEngine.getSession` fallback | — | **never** — that shape exists only to carry the sentinel pair |
-/// | 3 | `ssl_security::new13_alloc_null_ssl_session` and `new13_alloc_ssl_session` | `NEW13_SESS_TLSID` | a stream id was recorded (`>= 0`); the NULL session carries `-1` |
-/// | 4 | `SSLServerSocket.accept` in this file | the stream id, always `>= 0` | always — the shape is only minted after a handshake |
-/// | 6 | `http2.rs`'s `HttpResponse.sslSession()`; `tls.rs` | — | always (same reason) |
+/// | 4 | `ssl_security::new13_alloc_{,null_}ssl_session`; `SSLServerSocket.accept` in this file | `NEW13_SESS_TLSID` — the stream id | a stream id was recorded (`>= 0`); the NULL session carries `-1` |
+/// | 6 | `http2.rs`'s `HttpResponse.sslSession()`; `tls.rs` | — | always — the shape is only minted after a handshake |
 /// | 8 | `build_synthetic_ssl_session` in this file | the `isValid` flag | the flag is set |
 ///
-/// The 3-field row is the one the nomination that prompted this did not
-/// cover, and it is the row that decides an unconnected `SSLSocket`: a
+/// E42 — **widths 2 and 3 were RETIRED, and the 4-row is the merge of what
+/// used to be two rows.** `ssl_security`'s NEW-13 shape widened from 3 to 4 so
+/// that `putValue` has a slot of its own (see `NEW13_SSL_SESS_FIELDS` and
+/// `sslsess_attrs_slot`), and its 2-field `SSLEngine.getSession` fallback now
+/// calls `new13_alloc_null_ssl_session` like everything else. Width 4 is
+/// byte-identical to the accept shape — proto, cipher, streamId, attrs — so
+/// this is ONE row and not a coincidence of two.
+///
+/// The width-4 row is the one that decides an unconnected `SSLSocket`: a
 /// field-count test alone would treat every narrow shape as negotiated and
 /// leave the null session answering `isValid() = true` / a 32-byte id, which
-/// is the exact defect in the mode this file is live in.
+/// is the exact defect in the mode this file is live in. The `0..=3` arms are
+/// kept as defensive lower bounds — nothing mints those widths any more, and
+/// nothing may be allowed to answer "negotiated" if something starts.
 ///
 /// E31: `pub(crate)` since 2026-08-13. `tls.rs` had grown its OWN width-blind
 /// copies of this question (`isValid` on `javax/net/ssl/SSLSession` and again
@@ -12260,17 +13121,40 @@ pub(crate) fn session_has_negotiated(ctx: &dyn NativeContext, this: ObjectRef) -
     match ctx.object_num_fields(this) {
         // No slot at all, and never minted for a negotiated session.
         0..=2 => false,
-        3 => match ctx.get_field(this, 2) {
+        // E42: 3 and 4 are ONE arm. `ssl_security`'s NEW-13 shape widened from
+        // 3 to 4 so that `putValue` has a slot of its own instead of writing a
+        // HashMap over the stream id (see `NEW13_SSL_SESS_FIELDS`), and width 4
+        // is byte-identical to `SSLServerSocket.accept`'s shape below: proto,
+        // cipher, streamId, attrs.
+        //
+        // Merging them is a no-op for the accept shape and the fix for the
+        // widened one. accept writes `RUSTLS_SOCK_ID_BASE + stream_id` into
+        // slot 2, which is always `>= 0`, so `_ => true`'s answer for it is
+        // unchanged — and that arm's premise ("4- and 6-field shapes are only
+        // minted after a handshake") is now FALSE for width 4, which is
+        // precisely why it cannot stay. `ssl_security`'s null session carries
+        // `Int(-1)`.
+        //
+        // Pinned from the other side by
+        // `phases_late::ssl_security::new13_tests
+        // ::the_widened_null_session_is_still_not_negotiated`, which calls this
+        // function directly: if this arm regresses, that test fails rather than
+        // `RSslNullSession` silently reporting a valid null session again. The
+        // in-file pair `the_null_socket_session_has_no_id_and_is_not_valid` /
+        // `a_session_that_negotiated_keeps_its_id_and_its_validity` covers both
+        // directions at both widths without leaving this crate.
+        3 | 4 => match ctx.get_field(this, 2) {
             Value::Int(tls_id) => tls_id >= 0,
-            // Defensive: `putValue` stores its attribute HashMap in slot
-            // `num_fields - 1`, which on THIS shape is the stream id — see
-            // E22-1's NOMINATION on the attribute-slot collision. If that has
-            // happened the id is already gone; keep the pre-E12 answer rather
-            // than inventing a new one from a clobbered slot.
+            // Defensive: a non-`Int` here used to mean `putValue` had
+            // overwritten the stream id — the collision the widening removes.
+            // Kept because this predicate is also reached from `tls.rs` and
+            // from any future minter that has not been audited: an unreadable
+            // slot must not silently answer "never negotiated" for a session
+            // that did.
             _ => true,
         },
         n if n >= 7 => matches!(ctx.get_field(this, 2), Value::Int(v) if v != 0),
-        // 4- and 6-field shapes are only minted after a handshake.
+        // The 6-field shape is only minted after a handshake.
         _ => true,
     }
 }
@@ -12323,23 +13207,23 @@ pub(crate) fn session_proto_slot(num_fields: usize) -> Option<usize> {
 ///
 /// **E31 — this replaces a bare `num_fields - 1` at five call sites, and the
 /// bare form was a live slot collision.** `num_fields - 1` is the attribute
-/// slot on exactly two of the five widths this tree mints; on the other three
-/// it is a field that means something else, and `putValue` wrote a
-/// `java.util.HashMap` straight over it:
+/// slot on some widths and a field that means something else on others, and
+/// `putValue` wrote a `java.util.HashMap` straight over it:
 ///
 /// | width | `num_fields - 1` is | what a `putValue` destroyed |
 /// |---|---|---|
-/// | 2 | the cipher-suite `String` | `getCipherSuite()` answers the map |
-/// | 3 | `ssl_security::NEW13_SESS_TLSID` | see below — the worst one |
 /// | 4 | a dedicated attrs slot | nothing |
 /// | 6 | `tls.rs::SES_CREATION_TIME` | `getCreationTime()` returns an object reference through a `()J` descriptor |
 /// | 8 | a dedicated attrs slot | nothing |
 ///
-/// The 3-field row is why this is a priority rather than a tidy-up. Slot 2 on
-/// that shape is the stream id, and it is also the slot
+/// E42 — **the 2- and 3-field rows are gone, and they were the two worst.**
+/// The 2-field `SSLEngine.getSession` fallback now calls
+/// `ssl_security::new13_alloc_null_ssl_session`, and the 3-field NEW-13 shape
+/// widened to 4 *for this reason*: on it, `num_fields - 1` was
+/// `ssl_security::NEW13_SESS_TLSID`, which is also the slot
 /// [`session_has_negotiated`] reads to decide whether anything was negotiated.
 /// A single `putValue` on an unconnected socket's session therefore turned
-/// `Int(-1)` ("nothing negotiated") into `Object(Some(map))`, which takes that
+/// `Int(-1)` ("nothing negotiated") into `Object(Some(map))`, which took that
 /// function's defensive `_ => true` arm — so `isValid()` went back to `true`
 /// and `getId()` went back to 32 fabricated bytes. **A `putValue` resurrected
 /// the exact fabrication the E12/E22 lanes removed**, on the one shape whose
@@ -12347,21 +13231,34 @@ pub(crate) fn session_proto_slot(num_fields: usize) -> Option<usize> {
 /// what kept that from being a *new* wrong answer relative to the pre-E12
 /// code; it was never a reason the collision was safe.
 ///
+/// Note the two halves of the width-4 agreement, because either alone is a
+/// silent regression: `4 => Some(3)` is only correct while
+/// `ssl_security::NEW13_SESS_ATTRS == NEW13_SSL_SESS_FIELDS - 1` and
+/// `!= NEW13_SESS_TLSID`, and slot 2 is only a stream id while
+/// [`session_has_negotiated`]'s `3 | 4` arm reads it as one. Both are held by
+/// tests rather than by this comment — this file's
+/// `tests::a_widened_null_session_put_value_does_not_touch_the_stream_id`, and
+/// `phases_late::ssl_security::new13_tests
+/// ::the_attribute_slot_is_the_last_one_and_is_not_the_stream_id` for the
+/// constants' side of the agreement.
+///
 /// Jetty's `SecureRequestCustomizer.retrieveSni()` calls `getValue()` then
 /// `putValue()` on every SSL request, so the writer is not hypothetical — it
 /// is the caller the attribute API was registered for in the first place.
 ///
-/// Returning `None` (rather than widening the three shapes) is the change that
-/// cannot break anything else: `putValue`/`removeValue` become no-ops and
+/// Returning `None` (rather than widening the shapes) was the change that
+/// could not break anything else: `putValue`/`removeValue` become no-ops and
 /// `getValue`/`getValueNames` answer null/`String[0]`, which is what those
 /// shapes already answer today for a session nobody has written to. The
-/// divergence that remains — a `putValue` on a 2-, 3- or 6-field session does
-/// not round-trip through `getValue` — is a *quiet* miss on a JSSE convenience
-/// API, against a *loud* corruption of the negotiation state. Widening those
-/// three shapes is the real fix and is nominated, not done here: the 3-field
-/// one is `ssl_security.rs`'s and cannot be widened without moving
-/// `session_has_negotiated`'s arms in the same commit (E22-1's NOMINATION C
-/// carries that warning already).
+/// divergence that remains — a `putValue` on a 6-field session does not
+/// round-trip through `getValue` — is a *quiet* miss on a JSSE convenience
+/// API, against a *loud* corruption of the negotiation state.
+///
+/// E42 closed the 3-field half of that residual by widening rather than by
+/// refusing, together with the `session_has_negotiated` arm merge it required;
+/// see `docs/known-issues/jdk-only/E42-1-the-slot-that-was-never-there-and-the-predicate-that-was-its-own-negation.md`.
+/// The 6-field shape is now the **only** one with no attribute slot, and it is
+/// what `_ => None` is for.
 fn sslsess_attrs_slot(ctx: &dyn NativeContext, this: ObjectRef) -> Option<usize> {
     match ctx.object_num_fields(this) {
         4 => Some(3),
@@ -12380,17 +13277,22 @@ fn register_ssl_session_real(r: &mut NativeMethodRegistry) {
     // (same path the keystore uses). Empty chain → throw
     // SSLPeerUnverifiedException (real-JDK contract), which Tomcat treats as
     // "no client cert".
+    //
+    // F18: the chain now comes from `peer_certs_for_session` rather than from
+    // an inline `session_peer_certs_table` lookup, so this door and
+    // `ssl_security`'s `getPeerPrincipal` cannot see different chains for one
+    // session — they are the same function call. See that helper for the
+    // measured HotSpot contract the two have to agree on. This is a strict
+    // widening for THIS door: it keeps the object-table answer it already gave
+    // and gains the stream-id fallback its neighbour had, which is why the
+    // change cannot make an answer that used to be a chain become empty.
     r.register(
         cls,
         "getPeerCertificates",
         "()[Ljava/security/cert/Certificate;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            let chain = session_peer_certs_table()
-                .lock()
-                .get(&gc_stable_objref_key(ctx, this))
-                .cloned()
-                .unwrap_or_default();
+            let chain = peer_certs_for_session(ctx, this);
             if chain.is_empty() {
                 // Real-JDK contract (and this function's own doc): throw
                 // SSLPeerUnverifiedException — an SSLException — NOT
@@ -12544,11 +13446,16 @@ fn register_ssl_session_real(r: &mut NativeMethodRegistry) {
     // answers them from one piece of state — see `session_has_negotiated`.
     // This used to return `Value::Int(1)` for every shape narrower than 7
     // fields on the reasoning that "the accept session was just negotiated".
-    // That reasoning holds for the 4-field accept shape and NOT for the
-    // 3-field NEW-13 shape, which `ssl_security::new13_resolve_socket_session`
-    // also mints — with `tls_id = -1` — for a socket that was never connected.
-    // So an unconnected `SSLSocket.getSession().isValid()` answered `true`
-    // where HotSpot measures `false` (E12-1 §1 arm A).
+    // That reasoning holds for the accept shape and NOT for the NEW-13 shape,
+    // which `ssl_security::new13_resolve_socket_session` also mints — with
+    // `tls_id = -1` — for a socket that was never connected. So an unconnected
+    // `SSLSocket.getSession().isValid()` answered `true` where HotSpot measures
+    // `false` (E12-1 §1 arm A).
+    //
+    // E42: those are now the SAME WIDTH (4), which is why the width alone can
+    // never answer this and `session_has_negotiated` must read slot 2. The two
+    // shapes are distinguished by the VALUE there — `-1` versus a real stream
+    // id — and by nothing else.
     //
     // Deliberately NOT tied to stream liveness: measured (arm G), closing the
     // socket does NOT invalidate the session — it outlives its transport, for
@@ -12562,14 +13469,173 @@ fn register_ssl_session_real(r: &mut NativeMethodRegistry) {
     // live — confirmed against `--dump-native-registry`, not source order.
     // Its version was slot-2-only and mis-reported the 3-field accept session;
     // it has been made field-count aware to match this logic. Keep in step.
+    //
+    // F18 — THE SECOND HALF OF THE PREDICATE, which this VM could not model
+    // until `invalidate()` had a writer in this mode. HotSpot's `isValid()` is
+    // `sessionId.length() != 0 && !invalidated && ...`; `session_is_valid`
+    // composes both halves and is now the one function both modes call. It
+    // reduces to `session_has_negotiated` exactly when nothing has ever been
+    // invalidated, so this line changes no answer in a process that never
+    // calls `invalidate()`. See `session_is_valid` for the measurement on a
+    // genuinely negotiated session.
     r.register(cls, "isValid", "()Z", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        Ok(Some(Value::Int(if session_has_negotiated(ctx, this) {
-            1
-        } else {
-            0
-        })))
+        Ok(Some(Value::Int(if session_is_valid(ctx, this) { 1 } else { 0 })))
     });
+
+    // invalidate() -> void
+    //
+    // F18 (F10-1 NOMINATION 3). This had **no registration in real-JDK mode at
+    // all** — `javax.net.ssl.SSLSession` is an interface whose `invalidate()`
+    // has no Code attribute, so the shipping mode threw `AbstractMethodError`.
+    // It was unreachable in practice only while every session this VM handed
+    // out answered `isValid() == false` anyway; F10's minter fix made completed
+    // HTTPS handshakes report `isValid() == true`, so a program that checks
+    // validity and then invalidates now gets here.
+    //
+    // Both halves of that nomination land together — the registration AND a
+    // state model that makes it mean something at width 4 — because
+    // `session_mark_invalidated` records the bit outside the object. See
+    // `session_invalidated_table` for why that is not the widening F6-1 §4 and
+    // E42-1 §2 reject, and `session_is_valid` for the measured contract.
+    r.register(cls, "invalidate", "()V", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        session_mark_invalidated(ctx, this);
+        Ok(None)
+    });
+
+    // getPeerHost() / getPeerPort()
+    //
+    // F18 — neither had ANY real-JDK-mode registration. `grep -rn '"getPeerHost"'`
+    // over `native-builtins/src/` returns only `tls.rs`, whose registrar
+    // `register_tls_natives` is reached solely from
+    // `register_synthetic_overrides` (`#[cfg(feature = "synthetic-jdk")]`), so
+    // in the mode `--jdk-only` runs both were `AbstractMethodError`. E12-1's
+    // residual 4 recorded these as *answering the wrong value* — it was reading
+    // `build_synthetic_ssl_session`, the producer. The accessor side is worse
+    // than wrong; it is absent.
+    //
+    // MEASURED, HotSpot 25.0.3+9-LTS (`scratchpad/f18/F18SessionContract.java`,
+    // three runs byte-identical):
+    //
+    //   unconnected SSLSocket / pre-handshake SSLEngine   host=null   port=-1
+    //   completed HTTPS client handshake                  host=localhost
+    //                                                     port=<the server port>
+    //   after invalidate()                                unchanged (both)
+    //
+    // Note HotSpot reports the host the caller ASKED for, not the certificate's
+    // subject — `localhost` here, while the leaf certificate is also
+    // `CN=localhost`; do not "verify" one against the other.
+    //
+    // Width handling, which is the trap this family keeps falling into:
+    // slot 3 is the peer host on the 6- and 8-field shapes and the ATTRIBUTE
+    // MAP on the 4-field one, so a slot read with no width test would return a
+    // `java.util.HashMap` through a `()Ljava/lang/String;` descriptor as soon
+    // as anything had called `putValue` — the exact defect E31-1 §2 records
+    // against `tls.rs`'s copies. The `>= 6` threshold is
+    // `session_cipher_slot`'s, deliberately the same number so there is one
+    // width boundary in this file and not two.
+    //
+    // For the 4-field shapes the answer comes from the socket registry via
+    // `session_stream_id`, which is where the host and port a client actually
+    // dialled are recorded (`servlet::s2_tls_session_info`'s third and fourth
+    // components). That is a real answer rather than a fallback, and it is the
+    // half E12-1's residual 4 said was missing.
+    r.register(cls, "getPeerHost", "()Ljava/lang/String;", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        if ctx.object_num_fields(this) >= 6 {
+            // Only a String counts: `tls.rs::init_ssl_session_fields` seeds
+            // this slot with `Int(0)`, and `build_synthetic_ssl_session` may
+            // leave it unwritten.
+            if let v @ Value::Object(Some(_)) = ctx.get_field(this, 3) {
+                return Ok(Some(v));
+            }
+            return Ok(Some(Value::Object(None)));
+        }
+        // Bound to a `let`, and NOT written as `if let Some(id) =
+        // session_stream_id(ctx, this)`: the `&*ctx` reborrow in an `if let`
+        // scrutinee is a temporary that lives to the end of the block under
+        // Rust 2021's drop rules, which would collide with the `&mut ctx` that
+        // `create_string` needs inside it. Same hazard `getProtocol` in this
+        // file records against a match scrutinee.
+        let host = session_stream_id(ctx, this)
+            .and_then(servlet::s2_tls_session_info)
+            .map(|(_, _, host, _)| host)
+            .filter(|h| !h.is_empty());
+        if let Some(host) = host {
+            let s = ctx.create_string(&host);
+            return Ok(Some(Value::Object(Some(s))));
+        }
+        // HotSpot's measured answer for a session that negotiated nothing.
+        Ok(Some(Value::Object(None)))
+    });
+    r.register(cls, "getPeerPort", "()I", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        if ctx.object_num_fields(this) >= 6 {
+            // `0` means UNWRITTEN, not "port zero". Both producers of a wide
+            // shape that populate this slot write `-1` explicitly for "no peer"
+            // (`build_synthetic_ssl_session` slot 4, `tls.rs
+            // ::init_ssl_session_fields` `SES_PEER_PORT`), and `http2.rs`'s
+            // 6-field session writes NO slot at all, so a zero here is the
+            // allocator's fill. A connected peer never has port 0 — it is the
+            // "any port" value a bind may ask for and never a value a peer
+            // reports — so mapping it to HotSpot's measured `-1` cannot mask a
+            // real answer.
+            if let Value::Int(p) = ctx.get_field(this, 4) {
+                return Ok(Some(Value::Int(if p == 0 { -1 } else { p })));
+            }
+            return Ok(Some(Value::Int(-1)));
+        }
+        // Same `let`-binding discipline as `getPeerHost` above. This body has
+        // no `&mut ctx` use inside the block today, so the hazard is latent
+        // rather than live — which is exactly when it gets introduced.
+        let port = session_stream_id(ctx, this)
+            .and_then(servlet::s2_tls_session_info)
+            .map(|(_, _, _, port)| port)
+            .filter(|p| *p != 0);
+        match port {
+            Some(p) => Ok(Some(Value::Int(p as i32))),
+            None => Ok(Some(Value::Int(-1))),
+        }
+    });
+
+    // getSessionContext() -> SSLSessionContext
+    //
+    // F18 — registered NOWHERE in the crate, in either mode: `grep -rn
+    // '"getSessionContext"'` over `native-builtins/src/` returns zero
+    // registrations. Another abstract interface declaration, another
+    // `AbstractMethodError`, and the last of the four `javax/net/ssl/SSLSession`
+    // doors that had none (the others being `invalidate`, `getPeerHost` and
+    // `getPeerPort`, all above).
+    //
+    // `null` IS the answer, not a stand-in for one. The interface says so in
+    // the method's own contract:
+    //
+    //   "This context may be unavailable in some environments, in which case
+    //    this method returns null."
+    //   -- C:\craton\jdk25src/java.base/javax/net/ssl/SSLSession.java:77-84
+    //
+    // This VM has no `SSLSessionContext` — no session cache, no id-keyed
+    // lookup, no timeout — so "unavailable" is a true statement about it, and
+    // saying so is the `--jdk-only` posture rather than a fabricated context
+    // object that would answer every subsequent question wrongly. Contrast
+    // `getCipherSuite`, where the honest value is a JSSE sentinel because the
+    // method may not return null at all.
+    //
+    // MEASURED (`scratchpad/f18/F18SessionContract.java`, three runs): HotSpot
+    // answers `null` on the unconnected socket's session and on the
+    // pre-handshake engine's, `SSLSessionContextImpl` after a completed
+    // handshake, and `null` AGAIN once `invalidate()` has been called — the
+    // second thing `invalidate()` moves, which no record in this directory had
+    // noted. So the constant is right in three of HotSpot's four states and
+    // under-reports the fourth, and it is right in the invalidated state for
+    // free.
+    r.register(
+        cls,
+        "getSessionContext",
+        "()Ljavax/net/ssl/SSLSessionContext;",
+        |_ctx, _args| Ok(Some(Value::Object(None))),
+    );
 
     // creation / last-accessed time: the 8-field engine session stores a
     // millis timestamp in slot 5; the narrower shapes have no slot for one.
@@ -12582,11 +13648,18 @@ fn register_ssl_session_real(r: &mut NativeMethodRegistry) {
     // RESIDUAL, stated rather than hidden: HotSpot's value is fixed at
     // construction, so two reads of one session agree; this one is `now` on
     // every call for the narrow shapes, so two reads disagree by the elapsed
-    // millis. Making it stable needs a slot to stash it in (the 3-field shape
-    // has none) — see E22-1's NOMINATION to widen `NEW13_SSL_SESS_FIELDS`. A
+    // millis. Making it stable needs a slot to stash it in (the NEW-13 shape
+    // has none — its slot 3 is the attribute map, not a timestamp). A
     // drifting real timestamp is still strictly better than a stable
     // impossible one: age arithmetic (`now - creationTime`), which is what
     // every consumer actually does, goes from "56 years old" to "~0 ms old".
+    //
+    // E42 did NOT change this. The NEW-13 widening stops at 4 and this gate is
+    // `> 5`, so the widened shape still answers `now` on every call. E22-1's
+    // NOMINATION C asked for a widening that carried a creation-time slot and
+    // this is not that widening — reaching slot 5 means width >= 6, which is
+    // `tls.rs`'s cipher-first convention and would shift slots 0/1/2 under
+    // every reader in this file.
     r.register(cls, "getCreationTime", "()J", |ctx, args| {
         let this = obj_arg(args, 0)?;
         if ctx.object_num_fields(this) > 5 {
@@ -12657,12 +13730,20 @@ fn register_ssl_session_real(r: &mut NativeMethodRegistry) {
                 .into());
             }
             // E31: a shape with no dedicated attribute slot must NOT fall back
-            // to `num_fields - 1` — on the 3-field NEW-13 shape that slot is
-            // the stream id, and overwriting it with a HashMap flips
+            // to `num_fields - 1` — on the then-3-field NEW-13 shape that slot
+            // was the stream id, and overwriting it with a HashMap flips
             // `session_has_negotiated` to `true`, which is exactly how a
             // `putValue` used to resurrect the 32-byte fabricated id and
             // `isValid() == true` on a session that never handshaked. No-op
             // instead; see `sslsess_attrs_slot`.
+            //
+            // E42: that shape is now 4 fields with a dedicated slot 3, so this
+            // door ROUND-TRIPS for it rather than no-opping — which is the
+            // whole point of the widening (Jetty's `SecureRequestCustomizer
+            // .retrieveSni()` does `getValue()` then `putValue()` on every SSL
+            // request). The `None` arm is now reached only by the 6-field
+            // shape. Do not "simplify" it back to `num_fields - 1`: on that
+            // shape the last slot is `tls.rs::SES_CREATION_TIME`.
             let slot = match sslsess_attrs_slot(ctx, this) {
                 Some(s) => s,
                 None => return Ok(None),
@@ -12705,9 +13786,11 @@ fn register_ssl_session_real(r: &mut NativeMethodRegistry) {
             ))))
         };
         // E31: `sslsess_attrs_slot`, not `num_fields - 1` — see its doc. On the
-        // 3-field shape the old spelling read the STREAM ID as a map reference;
-        // it missed (an `Int`) and answered empty, so this arm is unchanged in
-        // effect and changed in correctness.
+        // then-3-field shape the old spelling read the STREAM ID as a map
+        // reference; it missed (an `Int`) and answered empty, so this arm was
+        // unchanged in effect and changed in correctness. E42: that shape is
+        // width 4 now and slot 3 really is the map, so this door reports the
+        // names a `putValue` actually stored.
         let slot = match sslsess_attrs_slot(ctx, this) {
             Some(s) => s,
             None => return empty(ctx),

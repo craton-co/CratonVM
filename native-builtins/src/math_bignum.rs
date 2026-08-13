@@ -586,7 +586,7 @@ pub(crate) fn bi_shift_right_str(value: &str, n: i32) -> String {
         // more bits is `ArithmeticException("BigInteger would overflow
         // supported range")` on HotSpot; this `String`-returning helper has no
         // error channel and is NOT registered as a native (the registered
-        // `shiftLeft`/`shiftRight` enforce it via `bi_checked_shl`), so the arm
+        // `shiftLeft`/`shiftRight` enforce it via `p71_bi_checked_shl`), so the arm
         // is unreachable from Java — it must simply not recurse.
         let k = n.unsigned_abs();
         if k > i32::MAX as u32 {
@@ -602,6 +602,16 @@ pub(crate) fn bi_shift_right_str(value: &str, n: i32) -> String {
     let mut q = abs.to_string();
     for _ in 0..n {
         if q == "0" {
+            break;
+        }
+        if neg && q == "1" {
+            // ARGUMENT-DRIVEN LOOP (fixed 2026-08-13, lane F7). The `q == "0"`
+            // guard above only ever fires for a NON-NEGATIVE value: the
+            // negative arm computes `ceildiv(q, 2)`, whose fixpoint is 1, not
+            // 0. So `bi_shift_right_str("-1", Integer.MAX_VALUE)` ran the full
+            // 2^31 iterations — a decimal division each — to return "-1",
+            // which the sign-extension arm below already knows. The loop count
+            // came from the ARGUMENT while the answer had stopped changing.
             break;
         }
         // q = q / 2 (floor)
@@ -1457,58 +1467,18 @@ pub(crate) fn register_biginteger_natives(registry: &mut NativeMethodRegistry) {
         },
     );
 
-    // shiftLeft / shiftRight — see `bi_shift_arg` and `bi_checked_shl` for the
-    // contract. Both are limb shifts (`crate::bigint::BigInt::{shl,shr}`), not
-    // the repeated decimal multiply/divide this used to run: `shiftLeft(n)`
-    // looped `n` times over a growing decimal string, so an ordinary
-    // `x.shiftLeft(Integer.MAX_VALUE)` was 2^31 arbitrary-precision multiplies
-    // — a hang, not a wrong answer — and `n = Integer.MIN_VALUE` evaluated
-    // `-n`, which OVERFLOWS: a panic in a debug build (a panic is not a Java
-    // throwable; it takes the VM down) and a silently empty `0..i32::MIN`
-    // range in release, so `ONE.shiftLeft(Integer.MIN_VALUE)` answered 1 where
-    // HotSpot answers 0.
-    registry.register(bi, "shiftLeft", "(I)Ljava/math/BigInteger;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let n = match args.get(1) {
-            Some(Value::Int(v)) => *v,
-            _ => 0,
-        };
-        let v = bi_read_int(ctx, this);
-        let (left, k) = bi_shift_arg(n);
-        let res = if left {
-            bi_checked_shl(&v, k)?
-        } else {
-            v.shr(k)
-        };
-        Ok(Some(Value::Object(Some(bi_alloc_int(ctx, &res)?))))
-    });
-
-    // shiftRight — the same split with the direction inverted (JDK 25
-    // `BigInteger.shiftRight`, BigInteger.java:3565-3577).
-    registry.register(
-        bi,
-        "shiftRight",
-        "(I)Ljava/math/BigInteger;",
-        |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            let n = match args.get(1) {
-                Some(Value::Int(v)) => *v,
-                _ => 0,
-            };
-            let v = bi_read_int(ctx, this);
-            let (was_left, k) = bi_shift_arg(n);
-            let res = if was_left {
-                v.shr(k)
-            } else {
-                bi_checked_shl(&v, k)?
-            };
-            Ok(Some(Value::Object(Some(bi_alloc_int(ctx, &res)?))))
-        },
-    );
+    // `shiftLeft` / `shiftRight` are NOT registered here either, as of lane F7
+    // — see the "REGISTRATION CONSOLIDATION" note below. Lane E38-1 kept them
+    // only because `phases_late`'s twin had no range guard and
+    // `x.shiftRight(Integer.MIN_VALUE)` there was a `vec![0u32; 67_108_864]`
+    // (~256 MB) allocation. Lane F2 has since landed that guard
+    // (`phases_late::p71_bi_checked_shl`), so the stated reason for keeping a
+    // second copy is gone and keeping it would leave TWO live registrations for
+    // one triple with registration order deciding which guard runs.
 
     // `and` / `or` / `xor` / `bitLength` / `bitCount` / `testBit` are NOT
     // registered here on purpose — see the
-    // "REGISTRATION CONSOLIDATION" note above `bi_shift_arg`. The decimal
+    // "REGISTRATION CONSOLIDATION" note below. The decimal
     // versions that used to live here read `bi_read(..).trim_start_matches('-')`,
     // i.e. they threw the SIGN away before computing, so `(-1) & 5` answered 1
     // instead of 5 and `(-9).bitCount()` answered 2 instead of 1; `testBit`
@@ -1537,40 +1507,46 @@ pub(crate) fn register_biginteger_natives(registry: &mut NativeMethodRegistry) {
         Ok(Some(Value::Object(Some(bi_alloc(ctx, &val.to_string())?))))
     });
 
-    // isProbablePrime — string-based trial division
+    // isProbablePrime(certainty) — JDK 25 `BigInteger.java:1156-1166`:
+    //
+    //     if (certainty <= 0) return true;
+    //     BigInteger w = this.abs();
+    //     if (w.equals(TWO)) return true;
+    //     if (!w.testBit(0) || w.equals(ONE)) return false;
+    //     return w.primeToCertainty(certainty, null);
+    //
+    // This body used to be trial division by 5,7,11,… while `i*i <= |this|`
+    // with a HARD CAP of `i <= 10000`, and it answered **1** when the cap was
+    // reached. So every composite whose smallest factor exceeds 10,000 was
+    // reported PRIME. MEASURED (`scratchpad/f7/Prime.java`, Microsoft OpenJDK
+    // 25.0.3+9):
+    //
+    //     (1000003*1000033).isProbablePrime(100) = false   <- this body said true
+    //     (p256*q256).isProbablePrime(100)       = false   <- this body said true
+    //     4.isProbablePrime(0)  = true    4.isProbablePrime(-1) = true   <- ignored
+    //     (-7).isProbablePrime(10) = true    (-4).isProbablePrime(10) = false
+    //     2.isProbablePrime(10) = true       (-2).isProbablePrime(10) = true
+    //     0/1/(-1).isProbablePrime(10) = false
+    //
+    // "Composite reported prime" is the direction that matters: it is what a
+    // key-generation path trusts. `BigInt::is_probable_prime` (trial division
+    // below 1000, then Miller-Rabin over 13 fixed bases) is the validated
+    // primitive — `bigint::tests::is_probable_prime_matches_decimal` pins the
+    // p*q semiprime case specifically — and `phases_late`'s twin already calls
+    // it. It is called here on the ABSOLUTE value, which the twin does not do:
+    // its `if self.neg { return false }` makes `(-7).isProbablePrime(10)`
+    // false where HotSpot says true (see this lane's record, NOMINATION 3).
     registry.register(bi, "isProbablePrime", "(I)Z", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let s = bi_read(ctx, this).trim_start_matches('-').to_string();
-        if s == "0" || s == "1" {
-            return Ok(Some(Value::Int(0)));
-        }
-        if s == "2" || s == "3" {
+        let certainty = match args.get(1) {
+            Some(Value::Int(v)) => *v,
+            _ => 0,
+        };
+        if certainty <= 0 {
             return Ok(Some(Value::Int(1)));
         }
-        let last_digit: u8 = s.bytes().last().unwrap_or(b'0') - b'0';
-        if last_digit % 2 == 0 {
-            return Ok(Some(Value::Int(0)));
-        }
-        if bi_mod_unsigned(&s, "3") == "0" {
-            return Ok(Some(Value::Int(0)));
-        }
-        let mut i = 5u64;
-        while i <= 10000 {
-            let is = i.to_string();
-            let isq = bi_mul_unsigned(&is, &is);
-            if bi_cmp_unsigned(&isq, &s) > 0 {
-                break;
-            }
-            if bi_mod_unsigned(&s, &is) == "0" {
-                return Ok(Some(Value::Int(0)));
-            }
-            let i2 = (i + 2).to_string();
-            if bi_mod_unsigned(&s, &i2) == "0" {
-                return Ok(Some(Value::Int(0)));
-            }
-            i += 6;
-        }
-        Ok(Some(Value::Int(1)))
+        let v = bi_read_int(ctx, obj_arg(args, 0)?);
+        let w = if v.is_neg() { v.neg_value() } else { v };
+        Ok(Some(Value::Int(if w.is_probable_prime() { 1 } else { 0 })))
     });
 
     // modPow(exponent, modulus) -> BigInteger
@@ -1697,93 +1673,236 @@ pub(crate) fn register_biginteger_natives(registry: &mut NativeMethodRegistry) {
 // wrong (`and`/`or`/`xor`/`not`/`bitLength`/`bitCount`/`testBit`/
 // `toByteArray` — all of them sign-stripping, see the notes at their former
 // sites) are simply no longer registered here, so the limb twin wins in both
-// modes and there is ONE implementation per triple. `shiftLeft`/`shiftRight`
-// are the exception: they are still registered, because the limb twin's LEFT
-// arm has no `checkRange` guard and `x.shiftRight(Integer.MIN_VALUE)` there
-// allocates `vec![0u32; 67_108_864]` (~256 MB) before answering. Until that is
-// fixed at its own site (NOMINATION in the lane record) this file must keep a
-// body that refuses instead.
+// modes and there is ONE implementation per triple.
+//
+// 2026-08-13, lane F7 — `shiftLeft`/`shiftRight` now go the same way, and the
+// call ORDER above is worth stating exactly because two lanes have now guessed
+// at it. Traced through `vm/src/vm/vm_init.rs`:
+//
+//   * `if config.use_synthetic_jdk` (vm_init.rs:1932) calls `register_builtins`
+//     (vm_init.rs:1934), which is `register_essential_natives` THEN
+//     `register_synthetic_overrides` (lib.rs:21596-21601). So in synthetic mode
+//     BOTH registrars run and THIS FILE'S runs SECOND — it wins.
+//   * the `else` arm (vm_init.rs:2055) and the whole
+//     `#[cfg(not(feature = "synthetic-jdk"))]` build (vm_init.rs:2593) call
+//     `register_essential_natives_with_shims` and NOT
+//     `register_synthetic_overrides`. So in real-JDK mode this file's
+//     registrar never runs at all and `phases_late`'s is the only one.
+//
+// E38-1 kept `shiftLeft`/`shiftRight` here because `phases_late`'s twin had no
+// `checkRange` guard, so `x.shiftRight(Integer.MIN_VALUE)` there allocated
+// `vec![0u32; 67_108_864]` (~256 MB) before answering. Lane F2 has since landed
+// that guard as `phases_late::p71_bi_checked_shl`. Keeping a second copy after
+// that would mean TWO live registrations for one triple whose behaviour differs
+// only in which lane's guard runs — decided by registration order, i.e. by
+// mode. Deleting this copy leaves ONE implementation, reached in every mode.
+// `bi_shift_arg` and `bi_checked_shl` went with it; `p71_bi_checked_shl` is
+// their surviving twin and applies the identical magnitude-bit rule.
 
-/// Split a `BigInteger` shift argument into `(is_a_left_shift, distance)` for
-/// `shiftLeft`; `shiftRight` inverts the direction.
-///
-/// JDK 25 `BigInteger.java:3494-3506`:
-///
-/// ```text
-///     } else {
-///         // Possible int overflow in (-n) is not a trouble,
-///         // because shiftRightImpl considers its argument unsigned
-///         return shiftRightImpl(-n);
-///     }
-/// ```
-///
-/// So a negative `n` flips the direction and `-n` is then read as an UNSIGNED
-/// 32-bit count. `i32::unsigned_abs` is exactly that widening
-/// (`Integer.MIN_VALUE` -> 2_147_483_648), which is why the distance split is
-/// not where the defect lives — [`bi_checked_shl`] is.
-fn bi_shift_arg(n: i32) -> (bool, u32) {
-    if n >= 0 {
-        (true, n as u32)
-    } else {
-        (false, n.unsigned_abs())
+/// `ArithmeticException("BigInteger would overflow supported range")` — JDK 25
+/// `BigInteger.reportOverflow`, `BigInteger.java:1220`.
+fn bi_overflow() -> MethodCallFailed {
+    RuntimeError::ArithmeticException {
+        message: "BigInteger would overflow supported range".to_string(),
     }
+    .into()
 }
 
-/// Magnitude bit length (NOT `BigInteger.bitLength()`, which subtracts the sign
-/// bit for an exact power of two). `mag_le` is normalized, so the top limb is
-/// non-zero whenever the value is non-zero.
-fn bi_mag_bits(v: &crate::bigint::BigInt) -> u64 {
-    match v.mag_le().last() {
-        Some(&top) if top != 0 => {
-            (v.mag_le().len() as u64 - 1) * 32 + (32 - u64::from(top.leading_zeros()))
-        }
-        _ => 0,
+/// `BigInteger.pow`'s range guard, ported from JDK 25 `BigInteger.java:2594-2650`.
+///
+/// `pow` is the second argument-driven allocation in this family (the first is
+/// `phases_late::p71_bi_checked_shl`, the third was `BigInt::test_bit`): the exponent alone
+/// decides how big the answer is, and this native's square-and-multiply loop
+/// happily starts building it. `BigInteger.TEN.pow(1_000_000_000)` is one line
+/// of ordinary bytecode asking for a 3.3-billion-bit number. HotSpot does not
+/// start: it bounds the result from the operand's bit length and the exponent
+/// and throws. MEASURED (`scratchpad/f7/Pow.java`, Microsoft OpenJDK 25.0.3+9):
+///
+/// ```text
+/// TEN.pow(1000000000)   !! ArithmeticException: BigInteger would overflow supported range   [0 ms]
+/// THREE.pow(MAX)        !! ArithmeticException: …                                           [0 ms]
+/// (2^100).pow(1<<26)    !! ArithmeticException: …                                           [0 ms]
+/// TWO.pow(MAX)          !! ArithmeticException: …                                           [94 ms]
+/// TWO.pow(MAX-1)         = <signum=1 bitLength=2147483647>                                  [36 ms]
+/// THREE.pow(1<<20)       = <signum=1 bitLength=1661954>                                    [335 ms]
+/// ```
+///
+/// Only the REFUSAL is ported; the exponentiation stays the existing
+/// square-and-multiply, which is mathematically identical to the JDK's
+/// repeated squaring. That keeps the accepted set the same on both sides:
+/// the JDK factors `2^powersOfTwo` out of the base and shifts it back at the
+/// end, so its guard bounds `(remainingBits - 1)·exponent + bitsToShift + 1`,
+/// which is exactly the magnitude bit length of the answer this loop builds.
+///
+/// Called only with `exponent >= 2` and `|base| >= 2` — the trivial rows are
+/// already answered above.
+fn bi_pow_check_range(base: &crate::bigint::BigInt, exp: i32) -> Result<(), MethodCallFailed> {
+    // `final int powersOfTwo = base.getLowestSetBit();`
+    // `final long bitsToShiftLong = (long) powersOfTwo * exponent;`
+    // `if (bitsToShift != bitsToShiftLong) reportOverflow();` — both factors
+    // are non-negative here, so the narrowing survives iff the product fits.
+    let powers_of_two = i64::from(base.lowest_set_bit().max(0));
+    let bits_to_shift = powers_of_two * i64::from(exp);
+    if bits_to_shift > i64::from(i32::MAX) {
+        return Err(bi_overflow());
     }
+    // `base = base.shiftRight(powersOfTwo); final int remainingBits = base.bitLength();`
+    // Shifting out the trailing zeros removes exactly that many bits, so this
+    // needs no shifted copy of the magnitude.
+    let remaining_bits = base.magnitude_bits() as i64 - powers_of_two;
+    if remaining_bits == 1 {
+        // `return (negative ? NEGATIVE_ONE : ONE).shiftLeft(bitsToShift);` —
+        // a magnitude of exactly `bitsToShift + 1` bits, refused by
+        // `shiftLeft`'s own `checkRange`. This is the `TWO.pow(MAX)` row: it
+        // throws, while `TWO.pow(MAX-1)` lands on bitLength 2147483647.
+        if 1 + bits_to_shift > i64::from(i32::MAX) {
+            return Err(bi_overflow());
+        }
+        return Ok(());
+    }
+    // `final long scaleFactor = (long) remainingBits * exponent;`
+    // `if (scaleFactor <= Long.SIZE) { …small path, cannot overflow… }`
+    // `if (scaleFactor + bitsToShift - exponent >= Integer.MAX_VALUE) reportOverflow();`
+    let scale_factor = remaining_bits * i64::from(exp);
+    if scale_factor > 64
+        && scale_factor + bits_to_shift - i64::from(exp) >= i64::from(i32::MAX)
+    {
+        return Err(bi_overflow());
+    }
+    Ok(())
 }
 
-/// `value << k` with the JDK's range guard.
+/// The `10^n` factor every `BigDecimal` rescale needs.
 ///
-/// `BigInteger` supports a magnitude of at most `Integer.MAX_VALUE` bits:
-/// `checkRange` (JDK 25 `BigInteger.java:1213-1217`) is
-///
-/// ```text
-///     if (mag.length > MAX_MAG_LENGTH || mag.length == MAX_MAG_LENGTH && mag[0] < 0)
-///         reportOverflow();   // ArithmeticException("BigInteger would overflow supported range")
-/// ```
-///
-/// with `MAX_MAG_LENGTH == Integer.MAX_VALUE / 32 + 1 == 1 << 26`. `mag[0] < 0`
-/// means the top word's sign bit is set, so the two arms together say exactly
-/// "magnitude bit length > `Integer.MAX_VALUE`".
-///
-/// MEASURED on Microsoft OpenJDK 25.0.3+9 (`scratchpad/e38/Shift2.java`):
+/// `BigDecimal.bigTenToThe(n)` (`BigDecimal.java`) answers small `n` from a
+/// table and everything else with `BigInteger.TEN.pow(n)`, so it inherits
+/// [`bi_pow_check_range`]'s refusal exactly, and refusing here reproduces the
+/// JDK's own control flow rather than inventing a cap. MEASURED
+/// (`scratchpad/f7/Scale.java`, Microsoft OpenJDK 25.0.3+9):
 ///
 /// ```text
-/// ONE.shiftLeft(MIN)   = 0            (-9).shiftLeft(MIN)  = -1
-/// ONE.shiftRight(MIN) !! ArithmeticException: BigInteger would overflow supported range
-/// ONE.shiftLeft(MAX)  !! ArithmeticException: BigInteger would overflow supported range
-/// ONE.shiftRight(MAX)  = 0            (-1).shiftRight(MAX) = -1
-/// ONE.shiftLeft(1<<30) = <bitLength 1073741825>          (-9).shiftRight(1) = -5
+/// new BigDecimal("1.5").setScale(Integer.MAX_VALUE, HALF_UP)
+///     !! ArithmeticException: BigInteger would overflow supported range   [15 ms]
+/// new BigDecimal("1.5").setScale(1000000, HALF_UP)  = <1000002 chars, scale=1000000>  [2950 ms]
 /// ```
 ///
-/// HotSpot allocates the oversized `int[]` and *then* throws (157 ms and ~256 MB
-/// for the `shiftRight(MIN)` row). We refuse from the bit count alone, so the
-/// observable answer is identical and the allocation never happens — a
-/// multi-hundred-megabyte allocation reachable from `x.shiftRight(n)` with an
-/// attacker-chosen `n` is a denial-of-service shape, not merely a slow path.
-fn bi_checked_shl(
-    v: &crate::bigint::BigInt,
-    k: u32,
-) -> Result<crate::bigint::BigInt, MethodCallFailed> {
-    if v.is_zero() || k == 0 {
-        return Ok(v.clone());
+/// Both rows come out of the predicate below: `raise = 2147483646` is refused
+/// (`3·raise >= Integer.MAX_VALUE`) and `raise = 1000000` is admitted.
+fn bd_pow_ten_check(n: i32) -> Result<(), MethodCallFailed> {
+    if n < 2 {
+        return Ok(());
     }
-    if bi_mag_bits(v) + u64::from(k) > i32::MAX as u64 {
-        return Err(RuntimeError::ArithmeticException {
-            message: "BigInteger would overflow supported range".to_string(),
-        }
-        .into());
+    bi_pow_check_range(&crate::bigint::BigInt::from_decimal("10"), n)
+}
+
+/// Guards against the shape this lane was sent after: a loop or an allocation
+/// whose size comes from an ARGUMENT rather than from the operands' magnitude.
+///
+/// Every expected value below is a line of a `java` transcript on Microsoft
+/// OpenJDK 25.0.3+9; the probes are `scratchpad/f7/{Pow,Scale,Shr}.java`.
+#[cfg(test)]
+mod argument_driven_range_tests {
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{
+        NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess,
+        NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess,
+    };
+    use super::{bd_pow_ten_check, bi_pow_check_range, bi_shift_right_str};
+    use crate::bigint::BigInt;
+
+    fn refused(v: &str, exp: i32) -> bool {
+        bi_pow_check_range(&BigInt::from_decimal(v), exp).is_err()
     }
-    Ok(v.shl(k))
+
+    /// `scratchpad/f7/Pow.java`:
+    ///
+    /// ```text
+    /// TWO.pow(MAX)       !! ArithmeticException: BigInteger would overflow supported range [94 ms]
+    /// TWO.pow(MAX-1)      = <signum=1 bitLength=2147483647>                                [36 ms]
+    /// TWO.pow(1<<30)      = <signum=1 bitLength=1073741825>                                [50 ms]
+    /// THREE.pow(MAX)     !! …overflow…  [0 ms]      THREE.pow(1<<20) = <bitLength=1661954> [335 ms]
+    /// TEN.pow(MAX)       !! …overflow…  [0 ms]      TEN.pow(1000000000) !! …overflow…      [0 ms]
+    /// (2^100).pow(MAX)   !! …overflow…  [0 ms]      (2^100).pow(1<<26)  !! …overflow…      [0 ms]
+    /// (-2).pow(MAX)      !! …overflow…  [68 ms]     (2^31-1).pow(MAX)   !! …overflow…      [0 ms]
+    /// TEN.pow(3) = 1000     (-2).pow(3) = -8     (-2).pow(4) = 16
+    /// ```
+    ///
+    /// A further 2,560 (base, exponent) rows agree on class, message and value
+    /// (`scratchpad/f7/PowParity.java`: `POW PARITY cases=2560 diffs=0
+    /// value-compared=1635`).
+    #[test]
+    fn pow_range_guard_matches_hotspot() {
+        assert!(refused("2", i32::MAX));
+        assert!(refused("-2", i32::MAX));
+        assert!(refused("3", i32::MAX));
+        assert!(refused("-3", i32::MAX));
+        assert!(refused("10", i32::MAX));
+        assert!(refused("10", 1_000_000_000));
+        assert!(refused("2147483647", i32::MAX));
+        // 2^100: refused by the `powersOfTwo * exponent` narrowing, not by the
+        // scale factor — the two arms are separate rows of the JDK's guard.
+        let p100 = BigInt::from_decimal("1267650600228229401496703205376");
+        assert!(bi_pow_check_range(&p100, i32::MAX).is_err());
+        assert!(bi_pow_check_range(&p100, 1 << 26).is_err());
+
+        assert!(!refused("2", i32::MAX - 1));
+        assert!(!refused("2", 1 << 30));
+        assert!(!refused("3", 1 << 20));
+        assert!(!refused("10", 3));
+        assert!(!refused("-2", 3));
+        assert!(!refused("-2", 4));
+    }
+
+    /// `scratchpad/f7/Scale.java`:
+    ///
+    /// ```text
+    /// 1.5.setScale(MAX_VALUE, HALF_UP) !! ArithmeticException: BigInteger would overflow supported range [15 ms]
+    /// 1.5.setScale(1000000)             = <1000002 chars, scale=1000000>                                [2950 ms]
+    /// ```
+    #[test]
+    fn set_scale_pow_ten_guard_matches_hotspot() {
+        // `1.5` has scale 1, so `setScale(Integer.MAX_VALUE)` raises by MAX-1.
+        assert!(bd_pow_ten_check(i32::MAX - 1).is_err());
+        assert!(bd_pow_ten_check(i32::MAX).is_err());
+        assert!(bd_pow_ten_check(1_000_000).is_ok());
+        // Every scale a real caller uses.
+        assert!(bd_pow_ten_check(0).is_ok());
+        assert!(bd_pow_ten_check(1).is_ok());
+        assert!(bd_pow_ten_check(18).is_ok());
+        // The boundary itself: `TEN.pow(n)` refuses once `3n >= Integer.MAX_VALUE`.
+        assert!(bd_pow_ten_check(715_827_882).is_ok());
+        assert!(bd_pow_ten_check(715_827_883).is_err());
+    }
+
+    /// `scratchpad/f7/Shr.java`:
+    ///
+    /// ```text
+    /// (-1).shiftRight(MAX) = -1      (-9).shiftRight(MAX) = -1     (0).shiftRight(MAX) = 0
+    /// (-1).shiftRight(100) = -1      (-9).shiftRight(1)   = -5     (9).shiftRight(1)   = 4
+    /// (2^100).shiftRight(MAX) = 0    (-2^100).shiftRight(MAX) = -1
+    /// ```
+    ///
+    /// The `q == "0"` guard in the loop only ever fires for a NON-NEGATIVE
+    /// value: the negative arm computes `ceildiv(q, 2)`, whose fixpoint is 1.
+    /// Each row below used to run the full `n` iterations — 2^31 decimal
+    /// divisions — to return a value that had stopped changing after four.
+    #[test]
+    fn shift_right_str_negative_stops_at_the_fixpoint() {
+        assert_eq!(bi_shift_right_str("-1", i32::MAX), "-1");
+        assert_eq!(bi_shift_right_str("-9", i32::MAX), "-1");
+        assert_eq!(
+            bi_shift_right_str("1267650600228229401496703205376", i32::MAX),
+            "0"
+        );
+        assert_eq!(
+            bi_shift_right_str("-1267650600228229401496703205376", i32::MAX),
+            "-1"
+        );
+        assert_eq!(bi_shift_right_str("-1", 100), "-1");
+        assert_eq!(bi_shift_right_str("-9", 1), "-5");
+        assert_eq!(bi_shift_right_str("9", 1), "4");
+        assert_eq!(bi_shift_right_str("0", i32::MAX), "0");
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2547,14 +2666,33 @@ fn native_bi_pow(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
         }
         .into());
     }
+    let base = bi_read_int(ctx, this);
+    // JDK 25 `BigInteger.pow` (BigInteger.java:2594-2600) answers the trivial
+    // shapes before it computes anything, and `ZERO.pow(Integer.MAX_VALUE)` /
+    // `ONE.pow(Integer.MAX_VALUE)` are among them:
+    //
+    //     if (exponent == 0 || this.equals(ONE)) return ONE;
+    //     if (signum == 0 || exponent == 1)      return this;
+    //
+    // MEASURED (`scratchpad/f7/Pow.java`, Microsoft OpenJDK 25.0.3+9):
+    // `ZERO.pow(MAX) = 0 [0 ms]`, `ONE.pow(MAX) = 1 [0 ms]`.
+    let one = BigInt::from_decimal("1");
+    if exp == 0 || base == one {
+        return Ok(Some(Value::Object(Some(bi_alloc_int(ctx, &one)?))));
+    }
+    if base.is_zero() || exp == 1 {
+        return Ok(Some(Value::Object(Some(bi_alloc_int(ctx, &base)?))));
+    }
+    // Refuse the argument-driven blow-up BEFORE allocating for it — see
+    // `bi_pow_check_range`.
+    bi_pow_check_range(&base, exp)?;
     // Square-and-multiply on binary limbs. The old implementation was an
     // O(exp) loop of decimal-string schoolbook multiplies with a full
     // BigInteger heap allocation per step — `new BigDecimal(double)` runs
     // 5^52 through here (real-JDK bytecode delegates to BigInteger.pow), so
     // that O(exp) loop was a measured ~114us per BigDecimal(double) ctor in
     // Lucene's TestUtil.nextLong hot path (ES codec/doc-values test hangs).
-    let base = bi_read_int(ctx, this);
-    let mut result = BigInt::from_decimal("1");
+    let mut result = one;
     let mut sq = base;
     let mut e = exp as u32;
     while e > 0 {
@@ -3719,12 +3857,59 @@ fn bd_set_scale_impl(
 ) -> MethodCallResult {
     use crate::bigint::BigInt;
     let (unscaled, scale) = bd_unscaled_bigint(ctx, this);
-    if new_scale >= scale {
-        let padded = bigint_mul_pow10(&unscaled, new_scale - scale);
+    // JDK 25 `BigDecimal.setScale`, in its order:
+    //
+    //     if (newScale == oldScale) return this;
+    //     if (this.signum() == 0)   return zeroValueOf(newScale);
+    //     … int raise = checkScale((long) newScale - oldScale);   // or drop
+    //
+    // The scale DIFFERENCE has to be computed in a `long`, and that is the
+    // whole of `checkScale`'s job. Here it used to be `new_scale - scale` and
+    // `(scale - new_scale) as usize` — plain `i32` subtractions of two
+    // caller-chosen scales, so `x.setScale(Integer.MIN_VALUE)` OVERFLOWED:
+    // a panic in a debug build (a panic is not a Java throwable — it takes the
+    // VM down, it cannot be caught) and a wrap in release, after which
+    // `"0".repeat(drop)` asks for up to 2 GB of '0' from one ordinary call.
+    if new_scale == scale {
+        let same = bd_alloc_bigint(ctx, &unscaled, new_scale);
+        return Ok(Some(Value::Object(Some(same?))));
+    }
+    if unscaled.is_zero() {
+        // `zeroValueOf(newScale)`: a zero unscaled value takes ANY scale and
+        // `checkScale` is never consulted. MEASURED (`scratchpad/f7/Scale.java`,
+        // Microsoft OpenJDK 25.0.3+9): `ZERO.setScale(Integer.MAX_VALUE)` is
+        // `0E-2147483647` and `ZERO.setScale(Integer.MIN_VALUE)` is
+        // `0E+2147483648` — neither throws.
+        let zero = bd_alloc_bigint(ctx, &unscaled, new_scale);
+        return Ok(Some(Value::Object(Some(zero?))));
+    }
+    let diff = i64::from(new_scale) - i64::from(scale);
+    if diff.abs() > i64::from(i32::MAX) {
+        // `BigDecimal.checkScale`:
+        //     asInt = val > Integer.MAX_VALUE ? Integer.MAX_VALUE : Integer.MIN_VALUE;
+        //     if (…nonzero…) throw new ArithmeticException(asInt > 0 ? "Underflow" : "Overflow");
+        // Both call sites pass the POSITIVE magnitude (`newScale - oldScale`
+        // when raising, `oldScale - newScale` when dropping), so an
+        // out-of-range difference always clamps to `Integer.MAX_VALUE` and the
+        // message is always "Underflow". MEASURED:
+        // `new BigDecimal("1.5").setScale(Integer.MIN_VALUE, HALF_UP)`
+        // !! ArithmeticException: Underflow   [0 ms].
+        return Err(RuntimeError::ArithmeticException {
+            message: "Underflow".to_string(),
+        }
+        .into());
+    }
+    if diff > 0 {
+        let raise = diff as i32;
+        bd_pow_ten_check(raise)?;
+        let padded = bigint_mul_pow10(&unscaled, raise);
         let result = bd_alloc_bigint(ctx, &padded, new_scale);
         return Ok(Some(Value::Object(Some(result?))));
     }
-    let drop = (scale - new_scale) as usize;
+    // 0 < -diff <= i32::MAX, so both narrowings below are exact.
+    let drop_scale = (-diff) as i32;
+    bd_pow_ten_check(drop_scale)?;
+    let drop = drop_scale as usize;
     let mut divisor_dec = String::with_capacity(drop + 1);
     divisor_dec.push('1');
     divisor_dec.push_str(&"0".repeat(drop));

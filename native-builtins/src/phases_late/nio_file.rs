@@ -19470,79 +19470,45 @@ pub(crate) fn register_p66_watch_service(r: &mut NativeMethodRegistry) {
     // the two layouts are not interchangeable, so the losing side's objects
     // are garbage to the winning side's natives. That is exactly how the
     // Spring Boot `FileWatcher` failure arose (a placeholder `newWatchService`
-    // displacing the real one). Only the `StandardWatchEventKinds` constants
-    // stay here: they are plain named singletons, not a second implementation.
-
-    // StandardWatchEventKinds — FOUR FIELD-SHAPED ROWS, DEAD AND TYPE-WRONG,
-    // VERDICT "DELETE", NOT DELETED HERE (2026-08-13, lane E36).
+    // displacing the real one).
     //
-    // The comment above says these "stay here: they are plain named singletons,
-    // not a second implementation". They are neither: they are field names in
-    // the method slot with `Ljava/nio/file/WatchEvent$Kind;` where a method
-    // descriptor belongs, and no `getstatic` path in this VM consults the
-    // native registry (`interpreter/opcodes.rs Instruction::Getstatic`,
-    // `jit/helpers.rs jit_getstatic`, and `ir_lower.rs emit_inline_getstatic`,
-    // which bakes the statics base as an immediate and emits two `mov`s with
-    // no call at all). `StandardWatchEventKinds.ENTRY_CREATE` compiles to
-    // `getstatic ...ENTRY_CREATE:Ljava/nio/file/WatchEvent$Kind;` — measured —
-    // so it is a real read that these rows can never answer.
+    // AS OF 2026-08-13 (lane F9) THIS REGISTRAR REGISTERS NOTHING AT ALL, and
+    // the four `StandardWatchEventKinds` rows it used to hold are DELETED —
+    // E36-1 table row 5's verdict, unblocked by E40-1 §1a deleting the one
+    // caller. What was here, and why it is gone rather than converted:
     //
-    // They are also type-wrong. Each body returns `ctx.create_string("…")`: a
-    // `java/lang/String` where the descriptor names a `WatchEvent$Kind`. On the
-    // oracle the constant's class is
-    // `java.nio.file.StandardWatchEventKinds$StdWatchEventKind`, `name()` is
-    // `"ENTRY_CREATE"` and `type()` is `interface java.nio.file.Path` — a bare
-    // String has none of that.
+    //   * `ENTRY_CREATE`, `ENTRY_MODIFY`, `ENTRY_DELETE`, `OVERFLOW`, each
+    //     registered with `Ljava/nio/file/WatchEvent$Kind;` in the DESCRIPTOR
+    //     slot — a field name in the method slot, not a method descriptor.
+    //   * No `getstatic` path in this VM consults the native registry. There
+    //     are three of them (`interpreter/opcodes.rs Instruction::Getstatic`,
+    //     `jit/helpers.rs jit_getstatic`, `ir_lower.rs
+    //     emit_inline_getstatic` — the last bakes the statics base as an
+    //     immediate and emits two `mov`s with no call at all), and
+    //     `StandardWatchEventKinds.ENTRY_CREATE` compiles to
+    //     `getstatic ...ENTRY_CREATE:Ljava/nio/file/WatchEvent$Kind;`
+    //     (measured on HotSpot 25.0.3+9), so it was a real read no row here
+    //     could ever answer.
+    //   * Each body returned `ctx.create_string("…")` — a `java/lang/String`
+    //     where its own descriptor names a `WatchEvent$Kind`. On the oracle
+    //     the constant's class is
+    //     `java.nio.file.StandardWatchEventKinds$StdWatchEventKind`, `name()`
+    //     is `"ENTRY_CREATE"` and `type()` is `interface java.nio.file.Path`;
+    //     a bare String has none of that. `vm/src/vm/tests.rs`'s
+    //     `watch_event_kinds_p66` asserted `read_java_string(...) ==
+    //     "ENTRY_CREATE"`, i.e. it pinned the wrong TYPE as correct. That test
+    //     is deleted (E40-1 §1a) and this deletion is its pair.
     //
-    // Nothing depends on them: the real consumer, `native-io`'s
-    // `watch_event_kind_object`, reads the STATIC
-    // (`static_field_index_by_name` + `get_static_field`) and falls back to a
-    // synthetic one-field `WatchEvent$Kind` carrying the bit. Converting these
-    // to a `<clinit>` belongs with the `WatchService` work in that crate,
-    // which owns the surface and the layout — not here.
+    // The behaviour DOES have an owner and now has coverage: `native-io`'s
+    // `watch_event_kind_bit` / `watch_event_kind_object` read the class's
+    // STATIC (`static_field_index_by_name` + `get_static_field`) and fall back
+    // to a synthetic one-field `WatchEvent$Kind` carrying the bit. Do not
+    // re-add rows here: a `<clinit>` conversion belongs in the crate that owns
+    // the WatchService surface and its layout.
     //
-    // Left in place only because `vm/src/vm/tests.rs`'s `watch_event_kinds_p66`
-    // `call_native`s `ENTRY_CREATE`/`ENTRY_MODIFY` — and it asserts
-    // `read_java_string(...) == "ENTRY_CREATE"`, i.e. it does not merely keep a
-    // dead row alive, it pins the wrong TYPE as correct. The paired deletion is
-    // nominated so the two land together.
-    let swek = "java/nio/file/StandardWatchEventKinds";
-    r.register(
-        swek,
-        "ENTRY_CREATE",
-        "Ljava/nio/file/WatchEvent$Kind;",
-        |ctx, _args| {
-            let s = ctx.create_string("ENTRY_CREATE");
-            Ok(Some(Value::Object(Some(s))))
-        },
-    );
-    r.register(
-        swek,
-        "ENTRY_MODIFY",
-        "Ljava/nio/file/WatchEvent$Kind;",
-        |ctx, _args| {
-            let s = ctx.create_string("ENTRY_MODIFY");
-            Ok(Some(Value::Object(Some(s))))
-        },
-    );
-    r.register(
-        swek,
-        "ENTRY_DELETE",
-        "Ljava/nio/file/WatchEvent$Kind;",
-        |ctx, _args| {
-            let s = ctx.create_string("ENTRY_DELETE");
-            Ok(Some(Value::Object(Some(s))))
-        },
-    );
-    r.register(
-        swek,
-        "OVERFLOW",
-        "Ljava/nio/file/WatchEvent$Kind;",
-        |ctx, _args| {
-            let s = ctx.create_string("OVERFLOW");
-            Ok(Some(Value::Object(Some(s))))
-        },
-    );
+    // The registrar itself is kept (it is called from `phases_late.rs`) so the
+    // history above stays attached to the name a future author will search
+    // for. If it is ever deleted, move this comment, not just the call.
 
     r.set_category(__prev_cat);
 }
@@ -20221,7 +20187,13 @@ pub(crate) fn register_p70_file_attributes(r: &mut NativeMethodRegistry) {
 mod e36_enum_constant_tests {
     use super::*;
     use crate::test_utils::MockNativeContext;
-    use cratonvm_native_api::FieldMetadata;
+    // The accessor traits must be in scope for `get_field` /
+    // `ensure_class_initialized` / `read_string` to resolve on the mock.
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{
+        FieldMetadata, NativeClassAccess, NativeContext, NativeExceptionAccess, NativeHeapAccess,
+        NativeSystemAccess,
+    };
 
     /// Declare `class_name`'s statics at slots `0..n` so
     /// `set_static_field_by_name` has something to resolve. The mock's

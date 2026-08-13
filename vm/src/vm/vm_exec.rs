@@ -20789,8 +20789,71 @@ pub(super) fn proxy_resolve_declaring_class_mirror(
 /// `Method.invoke`/reflection unbox throws `IllegalArgumentException: cannot
 /// convert java/lang/Integer to Z` (e.g. `Connection.setAutoCommit(boolean)`
 /// through Hibernate's `JdbcSpies` proxy — 17 CV-only suite classes).
+///
+/// # Identity, and the one arm that has an observable contract
+///
+/// This is the FOURTH independent boxing implementation in the tree
+/// (`lang_class::box_value`, `lang_class::box_value_canonical`,
+/// `lib.rs::native_array_get`, and this) — and it is not even the only one
+/// that boxes a PROXY's arguments. `classloading/src/proxy_gen.rs` emits a
+/// real `X.valueOf` `invokestatic` per parameter into every generated
+/// `$ProxyN` (see its `DescKind::Int` / `Long` / `Float` / `Double` arms), so
+/// that path is canonical by construction: it does not implement boxing, it
+/// delegates to Java. Which of the two answers is a ROUTE question, not a
+/// code-reading one — `is_proxy_dispatch` in
+/// `runtime/interpreter/invoke.rs` and the `class_chain_reaches_proxy_instance`
+/// check above intercept ANY receiver whose chain reaches
+/// `java/lang/reflect/Proxy`, which includes a real generated `$ProxyN`, and
+/// they fire before that class's own bytecode runs. So on the interpreted path
+/// this function is expected to be the live one and the emitted `valueOf`
+/// calls unreached, but that has NOT been run and is not asserted here.
+/// `RJdkReflBox --only=proxy` is the discriminator: it is red on the fresh
+/// route and green on either correct one.
+///
+/// Measured on Microsoft OpenJDK 25.0.3+9
+/// (`scratchpad/f19/ReflBoxOracle.java`, §2 of
+/// `docs/known-issues/jdk-only/F19-1-*.md`), a JDK dynamic proxy's `args[]`
+/// holds the CANONICAL wrapper on every primitive parameter type:
+///
+/// ```text
+/// proxy.int  proxy.char  proxy.bool  proxy.long  proxy.byte  proxy.short = true
+/// proxy.boolTRUE                                                         = true
+/// proxyoob.int1000                                                       = false
+/// ```
+///
+/// because HotSpot's generated proxy class boxes each argument with a
+/// `valueOf` invocation in its own bytecode. Everything here allocates
+/// unconditionally instead, so every one of those rows is `false` on this VM.
+///
+/// **The `Z` arm is the one that is not merely an allocation.** `alloc_object`
+/// + `set_field(0, …)` produces a `Boolean` that is not `Boolean.TRUE`, and
+/// `fFeatures.get(…) == Boolean.TRUE` is exactly the identity test
+/// `native_boolean_value_of`'s own comment documents for Xerces'
+/// `XML11Configuration.configurePipeline()`. The documentation of that bug and
+/// a live instance of it coexisted in this tree: the native was fixed, this
+/// copy one layer up was not, and nothing connects the two files. So the `Z`
+/// arm now resolves the real `Boolean.TRUE`/`FALSE` statics, the same way the
+/// native does — see [`proxy_canonical_boolean`].
+///
+/// The other five arms (`C B S I`, and `J` via [`proxy_box_value`]) are still
+/// fresh. Their canonical instances live in `lang_math`'s process-global
+/// caches, which are `pub(crate)` to `cratonvm-native-builtins` and reachable
+/// only through a `&mut dyn NativeContext` — which this function does not have
+/// and cannot get without changing both call sites' signatures. Minting a
+/// cache HERE would make this the fifth boxing implementation and the second
+/// `IntegerCache`, so it is a NOMINATION (F19-1 N1), not a local fix.
 pub(super) fn proxy_box_value_for_desc(shared: &SharedVm, value: Value, pdesc: &str) -> Value {
     if let Value::Int(v) = value {
+        // `Z` before the generic wrapper table: a `boolean` argument has a
+        // canonical answer and the table below cannot produce it.
+        if pdesc == "Z" {
+            if let Some(canonical) = proxy_canonical_boolean(shared, v != 0) {
+                return canonical;
+            }
+            // Fall through to the allocating path — never to `null`. A boxing
+            // failure that becomes a null argument is a defect already
+            // recorded above `lang_class::create_method_object`.
+        }
         let wrapper = match pdesc {
             "Z" => Some("java/lang/Boolean"),
             "C" => Some("java/lang/Character"),
@@ -20800,6 +20863,16 @@ pub(super) fn proxy_box_value_for_desc(shared: &SharedVm, value: Value, pdesc: &
             _ => None,
         };
         if let Some(wname) = wrapper {
+            // Normalise the payload for `Z`. The raw slot can carry any
+            // non-zero int, and a `Boolean` whose slot holds 5 is a wrong
+            // ANSWER, not just a wrong identity: `booleanValue()` and every
+            // `Boolean.toString` path read that slot. `native_boolean_value_of`
+            // applies the same `val != 0` normalisation.
+            let stored = if pdesc == "Z" {
+                Value::Int(i32::from(v != 0))
+            } else {
+                Value::Int(v)
+            };
             let class_id = shared
                 .classes
                 .class_manager
@@ -20807,12 +20880,68 @@ pub(super) fn proxy_box_value_for_desc(shared: &SharedVm, value: Value, pdesc: &
                 .load_class(wname)
                 .unwrap_or(ClassId::new(0));
             let obj = shared.mem.heap.alloc_object(class_id, 1);
-            shared.mem.heap.set_field(obj, 0, Value::Int(v));
+            shared.mem.heap.set_field(obj, 0, stored);
             return Value::Object(Some(obj));
         }
     }
     // Long/Float/Double and reference values: descriptor-independent.
     proxy_box_value(shared, value)
+}
+
+/// The live `java.lang.Boolean.TRUE` / `FALSE` instance, or `None`.
+///
+/// `Boolean.valueOf(boolean)` is literally `return b ? TRUE : FALSE` in the
+/// JDK, so those two static fields — not a private mirror of them — ARE the
+/// canonical instances. `native_boolean_value_of` resolves them exactly this
+/// way; this is the same resolution on the `&SharedVm` side of the boundary,
+/// because `vm_exec` cannot reach the native's `&mut dyn NativeContext`.
+///
+/// Returns `None`, never a fabricated object, when:
+///
+///   * `java/lang/Boolean` will not load (synthetic-JDK arms where the class
+///     is absent), or
+///   * the class is loaded but `<clinit>` has not run, so the static slot
+///     still holds its default rather than an object.
+///
+/// The second case is why the value is match-checked for `Object(Some(_))`
+/// instead of being unwrapped: `get_static_shared`'s miss answer is
+/// `Value::Int(0)`, and a caller that trusted it would put an `Int` into an
+/// `Object[]` slot. This function does not RUN `<clinit>` — it has no thread —
+/// which is correct as well as necessary: a proxy invocation is not a legal
+/// place to trigger class initialisation, and the caller's fallback is a
+/// perfectly valid `Boolean`, merely a non-canonical one.
+fn proxy_canonical_boolean(shared: &SharedVm, truthy: bool) -> Option<Value> {
+    let class_id = shared
+        .classes
+        .class_manager
+        .write()
+        .load_class("java/lang/Boolean")
+        .ok()?;
+    let want = if truthy { "TRUE" } else { "FALSE" };
+    // Static field INDEX, not slot: `get_static_shared` is indexed by position
+    // among the class's static fields only. Same walk as
+    // `NativeContext::static_field_index_by_name` above; the guard is dropped
+    // before `get_static_shared` reacquires anything.
+    let field_index = {
+        let cm = shared.classes.class_manager.read();
+        let class = cm.get_class(class_id)?;
+        let mut static_idx = 0usize;
+        let mut found: Option<usize> = None;
+        for f in &class.fields {
+            if f.is_static() {
+                if &*f.name == want {
+                    found = Some(static_idx);
+                    break;
+                }
+                static_idx += 1;
+            }
+        }
+        found?
+    };
+    match super::get_static_shared(shared, class_id, field_index) {
+        v @ Value::Object(Some(_)) => Some(v),
+        _ => None,
+    }
 }
 
 pub(super) fn proxy_box_value(shared: &SharedVm, value: Value) -> Value {
@@ -27623,6 +27752,119 @@ mod tests {
         let shared = test_shared();
         let boxed = proxy_box_value(&shared, Value::Object(None));
         assert_eq!(boxed, Value::Object(None));
+    }
+
+    // -----------------------------------------------------------------------
+    // proxy_box_value_for_desc — the `Z` arm.
+    //
+    // Measured on Microsoft OpenJDK 25.0.3+9 (scratchpad/f19/ReflBoxOracle):
+    // `proxy.boolTRUE` = true — an `InvocationHandler`'s `args[i]` for a
+    // `boolean` parameter IS `Boolean.TRUE`, because the generated proxy class
+    // boxes with a `valueOf` invocation. This VM allocated instead, which is
+    // the identity failure `native_boolean_value_of`'s own comment documents
+    // for Xerces' `XML11Configuration.configurePipeline()` — one layer up, in
+    // a file that cannot see that fix.
+    //
+    // The POSITIVE half (the returned object is the very object in
+    // `java.lang.Boolean.TRUE`) is not asserted here: it needs a bootstrapped
+    // `java/lang/Boolean` whose `<clinit>` has run, which a `SharedVm::new`
+    // test fixture does not have. It is asserted end-to-end instead, by
+    // `regression-suite/src/RJdkReflBox.java`'s `proxy.boolTRUE` row against
+    // the HotSpot oracle. What IS asserted here is the half a running VM
+    // cannot easily show: that the fallback stays a valid `Boolean` and never
+    // becomes `null`, and that the arm is still WIRED to the canonical route.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn a_boolean_proxy_arg_is_never_null_even_with_no_canonical_instance() {
+        // `test_shared()` has no initialised `java/lang/Boolean`, so
+        // `proxy_canonical_boolean` answers `None` and the allocating path is
+        // taken. The contract that must survive that is "still an object":
+        // mapping a boxing miss onto `Value::Object(None)` would put a null
+        // into an `Object[]` argument slot, which is the defect already
+        // recorded above `lang_class::create_method_object`.
+        let shared = test_shared();
+        for raw in [0, 1] {
+            match proxy_box_value_for_desc(&shared, Value::Int(raw), "Z") {
+                Value::Object(Some(_)) => {}
+                other => panic!("Z arg boxed to {other:?}, which is not an object"),
+            }
+        }
+    }
+
+    #[test]
+    fn a_boolean_proxy_arg_carries_0_or_1_and_never_the_raw_slot() {
+        // Not an identity question: the raw slot can hold any non-zero int,
+        // and a `Boolean` carrying 5 is a wrong ANSWER — `booleanValue()` and
+        // every `toString` path read that slot. `native_boolean_value_of`
+        // normalises with the same `val != 0`. Holds on both routes: a
+        // canonical `Boolean.TRUE` carries 1 by construction, and the
+        // fallback now normalises before storing.
+        let shared = test_shared();
+        for (raw, want) in [(0, 0), (1, 1), (5, 1), (-1, 1), (i32::MIN, 1)] {
+            let obj = match proxy_box_value_for_desc(&shared, Value::Int(raw), "Z") {
+                Value::Object(Some(o)) => o,
+                other => panic!("Z arg boxed to {other:?}"),
+            };
+            assert_eq!(
+                shared.mem.heap.get_field(obj, 0),
+                Value::Int(want),
+                "a boolean argument whose raw slot held {raw} must box to \
+                 {want}, not to the slot verbatim"
+            );
+        }
+        // The contrast that keeps the normalisation from over-reaching: an
+        // `int` parameter carrying 5 is still 5.
+        let obj = match proxy_box_value_for_desc(&shared, Value::Int(5), "I") {
+            Value::Object(Some(o)) => o,
+            other => panic!("I arg boxed to {other:?}"),
+        };
+        assert_eq!(shared.mem.heap.get_field(obj, 0), Value::Int(5));
+    }
+
+    #[test]
+    fn the_boolean_proxy_arm_still_routes_through_the_canonical_resolver() {
+        // A SOURCE WITNESS, because the two behavioural tests above pass
+        // unchanged if the `Z` arm is reverted to a plain `alloc_object` —
+        // the fallback they exercise IS that code. Only this test can see the
+        // difference between "the canonical route was tried and missed" and
+        // "there is no canonical route".
+        //
+        // The needles are assembled with `format!` at runtime: spelled as
+        // literals they would match this test's own source text and assert
+        // nothing, since the file being searched is this file. The `\r` strip
+        // is load-bearing on a CRLF checkout.
+        // Whitespace is stripped before matching: every needle below is part
+        // of a method chain or a signature that rustfmt is free to re-wrap,
+        // and a witness that breaks on a reformat is a witness that gets
+        // deleted rather than fixed.
+        let src = include_str!("vm_exec.rs");
+        let squashed: String = src.chars().filter(|c| !c.is_whitespace()).collect();
+        let resolver = format!("proxy_canonical_{}", "boolean");
+        for (needle, why) in [
+            (
+                format!("fn{resolver}(shared:&SharedVm,truthy:bool)"),
+                "the canonical Boolean resolver is gone, so a proxy's boolean \
+                 argument can no longer be `Boolean.TRUE` (measured true on \
+                 HotSpot 25.0.3+9: proxy.boolTRUE)",
+            ),
+            (
+                format!("ifletSome(canonical)={resolver}(shared,v!=0)"),
+                "`proxy_box_value_for_desc`'s Z arm no longer consults the \
+                 resolver — it allocates a Boolean that `== Boolean.TRUE` \
+                 answers false for, the Xerces \
+                 `XML11Configuration.configurePipeline()` shape",
+            ),
+            (
+                format!(".load_class(\"java/lang/{}\").ok()?", "Boolean"),
+                "the resolver no longer reads `java/lang/Boolean`'s own \
+                 statics; `Boolean.valueOf` is `return b ? TRUE : FALSE`, so \
+                 those two fields ARE the canonical instances and a private \
+                 mirror of them is not",
+            ),
+        ] {
+            assert!(squashed.contains(&needle), "{why} (`{needle}` is gone)");
+        }
     }
 
     // -----------------------------------------------------------------------

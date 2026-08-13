@@ -2804,6 +2804,28 @@ pub trait NativeHeapAccess: NativeInvokeAccess {
     /// objects): stores the units in a plain `char[]` at field 0 via the
     /// generic array/field primitives. The VM override replaces this with
     /// the exact compact-string layout used by every other String natively.
+    ///
+    /// # This IS the lossless String writer — there is no missing primitive
+    ///
+    /// `create_string`/`create_string_uninterned`/`create_string_uninterned_gc_safe`
+    /// all take a `&str`, and a Rust `str` cannot hold an unpaired UTF-16
+    /// surrogate — so a native that reads a Java `String` losslessly and then
+    /// hands the units to any of those has thrown the surrogate away at the
+    /// LAST step. The recurring conclusion from that is "`NativeContext` needs
+    /// a `create_string_from_utf16`". It does not: `new_object("java/lang/
+    /// String")` followed by this method is that constructor, it is what the
+    /// `String(char[])` / `String(char[], int, int)` overrides already use, and
+    /// on the VM it lands in the same `populate_java_string_fields` that
+    /// `create_java_string_from_units` uses — the one place that decides a
+    /// compact `String`'s coder and byte order.
+    ///
+    /// `native-builtins`' `lang_string::sb_string_from_units` packages the pair
+    /// (plus the GC pin and the well-formed fast path) into a single call, and
+    /// is what every `String`-returning native in that file should end in.
+    ///
+    /// A third spelling of the same construction would be a second encoding of
+    /// one concept, reconciled only where the bytes are consumed. Extend or
+    /// re-route this one instead.
     fn init_string_from_units(&mut self, this: ObjectRef, units: &[u16]) -> bool {
         let arr = self.new_array(ArrayElementType::Char, units.len());
         for (i, &u) in units.iter().enumerate() {

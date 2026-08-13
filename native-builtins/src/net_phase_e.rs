@@ -7889,6 +7889,74 @@ fn https_not_yet_open(ctx: &mut dyn NativeContext) -> MethodCallFailed {
     }
 }
 
+/// The value BOTH HTTPS-client `SSLSession` minters write into
+/// `ssl_security::NEW13_SESS_TLSID` — a **presence marker, never a lookup
+/// key**.
+///
+/// F10. This slot used to hold `Int(-1)` on both of them, and `-1` is the
+/// "never negotiated" sentinel: `t27_tls::session_has_negotiated` reads exactly
+/// this slot and answers `slot2 >= 0`. Both minters are reached only from a
+/// handshake that **completed**, so `-1` asserted the opposite of the truth.
+/// While `session_has_negotiated`'s width-4 case fell into a catch-all
+/// `_ => true` the lie was invisible; F6 merged that arm onto `3 | 4` — the
+/// correct fix — and the lie became the answer. MEASURED, HotSpot 25.0.3+9-LTS
+/// `Microsoft-13877124`, loopback `HttpsServer` + `HttpsURLConnection`, three
+/// byte-identical runs (`scratchpad/f10/F10HttpsSession.java`):
+///
+/// ```text
+///   completed HTTPS handshake   isValid=true  idLen=32 cipher=TLS_AES_256_GCM_SHA384 proto=TLSv1.3
+///   never-connected SSLSocket   isValid=false idLen=0  cipher=SSL_NULL_WITH_NULL_NULL proto=NONE
+/// ```
+///
+/// **Why a marker and not a real id.** The preferred fix is to register the
+/// connection in the `servlet` TLS id space and write
+/// `RUSTLS_SOCK_ID_BASE + stream_id`, as `t27_tls`'s `SSLServerSocket.accept`
+/// does. That is not available here, and not merely because it is invasive:
+/// this connection's rustls state is a `StreamOwned<ClientConnection,
+/// TcpStream>` local to `http_url_connection::perform`, which **drops it before
+/// any of these accessors run** — `https_session_object` is called from
+/// `getSSLSession()`/`getPeerPrincipal()`/... long after `perform` returned, so
+/// at that moment there is no stream to register. Registering the still-live
+/// one from inside `huc_verify_hostname` would insert an entry that the HTTP
+/// exchange then closes locally and that nothing ever removes (`s2_tls_close`
+/// is the only remover, and it is never called for this stream): one leaked
+/// registry entry per HTTPS request, each permanently answering "this stream is
+/// alive". That trades a wrong boolean for an unbounded leak.
+///
+/// **Why THIS value, and why it is load-bearing.** Slot 2 is read as a lookup
+/// key by registrations that are LIVE in real-JDK mode — in particular
+/// `phases_late::ssl_security`'s `SSLSession.getPeerPrincipal`, which
+/// `s2_tls_peer_cert_chain_der(tls_id)`s it (E22-1 §1's `--dump-native-registry`
+/// table: `getPeerPrincipal` is owned by `ssl_security`, not `t27_tls`). So a
+/// marker that could ever equal a live TLS stream id would hand one connection
+/// **another connection's peer certificate chain** — a far worse failure than
+/// the one being fixed. This value sits outside every id range in
+/// `servlet.rs`: below `PENDING_CONNECT_SOCK_ID_BASE` (`0x1000_0000`),
+/// `PENDING_LAYERED_SOCK_ID_BASE` (`0x2000_0000`) and `RUSTLS_SOCK_ID_BASE`
+/// (`0x4000_0000`), and far above the small monotonic counter `s2_next_free_id`
+/// hands out, so `s2_tls_session_info`/`s2_tls_peer_cert_chain_der` on it are
+/// plain `HashMap` misses. It continues those three constants' halving
+/// sequence and rests on the identical, already load-bearing assumption they
+/// state: *"native-tls and rustls ids are small counters, so the high offset
+/// never collides."*
+///
+/// **What a miss costs, stated rather than assumed:** nothing changes
+/// direction. With `-1` those readers skipped the lookup and used an empty
+/// chain; with this marker they perform the lookup, miss, and use an empty
+/// chain. Same answer, same exception, for a reason that is now written down.
+/// (That answer is itself wrong for a completed handshake — HotSpot measures
+/// `getPeerPrincipal() == CN=localhost` — but it is wrong identically before
+/// and after this change; see this file's F10 record, NOMINATION 2.)
+///
+/// **Deliberately ONE constant rather than a per-connection counter.**
+/// `getId()`'s bytes do not come from this slot in either mode — `t27_tls`'s
+/// real-mode copy seeds from `gc_stable_objref_key(session)` and `tls.rs`'s
+/// `--synthetic-jdk` copy from `identity_hash_code(session)` — so per-session
+/// distinctness is already carried by the session object's identity, and
+/// varying this value would buy nothing while re-opening the collision surface
+/// the paragraph above closes.
+pub(crate) const HTTPS_CLIENT_SESSION_MARKER: i32 = 0x0800_0000;
+
 /// Materialise the recorded handshake as the same synthetic
 /// `javax/net/ssl/SSLSession` shape the hostname-verifier path builds, so the
 /// layout-aware accessors already registered in
@@ -7926,14 +7994,18 @@ fn https_session_object(
         crate::phases_late::ssl_security::NEW13_SESS_CIPHER,
         Value::Object(Some(cipher_s)),
     );
-    // -1: this connection owned its rustls state inside `perform` and was never
-    // registered in the `servlet` TLS id space, so there is no id to record.
-    // Every accessor that would consult it already tolerates a miss. Same value
-    // and same reason as `huc_verify_hostname`'s session.
+    // This session's handshake COMPLETED — `https_carrier_session` only has an
+    // entry because `record_https_carrier_session` was called from the far side
+    // of a successful TLS handshake — so slot 2 must not carry the "never
+    // negotiated" sentinel. See `HTTPS_CLIENT_SESSION_MARKER` for the measured
+    // contract, for why this connection cannot be given a real `servlet` TLS id,
+    // and for why the marker's numeric value is not free to choose. Same value
+    // and same reason as `http_url_connection::huc_verify_hostname`'s session:
+    // the two minters share the constant so they cannot drift apart.
     ctx.set_field(
         session,
         crate::phases_late::ssl_security::NEW13_SESS_TLSID,
-        Value::Int(-1),
+        Value::Int(HTTPS_CLIENT_SESSION_MARKER),
     );
     let session = ctx.read_native_pin(session_pin, session0);
     crate::t27_tls::record_client_peer_chain(ctx, session, s.peer_chain_der.clone());

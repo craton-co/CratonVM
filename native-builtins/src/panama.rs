@@ -9,10 +9,14 @@ use cratonvm_types::{ObjectRef, Value};
 
 use crate::{try_alloc_concurrent_synthetic, obj_arg};
 
+// `LAYOUT_PADDING`, `LAYOUT_SEQUENCE`, `LAYOUT_STRUCT` and `LAYOUT_UNION` are
+// NOT imported here any more (F16, 2026-08-13): the group-layout family moved
+// wholesale to `phases_late/foreign_ffm.rs`, which does not tag a layout with a
+// kind at all, so this file's last uses of the four compound tags are in its
+// own `#[cfg(test)]` module — which imports them itself.
 use cratonvm_native_api::ffi::{
     self, LAYOUT_ADDRESS, LAYOUT_BOOLEAN, LAYOUT_BYTE, LAYOUT_CHAR, LAYOUT_DOUBLE, LAYOUT_FLOAT,
-    LAYOUT_INT, LAYOUT_LONG, LAYOUT_PADDING, LAYOUT_SEQUENCE, LAYOUT_SHORT, LAYOUT_STRUCT,
-    LAYOUT_UNION,
+    LAYOUT_INT, LAYOUT_LONG, LAYOUT_SHORT,
 };
 
 /// Maximum number of bytes for a single memory copy/fill operation.
@@ -298,11 +302,29 @@ pub(crate) fn register_pe_panama(registry: &mut NativeMethodRegistry) {
 }
 
 // --- ValueLayout: type descriptors for native memory ---
-// ValueLayout synthetic: [0]=kind (Int), [1]=byteSize (Int)
-
+//
+// `pe_make_layout` IS A TEST FIXTURE AND NOTHING ELSE (F16, 2026-08-13).
+//
+// It is the last thing in this crate that builds the `[0]=Int(kind)` layout
+// object, and it is `#[cfg(test)]` so that it cannot become a second
+// production encoding again. The shipping encoding — the JDK's own
+// `[0]=Long(byteSize), [1]=Long(byteAlignment), …` — is minted only by
+// `phases_late/foreign_ffm.rs::p67_layout_object` and the four group-layout
+// factories beside it. See the banner in `register_pe_value_layout` below.
+//
+// The kind tag it writes is still MEANINGFUL to the downcall marshaller:
+// `panama_libffi::read_layout_kind` reads slot 0 as `Int(kind)` first and
+// falls back to resolving the layout's CLASS NAME when slot 0 is a `Long`,
+// which is how the shipping carriers are decoded. That fallback is why
+// deleting the production rows did not break the FFI path — but it is also a
+// reconciliation layer for two encodings that now has only one left to
+// reconcile, and it carries a `_ => LAYOUT_LONG` default that is wrong for the
+// real JDK's own `ValueLayouts$Of*Impl` class names. Nominated, not this
+// lane's file.
+#[cfg(test)]
 const PE_VALUE_LAYOUT_NAME_SLOT: usize = 2;
-const PE_P67_LAYOUT_NAME_SLOT: usize = 3;
 
+#[cfg(test)]
 fn pe_make_layout(ctx: &mut dyn NativeContext, kind: i32) -> Result<ObjectRef, MethodCallFailed> {
     let layout = try_alloc_concurrent_synthetic(ctx, "java/lang/foreign/ValueLayout", 3)?;
     ctx.set_field(layout, 0, Value::Int(kind));
@@ -311,190 +333,69 @@ fn pe_make_layout(ctx: &mut dyn NativeContext, kind: i32) -> Result<ObjectRef, M
     Ok(layout)
 }
 
-fn pe_optional(ctx: &mut dyn NativeContext, value: Value) -> Result<ObjectRef, MethodCallFailed> {
-    let pinned = match value {
-        Value::Object(Some(obj)) => Some((ctx.pin_native_root(obj), obj)),
-        _ => None,
-    };
-    let opt = try_alloc_concurrent_synthetic(ctx, "java/util/Optional", 1)?;
-    let value = match pinned {
-        Some((pin, obj)) => {
-            let obj = ctx.read_native_pin(pin, obj);
-            ctx.unpin_native_roots(pin);
-            Value::Object(Some(obj))
-        }
-        None => Value::Object(None),
-    };
-    ctx.set_field(opt, 0, value);
-    Ok(opt)
-}
-
-fn pe_layout_name_value(ctx: &dyn NativeContext, layout: ObjectRef) -> Value {
-    match ctx.get_field(layout, 0) {
-        Value::Long(_) => {
-            if ctx.object_num_fields(layout) > PE_P67_LAYOUT_NAME_SLOT {
-                ctx.get_field(layout, PE_P67_LAYOUT_NAME_SLOT)
-            } else {
-                Value::Object(None)
-            }
-        }
-        _ => {
-            if ctx.object_num_fields(layout) > PE_VALUE_LAYOUT_NAME_SLOT {
-                ctx.get_field(layout, PE_VALUE_LAYOUT_NAME_SLOT)
-            } else {
-                Value::Object(None)
-            }
-        }
-    }
-}
-
-fn pe_layout_name(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = obj_arg(args, 0)?;
-    let name = pe_layout_name_value(ctx, this);
-    Ok(Some(Value::Object(Some(pe_optional(ctx, name)?))))
-}
-
-fn pe_layout_with_name(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = obj_arg(args, 0)?;
-    let name = args.get(1).copied().unwrap_or(Value::Object(None));
-    let class_name = ctx
-        .class_name_of_id(ctx.class_id_of_object(this))
-        .unwrap_or_else(|| "java/lang/foreign/MemoryLayout".to_string());
-    let field_count = ctx.object_num_fields(this);
-    let name_slot = match ctx.get_field(this, 0) {
-        Value::Long(_) => PE_P67_LAYOUT_NAME_SLOT,
-        _ => PE_VALUE_LAYOUT_NAME_SLOT,
-    };
-    let clone_fields = std::cmp::max(field_count, name_slot + 1);
-    let this_pin = ctx.pin_native_root(this);
-    let name_pin = match name {
-        Value::Object(Some(obj)) => Some((ctx.pin_native_root(obj), obj)),
-        _ => None,
-    };
-
-    let cloned = try_alloc_concurrent_synthetic(ctx, &class_name, clone_fields)?;
-    let this = ctx.read_native_pin(this_pin, this);
-    for i in 0..field_count {
-        let value = ctx.get_field(this, i);
-        ctx.set_field(cloned, i, value);
-    }
-    let name = match name_pin {
-        Some((pin, obj)) => {
-            let obj = ctx.read_native_pin(pin, obj);
-            ctx.unpin_native_roots(pin);
-            Value::Object(Some(obj))
-        }
-        None => Value::Object(None),
-    };
-    ctx.set_field(cloned, name_slot, name);
-    ctx.unpin_native_roots(this_pin);
-    Ok(Some(Value::Object(Some(cloned))))
-}
-
 fn register_pe_value_layout(r: &mut NativeMethodRegistry) {
     let vl = "java/lang/foreign/ValueLayout";
 
-    // Static factory fields — return pre-built layout objects
-    r.register(
-        vl,
-        "JAVA_BYTE",
-        "()Ljava/lang/foreign/ValueLayout;",
-        |ctx, _| Ok(Some(Value::Object(Some(pe_make_layout(ctx, LAYOUT_BYTE)?)))),
-    );
-    r.register(
-        vl,
-        "JAVA_SHORT",
-        "()Ljava/lang/foreign/ValueLayout;",
-        |ctx, _| Ok(Some(Value::Object(Some(pe_make_layout(ctx, LAYOUT_SHORT)?)))),
-    );
-    r.register(
-        vl,
-        "JAVA_INT",
-        "()Ljava/lang/foreign/ValueLayout;",
-        |ctx, _| Ok(Some(Value::Object(Some(pe_make_layout(ctx, LAYOUT_INT)?)))),
-    );
-    r.register(
-        vl,
-        "JAVA_LONG",
-        "()Ljava/lang/foreign/ValueLayout;",
-        |ctx, _| Ok(Some(Value::Object(Some(pe_make_layout(ctx, LAYOUT_LONG)?)))),
-    );
-    r.register(
-        vl,
-        "JAVA_FLOAT",
-        "()Ljava/lang/foreign/ValueLayout;",
-        |ctx, _| Ok(Some(Value::Object(Some(pe_make_layout(ctx, LAYOUT_FLOAT)?)))),
-    );
-    r.register(
-        vl,
-        "JAVA_DOUBLE",
-        "()Ljava/lang/foreign/ValueLayout;",
-        |ctx, _| {
-            Ok(Some(Value::Object(Some(pe_make_layout(
-                ctx,
-                LAYOUT_DOUBLE,
-            )?))))
-        },
-    );
-    r.register(
-        vl,
-        "JAVA_BOOLEAN",
-        "()Ljava/lang/foreign/ValueLayout;",
-        |ctx, _| {
-            Ok(Some(Value::Object(Some(pe_make_layout(
-                ctx,
-                LAYOUT_BOOLEAN,
-            )?))))
-        },
-    );
-    r.register(
-        vl,
-        "JAVA_CHAR",
-        "()Ljava/lang/foreign/ValueLayout;",
-        |ctx, _| Ok(Some(Value::Object(Some(pe_make_layout(ctx, LAYOUT_CHAR)?)))),
-    );
-    r.register(
-        vl,
-        "ADDRESS",
-        "()Ljava/lang/foreign/ValueLayout;",
-        |ctx, _| {
-            Ok(Some(Value::Object(Some(pe_make_layout(
-                ctx,
-                LAYOUT_ADDRESS,
-            )?))))
-        },
-    );
-
-    r.register(vl, "byteSize", "()J", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let size = match ctx.get_field(this, 1) {
-            Value::Int(n) => n as i64,
-            _ => 1,
-        };
-        Ok(Some(Value::Long(size)))
-    });
-    r.register(vl, "byteAlignment", "()J", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let size = match ctx.get_field(this, 1) {
-            Value::Int(n) => n as i64,
-            _ => 1,
-        };
-        Ok(Some(Value::Long(size))) // alignment = size for primitive layouts
-    });
-    r.register(vl, "name", "()Ljava/util/Optional;", pe_layout_name);
-    r.register(
-        vl,
-        "withName",
-        "(Ljava/lang/String;)Ljava/lang/foreign/ValueLayout;",
-        pe_layout_with_name,
-    );
-    r.register(
-        vl,
-        "withName",
-        "(Ljava/lang/String;)Ljava/lang/foreign/MemoryLayout;",
-        pe_layout_with_name,
-    );
-    ()
+    // NINE ROWS WERE DELETED HERE, AND THE SIX BELOW THEM WITH THEM
+    // (F16, 2026-08-13). What stood here was:
+    //
+    //     r.register(vl, "JAVA_BYTE",  "()Ljava/lang/foreign/ValueLayout;", …)
+    //     r.register(vl, "JAVA_SHORT", "()Ljava/lang/foreign/ValueLayout;", …)
+    //     … JAVA_INT, JAVA_LONG, JAVA_FLOAT, JAVA_DOUBLE, JAVA_BOOLEAN,
+    //     … JAVA_CHAR, ADDRESS
+    //
+    // each answering a `pe_make_layout` object, plus `byteSize`,
+    // `byteAlignment`, `name` and two `withName` overloads reading it.
+    //
+    // TWO THINGS WERE WRONG WITH THEM, AND THE SECOND IS THE ONE THAT
+    // MATTERED.
+    //
+    // 1. The descriptor is fabricated. These are FIELDS, not methods, and
+    //    `()Ljava/lang/foreign/ValueLayout;` appears nowhere in JDK 25:
+    //
+    //      $ javap -p java.lang.foreign.ValueLayout      # 25.0.3+9-LTS
+    //        public static final java.lang.foreign.ValueLayout$OfInt JAVA_INT;
+    //      $ javap -c F16Desc   # static Object e(){ return ValueLayout.JAVA_INT; }
+    //        0: getstatic Field java/lang/foreign/ValueLayout.JAVA_INT:
+    //                          Ljava/lang/foreign/ValueLayout$OfInt;
+    //
+    //    No classfile can reach these rows. Only a Rust-side `call_native`
+    //    could, and `vm/src/vm/tests.rs` was the only caller.
+    //
+    // 2. They were a SECOND MINTER FOR A SECOND ENCODING. `pe_make_layout`
+    //    built a 3-slot object whose slot 0 is `Int(kind)`;
+    //    `phases_late/foreign_ffm.rs::p67_layout_object` builds the JDK-shaped
+    //    4-slot `[byteSize, byteAlignment, …, name]`. Both were registered,
+    //    under different keys, so neither shadowed the other — and every
+    //    group-layout consumer decoded slot 0 as `Int(kind)` with a `_ => 0`
+    //    fallback. `LAYOUT_BYTE == 0`, so a 4-slot layout arriving at
+    //    `sequenceLayout(10, JAVA_INT)` answered 10 instead of 40. A defaulting
+    //    reader turning a wrong type into a plausible number is exactly the
+    //    shape that stays invisible until something returns it to Java.
+    //
+    // The 4-slot encoding won, because it is the JDK's own: a real
+    // `jdk.internal.foreign.layout.AbstractLayout` declares `byteSize` then
+    // `byteAlignment` then `name`, so slots 0 and 1 read the same on a real
+    // JDK object and on a CratonVM carrier. `foreign_ffm.rs` now owns the
+    // whole family, in both JDK modes, and is reachable the way the JDK is:
+    // its `<clinit>` row populates the real static fields, so a plain
+    // `getstatic ValueLayout.JAVA_INT` finds an object.
+    //
+    // The replacements, all in `foreign_ffm.rs::register_p67_foreign_memory`:
+    //   * the nine constants — the `$Of*`/`AddressLayout` FIELD rows, plus
+    //     `<clinit>`, which also covers the seven `_UNALIGNED` fields these
+    //     never had;
+    //   * `byteSize` / `byteAlignment` / `name` / `withName` on
+    //     `java/lang/foreign/ValueLayout` and on every `$Of*` class.
+    //
+    // DO NOT RE-ADD A LAYOUT FACTORY HERE. `register_pe_panama` runs AFTER
+    // `register_p67_foreign_memory` (lib.rs: `register_phase67_natives` at
+    // :24121, `register_pe_panama` at :24181, both inside
+    // `register_synthetic_overrides`), so a row added here silently REPLACES
+    // the JDK-true one for every synthetic-JDK run while leaving real-JDK mode
+    // — which never calls `register_pe_panama` at all — on the other body.
+    // That divergence-by-registration-order is what this deletion removes.
+    let _ = vl;
 }
 
 // --- Arena: lifecycle-scoped memory management ---
@@ -580,11 +481,22 @@ pub(crate) fn register_pe_arena(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let this = obj_arg(args, 0)?;
             let layout = obj_arg(args, 1)?;
-            let size = match ctx.get_field(layout, 1) {
-                Value::Int(n) => n as i64,
-                _ => 1,
-            };
-            pe_arena_allocate_impl(ctx, this, size, size)
+            // This read WAS `match ctx.get_field(layout, 1) { Value::Int(n) =>
+            // n as i64, _ => 1 }` — slot 1 as an `Int`, i.e. the deleted
+            // `[0]=Int(kind), [1]=Int(byteSize)` carrier (F16, 2026-08-13).
+            // Every layout that reaches it now carries `Long(byteAlignment)`
+            // there, so the `Int` arm never matched and the `_ => 1` default
+            // took over: `arena.allocate(ValueLayout.JAVA_LONG)` reserved ONE
+            // byte for an eight-byte value, and the caller got a segment that
+            // passes its own bounds check at every offset it will then write.
+            // A defaulting reader is not a safe reader when what it feeds is
+            // an allocation size.
+            //
+            // It now uses the same two accessors as the rest of the family, so
+            // there is one definition of "how big is this layout".
+            let size = crate::phases_late::foreign_ffm::p67_layout_size_of(ctx, layout);
+            let align = crate::phases_late::foreign_ffm::p67_layout_align_of(ctx, layout);
+            pe_arena_allocate_impl(ctx, this, size, align)
         },
     );
     // allocate(MemoryLayout) uses the interface descriptor emitted for
@@ -596,8 +508,23 @@ pub(crate) fn register_pe_arena(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let this = obj_arg(args, 0)?;
             let layout = obj_arg(args, 1)?;
-            let size = crate::panama_libffi::layout_total_size(ctx, layout)? as i64;
-            let align = crate::panama_libffi::layout_align(ctx, layout) as i64;
+            // `panama_libffi::layout_total_size` / `layout_align` CANNOT SIZE A
+            // GROUP LAYOUT ANY MORE, and could not size the one real-JDK mode
+            // has always had (F16, 2026-08-13). Both start from
+            // `read_layout_kind`, which resolves a `Long`-slot-0 carrier by
+            // CLASS NAME against a list of the nine `ValueLayout$Of*` spellings
+            // only. `java/lang/foreign/StructLayout` is not on that list, so it
+            // fell to `_ => LAYOUT_LONG` — a struct of any size was allocated
+            // EIGHT BYTES, at alignment 8.
+            //
+            // That was already true for every `--jdk-only` run, because
+            // `register_pe_panama` never executes there and the layout in hand
+            // has always been `foreign_ffm.rs`'s. It only looked correct under
+            // synthetic-JDK, where the kind-tagged carrier happened to answer.
+            // Reading the layout's own recorded size and alignment is right in
+            // both modes and does not depend on a name list staying in sync.
+            let size = crate::phases_late::foreign_ffm::p67_layout_size_of(ctx, layout);
+            let align = crate::phases_late::foreign_ffm::p67_layout_align_of(ctx, layout);
             pe_arena_allocate_impl(ctx, this, size, align)
         },
     );
@@ -2965,20 +2892,50 @@ pub(crate) fn pe_downcall_invoke(ctx: &mut dyn NativeContext, args: &[Value]) ->
                 // Struct/union/sequence return: copy the bytes into a
                 // freshly allocated MemorySegment via the global arena
                 // path. The Java caller will then read the segment.
-                let total = plf::layout_total_size(ctx, rl)?;
+                //
+                // Sized from the layout's own `byteSize`/`byteAlignment` and
+                // not from `plf::layout_total_size` — see the note at
+                // `Arena.allocate(MemoryLayout)`. `layout_total_size` answers 8
+                // for EVERY group layout (its `read_layout_kind` resolves a
+                // `Long`-slot-0 carrier by class name, and no GROUP class is on
+                // that list, so it defaults to `LAYOUT_LONG`), so a by-value
+                // struct return of any width got an 8-byte segment.
+                let total =
+                    crate::phases_late::foreign_ffm::p67_layout_size_of(ctx, rl).max(0) as usize;
+                let align =
+                    crate::phases_late::foreign_ffm::p67_layout_align_of(ctx, rl).max(1) as usize;
                 let (alloc_id, ptr) = ctx
-                    .allocate_native_memory(total, plf::layout_align(ctx, rl).max(8))
+                    .allocate_native_memory(total, align.max(8))
                     .ok_or_else(|| -> MethodCallFailed {
                         RuntimeError::OutOfMemoryError {
                             message: "Failed to allocate result MemorySegment".into(),
                         }
                         .into()
                     })?;
-                // SAFETY: ptr was just freshly allocated to `total`
-                // bytes; ret_slot has at least `total` bytes (we sized
-                // it that way for aggregate returns).
+                // THE COPY LENGTH IS CLAMPED TO `ret_slot`, DELIBERATELY.
+                //
+                // `ret_slot` is sized by `panama_libffi` using its OWN
+                // `layout_total_size` — the one corrected above — so while that
+                // function still answers 8 for a group layout, `total` here can
+                // legitimately exceed the buffer libffi actually wrote. Copying
+                // `total` bytes unconditionally would then read past the end of
+                // `ret_slot`: an out-of-bounds READ introduced by fixing the
+                // size on only one side of the pair.
+                //
+                // Clamping keeps this side correct (the segment reports the
+                // layout's real size, and the tail is the zeroed allocation)
+                // without reaching into a file this lane does not own. The
+                // matching fix — teach `layout_total_size`/`layout_align` to
+                // read `[0]=byteSize, [1]=byteAlignment` — is NOMINATED, and
+                // until it lands an aggregate return wider than 8 bytes is
+                // TRUNCATED rather than corrupt.
+                let copy_len = total.min(ret_slot.len());
+                // SAFETY: `ptr` was freshly allocated with `total >= copy_len`
+                // bytes, and `copy_len <= ret_slot.len()`, so both sides are in
+                // bounds. The regions cannot overlap — one is a fresh
+                // allocation.
                 unsafe {
-                    std::ptr::copy_nonoverlapping(ret_slot.as_ptr(), ptr, total);
+                    std::ptr::copy_nonoverlapping(ret_slot.as_ptr(), ptr, copy_len);
                 }
                 let seg = try_alloc_concurrent_synthetic(ctx, "java/lang/foreign/MemorySegment", 6)?;
                 ctx.set_field(seg, 0, Value::Long(ptr as i64));
@@ -3729,232 +3686,63 @@ fn pe_upcall_invoke(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     }
 }
 
-// --- StructLayout / UnionLayout / SequenceLayout ---
-// StructLayout synthetic: [0]=kind(LAYOUT_STRUCT), [1]=totalSize(Long), [2]=memberLayouts(array),
-//                          [3]=memberNames(array), [4]=memberOffsets(array), [5]=alignment(Long)
-
+// --- MemoryLayout$PathElement ---
+//
+// This registrar KEEPS ITS NAME and has lost its subject. The
+// StructLayout/UnionLayout/SequenceLayout family it was written for lives in
+// `phases_late/foreign_ffm.rs` now; what is left is the two path-element
+// factories, which have no twin there. The banner that used to sit here
+// described the deleted 6-slot `[kind, size, members, names, offsets, align]`
+// carrier — the authoritative one is 4-slot `[byteSize, byteAlignment,
+// payload, name]` and is documented at `foreign_ffm.rs::p67_member_size_align`.
 fn register_pe2_struct_layouts(r: &mut NativeMethodRegistry) {
     let ml = "java/lang/foreign/MemoryLayout";
 
-    // MemoryLayout.structLayout(members...) → StructLayout
-    r.register(
-        ml,
-        "structLayout",
-        "([Ljava/lang/foreign/MemoryLayout;)Ljava/lang/foreign/MemoryLayout;",
-        pe_struct_layout,
-    );
-    r.register(
-        ml,
-        "structLayout",
-        "([Ljava/lang/foreign/MemoryLayout;)Ljava/lang/foreign/StructLayout;",
-        pe_struct_layout,
-    );
-
-    // MemoryLayout.unionLayout(members...) → UnionLayout
-    r.register(
-        ml,
-        "unionLayout",
-        "([Ljava/lang/foreign/MemoryLayout;)Ljava/lang/foreign/MemoryLayout;",
-        pe_union_layout,
-    );
-    r.register(
-        ml,
-        "unionLayout",
-        "([Ljava/lang/foreign/MemoryLayout;)Ljava/lang/foreign/UnionLayout;",
-        pe_union_layout,
-    );
-
-    // MemoryLayout.sequenceLayout(count, element) → SequenceLayout
-    r.register(
-        ml,
-        "sequenceLayout",
-        "(JLjava/lang/foreign/MemoryLayout;)Ljava/lang/foreign/MemoryLayout;",
-        pe_sequence_layout,
-    );
-    r.register(
-        ml,
-        "sequenceLayout",
-        "(JLjava/lang/foreign/MemoryLayout;)Ljava/lang/foreign/SequenceLayout;",
-        pe_sequence_layout,
-    );
-
-    // MemoryLayout.paddingLayout(bytes) → PaddingLayout
-    r.register(
-        ml,
-        "paddingLayout",
-        "(J)Ljava/lang/foreign/MemoryLayout;",
-        |ctx, args| {
-            let bytes = match args.first() {
-                Some(Value::Long(n)) => *n,
-                _ => 0,
-            };
-            let layout = try_alloc_concurrent_synthetic(ctx, "java/lang/foreign/MemoryLayout", 6)?;
-            ctx.set_field(layout, 0, Value::Int(LAYOUT_PADDING));
-            ctx.set_field(layout, 1, Value::Long(bytes));
-            ctx.set_field(layout, 5, Value::Long(1)); // alignment=1
-            Ok(Some(Value::Object(Some(layout))))
-        },
-    );
-    r.register(
-        ml,
-        "paddingLayout",
-        "(J)Ljava/lang/foreign/PaddingLayout;",
-        |ctx, args| {
-            let bytes = match args.first() {
-                Some(Value::Long(n)) => *n,
-                _ => 0,
-            };
-            let layout = try_alloc_concurrent_synthetic(ctx, "java/lang/foreign/MemoryLayout", 6)?;
-            ctx.set_field(layout, 0, Value::Int(LAYOUT_PADDING));
-            ctx.set_field(layout, 1, Value::Long(bytes));
-            ctx.set_field(layout, 5, Value::Long(1)); // alignment=1
-            Ok(Some(Value::Object(Some(layout))))
-        },
-    );
-
-    // Common methods on all layouts
-    fn layout_members_as_list(ctx: &mut dyn NativeContext, members_arr: ObjectRef) -> Result<ObjectRef, MethodCallFailed> {
-        let len = ctx.array_length(members_arr);
-        let arr_pin = ctx.pin_native_root(members_arr);
-        let data_slot = ctx
-            .resolve_field_index("java/util/ArrayList", "elementData")
-            .unwrap_or(0);
-        let size_slot = ctx
-            .resolve_field_index("java/util/ArrayList", "size")
-            .unwrap_or(1);
-        let n_fields = std::cmp::max(data_slot, size_slot) + 1;
-        let list = try_alloc_concurrent_synthetic(ctx, "java/util/ArrayList", n_fields)?;
-        let members_arr = ctx.read_native_pin(arr_pin, members_arr);
-        ctx.set_field(list, data_slot, Value::Object(Some(members_arr)));
-        ctx.set_field(list, size_slot, Value::Int(len as i32));
-        ctx.unpin_native_roots(arr_pin);
-        Ok(list)
-    }
-
-    let sl = "java/lang/foreign/StructLayout";
-    for layout_class in [sl, "java/lang/foreign/GroupLayout"] {
-        r.register(layout_class, "byteSize", "()J", |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            let size = match ctx.get_field(this, 1) {
-                Value::Long(n) => n,
-                _ => 0,
-            };
-            Ok(Some(Value::Long(size)))
-        });
-        r.register(layout_class, "byteAlignment", "()J", |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            let align = match ctx.get_field(this, 5) {
-                Value::Long(n) => n,
-                _ => 1,
-            };
-            Ok(Some(Value::Long(align)))
-        });
-        r.register(
-            layout_class,
-            "name",
-            "()Ljava/util/Optional;",
-            pe_layout_name,
-        );
-        r.register(
-            layout_class,
-            "withName",
-            "(Ljava/lang/String;)Ljava/lang/foreign/MemoryLayout;",
-            pe_layout_with_name,
-        );
-        r.register(
-            layout_class,
-            "memberLayouts",
-            "()Ljava/util/List;",
-            |ctx, args| {
-                let this = obj_arg(args, 0)?;
-                match ctx.get_field(this, 2) {
-                    Value::Object(Some(members_arr)) => Ok(Some(Value::Object(Some(
-                        layout_members_as_list(ctx, members_arr)?,
-                    )))),
-                    _ => {
-                        let empty = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0);
-                        Ok(Some(Value::Object(Some(layout_members_as_list(
-                            ctx, empty,
-                        )?))))
-                    }
-                }
-            },
-        );
-    }
-
-    // byteOffset(PathElement...) — compute offset to a named field
-    r.register(
-        sl,
-        "byteOffset",
-        "([Ljava/lang/foreign/MemoryLayout$PathElement;)J",
-        |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            // Simple case: one path element = field name
-            if let Some(Value::Object(Some(path_arr))) = args.get(1) {
-                if ctx.array_length(*path_arr) > 0 {
-                    if let Value::Object(Some(pe)) = ctx.get_array_element(*path_arr, 0) {
-                        // PathElement stores the field name in field 0
-                        if let Value::Object(Some(name_ref)) = ctx.get_field(pe, 0) {
-                            let target_name = ctx.read_string(name_ref).unwrap_or_default();
-                            // Search member names and return corresponding offset
-                            if let Value::Object(Some(names_arr)) = ctx.get_field(this, 3) {
-                                if let Value::Object(Some(offsets_arr)) = ctx.get_field(this, 4) {
-                                    let count = ctx.array_length(names_arr);
-                                    for i in 0..count {
-                                        if let Value::Object(Some(n)) =
-                                            ctx.get_array_element(names_arr, i)
-                                        {
-                                            if ctx.read_string(n).as_deref() == Some(&target_name) {
-                                                if let Value::Long(off) =
-                                                    ctx.get_array_element(offsets_arr, i)
-                                                {
-                                                    return Ok(Some(Value::Long(off)));
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            Ok(Some(Value::Long(0)))
-        },
-    );
-
-    // MemoryLayout.withName(name) → layout with name set
-    r.register(
-        ml,
-        "withName",
-        "(Ljava/lang/String;)Ljava/lang/foreign/MemoryLayout;",
-        pe_layout_with_name,
-    );
-    r.register(
-        ml,
-        "varHandle",
-        "([Ljava/lang/foreign/MemoryLayout$PathElement;)Ljava/lang/invoke/VarHandle;",
-        pe_memory_layout_var_handle,
-    );
-    r.register(ml, "name", "()Ljava/util/Optional;", pe_layout_name);
-
-    // MemoryLayout.byteSize() fallback for any layout
-    r.register(ml, "byteSize", "()J", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let kind = match ctx.get_field(this, 0) {
-            Value::Int(k) => k,
-            _ => 0,
-        };
-        let size = if kind < 10 {
-            ffi::layout_byte_size(kind) as i64
-        } else {
-            match ctx.get_field(this, 1) {
-                Value::Long(n) => n,
-                _ => 0,
-            }
-        };
-        Ok(Some(Value::Long(size)))
-    });
+    // THE WHOLE GROUP-LAYOUT FAMILY WAS DELETED FROM HERE
+    // (F16, 2026-08-13). It is now `phases_late/foreign_ffm.rs`'s, alone.
+    //
+    // What stood here: `structLayout`, `unionLayout`, `sequenceLayout` and
+    // `paddingLayout`, each registered TWICE — once under the JDK-true return
+    // type and once under a fabricated `…)Ljava/lang/foreign/MemoryLayout;`
+    // one — plus `byteSize`/`byteAlignment`/`name`/`withName`/`memberLayouts`
+    // on `StructLayout` and `GroupLayout`, `byteOffset` on `StructLayout`, and
+    // `withName`/`varHandle`/`name`/`byteSize` on `MemoryLayout`.
+    //
+    // EVERY ONE OF THEM HAD A TWIN in `register_p67_foreign_memory`, and the
+    // twins disagreed, because the two files carry two different layout
+    // objects:
+    //
+    //     panama       [0]=Int(kind) [1]=size [2]=members [3]=names
+    //                  [4]=offsets   [5]=align
+    //     foreign_ffm  [0]=Long(byteSize) [1]=Long(byteAlignment)
+    //                  [2]=payload        [3]=name
+    //
+    // Which one a caller got was decided by REGISTRATION ORDER, not by the
+    // descriptor it wrote: `register_pe_panama` runs after
+    // `register_p67_foreign_memory`, and `register()` is last-write-wins, so
+    // these rows took the JDK-true keys away from the JDK-true bodies — but
+    // only in synthetic-JDK mode, since real-JDK mode never calls
+    // `register_pe_panama` at all. One VM, two answers, chosen by which mode
+    // you booted.
+    //
+    // The surviving implementation is also the CORRECT one, which the deleted
+    // `pe_struct_layout` was not. Measured on HotSpot 25.0.3+9-LTS:
+    //
+    //     structLayout(JAVA_BYTE, JAVA_INT)  -> IllegalArgumentException
+    //     structLayout(JAVA_INT, JAVA_LONG)  -> IllegalArgumentException
+    //     structLayout(JAVA_LONG, JAVA_INT)  -> byteSize=12  (NOT 16)
+    //
+    // `pe_struct_layout` auto-padded the first two into a fabricated success
+    // and rounded the third up to 16. The JDK never pads a struct: the caller
+    // writes `paddingLayout(...)`, and an under-aligned member is an error.
+    //
+    // `MemoryLayout$PathElement`'s two factories are the ONLY thing kept, and
+    // deliberately: `foreign_ffm.rs` decodes path elements but mints none,
+    // because in real-JDK mode `PathElement.groupElement("c")` runs the JDK's
+    // own bytecode and yields a `jdk.internal.foreign.LayoutPath$…` record.
+    // Synthetic-JDK mode has no such bytecode, so these two rows are its only
+    // source — and the 2-field carrier they build is a shape
+    // `p67_classify_path_element` explicitly accepts.
 
     // PathElement.groupElement(name) → PathElement
     let pe = "java/lang/foreign/MemoryLayout$PathElement";
@@ -3983,263 +3771,6 @@ fn register_pe2_struct_layouts(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(Some(elem))))
         },
     );
-}
-
-fn pe_memory_layout_width(ctx: &mut dyn NativeContext, layout: ObjectRef) -> i64 {
-    let kind = match ctx.get_field(layout, 0) {
-        Value::Int(v) => v,
-        _ => -1,
-    };
-    if kind < 10 {
-        ffi::layout_byte_size(kind) as i64
-    } else {
-        match ctx.get_field(layout, 1) {
-            Value::Long(v) => v,
-            _ => 1,
-        }
-    }
-}
-
-fn pe_memory_layout_path_target(
-    ctx: &mut dyn NativeContext,
-    layout: ObjectRef,
-    path_arr: ObjectRef,
-) -> ObjectRef {
-    let mut current = layout;
-    let mut i = 0;
-    let len = ctx.array_length(path_arr);
-    while i < len {
-        let pe = match ctx.get_array_element(path_arr, i) {
-            Value::Object(Some(pe)) => pe,
-            _ => break,
-        };
-        let path_kind = match ctx.get_field(pe, 1) {
-            Value::Int(v) => v,
-            _ => -1,
-        };
-        match path_kind {
-            0 => {
-                let target_name = match ctx.get_field(pe, 0) {
-                    Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
-                    _ => String::new(),
-                };
-                if target_name.is_empty() {
-                    break;
-                }
-                let current_kind = match ctx.get_field(current, 0) {
-                    Value::Int(v) => v,
-                    _ => -1,
-                };
-                if current_kind != LAYOUT_STRUCT && current_kind != LAYOUT_UNION {
-                    break;
-                }
-                let names_arr = match ctx.get_field(current, 3) {
-                    Value::Object(Some(arr)) => arr,
-                    _ => break,
-                };
-                let members_arr = match ctx.get_field(current, 2) {
-                    Value::Object(Some(arr)) => arr,
-                    _ => break,
-                };
-                let mut found = false;
-                let name_len = ctx.array_length(names_arr);
-                let mut j = 0;
-                while j < name_len {
-                    if let Value::Object(Some(name_ref)) = ctx.get_array_element(names_arr, j) {
-                        if ctx.read_string(name_ref).as_deref() == Some(&target_name) {
-                            if let Value::Object(Some(member_layout)) =
-                                ctx.get_array_element(members_arr, j)
-                            {
-                                current = member_layout;
-                                found = true;
-                                break;
-                            }
-                        }
-                    }
-                    j += 1;
-                }
-                if !found {
-                    break;
-                }
-            }
-            1 => {
-                if let Value::Object(Some(element)) = ctx.get_field(current, 2) {
-                    current = element;
-                } else {
-                    break;
-                }
-            }
-            _ => break,
-        }
-        i += 1;
-    }
-    current
-}
-
-fn pe_memory_layout_var_handle(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = obj_arg(args, 0)?;
-    let target_layout = match args.get(1) {
-        Some(Value::Object(Some(path_arr))) => pe_memory_layout_path_target(ctx, this, *path_arr),
-        _ => this,
-    };
-    let mut width = pe_memory_layout_width(ctx, target_layout);
-    if !(1..=8).contains(&width) {
-        width = 1;
-    }
-    let vh = try_alloc_concurrent_synthetic(ctx, "java/lang/invoke/VarHandle", 3)?;
-    ctx.set_field(vh, 0, Value::Int(1)); // little-endian marker for memory-segment varhandles
-    ctx.set_field(vh, 1, Value::Int(width as i32));
-    ctx.set_field(vh, 2, Value::Int(3)); // VH_KIND_MEMORY_SEGMENT
-    Ok(Some(Value::Object(Some(vh))))
-}
-
-/// Compute struct layout: iterate members, align each, compute offsets and total size.
-fn pe_struct_layout(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let members_arr = match args.first() {
-        Some(Value::Object(Some(a))) => *a,
-        _ => return Ok(Some(Value::Object(None))),
-    };
-    let count = ctx.array_length(members_arr);
-
-    let offsets_arr = ctx.new_array(cratonvm_types::ArrayElementType::Long, count);
-    let names_arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, count);
-
-    let mut offset: usize = 0;
-    let mut max_align: usize = 1;
-
-    for i in 0..count {
-        let member = ctx.get_array_element(members_arr, i);
-        if let Value::Object(Some(m)) = member {
-            let kind = match ctx.get_field(m, 0) {
-                Value::Int(k) => k,
-                _ => 0,
-            };
-            let (member_size, member_align) = if kind < 10 {
-                (ffi::layout_byte_size(kind), ffi::layout_alignment(kind))
-            } else {
-                let s = match ctx.get_field(m, 1) {
-                    Value::Long(n) => n as usize,
-                    _ => 0,
-                };
-                let a = match ctx.get_field(m, 5) {
-                    Value::Long(n) => n as usize,
-                    _ => 1,
-                };
-                (s, a)
-            };
-
-            offset = ffi::align_up(offset, member_align);
-            ctx.set_array_element(offsets_arr, i, Value::Long(offset as i64));
-            ctx.set_array_element(names_arr, i, pe_layout_name_value(ctx, m));
-            offset += member_size;
-            if member_align > max_align {
-                max_align = member_align;
-            }
-        }
-    }
-
-    // Pad total size to alignment
-    let total_size = ffi::align_up(offset, max_align);
-
-    let layout = try_alloc_concurrent_synthetic(ctx, "java/lang/foreign/StructLayout", 6)?;
-    ctx.set_field(layout, 0, Value::Int(LAYOUT_STRUCT));
-    ctx.set_field(layout, 1, Value::Long(total_size as i64));
-    ctx.set_field(layout, 2, Value::Object(Some(members_arr)));
-    ctx.set_field(layout, 3, Value::Object(Some(names_arr)));
-    ctx.set_field(layout, 4, Value::Object(Some(offsets_arr)));
-    ctx.set_field(layout, 5, Value::Long(max_align as i64));
-
-    Ok(Some(Value::Object(Some(layout))))
-}
-
-/// Compute union layout: all fields at offset 0, size = max member size.
-fn pe_union_layout(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let members_arr = match args.first() {
-        Some(Value::Object(Some(a))) => *a,
-        _ => return Ok(Some(Value::Object(None))),
-    };
-    let count = ctx.array_length(members_arr);
-
-    let mut max_size: usize = 0;
-    let mut max_align: usize = 1;
-
-    for i in 0..count {
-        if let Value::Object(Some(m)) = ctx.get_array_element(members_arr, i) {
-            let kind = match ctx.get_field(m, 0) {
-                Value::Int(k) => k,
-                _ => 0,
-            };
-            let (member_size, member_align) = if kind < 10 {
-                (ffi::layout_byte_size(kind), ffi::layout_alignment(kind))
-            } else {
-                let s = match ctx.get_field(m, 1) {
-                    Value::Long(n) => n as usize,
-                    _ => 0,
-                };
-                let a = match ctx.get_field(m, 5) {
-                    Value::Long(n) => n as usize,
-                    _ => 1,
-                };
-                (s, a)
-            };
-            if member_size > max_size {
-                max_size = member_size;
-            }
-            if member_align > max_align {
-                max_align = member_align;
-            }
-        }
-    }
-
-    let layout = try_alloc_concurrent_synthetic(ctx, "java/lang/foreign/MemoryLayout", 6)?;
-    ctx.set_field(layout, 0, Value::Int(LAYOUT_UNION));
-    ctx.set_field(layout, 1, Value::Long(max_size as i64));
-    ctx.set_field(layout, 2, Value::Object(Some(members_arr)));
-    ctx.set_field(layout, 3, Value::Object(None));
-    ctx.set_field(layout, 4, Value::Object(None));
-    ctx.set_field(layout, 5, Value::Long(max_align as i64));
-
-    Ok(Some(Value::Object(Some(layout))))
-}
-
-/// Compute sequence layout (array): count * element size.
-fn pe_sequence_layout(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let count = match args.first() {
-        Some(Value::Long(n)) => *n as usize,
-        _ => 0,
-    };
-    let element = match args.get(1) {
-        Some(Value::Object(Some(e))) => *e,
-        _ => return Ok(Some(Value::Object(None))),
-    };
-
-    let kind = match ctx.get_field(element, 0) {
-        Value::Int(k) => k,
-        _ => 0,
-    };
-    let (elem_size, elem_align) = if kind < 10 {
-        (ffi::layout_byte_size(kind), ffi::layout_alignment(kind))
-    } else {
-        let s = match ctx.get_field(element, 1) {
-            Value::Long(n) => n as usize,
-            _ => 0,
-        };
-        let a = match ctx.get_field(element, 5) {
-            Value::Long(n) => n as usize,
-            _ => 1,
-        };
-        (s, a)
-    };
-
-    let layout = try_alloc_concurrent_synthetic(ctx, "java/lang/foreign/MemoryLayout", 6)?;
-    ctx.set_field(layout, 0, Value::Int(LAYOUT_SEQUENCE));
-    ctx.set_field(layout, 1, Value::Long((count * elem_size) as i64));
-    ctx.set_field(layout, 2, Value::Object(Some(element))); // element layout
-    ctx.set_field(layout, 3, Value::Object(None));
-    ctx.set_field(layout, 4, Value::Object(None));
-    ctx.set_field(layout, 5, Value::Long(elem_align as i64));
-
-    Ok(Some(Value::Object(Some(layout))))
 }
 
 // --- String marshaling helpers ---
@@ -4504,6 +4035,11 @@ fn r3_get_input_stream(ctx: &dyn NativeContext, buffered_reader: ObjectRef) -> O
 #[cfg(test)]
 mod tests {
     use super::*;
+    // The four compound layout tags are test-only in this file now — see the
+    // note on the `ffi::` import at the top.
+    use cratonvm_native_api::ffi::{
+        LAYOUT_PADDING, LAYOUT_SEQUENCE, LAYOUT_STRUCT, LAYOUT_UNION,
+    };
     #[allow(unused_imports)]
     use cratonvm_native_api::{
         NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess,
@@ -5543,76 +5079,27 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_85_3_downcall_struct_layout() {
-        // Test struct layout computation for passing structs
-        let mut ctx = mock_ctx();
-
-        // struct { int x; long y; } — should have size 16 (4 + 4 padding + 8)
-        let int_layout = make_layout(&mut ctx, LAYOUT_INT);
-        let long_layout = make_layout(&mut ctx, LAYOUT_LONG);
-
-        let members = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 2);
-        ctx.set_array_element(members, 0, Value::Object(Some(int_layout)));
-        ctx.set_array_element(members, 1, Value::Object(Some(long_layout)));
-
-        let result = pe_struct_layout(&mut ctx, &[Value::Object(Some(members))]);
-        assert!(result.is_ok());
-        let layout = match result.unwrap() {
-            Some(Value::Object(Some(l))) => l,
-            _ => panic!("Expected struct layout object"),
-        };
-
-        let total_size = match ctx.get_field(layout, 1) {
-            Value::Long(n) => n,
-            _ => 0,
-        };
-        // int(4) + padding(4) + long(8) = 16, aligned to 8
-        assert_eq!(total_size, 16);
-
-        let alignment = match ctx.get_field(layout, 5) {
-            Value::Long(n) => n,
-            _ => 0,
-        };
-        assert_eq!(alignment, 8);
-    }
-
-    #[test]
-    fn panama_struct_layout_preserves_named_members() {
-        let mut ctx = mock_ctx();
-        let address = make_layout(&mut ctx, LAYOUT_ADDRESS);
-        let name = ctx.create_string("ptr");
-        let named = pe_layout_with_name(
-            &mut ctx,
-            &[Value::Object(Some(address)), Value::Object(Some(name))],
-        )
-        .unwrap()
-        .and_then(|v| match v {
-            Value::Object(Some(obj)) => Some(obj),
-            _ => None,
-        })
-        .expect("withName must return a layout object");
-
-        let members = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 1);
-        ctx.set_array_element(members, 0, Value::Object(Some(named)));
-        let layout = pe_struct_layout(&mut ctx, &[Value::Object(Some(members))])
-            .unwrap()
-            .and_then(|v| match v {
-                Value::Object(Some(obj)) => Some(obj),
-                _ => None,
-            })
-            .expect("structLayout must return a layout object");
-
-        let names_arr = match ctx.get_field(layout, 3) {
-            Value::Object(Some(arr)) => arr,
-            other => panic!("expected names array, got {other:?}"),
-        };
-        let stored_name = match ctx.get_array_element(names_arr, 0) {
-            Value::Object(Some(obj)) => obj,
-            other => panic!("expected stored member name, got {other:?}"),
-        };
-        assert_eq!(ctx.read_string(stored_name).as_deref(), Some("ptr"));
-    }
+    // `test_85_3_downcall_struct_layout` AND
+    // `panama_struct_layout_preserves_named_members` WERE HERE AND ARE DELETED
+    // WITH THE FUNCTION THEY TESTED (F16, 2026-08-13).
+    //
+    // The first called `pe_struct_layout` on `{int, long}` and asserted
+    // size 16 / alignment 8. That is a call HotSpot 25.0.3+9-LTS REFUSES:
+    //
+    //     MemoryLayout.structLayout(JAVA_INT, JAVA_LONG)
+    //       -> IllegalArgumentException: Invalid alignment constraint for
+    //          member layout: j8
+    //
+    // so the test was pinning a fabricated success — it froze the VM's own
+    // wrong answer as if it were the specification. The second asserted that
+    // member NAMES survive into a `names` array at slot 3, which is a slot the
+    // authoritative carrier does not have: `foreign_ffm.rs` keeps the member
+    // LAYOUTS at slot 2 and resolves a name by asking each member for its own
+    // (`p67_layout_named_member`), so there is no second copy to drift.
+    //
+    // Both behaviours are now covered against the ORACLE'S numbers in
+    // `vm/src/vm/tests.rs` — see `struct_layout_rejects_underaligned_member`,
+    // `struct_layout_does_not_pad_the_total` and `struct_layout_single_field`.
 
     #[test]
     fn test_85_3_downcall_void_return() {

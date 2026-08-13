@@ -4640,9 +4640,26 @@ pub(crate) fn parse_descriptor_param_and_return(desc: &str) -> (Vec<String>, Str
     (params, ret_type)
 }
 
-/// Box a VM Value into a wrapper object for reflection returns.
+/// Box a VM Value into a **FRESH** wrapper object.
 ///
-/// e.g. Value::Int(42) with type "I" в†’ Integer.valueOf(42) object
+/// e.g. `Value::Int(42)` with type `"I"` produces a `new Integer(42)`-shaped
+/// object. It is **not** `Integer.valueOf(42)`, whatever this comment used to
+/// claim: the body below calls [`alloc_wrapper`] on every arm and has never
+/// consulted a cache. The distinction is observable (`==` on two boxes of the
+/// same in-cache value) and it is the entire reason [`box_value_canonical`]
+/// exists beside this function.
+///
+/// This is the correct helper for a caller whose HotSpot counterpart allocates
+/// unconditionally — HotSpot's `java_lang_boxing_object::create`, which is what
+/// `Reflection::array_get` and the `MethodHandleNatives` VM-info shapes reach.
+/// `Array.get` is the archetype and is measured fresh on **both** VMs (it does
+/// not call through here at all; `lib.rs::native_array_get` inlines its own
+/// `alloc_wrapper` per component type, which is why routing this function
+/// wholesale through the caches would *not* have broken it — and why "it
+/// would break `Array.get`" is not by itself the reason for the split).
+///
+/// `"V"` boxes to `null`; anything else is already a reference and passes
+/// through untouched.
 pub(crate) fn box_value(ctx: &mut dyn NativeContext, value: Value, type_desc: &str) -> Value {
     match type_desc {
         "I" => {
@@ -4687,6 +4704,90 @@ pub(crate) fn box_value(ctx: &mut dyn NativeContext, value: Value, type_desc: &s
         }
         "V" => Value::Object(None), // void в†’ null
         _ => value,                 // already an object reference
+    }
+}
+
+/// Box a VM Value the way the JDK's **reflective accessors** do: through
+/// `X.valueOf`, i.e. through the wrapper caches.
+///
+/// [`box_value`]'s cached sibling. The two are NOT interchangeable and the
+/// choice per call site is a measurement, not a preference. Every row below
+/// was measured on Microsoft OpenJDK 25.0.3+9 with `scratchpad/f11/
+/// BoxCallers.java` / `BoxCallers2.java`, which compare the object a path
+/// hands back against `X.valueOf(v)` by `==` (all values inside every bound:
+/// int 7, char 'a', byte 3, short 9, long 5, `true`):
+///
+/// | reflective path | HotSpot 25 | helper |
+/// |---|---|---|
+/// | `Field.get` (instance + static, I J Z B S C) | CANONICAL | this one |
+/// | `Method.invoke` primitive return | CANONICAL | this one |
+/// | `MethodHandle` return adaptation (`asType`/`invoke`/`invokeWithArguments`) | CANONICAL | this one |
+/// | `VarHandle.get` — field, array element, byte-array view, FFM layout | CANONICAL | this one |
+/// | `SerializedLambda.getCapturedArg` | CANONICAL | this one |
+/// | `InvocationHandler` `args[]` (proxy parameter boxing) | CANONICAL | this one |
+/// | `Array.get` | **FRESH** | [`box_value`] |
+/// | `Field.get` / `Method.invoke` of `float`/`double` | **FRESH** | [`box_value`] |
+/// | any value outside its type's cache bound | **FRESH** | either — the natives' own uncached arm |
+///
+/// The JDK's reason for the asymmetry is an implementation detail that is
+/// nonetheless observable, and therefore is behaviour: `Field.get` and
+/// `Method.invoke` run through `MethodHandle`-based accessors
+/// (`MethodHandleIntegerFieldAccessorImpl` etc.), whose boxing step is a
+/// direct handle to `Integer.valueOf` — so they inherit the cache. `Array.get`
+/// is a VM native (`Reflection::array_get`) that boxes with
+/// `java_lang_boxing_object::create`, which allocates and never looks at
+/// `IntegerCache`. **Do not "unify" them.** Both directions are asserted by
+/// tests below, and the fresh direction is the one no equality-shaped check
+/// can see (every "fresh" row above is still `.equals`-equal).
+///
+/// `F` and `D` deliberately fall through to [`box_value`]: `Float`/`Double`
+/// have no cache at all on HotSpot (`Float.valueOf(0f) == Float.valueOf(0f)`
+/// is `false`, measured), so "completing the family" to eight is a regression.
+///
+/// Three implementation notes:
+///
+/// 1. The descriptor arm is entered only when the `Value` variant MATCHES the
+///    descriptor. `native_long_value_of` reads `Some(Value::Long(v))` and
+///    **defaults to 0** for anything else, so handing it a `Value::Int` would
+///    convert an identity bug into a wrong-value bug. On a mismatch this falls
+///    back to [`box_value`], which stores the raw slot verbatim — i.e. exactly
+///    today's behaviour for those shapes.
+/// 2. A failing or empty native result also falls back to [`box_value`],
+///    never to `Value::Object(None)`. Mapping a boxing failure onto `null` is
+///    the defect already recorded above `create_method_object` — a reference
+///    return silently becoming `null` — and there is no reason to reintroduce
+///    it here.
+/// 3. No new cached storage is added: this routes callers into the SIX caches
+///    that already live in `lang_math.rs` and are already reported by
+///    `gc_scan_value_of_cache_roots` **and** remapped by
+///    `gc_update_value_of_cache_refs` (both hooks list the same six
+///    `*_cache()` accessors, and `vm/src/memory/native_roots.rs` registers
+///    them as one `VmRootSource { scan, remap }` pair, so the two cannot be
+///    wired independently). A cache that is rooted but not remapped is a
+///    use-after-move.
+pub(crate) fn box_value_canonical(
+    ctx: &mut dyn NativeContext,
+    value: Value,
+    type_desc: &str,
+) -> Value {
+    // Note 1: the `Value` variant is part of the match. A `("J", Value::Int)`
+    // shape must NOT reach `native_long_value_of`.
+    let cached = match (type_desc, value) {
+        ("I", Value::Int(_)) => crate::lang_math::native_integer_value_of(ctx, &[value]),
+        ("J", Value::Long(_)) => crate::lang_math::native_long_value_of(ctx, &[value]),
+        ("Z", Value::Int(_)) => crate::lang_math::native_boolean_value_of(ctx, &[value]),
+        ("B", Value::Int(_)) => crate::lang_math::native_byte_value_of(ctx, &[value]),
+        ("S", Value::Int(_)) => crate::lang_math::native_short_value_of(ctx, &[value]),
+        ("C", Value::Int(_)) => crate::lang_math::native_character_value_of(ctx, &[value]),
+        // "F" / "D" (no cache on HotSpot), "V" (void в†’ null), reference
+        // descriptors (pass through), and every mismatched variant.
+        _ => return box_value(ctx, value, type_desc),
+    };
+    // Note 2: only a real object is taken from the native; anything else
+    // degrades to the allocating path rather than to `null`.
+    match cached {
+        Ok(Some(v @ Value::Object(Some(_)))) => v,
+        _ => box_value(ctx, value, type_desc),
     }
 }
 
@@ -6520,7 +6621,13 @@ pub(crate) fn native_field_get(ctx: &mut dyn NativeContext, args: &[Value]) -> M
     // wrapper. Otherwise Long.longValue() later receives the raw compact-Int
     // bits (0xfffc...) as a supposed long.
     let boxed_value = coerce_reflective_field_value(raw_value, &descriptor);
-    let result = box_value(ctx, boxed_value, &descriptor);
+    // CANONICAL, not fresh. Measured on HotSpot 25.0.3+9: `f.get(o) ==
+    // Character.valueOf('a')` is true for a `char` field holding 'a', and the
+    // same for I/J/Z/B/S in their cache bounds — `Field.get` boxes through a
+    // `MethodHandle` field accessor whose boxing step IS `X.valueOf`. The
+    // `float`/`double` and out-of-bound arms stay fresh; `box_value_canonical`
+    // routes those back to `box_value` itself.
+    let result = box_value_canonical(ctx, boxed_value, &descriptor);
     Ok(Some(result))
 }
 
@@ -8697,7 +8804,11 @@ fn build_serialized_lambda(
     for (i, tc) in capture_chars.iter().enumerate() {
         let proxy = ctx.read_native_pin(proxy_pin, proxy);
         let raw = ctx.get_field(proxy, i);
-        let boxed = box_value(ctx, raw, &tc.to_string());
+        // CANONICAL: measured on HotSpot, `SerializedLambda.getCapturedArg(i)`
+        // for a captured `int`/`char`/`long` is identical to `X.valueOf(v)` —
+        // the spun `writeReplace` boxes the capture fields with `valueOf`
+        // bytecode, so this side table inherits the caches too.
+        let boxed = box_value_canonical(ctx, raw, &tc.to_string());
         let captured = ctx.read_native_pin(captured_pin, captured);
         ctx.set_array_element(captured, i, boxed);
     }
@@ -9397,10 +9508,15 @@ pub(crate) fn native_method_invoke(
         }
     }
 
-    // Box the return value
+    // Box the return value — CANONICAL. Measured on HotSpot 25.0.3+9:
+    // `m.invoke(null) == Integer.valueOf(7)` for a `()I` returning 7, and the
+    // same for C/B/S/Z/J in bound; `()F`/`()D` and out-of-bound values come
+    // back fresh, which is what `box_value_canonical` delegates for. Since
+    // JDK 18 `Method.invoke` runs through a `MethodHandle` accessor whose
+    // return adaptation is a direct handle to `X.valueOf`.
     match result {
         Some(val) => {
-            let boxed = box_value(ctx, val, &ret_desc);
+            let boxed = box_value_canonical(ctx, val, &ret_desc);
             Ok(Some(boxed))
         }
         None => Ok(Some(Value::Object(None))), // void method returns null
@@ -26599,6 +26715,20 @@ Implementation-Title: opensaml-core-api\r\n\
 
 #[cfg(test)]
 mod protection_domain_layout_tests {
+    // The boxing-identity tests appended at the end of this module need the
+    // parent's items (`box_value`, `box_value_canonical`, `Value`,
+    // `ObjectRef`) and a mock receiver; the ProtectionDomain tests above
+    // predate them and spell every path in full, so nothing was imported.
+    #[allow(unused_imports)]
+    use super::*;
+    #[allow(unused_imports)]
+    use crate::test_utils::mock_ctx;
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{
+        NativeClassAccess, NativeContext, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess,
+        NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess,
+    };
+
     /// Real JDK 21–25 `java.security.ProtectionDomain`, instance fields in
     /// DECLARATION order — not the constructor's argument order, which is
     /// `(CodeSource, PermissionCollection, ClassLoader, Principal[])` and is
@@ -26664,6 +26794,214 @@ mod protection_domain_layout_tests {
                 !body.contains(&needle),
                 "`{needle}` addresses ProtectionDomain by raw index; resolve on \
                  the receiver by name instead"
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // `box_value` vs `box_value_canonical` — the split, and BOTH directions.
+    //
+    // Measured on Microsoft OpenJDK 25.0.3+9 (`scratchpad/f11/BoxCallers.java`
+    // and `BoxCallers2.java`, which print rather than assert): `Field.get`,
+    // `Method.invoke`, MethodHandle return adaptation, every `VarHandle.get`
+    // shape, `SerializedLambda`'s captured args and a proxy's `args[]` all
+    // hand back the CANONICAL box, while `Array.get` hands back a FRESH one on
+    // both VMs. Every "fresh" row above is still `.equals`-equal to the
+    // canonical instance, so these tests assert on `ObjectRef` identity and
+    // never on the payload alone — an equality-shaped assertion cannot see
+    // this defect in either direction.
+    //
+    // The caches are process-global and keyed by `vm_identity()`, whose mock
+    // default is `0` and is therefore shared with every other test in this
+    // suite; entries dangle once a mock heap drops, so each test below claims
+    // its own identity rather than handing a stale ref to an unrelated test.
+    // -----------------------------------------------------------------------
+
+    fn boxed_ref(v: Value) -> ObjectRef {
+        match v {
+            Value::Object(Some(o)) => o,
+            other => panic!("expected a boxed object, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn box_value_canonical_returns_the_cached_instance_for_the_six_cached_types() {
+        let mut ctx = mock_ctx();
+        ctx.set_vm_identity(0x5f11);
+        for (desc, v) in [
+            ("I", Value::Int(7)),
+            ("J", Value::Long(5)),
+            ("Z", Value::Int(1)),
+            ("B", Value::Int(3)),
+            ("S", Value::Int(9)),
+            ("C", Value::Int('a' as i32)),
+        ] {
+            let a = boxed_ref(box_value_canonical(&mut ctx, v, desc));
+            let b = boxed_ref(box_value_canonical(&mut ctx, v, desc));
+            assert_eq!(
+                a, b,
+                "box_value_canonical({desc}, {v:?}) must return THE canonical \
+                 instance — this is what makes `Field.get`/`Method.invoke` \
+                 agree with `X.valueOf` as they do on HotSpot"
+            );
+            assert_eq!(
+                ctx.get_field(a, 0),
+                v,
+                "a canonical box that carries the wrong value passes every \
+                 identity row above"
+            );
+        }
+
+        // Identity with the VM's own `valueOf` native, not merely with itself.
+        // A private-but-self-consistent cache would satisfy the loop above and
+        // still fail HotSpot's `f.get(o) == Character.valueOf('a')`.
+        let via_helper = boxed_ref(box_value_canonical(&mut ctx, Value::Int('a' as i32), "C"));
+        let via_native = boxed_ref(
+            crate::lang_math::native_character_value_of(&mut ctx, &[Value::Int('a' as i32)])
+                .unwrap()
+                .unwrap(),
+        );
+        assert_eq!(
+            via_helper, via_native,
+            "the cached sibling must delegate to the registered `valueOf` \
+             native, not mint a second canonical instance"
+        );
+    }
+
+    #[test]
+    fn box_value_must_stay_fresh_even_for_values_that_are_in_every_cache() {
+        // NEGATIVE CONTROL, and the reason this is a split rather than a
+        // one-line fix. HotSpot's `Reflection::array_get` boxes with
+        // `java_lang_boxing_object::create`, which never consults a cache:
+        // `Array.get(new int[]{7}, 0) == Integer.valueOf(7)` is FALSE, and
+        // `Array.get` twice is not even identical to itself (both measured).
+        // A lane that "unifies" the pair by routing this half through the
+        // caches breaks that, and nothing equality-shaped would notice.
+        let mut ctx = mock_ctx();
+        ctx.set_vm_identity(0x5f12);
+        for (desc, v) in [
+            ("I", Value::Int(7)),
+            ("J", Value::Long(5)),
+            ("Z", Value::Int(1)),
+            ("B", Value::Int(3)),
+            ("S", Value::Int(9)),
+            ("C", Value::Int('a' as i32)),
+        ] {
+            let a = boxed_ref(box_value(&mut ctx, v, desc));
+            let b = boxed_ref(box_value(&mut ctx, v, desc));
+            assert_ne!(
+                a, b,
+                "box_value({desc}, {v:?}) is the FRESH half of the split and \
+                 must allocate — `Array.get`'s contract depends on it"
+            );
+            assert_eq!(ctx.get_field(a, 0), v);
+        }
+        assert_eq!(
+            box_value(&mut ctx, Value::Int(0), "V"),
+            Value::Object(None),
+            "a void return has no value and boxes to null"
+        );
+    }
+
+    #[test]
+    fn box_value_canonical_caches_neither_float_double_nor_out_of_bound_values() {
+        let mut ctx = mock_ctx();
+        ctx.set_vm_identity(0x5f13);
+
+        // `Float`/`Double` cache NOTHING. Measured: `Float.valueOf(0f) ==
+        // Float.valueOf(0f)` is false on HotSpot 25 while `.equals` is true,
+        // and `Field.get`/`Method.invoke` of a `float` come back fresh even
+        // though every integral sibling comes back canonical. Completing the
+        // family to eight here is a regression, not a completion.
+        for (desc, v) in [
+            ("F", Value::Float(0.0)),
+            ("F", Value::Float(1.0)),
+            ("D", Value::Double(0.0)),
+            ("D", Value::Double(1.0)),
+        ] {
+            let a = boxed_ref(box_value_canonical(&mut ctx, v, desc));
+            let b = boxed_ref(box_value_canonical(&mut ctx, v, desc));
+            assert_ne!(
+                a, b,
+                "box_value_canonical({desc}, {v:?}) must NOT be canonical — \
+                 there is no FloatCache and no DoubleCache"
+            );
+        }
+
+        // And each cached type keeps its own uncached arm, with its own bound.
+        // `Byte` is absent from this list on purpose: `ByteCache` covers all
+        // 256 values and has no fresh arm at all, so no `Byte` row belongs
+        // here — the four bounds in this family are genuinely different.
+        for (desc, v) in [
+            ("I", Value::Int(1000)),
+            ("J", Value::Long(1000)),
+            ("S", Value::Int(1000)),
+            ("C", Value::Int(200)),
+        ] {
+            let a = boxed_ref(box_value_canonical(&mut ctx, v, desc));
+            let b = boxed_ref(box_value_canonical(&mut ctx, v, desc));
+            assert_ne!(
+                a, b,
+                "{desc} {v:?} is outside its cache bound; HotSpot's \
+                 `Field.get` is fresh there too"
+            );
+        }
+    }
+
+    #[test]
+    fn a_mismatched_value_variant_falls_back_instead_of_being_defaulted_to_zero() {
+        // `native_long_value_of` reads `Some(Value::Long(v))` and DEFAULTS TO
+        // 0 for every other variant. A raw `long` field slot can legitimately
+        // present as a compact `Value::Int` — `native_wrapper_long_value`
+        // exists to widen exactly that shape — so a canonical route that
+        // ignored the variant would turn an identity question into a wrong
+        // ANSWER: the cached `Long.valueOf(0)` returned for a field holding 5.
+        // That is why the descriptor arm matches on the variant too.
+        let mut ctx = mock_ctx();
+        ctx.set_vm_identity(0x5f14);
+        let obj = boxed_ref(box_value_canonical(&mut ctx, Value::Int(5), "J"));
+        assert_eq!(
+            ctx.get_field(obj, 0),
+            Value::Int(5),
+            "a (\"J\", Value::Int) pair must fall back to the verbatim \
+             allocating path — never be defaulted to 0 by the cached native"
+        );
+        let again = boxed_ref(box_value_canonical(&mut ctx, Value::Int(5), "J"));
+        assert_ne!(obj, again, "that fallback is `box_value`, which allocates");
+    }
+
+    #[test]
+    fn the_reflection_call_sites_still_take_the_cached_sibling() {
+        // A source witness, because every behavioural test above exercises the
+        // HELPERS and all of them would still pass if a CALL SITE were put
+        // back to `box_value` — which is precisely the defect the split
+        // exists to fix. The needles are assembled at runtime: spelled out as
+        // literals they would match this test's own source text and assert
+        // nothing (the file being searched is this file).
+        //
+        // The `\r` strip is load-bearing on a CRLF checkout; same reason as
+        // `the_populator_writes_no_raw_slot_indices` above.
+        let src = include_str!("lang_class.rs").replace("\r\n", "\n");
+        let canon = format!("box_value_{}", "canonical");
+        for (site, anchor) in [
+            (
+                "Field.get",
+                format!("let result = {canon}(ctx, boxed_value, &descriptor);"),
+            ),
+            (
+                "SerializedLambda capturedArgs",
+                format!("let boxed = {canon}(ctx, raw, &tc.to_string());"),
+            ),
+            (
+                "Method.invoke return",
+                format!("let boxed = {canon}(ctx, val, &ret_desc);"),
+            ),
+        ] {
+            assert!(
+                src.contains(&anchor),
+                "{site} no longer boxes through the cached sibling — on \
+                 HotSpot 25 that path returns the canonical instance \
+                 (measured); `{anchor}` is gone"
             );
         }
     }

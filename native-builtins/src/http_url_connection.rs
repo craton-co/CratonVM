@@ -2180,8 +2180,10 @@ fn huc_verify_hostname(
     let proto_pin = ctx.pin_native_root(proto_s0);
     let cipher_s0 = ctx.create_string(cipher);
     let cipher_pin = ctx.pin_native_root(cipher_s0);
-    // The 3-field client `SSLSession` shape (`new13_alloc_ssl_session`'s), so
-    // the layout-aware real-mode accessors in `t27_tls::register_ssl_session_real`
+    // The client `SSLSession` shape (`new13_alloc_ssl_session`'s — 4 fields
+    // since E42; the width is `NEW13_SSL_SESS_FIELDS` and must stay that
+    // constant, because `t27_tls`'s slot rules are keyed on it), so the
+    // layout-aware real-mode accessors in `t27_tls::register_ssl_session_real`
     // read it correctly: `getProtocol`/`getCipherSuite` from these slots,
     // `getPeerCertificates` from the side table populated just below. A
     // pinning verifier calls exactly that pair.
@@ -2207,13 +2209,25 @@ fn huc_verify_hostname(
         crate::phases_late::ssl_security::NEW13_SESS_CIPHER,
         Value::Object(Some(cipher_s)),
     );
-    // -1: this connection owns its rustls state inside `perform` and is never
-    // registered in the `servlet` TLS id space, so there is no id to record.
-    // Every accessor that would consult it already tolerates a miss.
+    // This session is handed to a HostnameVerifier from the far side of a
+    // handshake that COMPLETED — `verify()` is called to decide whether to
+    // ACCEPT the peer, which is a separate question from whether anything was
+    // negotiated (see STEP 0's comment above, and the real JDK, which records
+    // the session either way). So slot 2 must not carry the "never negotiated"
+    // sentinel `-1`: `t27_tls::session_has_negotiated` reads exactly this slot,
+    // and a verifier that asks `session.isValid()` or `session.getId()` — the
+    // two accessors that predicate decides — would be told the handshake it was
+    // invoked to vet had not happened.
+    //
+    // See `net_phase_e::HTTPS_CLIENT_SESSION_MARKER` for the measured HotSpot
+    // contract, for why this connection cannot be given a real `servlet` TLS id,
+    // and for why the marker's numeric value is not free to choose. Shared with
+    // `net_phase_e::https_session_object`, the other minter of this shape, so
+    // the two cannot drift apart.
     ctx.set_field(
         session,
         crate::phases_late::ssl_security::NEW13_SESS_TLSID,
-        Value::Int(-1),
+        Value::Int(crate::net_phase_e::HTTPS_CLIENT_SESSION_MARKER),
     );
     let session = ctx.read_native_pin(session_pin, session0);
     crate::t27_tls::record_client_peer_chain(ctx, session, peer_chain_der);

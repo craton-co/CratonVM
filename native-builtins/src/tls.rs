@@ -1095,8 +1095,9 @@ fn register_ssl_session(r: &mut NativeMethodRegistry) {
     // session is 4, not 3), and its `> SES_CREATION_TIME` gate answered
     // `Int(1)` — VALID — for **every** shape narrower than 6. That is the
     // width-blind inference: it treats "too narrow to carry a flag" as "was
-    // just negotiated", and the 3-field `ssl_security::
-    // new13_alloc_null_ssl_session` shape is minted with `tls_id = -1` for a
+    // just negotiated", and the `ssl_security::new13_alloc_null_ssl_session`
+    // shape (`NEW13_SSL_SESS_FIELDS` — 3 fields when this was written, 4 since
+    // E42, and narrower than 6 either way) is minted with `tls_id = -1` for a
     // socket that was NEVER CONNECTED. So under `--synthetic-jdk` an
     // unconnected `SSLSocket.getSession().isValid()` still answered `true`
     // where HotSpot measures `false` (E12-1 §1 arm A) — the E22 fix was live
@@ -1118,14 +1119,29 @@ fn register_ssl_session(r: &mut NativeMethodRegistry) {
     // have gone inert, because width 6 takes the predicate's
     // "only minted after a handshake" arm. Compose the two the way the JDK
     // composes them — negotiated AND not invalidated — instead of picking one.
+    //
+    // F18 — the `invalidated` half is no longer width-limited, and the comment
+    // above that said "a narrower shape has no `invalidate()` writer either" is
+    // no longer true. `t27_tls::session_is_valid` composes negotiated AND
+    // not-invalidated for EVERY width, because the bit now lives in a side
+    // table (`t27_tls::session_invalidated_table`) rather than in a slot the
+    // narrow shapes do not have. That closes F10-1 NOMINATION 3's second half
+    // in this mode too: at width 4 `invalidate()` used to no-op, so
+    // `SSLServerSocket.accept`'s session stayed `isValid() == true` after an
+    // explicit invalidation.
+    //
+    // The wide-shape flag is still read and still wins a `false`. It is a
+    // SECOND writer of the same concept, kept because `init_ssl_session_fields`
+    // seeds `SES_VALID` at construction and other code in this file writes it;
+    // dropping the read here would make those writes silently inert. The two
+    // are composed, not chosen between — the same reasoning the original
+    // comment applied to the two halves of the predicate.
     r.register(cls, "isValid", "()Z", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        if !crate::t27_tls::session_has_negotiated(ctx, this) {
+        if !crate::t27_tls::session_is_valid(ctx, this) {
             return Ok(Some(Value::Int(0)));
         }
-        // The `invalidated` half. Only shapes wide enough to carry the flag
-        // have one; a narrower shape has no `invalidate()` writer either, so
-        // "negotiated" is the whole answer for it.
+        // The wide shapes' own `invalidated` slot, still honoured.
         if ctx.object_num_fields(this) > SES_CREATION_TIME {
             return Ok(Some(ctx.get_field(this, SES_VALID)));
         }
@@ -1137,23 +1153,68 @@ fn register_ssl_session(r: &mut NativeMethodRegistry) {
     // E31 — this is a THIRD member of the slot-collision family
     // `t27_tls::sslsess_attrs_slot` documents, and nobody had named it. It
     // wrote `SES_VALID` (slot 2) on whatever shape it was handed, and slot 2 is
-    // the valid flag on only two of the five widths. On the 3-field
+    // the valid flag on only some of the widths. On the
     // `ssl_security::new13_alloc_null_ssl_session` shape it is
     // `NEW13_SESS_TLSID`, so `invalidate()` on an unconnected socket's session
     // overwrote `Int(-1)` — "never connected" — with `Int(0)`, which
     // `session_has_negotiated` reads as a valid stream id. The result was
     // exactly inverted: `isValid()` went from `false` to `true` and `getId()`
     // from `byte[0]` back to 32 fabricated bytes, **because the caller asked to
-    // invalidate it**. On the 4-field accept shape it clobbers the real stream
-    // id with 0.
+    // invalidate it**. On the accept shape it clobbers the real stream id
+    // with 0.
+    //
+    // E42 did not change this gate and must not be read as having done so.
+    // `NEW13_SSL_SESS_FIELDS` widened 3 -> 4, which is still `<= SES_CREATION_TIME`,
+    // so this stays a no-op for that shape — and it has to, because slot 2
+    // there is STILL the stream id. The widening bought an attribute slot, not
+    // an `invalidated` flag.
     //
     // No-op for shapes with no flag slot, on the same reasoning as
     // `sslsess_attrs_slot`: a quiet miss on a state this VM cannot record beats
-    // a loud corruption of the state it can. It is also nearly free — the
-    // 3-field shape's `isValid()` is already `false` (nothing was negotiated),
-    // which is what `invalidate()` was trying to achieve.
+    // a loud corruption of the state it can.
+    //
+    // For the NULL session the no-op is not a miss at all — it is HotSpot's
+    // own behaviour. MEASURED, HotSpot 25.0.3+9-LTS, three byte-identical runs
+    // (`scratchpad/f6/F6Invalidate.java`), on the unconnected `SSLSocket`'s
+    // session and on the pre-handshake `SSLEngine`'s alike:
+    //
+    //   before-invalidate  isValid=false idLen=0 cipher=SSL_NULL_WITH_NULL_NULL
+    //   after-invalidate   isValid=false idLen=0 cipher=SSL_NULL_WITH_NULL_NULL
+    //
+    // `invalidate()` on a session that negotiated nothing changes NOTHING,
+    // because there was nothing to invalidate. So this arm is exactly right
+    // for the shape it governs, and the residual is only a session that DID
+    // negotiate and cannot be invalidated on this width. Measured, that
+    // residual is confined to one accessor: `invalidate()` changes `isValid()`
+    // and nothing else — cipher, protocol, id and certs all survive it (E12-1
+    // §1 arm E) — so it cannot spread to the other twelve. Recording an
+    // `invalidated` bit needs a slot this shape does not have, and widening
+    // again would move slots 0/1/2 under every reader in `t27_tls`.
+    //
+    // F18 — the "recording an `invalidated` bit needs a slot this shape does
+    // not have" paragraph above is now only half true, and the half that
+    // mattered is fixed. The slot is still unavailable at width 4 and widening
+    // is still rejected for the reasons E42-1 §2 gives — so the bit went
+    // OUTSIDE the object, into `t27_tls::session_invalidated_table`, keyed the
+    // same GC-stable way this file's sibling cert tables already are. No width
+    // moves, no reader retargets, and `invalidate()` stops being a silent
+    // no-op on the two width-4 shapes.
+    //
+    // The slot write is KEPT for the wide shapes. It is not redundant: other
+    // code in this file reads `SES_VALID` directly, and the `isValid()`
+    // registration above still consults it. Writing both keeps this door's
+    // effect visible to both readers.
+    //
+    // The narrow-shape no-op that HotSpot itself performs is unchanged in
+    // effect and now for the right reason. MEASURED (this lane,
+    // `scratchpad/f18/F18SessionContract.java`; independently reproducing
+    // `scratchpad/f6/F6Invalidate.java`): on a session that negotiated nothing,
+    // `invalidate()` changes NOTHING, because there was nothing to invalidate —
+    // and `session_mark_invalidated` declines to record a bit for exactly that
+    // session, so the two agree by construction rather than by coincidence.
     r.register(cls, "invalidate", "()V", |ctx, args| {
         let this = obj_arg(args, 0)?;
+        crate::t27_tls::session_mark_invalidated(ctx, this);
         if ctx.object_num_fields(this) > SES_CREATION_TIME {
             ctx.set_field(this, SES_VALID, Value::Int(0));
         }
@@ -3260,19 +3321,33 @@ fn register_keycloak_tls_natives(r: &mut NativeMethodRegistry) {
     // shapes and gating on the field count for exactly that reason; this copy,
     // registered ~1,900 lines later in the same file, kept the naive
     // `> SES_VALID` (i.e. 3+ fields) test the other one was written to
-    // replace. On the 3-field `new13_alloc_null_ssl_session` shape that reads
+    // replace. On the `new13_alloc_null_ssl_session` shape that reads
     // `Int(-1)` — the "never connected" stream id — and returns it through a
     // `()Z` descriptor, so an unconnected socket's session answers `isValid()`
-    // with a non-zero int. On the 4-field accept shape it returns the stream
-    // id, so a genuinely negotiated session reports INVALID whenever its id
-    // happens to be 0. Both directions wrong, from one width-blind test.
+    // with a non-zero int. On the accept shape it returns the stream id, so a
+    // genuinely negotiated session reports INVALID whenever its id happens to
+    // be 0. Both directions wrong, from one width-blind test. (E42 made those
+    // two shapes the same width, 4, which is why no width test can ever
+    // separate them — only the VALUE in slot 2 can.)
     //
     // Same composition as the other copy: negotiated (the one shared
     // width-aware predicate) AND not invalidated. See that copy for why the
     // two halves must not collapse into one.
+    //
+    // F18 — and "same composition" now means the same FUNCTION, not a second
+    // hand-assembled copy of the rule. This copy said it matched its twin and
+    // then spelled the composition out again, which is how the twin drifted
+    // last time. `t27_tls::session_is_valid` is the one place both halves are
+    // combined; this door adds only the wide-shape slot read, exactly as the
+    // `javax/net/ssl/SSLSession` copy above does.
+    //
+    // No `invalidate` is registered on THIS class name and none is needed: the
+    // invalidated bit is keyed on the session OBJECT, not on the class name it
+    // was reached through, so an `invalidate()` made through the
+    // `javax/net/ssl/SSLSession` door is visible here on the same object.
     r.register(sess_impl, "isValid", "()Z", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        if !crate::t27_tls::session_has_negotiated(ctx, this) {
+        if !crate::t27_tls::session_is_valid(ctx, this) {
             return Ok(Some(Value::Int(0)));
         }
         if ctx.object_num_fields(this) > SES_CREATION_TIME {

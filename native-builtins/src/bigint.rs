@@ -687,6 +687,24 @@ impl BigInt {
         }
     }
 
+    /// This value's MAGNITUDE bit length — the single owner of that rule.
+    ///
+    /// It is **not** [`Self::bit_length`]: `BigInteger.bitLength()` subtracts
+    /// the sign bit for a negative exact power of two, and every range guard in
+    /// this family needs the magnitude. MEASURED by lane F2
+    /// (`scratchpad/f2/BiProbe.java`, Microsoft OpenJDK 25.0.3+9):
+    /// `(-2).shiftLeft(Integer.MAX_VALUE - 2)` is LEGAL and reports
+    /// `bitLength=2147483646`, one less than its 2_147_483_647 magnitude bits —
+    /// so a guard written on `bit_length()` admits exactly one bit too many for
+    /// that family of operands, which is where a 256 MB allocation comes back.
+    ///
+    /// Exposed because the same three lines had been copied into
+    /// `math_bignum::bi_mag_bits` and `phases_late::p71_bi_mag_bits`; callers
+    /// should use this instead of a fourth copy.
+    pub(crate) fn magnitude_bits(&self) -> u64 {
+        Self::mag_bits(&self.mag) as u64
+    }
+
     /// Two's-complement representation in exactly `len` words (little-endian),
     /// sign-extended. `len` must be at least the magnitude word count.
     fn to_twos(&self, len: usize) -> Vec<u32> {
@@ -779,12 +797,59 @@ impl BigInt {
         }
     }
 
-    /// `BigInteger.testBit(n)`.
+    /// The `n`th least-significant word of the **infinite** two's-complement
+    /// representation — JDK 25 `BigInteger.getInt` (`BigInteger.java:4838`):
+    ///
+    /// ```text
+    ///     if (n >= mag.length) return signInt();          // 0, or -1 when negative
+    ///     int magInt = mag[mag.length-n-1];
+    ///     return (signum >= 0 ? magInt :
+    ///             (n <= numberOfTrailingZeroInts() ? -magInt : ~magInt));
+    /// ```
+    ///
+    /// `mag` there is big-endian, so `mag[mag.length-n-1]` is our little-endian
+    /// `mag[n]`, and `numberOfTrailingZeroInts()` is the index of the lowest
+    /// non-zero limb. Words at or below that index are negated; the ones above
+    /// it are complemented — the borrow out of the low words has already been
+    /// consumed. **Allocates nothing**, which is the whole point: `n` is an
+    /// argument, so anything sized by it is reachable denial of service.
+    fn get_int(&self, n: usize) -> u32 {
+        if n >= self.mag.len() {
+            return if self.neg { u32::MAX } else { 0 };
+        }
+        let m = self.mag[n];
+        if !self.neg {
+            return m;
+        }
+        let lowest_nonzero = self.mag.iter().position(|&w| w != 0).unwrap_or(0);
+        if n <= lowest_nonzero {
+            m.wrapping_neg()
+        } else {
+            !m
+        }
+    }
+
+    /// `BigInteger.testBit(n)` — `(getInt(n >>> 5) & (1 << (n & 31))) != 0`,
+    /// JDK 25 `BigInteger.java:3747`. The caller rejects a negative `n` with
+    /// `ArithmeticException("Negative bit address")` before widening to `u32`.
+    ///
+    /// This used to materialize the two's complement out to `n`'s word:
+    ///
+    /// ```text
+    ///     let len = self.mag.len().max(word + 1) + 1;
+    ///     let tw = self.to_twos(len);
+    /// ```
+    ///
+    /// The answers were right, but `BigInteger.ONE.testBit(Integer.MAX_VALUE)`
+    /// — one line of ordinary bytecode, in EVERY jdk mode — allocated
+    /// `vec![0u32; 67_108_866]`, ~256 MB, to read one bit that is a function of
+    /// the sign alone. HotSpot answers the same call in 0 ms (MEASURED,
+    /// `scratchpad/f7/TestBit.java`, Microsoft OpenJDK 25.0.3+9), and the
+    /// transliteration of the body below agrees with `java.math.BigInteger` on
+    /// 371,547 (operand, bit) pairs — including every bit index up to 400 and
+    /// `Integer.MAX_VALUE` itself — with zero diffs.
     pub(crate) fn test_bit(&self, n: u32) -> bool {
-        let word = (n / 32) as usize;
-        let len = self.mag.len().max(word + 1) + 1;
-        let tw = self.to_twos(len);
-        (tw[word] >> (n % 32)) & 1 == 1
+        (self.get_int((n / 32) as usize) >> (n % 32)) & 1 == 1
     }
 
     /// `BigInteger.getLowestSetBit()` — index of the rightmost set bit, or -1
@@ -1232,6 +1297,54 @@ mod tests {
     #[ignore = "exhaustive decimal cross-check takes several minutes; run explicitly before bigint rewrites"]
     fn positive_bit_ops_match_decimal_exhaustive() {
         positive_bit_ops_match_decimal_cases(150, 25);
+    }
+
+    /// `test_bit` must answer a huge bit address from the sign alone, without
+    /// materializing the two's complement out to that word. The old body built
+    /// `vec![0u32; (n/32)+2]`, so every row here allocated ~256 MB; this test
+    /// would have taken minutes and ~4 GB.
+    ///
+    /// Expected values MEASURED on Microsoft OpenJDK 25.0.3+9
+    /// (`scratchpad/f7/TestBit.java`), each `[0 ms]`:
+    ///
+    /// ```text
+    /// ONE.testBit(Integer.MAX_VALUE)  = false      (-1).testBit(Integer.MAX_VALUE) = true
+    /// ZERO.testBit(Integer.MAX_VALUE) = false      (-1).testBit(0)                 = true
+    /// (-2).testBit(0) = false                      (-2).testBit(1)                 = true
+    /// (2^64).testBit(0)     = false                (-(2^64)).testBit(0)  = false
+    /// (-(2^64)).testBit(64) = true                 (-(2^64)).testBit(65) = true
+    /// (-(2^64+1)).testBit(0) = true                (-(2^64+1)).testBit(1) = true
+    /// ```
+    ///
+    /// The full transliteration of this body agrees with `java.math.BigInteger`
+    /// on 371,547 (operand, bit) pairs with zero diffs.
+    #[test]
+    fn test_bit_is_allocation_free_at_huge_addresses() {
+        const MAX: u32 = i32::MAX as u32;
+        assert!(!b("1").test_bit(MAX));
+        assert!(b("-1").test_bit(MAX));
+        assert!(!b("0").test_bit(MAX));
+        assert!(b("-1").test_bit(0));
+        assert!(!b("-2").test_bit(0));
+        assert!(b("-2").test_bit(1));
+        // 2^64 == mag [0, 0, 1]: the low limbs are zero, which is what
+        // separates `-magInt` from `~magInt` in the JDK's `getInt`.
+        let p64 = b("18446744073709551616");
+        let n64 = b("-18446744073709551616");
+        assert!(!p64.test_bit(0));
+        assert!(!n64.test_bit(0));
+        assert!(n64.test_bit(64));
+        assert!(n64.test_bit(65));
+        assert!(n64.test_bit(MAX));
+        let n64p1 = b("-18446744073709551617");
+        assert!(n64p1.test_bit(0));
+        assert!(n64p1.test_bit(1));
+        // A positive value is 0 above its magnitude, a negative one is 1 —
+        // for every address past the top limb, not just the huge ones.
+        for &n in &[96u32, 97, 1000, 1 << 20, 1 << 26, MAX - 1, MAX] {
+            assert!(!p64.test_bit(n), "positive bit {n}");
+            assert!(n64.test_bit(n), "negative bit {n}");
+        }
     }
 
     #[test]

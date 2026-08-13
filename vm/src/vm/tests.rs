@@ -1156,6 +1156,8 @@ use std::sync::Arc;
                 read_java_string(&shared.mem.heap, obj),
                 Some("hello world".to_string())
             );
+        } else {
+            panic!("String.toLowerCase()Ljava/lang/String; must answer a String reference, got {r:?}");
         }
 
         let text2 = create_java_string(&shared, "Hello World");
@@ -1173,6 +1175,8 @@ use std::sync::Arc;
                 read_java_string(&shared.mem.heap, obj),
                 Some("HELLO WORLD".to_string())
             );
+        } else {
+            panic!("String.toUpperCase()Ljava/lang/String; must answer a String reference, got {r:?}");
         }
     }
 
@@ -6572,6 +6576,8 @@ use std::sync::Arc;
         .unwrap();
         if let Some(Value::Int(v)) = r {
             assert!(v < 0, "compare(-0.0, 0.0) should be negative, got {v}");
+        } else {
+            panic!("Float.compare(FF)I must answer an int, got {r:?}");
         }
 
         // Float.compare(NaN, 1.0) should be > 0
@@ -6586,6 +6592,8 @@ use std::sync::Arc;
         .unwrap();
         if let Some(Value::Int(v)) = r {
             assert!(v > 0, "compare(NaN, 1.0) should be positive, got {v}");
+        } else {
+            panic!("Float.compare(NaN, 1.0) must answer an int, got {r:?}");
         }
     }
 
@@ -7612,6 +7620,8 @@ use std::sync::Arc;
         .unwrap();
         if let Some(Value::Object(Some(s))) = r0 {
             assert_eq!(read_java_string(&shared.mem.heap, s), Some("c".into()));
+        } else {
+            panic!("ArrayList.get(0) after Collections.reverse must answer a reference, got {r0:?}");
         }
 
         let r2 = call_native(
@@ -7625,6 +7635,8 @@ use std::sync::Arc;
         .unwrap();
         if let Some(Value::Object(Some(s))) = r2 {
             assert_eq!(read_java_string(&shared.mem.heap, s), Some("a".into()));
+        } else {
+            panic!("ArrayList.get(2) after Collections.reverse must answer a reference, got {r2:?}");
         }
     }
 
@@ -44334,6 +44346,34 @@ use std::sync::Arc;
         assert_eq!(empty, Value::Int(1));
     }
 
+    // DEAD TWICE OVER (measured 2026-08-13, lane F9). The four values asserted
+    // below are all CORRECT against the JDK — and no classfile in any mode will
+    // ever ask this VM for them.
+    //
+    // First: `getstatic` has three implementations here
+    // (`interpreter/opcodes.rs Instruction::Getstatic`, `jit/helpers.rs
+    // jit_getstatic`, `ir_lower.rs emit_inline_getstatic`) and NONE consults
+    // the native registry — the third bakes the statics base as an immediate
+    // and emits two `mov`s with no call at all. E21-1.
+    //
+    // Second, and specific to these: `SelectionKey.OP_*` are `static final int`
+    // CONSTANT EXPRESSIONS, so JLS 13.1 inlining applies and javac emits no
+    // `getstatic` in the first place. Measured on 25.0.3+9-LTS:
+    //
+    //   static int opRead() { return SelectionKey.OP_READ; }
+    //     0: iconst_1                       // not getstatic
+    //
+    // versus a reference-typed constant, which does emit a real read the
+    // registry still cannot answer:
+    //
+    //   static Object utf8() { return StandardCharsets.UTF_8; }
+    //     0: getstatic Field java/nio/charset/StandardCharsets.UTF_8:
+    //                       Ljava/nio/charset/Charset;
+    //
+    // Kept, not deleted: a right answer is not a reason to delete, and the
+    // registrations are what would have to go first. This is a right answer to
+    // a question nobody asks — which is why "every value checked was correct"
+    // (E40-1 §4d) is not reassurance on its own.
     #[test]
     fn selection_key_constants_p58() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
@@ -44760,6 +44800,12 @@ use std::sync::Arc;
         );
     }
 
+    // DEAD TWICE OVER, exactly as `selection_key_constants_p58` — see the block
+    // comment there for the mechanism and the bytecode. Measured on
+    // 25.0.3+9-LTS:
+    //
+    //   static int spOrdered() { return Spliterator.ORDERED; }
+    //     0: bipush 16                      // not getstatic
     #[test]
     fn spliterator_constants_p59() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
@@ -48024,6 +48070,22 @@ use std::sync::Arc;
             assert!(matches!(stream, Value::Object(Some(_))));
 
             let _ = std::fs::remove_file(&tmp);
+        } else {
+            // Without this arm the ENTIRE body above was optional: the
+            // `let _ = cm.load_class("java/lang/String")` two lines up
+            // DISCARDS its Result, so a failure to load left `string_id` as
+            // `None` and this test reported success having asserted nothing at
+            // all — no JAR built, no `find_resource`, no ServiceLoader call.
+            // `VmConfig::default()` is `EMBEDDED_DEFAULT_JDK_MODE` =
+            // synthetic (vm/src/config.rs:225), and `java/lang/String` is a
+            // declared synthetic bootstrap class
+            // (`classloading/src/class_manager.rs`), so this arm is expected
+            // to be unreachable — but it is the only thing that says so.
+            panic!(
+                "java/lang/String is not a loaded bootstrap class, so this test \
+                 would have asserted NOTHING; load_class's discarded Result is \
+                 the thing to look at"
+            );
         }
     }
 
@@ -48381,6 +48443,11 @@ use std::sync::Arc;
             .unwrap()
             .unwrap();
             assert!(matches!(itr, Value::Object(Some(_))));
+        } else {
+            panic!(
+                "Collections.emptyEnumeration()Ljava/util/Enumeration; must answer a \
+                 reference, got {en:?}"
+            );
         }
     }
 
@@ -48587,6 +48654,8 @@ use std::sync::Arc;
         .unwrap();
         if let Value::Object(Some(s)) = hex {
             assert_eq!(read_java_string(&shared.mem.heap, s).unwrap(), "0102ff");
+        } else {
+            panic!("HexFormat.formatHex([B)Ljava/lang/String; must answer a String, got {hex:?}");
         }
         // parseHex back
         let hex_str = create_java_string(&shared, "0102ff");
@@ -48614,6 +48683,8 @@ use std::sync::Arc;
                 Value::Int(-1)
             );
             // 0xFF = -1 as signed byte
+        } else {
+            panic!("HexFormat.parseHex(Ljava/lang/String;)[B must answer a byte[], got {parsed:?}");
         }
     }
 
@@ -48801,7 +48872,14 @@ use std::sync::Arc;
                 .unwrap()
                 .unwrap();
                 assert_eq!(size, Value::Int(3));
+            } else {
+                panic!("Stream.toList()Ljava/util/List; must answer a reference, got {list:?}");
             }
+        } else {
+            panic!(
+                "Stream.concat(Stream,Stream)Ljava/util/stream/Stream; must answer a \
+                 reference, got {result:?}"
+            );
         }
     }
 
@@ -48874,6 +48952,8 @@ use std::sync::Arc;
         .unwrap();
         if let Value::Int(v) = r {
             assert!((10..20).contains(&v));
+        } else {
+            panic!("ThreadLocalRandom.nextInt(II)I must answer an int, got {r:?}");
         }
         // nextDouble is in [0, 1)
         let d = call_native(
@@ -48888,6 +48968,8 @@ use std::sync::Arc;
         .unwrap();
         if let Value::Double(v) = d {
             assert!((0.0..1.0).contains(&v));
+        } else {
+            panic!("ThreadLocalRandom.nextDouble()D must answer a double, got {d:?}");
         }
     }
 
@@ -50039,6 +50121,11 @@ use std::sync::Arc;
             assert!(matches!(thr, Value::Object(Some(_))));
             // Wait a moment for the thread to complete
             std::thread::sleep(std::time::Duration::from_millis(50));
+        } else {
+            panic!(
+                "Thread.ofVirtual()Ljava/lang/Thread$Builder; must answer a reference, \
+                 got {builder:?}"
+            );
         }
     }
 
@@ -51662,7 +51749,17 @@ use std::sync::Arc;
                 let hs = shared.mem.heap.get_field(test_eng, 5); // handshake_status
                 assert_eq!(hs, Value::Int(1)); // HS_NEED_WRAP
                 let _ = eng; // original engine from createSSLEngine also valid
+            } else {
+                // Unreachable: guarded by the `assert!(matches!(engine, ...))`
+                // three lines up. Present so the shape cannot rot into a real
+                // skip if that assertion is ever moved or relaxed.
+                panic!("SSLContext.createSSLEngine must answer a reference, got {engine:?}");
             }
+        } else {
+            panic!(
+                "SSLContext.getDefault()Ljavax/net/ssl/SSLContext; must answer a \
+                 reference, got {ctx_obj:?}"
+            );
         }
     }
 
@@ -56821,6 +56918,49 @@ use std::sync::Arc;
     // =========================================================================
     // Phase E: Panama FFI (JEP 454)
     // =========================================================================
+    //
+    // THE TWO ENCODINGS ARE GONE; THESE TESTS NOW SPEAK THE JDK'S (F16,
+    // 2026-08-13). This block replaces F9's "just fix it is not available"
+    // note, which was correct on the day it was written and is now resolved.
+    //
+    // F9 found fourteen sites in eight tests driving `ValueLayout.JAVA_*`
+    // under `()Ljava/lang/foreign/ValueLayout;` — a METHOD descriptor for a
+    // FIELD, naming a return type the JDK never uses:
+    //
+    //   $ javap -p java.lang.foreign.ValueLayout        # 25.0.3+9-LTS
+    //     public static final java.lang.foreign.ValueLayout$OfInt JAVA_INT;
+    //   $ javap -c F16Desc   # static Object e(){ return ValueLayout.JAVA_INT; }
+    //     0: getstatic  Field java/lang/foreign/ValueLayout.JAVA_INT:
+    //                         Ljava/lang/foreign/ValueLayout$OfInt;
+    //
+    // and could not simply correct them, because the `$Of*` spelling resolved
+    // to a SECOND registration with an incompatible object encoding, and the
+    // group-layout consumers were bound to the other one by registration
+    // ORDER rather than by descriptor. Both halves have now been resolved in
+    // `native-builtins`:
+    //
+    //   * `panama.rs`'s `pe_make_layout` (3 slots, `[0]=Int(kind)`) is
+    //     `#[cfg(test)]` and mints nothing that ships; its nine fabricated
+    //     `()L…ValueLayout;` rows and its whole group-layout family are
+    //     DELETED.
+    //   * `phases_late/foreign_ffm.rs` is the only implementation left, in
+    //     BOTH JDK modes, on the JDK's own shape — `[0]=Long(byteSize),
+    //     [1]=Long(byteAlignment), [2]=payload, [3]=name`, the order a real
+    //     `jdk.internal.foreign.layout.AbstractLayout` declares.
+    //
+    // So all fourteen sites now carry the descriptor `javap` prints, and the
+    // group-layout calls carry theirs (`…)Ljava/lang/foreign/StructLayout;`,
+    // `UnionLayout`, `SequenceLayout`) instead of the fabricated
+    // `…)Ljava/lang/foreign/MemoryLayout;` that only panama ever registered.
+    //
+    // READ SLOT 0 FOR A SIZE AND SLOT 1 FOR AN ALIGNMENT. The tests below used
+    // to read slot 1 for the size and slot 5 for the alignment, which were the
+    // deleted carrier's. Prefer calling `byteSize()`/`byteAlignment()` over
+    // touching a slot at all — those are registered on every layout class now.
+    //
+    // Two tests below assert an EXCEPTION where they used to assert a number.
+    // That is not a regression: they were pinning a call HotSpot refuses. See
+    // `panama_struct_layout_pe2` and `struct_layout_byte_int_alignment`.
 
     #[test]
     fn panama_value_layout_constants_pe() {
@@ -56833,7 +56973,7 @@ use std::sync::Arc;
             &mut thread,
             vl,
             "JAVA_INT",
-            "()Ljava/lang/foreign/ValueLayout;",
+            "Ljava/lang/foreign/ValueLayout$OfInt;",
             &[],
         )
         .unwrap()
@@ -56859,7 +56999,7 @@ use std::sync::Arc;
             &mut thread,
             vl,
             "JAVA_LONG",
-            "()Ljava/lang/foreign/ValueLayout;",
+            "Ljava/lang/foreign/ValueLayout$OfLong;",
             &[],
         )
         .unwrap()
@@ -57013,7 +57153,7 @@ use std::sync::Arc;
             &mut thread,
             vl,
             "JAVA_INT",
-            "()Ljava/lang/foreign/ValueLayout;",
+            "Ljava/lang/foreign/ValueLayout$OfInt;",
             &[],
         )
         .unwrap()
@@ -57150,7 +57290,7 @@ use std::sync::Arc;
             &mut thread,
             "java/lang/foreign/ValueLayout",
             "JAVA_BYTE",
-            "()Ljava/lang/foreign/ValueLayout;",
+            "Ljava/lang/foreign/ValueLayout$OfByte;",
             &[],
         )
         .unwrap()
@@ -57199,7 +57339,7 @@ use std::sync::Arc;
             &mut thread,
             vl,
             "JAVA_INT",
-            "()Ljava/lang/foreign/ValueLayout;",
+            "Ljava/lang/foreign/ValueLayout$OfInt;",
             &[],
         )
         .unwrap()
@@ -57313,7 +57453,7 @@ use std::sync::Arc;
             &mut thread,
             vl,
             "JAVA_INT",
-            "()Ljava/lang/foreign/ValueLayout;",
+            "Ljava/lang/foreign/ValueLayout$OfInt;",
             &[],
         )
         .unwrap()
@@ -57323,7 +57463,7 @@ use std::sync::Arc;
             &mut thread,
             vl,
             "JAVA_LONG",
-            "()Ljava/lang/foreign/ValueLayout;",
+            "Ljava/lang/foreign/ValueLayout$OfLong;",
             &[],
         )
         .unwrap()
@@ -57337,20 +57477,94 @@ use std::sync::Arc;
         let _ = shared.mem.heap.set_array_element(members, 0, int_layout);
         let _ = shared.mem.heap.set_array_element(members, 1, long_layout);
 
-        // Create struct layout
+        // WAS A DIVERGENCE PIN, IS NOW A REAL ASSERTION (F16, 2026-08-13).
+        //
+        // This test used to assert byteSize=16 / byteAlignment=8 for
+        // `structLayout(JAVA_INT, JAVA_LONG)`. F9 measured that HotSpot
+        // REFUSES that call and relabelled the numbers as a divergence pin
+        // rather than inventing new ones, because the fix was in
+        // native-builtins. It has landed, so the pin becomes the measurement:
+        //
+        //   $ java F16Probe                               # 25.0.3+9-LTS
+        //     structLayout(JAVA_INT, JAVA_LONG)
+        //       -> THREW java.lang.IllegalArgumentException:
+        //          Invalid alignment constraint for member layout: j8
+        //
+        // The JDK never auto-pads a struct — the caller writes the padding,
+        // and an under-aligned member is an error. `JAVA_LONG` needs an offset
+        // divisible by 8 and lands at 4.
+        //
+        // The KIND is what a `catch` can rely on and is asserted exactly. The
+        // MESSAGE is checked loosely, because the JDK renders the offending
+        // member with `MemoryLayout::toString` (`j8`) and that rendering is a
+        // diagnostic, not a contract.
+        let refused = call_native(
+            &shared,
+            &mut thread,
+            ml,
+            "structLayout",
+            "([Ljava/lang/foreign/MemoryLayout;)Ljava/lang/foreign/StructLayout;",
+            &[Value::Object(Some(members))],
+        );
+        match refused {
+            Err(MethodCallFailed::InternalError(crate::error::VmError::Runtime(
+                crate::error::RuntimeError::IllegalArgumentException { ref message },
+            ))) => {
+                assert!(
+                    message.contains("Invalid alignment constraint for member layout"),
+                    "structLayout(JAVA_INT, JAVA_LONG) must refuse with the JDK's wording, \
+                     got {message:?}"
+                );
+            }
+            other => panic!(
+                "structLayout(JAVA_INT, JAVA_LONG) must throw IllegalArgumentException the way \
+                 HotSpot 25.0.3+9 does (Invalid alignment constraint for member layout: j8); \
+                 got {other:?}"
+            ),
+        }
+
+        // The padded form is the one the JDK accepts, and it is the 16/8 this
+        // test used to claim for the unpadded call. Measured:
+        //   structLayout(JAVA_INT, paddingLayout(4), JAVA_LONG)
+        //     -> byteSize=16 byteAlignment=8
+        let padding = call_native(
+            &shared,
+            &mut thread,
+            ml,
+            "paddingLayout",
+            "(J)Ljava/lang/foreign/PaddingLayout;",
+            &[Value::Long(4)],
+        )
+        .unwrap()
+        .unwrap();
+
+        let padded_members = shared.mem.heap.alloc_array(
+            ClassId::new(0),
+            crate::memory::heap::ArrayElementType::Reference,
+            3,
+        );
+        let _ = shared
+            .mem
+            .heap
+            .set_array_element(padded_members, 0, int_layout);
+        let _ = shared.mem.heap.set_array_element(padded_members, 1, padding);
+        let _ = shared
+            .mem
+            .heap
+            .set_array_element(padded_members, 2, long_layout);
+
         let struct_layout = call_native(
             &shared,
             &mut thread,
             ml,
             "structLayout",
-            "([Ljava/lang/foreign/MemoryLayout;)Ljava/lang/foreign/MemoryLayout;",
-            &[Value::Object(Some(members))],
+            "([Ljava/lang/foreign/MemoryLayout;)Ljava/lang/foreign/StructLayout;",
+            &[Value::Object(Some(padded_members))],
         )
         .unwrap()
         .unwrap();
 
         if let Value::Object(Some(sl)) = struct_layout {
-            // struct { int (4 bytes), padding (4 bytes), long (8 bytes) } = 16 bytes
             let size = call_native(
                 &shared,
                 &mut thread,
@@ -57364,7 +57578,7 @@ use std::sync::Arc;
             assert_eq!(
                 size,
                 Value::Long(16),
-                "struct(int, long) should be 16 bytes (4+4pad+8)"
+                "struct(int, pad(4), long) is 16 bytes on HotSpot 25.0.3+9"
             );
 
             let align = call_native(
@@ -57380,10 +57594,285 @@ use std::sync::Arc;
             assert_eq!(
                 align,
                 Value::Long(8),
-                "alignment should be 8 (max member alignment)"
+                "alignment is 8 (max member alignment)"
             );
         } else {
-            panic!("Expected StructLayout object");
+            panic!("MemoryLayout.structLayout must answer a reference, got {struct_layout:?}");
+        }
+    }
+
+    /// The JDK does not round a struct's total size up to its alignment, and
+    /// this VM used to (F16, 2026-08-13). Measured on 25.0.3+9-LTS:
+    ///
+    /// ```text
+    /// structLayout(JAVA_LONG, JAVA_INT) -> byteSize=12 align=8
+    /// structLayout(JAVA_INT,  JAVA_BYTE) -> byteSize=5  align=4
+    /// structLayout()                     -> byteSize=0  align=1
+    /// ```
+    ///
+    /// `structLayout(JAVA_LONG, JAVA_INT)` is the important one: it is a call
+    /// the oracle ACCEPTS (each member lands on a multiple of its own
+    /// alignment — long at 0, int at 8), so no alignment refusal hides the
+    /// arithmetic. The old body ended with
+    /// `total_size = ((offset + max_align - 1) / max_align) * max_align`
+    /// and answered 16. Nothing tested it.
+    #[test]
+    fn struct_layout_does_not_pad_the_total() {
+        let shared = Arc::new(SharedVm::new(VmConfig::default()));
+        let mut thread = JvmThread::new(ThreadId(0), "test");
+        let vl = "java/lang/foreign/ValueLayout";
+        let ml = "java/lang/foreign/MemoryLayout";
+
+        let long_layout = call_native(
+            &shared,
+            &mut thread,
+            vl,
+            "JAVA_LONG",
+            "Ljava/lang/foreign/ValueLayout$OfLong;",
+            &[],
+        )
+        .unwrap()
+        .unwrap();
+        let int_layout = call_native(
+            &shared,
+            &mut thread,
+            vl,
+            "JAVA_INT",
+            "Ljava/lang/foreign/ValueLayout$OfInt;",
+            &[],
+        )
+        .unwrap()
+        .unwrap();
+
+        let members = shared.mem.heap.alloc_array(
+            ClassId::new(0),
+            crate::memory::heap::ArrayElementType::Reference,
+            2,
+        );
+        let _ = shared.mem.heap.set_array_element(members, 0, long_layout);
+        let _ = shared.mem.heap.set_array_element(members, 1, int_layout);
+
+        let sl = call_native(
+            &shared,
+            &mut thread,
+            ml,
+            "structLayout",
+            "([Ljava/lang/foreign/MemoryLayout;)Ljava/lang/foreign/StructLayout;",
+            &[Value::Object(Some(members))],
+        )
+        .unwrap()
+        .unwrap();
+
+        let Value::Object(Some(s)) = sl else {
+            panic!("MemoryLayout.structLayout must answer a reference, got {sl:?}");
+        };
+        let size = call_native(
+            &shared,
+            &mut thread,
+            "java/lang/foreign/StructLayout",
+            "byteSize",
+            "()J",
+            &[Value::Object(Some(s))],
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            size,
+            Value::Long(12),
+            "struct(long, int) is 12 bytes on HotSpot 25.0.3+9 — the total is NOT rounded up \
+             to the 8-byte alignment"
+        );
+
+        let align = call_native(
+            &shared,
+            &mut thread,
+            "java/lang/foreign/StructLayout",
+            "byteAlignment",
+            "()J",
+            &[Value::Object(Some(s))],
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(align, Value::Long(8), "alignment is max(8, 4) = 8");
+    }
+
+    /// A padding layout's alignment is 1, whatever its size — and this is what
+    /// made the JDK's own CORRECT idiom answer wrongly here (F16,
+    /// 2026-08-13). Measured on 25.0.3+9-LTS:
+    ///
+    /// ```text
+    /// paddingLayout(3)                                    -> byteSize=3 align=1
+    /// structLayout(JAVA_BYTE, paddingLayout(3), JAVA_INT) -> byteSize=8 align=4
+    /// ```
+    ///
+    /// `paddingLayout` used to mint a ONE-slot carrier, so the member decode
+    /// found no alignment in slot 1 and fell back to "alignment = size" — a
+    /// 3-byte padding claiming 3-byte alignment. The struct above then came
+    /// out at 12 instead of 8. The carrier is four slots now, like every other
+    /// layout, and `PaddingLayout` has the accessors to read it with (it had
+    /// none at all: `paddingLayout(3).byteSize()` raised `AbstractMethodError`).
+    #[test]
+    fn padding_layout_is_byte_aligned_and_pads_a_struct_to_eight() {
+        let shared = Arc::new(SharedVm::new(VmConfig::default()));
+        let mut thread = JvmThread::new(ThreadId(0), "test");
+        let vl = "java/lang/foreign/ValueLayout";
+        let ml = "java/lang/foreign/MemoryLayout";
+
+        let padding = call_native(
+            &shared,
+            &mut thread,
+            ml,
+            "paddingLayout",
+            "(J)Ljava/lang/foreign/PaddingLayout;",
+            &[Value::Long(3)],
+        )
+        .unwrap()
+        .unwrap();
+        let Value::Object(Some(p)) = padding else {
+            panic!("MemoryLayout.paddingLayout must answer a reference, got {padding:?}");
+        };
+        assert_eq!(
+            call_native(
+                &shared,
+                &mut thread,
+                "java/lang/foreign/PaddingLayout",
+                "byteSize",
+                "()J",
+                &[Value::Object(Some(p))],
+            )
+            .unwrap()
+            .unwrap(),
+            Value::Long(3),
+            "paddingLayout(3).byteSize() is 3"
+        );
+        assert_eq!(
+            call_native(
+                &shared,
+                &mut thread,
+                "java/lang/foreign/PaddingLayout",
+                "byteAlignment",
+                "()J",
+                &[Value::Object(Some(p))],
+            )
+            .unwrap()
+            .unwrap(),
+            Value::Long(1),
+            "a padding layout's alignment is ALWAYS 1, never its size"
+        );
+
+        let byte_layout = call_native(
+            &shared,
+            &mut thread,
+            vl,
+            "JAVA_BYTE",
+            "Ljava/lang/foreign/ValueLayout$OfByte;",
+            &[],
+        )
+        .unwrap()
+        .unwrap();
+        let int_layout = call_native(
+            &shared,
+            &mut thread,
+            vl,
+            "JAVA_INT",
+            "Ljava/lang/foreign/ValueLayout$OfInt;",
+            &[],
+        )
+        .unwrap()
+        .unwrap();
+
+        let members = shared.mem.heap.alloc_array(
+            ClassId::new(0),
+            crate::memory::heap::ArrayElementType::Reference,
+            3,
+        );
+        let _ = shared.mem.heap.set_array_element(members, 0, byte_layout);
+        let _ = shared.mem.heap.set_array_element(members, 1, padding);
+        let _ = shared.mem.heap.set_array_element(members, 2, int_layout);
+
+        let sl = call_native(
+            &shared,
+            &mut thread,
+            ml,
+            "structLayout",
+            "([Ljava/lang/foreign/MemoryLayout;)Ljava/lang/foreign/StructLayout;",
+            &[Value::Object(Some(members))],
+        )
+        .unwrap()
+        .unwrap();
+        let Value::Object(Some(s)) = sl else {
+            panic!("MemoryLayout.structLayout must answer a reference, got {sl:?}");
+        };
+        assert_eq!(
+            call_native(
+                &shared,
+                &mut thread,
+                "java/lang/foreign/StructLayout",
+                "byteSize",
+                "()J",
+                &[Value::Object(Some(s))],
+            )
+            .unwrap()
+            .unwrap(),
+            Value::Long(8),
+            "struct(byte, pad(3), int) is 8 bytes — the idiom the JDK REQUIRES, which this VM \
+             answered 12 for while its padding carried alignment 3"
+        );
+        assert_eq!(
+            call_native(
+                &shared,
+                &mut thread,
+                "java/lang/foreign/StructLayout",
+                "byteAlignment",
+                "()J",
+                &[Value::Object(Some(s))],
+            )
+            .unwrap()
+            .unwrap(),
+            Value::Long(4),
+            "alignment is max(1, 1, 4) = 4 — padding contributes 1, not 3"
+        );
+    }
+
+    /// `sequenceLayout` rejects a negative element count, as the JDK does.
+    /// Measured: `sequenceLayout(-1, JAVA_INT)` throws
+    /// `IllegalArgumentException: The provided elementCount is negative: -1`.
+    /// This VM accepted it and answered a NEGATIVE byteSize.
+    #[test]
+    fn sequence_layout_rejects_negative_element_count() {
+        let shared = Arc::new(SharedVm::new(VmConfig::default()));
+        let mut thread = JvmThread::new(ThreadId(0), "test");
+
+        let int_layout = call_native(
+            &shared,
+            &mut thread,
+            "java/lang/foreign/ValueLayout",
+            "JAVA_INT",
+            "Ljava/lang/foreign/ValueLayout$OfInt;",
+            &[],
+        )
+        .unwrap()
+        .unwrap();
+
+        let refused = call_native(
+            &shared,
+            &mut thread,
+            "java/lang/foreign/MemoryLayout",
+            "sequenceLayout",
+            "(JLjava/lang/foreign/MemoryLayout;)Ljava/lang/foreign/SequenceLayout;",
+            &[Value::Long(-1), int_layout],
+        );
+        match refused {
+            Err(MethodCallFailed::InternalError(crate::error::VmError::Runtime(
+                crate::error::RuntimeError::IllegalArgumentException { ref message },
+            ))) => assert!(
+                message.contains("negative"),
+                "sequenceLayout(-1, JAVA_INT) must refuse with the JDK's wording, got {message:?}"
+            ),
+            other => panic!(
+                "sequenceLayout(-1, JAVA_INT) must throw IllegalArgumentException \
+                 (The provided elementCount is negative: -1); got {other:?}"
+            ),
         }
     }
 
@@ -57399,27 +57888,61 @@ use std::sync::Arc;
             &mut thread,
             vl,
             "JAVA_INT",
-            "()Ljava/lang/foreign/ValueLayout;",
+            "Ljava/lang/foreign/ValueLayout$OfInt;",
             &[],
         )
         .unwrap()
         .unwrap();
 
-        // sequenceLayout(10, JAVA_INT) → 40 bytes
+        // sequenceLayout(10, JAVA_INT) → 40 bytes, alignment 4.
+        // Measured on 25.0.3+9-LTS: byteSize=40 align=4. This test already
+        // agreed with the oracle; what changed (F16, 2026-08-13) is the
+        // descriptor — `…)Ljava/lang/foreign/SequenceLayout;` is what javac
+        // emits, and the `…)Ljava/lang/foreign/MemoryLayout;` spelling it used
+        // was registered only by the deleted panama family — and the SLOT: the
+        // size is slot 0 in the authoritative carrier, not slot 1.
         let seq = call_native(
             &shared,
             &mut thread,
             ml,
             "sequenceLayout",
-            "(JLjava/lang/foreign/MemoryLayout;)Ljava/lang/foreign/MemoryLayout;",
+            "(JLjava/lang/foreign/MemoryLayout;)Ljava/lang/foreign/SequenceLayout;",
             &[Value::Long(10), int_layout],
         )
         .unwrap()
         .unwrap();
 
         if let Value::Object(Some(s)) = seq {
-            let size = shared.mem.heap.get_field(s, 1);
-            assert_eq!(size, Value::Long(40));
+            // Read it the way Java does rather than by slot index, so the test
+            // survives a carrier change instead of pinning one.
+            let size = call_native(
+                &shared,
+                &mut thread,
+                "java/lang/foreign/SequenceLayout",
+                "byteSize",
+                "()J",
+                &[Value::Object(Some(s))],
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(size, Value::Long(40), "sequenceLayout(10, JAVA_INT) is 40 bytes");
+            let align = call_native(
+                &shared,
+                &mut thread,
+                "java/lang/foreign/SequenceLayout",
+                "byteAlignment",
+                "()J",
+                &[Value::Object(Some(s))],
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(
+                align,
+                Value::Long(4),
+                "a sequence's alignment is its ELEMENT's, not its total size"
+            );
+        } else {
+            panic!("MemoryLayout.sequenceLayout must answer a reference, got {seq:?}");
         }
     }
 
@@ -57561,6 +58084,8 @@ use std::sync::Arc;
         if let Value::Object(Some(r)) = reinterpreted {
             let size = shared.mem.heap.get_field(r, 1);
             assert_eq!(size, Value::Long(128));
+        } else {
+            panic!("MemorySegment.reinterpret(J) must answer a reference, got {reinterpreted:?}");
         }
 
         call_native(
@@ -57749,7 +58274,7 @@ use std::sync::Arc;
             &mut thread,
             "java/lang/foreign/ValueLayout",
             "JAVA_INT",
-            "()Ljava/lang/foreign/ValueLayout;",
+            "Ljava/lang/foreign/ValueLayout$OfInt;",
             &[],
         )
         .unwrap()
@@ -57766,16 +58291,47 @@ use std::sync::Arc;
             &mut thread,
             "java/lang/foreign/MemoryLayout",
             "structLayout",
-            "([Ljava/lang/foreign/MemoryLayout;)Ljava/lang/foreign/MemoryLayout;",
+            "([Ljava/lang/foreign/MemoryLayout;)Ljava/lang/foreign/StructLayout;",
             &[Value::Object(Some(members))],
         )
         .unwrap()
         .unwrap();
 
+        // Single int field: byteSize=4, byteAlignment=4. Measured on
+        // 25.0.3+9-LTS, and unchanged by F16 — this was one of the three
+        // layouts F9 confirmed already agreed with the oracle. What changed is
+        // only HOW it is read: the descriptor javac actually emits, and
+        // `byteSize()`/`byteAlignment()` instead of slots 1 and 5, which
+        // belonged to the deleted carrier.
         if let Value::Object(Some(s)) = sl {
-            // Single int field: size=4, alignment=4
-            assert_eq!(shared.mem.heap.get_field(s, 1), Value::Long(4));
-            assert_eq!(shared.mem.heap.get_field(s, 5), Value::Long(4));
+            assert_eq!(
+                call_native(
+                    &shared,
+                    &mut thread,
+                    "java/lang/foreign/StructLayout",
+                    "byteSize",
+                    "()J",
+                    &[Value::Object(Some(s))],
+                )
+                .unwrap()
+                .unwrap(),
+                Value::Long(4)
+            );
+            assert_eq!(
+                call_native(
+                    &shared,
+                    &mut thread,
+                    "java/lang/foreign/StructLayout",
+                    "byteAlignment",
+                    "()J",
+                    &[Value::Object(Some(s))],
+                )
+                .unwrap()
+                .unwrap(),
+                Value::Long(4)
+            );
+        } else {
+            panic!("MemoryLayout.structLayout must answer a reference, got {sl:?}");
         }
     }
 
@@ -57790,7 +58346,7 @@ use std::sync::Arc;
             &mut thread,
             "java/lang/foreign/ValueLayout",
             "JAVA_BYTE",
-            "()Ljava/lang/foreign/ValueLayout;",
+            "Ljava/lang/foreign/ValueLayout$OfByte;",
             &[],
         )
         .unwrap()
@@ -57800,7 +58356,7 @@ use std::sync::Arc;
             &mut thread,
             "java/lang/foreign/ValueLayout",
             "JAVA_INT",
-            "()Ljava/lang/foreign/ValueLayout;",
+            "Ljava/lang/foreign/ValueLayout$OfInt;",
             &[],
         )
         .unwrap()
@@ -57814,33 +58370,50 @@ use std::sync::Arc;
         let _ = shared.mem.heap.set_array_element(members, 0, byte_layout);
         let _ = shared.mem.heap.set_array_element(members, 1, int_layout);
 
-        let sl = call_native(
+        // WAS A DIVERGENCE PIN, IS NOW A REAL ASSERTION (F16, 2026-08-13) —
+        // the same fabrication as `panama_struct_layout_pe2`, one size down.
+        // Re-measured on 25.0.3+9-LTS rather than taken from F9's transcript:
+        //
+        //   $ java F16Probe
+        //     structLayout(JAVA_BYTE, JAVA_INT)
+        //       -> THREW java.lang.IllegalArgumentException:
+        //          Invalid alignment constraint for member layout: i4
+        //
+        // The 8/4 this test used to assert is the PADDED layout's answer, and
+        // this call supplies no padding. `JAVA_INT` needs an offset divisible
+        // by 4 and lands at 1.
+        //
+        // The padded form — `structLayout(JAVA_BYTE, paddingLayout(3),
+        // JAVA_INT) -> 8/4`, the idiom the JDK requires — is asserted in
+        // `padding_layout_is_byte_aligned_and_pads_a_struct_to_eight`, which
+        // is where the old 8/4 numbers now live, attached to the call that
+        // actually produces them.
+        //
+        // The slot-4 "offsets array" the old body checked is gone with the
+        // deleted carrier. A member's offset is now derived by the one shared
+        // layout-path walk (`p67_layout_path_walk`) rather than cached in a
+        // parallel array, so there is no second copy to disagree with it.
+        let refused = call_native(
             &shared,
             &mut thread,
             "java/lang/foreign/MemoryLayout",
             "structLayout",
-            "([Ljava/lang/foreign/MemoryLayout;)Ljava/lang/foreign/MemoryLayout;",
+            "([Ljava/lang/foreign/MemoryLayout;)Ljava/lang/foreign/StructLayout;",
             &[Value::Object(Some(members))],
-        )
-        .unwrap()
-        .unwrap();
-
-        if let Value::Object(Some(s)) = sl {
-            // byte(1) at offset 0, pad to 4, int(4) at offset 4, total = 8
-            assert_eq!(shared.mem.heap.get_field(s, 1), Value::Long(8));
-            assert_eq!(shared.mem.heap.get_field(s, 5), Value::Long(4)); // alignment = max(1,4) = 4
-
-            // Check offsets array
-            if let Value::Object(Some(offsets)) = shared.mem.heap.get_field(s, 4) {
-                assert_eq!(
-                    shared.mem.heap.get_array_element(offsets, 0).unwrap(),
-                    Value::Long(0)
-                ); // byte at 0
-                assert_eq!(
-                    shared.mem.heap.get_array_element(offsets, 1).unwrap(),
-                    Value::Long(4)
-                ); // int at 4
-            }
+        );
+        match refused {
+            Err(MethodCallFailed::InternalError(crate::error::VmError::Runtime(
+                crate::error::RuntimeError::IllegalArgumentException { ref message },
+            ))) => assert!(
+                message.contains("Invalid alignment constraint for member layout"),
+                "structLayout(JAVA_BYTE, JAVA_INT) must refuse with the JDK's wording, \
+                 got {message:?}"
+            ),
+            other => panic!(
+                "structLayout(JAVA_BYTE, JAVA_INT) must throw IllegalArgumentException the way \
+                 HotSpot 25.0.3+9 does (Invalid alignment constraint for member layout: i4) \
+                 rather than silently padding to 8; got {other:?}"
+            ),
         }
     }
 
@@ -57854,7 +58427,7 @@ use std::sync::Arc;
             &mut thread,
             "java/lang/foreign/ValueLayout",
             "JAVA_INT",
-            "()Ljava/lang/foreign/ValueLayout;",
+            "Ljava/lang/foreign/ValueLayout$OfInt;",
             &[],
         )
         .unwrap()
@@ -57864,7 +58437,7 @@ use std::sync::Arc;
             &mut thread,
             "java/lang/foreign/ValueLayout",
             "JAVA_LONG",
-            "()Ljava/lang/foreign/ValueLayout;",
+            "Ljava/lang/foreign/ValueLayout$OfLong;",
             &[],
         )
         .unwrap()
@@ -57878,20 +58451,60 @@ use std::sync::Arc;
         let _ = shared.mem.heap.set_array_element(members, 0, int_layout);
         let _ = shared.mem.heap.set_array_element(members, 1, long_layout);
 
+        // union(int, long) → byteSize = max(4, 8) = 8, byteAlignment = 8.
+        // Measured on 25.0.3+9-LTS; a union imposes NO alignment constraint,
+        // because every member sits at offset 0.
+        //
+        // This test used to pass against `panama.rs`'s union and read slot 1
+        // directly. Both are gone (F16, 2026-08-13), and the implementation
+        // that survives had a worse bug that no test could see: its
+        // `unionLayout` DISCARDED its members and answered a one-slot carrier
+        // holding `Long(0)`, and `UnionLayout` had no `byteSize` registration
+        // to read it back with — so `unionLayout(...).byteSize()` raised
+        // `AbstractMethodError` in --jdk-only mode. Asserting through
+        // `byteSize()`/`byteAlignment()` is what makes that reachable.
         let ul = call_native(
             &shared,
             &mut thread,
             "java/lang/foreign/MemoryLayout",
             "unionLayout",
-            "([Ljava/lang/foreign/MemoryLayout;)Ljava/lang/foreign/MemoryLayout;",
+            "([Ljava/lang/foreign/MemoryLayout;)Ljava/lang/foreign/UnionLayout;",
             &[Value::Object(Some(members))],
         )
         .unwrap()
         .unwrap();
 
         if let Value::Object(Some(u)) = ul {
-            // union(int, long) → size = max(4, 8) = 8
-            assert_eq!(shared.mem.heap.get_field(u, 1), Value::Long(8));
+            assert_eq!(
+                call_native(
+                    &shared,
+                    &mut thread,
+                    "java/lang/foreign/UnionLayout",
+                    "byteSize",
+                    "()J",
+                    &[Value::Object(Some(u))],
+                )
+                .unwrap()
+                .unwrap(),
+                Value::Long(8),
+                "union(int, long) is max(4, 8) = 8 bytes"
+            );
+            assert_eq!(
+                call_native(
+                    &shared,
+                    &mut thread,
+                    "java/lang/foreign/UnionLayout",
+                    "byteAlignment",
+                    "()J",
+                    &[Value::Object(Some(u))],
+                )
+                .unwrap()
+                .unwrap(),
+                Value::Long(8),
+                "union alignment is max(4, 8) = 8"
+            );
+        } else {
+            panic!("MemoryLayout.unionLayout must answer a reference, got {ul:?}");
         }
     }
 
@@ -58000,7 +58613,7 @@ use std::sync::Arc;
             &mut thread,
             "java/lang/foreign/ValueLayout",
             "JAVA_DOUBLE",
-            "()Ljava/lang/foreign/ValueLayout;",
+            "Ljava/lang/foreign/ValueLayout$OfDouble;",
             &[],
         )
         .unwrap()
@@ -63606,6 +64219,8 @@ use std::sync::Arc;
             )
             .unwrap();
             assert_eq!(text, "8", "12 & 10 = 8");
+        } else {
+            panic!("BigInteger.and must answer a BigInteger reference, got {and_result:?}");
         }
 
         let or_result = call_native(
@@ -63628,6 +64243,8 @@ use std::sync::Arc;
             )
             .unwrap();
             assert_eq!(text, "14", "12 | 10 = 14");
+        } else {
+            panic!("BigInteger.or must answer a BigInteger reference, got {or_result:?}");
         }
 
         let xor_result = call_native(
@@ -63650,6 +64267,8 @@ use std::sync::Arc;
             )
             .unwrap();
             assert_eq!(text, "6", "12 ^ 10 = 6");
+        } else {
+            panic!("BigInteger.xor must answer a BigInteger reference, got {xor_result:?}");
         }
     }
 
@@ -63801,6 +64420,8 @@ use std::sync::Arc;
             )
             .unwrap();
             assert_eq!(text, "-1", "not(0) = -1");
+        } else {
+            panic!("BigInteger.not must answer a BigInteger reference, got {result:?}");
         }
     }
 
@@ -75551,6 +76172,13 @@ public class SkippedTest {
                 semantics: ResumeSemantics::for_reason(DeoptReason::BoundsCheck),
             });
             assert_eq!(cm.deopt_points.len(), 1);
+        } else {
+            // `ExecutableBuffer::new` is `platform::alloc_executable(cap)?`,
+            // i.e. one `VirtualAlloc`/`mmap` of 64 bytes. A `None` here is the
+            // host refusing W|X memory, not a CompiledMethod defect — but
+            // without this arm that refusal made the test GREEN, and this is
+            // the only assertion in it.
+            panic!("ExecutableBuffer::new(64) returned None: the host refused executable memory");
         }
     }
 

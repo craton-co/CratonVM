@@ -2661,12 +2661,97 @@ pub fn register_p60_process_handle(r: &mut NativeMethodRegistry) {
             p60_unmeasurable_process_tree(ctx)
         },
     );
+    // `onExit()` — W7-10 §7.1, the residual that record left open. It was the
+    // one row in this block that neither delegated nor measured: it answered an
+    // already-COMPLETED `CompletableFuture` carrying `null`, for every receiver
+    // and every process state. That is wrong three ways at once, and each way
+    // is measured on this host (openjdk 25.0.3+9-LTS) rather than read off the
+    // javadoc:
+    //
+    //     ProcessHandle.current().onExit()  !! IllegalStateException: onExit for current process not allowed
+    //     deadChild.onExit()                -> future, isDone()=false   (alive=false)
+    //
+    // 1. For the CURRENT process the JDK REFUSES — a process cannot wait for
+    //    itself — where this returned a future saying it had already exited.
+    // 2. The future the JDK hands back completes with the ProcessHandle, never
+    //    with `null`; `f.get()` here returned `null` on every path.
+    // 3. It is not complete when it is handed back. Note the second measured
+    //    row: even for a child that HAS already exited, HotSpot returns
+    //    `isDone()==false` synchronously and completes it from the reaper. So
+    //    "completed immediately" was not merely early — it is not a state
+    //    HotSpot returns at all.
+    //
+    // The fix is the one every sibling row in this registrar already takes —
+    // `children`, `descendants`, `info` and `parent` all delegate — and W7-10's
+    // stated reason for exempting this one is verifiable, so it was verified
+    // rather than believed. That reason was that delegating "registers a reaper
+    // against `ProcessHandleImpl.completions` and `waitForProcessExit0`" and so
+    // "changes process-reaping behaviour rather than just an answer". The
+    // machinery it names is present, implemented and already measured against
+    // HotSpot: `native-io/src/process.rs` registers
+    // `ProcessHandleImpl.waitForProcessExit0(JZ)I`, whose own-child arm blocks
+    // in `wait_for_handle` inside a `begin_blocking_region`, and whose
+    // foreign-pid arm returns the JDK's `NOT_A_CHILD` (-2) so the JDK's own
+    // `isAlive0` poll loop takes over — pinned by `probes/ForeignHandleProbe.java`
+    // against HotSpot 25. This is the same path `Process.onExit()` on a spawned
+    // child already runs, so delegation adds no reaper the VM was not already
+    // running.
+    //
+    // The current-process refusal is nonetheless answered HERE, ahead of the
+    // delegation, and not left to fall out of the real
+    // `ProcessHandleImpl.onExit()`'s `this.equals(current)` test. Two reasons:
+    // it is the only arm that must hold in synthetic-JDK mode too, where there
+    // is no `ProcessHandleImpl` to delegate to; and `p60_handle_destroy`
+    // earlier in this file already refuses the current process by pid with the
+    // JDK's own message ("destroy of current process not allowed"), so this is
+    // the established shape here rather than a new one. The message is
+    // HotSpot's verbatim.
+    //
+    // Mode reach: `register_p60_process_handle` is NOT synthetic-only, unlike
+    // the phase bundles — `vm/src/vm/vm_init.rs` calls it from BOTH real-JDK
+    // arms ("SmallRye calls ProcessHandle.current().info() in real-JDK mode as
+    // well"). So this row is live in `--real-jdk`, and refused in `--jdk-only`
+    // by the `SyntheticStub` category this registrar sets.
     r.register(
         ph,
         "onExit",
         "()Ljava/util/concurrent/CompletableFuture;",
-        |ctx, _args| {
-            let cf = p58_new_cf(ctx, Value::Object(None), true)?;
+        |ctx, args| {
+            if p60_handle_pid(ctx, args) == Some(std::process::id() as i64) {
+                return Err(RuntimeError::IllegalStateException {
+                    message: "onExit for current process not allowed".to_string(),
+                }
+                .into());
+            }
+            if let Some(result) = p60_delegate_to_real_handle(
+                ctx,
+                args,
+                "onExit",
+                "()Ljava/util/concurrent/CompletableFuture;",
+            ) {
+                return result;
+            }
+            // Synthetic-JDK fallback: no `java.lang.ProcessHandleImpl` exists,
+            // so there is no reaper to complete a future from and no honest way
+            // to build one. What CAN be corrected without inventing a waiter is
+            // the VALUE: complete with the receiver handle, which is what the
+            // JDK's future carries (`.handleAsync((exitStatus, unused) -> this)`),
+            // instead of the `null` this answered.
+            //
+            // RESIDUAL, stated in place rather than implied — the same
+            // convention `p60_unmeasurable_process_tree` below uses for the
+            // empty stream. Completing at all still asserts "this process has
+            // exited" for a process that may be running. It is NOT converted to
+            // an incomplete future here, because `p60_pid_is_alive` answers a
+            // flat `true` for every foreign pid on non-unix (it has no portable
+            // probe), so on Windows that would turn a wrong answer into a
+            // silent forever-hang in `get()` — a worse failure with a harder
+            // diagnosis. Removing the last of it needs the same thing §7.2
+            // needs: a process waiter `native-builtins` can call without a real
+            // JDK. Under `--jdk-only` the `SyntheticStub` tag on this whole
+            // registrar means this arm is not reachable at all.
+            let this = args.first().copied().unwrap_or(Value::Object(None));
+            let cf = p58_new_cf(ctx, this, true)?;
             Ok(Some(Value::Object(Some(cf))))
         },
     );
@@ -4179,6 +4264,55 @@ fn p64_hex_cfg(ctx: &mut dyn NativeContext, this: ObjectRef) -> P64HexCfg {
     }
 }
 
+/// `HexFormat.of()` and `ofDelimiter("")` are the SAME OBJECT on HotSpot —
+/// `of()` returns the `HEX_FORMAT` static, minted once in `<clinit>`
+/// (`HexFormat.java:161-162`, `:200-202`). MEASURED:
+///
+/// ```text
+/// HexFormat.of() == HexFormat.of()                          true
+/// HexFormat.of().withUpperCase() == of().withUpperCase()    true    (HEX_UPPER_FORMAT)
+/// ```
+///
+/// A factory that fabricates a fresh receiver per call fails an identity
+/// comparison and NOTHING else, which is exactly how the `Base64` factories
+/// failed (E14-1). The cache lives in the class's OWN static field, not in a
+/// Rust-side `OnceLock`: a static is a GC root, so the reference stays valid
+/// across a moving collection, and it is per-VM rather than per-process.
+///
+/// Degrades to the old fabricate-every-time behaviour when the field cannot be
+/// resolved — a synthetic stub that does not declare `HEX_FORMAT` answers
+/// `None` here and nothing changes for it.
+///
+/// RESIDUAL, measured and left: `HEX_UPPER_FORMAT` is a singleton too, so
+/// `of().withUpperCase() == of().withUpperCase()` is `true` on HotSpot and
+/// `false` here. `withUpperCase` is not a factory the fixture compares by
+/// identity and no caller in this tree depends on it; the row is recorded
+/// rather than fixed, so this file keeps ONE cached instance and not two
+/// interacting ones.
+const P64_HF_SINGLETON: &str = "HEX_FORMAT";
+
+fn p64_hf_static_slot(ctx: &dyn NativeContext, field: &str) -> Option<(ClassId, usize)> {
+    let cid = ctx.class_id_by_name("java/util/HexFormat")?;
+    let idx = ctx.static_field_index_by_name(cid, field)?;
+    Some((cid, idx))
+}
+
+/// The cached instance, if one has been minted (by `<clinit>` or by an earlier
+/// call) and it carries the four settings this family reads.
+fn p64_hf_cached(ctx: &dyn NativeContext, field: &str) -> Option<ObjectRef> {
+    let (cid, idx) = p64_hf_static_slot(ctx, field)?;
+    match ctx.get_static_field(cid, idx) {
+        Value::Object(Some(r)) if ctx.object_num_fields(r) >= P64_HF_SLOTS => Some(r),
+        _ => None,
+    }
+}
+
+fn p64_hf_cache(ctx: &mut dyn NativeContext, field: &str, obj: ObjectRef) {
+    if let Some((cid, idx)) = p64_hf_static_slot(ctx, field) {
+        ctx.set_static_field(cid, idx, Value::Object(Some(obj)));
+    }
+}
+
 /// Mint a `HexFormat` carrying the four settings.
 fn p64_hex_new(
     ctx: &mut dyn NativeContext,
@@ -4236,16 +4370,106 @@ fn p64_is_hex_digit(ch: i32) -> bool {
 
 /// Digit value, or HotSpot's `NumberFormatException: not a hexadecimal digit:
 /// "g" = 103` (the trailing number is the code point, measured).
-fn p64_hex_digit_value(ch: char) -> Result<u32, MethodCallFailed> {
-    let cp = ch as i32;
+///
+/// The argument is ONE UTF-16 CODE UNIT, not a Rust `char`. Every method in
+/// this family walks `CharSequence.charAt` / `char[]`, so a surrogate PAIR is
+/// two failing digits, not one astral code point, and the reported number is
+/// the unit's own value. MEASURED on 25.0.3+9 (`scratchpad/f2/HexProbe.java`):
+///
+/// ```text
+/// of().parseHex("𐐷")  !! NumberFormatException: not a hexadecimal digit: "?" = 55297
+/// of().parseHex("\uD801")        !! IllegalArgumentException: string length not even: 1
+/// of().parseHex("١١")  !! NumberFormatException: not a hexadecimal digit: "?" = 1633
+/// ```
+///
+/// 55297 is the high surrogate `\uD801`, not the pair's code point 66615, and
+/// the odd-length row counts the lone surrogate as ONE character — both of
+/// which a `Vec<char>` reader gets wrong, because it fuses the pair into a
+/// single `char` and shortens the sequence by one.
+///
+/// RESIDUAL: a Rust `String` cannot hold a lone surrogate, so the quoted
+/// character is rendered U+FFFD where HotSpot emits the raw unit (which prints
+/// as `?` on a console anyway). The code point — the comparable part — is
+/// exact.
+fn p64_hex_digit_value(unit: u16) -> Result<u32, MethodCallFailed> {
+    let cp = i32::from(unit);
     if p64_is_hex_digit(cp) {
-        Ok(ch.to_digit(16).unwrap_or(0))
+        // `p64_is_hex_digit` admitted only ASCII `0-9 a-f A-F`, so both
+        // conversions below are total for every value that reaches here.
+        Ok(char::from_u32(u32::from(unit))
+            .and_then(|c| c.to_digit(16))
+            .unwrap_or(0))
     } else {
         Err(RuntimeError::NumberFormatException {
-            message: format!("not a hexadecimal digit: \"{ch}\" = {cp}"),
+            message: format!(
+                "not a hexadecimal digit: \"{}\" = {cp}",
+                char::from_u32(u32::from(unit)).unwrap_or('\u{FFFD}')
+            ),
         }
         .into())
     }
+}
+
+/// `Objects.checkFromToIndex(fromIndex, toIndex, length)` — the bounds test
+/// every ranged `HexFormat` method opens with, and HotSpot's exact wording.
+///
+/// MEASURED (`scratchpad/f2/HexProbe.java`), on a length-4 operand:
+///
+/// ```text
+/// parseHex(x, 3, 1)   !! IndexOutOfBoundsException: Range [3, 1) out of bounds for length 4
+/// parseHex(x, -1, 2)  !! IndexOutOfBoundsException: Range [-1, 2) out of bounds for length 4
+/// parseHex(x, 0, 9)   !! IndexOutOfBoundsException: Range [0, 9) out of bounds for length 4
+/// parseHex(x, 4, 4)    = []        <- an EMPTY range at the very end is legal
+/// ```
+///
+/// Note that the third failure class is reached only after this one passes:
+/// `parseHex(x, 1, 4)` is `IllegalArgumentException: string length not even: 3`
+/// — the length in that message is the RANGE's, not the operand's.
+fn p64_hf_check_from_to(from: i32, to: i32, length: usize) -> Result<(), MethodCallFailed> {
+    if from < 0 || to < from || i64::from(to) > length as i64 {
+        return Err(RuntimeError::ioobe(format!(
+            "Range [{from}, {to}) out of bounds for length {length}"
+        ))
+        .into());
+    }
+    Ok(())
+}
+
+/// The UTF-16 code units of a `CharSequence` argument.
+///
+/// `NativeContext::read_string` answers `None` for anything that is not a real
+/// `java.lang.String`, and the old readers all spelled that
+/// `.unwrap_or_default()` — so every non-`String` `CharSequence` parsed as the
+/// EMPTY sequence and `parseHex` handed back a zero-length array, silently.
+/// That is not a hypothetical receiver: `parseHex(char[], int, int)` is
+/// specified as `parseHex(CharBuffer.wrap(chars, fromIndex, toIndex -
+/// fromIndex))`, so the JDK's own bytecode arrives here holding a `CharBuffer`.
+///
+/// `charset_buffers::read_wrapped_char_sequence` is the reader this family was
+/// missing and it already exists — it falls back to the receiver's own
+/// `toString()` for `CharBuffer`, `StringBuilder` and any application type.
+fn p64_hf_seq_units(ctx: &mut dyn NativeContext, seq: ObjectRef) -> Vec<u16> {
+    if ctx.read_string(seq).is_some() {
+        // A real String: read it losslessly, without a UTF-8 round trip that
+        // would fold an unpaired surrogate into U+FFFD before it can be
+        // reported as the digit that failed.
+        return crate::lang_string::read_string_chars(ctx, seq);
+    }
+    charset_buffers::read_wrapped_char_sequence(ctx, seq)
+        .encode_utf16()
+        .collect()
+}
+
+/// The units of a `char[]` argument. The elements are `Value::Int`, one UTF-16
+/// unit each.
+fn p64_hf_char_array_units(ctx: &dyn NativeContext, arr: ObjectRef) -> Vec<u16> {
+    let len = ctx.array_length(arr);
+    (0..len)
+        .map(|i| match ctx.get_array_element(arr, i) {
+            Value::Int(v) => v as u16,
+            _ => 0,
+        })
+        .collect()
 }
 
 pub(crate) fn register_p64_hex_format(r: &mut NativeMethodRegistry) {
@@ -4254,6 +4478,11 @@ pub(crate) fn register_p64_hex_format(r: &mut NativeMethodRegistry) {
     let hf = "java/util/HexFormat";
 
     r.register(hf, "of", "()Ljava/util/HexFormat;", |ctx, _args| {
+        // `of()` is `return HEX_FORMAT;` — a SINGLETON, measured. See
+        // `p64_hf_cached`.
+        if let Some(obj) = p64_hf_cached(ctx, P64_HF_SINGLETON) {
+            return Ok(Some(Value::Object(Some(obj))));
+        }
         let obj = p64_hex_new(
             ctx,
             &P64HexCfg {
@@ -4263,6 +4492,7 @@ pub(crate) fn register_p64_hex_format(r: &mut NativeMethodRegistry) {
                 ucase: false,
             },
         )?;
+        p64_hf_cache(ctx, P64_HF_SINGLETON, obj);
         Ok(Some(Value::Object(Some(obj))))
     });
     r.register(
@@ -4316,6 +4546,20 @@ pub(crate) fn register_p64_hex_format(r: &mut NativeMethodRegistry) {
         "(Ljava/lang/CharSequence;)[B",
         native_p64_parse_hex,
     );
+    // The two RANGED overloads. Neither was registered, and in real-JDK mode
+    // that was not a `NoSuchMethodError` but something quieter: the JDK's own
+    // `parseHex(char[], int, int)` bytecode ran, wrapped the array in a
+    // `CharBuffer`, and handed it to the one-argument native above — which
+    // read a non-`String` `CharSequence` as the empty string. `parseHex(chars,
+    // 1, 5)` therefore answered `[]` instead of `[0, -1]`, with no exception
+    // anywhere. See `native_p64_parse_hex_chars`.
+    r.register(
+        hf,
+        "parseHex",
+        "(Ljava/lang/CharSequence;II)[B",
+        native_p64_parse_hex_range,
+    );
+    r.register(hf, "parseHex", "([CII)[B", native_p64_parse_hex_chars);
     r.register(hf, "toHexDigits", "(B)Ljava/lang/String;", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let ucase = p64_hex_cfg(ctx, this).ucase;
@@ -4398,6 +4642,38 @@ pub(crate) fn register_p64_hex_format(r: &mut NativeMethodRegistry) {
             let mut acc: u64 = 0;
             for ch in chars {
                 acc = (acc << 4) | u64::from(p64_hex_digit_value(ch)?);
+            }
+            Ok(Some(Value::Long(acc as i64)))
+        },
+    );
+    // The RANGED twins of the two above. In real-JDK mode they were served by
+    // the JDK's own bytecode and were correct; in synthetic-jdk mode there is
+    // no bytecode to fall through to, so half of one family was registered —
+    // the shape that has cost this tree a dozen defects. Both are the JDK's
+    // `checkFromToIndex` then `checkDigitCount` (`HexFormat.java:863-869` and
+    // `:977-986`), in that order.
+    r.register(
+        hf,
+        "fromHexDigits",
+        "(Ljava/lang/CharSequence;II)I",
+        |ctx, args| {
+            let units = p64_hf_range_digits(ctx, args, 8)?;
+            let mut acc: u32 = 0;
+            for u in units {
+                acc = (acc << 4) | p64_hex_digit_value(u)?;
+            }
+            Ok(Some(Value::Int(acc as i32)))
+        },
+    );
+    r.register(
+        hf,
+        "fromHexDigitsToLong",
+        "(Ljava/lang/CharSequence;II)J",
+        |ctx, args| {
+            let units = p64_hf_range_digits(ctx, args, 16)?;
+            let mut acc: u64 = 0;
+            for u in units {
+                acc = (acc << 4) | u64::from(p64_hex_digit_value(u)?);
             }
             Ok(Some(Value::Long(acc as i64)))
         },
@@ -4500,20 +4776,18 @@ pub(crate) fn register_p64_hex_format(r: &mut NativeMethodRegistry) {
     r.set_category(__prev_cat);
 }
 
-/// The `CharSequence` argument of the two STATIC `fromHexDigits` forms, as
-/// UTF-16-safe `char`s. `null` is HotSpot's
+/// The `CharSequence` argument of the two one-argument STATIC `fromHexDigits`
+/// forms, as UTF-16 code units. `null` is HotSpot's
 /// `NullPointerException: Cannot invoke "java.lang.CharSequence.length()"
-/// because "string" is null` — measured.
+/// because "string" is null` — measured. (The RANGED forms name the parameter
+/// instead, because they open with an explicit `Objects.requireNonNull`; see
+/// `p64_hf_range_digits`.)
 fn p64_hf_digits_arg(
     ctx: &mut dyn NativeContext,
     args: &[Value],
-) -> Result<Vec<char>, MethodCallFailed> {
+) -> Result<Vec<u16>, MethodCallFailed> {
     match args.first() {
-        Some(Value::Object(Some(r))) => Ok(ctx
-            .read_string(*r)
-            .unwrap_or_default()
-            .chars()
-            .collect::<Vec<char>>()),
+        Some(Value::Object(Some(r))) => Ok(p64_hf_seq_units(ctx, *r)),
         _ => Err(RuntimeError::NullPointerException {
             message: Some(
                 "Cannot invoke \"java.lang.CharSequence.length()\" because \"string\" is null"
@@ -4522,6 +4796,46 @@ fn p64_hf_digits_arg(
         }
         .into()),
     }
+}
+
+/// The `(CharSequence, fromIndex, toIndex)` argument triple of the two ranged
+/// STATIC digit readers, checked in the JDK's order: null, then range, then
+/// digit count.
+///
+/// `limit` is 8 for `fromHexDigits` and 16 for `fromHexDigitsToLong`, and the
+/// message quotes the RANGE's length, not the sequence's —
+/// `checkDigitCount(fromIndex, toIndex, limit)`, `HexFormat.java:863-869`.
+fn p64_hf_range_digits(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+    limit: usize,
+) -> Result<Vec<u16>, MethodCallFailed> {
+    let units = match args.first() {
+        Some(Value::Object(Some(r))) => p64_hf_seq_units(ctx, *r),
+        _ => {
+            return Err(RuntimeError::NullPointerException {
+                message: Some("string".to_string()),
+            }
+            .into())
+        }
+    };
+    let from = match args.get(1) {
+        Some(Value::Int(v)) => *v,
+        _ => 0,
+    };
+    let to = match args.get(2) {
+        Some(Value::Int(v)) => *v,
+        _ => 0,
+    };
+    p64_hf_check_from_to(from, to, units.len())?;
+    let slice = &units[from as usize..to as usize];
+    if slice.len() > limit {
+        return Err(RuntimeError::IllegalArgumentException {
+            message: format!("string length greater than {limit}: {}", slice.len()),
+        }
+        .into());
+    }
+    Ok(slice.to_vec())
 }
 
 /// The shared body of both `formatHex` forms: the READER the family was
@@ -4638,8 +4952,9 @@ fn native_p64_format_hex_range(ctx: &mut dyn NativeContext, args: &[Value]) -> M
 /// PANICKED on any non-ASCII input.
 fn native_p64_parse_hex(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
-    let chars: Vec<char> = match args.get(1) {
-        Some(Value::Object(Some(r))) => ctx.read_string(*r).unwrap_or_default().chars().collect(),
+    let cfg = p64_hex_cfg(ctx, this);
+    let units = match args.get(1) {
+        Some(Value::Object(Some(r))) => p64_hf_seq_units(ctx, *r),
         _ => {
             return Err(RuntimeError::NullPointerException {
                 message: Some(
@@ -4650,8 +4965,108 @@ fn native_p64_parse_hex(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
             .into())
         }
     };
+    p64_parse_hex_answer(ctx, &cfg, &units)
+}
+
+/// `parseHex(CharSequence string, int fromIndex, int toIndex)`.
+///
+/// The range is in UTF-16 CODE UNITS (`string.length()`'s unit), it is
+/// half-open, and the null check comes FIRST — MEASURED
+/// (`scratchpad/f2/HexProbe.java`):
+///
+/// ```text
+/// of().parseHex("00ff0a80", 2, 6)            = [-1, 10]
+/// of().parseHex("00ff", 4, 4)                = []
+/// of().parseHex("00ff", 1, 4)               !! IllegalArgumentException: string length not even: 3
+/// of().parseHex("00ff", 0, 9)               !! IndexOutOfBoundsException: Range [0, 9) out of bounds for length 4
+/// of().parseHex((CharSequence) null, -1, 9) !! NullPointerException: string
+/// ```
+///
+/// The last row is why the order is load-bearing: a null operand with an
+/// out-of-range pair reports the NULL, not the range. Note also that the
+/// `null` MESSAGE differs between the two overloads — the one-argument form is
+/// `Objects.requireNonNull`-free and fails inside `string.length()`, so it
+/// carries the helpful-NPE text, while this one names the parameter.
+fn native_p64_parse_hex_range(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
     let cfg = p64_hex_cfg(ctx, this);
-    let bytes = p64_parse_hex_chars(&chars, &cfg)?;
+    let units = match args.get(1) {
+        Some(Value::Object(Some(r))) => p64_hf_seq_units(ctx, *r),
+        _ => {
+            return Err(RuntimeError::NullPointerException {
+                message: Some("string".to_string()),
+            }
+            .into())
+        }
+    };
+    p64_parse_hex_slice(ctx, &cfg, &units, args, 2)
+}
+
+/// `parseHex(char[] chars, int fromIndex, int toIndex)`.
+///
+/// The JDK spells this `parseHex(CharBuffer.wrap(chars, fromIndex, toIndex -
+/// fromIndex))` (JDK 25 `HexFormat.java:577-582`), and the parameters are a
+/// half-open index PAIR despite the class javadoc calling them
+/// "offset, length" at line 79. MEASURED:
+///
+/// ```text
+/// of().parseHex("x00ff0a80".toCharArray(), 1, 5)   = [0, -1]
+/// of().parseHex(chars4, 3, 1)   !! IndexOutOfBoundsException: Range [3, 1) out of bounds for length 4
+/// of().parseHex((char[]) null, 0, 0)  !! NullPointerException: chars
+/// ```
+///
+/// Registering it is what stops the JDK's `CharBuffer` from arriving at the
+/// one-argument native, which read it through `read_string` — `None` for a
+/// non-`String` — and answered the EMPTY array for every range.
+fn native_p64_parse_hex_chars(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let cfg = p64_hex_cfg(ctx, this);
+    let units = match args.get(1) {
+        Some(Value::Object(Some(r))) => p64_hf_char_array_units(ctx, *r),
+        _ => {
+            return Err(RuntimeError::NullPointerException {
+                message: Some("chars".to_string()),
+            }
+            .into())
+        }
+    };
+    p64_parse_hex_slice(ctx, &cfg, &units, args, 2)
+}
+
+/// The shared tail of both ranged overloads: bounds-check, slice, parse.
+fn p64_parse_hex_slice(
+    ctx: &mut dyn NativeContext,
+    cfg: &P64HexCfg,
+    units: &[u16],
+    args: &[Value],
+    first: usize,
+) -> MethodCallResult {
+    let from = match args.get(first) {
+        Some(Value::Int(v)) => *v,
+        _ => 0,
+    };
+    let to = match args.get(first + 1) {
+        Some(Value::Int(v)) => *v,
+        _ => 0,
+    };
+    p64_hf_check_from_to(from, to, units.len())?;
+    p64_parse_hex_answer(ctx, cfg, &units[from as usize..to as usize])
+}
+
+/// Parse `units` under the receiver's configuration and box the result.
+///
+/// GC-SAFETY: the caller reads the configuration off the receiver BEFORE it
+/// reads the sequence, because `p64_hf_seq_units` can call back into Java
+/// (`CharBuffer.toString()`) and a collection there may move the receiver —
+/// which would leave the `this` handle in `args[0]` stale. `P64HexCfg` is
+/// Rust-owned, so once it is read nothing on the Java heap is held across the
+/// re-entry.
+fn p64_parse_hex_answer(
+    ctx: &mut dyn NativeContext,
+    cfg: &P64HexCfg,
+    units: &[u16],
+) -> MethodCallResult {
+    let bytes = p64_parse_hex_chars(units, cfg)?;
     let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, bytes.len());
     for (i, b) in bytes.iter().enumerate() {
         ctx.set_array_element(arr, i, Value::Int(i32::from(*b as i8)));
@@ -4662,10 +5077,10 @@ fn native_p64_parse_hex(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
 const P64_HF_STRIDE_ERR: &str = "extra or missing delimiters or values consisting of prefix, \
      two hexadecimal digits, and suffix";
 
-fn p64_parse_hex_chars(chars: &[char], cfg: &P64HexCfg) -> Result<Vec<u8>, MethodCallFailed> {
-    let pre: Vec<char> = cfg.prefix.chars().collect();
-    let suf: Vec<char> = cfg.suffix.chars().collect();
-    let del: Vec<char> = cfg.delimiter.chars().collect();
+fn p64_parse_hex_chars(chars: &[u16], cfg: &P64HexCfg) -> Result<Vec<u8>, MethodCallFailed> {
+    let pre: Vec<u16> = cfg.prefix.encode_utf16().collect();
+    let suf: Vec<u16> = cfg.suffix.encode_utf16().collect();
+    let del: Vec<u16> = cfg.delimiter.encode_utf16().collect();
 
     if pre.is_empty() && suf.is_empty() && del.is_empty() {
         if chars.len() % 2 != 0 {
@@ -4739,43 +5154,89 @@ fn p64_parse_hex_chars(chars: &[char], cfg: &P64HexCfg) -> Result<Vec<u8>, Metho
 // Register for Random (already exists) and ThreadLocalRandom
 // =============================================================================
 
+/// The SIX `java/util/random/RandomGenerator` registrations that used to open
+/// this function — `nextInt()I`, `nextInt(I)I`, `nextLong()J`, `nextDouble()D`,
+/// `nextFloat()F`, `nextBoolean()Z` — were DELETED 2026-08-13 (lane F15).
+/// They are not moved, not renamed and not conditional: they are gone, and the
+/// reachability argument that says nothing loses an answer is here so the next
+/// reader does not re-add them on the strength of `Random implements
+/// RandomGenerator`.
+///
+/// **They were dead, and they were dead-wrong, which is the order that matters:
+/// a registration nothing can reach is a registration whose wrongness is
+/// invisible.** All six were backed by `p64_simple_random()`, which takes no
+/// receiver — so any seeded `Random`/`SplittableRandom` that had ever reached
+/// them would have had its whole stream silently replaced by an unrelated
+/// xorshift, and `nextInt(I)`'s body divided by `bound as u64` with **no
+/// guard**: `bound == 0` is a Rust integer divide-by-zero, i.e. a PANIC that
+/// kills the VM, where HotSpot 25.0.3+9 raises
+/// `IllegalArgumentException: bound must be positive` (measured on this host
+/// for `Random`, `ThreadLocalRandom` and `SplittableRandom` alike). A negative
+/// bound did not panic; it sign-extended into a huge modulus and returned
+/// garbage. The `ThreadLocalRandom` sibling below carries the identical final
+/// expression WITH a `bound <= 0` guard — one rule, two copies, disagreeing.
+///
+/// **Which mode this registrar even runs in — check this FIRST, it shortens
+/// every other argument.** `register_p64_random_generator` is reached only
+/// through `register_phase64_natives`, whose sole caller is
+/// `lib.rs::register_synthetic_overrides` — which is `#[cfg(feature =
+/// "synthetic-jdk")]` and is called only from `register_builtins`, i.e. the
+/// synthetic path. `vm/src/vm/vm_init.rs`'s real-JDK arms say so in as many
+/// words ("the phase bundles are synthetic-only") and hand-register the
+/// handful of phase natives they actually want. So in `--real-jdk` and
+/// `--jdk-only` these six rows were never registered at all, and everything
+/// below is about the one mode where they were.
+///
+/// **Why no receiver reaches them THERE either.** Three facts, each checked in
+/// the tree rather than taken from the nominating lane (NOM F12-3). Facts 1–2
+/// are stated for the real-JDK shape as well, because that is the shape a
+/// reader will reason about when tempted to re-add these:
+///
+/// 1. The registry has no hierarchy of its own. `NativeMethodRegistry
+///    ::resolve_id` (`native-api/src/registry.rs`) is a digest probe plus a
+///    re-check of all three strings; its only fallback,
+///    `resolve_id_with_descriptor_quirks`, rewrites the DESCRIPTOR. No
+///    superclass walk, no superinterface walk. So the question is entirely
+///    which class name the interpreter hands it.
+/// 2. The interpreter hands it the RESOLVED DECLARING class
+///    (`vm/src/runtime/interpreter/invoke.rs`, "look up in the registry by
+///    declaring class"; the second site takes `class_name_arc` from
+///    `cm.get_class(declaring_id)`, not from the constant pool), and
+///    `find_method_recursive` (`classloading/src/class.rs`) returns on the
+///    first CONCRETE superclass-chain match, entering its interface BFS only
+///    when there is none. `javap -p java.util.Random` on JDK 25 declares all
+///    six concretely, so Phase 1 answers `java/util/Random` and
+///    `securerandom.rs`'s registration wins. In synthetic-JDK mode
+///    `class_manager.rs`'s `"java/util/Random" => instance_fields(2)` has no
+///    `implements` clause at all, so the interface is not even in the
+///    hierarchy.
+/// 3. **There IS an interface-name native fallback, and it still cannot fire
+///    here.** F12's "nothing dispatches on interface names" is too strong:
+///    `vm/src/vm/vm_exec.rs`'s slow dispatch path ends with a *"fall back to a
+///    native registered on any interface name (legacy behavior)"* loop over the
+///    receiver's transitive superinterface closure. It is reached only after
+///    the concrete-chain lookup has already failed, and it is preceded by a
+///    first pass that PREFERS a non-abstract interface default. `javap -p
+///    java.util.random.RandomGenerator` shows `nextLong()J` is the interface's
+///    ONLY abstract method — every legal implementor must therefore declare it
+///    concretely — and the other five are `default`, so that first pass routes
+///    them to the JDK's own bytecode before the native loop is consulted.
+///    Both gates would have to fail at once, and each closes the other's case.
+///
+/// Deleting rather than guarding is the right end state. Guarding the divide
+/// would have kept six receiver-ignoring bodies alive under a `Bridge` tag,
+/// which is the tag `--jdk-only` does NOT drop — so the day something did
+/// reach them, in whichever mode, a fabricated PRNG would have been served in
+/// silence rather than refused. `java/util/random/RandomGenerator` now occurs
+/// nowhere in this repository outside the JDK jars.
+///
+/// Ratchet: −6 `Bridge` registrations, all of them on the synthetic-mode
+/// total; the `--jdk-only`/strict total is unchanged because they were never
+/// in it. See
+/// docs/known-issues/jdk-only/F15-1-two-registrars-that-no-bytecode-can-name-20260813.md
 pub(crate) fn register_p64_random_generator(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
-    // RandomGenerator interface methods
-    let rg = "java/util/random/RandomGenerator";
-    r.register(rg, "nextInt", "()I", |_ctx, _args| {
-        Ok(Some(Value::Int(p64_simple_random() as i32)))
-    });
-    r.register(rg, "nextInt", "(I)I", |_ctx, args| {
-        let bound = match args.get(1) {
-            Some(Value::Int(v)) => *v,
-            _ => 1,
-        };
-        Ok(Some(Value::Int(
-            ((p64_simple_random() as i64).unsigned_abs() % (bound as u64)) as i32,
-        )))
-    });
-    r.register(rg, "nextLong", "()J", |_ctx, _args| {
-        let hi = (p64_simple_random() as i64) << 32;
-        let lo = p64_simple_random() as i64 & 0xFFFF_FFFF;
-        Ok(Some(Value::Long(hi | lo)))
-    });
-    r.register(rg, "nextDouble", "()D", |_ctx, _args| {
-        let v = (p64_simple_random() & 0x001F_FFFF_FFFF_FFFF) as f64 / (1u64 << 53) as f64;
-        Ok(Some(Value::Double(v)))
-    });
-    r.register(rg, "nextFloat", "()F", |_ctx, _args| {
-        let v = (p64_simple_random() as u32 & 0x00FF_FFFF) as f32 / (1u32 << 24) as f32;
-        Ok(Some(Value::Float(v)))
-    });
-    r.register(rg, "nextBoolean", "()Z", |_ctx, _args| {
-        Ok(Some(Value::Int(if p64_simple_random() & 1 == 0 {
-            0
-        } else {
-            1
-        })))
-    });
 
     // ThreadLocalRandom
     let tlr = "java/util/concurrent/ThreadLocalRandom";
@@ -4793,13 +5254,41 @@ pub(crate) fn register_p64_random_generator(r: &mut NativeMethodRegistry) {
     r.register(tlr, "nextInt", "()I", |_ctx, _args| {
         Ok(Some(Value::Int(p64_simple_random() as i32)))
     });
+    // `ThreadLocalRandom` is `final` and declares `nextInt(int)` and
+    // `nextInt(int,int)` concretely (`javap -p`), so unlike the interface rows
+    // deleted above these are keyed on the class name the interpreter actually
+    // hands the registry — they WIN for a `ThreadLocalRandom` receiver wherever
+    // they are registered. That is synthetic-JDK mode only (see the mode note
+    // on this function): in `--real-jdk`/`--jdk-only` this bundle does not run
+    // and the JDK's own `RandomSupport.checkBound` answers. So these were live
+    // wrong answers in one mode, not dead ones in all of them, and the fix
+    // below is a synthetic-mode fix.
+    //
+    // Both used to swallow the bad bound and return a NUMBER — `0` for
+    // `nextInt(0)`, `origin` for `nextInt(5,5)` — so a caller that had computed
+    // an empty range got a plausible index instead of the exception that says
+    // its range is empty. MEASURED on this host (openjdk 25.0.3+9-LTS), for
+    // `ThreadLocalRandom`, `Random` and `SplittableRandom` alike:
+    //
+    //     ThreadLocalRandom.current().nextInt(0)   !! IllegalArgumentException: bound must be positive
+    //     ThreadLocalRandom.current().nextInt(-5)  !! IllegalArgumentException: bound must be positive
+    //     ThreadLocalRandom.current().nextInt(5,5) !! IllegalArgumentException: bound must be greater than origin
+    //     ThreadLocalRandom.current().nextInt(5,1) !! IllegalArgumentException: bound must be greater than origin
+    //
+    // The two messages are DIFFERENT and are the JDK's own
+    // (`RandomSupport.checkBound` / `checkRange`, `BAD_BOUND` / `BAD_RANGE`);
+    // they are quoted verbatim rather than paraphrased because a caller that
+    // greps the message is the caller most likely to be relying on it.
     r.register(tlr, "nextInt", "(I)I", |_ctx, args| {
         let bound = match args.get(1) {
             Some(Value::Int(v)) => *v,
             _ => 1,
         };
         if bound <= 0 {
-            return Ok(Some(Value::Int(0)));
+            return Err(RuntimeError::IllegalArgumentException {
+                message: "bound must be positive".to_string(),
+            }
+            .into());
         }
         Ok(Some(Value::Int(
             ((p64_simple_random() as i64).unsigned_abs() % (bound as u64)) as i32,
@@ -4815,12 +5304,24 @@ pub(crate) fn register_p64_random_generator(r: &mut NativeMethodRegistry) {
             _ => 1,
         };
         if bound <= origin {
-            return Ok(Some(Value::Int(origin)));
+            return Err(RuntimeError::IllegalArgumentException {
+                message: "bound must be greater than origin".to_string(),
+            }
+            .into());
         }
-        let range = (bound - origin) as u64;
-        Ok(Some(Value::Int(
-            origin + ((p64_simple_random() as i64).unsigned_abs() % range) as i32,
-        )))
+        // WIDENED to i64 before subtracting, and the offset added in i64 too.
+        // `bound - origin` in `i32` overflows for any range wider than
+        // `Integer.MAX_VALUE` — `nextInt(Integer.MIN_VALUE, Integer.MAX_VALUE)`
+        // is the whole-domain call, and it is LEGAL: measured on this host it
+        // returns an ordinary int. In Rust that subtraction is a checked
+        // overflow in release builds too, so the previous line turned the
+        // JDK's widest legal range into a PANIC — and the `origin + …` that
+        // followed had the same defect one line later. Neither is reachable
+        // through a bad argument only: `nextInt(-2_000_000_000, 2_000_000_000)`
+        // is an ordinary application call.
+        let range = (i64::from(bound) - i64::from(origin)) as u64;
+        let offset = (p64_simple_random() % range) as i64;
+        Ok(Some(Value::Int((i64::from(origin) + offset) as i32)))
     });
     r.register(tlr, "nextLong", "()J", |_ctx, _args| {
         let hi = (p64_simple_random() as i64) << 32;
@@ -5288,7 +5789,7 @@ pub(crate) fn register_phase66_natives(registry: &mut NativeMethodRegistry) {
 // =============================================================================
 // Phase 67: StructuredTaskScope, ScopedValue, Stream.Gatherer stubs,
 //           AsynchronousFileChannel/SocketChannel, Foreign Memory API stubs,
-//           StringTemplate stubs, additional Thread/Process/IO refinements
+//           additional Thread/Process/IO refinements
 // =============================================================================
 
 pub(crate) fn register_phase67_natives(registry: &mut NativeMethodRegistry) {
@@ -5299,7 +5800,47 @@ pub(crate) fn register_phase67_natives(registry: &mut NativeMethodRegistry) {
     register_p67_gatherer(registry);
     register_p67_async_channels(registry);
     register_p67_foreign_memory(registry);
-    register_p67_string_template(registry);
+    // `register_p67_string_template(registry);` — DELETED 2026-08-13 (lane F15),
+    // with the eight registrations it made and its banner comment.
+    //
+    // `java.lang.StringTemplate` DOES NOT EXIST on JDK 25. Measured on this
+    // host, not recalled:
+    //
+    //     $ javap -p java.lang.StringTemplate
+    //     Error: class not found: java.lang.StringTemplate
+    //     $ java -version
+    //     openjdk version "25.0.3" 2026-04-21 LTS (Microsoft-13877124, 25.0.3+9-LTS)
+    //
+    // The string-template API was a preview feature and was WITHDRAWN after
+    // JDK 23. Every row the registrar made was therefore a fabricated
+    // compatibility stand-in for a class no bytecode on this JDK can name —
+    // the exact thing `--jdk-only` exists to refuse — and one of them was
+    // type-confused on top of that: `fragments` was registered under
+    // `()Ljava/util/List;` and returned slot 0, which `of(String)` had just
+    // filled with a `java.lang.String`.
+    //
+    // Re-verified before deleting, because `call_native` PANICS on an
+    // unregistered triple that something still reaches, and a Rust panic is
+    // not a Java throwable — it kills the VM. `grep -rIn StringTemplate`
+    // over the whole tree (excluding `target/`, `.git/` and `docs/`) leaves
+    // only comments: `lib.rs`'s phase-67 header line and the tombstone in
+    // `vm/src/vm/tests.rs` where `string_template_basics_p67`, the sole
+    // caller, was already deleted whole (E40-1 §1b). No class declaration
+    // names `java/lang/StringTemplate` or its `$Processor` on the synthetic
+    // side either, so neither mode can reach a `StringTemplate` triple.
+    //
+    // Mode reach, stated so nobody has to re-derive it: this whole phase
+    // bundle is SYNTHETIC-ONLY. `register_phase67_natives`' one caller is
+    // `lib.rs::register_synthetic_overrides`, which is `#[cfg(feature =
+    // "synthetic-jdk")]` and is called only from `register_builtins`;
+    // `vm/src/vm/vm_init.rs`'s real-JDK arms say "the phase bundles are
+    // synthetic-only" and hand-register the few phase natives they want.
+    // So these eight rows never existed in `--real-jdk`/`--jdk-only`, and
+    // deleting them cannot move a strict-mode count.
+    //
+    // Ratchet: −8 `Bridge` registrations off the synthetic-mode total; the
+    // strict total is unchanged. See
+    // docs/known-issues/jdk-only/F15-1-two-registrars-that-no-bytecode-can-name-20260813.md
     register_p67_misc(registry);
     registry.set_category(__prev_cat);
 }
@@ -5368,108 +5909,6 @@ pub(crate) fn register_phase67_natives(registry: &mut NativeMethodRegistry) {
 
 
 
-
-// =============================================================================
-// StringTemplate — Java 21 (preview, removed in Java 25 in favor of string templates)
-// Stub for template processor API
-// =============================================================================
-
-pub(crate) fn register_p67_string_template(r: &mut NativeMethodRegistry) {
-    let __prev_cat = r.current_category();
-    r.set_category(cratonvm_native_api::NativeKind::Bridge);
-    let st = "java/lang/StringTemplate";
-    // StringTemplate.of(String) → StringTemplate
-    r.register(
-        st,
-        "of",
-        "(Ljava/lang/String;)Ljava/lang/StringTemplate;",
-        |ctx, args| {
-            let obj = try_alloc_concurrent_synthetic(ctx, "java/lang/StringTemplate", 2)?;
-            ctx.set_field(obj, 0, args.first().copied().unwrap_or(Value::Object(None))); // fragments
-            ctx.set_field(obj, 1, Value::Object(None)); // values
-            Ok(Some(Value::Object(Some(obj))))
-        },
-    );
-    r.register(st, "fragments", "()Ljava/util/List;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        Ok(Some(ctx.get_field(this, 0)))
-    });
-    r.register(st, "values", "()Ljava/util/List;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        Ok(Some(ctx.get_field(this, 1)))
-    });
-    r.register(st, "interpolate", "()Ljava/lang/String;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        Ok(Some(ctx.get_field(this, 0)))
-    });
-
-    // StringTemplate.STR / RAW / FMT — THREE FIELD-SHAPED ROWS, DEAD, VERDICT
-    // "DELETE", NOT DELETED HERE (2026-08-13, lane E36).
-    //
-    // Same dead shape as the rest of the family: a field name in the method
-    // slot, `Ljava/lang/StringTemplate$Processor;` where a method descriptor
-    // belongs, and no `getstatic` path in this VM consults the native
-    // registry.
-    //
-    // Unlike `System$Logger$Level` there is nothing here worth converting.
-    // `java.lang.StringTemplate` was a preview API and was WITHDRAWN: measured
-    // on this host, `javap -p java.lang.StringTemplate` answers
-    // `Error: class not found`. On JDK 25 the class does not exist, so no
-    // bytecode can reference it in real-JDK mode, and nothing declares it on
-    // the synthetic side either.
-    //
-    // Left in place only because `vm/src/vm/tests.rs`'s
-    // `string_template_basics_p67` `call_native`s the `STR` row — the exact
-    // shape where a test is the sole thing keeping a dead registration alive.
-    // The paired deletion is nominated so the two land together.
-    r.register(
-        st,
-        "STR",
-        "Ljava/lang/StringTemplate$Processor;",
-        |ctx, _args| {
-            let obj = try_alloc_concurrent_synthetic(ctx, "java/lang/StringTemplate$Processor", 0)?;
-            Ok(Some(Value::Object(Some(obj))))
-        },
-    );
-    // StringTemplate.RAW processor
-    r.register(
-        st,
-        "RAW",
-        "Ljava/lang/StringTemplate$Processor;",
-        |ctx, _args| {
-            let obj = try_alloc_concurrent_synthetic(ctx, "java/lang/StringTemplate$Processor", 0)?;
-            Ok(Some(Value::Object(Some(obj))))
-        },
-    );
-
-    // Processor interface
-    let proc = "java/lang/StringTemplate$Processor";
-    r.register(
-        proc,
-        "process",
-        "(Ljava/lang/StringTemplate;)Ljava/lang/Object;",
-        |ctx, args| {
-            // Default STR behavior: just return the interpolated string
-            let template = match args.get(1) {
-                Some(Value::Object(Some(t))) => *t,
-                _ => return Ok(Some(Value::Object(None))),
-            };
-            Ok(Some(ctx.get_field(template, 0)))
-        },
-    );
-
-    // FMT processor (FormatProcessor)
-    r.register(
-        st,
-        "FMT",
-        "Ljava/lang/StringTemplate$Processor;",
-        |ctx, _args| {
-            let obj = try_alloc_concurrent_synthetic(ctx, "java/lang/StringTemplate$Processor", 0)?;
-            Ok(Some(Value::Object(Some(obj))))
-        },
-    );
-    r.set_category(__prev_cat);
-}
 
 
 // =============================================================================
@@ -7903,6 +8342,99 @@ pub(crate) fn register_p71_wrapper_extras(r: &mut NativeMethodRegistry) {
 
 
 
+/// The `byte[]` argument of a `BigInteger` constructor.
+///
+/// Both byte-array constructors reach their array through
+/// `this(val, 0, val.length)` / `this(signum, magnitude, 0, magnitude.length)`,
+/// so a null fails on the ARRAY LENGTH READ at the delegating call site and
+/// HotSpot's helpful NPE names the parameter. MEASURED:
+///
+/// ```text
+/// new BigInteger((byte[]) null)      !! NullPointerException: Cannot read the array length because "val" is null
+/// new BigInteger(2, (byte[]) null)   !! NullPointerException: Cannot read the array length because "magnitude" is null
+/// ```
+///
+/// The generic `obj_arg` NPE these used carries no message at all.
+fn p71_bi_array_arg(
+    args: &[Value],
+    idx: usize,
+    name: &'static str,
+) -> Result<ObjectRef, MethodCallFailed> {
+    match args.get(idx) {
+        Some(Value::Object(Some(a))) => Ok(*a),
+        _ => Err(RuntimeError::NullPointerException {
+            message: Some(format!(
+                "Cannot read the array length because \"{name}\" is null"
+            )),
+        }
+        .into()),
+    }
+}
+
+/// `value << k` with the JDK's range guard, decided from the bit count BEFORE
+/// anything is allocated.
+///
+/// `BigInteger` supports a magnitude of at most `Integer.MAX_VALUE` bits.
+/// `checkRange` (JDK 25 `BigInteger.java:1213-1217`) is
+///
+/// ```text
+///     if (mag.length > MAX_MAG_LENGTH || mag.length == MAX_MAG_LENGTH && mag[0] < 0)
+///         reportOverflow();   // ArithmeticException("BigInteger would overflow supported range")
+/// ```
+///
+/// with `MAX_MAG_LENGTH == Integer.MAX_VALUE / 32 + 1 == 1 << 26`; `mag[0] < 0`
+/// means the top word's sign bit is set, so the two arms together say exactly
+/// "magnitude bit length > `Integer.MAX_VALUE`".
+///
+/// MEASURED on Microsoft OpenJDK 25.0.3+9 (`scratchpad/f2/BiProbe.java`):
+///
+/// ```text
+/// ONE.shiftRight(Integer.MIN_VALUE) !! ArithmeticException: BigInteger would overflow supported range  [103 ms]
+/// ONE.shiftLeft(Integer.MAX_VALUE)  !! ArithmeticException: BigInteger would overflow supported range  [ 28 ms]
+/// (-1).shiftRight(Integer.MIN_VALUE)!! ArithmeticException: BigInteger would overflow supported range  [ 84 ms]
+/// ONE.shiftLeft(Integer.MAX_VALUE-1) = <signum=1 bitLength=2147483647>                                 [ 32 ms]
+/// ONE.shiftLeft(Integer.MIN_VALUE)   = 0        ZERO.shiftRight(Integer.MIN_VALUE) = 0
+/// ```
+///
+/// The three refusals are HotSpot allocating `new int[1 + 67_108_864]` (~256 MB)
+/// and only then failing `checkRange` — that is what the 84-103 ms rows are.
+/// Because `shiftRight(n)`'s negative arm is a LEFT shift by `n.unsigned_abs()`
+/// (the JDK's own unsigned-distance rule, `BigInteger.java:3494-3506`), the
+/// same 256 MB is reachable here from one ordinary call with an
+/// attacker-chosen `n`. Refusing from the bit count gives the identical
+/// observable answer without the allocation.
+///
+/// DUPLICATE RESOLVED 2026-08-13 (lane F7, applied here by F15). The
+/// `math_bignum::bi_checked_shl` copy and that registrar's
+/// `shiftLeft`/`shiftRight` rows are DELETED, so this is now the single
+/// implementation and it is reached in every mode. F7 established the mode
+/// question by tracing `vm/src/vm/vm_init.rs` rather than assuming it:
+/// synthetic mode runs BOTH registrars with `math_bignum`'s SECOND
+/// (`use_synthetic_jdk` → essentials, then the synthetic overrides), real-JDK
+/// mode runs essentials only — so neither copy was unreachable, they were live
+/// in different modes and guaranteed to drift.
+///
+/// The magnitude-bit count is `BigInt::magnitude_bits` (`bigint.rs`), NOT a
+/// fourth private copy of the same three lines. This function used to call a
+/// local `p71_bi_mag_bits`, deleted with this change (F7 NOM 1); the
+/// `bitLength()`-vs-magnitude warning and F2's `(-2).shiftLeft(MAX-2)`
+/// measurement now live once, on `magnitude_bits` itself.
+fn p71_bi_checked_shl(
+    v: &crate::bigint::BigInt,
+    k: u32,
+) -> Result<crate::bigint::BigInt, MethodCallFailed> {
+    if v.is_zero() || k == 0 {
+        return Ok(v.clone());
+    }
+    if v.magnitude_bits() + u64::from(k) > i32::MAX as u64 {
+        return Err(RuntimeError::ArithmeticException {
+            message: "BigInteger would overflow supported range".to_string(),
+        }
+        .into());
+    }
+    Ok(v.shl(k))
+}
+
 pub(crate) fn register_p71_biginteger_extras(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
@@ -7919,12 +8451,57 @@ pub(crate) fn register_p71_biginteger_extras(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(Some(bi_alloc(ctx, &g)?))))
         },
     );
+    // `isProbablePrime(certainty)` — two arms this body did not have, both
+    // ahead of the primality test itself. JDK 25 `BigInteger.java:1156-1166`:
+    //
+    //     if (certainty <= 0) return true;
+    //     BigInteger w = this.abs();
+    //     if (w.equals(TWO)) return true;
+    //     if (!w.testBit(0) || w.equals(ONE)) return false;
+    //     return w.primeToCertainty(certainty, null);
+    //
+    // MEASURED on this host (openjdk 25.0.3+9-LTS) — F7 reported these and
+    // every row reproduced here before the edit was written:
+    //
+    //     (-7).isProbablePrime(10) = true     (-2).isProbablePrime(10) = true
+    //     (-4).isProbablePrime(10) = false    (-1).isProbablePrime(10) = false
+    //     0.isProbablePrime(10)    = false
+    //     4.isProbablePrime(0)     = true     4.isProbablePrime(-1)    = true
+    //     4.isProbablePrime(1)     = false
+    //     0.isProbablePrime(0)     = true     (-1).isProbablePrime(0)  = true
+    //
+    // The last row is the one that fixes the ORDER and is not in F7's record:
+    // `certainty <= 0` short-circuits before ANY inspection of the value, so
+    // even zero and −1 answer `true`. The guard must therefore precede
+    // `bi_read_int`, not sit beside it.
+    //
+    // `BigInt::is_probable_prime` opens `if self.neg || self.is_zero() { false }`,
+    // so calling it directly made `(-7).isProbablePrime(10)` FALSE where
+    // HotSpot says true — the JDK takes `this.abs()` first, and sign has no
+    // part in primality. Zero survives the `abs()` and still answers false,
+    // which matches.
+    //
+    // Not this file's defect but worth stating where the pair is: the twin in
+    // `math_bignum.rs` (which wins in synthetic mode, running second) was worse
+    // in the direction that matters — trial division capped at `i <= 10000`
+    // that returned TRUE on reaching the cap, so `1000003 * 1000033` and a
+    // 512-bit semiprime were both reported prime to a key-generation caller.
+    // F7 fixed it there; this is the same rule, in the copy that wins in
+    // real-JDK mode.
     r.register(bi, "isProbablePrime", "(I)Z", |ctx, args| {
+        let certainty = match args.get(1) {
+            Some(Value::Int(v)) => *v,
+            _ => 0,
+        };
+        if certainty <= 0 {
+            return Ok(Some(Value::Int(1)));
+        }
         // Limb-based Miller-Rabin (rewrite step 3): read mag:[I directly into
         // BigInt — no decimal round-trip — so the inner modPow is fast. This
         // is the hot path for createRandomPrime / RSA key-gen.
         let v = bi_read_int(ctx, obj_arg(args, 0)?);
-        Ok(Some(Value::Int(if v.is_probable_prime() { 1 } else { 0 })))
+        let w = if v.is_neg() { v.neg_value() } else { v };
+        Ok(Some(Value::Int(if w.is_probable_prime() { 1 } else { 0 })))
     });
     // shiftLeft/shiftRight via limb BigInt (rewrite step 4). Negative counts
     // flip direction (BigInteger contract). Arithmetic (floor) right shift.
@@ -7934,8 +8511,14 @@ pub(crate) fn register_p71_biginteger_extras(r: &mut NativeMethodRegistry) {
             Some(Value::Int(i)) => *i,
             _ => 0,
         };
+        // A left shift past `Integer.MAX_VALUE` magnitude bits is
+        // `ArithmeticException("BigInteger would overflow supported range")`
+        // (JDK 25 BigInteger.java:1213 `checkRange`), decided from the bit
+        // count so the oversized magnitude is never allocated. `unsigned_abs`
+        // on the right arm is the JDK's own rule and is NOT the defect:
+        // `shiftRightImpl` reads `-n` as UNSIGNED (BigInteger.java:3494-3506).
         let res = if n >= 0 {
-            v.shl(n as u32)
+            p71_bi_checked_shl(&v, n as u32)?
         } else {
             v.shr(n.unsigned_abs())
         };
@@ -7951,10 +8534,13 @@ pub(crate) fn register_p71_biginteger_extras(r: &mut NativeMethodRegistry) {
                 Some(Value::Int(i)) => *i,
                 _ => 0,
             };
+            // The negative arm is a LEFT shift by an UNSIGNED distance, so
+            // `shiftRight(Integer.MIN_VALUE)` is `<< 2_147_483_648` — the
+            // 256 MB allocation. Same guard, same message as `shiftLeft`.
             let res = if n >= 0 {
                 v.shr(n as u32)
             } else {
-                v.shl(n.unsigned_abs())
+                p71_bi_checked_shl(&v, n.unsigned_abs())?
             };
             Ok(Some(Value::Object(Some(bi_alloc_int(ctx, &res)?))))
         },
@@ -8032,8 +8618,22 @@ pub(crate) fn register_p71_biginteger_extras(r: &mut NativeMethodRegistry) {
     });
     r.register(bi, "<init>", "([B)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let arr = obj_arg(args, 1)?;
+        let arr = p71_bi_array_arg(args, 1, "val")?;
         let len = ctx.array_length(arr);
+        // `new BigInteger(byte[])` is `this(val, 0, val.length)`, whose first
+        // statement is the length check (JDK 25 BigInteger.java:348-350).
+        // MEASURED: `new BigInteger(new byte[0])` is
+        // `NumberFormatException: Zero length BigInteger`; this body answered
+        // ZERO, because `bi_from_byte_array_signed(&[])` is `"0"`. A
+        // zero-length array is exactly what a truncated read or an empty
+        // network frame hands to a decoder, so the wrong answer is silent and
+        // the value it invents is the one that compares equal to nothing.
+        if len == 0 {
+            return Err(RuntimeError::NumberFormatException {
+                message: "Zero length BigInteger".to_string(),
+            }
+            .into());
+        }
         let bytes: Vec<u8> = (0..len)
             .map(|i| match ctx.get_array_element(arr, i) {
                 Value::Int(x) => x as u8,
@@ -8087,8 +8687,43 @@ pub(crate) fn register_p71_biginteger_extras(r: &mut NativeMethodRegistry) {
             Some(Value::Int(i)) => *i,
             _ => 0,
         };
-        let arr = obj_arg(args, 2)?;
+        // The null check precedes the signum check, and it is not an ordering
+        // choice: `new BigInteger(int, byte[])` is
+        // `this(signum, magnitude, 0, magnitude.length)`, so `magnitude.length`
+        // is evaluated at the DELEGATING call site, before the 4-argument
+        // constructor's first statement. MEASURED:
+        // `new BigInteger(2, (byte[]) null)` is
+        // `NullPointerException: Cannot read the array length because
+        // "magnitude" is null`, NOT "Invalid signum value".
+        let arr = p71_bi_array_arg(args, 2, "magnitude")?;
         let len = ctx.array_length(arr);
+        // JDK 25 BigInteger.java:440-442. MEASURED: every signum outside
+        // -1..=1 is `NumberFormatException: Invalid signum value`, INCLUDING
+        // `new BigInteger(2, new byte[0])`, so the check is ahead of the
+        // zero-magnitude shortcut. This body accepted any `i32` and let
+        // `bi_from_byte_array_with_signum` interpret it.
+        if !(-1..=1).contains(&signum) {
+            return Err(RuntimeError::NumberFormatException {
+                message: "Invalid signum value".to_string(),
+            }
+            .into());
+        }
+        // JDK 25 BigInteger.java:446-453: a magnitude that strips to nothing
+        // is the value ZERO whatever the signum says (`new BigInteger(1, new
+        // byte[0])` and `new BigInteger(-1, new byte[]{0,0})` are both 0,
+        // measured) — and only a NON-empty magnitude with signum 0 is the
+        // mismatch. Testing `signum == 0` against the raw bytes would reject
+        // `new BigInteger(0, new byte[]{0})`, which is legal.
+        if signum == 0
+            && (0..len).any(
+                |i| matches!(ctx.get_array_element(arr, i), Value::Int(x) if (x & 0xff) != 0),
+            )
+        {
+            return Err(RuntimeError::NumberFormatException {
+                message: "signum-magnitude mismatch".to_string(),
+            }
+            .into());
+        }
         let bytes: Vec<u8> = (0..len)
             .map(|i| match ctx.get_array_element(arr, i) {
                 Value::Int(x) => x as u8,
@@ -9602,11 +10237,22 @@ mod cert_verify_bounds_security_tests {
     /// **16** of them — every one of which is registered — so a census whose
     /// stated subject is "every PUBLIC method, not most of them" was itself
     /// built from the registered set and could not go red for the one case it
-    /// exists to catch. The seventeenth,
-    /// `getInstance(String, java.security.Provider)`, is NOT registered
-    /// anywhere in the tree (`grep -rn 'javax/crypto/Mac'`: only
-    /// `phases_late/ssl_security.rs` and this file), and is carried below as an
-    /// explicit `false` row rather than by omission.
+    /// exists to catch.
+    ///
+    /// The seventeenth, `getInstance(String, java.security.Provider)`, was the
+    /// gap that census found, and it is now CLOSED: it is registered at
+    /// `phases_late/ssl_security.rs`, so its row below reads `true` like the
+    /// other sixteen. The prose here used to say it was "NOT registered
+    /// anywhere in the tree" and carried "as an explicit `false` row" — stale
+    /// as of 2026-08-13, and stale in the direction that matters, because the
+    /// reverse ratchet makes a closed gap a FAILURE (NOM E25-1). A reader who
+    /// trusted this paragraph over the table would have read the assertion as
+    /// a standing exemption, which is the one thing the ratchet exists to
+    /// prevent.
+    ///
+    /// **The sentence that must survive every edit:** the population is
+    /// `javap`'s, not the registry's. A row is added here because the JDK
+    /// declares the method, never because this VM happens to register it.
     ///
     /// The `expect_registered` column is ratcheted in BOTH directions: a row
     /// that flips either way fails, so registering the missing overload

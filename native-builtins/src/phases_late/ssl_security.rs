@@ -5159,22 +5159,23 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
     // chain DER bytes captured during the native-tls handshake. Throws
     // `SSLPeerUnverifiedException` (surfaced as RuntimeException) if the
     // peer did not present a certificate.
+    //
+    // F18: this copy LOSES its slot in real-JDK mode to `t27_tls`'s
+    // registration (E22-1 §1's `--dump-native-registry` table: `owns_slot =
+    // false` here, `true` there), but it is still the twin of the
+    // `getPeerPrincipal` below it, and a dead twin that reads a different
+    // source is how the live pair drifted apart in the first place. It now
+    // calls the same one resolver as its two siblings, so all three see one
+    // chain in whichever mode any of them wins — and the width bug described
+    // on `getPeerPrincipal` (slot 2 read as a stream id at widths where it is
+    // the `isValid` flag) was present here identically and is gone with it.
     r.register(
         ssl_session,
         "getPeerCertificates",
         "()[Ljava/security/cert/Certificate;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            let tls_id = if ctx.object_num_fields(this) > NEW13_SESS_TLSID {
-                ctx.get_field(this, NEW13_SESS_TLSID).as_int().unwrap_or(-1)
-            } else {
-                -1
-            };
-            let chain = if tls_id >= 0 {
-                crate::servlet::s2_tls_peer_cert_chain_der(tls_id).unwrap_or_default()
-            } else {
-                Vec::new()
-            };
+            let chain = crate::t27_tls::peer_certs_for_session(ctx, this);
             if chain.is_empty() {
                 // FIX (tomcatservletwebserverfactorytests-ssl-clientauth-peercert-residuals):
                 // this threw a bare IllegalStateException, contradicting this
@@ -5283,22 +5284,54 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(Some(arr))))
         },
     );
+    // F18 — THE DRIFTED TWIN, closed (F10-1 NOMINATION 2, and E31-1
+    // NOMINATION 4 / E22-1 NOMINATION B in the same edit).
+    //
+    // This door and `t27_tls`'s `getPeerCertificates` answer questions about
+    // the same fact — what the peer proved about its identity — and they read
+    // DIFFERENT SOURCES. `getPeerCertificates` (which owns its slot in
+    // real-JDK mode) read the object-keyed `session_peer_certs_table`; this one
+    // read `s2_tls_peer_cert_chain_der(slot2)`, the socket registry. An HTTPS
+    // client session is in the first and not the second, so on one object, in
+    // one call sequence, `getPeerCertificates()` returned the chain while
+    // `getPeerPrincipal()` threw `SSLPeerUnverifiedException`.
+    //
+    // MEASURED on HotSpot 25.0.3+9-LTS (`scratchpad/f18/F18SessionContract.java`,
+    // loopback `HttpsServer` + `HttpsURLConnection`, three runs byte-identical):
+    //
+    //   getPeerPrincipal().getClass()  = javax.security.auth.x500.X500Principal
+    //   getPeerPrincipal().getName()   = CN=localhost,OU=F18,O=CratonVM,...
+    //   getPeerPrincipal().toString()  = CN=localhost, OU=F18, O=CratonVM, ...
+    //   getPeerPrincipal().equals(peerCerts[0].getSubjectX500Principal()) = true
+    //
+    // That last row is the contract, and it is what makes ONE resolver the
+    // right shape rather than merely a tidier one: HotSpot's answer here is
+    // *defined* as the subject of the leaf of the chain the sibling returns, so
+    // any implementation in which the two can disagree is wrong by
+    // construction. `t27_tls::peer_certs_for_session` is now the only function
+    // that decides, and both doors call it.
+    //
+    // The second bug this removes is a cross-connection one and was already on
+    // record. The width test was `> NEW13_SESS_TLSID`, i.e. "three or more
+    // fields", but slot 2 is a stream id on only some widths — on the 8-field
+    // engine session it is the `isValid` FLAG, so this looked up
+    // `s2_tls_peer_cert_chain_der(0)` or `(1)`, and `1` is the first id
+    // `servlet::s2_next_free_id` ever hands out. A valid engine session could
+    // be handed an unrelated socket's peer certificate chain.
+    // `session_stream_id` (inside the resolver) is the width table that stops
+    // it.
+    //
+    // The refusal is UNCHANGED and must stay: measured on the same host, a
+    // session with no authenticated peer throws
+    // `javax.net.ssl.SSLPeerUnverifiedException: peer not authenticated` —
+    // exception KIND and message both, and both already correct here.
     r.register(
         ssl_session,
         "getPeerPrincipal",
         "()Ljava/security/Principal;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            let tls_id = if ctx.object_num_fields(this) > NEW13_SESS_TLSID {
-                ctx.get_field(this, NEW13_SESS_TLSID).as_int().unwrap_or(-1)
-            } else {
-                -1
-            };
-            let chain = if tls_id >= 0 {
-                crate::servlet::s2_tls_peer_cert_chain_der(tls_id).unwrap_or_default()
-            } else {
-                Vec::new()
-            };
+            let chain = crate::t27_tls::peer_certs_for_session(ctx, this);
             let Some(leaf) = chain.first() else {
                 // FIX (tomcatservletwebserverfactorytests-ssl-clientauth-peercert-residuals):
                 // same wrong-exception-type bug as getPeerCertificates just

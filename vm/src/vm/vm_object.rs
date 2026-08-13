@@ -755,6 +755,36 @@ pub fn read_java_string(heap: &VmHeap, obj_ref: ObjectRef) -> Option<String> {
 /// Same receiver guards as [`read_java_string`], but lossless: an unpaired
 /// surrogate survives. Use this whenever the destination is another Java
 /// `String` rather than Rust text.
+///
+/// # The write side already exists — do not add a second one
+///
+/// This reader's lossless twin is [`create_java_string_from_units`] (and its
+/// fallible sibling [`try_create_java_string_from_units`]), one screen above.
+/// Both bottom out in `populate_java_string_fields`, which is the ONE function
+/// that decides a `String`'s coder and byte order, and which this decoder is
+/// the exact inverse of — LATIN1 when every unit fits in a byte, otherwise
+/// little-endian UTF-16 pairs.
+///
+/// That matters because the write side is easy to believe is missing. It is
+/// reachable from native code without any new VM primitive:
+///
+/// ```text
+///   NativeContext::init_string_from_units   (native-api/src/registry.rs)
+///     -> VmNativeContext::init_string_from_units   (vm/src/vm/vm_exec.rs)
+///       -> populate_java_string_fields             (this file)
+/// ```
+///
+/// so a native that has already `new_object("java/lang/String")`'d gets the
+/// same bytes this reader would decode. `native-builtins`' own
+/// `lang_string::sb_string_from_units` is that pair packaged as one call and is
+/// the writer every `String`-returning native in that file should use.
+///
+/// A `create_string_from_utf16` added to `NativeContext` would therefore be a
+/// THIRD spelling of one concept, and "two encodings of one thing that
+/// reconcile only at consumption" is precisely how the coder/endianness
+/// agreement above gets broken. If a leaner path is ever wanted, route the
+/// existing trait method at a direct
+/// [`create_java_string_from_units`] — do not introduce a parallel one.
 pub fn read_java_string_units(heap: &VmHeap, obj_ref: ObjectRef) -> Option<Vec<u16>> {
     let (value_array, coder) = java_string_value_and_coder(heap, obj_ref)?;
     decode_java_string_value_array_units(heap, value_array, coder)
