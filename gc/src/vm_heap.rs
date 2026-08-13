@@ -2325,13 +2325,14 @@ impl VmHeap {
             use std::sync::atomic::Ordering as O;
             eprintln!(
                 "[GC] young_sweep: par_attempts={} par_accepts={} zero_spans={} \
-                 zero_empty_runs={} phantom_extents={} live_in_dead={} \
-                 walk_overshoot={} anchor_not_a_base={}",
+                 zero_empty_runs={} phantom_extents={} phantom_nonbase_marks={} \
+                 live_in_dead={} walk_overshoot={} anchor_not_a_base={}",
                 crate::gen_heap::PAR_SWEEP_ATTEMPTS.load(O::Relaxed),
                 crate::gen_heap::PAR_SWEEP_ACCEPTS.load(O::Relaxed),
                 crate::gen_heap::SWEEP_ZERO_SPAN_HITS.load(O::Relaxed),
                 crate::gen_heap::SWEEP_ZERO_SPAN_EMPTY_RUNS.load(O::Relaxed),
                 crate::gen_heap::SWEEP_PHANTOM_EXTENTS.load(O::Relaxed),
+                crate::gen_heap::SWEEP_PHANTOM_INTERIOR_MARKS.load(O::Relaxed),
                 crate::gen_heap::LIVE_IN_DEAD_SPANS.load(O::Relaxed),
                 crate::gen_heap::SWEEP_WALK_OVERSHOOT_HITS.load(O::Relaxed),
                 crate::gen_heap::SWEEP_ANCHOR_NOT_A_BASE.load(O::Relaxed),

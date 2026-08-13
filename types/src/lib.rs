@@ -360,3 +360,48 @@ mod tests {
         assert_eq!(scope.get(&h2), r);
     }
 }
+
+// ---------------------------------------------------------------------------
+// ZGC read-barrier codegen gate
+// ---------------------------------------------------------------------------
+
+/// Whether **any** ZGC heap in this process has armed its read-path load
+/// barrier -- the codegen gate for stage (a) of `zgc-jit-load-barrier.md`.
+///
+/// # Why it lives HERE, and why it is process-wide
+///
+/// Two constraints meet. `gc/src/zgc_concurrent.rs` states the rule this
+/// breaks -- "No process-global state ... this tree has had parallel-test
+/// crashes from process-global GC caches" -- so the exception needs a reason.
+/// And `cratonvm-jit` depends on `cratonvm-gc` only as a **dev-dependency**,
+/// deliberately (see the acyclicity note in `jit/Cargo.toml`), so the gate
+/// cannot live in the gc crate without adding a real edge.
+///
+/// `cratonvm-types` is the crate both already depend on and which depends on
+/// nothing, so it is where a fact shared by the collector and the code
+/// generator belongs.
+///
+/// The reason it must be process-wide at all: the **consumer** is the JIT's
+/// code generator, deciding whether to emit an inline reference load while
+/// holding no heap handle and, for shared code, on behalf of no particular VM.
+///
+/// The direction of the error makes it safe. The only thing this can get wrong
+/// in a multi-VM process is make a second VM's JIT route reference loads
+/// through the helpers when its own heap has no barrier armed -- a throughput
+/// loss. The reverse, a heap arming its barrier while some other VM's JIT goes
+/// on emitting raw inline loads, is the use-after-free, and it cannot happen,
+/// because arming sets the flag for everyone.
+#[inline]
+pub fn zgc_read_barrier_armed() -> bool {
+    ZGC_READ_BARRIER_ARMED.load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// Publish the read-barrier arming state. Called by
+/// `ZgcRealHeap::set_barrier_color`; see [`zgc_read_barrier_armed`].
+#[inline]
+pub fn set_zgc_read_barrier_armed(armed: bool) {
+    ZGC_READ_BARRIER_ARMED.store(armed, std::sync::atomic::Ordering::Release);
+}
+
+static ZGC_READ_BARRIER_ARMED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
