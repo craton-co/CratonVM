@@ -111,7 +111,16 @@ say ZGC is *not* simply more correct:
   link this page used to carry;
 - ZGC needs measurably more heap for the same work: `ZipContentTests` OOMs at
   `-Xmx 2g` under ZGC and passes at 3g, where the default collector passes at
-  2g — the price of not compacting;
+  2g — the price of not compacting. **Partly re-attributed 2026-08-13:** the
+  Tomcat instance of that shape (`TestNonBlockingAPI`, OOM with 1.99 GB of a
+  2.15 GB heap free) turned out to be mostly *not* the price of not compacting.
+  A TLAB chunk is RESERVED space no collection can reclaim, its size was flat at
+  512 KiB however many threads a workload ran, and this class runs ~4,000 —
+  `4,000 x 512 KiB` is the whole heap. See
+  fixed-suite-bugs/tomcat/zgc-nonblockingapi-fragmentation-oom-double-fault-hang-FIXED-20260813.md
+  and feature-designs/zgc-maturity-assessment-and-plan-20260813.md. The
+  headroom premium is real but is not a single constant, and the 1.5x figure
+  quoted elsewhere has never been re-measured since;
 - it still has 29 HANGs and 18 FAILs here.
 
 ## The ZGC half of the class-list diff — done 2026-08-10
