@@ -204,3 +204,24 @@ every claim above was re-measured on the merged binary rather than carried over:
 * `TestDefaultInstanceManager` `OK (1 test)` on all four collectors again;
 * `regression-suite` core 43 passed / 0 failed; `cratonvm-gc --lib` 1503 and
   `cratonvm-types --lib` 562, both green.
+
+### Flag hygiene, found by the guard that exists for it
+
+`CRATONVM_GC_NO_EMPTY_OBJECT_RUN` is declared in `types/src/flag_groups.rs`'s
+`INVENTORY` and listed in `types/tests/flag-surface.txt`. Both are required and
+both are checked: removing the surface line alone fails
+`flag_surface::inventory_matches_the_checked_in_surface`, which was confirmed by
+deleting it and re-running rather than assumed.
+
+Running those guards also caught two flags this session's EARLIER branch
+(`fix/websocket-frame-truncation-20260813`) introduced without declaring —
+`CRATONVM_DBG_INTRINSIC` and `CRATONVM_JIT_NO_STRING_INTRINSIC_PIN`. An
+undeclared flag is served by a live `getenv` instead of the latched `VmFlags`
+snapshot, so `CRATONVM_JIT=no-string-intrinsic-pin` could not reach it and
+`flags::with_thread_overrides` could not arrange it in a test. Both are declared
+here. `flag_declaration_guard` was already red on `dev` before either branch —
+it named eight, of which six (`CRATONVM_DBG_ATOMIC_INTRINSIC`,
+`CRATONVM_JIT_NO_ATOMIC_INTRINSIC`, `CRATONVM_DBG_DEFINE_FILTER`,
+`CRATONVM_DBG_DEFINE_STACK_FILTER`, `CRATONVM_DBG_HW_ATOMIC`,
+`CRATONVM_ZGC_PARMARK`) are pre-existing and untouched here; this branch takes
+the population from eight to six rather than adding to it. Filed separately.
