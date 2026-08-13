@@ -65,6 +65,19 @@ Trade-offs at a glance:
   `fixed-suite-bugs/springboot/zgc-real-fullsuite-regression-RETIRED-20260808.md`.
   The path to a real one is
   [`docs/feature-designs/zgc-production-implementation-plan.md`](feature-designs/zgc-production-implementation-plan.md).
+  **Re-attributed 2026-08-13, and this is the part to read before sizing a
+  heap:** the Tomcat instance of the "ZGC wants more heap" shape
+  (`TestNonBlockingAPI`, `OutOfMemoryError` with 1.99 GB of a 2.15 GB heap
+  free) turned out to be mostly *not* the price of not compacting. A TLAB chunk
+  is RESERVED space no collection can reclaim while its thread lives, its size
+  was flat at 512 KiB however many threads a workload ran, and that class runs
+  ~4,000 of them — `4,000 x 512 KiB` is the whole heap. The chunk is now sized
+  against the live thread count. The headroom premium is real, but it is not a
+  single constant and the 1.5x figure has never been re-measured; see
+  fixed-suite-bugs/tomcat/zgc-nonblockingapi-fragmentation-oom-double-fault-hang-FIXED-20260813.md
+  and
+  [the maturity assessment](feature-designs/zgc-maturity-assessment-and-plan-20260813.md).
+
   Those Spring Boot numbers are from 2026-08-08 and are **stale in ZGC's
   disfavour**: two ZGC-only defects behind them were fixed on 2026-08-10 (see
   the retired page). The suite has not been re-run under ZGC since, which is

@@ -2277,6 +2277,13 @@ impl VmHeap {
                 crate::gen_heap::EMPTY_RUN_BYTES_LAST.load(O::Relaxed),
                 crate::gen_heap::EMPTY_RUN_YOUNG_USED_LAST.load(O::Relaxed),
             );
+            let l = &crate::gen_heap::LATE_WALK_ZERO_RUNS;
+            eprintln!(
+                "[GC] late_walk_zero_runs: mark_y2o={} fixup_yo={} walk_young={}",
+                l[0].load(O::Relaxed),
+                l[1].load(O::Relaxed),
+                l[2].load(O::Relaxed),
+            );
             // Which check abandoned a chunk. `par_accepts` alone cannot say,
             // and one `None` from any chunk discards the whole cycle's
             // attempt. Legend is on `PAR_CHUNK_BAILS`; printed as a bare array
