@@ -1,10 +1,12 @@
 # FastThreadLocalTest — a 2.1-billion-iteration loop against a per-helper-call floor
 
-**Status:** OPEN — **throughput, not correctness** (2026-08-12). The correctness
-half of this class was fixed earlier the same day (see
-[jit-elided-constructor-side-effects-20260812.md](jit-elided-constructor-side-effects-20260812.md));
-what remains cannot be closed by a targeted fix and is recorded here with the
-numbers that size it.
+**Status:** OPEN — **throughput, not correctness** (2026-08-12; **re-measured
+2026-08-13**, see "Re-measured" below — every rate in the original table has
+moved, two of them by more than an order of magnitude, and the attribution has
+changed). The correctness half of this class was fixed on 2026-08-12 (see
+[jit-elided-constructor-side-effects-FIXED-20260812.md](../../internal/fixed-suite-bugs/netty/jit-elided-constructor-side-effects-FIXED-20260812.md),
+retired 2026-08-13); what remains is a performance workstream, recorded here
+with the numbers that size it.
 
 ## What the test does
 
@@ -64,6 +66,87 @@ Two things this says:
 native (`native-builtins/src/phases_early.rs`), and in-tree measurements put a
 native call at ~120 ns. Compiled code is paying a call per allocation and per
 atomic where HotSpot emits an inline TLAB bump and a `lock xadd`.
+
+## Re-measured 2026-08-13 — every rate above has moved
+
+`probes/CtorShapeRateProbe.java` (`Rate2`: each loop in its own method, so the
+measured body is compiled and not interpreted) and
+`probes/CtorCallSiteRateProbe.java` (`Rate3`: the constructor site in an
+ordinarily invocation-compiled method rather than an OSR'd loop). Same host,
+JDK 25, real-jdk mode, 10 M iterations after warm-up. Left-to-right: HotSpot,
+`dev` `ae2e1d9c8`, and `dev` + the constructor direct-call change described
+below.
+
+| loop (ns/op) | HotSpot | dev | +ctor direct call |
+|---|---|---|---|
+| `new X()` where `X()` is `i = ATOMIC.getAndIncrement()` | 6.2 | 916.6 | 999.7 |
+| `new X()` where `X()` is `i = ++staticInt` | 1.7 | 311.8 | 361.1 |
+| `new X(v)` where `X(int v)` is `i = v` | 2.0 | 749.0 | 752.3 |
+| `new X()` where `X()` is empty (elidable) | 1.5 | 104.0 | 79.4 |
+| `new Object()` | 1.5 | 98.9 | 78.6 |
+| `nextIndex.getAndIncrement()` alone | 4.7 | 5.7 | 5.0 |
+| **ordinary call site**: `mkAtomic()` (Rate3) | 6.8 | 875.7 | **627.2** |
+| **ordinary call site**: `mkPlain()` (Rate3) | 2.2 | 277.3 | **227.5** |
+
+Extrapolated to the 2 147 483 639 iterations the test performs:
+
+| component | 2026-08-12 | 2026-08-13 |
+|---|---|---|
+| the atomic alone | 534 s | **11 s** |
+| the allocation alone | 410 s | **169 s** |
+| the whole constructor loop | 2 508 s | ~2 100 s |
+
+**Two of this page's three recommendations have moved, and the ordering has
+changed.**
+
+* **Recommendation 1 (atomic intrinsics) is DONE.** `AtomicIntGetAndIncrement`
+  is an intrinsic in the JIT's ladder now
+  ([record](../../internal/fixed-suite-bugs/netty/atomicinteger-lock-xadd-intrinsic-20260812-FIXED.md)):
+  4.1 M/s → **200 M/s**, i.e. **49x**, and within 1.2x of HotSpot. The atomic
+  half of this loop is 11 seconds, not 534.
+* **Recommendation 2 (allocation) improved 2.3x** without being worked on
+  directly — 5.5 M/s → 12.7 M/s, 410 s → 169 s. It is now *under* the 180 s
+  per-class wall on its own, so **the sentence "the floor is already over the
+  cap" above is no longer true**: allocation plus atomic is ~84 ns/op, i.e.
+  ~180 s, right at it.
+* **Recommendation 3 (the constructor call) is now the whole gap.** ~915 ns of
+  the ~1000 ns per iteration is neither the allocation (79 ns) nor the atomic
+  (5 ns) — it is the `<init>` dispatch round trip.
+  `CRATONVM_DBG_JIT_SCAN_PROF=1` reports `jit_entries` exactly equal to the
+  iteration count, which is the tell: one JIT boundary crossing per `new`.
+
+### What landed for it, and the blocker that remains
+
+`jit/src/lib.rs`'s IR (optimizing) tier refused to bind a constructor site
+directly — `!is_ctor` in the direct-call gate — where the single-pass backend
+has always bound `matches!(invoke_kind, 1 | 3)` without that exclusion. That
+exclusion is gone; the two backends now agree. It is worth **1.40x** on
+`mkAtomic` and **1.22x** on `mkPlain` in the default configuration (Rate3
+above), and 1.64x on `ctorAtomic` with `CRATONVM_BG_COMPILE=0`.
+
+It is worth **nothing on an OSR'd loop**, and the reason is specific and
+actionable. `CRATONVM_DBG_JITC=1` on the Rate2 loops shows the order:
+
+```
+OSR-compile Rate2.l1(I)J entry_pc=6 …
+full-compile Rate2$CtorAtomic.<init>()V …        <-- AFTER its caller
+OSR-reuse   Rate2.l1(I)J entry_pc=6 …            <-- forever
+```
+
+The background compile worker deliberately passes a **lookup-only** callee
+resolver (`direct_callee_lookup` in `vm/src/runtime/interpreter/jit_bridge.rs`,
+whose comment reasons that "the tiered manager compiles leaves before their
+callers because leaves reach the invocation threshold first"). For an **OSR**
+compile that premise is false: a loop trips the OSR threshold during its *first*
+invocation, before the callee it calls has accumulated any call count at all.
+The caller's artifact is then cached and reused, so the site never gets a second
+chance. Closing this needs either a recompile trigger when a bound-able callee
+appears, or a late-binding cache at the site — neither is a one-line change, and
+neither is measured here.
+
+`new X(){}` (empty constructor) still tracks `new Object()` to within a
+nanosecond in both columns, so the scalar-replacement/elision path this page's
+predecessor narrowed is unaffected.
 
 ### Ground truth
 
