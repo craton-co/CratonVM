@@ -2241,6 +2241,38 @@ impl VmHeap {
             // last collection saw. Cheap: two arena locks at shutdown.
             h.publish_gc_metrics_occupancy();
         }
+        // Young non-moving-sweep health, UNCONDITIONALLY (the H2-CID0 rule: a
+        // line printed only when non-zero cannot tell "clean" from "never
+        // ran", and here that is the whole question).
+        //
+        // `par_accepts` far below `par_attempts` means the parallel sweep
+        // prefix is being discarded and the entire arena is re-swept
+        // sequentially. Until 2026-08-12 that was the state on EVERY JIT-warm
+        // workload — `attempts=5 accepts=0` on the hibernate-reactive repro,
+        // every abort the benign empty-object zero run — and these counters
+        // said so the whole time with nobody to read them.
+        //
+        // `zero_empty_runs` is that benign shape, now stepped over on-grid: it
+        // is normal and often large, and is deliberately NOT summed with
+        // `zero_spans`, the residue that still forces an unwind.
+        // `phantom_extents` and `live_in_dead` are the two corruption guards —
+        // non-zero on either is a finding, not tuning.
+        if let VmHeap::Generational(_) = self {
+            use std::sync::atomic::Ordering as O;
+            eprintln!(
+                "[GC] young_sweep: par_attempts={} par_accepts={} zero_spans={} \
+                 zero_empty_runs={} phantom_extents={} live_in_dead={} \
+                 walk_overshoot={} anchor_not_a_base={}",
+                crate::gen_heap::PAR_SWEEP_ATTEMPTS.load(O::Relaxed),
+                crate::gen_heap::PAR_SWEEP_ACCEPTS.load(O::Relaxed),
+                crate::gen_heap::SWEEP_ZERO_SPAN_HITS.load(O::Relaxed),
+                crate::gen_heap::SWEEP_ZERO_SPAN_EMPTY_RUNS.load(O::Relaxed),
+                crate::gen_heap::SWEEP_PHANTOM_EXTENTS.load(O::Relaxed),
+                crate::gen_heap::LIVE_IN_DEAD_SPANS.load(O::Relaxed),
+                crate::gen_heap::SWEEP_WALK_OVERSHOOT_HITS.load(O::Relaxed),
+                crate::gen_heap::SWEEP_ANCHOR_NOT_A_BASE.load(O::Relaxed),
+            );
+        }
         // Old-gen free-list coalescing (the counterpart of the young sweep's
         // post-sweep coalescer). A large `merged` with compaction never having
         // run is the fragmentation regime this exists for; `calls>0 merged=0`
