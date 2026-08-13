@@ -3924,6 +3924,11 @@ fn al_slots_for_uncached(
             None => AlLayout::Lenient,
             Some("") => AlLayout::Lenient,
             Some("java/lang/Object") => AlLayout::BareObject,
+            // A map view carries its state in ArrayList's own resolved slots
+            // under its own class — see `MAP_VIEW_CARRIERS`. Without this arm
+            // the guard below rejects it as a named non-list and every view
+            // reads back EMPTY.
+            Some(n) if is_map_view_carrier(n) => AlLayout::ArrayList,
             Some(_) => AlLayout::Foreign,
         }
     };
@@ -4480,6 +4485,72 @@ fn register_arraylist_natives(r: &mut NativeMethodRegistry) {
     r.set_category(__prev_cat);
     // Fix (item 6): the backed-view class returned by `subList`.
     register_al_sublist_natives(r);
+    // The classes a map's `values()`/`entrySet()` view is minted under.
+    register_map_view_carrier_natives(r);
+}
+
+/// The `Collection` surface of a map view, registered on each of the
+/// [`MAP_VIEW_CARRIERS`].
+///
+/// A view is ArrayList-LAYOUT under its own class, so it needs the same
+/// `native_al_*` bodies the ArrayList registration installs. Interface-level
+/// registrations (`java/util/Collection`, `java/util/AbstractCollection`) catch
+/// some of these already, but only for methods the carrier's own JDK class does
+/// not declare — and `HashMap$Values` declares `size`, `iterator`, `clear`,
+/// `forEach` and `spliterator` itself, `TreeMap$Values` adds `contains` and
+/// `remove`, and `ConcurrentHashMap$ValuesView` declares nearly the whole
+/// surface. Registering here is what keeps the receiver-has-own-bytecode rule
+/// from running JDK bodies that would read `this$0` (null on these carriers) —
+/// paired with the entries in `force_native_over_real_jdk_bytecode`.
+///
+/// Deliberately NOT registered: `equals` and `hashCode`. The JDK's views
+/// inherit `AbstractCollection`'s, i.e. `Object` identity, and installing the
+/// LIST-contract `native_al_equals`/`native_al_hash_code` here would reinstate
+/// exactly the `values().equals(anArrayList) == true` divergence that giving
+/// these views their own class removes. `get`/`indexOf`/`lastIndexOf`/`set`/
+/// `add(int, …)` are omitted for the same reason: a `Collection` has no
+/// positional access, and answering one would make the view act like the `List`
+/// it is no longer classed as.
+fn register_map_view_carrier_natives(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
+    for c in MAP_VIEW_CARRIERS {
+        let c = *c;
+        r.register(c, "size", "()I", native_al_size);
+        r.register(c, "isEmpty", "()Z", native_al_is_empty);
+        r.register(c, "contains", "(Ljava/lang/Object;)Z", native_al_contains);
+        r.register(c, "iterator", "()Ljava/util/Iterator;", native_al_iterator);
+        r.register(c, "toArray", "()[Ljava/lang/Object;", native_al_to_array);
+        r.register(
+            c,
+            "toArray",
+            "([Ljava/lang/Object;)[Ljava/lang/Object;",
+            native_al_to_array_typed,
+        );
+        r.register(
+            c,
+            "toArray",
+            "(Ljava/util/function/IntFunction;)[Ljava/lang/Object;",
+            native_collection_to_array_generator,
+        );
+        r.register(c, "toString", "()Ljava/lang/String;", native_al_to_string);
+        r.register(c, "remove", "(Ljava/lang/Object;)Z", native_al_remove_obj);
+        r.register(c, "clear", "()V", native_al_clear);
+        r.register(
+            c,
+            "forEach",
+            "(Ljava/util/function/Consumer;)V",
+            native_al_for_each,
+        );
+        r.register(c, "stream", "()Ljava/util/stream/Stream;", native_al_stream);
+        r.register(
+            c,
+            "removeIf",
+            "(Ljava/util/function/Predicate;)Z",
+            native_al_remove_if,
+        );
+    }
+    r.set_category(__prev_cat);
 }
 
 pub fn native_al_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -11040,10 +11111,11 @@ fn native_map_values(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     // cceres3: pin across GC-capable call (stream stale-at-store wave) — the
     // list/buffer allocations move `this` and every snapshotted value before
     // the stores below (mirrors native_map_keys_as_array).
+    let carrier = values_carrier_for(&*ctx, this);
     let this_pin = ctx.pin_native_root(this);
     let (_, val_handles) = pin_value_slice(ctx, &values);
     let __al_n_fields = al_slots(ctx).2;
-    let list = try_alloc_synthetic(ctx, "java/util/ArrayList", __al_n_fields)?;
+    let list = alloc_view_carrier(ctx, carrier, __al_n_fields)?;
     let list_pin = ctx.pin_native_root(list);
     let cap = std::cmp::max(values.len(), AL_DEFAULT_CAPACITY) + 1;
     let buf = alloc_ref_array(ctx, cap);
@@ -11077,10 +11149,11 @@ pub fn make_live_values_list(
     source: ObjectRef,
     values: &[Value],
 ) -> Result<ObjectRef, MethodCallFailed> {
+    let carrier = values_carrier_for(&*ctx, source);
     let source_pin = ctx.pin_native_root(source);
     let (_, val_handles) = pin_value_slice(ctx, values);
     let __al_n_fields = al_slots(ctx).2;
-    let list = try_alloc_synthetic(ctx, "java/util/ArrayList", __al_n_fields)?;
+    let list = alloc_view_carrier(ctx, carrier, __al_n_fields)?;
     let list_pin = ctx.pin_native_root(list);
     let cap = std::cmp::max(values.len(), AL_DEFAULT_CAPACITY) + 1;
     let buf = alloc_ref_array(ctx, cap);
@@ -12120,9 +12193,105 @@ fn make_view_set_of(
     Ok(set)
 }
 
-/// Build a `values()` view: an `ArrayList` snapshot whose element array stashes
-/// the source map in its last capacity slot so removals write through.
-fn make_view_list_of(ctx: &mut dyn NativeContext, source: ObjectRef, vals: &[Value]) -> Result<ObjectRef, MethodCallFailed> {
+/// The carrier classes a map view is minted under.
+///
+/// Every one of these was `java/util/ArrayList` until 2026-08-13, and that had
+/// two costs. The visible one: `hashMap.values().getClass()` answered
+/// `java.util.ArrayList`, `values() instanceof List` was `true` where HotSpot
+/// says `false`, and `values().equals(anArrayList)` was `true` where HotSpot's
+/// `AbstractCollection` gives identity equality. The expensive one: because a
+/// receiver whose class is exactly `java/util/ArrayList` MIGHT have been a
+/// view, no `native_al_*` operation could take an exact-class fast path — every
+/// `size()` on every ordinary list ran the whole view-discrimination chain
+/// first.
+///
+/// These are the REAL JDK class names, not `cratonvm/internal/*` ones, which is
+/// affordable here in a way it was not for `cratonvm/internal/ArrayListSubList`
+/// (see the "ArrayList subList backed view" section): a view carries its state
+/// in ArrayList's own resolved `elementData`/`size` slots, which sit at
+/// absolute indices 1 and 2 in the real-JDK layout, past the single `this$0`
+/// these classes declare. Writing there is the same undeclared-slot pattern
+/// `alloc_key_set_view_object` already uses on the real
+/// `ConcurrentHashMap$KeySetView`: an undeclared slot resolves to no field
+/// descriptor and is left untyped rather than mistyped. The JDK's own bodies
+/// for these classes must not run over that layout, which is why every name
+/// here also appears in `force_native_over_real_jdk_bytecode` and in
+/// `vm_exec`'s companion arm, exactly as `java/util/ArrayList` did.
+const MAP_VIEW_CARRIERS: &[&str] = &[
+    "java/util/HashMap$Values",
+    "java/util/LinkedHashMap$LinkedValues",
+    "java/util/TreeMap$Values",
+    "java/util/TreeMap$EntrySet",
+    "java/util/Hashtable$ValueCollection",
+    "java/util/concurrent/ConcurrentHashMap$ValuesView",
+];
+
+/// `true` iff `name` is one of the [`MAP_VIEW_CARRIERS`]. Cold path only: the
+/// per-call answer comes from the `AlLayout` memo, which consults this once per
+/// `ClassId`.
+#[inline]
+fn is_map_view_carrier(name: &str) -> bool {
+    MAP_VIEW_CARRIERS.contains(&name)
+}
+
+/// The class a `values()` view over `source` should be minted under, chosen to
+/// match what the JDK's own `values()` returns for that map family.
+///
+/// `Hashtable`/`Properties` are the one deliberate approximation: the JDK wraps
+/// `Hashtable$ValueCollection` in a `Collections$SynchronizedCollection`, and
+/// only the inner class is modelled here. That is a strictly smaller divergence
+/// than `java.util.ArrayList` and does not affect the exact-class fast path,
+/// which only needs the answer to be "not `java/util/ArrayList`".
+fn values_carrier_for(ctx: &dyn NativeContext, source: ObjectRef) -> &'static str {
+    // Order matters and mirrors `collect_entries_any`: LinkedHashMap is a
+    // HashMap subclass, so it has to be asked first.
+    if is_lhm_receiver(ctx, source) {
+        "java/util/LinkedHashMap$LinkedValues"
+    } else if is_tree_map_receiver(ctx, source) {
+        "java/util/TreeMap$Values"
+    } else if is_chm_receiver(ctx, source) {
+        "java/util/concurrent/ConcurrentHashMap$ValuesView"
+    } else if receiver_facts(ctx, source).has(CF_HASHTABLE_ANCESTRY) {
+        "java/util/Hashtable$ValueCollection"
+    } else {
+        "java/util/HashMap$Values"
+    }
+}
+
+/// Allocate a view carrier, falling back to `java/util/ArrayList` if the
+/// carrier class cannot be had.
+///
+/// The fallback is not decoration. These are package-private JDK classes; a
+/// stripped image, a `--jdk-only` policy refusal, or a synthetic-JDK build that
+/// has not bootstrapped them would otherwise turn `map.values()` — which cannot
+/// fail — into a `NoClassDefFoundError`. Degrading to the old carrier costs the
+/// `getClass()` fidelity for that run and nothing else, because every
+/// `native_al_*` path still accepts an ArrayList-classed view.
+fn alloc_view_carrier(
+    ctx: &mut dyn NativeContext,
+    carrier: &str,
+    n_fields: usize,
+) -> Result<ObjectRef, MethodCallFailed> {
+    if let Ok(cid) = ctx.ensure_class_initialized(carrier) {
+        if ctx.class_name_arc_of_id(cid).as_deref() == Some(carrier) {
+            return Ok(ctx.alloc_object(cid, n_fields));
+        }
+    }
+    if let Some(cid) = ctx.class_id_by_name(carrier) {
+        return Ok(ctx.alloc_object(cid, n_fields));
+    }
+    try_alloc_synthetic(ctx, "java/util/ArrayList", n_fields)
+}
+
+/// Build a `values()` view: an ArrayList-LAYOUT snapshot, under its own carrier
+/// class, whose element array stashes the source map in its last capacity slot
+/// so removals write through.
+fn make_view_list_of(
+    ctx: &mut dyn NativeContext,
+    source: ObjectRef,
+    vals: &[Value],
+    carrier: &str,
+) -> Result<ObjectRef, MethodCallFailed> {
     // cceres5 (metrics-registry Properties CCE family): the list/buffer
     // allocations below can move `source` and every snapshotted value held
     // only in this Rust slice; storing the raw refs would bake pre-move
@@ -12135,7 +12304,7 @@ fn make_view_list_of(ctx: &mut dyn NativeContext, source: ObjectRef, vals: &[Val
         elem_base
     };
     let __al_n_fields = al_slots(ctx).2;
-    let list = try_alloc_synthetic(ctx, "java/util/ArrayList", __al_n_fields)?;
+    let list = alloc_view_carrier(ctx, carrier, __al_n_fields)?;
     let list_pin = ctx.pin_native_root(list);
     let cap = std::cmp::max(vals.len(), AL_DEFAULT_CAPACITY) + 1;
     let buf = alloc_ref_array(ctx, cap);
@@ -34865,7 +35034,8 @@ fn native_lhm_values(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
         _ => return Ok(Some(Value::Object(None))),
     };
     let vals = lhm_collect_values(ctx, this);
-    let list = make_view_list_of(ctx, this, &vals)?;
+    let carrier = values_carrier_for(&*ctx, this);
+    let list = make_view_list_of(ctx, this, &vals, carrier)?;
     Ok(Some(Value::Object(Some(list))))
 }
 
@@ -42477,7 +42647,8 @@ fn native_tm_values(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     // `values().iterator().remove()` deletes the matching entry from the tree.
     let pairs = tm_collect_pairs(ctx, this);
     let vals: Vec<Value> = pairs.into_iter().map(|(_, v)| v).collect();
-    let list = make_view_list_of(ctx, this, &vals)?;
+    let carrier = values_carrier_for(&*ctx, this);
+    let list = make_view_list_of(ctx, this, &vals, carrier)?;
     Ok(Some(Value::Object(Some(list))))
 }
 
@@ -42519,7 +42690,7 @@ fn native_tm_entry_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         .map(|i| read_pinned_elem(ctx, entry_pins[i], entries[i]))
         .collect();
     let this = ctx.read_native_pin(this_pin, this);
-    let list = make_view_list_of(ctx, this, &entries)?;
+    let list = make_view_list_of(ctx, this, &entries, "java/util/TreeMap$EntrySet")?;
     ctx.unpin_native_roots(this_pin);
     Ok(Some(Value::Object(Some(list))))
 }
@@ -47399,7 +47570,11 @@ fn native_chm_values(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
         elem_base
     };
     let n_fields = al_slots(ctx).2;
-    let list = try_alloc_synthetic(ctx, "java/util/ArrayList", n_fields)?;
+    let list = alloc_view_carrier(
+        ctx,
+        "java/util/concurrent/ConcurrentHashMap$ValuesView",
+        n_fields,
+    )?;
     let list_pin = ctx.pin_native_root(list);
     let cap = std::cmp::max(vals.len(), AL_DEFAULT_CAPACITY) + 1;
     let arr = alloc_ref_array(ctx, cap);
