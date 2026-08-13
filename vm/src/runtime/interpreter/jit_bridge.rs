@@ -556,6 +556,31 @@ pub(super) fn compile_osr_artifact(
             // drops the per-object dispatch. See `execute` for the rationale.
             let ctor_direct_call_off = crate::runtime::env_cache::ctor_direct_call_disabled();
             let mut pending_ctor_sites: Vec<(usize, String, usize)> = Vec::new();
+            // THIRD COMPILE DOOR, 2026-08-13. `java/lang/String`'s call-site
+            // intrinsics (`length`/`isEmpty`/`charAt`/`hashCode`/`equals`/
+            // `compareTo`/`indexOf`) were bound only in `jit::try_compile`'s
+            // ladder, and this door passed `string_layout: None` under the
+            // comment "String intrinsics land in a later wave". The wave never
+            // came, so in a hot loop — the one place they matter, and the one
+            // place compiled HERE — every one of them was inert: measured on
+            // this branch before the fix, `String.charAt(i)` in a 20M-iteration
+            // loop cost **408 ns/call** (HotSpot: 0.6 ns), because the site ran
+            // the real `charAt` → `isLatin1` → `StringLatin1.charAt` →
+            // `String.checkIndex` → `Preconditions.checkIndex` chain instead of
+            // the inline decode. `String.length()` likewise cost 28 ns.
+            //
+            // This is verbatim the lesson the `Thread.currentThread()` bind
+            // above records ("binding it in all THREE compile doors is the
+            // whole lesson of that document") — and, like it, no timing could
+            // have found it: a resolver, a codegen ladder and two green unit
+            // suites all agree the intrinsic exists. `CRATONVM_DBG_INTRINSIC=1`
+            // (jit/src/lib.rs) is the lever that names which door produced a
+            // body, so the next one of these is a one-run question.
+            //
+            // Resolved BEFORE the `class_manager` read lock below: this helper
+            // takes that same lock, and a recursive read on a `parking_lot`
+            // RwLock can deadlock against a queued writer.
+            let osr_string_layout = super::dispatch_static::resolve_string_field_layout(shared);
             if !scan.invoke_ops.is_empty() {
                 let cm_lock = shared.classes.class_manager.read();
                 let class = cm_lock.get_class(class_id)?;
@@ -602,6 +627,81 @@ pub(super) fn compile_osr_artifact(
                     // vm_ptr frame slot exists.
                     if invoke_kind == 3 && is_recursive_call {
                         continue;
+                    }
+
+                    // `java/lang/String` / `java/lang/CharSequence` call-site
+                    // intrinsics — see `osr_string_layout` above for why this
+                    // arm exists and what its absence cost. The matcher and the
+                    // codegen must agree about the layout or the codegen would
+                    // fall through and `CALL` an intrinsic sentinel address, so
+                    // the SAME `osr_string_layout` value is handed to
+                    // `compile_with_param_slots` below (the `string_layout`
+                    // argument) — exactly the invariant
+                    // `try_compile_inner` documents for its own copy.
+                    //
+                    // `guard_class_id` comes from the resolver: 0 for a
+                    // `java/lang/String` site (final class, monomorphic), the
+                    // real String class id for a `java/lang/CharSequence` site
+                    // so the codegen guards the receiver and deopts for any
+                    // non-String `CharSequence`.
+                    if matches!(invoke_kind, 0 | 2) {
+                        if let Some((entry, num_params, ret, guard_class_id)) =
+                            cratonvm_jit::try_resolve_string_intrinsic(
+                                target_class,
+                                mn,
+                                desc,
+                                osr_string_layout,
+                            )
+                        {
+                            direct_calls2.push((
+                                pc,
+                                crate::jit::JitDirectCall {
+                                    entry,
+                                    needs_context: false,
+                                    num_params,
+                                    return_type: ret,
+                                    guard_class_id,
+                                },
+                            ));
+                            continue;
+                        }
+                    }
+
+                    // The layout-independent STATIC intrinsic families
+                    // (`Math`/`StrictMath`, `Integer`/`Long` bit ops, …). This
+                    // door previously recognised exactly one of them by hand —
+                    // `Math.sqrt`, immediately below — so an OSR body paid full
+                    // dispatch for `Math.abs`, `Math.min`/`max`,
+                    // `Integer.bitCount`, `Long.numberOfTrailingZeros` and the
+                    // rest, all of which lower to one or two instructions.
+                    //
+                    // Restricted to `invokestatic`: every member of those
+                    // families is static, so `guard_class_id: 0` (no receiver
+                    // guard) is exactly right, and the restriction also keeps
+                    // the CRC32/CRC32C members — the only ones in
+                    // `try_resolve_intrinsic` whose inline code is sound ONLY
+                    // behind a resolved receiver class-id guard, which this
+                    // door has no resolver for — off this path entirely.
+                    if invoke_kind == 3 {
+                        if let Some((entry, num_params, ret)) =
+                            cratonvm_jit::try_resolve_intrinsic(target_class, mn, desc)
+                        {
+                            if !cratonvm_jit::JitIntrinsic::from_entry(entry)
+                                .is_some_and(|i| i.is_crc32_family())
+                            {
+                                direct_calls2.push((
+                                    pc,
+                                    crate::jit::JitDirectCall {
+                                        entry,
+                                        needs_context: false,
+                                        num_params,
+                                        return_type: ret,
+                                        guard_class_id: 0,
+                                    },
+                                ));
+                                continue;
+                            }
+                        }
                     }
 
                     // Math.sqrt intrinsic: inline as SQRTSD (no dispatch overhead)
@@ -1381,7 +1481,11 @@ pub(super) fn compile_osr_artifact(
                 scan.non_escaping_new.clone(), // escape analysis results
                 std::collections::HashMap::new(), // inline_sites
                 std::collections::HashMap::new(), // inline_guard_variants (PGO-02, no guarded plan from this scan-based fast path)
-                None, // string_layout — String intrinsics land in a later wave
+                // string_layout — the SAME value the matcher above used, so a
+                // registered String sentinel is never one this codegen cannot
+                // emit. Was `None` ("String intrinsics land in a later wave"),
+                // which made every String intrinsic inert in OSR bodies.
+                osr_string_layout,
                 &param_jvm_slots,
                 param_slot_span,
                 param_oop_mask,
