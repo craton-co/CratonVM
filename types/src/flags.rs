@@ -703,8 +703,17 @@ pub struct GcFlags {
     /// `CRATONVM_OLD_SWEEP_JIT` — default **ON** opt-out for the old-gen
     /// non-moving sweep. [`parse::on_unless_zero`].
     pub old_sweep_jit: bool,
-    /// `CRATONVM_G1_PARALLEL_EVAC` — parallel STW evacuation.
-    /// [`parse::one_or_true`].
+    /// `CRATONVM_G1_PARALLEL_EVAC` — parallel STW evacuation. Default **ON**
+    /// opt-out since 2026-08-13 ([`parse::on_unless_zero`]); set `=0` to force
+    /// the single-threaded evacuator.
+    ///
+    /// It was an opt-IN while G1-9 was open — a live-object corruption whose
+    /// root cause turned out to be a compact-layout scan divergence in the
+    /// parallel evacuator's own object walk, not a race. With that fixed and
+    /// covered by a unit regression, the flag's default is the throughput
+    /// decision it was always meant to be. `=0` remains the bisection lever for
+    /// any suspected parallel-evacuation regression, and a cycle record still
+    /// names which evacuator ran.
     pub g1_parallel_evac: bool,
     /// `CRATONVM_G1_NO_EVAC_RETRY` — do not retry a failed evacuation.
     pub g1_no_evac_retry: bool,
@@ -896,7 +905,7 @@ impl GcFlags {
             no_defrag_promote: present(src, "CRATONVM_NO_DEFRAG_PROMOTE"),
             card_table_only: present(src, "CRATONVM_CARD_TABLE_ONLY"),
             old_sweep_jit: on_unless_zero(src, "CRATONVM_OLD_SWEEP_JIT"),
-            g1_parallel_evac: one_or_true(src, "CRATONVM_G1_PARALLEL_EVAC"),
+            g1_parallel_evac: on_unless_zero(src, "CRATONVM_G1_PARALLEL_EVAC"),
             g1_no_evac_retry: present(src, "CRATONVM_G1_NO_EVAC_RETRY"),
             g1_coverage_pin: present(src, "CRATONVM_G1_COVERAGE_PIN"),
             g1_workers: usize_min1(src, "CRATONVM_G1_WORKERS"),
@@ -2729,27 +2738,34 @@ mod tests {
     }
 
     #[test]
-    fn g1_parallel_evac_accepts_one_or_true_only() {
+    fn g1_parallel_evac_is_default_on_with_a_zero_opt_out() {
+        // Flipped 2026-08-13. This test used to pin the OPT-IN semantics
+        // (`one_or_true`): unset meant serial. Parallel evacuation is now the
+        // default, so the meaningful assertions are the inverse — unset means
+        // parallel, and only an explicit "0" gets you the single-threaded
+        // evacuator, which is the bisection lever for a suspected
+        // parallel-evacuation regression.
         assert!(
-            VmFlags::from_source(&src(&[("CRATONVM_G1_PARALLEL_EVAC", "1")]))
-                .gc
-                .g1_parallel_evac
+            VmFlags::from_source(&src(&[])).gc.g1_parallel_evac,
+            "unset must now select the parallel evacuator"
         );
         assert!(
-            VmFlags::from_source(&src(&[("CRATONVM_G1_PARALLEL_EVAC", "TRUE")]))
+            !VmFlags::from_source(&src(&[("CRATONVM_G1_PARALLEL_EVAC", "0")]))
                 .gc
-                .g1_parallel_evac
+                .g1_parallel_evac,
+            "=0 is the documented opt-out and the bisection lever"
         );
-        assert!(
-            !VmFlags::from_source(&src(&[("CRATONVM_G1_PARALLEL_EVAC", "yes")]))
-                .gc
-                .g1_parallel_evac
-        );
-        assert!(
-            !VmFlags::from_source(&src(&[("CRATONVM_G1_PARALLEL_EVAC", "2")]))
-                .gc
-                .g1_parallel_evac
-        );
+        // Anything that is not "0" leaves the default in force, including the
+        // spellings the old opt-in parser rejected. That is the `on_unless_zero`
+        // contract, shared with `CRATONVM_OLD_SWEEP_JIT`.
+        for v in ["1", "TRUE", "yes", "2", ""] {
+            assert!(
+                VmFlags::from_source(&src(&[("CRATONVM_G1_PARALLEL_EVAC", v)]))
+                    .gc
+                    .g1_parallel_evac,
+                "{v:?} is not the opt-out, so parallel stays on"
+            );
+        }
     }
 
     #[test]

@@ -212,12 +212,20 @@ fn array_element_to_bytes(element_type: ArrayElementType, value: Value, raw: &mu
 /// `true`) will opt INTO the multi-threaded evacuator once it is built; unset or
 /// any other value keeps evacuation single-threaded.
 ///
-/// STALE UNTIL 2026-08-13, corrected here: this used to say "nothing gates on
-/// it yet — the parallel work_list / CAS-forwarding machinery is a deliberate
-/// follow-up". That machinery landed (Step 9); `young_collection` and
-/// `mixed_collection` dispatch on this flag to `*_parallel`. What is still true
-/// is the DEFAULT: off, and the serial path remains the supported one while
-/// G1-9 is open.
+/// DEFAULT FLIPPED 2026-08-13: parallel evacuation is now ON unless
+/// `CRATONVM_G1_PARALLEL_EVAC=0` (or `CRATONVM_GC=-g1-parallel-evac`).
+///
+/// The flag was an opt-in for as long as G1-9 was open. G1-9 turned out to be a
+/// compact-layout scan divergence in this evacuator's own object walk — not a
+/// race, and reproducing identically at one worker — which is fixed and
+/// covered by `parallel_evacuation_scans_compact_object_reference_fields`.
+/// What the flag now selects is a throughput decision, and `=0` is the
+/// bisection lever for any suspected parallel-evacuation regression.
+///
+/// What this flip does NOT claim: it is not a gauntlet result. Mixed
+/// collections still dispatch to the parallel path only through the same flag,
+/// the worker pool is still spawned per collection rather than persistent, and
+/// the G1-as-default-collector question is untouched and separate.
 /// Object budget for the post-evacuation CSet verification pass in a build
 /// where it is not already unbounded (audit §9 item 2).
 ///
@@ -3855,6 +3863,34 @@ impl G1Collector {
             .map(|(i, _)| i)
             .collect();
         if cset.is_empty() {
+            // OBSERVABILITY PARITY with the serial driver (G1-7). A pause that
+            // declines to collect because every young region was pinned out is
+            // still a pause, and the serial path records it with
+            // `EMPTY_COLLECTION_SET` plus whichever pin excluded the regions.
+            // The parallel path returned here silently, so under parallel
+            // evacuation an operator watching G1 fail to reclaim saw NO cycle
+            // at all rather than one saying why — the exact blindness
+            // `record_g1_cycle` exists to remove. Surfaced by
+            // `a_pinned_region_is_never_evacuated` the moment parallel
+            // evacuation became the default.
+            let (jni_pinned_out, jit_pinned_out) =
+                count_young_regions_pinned_out(regions.as_slice(), &jit_pinned_regions);
+            let mut degraded = crate::gc_metrics::g1_degraded::EMPTY_COLLECTION_SET
+                | crate::gc_metrics::g1_degraded::PARALLEL_EVACUATOR;
+            if jni_pinned_out > 0 {
+                degraded |= crate::gc_metrics::g1_degraded::JNI_PINNED_REGIONS_EXCLUDED;
+            }
+            if jit_pinned_out > 0 {
+                degraded |= crate::gc_metrics::g1_degraded::JIT_PINNED_REGIONS_EXCLUDED;
+            }
+            crate::gc_metrics::record_g1_cycle(
+                crate::gc_metrics::g1_cycle_kind::YOUNG,
+                0,
+                0,
+                (jni_pinned_out + jit_pinned_out) as u32,
+                0,
+                degraded,
+            );
             return GcResult {
                 stats: GcStats {
                     objects_copied: 0,
@@ -4062,6 +4098,34 @@ impl G1Collector {
         }
 
         if cset.is_empty() {
+            // OBSERVABILITY PARITY with the serial driver (G1-7). A pause that
+            // declines to collect because every young region was pinned out is
+            // still a pause, and the serial path records it with
+            // `EMPTY_COLLECTION_SET` plus whichever pin excluded the regions.
+            // The parallel path returned here silently, so under parallel
+            // evacuation an operator watching G1 fail to reclaim saw NO cycle
+            // at all rather than one saying why — the exact blindness
+            // `record_g1_cycle` exists to remove. Surfaced by
+            // `a_pinned_region_is_never_evacuated` the moment parallel
+            // evacuation became the default.
+            let (jni_pinned_out, jit_pinned_out) =
+                count_young_regions_pinned_out(regions.as_slice(), &jit_pinned_regions);
+            let mut degraded = crate::gc_metrics::g1_degraded::EMPTY_COLLECTION_SET
+                | crate::gc_metrics::g1_degraded::PARALLEL_EVACUATOR;
+            if jni_pinned_out > 0 {
+                degraded |= crate::gc_metrics::g1_degraded::JNI_PINNED_REGIONS_EXCLUDED;
+            }
+            if jit_pinned_out > 0 {
+                degraded |= crate::gc_metrics::g1_degraded::JIT_PINNED_REGIONS_EXCLUDED;
+            }
+            crate::gc_metrics::record_g1_cycle(
+                crate::gc_metrics::g1_cycle_kind::MIXED,
+                0,
+                0,
+                (jni_pinned_out + jit_pinned_out) as u32,
+                0,
+                degraded,
+            );
             return GcResult {
                 stats: GcStats {
                     objects_copied: 0,

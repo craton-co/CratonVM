@@ -1035,7 +1035,15 @@ pub mod g1_degraded {
     /// holds a conservatively-discovered JIT root or a frozen peer's
     /// un-retired TLAB tail (`jit_pinned_region_set`).
     pub const JIT_PINNED_REGIONS_EXCLUDED: u32 = 1 << 6;
-    /// The experimental parallel evacuator ran (`CRATONVM_G1_PARALLEL_EVAC`).
+    /// The parallel evacuator ran, rather than the single-threaded one.
+    ///
+    /// Unlike its neighbours this is NOT a fail-safe the collector took, and
+    /// since 2026-08-13 it is not an experiment either — parallel evacuation is
+    /// the default. It stays in this word because the question it answers is
+    /// the one every G1 bug report needs answered first: WHICH evacuator ran.
+    /// Reading a cycle record without it is how a parallel-path defect gets
+    /// triaged as a serial-path one, which is most of what went wrong with
+    /// G1-9.
     pub const PARALLEL_EVACUATOR: u32 = 1 << 7;
     /// The collection set came out empty, so the pause did nothing.
     pub const EMPTY_COLLECTION_SET: u32 = 1 << 8;
@@ -1077,7 +1085,7 @@ pub mod g1_degraded {
             ),
             (JNI_PINNED_REGIONS_EXCLUDED, "jni-pinned-regions-excluded"),
             (JIT_PINNED_REGIONS_EXCLUDED, "jit-pinned-regions-excluded"),
-            (PARALLEL_EVACUATOR, "experimental-parallel-evacuator"),
+            (PARALLEL_EVACUATOR, "parallel-evacuator"),
             (EMPTY_COLLECTION_SET, "empty-collection-set"),
             (ROOT_COVERAGE_INCOMPLETE, "root-coverage-incomplete-no-evacuation"),
         ];
