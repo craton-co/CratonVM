@@ -46,8 +46,21 @@ adopted**.
   Selecting one emits a one-time warning so it cannot masquerade as production
   ZGC.
 
-**Why it is default-off:** not because nothing uses it, but because it is not
-at pass-rate parity with Generational. Default-off is not uncompiled — CI's
+**It is no longer default-off.** As of 2026-08-10 the default `GcAlgorithm` IS
+`Zgc` (`vm/src/config.rs`), on the strength of the three-way Tomcat suite
+comparison; the paragraph that used to stand here explained why it was
+default-off and is kept below only so the reversal is visible rather than
+silently edited away:
+
+> *Why it is default-off: not because nothing uses it, but because it is not at
+> pass-rate parity with Generational.*
+
+That parity question was never answered — it was overtaken. Re-establishing it
+is Phase 1 of
+[`zgc-maturity-assessment-and-plan-20260813.md`](zgc-maturity-assessment-and-plan-20260813.md),
+which also carries the current state of everything below.
+
+Default-off was never uncompiled either, and that part still holds: CI's
 `experimental-features` job builds the `cratonvm-cli` binary under the feature
 and runs the gc crate's unit tests with it, because this configuration once
 stopped compiling entirely and nobody noticed.

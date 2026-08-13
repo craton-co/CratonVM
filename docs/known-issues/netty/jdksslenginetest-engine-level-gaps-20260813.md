@@ -14,7 +14,8 @@ HotSpot 25 with the same jars on the same host.
 | | tests | ok | failed | aborted | wall |
 |---|---|---|---|---|---|
 | HotSpot 25 | 821 | 755 | **0** | 66 | 103 s |
-| CratonVM (`fcb509bda`) | 821 | 398 | **357** | 66 | 630 s |
+| CratonVM (`fcb509bda`) | 821 | 398 | 357 | 66 | 630 s |
+| CratonVM (V1 landed) | 821 | 448 | **307** | 66 | **516 s** |
 
 The 66 aborts are netty-tcnative being absent and are the same 66 HotSpot
 aborts. The wall-clock ratio is **6.2x**; re-derive it after fixing failures
@@ -43,6 +44,98 @@ python3 <<'PY'   # or see tb10-bucket2.py in the batch-10 session notes
 # group @@TESTFAIL entries by the first io.netty.handler.ssl frame in the trace
 PY
 ```
+
+## Roadmap
+
+Ordered by what unblocks what, not by failure count. Each item says what it is
+waiting on, so nothing here starts before its premise is measured.
+
+| # | item | size | blocked on | worth |
+|---|---|---|---|---|
+| ~~V1~~ | ~~skip `keys_match` at the five identity-install sites~~ | S | — | **done 2026-08-13, 49 failures** |
+| ~~P1~~ | ~~does the JDK accept the invalid v1 chain?~~ | XS | — | **done 2026-08-13 — no. V2 refuted** |
+| V6 | OPTIONAL client auth must not abort on a chain that fails validation | M | — | 36 |
+| B1 | `getLocalCertificates()` must report what was SENT, not what was available | M | — | ~36 |
+| C | ALPN on the `SSLEngine` path | M | — | 24 |
+| D | "a handshake that should fail, succeeds" — one question behind five methods | L | — | ~60 |
+| E | TLS 1.2 session id shared between the two engines | M | — | 8 |
+| ~~V2~~ | ~~vendor `rustls-webpki`, relax the v1 rule~~ | — | — | **parked — premise refuted by P1** |
+| V5 | upstream a v1 policy knob to `rustls-webpki` | S to file | — | speculative; no measured cost today |
+
+### V6 — OPTIONAL client auth must not abort on an unvalidatable chain
+
+The 36 that survive V1. Both VMs reject
+`mutual_auth_invalid_client.p12`'s chain (P1, above); netty's test asserts the
+connection succeeds regardless, because the server is configured
+`ClientAuth.OPTIONAL`.
+
+rustls's `allow_unauthenticated()` permits the **absence** of a client
+certificate, not a **bad** one: a presented certificate is still verified and a
+verification failure is fatal. JSSE's `setWantClientAuth(true)` continues either
+way.
+
+Two candidate seams, and the first is worth measuring before building anything:
+
+1. **The JDK client may never send it.** `X509KeyManager.chooseClientAlias`
+   filters candidate identities against the server's `certificate_authorities`
+   hint; a client that cannot build an acceptable chain sends no certificate at
+   all, and then OPTIONAL trivially succeeds. If that is what HotSpot does, the
+   fix is client-side and small. *Measure:* does HotSpot's server see a client
+   certificate on that connection?
+2. **Otherwise, server-side:** when client auth is optional, a verification
+   failure must downgrade to "no client identity" instead of aborting. The
+   existing `PassthroughClientCertVerifier` (`t27_tls.rs:3381`) is the natural
+   place — it already exists for the case where trust is delegated to a Java
+   `TrustManager`, and it already has to answer this question.
+
+Whatever lands must keep the negative tests negative: `testMutualAuthClientCertFail`
+exists to see the chain rejected, and a change that makes both the "valid" and
+"invalid" fixtures succeed has broken the tests' meaning rather than fixed the
+VM.
+
+### ~~V2~~ — vendor `rustls-webpki`, relax the v1 rule (parked)
+
+**Parked 2026-08-13: P1 refuted the premise.** V2 existed because 72 failures
+looked like "webpki refuses v1 certificates that the JDK accepts". After V1
+removed the identity-install half, the surviving 36 turned out to be a chain the
+JDK rejects too. No measured case remains where webpki's v3 rule costs this VM
+something HotSpot allows.
+
+Kept written down rather than deleted, because the reasoning is what matters if
+a genuine case turns up later:
+
+* an end-entity-only relaxation is the safe shape — a v1 CA has no
+  `basicConstraints`, so accepting one lets any leaf sign for any other;
+* the certificate that actually failed here was an **intermediate**, so
+  end-entity-only would not have closed these 36 anyway — V2 would have had to
+  relax the CA position, which was already written down as *not recommended*;
+* webpki already exempts one position (`anchor_from_trusted_cert` re-parses v1
+  anchors), so any patch should follow that pattern — a separate parser entry
+  point — rather than loosening `version3` in place;
+* the cost is a second vendored crypto crate beside `rustls-cbc`, with the same
+  pin/record/re-base obligations. The diff would be small; the carrying cost is
+  not.
+
+**Re-open only on a measured case** where the JDK validates a chain and webpki
+rejects it for version alone.
+
+### V5 — upstream a v1 policy knob
+
+Speculative now that V2 is parked — there is no measured cost to point at, so
+this is worth filing only if a real case appears. Recorded because it is the
+one option that ends with nothing vendored.
+
+* **Shape to propose:** an opt-in policy enum in the existing style of
+  `UnknownExtensionPolicy` — e.g. `CertificateVersionPolicy::{V3Only, AllowV1EndEntity}`
+  on the verifier builder, defaulting to today's behaviour.
+* **Argument to make:** webpki already ships a v1 parser and already uses it for
+  trust anchors; the JDK, OpenSSL and Go all accept v1 certificates in at least
+  some positions; and consumers re-implementing a JVM's TLS surface need to
+  match the JDK, not RFC 5280's SHOULD.
+* **Relationship to V2:** V5 is what makes V2 unnecessary. If a case for V2
+  ever appears, file V5 first so the fork has a documented exit from the day it
+  is created.
+
 
 ## The causes
 
@@ -125,71 +218,84 @@ that a v1 cert "doesn't allow extensions, so there's no need to worry about
 embedded name constraints". The v3-only rule is a path-building policy, not a
 parser limitation.
 
-#### Variants
+#### V1 — landed 2026-08-13, and it answered the gate-2 question
 
-**V0 — do nothing.** 72 failures stay. CratonVM is stricter than the JDK for any
-application whose own identity is a v1 certificate, which is a legacy-PKI and
-test-fixture shape rather than a modern one. Cost: nothing. Records a known
-divergence.
+The five identity-install sites now build their `CertifiedKey` with
+`CertifiedKey::new` and hand it to `with_cert_resolver` /
+`with_client_cert_resolver`, which is exactly what `with_single_cert` /
+`with_client_auth_cert` do minus the `keys_match` call:
 
-**V1 — stop calling `keys_match` at the five identity-install sites. No
-vendoring.** Replace `with_client_auth_cert(chain, key)` /
-`with_single_cert(chain, key)` with the resolver form built on
-`CertifiedKey::new(chain, signing_key)`, which skips the consistency check.
-Every API used is public rustls; nothing is vendored or patched.
+```rust
+// rustls-cbc/src/server/builder.rs — what with_single_cert IS
+let certified_key = CertifiedKey::from_der(cert_chain, key_der, self.crypto_provider())?;
+Ok(self.with_cert_resolver(Arc::new(SingleCertAndKey::from(certified_key))))
+```
 
-*Precedent already in the tree:* `t27_tls.rs:1712`
-(`SniCertResolver::certified_key_from_pem`) already builds its `CertifiedKey`
-this way, so the multi-tenant SNI server path accepts a v1 certificate today
-while the five single-cert paths do not. V1 makes them consistent.
+No vendoring, all public API, and `SniCertResolver::certified_key_from_pem` —
+which had always done it this way — now routes through the same helper, so
+there is one way to build an identity instead of two.
 
-*What it gives up:* the early "your certificate and private key do not match"
-error. That becomes a handshake-time failure instead of a config-time one. Note
-rustls itself treats this check as best-effort — a key provider that cannot
-expose a public key already skips it — and CratonVM's own `repair_ec_key_for_ring`
-path deliberately reconstructs keys, so the check is not load-bearing here.
+**Result: 356 → 307 failures, 630 s → 516 s.** Cleared outright:
 
-*Unknown it resolves:* whether gate 2 exists. **Do this first and re-measure.**
-If the 72 clear, there is no vendoring decision to make.
+| n | method | was |
+|---|---|---|
+| 24 | `testMutualAuthClientCertFail` | `with_client_auth_cert failed: … UnsupportedCertVersion` |
+| 12 | `testClientHostnameValidationFail` | `ServerConfig with_single_cert failed: …` |
+| 12 | `testMutualAuthDiffCertsClientFailure` | (not previously attributed to group A) |
 
-**V2 — vendor `rustls-webpki`, relax v1 at the END-ENTITY position only.** Only
-if V1 leaves gate-2 failures. Add a `Cert::from_der_end_entity` that tolerates
-v1/v2 and use it exactly where an end-entity is parsed; leave intermediates and
-the v3 requirement for CAs untouched. This matches the JDK's effective
-behaviour, and it keeps `NettyTestInvalidIntermediate` rejected, which the
-fixture wants.
+The eight other classes on the parent page were re-run against the same build
+and are unchanged, all at or above the oracle.
 
-*Cost:* a second vendored crypto crate alongside `rustls-cbc`, with the same
-maintenance obligation (pin the version, record the delta, re-base on upgrade).
-That is the real price — not the diff, which is small.
+#### What gate 2 turned out to be
 
-**V3 — vendor and relax v1 everywhere.** Not recommended. Accepting a v1
-*intermediate* means accepting a CA with no `basicConstraints`, so any leaf can
-sign for any other. It would also flip the meaning of
-`testMutualAuthInvalidClientCertSucceed`.
+36 failures survive, and they have changed shape — this is the answer V1 was
+run to get:
 
-**V4 — bypass webpki for peer verification.** Route client-auth to the existing
-`PassthroughClientCertVerifier` (`t27_tls.rs:3381`) and let the Java
-`TrustManager` decide, which `engine_run_trust_check` already consults
-post-handshake. *Cost:* rustls then performs no chain validation for that
-connection and correctness rests entirely on this VM's own `x509_manager` path,
-which is less exercised. It also cannot be scoped to v1 — the decision has to be
-made at config-build time, before any peer certificate exists. Only worth it if
-V2 is rejected on maintenance grounds.
+```
+before V1:  java.io.IOException: with_client_auth_cert failed: invalid peer certificate:
+                Other(OtherError(UnsupportedCertVersion))            <- config-build time
+after V1:   javax.net.ssl.SSLHandshakeException: rustls: invalid peer certificate:
+                Other(OtherError(UnsupportedCertVersion))            <- handshake time
+```
 
-**V5 — upstream it.** Ask `rustls-webpki` for an opt-in policy knob for v1
-end-entity certificates, in the shape of the existing
-`UnknownExtensionPolicy`. Slow and uncertain, but it is the only variant that
-ends with nothing vendored. Worth filing in parallel with V1 either way.
+So gate 2 is real. But the 36 are all one call path —
+`testMutualAuthInvalidIntermediateCASucceedWithOptionalClientAuth` →
+`testMutualAuthInvalidClientCertSucceed` — which uses
+`mutual_auth_invalid_client.p12`, the fixture whose **intermediate** is v1, with
+`ClientAuth.OPTIONAL`. The test asserts the connection **succeeds anyway**.
 
-#### Recommended order
+That admitted two explanations, and P1 settled it.
 
-1. **V1**, then re-run `JdkSslEngineTest` and re-bucket. It is cheap, reversible,
-   consistent with code already in the tree, and it answers the gate-2 question
-   that every other variant depends on.
-2. If gate-2 failures remain, **V2**, as its own change with its own review —
-   not folded into unrelated work.
-3. **V5** in parallel, so the vendored delta has an exit.
+#### P1 — the JDK rejects that chain too (measured 2026-08-13)
+
+Ran the JDK's own validators over `mutual_auth_invalid_client.p12`'s chain
+against `mutual_auth_ca.pem`, no networking involved:
+
+```
+chain length = 3
+  v1  UID=ClientWithInvalidCa, CN=NettyTestInvalidClient   issuer=CN=NettyTestInvalidIntermediate
+  v1  CN=NettyTestInvalidIntermediate                      issuer=CN=NettyTestRoot
+  v3  CN=NettyTestRoot                                     issuer=CN=NettyTestRoot
+anchor  = v3  CN=NettyTestRoot
+
+PKIX:    REJECTED -> PKIX path validation failed: basic constraints check failed:
+                     this is not a CA certificate
+SunX509: REJECTED -> End user tried to act as a CA
+```
+
+**So webpki is not stricter than the JDK here — both refuse the chain**, and for
+the same reason: a v1 certificate carries no `basicConstraints`, so it cannot be
+a CA. The certificate version is incidental; `UnsupportedCertVersion` and
+"this is not a CA certificate" are two spellings of one verdict.
+
+**V2's premise is refuted for the fixture that motivated it.** The difference
+that remains is entirely about what happens *after* the rejection: netty asserts
+the connection succeeds anyway, because client auth is `OPTIONAL`. On HotSpot
+nothing valid is ever presented and the server proceeds without a client
+identity; on CratonVM the rejection aborts the handshake.
+
+That is item **V6**, it is CratonVM-side, and it needs no vendoring.
+
 
 ### B. client-side mTLS material never reaches the session — 84 failures
 

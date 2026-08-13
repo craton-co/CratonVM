@@ -3980,6 +3980,14 @@ impl SharedVm {
         // VM is registered, so it falls through to a no-op.
         cratonvm_classloading::install_resolution_invalidate_hook(resolution_invalidate_adapter);
 
+        // Give the GC crate a way to turn a `ClassId` into a name for its
+        // failure-path reports. Same bridge, same reason: the gc crate cannot
+        // name a `Class`. Without it the ZGC fragmentation report can only say
+        // `class_id=418`, and the second run needed to decode that is a
+        // different process with a different heap layout — so the answer does
+        // not carry over. See `cratonvm_gc::collector::set_class_namer`.
+        cratonvm_gc::collector::set_class_namer(class_name_adapter);
+
         // Found while investigating the guarded-inline-getfield SIGSEGV
         // cluster (that SIGSEGV's actual cause was a separate, already-fixed
         // bug — see `jit_invalidate_adapter`'s doc comment): `install_jit_invalidate_hook`
@@ -4217,6 +4225,30 @@ pub fn set_global_shared_vm_for_hooks(weak: Weak<SharedVm>) {
     if !already {
         reg.push(weak);
     }
+}
+
+/// The `set_class_namer` adapter: `ClassId` -> binary name, for GC
+/// diagnostics only.
+///
+/// `try_read` rather than `read`, and this is load-bearing. Every caller is a
+/// failure-path report, and at least one of them (the ZGC fragmentation
+/// report) runs on a thread that has just failed an allocation — a thread that
+/// may well be the one holding the class-manager write lock further up its own
+/// stack. Blocking there would convert a diagnostic into a hang, which is
+/// strictly worse than an unnamed class id. A contended lock therefore falls
+/// back to the id, which is exactly what the caller prints when no namer is
+/// installed at all.
+fn class_name_adapter(class_id: u32) -> Option<String> {
+    let cid = crate::classloading::ClassId::new(class_id);
+    for shared in live_hook_vms() {
+        let Some(cm) = shared.classes.class_manager.try_read() else {
+            continue;
+        };
+        if let Some(class) = cm.get_class(cid) {
+            return Some(class.name.to_string());
+        }
+    }
+    None
 }
 
 /// The `ResolutionInvalidateHook` adapter handed to
