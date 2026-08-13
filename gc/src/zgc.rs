@@ -2298,6 +2298,51 @@ pub struct ZgcRealHeap {
     /// observes the store one boundary late merely defers a collection to the
     /// next boundary.
     native_alloc_pressure: AtomicBool,
+    /// A request that the arena **actually refused**, as distinct from the
+    /// advisory pressure above.
+    ///
+    /// # Why the two cannot be one bit
+    ///
+    /// `native_alloc_pressure` is consumed through
+    /// `VmHeap::young_spill_pressure`, whose boundary consumer re-checks
+    /// `needs_gc()` before it collects — deliberately, so that an advisory note
+    /// buys one gate evaluation and cannot storm. That is right for a *soft*
+    /// signal and wrong for a hard one, and [`Self::alloc_raw`] latches the
+    /// same bit for both. Its own comment says why the re-check is wrong there:
+    /// a request that just failed "is stronger evidence that a cycle is due
+    /// than the `allocated >= gc_threshold` predicate, which counts LIVE bytes
+    /// and therefore cannot see the bump space this heap never rewinds."
+    ///
+    /// So the arming site and the consuming site disagreed, and the consuming
+    /// site won: on the exact shape this collector fails in — an arena full of
+    /// TLAB *reservations* with `allocated` far below the threshold, i.e.
+    /// Tomcat's `TestNonBlockingAPI` on 2026-08-13 — `needs_gc()` answered
+    /// **no**, the latch was cleared without collecting, and the one signal
+    /// that knew better was discarded. This bit is that signal, kept separate
+    /// so the boundary can honour it without loosening the soft path.
+    ///
+    /// Cannot storm: it is set only where an allocation genuinely failed, the
+    /// consumer clears it after acting, and `gc_overhead_limit_exceeded` still
+    /// gates it — the same bound the soft path relies on.
+    hard_alloc_failure: AtomicBool,
+    /// Fragmentation ratchet — Phase 2.2. See [`ZFragGauge`].
+    ///
+    /// Held as three plain atomics rather than a `Mutex<ZFragGauge>` because
+    /// they are written once per collection, under the arena lock, and read at
+    /// shutdown; there is no invariant across them that a torn read could
+    /// break, only three numbers describing one sample.
+    frag_samples: AtomicUsize,
+    /// Worst `largest_free_block * 1000 / capacity` seen, or `usize::MAX` for
+    /// "never sampled" — deliberately a sentinel rather than 1000, so that a
+    /// run which never met the sampling condition cannot be mistaken for one
+    /// that scored perfectly.
+    frag_worst_permille: AtomicUsize,
+    /// Free share of capacity at the worst sample, permille.
+    frag_worst_free_permille: AtomicUsize,
+    /// Collection number of the worst sample.
+    frag_worst_cycle: AtomicUsize,
+    /// One-shot latch for the floor warning.
+    frag_floor_warned: AtomicBool,
     /// "The arena can no longer serve a request of [`headroom_margin`] bytes."
     ///
     /// # Why the live-bytes trigger is not enough on THIS backend
@@ -2569,6 +2614,12 @@ impl ZgcRealHeap {
             gc_threshold: cap * ZGC_REAL_GC_THRESHOLD_PERCENT / 100,
             gc_rearm: AtomicUsize::new(0),
             native_alloc_pressure: AtomicBool::new(false),
+            hard_alloc_failure: AtomicBool::new(false),
+            frag_samples: AtomicUsize::new(0),
+            frag_worst_permille: AtomicUsize::new(usize::MAX),
+            frag_worst_free_permille: AtomicUsize::new(0),
+            frag_worst_cycle: AtomicUsize::new(0),
+            frag_floor_warned: AtomicBool::new(false),
             headroom_low: AtomicBool::new(false),
             gc_count: AtomicUsize::new(0),
             gc_log_enabled: AtomicBool::new(false),
@@ -2675,6 +2726,121 @@ impl ZgcRealHeap {
     #[inline]
     pub fn note_native_alloc_pressure(&self) {
         self.native_alloc_pressure.store(true, Ordering::Relaxed);
+    }
+
+    /// Whether an allocation has been **refused** since the last collection —
+    /// see the [`hard_alloc_failure`](Self::hard_alloc_failure) field doc.
+    ///
+    /// Consumed at the `safe_native_call` boundary, which is the one point on
+    /// the native dispatch path where a collection is safe (every Java
+    /// argument is pinned and remapped around it). It is deliberately NOT
+    /// consumed inside the allocation wrappers themselves: those "must stay
+    /// GC-free mid-callback, since their callers hold unrooted local
+    /// `ObjectRef`s" (`vm_exec.rs`, the native-alloc young-pressure relief
+    /// comment). Collecting there would be a use-after-free, not a fix.
+    #[inline]
+    pub fn hard_alloc_failure(&self) -> bool {
+        self.hard_alloc_failure.load(Ordering::Relaxed)
+    }
+
+    /// Clear the hard-failure latch. Idempotent; the consumer clears after
+    /// acting whether or not its overhead gate let the cycle run.
+    #[inline]
+    pub fn clear_hard_alloc_failure(&self) {
+        self.hard_alloc_failure.store(false, Ordering::Relaxed);
+    }
+
+    /// The fragmentation ratchet's current reading — Phase 2.2 of the ZGC
+    /// maturity plan, which asked to turn "ZGC fragments" from an anecdote per
+    /// suite run into a tracked number.
+    ///
+    /// Reported at shutdown by `VmHeap::print_gc_summary` on the `[GC]
+    /// zgc-real:` line, so a suite runner can extract it per class with a grep
+    /// and a CI job can ratchet on it. See [`ZFragGauge`] for what the two
+    /// numbers mean and why one of them alone means nothing.
+    pub fn frag_gauge(&self) -> ZFragGauge {
+        let worst = self.frag_worst_permille.load(Ordering::Relaxed);
+        ZFragGauge {
+            samples: self.frag_samples.load(Ordering::Relaxed),
+            worst_permille: (worst != usize::MAX).then_some(worst),
+            free_permille: self.frag_worst_free_permille.load(Ordering::Relaxed),
+            worst_cycle: self.frag_worst_cycle.load(Ordering::Relaxed),
+        }
+    }
+
+    /// Take one post-sweep fragmentation reading.
+    ///
+    /// Called at the end of every collection with the arena guard still held.
+    /// Cost is one `largest_free_block()` (O(1) — a `BTreeMap` last key and a
+    /// field read), two divisions and, on the rare improving edge, three
+    /// relaxed stores.
+    ///
+    /// The sampling condition is the instrument: a collection that leaves less
+    /// than [`ZGC_FRAG_GAUGE_MIN_FREE_PERMILLE`] of the heap free is not
+    /// evidence about fragmentation at all, and counting it would turn this
+    /// gauge into a second, worse occupancy trigger.
+    fn sample_frag_gauge(&self, arena: &Arena, cycle: usize) {
+        let capacity = arena.capacity();
+        if capacity == 0 {
+            return;
+        }
+        // Free = what the arena could still hand out at all: the un-bumped
+        // middle plus both free lists. `remaining()` is exactly that sum.
+        let free_permille = arena.remaining().saturating_mul(1000) / capacity;
+        if free_permille < ZGC_FRAG_GAUGE_MIN_FREE_PERMILLE {
+            return;
+        }
+        // ...against the biggest single thing it could hand out.
+        //
+        // NOT `largest_free_block()` alone. That is the largest FREE-LIST
+        // block, and on a heap that has not yet bumped its way to capacity the
+        // biggest servable run is the un-bumped middle between the two
+        // cursors, which is on no free list at all. Scoring the free list by
+        // itself reads a pristine 1 MiB arena as **0 permille fragmented** —
+        // caught by `a_collection_with_room_to_spare_takes_a_reading`, which
+        // is what that test is for. `remaining()` is middle + both free lists,
+        // so subtracting the lists leaves the middle exactly.
+        let middle = arena.remaining().saturating_sub(arena.free_list_bytes());
+        let servable = middle.max(arena.largest_free_block());
+        let largest_permille = servable.saturating_mul(1000) / capacity;
+        self.frag_samples.fetch_add(1, Ordering::Relaxed);
+        if largest_permille < self.frag_worst_permille.load(Ordering::Relaxed) {
+            self.frag_worst_permille
+                .store(largest_permille, Ordering::Relaxed);
+            self.frag_worst_free_permille
+                .store(free_permille, Ordering::Relaxed);
+            self.frag_worst_cycle.store(cycle, Ordering::Relaxed);
+        }
+        if largest_permille < ZGC_FRAG_FLOOR_PERMILLE
+            && !self.frag_floor_warned.swap(true, Ordering::Relaxed)
+        {
+            tracing::warn!(
+                target: "cratonvm::gc::guard",
+                cycle,
+                largest_free_permille = largest_permille,
+                free_permille,
+                capacity,
+                largest_servable_block = servable,
+                "zgc frag gauge: the arena is broken up — {}.{}% of the heap is                  free but the largest single block is only {}.{}% of capacity,                  so a request above that size cannot be served however much is                  free. This collector does not compact, so the shape does not                  recover on its own.",
+                free_permille / 10,
+                free_permille % 10,
+                largest_permille / 10,
+                largest_permille % 10,
+            );
+        }
+    }
+
+    /// Free share of the arena in permille — test support for the
+    /// fragmentation-gauge fixtures, which have to assert the state they claim
+    /// to have built rather than assume it.
+    #[cfg(test)]
+    fn arena_free_permille_for_test(&self) -> usize {
+        let arena = self.arena.lock();
+        let capacity = arena.capacity();
+        if capacity == 0 {
+            return 0;
+        }
+        arena.remaining().saturating_mul(1000) / capacity
     }
 
     /// Enable GC event logging (`--verbose:gc`).
@@ -2934,6 +3100,12 @@ impl ZgcRealHeap {
                     // counts LIVE bytes and therefore cannot see the bump space
                     // this heap never rewinds.
                     self.native_alloc_pressure.store(true, Ordering::Relaxed);
+                    // ...and the HARD latch, which the boundary honours without
+                    // re-asking `needs_gc()`. The line above has been here since
+                    // the latch existed and was, on its own, inert in exactly
+                    // the case it was written for: see the `hard_alloc_failure`
+                    // field doc.
+                    self.hard_alloc_failure.store(true, Ordering::Relaxed);
                     return None;
                 }
             };
@@ -4060,6 +4232,52 @@ fn recycled_chunk_size(want: usize, need: usize, largest_low_free: usize) -> Opt
 /// workloads unchanged: below 256 threads the per-thread share still exceeds
 /// 512 KiB at `-Xmx 2g`, so the chunk is the same 512 KiB it was.
 const ZGC_TLAB_RESERVATION_SHARE: usize = 16;
+
+/// Below this share of capacity free, a small largest-block means the heap is
+/// **full**, not fragmented — so the fragmentation gauge does not sample.
+///
+/// This condition is the difference between an instrument and a number. The
+/// quantity Phase 2.2 asks to track is `largest_free_block / capacity`, and on
+/// its own that quantity falls to nearly zero in two completely different
+/// states: an arena broken into crumbs (which is the problem) and an arena
+/// genuinely full of live objects (which is not — it is what a heap is for).
+/// A gauge that cannot separate them would fire on every workload that uses
+/// its heap, get muted, and then be worth nothing on the day it was right.
+/// 250 permille — a quarter of the heap free — is where "there are plenty of
+/// bytes, they are just not contiguous" becomes the only reading available.
+const ZGC_FRAG_GAUGE_MIN_FREE_PERMILLE: usize = 250;
+
+/// The ratchet's floor: one warning per process when the largest block a
+/// sampled collection could hand out falls below 1% of capacity.
+///
+/// Sized against what it is protecting rather than picked: `ZGC_TLAB_MAX_CHUNK`
+/// is 512 KiB, so on any heap up to 50 MiB a 1% largest block cannot serve even
+/// one full TLAB chunk, and above that it cannot serve the large-object end's
+/// first request. It is a floor, not a target — a healthy run does not
+/// approach it, and the number to watch is the reported worst, not this.
+const ZGC_FRAG_FLOOR_PERMILLE: usize = 10;
+
+/// A fragmentation reading, taken post-sweep — the "steady state" of Phase 2.2.
+///
+/// `worst_permille` is `largest_free_block * 1000 / capacity` at its lowest
+/// across every SAMPLED collection (see [`ZGC_FRAG_GAUGE_MIN_FREE_PERMILLE`]
+/// for which collections those are), and `free_permille` is how much of the
+/// heap was free at that same moment — the two have to be read together or
+/// neither means anything.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ZFragGauge {
+    /// Collections that met the sampling condition.
+    pub samples: usize,
+    /// Worst (lowest) `largest_free_block / capacity`, in permille. `None`
+    /// when nothing was sampled — which is the normal state for a short or
+    /// heap-light run and must not be reported as a perfect score.
+    pub worst_permille: Option<usize>,
+    /// Free share of capacity at the worst sample, in permille.
+    pub free_permille: usize,
+    /// The collection number the worst sample came from.
+    pub worst_cycle: usize,
+}
+
 
 /// Runtime kill switch: `CRATONVM_ZGC_TLAB`. **Default on.**
 ///
@@ -6308,7 +6526,25 @@ impl GarbageCollector for ZgcRealHeap {
         // that decides whether the next allocation may raise it again. Mirrors
         // G1's clear at the end of its cycle (`g1.rs:8392`).
         self.native_alloc_pressure.store(false, Ordering::Relaxed);
+        // Same point, same reasoning, for the hard-refusal latch. Note this is
+        // NOT done in `clear_native_alloc_pressure`: that runs on the boundary's
+        // "gates said no" path too, and lowering the hard bit there would throw
+        // away the one signal this whole mechanism exists to carry.
+        self.hard_alloc_failure.store(false, Ordering::Relaxed);
         let cycle = self.gc_count.fetch_add(1, Ordering::Relaxed) + 1;
+
+        // Phase 2.2: one post-sweep fragmentation reading per collection.
+        //
+        // Here rather than inside the sweep's own arena scope above, and the
+        // second `lock()` is deliberate: this reads the arena AFTER the sweep,
+        // the high-end coalesce, and both cursor retractions, which is the
+        // state a workload actually allocates against and therefore the only
+        // one worth ratcheting on. The world is still stopped, so the two
+        // scopes see identical bytes and the extra acquire is uncontended.
+        {
+            let arena = self.arena.lock();
+            self.sample_frag_gauge(&arena, cycle);
+        }
 
         // Per-collection `--verbose:gc` line. One `eprintln!` and no
         // `tracing` twin on purpose: the defect this closes is that a run with
@@ -7604,6 +7840,166 @@ mod tests {
         let obj = heap.alloc_object(ClassId::new(1), 4);
         heap.set_field(obj, 0, Value::Int(123));
         assert_eq!(heap.get_field(obj, 0), Value::Int(123));
+    }
+
+    /// A refusal and the occupancy predicate are **different questions**, and
+    /// this is the test that says so.
+    ///
+    /// `needs_gc()` asks "have enough live bytes accumulated". A non-compacting
+    /// arena refuses a request when no single hole is big enough, which it can
+    /// do at any occupancy at all — including zero. Until 2026-08-13 the
+    /// `safe_native_call` boundary consumed the refusal latch through a gate
+    /// that re-asked `needs_gc()`, so in exactly this state the signal was
+    /// cleared without a collection ever running.
+    ///
+    /// The assertions are deliberately paired: `!needs_gc()` is what makes
+    /// `hard_alloc_failure()` worth having, and a version of this test that
+    /// dropped it would still pass against a latch wired to the occupancy
+    /// trigger — i.e. against no fix at all.
+    #[test]
+    fn a_refused_request_latches_a_signal_the_occupancy_trigger_cannot_see() {
+        let heap = ZgcRealHeap::with_capacity(64 * 1024);
+        assert!(!heap.needs_gc());
+        assert!(!heap.hard_alloc_failure());
+
+        // No arena of this size can ever serve this, at any occupancy.
+        let refused = heap.try_alloc_array(ClassId::new(0), ArrayElementType::Byte, 1024 * 1024);
+        assert!(refused.is_none(), "a 1 MB array must not fit a 64 KB arena");
+
+        assert!(
+            !heap.needs_gc(),
+            "the occupancy trigger must still say no — that is the whole point"
+        );
+        assert!(
+            heap.hard_alloc_failure(),
+            "a refused request must latch the hard signal"
+        );
+    }
+
+    /// The hard latch is lowered by the collection it asked for, so one
+    /// refusal buys one cycle and a healthy heap does not carry the bit.
+    #[test]
+    fn a_collection_lowers_the_hard_allocation_failure_latch() {
+        let heap = ZgcRealHeap::with_capacity(64 * 1024);
+        assert!(heap
+            .try_alloc_array(ClassId::new(0), ArrayElementType::Byte, 1024 * 1024)
+            .is_none());
+        assert!(heap.hard_alloc_failure());
+
+        // SAFETY: these unit tests run the heap single-threaded.
+        let stw = unsafe { StopTheWorldToken::new() };
+        let mut roots: [ObjectRef; 0] = [];
+        heap.collect_garbage(&stw, &mut roots, &NoMonitors);
+
+        assert!(
+            !heap.hard_alloc_failure(),
+            "the cycle the latch asked for has run; the bit must not persist"
+        );
+    }
+
+    // -- Phase 2.2: the fragmentation ratchet -----------------------------
+
+    /// A run that never met the sampling condition reports **no reading**, not
+    /// a perfect one.
+    ///
+    /// This is the vacuous-green guard for the whole gauge. `worst_permille`
+    /// starts at a `usize::MAX` sentinel precisely so that "never sampled" and
+    /// "sampled and scored 1000" cannot be confused, and this test is what
+    /// stops someone simplifying that sentinel into a plain `1000`.
+    #[test]
+    fn the_frag_gauge_reports_no_reading_rather_than_a_perfect_one() {
+        let heap = ZgcRealHeap::with_capacity(64 * 1024);
+        let g = heap.frag_gauge();
+        assert_eq!(g.samples, 0);
+        assert_eq!(
+            g.worst_permille, None,
+            "an unsampled gauge must not read as a perfect score"
+        );
+    }
+
+    /// A collection on a mostly-empty heap samples, and scores well.
+    #[test]
+    fn a_collection_with_room_to_spare_takes_a_reading() {
+        let heap = ZgcRealHeap::with_capacity(1024 * 1024);
+        // A handful of objects, all dead by the time we collect.
+        for _ in 0..16 {
+            heap.alloc_object(ClassId::new(1), 4);
+        }
+        // SAFETY: these unit tests run the heap single-threaded.
+        let stw = unsafe { StopTheWorldToken::new() };
+        let mut roots: [ObjectRef; 0] = [];
+        heap.collect_garbage(&stw, &mut roots, &NoMonitors);
+
+        let g = heap.frag_gauge();
+        assert_eq!(g.samples, 1, "an empty-ish heap must be sampled");
+        let worst = g.worst_permille.expect("sampled, so there is a reading");
+        assert!(
+            worst > ZGC_FRAG_FLOOR_PERMILLE,
+            "a heap with one contiguous run of free space is not fragmented; \
+             got {worst} permille"
+        );
+        assert!(
+            g.free_permille >= ZGC_FRAG_GAUGE_MIN_FREE_PERMILLE,
+            "the recorded sample must satisfy the condition it was taken under"
+        );
+    }
+
+    /// **A full heap is not a fragmented heap**, and the gauge must not say it
+    /// is.
+    ///
+    /// This is the test that makes [`ZGC_FRAG_GAUGE_MIN_FREE_PERMILLE`] load-
+    /// bearing rather than decorative. Fill a heap with LIVE objects, collect,
+    /// and the largest free block is legitimately tiny — a gauge without the
+    /// condition would ratchet to nearly zero here and fire its floor warning
+    /// on the most ordinary workload there is.
+    ///
+    /// The exact edit that trips it: delete the `free_permille <` early return
+    /// in `sample_frag_gauge`.
+    #[test]
+    fn a_heap_that_is_merely_full_is_not_recorded_as_fragmented() {
+        let heap = ZgcRealHeap::with_capacity(64 * 1024);
+        // Keep everything alive, so the sweep frees nothing — and allocate
+        // until the arena genuinely refuses, so the post-sweep free share is
+        // really below the sampling condition. A fixed object count would
+        // leave room and quietly test nothing.
+        // Pin the TLAB off for this fixture. Not because the TLAB is the
+        // subject — it is not — but because `zgc_tlab_enabled_by_default`
+        // reads a process-wide flag on every heap construction, so a peer test
+        // holding a `FlagOverride` decides how much of this arena a refill
+        // claims and therefore where the fill loop below stops. Without this
+        // the test passed alone and failed in the full suite, which is a
+        // FIXTURE defect masquerading as a gauge defect.
+        heap.set_tlab_enabled(false);
+        let mut live: Vec<ObjectRef> = Vec::new();
+        while let Some(o) = heap.try_alloc_object(ClassId::new(1), 8) {
+            live.push(o);
+        }
+        assert!(
+            live.len() > 16,
+            "the fixture must actually fill the arena to test anything; got {}",
+            live.len()
+        );
+        // SAFETY: these unit tests run the heap single-threaded.
+        let stw = unsafe { StopTheWorldToken::new() };
+        heap.collect_garbage(&stw, &mut live, &NoMonitors);
+
+        // Precondition, asserted rather than assumed: this test says nothing
+        // unless the heap really did end up full. If a future change makes the
+        // fill loop stop early, the assertion below would pass for the wrong
+        // reason and the test would become a vacuous green.
+        let free_permille = heap.arena_free_permille_for_test();
+        assert!(
+            free_permille < ZGC_FRAG_GAUGE_MIN_FREE_PERMILLE,
+            "fixture did not fill the heap: {free_permille} permille free"
+        );
+
+        let g = heap.frag_gauge();
+        assert_eq!(
+            g.samples, 0,
+            "a collection that left <25% of the heap free says nothing about \
+             fragmentation and must not be counted as a reading"
+        );
+        assert_eq!(g.worst_permille, None);
     }
 
     #[test]

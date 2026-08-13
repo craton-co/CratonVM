@@ -1283,6 +1283,41 @@ impl VmHeap {
         }
     }
 
+    /// Whether an allocation was **refused** since the last collection.
+    ///
+    /// The hard twin of [`Self::young_spill_pressure`], and the difference is
+    /// the whole point: the boundary consumer re-checks `needs_gc()` before
+    /// acting on the soft signal, which is right for an advisory note and
+    /// wrong for a request that already failed. On a non-compacting heap those
+    /// two states come apart completely — an arena can refuse a 2 MB array
+    /// while `allocated` sits at 7% of capacity, because the bytes are there
+    /// and no single hole is — and in that state `needs_gc()` answers no and
+    /// discards the only signal that knew better.
+    ///
+    /// Non-ZGC backends answer `false`: Generational's own spill latch plus
+    /// `old_gen_needs_gc()` already cover the same ground for it, and G1
+    /// relocates, so "no hole this big" is not a durable state there.
+    #[inline]
+    pub fn hard_alloc_failure(&self) -> bool {
+        match self {
+            VmHeap::Generational(_) => false,
+            VmHeap::G1(_) => false,
+            #[cfg(feature = "zgc")]
+            VmHeap::Zgc(h) => h.hard_alloc_failure(),
+        }
+    }
+
+    /// Clear the hard-allocation-failure latch — see [`Self::hard_alloc_failure`].
+    #[inline]
+    pub fn clear_hard_alloc_failure(&self) {
+        match self {
+            VmHeap::Generational(_) => {}
+            VmHeap::G1(_) => {}
+            #[cfg(feature = "zgc")]
+            VmHeap::Zgc(h) => h.clear_hard_alloc_failure(),
+        }
+    }
+
     /// Clear the native-wrapper allocation-pressure signal.
     #[inline]
     pub fn clear_young_spill_pressure(&self) {
@@ -2223,6 +2258,25 @@ impl VmHeap {
                 h.allocated_bytes(),
                 h.heap_capacity(),
             );
+            // Phase 2.2's tracked number, on its own line so a suite runner can
+            // extract it per class with one grep.
+            //
+            // `frag_samples=0` is printed rather than suppressed, and it does
+            // NOT mean "no fragmentation": it means no collection ever left a
+            // quarter of the heap free, so this run says nothing about the
+            // subject. Reporting that as a clean score is exactly how a gauge
+            // becomes a vacuous green, so the two cases are spelled
+            // differently and the reader is told which they have.
+            let g = h.frag_gauge();
+            match g.worst_permille {
+                Some(worst) => eprintln!(
+                    "[GC] zgc-frag: frag_samples={} worst_largest_free_permille={}                      free_permille_at_worst={} at_cycle={}",
+                    g.samples, worst, g.free_permille, g.worst_cycle,
+                ),
+                None => eprintln!(
+                    "[GC] zgc-frag: frag_samples=0 worst_largest_free_permille=n/a                      (no collection left >=25% of the heap free; this run is not                      evidence either way)"
+                ),
+            }
         }
         // Collection COUNTS, unconditionally. Without these the summary is not
         // comparable across configurations: the moving-young line below only

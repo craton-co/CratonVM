@@ -263,6 +263,49 @@ independently valuable and none of it needs a barrier:
 **Exit:** no suite class OOMs at a heap where Generational passes, and the
 fragmentation gauge is green over a full Tomcat run.
 
+**Status 2026-08-13: 2.1 landed earlier; 2.2, 2.3 and 2.4 landed with this
+document. The exit criterion is NOT met** — it names a suite run, and this
+session was scoped to build the mechanisms without re-running suites. What
+exists now is the instrument the exit criterion needs.
+
+* **2.2 — the gauge is built and reported.** Every collection takes one
+  post-sweep reading and the shutdown line carries
+  `[GC] zgc-frag: frag_samples=… worst_largest_free_permille=… free_permille_at_worst=…`,
+  which is one grep per class. Two design points are load-bearing and each has
+  a test that fails without it. **A full heap is not a fragmented heap**, so a
+  collection leaving under 25% free is not sampled at all — without that the
+  gauge would fire on the most ordinary workload there is, get muted, and be
+  worth nothing on the day it was right. And the metric is the largest
+  *servable* run, not the largest free-list block: the un-bumped middle between
+  the two cursors is on no free list, so scoring the list alone reads a pristine
+  1 MiB arena as **0 permille fragmented**. That second one was found by the
+  test, not by review.
+* **2.3 — the audit is written**, as
+  [`zgc-allocator-constant-audit-20260813.md`](zgc-allocator-constant-audit-20260813.md).
+  Thirteen constants; ten sound, two newly derived, one standing "No"
+  (`zgc_headroom_margin`, which bounds "a typical allocation" and is used as a
+  proxy for "this allocation" — and the request size it stands in front of is
+  unbounded). `ZGC_ADDRESS_BITS` is flagged as not yet load-bearing and owed a
+  re-derivation in Phase 4.
+* **2.4 — closed, but not the way this plan predicted, and the difference is
+  the finding.** The plan assumed the fix needed "a safe collection point
+  reachable from inside a native". Collecting inside the allocation wrapper is
+  not merely hard — **it is forbidden**: `vm_exec.rs` states that the wrappers
+  "must stay GC-free mid-callback, since their callers hold unrooted local
+  `ObjectRef`s". I wrote that version first and backed it out; it would have
+  been a use-after-free, not a fix.
+  The real defect was one level up. `alloc_raw` already latched on a refusal,
+  with a comment arguing that a failed request "is stronger evidence that a
+  cycle is due than the `allocated >= gc_threshold` predicate, which counts
+  LIVE bytes and therefore cannot see the bump space this heap never rewinds" —
+  and the boundary consumer then discarded that latch unless `needs_gc()`, the
+  very predicate being argued against, agreed. **The arming site and the
+  consuming site contradicted each other and the consuming site won**, silently,
+  in exactly the state the mechanism was written for. A separate
+  `hard_alloc_failure` latch now carries a genuine refusal to the one place a
+  collection is safe — the native boundary, where every argument is pinned and
+  remapped — without loosening the soft path.
+
 ### Phase 3 — Adopt concurrency before relocation *(weeks-months)*
 
 Concurrent marking is the half of ZGC that does **not** need a load barrier for
