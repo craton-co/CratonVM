@@ -11,22 +11,55 @@
 //! and monotonic-clock contract required by the Java streaming implementation;
 //! event payload collection remains owned by CratonVM's `jfr` crate.
 
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use cratonvm_native_api::{NativeContext, NativeKind, NativeMethodRegistry};
+use cratonvm_native_api::{
+    AnnotationElementValue, NativeContext, NativeHandle, NativeHandleScope, NativeKind,
+    NativeMethodRegistry,
+};
 use cratonvm_types::error::{MethodCallFailed, RuntimeError};
-use cratonvm_types::{ArrayElementType, Value};
+use cratonvm_types::{ArrayElementType, ClassId, ObjectRef, Value};
 
-static RECORDING: AtomicBool = AtomicBool::new(false);
+// There used to be a `static RECORDING: AtomicBool` here, written by
+// `beginRecording`, `endRecording` and `destroyJFR` and **read by nothing**.
+// `isRecording()` and `Event.isEnabled()`/`shouldCommit()` all answer
+// `ctx.jfr_java_recording_active()`, which is the VM's real state, so the static
+// was a second source of truth that could only ever drift from it. Removed
+// rather than extended when the `RecordingStream` transitions were added: a
+// write-only mirror of a state that already has an authoritative reader is a
+// latent disagreement, not bookkeeping.
+
 /// Mirrors HotSpot's `JfrRecorder::is_created()`: set by `createJFR`, cleared
 /// by `destroyJFR`. Both natives are specified in terms of it (see their
 /// registrations), so it cannot be replaced by a constant.
 static CREATED: AtomicBool = AtomicBool::new(false);
 static CLOCK_ORIGIN: OnceLock<Instant> = OnceLock::new();
-static NEXT_TYPE_ID: AtomicI64 = AtomicI64::new(1);
+
+/// First JFR type id this bridge hands out, and the reason it is not 1.
+///
+/// `jdk.jfr.internal.JVM.RESERVED_CLASS_ID_LIMIT` is 500, and the JDK treats
+/// every id below it as "defined by the JVM" (`Type.isDefinedByJVM`). More
+/// concretely, `jdk/jfr/internal/types/metadata.bin` bakes FIXED ids into the
+/// ~200 built-in types the JDK loads at startup, and `TypeLibrary.types` is a
+/// map KEYED BY ID. So a counter starting at 1 does not merely look odd — it
+/// collides: `TypeLibrary.createType` looks the app's event class up by the id
+/// `JVM.getTypeId` returned and finds the JDK's built-in type sitting there.
+///
+/// Measured on this VM before the fix (JDK 25, Temurin 25.0.4):
+/// `FlightRecorder.register(ProbeEvent.class)` reported success and
+/// `EventType.getEventType(ProbeEvent.class)` then answered
+/// `jdk.MetaspaceAllocationFailure` (id 44) — a completely unrelated event
+/// type — while a second registration answered `jdk.MetaspaceOOM` (id 45).
+/// Starting above the reserved limit keeps this bridge's ids in the range the
+/// JDK reserves for VM-assigned application class ids, which is where HotSpot
+/// puts them too (its own answers for app event classes are in the hundreds to
+/// low thousands).
+const FIRST_JFR_TYPE_ID: i64 = 500;
+static NEXT_TYPE_ID: AtomicI64 = AtomicI64::new(FIRST_JFR_TYPE_ID);
 
 /// The tick rate `counterTime()` counts in. `counterTime()` returns
 /// nanoseconds, so this is 1e9 — and `getTicksFrequency()` /
@@ -256,6 +289,593 @@ fn host_memory_totals() -> Option<(i64, i64)> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// jdk.jfr.Event payload capture
+// ---------------------------------------------------------------------------
+
+/// The JVM field descriptors this bridge can carry into a JFR event.
+///
+/// Everything else — any reference type other than `String`, and every array —
+/// is skipped, because CratonVM's chunk writer models exactly these and a
+/// field it cannot describe in metadata must not appear in a payload either.
+/// The most common casualty is a `Class`-typed field (netty's
+/// `AbstractAllocatorEvent.allocatorType`); on HotSpot that is a constant-pool
+/// reference, which needs a checkpoint event this writer does not emit.
+const JFR_FIELD_DESCRIPTORS: [&str; 9] = [
+    "Z",
+    "B",
+    "C",
+    "S",
+    "I",
+    "J",
+    "F",
+    "D",
+    "Ljava/lang/String;",
+];
+
+/// JFR event names, keyed by the event class's internal name.
+///
+/// The `@Name` annotation is immutable class-file data, so one read per class
+/// is enough — and `commit()` is hot enough that re-deriving it per event would
+/// be visible.
+fn event_names() -> &'static Mutex<HashMap<String, String>> {
+    static NAMES: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
+    NAMES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// The JFR name of an event class: its `@Name` value when it declares one,
+/// else its binary class name.
+///
+/// This is what `EventType.getName()` answers on HotSpot and what
+/// `RecordingStream.onEvent(String, …)` matches against, so it is the name the
+/// recorder must store. `@Name` is deliberately read from the exact class and
+/// not inherited — `jdk.jfr.Name` is not `@Inherited`, and netty relies on
+/// that: `FreeBufferEvent` and `AllocateBufferEvent` share a superclass and
+/// carry different names.
+fn jfr_event_name(ctx: &mut dyn NativeContext, class_id: ClassId) -> String {
+    let internal = ctx.class_name_of_id(class_id).unwrap_or_default();
+    if let Some(cached) = event_names()
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .get(&internal)
+    {
+        return cached.clone();
+    }
+    let mut name = internal.replace('/', ".");
+    for annotation in ctx.class_annotations(class_id) {
+        if annotation.type_descriptor != "Ljdk/jfr/Name;" {
+            continue;
+        }
+        for (element, value) in &annotation.elements {
+            if element == "value" {
+                if let AnnotationElementValue::StringVal(text) = value {
+                    if !text.is_empty() {
+                        name = text.clone();
+                    }
+                }
+            }
+        }
+    }
+    event_names()
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .insert(internal, name.clone());
+    name
+}
+
+/// The event's field values as `(name, descriptor, value)`, superclass fields
+/// first — the order JFR itself declares inherited fields in.
+///
+/// Static fields are skipped: netty's event classes each hold a `private static
+/// final INSTANCE` of their own type purely so `isEventEnabled()` has a
+/// receiver, and treating that as a payload field would put the event class
+/// inside its own event.
+///
+/// A field name declared twice in the chain (Java shadowing) is kept only at
+/// its most-derived declaration, because the recorder rejects an event type
+/// with a duplicate field name outright — which would silently drop the whole
+/// event rather than one field.
+fn capture_event_fields(
+    ctx: &mut dyn NativeContext,
+    event: ObjectRef,
+) -> Vec<(String, String, Value)> {
+    let mut current = Some(ctx.class_id_of_object(event));
+    // `startTime` and `duration` are JFR's own implicit fields: every event type
+    // declares them first and positionally, and consumers reach them by those
+    // names. A payload field with either name would be shadowed by the implicit
+    // one at every consumer, so it is dropped here rather than written into a
+    // record where it can never be read back.
+    let mut seen: HashSet<String> =
+        ["startTime", "duration"].iter().map(|s| (*s).to_owned()).collect();
+    // Collected most-derived first so shadowing resolves the Java way, then
+    // reversed for JFR's superclass-first declaration order.
+    let mut derived_first: Vec<(String, String, Value)> = Vec::new();
+    while let Some(class_id) = current {
+        let class_name = ctx.class_name_of_id(class_id).unwrap_or_default();
+        // `jdk.jfr.Event` declares no fields of its own; `jdk.internal.event
+        // .Event` is the base the JDK's own `Utils.isEventBaseClass` stops at.
+        if class_name == "jdk/jfr/Event"
+            || class_name == "jdk/internal/event/Event"
+            || class_name == "java/lang/Object"
+        {
+            break;
+        }
+        for field in ctx.declared_fields(class_id) {
+            if field.is_static || !JFR_FIELD_DESCRIPTORS.contains(&field.descriptor.as_str()) {
+                continue;
+            }
+            if !seen.insert(field.name.clone()) {
+                continue;
+            }
+            let value = ctx.get_field(event, field.slot_index);
+            derived_first.push((field.name, field.descriptor, value));
+        }
+        current = ctx.superclass_of(class_id);
+    }
+    derived_first.reverse();
+    derived_first
+}
+
+/// `begin()`/`end()` timestamps for the event being built on each thread.
+///
+/// HotSpot keeps `startTime`/`duration` in fields that `EventInstrumentation`
+/// weaves into the event class. CratonVM does not instrument event classes
+/// (`retransformClasses` above is a no-op and `isInstrumented` reports `false`
+/// to match), so there is no field to put them in. JFR's contract is that
+/// `begin()`, `end()` and `commit()` for one event run on one thread, which is
+/// what makes a single slot per thread sufficient — and why nesting two
+/// in-flight events on one thread would attribute the inner one's timing to
+/// whichever committed first.
+///
+/// Keyed by `(vm_identity, thread id)`: Rust tests build several independent
+/// `Vm`s in one process and thread ids restart per VM.
+fn event_timing() -> &'static Mutex<HashMap<(usize, u64), (u64, Option<u64>)>> {
+    static TIMING: OnceLock<Mutex<HashMap<(usize, u64), (u64, Option<u64>)>>> = OnceLock::new();
+    TIMING.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+// ---------------------------------------------------------------------------
+// RecordingStream event delivery
+// ---------------------------------------------------------------------------
+
+/// One live `jdk.jfr.consumer.RecordingStream` and the consumers it registered.
+///
+/// Both the stream and every `Consumer` are held as GLOBAL ROOTS
+/// (`add_global_root`), never as bare `ObjectRef`s. A consumer is parked here
+/// from `onEvent(...)` until `close()` — arbitrarily many GCs later — and a
+/// moving collector relocates it in between; an address-keyed side table is the
+/// failure mode that has bitten several overlay tables in this VM.
+///
+/// The stream itself is rooted for identity rather than for use: `close()` has
+/// to find the entry that belongs to the closing stream, and comparing
+/// freshly-resolved roots is exact where an identity hash would only be
+/// probably-unique among live objects.
+struct JavaEventStream {
+    /// `NativeContext::vm_identity` of the VM that owns these roots. The table
+    /// is process-global while the roots are per-VM, so every read filters on
+    /// this — a global-root handle from another `Vm` in the same process would
+    /// otherwise resolve to that VM's heap.
+    vm: usize,
+    stream: usize,
+    started: bool,
+    /// `(event-name filter, Consumer global root)`. A `None` filter is
+    /// `onEvent(Consumer)`, which subscribes to every event.
+    subscriptions: Vec<(Option<String>, usize)>,
+}
+
+fn java_event_streams() -> &'static Mutex<Vec<JavaEventStream>> {
+    static STREAMS: OnceLock<Mutex<Vec<JavaEventStream>>> = OnceLock::new();
+    STREAMS.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+thread_local! {
+    /// Set while this thread is inside a consumer callback.
+    ///
+    /// Delivery is synchronous on the committing thread (see
+    /// `dispatch_to_java_streams`), so a consumer that itself commits an event
+    /// would recurse without bound. The inner commit is still recorded into the
+    /// repository; only its delivery is suppressed.
+    static DISPATCHING: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Index of `stream`'s entry in the table, resolving each stored root so the
+/// comparison is between two current addresses.
+fn java_stream_slot(
+    ctx: &dyn NativeContext,
+    table: &[JavaEventStream],
+    stream: ObjectRef,
+) -> Option<usize> {
+    let vm = ctx.vm_identity();
+    table.iter().position(|entry| {
+        entry.vm == vm && ctx.resolve_global_root(entry.stream) == Some(stream)
+    })
+}
+
+/// Find `stream`'s entry, creating it if this is the first call for it.
+fn java_stream_slot_or_insert(ctx: &mut dyn NativeContext, stream: ObjectRef) -> usize {
+    let existing = {
+        let table = java_event_streams()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        java_stream_slot(ctx, &table, stream)
+    };
+    if let Some(index) = existing {
+        return index;
+    }
+    let vm = ctx.vm_identity();
+    let root = ctx.add_global_root(stream);
+    let mut table = java_event_streams()
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    table.push(JavaEventStream {
+        vm,
+        stream: root,
+        started: false,
+        subscriptions: Vec::new(),
+    });
+    table.len() - 1
+}
+
+/// Build the `jdk.jfr.ValueDescriptor` for one field.
+///
+/// `ValueDescriptor(Class, String)` is public API and routes through
+/// `Utils.getValidType`, which this file also implements — so the accepted set
+/// here is exactly [`JFR_FIELD_DESCRIPTORS`] by construction.
+fn value_descriptor(
+    scope: &mut NativeHandleScope<'_>,
+    descriptor: &str,
+    name: &str,
+) -> Option<ObjectRef> {
+    let mirror = match descriptor {
+        "Z" => scope.primitive_class_mirror("boolean"),
+        "B" => scope.primitive_class_mirror("byte"),
+        "C" => scope.primitive_class_mirror("char"),
+        "S" => scope.primitive_class_mirror("short"),
+        "I" => scope.primitive_class_mirror("int"),
+        "J" => scope.primitive_class_mirror("long"),
+        "F" => scope.primitive_class_mirror("float"),
+        "D" => scope.primitive_class_mirror("double"),
+        "Ljava/lang/String;" => {
+            let class_id = scope.ensure_class_initialized("java/lang/String").ok()?;
+            scope.get_class_mirror(class_id)
+        }
+        _ => return None,
+    };
+    let mirror = scope.root(mirror);
+    let text = scope.create_string(name);
+    let text = scope.root(text);
+    let (mirror, text) = (scope.get(&mirror), scope.get(&text));
+    match scope.new_object_initialized(
+        "jdk/jfr/ValueDescriptor",
+        "(Ljava/lang/Class;Ljava/lang/String;)V",
+        &[Value::Object(Some(mirror)), Value::Object(Some(text))],
+    ) {
+        Ok(Some(Value::Object(Some(vd)))) => Some(vd),
+        _ => None,
+    }
+}
+
+/// Build the `TimeConverter` a `RecordedEvent` needs to answer
+/// `getStartTime()`/`getEndTime()`/`getDuration()`.
+///
+/// Its only constructor takes a `ChunkHeader`, which only exists while parsing
+/// a file, so the object is allocated without running `<init>` and its four
+/// fields are set directly. With `startTicks = 0`, `startNanos = 0` and
+/// `divisor = 1.0`, `convertTimestamp(t)` is the identity — which is what makes
+/// it correct to hand this converter absolute epoch nanoseconds as "ticks".
+///
+/// Returns `None` when the field layout is not what we expect, rather than
+/// guessing: a missing `divisor` would leave it 0.0 and turn every timestamp
+/// into infinity. The caller then builds a converter-less event whose field
+/// accessors still work.
+fn identity_time_converter(scope: &mut NativeHandleScope<'_>) -> Option<ObjectRef> {
+    let utc = {
+        let class_id = scope.ensure_class_initialized("java/time/ZoneOffset").ok()?;
+        let index = scope.static_field_index_by_name(class_id, "UTC")?;
+        match scope.get_static_field(class_id, index) {
+            Value::Object(Some(utc)) => utc,
+            _ => return None,
+        }
+    };
+    let utc = scope.root(utc);
+    let converter = match scope.new_object("jdk/jfr/internal/consumer/TimeConverter") {
+        Ok(Some(Value::Object(Some(converter)))) => converter,
+        _ => return None,
+    };
+    let converter = scope.root(converter);
+    let (converter, utc) = (scope.get(&converter), scope.get(&utc));
+    scope.set_field_by_name(converter, "startTicks", Value::Long(0));
+    scope.set_field_by_name(converter, "startNanos", Value::Long(0));
+    scope.set_field_by_name(converter, "divisor", Value::Double(1.0));
+    scope.set_field_by_name(converter, "zoneOffset", Value::Object(Some(utc)));
+    // Read the one field whose absence would be silent and catastrophic.
+    match scope.get_field_by_name(converter, "divisor") {
+        Value::Double(divisor) if divisor == 1.0 => Some(converter),
+        other => {
+            tracing::warn!(
+                ?other,
+                "jdk.jfr.internal.consumer.TimeConverter has an unexpected field layout; \
+                 RecordedEvent timestamps will be unavailable while field access still works"
+            );
+            None
+        }
+    }
+}
+
+/// Materialise a `jdk.jfr.consumer.RecordedEvent` for a committed event.
+///
+/// Every object here is built through a real constructor — `ValueDescriptor`,
+/// `PlatformEventType`, `EventType`, `ObjectContext` and `RecordedEvent` all
+/// have one this boundary can reach — so the only field-level poking is
+/// [`identity_time_converter`]'s.
+///
+/// The descriptor list is `[startTime, duration] ++ fields` and the value array
+/// is `fields` alone. That is not a mismatch: `RecordedEvent.objectAt` returns
+/// the tick fields for indices 0 and 1 and shifts the rest, and it decides
+/// whether to shift by 1 or 2 from `objects.length + 2 == fields.size()` — so
+/// declaring both implicit fields is what makes `getInt("capacity")` land on
+/// the right slot.
+fn recorded_event_for(
+    ctx: &mut dyn NativeContext,
+    event_name: &str,
+    fields: &[(String, String, Value)],
+    start_ns: u64,
+    end_ns: u64,
+) -> Option<ObjectRef> {
+    let mut scope = NativeHandleScope::new(ctx);
+
+    // Root every reference-valued field FIRST. Everything below allocates, and
+    // a `String` field's `ObjectRef` was copied out of the heap before this
+    // function ran — a moving collector would leave that copy dangling.
+    let mut roots: Vec<Option<NativeHandle>> = Vec::with_capacity(fields.len());
+    for (_, _, value) in fields {
+        roots.push(match value {
+            Value::Object(Some(reference)) => Some(scope.root(*reference)),
+            _ => None,
+        });
+    }
+
+    let mut boxed: Vec<Option<NativeHandle>> = Vec::with_capacity(fields.len());
+    for (index, (_, descriptor, value)) in fields.iter().enumerate() {
+        let object = match &roots[index] {
+            // A reference field is already an object; only primitives need a
+            // wrapper, and `RecordedObject.getInt`/`getBoolean` require the
+            // boxed form.
+            Some(handle) => Some(scope.get(handle)),
+            None => match crate::lang_class::box_value(&mut *scope, *value, descriptor) {
+                Value::Object(Some(wrapper)) => Some(wrapper),
+                _ => None,
+            },
+        };
+        boxed.push(object.map(|object| scope.root(object)));
+    }
+
+    let values = scope.new_array(ArrayElementType::Reference, fields.len());
+    let values = scope.root(values);
+    for (index, handle) in boxed.iter().enumerate() {
+        let element = match handle {
+            Some(handle) => Value::Object(Some(scope.get(handle))),
+            None => Value::Object(None),
+        };
+        let array = scope.get(&values);
+        scope.set_array_element(array, index, element);
+    }
+
+    let descriptors = match scope.new_object_initialized("java/util/ArrayList", "()V", &[]) {
+        Ok(Some(Value::Object(Some(list)))) => list,
+        _ => return None,
+    };
+    let descriptors = scope.root(descriptors);
+    let implicit = [("startTime", "J"), ("duration", "J")];
+    for (name, descriptor) in implicit
+        .iter()
+        .map(|(name, descriptor)| ((*name).to_owned(), (*descriptor).to_owned()))
+        .chain(
+            fields
+                .iter()
+                .map(|(name, descriptor, _)| (name.clone(), descriptor.clone())),
+        )
+    {
+        let value_descriptor = value_descriptor(&mut scope, &descriptor, &name)?;
+        let value_descriptor = scope.root(value_descriptor);
+        let (list, value_descriptor) = (scope.get(&descriptors), scope.get(&value_descriptor));
+        scope
+            .invoke_virtual(
+                list,
+                "add",
+                "(Ljava/lang/Object;)Z",
+                &[Value::Object(Some(value_descriptor))],
+            )
+            .ok()?;
+    }
+
+    let converter = identity_time_converter(&mut scope).map(|converter| scope.root(converter));
+
+    let name = scope.create_string(event_name);
+    let name = scope.root(name);
+    let name = scope.get(&name);
+    let platform_type = match scope.new_object_initialized(
+        "jdk/jfr/internal/PlatformEventType",
+        "(Ljava/lang/String;JZZ)V",
+        &[
+            Value::Object(Some(name)),
+            Value::Long(type_id(event_name)),
+            // (isJDK, dynamicSettings) — neither is true of an application
+            // event class, and `MetadataReader` passes the same pair when it
+            // rebuilds an event type out of a parsed chunk.
+            Value::Int(0),
+            Value::Int(0),
+        ],
+    ) {
+        Ok(Some(Value::Object(Some(platform_type)))) => platform_type,
+        // A `@Name` the JDK rejects as a class name reaches `Type`'s
+        // constructor as an `InternalError`. Keep delivering the event with no
+        // event type rather than dropping it.
+        _ => return recorded_event_without_type(&mut scope, &descriptors, &values, start_ns, end_ns),
+    };
+    let platform_type = scope.root(platform_type);
+    let platform_type = scope.get(&platform_type);
+    let event_type = match scope.new_object_initialized(
+        "jdk/jfr/EventType",
+        "(Ljdk/jfr/internal/PlatformEventType;)V",
+        &[Value::Object(Some(platform_type))],
+    ) {
+        Ok(Some(Value::Object(Some(event_type)))) => event_type,
+        _ => return recorded_event_without_type(&mut scope, &descriptors, &values, start_ns, end_ns),
+    };
+    let event_type = scope.root(event_type);
+
+    let (event_type, list) = (scope.get(&event_type), scope.get(&descriptors));
+    let converter_value = match &converter {
+        Some(handle) => Value::Object(Some(scope.get(handle))),
+        None => Value::Object(None),
+    };
+    let context = match scope.new_object_initialized(
+        "jdk/jfr/internal/consumer/ObjectContext",
+        "(Ljdk/jfr/EventType;Ljava/util/List;Ljdk/jfr/internal/consumer/TimeConverter;)V",
+        &[
+            Value::Object(Some(event_type)),
+            Value::Object(Some(list)),
+            converter_value,
+        ],
+    ) {
+        Ok(Some(Value::Object(Some(context)))) => context,
+        _ => return None,
+    };
+    let context = scope.root(context);
+    let (context, array) = (scope.get(&context), scope.get(&values));
+    match scope.new_object_initialized(
+        "jdk/jfr/consumer/RecordedEvent",
+        "(Ljdk/jfr/internal/consumer/ObjectContext;[Ljava/lang/Object;JJ)V",
+        &[
+            Value::Object(Some(context)),
+            Value::Object(Some(array)),
+            Value::Long(start_ns as i64),
+            Value::Long(end_ns as i64),
+        ],
+    ) {
+        Ok(Some(Value::Object(Some(event)))) => Some(event),
+        _ => None,
+    }
+}
+
+/// Last-resort shape of [`recorded_event_for`]: the field values and their
+/// descriptors, with a null `EventType`. `getInt`/`getBoolean`/`hasField` all
+/// still answer; only `getEventType()` comes back null.
+fn recorded_event_without_type(
+    scope: &mut NativeHandleScope<'_>,
+    descriptors: &NativeHandle,
+    values: &NativeHandle,
+    start_ns: u64,
+    end_ns: u64,
+) -> Option<ObjectRef> {
+    let list = scope.get(descriptors);
+    let context = match scope.new_object_initialized(
+        "jdk/jfr/internal/consumer/ObjectContext",
+        "(Ljdk/jfr/EventType;Ljava/util/List;Ljdk/jfr/internal/consumer/TimeConverter;)V",
+        &[
+            Value::Object(None),
+            Value::Object(Some(list)),
+            Value::Object(None),
+        ],
+    ) {
+        Ok(Some(Value::Object(Some(context)))) => context,
+        _ => return None,
+    };
+    let context = scope.root(context);
+    let (context, array) = (scope.get(&context), scope.get(values));
+    match scope.new_object_initialized(
+        "jdk/jfr/consumer/RecordedEvent",
+        "(Ljdk/jfr/internal/consumer/ObjectContext;[Ljava/lang/Object;JJ)V",
+        &[
+            Value::Object(Some(context)),
+            Value::Object(Some(array)),
+            Value::Long(start_ns as i64),
+            Value::Long(end_ns as i64),
+        ],
+    ) {
+        Ok(Some(Value::Object(Some(event)))) => Some(event),
+        _ => None,
+    }
+}
+
+/// Hand a committed event to every consumer a started `RecordingStream`
+/// registered for it.
+///
+/// **Delivery is synchronous, on the committing thread.** HotSpot delivers from
+/// the stream's own thread, which polls an on-disk chunk repository CratonVM
+/// does not produce; there is no door on this boundary to start a Java
+/// dispatcher thread from a native. The observable differences are that a
+/// consumer runs inside the emitting call (so it must not block on that call's
+/// completion) and that events arrive in commit order with no flush batching.
+/// `DISPATCHING` keeps a consumer that commits its own event from recursing.
+fn dispatch_to_java_streams(
+    ctx: &mut dyn NativeContext,
+    event_name: &str,
+    fields: &[(String, String, Value)],
+    start_ns: u64,
+    end_ns: u64,
+) {
+    if DISPATCHING.with(Cell::get) {
+        return;
+    }
+    let vm = ctx.vm_identity();
+    let targets: Vec<usize> = {
+        let table = java_event_streams()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        table
+            .iter()
+            .filter(|entry| entry.started && entry.vm == vm)
+            .flat_map(|entry| entry.subscriptions.iter())
+            .filter(|(filter, _)| match filter {
+                Some(name) => name == event_name,
+                // `onEvent(Consumer)` subscribes to every event.
+                None => true,
+            })
+            .map(|(_, consumer)| *consumer)
+            .collect()
+    };
+    if targets.is_empty() {
+        return;
+    }
+    let Some(event) = recorded_event_for(ctx, event_name, fields, start_ns, end_ns) else {
+        tracing::warn!(
+            event = %event_name,
+            "could not materialise a jdk.jfr.consumer.RecordedEvent; the event was recorded but \
+             not delivered to RecordingStream consumers"
+        );
+        return;
+    };
+    let mut scope = NativeHandleScope::new(ctx);
+    let event = scope.root(event);
+    DISPATCHING.with(|flag| flag.set(true));
+    for consumer in targets {
+        // Resolve per iteration: `accept` runs arbitrary Java, so the previous
+        // resolution can have been relocated by then.
+        let Some(consumer) = scope.resolve_global_root(consumer) else {
+            continue;
+        };
+        let delivered = scope.get(&event);
+        if let Err(error) = scope.invoke_virtual(
+            consumer,
+            "accept",
+            "(Ljava/lang/Object;)V",
+            &[Value::Object(Some(delivered))],
+        ) {
+            // HotSpot's `Dispatcher` also isolates a consumer's failure from
+            // the emitting thread; report it rather than letting `commit()`
+            // throw into application code that never opted into the stream.
+            tracing::warn!(
+                event = %event_name,
+                ?error,
+                "a RecordingStream consumer threw; the exception is not propagated to commit()"
+            );
+        }
+    }
+    DISPATCHING.with(|flag| flag.set(false));
+}
+
 fn saved_dump_path(ctx: &mut dyn NativeContext) -> Value {
     let path = dump_path()
         .lock()
@@ -339,20 +959,37 @@ pub fn register_jfr_natives(registry: &mut NativeMethodRegistry) {
 
     registry.register_with_kind(JVM, "beginRecording", "()V", |ctx, _args| {
         ctx.jfr_begin_java_recording();
-        RECORDING.store(ctx.jfr_java_recording_active(), Ordering::Release);
         Ok(None)
     }, NativeKind::Bridge);
     registry.register_with_kind(JVM, "endRecording", "()V", |ctx, _args| {
         ctx.jfr_end_java_recording();
-        RECORDING.store(false, Ordering::Release);
         Ok(None)
     }, NativeKind::Bridge);
     registry.register_with_kind(JVM, "isRecording", "()Z", |ctx, _args| {
         Ok(Some(Value::Int(ctx.jfr_java_recording_active() as i32)))
     }, NativeKind::Bridge);
-    for (name, descriptor) in [("begin", "()V"), ("end", "()V")] {
-        registry.register("jdk/jfr/Event", name, descriptor, |_ctx, _args| Ok(None));
-    }
+    // `begin()`/`end()` are no longer no-ops: they are the only place the
+    // event's own start time and duration exist. See `event_timing`.
+    registry.register("jdk/jfr/Event", "begin", "()V", |ctx, _args| {
+        let key = (ctx.vm_identity(), ctx.thread_id());
+        event_timing()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .insert(key, (epoch_nanos().max(0) as u64, None));
+        Ok(None)
+    });
+    registry.register("jdk/jfr/Event", "end", "()V", |ctx, _args| {
+        let key = (ctx.vm_identity(), ctx.thread_id());
+        let now = epoch_nanos().max(0) as u64;
+        if let Some(slot) = event_timing()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .get_mut(&key)
+        {
+            slot.1 = Some(now);
+        }
+        Ok(None)
+    });
     registry.register("jdk/jfr/Event", "isEnabled", "()Z", |ctx, _args| {
         Ok(Some(Value::Int(ctx.jfr_java_recording_active() as i32)))
     });
@@ -363,15 +1000,51 @@ pub fn register_jfr_natives(registry: &mut NativeMethodRegistry) {
         if !ctx.jfr_java_recording_active() {
             return Ok(None);
         }
-        let event_class = args
-            .first()
-            .and_then(|value| match value {
-                Value::Object(Some(obj)) => Some(*obj),
-                _ => None,
-            })
-            .and_then(|obj| ctx.class_name_of_id(ctx.class_id_of_object(obj)))
-            .unwrap_or_else(|| "jdk/jfr/Event".to_owned());
-        ctx.jfr_emit_java_event(&event_class, epoch_nanos().max(0) as u64, 0);
+        let Some(Value::Object(Some(event))) = args.first().copied() else {
+            return Ok(None);
+        };
+        // Consume this thread's begin/end pair. An event committed without
+        // `begin()` is an instant event at commit time, which is what HotSpot
+        // records for one too.
+        let (start_ns, end_ns) = {
+            let key = (ctx.vm_identity(), ctx.thread_id());
+            let taken = event_timing()
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .remove(&key);
+            match taken {
+                Some((start, end)) => (start, end.unwrap_or(start)),
+                None => {
+                    let now = epoch_nanos().max(0) as u64;
+                    (now, now)
+                }
+            }
+        };
+        // The event is rooted for the whole body: name resolution can load the
+        // `@Name` annotation's class and field capture reads through the object,
+        // so neither may hold a pre-GC `ObjectRef` copy.
+        let mut scope = NativeHandleScope::new(ctx);
+        let event = scope.root(event);
+        let receiver = scope.get(&event);
+        let event_class = scope.class_id_of_object(receiver);
+        let event_name = jfr_event_name(&mut *scope, event_class);
+        let receiver = scope.get(&event);
+        let fields = capture_event_fields(&mut *scope, receiver);
+        // Record first, deliver second: a consumer that throws must not cost
+        // the recording its event.
+        //
+        // `fields` carries a raw `ObjectRef` for each `String` field, so nothing
+        // between here and `recorded_event_for` (which roots them first thing)
+        // may allocate. `jfr_emit_java_event`'s VM side only reads those strings'
+        // characters into Rust and touches the Rust recorder — no Java
+        // allocation, so no GC point.
+        scope.jfr_emit_java_event(
+            &event_name,
+            &fields,
+            start_ns,
+            end_ns.saturating_sub(start_ns),
+        );
+        dispatch_to_java_streams(&mut *scope, &event_name, &fields, start_ns, end_ns);
         Ok(None)
     });
     // `createJFR(boolean simulateFailure)` is NOT a constant: HotSpot's
@@ -434,7 +1107,6 @@ pub fn register_jfr_natives(registry: &mut NativeMethodRegistry) {
     // never-created path. `JVMSupport.destroyJFR` feeds the answer straight
     // into `nativeOK = !result`, i.e. into `hasJFR()`.
     registry.register_with_kind(JVM, "destroyJFR", "()Z", |_ctx, _args| {
-        RECORDING.store(false, Ordering::Release);
         Ok(Some(Value::Int(i32::from(
             CREATED.swap(false, Ordering::AcqRel),
         ))))
@@ -514,7 +1186,7 @@ pub fn register_jfr_natives(registry: &mut NativeMethodRegistry) {
             return Ok(Some(Value::Int(0)));
         }
         let timestamp = longs.get(1).copied().unwrap_or(0).max(0) as u64;
-        ctx.jfr_emit_java_event("jdk.PeriodicEvent", timestamp, 0);
+        ctx.jfr_emit_java_event("jdk.PeriodicEvent", &[], timestamp, 0);
         Ok(Some(Value::Int(1)))
     }, NativeKind::Bridge);
 
@@ -1054,28 +1726,176 @@ pub fn register_jfr_natives(registry: &mut NativeMethodRegistry) {
         "()V",
         |_ctx, _args| Ok(None),
     );
-    // Also an OVERRIDE of real bytecode, not a constant. The real body
-    // (JDK 25) is four statements:
+    // `RecordingStream` — an OVERRIDE of real bytecode, not a constant stub.
+    //
+    // The real `startAsync()` (JDK 25) is four statements:
     //     PlatformRecording pr = ...getPlatformRecording(recording);
     //     long startNanos = pr.start();
     //     updateOnCompleteHandler();
     //     directoryStream.startAsync(startNanos);
-    // Only the last one is unsupportable here: `EventDirectoryStream` polls an
-    // on-disk chunk repository that nothing in CratonVM produces, so its loop
-    // has no blocking source and spins a core forever. The first two are the
-    // recording state transition and would be worth keeping — but `pr.start()`
-    // routes into `PlatformRecorder.start`, i.e. chunk creation against that
-    // same absent repository, so it cannot be re-added without a run to prove
-    // it terminates. Left as the whole-method no-op it has been: the stream
-    // stays constructible, configurable and closeable and delivers no events,
-    // which is what every other entry point on this surface also reports.
-    // NOTE for the same follow-up run: `RecordingStream.start()` (the blocking
-    // sibling) is NOT overridden and still reaches `directoryStream.start`.
+    // The last one stays skipped, and the reason is unchanged and still worth
+    // keeping: `EventDirectoryStream` polls an on-disk chunk repository that
+    // nothing in CratonVM produces, so its loop has no blocking source and
+    // spins a core forever.
+    //
+    // What used to go with it was the RECORDING STATE TRANSITION, and that was
+    // the whole bug: `Event.isEnabled()` and `shouldCommit()` both answer
+    // `jfr_java_recording_active()`, so with no transition they answered
+    // `false` while a stream was running, `commit()` returned early, and
+    // nothing was ever recorded — let alone delivered. netty's
+    // `JfrEventsTest` fails all 10 of its tests on exactly that: every test
+    // opens a stream, allocates a buffer and blocks until the event arrives.
+    // So the transition happens here, through the same
+    // `jfr_begin_java_recording` door the non-streaming `Recording.start()`
+    // uses, and delivery is `Event.commit()`'s synchronous dispatch (see
+    // `dispatch_to_java_streams`) rather than a chunk-repository poll.
+    //
+    // `start()` gets the same treatment, and its divergence is deliberate: on
+    // HotSpot the blocking sibling processes events until the stream closes,
+    // which requires the dispatcher thread this boundary has no way to start.
+    // It therefore performs the transition and RETURNS instead of blocking.
+    // That is still a strict improvement on what it did before, which was to
+    // fall through to `directoryStream.start` and spin a core forever.
+    for name in ["startAsync", "start"] {
+        registry.register(
+            "jdk/jfr/consumer/RecordingStream",
+            name,
+            "()V",
+            |ctx, args| {
+                let Some(Value::Object(Some(stream))) = args.first().copied() else {
+                    return Ok(None);
+                };
+                let slot = java_stream_slot_or_insert(ctx, stream);
+                java_event_streams()
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner())[slot]
+                    .started = true;
+                ctx.jfr_begin_java_recording();
+                Ok(None)
+            },
+        );
+    }
+    // `onEvent(String, Consumer)` / `onEvent(Consumer)` — captured here instead
+    // of in the JDK's `Dispatcher`, because the dispatcher is only ever read by
+    // the `EventDirectoryStream` loop that is not running. The `Consumer` is
+    // held as a global root: it is parked from this call until `close()`, which
+    // is arbitrarily many GCs later, so a bare `ObjectRef` would dangle.
     registry.register(
         "jdk/jfr/consumer/RecordingStream",
-        "startAsync",
+        "onEvent",
+        "(Ljava/lang/String;Ljava/util/function/Consumer;)V",
+        |ctx, args| {
+            let Some(Value::Object(Some(stream))) = args.first().copied() else {
+                return Ok(None);
+            };
+            let filter = match args.get(1) {
+                Some(Value::Object(Some(name))) => ctx.read_string(*name),
+                _ => None,
+            };
+            let Some(Value::Object(Some(consumer))) = args.get(2).copied() else {
+                return Ok(None);
+            };
+            let slot = java_stream_slot_or_insert(ctx, stream);
+            let root = ctx.add_global_root(consumer);
+            java_event_streams()
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())[slot]
+                .subscriptions
+                .push((filter, root));
+            Ok(None)
+        },
+    );
+    registry.register(
+        "jdk/jfr/consumer/RecordingStream",
+        "onEvent",
+        "(Ljava/util/function/Consumer;)V",
+        |ctx, args| {
+            let Some(Value::Object(Some(stream))) = args.first().copied() else {
+                return Ok(None);
+            };
+            let Some(Value::Object(Some(consumer))) = args.get(1).copied() else {
+                return Ok(None);
+            };
+            let slot = java_stream_slot_or_insert(ctx, stream);
+            let root = ctx.add_global_root(consumer);
+            java_event_streams()
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())[slot]
+                .subscriptions
+                .push((None, root));
+            Ok(None)
+        },
+    );
+    // `close()` must undo `startAsync` symmetrically, or `Event.isEnabled()`
+    // stays true after the try-with-resources block and the next unrelated
+    // event class starts committing into a recording nobody is reading.
+    //
+    // The JDK body is `directoryStream.setChunkCompleteHandler(null);
+    // recording.close(); directoryStream.close();`. It is replayed below rather
+    // than skipped: it already runs cleanly on this VM today, and it is what
+    // makes `onClose(Runnable)` actions fire. Our own teardown happens FIRST so
+    // a failure in the replay cannot leave the recording latched on.
+    registry.register(
+        "jdk/jfr/consumer/RecordingStream",
+        "close",
         "()V",
-        |_ctx, _args| Ok(None),
+        |ctx, args| {
+            let Some(Value::Object(Some(stream))) = args.first().copied() else {
+                return Ok(None);
+            };
+            let vm = ctx.vm_identity();
+            let (removed, remaining_started) = {
+                let mut table = java_event_streams()
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner());
+                let removed = java_stream_slot(ctx, &table, stream).map(|slot| table.remove(slot));
+                // Only this VM's streams keep this VM's recording alive.
+                let remaining = table
+                    .iter()
+                    .filter(|entry| entry.started && entry.vm == vm)
+                    .count();
+                (removed, remaining)
+            };
+            if let Some(entry) = removed {
+                ctx.remove_global_root(entry.stream);
+                for (_, consumer) in entry.subscriptions {
+                    ctx.remove_global_root(consumer);
+                }
+            }
+            // Only the last started stream ends the recording — two concurrent
+            // streams share one, and ending it under the first to close would
+            // silently disable the other.
+            if remaining_started == 0 {
+                ctx.jfr_end_java_recording();
+            }
+            // Replay the JDK's own close. `recording` and `directoryStream` are
+            // private fields of `RecordingStream`; a missing one means the JDK
+            // shape changed, in which case skipping the replay is the safe
+            // answer — our teardown above has already run.
+            //
+            // BOTH fields are read and rooted before EITHER `close()` runs:
+            // `Recording.close()` is Java and can move `stream`, so reading the
+            // second field off the pre-call `ObjectRef` afterwards would be a
+            // use-after-move.
+            let mut scope = NativeHandleScope::new(ctx);
+            let recording = match scope.get_field_by_name(stream, "recording") {
+                Value::Object(Some(recording)) => Some(scope.root(recording)),
+                _ => None,
+            };
+            let directory_stream = match scope.get_field_by_name(stream, "directoryStream") {
+                Value::Object(Some(directory_stream)) => Some(scope.root(directory_stream)),
+                _ => None,
+            };
+            if let Some(handle) = &recording {
+                let recording = scope.get(handle);
+                let _ = scope.invoke_virtual(recording, "close", "()V", &[]);
+            }
+            if let Some(handle) = &directory_stream {
+                let directory_stream = scope.get(handle);
+                let _ = scope.invoke_virtual(directory_stream, "close", "()V", &[]);
+            }
+            Ok(None)
+        },
     );
     registry.register_with_kind(
         JVM,
@@ -1120,9 +1940,37 @@ mod tests {
         assert!(registry
             .find("jdk/jfr/internal/JDKEvents", "initialize", "()V")
             .is_some());
-        assert!(registry
-            .find("jdk/jfr/consumer/RecordingStream", "startAsync", "()V")
-            .is_some());
+        // The streaming surface is a SET: a stream that starts a recording but
+        // never ends it leaves `Event.isEnabled()` true for the rest of the
+        // process, and a stream whose consumers are never captured delivers
+        // nothing however well the recording state behaves. Each of these had
+        // to be added together for `JfrEventsTest` to pass, so each is pinned.
+        for (name, descriptor) in [
+            ("startAsync", "()V"),
+            ("start", "()V"),
+            ("close", "()V"),
+            (
+                "onEvent",
+                "(Ljava/lang/String;Ljava/util/function/Consumer;)V",
+            ),
+            ("onEvent", "(Ljava/util/function/Consumer;)V"),
+        ] {
+            assert!(
+                registry
+                    .find("jdk/jfr/consumer/RecordingStream", name, descriptor)
+                    .is_some(),
+                "jdk/jfr/consumer/RecordingStream.{name}{descriptor} must stay registered"
+            );
+        }
+        // `begin`/`end` carry the event's start time and duration, which no
+        // field on the object can hold because CratonVM does not weave event
+        // classes. As no-ops every event was an instant event at commit time.
+        for (name, descriptor) in [("begin", "()V"), ("end", "()V"), ("commit", "()V")] {
+            assert!(
+                registry.find("jdk/jfr/Event", name, descriptor).is_some(),
+                "jdk/jfr/Event.{name}{descriptor} must stay registered"
+            );
+        }
         // The thread filter and the event-configuration round trip are
         // stateful: the guard/reader must exist alongside its mutator, or the
         // pair silently disagrees again (wave-2 stub removal).
@@ -1152,6 +2000,51 @@ mod tests {
         assert_eq!(string, type_id("java.lang.String"));
         assert_ne!(string, type_id("java.lang.Thread"));
         assert_ne!(string, 0);
+    }
+
+    /// Every id this bridge hands out must clear
+    /// `JVM.RESERVED_CLASS_ID_LIMIT` (500). Below it the JDK's
+    /// `TypeLibrary.types` map — keyed by id — already holds the ~200 built-in
+    /// types whose ids are baked into `metadata.bin`, so a low id makes
+    /// `EventType.getEventType(myEventClass)` answer with somebody else's event
+    /// type instead of failing.
+    #[test]
+    fn jfr_type_ids_clear_the_jdks_reserved_class_id_range() {
+        assert_eq!(FIRST_JFR_TYPE_ID, 500);
+        for name in [
+            "com.example.First",
+            "com.example.Second",
+            "com.example.Third",
+        ] {
+            assert!(
+                type_id(name) >= FIRST_JFR_TYPE_ID,
+                "{name} was assigned an id inside the JDK's reserved range"
+            );
+        }
+    }
+
+    /// The descriptor set the payload capture admits has to be exactly the set
+    /// the chunk writer can declare in metadata — a field written into a
+    /// payload but absent from the metadata mis-frames every field after it.
+    #[test]
+    fn capturable_field_descriptors_match_the_writable_jfr_types() {
+        for descriptor in ["Z", "B", "C", "S", "I", "J", "F", "D", "Ljava/lang/String;"] {
+            assert!(
+                JFR_FIELD_DESCRIPTORS.contains(&descriptor),
+                "{descriptor} must be capturable"
+            );
+        }
+        for descriptor in [
+            "Ljava/lang/Class;",
+            "Ljava/lang/Object;",
+            "[I",
+            "[Ljava/lang/String;",
+        ] {
+            assert!(
+                !JFR_FIELD_DESCRIPTORS.contains(&descriptor),
+                "{descriptor} has no JFR field type this writer can declare and must be skipped"
+            );
+        }
     }
 
     /// `JVMSupport.nanosToTicks` is `(long)(nanos * getTimeConversionFactor())`

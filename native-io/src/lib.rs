@@ -20521,20 +20521,44 @@ fn register_datagram_channel(r: &mut NativeMethodRegistry) {
     // concrete EPoll implementation then allocates a separate channel whose
     // local-address fields CratonVM does not maintain. Keep the provider
     // result on the same fd-table-backed DatagramChannel path.
-    r.register(
+    //
+    // BOTH descriptors, and this is the point. `openDatagramChannel()` is a
+    // SEPARATE METHOD, not a default-argument form of the one below it, and it
+    // is the one netty takes: `NioDatagramChannel()` calls
+    // `DEFAULT_SELECTOR_PROVIDER.openDatagramChannel()`. While only the
+    // `(ProtocolFamily)` row existed, the no-arg call fell through to real
+    // `DatagramChannelImpl` construction, which this VM cannot complete — so the
+    // channel arrived ALREADY CLOSED (`isOpen()==false`,
+    // `socket().isClosed()==true`), and every `DatagramSocket` accessor on a
+    // fresh netty datagram channel reported "Socket is closed" while
+    // `DefaultDatagramChannelConfig.setBroadcast` NPE'd on the null local
+    // address a closed adaptor returns.
+    //
+    // Registered on the concrete platform providers as well as on the abstract
+    // base and `SelectorProviderImpl`, matching what `socket_channel.rs` does
+    // for `openServerSocketChannel`/`openSocketChannel`: native dispatch may key
+    // on the receiver's concrete class (`sun.nio.ch.EPollSelectorProvider` on
+    // Linux, `WEPollSelectorProvider` on Windows) or on the declaring class of
+    // the resolved method, and the pair covers both.
+    for prov in [
         "java/nio/channels/spi/SelectorProvider",
-        "openDatagramChannel",
-        "(Ljava/net/ProtocolFamily;)Ljava/nio/channels/DatagramChannel;",
-        native_dc_open,
-    );
-    // Linux's default EPoll provider inherits the concrete implementation from
-    // SelectorProviderImpl, so its real bytecode must be overridden as well.
-    r.register(
         "sun/nio/ch/SelectorProviderImpl",
-        "openDatagramChannel",
-        "(Ljava/net/ProtocolFamily;)Ljava/nio/channels/DatagramChannel;",
-        native_dc_open,
-    );
+        "sun/nio/ch/EPollSelectorProvider",
+        "sun/nio/ch/WEPollSelectorProvider",
+    ] {
+        r.register(
+            prov,
+            "openDatagramChannel",
+            "()Ljava/nio/channels/DatagramChannel;",
+            native_dc_open,
+        );
+        r.register(
+            prov,
+            "openDatagramChannel",
+            "(Ljava/net/ProtocolFamily;)Ljava/nio/channels/DatagramChannel;",
+            native_dc_open,
+        );
+    }
 
     // bind(SocketAddress) → DatagramChannel
     r.register(
@@ -20653,6 +20677,56 @@ fn register_datagram_channel(r: &mut NativeMethodRegistry) {
         "()Ljava/net/SocketAddress;",
         native_dc_local_addr,
     );
+    // The remote twin of the pair above, and it had NO registration at all —
+    // so `socket().getRemoteSocketAddress()` and `socket().getPort()` both died
+    // with `NoSuchMethodError: DatagramChannel.remoteAddress()`. Same two
+    // spellings, same reason. See `native_dc_remote_addr`.
+    r.register(
+        dc,
+        "remoteAddress",
+        "()Ljava/net/InetSocketAddress;",
+        native_dc_remote_addr,
+    );
+    r.register(
+        dc,
+        "remoteAddress",
+        "()Ljava/net/SocketAddress;",
+        native_dc_remote_addr,
+    );
+    r.register(
+        dc,
+        "getRemoteAddress",
+        "()Ljava/net/SocketAddress;",
+        native_dc_remote_addr,
+    );
+
+    // The generic `SocketOption` surface. It has to land together with the
+    // no-arg `openDatagramChannel()` above: with the factory bridged and this
+    // still missing, netty's `NioDatagramChannelTest` goes from 1 passing / 3
+    // failing to 0/4, because a channel that now opens successfully gets far
+    // enough to reach `getOption`/`setOption`/`supportedOptions` — and those
+    // were the abstract declarations. Two descriptors for `setOption`: real
+    // bytecode emits the COVARIANT `…)Ljava/nio/channels/DatagramChannel;`,
+    // while a caller holding a `NetworkChannel` emits the other.
+    r.register(
+        dc,
+        "setOption",
+        "(Ljava/net/SocketOption;Ljava/lang/Object;)Ljava/nio/channels/DatagramChannel;",
+        dc_set_option,
+    );
+    r.register(
+        dc,
+        "setOption",
+        "(Ljava/net/SocketOption;Ljava/lang/Object;)Ljava/nio/channels/NetworkChannel;",
+        dc_set_option,
+    );
+    r.register(
+        dc,
+        "getOption",
+        "(Ljava/net/SocketOption;)Ljava/lang/Object;",
+        dc_get_option,
+    );
+    r.register(dc, "supportedOptions", "()Ljava/util/Set;", dc_supported_options);
 
     // socket() → DatagramSocket
     r.register(dc, "socket", "()Ljava/net/DatagramSocket;", native_dc_socket);
@@ -20910,6 +20984,284 @@ fn native_dc_set_traffic_class(ctx: &mut dyn NativeContext, args: &[Value]) -> M
         let _ = ctx.fd_table().udp_set_tos(fd, tc as u32);
     }
     Ok(None)
+}
+
+// ---------------------------------------------------------------------------
+// DatagramChannel — the generic `SocketOption` surface
+// ---------------------------------------------------------------------------
+
+/// Every `setOption` value Java has requested on a `DatagramChannel`, by option
+/// name.
+///
+/// The individual setters above (`setReuseAddress`, `setReceiveBufferSize`, …)
+/// write straight through to the fd and keep nothing, which is fine for a
+/// write-only surface. `getOption` is a READER, and two of the options it must
+/// answer cannot be read back off the socket at all in the shape the JDK
+/// promises: `IP_MULTICAST_IF`'s value is a `NetworkInterface`, and the socket
+/// only knows an address. So the requested value is recorded here as well, and
+/// used when the socket cannot answer.
+///
+/// Keyed like every other `DatagramChannel` side table — see [`DcKey`] for why
+/// identity hash plus VM identity, and why no collector hook is needed: the
+/// values are ints and Strings, never `ObjectRef`s.
+fn dc_option_state() -> &'static Mutex<HashMap<DcKey, HashMap<String, i32>>> {
+    static OPTS: OnceLock<Mutex<HashMap<DcKey, HashMap<String, i32>>>> = OnceLock::new();
+    OPTS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn dc_option_set(ctx: &dyn NativeContext, channel: ObjectRef, name: &str, value: i32) {
+    dc_option_state()
+        .lock()
+        .entry(dc_key(ctx, channel))
+        .or_default()
+        .insert(name.to_string(), value);
+}
+
+fn dc_option_get(ctx: &dyn NativeContext, channel: ObjectRef, name: &str) -> Option<i32> {
+    dc_option_state()
+        .lock()
+        .get(&dc_key(ctx, channel))?
+        .get(name)
+        .copied()
+}
+
+/// Drop a closed channel's recorded options, so the identity hash it releases
+/// cannot hand a later channel this one's settings — the same staleness
+/// `dc_set_blocking` and `dc_socket_cache_clear` are reset for in `native_dc_close`.
+fn dc_option_clear(ctx: &dyn NativeContext, channel: ObjectRef) {
+    dc_option_state().lock().remove(&dc_key(ctx, channel));
+}
+
+/// The option name carried by a `java.net.SocketOption` argument. Shares the
+/// stream-channel reader, which knows that not every `SocketOption` the JDK's
+/// own adaptors pass declares a `name` FIELD — see
+/// `socket_channel::socket_option_name`.
+fn dc_option_name(ctx: &mut dyn NativeContext, arg: Option<&Value>) -> String {
+    let option = match arg {
+        Some(Value::Object(Some(o))) => Some(*o),
+        _ => None,
+    };
+    crate::socket_channel::socket_option_name(ctx, option)
+}
+
+/// The first IPv4 address of a `java.net.NetworkInterface`, as the socket-level
+/// `IP_MULTICAST_IF` value.
+///
+/// The JDK option is typed `SocketOption<NetworkInterface>` while the socket
+/// option is an address, so the interface has to be resolved. Answering `None`
+/// (IPv6-only or unresolvable interface) means the OS write is skipped and only
+/// the Java-visible record is kept — which is still the value `getOption` will
+/// return, so the round-trip the caller can observe stays consistent.
+fn dc_interface_ipv4(ctx: &mut dyn NativeContext, ni: ObjectRef) -> Option<std::net::Ipv4Addr> {
+    let addresses = match ctx.invoke_virtual(ni, "getInetAddresses", "()Ljava/util/Enumeration;", &[])
+    {
+        Ok(Some(Value::Object(Some(e)))) => e,
+        _ => return None,
+    };
+    // Bounded: an interface with a pathological address list must not spin.
+    for _ in 0..64 {
+        match ctx.invoke_virtual(addresses, "hasMoreElements", "()Z", &[]) {
+            Ok(Some(Value::Int(1))) => {}
+            _ => return None,
+        }
+        let addr = match ctx.invoke_virtual(addresses, "nextElement", "()Ljava/lang/Object;", &[]) {
+            Ok(Some(Value::Object(Some(a)))) => a,
+            _ => return None,
+        };
+        let text = match ctx.invoke_virtual(addr, "getHostAddress", "()Ljava/lang/String;", &[]) {
+            Ok(Some(Value::Object(Some(s)))) => ctx.read_string(s).unwrap_or_default(),
+            _ => continue,
+        };
+        if let Ok(v4) = text.parse::<std::net::Ipv4Addr>() {
+            return Some(v4);
+        }
+    }
+    None
+}
+
+/// `DatagramChannel.setOption(SocketOption, Object)`.
+///
+/// The individual `DatagramSocket`-surface setters registered above cover the
+/// four options Tomcat's `NioReceiver` uses by name. This is the GENERIC
+/// surface — the one `sun.nio.ch.DatagramSocketAdaptor` and netty's
+/// `NioChannelOption` go through — and it had no registration at all, so it
+/// resolved to the abstract declaration:
+///
+/// ```text
+///   AbstractMethodError: java/nio/channels/DatagramChannel.setOption(
+///       Ljava/net/SocketOption;Ljava/lang/Object;)Ljava/nio/channels/DatagramChannel;
+///       has no Code attribute
+/// ```
+fn dc_set_option(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = dc_receiver_channel(ctx, obj_arg92(args, 0)?);
+    let name = dc_option_name(ctx, args.get(1));
+    let fd = dc_fd(ctx, this);
+
+    // `IP_MULTICAST_IF` is the one option whose value is neither a Boolean nor
+    // an Integer, so it cannot go through `socket_option_value`.
+    if name == "IP_MULTICAST_IF" {
+        let ni = match args.get(2) {
+            Some(Value::Object(Some(ni))) => *ni,
+            // The JDK rejects a null interface; nothing here can act on one
+            // either, and silently recording "interface 0" would make
+            // `getOption` answer a different object than was set.
+            _ => {
+                return Err(RuntimeError::IllegalArgumentException {
+                    message: "IP_MULTICAST_IF requires a NetworkInterface".to_string(),
+                }
+                .into())
+            }
+        };
+        let index = match ctx.invoke_virtual(ni, "getIndex", "()I", &[]) {
+            Ok(Some(Value::Int(i))) => i,
+            _ => 0,
+        };
+        if let (Some(fd), Some(v4)) = (fd, dc_interface_ipv4(ctx, ni)) {
+            let _ = ctx.fd_table().udp_set_multicast_if_v4(fd, &v4);
+        }
+        dc_option_set(ctx, this, &name, index);
+        return Ok(Some(Value::Object(Some(this))));
+    }
+
+    let value = crate::socket_channel::socket_option_value(
+        ctx,
+        args.get(2).copied().unwrap_or(Value::Int(0)),
+    );
+
+    // Range checks first: `setOption` must refuse an out-of-range value rather
+    // than record it and hand back a channel that reads it straight out again.
+    match name.as_str() {
+        "IP_TOS" | "IP_MULTICAST_TTL" if !(0..=255).contains(&value) => {
+            return Err(RuntimeError::IllegalArgumentException {
+                message: format!("Invalid value '{value}' for {name}"),
+            }
+            .into())
+        }
+        "SO_RCVBUF" | "SO_SNDBUF" if value <= 0 => {
+            return Err(RuntimeError::IllegalArgumentException {
+                message: format!("Invalid send/receive buffer size: {value}"),
+            }
+            .into())
+        }
+        _ => {}
+    }
+
+    if let Some(fd) = fd {
+        let table = ctx.fd_table();
+        let _ = match name.as_str() {
+            "SO_REUSEADDR" => table.udp_set_reuse_address(fd, value != 0),
+            "SO_BROADCAST" => table.udp_set_broadcast(fd, value != 0),
+            "SO_RCVBUF" => table.udp_set_recv_buffer_size(fd, value as usize),
+            "SO_SNDBUF" => table.udp_set_send_buffer_size(fd, value as usize),
+            "IP_TOS" => table.udp_set_tos(fd, value as u32),
+            "IP_MULTICAST_TTL" => table.udp_set_multicast_ttl_v4(fd, value as u32),
+            "IP_MULTICAST_LOOP" => table.udp_set_multicast_loop_v4(fd, value != 0),
+            _ => Ok(()),
+        };
+    }
+    dc_option_set(ctx, this, &name, value);
+    Ok(Some(Value::Object(Some(this))))
+}
+
+/// `DatagramChannel.getOption(SocketOption)`.
+///
+/// Reads the SOCKET where the socket can answer, and the recorded request
+/// otherwise. The order matters: a value set before `bind()` was applied to the
+/// fd that existed then, and `bind` closes that fd and opens a replacement
+/// (`native_dc_bind`), so on a rebound channel the record is the only place the
+/// caller's own value still exists.
+///
+/// The return MUST be boxed — `getOption` is `<T> T getOption(SocketOption<T>)`,
+/// and a raw `Value::Int` returned for an object-typed method coerces to null,
+/// which NPEs the adaptor's `((Boolean) …).booleanValue()`. See
+/// `socket_channel::box_socket_option`.
+fn dc_get_option(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = dc_receiver_channel(ctx, obj_arg92(args, 0)?);
+    let name = dc_option_name(ctx, args.get(1));
+    let fd = dc_fd(ctx, this);
+
+    if name == "IP_MULTICAST_IF" {
+        // Prefer the interface Java itself named: the socket only knows an
+        // address, and mapping an address back to an interface is lossy.
+        let index = dc_option_get(ctx, this, &name).unwrap_or(0);
+        if index > 0 {
+            return ctx.invoke(
+                "java/net/NetworkInterface",
+                "getByIndex",
+                "(I)Ljava/net/NetworkInterface;",
+                &[Value::Int(index)],
+            );
+        }
+        let address = fd.and_then(|fd| ctx.fd_table().udp_multicast_if_v4(fd).ok());
+        match address {
+            Some(v4) if !v4.is_unspecified() => {
+                let text = ctx.create_string(&v4.to_string());
+                let inet = ctx.invoke(
+                    "java/net/InetAddress",
+                    "getByName",
+                    "(Ljava/lang/String;)Ljava/net/InetAddress;",
+                    &[Value::Object(Some(text))],
+                )?;
+                ctx.invoke(
+                    "java/net/NetworkInterface",
+                    "getByInetAddress",
+                    "(Ljava/net/InetAddress;)Ljava/net/NetworkInterface;",
+                    &[inet.unwrap_or(Value::Object(None))],
+                )
+            }
+            // No interface selected — HotSpot answers null here, measured.
+            _ => Ok(Some(Value::Object(None))),
+        }
+    } else {
+        let live = fd.and_then(|fd| {
+            let table = ctx.fd_table();
+            match name.as_str() {
+                "SO_REUSEADDR" => table.udp_reuse_address(fd).ok().map(i32::from),
+                "SO_BROADCAST" => table.udp_broadcast(fd).ok().map(i32::from),
+                "SO_RCVBUF" => table.udp_recv_buffer_size(fd).ok().map(|n| n as i32),
+                "SO_SNDBUF" => table.udp_send_buffer_size(fd).ok().map(|n| n as i32),
+                "IP_TOS" => table.udp_tos(fd).ok().map(|n| n as i32),
+                "IP_MULTICAST_TTL" => table.udp_multicast_ttl_v4(fd).ok().map(|n| n as i32),
+                "IP_MULTICAST_LOOP" => table.udp_multicast_loop_v4(fd).ok().map(i32::from),
+                _ => None,
+            }
+        });
+        let raw = live
+            .or_else(|| dc_option_get(ctx, this, &name))
+            .unwrap_or(0);
+        crate::socket_channel::box_socket_option(ctx, &name, raw)
+    }
+}
+
+/// `DatagramChannel.supportedOptions()`.
+///
+/// HotSpot JDK 25 / Linux answers `[IP_DONTFRAGMENT, IP_MULTICAST_IF,
+/// IP_MULTICAST_LOOP, IP_MULTICAST_TTL, IP_TOS, SO_BROADCAST,
+/// SO_INCOMING_NAPI_ID, SO_RCVBUF, SO_REUSEADDR, SO_REUSEPORT, SO_SNDBUF]`
+/// (measured). The `jdk.net.ExtendedSocketOptions` entries are left out here
+/// because nothing in this file implements them, and the set is a CONTRACT, not
+/// a wish list: netty's `NioChannelOption.setOption` uses
+/// `supportedOptions().contains(...)` as its only gate and reports an unlisted
+/// option as "not set" — so listing an option nothing honours turns a refusal
+/// into a silent lie.
+///
+/// What must NOT be here is just as load-bearing: `TCP_NODELAY` is netty's
+/// `newInvalidOption()` for `NioDatagramChannelTest.testInvalidNioChannelOption`,
+/// which asserts `setOption` returns false for it.
+fn dc_supported_options(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+    crate::socket_channel::supported_options_set(
+        ctx,
+        &[
+            "IP_MULTICAST_IF",
+            "IP_MULTICAST_LOOP",
+            "IP_MULTICAST_TTL",
+            "IP_TOS",
+            "SO_BROADCAST",
+            "SO_RCVBUF",
+            "SO_REUSEADDR",
+            "SO_SNDBUF",
+        ],
+    )
 }
 
 /// `DatagramChannel.socket()`.
@@ -21350,6 +21702,8 @@ fn native_dc_close(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
     // more: that row holds two heap references and is a GC root, so leaving it
     // behind keeps a closed channel and its adaptor alive forever.
     dc_socket_cache_clear(ctx, this);
+    // ... and the recorded socket options, same staleness reason again.
+    dc_option_clear(ctx, this);
     if let Some(fd_id) = remove_dc_fd(ctx, this) {
         let _ = ctx.fd_table().close(fd_id);
     }
@@ -21401,30 +21755,48 @@ fn native_dc_is_blocking(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     Ok(Some(Value::Int(i32::from(dc_is_blocking(ctx, this)))))
 }
 
-fn native_dc_local_addr(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = obj_arg92(args, 0)?;
-    // Phase T16 can allocate an older channel layout that does not retain the
-    // fd-table id in field zero. The JDK contract after bind(null) is still a
-    // non-null wildcard local address; use port zero when that legacy layout
-    // cannot expose its ephemeral port rather than returning null to JNDI.
-    let addr = dc_fd(ctx, this)
-        .and_then(|fd| ctx.fd_table().udp_local_addr(fd).ok())
-        .unwrap_or_else(|| "0.0.0.0:0".to_string());
+/// `DatagramChannel.remoteAddress()` / `getRemoteAddress()`.
+///
+/// The same per-method hole as `localAddress()` above, found by walking the
+/// whole adaptor surface (`AdaptorAudit`) instead of waiting for the next
+/// application to hit it: it is declared on `sun.nio.ch.DatagramChannelImpl`,
+/// not on the abstract `java.nio.channels.DatagramChannel` this VM
+/// instantiates, and `sun.nio.ch.DatagramSocketAdaptor`'s real bytecode calls
+/// it from `getRemoteSocketAddress()` and `getPort()`:
+///
+/// ```text
+///   NoSuchMethodError: java.nio.channels.DatagramChannel.remoteAddress()
+///                      Ljava/net/InetSocketAddress;
+/// ```
+///
+/// NOTE THE DESCRIPTOR, again: like `localAddress()`, the `DatagramChannelImpl`
+/// spelling returns the NARROWER `java.net.InetSocketAddress`. Both are
+/// registered.
+///
+/// `null` for an unconnected channel is the JDK's own answer, not a failure —
+/// `getRemoteSocketAddress()` returns null and `getPort()` returns -1 there.
+fn native_dc_remote_addr(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = dc_receiver_channel(ctx, obj_arg92(args, 0)?);
+    if !dc_is_connected(ctx, this) {
+        return Ok(Some(Value::Object(None)));
+    }
+    let addr = dc_fd(ctx, this).and_then(|fd| ctx.fd_table().udp_peer_addr(fd).ok());
+    match addr {
+        Some(addr) => dc_build_inet_socket_address(ctx, &addr),
+        None => Ok(Some(Value::Object(None))),
+    }
+}
+
+/// Build a real `java.net.InetSocketAddress` from a `host:port` string.
+///
+/// Shared by the local- and remote-address bridges. Goes through the real
+/// `(String,int)` constructor rather than writing slots by hand — see
+/// [`native_dc_local_addr`] for what the hand-written two-slot form cost.
+fn dc_build_inet_socket_address(ctx: &mut dyn NativeContext, addr: &str) -> MethodCallResult {
     let (host, port) = addr
         .rsplit_once(':')
         .and_then(|(host, port)| port.parse::<i32>().ok().map(|port| (host, port)))
         .unwrap_or(("0.0.0.0", 0));
-    // Build the address through the real constructor rather than writing the
-    // legacy two-slot layout by hand. The hand-written form put a bare host
-    // String in slot 0 — where a real-layout `InetSocketAddress` keeps its
-    // `holder` — so `getAddress()` fell through to an out-of-range slot read
-    // and answered **null** while `isUnresolved()` still answered **false**.
-    // That is the same broken pair that let `ServerSocket.bind` walk past its
-    // unresolved-address guard and NPE inside `sun.nio.ch.Net.bind`; here it
-    // simply meant `DatagramChannel.getLocalAddress().getAddress()` was null on
-    // a channel that was demonstrably bound. `(Ljava/lang/String;I)V` resolves
-    // the numeric literal and populates the holder, so both answers agree and
-    // match HotSpot.
     let host_s = ctx.create_string(host);
     let host_pin = ctx.pin_native_root(host_s);
     let host_s = ctx.read_native_pin(host_pin, host_s);
@@ -21438,6 +21810,30 @@ fn native_dc_local_addr(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         Ok(Some(v @ Value::Object(Some(_)))) => Ok(Some(v)),
         _ => Ok(Some(Value::Object(None))),
     }
+}
+
+fn native_dc_local_addr(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg92(args, 0)?;
+    // Phase T16 can allocate an older channel layout that does not retain the
+    // fd-table id in field zero. The JDK contract after bind(null) is still a
+    // non-null wildcard local address; use port zero when that legacy layout
+    // cannot expose its ephemeral port rather than returning null to JNDI.
+    let addr = dc_fd(ctx, this)
+        .and_then(|fd| ctx.fd_table().udp_local_addr(fd).ok())
+        .unwrap_or_else(|| "0.0.0.0:0".to_string());
+    // Build the address through the real constructor rather than writing the
+    // legacy two-slot layout by hand. The hand-written form put a bare host
+    // String in slot 0 — where a real-layout `InetSocketAddress` keeps its
+    // `holder` — so `getAddress()` fell through to an out-of-range slot read
+    // and answered **null** while `isUnresolved()` still answered **false**.
+    // That is the same broken pair that let `ServerSocket.bind` walk past its
+    // unresolved-address guard and NPE inside `sun.nio.ch.Net.bind`; here it
+    // simply meant `DatagramChannel.getLocalAddress().getAddress()` was null on
+    // a channel that was demonstrably bound. `(Ljava/lang/String;I)V` resolves
+    // the numeric literal and populates the holder, so both answers agree and
+    // match HotSpot. (That construction now lives in
+    // `dc_build_inet_socket_address`, shared with the remote-address bridge.)
+    dc_build_inet_socket_address(ctx, &addr)
 }
 
 // ---------------------------------------------------------------------------

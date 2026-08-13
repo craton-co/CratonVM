@@ -2283,14 +2283,16 @@ fn validate_cert_chain(
 
     match crate::x509_manager::validate_chain(&chain_der, &trust) {
         Ok(()) => Ok(None),
-        Err(e) => Err(cratonvm_types::error::RuntimeError::IOException {
-            // Mirrors the production trust-manager path: a failed PKIX check
-            // surfaces as a CertificateException (mapped to IOException at the
-            // native boundary) so apps see a real validation failure rather
-            // than a silently-trusted connection.
-            message: format!("CertificateException: {}", e),
-        }
-        .into()),
+        // A failed PKIX check must surface as a REAL
+        // `java.security.cert.CertificateException`, not an `IOException`
+        // whose message names one: `checkServerTrusted` declares that type and
+        // every caller — TLS stacks turning a failure into a handshake alert,
+        // tests asserting an untrusted chain was rejected — catches it by
+        // type. See `x509_manager::cert_exception`, which this shares.
+        Err(e) => Err(crate::x509_manager::cert_exception_external(
+            ctx,
+            e.to_string(),
+        )),
     }
 }
 

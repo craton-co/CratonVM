@@ -460,6 +460,9 @@ fn compile_despec_arraycopy_with_dispatch(
         Vec::new(),
         method_key,
         Vec::new(), // indy_info
+        // elidable_init_pcs: hand-built bytecode with no constant pool, so
+        // nothing is PROVEN to be an empty `<init>` and nothing may be elided.
+        None,
     )
     .expect("JIT compilation of the despecialized arraycopy wrapper failed")
 }

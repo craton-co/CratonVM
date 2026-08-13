@@ -1,7 +1,7 @@
 # netty `handler.ssl` batch 10 — residuals after the provider-routing / close-notify fixes
 
 **Status:** OPEN (2026-08-13). What is left of
-[tls-batch10-encrypted-keys-and-handshake-gaps-20260812.md] after its two root
+`tls-batch10-encrypted-keys-and-handshake-gaps-20260812.md` after its two root
 causes were fixed and it was retired to
 [`docs/internal/fixed-suite-bugs/netty-tls-batch10-provider-routing-and-close-notify-FIXED-20260813.md`][fixed].
 

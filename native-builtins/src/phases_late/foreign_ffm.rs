@@ -340,6 +340,26 @@ pub(crate) fn p67_value_layout_clinit(
     Ok(None)
 }
 
+/// `(byteSize, byteAlignment)` of a layout carrier.
+///
+/// Every layout this file mints keeps the same two-slot prefix —
+/// `[0]=byteSize, [1]=byteAlignment` — see [`p67_layout_object`]. The
+/// alignment fallback is `size` because that is what a `ValueLayout`'s natural
+/// alignment is; a zero would make the rounding below divide by zero.
+pub(crate) fn p67_layout_size_align(ctx: &mut dyn NativeContext, layout: ObjectRef) -> (i64, i64) {
+    let size = match ctx.get_field(layout, 0) {
+        Value::Long(v) => v,
+        Value::Int(v) => i64::from(v),
+        _ => 0,
+    };
+    let align = match ctx.get_field(layout, 1) {
+        Value::Long(v) if v > 0 => v,
+        Value::Int(v) if v > 0 => i64::from(v),
+        _ => size.max(1),
+    };
+    (size.max(0), align.max(1))
+}
+
 pub(crate) fn p67_layout_byte_size(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -1823,20 +1843,19 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(Some(segment))))
         },
     );
+    // `allocateFrom(String)` allocates REAL memory and writes the string into
+    // it. It used to hand back a `p67_arena_segment` — a stand-in whose address
+    // is 0 and which `panama_libffi::segment_byte_size` decodes as size 0, so
+    // `Arena.allocateFrom("abc").byteSize()` answered 0 where HotSpot answers 4,
+    // and the bytes were never written at all. `Arena.allocate` was already
+    // routed to the real allocator; this is the sibling that was left behind,
+    // and it is the second half of residual 3 in
+    // `ffm-elements-spliterator-and-allocatefrom-gaps-20260813`.
     r.register(
         arena,
         "allocateFrom",
         "(Ljava/lang/String;)Ljava/lang/foreign/MemorySegment;",
-        |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            let len = match args.get(1) {
-                Some(Value::Object(Some(s))) => {
-                    ctx.read_string(*s).map(|t| t.len() as i64 + 1).unwrap_or(1)
-                }
-                _ => 1,
-            };
-            Ok(Some(Value::Object(Some(p67_arena_segment(ctx, this, len)?))))
-        },
+        crate::panama::pe_arena_allocate_from_string,
     );
     r.register(arena, "close", "()V", |ctx, args| {
         let this = obj_arg(args, 0)?;
@@ -2742,6 +2761,14 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(Some(obj))))
         },
     );
+    // The three carriers below used to be ONE slot wide, holding the
+    // constructor's own argument — the element COUNT for a sequence, a
+    // hard-coded 0 for a union — while every reader in the tree expects the
+    // `[0]=byteSize, [1]=byteAlignment` prefix `p67_layout_object` defines. So
+    // `MemoryLayout.sequenceLayout(4, JAVA_INT).byteSize()` did not merely
+    // answer wrong, it answered `AbstractMethodError: MemoryLayout.byteSize()
+    // has no Code attribute` — no `byteSize` was registered for these classes
+    // at all, and a one-slot object could not have served one.
     r.register(
         ml,
         "sequenceLayout",
@@ -2751,8 +2778,31 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
                 Some(Value::Long(v)) => *v,
                 _ => 0,
             };
-            let obj = try_alloc_concurrent_synthetic(ctx, "java/lang/foreign/SequenceLayout", 1)?;
-            ctx.set_field(obj, 0, Value::Long(count));
+            let element = match args.get(1) {
+                Some(Value::Object(Some(obj))) => Some(*obj),
+                _ => None,
+            };
+            let (elem_size, elem_align) = element.map_or((0, 1), |e| p67_layout_size_align(ctx, e));
+            let element_pin = element.map(|e| (ctx.pin_native_root(e), e));
+            // Six slots: the standard four plus the element layout and count,
+            // so `elementLayout()`/`elementCount()` have somewhere to read from
+            // when they are implemented.
+            let obj = try_alloc_concurrent_synthetic(ctx, "java/lang/foreign/SequenceLayout", 6)?;
+            let element = element_pin.map(|(pin, e)| {
+                let e = ctx.read_native_pin(pin, e);
+                ctx.unpin_native_roots(pin);
+                e
+            });
+            ctx.set_field(obj, 0, Value::Long(count.max(0).saturating_mul(elem_size)));
+            ctx.set_field(obj, 1, Value::Long(elem_align));
+            ctx.set_field(
+                obj,
+                2,
+                Value::Int(i32::from(cfg!(target_endian = "little"))),
+            );
+            ctx.set_field(obj, 3, Value::Object(None));
+            ctx.set_field(obj, 4, Value::Object(element));
+            ctx.set_field(obj, 5, Value::Long(count));
             Ok(Some(Value::Object(Some(obj))))
         },
     );
@@ -2760,9 +2810,26 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
         ml,
         "unionLayout",
         "([Ljava/lang/foreign/MemoryLayout;)Ljava/lang/foreign/UnionLayout;",
-        |ctx, _args| {
-            let obj = try_alloc_concurrent_synthetic(ctx, "java/lang/foreign/UnionLayout", 1)?;
-            ctx.set_field(obj, 0, Value::Long(0));
+        |ctx, args| {
+            // A union is as large as its largest member, rounded up to the
+            // strictest member alignment — not zero, which is what this
+            // returned for every union regardless of its members.
+            let members = match args.first() {
+                Some(Value::Object(Some(arr))) => Some(*arr),
+                _ => None,
+            };
+            let (mut size, mut align) = (0_i64, 1_i64);
+            if let Some(members) = members {
+                for i in 0..ctx.array_length(members) {
+                    if let Value::Object(Some(member)) = ctx.get_array_element(members, i) {
+                        let (m_size, m_align) = p67_layout_size_align(ctx, member);
+                        size = size.max(m_size);
+                        align = align.max(m_align);
+                    }
+                }
+            }
+            let size = ((size + align - 1) / align).saturating_mul(align);
+            let obj = p67_layout_object(ctx, "java/lang/foreign/UnionLayout", size, align)?;
             Ok(Some(Value::Object(Some(obj))))
         },
     );
@@ -2775,8 +2842,9 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
                 Some(Value::Long(v)) => *v,
                 _ => 0,
             };
-            let obj = try_alloc_concurrent_synthetic(ctx, "java/lang/foreign/PaddingLayout", 1)?;
-            ctx.set_field(obj, 0, Value::Long(size));
+            // Padding has no alignment constraint of its own — the JDK's
+            // `PaddingLayoutImpl` is byte-aligned.
+            let obj = p67_layout_object(ctx, "java/lang/foreign/PaddingLayout", size, 1)?;
             Ok(Some(Value::Object(Some(obj))))
         },
     );
@@ -2793,6 +2861,66 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
         p67_memory_layout_var_handle,
     );
     r.register(ml, "name", "()Ljava/util/Optional;", p67_layout_name);
+
+    // `byteSize()`/`byteAlignment()` on the INTERFACE, not only on the
+    // concrete layout classes.
+    //
+    // CratonVM fabricates every `java.lang.foreign` object as an instance of
+    // the interface it implements (`ValueLayout.JAVA_INT.getClass()` is
+    // `java.lang.foreign.ValueLayout$OfInt`, where HotSpot has
+    // `jdk.internal.foreign.layout.ValueLayouts$OfIntImpl`), and an
+    // `invokeinterface MemoryLayout.byteSize()` against such a carrier resolves
+    // to the interface method — not to the per-class registration. Real JDK
+    // bytecode reaches it that way constantly: `SegmentAllocator.allocateFrom
+    // (JAVA_INT, 1, 2, 3)` failed with `MemoryLayout.byteSize() has no Code
+    // attribute` even though `JAVA_INT.byteSize()` answered 4 one line earlier.
+    //
+    // Safe to register on the interface for the same reason the rest of this
+    // file does: a non-static interface method's native only reaches receivers
+    // whose class IS the interface, i.e. exactly these carriers. The uniform
+    // `[0]=byteSize, [1]=byteAlignment` prefix is what makes one registration
+    // serve all of them.
+    r.register(ml, "byteSize", "()J", p67_layout_byte_size);
+    r.register(ml, "byteAlignment", "()J", p67_layout_byte_alignment);
+    for layout_class in [
+        "java/lang/foreign/SequenceLayout",
+        "java/lang/foreign/PaddingLayout",
+        "java/lang/foreign/UnionLayout",
+    ] {
+        r.register(layout_class, "byteSize", "()J", p67_layout_byte_size);
+        r.register(
+            layout_class,
+            "byteAlignment",
+            "()J",
+            p67_layout_byte_alignment,
+        );
+    }
+
+    // `SequenceLayout`'s own two accessors. The factory above already keeps the
+    // element layout at slot 4 and the count at slot 5 "so `elementLayout()`/
+    // `elementCount()` have somewhere to read from when they are implemented" —
+    // this is that.
+    r.register(
+        "java/lang/foreign/SequenceLayout",
+        "elementLayout",
+        "()Ljava/lang/foreign/MemoryLayout;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            Ok(Some(ctx.get_field(this, 4)))
+        },
+    );
+    r.register(
+        "java/lang/foreign/SequenceLayout",
+        "elementCount",
+        "()J",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            Ok(Some(match ctx.get_field(this, 5) {
+                v @ Value::Long(_) => v,
+                _ => Value::Long(0),
+            }))
+        },
+    );
 
     // Linker
     let gl = "java/lang/foreign/GroupLayout";

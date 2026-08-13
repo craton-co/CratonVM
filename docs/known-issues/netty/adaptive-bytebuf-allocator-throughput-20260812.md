@@ -16,6 +16,24 @@ The measurements that replace it are below. Nothing here is a guess: every
 number is from an in-tree instrument or `perf`, and the two that disagreed with
 a hypothesis of mine killed it.
 
+## Codec-dense classes put the same cost at 85–92× (batch 05, 2026-08-12)
+
+The compression codecs are the densest call workload in the suite and the
+cleanest confirmation of the per-call model, with **zero assertion failures**
+anywhere in the family:
+
+| class | HotSpot | CratonVM | ratio |
+| --- | --- | --- | --- |
+| `Bzip2IntegrationTest` | 21.3 s | **1 964 s** (13/14) | **92×** |
+| `LzfIntegrationTest` | 9.9 s | 873 s (10/11) | 88× |
+| `JdkZlibIntegrationTest` | 8.8 s | 746 s (10/11) | 85× |
+
+`Bzip2IntegrationTest` completing at a 3000 s cap is what proves the suite's
+compression "HANG"s are wall-clock, not deadlocks. `--nojit` is identical, so
+it is not the JIT; the pure-Java codecs behave the same as the JNI-backed ones,
+so it is not the native boundary. Details on
+[investigate-batch-05](investigate-batch-05.md).
+
 ## 1. What the cost actually is
 
 `CRATONVM_DBG=jit-scan-prof` reports `jit_entries` — transfers of control into
@@ -113,7 +131,7 @@ The two arms do not do the same work:
 most of the work rather than doing it faster — and it issues *more* native calls
 than arm A while taking a sixth of the time. The arm is a fine
 `MemorySegment` reproducer (see
-[memorysegment-asbytebuffer-unimplemented](memorysegment-asbytebuffer-unimplemented-20260812.md))
+memorysegment-asbytebuffer-unimplemented (retired: `memorysegment-asbytebuffer-unimplemented-20260812`))
 and worthless as a throughput instrument.
 
 ### 3.3 My own first hypothesis — also refuted, by its own flag

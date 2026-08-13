@@ -1535,6 +1535,12 @@ fn clamp_i64(v: u64) -> i64 {
 /// Builds its own registry, so this works on a run that never started a
 /// flight recording — which is every run today (see the LIVENESS block in
 /// [`crate`]'s module docs). Returns the byte count written.
+///
+/// The bytes are the **JDK's own** chunk format ([`crate::jdk_chunk`]). This
+/// file is handed to an operator who opens it in JMC or runs `jfr print` on it —
+/// the timeline caveat below is written for exactly that reader — and until this
+/// used the JDK format that reader got
+/// `IOException: Unknown string encoding 17` instead of a timeline.
 pub fn write_jfr_report(path: &Path, report: &PhaseReport) -> Result<u64, JfrDumpError> {
     let mut registry = EventTypeRegistry::new();
     register_phase_events(&mut registry);
@@ -1546,7 +1552,7 @@ pub fn write_jfr_report(path: &Path, report: &PhaseReport) -> Result<u64, JfrDum
     let chunk_start_ns = now_epoch_ns.saturating_sub(report.process_wall_ns);
     let events = report_to_events(report, &registry, chunk_start_ns);
     let repository = EventRepository::new(1);
-    crate::dump::dump_to_file(
+    crate::jdk_chunk::dump_to_file(
         path,
         &repository,
         &registry,
@@ -2285,27 +2291,26 @@ mod tests {
         let bytes = write_jfr_report(&path, &report).expect("jfr write");
         assert!(bytes > 0);
 
-        let header = crate::read_jfr_header(&path).expect("header");
-        assert_eq!(header.magic, crate::dump::JFR_MAGIC);
-
+        let chunk = crate::jdk_chunk::read_chunk(&path).expect("chunk");
         let mut registry = EventTypeRegistry::new();
         register_phase_events(&mut registry);
-        let events = crate::read_events(&path, &registry).expect("read events");
+        let events = &chunk.events;
         assert!(
             !events.is_empty(),
             "the phase report produced no readable events"
         );
-        for e in &events {
+        for e in events {
             assert!(
-                registry.get(e.type_id).is_some(),
+                registry.find_by_name(&e.type_name).is_some(),
                 "event of unregistered type {} survived the round trip",
-                e.type_id.0
+                e.type_name
             );
         }
-        let summary_id = registry.find_by_name(PHASE_SUMMARY_EVENT);
-        let summary_id = summary_id.expect("summary type registered");
         assert_eq!(
-            events.iter().filter(|e| e.type_id == summary_id).count(),
+            events
+                .iter()
+                .filter(|e| e.type_name == PHASE_SUMMARY_EVENT)
+                .count(),
             1,
             "expected exactly one summary event"
         );
