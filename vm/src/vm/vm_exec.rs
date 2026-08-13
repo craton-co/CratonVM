@@ -15415,13 +15415,35 @@ impl<'a> NativeSystemAccess for NativeContextImpl<'a> {
 
     fn jfr_begin_java_recording(&mut self) {
         let mut active = self.shared.debug.jfr_java_recording.lock();
-        if active.is_some() {
-            return;
-        }
         let mut recorder = self.shared.debug.flight_recorder.lock();
-        let id = recorder.new_recording(cratonvm_jfr::RecordingSettings::new("jdk.jfr"));
-        recorder.start_recording(id);
-        *active = Some(id);
+        // A recording that is STILL RUNNING is the one to keep: two concurrent
+        // `RecordingStream`s (or a stream alongside a `Recording`) share it, and
+        // beginning again must not replace it under the other one.
+        //
+        // A recording that has already been STOPPED must not be reused, and this
+        // used to `return` on `active.is_some()` without looking. `Recording
+        // ::start()` only transitions out of `New`, so the stopped recording
+        // stayed stopped — and because the early return also skipped the
+        // `jfr_java_recording_running` store, `Event.isEnabled()` answered
+        // `false` for every recording after the first in a process.
+        //
+        // That is what made netty's `JfrEventsTest` fail 9 of its 10 tests while
+        // the first one to run passed: each test opens its own `RecordingStream`,
+        // and only the first got a live recording.
+        let reusable = active.filter(|id| {
+            recorder.get_recording(*id).map(|rec| rec.state)
+                == Some(cratonvm_jfr::recording::RecordingState::Running)
+        });
+        if reusable.is_none() {
+            // Release the finished recording's event ring rather than leaving it
+            // in the map for the life of the process.
+            if let Some(previous) = *active {
+                recorder.discard_recording(previous);
+            }
+            let id = recorder.new_recording(cratonvm_jfr::RecordingSettings::new("jdk.jfr"));
+            recorder.start_recording(id);
+            *active = Some(id);
+        }
         self.shared
             .debug
             .jfr_java_recording_running
@@ -15447,15 +15469,84 @@ impl<'a> NativeSystemAccess for NativeContextImpl<'a> {
             .load(std::sync::atomic::Ordering::Acquire)
     }
 
-    fn jfr_emit_java_event(&mut self, event_class: &str, start_ns: u64, duration_ns: u64) {
-        let event_name = format!("jdk.JavaEvent.{}", event_class.replace('/', "."));
+    fn jfr_emit_java_event(
+        &mut self,
+        event_name: &str,
+        fields: &[(String, String, Value)],
+        start_ns: u64,
+        duration_ns: u64,
+    ) {
+        // Resolve the payload BEFORE taking the recorder lock: reading a
+        // `String` field's characters goes back through `self`, and the
+        // recorder guard would still be held.
+        let mut declared: Vec<cratonvm_jfr::EventField> = Vec::with_capacity(fields.len());
+        let mut values = cratonvm_jfr::EventFields::new();
+        for (name, descriptor, value) in fields {
+            // The descriptor decides the JFR field type; `Value` alone cannot
+            // (CratonVM represents boolean/byte/char/short/int all as
+            // `Value::Int`). A descriptor with no JFR counterpart — any
+            // reference type other than `String`, or an array — is dropped
+            // from BOTH the declaration and the payload, so the two stay the
+            // same length and the event still carries every field the format
+            // can describe.
+            let (type_name, encoded) = match descriptor.as_str() {
+                "Z" => (
+                    "boolean",
+                    cratonvm_jfr::EventValue::Boolean(value.as_int().unwrap_or(0) != 0),
+                ),
+                "B" | "C" | "S" | "I" => (
+                    "int",
+                    cratonvm_jfr::EventValue::Int(value.as_int().unwrap_or(0)),
+                ),
+                "J" => (
+                    "long",
+                    cratonvm_jfr::EventValue::Long(match value {
+                        Value::Long(v) => *v,
+                        other => other.as_int().unwrap_or(0) as i64,
+                    }),
+                ),
+                "F" => (
+                    "float",
+                    cratonvm_jfr::EventValue::Float(match value {
+                        Value::Float(v) => *v,
+                        _ => 0.0,
+                    }),
+                ),
+                "D" => (
+                    "double",
+                    cratonvm_jfr::EventValue::Double(match value {
+                        Value::Double(v) => *v,
+                        _ => 0.0,
+                    }),
+                ),
+                "Ljava/lang/String;" => (
+                    "string",
+                    match value {
+                        Value::Object(Some(text)) => match self.read_string(*text) {
+                            Some(text) => cratonvm_jfr::EventValue::String(text.into()),
+                            None => cratonvm_jfr::EventValue::Null,
+                        },
+                        _ => cratonvm_jfr::EventValue::Null,
+                    },
+                ),
+                _ => continue,
+            };
+            declared.push(cratonvm_jfr::EventField::new(name, type_name, ""));
+            values.push(encoded);
+        }
+
+        let thread_id = self.thread.thread_id.0;
         let mut recorder = self.shared.debug.flight_recorder.lock();
+        // `register` is keyed by name and returns the existing id for a name it
+        // already knows, so the first commit of an event name fixes its field
+        // list for the rest of the process — which is what the chunk writer
+        // needs, since one metadata declaration has to describe every instance.
         let type_id = recorder.type_registry.register(cratonvm_jfr::EventType {
             id: cratonvm_jfr::EventTypeId::INVALID,
-            name: event_name,
+            name: event_name.to_owned(),
             category: vec!["Java Application".to_owned()],
             description: "Event committed through the real-JDK jdk.jfr.Event bridge".to_owned(),
-            fields: Vec::new(),
+            fields: declared,
             has_thread: true,
             has_stacktrace: false,
             period: cratonvm_jfr::EventPeriod::BeginEnd,
@@ -15464,12 +15555,27 @@ impl<'a> NativeSystemAccess for NativeContextImpl<'a> {
         if type_id.is_invalid() {
             return;
         }
+        // A later commit of the same event name whose field count disagrees
+        // with the registered declaration would be dropped by the writer; log
+        // it here where the name is still in hand instead of leaving the drop
+        // unexplained at dump time.
+        if let Some(registered) = recorder.type_registry.get(type_id) {
+            if registered.fields.len() != values.len() {
+                tracing::debug!(
+                    event = %event_name,
+                    declared = registered.fields.len(),
+                    committed = values.len(),
+                    "jdk.jfr.Event commit disagrees with the field list registered for this \
+                     event name; the event will be dropped from a dump"
+                );
+            }
+        }
         recorder.record_event(cratonvm_jfr::EventInstance {
             type_id,
             start_time: start_ns,
             end_time: start_ns.saturating_add(duration_ns),
-            thread_id: self.thread.thread_id.0,
-            fields: cratonvm_jfr::EventFields::new(),
+            thread_id,
+            fields: values,
         });
     }
 
@@ -15486,15 +15592,13 @@ impl<'a> NativeSystemAccess for NativeContextImpl<'a> {
             .debug
             .jfr_java_recording_running
             .store(false, std::sync::atomic::Ordering::Release);
-        if let Err(error) = self
-            .shared
-            .debug
-            .flight_recorder
-            .lock()
-            .dump_recording(id, std::path::Path::new(path))
-        {
+        let mut recorder = self.shared.debug.flight_recorder.lock();
+        if let Err(error) = recorder.dump_recording(id, std::path::Path::new(path)) {
             tracing::warn!(path = %path, %error, "failed to dump Java JFR recording");
         }
+        // The id was `take`n above, so nothing can reach this recording again;
+        // drop it rather than leaving its event ring alive for the process.
+        recorder.discard_recording(id);
     }
 
     fn emit_virtual_thread_pinned_jfr(&mut self, reason: &'static str) {

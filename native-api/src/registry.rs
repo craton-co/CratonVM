@@ -4193,8 +4193,29 @@ pub trait NativeSystemAccess: NativeThreadAccess {
         false
     }
 
-    /// Record one Java jdk.jfr.Event.commit() through the VM recorder.
-    fn jfr_emit_java_event(&mut self, _event_class: &str, _start_ns: u64, _duration_ns: u64) {}
+    /// Record one Java `jdk.jfr.Event.commit()` through the VM recorder.
+    ///
+    /// `event_name` is the **JFR event name** — the `@Name` value when the
+    /// event class carries one, else its binary class name — not the internal
+    /// class name. That is what a consumer sees from
+    /// `RecordedEvent.getEventType().getName()` and what
+    /// `RecordingStream.onEvent(String, …)` matches on, so the name has to be
+    /// canonicalised on the way in rather than decorated here.
+    ///
+    /// `fields` carries `(field name, JVM field descriptor, current value)` in
+    /// the order the event type declares them. The descriptor is what lets the
+    /// VM register the right JFR field type — `Value::Int` alone cannot
+    /// distinguish a `boolean` from an `int` — and a `String` field arrives as
+    /// its `Value::Object` because only the VM side can read the characters
+    /// out of the heap.
+    fn jfr_emit_java_event(
+        &mut self,
+        _event_name: &str,
+        _fields: &[(String, String, Value)],
+        _start_ns: u64,
+        _duration_ns: u64,
+    ) {
+    }
 
     /// Remember the output requested by the JDK recorder so stopping it can
     /// flush the VM recording to the same path.

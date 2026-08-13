@@ -21,7 +21,8 @@
 use std::sync::Arc;
 
 use cratonvm_jfr::create_flight_recorder;
-use cratonvm_jfr::dump::{HEADER_SIZE, JFR_MAGIC, JFR_VERSION_MAJOR, JFR_VERSION_MINOR};
+use cratonvm_jfr::dump::JFR_MAGIC;
+use cratonvm_jfr::jdk_chunk::{JDK_HEADER_SIZE, JDK_MAJOR, JDK_MINOR};
 use cratonvm_jfr::event::{EventInstance, EventTypeId, EventValue};
 use cratonvm_jfr::recording::{FlightRecorder, RecordingSettings, RecordingState};
 use cratonvm_jfr::stream::EventStream;
@@ -363,42 +364,53 @@ fn t4_7_2_jfr_recording_dump_produces_valid_file() {
         "first 4 bytes must be JFR magic: FLR\\0"
     );
 
-    // Assertion 4: Version header is 2.0.
+    // Assertion 4: Version header is 2.x, which is the range `ChunkHeader`
+    // accepts.
     let major = u16::from_be_bytes([raw[4], raw[5]]);
     let minor = u16::from_be_bytes([raw[6], raw[7]]);
-    assert_eq!(major, JFR_VERSION_MAJOR, "JFR major version must be 2");
-    // Round-5 JFR Fix 3: minor version is now 1 (delta-encoded timestamps).
+    assert_eq!(major, JDK_MAJOR, "JFR major version must be 2");
     assert_eq!(
-        minor, JFR_VERSION_MINOR,
-        "JFR minor version must match crate constant"
+        minor, JDK_MINOR,
+        "JFR minor version must be what JDK 25 itself writes"
     );
 
-    // Assertion 5: Parse the full header for structural validity.
-    let header = cratonvm_jfr::read_jfr_header(&dump_path)
-        .expect("read_jfr_header must succeed on a valid dump");
-    assert_eq!(header.magic, JFR_MAGIC);
-    assert_eq!(header.major, 2);
-    assert_eq!(header.minor, JFR_VERSION_MINOR);
-    assert_eq!(header.file_size, bytes_written);
-    assert_eq!(header.file_state, 1, "file_state must be COMPLETE (1)");
+    // Assertion 5: the invariants the JDK's own `ChunkHeader` enforces.
+    //
+    // `dump_recording` writes the JDK's chunk format, not CratonVM's internal
+    // one, so these are the constraints that decide whether `RecordingFile`,
+    // `jfr print` and JMC can open the file at all. They are deliberately
+    // spelled out against the raw bytes: reading them back through CratonVM's
+    // own `read_jfr_header` would only prove the two internal halves agree,
+    // which is what let the pre-fix format look valid while being unreadable.
+    let chunk_size = u64::from_be_bytes(raw[8..16].try_into().unwrap());
+    let constant_pool_position = u64::from_be_bytes(raw[16..24].try_into().unwrap());
+    let metadata_position = u64::from_be_bytes(raw[24..32].try_into().unwrap());
+    let ticks_per_second = u64::from_be_bytes(raw[56..64].try_into().unwrap());
     assert_eq!(
-        header.ticks_per_second, 1_000_000_000,
+        chunk_size, bytes_written,
+        "chunkSize must be the file size, or ChunkHeader.isLastChunk() never terminates"
+    );
+    assert_eq!(
+        constant_pool_position, 0,
+        "no checkpoint event is written, and 0 is how the format says there are no constant pools"
+    );
+    assert!(
+        metadata_position >= JDK_HEADER_SIZE && metadata_position < chunk_size,
+        "metadataPosition {metadata_position} must point inside the chunk after the header"
+    );
+    assert_ne!(
+        metadata_position, 0,
+        "a zero metadataPosition makes ChunkHeader.refresh reject the chunk as truncated"
+    );
+    assert_eq!(
+        ticks_per_second, 1_000_000_000,
         "ticks_per_second must be 1e9 (nanoseconds)"
     );
-
-    // Structural: checkpoint is after the header, metadata is after checkpoint.
-    assert!(
-        header.checkpoint_offset >= HEADER_SIZE,
-        "checkpoint must be at or after header end"
+    assert_eq!(
+        raw[64], 0,
+        "file state 0 means FINISHED in ChunkHeader.refresh — the inverse of the internal format's 1"
     );
-    assert!(
-        header.metadata_offset > header.checkpoint_offset,
-        "metadata must come after checkpoint"
-    );
-    assert!(
-        header.metadata_offset < header.file_size,
-        "metadata offset must be within file bounds"
-    );
+    assert_eq!(raw[67] & 2, 2, "the final-chunk flag bit must be set");
 
     // Cleanup.
     let _ = std::fs::remove_file(&dump_path);
@@ -426,11 +438,24 @@ fn t4_7_2_jfr_dump_empty_recording_produces_valid_file() {
         "even an empty dump must produce a non-zero file"
     );
 
-    let header = cratonvm_jfr::read_jfr_header(&dump_path).expect("header must be valid");
-    assert_eq!(header.magic, JFR_MAGIC);
-    assert_eq!(header.major, 2);
-    assert_eq!(header.minor, JFR_VERSION_MINOR);
-    assert_eq!(header.file_state, 1);
+    // An EMPTY recording is the case that localised the original defect: it
+    // was already unreadable before any event writer ran, so the framing was
+    // wrong in the chunk header and metadata event rather than in the payload.
+    // It must still produce a chunk the JDK accepts.
+    let raw = std::fs::read(&dump_path).expect("must be able to read the empty dump");
+    assert_eq!(&raw[0..4], &JFR_MAGIC);
+    assert_eq!(u16::from_be_bytes([raw[4], raw[5]]), JDK_MAJOR);
+    assert_eq!(u16::from_be_bytes([raw[6], raw[7]]), JDK_MINOR);
+    assert_eq!(
+        u64::from_be_bytes(raw[8..16].try_into().unwrap()),
+        bytes_written
+    );
+    assert_eq!(
+        u64::from_be_bytes(raw[24..32].try_into().unwrap()),
+        JDK_HEADER_SIZE,
+        "with no events the metadata event follows the header directly"
+    );
+    assert_eq!(raw[64], 0, "file state 0 means FINISHED");
 
     let _ = std::fs::remove_file(&dump_path);
     let _ = std::fs::remove_dir(&dir);
