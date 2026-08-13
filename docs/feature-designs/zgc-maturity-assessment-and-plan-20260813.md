@@ -65,37 +65,42 @@ The machinery is not missing — it is *unadopted*. Counting symbol uses of each
 | `adapters` | **0** | no |
 
 Six of twelve, and the six that are missing are exactly the moving,
-generational and concurrent halves.
+generational and concurrent halves. *(That count was true when this was
+written; it is now twelve of twelve — see the re-count immediately below.)*
 
-> **Re-counted 2026-08-13, after Phases 3 and 4: eight of twelve.** Same
+> **Re-counted 2026-08-13, after Phases 3 and 4: TWELVE of twelve.** Same
 > method, same command, `zgc.rs` outside its `mod tests`:
 >
-> | submodule | uses, 08-13 morning | uses, after this work |
-> |---|---:|---:|
-> | `census` | 24 | 25 |
-> | `mark` | 16 | 25 |
-> | `tlab` | 11 | 13 |
-> | `vaddr` | 9 | 8 |
-> | `forwarding` | **0** | **7** |
-> | `barrier` | **0** | **6** |
-> | `page` | 2 | 2 |
-> | `metrics` | 1 | 1 |
-> | `generation` | 0 | **0** |
-> | `relocate` | 0 | **0** |
-> | `remembered` | 0 | **0** |
-> | `adapters` | 0 | **0** |
+> | submodule | uses, 08-13 morning | uses now | what adopted it |
+> |---|---:|---:|---|
+> | `census` | 24 | 26 | slot enumeration for the compaction rewrite pass |
+> | `mark` | 16 | 25 | parallel STW marking; `ZMarkContext`; the ingress |
+> | `tlab` | 11 | 13 | unchanged |
+> | `vaddr` | 9 | 8 | unchanged (`ZColor`, the good mask) |
+> | `page` | 2 | 8 | `ZPageReal::view` -- a logical grid over the arena |
+> | `metrics` | 1 | 1 | unchanged |
+> | `forwarding` | **0** | 5 | the relocation-set selector picks what moves |
+> | `barrier` | **0** | 6 | `ZBarrierContext`, drivable but on no read path |
+> | `generation` | **0** | 6 | page ages, promotion policy, young scope |
+> | `remembered` | **0** | 2 | the card barrier on `write_barrier` |
+> | `relocate` | **0** | 2 | `ZRelocationRecord` is compaction's from->to ledger |
+> | `adapters` | **0** | 2 | the one `ZPageReal -> PageCandidate` conversion |
 >
-> `forwarding` is adopted for its **relocation-set selector**, which now
-> decides what compaction moves; `barrier` for its `ZBarrierContext`, which is
-> drivable but on no read path. The four still at zero are the honest remainder
-> and each is blocked on the same thing: **`zgc::page`'s allocator**.
-> `relocate`'s machinery is the *concurrent* evacuator and wants real pages to
-> evacuate; `generation` and `remembered` want pages to age and to record
-> cross-generational edges between. Replacing `Arena` with the page allocator
-> is a rewrite of the allocation path, not an increment, and it is the single
-> next thing that unblocks all four. The logical-page grid this work imposed
-> over the arena (`Z_LOGICAL_PAGE_BYTES`) is deliberately an *accounting* view
-> only — enough for the selector, not a substitute for the allocator.
+> **What twelve-of-twelve does and does not mean.** It means every submodule
+> now has a production consumer, and that the four that were dead code are
+> exercised by tests against a real heap. It does **not** mean the collector is
+> concurrent, generational or compacting *by default*: compaction and parallel
+> marking are opt-in switches, the barrier is on no read path, and the
+> generational split is accounting over a logical grid rather than a real
+> page-allocated young space.
+>
+> The unlock was noticing that most of these modules are keyed by **page id,
+> live bytes and extent** — not by a page *allocator*. `ZPageReal::view` gives
+> them all three over the existing `Arena`, which is why `page`, `generation`,
+> `remembered`, `forwarding` and `adapters` came in together. Replacing `Arena`
+> with `ZPageAllocator` is still the honest next step, and it is now an
+> *optimisation and a concurrency enabler* rather than a precondition for
+> anything being adopted at all.
 
 Three specific facts make this concrete:
 
