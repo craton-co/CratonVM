@@ -21,7 +21,7 @@ but was instance of:
 
 HotSpot JDK 25 runs it (`ok=127`); CratonVM reports `ok=126 aborted=1`. Same
 shape, smaller, as the `AlignedPooledByteBufAllocatorTest` divergence in
-[unsafe-memory-access-property-flips-netty-to-unsafe-paths](unsafe-memory-access-property-flips-netty-to-unsafe-paths-20260812.md)
+unsafe-memory-access-property-flips-netty-to-unsafe-paths (retired: `unsafe-memory-access-property-flips-netty-to-unsafe-paths-20260812`)
 — a `Assumptions.assumeTrue`/`assertThat(...).isInstanceOf(...)` guard whose
 answer differs, so a different *set* of tests runs on each VM.
 

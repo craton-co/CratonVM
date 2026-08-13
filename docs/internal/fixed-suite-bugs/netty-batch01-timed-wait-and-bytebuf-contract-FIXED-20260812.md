@@ -248,9 +248,9 @@ Not defects introduced or missed here — filed separately:
 * `AlignedPooledByteBufAllocatorTest` runs 28 tests HotSpot skips, because
   CratonVM pins `sun.misc.unsafe.memory.access=allow` and netty therefore keeps
   `hasUnsafe() == true` where HotSpot 25 turns it off →
-  `known-issues/netty/unsafe-memory-access-property-flips-netty-to-unsafe-paths-20260812.md`,
+  the retired `unsafe-memory-access-property-flips-netty-to-unsafe-paths-20260812` write-up,
   and the reason that pin cannot just be dropped,
-  `known-issues/netty/memorysegment-asbytebuffer-unimplemented-20260812.md`.
+  the retired `memorysegment-asbytebuffer-unimplemented-20260812` write-up.
 * `CyclicBarrier`'s barrier-action `Runnable` is silently dropped → FIXED the
   same day, with two further defects in the same native (no generation, and a
   registration gate on the flag rather than the mode) →

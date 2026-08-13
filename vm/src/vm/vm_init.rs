@@ -3269,24 +3269,34 @@ impl SharedVm {
         // our ReentrantLock native when nested inside deep I/O call chains.
         sys_props.insert("jdk.io.useMonitors".to_string(), "true".to_string());
 
-        // JEP 498 — `sun.misc.Unsafe` memory-access methods (getObject,
-        // putOrderedLong, …) call `Unsafe.beforeMemoryAccess()` on entry.
-        // Under the JDK 25 default (`warn`) the *first* call drops into
-        // `beforeMemoryAccessSlow()`, which runs a `StackWalker.walk()` and
-        // unconditionally dereferences `frames.get(1)` to name the caller.
-        // CratonVM's StackWalker can return fewer than two frames for some
-        // native/JIT-spliced call chains, so `List.get(1)` throws
-        // ArrayIndexOutOfBoundsException — surfacing in jctools'
-        // MpscUnboundedArrayQueue (Netty's per-NioEventLoop task queue) as
-        // "failed to create a child event loop". Setting the documented
-        // escape-hatch property to `allow` makes `beforeMemoryAccess()`
-        // return at its first check (`MEMORY_ACCESS_OPTION == ALLOW`),
-        // bypassing the warning machinery entirely — exactly what a real
-        // JVM does when run with `-Dsun.misc.unsafe.memory.access=allow`.
-        sys_props.insert(
-            "sun.misc.unsafe.memory.access".to_string(),
-            "allow".to_string(),
-        );
+        // NOT seeded here: `sun.misc.unsafe.memory.access`.
+        //
+        // It used to be pinned to `allow` unconditionally, as a workaround for
+        // JEP 498: under the JDK 25 default (`warn`) the first legacy
+        // `sun.misc.Unsafe` memory access drops into
+        // `Unsafe.beforeMemoryAccessSlow()`, which walks the stack and
+        // dereferences `frames.get(1)`; CratonVM's StackWalker was reported to
+        // return fewer than two frames for some native/JIT-spliced chains, and
+        // that surfaced in jctools' `MpscUnboundedArrayQueue` (netty's
+        // per-`NioEventLoop` task queue) as "failed to create a child event
+        // loop". Pinning `allow` makes `beforeMemoryAccess()` return at its
+        // first check and bypasses the warning machinery.
+        //
+        // The cost was much larger than the fix. HotSpot sets this property
+        // ONLY for `--sun-misc-unsafe-memory-access=<mode>`; a default JDK 25
+        // run leaves it unset. netty 4.2 keys its entire Unsafe-vs-FFM
+        // decision on exactly that (`PlatformDependent0.explicitNoUnsafeCause0`
+        // disables Unsafe on Java 25+ unless the property is set), so pinning
+        // it put netty — and every other Unsafe-aware library — on a different
+        // code path than a stock JDK 25 run, and made every "CratonVM vs
+        // HotSpot" netty comparison a comparison of two different code paths.
+        //
+        // The property is now the user's to set: `vm-cli` rewrites
+        // `--sun-misc-unsafe-memory-access=<mode>` to the `-D` form and nothing
+        // else writes it, so a default run answers `null` exactly as HotSpot
+        // does. The `sun/misc/Unsafe` post-clinit repair in `vm_util.rs` reads
+        // the same property and falls back to `WARN` — the JDK's own default —
+        // rather than to a forced `ALLOW`.
 
         // Allow dynamic agents to attach to *this* running VM in-process.
         // Tools that ship as a `java.lang.instrument` agent but are launched

@@ -131,7 +131,7 @@ The two arms do not do the same work:
 most of the work rather than doing it faster — and it issues *more* native calls
 than arm A while taking a sixth of the time. The arm is a fine
 `MemorySegment` reproducer (see
-[memorysegment-asbytebuffer-unimplemented](memorysegment-asbytebuffer-unimplemented-20260812.md))
+memorysegment-asbytebuffer-unimplemented (retired: `memorysegment-asbytebuffer-unimplemented-20260812`))
 and worthless as a throughput instrument.
 
 ### 3.3 My own first hypothesis — also refuted, by its own flag

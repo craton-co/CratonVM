@@ -13,9 +13,9 @@ These change how every page on this list should be read, not just batch 01:
   `PlatformDependent.hasUnsafe()` is `true` on CratonVM and `false` on HotSpot
   JDK 25 — CratonVM takes the `sun.misc.Unsafe` fast paths, HotSpot takes the
   `ByteBuffer`/FFM safe paths. See
-  [unsafe-memory-access-property-flips-netty-to-unsafe-paths](unsafe-memory-access-property-flips-netty-to-unsafe-paths-20260812.md)
+  unsafe-memory-access-property-flips-netty-to-unsafe-paths (retired: `unsafe-memory-access-property-flips-netty-to-unsafe-paths-20260812`)
   and the reason it cannot simply be turned off,
-  [memorysegment-asbytebuffer-unimplemented](memorysegment-asbytebuffer-unimplemented-20260812.md).
+  memorysegment-asbytebuffer-unimplemented (retired: `memorysegment-asbytebuffer-unimplemented-20260812`).
 * **`NativeImageHandlerMetadataTest` fails on HotSpot too — in every module.**
   Six of them across batches 04/05/06 (`channel`, `handler`, `handler.codec`,
   `dns`, `haproxy`, `http`), all `collectAndCompareMetadata()`, all 0/1 on stock
