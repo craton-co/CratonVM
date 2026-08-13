@@ -5,7 +5,7 @@
 `CRATONVM_NO_JIT_PRECISE_HANDLER_FRAMES`). Four defects were behind the
 corruption that forced it off on 2026-07-27; a fifth, unrelated to the gate, was
 found on the way. All five are fixed, with a deterministic regression fixture
-(`vm/tests/resources/cratonvm/JitPreciseHandlerFrame.java`) that reproduced
+(`../../../vm/tests/resources/cratonvm/JitPreciseHandlerFrame.java`) that reproduced
 every one of them.
 
 Retained because two earlier readings of this symptom were **wrong** and someone
@@ -14,7 +14,7 @@ and it is not "the corruption needs a moving young generation".
 
 ## What the relaxation is
 
-`try_compile_inner` (`jit/src/lib.rs`) refuses to compile a method whose
+`try_compile_inner` (`../../../jit/src/lib.rs`) refuses to compile a method whose
 exception handler — or code reachable from it — reads a local beyond the
 incoming parameters, because `route_jit_exception_through_method` can only
 rebuild a handler frame from `this` + declared params. `83e078aa5` relaxed that:
@@ -50,7 +50,7 @@ Protected range [8,14), the only invoke at pc 11.
 
 ### 1. The rbp-chain walk used an unvalidated parent link — the actual crash
 
-`remap_active_jit_frames` (`vm/src/jit/conservative_roots.rs`) walks the JIT
+`remap_active_jit_frames` (`../../../vm/src/jit/conservative_roots.rs`) walks the JIT
 saved-RBP chain after a moving collection and remaps each ancestor frame's oop
 slots. It read `parent_rbp` out of the stack and passed it straight to
 `remap_one_jit_frame`, which dereferences `[parent_rbp - sp_id_slot_off]` and
@@ -163,7 +163,7 @@ typed handlers still match by class.
 
 ## Regression fixture
 
-`vm/tests/resources/cratonvm/JitPreciseHandlerFrame.java`, three shapes, each
+`../../../vm/tests/resources/cratonvm/JitPreciseHandlerFrame.java`, three shapes, each
 returning a mismatch count that must be 0 (counts, not checksums, so a
 duplicated loop iteration from an OSR bail re-checks instead of corrupting an
 expected value). Measured with `cratonvm.Drive`:
@@ -187,7 +187,7 @@ compiled it with no precise-frame codegen at all still crashed, which is what
 settled it. (Those investigation knobs were not kept; rebuild them from the
 table above if the question ever comes back.)
 
-**"The corruption needs a MOVING young generation."** `types/src/flags.rs` sets
+**"The corruption needs a MOVING young generation."** `../../../types/src/flags.rs` sets
 `DEFAULT_MOVING_YOUNG = false` and parses `CRATONVM_MOVING_YOUNG` with
 `present()`, which never reads the value — so the `CRATONVM_MOVING_YOUNG=0` arm
 that produced that conclusion was running the compacting collector, not the

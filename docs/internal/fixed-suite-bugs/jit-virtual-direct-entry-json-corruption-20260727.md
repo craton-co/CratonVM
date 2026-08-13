@@ -38,7 +38,7 @@ Two independent defects, either of which closes the symptom on its own:
 
 ## Two corrections to the original analysis
 
-**"It needs a MOVING young generation" is backwards.** `types/src/flags.rs` sets
+**"It needs a MOVING young generation" is backwards.** `../../../types/src/flags.rs` sets
 `DEFAULT_MOVING_YOUNG = false` and parses `CRATONVM_MOVING_YOUNG` by
 `present()`, never reading the value — so `CRATONVM_MOVING_YOUNG=0` turns the
 compacting young generation **ON**, and the opt-out is

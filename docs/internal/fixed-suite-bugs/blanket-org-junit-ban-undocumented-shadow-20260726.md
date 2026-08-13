@@ -46,7 +46,7 @@ built around that contract — near its end,
 `if buf.overflowed() { return None }` discards the artifact and the caller falls
 back to the single-pass backend.
 
-Thirteen rel32 patch sites in `jit/src/ir_lower.rs` used
+Thirteen rel32 patch sites in `../../../jit/src/ir_lower.rs` used
 `.expect("… patch in-bounds")`. Once the buffer overflowed, recorded patch
 offsets no longer addressed their placeholder bytes, `try_patch_i32` returned
 `Err` as documented — and the `expect` panicked the compile thread before
@@ -56,7 +56,7 @@ process**.
 
 This was a missed conversion, not a design question:
 
-- `jit/src/x64.rs` has always used `.ok()` at every equivalent site
+- `../../../jit/src/x64.rs` has always used `.ok()` at every equivalent site
   (`// on Err try_patch_i32 set buf.overflowed; compile bails`).
 - `ir_lower.rs`'s own `patch_rel32_to_here` already documents the rule:
   *"an `expect` here would turn a recoverable 'fall back to single-pass' into a
@@ -83,7 +83,7 @@ single-pass instead of aborting the process.
 What this session contributes on top, and what remains in the tree:
 
 - The **regression witness**, `no_patch_site_panics_on_an_overflowed_buffer` in
-  `jit/src/ir_lower.rs`'s test module: asserts that NO patch site in the file
+  `../../../jit/src/ir_lower.rs`'s test module: asserts that NO patch site in the file
   uses `expect`/`unwrap`. It passes against the `patch_or_bail` form and would
   catch a future site reintroducing the abort in either style. A behavioural
   test cannot reach these emitters without a graph large enough to overflow
