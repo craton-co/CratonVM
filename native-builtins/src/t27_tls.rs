@@ -2960,6 +2960,31 @@ impl ResolvesClientCert for JavaKeyManagerResolver {
     }
 }
 
+/// The JSSE name for a negotiated rustls `CipherSuite`.
+///
+/// The inverse of [`java_cipher_name_to_suite`], and it has to exist: rustls's
+/// `Debug` spelling of a TLS 1.3 suite carries a `13` infix
+/// (`TLS13_AES_128_GCM_SHA256`) that JSSE's name does not
+/// (`TLS_AES_128_GCM_SHA256`), and eight call sites were reporting the `Debug`
+/// string verbatim as `SSLSession.getCipherSuite()`. netty's
+/// `SSLEngineTest.testGetCiphersuite` compares it against the name it asked for
+/// and got `expected: <TLS_AES_128_GCM_SHA256> but was:
+/// <TLS13_AES_128_GCM_SHA256>`; `assertArrayContains` failed the same way.
+///
+/// Only the TLS 1.3 triple differs — every TLS 1.2 suite rustls names is
+/// already spelled the JSSE way — so this is an explicit list rather than a
+/// blind `replace("TLS13_", "TLS_")`, which would also rewrite a future suite
+/// whose real name happens to contain that text.
+fn suite_to_java_cipher_name(suite: rustls::CipherSuite) -> String {
+    use rustls::CipherSuite::*;
+    match suite {
+        TLS13_AES_128_GCM_SHA256 => "TLS_AES_128_GCM_SHA256".to_string(),
+        TLS13_AES_256_GCM_SHA384 => "TLS_AES_256_GCM_SHA384".to_string(),
+        TLS13_CHACHA20_POLY1305_SHA256 => "TLS_CHACHA20_POLY1305_SHA256".to_string(),
+        other => format!("{other:?}"),
+    }
+}
+
 /// Map a Java `SSLEngine.setEnabledCipherSuites` name to the matching rustls
 /// `CipherSuite`. Only covers the suites this module ever advertises via
 /// `getSupportedCipherSuites`/`getEnabledCipherSuites` (see the two identical
@@ -3555,7 +3580,7 @@ pub(crate) fn rustls_client_connect(
     let negotiated_cipher = stream
         .conn
         .negotiated_cipher_suite()
-        .map(|cs| format!("{:?}", cs.suite()))
+        .map(|cs| suite_to_java_cipher_name(cs.suite()))
         .unwrap_or_else(|| "UNKNOWN".to_string());
     let negotiated_alpn = stream
         .conn
@@ -3719,7 +3744,7 @@ pub(crate) fn rustls_server_accept(listener_id: i32) -> Result<i32, String> {
                 let cipher = stream
                     .conn
                     .negotiated_cipher_suite()
-                    .map(|cs| format!("{:?}", cs.suite()))
+                    .map(|cs| suite_to_java_cipher_name(cs.suite()))
                     .unwrap_or_else(|| "UNKNOWN".to_string());
                 let alpn = stream
                     .conn
@@ -3902,7 +3927,7 @@ pub(crate) fn rustls_server_handshake_over_stream(
     let negotiated_cipher = stream
         .conn
         .negotiated_cipher_suite()
-        .map(|cs| format!("{:?}", cs.suite()))
+        .map(|cs| suite_to_java_cipher_name(cs.suite()))
         .unwrap_or_else(|| "UNKNOWN".to_string());
     let negotiated_alpn = stream
         .conn
@@ -3977,7 +4002,7 @@ pub(crate) fn rustls_client_handshake_over_stream(
     let negotiated_cipher = stream
         .conn
         .negotiated_cipher_suite()
-        .map(|cs| format!("{:?}", cs.suite()))
+        .map(|cs| suite_to_java_cipher_name(cs.suite()))
         .unwrap_or_else(|| "UNKNOWN".to_string());
     let negotiated_alpn = stream
         .conn
@@ -5361,9 +5386,10 @@ fn register_sslserversocket(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let this = obj_arg(args, 0)?;
             let mut list: Vec<String> = Vec::new();
+            let mut given = 0usize;
             if let Some(Value::Object(Some(arr))) = args.get(1) {
-                let len = ctx.array_length(*arr);
-                for i in 0..len {
+                given = ctx.array_length(*arr);
+                for i in 0..given {
                     if let Value::Object(Some(s)) = ctx.get_array_element(*arr, i) {
                         if let Some(t) = ctx.read_string(s) {
                             list.push(t);
@@ -5371,7 +5397,8 @@ fn register_sslserversocket(r: &mut NativeMethodRegistry) {
                     }
                 }
             }
-            if list.is_empty() {
+            // Same rule as the `SSLEngineImpl` setter — see its comment.
+            if list.is_empty() && given > 0 {
                 list = vec!["TLSv1.3".to_string(), "TLSv1.2".to_string()];
             }
             stash_sss_enabled_protocols(ctx, this, list);
@@ -6199,7 +6226,7 @@ pub(crate) fn run_loopback_self_test(
     let cipher = stream
         .conn
         .negotiated_cipher_suite()
-        .map(|cs| format!("{:?}", cs.suite()))
+        .map(|cs| suite_to_java_cipher_name(cs.suite()))
         .unwrap_or_else(|| "?".into());
     let alpn = stream
         .conn
@@ -9638,7 +9665,7 @@ fn engine_take_pending_trust_check(id: i32, state: &mut EngineState) -> Option<P
         .conn
         .as_ref()
         .and_then(|c| c.negotiated_cipher_suite())
-        .map(|cs| format!("{:?}", cs.suite()));
+        .map(|cs| suite_to_java_cipher_name(cs.suite()));
     Some(PendingTrustCheck {
         engine_id: id,
         is_client: state.is_client,
@@ -10390,6 +10417,75 @@ pub fn engine_negotiated_alpn_internal(engine_id: i32) -> Option<String> {
 
 /// Build a synthetic `SSLSession` reflecting `id`'s negotiated (or, before/
 /// outside a handshake, best-effort default) cipher/protocol/ALPN state.
+/// The `SSLSession` object this engine is currently presenting, keyed by
+/// `engine_objref_key` and by handshake epoch (`false` = the pre-handshake
+/// session, `true` = the negotiated one).
+///
+/// `getSession()` used to build a FRESH synthetic session on every call, which
+/// breaks the identity every stateful part of the API depends on:
+/// `putValue`/`getValue` landed on different objects, so an attribute never
+/// read back; `invalidate()` marked an object the next `isValid()` never saw;
+/// and `getCreationTime()` moved every time it was asked. netty's
+/// `SSLEngineTest.testSessionAfterHandshake0` is the direct witness — 48 of
+/// this class's failures, `expected: <true> but was: <null>` from
+/// `assertEquals(Boolean.TRUE, engine.getSession().getValue(key))`.
+///
+/// Two epochs rather than one, because JSSE genuinely replaces the session at
+/// handshake completion and the same test asserts it: values put on the
+/// pre-handshake session must NOT be visible afterwards.
+///
+/// Holds live `ObjectRef`s, so it is scanned and remapped by
+/// `gc_scan_tls_ctx_trust_manager_roots` /
+/// `gc_update_tls_ctx_trust_manager_refs` alongside this module's other
+/// object-holding tables.
+fn engine_session_table() -> &'static Mutex<HashMap<(u64, bool), ObjectRef>> {
+    static T: OnceLock<Mutex<HashMap<(u64, bool), ObjectRef>>> = OnceLock::new();
+    T.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Identity keys of the session objects built in the NEGOTIATED epoch.
+///
+/// Only `engine_session_for` knows which epoch a session belongs to, and the
+/// object itself has no spare slot to record it in (all eight are in use, and
+/// `javax/net/ssl/SSLSession` is a real interface with no fields of its own to
+/// widen into). Keyed by `gc_stable_objref_key` — the same GC-stable identity
+/// `getId` already derives its bytes from.
+fn negotiated_session_keys() -> &'static Mutex<std::collections::HashSet<u64>> {
+    static T: OnceLock<Mutex<std::collections::HashSet<u64>>> = OnceLock::new();
+    T.get_or_init(|| Mutex::new(std::collections::HashSet::new()))
+}
+
+/// Has this session object been through a completed handshake? See
+/// [`negotiated_session_keys`].
+fn session_is_negotiated(ctx: &mut dyn NativeContext, ses: ObjectRef) -> bool {
+    let key = gc_stable_objref_key(ctx, ses);
+    negotiated_session_keys().lock().contains(&key)
+}
+
+/// `getSession()`'s stable answer: the cached session for this engine's current
+/// handshake epoch, built on first use. See [`engine_session_table`].
+fn engine_session_for(
+    ctx: &mut dyn NativeContext,
+    engine: ObjectRef,
+    id: i32,
+) -> Result<ObjectRef, MethodCallFailed> {
+    let handshaked = with_engine(id, |s| {
+        s.conn.as_ref().map(|c| !c.is_handshaking()).unwrap_or(false)
+    })
+    .unwrap_or(false);
+    let key = (engine_objref_key(ctx, engine), handshaked);
+    if let Some(existing) = engine_session_table().lock().get(&key).copied() {
+        return Ok(existing);
+    }
+    let ses = build_synthetic_ssl_session(ctx, id)?;
+    if handshaked {
+        let k = gc_stable_objref_key(ctx, ses);
+        negotiated_session_keys().lock().insert(k);
+    }
+    engine_session_table().lock().insert(key, ses);
+    Ok(ses)
+}
+
 /// Shared by `getSession()` and `getHandshakeSession()` — see the latter's
 /// registration for why real JDK's `getHandshakeSession()` cannot be left
 /// un-intercepted on this engine implementation.
@@ -10404,7 +10500,7 @@ fn build_synthetic_ssl_session(ctx: &mut dyn NativeContext, id: i32) -> Result<O
             .conn
             .as_ref()
             .and_then(|c| c.negotiated_cipher_suite())
-            .map(|cs| format!("{:?}", cs.suite()))
+            .map(|cs| suite_to_java_cipher_name(cs.suite()))
             .unwrap_or_else(|| "TLS_AES_256_GCM_SHA384".into());
         let alpn = s.negotiated_alpn.clone().unwrap_or_default();
         (proto.to_string(), cipher, alpn)
@@ -10615,9 +10711,10 @@ fn register_engine_impl_natives(r: &mut NativeMethodRegistry) {
             let this = obj_arg(args, 0)?;
             let id = engine_id_or_alloc(ctx, this);
             let mut list: Vec<String> = Vec::new();
+            let mut given = 0usize;
             if let Some(Value::Object(Some(arr))) = args.get(1) {
-                let len = ctx.array_length(*arr);
-                for i in 0..len {
+                given = ctx.array_length(*arr);
+                for i in 0..given {
                     if let Value::Object(Some(s)) = ctx.get_array_element(*arr, i) {
                         if let Some(t) = ctx.read_string(s) {
                             list.push(t);
@@ -10625,8 +10722,22 @@ fn register_engine_impl_natives(r: &mut NativeMethodRegistry) {
                     }
                 }
             }
-            // Spec: must contain at least one of TLSv1.3 / TLSv1.2.
-            if list.is_empty() {
+            // An EXPLICITLY empty array means "nothing enabled", and JSSE keeps
+            // it: `SSLEngineImpl.setEnabledProtocols` stores
+            // `ProtocolVersion.namesOf(protocols)` verbatim and only rejects
+            // null, so the next `getEnabledProtocols()` answers an empty array
+            // and a handshake attempt fails with "no appropriate protocol".
+            // Substituting the defaults told the caller its disable had been
+            // ignored — netty's
+            // `SSLEngineTest.testEnablingAnAlreadyDisabledSslProtocol` asserts
+            // exactly that round trip (`array lengths differ, expected: <0> but
+            // was: <2>`).
+            //
+            // The defaulting stays for the OTHER way `list` can end up empty —
+            // a non-empty array whose entries this native could not read back —
+            // where falling back to a negotiable pair is a safety net rather
+            // than a contradiction of the caller.
+            if list.is_empty() && given > 0 {
                 list = vec!["TLSv1.3".to_string(), "TLSv1.2".to_string()];
             }
             with_engine(id, |s| {
@@ -10873,9 +10984,7 @@ fn register_engine_impl_natives(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let this = obj_arg(args, 0)?;
             let id = engine_id_or_alloc(ctx, this);
-            Ok(Some(Value::Object(Some(build_synthetic_ssl_session(
-                ctx, id,
-            )?))))
+            Ok(Some(Value::Object(Some(engine_session_for(ctx, this, id)?))))
         },
     );
 
@@ -10926,9 +11035,7 @@ fn register_engine_impl_natives(r: &mut NativeMethodRegistry) {
             if finished {
                 return Ok(Some(Value::Object(None)));
             }
-            Ok(Some(Value::Object(Some(build_synthetic_ssl_session(
-                ctx, id,
-            )?))))
+            Ok(Some(Value::Object(Some(engine_session_for(ctx, this, id)?))))
         },
     );
 
@@ -12283,6 +12390,13 @@ pub fn gc_scan_tls_ctx_trust_manager_roots(roots: &mut Vec<ObjectRef>) {
         }
     }
     drop(matchers);
+    let sessions = engine_session_table().lock();
+    for ses in sessions.values() {
+        if !ses.as_ptr().is_null() {
+            roots.push(*ses);
+        }
+    }
+    drop(sessions);
     if let Some(f) = *huc_default_factory_slot().lock() {
         if !f.as_ptr().is_null() {
             roots.push(f);
@@ -12349,6 +12463,16 @@ pub fn gc_update_tls_ctx_trust_manager_refs(map: &cratonvm_types::PointerMap) {
         }
     }
     drop(matchers);
+    let mut sessions = engine_session_table().lock();
+    for ses in sessions.values_mut() {
+        let old = ses.as_ptr() as usize;
+        if let Some(&new) = map.get(&old) {
+            debug_assert!(new != 0, "GC pointer map contains null address");
+            // SAFETY: as above.
+            *ses = unsafe { ObjectRef::from_raw(new as *mut u8) };
+        }
+    }
+    drop(sessions);
     // Same treatment for the installed default `SSLSocketFactory` — see
     // `huc_default_factory_slot`.
     let mut slot = huc_default_factory_slot().lock();
@@ -12597,6 +12721,60 @@ pub(crate) fn record_client_peer_chain(
         .insert(gc_stable_objref_key(ctx, session), chain_der);
 }
 
+/// Fire `SSLSessionBindingListener.valueBound`/`valueUnbound` for a value that
+/// implements the interface, the way `SSLSessionImpl.putValue`/`removeValue`
+/// do.
+///
+/// JSSE's contract is explicit: "if the object implements
+/// SSLSessionBindingListener, the valueBound method is called". netty's
+/// `SSLEngineTest.assertSSLSessionBindingEventValue` is a listener that
+/// records the event it was handed and asserts on `event.getName()`; with no
+/// callback the recorded event stayed null and the test died on
+/// `NullPointerException: Cannot invoke
+/// "javax.net.ssl.SSLSessionBindingEvent.getName()" because "event" is null`.
+///
+/// A value that is not a listener, or an event that cannot be constructed, is
+/// silently skipped — the attribute store is the primary effect and must not
+/// fail because of a callback.
+fn fire_session_binding(
+    ctx: &mut dyn NativeContext,
+    session: ObjectRef,
+    name: Value,
+    value: Value,
+    bound: bool,
+) {
+    let Value::Object(Some(v)) = value else {
+        return;
+    };
+    let Some(iface) = ctx.class_id_by_name("javax/net/ssl/SSLSessionBindingListener") else {
+        return;
+    };
+    if !ctx.is_subclass(ctx.class_id_of_object(v), iface) {
+        return;
+    }
+    let ses_pin = ctx.pin_native_root(session);
+    let v_pin = ctx.pin_native_root(v);
+    let ses_now = ctx.read_native_pin(ses_pin, session);
+    let event = ctx.new_object_initialized(
+        "javax/net/ssl/SSLSessionBindingEvent",
+        "(Ljavax/net/ssl/SSLSession;Ljava/lang/String;)V",
+        &[Value::Object(Some(ses_now)), name],
+    );
+    if let Ok(Some(Value::Object(Some(ev)))) = event {
+        let ev_pin = ctx.pin_native_root(ev);
+        let v_now = ctx.read_native_pin(v_pin, v);
+        let ev_now = ctx.read_native_pin(ev_pin, ev);
+        let method = if bound { "valueBound" } else { "valueUnbound" };
+        let _ = ctx.invoke_virtual(
+            v_now,
+            method,
+            "(Ljavax/net/ssl/SSLSessionBindingEvent;)V",
+            &[Value::Object(Some(ev_now))],
+        );
+    }
+    ctx.unpin_native_roots(ses_pin);
+}
+
 fn register_ssl_session_real(r: &mut NativeMethodRegistry) {
     let cls = "javax/net/ssl/SSLSession";
 
@@ -12675,6 +12853,18 @@ fn register_ssl_session_real(r: &mut NativeMethodRegistry) {
     // stable 32-byte id derived from the session object's identity.
     r.register(cls, "getId", "()[B", |ctx, args| {
         let this = obj_arg(args, 0)?;
+        // Before anything has been negotiated there is no session id, and JSSE
+        // answers a ZERO-LENGTH array — not a placeholder. netty's
+        // `SSLEngineTest.testSSLSessionId` asserts
+        // `assertEquals(0, engine.getSession().getId().length)` on a
+        // freshly-created engine and got 32. Which epoch a session object
+        // belongs to is recorded by `engine_session_for`, the only place that
+        // knows — see `negotiated_session_keys`.
+        if ctx.object_num_fields(this) >= 7 && !session_is_negotiated(ctx, this) {
+            return Ok(Some(Value::Object(Some(
+                ctx.new_array(cratonvm_types::ArrayElementType::Byte, 0),
+            ))));
+        }
         let seed = gc_stable_objref_key(ctx, this);
         let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, 32);
         // SplitMix64-style fill so the 32 bytes are stable per session and not
@@ -12716,6 +12906,66 @@ fn register_ssl_session_real(r: &mut NativeMethodRegistry) {
             Ok(Some(ctx.get_field(this, slot)))
         },
     );
+
+    // getSessionContext() — the last unregistered method on the interface that
+    // netty's `SSLEngineTest.testSessionAfterHandshake0` reaches, after
+    // `getPeerHost`/`getPeerPort` below let it get that far. It only asserts
+    // the result is non-null. Real JSSE hands back the context the session was
+    // cached in; this VM has no session cache to speak of (see
+    // `net_phase_e`'s `SSLSessionContext` handlers, which answer an empty
+    // enumeration for the same reason), so this is the same zero-field
+    // carrier those handlers already key their cache-tuning side table off.
+    r.register(
+        cls,
+        "getSessionContext",
+        "()Ljavax/net/ssl/SSLSessionContext;",
+        |ctx, _args| {
+            let c = try_alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLSessionContext", 0)?;
+            Ok(Some(Value::Object(Some(c))))
+        },
+    );
+
+    // getPeerHost()/getPeerPort() — slots 3 and 4 of the 7/8-field engine
+    // session, written by `build_synthetic_ssl_session` (null / -1 for an
+    // engine created without a peer hint, which is exactly what JSSE reports
+    // for one). Real-mode registrations were missing entirely, so every call
+    // threw `AbstractMethodError: method javax/net/ssl/SSLSession.getPeerHost()
+    // Ljava/lang/String; has no Code attribute` — 48 of netty's
+    // `JdkSslEngineTest` failures once `testSessionAfterHandshake0` got far
+    // enough to reach them. `tls.rs` has had the synthetic-mode twins since
+    // the start (`register_ssl_session`, slots 3/4); keep the two in step.
+    r.register(cls, "getPeerHost", "()Ljava/lang/String;", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        if ctx.object_num_fields(this) > 3 {
+            Ok(Some(ctx.get_field(this, 3)))
+        } else {
+            Ok(Some(Value::Object(None)))
+        }
+    });
+    r.register(cls, "getPeerPort", "()I", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        if ctx.object_num_fields(this) > 4 {
+            Ok(Some(ctx.get_field(this, 4)))
+        } else {
+            Ok(Some(Value::Int(-1)))
+        }
+    });
+
+    // invalidate() — `SSLSession` is an interface with no body, so leaving it
+    // unregistered in real-JDK mode threw `AbstractMethodError: method
+    // javax/net/ssl/SSLSession.invalidate()V has no Code attribute` (netty's
+    // `SSLEngineTest.testSessionInvalidate`). The synthetic-JDK path already
+    // had this — `tls.rs::register_ssl_session` — and the two must stay in
+    // step; this is the real-mode twin, clearing the same slot its `isValid`
+    // reads. Only meaningful on the 7-field engine session: the 3-field accept
+    // session has no flag slot to clear.
+    r.register(cls, "invalidate", "()V", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        if ctx.object_num_fields(this) >= 7 {
+            ctx.set_field(this, 2, Value::Int(0));
+        }
+        Ok(None)
+    });
 
     // `isValid` flag is slot 2 only on the 7-field engine session; the 3-field
     // accept session has no flag — treat it as valid (it was just negotiated).
@@ -12800,12 +13050,17 @@ fn register_ssl_session_real(r: &mut NativeMethodRegistry) {
                 .into());
             }
             let map = sslsess_attrs_map(ctx, this)?;
-            ctx.invoke(
+            let old = ctx.invoke(
                 "java/util/HashMap",
                 "put",
                 "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
                 &[Value::Object(Some(map)), name, value],
             )?;
+            // JSSE unbinds the value being replaced before binding the new one.
+            if let Some(old @ Value::Object(Some(_))) = old {
+                fire_session_binding(ctx, this, name, old, false);
+            }
+            fire_session_binding(ctx, this, name, value, true);
             Ok(None)
         },
     );
@@ -12817,12 +13072,15 @@ fn register_ssl_session_real(r: &mut NativeMethodRegistry) {
             Value::Object(Some(m)) => m,
             _ => return Ok(None),
         };
-        ctx.invoke(
+        let old = ctx.invoke(
             "java/util/HashMap",
             "remove",
             "(Ljava/lang/Object;)Ljava/lang/Object;",
             &[Value::Object(Some(map)), name],
         )?;
+        if let Some(old @ Value::Object(Some(_))) = old {
+            fire_session_binding(ctx, this, name, old, false);
+        }
         Ok(None)
     });
     r.register(cls, "getValueNames", "()[Ljava/lang/String;", |ctx, args| {

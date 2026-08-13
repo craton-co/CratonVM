@@ -12827,6 +12827,38 @@ pub(crate) fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
         let this = obj_arg(args, 0)?;
         Ok(Some(Value::Int(ssc_get(ctx, this).timeout_secs)))
     });
+    // getIds() / getSession(byte[]) — the two LOOKUP methods on this
+    // interface. They had no registration at all, and `SSLSessionContext` is a
+    // real JDK interface with no bodies, so every call threw
+    // `AbstractMethodError: method javax/net/ssl/SSLSessionContext.getIds()
+    // Ljava/util/Enumeration; has no Code attribute`. That is 36 of netty's
+    // `JdkSslEngineTest` failures on its own (`SSLEngineTest
+    // .currentSessionCacheSize`, which every session-resumption test calls
+    // before it does anything else).
+    //
+    // The answers are honest rather than fabricated: rustls owns the session
+    // cache and exposes no enumeration of it, so this context genuinely knows
+    // of no cached sessions. An EMPTY enumeration and a null lookup are what
+    // the API says that state looks like — which is also what a real JSSE
+    // context answers before anything has been cached. The alternative, an
+    // `AbstractMethodError`, tells the caller nothing and cannot be caught by
+    // code written against this interface.
+    //
+    // If this VM ever grows a real session cache, these two are where it
+    // surfaces; the no-op cache-tuning setters above carry the same caveat.
+    r.register(ssc, "getIds", "()Ljava/util/Enumeration;", |ctx, _args| {
+        // The same object `Collections.emptyEnumeration()` answers, whose two
+        // methods this workspace already implements natively
+        // (`phases_late::collections::register_p63_enumeration`).
+        let e = try_alloc_concurrent_synthetic(ctx, "java/util/Collections$EmptyEnumeration", 0)?;
+        Ok(Some(Value::Object(Some(e))))
+    });
+    r.register(
+        ssc,
+        "getSession",
+        "([B)Ljavax/net/ssl/SSLSession;",
+        |_ctx, _args| Ok(Some(Value::Object(None))),
+    );
 
     let sf = "javax/net/ssl/SSLSocketFactory";
     r.register(
