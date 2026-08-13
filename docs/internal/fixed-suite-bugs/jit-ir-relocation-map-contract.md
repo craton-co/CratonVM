@@ -26,7 +26,7 @@ an absence of objections.
 
 ## Result
 
-`bench/IrEscapeProbe.java`, depth 60, 100 000 iterations, `-Xmx64m`,
+`../../../bench/IrEscapeProbe.java`, depth 60, 100 000 iterations, `-Xmx64m`,
 `CRATONVM_JIT_FORCE_C2=1`. Interleaved, five reps per lane, one binary:
 
 | lane | cycles | coverage_fallbacks | ms |
@@ -709,7 +709,7 @@ refusal for the `optimize=true` case in a single run.
 Then, separately, decide whether finding (2) matters: if the tier-up path is
 meant to request C2 for hot methods and does not, that is a much larger
 throughput question than the relocation contract, and it belongs in the
-tiered-manager work (`docs/feature-designs/wire-tiered-manager.md`), not here.
+tiered-manager work (`../../feature-designs/wire-tiered-manager.md`), not here.
 The relocation contract is ready for whichever methods do reach the IR backend.
 
 ### The post-`ir_compatible` conjuncts, narrowed by inspection
@@ -750,7 +750,7 @@ not here.
 
 ### Resolved by construction: the admission chain PASSES; the pipeline bails inside
 
-Reading the condition to its end (`jit/src/lib.rs`, the `if` closes at the
+Reading the condition to its end (`../../../jit/src/lib.rs`, the `if` closes at the
 `{` before `let num_params = prologue_param_slots;`), the full chain is:
 
 ```

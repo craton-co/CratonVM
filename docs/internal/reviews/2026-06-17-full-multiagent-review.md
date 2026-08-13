@@ -178,7 +178,7 @@ dragged down by `native-collections` (29%), `vm` (58%), `native-builtins`
 ### 3.1 Documentation consistency
 - **G1/ZGC contradiction (most serious):** README + CONTRIBUTING say "experimental zgc-gated stub, NO G1", but `gc/src/g1.rs` is a real `GcAlgorithm` variant with a full implementation, and ZGC is the feature-gated stub. ARCHITECTURE.md/CHANGELOG/code disagree with README/CONTRIBUTING. Fix the README/CONTRIBUTING blurb.
 - `PLATFORMS.md` ARM claim vs the (broken) aarch64 backend — temper claims.
-- `docs/README.md` and `docs/internal/README.md` link to `../ARCHITECTURE.md` etc.; no `ARCHITECTURE.md` exists *under docs/* (it's at repo root) — links resolve, but there's no public/internal index split.
+- `docs/README.md` and `../fixed-suite-bugs/README.md` link to `../ARCHITECTURE.md` etc.; no `ARCHITECTURE.md` exists *under docs/* (it's at repo root) — links resolve, but there's no public/internal index split.
 
 ### 3.2 Job docs to relocate into `docs/internal/`
 These are per-app/per-suite job-tracking artifacts (same class as what's

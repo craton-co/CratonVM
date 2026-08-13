@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | **Status** | **FIXED 2026-07-31.** Root-caused, fixed and measured: 46x -> 1x on a Mockito-free reproducer. Two independent 2026-07-30 re-measurements (Windows after the gate work, and Azure) had already ruled out the 2026-07-26 profile's leading hypothesis; see "Resolution" for what it actually was. |
-| **Correction** | This document also claimed, from 2026-07-26 to 2026-07-31, that this cost was what made Spring's AOT chunk 4 look like a hang. **It was not.** With this fixed and confirmed on the same host, chunk 4 still did not finish. The real cause was a correctness bug two layers down — a redefinition handed six `StringBuilder` operations back to real JDK bodies that index a layout CratonVM's synthetic builder does not have, so javac's tokenizer lexed garbage and its parser looped in error recovery. See ["Why this was believed to present as a hang"](#why-this-was-believed-to-present-as-a-hang) below and [`fixed-suite-bugs/spring/spring-aot-cluster.md`](fixed-suite-bugs/spring/spring-aot-cluster.md). |
+| **Correction** | This document also claimed, from 2026-07-26 to 2026-07-31, that this cost was what made Spring's AOT chunk 4 look like a hang. **It was not.** With this fixed and confirmed on the same host, chunk 4 still did not finish. The real cause was a correctness bug two layers down — a redefinition handed six `StringBuilder` operations back to real JDK bodies that index a layout CratonVM's synthetic builder does not have, so javac's tokenizer lexed garbage and its parser looped in error recovery. See ["Why this was believed to present as a hang"](#why-this-was-believed-to-present-as-a-hang) below and [`spring/spring-aot-cluster.md`](spring/spring-aot-cluster.md). |
 | **Category** | VM-PERFORMANCE (JVMTI redefine / interpreter caching) |
 | **Found** | 2026-07-26, Azure host `20.83.144.174`, dev `7cb040a97`, real JDK 25. |
 | **CratonVM** | ~40,950 ns per `StringBuilder.length()` call after `Mockito.mock(StringBuilder.class)` |
@@ -13,7 +13,7 @@
 
 `fix/deep-audit-retire-20260730` replaced the process-wide
 `any_class_redefined()` quiesce with exact-class / exact-hierarchy checks
-(`vm/src/runtime/redefine_state.rs`), refreshed inherited vtable entries on
+(`../../../vm/src/runtime/redefine_state.rs`), refreshed inherited vtable entries on
 reinstall, and stopped one `mock()` from disabling JIT compilation for the whole
 process. **That did not close this bug.**
 
@@ -81,7 +81,7 @@ and generated code needed no update.
 
 ### Measured
 
-`docs/known-issues/repros/redefine-call-cost`, Windows 11, release build,
+`../../known-issues/repros/redefine-call-cost`, Windows 11, release build,
 JDK 25, redefining with **byte-identical** bytecode so nothing about the class
 changes:
 
@@ -116,14 +116,14 @@ redefinition, and never again afterwards.
 
 ### Reproducer
 
-`docs/known-issues/repros/redefine-call-cost/` — Mockito removed. Mockito was
+`../../known-issues/repros/redefine-call-cost` — Mockito removed. Mockito was
 only ever a way to reach `Instrumentation.redefineClasses`; the cost was the
 VM's. `RedefineCostProbe` measures, `RedefineCorrectnessProbe` guards the fix by
 redefining with a body whose arithmetic differs and asserting the new body is
 observed both interpreted and after re-tiering. That second assertion was
 vacuous while the gates blocked compilation, and is load-bearing now.
 
-Its sibling, [`../known-issues/repros/redefine-builder-layout/`](../known-issues/repros/redefine-builder-layout/),
+Its sibling, [`../../known-issues/repros/redefine-builder-layout`](../known-issues/repros/redefine-builder-layout/),
 covers the *correctness* half of the same story — what a redefinition used to do
 to every real `StringBuilder` in the process. That is the one chunk 4 was
 actually waiting on.
@@ -195,7 +195,7 @@ The process is **spinning, not blocked** — 60 s of CPU per 60 s of wall clock.
 
 ## It is NOT the JIT kill-switch (checked)
 
-`vm/src/runtime/interpreter.rs` computes
+`../../../vm/src/runtime/interpreter.rs` computes
 `redefine_jit_quiesced = crate::classloading::any_class_redefined()` and ORs it
 into the JIT skip condition, so one `mock()` anywhere does permanently disable
 JIT compilation process-wide. That is worth revisiting on its own, but it is
@@ -238,7 +238,7 @@ of running the advice:
 
 - `QuickenedCode::build` **and** `drop_in_place<QuickenedCode>` both hot means
   the quickened bytecode stream is rebuilt and thrown away on every single
-  invocation. `quickened::intern` (`reader/src/quickened.rs`) keys on
+  invocation. `quickened::intern` (`../../../reader/src/quickened.rs`) keys on
   `(code.as_ptr(), code.len())` and holds a strong `Arc<[u8]>` per entry, so a
   hit is impossible only if a **fresh `Arc<[u8]>` is produced per call**.
   `SHARD_CAP` is 8192 x 16 shards, so this is not cache-capacity thrash — that

@@ -1,6 +1,6 @@
 # Constant-valued native surface — open items, CLOSED
 
-**Status: closed 2026-07-29.** Retired from `docs/known-issues/`. Every item in
+**Status: closed 2026-07-29.** Retired from `../../known-issues`. Every item in
 `native-constant-surface-open-items-20260728.md` is implemented, moved onto the
 path where it runs, or resolved as a decision recorded in the code beside the
 thing it governs. Nothing is tracked here any more; this file exists so the

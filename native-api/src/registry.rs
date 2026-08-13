@@ -4234,6 +4234,29 @@ pub trait NativeSystemAccess: NativeThreadAccess {
     ) {
     }
 
+    /// Apply the settings a `jdk.jfr.Recording` carries to the VM recording the
+    /// Java boundary is driving.
+    ///
+    /// `enabled_names` is the set of JFR event names the Java side enabled.
+    /// `None` means "no name filter" — record everything, which is what
+    /// CratonVM's own recordings want. `Some(&[])` means **record nothing**, and
+    /// that distinction is the point: a `new Recording()` with no `enable(...)`
+    /// call records no events on HotSpot, so an empty list cannot be allowed to
+    /// mean "everything".
+    ///
+    /// `thresholds` is `(event name, minimum duration in nanoseconds)`; an event
+    /// shorter than its threshold is dropped.
+    ///
+    /// Both are keyed by NAME because the Java side knows which events are
+    /// enabled before any of them has been committed, and a CratonVM event type
+    /// gets its id at first commit.
+    fn jfr_configure_java_recording(
+        &mut self,
+        _enabled_names: Option<&[String]>,
+        _thresholds: &[(String, u64)],
+    ) {
+    }
+
     /// Remember the output requested by the JDK recorder so stopping it can
     /// flush the VM recording to the same path.
     fn jfr_set_java_output(&mut self, _path: &str) {}

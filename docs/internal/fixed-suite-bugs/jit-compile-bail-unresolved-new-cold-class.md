@@ -3,7 +3,7 @@
 **Status:** FIXED 2026-07-31 (`fix/jit-new-unresolved-cp-20260731`). Was never a
 correctness bug — affected methods stayed interpreted, which is safe but can be
 very slow. Found on 2026-07-27 while re-testing the json-smart JIT ban (since
-retired). Repro: `docs/internal/repros/jit-cold-new-cp-20260731/`.
+retired). Repro: `../repros/jit-cold-new-cp-20260731`.
 
 ## Symptom
 
@@ -24,7 +24,7 @@ gave up permanently):
 ## Cause
 
 Every one of those methods contains `new net/minidev/json/parser/ParseException`
-on an error path. `resolve_jit_new_site` (`vm/src/runtime/interpreter/invoke.rs`)
+on an error path. `resolve_jit_new_site` (`../../../vm/src/runtime/interpreter/invoke.rs`)
 resolves a `new`'s CP index with `find_class_by_name_for_class`, which only sees
 **already-loaded** classes. When no parse ever fails, `ParseException` is never
 loaded, so the resolver returned `None`, `try_compile_inner` bailed the WHOLE
@@ -122,7 +122,7 @@ The two rejected alternatives stay rejected:
 
 ## Verification
 
-`docs/internal/repros/jit-cold-new-cp-20260731/ColdNewJitProbe.java`, 2,000,000
+`../repros/jit-cold-new-cp-20260731/ColdNewJitProbe.java`, 2,000,000
 iterations, release build, Azure Linux host, JDK 25:
 
 | arm | pre-fix | post-fix |
@@ -157,7 +157,7 @@ cores throughout, so treat any sub-10% wall-clock difference here as noise.
   COMPILE half. The same bytecode compiled three ways (resolved /
   deferred+wired / deferred+unwired); the resolved arm is a control, so a shape
   that stops compiling for an unrelated reason cannot make it pass vacuously.
-- `vm/tests/jit_cold_new_cp.rs` — the RUNTIME half, end-to-end against a real
+- `../../../vm/tests/jit_cold_new_cp.rs` — the RUNTIME half, end-to-end against a real
   JDK. A hot `hot(int)` carrying a cold `throw new Cold(...)` and a hot
   `hotArr(int)` carrying a cold `new Elem[3]`. On `origin/dev` BOTH are
   `tier_fail_count=3 compile-failed`; with the fix neither is, and every output
@@ -189,7 +189,7 @@ against a pristine `origin/dev` checkout of the same worktree —
 | `url_classloader_resource_delegation` | ok | ok — the one failing run said "fixture was not compiled", i.e. `build.rs`'s `javac` was absent from a non-interactive `PATH` |
 
 Apache Tomcat, all 645 test classes, one process per class, 6 shards, fix arm
-then baseline arm (`apps/tomcat-suite-runner/run-tomcat-suite.sh`):
+then baseline arm (`../../../apps/tomcat-suite-runner/run-tomcat-suite.sh`):
 
 | | PASS | FAIL | HANG | NOSUMMARY |
 |---|---|---|---|---|
