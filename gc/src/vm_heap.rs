@@ -1764,8 +1764,18 @@ impl VmHeap {
                     h.satb_pre_barrier(obj_ref.as_ptr() as usize);
                 }
             }
+            // Phase 3 (2026-08-13): this arm was `{}`, and that empty body was
+            // the whole of ZGC's missing mutator ingress. Every reference store
+            // in this VM already reaches here for G1's sake, so the barrier
+            // `zgc_concurrent.rs` describes as unwired needed no new call site
+            // — it needed this arm. Inert while no cycle is marking: the ZGC
+            // side is one relaxed load and a return.
             #[cfg(feature = "zgc")]
-            VmHeap::Zgc(_) => {}
+            VmHeap::Zgc(h) => {
+                if let Value::Object(Some(obj_ref)) = old_value {
+                    h.satb_pre_barrier(obj_ref.as_ptr() as usize);
+                }
+            }
         }
     }
 
@@ -3195,6 +3205,58 @@ mod concurrent_mark_controller_tests {
             VmHeap::G1(s) => Some(s),
             _ => None,
         }
+    }
+
+    /// **The `VmHeap::satb_barrier` ZGC arm actually reaches the collector.**
+    ///
+    /// This is the test that separates a wired barrier from an inert one, and
+    /// it is the only one that can: `ZgcRealHeap`'s own barrier tests call
+    /// `satb_pre_barrier` directly, so every one of them would still pass with
+    /// this arm back to the `{}` it was until 2026-08-13. The dispatch is the
+    /// subject here, not the barrier.
+    ///
+    /// The exact edit that trips it: empty the `VmHeap::Zgc` arm of
+    /// `satb_barrier`.
+    #[cfg(feature = "zgc")]
+    #[test]
+    fn the_vm_heap_satb_arm_reaches_the_zgc_barrier() {
+        let heap = VmHeap::Zgc(crate::zgc::ZgcRealHeap::with_capacity(64 * 1024));
+        let VmHeap::Zgc(z) = &heap else {
+            unreachable!("constructed as Zgc")
+        };
+        let obj = z.alloc_object(ClassId::new(1), 4);
+        z.set_mark_active(true);
+
+        // Through the VM-facing funnel every reference store already calls.
+        heap.satb_barrier(Value::Object(Some(obj)));
+
+        let VmHeap::Zgc(z) = &heap else {
+            unreachable!("constructed as Zgc")
+        };
+        assert_eq!(
+            z.mark_ingress_pushes(),
+            1,
+            "VmHeap::satb_barrier must reach ZgcRealHeap::satb_pre_barrier"
+        );
+    }
+
+    /// ...and the same funnel is inert on ZGC while no cycle is marking, which
+    /// is what makes it free to leave wired in every build.
+    #[cfg(feature = "zgc")]
+    #[test]
+    fn the_vm_heap_satb_arm_is_inert_on_zgc_while_not_marking() {
+        let heap = VmHeap::Zgc(crate::zgc::ZgcRealHeap::with_capacity(64 * 1024));
+        let VmHeap::Zgc(z) = &heap else {
+            unreachable!("constructed as Zgc")
+        };
+        let obj = z.alloc_object(ClassId::new(1), 4);
+
+        heap.satb_barrier(Value::Object(Some(obj)));
+
+        let VmHeap::Zgc(z) = &heap else {
+            unreachable!("constructed as Zgc")
+        };
+        assert_eq!(z.mark_ingress_pushes(), 0);
     }
 
     /// The `-XX:` G1 knobs flow config → `G1ConfigOverrides` →

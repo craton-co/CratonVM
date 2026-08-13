@@ -322,6 +322,74 @@ rather than corrupting the heap.
 **Exit:** `zgc_concurrent`'s coordinator drives a real collection; pause time
 falls measurably on a heap with a large live set; no suite regression.
 
+**Status 2026-08-13: the mutator ingress is built and wired. The exit criterion
+is NOT met — no coordinator drives a real collection.** What follows is what
+was found, because two of this phase's three named blockers turned out not to
+be what the plan described.
+
+**Blocker 1 (`ZMarkContext` for `ZgcRealHeap`) was already gone.**
+`zgc_concurrent.rs`'s module doc still said "**No `ZMarkContext`
+implementation for `ZgcRealHeap` exists**" — it does, in `gc/src/zgc.rs`, and
+it satisfies the requirement list in that same doc, including the atomic
+`try_mark` (through `ObjectHeader::try_add_gc_flags`, a CAS loop). Doc
+corrected.
+
+**Blocker 2 (the mutator barrier) needed one match arm, not three code
+generators.** The plan asked for "a mutator write barrier feeding
+`mark::ZMarkIngress`", and `zgc_concurrent.rs` describes the gap as "nothing
+calls `ZMarkHandle::mark_live_offset` from a `getfield`". Both readings point
+at new emission work across the interpreter, the x64 JIT and the natives.
+Neither is what was actually missing: **`VmHeap::satb_barrier` is already
+called before every reference store in this VM** — interpreter `putfield` and
+`aastore`, the JIT's `aastore` and `putfield` helpers, `deopt_materialize`,
+`vm_init` — because G1 needs it. Its ZGC arm was `{}`.
+
+That arm now reaches `ZgcRealHeap::satb_pre_barrier`, which publishes the
+overwritten reference into the heap's own `ZMarkIngress` when a cycle is armed.
+Cost while nothing is marking: **one relaxed load of a never-written cache
+line**, which is the reason `mark_active` is a separate flag and not an
+`Option` probe or a lock. Six tests, including the one that matters —
+`the_vm_heap_satb_arm_reaches_the_zgc_barrier`, which is the only one that can
+tell a wired barrier from an inert one, since every test that calls
+`satb_pre_barrier` directly would still pass with the arm back to `{}`.
+
+**This substitutes SATB for the load barrier, and that is a real design
+decision, not a shortcut.** Recorded here and at both sites so nobody
+rediscovers it: `zgc_concurrent.rs`'s termination design is built on ZGC's
+*read*-barrier discipline, where every mutator is a producer until stopped and
+"all queues empty" is a fixed point rather than a completion — hence the
+restart loop. Snapshot-at-the-beginning has a **bounded** producer set, so
+`try_end_mark` should reach `Complete` after the mark-end flush rather than
+looping. The restart loop stays correct and stays necessary (the flush can
+still produce work), but a `Restart` under SATB means the flush found buffered
+work, not that a mutator raced the marker. SATB is also *conservative* — an
+object dying mid-cycle survives to the next one — which is a throughput cost
+and not a correctness one, i.e. the right side to be wrong on for a first
+adoption.
+
+**Blocker 3, the real one, is ownership, and the plan does not name it.**
+`ZMarkCoordinator::new` takes an `Arc<dyn ZMarkContext>` and spawns persistent
+worker threads. `ZgcRealHeap` is held **by value** inside `VmHeap`, so there is
+no `Arc` to hand it and no safe way to mint one. Every route to adoption goes
+through this and each has a cost worth stating before one is chosen:
+
+* put the heap in an `Arc` — touches every `VmHeap` arm and every caller;
+* a raw-pointer bridge, with the coordinator constructed and `shutdown()` (which
+  joins) inside one `collect_garbage` call so no worker can outlive `&self` —
+  sound, but pays N thread spawns per collection;
+* a scoped parallel driver reusing `ZMarkStripeSet` + `ZMarkTerminator` (both
+  standalone, neither needs the `Arc`) under `std::thread::scope` — no `unsafe`,
+  but it reimplements `ZMarkWorker::run`, and a hand-copied termination loop is
+  the one piece of this engine where a mistake is a use-after-free rather than a
+  slowdown.
+
+**The intermediate step this suggests, and which the plan should adopt:
+stop-the-world *parallel* marking before *concurrent* marking.** It needs no
+barrier at all (mutators are stopped), it exercises the coordinator against a
+real heap, and `ZMarkCoordinator::mark_to_completion` is already exactly its
+driver. It converts the ownership question into a measurable step instead of a
+prerequisite for one.
+
 ### Phase 4 — Relocation, gated behind the JIT barrier *(months)*
 
 Only now does `RELOCATION_REQUESTED` become a switch worth flipping, and the
@@ -343,6 +411,33 @@ is forced:
 **Exit:** relocation on, JIT on, both suites at parity, and the ~1.5x heap
 premium gone — which is the only outcome that actually retires Gap B rather
 than mitigating it.
+
+**Status 2026-08-13: not started, and correctly so — it is gated on Phase 3.
+One precondition is done: the seven value-degrading sites are no longer
+uncaught.**
+
+`gc/tests/zgc_colored_word_degradation.rs` (8 tests) pins what each site does
+today with a word that has bit 63 set. It deliberately does **not** assert the
+degradation is wrong — today it is right, and `vaddr.rs` designs it that way, so
+that an un-barriered read path fails loudly with a null dereference instead of
+quietly with a wild pointer. What the file changes is that the behaviour is now
+*enumerated and load-bearing*: each assertion is a checklist entry naming the
+file to change, and **a passing test after the barrier lands is a bug report**.
+
+Writing them surfaced two things the plan's one-line summary does not carry:
+
+* **Site 4 is a trap, not a site.** Widening `plausible_heap_pointer` to admit
+  bit 63 would "fix" all seven at once, and it is the wrong lever: it un-guards
+  every read path that has not been migrated yet, converting each from a loud
+  null into a wild pointer. The tripwire says so where someone would try it.
+* **Sites 6 and 7 cannot be edited, only branched.** `read_prim_element`'s
+  reference arm is shared with Generational and G1, so teaching it about colored
+  words changes those collectors too. It needs a ZGC-aware branch.
+
+Also flagged from the Phase 2.3 audit: `ZGC_ADDRESS_BITS` (42, "4 TB heap max")
+is **not yet load-bearing** — `vaddr` is adopted only as an enum today — and
+must be re-derived in this phase against this arena's actual address range
+rather than inherited from OpenJDK's.
 
 ---
 

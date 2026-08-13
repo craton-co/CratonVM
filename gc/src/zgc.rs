@@ -2343,6 +2343,24 @@ pub struct ZgcRealHeap {
     frag_worst_cycle: AtomicUsize,
     /// One-shot latch for the floor warning.
     frag_floor_warned: AtomicBool,
+    /// Whether a concurrent mark cycle is in progress — Phase 3.
+    ///
+    /// This is the **only** thing on the mutator store path while no cycle is
+    /// running: [`Self::satb_pre_barrier`] loads it and returns. Everything
+    /// else behind the barrier is reachable only when it is `true`.
+    mark_active: AtomicBool,
+    /// Mutator ingress for the concurrent marker — Phase 3.
+    ///
+    /// Overwritten references arrive here from the VM's existing pre-write
+    /// barrier and are drained by the marker. Allocated once with the heap and
+    /// left empty while [`Self::mark_active`] is false, so a non-concurrent
+    /// run pays for the buckets and nothing else.
+    mark_ingress: mark::ZMarkIngress,
+    /// Addresses this barrier has published since the cycle began. Telemetry
+    /// for the adoption work — it is how you tell "the barrier is wired" from
+    /// "the barrier is wired and the workload actually overwrites references",
+    /// which are the two states an inert-looking instrument confuses.
+    mark_ingress_pushes: AtomicUsize,
     /// "The arena can no longer serve a request of [`headroom_margin`] bytes."
     ///
     /// # Why the live-bytes trigger is not enough on THIS backend
@@ -2620,6 +2638,9 @@ impl ZgcRealHeap {
             frag_worst_free_permille: AtomicUsize::new(0),
             frag_worst_cycle: AtomicUsize::new(0),
             frag_floor_warned: AtomicBool::new(false),
+            mark_active: AtomicBool::new(false),
+            mark_ingress: mark::ZMarkIngress::new(),
+            mark_ingress_pushes: AtomicUsize::new(0),
             headroom_low: AtomicBool::new(false),
             gc_count: AtomicUsize::new(0),
             gc_log_enabled: AtomicBool::new(false),
@@ -2828,6 +2849,120 @@ impl ZgcRealHeap {
                 largest_permille % 10,
             );
         }
+    }
+
+    /// The SATB pre-write barrier, for the concurrent marker — Phase 3.
+    ///
+    /// # What calls this, and why that is the whole point
+    ///
+    /// Nothing new. `VmHeap::satb_barrier` is already called before **every**
+    /// reference store in this VM — the interpreter's `putfield`/`aastore`,
+    /// the JIT's `aastore` and `putfield` helpers, `deopt_materialize`, and
+    /// `vm_init` — because G1 needs it. Its ZGC arm was `{}`. So the mutator
+    /// ingress that `zgc_concurrent.rs` describes as the missing piece
+    /// ("nothing calls `ZMarkHandle::mark_live_offset` from a `getfield`, so
+    /// the mutator ingress is empty in practice") did not need a new call
+    /// site threaded through three code generators. It needed this arm to stop
+    /// being empty.
+    ///
+    /// # Cost while nothing is marking
+    ///
+    /// One relaxed load of a never-written cache line, then return. That is
+    /// the reason `mark_active` is a separate flag rather than, say, an
+    /// `Option` probe or a lock: this sits on the store path of every Java
+    /// program the VM runs, including every program that will never see a
+    /// concurrent cycle.
+    ///
+    /// # Why SATB and not the load barrier ZGC actually uses
+    ///
+    /// Real ZGC marks on **read**, in the load barrier, which is why
+    /// `zgc_concurrent.rs`'s mark-end is a *decision point* rather than a
+    /// conclusion: with a read barrier every mutator stays a producer until it
+    /// is stopped, hence the restart loop. A pre-write barrier is the other
+    /// discipline — snapshot-at-the-beginning — and it is what this VM already
+    /// has plumbed everywhere, at zero additional emission cost.
+    ///
+    /// The two are **not interchangeable**, and adopting this one has a
+    /// consequence that must be written down before anybody relies on it: SATB
+    /// keeps everything live at the snapshot, so it is *conservative* (an
+    /// object that dies during the cycle is collected in the next one), while
+    /// ZGC's load barrier is precise. Conservative is a throughput cost, not a
+    /// correctness one, which is the right side to be wrong on for a first
+    /// adoption. The restart loop stays correct under it — it simply reaches
+    /// `Complete` sooner, because a snapshot's producer set really is bounded.
+    ///
+    /// # What is NOT done
+    ///
+    /// This publishes into the ingress; it does not yet run a cycle. There is
+    /// no mark-start safepoint, no per-thread [`mark::ZMarkMutatorBuffer`]
+    /// (every push takes an uncontended bucket mutex, which is the batching
+    /// this barrier will want before it is on by default), and no coordinator
+    /// pointed at this heap. `mark_active` is therefore never set to `true` by
+    /// production code today — only by tests. Nothing here is reachable in a
+    /// real run, and it must not be described as if it were.
+    #[inline]
+    pub fn satb_pre_barrier(&self, old_addr: usize) {
+        // The entire cost of this barrier on a non-concurrent run.
+        if !self.mark_active.load(Ordering::Relaxed) {
+            return;
+        }
+        self.satb_pre_barrier_slow(old_addr);
+    }
+
+    /// Out-of-line remainder of [`Self::satb_pre_barrier`], so the fast path
+    /// is a load and a branch and nothing else is inlined into every store
+    /// site in the VM.
+    #[cold]
+    fn satb_pre_barrier_slow(&self, old_addr: usize) {
+        if old_addr == 0 || !self.registry.contains(old_addr) {
+            // A null overwrite carries no edge, and an address this heap never
+            // handed out is not ours to mark — the same gate
+            // `ZMarkContext::is_in_heap` applies to every child pointer.
+            return;
+        }
+        // Bucket by address so concurrent mutators spread across the ingress
+        // rather than contending on one mutex. `ZMarkIngress::push` masks this
+        // into its bucket count, so any well-distributed key works; the
+        // address shifted past the object-alignment zeros is the cheapest one
+        // available here.
+        self.mark_ingress.push(old_addr >> 3, old_addr as u64);
+        self.mark_ingress_pushes.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Arm or disarm the concurrent-mark barrier — Phase 3 wiring and tests.
+    ///
+    /// Disarming clears the ingress, because a leftover address from a
+    /// finished cycle would be republished into the next one as mark work
+    /// against an arena that has since been swept and coalesced.
+    pub fn set_mark_active(&self, active: bool) {
+        if !active {
+            self.mark_active.store(false, Ordering::Relaxed);
+            self.mark_ingress.clear();
+            self.mark_ingress_pushes.store(0, Ordering::Relaxed);
+        } else {
+            self.mark_ingress.clear();
+            self.mark_ingress_pushes.store(0, Ordering::Relaxed);
+            self.mark_active.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// Is the concurrent-mark barrier armed?
+    #[inline]
+    pub fn mark_active(&self) -> bool {
+        self.mark_active.load(Ordering::Relaxed)
+    }
+
+    /// How many overwritten references this barrier has published since the
+    /// cycle began. See the field doc: zero with the barrier armed means the
+    /// workload overwrote no references, which is a different fact from the
+    /// barrier not being wired.
+    pub fn mark_ingress_pushes(&self) -> usize {
+        self.mark_ingress_pushes.load(Ordering::Relaxed)
+    }
+
+    /// Drain the mutator ingress — what a coordinator's mark-end flush calls.
+    pub fn drain_mark_ingress(&self, out: &mut Vec<u64>) -> usize {
+        self.mark_ingress.drain_into(out)
     }
 
     /// Free share of the arena in permille — test support for the
@@ -8000,6 +8135,100 @@ mod tests {
              fragmentation and must not be counted as a reading"
         );
         assert_eq!(g.worst_permille, None);
+    }
+
+    // -- Phase 3: the mutator ingress -------------------------------------
+
+    /// Disarmed, the barrier publishes **nothing** — including for a live,
+    /// registered address it would otherwise capture.
+    ///
+    /// This is the test that pins the cost argument. The barrier sits on the
+    /// store path of every Java program this VM runs, and the claim that a
+    /// non-concurrent run pays "one relaxed load" is only true while the
+    /// disarmed path reaches no registry lookup, no mutex and no counter.
+    #[test]
+    fn the_satb_barrier_is_inert_while_no_cycle_is_marking() {
+        let heap = ZgcRealHeap::with_capacity(64 * 1024);
+        let obj = heap.alloc_object(ClassId::new(1), 4);
+        assert!(!heap.mark_active());
+
+        heap.satb_pre_barrier(obj.as_ptr() as usize);
+
+        assert_eq!(
+            heap.mark_ingress_pushes(),
+            0,
+            "a disarmed barrier must publish nothing"
+        );
+        let mut drained = Vec::new();
+        assert_eq!(heap.drain_mark_ingress(&mut drained), 0);
+        assert!(drained.is_empty());
+    }
+
+    /// Armed, the barrier publishes the overwritten reference — which is the
+    /// whole point of a snapshot-at-the-beginning barrier.
+    #[test]
+    fn an_armed_satb_barrier_publishes_the_overwritten_reference() {
+        let heap = ZgcRealHeap::with_capacity(64 * 1024);
+        let obj = heap.alloc_object(ClassId::new(1), 4);
+        heap.set_mark_active(true);
+
+        heap.satb_pre_barrier(obj.as_ptr() as usize);
+
+        assert_eq!(heap.mark_ingress_pushes(), 1);
+        let mut drained = Vec::new();
+        assert_eq!(heap.drain_mark_ingress(&mut drained), 1);
+        assert_eq!(drained, vec![obj.as_ptr() as usize as u64]);
+    }
+
+    /// Two things the armed barrier must still refuse: a null overwrite (no
+    /// edge to preserve) and an address this heap never handed out.
+    ///
+    /// The second is the same gate `ZMarkContext::is_in_heap` applies to every
+    /// child pointer. Publishing a foreign address would hand the marker an
+    /// address to `try_mark`, i.e. a write through a pointer into memory this
+    /// collector does not own.
+    #[test]
+    fn an_armed_satb_barrier_refuses_null_and_foreign_addresses() {
+        let heap = ZgcRealHeap::with_capacity(64 * 1024);
+        heap.set_mark_active(true);
+
+        heap.satb_pre_barrier(0);
+        assert_eq!(heap.mark_ingress_pushes(), 0, "null carries no edge");
+
+        // An address the arena never handed out. Well clear of the arena and
+        // aligned, so only the registry gate can reject it.
+        heap.satb_pre_barrier(0xDEAD_BEE0);
+        assert_eq!(
+            heap.mark_ingress_pushes(),
+            0,
+            "an address this heap never allocated must not reach the marker"
+        );
+    }
+
+    /// Disarming clears the ingress, so a leftover address cannot be
+    /// republished into the next cycle.
+    ///
+    /// This matters more than it looks: the addresses in the ingress are raw
+    /// arena offsets, and between cycles the sweep coalesces the free list and
+    /// retracts the bump cursor. An address held across that is not merely
+    /// stale, it may name reclaimed space — `reclaim_guard`'s whole subject.
+    #[test]
+    fn disarming_the_satb_barrier_clears_the_ingress() {
+        let heap = ZgcRealHeap::with_capacity(64 * 1024);
+        let obj = heap.alloc_object(ClassId::new(1), 4);
+        heap.set_mark_active(true);
+        heap.satb_pre_barrier(obj.as_ptr() as usize);
+        assert_eq!(heap.mark_ingress_pushes(), 1);
+
+        heap.set_mark_active(false);
+
+        assert!(!heap.mark_active());
+        let mut drained = Vec::new();
+        assert_eq!(
+            heap.drain_mark_ingress(&mut drained),
+            0,
+            "an address from a finished cycle must not survive into the next"
+        );
     }
 
     #[test]
