@@ -2366,6 +2366,15 @@ pub struct ZgcRealHeap {
     /// [`Self::mark_active`] because the barrier's mark and relocate slow
     /// paths are separately armed.
     relocate_active: AtomicBool,
+    /// Whether reference slots currently hold COLOURED words, and so whether
+    /// the read-path load barrier may run at all.
+    ///
+    /// Deliberately not inferred from the good mask. `Z_REMAPPED` is both the
+    /// quiescent "addresses are plain" state AND a real ZGC colour, so
+    /// `good_mask() != Z_REMAPPED` answers "is a mark parity good", which is a
+    /// different question and is false during the remap phase — exactly when
+    /// the barrier is most needed.
+    barrier_armed: AtomicBool,
     /// Phase 4: `from_offset -> to_offset` for objects this cycle has moved.
     ///
     /// A plain map rather than `zgc::forwarding::ZForwardingTable` on purpose:
@@ -2376,6 +2385,21 @@ pub struct ZgcRealHeap {
     forwarding: Mutex<FxHashMap<u64, u64>>,
     /// Barrier counters — slow-path entries, heals, forward lookups.
     barrier_stats: barrier::ZBarrierStats,
+    /// Per-logical-page age, indexed by page id. A page's age is the number of
+    /// cycles it has survived; `generation::ZPromotionPolicy` turns that into
+    /// young-or-old. Grown on demand, never shrunk -- a page id is an index
+    /// into the arena's logical grid and the arena does not shrink either.
+    page_ages: Mutex<Vec<u32>>,
+    /// Old-to-young edges, per old page -- `zgc::remembered`.
+    ///
+    /// Fed by [`Self::satb_pre_barrier`], which every reference store in the
+    /// VM already reaches. Consumed as extra roots by a young-scoped cycle,
+    /// which is the whole reason a generational collector can look at less
+    /// than the whole heap.
+    remembered: remembered::ZRememberedSetTable,
+    /// Page ids the last cycle classified as old. Read by the store barrier to
+    /// decide whether a store is an old-to-young edge worth remembering.
+    old_page_ids: Mutex<Vec<u64>>,
     /// Addresses this barrier has published since the cycle began. Telemetry
     /// for the adoption work — it is how you tell "the barrier is wired" from
     /// "the barrier is wired and the workload actually overwrites references",
@@ -2663,8 +2687,12 @@ impl ZgcRealHeap {
             mark_ingress_pushes: AtomicUsize::new(0),
             barrier_good_mask: AtomicU64::new(vaddr::Z_REMAPPED),
             relocate_active: AtomicBool::new(false),
+            barrier_armed: AtomicBool::new(false),
             forwarding: Mutex::new(FxHashMap::default()),
             barrier_stats: barrier::ZBarrierStats::default(),
+            page_ages: Mutex::new(Vec::new()),
+            remembered: remembered::ZRememberedSetTable::new(),
+            old_page_ids: Mutex::new(Vec::new()),
             headroom_low: AtomicBool::new(false),
             gc_count: AtomicUsize::new(0),
             gc_log_enabled: AtomicBool::new(false),
@@ -2953,6 +2981,62 @@ impl ZgcRealHeap {
         self.mark_ingress_pushes.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Card an OLD object whose fields have just been written --
+    /// `zgc::remembered`.
+    ///
+    /// # A card names an OBJECT to re-scan, not a slot
+    ///
+    /// The first version of this recorded the slot address and
+    /// `remembered_roots` read a reference word straight out of it. That is
+    /// the *precise* remembered set, and this VM cannot feed it: the barrier
+    /// hook every reference store already reaches is
+    /// `GarbageCollector::write_barrier(obj, stored_value)`, which is handed
+    /// the **object**. Recording an object base and re-enumerating its
+    /// reference slots at cycle time is the classic card design, it is what
+    /// the available hook can actually supply, and it is robust to the four
+    /// different slot shapes an object can have -- a hand-computed slot offset
+    /// is not, which is how the first version carded the tag word of a
+    /// 16-byte cell instead of its reference word.
+    ///
+    /// # Cost while there is no old generation
+    ///
+    /// One `is_empty` check on a lock that is uncontended and, until a cycle
+    /// has aged a page past the promotion age, always empty.
+    #[inline]
+    pub fn note_ref_store(&self, obj_addr: usize) {
+        if self.old_page_ids.lock().is_empty() {
+            return;
+        }
+        self.note_ref_store_slow(obj_addr);
+    }
+
+    #[cold]
+    fn note_ref_store_slow(&self, obj_addr: usize) {
+        let base = self.arena.lock().base_ptr() as usize;
+        if obj_addr < base {
+            return;
+        }
+        let page = ((obj_addr - base) / Self::Z_LOGICAL_PAGE_BYTES) as u64;
+        if !self.old_page_ids.lock().contains(&page) {
+            // A store into a young page needs no card: a young cycle scans
+            // every young page anyway.
+            return;
+        }
+        let offset = (obj_addr - base) % Self::Z_LOGICAL_PAGE_BYTES;
+        self.remember_old_to_young(page, offset);
+    }
+
+    /// How many old-to-young edges are currently remembered. Diagnostic, and
+    /// the discriminator a test needs between "the barrier is wired" and "the
+    /// workload made no such store".
+    pub fn remembered_edge_count(&self) -> usize {
+        self.remembered
+            .snapshot()
+            .iter()
+            .map(|s| s.bits_set())
+            .sum()
+    }
+
     /// Arm or disarm the concurrent-mark barrier — Phase 3 wiring and tests.
     ///
     /// Disarming clears the ingress, because a leftover address from a
@@ -3087,38 +3171,235 @@ impl ZgcRealHeap {
     /// 64 MiB default heap.
     const Z_LOGICAL_PAGE_BYTES: usize = 2 * 1024 * 1024;
 
-    /// Build the relocation-set candidates: one per logical page, with the
-    /// live bytes and allocated extent the selector ranks on.
+    /// The logical grid as real [`page::ZPageReal`] views, with per-page
+    /// `used` and `live_bytes` filled in from the live set.
     ///
-    /// `live` is the post-sweep live set, so a page's live bytes is the sum of
-    /// its survivors' sizes and its garbage is `extent - live` -- the "benefit
-    /// side" `PageCandidate::capacity_bytes`'s own doc insists must be the
-    /// bump extent and not the page span, because bytes never allocated cost
-    /// nothing to reclaim and counting them inverts the ranking.
-    fn page_candidates(&self, live: &[usize], base: usize, low_end: usize) -> Vec<forwarding::PageCandidate> {
-        let page_of = |addr: usize| ((addr - base) / Self::Z_LOGICAL_PAGE_BYTES) as u64;
+    /// Views, not pages: they allocate nothing and free nothing -- see
+    /// `ZPageReal::view`. They exist so the page-keyed consumers in this crate
+    /// (`forwarding`'s selector, `generation`'s scope, `remembered`'s table)
+    /// can be driven against this arena-backed heap without the arena being
+    /// replaced by the page allocator first.
+    fn logical_pages(
+        &self,
+        live: &[usize],
+        base: usize,
+        low_end: usize,
+    ) -> Vec<std::sync::Arc<page::ZPageReal>> {
         let pages = (low_end - base).div_ceil(Self::Z_LOGICAL_PAGE_BYTES);
         let mut live_bytes = vec![0usize; pages.max(1)];
         for addr in live {
             if *addr < base || *addr >= low_end {
                 continue;
             }
-            let size = Self::alloc_size(self.header_ref(*addr as *mut u8)).unwrap_or(0);
-            live_bytes[page_of(*addr) as usize] += size;
+            let idx = (*addr - base) / Self::Z_LOGICAL_PAGE_BYTES;
+            live_bytes[idx] += Self::alloc_size(self.header_ref(*addr as *mut u8)).unwrap_or(0);
         }
+        let ages = self.page_ages.lock();
         (0..pages)
             .map(|i| {
-                let page_start = base + i * Self::Z_LOGICAL_PAGE_BYTES;
-                let page_end = (page_start + Self::Z_LOGICAL_PAGE_BYTES).min(low_end);
-                forwarding::PageCandidate {
-                    page_id: i as u64,
-                    live_bytes: live_bytes[i],
-                    // The bump extent of this page, not its span.
-                    capacity_bytes: page_end.saturating_sub(page_start),
-                    size_class_index: forwarding::ZFWD_SIZE_CLASS_SMALL,
-                }
+                let page_base = base + i * Self::Z_LOGICAL_PAGE_BYTES;
+                let span = Self::Z_LOGICAL_PAGE_BYTES;
+                // `used` is the arena's bump extent inside this cell, which is
+                // what `walk_bounds` must report and what the selector's
+                // "capacity" means -- bytes never allocated cost nothing to
+                // reclaim.
+                let used = low_end.saturating_sub(page_base).min(span);
+                let p = page::ZPageReal::view(
+                    i as u64,
+                    page::ZPageSizeClass::Small,
+                    page_base,
+                    span,
+                    used,
+                    live_bytes[i],
+                );
+                p.set_age(ages.get(i).copied().unwrap_or(0));
+                std::sync::Arc::new(p)
             })
             .collect()
+    }
+
+    /// Age every logical page by one cycle and return the young/old split
+    /// under `policy`.
+    ///
+    /// This is `zgc::generation`'s promotion rule applied to the grid: a page
+    /// whose age after this cycle reaches the policy's promotion age is old,
+    /// and everything else is young.
+    fn age_pages_and_split(
+        &self,
+        page_count: usize,
+        policy: &generation::ZPromotionPolicy,
+    ) -> (Vec<u64>, Vec<u64>) {
+        let mut ages = self.page_ages.lock();
+        if ages.len() < page_count {
+            ages.resize(page_count, 0);
+        }
+        let mut young = Vec::new();
+        let mut old = Vec::new();
+        for (i, age) in ages.iter_mut().enumerate().take(page_count) {
+            *age = age.saturating_add(1);
+            if policy.should_promote(*age) {
+                old.push(i as u64);
+            } else {
+                young.push(i as u64);
+            }
+        }
+        (young, old)
+    }
+
+    /// Record an old-to-young edge for a young-scoped cycle -- `zgc::remembered`.
+    ///
+    /// Called from the store barrier. `slot_page` must already be known old
+    /// and the value it now holds young; this only writes the bit.
+    fn remember_old_to_young(&self, slot_page: u64, page_relative_offset: usize) {
+        let _ = self
+            .remembered
+            .remember(slot_page, page_relative_offset);
+    }
+
+    /// The remembered set's extra roots for a young cycle: every old-page slot
+    /// recorded as pointing into young.
+    ///
+    /// Without these a young collection is simply wrong -- an object reachable
+    /// only from an old-generation field has no path from the thread roots and
+    /// would be swept while live. That is the entire justification for the
+    /// store barrier's existence, so it is asserted rather than assumed by
+    /// `a_young_scope_treats_remembered_old_slots_as_roots`.
+    fn remembered_roots(&self, base: usize) -> Vec<usize> {
+        let mut roots = Vec::new();
+        for set in self.remembered.snapshot() {
+            let page_base = base + set.page_id() as usize * Self::Z_LOGICAL_PAGE_BYTES;
+            let mut carded: Vec<usize> = Vec::new();
+            set.iterate(|offset| carded.push(page_base + offset));
+            for obj in carded {
+                // A card names an OBJECT to re-scan. Re-check the registry:
+                // the carded object may have died since the card was written,
+                // and a card is allowed to be stale -- that is the price of
+                // recording eagerly on the store path.
+                if !self.registry.contains(obj) {
+                    continue;
+                }
+                use census::ZCensusHeapView;
+                self.reference_slots(obj as u64, &mut |slot| {
+                    let target = slot.raw_word as usize;
+                    if target != 0 && self.registry.contains(target) {
+                        roots.push(target);
+                    }
+                });
+            }
+        }
+        roots
+    }
+
+    /// Apply the ZGC **load barrier** to one reference slot, in place.
+    ///
+    /// This is the read path Phase 4 is about. Given the address of an 8-byte
+    /// reference word, it runs `barrier::load_barrier_fast_bad`; on the fast
+    /// path (the overwhelmingly common case, and the only one reachable while
+    /// no cycle is armed) it returns the word unchanged. On the slow path it
+    /// calls `barrier::load_barrier_slow`, which forwards the offset through
+    /// [`Self::forward`], publishes it to the marker if a mark is running, and
+    /// **self-heals** the slot by CAS-ing the corrected colored word back.
+    ///
+    /// # Colored slots, and why the word returned here is not a pointer
+    ///
+    /// A colored word is `Z_COLORED_TAG | color | 42-bit OFFSET`. The barrier
+    /// hands back a bare offset, so a caller wanting a machine address must
+    /// add the heap base. That conversion is the reason
+    /// `ZMarkContext::heap_base` had to stop being `None`.
+    ///
+    /// # Cost while no cycle is armed
+    ///
+    /// One relaxed load, one AND, one compare. `bad_mask` is derived from a
+    /// good mask that stays at `Z_REMAPPED`, under which a plain pointer
+    /// classifies as good — so an unarmed run takes the fast path on every
+    /// reference read and touches nothing else.
+    ///
+    /// Returns the **machine address** the slot should be read as, or `None`
+    /// for null.
+    #[inline]
+    fn load_barrier_slot(&self, slot_addr: usize) -> Option<usize> {
+        use barrier::ZBarrierContext;
+        // SAFETY: the caller supplies the address of an 8-byte-aligned
+        // reference word inside a live object.
+        let slot = unsafe { &*(slot_addr as *const std::sync::atomic::AtomicU64) };
+
+        // ---- THE GATE, and it is not an optimisation ---------------------
+        //
+        // The barrier cannot be run over an UNCOLORED slot. `ZFastPath::Good`
+        // carries a bare 42-bit OFFSET, and the classifier decides good-vs-bad
+        // by testing the metadata bits — but a plain machine pointer into this
+        // arena is well above 2^42, so its bits 42-46 are address bits that the
+        // classifier would read as colors and `address_mask` would truncate.
+        // Every reference read would take the slow path and every one of them
+        // would resolve to the wrong object.
+        //
+        // So the barrier runs only once slots actually hold colored words,
+        // which is what flipping the good mask off `Z_REMAPPED` declares.
+        // Nothing in a default run flips it. The cost of the gate on an
+        // unarmed run is one relaxed load and a compare.
+        if !self.load_barrier_armed() {
+            let raw = slot.load(Ordering::Relaxed) as usize;
+            return (raw != 0).then_some(raw);
+        }
+
+        let bad = self.bad_mask();
+        let mask = self.address_mask();
+        match barrier::load_barrier_fast_bad(slot, bad, mask) {
+            barrier::ZFastPath::Good(offset) => {
+                if slot.load(Ordering::Relaxed) == vaddr::Z_NULL {
+                    return None;
+                }
+                let base = <Self as mark::ZMarkContext>::heap_base(self).unwrap_or(0);
+                Some(base.wrapping_add(offset) as usize)
+            }
+            barrier::ZFastPath::Bad(observed) => {
+                let offset = barrier::load_barrier_slow(
+                    slot,
+                    observed,
+                    self,
+                    barrier::ZBarrierKind::Load,
+                );
+                if offset == 0 {
+                    return None;
+                }
+                let base = <Self as mark::ZMarkContext>::heap_base(self).unwrap_or(0);
+                Some(base.wrapping_add(offset) as usize)
+            }
+        }
+    }
+
+    /// Is the read-path load barrier armed?
+    ///
+    /// Only ever true when the good mask has been flipped off `Z_REMAPPED`,
+    /// which nothing in a default run does. Exposed so a test can assert the
+    /// unarmed cost claim rather than take it on trust.
+    pub fn load_barrier_armed(&self) -> bool {
+        self.barrier_armed.load(Ordering::Acquire)
+    }
+
+    /// Arm or disarm the read-path barrier by flipping the good mask.
+    ///
+    /// `Some(color)` arms it for that mark parity; `None` returns to
+    /// `Z_REMAPPED`, the quiescent "addresses are plain" state.
+    pub fn set_barrier_color(&self, color: Option<vaddr::ZColor>) {
+        let mask = match color {
+            Some(vaddr::ZColor::Marked0) => vaddr::Z_MARKED0,
+            Some(vaddr::ZColor::Marked1) => vaddr::Z_MARKED1,
+            // `Finalizable` is not a phase: it marks a pointer reached ONLY
+            // through a finalizable object, and is never the cycle's good
+            // color. Treating it as one would make every ordinary reference
+            // bad for a whole cycle.
+            Some(vaddr::ZColor::Finalizable)
+            | Some(vaddr::ZColor::Remapped)
+            | None => vaddr::Z_REMAPPED,
+        };
+        self.barrier_good_mask.store(mask, Ordering::Release);
+        self.barrier_armed.store(color.is_some(), Ordering::Release);
+        // ...and the process-wide codegen gate. The JIT decides whether to
+        // emit a raw inline reference load while holding no heap handle, so
+        // this one fact has to be reachable without one -- see
+        // `crate::zgc_read_barrier_armed` for why that exception is safe.
+        cratonvm_types::set_zgc_read_barrier_armed(color.is_some());
     }
 
     /// Is the default-off stop-the-world compaction sub-flag set?
@@ -3208,9 +3489,17 @@ impl ZgcRealHeap {
     }
 
     fn relocate_stw(&self, live: &[usize]) -> (usize, usize, cratonvm_types::PointerMap) {
-        let mut pointer_map = cratonvm_types::PointerMap::default();
+        // `relocate::ZRelocationRecord` rather than a local map: it is the
+        // module's from->to ledger, it builds the `PointerMap` this function
+        // must return, and it carries the reserve so a large evacuation does
+        // not rehash mid-slide. Hand-rolling a `FxHashMap` here -- which this
+        // did first -- is a second implementation of the thing the module
+        // exists to be, and the two would drift on exactly the question that
+        // matters: whether an identity entry is recorded for an object that
+        // did not move. It is not; only real moves are recorded.
+        let record = relocate::ZRelocationRecord::new(true, live.len());
+        let mut pairs: Vec<(usize, usize)> = Vec::new();
         let mut moved = 0usize;
-        let mut fwd: FxHashMap<usize, usize> = FxHashMap::default();
         let reclaimed;
 
         {
@@ -3234,7 +3523,57 @@ impl ZgcRealHeap {
             // Without it this function slid the WHOLE low region every cycle,
             // which copies a dense, wholly-live page for no reclaim at all.
             // With it, a page that is 90% live is left to decay.
-            let candidates = self.page_candidates(live, base, low_end);
+            // ---- The generational scope -----------------------------------
+            //
+            // `generation::ZPromotionPolicy` ages every logical page one cycle
+            // and splits young from old; `ZGenerationScope::from_pages` then
+            // names the byte ranges a young cycle may touch. Both are driven
+            // from real `page::ZPageReal` VIEWS over the arena grid -- see
+            // `logical_pages` for why a view is not a page.
+            //
+            // The scope is advisory for now: this cycle still evacuates from
+            // whichever pages the relocation-set selector picks, young or old.
+            // What it buys today is the accounting and the ages; scoping the
+            // MARK to young is what needs the remembered set to be complete,
+            // and completeness is a property of every store site, not of this
+            // function.
+            let views = self.logical_pages(live, base, low_end);
+            let promo = generation::ZPromotionPolicy::default();
+            let (young_ids, old_ids) = self.age_pages_and_split(views.len(), &promo);
+            let young_views: Vec<_> = views
+                .iter()
+                .filter(|p| young_ids.contains(&p.id()))
+                .cloned()
+                .collect();
+            let scope = generation::ZGenerationScope::from_pages(
+                generation::ZGeneration::Young,
+                self.gc_count.load(Ordering::Relaxed) as u64,
+                &young_views,
+                young_ids.len() == views.len(),
+            );
+            // Every old page gets a remembered set, so the store barrier has
+            // somewhere to record an old-to-young edge before the next cycle.
+            for id in &old_ids {
+                self.remembered
+                    .register_old_page(*id, Self::Z_LOGICAL_PAGE_BYTES);
+            }
+            self.old_page_ids.lock().clone_from(&old_ids);
+            tracing::debug!(
+                target: "zgc",
+                young = young_ids.len(),
+                old = old_ids.len(),
+                scope_pages = scope.page_count(),
+                "zgc generational split over the logical grid"
+            );
+
+            // `adapters::page_candidates` rather than a local map. That module
+            // exists so there is EXACTLY ONE conversion between a
+            // `page::ZPageReal` and a `forwarding::PageCandidate`; hand-rolling
+            // a second one here is the thing its header calls a symptom, and it
+            // is how `capacity_bytes` comes to mean the page SPAN in one place
+            // and the bump EXTENT in another -- an ambiguity that inverts the
+            // selector's profitability ranking.
+            let candidates = adapters::page_candidates(&views);
             let policy = forwarding::ZRelocationPolicy::default();
             let reloc_set = forwarding::ZRelocationSet::select(&candidates, &policy);
             let selected: std::collections::HashSet<u64> =
@@ -3243,7 +3582,7 @@ impl ZgcRealHeap {
                 // Nothing profitable to move. Not a failure -- it is the
                 // selector doing its job on a heap whose pages are all dense.
                 let reclaimed = arena.retract_cursor_into_free_tail();
-                return (0, reclaimed, pointer_map);
+                return (0, reclaimed, cratonvm_types::PointerMap::default());
             }
 
             let page_of = |addr: usize| ((addr - base) / Self::Z_LOGICAL_PAGE_BYTES) as u64;
@@ -3290,8 +3629,7 @@ impl ZgcRealHeap {
                     // the arena and strictly below `from`, and the regions may
                     // overlap -- `copy` is memmove, correct in that direction.
                     unsafe { std::ptr::copy(from as *const u8, to as *mut u8, size) };
-                    fwd.insert(from, to);
-                    pointer_map.insert(from, to);
+                    pairs.push((from, to));
                     moved += 1;
                 }
                 dest = to + size;
@@ -3314,10 +3652,14 @@ impl ZgcRealHeap {
                 .unwrap_or(base);
             let new_cursor = dest.max(highest_pinned_end) - base;
             reclaimed = arena.compact_low_to(new_cursor);
+            // One batched publish after the slide, not one per object: the
+            // record is read by the rewrite pass below, which must see the
+            // WHOLE map or it resolves half the graph against a half-built one.
+            record.record_many(&pairs);
         }
 
         if moved == 0 {
-            return (0, reclaimed, pointer_map);
+            return (0, reclaimed, cratonvm_types::PointerMap::default());
         }
 
         // ---- Rewrite every reference slot in every surviving object -------
@@ -3327,7 +3669,7 @@ impl ZgcRealHeap {
         // as we go resolves half the graph against a half-built map.
         let live_now: Vec<usize> = live
             .iter()
-            .map(|b| fwd.get(b).copied().unwrap_or(*b))
+            .map(|b| record.get(*b).unwrap_or(*b))
             .collect();
         for obj in &live_now {
             let mut rewrites: Vec<(u64, u64)> = Vec::new();
@@ -3338,8 +3680,8 @@ impl ZgcRealHeap {
                     if raw == 0 {
                         return;
                     }
-                    if let Some(to) = fwd.get(&raw) {
-                        rewrites.push((slot.slot_addr, *to as u64));
+                    if let Some(to) = record.get(raw) {
+                        rewrites.push((slot.slot_addr, to as u64));
                     }
                 });
             }
@@ -3352,11 +3694,13 @@ impl ZgcRealHeap {
         }
 
         // ---- Rebuild the object-start registry ----------------------------
-        for (from, to) in &fwd {
+        for (from, to) in &pairs {
             self.registry.remove(*from);
             self.registry.insert(*to);
         }
 
+        let pointer_map: cratonvm_types::PointerMap =
+            record.into_pointer_map().into_iter().collect();
         (moved, reclaimed, pointer_map)
     }
 
@@ -6744,8 +7088,43 @@ impl GarbageCollector for ZgcRealHeap {
         if index >= header.array_length() as usize {
             return Err(index as i32);
         }
-        // SAFETY: bounds check passed; data area starts at base + HEADER_SIZE.
         let element_type = header.element_type();
+        // ---- THE LOAD BARRIER, on a real read path (Phase 4) -------------
+        //
+        // A reference element goes through `load_barrier_slot`, which forwards
+        // a relocated offset, publishes to the marker, and self-heals the slot
+        // — but ONLY once the good mask says slots are coloured, which nothing
+        // in a default run does. Until then it is one relaxed load and a
+        // compare, and the element is read exactly as before.
+        //
+        // This arm exists because `read_prim_element`'s own Reference branch
+        // applies `plausible_heap_pointer` and degrades an implausible word to
+        // `Object(None)` — sites 6 and 7 of
+        // `gc/tests/zgc_colored_word_degradation.rs`. A coloured word IS
+        // deliberately implausible, so a coloured reference array read through
+        // that branch silently nulls every live element. Barriering first is
+        // how this backend goes through the barrier rather than around it;
+        // that arm is shared with Generational and G1 and must not be edited.
+        if element_type == ArrayElementType::Reference && self.load_barrier_armed() {
+            let slot_addr =
+                unsafe { obj.as_ptr().add(ARRAY_DATA_OFFSET) as usize + index * SLOT_SIZE };
+            let val = match self.load_barrier_slot(slot_addr) {
+                None => Value::Object(None),
+                // SAFETY: the barrier returned a machine address it resolved
+                // from a live slot; `from_raw` is the same construction the
+                // unbarriered path performs.
+                Some(addr) => {
+                    Value::Object(Some(unsafe { ObjectRef::from_raw(addr as *mut u8) }))
+                }
+            };
+            if let Value::Object(Some(boxed)) = val {
+                if let Some(inner) = self.autobox_payload(boxed) {
+                    return Ok(inner);
+                }
+            }
+            return Ok(val);
+        }
+        // SAFETY: bounds check passed; data area starts at base + HEADER_SIZE.
         let val = unsafe {
             let base = obj.as_ptr().add(ARRAY_DATA_OFFSET);
             read_prim_element(base, index, element_type)
@@ -7398,8 +7777,24 @@ impl GarbageCollector for ZgcRealHeap {
         }
     }
 
-    fn write_barrier(&self, _obj: ObjectRef, _stored_value: Value) {
-        // Non-generational, non-concurrent: nothing to record.
+    /// Card the written object when it lives in an old page --
+    /// `zgc::remembered`, Phase 4.
+    ///
+    /// This arm said "Non-generational, non-concurrent: nothing to record"
+    /// and was empty. It is the hook every reference store in the VM already
+    /// reaches, so it is where a generational collector's card barrier
+    /// belongs; see [`ZgcRealHeap::note_ref_store`] for why a card names an
+    /// object rather than a slot, and for the cost while no page is old (one
+    /// `is_empty` check).
+    ///
+    /// `stored_value` is deliberately not consulted. Filtering to
+    /// "the value is a young reference" would card fewer objects, but it
+    /// needs the value's page, which is another lock on the store path to
+    /// avoid a re-scan that only costs anything at cycle time. Over-carding
+    /// is safe -- a stale or unnecessary card makes a young cycle scan an
+    /// object it did not need to -- while under-carding is a use-after-free.
+    fn write_barrier(&self, obj: ObjectRef, _stored_value: Value) {
+        self.note_ref_store(obj.as_ptr() as usize);
     }
 
     fn allocated_bytes(&self) -> usize {
@@ -9375,6 +9770,300 @@ pub(crate) mod tests {
         );
         assert!(reclaimed > 0, "and the cursor must come back down");
         assert!(!map.is_empty());
+    }
+
+    // -- Phase 4: generation + remembered over the logical grid ------------
+
+    /// The address of an object's first reference WORD, as the census reports
+    /// it.
+    ///
+    /// Not `base + HEADER_SIZE`: for the two 16-byte-cell shapes the reference
+    /// word is at `cell + 8`, so a hand-computed offset lands on the tag and
+    /// the card is recorded against the wrong 8 bytes. `reference_slots` is
+    /// the only thing that knows which of the four slot shapes an object has.
+    fn first_ref_slot_addr(heap: &ZgcRealHeap, obj: ObjectRef) -> usize {
+        use super::census::ZCensusHeapView;
+        let mut found = None;
+        heap.reference_slots(obj.as_ptr() as u64, &mut |slot| {
+            if found.is_none() {
+                found = Some(slot.slot_addr as usize);
+            }
+        });
+        found.expect("the fixture object must have a reference slot")
+    }
+
+    /// Pages age one cycle at a time and cross into old at the policy's
+    /// promotion age -- `zgc::generation`'s rule, applied to the grid.
+    #[test]
+    fn a_logical_page_is_promoted_when_its_age_reaches_the_policy_age() {
+        let heap = ZgcRealHeap::with_capacity(64 * 1024);
+        let policy = generation::ZPromotionPolicy::with_age(3);
+
+        // Cycles 1 and 2: still young.
+        for cycle in 1..=2 {
+            let (young, old) = heap.age_pages_and_split(1, &policy);
+            assert_eq!(young.len(), 1, "cycle {cycle}: page must still be young");
+            assert!(old.is_empty(), "cycle {cycle}: nothing promoted yet");
+        }
+        // Cycle 3 reaches the promotion age.
+        let (young, old) = heap.age_pages_and_split(1, &policy);
+        assert!(young.is_empty(), "the page has reached the promotion age");
+        assert_eq!(old, vec![0], "and must now be old");
+    }
+
+    /// **The store barrier records an old-to-young edge, and is inert while
+    /// there is no old generation.**
+    ///
+    /// The inert half is the cost argument: `note_ref_store` sits on every
+    /// reference store, and a program short enough never to promote a page
+    /// must not pay more than one length check for it.
+    #[test]
+    fn the_card_barrier_is_inert_until_a_page_is_old_then_records_the_edge() {
+        let heap = ZgcRealHeap::with_capacity(64 * 1024);
+        heap.set_tlab_enabled(false);
+        let holder = heap.alloc_object(ClassId::new(1), 1);
+        let _slot = first_ref_slot_addr(&heap, holder);
+
+        // No page is old yet.
+        heap.note_ref_store(holder.as_ptr() as usize);
+        assert_eq!(
+            heap.remembered_edge_count(),
+            0,
+            "with no old generation there is nothing to remember"
+        );
+
+        // Age page 0 into old, and register its remembered set the way a
+        // cycle does.
+        let policy = generation::ZPromotionPolicy::with_age(1);
+        let (_young, old) = heap.age_pages_and_split(1, &policy);
+        assert_eq!(old, vec![0]);
+        heap.remembered
+            .register_old_page(0, ZgcRealHeap::Z_LOGICAL_PAGE_BYTES);
+        heap.old_page_ids.lock().clone_from(&old);
+
+        heap.note_ref_store(holder.as_ptr() as usize);
+        assert_eq!(
+            heap.remembered_edge_count(),
+            1,
+            "a store into an old page must be remembered"
+        );
+    }
+
+    /// **A remembered old slot is a ROOT: the object it names is reachable
+    /// from the old generation and nowhere else.**
+    ///
+    /// This is the assertion that makes the whole generational apparatus worth
+    /// having. Without it a young cycle sweeps an object whose only reference
+    /// lives in an old-generation field -- the classic missing-card
+    /// use-after-free, and the entire justification for the store barrier.
+    #[test]
+    fn a_young_scope_treats_remembered_old_slots_as_roots() {
+        let heap = ZgcRealHeap::with_capacity(64 * 1024);
+        heap.set_tlab_enabled(false);
+        let old_holder = heap.alloc_object(ClassId::new(1), 1);
+        let young_target = heap.alloc_object(ClassId::new(2), 0);
+        heap.set_field(old_holder, 0, Value::Object(Some(young_target)));
+
+        // Page 0 becomes old and the store is carded.
+        let policy = generation::ZPromotionPolicy::with_age(1);
+        let (_y, old) = heap.age_pages_and_split(1, &policy);
+        heap.remembered
+            .register_old_page(0, ZgcRealHeap::Z_LOGICAL_PAGE_BYTES);
+        heap.old_page_ids.lock().clone_from(&old);
+        heap.note_ref_store(old_holder.as_ptr() as usize);
+        assert_eq!(heap.remembered_edge_count(), 1);
+
+        let base = heap.arena.lock().base_ptr() as usize;
+        let roots = heap.remembered_roots(base);
+
+        assert!(
+            roots.contains(&(young_target.as_ptr() as usize)),
+            "the object an old field points at must come back as a root; \
+             without it a young cycle collects a live object. roots={roots:?}"
+        );
+    }
+
+    /// **`GarbageCollector::write_barrier` actually reaches the card
+    /// barrier.**
+    ///
+    /// The test above calls `note_ref_store` directly, so it would pass with
+    /// the `write_barrier` arm back to the `{}` it was until 2026-08-13. This
+    /// one drives the trait method every reference store in the VM already
+    /// goes through, which is the only way to tell a wired barrier from an
+    /// inert one.
+    #[test]
+    fn the_write_barrier_trait_arm_reaches_the_card_barrier() {
+        use crate::collector::GarbageCollector;
+        let heap = ZgcRealHeap::with_capacity(64 * 1024);
+        heap.set_tlab_enabled(false);
+        let holder = heap.alloc_object(ClassId::new(1), 1);
+
+        let policy = generation::ZPromotionPolicy::with_age(1);
+        let (_y, old) = heap.age_pages_and_split(1, &policy);
+        heap.remembered
+            .register_old_page(0, ZgcRealHeap::Z_LOGICAL_PAGE_BYTES);
+        heap.old_page_ids.lock().clone_from(&old);
+
+        heap.write_barrier(holder, Value::Object(None));
+
+        assert_eq!(
+            heap.remembered_edge_count(),
+            1,
+            "write_barrier must card the written object"
+        );
+    }
+
+    // -- Phase 4: the load barrier on a real read path ---------------------
+
+    /// Disarmed, the read path is byte-for-byte what it was: an uncoloured
+    /// slot is read as a plain pointer and no barrier machinery runs.
+    ///
+    /// This is the cost claim, asserted. The gate is not an optimisation --
+    /// the barrier CANNOT run over an uncoloured slot, because a plain arena
+    /// pointer is above 2^42 and the classifier would read its address bits as
+    /// colours. If this ever passes with the barrier armed by default, every
+    /// reference read in the VM is resolving to the wrong object.
+    #[test]
+    fn the_read_barrier_is_disarmed_by_default_and_reads_a_plain_pointer() {
+        let heap = ZgcRealHeap::with_capacity(64 * 1024);
+        assert!(
+            !heap.load_barrier_armed(),
+            "nothing in a default run may colour slots"
+        );
+        let arr = heap.alloc_array(ClassId::new(0), ArrayElementType::Reference, 2);
+        let target = heap.alloc_object(ClassId::new(1), 0);
+        heap.set_array_element(arr, 0, Value::Object(Some(target)))
+            .expect("in bounds");
+
+        assert_eq!(
+            heap.get_array_element(arr, 0),
+            Ok(Value::Object(Some(target)))
+        );
+        assert_eq!(heap.get_array_element(arr, 1), Ok(Value::Object(None)));
+    }
+
+    /// **Armed, the barrier resolves a COLOURED slot back to its object** --
+    /// which the unbarriered path cannot do, because a coloured word is
+    /// deliberately implausible and `read_prim_element` degrades it to null.
+    ///
+    /// This is sites 6 and 7 of `zgc_colored_word_degradation.rs` seen from
+    /// the other side: the tripwire says the shared array arm nulls a coloured
+    /// word, and this says the ZGC arm goes through the barrier instead of
+    /// through that arm.
+    #[test]
+    fn an_armed_barrier_resolves_a_coloured_reference_element() {
+        let heap = ZgcRealHeap::with_capacity(64 * 1024);
+        let arr = heap.alloc_array(ClassId::new(0), ArrayElementType::Reference, 1);
+        let target = heap.alloc_object(ClassId::new(1), 0);
+
+        let base = heap.arena.lock().base_ptr() as u64;
+        let offset = target.as_ptr() as u64 - base;
+        let coloured: u64 = vaddr::color(offset, vaddr::ZColor::Remapped).into();
+
+        // Write the coloured word straight into the element, the way a
+        // relocation-aware store would.
+        let slot = unsafe { arr.as_ptr().add(ARRAY_DATA_OFFSET) as usize };
+        // SAFETY: an 8-byte-aligned reference word in a live array.
+        unsafe { std::ptr::write(slot as *mut u64, coloured) };
+
+        // Disarmed, that word is nonsense: the plain read hands back the raw
+        // bits, which is exactly why the barrier must precede the shared arm.
+        assert!(!heap.load_barrier_armed());
+
+        heap.set_barrier_color(Some(vaddr::ZColor::Remapped));
+        assert!(heap.load_barrier_armed());
+
+        let got = heap.get_array_element(arr, 0).expect("in bounds");
+        heap.set_barrier_color(None);
+
+        assert_eq!(
+            got,
+            Value::Object(Some(target)),
+            "the barrier must resolve a coloured word back to its object; \
+             a null here is the silent-degradation defect the tripwire names"
+        );
+    }
+
+    /// An armed barrier **forwards** a reference whose object relocation
+    /// moved, and heals the slot so the next read takes the fast path.
+    ///
+    /// This is the property that makes relocation possible at all: the mutator
+    /// keeps reading through a stale slot and the barrier repairs it on the
+    /// way past.
+    #[test]
+    fn an_armed_barrier_forwards_a_relocated_reference() {
+        let heap = ZgcRealHeap::with_capacity(64 * 1024);
+        let arr = heap.alloc_array(ClassId::new(0), ArrayElementType::Reference, 1);
+        let from_obj = heap.alloc_object(ClassId::new(1), 0);
+        let to_obj = heap.alloc_object(ClassId::new(1), 0);
+
+        let base = heap.arena.lock().base_ptr() as u64;
+        let from_off = from_obj.as_ptr() as u64 - base;
+        let to_off = to_obj.as_ptr() as u64 - base;
+
+        // A slot still naming the OLD location, coloured with the mark parity
+        // that is bad while `Remapped` is good -- i.e. the state a mutator
+        // finds after a relocating cycle it has not yet caught up with.
+        let stale: u64 = vaddr::color(from_off, vaddr::ZColor::Marked0).into();
+        let slot = unsafe { arr.as_ptr().add(ARRAY_DATA_OFFSET) as usize };
+        // SAFETY: an 8-byte-aligned reference word in a live array.
+        unsafe { std::ptr::write(slot as *mut u64, stale) };
+
+        // Publish the move and arm the barrier.
+        heap.forwarding.lock().insert(from_off, to_off);
+        heap.relocate_active.store(true, Ordering::Relaxed);
+        heap.set_barrier_color(Some(vaddr::ZColor::Remapped));
+
+        let got = heap.get_array_element(arr, 0).expect("in bounds");
+
+        // SAFETY: reading back the word the barrier healed.
+        let healed = unsafe { std::ptr::read(slot as *const u64) };
+        heap.set_barrier_color(None);
+        heap.relocate_active.store(false, Ordering::Relaxed);
+        heap.forwarding.lock().clear();
+
+        assert_eq!(
+            got,
+            Value::Object(Some(to_obj)),
+            "the barrier must forward a stale reference to where the object went"
+        );
+        assert_ne!(
+            healed, stale,
+            "and it must SELF-HEAL the slot, or every later read pays the slow \
+             path again"
+        );
+    }
+
+    /// **Arming the read barrier reaches the JIT's codegen gate.**
+    ///
+    /// The barrier tests above all sit inside this crate, and every one of
+    /// them would pass while JIT-compiled code went on emitting raw inline
+    /// reference loads over coloured slots -- which is a use-after-free, not a
+    /// missed optimisation. This asserts the one fact that connects the two:
+    /// `set_barrier_color` publishes to `cratonvm_types`, which is what
+    /// `x64::zgc_read_barrier_blocks_inline_fields` reads.
+    ///
+    /// Serialised, because the flag is process-wide by design (see its doc for
+    /// why the JIT cannot read a per-heap one).
+    #[test]
+    fn arming_the_read_barrier_sets_the_process_wide_codegen_gate() {
+        let _serialise = OVERLAY_TEST_LOCK.lock();
+        let heap = ZgcRealHeap::with_capacity(64 * 1024);
+        assert!(
+            !cratonvm_types::zgc_read_barrier_armed(),
+            "the codegen gate must start closed"
+        );
+
+        heap.set_barrier_color(Some(vaddr::ZColor::Marked0));
+        let armed = cratonvm_types::zgc_read_barrier_armed();
+        heap.set_barrier_color(None);
+        let disarmed = cratonvm_types::zgc_read_barrier_armed();
+
+        assert!(
+            armed,
+            "arming must reach the codegen gate, or the JIT keeps emitting raw              inline loads over coloured slots"
+        );
+        assert!(!disarmed, "and disarming must let the inline arms back on");
     }
 
     /// The intent sub-flag is off unless asked for.

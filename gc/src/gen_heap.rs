@@ -16905,6 +16905,26 @@ fn zero_run_verdict(
     }
 }
 
+/// `CRATONVM_GC_NO_EMPTY_OBJECT_RUN=1` — treat every all-zero run as a walk
+/// desync again, i.e. restore the pre-2026-08-12 behaviour in which a run of
+/// EMPTY objects took the unwind-and-resync path.
+///
+/// This exists because the empty-object-run recovery is the kind of fix whose
+/// ABSENCE is invisible: without it the sweep still completes, still reports a
+/// walk that ran to `used`, and simply throws away almost every reclaim
+/// decision it made — 40 724 of 40 746 in the case it was written for. Two
+/// separate investigations (`young-sweep-empty-object-run-unwind-20260812`, and
+/// `TestDefaultInstanceManager`'s fourth recurrence) spent rounds on symptoms of
+/// exactly that, and neither could A/B the mechanism in one binary because
+/// there was no way to turn it off. Now there is, and the cross-run comparison
+/// that "prices the box" instead of the change is not the only option.
+///
+/// NOT `OnceLock`-cached: this is read once per zero RUN, not per object, and
+/// caching it would make the flag racy against whichever sweep runs first.
+fn empty_object_run_recovery_disabled() -> bool {
+    cratonvm_types::flags::runtime_var_os("CRATONVM_GC_NO_EMPTY_OBJECT_RUN").is_some()
+}
+
 /// `Some(resume)` when the run is a run of EMPTY objects and the walk may step
 /// to `resume`; `None` when it is evidence the walk left the object grid.
 fn zero_run_empty_object_resume(
@@ -16914,6 +16934,9 @@ fn zero_run_empty_object_resume(
     used: usize,
     side_sorted: &[usize],
 ) -> Option<usize> {
+    if empty_object_run_recovery_disabled() {
+        return None;
+    }
     match zero_run_verdict(base, cursor, run_end, used, side_sorted) {
         ZeroRunVerdict::EmptyObjects { resume } => Some(resume),
         _ => None,

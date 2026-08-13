@@ -5371,6 +5371,49 @@ fn deduplicate_rooted_urls(ctx: &mut dyn NativeContext, urls: &mut Vec<RootedUrl
 /// Falls back to the eager form when the fabricated `Enumeration$Impl` is
 /// refused (`--jdk-only`), since the real `java.util.Enumeration` that lands
 /// there has no slot to carry the marker and no native to act on it.
+/// A `getResources` enumeration that does not scan the classpath until the
+/// caller asks for an element, and then only far enough to find it.
+///
+/// Returns `None` when this call cannot use the form — the name can match more
+/// than once inside a single entry (a glob), the VM has no incremental scan
+/// (a mock `NativeContext`), or the fabricated `Enumeration$Impl` is refused
+/// (`--jdk-only`) — and the caller falls back to scanning eagerly.
+///
+/// The empty case is left to the caller too. `cl_get_resources_impl` has a
+/// documented fallback for "no entry served this name" (the `classpath:<name>`
+/// pseudo-URL) and a cap for `META-INF/MANIFEST.MF`, both of which need the
+/// whole result to decide; probing for the FIRST element here is what tells
+/// the caller whether either can apply.
+fn lazy_scan_enumeration(
+    ctx: &mut dyn NativeContext,
+    resource_name: &str,
+) -> Result<Option<ObjectRef>, MethodCallFailed> {
+    if !ctx.resource_name_supports_incremental_scan(resource_name) {
+        return Ok(None);
+    }
+    // If the scan yields nothing at all, the caller's empty-result fallback
+    // owns the answer — hand it back rather than returning an empty lazy
+    // enumeration that would skip it.
+    if ctx.next_resource_url(resource_name, 0, 0).is_none() {
+        return Ok(None);
+    }
+    let name_obj = ctx.create_string(resource_name);
+    let name_pin = ctx.pin_native_root(name_obj);
+    let out = match try_alloc_concurrent_synthetic(ctx, ENUMERATION_IMPL_CLASS, 5) {
+        Ok(enm) => {
+            let name_obj = ctx.read_native_pin(name_pin, name_obj);
+            ctx.set_field(enm, 0, Value::Object(Some(name_obj)));
+            ctx.set_field(enm, 1, Value::Int(0));
+            ctx.set_field(enm, 3, Value::Int(ENUM_ELEMENTS_LAZY_SCAN));
+            ctx.set_field(enm, 4, Value::Int(0));
+            Some(enm)
+        }
+        Err(_) => None,
+    };
+    ctx.unpin_native_roots(name_pin);
+    Ok(out)
+}
+
 fn lazy_enumeration_from_url_strings(
     ctx: &mut dyn NativeContext,
     urls: &[String],
@@ -5384,7 +5427,7 @@ fn lazy_enumeration_from_url_strings(
         let arr = ctx.read_native_pin(arr_pin, arr);
         ctx.set_array_element(arr, i, Value::Object(Some(spec)));
     }
-    let out = match try_alloc_concurrent_synthetic(ctx, ENUMERATION_IMPL_CLASS, 4) {
+    let out = match try_alloc_concurrent_synthetic(ctx, ENUMERATION_IMPL_CLASS, 5) {
         Ok(enm) => {
             let arr = ctx.read_native_pin(arr_pin, arr);
             ctx.set_field(enm, 0, Value::Object(Some(arr)));
@@ -5717,6 +5760,15 @@ fn cl_get_resources_impl(
                     }
                 }
             }
+        }
+    }
+
+    // The lazy form first: it is the same enumeration, in the same order, but
+    // it stops scanning where the caller stops reading. It declines the cases
+    // the two fallbacks below need a whole result for.
+    if resource_name != "META-INF/MANIFEST.MF" {
+        if let Some(enm) = lazy_scan_enumeration(ctx, resource_name)? {
+            return Ok(Some(Value::Object(Some(enm))));
         }
     }
 
@@ -6167,6 +6219,26 @@ pub(crate) const ENUM_ELEMENTS_AS_IS: i32 = 0;
 /// function the eager path called.
 pub(crate) const ENUM_ELEMENTS_URL_SPECS: i32 = 1;
 
+/// Slot 3 of [`ENUMERATION_IMPL_CLASS`]: there is no element array at all.
+/// Slot 0 holds the RESOURCE NAME, and each element is found by resuming the
+/// classpath scan from the cursor in slots 1 (entry index) and 4 (class-path
+/// segment).
+///
+/// [`ENUM_ELEMENTS_URL_SPECS`] stopped `getResources` building 1843
+/// `java.net.URL`s for a caller that wanted one, but it still SCANNED all 4230
+/// classpath entries to collect the spec strings first. Measured on the Quarkus
+/// full-reactor classpath, `resources("").anyMatch(..)` matching on element 1
+/// cost 1.20 ms against HotSpot's 0.03 ms — 40x, all of it work the caller
+/// never asked for. The JDK's enumeration touches one entry; this makes ours
+/// do the same.
+///
+/// There is deliberately no "peeked element" slot: `hasMoreElements` re-runs
+/// the same query `nextElement` does rather than caching. The query is a pure
+/// function of (name, cursor) that stops at the first hit, so re-running it
+/// costs only the entries between here and the next match — and a peek slot
+/// would be one more piece of state to keep consistent with the cursor.
+pub(crate) const ENUM_ELEMENTS_LAZY_SCAN: i32 = 2;
+
 /// A real `java.util.Enumeration` over `array`, or `None` when this image
 /// cannot build one.
 ///
@@ -6224,7 +6296,7 @@ pub(crate) fn make_snapshot_enumeration(
     // both and read it back through the pin, the same contract
     // `make_iterator_from_array` documents.
     let pin = ctx.pin_native_root(array);
-    let out = match try_alloc_concurrent_synthetic(ctx, ENUMERATION_IMPL_CLASS, 4) {
+    let out = match try_alloc_concurrent_synthetic(ctx, ENUMERATION_IMPL_CLASS, 5) {
         Ok(enm) => {
             let array = ctx.read_native_pin(pin, array);
             ctx.set_field(enm, 0, Value::Object(Some(array)));
@@ -6255,8 +6327,35 @@ pub(crate) fn make_snapshot_enumeration(
 /// ([`ENUM_ELEMENTS_AS_IS`], what every producer but `getResources` stores and
 /// what a zero-initialized instance already means) or as a URL spec string to
 /// be turned into a `java.net.URL` right here ([`ENUM_ELEMENTS_URL_SPECS`]).
+/// The next `(spec, segment, index)` a lazy-scan enumeration would yield, or
+/// `None` when the classpath is exhausted. Pure in the receiver: it reads the
+/// cursor but never advances it, so `hasMoreElements` and `nextElement` both
+/// call it and agree.
+fn enum_impl_peek_lazy(ctx: &mut dyn NativeContext, this: ObjectRef) -> Option<(String, u32, u32)> {
+    let name = match ctx.get_field(this, 0) {
+        Value::Object(Some(s)) => ctx.read_string(s)?,
+        _ => return None,
+    };
+    let index = ctx.get_field(this, 1).as_int().unwrap_or(0).max(0) as u32;
+    let segment = ctx.get_field(this, 4).as_int().unwrap_or(0).max(0) as u32;
+    ctx.next_resource_url(&name, segment, index)
+}
+
+fn enum_impl_is_lazy(ctx: &dyn NativeContext, this: ObjectRef) -> bool {
+    ctx.get_field(this, 3).as_int().unwrap_or(ENUM_ELEMENTS_AS_IS) == ENUM_ELEMENTS_LAZY_SCAN
+}
+
 fn enum_impl_next_element(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
+    if enum_impl_is_lazy(ctx, this) {
+        let Some((spec, segment, index)) = enum_impl_peek_lazy(ctx, this) else {
+            return Ok(Some(Value::Object(None)));
+        };
+        ctx.set_field(this, 4, Value::Int(segment as i32));
+        ctx.set_field(this, 1, Value::Int(index as i32));
+        let url = crate::jboss_module_loader::build_synthetic_url(ctx, &spec)?;
+        return Ok(Some(Value::Object(Some(url))));
+    }
     let idx = ctx.get_field(this, 1).as_int().unwrap_or(0) as usize;
     let arr = match ctx.get_field(this, 0) {
         Value::Object(Some(a)) => a,
@@ -6294,6 +6393,10 @@ pub fn register_enumeration_impl_natives(r: &mut NativeMethodRegistry) {
     let enm = "java/util/Enumeration$Impl";
     r.register(enm, "hasMoreElements", "()Z", |ctx, args| {
         let this = obj_arg(args, 0)?;
+        if enum_impl_is_lazy(ctx, this) {
+            let more = enum_impl_peek_lazy(ctx, this).is_some();
+            return Ok(Some(Value::Int(i32::from(more))));
+        }
         let idx = ctx.get_field(this, 1).as_int().unwrap_or(0) as usize;
         let arr = match ctx.get_field(this, 0) {
             Value::Object(Some(a)) => a,
@@ -6305,6 +6408,10 @@ pub fn register_enumeration_impl_natives(r: &mut NativeMethodRegistry) {
     r.register(enm, "nextElement", "()Ljava/lang/Object;", enum_impl_next_element);
     r.register(enm, "hasNext", "()Z", |ctx, args| {
         let this = obj_arg(args, 0)?;
+        if enum_impl_is_lazy(ctx, this) {
+            let more = enum_impl_peek_lazy(ctx, this).is_some();
+            return Ok(Some(Value::Int(i32::from(more))));
+        }
         let idx = ctx.get_field(this, 1).as_int().unwrap_or(0) as usize;
         let arr = match ctx.get_field(this, 0) {
             Value::Object(Some(a)) => a,

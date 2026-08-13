@@ -111,16 +111,72 @@ public class RClassUnloadSweep {
         churnSink = null;
     }
 
-    public static void main(String[] args) throws Exception {
+    /** Bare `new Object()` from a JIT-compiled loop, which is a DIFFERENT
+     *  allocation shape from `churn()` above and the only one this vector's
+     *  own defect leaves behind.
+     *
+     *  An empty object — `ClassId(0)`, kind `Object`, `num_slots = 0`, hash not
+     *  yet minted — is HEADER_SIZE all-zero bytes, indistinguishable by header
+     *  bytes from reclaimed memory. The generational young walk used to read a
+     *  run of them as evidence it had left the object grid and unwind every
+     *  reclaim decision taken since the last anchor; the loader this vector
+     *  drops is one of the decisions thrown away, so its span is never zeroed
+     *  and the sweep's `word0 != 0` liveness proxy answers "live". That is the
+     *  mechanism behind `TestDefaultInstanceManager`'s fourth recurrence and
+     *  behind a `BatchingConnectionTest` young-GC livelock, and it is worth
+     *  stating exactly why the ORIGINAL `churn()` cannot see it: a
+     *  `byte[128]`'s header carries its length, so it is never all-zero.
+     *
+     *  JIT-compiled on purpose. The interpreter mints the identity hash
+     *  eagerly, so an interpreted `new Object()` has a non-zero header and is
+     *  the wrong shape — which is why the defect this pins was invisible under
+     *  `--nojit`. The warm-up below is what gets the loop compiled.
+     *
+     *  Measured with `CRATONVM_GC_NO_EMPTY_OBJECT_RUN=1` (the in-binary A/B
+     *  opt-out for the recovery), `-XX:+UseGenerationalGC`: without this method
+     *  the vector prints `unloaded=true` in BOTH arms — it could not see the
+     *  bug at all — and with it, `true` with the recovery on and `false` with
+     *  it off. */
+    static void emptyChurn(int n) {
+        Object keep = null;
+        for (int i = 0; i < n; i++) {
+            Object o = new Object();
+            // Keep one per 1024 so the loop cannot be optimised away wholesale,
+            // while leaving the other 1023 immediately dead — which is the run
+            // of empty objects the walk has to step over.
+            if ((i & 1023) == 0) {
+                keep = o;
+            }
+        }
+        churnSink = keep;
+        churnSink = null;
+    }
+
+    /** The whole probe, minus the printing, so the Generational twin
+     *  (`RClassUnloadSweepGen`) runs byte-for-byte the same thing under a
+     *  different collector instead of a second copy that can drift. */
+    static boolean unloadedUnderChurn() throws Exception {
+        // Compile `emptyChurn` BEFORE the payload dies: the shape this vector
+        // exists for is the JIT's zero-header allocation, and a loop that only
+        // gets hot after the interesting collection contributes nothing.
+        for (int w = 0; w < 40; w++) {
+            emptyChurn(20000);
+        }
         byte[] bytes = readClassBytes(RClassUnloadSweep.class.getName() + "$Payload");
         WeakReference<Class<?>> ref = defineUseAndDrop(bytes);
 
         boolean cleared = false;
         for (int round = 0; round < 12 && !cleared; round++) {
             churn();
+            emptyChurn(200000);
             System.gc();
             cleared = ref.get() == null;
         }
+        return cleared;
+    }
+
+    public static void main(String[] args) throws Exception {
+        boolean cleared = unloadedUnderChurn();
 
         // The one observable, and it must be on a `CK ` line. run.sh:218
         // filters both VMs' output through `grep -aE '^(PASS|CK) '` before

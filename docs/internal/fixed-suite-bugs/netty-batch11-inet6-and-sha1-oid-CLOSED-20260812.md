@@ -16,7 +16,7 @@ against a stock HotSpot JDK 25 baseline.
 | 1 | `Inet6Address.getByAddress` folds a v4-mapped address to 4 bytes | ✅ **FIXED** — `NetUtilTest` 13/14 → **14/14**, matches HotSpot |
 | 2 | `sha1WithRSAEncryption` unimplemented in the chain verifier | ✅ **FIXED**, and it was hiding a second defect — `SslContextTrustManagerTest` 0/4 → **4/4** |
 | 3 | the DNS transport never comes up | ✅ the **hang is gone** and, as of 2026-08-13, so are the 7 residual failures: they were the batch-09 datagram-bind defect → [record](netty-pcap-write-handler-udp-bind-and-tcp-close-FIXED-20260813.md). `DnsAddressResolverGroupTest` 2/2, `SearchDomainTest` 7/7, `DnsNameResolverTest` 195 ok / 21 failed in 66 s |
-| 4 | post-quantum KeyPairGenerators + an `X509CertImpl` accessor | ⚠️ generators **closed on dev**; the remaining 15-test delta is re-filed → [pkitesting-pqc-certificates-and-x509certimpl-getalgorithm](pkitesting-pqc-certificates-and-x509certimpl-getalgorithm-20260812.md) |
+| 4 | post-quantum KeyPairGenerators + an `X509CertImpl` accessor | ✅ **CLOSED 2026-08-13** → [pkitesting PQC + initVerify](netty/pkitesting-pqc-and-initverify-FIXED-20260813.md). The delta was 18 tests and three defects, and the `X509CertImpl` accessor was none of them: `Signature.initVerify(Certificate)` was passing the CERTIFICATE as the verification key. `CertificateBuilderTest` now matches HotSpot exactly. |
 | 5 | TLS handshake/alert family | → [batch 10](tls-batch10-encrypted-keys-and-handshake-gaps-20260812.md), as this page always said |
 | 6 | BouncyCastle provider identity | ❌ **NOT A DEFECT** — `BouncyCastleUtilTest` discovers **0 tests on HotSpot too** |
 | 7 | `HashedWheelTimerTest` wall-clock assertion | unchanged: the throughput gap meeting a fixed 650 ms bound, not a correctness defect |
@@ -164,7 +164,7 @@ with `NoSuchMethodError: sun.security.x509.X509CertImpl.getAlgorithm()` visible
 in the log. That accessor **does not exist on JDK 25's `X509CertImpl`** (checked
 with `javap`), so it is a receiver-confusion, not a missing method — filed with
 the measurement in
-[pkitesting-pqc-certificates-and-x509certimpl-getalgorithm](pkitesting-pqc-certificates-and-x509certimpl-getalgorithm-20260812.md).
+[pkitesting PQC + initVerify](netty/pkitesting-pqc-and-initverify-FIXED-20260813.md) — **CLOSED 2026-08-13**.
 
 ## Cause 6 — not a defect
 

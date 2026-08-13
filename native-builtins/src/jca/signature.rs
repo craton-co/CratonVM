@@ -1073,6 +1073,77 @@ fn sig_init_verify(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
     Ok(None)
 }
 
+/// `Signature.initVerify(Certificate)` — extract the certificate's public key,
+/// then initialise exactly as the `PublicKey` overload does.
+///
+/// This overload was registered against `sig_init_verify` itself, whose body
+/// reads `args[1]` as the KEY. So the certificate was stored as the
+/// verification key and forwarded to the SPI, where it surfaced differently per
+/// algorithm and never as itself:
+///
+/// * ECDSA — `ECKeyFactory.toECKey` calls `key.getAlgorithm()`, which
+///   `sun.security.x509.X509CertImpl` does not declare (that method is
+///   `java.security.Key`'s), so `NoSuchMethodError:
+///   sun.security.x509.X509CertImpl.getAlgorithm()Ljava/lang/String;`;
+/// * EdDSA — `EdDSASignature.engineInitVerify` rejects the non-key outright
+///   with `InvalidKeyException: Unsupported key type`.
+///
+/// Both messages point at the SPI and neither names the real defect, which is
+/// why the known-issue page recorded them as two separate causes (a missing
+/// `X509CertImpl` accessor, and unimplemented Ed25519/Ed448 verification). They
+/// are one wrong argument. `io.netty.pkitesting.CertificateBuilderTest`'s five
+/// `createCertIssuedBy*` tests all reach it through
+/// `signature.initVerify(root.getCertificate())`.
+///
+/// The key-usage check mirrors `java.security.Signature.initVerify(Certificate)`
+/// exactly: a certificate whose KeyUsage extension is present AND explicitly
+/// denies `digitalSignature` (bit 0) must be refused. A `null` key usage — no
+/// such extension — is silently allowed, which is what makes this a no-op for
+/// every certificate that does not carry the extension.
+fn sig_init_verify_cert(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let cert = match args.get(1) {
+        Some(Value::Object(Some(c))) => *c,
+        // A null certificate: let the key-taking body raise whatever it raises
+        // for a null argument rather than inventing a different exception.
+        _ => return sig_init_verify(ctx, args),
+    };
+    let cert_pin = ctx.pin_native_root(cert);
+    let usage_denies_signing = match ctx.invoke_virtual(cert, "getKeyUsage", "()[Z", &[]) {
+        Ok(Some(Value::Object(Some(arr)))) => {
+            ctx.array_length(arr) > 0 && ctx.get_array_element(arr, 0) == Value::Int(0)
+        }
+        // `getKeyUsage` is not on `Certificate`, only on `X509Certificate`; a
+        // non-X509 certificate simply has no usage bits to consult.
+        _ => false,
+    };
+    if usage_denies_signing {
+        ctx.unpin_native_roots(cert_pin);
+        return Err(crate::phases_early::throw_jca_exc(
+            ctx,
+            "java/security/InvalidKeyException",
+            "Wrong key usage",
+        ));
+    }
+    let cert = ctx.read_native_pin(cert_pin, cert);
+    let key = ctx.invoke_virtual(cert, "getPublicKey", "()Ljava/security/PublicKey;", &[]);
+    ctx.unpin_native_roots(cert_pin);
+    let key = match key? {
+        Some(v @ Value::Object(Some(_))) => v,
+        // Fail CLOSED. Passing the certificate on (the old behaviour) is what
+        // produced the misleading SPI errors above, and silently initialising
+        // with no key would let `verify()` answer on nothing.
+        _ => {
+            return Err(crate::phases_early::throw_jca_exc(
+                ctx,
+                "java/security/InvalidKeyException",
+                "certificate has no public key",
+            ))
+        }
+    };
+    let this = this_arg(args)?;
+    sig_init_verify(ctx, &[Value::Object(Some(this)), key])
+}
+
 fn sig_update_byte(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = this_arg(args)?;
     // `Signature.update` DECLARES `SignatureException`, and HotSpot raises it
@@ -1484,11 +1555,14 @@ pub fn register(r: &mut NativeMethodRegistry) {
         "(Ljava/security/PublicKey;)V",
         sig_init_verify,
     );
+    // NOT `sig_init_verify`: that body reads `args[1]` as the verification KEY,
+    // and this overload's `args[1]` is a CERTIFICATE. See
+    // `sig_init_verify_cert`.
     r.register(
         cls,
         "initVerify",
         "(Ljava/security/cert/Certificate;)V",
-        sig_init_verify,
+        sig_init_verify_cert,
     );
 
     r.register(cls, "update", "(B)V", sig_update_byte);

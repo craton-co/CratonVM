@@ -477,6 +477,43 @@ impl ZPageReal {
         }
     }
 
+    /// A page **view** over memory this struct does not own.
+    ///
+    /// [`ZPageAllocator`] owns the pages it hands out and is the only thing
+    /// that may call [`Self::new`]. This constructor exists for the opposite
+    /// arrangement: `ZgcRealHeap` allocates from a single flat `Arena`, and
+    /// imposes a logical grid over it so that the page-keyed consumers in this
+    /// crate -- `forwarding`'s relocation-set selector, `generation`'s scope,
+    /// `remembered`'s per-page table -- have the three things they actually
+    /// need (an id, a byte range, and live/used accounting) without the arena
+    /// being replaced by the page allocator first.
+    ///
+    /// The distinction matters and must not blur: a view **allocates nothing**
+    /// and frees nothing. `alloc` on one would hand out bytes the arena
+    /// believes it still owns, so a caller that builds views must never use
+    /// them to allocate; they are an accounting overlay and their lifecycle
+    /// state is meaningless. `free_page` on one would be a double free.
+    ///
+    /// `used` is supplied rather than bumped, because the arena already knows
+    /// how far into each grid cell it has allocated.
+    pub(crate) fn view(
+        id: u64,
+        size_class: ZPageSizeClass,
+        base: usize,
+        size: usize,
+        used: usize,
+        live_bytes: usize,
+    ) -> Self {
+        let page = Self::new(id, size_class, base, size);
+        page.top.store(used.min(size), Ordering::Release);
+        page.live_bytes.store(live_bytes, Ordering::Release);
+        // `Allocating` rather than `Free`: a walker that checks state before
+        // decoding must not skip a view holding live objects.
+        page.state
+            .store(ZPageState::Allocating as u8, Ordering::Release);
+        page
+    }
+
     /// Stable page identity.
     pub fn id(&self) -> u64 {
         self.id
