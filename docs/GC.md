@@ -146,9 +146,12 @@ in `gc/`, not just documented:
 2. `-XX:+UseStringDeduplication` is parsed but intentionally inert. The
    raw-address deduplication table must participate in every collector's
    remap and purge protocol before production callers can use it.
-3. `CRATONVM_G1_PARALLEL_EVAC=1` is an experimental opt-in. Mixed
+3. `CRATONVM_GC=g1-parallel-evac` is an experimental opt-in. Mixed
    collections stay on the serial evacuator, and the serial path remains
-   the supported default.
+   the supported default. The live-object corruption this path carried
+   (G1-9) is fixed as of 2026-08-13; what keeps it opt-in now is that it
+   has had no gauntlet run and still spawns a `thread::scope` worker pool
+   per collection.
 
 The STW barrier race and missing class-unloading driver described by
 earlier versions of this page are fixed. For the current class-loader
@@ -181,7 +184,7 @@ mark), BinaryTrees (deep recursion). Always diff against a real JDK run.
 | `CRATONVM_GC_VERIFY_STALE=1` | Post-GC stale-frame-slot verifier (recycled drain destinations are recognized as benign) |
 | `CRATONVM_DBG_WEAKREF=1` | Weak/Phantom null/restore pass tracing |
 | `CRATONVM_G1_NO_EVAC_RETRY=1` | Disable the evacuation-failure drain (bisection) |
-| `CRATONVM_G1_PARALLEL_EVAC=1` | Opt-in parallel young evacuator (known race — testing only) |
+| `CRATONVM_GC=g1-parallel-evac` | Opt-in parallel young evacuator. The "known race" this row warned about was G1-9, which was neither known to be a race nor a race — it was a compact-layout scan divergence, now fixed (`audits/g1-audit.md` §0, internal record tree). Still opt-in: no gauntlet run yet, and it spawns a worker pool per GC. |
 | `CRATONVM_DBG_GC_STRESS=<bytes>` | Force young GCs every N allocated bytes (Generational) |
 | `CRATONVM_GC_PAR_THREADS=<n>` | Generational young-GC worker count. `0`/`1` forces the sequential collector; `>= 2` forces that many workers regardless of heap size. Unset = `min(available_parallelism, 8)` once the young gen passes the size floor. `available_parallelism` follows CPU affinity, so a `taskset -c N` run is automatically sequential |
 | `CRATONVM_GC_PAR_MIN_BYTES=<bytes>` | Young-gen size floor below which the young GC stays sequential (default 16 MiB) |

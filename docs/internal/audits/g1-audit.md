@@ -35,7 +35,7 @@ which this change does not own; they are written out verbatim in §8.
 | **G1-6** | G1's remembered set had a `source_count()` but was never fed into `gc_metrics::remembered_set_bytes`, so `rset_bytes_per_live_byte` read as zero under `-XX:+UseG1GC`. (Reconciliation item 5 of the TLAB audit.) | Observability | **Fixed** — `record_remembered_set_bytes` is published once per mark cycle from `cleanup`, after the prune (the point at which the set is smallest and final). The per-entry size is `size_of::<usize>() + size_of::<u64>()` since G1-8 made an entry `(source, generation)`; keeping the gauge in step with the representation is what stops `rset_bytes_per_live_byte` — the number §9 item 5 is decided on — from under-reporting by a third. |
 | **G1-7** | No G1 pause stated its own decision anywhere. Every fail-safe G1 takes — kept regions after evacuation failure, a wedged drain, an abandoned mark closure, a CSet emptied by pins — silently changes what the pause reclaims, and none was visible outside a debug build. | Observability | **Fixed** — `gc_metrics::record_g1_cycle` / the `[GC] g1 cycle #N:` line in `collector_decision_report()`. |
 | **G1-8** | The remembered set is *additive* and its only pruning is `cleanup`'s Free-source pass. A source region recycled into a live type is re-walked **wholesale**, resurrecting its dead objects' referents. | Medium (over-retention, not unsoundness) | **Fixed** (G1AUD-5) — an rset entry is now `(source_index, generation)` rather than a bare source index. `G1Region::recycled_in_generation` records when a region was last reset, `rset_cache_epoch` doubles as the monotone reclassification clock, and an entry is dead exactly when `stamp < source.recycled_in_generation`. Both the scan side (`live_rset_sources`) and `cleanup` (`retain_sources_in_generation`) now ask that sharper question instead of "is the source Free *right now*". Entries recorded without a generation get `RSET_GENERATION_PINNED` (`u64::MAX`) and are never aged out — over-retain rather than under-scan. The staleness test is a strict `<`, so an edge recorded in the same generation that later resets the source survives one extra cycle, again in the fail-safe direction. |
-| **G1-9** | The parallel young evacuator (`CRATONVM_G1_PARALLEL_EVAC=1`) has a known, non-deterministic live-object corruption. | Known | **Partially diagnosed; NOT fixed** (G1AUD-6). What was found and fixed is a *real serial/parallel divergence*: `young_collection_parallel` derived its remembered-set source set from the CSet rsets alone, omitting the `extend(jit_pinned_regions)` term the serial path has carried since the original CSet-straddle UAF fix. A JIT-pinned region is excluded from the CSet, so it is reached **only** as a source; any CSet object referenced from it whose edge the barrier did not record was neither evacuated nor rewritten, and Phase 5 zero-filled its region. `jit_pinned_region_set()` also contains every region holding a published un-retired TLAB tail, so it is routinely non-empty with no thread in JIT — which is the configuration the corruption reproduces under (`SteadyChurn @16m --nojit`, smallest heap, ~1 run in 8). **Whether this divergence is the whole of G1-9 is unconfirmed.** The root cause of the corruption has not been established by this audit; the path stays opt-in, mixed GC stays serial, and the cycle record still flags a parallel run so it cannot be mistaken for the serial path. Covered by `a_jit_pinned_region_is_a_wholesale_rset_source_on_the_parallel_path_too`. |
+| **G1-9** | The parallel young evacuator's object scan ignored compact field layouts, so a compact object's reference fields were never visited: its referents were not evacuated and its slots were not rewritten, and Phase 5 then freed the region they pointed into. | **Critical** (live-object loss / UAF under `CRATONVM_GC=g1-parallel-evac`) | **Fixed** 2026-08-13. `SharedEvac::process_object` and `seed_source_region` strode `HEADER_SIZE + slot_idx * SLOT_SIZE` over `num_slots()`, i.e. assumed the legacy uniform 16-byte cell body for every object, while every other reference walk in `g1.rs` — the serial evacuator, the Phase-4 remap, the mark scan, this audit's own V7b verifier — goes through `for_each_flat_object_reference`, which dispatches on `is_compact_object` and walks the registered `CompactLayout::field_offsets`. Both scans now do the same. Two corrections to this row's previous wording, both load-bearing for anyone re-reading the history: the defect was **not non-deterministic** (10/10 runs, and identical at `CRATONVM_G1_WORKERS=1`) and it was **not a race** — chasing it as a CAS race is why it stayed open. `num_slots()` is the hierarchy-wide field count, so the old stride also addressed 320 bytes of a 19-field compact object that occupies 152, reading and — on a decode that happened to look like `Value::Object` — writing past it. The G1AUD-6 source-set divergence recorded below was real and is still fixed, but it was **not** this. Regression: `parallel_evacuation_scans_compact_object_reference_fields`, which registers a `CompactLayout` with references at packed offsets and fails on the pre-fix scan — the coverage gap that hid this, since every other gc unit test allocates with no layout registered and is therefore legacy-layout, for which the old stride was accidentally correct. |
 
 Nothing in G1's SATB **pre**-write barrier was found missing on the paths this
 crate owns, and — contrary to the hypothesis this audit started from — the JIT
@@ -450,24 +450,42 @@ evacuated. Unchanged from that audit's §1.4.
 
 Ordered. Each item is a precondition for the next being meaningful.
 
-1. **Close G1-2** (§8.1). A remembered-set edge that the barrier can lose is a
-   UAF, and no amount of testing above it means anything while it stands.
+1. ~~**Close G1-2** (§8.1).~~ **Already done** — verified 2026-08-13 against the
+   code rather than this table: `region_bounds_are_live` (`jit/src/x64/licm.rs`)
+   reads the CONTENT of `JIT_REGION_BOUNDS` rather than its always-non-zero
+   address, and gates all three emitters that used to skip the containment
+   guard. Covered by `inline_ref_putfield_fast_path_is_gated_on_published_region_bounds`
+   and `region_bounds_are_live_reads_the_table_not_its_address`. The §0 row and
+   this item were both stale.
 2. **Make `verify_no_dangling_into_cset` affordable in release.** It is the only
    direct check of I-6 and today runs only under `debug_assertions` or the
    verify flag (`g1.rs:4222`). A sampled or budgeted variant, counted in
    `gc_metrics`, would turn "the rset is complete" from a review claim into a
    measured one.
-3. **Fix the parallel young evacuator's live-object corruption** (G1-9) or
-   delete the path. A collector with a known non-deterministic corruption behind
-   a flag is a permanent source of mis-triaged bug reports. *Partially advanced:*
-   one real serial/parallel divergence — the parallel source set omitting
-   JIT-pinned regions — was found and fixed (§0, G1AUD-6), and it is a plausible
-   contributor because it reproduces in the same `--nojit` configuration. **It
-   has not been confirmed as the root cause**, so this item stays open and the
-   flag stays opt-in until a run that reproduced the corruption is shown clean.
-4. **Give `pointer_map` a shardable form** so parallel evacuation's
-   `contains_key`-then-`evacuate` dedup stops being a TOCTOU
-   (`g1.rs:3805-3819` already writes the required change: `entry().or_insert_with`).
+3. ~~**Fix the parallel young evacuator's live-object corruption** (G1-9) or
+   delete the path.~~ **DONE** (2026-08-13) — root-caused to the compact-layout
+   scan divergence in §0, fixed, and covered by a unit regression. The repro
+   that established it is worth keeping: a self-verifying churn probe under
+   `-XX:+UseG1GC -Xmx16m --nojit` with `CRATONVM_GC=g1-parallel-evac`, whose
+   checksum is diffed against a real JDK run of the same class. It went 10/10
+   corrupt before the fix and 0/10 after, with the serial arm clean throughout.
+   Note for whoever writes the next such repro: verify the gated path is
+   actually taken (`RUST_LOG=cratonvm_gc=info` prints `g1: parallel evacuation
+   ACTIVE`) and that a collection actually happened — two of the first attempts
+   here ran no GC at all because the heap was too large, and
+   `CRATONVM_G1_PARALLEL_EVAC=1` is now a deprecated spelling of
+   `CRATONVM_GC=g1-parallel-evac`.
+4. ~~**Give `pointer_map` a shardable form** so parallel evacuation's
+   `contains_key`-then-`evacuate` dedup stops being a TOCTOU.~~ **Already
+   satisfied**, by the other half of the advice: the parallel evacuator does not
+   share the map at all. `SharedEvac::evacuate` decides the winner with a CAS on
+   the from-space object's own mark word, each worker accumulates its winning
+   `(old, new)` pairs in a thread-local `Vec`, and the shards are merged into one
+   `pointer_map` only after `thread::scope` joins. No `DashMap` is owed; the
+   surviving `contains_key` calls are all on the SERIAL path, which is
+   single-threaded under STW. (The two contracts that still told a future reader
+   to convert it "before enabling parallel evacuation" were corrected in
+   `g1.rs`.)
 5. **Bound the remembered set.** The "undead" entry is closed (G1-8): the prune
    is now generation-aware, so a recycled-then-retyped source no longer survives
    forever. What remains is a *bound* — the set is still additive within a
@@ -479,14 +497,15 @@ Ordered. Each item is a precondition for the next being meaningful.
    are walked wholesale and JNI-pinned ones are not. Once G1-2 is closed the
    asymmetry is sound; while it is open it is the hazard. Either way it should
    be a stated policy with a test, not a comment.
-7. **Put an STW witness on the mark-cycle entry points.** `start_concurrent_mark`,
-   `remark` and `cleanup` all require STW and none takes a
-   `StopTheWorldToken`, unlike `collect_garbage`. That is the one invariant in
-   §7 with no mechanical enforcement at all (I-17).
+7. ~~**Put an STW witness on the mark-cycle entry points.**~~ **DONE**
+   (2026-08-13). `start_concurrent_mark`, `remark` and `cleanup` now take
+   `&StopTheWorldToken`, threaded through the `VmHeap` wrappers to the two VM
+   sites, where the token is constructed only after `stw_take_over_and_wait` has
+   parked every mutator — not fabricated at the crate boundary, which would have
+   been decoration. `compile_fail` doctests in `gc/src/collector.rs` keep the
+   parameter from being dropped again. I-17 now has the same mechanical
+   enforcement `collect_garbage` has.
 8. **Run the probe kit (§`docs/GC.md`) with `CRATONVM_G1_DBG_REACH=1` on a
-   JIT-warm workload** and confirm the new `[GC] g1 cycle` line reports
-   `degraded=none` across a full mixed sequence. Any other value is a
-   reclamation the collector silently declined to make.
 
 ## 10. The G1-2 fix costs the fresh-ctor inline store, and that is not avoidable by elision
 
