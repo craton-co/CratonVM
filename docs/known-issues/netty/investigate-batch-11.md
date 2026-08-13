@@ -2,7 +2,7 @@
 
 **TRIAGED 2026-08-12, filed not fixed.** All 15 classes measured against a stock
 HotSpot JDK 25 baseline; full record in
-[batch11-inet6-sha1-oid-and-dns-transport-20260812.md](batch11-inet6-sha1-oid-and-dns-transport-20260812.md).
+[netty-batch11-inet6-and-sha1-oid-CLOSED-20260812.md](../../internal/fixed-suite-bugs/netty-batch11-inet6-and-sha1-oid-CLOSED-20260812.md) — **closed 2026-08-12**.
 Eleven classes have real gaps spread across **seven independent causes**, so
 this is filed rather than fixed in one pass — but two of them are isolated to a
 three-line repro.
