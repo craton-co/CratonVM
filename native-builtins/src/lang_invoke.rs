@@ -2158,6 +2158,41 @@ fn varhandle_coordinate_types(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
 /// `byteArrayViewVarHandle` get — distinct from an array-element access (which
 /// would return a single signed byte). CratonVM stores `byte[]` elements as
 /// signed `Value::Int`.
+/// Bounds-check a byte-array-view `VarHandle` access, JDK-style.
+///
+/// `MethodHandles.byteArrayViewVarHandle` checks the START index against
+/// `array.length - (width - 1)` — the number of positions a `width`-byte
+/// element can start at — and reports it that way:
+/// `Index -1 out of bounds for length 15` for a `short` view over a 16-byte
+/// array, not "for length 16". `RuntimeError::aioobe` formats the JDK's
+/// `Preconditions.checkIndex` wording, so the message matches character for
+/// character.
+///
+/// There was no check at all here. Both `get` and `set` took the raw `int`
+/// coordinate as `*i as usize`, so a negative index wrapped to an enormous
+/// `usize` and the per-byte loop below simply read zeros or dropped the writes
+/// — an out-of-bounds **write** that reported success. Nothing in the corpus
+/// caught it because netty only takes this path when `sun.misc.Unsafe` is
+/// unavailable, and CratonVM pinned `sun.misc.unsafe.memory.access` so netty
+/// never did; on stock HotSpot 25, which does not pin it, netty's heap
+/// `ByteBuf` reads and writes go through exactly this VarHandle.
+fn byte_view_check_index(
+    ctx: &dyn NativeContext,
+    arr: ObjectRef,
+    index: i32,
+    elem: u8,
+) -> Result<usize, MethodCallFailed> {
+    let width = i64::from(byte_view_width(elem) as u32);
+    let length = ctx.array_length(arr) as i64;
+    // Saturating at 0: an array shorter than one element has no valid start,
+    // and the JDK reports the (clamped) count, never a negative length.
+    let limit = (length - (width - 1)).max(0);
+    if i64::from(index) < 0 || i64::from(index) >= limit {
+        return Err(RuntimeError::aioobe(index, limit as i32).into());
+    }
+    Ok(index as usize)
+}
+
 fn byte_view_get(ctx: &dyn NativeContext, arr: ObjectRef, idx: usize, elem: u8, le: bool) -> Value {
     let w = byte_view_width(elem);
     let mut raw: u64 = 0;
@@ -2266,7 +2301,82 @@ fn byte_view_encode(elem: u8, le: bool, value: &Value) -> [u8; 8] {
     bytes
 }
 
+/// Bounds-check a byte-BUFFER-view `VarHandle` access.
+///
+/// The sibling of [`byte_view_check_index`]. HotSpot's contract differs in the
+/// exception TYPE: a buffer view raises plain `IndexOutOfBoundsException` where
+/// an array view raises `ArrayIndexOutOfBoundsException`. Both use
+/// `Preconditions.checkIndex`'s wording and both bound the START index by
+/// `length - (width - 1)` — for a buffer that length is its **limit**.
+/// Measured on JDK 25: `IndexOutOfBoundsException: Index -1 out of bounds for
+/// length 15` for a `short` view over a 16-byte buffer.
+///
+/// There was no check. Both call sites clamped a negative coordinate to `0`
+/// instead, so `get(buf, -1)` silently read element 0 and `set(buf, -1, v)`
+/// silently overwrote it — a wrong answer where the JDK throws, and on the
+/// `set` side a write to memory the caller never named.
+fn byte_buffer_view_check_index(
+    ctx: &mut dyn NativeContext,
+    bb: ObjectRef,
+    index: i32,
+    elem: u8,
+) -> Result<usize, MethodCallFailed> {
+    let width = i64::from(byte_view_width(elem) as u32);
+    let limit = match ctx.get_field_by_name(bb, "limit") {
+        Value::Int(l) => i64::from(l),
+        _ => 0,
+    };
+    let bound = (limit - (width - 1)).max(0);
+    if i64::from(index) < 0 || i64::from(index) >= bound {
+        return Err(RuntimeError::IndexOutOfBoundsException {
+            message: Some(cratonvm_types::error::out_of_bounds_message::check_index(
+                i64::from(index),
+                bound,
+            )),
+        }
+        .into());
+    }
+    Ok(index as usize)
+}
+
+/// Is this `ByteBuffer` a read-only view?
+///
+/// `VarHandle.set` through a byte-buffer view must raise
+/// `ReadOnlyBufferException`; CratonVM performed the write instead, so a
+/// `asReadOnlyBuffer()` handed to code that mutates it was not read-only at
+/// all. Two signals, because the field is not present on every buffer shape
+/// this VM can produce: the `isReadOnly` field when there is one, and
+/// otherwise the JDK's own naming — the read-only views are exactly
+/// `HeapByteBufferR` and `DirectByteBufferR`.
+fn byte_buffer_view_is_read_only(ctx: &mut dyn NativeContext, bb: ObjectRef) -> bool {
+    if let Value::Int(flag) = ctx.get_field_by_name(bb, "isReadOnly") {
+        if flag != 0 {
+            return true;
+        }
+    }
+    ctx.class_name_of_id(ctx.class_id_of_object(bb))
+        .map_or(false, |name| name.ends_with("ByteBufferR"))
+}
+
+/// The native address of a **direct** buffer's byte `idx`, or `None`.
+///
+/// The `hb == null` test is the whole point. `java.nio.Buffer.address` is NOT
+/// zero for a heap buffer on JDK 21+ — it holds the array base offset (16 on
+/// this platform) so that `Unsafe` accesses can use one code path for both
+/// kinds. Reading it as an absolute pointer therefore dereferenced address
+/// `16 + idx` for every heap buffer, which is a hard SIGSEGV, and the
+/// heap-array fallback below it was unreachable:
+///
+/// ```text
+/// SIGSEGV at pc=…, addr=0x10        # 0x10 == 16
+/// ```
+///
+/// `hb` (the backing `byte[]`) is the field that actually distinguishes the
+/// two: null on a direct buffer, non-null on a heap one.
 fn byte_buffer_view_addr(ctx: &mut dyn NativeContext, bb: ObjectRef, idx: usize) -> Option<i64> {
+    if matches!(ctx.get_field_by_name(bb, "hb"), Value::Object(Some(_))) {
+        return None;
+    }
     let base = match ctx.get_field_by_name(bb, "address") {
         Value::Long(a) if a > 0 => a,
         _ => return None,
@@ -2901,10 +3011,11 @@ fn varhandle_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
             Some(Value::Object(Some(a))) => *a,
             _ => return Ok(Some(Value::Object(None))),
         };
-        let idx = match args.get(2) {
-            Some(Value::Int(i)) => *i as usize,
+        let index = match args.get(2) {
+            Some(Value::Int(i)) => *i,
             _ => 0,
         };
+        let idx = byte_view_check_index(ctx, arr, index, elem)?;
         let value = byte_view_get(ctx, arr, idx, elem, le);
         return Ok(Some(box_value(ctx, value, byte_view_desc(elem))));
     }
@@ -2913,10 +3024,11 @@ fn varhandle_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
             Some(Value::Object(Some(b))) => *b,
             _ => return Ok(Some(Value::Object(None))),
         };
-        let idx = match args.get(2) {
-            Some(Value::Int(i)) if *i >= 0 => *i as usize,
+        let index = match args.get(2) {
+            Some(Value::Int(i)) => *i,
             _ => 0,
         };
+        let idx = byte_buffer_view_check_index(ctx, bb, index, elem)?;
         let value = byte_buffer_view_get(ctx, bb, idx, elem, le).unwrap_or(Value::Object(None));
         return Ok(Some(box_value(ctx, value, byte_view_desc(elem))));
     }
@@ -3046,10 +3158,11 @@ fn varhandle_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
     // SHA3/SHAKE-zeros bug.)
     if let Some((elem, le)) = byte_view_kind(meta.as_deref()) {
         if let Some(Value::Object(Some(arr))) = args.get(1) {
-            let idx = match args.get(2) {
-                Some(Value::Int(i)) => *i as usize,
+            let index = match args.get(2) {
+                Some(Value::Int(i)) => *i,
                 _ => 0,
             };
+            let idx = byte_view_check_index(ctx, *arr, index, elem)?;
             let value = args.get(3).cloned().unwrap_or(Value::Int(0));
             byte_view_set(ctx, *arr, idx, elem, le, &value);
         }
@@ -3057,10 +3170,14 @@ fn varhandle_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
     }
     if let Some((elem, le)) = byte_buffer_view_kind(meta.as_deref()) {
         if let Some(Value::Object(Some(bb))) = args.get(1) {
-            let idx = match args.get(2) {
-                Some(Value::Int(i)) if *i >= 0 => *i as usize,
+            let index = match args.get(2) {
+                Some(Value::Int(i)) => *i,
                 _ => 0,
             };
+            if byte_buffer_view_is_read_only(ctx, *bb) {
+                return Err(RuntimeError::ReadOnlyBufferException.into());
+            }
+            let idx = byte_buffer_view_check_index(ctx, *bb, index, elem)?;
             let value = args.get(3).cloned().unwrap_or(Value::Int(0));
             byte_buffer_view_set(ctx, *bb, idx, elem, le, &value);
         }
@@ -12551,6 +12668,79 @@ pub(crate) fn native_ibg_generate_named_function_invoker(
     let _ = args;
     let mn = alloc_resolved_member_name(ctx, "java/lang/invoke/LambdaForm", "NFI", "()V");
     Ok(Some(Value::Object(Some(mn?))))
+}
+
+/// `MethodHandles.byteArrayViewVarHandle` bounds.
+///
+/// Measured against HotSpot JDK 25 with the same three-line probe: a `short`
+/// view over a 16-byte array reports `Index -1 out of bounds for length 15` —
+/// `15`, not `16`, because the length in the message is the number of valid
+/// START positions. CratonVM checked nothing at all, so `set(m, -1, v)` was an
+/// out-of-bounds write that reported success.
+#[cfg(test)]
+mod byte_array_view_bounds_tests {
+    use super::*;
+    use crate::test_utils::mock_ctx;
+    use cratonvm_native_api::NativeHeapAccess;
+
+    /// `(width, valid start positions)` for a 16-byte array.
+    const CASES: &[(u8, i32)] = &[
+        (b'S', 15),
+        (b'C', 15),
+        (b'I', 13),
+        (b'F', 13),
+        (b'J', 9),
+        (b'D', 9),
+    ];
+
+    #[test]
+    fn a_negative_index_is_refused_with_the_jdk_message() {
+        let mut ctx = mock_ctx();
+        let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, 16);
+        for (elem, limit) in CASES {
+            let err = byte_view_check_index(&ctx, arr, -1, *elem)
+                .expect_err("a negative index must be refused");
+            let text = format!("{err:?}");
+            assert!(
+                text.contains(&format!("Index -1 out of bounds for length {limit}")),
+                "elem {}: {text}",
+                *elem as char
+            );
+        }
+    }
+
+    #[test]
+    fn the_last_valid_start_is_accepted_and_the_next_one_is_not() {
+        let mut ctx = mock_ctx();
+        let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, 16);
+        for (elem, limit) in CASES {
+            assert!(
+                byte_view_check_index(&ctx, arr, limit - 1, *elem).is_ok(),
+                "elem {}: index {} must fit",
+                *elem as char,
+                limit - 1
+            );
+            assert!(
+                byte_view_check_index(&ctx, arr, *limit, *elem).is_err(),
+                "elem {}: index {} must not fit",
+                *elem as char,
+                limit
+            );
+        }
+    }
+
+    #[test]
+    fn an_array_too_short_for_one_element_admits_no_index() {
+        let mut ctx = mock_ctx();
+        // Four bytes cannot hold a long; the JDK reports "for length 0"
+        // rather than a negative length.
+        let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, 4);
+        let err = byte_view_check_index(&ctx, arr, 0, b'J').expect_err("no index can fit");
+        assert!(
+            format!("{err:?}").contains("Index 0 out of bounds for length 0"),
+            "{err:?}"
+        );
+    }
 }
 
 #[cfg(test)]

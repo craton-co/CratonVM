@@ -41,7 +41,7 @@ gate every test on `assumeTrue(PlatformDependent.hasUnsafe())`;
 On HotSpot JDK 25 both predicates are false, so the plain baseline reports
 `aborted=413`, `aborted=412`, and `started=0` — no oracle at all. On CratonVM
 they are true (see
-[unsafe-memory-access-property-flips-netty-to-unsafe-paths](unsafe-memory-access-property-flips-netty-to-unsafe-paths-20260812.md)),
+unsafe-memory-access-property-flips-netty-to-unsafe-paths (retired: `unsafe-memory-access-property-flips-netty-to-unsafe-paths-20260812`)),
 so ~1240 tests execute here that the baseline never ran.
 
 **Get a real oracle by enabling Unsafe on HotSpot**, which puts netty on the
@@ -72,7 +72,7 @@ filed) · ❌ real blocker
 | `io.netty.buffer.PooledAlignedBigEndianDirectByteBufTest` | HANG | ✅ **417/417** vs the Unsafe-enabled oracle 417/417 (plain HotSpot starts 0) |
 | `io.netty.buffer.PooledBigEndianDirectByteBufTest` | HANG | ✅ **417/417** |
 | `io.netty.buffer.PooledBigEndianHeapByteBufTest` | FAIL/HANG | ✅ **417/417** |
-| `io.netty.buffer.PooledByteBufAllocatorTest` | HANG | ⚠ 46 ok / 1 abort vs HotSpot 45 ok / 2 abort — no failures either side. HotSpot skips `testArenaMetrics{,No}CacheAlign` ([unsafe property](unsafe-memory-access-property-flips-netty-to-unsafe-paths-20260812.md)), CratonVM runs them and passes; CratonVM skips `shouldReuseChunks` ([ThreadMXBean](threadmxbean-not-com-sun-extension-20260812.md)) |
+| `io.netty.buffer.PooledByteBufAllocatorTest` | HANG | ⚠ 46 ok / 1 abort vs HotSpot 45 ok / 2 abort — no failures either side. HotSpot skips `testArenaMetrics{,No}CacheAlign` (unsafe property (retired: `unsafe-memory-access-property-flips-netty-to-unsafe-paths-20260812`)), CratonVM runs them and passes; CratonVM skips `shouldReuseChunks` ([ThreadMXBean](threadmxbean-not-com-sun-extension-20260812.md)) |
 | `io.netty.buffer.PooledLittleEndianDirectByteBufTest` | HANG | ✅ **417/417** |
 | `io.netty.buffer.PooledLittleEndianHeapByteBufTest` | HANG | ✅ **417/417** |
 | `io.netty.buffer.ReadOnlyByteBufTest` | FAIL | ✅ **27/27** — repaired by the batch-07 `StackWalker$Option` fix, as that page predicted |
