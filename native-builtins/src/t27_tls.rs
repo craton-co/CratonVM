@@ -7690,6 +7690,14 @@ mod tests {
         assert!(!super::endpoint_alg_verifies_identity("NONE"));
     }
 
+    /// The engine id these trust-check tests pass through.
+    ///
+    /// `handshaked_pair()` builds `EngineState`s directly instead of
+    /// registering engines, so there is no registry id to quote — and
+    /// `engine_take_pending_trust_check` only copies the value into
+    /// `PendingTrustCheck::engine_id`, so any stable value serves.
+    const TEST_ENGINE_ID: i32 = 0;
+
     /// REGRESSION (`TestSecurity2018.testCVE_2018_8034`): a client engine
     /// configured with `setEndpointIdentificationAlgorithm("HTTPS")` must
     /// refuse a certificate that does not name the host it dialled — even
@@ -7707,7 +7715,7 @@ mod tests {
         //    exactly as cheap as before this fix.
         client.trust_check_done = false;
         client.endpoint_id_alg = None;
-        assert!(super::engine_take_pending_trust_check(0, &mut client).is_none());
+        assert!(super::engine_take_pending_trust_check(TEST_ENGINE_ID, &mut client).is_none());
 
         // 2. HTTPS configured: a pending check appears even with no
         //    TrustManager attached, because JSSE's own default manager is what
@@ -7715,9 +7723,14 @@ mod tests {
         client.trust_check_done = false;
         client.endpoint_id_alg = Some("HTTPS".to_string());
         client.peer_host = Some("localhost".to_string());
-        let pending =
-            super::engine_take_pending_trust_check(0, &mut client).expect("identity check pending");
+        let pending = super::engine_take_pending_trust_check(TEST_ENGINE_ID, &mut client)
+            .expect("identity check pending");
         assert!(pending.trust_ctx_key.is_none());
+        // The engine id is carried through so the deferred half
+        // (`engine_run_trust_check`, which runs after the registry lock is
+        // dropped) can find its engine again. Nothing asserted it, which is
+        // why adding the parameter broke three call sites and no test.
+        assert_eq!(pending.engine_id, TEST_ENGINE_ID);
         assert_eq!(
             pending.endpoint_identity,
             Some(("HTTPS".to_string(), "localhost".to_string()))
@@ -7742,7 +7755,7 @@ mod tests {
         //    is configured on it.
         client.trust_check_done = false;
         client.is_client = false;
-        let pending = super::engine_take_pending_trust_check(0, &mut client);
+        let pending = super::engine_take_pending_trust_check(TEST_ENGINE_ID, &mut client);
         assert!(pending.is_none(), "server engines do not identify endpoints");
     }
 
