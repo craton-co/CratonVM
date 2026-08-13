@@ -2850,6 +2850,23 @@ pub trait NativeHeapAccess: NativeInvokeAccess {
     /// Returns the total number of bytes allocated on the heap.
     fn heap_allocated_bytes(&self) -> usize;
 
+    /// Cumulative bytes the **calling** thread has allocated since it started,
+    /// or `None` when the VM cannot account for it.
+    ///
+    /// This is the source for `com.sun.management.ThreadMXBean
+    /// .getCurrentThreadAllocatedBytes` / `getThreadAllocatedBytes(long)`.
+    /// `None` is the honest answer a mock or a thread-less context gives, and
+    /// the bean turns it into the JMM's documented `-1` plus
+    /// `isThreadAllocatedMemorySupported() == false` — a "not supported" that
+    /// callers already handle, rather than a fabricated number.
+    ///
+    /// The VM implementation reads `Tlab::thread_allocated_bytes`, which is
+    /// live-cursor based and therefore sees compiled code's inline allocation
+    /// as well as the interpreter's.
+    fn current_thread_allocated_bytes(&self) -> Option<u64> {
+        None
+    }
+
     /// Bytes currently COMMITTED for the Java heap — backing storage the VM
     /// holds whether or not anything lives in it. `Runtime.totalMemory()`, the
     /// JMX heap `MemoryUsage.getCommitted()`, and (minus

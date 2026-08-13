@@ -12140,6 +12140,10 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
         self.shared.mem.heap.allocated_bytes()
     }
 
+    fn current_thread_allocated_bytes(&self) -> Option<u64> {
+        Some(self.thread.tlab.thread_allocated_bytes())
+    }
+
     fn committed_heap_bytes(&self) -> usize {
         self.shared.mem.heap.committed_bytes()
     }

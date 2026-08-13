@@ -655,11 +655,21 @@ pub(crate) fn p59_get_memory_mxbean(
     Ok(Some(Value::Object(Some(bean))))
 }
 
+/// Delegates to `jmx.rs` rather than fabricating its own bean.
+///
+/// Two reasons, both of which this pair had already drifted on. The bean must
+/// be typed `com.sun.management.ThreadMXBean` so the platform-extension
+/// `instanceof` answers true (see `jmx::alloc_extension_mxbean`), and it must
+/// be allocated with the six slots the count getters read by index — this
+/// function asked for **zero**. Per the DISPATCH NOTE at the top of this
+/// module the `jmx.rs` registration is the one that wins, so neither defect
+/// was reachable; sharing the allocator is what stops the next edit from
+/// making one of them reachable again.
 pub(crate) fn p59_get_thread_mxbean(
     ctx: &mut dyn NativeContext,
     _args: &[Value],
 ) -> MethodCallResult {
-    let bean = try_alloc_concurrent_synthetic(ctx, "java/lang/management/ThreadMXBean", 0)?;
+    let bean = crate::jmx::alloc_thread_mxbean(ctx)?;
     Ok(Some(Value::Object(Some(bean))))
 }
 
@@ -671,8 +681,10 @@ pub(crate) fn p59_get_runtime_mxbean(
     Ok(Some(Value::Object(Some(bean))))
 }
 
+/// Delegates to `jmx.rs` — same reasoning as [`p59_get_thread_mxbean`]: the
+/// extension type and the five slots `getName`/`getArch`/… read by index.
 pub(crate) fn p59_get_os_mxbean(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    let bean = try_alloc_concurrent_synthetic(ctx, "java/lang/management/OperatingSystemMXBean", 0)?;
+    let bean = crate::jmx::alloc_os_mxbean(ctx)?;
     Ok(Some(Value::Object(Some(bean))))
 }
 

@@ -126,7 +126,7 @@ layout before extending either.
 `OcspServerCertificateValidatorTest` (1): `expected: <true> but was: <false>`,
 `Unexpected type, expected: <javax.net.ssl.SSLException>`, `Unexpected null
 value, expected: <io.netty.handler.ssl.SslHandler...>`. Same shape as
-[batch 10's clusters 3 and 4](tls-batch10-encrypted-keys-and-handshake-gaps-20260812.md)
+[batch 10's clusters 3 and 4](../../internal/fixed-suite-bugs/netty-tls-batch10-provider-routing-and-close-notify-FIXED-20260813.md) (FIXED 2026-08-13)
 — a handshake that reports success but does not deliver the bytes, alerts or
 exceptions that follow. Treat as one investigation with those; do not chase it
 separately from this page.

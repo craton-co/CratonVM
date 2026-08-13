@@ -78,7 +78,7 @@ skipped · ⏱ wall-clock only, passes solo
 | `io.netty.buffer.AdaptiveBigEndianDirectByteBufTest` | HANG | ✅ fixes 1+2+3 → **415/417 solo in 70 s**, same as HotSpot. Its `testInternalNioBuffer()` only trips JUnit's 120 s per-test cap under shard contention → [throughput](adaptive-bytebuf-allocator-throughput-20260812.md) |
 | `io.netty.buffer.AdaptiveBigEndianHeapByteBufTest` | HANG | ✅ **415/417** (2 skipped) — same as HotSpot |
 | `io.netty.buffer.AdaptiveByteBufAllocatorGrowthTest` | HANG | ⏱ **400/400 solo** in 829 s vs HotSpot 11 s → [throughput](adaptive-bytebuf-allocator-throughput-20260812.md) |
-| `io.netty.buffer.AdaptiveByteBufAllocatorTest` | HANG | ⏱ **126/127, 0 failures, solo** in 500 s vs HotSpot 6 s → [throughput](adaptive-bytebuf-allocator-throughput-20260812.md). ⚠ the 1 skip is [ThreadMXBean](threadmxbean-not-com-sun-extension-20260812.md) |
+| `io.netty.buffer.AdaptiveByteBufAllocatorTest` | HANG | ⏱ **126/127, 0 failures, solo** in 500 s vs HotSpot 6 s → [throughput](adaptive-bytebuf-allocator-throughput-20260812.md). ⚠ the 1 skip is [ThreadMXBean](../../internal/fixed-bugs/mxbean-not-com-sun-extension-FIXED-20260813.md) — FIXED 2026-08-13, now 127/127 |
 | `io.netty.buffer.AdaptiveByteBufAllocatorUseCacheForNonEventLoopThreadsTest` | HANG | ⏱ **127/128, 0 failures, solo** in 437 s; same 1 skip as above |
 | `io.netty.buffer.AdaptiveLittleEndianDirectByteBufTest` | HANG | ✅ **415/417** — same as HotSpot |
 | `io.netty.buffer.AdaptiveLittleEndianHeapByteBufTest` | HANG | ✅ **415/417** — same as HotSpot |
@@ -115,7 +115,7 @@ skipped · ⏱ wall-clock only, passes solo
   more defects in the same native that the first record did not name: no
   generation (so reuse deadlocked) and a flag-not-mode registration gate that
   had left synthetic-JDK mode with no `CyclicBarrier` constructor at all.
-* [`threadmxbean-not-com-sun-extension-20260812.md`](threadmxbean-not-com-sun-extension-20260812.md)
+* [`mxbean-not-com-sun-extension-FIXED-20260813.md`](../../internal/fixed-bugs/mxbean-not-com-sun-extension-FIXED-20260813.md) — FIXED 2026-08-13
   — `ManagementFactory.getThreadMXBean()` / `getOperatingSystemMXBean()` do not
   implement their `com.sun.management` extensions, so feature-detecting callers
   take their fallback path.
