@@ -40,10 +40,19 @@ Two things were ruled out along the way:
   produces byte-identical output. Real, but three orders of magnitude short of
   explaining the wall.
 * **Not JNI.** Bzip2, FastLz, JZlib, JdkZlib, Lzf and Snappy are pure-Java
-  codecs. The family behaves the same whether or not a native library is
-  involved, which separates this cleanly from
-  [Brotli's hang](brotli-integration-test-hangs-outside-the-interpreter-20260812.md)
-  (batch 04), where the watchdog cannot even fire.
+  codecs, and the family behaves the same whether or not a native library is
+  involved.
+
+  Batch 04's `BrotliIntegrationTest` turns out to be **the same finding, not a
+  contrasting one**: `docs/internal/fixed-suite-bugs/netty-brotli-huge-decompress-not-a-hang-FIXED-20260812.md`
+  measured it as 10 of 11 tests passing in 4.2 s with only `testHugeDecompress`
+  unfinished, the thread `R` (running) at 100% of a core in JIT-compiled Java,
+  and brotli4j's library loading fine in 31 ms. `testHugeDecompress` builds
+  256 MB **one byte at a time** — 268 M `writeByte` plus 268 M `digest.update`
+  calls — which is this page's wall in its purest form. (My batch-04 page had
+  claimed the watchdog "never fires" and inferred a native block from it; the
+  watchdog does fire, and its inability to dump a *running compiled* thread was
+  itself the defect, since fixed.)
 
 ## The measurement
 
