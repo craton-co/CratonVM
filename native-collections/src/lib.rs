@@ -4750,6 +4750,112 @@ fn altrace_describe(ctx: &mut dyn NativeContext, v: Value) -> String {
     }
 }
 
+
+// ---------------------------------------------------------------------------
+// Vector's LEGACY index checks.
+//
+// MEASURED 2026-08-13 (scratchpad/orch/V2.java, HotSpot 25.0.3+9-LTS). Two
+// things the shared ArrayList natives get wrong for a Vector receiver:
+//
+//  * the CLASS is ArrayIndexOutOfBoundsException, a SUBCLASS of the
+//    IndexOutOfBoundsException `native_al_get` throws -- so a `catch
+//    (ArrayIndexOutOfBoundsException)` in legacy code never fired;
+//  * the TEXT follows three conventions that cannot be derived from one
+//    another, and the two negative arms actively disagree:
+//
+//      elementAt(i >= size)        "3 >= 3"
+//      elementAt(i < 0)            "Index -1 out of bounds for length 10"
+//      get(i >= size)              "Array index out of range: 3"
+//      get(i < 0)                  "Index -1 out of bounds for length 10"
+//      removeElementAt(i >= size)  "3 >= 3"
+//      removeElementAt(i < 0)      "Array index out of range: -1"
+//
+// The "length" in the negative arms is the BACKING ARRAY's capacity, not the
+// element count: `new Vector<>(100)` with one element reports "length 100".
+// That is `elementData(index)` faulting on the raw array, so it is reproduced
+// from the real array length rather than from `size`.
+fn vec_aioobe(index: i32, message: String) -> MethodCallFailed {
+    RuntimeError::ArrayIndexOutOfBoundsException {
+        index,
+        message: Some(message),
+    }
+    .into()
+}
+
+/// The negative-index arm shared by `elementAt` and `get` (but NOT by
+/// `removeElementAt`, which words it differently).
+fn vec_negative_index(ctx: &dyn NativeContext, this: ObjectRef, index: i32) -> MethodCallFailed {
+    let (data, _) = al_state(ctx, this);
+    let cap = data.map_or(0, |d| ctx.array_length(d));
+    vec_aioobe(
+        index,
+        format!("Index {index} out of bounds for length {cap}"),
+    )
+}
+
+fn vec_index_args(args: &[Value]) -> Option<(ObjectRef, i32)> {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return None,
+    };
+    let index = match args.get(1) {
+        Some(Value::Int(i)) => *i,
+        _ => return None,
+    };
+    Some((this, index))
+}
+
+fn native_vec_element_at(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let Some((this, index)) = vec_index_args(args) else {
+        return Ok(Some(Value::Object(None)));
+    };
+    let (_, size) = al_state(ctx, this);
+    if index < 0 {
+        return Err(vec_negative_index(ctx, this, index));
+    }
+    if index >= size {
+        return Err(vec_aioobe(index, format!("{index} >= {size}")));
+    }
+    native_al_get(ctx, args)
+}
+
+fn native_vec_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let Some((this, index)) = vec_index_args(args) else {
+        return Ok(Some(Value::Object(None)));
+    };
+    let (_, size) = al_state(ctx, this);
+    if index < 0 {
+        return Err(vec_negative_index(ctx, this, index));
+    }
+    if index >= size {
+        return Err(vec_aioobe(
+            index,
+            format!("Array index out of range: {index}"),
+        ));
+    }
+    native_al_get(ctx, args)
+}
+
+fn native_vec_remove_element_at_checked(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let Some((this, index)) = vec_index_args(args) else {
+        return Ok(None);
+    };
+    let (_, size) = al_state(ctx, this);
+    if index < 0 {
+        return Err(vec_aioobe(
+            index,
+            format!("Array index out of range: {index}"),
+        ));
+    }
+    if index >= size {
+        return Err(vec_aioobe(index, format!("{index} >= {size}")));
+    }
+    native_vec_remove_element_at(ctx, args)
+}
+
 pub fn native_al_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // `List.get(int)` on a values view is not reachable from correct Java — the
     // real classes are `AbstractCollection`s and the cast to `List` throws
@@ -36988,8 +37094,8 @@ fn register_vector_natives(r: &mut NativeMethodRegistry) {
     r.register(c, "<init>", "(I)V", native_al_init_capacity);
     r.register(c, "size", "()I", native_al_size);
     r.register(c, "isEmpty", "()Z", native_al_is_empty);
-    r.register(c, "get", "(I)Ljava/lang/Object;", native_al_get);
-    r.register(c, "elementAt", "(I)Ljava/lang/Object;", native_al_get);
+    r.register(c, "get", "(I)Ljava/lang/Object;", native_vec_get);
+    r.register(c, "elementAt", "(I)Ljava/lang/Object;", native_vec_element_at);
     r.register(
         c,
         "set",
@@ -37024,7 +37130,7 @@ fn register_vector_natives(r: &mut NativeMethodRegistry) {
         "(Ljava/lang/Object;)Z",
         native_al_remove_obj,
     );
-    r.register(c, "removeElementAt", "(I)V", native_vec_remove_element_at);
+    r.register(c, "removeElementAt", "(I)V", native_vec_remove_element_at_checked);
     r.register(c, "removeAllElements", "()V", native_al_clear);
     r.register(c, "clear", "()V", native_al_clear);
     r.register(c, "contains", "(Ljava/lang/Object;)Z", native_al_contains);
@@ -37115,7 +37221,8 @@ fn native_vec_first_element(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     if size == 0 {
         return Err(
             cratonvm_types::error::RuntimeError::NoSuchElementException {
-                message: "Vector is empty".to_string(),
+                // MEASURED: HotSpot throws with NO message here.
+                message: String::new(),
             }
             .into(),
         );
@@ -37133,7 +37240,8 @@ fn native_vec_last_element(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
     if size == 0 {
         return Err(
             cratonvm_types::error::RuntimeError::NoSuchElementException {
-                message: "Vector is empty".to_string(),
+                // MEASURED: HotSpot throws with NO message here.
+                message: String::new(),
             }
             .into(),
         );

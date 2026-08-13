@@ -1626,7 +1626,22 @@ impl RuntimeError {
                 ("java/util/ConcurrentModificationException", None)
             }
             RuntimeError::NoSuchElementException { message } => {
-                ("java/util/NoSuchElementException", Some(message.as_str()))
+                // An EMPTY message means "no message", i.e. the no-arg
+                // constructor and a null `getMessage()` -- not the (String)
+                // constructor with "". HotSpot's own `Vector.firstElement()`,
+                // `lastElement()` and the ArrayDeque/TreeMap family throw with
+                // NO message (MEASURED 2026-08-13, scratchpad/orch/V2.java:
+                // `NoSuchElementException: null`), and six sites in this tree
+                // already pass `String::new()` intending exactly that. The
+                // variant carries a non-optional String, so this is where the
+                // distinction has to be made; converting all 83 construction
+                // sites to Option<String> is the wider change it does not
+                // need.
+                if message.is_empty() {
+                    ("java/util/NoSuchElementException", None)
+                } else {
+                    ("java/util/NoSuchElementException", Some(message.as_str()))
+                }
             }
             // `None`, like `ConcurrentModificationException` above: the real
             // class has a no-arg constructor only.
