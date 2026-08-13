@@ -191,6 +191,31 @@ tell what they are running.
 
 ## 5. The plan
 
+> ### Status of every phase, 2026-08-13
+>
+> | phase | code | measurement it exits on |
+> |---|---|---|
+> | **0** — say what is shipping | **DONE** | none — the exit is a documentation property, and it is met |
+> | **1** — re-establish the baseline | **DONE from existing data** | the Spring Boot arm under ZGC is the one run it still owes; **DEFERRED** |
+> | **2** — defensible non-compacting | **DONE** (2.1–2.4) | "no suite class OOMs where Generational passes, gauge green over a full Tomcat run" — **DEFERRED** |
+> | **3** — concurrency before relocation | **DONE** (ingress, parallel STW marking) | "pause time falls measurably on a large live set" — **DEFERRED** |
+> | **4** — relocation behind the JIT barrier | **DONE** (barrier seam, read path, stage (a), compaction) | "both suites at parity, premium gone" — **DEFERRED**; see the per-component table in Phase 4 |
+>
+> **Every phase's code is implemented. Every phase's exit criterion is a
+> measurement, and all five measurements need suite runs.** That is by design —
+> the plan's own preamble says so: *"Each has an exit criterion that is a
+> **measurement**, not a merge — the standing lesson from this tree is that a
+> landed change with no re-measurement is indistinguishable from an inert
+> one."*
+>
+> The deferrals are therefore not gaps in the implementation; they are the
+> plan working as written. What has changed is that the instruments those
+> measurements need now exist: `[GC] zgc-frag:` on the shutdown line, the
+> parallel-mark switch, the compaction switch, and a relocation gate that no
+> longer refuses before the run starts.
+
+
+
 Five phases. Each has an exit criterion that is a **measurement**, not a
 merge — the standing lesson from this tree is that a landed change with no
 re-measurement is indistinguishable from an inert one.
@@ -597,36 +622,53 @@ obligation is recorded where it can be acted on: **if inline reference emission
 is ever re-enabled under an armed barrier, that function must go back to
 `false`**, and the test pinning the disjunction goes red.
 
-**Phase 4's code is complete. What is left is one measurement and two
-directions, and they are not the same kind of thing.**
+### Phase 4 exit criterion — status per component, 2026-08-13
 
-*The phase's own exit criterion* is "relocation on, JIT on, both suites at
-parity, and the ~1.5x heap premium gone". Two of the four are now facts:
-relocation is on (opt-in, `CRATONVM_ZGC_RELOCATE=1`) and the JIT is on
-(`zgc_relocation_permitted` no longer refuses for it). **The other two are a
-suite measurement**, which is the same gate every default-on decision in this
-plan carries and is the one thing no amount of code closes.
+The criterion is four things. Two are code and are done; two are measurements
+and are **explicitly deferred**, with the reason and the evidence search
+recorded here rather than left implicit.
 
-*Inline x64 barrier emission is CLOSED by decision, not deferred* -- and the
-reason is now an assertion, `an_armed_zgc_barrier_and_inline_reference_emission_cannot_coexist`.
-Every inline compact-field arm is gated on
-`narrow_oops_block_inline_fields`, which returns `true` whenever the barrier is
-armed. So the inline arm is **not emitted at all** in the only state where a
-barrier would have work to do; an inline sequence would execute exclusively
-with the barrier disarmed, where it is required to be the identity transform
-(bad mask 0, address mask all-ones, heap base 0) -- six instructions of
-provable no-op on the hottest path in the VM. Making it worthwhile means first
-*removing* the helper routing, which trades a mechanism that is correct today
-for one that is not yet validated, and validating it is a throughput
-measurement. If anyone lifts the ZGC clause out of that predicate the test
-fails, and at that moment the emission stops being dead code and becomes
-mandatory.
+| component | status | evidence |
+|---|---|---|
+| **relocation on** | **DONE** | `CRATONVM_ZGC_RELOCATE=1` drives `relocate_stw` from `collect_garbage`; six tests, the reference-rewrite one red-proven |
+| **JIT on** | **DONE** | `zgc_relocation_permitted` no longer refuses for the JIT. Stage (a) routes reference loads through the barriered helpers; the disjunction is asserted, and the obligation to revert it is asserted too |
+| **both suites at parity** | **DEFERRED — no data exists** | requires a suite run |
+| **~1.5x heap premium gone** | **DEFERRED — no data exists** | requires a suite run |
 
-*Two directions beyond this plan*, recorded here because they were identified
-while implementing it and not because any phase asks for them:
+**Why deferred and not done.** Both are measurements, and this session was
+scoped to build without re-running suites. That is not a gap in the
+implementation: no amount of code closes a measurement, and the plan applies
+the same gate to every default-on decision it contains.
+
+**The runner folders were searched first, exactly as Phase 1 was, and the
+result is that the data is not there.** Recorded because a future reader will
+otherwise repeat the search:
+
+* **No ZGC-tagged run exists in `apps/*-suite-runner` for either criterion.**
+  Not for Spring Boot, not for Tomcat, at any date.
+* The one tempting artifact is `zip-craton-2g-20260810`, which shows
+  `ZipContentTests` **passing at `-Xmx 2g`** — apparently refuting the premium
+  outright. It does not. Its binary is `CratonVM-sslpem-20260809`, built the
+  day *before* the default flip, and its log carries nine `moving-young` lines
+  — a Generational-only mechanism. It is a **Generational** arm, which is
+  precisely what the premium claim already asserts ("Generational passes at
+  2g"). Reading it as a ZGC result would have retired Gap B on a
+  misattribution.
+
+**So the premium figure stays exactly as `gc-tuning.md` already flags it:
+never re-measured, derived from one class, and partly re-attributed** — the
+2026-08-13 Tomcat OOM that looked like the same shape turned out to be mostly a
+TLAB reservation bug. One data point that has since been partly explained away
+is not a sizing constant, and it is not something this session could either
+confirm or retire.
+
+### Two directions beyond this plan
+
+Recorded because they were identified while implementing it, and **not because
+any of the five phases asks for them**:
 
 * **Replacing `Arena` with `ZPageAllocator`.** It was believed to block
-  `generation`, `relocate` and `remembered`; that turned out to be false --
+  `generation`, `relocate` and `remembered`; that turned out to be false —
   page-keyed modules need an id, live bytes and an extent, not an allocator,
   and all three are adopted over a logical grid. What it would still buy is a
   real young *space* rather than young *accounting*, and somewhere for
