@@ -241,6 +241,7 @@ run, which the original code's comment is explicit about.)
 |---|---|---|---|---:|
 | baseline `origin/dev` | no summary — died at sub-test 42 | **124 (timeout)** | 900 s | 1, then silence |
 | **this branch** | **`OK (44 tests)`** | **0** | **279.3 s** | **0** |
+| this branch, re-verified after merging current `dev` | `OK (44 tests)` | 0 | 697.9 s (host was building concurrently — not a timing measurement) | 0 |
 | control: `CRATONVM_ZGC_TLAB=0`, this branch | `OK (44 tests)` | 0 | 244.7 s | 0 |
 
 The control arm is what identified defect 1 and is kept as the ceiling: with
