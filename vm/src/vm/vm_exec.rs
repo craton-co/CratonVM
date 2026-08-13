@@ -15720,6 +15720,27 @@ impl<'a> NativeSystemAccess for NativeContextImpl<'a> {
         });
     }
 
+    fn jfr_configure_java_recording(
+        &mut self,
+        enabled_names: Option<&[String]>,
+        thresholds: &[(String, u64)],
+    ) {
+        let id = *self.shared.debug.jfr_java_recording.lock();
+        let Some(id) = id else {
+            return;
+        };
+        let mut recorder = self.shared.debug.flight_recorder.lock();
+        let Some(recording) = recorder.get_recording_mut(id) else {
+            return;
+        };
+        recording.settings.enabled_event_names =
+            enabled_names.map(|names| names.iter().cloned().collect());
+        recording.settings.event_thresholds_by_name = thresholds
+            .iter()
+            .map(|(name, nanos)| (name.clone(), *nanos))
+            .collect();
+    }
+
     fn jfr_set_java_output(&mut self, path: &str) {
         *self.shared.debug.jfr_java_output.lock() = Some(path.to_owned());
     }
