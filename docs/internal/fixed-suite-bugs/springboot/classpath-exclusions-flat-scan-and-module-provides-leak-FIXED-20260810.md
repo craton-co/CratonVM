@@ -146,7 +146,7 @@ not changed by the fix (identical counts and messages before and after):
 A class failing to cast to its own supertype is a loader-IDENTITY problem
 (one class reached through two loaders), not a resource-visibility one. That
 area is already flagged open in
-`docs/internal/spring-boot-core39-residual-clusters-20260723.md` ("a real,
+`../spring-boot-core39-residual-clusters-20260723.md` ("a real,
 likely-broad classloader-identity bug … blast radius large enough to warrant
 its own isolated investigation"). Left there deliberately rather than
 attempted alongside a resource-scoping fix.

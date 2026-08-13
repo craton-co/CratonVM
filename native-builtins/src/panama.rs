@@ -1727,6 +1727,168 @@ pub(crate) fn register_pe_memory_segment(r: &mut NativeMethodRegistry) {
         r.register(ms, "toArray", desc, pe_segment_to_array);
     }
 
+
+
+    // allocateFrom(elementLayout, values...) — the seven array overloads.
+    //
+    // These are `default` methods on `SegmentAllocator`, so real JDK bytecode
+    // runs for them, and it ends in
+    // `((AbstractMemorySegmentImpl) segment).copyFrom(...)` — a cast that can
+    // never succeed while CratonVM fabricates segments as instances of the
+    // `MemorySegment` INTERFACE. The failure was therefore not "no Code
+    // attribute" like its neighbours but a `ClassCastException` from inside the
+    // JDK, which is why it survived the interface audit that found the rest.
+    // A native for each descriptor keeps that bytecode from running at all.
+    for allocator in [
+        "java/lang/foreign/Arena",
+        "java/lang/foreign/SegmentAllocator",
+    ] {
+        // Seven, not eight: `SegmentAllocator` declares no `boolean...`
+        // overload. Registering a descriptor the JDK does not declare would be
+        // dead weight that reads like coverage.
+        for desc in [
+            "(Ljava/lang/foreign/ValueLayout$OfByte;[B)Ljava/lang/foreign/MemorySegment;",
+            "(Ljava/lang/foreign/ValueLayout$OfChar;[C)Ljava/lang/foreign/MemorySegment;",
+            "(Ljava/lang/foreign/ValueLayout$OfShort;[S)Ljava/lang/foreign/MemorySegment;",
+            "(Ljava/lang/foreign/ValueLayout$OfInt;[I)Ljava/lang/foreign/MemorySegment;",
+            "(Ljava/lang/foreign/ValueLayout$OfFloat;[F)Ljava/lang/foreign/MemorySegment;",
+            "(Ljava/lang/foreign/ValueLayout$OfLong;[J)Ljava/lang/foreign/MemorySegment;",
+            "(Ljava/lang/foreign/ValueLayout$OfDouble;[D)Ljava/lang/foreign/MemorySegment;",
+        ] {
+            r.register(allocator, "allocateFrom", desc, pe_allocate_from_array);
+        }
+    }
+
+    // spliterator(elementLayout) / elements(elementLayout).
+    //
+    // The last two `MemorySegment` methods that answered
+    // `AbstractMethodError`. They are implemented LAZILY — see
+    // `pe_segment_spliterator` for why a materialised list of slices would be
+    // wrong for exactly the case these methods exist for.
+    r.register(
+        ms,
+        "spliterator",
+        "(Ljava/lang/foreign/MemoryLayout;)Ljava/util/Spliterator;",
+        pe_segment_spliterator,
+    );
+    r.register(
+        ms,
+        "elements",
+        "(Ljava/lang/foreign/MemoryLayout;)Ljava/util/stream/Stream;",
+        pe_segment_elements,
+    );
+
+    // The splitter's own surface. Registered on ITS class, not on
+    // `java/util/Spliterator`: that interface already carries the
+    // array-backed collections implementation (field 0 = `Object[]`, 1 =
+    // cursor, 2 = fence), registered later than this file runs, and a second
+    // registration of the same triple would silently take those calls over.
+    // A distinct receiver class keeps the two implementations apart with no
+    // ordering dependency and no shape-sniffing.
+    let splitter = PE_SEGMENT_SPLITTER;
+    r.register(
+        splitter,
+        "tryAdvance",
+        "(Ljava/util/function/Consumer;)Z",
+        pe_splitter_try_advance,
+    );
+    r.register(
+        splitter,
+        "forEachRemaining",
+        "(Ljava/util/function/Consumer;)V",
+        |ctx, args| {
+            // `Spliterator.forEachRemaining` has a default body, but it is not
+            // reachable here: the receiver's class is a fabricated stub with no
+            // declared interfaces, so nothing routes the call to
+            // `java.util.Spliterator`. Every method the contract exposes is
+            // therefore registered explicitly rather than inherited.
+            while matches!(pe_splitter_try_advance(ctx, args)?, Some(Value::Int(1))) {}
+            Ok(None)
+        },
+    );
+    r.register(
+        splitter,
+        "trySplit",
+        "()Ljava/util/Spliterator;",
+        |ctx, args| {
+            // The JDK's `SegmentSplitter.trySplit`: split only before the first
+            // element is consumed, hand the LOW half to the new splitter and keep
+            // the high half (plus the odd element) here.
+            let this = obj_arg(args, 0)?;
+            let (elem_count, elem_size, index) = pe_splitter_state(ctx, this);
+            if index != 0 || elem_count <= 1 {
+                return Ok(Some(Value::Object(None)));
+            }
+            let (split, lobound, hibound) = pe_split_bounds(elem_count, elem_size);
+            // What THIS splitter keeps: everything the low half did not take,
+            // i.e. the JDK's `split + rem` with `rem = elemCount % 2`.
+            let high_count = elem_count - split;
+            let segment = match ctx.get_field(this, 0) {
+                Value::Object(Some(s)) => s,
+                _ => return Ok(Some(Value::Object(None))),
+            };
+            let low = match pe_segment_slice(ctx, segment, 0, lobound, None)? {
+                Some(Value::Object(Some(s))) => s,
+                _ => return Ok(Some(Value::Object(None))),
+            };
+            let low_pin = ctx.pin_native_root(low);
+            let prefix = pe_new_splitter(ctx, low, split, elem_size)?;
+            ctx.unpin_native_roots(low_pin);
+            // Only now narrow this splitter to its own (high) half.
+            let this = obj_arg(args, 0)?;
+            let segment = match ctx.get_field(this, 0) {
+                Value::Object(Some(s)) => s,
+                _ => return Ok(Some(Value::Object(None))),
+            };
+            if let Some(Value::Object(Some(high))) =
+                pe_segment_slice(ctx, segment, lobound, hibound, None)?
+            {
+                ctx.set_field(this, 0, Value::Object(Some(high)));
+            }
+            ctx.set_field(this, 1, Value::Long(high_count));
+            Ok(Some(Value::Object(Some(prefix))))
+        },
+    );
+    // `elemCount`, NOT `elemCount - currentIndex`. The JDK returns the former
+    // verbatim, so a half-drained splitter still reports its ORIGINAL size —
+    // measured, `tryAdvance` x3 over 8 elements still answers 8 on HotSpot.
+    // Subtracting would be the more sensible number and the wrong one.
+    r.register(splitter, "estimateSize", "()J", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let (elem_count, _, _) = pe_splitter_state(ctx, this);
+        Ok(Some(Value::Long(elem_count.max(0))))
+    });
+    r.register(splitter, "getExactSizeIfKnown", "()J", |ctx, args| {
+        // SIZED, so the exact size IS known — and it is `estimateSize()`,
+        // which is what the interface default returns.
+        let this = obj_arg(args, 0)?;
+        let (elem_count, _, _) = pe_splitter_state(ctx, this);
+        Ok(Some(Value::Long(elem_count.max(0))))
+    });
+    r.register(splitter, "characteristics", "()I", |_ctx, _args| {
+        Ok(Some(Value::Int(PE_SPLITTER_CHARACTERISTICS)))
+    });
+    r.register(splitter, "hasCharacteristics", "(I)Z", |_ctx, args| {
+        let wanted = args.get(1).and_then(|v| v.as_int()).unwrap_or(0);
+        let has = (PE_SPLITTER_CHARACTERISTICS & wanted) == wanted;
+        Ok(Some(Value::Int(i32::from(has))))
+    });
+    r.register(
+        splitter,
+        "getComparator",
+        "()Ljava/util/Comparator;",
+        |_ctx, _args| {
+            // Not SORTED — the spec'd answer is to throw, not to return null
+            // (null means "sorted in natural order"). `Spliterator`'s default
+            // throws `new IllegalStateException()`, so `getMessage()` is empty;
+            // measured on HotSpot as `IllegalStateException: null`.
+            Err(RuntimeError::IllegalStateException {
+                message: String::new(),
+            }
+            .into())
+        },
+    );
+
     // fill(byte value) — memset
     r.register(
         ms,
@@ -1848,6 +2010,249 @@ fn pe_long_arg(args: &[Value], index: usize) -> i64 {
         Some(Value::Int(n)) => *n as i64,
         _ => 0,
     }
+}
+
+/// `SegmentAllocator.allocateFrom(ValueLayout$OfX, X... elements)`.
+///
+/// One body for all eight overloads: the element width comes from the layout
+/// argument and the values from the Java array, the same way `toArray` reads
+/// its kind from the layout rather than the descriptor.
+fn pe_allocate_from_array(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let arena = obj_arg(args, 0)?;
+    let layout = obj_arg(args, 1)?;
+    let Some(Value::Object(Some(array))) = args.get(2).copied() else {
+        return Err(RuntimeError::NullPointerException {
+            message: Some("allocateFrom: elements array is null".to_string()),
+        }
+        .into());
+    };
+    let (width, align) = crate::phases_late::foreign_ffm::p67_layout_size_align(ctx, layout);
+    if width <= 0 {
+        return Err(RuntimeError::IllegalArgumentException {
+            message: format!("Invalid byte size: {}", width),
+        }
+        .into());
+    }
+    let count = ctx.array_length(array) as i64;
+    let size = count.saturating_mul(width);
+    // Zero elements still allocates: the JDK hands back an empty segment rather
+    // than null, and `Arena.allocate(0)` is legal.
+    let Some(Value::Object(Some(segment))) =
+        pe_arena_allocate_impl(ctx, arena, size.max(1), align)?
+    else {
+        return Ok(Some(Value::Object(None)));
+    };
+    // The allocator over-allocates one byte for an empty array (`size.max(1)`)
+    // so the pointer is real; report the size the caller asked for.
+    ctx.set_field(segment, 1, Value::Long(size));
+    let base = crate::panama_libffi::segment_address(ctx, segment) as *mut u8;
+    if base.is_null() || count == 0 {
+        return Ok(Some(Value::Object(Some(segment))));
+    }
+    for i in 0..count as usize {
+        let value = ctx.get_array_element(array, i);
+        // SAFETY: `i * width` is inside the block just allocated for
+        // `count * width` bytes, and each write is exactly `width` wide.
+        unsafe {
+            let p = base.add(i * width as usize);
+            match width {
+                1 => p.write(match value {
+                    Value::Int(v) => v as u8,
+                    _ => 0,
+                }),
+                2 => {
+                    let v = match value {
+                        Value::Int(v) => v as u16,
+                        _ => 0,
+                    };
+                    p.cast::<[u8; 2]>().write(v.to_ne_bytes());
+                }
+                4 => {
+                    let bits = match value {
+                        Value::Float(f) => f.to_bits(),
+                        Value::Int(v) => v as u32,
+                        _ => 0,
+                    };
+                    p.cast::<[u8; 4]>().write(bits.to_ne_bytes());
+                }
+                _ => {
+                    let bits = match value {
+                        Value::Double(d) => d.to_bits(),
+                        Value::Long(v) => v as u64,
+                        Value::Int(v) => i64::from(v) as u64,
+                        _ => 0,
+                    };
+                    p.cast::<[u8; 8]>().write(bits.to_ne_bytes());
+                }
+            }
+        }
+    }
+    Ok(Some(Value::Object(Some(segment))))
+}
+
+/// The receiver class of `MemorySegment.spliterator(...)`.
+///
+/// Deliberately NOT `java/util/Spliterator`. That name is already the runtime
+/// class of the array-backed collections spliterators, whose natives are
+/// registered by `native-collections` *after* this file's registrar runs — so
+/// re-registering `tryAdvance` there would take over every `ArrayList`
+/// spliterator in the VM. A distinct class also makes
+/// `StreamSupport.stream(spliterator, false)` treat this as a real
+/// `Spliterator` implementation and drain it lazily through `tryAdvance`,
+/// which is exactly the behaviour wanted here.
+const PE_SEGMENT_SPLITTER: &str = "java/lang/foreign/MemorySegment$SegmentSplitter";
+
+/// `NONNULL | SUBSIZED | SIZED | IMMUTABLE | ORDERED`, the value the JDK's
+/// `AbstractMemorySegmentImpl.SegmentSplitter.characteristics()` returns.
+const PE_SPLITTER_CHARACTERISTICS: i32 = 0x100 | 0x4000 | 0x40 | 0x400 | 0x10;
+
+/// `(low half element count, low half byte size, high half byte size)`.
+///
+/// The JDK's `SegmentSplitter.trySplit` arithmetic, lifted out so it can be
+/// checked without a heap: the LOW half gets `elemCount / 2` elements and the
+/// odd one stays with the high half, so an odd count splits 2/3, not 3/2. An
+/// off-by-one here silently drops or duplicates an element in every parallel
+/// stream over a segment, which is exactly the bug a differential probe over
+/// an even count cannot see.
+fn pe_split_bounds(elem_count: i64, elem_size: i64) -> (i64, i64, i64) {
+    let rem = elem_count % 2;
+    let split = elem_count / 2;
+    let lobound = split * elem_size;
+    let hibound = lobound + (rem * elem_size);
+    (split, lobound, hibound)
+}
+
+/// `(elemCount, elementSize, currentIndex)` off a splitter carrier.
+///
+/// Slots: `[0]=segment, [1]=elemCount, [2]=elementSize, [3]=currentIndex`.
+fn pe_splitter_state(ctx: &mut dyn NativeContext, this: ObjectRef) -> (i64, i64, i64) {
+    let long_at = |ctx: &mut dyn NativeContext, i: usize| match ctx.get_field(this, i) {
+        Value::Long(v) => v,
+        Value::Int(v) => i64::from(v),
+        _ => 0,
+    };
+    (long_at(ctx, 1), long_at(ctx, 2), long_at(ctx, 3))
+}
+
+/// Allocate a splitter over `segment`.
+fn pe_new_splitter(
+    ctx: &mut dyn NativeContext,
+    segment: ObjectRef,
+    elem_count: i64,
+    elem_size: i64,
+) -> Result<ObjectRef, MethodCallFailed> {
+    let segment_pin = ctx.pin_native_root(segment);
+    let splitter = try_alloc_concurrent_synthetic(ctx, PE_SEGMENT_SPLITTER, 4)?;
+    let segment = ctx.read_native_pin(segment_pin, segment);
+    ctx.unpin_native_roots(segment_pin);
+    ctx.set_field(splitter, 0, Value::Object(Some(segment)));
+    ctx.set_field(splitter, 1, Value::Long(elem_count));
+    ctx.set_field(splitter, 2, Value::Long(elem_size));
+    ctx.set_field(splitter, 3, Value::Long(0));
+    Ok(splitter)
+}
+
+/// `Spliterator.tryAdvance` — hand the consumer the next slice, one at a time.
+///
+/// This is where the laziness lives: the slice for element `i` is minted when
+/// `i` is reached, so a segment with more elements than fit in memory as
+/// separate `MemorySegment` objects still streams. A materialised list of
+/// slices would answer the same two calls and be wrong for exactly the case
+/// these methods exist for.
+fn pe_splitter_try_advance(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let (elem_count, elem_size, index) = pe_splitter_state(ctx, this);
+    if index >= elem_count {
+        return Ok(Some(Value::Int(0)));
+    }
+    let segment = match ctx.get_field(this, 0) {
+        Value::Object(Some(s)) => s,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let this_pin = ctx.pin_native_root(this);
+    let slice = pe_segment_slice(ctx, segment, index * elem_size, elem_size, None)?;
+    let this = ctx.read_native_pin(this_pin, this);
+    ctx.unpin_native_roots(this_pin);
+    // Advance BEFORE the callback: the JDK increments in a `finally`, so a
+    // consumer that throws still leaves the splitter past this element.
+    ctx.set_field(this, 3, Value::Long(index + 1));
+    if let Some(Value::Object(Some(consumer))) = args.get(1) {
+        let slice = slice.unwrap_or(Value::Object(None));
+        ctx.invoke_virtual(*consumer, "accept", "(Ljava/lang/Object;)V", &[slice])?;
+    }
+    Ok(Some(Value::Int(1)))
+}
+
+/// `MemorySegment.spliterator(MemoryLayout)`.
+///
+/// The four `IllegalArgumentException`s are the JDK's, in its order — see
+/// `AbstractMemorySegmentImpl.spliterator`.
+fn pe_segment_spliterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let layout = obj_arg(args, 1)?;
+    pe_segment_check_scope(ctx, this)?;
+    let (elem_size, elem_align) =
+        crate::phases_late::foreign_ffm::p67_layout_size_align(ctx, layout);
+    if elem_size == 0 {
+        return Err(RuntimeError::IllegalArgumentException {
+            message: "Element layout size cannot be zero".into(),
+        }
+        .into());
+    }
+    if elem_size % elem_align != 0 {
+        return Err(RuntimeError::IllegalArgumentException {
+            message: "Element layout size is not multiple of alignment".into(),
+        }
+        .into());
+    }
+    if crate::panama_libffi::segment_address(ctx, this) % elem_align != 0 {
+        return Err(RuntimeError::IllegalArgumentException {
+            message: "Incompatible alignment constraints".into(),
+        }
+        .into());
+    }
+    let size = crate::panama_libffi::segment_byte_size(ctx, this).max(0);
+    if size % elem_size != 0 {
+        return Err(RuntimeError::IllegalArgumentException {
+            message: "Segment size is not a multiple of layout size".into(),
+        }
+        .into());
+    }
+    let splitter = pe_new_splitter(ctx, this, size / elem_size, elem_size)?;
+    Ok(Some(Value::Object(Some(splitter))))
+}
+
+/// `MemorySegment.elements(MemoryLayout)` — `StreamSupport.stream(spliterator, false)`.
+///
+/// Built here rather than by calling that method, because `NativeContext` has
+/// no `invoke_static`. The shape is not invented: it is byte for byte what
+/// `service_loader::native_stream_support_stream_from_spliterator` builds for a
+/// non-synthetic spliterator — a `java/util/stream/Stream` carrier with a null
+/// element array in slot 0 and the spliterator parked in the lazy slot 2, which
+/// `native-collections`' `materialize_lazy_stream` / `stream_lazy_spliterator`
+/// drain on demand. Going through that path is what keeps `elements()` lazy:
+/// `forEach` interleaves `tryAdvance` and `accept` instead of buffering.
+fn pe_segment_elements(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let Some(Value::Object(Some(splitter))) = pe_segment_spliterator(ctx, args)? else {
+        return Ok(Some(Value::Object(None)));
+    };
+    let splitter_pin = ctx.pin_native_root(splitter);
+    let cid = ctx
+        .ensure_class_initialized("java/util/stream/Stream")
+        .unwrap_or_else(|_| cratonvm_types::ClassId::new(0));
+    // Force >= 3 fields so the lazy slot exists alongside elements (0) and
+    // close-handlers (1).
+    let nfields = ctx.class_num_total_fields(cid).max(3);
+    let stream = ctx.alloc_object(cid, nfields);
+    let stream_pin = ctx.pin_native_root(stream);
+    let mut stream = ctx.read_native_pin(stream_pin, stream);
+    ctx.set_field(stream, 0, Value::Object(None));
+    stream = ctx.read_native_pin(stream_pin, stream);
+    let splitter = ctx.read_native_pin(splitter_pin, splitter);
+    ctx.set_field(stream, 2, Value::Object(Some(splitter)));
+    stream = ctx.read_native_pin(stream_pin, stream);
+    ctx.unpin_native_roots(splitter_pin);
+    Ok(Some(Value::Object(Some(stream))))
 }
 
 /// The body behind `asSlice(long,long)`, `asSlice(long)` and `asReadOnly()`.
@@ -4901,6 +5306,71 @@ pub(crate) fn pe_arena_allocate_from_string(
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+/// `MemorySegment.spliterator` split arithmetic and characteristics.
+#[cfg(test)]
+mod segment_splitter_tests {
+    use super::{pe_split_bounds, PE_SPLITTER_CHARACTERISTICS};
+
+    #[test]
+    fn an_even_count_splits_down_the_middle() {
+        // 8 ints: low half 4 elements / 16 bytes, high half 16 bytes.
+        assert_eq!(pe_split_bounds(8, 4), (4, 16, 16));
+    }
+
+    #[test]
+    fn an_odd_element_stays_with_the_high_half() {
+        // 5 ints: low half 2 elements / 8 bytes, high half 12 bytes (3 elements).
+        // The JDK keeps the remainder on the side that is NOT handed out, so
+        // `lo + hi` must still be the whole segment.
+        let (split, lobound, hibound) = pe_split_bounds(5, 4);
+        assert_eq!((split, lobound, hibound), (2, 8, 12));
+        assert_eq!(
+            lobound + hibound,
+            5 * 4,
+            "the two halves must tile the segment"
+        );
+    }
+
+    #[test]
+    fn the_halves_always_tile_the_segment() {
+        for count in 1..64_i64 {
+            for size in [1_i64, 2, 4, 8] {
+                let (split, lobound, hibound) = pe_split_bounds(count, size);
+                assert_eq!(
+                    lobound + hibound,
+                    count * size,
+                    "count {count} size {size} leaves a gap or an overlap"
+                );
+                assert_eq!(split * size, lobound, "count {count} size {size}");
+                assert!(split <= count - split, "the low half must never be the larger one");
+                // The element counts must tile too, and each half's count must
+                // match its byte span. Checking only the BYTE bounds is what let
+                // a bad high-half count through: the splitter kept claiming the
+                // whole original count over the half-sized segment it had left,
+                // and ran off the end on the first element past the middle.
+                assert_eq!(
+                    split + (count - split),
+                    count,
+                    "count {count} size {size}: element counts must tile"
+                );
+                assert_eq!(
+                    (count - split) * size,
+                    hibound,
+                    "count {count} size {size}: the high half's count must match its bytes"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn characteristics_match_the_jdk() {
+        // Measured on HotSpot JDK 25: `seg.spliterator(JAVA_INT)
+        // .characteristics()` is 17744 =
+        // NONNULL|SUBSIZED|SIZED|IMMUTABLE|ORDERED.
+        assert_eq!(PE_SPLITTER_CHARACTERISTICS, 17744);
+    }
+}
 
 #[cfg(test)]
 mod tests {

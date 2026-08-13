@@ -1,8 +1,8 @@
 # JIT LICM / speculative pre-header bypassed by a branch into the loop header — FIXED 2026-07-27
 
-**Status: ✅ FIXED** (`jit/src/x64.rs`, `find_bypassable_loop_headers`).
+**Status: ✅ FIXED** (`../../../jit/src/x64.rs`, `find_bypassable_loop_headers`).
 General VM correctness bug — not app-specific. Found while closing
-`docs/internal/java-io-writer-write-char-array-jit-miscompile-20260726.md`
+`java-io-writer-write-char-array-jit-miscompile-20260726.md`
 and lifting the `org/glassfish/jaxb/` JIT ban.
 
 ## Symptom
@@ -27,7 +27,7 @@ hoists, speculative-BCE range guards, SIMD batch preheaders — is emitted
 **inline at the loop-header PC**, and `pc_to_native[header]` is then set to the
 position **after** it, so the in-loop back edge does not re-run it. (The
 `osr_entry_native` field exists precisely because an OSR entry must land
-*before* the pre-header; see its doc comment in `jit/src/x64.rs`.)
+*before* the pre-header; see its doc comment in `../../../jit/src/x64.rs`.)
 
 That contract silently assumes the only way into the loop is the linear
 fall-through, which runs the pre-header first. It does not hold when the loop
@@ -104,7 +104,7 @@ correct before and after the fix — 0/200000 wrong in both.
 
 ## Fix
 
-`find_bypassable_loop_headers(code, code_len, loops)` in `jit/src/x64.rs`
+`find_bypassable_loop_headers(code, code_len, loops)` in `../../../jit/src/x64.rs`
 decodes every explicit branch edge in the method (conditional branches, `goto`,
 `goto_w`, `tableswitch`, `lookupswitch` — same decoding as
 `compute_branch_targets`, but keeping the *source* PC) and reports every loop
@@ -154,7 +154,7 @@ bypass its pre-header.
 
 ## Verification
 
-Regression witnesses (`docs/internal/repros/jit-licm-preheader-bypass-20260727/`):
+Regression witnesses (`../repros/jit-licm-preheader-bypass-20260727`):
 
 * `LicmEntryProbe.java` — minimal, deterministic, pure-user-bytecode.
   Before: `badB=199266/200000`. After: `badA=0 badB=0`.
@@ -168,7 +168,7 @@ Regression witnesses (`docs/internal/repros/jit-licm-preheader-bypass-20260727/`
   (the original HIB-LONGTAIL.2 witness) — before: 6 fail / 20 runs.
   After: 0 / 6.
 
-Unit tests in `jit/src/x64.rs`:
+Unit tests in `../../../jit/src/x64.rs`:
 `single_entry_loop_header_is_not_bypassable`,
 `forward_goto_into_loop_header_is_bypassable` (the latter also asserts
 `find_arith_loop_hoists` *does* match the run, so the test would still be
@@ -194,7 +194,7 @@ VERIFY[attrs-corrupt-20k]         OK=10 BAD=0
 VERIFY[licm-entry-200k]           OK=3  BAD=0
 ```
 
-Suites: `regression-suite/run.sh` 13/13; `cargo test --release -p cratonvm-jit`
+Suites: `../../../regression-suite/run.sh` 13/13; `cargo test --release -p cratonvm-jit`
 1021 lib + 191 integration tests, 0 failures;
 `cargo test --release -p cratonvm-vm --lib skip_list` 68/68.
 
@@ -213,7 +213,7 @@ Suites: `regression-suite/run.sh` 13/13; `cargo test --release -p cratonvm-jit`
 
 ## Other backends — checked, not affected
 
-* **aarch64** (`jit/src/aarch64_backend.rs`, `jit/src/aarch64.rs`): no LICM,
+* **aarch64** (`../../../jit/src/aarch64_backend.rs`, `../../../jit/src/aarch64.rs`): no LICM,
   speculative-BCE or SIMD pre-header machinery at all (grep for
   `hoist`/`LICM`/`preheader` finds only an unrelated comment), so there is no
   equivalent placement contract to break.
@@ -296,7 +296,7 @@ exception-table gate is relaxed, run this driver first; it is the direct witness
 for this edge.
 
 Unit test: `handler_reachable_from_outside_a_hoisted_loop_is_bypassable` in
-`jit/src/x64.rs` covers all four cases on hand-written bytecode — no handler,
+`../../../jit/src/x64.rs` covers all four cases on hand-written bytecode — no handler,
 range wholly inside (must KEEP the hoist), range starting before the header, and
 handler outside the loop.
 

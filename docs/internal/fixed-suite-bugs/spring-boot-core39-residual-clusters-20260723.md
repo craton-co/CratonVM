@@ -29,7 +29,7 @@ before touching any code.
 
 1. **`SSLSocketFactory.getDefault()` (the static method) allocated a bare
    0-field synthetic object, never wiring up field 0 (the owning
-   `SSLContext`)** (`native-builtins/src/phases_late/ssl_security.rs`) —
+   `SSLContext`)** (`../../../native-builtins/src/phases_late/ssl_security.rs`) —
    unlike `SSLContext.getSocketFactory()`'s registration a few lines above,
    which correctly stashes the context at field 0. Any caller that reaches
    the layered `createSocket(Socket,String,int,boolean)` overload through a
@@ -53,7 +53,7 @@ before touching any code.
 
 2. **`ch.qos.logback.classic.LoggerContext`'s `start`/`stop`/`reset`/
    `isStarted` were STILL natively stubbed to no-ops**
-   (`native-builtins/src/logging_shims.rs`) — stale leftovers from the same
+   (`../../../native-builtins/src/logging_shims.rs`) — stale leftovers from the same
    pre-fix era the file's own `getLogger` comment documents (when
    `LoggerContext` was served via `alloc_concurrent_synthetic` and every
    method had to be faked). `<init>` has been real bytecode for a while
@@ -81,7 +81,7 @@ before touching any code.
    log output and AOT model entries across `@Test` methods" family.
 
 3. **`"".getBytes(StandardCharsets.UTF_16)` returned a 2-byte BOM (`FE FF`)
-   instead of an empty array** (`native-api/src/charset.rs`,
+   instead of an empty array** (`../../../native-api/src/charset.rs`,
    `encode_utf16_with_bom`) — real JDK's `UnicodeEncoder` only ever emits the
    BOM as part of its per-character encode loop, which never runs for zero
    input chars, so an empty string round-trips to an empty array on real
@@ -99,7 +99,7 @@ before touching any code.
    Confirmed via a direct `"".getBytes(UTF_16)` A/B (real JDK: `[]`;
    CratonVM: `[-2, -1]`) before touching the fix. Only affects the one-shot
    `String.getBytes(Charset)`/`encode_chars[_lossy]` path — the STATEFUL
-   `CharsetEncoder.encode()` session path (`native-builtins/src/charset.rs`,
+   `CharsetEncoder.encode()` session path (`../../../native-builtins/src/charset.rs`,
    separate BOM-once-per-session tracking) is untouched and was already
    correct. Fixed `DefaultLogbackConfigurationTests` (was silently
    PASSING at the JUnit level the whole time — 7/7 — but the runner
@@ -108,7 +108,7 @@ before touching any code.
 
 4. **`org.slf4j.impl.StaticMDCBinder`'s `getSingleton`/`getMDCA`/
    `getMDCAdapterClassStr` were UNCONDITIONALLY native-stubbed**
-   (`native-builtins/src/logging_shims.rs`) — the exact same bug class as
+   (`../../../native-builtins/src/logging_shims.rs`) — the exact same bug class as
    `micrometer-metrics-logbackcondition-wrong-binder-20260724` fixed for
    `StaticLoggerBinder` right below it in the same file, just never applied
    here too. A registered native shadows ANY class of that name at every
@@ -128,7 +128,7 @@ before touching any code.
    2 of 3 `Log4J2LoggingSystemTests` `correlationLoggingTo*` failures (61→1).
 
 5. **The JUL-to-handler bridge's synthetic `LogRecord` never set
-   `loggerName`** (`native-builtins/src/logmanager.rs`,
+   `loggerName`** (`../../../native-builtins/src/logmanager.rs`,
    `publish_to_jul_handlers_src`) — this native path constructs a fresh
    `LogRecord` and stamps `level`/`message`/`sourceClassName`/
    `sourceMethodName` onto it, bypassing `Logger.log(LogRecord)`'s real
@@ -360,7 +360,7 @@ token under JIT, producing a javac parse error. **Both are now fixed as of
 2026-07-26** (an unrelated JIT branch-join-merge fix, commit `13055f75c`,
 turned out to resolve both — see the full diagnostic trail, minimal
 repros, bisection notes, and closure writeup:
-`docs/internal/fixed-suite-bugs/springboot/configurationpropertiesbeanregistrationaotprocessortests-hang-FIXED.md`).
+`springboot/configurationpropertiesbeanregistrationaotprocessortests-hang-FIXED.md`).
 The class now passes under JIT-on, real repro, all 9 test methods.
 
 ## Cluster B — diagnostics, process metadata, and byte/URL utilities — 4/4 CLOSED (see STATUS above; fix commit `ecfa6aff6`)

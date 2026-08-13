@@ -117,13 +117,38 @@ fn class_name_for_mirror(
         .map(|name| canonical_jfr_type_name(&name))
 }
 
+/// JFR event names keyed by the type id `JVM.getTypeId(Class)` handed out.
+///
+/// `Recording.enable(Class)` does NOT store the class name in the recording's
+/// settings map — `Recording$RecordingSettings` stores
+/// `String.valueOf(Type.getTypeId(eventClass))`, i.e. the decimal id that came
+/// out of this bridge. So a settings key can read `545#enabled`, and the only
+/// way back to `io.netty.AllocateChunk` is a table this side keeps as it hands
+/// the ids out. Recorded here rather than derived later because the `Class`
+/// mirror — the one thing that knows the `@Name` — is only in hand at this call.
+fn type_id_event_names() -> &'static Mutex<HashMap<i64, String>> {
+    static NAMES: OnceLock<Mutex<HashMap<i64, String>>> = OnceLock::new();
+    NAMES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
 fn type_id_from_class_mirror(ctx: &mut dyn NativeContext, args: &[Value]) -> i64 {
-    match args.first() {
-        Some(Value::Object(Some(mirror))) => class_name_for_mirror(ctx, *mirror)
-            .map(|name| type_id(&name))
-            .unwrap_or_default(),
-        _ => 0,
+    let Some(Value::Object(Some(mirror))) = args.first().copied() else {
+        return 0;
+    };
+    let Some(name) = class_name_for_mirror(ctx, mirror) else {
+        return 0;
+    };
+    let id = type_id(&name);
+    // Remember the JFR name this id stands for, so a settings key that names the
+    // id can be resolved back. `jfr_event_name` is cached per class.
+    if let Some(class_id) = ctx.class_id_from_mirror(mirror) {
+        let event_name = jfr_event_name(ctx, class_id);
+        type_id_event_names()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .insert(id, event_name);
     }
+    id
 }
 
 fn known_jfr_type_for_class_mirror(ctx: &mut dyn NativeContext, args: &[Value]) -> Option<Value> {
@@ -432,6 +457,482 @@ fn capture_event_fields(
 fn event_timing() -> &'static Mutex<HashMap<(usize, u64), (u64, Option<u64>)>> {
     static TIMING: OnceLock<Mutex<HashMap<(usize, u64), (u64, Option<u64>)>>> = OnceLock::new();
     TIMING.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+// ---------------------------------------------------------------------------
+// jdk.jfr.Recording settings
+// ---------------------------------------------------------------------------
+
+/// One open `jdk.jfr.Recording` the Java boundary started, and the settings read
+/// off it.
+///
+/// The `Recording` is held as a GLOBAL ROOT so its settings map can be re-read
+/// after `start()` — a bare `ObjectRef` would not survive the GCs in between.
+struct JavaRecording {
+    /// `NativeContext::vm_identity` of the owning VM; the table is
+    /// process-global while the root is per-VM.
+    vm: usize,
+    recording: usize,
+    /// JFR event names this recording set `#enabled=true` for.
+    enabled: HashSet<String>,
+    /// JFR event names this recording set `#enabled=false` for. Kept separately
+    /// from "absent from `enabled`", because absent and explicitly-off mean
+    /// different things — see [`java_event_enabled`].
+    disabled: HashSet<String>,
+    /// `#threshold` per event name, in nanoseconds.
+    thresholds: HashMap<String, u64>,
+}
+
+fn java_recordings() -> &'static Mutex<Vec<JavaRecording>> {
+    static RECORDINGS: OnceLock<Mutex<Vec<JavaRecording>>> = OnceLock::new();
+    RECORDINGS.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+/// Per-VM set of event names a settings re-read has already failed to admit.
+///
+/// Without this memo, every commit of an explicitly-disabled event would trigger
+/// a full Java-side `getSettings()` re-read. Cleared by
+/// [`publish_java_recording_settings`], i.e. by every start, stop and re-read,
+/// so a later `enable(...)` is still picked up.
+fn java_events_known_disabled() -> &'static Mutex<HashMap<usize, HashSet<String>>> {
+    static DENIED: OnceLock<Mutex<HashMap<usize, HashSet<String>>>> = OnceLock::new();
+    DENIED.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Per-VM set of Java event names this bridge has decided to record.
+///
+/// This is what makes the VM-side allow-list work without the recorder needing
+/// to know which of its event types came from Java. The allow-list it publishes
+/// is `explicitly enabled ∪ admitted`, so:
+///
+///   * a Java event class is recorded because `java_event_enabled` admitted it
+///     and added it here, and
+///   * CratonVM's own built-in `jdk.*` events are NOT, unless a recording names
+///     one explicitly.
+///
+/// That asymmetry is HotSpot's, measured on JDK 25 rather than assumed: a
+/// `new Recording()` with no `enable(...)` call records both of a probe's two
+/// custom events and none of the JDK's own, because `jdk.jfr.Enabled` defaults
+/// to `true` for a user event class while the JDK's metadata ships most `jdk.*`
+/// types with `enabled=false`.
+fn java_events_admitted() -> &'static Mutex<HashMap<usize, HashSet<String>>> {
+    static ADMITTED: OnceLock<Mutex<HashMap<usize, HashSet<String>>>> = OnceLock::new();
+    ADMITTED.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Parse a JFR timespan setting value into nanoseconds.
+///
+/// The spelling is `<number> <unit>` with unit in `ns`/`us`/`ms`/`s`/`m`/`h`/`d`
+/// (`jdk.jfr.internal.util.ValueParser`); `withoutThreshold()` writes `0 ns`. A
+/// bare number is nanoseconds, which is also what the JDK's parser accepts.
+/// Anything unparseable answers `None` and the setting is ignored rather than
+/// guessed at — a wrong threshold silently drops events.
+fn parse_jfr_timespan_nanos(value: &str) -> Option<u64> {
+    let value = value.trim();
+    if value.eq_ignore_ascii_case("infinity") {
+        return Some(u64::MAX);
+    }
+    let split = value
+        .find(|c: char| !c.is_ascii_digit() && c != '-' && c != '+')
+        .unwrap_or(value.len());
+    let (number, unit) = value.split_at(split);
+    let amount: u64 = number.trim().parse().ok()?;
+    let multiplier = match unit.trim() {
+        "" | "ns" => 1u64,
+        "us" => 1_000,
+        "ms" => 1_000_000,
+        "s" => 1_000_000_000,
+        "m" => 60 * 1_000_000_000,
+        "h" => 3_600 * 1_000_000_000,
+        "d" => 86_400 * 1_000_000_000,
+        _ => return None,
+    };
+    Some(amount.saturating_mul(multiplier))
+}
+
+/// What one `jdk.jfr.Recording`'s settings map says.
+type ReadSettings = (HashSet<String>, HashSet<String>, HashMap<String, u64>);
+
+/// Read `recording.getSettings()` and translate it into `(enabled, disabled,
+/// thresholds)`.
+///
+/// Settings keys are `<identifier>#<setting>`, where the identifier is either an
+/// event NAME (from `enable(String)`) or the decimal type id this bridge handed
+/// out (from `enable(Class)` — see [`type_id_event_names`]).
+///
+/// Returns `None` when the map cannot be read at all, which the caller must
+/// treat as "no filter": guessing an empty set there would silently turn every
+/// recording into a recording of nothing.
+fn read_java_recording_settings(
+    ctx: &mut dyn NativeContext,
+    recording: ObjectRef,
+) -> Option<ReadSettings> {
+    let mut scope = NativeHandleScope::new(ctx);
+    let recording = scope.root(recording);
+    let settings = {
+        let receiver = scope.get(&recording);
+        match scope.invoke_virtual(receiver, "getSettings", "()Ljava/util/Map;", &[]) {
+            Ok(Some(Value::Object(Some(map)))) => map,
+            _ => return None,
+        }
+    };
+    let settings = scope.root(settings);
+    // `keySet().toArray()` rather than an entry-set iterator: two virtual calls
+    // and then pure array reads, instead of one call per entry per step.
+    let keys = {
+        let map = scope.get(&settings);
+        match scope.invoke_virtual(map, "keySet", "()Ljava/util/Set;", &[]) {
+            Ok(Some(Value::Object(Some(set)))) => {
+                let set = scope.root(set);
+                let receiver = scope.get(&set);
+                match scope.invoke_virtual(receiver, "toArray", "()[Ljava/lang/Object;", &[]) {
+                    Ok(Some(Value::Object(Some(array)))) => array,
+                    _ => return None,
+                }
+            }
+            _ => return None,
+        }
+    };
+    let keys = scope.root(keys);
+
+    let mut enabled: HashSet<String> = HashSet::new();
+    let mut disabled: HashSet<String> = HashSet::new();
+    let mut thresholds: HashMap<String, u64> = HashMap::new();
+    let length = {
+        let array = scope.get(&keys);
+        scope.array_length(array)
+    };
+    for index in 0..length {
+        let key = {
+            let array = scope.get(&keys);
+            match scope.get_array_element(array, index) {
+                Value::Object(Some(key)) => key,
+                _ => continue,
+            }
+        };
+        let key = scope.root(key);
+        let Some(text) = ({
+            let key = scope.get(&key);
+            scope.read_string(key)
+        }) else {
+            continue;
+        };
+        // `#` separates the identifier from the setting name, and an event name
+        // cannot contain one, so splitting at the LAST `#` is unambiguous.
+        let Some((identifier, setting)) = text.rsplit_once('#') else {
+            continue;
+        };
+        if setting != "enabled" && setting != "threshold" {
+            // `stackTrace`, `period`, `cutoff`, `throttle`, `level` and the
+            // per-event control classes have no counterpart in the Rust
+            // recorder. Skipping them is visible in the code rather than
+            // implied by a match arm that silently accepts everything.
+            continue;
+        }
+        let value = {
+            let map = scope.get(&settings);
+            let key = scope.get(&key);
+            match scope.invoke_virtual(
+                map,
+                "get",
+                "(Ljava/lang/Object;)Ljava/lang/Object;",
+                &[Value::Object(Some(key))],
+            ) {
+                Ok(Some(Value::Object(Some(value)))) => scope.read_string(value),
+                _ => None,
+            }
+        };
+        let Some(value) = value else {
+            continue;
+        };
+        let name = match identifier.parse::<i64>() {
+            Ok(id) => match type_id_event_names()
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .get(&id)
+                .cloned()
+            {
+                Some(name) => name,
+                // An id this bridge never handed out cannot be resolved to a
+                // name; there is nothing honest to do with it.
+                None => continue,
+            },
+            Err(_) => identifier.to_owned(),
+        };
+        match setting {
+            "enabled" => {
+                // A map holds one value per key, so `enable(X)` followed by
+                // `disable(X)` leaves only the last one — no ordering to track.
+                if value.trim().eq_ignore_ascii_case("true") {
+                    disabled.remove(&name);
+                    enabled.insert(name);
+                } else {
+                    enabled.remove(&name);
+                    disabled.insert(name);
+                }
+            }
+            "threshold" => {
+                if let Some(nanos) = parse_jfr_timespan_nanos(&value) {
+                    if nanos == 0 {
+                        thresholds.remove(&name);
+                    } else {
+                        thresholds.insert(name, nanos);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    Some((enabled, disabled, thresholds))
+}
+
+/// Re-read `recording`'s settings and push the union across every open Java
+/// recording into the VM recorder.
+///
+/// The union is the right answer and matches HotSpot: an event type is recorded
+/// if *any* running recording enables it, and CratonVM's Java boundary drives
+/// one VM-side recording shared by every open `Recording`/`RecordingStream`.
+fn refresh_java_recording_settings(ctx: &mut dyn NativeContext, recording: ObjectRef) {
+    let vm = ctx.vm_identity();
+    let read = read_java_recording_settings(ctx, recording);
+    {
+        let mut table = java_recordings()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let slot = table
+            .iter()
+            .position(|entry| entry.vm == vm && ctx.resolve_global_root(entry.recording) == Some(recording));
+        match (slot, read) {
+            (Some(slot), Some((enabled, disabled, thresholds))) => {
+                table[slot].enabled = enabled;
+                table[slot].disabled = disabled;
+                table[slot].thresholds = thresholds;
+            }
+            (Some(slot), None) => {
+                // The map could not be read. Drop the entry rather than leave a
+                // stale filter in place; with no entry the recording falls back
+                // to "record everything".
+                let entry = table.remove(slot);
+                ctx.remove_global_root(entry.recording);
+            }
+            (None, Some((enabled, disabled, thresholds))) => {
+                let root = ctx.add_global_root(recording);
+                table.push(JavaRecording {
+                    vm,
+                    recording: root,
+                    enabled,
+                    disabled,
+                    thresholds,
+                });
+            }
+            (None, None) => {}
+        }
+    }
+    publish_java_recording_settings(ctx);
+}
+
+/// Forget `recording`'s settings — it stopped or closed.
+fn forget_java_recording_settings(ctx: &mut dyn NativeContext, recording: ObjectRef) {
+    let vm = ctx.vm_identity();
+    let removed = {
+        let mut table = java_recordings()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        table
+            .iter()
+            .position(|entry| {
+                entry.vm == vm && ctx.resolve_global_root(entry.recording) == Some(recording)
+            })
+            .map(|slot| table.remove(slot))
+    };
+    if let Some(entry) = removed {
+        ctx.remove_global_root(entry.recording);
+    }
+    publish_java_recording_settings(ctx);
+}
+
+/// Hand this VM's effective allow-list and thresholds to the VM recorder.
+///
+/// The allow-list is `explicitly enabled ∪ admitted` (see
+/// [`java_events_admitted`]) — which is what keeps CratonVM's own `jdk.*`
+/// built-ins out of a Java recording that never asked for them, while letting
+/// every Java event class in by default.
+fn publish_java_recording_settings(ctx: &mut dyn NativeContext) {
+    let vm = ctx.vm_identity();
+    // Any change to the settings invalidates the "already refused" memo.
+    java_events_known_disabled()
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .remove(&vm);
+    let (enabled, thresholds) = {
+        let table = java_recordings()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let mine: Vec<&JavaRecording> = table.iter().filter(|entry| entry.vm == vm).collect();
+        if mine.is_empty() {
+            // No Java recording is open: no name filter at all, which is what
+            // every CratonVM-internal recording needs. Nothing can be admitted
+            // against a recording that does not exist, so drop that set too.
+            java_events_admitted()
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .remove(&vm);
+            (None, Vec::new())
+        } else {
+            let mut enabled: Vec<String> = Vec::new();
+            let mut thresholds: HashMap<String, u64> = HashMap::new();
+            for entry in mine {
+                for name in &entry.enabled {
+                    if !enabled.iter().any(|existing| existing == name) {
+                        enabled.push(name.clone());
+                    }
+                }
+                for (name, nanos) in &entry.thresholds {
+                    // The most permissive threshold wins, so one recording's
+                    // narrow filter cannot suppress another's events.
+                    thresholds
+                        .entry(name.clone())
+                        .and_modify(|existing| *existing = (*existing).min(*nanos))
+                        .or_insert(*nanos);
+                }
+            }
+            for name in java_events_admitted()
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .get(&vm)
+                .into_iter()
+                .flatten()
+            {
+                if !enabled.iter().any(|existing| existing == name) {
+                    enabled.push(name.clone());
+                }
+            }
+            let thresholds: Vec<(String, u64)> = thresholds.into_iter().collect();
+            (Some(enabled), thresholds)
+        }
+    };
+    ctx.jfr_configure_java_recording(enabled.as_deref(), &thresholds);
+}
+
+/// Whether a Java event class named `event_name` should be recorded, given the
+/// settings of every open Java recording in this VM.
+///
+/// The rule, measured against HotSpot JDK 25 rather than assumed — a probe with
+/// two custom events and a bare `new Recording()` records BOTH there:
+///
+///   * explicitly `enable`d by any recording → yes;
+///   * otherwise explicitly `disable`d → no;
+///   * otherwise **yes**, because `jdk.jfr.Enabled` defaults to `true` and a
+///     user event class carries no metadata that turns it off. An earlier
+///     version of this function defaulted to *no*, which made a
+///     `new Recording()` record nothing and disagreed with HotSpot on three of
+///     the probe's rows.
+///
+/// A `true` answer also ADMITS the name (see [`java_events_admitted`]), which is
+/// what lets the VM-side allow-list keep CratonVM's built-in events out while
+/// letting Java's in.
+///
+/// With no Java recording open at all the answer is `true` and nothing is
+/// admitted: the recorder then has no name filter, which is what CratonVM's own
+/// recordings need.
+fn java_event_enabled(ctx: &mut dyn NativeContext, event_name: &str) -> bool {
+    let vm = ctx.vm_identity();
+
+    // `admits` is the per-recording answer OR-ed together, which is HotSpot's
+    // rule: a type is recorded if any running recording would record it. A
+    // recording that does not mention the name applies the TYPE's default —
+    // `true` — so it admits; only a recording that explicitly disables the name
+    // refuses. Therefore "disabled" requires *every* open recording to have said
+    // so, which is why this cannot be a "first opinion wins" scan.
+    let (any_recording, admits) = {
+        let table = java_recordings()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let mut any_recording = false;
+        let mut admits = false;
+        for entry in table.iter().filter(|entry| entry.vm == vm) {
+            any_recording = true;
+            if entry.enabled.contains(event_name) || !entry.disabled.contains(event_name) {
+                admits = true;
+                break;
+            }
+        }
+        (any_recording, admits)
+    };
+    if !any_recording {
+        return true;
+    }
+    if admits {
+        admit_java_event(ctx, vm, event_name);
+        return true;
+    }
+
+    if java_events_known_disabled()
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .get(&vm)
+        .is_some_and(|names| names.contains(event_name))
+    {
+        return false;
+    }
+    // First refusal of this name. A `Recording.enable(...)` AFTER `start()` is
+    // legal, and its only funnel is a private `Recording.setSetting` this bridge
+    // does not intercept, so re-read every open recording once before saying no.
+    let roots: Vec<usize> = {
+        let table = java_recordings()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        table
+            .iter()
+            .filter(|entry| entry.vm == vm)
+            .map(|entry| entry.recording)
+            .collect()
+    };
+    for root in roots {
+        if let Some(recording) = ctx.resolve_global_root(root) {
+            refresh_java_recording_settings(ctx, recording);
+        }
+    }
+    let still_disabled = {
+        let table = java_recordings()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let mut any_recording = false;
+        let mut admits = false;
+        for entry in table.iter().filter(|entry| entry.vm == vm) {
+            any_recording = true;
+            if entry.enabled.contains(event_name) || !entry.disabled.contains(event_name) {
+                admits = true;
+                break;
+            }
+        }
+        any_recording && !admits
+    };
+    if still_disabled {
+        java_events_known_disabled()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .entry(vm)
+            .or_default()
+            .insert(event_name.to_owned());
+        return false;
+    }
+    admit_java_event(ctx, vm, event_name);
+    true
+}
+
+/// Record that `event_name` is being recorded, republishing the allow-list the
+/// first time a name is added.
+fn admit_java_event(ctx: &mut dyn NativeContext, vm: usize, event_name: &str) {
+    let newly_admitted = java_events_admitted()
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .entry(vm)
+        .or_default()
+        .insert(event_name.to_owned());
+    if newly_admitted {
+        publish_java_recording_settings(ctx);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -892,10 +1393,17 @@ fn saved_dump_path(ctx: &mut dyn NativeContext) -> Value {
 
 /// Register every native declared by JDK 25's `jdk.jfr.internal.JVM`.
 ///
-/// Configuration and logging calls are deliberately no-ops until a setting is
-/// consumed by the Rust recorder.  They still must succeed: OpenJDK's Java
+/// Logging calls, and the tuning knobs for a chunk writer this bridge does not
+/// own, are deliberately no-ops. They still must succeed: OpenJDK's Java
 /// implementation uses them while constructing a recording and before an
 /// `EventDirectoryStream` can be started.
+///
+/// "Configuration" is no longer in that list. A recording's
+/// `enable`/`disable`/`threshold` settings ARE consumed — read off
+/// `Recording.getSettings()` at `start()` and applied both here (per-type
+/// `Event.isEnabled()`) and in the recorder (the name filter on
+/// `RecordingSettings`). What is still ignored is named at its `continue` in
+/// `read_java_recording_settings`.
 pub fn register_jfr_natives(registry: &mut NativeMethodRegistry) {
     const JVM: &str = "jdk/jfr/internal/JVM";
 
@@ -990,12 +1498,31 @@ pub fn register_jfr_natives(registry: &mut NativeMethodRegistry) {
         }
         Ok(None)
     });
-    registry.register("jdk/jfr/Event", "isEnabled", "()Z", |ctx, _args| {
-        Ok(Some(Value::Int(ctx.jfr_java_recording_active() as i32)))
-    });
-    registry.register("jdk/jfr/Event", "shouldCommit", "()Z", |ctx, _args| {
-        Ok(Some(Value::Int(ctx.jfr_java_recording_active() as i32)))
-    });
+    // `isEnabled()`/`shouldCommit()` answer for THIS event type, not just "is a
+    // recording running".
+    //
+    // The recording-active check stays first and is a single relaxed atomic
+    // load, so a process that never touches `jdk.jfr` pays exactly what it paid
+    // before. Only inside a recording does the per-name lookup run — and that is
+    // the point: netty guards every buffer allocation with
+    // `AllocateBufferEvent.isEventEnabled()`, and a test that enabled only the
+    // chunk event should not be paying to fill and commit buffer events.
+    for name in ["isEnabled", "shouldCommit"] {
+        registry.register("jdk/jfr/Event", name, "()Z", |ctx, args| {
+            if !ctx.jfr_java_recording_active() {
+                return Ok(Some(Value::Int(0)));
+            }
+            let Some(Value::Object(Some(event))) = args.first().copied() else {
+                return Ok(Some(Value::Int(1)));
+            };
+            let event_class = ctx.class_id_of_object(event);
+            let event_name = jfr_event_name(ctx, event_class);
+            Ok(Some(Value::Int(i32::from(java_event_enabled(
+                ctx,
+                &event_name,
+            )))))
+        });
+    }
     registry.register("jdk/jfr/Event", "commit", "()V", |ctx, args| {
         if !ctx.jfr_java_recording_active() {
             return Ok(None);
@@ -1028,6 +1555,11 @@ pub fn register_jfr_natives(registry: &mut NativeMethodRegistry) {
         let receiver = scope.get(&event);
         let event_class = scope.class_id_of_object(receiver);
         let event_name = jfr_event_name(&mut *scope, event_class);
+        // An application may call `commit()` without asking `shouldCommit()`
+        // first; a disabled event type must not be recorded either way.
+        if !java_event_enabled(&mut *scope, &event_name) {
+            return Ok(None);
+        }
         let receiver = scope.get(&event);
         let fields = capture_event_fields(&mut *scope, receiver);
         // Record first, deliver second: a consumer that throws must not cost
@@ -1064,12 +1596,21 @@ pub fn register_jfr_natives(registry: &mut NativeMethodRegistry) {
         Ok(None)
     }, NativeKind::Bridge);
 
-    registry.register("jdk/jfr/Recording", "start", "()V", |ctx, _args| {
+    registry.register("jdk/jfr/Recording", "start", "()V", |ctx, args| {
         ctx.jfr_begin_java_recording();
+        // Read the recording's `enable`/`disable`/`threshold` settings now. Every
+        // documented usage sets them before `start()`, and this is the one place
+        // the `Recording` object is in hand with the recording about to go live.
+        if let Some(Value::Object(Some(recording))) = args.first().copied() {
+            refresh_java_recording_settings(ctx, recording);
+        }
         Ok(None)
     });
-    registry.register("jdk/jfr/Recording", "stop", "()Z", |ctx, _args| {
+    registry.register("jdk/jfr/Recording", "stop", "()Z", |ctx, args| {
         ctx.jfr_end_java_recording();
+        if let Some(Value::Object(Some(recording))) = args.first().copied() {
+            forget_java_recording_settings(ctx, recording);
+        }
         Ok(Some(Value::Int(1)))
     });
     registry.register(
@@ -1771,6 +2312,12 @@ pub fn register_jfr_natives(registry: &mut NativeMethodRegistry) {
                     .unwrap_or_else(|poison| poison.into_inner())[slot]
                     .started = true;
                 ctx.jfr_begin_java_recording();
+                // A stream's `enable(...)` calls land on the `Recording` it owns
+                // (`RecordingStream.enable` delegates straight to it), so the
+                // settings live on that private field, not on the stream.
+                if let Value::Object(Some(recording)) = ctx.get_field_by_name(stream, "recording") {
+                    refresh_java_recording_settings(ctx, recording);
+                }
                 Ok(None)
             },
         );
@@ -1867,6 +2414,12 @@ pub fn register_jfr_natives(registry: &mut NativeMethodRegistry) {
             // silently disable the other.
             if remaining_started == 0 {
                 ctx.jfr_end_java_recording();
+            }
+            // This stream's settings stop contributing to the enable union
+            // whether or not it was the last one, or the next test's events
+            // would still be admitted by a closed stream's `enable(...)`.
+            if let Value::Object(Some(recording)) = ctx.get_field_by_name(stream, "recording") {
+                forget_java_recording_settings(ctx, recording);
             }
             // Replay the JDK's own close. `recording` and `directoryStream` are
             // private fields of `RecordingStream`; a missing one means the JDK
@@ -2064,6 +2617,27 @@ mod tests {
         let (total, swap) = host_memory_totals().expect("host RAM probe");
         assert!(total > 0, "hostTotalMemory must be a real total");
         assert!(swap >= 0, "hostTotalSwapMemory must not be negative");
+    }
+
+    /// `withoutThreshold()` writes `0 ns`, `withThreshold(Duration)` writes the
+    /// unit-suffixed form. A value this parser cannot read must answer `None`
+    /// rather than a guess: a wrong threshold silently drops events.
+    #[test]
+    fn jfr_timespan_settings_parse_to_nanoseconds() {
+        assert_eq!(parse_jfr_timespan_nanos("0 ns"), Some(0));
+        assert_eq!(parse_jfr_timespan_nanos("20 ms"), Some(20_000_000));
+        assert_eq!(parse_jfr_timespan_nanos("20ms"), Some(20_000_000));
+        assert_eq!(parse_jfr_timespan_nanos("1 s"), Some(1_000_000_000));
+        assert_eq!(parse_jfr_timespan_nanos("500 us"), Some(500_000));
+        assert_eq!(parse_jfr_timespan_nanos("2 m"), Some(120_000_000_000));
+        assert_eq!(parse_jfr_timespan_nanos("1 h"), Some(3_600_000_000_000));
+        assert_eq!(parse_jfr_timespan_nanos("1 d"), Some(86_400_000_000_000));
+        // A bare number is nanoseconds, which is what the JDK's own parser does.
+        assert_eq!(parse_jfr_timespan_nanos("750"), Some(750));
+        assert_eq!(parse_jfr_timespan_nanos("infinity"), Some(u64::MAX));
+        assert_eq!(parse_jfr_timespan_nanos("everything"), None);
+        assert_eq!(parse_jfr_timespan_nanos("20 fortnights"), None);
+        assert_eq!(parse_jfr_timespan_nanos(""), None);
     }
 
     #[test]

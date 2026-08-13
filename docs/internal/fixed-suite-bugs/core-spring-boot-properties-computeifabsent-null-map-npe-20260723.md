@@ -25,7 +25,7 @@ the null field.
 
 Commit `2a44df5cce7d5a3446c45a05c341005b8283b6ef` added the permanent bridge
 `native_properties_compute_if_absent` in
-`native-builtins/src/properties_sidetable.rs` and registered it for:
+`../../../native-builtins/src/properties_sidetable.rs` and registered it for:
 
 ```
 java/util/Properties.computeIfAbsent
@@ -57,7 +57,7 @@ SHA-256 EF93787280EA0D66DAB6010B1AD9197939228EF63C52B979D8FCB4B35A334684
 
 After merging current `origin/dev`, the final integrated release executable
 had SHA-256 `C61F1E896735B06E22FBD7CA34624ACA3CE53B5B93837D6CADB08549D53721E7`.
-Using the external `apps/spring-boot` fixture with JDK 25 and the suite
+Using the external `../../../apps/spring-boot` fixture with JDK 25 and the suite
 runner's per-module generated classpath, the complete class passed in both
 required modes:
 
