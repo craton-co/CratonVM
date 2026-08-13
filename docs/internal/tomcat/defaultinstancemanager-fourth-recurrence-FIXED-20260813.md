@@ -191,3 +191,16 @@ unavailable for the reason the superseded page gives — a non-zero mark word
 loses the thin-lock CAS — and is not needed: the discriminators are
 `side_sorted` for the live half and the on-grid empty-object-run test for the
 dead half.
+
+## Re-verified after merging `origin/dev`
+
+`dev` moved 17 commits mid-work, touching `gc/src/gen_heap.rs` among others, so
+every claim above was re-measured on the merged binary rather than carried over:
+
+* the in-binary A/B still discriminates — recovery on: both unload vectors
+  `PASS`; recovery off: `RClassUnloadSweep PASS` (default collector, still
+  blind by construction) and `RClassUnloadSweepGen FAIL output differs from
+  HotSpot`;
+* `TestDefaultInstanceManager` `OK (1 test)` on all four collectors again;
+* `regression-suite` core 43 passed / 0 failed; `cratonvm-gc --lib` 1503 and
+  `cratonvm-types --lib` 562, both green.
