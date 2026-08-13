@@ -256,7 +256,7 @@ Suite state on the merged tree:
   `jni_nio_slots_not_stub`. Both are pre-existing and unrelated — re-run on
   unmodified `dev` (`a0a648dfc`) they fail identically, same assertion, same
   folded address. They are the `/OPT:ICF` casualties already recorded in
-  `../../native-call-funnel-per-call-floor-item2-20260805.md` §"`/OPT:ICF` —
+  `../native-call-funnel-per-call-floor-item2-20260805.md` §"`/OPT:ICF` —
   four tests, one cause": `jni_get_module` compiles to the same bytes as
   `jni_stub`, so the linker folds them and `assert_ne!` on the two addresses
   cannot hold.

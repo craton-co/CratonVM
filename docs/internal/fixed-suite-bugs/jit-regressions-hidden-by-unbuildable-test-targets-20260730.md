@@ -37,9 +37,9 @@ independent places:
 1. Ten `jit/tests/*.rs` helper literals were never updated when `set_throw_bci`
    and `service_callee_deopt` were appended to `JitRuntimeHelpers`
    (`66548471f`, 2026-07-28 and `31a80bfb8`).
-2. `jit-api/src/lib.rs`'s own unit tests had the same gap, plus a golden
+2. `../../../jit-api/src/lib.rs`'s own unit tests had the same gap, plus a golden
    ABI-offset table still describing 56 fields when there are 58.
-3. `classloading/tests/wp2_10_nest_host.rs` was missing
+3. `../../../classloading/tests/wp2_10_nest_host.rs` was missing
    `Class::record_object_methods`.
 4. `native-builtins-crypto`'s lib tests import `cratonvm_native_api` without it
    being a dev-dependency.
@@ -73,7 +73,7 @@ the gate works is not.
 | `fix/deep-audit-retire-20260730`, after merging `origin/dev` at `0477c8851` | 11 |
 
 **A "39" previously stood in that second row and was wrong.** It was measured
-against a stale `target/release/cratonvm.exe` built before the merge:
+against a stale `../../../target/release/cratonvm.exe` built before the merge:
 `synthetic_diff.rs::cratonvm_binary()` prefers a release binary over a debug one,
 so every subprocess test in that run validated pre-merge code. Deleting the
 stale binary and rebuilding changed the result.
@@ -89,7 +89,7 @@ listed below. Read it as an order of magnitude, not a subtraction.
 
 ## The regressions
 
-With the targets buildable again, `jit/tests/ir_vs_singlepass.rs` reports 8
+With the targets buildable again, `../../../jit/tests/ir_vs_singlepass.rs` reports 8
 failures and one process-level `STATUS_ACCESS_VIOLATION`, and `cratonvm-jit
 --lib` reports a further cluster.
 
@@ -98,7 +98,7 @@ before the compile break — the same file passes **89/89**, verified by checkin
 out that commit into a separate worktree and running it with the same
 test-source fix applied.
 
-`jit/tests/ir_vs_singlepass.rs`:
+`../../../jit/tests/ir_vs_singlepass.rs`:
 
 | test | symptom |
 |---|---|
@@ -162,7 +162,7 @@ For the known-good comparison:
 git worktree add --detach /tmp/wt-0727 c05f85967
 ```
 
-then copy this branch's `jit/tests/ir_vs_singlepass.rs` over the old one (it
+then copy this branch's `../../../jit/tests/ir_vs_singlepass.rs` over the old one (it
 only adds the two new helper fields and a correct-ABI `set_throw_bci` no-op)
 and run the same command. Note that a zero-argument `panic!` stub for
 `set_throw_bci` faults the process rather than failing a test — it is called

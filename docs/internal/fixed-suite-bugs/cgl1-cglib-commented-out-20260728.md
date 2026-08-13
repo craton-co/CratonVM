@@ -12,7 +12,7 @@ CGLIB artifact. Spring's own internal, repackaged copy
 
 ## Original symptom (Session 117, agent O4, 2026-05-16)
 
-`../../apps/cglib_probe` (a minimal repro: `Enhancer.create()` over `Greeter`
+`../../../apps/cglib_probe` (a minimal repro: `Enhancer.create()` over `Greeter`
 with a single `MethodInterceptor` lambda, never found on this host in
 later sessions) SEGFAULT'd (rc=139) immediately after `<clinit>` of the
 generated proxy class
@@ -27,7 +27,7 @@ the RBC.1/SPB.1-9/W2-CHM archetype.
 
 ## Why it was never re-verified before being commented out
 
-The original fixture (`../../apps/cglib_probe`) was never found on this host.
+The original fixture (`../../../apps/cglib_probe`) was never found on this host.
 The standalone `net/sf/cglib/` artifact is not one of the 5 target apps
 — note Spring's OWN CGLIB usage (via `org/springframework/cglib/`) is a
 totally different package and was never covered by this ban in the

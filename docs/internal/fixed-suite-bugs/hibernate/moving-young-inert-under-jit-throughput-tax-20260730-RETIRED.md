@@ -120,7 +120,7 @@ moving-young owner branch's own `BinTreesClassic` acceptance data
 (`cycles=0, coverage_fallbacks=64`).
 
 This was real at the time, and is exactly what
-`docs/internal/default-moving-young-enabled-20260730.md` root-caused to three
+`../default-moving-young-enabled-20260730.md` root-caused to three
 independent defects (a process-wide coverage blanket, a coverage proof that
 erased its own input, and recursion misread as an unguarded foreign frame) and
 fixed: the same `BinTreesClassic` lane went from `cycles=0

@@ -219,7 +219,7 @@ attributable to this change (which only *removes* compiles).
 
 `cargo test -p cratonvm-vm --lib` — 2401 passed, the same 2 pre-existing
 `native::jni` `/OPT:ICF` failures as on unmodified `dev`, documented in
-`../../native-call-funnel-per-call-floor-item2-20260805.md`.
+`../native-call-funnel-per-call-floor-item2-20260805.md`.
 
 `vm/tests/clinit_first_call_compile_order.rs` pins both flag arms — the default
 arm too, so a future change that moves the first-call door under the background

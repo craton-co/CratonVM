@@ -74,35 +74,115 @@ fn noop_environment() -> &'static Mutex<Option<(i32, ObjectRef)>> {
 /// `customizePropertySources` which uses `System.getProperties()`/`getenv()` —
 /// both of which CratonVM supports — yielding a fully functional environment
 /// with the canonical `systemProperties`/`systemEnvironment` sources.
-fn construct_real_standard_environment(ctx: &mut dyn NativeContext) -> Option<ObjectRef> {
-    let env_class = "org/springframework/core/env/StandardEnvironment";
-    let env = match ctx.new_object(env_class) {
-        Ok(Some(Value::Object(Some(o)))) => o,
-        other => {
-            report_env_bootstrap_failure(&format!("new_object failed: {other:?}"));
-            return None;
-        }
-    };
-    // GC-safety: the `<init>` invocation below can itself allocate (it runs
-    // `customizePropertySources`); pin `env` and re-read the forwarded
-    // reference before returning it.
-    let env_pin = ctx.pin_native_root(env);
-    let init = ctx.invoke(env_class, "<init>", "()V", &[Value::Object(Some(env))]);
-    if let Err(e) = init {
-        ctx.unpin_native_roots(env_pin);
-        // Do NOT swallow this. The caller's fallback is a SYNTHETIC
-        // `StandardEnvironment` allocated without running any constructor, so
-        // every field initialiser — `AbstractEnvironment.logger` among them —
-        // stays null, and the first `setActiveProfiles` on it dies with a bare
-        // `NullPointerException: ... because "this.logger" is null` from
-        // `AbstractContextLoader.prepareContext`, hundreds of frames and one
-        // swallowed exception away from whatever actually broke here.
-        let what = describe_thrown(ctx, &e);
-        report_env_bootstrap_failure(&format!("StandardEnvironment.<init> threw {what}"));
+/// Resolve `internal_name` through `loader_context`'s own defining loader,
+/// when that loader is a user-defined (isolated) one. `None` for anything
+/// builtin-loaded, since Application-loaded callers legitimately want
+/// Application's own copy and the caller's existing name-based path already
+/// gets that right.
+///
+/// Mirrors `preload_isolated_loader_supertypes`'s pattern: the only
+/// authoritative way to ask what a given loader considers `name` is to
+/// invoke its own `loadClass`, not a global/name-only lookup — CratonVM's
+/// class dictionary is keyed by `(ClassLoaderId, name)`, and `new_object`
+/// re-resolves by name alone, collapsing to whichever definer is
+/// global/first. That is how `AbstractApplicationContext.createEnvironment()`
+/// — a native override, so it never runs the bytecode `new
+/// StandardEnvironment()` that would otherwise resolve through the compiling
+/// class's own constant pool correctly — built a `StandardEnvironment` from a
+/// different loader than the isolated `@ClassPathExclusions` context that
+/// called it, so a `PropertiesPropertySource` this environment carries in its
+/// `MutablePropertySources` failed `checkcast EnumerablePropertySource`
+/// against the isolated loader's own copy.
+fn resolve_class_via_loader_context(
+    ctx: &mut dyn NativeContext,
+    loader_context: ObjectRef,
+    internal_name: &str,
+) -> Option<cratonvm_types::ClassId> {
+    let ctx_class_id = ctx.class_id_of_object(loader_context);
+    let loader_ns = ctx.loader_id_of_class(ctx_class_id);
+    if loader_ns < 3 {
         return None;
     }
-    let env = ctx.read_native_pin(env_pin, env);
-    ctx.unpin_native_roots(env_pin);
+    let loader_obj = crate::classloader::loader_object_for_namespace_id(loader_ns as u32)?;
+    let dotted_name = ctx.create_string(&internal_name.replace('/', "."));
+    let name_pin = ctx.pin_native_root(dotted_name);
+    let result = ctx.invoke_virtual(
+        loader_obj,
+        "loadClass",
+        "(Ljava/lang/String;)Ljava/lang/Class;",
+        &[Value::Object(Some(dotted_name))],
+    );
+    ctx.unpin_native_roots(name_pin);
+    match result {
+        Ok(Some(Value::Object(Some(mirror)))) => ctx.class_id_from_mirror(mirror),
+        _ => None,
+    }
+}
+
+fn construct_real_standard_environment(ctx: &mut dyn NativeContext) -> Option<ObjectRef> {
+    construct_real_standard_environment_for(ctx, None)
+}
+
+/// `loader_context`: any live object whose own defining loader should own the
+/// new `StandardEnvironment` — normally the `AbstractApplicationContext` (or
+/// `SpringApplication`) instance the caller is building an environment for.
+/// `None` keeps the original loader-blind behaviour, appropriate for the
+/// process-global last-resort singleton in `get_noop_environment` (which by
+/// design has no single owning context to be loader-faithful to).
+fn construct_real_standard_environment_for(
+    ctx: &mut dyn NativeContext,
+    loader_context: Option<ObjectRef>,
+) -> Option<ObjectRef> {
+    let env_class = "org/springframework/core/env/StandardEnvironment";
+    let scoped_class_id =
+        loader_context.and_then(|lc| resolve_class_via_loader_context(ctx, lc, env_class));
+    let env = if let Some(class_id) = scoped_class_id {
+        match ctx.new_object_initialized_with_class_id(class_id, "()V", &[]) {
+            Ok(Some(Value::Object(Some(o)))) => o,
+            Err(e) => {
+                let what = describe_thrown(ctx, &e);
+                report_env_bootstrap_failure(&format!(
+                    "StandardEnvironment.<init> (loader-scoped) threw {what}"
+                ));
+                return None;
+            }
+            other => {
+                report_env_bootstrap_failure(&format!(
+                    "new_object_initialized_with_class_id failed: {other:?}"
+                ));
+                return None;
+            }
+        }
+    } else {
+        let env = match ctx.new_object(env_class) {
+            Ok(Some(Value::Object(Some(o)))) => o,
+            other => {
+                report_env_bootstrap_failure(&format!("new_object failed: {other:?}"));
+                return None;
+            }
+        };
+        // GC-safety: the `<init>` invocation below can itself allocate (it runs
+        // `customizePropertySources`); pin `env` and re-read the forwarded
+        // reference before returning it.
+        let env_pin = ctx.pin_native_root(env);
+        let init = ctx.invoke(env_class, "<init>", "()V", &[Value::Object(Some(env))]);
+        if let Err(e) = init {
+            ctx.unpin_native_roots(env_pin);
+            // Do NOT swallow this. The caller's fallback is a SYNTHETIC
+            // `StandardEnvironment` allocated without running any constructor, so
+            // every field initialiser — `AbstractEnvironment.logger` among them —
+            // stays null, and the first `setActiveProfiles` on it dies with a bare
+            // `NullPointerException: ... because "this.logger" is null` from
+            // `AbstractContextLoader.prepareContext`, hundreds of frames and one
+            // swallowed exception away from whatever actually broke here.
+            let what = describe_thrown(ctx, &e);
+            report_env_bootstrap_failure(&format!("StandardEnvironment.<init> threw {what}"));
+            return None;
+        }
+        let env = ctx.read_native_pin(env_pin, env);
+        ctx.unpin_native_roots(env_pin);
+        env
+    };
     Some(env)
 }
 
@@ -256,7 +336,7 @@ fn get_environment(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
             ctx.unpin_native_roots(this_pin);
             return Ok(Some(Value::Object(Some(env))));
         }
-        if let Some(env) = construct_real_standard_environment(ctx) {
+        if let Some(env) = construct_real_standard_environment_for(ctx, Some(*this)) {
             let this = ctx.read_native_pin(this_pin, *this);
             ctx.set_field_by_name(this, "environment", Value::Object(Some(env)));
             ctx.unpin_native_roots(this_pin);
@@ -269,8 +349,12 @@ fn get_environment(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
 
 /// `AbstractApplicationContext.createEnvironment()` — a FRESH environment per
 /// call, like the real `return new StandardEnvironment();` body.
-fn create_environment(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    if let Some(env) = construct_real_standard_environment(ctx) {
+fn create_environment(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(this))) => Some(*this),
+        _ => None,
+    };
+    if let Some(env) = construct_real_standard_environment_for(ctx, this) {
         return Ok(Some(Value::Object(Some(env))));
     }
     Ok(Some(Value::Object(Some(get_noop_environment(ctx)?))))
@@ -393,7 +477,7 @@ fn spring_app_get_or_create_environment(
         // and can trigger a collection that relocates `this` (dereferenced
         // again by `set_field_by_name`); pin it and re-read.
         let this_pin = ctx.pin_native_root(*this);
-        if let Some(env) = construct_real_standard_environment(ctx) {
+        if let Some(env) = construct_real_standard_environment_for(ctx, Some(*this)) {
             // Cache on `this.environment` so future Spring code that reads
             // the field directly (not via this method) sees the same env.
             // Best-effort — if the field doesn't exist on this Spring

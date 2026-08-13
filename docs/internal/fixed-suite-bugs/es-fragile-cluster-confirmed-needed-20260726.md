@@ -160,7 +160,7 @@ looks exactly like a reproduction.
 
 **196 of 197 classes match their interpreted baseline exactly**, including the
 seven-class vector/DiskBBQ hang cluster that
-`fixed-suite-bugs/elasticsearch-suite/elasticsearch-vector-diskbbq-hangs.md`
+`elasticsearch-suite/elasticsearch-vector-diskbbq-hangs.md`
 had retired *by* this containment: six are identical either way and the seventh
 (`IVFKnnFloatSlicedVectorQueryTests`) times out in both arms at a 60-minute
 budget, so it is a pre-existing hang the ban never addressed.

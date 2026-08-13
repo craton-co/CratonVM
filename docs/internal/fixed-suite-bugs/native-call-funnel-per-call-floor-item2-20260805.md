@@ -21,7 +21,7 @@ that cannot.
 
 ## The profile
 
-`vm/src/vm/vm_exec.rs`, module `native_funnel_profile`, `#[ignore]`d:
+`../../../vm/src/vm/vm_exec.rs`, module `native_funnel_profile`, `#[ignore]`d:
 
 ```bash
 cargo test --release -p cratonvm-vm --lib funnel -- --ignored --nocapture
@@ -208,13 +208,13 @@ differ. In this tree it accounts for:
   on the still-unmerged `fix/locale-tostring-shadow-20260801`.
 * `ir_lower::tests::a_wide_field_read_refuses_without_the_sentinel_disambiguator`
   — its two `extern "C"` fakes both compile to `xor eax,eax; ret`. Verified
-  pre-existing by reverting `jit/src/lib.rs` to `origin/dev` and re-running.
+  pre-existing by reverting `../../../jit/src/lib.rs` to `origin/dev` and re-running.
 * the first cut of this branch's own tests, where three same-bodied test
   natives collapsed into one address.
 
 ## The end-to-end A/B, and what it cannot resolve
 
-`scripts/ab-native-funnel.ps1` runs `NativeShapeProbe` A-B-B-A and reports the
+`../../../scripts/ab-native-funnel.ps1` runs `NativeShapeProbe` A-B-B-A and reports the
 minimum last-pass ns/op per rung. On the three-round run against `origin/dev`
 (pre-leaf-work), only the `currentThread` row (34.7x) is a measurement.
 `String.length()` — an interpreter intrinsic this branch does not touch — moved

@@ -4911,6 +4911,14 @@ pub(crate) fn native_classloader_define_class1(
         }
         _ => String::new(),
     };
+    if let Ok(filter) = cratonvm_types::flags::runtime_var("CRATONVM_DBG_DEFINE_STACK_FILTER") {
+        if !filter.is_empty() && name.contains(filter.as_str()) {
+            eprintln!("[DBG_DEFINE_STACK] defineClass1({name})");
+            for entry in ctx.capture_stack_trace(0) {
+                eprintln!("    at {}.{}", entry.class_name, entry.method_name);
+            }
+        }
+    }
 
     let byte_array = match args.get(2) {
         Some(Value::Object(Some(arr))) => *arr,

@@ -41,8 +41,8 @@ JAXB 4.0.7 jars, real JDK 25 via `--java-home`):
 Closed by general JIT correctness work merged into dev between 2026-07-26 and
 2026-07-27 — not by a targeted fix, and not by this session's change. The
 `Writer` family was never a JIT ban (it has no skip-list entry), so there is
-nothing to lift; this doc is retired to `docs/internal/` per the
-`docs/known-issues` convention (that directory holds only *unfixed* bugs).
+nothing to lift; this doc is retired to `..` per the
+`../../known-issues` convention (that directory holds only *unfixed* bugs).
 
 ## Correction 1 — the overload was `write(String)`, not `write(char[])`
 
@@ -72,14 +72,14 @@ still-live general VM bug — the LICM / speculative pre-header bypass, whose
 `org.xml.sax.helpers.AttributesImpl.ensureCapacity` face killed the run with
 `OutOfMemoryError … anewarray … length 1677721600` about one run in three. That
 one is real, root-caused, and fixed:
-`docs/internal/jit-licm-preheader-bypass-20260727.md`. It is **not** the bug
+`jit-licm-preheader-bypass-20260727.md`. It is **not** the bug
 described here: it has no loop in any `Writer` method to hoist out of, and the
 `Writer` symptom predates it and reproduced under `BISECT_ONLY=java/io/Writer`
 where `AttributesImpl` cannot compile at all.
 
 ## Related
 
-- `docs/internal/jit-licm-preheader-bypass-20260727.md` — the real bug this
+- `jit-licm-preheader-bypass-20260727.md` — the real bug this
   probe was hiding at higher iteration counts.
 - `docs/internal/jaxb-jit-ban-removed-20260727.md` — the ban this was found
   under; now removed.

@@ -324,7 +324,7 @@ already packed at natural 1/2/4/8-byte widths in the production allocators,
 interpreter, JIT helpers, and collectors. The remaining 16-byte-cell path is
 the required fallback for descriptor-less/padded synthetic slots. The last
 allocation hot-path registry lookup was removed by
-`../packed-object-fields-performance-20260727.md`; this section is retained as
+`../fixed-suite-bugs/packed-object-fields-performance-20260727.md`; this section is retained as
 the recommendation that led to that verification, not as current-state truth.
 
 The 16-byte universal heap field slot dominates ordinary object size. Use

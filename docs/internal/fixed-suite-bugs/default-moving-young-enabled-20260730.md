@@ -177,7 +177,7 @@ misleading figures above came from not doing that.
 
 ## Cross-thread coverage is still an open obligation (by design)
 
-`probes/MovingYoungConcurrentProbe.java` puts four threads in long-lived
+`../../../probes/MovingYoungConcurrentProbe.java` puts four threads in long-lived
 compiled frames, allocating hard enough to collect from each of them. Its
 checksum is order-independent, so HotSpot and CratonVM must agree exactly. Run
 as `MovingYoungConcurrentProbe 4 400 2000` at `-Xmx256m`.
@@ -192,7 +192,7 @@ as `MovingYoungConcurrentProbe 4 400 2000` at `-Xmx256m`.
 `refresh_moving_young_coverage_for_collection` treats a cycle as unproven
 whenever a peer thread is in compiled code, because a peer's registers and frame
 slots are not rewritable by this collection. That is obligation #8 in
-`docs/internal/arch-2026-07-26/moving-young-precise-roots.md` ("cross-thread
+`../arch-2026-07-26/moving-young-precise-roots.md` ("cross-thread
 coverage handshake") and it is not implemented. So single-threaded phases now
 compact and multi-threaded phases still take the non-moving sweep — visibly
 accounted rather than silently. Closing it is the next item, and the largest
@@ -221,7 +221,7 @@ remaining throughput lever for Tomcat/Spring-shaped workloads.
   JitCollectionCtorIdentity, JitDeepRecursionFaultRecovery, JitDifferential,
   JitExceptionTableInlineCache, JitNull, JitOsrLoopProgress, NestedClinitStartup,
   RealAnnotations, RealAqs, RealFjp, RealRaf, SyntheticDiff}` from
-  `vm/tests/resources` under both VMs and compares stdout byte-for-byte, after
+  `../../../vm/tests/resources` under both VMs and compares stdout byte-for-byte, after
   dropping CratonVM-only diagnostics (`tracing` records and the launcher's
   `[cratonvm]`/`[GC]` lines) and normalising CRLF — MSYS `grep`/`sed` strip CR
   from one side of the pipeline but not the other, which otherwise reports every
@@ -271,7 +271,7 @@ the guard across it meant that the moment `DEFAULT_MOVING_YOUNG` became `true`
 the predicate was unconditionally `false`, every young class mirror was rooted
 directly again, and `TestDefaultInstanceManager.testClassUnloading` broke for
 the third time — one day after being fixed and verified 3/3. See
-`fixed-suite-bugs/tomcat/defaultinstancemanager-third-recurrence-FIXED.md`.
+`tomcat/defaultinstancemanager-third-recurrence-FIXED.md`.
 
 Two things about that are worth carrying forward:
 
@@ -297,7 +297,7 @@ Both directions, two days apart, same root shape: a fix keyed on this flag for
 correlation rather than for meaning.
 
 A full sweep of `moving_young_enabled()` was done on 2026-08-01 — 8 sites in
-`gc/`, `vm/` and `jit/`. Seven are correct: the four `conservative_roots`
+`../../../gc`, `../../../vm` and `../../../jit`. Seven are correct: the four `conservative_roots`
 entries are early-outs of moving-young-specific machinery, and `x64.rs`'s
 `precise_maps && !moving_young_enabled()` reload gate is a deliberate either/or
 (the moving path reloads registers from GC-rewritten shadow entries in

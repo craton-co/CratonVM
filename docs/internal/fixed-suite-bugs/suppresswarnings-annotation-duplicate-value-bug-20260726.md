@@ -30,7 +30,7 @@ custom `@interface`s; its output is byte-identical to HotSpot JDK 25 —
 The actual cause was a **collection** defect with no annotation content at all:
 `java.util.LinkedHashSet.remove(Object)` deleted the element but returned
 `false`. `native_linkedhashset_remove`
-(`native-builtins/src/properties_sidetable.rs`, an override that only really
+(`../../../native-builtins/src/properties_sidetable.rs`, an override that only really
 wants `Properties.keySet()` snapshots) sent every *ordinary* `LinkedHashSet` to
 real bytecode via `invoke_virtual_bytecode_only`; real `HashSet.remove` is
 `return map.remove(o) == PRESENT;`, and this VM's synthetic backing map stores

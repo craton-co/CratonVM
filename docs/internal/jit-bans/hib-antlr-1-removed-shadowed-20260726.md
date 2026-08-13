@@ -110,7 +110,7 @@ failure modes. Neither mode is specific to a configuration:
    binary when the host was quiet and OOM'd on that same binary once load
       average passed 100. **Identified 2026-07-27 (later the same day): this is
    the LICM/speculative pre-header bypass fixed in `613b10f4c`** — see
-   `docs/internal/jit-licm-preheader-bypass-20260727.md`. Both arms of this
+   `../fixed-suite-bugs/jit-licm-preheader-bypass-20260727.md`. Both arms of this
    A/B were built from a base that predates that fix, so it was never the
    ban. `component 6` is a ClassId (`java/lang/String`), not T_FLOAT, and
    `1677721600 == 25 * 2^26` is `AttributesImpl.ensureCapacity`'s doubling

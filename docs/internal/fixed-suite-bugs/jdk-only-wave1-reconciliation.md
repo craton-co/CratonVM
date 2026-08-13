@@ -7,12 +7,12 @@ Author: AA-RECONCILE. Read-only audit; no file outside this one was modified.
 (committed + uncommitted), because most of the feature is uncommitted.
 
 **The tree moved while this audit ran.** `HEAD` advanced from `947ee1f5c` to
-`ef75dd778`, `vm-cli/src/main.rs` shrank by ~1,000 lines, and two new untracked
+`ef75dd778`, `../../../vm-cli/src/main.rs` shrank by ~1,000 lines, and two new untracked
 files appeared. Three defects I had already written up were fixed underneath me
 and are recorded in §5 as *resolved during audit*, not as open findings. Anything
 in §1–§3 was re-verified against the final snapshot immediately before writing.
 
-Reference standard for every comparison: `docs/feature-designs/jdk-only-mode.md`.
+Reference standard for every comparison: `../../feature-designs/jdk-only-mode.md`.
 
 Nothing was built. `cargo` was not run (per instruction). Every claim below is
 from reading source. Where I cannot tell whether something compiles without
@@ -30,16 +30,16 @@ building, I say so.
 | Stale-comment / process divergences | **4** |
 
 **Most likely first failure:** not a compiler error — it is
-`cargo test --workspace` failing in `vm/tests/jdk_only_config.rs`, four
+`cargo test --workspace` failing in `../../../vm/tests/jdk_only_config.rs`, four
 assertions in three tests (§2.1–§2.4). All four are that test file asserting a
 *different* `JdkOnlyViolation::render` / `to_json` surface than
-`types/src/error.rs` actually implements, and `types/src/error.rs` has its own
+`../../../types/src/error.rs` actually implements, and `../../../types/src/error.rs` has its own
 unit tests pinning the shape it does implement — so the two test suites
 contradict each other and one of them must lose.
 
 If a compile error does appear first, the two places I could not fully rule out
-are named in §4 (`jfr/src/jdk_only.rs`, and the doctest in
-`cratonvm-embed/src/lib.rs`).
+are named in §4 (`../../../jfr/src/jdk_only.rs`, and the doctest in
+`../../../cratonvm-embed/src/lib.rs`).
 
 ---
 
@@ -60,9 +60,9 @@ intended shape, but only a build proves it.
 
 ## 2. Test-time failures — compile, then fail
 
-All four are the same disagreement: **`vm/tests/jdk_only_config.rs` (agent A's
+All four are the same disagreement: **`../../../vm/tests/jdk_only_config.rs` (agent A's
 test file) was written against a `JdkOnlyViolation` diagnostic surface that
-`types/src/error.rs` (agent F) did not implement.** `types/src/error.rs` carries
+`../../../types/src/error.rs` (agent F) did not implement.** `../../../types/src/error.rs` carries
 its own `#[cfg(test)]` tests (`types/src/error.rs:1593-1638`,
 `remediation_ends_with_the_two_fixed_lines`) that pin the shape it *does*
 implement, so this is not "one side is unfinished" — both sides are finished and
@@ -93,7 +93,7 @@ Minimal fix: change the assertion at `jdk_only_config.rs:434` to
 Contract §3 says "hand-rolled to match existing dump style", no spacing
 requirement. The compact form is also what the `--jdk-only-report` writer
 consumes (`vm/src/vm/vm_init.rs:4158` re-indents by newline only, and the body
-has no newlines), and `difftest/src/census.rs` parses with `serde_json`, which
+has no newlines), and `../../../difftest/src/census.rs` parses with `serde_json`, which
 does not care. **Contract-neutral; `types` is the incumbent.**
 
 Minimal fix: drop the two spaces in the test's expected substrings.
@@ -147,7 +147,7 @@ and the three implementations agree.
 
 - Producer: `classloading/src/class_manager.rs:2438` — `requested_by: None`, hard-coded, with a `JDK-ONLY-NOTE` (line 2428) handing the job to the §7 interpreter agent.
 - Second ask: `classloading/src/class_manager.rs:2488` — `requester: None` on every `CompatibilityClassRequested` the class manager records, same reason.
-- Consumers: `vm/src/vm/vm_init.rs:4802` writes `"requested_by": …` (always `null`); `tools/jdk-only-blockers/blockers.py` reads the field; the contract's §5 row shape promises it.
+- Consumers: `vm/src/vm/vm_init.rs:4802` writes `"requested_by": …` (always `null`); `../../../tools/jdk-only-blockers/blockers.py` reads the field; the contract's §5 row shape promises it.
 
 **Not satisfied.** No interpreter-side code populates either field. Every
 `compatibility-class-requested` violation in a real report will therefore say
@@ -163,7 +163,7 @@ which is half of §1.7's actionability requirement.
 
 Grep over the whole tree: the variant is constructed only in
 `vm/tests/jdk_only_config.rs:314`, `vm/tests/jdk_only_config.rs:487` and the
-un-wired `jfr/src/jdk_only.rs`. Production code never builds one.
+un-wired `../../../jfr/src/jdk_only.rs`. Production code never builds one.
 
 Contract §8 permits either `MissingBootClass` **or** `InvalidConfiguration` for
 the strict boot precondition, and `vm/src/vm/vm_init.rs:429` chose
@@ -187,7 +187,7 @@ mandated, outside §4/§5), so this is a gap, not a violation.
 ### 3.4 Two independent notices for `CRATONVM_REAL=-stubs`
 
 - `vm-cli/src/main.rs:2053` `note_no_stubs_env_without_jdk_only`, called at `vm-cli/src/main.rs:2811`, prints a 4-line note.
-- `types/src/flag_groups.rs:838-847` `SUPERSEDED` + `process_env_supersessions`, consumed at `vm-cli/src/main.rs` (the `for superseded in …process_env_supersessions()` loop), prints a one-line note.
+- `types/src/flag_groups.rs:838-847` `SUPERSEDED` + `process_env_supersessions`, consumed at `../../../vm-cli/src/main.rs` (the `for superseded in …process_env_supersessions()` loop), prints a one-line note.
 
 Both fire for the same environment (`CRATONVM_REAL=-stubs` without
 `--jdk-only`), so an operator sees the advice twice, in two different wordings.
@@ -219,7 +219,7 @@ Already written up by its author in
 Consequence for the CI gate: the "zero compatibility classes" assertion in
 `.github/workflows/ci.yml:487-505` can fail even when the policy is working,
 because this path still mints stubs. Two of the three test files
-(`classloading/tests/jdk_only_class_origin.rs`) route around it by calling
+(`../../../classloading/tests/jdk_only_class_origin.rs`) route around it by calling
 `load_class`, which *does* return `Result`.
 
 ### 3.7 `resolve_dispatch` deviates from the normative §7 order — deliberately
@@ -259,7 +259,7 @@ bit-for-bit — that reasoning is sound as written.
 `.github/workflows/ci.yml:441-445` runs `jdk_only_registry`,
 `jdk_only_class_origin`, `jdk_only_dispatch` and `stub_ratchet`.
 `.github/workflows/ci.yml:437-438` says to add `--test jdk_only_config` "when
-`vm/tests/jdk_only_config.rs` … lands". It landed (commit `fcd11e0cc`).
+`../../../vm/tests/jdk_only_config.rs` … lands". It landed (commit `fcd11e0cc`).
 
 Consequence: the four §2 failures surface only in the blocking
 `cargo test --workspace`, not in the job named after the feature.
@@ -288,7 +288,7 @@ Every contract-specified item traced from definition to all call sites:
 | `ClassOriginEntry` (6 fields) | `class_origin.rs:175-189` | matches §5 |
 | `Class::origin` + `Class::set_origin` | `classloading/src/class.rs:343,508` | matches §5; `is_synthetic_stub` retained as required |
 | `ClassManager::{set_compatibility_mode, compatibility_mode, dump_class_origins, origin_violations}` | `class_manager.rs:2405,2410,2421,2450` | all four present, signatures match §5 |
-| `VmConfig::{is_jdk_only, execution_policy, validate_compatibility}` + `compatibility_mode` field | `vm/src/config.rs` (`with_compatibility_mode`, `is_jdk_only`, `execution_policy`, `validate_compatibility`) | matches §6 |
+| `VmConfig::{is_jdk_only, execution_policy, validate_compatibility}` + `compatibility_mode` field | `../../../vm/src/config.rs` (`with_compatibility_mode`, `is_jdk_only`, `execution_policy`, `validate_compatibility`) | matches §6 |
 | `DispatchDecision<'a>`, 4 variants | `vm/src/vm/vm_exec.rs:62-74` | matches §7 |
 | `resolve_dispatch` | `vm/src/vm/vm_exec.rs:178-183` | 4 params, types match §7 (`Method` aliased to `ClassFileMethod` at `vm_exec.rs:54`) |
 | `resolve_native_dispatch_wave1` | `vm/src/vm/vm_exec.rs:279-287` | not in contract — see §3.8; all 8 call sites pass 7 matching args |
@@ -296,9 +296,9 @@ Every contract-specified item traced from definition to all call sites:
 | `record_native_dispatch` | `vm/src/vm/vm_exec.rs:342` | 4 params; one call site (`invoke.rs:13013`) |
 
 Re-exports verified: `types/src/lib.rs:34` (`pub mod compat;` + root re-export),
-`native-api/src/lib.rs` (`NativeCensusEntry` added to the `pub use` list),
-`classloading/src/lib.rs` (`pub mod class_origin;` + `pub use
-class_origin::{ClassOrigin, ClassOriginEntry}`), `vm/src/config.rs`
+`../../../native-api/src/lib.rs` (`NativeCensusEntry` added to the `pub use` list),
+`../../../classloading/src/lib.rs` (`pub mod class_origin;` + `pub use
+class_origin::{ClassOrigin, ClassOriginEntry}`), `../../../vm/src/config.rs`
 (`pub use cratonvm_types::compat::{CompatibilityMode, ExecutionPolicy}`),
 `vm/src/vm.rs:22-23` (`pub use vm_exec::*; pub use vm_init::*;`),
 `cratonvm-embed/src/lib.rs:156`.
@@ -325,7 +325,7 @@ The exhaustive destructure/rebuild in
 deliberately written without a trailing `..` so a new field is a hard error)
 handles `origin` at `:2107`.
 
-The `Class` literal in `vm/src/vm/vm_exec.rs`'s `#[cfg(test)] mod tests` was
+The `Class` literal in `../../../vm/src/vm/vm_exec.rs`'s `#[cfg(test)] mod tests` was
 missing `origin` earlier in this session and now sets it
 (`vm_exec.rs:23888`, immediately above `is_synthetic_stub` at `:23889`). See §5.
 
@@ -336,7 +336,7 @@ exist. **They did, and they no longer do.** They were collapsed to one while thi
 audit was running. Both the finding and the resolution are recorded here because
 the orchestrator was told to expect the divergence.
 
-**What it was** (`vm-cli/src/main.rs`'s `write_native_census_json` vs
+**What it was** (`../../../vm-cli/src/main.rs`'s `write_native_census_json` vs
 `SharedVm::dump_native_census_json`, both stamping `"schema_version": 2`):
 
 | Aspect | launcher writer (deleted) | `vm` writer (survived) |
@@ -348,7 +348,7 @@ the orchestrator was told to expect the divergence.
 | `counts` / `invocations` blocks | identical | identical |
 
 Which consumers would have broken under which writer:
-`difftest/src/census.rs` — **neither**; it is shape-tolerant
+`../../../difftest/src/census.rs` — **neither**; it is shape-tolerant
 (`find_row_array`, `census.rs:180`) and only reads `kind` + `invocations`.
 `tools/jdk-only-blockers/blockers.py:497-517` — **neither**; it copies
 `real_declaring_method` verbatim and tolerates `null`.
@@ -378,7 +378,7 @@ Remaining JSON observations, all benign:
   is always present. The step's logic (`[ -n "$n" ] || n=0`) is still correct;
   only the rationale is wrong. Fix the comment.
 - The `--jdk-only-report` violation list is now sorted by `(kind, summary)`
-  (`vm_init.rs:4118`), matching `docs/CONFIG.md`'s "Violations are sorted so the
+  (`vm_init.rs:4118`), matching `../../CONFIG.md`'s "Violations are sorted so the
   file is diff-stable". Agreed.
 - `JdkOnlyViolation::to_json` returns a **complete object including braces**
   (`types/src/error.rs:508,599`), and both the report writer
@@ -407,7 +407,7 @@ Swept every literal spelling of the four vocabularies across `*.rs`, `*.py`,
 - `ClassOrigin::as_str` → the ten tags (`classloading/src/class_origin.rs:93-102`).
   Duplicated as literal arrays in `vm/src/vm/vm_init.rs:4481`
   (`CLASS_ORIGIN_TAGS`, 10 entries, correct spellings, declaration order) and
-  `tools/jdk-only-blockers/blockers.py:93-101`. `.github/ISSUE_TEMPLATE/jdk-only.yml`
+  `tools/jdk-only-blockers/blockers.py:93-101`. `../../../.github/ISSUE_TEMPLATE/jdk-only.yml`
   agrees. **No disagreement.** The `vm_init.rs` array is a hand-maintained
   duplicate of the enum with a comment saying so (`vm_init.rs:4479-4480`) —
   correct today, unenforced.
@@ -427,8 +427,8 @@ it consistently.
 
 ### 4.5 Test-vs-implementation agreement — **CHECKED**
 
-- `vm/tests/jdk_only_config.rs` — **4 failing assertions**, §2.
-- `native-api/tests/jdk_only_registry.rs` — every API it calls exists with the
+- `../../../vm/tests/jdk_only_config.rs` — **4 failing assertions**, §2.
+- `../../../native-api/tests/jdk_only_registry.rs` — every API it calls exists with the
   right signature (`census`, `compatibility_mode`, `find`, `find_with_kind`,
   `invocations_of_kind`, `kind_of`, `record_invocation`, `refused_registrations`,
   `resolve_id`, `set_compatibility_mode`, `with_category`). The
@@ -439,7 +439,7 @@ it consistently.
   holds. `invocation_counters_survive_re_registration_on_the_winning_slot` relies
   on `register()` rewriting `slot.reg_index` in place — verified at
   `native-api/src/registry.rs:5265`. **No problems found.**
-- `classloading/tests/jdk_only_class_origin.rs` — `ClassManager::new(&[],&[],&[])`
+- `../../../classloading/tests/jdk_only_class_origin.rs` — `ClassManager::new(&[],&[],&[])`
   matches `class_manager.rs:2242`; `get_class_mut` exists at `:5512`;
   `ClassLoaderId::to_native_id` at `types/src/class_id.rs:58`. The array-origin
   fixtures depend on `load_class("[Ljava/util/HashMap;")` reaching the
@@ -449,7 +449,7 @@ it consistently.
   `create_synthetic_stub` (`class_manager.rs:7289`) calling
   `admit_compatibility_class` and propagating `?` — it does, at `:7320`.
   **No problems found.**
-- `vm/tests/jdk_only_dispatch.rs` — fixtures build `ClassFileMethod` and
+- `../../../vm/tests/jdk_only_dispatch.rs` — fixtures build `ClassFileMethod` and
   `CodeAttribute` literals; field sets match `reader/src/method.rs:18-23` and
   `reader/src/attribute.rs:288-294`; `LazyAttribute::new_decoded`
   (`attribute.rs:616`) and `ByteView::from_vec` (`byte_view.rs:212`) exist, and
@@ -457,8 +457,8 @@ it consistently.
   `Decoded` fixture is visible to §7 step 3. `owner_class` uses
   `ensure_synthetic_class` under the default `Compatible` mode. **No problems
   found.**
-- `native-builtins/tests/stub_ratchet.rs` — `cratonvm-types` is a regular
-  dependency of `native-builtins` (`native-builtins/Cargo.toml`), so
+- `../../../native-builtins/tests/stub_ratchet.rs` — `cratonvm-types` is a regular
+  dependency of `native-builtins` (`../../../native-builtins/Cargo.toml`), so
   `use cratonvm_types::compat::CompatibilityMode` resolves in an integration
   test. The three new tests' one-sided bounds
   (`dropped >= compat_stubs`, `refused <= compat_stubs`) are consistent with
@@ -509,8 +509,8 @@ own:
 6. Monitor direct fns — no action needed. Matched by the same comment.
 
 A **seventh marker vocabulary** appeared that the brief does not mention:
-`JDK-ONLY-CLASSIFY` (e.g. `native-io/src/pipe.rs:767`, `native-collections/src/lib.rs`,
-`native-awt/src/natives.rs`) — per-registrar classification requests for the
+`JDK-ONLY-CLASSIFY` (e.g. `native-io/src/pipe.rs:767`, `../../../native-collections/src/lib.rs`,
+`../../../native-awt/src/natives.rs`) — per-registrar classification requests for the
 wave-2 stub reclassification. They are self-contained comments, no cross-file
 ask, no compile impact.
 
@@ -519,28 +519,28 @@ ask, no compile impact.
 
 ### 4.7 Not fully checkable / partially checked
 
-- **`jfr/src/jdk_only.rs` — untracked, ~1,400 lines, NOT wired.** `jfr/src/lib.rs`
+- **`../../../jfr/src/jdk_only.rs` — untracked, ~1,400 lines, NOT wired.** `../../../jfr/src/lib.rs`
   has no `mod jdk_only;` (`lib.rs:81-86` lists `builtin, dump, event, recording,
   repository, stream`), so the file is not compiled and cannot cause a build
   error today. If it is wired as-is it **will** fail: it does
   `use cratonvm_types::error::JdkOnlyViolation` (`jdk_only.rs:116`) and
-  `jfr/Cargo.toml`'s `[dependencies]` contains no `cratonvm-types`. It appeared
+  `../../../jfr/Cargo.toml`'s `[dependencies]` contains no `cratonvm-types`. It appeared
   mid-session; treat as work-in-progress, not a defect. Two things must land
   together: the `pub mod jdk_only;` line and the `cratonvm-types` dependency.
-- **`scripts/jdk-only-bench.sh`** — untracked, appeared mid-session, not reviewed.
+- **`../../../scripts/jdk-only-bench.sh`** — untracked, appeared mid-session, not reviewed.
 - **`cratonvm-embed/src/lib.rs:74-110` doctest** — I read it and every symbol it
   names exists (`VmConfig::with_host_jdk_default` at `vm/src/config.rs:835`,
   `Clone` on `VmConfig` at `config.rs:300`, the re-exports at
   `cratonvm-embed/src/lib.rs:156`). I cannot confirm a doctest compiles without
   running it.
 - **`libcratonvm`** — the three new C entry points declared in
-  `libcratonvm/include/cratonvm.h` (`cratonvm_create_with_compatibility`,
+  `../../../libcratonvm/include/cratonvm.h` (`cratonvm_create_with_compatibility`,
   `cratonvm_compatibility_mode`, `cratonvm_compatibility_mode_supported`) all
-  exist in `libcratonvm/src/lib.rs` (`:1480`, `:2007`, `:2040`) and all five new
-  symbols are in `libcratonvm/cbindgen.toml`'s `include` list. Header/impl agree.
+  exist in `../../../libcratonvm/src/lib.rs` (`:1480`, `:2007`, `:2040`) and all five new
+  symbols are in `../../../libcratonvm/cbindgen.toml`'s `include` list. Header/impl agree.
   I did not verify the generated-vs-committed header is byte-identical (that
   needs a cbindgen run).
-- **`regression-suite/`** — I verified `CRATONVM_ARGS` forwarding exists
+- **`../../../regression-suite`** — I verified `CRATONVM_ARGS` forwarding exists
   (`regression-suite/run.sh:201`) and the `--jdk-only`-implies-strict-corpus
   selection (`run.sh:83`). I did **not** review the 21 new `RJdk*.java` vectors
   or the module fixture for correctness.
@@ -548,20 +548,20 @@ ask, no compile impact.
   `Mode` variants, their labels, `cli_args`, `env_overrides`, `jdk_profile`,
   `collects_census`, `from_label` round-trip (`difftest/src/runner.rs:212-336`)
   and the `(class, jdk_profile)` ledger keying. I did **not** audit the ledger
-  migration or the `difftest/ledger.json` diff.
-- **`docs/`** — the ~15 new documents were not proof-read against the code
+  migration or the `../../../difftest/ledger.json` diff.
+- **`../..`** — the ~15 new documents were not proof-read against the code
   beyond the specific claims cited above.
 - **Borrow-check / lifetime correctness anywhere.** Not checkable without a build.
 
 ### 4.8 Not checked at all
 
-- `jit/src/lib.rs`'s 427 changed lines beyond the `JDK-ONLY-NOTE`/`WAVE2` markers,
+- `../../../jit/src/lib.rs`'s 427 changed lines beyond the `JDK-ONLY-NOTE`/`WAVE2` markers,
   `set_jit_execution_policy` (`jit/src/lib.rs:4042`) and the
   `NativeShadowsBytecode` construction at `:4134`.
-- `vm/src/vm/vm_object.rs`, `vm/src/vm/vm_util.rs` beyond the `Class` literals.
-- `.github/ISSUE_TEMPLATE/jdk-only.yml` beyond its tag vocabulary.
-- `tools/jdk-only-blockers/selftest.py` (490 lines).
-- `docs/benchmarks/jdk-only.md`, `docs/security/jdk-only-threat-model.md`.
+- `../../../vm/src/vm/vm_object.rs`, `../../../vm/src/vm/vm_util.rs` beyond the `Class` literals.
+- `../../../.github/ISSUE_TEMPLATE/jdk-only.yml` beyond its tag vocabulary.
+- `../../../tools/jdk-only-blockers/selftest.py` (490 lines).
+- `docs/benchmarks/jdk-only.md`, `../../security/jdk-only-threat-model.md`.
 
 ---
 
@@ -570,7 +570,7 @@ ask, no compile impact.
 These were real at the start of this session and are fixed at `ef75dd778`. They
 are listed so the orchestrator does not chase them from a stale note.
 
-1. **`vm/src/vm/vm_exec.rs`** — the `Class { … }` literal in the
+1. **`../../../vm/src/vm/vm_exec.rs`** — the `Class { … }` literal in the
    `#[cfg(test)] mod tests` block did not set `origin`, which would have failed
    `cargo test -p cratonvm-vm` and `cargo clippy --all-targets`. Now sets it at
    `vm_exec.rs:23888`.
@@ -585,11 +585,11 @@ are listed so the orchestrator does not chase them from a stale note.
 ## 6. Stale comments that will mislead the next reader
 
 1. `.github/workflows/ci.yml:404,510` — "`CRATONVM_ARGS` forwarding in
-   `regression-suite/run.sh`: NOT PRESENT" and "this step currently runs the
+   `../../../regression-suite/run.sh`: NOT PRESENT" and "this step currently runs the
    ordinary compatible-mode suite". **It is present** (`regression-suite/run.sh:201`).
    The step is now genuine strict-mode evidence and the comment says not to trust it.
 2. `.github/workflows/ci.yml:437-438` — "Add `--test jdk_only_config` here when
-   `vm/tests/jdk_only_config.rs` … lands". It landed. See §3.9.
+   `../../../vm/tests/jdk_only_config.rs` … lands". It landed. See §3.9.
 3. `.github/workflows/ci.yml:494-495` — the "absent key is a real zero" rationale
    is false; counts are seeded. See §4.3.
 4. `vm/src/vm/vm_init.rs:3747-3756` — `dump_native_registry_json`'s doc claims
