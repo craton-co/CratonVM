@@ -1720,6 +1720,44 @@ fn chm_get(ctx: &mut dyn NativeContext, this: ObjectRef, key_obj: ObjectRef) -> 
     value
 }
 
+/// HotSpot's null contract for the `Properties` family, MEASURED 2026-08-13 on
+/// 25.0.3+9-LTS (`scratchpad/orch/PropNull.java`). Every lookup entry point
+/// (`getProperty`, `getProperty(String,String)`, `get`, `containsKey`,
+/// `getOrDefault`) reaches `Hashtable.get`, which dereferences the key for its
+/// hash; `setProperty` reaches `Hashtable.put`, whose own null check carries NO
+/// message:
+///
+///   getProperty(null)      !! NPE: Cannot invoke "Object.hashCode()" because "key" is null
+///   setProperty(null, "v") !! NPE (getMessage() == null)
+///   setProperty("k", null) !! NPE (getMessage() == null)
+///
+/// Before this, EVERY one of those arms returned a benign default, so all eight
+/// entry points silently SUCCEEDED where HotSpot throws -- 8 of 8 divergent,
+/// the same total-miss rate the `SecureRandom` sweep found on this axis. A
+/// defaulting reader that answers plausibly is invisible to any test that only
+/// compares successful answers.
+fn props_null_key_npe() -> MethodCallFailed {
+    RuntimeError::NullPointerException {
+        message: Some("Cannot invoke \"Object.hashCode()\" because \"key\" is null".into()),
+    }
+    .into()
+}
+
+fn props_null_map_npe() -> MethodCallFailed {
+    RuntimeError::NullPointerException {
+        message: Some(
+            "Cannot invoke \"java.util.Map.size()\" because \"m\" is null".into(),
+        ),
+    }
+    .into()
+}
+
+
+fn props_null_put_npe() -> MethodCallFailed {
+    RuntimeError::NullPointerException { message: None }.into()
+}
+
+
 fn native_properties_get_property_1(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -1730,7 +1768,7 @@ fn native_properties_get_property_1(
     };
     let key_obj = match args.get(1) {
         Some(Value::Object(Some(k))) => *k,
-        _ => return Ok(Some(Value::Object(None))),
+        _ => return Err(props_null_key_npe()),
     };
     let key = crate::property_key_from_java_string(ctx, key_obj);
     if let Some(v) = get_kv(ctx, this, &key) {
@@ -1850,11 +1888,11 @@ fn native_properties_set_property(ctx: &mut dyn NativeContext, args: &[Value]) -
     };
     let key_obj = match args.get(1) {
         Some(Value::Object(Some(k))) => *k,
-        _ => return Ok(Some(Value::Object(None))),
+        _ => return Err(props_null_put_npe()),
     };
     let val_obj = match args.get(2) {
         Some(Value::Object(Some(v))) => *v,
-        _ => return Ok(Some(Value::Object(None))),
+        _ => return Err(props_null_put_npe()),
     };
     let key = ctx.read_string(key_obj).unwrap_or_default();
     let val = ctx.read_string(val_obj).unwrap_or_default();
@@ -1913,6 +1951,14 @@ fn native_properties_set_property(ctx: &mut dyn NativeContext, args: &[Value]) -
 /// `false`, so the loose-validation bypass never engages and
 /// "malformed integer" throws on inputs the test expects to accept.
 fn native_properties_put(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    // Null contract MEASURED 2026-08-13 (scratchpad/orch/PropAxis.java).
+    if matches!(args.get(1), None | Some(Value::Object(None))) {
+        return Err(props_null_put_npe());
+    }
+    // Null contract MEASURED 2026-08-13 (scratchpad/orch/PropAxis.java).
+    if matches!(args.get(2), None | Some(Value::Object(None))) {
+        return Err(props_null_put_npe());
+    }
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
@@ -2011,6 +2057,14 @@ fn native_properties_put_if_absent(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
+    // Null contract MEASURED 2026-08-13 (scratchpad/orch/PropAxis.java).
+    if matches!(args.get(1), None | Some(Value::Object(None))) {
+        return Err(props_null_put_npe());
+    }
+    // Null contract MEASURED 2026-08-13 (scratchpad/orch/PropAxis.java).
+    if matches!(args.get(2), None | Some(Value::Object(None))) {
+        return Err(props_null_put_npe());
+    }
     if args.is_empty() {
         return Ok(Some(Value::Object(None)));
     }
@@ -2027,6 +2081,10 @@ fn native_properties_compute_if_absent(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
+    // Null contract MEASURED 2026-08-13 (scratchpad/orch/PropAxis.java).
+    if matches!(args.get(1), None | Some(Value::Object(None))) {
+        return Err(props_null_put_npe());
+    }
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
@@ -2107,6 +2165,10 @@ fn native_properties_compute_if_absent(
 /// behaviour via the no-op stub this replaces — empty side-table for
 /// jdk.module.* keys keeps that path unchanged).
 fn native_properties_remove(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    // Null contract MEASURED 2026-08-13 (scratchpad/orch/PropAxis.java).
+    if matches!(args.get(1), None | Some(Value::Object(None))) {
+        return Err(props_null_key_npe());
+    }
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
@@ -2206,7 +2268,7 @@ fn native_properties_contains_key(ctx: &mut dyn NativeContext, args: &[Value]) -
     };
     let key_obj = match args.get(1) {
         Some(Value::Object(Some(k))) => *k,
-        _ => return Ok(Some(Value::Int(0))),
+        _ => return Err(props_null_key_npe()),
     };
     let key = ctx.read_string(key_obj).unwrap_or_default();
     if get_kv(ctx, this, &key).is_some() {
@@ -2245,6 +2307,31 @@ fn native_properties_contains_key(ctx: &mut dyn NativeContext, args: &[Value]) -
 ///
 /// Returns `null` when the key is absent — matches `Hashtable.get`
 /// semantics.
+fn native_properties_get_or_default(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    // `Properties` extends `Hashtable`, which REJECTS a null key; the generic
+    // `native_map_get_or_default` in native-collections must not, because
+    // `HashMap` ACCEPTS one. MEASURED 2026-08-13 (`scratchpad/orch/MapNull.java`):
+    //   HashMap.getOrDefault(null, d)   = ok
+    //   Hashtable.getOrDefault(null, d) !! NullPointerException
+    // So this cannot be fixed in the shared native without breaking the other
+    // half of the family -- ask what serves the class, per class.
+    match args.get(1) {
+        Some(Value::Object(Some(_))) => {}
+        _ => return Err(props_null_key_npe()),
+    }
+    let default = args.get(2).copied().unwrap_or(Value::Object(None));
+    match native_properties_get(ctx, args)? {
+        Some(Value::Object(Some(v))) => Ok(Some(Value::Object(Some(v)))),
+        // Hashtable stores no null VALUES, so "absent" and "mapped to null"
+        // cannot be distinguished here and do not need to be.
+        _ => Ok(Some(default)),
+    }
+}
+
+
 fn native_properties_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
@@ -2252,7 +2339,7 @@ fn native_properties_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     };
     let key_obj = match args.get(1) {
         Some(Value::Object(Some(k))) => *k,
-        _ => return Ok(Some(Value::Object(None))),
+        _ => return Err(props_null_key_npe()),
     };
     let key = crate::property_key_from_java_string(ctx, key_obj);
     // Check the Rust side-table (String→String only).
@@ -3043,6 +3130,10 @@ fn native_properties_elements(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
 /// JDK 25 forwards to `map.contains(value)`.  Returns true iff the
 /// side-table holds a string-equal value for any key.
 fn native_properties_contains(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    // Null contract MEASURED 2026-08-13 (scratchpad/orch/PropAxis.java).
+    if matches!(args.get(1), None | Some(Value::Object(None))) {
+        return Err(props_null_put_npe());
+    }
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Int(0))),
@@ -3079,6 +3170,10 @@ fn native_properties_contains_value(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
+    // Null contract MEASURED 2026-08-13 (scratchpad/orch/PropAxis.java).
+    if matches!(args.get(1), None | Some(Value::Object(None))) {
+        return Err(props_null_put_npe());
+    }
     native_properties_contains(ctx, args)
 }
 
@@ -3094,6 +3189,10 @@ fn native_properties_contains_value(
 /// (System, env, .properties file) during `StatusLogger$Config.<clinit>`.
 /// Without this override, WildFly fails to bootstrap the status logger.
 fn native_properties_for_each(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    // Null contract MEASURED 2026-08-13 (scratchpad/orch/PropAxis.java).
+    if matches!(args.get(1), None | Some(Value::Object(None))) {
+        return Err(props_null_put_npe());
+    }
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(None),
@@ -3658,6 +3757,12 @@ pub fn register_properties_sidetable(registry: &mut NativeMethodRegistry) {
         "(Ljava/lang/Object;)Z",
         native_properties_contains_key,
     );
+    registry.register(
+        "java/util/Properties",
+        "getOrDefault",
+        "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+        native_properties_get_or_default,
+    );
     // S111r11 SB3 (formerly a no-op stub registered in lib.rs):
     // ModuleBootstrap.<clinit> calls `getAndRemoveProperty(key)` which is
     // `(String) System.getProperties().remove(key)`; H2's ConnectionInfo
@@ -3872,6 +3977,10 @@ pub fn register_properties_sidetable(registry: &mut NativeMethodRegistry) {
 /// empty.  This override snapshots the source side-table and stores each
 /// `(k,v)` into the destination via `put_kv`.
 fn native_properties_put_all(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    // Null contract MEASURED 2026-08-13 (scratchpad/orch/PropAxis.java).
+    if matches!(args.get(1), None | Some(Value::Object(None))) {
+        return Err(props_null_map_npe());
+    }
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(None),

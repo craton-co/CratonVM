@@ -2099,7 +2099,7 @@ public class RJdkBridge1 {
         }
         check(ae.equals(nameOf(t)), "modInverse(0) must throw ArithmeticException, got "
                 + nameOf(t));
-        step("bigint", "4.modInverse(8) — not invertible");
+        step("bigint", "4.modInverse(8) - not invertible");
         t = null;
         try {
             sinkO = new BigInteger("4").modInverse(new BigInteger("8"));
@@ -2111,7 +2111,7 @@ public class RJdkBridge1 {
                         + " answer; got " + nameOf(t));
         check("5".equals(new BigInteger("3").modInverse(new BigInteger("7")).toString()),
                 "3^-1 mod 7 is 5");
-        step("bigint", "4.modPow(-1, 8) — not invertible");
+        step("bigint", "4.modPow(-1, 8) - not invertible");
         t = null;
         try {
             sinkO = new BigInteger("4").modPow(new BigInteger("-1"), new BigInteger("8"));

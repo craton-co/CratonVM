@@ -10438,9 +10438,31 @@ fn map_kv_reject_null_for_hashtable(
 ) -> Result<(), MethodCallFailed> {
     if matches!(value, Value::Object(None)) && is_hashtable_receiver(ctx, this) {
         return Err(RuntimeError::NullPointerException {
-            message: Some(format!("Hashtable.{method}: null value")),
+            // MEASURED 2026-08-13 (scratchpad/orch/PropAxis.java): HotSpot's
+            // `Objects.requireNonNull(value)` carries NO message here. The old
+            // `format!("Hashtable.{method}: null value")` was a FABRICATED string
+            // that appears nowhere in the JDK -- right exception KIND, invented
+            // text, so any test asserting only the type read as passing.
+            message: None,
         }
         .into());
+    }
+    Ok(())
+}
+
+
+/// The KEY half of the same contract, which the value helper above did not
+/// cover: MEASURED 2026-08-13, `Hashtable`/`Properties` throw for a null key in
+/// `replace(k,v)`, `replace(k,old,new)` and `remove(k,v)` as well, with no
+/// message. `HashMap` accepts a null key in all three, so this must stay
+/// receiver-routed exactly like its sibling.
+fn map_k_reject_null_for_hashtable(
+    ctx: &dyn NativeContext,
+    this: ObjectRef,
+    key: &Value,
+) -> Result<(), MethodCallFailed> {
+    if matches!(key, Value::Object(None)) && is_hashtable_receiver(ctx, this) {
+        return Err(RuntimeError::NullPointerException { message: None }.into());
     }
     Ok(())
 }
@@ -10461,6 +10483,7 @@ fn native_map_remove_kv(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     let key = args.get(1).copied().unwrap_or(Value::Object(None));
     let expected = args.get(2).copied().unwrap_or(Value::Object(None));
     map_kv_reject_null_for_hashtable(ctx, this, &expected, "remove")?;
+    map_k_reject_null_for_hashtable(ctx, this, &key)?;
     // GC-safety: `get`/`containsKey`/`remove` each dispatch the key's
     // `hashCode()`/`equals()` — arbitrary Java that can complete a moving young
     // GC — so every receiver/key/value local is re-read from its pin after each
@@ -10511,6 +10534,7 @@ fn native_map_replace(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     };
     let key = args.get(1).copied().unwrap_or(Value::Object(None));
     let new_val = args.get(2).copied().unwrap_or(Value::Object(None));
+    map_k_reject_null_for_hashtable(ctx, this, &key)?;
     map_kv_reject_null_for_hashtable(ctx, this, &new_val, "replace")?;
     let this_pin = ctx.pin_native_root(this);
     let key_pin = pin_value(ctx, key);
@@ -10560,6 +10584,7 @@ fn native_map_replace_kv(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     let key = args.get(1).copied().unwrap_or(Value::Object(None));
     let old_val = args.get(2).copied().unwrap_or(Value::Object(None));
     let new_val = args.get(3).copied().unwrap_or(Value::Object(None));
+    map_k_reject_null_for_hashtable(ctx, this, &key)?;
     map_kv_reject_null_for_hashtable(ctx, this, &old_val, "replace")?;
     map_kv_reject_null_for_hashtable(ctx, this, &new_val, "replace")?;
     let this_pin = ctx.pin_native_root(this);

@@ -3300,7 +3300,7 @@ public class RJdkIntrinsics2 {
         check("java.lang.StringIndexOutOfBoundsException".equals(nameOf(t)),
                 "\"ab\".substring(2, 1) must throw StringIndexOutOfBoundsException, got "
                         + nameOf(t));
-        step("bounds", "ByteBuffer.getChar(7) — one byte short of a char");
+        step("bounds", "ByteBuffer.getChar(7) - one byte short of a char");
         t = null;
         try {
             sink = raw.getChar(7);
