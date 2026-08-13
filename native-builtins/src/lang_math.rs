@@ -1679,10 +1679,32 @@ pub(crate) fn native_math_pow(_ctx: &mut dyn NativeContext, args: &[Value]) -> M
         Some(Value::Double(v)) => *v,
         _ => 0.0,
     };
+    // JLS special values that C99's pow() — which is what Rust's `powf`
+    // lowers to — answers DIFFERENTLY. Falling through to `powf` does not
+    // "preserve JLS semantics" for these; it is precisely where the two
+    // standards disagree, and it must be pre-empted:
+    //
+    //   * "If the second argument is NaN, then the result is NaN." C99
+    //     instead makes pow(1.0, anything) == 1.0, including pow(1.0, NaN).
+    //   * "If the absolute value of the first argument equals 1 and the
+    //     second argument is infinite, then the result is NaN." C99 makes
+    //     pow(±1.0, ±inf) == 1.0.
+    //
+    // Measured against HotSpot 25: all five of pow(1.0, NaN),
+    // pow(±1.0, ±Infinity) answered 0x3ff0000000000000 (1.0) here and
+    // 0x7ff8000000000000 (NaN) there.
+    //
+    // The neighbouring JLS rule "if the second argument is ±0 the result is
+    // 1.0, even for a NaN first argument" is shared by BOTH standards and is
+    // deliberately NOT caught here — b == ±0.0 is neither NaN nor infinite,
+    // so it falls through untouched.
+    if b.is_nan() || (b.is_infinite() && a.abs() == 1.0) {
+        return Ok(Some(Value::Double(f64::NAN)));
+    }
     // HotSpot-style fast path: integer-valued exponent with finite base.
-    // - Gated on a.is_finite() && b.is_finite() so NaN/±infinity edge cases fall through to powf,
-    //   preserving Java/JLS special-value semantics (e.g. pow(NaN, 0) == 1, pow(±0, neg) == ±inf,
-    //   pow(1, ±inf) == NaN per JLS, etc.).
+    // - Gated on a.is_finite() && b.is_finite() so the remaining NaN/±infinity
+    //   edge cases fall through to powf, which agrees with the JLS on them
+    //   (pow(NaN, 0) == 1, pow(±0, neg) == ±inf, ...).
     // - b.fract() == 0.0 ensures b is an exact integer (also false for NaN, but we already gated that).
     // - |b| < 64 keeps powi cheap and avoids producing values that overflow to ±inf when powf
     //   would have given a finite (but huge) result via continuous exponentiation.
@@ -2712,8 +2734,18 @@ pub(crate) fn native_math_ulp_double(
         f64::INFINITY
     } else {
         let abs = v.abs();
-        let next = f64::from_bits(abs.to_bits() + 1);
-        next - abs
+        let bits = abs.to_bits();
+        let next = f64::from_bits(bits + 1);
+        if next.is_infinite() {
+            // At MAX_VALUE the forward step lands on +Infinity, and
+            // `Infinity - MAX_VALUE` is Infinity — so the naive
+            // `nextUp(x) - x` answered +Infinity where HotSpot answers
+            // 2^971 (0x7ca0000000000000). In the top binade the ulp is the
+            // BACKWARD step, which is exact and representable.
+            abs - f64::from_bits(bits - 1)
+        } else {
+            next - abs
+        }
     };
     Ok(Some(Value::Double(result)))
 }
@@ -2733,8 +2765,15 @@ pub(crate) fn native_math_ulp_float(
         f32::INFINITY
     } else {
         let abs = v.abs();
-        let next = f32::from_bits(abs.to_bits() + 1);
-        next - abs
+        let bits = abs.to_bits();
+        let next = f32::from_bits(bits + 1);
+        if next.is_infinite() {
+            // See `native_math_ulp_double`: at MAX_VALUE the ulp is the
+            // backward step. HotSpot answers 2^104 (0x73800000) here.
+            abs - f32::from_bits(bits - 1)
+        } else {
+            next - abs
+        }
     };
     Ok(Some(Value::Float(result)))
 }
@@ -3706,6 +3745,33 @@ pub(crate) fn native_character_is_letter(
     Ok(Some(Value::Int(if result { 1 } else { 0 })))
 }
 
+/// `Character.isWhitespace` — the JAVADOC rule, not `char::is_whitespace`.
+///
+/// W7-98(a). These are two different predicates and the difference is not an
+/// approximation, it is the point of the method:
+///
+/// * Rust's `char::is_whitespace` is the Unicode **White_Space** property,
+///   which is `Zs ∪ Zl ∪ Zp ∪ {U+0009..U+000D, U+0085}`.
+/// * Java's `isWhitespace` is "a Unicode space character (`Zs`/`Zl`/`Zp`) that
+///   is **not** a non-breaking space (`U+00A0`, `U+2007`, `U+202F`), **or** one
+///   of `U+0009..U+000D`, `U+001C..U+001F`".
+///
+/// So the two disagree on eight code points, measured against HotSpot 25:
+/// `U+0085` NEL, `U+00A0` NBSP, `U+2007` FIGURE SPACE and `U+202F` NARROW NBSP
+/// answered `true` here and `false` on HotSpot (a non-breaking space is
+/// excluded precisely *because* it must not be treated as a break
+/// opportunity); the C0 file/group/record/unit separators `U+001C..U+001F`
+/// answered `false` here and `true` on HotSpot. `String.isBlank`/`strip`
+/// inherit every one of them — `" x".strip()` (`U+2007`) lost a character.
+///
+/// The derivation below is exact rather than a table: subtracting
+/// `U+0009..U+000D` and `U+0085` from White_Space leaves exactly `Zs ∪ Zl ∪ Zp`
+/// = Java's `isSpaceChar`, and the rest is the javadoc sentence transcribed.
+/// The three excluded code points are the javadoc's own list, not a sample.
+///
+/// A surrogate is `Cs`, never whitespace: `char::from_u32` answers `None` for
+/// one and the low-range arm rejects it, so it falls out `false` — which is
+/// what HotSpot answers.
 pub(crate) fn native_character_is_whitespace(
     _ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -3714,7 +3780,11 @@ pub(crate) fn native_character_is_whitespace(
         Some(Value::Int(v)) => *v as u32,
         _ => 0,
     };
-    let result = char::from_u32(ch).is_some_and(|c| c.is_whitespace());
+    // `Zs ∪ Zl ∪ Zp` — i.e. Java's `Character.isSpaceChar`.
+    let is_space_char = char::from_u32(ch).is_some_and(|c| c.is_whitespace())
+        && !matches!(ch, 0x09..=0x0D | 0x85);
+    let result = (is_space_char && !matches!(ch, 0x00A0 | 0x2007 | 0x202F))
+        || matches!(ch, 0x09..=0x0D | 0x1C..=0x1F);
     Ok(Some(Value::Int(if result { 1 } else { 0 })))
 }
 
@@ -3742,6 +3812,66 @@ pub(crate) fn native_character_is_lower_case(
     Ok(Some(Value::Int(if result { 1 } else { 0 })))
 }
 
+/// A lone surrogate is a legal `char` value; it must survive a case mapping
+/// unchanged.
+///
+/// W7-98(c), and the highest-severity defect in this family because it is
+/// **silent data corruption**, not a wrong classification. `char::from_u32`
+/// answers `None` for `U+D800..U+DFFF` (they are not Unicode scalar values, so
+/// Rust's `char` cannot hold one), and every body here used to finish with
+/// `.unwrap_or('\0')` — so `Character.toUpperCase('\uD800')` answered `U+0000`
+/// where HotSpot 25 answers `'\uD800'`. Measured on all six of
+/// `U+D800/U+D83D/U+DBFF/U+DC00/U+DE00/U+DFFF`, for both `toUpperCase(C)C` and
+/// `toLowerCase(C)C`: HotSpot returns the input, CratonVM returned 0. A split
+/// UTF-16 pair — the normal state of a `char` halfway through a surrogate pair,
+/// and of any text chunked on a non-code-point boundary — was being zeroed.
+///
+/// The `int`-taking overloads already had the right shape (`.unwrap_or(cp)`);
+/// this makes the `char` overloads agree.
+#[inline]
+fn character_case_map(ch: u32, upper: bool) -> u32 {
+    let Some(c) = char::from_u32(ch) else {
+        // Surrogate (or otherwise not a scalar value): return it unchanged.
+        return ch;
+    };
+    if upper {
+        // W7-98(b). Rust exposes the Unicode **full** uppercase mapping
+        // (`SpecialCasing.txt`), which is an ITERATOR; Java's
+        // `Character.toUpperCase` is the **simple** mapping
+        // (`UnicodeData.txt` field 12), which is one code point or none.
+        // Taking `.next()` silently returned the first char of a multi-char
+        // full mapping: measured against HotSpot 25, `toUpperCase('ß')`
+        // answered `'S'` (Java: `'ß'`), `'ﬀ'` answered `'F'` (Java: `'ﬀ'`),
+        // and the same for `U+FB01/U+FB02/U+FB03/U+FB05/U+0149/U+01F0/
+        // U+0390/U+03B0/U+1E96/U+1F50` — eleven code points where the correct
+        // answer is "unchanged, because the uppercase does not fit in a
+        // `char`". Requiring the mapping to be exactly one char restores all
+        // eleven.
+        //
+        // NOT exact, and deliberately not claimed to be: `U+1FB3` and its
+        // ypogegrammeni family have a multi-char FULL mapping *and* a
+        // single-char SIMPLE mapping (`U+1FB3` -> `U+1FBC`), which no Rust
+        // std API exposes. That code point stays wrong — but wrong as the
+        // IDENTITY rather than as a different letter (`U+0391`), which is the
+        // safer of the two failures. The exact fix is to stop shadowing the
+        // JDK bytecode at all; see docs/known-issues/jdk-only/W7-98.
+        let mut it = c.to_uppercase();
+        match (it.next(), it.next()) {
+            (Some(u), None) => u as u32,
+            _ => ch,
+        }
+    } else {
+        // Lowercase deliberately keeps `.next()`. The arity rule is NOT
+        // symmetric here and applying it would REGRESS a currently-correct
+        // row: `U+0130` (LATIN CAPITAL LETTER I WITH DOT ABOVE) has a
+        // two-char full lowercase (`i` + `U+0307`) whose FIRST char is
+        // exactly Java's simple mapping, so HotSpot and CratonVM both answer
+        // `105` today. Measured: no `toLowerCase` row in the 755-row
+        // differential census diverges except the surrogates fixed above.
+        c.to_lowercase().next().map_or(ch, |l| l as u32)
+    }
+}
+
 pub(crate) fn native_character_to_upper_case(
     _ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -3750,10 +3880,7 @@ pub(crate) fn native_character_to_upper_case(
         Some(Value::Int(v)) => *v as u32,
         _ => 0,
     };
-    let result = char::from_u32(ch)
-        .and_then(|c| c.to_uppercase().next())
-        .unwrap_or('\0') as u32;
-    Ok(Some(Value::Int(result as i32)))
+    Ok(Some(Value::Int(character_case_map(ch, true) as i32)))
 }
 
 pub(crate) fn native_character_to_lower_case(
@@ -3764,16 +3891,15 @@ pub(crate) fn native_character_to_lower_case(
         Some(Value::Int(v)) => *v as u32,
         _ => 0,
     };
-    let result = char::from_u32(ch)
-        .and_then(|c| c.to_lowercase().next())
-        .unwrap_or('\0') as u32;
-    Ok(Some(Value::Int(result as i32)))
+    Ok(Some(Value::Int(character_case_map(ch, false) as i32)))
 }
 
-/// `Character.toLowerCase(int)` — code-point variant. Fall-through to the
-/// same Rust `char::to_lowercase` for valid scalar values; pass invalid /
-/// out-of-range code points back unchanged (matching JDK behaviour for
-/// non-character integers).
+/// `Character.toLowerCase(int)` — code-point variant. Shares
+/// [`character_case_map`] with the `(C)C` form so the two cannot drift: the
+/// JDK bytecode for `(C)C` is literally `toLowerCase((int) c)` narrowed back to
+/// a `char`, so a divergence between the two overloads is a defect by
+/// construction. Invalid / out-of-range code points (including a lone
+/// surrogate) pass back unchanged.
 pub(crate) fn native_character_to_lower_case_int(
     _ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -3782,17 +3908,20 @@ pub(crate) fn native_character_to_lower_case_int(
         Some(Value::Int(v)) => *v,
         _ => 0,
     };
-    let result = char::from_u32(cp as u32)
-        .and_then(|c| c.to_lowercase().next())
-        .map(|c| c as u32 as i32)
-        .unwrap_or(cp);
-    Ok(Some(Value::Int(result)))
+    if !(0..=0x10FFFF).contains(&cp) {
+        return Ok(Some(Value::Int(cp)));
+    }
+    Ok(Some(Value::Int(character_case_map(cp as u32, false) as i32)))
 }
 
 /// `Character.toUpperCase(int)` — code-point variant, mirror of
-/// `toLowerCase(I)I` to keep the JIT-bypass symmetric (the same compile
-/// path that miscompiles the lowercase chain miscompiles the uppercase
-/// chain — register both pre-emptively).
+/// `toLowerCase(I)I`.
+///
+/// W7-98(b): shares [`character_case_map`] with the `(C)C` form, so the
+/// simple-vs-full uppercase-mapping fix applies to both overloads. Before the
+/// fix this overload disagreed with HotSpot on the same eleven code points
+/// (`U+00DF`, `U+FB00..U+FB05`, `U+0149`, `U+01F0`, `U+0390`, `U+03B0`,
+/// `U+1E96`, `U+1F50`) as the `char` form.
 pub(crate) fn native_character_to_upper_case_int(
     _ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -3801,11 +3930,10 @@ pub(crate) fn native_character_to_upper_case_int(
         Some(Value::Int(v)) => *v,
         _ => 0,
     };
-    let result = char::from_u32(cp as u32)
-        .and_then(|c| c.to_uppercase().next())
-        .map(|c| c as u32 as i32)
-        .unwrap_or(cp);
-    Ok(Some(Value::Int(result)))
+    if !(0..=0x10FFFF).contains(&cp) {
+        return Ok(Some(Value::Int(cp)));
+    }
+    Ok(Some(Value::Int(character_case_map(cp as u32, true) as i32)))
 }
 
 pub(crate) fn native_character_is_letter_or_digit(
@@ -4540,6 +4668,21 @@ pub(crate) fn native_character_is_iso_control(
     )))
 }
 
+/// `Character.toString(char)`.
+///
+/// W7-98(c). A lone surrogate is a legal `char` but is NOT a Unicode scalar
+/// value, so it cannot round-trip through Rust's `char`/`str`: the old body's
+/// `char::from_u32(ch).unwrap_or('\0')` turned `U+D800` into `U+0000`, and even
+/// without that `unwrap_or`, `ctx.create_string(&str)` has no way to express
+/// one. Measured against HotSpot 25 on `U+D800/U+DBFF/U+DC00/U+DFFF`:
+/// `Character.toString(c).charAt(0)` answered `0` here and the input there.
+///
+/// `String.valueOf(char)` is NOT native-registered (verified by
+/// `--dump-native-registry`), so this is a plain call into real JDK bytecode
+/// with no native re-entry — and it is measured correct on this VM for every
+/// lone surrogate. The Rust path stays as a fallback for the synthetic class
+/// library, where that bytecode does not exist; it is still exact for every
+/// scalar value, which is every input except the 2,048 surrogates.
 pub(crate) fn native_character_static_to_string(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -4548,9 +4691,28 @@ pub(crate) fn native_character_static_to_string(
         Some(Value::Int(v)) => *v as u32,
         _ => 0,
     };
-    let c = char::from_u32(ch).unwrap_or('\0');
-    let s = ctx.create_string(&c.to_string());
-    Ok(Some(Value::Object(Some(s))))
+    match char::from_u32(ch) {
+        Some(c) => {
+            let s = ctx.create_string(&c.to_string());
+            Ok(Some(Value::Object(Some(s))))
+        }
+        None => {
+            // Surrogate: hand it to the real `String.valueOf(char)`, which
+            // stores UTF-16 code units and preserves it.
+            if let Ok(Some(v @ Value::Object(Some(_)))) = ctx.invoke(
+                "java/lang/String",
+                "valueOf",
+                "(C)Ljava/lang/String;",
+                &[Value::Int(ch as i32)],
+            ) {
+                return Ok(Some(v));
+            }
+            // No real class library: keep the historical answer rather than
+            // failing the call.
+            let s = ctx.create_string("\u{0}");
+            Ok(Some(Value::Object(Some(s))))
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -4829,69 +4991,384 @@ pub(crate) fn native_double_is_infinite(
 
 // --- Float/Double parsing and utilities (Phase 8 Part 7) ---
 
-fn strip_java_float_type_suffix(s: &str) -> &str {
-    let Some(&suffix) = s.as_bytes().last() else {
-        return s;
+// ---------------------------------------------------------------------------
+// Java's floating-point grammar
+//
+// `str::parse::<f64>` is NOT `Double.parseDouble`, and again it differs in
+// both directions:
+//
+//   * Rust accepts `nan` / `inf` / `infinity` CASE-INSENSITIVELY. Java accepts
+//     only the exact spellings `NaN` and `Infinity`; `Double.parseDouble("inf")`
+//     throws on a real JDK. We were answering +Infinity — a wrong VALUE, not
+//     just a missing exception, for any input-validation path.
+//   * Rust REJECTS Java's hex significand, `0x1p3` == 8.0.
+//   * Rust's `str::trim` strips Unicode whitespace; the Java grammar's
+//     `[\x00-\x20]*` does not. `Double.parseDouble("\u{a0}1.0")` throws on a
+//     real JDK; we answered 1.0.
+//
+// The grammar implemented here is the regex published in the
+// `Double.valueOf(String)` javadoc, transcribed rather than approximated:
+//
+// ```text
+// [\x00-\x20]* [+-]? ( NaN | Infinity |
+//     ( ( Digits (\.)? Digits? Exp? )
+//     | ( \. Digits Exp? )
+//     | ( ( 0[xX] HexDigits (\.)? | 0[xX] HexDigits? \. HexDigits ) [pP] [+-]? Digits )
+//     ) [fFdD]? ) [\x00-\x20]*
+// ```
+//
+// `Digits` is `\p{Digit}`, which WITHOUT `UNICODE_CHARACTER_CLASS` is ASCII
+// `[0-9]` only — so unlike `Integer.parseInt`, the floating-point grammar does
+// NOT accept Unicode decimal digits. Measured on JDK 25:
+// `Double.parseDouble("\u{661}\u{662}")` throws while
+// `Integer.parseInt("\u{661}\u{662}")` returns 12. The two grammars really do
+// disagree, and copying one onto the other is how this drifted.
+// ---------------------------------------------------------------------------
+
+/// `String.trim()` semantics: strip chars `<= '\u{20}'`, which is exactly the
+/// grammar's `[\x00-\x20]*`. Deliberately NOT `str::trim`, which also strips
+/// NBSP and the rest of Unicode `White_Space`.
+fn java_trim(s: &str) -> &str {
+    s.trim_matches(|c: char| c <= '\u{20}')
+}
+
+/// The shared front half of `Double.parseDouble` / `Float.parseFloat`: trim,
+/// sign, the two literal words, and the optional `FloatTypeSuffix`.
+enum JavaFloatHead<'a> {
+    /// One of the two words. `nan` is true for `NaN`, else `Infinity`.
+    Word { nan: bool, neg: bool },
+    /// A numeric body with its sign, suffix already removed.
+    Body { body: &'a str, neg: bool },
+    Malformed,
+}
+
+fn java_float_head(s: &str) -> JavaFloatHead<'_> {
+    let t = java_trim(s);
+    if t.is_empty() {
+        return JavaFloatHead::Malformed;
+    }
+    // `t` is non-empty and the sign is ASCII, so slicing at 1 is on a char
+    // boundary.
+    let (neg, rest) = match t.as_bytes()[0] {
+        b'+' => (false, &t[1..]),
+        b'-' => (true, &t[1..]),
+        _ => (false, t),
     };
-    if !matches!(suffix, b'd' | b'D' | b'f' | b'F') {
-        return s;
+    if rest == "NaN" {
+        return JavaFloatHead::Word { nan: true, neg };
+    }
+    if rest == "Infinity" {
+        return JavaFloatHead::Word { nan: false, neg };
+    }
+    if rest.is_empty() {
+        return JavaFloatHead::Malformed;
+    }
+    let body = match rest.as_bytes()[rest.len() - 1] {
+        b'f' | b'F' | b'd' | b'D' => &rest[..rest.len() - 1],
+        _ => rest,
+    };
+    if body.is_empty() {
+        return JavaFloatHead::Malformed;
+    }
+    JavaFloatHead::Body { body, neg }
+}
+
+/// `Digits (\.)? Digits? Exp?` | `\. Digits Exp?` — the decimal alternatives.
+///
+/// Only a validator: everything it accepts is also accepted by Rust's
+/// `f64`/`f32` `from_str`, whose grammar is a strict superset over the decimal
+/// forms and which is correctly rounded, so the actual conversion is delegated.
+/// The point of the check is to reject what Rust would otherwise ACCEPT.
+fn java_decimal_grammar_ok(b: &str) -> bool {
+    let s = b.as_bytes();
+    let n = s.len();
+    let mut i = 0;
+    let mut int_digits = 0;
+    while i < n && s[i].is_ascii_digit() {
+        i += 1;
+        int_digits += 1;
+    }
+    let mut frac_digits = 0;
+    if i < n && s[i] == b'.' {
+        i += 1;
+        while i < n && s[i].is_ascii_digit() {
+            i += 1;
+            frac_digits += 1;
+        }
+    }
+    if int_digits == 0 && frac_digits == 0 {
+        return false;
+    }
+    if i < n {
+        if s[i] != b'e' && s[i] != b'E' {
+            return false;
+        }
+        i += 1;
+        if i < n && (s[i] == b'+' || s[i] == b'-') {
+            i += 1;
+        }
+        let mut exp_digits = 0;
+        while i < n && s[i].is_ascii_digit() {
+            i += 1;
+            exp_digits += 1;
+        }
+        if exp_digits == 0 {
+            return false;
+        }
+    }
+    i == n
+}
+
+/// `HexDigits (\.)?` | `HexDigits? \. HexDigits`, then a MANDATORY
+/// `[pP] [+-]? Digits`. `b` is the body with the leading `0x`/`0X` removed.
+///
+/// Returns the significand hex digits, how many of them follow the point, and
+/// the binary exponent.
+fn java_hex_grammar(b: &str) -> Option<(Vec<u8>, usize, i64)> {
+    let s = b.as_bytes();
+    let n = s.len();
+    let mut i = 0;
+    let mut digits: Vec<u8> = Vec::new();
+    while i < n {
+        let Some(d) = (s[i] as char).to_digit(16) else {
+            break;
+        };
+        digits.push(d as u8);
+        i += 1;
+    }
+    let int_n = digits.len();
+    let mut frac_n = 0usize;
+    if i < n && s[i] == b'.' {
+        i += 1;
+        while i < n {
+            let Some(d) = (s[i] as char).to_digit(16) else {
+                break;
+            };
+            digits.push(d as u8);
+            frac_n += 1;
+            i += 1;
+        }
+    }
+    if int_n == 0 && frac_n == 0 {
+        return None;
+    }
+    // The binary exponent is not optional in this alternative.
+    if i >= n || (s[i] != b'p' && s[i] != b'P') {
+        return None;
+    }
+    i += 1;
+    let mut exp_neg = false;
+    if i < n && (s[i] == b'+' || s[i] == b'-') {
+        exp_neg = s[i] == b'-';
+        i += 1;
+    }
+    let mut exp_digits = 0;
+    let mut pexp: i64 = 0;
+    while i < n && s[i].is_ascii_digit() {
+        // Saturate rather than overflow: any exponent past this is far beyond
+        // the range where the result is not already 0 or Infinity.
+        if pexp < 1_000_000 {
+            pexp = pexp * 10 + (s[i] - b'0') as i64;
+        }
+        i += 1;
+        exp_digits += 1;
+    }
+    if exp_digits == 0 || i != n {
+        return None;
+    }
+    Some((digits, frac_n, if exp_neg { -pexp } else { pexp }))
+}
+
+/// Round `m * 2^exp2` — with `sticky` recording that nonzero bits were already
+/// dropped off the bottom of `m` — to the nearest IEEE-754 binary value of the
+/// given width, ties to even, and return the raw bit pattern of its MAGNITUDE
+/// (the caller ORs in the sign).
+///
+/// `prec` is the significand width in bits (53 for `double`, 24 for `float`)
+/// and `emax` the maximum normal exponent (1023 / 127), from which the bias
+/// and the minimum normal exponent `1 - emax` follow.
+fn round_binary(m: u128, sticky: bool, exp2: i64, prec: u32, emax: i64) -> u64 {
+    let inf_bits = ((2 * emax + 1) as u64) << (prec - 1);
+    if m == 0 {
+        return 0;
+    }
+    let nb = (128 - m.leading_zeros()) as i64; // bit length of m
+    let e = exp2 + nb - 1; // value == 1.f * 2^e, exactly
+    let emin = 1 - emax; // minimum NORMAL exponent
+    let qmin = emin - (prec as i64 - 1); // subnormal quantum (-1074 / -149)
+
+    // These bounds also keep `shift` within the integer width. `e == qmin - 1`
+    // and `e == qmin - 2` must stay in the general path: the first can still
+    // round up to MIN_VALUE and the second is where the exact tie lands.
+    if e > emax + 1 {
+        return inf_bits;
+    }
+    if e < qmin - 2 {
+        return 0;
     }
 
-    let numeric = &s[..s.len() - 1];
-    let has_digit = numeric.bytes().any(|b| b.is_ascii_digit());
-    let suffix_follows_number = matches!(
-        numeric.as_bytes().last().copied(),
-        Some(b'0'..=b'9') | Some(b'.')
-    );
-    if has_digit && suffix_follows_number {
-        numeric
+    // Quantum of the result significand: in the normal range it tracks `e`; in
+    // the subnormal range it is pinned at `qmin`.
+    let q = if e >= emin {
+        e - (prec as i64 - 1)
     } else {
-        s
+        qmin
+    };
+    let shift = q - exp2; // bits of m to drop
+    if shift > nb {
+        return 0; // strictly below half
+    }
+
+    let (mut s, round_up) = if shift > 0 {
+        let sh = shift as u32;
+        let trunc = if sh >= 128 { 0 } else { m >> sh };
+        let low = if sh >= 128 { m } else { m & ((1u128 << sh) - 1) };
+        let half = 1u128 << (sh - 1);
+        let up = match low.cmp(&half) {
+            std::cmp::Ordering::Greater => true,
+            std::cmp::Ordering::Less => false,
+            // Exactly half: any bit already shifted out breaks the tie
+            // upward, otherwise round to even.
+            std::cmp::Ordering::Equal => sticky || (trunc & 1 == 1),
+        };
+        (trunc, up)
+    } else {
+        (m << ((-shift) as u32), false)
+    };
+    if round_up {
+        s += 1;
+    }
+    if s == 0 {
+        return 0;
+    }
+
+    if q == qmin {
+        // Subnormal encoding. A carry that took `s` up to exactly 2^(prec-1)
+        // IS the MIN_NORMAL bit pattern — the subnormal/normal boundary is
+        // seamless in IEEE-754, so there is nothing to renormalize.
+        return s as u64;
+    }
+    let mut e = e;
+    if 128 - s.leading_zeros() > prec {
+        s >>= 1;
+        e += 1;
+    }
+    if e > emax {
+        return inf_bits;
+    }
+    (((e + emax) as u64) << (prec - 1)) | ((s as u64) & ((1u64 << (prec - 1)) - 1))
+}
+
+/// Convert a parsed hex significand to raw bits at the requested width.
+///
+/// `value == M * 2^(pexp - 4*frac_n)` where `M` is the significand digits read
+/// as one integer. `M` is accumulated into a `u128`; once it is full the
+/// remaining digits only contribute to the binary exponent and to a sticky
+/// bit, which is all the rounding needs.
+fn java_hex_float_bits(digits: &[u8], frac_n: usize, pexp: i64, prec: u32, emax: i64) -> u64 {
+    let mut m: u128 = 0;
+    let mut extra: i64 = 0;
+    let mut sticky = false;
+    let mut started = false;
+    for &d in digits {
+        if !started && d == 0 {
+            continue; // leading zeros carry no information
+        }
+        started = true;
+        if m.leading_zeros() >= 4 {
+            m = (m << 4) | d as u128;
+        } else {
+            extra += 4;
+            sticky |= d != 0;
+        }
+    }
+    if !started {
+        return 0; // a significand of all zeros is zero at any exponent
+    }
+    let exp2 = pexp - 4 * frac_n as i64 + extra;
+    round_binary(m, sticky, exp2, prec, emax)
+}
+
+fn java_nfe_float(s: &str) -> cratonvm_types::error::RuntimeError {
+    cratonvm_types::error::RuntimeError::NumberFormatException {
+        message: format!("For input string: \"{s}\""),
+    }
+}
+
+/// Read argument 0 as a non-null `String` for the FLOATING-point parse family.
+///
+/// `Double.parseDouble(null)` and `Float.parseFloat(null)` throw
+/// `NullPointerException`, not `NumberFormatException` — they reach
+/// `String.length()`/`charAt` on the null before any grammar check. The
+/// INTEGER family is the other way round and throws
+/// `NumberFormatException("Cannot parse null string")`; see
+/// `read_string_arg_nfe`. Measured on JDK 25, both ways.
+fn read_string_arg_npe(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> Result<String, cratonvm_types::error::MethodCallFailed> {
+    match args.first() {
+        Some(Value::Object(Some(obj))) => Ok(ctx.read_string(*obj).unwrap_or_default()),
+        _ => Err(
+            cratonvm_types::error::RuntimeError::NullPointerException { message: None }.into(),
+        ),
     }
 }
 
 fn parse_float_string(s: &str) -> Result<f32, cratonvm_types::error::RuntimeError> {
-    let trimmed = s.trim();
-    let numeric = strip_java_float_type_suffix(trimmed);
-    match numeric {
-        "NaN" => Ok(f32::NAN),
-        "Infinity" | "+Infinity" => Ok(f32::INFINITY),
-        "-Infinity" => Ok(f32::NEG_INFINITY),
-        _ => numeric.parse::<f32>().map_err(|_| {
-            cratonvm_types::error::RuntimeError::NumberFormatException {
-                message: format!("For input string: \"{s}\""),
-            }
-        }),
-    }
+    let (body, neg) = match java_float_head(s) {
+        JavaFloatHead::Malformed => return Err(java_nfe_float(s)),
+        JavaFloatHead::Word { nan: true, .. } => return Ok(f32::NAN),
+        JavaFloatHead::Word { nan: false, neg } => {
+            return Ok(if neg { f32::NEG_INFINITY } else { f32::INFINITY })
+        }
+        JavaFloatHead::Body { body, neg } => (body, neg),
+    };
+    let is_hex = body.len() > 1
+        && body.as_bytes()[0] == b'0'
+        && (body.as_bytes()[1] == b'x' || body.as_bytes()[1] == b'X');
+    let v = if is_hex {
+        let (digits, frac_n, pexp) = java_hex_grammar(&body[2..]).ok_or_else(|| java_nfe_float(s))?;
+        f32::from_bits(java_hex_float_bits(&digits, frac_n, pexp, 24, 127) as u32)
+    } else {
+        if !java_decimal_grammar_ok(body) {
+            return Err(java_nfe_float(s));
+        }
+        // Parsed at float width directly, NOT via `f64` — narrowing a double
+        // would round twice and can land on the wrong float.
+        body.parse::<f32>().map_err(|_| java_nfe_float(s))?
+    };
+    Ok(if neg { -v } else { v })
 }
 
 fn parse_double_string(s: &str) -> Result<f64, cratonvm_types::error::RuntimeError> {
-    let trimmed = s.trim();
-    let numeric = strip_java_float_type_suffix(trimmed);
-    match numeric {
-        "NaN" => Ok(f64::NAN),
-        "Infinity" | "+Infinity" => Ok(f64::INFINITY),
-        "-Infinity" => Ok(f64::NEG_INFINITY),
-        _ => numeric.parse::<f64>().map_err(|_| {
-            cratonvm_types::error::RuntimeError::NumberFormatException {
-                message: format!("For input string: \"{s}\""),
-            }
-        }),
-    }
+    let (body, neg) = match java_float_head(s) {
+        JavaFloatHead::Malformed => return Err(java_nfe_float(s)),
+        JavaFloatHead::Word { nan: true, .. } => return Ok(f64::NAN),
+        JavaFloatHead::Word { nan: false, neg } => {
+            return Ok(if neg { f64::NEG_INFINITY } else { f64::INFINITY })
+        }
+        JavaFloatHead::Body { body, neg } => (body, neg),
+    };
+    let is_hex = body.len() > 1
+        && body.as_bytes()[0] == b'0'
+        && (body.as_bytes()[1] == b'x' || body.as_bytes()[1] == b'X');
+    let v = if is_hex {
+        let (digits, frac_n, pexp) = java_hex_grammar(&body[2..]).ok_or_else(|| java_nfe_float(s))?;
+        f64::from_bits(java_hex_float_bits(&digits, frac_n, pexp, 53, 1023))
+    } else {
+        if !java_decimal_grammar_ok(body) {
+            return Err(java_nfe_float(s));
+        }
+        body.parse::<f64>().map_err(|_| java_nfe_float(s))?
+    };
+    Ok(if neg { -v } else { v })
 }
 pub(crate) fn native_float_parse_float(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
-    let s = match args.first() {
-        Some(Value::Object(Some(obj))) => ctx.read_string(*obj).unwrap_or_default(),
-        _ => {
-            return Err(cratonvm_types::error::RuntimeError::NumberFormatException {
-                message: "null".to_string(),
-            }
-            .into())
-        }
-    };
+    let s = read_string_arg_npe(ctx, args)?;
     let val = parse_float_string(&s)?;
     Ok(Some(Value::Float(val)))
 }
@@ -4900,15 +5377,7 @@ pub(crate) fn native_double_parse_double(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
-    let s = match args.first() {
-        Some(Value::Object(Some(obj))) => ctx.read_string(*obj).unwrap_or_default(),
-        _ => {
-            return Err(cratonvm_types::error::RuntimeError::NumberFormatException {
-                message: "null".to_string(),
-            }
-            .into())
-        }
-    };
+    let s = read_string_arg_npe(ctx, args)?;
     let val = parse_double_string(&s)?;
     Ok(Some(Value::Double(val)))
 }
@@ -4917,15 +5386,7 @@ pub(crate) fn native_float_value_of_string(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
-    let s = match args.first() {
-        Some(Value::Object(Some(obj))) => ctx.read_string(*obj).unwrap_or_default(),
-        _ => {
-            return Err(cratonvm_types::error::RuntimeError::NumberFormatException {
-                message: "null".to_string(),
-            }
-            .into())
-        }
-    };
+    let s = read_string_arg_npe(ctx, args)?;
     let val = parse_float_string(&s)?;
     let obj = alloc_wrapper(ctx, "java/lang/Float");
     ctx.set_field(obj, 0, Value::Float(val));
@@ -4936,15 +5397,7 @@ pub(crate) fn native_double_value_of_string(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
-    let s = match args.first() {
-        Some(Value::Object(Some(obj))) => ctx.read_string(*obj).unwrap_or_default(),
-        _ => {
-            return Err(cratonvm_types::error::RuntimeError::NumberFormatException {
-                message: "null".to_string(),
-            }
-            .into())
-        }
-    };
+    let s = read_string_arg_npe(ctx, args)?;
     let val = parse_double_string(&s)?;
     let obj = alloc_wrapper(ctx, "java/lang/Double");
     ctx.set_field(obj, 0, Value::Double(val));
