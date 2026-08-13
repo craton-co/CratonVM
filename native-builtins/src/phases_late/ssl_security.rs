@@ -1892,6 +1892,38 @@ pub(crate) fn tmf_tm_id_by_identity() -> &'static parking_lot::Mutex<rustc_hash:
     T.get_or_init(|| parking_lot::Mutex::new(rustc_hash::FxHashMap::default()))
 }
 
+/// Is `this` the synthetic default factory THIS module's `getInstance` built,
+/// rather than a caller's own `TrustManagerFactory`/`KeyManagerFactory`
+/// subclass?
+///
+/// Every native on these two classes is dispatched by the interpreter for
+/// SUBCLASS receivers too, and the synthetic layout these handlers assume
+/// (`provider`, `factorySpi`, `algorithm` — the real JDK field order) belongs
+/// to an object a real subclass never went through. Writing a slot on such a
+/// receiver overwrites a field the real constructor already filled.
+///
+/// Measured 2026-08-13 (netty `handler.ssl` batch 10): `TrustManagerFactory.
+/// init(KeyStore)` did `set_field(this, 1, keystore)` unconditionally, and
+/// field 1 of the REAL class is `factorySpi`. netty's
+/// `SimpleTrustManagerFactory` (the base of `InsecureTrustManagerFactory` and
+/// of every per-test factory in this suite) is a real subclass constructed
+/// with a real SPI, so `SslContext.buildTrustManagerFactory`'s `tmf.init(ks)`
+/// replaced its SPI with the `KeyStore`, and the very next
+/// `getTrustManagers()` — which correctly delegates to the real bytecode for a
+/// subclass — died on
+/// `NoSuchMethodError: java.security.KeyStore.engineGetTrustManagers()`.
+/// `init((KeyStore) null)` was the same defect with a null: it nulled
+/// `factorySpi` and the real `getTrustManagers()` then NPE'd.
+///
+/// The runtime class is the whole test: `TrustManagerFactory`'s and
+/// `KeyManagerFactory`'s constructors are `protected`, so the only way to hold
+/// an instance whose class is EXACTLY the base class is to have got it from
+/// `getInstance` — i.e. from the handler right here.
+fn jsse_factory_is_ours(ctx: &mut dyn NativeContext, this: ObjectRef, base: &str) -> bool {
+    ctx.class_name_of_id(ctx.class_id_of_object(this))
+        .is_some_and(|n| n == base)
+}
+
 /// Build and throw a real `java.security.NoSuchAlgorithmException` carrying
 /// `msg`. Used by `KeyManagerFactory.getInstance`/`TrustManagerFactory.
 /// getInstance` (below) to honour the JCA `getInstance` contract — real JDK
@@ -4360,9 +4392,24 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
                     &format!("{algo_str} TrustManagerFactory not available"),
                 ));
             }
-            let obj = try_alloc_concurrent_synthetic(ctx, "javax/net/ssl/TrustManagerFactory", 2)?;
-            ctx.set_field(obj, 0, args.get(0).copied().unwrap_or(Value::Object(None)));
-            ctx.set_field(obj, 1, Value::Object(None));
+            let obj = try_alloc_concurrent_synthetic(ctx, "javax/net/ssl/TrustManagerFactory", 3)?;
+            // Field order is the REAL `javax.net.ssl.TrustManagerFactory`
+            // declaration order (`javap -p`: provider, factorySpi, algorithm),
+            // exactly as the sibling `KeyManagerFactory.getInstance` below
+            // already does. The previous layout put the algorithm String at
+            // slot 0, so the un-overridden real `getProvider()` bytecode
+            // returned a `String` where a `Provider` belongs — the same defect
+            // that fix records for KMF, still live here.
+            let provider_name = crate::jca::provider_chain::find_service_provider(
+                "TrustManagerFactory",
+                &algo_str,
+            )
+            .unwrap_or_else(|| "SunJSSE".to_string());
+            let provider =
+                crate::jca::provider_chain::resolve_or_make_provider(ctx, &provider_name)?;
+            ctx.set_field(obj, 0, Value::Object(Some(provider)));
+            ctx.set_field(obj, 1, Value::Object(None)); // factorySpi — unused by this stub
+            ctx.set_field(obj, 2, args.get(0).copied().unwrap_or(Value::Object(None)));
             Ok(Some(Value::Object(Some(obj))))
         },
     );
@@ -4377,8 +4424,14 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
     );
     r.register(tmf, "getAlgorithm", "()Ljava/lang/String;", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        if ctx.object_num_fields(this) > 0 {
-            Ok(Some(ctx.get_field(this, 0)))
+        // A caller's own subclass carries a real `algorithm` its constructor
+        // set; reading OUR slot off it returns whatever happens to live there
+        // (a `Provider`, for a real receiver). See `jsse_factory_is_ours`.
+        if !jsse_factory_is_ours(ctx, this, "javax/net/ssl/TrustManagerFactory") {
+            return ctx.invoke_virtual_bytecode_only(this, "getAlgorithm", "()Ljava/lang/String;", &[]);
+        }
+        if ctx.object_num_fields(this) > 2 {
+            Ok(Some(ctx.get_field(this, 2)))
         } else {
             let s = ctx.create_string("PKIX");
             Ok(Some(Value::Object(Some(s))))
@@ -4386,12 +4439,14 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
     });
     r.register(tmf, "init", "(Ljava/security/KeyStore;)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        if ctx.object_num_fields(this) > 1 {
-            // Stash the KeyStore reference so the emitted TrustManager can
-            // walk it at verification time. A null here is legitimate and
-            // means "use platform default trust store".
-            ctx.set_field(this, 1, args.get(1).copied().unwrap_or(Value::Object(None)));
-        }
+        let ours = jsse_factory_is_ours(ctx, this, "javax/net/ssl/TrustManagerFactory");
+        // NOTHING is written to a field here. Slot 1 of the real class is
+        // `factorySpi`; the write that used to live here destroyed a real
+        // subclass's SPI (see `jsse_factory_is_ours` for the measured
+        // failure), and for OUR synthetic the keystore is not read back from
+        // a field at all — `getTrustManagers()` below resolves it through
+        // `tmf_tm_id_by_identity`, which the staging block just after this
+        // populates for both receiver kinds.
         // FIX (es-restclient-https): this `TrustManagerFactory.init(KeyStore)`
         // is the one that actually wins (registered last in the lib.rs wiring,
         // shadowing `tls.rs::register_trust_manager_factory`'s otherwise
@@ -4440,6 +4495,18 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
                 }
             }
         }
+        if !ours {
+            // A real subclass's `init` means "call MY spi's engineInit" —
+            // netty's `SimpleTrustManagerFactory` routes it back to the
+            // subclass's own `engineInit(KeyStore)`. Swallowing it left the
+            // caller's factory uninitialised while reporting success.
+            return ctx.invoke_virtual_bytecode_only(
+                this,
+                "init",
+                "(Ljava/security/KeyStore;)V",
+                &[args.get(1).copied().unwrap_or(Value::Object(None))],
+            );
+        }
         Ok(None)
     });
     r.register(
@@ -4448,9 +4515,9 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
         "(Ljavax/net/ssl/ManagerFactoryParameters;)V",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            if ctx.object_num_fields(this) > 1 {
-                ctx.set_field(this, 1, args.get(1).copied().unwrap_or(Value::Object(None)));
-            }
+            let ours = jsse_factory_is_ours(ctx, this, "javax/net/ssl/TrustManagerFactory");
+            // No field write, for the reason `jsse_factory_is_ours` records:
+            // slot 1 is the real class's `factorySpi`.
             // FIX (tomcat-clientauth-engine-config): this overload — used
             // whenever `sslHostConfig.getTruststoreAlgorithm()` is `"PKIX"`
             // (Tomcat's default; see `SSLUtilBase.getTrustManagers()`,
@@ -4481,6 +4548,14 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
             let ih = ctx.identity_hash_code(this);
             if ih != 0 {
                 tmf_tm_id_by_identity().lock().insert(ih, tm_id);
+            }
+            if !ours {
+                return ctx.invoke_virtual_bytecode_only(
+                    this,
+                    "init",
+                    "(Ljavax/net/ssl/ManagerFactoryParameters;)V",
+                    &[args.get(1).copied().unwrap_or(Value::Object(None))],
+                );
             }
             Ok(None)
         },
@@ -4665,6 +4740,9 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
     );
     r.register(kmf, "getAlgorithm", "()Ljava/lang/String;", |ctx, args| {
         let this = obj_arg(args, 0)?;
+        if !jsse_factory_is_ours(ctx, this, "javax/net/ssl/KeyManagerFactory") {
+            return ctx.invoke_virtual_bytecode_only(this, "getAlgorithm", "()Ljava/lang/String;", &[]);
+        }
         if ctx.object_num_fields(this) > 2 {
             Ok(Some(ctx.get_field(this, 2)))
         } else {
@@ -4727,6 +4805,19 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
                 }
             }
         }
+        if let Ok(this) = obj_arg(args, 0) {
+            if !jsse_factory_is_ours(ctx, this, "javax/net/ssl/KeyManagerFactory") {
+                return ctx.invoke_virtual_bytecode_only(
+                    this,
+                    "init",
+                    "(Ljava/security/KeyStore;[C)V",
+                    &[
+                        args.get(1).copied().unwrap_or(Value::Object(None)),
+                        args.get(2).copied().unwrap_or(Value::Object(None)),
+                    ],
+                );
+            }
+        }
         Ok(None)
     });
     // STUB-REMOVAL (wave 2): this used to return normally without doing
@@ -4744,7 +4835,22 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
         kmf,
         "init",
         "(Ljavax/net/ssl/ManagerFactoryParameters;)V",
-        |ctx, _args| {
+        |ctx, args| {
+            // Only the synthetic default factory is unable to serve this
+            // overload. A caller's own subclass (netty's
+            // `SimpleKeyManagerFactory`, and every per-test factory built on
+            // it) has a real SPI that implements it — refusing on its behalf
+            // turned a working provider into a hard failure.
+            if let Ok(this) = obj_arg(args, 0) {
+                if !jsse_factory_is_ours(ctx, this, "javax/net/ssl/KeyManagerFactory") {
+                    return ctx.invoke_virtual_bytecode_only(
+                        this,
+                        "init",
+                        "(Ljavax/net/ssl/ManagerFactoryParameters;)V",
+                        &[args.get(1).copied().unwrap_or(Value::Object(None))],
+                    );
+                }
+            }
             Err(crate::phases_early::throw_jca_exc(
                 ctx,
                 "java/security/InvalidAlgorithmParameterException",
@@ -4798,6 +4904,20 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
             // call with no preceding `init(KeyStore, char[])`, which is not
             // a real/expected call shape for this API but shouldn't panic.
             let this = obj_arg(args, 0)?;
+            // Sibling of the `TrustManagerFactory.getTrustManagers` guard just
+            // above: a concrete provider factory (netty's
+            // `SimpleKeyManagerFactory`, e.g. `SniClientJava8TestUtil`'s
+            // per-host key manager) implements its policy through the real
+            // bytecode and its own SPI. Answering with OUR keystore-derived
+            // manager silently replaces the caller's.
+            if !jsse_factory_is_ours(ctx, this, "javax/net/ssl/KeyManagerFactory") {
+                return ctx.invoke_virtual_bytecode_only(
+                    this,
+                    "getKeyManagers",
+                    "()[Ljavax/net/ssl/KeyManager;",
+                    &[],
+                );
+            }
             let ih = ctx.identity_hash_code(this);
             let ks_id = if ih != 0 {
                 kmf_keystore_id_by_identity()

@@ -3475,7 +3475,30 @@ pub(crate) fn register(r: &mut NativeMethodRegistry) {
     // asymmetric provider to configure for real (so EC services register and
     // KeyPairGenerator/Signature("EC","BC") resolve real BC SPIs). Skip these
     // no-ops in that mode; the WildFly-era no-ops stay the default.
-    if !crate::real_jca_mode() {
+    //
+    // 2026-08-13: they are no longer the default, because the blocker the
+    // Round-87 comment above describes is gone. Re-measured on this host: with
+    // the no-ops lifted, `new BouncyCastleProvider()` + all six asymmetric
+    // `$Mappings.configure` calls complete in well under a second, and BC's EC
+    // family registers its 343 algorithms — no ~5-minute `ECNamedCurveTable`
+    // walk, no operand-stack tag mismatch. What changed since Round 87 is the
+    // EC routing this VM now does by default (`route_ec_to_real`, with the
+    // `sunec_intpoly`/`sunec_point` intrinsics behind it), which is also what
+    // makes the curve tables cheap.
+    //
+    // What the no-op cost, measured the same day: `bc.getService("KeyFactory",
+    // "EC")` answered `null`, so BouncyCastle could not convert an EC key at
+    // all. netty's `BouncyCastlePemReader` — which netty tries BEFORE the JDK
+    // parser for every PEM private key — failed with `PEMException: unable to
+    // convert key pair: no such algorithm: EC for provider BC` and returned
+    // null, and the JDK fallback cannot read a SEC1 `EC PRIVATE KEY` block at
+    // all. That is netty `SslContextBuilderTest.
+    // testCombinedPemFileClientContextJdk`'s `IllegalArgumentException: Input
+    // stream does not contain valid private key.`, three layers downstream.
+    //
+    // The kill-switch is `CRATONVM_SYNTHETIC_EC=1` (it turns
+    // `route_ec_to_real` off), which restores the Round-87 behaviour exactly.
+    if !crate::real_jca_mode() && !crate::route_ec_to_real() {
         r.register(
             "org/bouncycastle/jcajce/provider/asymmetric/EC",
             "<clinit>",

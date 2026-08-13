@@ -426,6 +426,20 @@ pub static SWEEP_ZERO_SPAN_HITS: AtomicU64 = AtomicU64::new(0);
 /// — it is read from a debugger or an instrumented repro build.
 pub static SWEEP_ZERO_SPAN_EMPTY_RUNS: AtomicU64 = AtomicU64::new(0);
 
+/// Bytes in the runs [`SWEEP_ZERO_SPAN_EMPTY_RUNS`] counts, accumulated for the
+/// CURRENT cycle by whichever walkers covered the arena (the sequential walk
+/// and the parallel chunks partition it, so both add).
+static EMPTY_RUN_BYTES_CYCLE: AtomicU64 = AtomicU64::new(0);
+
+/// [`EMPTY_RUN_BYTES_CYCLE`] as of the end of the last completed sweep — the
+/// standing retention, because every cycle re-skips the same runs. A
+/// cumulative total would just multiply this by the cycle count.
+pub static EMPTY_RUN_BYTES_LAST: AtomicU64 = AtomicU64::new(0);
+
+/// Young `used` at the end of the last sweep, so the figure above can be read
+/// as a fraction without a second run.
+pub static EMPTY_RUN_YOUNG_USED_LAST: AtomicU64 = AtomicU64::new(0);
+
 /// `CRATONVM_DBG_MARK_WHY_CLASS` straddle reports emitted — the sweep walk
 /// striding OVER the watched base, inside some earlier object's computed
 /// extent. Bounds the log: a desynced grid can straddle one watched address on
@@ -8810,6 +8824,8 @@ impl GenerationalHeap {
                                 &side_sorted,
                             ) {
                                 SWEEP_ZERO_SPAN_EMPTY_RUNS.fetch_add(1, Ordering::Relaxed);
+                                EMPTY_RUN_BYTES_CYCLE
+                                    .fetch_add((resume - cursor) as u64, Ordering::Relaxed);
                                 cursor = resume;
                                 continue;
                             }
@@ -9172,6 +9188,8 @@ impl GenerationalHeap {
                                     &side_sorted,
                                 ) {
                                     SWEEP_ZERO_SPAN_EMPTY_RUNS.fetch_add(1, Ordering::Relaxed);
+                                    EMPTY_RUN_BYTES_CYCLE
+                                        .fetch_add((resume - cursor) as u64, Ordering::Relaxed);
                                     cursor = resume;
                                     continue;
                                 }
@@ -9659,6 +9677,7 @@ impl GenerationalHeap {
         // grid — re-deriving it is exactly the desync hazard documented on
         // `mark_young_to_old_refs`.
         let mut young_survivors: Vec<usize> = Vec::new();
+        EMPTY_RUN_BYTES_CYCLE.store(0, Ordering::Relaxed);
         let mut bytes_swept: usize = 0;
         let mut objects_swept: usize = 0;
         // Index into `dead_regions` at the last trustworthy walk anchor
@@ -9966,6 +9985,7 @@ impl GenerationalHeap {
                 };
                 if let Some(resume) = empty_resume {
                     SWEEP_ZERO_SPAN_EMPTY_RUNS.fetch_add(1, Ordering::Relaxed);
+                    EMPTY_RUN_BYTES_CYCLE.fetch_add((resume - cursor) as u64, Ordering::Relaxed);
                     // `resume <= run_end <= limit` (the next free block's
                     // offset), so the run never crosses a free block and
                     // `free_iter` is already positioned correctly.
@@ -11552,6 +11572,11 @@ impl GenerationalHeap {
         clear_all_mark_bits_in_arena(&mut young_from, &side_sorted);
         report_phase("clear-marks");
 
+        EMPTY_RUN_BYTES_LAST.store(
+            EMPTY_RUN_BYTES_CYCLE.load(Ordering::Relaxed),
+            Ordering::Relaxed,
+        );
+        EMPTY_RUN_YOUNG_USED_LAST.store(young_from.used() as u64, Ordering::Relaxed);
         let live_bytes = bytes_before.saturating_sub(bytes_swept);
         tracing::debug!(
             "non-moving young sweep: {} live objects ({} bytes), {} dead \
@@ -15837,6 +15862,7 @@ fn sweep_chunk(ctx: &SweepCtx<'_>, lo: usize, hi: usize) -> Option<SweepChunkRes
                     ctx.side_sorted,
                 ) {
                     SWEEP_ZERO_SPAN_EMPTY_RUNS.fetch_add(1, Ordering::Relaxed);
+                    EMPTY_RUN_BYTES_CYCLE.fetch_add((resume - cursor) as u64, Ordering::Relaxed);
                     cursor = resume;
                     continue;
                 }
@@ -16867,6 +16893,7 @@ fn clear_all_mark_bits_in_arena(arena: &mut Arena, side_sorted: &[usize]) {
                     zero_run_empty_object_resume(base, cursor, run_end, used, side_sorted)
                 {
                     SWEEP_ZERO_SPAN_EMPTY_RUNS.fetch_add(1, Ordering::Relaxed);
+                    EMPTY_RUN_BYTES_CYCLE.fetch_add((resume - cursor) as u64, Ordering::Relaxed);
                     cursor = resume;
                     continue;
                 }

@@ -3189,6 +3189,34 @@ fn register_trust_manager(r: &mut NativeMethodRegistry, fqn: &'static str) {
         "([Ljava/security/cert/X509Certificate;Ljava/lang/String;)V",
         check_server_trusted,
     );
+    // The `X509ExtendedTrustManager` overloads. `X509TrustManagerImpl` extends
+    // that class, so real bytecode — and, since 2026-08-13, this crate's own
+    // `t27_tls::engine_run_trust_check` — reaches these four rather than the
+    // two above whenever the manager is used with an `SSLEngine` or `Socket`.
+    //
+    // Registering only the two-argument pair left the object half-shimmed: the
+    // objects this module hands out are built with
+    // `try_alloc_concurrent_synthetic`, so no constructor ever ran and every
+    // instance field is null. The moment a three-argument call fell through to
+    // the real JDK body it died on
+    // `NullPointerException: Cannot invoke "ReentrantLock.lock()" because
+    // "this.validatorLock" is null`, which the caller then reported as
+    // `SSLHandshakeException: TrustManager rejected the peer certificate
+    // chain` — measured on netty's `SniHandlerTest.testSniWithAlpnHandler`,
+    // whose `X509TrustManagerWrapper` delegates the engine-flavoured overload
+    // straight through.
+    //
+    // The extra `Socket`/`SSLEngine` argument is advisory in JSSE (it exists so
+    // an implementation CAN consult the connection); the chain and authType are
+    // the whole input to the decision this module makes, so both overloads
+    // share the two-argument handlers, which ignore any surplus argument.
+    for desc in [
+        "([Ljava/security/cert/X509Certificate;Ljava/lang/String;Ljava/net/Socket;)V",
+        "([Ljava/security/cert/X509Certificate;Ljava/lang/String;Ljavax/net/ssl/SSLEngine;)V",
+    ] {
+        r.register(fqn, "checkClientTrusted", desc, check_client_trusted);
+        r.register(fqn, "checkServerTrusted", desc, check_server_trusted);
+    }
     r.register(
         fqn,
         "getAcceptedIssuers",

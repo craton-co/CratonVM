@@ -2960,6 +2960,31 @@ impl ResolvesClientCert for JavaKeyManagerResolver {
     }
 }
 
+/// The JSSE name for a negotiated rustls `CipherSuite`.
+///
+/// The inverse of [`java_cipher_name_to_suite`], and it has to exist: rustls's
+/// `Debug` spelling of a TLS 1.3 suite carries a `13` infix
+/// (`TLS13_AES_128_GCM_SHA256`) that JSSE's name does not
+/// (`TLS_AES_128_GCM_SHA256`), and eight call sites were reporting the `Debug`
+/// string verbatim as `SSLSession.getCipherSuite()`. netty's
+/// `SSLEngineTest.testGetCiphersuite` compares it against the name it asked for
+/// and got `expected: <TLS_AES_128_GCM_SHA256> but was:
+/// <TLS13_AES_128_GCM_SHA256>`; `assertArrayContains` failed the same way.
+///
+/// Only the TLS 1.3 triple differs — every TLS 1.2 suite rustls names is
+/// already spelled the JSSE way — so this is an explicit list rather than a
+/// blind `replace("TLS13_", "TLS_")`, which would also rewrite a future suite
+/// whose real name happens to contain that text.
+fn suite_to_java_cipher_name(suite: rustls::CipherSuite) -> String {
+    use rustls::CipherSuite::*;
+    match suite {
+        TLS13_AES_128_GCM_SHA256 => "TLS_AES_128_GCM_SHA256".to_string(),
+        TLS13_AES_256_GCM_SHA384 => "TLS_AES_256_GCM_SHA384".to_string(),
+        TLS13_CHACHA20_POLY1305_SHA256 => "TLS_CHACHA20_POLY1305_SHA256".to_string(),
+        other => format!("{other:?}"),
+    }
+}
+
 /// Map a Java `SSLEngine.setEnabledCipherSuites` name to the matching rustls
 /// `CipherSuite`. Only covers the suites this module ever advertises via
 /// `getSupportedCipherSuites`/`getEnabledCipherSuites` (see the two identical
@@ -3555,7 +3580,7 @@ pub(crate) fn rustls_client_connect(
     let negotiated_cipher = stream
         .conn
         .negotiated_cipher_suite()
-        .map(|cs| format!("{:?}", cs.suite()))
+        .map(|cs| suite_to_java_cipher_name(cs.suite()))
         .unwrap_or_else(|| "UNKNOWN".to_string());
     let negotiated_alpn = stream
         .conn
@@ -3719,7 +3744,7 @@ pub(crate) fn rustls_server_accept(listener_id: i32) -> Result<i32, String> {
                 let cipher = stream
                     .conn
                     .negotiated_cipher_suite()
-                    .map(|cs| format!("{:?}", cs.suite()))
+                    .map(|cs| suite_to_java_cipher_name(cs.suite()))
                     .unwrap_or_else(|| "UNKNOWN".to_string());
                 let alpn = stream
                     .conn
@@ -3902,7 +3927,7 @@ pub(crate) fn rustls_server_handshake_over_stream(
     let negotiated_cipher = stream
         .conn
         .negotiated_cipher_suite()
-        .map(|cs| format!("{:?}", cs.suite()))
+        .map(|cs| suite_to_java_cipher_name(cs.suite()))
         .unwrap_or_else(|| "UNKNOWN".to_string());
     let negotiated_alpn = stream
         .conn
@@ -3977,7 +4002,7 @@ pub(crate) fn rustls_client_handshake_over_stream(
     let negotiated_cipher = stream
         .conn
         .negotiated_cipher_suite()
-        .map(|cs| format!("{:?}", cs.suite()))
+        .map(|cs| suite_to_java_cipher_name(cs.suite()))
         .unwrap_or_else(|| "UNKNOWN".to_string());
     let negotiated_alpn = stream
         .conn
@@ -5361,9 +5386,10 @@ fn register_sslserversocket(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let this = obj_arg(args, 0)?;
             let mut list: Vec<String> = Vec::new();
+            let mut given = 0usize;
             if let Some(Value::Object(Some(arr))) = args.get(1) {
-                let len = ctx.array_length(*arr);
-                for i in 0..len {
+                given = ctx.array_length(*arr);
+                for i in 0..given {
                     if let Value::Object(Some(s)) = ctx.get_array_element(*arr, i) {
                         if let Some(t) = ctx.read_string(s) {
                             list.push(t);
@@ -5371,7 +5397,8 @@ fn register_sslserversocket(r: &mut NativeMethodRegistry) {
                     }
                 }
             }
-            if list.is_empty() {
+            // Same rule as the `SSLEngineImpl` setter — see its comment.
+            if list.is_empty() && given > 0 {
                 list = vec!["TLSv1.3".to_string(), "TLSv1.2".to_string()];
             }
             stash_sss_enabled_protocols(ctx, this, list);
@@ -6199,7 +6226,7 @@ pub(crate) fn run_loopback_self_test(
     let cipher = stream
         .conn
         .negotiated_cipher_suite()
-        .map(|cs| format!("{:?}", cs.suite()))
+        .map(|cs| suite_to_java_cipher_name(cs.suite()))
         .unwrap_or_else(|| "?".into());
     let alpn = stream
         .conn
@@ -8165,6 +8192,10 @@ pub(crate) struct EngineState {
     /// to tell Tomcat's "renegotiate to collect the client certificate"
     /// second `beginHandshake()` apart from an ordinary redundant one.
     client_auth_requested: bool,
+    /// Set once this server engine's `SNIMatcher`s have been consulted for the
+    /// ClientHello's `server_name`, so the callback into Java happens once per
+    /// connection — same one-shot discipline as `trust_check_done`.
+    sni_match_done: bool,
 }
 
 impl Default for EngineState {
@@ -8195,6 +8226,7 @@ impl Default for EngineState {
             trust_managers_ctx_key: None,
             trust_check_done: false,
             client_auth_requested: false,
+            sni_match_done: false,
         }
     }
 }
@@ -9572,6 +9604,39 @@ fn endpoint_alg_verifies_identity(alg: &str) -> bool {
 /// deferred to `engine_run_trust_check` specifically so no allocating/GC-
 /// triggering call ever happens while this lock is held (see
 /// `EngineState::trust_managers_ctx_key`'s doc for why that matters).
+/// The ClientHello `server_name` about to be handed to rustls, exactly once
+/// per engine. `None` — meaning "no gate to apply" — for a client engine, for
+/// an engine with no matchers configured, for every call after the first, and
+/// for any source buffer that does not begin with a parseable ClientHello
+/// carrying a `server_name`.
+///
+/// Marks the engine checked as soon as it looks at a handshake record, so a
+/// hello that carries no SNI is not re-examined on every later `unwrap`.
+fn engine_pending_sni_host(
+    ctx: &mut dyn NativeContext,
+    id: i32,
+    view: &BbView,
+    from: usize,
+    to: usize,
+) -> Option<String> {
+    let interesting = with_engine(id, |s| !s.is_client && !s.sni_match_done).unwrap_or(false);
+    if !interesting {
+        return None;
+    }
+    // No cheap matcher pre-check here: the table is keyed by the ENGINE
+    // object, which this helper does not hold, and
+    // `engine_run_sni_match_check` returns immediately when the engine has
+    // none. This runs at most once per engine either way.
+    let bytes = bb_bytes_range(ctx, view, from, to.min(from + 4096));
+    let host = peek_client_hello_sni(&bytes);
+    if !bytes.is_empty() && bytes[0] == 22 {
+        with_engine(id, |s| {
+            s.sni_match_done = true;
+        });
+    }
+    host
+}
+
 fn engine_take_pending_trust_check(id: i32, state: &mut EngineState) -> Option<PendingTrustCheck> {
     if state.trust_check_done {
         return None;
@@ -9613,7 +9678,7 @@ fn engine_take_pending_trust_check(id: i32, state: &mut EngineState) -> Option<P
         .conn
         .as_ref()
         .and_then(|c| c.negotiated_cipher_suite())
-        .map(|cs| format!("{:?}", cs.suite()));
+        .map(|cs| suite_to_java_cipher_name(cs.suite()));
     Some(PendingTrustCheck {
         engine_id: id,
         is_client: state.is_client,
@@ -9622,6 +9687,232 @@ fn engine_take_pending_trust_check(id: i32, state: &mut EngineState) -> Option<P
         negotiated_cipher_suite_name: cipher_name,
         endpoint_identity,
     })
+}
+
+/// Extract the `server_name` (SNI host) from a buffer that starts at a TLS
+/// record boundary and is expected to hold a ClientHello.
+///
+/// Why parse it here instead of asking rustls: rustls only reports
+/// `server_name()` AFTER it has processed the ClientHello, and processing it
+/// also produces the whole server flight. JSSE's SNI gate runs at ClientHello
+/// time — `ServerHandshakeContext` refuses before a ServerHello exists, so the
+/// client sees an `unrecognized_name` alert and nothing else. Checking after
+/// the fact left the client's handshake already complete: netty's
+/// `SniClientTest.testSniSNIMatcherDoesNotMatchClient` then saw the server
+/// report a failure and the client report success, and its
+/// `assertThrows(SSLException.class, …)` failed with "nothing was thrown".
+///
+/// Deliberately total and bounds-checked: every length is validated against
+/// the remaining slice, and anything unexpected answers `None` (meaning "no
+/// gate to apply"), never a panic. `None` is also the answer for a hello with
+/// no `server_name` extension, which is exactly JSSE's behaviour — with no
+/// name received there is nothing for a matcher to match.
+fn peek_client_hello_sni(buf: &[u8]) -> Option<String> {
+    fn u16at(b: &[u8], i: usize) -> Option<usize> {
+        Some(((*b.get(i)? as usize) << 8) | *b.get(i + 1)? as usize)
+    }
+    // TLS record: type(1) version(2) length(2). Handshake is 22.
+    if *buf.first()? != 22 {
+        return None;
+    }
+    let rec_len = u16at(buf, 3)?;
+    let body = buf.get(5..5 + rec_len)?;
+    // Handshake: msg_type(1)=client_hello, length(3).
+    if *body.first()? != 1 {
+        return None;
+    }
+    let hs_len = ((*body.get(1)? as usize) << 16)
+        | ((*body.get(2)? as usize) << 8)
+        | (*body.get(3)? as usize);
+    let hello = body.get(4..4 + hs_len)?;
+    // legacy_version(2) random(32)
+    let mut p = 34usize;
+    // legacy_session_id
+    p += 1 + *hello.get(p)? as usize;
+    // cipher_suites
+    p += 2 + u16at(hello, p)?;
+    // legacy_compression_methods
+    p += 1 + *hello.get(p)? as usize;
+    // extensions
+    let ext_total = u16at(hello, p)?;
+    p += 2;
+    let ext_end = p.checked_add(ext_total)?;
+    if ext_end > hello.len() {
+        return None;
+    }
+    while p + 4 <= ext_end {
+        let ext_type = u16at(hello, p)?;
+        let ext_len = u16at(hello, p + 2)?;
+        let data = hello.get(p + 4..p + 4 + ext_len)?;
+        if ext_type == 0x0000 {
+            // ServerNameList: list_length(2), then entries of
+            // name_type(1) + length(2) + host.
+            let list_len = u16at(data, 0)?;
+            let list = data.get(2..2 + list_len)?;
+            let mut q = 0usize;
+            while q + 3 <= list.len() {
+                let name_type = *list.get(q)?;
+                let name_len = u16at(list, q + 1)?;
+                let name = list.get(q + 3..q + 3 + name_len)?;
+                if name_type == 0 {
+                    return String::from_utf8(name.to_vec()).ok();
+                }
+                q += 3 + name_len;
+            }
+            return None;
+        }
+        p += 4 + ext_len;
+    }
+    None
+}
+
+/// Read `SSLParameters.getSNIMatchers()` into raw `ObjectRef`s and file them
+/// under this engine. A null/empty collection CLEARS any previous set, so a
+/// caller that reads the parameters, edits something else and writes them back
+/// does not accidentally keep matchers it removed.
+fn capture_sni_matchers(ctx: &mut dyn NativeContext, engine: ObjectRef, params: ObjectRef) {
+    let key = engine_objref_key(ctx, engine);
+    let coll = match ctx.invoke_virtual(params, "getSNIMatchers", "()Ljava/util/Collection;", &[]) {
+        Ok(Some(Value::Object(Some(c)))) => c,
+        _ => {
+            engine_sni_matchers_table().lock().remove(&key);
+            return;
+        }
+    };
+    let mut list = Vec::new();
+    // Walk the Collection through its Iterator rather than assuming an
+    // ArrayList: `SSLParameters.getSNIMatchers` answers an unmodifiable
+    // wrapper, and JSSE itself builds it from whatever the caller passed.
+    if let Ok(Some(Value::Object(Some(it)))) =
+        ctx.invoke_virtual(coll, "iterator", "()Ljava/util/Iterator;", &[])
+    {
+        let it_pin = ctx.pin_native_root(it);
+        // Bounded: a matcher set is a handful of entries, and an iterator that
+        // never reports exhaustion must not wedge the handshake.
+        for _ in 0..64 {
+            let it_now = ctx.read_native_pin(it_pin, it);
+            match ctx.invoke_virtual(it_now, "hasNext", "()Z", &[]) {
+                Ok(Some(Value::Int(1))) => {}
+                _ => break,
+            }
+            let it_now = ctx.read_native_pin(it_pin, it);
+            match ctx.invoke_virtual(it_now, "next", "()Ljava/lang/Object;", &[]) {
+                Ok(Some(Value::Object(Some(m)))) => list.push(m),
+                _ => break,
+            }
+        }
+        ctx.unpin_native_roots(it_pin);
+    }
+    let mut table = engine_sni_matchers_table().lock();
+    if list.is_empty() {
+        table.remove(&key);
+    } else {
+        table.insert(key, list);
+    }
+}
+
+/// JSSE's server-side SNI gate: for the `server_name` the peer sent, consult
+/// every configured `SNIMatcher` of the matching type and abort the handshake
+/// with `unrecognized_name` if one refuses.
+///
+/// `SNIHostName`'s type is `StandardConstants.SNI_HOST_NAME` (0), the only type
+/// rustls surfaces, so a matcher declaring any other type is not consulted —
+/// matching `ServerHandshakeContext`, which pairs each received name with the
+/// matcher registered for that name's type and ignores the rest.
+///
+/// Runs with the engine registry lock NOT held: it calls into Java.
+fn engine_run_sni_match_check(
+    ctx: &mut dyn NativeContext,
+    engine_id: i32,
+    engine: ObjectRef,
+    host: String,
+) -> Result<(), cratonvm_types::error::MethodCallFailed> {
+    let key = engine_objref_key(ctx, engine);
+    let matchers = match engine_sni_matchers_table().lock().get(&key).cloned() {
+        Some(m) if !m.is_empty() => m,
+        _ => return Ok(()),
+    };
+    let name_str = ctx.create_string(&host);
+    let base = ctx.pin_native_root(name_str);
+    let name_str = ctx.read_native_pin(base, name_str);
+    let sni_name = ctx.new_object_initialized(
+        "javax/net/ssl/SNIHostName",
+        "(Ljava/lang/String;)V",
+        &[Value::Object(Some(name_str))],
+    );
+    let sni_name = match sni_name {
+        Ok(Some(Value::Object(Some(o)))) => o,
+        _ => {
+            ctx.unpin_native_roots(base);
+            return Ok(());
+        }
+    };
+    let name_pin = ctx.pin_native_root(sni_name);
+    let m_pins: Vec<usize> = matchers.iter().map(|m| ctx.pin_native_root(*m)).collect();
+    let mut refused = false;
+    for (i, _) in matchers.iter().enumerate() {
+        let m_now = ctx.read_native_pin(m_pins[i], matchers[i]);
+        // Only a SNI_HOST_NAME matcher applies to the name rustls gave us.
+        match ctx.invoke_virtual(m_now, "getType", "()I", &[]) {
+            Ok(Some(Value::Int(0))) => {}
+            _ => continue,
+        }
+        let m_now = ctx.read_native_pin(m_pins[i], matchers[i]);
+        let name_now = ctx.read_native_pin(name_pin, sni_name);
+        match ctx.invoke_virtual(
+            m_now,
+            "matches",
+            "(Ljavax/net/ssl/SNIServerName;)Z",
+            &[Value::Object(Some(name_now))],
+        ) {
+            Ok(Some(Value::Int(0))) => {
+                refused = true;
+                break;
+            }
+            // A matcher that throws is JSSE's "no match" too — it never lets an
+            // application exception decide the handshake succeeded.
+            Err(_) => {
+                refused = true;
+                break;
+            }
+            _ => {}
+        }
+    }
+    ctx.unpin_native_roots(base);
+    if !refused {
+        return Ok(());
+    }
+    with_engine(engine_id, |s| {
+        if let Some(c) = s.conn.as_mut() {
+            c.queue_fatal_alert(rustls::AlertDescription::UnrecognisedName);
+        }
+    });
+    Err(crate::phases_early::throw_jca_exc(
+        ctx,
+        "javax/net/ssl/SSLHandshakeException",
+        &format!("Unrecognized server name indication: {host}"),
+    ))
+}
+
+thread_local! {
+    /// Set for the duration of an application `TrustManager` callback.
+    ///
+    /// This VM defers the consultation until AFTER `process_new_packets`
+    /// (deliberately — calling into the JVM while the engine registry lock is
+    /// held is what `engine_take_pending_trust_check`'s doc forbids), so by the
+    /// time the manager runs, rustls reports the handshake finished. Real JSSE
+    /// calls it DURING the handshake, and an `X509ExtendedTrustManager` may
+    /// legitimately read `sslEngine.getHandshakeSession()` — netty's
+    /// `SniClientJava8TestUtil` manager asserts it is non-null. Without this
+    /// flag the "handshake is over, answer null" rule (correct for every other
+    /// caller) made that assertion fail from inside the callback.
+    static IN_TRUST_CHECK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Is this thread inside an application `TrustManager` callback? See
+/// [`IN_TRUST_CHECK`].
+fn in_trust_check() -> bool {
+    IN_TRUST_CHECK.with(|c| c.get())
 }
 
 /// Run the post-handshake `TrustManager` consultation captured by
@@ -9642,6 +9933,7 @@ fn engine_take_pending_trust_check(id: i32, state: &mut EngineState) -> Option<P
 fn engine_run_trust_check(
     ctx: &mut dyn NativeContext,
     pending: PendingTrustCheck,
+    engine_obj: Option<ObjectRef>,
 ) -> Result<(), cratonvm_types::error::MethodCallFailed> {
     let trust_managers = match pending.trust_ctx_key {
         Some(key) => ctx_trust_managers_table()
@@ -9710,6 +10002,10 @@ fn engine_run_trust_check(
     // pin pattern in `net_phase_e.rs`'s group-collector native. `base + 1` is
     // the authType pin because these two pins are taken back to back.
     let _ = ctx.pin_native_root(auth_type_str);
+    // The `SSLEngine` goes into the same pin scope: the three-argument
+    // `checkServerTrusted` overload passes it to Java, and every
+    // `invoke_virtual` in the loop below can move it.
+    let engine_pin = engine_obj.map(|e| (ctx.pin_native_root(e), e));
     let tm_pins: Vec<usize> = trust_managers
         .iter()
         .map(|tm| ctx.pin_native_root(*tm))
@@ -9732,16 +10028,38 @@ fn engine_run_trust_check(
     }
     let mut rejected = false;
     let mut rejection: Option<String> = None;
+    // See `IN_TRUST_CHECK`. Cleared on every exit path below — the early
+    // `return Err(e)` for a propagating `Error` clears it too.
+    IN_TRUST_CHECK.with(|c| c.set(true));
     for (i, _tm) in trust_managers.iter().enumerate() {
         let arr_now = ctx.read_native_pin(base, arr);
         let auth_now = ctx.read_native_pin(base + 1, auth_type_str);
         let tm_now = ctx.read_native_pin(tm_pins[i], trust_managers[i]);
-        let result = ctx.invoke_virtual(
-            tm_now,
-            method,
-            "([Ljava/security/cert/X509Certificate;Ljava/lang/String;)V",
-            &[Value::Object(Some(arr_now)), Value::Object(Some(auth_now))],
-        );
+        // Which overload JSSE would use — see `tm_is_extended`. The engine is
+        // absent on the native client-socket path
+        // (`run_client_trust_check_for_chain`), where JSSE's `Socket`-flavoured
+        // overload would apply and we have no `Socket` mirror either; the
+        // two-argument form stays the answer there, exactly as before.
+        let engine_now = engine_pin.map(|(pin, e)| ctx.read_native_pin(pin, e));
+        let result = match engine_now {
+            Some(engine) if tm_is_extended(ctx, tm_now) => ctx.invoke_virtual(
+                tm_now,
+                method,
+                "([Ljava/security/cert/X509Certificate;Ljava/lang/String;\
+                  Ljavax/net/ssl/SSLEngine;)V",
+                &[
+                    Value::Object(Some(arr_now)),
+                    Value::Object(Some(auth_now)),
+                    Value::Object(Some(engine)),
+                ],
+            ),
+            _ => ctx.invoke_virtual(
+                tm_now,
+                method,
+                "([Ljava/security/cert/X509Certificate;Ljava/lang/String;)V",
+                &[Value::Object(Some(arr_now)), Value::Object(Some(auth_now))],
+            ),
+        };
         if dbg {
             eprintln!(
                 "[dbg-tls-auth] engine_run_trust_check: invoke_virtual[{}] -> {}",
@@ -9757,6 +10075,17 @@ fn engine_run_trust_check(
             );
         }
         if let Err(e) = result {
+            // An `Error` is NOT a rejection. JSSE catches `Exception` around an
+            // application TrustManager and lets `Error` through untouched; see
+            // `throwable_is_error`. Unpin first — this is an early return out
+            // of the pinned region.
+            if let cratonvm_types::error::MethodCallFailed::ExceptionThrown(exc) = &e {
+                if throwable_is_error(ctx, *exc) {
+                    IN_TRUST_CHECK.with(|c| c.set(false));
+                    ctx.unpin_native_roots(base);
+                    return Err(e);
+                }
+            }
             // Name WHY, unconditionally — not only under `CRATONVM_DBG=tls-auth`.
             // "TrustManager rejected the peer certificate chain" on its own is
             // indistinguishable between the three things that reach it: the
@@ -9785,6 +10114,7 @@ fn engine_run_trust_check(
             break;
         }
     }
+    IN_TRUST_CHECK.with(|c| c.set(false));
     ctx.unpin_native_roots(base);
 
     if rejected {
@@ -9874,6 +10204,58 @@ fn reject_peer_with_fatal_alert(engine_id: i32) {
 /// behaviour. `CRATONVM_DBG=tls-auth` names the chain that was walked, because
 /// "returned true" and "never found the class" are the two answers that must
 /// not be confused when this is next investigated.
+/// Is `tm` an `X509ExtendedTrustManager`?
+///
+/// JSSE picks the overload by this: `SSLContextImpl.chooseTrustManager` uses an
+/// `X509ExtendedTrustManager` AS-IS and `X509TrustManagerImpl` then calls the
+/// **three**-argument `checkServerTrusted(chain, authType, SSLEngine)`; only a
+/// plain `X509TrustManager` gets the two-argument form (through
+/// `AbstractTrustManagerWrapper`). A manager that implements both — every
+/// `X509ExtendedTrustManager` does, the two-arg methods being inherited
+/// abstract — can tell the difference, and the ones in test suites do
+/// deliberately: netty's `SniClientJava8TestUtil` `fail()`s the two-arg form
+/// and asserts on `sslEngine.getHandshakeSession()` in the three-arg one, so
+/// calling the wrong overload turned a passing test into
+/// `SSLHandshakeException: TrustManager rejected the peer certificate chain:
+/// org/opentest4j/AssertionFailedError`.
+fn tm_is_extended(ctx: &mut dyn NativeContext, tm: ObjectRef) -> bool {
+    let mut cid = Some(ctx.class_id_of_object(tm));
+    // Bounded for the same reason `jsse_owns_endpoint_identification` bounds
+    // its walk: a corrupted `superclass_of` must not hang the handshake.
+    for _ in 0..32 {
+        let Some(c) = cid else { break };
+        if ctx.class_name_of_id(c).as_deref() == Some("javax/net/ssl/X509ExtendedTrustManager") {
+            return true;
+        }
+        cid = ctx.superclass_of(c);
+    }
+    false
+}
+
+/// Is `exc` a `java.lang.Error`?
+///
+/// JSSE catches `Exception` around an application `TrustManager` call, never
+/// `Error`. A JUnit assertion failure inside a `TrustManager`
+/// (`org.opentest4j.AssertionFailedError`) is an `Error`, and it is meant to
+/// reach the test runner intact rather than be re-reported as
+/// `SSLHandshakeException` — which is what this VM did, hiding both the
+/// assertion's message and its stack.
+fn throwable_is_error(ctx: &mut dyn NativeContext, exc: ObjectRef) -> bool {
+    let mut cid = Some(ctx.class_id_of_object(exc));
+    for _ in 0..64 {
+        let Some(c) = cid else { break };
+        match ctx.class_name_of_id(c).as_deref() {
+            Some("java/lang/Error") => return true,
+            // `Throwable` is above both `Error` and `Exception`; reaching it
+            // without having seen `Error` means this is an `Exception`.
+            Some("java/lang/Throwable") | Some("java/lang/Object") => return false,
+            _ => {}
+        }
+        cid = ctx.superclass_of(c);
+    }
+    false
+}
+
 fn jsse_owns_endpoint_identification(
     ctx: &mut dyn NativeContext,
     trust_managers: &[ObjectRef],
@@ -10031,6 +10413,7 @@ pub(crate) fn run_client_trust_check_for_chain(
             // does not route endpoint identification through here.
             endpoint_identity: None,
         },
+        None,
     )
 }
 
@@ -10047,6 +10430,75 @@ pub fn engine_negotiated_alpn_internal(engine_id: i32) -> Option<String> {
 
 /// Build a synthetic `SSLSession` reflecting `id`'s negotiated (or, before/
 /// outside a handshake, best-effort default) cipher/protocol/ALPN state.
+/// The `SSLSession` object this engine is currently presenting, keyed by
+/// `engine_objref_key` and by handshake epoch (`false` = the pre-handshake
+/// session, `true` = the negotiated one).
+///
+/// `getSession()` used to build a FRESH synthetic session on every call, which
+/// breaks the identity every stateful part of the API depends on:
+/// `putValue`/`getValue` landed on different objects, so an attribute never
+/// read back; `invalidate()` marked an object the next `isValid()` never saw;
+/// and `getCreationTime()` moved every time it was asked. netty's
+/// `SSLEngineTest.testSessionAfterHandshake0` is the direct witness — 48 of
+/// this class's failures, `expected: <true> but was: <null>` from
+/// `assertEquals(Boolean.TRUE, engine.getSession().getValue(key))`.
+///
+/// Two epochs rather than one, because JSSE genuinely replaces the session at
+/// handshake completion and the same test asserts it: values put on the
+/// pre-handshake session must NOT be visible afterwards.
+///
+/// Holds live `ObjectRef`s, so it is scanned and remapped by
+/// `gc_scan_tls_ctx_trust_manager_roots` /
+/// `gc_update_tls_ctx_trust_manager_refs` alongside this module's other
+/// object-holding tables.
+fn engine_session_table() -> &'static Mutex<HashMap<(u64, bool), ObjectRef>> {
+    static T: OnceLock<Mutex<HashMap<(u64, bool), ObjectRef>>> = OnceLock::new();
+    T.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Identity keys of the session objects built in the NEGOTIATED epoch.
+///
+/// Only `engine_session_for` knows which epoch a session belongs to, and the
+/// object itself has no spare slot to record it in (all eight are in use, and
+/// `javax/net/ssl/SSLSession` is a real interface with no fields of its own to
+/// widen into). Keyed by `gc_stable_objref_key` — the same GC-stable identity
+/// `getId` already derives its bytes from.
+fn negotiated_session_keys() -> &'static Mutex<std::collections::HashSet<u64>> {
+    static T: OnceLock<Mutex<std::collections::HashSet<u64>>> = OnceLock::new();
+    T.get_or_init(|| Mutex::new(std::collections::HashSet::new()))
+}
+
+/// Has this session object been through a completed handshake? See
+/// [`negotiated_session_keys`].
+fn session_is_negotiated(ctx: &mut dyn NativeContext, ses: ObjectRef) -> bool {
+    let key = gc_stable_objref_key(ctx, ses);
+    negotiated_session_keys().lock().contains(&key)
+}
+
+/// `getSession()`'s stable answer: the cached session for this engine's current
+/// handshake epoch, built on first use. See [`engine_session_table`].
+fn engine_session_for(
+    ctx: &mut dyn NativeContext,
+    engine: ObjectRef,
+    id: i32,
+) -> Result<ObjectRef, MethodCallFailed> {
+    let handshaked = with_engine(id, |s| {
+        s.conn.as_ref().map(|c| !c.is_handshaking()).unwrap_or(false)
+    })
+    .unwrap_or(false);
+    let key = (engine_objref_key(ctx, engine), handshaked);
+    if let Some(existing) = engine_session_table().lock().get(&key).copied() {
+        return Ok(existing);
+    }
+    let ses = build_synthetic_ssl_session(ctx, id)?;
+    if handshaked {
+        let k = gc_stable_objref_key(ctx, ses);
+        negotiated_session_keys().lock().insert(k);
+    }
+    engine_session_table().lock().insert(key, ses);
+    Ok(ses)
+}
+
 /// Shared by `getSession()` and `getHandshakeSession()` — see the latter's
 /// registration for why real JDK's `getHandshakeSession()` cannot be left
 /// un-intercepted on this engine implementation.
@@ -10061,7 +10513,7 @@ fn build_synthetic_ssl_session(ctx: &mut dyn NativeContext, id: i32) -> Result<O
             .conn
             .as_ref()
             .and_then(|c| c.negotiated_cipher_suite())
-            .map(|cs| format!("{:?}", cs.suite()))
+            .map(|cs| suite_to_java_cipher_name(cs.suite()))
             .unwrap_or_else(|| "TLS_AES_256_GCM_SHA384".into());
         let alpn = s.negotiated_alpn.clone().unwrap_or_default();
         (proto.to_string(), cipher, alpn)
@@ -10272,9 +10724,10 @@ fn register_engine_impl_natives(r: &mut NativeMethodRegistry) {
             let this = obj_arg(args, 0)?;
             let id = engine_id_or_alloc(ctx, this);
             let mut list: Vec<String> = Vec::new();
+            let mut given = 0usize;
             if let Some(Value::Object(Some(arr))) = args.get(1) {
-                let len = ctx.array_length(*arr);
-                for i in 0..len {
+                given = ctx.array_length(*arr);
+                for i in 0..given {
                     if let Value::Object(Some(s)) = ctx.get_array_element(*arr, i) {
                         if let Some(t) = ctx.read_string(s) {
                             list.push(t);
@@ -10282,8 +10735,22 @@ fn register_engine_impl_natives(r: &mut NativeMethodRegistry) {
                     }
                 }
             }
-            // Spec: must contain at least one of TLSv1.3 / TLSv1.2.
-            if list.is_empty() {
+            // An EXPLICITLY empty array means "nothing enabled", and JSSE keeps
+            // it: `SSLEngineImpl.setEnabledProtocols` stores
+            // `ProtocolVersion.namesOf(protocols)` verbatim and only rejects
+            // null, so the next `getEnabledProtocols()` answers an empty array
+            // and a handshake attempt fails with "no appropriate protocol".
+            // Substituting the defaults told the caller its disable had been
+            // ignored — netty's
+            // `SSLEngineTest.testEnablingAnAlreadyDisabledSslProtocol` asserts
+            // exactly that round trip (`array lengths differ, expected: <0> but
+            // was: <2>`).
+            //
+            // The defaulting stays for the OTHER way `list` can end up empty —
+            // a non-empty array whose entries this native could not read back —
+            // where falling back to a negotiable pair is a safety net rather
+            // than a contradiction of the caller.
+            if list.is_empty() && given > 0 {
                 list = vec!["TLSv1.3".to_string(), "TLSv1.2".to_string()];
             }
             with_engine(id, |s| {
@@ -10530,9 +10997,7 @@ fn register_engine_impl_natives(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let this = obj_arg(args, 0)?;
             let id = engine_id_or_alloc(ctx, this);
-            Ok(Some(Value::Object(Some(build_synthetic_ssl_session(
-                ctx, id,
-            )?))))
+            Ok(Some(Value::Object(Some(engine_session_for(ctx, this, id)?))))
         },
     );
 
@@ -10564,9 +11029,26 @@ fn register_engine_impl_natives(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let this = obj_arg(args, 0)?;
             let id = engine_id_or_alloc(ctx, this);
-            Ok(Some(Value::Object(Some(build_synthetic_ssl_session(
-                ctx, id,
-            )?))))
+            // JSSE returns null OUTSIDE a handshake — "the session being
+            // negotiated", and once negotiation is over there is none.
+            // netty's `SniClientTest.testSniClient` asserts exactly that
+            // ("After we are done with handshaking getHandshakeSession()
+            // should return null") and got a live session back.
+            //
+            // Only a FINISHED handshake answers null: the pre-handshake case
+            // (`conn` still `None`) keeps returning the best-effort session,
+            // because Jetty's `SslConnection.getBufferSize()` calls this while
+            // sizing buffers for a brand-new connection and drops the
+            // resulting NPE silently — the hang this handler was added for.
+            let finished = with_engine(id, |s| {
+                s.conn.as_ref().map(|c| !c.is_handshaking()).unwrap_or(false)
+            })
+            .unwrap_or(false)
+                && !in_trust_check();
+            if finished {
+                return Ok(Some(Value::Object(None)));
+            }
+            Ok(Some(Value::Object(Some(engine_session_for(ctx, this, id)?))))
         },
     );
 
@@ -10924,7 +11406,7 @@ fn do_wrap(
         (cons, status, hs, drained, pending_trust_check)
     };
     if let Some(pending) = pending_trust_check {
-        engine_run_trust_check(ctx, pending)?;
+        engine_run_trust_check(ctx, pending, Some(this))?;
     }
 
     // Step 3: write the drained bytes into dst.
@@ -11176,6 +11658,14 @@ fn do_unwrap(
     let (src_pos, src_lim) = (src_view.pos, src_view.lim);
     let mut offset = src_pos;
 
+    // JSSE's server-side SNI gate, run at ClientHello time — see
+    // `peek_client_hello_sni` for why it cannot wait until rustls has parsed
+    // the record. Nothing is consumed here; on refusal the bytes are never fed
+    // to rustls at all, so no ServerHello is ever produced.
+    if let Some(host) = engine_pending_sni_host(ctx, id, &src_view, src_pos, src_lim) {
+        engine_run_sni_match_check(ctx, id, this, host)?;
+    }
+
     let (status, hs, plaintext, pending_trust_check) = {
         let mut g = engine_registry().write();
         let s = match g.get_mut(&id) {
@@ -11424,7 +11914,7 @@ fn do_unwrap(
         (status, hs, plaintext, pending_trust_check)
     };
     if let Some(pending) = pending_trust_check {
-        engine_run_trust_check(ctx, pending)?;
+        engine_run_trust_check(ctx, pending, Some(this))?;
     }
     let consumed = offset - src_pos;
     bb_set_pos(ctx, src, src_view.layout, offset);
@@ -11667,6 +12157,9 @@ fn register_apply_parameters(r: &mut NativeMethodRegistry) {
                 with_engine(id, |s| {
                     s.endpoint_id_alg = alg.clone();
                 });
+                // SNI matchers — the server-side gate. See
+                // `engine_run_sni_match_check`.
+                capture_sni_matchers(ctx, this, *p);
             }
             Ok(None)
         },
@@ -11865,6 +12358,29 @@ pub(crate) fn set_engine_trust_ctx_key(
     Ok(())
 }
 
+/// The `SNIMatcher`s a caller installed on a server engine via
+/// `SSLParameters.setSNIMatchers` + `SSLEngine.setSSLParameters`, keyed by
+/// `engine_objref_key`.
+///
+/// A matcher is arbitrary application code — `SNIMatcher.matches(SNIServerName)`
+/// is abstract and netty's own tests subclass it inline — so the decision
+/// cannot be precomputed in Rust from the `SSLParameters`; the objects have to
+/// survive until the ClientHello arrives. That makes this the third
+/// `ObjectRef`-holding table in this module, and it is scanned and remapped by
+/// `gc_scan_tls_ctx_trust_manager_roots` / `gc_update_tls_ctx_trust_manager_refs`
+/// below alongside the other two.
+///
+/// Before this existed, `setSSLParameters` read the ALPN list, the cipher
+/// suites, the client-auth booleans and the endpoint-identification algorithm
+/// off the `SSLParameters` and silently dropped everything else. A server
+/// configured with a matcher that refuses every name still completed the
+/// handshake — netty's `SniClientTest.testSniSNIMatcherDoesNotMatchClient`
+/// asserts an `SSLException` and got `AssertionError: expected SSLException`.
+fn engine_sni_matchers_table() -> &'static Mutex<HashMap<u64, Vec<ObjectRef>>> {
+    static T: OnceLock<Mutex<HashMap<u64, Vec<ObjectRef>>>> = OnceLock::new();
+    T.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
 /// GC root scan for `ctx_trust_managers_table` — see the table's doc for why
 /// this exists (the only ObjectRef-holding side-table in this module that
 /// isn't purely derived PEM/DER bytes).
@@ -11878,6 +12394,22 @@ pub fn gc_scan_tls_ctx_trust_manager_roots(roots: &mut Vec<ObjectRef>) {
         }
     }
     drop(table);
+    let matchers = engine_sni_matchers_table().lock();
+    for list in matchers.values() {
+        for m in list {
+            if !m.as_ptr().is_null() {
+                roots.push(*m);
+            }
+        }
+    }
+    drop(matchers);
+    let sessions = engine_session_table().lock();
+    for ses in sessions.values() {
+        if !ses.as_ptr().is_null() {
+            roots.push(*ses);
+        }
+    }
+    drop(sessions);
     if let Some(f) = *huc_default_factory_slot().lock() {
         if !f.as_ptr().is_null() {
             roots.push(f);
@@ -11932,6 +12464,28 @@ pub fn gc_update_tls_ctx_trust_manager_refs(map: &cratonvm_types::PointerMap) {
         }
     }
     drop(table);
+    let mut matchers = engine_sni_matchers_table().lock();
+    for list in matchers.values_mut() {
+        for m in list.iter_mut() {
+            let old = m.as_ptr() as usize;
+            if let Some(&new) = map.get(&old) {
+                debug_assert!(new != 0, "GC pointer map contains null address");
+                // SAFETY: as above.
+                *m = unsafe { ObjectRef::from_raw(new as *mut u8) };
+            }
+        }
+    }
+    drop(matchers);
+    let mut sessions = engine_session_table().lock();
+    for ses in sessions.values_mut() {
+        let old = ses.as_ptr() as usize;
+        if let Some(&new) = map.get(&old) {
+            debug_assert!(new != 0, "GC pointer map contains null address");
+            // SAFETY: as above.
+            *ses = unsafe { ObjectRef::from_raw(new as *mut u8) };
+        }
+    }
+    drop(sessions);
     // Same treatment for the installed default `SSLSocketFactory` — see
     // `huc_default_factory_slot`.
     let mut slot = huc_default_factory_slot().lock();
@@ -12180,6 +12734,60 @@ pub(crate) fn record_client_peer_chain(
         .insert(gc_stable_objref_key(ctx, session), chain_der);
 }
 
+/// Fire `SSLSessionBindingListener.valueBound`/`valueUnbound` for a value that
+/// implements the interface, the way `SSLSessionImpl.putValue`/`removeValue`
+/// do.
+///
+/// JSSE's contract is explicit: "if the object implements
+/// SSLSessionBindingListener, the valueBound method is called". netty's
+/// `SSLEngineTest.assertSSLSessionBindingEventValue` is a listener that
+/// records the event it was handed and asserts on `event.getName()`; with no
+/// callback the recorded event stayed null and the test died on
+/// `NullPointerException: Cannot invoke
+/// "javax.net.ssl.SSLSessionBindingEvent.getName()" because "event" is null`.
+///
+/// A value that is not a listener, or an event that cannot be constructed, is
+/// silently skipped — the attribute store is the primary effect and must not
+/// fail because of a callback.
+fn fire_session_binding(
+    ctx: &mut dyn NativeContext,
+    session: ObjectRef,
+    name: Value,
+    value: Value,
+    bound: bool,
+) {
+    let Value::Object(Some(v)) = value else {
+        return;
+    };
+    let Some(iface) = ctx.class_id_by_name("javax/net/ssl/SSLSessionBindingListener") else {
+        return;
+    };
+    if !ctx.is_subclass(ctx.class_id_of_object(v), iface) {
+        return;
+    }
+    let ses_pin = ctx.pin_native_root(session);
+    let v_pin = ctx.pin_native_root(v);
+    let ses_now = ctx.read_native_pin(ses_pin, session);
+    let event = ctx.new_object_initialized(
+        "javax/net/ssl/SSLSessionBindingEvent",
+        "(Ljavax/net/ssl/SSLSession;Ljava/lang/String;)V",
+        &[Value::Object(Some(ses_now)), name],
+    );
+    if let Ok(Some(Value::Object(Some(ev)))) = event {
+        let ev_pin = ctx.pin_native_root(ev);
+        let v_now = ctx.read_native_pin(v_pin, v);
+        let ev_now = ctx.read_native_pin(ev_pin, ev);
+        let method = if bound { "valueBound" } else { "valueUnbound" };
+        let _ = ctx.invoke_virtual(
+            v_now,
+            method,
+            "(Ljavax/net/ssl/SSLSessionBindingEvent;)V",
+            &[Value::Object(Some(ev_now))],
+        );
+    }
+    ctx.unpin_native_roots(ses_pin);
+}
+
 fn register_ssl_session_real(r: &mut NativeMethodRegistry) {
     let cls = "javax/net/ssl/SSLSession";
 
@@ -12258,6 +12866,18 @@ fn register_ssl_session_real(r: &mut NativeMethodRegistry) {
     // stable 32-byte id derived from the session object's identity.
     r.register(cls, "getId", "()[B", |ctx, args| {
         let this = obj_arg(args, 0)?;
+        // Before anything has been negotiated there is no session id, and JSSE
+        // answers a ZERO-LENGTH array — not a placeholder. netty's
+        // `SSLEngineTest.testSSLSessionId` asserts
+        // `assertEquals(0, engine.getSession().getId().length)` on a
+        // freshly-created engine and got 32. Which epoch a session object
+        // belongs to is recorded by `engine_session_for`, the only place that
+        // knows — see `negotiated_session_keys`.
+        if ctx.object_num_fields(this) >= 7 && !session_is_negotiated(ctx, this) {
+            return Ok(Some(Value::Object(Some(
+                ctx.new_array(cratonvm_types::ArrayElementType::Byte, 0),
+            ))));
+        }
         let seed = gc_stable_objref_key(ctx, this);
         let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, 32);
         // SplitMix64-style fill so the 32 bytes are stable per session and not
@@ -12299,6 +12919,66 @@ fn register_ssl_session_real(r: &mut NativeMethodRegistry) {
             Ok(Some(ctx.get_field(this, slot)))
         },
     );
+
+    // getSessionContext() — the last unregistered method on the interface that
+    // netty's `SSLEngineTest.testSessionAfterHandshake0` reaches, after
+    // `getPeerHost`/`getPeerPort` below let it get that far. It only asserts
+    // the result is non-null. Real JSSE hands back the context the session was
+    // cached in; this VM has no session cache to speak of (see
+    // `net_phase_e`'s `SSLSessionContext` handlers, which answer an empty
+    // enumeration for the same reason), so this is the same zero-field
+    // carrier those handlers already key their cache-tuning side table off.
+    r.register(
+        cls,
+        "getSessionContext",
+        "()Ljavax/net/ssl/SSLSessionContext;",
+        |ctx, _args| {
+            let c = try_alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLSessionContext", 0)?;
+            Ok(Some(Value::Object(Some(c))))
+        },
+    );
+
+    // getPeerHost()/getPeerPort() — slots 3 and 4 of the 7/8-field engine
+    // session, written by `build_synthetic_ssl_session` (null / -1 for an
+    // engine created without a peer hint, which is exactly what JSSE reports
+    // for one). Real-mode registrations were missing entirely, so every call
+    // threw `AbstractMethodError: method javax/net/ssl/SSLSession.getPeerHost()
+    // Ljava/lang/String; has no Code attribute` — 48 of netty's
+    // `JdkSslEngineTest` failures once `testSessionAfterHandshake0` got far
+    // enough to reach them. `tls.rs` has had the synthetic-mode twins since
+    // the start (`register_ssl_session`, slots 3/4); keep the two in step.
+    r.register(cls, "getPeerHost", "()Ljava/lang/String;", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        if ctx.object_num_fields(this) > 3 {
+            Ok(Some(ctx.get_field(this, 3)))
+        } else {
+            Ok(Some(Value::Object(None)))
+        }
+    });
+    r.register(cls, "getPeerPort", "()I", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        if ctx.object_num_fields(this) > 4 {
+            Ok(Some(ctx.get_field(this, 4)))
+        } else {
+            Ok(Some(Value::Int(-1)))
+        }
+    });
+
+    // invalidate() — `SSLSession` is an interface with no body, so leaving it
+    // unregistered in real-JDK mode threw `AbstractMethodError: method
+    // javax/net/ssl/SSLSession.invalidate()V has no Code attribute` (netty's
+    // `SSLEngineTest.testSessionInvalidate`). The synthetic-JDK path already
+    // had this — `tls.rs::register_ssl_session` — and the two must stay in
+    // step; this is the real-mode twin, clearing the same slot its `isValid`
+    // reads. Only meaningful on the 7-field engine session: the 3-field accept
+    // session has no flag slot to clear.
+    r.register(cls, "invalidate", "()V", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        if ctx.object_num_fields(this) >= 7 {
+            ctx.set_field(this, 2, Value::Int(0));
+        }
+        Ok(None)
+    });
 
     // `isValid` flag is slot 2 only on the 7-field engine session; the 3-field
     // accept session has no flag — treat it as valid (it was just negotiated).
@@ -12383,12 +13063,17 @@ fn register_ssl_session_real(r: &mut NativeMethodRegistry) {
                 .into());
             }
             let map = sslsess_attrs_map(ctx, this)?;
-            ctx.invoke(
+            let old = ctx.invoke(
                 "java/util/HashMap",
                 "put",
                 "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
                 &[Value::Object(Some(map)), name, value],
             )?;
+            // JSSE unbinds the value being replaced before binding the new one.
+            if let Some(old @ Value::Object(Some(_))) = old {
+                fire_session_binding(ctx, this, name, old, false);
+            }
+            fire_session_binding(ctx, this, name, value, true);
             Ok(None)
         },
     );
@@ -12400,12 +13085,15 @@ fn register_ssl_session_real(r: &mut NativeMethodRegistry) {
             Value::Object(Some(m)) => m,
             _ => return Ok(None),
         };
-        ctx.invoke(
+        let old = ctx.invoke(
             "java/util/HashMap",
             "remove",
             "(Ljava/lang/Object;)Ljava/lang/Object;",
             &[Value::Object(Some(map)), name],
         )?;
+        if let Some(old @ Value::Object(Some(_))) = old {
+            fire_session_binding(ctx, this, name, old, false);
+        }
         Ok(None)
     });
     r.register(cls, "getValueNames", "()[Ljava/lang/String;", |ctx, args| {
