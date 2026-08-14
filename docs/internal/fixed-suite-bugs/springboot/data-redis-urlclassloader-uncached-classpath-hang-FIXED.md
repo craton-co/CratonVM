@@ -1,7 +1,9 @@
 # `module/spring-boot-data-redis` HANG cluster — uncached `URLClassLoader` classpath rescan — FIXED 2026-07-23
 
-**Re-verified end to end on `origin/dev` @ `79d5b40ad` on 2026-08-13 — 214 class-runs,
-2916 tests, zero failures, under three collectors and up to 20-way contention.
+**Re-verified end to end on 2026-08-13, on BOTH platforms: 214 Windows class-runs
+(2916 tests, zero failures, three collectors, up to 20-way contention) plus an
+Azure Linux arm on the fixture that actually exposes a difference. CratonVM
+matches HotSpot everywhere in this cluster.
 See [the re-verification section](#2026-08-13-re-verified-end-to-end-on-current-dev-every-claim-above-holds)
 at the foot of this page, which supersedes the platform and collector every
 older table here was taken on.**
@@ -573,9 +575,12 @@ collector changed from Generational to ZGC on 2026-08-10**, so every
 verification recorded above was taken under a collector that is no longer the
 default. This pass re-took all of it under one protocol.
 
-- **Where:** local Windows box (both Azure hosts unreachable — TCP connection
-  timeout on `20.83.144.174`, `Permission denied (publickey)` on
-  `20.80.105.49`). JDK 25 (`Eclipse Adoptium jdk-25.0.3.9-hotspot`).
+- **Where:** local Windows box, JDK 25 (`Eclipse Adoptium jdk-25.0.3.9-hotspot`),
+  **and** the Azure Linux host `20.80.105.49` — see "Linux, and the run that
+  looked like a regression" below. The first pass of this section was written
+  from the Windows arm alone, while the Azure hosts were thought unreachable;
+  that was incomplete evidence and the Linux arm was added before this page was
+  retired.
 - **Binary:** `cratonvm-redisdoc-20260813.exe`, built in worktree
   `C:\craton\CratonVM-redisdoc-20260813`, branch `fix/redis-doc-residuals-20260813`,
   forked from `origin/dev` @ `79d5b40ad`.
@@ -668,6 +673,52 @@ recorded when it closed the residual — so if these classes ever go red again,
 mode this page describes and a budget overrun look identical in a results
 table (both land as `HANG`), and only one of them is a bug in the code this
 page changed.
+
+### Linux, and the run that looked like a regression
+
+A 2026-08-12 Azure Linux run (`regression96-verify-gen-20260812`, binary
+`cratonvm-envfix-linux-20260812`) had three of this page's classes red —
+`DataRedisAutoConfigurationTests` HANG at 1044s,
+`DataRedisAutoConfigurationJedisTests` FAIL 21/23,
+`DataRedisHealthContributorAutoConfigurationTests` FAIL 2/2 — which reads
+exactly like this cluster coming back. It is not. Re-taken on current `dev`
+(`05fff8409`, worktree `/data/wt-redisdoc-20260813`, binary
+`cratonvm-redisdoc-linux-20260813`) against the same shared fixture at
+`/data/cratonvm/apps/spring-boot`:
+
+| Class | HotSpot (same fixture) | CratonVM, current dev | 
+|---|---|---|
+| `DataRedisAutoConfigurationTests` | 56 tests, 1 failed | 56 tests, 1 failed — **64s** default collector, **73s** Generational |
+| `DataRedisAutoConfigurationJedisTests` | 23 tests, 21 failed | 23 tests, 21 failed |
+| `DataRedisHealthContributorAutoConfigurationTests` | 2 tests, 2 failed | 2 tests, 2 failed |
+
+Two separate things were stacked in those rows:
+
+1. **The HANG is gone.** 1044s on the 08-12 binary, 64s on current `dev` —
+   under the default collector *and* under `-XX:+UseGenerationalGC`, which is
+   what that run used.
+2. **The remaining failures are the fixture, not the VM.** HotSpot fails the
+   same tests with the same counts. The host's `spring-data-redis-4.2.0-SNAPSHOT`
+   calls `DefaultJedisClientConfig.autoNegotiateProtocol(boolean)`,
+   which the pinned `jedis-7.4.1.jar` does not have; Windows resolves
+   `spring-data-redis-4.1.0-RC1`, which does not call it, which is the whole
+   reason this cluster is green there and red here. Tracked separately as
+   `data-redis-fixture-jedis-snapshot-skew-20260813.md` under
+   `known-issues/springboot/`.
+
+**So CratonVM diverges from HotSpot nowhere in this cluster, on either
+platform.** That is the claim this page needed before it could retire, and the
+Windows-only arm could not have made it — the Linux fixture is the one that
+exposes the difference.
+
+One real CratonVM defect was found *inside* that shared failure: our
+`NoSuchMethodError` message named the class dotted but then printed the raw
+descriptor, with no return type and no quotes
+(`…Builder.autoNegotiateProtocol(Z)L…Builder;` against HotSpot's
+`'…Builder ….autoNegotiateProtocol(boolean)'`). Fixed 2026-08-13 in
+`vm/src/runtime/exceptions.rs`, oracle committed as `apps/nsme_probe`. Worth
+remembering as a method: **both VMs failing is not the end of the triage — diff
+the message too.**
 
 ### Retired
 
