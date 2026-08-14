@@ -39,6 +39,9 @@ unconditional.
   unit-tested but has no non-doc callers; no `ZMarkContext`-backed coordinator
   is ever spawned for `ZgcRealHeap`. See
   [`zgc-production-implementation-plan.md`](zgc-production-implementation-plan.md).
+- **G1 parallel evacuation has no gauntlet-scale soak.** It is on by default since 2026-08-13 on
+  the strength of unit coverage and a differential checksum probe; the large-heap soak and the
+  throughput measurement that would justify the flip on performance grounds have not been run.
 - **G1 is not the default** and is not proposed as one here. Flipping it would
   change behaviour for every application and every test that assumes
   Generational, so it must be its own change with a full suite re-run.
@@ -309,11 +312,30 @@ is declared (read-once `OnceLock`, default off) per §7.
    pushes on `fresh` (today they push unconditionally — fine single-threaded, redundant in
    parallel).
 
+**All four landed, and the flag is now default-ON with a `=0` opt-out (2026-08-13).** The default
+flip is a separate decision from the four pieces and rests on G1-9 being root-caused rather than
+worked around: it was a compact-layout scan divergence in the parallel evacuator's own object walk,
+reproducing identically at one worker, not a race. Piece 2 was never owed a `DashMap` — per-worker
+shards merged after the barrier is the other half of the same advice.
+
+**Fifth piece, not in the original list: a persistent worker pool** (`gc/src/evac_pool.rs`,
+2026-08-13). The four pieces above left thread creation inside every pause, which is overhead
+charged against `max_gc_pause_ms` for threads that are identical from one pause to the next. The
+pool creates them once per collector and parks them on a condvar; `EvacPool::scope` keeps the
+dispatch/participate/barrier shape so the module SAFETY MODEL note is unchanged. What a persistent
+pool cannot inherit from `std::thread::scope` is the *type-level* proof that no worker outlives the
+borrowed job, so that argument is written out and turns on one property — `scope` does not return
+until every worker has decremented, and a worker decrements after its call returns INCLUDING on an
+unwind. A panicking worker that skipped its decrement would hang the driver on the condvar while it
+holds the regions lock, with the panic never surfacing; both panic directions are tested.
+
 **Validation (§4 step 9 / §5):** differential — the deterministic benches (e.g. `bintrees18@8g`)
-under `CRATONVM_G1_PARALLEL_EVAC=1` must produce **byte-identical checksums** vs serial G1 vs
-HotSpot, across worker counts; plus a parallel-evac soak with no leak/corruption. Parallel evac
-stays **opt-in** until soak-clean; flipping it on (with a demonstrated large-heap throughput win) is
-part of Step 10.
+under parallel evacuation must produce **byte-identical checksums** vs serial G1 vs HotSpot, across
+worker counts; plus a parallel-evac soak with no leak/corruption. The checksum half is met at the
+probe scale used for G1-9 (byte-identical to a real JDK run of the same class, 0/10 corrupt after
+the fix, serial arm clean throughout). **The gauntlet-scale soak and the large-heap throughput
+number are still owed** — the default flip was taken on correctness evidence, not on a measured
+win, and this document should not be read as claiming one.
 
 ---
 

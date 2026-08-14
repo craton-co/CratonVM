@@ -236,11 +236,38 @@ sentinel** — either would corrupt the contiguous payload the JIT, JNI-critical
   that `reset()` only zeroes on its STW retire path.
 * **Never evacuated.** Young and mixed pauses leave humongous spans in place;
   `is_collectable_region_type` excludes them from CSet eligibility.
-* **Reclaimed only by `cleanup`**, which is the only phase that can see the
-  whole heap. `reclaim_dead_humongous_spans_locked` (`g1.rs:6126`) validates the
-  span's *shape* before freeing anything (G1MAT-2): the extent is derived from a
-  cursor, so a stale or corrupt cursor would otherwise `reset()` regions
-  belonging to other live objects. It also refuses any span with a pinned slice.
+* **Reclaimed by `cleanup`** after whole-heap marking.
+  `reclaim_dead_humongous_spans_locked` validates the span's *shape* before
+  freeing anything (G1MAT-2): the extent is derived from a cursor, so a stale or
+  corrupt cursor would otherwise `reset()` regions belonging to other live
+  objects. It also refuses any span with a pinned slice.
+* **And, since 2026-08-13, by evacuation pauses**
+  (`eager_reclaim_humongous_locked`, `CRATONVM_G1_EAGER_HUMONGOUS`, default on).
+  This used to say "reclaimed ONLY by cleanup", and that was the whole problem:
+  a program whose humongous garbage is short-lived held every dead buffer until
+  IHOP happened to fire, which on a heap sized for the live set may be never.
+  A pause has no mark bitmap, but it has what the bitmap compresses — Phase 4
+  has just walked every reference slot of every non-CSet region, and Phase 5 has
+  just freed the CSet — so immediately after Phase 5, "no walked object and no
+  root references this span" IS "nothing in the heap does". The gates are the
+  ways that could be false: an aborted Phase-4 region walk
+  (`HumongousCensus::complete`, which starts `false` so an absent census can
+  never be read as a death certificate), an open mark cycle (under SATB an
+  object unreferenced *now* may still be snapshot-live), pending finalizer
+  resurrection, and evacuation failure — which makes Phase 5 KEEP a CSet region
+  that Phase 4 skipped, so a live self-forwarded holder was never walked.
+
+  **The ordering is the trap.** A young object Y in Eden holding the only
+  reference to humongous H records `source = Eden` in H's remembered set; the
+  pause copies Y to Survivor and frees Eden, leaving H's only rset entry naming
+  a zero-filled region while the live Survivor copy is in no rset at all.
+  Consulting the remembered set here frees a live H. Liveness therefore comes
+  from the Phase-4 walk, which sees the Survivor copy because to-space regions
+  are typed and cursor-committed before Phase 4 runs. Pinned by
+  `a_humongous_span_held_only_by_an_evacuated_young_object_survives`; debug
+  builds additionally re-derive the answer over every non-Free region after
+  Phase 5, because the census inherits Phase 4's region *filter* and that filter
+  is where this class of mistake lives.
 * **TAMS interaction.** A span allocated *during* the cycle is safe: its region's
   snapshot entry recorded type `Free`, which does not match `HumongousStart` at
   cleanup, so `tams = 0` and the whole span counts as implicitly live.
@@ -534,6 +561,9 @@ Ordered. Each item is a precondition for the next being meaningful.
    parameter from being dropped again. I-17 now has the same mechanical
    enforcement `collect_garbage` has.
 8. **Run the probe kit (§`docs/GC.md`) with `CRATONVM_G1_DBG_REACH=1` on a
+   JIT-warm workload** and confirm the new `[GC] g1 cycle` line reports
+   `degraded=none` across a full mixed sequence. Any other value is a
+   reclamation the collector silently declined to make.
 
 ## 10. The G1-2 fix costs the fresh-ctor inline store, and that is not avoidable by elision
 

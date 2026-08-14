@@ -197,7 +197,9 @@ mark), BinaryTrees (deep recursion). Always diff against a real JDK run.
 | `CRATONVM_GC_VERIFY_STALE=1` | Post-GC stale-frame-slot verifier (recycled drain destinations are recognized as benign) |
 | `CRATONVM_DBG_WEAKREF=1` | Weak/Phantom null/restore pass tracing |
 | `CRATONVM_G1_NO_EVAC_RETRY=1` | Disable the evacuation-failure drain (bisection) |
-| `CRATONVM_GC=g1-parallel-evac` | Opt-in parallel young evacuator. The "known race" this row warned about was G1-9, which was neither known to be a race nor a race — it was a compact-layout scan divergence, now fixed (`audits/g1-audit.md` §0, internal record tree). Still opt-in: no gauntlet run yet, and it spawns a worker pool per GC. |
+| `CRATONVM_G1_PARALLEL_EVAC=0` | Force the single-threaded evacuator. Parallel evacuation is the DEFAULT since 2026-08-13; the "known race" this row used to warn about was G1-9, which was neither known to be a race nor a race — it was a compact-layout scan divergence, now fixed (`audits/g1-audit.md` §0, internal record tree). The worker threads are also no longer respawned per pause. Still owed: a gauntlet-scale soak and a throughput number, so this remains the bisection lever for any suspected parallel-evacuation regression. |
+| `CRATONVM_G1_EAGER_HUMONGOUS=0` | Restore cleanup-only humongous reclaim. By default an evacuation pause also frees humongous spans it can prove nothing references. This is the only path that frees memory outside the collection set, so it is the first thing to rule out if a live humongous object goes missing. |
+| `CRATONVM_G1_WORKERS=<n>` | Force the evacuation worker count; `=1` drains the parallel path serially, which separates a concurrency race from a logic divergence |
 | `CRATONVM_DBG_GC_STRESS=<bytes>` | Force young GCs every N allocated bytes (Generational) |
 | `CRATONVM_GC_PAR_THREADS=<n>` | Generational young-GC worker count. `0`/`1` forces the sequential collector; `>= 2` forces that many workers regardless of heap size. Unset = `min(available_parallelism, 8)` once the young gen passes the size floor. `available_parallelism` follows CPU affinity, so a `taskset -c N` run is automatically sequential |
 | `CRATONVM_GC_PAR_MIN_BYTES=<bytes>` | Young-gen size floor below which the young GC stays sequential (default 16 MiB) |
@@ -279,9 +281,12 @@ pauses add the most-garbage Old regions bounded by count and copy-time
 budget — only regions with liveness data from a completed mark cycle are
 eligible. Marking is SATB tri-color with a background worker that also
 drains the SATB shards each step; cleanup frees wholly-dead Old regions
-in place, reclaims dead humongous spans (the ONLY humongous reclaimer)
-and arms mixed collections. Humongous objects (> half a region) occupy
-physically contiguous region runs and are never evacuated. Evacuation
+in place, reclaims dead humongous spans and arms mixed collections.
+Humongous objects (> half a region) occupy physically contiguous region
+runs and are never evacuated — but a pause can still free one: after
+Phase 5 it reclaims any span that neither a root nor any object its
+Phase-4 walk visited refers to, which is what stops short-lived
+humongous garbage waiting on a mark cycle that may never fire. Evacuation
 failure self-forwards live objects in place, keeps their regions, and a
 same-pause drain recovers them; a wedged drain leaves the kept regions
 coherent (remembered-set edges recorded, precise liveness answers).

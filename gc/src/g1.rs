@@ -1853,6 +1853,21 @@ pub struct G1Collector {
     arena_base: usize,
     arena_end: usize,
 
+    /// This pause was entered through
+    /// [`Self::collect_garbage_with_finalizers`], i.e. some object registered
+    /// for finalization is unreachable-but-not-yet-finalized.
+    ///
+    /// Separate from `pending_finalizer_roots` because that list is CONSUMED by
+    /// Phase 3.5 (`std::mem::take`), so by Phase 5 — where
+    /// [`Self::eager_reclaim_humongous_locked`] runs — it is empty on every
+    /// path and testing it there would silently always pass. The distinction
+    /// matters for exactly one shape: a humongous object with a finalizer.
+    /// Phase 3.5 resurrects dead finalizable objects out of the CSet, and a
+    /// humongous object is never IN the CSet, so it is never resurrected and
+    /// never lands in `resurrected_finalizers` either — it would just be freed
+    /// out from under a `finalize()` that has not run yet.
+    finalizer_pause: AtomicBool,
+
     /// Persistent parallel-evacuation worker threads (see [`crate::evac_pool`]).
     ///
     /// Created on the FIRST parallel pause rather than in [`G1Collector::new`],
@@ -1979,6 +1994,7 @@ impl G1Collector {
             region_lookup,
             arena_base,
             arena_end,
+            finalizer_pause: AtomicBool::new(false),
             evac_pool: std::sync::OnceLock::new(),
         }
     }
@@ -4406,6 +4422,8 @@ impl G1Collector {
     ) -> (GcResult, Vec<usize>) {
         *self.pending_finalizer_roots.lock() = finalizer_addrs.to_vec();
         self.resurrected_finalizers.lock().clear();
+        self.finalizer_pause
+            .store(!finalizer_addrs.is_empty(), Ordering::Relaxed);
         let result = <Self as crate::collector::GarbageCollector>::collect_garbage(
             self, stw, roots, monitors,
         );
@@ -4413,6 +4431,7 @@ impl G1Collector {
         // (e.g. an empty-CSet early return) so a later plain collection
         // never sees stale candidates.
         self.pending_finalizer_roots.lock().clear();
+        self.finalizer_pause.store(false, Ordering::Relaxed);
         let mut dead = std::mem::take(&mut *self.resurrected_finalizers.lock());
         // `retry_after_evacuation_failure` (run inside collect_garbage,
         // after Phase 3.5) can relocate objects AGAIN via the kept-region
@@ -7738,8 +7757,11 @@ impl G1Collector {
         if !self.mark_worklist.lock().is_empty() {
             return declined("the gray set is non-empty");
         }
-        if !self.pending_finalizer_roots.lock().is_empty() {
-            return declined("finalizer resurrection is pending");
+        if self.finalizer_pause.load(Ordering::Relaxed) {
+            // NOT `pending_finalizer_roots.is_empty()`: Phase 3.5 has already
+            // taken that list by the time this runs, so the obvious test passes
+            // unconditionally. See the `finalizer_pause` field.
+            return declined("an object registered for finalization is awaiting finalize()");
         }
         if pointer_map.iter().any(|(old, new)| old == new) {
             return declined("evacuation failure kept cset regions phase 4 never walked");
@@ -12143,6 +12165,45 @@ mod tests {
         assert_eq!(
             gc.get_array_element(target, 0).unwrap(),
             Value::Long(0xB0B)
+        );
+    }
+
+    /// A humongous object with an unrun finalizer must survive the pause.
+    ///
+    /// This one nearly got away. The obvious gate — "are there pending
+    /// finalizer roots?" — is useless where the reclaim runs, because Phase 3.5
+    /// consumes that list with `std::mem::take` long before Phase 5, so the
+    /// test passes unconditionally. And the mechanism that normally protects
+    /// finalizable garbage does not apply here either: Phase 3.5 resurrects
+    /// dead finalizable objects *out of the CSet*, and a humongous object is
+    /// never in a CSet, so it is never resurrected and never appears in
+    /// `resurrected_finalizers`. Without the pause-scoped flag this frees the
+    /// object out from under a `finalize()` that has not run.
+    #[test]
+    fn a_humongous_span_awaiting_finalization_is_not_eagerly_reclaimed() {
+        let gc = make_collector();
+        let h = gc.alloc_array(ClassId::new(0), ArrayElementType::Long, 100_000);
+        let addr = h.as_ptr() as usize;
+        let _churn = gc.alloc_object(ClassId::new(1), 1);
+
+        let mut roots: Vec<ObjectRef> = vec![];
+        let _ = gc.collect_garbage_with_finalizers(&stw(), &mut roots, &[addr], &NoopMonitors);
+
+        assert_eq!(
+            gc.count_regions(RegionType::HumongousStart),
+            1,
+            "a span awaiting finalize() must not be freed"
+        );
+
+        // ...and the flag is per-pause, so the NEXT ordinary collection does
+        // reclaim it. A latch that never cleared would disable eager reclaim
+        // for the rest of the process after one finalizer pause.
+        let _churn2 = gc.alloc_object(ClassId::new(1), 1);
+        gc.young_collection(&mut roots, &NoopMonitors);
+        assert_eq!(
+            gc.count_regions(RegionType::HumongousStart),
+            0,
+            "the finalizer gate must be scoped to its own pause"
         );
     }
 
