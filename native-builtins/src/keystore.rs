@@ -2572,11 +2572,25 @@ pub(crate) fn private_key_der_from_proxy(
         Value::Long(value) => value,
         _ => return None,
     };
+    let alias_hash = composite as u32;
+    // The other producer of this layout is
+    // `x509_manager::make_private_key_mirror`, whose high half is a
+    // `KeyManager` id from a DIFFERENT counter. It tags itself so the two are
+    // distinguishable; untagged composites are keystore ids as before. Reading
+    // a tagged one as a store id is what made
+    // `KeyManager.getPrivateKey(alias).getEncoded()` return an empty array
+    // whenever the two counters were not coincidentally aligned.
+    if crate::x509_manager::is_km_proxy_composite(composite) {
+        let km_id = crate::x509_manager::km_id_of_composite(composite);
+        if km_id <= 0 {
+            return None;
+        }
+        return crate::x509_manager::km_key_der_by_alias_hash(km_id, alias_hash);
+    }
     let store_id = (composite >> 32) as i32;
     if store_id <= 0 {
         return None;
     }
-    let alias_hash = composite as u32;
     let store = keystore_lookup(store_id)?;
     store.entries.values().find_map(|entry| {
         if fnv1a_32(entry.alias.as_bytes()) != alias_hash {
