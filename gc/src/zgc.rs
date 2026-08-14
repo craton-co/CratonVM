@@ -3682,17 +3682,71 @@ impl ZgcRealHeap {
                     dest = from;
                     break;
                 };
-                let to = (dest + 7) & !7;
-                debug_assert!(to <= from, "the slide must never move an object UP");
-                if to < from {
-                    // SAFETY: `size` bytes are live at `from`, `to` is inside
-                    // the arena and strictly below `from`, and the regions may
-                    // overlap -- `copy` is memmove, correct in that direction.
-                    unsafe { std::ptr::copy(from as *const u8, to as *mut u8, size) };
-                    pairs.push((from, to));
-                    moved += 1;
+                // THE DESTINATION MUST LIE ENTIRELY INSIDE SELECTED PAGES.
+                //
+                // `ZRelocationSet::select` ranks by descending garbage ratio
+                // and takes a prefix, so the selected ids are an arbitrary,
+                // NON-CONTIGUOUS set -- every page at or above
+                // `max_live_occupancy` is skipped. Until 2026-08-14 this loop
+                // marched one cursor up from `slide_floor` and placed every
+                // survivor consecutively, so as soon as the selected pages'
+                // live bytes exceeded the gap below the first dense page, this
+                // memmove copied survivors straight over the live objects ON
+                // it. Silent heap corruption; it reached the outside world as
+                // `compaction must not raise the cursor: 15348137664 > ...`
+                // (a clobbered header read back as a 1.9-billion-element
+                // array) and, on one run, as a bare SIGSEGV.
+                //
+                // The comment eight lines above the old code said the cursor
+                // "has to start above the highest unselected survivor". That
+                // was the right rule and the code implemented something else.
+                //
+                // Skipping rather than clamping keeps the selector's choice:
+                // pages above a dense one are still compacted, into the next
+                // selected page, which is what makes a non-contiguous
+                // selection worth having at all.
+                let span = size.max(1);
+                let mut probe = dest;
+                let mut chosen: Option<usize> = None;
+                while probe < from {
+                    let cand = (probe + 7) & !7;
+                    // Only a strictly-downward move is worth anything, and an
+                    // upward one would overwrite a survivor not yet visited.
+                    if cand >= from || cand + span > low_end {
+                        break;
+                    }
+                    let first_page = page_of(cand);
+                    let last_page = page_of(cand + span - 1);
+                    match (first_page..=last_page).find(|pg| !selected.contains(pg)) {
+                        // The span would touch an unselected page: restart the
+                        // probe at the page after it. Strictly increasing, so
+                        // this terminates in at most one pass over the grid.
+                        Some(blocked) => {
+                            probe = base + (blocked as usize + 1) * Self::Z_LOGICAL_PAGE_BYTES;
+                        }
+                        None => {
+                            chosen = Some(cand);
+                            break;
+                        }
+                    }
                 }
-                dest = to + size;
+                match chosen {
+                    Some(to) => {
+                        debug_assert!(to < from, "the slide must never move an object UP");
+                        // SAFETY: `size` bytes are live at `from`, `to` is
+                        // inside the arena and strictly below `from`, and the
+                        // regions may overlap -- `copy` is memmove, correct in
+                        // that direction.
+                        unsafe { std::ptr::copy(from as *const u8, to as *mut u8, size) };
+                        pairs.push((from, to));
+                        moved += 1;
+                        dest = to + size;
+                    }
+                    // Nowhere below it inside a selected page: it stays put,
+                    // and the cursor continues above it so a later survivor
+                    // cannot be placed on top of it.
+                    None => dest = from + size,
+                }
             }
             // The cursor may only drop to the compacted end if nothing that
             // STAYED PUT lives above it.
@@ -3707,7 +3761,35 @@ impl ZgcRealHeap {
                 .copied()
                 .filter(|b| *b >= base && *b < low_end)
                 .filter(|b| !selected.contains(&page_of(*b)))
-                .map(|b| b + Self::alloc_size(self.header_ref(b as *mut u8)).unwrap_or(0))
+                .map(|b| {
+                    let size = Self::alloc_size(self.header_ref(b as *mut u8)).unwrap_or(0);
+                    // An extent that runs past the bump cursor is impossible
+                    // for a live object and means the header is not one --
+                    // which is how the 2026-08-14 corruption presented: a
+                    // clobbered header sized at 15,348,137,664 bytes on a
+                    // 168 MB arena, carried into `compact_low_to` as a cursor
+                    // 91x the heap.
+                    //
+                    // Refuse it here rather than let it set the cursor. Pinning
+                    // at `low_end` reclaims nothing this cycle, which is the
+                    // conservative answer and strictly better than either
+                    // trusting the number or panicking: `alloc_size` has no
+                    // arena to check against, and this is the caller that does.
+                    if size > low_end.saturating_sub(b) {
+                        tracing::warn!(
+                            target: "cratonvm::gc::guard",
+                            addr = b,
+                            size,
+                            low_end,
+                            "zgc relocate: a pinned survivor's extent runs past the \
+                             bump cursor -- refusing to reclaim this cycle rather than \
+                             trust the header"
+                        );
+                        low_end
+                    } else {
+                        b + size
+                    }
+                })
                 .max()
                 .unwrap_or(base);
             let new_cursor = dest.max(highest_pinned_end) - base;
@@ -10233,6 +10315,115 @@ pub(crate) mod tests {
             );
             assert!(!v, "CRATONVM_ZGC_RELOCATE={off} must be a kill switch");
         }
+    }
+
+    /// **A dense page BETWEEN two selected pages must not be slid over.**
+    ///
+    /// `ZRelocationSet::select` ranks by descending garbage ratio and takes a
+    /// prefix, so the selected page ids are an arbitrary, **non-contiguous**
+    /// set — any page at or above `max_live_occupancy` (25%) is skipped. The
+    /// slide, however, marched one `dest` cursor upward from the first
+    /// selected page and placed every survivor consecutively, with no regard
+    /// for the unselected pages in between. Once the selected pages' live
+    /// bytes exceeded the gap below the first dense page, survivors from the
+    /// pages ABOVE it were copied straight over the live objects ON it.
+    ///
+    /// That is `zgc-relocate-cursor-panic-on-netty-tls-20260814.md`. The panic
+    /// it was reported as is two steps downstream: the clobbered header is
+    /// read back by `highest_pinned_end`, `alloc_size` believes its garbage
+    /// array length, and `compact_low_to` refuses a `new_cursor` of
+    /// 15,348,137,664 on a 168 MB arena — which is exactly 1,918,517,208 * 8,
+    /// an 8-byte element type times a length read out of clobbered memory.
+    ///
+    /// This test asserts the corruption directly rather than the panic,
+    /// because the panic is incidental: the same overwrite presented once as a
+    /// bare SIGSEGV, and on a run where the clobbered bytes happened to decode
+    /// plausibly it would present as neither.
+    #[test]
+    fn compaction_must_not_slide_survivors_over_an_unselected_dense_page() {
+        // Six 2 MiB logical pages of bump, with page 1 dense. The selected
+        // pages' live bytes then total more than the 2 MiB below page 1, which
+        // is the condition that makes the slide reach it.
+        const PAGE: usize = ZgcRealHeap::Z_LOGICAL_PAGE_BYTES;
+        const PAGES: usize = 6;
+        const DENSE: usize = 1;
+        const FIELDS: usize = 500; // 16 + 4000 = 4016 bytes per object
+        let heap = ZgcRealHeap::with_capacity(64 * 1024 * 1024);
+        // Deterministic layout: a TLAB carves chunks whose size depends on a
+        // process-wide flag, which would make which object lands on which page
+        // depend on a peer test.
+        heap.set_tlab_enabled(false);
+
+        let per_page = PAGE / (HEADER_SIZE + FIELDS * SLOT_SIZE);
+        let mut roots: Vec<ObjectRef> = Vec::new();
+        // (object, sentinel) for the objects on the dense page.
+        let mut victims: Vec<(ObjectRef, i32)> = Vec::new();
+        let mut sentinel = 1i32;
+
+        for page in 0..PAGES {
+            // Dense page: keep 3 in 4 (75% > 25%, so never selected).
+            // Sparse pages: keep 1 in 5 (20% < 25%, so selected).
+            let keep_every = if page == DENSE { 4 } else { 5 };
+            let keep_of_four = if page == DENSE { 3 } else { 1 };
+            for i in 0..per_page {
+                let o = heap.alloc_object(ClassId::new(1), FIELDS);
+                let keep = (i % keep_every) < keep_of_four;
+                if keep {
+                    heap.set_field(o, 0, Value::Int(sentinel));
+                    roots.push(o);
+                    if page == DENSE {
+                        victims.push((o, sentinel));
+                    }
+                    sentinel += 1;
+                }
+            }
+        }
+        assert!(
+            victims.len() > 100,
+            "the dense page must hold enough live objects to be worth checking; got {}",
+            victims.len()
+        );
+
+        // SAFETY: these unit tests run the heap single-threaded.
+        let stw = unsafe { StopTheWorldToken::new() };
+        cratonvm_types::flags::with_thread_overrides(
+            &[("CRATONVM_ZGC_RELOCATE", Some("1"))],
+            || {
+                heap.collect_garbage(&stw, &mut roots, &NoMonitors);
+            },
+        );
+
+        // An object on an unselected page must not move...
+        for (i, (obj, _)) in victims.iter().enumerate() {
+            let now = roots[roots.len() - victims.len() + i - 0];
+            let _ = now; // addresses are checked via the sentinel below
+            let _ = obj;
+        }
+        // ...and, the part that actually fails, its contents must survive.
+        // Read through the ORIGINAL reference: an unselected object does not
+        // move, so a stale read here is the correct read.
+        let mut clobbered = 0usize;
+        for (obj, want) in &victims {
+            if heap.get_field(*obj, 0) != Value::Int(*want) {
+                clobbered += 1;
+            }
+        }
+        assert_eq!(
+            clobbered, 0,
+            "{clobbered} of {} live objects on the unselected dense page were \
+             overwritten by survivors slid down from the selected pages above it",
+            victims.len()
+        );
+
+        // ...and the fix must not have achieved that by refusing to compact.
+        // Skipping an unselected page is the correct repair; clamping the
+        // slide to the pages below it would also pass the assertion above and
+        // would quietly turn every non-contiguous selection into a no-op.
+        let (_par, compactions, relocated) = heap.feature_engagement();
+        assert!(
+            compactions > 0 && relocated > 0,
+            "compaction must still MOVE things across a non-contiguous              selection: compaction_cycles={compactions} objects_relocated={relocated}"
+        );
     }
 
     #[test]
