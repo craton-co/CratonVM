@@ -2400,6 +2400,19 @@ pub struct ZgcRealHeap {
     /// Page ids the last cycle classified as old. Read by the store barrier to
     /// decide whether a store is an old-to-young edge worth remembering.
     old_page_ids: Mutex<Vec<u64>>,
+    /// Cycles in which the parallel marker ran, and in which compaction moved
+    /// at least one object, plus the objects it moved.
+    ///
+    /// Reported on the `[GC] zgc-real:` shutdown line. These exist because the
+    /// first smoke test of the 2026-08-13 default flip could not tell whether
+    /// either feature had actually engaged: the per-cycle `tracing::debug!`
+    /// needs a subscriber the suite harness does not install, so a run that
+    /// silently took the serial path looked exactly like a run that did not.
+    /// **An opt-in feature turned on by default needs a counter, or its first
+    /// measurement is a vacuous green.**
+    parallel_mark_cycles: AtomicUsize,
+    compaction_cycles: AtomicUsize,
+    objects_relocated: AtomicUsize,
     /// Addresses this barrier has published since the cycle began. Telemetry
     /// for the adoption work — it is how you tell "the barrier is wired" from
     /// "the barrier is wired and the workload actually overwrites references",
@@ -2693,6 +2706,9 @@ impl ZgcRealHeap {
             page_ages: Mutex::new(Vec::new()),
             remembered: remembered::ZRememberedSetTable::new(),
             old_page_ids: Mutex::new(Vec::new()),
+            parallel_mark_cycles: AtomicUsize::new(0),
+            compaction_cycles: AtomicUsize::new(0),
+            objects_relocated: AtomicUsize::new(0),
             headroom_low: AtomicBool::new(false),
             gc_count: AtomicUsize::new(0),
             gc_log_enabled: AtomicBool::new(false),
@@ -2821,6 +2837,22 @@ impl ZgcRealHeap {
     #[inline]
     pub fn clear_hard_alloc_failure(&self) {
         self.hard_alloc_failure.store(false, Ordering::Relaxed);
+    }
+
+    /// `(parallel_mark_cycles, compaction_cycles, objects_relocated)` — did
+    /// the 2026-08-13 default-on features actually engage this run?
+    ///
+    /// Reported at shutdown. A zero here is not a failure — the relocation-set
+    /// selector legitimately declines a heap with no garbage worth moving, and
+    /// a small-core box legitimately marks serially — but it IS the difference
+    /// between "the feature ran and behaved" and "the feature never ran and
+    /// the run proves nothing about it".
+    pub fn feature_engagement(&self) -> (usize, usize, usize) {
+        (
+            self.parallel_mark_cycles.load(Ordering::Relaxed),
+            self.compaction_cycles.load(Ordering::Relaxed),
+            self.objects_relocated.load(Ordering::Relaxed),
+        )
     }
 
     /// The fragmentation ratchet's current reading — Phase 2.2 of the ZGC
@@ -7356,6 +7388,7 @@ impl GarbageCollector for ZgcRealHeap {
             let _skip = self.begin_concurrent_mark_cycle();
             let stats = self.mark_parallel_stw(&root_addrs, parallel_workers);
             self.end_concurrent_mark_cycle();
+            self.parallel_mark_cycles.fetch_add(1, Ordering::Relaxed);
             // `off_head_children` is this loop's `wild_skipped` under another
             // name — the engine's own doc says so.
             wild_skipped = stats.off_heap_children as usize;
@@ -7790,6 +7823,8 @@ impl GarbageCollector for ZgcRealHeap {
             let live_now: Vec<usize> = self.registry.snapshot().bases();
             let (moved, reclaimed, map) = self.relocate_stw(&live_now);
             if moved > 0 {
+                self.compaction_cycles.fetch_add(1, Ordering::Relaxed);
+                self.objects_relocated.fetch_add(moved, Ordering::Relaxed);
                 for r in roots.iter_mut() {
                     if let Some(to) = map.get(&(r.as_ptr() as usize)) {
                         // SAFETY: `to` is an object base this slide just wrote,
