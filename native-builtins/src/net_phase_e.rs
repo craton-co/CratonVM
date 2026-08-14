@@ -3374,10 +3374,18 @@ fn register_uri_natives(r: &mut NativeMethodRegistry) {
             };
             return Ok(Some(host));
         }
-        // No authority section in the raw string → fall back to an explicit host
-        // slot set during construction. Slot 1 is OUR model's `host`; on a real
-        // `java.net.URI` it is `fragment`, so ask before reading it, and prefer
-        // the real class's own `host` field when the receiver has one.
+        // No authority section in the raw string. java.net.URI parses the host
+        // ONLY out of an authority, so there is no host here -- MEASURED
+        // 2026-08-13 (/tmp/U.java): `mailto:a@b.com`.getHost() and
+        // `a/b`.getHost() are both null on HotSpot, and this fallback answered
+        // "mailto:a@b.com" and "a" respectively by reading a slot that means
+        // something else on a real receiver. Keep the fallback ONLY when we
+        // could not obtain a raw string at all, which is the synthetic-model
+        // case it was written for.
+        if !raw.is_empty() {
+            return Ok(Some(Value::Object(None)));
+        }
+        // Fall back to an explicit host slot set during construction.
         if uri_has_synthetic_layout(ctx, this) {
             if let Value::Object(Some(s)) = ctx.get_field(this, 1) {
                 if let Some(v) = ctx.read_string(s) {

@@ -17947,6 +17947,18 @@ pub fn register_essential_natives_with_shims(
         "(Ljava/util/logging/Level;Ljava/lang/String;)V",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
+            // JDK 25 ends this ctor with `sequenceNumber =
+            // globalSequenceNumber.getAndIncrement()`. It was never written, so
+            // MEASURED 2026-08-13 two fresh records both read 0 where HotSpot
+            // reads 0 then 1 -- any consumer ordering or de-duplicating by
+            // sequence saw a single record. Process-global rather than VM-scoped
+            // deliberately: the contract is STRICT INCREASE, which a shared
+            // counter still gives (sparser numbers, never repeated or reordered).
+            static LOG_RECORD_SEQ: std::sync::atomic::AtomicU64 =
+                std::sync::atomic::AtomicU64::new(0);
+            let seq =
+                LOG_RECORD_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed) as i64;
+            ctx.set_field_by_name(this, "sequenceNumber", Value::Long(seq));
             ctx.set_field_by_name(
                 this,
                 "level",

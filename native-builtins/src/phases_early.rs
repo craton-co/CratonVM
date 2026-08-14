@@ -20668,7 +20668,6 @@ pub(crate) fn register_phase54_logging_extras(r: &mut NativeMethodRegistry) {
     // an answer the bytecode would not; this constructor gives a DIFFERENT
     // object. JDK 25's `LogRecord(Level, String)` ends with
     // `needToInferCaller = true` and assigns `sequenceNumber` from
-    // `globalSequenceNumber.getAndIncrement()`. This one writes neither.
     //
     // `needToInferCaller` is the whole defect. Measured under `--jdk-only` with
     // `--add-opens=java.logging/java.util.logging=ALL-UNNAMED`, on a binary
@@ -20688,8 +20687,11 @@ pub(crate) fn register_phase54_logging_extras(r: &mut NativeMethodRegistry) {
     // `Bridge`, and this function's ambient category is `Intrinsic` — so the
     // entry has been INERT the whole time. Under `--jdk-only` the OTHER
     // registration of this triple (native-builtins/src/lib.rs, `Bridge`) is
-    // refused and this one silently owns the slot, which is why retiring that
-    // one measured verdict-neutral: nothing changed because this kept running.
+    // registration of this triple (native-builtins/src/lib.rs, `Bridge`) OWNS
+    // the slot -- MEASURED 2026-08-13 with `--dump-native-registry`:
+    // lib.rs owns=true inv=2, this one owns=false inv=0. The claim that ran
+    // the other way round sent a later fix into THIS dead body, where it
+    // changed nothing. Put LogRecord ctor changes in lib.rs.
     // Fourth instance of the ambient-category defect on this file's JUL rows.
     // W7-56-infercaller-strict.md
     //
