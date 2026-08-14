@@ -2281,8 +2281,14 @@ impl VmHeap {
             // that silently took the serial, non-moving path would otherwise
             // look identical to one that exercised both.
             let (par_cycles, compactions, relocated) = h.feature_engagement();
+            // `driver_passes` is the one field that separates "the worker pool
+            // marked" from "`zgc_concurrent`'s controller drove the cycle":
+            // the pool-only path this replaced produced identical mark bits,
+            // identical stats and an identical `parallel_mark_cycles`.
+            let (driver_passes, mark_fallbacks) = h.driver_engagement();
             eprintln!(
                 "[GC] zgc-features: parallel_mark_cycles={par_cycles} \
+                 driver_passes={driver_passes} mark_fallbacks={mark_fallbacks} \
                  compaction_cycles={compactions} objects_relocated={relocated}"
             );
             let g = h.frag_gauge();

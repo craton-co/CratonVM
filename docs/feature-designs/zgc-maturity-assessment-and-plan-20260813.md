@@ -198,20 +198,24 @@ tell what they are running.
 > | **0** — say what is shipping | **DONE** | none — the exit is a documentation property, and it is met |
 > | **1** — re-establish the baseline | **DONE from existing data** | **MET** — Tomcat 08-11 and the Spring Boot delta-set re-run 08-10 both put ZGC at or above Generational |
 > | **2** — defensible non-compacting | **DONE** (2.1–2.4) | "no suite class OOMs where Generational passes, gauge green over a full Tomcat run" — **DEFERRED** |
-> | **3** — concurrency before relocation | **SUBSTITUTED, not completed** — the mutator ingress is wired and marking is parallel, but *concurrent* marking is not built | Exit has TWO clauses. "`zgc_concurrent`'s coordinator drives a real collection" is a CODE fact and is **NOT MET**: nothing spawns the controller outside tests. "Pause time falls measurably" is the measurement and is **DEFERRED**. See [the concurrent+generational plan](zgc-concurrent-and-generational-plan-20260813.md) |
+> | **3** — concurrency before relocation | **DONE in code** — ingress wired, and `ZgcConcurrentMarkController` now drives every collection | Exit has TWO clauses. "`zgc_concurrent`'s coordinator drives a real collection" — **MET 2026-08-14**: the controller, its restart loop and its mark-end handshake run against `ZgcRealHeap` inside `collect_garbage`, fail-closed on `mark_set_complete`. "Pause time falls measurably" — **MEASURED, AND IT FAILED**: on a 1M-object live set a driven cycle costs +31% pause at one worker and +153% at four, rising monotonically with worker count. The marker is drivable, not parallel; the default is back to the serial loop and C5 of [the follow-on plan](zgc-concurrent-and-generational-plan-20260813.md) owns the fix |
 > | **4** — relocation behind the JIT barrier | **DONE** (barrier seam, read path, stage (a), compaction) | **MET, 4 of 4** — relocation on, JIT on, both suites at parity, heap premium retired. See the per-component table in Phase 4 |
 >
-> **Four of the five phases are complete in code and in exit criterion. Phase 3
-> is not, and the honest word for it is SUBSTITUTED.** Its exit asks for
-> `zgc_concurrent`'s coordinator to drive a real collection; what was built
-> instead is stop-the-world *parallel* marking, which the phase itself did not
-> ask for and which this document proposed mid-implementation as the reachable
-> intermediate. That was a deliberate call — parallel marking needs no barrier,
-> exercises the same engine, and de-risks the concurrent step — but it is a
-> substitution and calling it "done" would be the drift Gap C is about.
-> Concurrency now has its own plan.
+> **All five phases are complete in code. Four are complete in exit criterion
+> too; Phase 3's remaining clause is a measurement that needs a concurrent
+> cycle, not a code gap.**
 >
-> **For the other four:** Two of
+> Phase 3 was recorded as SUBSTITUTED for part of 2026-08-14, because the first
+> adoption used the worker pool via `mark_to_completion` and **bypassed the
+> driver** — same mark bits, same stats, same counters, and the phase's first
+> exit clause ("`zgc_concurrent`'s coordinator drives a real collection") was
+> therefore false while a summary table said the phase was done. It is now
+> true: `ZgcConcurrentMarkController` drives every collection, and
+> `driver_passes` exists precisely because nothing else could tell the two
+> apart. What is still *not* concurrent is the mutator half — the cycle runs at
+> a safepoint — and that is the plan below, not this one.
+>
+> **For all five:** Two of
 > them were met by *fixes* rather than by new measurements — the heap premium,
 > whose one supporting class stopped needing the heap, and Spring Boot parity,
 > whose delta set was re-run on 2026-08-10 after the defects behind it were
@@ -404,15 +408,38 @@ rather than corrupting the heap.
 **Exit:** `zgc_concurrent`'s coordinator drives a real collection; pause time
 falls measurably on a heap with a large live set; no suite regression.
 
-**Status 2026-08-13: SUBSTITUTED. The mutator ingress is built and wired and
-marking is parallel, but the exit criterion's first clause — "`zgc_concurrent`'s
-coordinator drives a real collection" — is NOT met, and that clause is a code
-fact rather than a measurement.** Nothing spawns the controller outside tests.
-What exists instead is stop-the-world *parallel* marking, proposed further down
-this section as the reachable intermediate and then built. Deliberate, and not
-the same thing as done. What follows is what
-was found, because two of this phase's three named blockers turned out not to
-be what the plan described.
+**Status: clause 1 MET 2026-08-14; clause 2 (a pause-time measurement) needs a
+concurrent cycle and is carried into the follow-on plan.**
+
+`ZgcConcurrentMarkController` now drives every ZGC collection against
+`ZgcRealHeap` — its restart loop, its mark-end handshake and its
+`mark_set_complete` verdict, with the single-threaded marker as a fail-closed
+fallback when that verdict is anything but certain.
+
+**How this was wrong for most of a day, and how it was caught.** The first
+adoption called `ZMarkCoordinator::mark_to_completion` directly. That uses the
+worker pool, the striped queues and the termination handshake — but **not the
+driver** — so the restart loop and the mark-end handshake were still bypassed on
+the real heap, and the resulting mark bits, engine stats and
+`parallel_mark_cycles` were *identical* to the driven path. Nothing observable
+distinguished them, so the summary table said "DONE" about a clause that was
+false. `driver_passes` exists for exactly that reason: `passes` is produced
+nowhere but inside `ZgcMarkCycleOutcome`, so it is the one number a pool-only
+path cannot fake.
+
+Two contracts were checked rather than assumed, and both hold *because* the
+cycle is stop-the-world:
+
+* **`ZgcNoMutatorSafepoint` is correct here, not a stub.** Its doc restricts it
+  to "the thread driving the heap is the sole mutator", which is precisely what
+  a `StopTheWorldToken` proves. Nothing to stop, no per-thread buffer to flush.
+  A concurrent cycle needs the real implementation (C1).
+* **`refs: None` is safe here, against the parameter's own warning.** That
+  warning is about a concurrent cycle, where the mark-end safepoint is the only
+  place a complete mark set exists. Here the reference phase is not skipped — it
+  runs immediately afterwards in `collect_garbage`, with its existing INT-8
+  remark re-draining whatever `keep_alive` resurrects. Moving it into the hook
+  is C3 and belongs with C1.
 
 **Blocker 1 (`ZMarkContext` for `ZgcRealHeap`) was already gone.**
 `zgc_concurrent.rs`'s module doc still said "**No `ZMarkContext`
@@ -455,6 +482,14 @@ and not a correctness one, i.e. the right side to be wrong on for a first
 adoption.
 
 **Blocker 3, the real one, is ownership, and the plan does not name it.**
+*(Resolved for a stop-the-world cycle by `ZHeapMarkBridge`, whose soundness
+argument is call-scoped: the coordinator is built and dropped inside one
+`collect_garbage`, `join_cycle` joins the driver thread and
+`ZMarkCoordinator::drop` joins every worker, so no thread holding the bridge
+outlives the `&self` it was built from. **That argument does not extend to a
+concurrent cycle**, where the pool must outlive the safepoint that starts it —
+so C2 below is still owed, and is still the larger of the two.)*
+
 `ZMarkCoordinator::new` takes an `Arc<dyn ZMarkContext>` and spawns persistent
 worker threads. `ZgcRealHeap` is held **by value** inside `VmHeap`, so there is
 no `Arc` to hand it and no safe way to mint one. Every route to adoption goes
