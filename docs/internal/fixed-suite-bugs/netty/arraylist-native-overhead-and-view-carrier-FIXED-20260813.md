@@ -6,7 +6,7 @@ this was filed against passes. What was left over was re-filed as
 and that page closed 11 of its 12 rows the same day: `MapViewBehaviourProbe` is
 byte-identical to HotSpot, and of the ⚠️ rows below only `subList`'s class name
 survives, re-filed narrowly as
-[the subList carrier row](../../../known-issues/arraylist-sublist-carrier-class-20260813.md).
+[the subList carrier row](arraylist-sublist-carrier-class-FIXED-20260814.md) (since closed).
 
 Filed 2026-08-12 as the residual behind netty investigate-batch-03's last
 failure, after the slot-layout memo landed
@@ -142,7 +142,7 @@ to a collision is an offset, not a different class name.
 The row is nevertheless still open, for a reason nobody had stated: registering
 the family on the real class also hands it every `SubList` **java.base's own
 bytecode** builds, which is what `--jdk-only` produces. See
-[the subList carrier row](../../../known-issues/arraylist-sublist-carrier-class-20260813.md).
+[the subList carrier row](arraylist-sublist-carrier-class-FIXED-20260814.md) (since closed).
 
 A values view is different in that it needs no offset at all: it keeps its state in
 ArrayList's own resolved `elementData`/`size` slots, which sit at absolute

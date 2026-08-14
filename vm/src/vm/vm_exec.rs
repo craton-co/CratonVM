@@ -23018,6 +23018,52 @@ fn invoke_on_class_shared_inner(
                                     | "higher"
                                     | "lower"
                             ))
+                        // And the sublist carrier (native-collections'
+                        // `ASL_REAL_CLASS`), whose five fields live past the
+                        // `root`/`parent`/`offset`/`size` the JDK's own
+                        // `SubList` declares. Companion entry in
+                        // native_override::force_native_over_real_jdk_bytecode,
+                        // which carries the reason a receiver test has to sit
+                        // inside every one of those natives.
+                        || (class_name == "java/util/ArrayList$SubList"
+                            && matches!(
+                                method_name,
+                                "size"
+                                    | "isEmpty"
+                                    | "get"
+                                    | "set"
+                                    | "iterator"
+                                    | "listIterator"
+                                    | "toArray"
+                                    | "toString"
+                                    | "contains"
+                                    | "containsAll"
+                                    | "indexOf"
+                                    | "lastIndexOf"
+                                    | "stream"
+                                    | "forEach"
+                                    | "spliterator"
+                                    | "hashCode"
+                                    | "equals"
+                                    | "subList"
+                                    | "add"
+                                    | "remove"
+                                    | "clear"
+                                    | "addAll"
+                                    | "removeIf"
+                                    | "sort"
+                                    | "removeAll"
+                                    | "retainAll"
+                                    | "replaceAll"
+                                    | "parallelStream"
+                                    | "getFirst"
+                                    | "getLast"
+                                    | "addFirst"
+                                    | "addLast"
+                                    | "removeFirst"
+                                    | "removeLast"
+                                    | "reversed"
+                            ))
                         // And the iterator carriers (native-collections'
                         // `MAP_KEY_ITR_CARRIERS`), whose snapshot lives past
                         // the `next`/`current`/`index` fields the JDK's own

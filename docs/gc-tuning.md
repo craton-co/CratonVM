@@ -64,12 +64,16 @@ CratonVM ships three collector backends, selected via `VmConfig::gc_algorithm`
 > See
 > [`docs/known-issues/tomcat/gc-backend-3way-fullsuite-comparison-20260810.md`](known-issues/tomcat/gc-backend-3way-fullsuite-comparison-20260810.md).
 
-> **Two ZGC defaults changed on 2026-08-13, for a gauntlet run.** Marking is
-> now **parallel** at the safepoint (`CRATONVM_ZGC_PARMARK=0` restores serial),
-> and the small-object end of the arena is **compacted** at the end of a
-> collection (`CRATONVM_ZGC_RELOCATE=0` restores non-moving). Both kill
-> switches restore the previous behaviour byte for byte, so either is a
-> re-run rather than a rebuild — which is what makes them usable as a bisect.
+> **One ZGC default changed for the gauntlet, not two.** The small-object end
+> of the arena is now **compacted** at the end of a collection;
+> `CRATONVM_ZGC_RELOCATE=0` restores the non-moving sweep byte for byte, so it
+> is a re-run rather than a rebuild and therefore usable as a bisect.
+>
+> **Parallel marking was flipped on 2026-08-13 and flipped back on 2026-08-14**,
+> by the measurement it should have had first: on a 1M-object live set a driven
+> mark costs **+31% pause at one worker and +153% at four**, rising with the
+> worker count. `CRATONVM_ZGC_PARMARK=<n>` still turns it on for anyone
+> measuring the fix; unset means the serial loop, which is the faster one.
 >
 > **What to watch.** Compaction is the first configuration in which a ZGC cycle
 > returns a **non-empty pointer map**, so every consumer of one now runs for
@@ -80,11 +84,11 @@ CratonVM ships three collector backends, selected via `VmConfig::gc_algorithm`
 > silently-wrong result that disappears under `CRATONVM_ZGC_RELOCATE=0` is that
 > change**, and the flag is the bisect.
 >
-> Turning parallel marking on already found one defect that had been invisible
-> while it was opt-in: the parallel path did not open a mark cycle, so
-> `visit_refs` traced every weak/soft/phantom referent as a strong edge and no
-> reference could be cleared. Fixed, with a test that drives both marking paths
-> through `collect_garbage` and asserts they agree.
+> Turning parallel marking on found two things worth the day it was on. A
+> defect that had been invisible while it was opt-in — the parallel path did
+> not open a mark cycle, so `visit_refs` traced every weak/soft/phantom
+> referent as a strong edge and no reference could be cleared — and then the
+> pause measurement above, which is why it is off again.
 
 ### What is actually shipping, in one place
 
@@ -101,7 +105,7 @@ leaves an operator unable to tell what they are running.
 | How do I switch collector at runtime? | `-XX:+UseGenerationalGC` (or `-XX:-UseZGC`); `-XX:+UseG1GC` for G1. Available in every build | `parse_gc_algorithm`, `vm/src/config.rs` |
 | Does ZGC move objects? | **No.** Non-moving, non-generational, whole-heap stop-the-world mark-sweep over one arena | `ZgcRealHeap::collect_garbage`, `gc/src/zgc.rs` |
 | Does ZGC have TLABs? | **Yes, default-on.** Not through `VmHeap::refill_tlab` (which returns `None` here) but inside the backend. Kill switch `CRATONVM_ZGC_TLAB=0` or `CRATONVM_GC=-zgc-tlab` | `ZgcRealHeap::alloc_raw_tlab`, `gc/src/zgc/tlab.rs` |
-| Is it concurrent, generational or compacting? | **Compacting: YES, on by default since 2026-08-13** (`CRATONVM_ZGC_RELOCATE=0` is the kill switch). **Marking is parallel** at the safepoint by default too (`CRATONVM_ZGC_PARMARK=0` for serial). **Concurrent: NO — not built**, and that is absence rather than a switch: no code path drives a concurrent cycle. **Generational: NO — not built**; page ages, a card barrier and a young scope are computed, but there is no young-only collection | [the concurrent+generational plan](feature-designs/zgc-concurrent-and-generational-plan-20260813.md) |
+| Is it concurrent, generational or compacting? | **Compacting: YES, on by default since 2026-08-13** (`CRATONVM_ZGC_RELOCATE=0` is the kill switch). **Marking is DRIVABLE but serial by default** — the `zgc_concurrent` driver runs the cycle when `CRATONVM_ZGC_PARMARK=<n>` asks, but adding workers currently makes the pause worse, so unset means the serial loop. **Concurrent: NO — the mutators are still stopped.** **Generational: NO — not built**; page ages, a card barrier and a young scope are computed, but there is no young-only collection | [the concurrent+generational plan](feature-designs/zgc-concurrent-and-generational-plan-20260813.md) |
 | What does it cost me? | Headroom. Not compacting means free memory can be plentiful and still too broken up to serve one large array | the sizing notes below |
 
 | Backend | Module | Status | Best for |

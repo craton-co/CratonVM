@@ -4929,12 +4929,25 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
                 0
             };
             let km = if ks_id != 0 {
+                // Slot 2 is the algorithm this factory was created with (see
+                // `KeyManagerFactory.getInstance` above). It decides WHICH
+                // KeyManager class the JDK hands out, and callers branch on
+                // that name — see `km_mirror_class_for_algorithm`.
+                let algorithm = if ctx.object_num_fields(this) > 2 {
+                    match ctx.get_field(this, 2) {
+                        Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
+                        _ => String::new(),
+                    }
+                } else {
+                    String::new()
+                };
+                let mirror = crate::x509_manager::km_mirror_class_for_algorithm(&algorithm);
                 let state = crate::x509_manager::build_key_manager_state(ks_id);
                 let km_id = crate::x509_manager::next_km_id();
                 crate::x509_manager::km_registry()
                     .write()
                     .insert(km_id, state);
-                let km = try_alloc_concurrent_synthetic(ctx, crate::x509_manager::FQN_SUN_X509_KM, 2)?;
+                let km = try_alloc_concurrent_synthetic(ctx, mirror, 2)?;
                 crate::x509_manager::set_km_id(ctx, km, km_id);
                 km
             } else {
