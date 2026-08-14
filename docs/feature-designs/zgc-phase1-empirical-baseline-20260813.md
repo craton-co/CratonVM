@@ -110,6 +110,40 @@ statement is:
 
 ---
 
+## 3b. CORRECTION, later the same day: the Spring Boot answer was in the tree
+
+Section 3 above says Phase 1 "cannot be closed from existing data" and that no
+Spring Boot full-suite run under ZGC exists after 2026-08-08. **The first half
+is wrong and the second is true but irrelevant.**
+
+There is no post-08-08 *full-suite* run. There is something better suited to
+the question: on **2026-08-10**, after the two ZGC-only defects were fixed, the
+**26 classes that were the entire ZGC-vs-default delta** were re-run on one
+binary, `-XX:+UseZGC` vs the default, `-Xmx 2g`, 300s/class.
+
+| arm | PASS | HANG | FAIL |
+|---|---:|---:|---:|
+| **ZGC** | **16** | 7 | 3 |
+| default (Generational) | 14 | 10 | 2 |
+
+The record's own verdict: *"No functional ZGC-vs-default difference is left."*
+Five rows move across the timeout boundary, three of them in ZGC's favour, and
+the one that goes the other way (`BatchJdbcAutoConfigurationTests`) passes on
+both arms when run alone. Raw arms:
+`CratonVM-zgcres-20260809/apps/spring-boot-suite-runner/.suite/results/zgcres-final-{zgc,default}-20260810/`.
+
+**Why this is parity and not a sample.** Those 26 classes are by construction
+the complete set on which the two arms differed in the 1975-class suite; the
+other ~1,949 already agreed. "No difference left across the delta set" is
+therefore a statement about the whole suite.
+
+**What I got wrong, and it is the mistake this very page was written to catch.**
+Section 1 shows `gc-tuning.md` quoting a Tomcat margin its own source had
+superseded the next day. I then did the same thing with 1860-vs-1902 — quoted
+the 08-08 pre-fix figure as the live one, four times, while the run that
+superseded it sat in a sibling worktree's runner folder. Searching for a *new*
+measurement is not the same as asking whether the old one still stands.
+
 ## 4. The plan's own warning cut both ways, in the same table
 
 The maturity plan said: *"If ZGC is not at pass-rate parity with Generational,

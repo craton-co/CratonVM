@@ -1590,6 +1590,63 @@ fn pqc_spi_classes(algo: i32) -> Option<(String, String)> {
     Some((format!("{base}$KPG{suffix}"), format!("{base}$KF{suffix}")))
 }
 
+/// The default parameter set of a PQC UMBRELLA algorithm name, and the prefix
+/// its parameter sets share.
+///
+/// JDK 25 registers `ML-DSA` and `ML-KEM` as real `KeyPairGenerator`
+/// algorithms in their own right — `sun.security.provider.ML_DSA_Impls$KPG` and
+/// `com.sun.crypto.provider.ML_KEM_Impls$KPG`, both `NamedKeyPairGenerator`
+/// subclasses whose parameter set is chosen by
+/// `initialize(NamedParameterSpec)`. `algo_idx` knows only the PARAMETERISED
+/// spellings, so an umbrella request resolved to -1 and fell through
+/// `kpg_generate_key_pair` to its `NoSuchAlgorithmException` tail.
+///
+/// The defaults are measured against HotSpot JDK 25, not assumed: an
+/// uninitialised `KeyPairGenerator.getInstance("ML-DSA")` there produces a
+/// 1974-byte X.509 public key whose `getParams().getName()` is `ML-DSA-65`, and
+/// `("ML-KEM")` produces a 1206-byte key — `ML-KEM-768`. See
+/// `probes/PqcStepProbe.java`, which prints both columns side by side.
+fn pqc_umbrella(name: &str) -> Option<(&'static str, &'static str)> {
+    match name.to_ascii_uppercase().as_str() {
+        "ML-DSA" => Some(("ML-DSA-", "ML-DSA-65")),
+        "ML-KEM" => Some(("ML-KEM-", "ML-KEM-768")),
+        _ => None,
+    }
+}
+
+/// The concrete PQC algorithm index for a generator whose requested name was an
+/// umbrella, or `None` when it was not one.
+///
+/// Prefers the `NamedParameterSpec` a caller passed to `initialize` — netty's
+/// `pkitesting` asks for `ML-DSA` and then initialises with `ML-DSA-44`, which
+/// is exactly the JDK's own contract — and falls back to the parameter set
+/// HotSpot defaults to. The spec's name is only honoured when it belongs to the
+/// requested family, so `initialize(new NamedParameterSpec("ML-KEM-512"))` on an
+/// `ML-DSA` generator does not silently switch algorithms.
+fn resolve_pqc_umbrella(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    base: usize,
+) -> Option<i32> {
+    let requested = get_kpg_name(ctx, this)?;
+    let (prefix, default_name) = pqc_umbrella(&requested)?;
+    let from_spec = match ctx.get_field(this, base + KPG_OFF_SPEC) {
+        Value::Object(Some(spec)) => {
+            match ctx.invoke_virtual(spec, "getName", "()Ljava/lang/String;", &[]) {
+                Ok(Some(Value::Object(Some(s)))) => ctx.read_string(s),
+                _ => None,
+            }
+        }
+        _ => None,
+    };
+    let chosen = match from_spec {
+        Some(n) if n.to_ascii_uppercase().starts_with(prefix) && algo_idx(&n) >= 0 => n,
+        _ => default_name.to_string(),
+    };
+    let idx = algo_idx(&chosen);
+    (idx >= 0).then_some(idx)
+}
+
 /// Drive the real JDK PQC `KeyPairGenerator` SPI: `new KPG<n>()` →
 /// `generateKeyPair()`. `NamedKeyPairGenerator.generateKeyPair()` self-seeds
 /// from `JCAUtil.getDefSecureRandom()` when uninitialized (which works under
@@ -1935,6 +1992,16 @@ fn kpg_generate_key_pair(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     // SunJCE) for a genuine, HotSpot-equivalent keypair. Safe now that the
     // native `SHA3.keccak` override makes SHAKE256 produce real output (without
     // it the JDK lattice keygen yields degenerate all-zero keys).
+    //
+    // An UMBRELLA request (`ML-DSA` / `ML-KEM`, parameter set supplied through
+    // `initialize(NamedParameterSpec)`) resolves here rather than in
+    // `algo_idx`, because the answer depends on this receiver's `initialize`
+    // history and not on the name alone. See `resolve_pqc_umbrella`.
+    let algo = if pqc_spi_classes(algo).is_none() {
+        resolve_pqc_umbrella(ctx, this, base).unwrap_or(algo)
+    } else {
+        algo
+    };
     if crate::route_pqc_to_real() && pqc_spi_classes(algo).is_some() {
         return drive_real_pqc_keypair(ctx, algo);
     }

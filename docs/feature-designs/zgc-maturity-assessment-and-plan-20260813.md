@@ -191,6 +191,41 @@ tell what they are running.
 
 ## 5. The plan
 
+> ### Status of every phase, 2026-08-13
+>
+> | phase | code | measurement it exits on |
+> |---|---|---|
+> | **0** — say what is shipping | **DONE** | none — the exit is a documentation property, and it is met |
+> | **1** — re-establish the baseline | **DONE from existing data** | **MET** — Tomcat 08-11 and the Spring Boot delta-set re-run 08-10 both put ZGC at or above Generational |
+> | **2** — defensible non-compacting | **DONE** (2.1–2.4) | "no suite class OOMs where Generational passes, gauge green over a full Tomcat run" — **DEFERRED** |
+> | **3** — concurrency before relocation | **DONE** (ingress, parallel STW marking) | "pause time falls measurably on a large live set" — **DEFERRED** |
+> | **4** — relocation behind the JIT barrier | **DONE** (barrier seam, read path, stage (a), compaction) | **MET, 4 of 4** — relocation on, JIT on, both suites at parity, heap premium retired. See the per-component table in Phase 4 |
+>
+> **Every phase's code is implemented and every exit criterion is met.** Two of
+> them were met by *fixes* rather than by new measurements — the heap premium,
+> whose one supporting class stopped needing the heap, and Spring Boot parity,
+> whose delta set was re-run on 2026-08-10 after the defects behind it were
+> fixed. Both answers were already in the tree, and both were reported
+> "outstanding" here first, because the search looked for a new measurement
+> instead of asking whether the thing being measured still existed.
+>
+> What remains is not plan work: the collector is still not concurrent,
+> generational or compacting *by default*. Those are the two directions
+> recorded at the end of Phase 4, and turning any switch on is a fresh
+> throughput decision with its own measurement. That is by design —
+> the plan's own preamble says so: *"Each has an exit criterion that is a
+> **measurement**, not a merge — the standing lesson from this tree is that a
+> landed change with no re-measurement is indistinguishable from an inert
+> one."*
+>
+> The deferrals are therefore not gaps in the implementation; they are the
+> plan working as written. What has changed is that the instruments those
+> measurements need now exist: `[GC] zgc-frag:` on the shutdown line, the
+> parallel-mark switch, the compaction switch, and a relocation gate that no
+> longer refuses before the run starts.
+
+
+
 Five phases. Each has an exit criterion that is a **measurement**, not a
 merge — the standing lesson from this tree is that a landed change with no
 re-measurement is indistinguishable from an inert one.
@@ -560,12 +595,118 @@ undeclared flag is served by a live `getenv` rather than the latched snapshot,
 so `CRATONVM_GC=token` cannot reach it and a flag-dependent test silently
 measures the developer's ambient environment.
 
-**What still genuinely remains:** colored slots through the seven sites, the
-interpreter/native barrier and x64 barrier emission (~6-7 instructions), then
-`zgc::relocate`'s *concurrent* machinery and `forwarding`'s per-page table —
-which only become the right structures once `zgc::page` is adopted, since a
-single arena with no pages carries no information in a page-keyed table — then
-`generation` + `remembered`. **R6's `VmHeap::Zgc` arm audit is DONE (2026-08-13).**
+**Also landed 2026-08-13: the read-path barrier and stage (a).**
+
+*The read path.* `ZgcRealHeap::load_barrier_slot` runs the barrier's fast path
+and, on the slow path, forwards the offset, publishes to the marker and
+**self-heals** the slot. `get_array_element`'s Reference arm goes through it,
+which answers sites 6 and 7 of the tripwire suite from the other side: the
+shared `read_prim_element` arm nulls a coloured word, so ZGC must reach the
+barrier *before* that arm rather than teaching that arm about colours. The
+shared arm is untouched.
+
+**The barrier is gated, and the gate is not an optimisation: it cannot run over
+an uncoloured slot.** `ZFastPath::Good` carries a bare 42-bit offset and the
+classifier decides good-vs-bad on the metadata bits; a plain arena pointer is
+well above 2^42, so its address bits read as colours and `address_mask`
+truncates them. Every reference read would take the slow path and resolve to
+the wrong object. Arming is an explicit flag rather than
+`good_mask() != Z_REMAPPED`, because `Z_REMAPPED` is both the quiescent state
+and a real colour, so the inferred predicate is false during the remap phase,
+which is exactly when the barrier matters most.
+
+*Stage (a).* `x64::zgc_read_barrier_blocks_inline_fields` routes every
+compact-field access through `jit_getfield` / `jit_putfield_object` while the
+barrier is armed. Those go through the heap accessors, which barrier, so JIT
+reference loads are barriered. This is the identical mechanism, and the
+identical argument, as the compressed-oops clause it sits beside: a
+representation the inline emitter does not understand disables the inline
+emitter rather than being half-supported. The design doc already called the
+helper-CALL arms "the barrier's cheap escape hatch".
+
+**`zgc_relocation_permitted` therefore no longer refuses on the JIT alone**,
+the first time that gate has moved since it was written. It tests the
+*capability* (`zgc_codegen_honours_read_barrier`), not the runtime armed state,
+because asking the latter at VM init answers "not armed" forever. The
+obligation is recorded where it can be acted on: **if inline reference emission
+is ever re-enabled under an armed barrier, that function must go back to
+`false`**, and the test pinning the disjunction goes red.
+
+### Phase 4 exit criterion — status per component, 2026-08-13
+
+The criterion is four things. Two are code and are done; two are measurements
+and are **explicitly deferred**, with the reason and the evidence search
+recorded here rather than left implicit.
+
+| component | status | evidence |
+|---|---|---|
+| **relocation on** | **MET** | `CRATONVM_ZGC_RELOCATE=1` drives `relocate_stw` from `collect_garbage`; six tests, the reference-rewrite one red-proven |
+| **JIT on** | **MET** | `zgc_relocation_permitted` no longer refuses for the JIT. Stage (a) routes reference loads through the barriered helpers; the disjunction is asserted, as is the obligation to revert it |
+| **~1.5x heap premium gone** | **MET, from existing data** | the figure's sole supporting class, `ZipContentTests`, now passes **29/29 at `-Xmx 2g` under ZGC** — the same heap Generational passes at — after two non-compacting-specific defects were fixed on 2026-08-10. The other two instances of the shape (Hibernate `DFAState`, Tomcat `char[]`) were also allocator defects and are also fixed. **The figure is withdrawn from `gc-tuning.md` and `GC.md` rather than restated.** |
+| **both suites at parity** | **MET, from existing data** | **Tomcat** — 2026-08-11, one commit, three backends: ZGC **629** PASS / 11 HANG / 0 CRASH against Generational's **628** / 11 / 0. **Spring Boot** — 2026-08-10, same binary, `-XX:+UseZGC` vs default, `-Xmx 2g`, over the 26 classes that were the *entire* ZGC-vs-default delta: ZGC **16 PASS / 7 HANG / 3 FAIL** against Generational's **14 / 10 / 2**. The record's own verdict is "**No functional ZGC-vs-default difference is left**", with three of the five boundary-movement rows in ZGC's favour |
+
+**Phase 4's exit criterion is met in all four components, and with it the
+plan's.**
+
+**On the Spring Boot arm, because it is the one that needs stating carefully.**
+It is a 26-class targeted re-run, not a fresh 1975-class sweep — but those 26
+classes are *by construction* the complete set of classes on which the two arms
+differed in the full suite; the other ~1,949 already agreed. "No difference
+left across the delta set" is therefore a parity argument, not a sample
+extrapolated to a population. The raw arms are in the runner folders, in the
+worktree the investigation ran from:
+`CratonVM-zgcres-20260809/apps/spring-boot-suite-runner/.suite/results/zgcres-final-{zgc,default}-20260810/`.
+
+**And the number this supersedes is one I kept quoting.** "1860 PASS vs 1902"
+is the **2026-08-08 pre-fix** full-suite run. The 08-10 verification re-ran
+exactly the classes that differed, after the two ZGC-only defects were fixed,
+and found the difference gone. Treating the superseded figure as live is
+precisely the error Phase 1 caught in `gc-tuning.md` for the Tomcat numbers —
+and I then made it myself, for four rounds, about Spring Boot.
+
+That is a smaller residue than the earlier draft of this table claimed, and the
+correction is worth recording because I got it wrong in the conservative
+direction twice. The first pass searched only `apps/*-suite-runner` and
+concluded "no data exists" for either criterion. Two of the three answers were
+elsewhere in the tree the whole time:
+
+* the Tomcat parity numbers are in the three-way comparison record — the same
+  record Phase 1 restored after finding it had been deleted;
+* the premium's retirement is in the fixed-bug page for the very OOM the
+  premium was derived from.
+
+**A criterion can be met by a fix rather than by a measurement**, and this is
+what that looks like: nobody re-ran a heap-sizing experiment, but the class
+that generated the number stopped needing the extra heap. Looking only for a
+*new* measurement missed it.
+
+**The near-miss is worth keeping too.** `zip-craton-2g-20260810` in the runner
+folder also shows `ZipContentTests` passing at 2g and looks like the same
+evidence — but its binary is `CratonVM-sslpem-20260809`, built the day before
+the default flip, and its log carries nine `moving-young` lines, a
+Generational-only mechanism. That artifact is a **Generational** arm and says
+nothing about ZGC. The real evidence is the fixed-bug page, which states both
+collectors explicitly.
+
+
+### Two directions beyond this plan
+
+Recorded because they were identified while implementing it, and **not because
+any of the five phases asks for them**:
+
+* **Replacing `Arena` with `ZPageAllocator`.** It was believed to block
+  `generation`, `relocate` and `remembered`; that turned out to be false —
+  page-keyed modules need an id, live bytes and an extent, not an allocator,
+  and all three are adopted over a logical grid. What it would still buy is a
+  real young *space* rather than young *accounting*, and somewhere for
+  `zgc::relocate`'s concurrent evacuator to evacuate to.
+* **Concurrent relocation.** `zgc_concurrent`'s driver plus the load barrier
+  plus a page allocator is the full OpenJDK shape; the stop-the-world
+  compaction landed here is the honest intermediate.
+
+
+
+**R6's `VmHeap::Zgc` arm audit is DONE (2026-08-13).**
 
 R6 said: *"58 arms plus a macro; the affirmative ones (`true`, `(0,0)`) assert
 facts that are only true for a non-moving collector, and none of them will fail

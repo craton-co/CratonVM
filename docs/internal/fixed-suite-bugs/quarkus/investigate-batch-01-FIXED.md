@@ -139,11 +139,31 @@ changed blind.
 
 1. **Headroom, not correctness.** ~55 s standalone is still ~3× HotSpot's
    ~17 s, and under six concurrent forks on this shared 8-core host the flat
-   180 s cap is still marginal for these startup-bound classes. The remaining
-   profile is the same SmallRye shape — `ClassLoader.lambda$resources$0` and
-   the `isInClassloader` predicate are together ~39% of interpreted samples —
-   i.e. the enumeration is now lazy but SmallRye still asks for it 1388 times.
-   Not a HANG any more; a per-call cost worth its own page.
+   180 s cap is still marginal for these startup-bound classes.
+
+   **Followed up 2026-08-13, and the obvious next lever was not the answer.**
+   The profile still showed `ClassLoader.lambda$resources$0` and the
+   `isInClassloader` predicate at ~39% of interpreted samples, and a
+   microbenchmark said the enumeration was 40× off HotSpot — 1.20 ms vs
+   0.03 ms — when `anyMatch` matches on element 1, because the scan still ran
+   to the end even though the URLs were built lazily. Making the *scan* lazy
+   too (`ENUM_ELEMENTS_LAZY_SCAN`) took that 1.20 ms to 0.06 ms, a 20×.
+
+   It moved these seven classes **0%**. An interleaved A/B, two rounds per
+   binary per class, came back between −8% and +5% — noise. The reason is in
+   the other half of the same measurement: a call that *consumes* the
+   enumeration costs 20.9 ms here against HotSpot's 11.7 ms, only 1.8×, and
+   this workload's `isInClassloader` calls are overwhelmingly of that kind.
+   1388 calls × ~12 ms is very nearly HotSpot's entire ~17 s runtime, so
+   SmallRye asking 1388 times is the cost, on both VMs, and CratonVM is
+   already within ~2× of HotSpot per call in both shapes.
+
+   So the residual is **not** the enumeration. Whatever is left belongs to
+   ordinary interpretation of the 1843-element stream pipeline, and a page
+   that wants to close it should start from a fresh profile rather than from
+   this one. The lazy scan landed anyway — it is a real 20× on a common shape
+   (`findFirst`/`anyMatch` over `resources()`, and the singular
+   `getResource`), it matches the JDK's own laziness, and it is neutral here.
 2. **The page's repro command names a `--gc` flag `run-quarkus-suite.sh` does
    not accept.** GC variant is selected by `--bin` (a wrapper) alone. Anyone
    copying that command gets the usage text and no run. Corrected in
