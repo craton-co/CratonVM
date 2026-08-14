@@ -108,6 +108,34 @@ const ALGO_EDDSA_GENERIC: i32 = 14;
 // key generation) would hit the exact same `$Legacy` rejection twice and
 // never reach a working factory, so this is `kf_algo_idx`-only too.
 const ALGO_RSASSA_PSS: i32 = 15;
+// Finite-field Diffie-Hellman key AGREEMENT keys, served by SunJCE's
+// `com.sun.crypto.provider.DHKeyPairGenerator`. Unlike every other index here
+// it names no CratonVM-side key material at all: `DH` exists purely so
+// `kpg_can_generate` can admit it and `kpg_generate_key_pair` can route it to
+// the real SPI, whose no-arg constructor already defaults to the JDK's
+// 2048-bit group. `algo_idx` maps both the standard name and the JDK's own
+// `DiffieHellman` registration spelling onto it.
+const ALGO_DH: i32 = 16;
+// The PQC UMBRELLA names, for `KeyFactory` only.
+//
+// `ML-DSA` / `ML-KEM` carry no parameter set, so they cannot map onto any of
+// indices 0..5: the concrete SPI is chosen at import time from the key's own
+// encoding. The JDK solves this by registering a NON-nested factory
+// (`sun.security.provider.ML_DSA_Impls$KF`,
+// `com.sun.crypto.provider.ML_KEM_Impls$KF`) that does exactly that sniff, and
+// driving it is what makes these two names servable rather than merely
+// advertisable — which is the distinction `W7-63-jca-advertise-vs-serve.md`
+// was written about. That record DECLINED the umbrella arm, on the measured
+// ground that the three parameter-set names it would have widened were "partly
+// unusable one accessor in": `KeyFactory.getInstance("ML-DSA-44").getProvider()`
+// raised `NullPointerException: Cannot enter synchronized block because
+// "this.lock" is null`. That objection is answered here, not ignored —
+// `kf_get_provider` is registered in the same change.
+//
+// `KeyPairGenerator` needs no such index: `resolve_pqc_umbrella` picks the
+// parameter set from the receiver's own `initialize` history.
+const ALGO_MLDSA_GENERIC: i32 = 17;
+const ALGO_MLKEM_GENERIC: i32 = 18;
 
 // ---------------------------------------------------------------------------
 // Real-JDK class instance-field counts (number of slots used by the real
@@ -436,6 +464,137 @@ fn drive_real_eddsa_keypair(ctx: &mut dyn NativeContext, algo: i32) -> MethodCal
         }
     };
     ctx.invoke_virtual(spi, "generateKeyPair", "()Ljava/security/KeyPair;", &[])
+}
+
+/// Replay this receiver's `initialize(...)` onto a freshly built real SPI, then
+/// generate.
+///
+/// The synthetic `KeyPairGenerator` records what `initialize` was told and
+/// never forwards it anywhere, because the algorithms that existed when it was
+/// written either ignore it (EdDSA) or are served by Rust (RSA). An SPI-driven
+/// algorithm has to be told, or `kpg.initialize(new NamedParameterSpec("X448"))`
+/// on an `XDH` generator silently produces an X25519 key and `kpg.initialize(1024)`
+/// on a `DH` generator silently produces a 2048-bit one — a wrong answer that
+/// reports success, which is the shape this whole page exists to remove.
+///
+/// `KPG_OFF_STATE` is the "`initialize` was called" latch, so an untouched
+/// generator forwards nothing and the SPI's own constructor default stands —
+/// which is what HotSpot does for a generator nobody initialised.
+fn replay_kpg_initialize(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    spi: ObjectRef,
+    base: usize,
+) -> Result<(), MethodCallFailed> {
+    let initialized = matches!(ctx.get_field(this, base + KPG_OFF_STATE), Value::Int(1));
+    if !initialized {
+        return Ok(());
+    }
+    // A stashed spec is the stronger statement — it pins a curve or a group —
+    // so it wins over the key size, exactly as the JDK's two `initialize`
+    // overloads do (the last call wins, and a spec call stores both).
+    if let Value::Object(Some(spec)) = ctx.get_field(this, base + KPG_OFF_SPEC) {
+        ctx.invoke_virtual(
+            spi,
+            "initialize",
+            "(Ljava/security/spec/AlgorithmParameterSpec;Ljava/security/SecureRandom;)V",
+            &[Value::Object(Some(spec)), Value::Object(None)],
+        )?;
+        return Ok(());
+    }
+    let bits = get_kpg_keysize(ctx, this)
+        .filter(|n| *n > 0)
+        .or_else(|| match ctx.get_field(this, base + KPG_OFF_KEYSIZE) {
+            Value::Int(n) if n > 0 => Some(n),
+            _ => None,
+        });
+    if let Some(bits) = bits {
+        ctx.invoke_virtual(
+            spi,
+            "initialize",
+            "(ILjava/security/SecureRandom;)V",
+            &[Value::Int(bits), Value::Object(None)],
+        )?;
+    }
+    Ok(())
+}
+
+/// `X25519` / `X448` / `XDH` — SunEC's `XDHKeyPairGenerator` family.
+fn drive_real_xdh_keypair(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    algo: i32,
+    base: usize,
+) -> MethodCallResult {
+    let spi_class = match xdh_kpg_spi_class(algo) {
+        Some(c) => c,
+        None => unreachable!("XDH route called for a non-XDH algorithm"),
+    };
+    drive_spi_keypair(ctx, this, spi_class, base)
+}
+
+/// `DH` — SunJCE's `DHKeyPairGenerator`.
+///
+/// Its no-arg constructor already calls `initialize(2048, null)`, so an
+/// uninitialised generator produces the same 2048-bit group HotSpot's does.
+fn drive_real_dh_keypair(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    base: usize,
+) -> MethodCallResult {
+    drive_spi_keypair(ctx, this, "com/sun/crypto/provider/DHKeyPairGenerator", base)
+}
+
+/// Build `spi_class`, replay this receiver's `initialize`, and generate.
+///
+/// GC-SAFETY: `new_object_initialized` and the replayed `initialize` both
+/// allocate, and `this` is a bare Rust local across them. Pin it and read it
+/// back before every use — the SPI is read back through its own pin for the
+/// same reason.
+fn drive_spi_keypair(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    spi_class: &str,
+    base: usize,
+) -> MethodCallResult {
+    let this_pin = ctx.pin_native_root(this);
+    let spi = match ctx.new_object_initialized(spi_class, "()V", &[]) {
+        Ok(Some(Value::Object(Some(o)))) => o,
+        Ok(_) => {
+            ctx.unpin_native_roots(this_pin);
+            return Err(RuntimeError::NotImplemented {
+                feature: spi_class.into(),
+            }
+            .into());
+        }
+        Err(e) => {
+            ctx.unpin_native_roots(this_pin);
+            return Err(e);
+        }
+    };
+    let spi_pin = ctx.pin_native_root(spi);
+    let this = ctx.read_native_pin(this_pin, this);
+    let spi = ctx.read_native_pin(spi_pin, spi);
+    if let Err(e) = replay_kpg_initialize(ctx, this, spi, base) {
+        ctx.unpin_native_roots(this_pin);
+        return Err(e);
+    }
+    let spi = ctx.read_native_pin(spi_pin, spi);
+    ctx.unpin_native_roots(this_pin);
+    // Fail CLOSED if the SPI produced no key. `invoke_virtual` answering
+    // `None` means the provider bytecode was not there to run (the unit-test
+    // mock, or an image without that provider), and returning it would hand
+    // Java a null `KeyPair` from a method that declares none — success
+    // reported for a keygen that never happened, which is the
+    // no-synthetic-stubs rule `drive_real_pqc_keyfactory` states for the
+    // import side.
+    match ctx.invoke_virtual(spi, "generateKeyPair", "()Ljava/security/KeyPair;", &[])? {
+        Some(Value::Object(Some(kp))) => Ok(Some(Value::Object(Some(kp)))),
+        _ => Err(throw_no_such_algorithm(
+            ctx,
+            &format!("{spi_class} produced no KeyPair"),
+        )),
+    }
 }
 
 /// Return the curve-specific JDK EdDSA `KeyFactorySpi` implementation for an
@@ -1399,7 +1558,20 @@ fn algo_idx(name: &str) -> i32 {
         "ED25519" | "EDDSA" => ALGO_ED25519,
         "ED448" => ALGO_ED448,
         "X25519" => ALGO_X25519,
+        // The other two XDH curves, and the umbrella. These used to stop at
+        // `X25519` because nothing downstream could generate them; they are
+        // here now that `kpg_generate_key_pair` drives the real
+        // `sun.security.ec.XDHKeyPairGenerator` family. `XDH` shares
+        // `kf_algo_idx`'s sentinel rather than getting a second one — both mean
+        // "curve not pinned by the name", and for KEY GENERATION the JDK's own
+        // non-nested SPI resolves that to its `DEFAULT_PARAM_SPEC` (X25519),
+        // exactly as `Signature`/`KeyFactory` resolve it by sniffing the spec.
+        "X448" => ALGO_X448,
+        "XDH" => ALGO_XDH_GENERIC,
         "DSA" | "DSS" => ALGO_DSA,
+        // `DiffieHellman` is the name SunJCE registers the service under; `DH`
+        // is the one every caller types.
+        "DH" | "DIFFIEHELLMAN" => ALGO_DH,
         _ => -1,
     }
 }
@@ -1422,6 +1594,9 @@ fn algo_name(idx: i32) -> &'static str {
         ALGO_EDDSA_GENERIC => "EdDSA",
         ALGO_RSASSA_PSS => "RSASSA-PSS",
         ALGO_DSA => "DSA",
+        ALGO_DH => "DH",
+        ALGO_MLDSA_GENERIC => "ML-DSA",
+        ALGO_MLKEM_GENERIC => "ML-KEM",
         _ => "Unknown",
     }
 }
@@ -1440,8 +1615,76 @@ fn kf_algo_idx(name: &str) -> i32 {
         "EDDSA" => ALGO_EDDSA_GENERIC,
         "X25519" => ALGO_X25519,
         "X448" => ALGO_X448,
+        // The two PQC umbrellas, served since 2026-08-14 by the JDK's own
+        // non-nested factories — see `pqc_umbrella_keyfactory_class`.
+        "ML-DSA" => ALGO_MLDSA_GENERIC,
+        "ML-KEM" => ALGO_MLKEM_GENERIC,
         _ => algo_idx(name),
     }
+}
+
+/// The real `KeyFactorySpi` class for a name whose SPI is not reachable through
+/// [`pqc_spi_classes`] (which is keyed on parameter set) or the RSA/EC/EdDSA/XDH
+/// routes.
+///
+/// Deliberately a SEPARATE table rather than two more `pqc_spi_classes` arms:
+/// that function answers for `KeyPairGenerator` too, and `kpg_can_generate` /
+/// `kpg_generate_key_pair` both test `pqc_spi_classes(idx).is_some()`. Widening
+/// it would silently claim a generator for an index that has none.
+fn pqc_umbrella_keyfactory_class(algo: i32) -> Option<&'static str> {
+    match algo {
+        ALGO_MLDSA_GENERIC => Some("sun/security/provider/ML_DSA_Impls$KF"),
+        ALGO_MLKEM_GENERIC => Some("com/sun/crypto/provider/ML_KEM_Impls$KF"),
+        ALGO_DH => Some("com/sun/crypto/provider/DHKeyFactory"),
+        _ => None,
+    }
+}
+
+/// The JDK provider that serves `algo` for `KeyFactory.getProvider()`.
+///
+/// Read off HotSpot JDK 25 with `probes/JcaGetInstanceProbe.java`, which prints
+/// `getProvider().getName()` per engine and algorithm. The split is not
+/// derivable from the family: `ML-DSA` is `SUN` while `ML-KEM` is `SunJCE`, and
+/// `DH` is `SunJCE` while `DSA` is `SUN`.
+fn kf_provider_name(algo: i32) -> Option<&'static str> {
+    match algo {
+        ALGO_RSA | ALGO_RSASSA_PSS => Some("SunRsaSign"),
+        ALGO_EC | ALGO_ED25519 | ALGO_ED448 | ALGO_EDDSA_GENERIC => Some("SunEC"),
+        ALGO_X25519 | ALGO_X448 | ALGO_XDH_GENERIC => Some("SunEC"),
+        ALGO_DSA => Some("SUN"),
+        // ML-DSA-44/65/87 and the umbrella.
+        3..=5 => Some("SUN"),
+        ALGO_MLDSA_GENERIC => Some("SUN"),
+        // ML-KEM-512/768/1024 and the umbrella, plus finite-field DH.
+        0..=2 => Some("SunJCE"),
+        ALGO_MLKEM_GENERIC | ALGO_DH => Some("SunJCE"),
+        _ => None,
+    }
+}
+
+/// `KeyFactory.getProvider()`.
+///
+/// Nothing was registered for it, so the call reached the real JDK body — which
+/// opens `synchronized (lock)` on a field the synthetic receiver's constructor
+/// never wrote. Every `KeyFactory` this VM produced therefore THREW
+/// `NullPointerException: Cannot enter synchronized block because "this.lock"
+/// is null` from a plain accessor, which `probes/JcaGetInstanceProbe` records
+/// as `provider=?`. Exactly the species `skf_algo_table` documents for
+/// `SecretKeyFactory` and `kpg_get_provider` fixed for `KeyPairGenerator`.
+fn kf_get_provider(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = this_arg(args)?;
+    let base = synthetic_base_offset(ctx, "java/security/KeyFactory");
+    let algo =
+        get_kf_algo(ctx, this).unwrap_or_else(|| match ctx.get_field(this, base + KF_OFF_ALGO) {
+            Value::Int(i) => i,
+            _ => -1,
+        });
+    // A factory can only exist for a name `kf_algo_idx` mapped, so the fallback
+    // is unreachable in practice; `SUN` is the JDK's own default provider and
+    // the least surprising answer if it ever is reached.
+    let name = kf_provider_name(algo).unwrap_or("SUN");
+    let p = crate::jca::make_named_provider(ctx, name)?;
+    Ok(Some(Value::Object(Some(p))))
 }
 
 /// Whether `KeyFactory.getInstance` will hand back a receiver for `name` —
@@ -1457,6 +1700,16 @@ fn kf_algo_idx(name: &str) -> i32 {
 /// W7-63-jca-advertise-vs-serve.md.
 pub(crate) fn get_instance_offers(name: &str) -> bool {
     kf_algo_idx(name) >= 0
+}
+
+/// The same question for `KeyPairGenerator`, without a provider argument.
+///
+/// Exposed for `provider_chain`'s `every_kpg_algorithm_this_vm_serves_is_advertised`,
+/// which owns the seed lists and asserts the pairing in BOTH directions —
+/// advertised names must be serviceable, and served names must be advertised,
+/// because `Security.getProviders(filter)` reads only the registry.
+pub(crate) fn kpg_get_instance_offers(name: &str) -> bool {
+    kpg_can_generate(name)
 }
 
 fn alloc_byte_array(ctx: &mut dyn NativeContext, bytes: &[u8]) -> ObjectRef {
@@ -1701,7 +1954,12 @@ fn drive_real_pqc_keyfactory(
 ) -> MethodCallResult {
     let kf_class = match pqc_spi_classes(algo) {
         Some((_, kf)) => kf,
-        None => return Err(throw_invalid_key_spec(ctx, "not a post-quantum algorithm")),
+        // The umbrella names and finite-field DH resolve here instead: their
+        // SPI is keyed on the ALGORITHM, not on a parameter set.
+        None => match pqc_umbrella_keyfactory_class(algo) {
+            Some(c) => c.to_string(),
+            None => return Err(throw_invalid_key_spec(ctx, "not a post-quantum algorithm")),
+        },
     };
     let spec_pin = ctx.pin_native_root(spec);
     let spi = match ctx.new_object_initialized(&kf_class, "()V", &[]) {
@@ -1797,17 +2055,24 @@ fn kpg_serviceable(alg: &str, provider_name: &str) -> bool {
 ///   that throws on use, with the caller's provider fallback skipped.
 ///
 /// Measured with `probes/KpgEndToEnd.java`, which prints `getInstance` and
-/// `generateKeyPair` per algorithm on both VMs. Deliberately EXCLUDED because
-/// `generateKeyPair` throws for them today: `X25519`, `X448`, `XDH`, `DH`,
-/// `SLH-DSA`. HotSpot serves all five, so each is a real gap — but refusing
-/// them here is strictly better than the generator-that-cannot-generate this
-/// function replaces, because it lets a caller reach BouncyCastle, which
-/// implements every one of them.
+/// `generateKeyPair` per algorithm on both VMs. `X25519`/`X448`/`XDH` and `DH`
+/// were excluded here until 2026-08-14 and are now served — each by the same
+/// real JDK SPI HotSpot's own provider registers for it, so the two VMs run
+/// identical bytecode for the key material. `SLH-DSA` is the one row of that
+/// group still excluded: JDK 25 registers no SLH-DSA `KeyPairGenerator` at
+/// all, so HotSpot refuses it too. Refusing what cannot be generated remains
+/// strictly better than the generator-that-cannot-generate this function
+/// replaces, because it lets a caller reach BouncyCastle.
 fn kpg_can_generate(alg: &str) -> bool {
     let idx = algo_idx(alg);
     // The real-keygen branches: RSA (and RSASSA-PSS, which shares RSA key
     // material), EC/ECDSA, DSA, and Ed25519/Ed448/EdDSA via the real SunEC SPI.
     if matches!(idx, ALGO_RSA | ALGO_EC | ALGO_DSA | ALGO_ED25519 | ALGO_ED448) {
+        return true;
+    }
+    // The XDH family and finite-field DH, each through the real provider SPI
+    // `drive_real_xdh_keypair` / `drive_real_dh_keypair` construct.
+    if xdh_kpg_spi_class(idx).is_some() || idx == ALGO_DH {
         return true;
     }
     // The parameterised PQC names, driven through the real JDK 25 SPI.
@@ -1839,8 +2104,31 @@ fn kpg_provider_name(alg: &str) -> Option<&'static str> {
     match algo_idx(alg) {
         // RSASSA-PSS shares RSA key material and RSA's provider.
         ALGO_RSA => Some("SunRsaSign"),
+        // SunEC registers the whole EC/EdDSA/XDH surface, umbrella names
+        // included (`KeyPairGenerator.XDH -> sun.security.ec.XDHKeyPairGenerator`).
         ALGO_EC | ALGO_ED25519 | ALGO_ED448 => Some("SunEC"),
+        ALGO_X25519 | ALGO_X448 | ALGO_XDH_GENERIC => Some("SunEC"),
         ALGO_DSA => Some("SUN"),
+        // Finite-field DH is SunJCE's, not SUN's — the split is not guessable
+        // and this one was read off HotSpot with the same probe as the rest.
+        ALGO_DH => Some("SunJCE"),
+        _ => None,
+    }
+}
+
+/// The real `KeyPairGeneratorSpi` class SunEC registers for an XDH algorithm.
+///
+/// The curve-specific names get the nested subclasses; the umbrella `XDH` gets
+/// the NON-nested base, whose `DEFAULT_PARAM_SPEC` is X25519 — which is why
+/// HotSpot's `XDH` and `X25519` rows produce the same 44-byte public key in
+/// `probes/KpgEndToEnd`. Mapping `XDH` onto `$X25519` would generate the same
+/// bytes while reporting the wrong `getAlgorithm()`, so it maps onto what the
+/// provider actually registers.
+fn xdh_kpg_spi_class(algo: i32) -> Option<&'static str> {
+    match algo {
+        ALGO_X25519 => Some("sun/security/ec/XDHKeyPairGenerator$X25519"),
+        ALGO_X448 => Some("sun/security/ec/XDHKeyPairGenerator$X448"),
+        ALGO_XDH_GENERIC => Some("sun/security/ec/XDHKeyPairGenerator"),
         _ => None,
     }
 }
@@ -2146,6 +2434,18 @@ fn kpg_generate_key_pair(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         return drive_real_eddsa_keypair(ctx, algo);
     }
 
+    // The XDH family (X25519 / X448 / the XDH umbrella) and finite-field DH,
+    // through the same provider SPI HotSpot registers for each. Both take the
+    // receiver, because both honour an `initialize(...)` the caller already
+    // made: an XDH `NamedParameterSpec` pins the curve for the umbrella name,
+    // and a DH key size selects the group.
+    if xdh_kpg_spi_class(algo).is_some() {
+        return drive_real_xdh_keypair(ctx, this, algo, base);
+    }
+    if algo == ALGO_DH {
+        return drive_real_dh_keypair(ctx, this, base);
+    }
+
     // ML-DSA / ML-KEM: drive the real JDK 25 PQC KeyPairGenerator SPI (SUN /
     // SunJCE) for a genuine, HotSpot-equivalent keypair. Safe now that the
     // native `SHA3.keccak` override makes SHAKE256 produce real output (without
@@ -2164,11 +2464,11 @@ fn kpg_generate_key_pair(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         return drive_real_pqc_keypair(ctx, algo);
     }
 
-    // Recognised but not implemented (Ed25519, X25519, an unknown name, or PQC
-    // with routing disabled). Real key generation is unavailable, so honour the
-    // JDK contract and throw `NoSuchAlgorithmException` rather than minting a
-    // KeyPair with empty key material (no-synthetic-stubs policy). RSA and EC
-    // returned above with real keys.
+    // Recognised but not implemented (an unknown name, or PQC with routing
+    // disabled). Real key generation is unavailable, so honour the JDK contract
+    // and throw `NoSuchAlgorithmException` rather than minting a KeyPair with
+    // empty key material (no-synthetic-stubs policy). RSA and EC returned above
+    // with real keys, as do EdDSA, XDH and DH through their provider SPIs.
     let requested = get_kpg_name(ctx, this).unwrap_or_else(|| algo_name(algo).to_string());
     Err(throw_no_such_algorithm(
         ctx,
@@ -2448,6 +2748,25 @@ fn kf_generate_public(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         }
     }
 
+    // The PQC UMBRELLA names and finite-field DH: one SPI per algorithm rather
+    // than per parameter set, so they carry their own table. Gated on the same
+    // switch, because `ML_DSA_Impls$KF` is the same provider code
+    // `route_pqc_to_real` governs — except DH, which is not PQC at all and is
+    // governed by nothing else.
+    if pqc_umbrella_keyfactory_class(algo).is_some()
+        && (algo == ALGO_DH || crate::route_pqc_to_real())
+    {
+        if let Some(Value::Object(Some(spec))) = args.get(1) {
+            return drive_real_pqc_keyfactory(
+                ctx,
+                algo,
+                *spec,
+                "engineGeneratePublic",
+                "Ljava/security/PublicKey;",
+            );
+        }
+    }
+
     // ML-DSA / ML-KEM: drive the real JDK 25 PQC KeyFactory SPI over the
     // X509EncodedKeySpec → real public key (keycloak AKP JWK parsing path).
     if crate::route_pqc_to_real() && pqc_spi_classes(algo).is_some() {
@@ -2565,6 +2884,22 @@ fn kf_generate_private(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
             return r;
         }
     }
+    // The PQC UMBRELLA names and finite-field DH — see the matching arm in
+    // `kf_generate_public`.
+    if pqc_umbrella_keyfactory_class(algo).is_some()
+        && (algo == ALGO_DH || crate::route_pqc_to_real())
+    {
+        if let Some(Value::Object(Some(spec))) = args.get(1) {
+            return drive_real_pqc_keyfactory(
+                ctx,
+                algo,
+                *spec,
+                "engineGeneratePrivate",
+                "Ljava/security/PrivateKey;",
+            );
+        }
+    }
+
     // ML-DSA / ML-KEM: drive the real JDK 25 PQC KeyFactory SPI over the
     // PKCS8EncodedKeySpec → real private key.
     if crate::route_pqc_to_real() && pqc_spi_classes(algo).is_some() {
@@ -3140,6 +3475,7 @@ pub fn register(r: &mut NativeMethodRegistry) {
         kf_generate_private,
     );
     r.register(kf, "getAlgorithm", "()Ljava/lang/String;", kf_get_algorithm);
+    r.register(kf, "getProvider", "()Ljava/security/Provider;", kf_get_provider);
     r.register(
         kf,
         "translateKey",
@@ -3285,10 +3621,16 @@ mod tests {
             "RSA", "RSASSA-PSS", "EC", "ECDSA", "DSA", "Ed25519", "Ed448", "EdDSA",
             "ML-DSA-44", "ML-DSA-65", "ML-DSA-87", "ML-KEM-512", "ML-KEM-768",
             "ML-KEM-1024", "ML-DSA", "ML-KEM",
+            // Served since 2026-08-14, each through the provider SPI HotSpot
+            // registers for it (`xdh_kpg_spi_class` / `DHKeyPairGenerator`).
+            "X25519", "X448", "XDH", "x25519", "DH", "DiffieHellman",
         ] {
             assert!(super::kpg_can_generate(alg), "{alg} must be serviceable");
         }
-        for alg in ["X25519", "X448", "XDH", "DH", "SLH-DSA", "TOTALLY-BOGUS-ALG", ""] {
+        // `SLH-DSA` stays refused because JDK 25 registers no SLH-DSA
+        // `KeyPairGenerator` either — HotSpot's own answer for it is
+        // `NoSuchAlgorithmException`.
+        for alg in ["SLH-DSA", "TOTALLY-BOGUS-ALG", ""] {
             assert!(
                 !super::kpg_can_generate(alg),
                 "{alg}: generateKeyPair throws for it, so getInstance must refuse it"
@@ -3316,6 +3658,11 @@ mod tests {
         assert_eq!(algo_idx("RSASSA-PSS"), ALGO_RSA);
         assert_eq!(algo_idx("DSA"), ALGO_DSA);
         assert_eq!(algo_idx("DSS"), ALGO_DSA);
+        assert_eq!(algo_idx("X25519"), ALGO_X25519);
+        assert_eq!(algo_idx("X448"), ALGO_X448);
+        assert_eq!(algo_idx("XDH"), ALGO_XDH_GENERIC);
+        assert_eq!(algo_idx("DH"), ALGO_DH);
+        assert_eq!(algo_idx("DiffieHellman"), ALGO_DH);
         assert_eq!(algo_idx("Garbage"), -1);
     }
 
@@ -3332,6 +3679,44 @@ mod tests {
         assert_eq!(algo_name(ALGO_XDH_GENERIC), "XDH");
         assert_eq!(algo_name(ALGO_EDDSA_GENERIC), "EdDSA");
         assert_eq!(algo_name(ALGO_RSASSA_PSS), "RSASSA-PSS");
+        assert_eq!(algo_name(ALGO_DH), "DH");
+    }
+
+    /// The XDH `KeyPairGenerator` SPI split, which is NOT the same shape as
+    /// [`xdh_keyfactory_spi_class`]: SunEC registers a generator for the
+    /// umbrella name too, and it is the non-nested base class.
+    #[test]
+    fn xdh_keypairgenerator_spi_classes_include_the_umbrella() {
+        assert_eq!(
+            xdh_kpg_spi_class(ALGO_X25519),
+            Some("sun/security/ec/XDHKeyPairGenerator$X25519")
+        );
+        assert_eq!(
+            xdh_kpg_spi_class(ALGO_X448),
+            Some("sun/security/ec/XDHKeyPairGenerator$X448")
+        );
+        assert_eq!(
+            xdh_kpg_spi_class(ALGO_XDH_GENERIC),
+            Some("sun/security/ec/XDHKeyPairGenerator")
+        );
+        assert_eq!(xdh_kpg_spi_class(ALGO_EC), None);
+        assert_eq!(xdh_kpg_spi_class(ALGO_DH), None);
+    }
+
+    /// Every newly-served `KeyPairGenerator` algorithm names the provider
+    /// HotSpot names for it — read off JDK 25 with
+    /// `probes/JcaGetInstanceProbe.java`, where the SunEC/SunJCE split is not
+    /// guessable from the algorithm family.
+    #[test]
+    fn newly_served_kpg_algorithms_name_their_hotspot_provider() {
+        for (alg, provider) in [
+            ("X25519", "SunEC"),
+            ("X448", "SunEC"),
+            ("XDH", "SunEC"),
+            ("DH", "SunJCE"),
+        ] {
+            assert_eq!(kpg_provider_name(alg), Some(provider), "{alg}");
+        }
     }
 
     /// `KeyFactory`'s algorithm resolution deliberately diverges from the
@@ -3354,6 +3739,70 @@ mod tests {
         assert_eq!(kf_algo_idx("RSA"), ALGO_RSA);
         assert_eq!(kf_algo_idx("EC"), ALGO_EC);
         assert_eq!(kf_algo_idx("Garbage"), -1);
+        // The two PQC umbrellas are KeyFactory-only indices: the shared table
+        // has no arm for either name, because `KeyPairGenerator` resolves them
+        // from the receiver rather than from the string.
+        assert_eq!(kf_algo_idx("ML-DSA"), ALGO_MLDSA_GENERIC);
+        assert_eq!(kf_algo_idx("ML-KEM"), ALGO_MLKEM_GENERIC);
+        assert_eq!(algo_idx("ML-DSA"), -1);
+        assert_eq!(algo_idx("ML-KEM"), -1);
+    }
+
+    /// Every name `kf_get_instance` accepts has a provider to report and an SPI
+    /// to reach. The pairing is the whole point: the residual this closes was
+    /// `getInstance` succeeding and `getProvider()` throwing one call later.
+    #[test]
+    fn every_serviceable_key_factory_name_has_a_provider() {
+        for (alg, provider) in [
+            ("RSA", "SunRsaSign"),
+            ("RSASSA-PSS", "SunRsaSign"),
+            ("EC", "SunEC"),
+            ("Ed25519", "SunEC"),
+            ("Ed448", "SunEC"),
+            ("EdDSA", "SunEC"),
+            ("X25519", "SunEC"),
+            ("X448", "SunEC"),
+            ("XDH", "SunEC"),
+            ("DSA", "SUN"),
+            ("ML-DSA", "SUN"),
+            ("ML-DSA-44", "SUN"),
+            ("ML-DSA-65", "SUN"),
+            ("ML-DSA-87", "SUN"),
+            ("ML-KEM", "SunJCE"),
+            ("ML-KEM-512", "SunJCE"),
+            ("ML-KEM-768", "SunJCE"),
+            ("ML-KEM-1024", "SunJCE"),
+            ("DH", "SunJCE"),
+        ] {
+            let idx = kf_algo_idx(alg);
+            assert!(idx >= 0, "{alg} must be serviceable");
+            assert_eq!(kf_provider_name(idx), Some(provider), "{alg}");
+            assert!(get_instance_offers(alg), "{alg}");
+        }
+        assert_eq!(kf_provider_name(-1), None);
+    }
+
+    /// The umbrella / DH factories name the JDK's own non-nested SPI, and the
+    /// table stays SEPARATE from `pqc_spi_classes` — widening that one would
+    /// make `kpg_can_generate` claim a generator these indices do not have.
+    #[test]
+    fn pqc_umbrella_keyfactory_classes_are_separate_from_the_generator_table() {
+        assert_eq!(
+            pqc_umbrella_keyfactory_class(ALGO_MLDSA_GENERIC),
+            Some("sun/security/provider/ML_DSA_Impls$KF")
+        );
+        assert_eq!(
+            pqc_umbrella_keyfactory_class(ALGO_MLKEM_GENERIC),
+            Some("com/sun/crypto/provider/ML_KEM_Impls$KF")
+        );
+        assert_eq!(
+            pqc_umbrella_keyfactory_class(ALGO_DH),
+            Some("com/sun/crypto/provider/DHKeyFactory")
+        );
+        assert!(pqc_spi_classes(ALGO_MLDSA_GENERIC).is_none());
+        assert!(pqc_spi_classes(ALGO_MLKEM_GENERIC).is_none());
+        assert!(pqc_spi_classes(ALGO_DH).is_none());
+        assert!(!kpg_can_generate("ML-DSA-not-a-name"));
     }
 
     #[test]
@@ -3514,7 +3963,11 @@ mod tests {
     /// caller's provider fallback unreachable — see `kpg_serviceable`.
     #[test]
     fn keypairgenerator_refuses_what_it_cannot_generate() {
-        for algo in ["X25519", "X448", "XDH", "DH", "SLH-DSA", "Totally-Bogus"] {
+        // `X25519`/`X448`/`XDH`/`DH` left this list on 2026-08-14: they are now
+        // served by the real provider SPIs, and moved to
+        // `unimplemented_algorithm_keygen_throws_not_empty_key`, which is where
+        // "serviceable, but the mock has no SPI to drive" is asserted.
+        for algo in ["SLH-DSA", "Totally-Bogus"] {
             let mut ctx = crate::test_utils::MockNativeContext::new();
             let name = ctx.create_string(algo);
             let err = kpg_get_instance(&mut ctx, &[Value::Object(Some(name))])
@@ -3542,7 +3995,16 @@ mod tests {
         // than return an empty key, which is what this test has always been
         // for. The refusal half moved to
         // `keypairgenerator_refuses_what_it_cannot_generate`.
-        for algo in ["ML-KEM-512", "ML-KEM-768", "ML-DSA-44", "ML-DSA-65"] {
+        for algo in [
+            "ML-KEM-512",
+            "ML-KEM-768",
+            "ML-DSA-44",
+            "ML-DSA-65",
+            "X25519",
+            "X448",
+            "XDH",
+            "DH",
+        ] {
             let mut ctx = crate::test_utils::MockNativeContext::new();
             let name = ctx.create_string(algo);
             let kpg = kpg_get_instance(&mut ctx, &[Value::Object(Some(name))])

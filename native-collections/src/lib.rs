@@ -6618,6 +6618,7 @@ fn register_al_sublist_natives(r: &mut NativeMethodRegistry) {
     // once already.
     register_al_sublist_natives_on(r, ASL_CLASS);
     register_al_sublist_natives_on(r, ASL_REAL_CLASS);
+    register_al_sublist_iterator_natives(r);
 }
 
 /// The whole `subList` surface, on one carrier class.
@@ -6727,17 +6728,21 @@ fn register_al_sublist_natives_on(r: &mut NativeMethodRegistry, c: &str) {
         "(Ljava/util/Collection;)Z",
         |ctx, args| asl_delegate_snapshot(ctx, args, "containsAll", "(Ljava/util/Collection;)Z"),
     );
+    // NOT `asl_delegate_snapshot`: it returned a real `ArrayList$ListItr` over
+    // a snapshot `ArrayList`, whose `set`/`remove`/`add` mutated the COPY and
+    // reported success — three silently-wrong rows of
+    // `probes/SubListBehaviourProbe`. See the `SLI_CLASS` block.
     r.register(
         c,
         "listIterator",
         "()Ljava/util/ListIterator;",
-        |ctx, args| asl_delegate_snapshot(ctx, args, "listIterator", "()Ljava/util/ListIterator;"),
+        native_asl_list_iterator,
     );
     r.register(
         c,
         "listIterator",
         "(I)Ljava/util/ListIterator;",
-        |ctx, args| asl_delegate_snapshot(ctx, args, "listIterator", "(I)Ljava/util/ListIterator;"),
+        native_asl_list_iterator_idx,
     );
     // NOT `asl_delegate_snapshot`: a view of a snapshot reads correctly and
     // writes nowhere. See `native_asl_sub_list`.
@@ -6873,6 +6878,593 @@ fn register_al_sublist_natives_on(r: &mut NativeMethodRegistry, c: &str) {
         });
     }
     r.set_category(__prev_cat);
+}
+
+
+// ---------------------------------------------------------------------------
+// The sublist view's LIVE ListIterator
+// ---------------------------------------------------------------------------
+//
+// WHAT WAS WRONG. `iterator()` snapshotted the slice into an `Object[]` and
+// handed back a real `java.util.Arrays$ArrayItr` over it; `listIterator()` went
+// through `asl_delegate_snapshot`, so it returned a real
+// `java.util.ArrayList$ListItr` over a snapshot `ArrayList`. Both were
+// iterators over a COPY, and `List.subList` is specified as a LIVE VIEW, so
+// seven rows of `probes/SubListBehaviourProbe` were wrong at once:
+//
+//   iter.remove / removeSecond / removeAllViaIterator
+//       `Arrays$ArrayItr` declares no `remove()` at all, so the call reached
+//       `Iterator.remove()`'s throwing default: UnsupportedOperationException
+//       where HotSpot mutates.
+//   iter.removeBeforeNext
+//       the same UOE where HotSpot raises IllegalStateException.
+//   iter.listIterator.set / .remove / .add
+//       `ArrayList$ListItr` HAS working mutators — and they mutated the copy.
+//       Those three reported SUCCESS and changed nothing, which is the
+//       dangerous half: a silent wrong answer on a live-view contract, where
+//       the `Iterator.remove` rows at least threw.
+//
+// WHY A CARRIER AND NOT A ROUTE. A write-through `remove()` can be bolted onto
+// the snapshot iterator — `snapshot_itr_backing_table` already does exactly
+// that for `HashSet`/`TreeSet`/`LinkedList`/`ArrayDeque` — but `set` and `add`
+// cannot: both need the POSITION the iterator is at, in the VIEW's
+// coordinates, and a snapshot iterator's cursor drifts from the view's indices
+// the moment anything is removed. So this is a real iterator over
+// `(view, cursor, lastRet)`, which is what the JDK's own
+// `ArrayList$SubList$1` is, and every method below is that class's body
+// rewritten against this VM's view state.
+//
+// WHY THE JDK'S OWN CLASS IS THE CARRIER. `SubList.iterator()` on HotSpot IS
+// `listIterator()`, so one live iterator serves both entry points and
+// `subList(1,4).iterator().getClass()` stops answering
+// `java.util.Arrays$ArrayItr`. The cost is the receiver-ownership trap the
+// `ASL_REAL_CLASS` carrier hit one level up: wearing a real class means these
+// natives are also handed every `ArrayList$SubList$1` **java.base's own
+// bytecode** built, which is what `--jdk-only` produces (there
+// `ArrayList.subList` is refused, java.base runs its own body, and its
+// iterator is a real one with real state). `sli_base_checked` is the same
+// width test `asl_base_checked` is, for the same reason, and
+// `sli_delegate_foreign` runs the receiver's own bytecode when the answer is
+// "not ours". `probes/SubListBehaviourProbe` on BOTH arms is what proves it.
+//
+// A build with no `java.util.ArrayList$SubList$1` to resolve keeps the
+// snapshot iterators it has always had — `alloc_sli_view` answers `None` and
+// both entry points fall back. That is deliberate and not a second carrier:
+// registering this surface on a `cratonvm/internal/*` name would add ten
+// synthetic stubs and trip `stub_ratchet`, for rows only a synthetic-JDK build
+// could reach, which is the same trade `register_al_sublist_natives` records
+// for the twelve `List` methods it puts on the real carrier only.
+
+/// The JDK's own anonymous `ListIterator` inside `ArrayList$SubList`, and the
+/// class `subList(a, b).iterator().getClass()` answers on HotSpot.
+const SLI_CLASS: &str = "java/util/ArrayList$SubList$1";
+
+/// The sublist view this iterator walks.
+const SLI_FIELD_VIEW: usize = 0;
+/// `nextIndex()`, in the VIEW's coordinates.
+const SLI_FIELD_CURSOR: usize = 1;
+/// The index `next()`/`previous()` last returned, or `-1` — the JDK's `lastRet`,
+/// and the flag `remove()`/`set()` raise `IllegalStateException` on.
+const SLI_FIELD_LASTRET: usize = 2;
+const SLI_NUM_FIELDS: usize = 3;
+
+/// Where this iterator's three native fields start: past the carrier's own
+/// declared fields. Exactly [`asl_base`]'s rule, one level down.
+#[inline]
+fn sli_base(ctx: &dyn NativeContext, this: ObjectRef) -> usize {
+    ctx.object_num_fields(this).saturating_sub(SLI_NUM_FIELDS)
+}
+
+/// [`sli_base`], answering `None` for an iterator this VM did not mint.
+///
+/// The receiver-ownership test. A real `ArrayList$SubList$1` that java.base
+/// built is exactly `class_num_total_fields` wide (`cursor`, `lastRet`,
+/// `expectedModCount`, `val$index`, `this$0`) and carries none of this VM's
+/// three; without this, every native below would read `expectedModCount` as
+/// the view and answer for an object it knows nothing about — the silent
+/// wrong answer that withdrew the first attempt at the `ArrayList$SubList`
+/// carrier.
+#[inline]
+fn sli_base_checked(ctx: &dyn NativeContext, this: ObjectRef) -> Option<usize> {
+    let width = ctx.object_num_fields(this);
+    let declared = ctx.class_num_total_fields(ctx.class_id_of_object(this));
+    if width < declared + SLI_NUM_FIELDS {
+        return None;
+    }
+    Some(width - SLI_NUM_FIELDS)
+}
+
+/// Run the receiver's OWN bytecode when it is a `SubList` iterator this VM did
+/// not mint. `None` means the receiver is ours and the caller proceeds.
+fn sli_delegate_foreign(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+    method: &str,
+    descriptor: &str,
+) -> Option<MethodCallResult> {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return None,
+    };
+    if sli_base_checked(&*ctx, this).is_some() {
+        return None;
+    }
+    Some(ctx.invoke_virtual_bytecode_only(this, method, descriptor, &args[1..]))
+}
+
+/// Whether `this` is a live sublist iterator this VM minted.
+///
+/// Used by the interface-level `hasNext`/`next` natives to route deliberately
+/// rather than by accident: their generic fallback would reach these bodies
+/// anyway, through a by-name re-dispatch guarded against shadow recursion, and
+/// an explicit arm is cheaper to read and impossible to lose to a change in
+/// that fallback. Costs nothing on the fast path — it is only consulted after
+/// the "slot 0 holds an `Object[]`" probe has already missed.
+fn is_live_sublist_itr(ctx: &dyn NativeContext, this: ObjectRef, class_name: &str) -> bool {
+    class_name == SLI_CLASS && sli_base_checked(ctx, this).is_some()
+}
+
+/// Allocate a live sublist iterator over `view`, positioned at `index`.
+///
+/// `None` when this image has no real `java.util.ArrayList$SubList$1` — the
+/// caller then keeps the snapshot iterator it has always returned. The resolved
+/// NAME is checked, not just `Ok`, for the same reason `alloc_asl_view` checks
+/// it: `ensure_class_initialized` can report success having fabricated a
+/// stand-in, and a fabricated carrier is exactly what must not be minted here.
+fn alloc_sli_view(
+    ctx: &mut dyn NativeContext,
+    view: ObjectRef,
+    index: i32,
+) -> Option<ObjectRef> {
+    let cid = ctx.ensure_class_initialized(SLI_CLASS).ok()?;
+    if ctx.class_name_arc_of_id(cid).as_deref() != Some(SLI_CLASS) {
+        return None;
+    }
+    let n = ctx.class_num_total_fields(cid) + SLI_NUM_FIELDS;
+    // GC-SAFETY: `alloc_object` collects, and `view` is a bare Rust local the
+    // collector cannot see. Root it across the allocation and read both halves
+    // back through their pins before the stores — the contract
+    // `alloc_real_snapshot_iterator_of` documents, and what `gc_native_pins`
+    // covers.
+    let view_pin = ctx.pin_native_root(view);
+    let itr = ctx.alloc_object(cid, n);
+    let itr_pin = ctx.pin_native_root(itr);
+    let itr = ctx.read_native_pin(itr_pin, itr);
+    let view = ctx.read_native_pin(view_pin, view);
+    let base = n - SLI_NUM_FIELDS;
+    ctx.set_field(itr, base + SLI_FIELD_VIEW, Value::Object(Some(view)));
+    let itr = ctx.read_native_pin(itr_pin, itr);
+    ctx.set_field(itr, base + SLI_FIELD_CURSOR, Value::Int(index));
+    let itr = ctx.read_native_pin(itr_pin, itr);
+    // Explicit, not left to whatever `alloc_object` zero-initialises an
+    // undeclared slot to: `lastRet` MUST start at -1, and W7-1's `lastRet` was
+    // exactly this hazard — an int-zero read as a meaningful value, which here
+    // would make `remove()` before any `next()` delete element 0 instead of
+    // raising `IllegalStateException`.
+    ctx.set_field(itr, base + SLI_FIELD_LASTRET, Value::Int(-1));
+    let itr = ctx.read_native_pin(itr_pin, itr);
+    ctx.unpin_native_roots(view_pin);
+    Some(itr)
+}
+
+/// Read `(view, cursor, lastRet)`.
+fn sli_state(ctx: &dyn NativeContext, this: ObjectRef) -> Option<(ObjectRef, i32, i32)> {
+    let base = sli_base_checked(ctx, this)?;
+    let view = match ctx.get_field(this, base + SLI_FIELD_VIEW) {
+        Value::Object(Some(v)) => v,
+        _ => return None,
+    };
+    let cursor = match ctx.get_field(this, base + SLI_FIELD_CURSOR) {
+        Value::Int(c) => c,
+        _ => 0,
+    };
+    let last_ret = match ctx.get_field(this, base + SLI_FIELD_LASTRET) {
+        Value::Int(l) => l,
+        _ => -1,
+    };
+    Some((view, cursor, last_ret))
+}
+
+fn sli_set_cursor(ctx: &mut dyn NativeContext, this: ObjectRef, cursor: i32, last_ret: i32) {
+    let base = sli_base(ctx, this);
+    ctx.set_field(this, base + SLI_FIELD_CURSOR, Value::Int(cursor));
+    ctx.set_field(this, base + SLI_FIELD_LASTRET, Value::Int(last_ret));
+}
+
+/// The view's current `size()`, which also runs the comodification check —
+/// so a parent mutated behind the view's back fails here exactly as it does
+/// through any other accessor.
+fn sli_view_size(
+    ctx: &mut dyn NativeContext,
+    view: ObjectRef,
+) -> Result<i32, MethodCallFailed> {
+    match native_asl_size(ctx, &[Value::Object(Some(view))])? {
+        Some(Value::Int(n)) => Ok(n),
+        _ => Ok(0),
+    }
+}
+
+/// `new IllegalStateException()` — with NO message, which is what
+/// `ArrayList$SubList$1.remove()`/`set()` throw.
+///
+/// The message is load-bearing here in the negative: `RuntimeError::IllegalStateException`
+/// always carries one (`Some(message.as_str())`), so routing through it prints
+/// `java.lang.IllegalStateException: remove` where HotSpot prints
+/// `java.lang.IllegalStateException` — `Throwable.toString()` omits the suffix
+/// only for a NULL message, and `iter.removeBeforeNext` measures exactly that
+/// line. `Iterator.remove()`'s throwing DEFAULT does carry `"remove"`, which is
+/// why the snapshot iterator's version keeps it; this is the other exception,
+/// from the other class, and it is bare.
+fn sli_illegal_state(ctx: &mut dyn NativeContext) -> MethodCallFailed {
+    if let Ok(Some(Value::Object(Some(exc)))) =
+        ctx.new_object_initialized("java/lang/IllegalStateException", "()V", &[])
+    {
+        return MethodCallFailed::ExceptionThrown(exc);
+    }
+    // An image with no `java.lang.IllegalStateException` to build cannot
+    // happen, but a wrong message beats no exception.
+    cratonvm_types::error::RuntimeError::IllegalStateException {
+        message: "remove".to_string(),
+    }
+    .into()
+}
+
+fn native_sli_has_next(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    if let Some(r) = sli_delegate_foreign(ctx, args, "hasNext", "()Z") {
+        return r;
+    }
+    let Some((view, cursor, _)) = args
+        .first()
+        .and_then(|v| match v {
+            Value::Object(Some(o)) => Some(*o),
+            _ => None,
+        })
+        .and_then(|this| sli_state(&*ctx, this))
+    else {
+        return Ok(Some(Value::Int(0)));
+    };
+    let size = sli_view_size(ctx, view)?;
+    Ok(Some(Value::Int(i32::from(cursor != size))))
+}
+
+fn native_sli_next(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    if let Some(r) = sli_delegate_foreign(ctx, args, "next", "()Ljava/lang/Object;") {
+        return r;
+    }
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let Some((view, cursor, _)) = sli_state(&*ctx, this) else {
+        return Ok(Some(Value::Object(None)));
+    };
+    let size = sli_view_size(ctx, view)?;
+    if cursor >= size {
+        return Err(cratonvm_types::error::RuntimeError::NoSuchElementException {
+            message: String::new(),
+        }
+        .into());
+    }
+    let v = native_asl_get(ctx, &[Value::Object(Some(view)), Value::Int(cursor)])?
+        .unwrap_or(Value::Object(None));
+    sli_set_cursor(ctx, this, cursor + 1, cursor);
+    Ok(Some(v))
+}
+
+fn native_sli_has_previous(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    if let Some(r) = sli_delegate_foreign(ctx, args, "hasPrevious", "()Z") {
+        return r;
+    }
+    let Some((_, cursor, _)) = args
+        .first()
+        .and_then(|v| match v {
+            Value::Object(Some(o)) => Some(*o),
+            _ => None,
+        })
+        .and_then(|this| sli_state(&*ctx, this))
+    else {
+        return Ok(Some(Value::Int(0)));
+    };
+    Ok(Some(Value::Int(i32::from(cursor != 0))))
+}
+
+fn native_sli_previous(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    if let Some(r) = sli_delegate_foreign(ctx, args, "previous", "()Ljava/lang/Object;") {
+        return r;
+    }
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let Some((view, cursor, _)) = sli_state(&*ctx, this) else {
+        return Ok(Some(Value::Object(None)));
+    };
+    if cursor <= 0 {
+        return Err(cratonvm_types::error::RuntimeError::NoSuchElementException {
+            message: String::new(),
+        }
+        .into());
+    }
+    let i = cursor - 1;
+    let v = native_asl_get(ctx, &[Value::Object(Some(view)), Value::Int(i)])?
+        .unwrap_or(Value::Object(None));
+    sli_set_cursor(ctx, this, i, i);
+    Ok(Some(v))
+}
+
+fn native_sli_next_index(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    if let Some(r) = sli_delegate_foreign(ctx, args, "nextIndex", "()I") {
+        return r;
+    }
+    let cursor = args
+        .first()
+        .and_then(|v| match v {
+            Value::Object(Some(o)) => Some(*o),
+            _ => None,
+        })
+        .and_then(|this| sli_state(&*ctx, this))
+        .map(|(_, c, _)| c)
+        .unwrap_or(0);
+    Ok(Some(Value::Int(cursor)))
+}
+
+fn native_sli_previous_index(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    if let Some(r) = sli_delegate_foreign(ctx, args, "previousIndex", "()I") {
+        return r;
+    }
+    let cursor = args
+        .first()
+        .and_then(|v| match v {
+            Value::Object(Some(o)) => Some(*o),
+            _ => None,
+        })
+        .and_then(|this| sli_state(&*ctx, this))
+        .map(|(_, c, _)| c)
+        .unwrap_or(0);
+    Ok(Some(Value::Int(cursor - 1)))
+}
+
+/// `remove()` — delete the element `next()`/`previous()` last returned, THROUGH
+/// the view, so the parent list sees it.
+///
+/// Removal is BY INDEX, not by element: a list is positional and may hold
+/// duplicates, and `lastRet` already says which slot. `asl_delegate_mutating`
+/// is the view's own `remove(int)`, so the parent's backing array is rebuilt
+/// and every enclosing view's `size`/`expected` is resynced — which is what
+/// keeps the very next read of the view from raising
+/// `ConcurrentModificationException`.
+fn native_sli_remove(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    if let Some(r) = sli_delegate_foreign(ctx, args, "remove", "()V") {
+        return r;
+    }
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(None),
+    };
+    let Some((view, _cursor, last_ret)) = sli_state(&*ctx, this) else {
+        return Ok(None);
+    };
+    if last_ret < 0 {
+        return Err(sli_illegal_state(ctx));
+    }
+    // GC-SAFETY: the delegate allocates (a snapshot list, a replacement backing
+    // array) and can dispatch Java, so the iterator can move under us. Root it
+    // and read it back before the bookkeeping write.
+    let this_pin = ctx.pin_native_root(this);
+    let r = asl_delegate_mutating(
+        ctx,
+        &[Value::Object(Some(view)), Value::Int(last_ret)],
+        "remove",
+        "(I)Ljava/lang/Object;",
+    );
+    let this = ctx.read_native_pin(this_pin, this);
+    ctx.unpin_native_roots(this_pin);
+    r?;
+    // The JDK's `cursor = lastRet; lastRet = -1`: the elements after the hole
+    // shift down by one, so the next `next()` must re-read the slot just
+    // vacated. `iter.removeAllViaIterator` is the row that catches getting
+    // this wrong — it removes index 0 three times in a row.
+    sli_set_cursor(ctx, this, last_ret, -1);
+    Ok(None)
+}
+
+/// `set(E)` — overwrite the element last returned, through the view.
+fn native_sli_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    if let Some(r) = sli_delegate_foreign(ctx, args, "set", "(Ljava/lang/Object;)V") {
+        return r;
+    }
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(None),
+    };
+    let Some((view, _cursor, last_ret)) = sli_state(&*ctx, this) else {
+        return Ok(None);
+    };
+    if last_ret < 0 {
+        return Err(sli_illegal_state(ctx));
+    }
+    let value = args.get(1).copied().unwrap_or(Value::Object(None));
+    native_asl_set(
+        ctx,
+        &[Value::Object(Some(view)), Value::Int(last_ret), value],
+    )?;
+    // `set` does not disturb the cursor and does not clear `lastRet` — the JDK
+    // allows `set` twice in a row, and only `remove`/`add` reset it.
+    Ok(None)
+}
+
+/// `add(E)` — insert at the cursor, through the view.
+fn native_sli_add(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    if let Some(r) = sli_delegate_foreign(ctx, args, "add", "(Ljava/lang/Object;)V") {
+        return r;
+    }
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(None),
+    };
+    let Some((view, cursor, _)) = sli_state(&*ctx, this) else {
+        return Ok(None);
+    };
+    let value = args.get(1).copied().unwrap_or(Value::Object(None));
+    let this_pin = ctx.pin_native_root(this);
+    let r = asl_delegate_mutating(
+        ctx,
+        &[Value::Object(Some(view)), Value::Int(cursor), value],
+        "add",
+        "(ILjava/lang/Object;)V",
+    );
+    let this = ctx.read_native_pin(this_pin, this);
+    ctx.unpin_native_roots(this_pin);
+    r?;
+    // The JDK's `cursor++; lastRet = -1`: the new element goes BEFORE the one
+    // `next()` would return, so the cursor moves past it, and `add` invalidates
+    // `remove`/`set` exactly as it does on `ArrayList$ListItr`.
+    sli_set_cursor(ctx, this, cursor + 1, -1);
+    Ok(None)
+}
+
+/// `forEachRemaining(Consumer)`.
+///
+/// Registered because the carrier DECLARES it: leaving it to the real body
+/// would run JDK bytecode over `this$0`/`expectedModCount` this VM never fills
+/// — an NPE on a receiver every other method serves correctly, which is the
+/// "a carrier is only as complete as the surface registered on it" rule
+/// `register_al_sublist_natives` records.
+fn native_sli_for_each_remaining(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    if let Some(r) = sli_delegate_foreign(
+        ctx,
+        args,
+        "forEachRemaining",
+        "(Ljava/util/function/Consumer;)V",
+    ) {
+        return r;
+    }
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(None),
+    };
+    let consumer = match args.get(1) {
+        Some(Value::Object(Some(c))) => *c,
+        _ => return Ok(None),
+    };
+    // Bounded by the size read at entry, re-read each round: the consumer can
+    // legally mutate nothing here, but a shrinking view must end the loop
+    // rather than index past it.
+    loop {
+        let Some((view, cursor, _)) = sli_state(&*ctx, this) else {
+            return Ok(None);
+        };
+        let size = sli_view_size(ctx, view)?;
+        if cursor >= size {
+            return Ok(None);
+        }
+        let v = native_asl_get(ctx, &[Value::Object(Some(view)), Value::Int(cursor)])?
+            .unwrap_or(Value::Object(None));
+        sli_set_cursor(ctx, this, cursor + 1, cursor);
+        let this_pin = ctx.pin_native_root(this);
+        let r = ctx.invoke_virtual(
+            consumer,
+            "accept",
+            "(Ljava/lang/Object;)V",
+            &[v],
+        );
+        let this = ctx.read_native_pin(this_pin, this);
+        ctx.unpin_native_roots(this_pin);
+        r?;
+        let _ = this;
+    }
+}
+
+/// The ten `ListIterator` methods `ArrayList$SubList$1` declares.
+///
+/// On the REAL carrier only, and gated by `sli_delegate_foreign` on every one:
+/// the class also names every iterator java.base's own `SubList` bytecode
+/// builds, and those must keep running their own bodies.
+fn register_al_sublist_iterator_natives(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
+    let c = SLI_CLASS;
+    r.register(c, "hasNext", "()Z", native_sli_has_next);
+    r.register(c, "next", "()Ljava/lang/Object;", native_sli_next);
+    r.register(c, "hasPrevious", "()Z", native_sli_has_previous);
+    r.register(c, "previous", "()Ljava/lang/Object;", native_sli_previous);
+    r.register(c, "nextIndex", "()I", native_sli_next_index);
+    r.register(c, "previousIndex", "()I", native_sli_previous_index);
+    r.register(c, "remove", "()V", native_sli_remove);
+    r.register(c, "set", "(Ljava/lang/Object;)V", native_sli_set);
+    r.register(c, "add", "(Ljava/lang/Object;)V", native_sli_add);
+    r.register(
+        c,
+        "forEachRemaining",
+        "(Ljava/util/function/Consumer;)V",
+        native_sli_for_each_remaining,
+    );
+    r.set_category(__prev_cat);
+}
+
+/// `listIterator()` / `listIterator(int)` / `iterator()` for a sublist view.
+///
+/// One body for all three, because on HotSpot they ARE one body:
+/// `ArrayList$SubList.iterator()` is `listIterator()`.
+fn asl_live_list_iterator(
+    ctx: &mut dyn NativeContext,
+    view: ObjectRef,
+    index: i32,
+) -> Option<MethodCallResult> {
+    // Fail the same way every other view accessor does if the parent moved
+    // under us, BEFORE minting an iterator over a stale slice.
+    let size = match asl_state(&*ctx, view) {
+        Some((parent, _, size, expected)) => match asl_check_comod(&*ctx, parent, expected) {
+            Ok(()) => size,
+            Err(e) => return Some(Err(e)),
+        },
+        None => return None,
+    };
+    if index < 0 || index > size {
+        return Some(Err(cratonvm_types::error::RuntimeError::ioobe(format!(
+            "Index: {index}"
+        ))
+        .into()));
+    }
+    alloc_sli_view(ctx, view, index).map(|itr| Ok(Some(Value::Object(Some(itr)))))
+}
+
+fn native_asl_list_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    if let Some(r) = asl_delegate_foreign(ctx, args, "listIterator", "()Ljava/util/ListIterator;") {
+        return r;
+    }
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    if let Some(r) = asl_live_list_iterator(ctx, this, 0) {
+        return r;
+    }
+    // No real `ArrayList$SubList$1` in this image — keep the snapshot
+    // ListIterator this method has always returned.
+    asl_delegate_snapshot(ctx, args, "listIterator", "()Ljava/util/ListIterator;")
+}
+
+fn native_asl_list_iterator_idx(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    if let Some(r) = asl_delegate_foreign(ctx, args, "listIterator", "(I)Ljava/util/ListIterator;")
+    {
+        return r;
+    }
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let index = match args.get(1) {
+        Some(Value::Int(i)) => *i,
+        _ => 0,
+    };
+    if let Some(r) = asl_live_list_iterator(ctx, this, index) {
+        return r;
+    }
+    asl_delegate_snapshot(ctx, args, "listIterator", "(I)Ljava/util/ListIterator;")
 }
 
 fn native_asl_size(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -7061,6 +7653,15 @@ fn native_asl_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
     };
+    // `SubList.iterator()` IS `listIterator()` on HotSpot, and it has to be
+    // here too: a snapshot iterator cannot write through, which is what made
+    // `iter.remove` answer `UnsupportedOperationException` where HotSpot
+    // mutates the parent. See the `SLI_CLASS` block above.
+    if let Some(r) = asl_live_list_iterator(ctx, this, 0) {
+        return r;
+    }
+    // No real `ArrayList$SubList$1` in this image — keep the snapshot iterator
+    // this method has always returned.
     let buf = asl_snapshot(ctx, this)?;
     let len = ctx.array_length(buf);
     // `make_iterator_from_array` already returns a `MethodCallResult`
@@ -39349,6 +39950,13 @@ fn native_snapshot_itr_has_next(ctx: &mut dyn NativeContext, args: &[Value]) -> 
             if let Some((_queue, size, cursor)) = real_inner_itr_state(ctx, this, &cn) {
                 return Ok(Some(Value::Int(if cursor < size { 1 } else { 0 })));
             }
+            // The live sublist iterator, routed DELIBERATELY: the by-name
+            // re-dispatch below would reach the same body, but only by
+            // accident, and only while that fallback keeps working. See
+            // `is_live_sublist_itr`.
+            if is_live_sublist_itr(&*ctx, this, &cn) {
+                return native_sli_has_next(ctx, args);
+            }
             // Any other real iterator: try its concrete `hasNext` bytecode by
             // name, but guard against the shadow-recursion — if dispatch
             // re-finds THIS native (no distinct concrete override) `ctx.invoke`
@@ -39462,6 +40070,9 @@ fn native_snapshot_itr_next(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
                     }
                     .into(),
                 );
+            }
+            if is_live_sublist_itr(&*ctx, this, &cn) {
+                return native_sli_next(ctx, args);
             }
             if !cn.is_empty() && cn != "java/util/Iterator" && cn != "java/util/ListIterator" {
                 // Guard the shadow-recursion (same as hasNext).
@@ -55032,6 +55643,11 @@ fn native_itr_remove_noop(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
             // Answers UOE itself when no backing was recorded, so a genuine
             // snapshot (`Arrays.asList(a).iterator()`) is unaffected.
             "java/util/Arrays$ArrayItr" => return native_snapshot_itr_remove(ctx, args),
+            // The live sublist iterator. `native_sli_remove` screens the
+            // receiver itself (`sli_delegate_foreign`), so an iterator
+            // java.base built keeps running its own `remove()` — which is the
+            // whole reason this arm can name a REAL JDK class at all.
+            SLI_CLASS => return native_sli_remove(ctx, args),
             _ => {}
         }
     }
