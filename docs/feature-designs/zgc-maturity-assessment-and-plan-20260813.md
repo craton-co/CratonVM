@@ -198,10 +198,20 @@ tell what they are running.
 > | **0** — say what is shipping | **DONE** | none — the exit is a documentation property, and it is met |
 > | **1** — re-establish the baseline | **DONE from existing data** | **MET** — Tomcat 08-11 and the Spring Boot delta-set re-run 08-10 both put ZGC at or above Generational |
 > | **2** — defensible non-compacting | **DONE** (2.1–2.4) | "no suite class OOMs where Generational passes, gauge green over a full Tomcat run" — **DEFERRED** |
-> | **3** — concurrency before relocation | **DONE** (ingress, parallel STW marking) | "pause time falls measurably on a large live set" — **DEFERRED** |
+> | **3** — concurrency before relocation | **SUBSTITUTED, not completed** — the mutator ingress is wired and marking is parallel, but *concurrent* marking is not built | Exit has TWO clauses. "`zgc_concurrent`'s coordinator drives a real collection" is a CODE fact and is **NOT MET**: nothing spawns the controller outside tests. "Pause time falls measurably" is the measurement and is **DEFERRED**. See [the concurrent+generational plan](zgc-concurrent-and-generational-plan-20260813.md) |
 > | **4** — relocation behind the JIT barrier | **DONE** (barrier seam, read path, stage (a), compaction) | **MET, 4 of 4** — relocation on, JIT on, both suites at parity, heap premium retired. See the per-component table in Phase 4 |
 >
-> **Every phase's code is implemented and every exit criterion is met.** Two of
+> **Four of the five phases are complete in code and in exit criterion. Phase 3
+> is not, and the honest word for it is SUBSTITUTED.** Its exit asks for
+> `zgc_concurrent`'s coordinator to drive a real collection; what was built
+> instead is stop-the-world *parallel* marking, which the phase itself did not
+> ask for and which this document proposed mid-implementation as the reachable
+> intermediate. That was a deliberate call — parallel marking needs no barrier,
+> exercises the same engine, and de-risks the concurrent step — but it is a
+> substitution and calling it "done" would be the drift Gap C is about.
+> Concurrency now has its own plan.
+>
+> **For the other four:** Two of
 > them were met by *fixes* rather than by new measurements — the heap premium,
 > whose one supporting class stopped needing the heap, and Spring Boot parity,
 > whose delta set was re-run on 2026-08-10 after the defects behind it were
@@ -394,8 +404,13 @@ rather than corrupting the heap.
 **Exit:** `zgc_concurrent`'s coordinator drives a real collection; pause time
 falls measurably on a heap with a large live set; no suite regression.
 
-**Status 2026-08-13: the mutator ingress is built and wired. The exit criterion
-is NOT met — no coordinator drives a real collection.** What follows is what
+**Status 2026-08-13: SUBSTITUTED. The mutator ingress is built and wired and
+marking is parallel, but the exit criterion's first clause — "`zgc_concurrent`'s
+coordinator drives a real collection" — is NOT met, and that clause is a code
+fact rather than a measurement.** Nothing spawns the controller outside tests.
+What exists instead is stop-the-world *parallel* marking, proposed further down
+this section as the reachable intermediate and then built. Deliberate, and not
+the same thing as done. What follows is what
 was found, because two of this phase's three named blockers turned out not to
 be what the plan described.
 

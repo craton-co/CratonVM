@@ -87,11 +87,13 @@ succeed; `generateKeyPair()` is what threw. That distinction matters twice over:
 `getInstance` succeeding is also why netty's BouncyCastle fallback never ran —
 `Algorithms.keyPairGenerator` only falls back when `getInstance` throws.
 
-**Still open, and worth its own page:** `KeyPairGenerator.getInstance` accepts
-*any* algorithm name on CratonVM. `getInstance("TOTALLY-BOGUS-ALG")` returns a
-generator where HotSpot throws `NoSuchAlgorithmException`. Every caller that
-uses a failed `getInstance` to select a provider is silently denied its
-fallback.
+**Filed separately, and since FIXED 2026-08-13**
+([record](keypairgenerator-getinstance-accepts-any-algorithm-FIXED-20260813.md)):
+`KeyPairGenerator.getInstance` accepted *any* algorithm name, so
+`getInstance("TOTALLY-BOGUS-ALG")` returned a generator where HotSpot throws —
+and every caller that uses a failed `getInstance` to select a provider was
+silently denied its fallback. A census run first found exactly one such name in
+the suites (`SLH-DSA`), which is the case where refusing helps.
 
 After the fix, every parameter set matches HotSpot byte-for-byte
 (`probes/PqcStepProbe.java` prints the two columns):

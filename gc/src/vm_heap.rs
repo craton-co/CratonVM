@@ -2277,6 +2277,14 @@ impl VmHeap {
             // subject. Reporting that as a clean score is exactly how a gauge
             // becomes a vacuous green, so the two cases are spelled
             // differently and the reader is told which they have.
+            // Did the 2026-08-13 default-on features engage? A gauntlet run
+            // that silently took the serial, non-moving path would otherwise
+            // look identical to one that exercised both.
+            let (par_cycles, compactions, relocated) = h.feature_engagement();
+            eprintln!(
+                "[GC] zgc-features: parallel_mark_cycles={par_cycles} \
+                 compaction_cycles={compactions} objects_relocated={relocated}"
+            );
             let g = h.frag_gauge();
             match g.worst_permille {
                 Some(worst) => eprintln!(
