@@ -11086,7 +11086,15 @@ fn jdk_interfaces(name: &str) -> &'static [&'static str] {
         // the real `java.util.ArrayList$SubList`, which extends
         // `AbstractList` (itself `implements List`) and separately
         // `implements RandomAccess`.
-        "cratonvm/internal/ArrayListSubList" => &["java/util/List", "java/util/RandomAccess"],
+        // Both sublist carriers. `java/util/ArrayList$SubList` is the class
+        // `alloc_asl_view` mints under whenever the real one resolves; in
+        // synthetic-JDK mode there is no class file for it, so without this arm
+        // the fabricated stub would declare no interfaces and every
+        // `(List) list.subList(..)` would be a ClassCastException — the same
+        // failure this entry's internal twin was added for.
+        "cratonvm/internal/ArrayListSubList" | "java/util/ArrayList$SubList" => {
+            &["java/util/List", "java/util/RandomAccess"]
+        }
         // The object `linkedList.listIterator()` hands back. Same reason as the
         // entry above, as `java/util/ArrayList$ListItr` two entries up, and as
         // `cratonvm/synthetic/Process`: with no arm here it fell to this
@@ -12123,6 +12131,12 @@ fn synthetic_stub_fields(name: &str) -> Vec<cratonvm_reader::field::ClassFileFie
         }],
         "java/util/Collections$EmptyEnumeration" => vec![],
         "java/util/ArrayList$Itr" | "java/util/ArrayList$ListItr" => instance_fields(5),
+        // The real nested class declares `root`/`parent`/`offset`/`size` on top
+        // of `AbstractList.modCount`. Fabricated at that width so
+        // `asl_base_checked`'s "`class_num_total_fields + ASL_NUM_FIELDS`"
+        // comparison means the same thing in synthetic-JDK mode as it does
+        // against the real class file.
+        "java/util/ArrayList$SubList" => instance_fields(5),
         // `Arrays.asList(T...)`'s fixed-size view. The real nested class has
         // exactly one field, `private final E[] a`, and derives `size()` from
         // `a.length` — which is what `native_arrays_as_list` and the

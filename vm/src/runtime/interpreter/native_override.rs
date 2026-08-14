@@ -2570,6 +2570,57 @@ pub(super) fn force_native_over_real_jdk_bytecode(
     ) {
         return true;
     }
+    // And for the sublist carrier (native-collections' `ASL_REAL_CLASS`). A
+    // CratonVM-minted view carries `(parent, offset, size, expected,
+    // viewParent)` PAST the class's own `root`/`parent`/`offset`/`size`
+    // (`asl_base`), so the real bodies would read fields this VM never fills
+    // and report the view empty. Unlike the carriers above, this class is ALSO
+    // instantiated by java.base's own `ArrayList.subList`, and forcing the
+    // native for those would be the mirror-image silent-empty bug — which is
+    // why every `native_asl_*` opens with `asl_delegate_foreign` and hands a
+    // receiver it did not mint straight back to this bytecode.
+    if class_name == "java/util/ArrayList$SubList"
+        && matches!(
+            method_name,
+            "size"
+                | "isEmpty"
+                | "get"
+                | "set"
+                | "iterator"
+                | "listIterator"
+                | "toArray"
+                | "toString"
+                | "contains"
+                | "containsAll"
+                | "indexOf"
+                | "lastIndexOf"
+                | "stream"
+                | "forEach"
+                | "spliterator"
+                | "hashCode"
+                | "equals"
+                | "subList"
+                | "add"
+                | "remove"
+                | "clear"
+                | "addAll"
+                | "removeIf"
+                | "sort"
+                | "removeAll"
+                | "retainAll"
+                | "replaceAll"
+                | "parallelStream"
+                | "getFirst"
+                | "getLast"
+                | "addFirst"
+                | "addLast"
+                | "removeFirst"
+                | "removeLast"
+                | "reversed"
+        )
+    {
+        return true;
+    }
     // And for the iterator carriers (native-collections'
     // `MAP_KEY_ITR_CARRIERS`). A `HashMap$KeyIterator`'s own bytecode walks the
     // `next`/`current`/`index` fields `HashIterator` declares, and a
