@@ -88,9 +88,35 @@ single collection. Each is a released mark-word reference on a live object's
 monitor — a use-after-free reachable from any `synchronized` block, on an object
 chosen by wherever the slide happened to land.
 
-**Fixed** by re-screening `dead` against the post-slide registry before the
-prune. Test: `a_dead_address_a_survivor_slid_into_is_withheld_from_the_monitor_prune`
-(verified red).
+**First fix was wrong, and the suite caught it the same day.** Re-screening
+`dead` against the post-slide registry stopped the collector freeing a live
+object's monitor — and left the *dead* object's entry sitting at that address
+for the survivor to inherit, because `remap_after_gc` RETAINS an entry absent
+from the pointer map. `io.netty.util.ResourceLeakDetectorTest` went from FAIL to
+CRASH on it. The screen fixed one bug and created its mirror image.
+
+**The real fix is ORDER: prune the dead first, then remap the survivors.** With
+the prune running first, every address in `dead` really is a freed base — no
+survivor has been re-keyed onto one yet — which is precisely the precondition
+`prune_dead` documents and which licenses its `release_mark_ref`. The remap then
+moves each survivor into a slot nobody else claims.
+
+Test: `a_survivor_keeps_its_own_monitor_and_never_inherits_a_dead_objects`. It
+models the real table (drain-and-reinsert, retain-if-absent) and asserts the end
+state rather than the call order. Verified red against **both** wrong
+orderings, which is what separates them:
+
+| ordering | outcome |
+|---|---|
+| remap → prune (original) | **169 survivors lost their monitor** |
+| filtered remap → prune (the bad fix) | **83 survivors inherited another object's monitor** |
+| prune → remap (correct) | 0 and 0 |
+
+**The lesson worth keeping** is not "screen the list". It is that two operations
+keyed by the same address space cannot be reasoned about independently once the
+collector moves objects between them: `remap` and `prune` were each correct
+alone and collided only because compaction made a dead base and a live base the
+same number. Fixing the one that noticed first produced a bug in the other.
 
 ---
 

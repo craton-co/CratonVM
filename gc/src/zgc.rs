@@ -8345,54 +8345,35 @@ impl GarbageCollector for ZgcRealHeap {
             }
             pointer_map = map;
         }
-        monitors.remap_after_gc(&pointer_map);
-        // ZGC-3: hand the collector's dead-address list to the registry prune —
-        // reclaims monitor/cas-lock entries and prevents a recycled address
-        // from inheriting a dead object's monitor.
+        // ORDER IS LOAD-BEARING: prune the dead FIRST, then remap survivors.
         //
-        // **RE-SCREENED AGAINST THE POST-SLIDE REGISTRY SINCE 2026-08-14, and
-        // without this the compacting configuration frees a LIVE object's
-        // monitor.** `MonitorCleanup::prune_dead` documents `dead` as EXACT —
-        // "this address was a live allocation base before this collection and
-        // its memory is now freed, so no thread can read its mark word" — and
-        // on that licence it calls `Monitor::release_mark_ref`, dropping the
-        // strong reference the mark word itself owns.
+        // Compaction makes these two operations collide on the same address.
+        // Survivors slide DOWN into space vacated by dead objects, so a dead
+        // base X is very often a survivor L's new base. `remap_after_gc`
+        // drains every shard and re-inserts, RETAINING an entry absent from
+        // the map (correct: an in-place survivor is legitimately absent) — so
+        // a dead object D's entry stays at X while L's entry is re-keyed to X,
+        // and whichever insert lands second wins. Either L loses its monitor,
+        // or L inherits D's, which is the exact thing `prune_dead`'s doc says
+        // must not happen: "a NEW object reusing the address MUST get a fresh
+        // monitor, not the dead object's".
         //
-        // Compaction breaks that precondition in the commonest way there is:
-        // survivors slide DOWN into the space vacated by dead objects, so a
-        // dead base is very likely to be a live object's new base by the time
-        // this runs. `remap_after_gc` has already moved that object's monitor
-        // to its new address, and the unfiltered prune then removes it again
-        // and releases the mark-word reference — leaving the live object's
-        // mark word pointing at a possibly-freed `Monitor`. That is a
-        // use-after-free reachable from any `synchronized` block, on an object
-        // chosen by where the slide happened to put it, which is why it
-        // presents as scattered SIGSEGVs in unrelated subsystems rather than
-        // as a locking bug.
+        // Pruning first removes D's entry while L's is still keyed at its OLD
+        // address, so the remap moves L into a slot nobody else claims. It
+        // also restores `prune_dead`'s documented precondition without any
+        // filtering: at that moment every address in `dead` really is a freed
+        // base, because no survivor has been re-keyed onto one yet — which is
+        // what licenses its `Monitor::release_mark_ref`.
         //
-        // The registry was rebuilt by the slide (old bases removed, new bases
-        // inserted), so `contains` is exactly "this address is a live base
-        // NOW" — which is the predicate `prune_dead`'s doc assumes and the
-        // pre-slide list can no longer supply.
-        let dead: Vec<usize> = if pointer_map.is_empty() {
-            dead
-        } else {
-            let before = dead.len();
-            let screened: Vec<usize> = dead
-                .into_iter()
-                .filter(|d| !self.registry.contains(*d))
-                .collect();
-            let resurrected = before - screened.len();
-            if resurrected > 0 {
-                tracing::debug!(
-                    target: "zgc",
-                    resurrected,
-                    "zgc compaction: dead addresses now occupied by slid survivors,                      withheld from the monitor prune"
-                );
-            }
-            screened
-        };
+        // A first attempt at this (2026-08-14, same day) kept the old order and
+        // screened `dead` against the post-slide registry instead. That stopped
+        // the collector freeing a live object's monitor, and it left D's stale
+        // monitor sitting at X for L to inherit — trading a use-after-free for
+        // a wrong-monitor bug. `io.netty.util.ResourceLeakDetectorTest` went
+        // from FAIL to CRASH on it. Ordering fixes both; screening fixes one
+        // and creates the other.
         monitors.prune_dead(&dead);
+        monitors.remap_after_gc(&pointer_map);
 
         GcResult {
             stats: GcStats {
@@ -10952,59 +10933,85 @@ pub(crate) mod tests {
         );
     }
 
-    /// **A dead address that a survivor slid into must NOT reach the monitor
-    /// prune.**
+    /// **A survivor must keep its OWN monitor, and must never inherit a dead
+    /// object's.**
     ///
-    /// `MonitorCleanup::prune_dead` documents its input as EXACT — the address
-    /// "was a live allocation base before this collection and its memory is
-    /// now freed, so no thread can read its mark word" — and on that licence
-    /// it calls `Monitor::release_mark_ref`, dropping the strong reference the
-    /// object's own mark word owns. Compaction breaks the precondition in the
-    /// commonest way possible: survivors slide DOWN into space vacated by dead
-    /// objects, so a dead base is very likely a LIVE object's base afterwards.
+    /// Compaction makes the prune and the remap collide. Survivors slide DOWN
+    /// into space vacated by dead objects, so a dead base `X` is very often a
+    /// survivor's new base, and `remap_after_gc` RETAINS an entry absent from
+    /// the pointer map (correct on its own terms — an in-place survivor is
+    /// legitimately absent). Run the remap first and the dead object's entry
+    /// is still sitting at `X` when the survivor is re-keyed onto it: one of
+    /// the two wins, so the survivor either loses its monitor or inherits a
+    /// dead one.
     ///
-    /// The consequence is a use-after-free on a live object's monitor, chosen
-    /// by wherever the slide happened to land — which is why it presents as
-    /// scattered SIGSEGVs rather than as a locking bug.
+    /// This models the real table — a map keyed by address, drained and
+    /// re-inserted exactly as `MonitorTable::remap_after_gc` does — and
+    /// asserts the end state rather than the call order, because the call
+    /// order is the mechanism and the end state is the contract.
     ///
-    /// This records exactly what reached `prune_dead` and asserts that nothing
-    /// in it is a live base afterwards. The exact edit that trips it: drop the
-    /// `registry.contains` filter before the `monitors.prune_dead(&dead)` call.
+    /// The exact edit that trips it: swap `prune_dead` and `remap_after_gc`
+    /// back, in either the filtered or the unfiltered form.
     #[test]
-    fn a_dead_address_a_survivor_slid_into_is_withheld_from_the_monitor_prune() {
-        /// Captures the `dead` slice the collector hands the monitor table.
+    fn a_survivor_keeps_its_own_monitor_and_never_inherits_a_dead_objects() {
+        /// A stand-in for `MonitorTable` that models the two operations the
+        /// collector drives, with the same retain-if-absent semantics.
         #[derive(Default)]
-        struct CapturingMonitors {
-            pruned: std::sync::Mutex<Vec<usize>>,
+        struct ModelMonitors {
+            /// address -> monitor identity
+            table: std::sync::Mutex<std::collections::HashMap<usize, u64>>,
         }
-        impl crate::collector::MonitorCleanup for CapturingMonitors {
-            fn remap_after_gc(&self, _map: &cratonvm_types::PointerMap) {}
+        impl crate::collector::MonitorCleanup for ModelMonitors {
+            fn remap_after_gc(&self, map: &cratonvm_types::PointerMap) {
+                let mut t = self.table.lock().unwrap();
+                let drained: Vec<(usize, u64)> = t.drain().collect();
+                for (old, id) in drained {
+                    // Retain-if-absent, exactly as the real table does.
+                    let key = map.get(&old).copied().unwrap_or(old);
+                    t.insert(key, id);
+                }
+            }
             fn prune_dead(&self, dead: &[usize]) {
-                self.pruned.lock().unwrap().extend_from_slice(dead);
+                let mut t = self.table.lock().unwrap();
+                for d in dead {
+                    t.remove(d);
+                }
             }
         }
 
         const PAGE: usize = ZgcRealHeap::Z_LOGICAL_PAGE_BYTES;
-        const FIELDS: usize = 500; // 4016 bytes per object
+        const FIELDS: usize = 500;
         let heap = ZgcRealHeap::with_capacity(64 * 1024 * 1024);
         heap.set_tlab_enabled(false);
 
-        // Two sparse pages so the selector takes both and page 1's survivors
-        // slide down into page 0's freed space — the exact overlap this is
-        // about.
         let per_page = PAGE / (HEADER_SIZE + FIELDS * SLOT_SIZE);
+        let monitors = ModelMonitors::default();
         let mut roots: Vec<ObjectRef> = Vec::new();
-        for _page in 0..4 {
-            for i in 0..per_page {
-                let o = heap.alloc_object(ClassId::new(1), FIELDS);
-                if i % 5 == 0 {
-                    roots.push(o);
+        let mut next_id = 1u64;
+        let mut expect: Vec<(usize, u64)> = Vec::new(); // (pre-GC addr, id) for LIVE
+        let mut dead_ids: Vec<u64> = Vec::new();
+        {
+            let mut t = monitors.table.lock().unwrap();
+            for _page in 0..4 {
+                for i in 0..per_page {
+                    let o = heap.alloc_object(ClassId::new(1), FIELDS);
+                    let addr = o.as_ptr() as usize;
+                    // EVERY object gets a monitor — live and dead alike. That
+                    // is what makes the collision reachable: the dead ones are
+                    // the entries a survivor can inherit.
+                    let id = next_id;
+                    next_id += 1;
+                    t.insert(addr, id);
+                    if i % 5 == 0 {
+                        roots.push(o);
+                        expect.push((addr, id));
+                    } else {
+                        dead_ids.push(id);
+                    }
                 }
             }
         }
-        let pre: Vec<usize> = roots.iter().map(|r| r.as_ptr() as usize).collect();
 
-        let monitors = CapturingMonitors::default();
         // SAFETY: these unit tests run the heap single-threaded.
         let stw = unsafe { StopTheWorldToken::new() };
         cratonvm_types::flags::with_thread_overrides(
@@ -11016,33 +11023,40 @@ pub(crate) mod tests {
 
         let moved = roots
             .iter()
-            .zip(pre.iter())
-            .filter(|(now, was)| now.as_ptr() as usize != **was)
+            .zip(expect.iter())
+            .filter(|(now, (was, _))| now.as_ptr() as usize != *was)
             .count();
         assert!(
             moved > 0,
-            "the fixture must actually relocate something, or this proves nothing"
+            "the fixture must relocate survivors, or the collision cannot arise"
         );
 
-        // THE ASSERTION: nothing handed to the prune may be a live base.
-        let pruned = monitors.pruned.lock().unwrap().clone();
-        let live_now: std::collections::HashSet<usize> =
-            roots.iter().map(|r| r.as_ptr() as usize).collect();
-        let overlap: Vec<usize> = pruned
-            .iter()
-            .copied()
-            .filter(|d| live_now.contains(d))
-            .collect();
-        assert!(
-            overlap.is_empty(),
-            "{} address(es) handed to prune_dead are LIVE object bases after the \
-             slide, e.g. {:#x} — prune_dead releases the mark-word reference on \
-             the strength of them being freed, so this is a use-after-free on a \
-             live object's monitor",
-            overlap.len(),
-            overlap[0]
+        let t = monitors.table.lock().unwrap();
+        let dead_set: std::collections::HashSet<u64> = dead_ids.into_iter().collect();
+        let mut lost = 0usize;
+        let mut inherited = 0usize;
+        for (i, root) in roots.iter().enumerate() {
+            let now = root.as_ptr() as usize;
+            match t.get(&now) {
+                Some(&id) if id == expect[i].1 => {}
+                Some(&id) if dead_set.contains(&id) => inherited += 1,
+                Some(_) => inherited += 1,
+                None => lost += 1,
+            }
+        }
+        assert_eq!(
+            lost, 0,
+            "{lost} survivor(s) lost their monitor: the prune removed an entry \
+             the remap had already re-keyed onto a dead object's address"
+        );
+        assert_eq!(
+            inherited, 0,
+            "{inherited} survivor(s) INHERITED another object's monitor — \
+             `prune_dead`'s contract is that a new occupant of an address must \
+             get a fresh monitor, not the previous tenant's"
         );
     }
+
 
     /// **A JNI-critical-pinned object must not be relocated.**
     ///
