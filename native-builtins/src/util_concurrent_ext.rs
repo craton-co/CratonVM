@@ -7616,6 +7616,38 @@ pub(crate) fn native_sync_collection_to_array(
     }
 }
 
+/// Forward one `Collections$Synchronized{Collection,Set}` method to the wrapped
+/// collection, unchanged.
+///
+/// The named-method stubs above cover the surface the wrapper needed while
+/// `Collections.synchronizedCollection(…)` was its only source. Since
+/// 2026-08-13 `Hashtable`/`Properties` views are wrapped too — the JDK's own
+/// `Hashtable.keySet()` is `Collections.synchronizedSet(new KeySet(), this)`, so
+/// matching `getClass()` means returning the wrapper — and those views are asked
+/// for the whole `Collection` contract (`toString`, `stream`, `forEach`,
+/// `containsAll`, …). In real-JDK mode the class's own bytecode answers all of
+/// it and these are dropped as `SyntheticStub`s; in synthetic-JDK mode they are
+/// the only implementation there is, and a MISSING one is worse than a slow one:
+/// the call falls through to an interface-level native that reads the wrapper as
+/// if it were the collection and reports it EMPTY.
+///
+/// `fallback` is what to answer when the wrapper has no `c` — a shape that
+/// cannot arise from either constructor, so it is chosen per method only to keep
+/// the return type honest rather than to encode behaviour.
+pub(crate) fn sync_collection_delegate(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+    method: &str,
+    descriptor: &str,
+    fallback: Option<Value>,
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    match sync_collection_backing(ctx, this) {
+        Some(c) => ctx.invoke_virtual(c, method, descriptor, &args[1..]),
+        None => Ok(fallback),
+    }
+}
+
 pub(crate) fn native_sync_map_init(
     ctx: &mut dyn NativeContext,
     args: &[Value],

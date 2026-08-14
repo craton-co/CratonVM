@@ -10776,6 +10776,19 @@ fn jdk_superclass(name: &str) -> &'static str {
         | "java/util/Hashtable$ValueCollection"
         | "java/util/concurrent/ConcurrentHashMap$ValuesView" => "java/util/AbstractCollection",
 
+        // The SET-shaped half of the same family (native-collections'
+        // `SET_VIEW_CARRIERS`, plus `TreeMap$KeySet`). Every one of them extends
+        // `AbstractSet` in the real JDK; without the arm the default below would
+        // leave `hashMap.keySet()` outside the Set dispatch chain.
+        "java/util/HashMap$KeySet"
+        | "java/util/HashMap$EntrySet"
+        | "java/util/LinkedHashMap$LinkedKeySet"
+        | "java/util/LinkedHashMap$LinkedEntrySet"
+        | "java/util/Hashtable$KeySet"
+        | "java/util/Hashtable$EntrySet"
+        | "java/util/TreeMap$KeySet"
+        | "java/util/concurrent/ConcurrentHashMap$EntrySetView" => "java/util/AbstractSet",
+
         // Concrete List/Queue hierarchy:
         "java/util/ArrayList" => "java/util/AbstractList",
         "java/util/LinkedList" => "java/util/AbstractSequentialList",
@@ -10896,7 +10909,24 @@ fn jdk_interfaces(name: &str) -> &'static [&'static str] {
         | "java/util/concurrent/ConcurrentHashMap$ValuesView" => {
             &["java/util/Collection", "java/lang/Iterable"]
         }
-        "java/util/TreeMap$EntrySet" => &[
+        "java/util/TreeMap$EntrySet"
+        | "java/util/HashMap$KeySet"
+        | "java/util/HashMap$EntrySet"
+        | "java/util/LinkedHashMap$LinkedKeySet"
+        | "java/util/LinkedHashMap$LinkedEntrySet"
+        | "java/util/Hashtable$KeySet"
+        | "java/util/Hashtable$EntrySet"
+        | "java/util/concurrent/ConcurrentHashMap$EntrySetView" => &[
+            "java/util/Set",
+            "java/util/Collection",
+            "java/lang/Iterable",
+        ],
+        // `TreeMap.keySet()` is declared to return a `NavigableSet`, and the
+        // carrier `native_tm_key_set` mints must satisfy that checkcast — a
+        // plain `Set` here would fail every `(NavigableSet) tm.keySet()`.
+        "java/util/TreeMap$KeySet" => &[
+            "java/util/NavigableSet",
+            "java/util/SortedSet",
             "java/util/Set",
             "java/util/Collection",
             "java/lang/Iterable",
@@ -11030,6 +11060,16 @@ fn jdk_interfaces(name: &str) -> &'static [&'static str] {
         // (WebClientIntegrationTests "[2] JDK", 40 sub-tests).
         "cratonvm/net/HttpBodyReplaySubscription" => &["java/util/concurrent/Flow$Subscription"],
         "java/util/ArrayList$Itr" => &["java/util/Iterator"],
+        // The iterator carriers `native_hs_iterator` mints since 2026-08-13
+        // (native-collections' `MAP_KEY_ITR_CARRIERS`), replacing the fabricated
+        // `java/util/HashMap$KeyItr` no JDK declares. In the real JDK they
+        // implement `Iterator` through `HashMap$HashIterator`; with no class
+        // file the default `_ => &[]` would leave `instanceof Iterator` false
+        // and every `(Iterator) set.iterator()` a ClassCastException.
+        "java/util/HashMap$KeyIterator"
+        | "java/util/HashMap$EntryIterator"
+        | "java/util/LinkedHashMap$LinkedKeyIterator"
+        | "java/util/LinkedHashMap$LinkedEntryIterator" => &["java/util/Iterator"],
         "java/util/ArrayList$ListItr" => &["java/util/ListIterator", "java/util/Iterator"],
         // `ArrayList.subList()`'s backed-view object (native-collections'
         // `ASL_CLASS`, allocated under this internal name rather than the
@@ -16125,7 +16165,36 @@ fn synthetic_stub_ctor_methods(name: &str) -> Vec<ClassFileMethod> {
                 mk("isEmpty", "()Z"),
                 mk("iterator", "()Ljava/util/Iterator;"),
                 mk("toArray", "()[Ljava/lang/Object;"),
+                // The rest of the `Collection` contract. A synchronized wrapper
+                // used to reach this VM only via
+                // `Collections.synchronizedCollection(…)`; since 2026-08-13 it
+                // is also what `Hashtable`/`Properties` hand back for
+                // `keySet()`/`entrySet()`/`values()`, so the full read surface
+                // is exercised. Undeclared here, those calls fall through to an
+                // interface-level native that reads the WRAPPER as the
+                // collection and reports it empty. Bodies:
+                // `util_concurrent_ext::sync_collection_delegate`.
+                mk("clear", "()V"),
+                mk("toString", "()Ljava/lang/String;"),
+                mk("stream", "()Ljava/util/stream/Stream;"),
+                mk("spliterator", "()Ljava/util/Spliterator;"),
+                mk("forEach", "(Ljava/util/function/Consumer;)V"),
+                mk("containsAll", "(Ljava/util/Collection;)Z"),
+                mk("addAll", "(Ljava/util/Collection;)Z"),
+                mk("removeAll", "(Ljava/util/Collection;)Z"),
+                mk("retainAll", "(Ljava/util/Collection;)Z"),
+                mk("removeIf", "(Ljava/util/function/Predicate;)Z"),
+                mk("toArray", "([Ljava/lang/Object;)[Ljava/lang/Object;"),
+                mk(
+                    "toArray",
+                    "(Ljava/util/function/IntFunction;)[Ljava/lang/Object;",
+                ),
             ]);
+            // Only the Set wrapper overrides these in the JDK — see the
+            // registration site for why the Collection wrapper must not.
+            if name == "java/util/Collections$SynchronizedSet" {
+                out.extend([mk("hashCode", "()I"), mk("equals", "(Ljava/lang/Object;)Z")]);
+            }
         }
     }
     if matches!(

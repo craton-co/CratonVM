@@ -1,10 +1,21 @@
 # The VM-wide per-call cost, and why its profile does not convert into time
 
-**Status:** OPEN (2026-08-13). This is what is left of
-[the netty `io.netty.buffer` throughput page](../internal/performance/netty-per-call-throughput-20260813.md)
+**Status:** RETIRED 2026-08-13 — a characterisation, not an open defect. This is
+what was left of
+[the netty `io.netty.buffer` throughput page](netty-per-call-throughput-20260813.md)
 after its netty-specific half was closed. Nothing here is netty: it is the cost
 CratonVM pays on every transfer of control, measured on the netty classes
 because they are the densest call workload in the tree.
+
+The one open item this page carried was §2's lever 2 — "a real fix is one lookup
+per invoke, handed down the chain" — together with the instruction to **get the
+per-invoke lookup COUNT before building it**. That count now exists
+(`CRATONVM_DBG_NATIVE_LOOKUPS=1`), it has been taken, and §2.1 records what it
+says: the divisor is **~4.2**, worth ~1.5% of CPU on a box whose measurement
+floor is ~5%. The lever is real and it is too small to build. With that answered
+nothing here is actionable, so the page moves out of `known-issues` and stays as
+the reference it always was: what the number is, how it was measured, and which
+five hypotheses it rules out.
 
 **Read §3 before optimising anything on this page.** Two changes were made on
 2026-08-13 that removed ~5.5% and ~10% of the attributed profile samples
@@ -94,6 +105,65 @@ there should first get the per-invoke lookup COUNT (there is no counter today;
 `CRATONVM_DBG_DISPATCH_TALLY` gives callees, not lookups per callee), because
 that number, not the profile share, is what a restructuring would divide.
 
+## 2.1 The count, taken — and why the restructuring is not worth building
+
+The counter the paragraph above asks for is `CRATONVM_DBG_NATIVE_LOOKUPS=1`
+(`cratonvm_native_api::registry::lookup_census`), added 2026-08-13. It counts
+both sides — every entry point INTO the registry, and every invoke that reaches
+the two dispatchers those entry points hang off — and prints one line at exit.
+
+`BigEndianHeapByteBufTest`, 414 tests, 44.6 s, real JDK 25:
+
+```text
+[native-lookups exit] lookups=19586621 invokes(general)=4700839
+    find=14487379  find_with_kind=4801400  resolve_id=297842
+    resolve_id_by_key=0  quirks=13225674  invokes(stackless)=89955
+```
+
+`UnpooledTest`, 41 tests, 3.6 s, as a second point:
+
+```text
+[native-lookups exit] lookups=716885 invokes(general)=163574
+    find=443644  find_with_kind=199206  resolve_id=74035
+    resolve_id_by_key=0  quirks=262099  invokes(stackless)=22163
+```
+
+Four things, in the order they matter.
+
+**The divisor is ~4.2, and it is per GENERAL dispatch, not per invoke.**
+19 586 621 / 4 700 839 = **4.17** registry probes per `invoke_or_native` call
+(4.38 on `UnpooledTest`). The page's guess — "the cost is not one lookup per
+invoke, it is *many*" — was right in direction; "many" is four, not ten or fifty.
+
+**`invoke_or_native` is not the majority path.** 4.7 M calls against the 116.8 M
+`jit_entries` §1 measures for the same class: the inline caches serve **96%** of
+transfers, and everything in lever 2 lives in the remaining 4%. This is the
+number that decides the question, and no profile could have produced it —
+`slot_for_exact` samples do not carry their caller.
+
+**So the arithmetic.** 19.6 M lookups per 44.6 s run. Taking 4.2 to 1 removes
+~14.7 M of them; at the ~50 ns a hash-plus-memcmp costs on this box that is
+~0.7 s of 44.6, i.e. **~1.5% of CPU** — and §3's one change that DID pay
+returned a third of what its profile share promised, so the honest expectation is
+lower still. The page's own measurability floor is ~5% at n=10 on this box. A
+restructuring of `invoke_or_native` — the VM's most delicate function, ~1000
+lines of `(class, method, descriptor)` comparison arms, each with its own
+correctness history — cannot be justified by a lever that cannot be measured
+after it lands.
+
+**Two findings for whoever comes back to this anyway.**
+
+* **91% of `find` probes are NEGATIVE.** `quirks=13 225 674` against
+  `find=14 487 379`: nine out of ten lookups pass the class prefilter, miss the
+  exact slot, and enter the `#[cold]` descriptor-rewrite arm — which answers
+  `None` after one backward byte pass. The work is "is there a native for this
+  triple?", asked four times per dispatch, answered `no` almost every time.
+* **`resolve_id_by_key=0`.** The memoized-digest entry point — the one
+  `NativeCallSite` exists to feed, negatives included — is reached **zero** times
+  in either workload. The mechanism that would make a repeated negative free is
+  built and this path never gets to it. That, not the registry's hashing, is
+  where a cheap version of lever 2 would start.
+
 ## 3. What was tried and did NOT convert — read this first
 
 Every one of these removed the work it targeted — the symbols disappear from the
@@ -153,8 +223,13 @@ This box runs many concurrent agents. Anything that needs better than ±20% must
 be ABBA-interleaved, repeated, and measured in CPU time on a fixed workload. A
 ratio against the same method body written in plain Java **in the same process**
 is the one figure immune to load, and is what
-[the ArrayList record](../internal/fixed-suite-bugs/netty/arraylist-native-overhead-and-view-carrier-FIXED-20260813.md)
+[the ArrayList record](../fixed-suite-bugs/netty/arraylist-native-overhead-and-view-carrier-FIXED-20260813.md)
 quotes.
+
+A **count** is immune to load outright, which is why §2.1 is a count and not a
+timing. `CRATONVM_DBG_NATIVE_LOOKUPS=1` costs a contended `fetch_add` per probe
+while it is on — useless for a timing, exactly right for the question it answers,
+and the reason that question could be settled in two runs instead of twenty.
 
 ## 7. Repro
 
@@ -170,4 +245,9 @@ CRATONVM_DBG=jit-scan-prof /usr/bin/time -f "%e s" <cratonvm> \
 
 perf record -F 499 -o p.data -- timeout 120 <cratonvm> … CratonRunner $CLS
 perf report -i p.data --stdio --no-children -g none --percent-limit 0.7
+
+# §2.1 — lookups per dispatch. One line at exit; no perf, no ABBA, no error bar.
+CRATONVM_DBG=native-lookups <cratonvm> --java-home <jdk25> --Xmx 1500m \
+    @common.args -Dcraton.batch=1 CratonRunner io.netty.buffer.BigEndianHeapByteBufTest \
+  2>&1 | grep native-lookups
 ```

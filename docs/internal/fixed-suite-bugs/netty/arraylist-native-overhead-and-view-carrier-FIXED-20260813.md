@@ -1,9 +1,12 @@
 # Collection views were carrier-classed `java.util.ArrayList`, and every ArrayList call paid for it
 
 **Status:** ✅ FIXED 2026-08-13. Both symptoms are closed and the netty class
-this was filed against passes. What is left over is narrower than what this page
-opened with and is re-filed as
-[collection-view carrier residuals](../../../known-issues/collection-view-carrier-residuals-20260813.md).
+this was filed against passes. What was left over was re-filed as
+[collection-view carrier residuals](collection-view-carrier-residuals-FIXED-20260813.md),
+and that page closed 11 of its 12 rows the same day: `MapViewBehaviourProbe` is
+byte-identical to HotSpot, and of the ⚠️ rows below only `subList`'s class name
+survives, re-filed narrowly as
+[the subList carrier row](../../../known-issues/arraylist-sublist-carrier-class-20260813.md).
 
 Filed 2026-08-12 as the residual behind netty investigate-batch-03's last
 failure, after the slot-layout memo landed
@@ -29,7 +32,11 @@ CratonVM fabricated a map's `values()` view as an object whose runtime class was
 | `hashMap.keySet().getClass()` | `java.util.HashMap$KeySet` | `java.util.HashSet` | unchanged ⚠️ |
 | `arrayList.subList(0,2).getClass()` | `java.util.ArrayList$SubList` | `cratonvm.internal.ArrayListSubList` | unchanged ⚠️ |
 
-The ⚠️ rows are the residuals; see the linked page.
+The ⚠️ rows were the residuals. Two of the three closed later the same day —
+`Hashtable`'s views gained the `Collections$Synchronized*` wrapper the JDK
+returns, and the Set-shaped views gained carriers of their own. `subList`'s
+stated reason turned out to be wrong (see the next paragraph) but the row is
+still open for a different, measured reason.
 
 **Symptom 2 — the expensive one — is closed by the same change.** Because a
 plain `java.util.ArrayList` receiver *might* have been a values view,
@@ -123,9 +130,21 @@ exact-class question meaningful in the first place.
 
 ### Why the REAL JDK class names were affordable here
 
-`cratonvm/internal/ArrayListSubList` exists because a `subList` view has its own
+**Read the correction first.** This section says
+`cratonvm/internal/ArrayListSubList` exists because a `subList` view "has its own
 native field layout and could not be laid over the real
-`java.util.ArrayList$SubList`. A values view is different: it keeps its state in
+`java.util.ArrayList$SubList`". The first half is true and the second does not
+follow: a collision at slots 0..4 only rules out writing at slots 0..4. The
+residuals page moved those five fields past the five the JDK class declares and
+`--real-jdk` measured byte-clean that way. The rule is COLLISION, and the answer
+to a collision is an offset, not a different class name.
+
+The row is nevertheless still open, for a reason nobody had stated: registering
+the family on the real class also hands it every `SubList` **java.base's own
+bytecode** builds, which is what `--jdk-only` produces. See
+[the subList carrier row](../../../known-issues/arraylist-sublist-carrier-class-20260813.md).
+
+A values view is different in that it needs no offset at all: it keeps its state in
 ArrayList's own resolved `elementData`/`size` slots, which sit at absolute
 indices 1 and 2 in the real-JDK layout — past the single `this$0` these classes
 declare. Writing there is the undeclared-slot pattern `alloc_key_set_view_object`
@@ -168,7 +187,7 @@ noise.** ~5.5% of attributed samples removed, ~0% of time. (A third attempt, a
 class prefilter on the native-registry lookup, did pay — 4.7% — but only after
 its first cut, which hashed the class name twice on a miss, measured 2.2%
 *slower*.) See
-[the VM-wide per-call page](../../../known-issues/vm-per-call-dispatch-cost-20260813.md)
+[the VM-wide per-call page](../../performance/vm-per-call-dispatch-cost-RETIRED-20260813.md)
 for what the run is actually bound by, and treat a profile percentage on this VM
 as a lead rather than a quantity.
 
