@@ -141,8 +141,52 @@ optimisation, because the mark bit is what dedups them.
 
 Pure throughput; do it after C1–C3 work.
 
+### C5 — Make the marker actually scale *(new 2026-08-14, and it is the one with a number)*
+
+**Adding workers makes the pause WORSE, and even one worker costs.** Measured
+on `probes/BigLive.java` (1,000,088 live objects, `-Xmx1500m`, relocation off),
+three interleaved reps, mean of the last five cycles each:
+
+| workers | mean pause | vs serial |
+|---:|---:|---:|
+| 0 — the bespoke serial loop | **95.2 ms** | — |
+| 1 — driven, one worker | 124.9 ms | **+31%** |
+| 2 | 237.4 ms | +149% |
+| 4 | 240.6 ms | +153% |
+| 8 | ~304 ms | +219% |
+
+Two separate costs are stacked here and they want separate fixes:
+
+* **A fixed ~30% for driving at all**, visible at one worker where no
+  contention can exist. Per-cycle pool and driver-thread spawn, plus the
+  striped-queue path replacing a plain `Vec` work stack.
+* **Contention on top**, which is what makes the curve rise monotonically
+  rather than flatten. A fixed overhead would flatten and then improve as the
+  work divided; this does not. Two candidates, both per-object and both hot:
+  `ZMarkStripeSet` takes a `Mutex` per publish and per steal, and `visit_refs`
+  resolves a class layout per object through the class-manager `RwLock` — a
+  contended reader lock on one cache line does not scale even though it never
+  blocks.
+
+**This is why `Z_PARMARK_DEFAULT_WORKERS` is 0.** The driver stays reachable,
+correct and covered end-to-end by
+`the_concurrent_mark_driver_drives_a_real_collection`; it is simply not what a
+user's pauses pay for until this lands.
+
+**Method note, because it nearly went the other way.** A single un-interleaved
+run of the one-worker arm measured 95.7 ms — free — and a default of `1` was
+briefly justified on it. Three interleaved reps put it at 124.9 ms with a
+spread of 2.7 ms; the original figure was noise on a box that had just finished
+a build. Interleave, or do not compare.
+
+**Exit:** four workers beat zero on the table above. Until then the honest
+statement is that this collector's marking is *drivable*, not *parallel*.
+
 **Exit for Phase C:** pause time falls measurably on a heap with a large live
-set, and no suite regression.
+set, and no suite regression. **Owed by C5 first** — the pause has to stop
+rising with worker count before concurrency can lower it, and C1's concurrent
+phase would otherwise inherit the same contention with mutators running
+alongside it.
 
 ---
 

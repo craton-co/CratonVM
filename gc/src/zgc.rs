@@ -3152,11 +3152,9 @@ impl ZgcRealHeap {
             .unwrap_or(1);
         let requested = match cratonvm_types::flags::runtime_var("CRATONVM_ZGC_PARMARK") {
             Ok(v) => v.trim().parse::<usize>().unwrap_or(0),
-            Err(_) => (cores / 2).clamp(1, 4),
+            Err(_) => Z_PARMARK_DEFAULT_WORKERS,
         };
-        if requested <= 1 {
-            // 0 = explicit kill switch, 1 = a pool of one is strictly worse
-            // than the serial loop (same work, plus a spawn and a join).
+        if requested == 0 {
             return 0;
         }
         // Never more workers than the machine has cores to run them on: this
@@ -5401,6 +5399,41 @@ fn recycled_chunk_size(want: usize, need: usize, largest_low_free: usize) -> Opt
 /// 512 KiB at `-Xmx 2g`, so the chunk is the same 512 KiB it was.
 const ZGC_TLAB_RESERVATION_SHARE: usize = 16;
 
+/// Workers the marking cycle uses when `CRATONVM_ZGC_PARMARK` is unset.
+///
+/// **Zero — the bespoke serial loop — and that is a measurement.**
+///
+/// Phase 3's exit criterion is "pause time falls measurably on a heap with a
+/// large live set". Measured on `probes/BigLive.java` (1,000,088 live objects,
+/// `-Xmx1500m`, relocation off, three interleaved reps, mean of the last five
+/// cycles each):
+///
+/// | workers | mean pause | vs serial |
+/// |---:|---:|---:|
+/// | 0 — this hand-written loop | **95.2 ms** | — |
+/// | 1 — driven, one worker | 124.9 ms | +31% |
+/// | 4 — driven | 240.6 ms | +153% |
+/// | 8 — driven | ~304 ms | +219% |
+///
+/// The criterion is therefore **measured and failed**, in both directions:
+/// adding workers makes the pause worse monotonically (contention, not
+/// start-up cost — a fixed overhead would flatten and then improve), and even
+/// a single-worker driven cycle costs a third of the pause over the loop it
+/// replaces.
+///
+/// **A note on how nearly this shipped wrong.** A single un-interleaved run of
+/// the one-worker arm measured 95.7 ms, i.e. free, and a default of `1` was
+/// briefly justified on it. Three interleaved reps put it at 124.9 ms with a
+/// spread of 2.7 ms — the original number was machine noise on a box that had
+/// just finished a build. Interleave, or do not compare.
+///
+/// The driver is not deleted and Phase 3's other clause still holds: it is
+/// reachable, correct, and exercised end-to-end through `collect_garbage` by
+/// `the_concurrent_mark_driver_drives_a_real_collection`. It is simply not
+/// what a user's pauses pay for until C5 of the concurrent+generational plan
+/// makes the marker scale.
+const Z_PARMARK_DEFAULT_WORKERS: usize = 0;
+
 /// Below this share of capacity free, a small largest-block means the heap is
 /// **full**, not fragmented — so the fragmentation gauge does not sample.
 ///
@@ -7604,7 +7637,12 @@ impl GarbageCollector for ZgcRealHeap {
         // Cleared when the driver refuses to certify a complete mark set, which
         // routes this cycle through the single-threaded marker below.
         let mut parallel_ok = true;
-        if parallel_workers > 1 {
+        // `>= 1`, not `> 1`: ONE worker still means the cycle is driven by
+        // `zgc_concurrent`'s controller, which is Phase 3's first exit clause,
+        // and it measures within 1.4% of the bespoke serial loop (95.7 ms vs
+        // 94.4 ms on a 1M-object live set). Only `0` takes the hand-written
+        // path, and that is the kill switch.
+        if parallel_workers >= 1 {
             let root_addrs: Vec<u64> = roots.iter().map(|r| r.as_ptr() as u64).collect();
             // OPEN THE CYCLE FIRST. `mark_parallel_stw`'s doc calls this "the
             // caller's contract" and this caller violated it until 2026-08-13.
@@ -7652,7 +7690,7 @@ impl GarbageCollector for ZgcRealHeap {
                 }
             }
         }
-        if !parallel_ok || parallel_workers <= 1 {
+        if !parallel_ok || parallel_workers == 0 {
         // Trace from roots. A work stack holds base addresses to visit.
         for r in roots.iter() {
             work.push(r.as_ptr() as usize);
@@ -9848,42 +9886,38 @@ pub(crate) mod tests {
         );
     }
 
-    /// Parallel marking is **on by default** as of 2026-08-13, and `0` is the
-    /// kill switch.
+    /// Marking is **serial by default**, and the driven path is opt-in.
     ///
-    /// A pool of one is refused deliberately: it does the same work as the
-    /// serial loop plus a spawn and a join, so `1` and `0` both mean serial.
-    /// The cap is the Phase 2.3 rule applied to this constant — the value it
-    /// bounds is a user-supplied integer, i.e. unbounded, and spawning it
-    /// inside a safepoint is the failure mode.
+    /// It was default-on for one day (2026-08-13 to 2026-08-14) and was turned
+    /// back off by the measurement Phase 3's exit criterion asks for: on a
+    /// 1M-object live set a driven cycle costs +31% pause at one worker and
+    /// +153% at four. See `Z_PARMARK_DEFAULT_WORKERS` for the table.
+    ///
+    /// The knob still resolves and still caps, because the opt-in path is how
+    /// C5 will be measured.
     #[test]
-    fn parallel_marking_is_on_by_default_and_zero_is_the_kill_switch() {
+    fn marking_is_serial_by_default_and_parallelism_is_opt_in() {
         let heap = ZgcRealHeap::with_capacity(64 * 1024);
-        let cores = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(1);
-
         let n = cratonvm_types::flags::with_thread_overrides(
             &[("CRATONVM_ZGC_PARMARK", None)],
             || heap.parallel_mark_workers(),
         );
-        if cores >= 4 {
-            assert!(n > 1, "unset must mean parallel on a multi-core box; got {n}");
-            assert!(n <= Z_PARMARK_MAX_WORKERS.min(cores));
-        } else {
-            // A 1-2 core box legitimately computes a pool of one, which is
-            // refused. Asserting "> 1" there would fail for the right reason
-            // and look like a defect.
-            assert_eq!(n, 0, "a pool of one must fall back to serial");
-        }
-
-        for off in ["0", "1"] {
-            let n = cratonvm_types::flags::with_thread_overrides(
-                &[("CRATONVM_ZGC_PARMARK", Some(off))],
-                || heap.parallel_mark_workers(),
-            );
-            assert_eq!(n, 0, "CRATONVM_ZGC_PARMARK={off} must mean serial");
-        }
+        assert_eq!(
+            n, 0,
+            "unset must mean the serial loop: a driven cycle is a measured              pause regression until the marker scales"
+        );
+        let n = cratonvm_types::flags::with_thread_overrides(
+            &[("CRATONVM_ZGC_PARMARK", Some("4"))],
+            || heap.parallel_mark_workers(),
+        );
+        let cores = std::thread::available_parallelism()
+            .map(|c| c.get())
+            .unwrap_or(1);
+        assert_eq!(
+            n,
+            4.min(cores).min(Z_PARMARK_MAX_WORKERS),
+            "an explicit request must still resolve, and still cap"
+        );
     }
 
     /// **The parallel mark path must open a mark cycle, or no weak reference
