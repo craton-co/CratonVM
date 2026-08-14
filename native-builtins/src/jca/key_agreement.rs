@@ -28,6 +28,9 @@ const KA_CLASS: &str = "javax/crypto/KeyAgreement";
 const ECDH_SPI: &str = "sun/security/ec/ECDHKeyAgreement";
 
 /// First synthetic slot index (= real `KeyAgreement` instance-field count).
+///
+/// Two slots follow it: the SPI at `base`, and the requested algorithm name at
+/// `base + 1` (which is what [`ka_get_provider`] answers from).
 fn base_offset(ctx: &mut dyn NativeContext) -> usize {
     let cid = ctx
         .ensure_class_initialized(KA_CLASS)
@@ -35,9 +38,32 @@ fn base_offset(ctx: &mut dyn NativeContext) -> usize {
     ctx.class_num_total_fields(cid)
 }
 
-fn is_ecdh(alg: &str) -> bool {
-    let u = alg.to_ascii_uppercase();
-    u == "ECDH" || u == "ECDHC" || u == "ECCDH"
+/// Offset of the algorithm-name slot, past the SPI.
+const KA_OFF_NAME: usize = 1;
+/// Total synthetic slots appended past the real layout.
+const KA_NUM_SLOTS: usize = 2;
+
+/// The real `KeyAgreementSpi` class the JDK own providers register for `alg`,
+/// with the provider that registers it.
+///
+/// Read off HotSpot JDK 25 by enumerating `Provider.getServices()`, not
+/// guessed: SunEC owns the whole EC/XDH surface including the `XDH` umbrella
+/// (whose SPI is the NON-nested base class, the same split
+/// `xdh_kpg_spi_class` records for key generation), while finite-field DH is
+/// SunJCE and is registered under the name `DiffieHellman`.
+///
+/// `KeyAgreement.getInstance("X25519")` refused before 2026-08-14 — this
+/// engine knew one algorithm — which is one of the four
+/// `NoSuchAlgorithmException` rows the JCA engine residuals page opened with.
+fn ka_spi_class(alg: &str) -> Option<(&'static str, &'static str)> {
+    match alg.to_ascii_uppercase().as_str() {
+        "ECDH" | "ECDHC" | "ECCDH" => Some((ECDH_SPI, "SunEC")),
+        "X25519" => Some(("sun/security/ec/XDHKeyAgreement$X25519", "SunEC")),
+        "X448" => Some(("sun/security/ec/XDHKeyAgreement$X448", "SunEC")),
+        "XDH" => Some(("sun/security/ec/XDHKeyAgreement", "SunEC")),
+        "DH" | "DIFFIEHELLMAN" => Some(("com/sun/crypto/provider/DHKeyAgreement", "SunJCE")),
+        _ => None,
+    }
 }
 
 fn read_string(ctx: &mut dyn NativeContext, args: &[Value], idx: usize) -> String {
@@ -73,29 +99,65 @@ fn ka_spi(ctx: &mut dyn NativeContext, this: ObjectRef) -> Option<ObjectRef> {
 
 fn ka_get_instance(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let alg = read_string(ctx, args, 0);
-    if !is_ecdh(&alg) {
+    let Some((spi_class, _provider)) = ka_spi_class(&alg) else {
         return Err(throw_no_such_algorithm(
             ctx,
             &format!("Algorithm {alg} not available"),
         ));
-    }
-    // Construct the real SunEC ECDH SPI and stash it in a GC-scanned slot.
-    let spi = match ctx.new_object_initialized(ECDH_SPI, "()V", &[])? {
+    };
+    // Construct the real provider SPI and stash it in a GC-scanned slot.
+    let spi = match ctx.new_object_initialized(spi_class, "()V", &[])? {
         Some(Value::Object(Some(o))) => o,
         _ => {
             return Err(throw_no_such_algorithm(
                 ctx,
-                "Algorithm ECDH not available (no ECDHKeyAgreement SPI)",
+                &format!("Algorithm {alg} not available (no {spi_class} SPI)"),
             ))
         }
     };
     let pin = ctx.pin_native_root(spi);
     let base = base_offset(ctx);
-    let obj = try_alloc_concurrent_synthetic(ctx, KA_CLASS, base + 1)?;
+    let obj = try_alloc_concurrent_synthetic(ctx, KA_CLASS, base + KA_NUM_SLOTS)?;
+    let obj_pin = ctx.pin_native_root(obj);
     let spi = ctx.read_native_pin(pin, spi);
+    let obj = ctx.read_native_pin(obj_pin, obj);
     ctx.set_field(obj, base, Value::Object(Some(spi)));
+    // `create_string` allocates, so re-read the receiver through its pin
+    // afterwards — the name write must land in the post-move object.
+    let name = ctx.create_string(&alg);
+    let obj = ctx.read_native_pin(obj_pin, obj);
+    ctx.set_field(obj, base + KA_OFF_NAME, Value::Object(Some(name)));
+    let obj = ctx.read_native_pin(obj_pin, obj);
     ctx.unpin_native_roots(pin);
     Ok(Some(Value::Object(Some(obj))))
+}
+
+/// `getAlgorithm()` — the name this engine was asked for.
+fn ka_get_algorithm(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let base = base_offset(ctx);
+    Ok(Some(ctx.get_field(this, base + KA_OFF_NAME)))
+}
+
+/// `getProvider()`.
+///
+/// Nothing was registered for it, so the real JDK bytecode ran and read the
+/// `provider` field this VM never assigns — and on a synthetic receiver that
+/// THREW, which `probes/JcaGetInstanceProbe` records as `provider=?`. The same
+/// one-line treatment `kpg_get_provider` got.
+fn ka_get_provider(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let base = base_offset(ctx);
+    let alg = match ctx.get_field(this, base + KA_OFF_NAME) {
+        Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
+        _ => String::new(),
+    };
+    // A `KeyAgreement` can only exist for an algorithm `ka_spi_class` matched,
+    // so the fallback is unreachable in practice; `SunEC` is what every EC/XDH
+    // row answers and the least surprising default if it ever is reached.
+    let provider = ka_spi_class(&alg).map(|(_, p)| p).unwrap_or("SunEC");
+    let p = crate::jca::make_named_provider(ctx, provider)?;
+    Ok(Some(Value::Object(Some(p))))
 }
 
 /// `init(Key)` / `init(Key, SecureRandom)` → `spi.engineInit(key, random)`.
@@ -228,4 +290,40 @@ pub fn register(r: &mut NativeMethodRegistry) {
         "(Ljava/lang/String;)Ljavax/crypto/SecretKey;",
         ka_generate_secret_alg,
     );
+    r.register(
+        cls,
+        "getProvider",
+        "()Ljava/security/Provider;",
+        ka_get_provider,
+    );
+    r.register(cls, "getAlgorithm", "()Ljava/lang/String;", ka_get_algorithm);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every algorithm this engine serves names the SPI class and the provider
+    /// HotSpot own registration does — enumerated from `Provider.getServices()`
+    /// on JDK 25, where the SunEC/SunJCE split is not derivable from the family.
+    #[test]
+    fn ka_spi_classes_match_the_jdk_registrations() {
+        for (alg, spi, provider) in [
+            ("ECDH", ECDH_SPI, "SunEC"),
+            ("ecdh", ECDH_SPI, "SunEC"),
+            ("X25519", "sun/security/ec/XDHKeyAgreement$X25519", "SunEC"),
+            ("X448", "sun/security/ec/XDHKeyAgreement$X448", "SunEC"),
+            ("XDH", "sun/security/ec/XDHKeyAgreement", "SunEC"),
+            ("DH", "com/sun/crypto/provider/DHKeyAgreement", "SunJCE"),
+            (
+                "DiffieHellman",
+                "com/sun/crypto/provider/DHKeyAgreement",
+                "SunJCE",
+            ),
+        ] {
+            assert_eq!(ka_spi_class(alg), Some((spi, provider)), "{alg}");
+        }
+        assert_eq!(ka_spi_class("TOTALLY-BOGUS-ALG"), None);
+        assert_eq!(ka_spi_class(""), None);
+    }
 }
