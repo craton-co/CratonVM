@@ -118,6 +118,21 @@ struct Counters {
     /// non-zero value means some pause after it walked every plausible source
     /// region wholesale, which is correct but is the expensive arm.
     rset_coarsened: AtomicU64,
+    /// Humongous spans reclaimed by an evacuation pause rather than by a
+    /// concurrent-mark cleanup (`CRATONVM_G1_EAGER_HUMONGOUS`), and the bytes
+    /// they held.
+    ///
+    /// Worth a counter of its own because eager reclaim is the ONLY path that
+    /// frees memory outside the collection set. When a humongous object goes
+    /// missing, the first question is which of the two reclaimers took it, and
+    /// `spans` answers it without a rebuild.
+    humongous_eager_spans: AtomicU64,
+    humongous_eager_bytes: AtomicU64,
+    /// Pauses that had eager reclaim enabled but declined to run it, because
+    /// some precondition (a mark cycle in flight, an evacuation failure, an
+    /// aborted region walk) made "unreferenced" untrustworthy. A high ratio
+    /// against `humongous_eager_spans` is why a heap is not reclaiming.
+    humongous_eager_declined: AtomicU64,
     /// Nanoseconds spent in card refinement (flush + drain + dirty-card scan).
     /// Ungated.
     refinement_nanos: AtomicU64,
@@ -146,6 +161,9 @@ impl Counters {
             cset_verify_dangling: AtomicU64::new(0),
             cset_verify_truncated: AtomicU64::new(0),
             rset_coarsened: AtomicU64::new(0),
+            humongous_eager_spans: AtomicU64::new(0),
+            humongous_eager_bytes: AtomicU64::new(0),
+            humongous_eager_declined: AtomicU64::new(0),
             refinement_nanos: AtomicU64::new(0),
             refinement_passes: AtomicU64::new(0),
             allocated_objects: AtomicU64::new(0),
@@ -332,6 +350,20 @@ pub fn record_g1_cset_verify(objects: u64, dangling: u64, truncated: bool) {
     });
 }
 
+/// Record an evacuation pause's eager humongous reclaim.
+///
+/// `spans == 0` with `declined == false` is the ordinary "nothing was dead"
+/// outcome; `declined == true` means the pause never asked the question.
+pub fn record_g1_eager_humongous(spans: u64, bytes: u64, declined: bool) {
+    with_counters(|c| {
+        c.humongous_eager_spans.fetch_add(spans, Ordering::Relaxed);
+        c.humongous_eager_bytes.fetch_add(bytes, Ordering::Relaxed);
+        if declined {
+            c.humongous_eager_declined.fetch_add(1, Ordering::Relaxed);
+        }
+    });
+}
+
 /// Record that one remembered set coarsened (audit §9 item 5).
 pub fn record_g1_rset_coarsened() {
     with_counters(|c| {
@@ -399,6 +431,9 @@ pub struct GcMetricsRaw {
     pub cset_verify_dangling: u64,
     pub cset_verify_truncated: u64,
     pub rset_coarsened: u64,
+    pub humongous_eager_spans: u64,
+    pub humongous_eager_bytes: u64,
+    pub humongous_eager_declined: u64,
     pub refinement_nanos: u64,
     pub refinement_passes: u64,
     pub allocated_objects: u64,
@@ -558,6 +593,9 @@ pub fn gc_metrics_raw() -> GcMetricsRaw {
         cset_verify_dangling: c.cset_verify_dangling.load(Ordering::Relaxed),
         cset_verify_truncated: c.cset_verify_truncated.load(Ordering::Relaxed),
         rset_coarsened: c.rset_coarsened.load(Ordering::Relaxed),
+        humongous_eager_spans: c.humongous_eager_spans.load(Ordering::Relaxed),
+        humongous_eager_bytes: c.humongous_eager_bytes.load(Ordering::Relaxed),
+        humongous_eager_declined: c.humongous_eager_declined.load(Ordering::Relaxed),
         refinement_nanos: c.refinement_nanos.load(Ordering::Relaxed),
         refinement_passes: c.refinement_passes.load(Ordering::Relaxed),
         allocated_objects: c.allocated_objects.load(Ordering::Relaxed),
@@ -986,6 +1024,15 @@ pub fn collector_decision_report() -> String {
             verify.cset_verify_objects as f64 / verify.cset_verify_pauses as f64,
         ));
     }
+    if verify.humongous_eager_spans > 0 || verify.humongous_eager_declined > 0 {
+        s.push('\n');
+        s.push_str(&format!(
+            "[GC] g1 humongous-eager: spans={} bytes={} declined_pauses={}",
+            verify.humongous_eager_spans,
+            verify.humongous_eager_bytes,
+            verify.humongous_eager_declined,
+        ));
+    }
     s
 }
 
@@ -1312,6 +1359,9 @@ mod tests {
             cset_verify_dangling: 0,
             cset_verify_truncated: 0,
             rset_coarsened: 0,
+            humongous_eager_spans: 0,
+            humongous_eager_bytes: 0,
+            humongous_eager_declined: 0,
             refinement_nanos: 4_000_000,
             refinement_passes: 4,
             allocated_objects: 1_000,

@@ -715,6 +715,22 @@ pub struct GcFlags {
     /// any suspected parallel-evacuation regression, and a cycle record still
     /// names which evacuator ran.
     pub g1_parallel_evac: bool,
+    /// `CRATONVM_G1_EAGER_HUMONGOUS` — reclaim provably-dead humongous spans
+    /// during evacuation pauses instead of waiting for a concurrent-mark
+    /// cleanup. Default **ON** ([`parse::on_unless_zero`]); set `=0` to restore
+    /// cleanup-only reclaim.
+    ///
+    /// Humongous spans are never evacuated — a young or mixed pause leaves them
+    /// where they are — so before this the ONLY thing that ever freed one was
+    /// `G1Collector::cleanup`, at the end of a whole concurrent mark cycle. A
+    /// program whose humongous garbage is short-lived (the `new byte[4 MiB]`
+    /// per request shape) therefore held every dead buffer until IHOP happened
+    /// to fire, which on a heap sized for the live set may be never.
+    ///
+    /// `=0` is the bisection lever: eager reclaim is the only path that frees
+    /// memory outside the collection set, so it is the first thing to rule out
+    /// if a pause is suspected of losing a live humongous object.
+    pub g1_eager_humongous: bool,
     /// `CRATONVM_G1_NO_EVAC_RETRY` — do not retry a failed evacuation.
     pub g1_no_evac_retry: bool,
     /// `CRATONVM_G1_COVERAGE_PIN` — **diagnostic bisection lever, default
@@ -906,6 +922,7 @@ impl GcFlags {
             card_table_only: present(src, "CRATONVM_CARD_TABLE_ONLY"),
             old_sweep_jit: on_unless_zero(src, "CRATONVM_OLD_SWEEP_JIT"),
             g1_parallel_evac: on_unless_zero(src, "CRATONVM_G1_PARALLEL_EVAC"),
+            g1_eager_humongous: on_unless_zero(src, "CRATONVM_G1_EAGER_HUMONGOUS"),
             g1_no_evac_retry: present(src, "CRATONVM_G1_NO_EVAC_RETRY"),
             g1_coverage_pin: present(src, "CRATONVM_G1_COVERAGE_PIN"),
             g1_workers: usize_min1(src, "CRATONVM_G1_WORKERS"),

@@ -59,7 +59,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_DBG`
 
-437 tokens.
+438 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -504,7 +504,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_JIT`
 
-172 tokens.
+173 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -547,6 +547,7 @@ export inherited from a parent shell.
 | `force-c2` | `CRATONVM_JIT_FORCE_C2` |
 | `native-shadow-interface-blind` | `CRATONVM_JIT_NATIVE_SHADOW_INTERFACE_BLIND` |
 | `native-shadow-caller-seal` | `CRATONVM_JIT_NATIVE_SHADOW_CALLER_SEAL` |
+| `gate-pass-memo` | `CRATONVM_JIT_GATE_PASS_MEMO` |
 | `full-self-call-spill` | `CRATONVM_JIT_FULL_SELF_CALL_SPILL` |
 | `gc-inert-selfrec` | `CRATONVM_JIT_GC_INERT_SELFREC` |
 | `getfield-helper` | `CRATONVM_JIT_GETFIELD_HELPER` |
@@ -683,7 +684,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_GC`
 
-40 tokens.
+45 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -699,7 +700,10 @@ export inherited from a parent shell.
 | `g1-coverage-pin` | `CRATONVM_G1_COVERAGE_PIN` |
 | `g1-evac-retry` | `CRATONVM_G1_NO_EVAC_RETRY` |
 | `g1-parallel-evac` | `CRATONVM_G1_PARALLEL_EVAC` |
+| `g1-eager-humongous` | `CRATONVM_G1_EAGER_HUMONGOUS` |
 | `g1-workers` | `CRATONVM_G1_WORKERS` |
+| `g1-rset-source-cap` | `CRATONVM_G1_RSET_SOURCE_CAP` |
+| `g1-verify-budget` | `CRATONVM_G1_VERIFY_BUDGET` |
 | `gpu-critical-lease-ms` | `CRATONVM_GPU_CRITICAL_LEASE_MS` |
 | `gpu-critical-wait-ms` | `CRATONVM_GPU_CRITICAL_WAIT_MS` |
 | `gpu-zerocopy` | `CRATONVM_GPU_NO_ZEROCOPY` |
@@ -802,7 +806,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_THREADS`
 
-16 tokens.
+17 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -813,6 +817,7 @@ export inherited from a parent shell.
 | `await-shortcircuit` | `CRATONVM_AWAIT_NO_SHORTCIRCUIT` |
 | `default-watchdog` | `CRATONVM_DISABLE_DEFAULT_WATCHDOG` |
 | `default-watchdog-sec` | `CRATONVM_DEFAULT_WATCHDOG_SEC` |
+| `thread-containers` | `CRATONVM_THREAD_CONTAINERS` |
 | `eqe-sync-execute` | `CRATONVM_EQE_SYNC_EXECUTE` |
 | `exec-depth-ceiling` | `CRATONVM_EXEC_DEPTH_CEILING` |
 | `fjp-eager-fork` | `CRATONVM_FJP_EAGER_FORK` |
@@ -821,7 +826,6 @@ export inherited from a parent shell.
 | `lock-order-check` | `CRATONVM_LOCK_ORDER_CHECK` |
 | `stress-thread-states` | `CRATONVM_STRESS_THREAD_STATES` |
 | `striped-counters` | `CRATONVM_STRIPED_COUNTERS_OFF` |
-| `thread-containers` | `CRATONVM_THREAD_CONTAINERS` |
 | `thread-start-grace-ms` | `CRATONVM_THREAD_START_GRACE_MS` |
 
 ## `CRATONVM_SECURITY`
