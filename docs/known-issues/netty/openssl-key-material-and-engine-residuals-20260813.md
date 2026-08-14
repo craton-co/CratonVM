@@ -110,6 +110,33 @@ passes both.
 gets nothing. CratonVM does not reject an unknown cipher-suite name where the
 JDK provider does. One test; HotSpot passes.
 
+## D — `ParameterizedSslHandlerTest` intermittently hangs in a selector spin
+
+`ParameterizedSslHandlerTest` is 63/63 ok when it finishes, and finishes in
+150–190 s. On a loaded host it hangs instead — 3 of 6 runs, at 400 s, 900 s and
+1500 s caps. Traced with a per-test start/finish listener, it always stops at the
+same point:
+
+    reentryOnHandshakeCompleteNioChannel
+      | 5: clientProvider=OPENSSL_REFCNT, 5: serverProvider=OPENSSL_REFCNT
+
+and the log then repeats, forever:
+
+    io.netty.channel.nio.NioIoHandler - Selector.select() returned prematurely
+      512 times in a row; rebuilding Selector sun.nio.ch.SelectorImpl@…
+    io.netty.channel.nio.NioIoHandler - Migrated 1 channel(s) to the new Selector
+
+JUnit's 120 s per-test timeout never fires, because
+`SameThreadTimeoutInvocation` can only check after the invocation returns.
+
+This is the NIO-channel variant — a real socket pair, not `EmbeddedChannel` —
+so it is a CratonVM `Selector` behaviour question (a `select()` that returns
+with no ready keys and no timeout elapsed), not an OpenSSL one; the OPENSSL_REFCNT
+pairing is what makes the handshake slow enough to sit in the selector loop.
+Whether the same spin underlies the four `*OpenSslEngine*` classes that now hang
+at 400 s is unknown — HotSpot also hangs on those four at that cap, so they need
+a raised per-class timeout before they can be judged.
+
 ## Repro
 
 ```bash
