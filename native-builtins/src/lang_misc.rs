@@ -46,6 +46,10 @@ use crate::obj_arg;
 const UNRESOLVED_FIELD_INDEX: usize = usize::MAX;
 static THROWABLE_DETAIL_MESSAGE_INDEX: AtomicUsize = AtomicUsize::new(UNRESOLVED_FIELD_INDEX);
 static THROWABLE_CAUSE_INDEX: AtomicUsize = AtomicUsize::new(UNRESOLVED_FIELD_INDEX);
+static THROWABLE_SUPPRESSED_INDEX: AtomicUsize = AtomicUsize::new(UNRESOLVED_FIELD_INDEX);
+static THROWABLE_BACKTRACE_INDEX: AtomicUsize = AtomicUsize::new(UNRESOLVED_FIELD_INDEX);
+static THROWABLE_DEPTH_INDEX: AtomicUsize = AtomicUsize::new(UNRESOLVED_FIELD_INDEX);
+static THROWABLE_STACK_TRACE_INDEX: AtomicUsize = AtomicUsize::new(UNRESOLVED_FIELD_INDEX);
 
 /// Sentinel meaning "STE class id not yet resolved." `ClassId::new(0)` is
 /// the legacy fallback (java/lang/Object) — using it as a sentinel would
@@ -104,6 +108,92 @@ fn synthetic_throwable_slot(field_name: &str) -> Option<usize> {
     }
 }
 
+/// The slot `java/lang/Throwable` itself declares for `field_name`, returned
+/// ONLY when the receiver's own class declares a DIFFERENT field of the same
+/// name — i.e. when the receiver SHADOWS one of `Throwable`'s fields.
+///
+/// A `Throwable` subclass may legally declare a field whose name collides with
+/// one of `Throwable`'s own, and real code does: H2 1.2's
+/// `org.h2.jdbc.JdbcSQLException` declares `private final Throwable cause` and
+/// assigns it in its constructor on the line before it calls `initCause(cause)`.
+///
+/// Javac resolves `getfield`/`putfield` against the class named in the constant
+/// pool, so `Throwable.initCause`'s own bytecode always reaches
+/// `Throwable.cause` no matter what a subclass declares. A name-keyed lookup on
+/// the RECEIVER does not — it answers the most-derived declaration. That is a
+/// different slot from the one the writers in this file target:
+/// `write_throwable_field_cached` resolves its index against
+/// `java/lang/Throwable` explicitly (see `cached_throwable_field_index`). So the
+/// two halves of every read/write pair addressed different memory the moment a
+/// subclass shadowed the name.
+///
+/// The visible consequence: `native_exc_init_message` wrote the `cause = this`
+/// sentinel into `Throwable`'s slot, `native_throwable_init_cause` read H2's
+/// slot, saw the value H2's constructor had just stored there, and refused the
+/// call with `IllegalStateException: Can't overwrite cause with ...`. Every
+/// `JdbcSQLException` H2 built then failed to construct, each refusal wrapped by
+/// the next JDBC layer — the five-deep cascade `org.h2.test.unit.TestUpgrade`
+/// died on (found 2026-08-14).
+///
+/// Returning `None` for a receiver that merely INHERITS the field keeps every
+/// existing path byte-identical; only the shadowing case is redirected.
+fn shadowed_throwable_slot(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    field_name: &str,
+) -> Option<usize> {
+    let cache = throwable_field_cache(field_name)?;
+    let declared = cached_throwable_field_index(ctx, cache, field_name)?;
+    let own = ctx.resolve_field_index_by_class_id(ctx.class_id_of_object(this), field_name)?;
+    if own == declared {
+        return None;
+    }
+    (declared < ctx.object_num_fields(this)).then_some(declared)
+}
+
+/// Per-name cache cell for [`shadowed_throwable_slot`]. `None` for a name
+/// `java/lang/Throwable` does not declare — there is nothing to shadow.
+fn throwable_field_cache(field_name: &str) -> Option<&'static AtomicUsize> {
+    match field_name {
+        "cause" => Some(&THROWABLE_CAUSE_INDEX),
+        "detailMessage" => Some(&THROWABLE_DETAIL_MESSAGE_INDEX),
+        "suppressedExceptions" => Some(&THROWABLE_SUPPRESSED_INDEX),
+        "backtrace" => Some(&THROWABLE_BACKTRACE_INDEX),
+        "depth" => Some(&THROWABLE_DEPTH_INDEX),
+        "stackTrace" => Some(&THROWABLE_STACK_TRACE_INDEX),
+        _ => None,
+    }
+}
+
+/// Read a field `java/lang/Throwable` declares, from the slot `Throwable`
+/// declares it in rather than whatever the receiver's class resolves the name
+/// to. See [`shadowed_throwable_slot`].
+pub(crate) fn throwable_field_get(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    field_name: &str,
+) -> Value {
+    if let Some(idx) = shadowed_throwable_slot(ctx, this, field_name) {
+        return ctx.get_field(this, idx);
+    }
+    ctx.get_field_by_name(this, field_name)
+}
+
+/// Write-side companion to [`throwable_field_get`]. Keeps a shadowing
+/// receiver's reads and writes on the same slot.
+pub(crate) fn throwable_field_set(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    field_name: &str,
+    value: Value,
+) {
+    if let Some(idx) = shadowed_throwable_slot(ctx, this, field_name) {
+        ctx.set_field(this, idx, value);
+        return;
+    }
+    ctx.set_field_by_name(this, field_name, value);
+}
+
 /// Write a Throwable field by name, falling back to
 /// [`synthetic_throwable_slot`] when the receiver has no field names.
 /// Companion to [`read_throwable_field`].
@@ -113,8 +203,8 @@ fn write_throwable_field(
     field_name: &str,
     value: Value,
 ) {
-    ctx.set_field_by_name(this, field_name, value);
-    if ctx.get_field_by_name(this, field_name) != value {
+    throwable_field_set(ctx, this, field_name, value);
+    if throwable_field_get(ctx, this, field_name) != value {
         if let Some(slot) = synthetic_throwable_slot(field_name) {
             if slot < ctx.object_num_fields(this) {
                 ctx.set_field(this, slot, value);
@@ -126,7 +216,7 @@ fn write_throwable_field(
 /// Read a Throwable field by name, falling back to
 /// [`synthetic_throwable_slot`] when the receiver has no field names.
 fn read_throwable_field(ctx: &mut dyn NativeContext, this: ObjectRef, field_name: &str) -> Value {
-    let by_name = ctx.get_field_by_name(this, field_name);
+    let by_name = throwable_field_get(ctx, this, field_name);
     if !matches!(by_name, Value::Object(None)) {
         return by_name;
     }
@@ -176,10 +266,10 @@ fn write_throwable_field_cached(
             return;
         }
     }
-    ctx.set_field_by_name(this, field_name, value);
+    throwable_field_set(ctx, this, field_name, value);
     // A synthetic receiver resolves neither the cached index nor the name, so
     // the write above was a no-op. See `synthetic_throwable_slot`.
-    if ctx.get_field_by_name(this, field_name) != value {
+    if throwable_field_get(ctx, this, field_name) != value {
         if let Some(slot) = synthetic_throwable_slot(field_name) {
             if slot < ctx.object_num_fields(this) {
                 ctx.set_field(this, slot, value);
@@ -422,8 +512,8 @@ pub(crate) fn capture_throwable_trace(ctx: &mut dyn NativeContext, this: ObjectR
     // `getOurStackTrace()` only materialises frames when `backtrace != null`;
     // park a self-reference as the non-null marker (the real frame data lives
     // in the identity-hash-keyed trace store).
-    ctx.set_field_by_name(this, "backtrace", Value::Object(Some(this)));
-    ctx.set_field_by_name(this, "depth", Value::Int(depth));
+    throwable_field_set(ctx, this, "backtrace", Value::Object(Some(this)));
+    throwable_field_set(ctx, this, "depth", Value::Int(depth));
     // Mirror the JDK field initializer `suppressedExceptions = SUPPRESSED_SENTINEL`.
     init_suppressed_sentinel(ctx, this);
 }
@@ -462,7 +552,7 @@ fn init_suppressed_sentinel(ctx: &mut dyn NativeContext, this: ObjectRef) {
     // Only mirror once `Throwable.<clinit>` has populated the sentinel; before
     // that (bootstrap-era throwables) leave the field as-is.
     if let Some(v @ Value::Object(Some(_))) = sentinel {
-        ctx.set_field_by_name(this, "suppressedExceptions", v);
+        throwable_field_set(ctx, this, "suppressedExceptions", v);
     }
 }
 
@@ -496,7 +586,7 @@ fn suppression_disabled(ctx: &mut dyn NativeContext, this: ObjectRef) -> bool {
         return false;
     }
     if !matches!(
-        ctx.get_field_by_name(this, "suppressedExceptions"),
+        throwable_field_get(ctx, this, "suppressedExceptions"),
         Value::Object(None)
     ) {
         return false;
@@ -887,7 +977,7 @@ pub(crate) fn native_invocation_target_exception_get_target(
         Value::Object(Some(target_obj)) if target_obj == this => Ok(Some(Value::Object(None))),
         Value::Object(_) => Ok(Some(target)),
         _ => {
-            let cause = ctx.get_field_by_name(this, "cause");
+            let cause = throwable_field_get(ctx, this, "cause");
             match cause {
                 Value::Object(Some(cause_obj)) if cause_obj == this => {
                     Ok(Some(Value::Object(None)))
@@ -1180,7 +1270,7 @@ pub(crate) fn native_throwable_get_message(
         .class_name_of_id(ctx.class_id_of_object(this))
         .and_then(|cn| ctx.resolve_field_index(&cn, "detailMessage"))
         .is_some();
-    let by_name = ctx.get_field_by_name(this, "detailMessage");
+    let by_name = throwable_field_get(ctx, this, "detailMessage");
     let detail = match by_name {
         Value::Object(Some(_)) => by_name,
         // `detailMessage` resolved by name but is null/absent: that is a
@@ -1449,6 +1539,27 @@ pub(crate) fn native_throwable_init_cause(
         // An unset reference slot reads back as `Int(0)` — no verdict.
         _ => false,
     };
+    if crate::nbflags().dbg_cause {
+        let this_cls = ctx
+            .class_name_of_id(ctx.class_id_of_object(this))
+            .unwrap_or_default();
+        let raw = throwable_field_get(ctx, this, "cause");
+        let idx = ctx.resolve_field_index_by_class_id(class_id, "cause");
+        let nf = ctx.object_num_fields(this);
+        let frames = ctx.capture_throwable_stack_trace(this);
+        let top: Vec<String> = frames
+            .iter()
+            .take(8)
+            .map(|f| format!("{}.{}:{}", f.class_name, f.method_name, f.line_number))
+            .collect();
+        eprintln!(
+            "CAUSE_DBG_INIT this={this_cls} hash={} raw={raw:?} is_self={} declares={declares_cause} idx={idx:?} nfields={nf} already_set={already_set} arg={:?} frames=[{}]",
+            ctx.identity_hash_code(this),
+            matches!(raw, Value::Object(Some(c)) if c == this),
+            cause_val,
+            top.join(" <- ")
+        );
+    }
     if already_set {
         // `"Can't overwrite cause with " + Objects.toString(cause, "a null")`.
         // Rendering the argument re-enters Java (`toString()`), so the receiver
@@ -1525,7 +1636,7 @@ fn throwable_detail_message_text(ctx: &mut dyn NativeContext, t: ObjectRef) -> O
         .class_name_of_id(ctx.class_id_of_object(t))
         .and_then(|cn| ctx.resolve_field_index(&cn, "detailMessage"))
         .is_some();
-    let detail = match ctx.get_field_by_name(t, "detailMessage") {
+    let detail = match throwable_field_get(ctx, t, "detailMessage") {
         v @ Value::Object(Some(_)) => v,
         _ if has_named_detail_message => Value::Object(None),
         _ => match ctx.get_field(t, 0) {
@@ -1573,7 +1684,7 @@ fn throwable_to_string_text(ctx: &mut dyn NativeContext, t: ObjectRef) -> (Objec
 /// Read the cause field, returning None if missing or self-referential
 /// (the JDK `cause = this` "uninitialized" sentinel).
 fn throwable_cause(ctx: &mut dyn NativeContext, t: ObjectRef) -> Option<ObjectRef> {
-    let by_name = ctx.get_field_by_name(t, "cause");
+    let by_name = throwable_field_get(ctx, t, "cause");
     if let Value::Object(Some(c)) = by_name {
         if c == t {
             return None;
@@ -1640,7 +1751,7 @@ fn throwable_frame_text(ctx: &mut dyn NativeContext, t: ObjectRef) -> Vec<String
 /// while CratonVM's native `addSuppressed` replaces it with a Throwable array;
 /// only the latter represents user-visible suppressed exceptions.
 fn throwable_suppressed(ctx: &mut dyn NativeContext, t: ObjectRef) -> Vec<ObjectRef> {
-    let Value::Object(Some(array)) = ctx.get_field_by_name(t, "suppressedExceptions") else {
+    let Value::Object(Some(array)) = throwable_field_get(ctx, t, "suppressedExceptions") else {
         return Vec::new();
     };
     if ctx.heap_kind_of(array) != cratonvm_types::ObjectKind::Array {
@@ -2041,7 +2152,7 @@ pub(crate) fn native_throwable_get_stack_trace_array(
     // ES-suite failures). The JDK sentinel `UNASSIGNED_STACK` is a zero-length
     // array, so a non-empty `stackTrace` field means it was set (or cached) and
     // must be returned verbatim instead of re-deriving from the backtrace.
-    if let Value::Object(Some(set_arr)) = ctx.get_field_by_name(this, "stackTrace") {
+    if let Value::Object(Some(set_arr)) = throwable_field_get(ctx, this, "stackTrace") {
         if ctx.array_length(set_arr) > 0 {
             if crate::nbflags().dbg_sttrace {
                 let n = ctx.array_length(set_arr);
@@ -2129,7 +2240,7 @@ pub(crate) fn native_throwable_set_stack_trace(
         _ => return Ok(None),
     };
     let stack = args.get(1).copied().unwrap_or(Value::Object(None));
-    ctx.set_field_by_name(this, "stackTrace", stack);
+    throwable_field_set(ctx, this, "stackTrace", stack);
     Ok(None)
 }
 

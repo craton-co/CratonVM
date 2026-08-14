@@ -17244,7 +17244,7 @@ pub fn register_essential_natives_with_shims(
         "()Ljava/lang/String;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            match ctx.get_field_by_name(this, "detailMessage") {
+            match crate::lang_misc::throwable_field_get(ctx, this, "detailMessage") {
                 Value::Object(Some(s)) => Ok(Some(Value::Object(Some(s)))),
                 _ => Ok(Some(Value::Object(None))),
             }
@@ -38938,7 +38938,7 @@ fn native_exception_get_message(ctx: &mut dyn NativeContext, args: &[Value]) -> 
         _ => return Ok(Some(Value::Object(None))),
     };
     // Real-JDK layout: detailMessage at slot 1; synthetic stubs put it at 0.
-    let by_name = ctx.get_field_by_name(this, "detailMessage");
+    let by_name = crate::lang_misc::throwable_field_get(ctx, this, "detailMessage");
     if matches!(by_name, Value::Object(Some(_))) {
         return Ok(Some(by_name));
     }
@@ -38975,7 +38975,7 @@ fn native_exception_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
         .class_name_of_id(ctx.class_id_of_object(this))
         .map(|n| n.replace('/', "."))
         .unwrap_or_else(|| "java.lang.Throwable".to_string());
-    let msg = match ctx.get_field_by_name(this, "detailMessage") {
+    let msg = match crate::lang_misc::throwable_field_get(ctx, this, "detailMessage") {
         Value::Object(Some(s)) => ctx.read_string(s),
         _ => None,
     };

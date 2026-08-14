@@ -774,7 +774,16 @@ public class ShadowDifferentialProbe {
                 "Throwable.suppressedFromTryWithResources", "Throwable.suppressedDefaultIsEmpty",
                 "Throwable.suppressionDisabled", "Throwable.stackTraceTopFrame",
                 "Throwable.stackTraceNonEmpty", "Throwable.setStackTraceIsHonoured",
-                "Throwable.customSubclassMessage", "VM.nullPointerHelpfulMessage",
+                "Throwable.customSubclassMessage",
+                "Throwable.shadowedCauseInitCauseSucceeds",
+                "Throwable.shadowedCauseInitCauseNull",
+                "Throwable.shadowedCauseGetCauseAfterInit",
+                "Throwable.shadowedCauseOwnFieldUntouched",
+                "Throwable.shadowedCauseCtorCauseWins",
+                "Throwable.shadowedCauseSecondInitCauseThrows",
+                "Throwable.shadowedDetailMessageGetMessage",
+                "Throwable.shadowedDetailMessageOwnFieldUntouched",
+                "VM.nullPointerHelpfulMessage",
                 "VM.nullFieldAccessMessage", "VM.nullArrayStoreMessage", "VM.divideByZero",
                 "VM.modByZero", "VM.longDivideByZero", "VM.doubleDivideByZeroIsInfinity",
                 "VM.classCast", "VM.arrayStore", "VM.arrayIndexOutOfBounds", "VM.negativeArraySize",
@@ -2513,6 +2522,7 @@ public class ShadowDifferentialProbe {
         line("Throwable.causeOfNoCauseIsNull", new RuntimeException("x").getCause());
         line("Throwable.initCauseAfterCtorThrows", thrownBy(() -> e.initCause(new RuntimeException())));
         line("Throwable.initCauseOnce", initCauseOnce());
+        shadowedThrowableFields();
         line("Throwable.initCauseTwiceThrows", initCauseTwice());
         line("Throwable.selfCauseThrows", thrownBy(() -> {
             RuntimeException x = new RuntimeException();
@@ -2604,6 +2614,108 @@ public class ShadowDifferentialProbe {
 
     static int negativeOne() {
         return -1;
+    }
+
+    /**
+     * A `Throwable` subclass is allowed to DECLARE ITS OWN field named `cause`
+     * or `detailMessage`, and real code does — H2 1.2's
+     * `org.h2.jdbc.JdbcSQLException` has `private final Throwable cause`, which
+     * it assigns immediately before calling `initCause(cause)`.
+     *
+     * Java resolves `getfield`/`putfield` against the class named in the
+     * constant pool, so `Throwable`'s own bytecode always reaches `Throwable`'s
+     * slot however many subclasses shadow the name. A VM that shadows those
+     * methods with natives and addresses the field BY NAME on the RECEIVER
+     * resolves the most-derived declaration instead — a different slot — and
+     * the two halves of a read/write pair stop agreeing.
+     *
+     * That is what broke `org.h2.test.unit.TestUpgrade` on 2026-08-14: the
+     * `cause = this` sentinel went to `Throwable`'s slot, `initCause` read the
+     * subclass's, saw the value the constructor had just put there, and refused
+     * the first and only call with
+     * `IllegalStateException: Can't overwrite cause with a null`.
+     *
+     * Every line below is an observable HotSpot answers one way and a
+     * name-keyed implementation answers another, INCLUDING the one that says
+     * the subclass's own field is still its own — a fix that redirected the
+     * write but not the read, or vice versa, fails here rather than silently
+     * half-working.
+     */
+    static class ShadowsCause extends RuntimeException {
+        // Same name as java.lang.Throwable.cause, and NOT the same field.
+        private Throwable cause;
+
+        ShadowsCause(String message, Throwable cause) {
+            super(message);
+            this.cause = cause;
+        }
+
+        ShadowsCause(String message) {
+            super(message);
+        }
+
+        Throwable ownCauseField() {
+            return cause;
+        }
+    }
+
+    static class ShadowsCauseWithCtorCause extends RuntimeException {
+        private Throwable cause;
+
+        ShadowsCauseWithCtorCause(String message, Throwable ctorCause, Throwable own) {
+            // Hands `ctorCause` to Throwable, then puts something else in the
+            // shadowing field: the two slots now hold DIFFERENT objects, so
+            // `getCause()` naming the wrong one is unambiguous.
+            super(message, ctorCause);
+            this.cause = own;
+        }
+    }
+
+    static class ShadowsDetailMessage extends RuntimeException {
+        private String detailMessage;
+
+        ShadowsDetailMessage(String message, String own) {
+            super(message);
+            this.detailMessage = own;
+        }
+
+        String ownDetailMessageField() {
+            return detailMessage;
+        }
+    }
+
+    static void shadowedThrowableFields() {
+        // A first initCause() on a receiver that shadows `cause` must SUCCEED —
+        // the subclass field holding a value is not Throwable's field holding
+        // one.
+        ShadowsCause a = new ShadowsCause("m", new IllegalArgumentException("own"));
+        line("Throwable.shadowedCauseInitCauseSucceeds",
+                thrownBy(() -> a.initCause(new IllegalStateException("real"))));
+        line("Throwable.shadowedCauseGetCauseAfterInit", String.valueOf(a.getCause()));
+        // ... and must not have disturbed the subclass's own field.
+        line("Throwable.shadowedCauseOwnFieldUntouched", String.valueOf(a.ownCauseField()));
+
+        // initCause(null) is a legal FIRST call. This is the exact shape H2's
+        // JdbcSQLException constructor uses.
+        ShadowsCause b = new ShadowsCause("m", null);
+        line("Throwable.shadowedCauseInitCauseNull", thrownBy(() -> b.initCause(null)));
+
+        // A cause supplied through the constructor is what getCause() reports,
+        // not the shadowing field.
+        ShadowsCauseWithCtorCause c = new ShadowsCauseWithCtorCause(
+                "m", new IllegalArgumentException("ctor"), new IllegalStateException("own"));
+        line("Throwable.shadowedCauseCtorCauseWins", String.valueOf(c.getCause()));
+        // ... and THAT receiver's cause really is set, so a later initCause
+        // must be refused. Reading the wrong slot would answer this one right
+        // by accident, which is why it sits beside the three above.
+        line("Throwable.shadowedCauseSecondInitCauseThrows",
+                thrownBy(() -> c.initCause(new IllegalStateException("late"))));
+
+        // The same shadow, on the other field the natives address by name.
+        ShadowsDetailMessage d = new ShadowsDetailMessage("real", "own");
+        line("Throwable.shadowedDetailMessageGetMessage", String.valueOf(d.getMessage()));
+        line("Throwable.shadowedDetailMessageOwnFieldUntouched",
+                String.valueOf(d.ownDetailMessageField()));
     }
 
     static String initCauseOnce() {
