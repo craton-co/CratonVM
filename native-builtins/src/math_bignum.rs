@@ -4561,6 +4561,17 @@ fn bd_set_scale_impl(
     mode: i32,
 ) -> MethodCallResult {
     use crate::bigint::BigInt;
+    // MEASURED 2026-08-13 (scratchpad/orch/V3.java): an out-of-range rounding
+    // mode is IllegalArgumentException "Invalid rounding mode" -- for 99, for
+    // -1 and for 8 (one past the last valid mode, UNNECESSARY == 7). The call
+    // used to RETURN, which is the worst shape: a caller passing a bad
+    // constant got a plausible number instead of a refusal.
+    if !(0..=7).contains(&mode) {
+        return Err(RuntimeError::IllegalArgumentException {
+            message: "Invalid rounding mode".into(),
+        }
+        .into());
+    }
     let (unscaled, scale) = bd_unscaled_bigint(ctx, this);
     // JDK 25 `BigDecimal.setScale`, in its order:
     //

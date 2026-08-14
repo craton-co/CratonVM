@@ -4856,6 +4856,81 @@ fn native_vec_remove_element_at_checked(
     native_vec_remove_element_at(ctx, args)
 }
 
+
+// The rest of Vector's index-taking surface. MEASURED 2026-08-13
+// (scratchpad/orch/V3.java). SIX conventions across five methods, and they do
+// not reduce to a rule:
+//
+//   set(i >= size)              "Array index out of range: 3"
+//   set(i < 0)                  "Index -1 out of bounds for length 10"
+//   setElementAt(x, i >= size)  "3 >= 3"
+//   setElementAt(x, i < 0)      "Index -1 out of bounds for length 10"
+//   insertElementAt(x, i > size) "4 > 3"      <- `>`, not `>=`: i == size is LEGAL
+//   insertElementAt(x, i < 0)   "arraycopy: source index -1 out of bounds for object array[10]"
+//   add(i > size) / add(i < 0)  same two as insertElementAt
+//   remove(i >= size)           "Array index out of range: 3"
+//   remove(i < 0)               "Index -1 out of bounds for length 10"
+//
+// NOT converted: `subList`, which keeps the PLAIN IndexOutOfBoundsException
+// ("toIndex = 5") -- measured. A blanket "Vector throws the array subclass"
+// rule would be wrong for exactly that one method.
+fn vec_arraycopy_negative(ctx: &dyn NativeContext, this: ObjectRef, index: i32) -> MethodCallFailed {
+    let (data, _) = al_state(ctx, this);
+    let cap = data.map_or(0, |d| ctx.array_length(d));
+    vec_aioobe(
+        index,
+        format!("arraycopy: source index {index} out of bounds for object array[{cap}]"),
+    )
+}
+
+fn native_vec_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let Some((this, index)) = vec_index_args(args) else {
+        return Ok(Some(Value::Object(None)));
+    };
+    let (_, size) = al_state(ctx, this);
+    if index < 0 {
+        return Err(vec_negative_index(ctx, this, index));
+    }
+    if index >= size {
+        return Err(vec_aioobe(
+            index,
+            format!("Array index out of range: {index}"),
+        ));
+    }
+    native_al_set(ctx, args)
+}
+
+fn native_vec_remove_at(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let Some((this, index)) = vec_index_args(args) else {
+        return Ok(Some(Value::Object(None)));
+    };
+    let (_, size) = al_state(ctx, this);
+    if index < 0 {
+        return Err(vec_negative_index(ctx, this, index));
+    }
+    if index >= size {
+        return Err(vec_aioobe(
+            index,
+            format!("Array index out of range: {index}"),
+        ));
+    }
+    native_al_remove_at(ctx, args)
+}
+
+fn native_vec_add_at(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let Some((this, index)) = vec_index_args(args) else {
+        return Ok(None);
+    };
+    let (_, size) = al_state(ctx, this);
+    if index < 0 {
+        return Err(vec_arraycopy_negative(ctx, this, index));
+    }
+    if index > size {
+        return Err(vec_aioobe(index, format!("{index} > {size}")));
+    }
+    native_al_add_at(ctx, args)
+}
+
 pub fn native_al_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // `List.get(int)` on a values view is not reachable from correct Java — the
     // real classes are `AbstractCollection`s and the cast to `List` throws
@@ -37100,7 +37175,7 @@ fn register_vector_natives(r: &mut NativeMethodRegistry) {
         c,
         "set",
         "(ILjava/lang/Object;)Ljava/lang/Object;",
-        native_al_set,
+        native_vec_set,
     );
     r.register(
         c,
@@ -37115,14 +37190,14 @@ fn register_vector_natives(r: &mut NativeMethodRegistry) {
         "(Ljava/lang/Object;)V",
         native_vec_add_element,
     );
-    r.register(c, "add", "(ILjava/lang/Object;)V", native_al_add_at);
+    r.register(c, "add", "(ILjava/lang/Object;)V", native_vec_add_at);
     r.register(
         c,
         "insertElementAt",
         "(Ljava/lang/Object;I)V",
         native_vec_insert_element_at,
     );
-    r.register(c, "remove", "(I)Ljava/lang/Object;", native_al_remove_at);
+    r.register(c, "remove", "(I)Ljava/lang/Object;", native_vec_remove_at);
     r.register(c, "remove", "(Ljava/lang/Object;)Z", native_al_remove_obj);
     r.register(
         c,
@@ -37174,13 +37249,20 @@ fn native_vec_set_element_at(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
     };
     let elem = args.get(1).copied().unwrap_or(Value::Object(None));
     let idx = match args.get(2) {
-        Some(Value::Int(i)) => *i as usize,
+        Some(Value::Int(i)) => *i,
         _ => return Ok(None),
     };
     let (data, size) = al_state(ctx, this);
-    if idx >= size as usize {
-        return Err(cratonvm_types::error::RuntimeError::aioobe_index_only(idx as i32).into());
+    // MEASURED 2026-08-13 (scratchpad/orch/V3.java): setElementAt words its
+    // two arms like elementAt, NOT like set -- "3 >= 3" past the end and the
+    // backing-array capacity text for a negative index.
+    if idx < 0 {
+        return Err(vec_negative_index(ctx, this, idx));
     }
+    if idx >= size {
+        return Err(vec_aioobe(idx, format!("{idx} >= {size}")));
+    }
+    let idx = idx as usize;
     if let Some(buf) = data {
         ctx.set_array_element(buf, idx, elem);
     }
@@ -37203,8 +37285,10 @@ fn native_vec_insert_element_at(ctx: &mut dyn NativeContext, args: &[Value]) -> 
         Some(Value::Int(i)) => *i,
         _ => return Ok(None),
     };
-    // Repack args as [this, idx, elem] to match add(int, Object) signature
-    native_al_add_at(ctx, &[Value::Object(Some(this)), Value::Int(idx), elem])
+    // insertElementAt shares add's two arms ("4 > 3", and arraycopy text for
+    // a negative index) -- measured, and `i == size` is legal for both.
+    // Repack as add(int, Object) and route through the CHECKED Vector form:
+    native_vec_add_at(ctx, &[Value::Object(Some(this)), Value::Int(idx), elem])
 }
 
 fn native_vec_remove_element_at(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
