@@ -2479,6 +2479,164 @@ pub(super) fn force_native_over_real_jdk_bytecode(
     {
         return true;
     }
+    // Same argument, for the classes a map view is now minted under
+    // (native-collections' `MAP_VIEW_CARRIERS`). These are REAL JDK classes,
+    // and their real bodies read `this$0` — which a CratonVM-minted view
+    // leaves null, because the view's state lives in ArrayList's own
+    // `elementData`/`size` slots instead. Every method the carriers declare
+    // themselves has to reach the registered native or it runs a JDK body over
+    // a layout that is not the JDK's.
+    //
+    // `equals`/`hashCode` are deliberately absent: the JDK's views inherit
+    // `AbstractCollection`'s identity semantics, which is what CratonVM should
+    // answer too, and there is no native registered for them on these classes
+    // (see `register_map_view_carrier_natives`).
+    if matches!(
+        class_name,
+        "java/util/HashMap$Values"
+            | "java/util/LinkedHashMap$LinkedValues"
+            | "java/util/TreeMap$Values"
+            | "java/util/TreeMap$EntrySet"
+            | "java/util/Hashtable$ValueCollection"
+            | "java/util/concurrent/ConcurrentHashMap$ValuesView"
+    ) && matches!(
+        method_name,
+        "size"
+            | "isEmpty"
+            | "contains"
+            | "iterator"
+            | "toArray"
+            | "toString"
+            | "remove"
+            | "clear"
+            | "forEach"
+            | "stream"
+            | "removeIf"
+            | "spliterator"
+    ) {
+        return true;
+    }
+    // The same again for the SET-shaped views (native-collections'
+    // `SET_VIEW_CARRIERS`). Here `equals`/`hashCode` ARE included: these
+    // carriers extend `AbstractSet`, whose `equals`/`hashCode` are the SET
+    // contract, and `register_set_view_carrier_natives` registers
+    // `native_hs_equals`/`native_hs_hash_code` for exactly that reason — the
+    // JDK bodies would compute it off a null `this$0`.
+    if matches!(
+        class_name,
+        "java/util/HashMap$KeySet"
+            | "java/util/HashMap$EntrySet"
+            | "java/util/LinkedHashMap$LinkedKeySet"
+            | "java/util/LinkedHashMap$LinkedEntrySet"
+            | "java/util/Hashtable$KeySet"
+            | "java/util/Hashtable$EntrySet"
+            | "java/util/TreeMap$KeySet"
+            | "java/util/concurrent/ConcurrentHashMap$EntrySetView"
+    ) && matches!(
+        method_name,
+        "size"
+            | "isEmpty"
+            | "add"
+            | "contains"
+            | "iterator"
+            | "toArray"
+            | "toString"
+            | "remove"
+            | "clear"
+            | "forEach"
+            | "stream"
+            | "removeIf"
+            | "spliterator"
+            | "addAll"
+            | "removeAll"
+            | "retainAll"
+            | "containsAll"
+            | "equals"
+            | "hashCode"
+            | "first"
+            | "last"
+            | "comparator"
+            | "headSet"
+            | "tailSet"
+            | "subSet"
+            | "descendingIterator"
+            | "descendingSet"
+            | "pollFirst"
+            | "pollLast"
+            | "ceiling"
+            | "floor"
+            | "higher"
+            | "lower"
+    ) {
+        return true;
+    }
+    // And for the sublist carrier (native-collections' `ASL_REAL_CLASS`). A
+    // CratonVM-minted view carries `(parent, offset, size, expected,
+    // viewParent)` PAST the class's own `root`/`parent`/`offset`/`size`
+    // (`asl_base`), so the real bodies would read fields this VM never fills
+    // and report the view empty. Unlike the carriers above, this class is ALSO
+    // instantiated by java.base's own `ArrayList.subList`, and forcing the
+    // native for those would be the mirror-image silent-empty bug — which is
+    // why every `native_asl_*` opens with `asl_delegate_foreign` and hands a
+    // receiver it did not mint straight back to this bytecode.
+    if class_name == "java/util/ArrayList$SubList"
+        && matches!(
+            method_name,
+            "size"
+                | "isEmpty"
+                | "get"
+                | "set"
+                | "iterator"
+                | "listIterator"
+                | "toArray"
+                | "toString"
+                | "contains"
+                | "containsAll"
+                | "indexOf"
+                | "lastIndexOf"
+                | "stream"
+                | "forEach"
+                | "spliterator"
+                | "hashCode"
+                | "equals"
+                | "subList"
+                | "add"
+                | "remove"
+                | "clear"
+                | "addAll"
+                | "removeIf"
+                | "sort"
+                | "removeAll"
+                | "retainAll"
+                | "replaceAll"
+                | "parallelStream"
+                | "getFirst"
+                | "getLast"
+                | "addFirst"
+                | "addLast"
+                | "removeFirst"
+                | "removeLast"
+                | "reversed"
+        )
+    {
+        return true;
+    }
+    // And for the iterator carriers (native-collections'
+    // `MAP_KEY_ITR_CARRIERS`). A `HashMap$KeyIterator`'s own bytecode walks the
+    // `next`/`current`/`index` fields `HashIterator` declares, and a
+    // CratonVM-minted one carries a SNAPSHOT past those slots instead
+    // (`key_itr_base`), so the real bodies would report every collection
+    // exhausted.
+    if matches!(
+        class_name,
+        "java/util/HashMap$KeyIterator"
+            | "java/util/HashMap$EntryIterator"
+            | "java/util/LinkedHashMap$LinkedKeyIterator"
+            | "java/util/LinkedHashMap$LinkedEntryIterator"
+    ) && matches!(method_name, "hasNext" | "next" | "remove")
+    {
+        return true;
+    }
     // BUG (found investigating the Tomcat Jasper/ecj JSP-compile NPE,
     // TestDefaultServlet.testBug57601 / TestMapperWebapps.testWelcomeFileStrict):
     // this function is the ONLY force-native gate consulted by the

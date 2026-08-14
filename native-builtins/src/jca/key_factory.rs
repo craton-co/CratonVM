@@ -1590,6 +1590,63 @@ fn pqc_spi_classes(algo: i32) -> Option<(String, String)> {
     Some((format!("{base}$KPG{suffix}"), format!("{base}$KF{suffix}")))
 }
 
+/// The default parameter set of a PQC UMBRELLA algorithm name, and the prefix
+/// its parameter sets share.
+///
+/// JDK 25 registers `ML-DSA` and `ML-KEM` as real `KeyPairGenerator`
+/// algorithms in their own right — `sun.security.provider.ML_DSA_Impls$KPG` and
+/// `com.sun.crypto.provider.ML_KEM_Impls$KPG`, both `NamedKeyPairGenerator`
+/// subclasses whose parameter set is chosen by
+/// `initialize(NamedParameterSpec)`. `algo_idx` knows only the PARAMETERISED
+/// spellings, so an umbrella request resolved to -1 and fell through
+/// `kpg_generate_key_pair` to its `NoSuchAlgorithmException` tail.
+///
+/// The defaults are measured against HotSpot JDK 25, not assumed: an
+/// uninitialised `KeyPairGenerator.getInstance("ML-DSA")` there produces a
+/// 1974-byte X.509 public key whose `getParams().getName()` is `ML-DSA-65`, and
+/// `("ML-KEM")` produces a 1206-byte key — `ML-KEM-768`. See
+/// `probes/PqcStepProbe.java`, which prints both columns side by side.
+fn pqc_umbrella(name: &str) -> Option<(&'static str, &'static str)> {
+    match name.to_ascii_uppercase().as_str() {
+        "ML-DSA" => Some(("ML-DSA-", "ML-DSA-65")),
+        "ML-KEM" => Some(("ML-KEM-", "ML-KEM-768")),
+        _ => None,
+    }
+}
+
+/// The concrete PQC algorithm index for a generator whose requested name was an
+/// umbrella, or `None` when it was not one.
+///
+/// Prefers the `NamedParameterSpec` a caller passed to `initialize` — netty's
+/// `pkitesting` asks for `ML-DSA` and then initialises with `ML-DSA-44`, which
+/// is exactly the JDK's own contract — and falls back to the parameter set
+/// HotSpot defaults to. The spec's name is only honoured when it belongs to the
+/// requested family, so `initialize(new NamedParameterSpec("ML-KEM-512"))` on an
+/// `ML-DSA` generator does not silently switch algorithms.
+fn resolve_pqc_umbrella(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    base: usize,
+) -> Option<i32> {
+    let requested = get_kpg_name(ctx, this)?;
+    let (prefix, default_name) = pqc_umbrella(&requested)?;
+    let from_spec = match ctx.get_field(this, base + KPG_OFF_SPEC) {
+        Value::Object(Some(spec)) => {
+            match ctx.invoke_virtual(spec, "getName", "()Ljava/lang/String;", &[]) {
+                Ok(Some(Value::Object(Some(s)))) => ctx.read_string(s),
+                _ => None,
+            }
+        }
+        _ => None,
+    };
+    let chosen = match from_spec {
+        Some(n) if n.to_ascii_uppercase().starts_with(prefix) && algo_idx(&n) >= 0 => n,
+        _ => default_name.to_string(),
+    };
+    let idx = algo_idx(&chosen);
+    (idx >= 0).then_some(idx)
+}
+
 /// Drive the real JDK PQC `KeyPairGenerator` SPI: `new KPG<n>()` →
 /// `generateKeyPair()`. `NamedKeyPairGenerator.generateKeyPair()` self-seeds
 /// from `JCAUtil.getDefSecureRandom()` when uninitialized (which works under
@@ -1678,6 +1735,135 @@ fn drive_real_pqc_keyfactory(
 // KeyPairGenerator natives
 // ---------------------------------------------------------------------------
 
+/// Whether `KeyPairGenerator.getInstance` refuses an algorithm nothing can
+/// serve. Default ON; `CRATONVM_JCA_LENIENT_GETINSTANCE=1` restores the old
+/// accept-anything behaviour so both arms are measurable in one binary.
+fn kpg_strict_get_instance() -> bool {
+    use std::sync::OnceLock;
+    static CACHE: OnceLock<bool> = OnceLock::new();
+    *CACHE.get_or_init(|| {
+        !cratonvm_types::flags::runtime_var_os("CRATONVM_JCA_LENIENT_GETINSTANCE")
+            .is_some_and(|v| v != "0" && !v.is_empty())
+    })
+}
+
+/// `CRATONVM_DBG_JCA_GETINSTANCE=1` — print every algorithm name that reaches
+/// `getInstance` with nothing able to serve it.
+///
+/// Deliberately not deduplicated and deliberately not a table: a dedup set
+/// would be a new global lock (the `lock_discipline_ratchet` counts those and
+/// its baseline is already over), and `sort -u` on the log does the same job.
+fn kpg_census_enabled() -> bool {
+    use std::sync::OnceLock;
+    static CACHE: OnceLock<bool> = OnceLock::new();
+    *CACHE.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JCA_GETINSTANCE").is_some()
+    })
+}
+
+/// Can anything in this VM produce a `KeyPairGenerator` for `alg`?
+///
+/// Two disjoint worlds have to be asked, which is the whole reason
+/// `getInstance` never refused anything: the algorithms CratonVM serves from
+/// its own natives are keyed by `algo_idx` and appear in NO service registry,
+/// while the algorithms a real provider (BouncyCastle, BC-FIPS) brings are in
+/// the registry and unknown to `algo_idx`. A test that consults only one of
+/// them is wrong in one direction or the other.
+fn kpg_serviceable(alg: &str, provider_name: &str) -> bool {
+    if kpg_can_generate(alg) {
+        return true;
+    }
+    if provider_name.is_empty() {
+        return super::provider_chain::any_provider_offers("KeyPairGenerator", alg);
+    }
+    // A specific provider was named: only that provider's own service list
+    // counts, exactly as the JDK's two-argument overload specifies.
+    super::provider_chain::provider_offers(provider_name, "KeyPairGenerator", alg)
+}
+
+/// Would [`kpg_generate_key_pair`] produce a key for `alg`, or throw?
+///
+/// This is the predicate `getInstance` refuses on, so it has to equal the
+/// generate-side dispatch and not merely resemble it. Each arm below names the
+/// branch of `kpg_generate_key_pair` it stands for; **if you add a branch
+/// there, add it here** — `kpg_can_generate_matches_the_generate_dispatch`
+/// pins the pair, and the cost of drift runs in both directions:
+///
+/// * too NARROW and `getInstance` refuses an algorithm the VM can do. The first
+///   cut of this function was `algo_idx(alg) >= 0`, which refused the
+///   `ML-DSA`/`ML-KEM` umbrella names — serviceable, but resolved by
+///   `resolve_pqc_umbrella` at generate time rather than by `algo_idx`;
+/// * too WIDE and the old bug is back: a generator handed out for an algorithm
+///   that throws on use, with the caller's provider fallback skipped.
+///
+/// Measured with `probes/KpgEndToEnd.java`, which prints `getInstance` and
+/// `generateKeyPair` per algorithm on both VMs. Deliberately EXCLUDED because
+/// `generateKeyPair` throws for them today: `X25519`, `X448`, `XDH`, `DH`,
+/// `SLH-DSA`. HotSpot serves all five, so each is a real gap — but refusing
+/// them here is strictly better than the generator-that-cannot-generate this
+/// function replaces, because it lets a caller reach BouncyCastle, which
+/// implements every one of them.
+fn kpg_can_generate(alg: &str) -> bool {
+    let idx = algo_idx(alg);
+    // The real-keygen branches: RSA (and RSASSA-PSS, which shares RSA key
+    // material), EC/ECDSA, DSA, and Ed25519/Ed448/EdDSA via the real SunEC SPI.
+    if matches!(idx, ALGO_RSA | ALGO_EC | ALGO_DSA | ALGO_ED25519 | ALGO_ED448) {
+        return true;
+    }
+    // The parameterised PQC names, driven through the real JDK 25 SPI.
+    if pqc_spi_classes(idx).is_some() {
+        return true;
+    }
+    // …and the umbrella names, whose parameter set is picked at generate time.
+    pqc_umbrella(alg).is_some()
+}
+
+/// The JDK provider that serves `alg`, for `KeyPairGenerator.getProvider()`.
+///
+/// Every name here was read off HotSpot JDK 25 with
+/// `probes/JcaGetInstanceProbe.java`, which prints `getProvider().getName()`
+/// per engine and algorithm — the split is not guessable (`ML-DSA` is `SUN`
+/// while `ML-KEM` is `SunJCE`, and `DSA` is `SUN` while `RSA` is `SunRsaSign`).
+///
+/// `None` for an algorithm this VM does not serve; `getInstance` refuses those
+/// before a generator exists to ask.
+fn kpg_provider_name(alg: &str) -> Option<&'static str> {
+    if pqc_umbrella(alg).is_some() || pqc_spi_classes(algo_idx(alg)).is_some() {
+        // FIPS 204 signatures live in SUN, FIPS 203 KEM in SunJCE.
+        return Some(if alg.to_ascii_uppercase().starts_with("ML-KEM") {
+            "SunJCE"
+        } else {
+            "SUN"
+        });
+    }
+    match algo_idx(alg) {
+        // RSASSA-PSS shares RSA key material and RSA's provider.
+        ALGO_RSA => Some("SunRsaSign"),
+        ALGO_EC | ALGO_ED25519 | ALGO_ED448 => Some("SunEC"),
+        ALGO_DSA => Some("SUN"),
+        _ => None,
+    }
+}
+
+/// `KeyPairGenerator.getProvider()`.
+///
+/// Nothing was registered for it, so the real JDK bytecode ran and handed back
+/// the `provider` field — which CratonVM never assigns, so **every** generator
+/// this VM produced reported `null`, including the ones that work. Code that
+/// logs, audits or branches on the selected provider saw nothing at all.
+fn kpg_get_provider(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = this_arg(args)?;
+    let name = get_kpg_name(ctx, this)
+        .as_deref()
+        .and_then(kpg_provider_name)
+        // A generator can only exist for a serviceable algorithm, so the
+        // fallback is unreachable in practice; `SUN` is the JDK's own default
+        // provider and the least surprising answer if it ever is reached.
+        .unwrap_or("SUN");
+    let p = crate::jca::make_named_provider(ctx, name)?;
+    Ok(Some(Value::Object(Some(p))))
+}
+
 fn kpg_get_instance(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let alg = read_string(ctx, args, 0);
     let idx = algo_idx(&alg);
@@ -1700,6 +1886,35 @@ fn kpg_get_instance(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
             ctx,
             &format!("no KeyPairGenerator {alg} implementation for provider {provider_name}"),
         ));
+    }
+
+    // JCA contract: `getInstance` is the SELECTION step, and callers use its
+    // failure to pick another provider. CratonVM accepted every name and
+    // deferred the refusal to `generateKeyPair`, so the standard
+    //
+    //     try { KeyPairGenerator.getInstance(alg); }
+    //     catch (GeneralSecurityException e) { getInstance(alg, bouncyCastle()); }
+    //
+    // never reached its fallback — `io.netty.pkitesting.Algorithms
+    // .keyPairGenerator` verbatim. A caller's fallback was dead code for exactly
+    // the algorithms it exists for. Measured against HotSpot JDK 25:
+    // `getInstance("TOTALLY-BOGUS-ALG")` throws there and returned a generator
+    // here.
+    if !kpg_serviceable(&alg, &provider_name) {
+        if kpg_census_enabled() {
+            eprintln!("[jca-getinstance] unserviceable KeyPairGenerator alg={alg:?} provider={provider_name:?}");
+        }
+        if kpg_strict_get_instance() {
+            // Wording taken from the JDK, which is what callers match on when
+            // they log or test: `<alg> KeyPairGenerator not available` for the
+            // one-argument form, and a provider-naming message for the other.
+            let message = if provider_name.is_empty() {
+                format!("{alg} KeyPairGenerator not available")
+            } else {
+                format!("no such algorithm: {alg} for provider {provider_name}")
+            };
+            return Err(throw_no_such_algorithm(ctx, &message));
+        }
     }
 
     let is_bc = is_bc_provider(&provider_name);
@@ -1935,6 +2150,16 @@ fn kpg_generate_key_pair(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     // SunJCE) for a genuine, HotSpot-equivalent keypair. Safe now that the
     // native `SHA3.keccak` override makes SHAKE256 produce real output (without
     // it the JDK lattice keygen yields degenerate all-zero keys).
+    //
+    // An UMBRELLA request (`ML-DSA` / `ML-KEM`, parameter set supplied through
+    // `initialize(NamedParameterSpec)`) resolves here rather than in
+    // `algo_idx`, because the answer depends on this receiver's `initialize`
+    // history and not on the name alone. See `resolve_pqc_umbrella`.
+    let algo = if pqc_spi_classes(algo).is_none() {
+        resolve_pqc_umbrella(ctx, this, base).unwrap_or(algo)
+    } else {
+        algo
+    };
     if crate::route_pqc_to_real() && pqc_spi_classes(algo).is_some() {
         return drive_real_pqc_keypair(ctx, algo);
     }
@@ -2868,6 +3093,15 @@ pub fn register(r: &mut NativeMethodRegistry) {
         "()Ljava/lang/String;",
         kpg_get_algorithm,
     );
+    // Nothing served this, so the real JDK bytecode returned the unset
+    // `provider` field and EVERY generator reported `null`. See
+    // `kpg_get_provider`.
+    r.register(
+        kpg,
+        "getProvider",
+        "()Ljava/security/Provider;",
+        kpg_get_provider,
+    );
     // <clinit> shim — the JDK-25 KeyPairGenerator.<clinit> reads
     // `sun.security.util.Debug.getInstance("jca", "KeyPairGenerator")`
     // which we already shim, but defensively no-op the whole clinit so
@@ -3040,6 +3274,37 @@ mod tests {
     use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
 
+    /// `kpg_can_generate` decides whether `getInstance` refuses, so it has to
+    /// agree with `kpg_generate_key_pair`'s dispatch. Both columns here were
+    /// measured with `probes/KpgEndToEnd.java` against this VM — the `false`
+    /// rows are algorithms whose `generateKeyPair` throws
+    /// `NoSuchAlgorithmException` today, not algorithms nobody tried.
+    #[test]
+    fn kpg_can_generate_matches_the_generate_dispatch() {
+        for alg in [
+            "RSA", "RSASSA-PSS", "EC", "ECDSA", "DSA", "Ed25519", "Ed448", "EdDSA",
+            "ML-DSA-44", "ML-DSA-65", "ML-DSA-87", "ML-KEM-512", "ML-KEM-768",
+            "ML-KEM-1024", "ML-DSA", "ML-KEM",
+        ] {
+            assert!(super::kpg_can_generate(alg), "{alg} must be serviceable");
+        }
+        for alg in ["X25519", "X448", "XDH", "DH", "SLH-DSA", "TOTALLY-BOGUS-ALG", ""] {
+            assert!(
+                !super::kpg_can_generate(alg),
+                "{alg}: generateKeyPair throws for it, so getInstance must refuse it"
+            );
+        }
+    }
+
+    /// Case-insensitivity is part of the JCA contract, and a refusal that is
+    /// case-sensitive would reject `ml-dsa` while accepting `ML-DSA`.
+    #[test]
+    fn kpg_can_generate_is_case_insensitive() {
+        for alg in ["ml-dsa", "Ml-Kem", "rsa", "ed25519", "ml-dsa-44"] {
+            assert!(super::kpg_can_generate(alg), "{alg} must be serviceable");
+        }
+    }
+
     #[test]
     fn algo_idx_round_trip() {
         assert_eq!(algo_idx("RSA"), ALGO_RSA);
@@ -3208,7 +3473,12 @@ mod tests {
 
     #[test]
     fn keypairgenerator_preserves_requested_algorithm_name() {
-        for requested in ["RSASSA-PSS", "Ed448", "Totally-Bogus"] {
+        // `Totally-Bogus` used to be in this list, back when `getInstance`
+        // accepted every name. It is now covered by
+        // `keypairgenerator_refuses_what_it_cannot_generate` — the generator it
+        // used to hand back could not generate anything, so there was no
+        // algorithm name worth preserving.
+        for requested in ["RSASSA-PSS", "Ed448"] {
             let mut ctx = crate::test_utils::MockNativeContext::new();
             let name = ctx.create_string(requested);
             let kpg = kpg_get_instance(&mut ctx, &[Value::Object(Some(name))])
@@ -3239,21 +3509,40 @@ mod tests {
         assert!(!is_bc_provider("SunEC"));
     }
 
+    /// `getInstance` REFUSES an algorithm nothing can generate, rather than
+    /// handing back a generator that throws on use. The old behaviour made a
+    /// caller's provider fallback unreachable — see `kpg_serviceable`.
+    #[test]
+    fn keypairgenerator_refuses_what_it_cannot_generate() {
+        for algo in ["X25519", "X448", "XDH", "DH", "SLH-DSA", "Totally-Bogus"] {
+            let mut ctx = crate::test_utils::MockNativeContext::new();
+            let name = ctx.create_string(algo);
+            let err = kpg_get_instance(&mut ctx, &[Value::Object(Some(name))])
+                .expect_err(&format!("{algo}: getInstance must refuse it"));
+            match err {
+                MethodCallFailed::ExceptionThrown(_) => {}
+                other => panic!("{algo}: expected NoSuchAlgorithmException, got {other:?}"),
+            }
+        }
+    }
+
     /// No-synthetic-stubs policy: a `KeyPairGenerator` for an algorithm we
-    /// recognise but cannot implement (ML-KEM, ML-DSA, X25519) — or an outright
-    /// unknown name — must throw from `generateKeyPair`, never return a
-    /// `KeyPair` with empty key material. The previous fallback minted an
-    /// empty-DER / `key_id == 0` key, presenting failed keygen as success.
+    /// recognise but cannot implement must throw from `generateKeyPair`, never
+    /// return a `KeyPair` with empty key material. The original fallback minted
+    /// an empty-DER / `key_id == 0` key, presenting failed keygen as success.
+    ///
+    /// The `X25519` / unknown-name half of that guarantee now lives in
+    /// `keypairgenerator_refuses_what_it_cannot_generate`: `getInstance`
+    /// refuses those before a generator exists, which is earlier and stronger.
     #[test]
     fn unimplemented_algorithm_keygen_throws_not_empty_key() {
-        for algo in [
-            "ML-KEM-512",
-            "ML-KEM-768",
-            "ML-DSA-44",
-            "ML-DSA-65",
-            "X25519",
-            "Totally-Bogus",
-        ] {
+        // These names ARE serviceable — `getInstance` hands out a generator and
+        // the real JDK SPI produces genuine keys under a real VM. The mock has
+        // no SPI to drive, so `generateKeyPair` must still fail LOUDLY rather
+        // than return an empty key, which is what this test has always been
+        // for. The refusal half moved to
+        // `keypairgenerator_refuses_what_it_cannot_generate`.
+        for algo in ["ML-KEM-512", "ML-KEM-768", "ML-DSA-44", "ML-DSA-65"] {
             let mut ctx = crate::test_utils::MockNativeContext::new();
             let name = ctx.create_string(algo);
             let kpg = kpg_get_instance(&mut ctx, &[Value::Object(Some(name))])

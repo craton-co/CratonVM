@@ -5935,9 +5935,28 @@ fn cmstateset_same_set(ctx: &dyn NativeContext, a: ObjectRef, b: ObjectRef) -> b
 }
 
 fn xmlchar_chars_array(ctx: &mut dyn NativeContext) -> Option<ObjectRef> {
-    let class_id = ctx
-        .class_id_by_name(XERCES_XMLCHAR)
-        .or_else(|| ctx.ensure_class_initialized(XERCES_XMLCHAR).ok())?;
+    // LOADED is not enough — the class must be INITIALIZED.
+    //
+    // `XMLChar.<clinit>` assigns `CHARS = new byte[0x10000]` first and spends
+    // the rest of its body filling it. A reader that accepts "the class id
+    // resolves" (which `class_id_by_name` answers for a merely-loaded class)
+    // can therefore read the array reference while another thread is still
+    // filling it, and every character it asks about below the fill point comes
+    // back with a zero mask. `isNameStart('c')` then answers false and xerces
+    // rejects `<component-set>` with "The markup in the document preceding the
+    // root element must be well-formed" at [1,2].
+    //
+    // Ordinary bytecode cannot hit this: the `getstatic XMLChar.CHARS` inside
+    // `XMLEntityScanner.scanQName` carries the initialization barrier. It is
+    // reachable only because CratonVM replaces that scanner with a native, so
+    // the barrier the bytecode would have run is gone unless this asks for it.
+    let class_id = match ctx.class_id_by_name(XERCES_XMLCHAR) {
+        Some(id) => {
+            ctx.ensure_class_initialized_with_class_id(id).ok()?;
+            id
+        }
+        None => ctx.ensure_class_initialized(XERCES_XMLCHAR).ok()?,
+    };
     let field_index = ctx.static_field_index_by_name(class_id, "CHARS")?;
     match ctx.get_static_field(class_id, field_index) {
         Value::Object(Some(chars)) => Some(chars),
@@ -6595,11 +6614,48 @@ fn populate_real_thread_holder(
     let group = match group {
         Value::Object(Some(_)) => group,
         _ => {
-            let cur = ctx.current_thread_object();
-            let g = ctx.get_field_by_name(cur, "holder");
-            match g {
-                Value::Object(Some(h)) => ctx.get_field_by_name(h, "group"),
-                _ => Value::Object(None),
+            // A thread created with no group of its own takes the installed
+            // SecurityManager's `getThreadGroup()` first, and only then the
+            // creating thread's group. That is the JDK's rule up to 23; JDK 24
+            // dropped it along with the SecurityManager itself (JEP 486).
+            //
+            // CratonVM deliberately did NOT adopt JEP 486 — `System
+            // .setSecurityManager` still installs, because the exec and Panama
+            // gates consult the installed manager for real (see
+            // `security_manager::register_system_security`). Keeping the
+            // manager alive but ignoring the one hook it has over thread
+            // construction left it half-alive: netty's
+            // `DefaultThreadFactoryTest
+            // .testDefaultThreadFactoryInheritsThreadGroupFromSecurityManager`
+            // installs a manager whose `getThreadGroup()` returns a sticky
+            // group and got the creating thread's group instead.
+            //
+            // This branch cannot introduce a divergence from HotSpot 25: it is
+            // reachable only once a SecurityManager is installed, which on
+            // HotSpot 25 cannot happen at all. The default
+            // `SecurityManager.getThreadGroup()` body is
+            // `Thread.currentThread().getThreadGroup()`, i.e. exactly the
+            // fallback below, so an unremarkable manager changes nothing.
+            let from_manager = match crate::security_manager::get_security_manager(&*ctx) {
+                Some(sm) => {
+                    match ctx.invoke_virtual(sm, "getThreadGroup", "()Ljava/lang/ThreadGroup;", &[])
+                    {
+                        Ok(Some(Value::Object(Some(g)))) => Some(g),
+                        _ => None,
+                    }
+                }
+                None => None,
+            };
+            match from_manager {
+                Some(g) => Value::Object(Some(g)),
+                None => {
+                    let cur = ctx.current_thread_object();
+                    let g = ctx.get_field_by_name(cur, "holder");
+                    match g {
+                        Value::Object(Some(h)) => ctx.get_field_by_name(h, "group"),
+                        _ => Value::Object(None),
+                    }
+                }
             }
         }
     };
@@ -40163,6 +40219,167 @@ fn register_synchronized_collection_wrapper_natives(registry: &mut NativeMethodR
             "()[Ljava/lang/Object;",
             native_sync_collection_to_array,
         );
+        // The rest of the `Collection` contract, forwarded verbatim — see
+        // `sync_collection_delegate` for why a wrapper now needs all of it.
+        registry.register(class, "clear", "()V", |ctx, args| {
+            sync_collection_delegate(ctx, args, "clear", "()V", None)
+        });
+        registry.register(class, "toString", "()Ljava/lang/String;", |ctx, args| {
+            sync_collection_delegate(
+                ctx,
+                args,
+                "toString",
+                "()Ljava/lang/String;",
+                Some(Value::Object(None)),
+            )
+        });
+        registry.register(class, "stream", "()Ljava/util/stream/Stream;", |ctx, args| {
+            sync_collection_delegate(
+                ctx,
+                args,
+                "stream",
+                "()Ljava/util/stream/Stream;",
+                Some(Value::Object(None)),
+            )
+        });
+        registry.register(
+            class,
+            "spliterator",
+            "()Ljava/util/Spliterator;",
+            |ctx, args| {
+                sync_collection_delegate(
+                    ctx,
+                    args,
+                    "spliterator",
+                    "()Ljava/util/Spliterator;",
+                    Some(Value::Object(None)),
+                )
+            },
+        );
+        registry.register(
+            class,
+            "forEach",
+            "(Ljava/util/function/Consumer;)V",
+            |ctx, args| {
+                sync_collection_delegate(
+                    ctx,
+                    args,
+                    "forEach",
+                    "(Ljava/util/function/Consumer;)V",
+                    None,
+                )
+            },
+        );
+        registry.register(
+            class,
+            "containsAll",
+            "(Ljava/util/Collection;)Z",
+            |ctx, args| {
+                sync_collection_delegate(
+                    ctx,
+                    args,
+                    "containsAll",
+                    "(Ljava/util/Collection;)Z",
+                    Some(Value::Int(0)),
+                )
+            },
+        );
+        registry.register(class, "addAll", "(Ljava/util/Collection;)Z", |ctx, args| {
+            sync_collection_delegate(
+                ctx,
+                args,
+                "addAll",
+                "(Ljava/util/Collection;)Z",
+                Some(Value::Int(0)),
+            )
+        });
+        registry.register(
+            class,
+            "removeAll",
+            "(Ljava/util/Collection;)Z",
+            |ctx, args| {
+                sync_collection_delegate(
+                    ctx,
+                    args,
+                    "removeAll",
+                    "(Ljava/util/Collection;)Z",
+                    Some(Value::Int(0)),
+                )
+            },
+        );
+        registry.register(
+            class,
+            "retainAll",
+            "(Ljava/util/Collection;)Z",
+            |ctx, args| {
+                sync_collection_delegate(
+                    ctx,
+                    args,
+                    "retainAll",
+                    "(Ljava/util/Collection;)Z",
+                    Some(Value::Int(0)),
+                )
+            },
+        );
+        registry.register(
+            class,
+            "removeIf",
+            "(Ljava/util/function/Predicate;)Z",
+            |ctx, args| {
+                sync_collection_delegate(
+                    ctx,
+                    args,
+                    "removeIf",
+                    "(Ljava/util/function/Predicate;)Z",
+                    Some(Value::Int(0)),
+                )
+            },
+        );
+        registry.register(
+            class,
+            "toArray",
+            "([Ljava/lang/Object;)[Ljava/lang/Object;",
+            |ctx, args| {
+                sync_collection_delegate(
+                    ctx,
+                    args,
+                    "toArray",
+                    "([Ljava/lang/Object;)[Ljava/lang/Object;",
+                    Some(Value::Object(None)),
+                )
+            },
+        );
+        registry.register(
+            class,
+            "toArray",
+            "(Ljava/util/function/IntFunction;)[Ljava/lang/Object;",
+            |ctx, args| {
+                sync_collection_delegate(
+                    ctx,
+                    args,
+                    "toArray",
+                    "(Ljava/util/function/IntFunction;)[Ljava/lang/Object;",
+                    Some(Value::Object(None)),
+                )
+            },
+        );
+        // `equals`/`hashCode` ONLY on the Set wrapper, matching the JDK:
+        // `SynchronizedSet` overrides both to delegate (the Set contract),
+        // `SynchronizedCollection` inherits `Object` identity and must keep it.
+        if class == "java/util/Collections$SynchronizedSet" {
+            registry.register(class, "hashCode", "()I", |ctx, args| {
+                sync_collection_delegate(ctx, args, "hashCode", "()I", Some(Value::Int(0)))
+            });
+            registry.register(class, "equals", "(Ljava/lang/Object;)Z", |ctx, args| {
+                sync_collection_delegate(
+                    ctx,
+                    args,
+                    "equals",
+                    "(Ljava/lang/Object;)Z",
+                    Some(Value::Int(0)),
+                )
+            });
+        }
     }
     let map = "java/util/Collections$SynchronizedMap";
     registry.register(map, "<init>", "(Ljava/util/Map;)V", native_sync_map_init);

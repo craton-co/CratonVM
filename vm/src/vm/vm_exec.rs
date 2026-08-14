@@ -2908,8 +2908,34 @@ fn safe_native_call_impl(
         // where the bytes had gone. `old_gen_needs_gc` is the same 75 %
         // threshold both major-GC branches use, so the collection this admits
         // is exactly the one that reclaims old.
+        // `|| hard_alloc_failure()` — ZGC Phase 2.4 (2026-08-13). The two
+        // predicates above are OCCUPANCY questions, and on a non-compacting
+        // heap occupancy is not what binds: an arena refuses a 2 MB array
+        // because no single hole is 2 MB, which it can do with `allocated` at
+        // 7% of capacity. `ZgcRealHeap::alloc_raw` latches on that refusal and
+        // its comment says exactly why the re-check below it is wrong — "a
+        // request that just failed is stronger evidence that a cycle is due
+        // than the `allocated >= gc_threshold` predicate, which counts LIVE
+        // bytes and therefore cannot see the bump space this heap never
+        // rewinds". It was right, and until this line the consumer overruled
+        // it: `needs_gc()` answered no, the latch was cleared a few lines
+        // below without collecting, and the signal was dropped. That is the
+        // 2026-08-13 `TestNonBlockingAPI` shape, where the arena was full of
+        // TLAB *reservations* the live-byte counter cannot see.
+        //
+        // A collection is worth running there even though the failing request
+        // has already raised its `OutOfMemoryError`: this sweep coalesces the
+        // free list and retracts the bump cursor into the freed tail, so it
+        // restores CONTIGUITY, which is the resource that was missing. The
+        // next request is the one it saves.
+        //
+        // It cannot storm — the bit is set only by a genuine refusal, is
+        // cleared unconditionally below, and `gc_overhead_limit_exceeded`
+        // still gates it, which is the same bound the soft path relies on.
         if !crate::runtime::interpreter::gc_overhead_limit_exceeded(shared)
-            && (shared.mem.heap.needs_gc() || shared.mem.heap.old_gen_needs_gc())
+            && (shared.mem.heap.needs_gc()
+                || shared.mem.heap.old_gen_needs_gc()
+                || shared.mem.heap.hard_alloc_failure())
         {
             // `maybe_gc_forced` retires this thread's TLAB itself.
             crate::runtime::interpreter::maybe_gc_forced_pub(shared, thread);
@@ -2917,8 +2943,11 @@ fn safe_native_call_impl(
         }
         // Clear even when the gates said no: the flag was stale (another
         // thread's GC already relieved young) or the heap is genuinely full
-        // of live data (overhead limit) — the next spill re-sets it.
+        // of live data (overhead limit) — the next spill re-sets it. Same for
+        // the hard latch, which `collect_garbage` also lowers; clearing it
+        // here covers the overhead-limited path, where no cycle ran to do it.
         shared.mem.heap.clear_young_spill_pressure();
+        shared.mem.heap.clear_hard_alloc_failure();
     }
     if stw_pending || requested_gc || pressure_gc {
         let mut fresh = args.to_vec();
@@ -3083,7 +3112,40 @@ fn safe_native_call_impl(
                 "unknown native method panic".to_string()
             };
             let in_bootstrap = shared.get_init_level() < 4;
-            if (msg.contains("unaligned pointer") || msg.contains("null pointer")) && in_bootstrap {
+            if let Some(oom) = &return_oom {
+                // A heap-exhaustion unwind is NOT a native bug and must not be
+                // reported as one. `NativeAllocOom` is neither a `String` nor a
+                // `&str`, so the ladder above degrades it to "unknown native
+                // method panic" and the final arm below logged that at ERROR,
+                // naming a callback address and a Java frame — which is how a
+                // working, catchable `OutOfMemoryError` came to read as a VM
+                // crash, and why the Tomcat `TestNonBlockingAPI` page filed
+                // "root cause of the native method panic" as an open question.
+                // There was no panic to root-cause. Say what actually happened,
+                // at the severity it actually has.
+                let top = thread
+                    .frames
+                    .last()
+                    .map(|f| {
+                        format!(
+                            "{}.{}{}",
+                            f.class_name(),
+                            f.method_name(),
+                            f.method_descriptor()
+                        )
+                    })
+                    .unwrap_or_default();
+                tracing::warn!(
+                    target: "cratonvm::gc::guard",
+                    java_frame = %top,
+                    "a native allocation could not be served and unwound to the \
+                     native-call boundary, where it becomes a catchable \
+                     java.lang.OutOfMemoryError ({oom:?}). This is the handled \
+                     heap-exhaustion path, not a native method fault.",
+                );
+            } else if (msg.contains("unaligned pointer") || msg.contains("null pointer"))
+                && in_bootstrap
+            {
                 shared
                     .debug
                     .swallow_counter
@@ -4918,6 +4980,72 @@ impl NativeContextImpl<'_> {
             }
         }
         self.shared.mem.heap.alloc_object(class_id, num_fields)
+    }
+}
+
+/// `class: message` for a Throwable, read out of the heap **without invoking
+/// any Java code and without allocating a single Java object**.
+///
+/// Every caller is on a thread-death or double-fault path, and at least one of
+/// them runs on a heap that has just refused an allocation. `toString()` would
+/// need a `StringBuilder`, a `char[]` and a `String` to answer, so on exactly
+/// the failure this exists to describe it would fail again — and a second
+/// failure inside the reporter is what turns a legible error into a silent
+/// one. So: class name from the class manager, `detailMessage` read straight
+/// out of its field slot.
+///
+/// Mirrors the field walk in `runtime::exceptions::set_detail_message_by_name`
+/// (the write side), including its `_fN` opaque-bootstrap-metadata fallback,
+/// so the two cannot disagree about which slot holds the message.
+pub(crate) fn describe_throwable(shared: &SharedVm, exc: ObjectRef) -> String {
+    if shared.mem.heap.is_object_address(exc.as_ptr() as usize).is_none() {
+        return format!("<not a live object: {:p}>", exc.as_ptr());
+    }
+    let class_id = shared.mem.heap.class_id_of(exc);
+    let (name, message_slot) = {
+        let cm = shared.classes.class_manager.read();
+        let name = cm
+            .get_class(class_id)
+            .map(|c| c.name.to_string())
+            .unwrap_or_else(|| format!("<class_id={}>", class_id.as_u32()));
+        let mut slot = None;
+        let mut opaque = None;
+        let mut walk = Some(class_id);
+        while let Some(cid) = walk {
+            let Some(cls) = cm.get_class(cid) else { break };
+            if &*cls.name == "java/lang/Throwable"
+                && cls.fields.len() >= 2
+                && cls.fields.iter().take(2).all(|f| f.name.starts_with("_f"))
+            {
+                opaque = Some(cls.first_field_index + 1);
+            }
+            let mut inst = 0usize;
+            for f in &cls.fields {
+                if f.is_static() {
+                    continue;
+                }
+                if &*f.name == "detailMessage" {
+                    slot = Some(cls.first_field_index + inst);
+                    break;
+                }
+                inst += 1;
+            }
+            if slot.is_some() {
+                break;
+            }
+            walk = cls.superclass;
+        }
+        (name, slot.or(opaque))
+    };
+    let message = message_slot
+        .map(|idx| shared.mem.heap.get_field(exc, idx))
+        .and_then(|v| match v {
+            Value::Object(Some(s)) => super::read_java_string(&shared.mem.heap, s),
+            _ => None,
+        });
+    match message {
+        Some(m) => format!("{name}: {m}"),
+        None => name,
     }
 }
 
@@ -8839,6 +8967,25 @@ impl<'a> NativeClassAccess for NativeContextImpl<'a> {
             .class_manager
             .read()
             .find_all_resource_urls(name)
+    }
+
+    fn next_resource_url(
+        &self,
+        name: &str,
+        segment: u32,
+        index: u32,
+    ) -> Option<(String, u32, u32)> {
+        let (url, seg, idx) = self
+            .shared
+            .classes
+            .class_manager
+            .read()
+            .next_resource_url_from(name, segment as usize, index as usize)?;
+        Some((url, seg as u32, idx as u32))
+    }
+
+    fn resource_name_supports_incremental_scan(&self, name: &str) -> bool {
+        cratonvm_classloading::ClassManager::resource_name_supports_incremental_scan(name)
     }
 
     fn find_all_resource_bytes(&self, name: &str) -> Vec<Vec<u8>> {
@@ -13676,9 +13823,40 @@ impl<'a> NativeThreadAccess for NativeContextImpl<'a> {
                     );
                     jvm_thread.native_pin_roots.truncate(pin_base);
                     if let Err(de) = dispatch_result {
+                        // NAME both throwables. This used to print two raw
+                        // `ObjectRef { ptr: 0x... }` addresses, which says a
+                        // thread died and a handler died with it and nothing
+                        // whatsoever about either — the state the Tomcat
+                        // `TestNonBlockingAPI` double fault was first reported
+                        // in, where neither exception could be identified from
+                        // the log at all.
+                        //
+                        // `describe_throwable` deliberately reads the class and
+                        // `detailMessage` out of the heap instead of invoking
+                        // `toString()`: the commonest reason the handler
+                        // dispatch fails in the first place is that the heap
+                        // cannot serve an allocation, and a reporter that needs
+                        // three of them would fail for the same reason and
+                        // print nothing.
+                        let first = shared_arc
+                            .mem
+                            .heap
+                            .is_object_address(exc_now.as_ptr() as usize)
+                            .map(|_| describe_throwable(&shared_arc, exc_now))
+                            .unwrap_or_else(|| format!("{e:?}"));
+                        let second = match &de {
+                            MethodCallFailed::ExceptionThrown(d) => {
+                                describe_throwable(&shared_arc, *d)
+                            }
+                            other => format!("{other:?}"),
+                        };
+                        // HotSpot's shape first, so the ORIGINAL failure is
+                        // legible even when the handler chain is what broke —
+                        // the whole point of a fallback report.
+                        eprintln!("Exception in thread \"{name}\" {first}");
                         eprintln!(
-                            "Thread {} terminated with error: {:?} (dispatchUncaughtException also failed: {:?})",
-                            tid, e, de
+                            "Thread {tid} terminated with error: {first} \
+                             (dispatchUncaughtException also failed: {second})",
                         );
                     }
                 } else {
@@ -16250,12 +16428,28 @@ impl<'a> NativeSystemAccess for NativeContextImpl<'a> {
         // This allows the library to register its native methods via RegisterNatives.
         // Safety: JNI_OnLoad has a fixed, well-known signature.
         //
-        // Windows: Apache `tcnative-*.dll` and Netty `*tcnative*.dll` often fault
-        // inside `JNI_OnLoad` / `RegisterNatives` when paired with CratonVM. We keep
-        // the DLL loaded (classpath / Tomcat may probe for its presence) but skip
-        // `JNI_OnLoad` — Java entry points are satisfied via Rust stubs and
-        // `find_jni_native` / `resolve_jni_native_in_libraries` blocks for
-        // `org/apache/tomcat/jni/**` and `io/netty/internal/tcnative/**`.
+        // Windows: Apache `tcnative-*.dll` faults inside `JNI_OnLoad` /
+        // `RegisterNatives` when paired with CratonVM. We keep the DLL loaded
+        // (classpath / Tomcat may probe for its presence) but skip `JNI_OnLoad`
+        // — Java entry points are satisfied by Rust stubs and `find_jni_native`
+        // / `resolve_jni_native_in_libraries` blocks for
+        // `org/apache/tomcat/jni/**`.
+        //
+        // Netty's `netty_tcnative_*` USED to be skipped by the same rule. It no
+        // longer is: that blanket skip was written when `RegisterNatives` could
+        // not serve the `FindClass` + `RegisterNatives` idiom every `JNI_OnLoad`
+        // uses at all (see `native/jni.rs`'s index-215 note — `FindClass`
+        // returned NULL, so the whole path was dead and any library that tried
+        // it produced an `UnsatisfiedLinkError` at best). With that fixed, the
+        // skip has one visible consequence and no remaining benefit:
+        // `OpenSsl.isAvailable()` is permanently false, so netty's own suites
+        // silently stop generating every `SslProvider.OPENSSL` /
+        // `OPENSSL_REFCNT` parameter — `ParameterizedSslHandlerTest` enumerated
+        // 7 of HotSpot's 63 tests, `SslErrorTest` 0 of 72 — and the
+        // `SslContextBuilder`/`CloseNotify`/`OpenSslKeyMaterialManager` classes
+        // fail the OpenSSL half outright. Measured against HotSpot 25 with the
+        // same classpath; see the retired `ssl-suite-test-discovery-undercounts`
+        // write-up.
         let basename_lc = std::path::Path::new(resolved.as_str())
             .file_name()
             .and_then(|s| s.to_str())
@@ -16274,9 +16468,27 @@ impl<'a> NativeSystemAccess for NativeContextImpl<'a> {
         // CratonVM's own TLS surface (`t27_tls.rs`), and the Java entry
         // points conscrypt's Java-side classes call into are satisfied by
         // `register_conscrypt_native_bridges` in native-builtins/src/tls.rs.
-        let skip_jni_onload_tcnative =
-            basename_lc.contains("tcnative") || basename_lc.contains("conscrypt_openjdk_jni");
+        // Netty ships its binding as `netty_tcnative_<os>_<arch>` (and extracts
+        // it under that name), Tomcat's APR binding as `tcnative-1`. Matching on
+        // the `netty` prefix is what keeps the two apart — a bare `tcnative`
+        // substring matches both.
+        let is_netty_tcnative = basename_lc.contains("netty_tcnative");
+        // Escape hatch for a host whose netty tcnative build does fault under
+        // our JNI ABI: `CRATONVM_SYNTHETIC_NETTY_TCNATIVE=1` restores the
+        // stub-only behaviour, and `OpenSsl.isAvailable()` goes back to `false`.
+        let netty_tcnative_opt_out = cratonvm_types::flags::flags()
+            .io
+            .synthetic_netty_tcnative_forced;
+        let skip_jni_onload_tcnative = (basename_lc.contains("tcnative")
+            && (!is_netty_tcnative || netty_tcnative_opt_out))
+            || basename_lc.contains("conscrypt_openjdk_jni");
 
+        // Whether `JNI_OnLoad` actually ran to completion for a netty tcnative
+        // library. Only that flips `netty_tcnative_real` — the library being on
+        // disk proves nothing, and dropping the stubs for a package whose real
+        // entry points were never registered would turn a working stub surface
+        // into `UnsatisfiedLinkError`s.
+        let mut netty_tcnative_onload_ran = false;
         unsafe {
             type JniOnLoad = extern "C" fn(
                 crate::native::jni::JavaVM,
@@ -16296,11 +16508,40 @@ impl<'a> NativeSystemAccess for NativeContextImpl<'a> {
                     // Safety: `self.thread` is the live `&mut JvmThread` borrowed
                     // for this call; it outlives `_jni_guard` per `set_jni_thread`.
                     let _jni_guard = JniContextGuard::install(self.shared, self.thread as *mut _);
-                    let _version = sym(crate::native::jni::get_java_vm(), std::ptr::null_mut());
+                    let version = sym(crate::native::jni::get_java_vm(), std::ptr::null_mut());
                     // `_jni_guard` clears the TLS context on scope exit (normal or
                     // unwind).
+                    //
+                    // netty_jni_util returns the requested JNI version on success
+                    // and `JNI_ERR` (-1) when any of its `FindClass` /
+                    // `RegisterNatives` steps failed. Treating -1 as success would
+                    // retire the stubs for a package with nothing behind it.
+                    netty_tcnative_onload_ran = is_netty_tcnative && version > 0;
                 }
             }
+        }
+        if netty_tcnative_onload_ran {
+            self.shared
+                .natives
+                .netty_tcnative_real
+                .store(true, std::sync::atomic::Ordering::Release);
+            // Retire the `SyntheticStub` stand-ins for this package in ONE
+            // place — the registry's own lookup — rather than at the dispatch
+            // sites. `vm_exec`'s general `is_native` arm is only one of several
+            // routes into the registry: `try_stackless_invoke`'s
+            // `resolve_step1_native` reaches it first for a plain zero-arg
+            // static, which is exactly the shape of
+            // `Library.initialize0()Z`. Suppressing only the `vm_exec` site
+            // produced a half-real package that ran real `aprVersionString`
+            // (1.7.5) and real `SSL.versionString` (BoringSSL) but a stubbed
+            // `initialize0` returning `true` without calling `apr_initialize`
+            // — so `tcn_global_pool` stayed NULL and the first real
+            // `SSLContext.make` took a SIGSEGV inside `apr_pool_create_ex`
+            // with a NULL parent pool.
+            self.shared
+                .natives
+                .native_methods
+                .mute_netty_tcnative_stubs();
         }
 
         let mut libs = self.shared.natives.native_libraries.lock();
@@ -17029,6 +17270,12 @@ pub fn invoke_or_native(
     descriptor: &str,
     args: &[Value],
 ) -> MethodCallResult {
+    // Second denominator for the per-invoke lookup census: the calls that get
+    // here are the ones an inline cache did NOT serve, and they are the ones
+    // that walk the long `(class, method, descriptor)` comparison chain below.
+    cratonvm_native_api::registry::lookup_census::probe(
+        cratonvm_native_api::registry::lookup_census::INVOKE_GENERAL,
+    );
     dbg_dispatch_tally("invoke_or_native", class_name, method_name, descriptor);
     // Residual-6 diagnosis (env-gated, CRATONVM_TRACE_CLASSVALUE): log every
     // get(Class) dispatch entering the general resolver, with its dispatch
@@ -22679,6 +22926,157 @@ fn invoke_on_class_shared_inner(
                                     | "hashCode"
                                     | "equals"
                             ))
+                        // As of 2026-08-13 a view is no longer minted as an
+                        // `ArrayList` but under its own carrier class
+                        // (native-collections' `MAP_VIEW_CARRIERS`), so the
+                        // arm above no longer covers it. These are REAL JDK
+                        // classes whose own bodies read `this$0` — null on a
+                        // CratonVM view, whose state lives in ArrayList's
+                        // `elementData`/`size` slots — so every method they
+                        // declare must reach the registered native.
+                        // `equals`/`hashCode` are omitted on purpose: the JDK
+                        // views inherit `AbstractCollection`'s identity
+                        // semantics and no native is registered for them here.
+                        // Companion entry in
+                        // native_override::force_native_over_real_jdk_bytecode.
+                        || (matches!(
+                                class_name,
+                                "java/util/HashMap$Values"
+                                    | "java/util/LinkedHashMap$LinkedValues"
+                                    | "java/util/TreeMap$Values"
+                                    | "java/util/TreeMap$EntrySet"
+                                    | "java/util/Hashtable$ValueCollection"
+                                    | "java/util/concurrent/ConcurrentHashMap$ValuesView"
+                            )
+                            && matches!(
+                                method_name,
+                                "size"
+                                    | "isEmpty"
+                                    | "contains"
+                                    | "iterator"
+                                    | "toArray"
+                                    | "toString"
+                                    | "remove"
+                                    | "clear"
+                                    | "forEach"
+                                    | "stream"
+                                    | "removeIf"
+                                    | "spliterator"
+                            ))
+                        // The same for the SET-shaped views
+                        // (native-collections' `SET_VIEW_CARRIERS`), whose state
+                        // is the backing map in HashSet's own `map` slot.
+                        // `equals`/`hashCode` ARE here: these carriers extend
+                        // `AbstractSet`, whose contract is what
+                        // `native_hs_equals`/`native_hs_hash_code` implement.
+                        // Companion entry in
+                        // native_override::force_native_over_real_jdk_bytecode.
+                        || (matches!(
+                                class_name,
+                                "java/util/HashMap$KeySet"
+                                    | "java/util/HashMap$EntrySet"
+                                    | "java/util/LinkedHashMap$LinkedKeySet"
+                                    | "java/util/LinkedHashMap$LinkedEntrySet"
+                                    | "java/util/Hashtable$KeySet"
+                                    | "java/util/Hashtable$EntrySet"
+                                    | "java/util/TreeMap$KeySet"
+                                    | "java/util/concurrent/ConcurrentHashMap$EntrySetView"
+                            )
+                            && matches!(
+                                method_name,
+                                "size"
+                                    | "isEmpty"
+                                    | "add"
+                                    | "contains"
+                                    | "iterator"
+                                    | "toArray"
+                                    | "toString"
+                                    | "remove"
+                                    | "clear"
+                                    | "forEach"
+                                    | "stream"
+                                    | "removeIf"
+                                    | "spliterator"
+                                    | "addAll"
+                                    | "removeAll"
+                                    | "retainAll"
+                                    | "containsAll"
+                                    | "equals"
+                                    | "hashCode"
+                                    | "first"
+                                    | "last"
+                                    | "comparator"
+                                    | "headSet"
+                                    | "tailSet"
+                                    | "subSet"
+                                    | "descendingIterator"
+                                    | "descendingSet"
+                                    | "pollFirst"
+                                    | "pollLast"
+                                    | "ceiling"
+                                    | "floor"
+                                    | "higher"
+                                    | "lower"
+                            ))
+                        // And the sublist carrier (native-collections'
+                        // `ASL_REAL_CLASS`), whose five fields live past the
+                        // `root`/`parent`/`offset`/`size` the JDK's own
+                        // `SubList` declares. Companion entry in
+                        // native_override::force_native_over_real_jdk_bytecode,
+                        // which carries the reason a receiver test has to sit
+                        // inside every one of those natives.
+                        || (class_name == "java/util/ArrayList$SubList"
+                            && matches!(
+                                method_name,
+                                "size"
+                                    | "isEmpty"
+                                    | "get"
+                                    | "set"
+                                    | "iterator"
+                                    | "listIterator"
+                                    | "toArray"
+                                    | "toString"
+                                    | "contains"
+                                    | "containsAll"
+                                    | "indexOf"
+                                    | "lastIndexOf"
+                                    | "stream"
+                                    | "forEach"
+                                    | "spliterator"
+                                    | "hashCode"
+                                    | "equals"
+                                    | "subList"
+                                    | "add"
+                                    | "remove"
+                                    | "clear"
+                                    | "addAll"
+                                    | "removeIf"
+                                    | "sort"
+                                    | "removeAll"
+                                    | "retainAll"
+                                    | "replaceAll"
+                                    | "parallelStream"
+                                    | "getFirst"
+                                    | "getLast"
+                                    | "addFirst"
+                                    | "addLast"
+                                    | "removeFirst"
+                                    | "removeLast"
+                                    | "reversed"
+                            ))
+                        // And the iterator carriers (native-collections'
+                        // `MAP_KEY_ITR_CARRIERS`), whose snapshot lives past
+                        // the `next`/`current`/`index` fields the JDK's own
+                        // `HashIterator` bodies walk. Companion entry in
+                        // native_override::force_native_over_real_jdk_bytecode.
+                        || (matches!(
+                                class_name,
+                                "java/util/HashMap$KeyIterator"
+                                    | "java/util/HashMap$EntryIterator"
+                                    | "java/util/LinkedHashMap$LinkedKeyIterator"
+                                    | "java/util/LinkedHashMap$LinkedEntryIterator"
+                            )
+                            && matches!(method_name, "hasNext" | "next" | "remove"))
                         // Surefire ForkedBooter: ManagementFactory.getRuntimeMXBean() /
                         // getThreadMXBean() — the real-JDK code path delegates
                         // through `getPlatformMXBean(Class)` + PlatformComponent
@@ -25579,8 +25977,18 @@ fn invoke_on_class_shared_inner(
         // `dispatch_jni_native` on Windows — using `find_jni_native` / dlsym
         // resolution here would bypass the Rust stub registry and fault with
         // 0xC0000005 during Spring Boot startup.
+        //
+        // `io/netty/internal/tcnative/**` is only refused while the real
+        // library has NOT been loaded — i.e. while the Rust stubs above are the
+        // only thing behind the package. Once `netty_tcnative_real` is set the
+        // stubs have stood down, so refusing here too would leave the package
+        // with nothing at all.
         let skip_jni_incompatible_host_lib = class_name.starts_with("org/apache/tomcat/jni/")
-            || class_name.starts_with("io/netty/internal/tcnative/");
+            || (class_name.starts_with("io/netty/internal/tcnative/")
+                && !shared
+                    .natives
+                    .netty_tcnative_real
+                    .load(std::sync::atomic::Ordering::Acquire));
 
         if let Some(callback) = registry_native {
             // CAPABILITY GATE, dispatch site 3 of 3 — the general

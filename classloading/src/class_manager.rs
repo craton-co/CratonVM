@@ -7030,6 +7030,47 @@ impl ClassManager {
         out
     }
 
+    /// `true` when [`Self::next_resource_url_from`] can serve `name`.
+    pub fn resource_name_supports_incremental_scan(name: &str) -> bool {
+        crate::class_path::ClassPath::name_supports_incremental_scan(name)
+    }
+
+    /// The incremental form of [`Self::find_all_resource_urls`]: the next URL
+    /// at or after `(segment, index)`, plus the cursor to resume at.
+    ///
+    /// `segment` walks the same three class paths in the same order the
+    /// whole-list version concatenates them — 0 bootstrap, 1 extension, 2
+    /// application — so enumerating from `(0, 0)` to exhaustion yields exactly
+    /// what `find_all_resource_urls` returns, in the same order. It exists so a
+    /// caller that stops early stops the SCAN early; see
+    /// `ClassPath::next_resource_url_from` for the measurement.
+    ///
+    /// A cursor is only meaningful for as long as the classpath is unchanged.
+    /// Appending a root mid-enumeration shifts what an index names, exactly as
+    /// it does for a JDK `Enumeration` held across a `URLClassLoader.addURL`.
+    pub fn next_resource_url_from(
+        &self,
+        name: &str,
+        segment: usize,
+        index: usize,
+    ) -> Option<(String, usize, usize)> {
+        let paths = [
+            self.bootstrap.class_path(),
+            self.extension.class_path(),
+            self.application.class_path(),
+        ];
+        let mut seg = segment;
+        let mut idx = index;
+        while seg < paths.len() {
+            if let Some((url, next)) = paths[seg].next_resource_url_from(name, idx) {
+                return Some((url, seg, next));
+            }
+            seg += 1;
+            idx = 0;
+        }
+        None
+    }
+
     /// with the given name. Parallel to [`find_all_resource_urls`] but returns
     /// content rather than URLs — used by Rust-native resource enumeration
     /// paths (e.g. `ServiceLoader` provider discovery in
@@ -10723,6 +10764,31 @@ fn jdk_superclass(name: &str) -> &'static str {
         "java/util/concurrent/ConcurrentHashMap$KeySetView" => "java/util/AbstractSet",
         "java/util/concurrent/ConcurrentSkipListSet" => "java/util/AbstractSet",
 
+        // The carrier classes a map's `values()`/`entrySet()` view is minted
+        // under (native-collections' `MAP_VIEW_CARRIERS`). In the real JDK
+        // every one of them extends `AbstractCollection`; with no class file
+        // the default `java/lang/Object` arm below would leave the view
+        // outside the Collection dispatch chain entirely.
+        "java/util/HashMap$Values"
+        | "java/util/LinkedHashMap$LinkedValues"
+        | "java/util/TreeMap$Values"
+        | "java/util/TreeMap$EntrySet"
+        | "java/util/Hashtable$ValueCollection"
+        | "java/util/concurrent/ConcurrentHashMap$ValuesView" => "java/util/AbstractCollection",
+
+        // The SET-shaped half of the same family (native-collections'
+        // `SET_VIEW_CARRIERS`, plus `TreeMap$KeySet`). Every one of them extends
+        // `AbstractSet` in the real JDK; without the arm the default below would
+        // leave `hashMap.keySet()` outside the Set dispatch chain.
+        "java/util/HashMap$KeySet"
+        | "java/util/HashMap$EntrySet"
+        | "java/util/LinkedHashMap$LinkedKeySet"
+        | "java/util/LinkedHashMap$LinkedEntrySet"
+        | "java/util/Hashtable$KeySet"
+        | "java/util/Hashtable$EntrySet"
+        | "java/util/TreeMap$KeySet"
+        | "java/util/concurrent/ConcurrentHashMap$EntrySetView" => "java/util/AbstractSet",
+
         // Concrete List/Queue hierarchy:
         "java/util/ArrayList" => "java/util/AbstractList",
         "java/util/LinkedList" => "java/util/AbstractSequentialList",
@@ -10831,6 +10897,39 @@ fn jdk_interfaces(name: &str) -> &'static [&'static str] {
             "java/util/Collection",
             "java/lang/Iterable",
             "java/io/Serializable",
+        ],
+        // A map view is a `Collection`, and deliberately NOT a `List` — that
+        // divergence (`hashMap.values() instanceof List` answering true) is
+        // half of what giving these views their own carrier class fixes. The
+        // `EntrySet` carrier is a `Set` for the same reason its JDK twin is.
+        "java/util/HashMap$Values"
+        | "java/util/LinkedHashMap$LinkedValues"
+        | "java/util/TreeMap$Values"
+        | "java/util/Hashtable$ValueCollection"
+        | "java/util/concurrent/ConcurrentHashMap$ValuesView" => {
+            &["java/util/Collection", "java/lang/Iterable"]
+        }
+        "java/util/TreeMap$EntrySet"
+        | "java/util/HashMap$KeySet"
+        | "java/util/HashMap$EntrySet"
+        | "java/util/LinkedHashMap$LinkedKeySet"
+        | "java/util/LinkedHashMap$LinkedEntrySet"
+        | "java/util/Hashtable$KeySet"
+        | "java/util/Hashtable$EntrySet"
+        | "java/util/concurrent/ConcurrentHashMap$EntrySetView" => &[
+            "java/util/Set",
+            "java/util/Collection",
+            "java/lang/Iterable",
+        ],
+        // `TreeMap.keySet()` is declared to return a `NavigableSet`, and the
+        // carrier `native_tm_key_set` mints must satisfy that checkcast — a
+        // plain `Set` here would fail every `(NavigableSet) tm.keySet()`.
+        "java/util/TreeMap$KeySet" => &[
+            "java/util/NavigableSet",
+            "java/util/SortedSet",
+            "java/util/Set",
+            "java/util/Collection",
+            "java/lang/Iterable",
         ],
         "java/util/HashMap"
         | "java/util/LinkedHashMap"
@@ -10961,6 +11060,16 @@ fn jdk_interfaces(name: &str) -> &'static [&'static str] {
         // (WebClientIntegrationTests "[2] JDK", 40 sub-tests).
         "cratonvm/net/HttpBodyReplaySubscription" => &["java/util/concurrent/Flow$Subscription"],
         "java/util/ArrayList$Itr" => &["java/util/Iterator"],
+        // The iterator carriers `native_hs_iterator` mints since 2026-08-13
+        // (native-collections' `MAP_KEY_ITR_CARRIERS`), replacing the fabricated
+        // `java/util/HashMap$KeyItr` no JDK declares. In the real JDK they
+        // implement `Iterator` through `HashMap$HashIterator`; with no class
+        // file the default `_ => &[]` would leave `instanceof Iterator` false
+        // and every `(Iterator) set.iterator()` a ClassCastException.
+        "java/util/HashMap$KeyIterator"
+        | "java/util/HashMap$EntryIterator"
+        | "java/util/LinkedHashMap$LinkedKeyIterator"
+        | "java/util/LinkedHashMap$LinkedEntryIterator" => &["java/util/Iterator"],
         "java/util/ArrayList$ListItr" => &["java/util/ListIterator", "java/util/Iterator"],
         // `ArrayList.subList()`'s backed-view object (native-collections'
         // `ASL_CLASS`, allocated under this internal name rather than the
@@ -10977,7 +11086,15 @@ fn jdk_interfaces(name: &str) -> &'static [&'static str] {
         // the real `java.util.ArrayList$SubList`, which extends
         // `AbstractList` (itself `implements List`) and separately
         // `implements RandomAccess`.
-        "cratonvm/internal/ArrayListSubList" => &["java/util/List", "java/util/RandomAccess"],
+        // Both sublist carriers. `java/util/ArrayList$SubList` is the class
+        // `alloc_asl_view` mints under whenever the real one resolves; in
+        // synthetic-JDK mode there is no class file for it, so without this arm
+        // the fabricated stub would declare no interfaces and every
+        // `(List) list.subList(..)` would be a ClassCastException — the same
+        // failure this entry's internal twin was added for.
+        "cratonvm/internal/ArrayListSubList" | "java/util/ArrayList$SubList" => {
+            &["java/util/List", "java/util/RandomAccess"]
+        }
         // The object `linkedList.listIterator()` hands back. Same reason as the
         // entry above, as `java/util/ArrayList$ListItr` two entries up, and as
         // `cratonvm/synthetic/Process`: with no arm here it fell to this
@@ -12014,6 +12131,12 @@ fn synthetic_stub_fields(name: &str) -> Vec<cratonvm_reader::field::ClassFileFie
         }],
         "java/util/Collections$EmptyEnumeration" => vec![],
         "java/util/ArrayList$Itr" | "java/util/ArrayList$ListItr" => instance_fields(5),
+        // The real nested class declares `root`/`parent`/`offset`/`size` on top
+        // of `AbstractList.modCount`. Fabricated at that width so
+        // `asl_base_checked`'s "`class_num_total_fields + ASL_NUM_FIELDS`"
+        // comparison means the same thing in synthetic-JDK mode as it does
+        // against the real class file.
+        "java/util/ArrayList$SubList" => instance_fields(5),
         // `Arrays.asList(T...)`'s fixed-size view. The real nested class has
         // exactly one field, `private final E[] a`, and derives `size()` from
         // `a.length` — which is what `native_arrays_as_list` and the
@@ -16056,7 +16179,36 @@ fn synthetic_stub_ctor_methods(name: &str) -> Vec<ClassFileMethod> {
                 mk("isEmpty", "()Z"),
                 mk("iterator", "()Ljava/util/Iterator;"),
                 mk("toArray", "()[Ljava/lang/Object;"),
+                // The rest of the `Collection` contract. A synchronized wrapper
+                // used to reach this VM only via
+                // `Collections.synchronizedCollection(…)`; since 2026-08-13 it
+                // is also what `Hashtable`/`Properties` hand back for
+                // `keySet()`/`entrySet()`/`values()`, so the full read surface
+                // is exercised. Undeclared here, those calls fall through to an
+                // interface-level native that reads the WRAPPER as the
+                // collection and reports it empty. Bodies:
+                // `util_concurrent_ext::sync_collection_delegate`.
+                mk("clear", "()V"),
+                mk("toString", "()Ljava/lang/String;"),
+                mk("stream", "()Ljava/util/stream/Stream;"),
+                mk("spliterator", "()Ljava/util/Spliterator;"),
+                mk("forEach", "(Ljava/util/function/Consumer;)V"),
+                mk("containsAll", "(Ljava/util/Collection;)Z"),
+                mk("addAll", "(Ljava/util/Collection;)Z"),
+                mk("removeAll", "(Ljava/util/Collection;)Z"),
+                mk("retainAll", "(Ljava/util/Collection;)Z"),
+                mk("removeIf", "(Ljava/util/function/Predicate;)Z"),
+                mk("toArray", "([Ljava/lang/Object;)[Ljava/lang/Object;"),
+                mk(
+                    "toArray",
+                    "(Ljava/util/function/IntFunction;)[Ljava/lang/Object;",
+                ),
             ]);
+            // Only the Set wrapper overrides these in the JDK — see the
+            // registration site for why the Collection wrapper must not.
+            if name == "java/util/Collections$SynchronizedSet" {
+                out.extend([mk("hashCode", "()I"), mk("equals", "(Ljava/lang/Object;)Z")]);
+            }
         }
     }
     if matches!(

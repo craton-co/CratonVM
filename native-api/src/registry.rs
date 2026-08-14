@@ -64,6 +64,133 @@ use cratonvm_types::ClassId;
 use cratonvm_types::{ArrayElementType, ObjectKind};
 use cratonvm_types::{ObjectRef, Value};
 
+/// `CRATONVM_DBG_NATIVE_LOOKUPS=1` — **how many registry probes one invoke
+/// costs**, which is the number the VM-wide per-call page asks for before
+/// anyone restructures dispatch:
+///
+/// > A real fix is one lookup per invoke, handed down the chain — a
+/// > restructuring of the dispatch entry points, not a change to the registry.
+/// > Anyone starting there should first get the per-invoke lookup COUNT (there
+/// > is no counter today; `CRATONVM_DBG_DISPATCH_TALLY` gives callees, not
+/// > lookups per callee), because that number, not the profile share, is what a
+/// > restructuring would divide.
+///
+/// A flat profile can only ever say what share `slot_for_exact` has; it cannot
+/// say whether that share is one lookup per invoke (in which case a
+/// restructuring divides it by one, i.e. buys nothing) or ten. This counts both
+/// sides: every entry point into the registry, and every invoke that reaches
+/// the two dispatchers those entry points hang off.
+///
+/// Off by default and gated on one relaxed atomic load, so a disabled run pays
+/// a predictable branch per probe and nothing else. When enabled it costs a
+/// contended `fetch_add` per probe — fine for a COUNT, useless for a timing.
+pub mod lookup_census {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::OnceLock;
+
+    /// `NativeMethodRegistry::find`.
+    pub const FIND: usize = 0;
+    /// `NativeMethodRegistry::find_with_kind`.
+    pub const FIND_WITH_KIND: usize = 1;
+    /// `NativeMethodRegistry::resolve_id` — the every-invoke entry point.
+    pub const RESOLVE_ID: usize = 2;
+    /// `NativeMethodRegistry::resolve_id_by_key` — the memoized-digest form.
+    pub const RESOLVE_ID_BY_KEY: usize = 3;
+    /// `resolve_id_with_descriptor_quirks` — the `#[cold]` rewrite arm.
+    pub const QUIRKS: usize = 4;
+    /// One bytecode-level invoke reaching `try_stackless_invoke`.
+    pub const INVOKE_STACKLESS: usize = 5;
+    /// One call reaching `invoke_or_native`, the general resolver.
+    pub const INVOKE_GENERAL: usize = 6;
+
+    const N: usize = 7;
+    const NAMES: [&str; N] = [
+        "find",
+        "find_with_kind",
+        "resolve_id",
+        "resolve_id_by_key",
+        "quirks",
+        "invokes(stackless)",
+        "invokes(general)",
+    ];
+
+    static COUNTS: [AtomicU64; N] = [
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+    ];
+    static INIT: OnceLock<bool> = OnceLock::new();
+
+    #[inline]
+    fn enabled() -> bool {
+        // The already-initialised load first: after the first probe this is a
+        // relaxed pointer read and a compare, which is what a per-invoke path
+        // can afford. `get_or_init` runs once.
+        if let Some(v) = INIT.get() {
+            return *v;
+        }
+        *INIT.get_or_init(|| {
+            cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_NATIVE_LOOKUPS").is_some()
+        })
+    }
+
+    /// Count one probe of `kind`. Inlined so the disabled case is a load and a
+    /// not-taken branch.
+    #[inline]
+    pub fn probe(kind: usize) {
+        if !enabled() {
+            return;
+        }
+        record(kind);
+    }
+
+    #[cold]
+    fn record(kind: usize) {
+        let n = COUNTS[kind].fetch_add(1, Ordering::Relaxed) + 1;
+        // Report on the INVOKE counters only: they are the denominators, so a
+        // line is emitted at a round number of invokes rather than at a round
+        // number of lookups, and every line is directly comparable.
+        if kind == INVOKE_STACKLESS && n % 50_000_000 == 0 {
+            report("periodic");
+        }
+    }
+
+    /// Zero every counter.
+    pub fn reset() {
+        for c in COUNTS.iter() {
+            c.store(0, Ordering::Relaxed);
+        }
+    }
+
+    /// Print the census and the ratio it exists to produce. Safe to call when
+    /// disabled — it prints nothing.
+    pub fn report(tag: &str) {
+        if !enabled() {
+            return;
+        }
+        let v: Vec<u64> = COUNTS.iter().map(|c| c.load(Ordering::Relaxed)).collect();
+        let lookups: u64 = v[FIND] + v[FIND_WITH_KIND] + v[RESOLVE_ID] + v[RESOLVE_ID_BY_KEY];
+        let invokes = v[INVOKE_STACKLESS];
+        let per_invoke = if invokes == 0 {
+            0.0
+        } else {
+            lookups as f64 / invokes as f64
+        };
+        let mut parts = String::new();
+        for (i, name) in NAMES.iter().enumerate() {
+            parts.push_str(&format!(" {name}={}", v[i]));
+        }
+        eprintln!(
+            "[native-lookups {tag}] lookups={lookups} invokes={invokes} \
+             lookups_per_invoke={per_invoke:.2}{parts}"
+        );
+    }
+}
+
 /// VM-owned data needed to materialize a truthful JMX `ThreadInfo` object.
 ///
 /// The object references are strong, GC-remapped registry roots for the short
@@ -1196,6 +1323,36 @@ pub trait NativeClassAccess {
     fn find_all_resource_urls(&self, name: &str) -> Vec<String> {
         let _ = name;
         Vec::new()
+    }
+
+    /// The incremental form of [`Self::find_all_resource_urls`]: the next
+    /// matching URL at or after the cursor `(segment, index)`, plus the cursor
+    /// to resume at.
+    ///
+    /// Enumerating from `(0, 0)` to exhaustion yields exactly what
+    /// `find_all_resource_urls` yields, in the same order. It exists so that a
+    /// consumer which stops early stops the classpath SCAN early — the JDK's
+    /// `getResources` enumeration is lazy per element, and
+    /// `resources(name).anyMatch(..)` is the common shape that depends on it.
+    ///
+    /// Only valid for names [`Self::resource_name_supports_incremental_scan`]
+    /// accepts. Default returns `None` so test mocks compile.
+    fn next_resource_url(
+        &self,
+        name: &str,
+        segment: u32,
+        index: u32,
+    ) -> Option<(String, u32, u32)> {
+        let _ = (name, segment, index);
+        None
+    }
+
+    /// `true` when [`Self::next_resource_url`] can serve `name` — i.e. the
+    /// name matches at most one entry per classpath entry, so "the first URL
+    /// this entry serves" cannot be dropping others. Default `false`.
+    fn resource_name_supports_incremental_scan(&self, name: &str) -> bool {
+        let _ = name;
+        false
     }
 
     /// Return the raw bytes of every classpath entry that contains a
@@ -5017,6 +5174,10 @@ const REGISTRY_EPOCH_STRIDE: u32 = 1 << 20;
 static NEXT_REGISTRY_EPOCH: std::sync::atomic::AtomicU32 =
     std::sync::atomic::AtomicU32::new(REGISTRY_EPOCH_STRIDE);
 
+/// The one package whose registrations can be retired at runtime — see
+/// [`NativeMethodRegistry::mute_netty_tcnative_stubs`].
+const NETTY_TCNATIVE_PACKAGE: &str = "io/netty/internal/tcnative/";
+
 /// One entry of the registry's dense slot table — the single place a resolved
 /// native lives.
 ///
@@ -5123,6 +5284,29 @@ pub struct NativeMethodRegistry {
     /// `REGISTRY_EPOCH_STRIDE`-wide range makes that a re-resolve instead of a
     /// wrong answer.
     registry_epoch: u32,
+    /// Set once this VM has loaded Netty's real `netty_tcnative` library and run
+    /// its `JNI_OnLoad`; from then on every lookup under
+    /// `io/netty/internal/tcnative/` misses, so dispatch falls through to the
+    /// `RegisterNatives` pointers the library published.
+    ///
+    /// This lives on the registry rather than at a dispatch site because the
+    /// registry is the only choke point all the routes share. `vm_exec`'s
+    /// general `is_native` arm, `try_stackless_invoke`'s `resolve_step1_native`,
+    /// and `dispatch_static`'s skip-clinit probe each reach the table
+    /// independently, and a stub retired at one of them is still live at the
+    /// others — which is not a cosmetic difference: it left
+    /// `Library.initialize0()Z` (a plain zero-arg static, so the stackless path
+    /// claims it) answering `true` without ever calling `apr_initialize`, while
+    /// the rest of the package ran against the real library. The first real
+    /// `SSLContext.make` then dereferenced the never-created `tcn_global_pool`
+    /// and took a SIGSEGV.
+    ///
+    /// The registry is per-`SharedVm`, so muting is per-VM: a sibling VM that
+    /// never loaded the library keeps its stubs.
+    ///
+    /// Only ever set, never cleared — a `dlclose` cannot un-publish the
+    /// function pointers `find_jni_native` already holds.
+    netty_tcnative_muted: std::sync::atomic::AtomicBool,
     /// Append-only registration log: the original `(class, method, descriptor)`
     /// triples, kept as `Box<str>` rather than `String` to minimize per-entry
     /// overhead. This replaces the previous `FxHashMap<u64, String>` reverse map
@@ -5372,6 +5556,7 @@ impl NativeMethodRegistry {
             ),
             registry_epoch: NEXT_REGISTRY_EPOCH
                 .fetch_add(REGISTRY_EPOCH_STRIDE, std::sync::atomic::Ordering::Relaxed),
+            netty_tcnative_muted: std::sync::atomic::AtomicBool::new(false),
             registrations: Vec::with_capacity(BOOT_REGISTRATION_HINT),
             provenance: Vec::with_capacity(BOOT_REGISTRATION_HINT),
             by_method_desc: FxHashMap::with_capacity_and_hasher(
@@ -7099,8 +7284,15 @@ impl NativeMethodRegistry {
         method_name: &str,
         descriptor: &str,
     ) -> Option<(NativeCallback, NativeKind)> {
-        if let Some(slot) = self.slot_for_exact(class_name, method_name, descriptor) {
-            return Some((slot.callback, slot.kind));
+        lookup_census::probe(lookup_census::FIND_WITH_KIND);
+        // One prefilter for both halves — see `find`.
+        let class_state = self.class_prefilter(class_name)?;
+        if let Some(idx) =
+            self.slot_index_from_state(class_state, class_name, method_name, descriptor)
+        {
+            if let Some(slot) = self.slots.get(idx as usize) {
+                return Some((slot.callback, slot.kind));
+            }
         }
         // Cold descriptor-quirk path. Semantics deliberately preserved from the
         // pre-memoization implementation: the kind is looked up with the
@@ -7161,7 +7353,21 @@ impl NativeMethodRegistry {
         method_name: &str,
         descriptor: &str,
     ) -> Option<NativeMethodId> {
-        let key = native_method_hash(class_name, method_name, descriptor);
+        // PERF (2026-08-13, netty `io.netty.buffer` throughput). This is the
+        // lookup `try_stackless_invoke`'s step 1 goes through — the one on the
+        // interpreter's EVERY-invoke path — and it was the only entry point
+        // that never consulted the class prefilter. It hashed the full triple,
+        // missed, and then entered the descriptor-quirk path, for classes like
+        // `io/netty/buffer/AdaptiveByteBuf` that register nothing at all. A
+        // flat profile of `AdaptiveByteBufAllocatorTest` put `slot_for_exact`
+        // at 8.2% and `resolve_id_with_descriptor_quirks` — the `#[cold]` arm —
+        // at another 1.8%, the largest family in the run.
+        //
+        // Answering from the prefix state also removes the second walk over the
+        // class name that `native_method_hash` did.
+        lookup_census::probe(lookup_census::RESOLVE_ID);
+        let class_state = self.class_prefilter(class_name)?;
+        let key = native_method_hash_from(class_state, method_name, descriptor);
         if let Some(idx) = self.slot_index_for_key(key, class_name, method_name, descriptor) {
             return Some(NativeMethodId::from_u32(idx));
         }
@@ -7184,11 +7390,15 @@ impl NativeMethodRegistry {
         method_name: &str,
         descriptor: &str,
     ) -> Option<NativeMethodId> {
+        lookup_census::probe(lookup_census::RESOLVE_ID_BY_KEY);
         if let Some(idx) =
             self.slot_index_for_key(key.as_pair(), class_name, method_name, descriptor)
         {
             return Some(NativeMethodId::from_u32(idx));
         }
+        // No prefilter here on purpose: the caller already saved the digest,
+        // so a class hash would be NEW work on this path, and the quirk arm
+        // below opens with its own cheap descriptor precheck.
         self.resolve_id_with_descriptor_quirks(class_name, method_name, descriptor)
     }
 
@@ -7336,6 +7546,31 @@ impl NativeMethodRegistry {
         Some((slot.callback, slot.kind))
     }
 
+    /// Reset the [`lookup_census`] so a measurement covers only what follows.
+    /// Cold; exists so a caller can exclude VM boot from the ratio.
+    pub fn reset_lookup_census() {
+        lookup_census::reset();
+    }
+
+    /// The class-name prefilter: `Some(prefix_state)` when this class MIGHT
+    /// register a native, `None` when it provably registers none.
+    ///
+    /// One-sided by construction, in the safe direction. `classes_with_natives`
+    /// holds the digest of every registered class name, so a registered class
+    /// can never be absent; an unregistered class whose digest collides with a
+    /// registered one merely falls through to the full path and misses there.
+    ///
+    /// Returning the prefix state rather than a bool is what lets the caller
+    /// finish the digest without re-walking the class name — see
+    /// [`native_class_hash`].
+    #[inline]
+    fn class_prefilter(&self, class_name: &str) -> Option<(u64, u64)> {
+        let class_state = native_class_hash(class_name);
+        self.classes_with_natives
+            .contains(&class_state)
+            .then_some(class_state)
+    }
+
     /// Slot lookup by exact triple (no descriptor rewriting).
     #[inline]
     fn slot_for_exact(
@@ -7347,13 +7582,50 @@ impl NativeMethodRegistry {
         // Prefilter on the class name alone before finishing the digest: see
         // `native_class_hash`. Exact for a miss, may false-positive into the
         // full path.
-        let class_state = native_class_hash(class_name);
-        if !self.classes_with_natives.contains(&class_state) {
-            return None;
-        }
+        let class_state = self.class_prefilter(class_name)?;
         let key = native_method_hash_from(class_state, method_name, descriptor);
         let idx = self.slot_index_for_key(key, class_name, method_name, descriptor)?;
         self.slots.get(idx as usize)
+    }
+
+    /// Retire this registry's `io/netty/internal/tcnative/**` stand-ins,
+    /// permanently, for this VM.
+    ///
+    /// Called from the library-load path the moment Netty's real
+    /// `netty_tcnative` `JNI_OnLoad` has run. See the
+    /// [`netty_tcnative_muted`](Self) field doc for why the decision cannot
+    /// live at a dispatch site.
+    pub fn mute_netty_tcnative_stubs(&self) {
+        self.netty_tcnative_muted
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Whether [`mute_netty_tcnative_stubs`](Self::mute_netty_tcnative_stubs)
+    /// has been called on this registry.
+    pub fn netty_tcnative_stubs_muted(&self) -> bool {
+        self.netty_tcnative_muted
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Slot index for an exact triple, given the class prefix state the caller
+    /// already obtained from [`class_prefilter`](Self::class_prefilter).
+    ///
+    /// Exists so an entry point can prefilter ONCE and still reach both the
+    /// exact lookup and the quirk fallback. `find` and `find_with_kind` used to
+    /// call `slot_for_exact` (which prefilters) and then, on a miss, a second
+    /// prefilter to decide whether the quirk path was worth entering — hashing
+    /// the class name twice for every miss on a class that DOES register
+    /// natives, which is the common miss on a collection-heavy workload.
+    #[inline]
+    fn slot_index_from_state(
+        &self,
+        class_state: (u64, u64),
+        class_name: &str,
+        method_name: &str,
+        descriptor: &str,
+    ) -> Option<u32> {
+        let key = native_method_hash_from(class_state, method_name, descriptor);
+        self.slot_index_for_key(key, class_name, method_name, descriptor)
     }
 
     /// The one place a 128-bit digest is turned into a slot index — and the one
@@ -7383,6 +7655,20 @@ impl NativeMethodRegistry {
         let slot = self.slots.get(idx as usize)?;
         let (c, m, d) = self.registrations.get(slot.reg_index as usize)?;
         if c.as_ref() == class_name && m.as_ref() == method_name && d.as_ref() == descriptor {
+            // Retired stand-ins (see `netty_tcnative_muted`). This is the one
+            // place every resolution route — `slot_for_exact`, the
+            // descriptor-quirk rewrite, and the precomputed-digest
+            // `resolve_id_by_key` — turns a digest into a slot, so a single
+            // check here cannot be routed around. It sits on the confirmed-hit
+            // edge, past the `slot_by_key` probe, so a miss (the overwhelmingly
+            // common case) never even loads the flag.
+            if self
+                .netty_tcnative_muted
+                .load(std::sync::atomic::Ordering::Relaxed)
+                && class_name.starts_with(NETTY_TCNATIVE_PACKAGE)
+            {
+                return None;
+            }
             Some(idx)
         } else {
             None
@@ -7398,8 +7684,16 @@ impl NativeMethodRegistry {
         method_name: &str,
         descriptor: &str,
     ) -> Option<NativeCallback> {
-        if let Some(slot) = self.slot_for_exact(class_name, method_name, descriptor) {
-            return Some(slot.callback);
+        lookup_census::probe(lookup_census::FIND);
+        // One prefilter for both the exact lookup and the quirk fallback: a
+        // class that registers nothing cannot be rescued by a descriptor
+        // rewrite either, since every variant is looked up under the SAME class
+        // name and that class has no key in `slot_by_key` under any descriptor.
+        let class_state = self.class_prefilter(class_name)?;
+        if let Some(idx) =
+            self.slot_index_from_state(class_state, class_name, method_name, descriptor)
+        {
+            return self.slots.get(idx as usize).map(|slot| slot.callback);
         }
 
         // AUDIT 2026-05-17 (Fix 4): the compatibility-variants path was
@@ -7441,16 +7735,31 @@ impl NativeMethodRegistry {
         method_name: &str,
         descriptor: &str,
     ) -> Option<NativeMethodId> {
+        lookup_census::probe(lookup_census::QUIRKS);
         // Cheap precheck: if the descriptor has none of the quirks the
         // rewrites target, there are no variants to try — bail before
         // touching the allocator.
-        let has_whitespace_or_nul = descriptor
-            .bytes()
-            .any(|b| b.is_ascii_whitespace() || b == b'\0');
-        let object_return_quirk = match descriptor.rfind(')') {
-            Some(rparen) => {
-                let ret = &descriptor[rparen + 1..];
-                ret.starts_with('L') && !ret.ends_with(';')
+        //
+        // One backward byte pass answers both questions. `descriptor.rfind(')')`
+        // went through `core::str::pattern::CharSearcher`, whose UTF-8 reverse
+        // search showed up as its own 0.73% line in a flat profile of
+        // `AdaptiveByteBufAllocatorTest` — for a byte that is ASCII by
+        // definition in a JVM descriptor (JVMS 4.3.3).
+        let bytes = descriptor.as_bytes();
+        let mut has_whitespace_or_nul = false;
+        let mut rparen = None;
+        for (i, &b) in bytes.iter().enumerate() {
+            if b.is_ascii_whitespace() || b == b'\0' {
+                has_whitespace_or_nul = true;
+            }
+            if b == b')' {
+                rparen = Some(i);
+            }
+        }
+        let object_return_quirk = match rparen {
+            Some(i) => {
+                let ret = &bytes[i + 1..];
+                ret.first() == Some(&b'L') && ret.last() != Some(&b';')
             }
             None => false,
         };

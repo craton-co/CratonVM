@@ -46,8 +46,21 @@ adopted**.
   Selecting one emits a one-time warning so it cannot masquerade as production
   ZGC.
 
-**Why it is default-off:** not because nothing uses it, but because it is not
-at pass-rate parity with Generational. Default-off is not uncompiled — CI's
+**It is no longer default-off.** As of 2026-08-10 the default `GcAlgorithm` IS
+`Zgc` (`vm/src/config.rs`), on the strength of the three-way Tomcat suite
+comparison; the paragraph that used to stand here explained why it was
+default-off and is kept below only so the reversal is visible rather than
+silently edited away:
+
+> *Why it is default-off: not because nothing uses it, but because it is not at
+> pass-rate parity with Generational.*
+
+That parity question was never answered — it was overtaken. Re-establishing it
+is Phase 1 of
+[`zgc-maturity-assessment-and-plan-20260813.md`](zgc-maturity-assessment-and-plan-20260813.md),
+which also carries the current state of everything below.
+
+Default-off was never uncompiled either, and that part still holds: CI's
 `experimental-features` job builds the `cratonvm-cli` binary under the feature
 and runs the gc crate's unit tests with it, because this configuration once
 stopped compiling entirely and nobody noticed.
@@ -71,9 +84,23 @@ stopped compiling entirely and nobody noticed.
 > **remains true**: no `ZMarkContext` for `ZgcRealHeap` exists, so the driver is
 > still off the execution path (§0.1).
 >
+> **A second substantive claim has since changed — dated 2026-08-13.** The
+> "no TLABs" clause below (and in the sentence this note replaced, which
+> re-verified it on 2026-08-07) is **no longer true**. `ZgcRealHeap` grew its
+> own thread-local allocation buffers on 2026-08-08 (`gc/src/zgc/tlab.rs`,
+> `ZgcRealHeap::alloc_raw_tlab`), they are **on by default**, and
+> `CRATONVM_ZGC_TLAB=0` is the kill switch. The `vm_heap.rs` cite the old claim
+> rested on is still literally accurate — `VmHeap::refill_tlab` does return
+> `None` for `VmHeap::Zgc` — which is precisely why the claim survived so long:
+> **the generic TLAB door is shut and the backend has its own.** A TLAB chunk
+> is *reserved* space no collection can reclaim while its thread lives, and
+> failing to bound that reservation by the thread count was the dominant defect
+> behind the 2026-08-13 Tomcat OOM.
+>
 > Everything else here — the two-halves-in-one-file shape, the simulation's
-> character, `ZgcRealHeap` being real but non-moving/non-concurrent/non-generational
-> with no TLABs, and the measured suite cost — was re-verified and **stands**.
+> character, `ZgcRealHeap` being real but
+> non-moving/non-concurrent/non-generational, and the measured suite cost — was
+> re-verified and **stands**.
 
 `gc/src/zgc.rs` (3454 lines) is two different things sharing a file. Lines
 1–1395 are a **metadata-only simulation** (`ColoredPointer`, `LoadBarrier`,
@@ -94,18 +121,23 @@ whole-heap mark-sweep**. It implements `GarbageCollector` in full and is wired
 end to end — `GcAlgorithm::Zgc` (`vm/src/config.rs:51`) → `GcBackend::Zgc`
 (`vm/src/vm/vm_init.rs:1357`) → `VmHeap::Zgc(ZgcRealHeap)`
 (`gc/src/vm_heap.rs:214`, `:278`) — and is selectable with `-XX:+UseZGC` /
-`--XX:UseGc ZGC`. It has no TLABs (`vm_heap.rs:2114` returns `None` from
-`refill_tlab`), no compaction, no concurrency, and no generational split.
+`--XX:UseGc ZGC`. It has no compaction, no concurrency, and no generational
+split. (The words "no TLABs (`vm_heap.rs:2114` returns `None` from
+`refill_tlab`)" stood here until 2026-08-13; see the correction at the head of
+this section — the cite is right and the conclusion drawn from it is wrong.)
 
 `gc/src/zgc_concurrent.rs` (505 lines) has a `ZgcConcurrentMarkController`
 (`:174`) with a real background worker thread — but it drives
 `Arc<Mutex<ZgcCollector>>` (`:198`), i.e. **the simulation**. It has never been
 pointed at `ZgcRealHeap`.
 
-All of the above is behind the default-off `zgc` Cargo feature
-(`gc/Cargo.toml:90`, `vm/Cargo.toml:106`). The gate hides an enum variant and a
-`parse_gc_algorithm` arm, so in a default build `-XX:+UseZGC` warns and silently
-falls back to Generational.
+All of the above is behind the `zgc` Cargo feature (find it by name, `^zgc = `,
+in `gc/Cargo.toml` and `vm/Cargo.toml`). The gate hides an enum variant and a
+`parse_gc_algorithm` arm. **It was default-off when this was written and has
+been default-ON since 2026-08-10** — it has to be, because the default
+`GcAlgorithm` is now the variant it gates. Only `--no-default-features` reaches
+the fallback this paragraph describes, where `-XX:+UseZGC` warns and silently
+selects Generational.
 
 **The measured cost of the gap** (2026-08-07, 1975-class Spring Boot suite,
 same binary, `-Xmx 2g`, only `-XX:+UseZGC` varied): PASS 1902 → 1860, HANG
@@ -260,11 +292,15 @@ an object.** The specific landmine:
 **4b is not a cleanup task. It is the phase that decides whether Phase 3b
 corrupts the heap.** Do the audit before 3b lands, not after.
 
-`4a`: `ZgcRealHeap` takes the arena lock on every allocation. `docs/GC.md`
-already calls this out ("it is a correctness-first reference backend, not a
-throughput one"). Since the measured regression is an *allocation-churn*
-workload, TLABs may account for part of the 35-class HANG group independently of
-the generational split — 0b's instrumentation should be able to separate the two.
+`4a`: `ZgcRealHeap` took the arena lock on every allocation when this was
+written. **Done, and ahead of this plan: TLABs landed 2026-08-08** — see
+`gc/src/zgc/tlab.rs` and `ZgcRealHeap::alloc_raw_tlab`, default-on, kill switch
+`CRATONVM_ZGC_TLAB=0`. The hypothesis above (that lock contention accounted for
+part of the 35-class HANG group) was never tested against the HANG group before
+the mechanism changed underneath it, so treat the group as un-attributed rather
+than as explained. What TLABs *did* introduce is a **reservation** the live-byte
+GC trigger cannot see, which is a new failure mode of its own and cost a Tomcat
+class the whole 2 GB heap on 2026-08-13.
 
 ### Phase 5 — validation and rollout
 
@@ -291,6 +327,15 @@ likely place a moving collector's remaining root-coverage gaps surface.
 the Generational arm of the same suite on the same host (1902/1975 = 96.3%),
 and ZGC must reach it with no new HANG class. Until then `zgc` stays default-off
 and the docs keep saying so.
+
+> **5d was taken out of this plan's hands — dated 2026-08-13.** The default was
+> flipped to ZGC on 2026-08-10 on the strength of the *Tomcat* three-way
+> comparison, not this bar: the Spring Boot parity gate above **was never
+> satisfied and was never formally waived — it was overtaken**. Re-establishing
+> it is Phase 1 of
+> [`zgc-maturity-assessment-and-plan-20260813.md`](zgc-maturity-assessment-and-plan-20260813.md),
+> and that phase carries this bar forward verbatim, including its consequence:
+> if ZGC is not at parity, the default is what should be revisited.
 
 ---
 
@@ -346,9 +391,9 @@ anything that adds a `VmHeap` method. Serialize them or hold the file.
 | **R1** | **The young-gen hypothesis is unverified.** | The entire justification for prioritizing Phase 2 is one unmeasured inference from 35 timeouts. If the 35 HANG classes are actually the arena-lock/no-TLAB path, or a livelock relative of the `gc_rearm` mode already fixed in `zgc.rs`, then Phase 2 is a large investment against the wrong cause. | 0b before 2a. Pull GC count + phase times from a sample of the 35 before committing. |
 | **R2** | **Compressed oops are structurally incompatible with colored pointers.** | `gc/src/compressed_oops.rs` narrows a pointer to 32 bits with a shift; ZGC colored pointers spend high bits on mark/remap/finalizable colors and rely on multi-mapping the same physical page at several virtual addresses. Both want the same bits. HotSpot resolves this by making ZGC and compressed oops mutually exclusive. | Decide explicitly in 1a. Most likely outcome: `-XX:+UseZGC` forces compressed oops off, and that must be enforced at config-parse time with a clear message, not discovered as corruption. |
 | **R3** | **JIT barrier coverage is all-or-nothing.** | A load barrier that the interpreter honors and compiled code does not is not a partial barrier — it is a broken one, because the first tier-up silently drops the invariant. This is why 1c is its own workstream. | 1c ships with a coverage assertion over JIT reference-load emit sites, and a debug mode that refuses to compile a method containing an unbarriered reference load. |
-| **R4** | **Feature-gate rot.** | Already happened once: `zgc` was uncompilable from 2026-08-05 to 2026-08-07 and CI did not notice, because every `zgc` job was library-scoped. `synthetic-jdk` lost 1,522 tests the same way. Every new `gc/src/zgc/*.rs` module is behind the same default-off gate. | 0a's two `ci.yml` steps must stay. Any new module needs its tests inside `cargo test -p cratonvm-gc --lib --features zgc` (`ci.yml:495`), and any new *flag* needs the binary build (`ci.yml:491`). |
-| **R5** | **Concurrent relocation has no in-tree precedent.** | Every existing CratonVM collector moves objects only at a stop-the-world. 3b is novel correctness surface with no working example, and it depends on five other new modules being simultaneously correct. | Sequence 3b last. Land it behind its own sub-flag, default-off within the already-default-off `zgc` feature, so a bad 3b cannot regress a good Phase 2. |
-| **R6** | **The `VmHeap::Zgc` neutral arms are silent.** | 58 arms plus a macro; the affirmative ones (`true`, `(0,0)`) assert facts that are only true for a non-moving collector, and none of them will fail loudly when they become wrong. | 4b before 3b. Prefer `unimplemented!()` over a neutral value for any arm whose correct moving-collector answer is not yet known — a panic in a default-off feature is cheaper than a UAF. |
+| **R4** | **Feature-gate rot.** | Already happened once: `zgc` was uncompilable from 2026-08-05 to 2026-08-07 and CI did not notice, because every `zgc` job was library-scoped. `synthetic-jdk` lost 1,522 tests the same way. Every new `gc/src/zgc/*.rs` module is behind the same gate. **The risk INVERTED on 2026-08-10** when `zgc` joined the default set: ordinary CI now compiles and tests it, and the configuration nothing builds is `--no-default-features` — i.e. the Generational-only fallback that every ZGC-less deployment runs. | 0a's two `ci.yml` steps must stay, and they are now the *cheap* half. Any new module needs its tests inside `cargo test -p cratonvm-gc --lib --features zgc` (`ci.yml:495`), and any new *flag* needs the binary build (`ci.yml:491`). The compile hole this row was written about is closed from the other side too: `feature-matrix.yml` runs `cargo check --workspace --all-targets --no-default-features`, so a `#[cfg(feature = "zgc")]` typo cannot go unnoticed. What is still uncovered is *running* that configuration — no job executes a `--no-default-features` binary, so a ZGC-less launcher is compiled-but-never-started on every commit. |
+| **R5** | **Concurrent relocation has no in-tree precedent.** | Every existing CratonVM collector moves objects only at a stop-the-world. 3b is novel correctness surface with no working example, and it depends on five other new modules being simultaneously correct. | Sequence 3b last. Land it behind its own sub-flag, default-off — and note that since 2026-08-10 this is the ONLY thing keeping it off a user's machine, because the `zgc` feature that used to be the outer default-off gate is now default-ON. The sub-flag is no longer belt-and-braces; it is the belt. |
+| **R6** | **The `VmHeap::Zgc` neutral arms are silent.** | 58 arms plus a macro; the affirmative ones (`true`, `(0,0)`) assert facts that are only true for a non-moving collector, and none of them will fail loudly when they become wrong. | 4b before 3b. Prefer `unimplemented!()` over a neutral value for any arm whose correct moving-collector answer is not yet known — a panic is cheaper than a UAF. **The original wording of this cell said "a panic in a default-off feature", and that qualifier expired on 2026-08-10**: this feature is default-on, so any such panic reaches every user on the default collector. It must therefore sit behind 3b's own default-off sub-flag, not behind the `zgc` feature. |
 
 ---
 

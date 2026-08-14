@@ -465,6 +465,13 @@ fn security_get_providers(ctx: &mut dyn NativeContext, _args: &[Value]) -> Metho
     let chain = snapshot();
     let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, chain.len());
     for (i, (name, ver, coverage)) in chain.iter().enumerate() {
+        // Same identity rule as `security_get_provider`: an entry the
+        // application registered is handed back as the object it registered,
+        // not as a same-named stand-in.
+        if let Some(real) = resolve_real_provider(ctx, name) {
+            ctx.set_array_element(arr, i, Value::Object(Some(real)));
+            continue;
+        }
         let p = make_provider(ctx, name, *ver, coverage);
         ctx.set_array_element(arr, i, Value::Object(Some(p?)));
     }
@@ -503,6 +510,23 @@ fn security_get_provider(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     };
     match find(&name_str) {
         Some((ver, coverage)) => {
+            // A provider the application registered itself must come back as
+            // THE SAME OBJECT it passed to `Security.addProvider`. The JDK's
+            // provider list stores the instance, so code that installs a
+            // provider and reads it back compares by identity or by class:
+            // netty's `BouncyCastleUtilTest` asserts `assertSame(added,
+            // Security.getProvider("BC"))`, and `BouncyCastleUtil` decides
+            // whether BouncyCastle is present by testing the answer with
+            // `instanceof BouncyCastleProvider`. Handing back a fresh
+            // `make_provider` synthetic failed both: the caller saw a bare
+            // `java.security.Provider` where it had registered a
+            // `BouncyCastleProvider`, and any provider-private state (BC's own
+            // service/creator maps) was unreachable through it. The registered
+            // object is already pinned by `remember_real_provider`, so
+            // preferring it costs no extra rooting.
+            if let Some(real) = resolve_real_provider(ctx, &name_str) {
+                return Ok(Some(Value::Object(Some(real))));
+            }
             let p = make_provider(ctx, &name_str, ver, coverage);
             Ok(Some(Value::Object(Some(p?))))
         }
@@ -759,6 +783,38 @@ fn empty_collection_value(
     Ok(Value::Object(Some(obj)))
 }
 
+/// Did the `set_field_by_name("provider", …)` write actually land — i.e. does
+/// this `Provider$Service` have the REAL JDK layout rather than CratonVM's
+/// synthetic one?
+///
+/// The two layouts disagree by a one-slot rotation. Synthetic:
+/// `(type=0, algorithm=1, provider=2, className=3)`, matching the accessors
+/// `phases_early::register_phase53_security` registers. Real JDK declaration
+/// order: `(provider=0, type=1, algorithm=2, className=3)`. So mirroring the
+/// synthetic slots onto a real `Service` writes the `type` String over
+/// `provider`, `provider` over `algorithm`, and undoes every named write.
+///
+/// It stayed invisible for as long as every JCA engine CratonVM served was
+/// intercepted upstream of the JDK's own `GetInstance`. `CertStore.getInstance`
+/// is not intercepted — it runs `new CertStore(spi, instance.provider, …)` on
+/// real bytecode — so `CertStore.getProvider()` handed back the type String and
+/// `.getName()` on it threw
+/// `NoSuchMethodError: java.lang.String.getName()Ljava/lang/String;`.
+///
+/// Read-back beats a layout query here because it answers the question the
+/// caller actually has ("did my write take?") in both modes, with no new
+/// `NativeContext` surface.
+fn service_has_named_layout(
+    ctx: &mut dyn NativeContext,
+    service: ObjectRef,
+    provider: ObjectRef,
+) -> bool {
+    matches!(
+        ctx.get_field_by_name(service, "provider"),
+        Value::Object(Some(got)) if got == provider
+    )
+}
+
 fn provider_service_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
 
@@ -788,18 +844,46 @@ fn provider_service_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     // reads at 0/1/2.  Mirror those writes so synthetic Provider$Service
     // allocations (i.e. when the real-JDK class isn't loaded) keep
     // returning the right values.
-    let nfields = ctx.object_num_fields(this);
-    if nfields > 0 {
-        ctx.set_field(this, 0, svc_type);
-    }
-    if nfields > 1 {
-        ctx.set_field(this, 1, algorithm);
-    }
-    if nfields > 2 {
-        ctx.set_field(this, 2, provider);
-    }
-    if nfields > 3 {
-        ctx.set_field(this, 3, class_name);
+    //
+    // ONLY in synthetic mode. The two layouts disagree — the synthetic one is
+    // `(type=0, algorithm=1, provider=2, className=3)`, the real JDK's
+    // declaration order is `(provider=0, type=1, algorithm=2, className=3)` —
+    // so on a real `Provider$Service` this mirror wrote `type` over `provider`,
+    // `algorithm` over `type` and `provider` over `algorithm`, undoing all
+    // three `set_field_by_name` writes above with a one-slot rotation.
+    //
+    // That was invisible while every JCA engine CratonVM served was intercepted
+    // before the JDK's own `GetInstance` ran. `CertStore.getInstance` is not:
+    // it runs real bytecode that does `new CertStore(spi, instance.provider, …)`
+    // and `CertStore.getProvider()` then returned the *type* String, so
+    // `getProvider().getName()` died as
+    // `NoSuchMethodError: java.lang.String.getName()` — the absurd-receiver
+    // shape [[a-native-must-not-write-a-field-of-a-receiver-it-did-not-build]]
+    // describes.
+    //
+    // Detected by reading back one of the named writes rather than by asking
+    // for the class layout — see `service_has_named_layout`.
+    let named_layout = match provider {
+        Value::Object(Some(p)) => service_has_named_layout(ctx, this, p),
+        // A null provider cannot be read back distinguishably. Fall back to
+        // asking whether the receiver kept the `className` we just wrote.
+        _ => matches!(ctx.get_field_by_name(this, "className"), Value::Object(Some(_)))
+            && matches!(class_name, Value::Object(Some(_))),
+    };
+    if !named_layout {
+        let nfields = ctx.object_num_fields(this);
+        if nfields > 0 {
+            ctx.set_field(this, 0, svc_type);
+        }
+        if nfields > 1 {
+            ctx.set_field(this, 1, algorithm);
+        }
+        if nfields > 2 {
+            ctx.set_field(this, 2, provider);
+        }
+        if nfields > 3 {
+            ctx.set_field(this, 3, class_name);
+        }
     }
 
     // OpenJDK Provider.Service turns null aliases/attributes into immutable
@@ -1835,6 +1919,53 @@ fn seed_sunjsse_services() {
         "PKIX",
         "sun.security.provider.certpath.SunCertPathBuilder",
     );
+    // CertStore Collection (SUN provider). `CertPathBuilder.PKIX` above is only
+    // half of a path build: PKIX finds intermediates through the `CertStore`s
+    // named in its `PKIXBuilderParameters`, and every caller that has the
+    // intermediates in hand rather than in an LDAP directory builds that store
+    // with `CertStore.getInstance("Collection", new
+    // CollectionCertStoreParameters(certs))`. Without the service that call
+    // threw `NoSuchAlgorithmException: Collection CertStore not available`, and
+    // BouncyCastle wrapped it as the misleading `OCSPException: Error setting up
+    // certificate path validation` recorded in the retired
+    // `ssl-cert-validation-residuals` write-up — a message that names certificate
+    // validation for what is really a missing JCA service.
+    //
+    // Unlike every other service seeded here, `CertStoreSpi` has NO no-arg
+    // constructor: JCA passes the `CertStoreParameters` to a one-argument ctor.
+    // `provider_service_new_instance` handles that via
+    // `jca_service_ctor_parameter_type`.
+    put_service(
+        S,
+        "CertStore",
+        "Collection",
+        "sun.security.provider.certpath.CollectionCertStore",
+    );
+    put_service(
+        S,
+        "CertStore",
+        "com.sun.security.IndexedCollection",
+        "sun.security.provider.certpath.IndexedCollectionCertStore",
+    );
+}
+
+/// The constructor-parameter type a JCA engine's SPI takes, if it takes one.
+///
+/// Most JCA SPIs are built with a public no-arg constructor, which is what
+/// `Provider$Service.newInstance` assumes when it is handed a null
+/// `constructorParameter`. A few engines are defined the other way round: the
+/// SPI has no no-arg constructor at all and JCA calls a one-argument one. The
+/// JDK keeps this in `Provider$Service`'s `knownEngines` table; this mirrors the
+/// entries CratonVM actually seeds services for.
+///
+/// `CertStore` is the one that matters here — `CertStoreSpi(CertStoreParameters)`
+/// is its only constructor, so calling `()V` on `CollectionCertStore` cannot
+/// work no matter how the service is registered.
+fn jca_service_ctor_parameter_type(engine_type: &str) -> Option<&'static str> {
+    match engine_type {
+        "CertStore" => Some("Ljava/security/cert/CertStoreParameters;"),
+        _ => None,
+    }
 }
 
 /// Mirror the JDK's `XMLDSig` provider (`org.jcp.xml.dsig.internal.dom.XMLDSigRI`)
@@ -2231,12 +2362,17 @@ fn make_service(
 
     // Synthetic-mode mirror — getType=0, getAlgorithm=1, getProvider=2
     // (matches the layout in `phases_early::register_phase53_security`).
-    ctx.set_field(svc, 0, Value::Object(Some(type_s)));
-    ctx.set_field(svc, 1, Value::Object(Some(algo_s)));
-    ctx.set_field(svc, 2, Value::Object(Some(prov)));
-    // Slot 3 reserved for className so the new `Service.getClassName`
-    // accessor (registered below) returns the right string.
-    ctx.set_field(svc, 3, Value::Object(Some(class_s)));
+    // Skipped when the named writes above landed: see
+    // `service_has_named_layout` for what the mirror did to a real
+    // `Provider$Service`, and how `CertStore.getInstance` exposed it.
+    if !service_has_named_layout(ctx, svc, prov) {
+        ctx.set_field(svc, 0, Value::Object(Some(type_s)));
+        ctx.set_field(svc, 1, Value::Object(Some(algo_s)));
+        ctx.set_field(svc, 2, Value::Object(Some(prov)));
+        // Slot 3 reserved for className so the new `Service.getClassName`
+        // accessor (registered below) returns the right string.
+        ctx.set_field(svc, 3, Value::Object(Some(class_s)));
+    }
     // GC-stable className: key the side table on the service's identity hash
     // (stored in the object header, preserved across moving-GC relocation) so
     // `newInstance` retrieves the className without depending on object slots
@@ -2839,6 +2975,27 @@ pub(crate) fn ssl_context_protocol_supported(protocol: &str) -> bool {
 /// That divergence is closed — `security_get_algorithms` and
 /// `provider_get_services_native` both wrap through `wrap_unmodifiable` now.
 /// A comment outlives its defect. W7-63-jca-advertise-vs-serve.md.)
+/// `true` when SOME registered provider offers `(type_str, algo)`.
+///
+/// The thin question behind `find_service_provider`, for callers that only need
+/// to know whether anything can serve a name — `KeyPairGenerator.getInstance`
+/// asks it to decide between handing back a generator and raising
+/// `NoSuchAlgorithmException`.
+///
+/// Note what this does NOT cover: the algorithms CratonVM serves from its own
+/// natives are not in the service registry at all, so a `false` here is only
+/// half the answer. `kpg_serviceable` is the other half.
+pub(crate) fn any_provider_offers(type_str: &str, algo: &str) -> bool {
+    find_service_provider(type_str, algo).is_some()
+}
+
+/// `true` when `provider` specifically offers `(type_str, algo)` — the
+/// two-argument `getInstance(alg, provider)` question, which must NOT be
+/// satisfied by some other provider that happens to have the algorithm.
+pub(crate) fn provider_offers(provider: &str, type_str: &str, algo: &str) -> bool {
+    get_service_entry(provider, type_str, algo).is_some()
+}
+
 pub(crate) fn algorithms_for_service(service_name: &str) -> Vec<String> {
     if service_name.is_empty() || service_name.ends_with('.') {
         return Vec::new();
@@ -3358,6 +3515,33 @@ fn provider_service_new_instance(ctx: &mut dyn NativeContext, args: &[Value]) ->
         }
     }
     let internal = class_name.replace('.', "/");
+    // Engines whose SPI takes its parameters through the CONSTRUCTOR rather
+    // than a no-arg ctor plus setters — see `jca_service_ctor_parameter_type`.
+    // `CertStore.getInstance("Collection", params)` is the reachable case: its
+    // SPI has no `()V` at all, so without this arm the arm below raised
+    // `ClassNotFoundException` for a class that had loaded perfectly well.
+    //
+    // Only taken when a non-null `constructorParameter` was actually supplied;
+    // `newInstance(null)` on such an engine keeps falling through to `()V` and
+    // failing there, which is what the JDK does too (`InvalidParameterException`
+    // territory, not a silently different object).
+    if let Some(param_desc) = provider_service_string_field(ctx, this, "type", 0)
+        .as_deref()
+        .and_then(jca_service_ctor_parameter_type)
+    {
+        if let Some(param @ Value::Object(Some(_))) = args.get(1).cloned() {
+            let ctor = format!("({param_desc})V");
+            match ctx.new_object_initialized(&internal, &ctor, &[param]) {
+                Ok(Some(v @ Value::Object(Some(_)))) => return Ok(Some(v)),
+                Err(MethodCallFailed::ExceptionThrown(t)) => {
+                    return Err(MethodCallFailed::ExceptionThrown(t))
+                }
+                // Fall through to the no-arg attempt: a provider may have
+                // registered a class under this engine that does declare `()V`.
+                _ => {}
+            }
+        }
+    }
     // GC-safe allocate + run the no-arg constructor (real BC SPI bytecode). The
     // SPI constructor can allocate enough to trigger a moving GC, so we must not
     // hold the raw reference across `<init>` — `new_object_initialized` pins it

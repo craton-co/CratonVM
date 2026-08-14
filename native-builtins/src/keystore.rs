@@ -904,7 +904,9 @@ pub(crate) fn load_pkcs12_ex(
     let mut keys_by_local_id: IndexMap<Vec<u8>, (Option<String>, Vec<u8>)> = IndexMap::new();
     let mut certs_by_local_id: IndexMap<Vec<u8>, Vec<(Option<String>, Vec<u8>)>> = IndexMap::new();
     let mut orphan_certs: Vec<(Option<String>, Vec<u8>)> = Vec::new();
-    let mut secret_keys: Vec<(String, Vec<u8>, String)> = Vec::new();
+    // `Option<String>` for the alias: a bag with no `friendlyName` is numbered
+    // from the load-wide counter below, not named here.
+    let mut secret_keys: Vec<(Option<String>, Vec<u8>, String)> = Vec::new();
 
     for bag in &bags {
         let friendly = bag.friendly_name();
@@ -1010,17 +1012,39 @@ pub(crate) fn load_pkcs12_ex(
                         .ok()
                     });
                 if let Some((algorithm, key_bytes)) = secret {
-                    let alias = friendly.unwrap_or_else(|| hex_lower(&local_id));
-                    secret_keys.push((alias, key_bytes, secret_alg_name(&algorithm)));
+                    // `friendly` stays an `Option` here: an un-named bag's alias
+                    // is assigned below, from the load-wide counter that has to
+                    // number every entry kind in one sequence.
+                    secret_keys.push((friendly, key_bytes, secret_alg_name(&algorithm)));
                 }
             }
             _ => {}
         }
     }
 
+    // Aliases for bags that carry NO `friendlyName`.
+    //
+    // The old rule here was "hex of the localKeyId, like keytool does". That is
+    // what keytool PRINTS, and it is not what `sun.security.pkcs12.PKCS12KeyStore`
+    // — the reader every `KeyStore.getInstance("PKCS12")` actually uses — does.
+    // Its `getUnfriendlyName()` is `counter++; return String.valueOf(counter)`,
+    // so an un-named bag is called "1", "2", … in bag order, and the counter is
+    // shared by every entry kind in one load.
+    //
+    // Measured on jdk-25.0.3.9-hotspot against netty's own
+    // `mutual_auth_server.p12` (a `localKeyID` and no `friendlyName`): HotSpot
+    // reports alias `1`; CratonVM reported
+    // `70e4faffe3f82e2db1c949282bf86a7c17348838`. Any caller that looks an entry
+    // up by the alias its own test data documents then missed —
+    // `OpenSslKeyMaterialProviderTest` asks for `"1"` and got null key material
+    // (found while closing the retired `ssl-suite-test-discovery-undercounts`
+    // write-up, whose fix made the OpenSSL half of those classes run at all).
+    let mut unfriendly_counter: u32 = 0;
+
     let mut entries: IndexMap<String, KeyStoreEntry> = IndexMap::new();
 
-    for (alias, key_bytes, algorithm) in secret_keys {
+    for (friendly, key_bytes, algorithm) in secret_keys {
+        let alias = friendly.unwrap_or_else(|| unfriendly_alias(&mut unfriendly_counter));
         entries.insert(
             alias.clone(),
             KeyStoreEntry {
@@ -1057,11 +1081,10 @@ pub(crate) fn load_pkcs12_ex(
         }
         extend_chain_by_issuer(&mut chain, &mut certs_by_local_id, &mut orphan_certs);
 
-        let alias = key_friendly.or(chain_friendly).unwrap_or_else(|| {
-            // Fallback: use the hex of the localKeyId, like keytool does
-            // when no friendlyName was specified.
-            hex_lower(&local_id)
-        });
+        let _ = &local_id;
+        let alias = key_friendly
+            .or(chain_friendly)
+            .unwrap_or_else(|| unfriendly_alias(&mut unfriendly_counter));
 
         entries.insert(
             alias.clone(),
@@ -1080,7 +1103,8 @@ pub(crate) fn load_pkcs12_ex(
         .collect::<Vec<_>>();
     walk.extend(orphan_certs);
     for (idx, (friendly, der)) in walk.into_iter().enumerate() {
-        let alias = friendly.unwrap_or_else(|| format!("cert_{}", idx));
+        let _ = idx;
+        let alias = friendly.unwrap_or_else(|| unfriendly_alias(&mut unfriendly_counter));
         entries.insert(
             alias.clone(),
             KeyStoreEntry {
@@ -1959,6 +1983,18 @@ impl<'a> JksReader<'a> {
         self.cursor += len;
         Ok(v)
     }
+}
+
+/// The alias `sun.security.pkcs12.PKCS12KeyStore` gives a bag that carries no
+/// `friendlyName`: `getUnfriendlyName()`, i.e. `++counter` rendered as a
+/// decimal string, shared across every entry kind in one load.
+///
+/// See the call sites in `parse_pkcs12` for why the previous "hex of the
+/// localKeyId" rule (what *keytool* prints, not what the reader assigns) made
+/// every alias in netty's `mutual_auth_server.p12` unfindable.
+fn unfriendly_alias(counter: &mut u32) -> String {
+    *counter += 1;
+    counter.to_string()
 }
 
 fn hex_lower(b: &[u8]) -> String {

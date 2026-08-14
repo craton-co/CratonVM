@@ -96,7 +96,7 @@ What it *is*: `CRATONVM_DBG_JIT_SCAN_PROF=1` reports **`jit_entries=2 980 692`**
 for ~1.4 M loop iterations — **~2 compiled-code entries per byte written**. The
 chain is not inlined, so every byte pays two JIT↔interpreter transitions at the
 300–700 ns each that
-[`jit-entries-per-call-cost`](arraylist-native-overhead-and-the-view-carrier-class-20260812.md)
+[`jit-entries-per-call-cost`](../performance/vm-per-call-dispatch-cost-RETIRED-20260813.md)
 prices. `--nojit` gives 9 415 ns for the same call, so the JIT *is* helping
 (3.6x) — it just cannot inline through it, where the same JIT gives 31x on a
 plain array store.
@@ -104,7 +104,7 @@ plain array store.
 **This is not a brotli, netty or `BrotliIntegrationTest` property.** Any
 per-byte `ByteBuf` loop pays it. It belongs to the ByteBuf-throughput
 workstream —
-[adaptive-bytebuf-allocator-throughput](adaptive-bytebuf-allocator-throughput-20260812.md)
+[netty per-call throughput](../performance/netty-per-call-throughput-20260813.md)
 — and this page should not be the place anyone looks for it.
 
 ## The defect that was fixed: the watchdog blamed native code for compiled code

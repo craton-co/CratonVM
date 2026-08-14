@@ -205,6 +205,23 @@ fn singleton_cell(vm: usize) -> &'static Mutex<Option<u64>> {
     per_vm_table(&INSTANCE, vm)
 }
 
+/// Whether this VM has performed the primordial configuration read, per VM.
+///
+/// The JDK's `LogManager.ensureLogManagerInitialized()` finishes by calling
+/// `readPrimordialConfiguration()`, which is what puts the `ConsoleHandler`
+/// from `$java.home/conf/logging.properties` on the root logger. Ours never
+/// did, so a fresh VM had `root.handlers=0` where HotSpot has 1 — and
+/// `Logger.getLogger("x").info("hello")` printed NOTHING, silently, because a
+/// record with no handler anywhere up the parent chain is simply dropped.
+///
+/// Latched so the read happens exactly once per VM, and latched BEFORE the
+/// read runs: `read_configuration_no_arg_impl` instantiates handler classes,
+/// which can re-enter `getLogManager()`.
+fn primordial_config_done(vm: usize) -> &'static Mutex<bool> {
+    static DONE: OnceLock<Mutex<HashMap<usize, &'static Mutex<bool>>>> = OnceLock::new();
+    per_vm_table(&DONE, vm)
+}
+
 /// Name -> `Logger` ObjectRef (as raw u64), per VM. Populated on first
 /// `getLogger`/`addLogger`. Reads are cheap; a lock is acquired only
 /// during mutation.
@@ -1306,6 +1323,9 @@ pub(crate) fn reset_state_for_tests() {
     if let Ok(mut m) = attachments(TEST_VM).lock() {
         m.clear();
     }
+    if let Ok(mut d) = primordial_config_done(TEST_VM).lock() {
+        *d = false;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1328,6 +1348,31 @@ fn native_get_log_manager(ctx: &mut dyn NativeContext, _args: &[Value]) -> Metho
     // satisfies every membership test and still has the wrong contents.
     let _ = get_or_create_logger(ctx, "");
     let _ = get_or_create_logger(ctx, "global");
+    // ...and then reads the configuration. `readPrimordialConfiguration` is
+    // the step that installs the `ConsoleHandler` named by
+    // `$java.home/conf/logging.properties`; without it `root.handlers` was 0
+    // against HotSpot's 1, and every `Logger.info(..)` on a default-configured
+    // VM was dropped on the floor with no handler to publish it.
+    //
+    // Latch FIRST. `read_configuration_no_arg_impl` instantiates the handler
+    // classes named by the file, and a handler constructor is free to call
+    // `LogManager.getLogManager()` — which is this function.
+    let first_time = {
+        let mut done = primordial_config_done(ctx.vm_identity())
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let first = !*done;
+        *done = true;
+        first
+    };
+    if first_time {
+        // A missing or unreadable file is not fatal in the JDK either, and
+        // `read_configuration_no_arg_impl` already returns `Ok(None)` for it.
+        // Swallow a hard error too rather than failing `getLogManager()`: the
+        // JDK's own primordial read is wrapped so that a broken config file
+        // leaves you with a usable (if unconfigured) LogManager.
+        let _ = read_configuration_no_arg_impl(ctx, &[]);
+    }
     Ok(Some(Value::Object(Some(obj))))
 }
 

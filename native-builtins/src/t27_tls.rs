@@ -3027,6 +3027,14 @@ impl ResolvesClientCert for JavaKeyManagerResolver {
 /// already spelled the JSSE way — so this is an explicit list rather than a
 /// blind `replace("TLS13_", "TLS_")`, which would also rewrite a future suite
 /// whose real name happens to contain that text.
+///
+/// `_pub` wrapper for `http_url_connection`, whose https branch reported the
+/// `Debug` spelling for the same reason the eight sites this function was
+/// written for did.
+pub(crate) fn suite_to_java_cipher_name_pub(suite: rustls::CipherSuite) -> String {
+    suite_to_java_cipher_name(suite)
+}
+
 fn suite_to_java_cipher_name(suite: rustls::CipherSuite) -> String {
     use rustls::CipherSuite::*;
     match suite {
