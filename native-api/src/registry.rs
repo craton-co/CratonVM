@@ -1325,6 +1325,36 @@ pub trait NativeClassAccess {
         Vec::new()
     }
 
+    /// The incremental form of [`Self::find_all_resource_urls`]: the next
+    /// matching URL at or after the cursor `(segment, index)`, plus the cursor
+    /// to resume at.
+    ///
+    /// Enumerating from `(0, 0)` to exhaustion yields exactly what
+    /// `find_all_resource_urls` yields, in the same order. It exists so that a
+    /// consumer which stops early stops the classpath SCAN early — the JDK's
+    /// `getResources` enumeration is lazy per element, and
+    /// `resources(name).anyMatch(..)` is the common shape that depends on it.
+    ///
+    /// Only valid for names [`Self::resource_name_supports_incremental_scan`]
+    /// accepts. Default returns `None` so test mocks compile.
+    fn next_resource_url(
+        &self,
+        name: &str,
+        segment: u32,
+        index: u32,
+    ) -> Option<(String, u32, u32)> {
+        let _ = (name, segment, index);
+        None
+    }
+
+    /// `true` when [`Self::next_resource_url`] can serve `name` — i.e. the
+    /// name matches at most one entry per classpath entry, so "the first URL
+    /// this entry serves" cannot be dropping others. Default `false`.
+    fn resource_name_supports_incremental_scan(&self, name: &str) -> bool {
+        let _ = name;
+        false
+    }
+
     /// Return the raw bytes of every classpath entry that contains a
     /// resource with the given name. Parallel to [`find_all_resource_urls`]
     /// but returns content rather than URLs — used by Rust-native resource

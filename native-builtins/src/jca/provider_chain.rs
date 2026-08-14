@@ -2863,6 +2863,27 @@ pub(crate) fn ssl_context_protocol_supported(protocol: &str) -> bool {
 /// That divergence is closed — `security_get_algorithms` and
 /// `provider_get_services_native` both wrap through `wrap_unmodifiable` now.
 /// A comment outlives its defect. W7-63-jca-advertise-vs-serve.md.)
+/// `true` when SOME registered provider offers `(type_str, algo)`.
+///
+/// The thin question behind `find_service_provider`, for callers that only need
+/// to know whether anything can serve a name — `KeyPairGenerator.getInstance`
+/// asks it to decide between handing back a generator and raising
+/// `NoSuchAlgorithmException`.
+///
+/// Note what this does NOT cover: the algorithms CratonVM serves from its own
+/// natives are not in the service registry at all, so a `false` here is only
+/// half the answer. `kpg_serviceable` is the other half.
+pub(crate) fn any_provider_offers(type_str: &str, algo: &str) -> bool {
+    find_service_provider(type_str, algo).is_some()
+}
+
+/// `true` when `provider` specifically offers `(type_str, algo)` — the
+/// two-argument `getInstance(alg, provider)` question, which must NOT be
+/// satisfied by some other provider that happens to have the algorithm.
+pub(crate) fn provider_offers(provider: &str, type_str: &str, algo: &str) -> bool {
+    get_service_entry(provider, type_str, algo).is_some()
+}
+
 pub(crate) fn algorithms_for_service(service_name: &str) -> Vec<String> {
     if service_name.is_empty() || service_name.ends_with('.') {
         return Vec::new();
