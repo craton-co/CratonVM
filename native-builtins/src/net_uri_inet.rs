@@ -1246,6 +1246,19 @@ pub(crate) fn native_uri_init(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(None),
     };
+    // MEASURED 2026-08-13 (/tmp/T.java): `new URI(null)` is a helpful NPE
+    // naming the JDK's own private field, not a URISyntaxException and not a
+    // silently-empty URI. The `_ => String::new()` arm below turned a null
+    // argument into the empty string, which is a LEGAL relative URI -- so the
+    // constructor succeeded and handed back a usable object.
+    if matches!(args.get(1), None | Some(Value::Object(None))) {
+        return Err(RuntimeError::NullPointerException {
+            message: Some(
+                "Cannot invoke \"String.length()\" because \"this.input\" is null".into(),
+            ),
+        }
+        .into());
+    }
     let url_str = match args.get(1) {
         Some(Value::Object(Some(o))) => ctx.read_string(*o).unwrap_or_default(),
         _ => String::new(),

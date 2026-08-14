@@ -155,3 +155,40 @@ it needs the same receiver-routing treatment rather than a copied guard.
 `ConcurrentHashMap`'s helper also carries an invented message
 (`"ConcurrentHashMap does not permit null keys"`) that has not been checked
 against the oracle.
+
+## 6. `InheritableThreadLocal` snapshots at START, not at CONSTRUCTION
+
+MEASURED 2026-08-13 (`/tmp/T.java`), and this one is a **semantics**
+divergence rather than a missing refusal:
+
+```java
+ITL.set("parent-init");
+Thread t = new Thread(() -> seen[0] = ITL.get());
+ITL.set("set-after-construction");
+t.start();
+```
+
+| | HotSpot | CratonVM |
+|---|---|---|
+| child sees | `parent-init` | `set-after-construction` |
+
+The JDK copies the parent's map in `Thread.<init>`
+(`this.inheritableThreadLocals = ThreadLocal.createInheritedMap(parent...)`),
+so a `set` between construction and `start()` is **not** visible to the child.
+A second thread constructed *after* the second `set` sees the new value on
+both VMs, which is why a single-thread probe reads clean.
+
+**The cause is already written down at the site** —
+`lang_system.rs::native_thread_start0` applies the snapshot at *start0-time*
+deliberately, as a documented workaround: the real `Thread.<init>` copy
+"silently doesn't take effect … specifically when BOTH the ThreadGroup and
+name constructor arguments are explicitly non-null", which is exactly the
+shape `Executors.defaultThreadFactory()` uses for every pooled worker. The
+workaround chose losing the values in executors over losing the capture
+timing; the timing is what this fixture measures.
+
+**Not attempted here.** Moving the capture to construction touches every
+executor path, and the site's own note says root-causing the constructor
+misbehaviour needs interpreter-level bytecode tracing. It is recorded with
+its repro rather than half-fixed at the tail of a session that cannot
+validate the executor paths it would move.
