@@ -6316,6 +6316,10 @@ fn asl_view_parent(ctx: &dyn NativeContext, this: ObjectRef) -> Option<ObjectRef
 /// `native_al_sub_list`, and note the `fromIndex > toIndex` case is an
 /// `IllegalArgumentException` rather than a bounds exception at all.
 fn native_asl_sub_list(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    if let Some(r) = asl_delegate_foreign(ctx, args, "subList", "(II)Ljava/util/List;") {
+        return r;
+    }
+
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
@@ -6459,7 +6463,6 @@ const ASL_NUM_FIELDS: usize = 5;
 /// VM's state into the JDK's five fields was tried first and is not sufficient
 /// alone: it makes the JDK's bodies correct on OUR objects and does nothing
 /// about ours running on THEIRS.
-#[allow(dead_code)]
 const ASL_REAL_CLASS: &str = "java/util/ArrayList$SubList";
 
 /// Where a sublist view's five native fields start: past the carrier's own
@@ -6472,6 +6475,57 @@ const ASL_REAL_CLASS: &str = "java/util/ArrayList$SubList";
 #[inline]
 fn asl_base(ctx: &dyn NativeContext, this: ObjectRef) -> usize {
     ctx.object_num_fields(this).saturating_sub(ASL_NUM_FIELDS)
+}
+
+/// [`asl_base`], answering `None` for a receiver this VM did not mint.
+///
+/// This is the receiver-ownership test the carrier needed. Wearing
+/// [`ASL_REAL_CLASS`] means the `native_asl_*` family is also handed every
+/// `SubList` **java.base's own bytecode** built — `ArrayList.subList` runs its
+/// own body under `--jdk-only`, and can under `--real-jdk` too. Such an object
+/// is exactly `class_num_total_fields` wide and carries none of this VM's five
+/// fields, so [`asl_base`] would land inside the JDK's own
+/// `root`/`parent`/`offset`/`size`, read `modCount` as `parent`, and every
+/// native would answer empty. That is a SILENT wrong answer on the most
+/// universally reached list path in the VM, which is why the previous attempt
+/// at this carrier was withdrawn rather than shipped
+/// (`fixed-suite-bugs/netty/collection-view-carrier-residuals-FIXED-20260813.md`,
+/// "the one row that stayed open").
+///
+/// Every mint site allocates `class_num_total_fields + ASL_NUM_FIELDS` — on
+/// BOTH carriers, which is what makes one comparison serve both and needs no
+/// assumption about how wide `class_manager` fabricates [`ASL_CLASS`]. A
+/// receiver narrower than that is not ours; [`asl_delegate_foreign`] then runs
+/// the receiver's own bytecode.
+#[inline]
+fn asl_base_checked(ctx: &dyn NativeContext, this: ObjectRef) -> Option<usize> {
+    let width = ctx.object_num_fields(this);
+    let declared = ctx.class_num_total_fields(ctx.class_id_of_object(this));
+    if width < declared + ASL_NUM_FIELDS {
+        return None;
+    }
+    Some(width - ASL_NUM_FIELDS)
+}
+
+/// Run the receiver's OWN bytecode when it is a `SubList` this VM did not mint.
+///
+/// Returns `None` for a receiver that is ours, so the caller proceeds with the
+/// native body. `invoke_virtual_bytecode_only` is what keeps this from
+/// recursing straight back into the same registration.
+fn asl_delegate_foreign(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+    method: &str,
+    descriptor: &str,
+) -> Option<MethodCallResult> {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return None,
+    };
+    if asl_base_checked(&*ctx, this).is_some() {
+        return None;
+    }
+    Some(ctx.invoke_virtual_bytecode_only(this, method, descriptor, &args[1..]))
 }
 
 /// Allocate a sublist view under [`ASL_REAL_CLASS`], wide enough for its own
@@ -6496,7 +6550,26 @@ fn asl_base(ctx: &dyn NativeContext, this: ObjectRef) -> usize {
 /// `try_ensure_synthetic_class` rather than a throwaway `try_alloc_synthetic`:
 /// same policy question, same answer, no object allocated to ask it.
 fn alloc_asl_view(ctx: &mut dyn NativeContext) -> Result<ObjectRef, MethodCallFailed> {
-    try_alloc_synthetic(ctx, ASL_CLASS, ASL_NUM_FIELDS)
+    // Policy FIRST, and asked about the INTERNAL name — see this function's
+    // doc comment. Wearing a real class must not smuggle a compatibility
+    // stand-in past a mode that refuses them.
+    let fallback = match ctx.try_ensure_synthetic_class(ASL_CLASS, ASL_NUM_FIELDS) {
+        Ok(id) => id,
+        Err(err) => return Err(cratonvm_native_api::refusal_to_java_failure(ctx, err)),
+    };
+    // `ensure_class_initialized` can report success having FABRICATED a
+    // stand-in, so check the resolved name rather than trusting `Ok` — the same
+    // check `alloc_key_set_view_object` makes for the same reason.
+    if let Ok(cid) = ctx.ensure_class_initialized(ASL_REAL_CLASS) {
+        if ctx.class_name_arc_of_id(cid).as_deref() == Some(ASL_REAL_CLASS) {
+            let n = ctx.class_num_total_fields(cid) + ASL_NUM_FIELDS;
+            return Ok(ctx.alloc_object(cid, n));
+        }
+    }
+    // Same width rule on the fallback carrier, so `asl_base_checked` has one
+    // comparison to make and not two.
+    let n = ctx.class_num_total_fields(fallback) + ASL_NUM_FIELDS;
+    Ok(ctx.alloc_object(fallback, n))
 }
 
 
@@ -6538,9 +6611,13 @@ fn asl_check_comod(
 }
 
 fn register_al_sublist_natives(r: &mut NativeMethodRegistry) {
-    // ASL_CLASS only. `ASL_REAL_CLASS` is deliberately NOT registered — see
-    // its doc comment for the `--jdk-only` measurement that says why.
+    // Both carriers. `ASL_REAL_CLASS` is safe to register now that
+    // `asl_base_checked` can tell a view this VM minted from one java.base's
+    // own bytecode built; without that test this registration is a silent
+    // empty list on every foreign `SubList`, which is why it was withdrawn
+    // once already.
     register_al_sublist_natives_on(r, ASL_CLASS);
+    register_al_sublist_natives_on(r, ASL_REAL_CLASS);
 }
 
 /// The whole `subList` surface, on one carrier class.
@@ -6713,10 +6790,96 @@ fn register_al_sublist_natives_on(r: &mut NativeMethodRegistry, c: &str) {
     r.register(c, "sort", "(Ljava/util/Comparator;)V", |ctx, args| {
         asl_delegate_mutating(ctx, args, "sort", "(Ljava/util/Comparator;)V")
     });
+    // The rest of the `List` surface, on the REAL carrier only.
+    //
+    // WHY IT IS NEEDED. On the INTERNAL carrier an unregistered method fell to
+    // an interface-level native and raised `AbstractMethodError:
+    // java/util/List.removeAll has no Code attribute` — already a defect, and
+    // `probes/SubListBehaviourProbe` is what found it. On [`ASL_REAL_CLASS`]
+    // the same gap is worse: the receiver now HAS its own bytecode, so
+    // `removeAll`/`retainAll`/`replaceAll` reach the JDK's real `SubList`
+    // bodies and NPE on the null `root` this VM never fills. A carrier is only
+    // as complete as the surface registered on it — the same lesson
+    // `register_set_view_carrier_natives` records for the Set views.
+    //
+    // WHY ONLY THERE. The ambient `Bridge` set above is re-tagged
+    // `SyntheticStub` for a `cratonvm/internal/*` receiver, so registering
+    // these on both carriers adds twelve synthetic stubs and trips
+    // `stub_ratchet` — for rows nothing can reach. [`alloc_asl_view`] mints
+    // under [`ASL_REAL_CLASS`] whenever a class of that name resolves, and
+    // `class_manager` carries `java/util/ArrayList$SubList` in its preload list
+    // with a declared width, so synthetic-JDK mode resolves it too. The
+    // internal carrier is a fallback for "no class of that name anywhere" and
+    // keeps the surface it has always had.
+    if c == ASL_REAL_CLASS {
+        r.register(c, "removeAll", "(Ljava/util/Collection;)Z", |ctx, args| {
+            asl_delegate_mutating(ctx, args, "removeAll", "(Ljava/util/Collection;)Z")
+        });
+        r.register(c, "retainAll", "(Ljava/util/Collection;)Z", |ctx, args| {
+            asl_delegate_mutating(ctx, args, "retainAll", "(Ljava/util/Collection;)Z")
+        });
+        r.register(
+            c,
+            "replaceAll",
+            "(Ljava/util/function/UnaryOperator;)V",
+            |ctx, args| {
+                asl_delegate_mutating(
+                    ctx,
+                    args,
+                    "replaceAll",
+                    "(Ljava/util/function/UnaryOperator;)V",
+                )
+            },
+        );
+        r.register(c, "addAll", "(ILjava/util/Collection;)Z", |ctx, args| {
+            asl_delegate_mutating(ctx, args, "addAll", "(ILjava/util/Collection;)Z")
+        });
+        r.register(
+            c,
+            "parallelStream",
+            "()Ljava/util/stream/Stream;",
+            |ctx, args| {
+                asl_delegate_snapshot(ctx, args, "parallelStream", "()Ljava/util/stream/Stream;")
+            },
+        );
+        // `SequencedCollection` (JDK 21). `List` declares all seven, so a receiver
+        // with real bytecode answers them from `root` — null here.
+        r.register(c, "getFirst", "()Ljava/lang/Object;", |ctx, args| {
+            asl_delegate_snapshot(ctx, args, "getFirst", "()Ljava/lang/Object;")
+        });
+        r.register(c, "getLast", "()Ljava/lang/Object;", |ctx, args| {
+            asl_delegate_snapshot(ctx, args, "getLast", "()Ljava/lang/Object;")
+        });
+        r.register(c, "addFirst", "(Ljava/lang/Object;)V", |ctx, args| {
+            asl_delegate_mutating(ctx, args, "addFirst", "(Ljava/lang/Object;)V")
+        });
+        r.register(c, "addLast", "(Ljava/lang/Object;)V", |ctx, args| {
+            asl_delegate_mutating(ctx, args, "addLast", "(Ljava/lang/Object;)V")
+        });
+        r.register(c, "removeFirst", "()Ljava/lang/Object;", |ctx, args| {
+            asl_delegate_mutating(ctx, args, "removeFirst", "()Ljava/lang/Object;")
+        });
+        r.register(c, "removeLast", "()Ljava/lang/Object;", |ctx, args| {
+            asl_delegate_mutating(ctx, args, "removeLast", "()Ljava/lang/Object;")
+        });
+        // `reversed()` is a live VIEW in the JDK, and a view of a snapshot writes
+        // nowhere — the same reason `subList` is NOT snapshot-delegated (see
+        // `native_asl_sub_list`). Registered anyway because the alternative is the
+        // JDK body on a null `root`: reads are correct, writes through the reversed
+        // view are lost, and that is strictly better than an NPE. Covered by
+        // `probes/SubListBehaviourProbe`'s `read.reversed` row.
+        r.register(c, "reversed", "()Ljava/util/List;", |ctx, args| {
+            asl_delegate_snapshot(ctx, args, "reversed", "()Ljava/util/List;")
+        });
+    }
     r.set_category(__prev_cat);
 }
 
 fn native_asl_size(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    if let Some(r) = asl_delegate_foreign(ctx, args, "size", "()I") {
+        return r;
+    }
+
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Int(0))),
@@ -6731,6 +6894,10 @@ fn native_asl_size(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
 }
 
 fn native_asl_is_empty(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    if let Some(r) = asl_delegate_foreign(ctx, args, "isEmpty", "()Z") {
+        return r;
+    }
+
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Int(1))),
@@ -6745,6 +6912,10 @@ fn native_asl_is_empty(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
 }
 
 fn native_asl_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    if let Some(r) = asl_delegate_foreign(ctx, args, "get", "(I)Ljava/lang/Object;") {
+        return r;
+    }
+
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
@@ -6776,6 +6947,12 @@ fn native_asl_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
 }
 
 fn native_asl_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    if let Some(r) =
+        asl_delegate_foreign(ctx, args, "set", "(ILjava/lang/Object;)Ljava/lang/Object;")
+    {
+        return r;
+    }
+
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
@@ -6834,6 +7011,10 @@ fn asl_snapshot(
 }
 
 fn native_asl_to_array(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    if let Some(r) = asl_delegate_foreign(ctx, args, "toArray", "()[Ljava/lang/Object;") {
+        return r;
+    }
+
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
@@ -6843,6 +7024,10 @@ fn native_asl_to_array(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
 }
 
 fn native_asl_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    if let Some(r) = asl_delegate_foreign(ctx, args, "toString", "()Ljava/lang/String;") {
+        return r;
+    }
+
     use std::fmt::Write as _;
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
@@ -6868,6 +7053,10 @@ fn native_asl_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
 }
 
 fn native_asl_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    if let Some(r) = asl_delegate_foreign(ctx, args, "iterator", "()Ljava/util/Iterator;") {
+        return r;
+    }
+
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
@@ -6889,6 +7078,9 @@ fn asl_delegate_snapshot(
     method: &str,
     descriptor: &str,
 ) -> MethodCallResult {
+    if let Some(r) = asl_delegate_foreign(ctx, args, method, descriptor) {
+        return r;
+    }
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
@@ -6918,6 +7110,9 @@ fn asl_delegate_mutating(
     method: &str,
     descriptor: &str,
 ) -> MethodCallResult {
+    if let Some(r) = asl_delegate_foreign(ctx, args, method, descriptor) {
+        return r;
+    }
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
@@ -38040,7 +38235,15 @@ fn collect_collection_elements(ctx: &mut dyn NativeContext, coll: ObjectRef) -> 
         // LDAPDn.getParentDn → LdapName.getPrefix/toString SIGSEGV; also a wild
         // call through StringBuilder.append(Object) → EXCEPTION_ACCESS_VIOLATION).
         // Read the real slice straight out of the parent's backing array instead.
-        if cls_name == ASL_CLASS {
+        // Both carriers, and only for a view this VM minted: a `SubList`
+        // java.base's own bytecode built carries none of these fields, and
+        // falling THROUGH is right for it — the ArrayList-shape heuristic
+        // below does not match its `(modCount:int, root:ref, ...)` layout, so
+        // it reaches the `toArray()` fallback, which runs the receiver's own
+        // correct bytecode.
+        if (cls_name == ASL_CLASS || cls_name == ASL_REAL_CLASS)
+            && asl_base_checked(ctx, coll).is_some()
+        {
             if let Some((parent, offset, size, _expected)) = asl_state(ctx, coll) {
                 if size > 0 {
                     if let (Some(data), _) = al_state(ctx, parent) {
@@ -53474,7 +53677,57 @@ fn native_collections_swap(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         let b = ctx.get_array_element(d, j);
         ctx.set_array_element(d, i, b);
         ctx.set_array_element(d, j, a);
+        return Ok(None);
     }
+    // Not an ArrayList-layout receiver. `al_state` answers `(None, 0)` for a
+    // sublist view, a `LinkedList`, or any application `List`, and the loop
+    // above then swapped nothing and reported success — a SILENT no-op, which
+    // is what `probes/SubListBehaviourProbe`'s `write.swap` row measures. It
+    // failed on both collectors AND under `--jdk-only`, because this native is
+    // reached whatever runs `Collections.swap`. Go through the receiver's own
+    // `get`/`set`, which is what the JDK's own body does.
+    list_swap_via_accessors(ctx, list, i as i32, j as i32)
+}
+
+/// `Collections.swap` for a receiver whose backing array this file cannot
+/// read: two `get`s and two `set`s through the list's own methods.
+///
+/// Each invoke can allocate and therefore move the other element, so both are
+/// pinned across the pair.
+fn list_swap_via_accessors(
+    ctx: &mut dyn NativeContext,
+    list: ObjectRef,
+    i: i32,
+    j: i32,
+) -> MethodCallResult {
+    let list_pin = ctx.pin_native_root(list);
+    let a = ctx
+        .invoke_virtual(list, "get", "(I)Ljava/lang/Object;", &[Value::Int(i)])?
+        .unwrap_or(Value::Object(None));
+    let a_pin = pin_value(ctx, a);
+    let list = ctx.read_native_pin(list_pin, list);
+    let b = ctx
+        .invoke_virtual(list, "get", "(I)Ljava/lang/Object;", &[Value::Int(j)])?
+        .unwrap_or(Value::Object(None));
+    let b_pin = pin_value(ctx, b);
+    let list = ctx.read_native_pin(list_pin, list);
+    let a = read_pinned_elem(ctx, a_pin, a);
+    let b = read_pinned_elem(ctx, b_pin, b);
+    ctx.invoke_virtual(
+        list,
+        "set",
+        "(ILjava/lang/Object;)Ljava/lang/Object;",
+        &[Value::Int(i), b],
+    )?;
+    let list = ctx.read_native_pin(list_pin, list);
+    let a = read_pinned_elem(ctx, a_pin, a);
+    ctx.invoke_virtual(
+        list,
+        "set",
+        "(ILjava/lang/Object;)Ljava/lang/Object;",
+        &[Value::Int(j), a],
+    )?;
+    ctx.unpin_native_roots(list_pin);
     Ok(None)
 }
 
@@ -53489,7 +53742,27 @@ fn native_collections_fill(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         for i in 0..size as usize {
             ctx.set_array_element(d, i, val);
         }
+        return Ok(None);
     }
+    // Same silent no-op as `native_collections_swap`, same fix: a receiver
+    // whose backing array this file cannot read gets its own `size`/`set`.
+    let list_pin = ctx.pin_native_root(list);
+    let val_pin = pin_value(ctx, val);
+    let n = match ctx.invoke_virtual(list, "size", "()I", &[])? {
+        Some(Value::Int(n)) => n,
+        _ => 0,
+    };
+    for i in 0..n {
+        let list_cur = ctx.read_native_pin(list_pin, list);
+        let val_cur = read_pinned_elem(ctx, val_pin, val);
+        ctx.invoke_virtual(
+            list_cur,
+            "set",
+            "(ILjava/lang/Object;)Ljava/lang/Object;",
+            &[Value::Int(i), val_cur],
+        )?;
+    }
+    ctx.unpin_native_roots(list_pin);
     Ok(None)
 }
 
