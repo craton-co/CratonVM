@@ -1282,6 +1282,48 @@ pub(crate) fn native_uri_init(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
     // rejected unconditionally even with the opt-out gate (preserves the
     // keycloak fix); the broader ASCII check is gated default-ON so it can be
     // disabled (CRATONVM_URI_STRICT_CHARS=0) if a regression surfaces.
+    // An IPv6 literal in the authority must be `[` <non-empty> `]`. MEASURED
+    // 2026-08-13 (/tmp/W.java) -- both of these are URISyntaxException on
+    // HotSpot and were ACCEPTED here, i.e. a malformed URI parsed clean:
+    //
+    //   new URI("http://[::1/")  Expected closing bracket for IPv6 address at index 11
+    //   new URI("http://[]/")    Expected closing bracket for IPv6 address at index 8
+    //
+    // The reported index is where the address parse stopped: the end of the
+    // authority when the `]` is missing, and the position just past `[` when the
+    // body is empty. `http://[fe80::1]/` and `http://[::1]:80/` stay legal.
+    if let Some(open) = url_str.find("://").map(|s| s + 3) {
+        let auth_end = url_str[open..]
+            .find(['/', '?', '#'])
+            .map(|r| open + r)
+            .unwrap_or(url_str.len());
+        let auth = &url_str[open..auth_end];
+        if let Some(br) = auth.find('[') {
+            let abs_br = open + br;
+            let rest = &url_str[abs_br + 1..auth_end];
+            let bad = match rest.find(']') {
+                None => Some(auth_end),
+                Some(0) => Some(abs_br + 1),
+                Some(_) => None,
+            };
+            if let Some(pos) = bad {
+                let input = ctx.create_string(&url_str);
+                let reason = ctx.create_string("Expected closing bracket for IPv6 address");
+                if let Ok(Some(Value::Object(Some(exc)))) = ctx.new_object_initialized(
+                    "java/net/URISyntaxException",
+                    "(Ljava/lang/String;Ljava/lang/String;I)V",
+                    &[
+                        Value::Object(Some(input)),
+                        Value::Object(Some(reason)),
+                        Value::Int(pos as i32),
+                    ],
+                ) {
+                    return Err(MethodCallFailed::ExceptionThrown(exc));
+                }
+            }
+        }
+    }
+
     let strict_uri_chars = crate::nbflags().uri_strict_chars;
     let illegal = if strict_uri_chars {
         uri_first_illegal_index(&url_str)
@@ -1293,7 +1335,47 @@ pub(crate) fn native_uri_init(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
     };
     if let Some(pos) = illegal {
         let input = ctx.create_string(&url_str);
-        let reason = ctx.create_string("Illegal character in URI");
+        // The JDK names the COMPONENT the offending character sits in, not the
+        // URI as a whole. MEASURED 2026-08-13 (/tmp/W2.java) -- five distinct
+        // names, and the boundaries are the delimiters themselves:
+        //
+        //   htt<p://h/      Illegal character in scheme name at index 3
+        //   //auth<x/p      Illegal character in authority   at index 6
+        //   http://h/pa<th  Illegal character in path        at index 11
+        //   http://h/p?q<1  Illegal character in query       at index 12
+        //   http://h/p#f<1  Illegal character in fragment    at index 12
+        //
+        // A relative "/pa<th" with no scheme and no authority is still "path",
+        // so the component is decided by position, not by what the URI has.
+        let component = {
+            let frag = url_str.find('#');
+            let query = url_str.find('?').filter(|q| frag.is_none_or(|f| *q < f));
+            let scheme_end = url_str.find(':').filter(|c| {
+                url_str[..*c].chars().all(|ch| ch.is_ascii_alphanumeric() || "+-.".contains(ch))
+                    && url_str[..*c].starts_with(|ch: char| ch.is_ascii_alphabetic())
+            });
+            let auth_start = url_str.find("//").map(|s| s + 2);
+            let auth_stop = auth_start.map(|s| {
+                url_str[s..]
+                    .find(['/', '?', '#'])
+                    .map(|r| s + r)
+                    .unwrap_or(url_str.len())
+            });
+            if frag.is_some_and(|f| pos > f) {
+                "fragment"
+            } else if query.is_some_and(|q| pos > q) {
+                "query"
+            } else if scheme_end.is_some_and(|c| pos < c) {
+                "scheme name"
+            } else if auth_start.is_some_and(|s| pos >= s)
+                && auth_stop.is_some_and(|e| pos < e)
+            {
+                "authority"
+            } else {
+                "path"
+            }
+        };
+        let reason = ctx.create_string(&format!("Illegal character in {component}"));
         if let Ok(Some(Value::Object(Some(exc)))) = ctx.new_object_initialized(
             "java/net/URISyntaxException",
             "(Ljava/lang/String;Ljava/lang/String;I)V",

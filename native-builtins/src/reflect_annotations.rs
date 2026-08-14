@@ -216,6 +216,13 @@ pub(crate) fn register_annotation_overrides(registry: &mut NativeMethodRegistry)
         "addHandler",
         "(Ljava/util/logging/Handler;)V",
         |ctx, args| {
+            // MEASURED 2026-08-13 (/tmp/W.java): NullPointerException with NO
+            // message. NOT a blanket JUL rule -- `Handler.setFilter(null)` and
+            // `Logger.setLevel(null)` are LEGAL on HotSpot (the latter means
+            // "inherit"), so the check goes only where it was measured.
+            if matches!(args.get(1), None | Some(Value::Object(None))) {
+                return Err(RuntimeError::NullPointerException { message: None }.into());
+            }
             let Some(Value::Object(Some(logger))) = args.first() else {
                 return Ok(None);
             };
@@ -287,6 +294,13 @@ pub(crate) fn register_annotation_overrides(registry: &mut NativeMethodRegistry)
         "setFormatter",
         "(Ljava/util/logging/Formatter;)V",
         |ctx, args| {
+            // MEASURED 2026-08-13 (/tmp/W.java): NullPointerException with NO
+            // message. NOT a blanket JUL rule -- `Handler.setFilter(null)` and
+            // `Logger.setLevel(null)` are LEGAL on HotSpot (the latter means
+            // "inherit"), so the check goes only where it was measured.
+            if matches!(args.get(1), None | Some(Value::Object(None))) {
+                return Err(RuntimeError::NullPointerException { message: None }.into());
+            }
             if let Some(Value::Object(Some(this))) = args.first() {
                 ctx.set_field_by_name(
                     *this,
@@ -358,6 +372,13 @@ pub(crate) fn register_annotation_overrides(registry: &mut NativeMethodRegistry)
         "setLevel",
         "(Ljava/util/logging/Level;)V",
         |ctx, args| {
+            // MEASURED 2026-08-13 (/tmp/W.java): NullPointerException with NO
+            // message. NOT a blanket JUL rule -- `Handler.setFilter(null)` and
+            // `Logger.setLevel(null)` are LEGAL on HotSpot (the latter means
+            // "inherit"), so the check goes only where it was measured.
+            if matches!(args.get(1), None | Some(Value::Object(None))) {
+                return Err(RuntimeError::NullPointerException { message: None }.into());
+            }
             ctx.set_field_by_name(
                 obj_arg(args, 0)?,
                 "logLevel",
@@ -424,6 +445,13 @@ pub(crate) fn register_annotation_overrides(registry: &mut NativeMethodRegistry)
         "setFormatter",
         "(Ljava/util/logging/Formatter;)V",
         |ctx, args| {
+            // MEASURED 2026-08-13 (/tmp/W.java): NullPointerException with NO
+            // message. NOT a blanket JUL rule -- `Handler.setFilter(null)` and
+            // `Logger.setLevel(null)` are LEGAL on HotSpot (the latter means
+            // "inherit"), so the check goes only where it was measured.
+            if matches!(args.get(1), None | Some(Value::Object(None))) {
+                return Err(RuntimeError::NullPointerException { message: None }.into());
+            }
             ctx.set_field_by_name(
                 obj_arg(args, 0)?,
                 "formatter",
