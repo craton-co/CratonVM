@@ -2343,6 +2343,19 @@ pub struct ZgcRealHeap {
     frag_worst_cycle: AtomicUsize,
     /// One-shot latch for the floor warning.
     frag_floor_warned: AtomicBool,
+    /// Cycles in which the concurrent-mark driver refused to certify a
+    /// complete mark set and the single-threaded marker ran instead. Non-zero
+    /// is not a crash — it is the fail-closed path doing its job — but it is
+    /// the number that says the driver is not trustworthy on this workload.
+    parallel_mark_fallbacks: AtomicUsize,
+    /// Concurrent phases the DRIVER reported, summed over all cycles.
+    ///
+    /// This is the counter that distinguishes "the worker pool marked" from
+    /// "`zgc_concurrent`'s controller drove the cycle" — the pool-only path
+    /// this replaced produced identical mark bits, identical stats and an
+    /// identical `parallel_mark_cycles`, so nothing else here can tell the two
+    /// apart. `passes` exists only inside `ZgcMarkCycleOutcome`.
+    driver_passes: AtomicUsize,
     /// Whether a concurrent mark cycle is in progress — Phase 3.
     ///
     /// This is the **only** thing on the mutator store path while no cycle is
@@ -2695,6 +2708,8 @@ impl ZgcRealHeap {
             frag_worst_free_permille: AtomicUsize::new(0),
             frag_worst_cycle: AtomicUsize::new(0),
             frag_floor_warned: AtomicBool::new(false),
+            parallel_mark_fallbacks: AtomicUsize::new(0),
+            driver_passes: AtomicUsize::new(0),
             mark_active: AtomicBool::new(false),
             mark_ingress: mark::ZMarkIngress::new(),
             mark_ingress_pushes: AtomicUsize::new(0),
@@ -2852,6 +2867,19 @@ impl ZgcRealHeap {
             self.parallel_mark_cycles.load(Ordering::Relaxed),
             self.compaction_cycles.load(Ordering::Relaxed),
             self.objects_relocated.load(Ordering::Relaxed),
+        )
+    }
+
+    /// `(driver_passes, fallbacks)` — did `zgc_concurrent`'s controller drive
+    /// the marking, and did it ever refuse to certify the result?
+    ///
+    /// `driver_passes == 0` with a non-zero `parallel_mark_cycles` would mean
+    /// the pool marked without the driver, which is the state this adoption
+    /// exists to leave behind.
+    pub fn driver_engagement(&self) -> (usize, usize) {
+        (
+            self.driver_passes.load(Ordering::Relaxed),
+            self.parallel_mark_fallbacks.load(Ordering::Relaxed),
         )
     }
 
@@ -3164,8 +3192,132 @@ impl ZgcRealHeap {
     /// be cleared. It warns once if not, and this function does not rely on
     /// that warning — it is the caller's contract.
     ///
-    /// Returns the engine's stats for the cycle.
-    fn mark_parallel_stw(&self, roots: &[u64], workers: usize) -> mark::ZMarkStatsSnapshot {
+    /// Returns the engine's stats for the cycle, or `None` when the driver
+    /// could not certify a complete mark set — see
+    /// [`Self::mark_with_controller_stw`], whose refusal this forwards.
+    fn mark_parallel_stw(&self, roots: &[u64], workers: usize) -> Option<mark::ZMarkStatsSnapshot> {
+        self.mark_with_controller_stw(roots, workers)
+    }
+
+    /// Drive one whole marking cycle through
+    /// [`crate::zgc_concurrent::ZgcConcurrentMarkController`] against this
+    /// heap — the adoption Phase 3's exit criterion asks for.
+    ///
+    /// # What this closes
+    ///
+    /// The plan's Phase 3 exits on "`zgc_concurrent`'s coordinator drives a
+    /// real collection". Until this function that was false in a way no
+    /// measurement would have caught: the driver existed, it was complete, it
+    /// was unit-tested, and its only context was `TestMarkContext`. The heap
+    /// marked with its own single-threaded loop and later with a bespoke
+    /// `mark_to_completion` call that used the worker pool but **not the
+    /// driver** — so the restart loop, the mark-end handshake and the
+    /// reference re-drain were all still bypassed on the real heap.
+    ///
+    /// # Why `ZgcNoMutatorSafepoint` is the CORRECT safepoint here
+    ///
+    /// Its doc says it is legal "only when the thread driving the heap is the
+    /// sole mutator", and that is exactly the state a `StopTheWorldToken`
+    /// proves: every other mutator is parked (or was forcibly stopped and
+    /// conservatively scanned) before `collect_garbage` is entered. There is
+    /// nothing to stop and no per-thread buffer to flush, so a no-op
+    /// implementation is not a stub standing in for the real thing — it is the
+    /// right answer to the question the trait asks. A **concurrent** cycle
+    /// needs the real one (plan item C1); this one does not.
+    ///
+    /// # Why `refs: None` is safe here, against the parameter's own warning
+    ///
+    /// `ZgcConcurrentMarkParams`'s doc says `None` "skips the phase entirely,
+    /// which is only correct for a heap with no registered `Reference`
+    /// objects (i.e. a test)". That warning is about a **concurrent** cycle,
+    /// where the mark-end safepoint is the only place a complete mark set
+    /// exists and therefore the only place the reference phase can run.
+    ///
+    /// Here the phase is not skipped — it runs immediately after this returns,
+    /// in `collect_garbage`, exactly where it always has, including its
+    /// existing INT-8 remark that re-drains whatever `keep_alive` resurrects.
+    /// Moving it into the hook is plan item C3 and belongs with C1, not before
+    /// it: doing it now would duplicate a working reference phase for no
+    /// change in behaviour.
+    ///
+    /// # Fail-closed
+    ///
+    /// `mark_set_complete` is the driver's load-bearing verdict and a sweep
+    /// against an incomplete mark set is a use-after-free. This returns `None`
+    /// rather than stats when the driver cannot certify one, and the caller
+    /// falls back to the single-threaded marker. That fallback is not
+    /// belt-and-braces: it is the only reason this adoption can be default-on.
+    fn mark_with_controller_stw(
+        &self,
+        roots: &[u64],
+        workers: usize,
+    ) -> Option<mark::ZMarkStatsSnapshot> {
+        use crate::zgc_concurrent::{
+            ZgcConcurrentMarkController, ZgcConcurrentMarkParams, ZgcNoMutatorSafepoint,
+        };
+        let bridge: std::sync::Arc<dyn mark::ZMarkContext> =
+            std::sync::Arc::new(ZHeapMarkBridge { heap: self });
+        let coordinator = std::sync::Arc::new(mark::ZMarkCoordinator::new(bridge, workers));
+        coordinator.begin_cycle();
+        coordinator.push_roots(roots);
+
+        // One restart is budgeted rather than zero, for the reason the old
+        // bespoke path gave: no mutator can race us, but budgeting zero would
+        // turn any flush that legitimately produced work into an "incomplete
+        // mark set" verdict on a set the sweep is about to trust.
+        let params = ZgcConcurrentMarkParams::new(
+            std::sync::Arc::clone(&coordinator),
+            std::sync::Arc::new(ZgcNoMutatorSafepoint),
+        )
+        .with_max_mark_end_restarts(Z_PARMARK_RESTART_BUDGET);
+
+        let outcome = match ZgcConcurrentMarkController::spawn(params).join_cycle() {
+            Ok(o) => o,
+            Err(_) => {
+                tracing::error!(
+                    target: "zgc",
+                    "zgc mark: the concurrent-mark driver PANICKED; falling back to                      the single-threaded marker for this cycle"
+                );
+                coordinator.end_cycle();
+                return None;
+            }
+        };
+        let stats = coordinator.stats().snapshot();
+        coordinator.end_cycle();
+        self.driver_passes
+            .fetch_add(outcome.passes, Ordering::Relaxed);
+
+        if !outcome.mark_set_complete {
+            tracing::error!(
+                target: "zgc",
+                passes = outcome.passes,
+                restarts = outcome.restarts,
+                redrains = outcome.redrains,
+                "zgc mark: the driver could not certify a complete mark set AT A                  SAFEPOINT — no mutator is running, so this cannot be a mutator                  race. Falling back to the single-threaded marker rather than                  sweeping against it"
+            );
+            return None;
+        }
+        tracing::debug!(
+            target: "zgc",
+            workers,
+            passes = outcome.passes,
+            restarts = outcome.restarts,
+            marked = stats.objects_marked,
+            "zgc mark: driven by zgc_concurrent's coordinator"
+        );
+        Some(stats)
+        // `coordinator` drops here. The controller thread was joined by
+        // `join_cycle` above, and `ZMarkCoordinator::drop` stops and JOINS
+        // every worker — so no thread holding a clone of `bridge` outlives
+        // this borrow of `self`.
+    }
+
+    /// The pool-only marking path this heap used between 2026-08-13 and
+    /// 2026-08-14. Kept as a private helper so the driver-based path above has
+    /// something to be compared against in a bench, and referenced by name in
+    /// the plan's Phase 3 note; not on any live path.
+    #[cfg(test)]
+    fn mark_pool_only_stw(&self, roots: &[u64], workers: usize) -> mark::ZMarkStatsSnapshot {
         let bridge: std::sync::Arc<dyn mark::ZMarkContext> =
             std::sync::Arc::new(ZHeapMarkBridge { heap: self });
         let coordinator = mark::ZMarkCoordinator::new(bridge, workers);
@@ -7449,6 +7601,9 @@ impl GarbageCollector for ZgcRealHeap {
         let parallel_workers = self.parallel_mark_workers();
         let mut work: Vec<usize> = Vec::new();
         let mut wild_skipped = 0usize;
+        // Cleared when the driver refuses to certify a complete mark set, which
+        // routes this cycle through the single-threaded marker below.
+        let mut parallel_ok = true;
         if parallel_workers > 1 {
             let root_addrs: Vec<u64> = roots.iter().map(|r| r.as_ptr() as u64).collect();
             // OPEN THE CYCLE FIRST. `mark_parallel_stw`'s doc calls this "the
@@ -7468,21 +7623,36 @@ impl GarbageCollector for ZgcRealHeap {
             // below, so the two marking paths disagreed about the one thing
             // that must not differ between them.
             let _skip = self.begin_concurrent_mark_cycle();
-            let stats = self.mark_parallel_stw(&root_addrs, parallel_workers);
+            let driven = self.mark_parallel_stw(&root_addrs, parallel_workers);
             self.end_concurrent_mark_cycle();
-            self.parallel_mark_cycles.fetch_add(1, Ordering::Relaxed);
-            // `off_head_children` is this loop's `wild_skipped` under another
-            // name — the engine's own doc says so.
-            wild_skipped = stats.off_heap_children as usize;
-            tracing::debug!(
-                target: "zgc",
-                workers = parallel_workers,
-                marked = stats.objects_marked,
-                scanned = stats.objects_scanned,
-                off_heap_children = stats.off_heap_children,
-                "zgc parallel STW mark complete"
-            );
-        } else {
+            match driven {
+                Some(stats) => {
+                    self.parallel_mark_cycles.fetch_add(1, Ordering::Relaxed);
+                    // `off_head_children` is this loop's `wild_skipped` under
+                    // another name — the engine's own doc says so.
+                    wild_skipped = stats.off_heap_children as usize;
+                    tracing::debug!(
+                        target: "zgc",
+                        workers = parallel_workers,
+                        marked = stats.objects_marked,
+                        scanned = stats.objects_scanned,
+                        off_heap_children = stats.off_heap_children,
+                        "zgc STW mark complete, driven by zgc_concurrent"
+                    );
+                }
+                // FAIL CLOSED. The driver could not certify a complete mark
+                // set, and a sweep against one is a use-after-free. Fall
+                // through to the single-threaded marker below, which starts
+                // from the same roots and re-marks from scratch — the mark
+                // bits already set are idempotent, so the fallback is a
+                // superset of whatever the driver managed.
+                None => {
+                    self.parallel_mark_fallbacks.fetch_add(1, Ordering::Relaxed);
+                    parallel_ok = false;
+                }
+            }
+        }
+        if !parallel_ok || parallel_workers <= 1 {
         // Trace from roots. A work stack holds base addresses to visit.
         for r in roots.iter() {
             work.push(r.as_ptr() as usize);
@@ -9546,7 +9716,8 @@ pub(crate) mod tests {
         *OVERLAY_ARMED.lock() = Some((owner.as_ptr() as usize, overlay));
 
         let _skip = heap.begin_concurrent_mark_cycle();
-        heap.mark_parallel_stw(&[owner.as_ptr() as u64], 2);
+        heap.mark_parallel_stw(&[owner.as_ptr() as u64], 2)
+            .expect("the driver must certify a complete mark set at a safepoint");
         heap.end_concurrent_mark_cycle();
         *OVERLAY_ARMED.lock() = None;
 
@@ -9598,7 +9769,9 @@ pub(crate) mod tests {
         let skip = par.begin_concurrent_mark_cycle();
         let _ = skip;
         let root_addrs: Vec<u64> = par_roots.iter().map(|r| r.as_ptr() as u64).collect();
-        let stats = par.mark_parallel_stw(&root_addrs, 4);
+        let stats = par
+            .mark_parallel_stw(&root_addrs, 4)
+            .expect("the driver must certify a complete mark set at a safepoint");
         par.end_concurrent_mark_cycle();
 
         // Count what the parallel engine marked, directly off the headers.
@@ -9636,7 +9809,8 @@ pub(crate) mod tests {
         heap.set_field(child, 0, Value::Object(Some(grandchild)));
 
         let _skip = heap.begin_concurrent_mark_cycle();
-        heap.mark_parallel_stw(&[root.as_ptr() as u64], 4);
+        heap.mark_parallel_stw(&[root.as_ptr() as u64], 4)
+            .expect("the driver must certify a complete mark set at a safepoint");
         heap.end_concurrent_mark_cycle();
 
         for (name, obj) in [
@@ -9663,7 +9837,8 @@ pub(crate) mod tests {
         let orphan = heap.alloc_object(ClassId::new(1), 0);
 
         let _skip = heap.begin_concurrent_mark_cycle();
-        heap.mark_parallel_stw(&[root.as_ptr() as u64], 4);
+        heap.mark_parallel_stw(&[root.as_ptr() as u64], 4)
+            .expect("the driver must certify a complete mark set at a safepoint");
         heap.end_concurrent_mark_cycle();
 
         assert!(heap.header_ref(root.as_ptr()).gc_flags() & GC_FLAG_MARKED != 0);
@@ -10423,6 +10598,67 @@ pub(crate) mod tests {
         assert!(
             compactions > 0 && relocated > 0,
             "compaction must still MOVE things across a non-contiguous              selection: compaction_cycles={compactions} objects_relocated={relocated}"
+        );
+    }
+
+    /// **`zgc_concurrent`'s coordinator drives a real collection** — Phase 3's
+    /// exit criterion, clause 1, asserted through `collect_garbage`.
+    ///
+    /// That clause is a CODE fact rather than a measurement, and it was false
+    /// for a whole session while the summary table said the phase was done:
+    /// the driver was complete, unit-tested, and its only context was
+    /// `TestMarkContext`. The heap marked with a bespoke `mark_to_completion`
+    /// call that used the worker pool but bypassed the driver — same mark
+    /// bits, same stats, same `parallel_mark_cycles`. `driver_passes` is the
+    /// only observable that separates them, because `passes` exists nowhere
+    /// but inside `ZgcMarkCycleOutcome`.
+    ///
+    /// The exact edit that trips it: point `mark_parallel_stw` back at
+    /// `mark_pool_only_stw`.
+    #[test]
+    fn the_concurrent_mark_driver_drives_a_real_collection() {
+        let heap = ZgcRealHeap::with_capacity(4 * 1024 * 1024);
+        heap.set_tlab_enabled(false);
+
+        // A small graph with reachable and unreachable halves, so the cycle
+        // has real work and a real verdict to reach.
+        let root = heap.alloc_object(ClassId::new(1), 4);
+        let child = heap.alloc_object(ClassId::new(2), 2);
+        heap.set_field(root, 0, Value::Object(Some(child)));
+        for _ in 0..64 {
+            heap.alloc_object(ClassId::new(3), 8);
+        }
+
+        let mut roots = [root];
+        cratonvm_types::flags::with_thread_overrides(
+            &[
+                ("CRATONVM_ZGC_PARMARK", Some("4")),
+                // Isolate marking from the moving question.
+                ("CRATONVM_ZGC_RELOCATE", Some("0")),
+            ],
+            || {
+                // SAFETY: these unit tests run the heap single-threaded, which
+                // is also exactly the condition `ZgcNoMutatorSafepoint` needs.
+                let stw = unsafe { StopTheWorldToken::new() };
+                heap.collect_garbage(&stw, &mut roots, &NoMonitors);
+            },
+        );
+
+        let (passes, fallbacks) = heap.driver_engagement();
+        assert!(
+            passes > 0,
+            "the coordinator must have DRIVEN the cycle; `passes` comes only              from ZgcMarkCycleOutcome, so 0 means the pool marked without it"
+        );
+        assert_eq!(
+            fallbacks, 0,
+            "the driver must certify a complete mark set at a safepoint, where              by construction no mutator can race it"
+        );
+
+        // ...and it must have marked correctly, not merely run.
+        assert_ne!(
+            heap.get_field(roots[0], 0),
+            Value::Object(None),
+            "the reachable child must have survived the driven cycle"
         );
     }
 

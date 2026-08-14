@@ -21,12 +21,15 @@ that tests drive?
 |---|---|---|
 | **Parallel marking** | **Built, opt-in** | `CRATONVM_ZGC_PARMARK=<n>` reaches `mark_parallel_stw` from `collect_garbage` |
 | **Compacting** | **Built, opt-in** | `CRATONVM_ZGC_RELOCATE=1` reaches `relocate_stw` from `collect_garbage`; returns a non-empty `PointerMap` and rewrites roots |
-| **Concurrent** | **NOT BUILT** | `set_mark_active(true)` and `ZgcConcurrentMarkController::spawn` have **no non-test caller**. The driver exists, the ingress is wired and inert, and nothing starts a cycle |
+| **Concurrent** | **PARTLY BUILT — the driver runs, the mutators do not** | Since 2026-08-14 `ZgcConcurrentMarkController` drives every collection against `ZgcRealHeap`, with its restart loop, mark-end handshake and `mark_set_complete` verdict. What is not concurrent is the mutator half: the cycle runs **at a safepoint**, so `ZgcNoMutatorSafepoint` is legitimately a no-op and `set_mark_active(true)` still has no non-test caller. C1 and C2 below are what make it concurrent |
 | **Generational** | **NOT BUILT** | page ages, the card barrier and `ZGenerationScope` are computed inside `relocate_stw`, but `remembered_roots` has **no non-test caller** and there is no young-only collection. (`minor_collect` in `zgc.rs` belongs to the *simulation* half, not `ZgcRealHeap`.) |
 
-So the first two are a flag away and the last two are a project. Saying "ZGC
-isn't concurrent by default" would be wrong in a way this tree has been burned
-by before: it is not off, it is absent.
+So the first two are a flag away, generational is a project, and concurrency
+is now half a project: the machinery runs, the mutators are still stopped while
+it does. Saying "ZGC isn't concurrent by default" would be wrong in a way this
+tree has been burned by before — it is not off, and it is no longer wholly
+absent either. The precise missing thing is a `ZgcMarkSafepoint` that really
+stops mutators and a pool that outlives it.
 
 **What already exists, and is the reason this is weeks and not months:**
 
@@ -34,7 +37,8 @@ by before: it is not off, it is absent.
   termination handshake. **Exercised against the real heap** since parallel STW
   marking landed, so it is no longer only test-driven.
 * `gc/src/zgc_concurrent.rs` — the cycle driver, including the restart loop and
-  the reference-processing re-drain. Complete; never spawned outside tests.
+  the reference-processing re-drain. **Driving every collection since
+  2026-08-14**, at a safepoint.
 * `ZgcRealHeap: ZMarkContext` — the marking seam, including the collection
   overlay edge that adopting it exposed as missing.
 * `ZgcRealHeap::satb_pre_barrier` — the mutator ingress, fed by
@@ -54,9 +58,17 @@ Two remain, plus the piece that phase did not name.
 
 ### C1 — `ZgcMarkSafepoint` for the real VM *(the critical path)*
 
+**Narrowed 2026-08-14.** The driver, its restart loop and its verdict are now
+exercised on the real heap every cycle, so this is no longer "wire up an
+unproven component" — it is "replace one no-op implementation with a real one".
+`ZgcNoMutatorSafepoint` is correct while the cycle is stop-the-world and becomes
+wrong the moment it is not, which makes it the single switch this phase turns.
+
+
 `ZgcConcurrentMarkParams` wants an `Arc<dyn ZgcMarkSafepoint>` with three
 methods: `begin_mark_end_safepoint`, `flush_mutator_buffers`,
-`end_mark_end_safepoint`. Nothing implements it against this VM.
+`end_mark_end_safepoint`. The only implementation reaching the real heap is
+`ZgcNoMutatorSafepoint`, which stops nothing and flushes nothing.
 
 The implementor must drive the VM's existing safepoint path — the one that
 produces a `StopTheWorldToken` after `gc_barrier.wait_for_all()` — and hold the
