@@ -1192,27 +1192,26 @@ fn seed_direct_native_engine_services() {
     // answers 15.
     put_alias(SUN, "MessageDigest", "SHAKE128", "SHAKE128-256");
     put_alias(SUN, "MessageDigest", "SHAKE256", "SHAKE256-512");
-    // `ML-DSA` — the UMBRELLA name — is deliberately absent from this
-    // `KeyFactory` list while the three parameter-set names stay. HotSpot's
-    // SUN does advertise and serve it, so this is a knowing divergence in the
-    // under-advertising direction, and it is the safe one: this VM's
-    // `key_factory::kf_algo_idx` has arms only for `ML-DSA-44/65/87`, falls to
-    // `-1`, and `kf_get_instance` throws. Advertised-and-refused.
+    // `ML-DSA` — the UMBRELLA name — was deliberately absent from this
+    // `KeyFactory` list until 2026-08-14, while the three parameter-set names
+    // stayed. It is back because the ALTERNATIVE the earlier record declined
+    // has now been taken: `kf_algo_idx` carries an umbrella arm
+    // (`ALGO_MLDSA_GENERIC`) and `pqc_umbrella_keyfactory_class` drives the
+    // JDK's own non-nested `sun.security.provider.ML_DSA_Impls$KF`, which is
+    // the factory that resolves the parameter set from the key's encoding.
     //
-    // The alternative — add an umbrella arm resolving the parameter set from
-    // the key spec, as `signature::mldsa_spi_class` does from the init key —
-    // was declined rather than deferred, because W7-29 RAN the three names
-    // that already resolve and found the objects partly unusable one accessor
-    // in (`KeyFactory.getInstance("ML-DSA-44").getProvider()` raises
+    // The reason the record gave for declining was not "too much work": it had
+    // RUN the three names that already resolved and found the objects partly
+    // unusable one accessor in —
+    // `KeyFactory.getInstance("ML-DSA-44").getProvider()` raised
     // `NullPointerException: Cannot enter synchronized block because
-    // "this.lock" is null`, where HotSpot answers `SUN version 25`). Widening
-    // a surface that is already broken is not a fix. Note that
-    // `signature::algo_idx` DOES carry the umbrella arm, so `Signature`
-    // continues to advertise and serve `ML-DSA` — the two engines disagreed
-    // about the same name, and this makes each engine's advertisement match
-    // its own implementation rather than making them agree with each other.
+    // "this.lock" is null`, where HotSpot answers `SUN version 25`. Widening a
+    // surface that is already broken is not a fix, and that objection is
+    // ANSWERED rather than ignored: `kf_get_provider` is registered in the
+    // same change, so every one of these names now reports its provider
+    // instead of throwing from a plain accessor.
     // W7-63-jca-advertise-vs-serve.md.
-    for algorithm in ["DSA", "ML-DSA-44", "ML-DSA-65", "ML-DSA-87"] {
+    for algorithm in ["DSA", "ML-DSA", "ML-DSA-44", "ML-DSA-65", "ML-DSA-87"] {
         put_service(SUN, "KeyFactory", algorithm, "sun.security.provider.Native");
     }
     for algorithm in ["DRBG", "SHA1PRNG"] {
@@ -1346,21 +1345,24 @@ fn seed_direct_native_engine_services() {
             );
         }
     }
-    // The `ML-KEM` UMBRELLA is absent for the same reason `ML-DSA` is absent
+    // The `ML-KEM` UMBRELLA was absent for the same reason `ML-DSA` was absent
     // from the `SUN` `KeyFactory` list above, and it was found by the census
-    // rather than by either record: `key_factory::algo_idx` has arms for
-    // `ML-KEM-512/768/1024` only, falls to `-1`, and `kf_get_instance` throws,
-    // so `Security.getAlgorithms("KeyFactory")` named `ML-KEM` while
-    // `KeyFactory.getInstance("ML-KEM")` raised `NoSuchAlgorithmException`.
-    // Advertised-and-refused, a seventh instance of the species in the same
-    // seed function, and note that the SPI class name here is a REAL JDK class
-    // — that does not help, because `kf_get_instance` intercepts natively and
-    // never reaches `build_jca_impl`. A real class name in a service row is
-    // not evidence the row is serviceable.
+    // rather than by either record. Both are back on 2026-08-14 and for the
+    // same reason: `kf_algo_idx` carries the umbrella arm and
+    // `pqc_umbrella_keyfactory_class` drives the JDK's own non-nested
+    // `ML_KEM_Impls$KF`. Note that the SPI class name in a service row was
+    // never evidence of anything — `kf_get_instance` intercepts natively and
+    // never reaches `build_jca_impl` — so what makes these rows truthful is
+    // the engine arm, not the string.
     // W7-63-jca-advertise-vs-serve.md.
-    for algorithm in ["ML-KEM-512", "ML-KEM-768", "ML-KEM-1024"] {
+    for algorithm in ["ML-KEM", "ML-KEM-512", "ML-KEM-768", "ML-KEM-1024"] {
         put_service(JCE, "KeyFactory", algorithm, "com.sun.crypto.provider.ML_KEM_Impls$KF");
     }
+    // Finite-field Diffie-Hellman, registered under the name HotSpot uses.
+    // `DH` is an ALIAS there, not a service, which is why the advertised list
+    // names `DiffieHellman` while every caller types `DH`.
+    put_service(JCE, "KeyFactory", "DiffieHellman", "com.sun.crypto.provider.DHKeyFactory");
+    put_alias(JCE, "KeyFactory", "DH", "DiffieHellman");
     // SunJCE's own aliases. Aliases are excluded from
     // `Security.getAlgorithms` (their property key is `Alg.Alias.Cipher.X`, not
     // `Cipher.X`), so these widen `getInstance`/`getService` resolution without
@@ -1553,6 +1555,77 @@ fn seed_retired_getalgorithms_literals() {
         "DSA",
         "sun.security.provider.DSAKeyPairGenerator$Current",
     );
+    seed_builtin_keypairgenerator_services();
+}
+
+/// Service entries for every `KeyPairGenerator` algorithm this VM SERVES from
+/// its own natives.
+///
+/// WHY THIS EXISTS. `Security.getProviders("KeyPairGenerator.Ed25519")`
+/// answered `<none>` for an algorithm `getInstance("Ed25519")` happily served,
+/// because the two live in disjoint worlds: `security_get_providers_filtered`
+/// consults only the service registry, and the algorithms CratonVM serves from
+/// `key_factory::kpg_can_generate` are in no registry at all. A caller that
+/// picks its provider by filter — the JDK's own `Provider.getService` shape —
+/// therefore concluded the algorithm did not exist, and `getInstance` then
+/// served it anyway.
+///
+/// Seeding them closes the filter AND collapses the split `kpg_serviceable`
+/// has to straddle: the second half of that disjunction
+/// (`any_provider_offers`) now covers the first for every built-in name, so
+/// the two worlds agree even though the code still asks both.
+///
+/// Provider assignment is HotSpot's, read off JDK 25 with
+/// `probes/JcaGetInstanceProbe.java` and pinned to `kpg_provider_name` by
+/// `every_kpg_algorithm_this_vm_serves_is_advertised`. Class names are the
+/// real SPI classes each provider registers; nothing reads them on the
+/// intercepted path (`kpg_get_instance` never reaches `build_jca_impl`), which
+/// is exactly why the RATCHET and not the string is what keeps a row honest.
+fn seed_builtin_keypairgenerator_services() {
+    put_service(
+        "SunRsaSign",
+        "KeyPairGenerator",
+        "RSASSA-PSS",
+        "sun.security.rsa.RSAKeyPairGenerator$PSS",
+    );
+    for (algorithm, class_name) in [
+        ("Ed25519", "sun.security.ec.ed.EdDSAKeyPairGenerator$Ed25519"),
+        ("Ed448", "sun.security.ec.ed.EdDSAKeyPairGenerator$Ed448"),
+        ("EdDSA", "sun.security.ec.ed.EdDSAKeyPairGenerator"),
+        ("X25519", "sun.security.ec.XDHKeyPairGenerator$X25519"),
+        ("X448", "sun.security.ec.XDHKeyPairGenerator$X448"),
+        ("XDH", "sun.security.ec.XDHKeyPairGenerator"),
+    ] {
+        put_service("SunEC", "KeyPairGenerator", algorithm, class_name);
+    }
+    for (algorithm, class_name) in [
+        ("ML-DSA", "sun.security.provider.ML_DSA_Impls$KPG"),
+        ("ML-DSA-44", "sun.security.provider.ML_DSA_Impls$KPG2"),
+        ("ML-DSA-65", "sun.security.provider.ML_DSA_Impls$KPG3"),
+        ("ML-DSA-87", "sun.security.provider.ML_DSA_Impls$KPG5"),
+    ] {
+        put_service("SUN", "KeyPairGenerator", algorithm, class_name);
+    }
+    for (algorithm, class_name) in [
+        ("ML-KEM", "com.sun.crypto.provider.ML_KEM_Impls$KPG"),
+        ("ML-KEM-512", "com.sun.crypto.provider.ML_KEM_Impls$KPG2"),
+        ("ML-KEM-768", "com.sun.crypto.provider.ML_KEM_Impls$KPG3"),
+        ("ML-KEM-1024", "com.sun.crypto.provider.ML_KEM_Impls$KPG5"),
+        (
+            "DiffieHellman",
+            "com.sun.crypto.provider.DHKeyPairGenerator",
+        ),
+    ] {
+        put_service("SunJCE", "KeyPairGenerator", algorithm, class_name);
+    }
+    // `DH` is an alias on HotSpot too, so it resolves through `getInstance`
+    // without lengthening `Security.getAlgorithms("KeyPairGenerator")`.
+    put_alias("SunJCE", "KeyPairGenerator", "DH", "DiffieHellman");
+    // `ECDSA` is deliberately NOT here. SunEC registers `KeyPairGenerator.EC`
+    // and no `ECDSA` alias for it, so HotSpot answers
+    // `NoSuchAlgorithmException` — advertising it would make the filter claim
+    // a name HotSpot refuses, which is this table's own failure mode in the
+    // other direction.
 }
 
 /// Real-JCA bring-up: seed the `SunEC` provider's EC service entries into the
@@ -4654,6 +4727,71 @@ mod tests {
         }
     }
 
+    /// The `KeyPairGenerator` ratchet, in BOTH directions — which is what makes
+    /// it different from its `Signature` / `KeyFactory` siblings.
+    ///
+    /// The one-way form (advertised ⇒ serviceable) cannot see the residual this
+    /// closes. `Security.getProviders("KeyPairGenerator.Ed25519")` answered
+    /// `<none>` for an algorithm `getInstance("Ed25519")` served, because
+    /// `security_get_providers_filtered` reads the service registry and the
+    /// built-in algorithms were in NO registry — under-advertised, not
+    /// over-advertised, and therefore invisible to a one-way check. A caller
+    /// that picks its provider by filter concluded the algorithm did not exist.
+    ///
+    /// So both halves are asserted: nothing advertised is refused, and nothing
+    /// served is unadvertised.
+    #[test]
+    fn every_kpg_algorithm_this_vm_serves_is_advertised() {
+        let _lock = reset_service_state_for_tests();
+        seed_direct_native_engine_services();
+        let advertised = all_advertised("KeyPairGenerator");
+        assert!(
+            advertised.len() >= 15,
+            "the KeyPairGenerator seed looks empty ({} rows): a loop over \
+             nothing passes vacuously",
+            advertised.len()
+        );
+        for (provider, algorithm) in &advertised {
+            assert!(
+                crate::jca::key_factory::kpg_get_instance_offers(algorithm),
+                "{provider} advertises KeyPairGenerator.{algorithm}, but \
+                 KeyPairGenerator.getInstance refuses it"
+            );
+        }
+        // The direction the filter needs, and the one the residual was in.
+        // `DH` and `ECDSA` are absent by design: HotSpot registers `DH` as an
+        // ALIAS of `DiffieHellman` (aliases resolve but are not advertised),
+        // and registers no `ECDSA` generator at all.
+        for algorithm in [
+            "RSA", "RSASSA-PSS", "EC", "DSA", "Ed25519", "Ed448", "EdDSA", "X25519", "X448",
+            "XDH", "ML-DSA", "ML-DSA-44", "ML-KEM", "ML-KEM-512", "DiffieHellman",
+        ] {
+            assert!(
+                crate::jca::key_factory::kpg_get_instance_offers(algorithm),
+                "{algorithm} must be serviceable"
+            );
+            assert!(
+                find_service_provider("KeyPairGenerator", algorithm).is_some(),
+                "KeyPairGenerator.{algorithm} is served but advertised by no \
+                 provider — Security.getProviders(\"KeyPairGenerator.{algorithm}\") \
+                 answers <none> and a caller that picks its provider by filter \
+                 cannot find it"
+            );
+        }
+        // The alias resolves without being advertised, exactly as on HotSpot.
+        assert!(
+            find_service_provider("KeyPairGenerator", "DH").is_some(),
+            "the DH alias must resolve to the DiffieHellman service"
+        );
+        // Anti-vacuity: prove the registry can say NO.
+        for bogus in ["NO-SUCH-KPG", "SLH-DSA", "AES", ""] {
+            assert!(
+                find_service_provider("KeyPairGenerator", bogus).is_none(),
+                "no provider may advertise KeyPairGenerator.{bogus:?}"
+            );
+        }
+    }
+
     /// W7-63 ratchet: every `KeyFactory` name the seed advertises must be one
     /// `KeyFactory.getInstance` will serve.
     ///
@@ -4684,17 +4822,24 @@ mod tests {
                  KeyFactory.getInstance refuses it"
             );
         }
-        // Both umbrellas are STOP-ADVERTISING fixes, not implementations, so
-        // pin both halves of each: absent where the engine refuses them,
-        // present where it does not. Either half alone would let the pair
-        // drift back. `ML-KEM` was found by the census, not by either
-        // originating record — the loop above is what catches the next one.
+        // Both umbrellas WERE stop-advertising fixes and are now
+        // implementations: `kf_algo_idx` carries `ALGO_MLDSA_GENERIC` /
+        // `ALGO_MLKEM_GENERIC` and `pqc_umbrella_keyfactory_class` drives the
+        // JDK's own non-nested factory for each. The rule the earlier
+        // assertion encoded has not changed — "either implement the umbrella
+        // arm or leave the name out, but never both" — only which side of it
+        // these two names sit on. The loop above is what enforces it
+        // generically; this is the named pin for the pair that drifted.
         for (provider, umbrella) in [("SUN", "ML-DSA"), ("SunJCE", "ML-KEM")] {
             assert!(
-                get_service_entry(provider, "KeyFactory", umbrella).is_none(),
-                "{provider} must not advertise the {umbrella} umbrella for KeyFactory \
-                 while kf_algo_idx refuses it — either implement the umbrella arm or \
-                 leave the name out, but never both"
+                get_service_entry(provider, "KeyFactory", umbrella).is_some(),
+                "{provider} implements the {umbrella} KeyFactory umbrella and must \
+                 advertise it — an implemented-but-unadvertised name is invisible to \
+                 Security.getProviders(filter), which is how a caller picks a provider"
+            );
+            assert!(
+                crate::jca::key_factory::get_instance_offers(umbrella),
+                "{umbrella} is advertised for KeyFactory and must be serviceable"
             );
         }
         assert!(

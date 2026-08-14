@@ -2375,6 +2375,74 @@ impl Rsa {
         Some(em)
     }
 
+    /// Build the PKCS#1 v1.5 **block type 1** encoding with NO DigestInfo:
+    /// `00 01 FF..FF 00 || M`.
+    ///
+    /// This is what `NONEwithRSA` signs. The algorithm takes the caller's bytes
+    /// as the already-computed digest and does NOT wrap them in a DigestInfo —
+    /// the caller who chose `NONEwithRSA` is the one who decides what the
+    /// payload means, which is the whole point of the algorithm and also why it
+    /// is the one RSA signature scheme SunJCE serves rather than SunRsaSign
+    /// (SunJCE implements it by encrypting under the private key through
+    /// `com.sun.crypto.provider.RSACipherAdaptor`, i.e. exactly this padding).
+    ///
+    /// `None` for a payload that cannot fit: RFC 8017 §9.2 wants at least eight
+    /// `FF` bytes, so `k >= m.len() + 11`. Returning `None` rather than
+    /// underflowing `k - m_len - 3` is the same guard, and for the same reason,
+    /// as [`Self::pkcs1v15_encode`].
+    fn pkcs1v15_encode_raw(m: &[u8], k: usize) -> Option<Vec<u8>> {
+        let ps_len = k.checked_sub(m.len() + 3).filter(|&ps| ps >= 8)?;
+        let mut em = Vec::with_capacity(k);
+        em.push(0x00);
+        em.push(0x01);
+        em.extend(std::iter::repeat(0xff).take(ps_len));
+        em.push(0x00);
+        em.extend_from_slice(m);
+        Some(em)
+    }
+
+    /// `NONEwithRSA` sign — PKCS#1 v1.5 block type 1 over the raw payload.
+    ///
+    /// `None` when the payload is too long for the modulus, which is the
+    /// condition SunJCE reports as `SignatureException`; every caller here has
+    /// that channel.
+    pub fn sign_none(key: &RsaPrivateKey, data: &[u8]) -> Option<Vec<u8>> {
+        let k = (key.n.bit_length() + 7) / 8;
+        let em = Self::pkcs1v15_encode_raw(data, k)?;
+        let m = BigUint::from_bytes_be(&em);
+        // Blinded, for the same VULN(2) reason `sign_sha256` is blinded: the
+        // variable-time `modpow` otherwise leaks a message-dependent timing
+        // signal, and `NONEwithRSA` payloads are frequently attacker-chosen.
+        let sig = rsa_private_modpow_blinded(&m, &key.d, &key.e, &key.n);
+        Some(sig.to_bytes_be_padded(k))
+    }
+
+    /// `NONEwithRSA` verify.
+    ///
+    /// `Some(bool)` is the genuine answer; `None` means the question was never
+    /// asked — a signature of the wrong length for the modulus, or a payload
+    /// that cannot be encoded under it. The same three-valued contract
+    /// [`Self::try_verify_sha256`] carries, and for the same reason: collapsing
+    /// a refusal to `false` reports "forged" where nothing was checked.
+    ///
+    /// The comparison is against the RE-ENCODED expected block, so a signature
+    /// whose recovered block has the right payload but malformed padding is
+    /// rejected — the Bleichenbacher'06 signature-forgery shape. Nothing here
+    /// parses the recovered bytes.
+    pub fn verify_none(key: &RsaPublicKey, data: &[u8], signature: &[u8]) -> Option<bool> {
+        let k = (key.n.bit_length() + 7) / 8;
+        if signature.len() != k {
+            return None;
+        }
+        let expected = Self::pkcs1v15_encode_raw(data, k)?;
+        let c = BigUint::from_bytes_be(signature);
+        if c.cmp(&key.n) != std::cmp::Ordering::Less {
+            return None;
+        }
+        let m = c.modpow(&key.e, &key.n);
+        Some(m.to_bytes_be_padded(k) == expected)
+    }
+
     /// Serialize public key to DER (SubjectPublicKeyInfo).
     pub fn public_key_to_der(key: &RsaPublicKey) -> Vec<u8> {
         let n_bytes = key.n.to_bytes_be();
@@ -4652,6 +4720,21 @@ pub fn rsa_verify(id: u64, message: &[u8], signature: &[u8]) -> Option<bool> {
     let guard = RSA_KEY_STORE.read();
     let key_pair = guard.as_ref().and_then(|m| m.get(&id))?;
     Rsa::try_verify_sha256(&key_pair.public_key, message, signature).ok()
+}
+
+/// `NONEwithRSA` sign, by `crypto_impl` key handle.
+pub fn rsa_sign_none(id: u64, data: &[u8]) -> Option<Vec<u8>> {
+    let guard = RSA_KEY_STORE.read();
+    let key_pair = guard.as_ref().and_then(|m| m.get(&id))?;
+    Rsa::sign_none(&key_pair.private_key, data)
+}
+
+/// `NONEwithRSA` verify, by `crypto_impl` key handle. Same `None`-is-a-refusal
+/// contract as [`rsa_verify`].
+pub fn rsa_verify_none(id: u64, data: &[u8], signature: &[u8]) -> Option<bool> {
+    let guard = RSA_KEY_STORE.read();
+    let key_pair = guard.as_ref().and_then(|m| m.get(&id))?;
+    Rsa::verify_none(&key_pair.public_key, data, signature)
 }
 
 /// Maps a *real* RSA key object's GC-stable `identityHashCode` to its
@@ -6992,11 +7075,40 @@ mod tests {
     /// test above cannot see any of it, because a round trip never fails.
     #[test]
     fn rsa_cipher_failures_carry_the_class_sunjce_raises() {
-        let (pk, sk) = Rsa::generate_keypair(2048);
+        // ORDER THE TWO MODULI, and the reason is a measured 1-in-8 flake.
+        //
+        // The wrong-key row below encrypts under the first key and decrypts
+        // under the second, and asserts a PADDING failure. Both moduli are
+        // 2048-bit and otherwise unrelated, so roughly half the time the second
+        // is the smaller of the two — and then the ciphertext integer (uniform
+        // below the FIRST modulus) is sometimes at or above the second, where
+        // `RSACore.parseMsg`'s guard rejects it as
+        // `BadPaddingException("Message is larger than modulus")` BEFORE any
+        // unpadding runs. Same class, different message, and the message is
+        // what the VULN(1) oracle repair pins:
+        //
+        // ```text
+        // assertion `left == right` failed: Pkcs1
+        //   left: "Message is larger than modulus"
+        //  right: "Padding error in decryption"
+        // ```
+        //
+        // Sorting the pair so the ENCRYPTING modulus is the smaller one makes
+        // `ct < n <= other_n` hold by construction, so the ciphertext is always
+        // a decryptable representative under the wrong key and the failure is
+        // always the unpadding one the test is about. Relaxing the assertion
+        // instead would retire the oracle regression it exists for.
+        let (a_pk, a_sk) = Rsa::generate_keypair(2048);
+        let (b_pk, b_sk) = Rsa::generate_keypair(2048);
+        let ((pk, sk), (other_pk, other_sk)) =
+            if a_pk.n.cmp(&b_pk.n) == std::cmp::Ordering::Less {
+                ((a_pk, a_sk), (b_pk, b_sk))
+            } else {
+                ((b_pk, b_sk), (a_pk, a_sk))
+            };
         let n = pk.n.to_bytes_be();
         let e = pk.e.to_bytes_be();
         let d = sk.d.to_bytes_be();
-        let (other_pk, other_sk) = Rsa::generate_keypair(2048);
         let other_n = other_pk.n.to_bytes_be();
         let other_d = other_sk.d.to_bytes_be();
 
