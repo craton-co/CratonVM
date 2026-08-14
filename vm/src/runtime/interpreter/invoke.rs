@@ -2986,6 +2986,14 @@ pub(super) fn try_stackless_invoke(
     use crate::runtime::frame::padded_bytecode;
     use crate::vm::{coerce_value_for_return, native_return_pushed_to_stack, safe_native_call};
 
+    // The denominator of the per-invoke lookup count — see
+    // `cratonvm_native_api::registry::lookup_census`. This is the every-invoke
+    // entry point, so it is what a "one lookup per invoke" restructuring would
+    // be dividing the registry probes by.
+    cratonvm_native_api::registry::lookup_census::probe(
+        cratonvm_native_api::registry::lookup_census::INVOKE_STACKLESS,
+    );
+
     // Memo for the constant `DowncallHandle.type()` triple resolved in the
     // receiver-class-gated arm below (native-dispatch-memoization §3, B4).
     // ONE STATIC, ONE TRIPLE: the single `.callback` below passes three

@@ -490,12 +490,41 @@ use cratonvm_types::compat::CompatibilityMode;
 ///
 /// Anything the run reports beyond (a) is a finding to attribute, not slack to
 /// absorb: 182 commits separate the freeze from HEAD.
-const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 1263;
+///
+/// ## Re-frozen 2026-08-13: 1263 -> 1287, and 1253 -> 1277
+///
+/// **+24 in BOTH configurations, from ONE change**, which is why both constants
+/// move by the same delta in one commit: twelve `Collection` methods forwarded
+/// on each of `java/util/Collections$SynchronizedCollection` and
+/// `$SynchronizedSet` (`register_synchronized_collection_wrapper_natives`,
+/// bodies in `util_concurrent_ext::sync_collection_delegate`).
+///
+/// **Attributed, not absorbed.** The wrapper had seven methods —
+/// `add`/`contains`/`remove`/`size`/`isEmpty`/`iterator`/`toArray` — which was
+/// the whole surface `Collections.synchronizedCollection(…)` had ever been asked
+/// for. Since 2026-08-13 the wrapper is also what `Hashtable`/`Properties` hand
+/// back for `keySet()`/`entrySet()`/`values()` (the JDK's own answer: those
+/// accessors are `Collections.synchronizedSet(new KeySet(), this)`), so it is
+/// now asked for `stream`, `forEach`, `toString`, `containsAll`, `retainAll`,
+/// `removeAll`, `addAll`, `removeIf`, `clear`, `spliterator` and the two typed
+/// `toArray` overloads as well.
+///
+/// **`SyntheticStub` is the right kind here, and `Bridge` would be wrong.** In
+/// real-JDK mode all 24 are DROPPED — the strict census in this same file
+/// reports every stub row dropped — and the real
+/// `Collections$SynchronizedCollection` bytecode runs, `synchronized (mutex)`
+/// included. They exist for synthetic-JDK mode, where the class has no bytecode
+/// at all and an UNDECLARED method falls through to an interface-level native
+/// that reads the WRAPPER as the collection and reports it EMPTY. Registering
+/// them `Bridge` would make them win over the real class and silently drop the
+/// synchronization. See
+/// `fixed-suite-bugs/netty/collection-view-carrier-residuals-FIXED-20260813.md`.
+const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 1287;
 
 /// The default `-p cratonvm-native-builtins` resolve: ten `jmx::*` registrars
 /// short of the shipping registry, and 10 stub rows lighter. See
 /// [`BASELINE_SYNTHETIC_STUBS_MANAGEMENT`] for the history both share.
-const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 1253;
+const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 1277;
 
 // Both constants are compiled in both configurations on purpose: a reader
 // re-freezing one can see the other, and neither can be edited by accident

@@ -113,6 +113,14 @@ fn maybe_dump_shutdown_reports() {
     // its cost somewhere the compiler statistics do not reach.
     cratonvm_vm::jit::conservative_roots::scan_prof::dump();
 
+    // How many native-registry probes one invoke cost, self-gated on
+    // `CRATONVM_DBG_NATIVE_LOOKUPS=1`. This is the number
+    // `performance/vm-per-call-dispatch-cost-RETIRED-20260813.md` §2 asks for
+    // before anyone restructures the dispatch entry points: a profile share can
+    // say `slot_for_exact` is 8.5%, but only this says whether a "one lookup
+    // per invoke" rewrite would divide it by 1 or by 10.
+    cratonvm_native_api::registry::lookup_census::report("exit");
+
     // Which classes this run DEFINED, hottest first, self-gated on
     // `CRATONVM_DBG=define-census`. Class definition is the only thing that
     // calls `JitCache::invalidate_for_class`, so a profile that shows that

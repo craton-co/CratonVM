@@ -152,8 +152,9 @@ defect outright — collection views stopped being carrier-classed
 retired the page. See
 [the record](arraylist-native-overhead-and-view-carrier-FIXED-20260813.md),
 which already reports this class at **15/15**, and its two residual pages:
-[collection-view carrier residuals](../../../known-issues/collection-view-carrier-residuals-20260813.md)
-and [the VM-wide per-call cost](../../../known-issues/vm-per-call-dispatch-cost-20260813.md).
+[collection-view carrier residuals](collection-view-carrier-residuals-FIXED-20260813.md)
+(closed the same day) and
+[the VM-wide per-call cost](../../performance/vm-per-call-dispatch-cost-RETIRED-20260813.md).
 
 Re-measured here on the merged tree (that fix plus this branch's three):
 

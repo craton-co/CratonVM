@@ -17188,6 +17188,12 @@ pub fn invoke_or_native(
     descriptor: &str,
     args: &[Value],
 ) -> MethodCallResult {
+    // Second denominator for the per-invoke lookup census: the calls that get
+    // here are the ones an inline cache did NOT serve, and they are the ones
+    // that walk the long `(class, method, descriptor)` comparison chain below.
+    cratonvm_native_api::registry::lookup_census::probe(
+        cratonvm_native_api::registry::lookup_census::INVOKE_GENERAL,
+    );
     dbg_dispatch_tally("invoke_or_native", class_name, method_name, descriptor);
     // Residual-6 diagnosis (env-gated, CRATONVM_TRACE_CLASSVALUE): log every
     // get(Class) dispatch entering the general resolver, with its dispatch
@@ -22875,6 +22881,74 @@ fn invoke_on_class_shared_inner(
                                     | "removeIf"
                                     | "spliterator"
                             ))
+                        // The same for the SET-shaped views
+                        // (native-collections' `SET_VIEW_CARRIERS`), whose state
+                        // is the backing map in HashSet's own `map` slot.
+                        // `equals`/`hashCode` ARE here: these carriers extend
+                        // `AbstractSet`, whose contract is what
+                        // `native_hs_equals`/`native_hs_hash_code` implement.
+                        // Companion entry in
+                        // native_override::force_native_over_real_jdk_bytecode.
+                        || (matches!(
+                                class_name,
+                                "java/util/HashMap$KeySet"
+                                    | "java/util/HashMap$EntrySet"
+                                    | "java/util/LinkedHashMap$LinkedKeySet"
+                                    | "java/util/LinkedHashMap$LinkedEntrySet"
+                                    | "java/util/Hashtable$KeySet"
+                                    | "java/util/Hashtable$EntrySet"
+                                    | "java/util/TreeMap$KeySet"
+                                    | "java/util/concurrent/ConcurrentHashMap$EntrySetView"
+                            )
+                            && matches!(
+                                method_name,
+                                "size"
+                                    | "isEmpty"
+                                    | "add"
+                                    | "contains"
+                                    | "iterator"
+                                    | "toArray"
+                                    | "toString"
+                                    | "remove"
+                                    | "clear"
+                                    | "forEach"
+                                    | "stream"
+                                    | "removeIf"
+                                    | "spliterator"
+                                    | "addAll"
+                                    | "removeAll"
+                                    | "retainAll"
+                                    | "containsAll"
+                                    | "equals"
+                                    | "hashCode"
+                                    | "first"
+                                    | "last"
+                                    | "comparator"
+                                    | "headSet"
+                                    | "tailSet"
+                                    | "subSet"
+                                    | "descendingIterator"
+                                    | "descendingSet"
+                                    | "pollFirst"
+                                    | "pollLast"
+                                    | "ceiling"
+                                    | "floor"
+                                    | "higher"
+                                    | "lower"
+                            ))
+                        // And the iterator carriers (native-collections'
+                        // `MAP_KEY_ITR_CARRIERS`), whose snapshot lives past
+                        // the `next`/`current`/`index` fields the JDK's own
+                        // `HashIterator` bodies walk. Companion entry in
+                        // native_override::force_native_over_real_jdk_bytecode.
+                        || (matches!(
+                                class_name,
+                                "java/util/HashMap$KeyIterator"
+                                    | "java/util/HashMap$EntryIterator"
+                                    | "java/util/LinkedHashMap$LinkedKeyIterator"
+                                    | "java/util/LinkedHashMap$LinkedEntryIterator"
+                            )
+                            && matches!(method_name, "hasNext" | "next" | "remove"))
                         // Surefire ForkedBooter: ManagementFactory.getRuntimeMXBean() /
                         // getThreadMXBean() — the real-JDK code path delegates
                         // through `getPlatformMXBean(Class)` + PlatformComponent
