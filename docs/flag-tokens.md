@@ -737,7 +737,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_REAL`
 
-27 tokens.
+28 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -755,6 +755,7 @@ export inherited from a parent shell.
 | `msc-real-start` | `CRATONVM_MSC_REAL_START` |
 | `mxbean-mapping` | `CRATONVM_SYNTHETIC_MXBEAN_MAPPING` |
 | `net-sockets` | `CRATONVM_REAL_NET_SOCKETS / CRATONVM_SYNTHETIC_NET_SOCKETS` |
+| `netty-tcnative` | `CRATONVM_SYNTHETIC_NETTY_TCNATIVE` |
 | `pqc` | `CRATONVM_SYNTHETIC_PQC` |
 | `proxy` | `CRATONVM_REAL_PROXY` |
 | `proxy-strict` | `CRATONVM_REAL_PROXY_STRICT` |

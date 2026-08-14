@@ -5635,12 +5635,57 @@ pub fn resolve_jni_native_in_libraries(
     None
 }
 
+/// The `jlong` bits for one Java `long` argument of a JNI call — with an
+/// `Unsafe`-arena handle translated to the real address it names.
+///
+/// This is the second door of the problem
+/// [`direct_buffer_native_address`](fn@direct_buffer_native_address) documents
+/// for the first. `Unsafe.allocateMemory` on this VM returns a tagged handle,
+/// not an OS pointer; `GetDirectBufferAddress` already translates one before
+/// handing it to C, but a library that never calls that entry point and instead
+/// takes the address as a plain `long` parameter got the raw handle. Netty's
+/// `netty-tcnative` is written exactly that way — `SSL.bioWrite(long bio, long
+/// address, int len)` — so the first BIO write of the first TLS handshake
+/// reached `BUF_MEM_append` with `0x4000_0010_0000_0010` in RSI and took a
+/// SIGSEGV inside BoringSSL, with no CratonVM frame at the fault to say why.
+///
+/// Only a value that is BOTH tagged (bit 62 — never set on a real pointer on
+/// any target this VM builds for) AND inside a live arena block is rewritten,
+/// so a genuine `long` payload is untouched unless it lands in the few-GiB
+/// window of currently-live arena addresses, which no real datum does.
+///
+/// A tagged handle that no live block covers — a use-after-free, or an offset
+/// past the end — is passed through unchanged rather than silently redirected
+/// to some other block: the native then faults on the handle, which is the
+/// same visible failure it has today, instead of quietly reading the wrong
+/// object's bytes.
+#[inline]
+fn jni_long_arg_bits(raw: i64) -> u64 {
+    if !cratonvm_native_builtins::unsafe_arena_addr_is_tagged(raw) {
+        return raw as u64;
+    }
+    match cratonvm_native_builtins::unsafe_arena_real_ptr(raw) {
+        Some((ptr, _remaining)) => ptr as usize as u64,
+        None => {
+            tracing::warn!(
+                handle = format!("{raw:#x}"),
+                "JNI long argument is a dead Unsafe-arena handle — passing it through untranslated"
+            );
+            raw as u64
+        }
+    }
+}
+
 /// Dispatch a JNI native function pointer call.
 ///
 /// Converts `Value` args to 64-bit C values (correct for all integer/reference
 /// types on x86-64). Float/double args are passed as their bit representation
 /// in integer registers — this is ABI-correct on Windows x64, but not on
 /// Linux x86-64 System V for the float/double parameter positions.
+///
+/// Java `long` arguments pass through [`jni_long_arg_bits`], which turns an
+/// `Unsafe`-arena handle into the real address it names — see that function for
+/// why the `GetDirectBufferAddress` translation alone was not enough.
 ///
 /// # Safety
 /// `fn_ptr` must be a valid JNI native function whose signature matches
@@ -5666,7 +5711,7 @@ pub unsafe fn dispatch_jni_native(
     for (v, tag) in args.iter().zip(param_types.iter()) {
         let a = match v {
             Value::Int(i) => JniArg::int(*i as i64 as u64),
-            Value::Long(l) => JniArg::int(*l as u64),
+            Value::Long(l) => JniArg::int(jni_long_arg_bits(*l)),
             // Float/double are SSE-class: their bit pattern must go in an XMM
             // register on SysV (and in the positionally-shared XMM slot on
             // Win64), not in a GP register.

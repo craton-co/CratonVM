@@ -1346,6 +1346,7 @@ applies to `flag_env_mutation_guard.rs`.
 | `CRATONVM_SYNTHETIC_FORKJOINPOOL` | REAL | `CRATONVM_REAL=forkjoinpool` | both | off | behaviour | snapshot | types |
 | `CRATONVM_SYNTHETIC_MEMORYUSAGE_TOSTRING` | REAL | `CRATONVM_REAL=memoryusage-tostring` | opt-out | on | behaviour | snapshot | types |
 | `CRATONVM_SYNTHETIC_MXBEAN_MAPPING` | REAL | `CRATONVM_REAL=mxbean-mapping` | opt-out | on | behaviour | snapshot | types |
+| `CRATONVM_SYNTHETIC_NETTY_TCNATIVE` | REAL | `CRATONVM_REAL=netty-tcnative` | opt-out | on | behaviour | snapshot | types |
 | `CRATONVM_SYNTHETIC_NET_SOCKETS` | REAL | `CRATONVM_REAL=net-sockets` | both | off | behaviour | snapshot | native-builtins, types |
 | `CRATONVM_SYNTHETIC_PQC` | REAL | `CRATONVM_REAL=pqc` | opt-out | on | behaviour | snapshot | types |
 | `CRATONVM_SYNTHETIC_QUARKUS_ARC` | REAL | `CRATONVM_REAL=quarkus-arc` | opt-out | on | behaviour | snapshot | native-builtins |
