@@ -801,7 +801,10 @@ fn drive_real_keypair_spi(
             Value::Int(n) if n > 0 => Some(n),
             _ => None,
         })
-        .unwrap_or(256);
+        // The same JDK 25 default `default_key_strength` records. A bare
+        // `256` here would quietly restore the old curve for any receiver
+        // whose keysize slot was never written.
+        .unwrap_or_else(|| default_key_strength(ALGO_EC));
     let spec0 = match ctx.get_field(this, base + KPG_OFF_SPEC) {
         Value::Object(Some(o)) => Some(o),
         _ => None,
@@ -957,6 +960,68 @@ fn drive_keyspec_spi(
     result
 }
 
+/// Which of the two real `sun.security.rsa.RSAKeyFactory` SPIs re-imports this
+/// VM's own RSA components — and therefore which `AlgorithmIdentifier` the
+/// resulting key object carries.
+///
+/// The two are not interchangeable, and the difference is visible in
+/// `getEncoded()`: `$Legacy` stamps `rsaEncryption` (1.2.840.113549.1.1.1, with
+/// a NULL parameters field), `$PSS` stamps `id-RSASSA-PSS`
+/// (1.2.840.113549.1.1.10, with none) — 294 bytes against 292 for the same
+/// 2048-bit key. `getAlgorithm()` moves with it (`"RSA"` vs `"RSASSA-PSS"`).
+///
+/// **This VM stamped `rsaEncryption` on both**, because `algo_idx` collapses
+/// `"RSASSA-PSS"` onto `ALGO_RSA` — correct for KEY GENERATION, where the two
+/// share their key material, and wrong for the resulting KEY OBJECT, which
+/// carries the algorithm identity forward. The consequence was not cosmetic:
+/// `KeyFactory.getInstance("RSASSA-PSS")` drives `$PSS`, which REJECTS the
+/// `rsaEncryption` OID, so a PSS key pair this VM generated could not be
+/// re-imported by this VM — `probes/KeyEncodingProbe`'s
+/// `RSASSA-PSS.pub.roundTrip` answered `InvalidKeySpecException` where HotSpot
+/// round-trips byte-identically. `getEncoded()` is only useful if it comes back.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum RsaKeyType {
+    /// `rsaEncryption` — `sun.security.rsa.RSAKeyFactory$Legacy`.
+    Rsa,
+    /// `id-RSASSA-PSS` — `sun.security.rsa.RSAKeyFactory$PSS`.
+    Pss,
+}
+
+impl RsaKeyType {
+    /// The real SPI class, so a caller can ask `real_spi_available` about the
+    /// one it will actually drive rather than about its sibling.
+    fn spi_class(self) -> &'static str {
+        match self {
+            RsaKeyType::Rsa => "sun/security/rsa/RSAKeyFactory$Legacy",
+            RsaKeyType::Pss => "sun/security/rsa/RSAKeyFactory$PSS",
+        }
+    }
+
+    /// What `KeyPairGenerator.getInstance(name)` asked for. Keyed on the
+    /// REQUESTED NAME, not on `algo_idx`, which deliberately cannot tell the
+    /// two apart.
+    fn for_requested_name(name: Option<&str>) -> Self {
+        match name {
+            Some(n) if n.eq_ignore_ascii_case("RSASSA-PSS") => RsaKeyType::Pss,
+            _ => RsaKeyType::Rsa,
+        }
+    }
+}
+
+/// Drive the `RSAKeyFactory` SPI `kind` names.
+fn drive_real_rsa_keyfactory_of(
+    ctx: &mut dyn NativeContext,
+    kind: RsaKeyType,
+    spec: ObjectRef,
+    engine: &'static str,
+    ret_desc: &'static str,
+) -> MethodCallResult {
+    match kind {
+        RsaKeyType::Rsa => drive_real_rsa_keyfactory(ctx, spec, engine, ret_desc),
+        RsaKeyType::Pss => drive_real_rsa_pss_keyfactory(ctx, spec, engine, ret_desc),
+    }
+}
+
 /// Drive the real SunRsaSign `RSAKeyFactory$Legacy` SPI's `engineGenerate*`
 /// over the supplied RSA key spec (RSAPrivateCrtKeySpec / RSAPrivateKeySpec /
 /// RSAPublicKeySpec / PKCS8EncodedKeySpec / X509EncodedKeySpec), yielding a
@@ -1108,6 +1173,7 @@ fn real_rsa_key_from_components(
     second: &[u8],
     key_id: u64,
     is_public: bool,
+    kind: RsaKeyType,
 ) -> Result<ObjectRef, MethodCallFailed> {
     let (spec_class, engine, ret_desc) = if is_public {
         (
@@ -1144,14 +1210,14 @@ fn real_rsa_key_from_components(
                 .into())
             }
         };
-        drive_real_rsa_keyfactory(ctx, spec, engine, ret_desc)
+        drive_real_rsa_keyfactory_of(ctx, kind, spec, engine, ret_desc)
     })();
     ctx.unpin_native_roots(p0);
     let key = match built? {
         Some(Value::Object(Some(o))) => o,
         _ => {
             return Err(RuntimeError::NotImplemented {
-                feature: "RSAKeyFactory$Legacy produced no key".into(),
+                feature: format!("{} produced no key", kind.spi_class()),
             }
             .into())
         }
@@ -1183,6 +1249,7 @@ fn real_rsa_crt_private_key(
     ctx: &mut dyn NativeContext,
     comps: [&[u8]; 8],
     key_id: u64,
+    kind: RsaKeyType,
 ) -> Result<ObjectRef, MethodCallFailed> {
     // Build all eight BigIntegers, keeping every previously-built one pinned
     // across each new allocation. `pin_native_root` returns the slot index;
@@ -1222,8 +1289,9 @@ fn real_rsa_crt_private_key(
                 .into())
             }
         };
-        drive_real_rsa_keyfactory(
+        drive_real_rsa_keyfactory_of(
             ctx,
+            kind,
             spec,
             "engineGeneratePrivate",
             "Ljava/security/PrivateKey;",
@@ -1236,7 +1304,7 @@ fn real_rsa_crt_private_key(
         Some(Value::Object(Some(o))) => o,
         _ => {
             return Err(RuntimeError::NotImplemented {
-                feature: "RSAKeyFactory$Legacy produced no CRT key".into(),
+                feature: format!("{} produced no CRT key", kind.spi_class()),
             }
             .into())
         }
@@ -1265,8 +1333,9 @@ fn real_rsa_keypair(
     d_bytes: &[u8],
     crt_priv: Option<[&[u8]; 5]>,
     key_id: u64,
+    kind: RsaKeyType,
 ) -> Result<ObjectRef, MethodCallFailed> {
-    let pub_obj = real_rsa_key_from_components(ctx, n_bytes, e_bytes, key_id, true)?;
+    let pub_obj = real_rsa_key_from_components(ctx, n_bytes, e_bytes, key_id, true, kind)?;
     let pin = ctx.pin_native_root(pub_obj);
     let assembled = (|| {
         let priv_obj = match crt_priv {
@@ -1274,8 +1343,9 @@ fn real_rsa_keypair(
                 ctx,
                 [n_bytes, e_bytes, d_bytes, p, q, dp, dq, qinv],
                 key_id,
+                kind,
             )?,
-            None => real_rsa_key_from_components(ctx, n_bytes, d_bytes, key_id, false)?,
+            None => real_rsa_key_from_components(ctx, n_bytes, d_bytes, key_id, false, kind)?,
         };
         // `new_object_initialized` is GC-safe for its init args (VM override), so
         // `priv_obj` needs no separate pin; refresh `pub_obj` post-relocation.
@@ -1347,7 +1417,9 @@ fn real_public_key_from_x509_der(ctx: &mut dyn NativeContext, der: &[u8]) -> Met
                     },
                 },
             );
-            if let Ok(key) = real_rsa_key_from_components(ctx, &n, &e, key_id, true) {
+            if let Ok(key) =
+                real_rsa_key_from_components(ctx, &n, &e, key_id, true, RsaKeyType::Rsa)
+            {
                 return Ok(Some(Value::Object(Some(key))));
             }
         }
@@ -1554,7 +1626,22 @@ fn algo_idx(name: &str) -> i32 {
         // RSASSA-PSS uses standard RSA key material; the PSS choice belongs to
         // Signature, not KeyPairGenerator.
         "RSASSA-PSS" => ALGO_RSA,
-        "EC" | "ECDSA" => ALGO_EC,
+        // `EC` only. SunEC registers `KeyPairGenerator.EC` and `KeyFactory.EC`
+        // with no `ECDSA` alias for either, so HotSpot 25 answers
+        // `NoSuchAlgorithmException` for `ECDSA` on BOTH engines — measured,
+        // and this VM served both. That is the same accept-what-HotSpot-refuses
+        // shape `keypairgenerator-getinstance-accepts-any-algorithm-FIXED-20260813.md`
+        // closed in the accept-EVERYTHING direction; this is the one name that
+        // survived it. A caller reaching for `ECDSA` is reaching for
+        // BouncyCastle, which DOES register it — and `kpg_serviceable`'s
+        // provider-chain half still finds it there, so refusing here is what
+        // makes that fallback reachable rather than what breaks it.
+        //
+        // NOT the same question as a KEY whose `getAlgorithm()` is `"ECDSA"`:
+        // BouncyCastle's EC keys answer that, and `kf_check_key_algorithm`
+        // deliberately accepts them for an `EC` factory. Names of keys and
+        // names of engines are different namespaces.
+        "EC" => ALGO_EC,
         "ED25519" | "EDDSA" => ALGO_ED25519,
         "ED448" => ALGO_ED448,
         "X25519" => ALGO_X25519,
@@ -2133,6 +2220,39 @@ fn xdh_kpg_spi_class(algo: i32) -> Option<&'static str> {
     }
 }
 
+/// What an UNINITIALISED `KeyPairGenerator` generates, in bits.
+///
+/// **A default is a policy choice, and the JDK's moved.** JDK 22 raised the
+/// default RSA modulus from 2048 to 3072 (and RSASSA-PSS with it, since they
+/// share key material), and JDK 24 moved the default EC curve from secp256r1
+/// to secp384r1. This VM kept 2048/256, so
+/// `KeyPairGenerator.getInstance("RSA").generateKeyPair()` handed back a
+/// WEAKER key than the same line on HotSpot 25 — silently, because the only
+/// visible symptom was a shorter `getEncoded()`
+/// (`probes/KpgEndToEnd`: RSA 294 bytes against 422). That is a security
+/// property of the platform, not a formatting difference, and an application
+/// that never calls `initialize` is exactly the one relying on the platform to
+/// pick.
+///
+/// DSA stays 2048: measured, not assumed — HotSpot 25's uninitialised DSA
+/// generator produces a 2048-bit p, and `probes/KeyEncodingProbe`'s
+/// `default.DSA` row is what says so.
+///
+/// `0` means "this algorithm's strength is not a bit count" (the Edwards and
+/// XDH curves, the PQC parameter sets), and every one of those is served by a
+/// real provider SPI whose own constructor default then stands.
+fn default_key_strength(algo: i32) -> i32 {
+    match algo {
+        // 3072 since JDK 22 (JDK-8302233). RSASSA-PSS shares `ALGO_RSA`.
+        ALGO_RSA => 3072,
+        ALGO_DSA => 2048,
+        // secp384r1 since JDK 24. `drive_real_keypair_spi` forwards this to
+        // SunEC's `initialize(int, SecureRandom)`, which resolves the curve.
+        ALGO_EC => 384,
+        _ => 0,
+    }
+}
+
 /// `KeyPairGenerator.getProvider()`.
 ///
 /// Nothing was registered for it, so the real JDK bytecode ran and handed back
@@ -2222,13 +2342,7 @@ fn kpg_get_instance(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     // Record a BouncyCastle provider request (getInstance(alg, "BC"|BCprovider))
     // so EC keygen can hand out genuine BC keys (see `kpg_bcprov_table`).
     set_kpg_bcprov(ctx, kpg, is_bc);
-    let default_bits = if idx == ALGO_RSA || idx == ALGO_DSA {
-        2048
-    } else if idx == ALGO_EC {
-        256
-    } else {
-        0
-    };
+    let default_bits = default_key_strength(idx);
     set_kpg_keysize(ctx, kpg, default_bits);
     // Also write the algorithm string to the real-JDK named field so the
     // bytecode-side `getAlgorithm()` (if ever reached on this receiver)
@@ -2248,7 +2362,10 @@ fn kpg_initialize_int(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     let base = synthetic_base_offset(ctx, "java/security/KeyPairGenerator");
     let bits = match args.get(1) {
         Some(Value::Int(n)) => *n,
-        _ => 2048,
+        // Unreachable for a well-formed `initialize(int)`; the platform default
+        // is the only defensible stand-in, and it must not be a second literal
+        // that drifts from `default_key_strength`.
+        _ => default_key_strength(ALGO_RSA),
     };
     // The real JDK rejects a nonsensical size with `InvalidParameterException`
     // (a subclass of `IllegalArgumentException`, which is the closest
@@ -2291,10 +2408,15 @@ fn kpg_initialize_spec(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     if let Some(Value::Object(Some(spec))) = args.get(1) {
         ctx.set_field(this, base + KPG_OFF_SPEC, Value::Object(Some(*spec)));
     }
+    // A spec pins the parameters and `drive_real_keypair_spi` prefers it over
+    // this number, so `bits` is only the fallback for when the spec path is not
+    // taken. It still has to be the PLATFORM default and not a stale literal:
+    // an `ECGenParameterSpec("secp384r1")` that fell back to a hardcoded 256
+    // would silently generate the wrong curve.
     let bits = if algo == ALGO_EC {
-        256
+        default_key_strength(ALGO_EC)
     } else if cur == 0 {
-        2048
+        default_key_strength(ALGO_RSA)
     } else {
         cur
     };
@@ -2333,9 +2455,16 @@ fn kpg_generate_key_pair(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
             _ => None,
         })
         .map(|n| n as usize)
-        .unwrap_or(2048);
+        .unwrap_or_else(|| default_key_strength(ALGO_RSA) as usize);
 
     if algo == ALGO_RSA {
+        // `algo_idx` collapses `"RSASSA-PSS"` onto `ALGO_RSA`, which is right
+        // for the MATERIAL and wrong for the key OBJECT: a PSS key carries
+        // `id-RSASSA-PSS` in its `AlgorithmIdentifier` and answers
+        // `getAlgorithm() == "RSASSA-PSS"`. The requested NAME is the only
+        // thing that still knows, so read it before anything else. See
+        // `RsaKeyType`.
+        let kind = RsaKeyType::for_requested_name(get_kpg_name(ctx, this).as_deref());
         // Fast Rust keygen (the actual optimisation — no slow interpreter prime
         // generation). The resulting components + crypto material are real.
         let (pk, sk) = crypto_impl::Rsa::generate_keypair(bits);
@@ -2373,9 +2502,10 @@ fn kpg_generate_key_pair(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         // work — while sign/verify stay on the fast crypto_impl path via the
         // identity bridge. CRATONVM_SYNTHETIC_RSA=1 restores the bare-interface
         // synthetic keys (faster alloc, but the cast/cert paths fail).
-        if crate::route_rsa_to_real()
-            && real_spi_available(ctx, "sun/security/rsa/RSAKeyFactory$Legacy")
-        {
+        // Ask about the SPI this call will actually drive, not about its
+        // sibling: `$PSS` and `$Legacy` are separate classes and an image can
+        // have one fabricated and the other real.
+        if crate::route_rsa_to_real() && real_spi_available(ctx, kind.spi_class()) {
             let crt_ref: Option<[&[u8]; 5]> = crt_bytes.as_ref().map(|a| {
                 [
                     a[0].as_slice(),
@@ -2385,7 +2515,9 @@ fn kpg_generate_key_pair(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
                     a[4].as_slice(),
                 ]
             });
-            if let Ok(kp) = real_rsa_keypair(ctx, &n_bytes, &e_bytes, &d_bytes, crt_ref, key_id) {
+            if let Ok(kp) =
+                real_rsa_keypair(ctx, &n_bytes, &e_bytes, &d_bytes, crt_ref, key_id, kind)
+            {
                 return Ok(Some(Value::Object(Some(kp))));
             }
             // Fall through to the synthetic keys if the real SPI is unavailable.
@@ -2719,13 +2851,29 @@ fn kf_generate_public(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
             // BC consumers); verify stays on the fast crypto_impl path via the
             // identity bridge. CRATONVM_SYNTHETIC_RSA=1 → bare-interface key.
             if crate::route_rsa_to_real() {
-                if let Ok(key) = real_rsa_key_from_components(ctx, &n_bytes, &e_bytes, key_id, true)
+                if let Ok(key) = real_rsa_key_from_components(
+                    ctx,
+                    &n_bytes,
+                    &e_bytes,
+                    key_id,
+                    true,
+                    RsaKeyType::Rsa,
+                )
                 {
                     return Ok(Some(Value::Object(Some(key))));
                 }
             }
+            // The IMPORTED key's own modulus size, not a literal: this is the
+            // synthetic fallback for a key that arrived from outside, and 2048
+            // was simply wrong for every 3072- or 4096-bit key that reached it.
+            // `n_bytes` is an unsigned magnitude with no leading zeros, so the
+            // bit length is the byte count less the top byte's leading zeros.
+            let modulus_bits = n_bytes
+                .first()
+                .map(|b| n_bytes.len() as i32 * 8 - i32::from(b.leading_zeros() as u8))
+                .unwrap_or(0);
             return Ok(Some(Value::Object(Some(alloc_public_key(
-                ctx, ALGO_RSA, 2048, &pk_der, key_id,
+                ctx, ALGO_RSA, modulus_bits, &pk_der, key_id,
             )?))));
         }
     }
@@ -3618,7 +3766,7 @@ mod tests {
     #[test]
     fn kpg_can_generate_matches_the_generate_dispatch() {
         for alg in [
-            "RSA", "RSASSA-PSS", "EC", "ECDSA", "DSA", "Ed25519", "Ed448", "EdDSA",
+            "RSA", "RSASSA-PSS", "EC", "DSA", "Ed25519", "Ed448", "EdDSA",
             "ML-DSA-44", "ML-DSA-65", "ML-DSA-87", "ML-KEM-512", "ML-KEM-768",
             "ML-KEM-1024", "ML-DSA", "ML-KEM",
             // Served since 2026-08-14, each through the provider SPI HotSpot
@@ -3630,7 +3778,9 @@ mod tests {
         // `SLH-DSA` stays refused because JDK 25 registers no SLH-DSA
         // `KeyPairGenerator` either — HotSpot's own answer for it is
         // `NoSuchAlgorithmException`.
-        for alg in ["SLH-DSA", "TOTALLY-BOGUS-ALG", ""] {
+        // `ECDSA` joined this list on 2026-08-14: SunEC registers no such
+        // generator, so HotSpot refuses it too.
+        for alg in ["SLH-DSA", "ECDSA", "TOTALLY-BOGUS-ALG", ""] {
             assert!(
                 !super::kpg_can_generate(alg),
                 "{alg}: generateKeyPair throws for it, so getInstance must refuse it"
@@ -3652,7 +3802,9 @@ mod tests {
         assert_eq!(algo_idx("RSA"), ALGO_RSA);
         assert_eq!(algo_idx("rsa"), ALGO_RSA);
         assert_eq!(algo_idx("EC"), ALGO_EC);
-        assert_eq!(algo_idx("ECDSA"), ALGO_EC);
+        // `ECDSA` is NOT an engine name — see the `"EC"` arm.
+        assert_eq!(algo_idx("ECDSA"), -1);
+        assert_eq!(kf_algo_idx("ECDSA"), -1);
         assert_eq!(algo_idx("Ed25519"), ALGO_ED25519);
         assert_eq!(algo_idx("Ed448"), ALGO_ED448);
         assert_eq!(algo_idx("RSASSA-PSS"), ALGO_RSA);
@@ -3680,6 +3832,56 @@ mod tests {
         assert_eq!(algo_name(ALGO_EDDSA_GENERIC), "EdDSA");
         assert_eq!(algo_name(ALGO_RSASSA_PSS), "RSASSA-PSS");
         assert_eq!(algo_name(ALGO_DH), "DH");
+    }
+
+    /// The defaults an UNINITIALISED generator uses, pinned to HotSpot 25.
+    ///
+    /// Every number here was read off `probes/KeyEncodingProbe`'s `default.*`
+    /// rows against the real JDK, including the one that did NOT move (DSA) —
+    /// which is the row that keeps this from being "raise everything".
+    #[test]
+    fn default_key_strengths_match_hotspot_25() {
+        assert_eq!(default_key_strength(ALGO_RSA), 3072);
+        assert_eq!(default_key_strength(ALGO_DSA), 2048);
+        assert_eq!(default_key_strength(ALGO_EC), 384);
+        // RSASSA-PSS shares RSA's index and therefore RSA's default, which is
+        // what HotSpot does too (3072-bit modulus, 420-byte SPKI).
+        assert_eq!(default_key_strength(algo_idx("RSASSA-PSS")), 3072);
+        // Not a bit count: the real provider SPI's own default stands.
+        for alg in ["Ed25519", "Ed448", "X25519", "X448", "XDH", "DH"] {
+            assert_eq!(default_key_strength(algo_idx(alg)), 0, "{alg}");
+        }
+    }
+
+    /// `RSASSA-PSS` key OBJECTS carry the PSS identity even though their key
+    /// MATERIAL is generated by the same code as RSA's.
+    ///
+    /// The pairing is the defect: `algo_idx` collapses the two names, so
+    /// nothing downstream could tell them apart, and the PSS key pair this VM
+    /// generated could not be re-imported by this VM's own
+    /// `KeyFactory.getInstance("RSASSA-PSS")`.
+    #[test]
+    fn rsa_key_type_follows_the_requested_name_not_the_algo_index() {
+        assert_eq!(
+            RsaKeyType::for_requested_name(Some("RSASSA-PSS")),
+            RsaKeyType::Pss
+        );
+        assert_eq!(
+            RsaKeyType::for_requested_name(Some("rsassa-pss")),
+            RsaKeyType::Pss
+        );
+        assert_eq!(RsaKeyType::for_requested_name(Some("RSA")), RsaKeyType::Rsa);
+        assert_eq!(RsaKeyType::for_requested_name(None), RsaKeyType::Rsa);
+        // The index cannot answer this question, which is why the name has to.
+        assert_eq!(algo_idx("RSASSA-PSS"), algo_idx("RSA"));
+        assert_eq!(
+            RsaKeyType::Pss.spi_class(),
+            "sun/security/rsa/RSAKeyFactory$PSS"
+        );
+        assert_eq!(
+            RsaKeyType::Rsa.spi_class(),
+            "sun/security/rsa/RSAKeyFactory$Legacy"
+        );
     }
 
     /// The XDH `KeyPairGenerator` SPI split, which is NOT the same shape as
@@ -3967,7 +4169,7 @@ mod tests {
         // served by the real provider SPIs, and moved to
         // `unimplemented_algorithm_keygen_throws_not_empty_key`, which is where
         // "serviceable, but the mock has no SPI to drive" is asserted.
-        for algo in ["SLH-DSA", "Totally-Bogus"] {
+        for algo in ["SLH-DSA", "ECDSA", "Totally-Bogus"] {
             let mut ctx = crate::test_utils::MockNativeContext::new();
             let name = ctx.create_string(algo);
             let err = kpg_get_instance(&mut ctx, &[Value::Object(Some(name))])
