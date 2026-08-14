@@ -3244,7 +3244,7 @@ pub fn check_endpoint_identity(
 // TrustManagerFactoryImpl$SimpleFactory: slot 0 = i32 tm_id.
 
 pub(crate) const FQN_SUN_X509_KM: &str = "sun/security/ssl/SunX509KeyManagerImpl";
-const FQN_X509_KM: &str = "sun/security/ssl/X509KeyManagerImpl";
+pub(crate) const FQN_X509_KM: &str = "sun/security/ssl/X509KeyManagerImpl";
 pub(crate) const FQN_X509_TM: &str = "sun/security/ssl/X509TrustManagerImpl";
 const FQN_PKIX_VALIDATOR: &str = "sun/security/validator/PKIXValidator";
 const FQN_KMF_SUN_X509: &str = "sun/security/ssl/KeyManagerFactoryImpl$SunX509";
@@ -4035,9 +4035,13 @@ fn make_private_key_mirror(
 ) -> Result<ObjectRef, MethodCallFailed> {
     let pk = try_alloc_concurrent_synthetic(ctx, "java/security/PrivateKey", 4)?;
     // Same packing convention keystore.rs uses so the TLS path can decode
-    // the (km_id, alias_hash) pair.
+    // the (km_id, alias_hash) pair — plus [`KM_PROXY_TAG`], which says WHICH
+    // registry the high half indexes. Without the tag the two conventions are
+    // indistinguishable and `keystore::private_key_der_from_proxy` read this
+    // `km_id` as a KEYSTORE id.
     let alias_hash = fnv1a_32(alias.as_bytes());
-    let composite = ((km_id as i64 & 0xFFFF_FFFF) << 32) | (alias_hash as i64 & 0xFFFF_FFFF);
+    let composite =
+        KM_PROXY_TAG | ((km_id as i64 & 0xFFFF_FFFF) << 32) | (alias_hash as i64 & 0xFFFF_FFFF);
     let algo_idx = match classify_key_type_from_pkcs8(key_der) {
         "RSA" => 6,
         "EC" => 7,
@@ -4063,9 +4067,56 @@ fn make_private_key_mirror(
 /// `null` or a differently-shaped object).
 pub(crate) fn km_id_from_private_key_mirror(ctx: &dyn NativeContext, pk: ObjectRef) -> Option<i32> {
     match ctx.get_field(pk, 3) {
-        Value::Long(composite) => Some((composite >> 32) as i32),
+        Value::Long(composite) => Some(km_id_of_composite(composite)),
         _ => None,
     }
+}
+
+/// Marks a four-slot `java/security/PrivateKey` proxy whose field-3 composite
+/// indexes [`km_registry`] — a `KeyManager` id — rather than the keystore
+/// registry that `keystore::private_key_der_from_proxy` was written for.
+///
+/// Both producers pack `(id << 32) | alias_hash` into the same slot of the same
+/// class, and the two id spaces are independent counters, so the reader had no
+/// way to tell them apart and always chose the keystore. That is not a
+/// hypothetical: `KeyManager.getPrivateKey(alias).getEncoded()` returned the
+/// right DER only while `km_id` happened to name a live keystore holding an
+/// alias with the same FNV hash, and an EMPTY array as soon as the counters
+/// drifted apart. netty's `OpenSslCachingX509KeyManagerFactory.newProvider`
+/// calls `getKeyManagers()` twice, which was enough to drift them: every
+/// `chooseKeyMaterial` after it built a PEM with no body, and BoringSSL's
+/// `PEM_read_bio_PrivateKey` returned NULL without queueing an error, so
+/// tcnative reported the uninformative `Unable to load certificate key
+/// (error:00000000:invalid library (0))`.
+///
+/// Bit 62: no id counter reaches it, and it leaves the value positive so the
+/// `Long` round-trips through Java unchanged.
+const KM_PROXY_TAG: i64 = 1 << 62;
+
+/// The `km_id` half of a composite, with [`KM_PROXY_TAG`] removed.
+pub(crate) fn km_id_of_composite(composite: i64) -> i32 {
+    ((composite & !KM_PROXY_TAG) >> 32) as i32
+}
+
+/// Is this field-3 composite one of `make_private_key_mirror`'s — i.e. does its
+/// high half index [`km_registry`] rather than the keystore registry?
+pub(crate) fn is_km_proxy_composite(composite: i64) -> bool {
+    composite & KM_PROXY_TAG != 0
+}
+
+/// The PKCS#8 DER `km_id` holds for the alias whose FNV-1a hash is
+/// `alias_hash`. The proxy carries only the hash, so the alias is recovered by
+/// scanning this manager's own alias set — the same shape
+/// `keystore::private_key_der_from_proxy` uses, and bounded by the number of
+/// entries one `KeyManagerFactory` was initialised with.
+pub(crate) fn km_key_der_by_alias_hash(km_id: i32, alias_hash: u32) -> Option<Vec<u8>> {
+    let registry = km_registry().read();
+    let state = registry.get(&km_id)?;
+    state
+        .aliases_to_key
+        .iter()
+        .find(|(alias, _)| fnv1a_32(alias.as_bytes()) == alias_hash)
+        .map(|(_, der)| der.clone())
 }
 
 /// Look up the DER cert chain (leaf first) and PKCS#8 private-key DER
@@ -4481,17 +4532,51 @@ fn kmf_engine_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
     Ok(Some(Value::Object(None)))
 }
 
+/// Which `KeyManager` implementation class a `KeyManagerFactory` of this
+/// algorithm hands out.
+///
+/// The JDK has two, and the difference is observable: `SunX509` yields
+/// `sun.security.ssl.SunX509KeyManagerImpl`, while `PKIX` and its alias
+/// `NewSunX509` yield `sun.security.ssl.X509KeyManagerImpl`. CratonVM returned
+/// the `SunX509` class for every algorithm.
+///
+/// This is not cosmetic. Netty's `OpenSslCachingX509KeyManagerFactory.newProvider`
+/// branches on exactly this class name — `X509KeyManagerImpl` means "aliases are
+/// not stable and will change between invocations", so it must NOT cache key
+/// material against them. Reporting the `SunX509` class for a PKIX factory made
+/// netty cache where the JDK's own contract says it may not.
+///
+/// Both classes are already fully registered by `register_key_manager`, so this
+/// only decides which one to stamp on the mirror.
+pub(crate) fn km_mirror_class_for_algorithm(algorithm: &str) -> &'static str {
+    if algorithm.eq_ignore_ascii_case("PKIX") || algorithm.eq_ignore_ascii_case("NewSunX509") {
+        FQN_X509_KM
+    } else {
+        FQN_SUN_X509_KM
+    }
+}
+
 fn kmf_engine_get_key_managers(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = this_arg(args)?;
     let id = get_km_id(ctx, this);
 
-    // Return a 1-element KeyManager[] holding a SunX509KeyManagerImpl mirror
-    // wired to the same id.
+    // Return a 1-element KeyManager[] holding the mirror class this factory's
+    // algorithm calls for. On the SPI route the algorithm is not a field — it
+    // is the SPI's own class (`KeyManagerFactoryImpl$SunX509` vs `$X509`), so
+    // read it from there.
+    let spi_class = ctx
+        .class_name_of_id(ctx.class_id_of_object(this))
+        .unwrap_or_default();
+    let mirror = if spi_class.ends_with("$X509") || spi_class.ends_with("$PKIX") {
+        FQN_X509_KM
+    } else {
+        FQN_SUN_X509_KM
+    };
     let cls_id = ctx
         .ensure_class_initialized("javax/net/ssl/KeyManager")
         .unwrap_or(cratonvm_types::ClassId::new(0));
     let arr = ctx.new_ref_array(cls_id, 1);
-    let km = try_alloc_concurrent_synthetic(ctx, FQN_SUN_X509_KM, 2)?;
+    let km = try_alloc_concurrent_synthetic(ctx, mirror, 2)?;
     set_km_id(ctx, km, id);
     ctx.set_array_element(arr, 0, Value::Object(Some(km)));
     Ok(Some(Value::Object(Some(arr))))
