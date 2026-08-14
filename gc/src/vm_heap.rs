@@ -1074,8 +1074,18 @@ impl VmHeap {
                 .pin_region_for_addr(obj.as_ptr() as usize)
                 .into_iter()
                 .collect(),
+            // ZGC pins the ADDRESS and returns it as its own "region index":
+            // this collector has no regions, and the slide's filter is
+            // page-granular over addresses. Returning `Vec::new()` was correct
+            // only while this collector never moved an object — see
+            // `ZgcRealHeap::critical_pins` for what the copy-back at Release
+            // does to a moved array.
             #[cfg(feature = "zgc")]
-            VmHeap::Zgc(_) => Vec::new(),
+            VmHeap::Zgc(h) => {
+                let addr = obj.as_ptr() as usize;
+                h.pin_critical(addr);
+                vec![addr]
+            }
         }
     }
 
@@ -1083,10 +1093,21 @@ impl VmHeap {
     /// `GetPrimitiveArrayCritical`. No-op on the generational collector / for an
     /// empty set.
     pub fn unpin_critical_regions(&self, region_indices: &[usize]) {
-        if let VmHeap::G1(h) = self {
-            for &idx in region_indices {
-                h.unpin_region(idx);
+        match self {
+            VmHeap::G1(h) => {
+                for &idx in region_indices {
+                    h.unpin_region(idx);
+                }
             }
+            // For ZGC the "index" IS the pinned object address — see
+            // `pin_critical_region`'s ZGC arm.
+            #[cfg(feature = "zgc")]
+            VmHeap::Zgc(h) => {
+                for &addr in region_indices {
+                    h.unpin_critical(addr);
+                }
+            }
+            _ => {}
         }
     }
 

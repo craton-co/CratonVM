@@ -2348,6 +2348,30 @@ pub struct ZgcRealHeap {
     /// is not a crash — it is the fail-closed path doing its job — but it is
     /// the number that says the driver is not trustworthy on this workload.
     parallel_mark_fallbacks: AtomicUsize,
+    /// `allocated` at the last stress-triggered collection — see `needs_gc`.
+    gc_stress_mark: AtomicUsize,
+    /// Addresses that must NOT be relocated, with a use count.
+    ///
+    /// Filled by `VmHeap::pin_critical_region` at
+    /// `GetPrimitiveArrayCritical` and drained by `unpin_critical_regions` at
+    /// `Release`. Refcounted because the same array can be inside two nested
+    /// critical sections, and the inner `Release` must not unpin the outer.
+    ///
+    /// # Why this exists (2026-08-14)
+    ///
+    /// `pin_critical_region`'s ZGC arm returned `Vec::new()`, i.e. pinned
+    /// nothing, and that was correct for as long as this collector never moved
+    /// an object. It moves now. The hazard is not the native pointer — this VM
+    /// hands native code a *copy* — it is the **copy-back at Release**, which
+    /// re-resolves the Get-time array address. If the slide moved that array,
+    /// the copy-back writes a whole array's worth of bytes over whatever
+    /// object now occupies the old address. The JNI site's own comment names
+    /// the outcome: "data loss / write to a recycled object".
+    ///
+    /// A `Mutex<FxHashMap>` rather than something clever: it is touched twice
+    /// per critical section and once per collection, and it is empty in every
+    /// workload that makes no critical calls at all.
+    critical_pins: Mutex<FxHashMap<usize, usize>>,
     /// Concurrent phases the DRIVER reported, summed over all cycles.
     ///
     /// This is the counter that distinguishes "the worker pool marked" from
@@ -2709,6 +2733,8 @@ impl ZgcRealHeap {
             frag_worst_cycle: AtomicUsize::new(0),
             frag_floor_warned: AtomicBool::new(false),
             parallel_mark_fallbacks: AtomicUsize::new(0),
+            gc_stress_mark: AtomicUsize::new(0),
+            critical_pins: Mutex::new(FxHashMap::default()),
             driver_passes: AtomicUsize::new(0),
             mark_active: AtomicBool::new(false),
             mark_ingress: mark::ZMarkIngress::new(),
@@ -3711,11 +3737,17 @@ impl ZgcRealHeap {
         let mut pairs: Vec<(usize, usize)> = Vec::new();
         let mut moved = 0usize;
         let reclaimed;
+        // Captured out of the arena scope for the post-slide verifier, which
+        // runs after the guard is dropped.
+        let mut arena_lo = 0usize;
+        let mut arena_hi = 0usize;
 
         {
             let mut arena = self.arena.lock();
             let base = arena.base_ptr() as usize;
             let low_end = base + arena.used_low_for_compaction();
+            arena_lo = base;
+            arena_hi = base + arena.capacity();
 
             // Survivors in ADDRESS order. The slide requires it: an object may
             // only be copied into space a lower-addressed survivor has already
@@ -3786,8 +3818,38 @@ impl ZgcRealHeap {
             let candidates = adapters::page_candidates(&views);
             let policy = forwarding::ZRelocationPolicy::default();
             let reloc_set = forwarding::ZRelocationSet::select(&candidates, &policy);
-            let selected: std::collections::HashSet<u64> =
+            let mut selected: std::collections::HashSet<u64> =
                 reloc_set.pages().iter().map(|p| p.page_id).collect();
+            // A pinned object makes its whole PAGE immovable.
+            //
+            // Page granularity, deliberately, and it is what G1 does with
+            // `pin_region_for_addr`: the slide's placement probe reasons about
+            // pages, so an object-granular pin would need the probe to route
+            // around individual survivors inside a page it is otherwise
+            // compacting — more machinery, and every extra rule in that probe
+            // is a chance to overwrite something live. Dropping the page costs
+            // one page's worth of reclaim for the duration of a critical
+            // section, which is bounded by the section itself.
+            let pins = self.critical_pin_addrs();
+            if !pins.is_empty() {
+                let page_span = Self::Z_LOGICAL_PAGE_BYTES;
+                let mut dropped = 0usize;
+                for addr in pins {
+                    if addr >= base && addr < low_end {
+                        if selected.remove(&(((addr - base) / page_span) as u64)) {
+                            dropped += 1;
+                        }
+                    }
+                }
+                if dropped > 0 {
+                    tracing::debug!(
+                        target: "zgc",
+                        dropped,
+                        "zgc relocate: pages withheld from the relocation set because \
+                         a JNI critical section pins an object on them"
+                    );
+                }
+            }
             if selected.is_empty() {
                 // Nothing profitable to move. Not a failure -- it is the
                 // selector doing its job on a heap whose pages are all dense.
@@ -3810,10 +3872,12 @@ impl ZgcRealHeap {
             // The slide may only use space below the first page it is allowed
             // to disturb. Sliding into an unselected page would overwrite
             // survivors this cycle promised not to touch.
-            let first_selected_page = reloc_set
-                .pages()
+            // From the FILTERED set, not `reloc_set`: a pinned page dropped
+            // above may have been the lowest, and starting the slide at a page
+            // that is no longer selected would place survivors on top of the
+            // very object the pin exists to hold still.
+            let first_selected_page = *selected
                 .iter()
-                .map(|p| p.page_id)
                 .min()
                 .expect("non-empty, checked above");
             let slide_floor = base + first_selected_page as usize * Self::Z_LOGICAL_PAGE_BYTES;
@@ -3991,9 +4055,124 @@ impl ZgcRealHeap {
             self.registry.insert(*to);
         }
 
+        self.verify_no_dangling_slots_after_slide(&live_now, arena_lo, arena_hi);
+
         let pointer_map: cratonvm_types::PointerMap =
             record.into_pointer_map().into_iter().collect();
         (moved, reclaimed, pointer_map)
+    }
+
+    /// After a slide: every reference slot in every survivor must point at a
+    /// **registered live base**, or the rewrite pass missed it.
+    ///
+    /// # Why this exists rather than a test
+    ///
+    /// A missed slot is a dangling pointer, and a dangling pointer surfaces as
+    /// a SIGSEGV somewhere else entirely, later, in whichever subsystem
+    /// happens to dereference it first. That is the 2026-08-14 netty/hibernate
+    /// cluster: 22 crashes across two unrelated applications, ZGC-only,
+    /// spanning WebSocket handshaking, HTTP/2, LZMA, HQL queries and
+    /// multitenancy — i.e. no subsystem in common except the collector. No
+    /// stack trace from such a crash names the collector, so the crash site is
+    /// worthless as evidence and the only useful place to look is here, at the
+    /// moment the invariant breaks.
+    ///
+    /// Off unless `CRATONVM_DBG_ZGC_VERIFY_SLIDE` is set: it is O(live slots)
+    /// with a registry probe each, which is far too expensive for every cycle
+    /// but trivial next to a debugging session.
+    ///
+    /// Reports and continues rather than panicking. A panic here would abort
+    /// inside a stop-the-world with the heap half-described, and the whole
+    /// point is to get the *list* — the first offender is rarely the only one,
+    /// and the shape of the set is what names the missing rewrite.
+    fn verify_no_dangling_slots_after_slide(
+        &self,
+        live_now: &[usize],
+        arena_lo: usize,
+        arena_hi: usize,
+    ) {
+        if !zgc_verify_slide_enabled() {
+            return;
+        }
+        use census::ZCensusHeapView;
+        let mut dangling = 0usize;
+        let mut reported = 0usize;
+        for obj in live_now {
+            self.reference_slots(*obj as u64, &mut |slot| {
+                let raw = slot.raw_word as usize;
+                if raw == 0 || raw < arena_lo || raw >= arena_hi {
+                    // Off-arena words are not this collector's to judge: a
+                    // reference slot can legitimately hold an address from
+                    // another space, and `is_in_heap` refuses them everywhere
+                    // else too.
+                    return;
+                }
+                if self.registry.contains(raw) {
+                    return;
+                }
+                dangling += 1;
+                if reported < 16 {
+                    reported += 1;
+                    tracing::error!(
+                        target: "cratonvm::gc::guard",
+                        holder = *obj,
+                        holder_class = self.header_ref(*obj as *mut u8).class_id.as_u32(),
+                        slot_addr = slot.slot_addr,
+                        points_to = raw,
+                        "zgc slide verify: a reference slot points at an address that                          is NOT a registered live base — the rewrite pass missed it,                          and this word is a dangling pointer"
+                    );
+                }
+            });
+        }
+        if dangling > 0 {
+            tracing::error!(
+                target: "cratonvm::gc::guard",
+                dangling,
+                survivors = live_now.len(),
+                "zgc slide verify: {dangling} dangling reference slot(s) after                  compaction",
+            );
+        } else {
+            tracing::debug!(
+                target: "zgc",
+                survivors = live_now.len(),
+                "zgc slide verify: every reference slot resolves to a live base"
+            );
+        }
+    }
+
+    /// Pin `addr` against relocation for a JNI critical section — see
+    /// [`Self::critical_pins`]. Idempotent per call; balanced by
+    /// [`Self::unpin_critical`].
+    pub fn pin_critical(&self, addr: usize) {
+        if addr == 0 {
+            return;
+        }
+        *self.critical_pins.lock().entry(addr).or_insert(0) += 1;
+    }
+
+    /// Release one pin taken by [`Self::pin_critical`].
+    pub fn unpin_critical(&self, addr: usize) {
+        let mut pins = self.critical_pins.lock();
+        if let Some(count) = pins.get_mut(&addr) {
+            *count -= 1;
+            if *count == 0 {
+                pins.remove(&addr);
+            }
+        }
+    }
+
+    /// Snapshot of the pinned addresses, for the relocation-set filter.
+    fn critical_pin_addrs(&self) -> Vec<usize> {
+        let pins = self.critical_pins.lock();
+        if pins.is_empty() {
+            return Vec::new();
+        }
+        pins.keys().copied().collect()
+    }
+
+    /// Number of live critical pins — diagnostics and tests.
+    pub fn critical_pin_count(&self) -> usize {
+        self.critical_pins.lock().len()
     }
 
     /// Free share of the arena in permille — test support for the
@@ -5433,6 +5612,16 @@ const ZGC_TLAB_RESERVATION_SHARE: usize = 16;
 /// what a user's pauses pay for until C5 of the concurrent+generational plan
 /// makes the marker scale.
 const Z_PARMARK_DEFAULT_WORKERS: usize = 0;
+
+/// `CRATONVM_DBG_ZGC_VERIFY_SLIDE` — walk every survivor's reference slots
+/// after a compaction and report any that do not resolve to a registered live
+/// base. See [`ZgcRealHeap::verify_no_dangling_slots_after_slide`].
+fn zgc_verify_slide_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_ZGC_VERIFY_SLIDE").is_some()
+    })
+}
 
 /// Below this share of capacity free, a small largest-block means the heap is
 /// **full**, not fragmented — so the fragmentation gauge does not sample.
@@ -7512,6 +7701,28 @@ impl GarbageCollector for ZgcRealHeap {
 
     fn needs_gc(&self) -> bool {
         let a = self.allocated.load(Ordering::Relaxed);
+        // DBG: `CRATONVM_DBG_GC_STRESS=<bytes>` — collect every `<bytes>` of
+        // allocation, bypassing every occupancy predicate below.
+        //
+        // **This backend ignored the flag entirely until 2026-08-14**, which
+        // made the tree's standard GC-stress lever inert on its DEFAULT
+        // collector: `gen_heap` honours it, ZGC did not, so a repro command
+        // copied from any handoff page silently ran an ordinary workload. It
+        // is how a moving-collector defect that needs many cycles to surface
+        // gets one cycle in a suite class and hides.
+        //
+        // Bypassing `gc_rearm` is the point and is safe because this is a
+        // diagnostic: the floor exists to stop a cycle-per-allocation storm
+        // against a live set parked above the threshold, and storming is
+        // exactly what the operator asked for.
+        if let Some(step) = crate::gc_flags().gc_stress_bytes {
+            if step > 0 {
+                let last = self.gc_stress_mark.load(Ordering::Relaxed);
+                if a.saturating_sub(last) >= step {
+                    return true;
+                }
+            }
+        }
         // Two independent reasons to collect, behind one shared anti-storm
         // floor:
         //
@@ -8039,6 +8250,9 @@ impl GarbageCollector for ZgcRealHeap {
         // "gates said no" path too, and lowering the hard bit there would throw
         // away the one signal this whole mechanism exists to carry.
         self.hard_alloc_failure.store(false, Ordering::Relaxed);
+        // Re-arm the stress trigger against the post-sweep live figure.
+        self.gc_stress_mark
+            .store(self.allocated.load(Ordering::Relaxed), Ordering::Relaxed);
         let cycle = self.gc_count.fetch_add(1, Ordering::Relaxed) + 1;
 
         // Phase 2.2: one post-sweep fragmentation reading per collection.
@@ -8132,10 +8346,52 @@ impl GarbageCollector for ZgcRealHeap {
             pointer_map = map;
         }
         monitors.remap_after_gc(&pointer_map);
-        // ZGC-3: `remap_after_gc` early-returns on the (always-empty) map,
-        // so hand the collector's EXACT dead-address list to the registry
-        // prune instead — reclaims monitor/cas-lock entries and prevents a
-        // recycled address from inheriting a dead object's monitor.
+        // ZGC-3: hand the collector's dead-address list to the registry prune —
+        // reclaims monitor/cas-lock entries and prevents a recycled address
+        // from inheriting a dead object's monitor.
+        //
+        // **RE-SCREENED AGAINST THE POST-SLIDE REGISTRY SINCE 2026-08-14, and
+        // without this the compacting configuration frees a LIVE object's
+        // monitor.** `MonitorCleanup::prune_dead` documents `dead` as EXACT —
+        // "this address was a live allocation base before this collection and
+        // its memory is now freed, so no thread can read its mark word" — and
+        // on that licence it calls `Monitor::release_mark_ref`, dropping the
+        // strong reference the mark word itself owns.
+        //
+        // Compaction breaks that precondition in the commonest way there is:
+        // survivors slide DOWN into the space vacated by dead objects, so a
+        // dead base is very likely to be a live object's new base by the time
+        // this runs. `remap_after_gc` has already moved that object's monitor
+        // to its new address, and the unfiltered prune then removes it again
+        // and releases the mark-word reference — leaving the live object's
+        // mark word pointing at a possibly-freed `Monitor`. That is a
+        // use-after-free reachable from any `synchronized` block, on an object
+        // chosen by where the slide happened to put it, which is why it
+        // presents as scattered SIGSEGVs in unrelated subsystems rather than
+        // as a locking bug.
+        //
+        // The registry was rebuilt by the slide (old bases removed, new bases
+        // inserted), so `contains` is exactly "this address is a live base
+        // NOW" — which is the predicate `prune_dead`'s doc assumes and the
+        // pre-slide list can no longer supply.
+        let dead: Vec<usize> = if pointer_map.is_empty() {
+            dead
+        } else {
+            let before = dead.len();
+            let screened: Vec<usize> = dead
+                .into_iter()
+                .filter(|d| !self.registry.contains(*d))
+                .collect();
+            let resurrected = before - screened.len();
+            if resurrected > 0 {
+                tracing::debug!(
+                    target: "zgc",
+                    resurrected,
+                    "zgc compaction: dead addresses now occupied by slid survivors,                      withheld from the monitor prune"
+                );
+            }
+            screened
+        };
         monitors.prune_dead(&dead);
 
         GcResult {
@@ -10694,6 +10950,187 @@ pub(crate) mod tests {
             Value::Object(None),
             "the reachable child must have survived the driven cycle"
         );
+    }
+
+    /// **A dead address that a survivor slid into must NOT reach the monitor
+    /// prune.**
+    ///
+    /// `MonitorCleanup::prune_dead` documents its input as EXACT — the address
+    /// "was a live allocation base before this collection and its memory is
+    /// now freed, so no thread can read its mark word" — and on that licence
+    /// it calls `Monitor::release_mark_ref`, dropping the strong reference the
+    /// object's own mark word owns. Compaction breaks the precondition in the
+    /// commonest way possible: survivors slide DOWN into space vacated by dead
+    /// objects, so a dead base is very likely a LIVE object's base afterwards.
+    ///
+    /// The consequence is a use-after-free on a live object's monitor, chosen
+    /// by wherever the slide happened to land — which is why it presents as
+    /// scattered SIGSEGVs rather than as a locking bug.
+    ///
+    /// This records exactly what reached `prune_dead` and asserts that nothing
+    /// in it is a live base afterwards. The exact edit that trips it: drop the
+    /// `registry.contains` filter before the `monitors.prune_dead(&dead)` call.
+    #[test]
+    fn a_dead_address_a_survivor_slid_into_is_withheld_from_the_monitor_prune() {
+        /// Captures the `dead` slice the collector hands the monitor table.
+        #[derive(Default)]
+        struct CapturingMonitors {
+            pruned: std::sync::Mutex<Vec<usize>>,
+        }
+        impl crate::collector::MonitorCleanup for CapturingMonitors {
+            fn remap_after_gc(&self, _map: &cratonvm_types::PointerMap) {}
+            fn prune_dead(&self, dead: &[usize]) {
+                self.pruned.lock().unwrap().extend_from_slice(dead);
+            }
+        }
+
+        const PAGE: usize = ZgcRealHeap::Z_LOGICAL_PAGE_BYTES;
+        const FIELDS: usize = 500; // 4016 bytes per object
+        let heap = ZgcRealHeap::with_capacity(64 * 1024 * 1024);
+        heap.set_tlab_enabled(false);
+
+        // Two sparse pages so the selector takes both and page 1's survivors
+        // slide down into page 0's freed space — the exact overlap this is
+        // about.
+        let per_page = PAGE / (HEADER_SIZE + FIELDS * SLOT_SIZE);
+        let mut roots: Vec<ObjectRef> = Vec::new();
+        for _page in 0..4 {
+            for i in 0..per_page {
+                let o = heap.alloc_object(ClassId::new(1), FIELDS);
+                if i % 5 == 0 {
+                    roots.push(o);
+                }
+            }
+        }
+        let pre: Vec<usize> = roots.iter().map(|r| r.as_ptr() as usize).collect();
+
+        let monitors = CapturingMonitors::default();
+        // SAFETY: these unit tests run the heap single-threaded.
+        let stw = unsafe { StopTheWorldToken::new() };
+        cratonvm_types::flags::with_thread_overrides(
+            &[("CRATONVM_ZGC_RELOCATE", Some("1"))],
+            || {
+                heap.collect_garbage(&stw, &mut roots, &monitors);
+            },
+        );
+
+        let moved = roots
+            .iter()
+            .zip(pre.iter())
+            .filter(|(now, was)| now.as_ptr() as usize != **was)
+            .count();
+        assert!(
+            moved > 0,
+            "the fixture must actually relocate something, or this proves nothing"
+        );
+
+        // THE ASSERTION: nothing handed to the prune may be a live base.
+        let pruned = monitors.pruned.lock().unwrap().clone();
+        let live_now: std::collections::HashSet<usize> =
+            roots.iter().map(|r| r.as_ptr() as usize).collect();
+        let overlap: Vec<usize> = pruned
+            .iter()
+            .copied()
+            .filter(|d| live_now.contains(d))
+            .collect();
+        assert!(
+            overlap.is_empty(),
+            "{} address(es) handed to prune_dead are LIVE object bases after the \
+             slide, e.g. {:#x} — prune_dead releases the mark-word reference on \
+             the strength of them being freed, so this is a use-after-free on a \
+             live object's monitor",
+            overlap.len(),
+            overlap[0]
+        );
+    }
+
+    /// **A JNI-critical-pinned object must not be relocated.**
+    ///
+    /// `VmHeap::pin_critical_region`'s ZGC arm returned `Vec::new()` until
+    /// 2026-08-14 — correct while this collector never moved an object, and
+    /// wrong the day compaction shipped. The hazard is not the native pointer
+    /// (this VM hands native code a copy); it is the copy-back at
+    /// `ReleasePrimitiveArrayCritical`, which re-resolves the Get-time
+    /// address. Move the array and that copy-back writes a whole array of
+    /// bytes over whatever now occupies the old address — "data loss / write
+    /// to a recycled object", in the JNI site's own words.
+    ///
+    /// The exact edit that trips it: delete the `critical_pin_addrs` filter
+    /// that drops a pinned object's page from the relocation set.
+    #[test]
+    fn a_critically_pinned_object_is_never_relocated() {
+        const PAGE: usize = ZgcRealHeap::Z_LOGICAL_PAGE_BYTES;
+        const FIELDS: usize = 500;
+        let heap = ZgcRealHeap::with_capacity(64 * 1024 * 1024);
+        heap.set_tlab_enabled(false);
+
+        let per_page = PAGE / (HEADER_SIZE + FIELDS * SLOT_SIZE);
+        let mut roots: Vec<ObjectRef> = Vec::new();
+        for _page in 0..4 {
+            for i in 0..per_page {
+                let o = heap.alloc_object(ClassId::new(1), FIELDS);
+                if i % 5 == 0 {
+                    roots.push(o);
+                }
+            }
+        }
+        // Pin one survivor from a page the selector would otherwise compact.
+        // Index 1 rather than 0: object 0 sits at the very bottom and would
+        // not move anyway, which would make this pass for the wrong reason.
+        let pinned_idx = 1usize;
+        let pinned_addr = roots[pinned_idx].as_ptr() as usize;
+        heap.pin_critical(pinned_addr);
+        assert_eq!(heap.critical_pin_count(), 1);
+
+        let pre: Vec<usize> = roots.iter().map(|r| r.as_ptr() as usize).collect();
+        // SAFETY: these unit tests run the heap single-threaded.
+        let stw = unsafe { StopTheWorldToken::new() };
+        cratonvm_types::flags::with_thread_overrides(
+            &[("CRATONVM_ZGC_RELOCATE", Some("1"))],
+            || {
+                heap.collect_garbage(&stw, &mut roots, &NoMonitors);
+            },
+        );
+
+        let moved_total = roots
+            .iter()
+            .zip(pre.iter())
+            .filter(|(now, was)| now.as_ptr() as usize != **was)
+            .count();
+        assert!(
+            moved_total > 0,
+            "the fixture must relocate SOMETHING, or a pin that holds is meaningless"
+        );
+        assert_eq!(
+            roots[pinned_idx].as_ptr() as usize, pinned_addr,
+            "the pinned object moved: the copy-back at Release would write over \
+             whatever now occupies {pinned_addr:#x}"
+        );
+
+        // ...and the pin is releasable, or one critical section immobilises a
+        // page for the life of the process.
+        heap.unpin_critical(pinned_addr);
+        assert_eq!(heap.critical_pin_count(), 0);
+    }
+
+    /// Nested critical sections on one array: the inner release must not
+    /// unpin the outer. Refcounting, asserted rather than assumed.
+    #[test]
+    fn critical_pins_are_refcounted_so_a_nested_release_does_not_unpin() {
+        let heap = ZgcRealHeap::with_capacity(64 * 1024);
+        let o = heap.alloc_object(ClassId::new(1), 4);
+        let addr = o.as_ptr() as usize;
+        heap.pin_critical(addr);
+        heap.pin_critical(addr);
+        assert_eq!(heap.critical_pin_count(), 1, "one address, two pins");
+        heap.unpin_critical(addr);
+        assert_eq!(
+            heap.critical_pin_count(),
+            1,
+            "the inner release must leave the outer pin standing"
+        );
+        heap.unpin_critical(addr);
+        assert_eq!(heap.critical_pin_count(), 0);
     }
 
     #[test]
