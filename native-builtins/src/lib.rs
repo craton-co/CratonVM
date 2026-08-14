@@ -40219,6 +40219,167 @@ fn register_synchronized_collection_wrapper_natives(registry: &mut NativeMethodR
             "()[Ljava/lang/Object;",
             native_sync_collection_to_array,
         );
+        // The rest of the `Collection` contract, forwarded verbatim — see
+        // `sync_collection_delegate` for why a wrapper now needs all of it.
+        registry.register(class, "clear", "()V", |ctx, args| {
+            sync_collection_delegate(ctx, args, "clear", "()V", None)
+        });
+        registry.register(class, "toString", "()Ljava/lang/String;", |ctx, args| {
+            sync_collection_delegate(
+                ctx,
+                args,
+                "toString",
+                "()Ljava/lang/String;",
+                Some(Value::Object(None)),
+            )
+        });
+        registry.register(class, "stream", "()Ljava/util/stream/Stream;", |ctx, args| {
+            sync_collection_delegate(
+                ctx,
+                args,
+                "stream",
+                "()Ljava/util/stream/Stream;",
+                Some(Value::Object(None)),
+            )
+        });
+        registry.register(
+            class,
+            "spliterator",
+            "()Ljava/util/Spliterator;",
+            |ctx, args| {
+                sync_collection_delegate(
+                    ctx,
+                    args,
+                    "spliterator",
+                    "()Ljava/util/Spliterator;",
+                    Some(Value::Object(None)),
+                )
+            },
+        );
+        registry.register(
+            class,
+            "forEach",
+            "(Ljava/util/function/Consumer;)V",
+            |ctx, args| {
+                sync_collection_delegate(
+                    ctx,
+                    args,
+                    "forEach",
+                    "(Ljava/util/function/Consumer;)V",
+                    None,
+                )
+            },
+        );
+        registry.register(
+            class,
+            "containsAll",
+            "(Ljava/util/Collection;)Z",
+            |ctx, args| {
+                sync_collection_delegate(
+                    ctx,
+                    args,
+                    "containsAll",
+                    "(Ljava/util/Collection;)Z",
+                    Some(Value::Int(0)),
+                )
+            },
+        );
+        registry.register(class, "addAll", "(Ljava/util/Collection;)Z", |ctx, args| {
+            sync_collection_delegate(
+                ctx,
+                args,
+                "addAll",
+                "(Ljava/util/Collection;)Z",
+                Some(Value::Int(0)),
+            )
+        });
+        registry.register(
+            class,
+            "removeAll",
+            "(Ljava/util/Collection;)Z",
+            |ctx, args| {
+                sync_collection_delegate(
+                    ctx,
+                    args,
+                    "removeAll",
+                    "(Ljava/util/Collection;)Z",
+                    Some(Value::Int(0)),
+                )
+            },
+        );
+        registry.register(
+            class,
+            "retainAll",
+            "(Ljava/util/Collection;)Z",
+            |ctx, args| {
+                sync_collection_delegate(
+                    ctx,
+                    args,
+                    "retainAll",
+                    "(Ljava/util/Collection;)Z",
+                    Some(Value::Int(0)),
+                )
+            },
+        );
+        registry.register(
+            class,
+            "removeIf",
+            "(Ljava/util/function/Predicate;)Z",
+            |ctx, args| {
+                sync_collection_delegate(
+                    ctx,
+                    args,
+                    "removeIf",
+                    "(Ljava/util/function/Predicate;)Z",
+                    Some(Value::Int(0)),
+                )
+            },
+        );
+        registry.register(
+            class,
+            "toArray",
+            "([Ljava/lang/Object;)[Ljava/lang/Object;",
+            |ctx, args| {
+                sync_collection_delegate(
+                    ctx,
+                    args,
+                    "toArray",
+                    "([Ljava/lang/Object;)[Ljava/lang/Object;",
+                    Some(Value::Object(None)),
+                )
+            },
+        );
+        registry.register(
+            class,
+            "toArray",
+            "(Ljava/util/function/IntFunction;)[Ljava/lang/Object;",
+            |ctx, args| {
+                sync_collection_delegate(
+                    ctx,
+                    args,
+                    "toArray",
+                    "(Ljava/util/function/IntFunction;)[Ljava/lang/Object;",
+                    Some(Value::Object(None)),
+                )
+            },
+        );
+        // `equals`/`hashCode` ONLY on the Set wrapper, matching the JDK:
+        // `SynchronizedSet` overrides both to delegate (the Set contract),
+        // `SynchronizedCollection` inherits `Object` identity and must keep it.
+        if class == "java/util/Collections$SynchronizedSet" {
+            registry.register(class, "hashCode", "()I", |ctx, args| {
+                sync_collection_delegate(ctx, args, "hashCode", "()I", Some(Value::Int(0)))
+            });
+            registry.register(class, "equals", "(Ljava/lang/Object;)Z", |ctx, args| {
+                sync_collection_delegate(
+                    ctx,
+                    args,
+                    "equals",
+                    "(Ljava/lang/Object;)Z",
+                    Some(Value::Int(0)),
+                )
+            });
+        }
     }
     let map = "java/util/Collections$SynchronizedMap";
     registry.register(map, "<init>", "(Ljava/util/Map;)V", native_sync_map_init);

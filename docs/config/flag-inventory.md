@@ -841,6 +841,7 @@ applies to `flag_env_mutation_guard.rs`.
 | `CRATONVM_DBG_MSC` | DBG | `CRATONVM_DBG=msc` | opt-in | off | diag | snapshot | types |
 | `CRATONVM_DBG_MTROOTS` | DBG | `CRATONVM_DBG=mtroots` | opt-in | off | diag | snapshot | vm |
 | `CRATONVM_DBG_NATIVELIBRARIES_LOAD_OK` | DBG | `CRATONVM_DBG=nativelibraries-load-ok` | opt-in | off | diag | snapshot | native-builtins |
+| `CRATONVM_DBG_NATIVE_LOOKUPS` | DBG | `CRATONVM_DBG=native-lookups` | opt-in | off | diag | snapshot | native-api |
 | `CRATONVM_DBG_NCDFE` | DBG | `CRATONVM_DBG=ncdfe` | opt-in | off | diag | snapshot | vm |
 | `CRATONVM_DBG_NET` | DBG | `CRATONVM_DBG=net` | opt-in | off | diag | snapshot | types |
 | `CRATONVM_DBG_NETTY_QUEUE` | DBG | `CRATONVM_DBG=netty-queue` | opt-in | off | diag | snapshot | types |

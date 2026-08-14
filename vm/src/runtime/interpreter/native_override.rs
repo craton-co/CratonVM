@@ -2516,6 +2516,76 @@ pub(super) fn force_native_over_real_jdk_bytecode(
     ) {
         return true;
     }
+    // The same again for the SET-shaped views (native-collections'
+    // `SET_VIEW_CARRIERS`). Here `equals`/`hashCode` ARE included: these
+    // carriers extend `AbstractSet`, whose `equals`/`hashCode` are the SET
+    // contract, and `register_set_view_carrier_natives` registers
+    // `native_hs_equals`/`native_hs_hash_code` for exactly that reason — the
+    // JDK bodies would compute it off a null `this$0`.
+    if matches!(
+        class_name,
+        "java/util/HashMap$KeySet"
+            | "java/util/HashMap$EntrySet"
+            | "java/util/LinkedHashMap$LinkedKeySet"
+            | "java/util/LinkedHashMap$LinkedEntrySet"
+            | "java/util/Hashtable$KeySet"
+            | "java/util/Hashtable$EntrySet"
+            | "java/util/TreeMap$KeySet"
+            | "java/util/concurrent/ConcurrentHashMap$EntrySetView"
+    ) && matches!(
+        method_name,
+        "size"
+            | "isEmpty"
+            | "add"
+            | "contains"
+            | "iterator"
+            | "toArray"
+            | "toString"
+            | "remove"
+            | "clear"
+            | "forEach"
+            | "stream"
+            | "removeIf"
+            | "spliterator"
+            | "addAll"
+            | "removeAll"
+            | "retainAll"
+            | "containsAll"
+            | "equals"
+            | "hashCode"
+            | "first"
+            | "last"
+            | "comparator"
+            | "headSet"
+            | "tailSet"
+            | "subSet"
+            | "descendingIterator"
+            | "descendingSet"
+            | "pollFirst"
+            | "pollLast"
+            | "ceiling"
+            | "floor"
+            | "higher"
+            | "lower"
+    ) {
+        return true;
+    }
+    // And for the iterator carriers (native-collections'
+    // `MAP_KEY_ITR_CARRIERS`). A `HashMap$KeyIterator`'s own bytecode walks the
+    // `next`/`current`/`index` fields `HashIterator` declares, and a
+    // CratonVM-minted one carries a SNAPSHOT past those slots instead
+    // (`key_itr_base`), so the real bodies would report every collection
+    // exhausted.
+    if matches!(
+        class_name,
+        "java/util/HashMap$KeyIterator"
+            | "java/util/HashMap$EntryIterator"
+            | "java/util/LinkedHashMap$LinkedKeyIterator"
+            | "java/util/LinkedHashMap$LinkedEntryIterator"
+    ) && matches!(method_name, "hasNext" | "next" | "remove")
+    {
+        return true;
+    }
     // BUG (found investigating the Tomcat Jasper/ecj JSP-compile NPE,
     // TestDefaultServlet.testBug57601 / TestMapperWebapps.testWelcomeFileStrict):
     // this function is the ONLY force-native gate consulted by the

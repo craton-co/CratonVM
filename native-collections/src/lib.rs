@@ -6250,16 +6250,31 @@ fn native_al_sub_list(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     // `ArrayList.subList` returns a `java.util.ArrayList$SubList` running real
     // bytecode, so handing back this stand-in under `--jdk-only` is exactly the
     // substitution §5 forbids. Refuse there instead, naming the class.
-    let view = try_alloc_synthetic(ctx, ASL_CLASS, ASL_NUM_FIELDS)?;
-    ctx.set_field(view, ASL_FIELD_PARENT, Value::Object(Some(this)));
-    ctx.set_field(view, ASL_FIELD_OFFSET, Value::Int(from as i32));
-    ctx.set_field(view, ASL_FIELD_SIZE, Value::Int(sub_size as i32));
-    ctx.set_field(view, ASL_FIELD_EXPECTED, Value::Int(parent_size));
+    // GC-SAFETY: `alloc_asl_view` allocates (and may run a `<clinit>`), and
+    // `this` is stored into the new view immediately afterwards — a from-space
+    // `this` here is the root list every later read of the view indexes into.
+    let this_pin = ctx.pin_native_root(this);
+    let view = match alloc_asl_view(ctx) {
+        Ok(v) => v,
+        Err(e) => {
+            ctx.unpin_native_roots(this_pin);
+            return Err(e);
+        }
+    };
+    let view_pin = ctx.pin_native_root(view);
+    let this = ctx.read_native_pin(this_pin, this);
+    let view = ctx.read_native_pin(view_pin, view);
+    let base = asl_base(ctx, view);
+    ctx.set_field(view, base + ASL_FIELD_PARENT, Value::Object(Some(this)));
+    ctx.set_field(view, base + ASL_FIELD_OFFSET, Value::Int(from as i32));
+    ctx.set_field(view, base + ASL_FIELD_SIZE, Value::Int(sub_size as i32));
+    ctx.set_field(view, base + ASL_FIELD_EXPECTED, Value::Int(parent_size));
     // Explicit, not left to whatever `alloc_object` zero-initialises a slot of
     // an undeclared shape to: W7-1's `lastRet` was exactly this hazard, an
     // int-zero read as a meaningful value. `this` is a real `ArrayList` here,
     // so there is no enclosing view to propagate to.
-    ctx.set_field(view, ASL_FIELD_VIEW_PARENT, Value::Object(None));
+    ctx.set_field(view, base + ASL_FIELD_VIEW_PARENT, Value::Object(None));
+    ctx.unpin_native_roots(this_pin);
     Ok(Some(Value::Object(Some(view))))
 }
 
@@ -6269,10 +6284,11 @@ fn native_al_sub_list(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
 /// view" (it degrades to the pre-existing behaviour) rather than reading past
 /// the object.
 fn asl_view_parent(ctx: &dyn NativeContext, this: ObjectRef) -> Option<ObjectRef> {
-    if ctx.object_num_fields(this) <= ASL_FIELD_VIEW_PARENT {
+    let base = asl_base(ctx, this);
+    if ctx.object_num_fields(this) <= base + ASL_FIELD_VIEW_PARENT {
         return None;
     }
-    match ctx.get_field(this, ASL_FIELD_VIEW_PARENT) {
+    match ctx.get_field(this, base + ASL_FIELD_VIEW_PARENT) {
         Value::Object(Some(p)) => Some(p),
         _ => None,
     }
@@ -6347,7 +6363,7 @@ fn native_asl_sub_list(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     // copies — a from-space `parent` recorded here would be what every later
     // read of the nested view indexes into.
     let this_pin = ctx.pin_native_root(this);
-    let view = match try_alloc_synthetic(ctx, ASL_CLASS, ASL_NUM_FIELDS) {
+    let view = match alloc_asl_view(ctx) {
         Ok(v) => v,
         Err(e) => {
             ctx.unpin_native_roots(this_pin);
@@ -6364,11 +6380,12 @@ fn native_asl_sub_list(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         }
     };
     let view = ctx.read_native_pin(view_pin, view);
-    ctx.set_field(view, ASL_FIELD_PARENT, Value::Object(Some(parent)));
-    ctx.set_field(view, ASL_FIELD_OFFSET, Value::Int(offset + from_i32));
-    ctx.set_field(view, ASL_FIELD_SIZE, Value::Int(to_i32 - from_i32));
-    ctx.set_field(view, ASL_FIELD_EXPECTED, Value::Int(expected));
-    ctx.set_field(view, ASL_FIELD_VIEW_PARENT, Value::Object(Some(this)));
+    let base = asl_base(ctx, view);
+    ctx.set_field(view, base + ASL_FIELD_PARENT, Value::Object(Some(parent)));
+    ctx.set_field(view, base + ASL_FIELD_OFFSET, Value::Int(offset + from_i32));
+    ctx.set_field(view, base + ASL_FIELD_SIZE, Value::Int(to_i32 - from_i32));
+    ctx.set_field(view, base + ASL_FIELD_EXPECTED, Value::Int(expected));
+    ctx.set_field(view, base + ASL_FIELD_VIEW_PARENT, Value::Object(Some(this)));
     let view = ctx.read_native_pin(view_pin, view);
     ctx.unpin_native_roots(this_pin);
     Ok(Some(Value::Object(Some(view))))
@@ -6416,21 +6433,89 @@ const ASL_FIELD_EXPECTED: usize = 3;
 const ASL_FIELD_VIEW_PARENT: usize = 4;
 const ASL_NUM_FIELDS: usize = 5;
 
+/// The class HotSpot's `arrayList.subList(0, 2).getClass()` answers, and the
+/// one row of `probes/ViewClassProbe` this VM still does not match.
+///
+/// **Not used as a carrier, and the reason is measured** — see
+/// `fixed-suite-bugs/netty/collection-view-carrier-residuals-FIXED-20260813.md`,
+/// "the one row that stayed open". The undeclared-slot rule does apply here:
+/// the JDK class declares `root`/`parent`/`offset`/`size` on top of
+/// `AbstractList.modCount`, this VM's five fields go PAST them ([`asl_base`]),
+/// and `--real-jdk` measures byte-clean that way. What is NOT solved is
+/// receiver OWNERSHIP. Registering the `native_asl_*` family on the real class
+/// means it also fires for a `SubList` that **java.base's own bytecode** built —
+/// which is precisely what `--jdk-only` produces, because there
+/// `ArrayList.subList` runs its own body. Such an object has the class's
+/// declared width and none of this VM's fields, so `asl_state` reads `modCount`
+/// as `parent` and answers "empty": `sublist.size` 0, `sublist.of-sublist`
+/// null, `Pattern.split` -> `null|null|null` — seven lines of
+/// `probes/JdkOnlyCollectionViewProbe`, on an arm where the `--real-jdk` arm of
+/// the same run was clean.
+///
+/// A retry needs a receiver test, not another carrier: `asl_base` must answer
+/// `None` when `object_num_fields < class_num_total_fields + ASL_NUM_FIELDS`,
+/// and every `native_asl_*` must then delegate through
+/// `invoke_virtual_bytecode_only` instead of answering zero. Mirroring this
+/// VM's state into the JDK's five fields was tried first and is not sufficient
+/// alone: it makes the JDK's bodies correct on OUR objects and does nothing
+/// about ours running on THEIRS.
+#[allow(dead_code)]
+const ASL_REAL_CLASS: &str = "java/util/ArrayList$SubList";
+
+/// Where a sublist view's five native fields start: past the carrier's own
+/// declared fields (5 on the real JDK class, 0 on [`ASL_CLASS`]).
+///
+/// Derived from the object's width for the same reason [`key_itr_base`] is —
+/// both mint sites allocate exactly `declared + ASL_NUM_FIELDS`, and a view
+/// built by some other path with the older FOUR-field shape stays at 0, which
+/// is what keeps `asl_view_parent`'s width guard meaning what it meant.
+#[inline]
+fn asl_base(ctx: &dyn NativeContext, this: ObjectRef) -> usize {
+    ctx.object_num_fields(this).saturating_sub(ASL_NUM_FIELDS)
+}
+
+/// Allocate a sublist view under [`ASL_REAL_CLASS`], wide enough for its own
+/// declared fields plus this VM's five, falling back to [`ASL_CLASS`].
+///
+/// **The §5 gate runs FIRST, and it is asked about the INTERNAL name.** That is
+/// not bookkeeping. A sublist view is a compatibility stand-in whatever class it
+/// wears — its state is at [`asl_base`], not in `root`/`parent`/`offset`/`size`
+/// — so `--jdk-only` must go on refusing it, and refusing is what makes strict
+/// mode fall back to `java.base`'s own `ArrayList.subList`, which builds a REAL
+/// SubList that works. Skipping the gate because the object now has a real class
+/// name was measured, on `probes/JdkOnlyCollectionViewProbe`:
+///
+/// ```text
+/// sublist.mid    HotSpot [b|c]/2   --jdk-only []/0
+/// Pattern.split  HotSpot 1|2|3     --jdk-only null|null|null
+/// ```
+///
+/// — the JDK's own `SubList` bytecode reading fields this VM never fills. Seven
+/// probe lines, from one skipped refusal.
+///
+/// `try_ensure_synthetic_class` rather than a throwaway `try_alloc_synthetic`:
+/// same policy question, same answer, no object allocated to ask it.
+fn alloc_asl_view(ctx: &mut dyn NativeContext) -> Result<ObjectRef, MethodCallFailed> {
+    try_alloc_synthetic(ctx, ASL_CLASS, ASL_NUM_FIELDS)
+}
+
+
 /// Read `(parent, offset, size, expected_parent_size)` from a sublist view.
 fn asl_state(ctx: &dyn NativeContext, this: ObjectRef) -> Option<(ObjectRef, i32, i32, i32)> {
-    let parent = match ctx.get_field(this, ASL_FIELD_PARENT) {
+    let base = asl_base(ctx, this);
+    let parent = match ctx.get_field(this, base + ASL_FIELD_PARENT) {
         Value::Object(Some(p)) => p,
         _ => return None,
     };
-    let offset = match ctx.get_field(this, ASL_FIELD_OFFSET) {
+    let offset = match ctx.get_field(this, base + ASL_FIELD_OFFSET) {
         Value::Int(o) => o,
         _ => 0,
     };
-    let size = match ctx.get_field(this, ASL_FIELD_SIZE) {
+    let size = match ctx.get_field(this, base + ASL_FIELD_SIZE) {
         Value::Int(s) => s,
         _ => 0,
     };
-    let expected = match ctx.get_field(this, ASL_FIELD_EXPECTED) {
+    let expected = match ctx.get_field(this, base + ASL_FIELD_EXPECTED) {
         Value::Int(e) => e,
         _ => 0,
     };
@@ -6453,9 +6538,22 @@ fn asl_check_comod(
 }
 
 fn register_al_sublist_natives(r: &mut NativeMethodRegistry) {
+    // ASL_CLASS only. `ASL_REAL_CLASS` is deliberately NOT registered — see
+    // its doc comment for the `--jdk-only` measurement that says why.
+    register_al_sublist_natives_on(r, ASL_CLASS);
+}
+
+/// The whole `subList` surface, on one carrier class.
+///
+/// Split out from `register_al_sublist_natives` for a second carrier that was
+/// then withdrawn: registering this family on the real
+/// `java/util/ArrayList$SubList` also hands it every `SubList` java.base's own
+/// bytecode builds, which have none of this VM's fields. [`ASL_REAL_CLASS`]
+/// carries the measurement. The shape is left as a function because the retry
+/// described there needs exactly it, plus a receiver test.
+fn register_al_sublist_natives_on(r: &mut NativeMethodRegistry, c: &str) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
-    let c = ASL_CLASS;
     r.register(c, "size", "()I", native_asl_size);
     r.register(c, "isEmpty", "()Z", native_asl_is_empty);
     r.register(c, "get", "(I)Ljava/lang/Object;", native_asl_get);
@@ -6883,8 +6981,9 @@ fn asl_delegate_mutating(
     }
     al_set_data(ctx, parent, new_buf);
     al_set_size(ctx, parent, w as i32);
-    ctx.set_field(this, ASL_FIELD_SIZE, Value::Int(new_size));
-    ctx.set_field(this, ASL_FIELD_EXPECTED, Value::Int(w as i32));
+    let this_base = asl_base(ctx, this);
+    ctx.set_field(this, this_base + ASL_FIELD_SIZE, Value::Int(new_size));
+    ctx.set_field(this, this_base + ASL_FIELD_EXPECTED, Value::Int(w as i32));
     // Ripple the element-count change up the enclosing views, the way the JDK's
     // `SubList.updateSizeAndModCount` walks its own `parent` chain. Without
     // this, `sub.subList(1,3).clear()` leaves `sub` holding the pre-mutation
@@ -6902,12 +7001,13 @@ fn asl_delegate_mutating(
     let mut cursor = asl_view_parent(ctx, this);
     for _ in 0..64 {
         let Some(v) = cursor else { break };
-        let vs = match ctx.get_field(v, ASL_FIELD_SIZE) {
+        let vb = asl_base(ctx, v);
+        let vs = match ctx.get_field(v, vb + ASL_FIELD_SIZE) {
             Value::Int(s) => s,
             _ => break,
         };
-        ctx.set_field(v, ASL_FIELD_SIZE, Value::Int((vs + delta).max(0)));
-        ctx.set_field(v, ASL_FIELD_EXPECTED, Value::Int(w as i32));
+        ctx.set_field(v, vb + ASL_FIELD_SIZE, Value::Int((vs + delta).max(0)));
+        ctx.set_field(v, vb + ASL_FIELD_EXPECTED, Value::Int(w as i32));
         cursor = asl_view_parent(ctx, v);
     }
     ctx.unpin_native_roots(pin);
@@ -11117,8 +11217,18 @@ fn native_map_key_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     }
     // Build the live view through the shared helper so every key, including a
     // legal HashMap null key, is inserted through native_map_put.
+    //
+    // The wrapper verdict is taken BEFORE the build: `make_view_set_of`
+    // allocates, so `this` afterwards may be a pre-move address and asking it
+    // for its class then would be reading a corpse.
+    let sync = wants_synchronized_views(&*ctx, this);
     let keys = map_collect_keys(ctx, this);
     let set = make_view_set_of(ctx, this, VIEW_KIND_KEYSET, &keys)?;
+    let set = if sync {
+        wrap_synchronized_view(ctx, set, true)?
+    } else {
+        set
+    };
     Ok(Some(Value::Object(Some(set))))
 }
 
@@ -11140,6 +11250,8 @@ fn native_map_values(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     // list/buffer allocations move `this` and every snapshotted value before
     // the stores below (mirrors native_map_keys_as_array).
     let carrier = values_carrier_for(&*ctx, this);
+    // Taken before anything allocates — see `native_map_key_set`.
+    let sync = wants_synchronized_views(&*ctx, this);
     let this_pin = ctx.pin_native_root(this);
     let (_, val_handles) = pin_value_slice(ctx, &values);
     let __al_n_fields = al_slots(ctx).2;
@@ -11157,6 +11269,11 @@ fn native_map_values(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     al_set_data(ctx, list, buf);
     al_set_size(ctx, list, values.len() as i32);
     ctx.unpin_native_roots(this_pin);
+    let list = if sync {
+        wrap_synchronized_view(ctx, list, false)?
+    } else {
+        list
+    };
     Ok(Some(Value::Object(Some(list))))
 }
 
@@ -11178,6 +11295,7 @@ pub fn make_live_values_list(
     values: &[Value],
 ) -> Result<ObjectRef, MethodCallFailed> {
     let carrier = values_carrier_for(&*ctx, source);
+    let sync = wants_synchronized_views(&*ctx, source);
     let source_pin = ctx.pin_native_root(source);
     let (_, val_handles) = pin_value_slice(ctx, values);
     let __al_n_fields = al_slots(ctx).2;
@@ -11195,6 +11313,9 @@ pub fn make_live_values_list(
     al_set_data(ctx, list, buf);
     al_set_size(ctx, list, values.len() as i32);
     ctx.unpin_native_roots(source_pin);
+    if sync {
+        return wrap_synchronized_view(ctx, list, false);
+    }
     Ok(list)
 }
 
@@ -11206,16 +11327,19 @@ fn native_map_entry_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     if is_tree_map_receiver(ctx, this) {
         return native_tm_entry_set(ctx, args);
     }
+    // Taken before anything allocates — see `native_map_key_set`.
+    let sync = wants_synchronized_views(&*ctx, this);
     // Both allocations below may run a moving young collection. Keep the
     // source and newly created view rooted, then collect entries only after
     // the view is fully wired; otherwise `set_field(set, ...)` can target the
     // pre-move Set and leave entrySet().iterator() observing a null backing.
     let this_pin = ctx.pin_native_root(this);
     let entry_count = map_collect_entries(ctx, this).len();
-    // Build a HashSet of Map.Entry objects, backed by a view backing that
-    // remembers the source map so removing an entry through the set (or its
-    // iterator) deletes the corresponding key from the source map.
-    let set = try_alloc_synthetic(ctx, "java/util/HashSet", HS_NUM_FIELDS)?;
+    // Build an entrySet carrier holding Map.Entry objects, backed by a view
+    // backing that remembers the source map so removing an entry through the
+    // set (or its iterator) deletes the corresponding key from the source map.
+    let carrier = set_view_carrier_for(&*ctx, this, VIEW_KIND_ENTRYSET);
+    let set = alloc_set_view_carrier(ctx, carrier)?;
     let set_pin = ctx.pin_native_root(set);
     let cap = std::cmp::max(entry_count.next_power_of_two(), MAP_DEFAULT_CAPACITY);
     let this = ctx.read_native_pin(this_pin, this);
@@ -11223,7 +11347,7 @@ fn native_map_entry_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     let backing_pin = ctx.pin_native_root(backing_map);
     let set = ctx.read_native_pin(set_pin, set);
     let backing_map = ctx.read_native_pin(backing_pin, backing_map);
-    ctx.set_field(set, HS_FIELD_MAP, Value::Object(Some(backing_map)));
+    hs_set_backing_map(ctx, set, backing_map);
     let this = ctx.read_native_pin(this_pin, this);
     let entries = map_collect_entries(ctx, this);
     // cceres3: pin across GC-capable call (stream stale-at-store wave) — the
@@ -11279,6 +11403,11 @@ fn native_map_entry_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     ctx.unpin_native_roots(backing_pin);
     ctx.unpin_native_roots(set_pin);
     ctx.unpin_native_roots(this_pin);
+    let set = if sync {
+        wrap_synchronized_view(ctx, set, true)?
+    } else {
+        set
+    };
     Ok(Some(Value::Object(Some(set))))
 }
 
@@ -11286,13 +11415,16 @@ fn native_map_entry_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
 /// `(key, value)` pairs backed by `source`. Mirrors [`native_map_entry_set`]
 /// (3-field live `Map$Entry` elements, a view backing that remembers `source`
 /// so `remove`/`iterator().remove()` and `Entry.setValue` write through to
-/// `source` via its virtual `remove`/`put`), but tagged `VIEW_KIND_ENTRYSET_STATIC`
-/// so the view is materialised **once** and never resynced from `source`.
+/// `source` via its virtual `remove`/`put`), but tagged
+/// `VIEW_KIND_ENTRYSET_STATIC`, which decides HOW the view refreshes rather
+/// than whether it does.
 ///
-/// This is for sources whose entries cannot be read back without re-entering
-/// `entrySet()` — `java/util/Properties`, whose data lives in a Rust side-table.
-/// A standard (resyncing) entrySet view would walk `Properties.entrySet()` on
-/// every `iterator()` and recurse. Because the write-through is keyed on this
+/// This is for sources whose entries cannot be read back by walking their
+/// fields — `java/util/Properties`, whose data lives in a Rust side-table. A
+/// standard (field-walking) entrySet view would walk `Properties.entrySet()` on
+/// every `iterator()` and recurse, so a read of this kind instead calls the
+/// source's own `entrySet()` once and adopts the fresh view's backing
+/// ([`adopt_fresh_view_backing`]). Because the write-through is keyed on this
 /// specific view backing (not on the entries' source field), a later
 /// `new HashSet<>(props.entrySet())` copy is a plain set and its `remove` is
 /// correctly detached from the source.
@@ -11309,6 +11441,7 @@ pub fn make_static_entry_set(
     // entries; `(String) entry.getKey()` then observed a zeroed/reused block
     // identifying as bare `java.lang.Object`. Pin + re-read everything,
     // mirroring `resync_view_set`'s entry loop.
+    let sync = wants_synchronized_views(&*ctx, source);
     let flat: Vec<Value> = entries.iter().flat_map(|(k, v)| [*k, *v]).collect();
     let (elem_base, flat_pins) = pin_value_slice(ctx, &flat);
     let source_pin = ctx.pin_native_root(source);
@@ -11317,14 +11450,15 @@ pub fn make_static_entry_set(
     } else {
         elem_base
     };
-    let set = try_alloc_synthetic(ctx, "java/util/HashSet", HS_NUM_FIELDS)?;
+    let carrier = set_view_carrier_for(&*ctx, source, VIEW_KIND_ENTRYSET_STATIC);
+    let set = alloc_set_view_carrier(ctx, carrier)?;
     let set_pin = ctx.pin_native_root(set);
     let cap = std::cmp::max(entries.len().next_power_of_two(), MAP_DEFAULT_CAPACITY);
     let source_now = ctx.read_native_pin(source_pin, source);
     let backing_map = alloc_view_backing(ctx, source_now, VIEW_KIND_ENTRYSET_STATIC, cap)?;
     let backing_pin = ctx.pin_native_root(backing_map);
     let set_now = ctx.read_native_pin(set_pin, set);
-    ctx.set_field(set_now, HS_FIELD_MAP, Value::Object(Some(backing_map)));
+    hs_set_backing_map(ctx, set_now, backing_map);
     let sentinel = Value::Int(1);
     for i in 0..entries.len() {
         // 3-field Map$Entry: key@0, value@1, sourceMap@2 — so `Entry.setValue`
@@ -11367,7 +11501,35 @@ pub fn make_static_entry_set(
     }
     let set_now = ctx.read_native_pin(set_pin, set);
     ctx.unpin_native_roots(first_pin);
+    if sync {
+        return wrap_synchronized_view(ctx, set_now, true);
+    }
     Ok(set_now)
+}
+
+/// The keySet twin of [`make_static_entry_set`]: a live `keySet()` view over
+/// `keys`, backed by `source`, tagged [`VIEW_KIND_KEYSET_STATIC`] so a read
+/// refreshes it through the source's own `keySet()` rather than by walking the
+/// source's fields.
+///
+/// `java/util/Properties` is the caller. Its keys are half in a Rust side-table
+/// and half in a `ConcurrentHashMap` field, so `map_collect_keys` — which every
+/// other keySet view resyncs through — sees only the second half. Handing back
+/// a plain snapshot instead was the older answer, and it cost both liveness on
+/// read and write-through: `remove`/`retainAll` had to be re-implemented as an
+/// override on the snapshot's class. A view carrier gets both from the shared
+/// machinery (`native_hs_remove` consults the view backing).
+pub fn make_static_key_set(
+    ctx: &mut dyn NativeContext,
+    source: ObjectRef,
+    keys: &[Value],
+) -> Result<ObjectRef, MethodCallFailed> {
+    let sync = wants_synchronized_views(&*ctx, source);
+    let set = make_view_set_of(ctx, source, VIEW_KIND_KEYSET_STATIC, keys)?;
+    if sync {
+        return wrap_synchronized_view(ctx, set, true);
+    }
+    Ok(set)
 }
 
 fn native_map_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -11768,11 +11930,33 @@ const VIEW_KIND_ENTRYSET: i32 = 1;
 /// the backing directly; only structural `remove` (and `Entry.setValue`)
 /// propagate to the live source.
 const VIEW_KIND_ENTRYSET_STATIC: i32 = 2;
+/// `VIEW_KIND_KEYSET_STATIC`: the keySet twin of [`VIEW_KIND_ENTRYSET_STATIC`]
+/// — elements are bare keys and a `remove` writes through, but the source's
+/// keys cannot be collected by walking its fields, so a resync cannot go
+/// through `collect_keys_any`. Used for `java/util/Properties`, whose keys are
+/// half in a Rust side-table and half in a `ConcurrentHashMap` field and are
+/// only assembled correctly by `Properties.keySet()` itself.
+///
+/// Both STATIC kinds resync by [`adopt_fresh_view_backing`]: ask the source for
+/// a NEW view and take its backing. That costs one extra view construction per
+/// read and, unlike a field walk, cannot get the contents wrong.
+const VIEW_KIND_KEYSET_STATIC: i32 = 3;
 
 /// True for either entrySet view kind (elements are `Map.Entry` objects), as
 /// opposed to a keySet view (elements are bare keys).
 fn is_entryset_kind(kind: i32) -> bool {
     kind == VIEW_KIND_ENTRYSET || kind == VIEW_KIND_ENTRYSET_STATIC
+}
+
+/// The accessor a view of `kind` is rebuilt through — see
+/// [`adopt_fresh_view_backing`]. `None` for the resyncing kinds, which rebuild
+/// their contents from the source's fields instead.
+fn static_view_accessor(kind: i32) -> Option<(&'static str, &'static str)> {
+    match kind {
+        VIEW_KIND_ENTRYSET_STATIC => Some(("entrySet", "()Ljava/util/Set;")),
+        VIEW_KIND_KEYSET_STATIC => Some(("keySet", "()Ljava/util/Set;")),
+        _ => None,
+    }
 }
 
 /// Allocate the backing HashMap for a keySet/entrySet view: a synthetic
@@ -12196,14 +12380,15 @@ fn make_view_set_of(
     } else {
         elem_base
     };
-    let set = try_alloc_synthetic(ctx, "java/util/HashSet", HS_NUM_FIELDS)?;
+    let carrier = set_view_carrier_for(&*ctx, source, kind);
+    let set = alloc_set_view_carrier(ctx, carrier)?;
     let set_pin = ctx.pin_native_root(set);
     let cap = std::cmp::max(elems.len().next_power_of_two(), MAP_DEFAULT_CAPACITY);
     let source = ctx.read_native_pin(source_pin, source);
     let backing = alloc_view_backing(ctx, source, kind, cap)?;
     let backing_pin = ctx.pin_native_root(backing);
     let set = ctx.read_native_pin(set_pin, set);
-    ctx.set_field(set, HS_FIELD_MAP, Value::Object(Some(backing)));
+    hs_set_backing_map(ctx, set, backing);
     let sentinel = Value::Int(1);
     for (i, elem) in elems.iter().enumerate() {
         let backing = ctx.read_native_pin(backing_pin, backing);
@@ -12260,6 +12445,180 @@ const MAP_VIEW_CARRIERS: &[&str] = &[
 #[inline]
 fn is_map_view_carrier(name: &str) -> bool {
     MAP_VIEW_CARRIERS.contains(&name)
+}
+
+/// The carrier classes a map's SET-shaped view (`keySet()`, `entrySet()`) is
+/// minted under — the [`MAP_VIEW_CARRIERS`] argument, one family over.
+///
+/// Every one of these was `java/util/HashSet` until 2026-08-13, so
+/// `hashMap.keySet().getClass()` answered `java.util.HashSet` where HotSpot
+/// says `java.util.HashMap$KeySet` (`probes/ViewClassProbe`, six rows).
+///
+/// Same undeclared-slot argument as the values carriers, one slot lower: a view
+/// set keeps its state in HashSet's own `map` slot, which is absolute index 0
+/// because nothing in `HashSet`'s superclass chain declares a field — and these
+/// carriers declare exactly one field there themselves, the compiler-generated
+/// `this$0`, a REFERENCE of the enclosing map's type. Storing the view backing
+/// (a real `java/util/HashMap`, or `cratonvm/util/MapViewBacking` before
+/// `java/util/HashMap` resolves) in it is a reference into a reference slot, so
+/// no collector and no GC guard sees anything unusual; it is only the *declared
+/// type* that can be a supertype mismatch, and that would matter solely to JDK
+/// bytecode — which is exactly what the two force-native gates keep off these
+/// classes. `Hashtable$KeySet`/`$EntrySet` are the inner views the JDK wraps in
+/// a `Collections$Synchronized*`; see [`wrap_synchronized_view`].
+const SET_VIEW_CARRIERS: &[&str] = &[
+    "java/util/HashMap$KeySet",
+    "java/util/HashMap$EntrySet",
+    "java/util/LinkedHashMap$LinkedKeySet",
+    "java/util/LinkedHashMap$LinkedEntrySet",
+    "java/util/Hashtable$KeySet",
+    "java/util/Hashtable$EntrySet",
+    "java/util/concurrent/ConcurrentHashMap$EntrySetView",
+];
+
+/// `true` iff `name` is one of the [`SET_VIEW_CARRIERS`]. Cold path only —
+/// `is_hashset_native_backed` reaches it just for a receiver that is not a
+/// `HashSet` subclass, which every ordinary set is.
+#[inline]
+fn is_set_view_carrier(name: &str) -> bool {
+    SET_VIEW_CARRIERS.contains(&name)
+}
+
+/// The class a `keySet()`/`entrySet()` view over `source` should be minted
+/// under, matching what the JDK's own accessor returns for that map family.
+///
+/// `Hashtable`/`Properties` name the INNER view here; the JDK's outer answer is
+/// a `Collections$Synchronized{Set,Collection}` around it, applied separately by
+/// [`wrap_synchronized_view`] so the wrapper's own bytecode does the delegating.
+/// `TreeMap` is absent because its keySet is a `TreeSet`-shaped view with its
+/// own carrier (`native_tm_key_set`) and its entrySet an ArrayList-shaped one
+/// (`MAP_VIEW_CARRIERS`); `ConcurrentHashMap`'s keySet is
+/// `alloc_key_set_view_object`'s real `KeySetView`.
+fn set_view_carrier_for(ctx: &dyn NativeContext, source: ObjectRef, kind: i32) -> &'static str {
+    let entryset = is_entryset_kind(kind);
+    // Order mirrors `collect_entries_any`: LinkedHashMap is a HashMap subclass,
+    // so it has to be asked first.
+    if is_lhm_receiver(ctx, source) {
+        if entryset {
+            "java/util/LinkedHashMap$LinkedEntrySet"
+        } else {
+            "java/util/LinkedHashMap$LinkedKeySet"
+        }
+    } else if is_chm_receiver(ctx, source) {
+        if entryset {
+            "java/util/concurrent/ConcurrentHashMap$EntrySetView"
+        } else {
+            // Reached only if a CHM keySet ever arrives here; its own accessor
+            // returns the real `KeySetView` via `alloc_key_set_view_object`.
+            "java/util/HashMap$KeySet"
+        }
+    } else if receiver_facts(ctx, source).has(CF_HASHTABLE_ANCESTRY) {
+        if entryset {
+            "java/util/Hashtable$EntrySet"
+        } else {
+            "java/util/Hashtable$KeySet"
+        }
+    } else if entryset {
+        "java/util/HashMap$EntrySet"
+    } else {
+        "java/util/HashMap$KeySet"
+    }
+}
+
+/// Allocate a set-view carrier wide enough for both its own declared fields and
+/// [`HS_FIELD_MAP`], falling back to `java/util/HashSet` if the carrier class
+/// cannot be had.
+///
+/// The fallback is the same not-decoration argument [`alloc_view_carrier`]
+/// makes: these are package-private JDK classes, and a stripped image or a
+/// synthetic-JDK build that has not bootstrapped them must not turn
+/// `map.keySet()` — which cannot fail — into a `NoClassDefFoundError`.
+fn alloc_set_view_carrier(
+    ctx: &mut dyn NativeContext,
+    carrier: &str,
+) -> Result<ObjectRef, MethodCallFailed> {
+    if let Ok(cid) = ctx.ensure_class_initialized(carrier) {
+        if ctx.class_name_arc_of_id(cid).as_deref() == Some(carrier) {
+            // Declared fields, then one undeclared slot for the backing map —
+            // the slot `hs_map_slot` reads. See its doc for why not slot 0.
+            let n = ctx.class_num_total_fields(cid) + HS_NUM_FIELDS;
+            return Ok(ctx.alloc_object(cid, n));
+        }
+    }
+    try_alloc_synthetic(ctx, "java/util/HashSet", HS_NUM_FIELDS)
+}
+
+/// Wrap a `Hashtable`-family view in the `Collections$Synchronized*` the JDK's
+/// own `Hashtable.keySet()`/`entrySet()`/`values()` return, so `getClass()`
+/// answers what HotSpot answers.
+///
+/// The wrapper is a REAL `Collections$SynchronizedCollection`/`$SynchronizedSet`
+/// running real JDK bytecode — `Collections.synchronizedSet` already builds one
+/// (`native_collections_synchronized_set`) — so every method is
+/// `synchronized (mutex) { c.method(); }` onto the inner view, which is the
+/// carrier this crate's natives are registered on. Nothing about the view's
+/// liveness or write-through changes; one delegation hop is added.
+///
+/// Returns `view` unchanged if the wrapper class cannot be built, which costs
+/// the `getClass()` fidelity for that run and nothing else.
+fn wrap_synchronized_view(
+    ctx: &mut dyn NativeContext,
+    view: ObjectRef,
+    as_set: bool,
+) -> Result<ObjectRef, MethodCallFailed> {
+    let (cls, desc) = if as_set {
+        (
+            "java/util/Collections$SynchronizedSet",
+            "(Ljava/util/Set;)V",
+        )
+    } else {
+        (
+            "java/util/Collections$SynchronizedCollection",
+            "(Ljava/util/Collection;)V",
+        )
+    };
+    // GC-SAFETY: `new_object_initialized` allocates and runs a constructor;
+    // `view` is a bare Rust local passed INTO it and used again on the failure
+    // path, so it is pinned and re-read.
+    let view_pin = ctx.pin_native_root(view);
+    let built = ctx.new_object_initialized(cls, desc, &[Value::Object(Some(view))]);
+    let view = ctx.read_native_pin(view_pin, view);
+    ctx.unpin_native_roots(view_pin);
+    match built {
+        Ok(Some(Value::Object(Some(w)))) => Ok(w),
+        _ => Ok(view),
+    }
+}
+
+/// `true` iff `source`'s views are the JDK's `synchronized` wrappers — i.e. it
+/// is a `Hashtable` or a subclass such as `Properties`.
+fn wants_synchronized_views(ctx: &dyn NativeContext, source: ObjectRef) -> bool {
+    receiver_facts(ctx, source).has(CF_HASHTABLE_ANCESTRY)
+}
+
+/// The collection inside a `Collections$Synchronized{Collection,Set,List,…}`,
+/// or `obj` itself when it is not one.
+///
+/// The inverse of [`wrap_synchronized_view`], for the native paths that need
+/// the CratonVM-backed view rather than the JDK object in front of it.
+fn unwrap_synchronized(ctx: &dyn NativeContext, obj: ObjectRef) -> ObjectRef {
+    let is_sync = match ctx
+        .class_name_arc_of_id(ctx.class_id_of_object(obj))
+        .as_deref()
+    {
+        Some(n) => n.starts_with("java/util/Collections$Synchronized"),
+        None => false,
+    };
+    if !is_sync {
+        return obj;
+    }
+    // `c` is the field every `SynchronizedCollection` subclass inherits; by
+    // name, not by index, because the synthetic-JDK stub and the real class
+    // need not agree on the slot.
+    match ctx.get_field_by_name(obj, "c") {
+        Value::Object(Some(inner)) => inner,
+        _ => obj,
+    }
 }
 
 /// The class a `values()` view over `source` should be minted under, chosen to
@@ -12349,6 +12708,102 @@ fn make_view_list_of(
     Ok(list)
 }
 
+thread_local! {
+    /// Sources currently being re-read by [`adopt_fresh_view_backing`], keyed
+    /// on the source's own pointer.
+    ///
+    /// The accessors this calls (`Properties.keySet()` / `.entrySet()`)
+    /// materialise a view directly from their storage and do not resync
+    /// anything, so today the re-entrant case cannot arise. It is guarded
+    /// anyway, for the reason `ITER_COLLECT_GUARD` was added: a source whose
+    /// accessor DOES read one of its own views turns "refresh on read" into
+    /// unbounded recursion, and that shape was found live once already
+    /// (the JSSE-connector stack overflow during TLS init).
+    static ADOPT_VIEW_GUARD: std::cell::RefCell<std::collections::HashSet<u64>> =
+        std::cell::RefCell::new(std::collections::HashSet::new());
+}
+
+/// RAII removal from [`ADOPT_VIEW_GUARD`], including on unwind — see
+/// [`IterCollectGuard`], which this mirrors.
+struct AdoptViewGuard {
+    key: u64,
+    inserted: bool,
+}
+impl Drop for AdoptViewGuard {
+    fn drop(&mut self) {
+        if self.inserted {
+            ADOPT_VIEW_GUARD.with(|g| {
+                g.borrow_mut().remove(&self.key);
+            });
+        }
+    }
+}
+
+/// Refresh a STATIC view (see [`VIEW_KIND_KEYSET_STATIC`]) by asking `source`
+/// for a fresh view of the same kind and pointing `set` at the fresh view's
+/// backing.
+///
+/// The fresh view is built by the source's own accessor native, which is the
+/// only code that knows how to assemble that source's contents; adopting its
+/// backing wholesale means this function never has to know. The fresh backing
+/// carries the same `(source, kind)` markers — `alloc_view_backing` wrote them
+/// — so `set` stays a live view with write-through afterwards.
+///
+/// Refusals from the accessor are propagated. A non-view answer (no backing to
+/// adopt) leaves `set` exactly as it was: a stale view is a worse answer than a
+/// fresh one, but an emptied view is worse than both.
+fn adopt_fresh_view_backing(
+    ctx: &mut dyn NativeContext,
+    set: ObjectRef,
+    source: ObjectRef,
+    method: &str,
+    descriptor: &str,
+) -> Result<(), MethodCallFailed> {
+    let guard_key = source.as_ptr() as u64;
+    let inserted = ADOPT_VIEW_GUARD.with(|g| g.borrow_mut().insert(guard_key));
+    let _guard = AdoptViewGuard {
+        key: guard_key,
+        inserted,
+    };
+    if !inserted {
+        return Ok(());
+    }
+    // GC-SAFETY: the accessor is a full native dispatch that allocates a view,
+    // its backing and its bucket array — `set` is a bare Rust local used for
+    // the store afterwards, so it is pinned and re-read (the same shape
+    // `native_hs_iterator` uses around its own `resync_view_set` call).
+    let set_pin = ctx.pin_native_root(set);
+    let fresh = ctx.invoke_virtual(source, method, descriptor, &[]);
+    let fresh = match fresh {
+        Ok(Some(Value::Object(Some(f)))) => f,
+        Err(e) => {
+            ctx.unpin_native_roots(set_pin);
+            return Err(e);
+        }
+        _ => {
+            ctx.unpin_native_roots(set_pin);
+            return Ok(());
+        }
+    };
+    // `Hashtable`/`Properties` accessors hand back the JDK's
+    // `Collections$Synchronized*` wrapper (see `wrap_synchronized_view`), so the
+    // fresh view is one level in. Without this the backing lookup answers `None`
+    // and the resync becomes a silent no-op — which is the very bug this
+    // function exists to close.
+    let fresh = unwrap_synchronized(ctx, fresh);
+    let backing = match hs_backing_map(ctx, fresh) {
+        Some(b) => b,
+        None => {
+            ctx.unpin_native_roots(set_pin);
+            return Ok(());
+        }
+    };
+    let set = ctx.read_native_pin(set_pin, set);
+    hs_set_backing_map(ctx, set, backing);
+    ctx.unpin_native_roots(set_pin);
+    Ok(())
+}
+
 /// Refresh a keySet/entrySet view's backing HashSet from its live source map,
 /// so reads (`contains`/`size`/`isEmpty`/`iterator`) reflect mutations made
 /// DIRECTLY to the source map after the view was obtained — JDK keySet/entrySet
@@ -12365,11 +12820,19 @@ fn resync_view_set(ctx: &mut dyn NativeContext, set: ObjectRef) -> Result<(), Me
         None => return Ok(()),
     };
     let kind = view_backing_kind(ctx, backing);
-    // A STATIC entrySet view (Properties) is materialised once and never
-    // resynced — its source cannot be read back without recursing through
-    // `Properties.entrySet()`. Leave the backing's contents untouched.
-    if kind == VIEW_KIND_ENTRYSET_STATIC {
-        return Ok(());
+    // A STATIC view's source cannot be read back by walking its fields, so it
+    // is refreshed by asking the source for a fresh view and adopting that
+    // view's backing. Until 2026-08-13 this arm returned without doing
+    // anything, which is what `probes/MapViewBehaviourProbe` measured as
+    //
+    // ```text
+    // props.keys.afterPut.size      HotSpot 3   CratonVM 2
+    // props.entries.afterPut.size   HotSpot 3   CratonVM 2
+    // ```
+    //
+    // — a `Properties` view was live in the WRITE direction only.
+    if let Some((method, desc)) = static_view_accessor(kind) {
+        return adopt_fresh_view_backing(ctx, set, source, method, desc);
     }
     // Rebuild the backing map's contents from the live source. Derive the
     // capacity from the current bucket-array length via `map_state` (NOT a raw
@@ -12516,11 +12979,14 @@ fn collect_keys_any(ctx: &mut dyn NativeContext, source: ObjectRef) -> Vec<Value
 /// layout `native_lhm_entry_set` and `native_hs_remove`'s key-extraction use).
 fn collect_view_snapshot_ordered(ctx: &mut dyn NativeContext, backing: ObjectRef) -> Result<Vec<Value>, MethodCallFailed> {
     if let Some(source) = view_backing_source(ctx, backing) {
-        // STATIC entrySet (Properties): never resynced from the source, so read
-        // the entries straight from the backing — the same path a plain set
-        // takes — rather than walking the source (which would recurse into
-        // `Properties.entrySet()`).
-        if view_backing_kind(ctx, backing) == VIEW_KIND_ENTRYSET_STATIC {
+        // A STATIC view (Properties): its contents were put in the backing by
+        // the source's own accessor — either at construction or by the
+        // `adopt_fresh_view_backing` this read's `resync_view_set` just ran —
+        // so read them straight from the backing, the same path a plain set
+        // takes. Walking the source instead would recurse into
+        // `Properties.entrySet()`. Both kinds' elements are already the right
+        // objects (entries for one, keys for the other).
+        if static_view_accessor(view_backing_kind(ctx, backing)).is_some() {
             return Ok(map_collect_keys(ctx, backing));
         }
         if view_backing_kind(ctx, backing) == VIEW_KIND_ENTRYSET {
@@ -12786,6 +13252,74 @@ fn ts_view_source(ctx: &dyn NativeContext, ts: ObjectRef) -> Option<ObjectRef> {
     None
 }
 
+/// Refresh a `TreeMap.keySet()` view from its live source map, so a read sees
+/// keys put into the map AFTER the view was taken. JDK keySet views are live;
+/// this is the `TreeSet`-carried family's counterpart to [`resync_view_set`]
+/// (HashSet-carried keySet/entrySet) and [`resync_values_view`]
+/// (ArrayList-carried values/TreeMap-entrySet).
+///
+/// Measured before this existed, `probes/MapViewBehaviourProbe`:
+///
+/// ```text
+/// tm.keys.afterPut.size   HotSpot 3   CratonVM 2
+/// ```
+///
+/// — the view had write-through (`remove`/`clear`/`pollFirst` all consult the
+/// marker) but no read-through, so it was a snapshot in the read direction
+/// only. `values()` and `entrySet()` of the same TreeMap already resynced,
+/// which is why exactly this one row diverged.
+///
+/// Only a **map** source is rebuilt. `TreeSet.descendingSet()` puts another
+/// `TreeSet` behind the same marker and its elements are the source's in
+/// REVERSE; rebuilding it in sorted order here would silently un-reverse the
+/// view. Its liveness is a separate, unmeasured row — see
+/// [`ts_source_remove`], which makes the same map-vs-set distinction.
+fn resync_ts_view(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+) -> Result<ObjectRef, MethodCallFailed> {
+    let source = match ts_view_source(ctx, this) {
+        Some(s) => s,
+        None => return Ok(this),
+    };
+    if !is_tree_map_receiver(ctx, source) {
+        return Ok(this);
+    }
+    // GC-SAFETY: `tm_collect_pairs` boxes fast-mode keys (allocating), and
+    // `alloc_ref_array` below collects too. `this`, `source` and every
+    // collected key are bare Rust locals used after those calls, so all three
+    // are pinned and re-read — the same shape `resync_values_view` uses.
+    let this_pin = ctx.pin_native_root(this);
+    let source_pin = ctx.pin_native_root(source);
+    let source = ctx.read_native_pin(source_pin, source);
+    let keys: Vec<Value> = tm_collect_pairs(ctx, source)
+        .into_iter()
+        .map(|(k, _)| k)
+        .collect();
+    let (_, key_handles) = pin_value_slice(ctx, &keys);
+    let cap = std::cmp::max(keys.len(), TS_DEFAULT_CAPACITY) + 1;
+    let buf = alloc_ref_array(ctx, cap);
+    let buf_pin = ctx.pin_native_root(buf);
+    for (i, k) in keys.iter().enumerate() {
+        let k = read_pinned_elem(ctx, key_handles[i], *k);
+        let buf = ctx.read_native_pin(buf_pin, buf);
+        ctx.set_array_element(buf, i, k);
+    }
+    // Re-install the trailing source marker: the array is longer than the
+    // logical size and its last slot is non-null, which is exactly what
+    // `ts_view_source` tests for. Without it the rebuilt view stops writing
+    // through.
+    let source = ctx.read_native_pin(source_pin, source);
+    let buf = ctx.read_native_pin(buf_pin, buf);
+    ctx.set_array_element(buf, cap - 1, Value::Object(Some(source)));
+    let this = ctx.read_native_pin(this_pin, this);
+    ts_set_slot(ctx, this, TS_FIELD_DATA, Value::Object(Some(buf)));
+    ts_set_slot(ctx, this, TS_FIELD_SIZE, Value::Int(keys.len() as i32));
+    let this = ctx.read_native_pin(this_pin, this);
+    ctx.unpin_native_roots(this_pin);
+    Ok(this)
+}
+
 /// Write a removal back to whatever a [`ts_view_source`] marker names.
 ///
 /// Two kinds of source reach that marker now. A `TreeMap` keySet view names a
@@ -12809,6 +13343,36 @@ fn ts_source_remove(
 
 /// Get the backing HashMap from a HashSet.
 fn is_hashset_native_backed(ctx: &dyn NativeContext, this: ObjectRef) -> bool {
+    hs_map_slot(ctx, this).is_some()
+}
+
+/// The slot a HashSet-shaped receiver keeps its backing map in, or `None` when
+/// the receiver is not HashSet-shaped at all.
+///
+/// For a real `HashSet` (or `CopyOnWriteArraySet`, or a subclass) it is
+/// [`HS_FIELD_MAP`] — absolute 0, because nothing in that chain declares a
+/// field before `HashSet.map`.
+///
+/// For one of the [`SET_VIEW_CARRIERS`] it is **past** the class's own declared
+/// fields, and that is not decoration:
+///
+/// ```text
+/// java.util.HashMap$KeySet             final java.util.HashMap this$0;
+/// java.util.LinkedHashMap$LinkedKeySet final boolean reversed;
+///                                      final java.util.LinkedHashMap this$0;
+/// ```
+///
+/// The `Linked*` views declare `reversed` FIRST, so slot 0 there is a BOOLEAN.
+/// Storing the backing map at slot 0 (which is what the first cut of this
+/// change did) wrote a reference into an int-declared slot, and every
+/// `linkedHashMap.keySet()` read back empty —
+/// `probes/MapViewBehaviourProbe`'s `lhm.keys.size` 0 against HotSpot's 2, and
+/// `AbstractMap.toString` recursing until the stack ran out. Anchoring on
+/// `class_num_total_fields` puts it in an UNDECLARED slot, which resolves to no
+/// field descriptor and is left untyped — the same rule the values carriers
+/// follow, and the reason those were already safe (they write ArrayList's
+/// absolute slots 1 and 2, past both declared fields).
+fn hs_map_slot(ctx: &dyn NativeContext, this: ObjectRef) -> Option<usize> {
     let cid = ctx.class_id_of_object(this);
     for class_name in [
         "java/util/HashSet",
@@ -12816,18 +13380,30 @@ fn is_hashset_native_backed(ctx: &dyn NativeContext, this: ObjectRef) -> bool {
     ] {
         if let Some(base) = ctx.class_id_by_name(class_name) {
             if cid == base || ctx.is_subclass(cid, base) {
-                return true;
+                return Some(HS_FIELD_MAP);
             }
         }
     }
-    false
+    // Reached only after both subclass checks miss, so no ordinary set pays for
+    // the name lookup.
+    match ctx.class_name_arc_of_id(cid).as_deref() {
+        Some(n) if is_set_view_carrier(n) => Some(ctx.class_num_total_fields(cid)),
+        _ => None,
+    }
+}
+
+/// Point a HashSet-shaped receiver at its backing map, at whatever slot
+/// [`hs_map_slot`] says. Every view mint site goes through this rather than
+/// writing [`HS_FIELD_MAP`] directly, so the reader and the writer cannot
+/// disagree about where the backing lives.
+fn hs_set_backing_map(ctx: &mut dyn NativeContext, set: ObjectRef, backing: ObjectRef) {
+    let slot = hs_map_slot(&*ctx, set).unwrap_or(HS_FIELD_MAP);
+    ctx.set_field(set, slot, Value::Object(Some(backing)));
 }
 
 fn hs_backing_map(ctx: &dyn NativeContext, this: ObjectRef) -> Option<ObjectRef> {
-    if !is_hashset_native_backed(ctx, this) {
-        return None;
-    }
-    match ctx.get_field(this, HS_FIELD_MAP) {
+    let slot = hs_map_slot(ctx, this)?;
+    match ctx.get_field(this, slot) {
         Value::Object(Some(m)) => Some(m),
         _ => None,
     }
@@ -13050,7 +13626,7 @@ pub fn make_hashset_with_elements(ctx: &mut dyn NativeContext, elems: &[Value]) 
     set_map_size(ctx, backing_map, 0);
     let set = ctx.read_native_pin(set_pin, set);
     let backing_map = ctx.read_native_pin(backing_map_pin, backing_map);
-    ctx.set_field(set, HS_FIELD_MAP, Value::Object(Some(backing_map)));
+    hs_set_backing_map(ctx, set, backing_map);
 
     let (_, elem_pins) = pin_value_slice(ctx, elems);
     let sentinel = Value::Int(1);
@@ -13166,6 +13742,92 @@ fn register_hashset_natives(r: &mut NativeMethodRegistry) {
         "()I",
         native_hs_hash_code,
     );
+    r.set_category(__prev_cat);
+    // The classes a map's `keySet()`/`entrySet()` view is minted under.
+    register_set_view_carrier_natives(r);
+}
+
+/// The `Set` surface of a keySet/entrySet view, registered on each of the
+/// [`SET_VIEW_CARRIERS`] — the set-shaped twin of
+/// [`register_map_view_carrier_natives`].
+///
+/// A view is HashSet-LAYOUT under its own class, so it needs the same
+/// `native_hs_*` bodies the `HashSet` registration installs. It is not optional:
+/// `HashMap$KeySet` declares `size`, `contains`, `remove`, `iterator`, `clear`,
+/// `forEach` and `spliterator` itself, and the receiver-has-own-bytecode rule
+/// would run those JDK bodies over `this$0` — null on a CratonVM view, whose
+/// state is the backing map in that same slot. Paired with the entries in
+/// `force_native_over_real_jdk_bytecode` and its `vm_exec` twin.
+///
+/// `equals`/`hashCode` ARE registered here, unlike on the values carriers: the
+/// JDK's set views extend `AbstractSet`, whose `equals`/`hashCode` are the SET
+/// contract, which is exactly what `native_hs_equals`/`native_hs_hash_code`
+/// implement. (On a `Collection` view they would have installed LIST semantics,
+/// which is why that family omits them.)
+///
+/// `<init>` is deliberately absent: nothing constructs these, and a constructor
+/// native would fire for a JDK-built view too.
+fn register_set_view_carrier_natives(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
+    for c in SET_VIEW_CARRIERS {
+        let c = *c;
+        r.register(c, "size", "()I", native_hs_size);
+        r.register(c, "isEmpty", "()Z", native_hs_is_empty);
+        r.register(c, "add", "(Ljava/lang/Object;)Z", native_hs_add);
+        r.register(c, "remove", "(Ljava/lang/Object;)Z", native_hs_remove);
+        r.register(c, "contains", "(Ljava/lang/Object;)Z", native_hs_contains);
+        r.register(c, "clear", "()V", native_hs_clear);
+        r.register(c, "iterator", "()Ljava/util/Iterator;", native_hs_iterator);
+        r.register(c, "toArray", "()[Ljava/lang/Object;", native_hs_to_array);
+        r.register(
+            c,
+            "toArray",
+            "([Ljava/lang/Object;)[Ljava/lang/Object;",
+            native_hs_to_array_typed,
+        );
+        r.register(
+            c,
+            "toArray",
+            "(Ljava/util/function/IntFunction;)[Ljava/lang/Object;",
+            native_collection_to_array_generator,
+        );
+        r.register(c, "toString", "()Ljava/lang/String;", native_hs_to_string);
+        r.register(c, "hashCode", "()I", native_hs_hash_code);
+        r.register(c, "equals", "(Ljava/lang/Object;)Z", native_hs_equals);
+        r.register(
+            c,
+            "forEach",
+            "(Ljava/util/function/Consumer;)V",
+            native_hs_for_each,
+        );
+        r.register(c, "stream", "()Ljava/util/stream/Stream;", native_hs_stream);
+        r.register(
+            c,
+            "spliterator",
+            "()Ljava/util/Spliterator;",
+            native_hs_spliterator,
+        );
+        r.register(c, "addAll", "(Ljava/util/Collection;)Z", native_hs_add_all);
+        r.register(
+            c,
+            "removeAll",
+            "(Ljava/util/Collection;)Z",
+            native_hs_remove_all,
+        );
+        r.register(
+            c,
+            "retainAll",
+            "(Ljava/util/Collection;)Z",
+            native_hs_retain_all,
+        );
+        r.register(
+            c,
+            "containsAll",
+            "(Ljava/util/Collection;)Z",
+            native_hs_contains_all,
+        );
+    }
     r.set_category(__prev_cat);
 }
 
@@ -13487,7 +14149,7 @@ fn native_hs_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
     let this_pin = ctx.pin_native_root(this);
     let backing = alloc_hs_backing(ctx, this, MAP_DEFAULT_CAPACITY);
     let this = ctx.read_native_pin(this_pin, this);
-    ctx.set_field(this, HS_FIELD_MAP, Value::Object(Some(backing)));
+    hs_set_backing_map(ctx, this, backing);
     ctx.unpin_native_roots(this_pin);
     Ok(None)
 }
@@ -13505,7 +14167,7 @@ fn native_hs_init_capacity(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
     let this_pin = ctx.pin_native_root(this);
     let backing = alloc_hs_backing(ctx, this, cap);
     let this = ctx.read_native_pin(this_pin, this);
-    ctx.set_field(this, HS_FIELD_MAP, Value::Object(Some(backing)));
+    hs_set_backing_map(ctx, this, backing);
     ctx.unpin_native_roots(this_pin);
     Ok(None)
 }
@@ -13902,7 +14564,7 @@ fn native_hs_contains_pinned(
         // native lookup bypassed that override so `keySet().contains("KEY")`
         // returned false (LinkedCaseInsensitiveMapTests putAndGet /
         // putWithOverlappingKeys).
-        if view_backing_kind(ctx, backing) == VIEW_KIND_KEYSET {
+        if !is_entryset_kind(view_backing_kind(ctx, backing)) {
             let elem = read_pinned_elem(ctx, elem_pin, elem);
             let has =
                 ctx.invoke_virtual(source, "containsKey", "(Ljava/lang/Object;)Z", &[elem])?;
@@ -14043,7 +14705,11 @@ fn native_hs_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     // A refusal is not the end of the road: `real_snapshot_iterator` hands back
     // the same elements through a real `Arrays$ArrayItr`, carrying the same
     // backing set so `it.remove()` still writes through (see that function).
-    let itr = match try_alloc_synthetic(ctx, "java/util/HashMap$KeyItr", MAP_KEY_ITR_NUM_FIELDS) {
+    let this_now = ctx.read_native_pin(this_pin, this);
+    let backing_now = ctx.read_native_pin(backing_pin, backing);
+    let entryset = is_entryset_kind(view_backing_kind(ctx, backing_now));
+    let carrier = key_itr_carrier_for(&*ctx, this_now, entryset);
+    let itr = match alloc_key_itr(ctx, carrier) {
         Ok(itr) => itr,
         Err(_refused) => {
             let keys_arr = ctx.read_native_pin(keys_arr_pin, keys_arr);
@@ -14058,17 +14724,18 @@ fn native_hs_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
             return real;
         }
     };
+    let base = key_itr_base(ctx, itr);
     let keys_arr = ctx.read_native_pin(keys_arr_pin, keys_arr);
     let this = ctx.read_native_pin(this_pin, this);
-    ctx.set_field(itr, MAP_KEY_ITR_FIELD_KEYS, Value::Object(Some(keys_arr)));
-    ctx.set_field(itr, MAP_KEY_ITR_FIELD_CURSOR, Value::Int(0));
-    ctx.set_field(itr, MAP_KEY_ITR_FIELD_TOTAL, Value::Int(total as i32));
+    ctx.set_field(itr, base + MAP_KEY_ITR_FIELD_KEYS, Value::Object(Some(keys_arr)));
+    ctx.set_field(itr, base + MAP_KEY_ITR_FIELD_CURSOR, Value::Int(0));
+    ctx.set_field(itr, base + MAP_KEY_ITR_FIELD_TOTAL, Value::Int(total as i32));
     // Wire backing HashSet for Iterator.remove() — without this, JDK code
     // like MXBeanSupport.findMXBeanInterface (which iterates a HashSet and
     // calls it.remove() inside the loop) throws UnsupportedOperationException
     // because dispatch falls through to the default Iterator.remove().
-    ctx.set_field(itr, MAP_KEY_ITR_FIELD_BACKING, Value::Object(Some(this)));
-    ctx.set_field(itr, MAP_KEY_ITR_FIELD_LAST_RET, Value::Int(-1));
+    ctx.set_field(itr, base + MAP_KEY_ITR_FIELD_BACKING, Value::Object(Some(this)));
+    ctx.set_field(itr, base + MAP_KEY_ITR_FIELD_LAST_RET, Value::Int(-1));
     ctx.unpin_native_roots(this_pin);
     Ok(Some(Value::Object(Some(itr))))
 }
@@ -14296,6 +14963,98 @@ const MAP_KEY_ITR_FIELD_BACKING: usize = 3;
 const MAP_KEY_ITR_FIELD_LAST_RET: usize = 4;
 const MAP_KEY_ITR_NUM_FIELDS: usize = 5;
 
+/// The classes a snapshot key/entry iterator over a HashSet-shaped receiver is
+/// minted under, alongside the historical fabricated `java/util/HashMap$KeyItr`.
+///
+/// `HashMap$KeyItr` is a name no JDK declares — the real one is
+/// `HashMap$KeyIterator` — which is both a `getClass()` divergence
+/// (`probes/ViewClassProbe`'s `lhs.iterator` row: HotSpot
+/// `java.util.LinkedHashMap$LinkedKeyIterator`, CratonVM
+/// `java.util.HashMap$KeyItr`) and the reason six `--jdk-only` strict-mode rows
+/// used to die with `NoClassDefFoundError` (see `real_snapshot_iterator`).
+///
+/// Unlike the collection carriers, these DO collide: `HashMap$HashIterator`
+/// declares `next`/`current` (references) and `expectedModCount`/`index`
+/// (ints), and this VM's five fields would land an `Int` cursor in a reference
+/// slot. So the native state goes PAST the declared fields —
+/// [`key_itr_base`] — and the object is allocated `declared + 5` wide.
+const MAP_KEY_ITR_CARRIERS: &[&str] = &[
+    "java/util/HashMap$KeyIterator",
+    "java/util/HashMap$EntryIterator",
+    "java/util/LinkedHashMap$LinkedKeyIterator",
+    "java/util/LinkedHashMap$LinkedEntryIterator",
+];
+
+/// `true` for the fabricated `HashMap$KeyItr` shape and for every
+/// [`MAP_KEY_ITR_CARRIERS`] name — i.e. every receiver whose five native
+/// iterator fields live at [`key_itr_base`].
+fn is_map_key_itr_class(name: &str) -> bool {
+    name == "java/util/HashMap$KeyItr" || MAP_KEY_ITR_CARRIERS.contains(&name)
+}
+
+/// Where this iterator's five native fields start.
+///
+/// Derived from the object's own width rather than from its class, which makes
+/// it one header read on a path (`hasNext`/`next`) that runs once per element:
+/// every mint site allocates exactly `declared + MAP_KEY_ITR_NUM_FIELDS` slots,
+/// so the base is whatever is left over. The fabricated `HashMap$KeyItr`
+/// declares nothing and lands on 0, and the legacy three-field snapshot shape
+/// (`make_fabricated_iterator_from_array`) is narrower than five and also lands
+/// on 0 — which is what keeps `n_fields > base + LAST_RET` telling the two
+/// apart, exactly as it did when the base was always zero.
+#[inline]
+fn key_itr_base(ctx: &dyn NativeContext, this: ObjectRef) -> usize {
+    ctx.object_num_fields(this)
+        .saturating_sub(MAP_KEY_ITR_NUM_FIELDS)
+}
+
+/// The iterator class a `HashSet`-shaped receiver's `iterator()` should mint,
+/// matching what HotSpot answers for that receiver.
+///
+/// `LinkedHashSet.iterator()` is `LinkedHashMap$LinkedKeyIterator` in the JDK
+/// because a `LinkedHashSet` is backed by a `LinkedHashMap`; a keySet/entrySet
+/// view follows its SOURCE map the same way. Anything else — a plain
+/// `HashSet`, a `CopyOnWriteArraySet`, a view of a map family with no iterator
+/// carrier of its own — takes the `HashMap` pair, which is what an unqualified
+/// `HashSet.iterator()` answers.
+fn key_itr_carrier_for(ctx: &dyn NativeContext, receiver: ObjectRef, entryset: bool) -> &'static str {
+    let linked = match ctx
+        .class_name_arc_of_id(ctx.class_id_of_object(receiver))
+        .as_deref()
+    {
+        Some("java/util/LinkedHashSet") => true,
+        Some(
+            "java/util/LinkedHashMap$LinkedKeySet" | "java/util/LinkedHashMap$LinkedEntrySet",
+        ) => true,
+        _ => false,
+    };
+    match (linked, entryset) {
+        (true, false) => "java/util/LinkedHashMap$LinkedKeyIterator",
+        (true, true) => "java/util/LinkedHashMap$LinkedEntryIterator",
+        (false, false) => "java/util/HashMap$KeyIterator",
+        (false, true) => "java/util/HashMap$EntryIterator",
+    }
+}
+
+/// Allocate a snapshot key/entry iterator under `carrier`, wide enough for the
+/// class's own declared fields plus this VM's five.
+///
+/// Falls back to the fabricated `java/util/HashMap$KeyItr` shape when the real
+/// class cannot be had, which is the pre-2026-08-13 behaviour and keeps a
+/// stripped image iterating rather than failing.
+fn alloc_key_itr(
+    ctx: &mut dyn NativeContext,
+    carrier: &str,
+) -> Result<ObjectRef, MethodCallFailed> {
+    if let Ok(cid) = ctx.ensure_class_initialized(carrier) {
+        if ctx.class_name_arc_of_id(cid).as_deref() == Some(carrier) {
+            let n = ctx.class_num_total_fields(cid) + MAP_KEY_ITR_NUM_FIELDS;
+            return Ok(ctx.alloc_object(cid, n));
+        }
+    }
+    try_alloc_synthetic(ctx, "java/util/HashMap$KeyItr", MAP_KEY_ITR_NUM_FIELDS)
+}
+
 fn register_iterator_natives(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
@@ -14319,25 +15078,18 @@ fn register_iterator_natives(r: &mut NativeMethodRegistry) {
         native_al_itr_remove,
     );
 
-    // HashMap$KeyItr
-    r.register(
-        "java/util/HashMap$KeyItr",
-        "hasNext",
-        "()Z",
-        native_map_key_itr_has_next,
-    );
-    r.register(
-        "java/util/HashMap$KeyItr",
-        "next",
-        "()Ljava/lang/Object;",
-        native_map_key_itr_next,
-    );
-    r.register(
-        "java/util/HashMap$KeyItr",
-        "remove",
-        "()V",
-        native_map_key_itr_remove,
-    );
+    // The fabricated `HashMap$KeyItr` shape and the real classes that replaced
+    // it as the default carrier (`MAP_KEY_ITR_CARRIERS`). The real ones need
+    // these registrations for the same reason the collection carriers do: their
+    // own JDK bodies walk `next`/`current`/`index`, which this VM's snapshot
+    // iterator never populates. Paired with the entries in
+    // `force_native_over_real_jdk_bytecode`.
+    for c in std::iter::once(&"java/util/HashMap$KeyItr").chain(MAP_KEY_ITR_CARRIERS.iter()) {
+        let c = *c;
+        r.register(c, "hasNext", "()Z", native_map_key_itr_has_next);
+        r.register(c, "next", "()Ljava/lang/Object;", native_map_key_itr_next);
+        r.register(c, "remove", "()V", native_map_key_itr_remove);
+    }
     r.set_category(__prev_cat);
 }
 
@@ -14490,11 +15242,12 @@ fn native_map_key_itr_has_next(ctx: &mut dyn NativeContext, args: &[Value]) -> M
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Int(0))),
     };
-    let cursor = match ctx.get_field(this, MAP_KEY_ITR_FIELD_CURSOR) {
+    let base = key_itr_base(ctx, this);
+    let cursor = match ctx.get_field(this, base + MAP_KEY_ITR_FIELD_CURSOR) {
         Value::Int(c) => c,
         _ => return Ok(Some(Value::Int(0))),
     };
-    let total = match ctx.get_field(this, MAP_KEY_ITR_FIELD_TOTAL) {
+    let total = match ctx.get_field(this, base + MAP_KEY_ITR_FIELD_TOTAL) {
         Value::Int(t) => t,
         _ => return Ok(Some(Value::Int(0))),
     };
@@ -14506,11 +15259,12 @@ fn native_map_key_itr_next(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
-    let cursor = match ctx.get_field(this, MAP_KEY_ITR_FIELD_CURSOR) {
+    let base = key_itr_base(ctx, this);
+    let cursor = match ctx.get_field(this, base + MAP_KEY_ITR_FIELD_CURSOR) {
         Value::Int(c) => c,
         _ => return Ok(Some(Value::Object(None))),
     };
-    let total = match ctx.get_field(this, MAP_KEY_ITR_FIELD_TOTAL) {
+    let total = match ctx.get_field(this, base + MAP_KEY_ITR_FIELD_TOTAL) {
         Value::Int(t) => t,
         _ => return Ok(Some(Value::Object(None))),
     };
@@ -14531,18 +15285,18 @@ fn native_map_key_itr_next(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
             .into(),
         );
     }
-    let keys = match ctx.get_field(this, MAP_KEY_ITR_FIELD_KEYS) {
+    let keys = match ctx.get_field(this, base + MAP_KEY_ITR_FIELD_KEYS) {
         Value::Object(Some(arr)) => arr,
         _ => return Ok(Some(Value::Object(None))),
     };
     let val = ctx.get_array_element(keys, cursor as usize);
-    ctx.set_field(this, MAP_KEY_ITR_FIELD_CURSOR, Value::Int(cursor + 1));
+    ctx.set_field(this, base + MAP_KEY_ITR_FIELD_CURSOR, Value::Int(cursor + 1));
     // Record index just returned for a subsequent Iterator.remove().
     // Iterator allocated with <5 fields (older snapshot iterators) silently
     // ignores the write because alloc_object pre-sized the field block.
     let n_fields = ctx.object_num_fields(this);
-    if n_fields > MAP_KEY_ITR_FIELD_LAST_RET {
-        ctx.set_field(this, MAP_KEY_ITR_FIELD_LAST_RET, Value::Int(cursor));
+    if n_fields > base + MAP_KEY_ITR_FIELD_LAST_RET {
+        ctx.set_field(this, base + MAP_KEY_ITR_FIELD_LAST_RET, Value::Int(cursor));
     }
     Ok(Some(val))
 }
@@ -14566,11 +15320,12 @@ fn native_map_key_itr_remove(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
     // Iterators allocated via the legacy 3-field snapshot path
     // (`make_iterator_from_array`) have no backing reference — surface
     // UnsupportedOperationException so callers see the JDK-spec behaviour.
+    let base = key_itr_base(ctx, this);
     let n_fields = ctx.object_num_fields(this);
-    if n_fields <= MAP_KEY_ITR_FIELD_LAST_RET {
+    if n_fields <= base + MAP_KEY_ITR_FIELD_LAST_RET {
         return Err(unsupported_op());
     }
-    let last_ret = match ctx.get_field(this, MAP_KEY_ITR_FIELD_LAST_RET) {
+    let last_ret = match ctx.get_field(this, base + MAP_KEY_ITR_FIELD_LAST_RET) {
         Value::Int(v) => v,
         _ => -1,
     };
@@ -14580,11 +15335,11 @@ fn native_map_key_itr_remove(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
         }
         .into());
     }
-    let backing = match ctx.get_field(this, MAP_KEY_ITR_FIELD_BACKING) {
+    let backing = match ctx.get_field(this, base + MAP_KEY_ITR_FIELD_BACKING) {
         Value::Object(Some(b)) => b,
         _ => return Err(unsupported_op()),
     };
-    let keys = match ctx.get_field(this, MAP_KEY_ITR_FIELD_KEYS) {
+    let keys = match ctx.get_field(this, base + MAP_KEY_ITR_FIELD_KEYS) {
         Value::Object(Some(a)) => a,
         _ => return Ok(None),
     };
@@ -14611,7 +15366,7 @@ fn native_map_key_itr_remove(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
     let this = ctx.read_native_pin(this_pin, this);
     ctx.unpin_native_roots(this_pin);
     let _ = removed?;
-    ctx.set_field(this, MAP_KEY_ITR_FIELD_LAST_RET, Value::Int(-1));
+    ctx.set_field(this, base + MAP_KEY_ITR_FIELD_LAST_RET, Value::Int(-1));
     Ok(None)
 }
 
@@ -16036,7 +16791,7 @@ fn ensure_collections_empty_singletons(
                     let set = try_alloc_synthetic(ctx, "java/util/HashSet", HS_NUM_FIELDS)?;
                     let inner_map = alloc_backing_map(ctx);
                     native_map_init(ctx, &[Value::Object(Some(inner_map))])?;
-                    ctx.set_field(set, HS_FIELD_MAP, Value::Object(Some(inner_map)));
+                    hs_set_backing_map(ctx, set, inner_map);
                     set
                 }
             };
@@ -17839,7 +18594,7 @@ fn make_set_of(ctx: &mut dyn NativeContext, elems: &[Value]) -> MethodCallResult
     set_map_size(ctx, backing_map, 0);
     let set = ctx.read_native_pin(set_pin, set);
     let backing_map = ctx.read_native_pin(backing_map_pin, backing_map);
-    ctx.set_field(set, HS_FIELD_MAP, Value::Object(Some(backing_map)));
+    hs_set_backing_map(ctx, set, backing_map);
 
     let sentinel = Value::Int(1);
     for (index, elem) in elems.iter().enumerate() {
@@ -21073,6 +21828,7 @@ fn native_ts_stream(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
         Some(Value::Object(Some(r))) => *r,
         _ => return make_stream(ctx, &[]),
     };
+    let this = resync_ts_view(ctx, this)?;
     let this_pin = ctx.pin_native_root(this);
     let (_, size, _) = ts_state(ctx, this);
     let stream = try_alloc_synthetic(ctx, "java/util/stream/Stream", STREAM_NUM_FIELDS)?;
@@ -29496,7 +30252,7 @@ fn native_hs_init_from_collection(ctx: &mut dyn NativeContext, args: &[Value]) -
             let this_pin = ctx.pin_native_root(this);
             let backing = alloc_hs_backing(ctx, this, MAP_DEFAULT_CAPACITY);
             let this = ctx.read_native_pin(this_pin, this);
-            ctx.set_field(this, HS_FIELD_MAP, Value::Object(Some(backing)));
+            hs_set_backing_map(ctx, this, backing);
             ctx.unpin_native_roots(this_pin);
             return Ok(None);
         }
@@ -29525,7 +30281,7 @@ fn native_hs_init_from_collection(ctx: &mut dyn NativeContext, args: &[Value]) -
     let backing = alloc_hs_backing(ctx, this, MAP_DEFAULT_CAPACITY);
     let backing_pin = ctx.pin_native_root(backing);
     let this = ctx.read_native_pin(this_pin, this);
-    ctx.set_field(this, HS_FIELD_MAP, Value::Object(Some(backing)));
+    hs_set_backing_map(ctx, this, backing);
 
     // Round 49 fix: route through `collect_collection_elements` so we
     // honour every wrapper layout (ArrayList, Arrays$ArrayList,
@@ -35100,15 +35856,16 @@ fn native_lhm_entry_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     let mut this = this;
     let flat: Vec<Value> = pairs.iter().flat_map(|(k, v)| [*k, *v]).collect();
     let (flat_base, flat_pins) = pin_value_slice(ctx, &flat);
+    let carrier = set_view_carrier_for(&*ctx, this, VIEW_KIND_ENTRYSET);
     let mut set = rooted_across(ctx, &mut [&mut this], |ctx| {
-        try_alloc_synthetic(ctx, "java/util/HashSet", HS_NUM_FIELDS)
+        alloc_set_view_carrier(ctx, carrier)
     })?;
     let cap = std::cmp::max(pairs.len().next_power_of_two(), MAP_DEFAULT_CAPACITY);
     let this_at_call = this;
     let mut backing_map = rooted_across(ctx, &mut [&mut this, &mut set], |ctx| {
         alloc_view_backing(ctx, this_at_call, VIEW_KIND_ENTRYSET, cap)
     })?;
-    ctx.set_field(set, HS_FIELD_MAP, Value::Object(Some(backing_map)));
+    hs_set_backing_map(ctx, set, backing_map);
     for i in 0..pairs.len() {
         let mut entry_obj =
             rooted_across(ctx, &mut [&mut this, &mut set, &mut backing_map], |ctx| {
@@ -37755,8 +38512,21 @@ fn collect_collection_elements(ctx: &mut dyn NativeContext, coll: ObjectRef) -> 
         .class_id_by_name("java/util/HashSet")
         .map(|hs| cid == hs || ctx.is_subclass(cid, hs))
         .unwrap_or(false);
-    if is_hashset_like && HS_FIELD_MAP < n_fields {
-        if let Value::Object(Some(backing)) = ctx.get_field(coll, HS_FIELD_MAP) {
+    // A keySet/entrySet view is HashSet-shaped but is NOT a `HashSet` subclass
+    // since it got its own carrier class (`SET_VIEW_CARRIERS`), and it keeps
+    // its backing past its declared fields rather than at slot 0. The gate
+    // above is about not mistaking an arbitrary `Set` with a `HashMap` in slot
+    // 0 for a HashSet; a carrier is not arbitrary, so it is admitted by name.
+    let backing_slot = if is_hashset_like {
+        Some(HS_FIELD_MAP)
+    } else {
+        match ctx.class_name_arc_of_id(cid).as_deref() {
+            Some(n) if is_set_view_carrier(n) => Some(ctx.class_num_total_fields(cid)),
+            _ => None,
+        }
+    };
+    if backing_slot.is_some_and(|s| s < n_fields) {
+        if let Value::Object(Some(backing)) = ctx.get_field(coll, backing_slot.unwrap()) {
             // An insertion-ordered set (LinkedHashSet / CopyOnWriteArraySet) is
             // backed by a LinkedHashMap, which keeps its entries in the
             // insertion-order overlay rather than the bucket array — so the
@@ -38340,6 +39110,25 @@ fn native_snapshot_itr_has_next(ctx: &mut dyn NativeContext, args: &[Value]) -> 
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Int(0))),
     };
+    // A key/entry-iterator carrier keeps its snapshot at `key_itr_base`, not at
+    // slot 0 — slot 0 there is the JDK class's own `next` field. Route it to the
+    // dedicated native; without this the array probe below misses and the
+    // iterator falls through to the real-bytecode arm, which walks a `next`
+    // chain nothing populated and reports every collection exhausted.
+    //
+    // Gated on the object's WIDTH, not its class name: this native is the
+    // per-element `hasNext` of every snapshot iterator in the VM, and a name
+    // lookup here would be paid by all of them. Only a carrier is wider than
+    // the five native fields (see `key_itr_base`), so a base of 0 — the
+    // fabricated `HashMap$KeyItr` and the legacy three-field shape — keeps
+    // reading slot 0 exactly as before.
+    if key_itr_base(ctx, this) > 0 {
+        let cid = ctx.class_id_of_object(this);
+        let cn = ctx.class_name_of_id(cid).unwrap_or_default();
+        if is_map_key_itr_class(&cn) {
+            return native_map_key_itr_has_next(ctx, args);
+        }
+    }
     let arr = match ctx.get_field(this, 0) {
         Value::Object(Some(r)) if ctx.heap_kind_of(r) == ObjectKind::Array => r,
         _ => {
@@ -38448,7 +39237,7 @@ fn native_snapshot_itr_next(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     // otherwise it.remove() throws spurious IllegalStateException.
     let cid = ctx.class_id_of_object(this);
     let cn = ctx.class_name_of_id(cid).unwrap_or_default();
-    if cn == "java/util/HashMap$KeyItr" {
+    if is_map_key_itr_class(&cn) {
         return native_map_key_itr_next(ctx, args);
     }
     // Real-JDK fallback: see `native_snapshot_itr_has_next` doc comment.
@@ -42519,7 +43308,18 @@ fn native_tm_key_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     // collect, moving both `this` and every key still held only in `pairs`.
     let this_pin = ctx.pin_native_root(this);
     let pinned_pairs = PinnedPairs::new(ctx, &pairs);
-    let ts = try_alloc_declared_width(ctx, "java/util/TreeSet", TS_NUM_FIELDS)?;
+    // The carrier is `java/util/TreeMap$KeySet` — what HotSpot's
+    // `treeMap.keySet().getClass()` answers — falling back to `java/util/TreeSet`
+    // when that class cannot be had. Nothing about the view's STATE depends on
+    // the choice: a native TreeSet keeps `(data, size, comparator)` in the
+    // `ts_array_table` side-table keyed on the object, never in its fields, so
+    // the carrier's own declared `m` slot is neither read nor written. What the
+    // choice does need is the `native_ts_*` family registered on the carrier
+    // (`register_tree_set_natives`) and the name in both force-native gates.
+    let ts = match try_alloc_declared_width(ctx, "java/util/TreeMap$KeySet", TS_NUM_FIELDS) {
+        Ok(o) => o,
+        Err(_) => try_alloc_declared_width(ctx, "java/util/TreeSet", TS_NUM_FIELDS)?,
+    };
     // Reserve one extra trailing slot and stash the source TreeMap there so the
     // keySet view writes through (`keySet().remove` / `iterator().remove`).
     // The slot lives beyond the logical size, so sorted iteration / binary
@@ -43568,6 +44368,7 @@ fn native_ts_contains(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         _ => return Ok(Some(Value::Int(0))),
     };
     let elem = args.get(1).copied().unwrap_or(Value::Object(None));
+    let this = resync_ts_view(ctx, this)?;
     let (data_opt, size, comparator) = ts_state(ctx, this);
     // W7-36 residual: `TreeSet.contains` is `m.containsKey(o)`, i.e. the same
     // `getEntry` null-check + `Comparable` checkcast `native_ts_add` already
@@ -43590,6 +44391,7 @@ fn native_ts_size(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Int(0))),
     };
+    let this = resync_ts_view(ctx, this)?;
     let size = match ts_get_slot(ctx, this, TS_FIELD_SIZE) {
         Value::Int(v) => v,
         _ => 0,
@@ -43733,6 +44535,7 @@ fn native_ts_is_empty(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Int(1))),
     };
+    let this = resync_ts_view(ctx, this)?;
     let size = match ts_get_slot(ctx, this, TS_FIELD_SIZE) {
         Value::Int(v) => v,
         _ => 0,
@@ -43774,6 +44577,7 @@ fn native_ts_first(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
             )
         }
     };
+    let this = resync_ts_view(ctx, this)?;
     let (data_opt, size, _) = ts_state(ctx, this);
     // Treat a None backing array as empty rather than panicking on `unwrap`.
     let data = match data_opt {
@@ -43802,6 +44606,7 @@ fn native_ts_last(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
             )
         }
     };
+    let this = resync_ts_view(ctx, this)?;
     let (data_opt, size, _) = ts_state(ctx, this);
     // Treat a None backing array as empty rather than panicking on `unwrap`.
     let data = match data_opt {
@@ -43944,6 +44749,7 @@ fn native_ts_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
+    let this = resync_ts_view(ctx, this)?;
     let (data_opt, size, _) = ts_state(ctx, this);
     // GC-safety: both allocations below collect; `this`, the backing data array
     // and the snapshot are bare Rust locals used afterwards. See `rooted_across`.
@@ -44102,6 +44908,7 @@ fn native_ts_for_each(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(None),
     };
+    let this = resync_ts_view(ctx, this)?;
     let (data_opt, size, _) = ts_state(ctx, this);
     let data = match data_opt {
         Some(d) => d,
@@ -44135,6 +44942,7 @@ fn native_ts_to_array(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
+    let this = resync_ts_view(ctx, this)?;
     let (data_opt, size, _) = ts_state(ctx, this);
     // cceres3: `data` spans the result-array allocation — pin + re-read.
     let data_pin = data_opt.map(|d| ctx.pin_native_root(d));
@@ -44155,6 +44963,7 @@ fn native_ts_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
+    let this = resync_ts_view(ctx, this)?;
     let (data_opt, size, _) = ts_state(ctx, this);
     let mut buf = String::from("[");
     if let Some(data) = data_opt {
@@ -44619,6 +45428,7 @@ fn native_ts_descending_iterator(ctx: &mut dyn NativeContext, args: &[Value]) ->
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
+    let this = resync_ts_view(ctx, this)?;
     let (data_opt, size, _) = ts_state(ctx, this);
     let n = size as usize;
     // GC-safety: see `native_ts_iterator`.
@@ -45191,140 +46001,149 @@ fn register_tree_map_natives(registry: &mut NativeMethodRegistry) {
 fn register_tree_set_natives(registry: &mut NativeMethodRegistry) {
     let __prev_cat = registry.current_category();
     registry.set_category(cratonvm_native_api::NativeKind::Bridge);
-    let c = "java/util/TreeSet";
-    registry.register(c, "<init>", "()V", native_ts_init);
-    registry.register(
-        c,
-        "<init>",
-        "(Ljava/util/Comparator;)V",
-        native_ts_init_comparator,
-    );
-    registry.register(
-        c,
-        "<init>",
-        "(Ljava/util/Collection;)V",
-        native_ts_init_collection,
-    );
-    registry.register(c, "add", "(Ljava/lang/Object;)Z", native_ts_add);
-    registry.register(c, "remove", "(Ljava/lang/Object;)Z", native_ts_remove);
-    // Serialization: drive the stream from `ts_state` so a native TreeSet
-    // round-trips byte-correct (the inherited real methods go through the
-    // never-populated backing `m` TreeMap → an empty set).
-    registry.register(
-        c,
-        "writeObject",
-        "(Ljava/io/ObjectOutputStream;)V",
-        native_ts_write_object,
-    );
-    registry.register(
-        c,
-        "readObject",
-        "(Ljava/io/ObjectInputStream;)V",
-        native_ts_read_object,
-    );
-    registry.register(c, "contains", "(Ljava/lang/Object;)Z", native_ts_contains);
-    registry.register(c, "size", "()I", native_ts_size);
-    registry.register(c, "isEmpty", "()Z", native_ts_is_empty);
-    registry.register(c, "clear", "()V", native_ts_clear);
-    registry.register(c, "first", "()Ljava/lang/Object;", native_ts_first);
-    registry.register(c, "last", "()Ljava/lang/Object;", native_ts_last);
-    registry.register(
-        c,
-        "ceiling",
-        "(Ljava/lang/Object;)Ljava/lang/Object;",
-        native_ts_ceiling,
-    );
-    registry.register(
-        c,
-        "floor",
-        "(Ljava/lang/Object;)Ljava/lang/Object;",
-        native_ts_floor,
-    );
-    registry.register(
-        c,
-        "higher",
-        "(Ljava/lang/Object;)Ljava/lang/Object;",
-        native_ts_higher,
-    );
-    registry.register(
-        c,
-        "lower",
-        "(Ljava/lang/Object;)Ljava/lang/Object;",
-        native_ts_lower,
-    );
-    registry.register(c, "iterator", "()Ljava/util/Iterator;", native_ts_iterator);
-    registry.register(
-        c,
-        "forEach",
-        "(Ljava/util/function/Consumer;)V",
-        native_ts_for_each,
-    );
-    registry.register(c, "toArray", "()[Ljava/lang/Object;", native_ts_to_array);
-    registry.register(c, "toString", "()Ljava/lang/String;", native_ts_to_string);
-    registry.register(
-        c,
-        "comparator",
-        "()Ljava/util/Comparator;",
-        native_ts_comparator,
-    );
-    registry.register(
-        c,
-        "headSet",
-        "(Ljava/lang/Object;)Ljava/util/SortedSet;",
-        native_ts_head_set,
-    );
-    registry.register(
-        c,
-        "tailSet",
-        "(Ljava/lang/Object;)Ljava/util/SortedSet;",
-        native_ts_tail_set,
-    );
-    registry.register(
-        c,
-        "subSet",
-        "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/util/SortedSet;",
-        native_ts_sub_set,
-    );
-    // NavigableSet range views (inclusive flags). The inherited bytecode reads
-    // the never-populated backing `m` TreeMap and NPEs; drive them from the
-    // side-table. (PMRPR's jar-entry scan calls `tailSet(entry, false)`.)
-    registry.register(
-        c,
-        "tailSet",
-        "(Ljava/lang/Object;Z)Ljava/util/NavigableSet;",
-        native_ts_tail_set_inclusive,
-    );
-    registry.register(
-        c,
-        "headSet",
-        "(Ljava/lang/Object;Z)Ljava/util/NavigableSet;",
-        native_ts_head_set_inclusive,
-    );
-    registry.register(
-        c,
-        "subSet",
-        "(Ljava/lang/Object;ZLjava/lang/Object;Z)Ljava/util/NavigableSet;",
-        native_ts_sub_set_inclusive,
-    );
-    registry.register(c, "addAll", "(Ljava/util/Collection;)Z", native_ts_add_all);
-    registry.register(c, "stream", "()Ljava/util/stream/Stream;", native_ts_stream);
-    // Descending/poll views — read the backing `m` TreeMap in real JDK, which
-    // CratonVM's native TreeSet never populates (state lives in the side-table),
-    // so the inherited bytecode NPEs on a null `m`. Drive them from `ts_state`.
-    registry.register(
-        c,
-        "descendingIterator",
-        "()Ljava/util/Iterator;",
-        native_ts_descending_iterator,
-    );
-    registry.register(
-        c,
-        "descendingSet",
-        "()Ljava/util/NavigableSet;",
-        native_ts_descending_set,
-    );
-    registry.register(c, "pollFirst", "()Ljava/lang/Object;", native_ts_poll_first);
-    registry.register(c, "pollLast", "()Ljava/lang/Object;", native_ts_poll_last);
+    // Every registration below is mirrored onto `java/util/TreeMap$KeySet`, the
+    // class `native_tm_key_set` mints a TreeMap keySet view under since
+    // 2026-08-13 (HotSpot: `treeMap.keySet().getClass()` is
+    // `java.util.TreeMap$KeySet`, not `java.util.TreeSet`). The view is a
+    // TreeSet-SHAPED object under its own class — its state is in the
+    // `ts_array_table` side-table, not in fields — so it needs the identical
+    // native surface, and `force_native_over_real_jdk_bytecode` carries the name
+    // so the JDK's own `KeySet` bodies (which read `m`, null here) never run.
+    for c in ["java/util/TreeSet", "java/util/TreeMap$KeySet"] {
+        registry.register(c, "<init>", "()V", native_ts_init);
+        registry.register(
+            c,
+            "<init>",
+            "(Ljava/util/Comparator;)V",
+            native_ts_init_comparator,
+        );
+        registry.register(
+            c,
+            "<init>",
+            "(Ljava/util/Collection;)V",
+            native_ts_init_collection,
+        );
+        registry.register(c, "add", "(Ljava/lang/Object;)Z", native_ts_add);
+        registry.register(c, "remove", "(Ljava/lang/Object;)Z", native_ts_remove);
+        // Serialization: drive the stream from `ts_state` so a native TreeSet
+        // round-trips byte-correct (the inherited real methods go through the
+        // never-populated backing `m` TreeMap → an empty set).
+        registry.register(
+            c,
+            "writeObject",
+            "(Ljava/io/ObjectOutputStream;)V",
+            native_ts_write_object,
+        );
+        registry.register(
+            c,
+            "readObject",
+            "(Ljava/io/ObjectInputStream;)V",
+            native_ts_read_object,
+        );
+        registry.register(c, "contains", "(Ljava/lang/Object;)Z", native_ts_contains);
+        registry.register(c, "size", "()I", native_ts_size);
+        registry.register(c, "isEmpty", "()Z", native_ts_is_empty);
+        registry.register(c, "clear", "()V", native_ts_clear);
+        registry.register(c, "first", "()Ljava/lang/Object;", native_ts_first);
+        registry.register(c, "last", "()Ljava/lang/Object;", native_ts_last);
+        registry.register(
+            c,
+            "ceiling",
+            "(Ljava/lang/Object;)Ljava/lang/Object;",
+            native_ts_ceiling,
+        );
+        registry.register(
+            c,
+            "floor",
+            "(Ljava/lang/Object;)Ljava/lang/Object;",
+            native_ts_floor,
+        );
+        registry.register(
+            c,
+            "higher",
+            "(Ljava/lang/Object;)Ljava/lang/Object;",
+            native_ts_higher,
+        );
+        registry.register(
+            c,
+            "lower",
+            "(Ljava/lang/Object;)Ljava/lang/Object;",
+            native_ts_lower,
+        );
+        registry.register(c, "iterator", "()Ljava/util/Iterator;", native_ts_iterator);
+        registry.register(
+            c,
+            "forEach",
+            "(Ljava/util/function/Consumer;)V",
+            native_ts_for_each,
+        );
+        registry.register(c, "toArray", "()[Ljava/lang/Object;", native_ts_to_array);
+        registry.register(c, "toString", "()Ljava/lang/String;", native_ts_to_string);
+        registry.register(
+            c,
+            "comparator",
+            "()Ljava/util/Comparator;",
+            native_ts_comparator,
+        );
+        registry.register(
+            c,
+            "headSet",
+            "(Ljava/lang/Object;)Ljava/util/SortedSet;",
+            native_ts_head_set,
+        );
+        registry.register(
+            c,
+            "tailSet",
+            "(Ljava/lang/Object;)Ljava/util/SortedSet;",
+            native_ts_tail_set,
+        );
+        registry.register(
+            c,
+            "subSet",
+            "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/util/SortedSet;",
+            native_ts_sub_set,
+        );
+        // NavigableSet range views (inclusive flags). The inherited bytecode reads
+        // the never-populated backing `m` TreeMap and NPEs; drive them from the
+        // side-table. (PMRPR's jar-entry scan calls `tailSet(entry, false)`.)
+        registry.register(
+            c,
+            "tailSet",
+            "(Ljava/lang/Object;Z)Ljava/util/NavigableSet;",
+            native_ts_tail_set_inclusive,
+        );
+        registry.register(
+            c,
+            "headSet",
+            "(Ljava/lang/Object;Z)Ljava/util/NavigableSet;",
+            native_ts_head_set_inclusive,
+        );
+        registry.register(
+            c,
+            "subSet",
+            "(Ljava/lang/Object;ZLjava/lang/Object;Z)Ljava/util/NavigableSet;",
+            native_ts_sub_set_inclusive,
+        );
+        registry.register(c, "addAll", "(Ljava/util/Collection;)Z", native_ts_add_all);
+        registry.register(c, "stream", "()Ljava/util/stream/Stream;", native_ts_stream);
+        // Descending/poll views — read the backing `m` TreeMap in real JDK, which
+        // CratonVM's native TreeSet never populates (state lives in the side-table),
+        // so the inherited bytecode NPEs on a null `m`. Drive them from `ts_state`.
+        registry.register(
+            c,
+            "descendingIterator",
+            "()Ljava/util/Iterator;",
+            native_ts_descending_iterator,
+        );
+        registry.register(
+            c,
+            "descendingSet",
+            "()Ljava/util/NavigableSet;",
+            native_ts_descending_set,
+        );
+        registry.register(c, "pollFirst", "()Ljava/lang/Object;", native_ts_poll_first);
+        registry.register(c, "pollLast", "()Ljava/lang/Object;", native_ts_poll_last);
+    }
 
     // TreeSet iterator
     let ti = "java/util/TreeSet$Itr";
@@ -47634,12 +48453,13 @@ fn native_chm_entry_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     } else {
         elem_base
     };
-    // Build a HashSet of Map.Entry objects. Each entry must be a real
-    // `java/util/Map$Entry` (not raw Object cid=0) so user-bytecode
+    // Build an entrySet carrier holding Map.Entry objects. Each entry must be a
+    // real `java/util/Map$Entry` (not raw Object cid=0) so user-bytecode
     // `checkcast Map$Entry` succeeds after iterating entrySet() — see
     // Spring DefaultSingletonBeanRegistry.destroyBean iterating the
     // dependentBeanMap (a ConcurrentHashMap) entrySet.
-    let set = try_alloc_synthetic(ctx, "java/util/HashSet", HS_NUM_FIELDS)?;
+    let carrier = set_view_carrier_for(&*ctx, this, VIEW_KIND_ENTRYSET);
+    let set = alloc_set_view_carrier(ctx, carrier)?;
     let set_pin = ctx.pin_native_root(set);
     let cap = std::cmp::max(entries.len().next_power_of_two(), MAP_DEFAULT_CAPACITY);
     // Live entrySet view: back the HashSet with a view-backing that remembers the
@@ -47661,7 +48481,7 @@ fn native_chm_entry_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     let backing = alloc_view_backing(ctx, this_now, VIEW_KIND_ENTRYSET, cap)?;
     let backing_pin = ctx.pin_native_root(backing);
     let set_now = ctx.read_native_pin(set_pin, set);
-    ctx.set_field(set_now, HS_FIELD_MAP, Value::Object(Some(backing)));
+    hs_set_backing_map(ctx, set_now, backing);
     // cceres5: `alloc_live_entry`/`map_alloc_node` below can move the raw
     // snapshot refs still pending in `entries` (and `set`/`backing`/`this`
     // themselves); pin + re-read everything (see make_static_entry_set).
@@ -52417,7 +53237,7 @@ fn native_collections_empty_set(ctx: &mut dyn NativeContext, _args: &[Value]) ->
     let set = try_alloc_synthetic(ctx, "java/util/HashSet", HS_NUM_FIELDS)?;
     let inner_map = alloc_backing_map(ctx);
     native_map_init(ctx, &[Value::Object(Some(inner_map))])?;
-    ctx.set_field(set, HS_FIELD_MAP, Value::Object(Some(inner_map)));
+    hs_set_backing_map(ctx, set, inner_map);
     Ok(Some(Value::Object(Some(set))))
 }
 
@@ -52441,7 +53261,7 @@ fn native_collections_singleton(ctx: &mut dyn NativeContext, args: &[Value]) -> 
     let set = try_alloc_synthetic(ctx, "java/util/HashSet", HS_NUM_FIELDS)?;
     let inner_map = alloc_backing_map(ctx);
     native_map_init(ctx, &[Value::Object(Some(inner_map))])?;
-    ctx.set_field(set, HS_FIELD_MAP, Value::Object(Some(inner_map)));
+    hs_set_backing_map(ctx, set, inner_map);
     // Add elem
     native_map_put(
         ctx,
@@ -53910,8 +54730,13 @@ fn native_itr_remove_noop(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
     if let Some(Value::Object(Some(this))) = args.first().copied() {
         let cid = ctx.class_id_of_object(this);
         let cn = ctx.class_name_of_id(cid).unwrap_or_default();
+        // The fabricated `HashMap$KeyItr` and the real classes that replaced it
+        // (`MAP_KEY_ITR_CARRIERS`) share one body — asked by name, not by a
+        // literal, so a new carrier cannot be added without this route seeing it.
+        if is_map_key_itr_class(&cn) {
+            return native_map_key_itr_remove(ctx, args);
+        }
         match cn.as_str() {
-            "java/util/HashMap$KeyItr" => return native_map_key_itr_remove(ctx, args),
             "java/util/ArrayList$Itr" | "java/util/ArrayList$ListItr" => {
                 return native_al_itr_remove(ctx, args);
             }
