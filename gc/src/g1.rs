@@ -3083,9 +3083,11 @@ impl G1Collector {
         self.dbg_scan_for_zeroed_refs(&regions, &cset_set, roots);
         self.dbg_verify_reachable_integrity(&regions, roots, "young-serial");
 
-        // Young and mixed evacuation leave humongous spans in place. Their
-        // reachability is decided by the concurrent-mark cleanup phase, which
-        // can see the whole heap and reclaims unmarked, unpinned spans there.
+        // Young and mixed evacuation leave humongous spans IN PLACE — they are
+        // never evacuated — but they are no longer left ALIVE unconditionally:
+        // `eager_reclaim_humongous_locked` above frees any span this pause can
+        // prove nothing references. Anything it declines to judge falls through
+        // to the concurrent-mark cleanup phase as before.
 
         // Reset current eden if it was in the CSet
         let cur_eden = self.current_eden.load(Ordering::Relaxed);
@@ -5357,12 +5359,22 @@ impl G1Collector {
         pointer_map: &cratonvm_types::PointerMap,
     ) -> HumongousCensus {
         let mut census = HumongousCensus::default();
+        let rewrite = !pointer_map.is_empty();
         // An empty forwarding map means nothing moved, so there is nothing to
         // rewrite — but the census still has to be taken, because "no object was
         // copied this pause" says nothing at all about whether a humongous span
-        // is dead. The walk below therefore runs either way; only the per-object
-        // *rewrite* is skipped.
-        let rewrite = !pointer_map.is_empty();
+        // is dead. So the walk runs either way when eager reclaim is on, with
+        // only the per-object *rewrite* skipped.
+        //
+        // When it is OFF, nothing consumes the census and this reverts exactly
+        // to the previous behaviour — return immediately, walk nothing. That
+        // keeps `CRATONVM_G1_EAGER_HUMONGOUS=0` a COMPLETE off-switch for this
+        // feature rather than one that leaves the extra walk running, which is
+        // what a bisection lever has to be to be worth anything.
+        let want_census = gc_flags().g1_eager_humongous;
+        if !rewrite && !want_census {
+            return census;
+        }
 
         // RSet rebuild (CORRECTNESS — remembered-set completeness for GC-internal
         // pointer rewrites). An edge whose holder and referent are collected
@@ -5483,7 +5495,7 @@ impl G1Collector {
                     obj_ptr,
                     header,
                     &mut new_rset_edges,
-                    &mut census,
+                    want_census.then_some(&mut census),
                 );
                 offset += obj_size;
             }
@@ -5499,7 +5511,7 @@ impl G1Collector {
                 .add_reference_in_generation(source_region, generation);
         }
 
-        census.complete = !walk_aborted;
+        census.complete = want_census && !walk_aborted;
         census
     }
 
@@ -5524,7 +5536,7 @@ impl G1Collector {
         obj_ptr: *mut u8,
         header: &ObjectHeader,
         out: &mut Vec<(usize, usize)>,
-        census: &mut HumongousCensus,
+        mut census: Option<&mut HumongousCensus>,
     ) {
         let holder_span = humongous_span_start(regions, holder).unwrap_or(holder);
         let mut note = |target: usize| {
@@ -5536,7 +5548,9 @@ impl G1Collector {
                 // self-referential dead object must not be its own reason to
                 // survive.
                 if span != holder_span {
-                    census.referenced.insert(span);
+                    if let Some(c) = census.as_mut() {
+                        c.referenced.insert(span);
+                    }
                 }
             } else if target != holder && is_collectable_region_type(regions[target].region_type) {
                 out.push((target, holder));
@@ -7601,10 +7615,16 @@ impl G1Collector {
 
     /// Reclaim dead humongous spans after a mark cycle.
     ///
-    /// Young and mixed evacuation cannot infer humongous reachability from a
-    /// partial collection set. Cleanup runs after whole-heap marking, so an
-    /// unmarked `HumongousStart` with no pinned slice is safe to recycle along
-    /// with each contiguous continuation region.
+    /// Cleanup runs after whole-heap marking, so an unmarked `HumongousStart`
+    /// with no pinned slice is safe to recycle along with each contiguous
+    /// continuation region.
+    ///
+    /// This is no longer the only humongous reclaimer: since 2026-08-13
+    /// evacuation pauses run [`Self::eager_reclaim_humongous_locked`], which
+    /// reaches the same conclusion from the Phase-4 reference walk instead of
+    /// the bitmap. The two are complementary rather than redundant — this one
+    /// works during a mark cycle and after an evacuation failure, which are
+    /// exactly the cases the pause path refuses.
     fn reclaim_dead_humongous_spans_locked(&self, regions: &mut [G1Region]) -> usize {
         let region_size = self.config.region_size;
         if region_size == 0 {

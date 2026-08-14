@@ -36,6 +36,8 @@ which this change does not own; they are written out verbatim in §8.
 | **G1-7** | No G1 pause stated its own decision anywhere. Every fail-safe G1 takes — kept regions after evacuation failure, a wedged drain, an abandoned mark closure, a CSet emptied by pins — silently changes what the pause reclaims, and none was visible outside a debug build. | Observability | **Fixed** — `gc_metrics::record_g1_cycle` / the `[GC] g1 cycle #N:` line in `collector_decision_report()`. |
 | **G1-8** | The remembered set is *additive* and its only pruning is `cleanup`'s Free-source pass. A source region recycled into a live type is re-walked **wholesale**, resurrecting its dead objects' referents. | Medium (over-retention, not unsoundness) | **Fixed** (G1AUD-5) — an rset entry is now `(source_index, generation)` rather than a bare source index. `G1Region::recycled_in_generation` records when a region was last reset, `rset_cache_epoch` doubles as the monotone reclassification clock, and an entry is dead exactly when `stamp < source.recycled_in_generation`. Both the scan side (`live_rset_sources`) and `cleanup` (`retain_sources_in_generation`) now ask that sharper question instead of "is the source Free *right now*". Entries recorded without a generation get `RSET_GENERATION_PINNED` (`u64::MAX`) and are never aged out — over-retain rather than under-scan. The staleness test is a strict `<`, so an edge recorded in the same generation that later resets the source survives one extra cycle, again in the fail-safe direction. |
 | **G1-9** | The parallel young evacuator's object scan ignored compact field layouts, so a compact object's reference fields were never visited: its referents were not evacuated and its slots were not rewritten, and Phase 5 then freed the region they pointed into. | **Critical** (live-object loss / UAF under `CRATONVM_GC=g1-parallel-evac`) | **Fixed** 2026-08-13. `SharedEvac::process_object` and `seed_source_region` strode `HEADER_SIZE + slot_idx * SLOT_SIZE` over `num_slots()`, i.e. assumed the legacy uniform 16-byte cell body for every object, while every other reference walk in `g1.rs` — the serial evacuator, the Phase-4 remap, the mark scan, this audit's own V7b verifier — goes through `for_each_flat_object_reference`, which dispatches on `is_compact_object` and walks the registered `CompactLayout::field_offsets`. Both scans now do the same. Two corrections to this row's previous wording, both load-bearing for anyone re-reading the history: the defect was **not non-deterministic** (10/10 runs, and identical at `CRATONVM_G1_WORKERS=1`) and it was **not a race** — chasing it as a CAS race is why it stayed open. `num_slots()` is the hierarchy-wide field count, so the old stride also addressed 320 bytes of a 19-field compact object that occupies 152, reading and — on a decode that happened to look like `Value::Object` — writing past it. The G1AUD-6 source-set divergence recorded below was real and is still fixed, but it was **not** this. Regression: `parallel_evacuation_scans_compact_object_reference_fields`, which registers a `CompactLayout` with references at packed offsets and fails on the pre-fix scan — the coverage gap that hid this, since every other gc unit test allocates with no layout registered and is therefore legacy-layout, for which the old stride was accidentally correct. |
+| **G1-10** | Humongous spans were reclaimed by `cleanup` and nothing else, so humongous garbage survived until a concurrent mark cycle happened to fire. On a heap sized for the live set, IHOP may never be crossed and the answer is "never". | Medium (over-retention, not unsoundness) | **Fixed** 2026-08-13 — `eager_reclaim_humongous_locked` runs after Phase 5 of every young/mixed pause and frees any span neither a root nor the Phase-4 reference walk reaches. See §4 for the gates and for the ordering trap (asking the *remembered set* here frees a live span, because the pause has just recycled the Eden region its only entry names). `CRATONVM_G1_EAGER_HUMONGOUS=0` restores the old behaviour. |
+| **G1-11** | Under `-XX:+UseG1GC` with the **JIT warm** and a heap tight enough to force sustained collection, the VM takes `EXCEPTION_ACCESS_VIOLATION` reading one page past a heap arena boundary (`read at address 0x…010000`), then reports "thread 'main-vm' has overflowed its stack". | **Critical** (memory unsafety under `-XX:+UseG1GC`) | **OPEN — not this branch's.** Found by finally running §9 item 8 (below). Reproduces with every G1 flag this branch added turned off (`CRATONVM_G1_EAGER_HUMONGOUS=0 CRATONVM_G1_PARALLEL_EVAC=0 CRATONVM_G1_RSET_SOURCE_CAP=0`), so it is not attributable to the parallel evacuator, the worker pool, the eager humongous reclaim or the rset bound — though it was NOT bisected against a `dev` build, so "pre-existing" is an inference from the flag arms, not a measurement. Repro and the four discriminating arms are in item 8. |
 
 Nothing in G1's SATB **pre**-write barrier was found missing on the paths this
 crate owns, and — contrary to the hypothesis this audit started from — the JIT
@@ -405,7 +407,7 @@ conservative whole-heap rescan recovers their subtrees).
 | I-9 | An unevacuable object is self-forwarded, never dropped | identity forward + kept region | `g1.rs:3756`, `:1895` | `evacuation_failure_self_forwards_and_keeps_the_region` | **holds** |
 | I-10 | An evacuation destination is never in the CSet | `alloc_in_type_locked` filter | `g1.rs:1851` | type-level (`&mut Vec<G1Region>` ⇒ lock held) + the test above | **holds** |
 | I-11 | A humongous span is contiguous: Start(cursor=size) + Continuations(cursor=0) | `alloc_humongous_locked` | `g1.rs:1800-1805` | `a_humongous_span_is_a_contiguous_start_plus_continuations` | **holds** |
-| I-12 | A humongous span is freed only after whole-heap marking, and only if its shape validates | `cleanup` → `reclaim_dead_humongous_spans_locked` | `g1.rs:6126`, shape check `:6163` | `cleanup_with_an_undrained_gray_set_also_spares_humongous_spans` | **holds** |
+| I-12 | A humongous span is freed only against a liveness answer that covers the whole heap, and only if its shape validates | `cleanup` → `reclaim_dead_humongous_spans_locked`; `eager_reclaim_humongous_locked` after Phase 5 | shape check shared by both | `cleanup_with_an_undrained_gray_set_also_spares_humongous_spans`, `a_humongous_span_held_only_by_an_evacuated_young_object_survives` | **holds** — restated 2026-08-13. It used to read "only after whole-heap marking", which stopped being true when evacuation pauses learned to reclaim. The mark bitmap is one way to get a whole-heap answer; the Phase-4 walk plus roots, taken after Phase 5 has freed the CSet, is another. What must not weaken is the *coverage*, which is why the pause path declines outright on an aborted walk, an open mark cycle, a pending finalizer, or an evacuation failure. |
 | I-13 | A pinned region is never in a collection set | six CSet filters | `g1.rs:2332`, `:2787`, `:2812`, `:3388`, `:3516`, `:2708` | `debug_assert!` on the young and mixed CSets; `a_pinned_region_is_never_evacuated` | **holds** |
 | I-14 | Pins are refcounted and cannot underflow | `saturating_add/sub` | `g1.rs:6014`, `:6027` | `overlapping_pins_release_independently` | **holds** |
 | I-15 | `cleanup` frees in place only on a complete closure | retain-all fail-safe | `g1.rs` `G1AUD-3` | `cleanup_frees_a_zero_live_old_region_when_the_closure_is_complete` + `..._with_an_undrained_gray_set_retains_every_region` | **fixed** |
@@ -529,17 +531,42 @@ Ordered. Each item is a precondition for the next being meaningful.
    runs a real collection because reading a coarsened set as the empty set it
    physically contains would drop exactly the objects the rset exists to find.
    `rset_coarsened` counts it.
-   The MEASUREMENT half is not done, and the reason is now specific rather than
-   "nobody ran it". Two blockers, one removed: `record_heap_occupancy` had a
-   single caller in the tree (`GenerationalHeap`), so under G1 the DENOMINATOR
-   was never published and every per-live-byte ratio was structurally zero — G1
-   publishes it now (`live_bytes=1445440` on a real run). The numerator is
-   published from `cleanup`, so a reading needs a workload that completes a
-   concurrent mark cycle AND has old→young edges to record. The churn probe
-   used here is the wrong shape: 120 iterations at 16 MiB produced 21 pauses,
-   all `kind=young`, every one reporting `rset_sources=0`, because its live set
-   never ages into Old. A deep retained tree (binarytrees-shaped) is what would
-   produce the number.
+   **MEASUREMENT: DONE 2026-08-13.** `rset_bytes_per_live_byte = 0.000034` —
+   176 bytes of remembered set against 5,113,280 bytes live, i.e. **one rset
+   byte per ~29 KiB of live data**. Three orders of magnitude below anything
+   that would argue for replacing region-granular sets with a card table, and
+   the coarsening bound above is confirmed as insurance for the O(regions²)
+   ceiling rather than as relief from present pressure.
+
+   Getting a reading took a purpose-built probe (`apps/g1_probe/RsetChurn.java`, committed so the number stays
+   reproducible: four retained
+   depth-12 trees whose leaves are re-pointed at fresh young arrays every
+   round, so the edges are old→young and load-bearing) and three corrections
+   to the earlier attempt, each worth recording because each produced a
+   confident zero:
+     * `record_heap_occupancy` had one caller in the tree
+       (`GenerationalHeap`), so under G1 the DENOMINATOR was never published
+       and every per-live-byte ratio was structurally zero. Fixed earlier;
+       G1 publishes it now.
+     * The NUMERATOR is published from `cleanup`, so the run must complete a
+       concurrent mark cycle. The old churn probe never did — its live set
+       never ages into Old, so IHOP is never crossed no matter how long it
+       runs.
+     * Even with the right probe, heap size decides the answer. At 32/24/20 MiB
+       the run produced 54 young pauses and no mark cycle at all (`rset_bytes=0`
+       — a *third* confident zero). At **16 MiB** it produced 323 cycles: 85
+       young, 158 mixed, and the concurrent cleanups that publish the gauge.
+   Command:
+   `cratonvm -XX:+UseG1GC -Xmx16m -XX:InitiatingHeapOccupancyPercent=15 --nojit RsetChurn 12 300`
+   with `CRATONVM_GC_STATS=1`. Checksum matched HotSpot, `cset-verify` reported
+   `dangling=0` over 243 pauses.
+
+   One caveat the number carries: `budget_truncated=243` of 243. The budgeted
+   V7b verifier hit its cap on EVERY pause, so no single pause ever verified
+   the whole heap — coverage accumulates through the rotating cursor. That is
+   the reading item 2's `cset_verify_truncated` counter exists to make possible,
+   and it means `dangling=0` here is "nothing found in 995,328 objects
+   sampled", not "the heap was exhaustively clean at any instant".
 6. ~~**Decide the JNI-pinned-source policy explicitly.**~~ **DONE.** Stated in
    `a_jni_pinned_region_is_an_ordinary_rset_source_not_a_wholesale_one`, which
    pins both halves: a JNI-pinned region is held out of the CSet but is an
@@ -560,10 +587,39 @@ Ordered. Each item is a precondition for the next being meaningful.
    been decoration. `compile_fail` doctests in `gc/src/collector.rs` keep the
    parameter from being dropped again. I-17 now has the same mechanical
    enforcement `collect_garbage` has.
-8. **Run the probe kit (§`docs/GC.md`) with `CRATONVM_G1_DBG_REACH=1` on a
+8. ~~**Run the probe kit (§`docs/GC.md`) with `CRATONVM_G1_DBG_REACH=1` on a
    JIT-warm workload** and confirm the new `[GC] g1 cycle` line reports
-   `degraded=none` across a full mixed sequence. Any other value is a
-   reclamation the collector silently declined to make.
+   `degraded=none` across a full mixed sequence.~~ **RUN 2026-08-13. The answer
+   is no, and it is worse than a degraded cycle record.** There is no
+   configuration of this probe in which G1 runs a full mixed sequence JIT-warm
+   and reports `degraded=none`:
+
+   | Heap | Result |
+   |---|---|
+   | 128 MiB | `degraded=none`, but 3 young pauses and no mixed or cleanup cycle — not a sequence |
+   | 64 MiB | `degraded=none`, 7 young pauses, still no mixed sequence |
+   | 48 MiB | Correct output (checksum matches HotSpot) but the run ends `kind=kept-region-drain degraded=evacuation-failure-self-forwarded,evacuation-failure-drain-wedged` — a **wedged** drain |
+   | 32 MiB | `EXCEPTION_ACCESS_VIOLATION` — see G1-11 |
+   | 16 MiB | `EXCEPTION_ACCESS_VIOLATION` |
+
+   The crash (G1-11) is the finding. Its four discriminating arms, all at
+   `-Xmx32m` on the same class:
+     * `--nojit` → clean, checksum matches HotSpot at 40 and 300 rounds;
+     * default (generational) collector, JIT warm → clean;
+     * `-Xmx256m` under G1, JIT warm → clean (few enough pauses that it does
+       not collect hard);
+     * G1 + JIT + `-Xmx32m` → `read at address 0x…010000`, a round page
+       boundary at the edge of a heap arena, then a Rust-side stack overflow
+       report.
+   `SteadyChurn` (non-recursive, pure young churn) is clean under G1 + JIT at
+   the same heap, so the trigger involves the retained-tree shape and not
+   merely allocation rate.
+
+   So the item is discharged as *asked* — the run happened — and replaced by
+   G1-11, which gates far more than this item did. Anyone re-opening it should
+   note that every earlier run in this line of work was `--nojit`, which is
+   exactly why this went unseen: the JIT-interaction surface had no evidence
+   behind it at all.
 
 ## 10. The G1-2 fix costs the fresh-ctor inline store, and that is not avoidable by elision
 
