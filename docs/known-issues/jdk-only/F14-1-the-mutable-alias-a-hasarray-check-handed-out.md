@@ -41,6 +41,32 @@ public final int arrayOffset() {          // the identical split
 }
 ```
 
+> **CORRECTION 2026-08-14 (F41-1 §2) — the `native_tb_array` half of this
+> record fixed a body that NEVER RAN.** The line numbers below are right and
+> the reasoning is right; the ownership is not. Measured with
+> `--dump-native-registry` on a built binary:
+>
+> ```
+> java/nio/IntBuffer     ()[I  by=servlet.rs:6581  owns_slot=true  overwrote=null
+> java/nio/LongBuffer    ()[I  by=servlet.rs:6581
+> java/nio/ShortBuffer   ()[I  by=servlet.rs:6581
+> java/nio/FloatBuffer   ()[I  by=servlet.rs:6581
+> java/nio/DoubleBuffer  ()[I  by=servlet.rs:6581
+> ```
+>
+> Two defects in one row. The loop hardcodes `()[I` for five families with
+> five different element types, so **four are phantom registrations** nothing
+> can dispatch to; and for `IntBuffer` — the one whose descriptor happens to
+> be right — `servlet.rs` is the **sole** registrant, so `native_tb_array`
+> and every refusal added to it here were unreachable.
+> `ByteBuffer.allocate(16).asIntBuffer().array().length` still raised
+> NullPointerException where HotSpot throws UnsupportedOperationException,
+> until `fdacf3a01`.
+>
+> The lesson is not that this lane was careless — it verified its line
+> numbers, which is more than most. It is that **a line number proves where a
+> body is, never that the body runs.** Only the registry dump answers that.
+
 F5-1's line numbers for the four defective natives were verified before editing
 and were all correct: `native_bb_array` L9703, `native_bb_has_array` L9717,
 `native_bb_array_offset` L9730, `native_tb_array` L16018.

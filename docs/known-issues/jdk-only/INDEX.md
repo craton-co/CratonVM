@@ -568,3 +568,70 @@ number. **Do not rewrite those.**
 "these 23" for a function with 38 registrations
 (`native-collections/src/lib.rs`, ≈28773). Two records now correct it from the
 outside; the comment itself is what a reader hits first.
+
+---
+
+# THIRD PASS — the measurement phase, 2026-08-14
+
+**Why this block exists.** Waves A–F were written by lanes that could not
+build or run the VM: every "after" in those records is **PREDICTED**. A
+measurement phase then built the binary and ran the fixtures against the
+HotSpot 25.0.3+9-LTS oracle. This block records what the binary said, adds the
+seven records that had no row, and corrects the rows measurement falsified.
+
+**Read `F41-1` first.** It is the summary of that phase and the only record in
+
+**Starting fresh? Read `HANDOFF-20260814.md` first instead.** It has the build
+and measurement loop, the traps that cost this session real time, and the
+ordered list of what to pick up next.
+this directory whose claims were verified by running the VM.
+
+## Records added (had no row in either earlier pass)
+
+| record | subject | status | prov |
+|---|---|---|---|
+| F34-1-the-synthetic-only-registrar-population-and-its-gate | 284 registrars reachable only via `register_synthetic_overrides`; **0 of 127 exclusive classes declare a `native` method**, so no capability gap at class granularity — the exposure is 2,412 triples registered by BOTH a synthetic-only family and a shipping pass (drift, ungated) | GATE LANDED, and **RUN**: `cargo test --test registrar_reachability` = 4 passed | READ + the gate EXECUTED |
+| F35-1-the-segment-that-could-not-read-its-own-array-and-the-gate-that-was-inverted | heap `MemorySegment` access implemented; `asSlice` stamped `0 + offset` as an address, so a sliced heap segment dereferenced the literal offset — F27-1 **moved** that fault rather than closing it | FIXED-UNVERIFIED | MEAS (oracle) |
+| F36-1-the-half-the-null-session-cannot-reach-and-the-verifier-that-was-never-invoked | `RSslLiveSession`, 95 checks, loopback TLS; **F18-1 §8.3(4) is WRONG** — its verifier claim was measured against a verifier that never ran | FIXED-MEASURED on the oracle | MEAS (121/121 mutants dead) |
+| F37-1-the-typed-families-alias-and-a-read-only-put-that-succeeded | `ByteBuffer.allocate(8).asReadOnlyBuffer().put(0,(byte)1)` **SUCCEEDED**; F21-1 had CLEARED that cell against a body registration order shadows | FIXED-UNVERIFIED | MEAS |
+| F38-1-the-formatter-locale-slot-and-two-year-fields-with-one-localized-minus | `Formatter()` wrote null into the locale slot, collapsing "no locale" and "the default" into one value; the deletion route fails on slot 0 | FIXED-UNVERIFIED | MEAS |
+| F41-1-what-the-first-real-measurement-of-wave-f-found | **the measurement phase itself** — four defects, three of them created or left behind by wave F, none visible to the lane that owned the file | FIXED-MEASURED | MEAS (both VMs) |
+| W8-E30-1-broken-oracles-five-and-six-and-a-lint-that-makes-the-dialect-self-enforcing | harness dialect lint | (as stated in the record) | — |
+
+## Rows measurement CONFIRMED (PRED → MEASURED)
+
+These predicted a denominator or a flip, and the binary agreed **exactly**:
+
+| record | predicted | measured |
+|---|---|---|
+| F2-1 | `hex` 73 → up, checks 32–49/54–57/69/73 flip | **`hex=77`**, family green |
+| F14-1 | `hex` 73 → **77** | **77** |
+| F21-1 | `bounds` 102 → **121** | **121** |
+| F25-1 | `RJdkIntrinsics2` **1022**, `RJdkSecurity` **149** | **1022 PASS**, **149 PASS** |
+| F11-1 / F19-1 / F29-1 | reflective boxing identity | **`RJdkReflBox` PASS, 107 checks** |
+| F40-1 | the route switch would not redden the proxy arms | proxy family green |
+
+## Rows measurement FALSIFIED or narrowed
+
+| record | what it claimed | what the binary showed |
+|---|---|---|
+| **F14-1 §N1** | fixed `native_tb_array`'s refusals | that body **never ran**. `--dump-native-registry`: `java/nio/IntBuffer.array()[I` is owned by `servlet.rs` (`owns_slot=true, overwrote=null`), and four sibling families were registered under the **wrong descriptor** `()[I` — phantom rows nothing can dispatch to. Fixed in `fdacf3a01`. |
+| **F2-1** | `parseHex` fixed by registering the ranged overloads | correct, but resting on a reader that was wrong one layer down: `CharBuffer.toString()` applied the length and dropped the position **on the reflective route only**. Fixed in `fdacf3a01`. |
+| **F18-1 §8.3(4)** | the `HostnameVerifier`'s session is a different object | **same object** — measured against a verifier that was never invoked. Correction note inlined in F18-1 by `871ae0a25`. |
+| **F19-1 §7 N2** | the collector fix needs the handle's `MethodType` | the wrapper class comes from the **call-site static type**; one handle whose `MethodType` says `Object` yields six wrapper classes (F29-1). |
+| **F5-1 §1** | `ReadOnlyBufferException` and `UnsupportedOperationException` share no supertype below `RuntimeException` | ROBE **extends** UOE; the conclusion survives on check *ordering* (F14-1). |
+| **a `phases_early.rs` comment** | the `lib.rs` LogRecord ctor registration "is refused and this one silently owns the slot" | the reverse: `lib.rs owns=true inv=2`, `phases_early owns=false inv=0`. A fix landed in the dead body and changed nothing. Corrected in place by `8c72d23ca`. |
+
+## Still open, measured but deliberately NOT fixed
+
+- **`java/util/Hashtable`** diverges on **7 of 9** rows of the null axis. A
+  separate slot from `Properties`, served partly by generic Map natives shared
+  with `HashMap` (which legitimately accepts null keys), so it needs
+  receiver-routing, not a copied guard.
+- **`ConcurrentHashMap`**'s null-key helper carries an invented message
+  (`"ConcurrentHashMap does not permit null keys"`) never checked against the
+  oracle.
+- **`InheritableThreadLocal`** captures at `start()` where the JDK captures at
+  construction — see F41-1 §6. The current behaviour is a *documented
+  workaround* protecting every `Executors` path; moving it needs
+  interpreter-level tracing.
