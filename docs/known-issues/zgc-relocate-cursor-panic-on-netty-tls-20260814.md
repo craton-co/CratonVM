@@ -12,7 +12,9 @@ fatal runtime error: failed to initiate panic, error 5, aborting
 #  SIGABRT at pc=…  jdk mode: real-jdk
 ```
 
-Reproducible 3 of 3 runs. The panicking thread is `main-vm` or a netty
+Reproducible 5 of 5 runs across two dev tips (`6134821f4` and `f073e880f`).
+One run presented as a bare `SIGSEGV` (rc=139) with no panic line instead of the
+`SIGABRT`, so the two are the same defect seen at different points. The panicking thread is `main-vm` or a netty
 `multiThreadIoEventLoopGroup-*` worker — it is not thread-specific. The two
 numbers differ by ~91×, so the cursor is not being nudged; it is landing
 somewhere unrelated.
