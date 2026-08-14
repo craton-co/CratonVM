@@ -7,9 +7,10 @@ key-material defect (A′) and three unrelated single-behaviour gaps (B, C, D).
 
 Measured on Azure host 2 (Linux x86_64, JDK 25), `--shards 4 --timeout 400`,
 `-XX:+UseG1GC`, with `netty-tcnative-boringssl-static` on the classpath for BOTH
-VMs. **Use G1 for this suite**: ZGC aborts several of these classes for an
-unrelated reason, tracked in
-`docs/known-issues/zgc-relocate-cursor-panic-on-netty-tls-20260814.md`.
+VMs. G1 was used because ZGC was aborting several of these classes at the time —
+compaction sliding survivors over live objects on an unselected page, since
+fixed on dev and its write-up retired. If a class in this suite aborts inside
+`gc/`, check that first rather than reading it as a TLS defect.
 
 ## What was section A — FIXED 2026-08-14
 
@@ -179,7 +180,5 @@ is the one number section A′ turns on.
 
 - retired `ssl-suite-test-discovery-undercounts` and
   `ssl-cert-validation-residuals` write-ups — the work that made these reachable.
-- `docs/known-issues/zgc-relocate-cursor-panic-on-netty-tls-20260814.md` — run
-  this suite under G1 until that is fixed.
 - `docs/known-issues/netty/jdksslenginetest-engine-level-gaps-20260813.md` —
   JDK-engine gaps in the same package.
