@@ -4055,7 +4055,8 @@ impl ZgcRealHeap {
             self.registry.insert(*to);
         }
 
-        self.verify_no_dangling_slots_after_slide(&live_now, arena_lo, arena_hi);
+        let moved_from: FxHashSet<usize> = pairs.iter().map(|(from, _)| *from).collect();
+        self.verify_no_dangling_slots_after_slide(&live_now, arena_lo, arena_hi, &moved_from);
 
         let pointer_map: cratonvm_types::PointerMap =
             record.into_pointer_map().into_iter().collect();
@@ -4090,12 +4091,15 @@ impl ZgcRealHeap {
         live_now: &[usize],
         arena_lo: usize,
         arena_hi: usize,
+        moved_from: &FxHashSet<usize>,
     ) {
         if !zgc_verify_slide_enabled() {
             return;
         }
         use census::ZCensusHeapView;
         let mut dangling = 0usize;
+        let mut missed = 0usize;
+        let mut unregistered = 0usize;
         let mut reported = 0usize;
         for obj in live_now {
             self.reference_slots(*obj as u64, &mut |slot| {
@@ -4110,6 +4114,24 @@ impl ZgcRealHeap {
                 if self.registry.contains(raw) {
                     return;
                 }
+                // CLASSIFY, because "not a live base" has two very different
+                // causes and only one of them is a rewrite bug:
+                //
+                //  * `missed_rewrite` — the target is an address this very
+                //    slide moved an object AWAY from. The rewrite pass should
+                //    have updated this slot and did not. A real dangling
+                //    pointer, and the collector's fault.
+                //  * otherwise — the word was never a live base at all. Most
+                //    often a PRIMITIVE sitting in a slot the class declares as
+                //    a reference (the W7-84 family, which this VM already warns
+                //    about separately) that happens to land inside the arena's
+                //    address range. Not the slide's doing, and not fixable here.
+                let missed_rewrite = moved_from.contains(&raw);
+                if missed_rewrite {
+                    missed += 1;
+                } else {
+                    unregistered += 1;
+                }
                 dangling += 1;
                 if reported < 16 {
                     reported += 1;
@@ -4119,7 +4141,8 @@ impl ZgcRealHeap {
                         holder_class = self.header_ref(*obj as *mut u8).class_id.as_u32(),
                         slot_addr = slot.slot_addr,
                         points_to = raw,
-                        "zgc slide verify: a reference slot points at an address that                          is NOT a registered live base — the rewrite pass missed it,                          and this word is a dangling pointer"
+                        missed_rewrite,
+                        "zgc slide verify: reference slot does not resolve to a live base"
                     );
                 }
             });
@@ -4128,8 +4151,10 @@ impl ZgcRealHeap {
             tracing::error!(
                 target: "cratonvm::gc::guard",
                 dangling,
+                missed_rewrites = missed,
+                unregistered_targets = unregistered,
                 survivors = live_now.len(),
-                "zgc slide verify: {dangling} dangling reference slot(s) after                  compaction",
+                "zgc slide verify: {missed} slot(s) still point at an address this                  slide MOVED AWAY FROM (the rewrite pass missed them); {unregistered}                  point at something that was never a live base (most likely a                  primitive in a declared-reference slot, not this slide's doing)",
             );
         } else {
             tracing::debug!(
