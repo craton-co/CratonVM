@@ -2345,7 +2345,8 @@ impl VmHeap {
             eprintln!(
                 "[GC] zgc-features: parallel_mark_cycles={par_cycles} \
                  driver_passes={driver_passes} mark_fallbacks={mark_fallbacks} \
-                 compaction_cycles={compactions} objects_relocated={relocated} \n                 relocation_skipped_jit={skipped_jit}"
+                 compaction_cycles={compactions} objects_relocated={relocated} \
+                 relocation_skipped_jit={skipped_jit}"
             );
             let g = h.frag_gauge();
             match g.worst_permille {
