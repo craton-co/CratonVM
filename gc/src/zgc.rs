@@ -3830,7 +3830,31 @@ impl ZgcRealHeap {
             // is a chance to overwrite something live. Dropping the page costs
             // one page's worth of reclaim for the duration of a critical
             // section, which is bounded by the section itself.
-            let pins = self.critical_pin_addrs();
+            // CONSERVATIVE JIT ROOTS PIN THEIR PAGE TOO.
+            //
+            // `gc_quiescence::pinned_jit_roots_snapshot()` is the VM's set of
+            // addresses recovered by a CONSERVATIVE scan of JIT frames. The
+            // root array is over-approximate by construction — `is_heap_addr`
+            // is a range check, so an interior pointer or a plain `long` can
+            // present as a root — which means the collector cannot rewrite the
+            // slot it came from (it may not be a slot) and therefore must not
+            // MOVE the object it names.
+            //
+            // G1 learned this on 2026-08-11: it was evacuating 6-8 of them per
+            // pause and the remap then rewrote a Java `long`. It excludes those
+            // regions from its collection set (`g1.rs:2364`, `:8390`). ZGC had
+            // **no consumer of that snapshot at all** — correct while it never
+            // moved anything, and wrong from the day compaction shipped
+            // (2026-08-13).
+            //
+            // The failure is not a wild pointer, which is what makes it hard to
+            // read: `compact_low_to` ZEROES the vacated span on purpose, so the
+            // conservative root ends up pointing at a valid, all-zero header.
+            // The reader then sees `num_slots=0` and walks off the end of a
+            // zero-length object — the `zgc real: field index OOB index=N
+            // num_slots=0` signature.
+            let mut pins = self.critical_pin_addrs();
+            pins.extend(crate::gc_quiescence::pinned_jit_roots_snapshot());
             if !pins.is_empty() {
                 let page_span = Self::Z_LOGICAL_PAGE_BYTES;
                 let mut dropped = 0usize;
@@ -4055,7 +4079,8 @@ impl ZgcRealHeap {
             self.registry.insert(*to);
         }
 
-        self.verify_no_dangling_slots_after_slide(&live_now, arena_lo, arena_hi);
+        let moved_from: FxHashSet<usize> = pairs.iter().map(|(from, _)| *from).collect();
+        self.verify_no_dangling_slots_after_slide(&live_now, arena_lo, arena_hi, &moved_from);
 
         let pointer_map: cratonvm_types::PointerMap =
             record.into_pointer_map().into_iter().collect();
@@ -4090,12 +4115,33 @@ impl ZgcRealHeap {
         live_now: &[usize],
         arena_lo: usize,
         arena_hi: usize,
+        moved_from: &FxHashSet<usize>,
     ) {
         if !zgc_verify_slide_enabled() {
             return;
         }
         use census::ZCensusHeapView;
+        // Extents of every survivor, sorted, so a dangling target can be asked
+        // the question that actually matters: does it land INSIDE a live
+        // object? A word that points at nothing is inert; a word that points
+        // into a live object of the wrong class is type confusion, and
+        // compaction is what converts the first into the second by moving a
+        // survivor onto an address some stale word already names.
+        let mut extents: Vec<(usize, usize)> = live_now
+            .iter()
+            .filter_map(|b| Self::alloc_size(self.header_ref(*b as *mut u8)).map(|sz| (*b, *b + sz)))
+            .collect();
+        extents.sort_unstable();
+        let lands_inside_a_survivor = |addr: usize| -> bool {
+            match extents.binary_search_by(|(lo, _)| lo.cmp(&addr)) {
+                Ok(_) => true,
+                Err(i) => i > 0 && addr < extents[i - 1].1,
+            }
+        };
         let mut dangling = 0usize;
+        let mut missed = 0usize;
+        let mut unregistered = 0usize;
+        let mut aliasing = 0usize;
         let mut reported = 0usize;
         for obj in live_now {
             self.reference_slots(*obj as u64, &mut |slot| {
@@ -4110,6 +4156,28 @@ impl ZgcRealHeap {
                 if self.registry.contains(raw) {
                     return;
                 }
+                // CLASSIFY, because "not a live base" has two very different
+                // causes and only one of them is a rewrite bug:
+                //
+                //  * `missed_rewrite` — the target is an address this very
+                //    slide moved an object AWAY from. The rewrite pass should
+                //    have updated this slot and did not. A real dangling
+                //    pointer, and the collector's fault.
+                //  * otherwise — the word was never a live base at all. Most
+                //    often a PRIMITIVE sitting in a slot the class declares as
+                //    a reference (the W7-84 family, which this VM already warns
+                //    about separately) that happens to land inside the arena's
+                //    address range. Not the slide's doing, and not fixable here.
+                let missed_rewrite = moved_from.contains(&raw);
+                let aliases_survivor = !missed_rewrite && lands_inside_a_survivor(raw);
+                if missed_rewrite {
+                    missed += 1;
+                } else {
+                    unregistered += 1;
+                    if aliases_survivor {
+                        aliasing += 1;
+                    }
+                }
                 dangling += 1;
                 if reported < 16 {
                     reported += 1;
@@ -4119,7 +4187,9 @@ impl ZgcRealHeap {
                         holder_class = self.header_ref(*obj as *mut u8).class_id.as_u32(),
                         slot_addr = slot.slot_addr,
                         points_to = raw,
-                        "zgc slide verify: a reference slot points at an address that                          is NOT a registered live base — the rewrite pass missed it,                          and this word is a dangling pointer"
+                        missed_rewrite,
+                        aliases_survivor,
+                        "zgc slide verify: reference slot does not resolve to a live base"
                     );
                 }
             });
@@ -4128,8 +4198,11 @@ impl ZgcRealHeap {
             tracing::error!(
                 target: "cratonvm::gc::guard",
                 dangling,
+                missed_rewrites = missed,
+                unregistered_targets = unregistered,
+                aliasing_a_survivor = aliasing,
                 survivors = live_now.len(),
-                "zgc slide verify: {dangling} dangling reference slot(s) after                  compaction",
+                "zgc slide verify: {missed} slot(s) still point at an address this                  slide MOVED AWAY FROM (the rewrite pass missed them); {unregistered}                  point at something that was never a live base, of which {aliasing}                  now land INSIDE a live object — those are the dangerous ones:                  inert before the slide, an alias to the wrong object after it",
             );
         } else {
             tracing::debug!(
@@ -11125,6 +11198,72 @@ pub(crate) mod tests {
         // page for the life of the process.
         heap.unpin_critical(pinned_addr);
         assert_eq!(heap.critical_pin_count(), 0);
+    }
+
+    /// **A conservative JIT root pins its page against relocation.**
+    ///
+    /// The root array is over-approximate by construction: `is_heap_addr` is a
+    /// range check, so an interior pointer or a plain `long` can present as a
+    /// root. The collector therefore cannot rewrite the slot it came from — it
+    /// may not be a slot — and so must not MOVE the object it names.
+    ///
+    /// G1 learned this on 2026-08-11, when it was evacuating 6-8 such roots per
+    /// pause and its remap was rewriting a Java `long`; it excludes those
+    /// regions from its collection set. ZGC had **no consumer of
+    /// `pinned_jit_roots_snapshot()` at all** — correct while it never moved
+    /// anything, wrong from the day compaction shipped.
+    ///
+    /// The failure mode is not a wild pointer, which is what makes it hard to
+    /// recognise: `compact_low_to` ZEROES the vacated span on purpose, so a
+    /// conservative root left behind reads a valid ALL-ZERO header and the
+    /// reader walks off the end of a zero-length object (`num_slots=0`).
+    #[test]
+    fn a_conservative_jit_root_pins_its_page_against_relocation() {
+        const PAGE: usize = ZgcRealHeap::Z_LOGICAL_PAGE_BYTES;
+        const FIELDS: usize = 500;
+        let heap = ZgcRealHeap::with_capacity(64 * 1024 * 1024);
+        heap.set_tlab_enabled(false);
+
+        let per_page = PAGE / (HEADER_SIZE + FIELDS * SLOT_SIZE);
+        let mut roots: Vec<ObjectRef> = Vec::new();
+        for _page in 0..4 {
+            for i in 0..per_page {
+                let o = heap.alloc_object(ClassId::new(1), FIELDS);
+                if i % 5 == 0 {
+                    roots.push(o);
+                }
+            }
+        }
+        // Index 1, not 0: object 0 sits at the bottom and would not move
+        // anyway, which would make this pass for the wrong reason.
+        let pinned_addr = roots[1].as_ptr() as usize;
+        crate::gc_quiescence::clear_pinned_jit_roots();
+        crate::gc_quiescence::add_pinned_jit_root(pinned_addr);
+
+        let pre: Vec<usize> = roots.iter().map(|r| r.as_ptr() as usize).collect();
+        // SAFETY: these unit tests run the heap single-threaded.
+        let stw = unsafe { StopTheWorldToken::new() };
+        cratonvm_types::flags::with_thread_overrides(
+            &[("CRATONVM_ZGC_RELOCATE", Some("1"))],
+            || {
+                heap.collect_garbage(&stw, &mut roots, &NoMonitors);
+            },
+        );
+        crate::gc_quiescence::clear_pinned_jit_roots();
+
+        let moved = roots
+            .iter()
+            .zip(pre.iter())
+            .filter(|(now, was)| now.as_ptr() as usize != **was)
+            .count();
+        assert!(
+            moved > 0,
+            "the fixture must relocate SOMETHING, or a pin that holds proves nothing"
+        );
+        assert_eq!(
+            roots[1].as_ptr() as usize, pinned_addr,
+            "a conservatively-rooted object moved; the root that named it cannot be              rewritten (it may be a long), so it now points at the zeroed vacated span"
+        );
     }
 
     /// Nested critical sections on one array: the inner release must not
