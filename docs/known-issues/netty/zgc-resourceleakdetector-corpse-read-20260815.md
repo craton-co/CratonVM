@@ -149,41 +149,58 @@ so a corpse line carries `root_source=`. On the repro it says:
 root_source="<none: not handed to the marker as a root>"
 ```
 
-That rules out all 26 named root sources as the DIRECT holder. It is weaker
-than it looks, and the reason is worth writing down: an object reachable
-through the Java object graph is legitimately not a direct root, so `<none>` is
-the *expected* answer for one and does not locate the stale address. The lever
-answers "who rooted this object", and the question here is "who kept a copy of
-its old address" — related, not the same. Keep the instrument; it is cheap and
-it did close off a whole inventory. Do not expect it to name the holder.
+That rules out all 26 named root sources as the direct holder. It is weaker
+than it looks: an object reachable through the Java object graph is
+legitimately not a direct root, so `<none>` is the *expected* answer for one.
+The lever answers "who rooted this object"; the question was "who kept a copy
+of its old address". Related, not the same. Keep the instrument — it is cheap
+and it did close off a whole inventory — but it was not what named the holder.
 
-## Where to look next
+## What DID name the holder
 
-The holder is not either reference processor, not the Java slot graph, and not
-a named root source. What is left is a structure that stores a `Reference`
-address, outlives the cycle, and is never scanned.
+Three cheap facts in sequence, each one flag:
 
-**The cheapest next bit is already built and unmeasured: READ or WRITE.**
-`check_field_index` is shared by `get_field` and `set_field`, and now takes an
-`op` tag that the corpse line reports. `index=0` on a `Reference` means:
+1. **`op="set"`, 7 of 7.** `check_field_index` is shared by `get_field` and
+   `set_field`; tagging it showed every stale access is a **write** to field 0.
+   Somebody is clearing a referent through a pre-move address.
+2. **`CRATONVM_DBG_JIT_NAMES=1`** named the faulting method:
+   `io/netty/util/ResourceLeakDetectorTest$LeakAwareResource.close()Z`, and the
+   dump reports `guarded compiled frames live process-wide: YES (quiescence
+   depth=101)`.
+3. `LeakAwareResource.close()` calls through to `DefaultResourceLeak`, whose
+   `close()` calls `WeakReference.clear()` — which nulls **field 0**. The write
+   the corpse ledger sees and the frame the crash dump names are the same
+   operation.
 
-* **write** → somebody is clearing a referent through a stale address. The
-  search is every `set_field(x, 0, ...)` reachable from a stored address.
-* **read** → somebody is servicing `Reference.get` or netty is reading its own
-  field. A completely different search.
+**The holder is the JIT frame.** A compiled frame can keep an object pointer in
+a register or a spill slot; the collector can neither find nor rewrite those.
+`gen_heap` says so at its own divert — "cannot be relocated (raw register/spill
+slots can't be rewritten)" — and diverts to a non-moving sweep;
+`gc_quiescence::is_active()` is the flag both it and G1 read.
 
-Everything else is guessing until that bit is in hand.
+**ZGC read it zero times.** 9 call sites in `gen_heap`, 6 in `g1`, none in
+`zgc.rs`. It consumed only `pinned_jit_roots_snapshot()`, which holds what a
+conservative STACK scan recovered — a pointer that never left a register is not
+in it, so its page is not withheld and the object slides.
 
-Two other things a follow-up should carry:
+Fixed 2026-08-15: `relocate_stw` now declines the cycle when a compiled frame
+is live, with `relocation_skipped_jit` exported so the cost is a number. That
+cost is real and unmeasured — on this collector compaction is also
+defragmentation, so a permanently JIT-busy process defragments less. **Someone
+should measure that on a JIT-heavy workload before calling it settled.**
 
-* **The uniformity is the strongest clue.** 35 of 35 corpse reads are the same
-  class, same field, same size, same `cycles_ago=0`. Whatever holds the address
-  does so on one code path, deterministically, every cycle — it is not a race
-  in the holder, only in whether the resulting write lands on something fatal.
-* **`--nojit` reduces but does not remove it.** So at least one holder is not a
-  JIT frame, but JIT frames may be a second one. Re-measure that with 10 reps
-  now that the base rate is known to be ~60% and not 100% — the earlier reading
-  was taken against an assumed-deterministic crash.
+## Not closed: a second, JIT-independent crash
+
+`--nojit` still crashes 2/10, in a completely different place — the collector
+faulting inside its own rewrite pass. Written up separately in
+`zgc-rewrite-pass-walks-off-a-reference-array-20260815.md`. Both defects vanish
+under `CRATONVM_ZGC_RELOCATE=0`, so both belong to compaction.
+
+| arm | SIGSEGV |
+|---|---|
+| ZGC, JIT on | 6/10 |
+| ZGC, `--nojit` | 2/10 |
+| ZGC, `RELOCATE=0` | 0/10 |
 
 ## Measurement traps recorded
 
