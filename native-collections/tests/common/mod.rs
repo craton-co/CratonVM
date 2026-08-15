@@ -1238,15 +1238,46 @@ pub fn new_treemap(reg: &NativeMethodRegistry, ctx: &mut MockCtx) -> ObjectRef {
     tm
 }
 
+/// Declare `java.lang.Comparable` on a mocked wrapper class, as the real one
+/// declares it.
+///
+/// `MockCtx::ensure_class_initialized` mints a bare name — no interfaces, and
+/// `superclass_of` is `None` — so `implements_comparable` answers *false* for
+/// every mocked object unless a test says otherwise. That is fine while the
+/// production code only ever ORDERS these values: `natural_compare` unboxes a
+/// primitive wrapper and never asks about the interface.
+///
+/// It stopped being fine when `tree_natural_order_key_check` landed. That guard
+/// models the JDK's `addEntryToEmptyMap` self-compare — `TreeMap.put` on an
+/// EMPTY natural-order map does `compare(key, key)`, which is a `checkcast
+/// java/lang/Comparable` — and it asks `implements_comparable` directly, not
+/// `natural_compare`. So the first `put` of a mocked `Integer` began throwing
+/// `ClassCastException: class java.lang.Integer cannot be cast to class
+/// java.lang.Comparable`, and `treemap_for_each_reads_forwarded_action_and_pairs`
+/// went red without ever reaching the GC-pin behaviour it exists to assert.
+///
+/// The production code is right — `probes/TreeNaturalKeyProbe` diffs 14 rows of
+/// TreeMap/TreeSet natural-order behaviour against HotSpot JDK 25 and is
+/// byte-identical in both `--real-jdk` and `--jdk-only`, including the CCE for a
+/// genuinely non-Comparable key. It was the MOCK that did not model
+/// `java.lang.Integer`.
+fn declare_comparable(ctx: &mut MockCtx, cid: cratonvm_types::ClassId) {
+    let comparable = ctx
+        .ensure_class_initialized("java/lang/Comparable")
+        .expect("mock class minting is infallible");
+    ctx.set_class_interfaces(cid, vec![comparable]);
+}
+
 /// Box an i32 as a synthetic `java.lang.Integer` so the keys behave as
 /// objects in the put/get dispatch path. Field layout: slot 0 = Int(v).
 ///
 /// Uses `alloc_object` + `set_field`, which the trait exposes — the heap
 /// entry's class_id carries the Integer name so `unbox_wrapper` in the
 /// production code can route through `obj_to_display_string`'s wrapper
-/// branch.
+/// branch. `Comparable` is declared for the reason `declare_comparable` gives.
 pub fn boxed_int(ctx: &mut MockCtx, v: i32) -> Value {
     let cid = ctx.ensure_class_initialized("java/lang/Integer").unwrap();
+    declare_comparable(ctx, cid);
     let obj = ctx.alloc_object(cid, 1);
     ctx.set_field(obj, 0, Value::Int(v));
     Value::Object(Some(obj))
@@ -1255,6 +1286,7 @@ pub fn boxed_int(ctx: &mut MockCtx, v: i32) -> Value {
 /// Box a `char` as a synthetic `java.lang.Character` (slot 0 = Int code unit).
 pub fn boxed_char(ctx: &mut MockCtx, c: char) -> Value {
     let cid = ctx.ensure_class_initialized("java/lang/Character").unwrap();
+    declare_comparable(ctx, cid);
     let obj = ctx.alloc_object(cid, 1);
     ctx.set_field(obj, 0, Value::Int(c as i32));
     Value::Object(Some(obj))
