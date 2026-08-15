@@ -3653,7 +3653,7 @@ impl ZgcRealHeap {
     /// Deliberately NOT `zgc_relocation_permitted`. That gate answers a
     /// *safety* question (is the JIT off?) and lives in `vm_init`; this one
     /// answers an *intent* question and lives here. A caller needs both.
-    fn relocation_requested(&self) -> bool {
+    pub(crate) fn relocation_requested(&self) -> bool {
         // DEFAULT-ON since 2026-08-13, for the gauntlet.
         //
         // `CRATONVM_ZGC_RELOCATE=0` (or `off`/`false`/`no`) is the kill switch
@@ -3874,8 +3874,19 @@ impl ZgcRealHeap {
             // The reader then sees `num_slots=0` and walks off the end of a
             // zero-length object — the `zgc real: field index OOB index=N
             // num_slots=0` signature.
-            let mut pins = self.critical_pin_addrs();
-            pins.extend(crate::gc_quiescence::pinned_jit_roots_snapshot());
+            let critical = self.critical_pin_addrs();
+            let jit_pins = crate::gc_quiescence::pinned_jit_roots_snapshot();
+            // DBG (`CRATONVM_DBG_ZGC_PINS=1`): the pin's PRICE, which is the
+            // number this design has to be judged on. A conservative JIT root
+            // is un-rewritable, so it must pin — but pinning is page-granular
+            // and this arena reclaims the middle of the heap only by sliding,
+            // so a pin that withholds most of the selected set converts a
+            // memory-corruption bug into an OutOfMemoryError. Print the three
+            // counts that say which of those you have.
+            let dbg_pins = cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_ZGC_PINS").is_some();
+            let selected_before = selected.len();
+            let mut pins = critical;
+            pins.extend(jit_pins.iter().copied());
             if !pins.is_empty() {
                 let page_span = Self::Z_LOGICAL_PAGE_BYTES;
                 let mut dropped = 0usize;
@@ -3885,6 +3896,15 @@ impl ZgcRealHeap {
                             dropped += 1;
                         }
                     }
+                }
+                if dbg_pins {
+                    eprintln!(
+                        "[ZGC_PINS] jit_roots={} selected_before={} pages_dropped={} selected_after={}",
+                        jit_pins.len(),
+                        selected_before,
+                        dropped,
+                        selected.len()
+                    );
                 }
                 if dropped > 0 {
                     tracing::debug!(

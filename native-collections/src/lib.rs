@@ -19253,17 +19253,190 @@ fn register_factory_natives(r: &mut NativeMethodRegistry) {
 
 /// Generic `List.of` for fixed-arity overloads: every positional arg is an
 /// element. Produces a frozen (unmodifiable) list.
+// ---------------------------------------------------------------------------
+// `List.of` / `Set.of` / `Map.of` argument validation
+// ---------------------------------------------------------------------------
+//
+// These factories are not "an ArrayList with a frozen wrapper". Their contract
+// is `java.util.ImmutableCollections`', which REJECTS a null element with a
+// `NullPointerException` and a repeated `Set` element / `Map` key with an
+// `IllegalArgumentException`. Ours accepted both: `Set.of("a","a")` silently
+// deduplicated to `["a"]` and `Map.of(null,"1")` produced `{null=1}`. Validating
+// is the reason an application writes `Set.of(...)` instead of
+// `new HashSet<>(Arrays.asList(...))`, so answering with a collection where the
+// JDK throws converts a caught, located bug into a wrong value carried onward.
+//
+// The checks live at the `of` ENTRY POINTS and NOT inside `make_set_of` /
+// `make_map_of`, because those two also build `Collectors.toSet()`, `Set.copyOf`
+// and every other synthetic set/map in this crate — and `copyOf` DEDUPLICATES
+// by contract (`Set.copyOf(List.of("a","a")).size() == 1`, a row
+// `ImmutableCollectionsDifferentialProbe` asserts). One helper serving both
+// callers would have to pick, and either pick is wrong for the other.
+
+/// `Objects.requireNonNull` over a factory's arguments.
+///
+/// The NPE carries **no message**: the JDK's comes from a bare
+/// `Objects.requireNonNull(e)`, and `Throwable.toString()` omits the `": …"`
+/// suffix only for a null message — so a "helpful" message here is a visible
+/// difference from HotSpot rather than a bonus. Same trap as the bare
+/// `IllegalStateException` in `ArrayList$SubList$1.remove`.
+fn of_reject_null_elements(elems: &[Value]) -> Result<(), MethodCallFailed> {
+    if elems.iter().any(|e| matches!(e, Value::Object(None))) {
+        return Err(MethodCallFailed::from(RuntimeError::NullPointerException {
+            message: None,
+        }));
+    }
+    Ok(())
+}
+
+/// Render one element for a `duplicate element: …` / `duplicate key: …`
+/// message through the receiver's own `toString()` — the text HotSpot prints,
+/// and the text the probe diffs.
+fn of_element_text(ctx: &mut dyn NativeContext, v: Value) -> String {
+    match v {
+        Value::Object(Some(o)) => ctx
+            .invoke_virtual(o, "toString", "()Ljava/lang/String;", &[])
+            .ok()
+            .flatten()
+            .and_then(|r| match r {
+                Value::Object(Some(s)) => ctx.read_string(s),
+                _ => None,
+            })
+            .unwrap_or_else(|| "?".to_string()),
+        Value::Int(i) => i.to_string(),
+        Value::Long(l) => l.to_string(),
+        other => format!("{other:?}"),
+    }
+}
+
+/// `IllegalArgumentException: duplicate <noun>: <e>` for the first repeat.
+///
+/// Equality is `values_equal_deep`, which ends in the RECEIVER's `equals` — the
+/// same predicate `make_set_of`'s `native_map_put` uses, so the check and the
+/// build can never disagree about what counts as a duplicate. Quadratic, and
+/// deliberately so: every `of` overload the JDK declares takes at most ten
+/// arguments, and the array form is the only unbounded one.
+fn of_reject_duplicates(
+    ctx: &mut dyn NativeContext,
+    elems: &[Value],
+    noun: &str,
+) -> Result<(), MethodCallFailed> {
+    if elems.len() < 2 {
+        return Ok(());
+    }
+    // `values_equal_deep` ends in the receiver's `equals`, which allocates and
+    // can therefore MOVE every element in this slice. The `Value`s here are
+    // bare copies of the caller's argument registers; re-reading them through
+    // pins is the same discipline `make_set_of` and `make_map_of` already keep
+    // for exactly this reason, and skipping it is how a comparison ends up
+    // asking an unrelated `java.lang.Object` whether it equals itself.
+    let (base, handles) = pin_value_slice(ctx, elems);
+    let mut verdict: Result<(), MethodCallFailed> = Ok(());
+    'outer: for i in 1..elems.len() {
+        for j in 0..i {
+            let a = read_pinned_elem(ctx, handles[i], elems[i]);
+            let b = read_pinned_elem(ctx, handles[j], elems[j]);
+            match values_equal_deep(ctx, &a, &b) {
+                Ok(false) => {}
+                Ok(true) => {
+                    let dup = read_pinned_elem(ctx, handles[i], elems[i]);
+                    let text = of_element_text(ctx, dup);
+                    verdict = Err(MethodCallFailed::from(
+                        RuntimeError::IllegalArgumentException {
+                            message: format!("duplicate {noun}: {text}"),
+                        },
+                    ));
+                    break 'outer;
+                }
+                Err(e) => {
+                    verdict = Err(e);
+                    break 'outer;
+                }
+            }
+        }
+    }
+    if base != usize::MAX {
+        ctx.unpin_native_roots(base);
+    }
+    verdict
+}
+
+/// The one `List.of` body. Every arity registration reaches it.
+fn of_list(ctx: &mut dyn NativeContext, elems: &[Value]) -> MethodCallResult {
+    of_reject_null_elements(elems)?;
+    let r = make_list_of(ctx, elems);
+    freeze_result(ctx, UNMOD_LIST_CLASS, r)
+}
+
+/// The one `Set.of` body — nulls first, then duplicates, in the JDK's order:
+/// `Set.of("a", null)` is an NPE, not an IAE.
+fn of_set(ctx: &mut dyn NativeContext, elems: &[Value]) -> MethodCallResult {
+    of_reject_null_elements(elems)?;
+    of_reject_duplicates(ctx, elems, "element")?;
+    let r = make_set_of(ctx, elems);
+    freeze_result(ctx, UNMOD_SET_CLASS, r)
+}
+
+/// The one `Map.of` / `Map.ofEntries` body. Keys AND values must be non-null;
+/// only keys are checked for duplicates.
+fn of_map(ctx: &mut dyn NativeContext, pairs: &[(Value, Value)]) -> MethodCallResult {
+    let flat: Vec<Value> = pairs.iter().flat_map(|(k, v)| [*k, *v]).collect();
+    of_reject_null_elements(&flat)?;
+    let keys: Vec<Value> = pairs.iter().map(|(k, _)| *k).collect();
+    of_reject_duplicates(ctx, &keys, "key")?;
+    let r = make_map_of(ctx, pairs);
+    freeze_result(ctx, UNMOD_MAP_CLASS, r)
+}
+
+/// Does `src` (any `Collection`) hold a null element? Asked through `toArray()`
+/// so it also answers for a collection this crate does not own.
+fn source_collection_has_null(ctx: &mut dyn NativeContext, src: ObjectRef) -> bool {
+    let arr = match ctx.invoke_virtual(src, "toArray", "()[Ljava/lang/Object;", &[]) {
+        Ok(Some(Value::Object(Some(a)))) => a,
+        _ => return false,
+    };
+    let len = ctx.array_length(arr);
+    (0..len).any(|i| matches!(ctx.get_array_element(arr, i), Value::Object(None)))
+}
+
+/// Is `v` already an immutable `*.of` / `copyOf` product of `class_name`?
+///
+/// `UNMOD_FIELD_IMMUTABLE` is the discriminator the wrapper already carried:
+/// `alloc_immutable_wrapper` sets it and `alloc_unmod_wrapper` — which is what
+/// `Collections.unmodifiableList` uses — does not. That is exactly the JDK's
+/// `coll instanceof ImmutableCollections.AbstractImmutableList` test, and it is
+/// why `copyOf` may return its argument unchanged here while still snapshotting
+/// a `Collections.unmodifiableList` VIEW of a mutable list: the view's contents
+/// can still change underneath it, which is the aliasing the Kafka
+/// `AdminApiDriver` fix above was about.
+fn already_immutable_of(
+    ctx: &mut dyn NativeContext,
+    v: Value,
+    class_name: &str,
+) -> Option<ObjectRef> {
+    let obj = match v {
+        Value::Object(Some(o)) => o,
+        _ => return None,
+    };
+    let cid = ctx.class_id_of_object(obj);
+    if ctx.class_name_of_id(cid).as_deref() != Some(class_name) {
+        return None;
+    }
+    match ctx.get_field(obj, UNMOD_FIELD_IMMUTABLE) {
+        Value::Int(1) => Some(obj),
+        _ => None,
+    }
+}
+
 fn native_list_of_varargs(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let elems: Vec<Value> = args.to_vec();
-    let r = make_list_of(ctx, &elems);
-    freeze_result(ctx, UNMOD_LIST_CLASS, r)
+    of_list(ctx, &elems)
 }
 
 /// Generic `Set.of` for fixed-arity overloads. Produces a frozen set.
 fn native_set_of_varargs(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let elems: Vec<Value> = args.to_vec();
-    let r = make_set_of(ctx, &elems);
-    freeze_result(ctx, UNMOD_SET_CLASS, r)
+    of_set(ctx, &elems)
 }
 
 /// Generic `Map.of` for fixed-arity overloads: args are k0,v0,k1,v1,...
@@ -19274,8 +19447,7 @@ fn native_map_of_varargs(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         pairs.push((args[i], args[i + 1]));
         i += 2;
     }
-    let r = make_map_of(ctx, &pairs);
-    freeze_result(ctx, UNMOD_MAP_CLASS, r)
+    of_map(ctx, &pairs)
 }
 
 /// `Map.ofEntries(Map$Entry...)`.
@@ -19291,8 +19463,7 @@ fn native_map_of_entries(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     let arr = match args.first() {
         Some(Value::Object(Some(a))) => *a,
         _ => {
-            let r = make_map_of(ctx, &[]);
-            return freeze_result(ctx, UNMOD_MAP_CLASS, r);
+            return of_map(ctx, &[]);
         }
     };
     let len = ctx.array_length(arr);
@@ -19312,8 +19483,7 @@ fn native_map_of_entries(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
             pairs.push((k, v));
         }
     }
-    let r = make_map_of(ctx, &pairs);
-    freeze_result(ctx, UNMOD_MAP_CLASS, r)
+    of_map(ctx, &pairs)
 }
 
 /// Helper: create an ArrayList from a slice of values.
@@ -19479,37 +19649,32 @@ fn freeze_result(
 }
 
 fn native_list_of_0(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    let r = make_list_of(ctx, &[]);
-    freeze_result(ctx, UNMOD_LIST_CLASS, r)
+    of_list(ctx, &[])
 }
 
 fn native_list_of_1(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let e1 = args.first().copied().unwrap_or(Value::Object(None));
-    let r = make_list_of(ctx, &[e1]);
-    freeze_result(ctx, UNMOD_LIST_CLASS, r)
+    of_list(ctx, &[e1])
 }
 
 fn native_list_of_2(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let e1 = args.first().copied().unwrap_or(Value::Object(None));
     let e2 = args.get(1).copied().unwrap_or(Value::Object(None));
-    let r = make_list_of(ctx, &[e1, e2]);
-    freeze_result(ctx, UNMOD_LIST_CLASS, r)
+    of_list(ctx, &[e1, e2])
 }
 
 fn native_list_of_3(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let e1 = args.first().copied().unwrap_or(Value::Object(None));
     let e2 = args.get(1).copied().unwrap_or(Value::Object(None));
     let e3 = args.get(2).copied().unwrap_or(Value::Object(None));
-    let r = make_list_of(ctx, &[e1, e2, e3]);
-    freeze_result(ctx, UNMOD_LIST_CLASS, r)
+    of_list(ctx, &[e1, e2, e3])
 }
 
 fn native_list_of_array(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let arr = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => {
-            let r = make_list_of(ctx, &[]);
-            return freeze_result(ctx, UNMOD_LIST_CLASS, r);
+            return of_list(ctx, &[]);
         }
     };
     let len = ctx.array_length(arr);
@@ -19517,34 +19682,29 @@ fn native_list_of_array(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     for i in 0..len {
         elems.push(ctx.get_array_element(arr, i));
     }
-    let r = make_list_of(ctx, &elems);
-    freeze_result(ctx, UNMOD_LIST_CLASS, r)
+    of_list(ctx, &elems)
 }
 
 fn native_set_of_0(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    let r = make_set_of(ctx, &[]);
-    freeze_result(ctx, UNMOD_SET_CLASS, r)
+    of_set(ctx, &[])
 }
 
 fn native_set_of_1(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let e1 = args.first().copied().unwrap_or(Value::Object(None));
-    let r = make_set_of(ctx, &[e1]);
-    freeze_result(ctx, UNMOD_SET_CLASS, r)
+    of_set(ctx, &[e1])
 }
 
 fn native_set_of_2(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let e1 = args.first().copied().unwrap_or(Value::Object(None));
     let e2 = args.get(1).copied().unwrap_or(Value::Object(None));
-    let r = make_set_of(ctx, &[e1, e2]);
-    freeze_result(ctx, UNMOD_SET_CLASS, r)
+    of_set(ctx, &[e1, e2])
 }
 
 fn native_set_of_array(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let arr = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => {
-            let r = make_set_of(ctx, &[]);
-            return freeze_result(ctx, UNMOD_SET_CLASS, r);
+            return of_set(ctx, &[]);
         }
     };
     let len = ctx.array_length(arr);
@@ -19552,20 +19712,17 @@ fn native_set_of_array(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     for i in 0..len {
         elems.push(ctx.get_array_element(arr, i));
     }
-    let r = make_set_of(ctx, &elems);
-    freeze_result(ctx, UNMOD_SET_CLASS, r)
+    of_set(ctx, &elems)
 }
 
 fn native_map_of_0(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    let r = make_map_of(ctx, &[]);
-    freeze_result(ctx, UNMOD_MAP_CLASS, r)
+    of_map(ctx, &[])
 }
 
 fn native_map_of_1(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let k = args.first().copied().unwrap_or(Value::Object(None));
     let v = args.get(1).copied().unwrap_or(Value::Object(None));
-    let r = make_map_of(ctx, &[(k, v)]);
-    freeze_result(ctx, UNMOD_MAP_CLASS, r)
+    of_map(ctx, &[(k, v)])
 }
 
 fn native_map_of_2(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -19573,8 +19730,7 @@ fn native_map_of_2(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
     let v1 = args.get(1).copied().unwrap_or(Value::Object(None));
     let k2 = args.get(2).copied().unwrap_or(Value::Object(None));
     let v2 = args.get(3).copied().unwrap_or(Value::Object(None));
-    let r = make_map_of(ctx, &[(k1, v1), (k2, v2)]);
-    freeze_result(ctx, UNMOD_MAP_CLASS, r)
+    of_map(ctx, &[(k1, v1), (k2, v2)])
 }
 
 // ===========================================================================
@@ -33938,17 +34094,82 @@ fn register_linked_list_natives(registry: &mut NativeMethodRegistry) {
         lit,
         "remove",
         "()V",
-        native_ll_listitr_remove_noop,
+        native_ll_listitr_remove,
         cratonvm_native_api::NativeKind::Bridge,
     );
     registry.register_with_kind(
         lit,
         "add",
         "(Ljava/lang/Object;)V",
-        native_ll_listitr_remove_noop,
+        native_ll_listitr_add,
         cratonvm_native_api::NativeKind::Bridge,
     );
     registry.set_category(__prev_cat);
+}
+
+// ---------------------------------------------------------------------------
+// The LinkedList snapshot ListIterator's slots
+// ---------------------------------------------------------------------------
+//
+// 0/1/2 are load-bearing NAMES, not just a layout: the interface-level
+// `java/util/ListIterator` natives dispatch on "slot 0 holds an `Object[]`,
+// slot 1 an `Int` cursor", so those two indices are shared with every other
+// snapshot iterator in this file and must not move.
+//
+// Slot 3 (`lastRet`) was added 2026-08-15 with `add`/`remove`. Before it, `set`
+// wrote at `cursor - 1` — correct after `next()`, WRONG after `previous()`
+// (the JDK's `set` targets the element the last `next`/`previous` returned,
+// which after `previous()` is at `cursor`), and there was no way at all to
+// answer `IllegalStateException` for a `set`/`remove` with no preceding call.
+// It is written EXPLICITLY to -1 at construction rather than left to whatever
+// `alloc_object` zeroes an undeclared slot to: an int-zero read as a
+// meaningful `lastRet` makes `remove()` before any `next()` delete element 0
+// instead of raising. Same hazard as `ArrayList$SubList$1`'s `lastRet`, which
+// is where this rule comes from.
+const LLI_FIELD_ARR: usize = 0;
+const LLI_FIELD_CURSOR: usize = 1;
+const LLI_FIELD_LIST: usize = 2;
+const LLI_FIELD_LASTRET: usize = 3;
+const LLI_NUM_FIELDS: usize = 4;
+
+/// `lastRet`, or `None` for a 3-slot iterator minted before that slot existed.
+/// The `None` arm keeps the old `cursor - 1` reading rather than inventing a
+/// value — a defensive read, since both mint sites now allocate four.
+fn lli_last_ret(ctx: &dyn NativeContext, this: ObjectRef) -> Option<i32> {
+    if ctx.object_num_fields(this) <= LLI_FIELD_LASTRET {
+        return None;
+    }
+    match ctx.get_field(this, LLI_FIELD_LASTRET) {
+        Value::Int(v) => Some(v),
+        _ => Some(-1),
+    }
+}
+
+fn lli_set_last_ret(ctx: &mut dyn NativeContext, this: ObjectRef, v: i32) {
+    if ctx.object_num_fields(this) > LLI_FIELD_LASTRET {
+        ctx.set_field(this, LLI_FIELD_LASTRET, Value::Int(v));
+    }
+}
+
+/// The index `set`/`remove` act on: the real `lastRet` when the carrier has
+/// one, else the pre-2026-08-15 `cursor - 1`.
+fn lli_target_index(ctx: &dyn NativeContext, this: ObjectRef, cursor: i32) -> i32 {
+    lli_last_ret(ctx, this).unwrap_or(cursor - 1)
+}
+
+/// Re-take the snapshot after a structural change and re-publish it.
+///
+/// `add`/`remove` mutate the backing `LinkedList`, so the array slot 0 holds is
+/// stale the instant they return; every later `next()` would walk the old
+/// elements. Re-snapshotting is O(n) per mutation and is what keeps this
+/// iterator's reads agreeing with the list it just edited.
+fn lli_resnapshot(ctx: &mut dyn NativeContext, this: ObjectRef, list: ObjectRef) {
+    let mut this = this;
+    let list_at_call = list;
+    let arr = rooted_across(ctx, &mut [&mut this], |ctx| {
+        ll_snapshot_array(ctx, list_at_call)
+    });
+    ctx.set_field(this, LLI_FIELD_ARR, Value::Object(Some(arr)));
 }
 
 fn ll_snapshot_array(ctx: &mut dyn NativeContext, this: ObjectRef) -> ObjectRef {
@@ -34009,12 +34230,16 @@ fn native_ll_list_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
     // collect, and `arr` and `this` are stored into the result immediately
     // after, so hoisting it out would leave both unrooted across a moving GC.
     let it = rooted_across(ctx, &mut [&mut this, &mut arr], |ctx| {
-        let cid = ctx.ensure_vm_internal_class("cratonvm/internal/LinkedListSnapshotListItr", 3);
-        ctx.alloc_object(cid, 3)
+        let cid = ctx.ensure_vm_internal_class(
+            "cratonvm/internal/LinkedListSnapshotListItr",
+            LLI_NUM_FIELDS,
+        );
+        ctx.alloc_object(cid, LLI_NUM_FIELDS)
     });
-    ctx.set_field(it, 0, Value::Object(Some(arr)));
-    ctx.set_field(it, 1, Value::Int(0));
-    ctx.set_field(it, 2, Value::Object(Some(this)));
+    ctx.set_field(it, LLI_FIELD_ARR, Value::Object(Some(arr)));
+    ctx.set_field(it, LLI_FIELD_CURSOR, Value::Int(0));
+    ctx.set_field(it, LLI_FIELD_LIST, Value::Object(Some(this)));
+    lli_set_last_ret(ctx, it, -1);
     Ok(Some(Value::Object(Some(it))))
 }
 
@@ -34036,12 +34261,16 @@ fn native_ll_list_iterator_idx(ctx: &mut dyn NativeContext, args: &[Value]) -> M
     });
     // Same mint, same pairing, as `native_ll_list_iterator` above.
     let it = rooted_across(ctx, &mut [&mut this, &mut arr], |ctx| {
-        let cid = ctx.ensure_vm_internal_class("cratonvm/internal/LinkedListSnapshotListItr", 3);
-        ctx.alloc_object(cid, 3)
+        let cid = ctx.ensure_vm_internal_class(
+            "cratonvm/internal/LinkedListSnapshotListItr",
+            LLI_NUM_FIELDS,
+        );
+        ctx.alloc_object(cid, LLI_NUM_FIELDS)
     });
-    ctx.set_field(it, 0, Value::Object(Some(arr)));
-    ctx.set_field(it, 1, Value::Int(idx.max(0)));
-    ctx.set_field(it, 2, Value::Object(Some(this)));
+    ctx.set_field(it, LLI_FIELD_ARR, Value::Object(Some(arr)));
+    ctx.set_field(it, LLI_FIELD_CURSOR, Value::Int(idx.max(0)));
+    ctx.set_field(it, LLI_FIELD_LIST, Value::Object(Some(this)));
+    lli_set_last_ret(ctx, it, -1);
     Ok(Some(Value::Object(Some(it))))
 }
 
@@ -34100,6 +34329,7 @@ fn native_ll_listitr_next(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
     }
     let elem = ctx.get_array_element(arr, cursor as usize);
     ctx.set_field(this, 1, Value::Int(cursor + 1));
+    lli_set_last_ret(ctx, this, cursor);
     Ok(Some(elem))
 }
 
@@ -34152,6 +34382,10 @@ fn native_ll_listitr_previous(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
     }
     let elem = ctx.get_array_element(arr, (cursor - 1) as usize);
     ctx.set_field(this, 1, Value::Int(cursor - 1));
+    // The JDK's `previous()` leaves `lastReturned` on the element it returned,
+    // which is now AT the cursor — not behind it. `set` after `previous` is the
+    // row that tells the two apart.
+    lli_set_last_ret(ctx, this, cursor - 1);
     Ok(Some(elem))
 }
 
@@ -34183,25 +34417,30 @@ fn native_ll_listitr_previous_index(
 }
 
 fn native_ll_listitr_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    // Set the element at (cursor - 1) in both the snapshot array AND the
-    // backing LinkedList node, so `List.sort` actually sorts.
+    // Set the element the last `next()`/`previous()` returned, in both the
+    // snapshot array AND the backing LinkedList node, so `List.sort` actually
+    // sorts.
     let this = match args.first() {
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(None),
     };
     let elem = args.get(1).copied().unwrap_or(Value::Object(None));
-    let cursor = match ctx.get_field(this, 1) {
+    let cursor = match ctx.get_field(this, LLI_FIELD_CURSOR) {
         Value::Int(v) => v,
         _ => 0,
     };
-    let idx = cursor - 1;
+    let idx = lli_target_index(&*ctx, this, cursor);
     if idx < 0 {
-        return Ok(None);
+        // Was `Ok(None)` — a silent no-op where HotSpot raises. A `set()` with
+        // no preceding `next()` is a caller bug, and swallowing it is the
+        // "reported success and changed nothing" shape the sublist iterators
+        // were fixed out of.
+        return Err(sli_illegal_state(ctx));
     }
-    if let Value::Object(Some(arr)) = ctx.get_field(this, 0) {
+    if let Value::Object(Some(arr)) = ctx.get_field(this, LLI_FIELD_ARR) {
         ctx.set_array_element(arr, idx as usize, elem);
     }
-    if let Value::Object(Some(list)) = ctx.get_field(this, 2) {
+    if let Value::Object(Some(list)) = ctx.get_field(this, LLI_FIELD_LIST) {
         if let Some(node) = ll_node_at(ctx, list, idx) {
             ctx.set_field(node, LL_NODE_ELEM, elem);
         }
@@ -34215,11 +34454,72 @@ fn native_ll_listitr_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
 /// mutation must throw `UnsupportedOperationException` rather than silently
 /// no-op'ing (which would mask caller bugs and diverge from real JDK
 /// behaviour). Used for both `remove()` and `add(Object)`.
-fn native_ll_listitr_remove_noop(
-    _ctx: &mut dyn NativeContext,
-    _args: &[Value],
-) -> MethodCallResult {
-    Err(unsupported_op())
+/// `ListItr.remove()` — the JDK's body against this VM's snapshot state.
+///
+/// Was a shared `Err(unsupported_op())` stub with `add`. `LinkedList` is a
+/// `List`, `listIterator()` is specified to return a mutating iterator, and
+/// `AbstractList`'s own `removeAll`/`retainAll`/`Collection.removeIf` defaults
+/// all reach it — so the stub did not merely lose a feature, it made every
+/// default method that drains a `LinkedList` through its list-iterator throw.
+fn native_ll_listitr_remove(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Err(sli_illegal_state(ctx)),
+    };
+    let cursor = match ctx.get_field(this, LLI_FIELD_CURSOR) {
+        Value::Int(v) => v,
+        _ => 0,
+    };
+    let idx = lli_target_index(&*ctx, this, cursor);
+    if idx < 0 {
+        return Err(sli_illegal_state(ctx));
+    }
+    let list = match ctx.get_field(this, LLI_FIELD_LIST) {
+        Value::Object(Some(l)) => l,
+        _ => return Err(sli_illegal_state(ctx)),
+    };
+    if let Some(node) = ll_node_at(&*ctx, list, idx) {
+        ll_unlink_node(ctx, list, node);
+    }
+    lli_resnapshot(ctx, this, list);
+    // The JDK's `cursor` bookkeeping: removing an element the iterator has
+    // already passed shifts everything after it down by one.
+    if idx < cursor {
+        ctx.set_field(this, LLI_FIELD_CURSOR, Value::Int(cursor - 1));
+    }
+    lli_set_last_ret(ctx, this, -1);
+    Ok(None)
+}
+
+/// `ListItr.add(e)` — insert before the implicit cursor, per the JDK: the new
+/// element goes where `next()` would have read, `nextIndex()` advances past it,
+/// and `lastRet` is cleared so an immediately following `set`/`remove` raises.
+fn native_ll_listitr_add(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(None),
+    };
+    let elem = args.get(1).copied().unwrap_or(Value::Object(None));
+    let cursor = match ctx.get_field(this, LLI_FIELD_CURSOR) {
+        Value::Int(v) => v,
+        _ => 0,
+    };
+    let list = match ctx.get_field(this, LLI_FIELD_LIST) {
+        Value::Object(Some(l)) => l,
+        _ => return Ok(None),
+    };
+    native_ll_add_at(
+        ctx,
+        &[
+            Value::Object(Some(list)),
+            Value::Int(cursor.max(0)),
+            elem,
+        ],
+    )?;
+    lli_resnapshot(ctx, this, list);
+    ctx.set_field(this, LLI_FIELD_CURSOR, Value::Int(cursor.max(0) + 1));
+    lli_set_last_ret(ctx, this, -1);
+    Ok(None)
 }
 
 fn native_ll_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -35215,10 +35515,16 @@ fn native_ll_itr_remove(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         Value::Object(Some(n)) => n,
         _ => {
             // `remove()` before `next()`, or twice in a row.
-            return Err(cratonvm_types::error::RuntimeError::IllegalStateException {
-                message: "remove".to_string(),
-            }
-            .into());
+            //
+            // Through `sli_illegal_state`, which builds the exception with NO
+            // message. `RuntimeError::IllegalStateException` always supplies
+            // one, so this printed `java.lang.IllegalStateException: remove`
+            // where HotSpot prints `java.lang.IllegalStateException` —
+            // `Throwable.toString()` omits the suffix only for a null message.
+            // The `"remove"` text belongs to `Iterator.remove()`'s throwing
+            // DEFAULT, which is a different exception from a different class;
+            // copying it here made the two indistinguishable in a log.
+            return Err(sli_illegal_state(ctx));
         }
     };
     let list = match ctx.get_field(this, 1) {
@@ -53917,6 +54223,21 @@ fn native_collections_synchronized_collection(
 // mutators throw.
 fn native_list_copy_of(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let src = args.first().copied().unwrap_or(Value::Object(None));
+    // `List.copyOf(x) == x` when `x` is ALREADY immutable — not an optimisation
+    // the JDK left implicit: `ImmutableCollections.listCopy` returns its
+    // argument, and application code compares the two with `==`. The
+    // independent-snapshot rule above still holds for everything else, which is
+    // what `already_immutable_of` is careful about.
+    if let Some(same) = already_immutable_of(ctx, src, UNMOD_LIST_CLASS) {
+        return Ok(Some(Value::Object(Some(same))));
+    }
+    if let Value::Object(Some(s)) = src {
+        if source_collection_has_null(ctx, s) {
+            return Err(MethodCallFailed::from(RuntimeError::NullPointerException {
+                message: None,
+            }));
+        }
+    }
     let backing = try_alloc_synthetic(ctx, "java/util/ArrayList", AL_NUM_FIELDS)?;
     native_al_init_from_collection(ctx, &[Value::Object(Some(backing)), src])?;
     Ok(Some(Value::Object(Some(alloc_immutable_wrapper(
@@ -53928,6 +54249,20 @@ fn native_list_copy_of(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
 
 fn native_set_copy_of(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let src = args.first().copied().unwrap_or(Value::Object(None));
+    // Identity for an already-immutable source, as `List.copyOf`. NOTE the
+    // asymmetry with `Set.of`: `copyOf` DEDUPLICATES and must not throw on a
+    // repeat (`Set.copyOf(List.of("a","a")).size() == 1`); only nulls are
+    // rejected.
+    if let Some(same) = already_immutable_of(ctx, src, UNMOD_SET_CLASS) {
+        return Ok(Some(Value::Object(Some(same))));
+    }
+    if let Value::Object(Some(s)) = src {
+        if source_collection_has_null(ctx, s) {
+            return Err(MethodCallFailed::from(RuntimeError::NullPointerException {
+                message: None,
+            }));
+        }
+    }
     let backing = try_alloc_synthetic(ctx, "java/util/HashSet", HS_NUM_FIELDS)?;
     native_hs_init_from_collection(ctx, &[Value::Object(Some(backing)), src])?;
     Ok(Some(Value::Object(Some(alloc_immutable_wrapper(
@@ -53939,6 +54274,9 @@ fn native_set_copy_of(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
 
 fn native_map_copy_of(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let src = args.first().copied().unwrap_or(Value::Object(None));
+    if let Some(same) = already_immutable_of(ctx, src, UNMOD_MAP_CLASS) {
+        return Ok(Some(Value::Object(Some(same))));
+    }
     // GC-safety: the allocation and the copy-in below both collect; `src` and
     // `backing` are bare locals used after each. See `rooted_across`.
     let src_pin = pin_value(ctx, src);
@@ -53952,6 +54290,17 @@ fn native_map_copy_of(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         ctx.unpin_native_roots(src_pin);
     }
     copied?;
+    // `Map.copyOf` rejects a null key or value, like the `of` factories. Read
+    // off the BUILT backing (ours, so the walk is a field read) rather than
+    // re-entering the source's `entrySet`.
+    if map_collect_entries(ctx, backing)
+        .iter()
+        .any(|(k, v)| matches!(k, Value::Object(None)) || matches!(v, Value::Object(None)))
+    {
+        return Err(MethodCallFailed::from(RuntimeError::NullPointerException {
+            message: None,
+        }));
+    }
     let wrapper = alloc_immutable_wrapper(ctx, UNMOD_MAP_CLASS, backing)?;
     Ok(Some(Value::Object(Some(wrapper))))
 }

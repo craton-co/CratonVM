@@ -132,6 +132,37 @@ binary, so none of them moved. They are `LinkedList$ListItr`'s class identity,
 caused nor closed. **Taking the control run is what makes that a measurement
 rather than an assumption**, and it cost one worktree and two minutes.
 
+> **Two of those three closed on 2026-08-15** (`fix/intobjecthashmap-sigsegv-20260815`),
+> and one of them was not a collections gap at all:
+>
+> * `ImmutableCollectionsDifferentialProbe` — 16 diverging lines to **0**.
+>   `List.of`/`Set.of`/`Map.of` now reject a null element (bare NPE) and a
+>   repeat (`IllegalArgumentException: duplicate element: a`), and
+>   `List.copyOf(x) == x` holds for an already-immutable `x`. The validation
+>   sits at the `of` ENTRY POINTS, never in `make_set_of`/`make_map_of` —
+>   `Set.copyOf` deduplicates by contract and shares those builders.
+> * `UnmodifiableListIteratorJitProbe` — 6 diverging lines to **0**. This one
+>   was never about `unmodifiableList`: it was a ZGC page slide relocating an
+>   object held only by a conservative JIT-frame slot, because every producer of
+>   `pinned_jit_roots_snapshot()` was still gated on `is_g1()`. See the retired
+>   `intobjecthashmaptest-discovery-sigsegv-20260814` write-up; the narrowed
+>   witness is `probes/JitFrameRootRelocationProbe`.
+>
+> `ListItrInterfaceProbe` is still 8 lines on both arms and is now the whole of
+> this page's residual: `LinkedList.listIterator()` answers
+> `cratonvm.internal.LinkedListSnapshotListItr` where HotSpot answers
+> `java.util.LinkedList$ListItr`, its `getInterfaces()` carries a `java.util.Iterator`
+> the JDK's does not declare, and `LinkedList.iterator()` answers
+> `java.util.LinkedList$Itr` — **a class the real JDK does not have at all**
+> (`AbstractSequentialList.iterator()` IS `listIterator()`). The recipe is this
+> page's own: the real class as carrier, state in the undeclared slots past
+> `class_num_total_fields`, and an `sli_base_checked`-shaped ownership test so a
+> java.base-built iterator delegates to its own bytecode. It was left alone here
+> because that carrier is load-bearing for Kafka `ConfigDef` and Spring
+> `processDeferredImportSelectors` paths this session had no fixture for, and a
+> class-identity row is not worth landing a change whose regression surface
+> cannot be measured.
+
 `cargo test -p cratonvm-native-collections --all-targets`: green.
 
 ## Repro

@@ -223,10 +223,13 @@ pub(super) fn stw_take_over_and_wait(
     // Generational degrades to the non-moving sweep that consumes the JIT
     // TLAB skip regions; G1 (INT-3) skips the published tails in every region
     // walker and pins everything a frozen peer can address out of the CSet
-    // (see `pin_frozen_peer_roots_for_g1`); ZGC (INT-3 residual) is trivially
-    // safe — non-moving, registry-walked sweep, and its mutators never hold
-    // TLABs. The `supports_jit_tlab_skip` gate is retained for any future
-    // backend that can't make one of those arguments.
+    // (see `pin_frozen_peer_roots_for_moving_collector`); ZGC used to be
+    // trivially safe here — "non-moving, registry-walked sweep" — and stopped
+    // being so on 2026-08-13, when its page-slide compaction shipped. It now
+    // takes the same pin as G1, through the same function; only its mutators
+    // never holding TLABs is still a ZGC-specific argument. The
+    // `supports_jit_tlab_skip` gate is retained for any future backend that
+    // can't make one of those arguments.
     if !xt::enabled() || !shared.mem.heap.supports_jit_tlab_skip() {
         shared.mem.gc_barrier.wait_for_all();
         return xt::TakenOver::default();
@@ -509,7 +512,8 @@ pub(super) fn stw_take_over_and_wait(
     taken
 }
 
-/// INT-3 (G1) — pin-in-place everything a forcibly-frozen peer can address.
+/// INT-3 — pin-in-place everything a forcibly-frozen peer can address, on
+/// every backend that relocates.
 ///
 /// A frozen peer is excused from the STW barrier, so it never applies this
 /// collection's pointer map to its own state; under an EVACUATING collector
@@ -532,15 +536,17 @@ pub(super) fn stw_take_over_and_wait(
 /// region out of one CSet. MUST run after `collect_roots` (which clears the
 /// initiator's entry) and before `collect_garbage`.
 ///
-/// No-op on non-G1 backends: Generational frozen-peer cycles run the fully
-/// non-moving sweep (`mark_moving_young_coverage_incomplete`), so nothing
-/// moves and no pin is needed.
-pub(super) fn pin_frozen_peer_roots_for_g1(
+/// No-op wherever `VmHeap::pins_conservative_jit_roots` is false: Generational
+/// frozen-peer cycles run the fully non-moving sweep
+/// (`mark_moving_young_coverage_incomplete`), so nothing moves and no pin is
+/// needed. It answers for ZGC too — it was `is_g1()` until 2026-08-15, which
+/// left ZGC's own pin CONSUMER reading an empty registry.
+pub(super) fn pin_frozen_peer_roots_for_moving_collector(
     shared: &SharedVm,
     xt_roots: &[ObjectRef],
     taken: &crate::jit::xt_root_scan::TakenOver,
 ) {
-    if !shared.mem.heap.is_g1() {
+    if !shared.mem.heap.pins_conservative_jit_roots() {
         return;
     }
     for r in xt_roots {
@@ -1090,7 +1096,7 @@ pub(crate) fn maybe_gc(shared: &SharedVm, thread: &mut JvmThread) {
                 roots.extend(snapshot_roots);
                 // INT-3 (G1) — everything a frozen peer can address must not
                 // move; must follow collect_roots (which clears the pins).
-                pin_frozen_peer_roots_for_g1(shared, &xt_roots, &taken);
+                pin_frozen_peer_roots_for_moving_collector(shared, &xt_roots, &taken);
                 // BUG-03 — conservative roots from forcibly-stopped in-JIT peers.
                 roots.extend(xt_roots);
 
@@ -1365,7 +1371,7 @@ pub(super) fn maybe_gc_forced(shared: &SharedVm, thread: &mut JvmThread) {
             roots.extend(snapshot_roots);
             // INT-3 (G1) — everything a frozen peer can address must not
             // move; must follow collect_roots (which clears the pins).
-            pin_frozen_peer_roots_for_g1(shared, &xt_roots, &taken);
+            pin_frozen_peer_roots_for_moving_collector(shared, &xt_roots, &taken);
             roots.extend(xt_roots); // BUG-03 cross-thread JIT conservative roots
                                     // STW invariant: `wait_for_all()` returned — every mutator
                                     // has parked at its safepoint poll (or, BUG-03, been forcibly
@@ -1663,7 +1669,7 @@ pub fn force_gc_from_native(shared: &SharedVm, thread: &mut JvmThread) {
             roots.extend(snapshot_roots);
             // INT-3 (G1) — everything a frozen peer can address must not
             // move; must follow collect_roots (which clears the pins).
-            pin_frozen_peer_roots_for_g1(shared, &xt_roots, &taken);
+            pin_frozen_peer_roots_for_moving_collector(shared, &xt_roots, &taken);
             roots.extend(xt_roots); // BUG-03 cross-thread JIT conservative roots
                                     // STW invariant: `wait_for_all()` returned — every mutator
                                     // has parked at its safepoint poll (or, BUG-03, been forcibly
@@ -4205,24 +4211,25 @@ pub(crate) fn update_root_snapshot(shared: &SharedVm, thread: &mut JvmThread) {
         let jit_scan_start = snapshot.len();
         crate::memory::native_roots::rootprof::note_scan_caller(1); // safepoint
         crate::jit::conservative_roots::scan_active_jit_frames(&shared.mem.heap, &mut snapshot);
-        // G1 pin-in-place, cross-thread half: the snapshot keeps these
-        // conservatively-discovered objects ALIVE, but under G1 (a moving
-        // collector) their regions must also be EXCLUDED from the collection
-        // set — the JIT register/spill slots holding them cannot be
-        // rewritten when the object moves. The initiator only publishes its
+        // Pin-in-place, cross-thread half: the snapshot keeps these
+        // conservatively-discovered objects ALIVE, but under a collector that
+        // MOVES them their regions/pages must also be EXCLUDED from what it is
+        // about to relocate — the JIT register/spill slots holding them cannot
+        // be rewritten when the object moves. The initiator only publishes its
         // OWN JIT roots (roots.rs); every parked/blocked mutator must
         // publish here, into the process-global per-thread pin registry
-        // consumed by `G1Collector::jit_pinned_region_set`. Replace
+        // consumed by `G1Collector::jit_pinned_region_set` AND by ZGC's
+        // relocation-set filter. Replace
         // semantics: a deposit with no live JIT frames clears this thread's
         // stale pins.
-        if shared.mem.heap.is_g1() {
+        if shared.mem.heap.pins_conservative_jit_roots() {
             let addrs: Vec<usize> = snapshot[jit_scan_start..]
                 .iter()
                 .map(|r| r.as_ptr() as usize)
                 .collect();
             cratonvm_gc::gc_quiescence::publish_pinned_jit_roots(&addrs);
         }
-    } else if shared.mem.heap.is_g1() {
+    } else if shared.mem.heap.pins_conservative_jit_roots() {
         // Precise-relocation mode covers every JIT oop with rewritable
         // shadow-stack slots — no conservative pins needed; drop stale ones.
         cratonvm_gc::gc_quiescence::publish_pinned_jit_roots(&[]);

@@ -1979,14 +1979,54 @@ impl VmHeap {
         matches!(self, VmHeap::G1(_))
     }
 
+    /// Does this backend PIN a conservatively-discovered JIT-frame root in
+    /// place, rather than relocate the object it names?
+    ///
+    /// Ask this — never `is_g1()` — at every root deposit that publishes into
+    /// [`crate::gc_quiescence::publish_pinned_jit_roots`] /
+    /// [`crate::gc_quiescence::add_pinned_jit_root`].
+    ///
+    /// `pinned_jit_roots_snapshot()` has a PRODUCER side (the VM's root
+    /// deposits) and a CONSUMER side (the collector's collection-set /
+    /// relocation-set filter), and for two days they named different
+    /// collectors: `caf25c3d1` gave ZGC the consumer, and every producer stayed
+    /// gated on `is_g1()`. So under ZGC the snapshot was empty on every cycle,
+    /// the consumer dropped no page, and the pin looked implemented while
+    /// pinning nothing — a capability that is false everywhere reads as an
+    /// absence, not as a bug. The behavioural tell was one Java object in
+    /// 200 000 with a `null` `final` field: its `this` lived only in a compiled
+    /// `<init>` frame, the slide moved it, the un-rewritable frame slot kept
+    /// the old address, and the `putfield` landed in the vacated span.
+    ///
+    /// * `G1` always evacuates, so it must pin (learned 2026-08-11).
+    /// * `Generational` runs its young sweep NON-MOVING while any thread is in
+    ///   JIT, so nothing moves and no pin is needed.
+    /// * `Zgc` only once compaction is actually intended. With
+    ///   `CRATONVM_ZGC_RELOCATE=0` the cycle moves nothing, so publishing would
+    ///   be pure cost — and keeping it off there is what keeps that kill switch
+    ///   a re-run rather than a different code path. This asks *intent*
+    ///   (`relocation_requested`), not the `vm_init` safety gate: over-pinning
+    ///   when the safety gate later refuses costs one page of reclaim, while
+    ///   under-pinning corrupts the heap.
+    pub fn pins_conservative_jit_roots(&self) -> bool {
+        match self {
+            VmHeap::G1(_) => true,
+            VmHeap::Generational(_) => false,
+            #[cfg(feature = "zgc")]
+            VmHeap::Zgc(h) => h.relocation_requested(),
+        }
+    }
+
     /// Returns whether this heap is the Generational collector — the only
     /// backend with a MOVING YOUNG generation.
     ///
     /// Exists because "does moving-young apply here?" was being answered by
     /// `conservative_roots::moving_young_enabled()`, which ANDs a JIT-side gate
     /// with `flags().gc.moving_young` and consults the collector in neither. G1
-    /// evacuates by region and ZGC never moves anything, so on both of them the
-    /// precise-moving-young question — and the unmemoised full-stack probe that
+    /// evacuates by region and ZGC compacts by page slide (2026-08-13 — the
+    /// "ZGC never moves anything" this line used to say is the premise
+    /// pins_conservative_jit_roots exists to stop anyone re-deriving), so on
+    /// both of them the precise-moving-young question — and the unmemoised full-stack probe that
     /// answers it — is inert work. See the two `moving_young_precise_only`
     /// sites.
     pub fn is_generational(&self) -> bool {
@@ -3929,6 +3969,60 @@ mod concurrent_mark_controller_tests {
             heap.load_and_forward(obj).as_ptr(),
             obj.as_ptr(),
             "an implausible forwarding target must fall back to the original pointer"
+        );
+    }
+    /// **The pin PRODUCER answers for every collector that consumes it.**
+    ///
+    /// `gc_quiescence::pinned_jit_roots_snapshot()` had a ZGC consumer
+    /// (`caf25c3d1`) and no ZGC producer: every deposit that publishes into it
+    /// asked `is_g1()`. The snapshot was therefore empty on every ZGC cycle,
+    /// the relocation-set filter dropped nothing, and the pin looked
+    /// implemented while pinning nothing.
+    ///
+    /// `a_conservative_jit_root_pins_its_page_against_relocation` in `zgc.rs`
+    /// could not catch that: it calls `add_pinned_jit_root` itself, so it
+    /// tests the consumer over a snapshot the VM would never have filled.
+    /// This is the other half.
+    #[test]
+    fn every_relocating_backend_pins_conservative_jit_roots() {
+        assert!(
+            VmHeap::new(GcBackend::G1, 16 * 1024 * 1024).pins_conservative_jit_roots(),
+            "G1 always evacuates, so a conservative JIT root must pin its region"
+        );
+        assert!(
+            !VmHeap::new(GcBackend::Generational, 16 * 1024 * 1024).pins_conservative_jit_roots(),
+            "the generational young sweep runs NON-MOVING while any thread is in JIT, \
+             so a pin would be pure cost"
+        );
+    }
+
+    /// The ZGC arm of the same question, on both sides of its kill switch.
+    /// `CRATONVM_ZGC_RELOCATE=0` must stay a re-run rather than a different
+    /// code path, so the producer has to go quiet with it.
+    #[cfg(feature = "zgc")]
+    #[test]
+    fn zgc_pins_conservative_jit_roots_exactly_when_it_intends_to_compact() {
+        let heap = VmHeap::new(GcBackend::Zgc, 16 * 1024 * 1024);
+        cratonvm_types::flags::with_thread_overrides(
+            &[("CRATONVM_ZGC_RELOCATE", Some("1"))],
+            || {
+                assert!(
+                    heap.pins_conservative_jit_roots(),
+                    "compaction shipped 2026-08-13; a conservative JIT root names an \
+                     object whose holding slot the collector cannot rewrite, so it \
+                     must not move"
+                );
+            },
+        );
+        cratonvm_types::flags::with_thread_overrides(
+            &[("CRATONVM_ZGC_RELOCATE", Some("0"))],
+            || {
+                assert!(
+                    !heap.pins_conservative_jit_roots(),
+                    "with relocation off nothing moves, and publishing pins would make \
+                     the kill switch a different code path instead of an A/B"
+                );
+            },
         );
     }
 }

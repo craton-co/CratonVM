@@ -59,7 +59,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_DBG`
 
-447 tokens.
+448 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -311,6 +311,7 @@ export inherited from a parent shell.
 | `root-source` | `CRATONVM_DBG_ROOT_SOURCE` |
 | `zgc-verify-slide` | `CRATONVM_DBG_ZGC_VERIFY_SLIDE` |
 | `zgc-corpse` | `CRATONVM_DBG_ZGC_CORPSE` |
+| `zgc-pins` | `CRATONVM_DBG_ZGC_PINS` |
 | `atomic-intrinsic` | `CRATONVM_DBG_ATOMIC_INTRINSIC` |
 | `define-filter` | `CRATONVM_DBG_DEFINE_FILTER` |
 | `define-stack-filter` | `CRATONVM_DBG_DEFINE_STACK_FILTER` |
