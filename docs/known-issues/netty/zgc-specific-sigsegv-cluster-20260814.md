@@ -8,6 +8,23 @@ ZGC. Four root-caused defects landed between `6a206f689` and `caf25c3d1`; the
 See "Current validation" below for the table that supersedes both earlier
 fix-validation sections.
 
+**Update, later on 2026-08-15.** That residual turned out to be TWO defects
+sharing one signature, and both now have their own pages:
+
+* `zgc-resourceleakdetector-corpse-read-20260815.md` — a compiled frame holding
+  a `DefaultResourceLeak` pointer in a register across a slide. ZGC never read
+  `gc_quiescence::is_active()`, the flag `gen_heap` (9 sites) and `g1` (6 sites)
+  use to decline relocation while a JIT frame is live. **Fixed.**
+* `zgc-rewrite-pass-walks-off-a-reference-array-20260815.md` — the collector
+  faulting inside its own post-slide rewrite pass, reproducible with `--nojit`.
+  **Open.**
+
+Two corrections to what this page records about that class: it crashes ~60% of
+the time, not on every run (measured 6/10, `--nojit` 2/10, `RELOCATE=0` 0/10),
+and two further ZGC defects were found and fixed on the way there — the
+reference-processor tables and the resurrected-finalizer list, both holding
+pre-slide addresses.
+
 Originally found on Windows running the **full** 657-class netty suite (not a
 non-passed subset) in 2 GC variants, G1 and ZGC, 4 shards each, identical
 binary built from commit `6a206f689` (merged fresh to `origin/dev`).
