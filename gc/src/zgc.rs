@@ -8206,7 +8206,12 @@ impl GarbageCollector for ZgcRealHeap {
                 if header.gc_flags() & GC_FLAG_MARKED != 0 {
                     continue; // survived normally — stays registered, not finalized
                 }
-                resurrected.push(addr); // non-moving: address unchanged
+                // Recorded PRE-slide; `collect_garbage` rewrites the list
+                // through the pointer map once relocation has run, because the
+                // contract with `collect_garbage_with_finalizers`'s caller is
+                // POST-move addresses. This line used to say "non-moving:
+                // address unchanged".
+                resurrected.push(addr);
                 work.push(addr);
                 while let Some(a) = work.pop() {
                     if a == 0 || !registered.contains(a) {
@@ -8654,6 +8659,28 @@ impl GarbageCollector for ZgcRealHeap {
         // slide, so no dead entry is left for a survivor to inherit.
         if !pointer_map.is_empty() {
             self.ref_processor.lock().update_after_gc(&pointer_map);
+
+            // SAME FAMILY: the resurrected-finalizer list is an OUTPUT, and
+            // its contract says POST-move.
+            //
+            // `collect_garbage_with_finalizers` returns these addresses to the
+            // runtime, which enqueues each one on the `FinalizerThread` --
+            // "(their new addresses)", as the call site in
+            // `vm/src/runtime/interpreter/gc_and_alloc.rs` puts it. G1 states
+            // the contract outright: "the POST-copy addresses of objects Phase
+            // 3.5 resurrected this collection".
+            //
+            // Here the list is filled during the remark, several phases BEFORE
+            // the slide, and nothing rewrote it. Every resurrected object is by
+            // definition live, so it is exactly the kind of object the slide
+            // relocates -- and `finalize()` would then run against the vacated
+            // address.
+            let mut resurrected = self.resurrected_finalizers.lock();
+            for addr in resurrected.iter_mut() {
+                if let Some(&new) = pointer_map.get(addr) {
+                    *addr = new;
+                }
+            }
         }
 
         GcResult {
@@ -11211,6 +11238,116 @@ pub(crate) mod tests {
             heap.get_field(roots[0], 0),
             Value::Object(None),
             "the reachable child must have survived the driven cycle"
+        );
+    }
+
+    /// **A resurrected finalizable object must be reported at its POST-SLIDE
+    /// address.**
+    ///
+    /// `collect_garbage_with_finalizers` returns the addresses of objects the
+    /// remark resurrected, and the runtime enqueues each one on the
+    /// `FinalizerThread` -- "(their new addresses)", per the call site in
+    /// `vm/src/runtime/interpreter/gc_and_alloc.rs`. G1 states the contract
+    /// outright: "the POST-copy addresses of objects Phase 3.5 resurrected
+    /// this collection".
+    ///
+    /// ZGC filled the list during the remark, several phases before the slide,
+    /// and never rewrote it -- under a comment reading "non-moving: address
+    /// unchanged". A resurrected object is live by definition, so it is
+    /// precisely what the slide relocates, and `finalize()` would then run
+    /// against a vacated address.
+    ///
+    /// The exact edit that trips it: drop the `resurrected_finalizers` remap
+    /// in `collect_garbage`.
+    #[test]
+    fn a_resurrected_finalizable_object_is_reported_at_its_post_slide_address() {
+        const PAGE: usize = ZgcRealHeap::Z_LOGICAL_PAGE_BYTES;
+        const FIELDS: usize = 500;
+        let heap = ZgcRealHeap::with_capacity(64 * 1024 * 1024);
+        heap.set_tlab_enabled(false);
+
+        let per_page = PAGE / (HEADER_SIZE + FIELDS * SLOT_SIZE);
+        let mut roots: Vec<ObjectRef> = Vec::new();
+        let mut finalizable: Vec<usize> = Vec::new();
+        for _page in 0..4 {
+            for i in 0..per_page {
+                let o = heap.alloc_object(ClassId::new(1), FIELDS);
+                // Both survivor kinds are counted against the selector's
+                // `max_live_occupancy` (0.25), so 1-in-5 each would leave every
+                // page 40% live and the selector would decline the whole heap
+                // -- nothing moves and the test passes vacuously. 1-in-12 each
+                // keeps total occupancy near 17%.
+                match i % 12 {
+                    // Rooted: ordinary survivors.
+                    0 => roots.push(o),
+                    // Unrooted AND registered for finalization: dead by the
+                    // trace, resurrected by the remark.
+                    1 => finalizable.push(o.as_ptr() as usize),
+                    _ => {}
+                }
+            }
+        }
+        assert!(!finalizable.is_empty(), "fixture registered no finalizables");
+
+        // SAFETY: these unit tests run the heap single-threaded.
+        let stw = unsafe { StopTheWorldToken::new() };
+        let monitors = NoMonitors;
+        let (result, reported) = cratonvm_types::flags::with_thread_overrides(
+            &[("CRATONVM_ZGC_RELOCATE", Some("1"))],
+            || heap.collect_garbage_with_finalizers(&stw, &mut roots, &finalizable, &monitors),
+        );
+        assert!(
+            !reported.is_empty(),
+            "nothing was resurrected, so a stale address could not be observed"
+        );
+
+        // Non-vacuity measured from the POINTER MAP, not from `reported`.
+        //
+        // Deriving it from `reported` looks natural and is a trap: with the
+        // remap missing, `reported` holds the pre-slide addresses, so "how
+        // many reported addresses differ from their input" is ZERO -- and the
+        // test then fails on its own vacuity guard, which reads as a broken
+        // fixture rather than as the defect. The pointer map is the collector's
+        // own record of what moved and is unaffected by the bug under test.
+        let relocated: Vec<usize> = finalizable
+            .iter()
+            .copied()
+            .filter(|a| result.pointer_map.contains_key(a))
+            .collect();
+        assert!(
+            !relocated.is_empty(),
+            "the slide relocated none of the {} resurrected object(s), so this              fixture cannot see a missing remap -- check that page occupancy is              below the selector's max_live_occupancy",
+            reported.len()
+        );
+
+        let stale: Vec<usize> = reported
+            .iter()
+            .copied()
+            .filter(|a| !heap.registry.contains(*a))
+            .collect();
+        assert!(
+            stale.is_empty(),
+            "{} of {} resurrected finalizable object(s) were reported at an              address that is not a live allocation base after the slide (first              0x{:x}). The runtime enqueues these on the FinalizerThread, so              `finalize()` would run against a vacated span.",
+            stale.len(),
+            reported.len(),
+            stale[0],
+        );
+
+        // And each object that DID move must be reported at its destination.
+        let reported_set: std::collections::HashSet<usize> =
+            reported.iter().copied().collect();
+        let missing: Vec<usize> = relocated
+            .iter()
+            .copied()
+            .filter(|a| !reported_set.contains(&result.pointer_map[a]))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "{} of {} relocated resurrected object(s) are reported at their              PRE-slide address (first: was 0x{:x}, is now 0x{:x})",
+            missing.len(),
+            relocated.len(),
+            missing[0],
+            result.pointer_map[&missing[0]],
         );
     }
 
