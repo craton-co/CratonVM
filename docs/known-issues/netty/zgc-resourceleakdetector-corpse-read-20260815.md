@@ -65,12 +65,51 @@ crash dump supplies Java frames instead. Worth knowing before reaching for
 |---|---|---|
 | the rewrite pass misses a reference slot | **no** | `missed_rewrites=0` (slide verifier) |
 | stale words alias live objects | **no** | `aliasing_a_survivor=0` |
-| compaction is not the trigger | **no**, it is | `CRATONVM_ZGC_RELOCATE=0` → 5/5 clean; on → 0/15 |
+| compaction is not the trigger | **no**, it is | 10 interleaved reps each: `RELOCATE=0` **0/10** crash, compaction on **6/10** |
 | the object died and this is a lifetime bug | **no** | `survivor_still_registered=true` |
 | JIT frames are the only holder | **no** | `--nojit` reduces but does not remove |
 | ZGC's heap-internal `ReferenceProcessor` holds it | **no** — it is EMPTY | `ZgcRealHeap::discover_reference` has no caller in the VM |
 | the VM-level `ref_processor` is never remapped | **no** | `ref_proc.update_after_gc` runs at the end of `process_references_after_gc` |
 | some collection path skips that remap | **no** | all six `collect_garbage_with_finalizers` sites call it; the four bare `collect_garbage` sites are tests |
+
+## The crash is INTERMITTENT, and the corpse read is not fatal by itself
+
+Thirty runs, one binary, interleaved, only the environment varied:
+
+| arm | SIGSEGV |
+|---|---|
+| ZGC, compaction on | **6/10** |
+| ZGC, `CRATONVM_ZGC_RELOCATE=0` | **0/10** |
+| ZGC + `CRATONVM_DBG_ROOT_SOURCE=1` | 2/10 |
+
+Two things follow that the earlier record got wrong.
+
+**It is not 0/15.** This page's parent recorded the class as crashing on every
+run. On current `dev` it crashes about 60% of the time; the other 40% complete
+and report `found=3 ok=0 failed=3` (the separate, GC-independent
+`NoSuchMethodError` on `DefaultResource.close`). Whether the two fixes landed
+today moved that rate is **not established** — the pre-fix binaries had to be
+discarded for provenance, so there is no clean before-arm to compare against.
+
+**The attribution flag is a variable, not a neutral observer.** It builds a
+`Vec` of every root each scan, and the crash rate falls from 6/10 to 2/10 with
+it on. Anything measured with it on is measuring a different program.
+
+**A corpse read does not imply a crash.** Runs that completed normally logged
+up to five of them. So the stale write lands somewhere harmless most times and
+somewhere fatal sometimes — consistent with "whatever now occupies the vacated
+address" being sometimes an object with a field 0 and sometimes not.
+
+**The reads are strikingly uniform.** Across every run that logged one, all 35:
+
+```
+class=io/netty/util/ResourceLeakDetector$DefaultResourceLeak
+size=176   index=0   cycles_ago=0   survivor_still_registered=true
+```
+
+One class, one field, one size, always the cycle immediately after the slide,
+survivor always alive. That is a single code path, not a scattering of stale
+pointers — which is worth more than any single sample.
 
 ## Two defects found and fixed on the way — neither closes this
 
@@ -100,28 +139,51 @@ Measured 73 of 88 at a dead address per collection. **This one is on a live
 path** (`collect_garbage_with_finalizers` is what the VM calls) and stands on
 its own merits.
 
+## What the root-source lever answered, and why it was not enough
+
+`CRATONVM_DBG_ROOT_SOURCE=1` was the named next step on the parent page. It is
+now wired through to the collector (`gc_quiescence::install_root_source_hook`),
+so a corpse line carries `root_source=`. On the repro it says:
+
+```
+root_source="<none: not handed to the marker as a root>"
+```
+
+That rules out all 26 named root sources as the DIRECT holder. It is weaker
+than it looks, and the reason is worth writing down: an object reachable
+through the Java object graph is legitimately not a direct root, so `<none>` is
+the *expected* answer for one and does not locate the stale address. The lever
+answers "who rooted this object", and the question here is "who kept a copy of
+its old address" — related, not the same. Keep the instrument; it is cheap and
+it did close off a whole inventory. Do not expect it to name the holder.
+
 ## Where to look next
 
-The holder is not either reference processor and not the Java slot graph. What
-is left is a **collector-side or runtime-side structure that stores a
-`Reference` address and outlives the cycle**. The corpse line's new
-`root_source=` field answers this directly on the next run: a named source
-means that source's remap half is incomplete; `<none>` means the holder never
-hands the address to the marker at all, which is a different and narrower
-search.
+The holder is not either reference processor, not the Java slot graph, and not
+a named root source. What is left is a structure that stores a `Reference`
+address, outlives the cycle, and is never scanned.
 
-Note the family pattern before starting. Five defects so far, every one code
-that was correct while the collector never moved an object:
+**The cheapest next bit is already built and unmeasured: READ or WRITE.**
+`check_field_index` is shared by `get_field` and `set_field`, and now takes an
+`op` tag that the corpse line reports. `index=0` on a `Reference` means:
 
-1. `pin_critical_region` pinned nothing under ZGC
-2. the reference-processing guard tested the pre-move address
-3. `prune_dead` ran with pre-slide addresses
-4. the heap-internal reference-processor tables (inert)
-5. `resurrected_finalizers`
+* **write** → somebody is clearing a referent through a stale address. The
+  search is every `set_field(x, 0, ...)` reachable from a stored address.
+* **read** → somebody is servicing `Reference.get` or netty is reading its own
+  field. A completely different search.
 
-1–3 are within-cycle and were found by their crashes. 4–5 are cross-cycle,
-found by asking **which structure outlives the cycle that filled it** — which
-is the question to keep asking here.
+Everything else is guessing until that bit is in hand.
+
+Two other things a follow-up should carry:
+
+* **The uniformity is the strongest clue.** 35 of 35 corpse reads are the same
+  class, same field, same size, same `cycles_ago=0`. Whatever holds the address
+  does so on one code path, deterministically, every cycle — it is not a race
+  in the holder, only in whether the resulting write lands on something fatal.
+* **`--nojit` reduces but does not remove it.** So at least one holder is not a
+  JIT frame, but JIT frames may be a second one. Re-measure that with 10 reps
+  now that the base rate is known to be ~60% and not 100% — the earlier reading
+  was taken against an assumed-deterministic crash.
 
 ## Measurement traps recorded
 
