@@ -18,7 +18,7 @@ rather than reading it as a TLS defect.
 | `JdkSslEngineTest` | 707 / 821, 48 failed | **755 / 821, 0 failed** ✅ | 755, 0 failed |
 | `JdkDelegatingPrivateKeyMethodTest` | 1 / 27 | **10 / 27** | 27 / 27 |
 | `OpenSslPrivateKeyMethodTest` | 24 / 24 | 24 / 24 | 3 / 24 |
-| `SslHandlerTest` | 47 / 54 | 47 / 54 | 53 / 54 |
+| `SslHandlerTest` | 47 / 54 | **48 / 54** | 53 / 54 |
 | `SslContextBuilderTest` | 21 / 21 | 21 / 21 ✅ | 21 / 21 |
 | `ParameterizedSslHandlerTest` | never finished, or hangs | **61 / 63 in 114–125 s, 3/3 runs** | 63 / 63 |
 
@@ -99,7 +99,7 @@ Two cheap moves that are still worth making: `keystore::engine_set_key_entry`
 still drops an entry silently on `if key_der.is_empty() { return Ok(None) }`,
 and should say something.
 
-## B — `SslHandlerTest`, 47 / 54 (HotSpot 53 / 54)
+## B — `SslHandlerTest`, 48 / 54 (HotSpot 53 / 54)
 
 * `testHandshakeFailureCipherMissmatchTLSv12Jdk` / `TLSv13Jdk` — the SERVER's
   handshake future still fails with `StacklessClosedChannelException` where
@@ -113,12 +113,16 @@ and should say something.
   exception not being raised on this particular path or a race with the peer's
   close. Trace `do_wrap`/`do_unwrap` on the SERVER engine with
   `CRATONVM_DBG_TLS_HS=1` before designing anything.
-* `testTruncatedPacket` — now throws, but `SSLHandshakeException` where JSSE
-  raises `SSLProtocolException`. A protocol violation (a ServerHello sent TO a
-  server) is a different class from a certificate or negotiation failure;
-  `do_unwrap`'s handshake-error arm should pick the class from the rustls
-  error kind (`InappropriateHandshakeMessage`, `InappropriateMessage`,
-  `PeerMisbehaved` → `SSLProtocolException`).
+* ~~`testTruncatedPacket`~~ — FIXED. It needed `SSLProtocolException`, not
+  `SSLHandshakeException`: a protocol violation (a ServerHello pushed INTO a
+  server engine) is a different class from a certificate or negotiation
+  failure, and JSSE's `SSLEngineInputRecord` raises exactly that.
+  `do_unwrap`'s handshake-error arm now picks the class from the rustls error
+  kind (`InappropriateMessage`, `InappropriateHandshakeMessage`,
+  `InvalidMessage`, `PeerMisbehaved`, `PeerSentOversizedRecord`,
+  `BadMaxFragmentSize` → `SSLProtocolException`; everything else stays
+  `SSLHandshakeException`), on both the immediate client throw and the
+  deferred server one.
 * `testHandshakeFailureOnlyFireExceptionOnce` — `expected: <false> but was:
   <true>`; unexamined.
 * `testClientHandshakeTimeoutBecauseExecutorNotExecute` /

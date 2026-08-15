@@ -8572,7 +8572,7 @@ pub(crate) struct EngineState {
     /// `StacklessClosedChannelException` — the promise failed by the peer
     /// hanging up, not by the mismatch this engine detected. Deferred to the
     /// wrap that drains the alert instead of dropped.
-    deferred_handshake_error: Option<String>,
+    deferred_handshake_error: Option<(&'static str, String)>,
     /// The `SSLParameters.getEndpointIdentificationAlgorithm()` value the
     /// application configured on this engine ("HTTPS" / "LDAPS"), if any.
     ///
@@ -9531,6 +9531,31 @@ fn wants_deferred_client_auth(ctx_key: Option<u64>) -> bool {
 /// `IOException` is not an `SSLException` at all, so such a caller sees the
 /// wrong type even when the handshake correctly refuses to happen.
 pub(crate) const HANDSHAKE_ERR_PREFIX: &str = "handshake_failure: ";
+
+/// Which `SSLException` subclass JSSE raises for a handshake-phase failure.
+///
+/// `SSLProtocolException` means "the peer broke the protocol" — a message of
+/// the wrong type or at the wrong time, a payload that will not decode, an
+/// implementation that did something RFC-illegal. `SSLHandshakeException`
+/// means "we could not agree", which is everything else here: a rejected
+/// certificate, no cipher suites in common, no ALPN protocol.
+///
+/// The distinction is asserted, not cosmetic: netty's
+/// `SslHandlerTest.testTruncatedPacket` pushes a ServerHello INTO a server
+/// engine and requires `SSLProtocolException` specifically, and JSSE's
+/// `SSLEngineInputRecord` raises exactly that for an unexpected handshake
+/// message.
+fn jsse_handshake_exception_class(e: &rustls::Error) -> &'static str {
+    match e {
+        rustls::Error::InappropriateMessage { .. }
+        | rustls::Error::InappropriateHandshakeMessage { .. }
+        | rustls::Error::InvalidMessage(_)
+        | rustls::Error::PeerMisbehaved(_)
+        | rustls::Error::PeerSentOversizedRecord
+        | rustls::Error::BadMaxFragmentSize => "javax/net/ssl/SSLProtocolException",
+        _ => "javax/net/ssl/SSLHandshakeException",
+    }
+}
 
 /// Turn an `engine_begin` error string into the Java exception JSSE raises for
 /// it — see [`HANDSHAKE_ERR_PREFIX`].
@@ -12651,14 +12676,10 @@ fn do_wrap(
     } else {
         0
     };
-    if let Some(msg) = deferred_failure {
+    if let Some((cls, msg)) = deferred_failure {
         // The alert is in `dst` (or already went out on an earlier wrap), so
         // the peer learns why; this side now learns it too.
-        return Err(crate::phases_early::throw_jca_exc(
-            ctx,
-            "javax/net/ssl/SSLHandshakeException",
-            &msg,
-        ));
+        return Err(crate::phases_early::throw_jca_exc(ctx, cls, &msg));
     }
 
     let total_consumed = consumed_app.max(consumed_inner) as i32;
@@ -12953,7 +12974,7 @@ fn do_unwrap(
         // network data"), and answering UNDERFLOW when nothing more is coming is
         // how a caller spins.
         let mut dst_too_small = false;
-        let mut deferred_error: Option<String> = None;
+        let mut deferred_error: Option<(&'static str, String)> = None;
         let src_resolved = !matches!(src_view.backing, BbBacking::Unresolved);
         if let (true, Some(conn)) = (src_resolved, s.conn.as_mut()) {
             loop {
@@ -13100,13 +13121,15 @@ fn do_unwrap(
                         if matches!(&*conn, EngineConn::Server(_)) {
                             // Deferred, not discarded: the next `wrap` drains
                             // the alert and then raises this.
-                            deferred_error = Some(format!("rustls: {}", e));
+                            deferred_error =
+                                Some((jsse_handshake_exception_class(&e), format!("rustls: {}", e)));
                             offset = rec_end;
                             break;
                         }
+                        let cls = jsse_handshake_exception_class(&e);
                         return Err(crate::phases_early::throw_jca_exc(
                             ctx,
-                            "javax/net/ssl/SSLHandshakeException",
+                            cls,
                             &format!("rustls: {}", e),
                         ));
                     }
