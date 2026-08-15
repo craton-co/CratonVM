@@ -2395,6 +2395,13 @@ pub struct ZgcRealHeap {
     /// the second a raw address kept across a safepoint. Capped, oldest cycles
     /// evicted first, so a long run cannot grow it without bound.
     corpse_ledger: Mutex<FxHashMap<usize, (usize, u32, usize, u64)>>,
+    /// Cycles that declined to relocate because a compiled frame was live.
+    ///
+    /// Exported so the cost of the refusal is a number rather than a guess:
+    /// on this collector compaction is also defragmentation, so a process that
+    /// is permanently JIT-busy trades heap layout for the correctness of not
+    /// sliding objects out from under registers the collector cannot rewrite.
+    relocation_skipped_jit: AtomicUsize,
     /// Slides completed, so a corpse can say HOW MANY cycles ago it was
     /// vacated -- "the slide that just ran" and "nine collections back" are
     /// different bugs with the same signature.
@@ -2768,6 +2775,7 @@ impl ZgcRealHeap {
             corpse_ledger: Mutex::new(FxHashMap::default()),
             corpse_reports: AtomicUsize::new(0),
             corpse_cycle: AtomicU64::new(0),
+            relocation_skipped_jit: AtomicUsize::new(0),
             driver_passes: AtomicUsize::new(0),
             mark_active: AtomicBool::new(false),
             mark_ingress: mark::ZMarkIngress::new(),
@@ -3758,6 +3766,45 @@ impl ZgcRealHeap {
     }
 
     fn relocate_stw(&self, live: &[usize]) -> (usize, usize, cratonvm_types::PointerMap) {
+        // DO NOT RELOCATE WHILE A JIT FRAME IS LIVE.
+        //
+        // `gc_quiescence::is_active()` means some thread is inside a compiled
+        // call right now, and its frame may hold object pointers in REGISTERS
+        // or SPILL SLOTS. Those are not slots the collector can find, and they
+        // are not slots it can rewrite. `gen_heap` states the rule plainly at
+        // its own divert (`gen_heap.rs:5629`): such objects "cannot be
+        // relocated (raw register/spill slots can't be rewritten)", so it runs
+        // the non-moving sweep instead. G1 reads the same flag. **ZGC read it
+        // ZERO times** -- 9 call sites in `gen_heap`, 6 in `g1`, none here --
+        // and has been sliding objects out from under live compiled frames
+        // since compaction went default-on on 2026-08-13.
+        //
+        // `pinned_jit_roots_snapshot()`, which this function DOES consume a
+        // few lines below, is not a substitute. It is the set of addresses a
+        // CONSERVATIVE STACK scan recovered; a pointer that never left a
+        // register is not in it, so its page is not withheld and the object
+        // slides anyway.
+        //
+        // Measured on `io.netty.util.ResourceLeakDetectorTest`: the faulting
+        // pc is inside compiled `LeakAwareResource.close()Z`, the crash dump
+        // reports `guarded compiled frames live process-wide: YES (quiescence
+        // depth=101)`, and every logged stale access is a WRITE to field 0 of
+        // a `DefaultResourceLeak` the last slide moved -- i.e. compiled code
+        // performing `Reference.clear()` through a pre-move address.
+        //
+        // The cost is real and is the same cost the other two collectors pay:
+        // a JIT-busy process compacts less often. `relocation_skipped_jit` is
+        // exported so that cost is visible rather than inferred, because on
+        // this collector deferred compaction is also deferred defragmentation.
+        // Correctness first: a slide under a live compiled frame corrupts the
+        // heap, and fragmentation only wastes it.
+        if crate::gc_quiescence::is_active()
+            || crate::gc_quiescence::unregistered_jit_frame_on_stack()
+        {
+            self.relocation_skipped_jit.fetch_add(1, Ordering::Relaxed);
+            let reclaimed = self.arena.lock().retract_cursor_into_free_tail();
+            return (0, reclaimed, cratonvm_types::PointerMap::default());
+        }
         // `relocate::ZRelocationRecord` rather than a local map: it is the
         // module's from->to ledger, it builds the `PointerMap` this function
         // must return, and it carries the reserve so a large evacuation does
@@ -5213,7 +5260,23 @@ impl ZgcRealHeap {
                     .map(|(from, v)| (*from, *v))
             })
         };
-        let backtrace = std::backtrace::Backtrace::force_capture().to_string();
+        // `exe+RVA` rather than a symbolized backtrace: see
+        // `gc_quiescence::native_rvas` for why `Backtrace::force_capture`
+        // yields nothing but `<unknown>` in this tree's release profile.
+        // Paste the list into `CRATONVM_SYMBOLIZE` with the SAME binary (and
+        // its PDB in place, i.e. `target/release/cratonvm.exe`, not a renamed
+        // copy -- the debug directory records the original PDB path).
+        let backtrace = {
+            let rvas = crate::gc_quiescence::native_rvas();
+            if rvas.is_empty() {
+                std::backtrace::Backtrace::force_capture().to_string()
+            } else {
+                rvas.iter()
+                    .map(|r| format!("0x{r:X}"))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            }
+        };
         match hit {
             Some((from, (to, class_id, size, cycle))) => {
                 let still_live = self.registry.contains(to);
@@ -11361,6 +11424,103 @@ pub(crate) mod tests {
             relocated.len(),
             missing[0],
             result.pointer_map[&missing[0]],
+        );
+    }
+
+    /// **No object may be relocated while a compiled frame is live.**
+    ///
+    /// A JIT frame can hold an object pointer in a register or a spill slot.
+    /// The collector cannot find those and cannot rewrite them, so an object a
+    /// compiled frame is using must not move. `gen_heap` diverts to its
+    /// non-moving sweep for exactly this reason and G1 reads the same flag;
+    /// ZGC read it zero times and slid anyway.
+    ///
+    /// Asserted both ways in ONE test, because only the pair is meaningful: a
+    /// heap that never relocates would satisfy the refusal trivially, and a
+    /// fixture too dense for the selector would satisfy it by accident. The
+    /// second half proves the same fixture DOES relocate once the guard is
+    /// dropped, so the first half is measuring the guard and not the fixture.
+    ///
+    /// The exact edit that trips it: remove the `is_active()` early return
+    /// from `relocate_stw`.
+    #[test]
+    fn a_live_compiled_frame_forbids_relocation_and_only_that_forbids_it() {
+        const PAGE: usize = ZgcRealHeap::Z_LOGICAL_PAGE_BYTES;
+        const FIELDS: usize = 500;
+
+        // Same sparse fixture both times: 1-in-12 live keeps page occupancy
+        // near 8%, well under the selector's 0.25 `max_live_occupancy`.
+        let build = || {
+            let heap = ZgcRealHeap::with_capacity(64 * 1024 * 1024);
+            heap.set_tlab_enabled(false);
+            let per_page = PAGE / (HEADER_SIZE + FIELDS * SLOT_SIZE);
+            let mut roots: Vec<ObjectRef> = Vec::new();
+            for _page in 0..4 {
+                for i in 0..per_page {
+                    let o = heap.alloc_object(ClassId::new(1), FIELDS);
+                    if i % 12 == 0 {
+                        roots.push(o);
+                    }
+                }
+            }
+            let pre: Vec<usize> = roots.iter().map(|o| o.as_ptr() as usize).collect();
+            (heap, roots, pre)
+        };
+        let moved_count = |roots: &[ObjectRef], pre: &[usize]| {
+            roots
+                .iter()
+                .zip(pre.iter())
+                .filter(|(now, was)| now.as_ptr() as usize != **was)
+                .count()
+        };
+
+        // --- guard held: nothing may move ---------------------------------
+        let (heap, mut roots, pre) = build();
+        // SAFETY: these unit tests run the heap single-threaded.
+        let stw = unsafe { StopTheWorldToken::new() };
+        let guard_depth = crate::gc_quiescence::enter();
+        assert!(
+            crate::gc_quiescence::is_active(),
+            "the fixture must actually arm quiescence, or the refusal is untested"
+        );
+        cratonvm_types::flags::with_thread_overrides(
+            &[("CRATONVM_ZGC_RELOCATE", Some("1"))],
+            || {
+                heap.collect_garbage(&stw, &mut roots, &NoMonitors);
+            },
+        );
+        let _ = guard_depth;
+        crate::gc_quiescence::leave();
+        let moved_under_guard = moved_count(&roots, &pre);
+        assert_eq!(
+            moved_under_guard, 0,
+            "{moved_under_guard} object(s) were relocated while a compiled              frame was live -- their pointers may sit in registers or spill              slots that no rewrite pass can reach"
+        );
+        assert!(
+            heap.relocation_skipped_jit.load(Ordering::Relaxed) > 0,
+            "nothing moved, but the JIT refusal never fired -- the fixture is              passing for some other reason (check page occupancy against              max_live_occupancy)"
+        );
+
+        // --- guard released: the SAME fixture must move ---------------------
+        let (heap2, mut roots2, pre2) = build();
+        assert!(
+            !crate::gc_quiescence::is_active(),
+            "quiescence leaked out of the first half"
+        );
+        cratonvm_types::flags::with_thread_overrides(
+            &[("CRATONVM_ZGC_RELOCATE", Some("1"))],
+            || {
+                heap2.collect_garbage(&stw, &mut roots2, &NoMonitors);
+            },
+        );
+        assert!(
+            moved_count(&roots2, &pre2) > 0,
+            "the fixture relocates nothing even with no compiled frame live,              so the first half proved nothing about the guard"
+        );
+        assert_eq!(
+            heap2.relocation_skipped_jit.load(Ordering::Relaxed),
+            0,
+            "the refusal fired with no compiled frame live"
         );
     }
 

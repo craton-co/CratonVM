@@ -1526,6 +1526,28 @@ pub fn root_source_of(addr: usize) -> Option<&'static str> {
     ROOT_SOURCE_HOOK.get().and_then(|f| f(addr))
 }
 
+/// Installed by the VM: capture the native return-address chain as
+/// `exe`-relative RVAs, ready to paste into `CRATONVM_SYMBOLIZE`.
+///
+/// `std::backtrace::Backtrace` is useless in this tree's release profile --
+/// fat LTO plus `debug = "line-tables-only"` renders every frame `<unknown>`
+/// -- but the crash handler's `RtlCaptureStackBackTrace` + `exe+RVA` pair
+/// symbolizes fine offline against the matching PDB. That machinery is
+/// Windows FFI living in the VM crate, so the collector reaches it through a
+/// doorway, exactly as with the root-source lookup above.
+static NATIVE_RVA_HOOK: std::sync::OnceLock<fn() -> Vec<usize>> = std::sync::OnceLock::new();
+
+/// Install the RVA capture. First call wins.
+pub fn install_native_rva_hook(f: fn() -> Vec<usize>) {
+    let _ = NATIVE_RVA_HOOK.set(f);
+}
+
+/// `exe`-relative return addresses for the current call chain, innermost
+/// first. Empty when no hook is installed or the platform has none.
+pub fn native_rvas() -> Vec<usize> {
+    NATIVE_RVA_HOOK.get().map(|f| f()).unwrap_or_default()
+}
+
 
 #[cfg(test)]
 mod tests {
