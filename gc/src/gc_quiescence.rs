@@ -1496,6 +1496,37 @@ pub fn watched_referents_snapshot() -> Option<std::collections::HashSet<usize>> 
     })
 }
 
+// ---------------------------------------------------------------------------
+// Root-source attribution hook (diagnostic)
+// ---------------------------------------------------------------------------
+
+/// Installed by the VM when `CRATONVM_DBG_ROOT_SOURCE` is on: "which named
+/// root source handed the marker this address, this cycle?"
+///
+/// Lives here for the same reason the quiescence flag does -- the VM crate
+/// depends on the GC crate, so the GC cannot call into it, and the collector
+/// is where the question gets asked. `vm/src/memory/native_roots.rs` owns the
+/// inventory and the per-cycle table; this is only the doorway.
+///
+/// Answering `None` is meaningful, not a failure: it says NO named source
+/// contributed that exact address, so whatever holds it is reachable some
+/// other way -- a different finding, wanting a different fix.
+static ROOT_SOURCE_HOOK: std::sync::OnceLock<fn(usize) -> Option<&'static str>> =
+    std::sync::OnceLock::new();
+
+/// Install the attribution lookup. First call wins; later calls are ignored,
+/// so a second VM in-process cannot repoint a live collector's diagnostics.
+pub fn install_root_source_hook(f: fn(usize) -> Option<&'static str>) {
+    let _ = ROOT_SOURCE_HOOK.set(f);
+}
+
+/// Which named root source contributed `addr` this cycle, if the hook is
+/// installed and the flag is on.
+pub fn root_source_of(addr: usize) -> Option<&'static str> {
+    ROOT_SOURCE_HOOK.get().and_then(|f| f(addr))
+}
+
+
 #[cfg(test)]
 mod tests {
     use super::*;

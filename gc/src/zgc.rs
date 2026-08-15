@@ -5228,6 +5228,8 @@ impl ZgcRealHeap {
                     class_id,
                     class = %crate::collector::class_name_for_diagnostics(class_id),
                     survivor_still_registered = still_live,
+                    root_source = crate::gc_quiescence::root_source_of(addr)
+                        .unwrap_or("<none: not handed to the marker as a root>"),
                     vacated_in_cycle = cycle,
                     cycles_ago,
                     index,
@@ -5244,6 +5246,8 @@ impl ZgcRealHeap {
                     target: "cratonvm::gc::guard",
                     read_addr = addr,
                     index,
+                    root_source = crate::gc_quiescence::root_source_of(addr)
+                        .unwrap_or("<none: not handed to the marker as a root>"),
                     slides_so_far = self.corpse_cycle.load(Ordering::Relaxed),
                     in_registry = self.registry.contains(addr),
                     %backtrace,

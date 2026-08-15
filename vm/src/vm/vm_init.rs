@@ -3941,6 +3941,19 @@ impl SharedVm {
         cratonvm_classloading::install_class_load_hook(class_load_adapter);
         cratonvm_classloading::install_class_prepare_hook(class_prepare_adapter);
 
+        // CRATONVM_DBG_ROOT_SOURCE: let the collector ask the root inventory
+        // "who handed me this address?".
+        //
+        // The registry lives in this crate and the question is asked in the
+        // GC crate, which cannot call back the other way -- so the GC owns a
+        // doorway and we install the lookup through it, exactly as the
+        // quiescence flag is arranged. Installed unconditionally; the lookup
+        // itself short-circuits to `None` unless the flag is on, so this costs
+        // one `OnceLock` write per VM.
+        cratonvm_gc::gc_quiescence::install_root_source_hook(
+            crate::memory::native_roots::root_source_of,
+        );
+
         // T10.5 — register the class loader's vtable-install hook so each
         // class-link emits its descriptor vec into `shared.classes.vtable_manager`.
         //
