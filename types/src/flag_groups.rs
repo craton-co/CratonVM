@@ -459,6 +459,7 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::DBG, token: "jit-safepoints", on_key: Some("CRATONVM_DBG_JIT_SAFEPOINTS"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "jit-stale-ic", on_key: Some("CRATONVM_DBG_JIT_STALE_IC"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "jit-unmap", on_key: Some("CRATONVM_DBG_JIT_UNMAP"), off_key: None, off_word: None },
+    E { group: Group::DBG, token: "intrinsic", on_key: Some("CRATONVM_DBG_INTRINSIC"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "jitc", on_key: Some("CRATONVM_DBG_JITC"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "jlm", on_key: Some("CRATONVM_DBG_JLM"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "jul", on_key: Some("CRATONVM_DBG_JUL"), off_key: None, off_word: None },
@@ -531,6 +532,7 @@ pub const INVENTORY: &[E] = &[
     // `Group::DBG` doc; `render-inventory.py` labels the whole group `diag`,
     // which is a generator limitation recorded there rather than a wart here.
     E { group: Group::DBG, token: "nativelibraries-load-ok", on_key: Some("CRATONVM_DBG_NATIVELIBRARIES_LOAD_OK"), off_key: None, off_word: None },
+    E { group: Group::DBG, token: "native-lookups", on_key: Some("CRATONVM_DBG_NATIVE_LOOKUPS"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "ncdfe", on_key: Some("CRATONVM_DBG_NCDFE"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "needs-exact-trace", on_key: Some("CRATONVM_NEEDS_EXACT_TRACE"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "net", on_key: Some("CRATONVM_DBG_NET"), off_key: None, off_word: None },
@@ -795,6 +797,7 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::JIT, token: "direct-callee-calls", on_key: Some("CRATONVM_JIT_DIRECT_CALLEE_CALLS"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "dispatch-cache-direct-entry", on_key: Some("CRATONVM_JIT_DISPATCH_CACHE_DIRECT_ENTRY"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "dispatch-cache-virtual-direct-entry", on_key: Some("CRATONVM_JIT_DISPATCH_CACHE_VIRTUAL_DIRECT_ENTRY"), off_key: None, off_word: None },
+    E { group: Group::JIT, token: "string-intrinsic-pin", on_key: None, off_key: Some("CRATONVM_JIT_NO_STRING_INTRINSIC_PIN"), off_word: None },
     E { group: Group::JIT, token: "dup-x1", on_key: None, off_key: Some("CRATONVM_JIT_NO_DUP_X1"), off_word: None },
     E { group: Group::JIT, token: "dup-x2", on_key: None, off_key: Some("CRATONVM_JIT_NO_DUP_X2"), off_word: None },
     E { group: Group::JIT, token: "dupx", on_key: None, off_key: Some("CRATONVM_JIT_NO_DUPX"), off_word: None },
@@ -1107,6 +1110,7 @@ pub const INVENTORY: &[E] = &[
     // `off_word` must stay `None`.
     E { group: Group::GC, token: "innermost-callee-resolve", on_key: None, off_key: Some("CRATONVM_GC_NO_CALLEE_RESOLVE"), off_word: None },
     E { group: Group::GC, token: "old-interior-pins", on_key: None, off_key: Some("CRATONVM_GC_NO_OLD_INTERIOR_PINS"), off_word: None },
+    E { group: Group::GC, token: "empty-object-run", on_key: None, off_key: Some("CRATONVM_GC_NO_EMPTY_OBJECT_RUN"), off_word: None },
     E { group: Group::GC, token: "oldgen-coalesce", on_key: None, off_key: Some("CRATONVM_NO_OLDGEN_COALESCE"), off_word: None },
     E { group: Group::GC, token: "oldgen-compact", on_key: Some("CRATONVM_OLDGEN_COMPACT"), off_key: None, off_word: None },
     E { group: Group::GC, token: "overhead-limit", on_key: Some("CRATONVM_GC_OVERHEAD_LIMIT"), off_key: None, off_word: None },
@@ -1141,8 +1145,13 @@ pub const INVENTORY: &[E] = &[
     // that field is how a reader tells a default-ON knob from a default-OFF
     // one, which is exactly the confusion that made both ZGC rows below wrong
     // until 2026-08-13.
-    E { group: Group::GC, token: "zgc-parmark", on_key: Some("CRATONVM_ZGC_PARMARK"), off_key: None, off_word: None },
-    E { group: Group::GC, token: "zgc-relocate", on_key: Some("CRATONVM_ZGC_RELOCATE"), off_key: None, off_word: None },
+    // BOTH became DEFAULT-ON on 2026-08-13, so both grew an `off_word` -- the
+    // same correction the two rows below needed, for the same reason: without
+    // it `CRATONVM_GC=-zgc-parmark` expands to UNSETTING the key, and an unset
+    // key now means ON. `parmark` is a worker count whose parser reads 0 as
+    // serial; `relocate` reads 0/off/false/no as off.
+    E { group: Group::GC, token: "zgc-parmark", on_key: Some("CRATONVM_ZGC_PARMARK"), off_key: None, off_word: Some("0") },
+    E { group: Group::GC, token: "zgc-relocate", on_key: Some("CRATONVM_ZGC_RELOCATE"), off_key: None, off_word: Some("0") },
     E { group: Group::GC, token: "zgc-startbits", on_key: Some("CRATONVM_ZGC_STARTBITS"), off_key: None, off_word: Some("0") },
     E { group: Group::GC, token: "zgc-tlab", on_key: Some("CRATONVM_ZGC_TLAB"), off_key: None, off_word: Some("0") },
     // Declared 2026-08-06 with the DBG/JIT block: a millisecond goal that
@@ -1184,6 +1193,11 @@ pub const INVENTORY: &[E] = &[
     // and `pqc` do not — the ON side is the default, not a variable.
     E { group: Group::REAL, token: "mxbean-mapping", on_key: None, off_key: Some("CRATONVM_SYNTHETIC_MXBEAN_MAPPING"), off_word: None },
     E { group: Group::REAL, token: "net-sockets", on_key: Some("CRATONVM_REAL_NET_SOCKETS"), off_key: Some("CRATONVM_SYNTHETIC_NET_SOCKETS"), off_word: None },
+    // Declared 2026-08-13. Netty's real `netty_tcnative` library became the
+    // default that day (its `JNI_OnLoad` runs and the
+    // `io/netty/internal/tcnative` stubs stand down); this is its opt-out, so
+    // it has no `on_key` for the same reason `raf` and `pqc` do not.
+    E { group: Group::REAL, token: "netty-tcnative", on_key: None, off_key: Some("CRATONVM_SYNTHETIC_NETTY_TCNATIVE"), off_word: None },
     E { group: Group::REAL, token: "pqc", on_key: None, off_key: Some("CRATONVM_SYNTHETIC_PQC"), off_word: None },
     E { group: Group::REAL, token: "proxy", on_key: Some("CRATONVM_REAL_PROXY"), off_key: None, off_word: Some("0") },
     E { group: Group::REAL, token: "proxy-strict", on_key: Some("CRATONVM_REAL_PROXY_STRICT"), off_key: None, off_word: None },
@@ -2509,6 +2523,11 @@ mod tests {
         for (token, key) in [
             ("zgc-tlab", "CRATONVM_ZGC_TLAB"),
             ("zgc-startbits", "CRATONVM_ZGC_STARTBITS"),
+            // Both joined the default-ON set on 2026-08-13 and hit the same
+            // trap on the way in: declared as opt-ins, so `-token` expanded to
+            // unsetting a key whose unset meaning had just become ON.
+            ("zgc-parmark", "CRATONVM_ZGC_PARMARK"),
+            ("zgc-relocate", "CRATONVM_ZGC_RELOCATE"),
         ] {
             let e = lookup(Group::GC, token).unwrap_or_else(|| panic!("{token} is undeclared"));
             assert_eq!(e.on_key, Some(key));

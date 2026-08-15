@@ -1122,7 +1122,16 @@ pub fn atan2(y: f64, x: f64) -> f64 {
     if x.is_nan() || y.is_nan() {
         return x + y;
     }
-    if ((hx - 0x3ff0_0000) | lx) == 0 {
+    // `hx == 0x3ff00000 && lx == 0`, i.e. x is exactly 1.0, written the way
+    // fdlibm writes it: OR the two word differences and test for zero.
+    //
+    // `wrapping_sub`, not `-`: `hi()` is signed (fdlibm reads the sign bit as
+    // `hx < 0`), so for any NEGATIVE x this subtracts 0x3ff00000 from a large
+    // negative `i32` and underflows. The C original is `hx-0x3ff00000` on an
+    // `int32_t` and wraps; we need the same bits, and only whether they are
+    // ZERO is ever read, which wrapping preserves exactly. Plain `-` made this
+    // a debug-only panic for every negative x — `atan2(y, -1.0)` was enough.
+    if (hx.wrapping_sub(0x3ff0_0000) | lx) == 0 {
         return atan(y); // x = 1.0
     }
     let m = ((hy >> 31) & 1) | ((hx >> 30) & 2); // 2*sign(x) + sign(y)
@@ -2205,7 +2214,15 @@ pub fn ieee_remainder(mut x: f64, mut p: f64) -> f64 {
     if hp <= 0x7fdf_ffff {
         x = fmod(x, p + p); // now x < 2p
     }
-    if ((hx - hp) | (lx - lp)) == 0 {
+    // `|x| == |p|` — again the fdlibm spelling, OR of the word differences.
+    //
+    // `hx`/`hp` are both masked to `EXP_SIGNIF_BITS_I` above so their
+    // difference cannot overflow, but `lx`/`lp` are whole low words: `lo()`
+    // reinterprets them as `i32` (the C declares them `uint32_t`), so `lx - lp`
+    // overflows whenever the two straddle the `i32` range — a mantissa with its
+    // top bit set against one without. `wrapping_sub` is the C's unsigned
+    // subtraction bit for bit, and as above only zero-ness is read.
+    if (hx.wrapping_sub(hp) | lx.wrapping_sub(lp)) == 0 {
         return 0.0 * x;
     }
     x = x.abs();
@@ -4070,4 +4087,302 @@ mod tests {
         (0x3FE0000000000000, 0x3FE6A09E667F3BCD), // 0.5
         (0x3FEFFFFFFFFFFFFF, 0x3FEFFFFFFFFFFFFF), // nextDown(1) — just under a tie
     ];
+
+    // -----------------------------------------------------------------------
+    // Overflow sweep — every ported entry point over a wide bit-pattern corpus
+    // -----------------------------------------------------------------------
+    //
+    // fdlibm does signed arithmetic on the extracted exponent/mantissa words
+    // and *relies on it wrapping*: C's `hx-0x3ff00000` on an `int32_t` whose
+    // sign bit is set, `lx-lp` on words the C declares `uint32_t`. Rust wraps
+    // in release and panics in debug, so a direct port is a latent
+    // debug-only crash that the golden tables only catch if some vector
+    // happens to reach the site — which is exactly how `atan2` and
+    // `IEEEremainder` shipped broken while 22 sibling tests stayed green.
+    //
+    // This sweep exists to make that class of defect impossible to miss: it
+    // is a no-panic assertion, run under `debug_assertions` where
+    // overflow-checks are on, over a corpus built to reach the sign-bit and
+    // extreme-exponent paths the golden tables under-sample. It asserts
+    // nothing about VALUES — `check_*` against the HotSpot vectors owns that
+    // — only that no operation overflows on the way there.
+    fn overflow_sweep_corpus() -> Vec<f64> {
+        let mut v: Vec<f64> = Vec::new();
+        // Every exponent, at three mantissa positions, both signs. The sign
+        // loop is the point: `hi()` is negative for every negative input, and
+        // that is what makes `hx - CONST` underflow.
+        //
+        // The mantissas are chosen for their LOW WORD, not their magnitude.
+        // `lo()` reinterprets the low 32 bits as `i32`, so a difference of two
+        // low words overflows only when they straddle the `i32` boundary —
+        // 0x8000_0000 (the most negative `i32`) against 0x7fff_ffff (the most
+        // positive). An earlier version of this corpus used
+        // `[0, 1, 0x8_0000_0000_0000, 0xf_ffff_ffff_ffff]`, whose low words are
+        // only {0, 1, 0xffff_ffff} = {0, 1, -1}: every difference fits in 2, so
+        // the sweep passed against the KNOWN-BROKEN `IEEEremainder` and proved
+        // nothing. Verify any change here the same way — put the bug back and
+        // watch the test fail.
+        for exp in 0u64..=0x7ff {
+            for mant in [
+                0u64,
+                1,
+                0x8_0000_0000_0000,      // low word 0x0000_0000
+                0xf_ffff_ffff_ffff,      // low word 0xffff_ffff  (-1)
+                0x0_0000_8000_0000,      // low word 0x8000_0000  (i32::MIN)
+                0x0_0000_7fff_ffff,      // low word 0x7fff_ffff  (i32::MAX)
+                0xf_ffff_8000_0000,      // i32::MIN low word, full high mantissa
+                0x7_ffff_7fff_ffff,      // i32::MAX low word, other high mantissa
+                0x0_0000_c000_0000,      // low word 0xc000_0000
+                0x0_0000_4000_0000,      // low word 0x4000_0000
+            ] {
+                let bits = (exp << 52) | mant;
+                v.push(f64::from_bits(bits));
+                v.push(f64::from_bits(bits | 0x8000_0000_0000_0000));
+            }
+        }
+        // The named edges, positive and negative.
+        for &b in &[
+            0x0000_0000_0000_0000u64, // +0
+            0x0000_0000_0000_0001,    // MIN_VALUE (subnormal)
+            0x000f_ffff_ffff_ffff,    // max subnormal
+            0x0010_0000_0000_0000,    // MIN_NORMAL
+            0x3fe0_0000_0000_0000,    // 0.5
+            0x3fef_ffff_ffff_ffff,    // nextDown(1)
+            0x3ff0_0000_0000_0000,    // 1.0  — atan2's `hx-0x3ff00000` zero case
+            0x3ff0_0000_0000_0001,    // nextUp(1)
+            0x4000_0000_0000_0000,    // 2.0
+            0x7fdf_ffff_ffff_ffff,    // IEEEremainder's `hp <= 0x7fdfffff` edge
+            0x7fe0_0000_0000_0000,    // just past it
+            0x7fef_ffff_ffff_ffff,    // MAX_VALUE
+            0x7ff0_0000_0000_0000,    // +inf
+            0x7ff8_0000_0000_0000,    // NaN
+            0x7ff0_0000_0000_0001,    // signalling NaN
+        ] {
+            v.push(f64::from_bits(b));
+            v.push(f64::from_bits(b | 0x8000_0000_0000_0000));
+        }
+        v
+    }
+
+    /// The unary family, swept. A panic here is an unwrapped `-`/`+` on an
+    /// extracted word, not a value bug.
+    #[test]
+    #[cfg(debug_assertions)]
+    fn no_unary_fdlibm_entry_point_overflows_on_any_exponent() {
+        let corpus = overflow_sweep_corpus();
+        let unary: &[(&str, fn(f64) -> f64)] = &[
+            ("log", super::log),
+            ("sin", super::sin),
+            ("cos", super::cos),
+            ("tan", super::tan),
+            ("asin", super::asin),
+            ("acos", super::acos),
+            ("atan", super::atan),
+            ("cbrt", super::cbrt),
+            ("exp", super::exp),
+            ("log10", super::log10),
+            ("log1p", super::log1p),
+            ("expm1", super::expm1),
+            ("sinh", super::sinh),
+            ("cosh", super::cosh),
+            ("tanh", super::tanh),
+        ];
+        for (name, f) in unary {
+            for &x in &corpus {
+                // Result deliberately unused: this is a no-panic assertion.
+                let _ = std::hint::black_box(f(std::hint::black_box(x)));
+                let _ = name;
+            }
+        }
+    }
+
+    /// The binary family, swept over the cross product. `atan2` and
+    /// `IEEEremainder` both overflowed here before the `wrapping_sub` fix;
+    /// the cross product is what reaches a negative `hx` against a positive
+    /// `hy` and vice versa.
+    #[test]
+    #[cfg(debug_assertions)]
+    fn no_binary_fdlibm_entry_point_overflows_on_any_exponent_pair() {
+        // Stride the corpus for the cross product: the full 2-D sweep is
+        // ~16M pairs per function, which is a minute of debug-build time for
+        // no extra coverage of the integer paths (they key on the exponent,
+        // and every exponent is still represented).
+        let corpus = overflow_sweep_corpus();
+        let strided: Vec<f64> = corpus.iter().copied().step_by(11).collect();
+        let binary: &[(&str, fn(f64, f64) -> f64)] = &[
+            ("atan2", super::atan2),
+            ("pow", super::pow),
+            ("hypot", super::hypot),
+            ("IEEEremainder", super::ieee_remainder),
+        ];
+        for (name, f) in binary {
+            for &x in &strided {
+                for &y in &strided {
+                    let _ = std::hint::black_box(f(
+                        std::hint::black_box(x),
+                        std::hint::black_box(y),
+                    ));
+                    let _ = name;
+                }
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Differential digest against HotSpot StrictMath — millions of points
+    // -----------------------------------------------------------------------
+    //
+    // The `*_VECTORS` tables above are hand-picked and small. They are the
+    // right tool for pinning a named edge, and the wrong one for the question
+    // "does the RELEASE build, where Rust wraps silently instead of panicking,
+    // still produce HotSpot's bits everywhere?".
+    //
+    // So: build a deterministic corpus, hash every result bit-for-bit, and
+    // compare one number against the same number computed by real
+    // `StrictMath` (`apps/fdlibm_oracle/FdlibmOracle.java`). 240,960 points per
+    // unary function; ~6.2M pairs per binary one. The corpus generator is
+    // duplicated verbatim in the Java, so a change to either side must be made
+    // to both — the digest will say so loudly.
+    //
+    // These tests are NOT `#[cfg(debug_assertions)]`: running them in release
+    // is the entire point. `cargo test -p cratonvm-types --lib --release`.
+    //
+    // To localize a mismatch, `java FdlibmOracle --dump <fn>` and diff against
+    // the same enumeration here — the digest tells you THAT you diverged, not
+    // where.
+    const NAN_SENTINEL: u64 = 0x7ff8_0000_0000_0000;
+    const STRUCTURED_MANTISSAS: [u64; 10] = [
+        0,
+        1,
+        0x8_0000_0000_0000,
+        0xf_ffff_ffff_ffff,
+        0x0_0000_8000_0000,
+        0x0_0000_7fff_ffff,
+        0xf_ffff_8000_0000,
+        0x7_ffff_7fff_ffff,
+        0x0_0000_c000_0000,
+        0x0_0000_4000_0000,
+    ];
+    const RANDOM_POINTS: usize = 200_000;
+    const BIN_STRIDE: usize = 97;
+
+    fn splitmix64(i: u64) -> u64 {
+        let x = i.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = x;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+
+    fn corpus_size() -> usize {
+        0x800 * STRUCTURED_MANTISSAS.len() * 2 + RANDOM_POINTS
+    }
+
+    /// The i-th corpus point. Must match `FdlibmOracle.point` exactly.
+    fn point(i: usize) -> f64 {
+        let structured = 0x800 * STRUCTURED_MANTISSAS.len() * 2;
+        if i < structured {
+            let idx = i / 2;
+            let neg = i % 2 == 1;
+            let exp = (idx / STRUCTURED_MANTISSAS.len()) as u64;
+            let mant = STRUCTURED_MANTISSAS[idx % STRUCTURED_MANTISSAS.len()];
+            let mut bits = (exp << 52) | mant;
+            if neg {
+                bits |= 0x8000_0000_0000_0000;
+            }
+            f64::from_bits(bits)
+        } else {
+            f64::from_bits(splitmix64((i - structured) as u64))
+        }
+    }
+
+    fn canon(d: f64) -> u64 {
+        if d.is_nan() { NAN_SENTINEL } else { d.to_bits() }
+    }
+
+    fn fnv(mut h: u64, v: u64) -> u64 {
+        for b in 0..8 {
+            h ^= (v >> (b * 8)) & 0xff;
+            h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        h
+    }
+
+    fn unary_digest(f: fn(f64) -> f64) -> u64 {
+        let mut h = 0xcbf2_9ce4_8422_2325u64;
+        for i in 0..corpus_size() {
+            h = fnv(h, canon(f(point(i))));
+        }
+        h
+    }
+
+    fn binary_digest(f: fn(f64, f64) -> f64) -> u64 {
+        let mut h = 0xcbf2_9ce4_8422_2325u64;
+        let n = corpus_size();
+        let mut i = 0;
+        while i < n {
+            let mut j = 0;
+            while j < n {
+                h = fnv(h, canon(f(point(i), point(j))));
+                j += BIN_STRIDE;
+            }
+            i += BIN_STRIDE;
+        }
+        h
+    }
+
+    /// Every unary entry point, 240,960 points each, against JDK 25
+    /// `StrictMath`. Digests produced by `apps/fdlibm_oracle`.
+    #[test]
+    fn unary_digests_match_hotspot_strictmath() {
+        let cases: &[(&str, fn(f64) -> f64, u64)] = &[
+            ("log", super::log, 0x850d_59ae_3424_5f2b),
+            ("sin", super::sin, 0xff32_e4c2_3073_d95d),
+            ("cos", super::cos, 0x1de7_26ca_8273_d984),
+            ("tan", super::tan, 0xeb49_07fe_b65f_6bb8),
+            ("asin", super::asin, 0xa6ae_71b9_ef8c_7a05),
+            ("acos", super::acos, 0x6a30_e215_84f1_b0bc),
+            ("atan", super::atan, 0xb99a_080a_58d1_3f24),
+            ("cbrt", super::cbrt, 0x951a_6706_50ff_988f),
+            ("exp", super::exp, 0x9f52_78e6_653f_288a),
+            ("log10", super::log10, 0xa3fd_89d1_687b_0795),
+            ("log1p", super::log1p, 0x578c_db90_723a_dfec),
+            ("expm1", super::expm1, 0x5829_72f0_847d_0dbb),
+            ("sinh", super::sinh, 0x346a_5c2f_3615_e9a0),
+            ("cosh", super::cosh, 0x0c83_bbdf_c31b_9b29),
+            ("tanh", super::tanh, 0x0f2f_cbf5_dd07_b09c),
+        ];
+        for &(name, f, want) in cases {
+            let got = unary_digest(f);
+            assert_eq!(
+                got, want,
+                "{name}: digest {got:#018x} != HotSpot {want:#018x} over {} points — \
+                 re-run apps/fdlibm_oracle with --dump {name} to localize",
+                corpus_size()
+            );
+        }
+    }
+
+    /// Every binary entry point over the strided cross product (~6.2M pairs
+    /// each) against JDK 25 `StrictMath`. `atan2` and `IEEEremainder` are the
+    /// two that carried the wrapping-subtraction defect, so their bits in
+    /// RELEASE — where the wrap is silent rather than a panic — are the whole
+    /// reason this test exists.
+    #[test]
+    fn binary_digests_match_hotspot_strictmath() {
+        let cases: &[(&str, fn(f64, f64) -> f64, u64)] = &[
+            ("atan2", super::atan2, 0x8327_323f_2533_8181),
+            ("pow", super::pow, 0x5c4c_68f6_e383_2102),
+            ("hypot", super::hypot, 0xe1fe_a734_7916_96e1),
+            ("IEEEremainder", super::ieee_remainder, 0x8aa1_c64f_79b8_b597),
+        ];
+        for &(name, f, want) in cases {
+            let got = binary_digest(f);
+            assert_eq!(
+                got, want,
+                "{name}: digest {got:#018x} != HotSpot {want:#018x} — \
+                 re-run apps/fdlibm_oracle with --dump {name} to localize"
+            );
+        }
+    }
 }

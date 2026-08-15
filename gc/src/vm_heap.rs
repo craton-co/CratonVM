@@ -1074,8 +1074,18 @@ impl VmHeap {
                 .pin_region_for_addr(obj.as_ptr() as usize)
                 .into_iter()
                 .collect(),
+            // ZGC pins the ADDRESS and returns it as its own "region index":
+            // this collector has no regions, and the slide's filter is
+            // page-granular over addresses. Returning `Vec::new()` was correct
+            // only while this collector never moved an object — see
+            // `ZgcRealHeap::critical_pins` for what the copy-back at Release
+            // does to a moved array.
             #[cfg(feature = "zgc")]
-            VmHeap::Zgc(_) => Vec::new(),
+            VmHeap::Zgc(h) => {
+                let addr = obj.as_ptr() as usize;
+                h.pin_critical(addr);
+                vec![addr]
+            }
         }
     }
 
@@ -1083,10 +1093,21 @@ impl VmHeap {
     /// `GetPrimitiveArrayCritical`. No-op on the generational collector / for an
     /// empty set.
     pub fn unpin_critical_regions(&self, region_indices: &[usize]) {
-        if let VmHeap::G1(h) = self {
-            for &idx in region_indices {
-                h.unpin_region(idx);
+        match self {
+            VmHeap::G1(h) => {
+                for &idx in region_indices {
+                    h.unpin_region(idx);
+                }
             }
+            // For ZGC the "index" IS the pinned object address — see
+            // `pin_critical_region`'s ZGC arm.
+            #[cfg(feature = "zgc")]
+            VmHeap::Zgc(h) => {
+                for &addr in region_indices {
+                    h.unpin_critical(addr);
+                }
+            }
+            _ => {}
         }
     }
 
@@ -2303,6 +2324,20 @@ impl VmHeap {
             // subject. Reporting that as a clean score is exactly how a gauge
             // becomes a vacuous green, so the two cases are spelled
             // differently and the reader is told which they have.
+            // Did the 2026-08-13 default-on features engage? A gauntlet run
+            // that silently took the serial, non-moving path would otherwise
+            // look identical to one that exercised both.
+            let (par_cycles, compactions, relocated) = h.feature_engagement();
+            // `driver_passes` is the one field that separates "the worker pool
+            // marked" from "`zgc_concurrent`'s controller drove the cycle":
+            // the pool-only path this replaced produced identical mark bits,
+            // identical stats and an identical `parallel_mark_cycles`.
+            let (driver_passes, mark_fallbacks) = h.driver_engagement();
+            eprintln!(
+                "[GC] zgc-features: parallel_mark_cycles={par_cycles} \
+                 driver_passes={driver_passes} mark_fallbacks={mark_fallbacks} \
+                 compaction_cycles={compactions} objects_relocated={relocated}"
+            );
             let g = h.frag_gauge();
             match g.worst_permille {
                 Some(worst) => eprintln!(
@@ -2351,13 +2386,14 @@ impl VmHeap {
             use std::sync::atomic::Ordering as O;
             eprintln!(
                 "[GC] young_sweep: par_attempts={} par_accepts={} zero_spans={} \
-                 zero_empty_runs={} phantom_extents={} live_in_dead={} \
-                 walk_overshoot={} anchor_not_a_base={}",
+                 zero_empty_runs={} phantom_extents={} phantom_nonbase_marks={} \
+                 live_in_dead={} walk_overshoot={} anchor_not_a_base={}",
                 crate::gen_heap::PAR_SWEEP_ATTEMPTS.load(O::Relaxed),
                 crate::gen_heap::PAR_SWEEP_ACCEPTS.load(O::Relaxed),
                 crate::gen_heap::SWEEP_ZERO_SPAN_HITS.load(O::Relaxed),
                 crate::gen_heap::SWEEP_ZERO_SPAN_EMPTY_RUNS.load(O::Relaxed),
                 crate::gen_heap::SWEEP_PHANTOM_EXTENTS.load(O::Relaxed),
+                crate::gen_heap::SWEEP_PHANTOM_INTERIOR_MARKS.load(O::Relaxed),
                 crate::gen_heap::LIVE_IN_DEAD_SPANS.load(O::Relaxed),
                 crate::gen_heap::SWEEP_WALK_OVERSHOOT_HITS.load(O::Relaxed),
                 crate::gen_heap::SWEEP_ANCHOR_NOT_A_BASE.load(O::Relaxed),

@@ -16066,10 +16066,24 @@ pub(crate) fn pbkdf2_get_instance(ctx: &mut dyn NativeContext, args: &[Value]) -
             skf_algo_table().lock().unwrap().insert(key, alg);
             Ok(Some(Value::Object(Some(obj))))
         }
-        None => Err(RuntimeError::SecurityException {
-            message: format!("{alg} SecretKeyFactory not available"),
-        }
-        .into()),
+        // `NoSuchAlgorithmException`, not `SecurityException`, and the
+        // difference is a caller's `catch`. `SecretKeyFactory.getInstance`
+        // DECLARES `NoSuchAlgorithmException`, so the standard
+        //
+        //     catch (NoSuchAlgorithmException | NoSuchProviderException e)
+        //
+        // does not catch an unchecked `java.lang.SecurityException` at all: the
+        // refusal escapes the handler written for exactly this case. Measured
+        // against HotSpot JDK 25 with `probes/JcaGetInstanceProbe.java`, which
+        // prints the exception CLASS per engine — the same shape as the
+        // `IOException`-where-`CertificateException`-belongs batch found in the
+        // trust manager. `throw_jca_exc` builds the real Java exception object,
+        // so what a caller catches is what HotSpot throws.
+        None => Err(throw_jca_exc(
+            ctx,
+            "java/security/NoSuchAlgorithmException",
+            &format!("{alg} SecretKeyFactory not available"),
+        )),
     }
 }
 

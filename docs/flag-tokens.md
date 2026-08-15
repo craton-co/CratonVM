@@ -59,7 +59,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_DBG`
 
-438 tokens.
+440 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -272,6 +272,7 @@ export inherited from a parent shell.
 | `jit-safepoints` | `CRATONVM_DBG_JIT_SAFEPOINTS` |
 | `jit-stale-ic` | `CRATONVM_DBG_JIT_STALE_IC` |
 | `jit-unmap` | `CRATONVM_DBG_JIT_UNMAP` |
+| `intrinsic` | `CRATONVM_DBG_INTRINSIC` |
 | `jitc` | `CRATONVM_DBG_JITC` |
 | `jlm` | `CRATONVM_DBG_JLM` |
 | `jul` | `CRATONVM_DBG_JUL` |
@@ -323,6 +324,7 @@ export inherited from a parent shell.
 | `msc` | `CRATONVM_DBG_MSC` |
 | `mtroots` | `CRATONVM_DBG_MTROOTS` |
 | `nativelibraries-load-ok` | `CRATONVM_DBG_NATIVELIBRARIES_LOAD_OK` |
+| `native-lookups` | `CRATONVM_DBG_NATIVE_LOOKUPS` |
 | `ncdfe` | `CRATONVM_DBG_NCDFE` |
 | `needs-exact-trace` | `CRATONVM_NEEDS_EXACT_TRACE` |
 | `net` | `CRATONVM_DBG_NET` |
@@ -504,7 +506,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_JIT`
 
-173 tokens.
+174 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -537,6 +539,7 @@ export inherited from a parent shell.
 | `direct-callee-calls` | `CRATONVM_JIT_DIRECT_CALLEE_CALLS` |
 | `dispatch-cache-direct-entry` | `CRATONVM_JIT_DISPATCH_CACHE_DIRECT_ENTRY` |
 | `dispatch-cache-virtual-direct-entry` | `CRATONVM_JIT_DISPATCH_CACHE_VIRTUAL_DIRECT_ENTRY` |
+| `string-intrinsic-pin` | `CRATONVM_JIT_NO_STRING_INTRINSIC_PIN` |
 | `dup-x1` | `CRATONVM_JIT_NO_DUP_X1` |
 | `dup-x2` | `CRATONVM_JIT_NO_DUP_X2` |
 | `dupx` | `CRATONVM_JIT_NO_DUPX` |
@@ -684,7 +687,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_GC`
 
-45 tokens.
+46 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -714,6 +717,7 @@ export inherited from a parent shell.
 | `moving-young-jit-frames` | `CRATONVM_MOVING_YOUNG_NO_JIT` |
 | `innermost-callee-resolve` | `CRATONVM_GC_NO_CALLEE_RESOLVE` |
 | `old-interior-pins` | `CRATONVM_GC_NO_OLD_INTERIOR_PINS` |
+| `empty-object-run` | `CRATONVM_GC_NO_EMPTY_OBJECT_RUN` |
 | `oldgen-coalesce` | `CRATONVM_NO_OLDGEN_COALESCE` |
 | `oldgen-compact` | `CRATONVM_OLDGEN_COMPACT` |
 | `overhead-limit` | `CRATONVM_GC_OVERHEAD_LIMIT` |
@@ -736,7 +740,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_REAL`
 
-27 tokens.
+28 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -754,6 +758,7 @@ export inherited from a parent shell.
 | `msc-real-start` | `CRATONVM_MSC_REAL_START` |
 | `mxbean-mapping` | `CRATONVM_SYNTHETIC_MXBEAN_MAPPING` |
 | `net-sockets` | `CRATONVM_REAL_NET_SOCKETS / CRATONVM_SYNTHETIC_NET_SOCKETS` |
+| `netty-tcnative` | `CRATONVM_SYNTHETIC_NETTY_TCNATIVE` |
 | `pqc` | `CRATONVM_SYNTHETIC_PQC` |
 | `proxy` | `CRATONVM_REAL_PROXY` |
 | `proxy-strict` | `CRATONVM_REAL_PROXY_STRICT` |

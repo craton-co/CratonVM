@@ -227,6 +227,15 @@ const SIG_EDDSA: i32 = 20;
 // None`/`unwrap_or(false)`, so DSA verification always silently failed, no
 // exception). Routed to the real JDK SPI below, same as ECDSA/EdDSA/ML-DSA.
 const SIG_SHA1_DSA: i32 = 21;
+/// `NONEwithRSA` — PKCS#1 v1.5 block type 1 over the caller's own bytes, with
+/// no hashing and no DigestInfo.
+///
+/// The one RSA signature name SunJCE serves rather than SunRsaSign, because it
+/// is implemented there by encrypting under the private key
+/// (`com.sun.crypto.provider.RSACipherAdaptor`). `getInstance` refused it until
+/// 2026-08-14 — `algo_idx` had no arm and no provider in the chain advertises
+/// it, so `signature_name_is_offered` answered false on both halves.
+const SIG_NONE_RSA: i32 = 22;
 
 fn algo_idx(name: &str) -> i32 {
     let upper = name.to_ascii_uppercase();
@@ -235,6 +244,7 @@ fn algo_idx(name: &str) -> i32 {
         "SHA384WITHRSA" => SIG_SHA384_RSA,
         "SHA512WITHRSA" => SIG_SHA512_RSA,
         "SHA1WITHRSA" | "SHA-1WITHRSA" => SIG_SHA1_RSA,
+        "NONEWITHRSA" => SIG_NONE_RSA,
         // RSASSA-PSS (JWA PS256/384/512). keycloak's `JavaAlgorithm` resolves
         // these to BouncyCastle's `SHA{256,384,512}withRSAandMGF1`; accept the
         // `/PSS` aliases too. (Bare "RSASSA-PSS" carries its hash in a
@@ -290,6 +300,7 @@ fn algo_name(idx: i32) -> &'static str {
         SIG_SHA384_RSA => "SHA384withRSA",
         SIG_SHA512_RSA => "SHA512withRSA",
         SIG_SHA1_RSA => "SHA1withRSA",
+        SIG_NONE_RSA => "NONEwithRSA",
         SIG_SHA384_ECDSA => "SHA384withECDSA",
         SIG_SHA256_ECDSA => "SHA256withECDSA",
         SIG_SHA512_ECDSA => "SHA512withECDSA",
@@ -473,6 +484,7 @@ fn clear_data(ctx: &mut dyn NativeContext, this: ObjectRef) {
 fn sign_dispatch(alg: i32, key_id: u64, data: &[u8]) -> Option<Vec<u8>> {
     match alg {
         SIG_SHA256_RSA => crypto_impl::rsa_sign(key_id, data),
+        SIG_NONE_RSA => crypto_impl::rsa_sign_none(key_id, data),
         SIG_PSS_SHA256 => {
             crypto_impl::rsa_sign_pss_by_id(key_id, crypto_impl::PssHash::Sha256, data)
         }
@@ -501,6 +513,7 @@ fn natively_dispatched(alg: i32) -> bool {
     matches!(
         alg,
         SIG_SHA256_RSA
+            | SIG_NONE_RSA
             | SIG_PSS_SHA256
             | SIG_PSS_SHA384
             | SIG_PSS_SHA512
@@ -593,6 +606,7 @@ fn refuse_unanswerable(
 fn verify_dispatch(alg: i32, key_id: u64, data: &[u8], sig: &[u8]) -> Option<bool> {
     match alg {
         SIG_SHA256_RSA => crypto_impl::rsa_verify(key_id, data, sig),
+        SIG_NONE_RSA => crypto_impl::rsa_verify_none(key_id, data, sig),
         SIG_PSS_SHA256 => {
             crypto_impl::rsa_verify_pss_by_id(key_id, crypto_impl::PssHash::Sha256, data, sig)
         }
@@ -1073,6 +1087,77 @@ fn sig_init_verify(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
     Ok(None)
 }
 
+/// `Signature.initVerify(Certificate)` — extract the certificate's public key,
+/// then initialise exactly as the `PublicKey` overload does.
+///
+/// This overload was registered against `sig_init_verify` itself, whose body
+/// reads `args[1]` as the KEY. So the certificate was stored as the
+/// verification key and forwarded to the SPI, where it surfaced differently per
+/// algorithm and never as itself:
+///
+/// * ECDSA — `ECKeyFactory.toECKey` calls `key.getAlgorithm()`, which
+///   `sun.security.x509.X509CertImpl` does not declare (that method is
+///   `java.security.Key`'s), so `NoSuchMethodError:
+///   sun.security.x509.X509CertImpl.getAlgorithm()Ljava/lang/String;`;
+/// * EdDSA — `EdDSASignature.engineInitVerify` rejects the non-key outright
+///   with `InvalidKeyException: Unsupported key type`.
+///
+/// Both messages point at the SPI and neither names the real defect, which is
+/// why the known-issue page recorded them as two separate causes (a missing
+/// `X509CertImpl` accessor, and unimplemented Ed25519/Ed448 verification). They
+/// are one wrong argument. `io.netty.pkitesting.CertificateBuilderTest`'s five
+/// `createCertIssuedBy*` tests all reach it through
+/// `signature.initVerify(root.getCertificate())`.
+///
+/// The key-usage check mirrors `java.security.Signature.initVerify(Certificate)`
+/// exactly: a certificate whose KeyUsage extension is present AND explicitly
+/// denies `digitalSignature` (bit 0) must be refused. A `null` key usage — no
+/// such extension — is silently allowed, which is what makes this a no-op for
+/// every certificate that does not carry the extension.
+fn sig_init_verify_cert(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let cert = match args.get(1) {
+        Some(Value::Object(Some(c))) => *c,
+        // A null certificate: let the key-taking body raise whatever it raises
+        // for a null argument rather than inventing a different exception.
+        _ => return sig_init_verify(ctx, args),
+    };
+    let cert_pin = ctx.pin_native_root(cert);
+    let usage_denies_signing = match ctx.invoke_virtual(cert, "getKeyUsage", "()[Z", &[]) {
+        Ok(Some(Value::Object(Some(arr)))) => {
+            ctx.array_length(arr) > 0 && ctx.get_array_element(arr, 0) == Value::Int(0)
+        }
+        // `getKeyUsage` is not on `Certificate`, only on `X509Certificate`; a
+        // non-X509 certificate simply has no usage bits to consult.
+        _ => false,
+    };
+    if usage_denies_signing {
+        ctx.unpin_native_roots(cert_pin);
+        return Err(crate::phases_early::throw_jca_exc(
+            ctx,
+            "java/security/InvalidKeyException",
+            "Wrong key usage",
+        ));
+    }
+    let cert = ctx.read_native_pin(cert_pin, cert);
+    let key = ctx.invoke_virtual(cert, "getPublicKey", "()Ljava/security/PublicKey;", &[]);
+    ctx.unpin_native_roots(cert_pin);
+    let key = match key? {
+        Some(v @ Value::Object(Some(_))) => v,
+        // Fail CLOSED. Passing the certificate on (the old behaviour) is what
+        // produced the misleading SPI errors above, and silently initialising
+        // with no key would let `verify()` answer on nothing.
+        _ => {
+            return Err(crate::phases_early::throw_jca_exc(
+                ctx,
+                "java/security/InvalidKeyException",
+                "certificate has no public key",
+            ))
+        }
+    };
+    let this = this_arg(args)?;
+    sig_init_verify(ctx, &[Value::Object(Some(this)), key])
+}
+
 fn sig_update_byte(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = this_arg(args)?;
     // `Signature.update` DECLARES `SignatureException`, and HotSpot raises it
@@ -1424,6 +1509,9 @@ fn sig_get_provider_null(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     // Measured on jdk-25: *withECDSA and the Edwards curves → SunEC,
     // *withDSA and ML-DSA → SUN, anything RSA (incl. PSS) → SunRsaSign.
     let name = match algo_name(idx) {
+        // BEFORE the `contains("RSA")` arm: `NONEwithRSA` is the one RSA name
+        // SunJCE owns, and the generic arm below would answer SunRsaSign.
+        "NONEwithRSA" => "SunJCE",
         a if a.ends_with("ECDSA") => "SunEC",
         "Ed25519" | "Ed448" | "EdDSA" => "SunEC",
         a if a.ends_with("DSA") || a.starts_with("ML-DSA") => "SUN",
@@ -1484,11 +1572,14 @@ pub fn register(r: &mut NativeMethodRegistry) {
         "(Ljava/security/PublicKey;)V",
         sig_init_verify,
     );
+    // NOT `sig_init_verify`: that body reads `args[1]` as the verification KEY,
+    // and this overload's `args[1]` is a CERTIFICATE. See
+    // `sig_init_verify_cert`.
     r.register(
         cls,
         "initVerify",
         "(Ljava/security/cert/Certificate;)V",
-        sig_init_verify,
+        sig_init_verify_cert,
     );
 
     r.register(cls, "update", "(B)V", sig_update_byte);
@@ -1648,6 +1739,52 @@ mod tests {
         assert_eq!(algo_name(SIG_ED25519), "Ed25519");
         assert_eq!(algo_name(SIG_ED448), "Ed448");
         assert_eq!(algo_name(SIG_EDDSA), "EdDSA");
+        assert_eq!(algo_name(SIG_NONE_RSA), "NONEwithRSA");
+    }
+
+    /// `NONEwithRSA` is recognised by name, is natively dispatched, and — the
+    /// row that is easy to get wrong — reports SunJCE, not SunRsaSign. It is
+    /// the one RSA signature name the JDK does not serve from SunRsaSign, and
+    /// `sig_get_provider_null`'s generic `contains("RSA")` arm answers
+    /// SunRsaSign for everything it reaches.
+    #[test]
+    fn nonewithrsa_is_recognised_and_natively_dispatched() {
+        assert_eq!(algo_idx("NONEwithRSA"), SIG_NONE_RSA);
+        assert_eq!(algo_idx("nonewithrsa"), SIG_NONE_RSA);
+        assert_eq!(algo_idx("NONEWITHRSA"), SIG_NONE_RSA);
+        assert!(natively_dispatched(SIG_NONE_RSA));
+        assert!(get_instance_offers("NONEwithRSA"));
+    }
+
+    /// The `NONEwithRSA` primitive itself, against its own inverse and against
+    /// the failure modes SunJCE refuses: a payload too long for the modulus, a
+    /// signature of the wrong length, and a forged block.
+    ///
+    /// Cross-checking the BYTES against HotSpot is `probes/NoneWithRsaProbe`,
+    /// which signs on one VM and verifies on the other — a round trip here
+    /// cannot catch a padding scheme that is self-consistent and wrong.
+    #[test]
+    fn none_with_rsa_round_trips_and_refuses_what_sunjce_refuses() {
+        use crate::crypto_impl::Rsa;
+        let (pk, sk) = Rsa::generate_keypair(1024);
+        let payload = b"32-bytes-of-caller-chosen-digest";
+        let sig = Rsa::sign_none(&sk, payload).expect("128-byte modulus fits a 32-byte payload");
+        assert_eq!(sig.len(), 128, "signature is modulus-sized");
+        assert_eq!(Rsa::verify_none(&pk, payload, &sig), Some(true));
+        assert_eq!(
+            Rsa::verify_none(&pk, b"a different payload", &sig),
+            Some(false),
+            "a different payload must be a genuine NO, not a refusal"
+        );
+        let mut forged = sig.clone();
+        forged[100] ^= 0x01;
+        assert_eq!(Rsa::verify_none(&pk, payload, &forged), Some(false));
+        // k - 11 is the largest payload that fits; one more is a refusal on
+        // both sides, not a `false`.
+        assert!(Rsa::sign_none(&sk, &vec![0u8; 128 - 11]).is_some());
+        assert!(Rsa::sign_none(&sk, &vec![0u8; 128 - 10]).is_none());
+        assert_eq!(Rsa::verify_none(&pk, &vec![0u8; 128 - 10], &sig), None);
+        assert_eq!(Rsa::verify_none(&pk, payload, &sig[1..]), None);
     }
 
     // ---- ML-DSA post-quantum Signature routing ----

@@ -34,16 +34,24 @@ this suite — but the margin is one class, not eighty-five. Do not quote the
 
 Two consequences worth stating plainly:
 
-* **It costs heap.** No compaction means ~1.5x the generational footprint on
-  buffer-churning workloads — `ZipContentTests` OOMs at `-Xmx 2g` and passes
-  from 3g. Raise `-Xmx` before diagnosing a post-flip `OutOfMemoryError`.
+* **It costs heap — but not by a known factor.** No compaction means a
+  non-compacting collector needs more headroom, and how much is a property of
+  the workload's allocation shapes. The "~1.5x" figure that stood here until
+  2026-08-13 came from one class, `ZipContentTests`, which OOMed at `-Xmx 2g`
+  and passed at 3g; it now passes 29/29 at 2g under ZGC after two allocator
+  defects were fixed, so the figure is withdrawn. Raise `-Xmx` to get moving
+  after a post-flip `OutOfMemoryError`, and file it: all three known instances
+  of the shape turned out to be allocator bugs.
 * **`-XX:+UseGenerationalGC` is the escape hatch**, in every build. A
   `--no-default-features` build has no ZGC at all and defaults to Generational.
 
 The Spring Boot comparison (1860 PASS vs 1902, 49 HANG vs 18,
 record `fixed-suite-bugs/springboot/zgc-real-fullsuite-regression-RETIRED-20260808.md`)
-predates the two ZGC-only defects fixed on 2026-08-10 and has not been re-run;
-it is the measurement this flip still owes. One of those two defects silently
+predates the two ZGC-only defects fixed on 2026-08-10 and is **superseded**:
+the same day, the 26 classes that were the entire ZGC-vs-default delta were
+re-run on one binary at `-Xmx 2g` and gave ZGC 16 PASS / 7 HANG / 3 FAIL
+against the default collector's 14 / 10 / 2 — "no functional ZGC-vs-default
+difference is left". One of those two defects silently
 zeroed a primitive array, which is a shape that manufactures FAILs wherever it
 occurs rather than in one place, so treat that row as **unmeasured** rather
 than as evidence against ZGC. Every other suite that has a per-collector

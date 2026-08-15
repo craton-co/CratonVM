@@ -783,6 +783,38 @@ fn empty_collection_value(
     Ok(Value::Object(Some(obj)))
 }
 
+/// Did the `set_field_by_name("provider", …)` write actually land — i.e. does
+/// this `Provider$Service` have the REAL JDK layout rather than CratonVM's
+/// synthetic one?
+///
+/// The two layouts disagree by a one-slot rotation. Synthetic:
+/// `(type=0, algorithm=1, provider=2, className=3)`, matching the accessors
+/// `phases_early::register_phase53_security` registers. Real JDK declaration
+/// order: `(provider=0, type=1, algorithm=2, className=3)`. So mirroring the
+/// synthetic slots onto a real `Service` writes the `type` String over
+/// `provider`, `provider` over `algorithm`, and undoes every named write.
+///
+/// It stayed invisible for as long as every JCA engine CratonVM served was
+/// intercepted upstream of the JDK's own `GetInstance`. `CertStore.getInstance`
+/// is not intercepted — it runs `new CertStore(spi, instance.provider, …)` on
+/// real bytecode — so `CertStore.getProvider()` handed back the type String and
+/// `.getName()` on it threw
+/// `NoSuchMethodError: java.lang.String.getName()Ljava/lang/String;`.
+///
+/// Read-back beats a layout query here because it answers the question the
+/// caller actually has ("did my write take?") in both modes, with no new
+/// `NativeContext` surface.
+fn service_has_named_layout(
+    ctx: &mut dyn NativeContext,
+    service: ObjectRef,
+    provider: ObjectRef,
+) -> bool {
+    matches!(
+        ctx.get_field_by_name(service, "provider"),
+        Value::Object(Some(got)) if got == provider
+    )
+}
+
 fn provider_service_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
 
@@ -812,18 +844,46 @@ fn provider_service_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     // reads at 0/1/2.  Mirror those writes so synthetic Provider$Service
     // allocations (i.e. when the real-JDK class isn't loaded) keep
     // returning the right values.
-    let nfields = ctx.object_num_fields(this);
-    if nfields > 0 {
-        ctx.set_field(this, 0, svc_type);
-    }
-    if nfields > 1 {
-        ctx.set_field(this, 1, algorithm);
-    }
-    if nfields > 2 {
-        ctx.set_field(this, 2, provider);
-    }
-    if nfields > 3 {
-        ctx.set_field(this, 3, class_name);
+    //
+    // ONLY in synthetic mode. The two layouts disagree — the synthetic one is
+    // `(type=0, algorithm=1, provider=2, className=3)`, the real JDK's
+    // declaration order is `(provider=0, type=1, algorithm=2, className=3)` —
+    // so on a real `Provider$Service` this mirror wrote `type` over `provider`,
+    // `algorithm` over `type` and `provider` over `algorithm`, undoing all
+    // three `set_field_by_name` writes above with a one-slot rotation.
+    //
+    // That was invisible while every JCA engine CratonVM served was intercepted
+    // before the JDK's own `GetInstance` ran. `CertStore.getInstance` is not:
+    // it runs real bytecode that does `new CertStore(spi, instance.provider, …)`
+    // and `CertStore.getProvider()` then returned the *type* String, so
+    // `getProvider().getName()` died as
+    // `NoSuchMethodError: java.lang.String.getName()` — the absurd-receiver
+    // shape [[a-native-must-not-write-a-field-of-a-receiver-it-did-not-build]]
+    // describes.
+    //
+    // Detected by reading back one of the named writes rather than by asking
+    // for the class layout — see `service_has_named_layout`.
+    let named_layout = match provider {
+        Value::Object(Some(p)) => service_has_named_layout(ctx, this, p),
+        // A null provider cannot be read back distinguishably. Fall back to
+        // asking whether the receiver kept the `className` we just wrote.
+        _ => matches!(ctx.get_field_by_name(this, "className"), Value::Object(Some(_)))
+            && matches!(class_name, Value::Object(Some(_))),
+    };
+    if !named_layout {
+        let nfields = ctx.object_num_fields(this);
+        if nfields > 0 {
+            ctx.set_field(this, 0, svc_type);
+        }
+        if nfields > 1 {
+            ctx.set_field(this, 1, algorithm);
+        }
+        if nfields > 2 {
+            ctx.set_field(this, 2, provider);
+        }
+        if nfields > 3 {
+            ctx.set_field(this, 3, class_name);
+        }
     }
 
     // OpenJDK Provider.Service turns null aliases/attributes into immutable
@@ -1132,27 +1192,26 @@ fn seed_direct_native_engine_services() {
     // answers 15.
     put_alias(SUN, "MessageDigest", "SHAKE128", "SHAKE128-256");
     put_alias(SUN, "MessageDigest", "SHAKE256", "SHAKE256-512");
-    // `ML-DSA` — the UMBRELLA name — is deliberately absent from this
-    // `KeyFactory` list while the three parameter-set names stay. HotSpot's
-    // SUN does advertise and serve it, so this is a knowing divergence in the
-    // under-advertising direction, and it is the safe one: this VM's
-    // `key_factory::kf_algo_idx` has arms only for `ML-DSA-44/65/87`, falls to
-    // `-1`, and `kf_get_instance` throws. Advertised-and-refused.
+    // `ML-DSA` — the UMBRELLA name — was deliberately absent from this
+    // `KeyFactory` list until 2026-08-14, while the three parameter-set names
+    // stayed. It is back because the ALTERNATIVE the earlier record declined
+    // has now been taken: `kf_algo_idx` carries an umbrella arm
+    // (`ALGO_MLDSA_GENERIC`) and `pqc_umbrella_keyfactory_class` drives the
+    // JDK's own non-nested `sun.security.provider.ML_DSA_Impls$KF`, which is
+    // the factory that resolves the parameter set from the key's encoding.
     //
-    // The alternative — add an umbrella arm resolving the parameter set from
-    // the key spec, as `signature::mldsa_spi_class` does from the init key —
-    // was declined rather than deferred, because W7-29 RAN the three names
-    // that already resolve and found the objects partly unusable one accessor
-    // in (`KeyFactory.getInstance("ML-DSA-44").getProvider()` raises
+    // The reason the record gave for declining was not "too much work": it had
+    // RUN the three names that already resolved and found the objects partly
+    // unusable one accessor in —
+    // `KeyFactory.getInstance("ML-DSA-44").getProvider()` raised
     // `NullPointerException: Cannot enter synchronized block because
-    // "this.lock" is null`, where HotSpot answers `SUN version 25`). Widening
-    // a surface that is already broken is not a fix. Note that
-    // `signature::algo_idx` DOES carry the umbrella arm, so `Signature`
-    // continues to advertise and serve `ML-DSA` — the two engines disagreed
-    // about the same name, and this makes each engine's advertisement match
-    // its own implementation rather than making them agree with each other.
+    // "this.lock" is null`, where HotSpot answers `SUN version 25`. Widening a
+    // surface that is already broken is not a fix, and that objection is
+    // ANSWERED rather than ignored: `kf_get_provider` is registered in the
+    // same change, so every one of these names now reports its provider
+    // instead of throwing from a plain accessor.
     // W7-63-jca-advertise-vs-serve.md.
-    for algorithm in ["DSA", "ML-DSA-44", "ML-DSA-65", "ML-DSA-87"] {
+    for algorithm in ["DSA", "ML-DSA", "ML-DSA-44", "ML-DSA-65", "ML-DSA-87"] {
         put_service(SUN, "KeyFactory", algorithm, "sun.security.provider.Native");
     }
     for algorithm in ["DRBG", "SHA1PRNG"] {
@@ -1286,21 +1345,24 @@ fn seed_direct_native_engine_services() {
             );
         }
     }
-    // The `ML-KEM` UMBRELLA is absent for the same reason `ML-DSA` is absent
+    // The `ML-KEM` UMBRELLA was absent for the same reason `ML-DSA` was absent
     // from the `SUN` `KeyFactory` list above, and it was found by the census
-    // rather than by either record: `key_factory::algo_idx` has arms for
-    // `ML-KEM-512/768/1024` only, falls to `-1`, and `kf_get_instance` throws,
-    // so `Security.getAlgorithms("KeyFactory")` named `ML-KEM` while
-    // `KeyFactory.getInstance("ML-KEM")` raised `NoSuchAlgorithmException`.
-    // Advertised-and-refused, a seventh instance of the species in the same
-    // seed function, and note that the SPI class name here is a REAL JDK class
-    // — that does not help, because `kf_get_instance` intercepts natively and
-    // never reaches `build_jca_impl`. A real class name in a service row is
-    // not evidence the row is serviceable.
+    // rather than by either record. Both are back on 2026-08-14 and for the
+    // same reason: `kf_algo_idx` carries the umbrella arm and
+    // `pqc_umbrella_keyfactory_class` drives the JDK's own non-nested
+    // `ML_KEM_Impls$KF`. Note that the SPI class name in a service row was
+    // never evidence of anything — `kf_get_instance` intercepts natively and
+    // never reaches `build_jca_impl` — so what makes these rows truthful is
+    // the engine arm, not the string.
     // W7-63-jca-advertise-vs-serve.md.
-    for algorithm in ["ML-KEM-512", "ML-KEM-768", "ML-KEM-1024"] {
+    for algorithm in ["ML-KEM", "ML-KEM-512", "ML-KEM-768", "ML-KEM-1024"] {
         put_service(JCE, "KeyFactory", algorithm, "com.sun.crypto.provider.ML_KEM_Impls$KF");
     }
+    // Finite-field Diffie-Hellman, registered under the name HotSpot uses.
+    // `DH` is an ALIAS there, not a service, which is why the advertised list
+    // names `DiffieHellman` while every caller types `DH`.
+    put_service(JCE, "KeyFactory", "DiffieHellman", "com.sun.crypto.provider.DHKeyFactory");
+    put_alias(JCE, "KeyFactory", "DH", "DiffieHellman");
     // SunJCE's own aliases. Aliases are excluded from
     // `Security.getAlgorithms` (their property key is `Alg.Alias.Cipher.X`, not
     // `Cipher.X`), so these widen `getInstance`/`getService` resolution without
@@ -1493,6 +1555,77 @@ fn seed_retired_getalgorithms_literals() {
         "DSA",
         "sun.security.provider.DSAKeyPairGenerator$Current",
     );
+    seed_builtin_keypairgenerator_services();
+}
+
+/// Service entries for every `KeyPairGenerator` algorithm this VM SERVES from
+/// its own natives.
+///
+/// WHY THIS EXISTS. `Security.getProviders("KeyPairGenerator.Ed25519")`
+/// answered `<none>` for an algorithm `getInstance("Ed25519")` happily served,
+/// because the two live in disjoint worlds: `security_get_providers_filtered`
+/// consults only the service registry, and the algorithms CratonVM serves from
+/// `key_factory::kpg_can_generate` are in no registry at all. A caller that
+/// picks its provider by filter — the JDK's own `Provider.getService` shape —
+/// therefore concluded the algorithm did not exist, and `getInstance` then
+/// served it anyway.
+///
+/// Seeding them closes the filter AND collapses the split `kpg_serviceable`
+/// has to straddle: the second half of that disjunction
+/// (`any_provider_offers`) now covers the first for every built-in name, so
+/// the two worlds agree even though the code still asks both.
+///
+/// Provider assignment is HotSpot's, read off JDK 25 with
+/// `probes/JcaGetInstanceProbe.java` and pinned to `kpg_provider_name` by
+/// `every_kpg_algorithm_this_vm_serves_is_advertised`. Class names are the
+/// real SPI classes each provider registers; nothing reads them on the
+/// intercepted path (`kpg_get_instance` never reaches `build_jca_impl`), which
+/// is exactly why the RATCHET and not the string is what keeps a row honest.
+fn seed_builtin_keypairgenerator_services() {
+    put_service(
+        "SunRsaSign",
+        "KeyPairGenerator",
+        "RSASSA-PSS",
+        "sun.security.rsa.RSAKeyPairGenerator$PSS",
+    );
+    for (algorithm, class_name) in [
+        ("Ed25519", "sun.security.ec.ed.EdDSAKeyPairGenerator$Ed25519"),
+        ("Ed448", "sun.security.ec.ed.EdDSAKeyPairGenerator$Ed448"),
+        ("EdDSA", "sun.security.ec.ed.EdDSAKeyPairGenerator"),
+        ("X25519", "sun.security.ec.XDHKeyPairGenerator$X25519"),
+        ("X448", "sun.security.ec.XDHKeyPairGenerator$X448"),
+        ("XDH", "sun.security.ec.XDHKeyPairGenerator"),
+    ] {
+        put_service("SunEC", "KeyPairGenerator", algorithm, class_name);
+    }
+    for (algorithm, class_name) in [
+        ("ML-DSA", "sun.security.provider.ML_DSA_Impls$KPG"),
+        ("ML-DSA-44", "sun.security.provider.ML_DSA_Impls$KPG2"),
+        ("ML-DSA-65", "sun.security.provider.ML_DSA_Impls$KPG3"),
+        ("ML-DSA-87", "sun.security.provider.ML_DSA_Impls$KPG5"),
+    ] {
+        put_service("SUN", "KeyPairGenerator", algorithm, class_name);
+    }
+    for (algorithm, class_name) in [
+        ("ML-KEM", "com.sun.crypto.provider.ML_KEM_Impls$KPG"),
+        ("ML-KEM-512", "com.sun.crypto.provider.ML_KEM_Impls$KPG2"),
+        ("ML-KEM-768", "com.sun.crypto.provider.ML_KEM_Impls$KPG3"),
+        ("ML-KEM-1024", "com.sun.crypto.provider.ML_KEM_Impls$KPG5"),
+        (
+            "DiffieHellman",
+            "com.sun.crypto.provider.DHKeyPairGenerator",
+        ),
+    ] {
+        put_service("SunJCE", "KeyPairGenerator", algorithm, class_name);
+    }
+    // `DH` is an alias on HotSpot too, so it resolves through `getInstance`
+    // without lengthening `Security.getAlgorithms("KeyPairGenerator")`.
+    put_alias("SunJCE", "KeyPairGenerator", "DH", "DiffieHellman");
+    // `ECDSA` is deliberately NOT here. SunEC registers `KeyPairGenerator.EC`
+    // and no `ECDSA` alias for it, so HotSpot answers
+    // `NoSuchAlgorithmException` — advertising it would make the filter claim
+    // a name HotSpot refuses, which is this table's own failure mode in the
+    // other direction.
 }
 
 /// Real-JCA bring-up: seed the `SunEC` provider's EC service entries into the
@@ -1859,6 +1992,53 @@ fn seed_sunjsse_services() {
         "PKIX",
         "sun.security.provider.certpath.SunCertPathBuilder",
     );
+    // CertStore Collection (SUN provider). `CertPathBuilder.PKIX` above is only
+    // half of a path build: PKIX finds intermediates through the `CertStore`s
+    // named in its `PKIXBuilderParameters`, and every caller that has the
+    // intermediates in hand rather than in an LDAP directory builds that store
+    // with `CertStore.getInstance("Collection", new
+    // CollectionCertStoreParameters(certs))`. Without the service that call
+    // threw `NoSuchAlgorithmException: Collection CertStore not available`, and
+    // BouncyCastle wrapped it as the misleading `OCSPException: Error setting up
+    // certificate path validation` recorded in the retired
+    // `ssl-cert-validation-residuals` write-up — a message that names certificate
+    // validation for what is really a missing JCA service.
+    //
+    // Unlike every other service seeded here, `CertStoreSpi` has NO no-arg
+    // constructor: JCA passes the `CertStoreParameters` to a one-argument ctor.
+    // `provider_service_new_instance` handles that via
+    // `jca_service_ctor_parameter_type`.
+    put_service(
+        S,
+        "CertStore",
+        "Collection",
+        "sun.security.provider.certpath.CollectionCertStore",
+    );
+    put_service(
+        S,
+        "CertStore",
+        "com.sun.security.IndexedCollection",
+        "sun.security.provider.certpath.IndexedCollectionCertStore",
+    );
+}
+
+/// The constructor-parameter type a JCA engine's SPI takes, if it takes one.
+///
+/// Most JCA SPIs are built with a public no-arg constructor, which is what
+/// `Provider$Service.newInstance` assumes when it is handed a null
+/// `constructorParameter`. A few engines are defined the other way round: the
+/// SPI has no no-arg constructor at all and JCA calls a one-argument one. The
+/// JDK keeps this in `Provider$Service`'s `knownEngines` table; this mirrors the
+/// entries CratonVM actually seeds services for.
+///
+/// `CertStore` is the one that matters here — `CertStoreSpi(CertStoreParameters)`
+/// is its only constructor, so calling `()V` on `CollectionCertStore` cannot
+/// work no matter how the service is registered.
+fn jca_service_ctor_parameter_type(engine_type: &str) -> Option<&'static str> {
+    match engine_type {
+        "CertStore" => Some("Ljava/security/cert/CertStoreParameters;"),
+        _ => None,
+    }
 }
 
 /// Mirror the JDK's `XMLDSig` provider (`org.jcp.xml.dsig.internal.dom.XMLDSigRI`)
@@ -2255,12 +2435,17 @@ fn make_service(
 
     // Synthetic-mode mirror — getType=0, getAlgorithm=1, getProvider=2
     // (matches the layout in `phases_early::register_phase53_security`).
-    ctx.set_field(svc, 0, Value::Object(Some(type_s)));
-    ctx.set_field(svc, 1, Value::Object(Some(algo_s)));
-    ctx.set_field(svc, 2, Value::Object(Some(prov)));
-    // Slot 3 reserved for className so the new `Service.getClassName`
-    // accessor (registered below) returns the right string.
-    ctx.set_field(svc, 3, Value::Object(Some(class_s)));
+    // Skipped when the named writes above landed: see
+    // `service_has_named_layout` for what the mirror did to a real
+    // `Provider$Service`, and how `CertStore.getInstance` exposed it.
+    if !service_has_named_layout(ctx, svc, prov) {
+        ctx.set_field(svc, 0, Value::Object(Some(type_s)));
+        ctx.set_field(svc, 1, Value::Object(Some(algo_s)));
+        ctx.set_field(svc, 2, Value::Object(Some(prov)));
+        // Slot 3 reserved for className so the new `Service.getClassName`
+        // accessor (registered below) returns the right string.
+        ctx.set_field(svc, 3, Value::Object(Some(class_s)));
+    }
     // GC-stable className: key the side table on the service's identity hash
     // (stored in the object header, preserved across moving-GC relocation) so
     // `newInstance` retrieves the className without depending on object slots
@@ -2863,6 +3048,27 @@ pub(crate) fn ssl_context_protocol_supported(protocol: &str) -> bool {
 /// That divergence is closed — `security_get_algorithms` and
 /// `provider_get_services_native` both wrap through `wrap_unmodifiable` now.
 /// A comment outlives its defect. W7-63-jca-advertise-vs-serve.md.)
+/// `true` when SOME registered provider offers `(type_str, algo)`.
+///
+/// The thin question behind `find_service_provider`, for callers that only need
+/// to know whether anything can serve a name — `KeyPairGenerator.getInstance`
+/// asks it to decide between handing back a generator and raising
+/// `NoSuchAlgorithmException`.
+///
+/// Note what this does NOT cover: the algorithms CratonVM serves from its own
+/// natives are not in the service registry at all, so a `false` here is only
+/// half the answer. `kpg_serviceable` is the other half.
+pub(crate) fn any_provider_offers(type_str: &str, algo: &str) -> bool {
+    find_service_provider(type_str, algo).is_some()
+}
+
+/// `true` when `provider` specifically offers `(type_str, algo)` — the
+/// two-argument `getInstance(alg, provider)` question, which must NOT be
+/// satisfied by some other provider that happens to have the algorithm.
+pub(crate) fn provider_offers(provider: &str, type_str: &str, algo: &str) -> bool {
+    get_service_entry(provider, type_str, algo).is_some()
+}
+
 pub(crate) fn algorithms_for_service(service_name: &str) -> Vec<String> {
     if service_name.is_empty() || service_name.ends_with('.') {
         return Vec::new();
@@ -3382,6 +3588,33 @@ fn provider_service_new_instance(ctx: &mut dyn NativeContext, args: &[Value]) ->
         }
     }
     let internal = class_name.replace('.', "/");
+    // Engines whose SPI takes its parameters through the CONSTRUCTOR rather
+    // than a no-arg ctor plus setters — see `jca_service_ctor_parameter_type`.
+    // `CertStore.getInstance("Collection", params)` is the reachable case: its
+    // SPI has no `()V` at all, so without this arm the arm below raised
+    // `ClassNotFoundException` for a class that had loaded perfectly well.
+    //
+    // Only taken when a non-null `constructorParameter` was actually supplied;
+    // `newInstance(null)` on such an engine keeps falling through to `()V` and
+    // failing there, which is what the JDK does too (`InvalidParameterException`
+    // territory, not a silently different object).
+    if let Some(param_desc) = provider_service_string_field(ctx, this, "type", 0)
+        .as_deref()
+        .and_then(jca_service_ctor_parameter_type)
+    {
+        if let Some(param @ Value::Object(Some(_))) = args.get(1).cloned() {
+            let ctor = format!("({param_desc})V");
+            match ctx.new_object_initialized(&internal, &ctor, &[param]) {
+                Ok(Some(v @ Value::Object(Some(_)))) => return Ok(Some(v)),
+                Err(MethodCallFailed::ExceptionThrown(t)) => {
+                    return Err(MethodCallFailed::ExceptionThrown(t))
+                }
+                // Fall through to the no-arg attempt: a provider may have
+                // registered a class under this engine that does declare `()V`.
+                _ => {}
+            }
+        }
+    }
     // GC-safe allocate + run the no-arg constructor (real BC SPI bytecode). The
     // SPI constructor can allocate enough to trigger a moving GC, so we must not
     // hold the raw reference across `<init>` — `new_object_initialized` pins it
@@ -4494,6 +4727,71 @@ mod tests {
         }
     }
 
+    /// The `KeyPairGenerator` ratchet, in BOTH directions — which is what makes
+    /// it different from its `Signature` / `KeyFactory` siblings.
+    ///
+    /// The one-way form (advertised ⇒ serviceable) cannot see the residual this
+    /// closes. `Security.getProviders("KeyPairGenerator.Ed25519")` answered
+    /// `<none>` for an algorithm `getInstance("Ed25519")` served, because
+    /// `security_get_providers_filtered` reads the service registry and the
+    /// built-in algorithms were in NO registry — under-advertised, not
+    /// over-advertised, and therefore invisible to a one-way check. A caller
+    /// that picks its provider by filter concluded the algorithm did not exist.
+    ///
+    /// So both halves are asserted: nothing advertised is refused, and nothing
+    /// served is unadvertised.
+    #[test]
+    fn every_kpg_algorithm_this_vm_serves_is_advertised() {
+        let _lock = reset_service_state_for_tests();
+        seed_direct_native_engine_services();
+        let advertised = all_advertised("KeyPairGenerator");
+        assert!(
+            advertised.len() >= 15,
+            "the KeyPairGenerator seed looks empty ({} rows): a loop over \
+             nothing passes vacuously",
+            advertised.len()
+        );
+        for (provider, algorithm) in &advertised {
+            assert!(
+                crate::jca::key_factory::kpg_get_instance_offers(algorithm),
+                "{provider} advertises KeyPairGenerator.{algorithm}, but \
+                 KeyPairGenerator.getInstance refuses it"
+            );
+        }
+        // The direction the filter needs, and the one the residual was in.
+        // `DH` and `ECDSA` are absent by design: HotSpot registers `DH` as an
+        // ALIAS of `DiffieHellman` (aliases resolve but are not advertised),
+        // and registers no `ECDSA` generator at all.
+        for algorithm in [
+            "RSA", "RSASSA-PSS", "EC", "DSA", "Ed25519", "Ed448", "EdDSA", "X25519", "X448",
+            "XDH", "ML-DSA", "ML-DSA-44", "ML-KEM", "ML-KEM-512", "DiffieHellman",
+        ] {
+            assert!(
+                crate::jca::key_factory::kpg_get_instance_offers(algorithm),
+                "{algorithm} must be serviceable"
+            );
+            assert!(
+                find_service_provider("KeyPairGenerator", algorithm).is_some(),
+                "KeyPairGenerator.{algorithm} is served but advertised by no \
+                 provider — Security.getProviders(\"KeyPairGenerator.{algorithm}\") \
+                 answers <none> and a caller that picks its provider by filter \
+                 cannot find it"
+            );
+        }
+        // The alias resolves without being advertised, exactly as on HotSpot.
+        assert!(
+            find_service_provider("KeyPairGenerator", "DH").is_some(),
+            "the DH alias must resolve to the DiffieHellman service"
+        );
+        // Anti-vacuity: prove the registry can say NO.
+        for bogus in ["NO-SUCH-KPG", "SLH-DSA", "AES", ""] {
+            assert!(
+                find_service_provider("KeyPairGenerator", bogus).is_none(),
+                "no provider may advertise KeyPairGenerator.{bogus:?}"
+            );
+        }
+    }
+
     /// W7-63 ratchet: every `KeyFactory` name the seed advertises must be one
     /// `KeyFactory.getInstance` will serve.
     ///
@@ -4524,17 +4822,24 @@ mod tests {
                  KeyFactory.getInstance refuses it"
             );
         }
-        // Both umbrellas are STOP-ADVERTISING fixes, not implementations, so
-        // pin both halves of each: absent where the engine refuses them,
-        // present where it does not. Either half alone would let the pair
-        // drift back. `ML-KEM` was found by the census, not by either
-        // originating record — the loop above is what catches the next one.
+        // Both umbrellas WERE stop-advertising fixes and are now
+        // implementations: `kf_algo_idx` carries `ALGO_MLDSA_GENERIC` /
+        // `ALGO_MLKEM_GENERIC` and `pqc_umbrella_keyfactory_class` drives the
+        // JDK's own non-nested factory for each. The rule the earlier
+        // assertion encoded has not changed — "either implement the umbrella
+        // arm or leave the name out, but never both" — only which side of it
+        // these two names sit on. The loop above is what enforces it
+        // generically; this is the named pin for the pair that drifted.
         for (provider, umbrella) in [("SUN", "ML-DSA"), ("SunJCE", "ML-KEM")] {
             assert!(
-                get_service_entry(provider, "KeyFactory", umbrella).is_none(),
-                "{provider} must not advertise the {umbrella} umbrella for KeyFactory \
-                 while kf_algo_idx refuses it — either implement the umbrella arm or \
-                 leave the name out, but never both"
+                get_service_entry(provider, "KeyFactory", umbrella).is_some(),
+                "{provider} implements the {umbrella} KeyFactory umbrella and must \
+                 advertise it — an implemented-but-unadvertised name is invisible to \
+                 Security.getProviders(filter), which is how a caller picks a provider"
+            );
+            assert!(
+                crate::jca::key_factory::get_instance_offers(umbrella),
+                "{umbrella} is advertised for KeyFactory and must be serviceable"
             );
         }
         assert!(

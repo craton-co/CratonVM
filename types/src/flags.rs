@@ -1185,6 +1185,18 @@ pub struct IoFlags {
     /// `RandomAccessFile`. Consumers want `!synthetic_raf_forced`.
     /// [`parse::exactly_one`].
     pub synthetic_raf_forced: bool,
+    /// `CRATONVM_SYNTHETIC_NETTY_TCNATIVE=1` — opt back into the
+    /// `io/netty/internal/tcnative` stub surface instead of running Netty's
+    /// real `netty_tcnative` library.
+    ///
+    /// Default (unset) loads the real library: its `JNI_OnLoad` runs and the
+    /// stubs stand down, which is what makes `OpenSsl.isAvailable()` true and
+    /// lets netty's suites generate their `SslProvider.OPENSSL` parameters at
+    /// all. Set this only on a host where that library genuinely misbehaves;
+    /// with it set, `OpenSsl.isAvailable()` is false exactly as before.
+    /// Consumers want `!synthetic_netty_tcnative_forced`.
+    /// [`parse::exactly_one`].
+    pub synthetic_netty_tcnative_forced: bool,
     /// `CRATONVM_SOCKET_CAPTURE` — non-empty path prefix for socket capture
     /// files. [`parse::non_empty_string`].
     pub socket_capture_prefix: Option<String>,
@@ -1246,6 +1258,10 @@ impl IoFlags {
             synthetic_net_sockets_forced: present(src, "CRATONVM_SYNTHETIC_NET_SOCKETS"),
             synthetic_filewriter_forced: exactly_one(src, "CRATONVM_SYNTHETIC_FILEWRITER"),
             synthetic_raf_forced: exactly_one(src, "CRATONVM_SYNTHETIC_RAF"),
+            synthetic_netty_tcnative_forced: exactly_one(
+                src,
+                "CRATONVM_SYNTHETIC_NETTY_TCNATIVE",
+            ),
             socket_capture_prefix: non_empty_string(src, "CRATONVM_SOCKET_CAPTURE"),
             select_max_block_ms: i32_positive(src, "CRATONVM_SELECT_MAX_BLOCK_MS"),
             no_selector_connect_probe: non_empty_non_zero_non_false(

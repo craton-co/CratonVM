@@ -2278,7 +2278,22 @@ pub(super) fn process_references_after_gc(
         // address absent from the pointer map did NOT survive this GC —
         // writing the `Object(None)` clear through it would corrupt the
         // memory's new occupant (the PROVEN bc-math-ec 0x4 writer).
-        if is_stale_young(ref_addr) {
+        // Test the RELOCATED address, not the pre-GC one.
+        //
+        // The write below already goes through `pointer_map`-relocated
+        // `actual_addr`; this guard used to test `ref_addr`, so for a survivor
+        // that MOVED the two disagreed about which object they meant. Under a
+        // non-moving collector they are the same address and it never
+        // mattered; ZGC began compacting on 2026-08-13, and from then every
+        // Reference the slide moved was judged dead here and silently never
+        // cleared or enqueued — no `WeakReference` delivery and no `Cleaner`
+        // action for it, which on netty is how a direct `ByteBuf`'s native
+        // memory stops being freed.
+        //
+        // A no-op wherever the map is empty, i.e. every non-moving cycle on
+        // every backend.
+        let relocated = pointer_map.get(&ref_addr).copied().unwrap_or(ref_addr);
+        if is_stale_young(relocated) {
             if straystack_enabled() {
                 eprintln!("[refproc] SKIP dead CLEARED ref @0x{ref_addr:x} (young, not in map)");
             }
@@ -2313,7 +2328,13 @@ pub(super) fn process_references_after_gc(
         // enqueue when either the Reference or its queue did not survive —
         // the head/size/next writes below through a stale address are the
         // same proven corruption class as the cleared-referent write.
-        if is_stale_young(*ref_addr) || is_stale_young(*queue_addr) {
+        // Relocated addresses, for the reason on the cleared loop above: the
+        // enqueue writes below resolve through the map, so the guard has to as
+        // well or a moved Reference (or a moved ReferenceQueue) is declined as
+        // dead.
+        let ref_reloc = pointer_map.get(ref_addr).copied().unwrap_or(*ref_addr);
+        let q_reloc = pointer_map.get(queue_addr).copied().unwrap_or(*queue_addr);
+        if is_stale_young(ref_reloc) || is_stale_young(q_reloc) {
             if straystack_enabled() {
                 eprintln!(
                     "[refproc] SKIP dead ENQUEUE ref@0x{ref_addr:x}/q@0x{queue_addr:x} (young, not in map)"

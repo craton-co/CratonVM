@@ -103,7 +103,7 @@ JDKONLY_MODULE="cratonvm.jdkonly.svc"
 # every scheduled class already receives that flag, so a second registration
 # would run the identical command twice. Nothing schedules by glob — every list
 # here is explicit — so the name collision is cosmetic.
-CORE_CLASSES="RCollections RStrings RNumbers RSerial RCrypto RExceptions RReflect ROptionalClassForName RPrivateLambdaOwner RLambdaDefaultOverload RJitGc RJitStringLayout RJitArrayTypecheck RArraysMismatch RExecutorShutdown RBlockingQueue RChmKeySetView RChannelInterrupt RSocketChannelInterrupt RAtomicArray RDirectBufferElem RMapResizeGc RMapGcStress RForNameGcStress ROverlaySystemGcStress RFileTimes RNioNoFollow RSyncMethodJit RFieldSiteCache RMethodSiteCache RDataInputFastPull RCanAccessRules RChaCha20Cipher RLockedIdentityHash RCanAccessReceiver RForeignLayoutCollections RForeignLayoutJdkInterfaces RLoaderChurnDefine RClassUnloadSweep RPriorityQueueGc RTreeRangeGc RJdkViews"
+CORE_CLASSES="RCollections RStrings RNumbers RSerial RCrypto RExceptions RReflect ROptionalClassForName RPrivateLambdaOwner RLambdaDefaultOverload RJitGc RJitStringLayout RJitArrayTypecheck RArraysMismatch RExecutorShutdown RBlockingQueue RChmKeySetView RChannelInterrupt RSocketChannelInterrupt RAtomicArray RDirectBufferElem RMapResizeGc RMapGcStress RForNameGcStress ROverlaySystemGcStress RFileTimes RNioNoFollow RSyncMethodJit RFieldSiteCache RMethodSiteCache RDataInputFastPull RCanAccessRules RChaCha20Cipher RLockedIdentityHash RCanAccessReceiver RForeignLayoutCollections RForeignLayoutJdkInterfaces RLoaderChurnDefine RClassUnloadSweep RClassUnloadSweepGen RPriorityQueueGc RTreeRangeGc RJdkViews"
 
 # The JDK-only corpus (docs/feature-designs/jdk-only-mode.md). Not in the
 # default set: `--jdk-only` is an internal-diagnostic policy in wave 1 and is
@@ -377,6 +377,16 @@ class_cv_args() {
   case "$1" in
     RPriorityQueueGc) printf '%s' "--nojit --Xmx 64m" ;;
     RTreeRangeGc)     printf '%s' "--Xmx 64m" ;;
+    # The COLLECTOR is a variable this suite otherwise never moves: every other
+    # vector runs on whatever the default happens to be, and that default
+    # changed (Generational -> ZGC) on 2026-08-10 with nothing scheduled to
+    # notice. `RClassUnloadSweepGen` is `RClassUnloadSweep`'s own probe run
+    # against the generational young sweep, where the last surviving arm of
+    # `TestDefaultInstanceManager`'s fourth recurrence lived. CratonVM-only by
+    # construction: `$cvextra` never reaches the HotSpot oracle, which is
+    # correct here — the claim is "a real JVM unloads this class", not "under a
+    # named collector".
+    RClassUnloadSweepGen) printf '%s' "-XX:+UseGenerationalGC" ;;
     *) : ;;
   esac
 }

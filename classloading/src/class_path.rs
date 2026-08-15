@@ -4010,6 +4010,408 @@ impl ClassPath {
         }
     }
 
+    /// Every URL a SINGLE classpath entry serves for `name`.
+    ///
+    /// Split out of [`Self::find_all_resource_urls_impl`] so the whole-list
+    /// walk and the incremental walk ([`Self::next_resource_url_from`]) run
+    /// the same per-entry rules instead of two copies that can drift. The
+    /// `continue`s that used to mean "next entry" are `return`s here; nothing
+    /// else moved.
+    fn resource_urls_for_entry(
+        &self,
+        entry: &ClassPathEntry,
+        name: &str,
+        archive_safe: bool,
+        directory_safe: bool,
+        dbg: bool,
+    ) -> Vec<String> {
+        let mut urls = Vec::new();
+        match entry {
+            ClassPathEntry::Directory(dir) => {
+                if !directory_safe {
+                    return urls;
+                }
+                if simple_resource_glob(name).is_some() {
+                    for full_path in Self::matching_directory_resource_paths(dir, name) {
+                        if let Some(canon_path) =
+                            self.checked_directory_resource_canonical(dir, &full_path, name)
+                        {
+                            urls.push(Self::directory_resource_url_from_canonical(&canon_path));
+                        }
+                    }
+                    return urls;
+                }
+                // `getResources("")` names the classpath root ITSELF, and
+                // the generic path below answers it the expensive way:
+                // `dir.join("")` is `dir` with a trailing separator, so it
+                // costs an `exists()` statx, a `canonicalize` of `dir`, a
+                // SECOND `canonicalize` of the trailing-slash spelling
+                // (a distinct cache key), and an `is_dir()` statx — per
+                // directory entry, per call.
+                //
+                // That is not a hypothetical shape. SmallRye Config's
+                // `AbstractLocationConfigSourceLoader.isInClassloader` is
+                // exactly `classLoader.resources(uri.getPath()).anyMatch(..)`
+                // with an empty path, and Quarkus's config bootstrap runs
+                // it once per discovered config source per profile — 1388
+                // times over a 4230-entry classpath for ONE test class,
+                // which is where 4.43M `statx` calls came from against
+                // HotSpot's 11.9K for the same run.
+                //
+                // A `Directory` entry is a directory that is on the
+                // classpath; both facts were established when it was
+                // admitted. Re-deriving them from the filesystem on every
+                // probe buys nothing, so answer from the memoized root.
+                if name.is_empty() {
+                    if let Ok(canon_dir) = self.canonicalize_root(dir) {
+                        let p = canon_dir.to_string_lossy().replace('\\', "/");
+                        let p = p.strip_prefix("//?/").unwrap_or(&p);
+                        let p = p.trim_start_matches('/').trim_end_matches('/');
+                        urls.push(format!("file:/{}/", encode_path_for_url(p)));
+                    }
+                    return urls;
+                }
+                let full_path = dir.join(Path::new(name));
+                if full_path.exists() {
+                    // C35 audit fix (HIGH security): fail-CLOSED on
+                    // canonicalize error. Previously the
+                    // `if let (Ok, Ok)` silently fell through to the
+                    // `urls.push(file:/...)` emission below — an
+                    // attacker who could plant a symlink causing
+                    // canonicalize to fail could leak the existence
+                    // of arbitrary files via `getResources()`
+                    // enumeration (even though the matching
+                    // `find_class` path correctly rejected the same
+                    // symlink).
+                    let canon_dir = match self.canonicalize_root(dir) {
+                        Ok(p) => p,
+                        Err(_) => return urls,
+                    };
+                    let canon_path = match self.canonicalize_cached(&full_path) {
+                        Ok(p) => p,
+                        Err(_) => return urls,
+                    };
+                    if !canon_path.starts_with(&canon_dir) {
+                        return urls;
+                    }
+                    // `canon_path` is the already-canonicalized
+                    // resolved path; reuse it directly instead of
+                    // re-canonicalizing (and avoid the
+                    // `unwrap_or(full_path)` fallback that, prior to
+                    // this fix, would have emitted the
+                    // un-canonicalized path on canonicalize error).
+                    let p = canon_path.to_string_lossy().replace('\\', "/");
+                    let p = p.strip_prefix("//?/").unwrap_or(&p);
+                    let p = p.trim_start_matches('/');
+                    // A directory resource (e.g. a package path queried via
+                    // `ClassLoader.getResources("com/example/pkg/")`) must
+                    // keep its trailing slash — real `URLClassLoader`
+                    // preserves it, and Spring's
+                    // `PathMatchingResourcePatternResolver` relies on it:
+                    // its `rootDirCache` collapses sibling directory scans
+                    // onto a shared parent `Resource` and reconstructs
+                    // child paths via `createRelative`/
+                    // `StringUtils.applyRelativePath`, which treats a
+                    // no-trailing-slash URL as a FILE path and strips the
+                    // last segment when appending a relative child —
+                    // silently resolving to a sibling directory instead of
+                    // a subdirectory. That broke any SECOND differently-
+                    // pathed scan against the same resolver instance, e.g.
+                    // a `@ComponentScan`-discovered `@Configuration` class
+                    // whose OWN `@ComponentScan` scans a sibling package
+                    // (ComponentScanAnnotationRecursionTests, 2+ levels of
+                    // recursive `@ComponentScan`). Matches the established
+                    // unconditional-slash pattern in
+                    // `find_class_code_source_info` above, but here it
+                    // must be conditional since this function also serves
+                    // plain (non-directory) resource lookups.
+                    if canon_path.is_dir() && !p.ends_with('/') {
+                        urls.push(format!("file:/{}/", encode_path_for_url(&p)));
+                    } else {
+                        urls.push(format!("file:/{}", encode_path_for_url(&p)));
+                    }
+                }
+            }
+            ClassPathEntry::JarFile {
+                archive,
+                multi_release,
+                versions_cache,
+                entry_index,
+                path,
+                ..
+            } => {
+                if !archive_safe {
+                    if dbg {
+                        eprintln!(
+                            "[GRES-DBG]   jar {} mr={} -> skipped unsafe name",
+                            path.display(),
+                            multi_release
+                        );
+                    }
+                    return urls;
+                }
+                if simple_resource_glob(name).is_some() {
+                    let candidates = Self::matching_resource_entry_names(
+                        entry_index
+                            .iter()
+                            .filter(|entry| !entry.starts_with("META-INF/versions/")),
+                        name,
+                    );
+                    if dbg {
+                        eprintln!(
+                            "[GRES-DBG]   jar {} mr={} -> {}",
+                            path.display(),
+                            multi_release,
+                            if candidates.is_empty() { "miss" } else { "HIT" }
+                        );
+                    }
+                    if !candidates.is_empty() {
+                        let abs = self
+                            .canonicalize_root(path)
+                            .unwrap_or_else(|_| path.clone());
+                        let p = abs.to_string_lossy().replace('\\', "/");
+                        let p = p.strip_prefix("//?/").unwrap_or(&p);
+                        let p = p.trim_start_matches('/');
+                        for candidate in candidates {
+                            urls.push(format!(
+                                "jar:file:/{}!/{candidate}",
+                                encode_path_for_url(&p)
+                            ));
+                        }
+                    }
+                    return urls;
+                }
+                let direct_entry = if *multi_release {
+                    Self::multi_release_entry_name(archive, versions_cache, entry_index, name)
+                } else {
+                    entry_index.contains(name).then(|| name.to_string())
+                };
+                // HotSpot's URLClassLoader matches a request for `cnf` against
+                // a `cnf/` directory entry inside a JAR. Without the slash-
+                // tolerant retry, `getResource("cnf")` returned null even when
+                // the JAR clearly contains the directory, breaking DaCapo's
+                // `extractBenchmarkSet` (which dereferences the URL's
+                // protocol without a null check).
+                let slash_entry = if direct_entry.is_none() && !name.ends_with('/') {
+                    let alt = format!("{name}/");
+                    if *multi_release {
+                        Self::multi_release_entry_name(
+                            archive,
+                            versions_cache,
+                            entry_index,
+                            &alt,
+                        )
+                    } else {
+                        entry_index.contains(&alt).then_some(alt)
+                    }
+                } else {
+                    None
+                };
+                let selected_entry = direct_entry.or(slash_entry);
+                if dbg {
+                    eprintln!(
+                        "[GRES-DBG]   jar {} mr={} -> {}",
+                        path.display(),
+                        multi_release,
+                        if selected_entry.is_some() { "HIT" } else { "miss" }
+                    );
+                }
+                // Bind the entry name by pattern rather than testing a
+                // separate `found` bool and then `expect()`ing the same
+                // Option: the two can only ever agree, but the file denies
+                // `clippy::expect_used` outside tests, so the pair broke
+                // `cargo clippy` for this crate and every crate that
+                // depends on it. `None` means no entry matched, which is
+                // exactly "push no URL" — the arm the bool already took.
+                if let Some(suffix) = selected_entry {
+                    let abs = self
+                        .canonicalize_root(path)
+                        .unwrap_or_else(|_| path.clone());
+                    let p = abs.to_string_lossy().replace('\\', "/");
+                    // Strip UNC prefix \\?\ that canonicalize produces on Windows.
+                    let p = p.strip_prefix("//?/").unwrap_or(&p);
+                    let p = p.trim_start_matches('/');
+                    urls.push(format!("jar:file:/{}!/{suffix}", encode_path_for_url(&p)));
+                }
+            }
+            ClassPathEntry::NestedDirectory {
+                parent_jar,
+                prefix,
+                entries_cache,
+            } => {
+                if !archive_safe {
+                    return urls;
+                }
+                if simple_resource_glob(name).is_some() {
+                    let p = Self::nested_jar_url_path(parent_jar);
+                    for candidate in
+                        Self::matching_resource_entry_names(entries_cache.keys(), name)
+                    {
+                        urls.push(format!("jar:file:{p}!/{prefix}{candidate}"));
+                    }
+                    return urls;
+                }
+                if entries_cache.contains_key(name) {
+                    let p = Self::nested_jar_url_path(parent_jar);
+                    urls.push(format!("jar:file:{p}!/{prefix}{name}"));
+                }
+            }
+            ClassPathEntry::NestedJar {
+                parent_jar,
+                archive,
+                nested_path,
+                entry_index,
+                ..
+            } => {
+                if !archive_safe {
+                    return urls;
+                }
+                if simple_resource_glob(name).is_some() {
+                    let p = Self::nested_jar_url_path(parent_jar);
+                    for candidate in
+                        Self::matching_resource_entry_names(entry_index.iter(), name)
+                    {
+                        urls.push(format!("jar:nested:{p}/!{nested_path}!/{candidate}"));
+                    }
+                    return urls;
+                }
+                if Self::find_in_indexed_archive(archive, entry_index, name).is_some() {
+                    let p = Self::nested_jar_url_path(parent_jar);
+                    urls.push(format!("jar:nested:{p}/!{nested_path}!/{name}"));
+                }
+            }
+            ClassPathEntry::JmodFile {
+                path,
+                class_entry_index,
+                archive,
+                ..
+            } => {
+                if !archive_safe {
+                    return urls;
+                }
+                if simple_resource_glob(name).is_some() {
+                    let p = path.to_string_lossy().replace('\\', "/");
+                    let p = p.trim_start_matches('/');
+                    for candidate in
+                        Self::matching_resource_entry_names(class_entry_index.iter(), name)
+                    {
+                        urls.push(format!(
+                            "jar:file:/{}!/{candidate}",
+                            encode_path_for_url(&p)
+                        ));
+                    }
+                    return urls;
+                }
+                let found = class_entry_index.contains(name) || {
+                    let jmod_name = format!("{JMOD_CLASSES_PREFIX}{name}");
+                    // URL emission only — never the bytes. Inflating the
+                    // entry here just to discard it made every
+                    // `getResource` hit on a JMOD pay a full deflate.
+                    Self::archive_has_entry(archive, &jmod_name)
+                };
+                if found {
+                    let p = path.to_string_lossy().replace('\\', "/");
+                    let p = p.trim_start_matches('/');
+                    urls.push(format!("jar:file:/{}!/{name}", encode_path_for_url(&p)));
+                }
+            }
+            ClassPathEntry::JImageFile {
+                reader,
+                resource_to_modules,
+                class_to_module,
+                ..
+            } => {
+                if !archive_safe {
+                    return urls;
+                }
+                let attempts: Vec<String> =
+                    if let Some(class_name) = name.strip_suffix(".class") {
+                        if let Some(module) = class_to_module.get(class_name) {
+                            vec![format!("/{module}/{class_name}.class")]
+                        } else {
+                            Vec::new()
+                        }
+                    } else {
+                        match resource_to_modules.get(name) {
+                            Some(modules) => {
+                                modules.iter().map(|m| format!("/{m}/{name}")).collect()
+                            }
+                            None => Vec::new(),
+                        }
+                    };
+                if simple_resource_glob(name).is_some() {
+                    for candidate in
+                        Self::matching_resource_entry_names(resource_to_modules.keys(), name)
+                    {
+                        if let Some(modules) = resource_to_modules.get(&candidate) {
+                            for module in modules {
+                                let attempt = format!("/{module}/{candidate}");
+                                if matches!(reader.find_resource(&attempt), Ok(Some(_))) {
+                                    urls.push(format!("jrt:{attempt}"));
+                                }
+                            }
+                        }
+                    }
+                    return urls;
+                }
+                for attempt in attempts {
+                    if matches!(reader.find_resource(&attempt), Ok(Some(_))) {
+                        // JEP 220 jrt URL scheme: `jrt:/<module>/<resource>`.
+                        // The TOC entry path is already `/<module>/<resource>`,
+                        // so emit it verbatim with the `jrt:` scheme prefix.
+                        // HotSpot's BuiltinClassLoader.findMiscResource builds
+                        // the same URL via JNUFileSystemProvider.
+                        urls.push(format!("jrt:{attempt}"));
+                    }
+                }
+            }
+        }
+        urls
+    }
+
+    /// `true` when a resource name can be served one entry at a time.
+    ///
+    /// A glob name (`simple_resource_glob`) can match SEVERAL names inside a
+    /// single entry, so "the first URL this entry serves" would silently drop
+    /// the rest. Every other name yields at most one URL per entry, which is
+    /// what makes the incremental walk equivalent to the whole-list one.
+    pub fn name_supports_incremental_scan(resource_name: &str) -> bool {
+        simple_resource_glob(resource_name.trim_start_matches('/')).is_none()
+    }
+
+    /// The next URL at or after entry `from`, and the entry index to resume at.
+    ///
+    /// The whole-list [`Self::find_all_resource_urls`] is the wrong shape for a
+    /// caller that stops early, and `ClassLoader.resources(name).anyMatch(..)`
+    /// — SmallRye Config's `isInClassloader`, and every `findFirst` over
+    /// `resources()` — stops at the first match by construction. The JDK's own
+    /// enumeration is lazy per element, which is why HotSpot answers such a
+    /// call in 0.03 ms against 1.20 ms here for a 4230-entry classpath: it
+    /// touches one entry, we touched all of them.
+    ///
+    /// Callers must gate on [`Self::name_supports_incremental_scan`].
+    pub fn next_resource_url_from(
+        &self,
+        resource_name: &str,
+        from: usize,
+    ) -> Option<(String, usize)> {
+        let name = resource_name.trim_start_matches('/');
+        let archive_safe = is_safe_resource_name(name);
+        let directory_safe = is_directory_resolvable_resource_name(name);
+        if !archive_safe && !directory_safe {
+            return None;
+        }
+        let dbg = dbg_getresources();
+        for (index, entry) in self.entries.iter().enumerate().skip(from) {
+            let urls =
+                self.resource_urls_for_entry(entry, name, archive_safe, directory_safe, dbg);
+            if let Some(url) = urls.into_iter().next() {
+                return Some((url, index + 1));
+            }
+        }
+        None
+    }
+
     pub fn find_all_resource_urls(&self, resource_name: &str) -> Vec<String> {
         diag_resource_call_wrapper("find_all_resource_urls", || {
             self.find_all_resource_urls_impl(resource_name)
@@ -4042,346 +4444,7 @@ impl ClassPath {
         }
         let mut urls = Vec::new();
         for entry in &self.entries {
-            match entry {
-                ClassPathEntry::Directory(dir) => {
-                    if !directory_safe {
-                        continue;
-                    }
-                    if simple_resource_glob(name).is_some() {
-                        for full_path in Self::matching_directory_resource_paths(dir, name) {
-                            if let Some(canon_path) =
-                                self.checked_directory_resource_canonical(dir, &full_path, name)
-                            {
-                                urls.push(Self::directory_resource_url_from_canonical(&canon_path));
-                            }
-                        }
-                        continue;
-                    }
-                    // `getResources("")` names the classpath root ITSELF, and
-                    // the generic path below answers it the expensive way:
-                    // `dir.join("")` is `dir` with a trailing separator, so it
-                    // costs an `exists()` statx, a `canonicalize` of `dir`, a
-                    // SECOND `canonicalize` of the trailing-slash spelling
-                    // (a distinct cache key), and an `is_dir()` statx — per
-                    // directory entry, per call.
-                    //
-                    // That is not a hypothetical shape. SmallRye Config's
-                    // `AbstractLocationConfigSourceLoader.isInClassloader` is
-                    // exactly `classLoader.resources(uri.getPath()).anyMatch(..)`
-                    // with an empty path, and Quarkus's config bootstrap runs
-                    // it once per discovered config source per profile — 1388
-                    // times over a 4230-entry classpath for ONE test class,
-                    // which is where 4.43M `statx` calls came from against
-                    // HotSpot's 11.9K for the same run.
-                    //
-                    // A `Directory` entry is a directory that is on the
-                    // classpath; both facts were established when it was
-                    // admitted. Re-deriving them from the filesystem on every
-                    // probe buys nothing, so answer from the memoized root.
-                    if name.is_empty() {
-                        if let Ok(canon_dir) = self.canonicalize_root(dir) {
-                            let p = canon_dir.to_string_lossy().replace('\\', "/");
-                            let p = p.strip_prefix("//?/").unwrap_or(&p);
-                            let p = p.trim_start_matches('/').trim_end_matches('/');
-                            urls.push(format!("file:/{}/", encode_path_for_url(p)));
-                        }
-                        continue;
-                    }
-                    let full_path = dir.join(Path::new(name));
-                    if full_path.exists() {
-                        // C35 audit fix (HIGH security): fail-CLOSED on
-                        // canonicalize error. Previously the
-                        // `if let (Ok, Ok)` silently fell through to the
-                        // `urls.push(file:/...)` emission below — an
-                        // attacker who could plant a symlink causing
-                        // canonicalize to fail could leak the existence
-                        // of arbitrary files via `getResources()`
-                        // enumeration (even though the matching
-                        // `find_class` path correctly rejected the same
-                        // symlink).
-                        let canon_dir = match self.canonicalize_root(dir) {
-                            Ok(p) => p,
-                            Err(_) => continue,
-                        };
-                        let canon_path = match self.canonicalize_cached(&full_path) {
-                            Ok(p) => p,
-                            Err(_) => continue,
-                        };
-                        if !canon_path.starts_with(&canon_dir) {
-                            continue;
-                        }
-                        // `canon_path` is the already-canonicalized
-                        // resolved path; reuse it directly instead of
-                        // re-canonicalizing (and avoid the
-                        // `unwrap_or(full_path)` fallback that, prior to
-                        // this fix, would have emitted the
-                        // un-canonicalized path on canonicalize error).
-                        let p = canon_path.to_string_lossy().replace('\\', "/");
-                        let p = p.strip_prefix("//?/").unwrap_or(&p);
-                        let p = p.trim_start_matches('/');
-                        // A directory resource (e.g. a package path queried via
-                        // `ClassLoader.getResources("com/example/pkg/")`) must
-                        // keep its trailing slash — real `URLClassLoader`
-                        // preserves it, and Spring's
-                        // `PathMatchingResourcePatternResolver` relies on it:
-                        // its `rootDirCache` collapses sibling directory scans
-                        // onto a shared parent `Resource` and reconstructs
-                        // child paths via `createRelative`/
-                        // `StringUtils.applyRelativePath`, which treats a
-                        // no-trailing-slash URL as a FILE path and strips the
-                        // last segment when appending a relative child —
-                        // silently resolving to a sibling directory instead of
-                        // a subdirectory. That broke any SECOND differently-
-                        // pathed scan against the same resolver instance, e.g.
-                        // a `@ComponentScan`-discovered `@Configuration` class
-                        // whose OWN `@ComponentScan` scans a sibling package
-                        // (ComponentScanAnnotationRecursionTests, 2+ levels of
-                        // recursive `@ComponentScan`). Matches the established
-                        // unconditional-slash pattern in
-                        // `find_class_code_source_info` above, but here it
-                        // must be conditional since this function also serves
-                        // plain (non-directory) resource lookups.
-                        if canon_path.is_dir() && !p.ends_with('/') {
-                            urls.push(format!("file:/{}/", encode_path_for_url(&p)));
-                        } else {
-                            urls.push(format!("file:/{}", encode_path_for_url(&p)));
-                        }
-                    }
-                }
-                ClassPathEntry::JarFile {
-                    archive,
-                    multi_release,
-                    versions_cache,
-                    entry_index,
-                    path,
-                    ..
-                } => {
-                    if !archive_safe {
-                        if dbg {
-                            eprintln!(
-                                "[GRES-DBG]   jar {} mr={} -> skipped unsafe name",
-                                path.display(),
-                                multi_release
-                            );
-                        }
-                        continue;
-                    }
-                    if simple_resource_glob(name).is_some() {
-                        let candidates = Self::matching_resource_entry_names(
-                            entry_index
-                                .iter()
-                                .filter(|entry| !entry.starts_with("META-INF/versions/")),
-                            name,
-                        );
-                        if dbg {
-                            eprintln!(
-                                "[GRES-DBG]   jar {} mr={} -> {}",
-                                path.display(),
-                                multi_release,
-                                if candidates.is_empty() { "miss" } else { "HIT" }
-                            );
-                        }
-                        if !candidates.is_empty() {
-                            let abs = self
-                                .canonicalize_root(path)
-                                .unwrap_or_else(|_| path.clone());
-                            let p = abs.to_string_lossy().replace('\\', "/");
-                            let p = p.strip_prefix("//?/").unwrap_or(&p);
-                            let p = p.trim_start_matches('/');
-                            for candidate in candidates {
-                                urls.push(format!(
-                                    "jar:file:/{}!/{candidate}",
-                                    encode_path_for_url(&p)
-                                ));
-                            }
-                        }
-                        continue;
-                    }
-                    let direct_entry = if *multi_release {
-                        Self::multi_release_entry_name(archive, versions_cache, entry_index, name)
-                    } else {
-                        entry_index.contains(name).then(|| name.to_string())
-                    };
-                    // HotSpot's URLClassLoader matches a request for `cnf` against
-                    // a `cnf/` directory entry inside a JAR. Without the slash-
-                    // tolerant retry, `getResource("cnf")` returned null even when
-                    // the JAR clearly contains the directory, breaking DaCapo's
-                    // `extractBenchmarkSet` (which dereferences the URL's
-                    // protocol without a null check).
-                    let slash_entry = if direct_entry.is_none() && !name.ends_with('/') {
-                        let alt = format!("{name}/");
-                        if *multi_release {
-                            Self::multi_release_entry_name(
-                                archive,
-                                versions_cache,
-                                entry_index,
-                                &alt,
-                            )
-                        } else {
-                            entry_index.contains(&alt).then_some(alt)
-                        }
-                    } else {
-                        None
-                    };
-                    let selected_entry = direct_entry.or(slash_entry);
-                    if dbg {
-                        eprintln!(
-                            "[GRES-DBG]   jar {} mr={} -> {}",
-                            path.display(),
-                            multi_release,
-                            if selected_entry.is_some() { "HIT" } else { "miss" }
-                        );
-                    }
-                    // Bind the entry name by pattern rather than testing a
-                    // separate `found` bool and then `expect()`ing the same
-                    // Option: the two can only ever agree, but the file denies
-                    // `clippy::expect_used` outside tests, so the pair broke
-                    // `cargo clippy` for this crate and every crate that
-                    // depends on it. `None` means no entry matched, which is
-                    // exactly "push no URL" — the arm the bool already took.
-                    if let Some(suffix) = selected_entry {
-                        let abs = self
-                            .canonicalize_root(path)
-                            .unwrap_or_else(|_| path.clone());
-                        let p = abs.to_string_lossy().replace('\\', "/");
-                        // Strip UNC prefix \\?\ that canonicalize produces on Windows.
-                        let p = p.strip_prefix("//?/").unwrap_or(&p);
-                        let p = p.trim_start_matches('/');
-                        urls.push(format!("jar:file:/{}!/{suffix}", encode_path_for_url(&p)));
-                    }
-                }
-                ClassPathEntry::NestedDirectory {
-                    parent_jar,
-                    prefix,
-                    entries_cache,
-                } => {
-                    if !archive_safe {
-                        continue;
-                    }
-                    if simple_resource_glob(name).is_some() {
-                        let p = Self::nested_jar_url_path(parent_jar);
-                        for candidate in
-                            Self::matching_resource_entry_names(entries_cache.keys(), name)
-                        {
-                            urls.push(format!("jar:file:{p}!/{prefix}{candidate}"));
-                        }
-                        continue;
-                    }
-                    if entries_cache.contains_key(name) {
-                        let p = Self::nested_jar_url_path(parent_jar);
-                        urls.push(format!("jar:file:{p}!/{prefix}{name}"));
-                    }
-                }
-                ClassPathEntry::NestedJar {
-                    parent_jar,
-                    archive,
-                    nested_path,
-                    entry_index,
-                    ..
-                } => {
-                    if !archive_safe {
-                        continue;
-                    }
-                    if simple_resource_glob(name).is_some() {
-                        let p = Self::nested_jar_url_path(parent_jar);
-                        for candidate in
-                            Self::matching_resource_entry_names(entry_index.iter(), name)
-                        {
-                            urls.push(format!("jar:nested:{p}/!{nested_path}!/{candidate}"));
-                        }
-                        continue;
-                    }
-                    if Self::find_in_indexed_archive(archive, entry_index, name).is_some() {
-                        let p = Self::nested_jar_url_path(parent_jar);
-                        urls.push(format!("jar:nested:{p}/!{nested_path}!/{name}"));
-                    }
-                }
-                ClassPathEntry::JmodFile {
-                    path,
-                    class_entry_index,
-                    archive,
-                    ..
-                } => {
-                    if !archive_safe {
-                        continue;
-                    }
-                    if simple_resource_glob(name).is_some() {
-                        let p = path.to_string_lossy().replace('\\', "/");
-                        let p = p.trim_start_matches('/');
-                        for candidate in
-                            Self::matching_resource_entry_names(class_entry_index.iter(), name)
-                        {
-                            urls.push(format!(
-                                "jar:file:/{}!/{candidate}",
-                                encode_path_for_url(&p)
-                            ));
-                        }
-                        continue;
-                    }
-                    let found = class_entry_index.contains(name) || {
-                        let jmod_name = format!("{JMOD_CLASSES_PREFIX}{name}");
-                        // URL emission only — never the bytes. Inflating the
-                        // entry here just to discard it made every
-                        // `getResource` hit on a JMOD pay a full deflate.
-                        Self::archive_has_entry(archive, &jmod_name)
-                    };
-                    if found {
-                        let p = path.to_string_lossy().replace('\\', "/");
-                        let p = p.trim_start_matches('/');
-                        urls.push(format!("jar:file:/{}!/{name}", encode_path_for_url(&p)));
-                    }
-                }
-                ClassPathEntry::JImageFile {
-                    reader,
-                    resource_to_modules,
-                    class_to_module,
-                    ..
-                } => {
-                    if !archive_safe {
-                        continue;
-                    }
-                    let attempts: Vec<String> =
-                        if let Some(class_name) = name.strip_suffix(".class") {
-                            if let Some(module) = class_to_module.get(class_name) {
-                                vec![format!("/{module}/{class_name}.class")]
-                            } else {
-                                Vec::new()
-                            }
-                        } else {
-                            match resource_to_modules.get(name) {
-                                Some(modules) => {
-                                    modules.iter().map(|m| format!("/{m}/{name}")).collect()
-                                }
-                                None => Vec::new(),
-                            }
-                        };
-                    if simple_resource_glob(name).is_some() {
-                        for candidate in
-                            Self::matching_resource_entry_names(resource_to_modules.keys(), name)
-                        {
-                            if let Some(modules) = resource_to_modules.get(&candidate) {
-                                for module in modules {
-                                    let attempt = format!("/{module}/{candidate}");
-                                    if matches!(reader.find_resource(&attempt), Ok(Some(_))) {
-                                        urls.push(format!("jrt:{attempt}"));
-                                    }
-                                }
-                            }
-                        }
-                        continue;
-                    }
-                    for attempt in attempts {
-                        if matches!(reader.find_resource(&attempt), Ok(Some(_))) {
-                            // JEP 220 jrt URL scheme: `jrt:/<module>/<resource>`.
-                            // The TOC entry path is already `/<module>/<resource>`,
-                            // so emit it verbatim with the `jrt:` scheme prefix.
-                            // HotSpot's BuiltinClassLoader.findMiscResource builds
-                            // the same URL via JNUFileSystemProvider.
-                            urls.push(format!("jrt:{attempt}"));
-                        }
-                    }
-                }
-            }
+            urls.extend(self.resource_urls_for_entry(entry, name, archive_safe, directory_safe, dbg));
         }
         if dbg {
             eprintln!(

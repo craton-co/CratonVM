@@ -2680,7 +2680,7 @@ fn dump_throwable_to_stderr(ctx: &mut dyn NativeContext, throwable: ObjectRef, i
             .class_name_of_id(ctx.class_id_of_object(t))
             .unwrap_or_else(|| "java/lang/Throwable".to_string())
             .replace('/', ".");
-        let detail = match ctx.get_field_by_name(t, "detailMessage") {
+        let detail = match crate::lang_misc::throwable_field_get(ctx, t, "detailMessage") {
             Value::Object(Some(s)) => ctx.read_string(s),
             _ => None,
         };
@@ -2716,7 +2716,7 @@ fn dump_throwable_to_stderr(ctx: &mut dyn NativeContext, throwable: ObjectRef, i
 
         // Walk to the cause (named `cause`; `this` is the JDK
         // "uninitialized" sentinel and means no cause).
-        let next = match ctx.get_field_by_name(t, "cause") {
+        let next = match crate::lang_misc::throwable_field_get(ctx, t, "cause") {
             Value::Object(Some(c)) if c != t => Some(c),
             _ => None,
         };
@@ -4118,7 +4118,7 @@ fn native_jul_logger_logp(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
             ctx.class_name_of_id(cid)
                 .unwrap_or_else(|| "Throwable".to_string())
         };
-        let detail = match ctx.get_field_by_name(t, "detailMessage") {
+        let detail = match crate::lang_misc::throwable_field_get(ctx, t, "detailMessage") {
             Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
             _ => String::new(),
         };
@@ -4957,7 +4957,7 @@ fn jul_render_throwable(ctx: &mut dyn NativeContext, t: ObjectRef) -> String {
             .unwrap_or_else(|| "java/lang/Throwable".to_string())
             .replace('/', ".")
     };
-    let detail = match ctx.get_field_by_name(t, "detailMessage") {
+    let detail = match crate::lang_misc::throwable_field_get(ctx, t, "detailMessage") {
         Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
         _ => String::new(),
     };
