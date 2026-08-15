@@ -169,21 +169,48 @@ rather than an assumption**, and it cost one worktree and two minutes.
 >   carrying `": remove"`, which is `Iterator.remove()`'s throwing DEFAULT's
 >   message, from a different class.
 >
->   What remains is the identity half, now specified rather than gestured at:
->   `listIterator()` answers `cratonvm.internal.LinkedListSnapshotListItr` and
->   `iterator()` answers `java.util.LinkedList$Itr` — **a class the real JDK
->   does not have** (`javap -p java.util.LinkedList$Itr` → *class not found*;
->   `AbstractSequentialList.iterator()` IS `listIterator()`, so HotSpot answers
->   `LinkedList$ListItr` for both) — plus a missing `ConcurrentModificationException`.
->   The recipe is this page's own: the real class as carrier, state in the
->   undeclared slots past `class_num_total_fields`, an `sli_base_checked`-shaped
->   ownership test so a java.base-built iterator delegates to its own bytecode,
->   and `iterator()` routed to `listIterator()`. It was left alone because that
->   carrier is load-bearing for Kafka `ConfigDef` and Spring
->   `processDeferredImportSelectors` paths this session had no fixture for, and
->   because routing `iterator()` through the snapshot iterator changes
->   `Iterator.remove()`'s mechanism — a behavioural change that wants those
->   fixtures, not a class-name change that does not.
+>   **The identity half closed on 2026-08-15 too**
+>   (`fix/linkedlist-listitr-carrier-20260815`), and it turned out to be worth
+>   the carrier after all. `LinkedList` now wears its own
+>   `java.util.LinkedList$ListItr` — state in the undeclared slots past
+>   `class_num_total_fields`, `lli_base_checked` as the receiver-ownership test,
+>   `lli_delegate_foreign` running java.base's own bytecode for an iterator this
+>   VM did not mint — and `iterator()` returns it too, because
+>   `AbstractSequentialList.iterator()` IS `listIterator()`. The fabricated
+>   `java/util/LinkedList$Itr` and the snapshot carrier both survive only as the
+>   fallback for an image with no real `LinkedList$ListItr` to resolve, exactly
+>   as `alloc_sli_view` does one collection up.
+>
+>   Making it LIVE over the node chain rather than a snapshot is what paid for
+>   itself. The snapshot could not raise `ConcurrentModificationException` (it
+>   had nothing to compare) and its `remove()` had to re-take the whole snapshot
+>   to stay consistent — O(n) per removal, so an `Iterator.remove` drain over a
+>   `LinkedList` was quadratic on the one collection whose entire point is O(1)
+>   removal. The node cursor is the JDK's own `ListItr` state and every mutator
+>   is O(1).
+>
+>   `probes/LinkedListLoadBearingProbe` (60 rows) is the evidence and was
+>   written FIRST, for the reason this page's own residual note gave for not
+>   touching the carrier: it covers the three application failures the source
+>   comments name as having shaped the old design — kafka `ConfigDef`
+>   `assertEquals(ArrayList, LinkedList)`, Spring
+>   `processDeferredImportSelectors`' `List.sort`, Mockito's
+>   `new LinkedList<>(collection)` — plus the drain loops, the `AbstractList`
+>   defaults, serialization and the identity rows. **26 diverging lines
+>   (`--real-jdk`) and 30 (`--jdk-only`) on pristine `dev`, 0 and 0 after.**
+>   `ListItrInterfaceProbe`, this page's original residual, goes 6 lines to 0 on
+>   both arms and its checked-in transcript now carries a CratonVM arm for the
+>   first time.
+>
+>   Two `NoSuchElementException`s were carrying a message HotSpot's do not —
+>   the third time that trap has been paid in this file, so it is now the named
+>   helper `bare_no_such_element` beside `sli_illegal_state`.
+>
+>   Regression net, all measured against a binary built from pristine
+>   `origin/dev` in a separate worktree: 13 collection probes, both arms, 0
+>   diverging on every one and no probe worse; a 15-class collections-heavy
+>   netty slice byte-identical in counts and exit codes (including the
+>   pre-existing `DefaultChannelPipelineTest` timeout).
 
 `cargo test -p cratonvm-native-collections --all-targets`: green.
 
