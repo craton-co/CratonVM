@@ -5147,15 +5147,15 @@ impl ZgcRealHeap {
     /// in-bounds slot count, or `None` (caller treats as no-op / null) when
     /// the header is suspect or the index is out of range. Mirrors the guards
     /// in `g1::get_field` / `gen_heap`.
-    fn check_field_index(&self, header: &ObjectHeader, index: usize) -> Option<usize> {
+    fn check_field_index(&self, header: &ObjectHeader, index: usize, op: &'static str) -> Option<usize> {
         let num_slots = header.num_slots() as usize;
         if num_slots > (1 << 24) {
-            tracing::debug!(target: "zgc", index, num_slots, "zgc real: suspect header");
+            tracing::debug!(target: "zgc", index, num_slots, op, "zgc real: suspect header");
             return None;
         }
         if index >= num_slots {
-            tracing::warn!(target: "zgc", index, num_slots, "zgc real: field index OOB");
-            self.report_corpse_read(header, index);
+            tracing::warn!(target: "zgc", index, num_slots, op, "zgc real: field index OOB");
+            self.report_corpse_read(header, index, op);
             return None;
         }
         Some(num_slots)
@@ -5193,7 +5193,7 @@ impl ZgcRealHeap {
     /// would bury the first one -- which is the only one whose heap state is
     /// still close to the fault.
     #[cold]
-    fn report_corpse_read(&self, header: &ObjectHeader, index: usize) {
+    fn report_corpse_read(&self, header: &ObjectHeader, index: usize, op: &'static str) {
         if !zgc_corpse_enabled() {
             return;
         }
@@ -5233,6 +5233,14 @@ impl ZgcRealHeap {
                     vacated_in_cycle = cycle,
                     cycles_ago,
                     index,
+                    // READ or WRITE decides who is holding it. A WRITE at
+                    // index 0 of a `Reference` is somebody clearing a
+                    // referent -- the collector or the reference processor. A
+                    // READ is Java code, or the VM reading `referent` on
+                    // behalf of `Reference.get`. The two want entirely
+                    // different searches, and the zeroed header cannot tell
+                    // them apart.
+                    op,
                     %backtrace,
                     "zgc corpse read: this address was vacated by the LAST slide --                      something still holds the pre-move address"
                 );
@@ -5249,6 +5257,7 @@ impl ZgcRealHeap {
                     root_source = crate::gc_quiescence::root_source_of(addr)
                         .unwrap_or("<none: not handed to the marker as a root>"),
                     slides_so_far = self.corpse_cycle.load(Ordering::Relaxed),
+                    op,
                     in_registry = self.registry.contains(addr),
                     %backtrace,
                     "zgc corpse read: OOB read at an address the LAST slide did not                      vacate -- older cycle, or never a relocation source"
@@ -7669,7 +7678,7 @@ impl GarbageCollector for ZgcRealHeap {
 
     fn get_field(&self, obj: ObjectRef, index: usize) -> Value {
         let header = self.header(obj);
-        if self.check_field_index(header, index).is_none() {
+        if self.check_field_index(header, index, "get").is_none() {
             return Value::Object(None);
         }
         if let Some((offset, storage)) =
@@ -7752,7 +7761,7 @@ impl GarbageCollector for ZgcRealHeap {
 
     fn set_field(&self, obj: ObjectRef, index: usize, value: Value) {
         let header = self.header(obj);
-        if self.check_field_index(header, index).is_none() {
+        if self.check_field_index(header, index, "set").is_none() {
             return;
         }
         if let Some((offset, storage)) =
