@@ -2943,6 +2943,75 @@ pub(crate) fn find_service_provider(type_str: &str, algo: &str) -> Option<String
         .map(|(name, _, _)| name)
 }
 
+/// The JDK providers this VM services from Rust rather than from the class
+/// named in their service table.
+///
+/// The seeded entries for these carry the REAL JDK's implementation class
+/// names, which are the names the native engines stand in for — instantiating
+/// them instead would bypass every native implementation in this crate. Only
+/// providers OUTSIDE this set are application code that must actually be run.
+const NATIVELY_SERVICED_PROVIDERS: &[&str] = &[
+    "SUN",
+    "SunRsaSign",
+    "SunEC",
+    "SunJSSE",
+    "SunJCE",
+    "SunJGSS",
+    "SunSASL",
+    "XMLDSig",
+    "SunPCSC",
+    "JdkLDAP",
+    "JdkSASL",
+    "SunMSCAPI",
+    "SunPKCS11",
+];
+
+/// The implementation class a THIRD-PARTY provider registered for
+/// `(type_str, algo)`, or `None` when no such provider offers it.
+///
+/// `Security.addProvider(myProvider)` + `put("Signature.SHA256withRSA",
+/// MySpi.class.getName())` is the documented way to supply an implementation
+/// the platform does not have — a smartcard, an HSM, a delegating key. This VM
+/// recorded those registrations (they show up in `getServices()` and in
+/// `getInstance`'s "is it offered" gate) but never instantiated the class, so
+/// every such `Signature` was silently serviced by the built-in native engine
+/// instead. For a key only the application's provider can use — precisely the
+/// case a third-party provider exists for — that engine cannot work, and
+/// netty's `JdkDelegatingPrivateKeyMethod` (`MockAlternativeKeyProvider` in
+/// `JdkDelegatingPrivateKeyMethodTest`) is exactly that shape.
+///
+/// `provider` `None` = "no provider requested", which searches the chain in
+/// order, the same order `Signature.getInstance(String)` walks.
+pub(crate) fn third_party_service_class(
+    provider: Option<&str>,
+    type_str: &str,
+    algo: &str,
+) -> Option<String> {
+    let is_third_party = |name: &str| {
+        !NATIVELY_SERVICED_PROVIDERS
+            .iter()
+            .any(|b| b.eq_ignore_ascii_case(name))
+    };
+    let name = match provider {
+        Some(p) => {
+            if !is_third_party(p) {
+                return None;
+            }
+            p.to_string()
+        }
+        None => snapshot()
+            .into_iter()
+            .find(|(name, _, _)| get_service_entry(name, type_str, algo).is_some())
+            .map(|(name, _, _)| name)
+            .filter(|name| is_third_party(name))?,
+    };
+    let entry = get_service_entry(&name, type_str, algo)?;
+    if entry.class_name.trim().is_empty() {
+        return None;
+    }
+    Some(entry.class_name.replace('.', "/"))
+}
+
 /// Every `SSLContext` protocol name SunJSSE registers on JDK 25, ASCII-
 /// uppercased.
 ///

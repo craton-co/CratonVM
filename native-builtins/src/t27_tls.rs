@@ -354,6 +354,196 @@ fn ctx_obj_key(ctx: &mut dyn NativeContext, obj: ObjectRef) -> Result<u64, Metho
     Ok(crate::gc_stable_lock_key(ctx, obj)? as u64)
 }
 
+/// The TLS session stores belonging to an `SSLContext`, keyed the same way as
+/// its TrustManagers.
+///
+/// **This is what makes resumption possible at all.** A rustls `ClientConfig`
+/// owns the client-side session store and a `ServerConfig` owns the
+/// server-side one, and `engine_begin` builds a FRESH config for every engine
+/// (it has to — ciphers, protocols, ALPN and client-auth mode are per-engine
+/// settings). Every ticket was therefore thrown away with the engine that
+/// received it, and two engines of one `SSLContext` could never resume.
+/// `HUC_DEFAULT_CLIENT_CONFIG` caches a whole config for the same reason on
+/// the `HttpsURLConnection` path, where there are no per-engine settings to
+/// lose.
+///
+/// Only the STORES are shared, never the configs: a shared config would make
+/// one engine's `setEnabledCipherSuites` silently govern the next engine's
+/// handshake.
+///
+/// Plain `Arc`s, no heap `ObjectRef`s — nothing for the GC to scan.
+#[allow(clippy::type_complexity)]
+fn ctx_client_session_store_table(
+) -> &'static Mutex<HashMap<u64, Arc<dyn rustls::client::ClientSessionStore>>> {
+    static T: OnceLock<Mutex<HashMap<u64, Arc<dyn rustls::client::ClientSessionStore>>>> =
+        OnceLock::new();
+    T.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Built `ClientConfig`s, keyed by `(SSLContext key, engine shape)`.
+///
+/// **Why the whole config and not just the session store.** rustls refuses to
+/// resume a TLS 1.3 session unless the `ServerCertVerifier` AND the
+/// `ResolvesClientCert` are the *same `Arc`* as when the session was stored
+/// (`persist::Tls13ClientSessionValue::compatible_config`, pointer identity —
+/// a deliberate rule: resuming across a different verifier would silently
+/// inherit a trust decision the new verifier never made). `engine_begin`
+/// builds a fresh config, and therefore a fresh verifier, per engine, so the
+/// ticket was always discarded and every handshake was `Full` — the client
+/// took the ticket out of the store and then never offered it.
+///
+/// The key is the whole engine shape because those settings genuinely change
+/// the config: sharing across different cipher/protocol restrictions would let
+/// one engine's `setEnabledCipherSuites` govern the next engine's handshake.
+///
+/// Plain `Arc`s, no heap `ObjectRef`s — nothing for the GC to scan.
+#[allow(clippy::type_complexity)]
+fn ctx_client_config_table() -> &'static Mutex<HashMap<(u64, String), Arc<ClientConfig>>> {
+    static T: OnceLock<Mutex<HashMap<(u64, String), Arc<ClientConfig>>>> = OnceLock::new();
+    T.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn ctx_client_session_store(key: u64) -> Arc<dyn rustls::client::ClientSessionStore> {
+    ctx_client_session_store_table()
+        .lock()
+        .entry(key)
+        .or_insert_with(|| {
+            let inner: Arc<dyn rustls::client::ClientSessionStore> =
+                Arc::new(rustls::client::ClientSessionMemoryCache::new(256));
+            if crate::nbflags().dbg_tls_auth_ok {
+                Arc::new(TracingClientSessionStore { inner })
+            } else {
+                inner
+            }
+        })
+        .clone()
+}
+
+/// `CRATONVM_DBG_TLS_AUTH=1` only: says whether a ticket was stored and
+/// whether the next connection took one, which is the difference between "the
+/// server never issued one" and "the client never offered it".
+#[derive(Debug)]
+struct TracingClientSessionStore {
+    inner: Arc<dyn rustls::client::ClientSessionStore>,
+}
+
+impl rustls::client::ClientSessionStore for TracingClientSessionStore {
+    fn set_kx_hint(&self, server_name: rustls::pki_types::ServerName<'static>, group: rustls::NamedGroup) {
+        self.inner.set_kx_hint(server_name, group)
+    }
+    fn kx_hint(&self, server_name: &rustls::pki_types::ServerName<'_>) -> Option<rustls::NamedGroup> {
+        self.inner.kx_hint(server_name)
+    }
+    fn set_tls12_session(
+        &self,
+        server_name: rustls::pki_types::ServerName<'static>,
+        value: rustls::client::Tls12ClientSessionValue,
+    ) {
+        eprintln!("[dbg-tls-auth] client store: set_tls12_session {server_name:?}");
+        self.inner.set_tls12_session(server_name, value)
+    }
+    fn tls12_session(
+        &self,
+        server_name: &rustls::pki_types::ServerName<'_>,
+    ) -> Option<rustls::client::Tls12ClientSessionValue> {
+        let v = self.inner.tls12_session(server_name);
+        eprintln!(
+            "[dbg-tls-auth] client store: tls12_session {server_name:?} -> {}",
+            v.is_some()
+        );
+        v
+    }
+    fn remove_tls12_session(&self, server_name: &rustls::pki_types::ServerName<'static>) {
+        self.inner.remove_tls12_session(server_name)
+    }
+    fn insert_tls13_ticket(
+        &self,
+        server_name: rustls::pki_types::ServerName<'static>,
+        value: rustls::client::Tls13ClientSessionValue,
+    ) {
+        eprintln!("[dbg-tls-auth] client store: insert_tls13_ticket {server_name:?}");
+        self.inner.insert_tls13_ticket(server_name, value)
+    }
+    fn take_tls13_ticket(
+        &self,
+        server_name: &rustls::pki_types::ServerName<'static>,
+    ) -> Option<rustls::client::Tls13ClientSessionValue> {
+        let v = self.inner.take_tls13_ticket(server_name);
+        eprintln!(
+            "[dbg-tls-auth] client store: take_tls13_ticket {server_name:?} -> {}",
+            v.is_some()
+        );
+        v
+    }
+}
+
+#[allow(clippy::type_complexity)]
+fn ctx_server_session_store_table(
+) -> &'static Mutex<HashMap<u64, Arc<dyn rustls::server::StoresServerSessions + Send + Sync>>> {
+    static T: OnceLock<
+        Mutex<HashMap<u64, Arc<dyn rustls::server::StoresServerSessions + Send + Sync>>>,
+    > = OnceLock::new();
+    T.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn ctx_server_session_store(
+    key: u64,
+) -> Arc<dyn rustls::server::StoresServerSessions + Send + Sync> {
+    ctx_server_session_store_table()
+        .lock()
+        .entry(key)
+        .or_insert_with(|| {
+            let inner: Arc<dyn rustls::server::StoresServerSessions + Send + Sync> =
+                rustls::server::ServerSessionMemoryCache::new(256);
+            if crate::nbflags().dbg_tls_auth_ok {
+                Arc::new(TracingServerSessionStore { inner })
+            } else {
+                inner
+            }
+        })
+        .clone()
+}
+
+/// `CRATONVM_DBG_TLS_AUTH=1` only — the server half of
+/// [`TracingClientSessionStore`].
+#[derive(Debug)]
+struct TracingServerSessionStore {
+    inner: Arc<dyn rustls::server::StoresServerSessions + Send + Sync>,
+}
+
+impl rustls::server::StoresServerSessions for TracingServerSessionStore {
+    fn put(&self, key: Vec<u8>, value: Vec<u8>) -> bool {
+        let ok = self.inner.put(key.clone(), value);
+        eprintln!(
+            "[dbg-tls-auth] server store: put len={} -> {}",
+            key.len(),
+            ok
+        );
+        ok
+    }
+    fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
+        let v = self.inner.get(key);
+        eprintln!(
+            "[dbg-tls-auth] server store: get len={} -> {}",
+            key.len(),
+            v.is_some()
+        );
+        v
+    }
+    fn take(&self, key: &[u8]) -> Option<Vec<u8>> {
+        let v = self.inner.take(key);
+        eprintln!(
+            "[dbg-tls-auth] server store: take len={} -> {}",
+            key.len(),
+            v.is_some()
+        );
+        v
+    }
+    fn can_cache(&self) -> bool {
+        self.inner.can_cache()
+    }
+}
+
 /// `SSLContext.init(km, tms, random)` calls this with the raw `tms` array
 /// argument (may be `None`/empty) to stash the actual `TrustManager` Java
 /// objects against this context, keyed the same way as the KMF identity /
@@ -427,15 +617,45 @@ pub(crate) fn attach_trust_managers_to_ctx(
     if let Some(&base) = pins.first() {
         ctx.unpin_native_roots(base);
     }
+    // Whether endpoint identification is THIS VM's job for engines of this
+    // context, decided here for the same reason the issuer hints are:
+    // `engine_begin` — which builds the `ClientConfig` that carries the
+    // in-handshake check — runs with no native context, and this question
+    // needs one (it walks the manager's class hierarchy).
+    let identifies = jsse_owns_endpoint_identification(ctx, &list);
     let mut table = ctx_trust_managers_table().lock();
     if list.is_empty() {
         table.remove(&key);
         ctx_accepted_issuers_table().lock().remove(&key);
+        ctx_jsse_identifies_table().lock().remove(&key);
     } else {
         table.insert(key, list);
         ctx_accepted_issuers_table().lock().insert(key, issuers);
+        ctx_jsse_identifies_table().lock().insert(key, identifies);
     }
     Ok(())
+}
+
+/// Does endpoint identification fall to THIS VM for engines created by this
+/// `SSLContext`? See [`jsse_owns_endpoint_identification`] for the rule and
+/// `attach_trust_managers_to_ctx` for why it is answered at attach time.
+///
+/// Absent = `true`: no application manager is installed, so JSSE's own default
+/// (which this VM stands in for) is the one that identifies.
+fn ctx_jsse_identifies_table() -> &'static Mutex<HashMap<u64, bool>> {
+    static T: OnceLock<Mutex<HashMap<u64, bool>>> = OnceLock::new();
+    T.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn ctx_jsse_identifies(ctx_key: Option<u64>) -> bool {
+    let Some(key) = ctx_key else {
+        return true;
+    };
+    ctx_jsse_identifies_table()
+        .lock()
+        .get(&key)
+        .copied()
+        .unwrap_or(true)
 }
 
 /// DER-encoded subject DNs of every `TrustManager`'s accepted issuers, keyed
@@ -863,6 +1083,7 @@ pub(crate) fn build_engine_client_config_with_identity_ciphers(
                 use_java_trust_manager,
                 provider,
                 &versions,
+                None,
             );
         }
     }
@@ -874,6 +1095,7 @@ pub(crate) fn build_engine_client_config_with_identity_ciphers(
         use_java_trust_manager,
         provider,
         &versions,
+        None,
     )
 }
 
@@ -2122,17 +2344,54 @@ struct OcspAwareServerCertVerifier {
 #[derive(Debug)]
 struct PassthroughServerCertVerifier {
     algorithms: rustls::crypto::WebPkiSupportedAlgorithms,
+    /// `(algorithm, host)` when this client engine must perform RFC 2818 /
+    /// RFC 6125 endpoint identification, i.e. the application called
+    /// `SSLParameters.setEndpointIdentificationAlgorithm("HTTPS"|"LDAPS")`.
+    ///
+    /// **Why it is HERE and not only in the post-handshake gate.** The
+    /// TrustManager consultation has to be post-handshake — it is a Java
+    /// upcall, and rustls's verifier is not a place we can run one from. The
+    /// identity check is not: it is a pure comparison of the presented chain
+    /// against the host this side dialled, so it belongs at the point JSSE
+    /// makes it, which is *before the client sends its Finished*.
+    ///
+    /// The difference is visible to the SERVER. netty's
+    /// `testClientHostnameValidationFail` asserts BOTH sides fail: with the
+    /// check deferred, the client's `Finished` had already gone out, the
+    /// server had completed its handshake and netty fired
+    /// `SslHandshakeCompletionEvent.SUCCESS` on it — so the test's server
+    /// handler recorded `IllegalStateException("handshake complete. expected
+    /// failure")` even though the client did reject the certificate.
+    endpoint_identity: Option<(String, String)>,
 }
 
 impl rustls::client::danger::ServerCertVerifier for PassthroughServerCertVerifier {
     fn verify_server_cert(
         &self,
-        _end_entity: &CertificateDer<'_>,
-        _intermediates: &[CertificateDer<'_>],
+        end_entity: &CertificateDer<'_>,
+        intermediates: &[CertificateDer<'_>],
         _server_name: &ServerName<'_>,
         _ocsp_response: &[u8],
         _now: rustls::pki_types::UnixTime,
     ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        if let Some((alg, host)) = self.endpoint_identity.as_ref() {
+            let mut chain: Vec<Vec<u8>> = Vec::with_capacity(1 + intermediates.len());
+            chain.push(end_entity.as_ref().to_vec());
+            chain.extend(intermediates.iter().map(|c| c.as_ref().to_vec()));
+            if let Err(e) = crate::x509_manager::check_endpoint_identity(&chain, host) {
+                let detail = format!("endpoint identification ({alg}) failed for host {host:?}: {e}");
+                if crate::nbflags().dbg_tls_auth_ok {
+                    eprintln!("[dbg-tls-auth] (in-handshake) {detail}");
+                }
+                set_last_trust_rejection_detail(&detail);
+                return Err(rustls::Error::InvalidCertificate(
+                    rustls::CertificateError::NotValidForNameContext {
+                        expected: _server_name.to_owned(),
+                        presented: Vec::new(),
+                    },
+                ));
+            }
+        }
         Ok(rustls::client::danger::ServerCertVerified::assertion())
     }
 
@@ -2341,6 +2600,7 @@ fn build_client_config_ex(
         use_java_trust_manager,
         Arc::new(cbc_augmented_default_provider()),
         &[],
+        None,
     )
 }
 
@@ -2361,6 +2621,7 @@ fn build_client_config_ex_with_provider(
     use_java_trust_manager: bool,
     provider: Arc<rustls::crypto::CryptoProvider>,
     versions: &[&'static rustls::SupportedProtocolVersion],
+    endpoint_identity: Option<(String, String)>,
 ) -> Result<Arc<ClientConfig>, String> {
     // `with_protocol_versions(&[])` is an error in rustls, and so is a list
     // whose versions the provider cannot serve — fall back to the safe
@@ -2385,6 +2646,7 @@ fn build_client_config_ex_with_provider(
         let verifier: Arc<dyn rustls::client::danger::ServerCertVerifier> =
             Arc::new(PassthroughServerCertVerifier {
                 algorithms: provider.signature_verification_algorithms.clone(),
+                endpoint_identity,
             });
         with_versions!(ClientConfig::builder_with_provider(provider.clone()))
             .dangerous()
@@ -4411,6 +4673,7 @@ pub(crate) fn drive_pending_layered_handshake(pending_id: i32) -> Result<i32, St
             pending.use_java_trust_manager,
             provider,
             &versions,
+            None,
         )
         .map_err(|e| format!("layered client config: {e}"))?;
         match pending.stream {
@@ -7993,6 +8256,21 @@ mod tests {
             super::jsse_owns_endpoint_identification(&mut ctx, &[plain2, netty]),
             "the FIRST manager decides, matching SSLContextImpl.chooseTrustManager"
         );
+
+        // 5. JSSE's OWN X509TrustManagerImpl is an X509ExtendedTrustManager
+        //    too, but its `checkServerTrusted` is served natively here and
+        //    performs no identification — so this VM must, or nobody does
+        //    (`testClientHostnameValidationFail`). This is the case
+        //    `SslContextBuilder.trustManager(File)` produces.
+        let jsse_cls = ctx
+            .ensure_class_initialized("sun/security/ssl/X509TrustManagerImpl")
+            .expect("mock class");
+        ctx.set_superclass(jsse_cls, extended);
+        let jsse = ctx.alloc_object(jsse_cls, 1);
+        assert!(
+            super::jsse_owns_endpoint_identification(&mut ctx, &[jsse]),
+            "JSSE's own trust manager does not identify on this VM, so this VM must"
+        );
     }
 
     #[test]
@@ -8148,6 +8426,15 @@ impl EngineConn {
             EngineConn::Server(s) => s.is_handshaking(),
         }
     }
+    /// Full, hello-retry or RESUMED — see `client_session_cache`, the only
+    /// consumer, which must not hand back a previous session object for a
+    /// handshake that was not actually a continuation of it.
+    fn handshake_kind(&self) -> Option<rustls::HandshakeKind> {
+        match self {
+            EngineConn::Client(c) => c.handshake_kind(),
+            EngineConn::Server(s) => s.handshake_kind(),
+        }
+    }
     fn wants_read(&self) -> bool {
         match self {
             EngineConn::Client(c) => c.wants_read(),
@@ -8272,6 +8559,20 @@ pub(crate) struct EngineState {
     /// exists so `SSLEngine.getPeerPort()` can answer what the application asked
     /// for instead of the uninitialised `-1` of a bare synthetic allocation.
     peer_port: i32,
+    /// A handshake failure this SERVER engine has detected but not yet
+    /// reported, because the fatal alert rustls queued for it still has to be
+    /// flushed first.
+    ///
+    /// `do_unwrap` used to DISCARD a server-side handshake error for exactly
+    /// that reason ("let the handshake driver observe NEED_WRAP and flush it
+    /// before the channel closes"), which delivered the alert to the peer and
+    /// left this side with no failure at all: netty's
+    /// `SslHandlerTest.testHandshakeFailureCipherMissmatch*` asserts BOTH
+    /// sides see an `SSLException`, and the server saw
+    /// `StacklessClosedChannelException` — the promise failed by the peer
+    /// hanging up, not by the mismatch this engine detected. Deferred to the
+    /// wrap that drains the alert instead of dropped.
+    deferred_handshake_error: Option<String>,
     /// The `SSLParameters.getEndpointIdentificationAlgorithm()` value the
     /// application configured on this engine ("HTTPS" / "LDAPS"), if any.
     ///
@@ -8383,6 +8684,7 @@ impl Default for EngineState {
             server_config: None,
             peer_host: None,
             peer_port: -1,
+            deferred_handshake_error: None,
             endpoint_id_alg: None,
             identity_override: None,
             trust_roots_override: None,
@@ -9311,7 +9613,28 @@ fn engine_begin(state: &mut EngineState) -> Result<(), String> {
         .filter_map(|p| std::str::from_utf8(p).ok())
         .collect();
     if state.is_client {
-        let config = match state.client_config.clone() {
+        // The shape that has to match for two engines to share one config —
+        // see `ctx_client_config_table`. A client WITH an identity is excluded
+        // below (it needs a per-engine `RecordingClientCertResolver`), so the
+        // identity is not part of the key.
+        let shape = format!(
+            "{:?}|{:?}|{:?}|{:?}|{}|{}",
+            state.enabled_ciphers,
+            state.enabled_protocols,
+            state.alpn_protocols,
+            (&state.endpoint_id_alg, &state.peer_host),
+            state.need_client_auth,
+            state.want_client_auth,
+        );
+        let shareable = state.identity_override.is_none() && state.client_config.is_none();
+        let cached = if shareable {
+            state
+                .trust_managers_ctx_key
+                .and_then(|k| ctx_client_config_table().lock().get(&(k, shape.clone())).cloned())
+        } else {
+            None
+        };
+        let config = match state.client_config.clone().or(cached) {
             Some(c) => c,
             // A real Java TrustManager is the authority for this context.
             // Rustls must only perform cryptographic handshake verification in
@@ -9367,6 +9690,29 @@ fn engine_begin(state: &mut EngineState) -> Result<(), String> {
                 // TLS 1.3 it cannot actually negotiate.
                 let (provider, versions) =
                     provider_and_versions(&state.enabled_ciphers, &state.enabled_protocols);
+                // Endpoint identification runs INSIDE the handshake (see
+                // `PassthroughServerCertVerifier::endpoint_identity`), because
+                // the SERVER can tell the difference: a client that rejects
+                // the certificate after its own `Finished` has already let the
+                // server complete. The post-handshake gate keeps its copy of
+                // the check for the paths that never build a config here.
+                //
+                // Gated on the SAME predicate as the post-handshake gate: an
+                // application `X509ExtendedTrustManager` OWNS identification
+                // and JSSE adds none, which is what netty's wrapper around
+                // `InsecureTrustManagerFactory` relies on — `testSessionCache`
+                // dials `a.netty.io` against a `localhost` certificate and
+                // expects it to connect.
+                let endpoint_identity = match (&state.endpoint_id_alg, &state.peer_host) {
+                    (Some(alg), Some(host))
+                        if endpoint_alg_verifies_identity(alg)
+                            && !host.is_empty()
+                            && ctx_jsse_identifies(state.trust_managers_ctx_key) =>
+                    {
+                        Some((alg.clone(), host.clone()))
+                    }
+                    _ => None,
+                };
                 build_client_config_ex_with_provider(
                     roots,
                     &alpn_strs,
@@ -9375,6 +9721,7 @@ fn engine_begin(state: &mut EngineState) -> Result<(), String> {
                     use_java_trust_manager,
                     provider,
                     &versions,
+                    endpoint_identity,
                 )?
             }
         };
@@ -9386,16 +9733,46 @@ fn engine_begin(state: &mut EngineState) -> Result<(), String> {
         // signal is needed at all. The clone is per engine, and the parts that
         // matter for sharing (the resumption/session store) are `Arc`s that
         // clone by reference.
-        let presented = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let config = {
+        // Interpose the recorder ONLY on a client that has an identity to
+        // present. Without one there is nothing to record — the existing
+        // `None` case already means "nothing sent" — and the wrapper's fresh
+        // `Arc` per engine is precisely what makes resumption impossible, so
+        // installing it unconditionally cost every identity-less client its
+        // session cache.
+        let needs_recorder = state.identity_override.is_some() || !shareable;
+        let session_store = state.trust_managers_ctx_key.map(ctx_client_session_store);
+        let config = if needs_recorder {
+            let presented = Arc::new(std::sync::atomic::AtomicBool::new(false));
             let mut cloned = (*config).clone();
             cloned.client_auth_cert_resolver = Arc::new(RecordingClientCertResolver {
                 inner: cloned.client_auth_cert_resolver.clone(),
                 presented: presented.clone(),
             });
+            if let Some(store) = session_store {
+                cloned.resumption = rustls::client::Resumption::store(store);
+            }
+            state.client_cert_presented = Some(presented);
             Arc::new(cloned)
+        } else if let Some(k) = state.trust_managers_ctx_key {
+            // Share this SSLContext's session store across its engines, then
+            // remember the finished config so the NEXT engine of the same
+            // shape is byte-for-byte the same object — see
+            // `ctx_client_config_table`.
+            let config = {
+                let mut cloned = (*config).clone();
+                if let Some(store) = session_store {
+                    cloned.resumption = rustls::client::Resumption::store(store);
+                }
+                Arc::new(cloned)
+            };
+            ctx_client_config_table()
+                .lock()
+                .entry((k, shape))
+                .or_insert(config)
+                .clone()
+        } else {
+            config
         };
-        state.client_cert_presented = Some(presented);
         let host = state
             .peer_host
             .clone()
@@ -9693,6 +10070,17 @@ fn engine_begin(state: &mut EngineState) -> Result<(), String> {
         // branches, so `engine_begin`'s rehandshake detector never mistakes
         // "already asked" for "asking for the first time".
         state.client_auth_requested |= state.need_client_auth || state.want_client_auth;
+        // Share this SSLContext's server-side session store across its engines,
+        // for the same reason as the client's — a server that forgets every
+        // session cannot honour a resumption attempt.
+        let config = match state.trust_managers_ctx_key {
+            Some(k) => {
+                let mut cloned = (*config).clone();
+                cloned.session_storage = ctx_server_session_store(k);
+                Arc::new(cloned)
+            }
+            None => config,
+        };
         let sc =
             ServerConnection::new(config).map_err(|e| format!("ServerConnection::new: {}", e))?;
         state.conn = Some(EngineConn::Server(sc));
@@ -10818,10 +11206,34 @@ fn jsse_owns_endpoint_identification(
         if dbg {
             chain.push(name.clone().unwrap_or_else(|| format!("<id {}>", c.as_u32())));
         }
+        // JSSE's OWN default trust manager is an `X509ExtendedTrustManager`,
+        // and on HotSpot it is the thing that identifies the endpoint. On
+        // THIS VM its `checkServerTrusted` is served by a native shim
+        // (`x509_manager::do_check_trusted`) which validates the chain and
+        // nothing else — it never sees the `SSLEngine`, so it cannot read
+        // `SSLParameters.getEndpointIdentificationAlgorithm()`.
+        //
+        // A predicate must mirror the dispatch it guards. Answering "the
+        // application owns identification" for a class whose identification
+        // code this VM does not run means NOBODY runs it:
+        // `testClientHostnameValidationFail` handshakes a client that dialled
+        // `localhost` against `notlocalhost_server.pem` and asserts the
+        // handshake FAILS; it completed.
+        if name.as_deref() == Some("sun/security/ssl/X509TrustManagerImpl") {
+            if dbg {
+                eprintln!(
+                    "[dbg-tls-auth] trust manager is JSSE's own X509TrustManagerImpl ({}) — \
+                     its checkServerTrusted is native here and does NOT identify, \
+                     so this VM must",
+                    chain.join(" -> ")
+                );
+            }
+            return true;
+        }
         if name.as_deref() == Some("javax/net/ssl/X509ExtendedTrustManager") {
             if dbg {
                 eprintln!(
-                    "[dbg-tls-auth] trust manager is an X509ExtendedTrustManager ({}) — \
+                    "[dbg-tls-auth] trust manager is an application X509ExtendedTrustManager ({}) — \
                      it owns endpoint identification, JSSE adds none",
                     chain.join(" -> ")
                 );
@@ -10998,6 +11410,79 @@ fn engine_session_table() -> &'static Mutex<HashMap<(u64, bool), ObjectRef>> {
     T.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// The client-side session cache: `(SSLContext key, host, port)` → the
+/// negotiated `SSLSession` object that connection produced.
+///
+/// This is JSSE's `SSLSessionContextImpl` for a client, which is keyed on
+/// host+port for exactly one reason — so that a LATER engine from the same
+/// `SSLContext`, dialling the same peer and RESUMING the session, hands the
+/// application back the *same* `SSLSession` object, with the same
+/// `putValue`/`getValue` bindings on it.
+///
+/// netty's `SSLEngineTest.doHandshakeVerifyReusedAndClose` is written around
+/// that: it puts `key=TRUE` on the first connection's session, reconnects to
+/// the same `a.netty.io:9999`, and asserts the value is readable off the new
+/// engine's session. A fresh object per engine answers `null`.
+///
+/// Entries are only ever CONSULTED for a handshake rustls reports as
+/// `HandshakeKind::Resumed`, so this cannot manufacture continuity that the
+/// TLS layer did not actually provide.
+///
+/// Holds live `ObjectRef`s → scanned and remapped alongside
+/// `engine_session_table` (see `gc_scan_tls_ctx_trust_manager_roots`).
+#[allow(clippy::type_complexity)]
+fn client_session_cache() -> &'static Mutex<HashMap<(u64, String, i32), ObjectRef>> {
+    static T: OnceLock<Mutex<HashMap<(u64, String, i32), ObjectRef>>> = OnceLock::new();
+    T.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// The cache key for a client engine, or `None` when this engine has no
+/// SSLContext identity or no peer to key on (a server engine, or a client
+/// created without a host).
+fn client_session_cache_key(id: i32) -> Option<(u64, String, i32)> {
+    with_engine(id, |s| {
+        if !s.is_client {
+            return None;
+        }
+        let ctx_key = s.trust_managers_ctx_key?;
+        let host = s.peer_host.clone().filter(|h| !h.is_empty())?;
+        Some((ctx_key, host, s.peer_port))
+    })
+    .flatten()
+}
+
+/// `SSLSession.getLastAccessedTime()` for the sessions that have been accessed
+/// again — i.e. reused by a later handshake. Keyed by `gc_stable_objref_key`,
+/// like `session_wire_id_table` beside it; absent means "never reused", and
+/// `getLastAccessedTime` then answers the creation time, which is what JSSE
+/// reports for a session used exactly once.
+fn session_last_accessed_table() -> &'static Mutex<HashMap<u64, i64>> {
+    static T: OnceLock<Mutex<HashMap<u64, i64>>> = OnceLock::new();
+    T.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn touch_session_access_time(ctx: &mut dyn NativeContext, ses: ObjectRef) {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    let k = gc_stable_objref_key(ctx, ses);
+    session_last_accessed_table().lock().insert(k, now);
+}
+
+/// Did rustls RESUME this connection's session (TLS 1.2 session id or ticket,
+/// TLS 1.3 PSK)? `false` for a full handshake and for a connection that has
+/// not got far enough to say.
+fn engine_handshake_was_resumed(id: i32) -> bool {
+    with_engine(id, |s| {
+        matches!(
+            s.conn.as_ref().and_then(|c| c.handshake_kind()),
+            Some(rustls::HandshakeKind::Resumed)
+        )
+    })
+    .unwrap_or(false)
+}
+
 /// Identity keys of the session objects built in the NEGOTIATED epoch.
 ///
 /// Only `engine_session_for` knows which epoch a session belongs to, and the
@@ -11032,12 +11517,43 @@ fn engine_session_for(
     if let Some(existing) = engine_session_table().lock().get(&key).copied() {
         return Ok(existing);
     }
+    // A RESUMED connection continues the previous session, so it must answer
+    // with the previous session OBJECT — its `putValue` bindings and its
+    // creation time are what "resumed" means to an application. See
+    // `client_session_cache`.
+    let cache_key = if handshaked {
+        client_session_cache_key(id)
+    } else {
+        None
+    };
+    if let Some(ck) = cache_key.as_ref() {
+        if crate::nbflags().dbg_tls_auth_ok {
+            eprintln!(
+                "[dbg-tls-auth] engine_session_for id={} key={:?} resumed={} kind={:?} cached={}",
+                id,
+                ck,
+                engine_handshake_was_resumed(id),
+                with_engine(id, |s| s.conn.as_ref().and_then(|c| c.handshake_kind())).flatten(),
+                client_session_cache().lock().contains_key(ck)
+            );
+        }
+        if engine_handshake_was_resumed(id) {
+            if let Some(prev) = client_session_cache().lock().get(ck).copied() {
+                engine_session_table().lock().insert(key, prev);
+                touch_session_access_time(ctx, prev);
+                return Ok(prev);
+            }
+        }
+    }
     let ses = build_synthetic_ssl_session(ctx, id)?;
     if handshaked {
         let k = gc_stable_objref_key(ctx, ses);
         negotiated_session_keys().lock().insert(k);
     }
     engine_session_table().lock().insert(key, ses);
+    if let Some(ck) = cache_key {
+        client_session_cache().lock().insert(ck, ses);
+    }
     Ok(ses)
 }
 
@@ -12049,7 +12565,7 @@ fn do_wrap(
     }
     let dst_remaining = dst_view.lim.saturating_sub(dst_view.pos);
 
-    let (consumed_inner, status, hs, drained, pending_trust_check) = {
+    let (consumed_inner, status, hs, drained, pending_trust_check, deferred_failure) = {
         let mut g = engine_registry().write();
         let s = match g.get_mut(&id) {
             Some(s) => s,
@@ -12108,10 +12624,22 @@ fn do_wrap(
         if hs == HS_FINISHED_R {
             s.handshake_finished_reported = true;
         }
+        // The handshake failure this engine detected on a previous `unwrap`,
+        // once the fatal alert it queued has actually gone out. Taking it only
+        // when nothing is left to write is what keeps the peer's copy of the
+        // alert intact — see `EngineState::deferred_handshake_error`.
+        let deferred_failure = if s.deferred_handshake_error.is_some()
+            && s.outbound.is_empty()
+            && !s.conn.as_ref().is_some_and(|c| c.wants_write())
+        {
+            s.deferred_handshake_error.take()
+        } else {
+            None
+        };
         // Extract-only — see `engine_take_pending_trust_check`'s doc for why
         // the actual Java call must happen after this lock is dropped.
         let pending_trust_check = engine_take_pending_trust_check(id, s);
-        (cons, status, hs, drained, pending_trust_check)
+        (cons, status, hs, drained, pending_trust_check, deferred_failure)
     };
     if let Some(pending) = pending_trust_check {
         engine_run_trust_check(ctx, pending, Some(this))?;
@@ -12123,6 +12651,15 @@ fn do_wrap(
     } else {
         0
     };
+    if let Some(msg) = deferred_failure {
+        // The alert is in `dst` (or already went out on an earlier wrap), so
+        // the peer learns why; this side now learns it too.
+        return Err(crate::phases_early::throw_jca_exc(
+            ctx,
+            "javax/net/ssl/SSLHandshakeException",
+            &msg,
+        ));
+    }
 
     let total_consumed = consumed_app.max(consumed_inner) as i32;
     if __dbg_hs {
@@ -12416,6 +12953,7 @@ fn do_unwrap(
         // network data"), and answering UNDERFLOW when nothing more is coming is
         // how a caller spins.
         let mut dst_too_small = false;
+        let mut deferred_error: Option<String> = None;
         let src_resolved = !matches!(src_view.backing, BbBacking::Unresolved);
         if let (true, Some(conn)) = (src_resolved, s.conn.as_mut()) {
             loop {
@@ -12560,6 +13098,9 @@ fn do_unwrap(
                         // and flush it before the channel closes; otherwise Netty
                         // reports only ClosedChannelException to the client.
                         if matches!(&*conn, EngineConn::Server(_)) {
+                            // Deferred, not discarded: the next `wrap` drains
+                            // the alert and then raises this.
+                            deferred_error = Some(format!("rustls: {}", e));
                             offset = rec_end;
                             break;
                         }
@@ -12630,6 +13171,9 @@ fn do_unwrap(
             if s.negotiated_session_id.is_empty() {
                 s.negotiated_session_id = sid;
             }
+        }
+        if deferred_error.is_some() {
+            s.deferred_handshake_error = deferred_error;
         }
         engine_capture_negotiation(s);
         let _ = underflow;
@@ -13261,6 +13805,16 @@ pub fn gc_scan_tls_ctx_trust_manager_roots(roots: &mut Vec<ObjectRef>) {
         }
     }
     drop(sessions);
+    // The client session cache outlives the engine that created each entry —
+    // that is its whole point — so it is an independent root, not something
+    // `engine_session_table` keeps alive for it.
+    let cached = client_session_cache().lock();
+    for ses in cached.values() {
+        if !ses.as_ptr().is_null() {
+            roots.push(*ses);
+        }
+    }
+    drop(cached);
     if let Some(f) = *huc_default_factory_slot().lock() {
         if !f.as_ptr().is_null() {
             roots.push(f);
@@ -13347,6 +13901,16 @@ pub fn gc_update_tls_ctx_trust_manager_refs(map: &cratonvm_types::PointerMap) {
         }
     }
     drop(sessions);
+    let mut cached = client_session_cache().lock();
+    for ses in cached.values_mut() {
+        let old = ses.as_ptr() as usize;
+        if let Some(&new) = map.get(&old) {
+            debug_assert!(new != 0, "GC pointer map contains null address");
+            // SAFETY: as above.
+            *ses = unsafe { ObjectRef::from_raw(new as *mut u8) };
+        }
+    }
+    drop(cached);
     // Same treatment for the installed default `SSLSocketFactory` — see
     // `huc_default_factory_slot`.
     let mut slot = huc_default_factory_slot().lock();
@@ -13910,6 +14474,12 @@ fn register_ssl_session_real(r: &mut NativeMethodRegistry) {
     });
     r.register(cls, "getLastAccessedTime", "()J", |ctx, args| {
         let this = obj_arg(args, 0)?;
+        // A session reused by a later handshake was last accessed then, not
+        // when it was created (`session_last_accessed_table`).
+        let k = gc_stable_objref_key(ctx, this);
+        if let Some(t) = session_last_accessed_table().lock().get(&k).copied() {
+            return Ok(Some(Value::Long(t)));
+        }
         if ctx.object_num_fields(this) > 5 {
             Ok(Some(ctx.get_field(this, 5)))
         } else {
