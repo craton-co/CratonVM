@@ -1,9 +1,9 @@
 # ZGC's own rewrite pass faults walking a reference array
 
-**Status: OPEN, found 2026-08-15.** The collector SIGSEGVs inside itself,
-during compaction's reference-slot rewrite. Distinct from the JIT-frame
-relocation defect fixed the same day — this one reproduces with `--nojit`, so
-no compiled frame is involved.
+**Status: FIXED 2026-08-15.** The collector SIGSEGV'd inside itself during
+compaction's reference-slot rewrite. Distinct from the JIT-frame relocation
+defect fixed the same day — this one reproduced with `--nojit`, so no compiled
+frame was involved.
 
 ## The fault
 
@@ -32,62 +32,97 @@ a mapped region, so the walk is reading past the object: either
 `array_length()` is not this object's, or the base being walked is no longer
 the object the walker thinks it is.
 
-## Why that is possible here
+## Root cause: "this page is selected" is not "these bytes are free"
 
-`live_now` is built as
+An object's page membership is decided by its **base**. An object based in an
+unselected page and extending across the boundary keeps its tail inside the
+selected page above, and it is not in `survivors`, so it never moves. The slide
+only ever checked page membership.
 
-```rust
-let live_now: Vec<usize> = live.iter().map(|b| record.get(*b).unwrap_or(*b)).collect();
-```
+The destination probe aimed straight at the hazard. When a span touched an
+unselected page it restarted at `base + (blocked + 1) * PAGE` — the first byte
+of the next page, which is exactly where a straddler from the page below lies.
+`slide_floor` has the same shape.
 
-`unwrap_or(*b)` keeps the ORIGINAL address for any live object the record does
-not list — correct only if an unlisted object genuinely did not move **and its
-memory was not written over**. The slide writes survivors downward into vacated
-space; the relocation set is non-contiguous (the selector skips dense pages),
-and the destination probe was taught to skip unselected pages on 2026-08-14.
-The hypothesis to test first is whether an unlisted live object can still be
-overwritten — in which case `live_now` hands the rewrite pass an address whose
-contents are now some other object, and the array arm reads a length that was
-never this object's.
+So the slide memmoved a survivor over the tail of a live object. The same bytes
+then belonged to two objects, and one of them was eventually read as a header.
 
-That is a hypothesis, not a finding. It has not been measured.
+**The workload said so in ASCII.** With the walkability guard in place, a
+`--nojit` netty run reported 16 unwalkable rewrite targets, all
+`registered=true`, whose headers decode as text:
 
-## First things to try
+| field | value | as bytes |
+|---|---|---|
+| `class_id` | `0x41524150` | `PARA` |
+| `num_slots` | `0x444f494e` | `NOID` |
+| neighbours | | `io/n`, `etty` |
 
-1. **Assert before walking.** In the rewrite loop, check `registry.contains`
-   and that the header's kind/length are self-consistent (`alloc_size` returns
-   `Some`, and `base + size <= arena_hi`) before calling `reference_slots`.
-   Report and skip rather than fault — the list of offenders is worth far more
-   than the first crash, and it turns a SIGSEGV inside the collector into data.
-2. **`CRATONVM_DBG_ZGC_VERIFY_SLIDE=1`** already classifies post-slide dangling
-   slots. It runs AFTER the rewrite, so it never gets to speak when the rewrite
-   is what faults; a pre-rewrite variant of the same walk would.
-3. **Check whether the object is in `moved_from`.** If the faulting base is an
-   address the slide vacated, this is the overwrite hypothesis confirmed. The
-   `CRATONVM_DBG_ZGC_CORPSE` ledger already records exactly that set.
+`PARANOID` is netty's `ResourceLeakDetector.Level`. The registry held bases
+pointing into **string data**.
 
-## Rate
+## The fix, and the result
 
-On `io.netty.util.ResourceLeakDetectorTest`, 10 interleaved reps each:
+The probe now carries an **obstacle list**: extents of live objects based in
+unselected pages that cross a boundary. At most one per boundary, so a sorted
+`Vec` and a short scan. `slide_floor` is raised past an obstacle too.
 
-| arm | SIGSEGV |
-|---|---|
-| ZGC, JIT on | 6/10 |
-| ZGC, `--nojit` | **2/10** |
-| ZGC, `CRATONVM_ZGC_RELOCATE=0` | 0/10 |
+`--nojit`, 12 interleaved reps each, same runner, one class per VM:
 
-The JIT-on excess is the separate relocation-under-a-live-compiled-frame defect
-(fixed 2026-08-15). The `--nojit` residue is this one. Both vanish with
-relocation off, so both are compaction defects.
+| arm | SIGSEGV | unwalkable targets |
+|---|---|---|
+| before | **2/10** | 16 in the crashing run |
+| after | **0/12** | **0** |
 
-`--nojit` is the cheap repro: it removes the other defect from the picture
-entirely, at the cost of needing about five runs per hit.
+All twelve report `found=3 started=3 ok=2 failed=1`, matching G1. With the JIT
+back ON — where the quiescence fix also applies — 8/8 clean, 0 unwalkable,
+same counts. The residual `failed=1` is the GC-independent defect that
+reproduces on every collector.
+
+## Two defensive changes that came with it
+
+**The array arm of the slot walker had no plausibility screen.** Its
+legacy-object sibling refuses `num_slots > 1<<24` before striding; the array
+arm trusted `array_length()` outright, because `array_data_size` refuses only
+integer OVERFLOW. A clobbered length of a few hundred million with 4-byte
+elements sizes cleanly to a couple of gigabytes and the walk strides all of it.
+`alloc_size` shared the gap. Both are now bounded by
+`MAX_PLAUSIBLE_ARRAY_LEN`.
+
+Worth keeping even now the corruption is fixed: it is the difference between a
+SIGSEGV inside the collector and a logged, skipped object. The test for it
+reproduces the production fault **in-process** — with the screens removed the
+test binary exits `0xc0000005 STATUS_ACCESS_VIOLATION` instead of failing an
+assertion.
+
+**`rewrite_target_is_walkable`** checks each survivor is sizable and fits the
+arena before the rewrite walks it, and reports the ones that are not. That
+guard is what produced the ASCII evidence above; without it the crash names
+only the collector.
+
+## Traps recorded
+
+* **The obvious check in the guard is wrong.** "Is this still a registered
+  base?" cannot be asked in the rewrite loop: the object-start registry is
+  rebuilt AFTER it, so during the rewrite it still holds every survivor's
+  PRE-slide base while `live_now` holds post-slide ones. Gating on it skips
+  precisely the objects that moved.
+  `collect_garbage_with_compaction_on_rewrites_roots_and_keeps_the_graph`
+  caught this immediately. It is now reported and never vetoes.
+* **`was_vacated=false` is not "the slide didn't do it".** `moved_from` covers
+  one cycle; an address vacated nine collections ago also reports false. Every
+  offender above reported false and the slide was nonetheless the cause.
+* **The invariant test passed vacuously first.** Only ~4 objects cross a page
+  boundary in a 10 MiB fill, and with a third of objects live the fixture
+  regularly contained no LIVE straddler — and a dead one cannot be written into
+  by mistake. The fixture now roots every straddler deliberately and asserts one
+  exists before judging anything.
 
 ## Related
 
 - `docs/known-issues/netty/zgc-resourceleakdetector-corpse-read-20260815.md` —
   the JIT-frame half, and the instruments (`CRATONVM_DBG_ZGC_CORPSE`,
   `CRATONVM_DBG_JIT_NAMES`, `CRATONVM_SYMBOLIZE`) used to separate the two.
-- The 2026-08-14 fix for the slide crossing unselected pages is the nearest
-  neighbour of the hypothesis above; read it before assuming the destination
-  probe is the problem, because that specific hole is closed.
+- The 2026-08-14 fix for the slide crossing unselected PAGES is this defect's
+  direct predecessor and the reason it was hard to see: that fix made the probe
+  page-correct, which reads as "the destination probe is handled". It is the
+  same probe and the same rule one level finer — pages, then bytes.
