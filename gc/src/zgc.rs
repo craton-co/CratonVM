@@ -2372,8 +2372,25 @@ pub struct ZgcRealHeap {
     /// per critical section and once per collection, and it is empty in every
     /// workload that makes no critical calls at all.
     critical_pins: Mutex<FxHashMap<usize, usize>>,
-    /// One-shot latch for the unenumerable-object compaction refusal.
-    unenumerable_warned: AtomicBool,
+    /// `CRATONVM_DBG_ZGC_CORPSE` -- the last slide's `from -> (to, class_id,
+    /// size)`, so a later read of a vacated span can say WHAT used to live
+    /// there instead of reporting an anonymous `num_slots=0`.
+    ///
+    /// This exists because `compact_low_to` zeroes the span it vacates, on
+    /// purpose, so that a conservative scan cannot resurrect a corpse. The
+    /// side effect is that a stale pointer resolves to a well-formed
+    /// ALL-ZERO object: `class_id=0`, `num_slots=0`, and the reader walks off
+    /// the end of a zero-length object. Every identifying byte is gone by the
+    /// time anyone notices, which is why "who still points here?" has been
+    /// unanswerable -- the evidence is destroyed by the same memset that makes
+    /// the bug safe to survive.
+    ///
+    /// Keyed by the vacated address; interior addresses resolve through the
+    /// stored size, because a stale pointer is not always to the base.
+    corpse_ledger: Mutex<FxHashMap<usize, (usize, u32, usize)>>,
+    /// How many OOB reads have already been reported in full, so a workload
+    /// that produces thousands does not produce thousands of backtraces.
+    corpse_reports: AtomicUsize,
     /// Concurrent phases the DRIVER reported, summed over all cycles.
     ///
     /// This is the counter that distinguishes "the worker pool marked" from
@@ -2737,7 +2754,8 @@ impl ZgcRealHeap {
             parallel_mark_fallbacks: AtomicUsize::new(0),
             gc_stress_mark: AtomicUsize::new(0),
             critical_pins: Mutex::new(FxHashMap::default()),
-            unenumerable_warned: AtomicBool::new(false),
+            corpse_ledger: Mutex::new(FxHashMap::default()),
+            corpse_reports: AtomicUsize::new(0),
             driver_passes: AtomicUsize::new(0),
             mark_active: AtomicBool::new(false),
             mark_ingress: mark::ZMarkIngress::new(),
@@ -3877,42 +3895,6 @@ impl ZgcRealHeap {
                     );
                 }
             }
-            // FAIL CLOSED if any live object's slots cannot be enumerated.
-            //
-            // Checked BEFORE anything moves, because the damage is only
-            // detectable afterwards and is unrecoverable once done: the
-            // rewrite pass below walks every live object to re-point slots at
-            // moved objects, and `reference_slots` reports NO slots for a
-            // compact-flagged object with no registered layout. Such an object
-            // holding a reference to a moved object keeps a dangling pointer,
-            // and nothing downstream will notice.
-            //
-            // Skipping the whole cycle rather than the object is deliberate:
-            // we cannot know what an unenumerable object points AT, so the
-            // only safe guarantee is that nothing it could point at has moved.
-            // The cost is one cycle's reclaim in a process that unloads
-            // classes; the alternative is a heap-corruption bug whose crash
-            // site is unrelated to its cause.
-            if let Some(bad) = live
-                .iter()
-                .copied()
-                .filter(|b| *b >= base && *b < low_end)
-                .find(|b| !self.slots_are_enumerable(*b))
-            {
-                if !self.unenumerable_warned.swap(true, Ordering::Relaxed) {
-                    tracing::warn!(
-                        target: "cratonvm::gc::guard",
-                        addr = bad,
-                        class_id = self.header_ref(bad as *mut u8).class_id.as_u32(),
-                        "zgc relocate: a live compact object has no registered layout, so \
-                         its reference slots cannot be enumerated and the rewrite could \
-                         not re-point them. SKIPPING COMPACTION for this cycle — see \
-                         `slots_are_enumerable`. Reclaim is reduced; correctness is not."
-                    );
-                }
-                let reclaimed = arena.retract_cursor_into_free_tail();
-                return (0, reclaimed, cratonvm_types::PointerMap::default());
-            }
             if selected.is_empty() {
                 // Nothing profitable to move. Not a failure -- it is the
                 // selector doing its job on a heap whose pages are all dense.
@@ -4075,6 +4057,19 @@ impl ZgcRealHeap {
             // record is read by the rewrite pass below, which must see the
             // WHOLE map or it resolves half the graph against a half-built one.
             record.record_many(&pairs);
+            // CRATONVM_DBG_ZGC_CORPSE -- remember what was at each vacated
+            // address before the memset erases it. Read AFTER the move (the
+            // header now lives at `to`) and before `compact_low_to` has
+            // zeroed anything at `from`.
+            if zgc_corpse_enabled() {
+                let mut ledger = self.corpse_ledger.lock();
+                ledger.clear();
+                for (from, to) in &pairs {
+                    let h = self.header_ref(*to as *mut u8);
+                    let size = Self::alloc_size(h).unwrap_or(0);
+                    ledger.insert(*from, (*to, h.class_id.as_u32(), size));
+                }
+            }
         }
 
         if moved == 0 {
@@ -4250,36 +4245,6 @@ impl ZgcRealHeap {
                 "zgc slide verify: every reference slot resolves to a live base"
             );
         }
-    }
-
-    /// Can this object's reference slots be ENUMERATED?
-    ///
-    /// `census::reference_slots` answers "no slots" for a compact-flagged
-    /// object whose `(class_id, num_slots)` has no registered layout, and says
-    /// so in a warning. That is the right answer for the census it was built
-    /// for — its own doc argues the omission "biases the legacy share DOWN —
-    /// the conservative direction". **It is the WRONG direction for the
-    /// compaction rewrite**, which uses the same enumeration to find slots
-    /// that must be re-pointed: a slot nobody enumerates is a slot nobody
-    /// rewrites, and after the slide it is a dangling pointer.
-    ///
-    /// The slide already refuses to MOVE an object it cannot size. This is the
-    /// other half, and it is the half that bites: the rewrite walks EVERY live
-    /// object, not just the moved ones, so an unenumerable object anywhere in
-    /// the heap can hold a reference to an object that did move.
-    fn slots_are_enumerable(&self, addr: usize) -> bool {
-        let header = self.header_ref(addr as *mut u8);
-        if !matches!(header.kind(), ObjectKind::Object) {
-            // Arrays are walked by element type and fillers hold no
-            // references; neither consults a layout.
-            return true;
-        }
-        if !cratonvm_types::is_compact_object(header) {
-            // Legacy bodies stride `num_slots` uniform cells — no layout
-            // needed, so enumeration cannot fail.
-            return true;
-        }
-        cratonvm_types::with_class_layout(header.class_id.as_u32(), header.num_slots(), |_| ())
     }
 
     /// Pin `addr` against relocation for a JNI critical section — see
@@ -5168,9 +5133,98 @@ impl ZgcRealHeap {
         }
         if index >= num_slots {
             tracing::warn!(target: "zgc", index, num_slots, "zgc real: field index OOB");
+            self.report_corpse_read(header, index);
             return None;
         }
         Some(num_slots)
+    }
+
+    /// `CRATONVM_DBG_ZGC_CORPSE` -- name the object that USED to be at the
+    /// address a stale reference just read.
+    ///
+    /// # Why the crash cannot be read without this
+    ///
+    /// The `zgc real: field index OOB index=N num_slots=0` signature is what a
+    /// stale pointer into a compacted-away object looks like, and it is
+    /// deliberately anonymous: `compact_low_to` zeroes the vacated span so a
+    /// conservative scan cannot resurrect a corpse, which also erases the
+    /// class id, the slot count and every field. So the warning reports the
+    /// only two numbers that survive, and neither of them identifies anything.
+    ///
+    /// Three questions decide what to fix, and the zeroed header answers none:
+    ///
+    ///  * **What moved away?** The class of the vacated object names the
+    ///    family of holder. A `Thread`, a `ThreadLocal` map or a JNI handle
+    ///    points somewhere very different from an ordinary Java object.
+    ///  * **Where did it go?** If the survivor is still alive at `moved_to`,
+    ///    the holder simply was not rewritten -- a missing remap. If it is not,
+    ///    the object died later and this is a lifetime bug instead.
+    ///  * **Who is reading?** The Rust caller chain separates an interpreter
+    ///    `getfield` (a Java slot the rewrite missed -- but the slide verifier
+    ///    already reports `missed_rewrites=0`, so this would be a contradiction
+    ///    worth having) from a native accessor holding a raw address across a
+    ///    safepoint (which the slot graph cannot see, and which is where the
+    ///    evidence currently points).
+    ///
+    /// Capped at eight full reports: the count of these warnings measures how
+    /// long a run SURVIVED, not how broken it is, and thousands of backtraces
+    /// would bury the first one -- which is the only one whose heap state is
+    /// still close to the fault.
+    #[cold]
+    fn report_corpse_read(&self, header: &ObjectHeader, index: usize) {
+        if !zgc_corpse_enabled() {
+            return;
+        }
+        let n = self.corpse_reports.fetch_add(1, Ordering::Relaxed);
+        if n >= 8 {
+            return;
+        }
+        let addr = header as *const ObjectHeader as usize;
+        // Exact base first; then an interior hit, because a stale pointer is
+        // not always to the object's base.
+        let hit = {
+            let ledger = self.corpse_ledger.lock();
+            ledger.get(&addr).copied().map(|v| (addr, v)).or_else(|| {
+                ledger
+                    .iter()
+                    .find(|(from, (_, _, size))| addr > **from && addr < **from + *size)
+                    .map(|(from, v)| (*from, *v))
+            })
+        };
+        let backtrace = std::backtrace::Backtrace::force_capture().to_string();
+        match hit {
+            Some((from, (to, class_id, size))) => {
+                let still_live = self.registry.contains(to);
+                tracing::error!(
+                    target: "cratonvm::gc::guard",
+                    read_addr = addr,
+                    vacated_base = from,
+                    interior_offset = addr - from,
+                    moved_to = to,
+                    size,
+                    class_id,
+                    class = %crate::collector::class_name_for_diagnostics(class_id),
+                    survivor_still_registered = still_live,
+                    index,
+                    %backtrace,
+                    "zgc corpse read: this address was vacated by the LAST slide --                      something still holds the pre-move address"
+                );
+            }
+            None => {
+                // Not from the last slide. Either an older cycle vacated it
+                // (the ledger keeps one cycle only) or the address was never a
+                // relocation source -- which would make this a different bug
+                // and is worth distinguishing rather than assuming.
+                tracing::error!(
+                    target: "cratonvm::gc::guard",
+                    read_addr = addr,
+                    index,
+                    in_registry = self.registry.contains(addr),
+                    %backtrace,
+                    "zgc corpse read: OOB read at an address the LAST slide did not                      vacate -- older cycle, or never a relocation source"
+                );
+            }
+        }
     }
 
     /// True iff the object at `base` carries the [`GC_FLAG_MARKED`] bit set by
@@ -5758,6 +5812,14 @@ const Z_PARMARK_DEFAULT_WORKERS: usize = 0;
 /// `CRATONVM_DBG_ZGC_VERIFY_SLIDE` — walk every survivor's reference slots
 /// after a compaction and report any that do not resolve to a registered live
 /// base. See [`ZgcRealHeap::verify_no_dangling_slots_after_slide`].
+/// `CRATONVM_DBG_ZGC_CORPSE` -- keep a one-cycle ledger of what each slide
+/// vacated, and report it when a stale read lands on a zeroed span. See
+/// [`ZgcRealHeap::report_corpse_read`].
+fn zgc_corpse_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_ZGC_CORPSE").is_some())
+}
+
 fn zgc_verify_slide_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {

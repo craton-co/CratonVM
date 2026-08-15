@@ -59,7 +59,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_DBG`
 
-440 tokens.
+447 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -309,6 +309,13 @@ export inherited from a parent shell.
 | `mark-why-class` | `CRATONVM_DBG_MARK_WHY_CLASS` |
 | `mirrorpin-why` | `CRATONVM_DBG_MIRRORPIN_WHY` |
 | `root-source` | `CRATONVM_DBG_ROOT_SOURCE` |
+| `zgc-verify-slide` | `CRATONVM_DBG_ZGC_VERIFY_SLIDE` |
+| `zgc-corpse` | `CRATONVM_DBG_ZGC_CORPSE` |
+| `atomic-intrinsic` | `CRATONVM_DBG_ATOMIC_INTRINSIC` |
+| `define-filter` | `CRATONVM_DBG_DEFINE_FILTER` |
+| `define-stack-filter` | `CRATONVM_DBG_DEFINE_STACK_FILTER` |
+| `hw-atomic` | `CRATONVM_DBG_HW_ATOMIC` |
+| `jca-getinstance` | `CRATONVM_DBG_JCA_GETINSTANCE` |
 | `mic-trace` | `CRATONVM_DBG_MIC_TRACE` |
 | `minvoke` | `CRATONVM_DBG_MINVOKE` |
 | `mirrorpin` | `CRATONVM_DBG_MIRRORPIN` |
@@ -506,7 +513,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_JIT`
 
-174 tokens.
+175 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -636,6 +643,7 @@ export inherited from a parent shell.
 | `scalar-replacement` | `CRATONVM_DISABLE_SCALAR_REPLACEMENT` |
 | `scan-cache` | `CRATONVM_NO_JIT_SCAN_CACHE` |
 | `self-cache-inherit` | `CRATONVM_JIT_NO_SELF_CACHE_INHERIT` |
+| `atomic-intrinsic` | `CRATONVM_JIT_NO_ATOMIC_INTRINSIC` |
 | `field-site-cache` | `CRATONVM_JIT_FIELD_SITE_CACHE` |
 | `site-cache` | `CRATONVM_JIT_SITE_CACHE` |
 | `unreg-memo-hiwater` | `CRATONVM_JIT_UNREG_MEMO_HIWATER` |
@@ -835,11 +843,12 @@ export inherited from a parent shell.
 
 ## `CRATONVM_SECURITY`
 
-12 tokens.
+13 tokens.
 
 | Token | Expands to |
 | --- | --- |
 | `aot-hmac-key` | `CRATONVM_AOT_HMAC_KEY` |
+| `jca-lenient-getinstance` | `CRATONVM_JCA_LENIENT_GETINSTANCE` |
 | `block-private-nets` | `CRATONVM_BLOCK_PRIVATE_NETS` |
 | `capability-grants` | `CRATONVM_CAPABILITY_GRANTS` |
 | `capability-log` | `CRATONVM_CAPABILITY_LOG` |
