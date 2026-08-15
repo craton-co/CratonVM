@@ -73,7 +73,10 @@ unselected pages that cross a boundary. At most one per boundary, so a sorted
 | before | **2/10** | 16 in the crashing run |
 | after | **0/12** | **0** |
 
-All twelve report `found=3 started=3 ok=2 failed=1`, matching G1.
+All twelve report `found=3 started=3 ok=2 failed=1`, matching G1. With the JIT
+back ON — where the quiescence fix also applies — 8/8 clean, 0 unwalkable,
+same counts. The residual `failed=1` is the GC-independent defect that
+reproduces on every collector.
 
 ## Two defensive changes that came with it
 
