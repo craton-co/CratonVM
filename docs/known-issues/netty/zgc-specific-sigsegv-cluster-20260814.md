@@ -1,38 +1,12 @@
 # ZGC-specific SIGSEGV cluster — 7 classes crash under ZGC, pass cleanly under G1
 
 **Status:** **7/7 of the cluster FIXED and re-confirmed on current `dev`
-(2026-08-15).** One class remains open and is the whole of this page's residual:
-`io.netty.util.ResourceLeakDetectorTest`. Four root-caused defects landed
-between `6a206f689` and `caf25c3d1`; the "new regression" this page recorded on
-2026-08-14 was one of them and is fixed. See "Current validation" below for the
-table that supersedes both earlier fix-validation sections.
-
-> **UPDATED 2026-08-15 (`fix/intobjecthashmap-sigsegv-20260815`) — the residual
-> no longer SIGSEGVs.** A FIFTH defect of the same family was found and fixed:
-> `caf25c3d1` gave ZGC a CONSUMER for
-> `gc_quiescence::pinned_jit_roots_snapshot()` while all four PRODUCERS stayed
-> gated on `is_g1()`, so the snapshot was empty on every ZGC cycle and the
-> conservative-JIT-root pin — the thing that keeps a moving collector off an
-> object named only by an un-rewritable frame slot — pinned nothing.
-> `VmHeap::pins_conservative_jit_roots()` is now the one predicate both sides
-> ask.
->
-> Measured on that branch, one class per process, `-XX:+UseZGC`, `--Xmx 1500m`:
->
-> | binary | runs | SIGSEGV | completed |
-> | --- | ---: | ---: | --- |
-> | pristine `dev` | 5 | **2** | best `3 started / 2 ok / 1 failed` |
-> | the fix | 6 | **0** | `3 started / 2 ok / 1 failed` — G1's own answer |
->
-> What is left on this class is **not** collector-specific and is a different
-> owner's: `NoSuchMethodError: 'int java.lang.Byte.addAndGet(int)'`, which
-> reproduces identically under `-XX:+UseG1GC` on pristine `dev`. Two of the six
-> ZGC runs also exhausted the heap while five other arms shared the box; a solo
-> run at the same `--Xmx` did not, and `CRATONVM_DBG_ZGC_PINS=1` (added with the
-> fix) shows the new pin withholding 27 of 748 pages at its worst, so
-> over-pinning is not the cause. **The ZGC-crash half of this row is closed; the
-> row stays open for the `Byte.addAndGet` receiver defect.** Full evidence in
-> the retired `intobjecthashmaptest-discovery-sigsegv-20260814` write-up.
+(2026-08-15).** One class remains open and is now the whole of this page's
+residual: `io.netty.util.ResourceLeakDetectorTest`, which still SIGSEGVs under
+ZGC. Four root-caused defects landed between `6a206f689` and `caf25c3d1`; the
+"new regression" this page recorded on 2026-08-14 was one of them and is fixed.
+See "Current validation" below for the table that supersedes both earlier
+fix-validation sections.
 
 **Update, later on 2026-08-15.** That residual turned out to be TWO defects
 sharing one signature, and both now have their own pages:

@@ -8989,7 +8989,7 @@ impl G1Collector {
     /// * a parked or blocked peer publishes its own conservative JIT roots via
     ///   `interpreter::update_root_snapshot`'s `publish_pinned_jit_roots`;
     /// * a forcibly-frozen peer and its helper window are pinned by
-    ///   `interpreter::pin_frozen_peer_roots_for_moving_collector`, and its un-retired TLAB
+    ///   `interpreter::pin_frozen_peer_roots_for_g1`, and its un-retired TLAB
     ///   tail by [`Self::set_jit_tlab_skip_regions`].
     ///
     /// So "coverage incomplete" under G1 means *the roots are not REWRITABLE*,

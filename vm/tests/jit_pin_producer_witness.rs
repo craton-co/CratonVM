@@ -1,39 +1,43 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2024-2026 Craton Software Company
 
-//! Source witness: **every publisher of a conservative JIT root asks the
-//! collector-agnostic predicate, not `is_g1()`.**
+//! **ZGC's conservative-JIT-root pin has a consumer and no producer.** That is
+//! survivable only while ZGC declines to relocate at all under a live compiled
+//! frame. This test pins the two facts together so the second cannot be relaxed
+//! without noticing the first.
 //!
-//! `gc_quiescence::pinned_jit_roots_snapshot()` is a two-sided contract. The
-//! CONSUMER side (a collector dropping those pages/regions from what it is
-//! about to move) and the PRODUCER side (the VM's root deposits filling the
-//! registry) live in different crates, and on 2026-08-14 they named different
-//! collectors for a day: `caf25c3d1` gave ZGC the consumer, while all four
-//! producers stayed gated on `shared.mem.heap.is_g1()`. Under ZGC the snapshot
-//! was therefore empty on every cycle and the filter dropped nothing — so the
-//! pin read as *implemented* everywhere and *pinned* nowhere.
+//! `gc_quiescence::pinned_jit_roots_snapshot()` is two-sided: a CONSUMER (a
+//! moving collector dropping those pages/regions from what it is about to
+//! relocate) and a PRODUCER (the VM's root deposits filling the registry).
+//! `caf25c3d1` (2026-08-14) gave ZGC the consumer. All four producers —
+//! `memory/roots.rs`, `update_root_snapshot`, the blocked-thread deposit in
+//! `vm/vm_exec.rs`, and `pin_frozen_peer_roots_for_g1` — are still gated on
+//! `shared.mem.heap.is_g1()`, so under ZGC that snapshot is **empty on every
+//! cycle** and the consumer withholds nothing.
 //!
-//! Nothing behavioural could catch that cheaply, because the two sides fail
-//! independently: `zgc.rs`'s
-//! `a_conservative_jit_root_pins_its_page_against_relocation` calls
+//! Nothing behavioural catches that, because the two sides fail independently:
+//! `zgc.rs`'s `a_conservative_jit_root_pins_its_page_against_relocation` calls
 //! `add_pinned_jit_root` itself, so it exercises the consumer over a snapshot
-//! the VM would never have produced, and passes with every producer removed.
-//! `VmHeap::pins_conservative_jit_roots` is the single predicate both sides
-//! now ask; this test is what stops a fifth producer being added — or one of
-//! these four being edited — with `is_g1()` again.
+//! the VM would never have produced — and passes with every producer deleted.
 //!
-//! The observable defect it stands in for: one Java object in 200 000 came out
-//! of a JIT-compiled constructor with a `null` `final` field. Its `this` was
-//! live only in a compiled frame, ZGC's page slide moved it, the conservative
-//! frame slot was not (and cannot be) rewritten, and the `putfield` landed in
-//! the vacated span. The same defect crashed
-//! `io.netty.util.collection.IntObjectHashMapTest` in `Monitor::exit` — see the
-//! retired `intobjecthashmaptest-discovery-sigsegv-20260814` write-up.
+//! What makes it safe today is `3c0fd9c01`: ZGC reads
+//! `gc_quiescence::is_active()` and refuses to relocate while any compiled frame
+//! is live. That is strictly stronger than the pin, and deliberately so — a pin
+//! built from a CONSERVATIVE STACK SCAN cannot see a pointer that never left a
+//! register, so the object slides anyway. Wiring the producers up was measured
+//! to fix `probes/JitFrameRootRelocationProbe`, and was still dropped in favour
+//! of the refusal for exactly that reason.
+//!
+//! But that commit files its own caveat: *"a JIT-busy process compacts less
+//! often, and on this collector compaction is also defragmentation […] Someone
+//! should measure the fragmentation impact on a JIT-heavy workload before this
+//! is considered settled."* If that refusal is narrowed or removed, the pin
+//! becomes ZGC's remaining protection and it has no producer. This test is the
+//! tripwire on that path — not a style check.
 
 use std::path::{Path, PathBuf};
 
 fn repo_root() -> PathBuf {
-    // `vm/` -> repo root.
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .expect("vm/ has a parent")
@@ -45,58 +49,65 @@ fn read(rel: &str) -> String {
     std::fs::read_to_string(&p).unwrap_or_else(|e| panic!("cannot read {}: {e}", p.display()))
 }
 
-/// The publishing call sites, and the file each lives in.
-const PRODUCERS: &[(&str, &str)] = &[
-    ("vm/src/memory/roots.rs", "add_pinned_jit_root"),
-    (
-        "vm/src/runtime/interpreter/gc_and_alloc.rs",
-        "publish_pinned_jit_roots",
-    ),
-    (
-        "vm/src/runtime/interpreter/gc_and_alloc.rs",
-        "add_pinned_jit_root",
-    ),
-    ("vm/src/vm/vm_exec.rs", "publish_pinned_jit_roots"),
-];
-
+/// The refusal is what makes the missing producer survivable. If it goes, read
+/// this test's header before deciding the pin is enough.
 #[test]
-fn every_conservative_jit_root_publisher_asks_the_shared_predicate() {
-    for (file, call) in PRODUCERS {
-        let src = read(file);
-        assert!(
-            src.contains(call),
-            "{file} no longer calls {call} — if the producer moved, move this witness too"
-        );
-        assert!(
-            src.contains("pins_conservative_jit_roots"),
-            "{file} publishes conservative JIT roots ({call}) but never asks \
-             `pins_conservative_jit_roots`. That predicate is the one place the \
-             producer and the collector's relocation filter agree about which \
-             backends move; gating on `is_g1()` here is what left ZGC's pin \
-             registry empty on every cycle while its consumer was already live."
-        );
-    }
+fn zgc_declines_to_relocate_while_a_compiled_frame_is_live() {
+    let zgc = read("gc/src/zgc.rs");
+    assert!(
+        zgc.contains("gc_quiescence::is_active"),
+        "gc/src/zgc.rs no longer asks `gc_quiescence::is_active()`. That refusal \
+         (3c0fd9c01) is the ONLY thing keeping a page slide off an object held \
+         in a compiled frame's register — the conservative-root pin cannot \
+         substitute, because a pointer that never left a register is absent \
+         from the scan the pin is built from. If this is being narrowed on \
+         purpose, wire up the pin PRODUCERS in the same commit (they are all \
+         still `is_g1()`; see this file's header) and re-run \
+         probes/JitFrameRootRelocationProbe, which reproduces the defect \
+         deterministically at iteration 10191."
+    );
 }
 
-/// The consumer half, stated so the pair cannot be half-deleted: if a
-/// collector stops reading the snapshot, this test is the reminder that its
-/// producer arm in `pins_conservative_jit_roots` is now dead weight — and if a
-/// new moving collector starts reading it, that it needs an arm at all.
+/// The consumer half, stated so the pair cannot be half-deleted.
 #[test]
 fn both_moving_collectors_consume_the_pinned_jit_root_snapshot() {
     for file in ["gc/src/g1.rs", "gc/src/zgc.rs"] {
         let src = read(file);
         assert!(
             src.contains("pinned_jit_roots_snapshot"),
-            "{file} no longer consumes `pinned_jit_roots_snapshot()`. A moving \
-             collector that ignores it relocates objects named only by an \
-             un-rewritable JIT frame slot."
+            "{file} no longer consumes `pinned_jit_roots_snapshot()`. For G1 that \
+             is a live memory-corruption bug; for ZGC it removes the second \
+             layer under the `is_active()` refusal."
         );
     }
-    let heap = read("gc/src/vm_heap.rs");
-    assert!(
-        heap.contains("pub fn pins_conservative_jit_roots"),
-        "`VmHeap::pins_conservative_jit_roots` is the shared predicate both \
-         sides ask; removing it re-opens the producer/consumer drift"
-    );
+}
+
+/// And the producer half, as a fact rather than an assertion of correctness:
+/// it records that all four publishers are G1-only, so a reader who finds this
+/// test red has been told what changed rather than left to diff four files.
+#[test]
+fn the_pin_producers_are_still_g1_only() {
+    let sites = [
+        ("vm/src/memory/roots.rs", "add_pinned_jit_root"),
+        (
+            "vm/src/runtime/interpreter/gc_and_alloc.rs",
+            "publish_pinned_jit_roots",
+        ),
+        ("vm/src/vm/vm_exec.rs", "publish_pinned_jit_roots"),
+    ];
+    for (file, call) in sites {
+        let src = read(file);
+        assert!(
+            src.contains(call),
+            "{file} no longer calls {call} — if the producer moved, move this \
+             witness with it"
+        );
+        assert!(
+            src.contains("is_g1()"),
+            "{file} publishes conservative JIT roots ({call}) and no longer gates \
+             on `is_g1()`. If ZGC now produces them too, that is a CHANGE OF \
+             POLICY, not a cleanup: read this file's header, then delete this \
+             test and restore the behavioural one it replaced."
+        );
+    }
 }

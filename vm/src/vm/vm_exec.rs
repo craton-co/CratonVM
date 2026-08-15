@@ -5758,23 +5758,22 @@ impl<'a> NativeContextImpl<'a> {
                 &self.shared.mem.heap,
                 &mut snapshot,
             );
-            // Pin-in-place, cross-thread half (same as the safepoint path
+            // G1 pin-in-place, cross-thread half (same as the safepoint path
             // in `update_root_snapshot`): the note above — "they can only
             // over-retain (the young sweep runs non-moving while any thread
             // is in JIT, so nothing is relocated)" — is GENERATIONAL-only.
-            // G1 and ZGC both relocate, so this blocked thread's conservative
-            // JIT roots must also PIN their regions/pages out of what the
-            // collector is about to move; the spill slots holding them cannot
-            // be rewritten. Replace semantics per thread; entry dropped at
-            // thread exit.
-            if self.shared.mem.heap.pins_conservative_jit_roots() {
+            // G1 always evacuates, so this blocked thread's conservative JIT
+            // roots must also PIN their regions out of the collection set;
+            // the spill slots holding them cannot be rewritten. Replace
+            // semantics per thread; entry dropped at thread exit.
+            if self.shared.mem.heap.is_g1() {
                 let addrs: Vec<usize> = snapshot[jit_scan_start..]
                     .iter()
                     .map(|r| r.as_ptr() as usize)
                     .collect();
                 cratonvm_gc::gc_quiescence::publish_pinned_jit_roots(&addrs);
             }
-        } else if self.shared.mem.heap.pins_conservative_jit_roots() {
+        } else if self.shared.mem.heap.is_g1() {
             cratonvm_gc::gc_quiescence::publish_pinned_jit_roots(&[]);
         }
         // Shadow-stack precise roots (mirrors the same fold in

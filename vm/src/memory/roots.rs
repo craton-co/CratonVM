@@ -786,21 +786,19 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
         crate::memory::native_roots::rootprof::note_scan_caller(0); // gc-roots
         crate::jit::conservative_roots::scan_active_jit_frames(&shared.mem.heap, &mut roots);
     }
-    // Pin-in-place for conservative JIT roots: the generational collector
+    // G1 pin-in-place for conservative JIT roots: the generational collector
     // protects a conservatively-scanned JIT root (a register/spill slot the
     // collector cannot rewrite) by running its NON-MOVING young sweep while any
-    // thread is in JIT, so nothing moves. G1 and ZGC both relocate, so they
-    // must instead PIN the regions/pages holding these roots — otherwise the
-    // object moves and the un-rewritable JIT-frame slot is left dangling (the
-    // SteadyChurn `-XX:+UseG1GC` + JIT wrong-result: the `live` list head, held
-    // only in a callee-saved register and its canonical frame slot, went stale
-    // after the young GC moved it; and, on ZGC,
-    // `probes/JitFrameRootRelocationProbe`s one-in-200 000 null `final` field).
-    // Publish each conservative JIT-frame root so the collector can pin it.
-    // Gated on `pins_conservative_jit_roots` — NOT on `is_g1()`, which is what
-    // left ZGC's own consumer reading an empty registry from `caf25c3d1` until
-    // 2026-08-15 — and on there actually being JIT roots this cycle.
-    if shared.mem.heap.pins_conservative_jit_roots() && roots.len() > jit_scan_start {
+    // thread is in JIT, so nothing moves. G1 always evacuates, so it must
+    // instead PIN the regions holding these roots (exclude them from the
+    // collection set) — otherwise it relocates the object and the un-rewritable
+    // JIT-frame slot is left dangling (the SteadyChurn `-XX:+UseG1GC` + JIT
+    // wrong-result: the `live` list head, held only in a callee-saved register
+    // and its canonical frame slot, went stale after the young GC moved it).
+    // Publish each conservative JIT-frame root so the G1 collector can pin its
+    // region. Gated on G1 (the generational path doesn't read this set) and on
+    // there actually being JIT roots this cycle.
+    if shared.mem.heap.is_g1() && roots.len() > jit_scan_start {
         for r in &roots[jit_scan_start..] {
             cratonvm_gc::gc_quiescence::add_pinned_jit_root(r.as_ptr() as usize);
         }
