@@ -204,6 +204,116 @@ pub fn verify_tls13_signature(
         .map(|_| HandshakeSignatureValid::assertion())
 }
 
+/// CratonVM addition — the peer's SubjectPublicKeyInfo, parsed WITHOUT
+/// webpki's v3-only rule.
+///
+/// Why this exists: `EndEntityCert::try_from` runs `version3()`, so a v1
+/// X.509 certificate cannot be parsed at all — not even to read its public
+/// key. That rule is a PATH-BUILDING policy, and webpki itself says so by
+/// exempting one position: `anchor_from_trusted_cert` catches
+/// `UnsupportedCertVersion` and re-parses with a v1-capable parser, on the
+/// reasoning that a v1 certificate carries no extensions and so no embedded
+/// name constraints to worry about.
+///
+/// Extracting a public key to check a handshake signature is the same kind of
+/// position. The JDK has no v1 restriction anywhere, and its `SSLEngine`
+/// completes handshakes against servers whose end-entity certificate is v1 —
+/// netty's own `mutual_auth_server.p12` / `localhost_server.pem` fixtures are
+/// exactly that, and every connection to them died here with
+/// `InvalidCertificate(Other(UnsupportedCertVersion))` even when the trust
+/// decision had been delegated to a Java `TrustManager` and no path building
+/// was being asked for at all.
+///
+/// This deliberately does NOT relax path building: `verify_server_cert` /
+/// `verify_client_cert` still refuse a v1 certificate in a CA position, which
+/// is correct under RFC 5280 (a v1 CA has no `basicConstraints`, so accepting
+/// one would let any leaf sign for any other) and is what netty's
+/// `mutual_auth_invalid_client.p12` fixture exists to exercise.
+fn spki_lenient(cert: &CertificateDer<'_>) -> Result<SubjectPublicKeyInfoDer<'static>, Error> {
+    match webpki::EndEntityCert::try_from(cert) {
+        Ok(parsed) => Ok(parsed.subject_public_key_info()),
+        Err(e) => match webpki::anchor_from_trusted_cert(cert) {
+            // `TrustAnchor::subject_public_key_info` is the VALUE of the
+            // `subjectPublicKeyInfo` field — webpki stores it without the outer
+            // SEQUENCE header — whereas `SubjectPublicKeyInfoDer` (and
+            // `RawPublicKeyEntity`, which parses it) wants the complete DER
+            // element. Re-wrap it, or the raw-key path fails with `BadEncoding`
+            // and the v1 tolerance buys nothing.
+            Ok(anchor) => Ok(SubjectPublicKeyInfoDer::from(der_sequence(
+                anchor.subject_public_key_info.as_ref(),
+            ))),
+            Err(_) => Err(pki_error(e)),
+        },
+    }
+}
+
+/// Wrap `value` in a DER `SEQUENCE` (tag 0x30) header.
+fn der_sequence(value: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(value.len() + 6);
+    out.push(0x30);
+    let len = value.len();
+    if len < 0x80 {
+        out.push(len as u8);
+    } else {
+        let bytes = len.to_be_bytes();
+        let first = bytes.iter().position(|b| *b != 0).unwrap_or(bytes.len() - 1);
+        let significant = &bytes[first..];
+        out.push(0x80 | significant.len() as u8);
+        out.extend_from_slice(significant);
+    }
+    out.extend_from_slice(value);
+    out
+}
+
+/// As [`verify_tls12_signature`], but tolerant of a v1 end-entity certificate.
+/// See [`spki_lenient`] for why that tolerance is correct here and nowhere
+/// else. A CratonVM addition.
+pub fn verify_tls12_signature_lenient(
+    message: &[u8],
+    cert: &CertificateDer<'_>,
+    dss: &DigitallySignedStruct,
+    supported_schemes: &WebPkiSupportedAlgorithms,
+) -> Result<HandshakeSignatureValid, Error> {
+    match verify_tls12_signature(message, cert, dss, supported_schemes) {
+        Err(Error::InvalidCertificate(_)) => {}
+        other => return other,
+    }
+    let spki = spki_lenient(cert)?;
+    let raw_key = webpki::RawPublicKeyEntity::try_from(&spki).map_err(pki_error)?;
+    let possible_algs = supported_schemes.convert_scheme(dss.scheme)?;
+    let mut error = None;
+    for alg in possible_algs {
+        match raw_key.verify_signature(*alg, message, dss.signature()) {
+            Err(err @ webpki::Error::UnsupportedSignatureAlgorithmForPublicKeyContext(_)) => {
+                error = Some(err);
+                continue;
+            }
+            Err(e) => return Err(pki_error(e)),
+            Ok(()) => return Ok(HandshakeSignatureValid::assertion()),
+        }
+    }
+    #[allow(deprecated)] // The `unwrap_or()` should be statically unreachable
+    Err(pki_error(error.unwrap_or(
+        webpki::Error::UnsupportedSignatureAlgorithmForPublicKey,
+    )))
+}
+
+/// As [`verify_tls13_signature`], but tolerant of a v1 end-entity certificate.
+/// See [`spki_lenient`]. A CratonVM addition.
+pub fn verify_tls13_signature_lenient(
+    msg: &[u8],
+    cert: &CertificateDer<'_>,
+    dss: &DigitallySignedStruct,
+    supported_schemes: &WebPkiSupportedAlgorithms,
+) -> Result<HandshakeSignatureValid, Error> {
+    match verify_tls13_signature(msg, cert, dss, supported_schemes) {
+        Err(Error::InvalidCertificate(_)) => {}
+        other => return other,
+    }
+    let spki = spki_lenient(cert)?;
+    verify_tls13_signature_with_raw_key(msg, &spki, dss, supported_schemes)
+}
+
 /// Verify a message signature using a raw public key and the first TLS 1.3 compatible
 /// supported scheme.
 pub fn verify_tls13_signature_with_raw_key(

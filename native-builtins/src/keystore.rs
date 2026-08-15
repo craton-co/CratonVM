@@ -3498,7 +3498,7 @@ fn read_byte_array(ctx: &mut dyn NativeContext, arr: ObjectRef) -> Vec<u8> {
 
 /// Invoke `getEncoded()[B` on `obj` and copy the result out. Empty vec when the
 /// call fails, returns null, or returns a zero-length array.
-fn read_encoded_byte_array(ctx: &mut dyn NativeContext, obj: ObjectRef) -> Vec<u8> {
+pub(crate) fn read_encoded_byte_array(ctx: &mut dyn NativeContext, obj: ObjectRef) -> Vec<u8> {
     match ctx.invoke_virtual(obj, "getEncoded", "()[B", &[]) {
         Ok(Some(Value::Object(Some(arr)))) => read_byte_array(ctx, arr),
         _ => Vec::new(),
@@ -3520,7 +3520,7 @@ fn read_encoded_byte_array(ctx: &mut dyn NativeContext, obj: ObjectRef) -> Vec<u
 /// The fallback is deliberately narrow — it fires only for objects whose exact
 /// class is the synthetic mirror — so it can never misread an unrelated field
 /// of a real `sun.security.x509.X509CertImpl`.
-fn certificate_der(ctx: &mut dyn NativeContext, cert: ObjectRef) -> Vec<u8> {
+pub(crate) fn certificate_der(ctx: &mut dyn NativeContext, cert: ObjectRef) -> Vec<u8> {
     let der = read_encoded_byte_array(ctx, cert);
     if !der.is_empty() {
         return der;

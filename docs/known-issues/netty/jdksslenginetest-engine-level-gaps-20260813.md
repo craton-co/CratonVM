@@ -1,7 +1,8 @@
 # netty `JdkSslEngineTest` — engine-level gaps, per cause
 
-**Status:** OPEN (2026-08-13). Successor to R6 of
-`tls-batch10-residuals-20260813.md`, which is retired to
+**Status:** OPEN, but 259 of the 307 failures this page opened with are closed
+(2026-08-15). Four causes remain, listed under "What is left". Successor to R6
+of `tls-batch10-residuals-20260813.md`, which is retired to
 [`docs/internal/fixed-suite-bugs/netty-tls-batch10-residuals-FIXED-20260813.md`][fixed].
 
 [fixed]: ../../internal/fixed-suite-bugs/netty-tls-batch10-residuals-FIXED-20260813.md
@@ -13,363 +14,112 @@ HotSpot 25 with the same jars on the same host.
 
 | | tests | ok | failed | aborted | wall |
 |---|---|---|---|---|---|
-| HotSpot 25 | 821 | 755 | **0** | 66 | 103 s |
-| CratonVM (`fcb509bda`) | 821 | 398 | 357 | 66 | 630 s |
-| CratonVM (V1 landed) | 821 | 448 | **307** | 66 | **516 s** |
+| HotSpot 25 | 821 | 755 | **0** | 66 | 98 s |
+| CratonVM (`fcb509bda`, 2026-08-13) | 821 | 398 | 357 | 66 | 630 s |
+| CratonVM (V1 landed, 2026-08-13) | 821 | 448 | 307 | 66 | 516 s |
+| CratonVM (`2cb9217e5` = dev, 2026-08-15) | 821 | — | — | — | **never finished** (killed at 2400 s) |
+| CratonVM (this page's work, 2026-08-15) | 821 | **707** | **48** | 66 | **342 s** |
 
-The 66 aborts are netty-tcnative being absent and are the same 66 HotSpot
-aborts. The wall-clock ratio is **6.2x**; re-derive it after fixing failures
-rather than before, because netty's engine tests fail by *waiting* (a latch that
-never counts down, an `@Timeout` that expires) — the previous round took 124
-failures off and 3.1x off the clock without touching a hot path.
+The 66 aborts are the same 66 HotSpot aborts (Conscrypt is not on the
+classpath, and `testMasterKeyLogging`'s assumption is false on both). The
+wall-clock ratio is **3.5x**, down from 6.2x.
+
+**Read the "never finished" row before re-running anything.** Between
+2026-08-13 and 2026-08-15 dev acquired a hang in this class: no output for
+~25 minutes while burning one CPU, killed at the harness cap. It is gone with
+the work below, but it is why the middle rows cannot simply be re-measured.
+JUnit's per-test timeout does not fire for it — `SameThreadTimeoutInvocation`
+can only check after the invocation returns — so a hung run produces no
+`@@TESTFAIL` at all. Run this class with a per-test `executionStarted`
+listener (`apps/netty-suite-runner/CratonRunner.java` plus an
+`@@START`/`@@END` trace) or a hang tells you nothing about where it is.
 
 ## How to read the count
 
 **The parameterisation axes explain nothing.** Every cause fires in all three
-buffer types, both protocols and both `delegate` values:
+buffer types, both protocols and both `delegate` values; the collapsing axis is
+the **test method**, each failing in all 12 (or 6) parameterisations. Bucket a
+run by the first `io.netty.handler.ssl` frame in each `@@TESTFAIL`'s trace.
 
-```
--- type                  -- protocolCipherCombo        -- delegate
-   88  Direct              136  TLSv1.3                   131  false
-   88  Heap                126  TLSv1.2                   131  true
-   86  Mixed
-```
+## What is left — 48 failures, four causes
 
-The collapsing axis is the **test method**: 357 failures are 22 method-level
-causes, each failing in all 12 (or 6) parameterisations of its method. Bucket a
-run with
-
-```bash
-python3 <<'PY'   # or see tb10-bucket2.py in the batch-10 session notes
-# group @@TESTFAIL entries by the first io.netty.handler.ssl frame in the trace
-PY
-```
-
-## Roadmap
-
-Ordered by what unblocks what, not by failure count. Each item says what it is
-waiting on, so nothing here starts before its premise is measured.
-
-| # | item | size | blocked on | worth |
-|---|---|---|---|---|
-| ~~V1~~ | ~~skip `keys_match` at the five identity-install sites~~ | S | — | **done 2026-08-13, 49 failures** |
-| ~~P1~~ | ~~does the JDK accept the invalid v1 chain?~~ | XS | — | **done 2026-08-13 — no. V2 refuted** |
-| V6 | OPTIONAL client auth must not abort on a chain that fails validation | M | — | 36 |
-| B1 | `getLocalCertificates()` must report what was SENT, not what was available | M | — | ~36 |
-| C | ALPN on the `SSLEngine` path | M | — | 24 |
-| D | "a handshake that should fail, succeeds" — one question behind five methods | L | — | ~60 |
-| E | TLS 1.2 session id shared between the two engines | M | — | 8 |
-| ~~V2~~ | ~~vendor `rustls-webpki`, relax the v1 rule~~ | — | — | **parked — premise refuted by P1** |
-| V5 | upstream a v1 policy knob to `rustls-webpki` | S to file | — | speculative; no measured cost today |
-
-### V6 — OPTIONAL client auth must not abort on an unvalidatable chain
-
-The 36 that survive V1. Both VMs reject
-`mutual_auth_invalid_client.p12`'s chain (P1, above); netty's test asserts the
-connection succeeds regardless, because the server is configured
-`ClientAuth.OPTIONAL`.
-
-rustls's `allow_unauthenticated()` permits the **absence** of a client
-certificate, not a **bad** one: a presented certificate is still verified and a
-verification failure is fatal. JSSE's `setWantClientAuth(true)` continues either
-way.
-
-Two candidate seams, and the first is worth measuring before building anything:
-
-1. **The JDK client may never send it.** `X509KeyManager.chooseClientAlias`
-   filters candidate identities against the server's `certificate_authorities`
-   hint; a client that cannot build an acceptable chain sends no certificate at
-   all, and then OPTIONAL trivially succeeds. If that is what HotSpot does, the
-   fix is client-side and small. *Measure:* does HotSpot's server see a client
-   certificate on that connection?
-2. **Otherwise, server-side:** when client auth is optional, a verification
-   failure must downgrade to "no client identity" instead of aborting. The
-   existing `PassthroughClientCertVerifier` (`t27_tls.rs:3381`) is the natural
-   place — it already exists for the case where trust is delegated to a Java
-   `TrustManager`, and it already has to answer this question.
-
-Whatever lands must keep the negative tests negative: `testMutualAuthClientCertFail`
-exists to see the chain rejected, and a change that makes both the "valid" and
-"invalid" fixtures succeed has broken the tests' meaning rather than fixed the
-VM.
-
-### ~~V2~~ — vendor `rustls-webpki`, relax the v1 rule (parked)
-
-**Parked 2026-08-13: P1 refuted the premise.** V2 existed because 72 failures
-looked like "webpki refuses v1 certificates that the JDK accepts". After V1
-removed the identity-install half, the surviving 36 turned out to be a chain the
-JDK rejects too. No measured case remains where webpki's v3 rule costs this VM
-something HotSpot allows.
-
-Kept written down rather than deleted, because the reasoning is what matters if
-a genuine case turns up later:
-
-* an end-entity-only relaxation is the safe shape — a v1 CA has no
-  `basicConstraints`, so accepting one lets any leaf sign for any other;
-* the certificate that actually failed here was an **intermediate**, so
-  end-entity-only would not have closed these 36 anyway — V2 would have had to
-  relax the CA position, which was already written down as *not recommended*;
-* webpki already exempts one position (`anchor_from_trusted_cert` re-parses v1
-  anchors), so any patch should follow that pattern — a separate parser entry
-  point — rather than loosening `version3` in place;
-* the cost is a second vendored crypto crate beside `rustls-cbc`, with the same
-  pin/record/re-base obligations. The diff would be small; the carrying cost is
-  not.
-
-**Re-open only on a measured case** where the JDK validates a chain and webpki
-rejects it for version alone.
-
-### V5 — upstream a v1 policy knob
-
-Speculative now that V2 is parked — there is no measured cost to point at, so
-this is worth filing only if a real case appears. Recorded because it is the
-one option that ends with nothing vendored.
-
-* **Shape to propose:** an opt-in policy enum in the existing style of
-  `UnknownExtensionPolicy` — e.g. `CertificateVersionPolicy::{V3Only, AllowV1EndEntity}`
-  on the verifier builder, defaulting to today's behaviour.
-* **Argument to make:** webpki already ships a v1 parser and already uses it for
-  trust anchors; the JDK, OpenSSL and Go all accept v1 certificates in at least
-  some positions; and consumers re-implementing a JVM's TLS surface need to
-  match the JDK, not RFC 5280's SHOULD.
-* **Relationship to V2:** V5 is what makes V2 unnecessary. If a case for V2
-  ever appears, file V5 first so the fork has a documented exit from the day it
-  is created.
-
-
-## The causes
-
-### A. v1 X.509 end-entity certificates — 72 failures
-
-```
-java.io.IOException: with_client_auth_cert failed: invalid peer certificate:
-    Other(OtherError(UnsupportedCertVersion))
-java.io.IOException: ServerConfig with_single_cert failed: …    (same cause, server side)
-```
-
-* 36 `SSLEngineTest.rethrowIfNotNull` (via `testMutualAuthInvalidClientCertSucceed`)
-* 24 `SSLEngineTest.testMutualAuthClientCertFail`
-* 12 `SSLEngineTest.testClientHostnameValidationFail`
-
-#### What is actually v1
-
-Every **end-entity** certificate in these fixtures; the anchor is not.
-
-| fixture | leaf | intermediate | root (anchor) |
+| n | method | symptom | what it needs |
 |---|---|---|---|
-| `mutual_auth_client.p12` | **v1** `CN=NettyTestClient` | v3 `NettyTestIntermediate` | v3 `NettyTestRoot` |
-| `mutual_auth_invalid_client.p12` | **v1** `CN=NettyTestInvalidClient` | **v1** `NettyTestInvalidIntermediate` | v3 `NettyTestRoot` |
-| `mutual_auth_server.p12` | **v1** `CN=NettyTestServer` | — | v3 `NettyTestRoot` |
-| `localhost_server.pem` | **v1** `CN=localhost` | — | v3 `NettyTestRoot` |
+| 12 | `testRSASSAPSS` (via `rethrowIfNotNull`) | `TrustManager rejected the peer certificate chain: signature verification failed at index 0 (cryptographic)` | RSASSA-PSS certificate signatures now DISPATCH (see below) but do not verify. The salt length or the digest is not what `crypto_impl::rsa_verify_pss` assumes (it fixes `slen == hlen` and tries SHA-256/384/512 in turn). Parse `RSASSA-PSS-params` off the certificate's `signatureAlgorithm` instead of guessing — `ParsedCert` keeps only the OID today. |
+| 12 | `testMutualAuthDiffCerts` (via `writeAndVerifyReceived`) | `Received fatal alert: CertificateUnknown`, then no message received | Same root cause: `test.crt`/`test2.crt` are PSS-signed. |
+| 12 | `testClientHostnameValidationFail` | `IllegalStateException: handshake complete. expected failure` | Client endpoint identification does not fire on this path. The engine is created through `newHandler(alloc, "localhost", 0)` and the algorithm is set with `SSLParameters.setEndpointIdentificationAlgorithm("HTTPS")`; the sibling `testUsingX509TrustManagerVerifies*Hostname` DOES fire the check, so the difference is in how this one reaches `EngineState.endpoint_id_alg`/`peer_host`. Trace both with `CRATONVM_DBG_TLS_AUTH=1` before designing anything. |
+| 12 | `doHandshakeVerifyReusedAndClose` | `expected: <true> but was: <null>` | TLS session RESUMPTION with a live `SSLSessionContext` cache — the test puts a value on the session, reconnects, and expects to read it back off the reused session. rustls can resume; nothing on this VM currently maps a resumed connection back to the previous `SSLSession` object. This is a feature, not a defect: size it as one. |
 
-The v1 *intermediate* in `mutual_auth_invalid_client.p12` is deliberate — it is
-what makes that fixture "invalid", and the test asserts the connection succeeds
-anyway because client auth is OPTIONAL. **Do not make that chain validate.** A
-v1 CA has no `basicConstraints`, so refusing it is correct under RFC 5280 and
-is what the fixture exists to exercise.
+## What was fixed, and what each fix actually was
 
-#### There are two gates, and only the first one has been measured
+Every item below was measured on this class against HotSpot 25 with the same
+jars, and re-measured after landing.
 
-**Gate 1 — installing your OWN identity.** This is where all 72 die, and it
-involves no trust decision at all. `ClientConfig::with_client_auth_cert` /
-`ServerConfig::with_single_cert` call `CertifiedKey::from_der`, which calls
-`keys_match()`:
-
-```rust
-// rustls-cbc/src/crypto/signer.rs
-pub fn from_der(…) -> Result<Self, Error> {
-    let private_key = provider.key_provider.load_private_key(key)?;
-    let certified_key = Self::new(cert_chain, private_key);
-    match certified_key.keys_match() {
-        // Don't treat unknown consistency as an error
-        Ok(()) | Err(Error::InconsistentKeys(InconsistentKeys::Unknown)) => Ok(certified_key),
-        Err(err) => Err(err),
-    }
-}
-
-pub fn keys_match(&self) -> Result<(), Error> {
-    let Some(key_spki) = self.key.public_key() else {
-        return Err(InconsistentKeys::Unknown.into());
-    };
-    let cert = ParsedCertificate::try_from(self.end_entity_cert()?)?;   // <- webpki
-    match key_spki == cert.subject_public_key_info() { … }
-}
-```
-
-`ParsedCertificate::try_from` is webpki's `Cert::from_der`, which calls
-`version3()` (`rustls-webpki-0.103.12/src/cert.rs:257`). A v1 cert makes the
-**SPKI extraction** fail, and that failure escapes as
-`InvalidCertificate(Other(UnsupportedCertVersion))` instead of being folded into
-the `InconsistentKeys::Unknown` arm the surrounding code already tolerates.
-
-So: rustls will not let this VM **present** a v1 certificate as its own
-identity, because a best-effort self-consistency check cannot parse it. JSSE
-has no such restriction.
-
-**Gate 2 — verifying the PEER's chain.** webpki's path building parses every
-certificate through the same `Cert::from_der`, so a v1 leaf would be rejected
-there too. **This is currently unmeasured — gate 1 masks it.** Whether gate 2
-bites at all is the first thing to establish, because it decides whether any of
-the vendoring options below are needed.
-
-Note webpki already exempts one position: `anchor_from_trusted_cert` catches
-`UnsupportedCertVersion` and re-parses with a v1-only parser, with the reasoning
-that a v1 cert "doesn't allow extensions, so there's no need to worry about
-embedded name constraints". The v3-only rule is a path-building policy, not a
-parser limitation.
-
-#### V1 — landed 2026-08-13, and it answered the gate-2 question
-
-The five identity-install sites now build their `CertifiedKey` with
-`CertifiedKey::new` and hand it to `with_cert_resolver` /
-`with_client_cert_resolver`, which is exactly what `with_single_cert` /
-`with_client_auth_cert` do minus the `keys_match` call:
-
-```rust
-// rustls-cbc/src/server/builder.rs — what with_single_cert IS
-let certified_key = CertifiedKey::from_der(cert_chain, key_der, self.crypto_provider())?;
-Ok(self.with_cert_resolver(Arc::new(SingleCertAndKey::from(certified_key))))
-```
-
-No vendoring, all public API, and `SniCertResolver::certified_key_from_pem` —
-which had always done it this way — now routes through the same helper, so
-there is one way to build an identity instead of two.
-
-**Result: 356 → 307 failures, 630 s → 516 s.** Cleared outright:
-
-| n | method | was |
-|---|---|---|
-| 24 | `testMutualAuthClientCertFail` | `with_client_auth_cert failed: … UnsupportedCertVersion` |
-| 12 | `testClientHostnameValidationFail` | `ServerConfig with_single_cert failed: …` |
-| 12 | `testMutualAuthDiffCertsClientFailure` | (not previously attributed to group A) |
-
-The eight other classes on the parent page were re-run against the same build
-and are unchanged, all at or above the oracle.
-
-#### What gate 2 turned out to be
-
-36 failures survive, and they have changed shape — this is the answer V1 was
-run to get:
-
-```
-before V1:  java.io.IOException: with_client_auth_cert failed: invalid peer certificate:
-                Other(OtherError(UnsupportedCertVersion))            <- config-build time
-after V1:   javax.net.ssl.SSLHandshakeException: rustls: invalid peer certificate:
-                Other(OtherError(UnsupportedCertVersion))            <- handshake time
-```
-
-So gate 2 is real. But the 36 are all one call path —
-`testMutualAuthInvalidIntermediateCASucceedWithOptionalClientAuth` →
-`testMutualAuthInvalidClientCertSucceed` — which uses
-`mutual_auth_invalid_client.p12`, the fixture whose **intermediate** is v1, with
-`ClientAuth.OPTIONAL`. The test asserts the connection **succeeds anyway**.
-
-That admitted two explanations, and P1 settled it.
-
-#### P1 — the JDK rejects that chain too (measured 2026-08-13)
-
-Ran the JDK's own validators over `mutual_auth_invalid_client.p12`'s chain
-against `mutual_auth_ca.pem`, no networking involved:
-
-```
-chain length = 3
-  v1  UID=ClientWithInvalidCa, CN=NettyTestInvalidClient   issuer=CN=NettyTestInvalidIntermediate
-  v1  CN=NettyTestInvalidIntermediate                      issuer=CN=NettyTestRoot
-  v3  CN=NettyTestRoot                                     issuer=CN=NettyTestRoot
-anchor  = v3  CN=NettyTestRoot
-
-PKIX:    REJECTED -> PKIX path validation failed: basic constraints check failed:
-                     this is not a CA certificate
-SunX509: REJECTED -> End user tried to act as a CA
-```
-
-**So webpki is not stricter than the JDK here — both refuse the chain**, and for
-the same reason: a v1 certificate carries no `basicConstraints`, so it cannot be
-a CA. The certificate version is incidental; `UnsupportedCertVersion` and
-"this is not a CA certificate" are two spellings of one verdict.
-
-**V2's premise is refuted for the fixture that motivated it.** The difference
-that remains is entirely about what happens *after* the rejection: netty asserts
-the connection succeeds anyway, because client auth is `OPTIONAL`. On HotSpot
-nothing valid is ever presented and the server proceeds without a client
-identity; on CratonVM the rejection aborts the handshake.
-
-That is item **V6**, it is CratonVM-side, and it needs no vendoring.
-
-
-### B. client-side mTLS material never reaches the session — 84 failures
-
-* 48 `SSLEngineTest.testSessionAfterHandshake0` (36 `SSLPeerUnverifiedException:
-  peer not authenticated`, 12 `getLocalCertificates()` non-null)
-* 24 `SSLEngineTest.testSessionLocalWhenNonMutual` — `expected: <null> but was: <[[…]]>`
-* 12 `SSLEngineTest.verifySSLSessionForMutualAuth` — `SSLPeerUnverifiedException`
-
-Two halves:
-
-**B1. `getLocalCertificates()` reports what was *available*, not what was
-*sent*.** `t27_tls`'s session builder records the chain whenever the engine has
-an `identity_override`. A client with a `KeyManager` configured against a server
-using `ClientAuth.NONE` never sends a certificate, and JSSE returns null there.
-`testSessionLocalWhenNonMutual` sets up exactly that. The fix needs a "did this
-side actually present a certificate" signal; rustls does not expose one on
-`ClientConnection`, so the likely seam is CratonVM's own `ResolvesClientCert`
-(`JavaKeyManagerResolver`) recording whether it was consulted and returned
-`Some` — but that only covers the KeyManager path, not the
-`client_identity` (cert_pem/key_pem) path, which needs its own.
-
-**B2. the server side does not capture the client's chain** when one *is* sent,
-so `serverSession.getPeerCertificates()` throws. Note these are the same
-fixtures as (A), so (A) must be closed before B2 can be measured at all.
-
-### C. ALPN does not negotiate on the engine path — 24 failures
-
-24 `SSLEngineTest.verifyApplicationLevelProtocol` —
-`expected: <my-protocol-http2> but was: <null>`.
-
-`ApplicationProtocolNegotiationHandlerTest` and `SniHandlerTest`'s ALPN cases
-pass, so the wiring works somewhere; what fails is `SSLEngine`-level ALPN in
-this harness. Start by checking whether `setApplicationProtocols` /
-`SSLParameters.setApplicationProtocols` reaches `EngineState.alpn_protocols`
-on the path these tests use, and whether the negotiated value is read back
-through `getApplicationProtocol()` or through the session.
-
-### D. engine semantics — 116 failures
-
-Each is its own small contract, and each is 12 (one per parameterisation):
-
-| n | method | symptom |
-|---|---|---|
-| 12 | `testProtocol` | expected `SSLHandshakeException`, nothing thrown — a protocol mismatch still handshakes |
-| 12 | `testTlsExtensionNoCompatibleProtocolsClientHandshakeFailure` | `expected: <true> but was: <false>` |
-| 12 | `testTlsExtensionNoCompatibleProtocolsServerHandshakeFailure` | as above |
-| 12 | `testMutualAuthDiffCertsClientFailure` | `expected: <true> but was: <false>` |
-| 12 | `testMutualAuthDiffCertsServerFailure` | as above |
-| 12 | `testCloseNotifySequence` | `expected: <false> but was: <true>` |
-| 12 | `testCloseInboundAfterBeginHandshake` | bare assertion failure |
-| 12 | `testBeginHandshakeAfterEngineClosed` | bare assertion failure |
-| 12 | `writeAndVerifyReceived` | `expected: <false> but was: <true>` |
-| 12 | `testUnwrapBehavior` | byte accounting — `expected: <69> but was: <35>`, `<55>`/`<28>` |
-| 12 | `doHandshakeVerifyReusedAndClose` | `expected: <true> but was: <null>` — session reuse |
-| 12 | `SslHandler.channelInactive` | `StacklessClosedChannelException` |
-| 12 | `handshake` (helper) | 12 endpoint-identification, 12 local-certificates (see B) |
-
-Five of these are "a handshake that should fail, succeeds", which is one
-question, not five: **which negotiation mismatches does this engine fail to
-reject?** Answer that once and it is likely worth 60.
-
-### E. session-id identity — 8 failures
-
-`testSSLSessionId` asserts that after a TLS 1.2 handshake the client's and
-server's `getId()` are byte-identical, and that under TLS 1.3 they differ.
-CratonVM derives a pseudo-id from the session object's identity, so two engines
-never agree. rustls exposes no session id; the ServerHello's `session_id` field
-is on the wire and could be captured the same way R7's ClientHello SNI now is —
-TLS 1.2 only, since under TLS 1.3 the legacy field is echoed and the test wants
-the two sides to *differ*.
-
-### F. one-offs — 1 failure
-
-`testInvalidCipher`, bare assertion failure. Not yet triaged.
+* **v1 end-entity certificates in the SIGNATURE-VERIFICATION path (was cause A's
+  "gate 2", 36).** The 2026-08-13 page concluded gate 2 was path building and
+  that V2's premise was refuted. Both halves were wrong. The failure is
+  `webpki::EndEntityCert::try_from` inside `rustls::crypto::verify_tls12_signature`
+  / `verify_tls13_signature`, which runs `version3()` and so cannot even read a
+  v1 certificate's public key — reached *even when the trust decision has been
+  delegated to a Java `TrustManager` and no path building is being asked for*.
+  `rustls-cbc` gained `verify_tls{12,13}_signature_lenient`, which fall back to
+  `anchor_from_trusted_cert` (webpki's own v1-capable parser, already exempted
+  for anchors) to get the SPKI and verify against the raw key. Path building is
+  untouched: a v1 certificate in a CA position is still refused.
+* **Server-side ALPN selection (cause C, 24, plus 24 more in cause D).**
+  `SSLEngineImpl.setHandshakeApplicationProtocolSelector` was inert, and netty
+  configures a SERVER engine's ALPN through nothing else — so a server
+  advertised no protocols at all and ALPN negotiated to null on both sides.
+  The selector is now stored, the ClientHello's ALPN list is parsed in
+  `do_unwrap` before `engine_begin` (the server's rustls connection is held
+  back until then), the Java `BiFunction` is applied, and its answer becomes the
+  advertised list. `null` from the selector fails the handshake with
+  `no_application_protocol`, which is what
+  `testTlsExtensionNoCompatibleProtocolsServerHandshakeFailure` asserts.
+* **`getLocalCertificates()` reports what was SENT (cause B1, 24 + 12).** A
+  recording `ResolvesClientCert` wrapper records whether rustls actually asked
+  for and got a client certificate; a client that had a `KeyManager` but was
+  never asked now answers null.
+* **The server's view of the client chain (cause B2, 48 + 12).** A registered
+  Java `TrustManager[]` is now the authority for the CLIENT chain too, not only
+  for the server chain — webpki refuses netty's self-signed `CA:true` test
+  certificates in an end-entity position (`CaUsedAsEndEntity`) where JSSE
+  accepts them. Trust is unchanged in force: `engine_run_trust_check` still
+  runs `checkClientTrusted` and still aborts with a fatal alert.
+* **`getPeerPrincipal()` on an engine session.** It only ever consulted the
+  native-socket peer chain, so a completed mutual-auth handshake answered
+  `getPeerCertificates()` with a chain and `getPeerPrincipal()` with
+  `SSLPeerUnverifiedException` in the same breath.
+* **A v1 INTERMEDIATE is not a CA.** `validate_chain`'s BasicConstraints step
+  exempted v1 certificates entirely; the exemption belongs to a self-signed
+  ROOT. This is what makes `mutual_auth_invalid_client.p12` invalid, and both
+  `testMutualAuthInvalidIntermediateCAFailWith*ClientAuth` assert the refusal.
+* **`isOutboundDone()`/`isInboundDone()`** now mean "the close_notify has been
+  sent" and "no more inbound will be accepted (including: the peer closed)",
+  not "the setter was called" (`testCloseNotifySequence`).
+* **`closeInbound()` throws mid-handshake**, `beginHandshake()` throws on a
+  closed engine (`testCloseInboundAfterBeginHandshake`,
+  `testBeginHandshakeAfterEngineClosed`).
+* **`unwrap` is one application record per call**, and refuses a record whose
+  plaintext cannot fit the destination WITHOUT consuming it — BUFFER_OVERFLOW,
+  src untouched (`testUnwrapBehavior`).
+* **A protocol restriction naming only versions this stack cannot negotiate is
+  a handshake failure**, not an invitation to widen (`testProtocolNoMatch`).
+* **`setEnabledCipherSuites` validates its argument** and throws
+  `IllegalArgumentException` for a non-cipher-suite name (`testInvalidCipher`,
+  and `SslContextBuilderTest.testInvalidCipherJdk` on the other page).
+* **A cipher restriction is a LIST, not a set** — the caller's order is the
+  order the ClientHello offers, and rustls honours client preference
+  (`verifySSLSessionForMutualAuth` asserted the suite it configured).
+* **TLS 1.2 session ids are the real ones.** The ServerHello's
+  `legacy_session_id` is captured on both sides, so `getId()` agrees
+  (`testSSLSessionId`); TLS 1.3 keeps the per-object pseudo-id, which the same
+  test requires to DIFFER.
+* **`SSLParameters.setServerNames`** now reaches the engine, so a client that
+  dials an IP and declares an SNI name verifies the certificate against the
+  name (`testUsingX509TrustManagerVerifiesSNIHostname`).
+* **A client-side `checkServerTrusted` sees no local certificate**, because
+  JSSE has not sent one yet at that point in the handshake.
 
 ## Repro
 
@@ -379,6 +129,7 @@ CRATONVM_DISABLE_DEFAULT_WATCHDOG=1 <cv-bin> --java-home "$JAVA_HOME" --Xmx 1500
     @common.args -Dcraton.batch=1 CratonRunner io.netty.handler.ssl.JdkSslEngineTest
 ```
 
-Give it at least 1200 s. The runner prints nothing until the class ends, so a
-silent process is not a hung one — check `/proc/<pid>/status` and `utime` before
-concluding otherwise.
+`common.args` MUST carry `netty-tcnative-boringssl-static-<ver>-<os>.jar` in
+place of the dynamic `netty-tcnative` the Maven reactor resolves — see the
+sibling page's Repro for why, and for what a run without it silently measures.
+Give it at least 600 s.

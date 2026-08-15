@@ -1870,6 +1870,21 @@ pub(crate) fn kmf_keystore_id_by_identity(
     T.get_or_init(|| parking_lot::Mutex::new(rustc_hash::FxHashMap::default()))
 }
 
+/// Sibling of `kmf_keystore_id_by_identity` for the case where the `KeyStore`
+/// handed to `init` is NOT one of this VM's own: the `KeyManagerState` was
+/// built by enumerating that store live, so what is recorded here is an
+/// `x509_manager::km_registry` id, not a keystore id.
+///
+/// Deliberately a SEPARATE map rather than a sentinel value in the one above:
+/// two independent id spaces sharing one integer slot is the exact shape that
+/// produced the `KEY_VALUES_MISMATCH` family this page's section A was about —
+/// right only while the two counters happened to be aligned.
+fn kmf_live_km_id_by_identity() -> &'static parking_lot::Mutex<rustc_hash::FxHashMap<i32, i32>> {
+    static T: std::sync::OnceLock<parking_lot::Mutex<rustc_hash::FxHashMap<i32, i32>>> =
+        std::sync::OnceLock::new();
+    T.get_or_init(|| parking_lot::Mutex::new(rustc_hash::FxHashMap::default()))
+}
+
 /// FIX (tomcat-clientauth-engine-config): same pattern as
 /// `kmf_keystore_id_by_identity` immediately above, for
 /// `javax/net/ssl/TrustManagerFactory` — maps the TMF object to the
@@ -4263,6 +4278,9 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
             // no-mTLS client session), so the original client behaviour is
             // unchanged.
             let this = obj_arg(args, 0)?;
+            if crate::t27_tls::in_client_trust_check() {
+                return Ok(Some(Value::Object(None)));
+            }
             let chain = crate::t27_tls::local_certs_for_session(ctx, this);
             let Some(leaf) = chain.first() else {
                 return Ok(Some(Value::Object(None)));
@@ -4293,6 +4311,11 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
             // for where the chain is actually populated (client sessions with no
             // configured identity correctly still get an empty chain here).
             let this = obj_arg(args, 0)?;
+            // Inside a client-side `checkServerTrusted`, JSSE has not yet sent
+            // the client's own certificate — see `in_client_trust_check`.
+            if crate::t27_tls::in_client_trust_check() {
+                return Ok(Some(Value::Object(None)));
+            }
             let chain = crate::t27_tls::local_certs_for_session(ctx, this);
             if chain.is_empty() {
                 return Ok(Some(Value::Object(None)));
@@ -4316,11 +4339,20 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
             } else {
                 -1
             };
-            let chain = if tls_id >= 0 {
+            let mut chain = if tls_id >= 0 {
                 crate::servlet::s2_tls_peer_cert_chain_der(tls_id).unwrap_or_default()
             } else {
                 Vec::new()
             };
+            if chain.is_empty() {
+                // …and for an `SSLEngine` session the chain lives in
+                // `t27_tls`'s session table, not behind a `tls_id`. Without
+                // this, a completed mutual-auth handshake answered
+                // `getPeerCertificates()` with a chain and `getPeerPrincipal()`
+                // with `SSLPeerUnverifiedException` in the same breath —
+                // `SSLEngineTest.verifySSLSessionForMutualAuth` asserts both.
+                chain = crate::t27_tls::peer_certs_for_session(ctx, this);
+            }
             let Some(leaf) = chain.first() else {
                 // FIX (tomcatservletwebserverfactorytests-ssl-clientauth-peercert-residuals):
                 // same wrong-exception-type bug as getPeerCertificates just
@@ -4786,6 +4818,40 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
                 &key_password,
             );
             let ks_id = crate::keystore::keystore_id_from_object(ctx, *ks);
+            if ks_id == 0 {
+                // A `KeyStore` this VM has no native record of — an application's
+                // own `KeyStore` subclass over its own `KeyStoreSpi`. netty's
+                // `OpenSslX509KeyManagerFactory.newKeyless` is exactly that, and
+                // it reaches THIS shim because netty's own factory SPI builds a
+                // default `KeyManagerFactory` and inits it with that store.
+                // Enumerating the store through its own bytecode is the only way
+                // to serve it; see
+                // `x509_manager::build_key_manager_state_from_live_keystore` for
+                // what the previous bare-interface fallback cost.
+                let this = obj_arg(args, 0)?;
+                let ih = ctx.identity_hash_code(this);
+                let pw_obj = match args.get(2) {
+                    Some(Value::Object(Some(p))) => Some(*p),
+                    _ => None,
+                };
+                if ih != 0 {
+                    let state = crate::x509_manager::build_key_manager_state_from_live_keystore(
+                        ctx, *ks, pw_obj,
+                    );
+                    if crate::nbflags().dbg_tls_auth {
+                        eprintln!(
+                            "[dbg-tls-auth] kmf(phases_late).init(live KeyStore) this_ih={} aliases={}",
+                            ih,
+                            state.aliases_to_chain.len()
+                        );
+                    }
+                    if !state.aliases_to_chain.is_empty() {
+                        let km_id = crate::x509_manager::next_km_id();
+                        crate::x509_manager::km_registry().write().insert(km_id, state);
+                        kmf_live_km_id_by_identity().lock().insert(ih, km_id);
+                    }
+                }
+            }
             if ks_id != 0 {
                 let this = obj_arg(args, 0)?;
                 // `set_field_by_name` would silently no-op here: this KMF
@@ -4950,8 +5016,40 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
                 let km = try_alloc_concurrent_synthetic(ctx, mirror, 2)?;
                 crate::x509_manager::set_km_id(ctx, km, km_id);
                 km
+            } else if let Some(km_id) = kmf_live_km_id_by_identity().lock().get(&ih).copied() {
+                // A caller's own `KeyStore`, already enumerated at `init` time.
+                // Same mirror class and the same `km_registry` id space as the
+                // branch above, so `getCertificateChain`/`getPrivateKey` are the
+                // real natives rather than abstract interface methods.
+                let algorithm = if ctx.object_num_fields(this) > 2 {
+                    match ctx.get_field(this, 2) {
+                        Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
+                        _ => String::new(),
+                    }
+                } else {
+                    String::new()
+                };
+                let mirror = crate::x509_manager::km_mirror_class_for_algorithm(&algorithm);
+                let km = try_alloc_concurrent_synthetic(ctx, mirror, 2)?;
+                crate::x509_manager::set_km_id(ctx, km, km_id);
+                km
             } else {
-                try_alloc_concurrent_synthetic(ctx, "javax/net/ssl/X509KeyManager", 0)?
+                // Nothing was ever `init`-ed with a usable store. Still answer
+                // with the natively-backed mirror rather than a bare-interface
+                // object: an EMPTY registry entry makes `getCertificateChain`
+                // return null, which is a contract-legal answer, where
+                // `AbstractMethodError` is not.
+                let km_id = crate::x509_manager::next_km_id();
+                crate::x509_manager::km_registry()
+                    .write()
+                    .insert(km_id, Default::default());
+                let km = try_alloc_concurrent_synthetic(
+                    ctx,
+                    crate::x509_manager::km_mirror_class_for_algorithm(""),
+                    2,
+                )?;
+                crate::x509_manager::set_km_id(ctx, km, km_id);
+                km
             };
             let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 1);
             ctx.set_array_element(arr, 0, Value::Object(Some(km)));

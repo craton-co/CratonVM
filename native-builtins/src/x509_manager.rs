@@ -135,6 +135,52 @@ pub struct KeyManagerState {
     pub server_aliases_by_key_type: HashMap<String, Vec<String>>,
     /// keyType -> aliases eligible as a *client* cert.
     pub client_aliases_by_key_type: HashMap<String, Vec<String>>,
+    /// alias -> the LIVE Java `PrivateKey` object this manager must hand back,
+    /// for a key that has no PKCS#8 encoding of its own.
+    ///
+    /// `aliases_to_key` stores key BYTES, which is enough for every key whose
+    /// `getEncoded()` answers. An *opaque* key — a PKCS#11/HSM key, or netty's
+    /// `OpenSslPrivateKey` and `OpenSslPrivateKeyMethod` delegating keys, whose
+    /// whole point is that the private material never leaves its provider —
+    /// answers `null` there, and reconstructing one from bytes is not merely
+    /// lossy but impossible. The caller needs THAT object back:
+    /// `OpenSslKeyMaterialProvider.chooseKeyMaterial` branches on
+    /// `key instanceof OpenSslPrivateKey` to decide whether to hand the key to
+    /// OpenSSL by reference or to PEM-encode it.
+    ///
+    /// Holds live `ObjectRef`s, so `km_registry` is scanned and remapped by
+    /// [`gc_scan_key_manager_roots`] / [`gc_update_key_manager_refs`].
+    pub aliases_to_live_key: HashMap<String, ObjectRef>,
+}
+
+/// GC root scan for the live `PrivateKey` objects a `KeyManagerState` holds —
+/// see [`KeyManagerState::aliases_to_live_key`].
+pub fn gc_scan_key_manager_roots(roots: &mut Vec<ObjectRef>) {
+    for state in km_registry().read().values() {
+        for k in state.aliases_to_live_key.values() {
+            if !k.as_ptr().is_null() {
+                roots.push(*k);
+            }
+        }
+    }
+}
+
+/// Post-move remap companion to [`gc_scan_key_manager_roots`].
+pub fn gc_update_key_manager_refs(map: &cratonvm_types::PointerMap) {
+    if map.is_empty() {
+        return;
+    }
+    for state in km_registry().write().values_mut() {
+        for k in state.aliases_to_live_key.values_mut() {
+            let old = k.as_ptr() as usize;
+            if let Some(&new) = map.get(&old) {
+                debug_assert!(new != 0, "GC pointer map contains null address");
+                // SAFETY: `new` is a live, 8-byte-aligned heap address produced
+                // by the moving collector for the object previously at `old`.
+                *k = unsafe { ObjectRef::from_raw(new as *mut u8) };
+            }
+        }
+    }
 }
 
 /// Trust-manager state. A null/default `TrustManagerFactory.init` state is
@@ -1228,6 +1274,173 @@ pub fn build_key_manager_state(keystore_id: i32) -> KeyManagerState {
     state
 }
 
+/// Build a `KeyManagerState` by ENUMERATING a live Java `KeyStore` object
+/// through its own bytecode, instead of reading this crate's native keystore
+/// registry.
+///
+/// Why a second path exists: `build_key_manager_state` can only see stores
+/// CratonVM itself created, and an application is free to hand
+/// `KeyManagerFactory.init` a `KeyStore` of its own — netty's
+/// `OpenSslX509KeyManagerFactory.newKeyless` does exactly that, with a private
+/// `KeyStore` subclass over a hand-written `KeyStoreSpi` whose entries are
+/// keyless certificate chains. `keystore_id_from_object` answers 0 for such a
+/// store, and the `getKeyManagers()` fallback for that case used to be an
+/// object stamped with the bare `javax/net/ssl/X509KeyManager` INTERFACE id,
+/// every method of which is abstract: netty's
+/// `OpenSslKeyMaterialProvider.chooseKeyMaterial` called
+/// `getCertificateChain(alias)` on it and died with `AbstractMethodError`,
+/// taking out all 27 of `JdkDelegatingPrivateKeyMethodTest` and all 24 of
+/// `OpenSslPrivateKeyMethodTest`.
+///
+/// Enumerating the store through `aliases()` / `getCertificateChain()` /
+/// `getKey()` is what the real `SunX509KeyManagerImpl` constructor does, and it
+/// works for ANY `KeyStore` implementation rather than only for the shapes this
+/// VM knows how to build natively.
+///
+/// The private key is kept BY REFERENCE as well as by bytes — see
+/// [`KeyManagerState::aliases_to_live_key`] for why bytes alone cannot serve an
+/// opaque key.
+pub(crate) fn build_key_manager_state_from_live_keystore(
+    ctx: &mut dyn NativeContext,
+    ks: ObjectRef,
+    password: Option<ObjectRef>,
+) -> KeyManagerState {
+    let mut state = KeyManagerState::default();
+    let base = ctx.pin_native_root(ks);
+    let pw_pin = password.map(|p| ctx.pin_native_root(p));
+
+    // 1. aliases() — bounded, so a misbehaving Enumeration cannot wedge init.
+    let mut aliases: Vec<String> = Vec::new();
+    let ks_now = ctx.read_native_pin(base, ks);
+    if let Ok(Some(Value::Object(Some(en)))) =
+        ctx.invoke_virtual(ks_now, "aliases", "()Ljava/util/Enumeration;", &[])
+    {
+        let en_pin = ctx.pin_native_root(en);
+        for _ in 0..4096 {
+            let en_now = ctx.read_native_pin(en_pin, en);
+            match ctx.invoke_virtual(en_now, "hasMoreElements", "()Z", &[]) {
+                Ok(Some(Value::Int(1))) => {}
+                _ => break,
+            }
+            let en_now = ctx.read_native_pin(en_pin, en);
+            match ctx.invoke_virtual(en_now, "nextElement", "()Ljava/lang/Object;", &[]) {
+                Ok(Some(Value::Object(Some(s)))) => match ctx.read_string(s) {
+                    Some(a) => aliases.push(a),
+                    None => break,
+                },
+                _ => break,
+            }
+        }
+    }
+
+    // 2. Per alias: the chain (DER) and the key (bytes AND reference).
+    struct Candidate {
+        alias: String,
+        key_type: String,
+        is_server: bool,
+        is_client: bool,
+    }
+    let mut candidates: Vec<Candidate> = Vec::new();
+    let mut live_pins: Vec<(String, usize, ObjectRef)> = Vec::new();
+    for alias in &aliases {
+        let a_str = ctx.create_string(alias);
+        let ks_now = ctx.read_native_pin(base, ks);
+        let chain: Vec<Vec<u8>> = match ctx.invoke_virtual(
+            ks_now,
+            "getCertificateChain",
+            "(Ljava/lang/String;)[Ljava/security/cert/Certificate;",
+            &[Value::Object(Some(a_str))],
+        ) {
+            Ok(Some(Value::Object(Some(arr)))) => {
+                let n = ctx.array_length(arr);
+                let mut v = Vec::with_capacity(n);
+                for i in 0..n {
+                    if let Value::Object(Some(c)) = ctx.get_array_element(arr, i) {
+                        let der = crate::keystore::certificate_der(ctx, c);
+                        if !der.is_empty() {
+                            v.push(der);
+                        }
+                    }
+                }
+                v
+            }
+            _ => Vec::new(),
+        };
+        if chain.is_empty() {
+            continue;
+        }
+        let leaf = match parse_certificate(&chain[0]) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+        let key_type = classify_key_type(&leaf.spki_algorithm_oid).to_string();
+        let is_server = is_server_cert(&leaf);
+        let is_client = is_client_cert(&leaf);
+
+        let a_str2 = ctx.create_string(alias);
+        let ks_now = ctx.read_native_pin(base, ks);
+        let pw_val = match (pw_pin, password) {
+            (Some(p), Some(orig)) => Value::Object(Some(ctx.read_native_pin(p, orig))),
+            _ => Value::Object(None),
+        };
+        if let Ok(Some(Value::Object(Some(k)))) = ctx.invoke_virtual(
+            ks_now,
+            "getKey",
+            "(Ljava/lang/String;[C)Ljava/security/Key;",
+            &[Value::Object(Some(a_str2)), pw_val],
+        ) {
+            let der = crate::keystore::read_encoded_byte_array(ctx, k);
+            if !der.is_empty() {
+                state.aliases_to_key.insert(alias.clone(), der);
+            }
+            live_pins.push((alias.clone(), ctx.pin_native_root(k), k));
+        }
+        state.aliases_to_chain.insert(alias.clone(), chain);
+        candidates.push(Candidate {
+            alias: alias.clone(),
+            key_type,
+            is_server,
+            is_client,
+        });
+    }
+
+    // 3. Candidate order, matching `build_key_manager_state`'s second pass.
+    let ordered = java_hashmap_iteration_order(
+        &candidates
+            .iter()
+            .map(|c| c.alias.clone())
+            .collect::<Vec<_>>(),
+    );
+    for alias in &ordered {
+        let Some(c) = candidates.iter().find(|c| &c.alias == alias) else {
+            continue;
+        };
+        if c.is_server {
+            state
+                .server_aliases_by_key_type
+                .entry(c.key_type.clone())
+                .or_default()
+                .push(alias.clone());
+        }
+        if c.is_client {
+            state
+                .client_aliases_by_key_type
+                .entry(c.key_type.clone())
+                .or_default()
+                .push(alias.clone());
+        }
+    }
+
+    // 4. Re-read every live key through its pin — the allocations above may
+    // have moved them — then release the whole pin frame.
+    for (alias, pin, orig) in &live_pins {
+        let now = ctx.read_native_pin(*pin, *orig);
+        state.aliases_to_live_key.insert(alias.clone(), now);
+    }
+    ctx.unpin_native_roots(base);
+    state
+}
+
 /// Build a `TrustManagerState` from either a caller-supplied `LoadedKeyStore`
 /// or the system trust store. Non-zero `keystore_id` means an explicit
 /// truststore was configured, so it is restrictive: platform roots are not
@@ -1756,11 +1969,29 @@ fn validate_ordered_chain(
     // Step 4: BasicConstraints CA on intermediates.
     if parsed.len() >= 2 {
         for i in 1..parsed.len() {
-            // Ed25519/Ed448 in earlier extension parsers may return None for
-            // BC; we treat None as "not-a-CA" only when v3 extensions exist
-            // for this cert. The is_v3 check matches what HotSpot's
-            // PKIXValidator does for legacy v1 roots which had no extensions.
-            if parsed[i].is_v3 && parsed[i].basic_constraints_ca == Some(false) {
+            if parsed[i].basic_constraints_ca == Some(false) {
+                return Err(TrustError::NotCa { at: i });
+            }
+            // A certificate that ISSUED another one must SAY it is a CA: RFC
+            // 5280 §6.1.4(k) makes `basicConstraints` with `cA=TRUE` mandatory
+            // for that position, and the JDK enforces it — `PKIXValidator`
+            // answers "basic constraints check failed: this is not a CA
+            // certificate", `SunX509` answers "End user tried to act as a CA".
+            //
+            // The `is_v3` guard this replaces exempted a v1 certificate from
+            // the check entirely, on the reasoning that a legacy v1 ROOT has no
+            // extensions to read. That is true of a root, and only of a root: a
+            // self-signed anchor still gets the exemption below. Applied to an
+            // INTERMEDIATE it inverted the rule — a v1 certificate carries no
+            // `basicConstraints`, which is exactly why it may not be a CA, and
+            // this accepted it as one. netty's `mutual_auth_invalid_client.p12`
+            // is built around that: its v1 intermediate is what makes the
+            // fixture "invalid", and both
+            // `testMutualAuthInvalidIntermediateCAFailWith{Optional,Required}
+            // ClientAuth` assert the handshake is REFUSED. They were passing
+            // only because an unrelated error refused it first.
+            let is_self_issued = parsed[i].issuer_der == parsed[i].subject_der;
+            if !is_self_issued && parsed[i].basic_constraints_ca.is_none() {
                 return Err(TrustError::NotCa { at: i });
             }
         }
@@ -2230,8 +2461,45 @@ fn verify_one_signature(
         } else {
             Err(TrustError::BadSignature { at })
         }
+    } else if oid == OID_SIG_RSA_PSS {
+        // RSASSA-PSS (1.2.840.113549.1.1.10). The in-tree
+        // `crypto_impl::rsa_verify_pss` already implements EMSA-PSS-VERIFY;
+        // what was missing was only this dispatch, and its absence was not
+        // cosmetic — `TrustError::NotImplemented` reaches the caller as
+        // `CertificateException: signature-algorithm OID … not implemented`,
+        // which a `TrustManager` reports as a REJECTED chain. Every connection
+        // whose certificates are PSS-signed therefore failed with
+        // `certificate_unknown`: netty's `test.crt`/`test2.crt` fixtures are
+        // (`testMutualAuthDiffCerts*`), and `testRSASSAPSS` exists to exercise
+        // exactly this.
+        //
+        // The digest is taken by TRIAL rather than by parsing the
+        // `RSASSA-PSS-params` AlgorithmIdentifier: `ParsedCert` keeps only the
+        // algorithm OID, and a wrong guess cannot launder a bad signature —
+        // each attempt is a complete PSS verification, so the worst case is
+        // three failed modular exponentiations and the same rejection. The
+        // three candidates are the only digests `PssHash` (and, in practice,
+        // any certificate) uses; the salt length is the hash length, which is
+        // what OpenSSL, the JDK and every PSS certificate generator emit.
+        let pk = match parse_rsa_public_key(issuer_spki) {
+            Some(k) => k,
+            None => return Err(TrustError::BadSignature { at }),
+        };
+        let n = pk.n.to_bytes_be();
+        let e = pk.e.to_bytes_be();
+        let ok = [
+            crate::crypto_impl::PssHash::Sha256,
+            crate::crypto_impl::PssHash::Sha384,
+            crate::crypto_impl::PssHash::Sha512,
+        ]
+        .into_iter()
+        .any(|h| crate::crypto_impl::rsa_verify_pss(&n, &e, h, tbs, sig));
+        if ok {
+            Ok(())
+        } else {
+            Err(TrustError::BadSignature { at })
+        }
     } else if oid == OID_SIG_DSA_SHA1
-        || oid == OID_SIG_RSA_PSS
         || oid == OID_SIG_ED25519
         || oid == OID_SIG_SHA224_RSA
         || oid == OID_SIG_ECDSA_SHA224
@@ -4329,6 +4597,18 @@ fn get_private_key(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
     let id = get_km_id(ctx, this);
     let alias = read_string_at(ctx, args, 1).unwrap_or_default();
 
+    // A key with no encoding of its own is served BY REFERENCE — the caller
+    // asked for the `PrivateKey` object, and for an opaque key (PKCS#11, or
+    // netty's `OpenSslPrivateKey`) that object is the only usable answer. See
+    // `KeyManagerState::aliases_to_live_key`.
+    if let Some(live) = km_registry()
+        .read()
+        .get(&id)
+        .and_then(|s| s.aliases_to_live_key.get(&alias))
+        .copied()
+    {
+        return Ok(Some(Value::Object(Some(live))));
+    }
     let key_der = {
         let registry = km_registry().read();
         match registry.get(&id).and_then(|s| s.aliases_to_key.get(&alias)) {
