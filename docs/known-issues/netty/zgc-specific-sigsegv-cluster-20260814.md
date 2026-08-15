@@ -17,7 +17,14 @@ sharing one signature, and both now have their own pages:
   use to decline relocation while a JIT frame is live. **Fixed.**
 * `zgc-rewrite-pass-walks-off-a-reference-array-20260815.md` — the collector
   faulting inside its own post-slide rewrite pass, reproducible with `--nojit`.
-  **Open.**
+  The slide wrote over the tail of an object based in the unselected page
+  below: page membership is decided by an object's BASE, so "this page is
+  selected" was being read as "these bytes are free". **Fixed.**
+
+**The cluster is now 8/8.** `ResourceLeakDetectorTest` runs clean on both
+collectors — 12/12 `--nojit`, 8/8 with JIT, all `ok=2 failed=1`, matching G1
+exactly. The residual `failed=1` is GC-independent and belongs to whoever owns
+that test.
 
 Two corrections to what this page records about that class: it crashes ~60% of
 the time, not on every run (measured 6/10, `--nojit` 2/10, `RELOCATE=0` 0/10),

@@ -3809,12 +3809,33 @@ fn native_properties_put_all(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
     //    sentinel for non-String values would shadow the CHM in
     //    native_properties_get, causing a String→XProperty CCE downstream.
     let mut str_collected: Vec<(String, String)> = Vec::new();
-    let entries_obj = match ctx.invoke(
-        "java/util/Map",
-        "entrySet",
-        "()Ljava/util/Set;",
-        &[Value::Object(Some(other))],
-    ) {
+    // Use `invoke_virtual` (dispatch on the receiver's actual runtime class),
+    // NOT `invoke` (which resolves against the literal interface/class name
+    // passed in). `invoke`'s C25 interface retarget correctly redirects e.g.
+    // `java/util/Iterator` onto the receiver's concrete class (verified via
+    // `is_subclass_of`), but the dispatch that follows only prefers a
+    // registered native over inherited bytecode for synthetic-stub/interface
+    // classes (`prefer_exact_class_native`). Since 2026-08-13, `HashMap$
+    // EntryIterator`/`KeyIterator` are minted as the REAL declared JDK class
+    // (see `alloc_key_itr`), which has real bytecode and so no longer counts
+    // as a stub — `invoke`'s dispatch then finds that real `HashIterator`
+    // bytecode instead of `native_map_key_itr_has_next`/`_next`, and that
+    // bytecode reads `next`/`current`/`index` fields this VM's snapshot
+    // iterator never populates, so `hasNext()` silently reports `false` on
+    // a non-empty iterator. This was invisible for a `Properties`-shaped
+    // source (which never reaches this generic-Map fallback at all) and for
+    // ordinary bytecode `invokeinterface` (whose interpreter loop checks the
+    // native registry before falling back to inherited bytecode, unlike this
+    // native-initiated entry point) — only a native calling through `invoke`
+    // with an interface-typed class name hit it. Concretely: `Properties.
+    // putAll(new HashMap<>(Map.of("k", "v")))` silently dropped every entry,
+    // which is what broke Hibernate's `foreign` id-generator `@Parameter`
+    // reading (`GeneratorParameters.collectParameters`'s `params.putAll
+    // (configuration)`, `configuration` being a plain `HashMap` built from
+    // the `@Parameter` array) — `ForeignGenerator.configure()` then saw no
+    // "property" entry and threw `MappingException: param named "property"
+    // is required for foreign id generation strategy`.
+    let entries_obj = match ctx.invoke_virtual(other, "entrySet", "()Ljava/util/Set;", &[]) {
         Ok(Some(Value::Object(Some(o)))) => o,
         _ => {
             ctx.unpin_native_roots(this_pin);
@@ -3822,12 +3843,7 @@ fn native_properties_put_all(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
         }
     };
     this = ctx.read_native_pin(this_pin, this);
-    let it = match ctx.invoke(
-        "java/util/Set",
-        "iterator",
-        "()Ljava/util/Iterator;",
-        &[Value::Object(Some(entries_obj))],
-    ) {
+    let it = match ctx.invoke_virtual(entries_obj, "iterator", "()Ljava/util/Iterator;", &[]) {
         Ok(Some(Value::Object(Some(o)))) => o,
         _ => {
             ctx.unpin_native_roots(this_pin);
@@ -3841,12 +3857,7 @@ fn native_properties_put_all(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
     let it_pin = ctx.pin_native_root(it);
     let mut it = it;
     loop {
-        let has_next = match ctx.invoke(
-            "java/util/Iterator",
-            "hasNext",
-            "()Z",
-            &[Value::Object(Some(it))],
-        ) {
+        let has_next = match ctx.invoke_virtual(it, "hasNext", "()Z", &[]) {
             Ok(Some(Value::Int(n))) => n != 0,
             _ => false,
         };
@@ -3855,23 +3866,13 @@ fn native_properties_put_all(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
         if !has_next {
             break;
         }
-        let entry = match ctx.invoke(
-            "java/util/Iterator",
-            "next",
-            "()Ljava/lang/Object;",
-            &[Value::Object(Some(it))],
-        ) {
+        let entry = match ctx.invoke_virtual(it, "next", "()Ljava/lang/Object;", &[]) {
             Ok(Some(Value::Object(Some(o)))) => o,
             _ => break,
         };
         it = ctx.read_native_pin(it_pin, it);
         let entry_pin = ctx.pin_native_root(entry);
-        let key_obj = match ctx.invoke(
-            "java/util/Map$Entry",
-            "getKey",
-            "()Ljava/lang/Object;",
-            &[Value::Object(Some(entry))],
-        ) {
+        let key_obj = match ctx.invoke_virtual(entry, "getKey", "()Ljava/lang/Object;", &[]) {
             Ok(Some(Value::Object(Some(o)))) => o,
             _ => {
                 ctx.unpin_native_roots(entry_pin);
@@ -3880,12 +3881,7 @@ fn native_properties_put_all(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
         };
         let entry = ctx.read_native_pin(entry_pin, entry);
         let key_pin = ctx.pin_native_root(key_obj);
-        let val_v = match ctx.invoke(
-            "java/util/Map$Entry",
-            "getValue",
-            "()Ljava/lang/Object;",
-            &[Value::Object(Some(entry))],
-        ) {
+        let val_v = match ctx.invoke_virtual(entry, "getValue", "()Ljava/lang/Object;", &[]) {
             Ok(Some(v)) => v,
             _ => {
                 ctx.unpin_native_roots(entry_pin);

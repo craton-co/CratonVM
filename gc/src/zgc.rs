@@ -2402,6 +2402,9 @@ pub struct ZgcRealHeap {
     /// is permanently JIT-busy trades heap layout for the correctness of not
     /// sliding objects out from under registers the collector cannot rewrite.
     relocation_skipped_jit: AtomicUsize,
+    /// How many unwalkable rewrite targets have already been logged in full,
+    /// so a heap that produces thousands does not produce thousands of lines.
+    unwalkable_reports: AtomicUsize,
     /// Slides completed, so a corpse can say HOW MANY cycles ago it was
     /// vacated -- "the slide that just ran" and "nine collections back" are
     /// different bugs with the same signature.
@@ -2776,6 +2779,7 @@ impl ZgcRealHeap {
             corpse_reports: AtomicUsize::new(0),
             corpse_cycle: AtomicU64::new(0),
             relocation_skipped_jit: AtomicUsize::new(0),
+            unwalkable_reports: AtomicUsize::new(0),
             driver_passes: AtomicUsize::new(0),
             mark_active: AtomicBool::new(false),
             mark_ingress: mark::ZMarkIngress::new(),
@@ -3999,7 +4003,51 @@ impl ZgcRealHeap {
                 .expect("non-empty, checked above");
             let slide_floor = base + first_selected_page as usize * Self::Z_LOGICAL_PAGE_BYTES;
 
+            // OBSTACLES: live objects that will not move but occupy bytes of a
+            // page that IS selected.
+            //
+            // Page membership is decided by an object's BASE, so an object
+            // based in an unselected page and extending across the boundary
+            // keeps its tail inside the selected page above -- and it is not in
+            // `survivors`, so it never moves. "This page is selected" and
+            // "these bytes are free" are therefore different claims, and the
+            // slide had only the first one.
+            //
+            // The probe aimed straight at the hazard: when a span touched an
+            // unselected page it restarted at `base + (blocked + 1) * PAGE` --
+            // the first byte of the next page, which is exactly where a
+            // straddler from the previous page lies. `slide_floor` has the same
+            // shape. Measured by
+            // `compaction_never_writes_into_an_object_it_did_not_move`.
+            //
+            // The list is tiny -- only an object crossing a boundary out of an
+            // unselected page can qualify, at most one per boundary -- so a
+            // sorted `Vec` and a short scan cost nothing beside the slide.
+            let mut obstacles: Vec<(usize, usize)> = live
+                .iter()
+                .copied()
+                .filter(|b| *b >= base && *b < low_end)
+                .filter(|b| !selected.contains(&page_of(*b)))
+                .filter_map(|b| {
+                    let sz = Self::alloc_size(self.header_ref(b as *mut u8))?;
+                    (page_of(b) != page_of(b + sz - 1)).then_some((b, b + sz))
+                })
+                .collect();
+            obstacles.sort_unstable();
+            // End of an obstacle overlapping `[lo, hi)`, if any.
+            let blocked_until = |lo: usize, hi: usize| -> Option<usize> {
+                obstacles
+                    .iter()
+                    .take_while(|(ob, _)| *ob < hi)
+                    .find(|(_, oe)| *oe > lo)
+                    .map(|(_, oe)| *oe)
+            };
+
+            // The floor itself can land inside a straddler's tail.
             let mut dest = slide_floor;
+            if let Some(end) = blocked_until(dest, dest + 1) {
+                dest = end;
+            }
             for from in survivors {
                 let Some(size) = Self::alloc_size(self.header_ref(from as *mut u8)) else {
                     // A header this collector cannot size cannot be moved, and
@@ -4055,10 +4103,19 @@ impl ZgcRealHeap {
                         Some(blocked) => {
                             probe = base + (blocked as usize + 1) * Self::Z_LOGICAL_PAGE_BYTES;
                         }
-                        None => {
-                            chosen = Some(cand);
-                            break;
-                        }
+                        // Every page of the span is selected -- which still
+                        // does not mean the bytes are free. Re-check against the
+                        // straddlers that reach into these pages from below,
+                        // and restart above the one in the way. Also strictly
+                        // increasing (an obstacle's end exceeds `cand`), so the
+                        // loop still terminates.
+                        None => match blocked_until(cand, cand + span) {
+                            Some(end) => probe = end,
+                            None => {
+                                chosen = Some(cand);
+                                break;
+                            }
+                        },
                     }
                 }
                 match chosen {
@@ -4167,7 +4224,35 @@ impl ZgcRealHeap {
             .iter()
             .map(|b| record.get(*b).unwrap_or(*b))
             .collect();
+        // Everything the rewrite is about to walk must still LOOK like the
+        // object the slide thought it was moving.
+        //
+        // `live_now` is `record.get(b).unwrap_or(b)` — it keeps the ORIGINAL
+        // address for any live object the relocation record does not list.
+        // That is correct only while an unlisted object is one that genuinely
+        // did not move AND whose memory nothing wrote over. If either half
+        // fails, this loop hands `reference_slots` an address whose contents
+        // are now some other object, and the walk strides a length that was
+        // never this object's.
+        //
+        // Screening here rather than trusting the header is what turns a
+        // SIGSEGV INSIDE THE COLLECTOR — whose stack names only the collector,
+        // so the crash site is worthless as evidence — into a list of
+        // offenders with the one fact that discriminates: whether this base is
+        // an address the slide just vacated. `moved_from.contains(base)` says
+        // the object was overwritten; `!contains` says the header was already
+        // wrong before the slide, which is a different bug entirely.
+        //
+        // Unconditional, not behind a debug flag: the cost is one registry
+        // probe and one `alloc_size` per survivor, against a walk of every one
+        // of its slots, and the failure it prevents is memory corruption.
+        let moved_from: FxHashSet<usize> = pairs.iter().map(|(from, _)| *from).collect();
+        let mut unwalkable = 0usize;
         for obj in &live_now {
+            if !self.rewrite_target_is_walkable(*obj, arena_lo, arena_hi, &moved_from) {
+                unwalkable += 1;
+                continue;
+            }
             let mut rewrites: Vec<(u64, u64)> = Vec::new();
             {
                 use census::ZCensusHeapView;
@@ -4195,12 +4280,111 @@ impl ZgcRealHeap {
             self.registry.insert(*to);
         }
 
-        let moved_from: FxHashSet<usize> = pairs.iter().map(|(from, _)| *from).collect();
+        if unwalkable > 0 {
+            tracing::error!(
+                target: "cratonvm::gc::guard",
+                unwalkable,
+                survivors = live_now.len(),
+                "zgc relocate: {unwalkable} of {} survivor(s) could not be walked by the \
+                 rewrite pass and were SKIPPED -- any reference they hold to a moved \
+                 object is now dangling. See the per-object lines above for whether the \
+                 slide vacated their address.",
+                live_now.len(),
+            );
+        }
         self.verify_no_dangling_slots_after_slide(&live_now, arena_lo, arena_hi, &moved_from);
 
         let pointer_map: cratonvm_types::PointerMap =
             record.into_pointer_map().into_iter().collect();
         (moved, reclaimed, pointer_map)
+    }
+
+    /// Can the rewrite pass safely walk the object at `base`?
+    ///
+    /// Answers three questions the rewrite loop used to assume, and reports
+    /// which one failed. The report is the point: a bad answer here becomes a
+    /// SIGSEGV *inside the collector*, whose stack names only the collector,
+    /// so the crash carries no information about which object was malformed or
+    /// why.
+    ///
+    ///  * **Can it be sized?** `alloc_size` refuses an implausible body or
+    ///    array length. A header decoded out of payload bytes usually fails
+    ///    here.
+    ///  * **Does its extent fit the arena?** The last line of defence: a length
+    ///    that is plausible in isolation can still run past the end of the
+    ///    heap, and striding it is the unmapped-page read.
+    ///
+    /// # Registry membership is NOT one of the questions, and that is not an
+    /// oversight
+    ///
+    /// The obvious third check — "is this still a registered base?" — is wrong
+    /// *here*, and the existing
+    /// `collect_garbage_with_compaction_on_rewrites_roots_and_keeps_the_graph`
+    /// caught it as a hard failure the first time this guard was written with
+    /// it in. The object-start registry is rebuilt AFTER this loop, so while
+    /// the rewrite runs it still holds every survivor's PRE-slide base;
+    /// `live_now` holds their post-slide ones. Gating on it therefore skips
+    /// precisely the objects that DID move — the ones whose slots most need
+    /// rewriting. It is reported as a field because it is informative, and it
+    /// is not allowed to veto.
+    ///
+    /// `was_vacated` discriminates the causes: if THIS slide vacated the exact
+    /// address, the object was overwritten by this cycle's bookkeeping.
+    ///
+    /// **Read `was_vacated=false` narrowly.** `moved_from` covers one cycle, so
+    /// an address vacated nine collections ago also reports `false`. On the
+    /// netty repro every offender reported `false` while its "header" decoded
+    /// as ASCII — `class_id=0x41524150` is `"PARA"`, `num_slots=0x444f494e` is
+    /// `"NOID"`, i.e. netty's `PARANOID` level string, and neighbours spelled
+    /// `io/netty`. So the registry held bases pointing into STRING data: the
+    /// same bytes were two things at once, from an earlier cycle. Widening this
+    /// to a multi-cycle set (as `corpse_ledger` already is) is the obvious
+    /// improvement if this fires again.
+    #[must_use]
+    fn rewrite_target_is_walkable(
+        &self,
+        base: usize,
+        arena_lo: usize,
+        arena_hi: usize,
+        moved_from: &FxHashSet<usize>,
+    ) -> bool {
+        // Off-arena survivors are the high-address (large-object) end, which
+        // this slide never touches, so there is nothing to check against.
+        if base < arena_lo || base >= arena_hi {
+            return true;
+        }
+        let header = self.header_ref(base as *mut u8);
+        let size = Self::alloc_size(header);
+        let fits = size.is_some_and(|sz| base.saturating_add(sz) <= arena_hi);
+        if fits {
+            return true;
+        }
+        // Reported, never a veto — see the header note on why the registry
+        // cannot be consulted at this point in the sequence.
+        let registered = self.registry.contains(base);
+        // Cap the log, not the screen: the skip must happen for every offender
+        // or the walk still faults, but sixteen lines is enough to see the
+        // shape and a million would itself be the hang.
+        let n = self.unwalkable_reports.fetch_add(1, Ordering::Relaxed);
+        if n < 16 {
+            tracing::error!(
+                target: "cratonvm::gc::guard",
+                base,
+                registered,
+                sizable = size.is_some(),
+                size = size.unwrap_or(0),
+                fits_arena = fits,
+                kind = ?header.kind(),
+                class_id = header.class_id.as_u32(),
+                num_slots = header.num_slots(),
+                array_length = header.array_length(),
+                was_vacated = moved_from.contains(&base),
+                arena_hi,
+                "zgc relocate: rewrite target is not walkable -- skipping it rather \
+                 than striding a length this header cannot justify"
+            );
+        }
+        false
     }
 
     /// After a slide: every reference slot in every survivor must point at a
@@ -5021,6 +5205,16 @@ impl ZgcRealHeap {
     /// doc in `types/src/field_layout.rs`. This collector had no such check.
     const MAX_PLAUSIBLE_BODY: usize = (1usize << 24) * SLOT_SIZE;
 
+    /// The array counterpart of [`Self::MAX_PLAUSIBLE_BODY`], in ELEMENTS.
+    ///
+    /// `1 << 28` is ~268M elements — larger than any array this VM can hold in
+    /// the heaps it runs (a reference array that long is a gigabyte before the
+    /// objects it points at), and small enough that a header decoded out of
+    /// payload bytes almost always exceeds it. Deliberately generous: this is
+    /// a corruption screen, not a policy limit, and refusing a real array would
+    /// break a working program in order to catch a broken one.
+    const MAX_PLAUSIBLE_ARRAY_LEN: usize = 1usize << 28;
+
     /// Total size in bytes of the allocation rooted at `header`, or `None` when
     /// the header cannot be sized.
     ///
@@ -5064,8 +5258,25 @@ impl ZgcRealHeap {
                 HEADER_SIZE.checked_add(body)
             }
             ObjectKind::Array => {
-                let data =
-                    array_data_size(header.array_length() as usize, header.element_type()).ok()?;
+                // The SAME plausibility bound the object arm applies, and it
+                // was missing here. `array_data_size` refuses only integer
+                // OVERFLOW, so a clobbered `array_length` of a few hundred
+                // million with 4-byte elements sizes cleanly to a couple of
+                // gigabytes — and every caller then trusts it, including
+                // `reference_slots`, which strides the whole thing and walks
+                // out of the arena into an unmapped page.
+                //
+                // Bounded in ELEMENTS as well as bytes because elements is the
+                // number the header actually carries, and so the one a desynced
+                // walk corrupts.
+                let len = header.array_length() as usize;
+                if len > Self::MAX_PLAUSIBLE_ARRAY_LEN {
+                    return None;
+                }
+                let data = array_data_size(len, header.element_type()).ok()?;
+                if data > Self::MAX_PLAUSIBLE_BODY {
+                    return None;
+                }
                 ARRAY_DATA_OFFSET.checked_add(data)
             }
         }
@@ -7184,6 +7395,20 @@ impl census::ZCensusHeapView for ZgcRealHeap {
             ObjectKind::Array => {
                 if header.element_type() == ArrayElementType::Reference {
                     let len = header.array_length() as usize;
+                    // The screen the legacy-object arm above already had, and
+                    // this arm did not. Without it a clobbered length strides
+                    // straight out of the arena — which is not hypothetical:
+                    // it is `zgc::reference_slots` faulting at a page-aligned
+                    // address inside `relocate_stw`'s rewrite pass on a
+                    // `--nojit` netty run (2/10).
+                    if len > Self::MAX_PLAUSIBLE_ARRAY_LEN {
+                        tracing::debug!(
+                            target: "zgc",
+                            len,
+                            "zgc census: suspect array length, elements omitted"
+                        );
+                        return;
+                    }
                     // `ref_element_size()`, not the `REF_ELEMENT_SIZE` constant:
                     // the constant is the wide (8-byte) width, and the stride is
                     // 4 under narrow oops. This is the stride
@@ -9947,6 +10172,210 @@ pub(crate) mod tests {
             Value::Object(Some(r)) => assert_eq!(r.as_ptr(), elem.as_ptr()),
             other => panic!("expected element reference, got {other:?}"),
         }
+    }
+
+    /// **Compaction must not write into an object it did not move.**
+    ///
+    /// The slide reasons in PAGES: it places a survivor wherever the whole
+    /// destination span lies inside selected pages. But "this page is selected"
+    /// is not the same claim as "these bytes are free — the low bytes of a
+    /// selected page can be the TAIL of an object based in the unselected page
+    /// below it, and that object is not in `survivors` (membership is decided
+    /// by its base) so it never moves.
+    ///
+    /// The probe's own restart rule aims at exactly that address: when a span
+    /// would touch an unselected page it retries at
+    /// `base + (blocked + 1) * PAGE`, i.e. the first byte of the next page —
+    /// which is precisely where a straddler from the previous page lies.
+    /// `slide_floor` has the same shape.
+    ///
+    /// Checked as an invariant over the whole heap rather than by constructing
+    /// one straddler, because the fixture that reliably produces a straddle at
+    /// a selected/unselected boundary is far more delicate than the property
+    /// itself, and a delicate fixture that stops straddling is a test that
+    /// silently stops testing.
+    ///
+    /// Reference slots ARE allowed to change: rewriting them is the pass's job.
+    /// Every other byte of an unmoved object must be identical.
+    #[test]
+    fn compaction_never_writes_into_an_object_it_did_not_move() {
+        const PAGE: usize = ZgcRealHeap::Z_LOGICAL_PAGE_BYTES;
+        let heap = ZgcRealHeap::with_capacity(64 * 1024 * 1024);
+        heap.set_tlab_enabled(false);
+
+        // Mixed sizes so objects land at varied offsets and some cross page
+        // boundaries; mixed liveness so the selector finds pages worth taking
+        // and pages worth refusing.
+        let arena_base = heap.arena.lock().base_ptr() as usize;
+        let mut roots: Vec<ObjectRef> = Vec::new();
+        let mut i = 0usize;
+        while heap.allocated_bytes() < 5 * PAGE {
+            let fields = 8 + (i % 700);
+            let o = heap.alloc_object(ClassId::new(1), fields);
+            let b = o.as_ptr() as usize;
+            let sz = ZgcRealHeap::alloc_size(heap.header_ref(b as *mut u8)).unwrap();
+            // KEEP EVERY STRADDLER ALIVE. Rooting them by luck is what made the
+            // first version of this test vacuous: only ~4 objects cross a
+            // boundary in a 10 MiB fill, and with a third of objects live the
+            // fixture regularly contained none. A dead straddler cannot be
+            // written into by mistake — it is garbage either way — so the
+            // hazard needs a live one, deliberately.
+            let straddles = (b - arena_base) / PAGE != (b + sz - 1 - arena_base) / PAGE;
+            // Dense band then sparse band, alternating per ~page, so the
+            // selector has both kinds to choose between and some pages are
+            // refused — an unselected page below a selected one is the other
+            // half of the hazard.
+            let dense = (heap.allocated_bytes() / PAGE) % 2 == 0;
+            if straddles || (dense && i % 2 == 0) || (!dense && i % 11 == 0) {
+                roots.push(o);
+            }
+            i += 1;
+        }
+
+        // Body snapshot of every live object, keyed by pre-GC base.
+        let snapshot: Vec<(usize, usize, Vec<u8>)> = roots
+            .iter()
+            .map(|o| {
+                let b = o.as_ptr() as usize;
+                let sz = ZgcRealHeap::alloc_size(heap.header_ref(b as *mut u8))
+                    .expect("fixture objects must be sizable");
+                // SAFETY: `b` is a live base of `sz` bytes in this heap.
+                let bytes = unsafe { std::slice::from_raw_parts(b as *const u8, sz) }.to_vec();
+                (b, sz, bytes)
+            })
+            .collect();
+
+        // SAFETY: these unit tests run the heap single-threaded.
+        let stw = unsafe { StopTheWorldToken::new() };
+        cratonvm_types::flags::with_thread_overrides(
+            &[("CRATONVM_ZGC_RELOCATE", Some("1"))],
+            || {
+                heap.collect_garbage(&stw, &mut roots, &NoMonitors);
+            },
+        );
+
+        let moved: usize = roots
+            .iter()
+            .zip(snapshot.iter())
+            .filter(|(now, (was, _, _))| now.as_ptr() as usize != *was)
+            .count();
+        assert!(
+            moved > 0,
+            "the fixture relocated nothing, so it cannot see the slide writing \
+             into a bystander"
+        );
+        // The hazard needs a live object whose extent CROSSES a page boundary:
+        // without one, nothing can be based in page N and occupy bytes of page
+        // N+1, and this test passes for a reason unrelated to the property.
+        // Asserted from the pre-GC snapshot, which is the state the slide saw.
+        let straddlers = snapshot
+            .iter()
+            .filter(|(b, sz, _)| {
+                let lo = b.saturating_sub(arena_base) / PAGE;
+                let hi = (b + sz - 1).saturating_sub(arena_base) / PAGE;
+                lo != hi
+            })
+            .count();
+        assert!(
+            straddlers > 0,
+            "no live object in this fixture crosses a page boundary, so it cannot \
+             exercise the tail-of-a-straddler hazard at all -- widen the size mix \
+             or the heap until some do"
+        );
+
+        let mut clobbered = Vec::new();
+        for (now, (was, sz, before)) in roots.iter().zip(snapshot.iter()) {
+            if now.as_ptr() as usize != *was {
+                continue; // it moved; its old bytes are fair game
+            }
+            // SAFETY: unmoved, so still a live base of `sz` bytes.
+            let after = unsafe { std::slice::from_raw_parts(*was as *const u8, *sz) };
+            // Compare in 8-byte words and forgive a word the rewrite pass could
+            // legitimately have re-pointed (old value was a relocated base).
+            let mut diffs = 0usize;
+            for w in 0..(*sz / 8) {
+                let o = u64::from_ne_bytes(before[w * 8..w * 8 + 8].try_into().unwrap());
+                let n = u64::from_ne_bytes(after[w * 8..w * 8 + 8].try_into().unwrap());
+                if o == n {
+                    continue;
+                }
+                let legitimate_rewrite = roots
+                    .iter()
+                    .zip(snapshot.iter())
+                    .any(|(nw, (ws, _, _))| *ws as u64 == o && nw.as_ptr() as u64 == n);
+                if !legitimate_rewrite {
+                    diffs += 1;
+                }
+            }
+            if diffs > 0 {
+                clobbered.push((*was, diffs));
+            }
+        }
+        assert!(
+            clobbered.is_empty(),
+            "the slide wrote into {} object(s) it did not move (first: base 0x{:x}, \
+             {} unexplained word(s)). A selected page's low bytes can be the tail of \
+             an object based in the unselected page below it.",
+            clobbered.len(),
+            clobbered[0].0,
+            clobbered[0].1,
+        );
+    }
+
+    /// **A clobbered array length must not be strided, and must not size.**
+    ///
+    /// `alloc_size`'s object arm has bounded its result by
+    /// `MAX_PLAUSIBLE_BODY` since the 1-TiB-memset fix below. Its ARRAY arm had
+    /// no equivalent: `array_data_size` refuses only integer overflow, so a
+    /// length of a few hundred million with 4-byte elements sizes cleanly to a
+    /// couple of gigabytes and every caller trusts it. `reference_slots` then
+    /// strides the whole thing from `base + ARRAY_DATA_OFFSET` and reads an
+    /// unmapped page — observed as `zgc::reference_slots` faulting at a
+    /// page-aligned address inside `relocate_stw`'s rewrite pass.
+    ///
+    /// Both halves are asserted because they fail independently: `alloc_size`
+    /// is what the sweep and the slide's extent arithmetic use, and the walk in
+    /// `reference_slots` has its own screen. Fixing one and not the other
+    /// leaves the crash reachable by the other path.
+    #[test]
+    fn a_clobbered_array_length_is_refused_by_both_the_sizer_and_the_walker() {
+        use census::ZCensusHeapView;
+        let heap = ZgcRealHeap::with_capacity(1024 * 1024);
+        let arr = heap.alloc_array(ClassId::new(1), ArrayElementType::Reference, 4);
+        let base = arr.as_ptr();
+
+        // Sane to start with: sizable, and the walk reports its 4 elements.
+        {
+            let header = unsafe { &*(base as *const ObjectHeader) };
+            assert!(ZgcRealHeap::alloc_size(header).is_some());
+        }
+        let mut seen = 0usize;
+        heap.reference_slots(base as u64, &mut |_| seen += 1);
+        assert_eq!(seen, 4, "the fixture must walk normally before it is clobbered");
+
+        // Now overwrite the length with a value that is huge but does NOT
+        // overflow `usize` — the exact shape `array_data_size` waves through.
+        // SAFETY: single-threaded test, and `base` is this heap's own array.
+        unsafe {
+            let header = &mut *(base as *mut ObjectHeader);
+            header.set_array_length(500_000_000);
+        }
+
+        {
+            let header = unsafe { &*(base as *const ObjectHeader) };
+            assert!(
+                ZgcRealHeap::alloc_size(header).is_none(),
+                "alloc_size accepted a 500M-element array in a 1 MiB heap; the sweep \\
+                 and the slide's extent arithmetic both trust this number"
+            );
+        }
+        let mut walked = 0usize;
+        heap.reference_slots(base as u64, &mut |_| walked += 1);
+        assert_eq!(
+            walked, 0,
+            "reference_slots strided {walked} element(s) of a 500M-element array in a \\
+             1 MiB heap — this is the read that leaves the arena"
+        );
     }
 
     /// `object_body_size` answers `IMPLAUSIBLE_BODY_SIZE` (1 TiB) — not `0` —

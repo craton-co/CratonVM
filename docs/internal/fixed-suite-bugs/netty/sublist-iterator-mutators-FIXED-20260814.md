@@ -132,6 +132,59 @@ binary, so none of them moved. They are `LinkedList$ListItr`'s class identity,
 caused nor closed. **Taking the control run is what makes that a measurement
 rather than an assumption**, and it cost one worktree and two minutes.
 
+> **All three moved on 2026-08-15**, and only one of them was a collections
+> defect at all.
+>
+> * `ImmutableCollectionsDifferentialProbe` — 16 diverging lines to **0**
+>   (`fix/intobjecthashmap-sigsegv-20260815`). `List.of`/`Set.of`/`Map.of` now
+>   reject a null element (bare NPE) and a repeat
+>   (`IllegalArgumentException: duplicate element: a`), and `List.copyOf(x) == x`
+>   holds for an already-immutable `x`. The validation sits at the `of` ENTRY
+>   POINTS and never in `make_set_of`/`make_map_of` — `Set.copyOf` deduplicates
+>   by contract and shares those builders, so one helper serving both would have
+>   to pick, and either pick is wrong for the other caller.
+>
+> * `UnmodifiableListIteratorJitProbe` — 6 diverging lines to **0**, fixed by
+>   `3c0fd9c01` on `dev`, and it was never about `unmodifiableList`. ZGC was
+>   sliding an object whose only reference lived in a compiled frame's register.
+>   `probes/JitFrameRootRelocationProbe` is the narrowed witness (one object in
+>   200 000 with a null `final` field, deterministically at iteration 10191) and
+>   is now this tree's only Java-level regression test for that fix. Full
+>   evidence in the retired `intobjecthashmaptest-discovery-sigsegv-20260814`
+>   write-up, including why the obvious repair — wiring up ZGC's
+>   conservative-JIT-root pin — is measurably sufficient for this probe and
+>   still the wrong mechanism.
+>
+> * `ListItrInterfaceProbe` is still 8 lines on both arms, but a wider probe
+>   (`probes/LinkedListIteratorBehaviourProbe`, 15 rows) showed that page's framing of it as a class-identity
+>   gap was **understated**: `LinkedList.listIterator()`'s `add` and `remove`
+>   threw `UnsupportedOperationException` where HotSpot writes through — the
+>   exact defect this page is about, one collection over, and enough to make
+>   every `AbstractList` default that drains a `LinkedList` through its
+>   list-iterator throw. Both now write through, against a fourth carrier slot
+>   (`lastRet`, written explicitly to -1, the hazard this page's third bullet
+>   names) which also fixes `set` after `previous()` — it was reading `cursor-1`
+>   — and makes a `set`/`remove` with no preceding call raise instead of
+>   silently doing nothing. The iterator's `IllegalStateException` also stopped
+>   carrying `": remove"`, which is `Iterator.remove()`'s throwing DEFAULT's
+>   message, from a different class.
+>
+>   What remains is the identity half, now specified rather than gestured at:
+>   `listIterator()` answers `cratonvm.internal.LinkedListSnapshotListItr` and
+>   `iterator()` answers `java.util.LinkedList$Itr` — **a class the real JDK
+>   does not have** (`javap -p java.util.LinkedList$Itr` → *class not found*;
+>   `AbstractSequentialList.iterator()` IS `listIterator()`, so HotSpot answers
+>   `LinkedList$ListItr` for both) — plus a missing `ConcurrentModificationException`.
+>   The recipe is this page's own: the real class as carrier, state in the
+>   undeclared slots past `class_num_total_fields`, an `sli_base_checked`-shaped
+>   ownership test so a java.base-built iterator delegates to its own bytecode,
+>   and `iterator()` routed to `listIterator()`. It was left alone because that
+>   carrier is load-bearing for Kafka `ConfigDef` and Spring
+>   `processDeferredImportSelectors` paths this session had no fixture for, and
+>   because routing `iterator()` through the snapshot iterator changes
+>   `Iterator.remove()`'s mechanism — a behavioural change that wants those
+>   fixtures, not a class-name change that does not.
+
 `cargo test -p cratonvm-native-collections --all-targets`: green.
 
 ## Repro
