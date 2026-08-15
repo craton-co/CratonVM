@@ -7095,6 +7095,31 @@ fn sli_view_size(
 /// line. `Iterator.remove()`'s throwing DEFAULT does carry `"remove"`, which is
 /// why the snapshot iterator's version keeps it; this is the other exception,
 /// from the other class, and it is bare.
+/// `new NoSuchElementException()` — with NO message, which is what
+/// `LinkedList$ListItr.next()`/`previous()` throw.
+///
+/// `RuntimeError::NoSuchElementException` always supplies a message and
+/// `Throwable.toString()` prints the suffix whenever there is one, so a
+/// "helpful" `"LinkedList$ListItr.next"` is a visible difference from HotSpot
+/// rather than a bonus. Exactly the trap [`sli_illegal_state`] exists for, on
+/// the other exception — this is the third time it has been paid in this file,
+/// which is why it is now a named helper instead of an inline literal.
+///
+/// NOT for the interface-level snapshot iterators: `ArrayList$Itr.next()`'s
+/// JDK body also throws bare, but several natives here deliberately carry a
+/// message that a caller matches on. Change those only with a probe row.
+fn bare_no_such_element(ctx: &mut dyn NativeContext) -> MethodCallFailed {
+    if let Ok(Some(Value::Object(Some(exc)))) =
+        ctx.new_object_initialized("java/util/NoSuchElementException", "()V", &[])
+    {
+        return MethodCallFailed::ExceptionThrown(exc);
+    }
+    cratonvm_types::error::RuntimeError::NoSuchElementException {
+        message: String::new(),
+    }
+    .into()
+}
+
 fn sli_illegal_state(ctx: &mut dyn NativeContext) -> MethodCallFailed {
     if let Ok(Some(Value::Object(Some(exc)))) =
         ctx.new_object_initialized("java/lang/IllegalStateException", "()V", &[])
@@ -34017,6 +34042,10 @@ fn register_linked_list_natives(registry: &mut NativeMethodRegistry) {
     // testGroupInference assertEquals(ArrayList, LinkedList)). The interface
     // natives registered on `java/util/ListIterator` share the same
     // array@0/cursor@1 layout, so dispatch through either route agrees.
+    // The REAL carrier, preferred by both entry points above. Registered
+    // before the fallback so a reader meets them in dispatch order.
+    register_ll_list_itr_natives(registry);
+
     let lit = "cratonvm/internal/LinkedListSnapshotListItr";
     // `register_with_kind`, NOT the ambient `register`, and the difference is
     // the census column `kind_stated` rather than the kind itself — the kind is
@@ -34172,6 +34201,441 @@ fn lli_resnapshot(ctx: &mut dyn NativeContext, this: ObjectRef, list: ObjectRef)
     ctx.set_field(this, LLI_FIELD_ARR, Value::Object(Some(arr)));
 }
 
+// ===========================================================================
+// `java.util.LinkedList$ListItr` — the real carrier, live over the node chain
+// ===========================================================================
+//
+// WHY THE JDK'S OWN CLASS. `LinkedList.iterator()` is
+// `AbstractSequentialList.iterator()`, which IS `listIterator()`, so HotSpot
+// answers `java.util.LinkedList$ListItr` for both. This VM answered
+// `cratonvm.internal.LinkedListSnapshotListItr` for one and
+// `java.util.LinkedList$Itr` for the other — and `LinkedList$Itr` is a class
+// the real JDK **does not declare at all** (`javap -p java.util.LinkedList$Itr`
+// → class not found). Two carriers, one of them fabricated, for a method the
+// JDK implements once.
+//
+// WHY LIVE AND NOT A SNAPSHOT. The snapshot carrier could not raise
+// `ConcurrentModificationException` (it has nothing to compare), and its
+// `remove()` had to re-take the whole snapshot to stay consistent — O(n) per
+// removal, so a `removeIf`/`Iterator.remove` drain over a `LinkedList` was
+// quadratic on the one collection whose entire selling point is O(1) removal.
+// A node cursor is the JDK's own `ListItr` state and makes every mutator O(1).
+//
+// WHY THIS IS SAFE NOW AND WAS NOT BEFORE. The comment this replaces recorded a
+// real failure: binding a 3-slot overlay to the name `java/util/LinkedList$ListItr`
+// put our `Int` cursor into the real `next:Node` slot, `next()` never advanced,
+// and `AbstractList.equals` compared element 0 forever — kafka `ConfigDef`
+// `testGroupInference`'s `assertEquals(ArrayList, LinkedList)` answered false
+// for ANY LinkedList. The fix is not to avoid the name, it is to stop
+// overlapping the declared fields: allocate `class_num_total_fields + N` slots
+// and put this VM's state ENTIRELY PAST them, which is what
+// `ArrayList$SubList$1` already does one collection over. `lli_base_checked` is
+// the matching receiver-ownership test, for the same reason `sli_base_checked`
+// is: these natives are also handed every `LinkedList$ListItr` **java.base's
+// own bytecode** built, and answering for one of those is the silent wrong
+// answer that withdrew the first attempt at this carrier.
+//
+// An image with no real `java.util.LinkedList$ListItr` to resolve keeps the
+// snapshot iterator it has always had — `alloc_lli_view` answers `None` and
+// both entry points fall back. Same trade as the sublist carrier.
+
+/// The JDK's own `ListIterator` inside `LinkedList`, and the class
+/// `linkedList.iterator().getClass()` answers on HotSpot.
+const LLI_CLASS: &str = "java/util/LinkedList$ListItr";
+
+/// The `LinkedList` being walked.
+const LLI_SLOT_LIST: usize = 0;
+/// The node `next()` will return, or null at the end. The JDK's `next`.
+const LLI_SLOT_NEXT: usize = 1;
+/// The node the last `next()`/`previous()` returned, or null. The JDK's
+/// `lastReturned`, and the flag `set`/`remove` raise `IllegalStateException` on.
+const LLI_SLOT_LAST: usize = 2;
+/// `nextIndex()`.
+const LLI_SLOT_INDEX: usize = 3;
+/// The list size this iterator was created against — the poor relation of the
+/// JDK's `expectedModCount`. See `lli_check_comodification`.
+const LLI_SLOT_EXPECTED_SIZE: usize = 4;
+const LLI_SLOTS: usize = 5;
+
+/// The fewest fields a REAL `java.util.LinkedList$ListItr` declares —
+/// `lastReturned`, `next`, `nextIndex`, `expectedModCount`. (The real class also
+/// carries `this$0`; four is the conservative floor, since the point is only to
+/// separate a real class from a fabricated one, which declares zero.)
+const LLI_REAL_MIN_FIELDS: usize = 4;
+
+/// Where this iterator's state starts: past the carrier's own declared fields.
+#[inline]
+fn lli_base(ctx: &dyn NativeContext, this: ObjectRef) -> usize {
+    ctx.object_num_fields(this).saturating_sub(LLI_SLOTS)
+}
+
+/// [`lli_base`], answering `None` for an iterator this VM did not mint.
+///
+/// A real `LinkedList$ListItr` that java.base built is exactly
+/// `class_num_total_fields` wide (`lastReturned`, `next`, `nextIndex`,
+/// `expectedModCount`, `this$0`) and carries none of this VM's five. Without
+/// this test every native below would read `expectedModCount` as the list.
+#[inline]
+fn lli_base_checked(ctx: &dyn NativeContext, this: ObjectRef) -> Option<usize> {
+    let width = ctx.object_num_fields(this);
+    let declared = ctx.class_num_total_fields(ctx.class_id_of_object(this));
+    // `declared` is also floored: on an image where the carrier is a fabricated
+    // 0-field stand-in, `declared + LLI_SLOTS` equals the width of anything this
+    // VM minted AND of anything else five slots wide, so the test would stop
+    // discriminating. `alloc_lli_view` refuses to mint on such an image, and
+    // this is the matching refusal on the read side.
+    if declared < LLI_REAL_MIN_FIELDS || width < declared + LLI_SLOTS {
+        return None;
+    }
+    Some(width - LLI_SLOTS)
+}
+
+/// Whether `this` is a live LinkedList list-iterator this VM minted.
+fn is_live_ll_list_itr(ctx: &dyn NativeContext, this: ObjectRef, class_name: &str) -> bool {
+    class_name == LLI_CLASS && lli_base_checked(ctx, this).is_some()
+}
+
+/// Run the receiver's OWN bytecode when it is a `LinkedList$ListItr` this VM
+/// did not mint. `None` means the receiver is ours and the caller proceeds.
+fn lli_delegate_foreign(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+    method: &str,
+    descriptor: &str,
+) -> Option<MethodCallResult> {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return None,
+    };
+    if lli_base_checked(&*ctx, this).is_some() {
+        return None;
+    }
+    Some(ctx.invoke_virtual_bytecode_only(this, method, descriptor, &args[1..]))
+}
+
+fn lli_obj(ctx: &dyn NativeContext, this: ObjectRef, slot: usize) -> Option<ObjectRef> {
+    let base = lli_base_checked(ctx, this)?;
+    match ctx.get_field(this, base + slot) {
+        Value::Object(Some(o)) => Some(o),
+        _ => None,
+    }
+}
+
+fn lli_int(ctx: &dyn NativeContext, this: ObjectRef, slot: usize) -> i32 {
+    match lli_base_checked(ctx, this) {
+        Some(base) => match ctx.get_field(this, base + slot) {
+            Value::Int(v) => v,
+            _ => 0,
+        },
+        None => 0,
+    }
+}
+
+fn lli_put(ctx: &mut dyn NativeContext, this: ObjectRef, slot: usize, v: Value) {
+    if let Some(base) = lli_base_checked(&*ctx, this) {
+        ctx.set_field(this, base + slot, v);
+    }
+}
+
+/// The JDK's `checkForComodification`, over SIZE rather than a modCount.
+///
+/// `LinkedList`'s overlay has no `modCount` and adding one means bumping it in
+/// every mutator in this file — a much wider change than this carrier, and one
+/// that fails open (a missed bump is a missed exception). Size is the
+/// conservative half of the same test: it catches every structural change that
+/// alters the length, which is `add`, `remove`, `clear` and `addAll`, and
+/// misses only a balanced add+remove between two calls. It can never fire
+/// SPURIOUSLY, which is the direction that matters — a false
+/// `ConcurrentModificationException` on a correct program is far worse than a
+/// missed one on an incorrect program.
+fn lli_check_comodification(
+    ctx: &dyn NativeContext,
+    this: ObjectRef,
+    list: ObjectRef,
+) -> Result<(), MethodCallFailed> {
+    if ll_size(ctx, list) != lli_int(ctx, this, LLI_SLOT_EXPECTED_SIZE) {
+        return Err(RuntimeError::ConcurrentModificationException.into());
+    }
+    Ok(())
+}
+
+/// Allocate a live `LinkedList$ListItr` over `list`, positioned at `index`.
+///
+/// `None` when this image has no real `java.util.LinkedList$ListItr` — the
+/// caller then keeps the iterator it has always returned.
+///
+/// TWO tests, and the second one is the load-bearing half.
+/// `ensure_class_initialized` can report `Ok` having FABRICATED a stand-in, and
+/// a fabricated stand-in carries exactly the name that was asked for — so the
+/// name check alone admits it. The real `java.util.LinkedList$ListItr` declares
+/// `lastReturned`, `next`, `nextIndex`, `expectedModCount` and `this$0`; a
+/// fabricated one declares nothing. Anchoring on `class_num_total_fields` is
+/// what tells them apart, and getting it wrong is not a cosmetic mistake:
+/// minting a fabricated `java/util/*` carrier is what §5 of the native contract
+/// forbids, and it made `vm::tests::linked_list_iterator` fail on the
+/// synthetic-JDK build — that test asks `LinkedList.iterator()` for an iterator
+/// and then calls `java/util/LinkedList$Itr.hasNext` on it BY NAME, which is
+/// the correct expectation for an image that has no real carrier to wear.
+fn alloc_lli_view(ctx: &mut dyn NativeContext, list: ObjectRef, index: i32) -> Option<ObjectRef> {
+    let cid = ctx.ensure_class_initialized(LLI_CLASS).ok()?;
+    if ctx.class_name_arc_of_id(cid).as_deref() != Some(LLI_CLASS) {
+        return None;
+    }
+    let declared = ctx.class_num_total_fields(cid);
+    if declared < LLI_REAL_MIN_FIELDS {
+        return None;
+    }
+    let n = declared + LLI_SLOTS;
+    let size = ll_size(&*ctx, list);
+    // GC-SAFETY: `alloc_object` collects and `list` is a bare Rust local the
+    // collector cannot see. Root it across the allocation and read both halves
+    // back through their pins before the stores.
+    let list_pin = ctx.pin_native_root(list);
+    let itr = ctx.alloc_object(cid, n);
+    let itr_pin = ctx.pin_native_root(itr);
+    let itr = ctx.read_native_pin(itr_pin, itr);
+    let list = ctx.read_native_pin(list_pin, list);
+    let base = n - LLI_SLOTS;
+    ctx.set_field(itr, base + LLI_SLOT_LIST, Value::Object(Some(list)));
+    // The node walk is a plain pointer chase over already-live objects, but it
+    // is done AFTER the allocation and through the pinned list.
+    let start = if index <= 0 {
+        match ll_get(&*ctx, list, "head") {
+            Value::Object(Some(n)) => Some(n),
+            _ => None,
+        }
+    } else if index >= size {
+        None
+    } else {
+        ll_node_at(&*ctx, list, index)
+    };
+    let itr = ctx.read_native_pin(itr_pin, itr);
+    ctx.set_field(itr, base + LLI_SLOT_NEXT, Value::Object(start));
+    // Written EXPLICITLY, never left to whatever `alloc_object` zero-initialises
+    // an undeclared slot to: a non-null `lastReturned` read out of an unwritten
+    // slot makes `remove()` before any `next()` unlink a real node instead of
+    // raising, and an int-zero `nextIndex` on a `listIterator(k)` silently
+    // reports the wrong position. `ArrayList$SubList$1`'s `lastRet` is the same
+    // hazard, one collection over.
+    ctx.set_field(itr, base + LLI_SLOT_LAST, Value::Object(None));
+    ctx.set_field(itr, base + LLI_SLOT_INDEX, Value::Int(index.clamp(0, size)));
+    ctx.set_field(itr, base + LLI_SLOT_EXPECTED_SIZE, Value::Int(size));
+    ctx.unpin_native_roots(list_pin);
+    Some(itr)
+}
+
+/// `(list, next, lastReturned, nextIndex)` for a receiver this VM minted.
+fn lli_state(
+    ctx: &dyn NativeContext,
+    args: &[Value],
+) -> Option<(
+    ObjectRef,
+    ObjectRef,
+    Option<ObjectRef>,
+    Option<ObjectRef>,
+    i32,
+)> {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return None,
+    };
+    let list = lli_obj(ctx, this, LLI_SLOT_LIST)?;
+    Some((
+        this,
+        list,
+        lli_obj(ctx, this, LLI_SLOT_NEXT),
+        lli_obj(ctx, this, LLI_SLOT_LAST),
+        lli_int(ctx, this, LLI_SLOT_INDEX),
+    ))
+}
+
+fn native_lli_has_next(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    if let Some(r) = lli_delegate_foreign(ctx, args, "hasNext", "()Z") {
+        return r;
+    }
+    let (this, list, _next, _last, index) = match lli_state(&*ctx, args) {
+        Some(s) => s,
+        None => return Ok(Some(Value::Int(0))),
+    };
+    let _ = this;
+    Ok(Some(Value::Int((index < ll_size(&*ctx, list)) as i32)))
+}
+
+fn native_lli_next(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    if let Some(r) = lli_delegate_foreign(ctx, args, "next", "()Ljava/lang/Object;") {
+        return r;
+    }
+    let (this, list, next, _last, index) = match lli_state(&*ctx, args) {
+        Some(s) => s,
+        None => return Err(bare_no_such_element(ctx)),
+    };
+    lli_check_comodification(&*ctx, this, list)?;
+    let node = match next {
+        Some(n) if index < ll_size(&*ctx, list) => n,
+        _ => return Err(bare_no_such_element(ctx)),
+    };
+    let elem = ctx.get_field(node, LL_NODE_ELEM);
+    let following = match ctx.get_field(node, LL_NODE_NEXT) {
+        Value::Object(Some(n)) => Some(n),
+        _ => None,
+    };
+    lli_put(ctx, this, LLI_SLOT_LAST, Value::Object(Some(node)));
+    lli_put(ctx, this, LLI_SLOT_NEXT, Value::Object(following));
+    lli_put(ctx, this, LLI_SLOT_INDEX, Value::Int(index + 1));
+    Ok(Some(elem))
+}
+
+fn native_lli_has_previous(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    if let Some(r) = lli_delegate_foreign(ctx, args, "hasPrevious", "()Z") {
+        return r;
+    }
+    let (_this, _list, _next, _last, index) = match lli_state(&*ctx, args) {
+        Some(s) => s,
+        None => return Ok(Some(Value::Int(0))),
+    };
+    Ok(Some(Value::Int((index > 0) as i32)))
+}
+
+fn native_lli_previous(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    if let Some(r) = lli_delegate_foreign(ctx, args, "previous", "()Ljava/lang/Object;") {
+        return r;
+    }
+    let (this, list, next, _last, index) = match lli_state(&*ctx, args) {
+        Some(s) => s,
+        None => return Err(bare_no_such_element(ctx)),
+    };
+    lli_check_comodification(&*ctx, this, list)?;
+    if index <= 0 {
+        return Err(bare_no_such_element(ctx));
+    }
+    // The JDK's `next = (next == null) ? last : next.prev` — a cursor parked
+    // past the end steps back onto the tail.
+    let node = match next {
+        Some(n) => match ctx.get_field(n, LL_NODE_PREV) {
+            Value::Object(Some(p)) => p,
+            _ => return Err(bare_no_such_element(ctx)),
+        },
+        None => match ll_get(&*ctx, list, "tail") {
+            Value::Object(Some(t)) => t,
+            _ => return Err(bare_no_such_element(ctx)),
+        },
+    };
+    let elem = ctx.get_field(node, LL_NODE_ELEM);
+    lli_put(ctx, this, LLI_SLOT_NEXT, Value::Object(Some(node)));
+    lli_put(ctx, this, LLI_SLOT_LAST, Value::Object(Some(node)));
+    lli_put(ctx, this, LLI_SLOT_INDEX, Value::Int(index - 1));
+    Ok(Some(elem))
+}
+
+fn native_lli_next_index(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    if let Some(r) = lli_delegate_foreign(ctx, args, "nextIndex", "()I") {
+        return r;
+    }
+    Ok(Some(Value::Int(
+        lli_state(&*ctx, args).map(|s| s.4).unwrap_or(0),
+    )))
+}
+
+fn native_lli_previous_index(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    if let Some(r) = lli_delegate_foreign(ctx, args, "previousIndex", "()I") {
+        return r;
+    }
+    Ok(Some(Value::Int(
+        lli_state(&*ctx, args).map(|s| s.4).unwrap_or(0) - 1,
+    )))
+}
+
+fn native_lli_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    if let Some(r) = lli_delegate_foreign(ctx, args, "set", "(Ljava/lang/Object;)V") {
+        return r;
+    }
+    let (this, list, _next, last, _index) = match lli_state(&*ctx, args) {
+        Some(s) => s,
+        None => return Ok(None),
+    };
+    let node = match last {
+        Some(n) => n,
+        None => return Err(sli_illegal_state(ctx)),
+    };
+    lli_check_comodification(&*ctx, this, list)?;
+    let elem = args.get(1).copied().unwrap_or(Value::Object(None));
+    ctx.set_field(node, LL_NODE_ELEM, elem);
+    Ok(None)
+}
+
+fn native_lli_remove(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    if let Some(r) = lli_delegate_foreign(ctx, args, "remove", "()V") {
+        return r;
+    }
+    let (this, list, next, last, index) = match lli_state(&*ctx, args) {
+        Some(s) => s,
+        None => return Ok(None),
+    };
+    let node = match last {
+        Some(n) => n,
+        None => return Err(sli_illegal_state(ctx)),
+    };
+    lli_check_comodification(&*ctx, this, list)?;
+    // The JDK's bookkeeping, verbatim: if the cursor was sitting ON the node
+    // being removed (a `previous()` then `remove()`), it steps forward onto its
+    // successor and the index does NOT move; otherwise the cursor is past it
+    // and the index drops by one.
+    let following = match ctx.get_field(node, LL_NODE_NEXT) {
+        Value::Object(Some(n)) => Some(n),
+        _ => None,
+    };
+    ll_unlink_node(ctx, list, node);
+    if next == Some(node) {
+        lli_put(ctx, this, LLI_SLOT_NEXT, Value::Object(following));
+    } else {
+        lli_put(ctx, this, LLI_SLOT_INDEX, Value::Int(index - 1));
+    }
+    lli_put(ctx, this, LLI_SLOT_LAST, Value::Object(None));
+    let expected = lli_int(&*ctx, this, LLI_SLOT_EXPECTED_SIZE);
+    lli_put(ctx, this, LLI_SLOT_EXPECTED_SIZE, Value::Int(expected - 1));
+    Ok(None)
+}
+
+fn native_lli_add(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    if let Some(r) = lli_delegate_foreign(ctx, args, "add", "(Ljava/lang/Object;)V") {
+        return r;
+    }
+    let (this, list, next, _last, index) = match lli_state(&*ctx, args) {
+        Some(s) => s,
+        None => return Ok(None),
+    };
+    lli_check_comodification(&*ctx, this, list)?;
+    let elem = args.get(1).copied().unwrap_or(Value::Object(None));
+    match next {
+        Some(succ) => ll_link_before(ctx, list, elem, succ)?,
+        None => ll_link_last(ctx, list, elem)?,
+    }
+    // `add` clears `lastReturned`, so an immediately following `set`/`remove`
+    // raises — the JDK's rule, and the reason `listIterator.add then set` is a
+    // probe row.
+    lli_put(ctx, this, LLI_SLOT_LAST, Value::Object(None));
+    lli_put(ctx, this, LLI_SLOT_INDEX, Value::Int(index + 1));
+    let expected = lli_int(&*ctx, this, LLI_SLOT_EXPECTED_SIZE);
+    lli_put(ctx, this, LLI_SLOT_EXPECTED_SIZE, Value::Int(expected + 1));
+    Ok(None)
+}
+
+fn register_ll_list_itr_natives(registry: &mut NativeMethodRegistry) {
+    let prev = registry.current_category();
+    registry.set_category(cratonvm_native_api::NativeKind::Bridge);
+    let c = LLI_CLASS;
+    registry.register(c, "hasNext", "()Z", native_lli_has_next);
+    registry.register(c, "next", "()Ljava/lang/Object;", native_lli_next);
+    registry.register(c, "hasPrevious", "()Z", native_lli_has_previous);
+    registry.register(c, "previous", "()Ljava/lang/Object;", native_lli_previous);
+    registry.register(c, "nextIndex", "()I", native_lli_next_index);
+    registry.register(c, "previousIndex", "()I", native_lli_previous_index);
+    registry.register(c, "set", "(Ljava/lang/Object;)V", native_lli_set);
+    registry.register(c, "remove", "()V", native_lli_remove);
+    registry.register(c, "add", "(Ljava/lang/Object;)V", native_lli_add);
+    registry.set_category(prev);
+}
+
 fn ll_snapshot_array(ctx: &mut dyn NativeContext, this: ObjectRef) -> ObjectRef {
     let size = ll_size(ctx, this) as usize;
     // GC-safety: the allocation can complete a moving young GC and the node
@@ -34202,6 +34666,12 @@ fn native_ll_list_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(Some(Value::Object(None))),
     };
+    // The real carrier when this image has one; the snapshot below when it does
+    // not (a synthetic-JDK build, where no `java.util.LinkedList$ListItr` exists
+    // to wear).
+    if let Some(live) = alloc_lli_view(ctx, this, 0) {
+        return Ok(Some(Value::Object(Some(live))));
+    }
     // GC-safety: the snapshot and the iterator shell each allocate; `this`
     // and the snapshot are both stored afterwards. See `rooted_across`.
     let mut this = this;
@@ -34252,6 +34722,15 @@ fn native_ll_list_iterator_idx(ctx: &mut dyn NativeContext, args: &[Value]) -> M
         Some(Value::Int(i)) => *i,
         _ => 0,
     };
+    // `listIterator(index)` bounds-checks BEFORE constructing, and the JDK's
+    // message is the one `ll_out_of_bounds` builds.
+    let size = ll_size(&*ctx, this);
+    if idx < 0 || idx > size {
+        return Err(ll_out_of_bounds(idx, size));
+    }
+    if let Some(live) = alloc_lli_view(ctx, this, idx) {
+        return Ok(Some(Value::Object(Some(live))));
+    }
     // GC-safety: the snapshot and the iterator shell each allocate; `this`
     // and the snapshot are both stored afterwards. See `rooted_across`.
     let mut this = this;
@@ -35395,7 +35874,24 @@ fn native_ll_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
 }
 
 // LinkedList$Itr = 2-field synthetic (field 0 = current node, field 1 = list ref for size tracking)
+/// `LinkedList.iterator()`.
+///
+/// On HotSpot this method does not exist: `LinkedList` inherits
+/// `AbstractSequentialList.iterator()`, which is `return listIterator();`. So
+/// `iterator()` and `listIterator()` return the SAME class, and
+/// `linkedList.iterator() instanceof ListIterator` is true. This VM returned a
+/// separate `java/util/LinkedList$Itr` — a name the real JDK does not declare —
+/// so both of those were wrong. Route to the same carrier and the divergence
+/// closes at the source rather than at nine more registrations.
+///
+/// The `LinkedList$Itr` body below is retained, unchanged, for the image that
+/// has no real `LinkedList$ListItr` to wear.
 fn native_ll_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    if let Some(Value::Object(Some(this))) = args.first().copied() {
+        if let Some(live) = alloc_lli_view(ctx, this, 0) {
+            return Ok(Some(Value::Object(Some(live))));
+        }
+    }
     let this = match args.first() {
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(Some(Value::Object(None))),
