@@ -1,6 +1,6 @@
 # `ResourceLeakDetectorTest` — ZGC reads a `DefaultResourceLeak` the slide moved away
 
-**Status: OPEN.** Still SIGSEGVs under ZGC on `dev` @ `a7f891a5a`+. This page
+**Status: FIXED** (the ZGC-only crash) — 2026-08-15. This page
 records what is now *measured* rather than inferred, two defects fixed along
 the way (neither of which closes this one), and one instrument that finally
 made the crash say something.
@@ -188,6 +188,34 @@ is live, with `relocation_skipped_jit` exported so the cost is a number. That
 cost is real and unmeasured — on this collector compaction is also
 defragmentation, so a permanently JIT-busy process defragments less. **Someone
 should measure that on a JIT-heavy workload before calling it settled.**
+
+## Verification
+
+Same binary, same runner, one class per VM:
+
+| arm | runs | outcome |
+|---|---|---|
+| ZGC, before the fix | 10 | **6 SIGSEGV**, corpse reads in most survivors |
+| ZGC, after the fix | 10 | **0 SIGSEGV, 0 corpse reads**, all `found=3 started=3 ok=2 failed=1` |
+| G1, after the fix | 2 | `found=3 started=3 ok=2 failed=1` |
+
+ZGC and G1 now agree exactly, and the residual `failed=1` is GC-independent —
+it reproduces identically on both collectors and belongs to whoever owns that
+test, not to the collector.
+
+**One correction to this morning's entry on the parent page.** It recorded G1
+as `0 ok / 3 failed` with a `NoSuchMethodError` on
+`DefaultResource.close(Ljava/lang/Object;)Z`. On the current binary G1 gives
+`2 ok / 1 failed`, which is what the page originally recorded before that
+update. The earlier reading came from a different build; treat that row as
+binary-dependent and re-measure rather than quoting it.
+
+**What is NOT verified:** the cost. The fix declines relocation while a
+compiled frame is live, and this workload runs at quiescence depth ~100, so it
+may now compact rarely or never. `relocation_skipped_jit` is printed beside
+`compaction_cycles` in the shutdown summary precisely so that shows up, but
+nobody has yet run a JIT-heavy workload long enough to say whether the
+fragmentation cost matters. That is the open question this fix creates.
 
 ## Not closed: a second, JIT-independent crash
 

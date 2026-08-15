@@ -2943,6 +2943,19 @@ impl ZgcRealHeap {
     /// `driver_passes == 0` with a non-zero `parallel_mark_cycles` would mean
     /// the pool marked without the driver, which is the state this adoption
     /// exists to leave behind.
+    /// Cycles that declined to relocate because a compiled frame was live.
+    ///
+    /// Printed in the shutdown summary beside `compaction_cycles`, because the
+    /// two only mean something together: `compaction_cycles=0` alone reads as
+    /// "compaction is broken", and `compaction_cycles=0
+    /// relocation_skipped_jit=97` reads as "this workload is never JIT-quiet",
+    /// which is a tuning problem and not a defect. On this collector
+    /// compaction is also defragmentation, so a run that never compacts is a
+    /// run that never defragments.
+    pub fn relocation_skipped_jit(&self) -> usize {
+        self.relocation_skipped_jit.load(Ordering::Relaxed)
+    }
+
     pub fn driver_engagement(&self) -> (usize, usize) {
         (
             self.driver_passes.load(Ordering::Relaxed),
