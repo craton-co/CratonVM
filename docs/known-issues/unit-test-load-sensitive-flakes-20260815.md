@@ -24,13 +24,14 @@ Azure host 2, 8 cores, `cargo test` debug builds.
 | whole `--lib`, `--test-threads=1` | pass (3 563 / 0 failed) |
 | whole `--lib`, default parallelism, ordinary load | pass ×2 |
 | `--lib x509_manager` filter, default parallelism | pass ×12 |
-| whole `--lib`, default parallelism, **load average ~35** | pass ×5 (see below) |
+| whole `--lib`, default parallelism, **load average ~35** | pass ×10 |
 | whole `--lib`, default parallelism, **two other cargo suites sharing the box** | **FAIL ×2** |
 
 The two failures were both observed while a second heavy `cargo` run was
 executing concurrently — once during a two-branch CI-gate comparison, once
-during an unrelated build. Fifteen deliberate reproduction attempts afterwards,
-including five with the box at load ~35, did not reproduce it. The monitor test
+during an unrelated build. **Twenty-four deliberate reproduction attempts
+afterwards did not reproduce it** — 12 filtered runs and 12 full-`--lib` runs,
+ten of the latter with the box at load average 34-37 from other work. The monitor test
 behaved identically: it failed inside a full `-p cratonvm-vm` run at load ~36 and
 passed 3/3 alone immediately after.
 
