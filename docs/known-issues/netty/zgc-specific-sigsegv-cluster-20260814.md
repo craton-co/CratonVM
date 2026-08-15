@@ -1,9 +1,16 @@
 # ZGC-specific SIGSEGV cluster — 7 classes crash under ZGC, pass cleanly under G1
 
-**Status:** OPEN, newly found (2026-08-14). Found on Windows running the
-**full** 657-class netty suite (not a non-passed subset) in 2 GC variants,
-G1 and ZGC, 4 shards each, identical binary built from commit `6a206f689`
-(merged fresh to `origin/dev`).
+**Status:** **7/7 of the cluster FIXED and re-confirmed on current `dev`
+(2026-08-15).** One class remains open and is now the whole of this page's
+residual: `io.netty.util.ResourceLeakDetectorTest`, which still SIGSEGVs under
+ZGC. Four root-caused defects landed between `6a206f689` and `caf25c3d1`; the
+"new regression" this page recorded on 2026-08-14 was one of them and is fixed.
+See "Current validation" below for the table that supersedes both earlier
+fix-validation sections.
+
+Originally found on Windows running the **full** 657-class netty suite (not a
+non-passed subset) in 2 GC variants, G1 and ZGC, 4 shards each, identical
+binary built from commit `6a206f689` (merged fresh to `origin/dev`).
 
 ## Symptom
 
@@ -56,6 +63,15 @@ corrupts state these classes happen to touch, not a defect in each
 individual class's code path.
 
 ## A concrete lead, not yet confirmed as the cause
+
+> **RESOLVED 2026-08-15 — the lead was right about the area and wrong about the
+> direction.** `6a206f689` is the FIX for the unselected-page slide, not the
+> cause of these crashes; the pre-merge binary predates compaction being
+> default-on at all, which is why it did not crash. The section below is kept
+> because its reasoning — "live objects getting overwritten by survivor data on
+> a page ZGC didn't intend to touch" — is an exact description of a real defect
+> that commit repaired, and because three further defects of the same family
+> were found by taking it seriously. See "Current validation".
 
 The `dev` merge that produced this binary (`6a206f689`, 136 commits ahead
 of the previous local build) includes:
@@ -117,7 +133,178 @@ Windows/Docker-Desktop environmental issue
 (`testcontainers-jackson-jit-stall-blocks-eventloop-20260812.md`), not
 part of this finding — only the CRASH column is relevant to this doc.
 
+## Fix validation — hibernate-reactive, same-day, candidate fix binary
+
+Re-ran the identical full-suite methodology (249 classes, G1 + ZGC, 4
+shards each, `TESTCONTAINERS_RYUK_DISABLED=true`, cleanup sweep) with
+`C:\craton\cratonvm-zgcfix-20260814.exe` in place of the earlier
+`6a206f689` build:
+
+| variant | CRASH before | CRASH after fix | PASS | HANG | FAIL | NOTESTS |
+|---|---|---|---|---|---|---|
+| G1 | 0 | **0** | 11 | 15 | 179 | 44 |
+| ZGC | 15 | **2** | 11 | 15 | 177 | 44 |
+
+The 2 remaining ZGC crashes are a **subset** of the original 15 — both
+were crashing before too (`BeforeExecutionIdGeneratorTypeTest`,
+`EagerOneToManyAssociationTest`), no new crash appeared anywhere. **13 of
+15 fixed, 0 regressions.** PASS/HANG/FAIL/NOTESTS counts are essentially
+unchanged from the pre-fix run (dominated by the separate, unrelated
+Windows/Docker-Desktop environmental issue — see
+`testcontainers-jackson-jit-stall-blocks-eventloop-20260812.md`), so this
+fix is cleanly isolated to the crash path and doesn't touch anything else
+observable at this level.
+
+## Fix validation — netty, same day, same fix binary
+
+Re-ran the original 9 netty crash classes directly (isolated, `--shards
+1`, both G1 and ZGC) against `cratonvm-zgcfix-20260814.exe`:
+
+| class | ZGC before | ZGC after fix | G1 after fix |
+|---|---|---|---|
+| `WebSocketClientHandshaker00Test` | CRASH | **PASS** | PASS |
+| `Http2FrameRoundtripTest` | CRASH | **PASS** | PASS |
+| `HttpObjectAggregatorTest` | CRASH | **PASS** | PASS |
+| `WeightedFairQueueByteDistributorTest` | CRASH | **PASS** | PASS |
+| `BoundedInputStreamTest` | CRASH | **PASS** | PASS |
+| `LzmaFrameEncoderTest` | CRASH | **PASS** | PASS |
+| `Http2StreamFrameToHttpObjectCodecTest` | CRASH | **PASS** | PASS |
+| `AdaptiveByteBufAllocatorGrowthTest` | CRASH | HANG (unrelated, pre-existing throughput issue) | HANG (same) |
+| `OpenSslPrivateKeyMethodTest` | CRASH | FAIL (unrelated, pre-existing) | FAIL (same) |
+
+**All 7 of the pure ZGC-only cluster now pass cleanly on both collectors.**
+The other 2 revert to their own separate, already-known non-crash issues
+(unaffected by this fix, unrelated to it).
+
+### But: one NEW crash appeared, ZGC-specific, not present before this fix
+
+`io.netty.util.ResourceLeakDetectorTest` was checked as a control (it
+crashed in the earlier full-suite non-passed rerun with this fix binary,
+appearing where it never had before):
+
+| | pre-fix (`6a206f689`) | post-fix, ZGC | post-fix, G1 |
+|---|---|---|---|
+| `ResourceLeakDetectorTest` | FAIL (2 ok/1 failed) | **CRASH** | FAIL (2 ok/1 failed, same as before) |
+
+Confirmed in isolation (`--shards 1`), not a contention artifact. Under
+G1 it fails the exact same way it did pre-fix (`2 ok/1 failed`) — the fix
+changed nothing there. Under ZGC it now SIGSEGVs where it used to just
+fail one assertion. **This fix candidate resolved 7 real crashes and
+introduced 1 new one, GC-specific in the same way as the ones it fixed.**
+Worth flagging loudly to whoever owns this: not a clean fix, net-positive
+but not zero-regression.
+
+## Current validation — 2026-08-15, `dev` @ `caf25c3d1`
+
+Every class from this page, isolated (one VM per class), **both** collectors,
+one binary, only the GC flag varied:
+
+| class | ZGC | G1 |
+|---|---|---|
+| `WebSocketClientHandshaker00Test` | **20/20** | 20/20 |
+| `Http2FrameRoundtripTest` | **28/28** | 28/28 |
+| `HttpObjectAggregatorTest` | **26/26** | 26/26 |
+| `WeightedFairQueueByteDistributorTest` | **23/23** | 23/23 |
+| `BoundedInputStreamTest` | **101/101** | 101/101 |
+| `LzmaFrameEncoderTest` | **6/6** | 6/6 |
+| `Http2StreamFrameToHttpObjectCodecTest` | **43/43** | 43/43 |
+| `ResourceLeakDetectorTest` | **CRASH** | ok=0 failed=3 |
+
+**Correction to this page's earlier reading of the last row.** It records
+`ResourceLeakDetectorTest` as `FAIL (2 ok/1 failed)` under G1, pre- and
+post-fix, and infers that "the fix changed nothing there". On current `dev` G1
+gives **0 ok / 3 failed**, and the reason is visible in the log:
+
+```
+NoSuchMethodError io/netty/util/ResourceLeakDetectorTest$DefaultResource.close(Ljava/lang/Object;)Z
+```
+
+That is a **GC-independent defect of its own** and it has drifted since this
+page was written. So the row is two problems stacked, and they want separate
+owners: a missing method that fails the class on every collector, and a
+ZGC-compaction crash on top of it.
+
+### The four defects that closed the 7
+
+All four are cases of the same thing — code that was correct while the
+collector never moved an object, and stopped being correct on 2026-08-13 when
+compaction went default-on:
+
+1. **The slide crossed unselected pages.** `ZRelocationSet::select` ranks by
+   garbage ratio and returns a NON-CONTIGUOUS page set; the slide marched one
+   cursor and memmoved survivors over live objects on the dense pages between.
+   (`6a206f689`, the commit this page nominated as the lead — it was the fix,
+   not the cause.)
+2. **`pin_critical_region` pinned nothing under ZGC.** The copy-back at
+   `ReleasePrimitiveArrayCritical` re-resolves the Get-time address; move the
+   array and it writes over whatever now occupies it.
+3. **The reference-processing guard tested the pre-move address** while the
+   write used the post-move one, so every moved `Reference` was judged dead —
+   no `WeakReference` delivery, no `Cleaner`.
+4. **`prune_dead` and `remap_after_gc` collided.** Survivors slide *down* into
+   space vacated by dead objects, so a dead base is often a live base
+   afterwards. Measured on a four-page fixture: 169 live objects' monitors
+   freed per collection in the original order. **This is the "new regression"
+   this page flagged** — the first attempt screened the dead list instead of
+   reordering, which stopped the free and left the dead tenant's monitor for
+   the survivor to inherit (83 per collection). Prune-then-remap fixes both.
+
+A fifth landed alongside: ZGC never consumed `pinned_jit_roots_snapshot()`,
+which G1 has honoured since 2026-08-11. Conservative JIT roots are
+over-approximate (a `long` can look like a root), so a moving collector must
+pin rather than relocate them. Real gap, fixed — but measured **not** to be
+this page's residual crash.
+
+### What is known about the remaining crash
+
+`ResourceLeakDetectorTest`, ZGC only, and every claim here is a measurement:
+
+| question | answer | how |
+|---|---|---|
+| Is compaction the trigger? | **Yes** | `CRATONVM_ZGC_RELOCATE=0` → 5/5 clean; on → 0/15 |
+| Does the slide miss a reference slot? | **No** | `missed_rewrites=0` |
+| Do stale words alias live objects? | **No** | `aliasing_a_survivor=0` |
+| What does the crash look like? | a **zeroed** header | `zgc real: field index OOB index=N num_slots=0` |
+
+So the heap's slot graph is internally consistent after a slide, and the holder
+of the stale address is **outside** it. `compact_low_to` zeroes the vacated span
+deliberately (so a conservative scan cannot resurrect a corpse), which is why
+the reader finds a well-formed ALL-ZERO object rather than a wild pointer —
+`num_slots=0`, then a walk off the end of a zero-length object.
+
+**Three hypotheses were eliminated by measurement, not argument:** an
+incomplete rewrite (this page's own leading theory), compaction-unenumerable
+objects, and stale-word aliasing. `--nojit` reduces but does not remove the
+crash, so JIT frames are one holder and not the only one.
+
+**Two instruments were built for this and are worth reusing:**
+`CRATONVM_DBG_ZGC_VERIFY_SLIDE=1` classifies every post-slide dangling slot as
+missed-rewrite / never-a-base / aliasing-a-survivor, and ZGC now honours
+`CRATONVM_DBG_GC_STRESS=<bytes>` — it ignored that flag entirely before, so any
+repro copied from a handoff page silently ran an ordinary workload on the
+default collector.
+
+**A measurement trap recorded so the next person does not repeat it:** the
+`field index OOB` warning count is NOT a severity metric. A run that dies early
+logs fewer warnings, so comparing 1250-against-1 between two arms measures how
+long each survived, not how broken each is. Use completion rate over 15+ reps;
+5 reps cannot separate 0/5 from 2/5 on this class.
+
+### Next step
+
+The holder is outside the heap slot graph and survives `--nojit`.
+`CRATONVM_DBG_ROOT_SOURCE=1` attributes an address to a named root source,
+which turns "something holds it" into "*this* holds it". Pair it with the first
+`num_slots=0` to capture the address, then ask the registry who contributed it.
+
 ## Not yet done
+
+> **Updated 2026-08-15.** Of the four items below, three are now done: isolated
+> `--shards 1` reproduction (every class in the table above is one VM per
+> class), the bisect against the compaction commit (done, and it inverted — see
+> the lead section), and CratonVM-side crash diagnostics (the `num_slots=0`
+> signature and the slide verifier). The HotSpot cross-check is still not run
+> and is still not needed to establish the finding.
 
 - No stack traces, crash dumps, or `gdb`/WinDbg analysis — the harness
   only records "Segmentation fault" from the shell, no CratonVM-side

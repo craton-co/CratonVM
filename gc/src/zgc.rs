@@ -2372,6 +2372,8 @@ pub struct ZgcRealHeap {
     /// per critical section and once per collection, and it is empty in every
     /// workload that makes no critical calls at all.
     critical_pins: Mutex<FxHashMap<usize, usize>>,
+    /// One-shot latch for the unenumerable-object compaction refusal.
+    unenumerable_warned: AtomicBool,
     /// Concurrent phases the DRIVER reported, summed over all cycles.
     ///
     /// This is the counter that distinguishes "the worker pool marked" from
@@ -2735,6 +2737,7 @@ impl ZgcRealHeap {
             parallel_mark_fallbacks: AtomicUsize::new(0),
             gc_stress_mark: AtomicUsize::new(0),
             critical_pins: Mutex::new(FxHashMap::default()),
+            unenumerable_warned: AtomicBool::new(false),
             driver_passes: AtomicUsize::new(0),
             mark_active: AtomicBool::new(false),
             mark_ingress: mark::ZMarkIngress::new(),
@@ -3874,6 +3877,42 @@ impl ZgcRealHeap {
                     );
                 }
             }
+            // FAIL CLOSED if any live object's slots cannot be enumerated.
+            //
+            // Checked BEFORE anything moves, because the damage is only
+            // detectable afterwards and is unrecoverable once done: the
+            // rewrite pass below walks every live object to re-point slots at
+            // moved objects, and `reference_slots` reports NO slots for a
+            // compact-flagged object with no registered layout. Such an object
+            // holding a reference to a moved object keeps a dangling pointer,
+            // and nothing downstream will notice.
+            //
+            // Skipping the whole cycle rather than the object is deliberate:
+            // we cannot know what an unenumerable object points AT, so the
+            // only safe guarantee is that nothing it could point at has moved.
+            // The cost is one cycle's reclaim in a process that unloads
+            // classes; the alternative is a heap-corruption bug whose crash
+            // site is unrelated to its cause.
+            if let Some(bad) = live
+                .iter()
+                .copied()
+                .filter(|b| *b >= base && *b < low_end)
+                .find(|b| !self.slots_are_enumerable(*b))
+            {
+                if !self.unenumerable_warned.swap(true, Ordering::Relaxed) {
+                    tracing::warn!(
+                        target: "cratonvm::gc::guard",
+                        addr = bad,
+                        class_id = self.header_ref(bad as *mut u8).class_id.as_u32(),
+                        "zgc relocate: a live compact object has no registered layout, so \
+                         its reference slots cannot be enumerated and the rewrite could \
+                         not re-point them. SKIPPING COMPACTION for this cycle — see \
+                         `slots_are_enumerable`. Reclaim is reduced; correctness is not."
+                    );
+                }
+                let reclaimed = arena.retract_cursor_into_free_tail();
+                return (0, reclaimed, cratonvm_types::PointerMap::default());
+            }
             if selected.is_empty() {
                 // Nothing profitable to move. Not a failure -- it is the
                 // selector doing its job on a heap whose pages are all dense.
@@ -4211,6 +4250,36 @@ impl ZgcRealHeap {
                 "zgc slide verify: every reference slot resolves to a live base"
             );
         }
+    }
+
+    /// Can this object's reference slots be ENUMERATED?
+    ///
+    /// `census::reference_slots` answers "no slots" for a compact-flagged
+    /// object whose `(class_id, num_slots)` has no registered layout, and says
+    /// so in a warning. That is the right answer for the census it was built
+    /// for — its own doc argues the omission "biases the legacy share DOWN —
+    /// the conservative direction". **It is the WRONG direction for the
+    /// compaction rewrite**, which uses the same enumeration to find slots
+    /// that must be re-pointed: a slot nobody enumerates is a slot nobody
+    /// rewrites, and after the slide it is a dangling pointer.
+    ///
+    /// The slide already refuses to MOVE an object it cannot size. This is the
+    /// other half, and it is the half that bites: the rewrite walks EVERY live
+    /// object, not just the moved ones, so an unenumerable object anywhere in
+    /// the heap can hold a reference to an object that did move.
+    fn slots_are_enumerable(&self, addr: usize) -> bool {
+        let header = self.header_ref(addr as *mut u8);
+        if !matches!(header.kind(), ObjectKind::Object) {
+            // Arrays are walked by element type and fillers hold no
+            // references; neither consults a layout.
+            return true;
+        }
+        if !cratonvm_types::is_compact_object(header) {
+            // Legacy bodies stride `num_slots` uniform cells — no layout
+            // needed, so enumeration cannot fail.
+            return true;
+        }
+        cratonvm_types::with_class_layout(header.class_id.as_u32(), header.num_slots(), |_| ())
     }
 
     /// Pin `addr` against relocation for a JNI critical section — see
