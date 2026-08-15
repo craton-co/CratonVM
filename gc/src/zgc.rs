@@ -2387,7 +2387,25 @@ pub struct ZgcRealHeap {
     ///
     /// Keyed by the vacated address; interior addresses resolve through the
     /// stored size, because a stale pointer is not always to the base.
-    corpse_ledger: Mutex<FxHashMap<usize, (usize, u32, usize)>>,
+    ///
+    /// Accumulates across cycles rather than keeping only the last one. A
+    /// holder that reads the address in the same cycle it was vacated and one
+    /// that cached it ten collections ago produce the identical `num_slots=0`
+    /// warning, and they are different bugs -- the first is a missing remap,
+    /// the second a raw address kept across a safepoint. Capped, oldest cycles
+    /// evicted first, so a long run cannot grow it without bound.
+    corpse_ledger: Mutex<FxHashMap<usize, (usize, u32, usize, u64)>>,
+    /// Cycles that declined to relocate because a compiled frame was live.
+    ///
+    /// Exported so the cost of the refusal is a number rather than a guess:
+    /// on this collector compaction is also defragmentation, so a process that
+    /// is permanently JIT-busy trades heap layout for the correctness of not
+    /// sliding objects out from under registers the collector cannot rewrite.
+    relocation_skipped_jit: AtomicUsize,
+    /// Slides completed, so a corpse can say HOW MANY cycles ago it was
+    /// vacated -- "the slide that just ran" and "nine collections back" are
+    /// different bugs with the same signature.
+    corpse_cycle: AtomicU64,
     /// How many OOB reads have already been reported in full, so a workload
     /// that produces thousands does not produce thousands of backtraces.
     corpse_reports: AtomicUsize,
@@ -2756,6 +2774,8 @@ impl ZgcRealHeap {
             critical_pins: Mutex::new(FxHashMap::default()),
             corpse_ledger: Mutex::new(FxHashMap::default()),
             corpse_reports: AtomicUsize::new(0),
+            corpse_cycle: AtomicU64::new(0),
+            relocation_skipped_jit: AtomicUsize::new(0),
             driver_passes: AtomicUsize::new(0),
             mark_active: AtomicBool::new(false),
             mark_ingress: mark::ZMarkIngress::new(),
@@ -2923,6 +2943,19 @@ impl ZgcRealHeap {
     /// `driver_passes == 0` with a non-zero `parallel_mark_cycles` would mean
     /// the pool marked without the driver, which is the state this adoption
     /// exists to leave behind.
+    /// Cycles that declined to relocate because a compiled frame was live.
+    ///
+    /// Printed in the shutdown summary beside `compaction_cycles`, because the
+    /// two only mean something together: `compaction_cycles=0` alone reads as
+    /// "compaction is broken", and `compaction_cycles=0
+    /// relocation_skipped_jit=97` reads as "this workload is never JIT-quiet",
+    /// which is a tuning problem and not a defect. On this collector
+    /// compaction is also defragmentation, so a run that never compacts is a
+    /// run that never defragments.
+    pub fn relocation_skipped_jit(&self) -> usize {
+        self.relocation_skipped_jit.load(Ordering::Relaxed)
+    }
+
     pub fn driver_engagement(&self) -> (usize, usize) {
         (
             self.driver_passes.load(Ordering::Relaxed),
@@ -3746,6 +3779,45 @@ impl ZgcRealHeap {
     }
 
     fn relocate_stw(&self, live: &[usize]) -> (usize, usize, cratonvm_types::PointerMap) {
+        // DO NOT RELOCATE WHILE A JIT FRAME IS LIVE.
+        //
+        // `gc_quiescence::is_active()` means some thread is inside a compiled
+        // call right now, and its frame may hold object pointers in REGISTERS
+        // or SPILL SLOTS. Those are not slots the collector can find, and they
+        // are not slots it can rewrite. `gen_heap` states the rule plainly at
+        // its own divert (`gen_heap.rs:5629`): such objects "cannot be
+        // relocated (raw register/spill slots can't be rewritten)", so it runs
+        // the non-moving sweep instead. G1 reads the same flag. **ZGC read it
+        // ZERO times** -- 9 call sites in `gen_heap`, 6 in `g1`, none here --
+        // and has been sliding objects out from under live compiled frames
+        // since compaction went default-on on 2026-08-13.
+        //
+        // `pinned_jit_roots_snapshot()`, which this function DOES consume a
+        // few lines below, is not a substitute. It is the set of addresses a
+        // CONSERVATIVE STACK scan recovered; a pointer that never left a
+        // register is not in it, so its page is not withheld and the object
+        // slides anyway.
+        //
+        // Measured on `io.netty.util.ResourceLeakDetectorTest`: the faulting
+        // pc is inside compiled `LeakAwareResource.close()Z`, the crash dump
+        // reports `guarded compiled frames live process-wide: YES (quiescence
+        // depth=101)`, and every logged stale access is a WRITE to field 0 of
+        // a `DefaultResourceLeak` the last slide moved -- i.e. compiled code
+        // performing `Reference.clear()` through a pre-move address.
+        //
+        // The cost is real and is the same cost the other two collectors pay:
+        // a JIT-busy process compacts less often. `relocation_skipped_jit` is
+        // exported so that cost is visible rather than inferred, because on
+        // this collector deferred compaction is also deferred defragmentation.
+        // Correctness first: a slide under a live compiled frame corrupts the
+        // heap, and fragmentation only wastes it.
+        if crate::gc_quiescence::is_active()
+            || crate::gc_quiescence::unregistered_jit_frame_on_stack()
+        {
+            self.relocation_skipped_jit.fetch_add(1, Ordering::Relaxed);
+            let reclaimed = self.arena.lock().retract_cursor_into_free_tail();
+            return (0, reclaimed, cratonvm_types::PointerMap::default());
+        }
         // `relocate::ZRelocationRecord` rather than a local map: it is the
         // module's from->to ledger, it builds the `PointerMap` this function
         // must return, and it carries the reserve so a large evacuation does
@@ -4082,12 +4154,22 @@ impl ZgcRealHeap {
             // header now lives at `to`) and before `compact_low_to` has
             // zeroed anything at `from`.
             if zgc_corpse_enabled() {
+                let cycle = self.corpse_cycle.fetch_add(1, Ordering::Relaxed);
                 let mut ledger = self.corpse_ledger.lock();
-                ledger.clear();
                 for (from, to) in &pairs {
                     let h = self.header_ref(*to as *mut u8);
                     let size = Self::alloc_size(h).unwrap_or(0);
-                    ledger.insert(*from, (*to, h.class_id.as_u32(), size));
+                    ledger.insert(*from, (*to, h.class_id.as_u32(), size, cycle));
+                }
+                // Bound it. Dropping the OLDEST cycles keeps the recent
+                // history, which is where a same-cycle stale read lives; a
+                // very old corpse still reports through the `None` arm as
+                // "not a recent relocation source", which is the same
+                // conclusion the entry would have supported.
+                const MAX: usize = 400_000;
+                if ledger.len() > MAX {
+                    let cutoff = cycle.saturating_sub(8);
+                    ledger.retain(|_, (_, _, _, c)| *c >= cutoff);
                 }
             }
         }
@@ -5145,15 +5227,15 @@ impl ZgcRealHeap {
     /// in-bounds slot count, or `None` (caller treats as no-op / null) when
     /// the header is suspect or the index is out of range. Mirrors the guards
     /// in `g1::get_field` / `gen_heap`.
-    fn check_field_index(&self, header: &ObjectHeader, index: usize) -> Option<usize> {
+    fn check_field_index(&self, header: &ObjectHeader, index: usize, op: &'static str) -> Option<usize> {
         let num_slots = header.num_slots() as usize;
         if num_slots > (1 << 24) {
-            tracing::debug!(target: "zgc", index, num_slots, "zgc real: suspect header");
+            tracing::debug!(target: "zgc", index, num_slots, op, "zgc real: suspect header");
             return None;
         }
         if index >= num_slots {
-            tracing::warn!(target: "zgc", index, num_slots, "zgc real: field index OOB");
-            self.report_corpse_read(header, index);
+            tracing::warn!(target: "zgc", index, num_slots, op, "zgc real: field index OOB");
+            self.report_corpse_read(header, index, op);
             return None;
         }
         Some(num_slots)
@@ -5191,7 +5273,7 @@ impl ZgcRealHeap {
     /// would bury the first one -- which is the only one whose heap state is
     /// still close to the fault.
     #[cold]
-    fn report_corpse_read(&self, header: &ObjectHeader, index: usize) {
+    fn report_corpse_read(&self, header: &ObjectHeader, index: usize, op: &'static str) {
         if !zgc_corpse_enabled() {
             return;
         }
@@ -5207,14 +5289,31 @@ impl ZgcRealHeap {
             ledger.get(&addr).copied().map(|v| (addr, v)).or_else(|| {
                 ledger
                     .iter()
-                    .find(|(from, (_, _, size))| addr > **from && addr < **from + *size)
+                    .find(|(from, (_, _, size, _))| addr > **from && addr < **from + *size)
                     .map(|(from, v)| (*from, *v))
             })
         };
-        let backtrace = std::backtrace::Backtrace::force_capture().to_string();
+        // `exe+RVA` rather than a symbolized backtrace: see
+        // `gc_quiescence::native_rvas` for why `Backtrace::force_capture`
+        // yields nothing but `<unknown>` in this tree's release profile.
+        // Paste the list into `CRATONVM_SYMBOLIZE` with the SAME binary (and
+        // its PDB in place, i.e. `target/release/cratonvm.exe`, not a renamed
+        // copy -- the debug directory records the original PDB path).
+        let backtrace = {
+            let rvas = crate::gc_quiescence::native_rvas();
+            if rvas.is_empty() {
+                std::backtrace::Backtrace::force_capture().to_string()
+            } else {
+                rvas.iter()
+                    .map(|r| format!("0x{r:X}"))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            }
+        };
         match hit {
-            Some((from, (to, class_id, size))) => {
+            Some((from, (to, class_id, size, cycle))) => {
                 let still_live = self.registry.contains(to);
+                let cycles_ago = self.corpse_cycle.load(Ordering::Relaxed).saturating_sub(cycle + 1);
                 tracing::error!(
                     target: "cratonvm::gc::guard",
                     read_addr = addr,
@@ -5225,7 +5324,19 @@ impl ZgcRealHeap {
                     class_id,
                     class = %crate::collector::class_name_for_diagnostics(class_id),
                     survivor_still_registered = still_live,
+                    root_source = crate::gc_quiescence::root_source_of(addr)
+                        .unwrap_or("<none: not handed to the marker as a root>"),
+                    vacated_in_cycle = cycle,
+                    cycles_ago,
                     index,
+                    // READ or WRITE decides who is holding it. A WRITE at
+                    // index 0 of a `Reference` is somebody clearing a
+                    // referent -- the collector or the reference processor. A
+                    // READ is Java code, or the VM reading `referent` on
+                    // behalf of `Reference.get`. The two want entirely
+                    // different searches, and the zeroed header cannot tell
+                    // them apart.
+                    op,
                     %backtrace,
                     "zgc corpse read: this address was vacated by the LAST slide --                      something still holds the pre-move address"
                 );
@@ -5239,6 +5350,10 @@ impl ZgcRealHeap {
                     target: "cratonvm::gc::guard",
                     read_addr = addr,
                     index,
+                    root_source = crate::gc_quiescence::root_source_of(addr)
+                        .unwrap_or("<none: not handed to the marker as a root>"),
+                    slides_so_far = self.corpse_cycle.load(Ordering::Relaxed),
+                    op,
                     in_registry = self.registry.contains(addr),
                     %backtrace,
                     "zgc corpse read: OOB read at an address the LAST slide did not                      vacate -- older cycle, or never a relocation source"
@@ -5359,8 +5474,14 @@ impl ZgcRealHeap {
 
         // Drop bookkeeping for Reference objects that did not survive this
         // cycle so the registry does not grow without bound and stale indices
-        // are rebuilt. (Non-moving: addresses are stable, so no
-        // `update_after_gc` relocation is needed.)
+        // are rebuilt.
+        //
+        // Runs BEFORE the slide, so every address here is still the one the
+        // mark bits describe -- which is what makes this screen correct and
+        // what keeps it from colliding with the relocation. The relocation
+        // half is `update_after_gc`, driven from `collect_garbage` once the
+        // pointer map exists; this comment used to claim it was unnecessary
+        // because the collector never moved anything.
         let is_live = |addr: usize| self.is_marked_addr(addr);
         rp.remove_collected(&is_live);
 
@@ -7653,7 +7774,7 @@ impl GarbageCollector for ZgcRealHeap {
 
     fn get_field(&self, obj: ObjectRef, index: usize) -> Value {
         let header = self.header(obj);
-        if self.check_field_index(header, index).is_none() {
+        if self.check_field_index(header, index, "get").is_none() {
             return Value::Object(None);
         }
         if let Some((offset, storage)) =
@@ -7736,7 +7857,7 @@ impl GarbageCollector for ZgcRealHeap {
 
     fn set_field(&self, obj: ObjectRef, index: usize, value: Value) {
         let header = self.header(obj);
-        if self.check_field_index(header, index).is_none() {
+        if self.check_field_index(header, index, "set").is_none() {
             return;
         }
         if let Some((offset, storage)) =
@@ -8194,7 +8315,12 @@ impl GarbageCollector for ZgcRealHeap {
                 if header.gc_flags() & GC_FLAG_MARKED != 0 {
                     continue; // survived normally — stays registered, not finalized
                 }
-                resurrected.push(addr); // non-moving: address unchanged
+                // Recorded PRE-slide; `collect_garbage` rewrites the list
+                // through the pointer map once relocation has run, because the
+                // contract with `collect_garbage_with_finalizers`'s caller is
+                // POST-move addresses. This line used to say "non-moving:
+                // address unchanged".
+                resurrected.push(addr);
                 work.push(addr);
                 while let Some(a) = work.pop() {
                     if a == 0 || !registered.contains(a) {
@@ -8598,6 +8724,73 @@ impl GarbageCollector for ZgcRealHeap {
         // and creates the other.
         monitors.prune_dead(&dead);
         monitors.remap_after_gc(&pointer_map);
+
+        // THE REFERENCE PROCESSOR'S OWN TABLES MOVE TOO.
+        //
+        // `ref_processor` holds raw `usize` addresses -- `reference_obj`,
+        // `referent` and `queue_addr` for every discovered soft/weak/phantom/
+        // cleaner/finalizer `Reference`, plus the soft-ref address index and
+        // the finalization queue. They are collector-side tables, not Java
+        // slots, so the rewrite pass in `relocate_and_compact` cannot see them
+        // and `pointer_map` never reached them.
+        //
+        // `process_references` said, until 2026-08-15:
+        //
+        //     (Non-moving: addresses are stable, so no `update_after_gc`
+        //     relocation is needed.)
+        //
+        // True when it was written and false since compaction went default-on
+        // on 2026-08-13 -- the same expired premise as the JNI critical pin,
+        // the reference-processing guard and the monitor prune. Unlike those,
+        // this one survives ACROSS cycles: the tables persist, and next
+        // cycle's `pointer_map` does not contain last cycle's pre-move
+        // addresses, so a stale entry is stale forever.
+        //
+        // What it costs, both directions, on the NEXT collection:
+        //
+        //  * `is_marked_addr(stale)` reads the zeroed span `compact_low_to`
+        //    left behind, finds no mark bit, and `remove_collected` drops the
+        //    entry -- a LIVE `WeakReference` silently leaves the processor and
+        //    is never cleared or enqueued. No `Cleaner`, no queue delivery.
+        //  * If a new object has since been allocated at that address and IS
+        //    marked, `process_references` instead writes null into FIELD 0 of
+        //    an unrelated live object. That is the `field index OOB index=0
+        //    num_slots=0` signature when the new occupant has no slots.
+        //
+        // ZGC is the only backend that owns a live `ReferenceProcessor` (G1
+        // constructs one only in its tests), which is why this presents as a
+        // ZGC-only defect on the one netty class built entirely out of weak
+        // references.
+        //
+        // Placed AFTER the monitor remap for the same reason that one is
+        // ordered as it is, though the collision cannot arise here:
+        // `remove_collected` already ran in `process_references`, BEFORE the
+        // slide, so no dead entry is left for a survivor to inherit.
+        if !pointer_map.is_empty() {
+            self.ref_processor.lock().update_after_gc(&pointer_map);
+
+            // SAME FAMILY: the resurrected-finalizer list is an OUTPUT, and
+            // its contract says POST-move.
+            //
+            // `collect_garbage_with_finalizers` returns these addresses to the
+            // runtime, which enqueues each one on the `FinalizerThread` --
+            // "(their new addresses)", as the call site in
+            // `vm/src/runtime/interpreter/gc_and_alloc.rs` puts it. G1 states
+            // the contract outright: "the POST-copy addresses of objects Phase
+            // 3.5 resurrected this collection".
+            //
+            // Here the list is filled during the remark, several phases BEFORE
+            // the slide, and nothing rewrote it. Every resurrected object is by
+            // definition live, so it is exactly the kind of object the slide
+            // relocates -- and `finalize()` would then run against the vacated
+            // address.
+            let mut resurrected = self.resurrected_finalizers.lock();
+            for addr in resurrected.iter_mut() {
+                if let Some(&new) = pointer_map.get(addr) {
+                    *addr = new;
+                }
+            }
+        }
 
         GcResult {
             stats: GcStats {
@@ -11155,6 +11348,326 @@ pub(crate) mod tests {
             Value::Object(None),
             "the reachable child must have survived the driven cycle"
         );
+    }
+
+    /// **A resurrected finalizable object must be reported at its POST-SLIDE
+    /// address.**
+    ///
+    /// `collect_garbage_with_finalizers` returns the addresses of objects the
+    /// remark resurrected, and the runtime enqueues each one on the
+    /// `FinalizerThread` -- "(their new addresses)", per the call site in
+    /// `vm/src/runtime/interpreter/gc_and_alloc.rs`. G1 states the contract
+    /// outright: "the POST-copy addresses of objects Phase 3.5 resurrected
+    /// this collection".
+    ///
+    /// ZGC filled the list during the remark, several phases before the slide,
+    /// and never rewrote it -- under a comment reading "non-moving: address
+    /// unchanged". A resurrected object is live by definition, so it is
+    /// precisely what the slide relocates, and `finalize()` would then run
+    /// against a vacated address.
+    ///
+    /// The exact edit that trips it: drop the `resurrected_finalizers` remap
+    /// in `collect_garbage`.
+    #[test]
+    fn a_resurrected_finalizable_object_is_reported_at_its_post_slide_address() {
+        const PAGE: usize = ZgcRealHeap::Z_LOGICAL_PAGE_BYTES;
+        const FIELDS: usize = 500;
+        let heap = ZgcRealHeap::with_capacity(64 * 1024 * 1024);
+        heap.set_tlab_enabled(false);
+
+        let per_page = PAGE / (HEADER_SIZE + FIELDS * SLOT_SIZE);
+        let mut roots: Vec<ObjectRef> = Vec::new();
+        let mut finalizable: Vec<usize> = Vec::new();
+        for _page in 0..4 {
+            for i in 0..per_page {
+                let o = heap.alloc_object(ClassId::new(1), FIELDS);
+                // Both survivor kinds are counted against the selector's
+                // `max_live_occupancy` (0.25), so 1-in-5 each would leave every
+                // page 40% live and the selector would decline the whole heap
+                // -- nothing moves and the test passes vacuously. 1-in-12 each
+                // keeps total occupancy near 17%.
+                match i % 12 {
+                    // Rooted: ordinary survivors.
+                    0 => roots.push(o),
+                    // Unrooted AND registered for finalization: dead by the
+                    // trace, resurrected by the remark.
+                    1 => finalizable.push(o.as_ptr() as usize),
+                    _ => {}
+                }
+            }
+        }
+        assert!(!finalizable.is_empty(), "fixture registered no finalizables");
+
+        // SAFETY: these unit tests run the heap single-threaded.
+        let stw = unsafe { StopTheWorldToken::new() };
+        let monitors = NoMonitors;
+        let (result, reported) = cratonvm_types::flags::with_thread_overrides(
+            &[("CRATONVM_ZGC_RELOCATE", Some("1"))],
+            || heap.collect_garbage_with_finalizers(&stw, &mut roots, &finalizable, &monitors),
+        );
+        assert!(
+            !reported.is_empty(),
+            "nothing was resurrected, so a stale address could not be observed"
+        );
+
+        // Non-vacuity measured from the POINTER MAP, not from `reported`.
+        //
+        // Deriving it from `reported` looks natural and is a trap: with the
+        // remap missing, `reported` holds the pre-slide addresses, so "how
+        // many reported addresses differ from their input" is ZERO -- and the
+        // test then fails on its own vacuity guard, which reads as a broken
+        // fixture rather than as the defect. The pointer map is the collector's
+        // own record of what moved and is unaffected by the bug under test.
+        let relocated: Vec<usize> = finalizable
+            .iter()
+            .copied()
+            .filter(|a| result.pointer_map.contains_key(a))
+            .collect();
+        assert!(
+            !relocated.is_empty(),
+            "the slide relocated none of the {} resurrected object(s), so this              fixture cannot see a missing remap -- check that page occupancy is              below the selector's max_live_occupancy",
+            reported.len()
+        );
+
+        let stale: Vec<usize> = reported
+            .iter()
+            .copied()
+            .filter(|a| !heap.registry.contains(*a))
+            .collect();
+        assert!(
+            stale.is_empty(),
+            "{} of {} resurrected finalizable object(s) were reported at an              address that is not a live allocation base after the slide (first              0x{:x}). The runtime enqueues these on the FinalizerThread, so              `finalize()` would run against a vacated span.",
+            stale.len(),
+            reported.len(),
+            stale[0],
+        );
+
+        // And each object that DID move must be reported at its destination.
+        let reported_set: std::collections::HashSet<usize> =
+            reported.iter().copied().collect();
+        let missing: Vec<usize> = relocated
+            .iter()
+            .copied()
+            .filter(|a| !reported_set.contains(&result.pointer_map[a]))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "{} of {} relocated resurrected object(s) are reported at their              PRE-slide address (first: was 0x{:x}, is now 0x{:x})",
+            missing.len(),
+            relocated.len(),
+            missing[0],
+            result.pointer_map[&missing[0]],
+        );
+    }
+
+    /// **No object may be relocated while a compiled frame is live.**
+    ///
+    /// A JIT frame can hold an object pointer in a register or a spill slot.
+    /// The collector cannot find those and cannot rewrite them, so an object a
+    /// compiled frame is using must not move. `gen_heap` diverts to its
+    /// non-moving sweep for exactly this reason and G1 reads the same flag;
+    /// ZGC read it zero times and slid anyway.
+    ///
+    /// Asserted both ways in ONE test, because only the pair is meaningful: a
+    /// heap that never relocates would satisfy the refusal trivially, and a
+    /// fixture too dense for the selector would satisfy it by accident. The
+    /// second half proves the same fixture DOES relocate once the guard is
+    /// dropped, so the first half is measuring the guard and not the fixture.
+    ///
+    /// The exact edit that trips it: remove the `is_active()` early return
+    /// from `relocate_stw`.
+    #[test]
+    fn a_live_compiled_frame_forbids_relocation_and_only_that_forbids_it() {
+        const PAGE: usize = ZgcRealHeap::Z_LOGICAL_PAGE_BYTES;
+        const FIELDS: usize = 500;
+
+        // Same sparse fixture both times: 1-in-12 live keeps page occupancy
+        // near 8%, well under the selector's 0.25 `max_live_occupancy`.
+        let build = || {
+            let heap = ZgcRealHeap::with_capacity(64 * 1024 * 1024);
+            heap.set_tlab_enabled(false);
+            let per_page = PAGE / (HEADER_SIZE + FIELDS * SLOT_SIZE);
+            let mut roots: Vec<ObjectRef> = Vec::new();
+            for _page in 0..4 {
+                for i in 0..per_page {
+                    let o = heap.alloc_object(ClassId::new(1), FIELDS);
+                    if i % 12 == 0 {
+                        roots.push(o);
+                    }
+                }
+            }
+            let pre: Vec<usize> = roots.iter().map(|o| o.as_ptr() as usize).collect();
+            (heap, roots, pre)
+        };
+        let moved_count = |roots: &[ObjectRef], pre: &[usize]| {
+            roots
+                .iter()
+                .zip(pre.iter())
+                .filter(|(now, was)| now.as_ptr() as usize != **was)
+                .count()
+        };
+
+        // --- guard held: nothing may move ---------------------------------
+        let (heap, mut roots, pre) = build();
+        // SAFETY: these unit tests run the heap single-threaded.
+        let stw = unsafe { StopTheWorldToken::new() };
+        let guard_depth = crate::gc_quiescence::enter();
+        assert!(
+            crate::gc_quiescence::is_active(),
+            "the fixture must actually arm quiescence, or the refusal is untested"
+        );
+        cratonvm_types::flags::with_thread_overrides(
+            &[("CRATONVM_ZGC_RELOCATE", Some("1"))],
+            || {
+                heap.collect_garbage(&stw, &mut roots, &NoMonitors);
+            },
+        );
+        let _ = guard_depth;
+        crate::gc_quiescence::leave();
+        let moved_under_guard = moved_count(&roots, &pre);
+        assert_eq!(
+            moved_under_guard, 0,
+            "{moved_under_guard} object(s) were relocated while a compiled              frame was live -- their pointers may sit in registers or spill              slots that no rewrite pass can reach"
+        );
+        assert!(
+            heap.relocation_skipped_jit.load(Ordering::Relaxed) > 0,
+            "nothing moved, but the JIT refusal never fired -- the fixture is              passing for some other reason (check page occupancy against              max_live_occupancy)"
+        );
+
+        // --- guard released: the SAME fixture must move ---------------------
+        let (heap2, mut roots2, pre2) = build();
+        assert!(
+            !crate::gc_quiescence::is_active(),
+            "quiescence leaked out of the first half"
+        );
+        cratonvm_types::flags::with_thread_overrides(
+            &[("CRATONVM_ZGC_RELOCATE", Some("1"))],
+            || {
+                heap2.collect_garbage(&stw, &mut roots2, &NoMonitors);
+            },
+        );
+        assert!(
+            moved_count(&roots2, &pre2) > 0,
+            "the fixture relocates nothing even with no compiled frame live,              so the first half proved nothing about the guard"
+        );
+        assert_eq!(
+            heap2.relocation_skipped_jit.load(Ordering::Relaxed),
+            0,
+            "the refusal fired with no compiled frame live"
+        );
+    }
+
+    /// **A `Reference` the collector moved must be findable at its NEW
+    /// address in the reference processor's own tables.**
+    ///
+    /// `ref_processor` stores raw `usize` addresses for every discovered
+    /// `Reference` -- the reference object, its referent, its queue. They are
+    /// collector-side tables, not Java reference slots, so
+    /// `relocate_and_compact`'s rewrite pass never sees them and the pointer
+    /// map reached them only if somebody called `update_after_gc`. Nobody did:
+    /// `process_references` carried a comment saying relocation was
+    /// unnecessary because the collector does not move objects, which stopped
+    /// being true on 2026-08-13.
+    ///
+    /// Unlike its three siblings (the JNI critical pin, the reference-guard
+    /// address, the monitor prune) this one persists ACROSS cycles. The tables
+    /// outlive the collection, and the next cycle's pointer map does not
+    /// contain this cycle's pre-move addresses, so a missed entry is stale for
+    /// the rest of the process.
+    ///
+    /// Asserted as an END STATE -- every stored address resolves to a live
+    /// allocation base -- rather than by counting remap calls, because the
+    /// contract is about where the addresses point and not about who moved
+    /// them.
+    ///
+    /// The exact edit that trips it: drop the `update_after_gc` call in
+    /// `collect_garbage`.
+    #[test]
+    fn a_relocated_reference_is_reachable_at_its_new_address_in_the_processor() {
+        const PAGE: usize = ZgcRealHeap::Z_LOGICAL_PAGE_BYTES;
+        const FIELDS: usize = 500;
+        let heap = ZgcRealHeap::with_capacity(64 * 1024 * 1024);
+        heap.set_tlab_enabled(false);
+
+        let per_page = PAGE / (HEADER_SIZE + FIELDS * SLOT_SIZE);
+        let mut roots: Vec<ObjectRef> = Vec::new();
+        let mut pre: Vec<usize> = Vec::new();
+        // Every fifth object survives; of the survivors, every other one is
+        // registered as a weak `Reference`. Both the reference object AND its
+        // referent are rooted -- referent-slot hiding means the referent is
+        // not traced through the `Reference`, and a dead referent would have
+        // the entry cleared and removed before it could be relocated, which
+        // would make this test pass for the wrong reason.
+        for _page in 0..4 {
+            for i in 0..per_page {
+                let o = heap.alloc_object(ClassId::new(1), FIELDS);
+                if i % 5 == 0 {
+                    roots.push(o);
+                    pre.push(o.as_ptr() as usize);
+                }
+            }
+        }
+        let mut registered: Vec<(usize, usize)> = Vec::new(); // (ref_obj, referent)
+        for pair in roots.clone().chunks_exact(2) {
+            heap.discover_reference(ReferenceType::Weak, pair[0], pair[1], None);
+            registered.push((pair[0].as_ptr() as usize, pair[1].as_ptr() as usize));
+        }
+        assert!(!registered.is_empty(), "fixture registered no references");
+
+        // SAFETY: these unit tests run the heap single-threaded.
+        let stw = unsafe { StopTheWorldToken::new() };
+        let monitors = NoMonitors;
+        cratonvm_types::flags::with_thread_overrides(
+            &[("CRATONVM_ZGC_RELOCATE", Some("1"))],
+            || {
+                heap.collect_garbage(&stw, &mut roots, &monitors);
+            },
+        );
+
+        // A fixture where nothing moved would pass with the fix reverted.
+        let moved = roots
+            .iter()
+            .zip(pre.iter())
+            .filter(|(now, was)| now.as_ptr() as usize != **was)
+            .count();
+        assert!(
+            moved > 0,
+            "the fixture must relocate survivors, or a missing remap is invisible"
+        );
+
+        // Where each survivor ended up, keyed by where it started.
+        let where_now: std::collections::HashMap<usize, usize> = pre
+            .iter()
+            .zip(roots.iter())
+            .map(|(was, now)| (*was, now.as_ptr() as usize))
+            .collect();
+
+        let stored = heap.ref_processor.lock().reference_object_addresses();
+        let stored_set: std::collections::HashSet<usize> = stored.iter().copied().collect();
+
+        let mut stale = Vec::new();
+        for (ref_obj, _referent) in &registered {
+            let expected = where_now[ref_obj];
+            if !stored_set.contains(&expected) {
+                stale.push((*ref_obj, expected));
+            }
+        }
+        assert!(
+            stale.is_empty(),
+            "{} of {} registered Reference object(s) are still recorded at their              PRE-SLIDE address in the reference processor. First: was 0x{:x}, is now              0x{:x}. On the next collection that address is a zeroed vacated span,              so `is_marked_addr` reports the Reference dead and the entry is dropped              (a live WeakReference that will never be cleared or enqueued) -- or a              new object now occupies it and `process_references` writes null into              ITS field 0.",
+            stale.len(),
+            registered.len(),
+            stale[0].0,
+            stale[0].1,
+        );
+
+        // And nothing may be left pointing outside the live set.
+        for addr in &stored {
+            assert!(
+                heap.registry.contains(*addr),
+                "reference processor holds 0x{addr:x}, which is not a live                  allocation base after the slide"
+            );
+        }
     }
 
     /// **A survivor must keep its OWN monitor, and must never inherit a dead

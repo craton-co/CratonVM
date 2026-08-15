@@ -2373,10 +2373,20 @@ impl VmHeap {
             // the pool-only path this replaced produced identical mark bits,
             // identical stats and an identical `parallel_mark_cycles`.
             let (driver_passes, mark_fallbacks) = h.driver_engagement();
+            // `relocation_skipped_jit` belongs NEXT TO `compaction_cycles`, not
+            // on a line of its own: alone, `compaction_cycles=0` reads as a
+            // broken collector; beside a large skip count it reads as a
+            // workload that is never JIT-quiet. ZGC declines to relocate while
+            // a compiled frame is live (its registers and spill slots cannot be
+            // rewritten), so a JIT-saturated run legitimately compacts rarely
+            // -- and compaction is this collector's only defragmentation, so
+            // that is a number somebody needs to see.
+            let skipped_jit = h.relocation_skipped_jit();
             eprintln!(
                 "[GC] zgc-features: parallel_mark_cycles={par_cycles} \
                  driver_passes={driver_passes} mark_fallbacks={mark_fallbacks} \
-                 compaction_cycles={compactions} objects_relocated={relocated}"
+                 compaction_cycles={compactions} objects_relocated={relocated} \
+                 relocation_skipped_jit={skipped_jit}"
             );
             let g = h.frag_gauge();
             match g.worst_permille {
