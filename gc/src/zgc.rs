@@ -4003,7 +4003,51 @@ impl ZgcRealHeap {
                 .expect("non-empty, checked above");
             let slide_floor = base + first_selected_page as usize * Self::Z_LOGICAL_PAGE_BYTES;
 
+            // OBSTACLES: live objects that will not move but occupy bytes of a
+            // page that IS selected.
+            //
+            // Page membership is decided by an object's BASE, so an object
+            // based in an unselected page and extending across the boundary
+            // keeps its tail inside the selected page above -- and it is not in
+            // `survivors`, so it never moves. "This page is selected" and
+            // "these bytes are free" are therefore different claims, and the
+            // slide had only the first one.
+            //
+            // The probe aimed straight at the hazard: when a span touched an
+            // unselected page it restarted at `base + (blocked + 1) * PAGE` --
+            // the first byte of the next page, which is exactly where a
+            // straddler from the previous page lies. `slide_floor` has the same
+            // shape. Measured by
+            // `compaction_never_writes_into_an_object_it_did_not_move`.
+            //
+            // The list is tiny -- only an object crossing a boundary out of an
+            // unselected page can qualify, at most one per boundary -- so a
+            // sorted `Vec` and a short scan cost nothing beside the slide.
+            let mut obstacles: Vec<(usize, usize)> = live
+                .iter()
+                .copied()
+                .filter(|b| *b >= base && *b < low_end)
+                .filter(|b| !selected.contains(&page_of(*b)))
+                .filter_map(|b| {
+                    let sz = Self::alloc_size(self.header_ref(b as *mut u8))?;
+                    (page_of(b) != page_of(b + sz - 1)).then_some((b, b + sz))
+                })
+                .collect();
+            obstacles.sort_unstable();
+            // End of an obstacle overlapping `[lo, hi)`, if any.
+            let blocked_until = |lo: usize, hi: usize| -> Option<usize> {
+                obstacles
+                    .iter()
+                    .take_while(|(ob, _)| *ob < hi)
+                    .find(|(_, oe)| *oe > lo)
+                    .map(|(_, oe)| *oe)
+            };
+
+            // The floor itself can land inside a straddler's tail.
             let mut dest = slide_floor;
+            if let Some(end) = blocked_until(dest, dest + 1) {
+                dest = end;
+            }
             for from in survivors {
                 let Some(size) = Self::alloc_size(self.header_ref(from as *mut u8)) else {
                     // A header this collector cannot size cannot be moved, and
@@ -4059,10 +4103,19 @@ impl ZgcRealHeap {
                         Some(blocked) => {
                             probe = base + (blocked as usize + 1) * Self::Z_LOGICAL_PAGE_BYTES;
                         }
-                        None => {
-                            chosen = Some(cand);
-                            break;
-                        }
+                        // Every page of the span is selected -- which still
+                        // does not mean the bytes are free. Re-check against the
+                        // straddlers that reach into these pages from below,
+                        // and restart above the one in the way. Also strictly
+                        // increasing (an obstacle's end exceeds `cand`), so the
+                        // loop still terminates.
+                        None => match blocked_until(cand, cand + span) {
+                            Some(end) => probe = end,
+                            None => {
+                                chosen = Some(cand);
+                                break;
+                            }
+                        },
                     }
                 }
                 match chosen {
@@ -4275,10 +4328,18 @@ impl ZgcRealHeap {
     /// rewriting. It is reported as a field because it is informative, and it
     /// is not allowed to veto.
     ///
-    /// `was_vacated` is the field that discriminates the causes. If the slide
-    /// vacated this exact address, the object was overwritten and the bug is in
-    /// the slide's bookkeeping. If it did not, the header was already wrong
-    /// before relocation ran, and compaction is only the messenger.
+    /// `was_vacated` discriminates the causes: if THIS slide vacated the exact
+    /// address, the object was overwritten by this cycle's bookkeeping.
+    ///
+    /// **Read `was_vacated=false` narrowly.** `moved_from` covers one cycle, so
+    /// an address vacated nine collections ago also reports `false`. On the
+    /// netty repro every offender reported `false` while its "header" decoded
+    /// as ASCII — `class_id=0x41524150` is `"PARA"`, `num_slots=0x444f494e` is
+    /// `"NOID"`, i.e. netty's `PARANOID` level string, and neighbours spelled
+    /// `io/netty`. So the registry held bases pointing into STRING data: the
+    /// same bytes were two things at once, from an earlier cycle. Widening this
+    /// to a multi-cycle set (as `corpse_ledger` already is) is the obvious
+    /// improvement if this fires again.
     #[must_use]
     fn rewrite_target_is_walkable(
         &self,
@@ -10111,6 +10172,154 @@ pub(crate) mod tests {
             Value::Object(Some(r)) => assert_eq!(r.as_ptr(), elem.as_ptr()),
             other => panic!("expected element reference, got {other:?}"),
         }
+    }
+
+    /// **Compaction must not write into an object it did not move.**
+    ///
+    /// The slide reasons in PAGES: it places a survivor wherever the whole
+    /// destination span lies inside selected pages. But "this page is selected"
+    /// is not the same claim as "these bytes are free — the low bytes of a
+    /// selected page can be the TAIL of an object based in the unselected page
+    /// below it, and that object is not in `survivors` (membership is decided
+    /// by its base) so it never moves.
+    ///
+    /// The probe's own restart rule aims at exactly that address: when a span
+    /// would touch an unselected page it retries at
+    /// `base + (blocked + 1) * PAGE`, i.e. the first byte of the next page —
+    /// which is precisely where a straddler from the previous page lies.
+    /// `slide_floor` has the same shape.
+    ///
+    /// Checked as an invariant over the whole heap rather than by constructing
+    /// one straddler, because the fixture that reliably produces a straddle at
+    /// a selected/unselected boundary is far more delicate than the property
+    /// itself, and a delicate fixture that stops straddling is a test that
+    /// silently stops testing.
+    ///
+    /// Reference slots ARE allowed to change: rewriting them is the pass's job.
+    /// Every other byte of an unmoved object must be identical.
+    #[test]
+    fn compaction_never_writes_into_an_object_it_did_not_move() {
+        const PAGE: usize = ZgcRealHeap::Z_LOGICAL_PAGE_BYTES;
+        let heap = ZgcRealHeap::with_capacity(64 * 1024 * 1024);
+        heap.set_tlab_enabled(false);
+
+        // Mixed sizes so objects land at varied offsets and some cross page
+        // boundaries; mixed liveness so the selector finds pages worth taking
+        // and pages worth refusing.
+        let arena_base = heap.arena.lock().base_ptr() as usize;
+        let mut roots: Vec<ObjectRef> = Vec::new();
+        let mut i = 0usize;
+        while heap.allocated_bytes() < 5 * PAGE {
+            let fields = 8 + (i % 700);
+            let o = heap.alloc_object(ClassId::new(1), fields);
+            let b = o.as_ptr() as usize;
+            let sz = ZgcRealHeap::alloc_size(heap.header_ref(b as *mut u8)).unwrap();
+            // KEEP EVERY STRADDLER ALIVE. Rooting them by luck is what made the
+            // first version of this test vacuous: only ~4 objects cross a
+            // boundary in a 10 MiB fill, and with a third of objects live the
+            // fixture regularly contained none. A dead straddler cannot be
+            // written into by mistake — it is garbage either way — so the
+            // hazard needs a live one, deliberately.
+            let straddles = (b - arena_base) / PAGE != (b + sz - 1 - arena_base) / PAGE;
+            // Dense band then sparse band, alternating per ~page, so the
+            // selector has both kinds to choose between and some pages are
+            // refused — an unselected page below a selected one is the other
+            // half of the hazard.
+            let dense = (heap.allocated_bytes() / PAGE) % 2 == 0;
+            if straddles || (dense && i % 2 == 0) || (!dense && i % 11 == 0) {
+                roots.push(o);
+            }
+            i += 1;
+        }
+
+        // Body snapshot of every live object, keyed by pre-GC base.
+        let snapshot: Vec<(usize, usize, Vec<u8>)> = roots
+            .iter()
+            .map(|o| {
+                let b = o.as_ptr() as usize;
+                let sz = ZgcRealHeap::alloc_size(heap.header_ref(b as *mut u8))
+                    .expect("fixture objects must be sizable");
+                // SAFETY: `b` is a live base of `sz` bytes in this heap.
+                let bytes = unsafe { std::slice::from_raw_parts(b as *const u8, sz) }.to_vec();
+                (b, sz, bytes)
+            })
+            .collect();
+
+        // SAFETY: these unit tests run the heap single-threaded.
+        let stw = unsafe { StopTheWorldToken::new() };
+        cratonvm_types::flags::with_thread_overrides(
+            &[("CRATONVM_ZGC_RELOCATE", Some("1"))],
+            || {
+                heap.collect_garbage(&stw, &mut roots, &NoMonitors);
+            },
+        );
+
+        let moved: usize = roots
+            .iter()
+            .zip(snapshot.iter())
+            .filter(|(now, (was, _, _))| now.as_ptr() as usize != *was)
+            .count();
+        assert!(
+            moved > 0,
+            "the fixture relocated nothing, so it cannot see the slide writing \
+             into a bystander"
+        );
+        // The hazard needs a live object whose extent CROSSES a page boundary:
+        // without one, nothing can be based in page N and occupy bytes of page
+        // N+1, and this test passes for a reason unrelated to the property.
+        // Asserted from the pre-GC snapshot, which is the state the slide saw.
+        let straddlers = snapshot
+            .iter()
+            .filter(|(b, sz, _)| {
+                let lo = b.saturating_sub(arena_base) / PAGE;
+                let hi = (b + sz - 1).saturating_sub(arena_base) / PAGE;
+                lo != hi
+            })
+            .count();
+        assert!(
+            straddlers > 0,
+            "no live object in this fixture crosses a page boundary, so it cannot \
+             exercise the tail-of-a-straddler hazard at all -- widen the size mix \
+             or the heap until some do"
+        );
+
+        let mut clobbered = Vec::new();
+        for (now, (was, sz, before)) in roots.iter().zip(snapshot.iter()) {
+            if now.as_ptr() as usize != *was {
+                continue; // it moved; its old bytes are fair game
+            }
+            // SAFETY: unmoved, so still a live base of `sz` bytes.
+            let after = unsafe { std::slice::from_raw_parts(*was as *const u8, *sz) };
+            // Compare in 8-byte words and forgive a word the rewrite pass could
+            // legitimately have re-pointed (old value was a relocated base).
+            let mut diffs = 0usize;
+            for w in 0..(*sz / 8) {
+                let o = u64::from_ne_bytes(before[w * 8..w * 8 + 8].try_into().unwrap());
+                let n = u64::from_ne_bytes(after[w * 8..w * 8 + 8].try_into().unwrap());
+                if o == n {
+                    continue;
+                }
+                let legitimate_rewrite = roots
+                    .iter()
+                    .zip(snapshot.iter())
+                    .any(|(nw, (ws, _, _))| *ws as u64 == o && nw.as_ptr() as u64 == n);
+                if !legitimate_rewrite {
+                    diffs += 1;
+                }
+            }
+            if diffs > 0 {
+                clobbered.push((*was, diffs));
+            }
+        }
+        assert!(
+            clobbered.is_empty(),
+            "the slide wrote into {} object(s) it did not move (first: base 0x{:x}, \
+             {} unexplained word(s)). A selected page's low bytes can be the tail of \
+             an object based in the unselected page below it.",
+            clobbered.len(),
+            clobbered[0].0,
+            clobbered[0].1,
+        );
     }
 
     /// **A clobbered array length must not be strided, and must not size.**
