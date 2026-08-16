@@ -1,11 +1,28 @@
 # Five FAILs from the 2026-08-07 full-suite sweep: `TestPgServer`, `TestTools`, `TestMemoryUnmapper`, `TestFileLock`, `TestTimer` — RESOLVED
 
 ## Status
-**✅ RESOLVED 2026-08-07.** Three were genuine CratonVM defects and are fixed;
-two are H2-test-versus-JDK-25 incompatibilities that real HotSpot 25.0.3 fails
-in exactly the same place, so they were never VM defects. Every verdict below
-was decided by running the class on stock HotSpot with the identical classpath
-before touching the VM.
+**REOPENED 2026-08-16 (item 2 only) — the rest still holds.** This doc was
+moved to `docs/internal/` as fully `✅ RESOLVED`, but its own "Residuals handed
+on" section promised a follow-up doc —
+`bug-cratonvm-tls-client-handshake-failure-reported-as-interrupted-20260807.md`
+— for `TestTools`' remaining TLS-handshake-reporting gap, and that file was
+never actually created anywhere in the tree. A fresh full-suite rerun today
+(`org.h2.test.unit.TestTools`, `origin/dev`, GC-sweep across default/G1/ZGC)
+reproduces the exact untracked residual: the exception is now genuinely typed
+`javax.net.ssl.SSLHandshakeException` (so the *type* half of the original
+residual note is fixed) but its message is still CratonVM's generic `TLS
+handshake failed: the handshake process was interrupted: localhost:9001`
+rather than HotSpot's real PKIX-path diagnostic (`certificate_unknown) PKIX
+path building failed …`) — see "Reopened: fresh evidence" below. Moved back to
+`known-issues/` so this doesn't get re-lost. Items 1, 3, 4, 5 below are
+unaffected by this reopening — they were independently verified against
+HotSpot at the time and nothing found today contradicts them.
+
+Original status, preserved: **✅ RESOLVED 2026-08-07.** Three were genuine
+CratonVM defects and are fixed; two are H2-test-versus-JDK-25 incompatibilities
+that real HotSpot 25.0.3 fails in exactly the same place, so they were never VM
+defects. Every verdict below was decided by running the class on stock HotSpot
+with the identical classpath before touching the VM.
 
 | # | Class | Verdict | Now |
 |---|-------|---------|-----|
@@ -275,3 +292,48 @@ cd apps/h2database/h2
 ```
 Always run the same class on `$JDK25/bin/java` with the identical classpath
 first — it is what settled items 3 and 5 in minutes.
+
+
+## Reopened 2026-08-16: fresh evidence for the untracked TestTools residual
+
+`org.h2.test.unit.TestTools` FAIL, `origin/dev` (post `f80a4b775`), Azure host
+`azureuser@20.80.105.49`, GC-sweep rerun (default/G1/ZGC, 1500s timeout):
+
+```
+org/h2/jdbc/JdbcSQLNonTransientConnectionException: Connection is broken:
+  "javax.net.ssl.SSLHandshakeException: TLS handshake failed: the handshake
+  process was interrupted: localhost:9001"
+	at org/h2/test/unit/TestTools.main(TestTools.java:81)
+	at org/h2/test/TestBase.testFromMain(TestBase.java:479)
+	at org/h2/test/unit/TestTools.test(TestTools.java:103)
+```
+
+Compare against this doc's own §2b closing table:
+
+```
+HOTSPOT : TestTools.java:656  Connection is broken: "javax.net.ssl.SSLHandshakeException:
+          (certificate_unknown) PKIX path building failed …"
+CRATONVM: TestTools.java:656  Connection is broken: "java.io.IOException:
+          TLS handshake failed: …"
+```
+
+The exception TYPE has moved from `java.io.IOException` (2026-08-07) to the
+correct `javax.net.ssl.SSLHandshakeException` (today) — real, if
+undocumented, progress. But the MESSAGE is still CratonVM's own generic
+"the handshake process was interrupted" rather than HotSpot's actual PKIX
+certificate-validation diagnostic. This is precisely the residual the
+original doc flagged and promised to file separately; it was not filed, and
+it is still open. Filing it now under this doc rather than a new one, since
+the original promised filename was never claimed by anything else in the
+tree and there is no reason to fragment the history further.
+
+**What's still needed**: find where CratonVM's TLS client-handshake failure
+path constructs its `SSLHandshakeException` (likely in the same
+`SSLSocket.connect()`-adjacent code the original §2b fix touched — the parked
+in `servlet::PENDING_CONNECT_SOCK_ID_BASE` handshake trigger points) and make
+it surface the real certificate-chain-validation failure reason instead of a
+generic "interrupted" message, matching HotSpot/JSSE's own
+`CertificateException`-derived wording.
+
+## Related
+* [`bug-h2-testtransaction-merge-using-lock-timeout-RESOLVED-20260807.md`](../../internal/fixed-suite-bugs/h2-suite-bugs/bug-h2-testtransaction-merge-using-lock-timeout-RESOLVED-20260807.md) — re-verified 2026-08-16, still accurately closed (not reopened).
