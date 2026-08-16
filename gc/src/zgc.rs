@@ -2430,6 +2430,7 @@ pub struct ZgcRealHeap {
     /// registry entries seen there. Exported so the ruling-out is re-checkable
     /// rather than remembered.
     tlab_retire_skipped_total: AtomicUsize,
+
     /// How many unwalkable rewrite targets have already been logged in full,
     /// so a heap that produces thousands does not produce thousands of lines.
     unwalkable_reports: AtomicUsize,
@@ -2839,6 +2840,7 @@ impl ZgcRealHeap {
             corpse_cycle: AtomicU64::new(0),
             relocation_skipped_jit: AtomicUsize::new(0),
             tlab_retire_skipped_total: AtomicUsize::new(0),
+
             unwalkable_reports: AtomicUsize::new(0),
             driver_passes: AtomicUsize::new(0),
             mark_active: AtomicBool::new(false),
@@ -4407,7 +4409,13 @@ impl ZgcRealHeap {
                 );
             }
             let new_cursor = proposed.max(live_ceiling) - base;
-            reclaimed = arena.compact_low_to(new_cursor);
+            // The bytes this slide actually wrote: it places survivors from
+            // `slide_floor` upwards and stops at `dest`. Everything outside
+            // that window is where it was before, so a free block there is
+            // still free -- see `Arena::compact_low_to` for what dropping them
+            // wholesale cost.
+            let touched = slide_floor.saturating_sub(base)..dest.saturating_sub(base);
+            reclaimed = arena.compact_low_to(new_cursor, touched);
             // One batched publish after the slide, not one per object: the
             // record is read by the rewrite pass below, which must see the
             // WHOLE map or it resolves half the graph against a half-built one.
@@ -9311,6 +9319,29 @@ impl GarbageCollector for ZgcRealHeap {
             // and a 16 MB array becomes unservable forever once the process has
             // allocated its capacity, with 1.8 GB free and 15% live. See
             // `Arena::retract_cursor_into_free_tail`.
+            // WHERE THE SWEPT BYTES ACTUALLY WENT.
+            //
+            // `bytes_freed` is what the sweep handed to `add_free_block`; this
+            // is what the arena has to show for it, measured at the same
+            // instant with the same lock held. A large `bytes_freed` beside a
+            // small `free_bytes_total` is memory that was swept and then lost,
+            // and it is the difference between "this heap fragments" and "this
+            // heap leaks" -- which want opposite fixes.
+            //
+            // Under `--verbose:gc` only, next to the per-cycle line it
+            // explains.
+            if self.gc_log_enabled.load(Ordering::Relaxed) {
+                eprintln!(
+                    "[GC] zgc-reclaim: bytes_freed={} free_list_bytes={} \
+                     largest_free_block={} cursor={} capacity={} registered={}",
+                    bytes_freed,
+                    arena.free_list_bytes(),
+                    arena.largest_free_block(),
+                    arena.used(),
+                    arena.capacity(),
+                    all.len(),
+                );
+            }
             let reclaimed_tail = arena.retract_cursor_into_free_tail();
             if reclaimed_tail != 0 {
                 tracing::debug!(
