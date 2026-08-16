@@ -2786,6 +2786,19 @@ pub(crate) fn s2_tls_peer_cert_chain_der(id: i32) -> Option<Vec<Vec<u8>>> {
         .map(|e| e.peer_cert_chain_der.clone())
 }
 
+/// Why this stream's TLS handshake failed, for a stream that was registered
+/// in a failed state instead of having the failure thrown at its creator —
+/// see `t27_tls::TlsServerStream::HandshakeFailed`. `None` for every healthy
+/// stream, and for every client-side one (a client handshake failure is
+/// reported by `SSLSocketFactory.createSocket` / `SSLSocket.connect` itself,
+/// which is where JSSE reports it).
+pub(crate) fn s2_tls_handshake_failure(id: i32) -> Option<String> {
+    if id >= RUSTLS_SOCK_ID_BASE {
+        return crate::t27_tls::rustls_server_handshake_failure(id - RUSTLS_SOCK_ID_BASE);
+    }
+    None
+}
+
 /// NEW-13 / T2.7.11: lookup the negotiated (protocol, cipher, host, port)
 /// tuple for a TLS stream id. Used to populate SSLSession fields lazily.
 pub(crate) fn s2_tls_session_info(id: i32) -> Option<(String, String, String, u16)> {

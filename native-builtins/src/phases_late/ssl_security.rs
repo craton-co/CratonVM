@@ -1595,6 +1595,26 @@ pub(crate) fn new13_alloc_ssl_session(ctx: &mut dyn NativeContext, tls_id: i32) 
     Ok(session)
 }
 
+/// Turn a failed TLS stream read/write into the exception JSSE raises for it.
+///
+/// A socket whose handshake never completed reports that at its FIRST I/O,
+/// as `javax.net.ssl.SSLHandshakeException` — the accepted-but-unhandshaked
+/// case is the server side of a rejected connection, and it reaches here
+/// because `SSLServerSocket.accept()` must not throw for it (see
+/// `t27_tls::TlsServerStream::HandshakeFailed`). Every other I/O error is an
+/// ordinary `IOException`, as before.
+fn tls_io_failure(ctx: &mut dyn NativeContext, tls_id: i32, e: std::io::Error) -> MethodCallFailed {
+    match crate::servlet::s2_tls_handshake_failure(tls_id) {
+        Some(reason) => {
+            crate::phases_early::throw_jca_exc(ctx, "javax/net/ssl/SSLHandshakeException", &reason)
+        }
+        None => RuntimeError::IOException {
+            message: e.to_string(),
+        }
+        .into(),
+    }
+}
+
 /// Resolve an `InetAddress` argument without depending on its implementation
 /// class.  Real JSSE factories expose all of the `SocketFactory` overloads;
 /// our P68 bridge must do the same because its synthetic factory is allocated
@@ -3862,10 +3882,7 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
                     .map(|b| b as i32)
                     .unwrap_or(-1),
             ))),
-            Err(e) => Err(RuntimeError::IOException {
-                message: e.to_string(),
-            }
-            .into()),
+            Err(e) => Err(tls_io_failure(ctx, tls_id, e)),
         }
     });
     r.register(ssl_is, "read", "([BII)I", |ctx, args| {
@@ -3925,10 +3942,7 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
                 }
                 Ok(Some(Value::Int(n as i32)))
             }
-            Err(e) => Err(RuntimeError::IOException {
-                message: e.to_string(),
-            }
-            .into()),
+            Err(e) => Err(tls_io_failure(ctx, tls_id, e)),
         }
     });
     r.register(ssl_is, "available", "()I", |ctx, args| {
@@ -4007,9 +4021,9 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
         ctx.begin_blocking_region();
         let write_result = crate::servlet::s2_tls_write(tls_id, &[b]);
         ctx.end_blocking_region();
-        write_result.map_err(|e| RuntimeError::IOException {
-            message: e.to_string(),
-        })?;
+        if let Err(e) = write_result {
+            return Err(tls_io_failure(ctx, tls_id, e));
+        }
         Ok(None)
     });
     r.register(ssl_os, "write", "([BII)V", |ctx, args| {
@@ -4073,23 +4087,26 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
         // marked blocked (the mirror-image failure: a live mutator the
         // barrier stops waiting for).
         ctx.begin_blocking_region();
-        let mut write_err: Option<String> = None;
+        let mut write_err: Option<std::io::Error> = None;
         while written < buf.len() {
             match crate::servlet::s2_tls_write(tls_id, &buf[written..]) {
                 Ok(0) => {
-                    write_err = Some("SSLSocketOutputStream.write: peer closed".into());
+                    write_err = Some(std::io::Error::new(
+                        std::io::ErrorKind::WriteZero,
+                        "SSLSocketOutputStream.write: peer closed",
+                    ));
                     break;
                 }
                 Ok(n) => written += n,
                 Err(e) => {
-                    write_err = Some(e.to_string());
+                    write_err = Some(e);
                     break;
                 }
             }
         }
         ctx.end_blocking_region();
-        if let Some(message) = write_err {
-            return Err(RuntimeError::IOException { message }.into());
+        if let Some(e) = write_err {
+            return Err(tls_io_failure(ctx, tls_id, e));
         }
         Ok(None)
     });

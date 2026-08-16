@@ -811,7 +811,7 @@ fn native_jarfile_get_input_stream(
         return Ok(Some(Value::Object(None)));
     }
 
-    let bytes = {
+    let (bytes, deflated) = {
         let handle = get_jar_handle(ctx, this);
         let mut table = jar_table().lock();
         let state = match table.get_mut(&handle) {
@@ -853,17 +853,101 @@ fn native_jarfile_get_input_stream(
         // are read.
         let raw_size = zf.size();
         let size = guard_zip_entry_size(&name, raw_size, zf.compressed_size())?;
+        // Which of the JDK's two entry-stream shapes this entry gets is
+        // decided by its compression method — see `wrap_inflater_like`.
+        let deflated = zf.compression() != zip::CompressionMethod::Stored;
         let mut buf: Vec<u8> = Vec::with_capacity(prealloc_hint(size));
         zf.read_to_end(&mut buf).map_err(|e| {
             MethodCallFailed::InternalError(VmError::Internal {
                 message: format!("JarFile.getInputStream({name}): read failed: {e}"),
             })
         })?;
-        buf
+        (buf, deflated)
     };
 
     let bais = build_byte_array_input_stream(ctx, &bytes)?;
+    if deflated {
+        return Ok(Some(Value::Object(Some(wrap_inflater_like(ctx, bais)?))));
+    }
     Ok(Some(Value::Object(Some(bais))))
+}
+
+/// Give a DEFLATED entry's stream the one `InflaterInputStream` behaviour a
+/// bare `ByteArrayInputStream` gets wrong: a **zero-length read at EOF**.
+///
+/// The JDK hands `ZipFile.getInputStream` callers one of two streams, and they
+/// disagree on exactly that call (MEASURED, Temurin 25.0.3, `ZeroLen2Probe`):
+///
+/// | entry method | JDK class | `read(b,0,0)` at EOF | `markSupported()` |
+/// |---|---|---|---|
+/// | DEFLATED | `ZipFile$ZipFileInflaterInputStream` | **0** (`InflaterInputStream`: `len == 0` returns 0 before anything else) | false |
+/// | STORED | `ZipFile$ZipFileInputStream` | **-1** (`rem == 0` is checked first) | false |
+///
+/// `ByteArrayInputStream` answers -1 for both, because its own `read` checks
+/// `pos >= count` before it clamps `len` — right for STORED, wrong for
+/// DEFLATED. That one value is not academic: `java.io.InputStream`'s contract
+/// says a zero-length read returns 0, so callers written against it treat -1
+/// as end-of-file. H2's `FileUtils.readFully(FileChannel, ByteBuffer)` does
+/// exactly that (`if (r < 0) throw new EOFException()`), and a read of the
+/// zero remaining bytes at the end of a zip entry — which `FileZip.read`
+/// forwards straight to this stream — therefore threw `EOFException` where
+/// HotSpot completed the loop (`TestFileSystem.testZipFileSystem`, prefixes
+/// `zip:` and `cache:zip:`).
+///
+/// `PushbackInputStream` is the wrapper that reproduces the DEFLATED row
+/// without disturbing anything else: it returns 0 for `len == 0` unconditionally,
+/// reports `markSupported()` as false (as both JDK zip streams do, and unlike
+/// the bare `ByteArrayInputStream` returned until now), and leaves
+/// `available()` exact — which the real `ZipFileInflaterInputStream` also is,
+/// and a plain `InflaterInputStream` over the raw deflate bytes would NOT be
+/// (it answers 1 until EOF), which is why this wraps the already-inflated
+/// bytes rather than handing out a real inflater.
+fn wrap_inflater_like(
+    ctx: &mut dyn NativeContext,
+    inner: ObjectRef,
+) -> Result<ObjectRef, MethodCallFailed> {
+    let cls = "java/io/PushbackInputStream";
+    // `inner` must survive the class init and the allocation below, and the
+    // wrapper must survive its own `<init>` — any of the three can trigger a
+    // collection that moves them.
+    let pin_inner = ctx.pin_native_root(inner);
+    let cid = match ctx.ensure_class_initialized(cls) {
+        Ok(cid) => cid,
+        Err(_) => {
+            ctx.unpin_native_roots(pin_inner);
+            return Ok(inner);
+        }
+    };
+    // The wrapper is only an improvement if the class it wraps in can actually
+    // serve a bulk read. In real-JDK mode `read([BII)I` is the class's own
+    // bytecode and this is the whole point; where the class exists only as the
+    // five natives `phases_late::io_streams` registers for it (`<init>`,
+    // `read()I`, `unread`, `available`, `close`), wrapping would REPLACE a
+    // working bulk read with a missing method. Fall back to the unwrapped
+    // stream there — the same behaviour as before this fix.
+    if !ctx.method_exists(cls, "read", "([BII)I") {
+        ctx.unpin_native_roots(pin_inner);
+        return Ok(inner);
+    }
+    let obj = ctx.alloc_object(cid, ctx.class_num_total_fields(cid).max(4));
+    let pin_obj = ctx.pin_native_root(obj);
+    let inner = ctx.read_native_pin(pin_inner, inner);
+    let init = ctx.invoke(
+        cls,
+        "<init>",
+        "(Ljava/io/InputStream;)V",
+        &[Value::Object(Some(obj)), Value::Object(Some(inner))],
+    );
+    let obj = ctx.read_native_pin(pin_obj, obj);
+    let inner = ctx.read_native_pin(pin_inner, inner);
+    ctx.unpin_native_roots(pin_inner);
+    // A wrapper that could not be constructed is not worth failing the read
+    // over: the bytes are already inflated and the unwrapped stream is what
+    // this native returned before the fix.
+    match init {
+        Ok(_) => Ok(obj),
+        Err(_) => Ok(inner),
+    }
 }
 
 fn build_byte_array_input_stream(
