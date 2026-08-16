@@ -20,7 +20,7 @@ rather than reading it as a TLS defect.
 | `OpenSslPrivateKeyMethodTest` | 24 / 24 | 24 / 24 | 3 / 24 |
 | `SslHandlerTest` | 47 / 54 | **48 / 54** | 53 / 54 |
 | `SslContextBuilderTest` | 21 / 21 | 21 / 21 ✅ | 21 / 21 |
-| `ParameterizedSslHandlerTest` | never finished, or hangs | **61–63 / 63 on a quiet host; still stalls under load** | 63 / 63 |
+| `ParameterizedSslHandlerTest` | never finished, or hangs | **61–63 / 63; still stalls intermittently, quiet host or not** | 63 / 63 |
 
 `JdkSslEngineTest` is now the oracle exactly and its page is retired — see the
 retired `jdksslenginetest-engine-level-gaps` write-up for the four causes that
@@ -194,20 +194,46 @@ contracted to return, so the alias is value-correct. It is belt-and-braces,
 not the fix: it changes no object's identity, and any other `X509Certificate`
 method asked of such an object would still fail.
 
-**What is left:** 61–62 of 63, and neither error above appears in any run. The
-residual is a different, later-stage defect on
-`clientProvider=JDK, serverProvider=OPENSSL{,_REFCNT}`:
+**What is left:** 61–62 of 63, and neither error above appears in any run.
+
+### The residual: intermittently unusable OPENSSL key material
+
+One test method, `reentryOnHandshakeCompleteNioChannel`, one failure per run,
+and **three different errors across runs** — all in netty's OPENSSL
+key-material path, all on an `OPENSSL`/`OPENSSL_REFCNT` server:
 
 ```
-OpenSslHandshakeException: error:100000ae:SSL routines:OPENSSL_internal:NO_CERTIFICATE_SET
-SSLHandshakeException: Unable to find key material for auth method(s):
-    [ECDHE_ECDSA, ECDHE_ECDSA, ECDHE_RSA, …, RSA]
+OpenSslHandshakeException: error:100000ae:…:NO_CERTIFICATE_SET
+SSLHandshakeException:     Unable to find key material for auth method(s):
+                           [ECDHE_ECDSA, ECDHE_RSA, …, RSA]
+SSLException:              PrivateKey type not supported PKCS#8
 ```
 
-i.e. the OPENSSL server context ends up with no usable key material —
-plausibly A′'s residual seen from the server side. It was measured on a host
-at load 40–50, so how much of the 1-vs-2 variation is the defect and how much
-is the host is not separated; re-measure on a quiet host first.
+The third is the informative one. It comes from
+`OpenSslKeyMaterialProvider.validate`, whose `catch` prints
+`key.getFormat()` — so the key DID report `PKCS#8`, and what failed inside the
+`try` was `toBIO(alloc, key)` → `SSL.parsePrivateKey`. A key that answers
+`getFormat()` correctly and then does not parse is a **value** problem, not a
+type one; together with the null/`DerValue` array corruption fixed above, the
+shape to suspect first is another native local held live across an
+allocation — a `byte[]` this time (`getEncoded()`, or the PEM built from it),
+not a reference array.
+
+**An array-rooting sweep did NOT close it.** `KeyStore.getCertificateChain`,
+`KeyStore.aliases`, `SSLSession.getPeerCertificates` and
+`SSLSession.getLocalCertificates` all had the same unpinned-array defect and
+were converted to `util_concurrent_ext::build_rooted_ref_array` (which exists
+now, and is the right thing to reach for). Measured A/B on a quiet host: one
+failure per run on BOTH the control and the fixed build, only the error text
+differing. So those four were real defects worth fixing, and none of them is
+this one.
+
+**Correction to the load story.** The stall is NOT load-only: with the host at
+load 5.7 a run still hung past 8 minutes at the same
+`reentryOnHandshakeCompleteNioChannel` parameterisation. The earlier "finishes
+on a quiet host" reading came from too few samples. Treat the class as
+intermittently hanging, full stop, and record the load average beside any
+result from it.
 
 ## Repro
 

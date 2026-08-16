@@ -2671,11 +2671,12 @@ pub(crate) fn engine_get_certificate_chain(
             crate::util_concurrent_ext::refused_class(ctx, "java/security/cert/X509Certificate", 8)?
         }
     };
-    let arr = ctx.new_ref_array(cls_id, chain.len());
-    for (i, der) in chain.iter().enumerate() {
-        let mirror = make_x509_mirror(ctx, &alias, der);
-        ctx.set_array_element(arr, i, Value::Object(Some(mirror?)));
-    }
+    let arr = crate::util_concurrent_ext::build_rooted_ref_array(
+        ctx,
+        cls_id,
+        chain.len(),
+        |ctx, i| make_x509_mirror(ctx, &alias, &chain[i]),
+    )?;
     Ok(Some(Value::Object(Some(arr))))
 }
 
@@ -2699,11 +2700,12 @@ pub(crate) fn engine_aliases(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
         // is not a recovery, it is a second failure wearing the first one's name.
         Err(_) => crate::util_concurrent_ext::refused_class(ctx, "java/lang/String", 8)?,
     };
-    let arr = ctx.new_ref_array(cls_id, aliases.len());
-    for (i, a) in aliases.iter().enumerate() {
-        let s = ctx.create_string(a);
-        ctx.set_array_element(arr, i, Value::Object(Some(s)));
-    }
+    let arr = crate::util_concurrent_ext::build_rooted_ref_array(
+        ctx,
+        cls_id,
+        aliases.len(),
+        |ctx, i| Ok(ctx.create_string(&aliases[i])),
+    )?;
 
     // Under `--jdk-only` this fabrication is refused; fall back to an
     // enumeration the JDK builds itself (`Arrays$ArrayList` +
