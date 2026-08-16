@@ -2342,11 +2342,29 @@ impl VmHeap {
             // -- and compaction is this collector's only defragmentation, so
             // that is a number somebody needs to see.
             let skipped_jit = h.relocation_skipped_jit();
+            // A retained TLAB chunk would be arena the collector cannot see,
+            // and on a compacting heap that is a correctness problem rather
+            // than a bookkeeping one. It reads zero on every workload measured
+            // so far, which is the point of printing it: the hypothesis it
+            // rules out is a good one, and the next reader should not have to
+            // re-derive it.
+            let tlab_skipped = h.tlab_retire_skipped();
             eprintln!(
                 "[GC] zgc-features: parallel_mark_cycles={par_cycles} \
                  driver_passes={driver_passes} mark_fallbacks={mark_fallbacks} \
                  compaction_cycles={compactions} objects_relocated={relocated} \
-                 relocation_skipped_jit={skipped_jit}"
+                 relocation_skipped_jit={skipped_jit} \
+                 tlab_retire_skipped={tlab_skipped}"
+            );
+            // `ZGC_UNSIZABLE_OBJECTS` had no reader anywhere but a unit test.
+            // It is the sweep's own count of registered objects whose header it
+            // could not size -- i.e. of heap corruption the collector has
+            // already met and silently worked around, one warning per process.
+            // A run that ends with a nonzero here has corrupt headers whatever
+            // else it reports.
+            eprintln!(
+                "[GC] zgc-integrity: unsizable_registered_objects={}",
+                crate::zgc::ZGC_UNSIZABLE_OBJECTS.load(std::sync::atomic::Ordering::Relaxed),
             );
             let g = h.frag_gauge();
             match g.worst_permille {

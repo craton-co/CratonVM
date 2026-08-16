@@ -2402,6 +2402,22 @@ pub struct ZgcRealHeap {
     /// is permanently JIT-busy trades heap layout for the correctness of not
     /// sliding objects out from under registers the collector cannot rewrite.
     relocation_skipped_jit: AtomicUsize,
+    /// Lifetime count of TLAB cells a [`Self::retire_all_tlabs`] could not
+    /// lock, and so could not close.
+    ///
+    /// A retained chunk would be unsound on a compacting heap: the collector
+    /// cannot see it (every walker here is driven by the object-start
+    /// registry), so nothing keeps the compaction cursor above it,
+    /// `compact_low_to` retracts past it and zeroes it, and
+    /// `clear_low_free_list` drops the only record that it was reserved --
+    /// after which the arena and the chunk's owner both fill one span.
+    ///
+    /// **Measured zero** across the `ResourceLeakDetectorTest` repro that the
+    /// reopened `zgc-rewrite-pass-walks-off-a-reference-array` page is about,
+    /// which is what rules that story out as the source of the overlapping
+    /// registry entries seen there. Exported so the ruling-out is re-checkable
+    /// rather than remembered.
+    tlab_retire_skipped_total: AtomicUsize,
     /// How many unwalkable rewrite targets have already been logged in full,
     /// so a heap that produces thousands does not produce thousands of lines.
     unwalkable_reports: AtomicUsize,
@@ -2809,6 +2825,7 @@ impl ZgcRealHeap {
             corpse_reports: AtomicUsize::new(0),
             corpse_cycle: AtomicU64::new(0),
             relocation_skipped_jit: AtomicUsize::new(0),
+            tlab_retire_skipped_total: AtomicUsize::new(0),
             unwalkable_reports: AtomicUsize::new(0),
             driver_passes: AtomicUsize::new(0),
             mark_active: AtomicBool::new(false),
@@ -2988,6 +3005,11 @@ impl ZgcRealHeap {
     /// run that never defragments.
     pub fn relocation_skipped_jit(&self) -> usize {
         self.relocation_skipped_jit.load(Ordering::Relaxed)
+    }
+
+    /// Lifetime count of TLAB cells a retire could not lock.
+    pub fn tlab_retire_skipped(&self) -> usize {
+        self.tlab_retire_skipped_total.load(Ordering::Relaxed)
     }
 
     pub fn driver_engagement(&self) -> (usize, usize) {
@@ -3873,6 +3895,19 @@ impl ZgcRealHeap {
             let reclaimed = self.arena.lock().retract_cursor_into_free_tail();
             return (0, reclaimed, cratonvm_types::PointerMap::default());
         }
+        // A RETAINED TLAB CHUNK WAS THE OBVIOUS SUSPECT HERE, AND IT IS RULED
+        // OUT. `retire_all_tlabs` skips a cell it cannot `try_lock`, and on a
+        // compacting heap that would be unsound rather than merely wasteful:
+        // nothing keeps the compaction cursor above a chunk the collector
+        // cannot see, so `compact_low_to` would retract past it, zero it, and
+        // `clear_low_free_list` would drop the only record it was reserved --
+        // after which the arena and the chunk's owner would fill one span.
+        //
+        // `tlab_retire_skipped` measured **zero** across every run of the
+        // `ResourceLeakDetectorTest` repro, so no chunk is ever retained and a
+        // refusal built on it could never fire. The counter is exported rather
+        // than the refusal written: it is what turned the story into a
+        // ruled-out one, and a nonzero there is how someone re-opens it.
         // `relocate::ZRelocationRecord` rather than a local map: it is the
         // module's from->to ledger, it builds the `PointerMap` this function
         // must return, and it carries the reserve so a large evacuation does
@@ -4470,11 +4505,119 @@ impl ZgcRealHeap {
                 live_now.len(),
             );
         }
+        // The same survey the sweep runs, asked here instead: the registry has
+        // just been rebuilt from this slide's `from -> to` pairs and no mutator
+        // has resumed, so an overlap reported HERE was created by this slide.
+        if zgc_corpse_enabled() {
+            let after: Vec<usize> = self.registry.snapshot().bases();
+            self.survey_registry_extents(&after, "post-slide");
+        }
         self.verify_no_dangling_slots_after_slide(&live_now, arena_lo, arena_hi, &moved_from);
 
         let pointer_map: cratonvm_types::PointerMap =
             record.into_pointer_map().into_iter().collect();
         (moved, reclaimed, pointer_map)
+    }
+
+    /// Survey the object-start registry for extents that run into the next
+    /// registered base, and report the first few.
+    ///
+    /// Every registered object's extent must end at or below the next
+    /// registered base. Two things depend on it: the sweep zeroes
+    /// `alloc_size(header)` bytes from a dead object's base and hands the same
+    /// span to `Arena::add_free_block`, and the slide memmoves the same count.
+    /// An extent that is too long therefore destroys the NEXT object and hands
+    /// its address back to the allocator while the registry still names it --
+    /// which is the reopened `zgc-rewrite-pass-walks-off-a-reference-array`
+    /// failure with no unsizable header needed anywhere in the story.
+    ///
+    /// `where_` names the call site so the two surveys can be told apart in a
+    /// log: `"pre-sweep"` inherits whatever the last cycle left, `"post-slide"`
+    /// is the same question asked before the mutators resume.
+    ///
+    /// Returns the number of overlaps. Diagnostic only -- it never vetoes, and
+    /// it is called only under `CRATONVM_DBG_ZGC_CORPSE`.
+    fn survey_registry_extents(&self, all: &[usize], where_: &'static str) -> usize {
+        let mut bases: Vec<usize> = all.to_vec();
+        bases.sort_unstable();
+        let mut overlaps = 0usize;
+        let mut unsizable_now = 0usize;
+        for w in bases.windows(2) {
+            let (b, next) = (w[0], w[1]);
+            let h = self.header_ref(b as *mut u8);
+            match Self::alloc_size(h) {
+                None => unsizable_now += 1,
+                Some(sz) => {
+                    if b.saturating_add(sz) > next {
+                        overlaps += 1;
+                        if overlaps <= 4 {
+                            let nh = self.header_ref(next as *mut u8);
+                            // Was this base a relocation SOURCE the ledger
+                            // still remembers? "yes" means the slide moved the
+                            // object away and the registry kept its old base;
+                            // "no" means the base is one nothing moved, so its
+                            // header was overwritten in place.
+                            let vacated = if zgc_corpse_enabled() {
+                                self.corpse_ledger.lock().get(&b).map(|e| e.3)
+                            } else {
+                                None
+                            };
+                            // The raw words at the base, and at the two 8-byte
+                            // steps below it. A header that was overwritten in
+                            // place has plausible neighbours; a registry entry
+                            // that never named an object sits in the middle of
+                            // somebody's payload, and the words below it say
+                            // whose.
+                            // SAFETY: `b` is a registered base inside the
+                            // arena, and the world is stopped.
+                            let w: [u64; 4] = unsafe { std::ptr::read_unaligned(b as *const [u64; 4]) };
+                            let below: [u64; 2] = if b >= self.arena_base + 16 {
+                                // SAFETY: as above; `b - 16` is still inside.
+                                unsafe { std::ptr::read_unaligned((b - 16) as *const [u64; 2]) }
+                            } else {
+                                [0; 2]
+                            };
+                            tracing::error!(
+                                target: "cratonvm::gc::guard",
+                                site = where_,
+                                base = b,
+                                size = sz,
+                                ends_at = b + sz,
+                                next_base = next,
+                                overrun = b + sz - next,
+                                kind = ?h.kind(),
+                                class_id = h.class_id.as_u32(),
+                                num_slots = h.num_slots(),
+                                array_length = h.array_length(),
+                                next_class_id = nh.class_id.as_u32(),
+                                next_num_slots = nh.num_slots(),
+                                vacated_in_cycle = ?vacated,
+                                w0 = format!("{:#018x}", w[0]),
+                                w1 = format!("{:#018x}", w[1]),
+                                w2 = format!("{:#018x}", w[2]),
+                                w3 = format!("{:#018x}", w[3]),
+                                below0 = format!("{:#018x}", below[0]),
+                                below1 = format!("{:#018x}", below[1]),
+                                "zgc extent census: a registered object's computed extent \
+                                 runs INTO the next registered object"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        if overlaps != 0 || unsizable_now != 0 {
+            tracing::error!(
+                target: "cratonvm::gc::guard",
+                site = where_,
+                overlaps,
+                unsizable = unsizable_now,
+                registered = bases.len(),
+                compaction_cycles = self.compaction_cycles.load(Ordering::Relaxed),
+                "zgc extent census: survey of the object-start registry"
+            );
+        }
+        overlaps
     }
 
     /// Can the rewrite pass safely walk the object at `base`?
@@ -5088,7 +5231,63 @@ impl ZgcRealHeap {
         );
         unsafe {
             std::ptr::write(ptr as *mut ObjectHeader, header);
-            Some(ObjectRef::from_raw(ptr))
+        }
+        self.audit_reserved_vs_header(ptr, total, "object", class_id);
+        // SAFETY: `ptr` is a fresh `total`-byte allocation carrying a header.
+        unsafe { Some(ObjectRef::from_raw(ptr)) }
+    }
+
+    /// The bytes an allocation reserved and the bytes its header describes must
+    /// be the same number.
+    ///
+    /// Everything downstream sizes an object from its header — the sweep zeroes
+    /// and free-lists `alloc_size(header)` bytes, the slide memmoves that many,
+    /// `is_object_address` decides containment with it — while the allocator
+    /// advanced the cursor by what it RESERVED. If those two disagree by even
+    /// one slot, the next allocation's base lands inside this object's declared
+    /// extent, and the object-start registry then holds two entries that
+    /// overlap. That is the shape of every overlap the extent census has
+    /// reported on the `ResourceLeakDetectorTest` repro: a registered base
+    /// interior to another registered object.
+    ///
+    /// Checking it here rather than inferring it from the wreckage a cycle
+    /// later is the difference between naming the class that does it and
+    /// reading tea leaves in a hex dump.
+    ///
+    /// Diagnostic only, behind `CRATONVM_DBG_ZGC_CORPSE`, capped at 16 lines.
+    #[inline]
+    fn audit_reserved_vs_header(
+        &self,
+        ptr: *mut u8,
+        reserved: usize,
+        what: &'static str,
+        class_id: ClassId,
+    ) {
+        if !zgc_corpse_enabled() {
+            return;
+        }
+        // SAFETY: the caller has just written a header at `ptr`.
+        let header = unsafe { &*(ptr as *const ObjectHeader) };
+        let sized = Self::alloc_size(header);
+        if sized == Some(reserved) {
+            return;
+        }
+        let n = self.corpse_reports.fetch_add(1, Ordering::Relaxed);
+        if n < 16 {
+            tracing::error!(
+                target: "cratonvm::gc::guard",
+                what,
+                addr = ptr as usize,
+                reserved,
+                header_says = ?sized,
+                class_id = class_id.as_u32(),
+                num_slots = header.num_slots(),
+                array_length = header.array_length(),
+                kind = ?header.kind(),
+                "zgc alloc audit: the bytes reserved for this object and the bytes its \
+                 header describes disagree -- the next allocation's base will land inside \
+                 its declared extent"
+            );
         }
     }
 
@@ -5106,17 +5305,13 @@ impl ZgcRealHeap {
         let total = ARRAY_DATA_OFFSET.checked_add(data_size)?;
         let ptr = self.alloc_raw_tlab(total)?;
         let len_u32 = u32::try_from(length).ok()?;
-        let header = ObjectHeader::new(
-            class_id,
-            ObjectKind::Array,
-            element_type,
-            len_u32,
-            len_u32,
-        );
+        let header = ObjectHeader::new(class_id, ObjectKind::Array, element_type, len_u32, len_u32);
         unsafe {
             std::ptr::write(ptr as *mut ObjectHeader, header);
-            Some(ObjectRef::from_raw(ptr))
         }
+        self.audit_reserved_vs_header(ptr, total, "array", class_id);
+        // SAFETY: `ptr` is a fresh `total`-byte allocation carrying a header.
+        unsafe { Some(ObjectRef::from_raw(ptr)) }
     }
 
     /// Allocate and pre-initialize primitive-typed slots from JVM descriptors.
@@ -6998,6 +7193,10 @@ impl ZgcRealHeap {
         // driver, neither of which stops the world, so a peer may legitimately
         // refill between the loop and the check. `tlab_reserved_tails()` stays
         // available as the tripwire for a caller that IS at a safepoint.
+        if summary.skipped_locked > 0 {
+            self.tlab_retire_skipped_total
+                .fetch_add(summary.skipped_locked, Ordering::Relaxed);
+        }
         if summary.live_chunks > 0 || summary.slots_pruned > 0 || summary.skipped_locked > 0 {
             tracing::debug!(
                 target: "zgc",
@@ -8823,6 +9022,25 @@ impl GarbageCollector for ZgcRealHeap {
             // cumulative counters. Callers that want the per-walk gauge read it
             // back through `slot_census()`.
             let _ = self.slot_census.run_walk(self);
+        }
+
+        // ---- EXTENT CENSUS (diagnostic, `CRATONVM_DBG_ZGC_CORPSE`) -------
+        //
+        // Every registered object's computed extent must end at or below the
+        // next registered base. The sweep below depends on it twice over: it
+        // zeroes `alloc_size(header)` bytes from a dead object's base and
+        // hands the same span to `Arena::add_free_block`. An extent that is
+        // too long therefore zeroes the header of the NEXT object and puts its
+        // memory on the free list, so the allocator re-issues an address that
+        // is still live and still registered -- which is the reopened
+        // rewrite-pass page's failure exactly, with no compaction anywhere in
+        // the story.
+        //
+        // Deliberately BEFORE the sweep, on the pre-sweep registry: anything
+        // it reports is older than this cycle's zeroing, so the report cannot
+        // be an echo of the damage it is looking for.
+        if zgc_corpse_enabled() {
+            self.survey_registry_extents(&all, "pre-sweep");
         }
 
         // ---- Sweep phase -------------------------------------------------

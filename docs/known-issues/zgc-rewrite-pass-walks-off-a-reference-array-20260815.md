@@ -5,8 +5,10 @@ straddler fix below is real and landed; the crash it was closed against is
 not gone. `io.netty.util.ResourceLeakDetectorTest` under `-XX:+UseZGC --nojit`
 still SIGSEGVs, on a binary built from **pristine `origin/dev`**, and the
 walkability guard still reports registered bases whose headers decode as text.
-See "Reopened" at the foot of the page for the numbers and for the one
-hypothesis that has since been tested and eliminated.
+See "Reopened" at the foot of the page for the numbers, and "Second pass"
+for what the corruption actually is -- an object-start registry that acquires
+an entry INTERIOR to a live object -- together with the five hypotheses
+eliminated by measurement and the instruments that did it.
 
 The "0/12 after" reading below is a **sampling artefact**, and this page's own
 Measurement-traps section predicted it: it says to use "completion rate over
@@ -246,25 +248,82 @@ fixed:
 * one guarded run crashed anyway, **with the cursor check not firing**. So the
   cascade is one route to this SIGSEGV and demonstrably not the only one.
 
-## What the next investigator should do first
+## Second pass, 2026-08-16: the corruption has a name
 
-* **A pre-slide census is now wired in** behind `CRATONVM_DBG_ZGC_CORPSE=1`: it
-  reports whether the live set was ALREADY unwalkable on entry to the slide.
-  That single number splits the search space in half — "this slide broke them"
-  versus "they arrived broken" — and no measurement so far distinguishes the
-  two. Run it first.
-* **Suspect the free list, not only the slide.** A String written over a run of
-  live objects is what an allocator hands out, not what a memmove does; a
-  memmove writes one object's worth. `Arena`'s low free list and its
-  coalescing are the obvious place for two adjacent freed blocks to merge
-  across a live object between them. `compact_low_to` drops the low free list
-  wholesale, which is a hint that this boundary has been trouble before.
-* **Do not measure the rate with a diagnostic flag on.** The companion page
-  measured `CRATONVM_DBG_ROOT_SOURCE=1` moving the crash rate from 6/10 to
-  2/10. `CRATONVM_DBG_ZGC_CORPSE=1` allocates a ledger entry per relocated
-  object and has never been checked for the same effect.
-* **Fifteen reps minimum, interleaved.** This page's own trap list says so and
-  this page's own conclusion ignored it.
+**The failure is an OVERLAPPING OBJECT-START REGISTRY.** The registry acquires
+an entry at an address that is *interior to a live object*, and everything
+downstream sizes objects from headers: the sweep zeroes and free-lists
+`alloc_size(header)` bytes from a dead base, the slide memmoves that many, and
+`is_object_address` decides containment with it. One interior entry therefore
+destroys its neighbours, and the wreckage is the "registered base whose header
+decodes as text" this page opened with.
+
+A new gated instrument names it directly — `zgc extent census`, run over the
+sorted registry before the sweep and again at the end of the slide:
+
+```
+zgc extent census: a registered object's computed extent runs INTO the next registered object
+  site="pre-sweep" base=2200137058232 size=8208 next_base=2200137058312 overrun=8128
+  kind=Object class_id=1113795904 num_slots=512
+  w0="0x0000020042632d40" w1="0x0200000000000000" w3="0x0000020042634808"
+```
+
+**`w0` is not a header. It is an arena pointer.** This heap's addresses are
+`0x0000_0200_4xxx_xxxx`, so read as a header its low half becomes
+`class_id=1113795904` and its high half `num_slots=512` — which is where the
+absurd 8208-byte extent comes from. `w3` is another pointer. The registry entry
+sits on a **reference slot inside a live object**, not on an allocation.
+
+## Five hypotheses, all eliminated by measurement
+
+| hypothesis | verdict | the number that settled it |
+|---|---|---|
+| the live set arrives at the slide already broken | **no** | pre-slide census `0` on every cycle of every run |
+| compaction is not involved | **no**, it is required | `CRATONVM_ZGC_RELOCATE=0`: 0 overlaps, 0 crashes, every arm |
+| the slide creates the overlap | **no** | post-slide census clean on the cycle before the first overlap appears |
+| a retained TLAB chunk is re-issued under the retracted cursor | **no** | `tlab_retire_skipped=0` — no chunk is ever left un-retired |
+| an allocation's header disagrees with the bytes reserved for it | **no** | `zgc alloc audit` never fires, including in runs that go on to overlap |
+
+The third row is the load-bearing one and it is worth reading twice: on the run
+that first shows an overlap, the **post-slide** survey at the end of the
+preceding cycle is clean and the **pre-sweep** survey of the next cycle is
+dirty. The entry appears while **mutators are running**, on a heap that has
+compacted at least once. That is a much smaller window than "somewhere in the
+collector".
+
+## What to do next, precisely
+
+Find who inserts an interior address into `ZObjectStartBits`. There are only
+three writers — `registry.insert` in `alloc_raw`, `insert_all` from the TLAB
+hook `register_allocations`, and `insert(*to)` in the slide's rebuild — and the
+table above rules out the shapes each of them would fail in. So the next
+instrument is a **precondition on the insert itself**: reject-and-report an
+address that `nearest_base_at_or_below` already covers. That is O(1) on the
+bitmap arm, it fires at the moment of the bad insert rather than a cycle later,
+and it names the caller. Gate it the same way as the census.
+
+Two things to keep in mind while doing it:
+
+* **the bitmap is 8-byte granular** (`bit i` denotes `base + i * 8`) while
+  objects are 16-byte shaped, so a spurious bit is representable — do not
+  assume alignment rules it out. One offender was 16-aligned and another was
+  not.
+* **`remove` and `insert` race on the same `AtomicU64` word.** Losing a bit
+  would explain a leak, not an overlap, but the pair is worth reading before
+  assuming the arithmetic is right.
+
+## Instruments now in the tree
+
+All three are behind `CRATONVM_DBG_ZGC_CORPSE=1` and cost a branch when off:
+
+* `zgc extent census` — the registry survey, at `pre-sweep` and `post-slide`,
+  with the raw words at the offending base;
+* `zgc alloc audit` — reserved bytes vs the header's own size, per allocation;
+* the pre-slide walkability census, from the first pass.
+
+And one counter is exported unconditionally in the shutdown summary:
+`tlab_retire_skipped`, which is what ruled the TLAB story out and is how
+someone re-opens it.
 
 ## Related
 
