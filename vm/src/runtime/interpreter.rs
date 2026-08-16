@@ -160,6 +160,46 @@ fn weakref_clear_enabled() -> bool {
     })
 }
 
+thread_local! {
+    /// Armed by the allocation-failure escalation ladder immediately before the
+    /// collection it runs as its final attempt, so that collection clears every
+    /// SoftReference rather than only the idle ones — the `java.lang.ref`
+    /// last-ditch guarantee (see
+    /// `ReferenceProcessor::condemn_all_soft_refs`).
+    ///
+    /// Thread-local rather than a process-global flag for two reasons. It is
+    /// armed and read on ONE thread: `last_ditch_reclaim` arms it, calls
+    /// `maybe_gc_forced`, and that function either initiates the collection on
+    /// this same thread — running `weakref_null_referents_pre_gc` here, where
+    /// the flag is visible — or declines because another thread is already
+    /// collecting, in which case no collection of ours happens and the flag
+    /// must not affect anyone else's. And a process can host more than one VM,
+    /// which a `static AtomicBool` would silently share; nothing about
+    /// "this thread is out of memory" belongs to a sibling VM.
+    static LAST_DITCH_SOFT_CLEAR: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Run `f` with the last-ditch soft-clear rule armed for any collection it
+/// initiates. Restores the previous value on the way out, including on unwind,
+/// so a panic inside the collection cannot leave the rule latched on for every
+/// later GC on this thread.
+pub(crate) fn with_last_ditch_soft_clear<R>(f: impl FnOnce() -> R) -> R {
+    struct Disarm(bool);
+    impl Drop for Disarm {
+        fn drop(&mut self) {
+            LAST_DITCH_SOFT_CLEAR.with(|c| c.set(self.0));
+        }
+    }
+    let _restore = Disarm(LAST_DITCH_SOFT_CLEAR.with(|c| c.replace(true)));
+    f()
+}
+
+/// Whether the collection about to run is the allocation failure's last
+/// attempt. See [`with_last_ditch_soft_clear`].
+fn last_ditch_soft_clear_armed() -> bool {
+    LAST_DITCH_SOFT_CLEAR.with(|c| c.get())
+}
+
 /// `CRATONVM_DBG_WEAKREF` — trace the Weak/Phantom referent null/restore passes.
 fn dbg_weakref() -> bool {
     use std::sync::OnceLock;
@@ -174,13 +214,60 @@ fn dbg_weakref() -> bool {
 /// immediately before `collect_garbage` (the Reference objects are still at
 /// their pre-collection addresses and no mutator can observe the transient
 /// null). No-op when the gate is off or no Weak/Phantom references exist.
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
 pub fn weakref_null_referents_pre_gc(shared: &SharedVm) {
     if !weakref_clear_enabled() {
         return;
     }
-    let pairs = {
-        let rp = shared.mem.ref_processor.lock();
-        rp.weak_phantom_active_pairs()
+    // Heap headroom for the soft-reference LRU policy below. Read BEFORE the
+    // reference-processor lock is taken -- the heap's own locks rank above L7.
+    let soft_free_mb = shared.mem.heap.soft_ref_policy_free_mb();
+    let (pairs, soft_pairs) = {
+        let mut rp = shared.mem.ref_processor.lock();
+        let weak_phantom = rp.weak_phantom_active_pairs();
+        // SOFT-CLEAR GAP (2026-08-15). This is the measured answer to the
+        // residual left by the retired `zgc-resourceleakdetector-corpse-read`
+        // write-up: "the marker traces referents as strong edges; whether the
+        // VM-level pass compensates is not established". It compensates for
+        // WEAK and PHANTOM -- that is what the loop below does. It did NOT for
+        // SOFT, on any collector: `process_soft_refs` skips an entry whose
+        // referent `is_marked`, and a soft referent is always marked through
+        // its own `SoftReference`'s slot 0, so the LRU policy beneath that
+        // check could never fire. In a 64 MiB heap HotSpot cleared the soft
+        // reference and allocated 30 MiB past it while CratonVM threw
+        // `OutOfMemoryError` under both ZGC and G1.
+        //
+        // `condemn_idle_soft_refs` applies the policy here instead, and only
+        // the entries it condemns join the null pass; the rest stay traced
+        // strongly and are retained exactly as before. `0` for the clock is
+        // the same convention `process_references_after_gc` uses -- the
+        // processor substitutes the mutator clock it has observed.
+        //
+        // The clock is a real `SystemTime` reading, not the `0` that
+        // `process_references_after_gc` passes. `0` means "use the last value a
+        // mutator handed `touch_soft_reference`", which is the moment of the
+        // most recent `SoftReference.get()` in the process — so the idle window
+        // of the reference that made that call is zero, and a program looping
+        // on its own soft-referenced cache never opens one. This caller is
+        // ordinary VM code and has a clock; `SoftReference.<init>` and `.get()`
+        // stamp entries from the same `SystemTime` epoch, so the two are
+        // directly comparable.
+        let soft = if last_ditch_soft_clear_armed() {
+            // The allocation has already failed and this is the last
+            // collection before `OutOfMemoryError`. The specification requires
+            // every softly-reachable object to be released first, whatever the
+            // LRU policy thinks.
+            rp.condemn_all_soft_refs()
+        } else {
+            rp.condemn_idle_soft_refs(soft_free_mb, now_ms())
+        };
+        (weak_phantom, soft)
     };
     // RandomizedContext WeakHashMap<Thread,...> fix: publish this cycle's
     // referent addresses so the non-moving young sweep can recognize a
@@ -231,16 +318,18 @@ pub fn weakref_null_referents_pre_gc(shared: &SharedVm) {
         );
     }
     cratonvm_gc::gc_quiescence::set_watched_referents(&watch_addrs);
-    if pairs.is_empty() {
+    if pairs.is_empty() && soft_pairs.is_empty() {
         return;
     }
     if dbg_weakref() {
         eprintln!(
-            "[weakref] pre-gc null pass: {} weak/phantom referent(s)",
-            pairs.len()
+            "[weakref] pre-gc null pass: {} weak/phantom referent(s), \
+             {} policy-condemned soft referent(s)",
+            pairs.len(),
+            soft_pairs.len()
         );
     }
-    for (ref_obj_addr, _referent) in pairs {
+    for (ref_obj_addr, _referent) in pairs.into_iter().chain(soft_pairs) {
         // The Reference object is live (or dead-but-not-yet-collected) at this
         // point, so its memory is valid; writing its referent slot is safe.
         // SAFETY: `ref_obj_addr` is a current Reference-object address held by

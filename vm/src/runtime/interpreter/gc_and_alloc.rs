@@ -1228,7 +1228,7 @@ pub(crate) fn create_string_or_oom(
     if let Some(obj) = try_new_string(shared, text) {
         return Ok(obj);
     }
-    g1_force_full_cycle(shared, thread);
+    last_ditch_reclaim(shared, thread);
     if let Some(obj) = try_new_string(shared, text) {
         return Ok(obj);
     }
@@ -1260,7 +1260,7 @@ pub(crate) fn create_string_from_units_or_oom(
     if let Some(obj) = try_new_string(shared, units) {
         return Ok(obj);
     }
-    g1_force_full_cycle(shared, thread);
+    last_ditch_reclaim(shared, thread);
     if let Some(obj) = try_new_string(shared, units) {
         return Ok(obj);
     }
@@ -1722,7 +1722,7 @@ pub fn force_gc_from_native(shared: &SharedVm, thread: &mut JvmThread) {
         // Eden evacuation. Finish the G1 mark/remark/cleanup synchronously so
         // dead old regions, weak loaders, and their metadata are observable
         // before System.gc() returns.
-        g1_force_full_cycle(shared, thread);
+        last_ditch_reclaim(shared, thread);
     }
     // Run pending finalizers
     run_finalizers(shared, thread);
@@ -2480,10 +2480,19 @@ pub(super) fn process_references_after_gc(
     // null slot. Runs before `update_after_gc` so processor addresses are still
     // the pre-collection (pointer-map key) view.
     if weakref_clear_enabled() {
-        let active = ref_proc.weak_phantom_active_pairs();
+        let mut active = ref_proc.weak_phantom_active_pairs();
+        // SOFT-CLEAR GAP (2026-08-15): the pre-collection pass also nulled the
+        // referent slot of every soft entry its LRU policy condemned. The ones
+        // still active here are the condemned entries whose referent turned
+        // out to be strongly reachable anyway, so `process_soft_refs` kept
+        // them -- and their slot 0 must be written back for exactly the reason
+        // a surviving weak referent's must be. The loop below is already
+        // generic over `(reference_obj, referent)` pairs, so they ride it.
+        active.extend(ref_proc.soft_pre_nulled_active_pairs());
         if dbg_weakref() && !active.is_empty() {
             eprintln!(
-                "[weakref] post-gc restore pass: {} surviving weak/phantom referent(s)",
+                "[weakref] post-gc restore pass: {} surviving referent(s) \
+                 (weak/phantom + policy-kept soft)",
                 active.len()
             );
         }
@@ -3393,7 +3402,7 @@ pub(crate) fn alloc_object_shared(
     }
     // G1 last-ditch: see `gc_alloc_array` — dead Old/humongous spans need a
     // completed mark cycle's cleanup; run one synchronously and retry once.
-    g1_force_full_cycle(shared, thread);
+    last_ditch_reclaim(shared, thread);
     let obj = shared
         .mem
         .heap
@@ -3592,7 +3601,7 @@ pub(super) fn gc_alloc_array(
     // G1 last-ditch: the young pause above cannot reclaim dead Old/humongous
     // spans — only a completed mark cycle's cleanup can. Run one
     // synchronously and retry once before surfacing OOM.
-    g1_force_full_cycle(shared, thread);
+    last_ditch_reclaim(shared, thread);
     let arr = shared
         .mem
         .heap
@@ -5418,6 +5427,48 @@ pub(super) fn g1_remark_process_references(
 /// marker never quiesces or the STW races never resolve — the caller then
 /// proceeds to OOM; this can delay an inevitable OOM slightly but never
 /// hangs the allocation path.
+/// The whole final rung of the allocation-failure ladder: everything the VM
+/// can still do to satisfy an allocation that has already failed once, before
+/// the caller is entitled to throw `OutOfMemoryError`.
+///
+/// Two steps, in order, because they reclaim disjoint things:
+///
+/// 1. [`g1_force_full_cycle`] — dead Old and humongous regions, which only a
+///    completed mark cycle's cleanup reclaims. G1 only.
+/// 2. [`last_ditch_clear_soft_refs`] — every softly-reachable object, on every
+///    collector. `java.lang.ref`'s guarantee is unconditional: all soft
+///    references to softly-reachable objects are cleared before the VM throws
+///    `OutOfMemoryError`. CratonVM honoured only the LRU half of the soft-ref
+///    policy, which by construction never fires for the reference the failing
+///    program is itself reading in a loop.
+pub(crate) fn last_ditch_reclaim(shared: &SharedVm, thread: &mut JvmThread) {
+    g1_force_full_cycle(shared, thread);
+    last_ditch_clear_soft_refs(shared, thread);
+}
+
+/// Collect once with every SoftReference condemned — see
+/// `ReferenceProcessor::condemn_all_soft_refs` for the rule and
+/// `with_last_ditch_soft_clear` for why the arming is thread-local.
+///
+/// Skipped outright when the application holds no live soft references, which
+/// is the common case; a heap that is genuinely full then pays no extra GC on
+/// its way to `OutOfMemoryError`.
+fn last_ditch_clear_soft_refs(shared: &SharedVm, thread: &mut JvmThread) {
+    if !weakref_clear_enabled() {
+        // The opt-out restores the legacy never-clearing behaviour wholesale;
+        // that has to include this rule, or `CRATONVM_WEAKREF_CLEAR=0` would
+        // no longer be the byte-identical safety net it is documented to be.
+        return;
+    }
+    if !shared.mem.ref_processor.lock().has_active_soft_refs() {
+        return;
+    }
+    thread.tlab.retire();
+    crate::runtime::interpreter::with_last_ditch_soft_clear(|| {
+        maybe_gc_forced(shared, thread);
+    });
+}
+
 pub(crate) fn g1_force_full_cycle(shared: &SharedVm, thread: &mut JvmThread) {
     if !shared.mem.heap.is_g1() {
         return;
