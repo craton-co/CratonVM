@@ -383,4 +383,6 @@ defect, and it has its own page:
   half. Still reproducing; see that page for the current numbers.
 * ZGC and the generational heap throw `OutOfMemoryError` on an allocation-churn
   workload that G1 and HotSpot both survive — found while measuring residual 1,
-  written up in `zgc-nojit-allocation-churn-oome-20260815.md`.
+  written up in the `zgc-nojit-allocation-churn-oome` page -- root-caused
+  and FIXED on 2026-08-16 (the slide discarded the whole low free list,
+  including the holes it had not written into), and retired with it.

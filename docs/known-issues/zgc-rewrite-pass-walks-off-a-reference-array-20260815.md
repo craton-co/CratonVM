@@ -353,6 +353,70 @@ holding non-reference words (the same population the `W7-84` autoboxing warning
 counts), not missed remaps. Doc A's `missed_rewrites=0` stands; do not spend a
 session on those lines.
 
+## Fourth pass, 2026-08-16: it is not a Java store, and not a raw native copy
+
+The third pass ended with "instrument the store path: report a field/array
+store whose receiver is not a registered base". Done, and it never fires.
+
+`ZgcRealHeap::audit_access_receiver` asks one question on every `set_field` and
+`set_array_element` — is this receiver a registered object base? — and reports
+the receiver's class, whether any registered object CONTAINS the address, how
+far into it, and that container's class. Across runs including two that
+produced overlaps (5 and 2) and one that SIGSEGV'd:
+
+```
+s-rep2 rc=1   access_audit=0 overlaps=5
+s-rep4 rc=1   access_audit=0 overlaps=2
+s-rep6 rc=139 access_audit=0 overlaps=0
+```
+
+**Every Java-level field and array access has a properly registered receiver.**
+`set_field_volatile` delegates to `set_field`, so it is covered by the same
+check; and `Unsafe.putObject` routes through `ctx.set_field` /
+`ctx.set_array_element`, so it is too. That closes the whole managed store path.
+
+The other way an 8-byte arena pointer can land on a header is a raw native
+copy, and this VM already has a detector for it: `CRATONVM_DBG_HEAPCOPY` on
+`VmExec::copy_to_native_memory` prints the Java stack of any raw write whose
+destination aliases the managed heap. It reads **zero** in a run that produced
+an overlap.
+
+## Which leaves one door, and it is the one the detector cannot see through
+
+`copy_to_native_memory` opens with:
+
+```rust
+if unsafe_arena_addr_is_tagged(addr) {
+    return unsafe_arena_copy_in(addr, data);
+}
+...
+if heapcopy_dbg() && self.shared.mem.heap.is_heap_addr(addr as usize).is_some() { ... }
+```
+
+**The tagged-arena-handle path returns before the diagnostic runs.** So a write
+through a tagged handle is invisible to the very detector written to catch raw
+writes into the heap — and tagged arena handles are exactly the values this VM
+is known to leak into native code (`0x4000_0010_…` appearing inside a `.so` is
+a tagged handle, not a pointer). That is the next place to look, and the first
+edit is to move the `heapcopy_dbg()` check ABOVE the tagged early return so the
+two paths are instrumented alike.
+
+## The elimination table, cumulative
+
+| candidate writer | verdict | the number |
+|---|---|---|
+| a bad registry insert (three shapes) | **no** | `double-issue` / `interior-insert` / `stale-entry-swallowed` all 0 |
+| the slide itself | **no** | post-slide survey clean on the cycle before the first overlap |
+| the live set arriving broken | **no** | pre-slide census 0, every cycle |
+| a retained TLAB chunk | **no** | `tlab_retire_skipped=0` |
+| an allocation sized wrong | **no** | `zgc alloc audit` never fires |
+| a Java field/array store | **no** | `zgc access audit` never fires, incl. runs that overlap |
+| a raw native copy into the heap | **no** | `CRATONVM_DBG_HEAPCOPY` 0 in an overlapping run |
+| a write through a TAGGED arena handle | **untested** | the detector returns before it |
+
+Compaction remains necessary — `CRATONVM_ZGC_RELOCATE=0` has never produced an
+overlap or a crash on any arm.
+
 ## Instruments added this pass
 
 Behind `CRATONVM_DBG_ZGC_CORPSE=1`, all O(1) or one pass, a branch when off:

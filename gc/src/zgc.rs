@@ -2430,6 +2430,7 @@ pub struct ZgcRealHeap {
     /// registry entries seen there. Exported so the ruling-out is re-checkable
     /// rather than remembered.
     tlab_retire_skipped_total: AtomicUsize,
+
     /// How many unwalkable rewrite targets have already been logged in full,
     /// so a heap that produces thousands does not produce thousands of lines.
     unwalkable_reports: AtomicUsize,
@@ -2839,6 +2840,7 @@ impl ZgcRealHeap {
             corpse_cycle: AtomicU64::new(0),
             relocation_skipped_jit: AtomicUsize::new(0),
             tlab_retire_skipped_total: AtomicUsize::new(0),
+
             unwalkable_reports: AtomicUsize::new(0),
             driver_passes: AtomicUsize::new(0),
             mark_active: AtomicBool::new(false),
@@ -4407,7 +4409,13 @@ impl ZgcRealHeap {
                 );
             }
             let new_cursor = proposed.max(live_ceiling) - base;
-            reclaimed = arena.compact_low_to(new_cursor);
+            // The bytes this slide actually wrote: it places survivors from
+            // `slide_floor` upwards and stops at `dest`. Everything outside
+            // that window is where it was before, so a free block there is
+            // still free -- see `Arena::compact_low_to` for what dropping them
+            // wholesale cost.
+            let touched = slide_floor.saturating_sub(base)..dest.saturating_sub(base);
+            reclaimed = arena.compact_low_to(new_cursor, touched);
             // One batched publish after the slide, not one per object: the
             // record is read by the rewrite pass below, which must see the
             // WHOLE map or it resolves half the graph against a half-built one.
@@ -5964,6 +5972,64 @@ impl ZgcRealHeap {
             return None;
         }
         Some(num_slots)
+    }
+
+    /// Is the receiver of a field or array access an object at all?
+    ///
+    /// [`Self::check_field_index`] guards the INDEX and nothing guards the
+    /// RECEIVER, so an access through an address that merely happens to carry a
+    /// plausible header passes every check and reads or writes wherever it
+    /// points. That is the one shape that can explain the reopened
+    /// `zgc-rewrite-pass-walks-off-a-reference-array` corruption: a store into
+    /// object `O` at index `i` writes at `O + HEADER_SIZE + i * SLOT_SIZE`, so
+    /// it can only land on another object's offset 0 -- which is what the
+    /// extent census keeps finding -- if `O` is not where an object starts.
+    ///
+    /// Reports and never refuses. Refusing would turn a wrong write into a
+    /// silently dropped one, which is harder to debug and no safer: by the time
+    /// this fires the receiver is already wrong, and what is wanted is its
+    /// identity, not its suppression.
+    ///
+    /// Behind `CRATONVM_DBG_ZGC_CORPSE`: one bit test on the object-start
+    /// bitmap when it is on, a branch when it is off. Capped, and it names
+    /// three things -- whether any registered object CONTAINS the receiver
+    /// (an interior pointer, so the caller derived it), how far into that
+    /// object it points, and what class that container is.
+    fn audit_access_receiver(&self, base: usize, index: usize, op: &'static str) {
+        if !zgc_corpse_enabled() || self.registry.contains(base) {
+            return;
+        }
+        let n = self.corpse_reports.fetch_add(1, Ordering::Relaxed);
+        if n >= 24 {
+            return;
+        }
+        // The registered object this address falls inside, if any. An interior
+        // hit means the caller HELD a derived pointer; a miss means the address
+        // is not in any live object at all, which is a different bug.
+        let container = self.registry.nearest_base_at_or_below(base);
+        let (container_base, container_class, container_slots, interior_off) = match container {
+            Some(c) if c < base => {
+                let ch = self.header_ref(c as *mut u8);
+                (c, ch.class_id.as_u32(), ch.num_slots(), base - c)
+            }
+            _ => (0, 0, 0, 0),
+        };
+        let h = self.header_ref(base as *mut u8);
+        tracing::error!(
+            target: "cratonvm::gc::guard",
+            op,
+            base,
+            index,
+            receiver_class_id = h.class_id.as_u32(),
+            receiver_num_slots = h.num_slots(),
+            receiver_kind = ?h.kind(),
+            container_base,
+            container_class,
+            container_slots,
+            interior_off,
+            "zgc access audit: the receiver of this field/array access is not a \
+             registered object base -- the access will land wherever it points"
+        );
     }
 
     /// `CRATONVM_DBG_ZGC_CORPSE` -- name the object that USED to be at the
@@ -8616,6 +8682,7 @@ impl GarbageCollector for ZgcRealHeap {
     }
 
     fn set_field(&self, obj: ObjectRef, index: usize, value: Value) {
+        self.audit_access_receiver(obj.as_ptr() as usize, index, "set_field");
         let header = self.header(obj);
         if self.check_field_index(header, index, "set").is_none() {
             return;
@@ -8767,6 +8834,7 @@ impl GarbageCollector for ZgcRealHeap {
     }
 
     fn set_array_element(&self, obj: ObjectRef, index: usize, value: Value) -> Result<(), i32> {
+        self.audit_access_receiver(obj.as_ptr() as usize, index, "set_array_element");
         let header = self.header(obj);
         if header.kind() != ObjectKind::Array {
             return Err(index as i32);
@@ -9311,6 +9379,29 @@ impl GarbageCollector for ZgcRealHeap {
             // and a 16 MB array becomes unservable forever once the process has
             // allocated its capacity, with 1.8 GB free and 15% live. See
             // `Arena::retract_cursor_into_free_tail`.
+            // WHERE THE SWEPT BYTES ACTUALLY WENT.
+            //
+            // `bytes_freed` is what the sweep handed to `add_free_block`; this
+            // is what the arena has to show for it, measured at the same
+            // instant with the same lock held. A large `bytes_freed` beside a
+            // small `free_bytes_total` is memory that was swept and then lost,
+            // and it is the difference between "this heap fragments" and "this
+            // heap leaks" -- which want opposite fixes.
+            //
+            // Under `--verbose:gc` only, next to the per-cycle line it
+            // explains.
+            if self.gc_log_enabled.load(Ordering::Relaxed) {
+                eprintln!(
+                    "[GC] zgc-reclaim: bytes_freed={} free_list_bytes={} \
+                     largest_free_block={} cursor={} capacity={} registered={}",
+                    bytes_freed,
+                    arena.free_list_bytes(),
+                    arena.largest_free_block(),
+                    arena.used(),
+                    arena.capacity(),
+                    all.len(),
+                );
+            }
             let reclaimed_tail = arena.retract_cursor_into_free_tail();
             if reclaimed_tail != 0 {
                 tracing::debug!(
