@@ -5203,24 +5203,41 @@ pub(crate) fn register_accepted_issuers(r: &mut NativeMethodRegistry) {
         "()[Ljava/security/cert/X509Certificate;",
         |ctx, _args| {
             let ders = accepted_issuer_ders();
-            let arr = ctx.new_ref_array(cratonvm_types::ClassId::new(0), ders.len());
-            for (i, der) in ders.iter().enumerate() {
-                let cert = try_alloc_concurrent_synthetic(ctx, "java/security/cert/X509Certificate", 4)?;
-                // Best-effort CN extraction via the existing DER parser.
-                let (subject, issuer) = crate::phases_late::basic_der_extract_names(der)
-                    .unwrap_or_else(|| ("CN=Unknown".into(), "CN=Unknown".into()));
-                let sub = ctx.create_string(&subject);
-                let iss = ctx.create_string(&issuer);
-                ctx.set_field(cert, 0, Value::Object(Some(sub)));
-                ctx.set_field(cert, 1, Value::Object(Some(iss)));
-                ctx.set_field(cert, 2, Value::Long(0));
-                let der_arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, der.len());
-                for (j, &b) in der.iter().enumerate() {
-                    ctx.set_array_element(der_arr, j, Value::Int(b as i8 as i32));
+            let arr0 = ctx.new_ref_array(cratonvm_types::ClassId::new(0), ders.len());
+            // GC: everything in this loop allocates — the mirror, two strings,
+            // the DER byte[] — so `arr` and `cert` must be pinned and re-read,
+            // not held raw. See `x509_manager::get_accepted_issuers`, which
+            // had the identical defect and the netty failure that found it.
+            let pin = ctx.pin_native_root(arr0);
+            let mut arr = arr0;
+            let result = (|| -> Result<(), cratonvm_types::error::MethodCallFailed> {
+                for (i, der) in ders.iter().enumerate() {
+                    let cert0 =
+                        try_alloc_concurrent_synthetic(ctx, "java/security/cert/X509Certificate", 4)?;
+                    let cert_pin = ctx.pin_native_root(cert0);
+                    // Best-effort CN extraction via the existing DER parser.
+                    let (subject, issuer) = crate::phases_late::basic_der_extract_names(der)
+                        .unwrap_or_else(|| ("CN=Unknown".into(), "CN=Unknown".into()));
+                    let sub = ctx.create_string(&subject);
+                    let iss = ctx.create_string(&issuer);
+                    let cert = ctx.read_native_pin(cert_pin, cert0);
+                    ctx.set_field(cert, 0, Value::Object(Some(sub)));
+                    ctx.set_field(cert, 1, Value::Object(Some(iss)));
+                    ctx.set_field(cert, 2, Value::Long(0));
+                    let der_arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, der.len());
+                    for (j, &b) in der.iter().enumerate() {
+                        ctx.set_array_element(der_arr, j, Value::Int(b as i8 as i32));
+                    }
+                    let cert = ctx.read_native_pin(cert_pin, cert0);
+                    ctx.set_field(cert, 3, Value::Object(Some(der_arr)));
+                    ctx.unpin_native_roots(cert_pin);
+                    arr = ctx.read_native_pin(pin, arr0);
+                    ctx.set_array_element(arr, i, Value::Object(Some(cert)));
                 }
-                ctx.set_field(cert, 3, Value::Object(Some(der_arr)));
-                ctx.set_array_element(arr, i, Value::Object(Some(cert)));
-            }
+                Ok(())
+            })();
+            ctx.unpin_native_roots(pin);
+            result?;
             Ok(Some(Value::Object(Some(arr))))
         },
     );
