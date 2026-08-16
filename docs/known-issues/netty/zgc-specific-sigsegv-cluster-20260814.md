@@ -332,6 +332,34 @@ The holder is outside the heap slot graph and survives `--nojit`.
 which turns "something holds it" into "*this* holds it". Pair it with the first
 `num_slots=0` to capture the address, then ask the registry who contributed it.
 
+## Update 2026-08-15 — `ResourceLeakDetectorTest` crash moved collectors again
+
+Azure host `azureuser@20.80.105.49`, worktree `/data/cvm-netty-gcrun-20260812`,
+merged fresh to `6dc9ebffe` (13 commits past `caf25c3d1`, including
+substantial GC-internals changes: `gen_heap.rs`, `region.rs`,
+`evac_pool.rs` (new), `narrow_oop.rs`). Same 43-class non-passed list, all
+3 GC variants, 1 shard each:
+
+| variant | CRASH | PASS | HANG | FAIL | ABORTED | NOTESTS |
+|---|---|---|---|---|---|---|
+| default (Generational) | **1** (`ResourceLeakDetectorTest`) | 10 | 20 | 8 | 2 | 2 |
+| G1 | 0 | 10 | 21 | 8 | 2 | 2 |
+| ZGC | **0** | 10 | 20 | 9 | 2 | 2 |
+
+**ZGC is now clean** — 0 crashes, matching G1's already-established 0.
+But `ResourceLeakDetectorTest`, the one new crash the previous fix
+binary introduced (2026-08-14, crashing under ZGC that day), now crashes
+under **default/Generational instead**, on this newer build. It has now
+been observed crashing under two different collectors across two
+different builds, and has never crashed under G1 in either. This argues
+against it being a fixed per-collector defect (like the original 7-class
+cluster clearly was — same 7 classes, same collector, every time) and
+more likely something timing/allocation-pattern-sensitive that different
+collectors happen to trigger differently. Not yet isolated in isolation
+(`--shards 1` was already used here, so this isn't shard contention) —
+worth a dedicated, focused investigation of this one class rather than
+folding it into the original cluster's narrative.
+
 ## Not yet done
 
 > **Updated 2026-08-15.** Of the four items below, three are now done: isolated

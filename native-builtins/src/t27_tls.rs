@@ -7769,6 +7769,13 @@ mod tests {
         assert!(r.find(cls, "setNeedClientAuth", "(Z)V").is_some());
         assert!(r.find(cls, "setWantClientAuth", "(Z)V").is_some());
         assert!(r.find(cls, "beginHandshake", "()V").is_some());
+        // JSSE's delegated-task contract. `getDelegatedTask` was unregistered
+        // until 2026-08-16, so a caller that followed the NEED_TASK this
+        // engine can report had no way to satisfy it. See `DelegatedTask`.
+        assert!(r
+            .find(cls, "getDelegatedTask", "()Ljava/lang/Runnable;")
+            .is_some());
+        assert!(r.find("java/lang/Runnable", "run", "()V").is_some());
         assert!(r
             .find(
                 cls,
@@ -7877,6 +7884,70 @@ mod tests {
         assert!(r
             .find(cls, "getApplicationProtocols", "()[Ljava/lang/String;")
             .is_some());
+    }
+
+    #[test]
+    fn a_delegated_task_is_owed_once_and_handed_over_once() {
+        // The state machine behind JSSE's NEED_TASK contract. See
+        // `DelegatedTask` for what each transition is load-bearing for.
+        let id = super::engine_alloc_id();
+        super::engine_registry()
+            .write()
+            .insert(id, super::EngineState::default());
+
+        // First need: deferred, and a Runnable is now owed.
+        assert_eq!(super::engine_begin_or_defer(id), Ok(true));
+        super::with_engine(id, |s| {
+            assert_eq!(s.delegated_task, super::DelegatedTask::Owed);
+            assert!(s.task_unclaimed);
+        });
+
+        // Collected exactly once — netty's in-line `runDelegatedTasks` loop
+        // terminates on the second, null answer and would otherwise spin.
+        assert!(super::claim_delegated_task(id));
+        assert!(!super::claim_delegated_task(id));
+        super::with_engine(id, |s| {
+            assert_eq!(s.delegated_task, super::DelegatedTask::HandedOut)
+        });
+
+        // Handed out and not yet run: the engine makes no progress, however
+        // many times it is asked. This refusal is the whole feature — it is
+        // what `test{Client,Server}HandshakeTimeoutBecauseExecutorNotExecute`
+        // measure, and it has to survive a retry loop.
+        assert_eq!(super::engine_begin_or_defer(id), Ok(true));
+        assert_eq!(super::engine_begin_or_defer(id), Ok(true));
+
+        super::engine_registry().write().remove(&id);
+    }
+
+    #[test]
+    fn a_task_done_inline_is_still_handed_over_when_the_caller_asks() {
+        // Rule 2 on `DelegatedTask`: netty's `SslTasksRunner.run()` returns
+        // WITHOUT calling `runComplete()` when `getDelegatedTask()` answers
+        // null, so `SslHandler` stays in STATE_PROCESS_TASK — where `decode()`
+        // and `flush()` are both no-ops — and the connection is wedged for
+        // good. Measured: `getDelegatedTask id=3 hand_out=false` on the
+        // executor thread, immediately after the event-loop thread had done
+        // the work inline, was `testHandshakeWithExecutorJDK`'s failure.
+        //
+        // A promise made must therefore be answered even when the work was
+        // meanwhile done by somebody else.
+        let id = super::engine_alloc_id();
+        let mut st = super::EngineState::default();
+        // Exactly what the `Owed` arm of `engine_begin_or_defer` leaves
+        // behind when it self-heals: the work is done, the promise is not.
+        st.delegated_task = super::DelegatedTask::None;
+        st.delegated_task_armed = true;
+        st.task_unclaimed = true;
+        super::engine_registry().write().insert(id, st);
+
+        assert!(
+            super::claim_delegated_task(id),
+            "a caller told NEED_TASK must never be answered with null"
+        );
+        assert!(!super::claim_delegated_task(id));
+
+        super::engine_registry().write().remove(&id);
     }
 
     #[test]
@@ -8576,6 +8647,20 @@ pub(crate) struct EngineState {
     /// exists so `SSLEngine.getPeerPort()` can answer what the application asked
     /// for instead of the uninitialised `-1` of a bare synthetic allocation.
     peer_port: i32,
+    /// JSSE's delegated-task state for this engine. See [`DelegatedTask`].
+    delegated_task: DelegatedTask,
+    /// This engine has already used its one deferral. Without it a caller that
+    /// keeps handing the engine back its own NEED_TASK would re-arm forever.
+    delegated_task_armed: bool,
+    /// We told a caller NEED_TASK and have not yet handed it a `Runnable`.
+    /// Deliberately NOT cleared when the work is done inline — see the `Owed`
+    /// arm of [`engine_begin_or_defer`] for what returning `null` to a caller
+    /// that was promised a task costs.
+    task_unclaimed: bool,
+    /// Complete TLS records taken out of the caller's buffer while the
+    /// connection did not exist yet, waiting for the delegated task to realize
+    /// it. See the NEED_TASK arm of `do_unwrap`.
+    deferred_inbound: Vec<u8>,
     /// A handshake failure this SERVER engine has detected but not yet
     /// reported, because the fatal alert rustls queued for it still has to be
     /// flushed first.
@@ -8701,6 +8786,10 @@ impl Default for EngineState {
             server_config: None,
             peer_host: None,
             peer_port: -1,
+            delegated_task: DelegatedTask::None,
+            delegated_task_armed: false,
+            task_unclaimed: false,
+            deferred_inbound: Vec::new(),
             deferred_handshake_error: None,
             endpoint_id_alg: None,
             identity_override: None,
@@ -8978,6 +9067,11 @@ fn handshake_status_of(s: &EngineState) -> i32 {
             return HS_NEED_WRAP_R;
         }
         return HS_NOT_HANDSHAKING_R;
+    }
+    // A delegated task the caller owes us outranks everything else: JSSE
+    // reports NEED_TASK until the task has actually run. See `DelegatedTask`.
+    if s.delegated_task != DelegatedTask::None {
+        return HS_NEED_TASK_R;
     }
     // `write_tls()` may have produced more than one complete TLS record. A
     // previous wrap can legitimately emit only the first record when the
@@ -9549,6 +9643,55 @@ fn wants_deferred_client_auth(ctx_key: Option<u64>) -> bool {
 /// wrong type even when the handshake correctly refuses to happen.
 pub(crate) const HANDSHAKE_ERR_PREFIX: &str = "handshake_failure: ";
 
+/// JSSE's delegated-task contract, which this engine implements.
+///
+/// `SSLEngine.wrap`/`unwrap` may answer `NEED_TASK`, meaning "I have work I
+/// want done off this thread". The caller must then collect the `Runnable`
+/// from `getDelegatedTask()` and run it before the engine will make progress.
+///
+/// It is not decoration. netty's
+/// `SslHandlerTest.test{Client,Server}HandshakeTimeoutBecauseExecutorNotExecute`
+/// installs an `Executor` that deliberately never runs what it is given and
+/// asserts the handshake then TIMES OUT. With no task ever emitted there was
+/// nothing to withhold: the handshake completed and the assertion saw `null`
+/// where an `SslHandshakeTimeoutException` belonged. `getDelegatedTask()` was
+/// not registered at all, so a caller that reached it got nothing back.
+///
+/// **The work is real.** What gets deferred is `engine_begin` — building the
+/// rustls configuration, which parses PEM chains, loads private keys and can
+/// call back into Java `KeyManager` code. That is the class of work JSSE
+/// defers, and until the task runs the connection genuinely does not exist, so
+/// an executor that drops the task really does stall the handshake.
+///
+/// **Two rules the callers impose, both learned the expensive way:**
+///
+/// 1. *Consume first, then defer.* netty's `SslHandler.decodeJdkCompatible`
+///    hands `unwrap` exactly one TLS record and treats
+///    `bytesConsumed != packetLength` as "not an SSL/TLS record" — it throws
+///    `NotSslRecordException` and fails the handshake. An `unwrap` that
+///    answers NEED_TASK having consumed nothing is not deferring the
+///    handshake, it is killing it. Real JSSE ingests the record and defers the
+///    processing; `do_unwrap` stages the records into `deferred_inbound` and
+///    reports them consumed.
+/// 2. *Never answer `null` to a caller that was promised a task.* netty's
+///    `SslTasksRunner.run()` returns immediately when `getDelegatedTask()` is
+///    `null`, WITHOUT calling `runComplete()` — so `SslHandler` stays in
+///    `STATE_PROCESS_TASK`, where `decode()` and `flush()` are both no-ops,
+///    and the connection is wedged for good. `task_unclaimed` is what
+///    guarantees one non-null answer per promise even if the work was
+///    meanwhile done inline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DelegatedTask {
+    /// Nothing outstanding — either never needed, or already run.
+    None,
+    /// A caller was told NEED_TASK; `getDelegatedTask()` owes it a `Runnable`.
+    Owed,
+    /// Collected. The caller owns the work now, and the engine stays
+    /// `NEED_TASK` until it is run — however long that takes, or forever,
+    /// which is exactly what the two timeout tests measure.
+    HandedOut,
+}
+
 /// Which `SSLException` subclass JSSE raises for a handshake-phase failure.
 ///
 /// `SSLProtocolException` means "the peer broke the protocol" — a message of
@@ -9590,6 +9733,94 @@ fn engine_begin_failure(
         ),
         None => RuntimeError::IOException { message: e }.into(),
     }
+}
+
+/// Take the `Runnable` this engine owes its caller, if it still owes one.
+///
+/// Answers `true` at most once per promise: netty's in-line
+/// `runDelegatedTasks` loop drains `getDelegatedTask()` until it answers null,
+/// so a second `true` would spin it. It reads `task_unclaimed` rather than
+/// `delegated_task` on purpose — see rule 2 on [`DelegatedTask`].
+fn claim_delegated_task(id: i32) -> bool {
+    with_engine(id, |s| {
+        if s.task_unclaimed {
+            s.task_unclaimed = false;
+            if s.delegated_task == DelegatedTask::Owed {
+                s.delegated_task = DelegatedTask::HandedOut;
+            }
+            true
+        } else {
+            false
+        }
+    })
+    .unwrap_or(false)
+}
+
+/// Realize the rustls connection, or hand the caller a delegated task to do
+/// it — JSSE's `NEED_TASK` contract. See [`DelegatedTask`].
+///
+/// Returns `Ok(true)` when the work was DEFERRED (the caller must now be told
+/// `NEED_TASK` and given no bytes), `Ok(false)` when it was done or was not
+/// needed.
+fn engine_begin_or_defer(id: i32) -> Result<bool, String> {
+    let mut g = engine_registry().write();
+    let Some(s) = g.get_mut(&id) else {
+        return Ok(false);
+    };
+    if crate::nbflags().dbg_tls_hs_ok {
+        eprintln!(
+            "[dbg-tls-task] thread={:?} begin_or_defer id={} state={:?} armed={} unclaimed={}",
+            std::thread::current().id(),
+            id,
+            s.delegated_task,
+            s.delegated_task_armed,
+            s.task_unclaimed
+        );
+    }
+    match s.delegated_task {
+        // Collected and not yet run: the caller owns the work. Refuse to make
+        // progress. This refusal IS the feature.
+        DelegatedTask::HandedOut => Ok(true),
+        // Owed, but the caller came back for more instead of collecting it.
+        // A caller that ignores NEED_TASK entirely would otherwise spin
+        // forever, so do the work inline and let it through.
+        //
+        // `task_unclaimed` is deliberately NOT cleared here. A caller can also
+        // reach this arm by being merely SLOW — its executor collects the task
+        // on another thread a moment later — and handing that caller a `null`
+        // is what wedges netty (rule 2 on [`DelegatedTask`]). One promise, one
+        // non-null answer, whoever did the work.
+        DelegatedTask::Owed => {
+            s.delegated_task = DelegatedTask::None;
+            engine_begin_if_needed(s).map(|()| false)
+        }
+        DelegatedTask::None => {
+            if s.delegated_task_armed {
+                return engine_begin_if_needed(s).map(|()| false);
+            }
+            // The roots are staged in a thread-local by whichever thread built
+            // the `SSLContext`; a delegated task runs on another thread by
+            // definition, so snapshot them onto the engine while we are still
+            // on the thread that can see them.
+            if s.trust_roots_override.is_none() {
+                s.trust_roots_override = take_selected_context_trust_roots();
+            }
+            s.delegated_task_armed = true;
+            s.task_unclaimed = true;
+            s.delegated_task = DelegatedTask::Owed;
+            Ok(true)
+        }
+    }
+}
+
+/// `engine_begin`, but only when the connection is not there yet. A CLIENT
+/// engine reaches the delegated-task paths with its connection already built —
+/// it defers the PROCESSING of the server's first flight, not the config.
+fn engine_begin_if_needed(state: &mut EngineState) -> Result<(), String> {
+    if state.conn.is_some() {
+        return Ok(());
+    }
+    engine_begin(state)
 }
 
 /// Begin the handshake — construct the rustls connection from the cached
@@ -10193,6 +10424,20 @@ fn engine_wrap_pump(
 /// Push inbound TLS bytes into rustls, process packets, then drain plaintext
 /// into the dsts (returned as `Vec<u8>`). Returns (consumed_from_src, plaintext_out).
 fn engine_unwrap_pump(state: &mut EngineState, inbound: &[u8]) -> Result<(usize, Vec<u8>), String> {
+    engine_unwrap_pump_raw(state, inbound).map_err(|e| format!("rustls process_new_packets: {}", e))
+}
+
+/// As [`engine_unwrap_pump`], but surfacing the rustls error itself.
+///
+/// The KIND of the error decides which `SSLException` subclass JSSE raises
+/// (`jsse_handshake_exception_class`), and a stringified error cannot be
+/// classified: `testTruncatedPacket` wants `SSLProtocolException` for a
+/// ServerHello pushed into a server engine and sees `SSLHandshakeException`
+/// if the class is picked before the kind is known.
+fn engine_unwrap_pump_raw(
+    state: &mut EngineState,
+    inbound: &[u8],
+) -> Result<(usize, Vec<u8>), rustls::Error> {
     let conn = match state.conn.as_mut() {
         Some(c) => c,
         None => return Ok((0, Vec::new())),
@@ -10211,9 +10456,7 @@ fn engine_unwrap_pump(state: &mut EngineState, inbound: &[u8]) -> Result<(usize,
             match conn.read_tls(&mut cursor) {
                 Ok(0) => break,
                 Ok(_) => {
-                    if let Err(e) = conn.process_new_packets() {
-                        return Err(format!("rustls process_new_packets: {}", e));
-                    }
+                    conn.process_new_packets()?;
                     if !conn.wants_read() && cursor.position() == pos_before {
                         break;
                     }
@@ -12080,6 +12323,175 @@ fn register_engine_impl_natives(r: &mut NativeMethodRegistry) {
         Ok(None)
     });
 
+    // getDelegatedTask() — hand over the work this engine deferred, once.
+    //
+    // Was not registered at all before, so a caller that followed the
+    // NEED_TASK this engine can already report (the fallthrough at the end of
+    // `handshake_status_of`) had no way to satisfy it.
+    r.register(
+        cls_impl,
+        "getDelegatedTask",
+        "()Ljava/lang/Runnable;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let id = engine_id_or_alloc(ctx, this);
+            let hand_out = claim_delegated_task(id);
+            if crate::nbflags().dbg_tls_hs_ok {
+                eprintln!(
+                    "[dbg-tls-task] thread={:?} getDelegatedTask id={} hand_out={}",
+                    std::thread::current().id(),
+                    id,
+                    hand_out
+                );
+            }
+            if !hand_out {
+                // JSSE answers null once the queue is drained, and netty's
+                // in-line `runDelegatedTasks` loop terminates on exactly that.
+                return Ok(Some(Value::Object(None)));
+            }
+            let task = try_alloc_concurrent_synthetic(ctx, "java/lang/Runnable", 1)?;
+            ctx.set_field(task, 0, Value::Int(id));
+            Ok(Some(Value::Object(Some(task))))
+        },
+    );
+
+    // The task itself. Registered on `java.lang.Runnable` because that is the
+    // class the object above wears — nothing else in this VM allocates a bare
+    // `Runnable`, so the interception cannot capture an application's own.
+    //
+    // **It never throws.** The task runs on somebody else's thread — that is
+    // its whole point — and callers do not treat it as a call site that can
+    // fail. Throwing left `delegate=true` blind to failures `delegate=false`
+    // saw: `SSLEngineTest.testClientHostnameValidationFail` failed on exactly
+    // its three `delegate=true` parameterisations, and `testIncompatibleCiphers`
+    // spun forever because neither engine ever learned the handshake was over.
+    // Failures go onto `EngineState::deferred_handshake_error`, which exists
+    // for this shape and which `do_wrap` raises once rustls's fatal alert has
+    // gone out — so the peer learns why before this side does.
+    r.register("java/lang/Runnable", "run", "()V", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let id = match ctx.get_field(this, 0) {
+            Value::Int(v) => v,
+            _ => return Ok(None),
+        };
+        // Both failure shapes are carried OUT from under the registry lock
+        // before they are raised: building a Java exception allocates, and
+        // allocating under this lock is the GC self-deadlock
+        // `EngineState::trust_managers_ctx_key` documents.
+        let outcome = {
+            let mut g = engine_registry().write();
+            match g.get_mut(&id) {
+                None => Ok(None),
+                Some(s) => {
+                    s.delegated_task = DelegatedTask::None;
+                    // On a SERVER engine this builds the rustls config; on a
+                    // CLIENT the connection already exists and this is a no-op.
+                    match engine_begin_if_needed(s) {
+                        Err(e) => Err(e),
+                        Ok(()) => {
+                            // The work proper: feed rustls the handshake flight
+                            // the deferring `unwrap` took out of the caller's
+                            // buffer, and process it. This is the expensive
+                            // half of a handshake — certificate verification,
+                            // key agreement, signing — and it is what JSSE
+                            // defers. Doing it HERE rather than leaving it for
+                            // a later `unwrap` matters: a caller that feeds the
+                            // engine only when it has bytes has none left to
+                            // feed, and both peers stall waiting for each
+                            // other. See `DelegatedTask`.
+                            let staged = std::mem::take(&mut s.deferred_inbound);
+                            if staged.is_empty() {
+                                Ok(None)
+                            } else {
+                                // The CLIENT half of the shared TLS 1.2 session
+                                // id is peeked out of the ServerHello RECORD,
+                                // before rustls consumes it — `do_unwrap`'s
+                                // record loop does exactly this, and deferring
+                                // routes the record past that loop.
+                                // `SSLEngineTest.testSSLSessionId` compares the
+                                // two engines' ids byte for byte and read
+                                // "array contents differ at index [0]" on all
+                                // six of its running parameterisations.
+                                if s.negotiated_session_id.is_empty() {
+                                    let mut off = 0usize;
+                                    while off + 5 <= staged.len() {
+                                        let len = ((staged[off + 3] as usize) << 8)
+                                            | staged[off + 4] as usize;
+                                        let end = off + 5 + len;
+                                        if end > staged.len() {
+                                            break;
+                                        }
+                                        if let Some(sid) =
+                                            peek_server_hello_session_id(&staged[off..end])
+                                        {
+                                            s.negotiated_session_id = sid;
+                                            break;
+                                        }
+                                        off = end;
+                                    }
+                                }
+                                match engine_unwrap_pump_raw(s, &staged) {
+                                    Ok((_, pt)) => {
+                                        // Any plaintext belongs to the caller's
+                                        // next unwrap; `do_unwrap`'s Step 0
+                                        // serves this buffer before it touches
+                                        // the network again.
+                                        s.plaintext_pending.extend_from_slice(&pt);
+                                        // NOT `engine_capture_negotiation` —
+                                        // the task runs mid-handshake, and
+                                        // capturing there latched a session id
+                                        // that was not the negotiated one:
+                                        // `SSLEngineTest.testSSLSessionId`
+                                        // read "array contents differ at index
+                                        // [0]" on all six of its running
+                                        // parameterisations. `do_wrap` and
+                                        // `do_unwrap` both capture at the
+                                        // right moment already.
+                                        Ok(None)
+                                    }
+                                    Err(e) => {
+                                        // Handed to the engine, not thrown.
+                                        // See the note above `r.register(
+                                        // "java/lang/Runnable", ...)`.
+                                        s.deferred_handshake_error = Some((
+                                            jsse_handshake_exception_class(&e),
+                                            format!("rustls: {}", e),
+                                        ));
+                                        Ok(Some(format!("rustls: {}", e)))
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        };
+        if crate::nbflags().dbg_tls_hs_ok {
+            eprintln!(
+                "[dbg-tls-task] thread={:?} task.run id={} outcome={}",
+                std::thread::current().id(),
+                id,
+                match &outcome {
+                    Ok(None) => "ok".to_string(),
+                    Ok(Some(msg)) => format!("deferred: {msg}"),
+                    Err(e) => format!("begin-failed: {e}"),
+                }
+            );
+        }
+        match outcome {
+            // Both arms return normally: whatever went wrong is on the engine
+            // now, and the caller's next `wrap` raises it.
+            Ok(_) => Ok(None),
+            Err(e) => {
+                with_engine(id, |s| {
+                    s.deferred_handshake_error =
+                        Some(("javax/net/ssl/SSLHandshakeException", e.clone()));
+                });
+                Ok(None)
+            }
+        }
+    });
+
     // wrap(ByteBuffer src, ByteBuffer dst)
     r.register(
         cls_impl,
@@ -12525,7 +12937,6 @@ fn do_wrap(
         }
     }
 
-    // Lazily realize rustls connection.
     {
         // The lock is dropped before the failure is reported: `engine_begin_failure`
         // allocates the Java exception, and allocating under `engine_registry()`'s
@@ -12836,29 +13247,6 @@ fn do_unwrap(
     // an engine with no selector installed.
     engine_apply_alpn_selector(ctx, id, this, src)?;
 
-    {
-        // The lock is dropped before the failure is reported: `engine_begin_failure`
-        // allocates the Java exception, and allocating under `engine_registry()`'s
-        // write lock is the GC self-deadlock `EngineState::trust_managers_ctx_key`
-        // documents.
-        let res = {
-            let mut g = engine_registry().write();
-            match g.get_mut(&id) {
-                Some(s) if s.conn.is_none() => engine_begin(s),
-                _ => Ok(()),
-            }
-        };
-        if let Err(e) = res {
-            if crate::nbflags().dbg_tls_hs_ok {
-                eprintln!(
-                    "[dbg-tls-hs] thread={:?} do_unwrap/do_wrap id={} RETURN(engine_begin ERROR) err={}",
-                    std::thread::current().id(), id, e
-                );
-            }
-            return Err(engine_begin_failure(ctx, e));
-        }
-    }
-
     // Step 1+2: record-oriented unwrap. Feed rustls only COMPLETE TLS records
     // from `src` whose decrypted plaintext fits the caller's dst buffers, and
     // advance `src` past exactly those records. Incomplete records, or records
@@ -12962,6 +13350,105 @@ fn do_unwrap(
         engine_run_sni_match_check(ctx, id, this, host)?;
     }
 
+    // Realize the rustls connection — and, on the first inbound handshake
+    // flight, hand the caller a delegated task instead of processing it. This
+    // is the ONLY place that defers; see `DelegatedTask`.
+    //
+    // Gated on a complete, plausible TLS record sitting at the head of `src`,
+    // for two independent reasons:
+    //
+    //   * Deferring here CONSUMES the caller's records first, into
+    //     `deferred_inbound`. netty's `SslHandler.decodeJdkCompatible` hands
+    //     `unwrap` exactly one TLS record and treats
+    //     `bytesConsumed != packetLength` as "not an SSL/TLS record": it
+    //     throws `NotSslRecordException` and fails the handshake. With no
+    //     record to consume there is nothing to report, so deferring would
+    //     kill the handshake rather than delay it.
+    //   * `src` may not hold a TLS record at all.
+    //     `SSLEngineTest.testSSLEngineUnwrapNoSslRecord` feeds a zeroed
+    //     application buffer and requires an `SSLException`; staging it as
+    //     3277 five-byte "records" would answer NEED_TASK instead. Anything
+    //     that does not look like a record falls through to rustls, which is
+    //     what raises the error.
+    //
+    // The lock is dropped before any failure is reported — see the identical
+    // note in `do_wrap`.
+    let head_is_tls_record = {
+        let mut ok = false;
+        if !matches!(src_view.backing, BbBacking::Unresolved) && src_pos + 5 <= src_lim {
+            let ct = bb_get_byte(ctx, &src_view, src_pos).unwrap_or(0);
+            let vmaj = bb_get_byte(ctx, &src_view, src_pos + 1).unwrap_or(0);
+            let b3 = bb_get_byte(ctx, &src_view, src_pos + 3).unwrap_or(0) as usize;
+            let b4 = bb_get_byte(ctx, &src_view, src_pos + 4).unwrap_or(0) as usize;
+            // ChangeCipherSpec / Alert / Handshake / ApplicationData, TLS
+            // version major 3, and the whole record present.
+            ok = (20..=23).contains(&ct) && vmaj == 3 && src_pos + 5 + ((b3 << 8) | b4) <= src_lim;
+        }
+        ok
+    };
+    let defer_decision = if head_is_tls_record {
+        engine_begin_or_defer(id)
+    } else {
+        // Nothing stageable: realize the connection the way `do_wrap` does and
+        // let the record loop (or rustls's error) speak.
+        let mut g = engine_registry().write();
+        match g.get_mut(&id) {
+            Some(s) => engine_begin_if_needed(s).map(|()| false),
+            None => Ok(false),
+        }
+    };
+    match defer_decision {
+        Err(e) => {
+            if __dbg_hs {
+                eprintln!(
+                    "[dbg-tls-hs] thread={:?} do_unwrap id={} RETURN(engine_begin ERROR) err={}",
+                    std::thread::current().id(),
+                    id,
+                    e
+                );
+            }
+            return Err(engine_begin_failure(ctx, e));
+        }
+        Ok(true) => {
+            let mut staged: Vec<u8> = Vec::new();
+            if !matches!(src_view.backing, BbBacking::Unresolved) {
+                // Whole records only, exactly as the main loop below decides
+                // it: an incomplete record stays in the caller's buffer for
+                // its next unwrap.
+                while offset + 5 <= src_lim {
+                    let b3 = bb_get_byte(ctx, &src_view, offset + 3).unwrap_or(0) as usize;
+                    let b4 = bb_get_byte(ctx, &src_view, offset + 4).unwrap_or(0) as usize;
+                    let rec_end = offset + 5 + ((b3 << 8) | b4);
+                    if rec_end > src_lim {
+                        break;
+                    }
+                    let rec = bb_bytes_range(ctx, &src_view, offset, rec_end);
+                    if rec.len() != rec_end - offset {
+                        // Backing could not produce the whole record (clamped
+                        // direct access) — leave it where it is.
+                        break;
+                    }
+                    staged.extend_from_slice(&rec);
+                    offset = rec_end;
+                }
+            }
+            let consumed = offset - src_pos;
+            if consumed > 0 {
+                bb_set_pos(ctx, src, src_view.layout, offset);
+                with_engine(id, |s| s.deferred_inbound.extend_from_slice(&staged));
+            }
+            if __dbg_hs {
+                eprintln!(
+                    "[dbg-tls-hs] thread={:?} do_unwrap id={} RETURN(delegated-task) status=OK hs=NEED_TASK consumed={} produced=0",
+                    std::thread::current().id(), id, consumed
+                );
+            }
+            let result = alloc_engine_result(ctx, SR_OK, HS_NEED_TASK_R, consumed as i32, 0)?;
+            return Ok(Some(Value::Object(Some(result))));
+        }
+        Ok(false) => {}
+    }
+
     let (status, hs, plaintext, pending_trust_check) = {
         let mut g = engine_registry().write();
         let s = match g.get_mut(&id) {
@@ -12992,6 +13479,60 @@ fn do_unwrap(
         // how a caller spins.
         let mut dst_too_small = false;
         let mut deferred_error: Option<(&'static str, String)> = None;
+        // Replay whatever a delegated task deferred. These records were taken
+        // out of the caller's buffer before the connection existed (see the
+        // NEED_TASK arm above), so the caller will never present them again —
+        // this is the only place left that can feed them to rustls.
+        //
+        // A failure here is classified exactly as the record loop below
+        // classifies its own, because it IS the same failure, merely one call
+        // later: the error KIND picks the `SSLException` subclass, and a
+        // server defers it so rustls's fatal alert reaches the peer first.
+        let staged = std::mem::take(&mut s.deferred_inbound);
+        if !staged.is_empty() {
+            match engine_unwrap_pump_raw(s, &staged) {
+                Ok((_, pt)) => plaintext.extend_from_slice(&pt),
+                Err(e) => {
+                    let handshaking_now = s.conn.as_ref().is_some_and(|c| c.is_handshaking());
+                    if handshaking_now {
+                        // Raised here, NOT deferred the way the record loop
+                        // below defers a server's handshake error.
+                        //
+                        // That deferral works only because the loop consumed a
+                        // record: the call reports progress, the caller comes
+                        // back, and the `wrap` that drains rustls's fatal
+                        // alert raises the error on its way out. This replay
+                        // consumed nothing from `src` — its records were taken
+                        // a call earlier, by the NEED_TASK arm — so the call
+                        // reports BUFFER_UNDERFLOW, the caller waits for
+                        // network data that is never coming, and the deferred
+                        // error is never drained. Measured with the deferral:
+                        // `testHandshakeFailureCipherMissmatch{TLSv12,TLSv13}Jdk`
+                        // fail with `StacklessClosedChannelException`, which is
+                        // the exact symptom that deferral was introduced to
+                        // cure. Both pass when it is raised here.
+                        let cls = jsse_handshake_exception_class(&e);
+                        return Err(crate::phases_early::throw_jca_exc(
+                            ctx,
+                            cls,
+                            &format!("rustls: {}", e),
+                        ));
+                    } else {
+                        let msg = match e {
+                            rustls::Error::AlertReceived(desc) => {
+                                format!("Received fatal alert: {desc:?}")
+                            }
+                            other => format!("rustls process_new_packets: {other}"),
+                        };
+                        return Err(crate::phases_early::throw_jca_exc(
+                            ctx,
+                            "javax/net/ssl/SSLException",
+                            &msg,
+                        ));
+                    }
+                }
+            }
+        }
         let src_resolved = !matches!(src_view.backing, BbBacking::Unresolved);
         if let (true, Some(conn)) = (src_resolved, s.conn.as_mut()) {
             loop {
