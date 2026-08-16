@@ -37,9 +37,62 @@ fn class_files_available() -> bool {
     std::path::Path::new(&format!("{dir}/cratonvm/JitLocalHandler.class")).exists()
 }
 
+/// Every VM in this file, and there is deliberately only one shape of them.
+///
+/// It carries a REAL class library. `VmConfig::new()` alone does not: it
+/// selects `use_synthetic_jdk` (`EMBEDDED_DEFAULT_JDK_MODE`, so the in-tree
+/// suite stays hermetic), but the ~5,200 synthetic stubs only exist when the
+/// `synthetic-jdk` Cargo feature is compiled in and `cargo test` does not
+/// enable it. The default test VM therefore has **neither** library:
+/// `String.length()I` and `String.startsWith(Ljava/lang/String;)Z` both raise
+/// `NoSuchMethodError`, though both are registered natives — the synthetic
+/// `java/lang/String` never declares them, and resolution reads the class, not
+/// the registry.
+///
+/// The `cratonvm` launcher REFUSES that configuration by name ("none of the
+/// ~5,200 synthetic stubs are compiled in … a VM with neither the synthetic
+/// class library nor a real-JDK boot classpath"). The embedding path has no
+/// such guard and hands it over in silence, which is what three tests here
+/// were measuring: `throwsInHandlerChecksum` and `LiquibaseScopeBisect`
+/// (`String.startsWith`, string-concat `invokedynamic`) and `buildMismatches`
+/// (a `StringBuilder` that must survive into the handler). Nothing about the
+/// JIT was wrong — with a library the fixtures return their exact golden
+/// values, the same numbers a real `java` prints.
+///
+/// UNIFORM ON PURPOSE. The first repair gave only the three String-using tests
+/// a real library and left the rest synthetic; that made
+/// `test_jit_rethrow_as_different_type` — untouched, and green before —
+/// start failing. Two VMs of different library shapes in ONE test process
+/// interfere, so the file uses one shape for all of them.
 fn test_vm() -> Vm {
-    let config = VmConfig::new().with_classpath(vec![test_resources_dir()]);
-    Vm::new(config)
+    real_jdk_vm().expect("guarded by require_class_library!")
+}
+
+fn real_jdk_vm() -> Option<Vm> {
+    let java_home = cratonvm_vm::config::resolve_java_home_public(None)?;
+    let mut config = VmConfig::new().with_classpath(vec![test_resources_dir()]);
+    config.use_synthetic_jdk = false;
+    Some(Vm::new(
+        config.with_java_home(java_home.to_string_lossy().into_owned()),
+    ))
+}
+
+/// Skip, loudly and for a stated reason, when no class library can be found.
+///
+/// NOT a silent `return`: a test that quietly passes on a VM that cannot run
+/// its fixture is worse than a red one, because the red one is at least
+/// visible. `resolve_java_home_public` is the probe the launcher itself uses.
+macro_rules! require_class_library {
+    () => {
+        if real_jdk_vm().is_none() {
+            eprintln!(
+                "Skipping: these fixtures need a class library, and neither a real JDK \
+                 (CRATONVM_JAVA_HOME / JAVA_HOME / `java` on PATH) nor the \
+                 `synthetic-jdk` Cargo feature is available."
+            );
+            return;
+        }
+    };
 }
 
 macro_rules! require_class_files {
@@ -67,6 +120,7 @@ fn invoke_checksum(method: &str) -> i32 {
 #[test]
 fn test_jit_rethrow_as_different_type() {
     require_class_files!();
+    require_class_library!();
     // Mirrors Response.toAbsolute(): try { ... } catch (Inner) { throw new
     // Outer(..., inner) }. The *method containing this try/catch* is called
     // 20000 times directly, so it JIT-compiles and its own handler must
@@ -77,30 +131,35 @@ fn test_jit_rethrow_as_different_type() {
 #[test]
 fn test_jit_catch_and_return() {
     require_class_files!();
+    require_class_library!();
     assert_eq!(invoke_checksum("catchReturnChecksum"), 99_980_000);
 }
 
 #[test]
 fn test_jit_catch_and_fall_through() {
     require_class_files!();
+    require_class_library!();
     assert_eq!(invoke_checksum("catchFallThroughChecksum"), 134_013_267);
 }
 
 #[test]
 fn test_jit_multi_catch() {
     require_class_files!();
+    require_class_library!();
     assert_eq!(invoke_checksum("multiCatchChecksum"), 199_990);
 }
 
 #[test]
 fn test_jit_nested_try_catch() {
     require_class_files!();
+    require_class_library!();
     assert_eq!(invoke_checksum("nestedTryChecksum"), 39_999);
 }
 
 #[test]
 fn test_jit_exception_in_handler_not_recaught_by_same_handler() {
     require_class_files!();
+    require_class_library!();
     // Encoded as checksum*10000 + secondaryEscapes (see the Java source).
     // secondaryEscapes must be exactly 2000 (one per x==7 hit, i in
     // 0..20000 stepping x=i%10 => 2000 hits) — if the JIT's routing ever
@@ -121,6 +180,10 @@ fn test_jit_two_sequential_try_catch_blocks_same_method() {
         eprintln!("Skipping: .class files not available (javac not on PATH?)");
         return;
     }
+    require_class_library!();
+    require_class_library!();
+    require_class_library!();
+    require_class_library!();
     // Bisection case: TWO separate, sequential (non-nested) try/catch blocks
     // in one method, first catching RuntimeException, second catching
     // IllegalStateException (a RuntimeException subclass). Golden (real
@@ -172,6 +235,10 @@ fn test_jit_indy_after_side_effect_no_double_execution() {
         eprintln!("Skipping: .class files not available (javac not on PATH?)");
         return;
     }
+    require_class_library!();
+    require_class_library!();
+    require_class_library!();
+    require_class_library!();
     let mut vm = test_vm();
     let result = vm.invoke("cratonvm/LiquibaseScopeBisect", "checksum", "()I", &[]);
     match result {
@@ -213,6 +280,10 @@ fn test_compiled_callee_catches_its_own_athrow() {
         eprintln!("Skipping: .class files not available (javac not on PATH?)");
         return;
     }
+    require_class_library!();
+    require_class_library!();
+    require_class_library!();
+    require_class_library!();
     // `plainStep`'s handler reads only parameters, so it compiles with or
     // without the precise-handler-frame relaxation. Its callee `maybeThrow`
     // athrows at ITS OWN bci 13, and `JitSignals::athrow_bci` carries no method
@@ -228,6 +299,10 @@ fn test_precise_handler_frame_catches_a_throw_at_the_end_of_its_try() {
         eprintln!("Skipping: .class files not available (javac not on PATH?)");
         return;
     }
+    require_class_library!();
+    require_class_library!();
+    require_class_library!();
+    require_class_library!();
     // `buildStep`'s protected range is [8,14) and its only invoke is at pc 11,
     // so the invoke's SUCCESSOR (14) is `end_pc` — outside the handler. The
     // precise exceptional frame used to be keyed on that successor and handed
@@ -243,6 +318,10 @@ fn test_precise_handler_frame_keeps_a_handler_only_local() {
         eprintln!("Skipping: .class files not available (javac not on PATH?)");
         return;
     }
+    require_class_library!();
+    require_class_library!();
+    require_class_library!();
+    require_class_library!();
     // `scopeStep`'s `keep` is read only on the path through the handler, so
     // handler-blind liveness let register allocation alias it with `other`
     // (live across the try).
@@ -255,6 +334,10 @@ fn test_compiled_callee_handler_resume_keeps_the_loop_iterator() {
         eprintln!("Skipping: .class files not available (javac not on PATH?)");
         return;
     }
+    require_class_library!();
+    require_class_library!();
+    require_class_library!();
+    require_class_library!();
     // `loopStep` is the `BindConverter.convert` shape: the non-parameter local
     // at risk is the loop's own `Iterator`, which the handler never touches —
     // it is read by the loop head the handler falls through to.
@@ -278,6 +361,10 @@ fn test_an_instanceof_in_a_protected_range_no_longer_refuses_the_method() {
         eprintln!("Skipping: .class files not available (javac not on PATH?)");
         return;
     }
+    require_class_library!();
+    require_class_library!();
+    require_class_library!();
+    require_class_library!();
     // `instanceof` (0xc1) sat inside `may_throw_without_precise_frame`'s
     // `0xbb..=0xc1` range, so ANY protected range containing one refused the
     // whole method — even though the x64 lowering of `instanceof` cannot throw
@@ -335,6 +422,10 @@ fn test_osr_loop_does_not_rerun_iterations_when_a_callee_catches() {
         eprintln!("Skipping: .class files not available (javac not on PATH?)");
         return;
     }
+    require_class_library!();
+    require_class_library!();
+    require_class_library!();
+    require_class_library!();
     // Two defects stacked here, both required for a 0:
     //   * the OSR tier's eager direct-call wiring baked a machine-code CALL
     //     into `step` even though it declares an exception table, so `step`'s
@@ -352,6 +443,10 @@ fn test_osr_loop_does_not_rerun_iterations_when_an_exception_escapes() {
         eprintln!("Skipping: .class files not available (javac not on PATH?)");
         return;
     }
+    require_class_library!();
+    require_class_library!();
+    require_class_library!();
+    require_class_library!();
     // The pure form: nothing below the caller can catch, so the OSR bail cannot
     // pretend the loop should continue. Before the fix the safe reject resumed
     // it anyway — 42 730 iterations executed where 12 346 were asked for.
@@ -364,6 +459,10 @@ fn test_osr_loop_does_not_rerun_iterations_on_an_implicit_npe() {
         eprintln!("Skipping: .class files not available (javac not on PATH?)");
         return;
     }
+    require_class_library!();
+    require_class_library!();
+    require_class_library!();
+    require_class_library!();
     // `try_osr`'s pending-NPE drain had the same shape: search this frame's
     // handlers (an OSR'd method provably has none — RBC.6b), then re-stash and
     // resume the loop.
@@ -376,6 +475,10 @@ fn test_osr_loop_does_not_rerun_iterations_on_an_implicit_aioobe() {
         eprintln!("Skipping: .class files not available (javac not on PATH?)");
         return;
     }
+    require_class_library!();
+    require_class_library!();
+    require_class_library!();
+    require_class_library!();
     // Sibling of the NPE drain, same defect.
     assert_eq!(osr_loop_progress_mismatches("aioobeMismatches"), 0);
 }
