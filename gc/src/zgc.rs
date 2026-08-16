@@ -2532,16 +2532,46 @@ pub struct ZgcRealHeap {
     /// `VmHeap::enable_gc_logging`. Mirrors G1's `gc_log_enabled`
     /// (`g1.rs:6770-6777`). `Relaxed`: a logging toggle orders nothing.
     gc_log_enabled: AtomicBool,
-    /// Shared `java.lang.ref` reference processor.
+    /// This heap's own `java.lang.ref` reference processor.
     ///
-    /// Weak/soft/phantom/cleaner/finalizer references discovered on this
-    /// backend are registered here (via [`Self::discover_reference`]) and
-    /// processed at the end of every [`Self::collect_garbage`] cycle by the
-    /// *same* [`ReferenceProcessor`] the generational and G1 collectors use —
-    /// the canonical HotSpot-ordered clearing/enqueue path in
-    /// `gc::reference`. This closes the gap where the ZGC-backed heap performed
-    /// NO reference processing, so finalizers/cleaners and `WeakReference`
-    /// semantics silently broke under this collector.
+    /// # It is EMPTY in a real run, and the machinery built on it is inert
+    ///
+    /// Nothing in the VM calls [`Self::discover_reference`] — the only callers
+    /// anywhere are this file's own tests. Every reference a running program
+    /// creates is registered with the VM-level processor
+    /// (`SharedVm::mem::ref_processor`) by `native_ref_init` and friends, and
+    /// is cleared and enqueued by `process_references_after_gc`. So this
+    /// processor holds nothing, and three things built on it never do
+    /// anything in production:
+    ///
+    /// * the `ref_skip_objs` referent skip set [`Self::collect_garbage`]
+    ///   builds, and the [`Self::mark_ref_skip`] twin for concurrent cycles —
+    ///   both derived from `reference_object_addresses()`, which returns an
+    ///   empty vector here;
+    /// * the soft-survivor resurrection pass that follows it;
+    /// * the `process_references` call at the end of the cycle.
+    ///
+    /// **This is not a hole in reference semantics**, which is the conclusion
+    /// the shape of this code invites and which was measured and rejected on
+    /// 2026-08-15. The VM compensates one level up, and unconditionally:
+    /// `weakref_null_referents_pre_gc` writes null into the referent slot of
+    /// every active Weak and Phantom reference *before* any collector runs, so
+    /// there is nothing for a skip set to skip — a marker that traces slot 0
+    /// as a strong edge (which every CratonVM marker does) reads a null. Soft
+    /// references take the same route since the same date, via
+    /// `ReferenceProcessor::condemn_idle_soft_refs`, which applies the LRU
+    /// policy ahead of the mark so only the entries it condemns are nulled.
+    ///
+    /// Verified end-to-end against HotSpot on all three collectors: a weak
+    /// reference clears, a phantom enqueues, a soft reference is retained
+    /// while the heap is roomy, cleared once it is tight, and cleared rather
+    /// than allowed to become an `OutOfMemoryError`.
+    ///
+    /// Left in place rather than deleted because it is the only reference
+    /// implementation this heap can be tested against in isolation, and
+    /// several tests in this file do exactly that. Anyone reading it as the
+    /// live path — or "fixing" a reference bug here — is reading the wrong
+    /// file; start at `weakref_null_referents_pre_gc`.
     ref_processor: Mutex<ReferenceProcessor>,
     /// Finalizer-resurrection input for the current collection — see
     /// [`Self::collect_garbage_with_finalizers`]. Consumed (taken) by the
@@ -3809,12 +3839,33 @@ impl ZgcRealHeap {
         // a `DefaultResourceLeak` the last slide moved -- i.e. compiled code
         // performing `Reference.clear()` through a pre-move address.
         //
-        // The cost is real and is the same cost the other two collectors pay:
-        // a JIT-busy process compacts less often. `relocation_skipped_jit` is
-        // exported so that cost is visible rather than inferred, because on
-        // this collector deferred compaction is also deferred defragmentation.
-        // Correctness first: a slide under a live compiled frame corrupts the
-        // heap, and fragmentation only wastes it.
+        // The cost is the same cost the other two collectors pay: a JIT-busy
+        // process compacts less often. `relocation_skipped_jit` is exported so
+        // it is visible rather than inferred, because on this collector
+        // deferred compaction is also deferred defragmentation.
+        //
+        // MEASURED 2026-08-15, which the original of this comment left as an
+        // open question. A deliberately JIT-saturated workload -- 4e6
+        // mixed-size (64 B .. 8 KiB) allocations through one hot compiled
+        // method, 512-entry rolling live window, 512 MiB heap -- then a count
+        // of the 4 MiB contiguous blocks the heap can still hand out:
+        //
+        //   arm                    compactions  skipped_jit  worst_free_permille  4 MiB blocks
+        //   JIT on (this branch)             4           64                  138            72
+        //   CRATONVM_ZGC_RELOCATE=0          0            0                  239           124
+        //
+        // The decline fires on 64 of 68 cycles, so "a JIT-saturated run
+        // compacts rarely" is confirmed -- and it costs NOTHING here. The arm
+        // that relocates *never* ends with a LARGER worst-case largest free
+        // block and satisfies nearly twice as many large contiguous requests.
+        // Compaction is not what buys contiguity on this collector, so
+        // deferring it is not what loses it. Four interleaved JIT reps
+        // returned an identical 72.
+        //
+        // That is one workload, not a proof; the numbers are here so the next
+        // person argues with a measurement rather than re-deriving the fear.
+        // Correctness settles it regardless: a slide under a live compiled
+        // frame corrupts the heap, and fragmentation only wastes it.
         if crate::gc_quiescence::is_active()
             || crate::gc_quiescence::unregistered_jit_frame_on_stack()
         {
@@ -3845,6 +3896,48 @@ impl ZgcRealHeap {
             let low_end = base + arena.used_low_for_compaction();
             arena_lo = base;
             arena_hi = base + arena.capacity();
+
+            // ---- PRE-SLIDE CENSUS (diagnostic, `CRATONVM_DBG_ZGC_CORPSE`) --
+            //
+            // `rewrite_target_is_walkable` reports offenders AFTER the slide,
+            // which cannot separate "this slide broke them" from "they arrived
+            // broken". The same question asked here, before a single byte
+            // moves, does separate them -- and it is the first question to ask,
+            // because the two answers point at opposite halves of the
+            // collector.
+            //
+            // Behind the corpse gate rather than unconditional: it is a full
+            // pass over the live set with an `alloc_size` each, which is the
+            // same order as the slide itself but buys nothing in a healthy run.
+            if zgc_corpse_enabled() {
+                let mut bad = 0usize;
+                let mut first: Option<(usize, u32, u32)> = None;
+                for &b in live {
+                    if b < base || b >= low_end {
+                        continue;
+                    }
+                    let h = self.header_ref(b as *mut u8);
+                    if Self::alloc_size(h).is_none_or(|sz| b.saturating_add(sz) > low_end) {
+                        bad += 1;
+                        if first.is_none() {
+                            first = Some((b, h.class_id.as_u32(), h.num_slots()));
+                        }
+                    }
+                }
+                if bad > 0 {
+                    let (addr, class_id, num_slots) = first.unwrap_or((0, 0, 0));
+                    tracing::error!(
+                        target: "cratonvm::gc::guard",
+                        unwalkable_before_slide = bad,
+                        live = live.len(),
+                        first_addr = addr,
+                        first_class_id = class_id,
+                        first_num_slots = num_slots,
+                        "zgc relocate: the live set was ALREADY unwalkable on entry -- \
+                         whatever corrupted these bases, it was not this slide"
+                    );
+                }
+            }
 
             // Survivors in ADDRESS order. The slide requires it: an object may
             // only be copied into space a lower-addressed survivor has already
@@ -4053,6 +4146,27 @@ impl ZgcRealHeap {
                     // A header this collector cannot size cannot be moved, and
                     // nothing above it may move either or the slide would run
                     // over it. Stop here rather than guess.
+                    //
+                    // THIS BREAK IS AN AMPLIFIER, and the live-ceiling check
+                    // after the loop is what disarms it. Abandoning the loop
+                    // leaves `dest` at `from`, so every selected-page survivor
+                    // ABOVE this one -- all of which are alive and none of
+                    // which have moved -- is above the cursor `compact_low_to`
+                    // is about to retract to. Their bytes get zeroed and
+                    // handed back to the bump allocator while the object-start
+                    // registry still names them, and the next allocation
+                    // writes over a contiguous RUN of live objects. That is
+                    // how one unsizable header becomes "492 of 27858 survivors
+                    // could not be walked" a cycle later, with the offending
+                    // headers decoding as whatever String the allocator put
+                    // there. See the reopened
+                    // `zgc-rewrite-pass-walks-off-a-reference-array` page.
+                    //
+                    // Deliberately NOT fixed by setting `dest = low_end` here.
+                    // That would be a second mechanism for the same property,
+                    // and the two would drift on exactly the case that matters.
+                    // The check on the answer belongs in one place, after every
+                    // exit path from this loop.
                     tracing::warn!(
                         target: "cratonvm::gc::guard",
                         addr = from,
@@ -4180,7 +4294,71 @@ impl ZgcRealHeap {
                 })
                 .max()
                 .unwrap_or(base);
-            let new_cursor = dest.max(highest_pinned_end) - base;
+            // ---- NOTHING LIVE MAY END ABOVE THE NEW CURSOR ---------------
+            //
+            // `compact_low_to` zeroes `[new_cursor, cursor)` and hands the span
+            // straight back to the bump allocator. A live object still up there
+            // is therefore erased AND its address re-issued: the registry keeps
+            // its base, a mutator writes a fresh object over it, and the next
+            // slide's rewrite pass reads a "header" made of somebody else's
+            // payload. That is precisely the failure
+            // `rewrite_target_is_walkable` reports -- a contiguous run of
+            // registered bases whose class ids and slot counts decode as ASCII,
+            // because what is actually there now is string data.
+            //
+            // `dest` and `highest_pinned_end` above are each derived from a
+            // DIFFERENT subset of `live` -- selected-page survivors and
+            // unselected ones -- and every argument that their maximum covers
+            // the whole live set is an argument about the partition, not a
+            // check on the answer. This is the check on the answer: one pass
+            // over `live`, resolved through the slide's own from->to pairs, of
+            // the one property the allocator is about to depend on.
+            //
+            // Cheap next to the slide (one hash probe and one `alloc_size` per
+            // survivor, against a memmove per survivor), and it can only
+            // RAISE the cursor -- i.e. reclaim less. Losing a cycle's reclaim
+            // is a cost; handing out occupied memory is heap corruption whose
+            // symptom surfaces cycles later in an unrelated subsystem.
+            let moved_to: FxHashMap<usize, usize> = pairs.iter().copied().collect();
+            let mut stranded = 0usize;
+            let mut live_ceiling = base;
+            for &b in live {
+                if b < base || b >= low_end {
+                    continue;
+                }
+                let now = moved_to.get(&b).copied().unwrap_or(b);
+                // An unsizable header cannot be bounded, so it cannot be
+                // proven dead either. Refuse to reclaim past `low_end` rather
+                // than guess -- the same answer `highest_pinned_end` gives an
+                // extent that runs past the cursor, and for the same reason.
+                let end = match Self::alloc_size(self.header_ref(now as *mut u8)) {
+                    Some(sz) => now.saturating_add(sz).min(low_end),
+                    None => low_end,
+                };
+                if end > live_ceiling {
+                    live_ceiling = end;
+                }
+            }
+            let proposed = dest.max(highest_pinned_end);
+            if live_ceiling > proposed {
+                stranded = live
+                    .iter()
+                    .filter(|b| **b >= proposed && **b < low_end)
+                    .count();
+                tracing::error!(
+                    target: "cratonvm::gc::guard",
+                    proposed_cursor = proposed - base,
+                    raised_to = live_ceiling - base,
+                    stranded_live_objects = stranded,
+                    low_end = low_end - base,
+                    moved,
+                    survivors = live.len(),
+                    "zgc relocate: the compaction cursor would have been left BELOW live \
+                     objects -- their bytes would have been zeroed and re-issued while the \
+                     object-start registry still named them. Raising it and reclaiming less."
+                );
+            }
+            let new_cursor = proposed.max(live_ceiling) - base;
             reclaimed = arena.compact_low_to(new_cursor);
             // One batched publish after the slide, not one per object: the
             // record is read by the rewrite pass below, which must see the
@@ -11137,6 +11315,67 @@ pub(crate) mod tests {
             "compaction must leave a bigger contiguous run than the free list \
              held before it: after={after} before={before}"
         );
+    }
+
+    /// **Nothing live may end above the cursor the slide hands the allocator.**
+    ///
+    /// `compact_low_to` zeroes everything above the new cursor and lets the
+    /// bump allocator re-issue it. A live object up there is therefore erased
+    /// and its address handed to the next allocation, while the object-start
+    /// registry still names it — after which the next slide's rewrite pass
+    /// reads a "header" made of the new tenant's payload. That is the failure
+    /// `rewrite_target_is_walkable` reports, and it has been seen in
+    /// production with the offending headers decoding as String character
+    /// data (`docs/known-issues/zgc-rewrite-pass-walks-off-a-reference-array-20260815.md`).
+    ///
+    /// **Read this test for what it is.** It asserts the property that failure
+    /// violates; it does not reproduce that failure. The guard it covers HAS
+    /// been observed firing on the netty repro — one unsizable survivor breaks
+    /// the slide loop early, leaving `dest` at that object and every live
+    /// survivor above it outside the cursor — so this is a live invariant, not
+    /// a hypothetical one. It is here so that a future change to `dest` /
+    /// `highest_pinned_end` — the two partial answers whose maximum the cursor
+    /// is — cannot quietly stop covering the live set.
+    #[test]
+    fn compaction_never_leaves_a_live_object_above_the_bump_cursor() {
+        let heap = ZgcRealHeap::with_capacity(1024 * 1024);
+        heap.set_tlab_enabled(false);
+        // A mixed population with two thirds garbage, so the selector finds
+        // pages worth evacuating and (at 0.25 max occupancy) also refuses
+        // some — both halves of the cursor's partition have to be populated
+        // or the test only exercises one of them.
+        let mut live: Vec<usize> = Vec::new();
+        for i in 0..2000usize {
+            let o = heap.alloc_object(ClassId::new(1), i % 6);
+            if i % 3 == 0 {
+                live.push(o.as_ptr() as usize);
+            }
+        }
+        let (_moved, _reclaimed, map) = heap.relocate_stw_for_test(&live);
+
+        let (base, cursor, capacity) = {
+            let arena = heap.arena.lock();
+            let b = arena.base_ptr() as usize;
+            (b, b + arena.used_low_for_compaction(), arena.capacity())
+        };
+        for &pre in &live {
+            let now = map.get(&pre).copied().unwrap_or(pre);
+            if now < base || now >= base + capacity {
+                continue; // off-arena / high end: this slide never touches it
+            }
+            let size = ZgcRealHeap::alloc_size(heap.header_ref(now as *mut u8)).expect(
+                "a live object must still be sizable after the slide -- an unsizable \
+                 one means the slide wrote over it, which is the other half of the \
+                 same bug",
+            );
+            assert!(
+                now + size <= cursor,
+                "live object at 0x{now:x}..0x{:x} ends above the compaction cursor \
+                 0x{cursor:x}: its bytes are about to be zeroed and re-issued while \
+                 the registry still names it",
+                now + size
+            );
+        }
     }
 
     /// **End to end: a full `collect_garbage` with compaction on keeps the

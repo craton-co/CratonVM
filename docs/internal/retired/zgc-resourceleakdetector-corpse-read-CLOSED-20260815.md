@@ -1,6 +1,14 @@
 # `ResourceLeakDetectorTest` — ZGC reads a `DefaultResourceLeak` the slide moved away
 
-**Status: FIXED** (the ZGC-only crash) — 2026-08-15. This page
+**Status: CLOSED and RETIRED — 2026-08-15 (later the same day).** The defect
+and all three residuals this page left behind are measured and settled; see
+"Closing out the residuals" at the foot of the page for what each of them
+turned out to be. One of them found a VM-wide defect in soft-reference
+clearing, which is fixed here; another found a still-open crash that has its
+own page. Everything above that section is the record as written when the fix
+landed, unedited apart from this banner.
+
+**Status when written: FIXED** (the ZGC-only crash) — 2026-08-15. This page
 records what is now *measured* rather than inferred, two defects fixed along
 the way (neither of which closes this one), and one instrument that finally
 made the crash say something.
@@ -257,3 +265,122 @@ CRATONVM_DISABLE_DEFAULT_WATCHDOG=1 CRATONVM_DBG_ZGC_CORPSE=1 CRATONVM_DBG_ROOT_
 ```
 
 `CRATONVM_ZGC_RELOCATE=0` is the control arm and is clean.
+
+---
+
+# Closing out the residuals (2026-08-15, later the same day)
+
+This page left three things open. All three are now measured. Two of them
+turned out to be about something other than what the page thought.
+
+## 1. The cost of declining relocation while a compiled frame is live
+
+The page's own words: *"nobody has yet run a JIT-heavy workload long enough to
+say whether the fragmentation cost matters. That is the open question this fix
+creates."*
+
+**Run.** `docs/known-issues/repros/frag-churn/FragProbe.java`: 4e6 allocations
+of 64 B..8 KiB through one hot compiled method, a 512-entry rolling live
+window, a 512 MiB heap, then a count of the 4 MiB contiguous blocks the heap
+can still hand out. The allocation loop lives in its own method so it tiers up
+— a loop in `main()` measures the interpreter.
+
+| arm | `compaction_cycles` | `relocation_skipped_jit` | worst largest-free ‰ | 4 MiB blocks |
+|---|---|---|---|---|
+| ZGC, JIT on | 4 | **64** | 138 | 72 |
+| ZGC, `CRATONVM_ZGC_RELOCATE=0` | 0 | 0 | **239** | **124** |
+
+**The decline fires on 64 of 68 cycles, and costs nothing.** The prediction that
+a JIT-saturated run compacts rarely is confirmed exactly. The fear attached to
+it is not: the arm that relocates *never* ends with a **larger** worst-case
+largest free block and satisfies nearly twice as many large contiguous
+requests. Compaction is not what buys contiguity on this collector, so
+deferring it is not what loses it. Four interleaved JIT reps returned an
+identical 72 blocks and ~2.4 s churn, so this is a reading and not a sample.
+
+One workload is not a proof, which is why the numbers are now in the source
+beside the guard (`relocate_stw`) rather than only here — the next person
+argues with a measurement instead of re-deriving the fear.
+
+## 2. "Whether the VM-level pass compensates is not established here"
+
+It is now, and the answer is **yes for Weak and Phantom, no for Soft** — and the
+soft half was broken on **every collector**, not just ZGC.
+
+`weakref_null_referents_pre_gc` writes null into the referent slot of every
+active Weak and Phantom reference before any collector runs, so a marker that
+traces slot 0 as a strong edge — which every CratonVM marker does — reads a
+null. That is what made ZGC's permanently-empty skip set harmless.
+
+Soft references were not in that pass, and `ReferenceProcessor::process_soft_refs`
+opens with `if is_marked(entry.referent) { continue; }`. A soft referent is
+always marked *through its own `SoftReference`*, so that check always won and
+the LRU policy underneath it was unreachable. **Soft references behaved exactly
+like strong ones.** Measured against HotSpot with
+`docs/known-issues/repros/reference-semantics/RefProbe.java` in a 64 MiB heap:
+
+| arm | HotSpot | CratonVM before | CratonVM after |
+|---|---|---|---|
+| weak clears | yes | yes | yes |
+| phantom enqueues | yes | yes | yes |
+| soft retained while roomy | yes | yes | yes |
+| soft cleared once tight | yes | **no** | **yes** |
+| soft cleared rather than OOME | yes | **no — `OutOfMemoryError`** | **yes** |
+
+Identical on ZGC, G1 and the default generational heap, before and after.
+
+**The fix moves the policy decision in front of the mark**, which is the only
+place it can go given a marker that traces referents strongly:
+`ReferenceProcessor::condemn_idle_soft_refs` applies the LRU rule during the
+pre-collection pass and only its condemned set gets nulled, so an entry the
+policy wants to keep is still traced strongly and still retained. Survivors
+(the referent was strongly reachable after all) are restored by the same
+post-GC loop that restores weak and phantom ones.
+
+Two things were needed beyond that, both found by the probe:
+
+* **the clock.** `process_references_after_gc` passes `0` for "now", which the
+  processor reads as "use the last value a mutator handed
+  `touch_soft_reference`" — i.e. the moment of the most recent
+  `SoftReference.get()`. The idle window of the reference that made that call
+  is then zero, forever, and a program looping on its own soft-referenced cache
+  is exactly the program that keeps re-stamping it. The pre-collection pass is
+  ordinary VM code and passes a real `SystemTime` reading.
+* **the last-ditch rule.** `java.lang.ref` guarantees every softly-reachable
+  object is released before the VM throws `OutOfMemoryError`, and that is a
+  different rule from the LRU policy, not a limiting case of it — see the
+  clock argument above. `condemn_all_soft_refs`, armed by
+  `last_ditch_reclaim` on the allocation-failure ladder, is that rule. It is
+  the step between "G1's forced full mark cycle" and "throw".
+
+ZGC's own `ref_processor` stays inert, and its field doc now says so outright,
+with the measurement above as the reason that is not a hole. It is left in
+place because several tests in `zgc.rs` are the only thing that exercises a
+reference processor in isolation.
+
+## 3. The residual `failed=1`
+
+This page and its parent both recorded it as "GC-independent and belongs to
+whoever owns that test". Half right.
+
+It is GC-independent — 15 interleaved runs, ZGC with the JIT, ZGC `--nojit` and
+G1, five reps each, every one `found=3 started=3 ok=2 failed=1`. But it does
+not belong to the test's owner: the failing test is **`testConcurrentUsage`,
+which HotSpot passes.** HotSpot fails the other two (`testLeakBrokenHint`,
+`testLeakSetupHints`) and completes the whole class in 2.8 s; CratonVM passes
+those two and blows `testConcurrentUsage`'s 60 s `@Timeout` at 61.3–65.3 s on
+every arm and every collector. So the two VMs fail *disjoint* sets, and quoting
+`ok=2 failed=1` as "better than HotSpot's `ok=1 failed=2`" would have been
+exactly backwards.
+
+That is a throughput gap on a 50-thread allocation workload, not a collector
+defect, and it has its own page:
+`docs/known-issues/netty/resourceleakdetector-concurrentusage-timeout-20260815.md`.
+
+## What is still open, and is not this page
+
+* `zgc-rewrite-pass-walks-off-a-reference-array-20260815.md` — the `--nojit`
+  half. Still reproducing; see that page for the current numbers.
+* ZGC and the generational heap throw `OutOfMemoryError` on an allocation-churn
+  workload that G1 and HotSpot both survive — found while measuring residual 1,
+  written up in `zgc-nojit-allocation-churn-oome-20260815.md`.
