@@ -1277,9 +1277,34 @@ pub(crate) fn new13_build_connector(
     extra_root_ders: &[Vec<u8>],
     danger_skip_native_verify: bool,
     max_protocol: Option<native_tls::Protocol>,
+    jsse_default_roots: Option<&[Vec<u8>]>,
 ) -> Result<native_tls::TlsConnector, String> {
     let mut builder = native_tls::TlsConnector::builder();
     builder.min_protocol_version(Some(native_tls::Protocol::Tlsv12));
+    // FIX (tls-client-trust-is-openssl-seclevel): the application named its
+    // own trust store with `javax.net.ssl.trustStore`, and this connection's
+    // `SSLContext` configured nothing of its own — so JSSE's rule applies:
+    // that store REPLACES cacerts, it does not add to it. Handing the anchors
+    // to the backend (rather than verifying separately afterwards) keeps
+    // OpenSSL's path building, name constraints and hostname check exactly as
+    // they are; the only thing that changes is which roots it trusts.
+    if let Some(roots) = jsse_default_roots {
+        builder.disable_built_in_roots(true);
+        for der in roots {
+            match native_tls::Certificate::from_der(der) {
+                Ok(cert) => {
+                    builder.add_root_certificate(cert);
+                }
+                Err(e) => {
+                    tracing::debug!(
+                        target: "phases_late::tls",
+                        "javax.net.ssl.trustStore: skipping unparseable anchor DER: {}",
+                        e
+                    );
+                }
+            }
+        }
+    }
     // FIX (TestSsl.testClientInitiatedRenegotiation[JSSE]): honour a
     // version-pinned `SSLContext.getInstance(...)`. Before this, the protocol
     // string was validated, stored on the SSLContext object, and then never
@@ -1927,8 +1952,68 @@ pub(crate) fn new13_connect_and_handshake_on(
             .and_then(|cert| cert.public_key().ok())
             .is_some_and(|key| key.dsa().is_ok())
     });
-    let connector = new13_build_connector(extra_root_ders, java_tm_key.is_some(), max_protocol)
-        .map_err(|msg| RuntimeError::IOException { message: msg })?;
+    // JSSE's default trust store, and ONLY for a connection whose own
+    // `SSLContext` configured no trust material: an explicit TrustManager or
+    // an explicit set of roots is already the answer, and must not be widened
+    // by a process-wide property.
+    //
+    // Deliberately computed AFTER `legacy_dsa_context`, which scans
+    // `extra_root_ders` for a DSA key: these anchors are NOT merged into that
+    // slice, so a DSA root that happens to sit in the application's trust
+    // store cannot switch an unrelated connection onto the legacy OpenSSL
+    // path (which runs at security level 0).
+    let jsse_default_trust: Option<crate::x509_manager::TrustManagerState> =
+        if extra_root_ders.is_empty() && java_tm_key.is_none() {
+            match crate::tls::explicit_trust_store_keystore_id(ctx) {
+                0 => None,
+                id => {
+                    let state = crate::x509_manager::build_trust_manager_state(id);
+                    (!state.anchor_ders.is_empty()).then_some(state)
+                }
+            }
+        } else {
+            None
+        };
+    let jsse_default_roots: Option<&[Vec<u8>]> = jsse_default_trust
+        .as_ref()
+        .map(|s| s.anchor_ders.as_slice());
+    // Handing OpenSSL the right anchors is necessary and NOT sufficient, and
+    // the measurement says so precisely. With the application's own trust
+    // store supplied as the connector's roots, `TlsProbe3` still got
+    //
+    //   SSLHandshakeException: … certificate verify failed … (EE certificate
+    //   key too weak)
+    //
+    // where HotSpot completes the handshake. That is not a trust verdict: it
+    // is OpenSSL's SECURITY LEVEL, which at its default of 2 requires a
+    // ≥2048-bit RSA key of every peer certificate. The JDK's equivalent knob,
+    // `jdk.certpath.disabledAlgorithms`, draws the line at 1024 bits and
+    // exempts a trust anchor from the signature-algorithm check entirely — so
+    // a 1024-bit MD5-self-signed certificate the application has explicitly
+    // installed as its trust anchor is something JSSE accepts and OpenSSL, at
+    // this level, cannot be told to.
+    //
+    // native-tls exposes no security-level control (that needs a raw
+    // `SslConnector`, as `s2_legacy_dsa_tls_connect_on` uses), so for THIS
+    // case — and only this one — the verdict moves to the validator that
+    // already implements the JDK's rules, exactly as the Java-TrustManager
+    // path above does: native verification stands down and the captured chain
+    // is checked against the configured anchors immediately after connect,
+    // failing closed.
+    //
+    // The blast radius is deliberately the set of connections that are
+    // MISCONFIGURED today: an application that named a trust store and was
+    // being validated against the platform roots regardless. A connection
+    // with no `javax.net.ssl.trustStore` keeps OpenSSL as its verifier,
+    // untouched.
+    let verify_against_default_roots = jsse_default_roots.is_some();
+    let connector = new13_build_connector(
+        extra_root_ders,
+        java_tm_key.is_some() || verify_against_default_roots,
+        max_protocol,
+        jsse_default_roots,
+    )
+    .map_err(|msg| RuntimeError::IOException { message: msg })?;
     // FIX (netty-client-socket-write-after-close): this is a real, blocking
     // TCP connect + full TLS handshake (same shape as net_phase_e.rs's own
     // client createSocket, which already announces this — see its "T19.H1"
@@ -2015,6 +2100,33 @@ pub(crate) fn new13_connect_and_handshake_on(
         if let Err(e) = crate::t27_tls::run_client_trust_check_for_chain(ctx, tm_key, chain) {
             let _ = crate::servlet::s2_tls_close(tls_id);
             return Err(e);
+        }
+    }
+
+    // The `javax.net.ssl.trustStore` arm of the same fail-closed rule: native
+    // verification was stood down for it above, so these anchors are now the
+    // ONLY verifier and a missing or unvalidatable chain must abort the
+    // socket. `validate_chain` is the same RFC 5280 validator the Java
+    // TrustManager shim runs, and the same one that answered exactly as
+    // HotSpot did on both arms of `TmProbe` — including accepting a
+    // self-signed certificate installed as the anchor itself.
+    if let Some(trust) = jsse_default_trust.as_ref() {
+        let chain = crate::servlet::s2_tls_peer_cert_chain_der(tls_id).unwrap_or_default();
+        if chain.is_empty() {
+            let _ = crate::servlet::s2_tls_close(tls_id);
+            return Err(crate::phases_early::throw_jca_exc(
+                ctx,
+                "javax/net/ssl/SSLHandshakeException",
+                "no peer certificate available for javax.net.ssl.trustStore verification",
+            ));
+        }
+        if let Err(e) = crate::x509_manager::validate_chain(&chain, trust) {
+            let _ = crate::servlet::s2_tls_close(tls_id);
+            return Err(crate::phases_early::throw_jca_exc(
+                ctx,
+                "javax/net/ssl/SSLHandshakeException",
+                &format!("PKIX path validation failed: {e}"),
+            ));
         }
     }
     Ok(tls_id)
@@ -2450,6 +2562,9 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
                 extra_roots.as_deref().unwrap_or(&[]),
                 false,
                 init_max_protocol,
+                // Buildability check only — the JSSE default store is
+                // resolved per connection, not here.
+                None,
             ) {
                 return Err(RuntimeError::IOException {
                     message: format!("SSLContext.init: {}", msg),
@@ -4773,6 +4888,51 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
                 // `AbstractMethodError` the moment real bytecode calls one
                 // directly instead of going through this crate's own
                 // post-handshake `engine_run_trust_check` native path).
+                let tm_id = crate::x509_manager::register_trust_manager_state(state);
+                let ih = ctx.identity_hash_code(this);
+                if ih != 0 {
+                    tmf_tm_id_by_identity().lock().insert(ih, tm_id);
+                }
+            }
+        } else if ours {
+            // A NULL KeyStore is not "no trust store" — it is JSSE's DEFAULT
+            // one, and that is the platform roots only when the application
+            // has not named its own via `javax.net.ssl.trustStore`. Nothing
+            // read the property, so a caller that pinned its trust to one
+            // private CA was silently given the whole public root set AND
+            // still had its own certificate rejected. See
+            // `tls::default_trust_store_keystore_id` for the measurement.
+            //
+            // Same staging as the non-null branch above, deliberately: once
+            // the property names a store, JSSE scopes every default context
+            // to it, so the `SSLContext.init` that follows must see it too.
+            let explicit = crate::tls::explicit_trust_store_keystore_id(ctx);
+            let ks_id = if explicit != 0 {
+                explicit
+            } else {
+                crate::tls::default_trust_store_keystore_id(ctx)
+            };
+            if crate::nbflags().dbg_tls_auth_ok {
+                eprintln!(
+                    "[dbg-tls-auth] tmf(phases_late).init(null) this_ih={} ks_id={} explicit={}",
+                    ctx.identity_hash_code(this),
+                    ks_id,
+                    explicit
+                );
+            }
+            if ks_id != 0 {
+                let state = crate::x509_manager::build_trust_manager_state(ks_id);
+                // Staged for the next `SSLContext.init` ONLY when the
+                // application named the store. Staging `cacerts` would push
+                // ~118 anchors into `extra_root_ders`, which the connector
+                // adds to the platform set (a union, not JSSE's replace) and
+                // which `legacy_dsa_context` then scans for a DSA key — so one
+                // DSA root anywhere in the JDK's own trust store could divert
+                // unrelated connections onto the legacy OpenSSL path at
+                // security level 0. Not a trade worth making for a default.
+                if explicit != 0 && !state.anchor_ders.is_empty() {
+                    crate::t27_tls::set_pending_tm_trust_roots(state.anchor_ders.clone());
+                }
                 let tm_id = crate::x509_manager::register_trust_manager_state(state);
                 let ih = ctx.identity_hash_code(this);
                 if ih != 0 {
@@ -7335,7 +7495,7 @@ pub(crate) mod new13_tests {
         // NEW-13.2 DoD: the default connector build (no custom KM/TM) must
         // succeed on every platform supported by native-tls, otherwise
         // SSLContext.init would fail even for the trivial null-TM path.
-        let c = new13_build_connector(&[], false, None);
+        let c = new13_build_connector(&[], false, None, None);
         assert!(c.is_ok(), "connector build failed: {:?}", c.err());
     }
 
@@ -7345,7 +7505,7 @@ pub(crate) mod new13_tests {
         // unexpected TrustManager) must be skipped rather than failing the
         // whole connector build — `new13_build_connector` logs and continues.
         let garbage = vec![0xFFu8, 0x00, 0x01, 0x02];
-        let c = new13_build_connector(&[garbage], false, None);
+        let c = new13_build_connector(&[garbage], false, None, None);
         assert!(
             c.is_ok(),
             "connector build must tolerate an unparseable extra root: {:?}",
