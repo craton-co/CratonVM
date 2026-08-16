@@ -99,30 +99,40 @@ Two cheap moves that are still worth making: `keystore::engine_set_key_entry`
 still drops an entry silently on `if key_der.is_empty() { return Ok(None) }`,
 and should say something.
 
-## B — `SslHandlerTest`, 50 / 54 (HotSpot 53 / 54)
+## B — `SslHandlerTest`, 52 / 54 (HotSpot 53 / 54)
 
-* `testHandshakeFailureCipherMissmatchTLSv12Jdk` / `TLSv13Jdk` — the SERVER's
-  handshake future still fails with `StacklessClosedChannelException` where
-  JSSE raises `SSLException`. Half of this is fixed: `do_unwrap` used to
-  DISCARD a server-side handshake error so the fatal alert rustls had queued
-  could still be flushed, which delivered the alert to the peer and left this
-  side with no failure at all; it is now DEFERRED to the wrap that finishes
-  draining the alert (`EngineState::deferred_handshake_error`). That is
-  demonstrably reaching netty — `testTruncatedPacket` moved from "nothing was
-  thrown" to `SSLHandshakeException` — so what is left is either the
-  exception not being raised on this particular path or a race with the peer's
-  close. Trace `do_wrap`/`do_unwrap` on the SERVER engine with
-  `CRATONVM_DBG_TLS_HS=1` before designing anything.
+* ~~`testHandshakeFailureCipherMissmatchTLSv12Jdk` / `TLSv13Jdk`~~ — FIXED
+  2026-08-16. **A wrap that raises cannot also deliver.**
 
-  One measurement worth keeping, from the delegated-task work below: an
-  intermediate build of it happened to RAISE the rustls failure from a code
-  path that consumed nothing, instead of deferring it, and **both of these
-  passed**. They went back to failing when the raise moved to where it
-  belongs. So the fix is about WHEN the exception is raised relative to the
-  alert drain, not about whether the exception is produced at all — and the
-  deferral's "take it only once nothing is left to write" condition is the
-  thing to look at. Do not simply raise early: that is what the deferral
-  replaced, and it costs the peer its copy of the alert.
+  The page had this the wrong way round for a while: the symptom is
+  `StacklessClosedChannelException` where an `SSLException` belongs, and the
+  server was assumed to be the side missing its exception. It is not — the
+  assertion that fails is the CLIENT's (`SslHandlerTest:1670`), and the server
+  raised correctly all along.
+
+  `do_wrap` drained rustls's fatal alert into the caller's `dst`, then
+  returned `Err`. netty advances its out-buffer's writerIndex from
+  `result.bytesProduced()`, and a throwing `wrap` has no result to read it
+  from — so the buffer read back empty, was released, and the alert died
+  there. The client received not one byte after its ClientHello and failed on
+  the channel closing. The trace that names it: server `do_unwrap` NEED_TASK
+  consumed=138, `task.run … rustls: peer is incompatible:
+  NoCipherSuitesInCommon`, `do_unwrap … hs=NEED_WRAP`, then a `do_wrap` that
+  logs its DST and never logs a RESULT (it threw), followed by a second
+  `do_wrap … produced=0` — the alert gone.
+
+  Two lines fix it, and they belong together:
+
+  * the deferred failure is taken only when `drained.is_empty()` as well, so
+    the alert leaves on an ordinary result the caller can act on;
+  * `handshake_status_of` keeps answering NEED_WRAP while a failure is
+    pending, so the caller comes back for the wrap that produces nothing —
+    and that one raises. netty's `wrapNonAppData` loops on NEED_WRAP and
+    `ctx.write`s each iteration that produced bytes, so the alert is already
+    on the wire when the throw arrives.
+
+  Measured ABBA on a quiet host: 50/54 → 52/54, both arms twice, and both
+  tests pass alone.
 * ~~`testTruncatedPacket`~~ — FIXED. It needed `SSLProtocolException`, not
   `SSLHandshakeException`: a protocol violation (a ServerHello pushed INTO a
   server engine) is a different class from a certificate or negotiation

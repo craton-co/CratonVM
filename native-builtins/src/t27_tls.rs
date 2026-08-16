@@ -9068,6 +9068,16 @@ fn handshake_status_of(s: &EngineState) -> i32 {
         }
         return HS_NOT_HANDSHAKING_R;
     }
+    // A handshake failure waiting to be raised is owed to the caller on a
+    // WRAP, so keep asking for one. Without this the engine answered
+    // NEED_UNWRAP as soon as the alert had drained, the caller stopped
+    // wrapping, and the failure sat on the engine until the peer hung up —
+    // which is the `StacklessClosedChannelException` the deferral exists to
+    // prevent. See `EngineState::deferred_handshake_error` and the
+    // `drained.is_empty()` note in `do_wrap`.
+    if s.deferred_handshake_error.is_some() {
+        return HS_NEED_WRAP_R;
+    }
     // A delegated task the caller owes us outranks everything else: JSSE
     // reports NEED_TASK until the task has actually run. See `DelegatedTask`.
     if s.delegated_task != DelegatedTask::None {
@@ -13081,7 +13091,22 @@ fn do_wrap(
         // once the fatal alert it queued has actually gone out. Taking it only
         // when nothing is left to write is what keeps the peer's copy of the
         // alert intact — see `EngineState::deferred_handshake_error`.
+        //
+        // `drained.is_empty()` as well, and that is the load-bearing half: a
+        // wrap that raises cannot also deliver. netty advances its out-buffer's
+        // writerIndex from `result.bytesProduced()`, and a throwing `wrap` has
+        // no result to read it from — the buffer reads back empty, is released,
+        // and the alert this very call had just drained into it dies there. The
+        // peer then learns only that the channel closed, which is exactly what
+        // `testHandshakeFailureCipherMissmatch{TLSv12,TLSv13}Jdk` measured on
+        // the CLIENT side (SslHandlerTest:1670,
+        // `StacklessClosedChannelException` where an `SSLException` belongs).
+        //
+        // `handshake_status_of` keeps answering NEED_WRAP while the failure is
+        // pending, so the caller comes back for the wrap that produces nothing
+        // — and that one raises.
         let deferred_failure = if s.deferred_handshake_error.is_some()
+            && drained.is_empty()
             && s.outbound.is_empty()
             && !s.conn.as_ref().is_some_and(|c| c.wants_write())
         {
