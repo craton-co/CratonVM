@@ -2369,8 +2369,19 @@ struct PassthroughServerCertVerifier {
     /// `SSLParameters.setEndpointIdentificationAlgorithm("HTTPS"|"LDAPS")`.
     ///
     /// **Why it is HERE and not only in the post-handshake gate.** The
-    /// TrustManager consultation has to be post-handshake — it is a Java
-    /// upcall, and rustls's verifier is not a place we can run one from. The
+    /// TrustManager consultation is post-handshake TODAY, but not because it
+    /// has to be: `JavaKeyManagerResolver::resolve` already runs a Java upcall
+    /// from inside `process_new_packets`, reborrowing the caller's context
+    /// through `with_active_native_context`. What actually keeps the
+    /// TrustManager out of here is that `do_unwrap` holds
+    /// `engine_registry()`'s (non-reentrant) write lock across the record
+    /// loop, and an `X509ExtendedTrustManager` handed the `SSLEngine` may call
+    /// straight back into an engine native. Deferring it costs the property
+    /// below in the other direction — see
+    /// `testHandshakeFailureOnlyFireExceptionOnce` in
+    /// `docs/known-issues/netty/openssl-key-material-and-engine-residuals-20260813.md`,
+    /// where the client sends its `Finished` for a chain its own TrustManager
+    /// rejected. The
     /// identity check is not: it is a pure comparison of the presented chain
     /// against the host this side dialled, so it belongs at the point JSSE
     /// makes it, which is *before the client sends its Finished*.

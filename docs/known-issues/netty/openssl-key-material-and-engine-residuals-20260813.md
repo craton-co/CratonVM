@@ -202,16 +202,54 @@ HotSpot.
   exposes the certificate and generates our `Finished`. The record loop cannot
   stop between them.
 
-  **What a correct fix needs.** The `TrustManager` verdict has to reach rustls
-  *inside* certificate verification — i.e. `PassthroughServerCertVerifier::verify_server_cert`
-  must be the thing that calls Java, so rustls aborts before producing
-  `Finished` and emits the alert under handshake keys. The blocker is stated
-  on `engine_take_pending_trust_check`: no JVM call may happen while the
-  engine registry write lock is held, and `process_new_packets` runs under it.
-  So this needs the pump restructured to run without the lock (take the
-  connection out of the state, drop the guard, pump, restore) plus a
-  thread-local `NativeContext` handoff into the verifier. Size it as a change
-  to the security-critical path, not a patch.
+  **What a correct fix needs**, and what is already in place for it. The
+  `TrustManager` verdict has to reach rustls *inside* certificate
+  verification — `PassthroughServerCertVerifier::verify_server_cert` must be
+  the thing that calls Java, so rustls aborts before producing `Finished` and
+  emits the alert under handshake keys. Three things found 2026-08-16 make
+  that smaller than it sounds, and two of them contradict what this codebase
+  currently says about itself:
+
+  1. **The precedent is already here.** The endpoint-identity check was moved
+     INTO this same verifier for exactly this reason, and
+     `PassthroughServerCertVerifier::endpoint_identity`'s doc describes the
+     identical symptom for `testClientHostnameValidationFail` — "with the
+     check deferred, the client's `Finished` had already gone out, the server
+     had completed its handshake". Only the Java half was left behind.
+  2. **"rustls's verifier is not a place we can run [a Java upcall] from" —
+     that comment, on `endpoint_identity`, is false.**
+     `JavaKeyManagerResolver::resolve` runs `KeyManager.chooseClientAlias`
+     from inside `process_new_packets` already, reborrowing the caller's
+     context through `set_active_native_context` / `with_active_native_context`.
+     The mechanism exists and is documented as safe on the same thread.
+  3. **The stated GC blocker is not the blocker.** No `gc_scan_*`/`gc_update_*`
+     in `t27_tls.rs` locks `engine_registry()` — zero references — which is
+     precisely what `trust_managers_ctx_key`'s "keep only a `u64`" discipline
+     bought. The real hazard is RE-ENTRANCY: an `X509ExtendedTrustManager` is
+     handed the `SSLEngine` and may call back into engine natives, and
+     `parking_lot`'s write guard is not reentrant, so the upcall must not
+     happen under `engine_registry().write()`. (Note the record loop already
+     calls `ctx` helpers — `bb_get_byte`, `bb_bytes_range` — under that lock,
+     so allocation there is evidently survivable; it is the re-entrant
+     `with_engine` that would deadlock.)
+
+  So the work is: publish the context around the record loop, check the
+  connection out of `EngineState` for the loop's duration (the loop body
+  touches only `conn` and locals — every `s.*` access is before or after it,
+  so the split is clean, but every early `return Err(throw_jca_exc(...))`
+  inside it must restore the connection first), and add a
+  `conn_checked_out` flag so a status query landing in that window answers
+  "handshaking" rather than "no connection". Then the verifier consults
+  `ctx_trust_managers_table` and returns
+  `Err(InvalidCertificate(ApplicationVerificationFailure))` on rejection, and
+  `engine_run_trust_check` becomes the fallback for paths with no published
+  context.
+
+  Prove the destination before the refactor: an in-tree client/server
+  `EngineState` pair test (the `engine_wrap_pump`/`engine_unwrap_pump` harness
+  around line 8030) with a client verifier that always rejects should show the
+  SERVER receiving a decryptable alert while `is_handshaking()` is still
+  true — which is the whole property the current design cannot deliver.
 * ~~`testClientHandshakeTimeoutBecauseExecutorNotExecute` /
   `testServerHandshakeTimeoutBecauseExecutorNotExecute`~~ — FIXED 2026-08-16.
   The engine implements JSSE's delegated-task contract now; `DelegatedTask` in
