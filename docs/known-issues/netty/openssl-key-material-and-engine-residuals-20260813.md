@@ -99,7 +99,7 @@ Two cheap moves that are still worth making: `keystore::engine_set_key_entry`
 still drops an entry silently on `if key_der.is_empty() { return Ok(None) }`,
 and should say something.
 
-## B — `SslHandlerTest`, 48 / 54 (HotSpot 53 / 54)
+## B — `SslHandlerTest`, 50 / 54 (HotSpot 53 / 54)
 
 * `testHandshakeFailureCipherMissmatchTLSv12Jdk` / `TLSv13Jdk` — the SERVER's
   handshake future still fails with `StacklessClosedChannelException` where
@@ -113,6 +113,16 @@ and should say something.
   exception not being raised on this particular path or a race with the peer's
   close. Trace `do_wrap`/`do_unwrap` on the SERVER engine with
   `CRATONVM_DBG_TLS_HS=1` before designing anything.
+
+  One measurement worth keeping, from the delegated-task work below: an
+  intermediate build of it happened to RAISE the rustls failure from a code
+  path that consumed nothing, instead of deferring it, and **both of these
+  passed**. They went back to failing when the raise moved to where it
+  belongs. So the fix is about WHEN the exception is raised relative to the
+  alert drain, not about whether the exception is produced at all — and the
+  deferral's "take it only once nothing is left to write" condition is the
+  thing to look at. Do not simply raise early: that is what the deferral
+  replaced, and it costs the peer its copy of the alert.
 * ~~`testTruncatedPacket`~~ — FIXED. It needed `SSLProtocolException`, not
   `SSLHandshakeException`: a protocol violation (a ServerHello pushed INTO a
   server engine) is a different class from a certificate or negotiation
@@ -123,18 +133,71 @@ and should say something.
   `BadMaxFragmentSize` → `SSLProtocolException`; everything else stays
   `SSLHandshakeException`), on both the immediate client throw and the
   deferred server one.
+
+  It passes in the CLASS run and fails when run ALONE — on pristine dev as
+  well as on this branch, measured 2026-08-16. So it is a per-process latch,
+  not a residual of the class-run fix, and a solo `#testTruncatedPacket`
+  result says nothing about it either way.
 * `testHandshakeFailureOnlyFireExceptionOnce` — `expected: <false> but was:
   <true>`; unexamined.
-* `testClientHandshakeTimeoutBecauseExecutorNotExecute` /
-  `testServerHandshakeTimeoutBecauseExecutorNotExecute` — expect an
-  `SslHandshakeTimeoutException`, get `null`, because the handshake COMPLETES.
-  The test installs an `Executor` that never runs what it is given and relies
-  on the engine returning `NEED_TASK` so that netty defers work to it; this
-  engine never returns `NEED_TASK` (rustls does everything inline), so nothing
-  is ever deferred and there is nothing to stall. Closing these means
-  modelling JSSE's delegated-task contract — size it as a feature, and measure
-  the `delegate=true` half of `SSLEngineTest` before and after, because that
-  is the surface it would newly exercise.
+* ~~`testClientHandshakeTimeoutBecauseExecutorNotExecute` /
+  `testServerHandshakeTimeoutBecauseExecutorNotExecute`~~ — FIXED 2026-08-16.
+  The engine implements JSSE's delegated-task contract now; `DelegatedTask` in
+  `t27_tls.rs` carries the whole shape. `getDelegatedTask()` was not
+  registered at all, so a caller that followed the NEED_TASK this engine could
+  ALREADY report (the fallthrough at the end of `handshake_status_of`) had
+  nothing to collect.
+
+  **Where the deferral goes.** On the FIRST inbound handshake flight, on
+  either side — never on a `wrap`. A fresh client's first `wrap` must emit the
+  ClientHello and answer NEED_UNWRAP
+  (`SSLEngineTest.testSSLEngineUnwrapNoSslRecord` asserts exactly that, on all
+  12 parameterisations), and real JSSE defers the certificate and
+  key-agreement work that follows the ServerHello, not anything before the
+  ClientHello.
+
+  **What the task does.** It PROCESSES the flight — `read_tls` plus
+  `process_new_packets`, and `engine_begin` too on a server, whose connection
+  does not exist until then. Staging the records and leaving them for a later
+  `unwrap` is not enough: netty makes that unwrap (`unwrapNonAppData` passes
+  an empty buffer) but `SSLEngineTest.handshake` only unwraps when it has
+  bytes to feed, and the bytes were consumed by the call that answered
+  NEED_TASK — both engines then sit in `wrap` producing nothing, each waiting
+  for the other, and `testSessionCacheTimeout` spins where the control takes
+  1.85 s.
+
+  **Three rules the callers impose:**
+
+  1. *Consume first, then defer.* netty's `SslHandler.decodeJdkCompatible`
+     hands `unwrap` exactly one TLS record and treats
+     `bytesConsumed != packetLength` as "not an SSL/TLS record" — it throws
+     `NotSslRecordException` and fails the handshake.
+  2. *Never answer `null` to a caller that was promised a task.* netty's
+     `SslTasksRunner.run()` returns immediately when `getDelegatedTask()` is
+     null, WITHOUT calling `runComplete()`, so `SslHandler` stays in
+     `STATE_PROCESS_TASK` — where `decode()` and `flush()` are both no-ops —
+     and the connection is wedged for good.
+  3. *The task never throws.* It runs on somebody else's thread and callers do
+     not treat it as a call site that can fail; throwing left `delegate=true`
+     blind to failures `delegate=false` saw. Failures go on
+     `EngineState::deferred_handshake_error`.
+
+  Two things the deferral routes past `do_unwrap`'s record loop and therefore
+  has to redo itself: the ServerHello session-id peek (`testSSLSessionId`
+  compares the two engines' ids byte for byte), and nothing else — the ALPN
+  selector already runs ahead of it.
+
+  Measured against pristine dev, interleaved ABBA on a quiet host:
+  `SslHandlerTest` 48/54 → 50/54 (twice each), `SslContextBuilderTest` 21/21
+  both, and `JdkSslEngineTest` — 821 tests, the `delegate=true` surface this
+  page asked to be checked — `ok=755 failed=0` on both arms of the new build
+  against `754/1` and `755/0` on the control.
+
+  **Read `JdkSslEngineTest` only from a quiet host.** At load 15–30 it
+  produced four `testTlsExtension` failures and a hang that survived three
+  rebuilds and looked exactly like an ALPN defect; at load 6–8 the same binary
+  is clean twice over, and `testTlsExtension` alone is 12 ok / 12 aborted on
+  both arms at any load.
 
 ## ~~C~~ — `SslContextBuilder` accepts an invalid cipher — FIXED 2026-08-15
 
@@ -153,7 +216,15 @@ serverProvider=OPENSSL_REFCNT`). That matches the original characterisation
 exactly ("on a loaded host it hangs instead — 3 of 7 runs"), so the honest
 reading is that the fixes below removed real failures and made the class
 *usually* finish, not that the stall is gone. Any future claim about it needs
-the host's load average recorded beside the result. The prior page's two
+the host's load average recorded beside the result.
+
+**It is not attributable to any VM change on this branch, and there is now an
+A/B that says so (2026-08-16).** At host load 13–30, `pristine dev` stalls at
+`reentryOnHandshakeCompleteNioChannel` after 21 of 63, and the delegated-task
+branch stalls at the same test after 24 and 25 of 63 — three arms, one
+symptom, one of them the control. At load ~4 the same control finishes 63 in
+176 s. Load is the variable; run the control in the same window or the result
+is unreadable. The prior page's two
 contributing findings stand: the `Selector.select() returned prematurely 512
 times in a row` storm came from `nio_selector.rs`'s interest-ops nudge (whose
 Linux premise was false) and is gone, and the storm was a symptom rather than
