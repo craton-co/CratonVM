@@ -1743,7 +1743,7 @@ pub(crate) fn new13_connect_and_handshake_on(
     // path (which runs at security level 0).
     let jsse_default_trust: Option<crate::x509_manager::TrustManagerState> =
         if extra_root_ders.is_empty() && java_tm_key.is_none() {
-            match crate::tls::default_trust_store_keystore_id(ctx) {
+            match crate::tls::explicit_trust_store_keystore_id(ctx) {
                 0 => None,
                 id => {
                     let state = crate::x509_manager::build_trust_manager_state(id);
@@ -4685,17 +4685,31 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
             // Same staging as the non-null branch above, deliberately: once
             // the property names a store, JSSE scopes every default context
             // to it, so the `SSLContext.init` that follows must see it too.
-            let ks_id = crate::tls::default_trust_store_keystore_id(ctx);
+            let explicit = crate::tls::explicit_trust_store_keystore_id(ctx);
+            let ks_id = if explicit != 0 {
+                explicit
+            } else {
+                crate::tls::default_trust_store_keystore_id(ctx)
+            };
             if crate::nbflags().dbg_tls_auth_ok {
                 eprintln!(
-                    "[dbg-tls-auth] tmf(phases_late).init(null) this_ih={} default_ks_id={}",
+                    "[dbg-tls-auth] tmf(phases_late).init(null) this_ih={} ks_id={} explicit={}",
                     ctx.identity_hash_code(this),
-                    ks_id
+                    ks_id,
+                    explicit
                 );
             }
             if ks_id != 0 {
                 let state = crate::x509_manager::build_trust_manager_state(ks_id);
-                if !state.anchor_ders.is_empty() {
+                // Staged for the next `SSLContext.init` ONLY when the
+                // application named the store. Staging `cacerts` would push
+                // ~118 anchors into `extra_root_ders`, which the connector
+                // adds to the platform set (a union, not JSSE's replace) and
+                // which `legacy_dsa_context` then scans for a DSA key — so one
+                // DSA root anywhere in the JDK's own trust store could divert
+                // unrelated connections onto the legacy OpenSSL path at
+                // security level 0. Not a trade worth making for a default.
+                if explicit != 0 && !state.anchor_ders.is_empty() {
                     crate::t27_tls::set_pending_tm_trust_roots(state.anchor_ders.clone());
                 }
                 let tm_id = crate::x509_manager::register_trust_manager_state(state);

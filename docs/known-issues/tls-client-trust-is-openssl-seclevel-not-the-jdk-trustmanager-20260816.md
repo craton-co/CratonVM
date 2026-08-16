@@ -14,6 +14,8 @@ of the two was in the opposite direction to the reported symptom.
 | Client TLS to a peer whose cert is in that trust store | handshake OK | **refused** | **handshake OK** |
 | Client TLS with a trust store that does NOT name that cert | refused | refused | refused |
 | Client TLS with no trust store configured at all | refused | refused | refused |
+| Default anchors with NO property set | 118 (cacerts) | **122 (OS store)** | **118** |
+| …anchors CratonVM trusted that the JDK does not | — | **4** | **0** |
 
 **Still open:** with no `javax.net.ssl.trustStore` configured, the client path
 keeps OpenSSL as its verifier at security level 2, which is stricter than the
@@ -39,6 +41,42 @@ whole public root set instead — and still had the one certificate it asked to
 trust rejected. Both halves wrong, and the first half in the dangerous
 direction.
 
+### 1b. And with no property set, the default anchors were the OS store, not `cacerts`
+
+Found by pulling on the "122 vs 118" in the numbers above rather than
+accepting it as noise. JSSE's default trust store is
+`$JAVA_HOME/lib/security/cacerts` (after `jssecacerts`);
+`build_trust_manager_state(0)` builds its set from `rustls-native-certs`, i.e.
+the OS store — a different set of CAs.
+
+MEASURED (`TrustSetProbe`), keyed on the SHA-256 of each encoded certificate,
+NOT on the subject DN — the two VMs render the same DN differently
+(hex-escaped OIDs vs `EMAILADDRESS=`/`SERIALNUMBER=` keywords), and a
+subject-keyed diff reported 5 and 9 one-sided anchors that were mostly the
+same certificates written twice:
+
+```
+HotSpot cacerts    118 anchors
+CratonVM OS store  122 anchors        overlap 118
+only in the JDK      0
+only in CratonVM     4
+```
+
+A strict SUPERSET — nothing the JDK trusts was missing, and four CAs were
+trusted here that the JDK does not:
+
+* `CN=Entrust Root Certification Authority` — a root the JDK has already
+  distrusted
+* `CN=Izenpe.com`
+* `CN=SecureSign Root CA12`
+* `CN=vm1.…gx.internal.cloudapp.net` — **the build host's own self-signed
+  machine certificate**, which lives in `/etc/ssl/certs` and was therefore a
+  trusted CA for every default-context client in the VM
+
+Same widening family as the ignored property, and the more consequential half
+of it: a certificate issued by any of those four would have been accepted by
+CratonVM and refused by the JDK.
+
 ### 2. The client socket path never consulted a TrustManager at all
 
 `SSLSocketFactory.getDefault()` returns a factory with no `SSLContext` behind
@@ -59,11 +97,32 @@ certificate and accepts that same certificate once it is installed as an
 anchor, MD5 signature and 1024-bit key notwithstanding. The verdict did not
 need to change; only which verifier gets to give it.
 
-* `tls::default_trust_store_keystore_id` resolves `javax.net.ssl.trustStore`
-  (+ `…Password`) through the same `keystore::load_keystore` the explicit
-  `KeyStore` path already uses, caches it by (path, password), and answers 0 —
-  today's platform roots — when the property is absent, unreadable, unparseable
-  or `NONE`. Wired into `TrustManagerFactory.init(KeyStore)`'s null branch.
+* `tls::resolve_default_trust_store` implements JSSE's search in its own
+  order: `javax.net.ssl.trustStore`, else `<java.home>/lib/security/jssecacerts`,
+  else `<java.home>/lib/security/cacerts`. It loads through the same
+  `keystore::load_keystore` the explicit-`KeyStore` path already uses (an empty
+  password skips the JKS integrity MAC, which is what real-JDK
+  `JavaKeyStore` does for a null password and how a trust store is normally
+  read), caches by (path, password), and answers 0 — today's platform roots —
+  whenever the file is absent, unreadable, unparseable or parses to zero
+  entries. A VM with no JDK image (synthetic-jdk mode) finds neither file and
+  keeps exactly today's behaviour. Wired into
+  `TrustManagerFactory.init(KeyStore)`'s null branch.
+
+* **Two resolvers, deliberately.** `explicit_trust_store_keystore_id` honours
+  the property ONLY and never `cacerts`, and it is what the client connect
+  path below uses. The distinction is load-bearing: that path stands native
+  verification down for the store it resolves, which is the right trade for a
+  store someone deliberately configured and the wrong one for `cacerts` —
+  applying it there would move every default HTTPS client in the VM off
+  OpenSSL's path builder and onto `x509_manager::validate_chain`, a far larger
+  change than this. For the same reason `cacerts` is registered for
+  `getTrustManagers()` but NOT staged via `set_pending_tm_trust_roots`:
+  staging ~118 anchors into `extra_root_ders` makes the connector union them
+  with the platform set instead of replacing it, and `legacy_dsa_context`
+  scans that slice for a DSA key — so one DSA root in the JDK's own store
+  could divert unrelated connections onto the legacy OpenSSL path at security
+  level 0.
 
   Note which copy: `init(KeyStore)` is registered TWICE for this class and
   `phases_late::ssl_security`'s copy wins. The first attempt at this fix went
@@ -93,8 +152,11 @@ Azure host, `--java-home /data/toolchain/jdk-25 --nojit --Xmx 1g`, branch off
 
 ```
                                         HotSpot      before        after
-TmProbe2  anchors / verdict             1 / ACCEPT   122 / REJECT  1 / ACCEPT
-TlsProbe3 cert IS in the trust store    OK 197ms     REJECTED      OK 57ms
+TrustSetProbe default anchors           118          122           118
+  … of which the JDK does not trust     —              4             0
+TmProbe   default anchors / verdict     118 / REJECT 122 / REJECT  118 / REJECT
+TmProbe2  property anchors / verdict    1 / ACCEPT   122 / REJECT  1 / ACCEPT
+TlsProbe3 cert IS in the trust store    OK 197ms     REJECTED      OK 53ms
 TlsProbe4 cert is NOT (negative ctrl)   REJECTED     REJECTED      REJECTED
 TlsProbe  no trust store at all         REJECTED     REJECTED      REJECTED
 ```

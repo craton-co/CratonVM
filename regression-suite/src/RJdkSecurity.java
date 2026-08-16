@@ -463,6 +463,18 @@ public class RJdkSecurity {
      * anchor, its own certificate accepted, an unrelated one refused.
      */
     static void defaultTrustStoreProperty() throws Exception {
+        // Before touching the property: with none set, JSSE's default anchors
+        // ARE `$JAVA_HOME/lib/security/cacerts`. Asserted as a RELATION rather
+        // than a count, because the count is a property of whichever JDK image
+        // the run uses — but "the default trust manager and cacerts hold the
+        // same number of trusted certificates" holds on any of them, and it is
+        // exactly what fails when the anchors come from the OS trust store
+        // instead (measured: 122 from /etc/ssl/certs against cacerts' 118,
+        // four of them CAs the JDK does not trust, one the host's own
+        // self-signed machine certificate).
+        System.out.println("CK RJdkSecurity defaultAnchorsAreCacerts=" + defaultAnchorsAreCacerts());
+        checks++;
+
         String saved = System.getProperty("javax.net.ssl.trustStore");
         java.io.File f = java.io.File.createTempFile("rjdksec-trust", ".p12");
         try {
@@ -528,6 +540,31 @@ public class RJdkSecurity {
             }
             f.delete();
         }
+    }
+
+    /**
+     * "true" on any JDK image, "false" when the default anchors come from
+     * somewhere other than cacerts. Answers "no-cacerts" rather than a verdict
+     * when the image has no such file, so a run on a trimmed image is visibly
+     * inconclusive instead of quietly passing.
+     */
+    static String defaultAnchorsAreCacerts() throws Exception {
+        java.io.File cacerts =
+                new java.io.File(System.getProperty("java.home"), "lib/security/cacerts");
+        if (!cacerts.isFile()) {
+            return "no-cacerts";
+        }
+        java.security.KeyStore ks = java.security.KeyStore.getInstance("JKS");
+        try (java.io.InputStream in = new java.io.FileInputStream(cacerts)) {
+            ks.load(in, null);
+        }
+        int trusted = 0;
+        for (java.util.Enumeration<String> e = ks.aliases(); e.hasMoreElements();) {
+            if (ks.isCertificateEntry(e.nextElement())) {
+                trusted++;
+            }
+        }
+        return String.valueOf(trusted > 0 && platformAnchors().size() == trusted);
     }
 
     static java.util.List<java.security.cert.X509Certificate> platformAnchors() throws Exception {
