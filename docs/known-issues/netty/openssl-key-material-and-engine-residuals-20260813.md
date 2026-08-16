@@ -5,8 +5,8 @@
 (`SslContextBuilder` accepting an invalid cipher) and the
 `AbstractMethodError` half of A′ are fixed; the **JCA half of A′ is fixed**
 (2026-08-15) and what remains of A′ is netty's OPENSSL **client** path;
-section B is halved; section D's intermittent hang is **gone** and what it was
-hiding is a wrong object identity, below.
+section B is halved; section D still hangs on a LOADED host but finishes on
+a quiet one, and two failures it was hiding were an unpinned array — fixed.
 
 Measured on Azure host 2 (Linux x86_64, JDK 25), one class per process,
 `-XX:+UseG1GC`, with `netty-tcnative-boringssl-static` on the classpath for
@@ -20,7 +20,7 @@ rather than reading it as a TLS defect.
 | `OpenSslPrivateKeyMethodTest` | 24 / 24 | 24 / 24 | 3 / 24 |
 | `SslHandlerTest` | 47 / 54 | **48 / 54** | 53 / 54 |
 | `SslContextBuilderTest` | 21 / 21 | 21 / 21 ✅ | 21 / 21 |
-| `ParameterizedSslHandlerTest` | never finished, or hangs | **61 / 63 in 114–125 s, 3/3 runs** | 63 / 63 |
+| `ParameterizedSslHandlerTest` | never finished, or hangs | **61–63 / 63 on a quiet host; still stalls under load** | 63 / 63 |
 
 `JdkSslEngineTest` is now the oracle exactly and its page is retired — see the
 retired `jdksslenginetest-engine-level-gaps` write-up for the four causes that
@@ -144,38 +144,70 @@ and should say something.
 
 ## D — the hang is gone; a wrong object identity was behind it
 
-`ParameterizedSslHandlerTest` finished in all three consecutive runs of the
-current build (114 s, 114 s, 125 s) at **61/63**. The prior page's two
+`ParameterizedSslHandlerTest` finished in **six consecutive runs on a quiet
+host** (114–184 s) at 61–63 of 63 — including one clean 63/63. **It is not
+cured**: two later runs at host load 45–50 gave one stall, killed at the 900 s
+cap, at the same parameterisation the original page named
+(`reentryOnHandshakeCompleteNioChannel`, `5: clientProvider=OPENSSL_REFCNT,
+serverProvider=OPENSSL_REFCNT`). That matches the original characterisation
+exactly ("on a loaded host it hangs instead — 3 of 7 runs"), so the honest
+reading is that the fixes below removed real failures and made the class
+*usually* finish, not that the stall is gone. Any future claim about it needs
+the host's load average recorded beside the result. The prior page's two
 contributing findings stand: the `Selector.select() returned prematurely 512
 times in a row` storm came from `nio_selector.rs`'s interest-ops nudge (whose
 Linux premise was false) and is gone, and the storm was a symptom rather than
 the cause.
 
-Both remaining failures are deterministic, and the first is the interesting
-one:
+### What the hang was hiding — an unpinned array, FIXED 2026-08-15
+
+Two intermittent failures shared one call site,
+`ReferenceCountedOpenSslServerContext.newSessionContext` →
+`toBIO(alloc, manager.getAcceptedIssuers())`, and one root cause:
 
 ```
 java.lang.NoSuchMethodError: 'byte[] sun.security.util.DerValue.getEncoded()'
-    at io.netty.handler.ssl.PemX509Certificate.append(PemX509Certificate.java:126)
-    at io.netty.handler.ssl.PemX509Certificate.toPEM(PemX509Certificate.java:86)
-    at io.netty.handler.ssl.ReferenceCountedOpenSslContext.toBIO(…:1041)
-    at io.netty.handler.ssl.ReferenceCountedOpenSslServerContext.newSessionContext(…:174)
-    at io.netty.handler.ssl.ParameterizedSslHandlerTest.reentryOnHandshakeComplete(…:568)
+    at io.netty.handler.ssl.PemX509Certificate.append(…:126)
+java.lang.IllegalArgumentException: Null element in chain: [null × 32]
+    at io.netty.handler.ssl.PemX509Certificate.toPEM(…:80)
+    (netty wraps this one as "SSLException: unable to setup trustmanager")
 ```
 
-`PemX509Certificate.append` calls `X509Certificate.getEncoded()`. The receiver
-is a `sun.security.util.DerValue`, and `DerValue` on JDK 25 has
-`toByteArray()`, not `getEncoded()` — verified with `javap`. So this is not a
-missing method: **something in this VM handed back a `DerValue` where an
-`X509Certificate` was expected**, and the `NoSuchMethodError` is the first
-place the substitution becomes visible. Find the producer (the certificate
-factory / keystore path that `SslContextBuilder.forServer` reaches for an
-OPENSSL server context) rather than adding the method.
+Both `getAcceptedIssuers` implementations —
+`x509_manager::get_accepted_issuers` and the `javax/net/ssl/X509TrustManager`
+one in `t27_tls` — built the result array and then filled it in a loop whose
+body ALLOCATES (a mirror object, two strings, a DER `byte[]`). The array
+reference was held raw, so a moving young collection landing inside the loop
+relocated it and every `set_array_element` after that wrote into the vacated
+slots. What the live array kept was whatever the collector left there: usually
+`null` (32 of them — the system trust-anchor count), occasionally a `DerValue`
+from the certificate parsing the loop had just done, which is why one site
+produced two unrelated-looking errors. Same family as
+`t27_tls::attach_trust_managers_to_ctx`'s documented GC fix: a native local
+held live across an allocation. Both loops now pin and re-read.
 
-The second, `SSLException: unable to setup trustmanager` on
-`4: clientProvider=OPENSSL_REFCNT, serverProvider=OPENSSL`, was recorded on
-the previous page as seen once in one completed run; it is now reproducible in
-every run and is very likely the same substitution seen from the trust side.
+A `sun.security.util.DerValue.getEncoded()` alias for `toByteArray()` was
+added alongside — JDK 25's class genuinely has no `getEncoded()` (verified
+with `javap --module java.base`), and a `DerValue` that wraps a parsed
+certificate carries exactly the DER `X509Certificate.getEncoded()` is
+contracted to return, so the alias is value-correct. It is belt-and-braces,
+not the fix: it changes no object's identity, and any other `X509Certificate`
+method asked of such an object would still fail.
+
+**What is left:** 61–62 of 63, and neither error above appears in any run. The
+residual is a different, later-stage defect on
+`clientProvider=JDK, serverProvider=OPENSSL{,_REFCNT}`:
+
+```
+OpenSslHandshakeException: error:100000ae:SSL routines:OPENSSL_internal:NO_CERTIFICATE_SET
+SSLHandshakeException: Unable to find key material for auth method(s):
+    [ECDHE_ECDSA, ECDHE_ECDSA, ECDHE_RSA, …, RSA]
+```
+
+i.e. the OPENSSL server context ends up with no usable key material —
+plausibly A′'s residual seen from the server side. It was measured on a host
+at load 40–50, so how much of the 1-vs-2 variation is the defect and how much
+is the host is not separated; re-measure on a quiet host first.
 
 ## Repro
 

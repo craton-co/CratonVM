@@ -4886,10 +4886,40 @@ fn get_accepted_issuers(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     let cls_id = ctx
         .ensure_class_initialized("java/security/cert/X509Certificate")
         .unwrap_or(cratonvm_types::ClassId::new(0));
-    let arr = ctx.new_ref_array(cls_id, ders.len());
+    let arr0 = ctx.new_ref_array(cls_id, ders.len());
+    // GC: `make_x509_mirror` allocates (a mirror object, its strings, its DER
+    // byte[]), so a moving young collection can relocate `arr` INSIDE this
+    // loop. Held raw, every `set_array_element` after that point wrote into
+    // the vacated slots and the live array kept whatever the collector put
+    // there — nulls, or unrelated objects the mirror building itself made.
+    //
+    // netty saw both faces of it on one call site
+    // (`ReferenceCountedOpenSslServerContext.newSessionContext` →
+    // `toBIO(alloc, manager.getAcceptedIssuers())`): intermittently
+    // `IllegalArgumentException: Null element in chain: [null × 32]`, and
+    // intermittently `NoSuchMethodError: sun.security.util.DerValue
+    // .getEncoded()` — a `DerValue` left in a vacated slot by the very
+    // certificate parsing this loop had just done. Same family as
+    // `t27_tls::attach_trust_managers_to_ctx`'s documented GC fix: a native
+    // local held live across an allocation.
+    let pin = ctx.pin_native_root(arr0);
+    let mut arr = arr0;
+    let mut failure = None;
     for (i, der) in ders.iter().enumerate() {
-        let mirror = make_x509_mirror(ctx, "trust-anchor", der);
-        ctx.set_array_element(arr, i, Value::Object(Some(mirror?)));
+        match make_x509_mirror(ctx, "trust-anchor", der) {
+            Ok(mirror) => {
+                arr = ctx.read_native_pin(pin, arr0);
+                ctx.set_array_element(arr, i, Value::Object(Some(mirror)));
+            }
+            Err(e) => {
+                failure = Some(e);
+                break;
+            }
+        }
+    }
+    ctx.unpin_native_roots(pin);
+    if let Some(e) = failure {
+        return Err(e);
     }
     Ok(Some(Value::Object(Some(arr))))
 }

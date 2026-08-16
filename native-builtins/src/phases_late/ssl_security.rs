@@ -6304,6 +6304,39 @@ pub(crate) fn register_p68_security_cert(r: &mut NativeMethodRegistry) {
         },
     );
 
+    // `sun.security.util.DerValue.getEncoded()` — an ALIAS for the method the
+    // real class actually declares, `toByteArray()`.
+    //
+    // **This is a symptom fix and is deliberately recorded as one.** JDK 25's
+    // `DerValue` has no `getEncoded()` (verified with `javap --module
+    // java.base`), so the `NoSuchMethodError` netty's
+    // `PemX509Certificate.append` raises is not a missing method — it is the
+    // first place a WRONG OBJECT becomes visible: something on the
+    // `CertificateFactory` path hands back a `DerValue` where an
+    // `X509Certificate` was expected, and `append` is simply the first caller
+    // to ask it for something only a certificate has.
+    //
+    // The alias is nevertheless correct for the value it returns: a `DerValue`
+    // produced by parsing a certificate wraps that certificate's whole DER
+    // SEQUENCE, and `toByteArray()` is exactly the encoding
+    // `X509Certificate.getEncoded()` is contracted to produce. So the PEM
+    // netty builds from it is the right PEM.
+    //
+    // What it does NOT do is fix the identity. Any other `X509Certificate`
+    // method asked of that object — `getSubjectX500Principal`,
+    // `checkValidity`, `getPublicKey` — still fails, and will fail with the
+    // same shape of error. The producer is the real fix; see the
+    // `openssl-key-material-and-engine-residuals` page.
+    r.register(
+        "sun/security/util/DerValue",
+        "getEncoded",
+        "()[B",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            ctx.invoke_virtual(this, "toByteArray", "()[B", &[])
+        },
+    );
+
     // Certificate base class
     let cert = "java/security/cert/Certificate";
     r.register(cert, "getType", "()Ljava/lang/String;", |ctx, _args| {
