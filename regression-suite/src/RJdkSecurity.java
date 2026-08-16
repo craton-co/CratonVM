@@ -444,11 +444,159 @@ public class RJdkSecurity {
                 + " digests=" + digestNames.size());
     }
 
+    /**
+     * `javax.net.ssl.trustStore` is how an application says "trust THIS and
+     * nothing else", and `TrustManagerFactory.init(null)` is what has to obey
+     * it: JSSE's default trust store is the platform roots only while the
+     * property is unset, and the property REPLACES them rather than adding to
+     * them.
+     *
+     * CratonVM ignored it, which failed in the widening direction — an
+     * application that pinned its trust to one CA was given the whole public
+     * root set (122 anchors where HotSpot reported 1) and still rejected the
+     * one certificate it had asked to trust.
+     *
+     * Nothing here prints a certificate, a subject or a platform anchor COUNT:
+     * the two VMs legitimately ship different root sets (118 vs 122), and the
+     * borrowed anchor below is simply "the first RSA root this VM has", which
+     * also differs. What is diffed is the shape the property produces — one
+     * anchor, its own certificate accepted, an unrelated one refused.
+     */
+    static void defaultTrustStoreProperty() throws Exception {
+        // Before touching the property: with none set, JSSE's default anchors
+        // ARE `$JAVA_HOME/lib/security/cacerts`. Asserted as a RELATION rather
+        // than a count, because the count is a property of whichever JDK image
+        // the run uses — but "the default trust manager and cacerts hold the
+        // same number of trusted certificates" holds on any of them, and it is
+        // exactly what fails when the anchors come from the OS trust store
+        // instead (measured: 122 from /etc/ssl/certs against cacerts' 118,
+        // four of them CAs the JDK does not trust, one the host's own
+        // self-signed machine certificate).
+        System.out.println("CK RJdkSecurity defaultAnchorsAreCacerts=" + defaultAnchorsAreCacerts());
+        checks++;
+
+        String saved = System.getProperty("javax.net.ssl.trustStore");
+        java.io.File f = java.io.File.createTempFile("rjdksec-trust", ".p12");
+        try {
+            java.security.cert.X509Certificate mine = null;
+            java.security.cert.X509Certificate other = null;
+            for (java.security.cert.X509Certificate c : platformAnchors()) {
+                if (!"RSA".equals(c.getPublicKey().getAlgorithm())) {
+                    continue;
+                }
+                if (mine == null) {
+                    mine = c;
+                } else if (!c.getSubjectX500Principal().equals(mine.getSubjectX500Principal())) {
+                    other = c;
+                    break;
+                }
+            }
+            if (mine == null || other == null) {
+                // Reported, never silently skipped: a run with no usable
+                // platform anchors must not read as a pass of this stage.
+                System.out.println("CK RJdkSecurity trustStoreProp=SKIPPED-no-rsa-anchors");
+                checks++;
+                return;
+            }
+            java.security.KeyStore ks =
+                    java.security.KeyStore.getInstance(java.security.KeyStore.getDefaultType());
+            ks.load(null, null);
+            ks.setCertificateEntry("only", mine);
+            try (java.io.OutputStream o = new java.io.FileOutputStream(f)) {
+                ks.store(o, "changeit".toCharArray());
+            }
+            System.setProperty("javax.net.ssl.trustStore", f.getAbsolutePath());
+            System.setProperty("javax.net.ssl.trustStorePassword", "changeit");
+
+            javax.net.ssl.TrustManagerFactory tmf = javax.net.ssl.TrustManagerFactory
+                    .getInstance(javax.net.ssl.TrustManagerFactory.getDefaultAlgorithm());
+            tmf.init((java.security.KeyStore) null);
+            javax.net.ssl.X509TrustManager x = null;
+            for (javax.net.ssl.TrustManager tm : tmf.getTrustManagers()) {
+                if (tm instanceof javax.net.ssl.X509TrustManager) {
+                    x = (javax.net.ssl.X509TrustManager) tm;
+                    break;
+                }
+            }
+            if (x == null) {
+                System.out.println("CK RJdkSecurity trustStoreProp=NO-X509-MANAGER");
+                checks++;
+                return;
+            }
+            java.security.cert.X509Certificate[] issuers = x.getAcceptedIssuers();
+            System.out.println("CK RJdkSecurity trustStorePropAnchors="
+                    + (issuers == null ? -1 : issuers.length) + " (expect 1)");
+            checks++;
+            System.out.println("CK RJdkSecurity trustStorePropOwnCert=" + verdict(x, mine));
+            checks++;
+            System.out.println("CK RJdkSecurity trustStorePropOtherCert=" + verdict(x, other));
+            checks++;
+        } finally {
+            if (saved == null) {
+                System.clearProperty("javax.net.ssl.trustStore");
+                System.clearProperty("javax.net.ssl.trustStorePassword");
+            } else {
+                System.setProperty("javax.net.ssl.trustStore", saved);
+            }
+            f.delete();
+        }
+    }
+
+    /**
+     * "true" on any JDK image, "false" when the default anchors come from
+     * somewhere other than cacerts. Answers "no-cacerts" rather than a verdict
+     * when the image has no such file, so a run on a trimmed image is visibly
+     * inconclusive instead of quietly passing.
+     */
+    static String defaultAnchorsAreCacerts() throws Exception {
+        java.io.File cacerts =
+                new java.io.File(System.getProperty("java.home"), "lib/security/cacerts");
+        if (!cacerts.isFile()) {
+            return "no-cacerts";
+        }
+        java.security.KeyStore ks = java.security.KeyStore.getInstance("JKS");
+        try (java.io.InputStream in = new java.io.FileInputStream(cacerts)) {
+            ks.load(in, null);
+        }
+        int trusted = 0;
+        for (java.util.Enumeration<String> e = ks.aliases(); e.hasMoreElements();) {
+            if (ks.isCertificateEntry(e.nextElement())) {
+                trusted++;
+            }
+        }
+        return String.valueOf(trusted > 0 && platformAnchors().size() == trusted);
+    }
+
+    static java.util.List<java.security.cert.X509Certificate> platformAnchors() throws Exception {
+        javax.net.ssl.TrustManagerFactory tmf = javax.net.ssl.TrustManagerFactory
+                .getInstance(javax.net.ssl.TrustManagerFactory.getDefaultAlgorithm());
+        tmf.init((java.security.KeyStore) null);
+        for (javax.net.ssl.TrustManager tm : tmf.getTrustManagers()) {
+            if (tm instanceof javax.net.ssl.X509TrustManager) {
+                java.security.cert.X509Certificate[] a =
+                        ((javax.net.ssl.X509TrustManager) tm).getAcceptedIssuers();
+                return a == null ? Collections.emptyList() : Arrays.asList(a);
+            }
+        }
+        return Collections.emptyList();
+    }
+
+    static String verdict(javax.net.ssl.X509TrustManager x,
+            java.security.cert.X509Certificate cert) {
+        try {
+            x.checkServerTrusted(new java.security.cert.X509Certificate[] { cert }, "RSA");
+            return "ACCEPTED";
+        } catch (Exception e) {
+            return "REJECTED";
+        }
+    }
+
     public static void main(String[] args) throws Exception {
         digests();
         secureRandoms();
         signatures();
         tls();
+        defaultTrustStoreProperty();
         providers();
         advertisedVersusServed();
         System.out.println("CK RJdkSecurity checks=" + checks);

@@ -1443,6 +1443,58 @@ fn bc_provider_get_public_key(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
     };
     let pin = ctx.pin_native_root(spki);
     let out = (|| {
+        // BouncyCastle's OWN converter first. This native stands in for a
+        // three-line BC method — look up `keyInfoConverters` by the SPKI's
+        // algorithm OID, call `generatePublic` — and it stood in for ALL of it,
+        // including the algorithms whose converter is perfectly well registered.
+        // The rebuild below only knows EC and RSA, so every other key came back
+        // as this VM's own object (or null), and BouncyCastle's post-quantum
+        // SPIs refuse anything but their own key classes: `cert.test`'s
+        // `PQCCertTest` got `InvalidKeyException: unknown public key passed to
+        // ML-DSA` from `X509CertificateImpl.checkSignature` on a certificate
+        // BouncyCastle had itself just parsed.
+        //
+        // `getAsymmetricKeyInfoConverter` is BC's own static accessor for that
+        // map and is NOT intercepted, so calling it runs the real lookup.
+        let spki_now = ctx.read_native_pin(pin, spki);
+        let algo_id = ctx.invoke_virtual(
+            spki_now,
+            "getAlgorithm",
+            "()Lorg/bouncycastle/asn1/x509/AlgorithmIdentifier;",
+            &[],
+        );
+        if let Ok(Some(Value::Object(Some(alg_id)))) = algo_id {
+            let oid = ctx.invoke_virtual(
+                alg_id,
+                "getAlgorithm",
+                "()Lorg/bouncycastle/asn1/ASN1ObjectIdentifier;",
+                &[],
+            );
+            if let Ok(Some(Value::Object(Some(oid)))) = oid {
+                let converter = ctx.invoke(
+                    "org/bouncycastle/jce/provider/BouncyCastleProvider",
+                    "getAsymmetricKeyInfoConverter",
+                    "(Lorg/bouncycastle/asn1/ASN1ObjectIdentifier;)\
+                     Lorg/bouncycastle/jcajce/provider/util/AsymmetricKeyInfoConverter;",
+                    &[Value::Object(Some(oid))],
+                );
+                if let Ok(Some(Value::Object(Some(converter)))) = converter {
+                    let spki_now = ctx.read_native_pin(pin, spki);
+                    let built = ctx.invoke_virtual(
+                        converter,
+                        "generatePublic",
+                        "(Lorg/bouncycastle/asn1/x509/SubjectPublicKeyInfo;)\
+                         Ljava/security/PublicKey;",
+                        &[Value::Object(Some(spki_now))],
+                    )?;
+                    if matches!(built, Some(Value::Object(Some(_)))) {
+                        return Ok(built);
+                    }
+                }
+            }
+        }
+        // No converter registered for this OID — the case this native was
+        // written for. Rebuild EC/RSA from the encoding.
         let spki = ctx.read_native_pin(pin, spki);
         let der = match ctx.invoke_virtual(spki, "getEncoded", "()[B", &[])? {
             Some(Value::Object(Some(arr))) => read_byte_array(ctx, arr),
@@ -1458,7 +1510,7 @@ fn bc_provider_get_public_key(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
 /// encoding, so `Signature.verify` stays on the fast crypto_impl path (the real
 /// key carries no synthetic `key_id` slot). Used by the `generatePublic` import
 /// path which may receive an `RSAPublicKeySpec` (not a DER we can pre-parse).
-fn register_rsa_pub_verify_material(ctx: &mut dyn NativeContext, key: ObjectRef) {
+pub(crate) fn register_rsa_pub_verify_material(ctx: &mut dyn NativeContext, key: ObjectRef) {
     let pin = ctx.pin_native_root(key);
     let key = ctx.read_native_pin(pin, key);
     let enc = ctx.invoke_virtual(key, "getEncoded", "()[B", &[]);
@@ -1550,7 +1602,7 @@ fn read_biginteger_magnitude(
 /// imported private key carries no synthetic `key_id` and `rsa_sign(0)` yields
 /// a garbage signature — keycloak's `KeyPairVerifier` (sign "content" then
 /// verify) then reports "Keys don't match".
-fn register_rsa_priv_sign_material(ctx: &mut dyn NativeContext, key: ObjectRef) {
+pub(crate) fn register_rsa_priv_sign_material(ctx: &mut dyn NativeContext, key: ObjectRef) {
     let pin = ctx.pin_native_root(key);
     let k = ctx.read_native_pin(pin, key);
     let n = read_biginteger_magnitude(ctx, k, "getModulus");
@@ -1758,8 +1810,35 @@ fn kf_provider_name(algo: i32) -> Option<&'static str> {
 /// is null` from a plain accessor, which `probes/JcaGetInstanceProbe` records
 /// as `provider=?`. Exactly the species `skf_algo_table` documents for
 /// `SecretKeyFactory` and `kpg_get_provider` fixed for `KeyPairGenerator`.
+/// The application `KeyFactorySpi` this `KeyFactory` wraps, if any.
+///
+/// A `KeyFactory` built by `kf_get_instance`'s own synthetic path never has an
+/// `spi`: this crate services it from `kf_algo_idx` and the routes behind it,
+/// and the field stays null. One built through the JDK's own
+/// `(KeyFactorySpi, Provider, String)` constructor — which is what
+/// `build_real_key_factory` does for a third-party provider — always does. So
+/// the field IS the discriminator, exactly as `spi` is for `SecretKeyFactory`
+/// (`skf_receiver_is_ours`), and no side table is needed.
+///
+/// Every native registered on `java/security/KeyFactory` consults this first.
+/// Without it they shadowed the real bytecode for a receiver they did not
+/// build, and a `KeyFactory` obtained from BouncyCastle produced this VM's own
+/// key objects instead of the `BCECPublicKey` / `BCRSAPrivateKey` the rest of
+/// that provider's code requires.
+fn kf_delegate_spi(ctx: &mut dyn NativeContext, this: ObjectRef) -> Option<ObjectRef> {
+    match ctx.get_field_by_name(this, "spi") {
+        Value::Object(Some(spi)) => Some(spi),
+        _ => None,
+    }
+}
+
 fn kf_get_provider(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = this_arg(args)?;
+    // A provider the caller named at `getInstance` wins over the algorithm-keyed
+    // guess below — see `provider_chain::record_requested_provider`.
+    if let Some(p) = crate::jca::provider_chain::recorded_requested_provider(ctx, this) {
+        return Ok(Some(Value::Object(Some(p))));
+    }
     let base = synthetic_base_offset(ctx, "java/security/KeyFactory");
     let algo =
         get_kf_algo(ctx, this).unwrap_or_else(|| match ctx.get_field(this, base + KF_OFF_ALGO) {
@@ -2261,6 +2340,10 @@ fn default_key_strength(algo: i32) -> i32 {
 /// logs, audits or branches on the selected provider saw nothing at all.
 fn kpg_get_provider(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = this_arg(args)?;
+    // A provider named at `getInstance` wins — see `kf_get_provider`.
+    if let Some(p) = crate::jca::provider_chain::recorded_requested_provider(ctx, this) {
+        return Ok(Some(Value::Object(Some(p))));
+    }
     let name = get_kpg_name(ctx, this)
         .as_deref()
         .and_then(kpg_provider_name)
@@ -2274,26 +2357,84 @@ fn kpg_get_provider(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
 
 fn kpg_get_instance(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let alg = read_string(ctx, args, 0);
-    let idx = algo_idx(&alg);
     // Resolve the requested provider BEFORE allocating the synthetic (the
     // Provider.getName() invoke can trigger GC, which would relocate the KPG and
     // desync its raw-ObjectRef side-table entries).
     let provider_name = requested_provider_name(ctx, args);
+    // An OID (or any other `Alg.Alias.KeyPairGenerator.*` spelling) resolves to
+    // the provider's primary name first. `kpg_serviceable` below consults the
+    // provider chain, which ALREADY resolves aliases — so the gate admitted
+    // `getInstance("1.2.840.10045.2.1", "BC")` and `algo_idx` then answered -1
+    // for it, producing a generator with no algorithm that reported provider
+    // `SUN` and could only fail at `generateKeyPair`.
+    let alg = crate::jca::provider_chain::canonical_if_unrecognised(
+        (!provider_name.is_empty()).then_some(provider_name.as_str()),
+        "KeyPairGenerator",
+        &alg,
+        &|n| algo_idx(n) >= 0,
+    )
+    .unwrap_or(alg);
+    let idx = algo_idx(&alg);
 
-    // BC-FIPS registers EC keypair generators through its Provider-owned
-    // EngineCreator map. Return that real KeyPairGenerator object directly so
-    // initialize()/generateKeyPair() run BC-FIPS bytecode instead of falling
-    // through to the SunEC shortcut used for default EC.
-    if idx == ALGO_EC && is_bc_fips_provider(&provider_name) {
-        if let Some(result) =
-            super::provider_chain::build_jca_impl(ctx, &provider_name, "KeyPairGenerator", &alg)
-        {
-            return result;
+    // A caller that NAMES a third-party provider gets THAT provider's
+    // generator, whose SPI class is itself a `java.security.KeyPairGenerator` —
+    // which is exactly the object HotSpot's `getInstance(alg, "BC")` returns
+    // (measured: `org.bouncycastle.jcajce.provider.asymmetric.ec
+    // .KeyPairGeneratorSpi$EC`, where this VM returned a bare
+    // `java.security.KeyPairGenerator`).
+    //
+    // This was previously scoped to BC-FIPS and to `EC` alone, on the reasoning
+    // that our own generators serve everything else. They serve it with the
+    // WRONG PROVIDER'S KEYS, and that is not a cosmetic difference: bc-java's
+    // `cert.plants` suite asks BC for an `ML-DSA-44` keypair, gets a
+    // `sun.security.provider` key from this VM's PQC route, and BC's own
+    // `mldsa.SignatureSpi.signInit` then refuses it —
+    // `InvalidKeyException: unknown private key passed to ML-DSA`. A key is only
+    // usable by the provider family that minted it, which is the whole reason
+    // the caller named a provider.
+    //
+    // Anonymous `getInstance(alg)` is routed here ONLY where this VM's own
+    // generators cannot serve the name at all — which is chain order, since
+    // every provider that precedes a third-party one on the chain is a JDK
+    // provider this crate services natively. So the anonymous answer for RSA/EC
+    // is unchanged, and `MLDSA44-RSA2048-PKCS15-SHA256` (BouncyCastle's
+    // composite-signature family, in bc-java's `cert.cmp` suite) resolves
+    // instead of raising `NoSuchAlgorithmException` against a provider that
+    // registers it.
+    let anonymous_needs_provider = provider_name.is_empty() && !kpg_can_generate(&alg);
+    if !provider_name.is_empty() || anonymous_needs_provider {
+        let chain_provider = if provider_name.is_empty() {
+            super::provider_chain::find_service_provider("KeyPairGenerator", &alg)
+        } else {
+            Some(provider_name.clone())
+        };
+        if let Some(engine) = match chain_provider.as_deref() {
+            Some(p) => super::provider_chain::build_third_party_engine(
+                ctx,
+                p,
+                "KeyPairGenerator",
+                &alg,
+                "java/security/KeyPairGenerator",
+            )?,
+            None => None,
+        } {
+            return Ok(Some(Value::Object(Some(engine))));
         }
-        return Err(throw_no_such_algorithm(
-            ctx,
-            &format!("no KeyPairGenerator {alg} implementation for provider {provider_name}"),
-        ));
+        if is_bc_fips_provider(&provider_name) && idx == ALGO_EC {
+            // BC-FIPS reaches its generators through a Provider-owned
+            // `EngineCreator` whose registered `className` is a non-loadable
+            // label, so the shape check above can decline where the engine is
+            // genuinely available. Keep its original direct route.
+            if let Some(result) =
+                super::provider_chain::build_jca_impl(ctx, &provider_name, "KeyPairGenerator", &alg)
+            {
+                return result;
+            }
+            return Err(throw_no_such_algorithm(
+                ctx,
+                &format!("no KeyPairGenerator {alg} implementation for provider {provider_name}"),
+            ));
+        }
     }
 
     // JCA contract: `getInstance` is the SELECTION step, and callers use its
@@ -2354,11 +2495,70 @@ fn kpg_get_instance(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     ctx.set_field(kpg, base + KPG_OFF_ALGO, Value::Int(idx));
     ctx.set_field(kpg, base + KPG_OFF_KEYSIZE, Value::Int(default_bits));
     ctx.set_field(kpg, base + KPG_OFF_STATE, Value::Int(0));
+    // See `kf_get_instance` — a named provider is the answer `getProvider()`
+    // owes the caller, not the JDK provider the algorithm alone implies.
+    if !provider_name.is_empty() {
+        crate::jca::provider_chain::record_requested_provider(ctx, kpg, &provider_name);
+    }
     Ok(Some(Value::Object(Some(kpg))))
+}
+
+/// Did THIS crate build this `KeyPairGenerator`, or did a provider?
+///
+/// `kpg_get_instance` allocates a synthetic whose runtime class is exactly
+/// `java.security.KeyPairGenerator`; a provider's own generator is a SUBCLASS of
+/// it (BouncyCastle's `KeyPairGeneratorSpi$EC`, and every other provider's, since
+/// `KeyPairGeneratorSpi` is that class's own superclass surface). So the exact
+/// class name is the discriminator.
+///
+/// This matters because native dispatch resolves against the DECLARING class of
+/// the method that virtual dispatch selected. A provider subclass overrides
+/// `initialize(int, SecureRandom)`, `initialize(AlgorithmParameterSpec,
+/// SecureRandom)` and `generateKeyPair()` — so those reach the provider — but it
+/// does NOT override the convenience forms `initialize(int)`,
+/// `initialize(AlgorithmParameterSpec)` and `genKeyPair()`, which are concrete on
+/// `java.security.KeyPairGenerator` and therefore hit the natives registered
+/// here. Measured with `KpgProbe.java` before this guard existed:
+/// `getInstance("EC", "BC").initialize(256)` recorded a key size in THIS crate's
+/// side table, the BouncyCastle generator was never initialised at all, and
+/// `generateKeyPair()` raised `NullPointerException: … because "this.engine" is
+/// null`; `initialize(new ECGenParameterSpec("P-256"))` raised
+/// `InvalidParameterException: unknown key size`. Only the two-argument form,
+/// which the subclass overrides, worked.
+///
+/// The convenience forms are re-implemented here exactly as the JDK does: hand
+/// the call to the two-argument overload, which virtual dispatch then delivers
+/// to the provider.
+fn kpg_receiver_is_ours(ctx: &dyn NativeContext, this: ObjectRef) -> bool {
+    match ctx.class_name_of_id(ctx.class_id_of_object(this)) {
+        Some(name) => name == "java/security/KeyPairGenerator",
+        // Unknown class: treat as ours, which is the pre-existing behaviour and
+        // keeps a class-lookup failure from silently disabling this engine.
+        None => true,
+    }
+}
+
+/// A `SecureRandom` to pass to a provider's two-argument `initialize`, matching
+/// the JDK's own `initialize(keysize)` body (`JCAUtil.getSecureRandom()`).
+fn kpg_default_random(ctx: &mut dyn NativeContext) -> Value {
+    match ctx.new_object_initialized("java/security/SecureRandom", "()V", &[]) {
+        Ok(Some(v @ Value::Object(Some(_)))) => v,
+        _ => Value::Object(None),
+    }
 }
 
 fn kpg_initialize_int(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = this_arg(args)?;
+    if !kpg_receiver_is_ours(ctx, this) {
+        let bits = args.get(1).copied().unwrap_or(Value::Int(0));
+        let random = kpg_default_random(ctx);
+        return ctx.invoke_virtual(
+            this,
+            "initialize",
+            "(ILjava/security/SecureRandom;)V",
+            &[bits, random],
+        );
+    }
     let base = synthetic_base_offset(ctx, "java/security/KeyPairGenerator");
     let bits = match args.get(1) {
         Some(Value::Int(n)) => *n,
@@ -2385,6 +2585,19 @@ fn kpg_initialize_int(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
 }
 
 fn kpg_initialize_int_random(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    // A provider's generator overrides this overload, so reaching here with a
+    // provider receiver means it did not — refuse rather than fall into
+    // `kpg_initialize_int`, whose non-ours arm forwards to THIS descriptor and
+    // would recurse forever.
+    let this = this_arg(args)?;
+    if !kpg_receiver_is_ours(ctx, this) {
+        return Err(RuntimeError::UnsupportedOperationException {
+            message: "KeyPairGenerator.initialize(int, SecureRandom) is not implemented by this \
+                      provider's generator"
+                .to_string(),
+        }
+        .into());
+    }
     kpg_initialize_int(ctx, args)
 }
 
@@ -2393,6 +2606,17 @@ fn kpg_initialize_spec(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     // from the previous value / the default. For EC, stash the spec so the real
     // keygen drive (`drive_real_ec_keypair`) honours the requested curve.
     let this = this_arg(args)?;
+    // See `kpg_receiver_is_ours`.
+    if !kpg_receiver_is_ours(ctx, this) {
+        let spec = args.get(1).copied().unwrap_or(Value::Object(None));
+        let random = kpg_default_random(ctx);
+        return ctx.invoke_virtual(
+            this,
+            "initialize",
+            "(Ljava/security/spec/AlgorithmParameterSpec;Ljava/security/SecureRandom;)V",
+            &[spec, random],
+        );
+    }
     let base = synthetic_base_offset(ctx, "java/security/KeyPairGenerator");
     let cur = get_kpg_keysize(ctx, this).unwrap_or_else(|| {
         match ctx.get_field(this, base + KPG_OFF_KEYSIZE) {
@@ -2427,11 +2651,29 @@ fn kpg_initialize_spec(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
 }
 
 fn kpg_initialize_spec_random(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    // Same recursion guard as `kpg_initialize_int_random`.
+    let this = this_arg(args)?;
+    if !kpg_receiver_is_ours(ctx, this) {
+        return Err(RuntimeError::UnsupportedOperationException {
+            message: "KeyPairGenerator.initialize(AlgorithmParameterSpec, SecureRandom) is not \
+                      implemented by this provider's generator"
+                .to_string(),
+        }
+        .into());
+    }
     kpg_initialize_spec(ctx, args)
 }
 
 fn kpg_generate_key_pair(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = this_arg(args)?;
+    // Registered for BOTH `generateKeyPair()` and `genKeyPair()`. A provider
+    // subclass overrides the former, so only the latter — concrete on
+    // `java.security.KeyPairGenerator`, body `return generateKeyPair();` —
+    // reaches this native for a provider's receiver. Reproduce that body; the
+    // virtual dispatch lands on the provider's override, not back here.
+    if !kpg_receiver_is_ours(ctx, this) {
+        return ctx.invoke_virtual(this, "generateKeyPair", "()Ljava/security/KeyPair;", &[]);
+    }
     let base = synthetic_base_offset(ctx, "java/security/KeyPairGenerator");
     // SigProbe fix: prefer the side-table read (survives real-JDK class
     // layouts where slot 0 collides with an inherited Object field).
@@ -2610,6 +2852,21 @@ fn kpg_generate_key_pair(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
 
 fn kpg_get_algorithm(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = this_arg(args)?;
+    // `getAlgorithm()` is FINAL on `KeyPairGenerator`, so this native also runs
+    // for a third-party provider's own generator subclass — a receiver that has
+    // no entry in the side table below and answered `Unknown` for it. The real
+    // `algorithm` field is what the JDK's own accessor reads, and
+    // `build_third_party_engine` writes it, so read it first.
+    if let Value::Object(Some(s)) = ctx.get_field_by_name(this, "algorithm") {
+        if ctx
+            .class_name_of_id(ctx.class_id_of_object(s))
+            .is_some_and(|n| n == "java/lang/String")
+        {
+            if ctx.read_string(s).is_some_and(|t| !t.is_empty()) {
+                return Ok(Some(Value::Object(Some(s))));
+            }
+        }
+    }
     let base = synthetic_base_offset(ctx, "java/security/KeyPairGenerator");
     let idx = match ctx.get_field(this, base + KPG_OFF_ALGO) {
         Value::Int(i) => i,
@@ -2643,6 +2900,51 @@ fn kf_get_instance(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
         &alg,
         crate::jca::provider_chain::ProviderArgWording::Shared,
     )?;
+    // An `Alg.Alias.KeyFactory.<name>` spelling — every X.509/PKCS caller names
+    // the algorithm by OID — resolves to the provider's primary service name
+    // before this engine's own table is consulted. `check_provider_ownership`
+    // above ALREADY resolves it (it goes through `get_service_entry`), so the
+    // ownership gate passed and `kf_algo_idx` then refused the same name: the
+    // two halves of one lookup disagreed. See
+    // `provider_chain::canonical_service_algorithm`.
+    let requested_provider = crate::jca::provider_chain::provider_arg_name(ctx, args, 1);
+    // The caller's OWN spelling, kept for `getAlgorithm()` — HotSpot echoes it
+    // verbatim, OID and all, rather than the name it resolved to.
+    let requested_alg = alg.clone();
+    let alg = crate::jca::provider_chain::canonical_if_unrecognised(
+        requested_provider.as_deref(),
+        "KeyFactory",
+        &alg,
+        &|n| kf_algo_idx(n) >= 0,
+    )
+    .unwrap_or(alg);
+    // A named third-party provider's own `KeyFactorySpi`, wrapped in a genuine
+    // `java.security.KeyFactory` — see `kf_delegate_spi` and
+    // `provider_chain::build_real_key_factory`. Same reasoning as the
+    // `KeyPairGenerator` route: the caller named the provider because it needs
+    // that provider's key objects, and this VM's own factories cannot mint them.
+    //
+    // The anonymous overload takes this route ONLY where this VM's own factory
+    // cannot serve the name — chain order, since every provider ahead of a
+    // third-party one is a JDK provider this crate services natively. `ECDSA`
+    // is the case that needs it: SunEC registers no `KeyFactory.ECDSA` (HotSpot
+    // refuses it too), BouncyCastle does, and bc-java's `eac` suite asks for it
+    // without naming a provider.
+    let kf_provider = requested_provider.clone().or_else(|| {
+        (kf_algo_idx(&alg) < 0)
+            .then(|| crate::jca::provider_chain::find_service_provider("KeyFactory", &alg))
+            .flatten()
+    });
+    if let Some(provider) = kf_provider.as_deref() {
+        if let Some(kf) = crate::jca::provider_chain::build_real_key_factory(
+            ctx,
+            provider,
+            &requested_alg,
+            &alg,
+        )? {
+            return Ok(Some(Value::Object(Some(kf))));
+        }
+    }
     let idx = kf_algo_idx(&alg);
     // `KeyFactory.getInstance` must reject an unrecognised name. In
     // particular, `X509Key.buildX509Key` deliberately catches
@@ -2661,6 +2963,16 @@ fn kf_get_instance(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
     let kf = try_alloc_concurrent_synthetic(ctx, "java/security/KeyFactory", base + KF_PRIVATE_SLOTS)?;
     set_kf_algo(ctx, kf, idx);
     ctx.set_field(kf, base + KF_OFF_ALGO, Value::Int(idx));
+    // `getAlgorithm()` echoes what the caller typed — see `kf_get_algorithm`.
+    let requested_alg_str = ctx.create_string(&requested_alg);
+    ctx.set_field_by_name(kf, "algorithm", Value::Object(Some(requested_alg_str)));
+    // Attribution: a caller who NAMED a provider gets that provider back from
+    // `getProvider()`, not the JDK provider `kf_provider_name` would have picked
+    // from the algorithm alone (which answered `SunEC` for
+    // `getInstance("EC", "BC")` — HotSpot answers `BC`).
+    if let Some(provider) = requested_provider.as_deref() {
+        crate::jca::provider_chain::record_requested_provider(ctx, kf, provider);
+    }
     Ok(Some(Value::Object(Some(kf))))
 }
 
@@ -2674,6 +2986,17 @@ fn kf_get_instance(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
 /// verify (no-synthetic-stubs policy).
 fn kf_generate_public(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = this_arg(args)?;
+    // A third-party provider's factory generates its own keys — see
+    // `kf_delegate_spi`.
+    if let Some(spi) = kf_delegate_spi(ctx, this) {
+        let spec = args.get(1).copied().unwrap_or(Value::Object(None));
+        return ctx.invoke_virtual(
+            spi,
+            "engineGeneratePublic",
+            "(Ljava/security/spec/KeySpec;)Ljava/security/PublicKey;",
+            &[spec],
+        );
+    }
     let base = synthetic_base_offset(ctx, "java/security/KeyFactory");
     let algo =
         get_kf_algo(ctx, this).unwrap_or_else(|| match ctx.get_field(this, base + KF_OFF_ALGO) {
@@ -2950,6 +3273,16 @@ fn kf_generate_public(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
 /// rather than returning that unusable synthetic key (no-synthetic-stubs).
 fn kf_generate_private(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = this_arg(args)?;
+    // See `kf_generate_public`.
+    if let Some(spi) = kf_delegate_spi(ctx, this) {
+        let spec = args.get(1).copied().unwrap_or(Value::Object(None));
+        return ctx.invoke_virtual(
+            spi,
+            "engineGeneratePrivate",
+            "(Ljava/security/spec/KeySpec;)Ljava/security/PrivateKey;",
+            &[spec],
+        );
+    }
     let base = synthetic_base_offset(ctx, "java/security/KeyFactory");
     let algo =
         get_kf_algo(ctx, this).unwrap_or_else(|| match ctx.get_field(this, base + KF_OFF_ALGO) {
@@ -3192,6 +3525,20 @@ fn rsa_pkcs1_to_pkcs8(pkcs1: &[u8]) -> Vec<u8> {
 
 fn kf_get_algorithm(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = this_arg(args)?;
+    // `getAlgorithm()` echoes the name the CALLER asked `getInstance` for, not
+    // the canonical service name it resolved to — measured on HotSpot 25, where
+    // `KeyFactory.getInstance("1.2.840.10045.2.1", "BC").getAlgorithm()`
+    // answers the OID, not "EC". The real `algorithm` field carries that
+    // spelling for every factory this crate now builds; the index-derived name
+    // below is the fallback for a receiver that predates it.
+    if let Value::Object(Some(s)) = ctx.get_field_by_name(this, "algorithm") {
+        if ctx
+            .class_name_of_id(ctx.class_id_of_object(s))
+            .is_some_and(|n| n == "java/lang/String")
+        {
+            return Ok(Some(Value::Object(Some(s))));
+        }
+    }
     let base = synthetic_base_offset(ctx, "java/security/KeyFactory");
     let idx = match ctx.get_field(this, base + KF_OFF_ALGO) {
         Value::Int(i) => i,
@@ -3220,6 +3567,16 @@ fn kf_get_algorithm(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
 /// a same-algorithm key passes through unchanged; a mismatched one throws.
 fn kf_translate_key(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = this_arg(args)?;
+    // See `kf_generate_public`.
+    if let Some(spi) = kf_delegate_spi(ctx, this) {
+        let key = args.get(1).copied().unwrap_or(Value::Object(None));
+        return ctx.invoke_virtual(
+            spi,
+            "engineTranslateKey",
+            "(Ljava/security/Key;)Ljava/security/Key;",
+            &[key],
+        );
+    }
     let key = match args.get(1) {
         Some(Value::Object(Some(o))) => *o,
         _ => {
@@ -3277,6 +3634,20 @@ fn kf_translate_key(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
 /// `InvalidKeySpecException`, exactly as a real provider would for an
 /// unsupported spec class.
 fn kf_get_key_spec(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    // See `kf_generate_public`. This native reads no receiver state otherwise,
+    // which is why `this` is fetched only here.
+    if let Ok(this) = this_arg(args) {
+        if let Some(spi) = kf_delegate_spi(ctx, this) {
+            let key = args.get(1).copied().unwrap_or(Value::Object(None));
+            let cls = args.get(2).copied().unwrap_or(Value::Object(None));
+            return ctx.invoke_virtual(
+                spi,
+                "engineGetKeySpec",
+                "(Ljava/security/Key;Ljava/lang/Class;)Ljava/security/spec/KeySpec;",
+                &[key, cls],
+            );
+        }
+    }
     let key = match args.get(1) {
         Some(Value::Object(Some(o))) => *o,
         _ => return Err(throw_invalid_key_spec(ctx, "Key must not be null")),

@@ -1,19 +1,48 @@
 # bc-java: two `java.security.Provider`/JCA framework defects explain most of the suite's FAILs
 
 ## Status
-**OPEN, confirmed CratonVM-specific, root-caused with a minimal repro** — found
-2026-08-16 running bc-java's Gradle-built `AllTests` suites under CratonVM on
-Azure (`azureuser@20.80.105.49`), differential-verified against real HotSpot
-JDK 25 (same classpath, same `BouncyCastleProvider`, same probe).
+**FIXED 2026-08-16** on `fix/bcjava-jca-alias-20260816`. All four bugs below are
+closed and pinned by `BcJcaProbe2.java` / `SicProbe.java` / `KpgProbe.java`,
+each run against real HotSpot JDK 25 on the same classpath. The original
+diagnosis is kept verbatim below because three quarters of it were right; the
+one place it was wrong is marked in Bug C.
 
-This one finding explains the overwhelming majority of the 24 `AllTests`
-class failures in this sweep — `cert.c509`, `cert.cmp`, `cert.ocsp`, `cms`,
-`eac`, `its`, `openssl`, `pkcs`, `pkix`, `tsp`, `jcajce.provider`, and more —
-every one of them constructs a JCA engine (`KeyFactory`, `KeyPairGenerator`,
-`SecretKeyFactory`, `Cipher`, `Mac`, `Signature`, `AlgorithmParameters`) by an
-OID string or an algorithm alias name registered against `BouncyCastleProvider`
-("BC"), which is the standard way X.509/PKCS/CMS/TSP code identifies an
-algorithm.
+**What the fix was.** Every JCA engine this VM intercepts natively now (a)
+resolves the requested provider's `Alg.Alias.<Engine>.<name>` rows before its own
+name table is consulted, (b) answers `getProvider()` / `toString()` with the
+provider the caller NAMED, and (c) hands the work to that provider's own SPI
+rather than servicing it here. `sun.security.jca.GetInstance`'s "no such
+service" path raises `NoSuchAlgorithmException` instead of a VM-fatal
+`RuntimeError::NotImplemented`.
+
+Landed in `native-builtins/src/jca/{provider_chain,key_factory,message_digest,
+cipher,key_agreement}.rs`, `phases_early.rs`, `phases_late/{ssl_security,
+bouncycastle}.rs`.
+
+**Measured**: `BcJcaProbe2` — 34 probe rows, every one now identical to HotSpot
+25 (they were 9 outright failures, 6 wrong-provider answers and one process kill
+before). `SicProbe` — identical to HotSpot on both IV shapes. `KpgProbe` —
+identical key classes to HotSpot on all seven generator rows. The bc-java
+`AllTests` sweep went from **24 class failures to the set recorded in**
+`docs/known-issues/bc-java/bug-bcjava-residual-suite-failures-20260816.md`, which
+is where everything this page did NOT cover now lives (and which also records
+that HotSpot itself fails 2 of the original 24 on this harness).
+
+**Two traps found while fixing it, both worth knowing:**
+
+* Returning a provider's own engine object is not enough. This VM's natives on
+  `java/security/KeyPairGenerator` still shadowed the CONVENIENCE overloads a
+  provider subclass does not override — `initialize(int)`,
+  `initialize(AlgorithmParameterSpec)`, `genKeyPair()` — so
+  `getInstance("EC","BC").initialize(256)` recorded a key size in OUR side table
+  and BouncyCastle's generator was never initialised. `getClass()` was right and
+  the object was inert. Every native on such a class needs an "is this receiver
+  ours" guard.
+* Handing back BouncyCastle's own keys then broke the OTHER direction: an
+  anonymous `Signature.getInstance("SHA256withRSA")` refused a
+  `BCRSAPrivateCrtKey` with "Missing key encoding" where HotSpot signs with it.
+  This VM's native signature engine now imports any key that exposes the
+  standard `java.security.interfaces.RSA*Key` accessors.
 
 ## Minimal repro
 `BcProviderProbe.java` — construct `BouncyCastleProvider`, register it, then
@@ -201,6 +230,27 @@ certainly implements via the normal SPI path), CratonVM throws a hard "not
 implemented" runtime error instead of falling back to the real, registered
 SPI — even though `bc.get("KeyGenerator.LEAWRAP")`-style lookups (per Bug
 A/B above) prove the registration data is sitting right there.
+
+**The diagnosis above is WRONG, and the measurement that shows it is one grep.**
+`LEAWRAP` is not an algorithm CratonVM failed to implement — bc-java's
+`LEATest.testUnregisteredKeyGeneratorAliases` asks for it *expecting to be
+refused*:
+
+```java
+try { KeyGenerator.getInstance("LEAWRAP", BC); fail("LEAWRAP should not be registered"); }
+catch (NoSuchAlgorithmException expected) { }
+```
+
+`bc.getService("KeyGenerator","LEAWRAP")` returns null on HotSpot too. The
+defect was entirely in HOW the refusal was delivered:
+`getinstance_get_service_provider` raised `RuntimeError::NotImplemented`, which
+is VM-fatal and unwinds past every `catch`, so a test asserting the negative
+killed the whole `jcajce.provider.test.AllTests` process. It now raises
+`NoSuchAlgorithmException("no such algorithm: LEAWRAP for provider BC")` —
+HotSpot's own wording, measured. The `JceSecurity` warning line quoted above is
+unrelated to the failure and is still emitted.
+
+The paragraph below is kept as written for the record.
 
 This is the same underlying theme as Bugs A and B — CratonVM's JCA layer
 doesn't fully respect a third-party `Provider`'s own registrations — reached

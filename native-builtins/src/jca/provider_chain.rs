@@ -1072,16 +1072,368 @@ fn normalize_algo(s: &str) -> String {
 fn get_service_entry(provider: &str, type_str: &str, algo: &str) -> Option<ServiceEntry> {
     let type_n = normalize_engine(type_str);
     let algo_n = normalize_algo(algo);
-    // Resolve alias first.
+    // Resolve alias first. The alias table stores the canonical name in the
+    // provider's OWN spelling (`Alg.Alias.KeyFactory.<oid> = EC` records "EC",
+    // `Alg.Alias.KeyFactory.DH = DiffieHellman` records "DiffieHellman"), so the
+    // service-map key has to be re-normalised here rather than at insertion —
+    // the raw spelling is what `canonical_service_algorithm` hands to the native
+    // engines, which is the only form a caller-facing `getAlgorithm()` may echo.
     let canonical = aliases()
         .lock()
         .get(&(provider.to_string(), type_n.clone(), algo_n.clone()))
-        .cloned()
+        .map(|c| normalize_algo(c))
         .unwrap_or(algo_n);
     services()
         .lock()
         .get(provider)
         .and_then(|m| m.get(&(type_n, canonical)).cloned())
+}
+
+/// The canonical service name a provider's `Alg.Alias.<Type>.<name>` row maps
+/// `algo` onto, in that provider's own spelling — `None` when `algo` is already
+/// a primary name, or when no alias row covers it.
+///
+/// `provider` `None` searches the chain in order, mirroring the anonymous
+/// `getInstance` walk.
+///
+/// This exists because the engines that intercept `getInstance` natively —
+/// `KeyFactory`, `KeyPairGenerator`, `MessageDigest`, `Mac`, `SecretKeyFactory`,
+/// `AlgorithmParameters` — gate on a hand-written name table and never consult a
+/// registry, so an alias spelling that `Provider.getService` resolves perfectly
+/// well was refused one layer up. Every X.509/PKCS/CMS caller names algorithms
+/// by OID, and an OID is exactly an `Alg.Alias` row: `KeyFactory.getInstance(
+/// "1.2.840.10045.2.1", "BC")` raised `NoSuchAlgorithmException` while
+/// `bc.get("Alg.Alias.KeyFactory.1.2.840.10045.2.1")` answered `"EC"` on the
+/// same VM, in the same process, from the table this reads.
+pub(crate) fn canonical_service_algorithm(
+    provider: Option<&str>,
+    type_str: &str,
+    algo: &str,
+) -> Option<String> {
+    let type_n = normalize_engine(type_str);
+    let algo_n = normalize_algo(algo);
+    let table = aliases().lock();
+    let lookup = |name: &str| -> Option<String> {
+        table
+            .get(&(name.to_string(), type_n.clone(), algo_n.clone()))
+            .cloned()
+    };
+    match provider {
+        Some(p) => lookup(p),
+        None => {
+            drop(table);
+            let names = snapshot();
+            let table = aliases().lock();
+            names.into_iter().find_map(|(name, _, _)| {
+                table
+                    .get(&(name, type_n.clone(), algo_n.clone()))
+                    .cloned()
+            })
+        }
+    }
+}
+
+/// `algo` rewritten to the canonical name a native engine recognises, or `None`
+/// when no rewrite helps.
+///
+/// `recognised` is the engine's own gate — the very predicate whose refusal sent
+/// us here. Both halves are tested: a caller spelling the engine already knows
+/// is returned unchanged (`None`), and a canonical form the engine STILL does
+/// not know is not substituted either, so the caller's original name is what
+/// appears in the refusal message instead of a resolved one it never typed.
+pub(crate) fn canonical_if_unrecognised(
+    provider: Option<&str>,
+    type_str: &str,
+    algo: &str,
+    recognised: &dyn Fn(&str) -> bool,
+) -> Option<String> {
+    if recognised(algo) {
+        return None;
+    }
+    let canonical = canonical_service_algorithm(provider, type_str, algo)?;
+    recognised(&canonical).then_some(canonical)
+}
+
+/// The provider name a `getInstance(algorithm, X)` overload's argument `idx`
+/// names — the string itself for the `(String, String)` form, the provider's own
+/// `getName()` for the `(String, Provider)` form, and `None` for the anonymous
+/// single-argument form.
+pub(crate) fn provider_arg_name(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+    idx: usize,
+) -> Option<String> {
+    let Some(Value::Object(Some(obj))) = args.get(idx) else {
+        return None;
+    };
+    let is_string = ctx
+        .class_name_of_id(ctx.class_id_of_object(*obj))
+        .is_some_and(|n| n == "java/lang/String");
+    let name = if is_string {
+        ctx.read_string(*obj).unwrap_or_default()
+    } else {
+        provider_name_of(ctx, *obj)
+    };
+    if name.is_empty() || name == "<unknown>" {
+        None
+    } else {
+        Some(name)
+    }
+}
+
+/// Record the provider a caller explicitly named onto the engine object's own
+/// real `provider` field, so `getProvider()` and the real JDK `toString()`
+/// bytecode both answer it.
+///
+/// The native engines build their answer from a name table keyed on the
+/// ALGORITHM (`kf_provider_name` and friends), which can only ever name the JDK
+/// provider that would have served it — so `KeyFactory.getInstance("EC", "BC")`
+/// reported `SunEC`, `Cipher.getInstance(t, "BC")` reported `SunJCE`, and
+/// `Cipher.toString()`/`MessageDigest.toString()`, which read this field
+/// directly, reported `(no provider)` because nothing ever wrote it. HotSpot
+/// answers `BC` for all four. Only ever called for an explicitly-named provider:
+/// the anonymous overload genuinely IS served by the JDK provider the name table
+/// names, and must keep answering it.
+pub(crate) fn record_requested_provider(
+    ctx: &mut dyn NativeContext,
+    engine_obj: ObjectRef,
+    provider: &str,
+) {
+    let Some((ver, coverage)) = find(provider).or_else(|| Some((25.0, USER_PROVIDER_COVERAGE)))
+    else {
+        return;
+    };
+    let pin = ctx.pin_native_root(engine_obj);
+    let prov_obj = make_provider(ctx, provider, ver, coverage);
+    let engine_obj = ctx.read_native_pin(pin, engine_obj);
+    ctx.unpin_native_roots(pin);
+    if let Ok(prov) = prov_obj {
+        ctx.set_field_by_name(engine_obj, "provider", Value::Object(Some(prov)));
+    }
+}
+
+/// The `Provider` recorded by [`record_requested_provider`], if any.
+pub(crate) fn recorded_requested_provider(
+    ctx: &mut dyn NativeContext,
+    engine_obj: ObjectRef,
+) -> Option<ObjectRef> {
+    match ctx.get_field_by_name(engine_obj, "provider") {
+        Value::Object(Some(p)) => Some(p),
+        _ => None,
+    }
+}
+
+/// Construct a THIRD-PARTY provider's own engine object for `(type_str, algo)`
+/// when its registered class is itself a `required_super` — the shape
+/// `KeyPairGenerator.getInstance` and `MessageDigest.getInstance` return
+/// directly on HotSpot, because those two engines' SPI base classes extend the
+/// engine class itself (`KeyPairGeneratorSpi` is `KeyPairGenerator`'s own
+/// superclass surface; BouncyCastle's `BCMessageDigest extends MessageDigest`).
+///
+/// `Ok(None)` = not this provider's, or its class is not of that shape, and the
+/// caller's own path stands. An `Err` means the provider owns the name and its
+/// class would not construct — reported rather than hidden behind our engine.
+///
+/// The returned object gets its `algorithm` and `provider` fields written, as
+/// `getInstance` does on HotSpot: those two accessors are `final` on the engine
+/// class, so they are served from here (or from this crate's natives reading
+/// these same fields) no matter what the provider's subclass overrides.
+/// The JDK's own `<Engine>$Delegate` wrapper for an engine class, as
+/// `(internal class name, `(Spi, String)` constructor descriptor)`.
+///
+/// Verified against JDK 25 with `javap -p`, not assumed: the ctor is
+/// package-private and its sibling `(GetInstance$Instance, Iterator, String)`
+/// overload is the one `getInstance` normally uses, so the two-argument form has
+/// to be named exactly.
+fn engine_delegate_shape(engine_class: &str) -> Option<(&'static str, &'static str)> {
+    match engine_class {
+        "java/security/KeyPairGenerator" => Some((
+            "java/security/KeyPairGenerator$Delegate",
+            "(Ljava/security/KeyPairGeneratorSpi;Ljava/lang/String;)V",
+        )),
+        _ => None,
+    }
+}
+
+pub(crate) fn build_third_party_engine(
+    ctx: &mut dyn NativeContext,
+    provider: &str,
+    type_str: &str,
+    algo: &str,
+    required_super: &str,
+) -> Result<Option<ObjectRef>, MethodCallFailed> {
+    if third_party_service_class(Some(provider), type_str, algo).is_none() {
+        return Ok(None);
+    }
+    let Some(impl_result) = build_jca_impl(ctx, provider, type_str, algo) else {
+        return Ok(None);
+    };
+    let engine = match impl_result? {
+        Some(Value::Object(Some(o))) => o,
+        _ => return Ok(None),
+    };
+    let Some(super_id) = ctx.class_id_by_name(required_super) else {
+        return Ok(None);
+    };
+    let engine = if ctx.is_subclass(ctx.class_id_of_object(engine), super_id) {
+        engine
+    } else {
+        // The provider registered a BARE SPI. HotSpot wraps one in the engine's
+        // package-private `Delegate`, and so do we — it is an ordinary JDK class
+        // with a `(Spi, String)` constructor, and building it is what makes the
+        // whole family reachable rather than only the providers whose SPI
+        // happens to extend the engine class.
+        //
+        // BouncyCastle's composite-signature generators are exactly this shape:
+        // `compositesignatures.KeyPairGeneratorSpi extends
+        // java.security.KeyPairGeneratorSpi`, where its `ec.KeyPairGeneratorSpi$EC`
+        // extends `java.security.KeyPairGenerator`. Declining here left
+        // `MLDSA44-RSA2048-PKCS15-SHA256` (bc-java's `cert.cmp` suite)
+        // unreachable while its sibling `EC` resolved.
+        let Some((delegate_class, delegate_desc)) = engine_delegate_shape(required_super) else {
+            return Ok(None);
+        };
+        let pin = ctx.pin_native_root(engine);
+        let algo_str = ctx.create_string(algo);
+        let spi = ctx.read_native_pin(pin, engine);
+        ctx.unpin_native_roots(pin);
+        match ctx.new_object_initialized(
+            delegate_class,
+            delegate_desc,
+            &[Value::Object(Some(spi)), Value::Object(Some(algo_str))],
+        ) {
+            Ok(Some(Value::Object(Some(o)))) => o,
+            // No Delegate on this JDK, or it would not construct. Leave the
+            // caller on its own path rather than handing back a wrong type.
+            _ => return Ok(None),
+        }
+    };
+    let pin = ctx.pin_native_root(engine);
+    let algo_str = ctx.create_string(algo);
+    let engine = ctx.read_native_pin(pin, engine);
+    ctx.unpin_native_roots(pin);
+    ctx.set_field_by_name(engine, "algorithm", Value::Object(Some(algo_str)));
+    record_requested_provider(ctx, engine, provider);
+    Ok(Some(engine))
+}
+
+/// A GENUINE `javax.crypto.SecretKeyFactory` wrapping `provider`'s own
+/// `SecretKeyFactorySpi` for `algo`, built through the JDK's own
+/// `(SecretKeyFactorySpi, Provider, String)` constructor — the same one
+/// `SecretKeyFactory.getInstance` uses.
+///
+/// `Ok(None)` means the provider registers nothing for the name; the caller's
+/// own refusal stands. `Err` means the provider owns the name but its class
+/// would not construct, which is a different fact and must not be hidden behind
+/// a fallback.
+///
+/// Building the REAL wrapper (rather than a synthetic with a delegation flag) is
+/// what makes `getKeySpec`/`translateKey` work: this crate intercepts neither,
+/// so they run ordinary JDK bytecode, which needs a properly-constructed
+/// receiver — `spi`, `algorithm`, `provider` and the inline-initialised `lock`
+/// all set by that constructor. The three natives this crate DOES register on
+/// the class recognise a receiver they did not build (`skf_receiver_is_ours`)
+/// and forward to its `spi`.
+pub(crate) fn build_real_secret_key_factory(
+    ctx: &mut dyn NativeContext,
+    provider: &str,
+    algo: &str,
+) -> Result<Option<ObjectRef>, MethodCallFailed> {
+    build_real_spi_wrapper(
+        ctx,
+        provider,
+        "SecretKeyFactory",
+        algo,
+        algo,
+        "javax/crypto/SecretKeyFactory",
+        "(Ljavax/crypto/SecretKeyFactorySpi;Ljava/security/Provider;Ljava/lang/String;)V",
+    )
+}
+
+/// The `KeyFactory` twin of [`build_real_secret_key_factory`], through
+/// `java.security.KeyFactory`'s own `(KeyFactorySpi, Provider, String)`
+/// constructor. `announce_algo` is the spelling `getAlgorithm()` will echo —
+/// the caller's, not the canonical one, which is what HotSpot does.
+pub(crate) fn build_real_key_factory(
+    ctx: &mut dyn NativeContext,
+    provider: &str,
+    announce_algo: &str,
+    algo: &str,
+) -> Result<Option<ObjectRef>, MethodCallFailed> {
+    build_real_spi_wrapper(
+        ctx,
+        provider,
+        "KeyFactory",
+        algo,
+        announce_algo,
+        "java/security/KeyFactory",
+        "(Ljava/security/KeyFactorySpi;Ljava/security/Provider;Ljava/lang/String;)V",
+    )
+}
+
+/// The `Mac` twin of [`build_real_key_factory`], through
+/// `javax.crypto.Mac`'s own `(MacSpi, Provider, String)` constructor.
+pub(crate) fn build_real_mac(
+    ctx: &mut dyn NativeContext,
+    provider: &str,
+    announce_algo: &str,
+    algo: &str,
+) -> Result<Option<ObjectRef>, MethodCallFailed> {
+    build_real_spi_wrapper(
+        ctx,
+        provider,
+        "Mac",
+        algo,
+        announce_algo,
+        "javax/crypto/Mac",
+        "(Ljavax/crypto/MacSpi;Ljava/security/Provider;Ljava/lang/String;)V",
+    )
+}
+
+/// Shared body: instantiate `provider`'s registered SPI class for
+/// `(type_str, algo)` and hand it to `engine_class`'s own
+/// `(Spi, Provider, String)` constructor.
+fn build_real_spi_wrapper(
+    ctx: &mut dyn NativeContext,
+    provider: &str,
+    type_str: &str,
+    algo: &str,
+    announce_algo: &str,
+    engine_class: &str,
+    ctor_desc: &str,
+) -> Result<Option<ObjectRef>, MethodCallFailed> {
+    if third_party_service_class(Some(provider), type_str, algo).is_none() {
+        return Ok(None);
+    }
+    let Some(impl_result) = build_jca_impl(ctx, provider, type_str, algo) else {
+        return Ok(None);
+    };
+    let spi = match impl_result? {
+        Some(Value::Object(Some(o))) => o,
+        _ => return Ok(None),
+    };
+    let spi_pin = ctx.pin_native_root(spi);
+    let (ver, coverage) = find(provider).unwrap_or((25.0, USER_PROVIDER_COVERAGE));
+    let prov_obj = make_provider(ctx, provider, ver, coverage)?;
+    let prov_pin = ctx.pin_native_root(prov_obj);
+    let algo_str = ctx.create_string(announce_algo);
+    let spi = ctx.read_native_pin(spi_pin, spi);
+    let prov_obj = ctx.read_native_pin(prov_pin, prov_obj);
+    ctx.unpin_native_roots(spi_pin);
+    ctx.unpin_native_roots(prov_pin);
+    let built = ctx.new_object_initialized(
+        engine_class,
+        ctor_desc,
+        &[
+            Value::Object(Some(spi)),
+            Value::Object(Some(prov_obj)),
+            Value::Object(Some(algo_str)),
+        ],
+    )?;
+    match built {
+        Some(Value::Object(Some(o))) => Ok(Some(o)),
+        _ => Ok(None),
+    }
 }
 
 /// Crack a legacy-style put key (e.g. `"Cipher.AES/GCM/NoPadding"`,
@@ -2120,13 +2472,20 @@ fn seed_xmldsig_services() {
 }
 
 /// Internal API: register an alias (Alg.Alias.<type>.<alias> → canonical).
+///
+/// The KEY is normalised (lookups are case-insensitive, per `Provider$ServiceKey`);
+/// the VALUE keeps the provider's own spelling. `get_service_entry` re-normalises
+/// it for the service-map lookup, and `canonical_service_algorithm` hands the raw
+/// form to the native engines — which is the form a caller-facing `getAlgorithm()`
+/// may echo, and the form `Alg.Alias.KeyFactory.DH = DiffieHellman` has to keep to
+/// stay a legible answer rather than `DIFFIEHELLMAN`.
 fn put_alias(provider: &str, type_str: &str, alias: &str, canonical: &str) {
     let type_n = normalize_engine(type_str);
     let alias_n = normalize_algo(alias);
-    let canon_n = normalize_algo(canonical);
-    aliases()
-        .lock()
-        .insert((provider.to_string(), type_n, alias_n), canon_n);
+    aliases().lock().insert(
+        (provider.to_string(), type_n, alias_n),
+        canonical.trim().to_string(),
+    );
 }
 
 /// Apply a single `put(key, value)` operation against the provider's
@@ -2718,12 +3077,21 @@ fn getinstance_get_service_provider(
     let provider = read_arg_string(ctx, args, 2);
     match resolve_service(ctx, &provider, &type_str, &algo)? {
         Some(svc) => Ok(Some(Value::Object(Some(svc)))),
-        None => Err(cratonvm_types::error::RuntimeError::NotImplemented {
-            feature: format!(
-                "no {type_str} {algo} implementation registered for provider {provider}"
-            ),
-        }
-        .into()),
+        // `RuntimeError::NotImplemented` is a VM-fatal error, not a Java
+        // exception: it unwinds past every `catch` and ends the process. But
+        // "this provider does not offer that algorithm" is an ORDINARY,
+        // EXPECTED outcome of the method being intercepted here —
+        // `GetInstance.getService` declares `NoSuchAlgorithmException` and
+        // throws exactly this wording ("no such algorithm: X for provider Y",
+        // measured on HotSpot 25). Callers routinely probe with it: bc-java's
+        // `LEATest.testUnregisteredKeyGeneratorAliases` asks for a
+        // deliberately-unregistered `KeyGenerator.LEAWRAP` and asserts the
+        // refusal, and on this VM that assertion killed the whole
+        // `jcajce.provider.test.AllTests` process instead of passing.
+        None => Err(throw_no_such_algorithm(
+            ctx,
+            &format!("no such algorithm: {algo} for provider {provider}"),
+        )),
     }
 }
 
@@ -2738,10 +3106,14 @@ fn getinstance_get_service_search(ctx: &mut dyn NativeContext, args: &[Value]) -
             return Ok(Some(Value::Object(Some(svc))));
         }
     }
-    Err(cratonvm_types::error::RuntimeError::NotImplemented {
-        feature: format!("no {type_str} {algo} implementation registered in any provider"),
-    }
-    .into())
+    // Same reasoning as the provider-qualified form above — a Java-level
+    // `NoSuchAlgorithmException`, not a VM-fatal `NotImplemented`. The
+    // no-provider form's wording differs on HotSpot ("<algorithm> <type> not
+    // available"), and callers do read it.
+    Err(throw_no_such_algorithm(
+        ctx,
+        &format!("{algo} {type_str} not available"),
+    ))
 }
 
 /// Resolve `(provider, type, algorithm)` to a real implementation class, build
@@ -3547,8 +3919,37 @@ pub(crate) fn try_build_real_certificate_factory(
     args: &[Value],
 ) -> Result<Option<ObjectRef>, MethodCallFailed> {
     let algo = read_arg_string(ctx, args, 0);
-    let Some(provider) = find_service_provider("CertificateFactory", &algo) else {
-        return Ok(None);
+    try_build_real_certificate_factory_for(ctx, None, &algo)
+}
+
+/// As above, but for a provider the caller NAMED.
+///
+/// `CertificateFactory.getInstance(type, providerName)` used to check that the
+/// provider EXISTS and then call the one-argument form, which walks the chain —
+/// so `getInstance("X.509", "BC")` handed back `SUN`'s factory. That is not
+/// cosmetic: the two implementations differ in what they can DO.
+/// `sun.security.provider.certpath.X509CertPath` supports the `PkiPath` and
+/// `PKCS7` encodings and BouncyCastle's also supports `PEM`, so bc-java's
+/// `CertPathTest` — which asks the factory it explicitly requested from BC for
+/// a PEM encoding — got `CertificateEncodingException: unsupported encoding`
+/// from a factory it never asked for.
+pub(crate) fn try_build_real_certificate_factory_for(
+    ctx: &mut dyn NativeContext,
+    requested_provider: Option<&str>,
+    algo: &str,
+) -> Result<Option<ObjectRef>, MethodCallFailed> {
+    let algo = algo.to_string();
+    let provider = match requested_provider {
+        Some(p) => {
+            if get_service_entry(p, "CertificateFactory", &algo).is_none() {
+                return Ok(None);
+            }
+            p.to_string()
+        }
+        None => match find_service_provider("CertificateFactory", &algo) {
+            Some(p) => p,
+            None => return Ok(None),
+        },
     };
     let impl_ref = match build_jca_impl(ctx, &provider, "CertificateFactory", &algo) {
         Some(Ok(Some(Value::Object(Some(o))))) => o,
