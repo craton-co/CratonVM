@@ -18,8 +18,11 @@ sweep found them, not because they share a cause.
 | run | of the 24 classes CratonVM failed on 2026-08-16 |
 |---|---|
 | CratonVM, pristine `dev` | 24 FAIL |
-| CratonVM, after the JCA fixes | **6 PASS, 15 FAIL** (`c509`, `cert.path`, `cert.ocsp`, `cert.plants`, `mozilla`, `operator`) |
+| CratonVM, after the JCA fixes | **7 PASS, 16 FAIL, 1 HANG** |
 | **HotSpot 25, same harness** | 22 PASS, 2 FAIL |
+
+The seven that now pass: `cert.c509`, `cert.ocsp`, `cert.path`, `cert.plants`,
+`mozilla`, `operator`, `test`.
 
 The two HotSpot also fails are not VM defects: `openssl.test` is an
 `OutOfMemoryError` inside `SCrypt.SMix` at `-Xmx 1g`, and `pkix.test` is
@@ -49,6 +52,17 @@ MODE=hotspot OUTDIR=/data/<out-hs> bash /data/bcjca-run.sh /data/bcjava-fail-lis
 
 Run with the JIT on. `--nojit` costs about 15× here (`cms.test`: 116 s with the
 JIT, over 1500 s without), which turns ordinary slowness into HANG rows.
+
+## Residual 0 — `pqc.jcajce.provider` is now too SLOW, not broken
+
+It failed in 3 s before, on `ClassCastException: sun.security.pkcs.NamedPKCS8Key
+cannot be cast to org.bouncycastle.jcajce.interfaces.MLDSAPrivateKey` — this VM
+minting a JDK key for a caller who asked BouncyCastle. That is fixed, so the
+class now runs its real body: ML-KEM/ML-DSA in BouncyCastle's pure Java instead
+of the JDK's own SPI. It exceeds a 1500 s budget where HotSpot takes 271 s.
+This is the one place where honouring the requested provider costs real time,
+and it is the shape to watch for elsewhere: a class that "regressed" from FAIL
+to HANG has usually started doing the work it was skipping.
 
 ## Residual A — the CMS/PKCS cipher-stream family
 
