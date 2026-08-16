@@ -780,10 +780,30 @@ impl CompactValue {
     /// Create a CompactValue holding a 64-bit double.
     ///
     /// If the bit pattern of `v` collides with our NaN-tagged encoding space,
-    /// it is replaced with the canonical quiet NaN.  This is lossless for all
-    /// non-NaN doubles and for the standard quiet NaN; only exotic NaN payloads
-    /// that happen to set our marker bits are canonicalized (Java mandates a
-    /// single NaN anyway).
+    /// it is replaced with the canonical quiet NaN. This is lossless for all
+    /// non-NaN doubles and for the standard quiet NaN.
+    ///
+    /// It is NOT lossless for every NaN, and the parenthetical that used to
+    /// stand here — "Java mandates a single NaN anyway" — is false.
+    /// `Double.doubleToLongBits` canonicalizes by specification, but
+    /// `doubleToRawLongBits` exists precisely so a program can observe the
+    /// payload it was handed, and HotSpot carries payloads through `f2d`,
+    /// `d2f`, `dmul`, `dadd`, array stores and field stores. So does this VM,
+    /// everywhere except here.
+    ///
+    /// The cost is measurable, not hypothetical. `is_nan_tagged` is
+    /// `(bits & 0xFFFC_0000_0000_0000) == 0xFFFC_0000_0000_0000` — sign,
+    /// exponent, quiet bit and marker bit — so exactly the NEGATIVE QUIET NaNs
+    /// with mantissa bit 50 set are destroyed. `probes/F2dCensus.java` widens
+    /// random NaN floats and finds 49 667 of 200 000 flattened, because a float
+    /// NaN's mantissa shifts left by 29 and its bits 22 and 21 land on the
+    /// quiet and marker bits. Positives: 0 of 2048. Negatives: 1024 of 2048.
+    ///
+    /// Keeping the check is still right — without it a tagged slot would be
+    /// indistinguishable from a double, which is a memory-safety problem rather
+    /// than a payload one. What is wrong is calling the loss free. See
+    /// `docs/known-issues/` for the write-up and the three candidate fixes,
+    /// all of which are changes to this encoding.
     #[inline]
     pub fn double(v: f64) -> Self {
         let bits = v.to_bits();
