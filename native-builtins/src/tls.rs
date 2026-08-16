@@ -1397,6 +1397,87 @@ pub(crate) fn read_keystore_registry_id(ctx: &mut dyn NativeContext, ks_obj: Obj
     crate::keystore::keystore_id_from_object(ctx, ks_obj)
 }
 
+/// The keystore-registry id for JSSE's DEFAULT trust store, or 0 for "the
+/// platform roots" (which is what `build_trust_manager_state(0)` resolves to).
+///
+/// `TrustManagerFactory.init(null)` means "use the default trust material",
+/// and in JSSE that is not unconditionally the platform roots: when
+/// `javax.net.ssl.trustStore` is set it names the ONLY trust store, REPLACING
+/// cacerts rather than adding to it. CratonVM recorded id 0 for every null
+/// KeyStore, so the property was ignored — and the failure was in the widening
+/// direction. MEASURED against Temurin 25.0.3 with the property pointing at a
+/// one-certificate store (`TmProbe2`):
+///
+/// ```text
+/// HOTSPOT  acceptedIssuers=1    checkServerTrusted(that cert) = ACCEPTED
+/// CRATONVM acceptedIssuers=122  checkServerTrusted(that cert) = REJECTED
+/// ```
+///
+/// So an application that pinned its trust to one private CA was silently
+/// given the whole public root set instead, AND still rejected the one
+/// certificate it had actually asked to trust.
+///
+/// `NONE` is JSSE's spelling for "no trust store at all"; it maps to 0 here
+/// rather than to an empty store, because an empty anchor set and the platform
+/// set are not distinguishable downstream and refusing everything would be a
+/// worse guess than today's behaviour. The password is optional: JSSE uses it
+/// only for the integrity check, and a trust store with no private material
+/// commonly ships without one.
+/// NOTE ON WHICH COPY RUNS: `init(KeyStore)` is registered twice for this
+/// class, and `phases_late::ssl_security`'s copy is the one that WINS
+/// (registered later in the `lib.rs` wiring). Both call this resolver, so the
+/// twins cannot drift on the answer — see the `es-restclient-https` note on
+/// the handler below.
+pub(crate) fn default_trust_store_keystore_id(ctx: &mut dyn NativeContext) -> i32 {
+    let Some(path) = ctx.get_system_property("javax.net.ssl.trustStore") else {
+        return 0;
+    };
+    if path.is_empty() || path.eq_ignore_ascii_case("NONE") {
+        return 0;
+    }
+    let password = ctx
+        .get_system_property("javax.net.ssl.trustStorePassword")
+        .unwrap_or_default();
+    // Keyed by (path, password) so repeated `init(null)` calls — every
+    // `SSLContext` build in a long-running app — parse the file once and
+    // reuse one registry id instead of leaking a fresh keystore per call.
+    static CACHE: std::sync::OnceLock<
+        parking_lot::Mutex<std::collections::HashMap<(String, String), i32>>,
+    > = std::sync::OnceLock::new();
+    let cache = CACHE.get_or_init(|| parking_lot::Mutex::new(std::collections::HashMap::new()));
+    let key = (path.clone(), password.clone());
+    if let Some(id) = cache.lock().get(&key).copied() {
+        return id;
+    }
+    let bytes = match std::fs::read(&path) {
+        Ok(b) => b,
+        Err(e) => {
+            // JSSE throws here. This shim does not, for the same reason the
+            // rest of this file does not: a hard failure at `init(null)` would
+            // take down callers that never depended on the property being
+            // readable. Fall back to the platform roots and say so.
+            tracing::debug!(
+                target: "tls",
+                "javax.net.ssl.trustStore={path} could not be read ({e}); using platform roots"
+            );
+            return 0;
+        }
+    };
+    let store = match crate::keystore::load_keystore(&bytes, password.as_bytes()) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::debug!(
+                target: "tls",
+                "javax.net.ssl.trustStore={path} did not parse ({e}); using platform roots"
+            );
+            return 0;
+        }
+    };
+    let id = crate::keystore::keystore_register(store);
+    cache.lock().insert(key, id);
+    id
+}
+
 fn register_trust_manager_factory(r: &mut NativeMethodRegistry) {
     // Bridge: init(KeyStore) records the loaded keystore's registry id on the
     // factory; getTrustManagers() returns a real javax/net/ssl/X509TrustManager
@@ -1486,7 +1567,10 @@ fn register_trust_manager_factory(r: &mut NativeMethodRegistry) {
         let this = obj_arg(args, 0)?;
         let ks_id = match args.get(1) {
             Some(Value::Object(Some(ks_obj))) => read_keystore_registry_id(ctx, *ks_obj),
-            _ => 0, // null KeyStore => default trust store (system roots)
+            // null KeyStore => JSSE's DEFAULT trust store, which is the
+            // platform roots ONLY when the application has not named one via
+            // `javax.net.ssl.trustStore` — see that resolver's doc comment.
+            _ => default_trust_store_keystore_id(ctx),
         };
         // slot 2 = bound keystore registry id (0 = system roots only).
         ctx.set_field(this, 2, Value::Int(ks_id));
