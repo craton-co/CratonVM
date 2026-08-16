@@ -171,23 +171,46 @@ one-anchor store, its own certificate, an unrelated one — diffed against
 HotSpot. It prints no certificate, subject or platform anchor count, because
 the two VMs legitimately ship different root sets (118 vs 122).
 
-## Residue (why this page stays open)
+## Residue (why this page stays open) — now WITNESSED, and blocked
 
 With NO trust store configured, the client still verifies through OpenSSL at
 security level 2. That is stricter than the JDK in a narrow band: an RSA key of
-1024–2047 bits, or a SHA-1 signature, on a chain to a PLATFORM root — accepted
-by HotSpot, refused here. It needs the default client connector moved off
-`native_tls::TlsConnector` onto a raw `openssl::SslConnector` (the shape
-`servlet::s2_legacy_dsa_tls_connect_on` already uses) so
-`set_security_level(1)` — the JDK-equivalent threshold — can be set. native-tls
-0.2 exposes no security-level control, and nothing short of that connector
-swap reaches it.
+1024–2047 bits, or a SHA-1 signature, on a chain to a PLATFORM root.
 
-That swap has to re-implement what native-tls does on the VM's busiest client
-path — SNI, ALPN, the protocol range, hostname verification, peer-chain
-capture — so it wants its own branch and its own netty/Spring gate runs. It is
-not urgent: public CAs stopped issuing 1024-bit RSA and SHA-1 certificates
-years ago, so the band is close to empty in practice.
+This page previously called that unwitnessable, because it needs a chain to a
+cacerts anchor and no public CA will issue one. It is witnessable — by making
+the anchor. `WeakChainProbe`, against an `openssl s_server` presenting a
+1024-bit RSA leaf signed by a 1024-bit CA, with a hard-linked copy of the JDK
+image whose `cacerts` trusts that CA and NO `javax.net.ssl.trustStore` set:
+
+```
+HOTSPOT  (java.home = the modified image)  HANDSHAKE-OK  328 ms
+CRATONVM (--java-home the same image)      REFUSED        60 ms
+  SSLHandshakeException: … certificate verify failed … (EE certificate key too weak)
+```
+
+Same server, same JDK image, same probe. The JDK's floor is 1024 bits;
+OpenSSL's level 2 requires 2048. So this is a measured defect, not a claim.
+
+**It is also blocked**, on
+[`tls-client-captures-only-the-leaf-so-a-custom-trustmanager-cannot-validate-20260816.md`](tls-client-captures-only-the-leaf-so-a-custom-trustmanager-cannot-validate-20260816.md).
+The obvious fix — move this path onto the VM's own validator, which uses the
+JDK's rules rather than OpenSSL's levels — cannot be done first: the client
+captures only the leaf certificate, and MEASURED, that validator then rejects
+**20 of 20** live public sites with `no trust anchor found for chain`. The
+chain has to be fixed before the verifier can move.
+
+Both needs land on the same change: the default client connector moved off
+`native_tls::TlsConnector` (which exposes neither `peer_cert_chain()` nor
+`set_security_level`) onto a raw `openssl::SslConnector`. That swap has to
+re-implement what native-tls does on the VM's busiest client path — SNI, ALPN,
+the protocol range, hostname verification — so it wants its own branch and its
+own netty/Spring gate runs.
+
+Of the two, the leaf-only chain is much the more urgent: it breaks ordinary
+HTTPS for any client that configures a TrustManager. The security-level band
+is close to empty in practice, since public CAs stopped issuing 1024-bit RSA
+and SHA-1 certificates years ago.
 
 ## Repro
 ```bash
