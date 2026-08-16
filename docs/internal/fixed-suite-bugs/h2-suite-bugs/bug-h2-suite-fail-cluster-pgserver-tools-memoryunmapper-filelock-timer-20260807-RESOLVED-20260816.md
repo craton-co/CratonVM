@@ -1,22 +1,44 @@
 # Five FAILs from the 2026-08-07 full-suite sweep: `TestPgServer`, `TestTools`, `TestMemoryUnmapper`, `TestFileLock`, `TestTimer` — RESOLVED
 
 ## Status
-**REOPENED 2026-08-16 (item 2 only) — the rest still holds.** This doc was
-moved to `docs/internal/` as fully `✅ RESOLVED`, but its own "Residuals handed
-on" section promised a follow-up doc —
-`bug-cratonvm-tls-client-handshake-failure-reported-as-interrupted-20260807.md`
-— for `TestTools`' remaining TLS-handshake-reporting gap, and that file was
-never actually created anywhere in the tree. A fresh full-suite rerun today
-(`org.h2.test.unit.TestTools`, `origin/dev`, GC-sweep across default/G1/ZGC)
-reproduces the exact untracked residual: the exception is now genuinely typed
-`javax.net.ssl.SSLHandshakeException` (so the *type* half of the original
-residual note is fixed) but its message is still CratonVM's generic `TLS
-handshake failed: the handshake process was interrupted: localhost:9001`
-rather than HotSpot's real PKIX-path diagnostic (`certificate_unknown) PKIX
-path building failed …`) — see "Reopened: fresh evidence" below. Moved back to
-`known-issues/` so this doesn't get re-lost. Items 1, 3, 4, 5 below are
-unaffected by this reopening — they were independently verified against
-HotSpot at the time and nothing found today contradicts them.
+**✅ RESOLVED AGAIN 2026-08-16 — item 2's reopened residual is closed, with a
+root cause nobody had looked for.** Retired back to `docs/internal/`.
+
+The 2026-08-16 reopening (preserved verbatim below) was right that the symptom
+was live and wrong about where it lived. It read `TLS handshake failed: the
+handshake process was interrupted` as a client-side *message-mapping* gap and
+asked for the client's `SSLHandshakeException` to be given the real
+certificate reason. The client was already capable of that — measured 57 ms and
+the real OpenSSL certificate-verify error, on the same binary, whenever it was
+the FIRST connection to the server. The reopening's own two hypotheses (the
+message text, and the `PENDING_CONNECT_SOCK_ID_BASE` trigger points) are both
+ruled out below.
+
+What was actually broken is on the **server** side, and it is a liveness bug,
+not a reporting one: `SSLServerSocket.accept()` ran the TLS handshake inline
+and threw its failure out of `accept()`. `TcpServer.isRunning()` opens a
+loopback socket and closes it again without any I/O, so H2 killed its own SSL
+server's accept loop on the first liveness probe. The real JDBC client that
+followed found a listening socket nobody was accepting from, waited out its
+30 s read timeout, and reported the `WouldBlock` text. Fixed by deferring the
+failure to the accepted socket, as JSSE does — see "Closed 2026-08-16" at the
+end of this page.
+
+```
+                        before            after           HotSpot 25.0.3
+TestTools verdict       FAIL              FAIL            FAIL   (all three at TestTools.java:656)
+  reported as           SSLHandshake-     SSLHandshake-   SSLHandshake-
+                        Exception: "the   Exception:      Exception: PKIX path
+                        handshake         "certificate    building failed …
+                        process was       verify failed
+                        interrupted"      … (EE certificate
+                                          key too weak)"
+  wall clock            ~38 s             4.9 s           3.0 s
+```
+
+Items 1, 3, 4, 5 are unaffected — independently verified against HotSpot at the
+time, and nothing found in either the reopening or today's work contradicts
+them.
 
 Original status, preserved: **✅ RESOLVED 2026-08-07.** Three were genuine
 CratonVM defects and are fixed; two are H2-test-versus-JDK-25 incompatibilities
@@ -274,8 +296,12 @@ never PASS under a per-class timeout even if the insert worked.)
 * **TLS handshake-failure reporting** — a client handshake that fails on
   certificate validation surfaces as `IOException: TLS handshake failed: the
   handshake process was interrupted` after ~30 s, where HotSpot raises
-  `SSLHandshakeException` naming the PKIX failure immediately. Filed as
-  `bug-cratonvm-tls-client-handshake-failure-reported-as-interrupted-20260807.md`.
+  `SSLHandshakeException` naming the PKIX failure immediately. Filed as the
+  `bug-cratonvm-tls-client-handshake-failure-reported-as-interrupted-20260807`
+  page — which WAS created, worked on 2026-08-10, and retired as
+  `bug-cratonvm-tls-client-handshake-reported-as-interrupted-20260807-FIXED-20260810`
+  (note the dropped `failure-`, which is why the 2026-08-16 reopening below
+  searched for it and concluded it had never existed).
 * **`TestPgServer` throughput** — 687–809 s under CratonVM against 17 s on
   HotSpot for the same work. That is the known interpreter/native-call
   throughput wall, not a defect of this cluster.
@@ -335,5 +361,127 @@ it surface the real certificate-chain-validation failure reason instead of a
 generic "interrupted" message, matching HotSpot/JSSE's own
 `CertificateException`-derived wording.
 
+## Closed 2026-08-16: the residual was a server-side accept loop, not a client message
+
+Everything below is MEASURED on `azureuser@20.80.105.49`, branch
+`fix/h2-tls-zipfs-20260816` off `origin/dev` (`ecc09d40d`),
+`--java-home /data/toolchain/jdk-25 --nojit --Xmx 1g`, one class per scratch
+CWD, with a pristine build of the same commit as the control arm.
+
+### The reopening's hypotheses, ruled out
+
+`TlsProbe` — H2's `NetUtils` on both ends, ONE client connection, the shape the
+2026-08-10 page used:
+
+```
+CRATONVM (pristine dev): javax.net.ssl.SSLHandshakeException: TLS handshake failed:
+  error:0A000086:…:tls_post_process_server_certificate:certificate verify failed:
+  … (EE certificate key too weak)                                    ELAPSED 57 ms
+HOTSPOT                : javax.net.ssl.SSLHandshakeException: (certificate_unknown)
+  PKIX path building failed: … unable to find valid certification path
+                                                                     ELAPSED 128 ms
+```
+
+So on the unmodified binary the client already reported a real
+certificate-verification failure, immediately, correctly typed. Neither the
+message construction nor the `PENDING_CONNECT_SOCK_ID_BASE` trigger points can
+be the fault — the reopening's two named suspects were both already correct.
+
+### What the probe was missing: a second connection
+
+`TcpServer.isRunning()` opens a loopback socket and closes it again **without
+any I/O**, and `Server.start()` does that before the JDBC client ever connects.
+`TlsProbe2` adds exactly that — three probe sockets, then a real client:
+
+```
+HOTSPOT                                     CRATONVM (pristine dev)
+SERVER accepted                    x4       (nothing)
+worker: SSLHandshakeException      x3       SERVER accept ended: java.io.IOException:
+  "Remote host terminated the                 legacy DSA TLS server handshake:
+   handshake"                                 the handshake failed: unexpected EOF
+worker: SSLHandshakeException               (accept loop is gone)
+  "(certificate_unknown) Received
+   fatal alert: certificate_unknown"
+REAL-CLIENT   149 ms  PKIX rejection        REAL-CLIENT  30 162 ms  "the handshake
+                                                          process was interrupted"
+```
+
+`rustls_server_accept` did the TCP accept AND the full TLS handshake, and
+returned the handshake failure as its error — which
+`SSLServerSocket.accept()` turns into an `IOException`. H2's
+`TcpServer.listen()` exits its accept loop on that, as any JSSE accept loop
+would: JSSE does not run the handshake in `accept()` at all, so a handshake
+error is not something an accept loop has any reason to expect. **H2 killed its
+own SSL server on its own liveness probe.** The 30 s that followed is not a
+client policy at all — it is the client's `SO_RCVTIMEO` expiring on a
+connection sitting in a listen backlog nobody is accepting from, at which point
+OpenSSL reports `WANT_READ` and `native_tls` renders it as
+`HandshakeError::WouldBlock` — "the handshake process was interrupted".
+
+This is also why the 2026-08-10 page, which fixed the *other* cause of a
+30 s `WouldBlock` (one `SSLSocket` dialling two TCP connections), measured
+605 ms and looked finished: its `TlsBoth` fixture makes exactly ONE client
+connection, so there is no earlier failed handshake to kill the listener.
+
+### Fix
+
+`native-builtins/src/t27_tls.rs` — a failed handshake is carried ON the
+accepted stream (`TlsServerStream::HandshakeFailed`) instead of being thrown
+out of `accept()`. `accept()` returns a socket, as JSSE's does; the first
+`read`/`write` on it raises `javax.net.ssl.SSLHandshakeException` with the
+backend's real reason, which is where JSSE raises it. Plumbed through
+`servlet::s2_tls_handshake_failure` and
+`phases_late/ssl_security.rs`'s `tls_io_failure`, so all four Java-facing
+TLS stream I/O natives report it the same way.
+
+After, same `TlsProbe2` invocation:
+
+```
+SERVER accepted                                                          x4
+SERVER worker: SSLHandshakeException: legacy DSA TLS server handshake:
+  the handshake failed: unexpected EOF                                   x3
+SERVER worker: SSLHandshakeException: … sslv3 alert bad certificate … alert number 42
+REAL-CLIENT ms=36 -> javax.net.ssl.SSLHandshakeException: TLS handshake failed:
+  error:0A000086:… certificate verify failed … (EE certificate key too weak)
+```
+
+Four accepts, three dead workers, one certificate rejection — HotSpot's shape,
+line for line.
+
+`org.h2.test.unit.TestTools`: **38 s → 4.9 s** (5.5 s on a re-run), still FAIL
+at `TestTools.java:656`, which is where stock HotSpot 25.0.3 fails too (3.0 s),
+for the reason §2b already gives: H2 sets `javax.net.ssl.keyStore` and never a
+trust store.
+
+Regression suite, both arms of the same branch: CORE 43 pass / 0 fail,
+JDK-only corpus 28 pass / 0 fail. (`RSocketChannelInterrupt` and `RJdkHandles`,
+which the "Residuals handed on" section above recorded as failing on
+`1082eb446`, both pass on today's `dev` — fixed in between by other work.)
+
+### One thing this page had wrong, now filed separately
+
+§2b and the 2026-08-10 page both say "both VMs reject the same certificate;
+only the report differs". Only the first half is true. H2's certificate is
+`CN=H2`, RSA, **MD5withRSA**, self-signed. With H2's own keystore installed as
+the trust store as well — so the certificate IS trusted — `TlsProbe3` gets:
+
+```
+HOTSPOT  : TRUSTED-HANDSHAKE-OK                                    197 ms
+CRATONVM : REJECTED  SSLHandshakeException: … certificate verify failed
+           … (EE certificate key too weak)                          50 ms
+```
+
+CratonVM's client applies OpenSSL's SECLEVEL to the peer certificate; HotSpot
+applies the JDK's `jdk.certpath.disabledAlgorithms` rules, which exempt a trust
+anchor from the signature-algorithm check. The two VMs agree on `TestTools`
+only because H2 configures no trust store there. Filed as
+`docs/known-issues/tls-client-trust-is-openssl-seclevel-not-the-jdk-trustmanager-20260816.md`
+— it changes no verdict in this cluster, and it is a real divergence in the
+other direction (CratonVM refusing what HotSpot accepts), so it does not belong
+buried in a closed page.
+
 ## Related
-* [`bug-h2-testtransaction-merge-using-lock-timeout-RESOLVED-20260807.md`](../../internal/fixed-suite-bugs/h2-suite-bugs/bug-h2-testtransaction-merge-using-lock-timeout-RESOLVED-20260807.md) — re-verified 2026-08-16, still accurately closed (not reopened).
+* `bug-h2-testtransaction-merge-using-lock-timeout-RESOLVED-20260807.md` —
+  re-verified 2026-08-16, still accurately closed (not reopened).
+* `bug-cratonvm-tls-client-handshake-reported-as-interrupted-20260807-FIXED-20260810.md`
+  — the other half of the same 30 s symptom, fixed six days earlier.
