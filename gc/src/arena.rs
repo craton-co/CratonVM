@@ -1863,10 +1863,31 @@ impl Arena {
     /// which is a claim only a relocator that has just moved the survivors can
     /// make. It is `pub(crate)` so that claim stays inside this crate.
     ///
-    /// The low free list is dropped wholesale rather than filtered: after a
-    /// slide every low hole is inside the reclaimed span by construction, so a
-    /// surviving entry would name bytes that are now un-bumped tail and would
-    /// hand them out twice.
+    /// `touched` is the half-open offset range the slide actually WROTE into --
+    /// its destination window. Free blocks that overlap it are dropped, because
+    /// the slide places survivors without consulting this list and may have put
+    /// one on top of a hole. Everything else below `new_cursor` is kept.
+    ///
+    /// # The list used to be dropped wholesale, and that was the churn OOM
+    ///
+    /// The premise was "after a slide every low hole is inside the reclaimed
+    /// span by construction, so a surviving entry would name bytes that are now
+    /// un-bumped tail and would hand them out twice". True of a slide that
+    /// compacts the whole low region; this one compacts the pages the
+    /// relocation-set selector picked, into `[slide_floor, dest)`, and leaves
+    /// every other byte exactly where it was. A hole outside that window is a
+    /// real free block below the cursor, and dropping it loses the memory
+    /// permanently -- the sweep only ever free-lists objects that DIE, so a
+    /// hole that was already free when the slide ran is never re-discovered.
+    ///
+    /// Measured on `repros/frag-churn` (512 MiB heap, ~2 MiB live): the sweep
+    /// free-listed 400 MB, the slide cleared it, and from then on the bump
+    /// cursor advanced by EXACTLY the bytes allocated -- not one byte came from
+    /// the free list -- until it reached capacity and the VM threw
+    /// `OutOfMemoryError` with 99% of the heap dead. It is also why the arm
+    /// with the JIT ON survives: `relocate_stw` declines to relocate while a
+    /// compiled frame is live, so on that arm `compact_low_to` is barely
+    /// called and the free list is left alone.
     ///
     /// The **high end is untouched**. Large objects live above `high_cursor`
     /// with their own free list, and this compaction does not move them; that
@@ -1880,7 +1901,11 @@ impl Arena {
         self.cursor
     }
 
-    pub(crate) fn compact_low_to(&mut self, new_cursor: usize) -> usize {
+    pub(crate) fn compact_low_to(
+        &mut self,
+        new_cursor: usize,
+        touched: std::ops::Range<usize>,
+    ) -> usize {
         assert!(
             new_cursor <= self.cursor,
             "compaction must not raise the cursor: {new_cursor} > {}",
@@ -1892,7 +1917,31 @@ impl Arena {
         // conservative scanner that met one would resurrect a corpse.
         self.data[new_cursor..self.cursor].fill(0);
         self.cursor = new_cursor;
+        // Keep the holes the slide did not write into. A block is dropped if it
+        // overlaps the destination window (a survivor may be sitting on it) or
+        // reaches above the new cursor (those bytes are un-bumped tail now, and
+        // serving them from both the list and the cursor is the double-hand-out
+        // the wholesale clear was guarding against). A block that straddles the
+        // cursor is truncated rather than dropped.
+        let keep: Vec<(usize, usize)> = self
+            .low_blocks_sorted()
+            .into_iter()
+            .filter_map(|(off, size)| {
+                if off >= new_cursor {
+                    return None;
+                }
+                let size = size.min(new_cursor - off);
+                if size == 0 {
+                    return None;
+                }
+                let overlaps_touched = off < touched.end && touched.start < off + size;
+                (!overlaps_touched).then_some((off, size))
+            })
+            .collect();
         self.clear_low_free_list();
+        for (off, size) in keep {
+            self.add_free_block(off, size);
+        }
         // Every recorded low object start just moved.
         self.clear_alloc_anchors();
         reclaimed
@@ -2100,6 +2149,69 @@ impl std::fmt::Debug for Arena {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **A compaction may only drop the holes it wrote into.**
+    ///
+    /// `compact_low_to` used to clear the whole low free list, on the premise
+    /// that a slide leaves no hole below the cursor. That holds for a slide
+    /// which compacts the entire low region; ZGC's compacts the pages its
+    /// relocation-set selector picked and leaves the rest untouched, so every
+    /// hole outside the destination window is a real free block — and the
+    /// sweep never re-discovers it, because the sweep only free-lists objects
+    /// that DIE.
+    ///
+    /// The cost was total: on `repros/frag-churn` the sweep free-listed 400 MB,
+    /// the slide cleared it, and from then on the bump cursor advanced by
+    /// exactly the bytes allocated until it hit capacity and the VM threw
+    /// `OutOfMemoryError` with 99% of the heap dead.
+    ///
+    /// Three blocks, one of each kind, so the test cannot pass by halves:
+    /// below the window (must survive), inside it (must go — a survivor may be
+    /// sitting on it), and straddling the new cursor (must be truncated, not
+    /// dropped, or the bytes below the cursor are lost too).
+    #[test]
+    fn compaction_keeps_the_free_holes_it_did_not_write_into() {
+        let mut arena = Arena::new(64 * 1024);
+        // Bump the cursor out so every offset below is inside the live region.
+        let _ = arena.alloc(32 * 1024, 8).expect("fresh arena has room");
+
+        arena.add_free_block(1024, 512); // below the window
+        arena.add_free_block(8192, 512); // inside the window
+        arena.add_free_block(20_480, 4096); // straddles the new cursor
+
+        let before = arena.free_list_bytes();
+        assert_eq!(
+            before,
+            512 + 512 + 4096,
+            "the fixture must set up three blocks"
+        );
+
+        // The slide wrote into [4096, 12288) and left the cursor at 22528.
+        let reclaimed = arena.compact_low_to(22_528, 4096..12_288);
+        assert!(reclaimed > 0, "the cursor must actually retract");
+
+        let kept = arena.free_blocks_sorted();
+        assert!(
+            kept.iter().any(|&(off, sz)| off == 1024 && sz == 512),
+            "a hole below the destination window is untouched memory and must \
+             survive: {kept:?}"
+        );
+        assert!(
+            !kept.iter().any(|&(off, _)| off == 8192),
+            "a hole inside the destination window may have a survivor on it and \
+             must be dropped: {kept:?}"
+        );
+        assert!(
+            kept.iter().any(|&(off, sz)| off == 20_480 && sz == 2048),
+            "a hole straddling the new cursor must be TRUNCATED to the part \
+             below it, not dropped: {kept:?}"
+        );
+        assert_eq!(
+            arena.free_list_bytes(),
+            512 + 2048,
+            "the accounting must match the blocks that survived"
+        );
+    }
 
     /// The `ZipContentTests` shape, in miniature: the cursor is a one-way
     /// ratchet, so a request larger than the biggest hole is unservable even
