@@ -2395,6 +2395,18 @@ pub struct ZgcRealHeap {
     /// the second a raw address kept across a safepoint. Capped, oldest cycles
     /// evicted first, so a long run cannot grow it without bound.
     corpse_ledger: Mutex<FxHashMap<usize, (usize, u32, usize, u64)>>,
+    /// `base -> alloc_size(header)` as the LAST slide left it, taken after the
+    /// registry rebuild and before any mutator resumed.
+    ///
+    /// The pre-sweep extent census consults it for every overlap it finds, and
+    /// the answer splits the search in half: a base that was present then, with
+    /// a smaller size then, has had its HEADER rewritten under it while
+    /// mutators ran; a base that was absent arrived by an insert, and the
+    /// insert audit is looking at the wrong call sites.
+    ///
+    /// Only populated under `CRATONVM_DBG_ZGC_CORPSE`, and replaced wholesale
+    /// each slide so it can never describe two cycles at once.
+    slide_exit_sizes: Mutex<FxHashMap<usize, usize>>,
     /// Cycles that declined to relocate because a compiled frame was live.
     ///
     /// Exported so the cost of the refusal is a number rather than a guess:
@@ -2822,6 +2834,7 @@ impl ZgcRealHeap {
             gc_stress_mark: AtomicUsize::new(0),
             critical_pins: Mutex::new(FxHashMap::default()),
             corpse_ledger: Mutex::new(FxHashMap::default()),
+            slide_exit_sizes: Mutex::new(FxHashMap::default()),
             corpse_reports: AtomicUsize::new(0),
             corpse_cycle: AtomicU64::new(0),
             relocation_skipped_jit: AtomicUsize::new(0),
@@ -4490,6 +4503,13 @@ impl ZgcRealHeap {
         // ---- Rebuild the object-start registry ----------------------------
         for (from, to) in &pairs {
             self.registry.remove(*from);
+            // No audit here: the registry is mid-rebuild, so it still holds
+            // every survivor's PRE-slide base while `to` is a post-slide one.
+            // Every probe would report a conflict against an address the next
+            // iterations are about to remove. The post-slide extent census,
+            // which runs once the rebuild is complete, is the check for this
+            // site -- and it comes back clean, which is why the two mutator
+            // sites above are the ones instrumented.
             self.registry.insert(*to);
         }
 
@@ -4511,12 +4531,140 @@ impl ZgcRealHeap {
         if zgc_corpse_enabled() {
             let after: Vec<usize> = self.registry.snapshot().bases();
             self.survey_registry_extents(&after, "post-slide");
+            // The state the mutators are about to be handed, so the next
+            // cycle's survey can say what changed rather than what is wrong.
+            let mut sizes = self.slide_exit_sizes.lock();
+            sizes.clear();
+            sizes.reserve(after.len());
+            for &b in &after {
+                let sz = Self::alloc_size(self.header_ref(b as *mut u8)).unwrap_or(0);
+                sizes.insert(b, sz);
+            }
         }
         self.verify_no_dangling_slots_after_slide(&live_now, arena_lo, arena_hi, &moved_from);
 
         let pointer_map: cratonvm_types::PointerMap =
             record.into_pointer_map().into_iter().collect();
         (moved, reclaimed, pointer_map)
+    }
+
+    /// Check a registry insertion against what the registry already holds.
+    ///
+    /// `addr` is the base about to be registered and `size` the bytes reserved
+    /// for it (0 when the caller does not know, which disables the second
+    /// check). Two distinct failures look identical by the time the extent
+    /// census meets them a cycle later, and this separates them:
+    ///
+    /// * **interior insert** -- `addr` is already inside a registered object.
+    ///   Someone is registering an interior address, most likely a reference
+    ///   slot, as though it were an allocation.
+    /// * **stale entry swallowed** -- a registered base already sits inside
+    ///   `[addr, addr + size)`. The allocation is innocent; an OLD entry was
+    ///   never removed, its memory was recycled, and the fresh object now
+    ///   contains a base the registry still believes in.
+    ///
+    /// The second is the one to expect if the sweep's `registry.remove` or the
+    /// slide's rebuild can miss an address, and it is invisible to any check
+    /// that only asks "am I inside somebody".
+    ///
+    /// Diagnostic only, behind `CRATONVM_DBG_ZGC_CORPSE`, capped. It never
+    /// vetoes: a refusal here would drop a live object's base and turn a
+    /// bookkeeping bug into a use-after-free.
+    fn audit_registry_insert(&self, addr: usize, size: usize, site: &'static str) {
+        if !zgc_corpse_enabled() {
+            return;
+        }
+        // (0) IS THIS ADDRESS ALREADY A REGISTERED BASE?
+        //
+        // The strongest thing the allocator can get wrong, and the one neither
+        // check below can see: both are strict about `addr`, so an address
+        // issued twice slips between them. A set bit here means the arena has
+        // handed out memory that the registry still believes holds a live
+        // object, and the caller is about to write a header over it.
+        if self.registry.contains(addr) {
+            let h = self.header_ref(addr as *mut u8);
+            let sz = Self::alloc_size(h).unwrap_or(0);
+            self.report_insert_conflict("double-issue", site, addr, size, addr, sz);
+        }
+        // (a) Is `addr` inside an object that is already registered?
+        if let Some(prev) = self
+            .registry
+            .nearest_base_at_or_below(addr.saturating_sub(1))
+        {
+            if prev < addr {
+                let ph = self.header_ref(prev as *mut u8);
+                if let Some(psz) = Self::alloc_size(ph) {
+                    if prev + psz > addr {
+                        self.report_insert_conflict(
+                            "interior-insert",
+                            site,
+                            addr,
+                            size,
+                            prev,
+                            psz,
+                        );
+                    }
+                }
+            }
+        }
+        // (b) Is a registered base already inside the span this object will
+        //     occupy? `nearest_base_at_or_below(end - 1)` is the greatest such
+        //     base, so one probe answers it.
+        if size > 1 {
+            if let Some(inside) = self.registry.nearest_base_at_or_below(addr + size - 1) {
+                if inside > addr {
+                    let ih = self.header_ref(inside as *mut u8);
+                    let isz = Self::alloc_size(ih).unwrap_or(0);
+                    self.report_insert_conflict(
+                        "stale-entry-swallowed",
+                        site,
+                        addr,
+                        size,
+                        inside,
+                        isz,
+                    );
+                }
+            }
+        }
+    }
+
+    /// One line per registry-insert conflict, capped so a storm cannot itself
+    /// become the hang. Carries the raw words at the conflicting base, because
+    /// an implausible header field here is usually half an arena pointer.
+    fn report_insert_conflict(
+        &self,
+        what: &'static str,
+        site: &'static str,
+        addr: usize,
+        size: usize,
+        other: usize,
+        other_size: usize,
+    ) {
+        let n = self.corpse_reports.fetch_add(1, Ordering::Relaxed);
+        if n >= 24 {
+            return;
+        }
+        let oh = self.header_ref(other as *mut u8);
+        // SAFETY: `other` is a registered base inside the arena.
+        let w: [u64; 2] = unsafe { std::ptr::read_unaligned(other as *const [u64; 2]) };
+        tracing::error!(
+            target: "cratonvm::gc::guard",
+            what,
+            site,
+            addr,
+            size,
+            other,
+            other_size,
+            other_ends_at = other + other_size,
+            delta = addr.abs_diff(other),
+            other_kind = ?oh.kind(),
+            other_class_id = oh.class_id.as_u32(),
+            other_num_slots = oh.num_slots(),
+            other_w0 = format!("{:#018x}", w[0]),
+            other_w1 = format!("{:#018x}", w[1]),
+            "zgc registry insert: this insertion and an entry the registry already \
+             holds describe overlapping memory"
+        );
     }
 
     /// Survey the object-start registry for extents that run into the next
@@ -4562,6 +4710,15 @@ impl ZgcRealHeap {
                             } else {
                                 None
                             };
+                            // What this base looked like when the last slide
+                            // handed the heap back to the mutators.
+                            let (seen_then, size_then) = {
+                                let sizes = self.slide_exit_sizes.lock();
+                                match sizes.get(&b) {
+                                    Some(&s) => (true, s),
+                                    None => (false, 0),
+                                }
+                            };
                             // The raw words at the base, and at the two 8-byte
                             // steps below it. A header that was overwritten in
                             // place has plausible neighbours; a registry entry
@@ -4570,7 +4727,8 @@ impl ZgcRealHeap {
                             // whose.
                             // SAFETY: `b` is a registered base inside the
                             // arena, and the world is stopped.
-                            let w: [u64; 4] = unsafe { std::ptr::read_unaligned(b as *const [u64; 4]) };
+                            let w: [u64; 4] =
+                                unsafe { std::ptr::read_unaligned(b as *const [u64; 4]) };
                             let below: [u64; 2] = if b >= self.arena_base + 16 {
                                 // SAFETY: as above; `b - 16` is still inside.
                                 unsafe { std::ptr::read_unaligned((b - 16) as *const [u64; 2]) }
@@ -4592,6 +4750,8 @@ impl ZgcRealHeap {
                                 next_class_id = nh.class_id.as_u32(),
                                 next_num_slots = nh.num_slots(),
                                 vacated_in_cycle = ?vacated,
+                                seen_at_slide_exit = seen_then,
+                                size_at_slide_exit = size_then,
                                 w0 = format!("{:#018x}", w[0]),
                                 w1 = format!("{:#018x}", w[1]),
                                 w2 = format!("{:#018x}", w[2]),
@@ -5191,6 +5351,7 @@ impl ZgcRealHeap {
         // One `fetch_or` into the object-start bitmap — no lock, no hash, no
         // table that grows with the live set. See the "Object-start membership"
         // section header for the measurement this replaced.
+        self.audit_registry_insert(ptr as usize, size, "alloc_raw");
         self.registry.insert(ptr as usize);
         let after = self.allocated.fetch_add(size, Ordering::Relaxed) + size;
         // Arm the native-allocation-pressure latch on the crossing edge. This
@@ -6984,6 +7145,23 @@ impl ZTlabHeapHooks for ZgcRealHeap {
     /// allocation clears the re-arm floor. Nothing here writes `gc_rearm`;
     /// only the sweep does.
     fn register_allocations(&self, addrs: &[usize], bytes: usize) {
+        if zgc_corpse_enabled() {
+            // Per-object sizes are not passed, but a TLAB hands out bases in
+            // increasing order inside one chunk, so consecutive entries bound
+            // each other. The LAST has no successor -- and skipping it was a
+            // hole, because the last object in a batch is exactly the one with
+            // no upper bound on its extent. Bound it by what the batch as a
+            // whole reserved: `bytes` covers every object in it, so
+            // `first + bytes` is at or above the last one's end.
+            let batch_end = addrs.first().map_or(0, |f| f.saturating_add(bytes));
+            for (i, &a) in addrs.iter().enumerate() {
+                let sz = match addrs.get(i + 1) {
+                    Some(next) => next.saturating_sub(a),
+                    None => batch_end.saturating_sub(a),
+                };
+                self.audit_registry_insert(a, sz, "tlab_batch");
+            }
+        }
         self.registry.insert_all(addrs);
         if bytes == 0 {
             return;

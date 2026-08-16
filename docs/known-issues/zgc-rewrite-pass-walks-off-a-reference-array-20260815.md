@@ -291,26 +291,83 @@ dirty. The entry appears while **mutators are running**, on a heap that has
 compacted at least once. That is a much smaller window than "somewhere in the
 collector".
 
-## What to do next, precisely
+## Third pass, 2026-08-16: nothing inserts it — it is overwritten in place
 
-Find who inserts an interior address into `ZObjectStartBits`. There are only
-three writers — `registry.insert` in `alloc_raw`, `insert_all` from the TLAB
-hook `register_allocations`, and `insert(*to)` in the slide's rebuild — and the
-table above rules out the shapes each of them would fail in. So the next
-instrument is a **precondition on the insert itself**: reject-and-report an
-address that `nearest_base_at_or_below` already covers. That is O(1) on the
-bitmap arm, it fires at the moment of the bad insert rather than a cycle later,
-and it names the caller. Gate it the same way as the census.
+The second pass left "who inserts an interior address into the registry" as the
+next step. **Nothing does.** Three checks were added at the two mutator-side
+insert paths (`alloc_raw` and the TLAB batch), and all three read zero on runs
+that go on to produce five overlaps and a SIGSEGV:
 
-Two things to keep in mind while doing it:
+| check | asks | result |
+|---|---|---|
+| `double-issue` | is this address already a registered base? | **0** |
+| `interior-insert` | is this address inside a registered object? | **0** |
+| `stale-entry-swallowed` | is a registered base inside the span I am about to occupy? | **0** |
 
-* **the bitmap is 8-byte granular** (`bit i` denotes `base + i * 8`) while
-  objects are 16-byte shaped, so a spurious bit is representable — do not
-  assume alignment rules it out. One offender was 16-aligned and another was
-  not.
-* **`remove` and `insert` race on the same `AtomicU64` word.** Losing a bit
-  would explain a leak, not an overlap, but the pair is worth reading before
-  assuming the arithmetic is right.
+The first of those is the one that matters most: the arena never hands out
+memory the registry still believes is live. So the allocator is exonerated, and
+so is the idea that a stale entry survives a sweep and gets swallowed.
+
+## What actually happens, in one line
+
+The registry is snapshotted at the end of every slide — base and computed size,
+taken after the rebuild and before any mutator resumes — and the next cycle's
+survey reports what changed:
+
+```
+base=2200137181440  size=8208  next_base=base+96
+seen_at_slide_exit=true   size_at_slide_exit=96
+w0="0x0000020042651248"
+```
+
+**It was a correctly-sized 96-byte object when the slide handed the heap back,
+and its header word now holds an arena pointer.** Same shape at 80 and at 40
+bytes in other runs. Nobody registered anything; a *write landed on a live
+object's header* while mutators were running.
+
+That also explains the recurring `num_slots=512`: this heap's addresses are
+`0x0000_0200_4xxx_xxxx`, and the header packs `class_id` in the low 32 bits and
+`num_slots` in the high 32, so **every** arena pointer read as a header yields
+`num_slots = 0x200 = 512`. It was never a 512-field class.
+
+## Which narrows the writer to one shape
+
+A well-formed store into object `O` at index `i` writes at `O + 16 + 16i`, so
+it can only land on *another* object's offset 0 if the writer's base sits
+exactly 16 bytes below a registered base. In one capture the words just below
+the victim decode as a plausible header — `class_id=1202 num_slots=11` at
+`base - 16` — for an object the registry does **not** contain.
+
+So the writer is holding a base the registry disagrees with, by one header. The
+next instrument follows directly: **check the target base in the field/array
+store path** — under the same corpse gate, refuse-and-report a store whose
+receiver is not a registered base, and log the receiver's class. That catches
+the write where it happens and names the class doing it, instead of inferring
+it from what the header looks like a collection later.
+
+Worth knowing before starting: the slide verifier
+(`CRATONVM_DBG_ZGC_VERIFY_SLIDE=1`) reports ~36 "reference slot does not
+resolve to a live base" lines per run, and **every one is
+`missed_rewrite=false`** — they are slots a class declares as references
+holding non-reference words (the same population the `W7-84` autoboxing warning
+counts), not missed remaps. Doc A's `missed_rewrites=0` stands; do not spend a
+session on those lines.
+
+## Instruments added this pass
+
+Behind `CRATONVM_DBG_ZGC_CORPSE=1`, all O(1) or one pass, a branch when off:
+
+* `zgc registry insert` — the three checks above, at `alloc_raw` and
+  `tlab_batch`. Reports and never vetoes: refusing an insert would drop a live
+  object's base and turn a bookkeeping bug into a use-after-free;
+* `slide_exit_sizes` — base → computed size as the last slide left it, so the
+  extent census can say `seen_at_slide_exit` / `size_at_slide_exit` and split
+  "changed under us" from "arrived wrong". That field is what turned this pass.
+
+The slide's own `registry.insert(*to)` is deliberately **not** audited: the
+registry is mid-rebuild there and still holds every survivor's pre-slide base,
+so every probe would report a conflict against an address the next iterations
+remove. The post-slide extent census covers that site instead.
 
 ## Instruments now in the tree
 
