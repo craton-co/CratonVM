@@ -76,13 +76,19 @@ louder reference-queue bug, which is why it had not been seen on its own before.
 * A synthetic probe of the reference machinery still shows a small same-family
   residue that may share a root cause: over 3200 phantom references through one
   queue on 8 threads, the fixed VM delivers 3197 distinct references with zero
-  duplicates (HotSpot: 3185/3185/0) — but 2–5 of them arrive as a *different,
-  half-constructed instance of the same class* (a `final int` field assigned in
-  the constructor reads `0`). Same-class reuse is precisely the case a
-  class-shape guard cannot see. That points at the reference processor holding a
-  pre-GC address for an object that is alive but was relocated by a collector
-  whose `pointer_map` did not name it — in which case `update_after_gc` cannot
-  repair the record either.
+  duplicates on a quiet host (HotSpot: 3185/3185/0) and 3126 distinct with **one**
+  duplicate on a loaded one — but in every run 2–5 of them arrive as a
+  *different, half-constructed instance of the same class* (a `final int` field
+  assigned in the constructor reads `0`, and the enclosing `Set` has never seen
+  the object handed back). Same-class reuse is precisely the case a class-shape
+  guard cannot see. That points at the reference processor holding a pre-GC
+  address for an object that is alive but was relocated by a collector whose
+  `pointer_map` did not name it — in which case `update_after_gc` cannot repair
+  the record either.
+* One more thing the same probe shows, and it is probably a separate defect
+  worth its own look: `Collections.synchronizedSet(new HashSet<>())` ends the
+  8-thread run reporting `size() == -26`. A negative size is not a reference
+  problem at all.
 * Not collector-specific: seen under both the default ZGC and
   `-XX:+UseGenerationalGC`.
 

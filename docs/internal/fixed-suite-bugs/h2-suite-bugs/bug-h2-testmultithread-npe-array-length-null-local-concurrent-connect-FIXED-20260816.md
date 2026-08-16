@@ -61,9 +61,15 @@ HotSpot's 3200-created / 3185-delivered / 0-duplicate baseline:
 | HotSpot 25 | 3185 | 3185 | 0 |
 | pristine `dev` | 3114 | 3106 | 8 |
 | fixed | 3197 | 3197 | **0** |
+| fixed, on the merged tree under load | 3127 | 3126 | 1 |
 
 The same probe run single-threaded is identical on all three VMs, which is what
 first separated this half from the second.
+
+The last row is not noise to wave away: a duplicate can still occur, at roughly
+one in three thousand instead of one in four hundred, and it is the *other*
+residual — same-class reuse, which a class-shape guard cannot see by
+construction. It is recorded with the MVStore residual below.
 
 **Fix:** `with_queue_monitor` — every queue-list mutation in
 `native_rq_poll` and in both arms of `native_ref_enqueue` now runs under the
