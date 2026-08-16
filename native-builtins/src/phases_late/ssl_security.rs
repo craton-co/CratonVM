@@ -186,6 +186,29 @@ pub(crate) fn mac_state_evict_if_needed(
     }
 }
 
+/// The application `MacSpi` a `javax.crypto.Mac` wraps, if it wraps one.
+///
+/// Every `Mac` built by `mac_get_instance`'s own path keeps its state in
+/// `mac_state_table` and leaves the real `spi` field null; one built through
+/// the JDK's own `(MacSpi, Provider, String)` constructor — which is what
+/// `provider_chain::build_real_mac` does for a third-party provider — always
+/// has it. So the field IS the discriminator, the same one
+/// `skf_receiver_is_ours` uses for `SecretKeyFactory` and `kf_delegate_spi`
+/// for `KeyFactory`.
+///
+/// Every native registered on `javax/crypto/Mac` consults this first. Without
+/// it they shadowed the real bytecode for a receiver they did not build, so a
+/// `Mac` obtained from BouncyCastle computed an HMAC of this VM's choosing —
+/// and for the BC-only MACs (`CMAC`, `Poly1305`, `GOST28147MAC`, the
+/// `*-CMAC`/`*-GMAC` families) `getInstance` refused a name the provider
+/// implements.
+fn mac_delegate_spi(ctx: &mut dyn NativeContext, this: ObjectRef) -> Option<ObjectRef> {
+    match ctx.get_field_by_name(this, "spi") {
+        Value::Object(Some(spi)) => Some(spi),
+        _ => None,
+    }
+}
+
 pub(crate) fn register_p68_crypto_mac(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
@@ -206,6 +229,16 @@ pub(crate) fn register_p68_crypto_mac(r: &mut NativeMethodRegistry) {
                 }
                 .into());
             };
+            // An `Alg.Alias.Mac.<oid>` spelling resolves to the primary name
+            // first — see `provider_chain::canonical_service_algorithm`. The
+            // anonymous overload searches the chain in chain order.
+            let algo = crate::jca::provider_chain::canonical_if_unrecognised(
+                None,
+                "Mac",
+                &algo,
+                &mac_algorithm_supported,
+            )
+            .unwrap_or(algo);
             // W4-3: refuse BEFORE allocating a receiver. An unimplemented name
             // used to yield a working-looking Mac that computed HMAC-SHA-256
             // under whatever name the caller asked for — see
@@ -262,14 +295,59 @@ pub(crate) fn register_p68_crypto_mac(r: &mut NativeMethodRegistry) {
                 algo_idx + 1,
                 crate::jca::provider_chain::ProviderArgWording::Shared,
             )?;
+            // Resolve against the NAMED provider's own alias rows before the
+            // engine's name gate — see the anonymous overload above.
+            let requested_provider =
+                crate::jca::provider_chain::provider_arg_name(ctx, args, algo_idx + 1);
+            let requested_algo = algo.clone();
+            let algo = crate::jca::provider_chain::canonical_if_unrecognised(
+                requested_provider.as_deref(),
+                "Mac",
+                &algo,
+                &mac_algorithm_supported,
+            )
+            .unwrap_or(algo);
+            // A caller that NAMED a third-party provider gets THAT provider's
+            // `MacSpi`, in a genuine `javax.crypto.Mac` — see
+            // `mac_delegate_spi`. This is both an attribution fix (HotSpot
+            // answers `BC`, this VM answered `SunJCE`) and a capability one:
+            // the BC-only MAC families have no arm in `mac_compute_hmac` at
+            // all, so `getInstance` refused names the named provider
+            // implements.
+            if let Some(provider) = requested_provider.as_deref() {
+                if let Some(obj) = crate::jca::provider_chain::build_real_mac(
+                    ctx,
+                    provider,
+                    &requested_algo,
+                    &algo,
+                )? {
+                    return Ok(Some(Value::Object(Some(obj))));
+                }
+            }
+            // No provider named and this engine cannot serve the name: fall to
+            // the chain, whose only candidates for a name we do not implement
+            // are third-party providers. `1.3.14.3.2.26` (SHA-1 HMAC by OID,
+            // bc-java's `pkcs` suite) is the shape.
+            if requested_provider.is_none() && !mac_algorithm_supported(&algo) {
+                if let Some(p) = crate::jca::provider_chain::find_service_provider("Mac", &algo) {
+                    if let Some(obj) = crate::jca::provider_chain::build_real_mac(
+                        ctx,
+                        &p,
+                        &requested_algo,
+                        &algo,
+                    )? {
+                        return Ok(Some(Value::Object(Some(obj))));
+                    }
+                }
+            }
             if !mac_algorithm_supported(&algo) {
                 // Once a provider has been named, HotSpot reports the failure
                 // against THAT provider: `no such algorithm: X for provider Y`.
-                let provider = match args.get(algo_idx + 1) {
-                    Some(Value::Object(Some(p))) => ctx.read_string(*p),
-                    _ => None,
-                };
-                return Err(mac_no_such_algorithm(ctx, &algo, provider.as_deref()));
+                return Err(mac_no_such_algorithm(
+                    ctx,
+                    &algo,
+                    requested_provider.as_deref(),
+                ));
             }
             let obj = try_alloc_concurrent_synthetic(ctx, "javax/crypto/Mac", 4)?;
             let id = ctx.identity_hash_code(obj);
@@ -291,6 +369,15 @@ pub(crate) fn register_p68_crypto_mac(r: &mut NativeMethodRegistry) {
     );
     r.register(mac, "init", "(Ljava/security/Key;)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
+        if let Some(spi) = mac_delegate_spi(ctx, this) {
+            let key = args.get(1).copied().unwrap_or(Value::Object(None));
+            return ctx.invoke_virtual(
+                spi,
+                "engineInit",
+                "(Ljava/security/Key;Ljava/security/spec/AlgorithmParameterSpec;)V",
+                &[key, Value::Object(None)],
+            );
+        }
         let key_bytes = match args.get(1) {
             Some(Value::Object(Some(k))) => mac_extract_key_bytes(ctx, *k),
             _ => Vec::new(),
@@ -310,6 +397,18 @@ pub(crate) fn register_p68_crypto_mac(r: &mut NativeMethodRegistry) {
     // update([B)V — append byte array to accumulator
     r.register(mac, "update", "([B)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
+        if let Some(spi) = mac_delegate_spi(ctx, this) {
+            let (arr, len) = match args.get(1) {
+                Some(Value::Object(Some(a))) => (Some(*a), ctx.array_length(*a) as i32),
+                _ => (None, 0),
+            };
+            return ctx.invoke_virtual(
+                spi,
+                "engineUpdate",
+                "([BII)V",
+                &[Value::Object(arr), Value::Int(0), Value::Int(len)],
+            );
+        }
         if let Some(Value::Object(Some(arr))) = args.get(1) {
             let bytes = mac_read_byte_array(ctx, *arr);
             let id = ctx.identity_hash_code(this);
@@ -326,6 +425,20 @@ pub(crate) fn register_p68_crypto_mac(r: &mut NativeMethodRegistry) {
     // update([BII)V — append byte range to accumulator
     r.register(mac, "update", "([BII)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
+        if let Some(spi) = mac_delegate_spi(ctx, this) {
+            let arr = match args.get(1) {
+                Some(Value::Object(Some(a))) => Some(*a),
+                _ => None,
+            };
+            let off = args.get(2).and_then(|v| v.as_int()).unwrap_or(0);
+            let len = args.get(3).and_then(|v| v.as_int()).unwrap_or(0);
+            return ctx.invoke_virtual(
+                spi,
+                "engineUpdate",
+                "([BII)V",
+                &[Value::Object(arr), Value::Int(off), Value::Int(len)],
+            );
+        }
         if let Some(Value::Object(Some(arr))) = args.get(1) {
             // Validate signed off/len against the array length BEFORE casting to
             // usize. A negative len would sign-extend into a huge usize and
@@ -364,6 +477,10 @@ pub(crate) fn register_p68_crypto_mac(r: &mut NativeMethodRegistry) {
     // update(B)V — append single byte to accumulator
     r.register(mac, "update", "(B)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
+        if let Some(spi) = mac_delegate_spi(ctx, this) {
+            let b = args.get(1).copied().unwrap_or(Value::Int(0));
+            return ctx.invoke_virtual(spi, "engineUpdate", "(B)V", &[b]);
+        }
         let b = args.get(1).and_then(|v| v.as_int()).unwrap_or(0) as u8;
         let id = ctx.identity_hash_code(this);
         mac_state_table()
@@ -378,6 +495,11 @@ pub(crate) fn register_p68_crypto_mac(r: &mut NativeMethodRegistry) {
     // doFinal()[B — compute HMAC, return result, reset accumulator
     r.register(mac, "doFinal", "()[B", |ctx, args| {
         let this = obj_arg(args, 0)?;
+        if let Some(spi) = mac_delegate_spi(ctx, this) {
+            let out = ctx.invoke_virtual(spi, "engineDoFinal", "()[B", &[])?;
+            ctx.invoke_virtual(spi, "engineReset", "()V", &[])?;
+            return Ok(out);
+        }
         let id = ctx.identity_hash_code(this);
         // PERF: single lock acquisition, no full-state clones. Previously this
         // cloned algo (String) + key (Vec) + the entire accumulated data (Vec)
@@ -428,6 +550,20 @@ pub(crate) fn register_p68_crypto_mac(r: &mut NativeMethodRegistry) {
     // doFinal([B)[B — update with input bytes, then compute HMAC
     r.register(mac, "doFinal", "([B)[B", |ctx, args| {
         let this = obj_arg(args, 0)?;
+        if let Some(spi) = mac_delegate_spi(ctx, this) {
+            if let Some(Value::Object(Some(a))) = args.get(1) {
+                let len = ctx.array_length(*a) as i32;
+                ctx.invoke_virtual(
+                    spi,
+                    "engineUpdate",
+                    "([BII)V",
+                    &[Value::Object(Some(*a)), Value::Int(0), Value::Int(len)],
+                )?;
+            }
+            let out = ctx.invoke_virtual(spi, "engineDoFinal", "()[B", &[])?;
+            ctx.invoke_virtual(spi, "engineReset", "()V", &[])?;
+            return Ok(out);
+        }
         let id = ctx.identity_hash_code(this);
         // Read the input bytes via ctx BEFORE taking the lock (ctx access must
         // not happen while the state mutex is held).
@@ -491,6 +627,41 @@ pub(crate) fn register_p68_crypto_mac(r: &mut NativeMethodRegistry) {
     // on iteration 2 of 4096 — after `doFinal()` had already succeeded once.
     r.register(mac, "doFinal", "([BI)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
+        if let Some(spi) = mac_delegate_spi(ctx, this) {
+            let out = match args.get(1) {
+                Some(Value::Object(Some(a))) => *a,
+                _ => {
+                    return Err(RuntimeError::NullPointerException {
+                        message: Some("Cannot store MAC in output buffer".to_string()),
+                    }
+                    .into())
+                }
+            };
+            let off = args.get(2).and_then(|v| v.as_int()).unwrap_or(0).max(0) as usize;
+            let pin = ctx.pin_native_root(out);
+            let produced = ctx.invoke_virtual(spi, "engineDoFinal", "()[B", &[]);
+            let out = ctx.read_native_pin(pin, out);
+            ctx.unpin_native_roots(pin);
+            let bytes = match produced? {
+                Some(Value::Object(Some(a))) => {
+                    let n = ctx.array_length(a);
+                    let mut b = vec![0u8; n];
+                    ctx.read_byte_array_into(a, 0, &mut b);
+                    b
+                }
+                _ => Vec::new(),
+            };
+            if off + bytes.len() > ctx.array_length(out) {
+                return Err(crate::phases_early::throw_jca_exc(
+                    ctx,
+                    "javax/crypto/ShortBufferException",
+                    "Cannot store MAC in output buffer",
+                ));
+            }
+            ctx.write_byte_array_from(out, off, &bytes);
+            ctx.invoke_virtual(spi, "engineReset", "()V", &[])?;
+            return Ok(None);
+        }
         let id = ctx.identity_hash_code(this);
         let out = match args.get(1) {
             Some(Value::Object(Some(arr))) => *arr,
@@ -597,6 +768,13 @@ pub(crate) fn register_p68_crypto_mac(r: &mut NativeMethodRegistry) {
     // path; reading `hb` directly would silently no-op on a direct buffer.
     r.register(mac, "update", "(Ljava/nio/ByteBuffer;)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
+        if let Some(spi) = mac_delegate_spi(ctx, this) {
+            let buf = args.get(1).copied().unwrap_or(Value::Object(None));
+            if matches!(buf, Value::Object(None)) {
+                return Ok(None);
+            }
+            return ctx.invoke_virtual(spi, "engineUpdate", "(Ljava/nio/ByteBuffer;)V", &[buf]);
+        }
         let Some(Value::Object(Some(buf))) = args.get(1).cloned() else {
             // JDK: a null ByteBuffer is a silent no-op (`if (input == null) …`).
             return Ok(None);
@@ -634,11 +812,20 @@ pub(crate) fn register_p68_crypto_mac(r: &mut NativeMethodRegistry) {
     // come from, which is what `Security.getProviders()` advertises them under.
     r.register(mac, "getProvider", "()Ljava/security/Provider;", |ctx, args| {
         let _this = obj_arg(args, 0)?;
+        if let Value::Object(Some(p)) = ctx.get_field_by_name(_this, "provider") {
+            let pid = ctx.class_id_by_name("java/security/Provider");
+            if pid.is_some_and(|pid| ctx.is_subclass(ctx.class_id_of_object(p), pid)) {
+                return Ok(Some(Value::Object(Some(p))));
+            }
+        }
         Ok(Some(Value::Object(Some(jce_provider_object(ctx)?))))
     });
     // reset()V — clear the accumulator
     r.register(mac, "reset", "()V", |ctx, args| {
         let this = obj_arg(args, 0)?;
+        if let Some(spi) = mac_delegate_spi(ctx, this) {
+            return ctx.invoke_virtual(spi, "engineReset", "()V", &[]);
+        }
         let id = ctx.identity_hash_code(this);
         if let Some(st) = mac_state_table().lock().unwrap().get_mut(&id) {
             st.data.clear();
@@ -647,6 +834,9 @@ pub(crate) fn register_p68_crypto_mac(r: &mut NativeMethodRegistry) {
     });
     r.register(mac, "getMacLength", "()I", |ctx, args| {
         let this = obj_arg(args, 0)?;
+        if let Some(spi) = mac_delegate_spi(ctx, this) {
+            return ctx.invoke_virtual(spi, "engineGetMacLength", "()I", &[]);
+        }
         let id = ctx.identity_hash_code(this);
         let algo = mac_state_table()
             .lock()
@@ -669,6 +859,16 @@ pub(crate) fn register_p68_crypto_mac(r: &mut NativeMethodRegistry) {
     });
     r.register(mac, "getAlgorithm", "()Ljava/lang/String;", |ctx, args| {
         let this = obj_arg(args, 0)?;
+        if mac_delegate_spi(ctx, this).is_some() {
+            if let Value::Object(Some(a)) = ctx.get_field_by_name(this, "algorithm") {
+                if ctx
+                    .class_name_of_id(ctx.class_id_of_object(a))
+                    .is_some_and(|n| n == "java/lang/String")
+                {
+                    return Ok(Some(Value::Object(Some(a))));
+                }
+            }
+        }
         let id = ctx.identity_hash_code(this);
         let algo = mac_state_table()
             .lock()
@@ -680,6 +880,27 @@ pub(crate) fn register_p68_crypto_mac(r: &mut NativeMethodRegistry) {
     });
     r.register(mac, "clone", "()Ljava/lang/Object;", |ctx, args| {
         let this = obj_arg(args, 0)?;
+        // A delegated Mac clones by cloning ITS spi and re-wrapping — the
+        // synthetic clone below would silently hand back an unrelated,
+        // natively-served Mac carrying none of the provider's state.
+        if let Some(spi) = mac_delegate_spi(ctx, this) {
+            let cloned = ctx.invoke_virtual(spi, "clone", "()Ljava/lang/Object;", &[])?;
+            let Some(Value::Object(Some(cloned))) = cloned else {
+                return Err(crate::phases_early::throw_jca_exc(
+                    ctx,
+                    "java/lang/CloneNotSupportedException",
+                    "MacSpi is not cloneable",
+                ));
+            };
+            let provider = ctx.get_field_by_name(this, "provider");
+            let algorithm = ctx.get_field_by_name(this, "algorithm");
+            let built = ctx.new_object_initialized(
+                "javax/crypto/Mac",
+                "(Ljavax/crypto/MacSpi;Ljava/security/Provider;Ljava/lang/String;)V",
+                &[Value::Object(Some(cloned)), provider, algorithm],
+            )?;
+            return Ok(built);
+        }
         let src_state = mac_state_table()
             .lock()
             .unwrap()
@@ -6164,6 +6385,22 @@ pub(crate) fn register_p68_security_cert(r: &mut NativeMethodRegistry) {
                 &args[1..2],
             );
             if matches!(provider, Ok(Some(Value::Object(Some(_))))) {
+                // The NAMED provider's own factory first — the one-argument form
+                // below walks the chain and answers `SUN` for `X.509` no matter
+                // who was asked. See
+                // `provider_chain::try_build_real_certificate_factory_for`.
+                let type_name = cf_type_arg(ctx, args).unwrap_or_default();
+                if !type_name.is_empty() {
+                    if let Ok(Some(real_cf)) =
+                        crate::jca::provider_chain::try_build_real_certificate_factory_for(
+                            ctx,
+                            Some(&provider_name),
+                            &type_name,
+                        )
+                    {
+                        return Ok(Some(Value::Object(Some(real_cf))));
+                    }
+                }
                 return ctx.invoke(
                     "java/security/cert/CertificateFactory",
                     "getInstance",

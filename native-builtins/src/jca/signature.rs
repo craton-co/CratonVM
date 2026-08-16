@@ -1392,10 +1392,27 @@ fn sig_init_sign(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
     ctx.set_field(this, base + SIG_OFF_STATE, Value::Int(STATE_SIGN));
     ctx.set_field(this, base + SIG_OFF_PENDING, Value::Int(0));
     if let Some(Value::Object(Some(k))) = args.get(1) {
-        let kid = extract_key_id_from_key(ctx, *k);
+        let mut kid = extract_key_id_from_key(ctx, *k);
         let alg = get_sig_algo(ctx, this).unwrap_or(-1);
         if needs_registered_rsa_key(alg) && !crypto_impl::rsa_key_registered(kid) {
-            return Err(refuse_unusable_key(ctx, alg));
+            // A key this VM did not mint. Import it from the standard
+            // `java.security.interfaces.RSA{Private,Public}Key` accessors
+            // before refusing — the JDK's own engines consume any provider's
+            // key that exposes that interface, and so must ours. This became
+            // load-bearing the moment `KeyPairGenerator.getInstance(alg, "BC")`
+            // started returning BouncyCastle's OWN keys: a `BCRSAPrivateCrtKey`
+            // handed to an ANONYMOUS `Signature.getInstance("SHA256withRSA")`
+            // was refused with "Missing key encoding" while HotSpot signs with
+            // it through SunRsaSign, and bc-java's `cmp` suite does exactly
+            // that pairing. `register_rsa_priv_sign_material` no-ops for a key with no
+            // usable accessors, so a genuinely OPAQUE key still lands on the
+            // refusal below — which is the behaviour netty's provider search
+            // depends on.
+            crate::jca::key_factory::register_rsa_priv_sign_material(ctx, *k);
+            kid = extract_key_id_from_key(ctx, *k);
+            if !crypto_impl::rsa_key_registered(kid) {
+                return Err(refuse_unusable_key(ctx, alg));
+            }
         }
         set_sig_keyid(ctx, this, kid);
         ctx.set_field(this, base + SIG_OFF_KEYID, Value::Long(kid as i64));
@@ -1430,10 +1447,27 @@ fn sig_init_verify(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
     ctx.set_field(this, base + SIG_OFF_STATE, Value::Int(STATE_VERIFY));
     ctx.set_field(this, base + SIG_OFF_PENDING, Value::Int(0));
     if let Some(Value::Object(Some(k))) = args.get(1) {
-        let kid = extract_key_id_from_key(ctx, *k);
+        let mut kid = extract_key_id_from_key(ctx, *k);
         let alg = get_sig_algo(ctx, this).unwrap_or(-1);
         if needs_registered_rsa_key(alg) && !crypto_impl::rsa_key_registered(kid) {
-            return Err(refuse_unusable_key(ctx, alg));
+            // A key this VM did not mint. Import it from the standard
+            // `java.security.interfaces.RSA{Private,Public}Key` accessors
+            // before refusing — the JDK's own engines consume any provider's
+            // key that exposes that interface, and so must ours. This became
+            // load-bearing the moment `KeyPairGenerator.getInstance(alg, "BC")`
+            // started returning BouncyCastle's OWN keys: a `BCRSAPrivateCrtKey`
+            // handed to an ANONYMOUS `Signature.getInstance("SHA256withRSA")`
+            // was refused with "Missing key encoding" while HotSpot signs with
+            // it through SunRsaSign, and bc-java's `cmp` suite does exactly
+            // that pairing. `register_rsa_pub_verify_material` no-ops for a key with no
+            // usable accessors, so a genuinely OPAQUE key still lands on the
+            // refusal below — which is the behaviour netty's provider search
+            // depends on.
+            crate::jca::key_factory::register_rsa_pub_verify_material(ctx, *k);
+            kid = extract_key_id_from_key(ctx, *k);
+            if !crypto_impl::rsa_key_registered(kid) {
+                return Err(refuse_unusable_key(ctx, alg));
+            }
         }
         set_sig_keyid(ctx, this, kid);
         ctx.set_field(this, base + SIG_OFF_KEYID, Value::Long(kid as i64));
