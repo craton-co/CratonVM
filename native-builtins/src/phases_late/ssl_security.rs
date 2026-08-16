@@ -4228,27 +4228,41 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
                     "peer not authenticated",
                 ));
             }
-            let arr = ctx.new_ref_array(ClassId::new(0), chain.len());
-            for (i, der) in chain.iter().enumerate() {
-                // Allocate a 4-field X509Certificate: the extra field 3
-                // carries the raw DER bytes so `Certificate.getEncoded()`
-                // can return them without relying on legacy-synthetic-crypto.
-                let cert = try_alloc_concurrent_synthetic(ctx, "java/security/cert/X509Certificate", 4)?;
-                let (subject, issuer) = basic_der_extract_names(der)
-                    .unwrap_or_else(|| ("CN=Unknown".into(), "CN=Unknown".into()));
-                let sub_str = ctx.create_string(&subject);
-                let iss_str = ctx.create_string(&issuer);
-                ctx.set_field(cert, 0, Value::Object(Some(sub_str)));
-                ctx.set_field(cert, 1, Value::Object(Some(iss_str)));
-                ctx.set_field(cert, 2, Value::Long(0));
-                // Copy DER bytes into a Java byte[] stored at field 3.
-                let der_arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, der.len());
-                for (j, &b) in der.iter().enumerate() {
-                    ctx.set_array_element(der_arr, j, Value::Int(b as i8 as i32));
-                }
-                ctx.set_field(cert, 3, Value::Object(Some(der_arr)));
-                ctx.set_array_element(arr, i, Value::Object(Some(cert)));
-            }
+            let arr = crate::util_concurrent_ext::build_rooted_ref_array(
+                ctx,
+                ClassId::new(0),
+                chain.len(),
+                |ctx, i| {
+                    let der = &chain[i];
+                    // Allocate a 4-field X509Certificate: the extra field 3
+                    // carries the raw DER bytes so `Certificate.getEncoded()`
+                    // can return them without relying on
+                    // legacy-synthetic-crypto.
+                    let cert0 =
+                        try_alloc_concurrent_synthetic(ctx, "java/security/cert/X509Certificate", 4)?;
+                    // `cert` is live across `create_string`/`new_array` below,
+                    // both of which allocate — pin and re-read, same discipline
+                    // `build_rooted_ref_array` applies to the array itself.
+                    let cert_pin = ctx.pin_native_root(cert0);
+                    let (subject, issuer) = basic_der_extract_names(der)
+                        .unwrap_or_else(|| ("CN=Unknown".into(), "CN=Unknown".into()));
+                    let sub_str = ctx.create_string(&subject);
+                    let iss_str = ctx.create_string(&issuer);
+                    let cert = ctx.read_native_pin(cert_pin, cert0);
+                    ctx.set_field(cert, 0, Value::Object(Some(sub_str)));
+                    ctx.set_field(cert, 1, Value::Object(Some(iss_str)));
+                    ctx.set_field(cert, 2, Value::Long(0));
+                    // Copy DER bytes into a Java byte[] stored at field 3.
+                    let der_arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, der.len());
+                    for (j, &b) in der.iter().enumerate() {
+                        ctx.set_array_element(der_arr, j, Value::Int(b as i8 as i32));
+                    }
+                    let cert = ctx.read_native_pin(cert_pin, cert0);
+                    ctx.set_field(cert, 3, Value::Object(Some(der_arr)));
+                    ctx.unpin_native_roots(cert_pin);
+                    Ok(cert)
+                },
+            )?;
             Ok(Some(Value::Object(Some(arr))))
         },
     );
@@ -4320,11 +4334,12 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
             if chain.is_empty() {
                 return Ok(Some(Value::Object(None)));
             }
-            let arr = ctx.new_ref_array(cratonvm_types::ClassId::new(0), chain.len());
-            for (i, der) in chain.iter().enumerate() {
-                let mirror = crate::keystore::make_x509_mirror(ctx, "local", der)?;
-                ctx.set_array_element(arr, i, Value::Object(Some(mirror)));
-            }
+            let arr = crate::util_concurrent_ext::build_rooted_ref_array(
+                ctx,
+                cratonvm_types::ClassId::new(0),
+                chain.len(),
+                |ctx, i| crate::keystore::make_x509_mirror(ctx, "local", &chain[i]),
+            )?;
             Ok(Some(Value::Object(Some(arr))))
         },
     );
