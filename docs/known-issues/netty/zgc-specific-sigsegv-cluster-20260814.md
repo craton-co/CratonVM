@@ -9,22 +9,33 @@ See "Current validation" below for the table that supersedes both earlier
 fix-validation sections.
 
 **Update, later on 2026-08-15.** That residual turned out to be TWO defects
-sharing one signature, and both now have their own pages:
+sharing one signature, and both got their own pages:
 
-* `zgc-resourceleakdetector-corpse-read-20260815.md` — a compiled frame holding
-  a `DefaultResourceLeak` pointer in a register across a slide. ZGC never read
+* the corpse-read page — a compiled frame holding a `DefaultResourceLeak`
+  pointer in a register across a slide. ZGC never read
   `gc_quiescence::is_active()`, the flag `gen_heap` (9 sites) and `g1` (6 sites)
-  use to decline relocation while a JIT frame is live. **Fixed.**
+  use to decline relocation while a JIT frame is live. **Fixed, verified, and
+  the page is retired** — its three residuals were closed out the same evening,
+  one of which turned up a VM-wide soft-reference defect (soft references were
+  never cleared on any collector) that is fixed with it.
 * `zgc-rewrite-pass-walks-off-a-reference-array-20260815.md` — the collector
   faulting inside its own post-slide rewrite pass, reproducible with `--nojit`.
-  The slide wrote over the tail of an object based in the unselected page
-  below: page membership is decided by an object's BASE, so "this page is
-  selected" was being read as "these bytes are free". **Fixed.**
+  The straddler fix on that page is real and landed. **The crash is not gone.**
 
-**The cluster is now 8/8.** `ResourceLeakDetectorTest` runs clean on both
-collectors — 12/12 `--nojit`, 8/8 with JIT, all `ok=2 failed=1`, matching G1
-exactly. The residual `failed=1` is GC-independent and belongs to whoever owns
-that test.
+**Correction, same evening: the cluster is 7/8, not 8/8.** The "12/12 `--nojit`
+clean" reading that closed it was a sampling artefact — a ~1-in-10 event and
+twelve draws. Re-verified against a binary built from **pristine `origin/dev`**:
+`--nojit` still SIGSEGVs, with the walkability guard still reporting registered
+bases whose headers decode as String data. The JIT-on arm is genuinely clean
+(5/5, plus 10 earlier), but that is partly because the corpse-read fix declines
+relocation on 64 of 68 cycles under a JIT-heavy load — **the first fix masks the
+second defect rather than being independent of it.** See the reopened page for
+the current evidence and the one hypothesis already eliminated.
+
+The residual `failed=1` is GC-independent — but it is *not* the test owner's
+problem, which this page also got wrong. The failing test is
+`testConcurrentUsage`, which HotSpot passes; HotSpot fails the other two. See
+`resourceleakdetector-concurrentusage-timeout-20260815.md`.
 
 Two corrections to what this page records about that class: it crashes ~60% of
 the time, not on every run (measured 6/10, `--nojit` 2/10, `RELOCATE=0` 0/10),

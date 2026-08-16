@@ -1,9 +1,22 @@
 # ZGC's own rewrite pass faults walking a reference array
 
-**Status: FIXED 2026-08-15.** The collector SIGSEGV'd inside itself during
-compaction's reference-slot rewrite. Distinct from the JIT-frame relocation
-defect fixed the same day — this one reproduced with `--nojit`, so no compiled
-frame was involved.
+**Status: STILL OPEN — reopened 2026-08-15, later the same day.** The
+straddler fix below is real and landed; the crash it was closed against is
+not gone. `io.netty.util.ResourceLeakDetectorTest` under `-XX:+UseZGC --nojit`
+still SIGSEGVs, on a binary built from **pristine `origin/dev`**, and the
+walkability guard still reports registered bases whose headers decode as text.
+See "Reopened" at the foot of the page for the numbers and for the one
+hypothesis that has since been tested and eliminated.
+
+The "0/12 after" reading below is a **sampling artefact**, and this page's own
+Measurement-traps section predicted it: it says to use "completion rate over
+15+ reps" and then closed the case on 12. A ~1-in-10 event and zero in twelve
+draws are entirely compatible.
+
+**Status when written: FIXED 2026-08-15.** The collector SIGSEGV'd inside itself
+during compaction's reference-slot rewrite. Distinct from the JIT-frame
+relocation defect fixed the same day — this one reproduced with `--nojit`, so no
+compiled frame was involved.
 
 ## The fault
 
@@ -119,10 +132,102 @@ only the collector.
 
 ## Related
 
-- `docs/known-issues/netty/zgc-resourceleakdetector-corpse-read-20260815.md` —
-  the JIT-frame half, and the instruments (`CRATONVM_DBG_ZGC_CORPSE`,
+- the retired `zgc-resourceleakdetector-corpse-read` write-up — the JIT-frame
+  half, and the instruments (`CRATONVM_DBG_ZGC_CORPSE`,
   `CRATONVM_DBG_JIT_NAMES`, `CRATONVM_SYMBOLIZE`) used to separate the two.
 - The 2026-08-14 fix for the slide crossing unselected PAGES is this defect's
   direct predecessor and the reason it was hard to see: that fix made the probe
   page-correct, which reads as "the destination probe is handled". It is the
   same probe and the same rule one level finer — pages, then bytes.
+
+---
+
+# Reopened (2026-08-15, later the same day)
+
+## It still crashes, on pristine `origin/dev`
+
+Found while re-verifying this page and its companion before retiring both.
+`ResourceLeakDetectorTest`, one class per VM, ZGC:
+
+| binary | arm | reps | SIGSEGV |
+|---|---|---|---|
+| `origin/dev` unmodified | `--nojit` | see below | **yes** |
+| `origin/dev` unmodified | JIT on | 5 | 0 |
+| `origin/dev` unmodified | G1 | 5 | 0 |
+
+The JIT-on arm is clean because the companion fix declines relocation while a
+compiled frame is live, and on this workload that is 64 of 68 cycles — so the
+JIT arm barely slides at all. `--nojit` slides every cycle, and is therefore
+the arm that exercises this defect. **The two fixes are not independent: the
+JIT one masks this one.**
+
+## The evidence is the same as the original, one level less specific
+
+The walkability guard's per-object lines, from a crashing `--nojit` run on
+pristine dev — a **contiguous run of twelve registered bases**, 32 to 1176
+bytes apart, every one `registered=true sizable=false was_vacated=false`, and
+every `class_id` / `num_slots` decoding as printable text:
+
+| field pair | as bytes |
+|---|---|
+| `796091762` / `1768710518` | `res/` `vali` |
+| `1702129257` / `1818324594` | `inte` `rnal` |
+| `1886680168` / `1630482234` | `http` `://a` |
+| `778531439` / `1667330145` | `org.` `apac` |
+| `1836592999` / `1919954796` | `g/xm` `l/pr` |
+
+`http://apache.org/xml/properties/internal/...` — JAXP constant-pool strings.
+The original found `PARANOID` and `io/netty`; this is the same failure with a
+different tenant. **A run of registry entries names memory that now holds
+String character data**, so either those addresses were handed back to the
+allocator while the registry still listed them, or a String was written over
+live objects.
+
+One crashing run reported **492 of 27858** survivors unwalkable. Another
+crashed with **zero** — so an unwalkable rewrite target is one route to the
+SIGSEGV and not the only one.
+
+## Hypothesis tested and eliminated: the compaction cursor
+
+`compact_low_to(new_cursor)` zeroes `[new_cursor, cursor)` and hands the span
+straight back to the bump allocator, so a live object above `new_cursor` would
+be erased and its address re-issued — which is exactly the shape of the
+evidence. `new_cursor` is `dest.max(highest_pinned_end)`, and those two are
+derived from *different subsets* of the live set (selected-page survivors and
+unselected ones); every argument that their maximum covers everything live is
+an argument about the partition, not a check on the answer.
+
+`relocate_stw` now carries that check on the answer: one pass over `live`,
+resolved through the slide's own `from -> to` pairs, raising the cursor rather
+than reclaiming past anything still live, and reporting when it has to.
+
+**It has not fired, and the crash reproduced anyway.** So the cursor is not
+where the live set is being lost. The check is kept — it is an assertion on a
+property the allocator depends on and it costs one pass beside a memmove per
+survivor — but it is an assertion, not a fix, and this page is the record that
+it has never been observed to be needed.
+
+## What the next investigator should do first
+
+* **A pre-slide census is now wired in** behind `CRATONVM_DBG_ZGC_CORPSE=1`: it
+  reports whether the live set was ALREADY unwalkable on entry to the slide.
+  That single number splits the search space in half — "this slide broke them"
+  versus "they arrived broken" — and no measurement so far distinguishes the
+  two. Run it first.
+* **Suspect the free list, not only the slide.** A String written over a run of
+  live objects is what an allocator hands out, not what a memmove does; a
+  memmove writes one object's worth. `Arena`'s low free list and its
+  coalescing are the obvious place for two adjacent freed blocks to merge
+  across a live object between them. `compact_low_to` drops the low free list
+  wholesale, which is a hint that this boundary has been trouble before.
+* **Do not measure the rate with a diagnostic flag on.** The companion page
+  measured `CRATONVM_DBG_ROOT_SOURCE=1` moving the crash rate from 6/10 to
+  2/10. `CRATONVM_DBG_ZGC_CORPSE=1` allocates a ledger entry per relocated
+  object and has never been checked for the same effect.
+* **Fifteen reps minimum, interleaved.** This page's own trap list says so and
+  this page's own conclusion ignored it.
+
+## Related
+
+- `zgc-resourceleakdetector-corpse-read-20260815.md` — retired; its closing
+  section records why the JIT-on arm no longer reaches this defect.
