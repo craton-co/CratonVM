@@ -11329,11 +11329,13 @@ pub(crate) mod tests {
     /// data (`docs/known-issues/zgc-rewrite-pass-walks-off-a-reference-array-20260815.md`).
     ///
     /// **Read this test for what it is.** It asserts the property that failure
-    /// violates; it does not reproduce that failure, and the guard it covers
-    /// has never been observed to fire on a real workload. It is here so that
-    /// a future change to `dest` / `highest_pinned_end` — the two partial
-    /// answers whose maximum the cursor is — cannot quietly stop covering the
-    /// live set.
+    /// violates; it does not reproduce that failure. The guard it covers HAS
+    /// been observed firing on the netty repro — one unsizable survivor breaks
+    /// the slide loop early, leaving `dest` at that object and every live
+    /// survivor above it outside the cursor — so this is a live invariant, not
+    /// a hypothetical one. It is here so that a future change to `dest` /
+    /// `highest_pinned_end` — the two partial answers whose maximum the cursor
+    /// is — cannot quietly stop covering the live set.
     #[test]
     fn compaction_never_leaves_a_live_object_above_the_bump_cursor() {
         let heap = ZgcRealHeap::with_capacity(1024 * 1024);

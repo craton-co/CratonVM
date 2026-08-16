@@ -151,9 +151,16 @@ Found while re-verifying this page and its companion before retiring both.
 
 | binary | arm | reps | SIGSEGV |
 |---|---|---|---|
-| `origin/dev` unmodified | `--nojit` | see below | **yes** |
-| `origin/dev` unmodified | JIT on | 5 | 0 |
+| `origin/dev` unmodified | ZGC `--nojit` | 23 | **3** |
+| this branch (cursor check) | ZGC `--nojit` | 14 | **1** |
+| `origin/dev` unmodified | ZGC, JIT on | 5 | 0 |
 | `origin/dev` unmodified | G1 | 5 | 0 |
+
+Interleaved, one class per VM, no diagnostic env flags. **Do not read 3/23
+against 1/14 as a rate reduction** — at these counts the two are
+indistinguishable, and the guarded run that crashed did so with the cursor
+check *not firing*, which is the finding that matters: there is at least one
+further path to this SIGSEGV that the amplifier below does not explain.
 
 The JIT-on arm is clean because the companion fix declines relocation while a
 compiled frame is live, and on this workload that is 64 of 68 cycles — so the
@@ -230,9 +237,14 @@ their maximum covers everything is an argument about the partition; this is a
 check on the answer. It has been observed firing on this workload, in a run
 that then completed.
 
-**This disarms the cascade. It does not explain the first unsizable header** —
-which is one object, and which the crash needs hundreds of to become a
-SIGSEGV. That origin is what remains open on this page.
+**This disarms the cascade. It does not close the page**, for two separate
+reasons, and both are worth stating plainly against the temptation to call it
+fixed:
+
+* it does not explain the **first** unsizable header — one object, where the
+  crash needs hundreds — and that origin is still unknown;
+* one guarded run crashed anyway, **with the cursor check not firing**. So the
+  cascade is one route to this SIGSEGV and demonstrably not the only one.
 
 ## What the next investigator should do first
 
