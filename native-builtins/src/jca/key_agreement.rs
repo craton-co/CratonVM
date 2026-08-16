@@ -99,12 +99,29 @@ fn ka_spi(ctx: &mut dyn NativeContext, this: ObjectRef) -> Option<ObjectRef> {
 
 fn ka_get_instance(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let alg = read_string(ctx, args, 0);
-    let Some((spi_class, _provider)) = ka_spi_class(&alg) else {
-        return Err(throw_no_such_algorithm(
-            ctx,
-            &format!("Algorithm {alg} not available"),
-        ));
+    let requested_provider = crate::jca::provider_chain::provider_arg_name(ctx, args, 1);
+    // A named THIRD-PARTY provider supplies its own `KeyAgreementSpi`. Every
+    // native on this class already forwards to whatever SPI sits in the slot, so
+    // this is a change of which class gets constructed and nothing else — but it
+    // is the difference between `getInstance("ECDH", "BC")` running BouncyCastle
+    // and running SunEC under BouncyCastle's name (`getProvider()` answered
+    // `SunEC`, where HotSpot answers `BC`).
+    let third_party_spi = requested_provider.as_deref().and_then(|p| {
+        crate::jca::provider_chain::third_party_service_class(Some(p), "KeyAgreement", &alg)
+    });
+    let spi_class_owned = match third_party_spi {
+        Some(cls) => cls.replace('.', "/"),
+        None => {
+            let Some((spi_class, _provider)) = ka_spi_class(&alg) else {
+                return Err(throw_no_such_algorithm(
+                    ctx,
+                    &format!("Algorithm {alg} not available"),
+                ));
+            };
+            spi_class.to_string()
+        }
     };
+    let spi_class = spi_class_owned.as_str();
     // Construct the real provider SPI and stash it in a GC-scanned slot.
     let spi = match ctx.new_object_initialized(spi_class, "()V", &[])? {
         Some(Value::Object(Some(o))) => o,
@@ -129,6 +146,11 @@ fn ka_get_instance(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
     ctx.set_field(obj, base + KA_OFF_NAME, Value::Object(Some(name)));
     let obj = ctx.read_native_pin(obj_pin, obj);
     ctx.unpin_native_roots(pin);
+    // Attribution — see `ka_get_provider`.
+    if let Some(provider) = requested_provider.as_deref() {
+        crate::jca::provider_chain::record_requested_provider(ctx, obj, provider);
+    }
+    let obj = ctx.read_native_pin(obj_pin, obj);
     Ok(Some(Value::Object(Some(obj))))
 }
 
@@ -147,6 +169,11 @@ fn ka_get_algorithm(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
 /// one-line treatment `kpg_get_provider` got.
 fn ka_get_provider(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
+    // A provider the caller named at `getInstance` wins over the algorithm-keyed
+    // guess below — see `provider_chain::record_requested_provider`.
+    if let Some(p) = crate::jca::provider_chain::recorded_requested_provider(ctx, this) {
+        return Ok(Some(Value::Object(Some(p))));
+    }
     let base = base_offset(ctx);
     let alg = match ctx.get_field(this, base + KA_OFF_NAME) {
         Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
@@ -189,6 +216,69 @@ fn ka_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
         &[Value::Object(Some(key)), random],
     )?;
     Ok(None)
+}
+
+/// `init(Key, AlgorithmParameterSpec)` / `init(Key, AlgorithmParameterSpec,
+/// SecureRandom)` → `spi.engineInit(key, params, random)`.
+///
+/// Both were UNREGISTERED, so they ran the real `javax.crypto.KeyAgreement`
+/// bytecode against a receiver whose state lives in this engine's own slots —
+/// `chooseProvider()` opens with `synchronized (lock)` on a field this VM never
+/// writes, so every parameterised key agreement died with
+/// `NullPointerException: Cannot enter synchronized block because "this.lock" is
+/// null`. Measured on bc-java's `crmf` suite, whose `PKIArchiveControlBuilder`
+/// takes exactly this door (`JceKeyAgreeRecipientInfoGenerator` →
+/// `KeyAgreement.init(key, ukmSpec, random)`). Same species as the `Mac`
+/// `doFinal([BI)V` note in `phases_late/ssl_security.rs`: the object looks
+/// healthy right up to the one overload nobody registered.
+fn ka_init_spec(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let key = match args.get(1) {
+        Some(Value::Object(Some(k))) => *k,
+        _ => {
+            return Err(RuntimeError::IllegalStateException {
+                message: "KeyAgreement.init: null key".into(),
+            }
+            .into())
+        }
+    };
+    let params = match args.get(2) {
+        Some(Value::Object(opt)) => Value::Object(*opt),
+        _ => Value::Object(None),
+    };
+    let random = match args.get(3) {
+        Some(Value::Object(opt)) => Value::Object(*opt),
+        _ => Value::Object(None),
+    };
+    let Some(spi) = ka_spi(ctx, this) else {
+        return Err(RuntimeError::IllegalStateException {
+            message: "KeyAgreement not initialized (no SPI)".into(),
+        }
+        .into());
+    };
+    ctx.invoke_virtual(
+        spi,
+        "engineInit",
+        "(Ljava/security/Key;Ljava/security/spec/AlgorithmParameterSpec;Ljava/security/SecureRandom;)V",
+        &[Value::Object(Some(key)), params, random],
+    )?;
+    Ok(None)
+}
+
+/// `generateSecret(byte[] sharedSecret, int offset)` → `spi.engineGenerateSecret`.
+/// The third unregistered overload of the same family; it returns the number of
+/// bytes written.
+fn ka_generate_secret_into(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let buf = args.get(1).copied().unwrap_or(Value::Object(None));
+    let off = args.get(2).copied().unwrap_or(Value::Int(0));
+    let Some(spi) = ka_spi(ctx, this) else {
+        return Err(RuntimeError::IllegalStateException {
+            message: "KeyAgreement not initialized (no SPI)".into(),
+        }
+        .into());
+    };
+    ctx.invoke_virtual(spi, "engineGenerateSecret", "([BI)I", &[buf, off])
 }
 
 /// `doPhase(Key, boolean)` → `spi.engineDoPhase(key, lastPhase)` (returns a Key,
@@ -279,10 +369,23 @@ pub fn register(r: &mut NativeMethodRegistry) {
     );
     r.register(
         cls,
+        "init",
+        "(Ljava/security/Key;Ljava/security/spec/AlgorithmParameterSpec;)V",
+        ka_init_spec,
+    );
+    r.register(
+        cls,
+        "init",
+        "(Ljava/security/Key;Ljava/security/spec/AlgorithmParameterSpec;Ljava/security/SecureRandom;)V",
+        ka_init_spec,
+    );
+    r.register(
+        cls,
         "doPhase",
         "(Ljava/security/Key;Z)Ljava/security/Key;",
         ka_do_phase,
     );
+    r.register(cls, "generateSecret", "([BI)I", ka_generate_secret_into);
     r.register(cls, "generateSecret", "()[B", ka_generate_secret);
     r.register(
         cls,

@@ -147,6 +147,41 @@ fn md_get_instance(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
         Some(Value::Object(Some(o))) => ctx.read_string(*o).unwrap_or_default(),
         _ => String::new(),
     };
+    // The anonymous overload resolves aliases against the whole chain, in chain
+    // order, exactly as `Security.getImpl` would.
+    let algo_raw = crate::jca::provider_chain::canonical_if_unrecognised(
+        None,
+        "MessageDigest",
+        &algo_raw,
+        &algorithm_supported,
+    )
+    .unwrap_or(algo_raw);
+    // Chain order for a name this engine does not implement: every provider
+    // ahead of a third-party one is a JDK provider this crate services
+    // natively, so reaching here means only a third-party provider can serve it.
+    if !algorithm_supported(&algo_raw) {
+        if let Some(p) = crate::jca::provider_chain::find_service_provider("MessageDigest", &algo_raw)
+        {
+            if let Some(engine) = crate::jca::provider_chain::build_third_party_engine(
+                ctx,
+                &p,
+                "MessageDigest",
+                &algo_raw,
+                "java/security/MessageDigest",
+            )? {
+                return Ok(Some(Value::Object(Some(engine))));
+            }
+        }
+    }
+    md_get_instance_named(ctx, &algo_raw)
+}
+
+/// The body both `getInstance` doors share, taking the algorithm name already
+/// resolved. Split out so the provider-taking overload can canonicalise against
+/// the NAMED provider's alias rows before this gate runs, and attribute the
+/// result to that provider afterwards.
+fn md_get_instance_named(ctx: &mut dyn NativeContext, algo_raw: &str) -> MethodCallResult {
+    let algo_raw = algo_raw.to_string();
     if algo_raw.is_empty() {
         return Err(RuntimeError::IllegalArgumentException {
             message: "algorithm must be non-null".to_string(),
@@ -190,6 +225,33 @@ fn md_get_instance(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
     Ok(Some(Value::Object(Some(md))))
 }
 
+/// `MessageDigest.toString()`.
+///
+/// The real body is `algorithm + " Message Digest from " + getProviderName() +
+/// ", " + state`, reading the `provider` FIELD directly — a field this crate
+/// only writes when a provider was explicitly named, so every anonymously
+/// obtained digest printed "from (no provider)" where HotSpot prints "from
+/// SUN". Rendering it here rather than eagerly materialising a `Provider`
+/// object inside `getInstance` keeps the cost on the path that asks: this is
+/// the engine every file-hashing loop calls, and `make_provider` allocates a
+/// synthetic plus three strings.
+fn md_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let algo = read_algo(ctx, this);
+    let provider = match crate::jca::provider_chain::recorded_requested_provider(ctx, this) {
+        Some(p) => match ctx.invoke_virtual(p, "getName", "()Ljava/lang/String;", &[]) {
+            Ok(Some(Value::Object(Some(s)))) => ctx.read_string(s).unwrap_or_default(),
+            _ => "SUN".to_string(),
+        },
+        None => "SUN".to_string(),
+    };
+    // HotSpot's own trailing form: "<initialized>\n" for a digest that has been
+    // reset or never fed, which is every digest this engine hands out.
+    let text = format!("{algo} Message Digest from {provider}, <initialized>\n");
+    let s = ctx.create_string(&text);
+    Ok(Some(Value::Object(Some(s))))
+}
+
 /// `MessageDigest.getInstance(String, String|Provider)` → `MessageDigest`.
 ///
 /// Same digest as the single-argument form; the provider argument only decides
@@ -215,17 +277,56 @@ fn md_get_instance_with_provider(
         Some(Value::Object(Some(o))) => ctx.read_string(*o).unwrap_or_default(),
         _ => String::new(),
     };
-    if !algo.is_empty() && !algorithm_supported(&algo) {
-        if let Some(Value::Object(Some(p))) = args.get(1) {
-            if let Some(provider) = ctx.read_string(*p) {
-                return Err(crate::jca::provider_chain::throw_no_such_algorithm_public(
-                    ctx,
-                    &format!("no such algorithm: {algo} for provider {provider}"),
-                ));
-            }
+    let requested_provider = crate::jca::provider_chain::provider_arg_name(ctx, args, 1);
+    // An `Alg.Alias.MessageDigest.<oid>` spelling — `1.3.14.3.2.26` for SHA-1,
+    // `2.16.840.1.101.3.4.2.1` for SHA-256 — resolves to the primary name the
+    // gate below knows. `canonical_algorithm` above handles the two SHAKE
+    // aliases this engine seeds for itself; this handles every alias any
+    // registered provider declared, which is where the OIDs live.
+    let algo = crate::jca::provider_chain::canonical_if_unrecognised(
+        requested_provider.as_deref(),
+        "MessageDigest",
+        &algo,
+        &algorithm_supported,
+    )
+    .unwrap_or(algo);
+    // A caller that NAMED a third-party provider gets THAT provider's own
+    // digest object. BouncyCastle's digests extend `java.security.MessageDigest`
+    // itself, so this hands back exactly what HotSpot's `getInstance` returns
+    // (measured: `org.bouncycastle.jcajce.provider.digest.SHA256$Digest`), and
+    // the guards on every native here (`md_receiver_is_ours`) keep this VM's
+    // accumulator away from it.
+    //
+    // This is what makes the BC-only digest families reachable at all —
+    // `RIPEMD128/160/256`, `GOST3411`, `SM3`, `Tiger`, `Whirlpool`, `Skein*`.
+    // They were the single largest refusal family left in bc-java's `cms` suite
+    // after the alias fix: `NoSuchAlgorithmException: no such algorithm:
+    // RIPEMD160 for provider BC`, against a provider that implements it.
+    if let Some(provider) = requested_provider.as_deref() {
+        if let Some(engine) = crate::jca::provider_chain::build_third_party_engine(
+            ctx,
+            provider,
+            "MessageDigest",
+            &algo,
+            "java/security/MessageDigest",
+        )? {
+            return Ok(Some(Value::Object(Some(engine))));
         }
     }
-    md_get_instance(ctx, args)
+    if !algo.is_empty() && !algorithm_supported(&algo) {
+        if let Some(provider) = requested_provider.as_deref() {
+            return Err(crate::jca::provider_chain::throw_no_such_algorithm_public(
+                ctx,
+                &format!("no such algorithm: {algo} for provider {provider}"),
+            ));
+        }
+    }
+    let md = md_get_instance_named(ctx, &algo)?;
+    if let (Some(provider), Some(Value::Object(Some(obj)))) = (requested_provider.as_deref(), md.as_ref())
+    {
+        crate::jca::provider_chain::record_requested_provider(ctx, *obj, provider);
+    }
+    Ok(md)
 }
 
 /// Read the algorithm name back from a MessageDigest receiver.  Tries
@@ -245,8 +346,39 @@ fn read_algo(ctx: &mut dyn NativeContext, this: ObjectRef) -> String {
     }
 }
 
+/// Did THIS crate build this `MessageDigest`, or did a provider?
+///
+/// `md_get_instance_named` allocates a synthetic whose runtime class is exactly
+/// `java.security.MessageDigest`; a provider's own digest is a SUBCLASS of it
+/// (BouncyCastle's `BCMessageDigest extends MessageDigest`, so
+/// `SHA256$Digest`, `RIPEMD160$Digest`, `GOST3411$Digest` all are). So the exact
+/// class name is the discriminator, the same one `kpg_receiver_is_ours` uses.
+///
+/// Every native on this class needs it, because `update`/`digest`/`reset` are
+/// FINAL on `MessageDigest` — a provider's subclass cannot override them, so
+/// they resolve to the class these natives are registered on and would run this
+/// VM's accumulator against a receiver it never built.
+fn md_receiver_is_ours(ctx: &dyn NativeContext, this: ObjectRef) -> bool {
+    match ctx.class_name_of_id(ctx.class_id_of_object(this)) {
+        Some(name) => name == "java/security/MessageDigest",
+        None => true,
+    }
+}
+
 fn md_update_bytes(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
+    if !md_receiver_is_ours(ctx, this) {
+        let (arr, len) = match args.get(1) {
+            Some(Value::Object(Some(a))) => (Some(*a), ctx.array_length(*a) as i32),
+            _ => (None, 0),
+        };
+        return ctx.invoke_virtual(
+            this,
+            "engineUpdate",
+            "([BII)V",
+            &[Value::Object(arr), Value::Int(0), Value::Int(len)],
+        );
+    }
     let arr = match args.get(1) {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(None),
@@ -258,6 +390,10 @@ fn md_update_bytes(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
 
 fn md_update_byte(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
+    if !md_receiver_is_ours(ctx, this) {
+        let b = args.get(1).copied().unwrap_or(Value::Int(0));
+        return ctx.invoke_virtual(this, "engineUpdate", "(B)V", &[b]);
+    }
     let b = match args.get(1) {
         Some(Value::Int(v)) => *v as u8,
         _ => 0,
@@ -268,6 +404,15 @@ fn md_update_byte(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
 
 fn md_update_bytes_off(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
+    if !md_receiver_is_ours(ctx, this) {
+        let arr = match args.get(1) {
+            Some(Value::Object(Some(a))) => Some(*a),
+            _ => None,
+        };
+        let off = args.get(2).copied().unwrap_or(Value::Int(0));
+        let len = args.get(3).copied().unwrap_or(Value::Int(0));
+        return ctx.invoke_virtual(this, "engineUpdate", "([BII)V", &[Value::Object(arr), off, len]);
+    }
     let arr = match args.get(1) {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(None),
@@ -306,6 +451,10 @@ fn md_update_bytes_off(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
 /// See `apps/spring-boot/cratonvm-bug-reports/SB-13`.
 fn md_update_bytebuffer(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
+    if !md_receiver_is_ours(ctx, this) {
+        let buf = args.get(1).copied().unwrap_or(Value::Object(None));
+        return ctx.invoke_virtual(this, "engineUpdate", "(Ljava/nio/ByteBuffer;)V", &[buf]);
+    }
     let buf = match args.get(1) {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(None),
@@ -334,6 +483,9 @@ fn md_update_bytebuffer(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
 
 fn md_digest(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
+    if !md_receiver_is_ours(ctx, this) {
+        return ctx.invoke_virtual(this, "engineDigest", "()[B", &[]);
+    }
     // C14: surface side-table misses as a loud IllegalStateException rather
     // than silently hashing empty input.  After the identity-hash-code key
     // fix, the only way to land here with no entry is if the receiver was
@@ -361,6 +513,18 @@ fn md_digest(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
 /// `digest(byte[])` — equivalent to `update(byte[]); return digest();`.
 fn md_digest_input(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
+    if !md_receiver_is_ours(ctx, this) {
+        if let Some(Value::Object(Some(a))) = args.get(1) {
+            let len = ctx.array_length(*a) as i32;
+            ctx.invoke_virtual(
+                this,
+                "engineUpdate",
+                "([BII)V",
+                &[Value::Object(Some(*a)), Value::Int(0), Value::Int(len)],
+            )?;
+        }
+        return ctx.invoke_virtual(this, "engineDigest", "()[B", &[]);
+    }
     let arr = match args.get(1) {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
@@ -451,6 +615,9 @@ fn throw_digest_exception(ctx: &mut dyn NativeContext, msg: &str) -> MethodCallF
 
 fn md_reset(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
+    if !md_receiver_is_ours(ctx, this) {
+        return ctx.invoke_virtual(this, "engineReset", "()V", &[]);
+    }
     // Reset to an empty accumulator (rather than removing the entry) so
     // the post-GC presence check in `md_digest` still recognises this
     // instance after `reset()`.
@@ -460,6 +627,8 @@ fn md_reset(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
 
 fn md_get_algorithm(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
+    // A provider's digest carries its own `algorithm` field, written by its
+    // `MessageDigest(String)` super constructor.
     let by_name = ctx.get_field_by_name(this, "algorithm");
     if matches!(&by_name, Value::Object(Some(_))) {
         return Ok(Some(by_name));
@@ -469,6 +638,9 @@ fn md_get_algorithm(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
 
 fn md_get_digest_length(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
+    if !md_receiver_is_ours(ctx, this) {
+        return ctx.invoke_virtual(this, "engineGetDigestLength", "()I", &[]);
+    }
     let algo = read_algo(ctx, this);
     // `digest_length_bytes` returns `Option` and has no default arm, so a
     // digest object carrying an algorithm this VM cannot compute reports 0
@@ -486,7 +658,17 @@ fn md_get_digest_length(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
 /// who chain `md.getProvider().getName()` see a sensible answer.  Reuses
 /// the layout-aware path from `provider_chain::make_provider` (set fields
 /// by name so the real-JDK class layout is honoured).
-fn md_get_provider(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+fn md_get_provider(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    // The provider recorded at `getInstance` — the one the caller NAMED for the
+    // two-argument overloads, `SUN` for the anonymous one. Reading it back is
+    // what makes `getProvider()` and the real `toString()` bytecode agree; the
+    // hardcoded `SUN` below survives only for a receiver that never went
+    // through either door.
+    if let Ok(this) = obj_arg(args, 0) {
+        if let Some(p) = crate::jca::provider_chain::recorded_requested_provider(ctx, this) {
+            return Ok(Some(Value::Object(Some(p))));
+        }
+    }
     // Shared with `Mac`, `SecretKeyFactory` and `Signature` — this was the
     // original of that object shape and three copies had accreted from it.
     let p = crate::jca::make_named_provider(ctx, "SUN")?;
@@ -678,6 +860,7 @@ pub(crate) fn register(r: &mut NativeMethodRegistry) {
         md_get_provider,
     );
     r.register(md, "clone", "()Ljava/lang/Object;", md_clone);
+    r.register(md, "toString", "()Ljava/lang/String;", md_to_string);
 }
 
 /// `MessageDigest.clone()` — JDK `MessageDigest`s whose SPI is `Cloneable`
@@ -687,6 +870,14 @@ pub(crate) fn register(r: &mut NativeMethodRegistry) {
 /// `CloneNotSupportedException`. Produce a fresh MessageDigest with the same
 /// algorithm and a COPY of the byte accumulator (snapshot semantics).
 fn md_clone(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    // A provider's digest clones itself — `MessageDigest.clone()` is not final,
+    // but this native is registered on the base class and would otherwise hand
+    // back one of OUR synthetics carrying none of the provider's state.
+    if let Ok(this) = obj_arg(args, 0) {
+        if !md_receiver_is_ours(ctx, this) {
+            return ctx.invoke_virtual(this, "clone", "()Ljava/lang/Object;", &[]);
+        }
+    }
     let this = obj_arg(args, 0)?;
     let algo = read_algo(ctx, this);
     let acc = read_accumulator(ctx, this);

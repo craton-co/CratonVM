@@ -2060,18 +2060,38 @@ pub(crate) enum TlsServerStream {
     Native(native_tls::TlsStream<TcpStream>),
     #[cfg(unix)]
     LegacyDsa(openssl::ssl::SslStream<TcpStream>),
+    /// The TCP connection was accepted; its TLS handshake was NOT completed.
+    ///
+    /// JSSE does not run the handshake inside `SSLServerSocket.accept()` at
+    /// all — `accept()` returns as soon as the TCP connection is up, and the
+    /// handshake runs on the returned socket's first read or write. A peer
+    /// that connects and disconnects without a ClientHello therefore costs
+    /// HotSpot one accepted socket whose first read throws
+    /// `SSLHandshakeException`; the listener is untouched. This variant is how
+    /// [`rustls_server_accept`] reaches the same end state while still running
+    /// the handshake eagerly: the failure is carried ON the accepted stream
+    /// and raised at the first I/O, instead of being thrown out of `accept()`
+    /// where it kills the caller's accept loop. See
+    /// `rustls_server_handshake_failure`.
+    HandshakeFailed {
+        /// A duplicate handle taken BEFORE the handshake consumed the stream:
+        /// the failing backends do not all hand the socket back.
+        tcp: Option<TcpStream>,
+        reason: String,
+    },
 }
 
 impl TlsServerStream {
     /// The underlying TCP socket, borrowed. Used only to `try_clone` a
     /// registry-held duplicate at registration time — see
     /// `TlsClientStreamEntry::raw`.
-    fn tcp(&self) -> &TcpStream {
+    fn tcp(&self) -> Option<&TcpStream> {
         match self {
-            TlsServerStream::Rustls(s) => &s.sock,
-            TlsServerStream::Native(s) => s.get_ref(),
+            TlsServerStream::Rustls(s) => Some(&s.sock),
+            TlsServerStream::Native(s) => Some(s.get_ref()),
             #[cfg(unix)]
-            TlsServerStream::LegacyDsa(s) => s.get_ref(),
+            TlsServerStream::LegacyDsa(s) => Some(s.get_ref()),
+            TlsServerStream::HandshakeFailed { tcp, .. } => tcp.as_ref(),
         }
     }
 }
@@ -2349,8 +2369,19 @@ struct PassthroughServerCertVerifier {
     /// `SSLParameters.setEndpointIdentificationAlgorithm("HTTPS"|"LDAPS")`.
     ///
     /// **Why it is HERE and not only in the post-handshake gate.** The
-    /// TrustManager consultation has to be post-handshake — it is a Java
-    /// upcall, and rustls's verifier is not a place we can run one from. The
+    /// TrustManager consultation is post-handshake TODAY, but not because it
+    /// has to be: `JavaKeyManagerResolver::resolve` already runs a Java upcall
+    /// from inside `process_new_packets`, reborrowing the caller's context
+    /// through `with_active_native_context`. What actually keeps the
+    /// TrustManager out of here is that `do_unwrap` holds
+    /// `engine_registry()`'s (non-reentrant) write lock across the record
+    /// loop, and an `X509ExtendedTrustManager` handed the `SSLEngine` may call
+    /// straight back into an engine native. Deferring it costs the property
+    /// below in the other direction — see
+    /// `testHandshakeFailureOnlyFireExceptionOnce` in
+    /// `docs/known-issues/netty/openssl-key-material-and-engine-residuals-20260813.md`,
+    /// where the client sends its `Finished` for a chain its own TrustManager
+    /// rejected. The
     /// identity check is not: it is a pure comparison of the presented chain
     /// against the host this side dialled, so it belongs at the point JSSE
     /// makes it, which is *before the client sends its Finished*.
@@ -4091,8 +4122,23 @@ pub(crate) fn rustls_server_accept(listener_id: i32) -> Result<i32, String> {
     let _ = tcp.set_read_timeout(Some(std::time::Duration::from_secs(30)));
     let _ = tcp.set_write_timeout(Some(std::time::Duration::from_secs(30)));
 
-    let (stream, sni_hostname, negotiated_protocol, negotiated_cipher, negotiated_alpn) =
-        match config {
+    // A duplicate handle for the failure path below: `native_tls`'s
+    // `HandshakeError::Failure` does not hand the stream back, so the only
+    // reliable moment to take one is before the handshake starts.
+    let tcp_dup = tcp.try_clone().ok();
+
+    #[allow(clippy::type_complexity)]
+    let handshake: Result<
+        (
+            TlsServerStream,
+            Option<String>,
+            String,
+            String,
+            Option<String>,
+        ),
+        String,
+    > = (|| {
+        Ok(match config {
             TlsServerConfig::Rustls(config) => {
                 let conn = ServerConnection::new(config)
                     .map_err(|e| format!("ServerConnection::new failed: {e}"))?;
@@ -4183,10 +4229,54 @@ pub(crate) fn rustls_server_accept(listener_id: i32) -> Result<i32, String> {
                     None,
                 )
             }
+        })
+    })();
+
+    // FIX (h2-testtools-ssl-accept-loop-dies): a handshake failure is NOT an
+    // `accept()` failure. It used to be raised straight out of this function,
+    // which `SSLServerSocket.accept()` turns into an `IOException` — and an
+    // H2 `TcpServer.listen()` loop (like any JSSE accept loop, which has no
+    // reason to expect a handshake error there) exits on it, taking the whole
+    // server down. `TcpServer.isRunning()` opens a loopback socket and closes
+    // it again WITHOUT any I/O, so H2 kills its own SSL server on the first
+    // liveness probe: the real JDBC client that follows then finds a listening
+    // socket nobody is accepting from, waits out the 30 s read timeout, and
+    // reports `the handshake process was interrupted` — the symptom this
+    // cluster's TLS residual was filed for, and the reason it read as a
+    // client-side message-mapping problem.
+    //
+    // What HotSpot does with the same three probes, MEASURED (`TlsProbe2`):
+    // `SERVER accepted` four times, three worker threads dying on
+    // `SSLHandshakeException: Remote host terminated the handshake`, and the
+    // fourth connection completing its handshake and rejecting the
+    // certificate in 149 ms. The listener never notices.
+    let (stream, sni_hostname, negotiated_protocol, negotiated_cipher, negotiated_alpn) =
+        match handshake {
+            Ok(parts) => parts,
+            Err(reason) => {
+                if debug_hs {
+                    eprintln!(
+                        "[dbg-tls-hs] server_accept listener_id={} handshake FAILED, \
+                         deferring to first I/O: {reason}",
+                        listener_id
+                    );
+                }
+                (
+                    TlsServerStream::HandshakeFailed {
+                        tcp: tcp_dup,
+                        reason,
+                    },
+                    None,
+                    // What JSSE reports for a session that never negotiated.
+                    "NONE".to_string(),
+                    "SSL_NULL_WITH_NULL_NULL".to_string(),
+                    None,
+                )
+            }
         };
 
     // W7-61: see `TlsClientStreamEntry::raw`.
-    let raw = stream.tcp().try_clone().ok();
+    let raw = stream.tcp().and_then(|t| t.try_clone().ok());
     let entry = TlsServerStreamEntry {
         stream: Arc::new(Mutex::new(stream)),
         raw,
@@ -4802,6 +4892,13 @@ pub(crate) fn rustls_stream_read(id: i32, buf: &mut [u8]) -> std::io::Result<usi
             TlsServerStream::Native(s) => EintrIo::new(s).read(buf),
             #[cfg(unix)]
             TlsServerStream::LegacyDsa(s) => EintrIo::new(s).read(buf),
+            // Where JSSE surfaces a rejected handshake — see the variant's
+            // doc comment. The caller turns this into `SSLHandshakeException`
+            // via `s2_tls_handshake_failure`.
+            TlsServerStream::HandshakeFailed { reason, .. } => Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                reason.clone(),
+            )),
         };
         if debug_srv {
             eprintln!(
@@ -4850,6 +4947,11 @@ pub(crate) fn rustls_stream_write(id: i32, data: &[u8]) -> std::io::Result<usize
             TlsServerStream::Native(s) => EintrIo::new(s).write(data),
             #[cfg(unix)]
             TlsServerStream::LegacyDsa(s) => EintrIo::new(s).write(data),
+            // See the read arm.
+            TlsServerStream::HandshakeFailed { reason, .. } => Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                reason.clone(),
+            )),
         };
         if debug_srv {
             eprintln!(
@@ -4937,8 +5039,32 @@ pub(crate) fn rustls_stream_close(id: i32) {
                 TlsServerStream::LegacyDsa(s) => {
                     let _ = s.shutdown();
                 }
+                // No session to close down gracefully; the `raw` shutdown
+                // above has already ended the TCP connection.
+                TlsServerStream::HandshakeFailed { .. } => {}
             }
         }
+    }
+}
+
+/// Why this accepted server-side stream's TLS handshake failed, or `None` if
+/// it did not — see [`TlsServerStream::HandshakeFailed`]. Lets the Java-facing
+/// read/write natives raise `SSLHandshakeException` (what JSSE raises at the
+/// first I/O on such a socket) rather than a bare `IOException`.
+pub(crate) fn rustls_server_handshake_failure(id: i32) -> Option<String> {
+    let stream = {
+        let reg = sreg().lock();
+        reg.server_streams.get(&id).map(|e| e.stream.clone())
+    }?;
+    // `try_lock`: this is only ever called to CLASSIFY an error the caller
+    // already has, so it must never park behind another thread's blocking
+    // read. A failed stream's own read/write arm returns without waiting, so
+    // losing the race here needs a second thread on the same socket, and
+    // costs only the exception type.
+    let guard = stream.try_lock()?;
+    match &*guard {
+        TlsServerStream::HandshakeFailed { reason, .. } => Some(reason.clone()),
+        _ => None,
     }
 }
 
@@ -9068,6 +9194,16 @@ fn handshake_status_of(s: &EngineState) -> i32 {
         }
         return HS_NOT_HANDSHAKING_R;
     }
+    // A handshake failure waiting to be raised is owed to the caller on a
+    // WRAP, so keep asking for one. Without this the engine answered
+    // NEED_UNWRAP as soon as the alert had drained, the caller stopped
+    // wrapping, and the failure sat on the engine until the peer hung up —
+    // which is the `StacklessClosedChannelException` the deferral exists to
+    // prevent. See `EngineState::deferred_handshake_error` and the
+    // `drained.is_empty()` note in `do_wrap`.
+    if s.deferred_handshake_error.is_some() {
+        return HS_NEED_WRAP_R;
+    }
     // A delegated task the caller owes us outranks everything else: JSSE
     // reports NEED_TASK until the task has actually run. See `DelegatedTask`.
     if s.delegated_task != DelegatedTask::None {
@@ -13081,7 +13217,22 @@ fn do_wrap(
         // once the fatal alert it queued has actually gone out. Taking it only
         // when nothing is left to write is what keeps the peer's copy of the
         // alert intact — see `EngineState::deferred_handshake_error`.
+        //
+        // `drained.is_empty()` as well, and that is the load-bearing half: a
+        // wrap that raises cannot also deliver. netty advances its out-buffer's
+        // writerIndex from `result.bytesProduced()`, and a throwing `wrap` has
+        // no result to read it from — the buffer reads back empty, is released,
+        // and the alert this very call had just drained into it dies there. The
+        // peer then learns only that the channel closed, which is exactly what
+        // `testHandshakeFailureCipherMissmatch{TLSv12,TLSv13}Jdk` measured on
+        // the CLIENT side (SslHandlerTest:1670,
+        // `StacklessClosedChannelException` where an `SSLException` belongs).
+        //
+        // `handshake_status_of` keeps answering NEED_WRAP while the failure is
+        // pending, so the caller comes back for the wrap that produces nothing
+        // — and that one raises.
         let deferred_failure = if s.deferred_handshake_error.is_some()
+            && drained.is_empty()
             && s.outbound.is_empty()
             && !s.conn.as_ref().is_some_and(|c| c.wants_write())
         {

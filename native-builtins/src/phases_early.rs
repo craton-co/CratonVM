@@ -16039,6 +16039,56 @@ pub(crate) fn pbkdf2_get_instance(ctx: &mut dyn NativeContext, args: &[Value]) -
         Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
         _ => String::new(),
     };
+    let requested_provider = crate::jca::provider_chain::provider_arg_name(ctx, args, 1);
+    // `Alg.Alias.SecretKeyFactory.<oid>` spellings first — PKCS#5/PKCS#12 code
+    // names its KDFs by OID as a matter of course.
+    let alg = crate::jca::provider_chain::canonical_if_unrecognised(
+        requested_provider.as_deref(),
+        "SecretKeyFactory",
+        &alg,
+        &|n| {
+            pbkdf2_prf_code(n).is_some()
+                || is_known_pbe_keyfactory_alg(n)
+                || (pbe_keyfactory_enabled() && is_pbe_keyfactory_alg(n))
+        },
+    )
+    .unwrap_or(alg);
+    // A caller that NAMED a third-party provider gets THAT provider's
+    // `SecretKeyFactorySpi`, wrapped in a REAL `javax.crypto.SecretKeyFactory`
+    // built through the JDK's own `(Spi, Provider, String)` constructor. Every
+    // method on it — including `getKeySpec`/`translateKey`, which this crate
+    // does not intercept at all — is then ordinary JDK bytecode over the
+    // provider's own engine, and the three natives that DO shadow this class
+    // already route a receiver they did not build back to its `spi` field (see
+    // `skf_receiver_is_ours`).
+    //
+    // Deliberately NOT restricted to names this VM cannot serve. Serving
+    // `PBKDF2WithHmacSHA256` from our own derivation while reporting provider
+    // `SunJCE` for a caller who asked BouncyCastle is the exact shape of
+    // `jca-getinstance-ignores-the-requested-provider`, whose measured cost was
+    // a SILENTLY WRONG KEY — the two providers agreed on that one name, and
+    // did not on the next. The anonymous overload keeps this VM's own path.
+    //
+    // The anonymous overload takes this route only where neither family covers
+    // the name — chain order, since every provider ahead of a third-party one
+    // is a JDK provider this crate services natively. `PBKDF-OpenSSL` and
+    // `PBKDF2with8BIT` (bc-java's `openssl` suite) are asked for without a
+    // provider named and exist only on BouncyCastle.
+    let skf_provider = requested_provider.clone().or_else(|| {
+        let ours = pbkdf2_prf_code(&alg).is_some()
+            || is_known_pbe_keyfactory_alg(&alg)
+            || (pbe_keyfactory_enabled() && is_pbe_keyfactory_alg(&alg));
+        (!ours)
+            .then(|| crate::jca::provider_chain::find_service_provider("SecretKeyFactory", &alg))
+            .flatten()
+    });
+    if let Some(provider) = skf_provider.as_deref() {
+        if let Some(obj) =
+            crate::jca::provider_chain::build_real_secret_key_factory(ctx, provider, &alg)?
+        {
+            return Ok(Some(Value::Object(Some(obj))));
+        }
+    }
     match pbkdf2_prf_code(&alg) {
         Some(code) => {
             let obj = try_alloc_concurrent_synthetic(ctx, "javax/crypto/SecretKeyFactory", 1)?;
