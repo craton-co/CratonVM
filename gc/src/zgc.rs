@@ -4146,6 +4146,27 @@ impl ZgcRealHeap {
                     // A header this collector cannot size cannot be moved, and
                     // nothing above it may move either or the slide would run
                     // over it. Stop here rather than guess.
+                    //
+                    // THIS BREAK IS AN AMPLIFIER, and the live-ceiling check
+                    // after the loop is what disarms it. Abandoning the loop
+                    // leaves `dest` at `from`, so every selected-page survivor
+                    // ABOVE this one -- all of which are alive and none of
+                    // which have moved -- is above the cursor `compact_low_to`
+                    // is about to retract to. Their bytes get zeroed and
+                    // handed back to the bump allocator while the object-start
+                    // registry still names them, and the next allocation
+                    // writes over a contiguous RUN of live objects. That is
+                    // how one unsizable header becomes "492 of 27858 survivors
+                    // could not be walked" a cycle later, with the offending
+                    // headers decoding as whatever String the allocator put
+                    // there. See the reopened
+                    // `zgc-rewrite-pass-walks-off-a-reference-array` page.
+                    //
+                    // Deliberately NOT fixed by setting `dest = low_end` here.
+                    // That would be a second mechanism for the same property,
+                    // and the two would drift on exactly the case that matters.
+                    // The check on the answer belongs in one place, after every
+                    // exit path from this loop.
                     tracing::warn!(
                         target: "cratonvm::gc::guard",
                         addr = from,

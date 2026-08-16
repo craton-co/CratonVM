@@ -187,25 +187,52 @@ One crashing run reported **492 of 27858** survivors unwalkable. Another
 crashed with **zero** — so an unwalkable rewrite target is one route to the
 SIGSEGV and not the only one.
 
-## Hypothesis tested and eliminated: the compaction cursor
+## The amplifier, found and disarmed
 
-`compact_low_to(new_cursor)` zeroes `[new_cursor, cursor)` and hands the span
-straight back to the bump allocator, so a live object above `new_cursor` would
-be erased and its address re-issued — which is exactly the shape of the
-evidence. `new_cursor` is `dest.max(highest_pinned_end)`, and those two are
-derived from *different subsets* of the live set (selected-page survivors and
-unselected ones); every argument that their maximum covers everything live is
-an argument about the partition, not a check on the answer.
+**One unsizable header becomes hundreds of stranded live objects, in one line
+of code.** The survivor loop refuses to slide past an object it cannot size —
+correctly, because it cannot know where that object ends:
 
-`relocate_stw` now carries that check on the answer: one pass over `live`,
-resolved through the slide's own `from -> to` pairs, raising the cursor rather
-than reclaiming past anything still live, and reporting when it has to.
+```rust
+let Some(size) = Self::alloc_size(self.header_ref(from as *mut u8)) else {
+    tracing::warn!(addr = from, "zgc relocate: unsizable survivor stops the slide");
+    dest = from;
+    break;
+};
+```
 
-**It has not fired, and the crash reproduced anyway.** So the cursor is not
-where the live set is being lost. The check is kept — it is an assertion on a
-property the allocator depends on and it costs one pass beside a memmove per
-survivor — but it is an assertion, not a fix, and this page is the record that
-it has never been observed to be needed.
+`dest` is the compaction cursor. `break` abandons **every selected-page
+survivor above `from`** — all of them alive, none of them moved — and then
+`compact_low_to(dest)` zeroes from `dest` upward and hands the span back to the
+bump allocator. The object-start registry still names every one of them. The
+next allocations write over the lot, and a cycle later the rewrite pass meets a
+contiguous run of registered bases holding String data.
+
+The crashing run on pristine `dev` says exactly this, in order:
+
+```
+line  113  WARN  zgc relocate: unsizable survivor stops the slide  addr=2200137083584
+line  130  ERROR zgc relocate: 56 of 27039 survivor(s) could not be walked
+```
+
+and the **first** of the unwalkable per-object lines is `base=2200137083584` —
+the same address — followed by eleven more marching upward 32 to 1176 bytes at
+a time. It is a cascade, not an event: each cycle's stranded run supplies the
+next cycle's unsizable headers, which strand a larger run. 56 in one crashing
+run, 492 in another.
+
+`relocate_stw` now checks the cursor against the whole live set before handing
+it to the allocator: one pass over `live`, resolved through the slide's own
+`from -> to` pairs, raising the cursor rather than reclaiming past anything
+still live, and reporting when it has to. `dest` and `highest_pinned_end` are
+derived from two *different subsets* of the live set, and every argument that
+their maximum covers everything is an argument about the partition; this is a
+check on the answer. It has been observed firing on this workload, in a run
+that then completed.
+
+**This disarms the cascade. It does not explain the first unsizable header** —
+which is one object, and which the crash needs hundreds of to become a
+SIGSEGV. That origin is what remains open on this page.
 
 ## What the next investigator should do first
 
