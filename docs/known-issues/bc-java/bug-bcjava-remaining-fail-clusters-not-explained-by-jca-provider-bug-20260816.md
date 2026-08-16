@@ -1,5 +1,19 @@
 # bc-java: remaining FAIL clusters not explained by the JCA provider alias/attribution bug
 
+> **Superseded in part, 2026-08-16 (later the same day).** The JCA
+> provider-framework cluster this page defers to is now FIXED
+> (`docs/internal/fixed-suite-bugs/bug-bcjava-jca-provider-alias-lookup-and-attribution-20260816.md`),
+> and the sweep was re-run against it. **Cluster 2 is CLOSED** — `cert.path`
+> and `mozilla` both PASS; the shared cause was not an ASN.1 encoder but
+> `CertificateFactory.getInstance(type, providerName)` discarding the provider
+> argument, so BouncyCastle's `CertPath` (which supports the `PEM` encoding the
+> test asks for) was never the one built. `cert.ocsp`, `cert.c509`,
+> `cert.plants` and `operator` also pass now. Clusters 1, 3, 4 and 5 survive in
+> some form. The measured post-fix state, with the harness faults that made the
+> earlier oracle unreliable, is in
+> `bug-bcjava-residual-suite-failures-20260816.md`; prefer that page's numbers
+> over this one's.
+
 ## Status
 **OPEN, mixed confidence, root causes NOT identified** — found 2026-08-16
 running bc-java's `AllTests` suites under CratonVM on Azure, differential-
