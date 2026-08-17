@@ -1385,6 +1385,43 @@ impl Frame {
     pub fn set_local(&mut self, index: u16, value: Value) {
         let i = index as usize;
         if i < self.locals.len() {
+            // `CRATONVM_DBG_VACATED_FRAMES`: catch a stale reference AS IT
+            // ENTERS a frame, which is the one moment the Rust producer is
+            // still on the stack. Every frame this VM builds sets its incoming
+            // arguments through here, so this covers the invoke paths that keep
+            // arguments in a Rust buffer between the pop and the frame build —
+            // the fast/cached dispatchers pin nothing and repair with
+            // `refresh_stale_object_args`, i.e. with `load_and_forward`, which
+            // cannot repair anything on a collector that leaves no forwarding
+            // word (see `VmHeap::load_and_forward`).
+            //
+            // The ledger is exact: `gc_quiescence::note_allocated` drops an
+            // address the moment the allocator re-issues it, so a hit here is a
+            // reference to memory the collector moved an object out of and
+            // nothing has been allocated into since.
+            if cratonvm_gc::gc_quiescence::vacated_frames_enabled() {
+                if let Value::Object(Some(o)) = value {
+                    if let Some(moved_to) =
+                        cratonvm_gc::gc_quiescence::was_vacated(o.as_ptr() as usize)
+                    {
+                        static N: std::sync::atomic::AtomicU64 =
+                            std::sync::atomic::AtomicU64::new(0);
+                        if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 12 {
+                            tracing::error!(
+                                target: "cratonvm::gc::guard",
+                                obj = format!("{:#x}", o.as_ptr() as usize),
+                                moved_to = format!("{moved_to:#x}"),
+                                class = %self.class_name(),
+                                method = %self.method_name(),
+                                pc = self.pc,
+                                slot = i,
+                                backtrace = %std::backtrace::Backtrace::force_capture(),
+                                "a STALE reference is being stored into a frame local — the                                  collector moved this object and nothing has been allocated at                                  the old address since. The backtrace names the VM code that                                  still held it.",
+                            );
+                        }
+                    }
+                }
+            }
             self.note_local_write();
             self.locals[i] = CompactValue::from_value(value);
             let k = lkind_of_value(&value);

@@ -800,7 +800,49 @@ impl VmHeap {
         // reproduced crash site downstream (`kind_of`, `class_id_of`,
         // `element_type_of`, `identity_hash_code`) now validates its own
         // input independently — see those methods below.
+        // `CRATONVM_DBG_VACATED_FRAMES`: was this barrier just asked to repair a
+        // reference the collector really did move, and did it fail?
+        //
+        // This barrier repairs by reading a FORWARDING WORD at the OLD address.
+        // ZGC's slide has none to read: `Arena::compact_low_to` zeroes the span
+        // above the new cursor and the memmove overwrites everything below it,
+        // so a stale reference either lands on zeroed bytes (not a registered
+        // base — the early return right below) or on another live object (whose
+        // header is not forwarded — the `is_forwarded` return after it). Every
+        // caller that treats this call as the repair for "a collection may have
+        // run since the frame read" is therefore unprotected on the DEFAULT
+        // collector. The ledger is exact (`gc_quiescence::note_allocated`
+        // removes re-issued addresses), so a hit here is proof, not a
+        // suspicion.
+        if crate::gc_quiescence::vacated_frames_enabled() {
+            if let Some(moved_to) = crate::gc_quiescence::was_vacated(obj.as_ptr() as usize) {
+                static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 12 {
+                    tracing::error!(
+                        target: "cratonvm::gc::guard",
+                        obj = format!("{:#x}", obj.as_ptr() as usize),
+                        moved_to = format!("{moved_to:#x}"),
+                        backtrace = %std::backtrace::Backtrace::force_capture(),
+                        "load_and_forward was handed a reference the collector MOVED, and                          cannot repair it: this collector leaves no forwarding word at the                          vacated address. The caller in the backtrace is holding a stale                          ObjectRef that nothing else will fix.",
+                    );
+                }
+            }
+        }
         if self.is_object_address(obj.as_ptr() as usize).is_none() {
+            // Not a live base. On a collector that leaves a forwarding word
+            // this is the end of the road; ZGC's slide leaves none, so ask its
+            // relocation table instead — that is the whole point of
+            // `ZgcRealHeap::relocations`, and without it this barrier is a
+            // silent no-op on the default collector.
+            #[cfg(feature = "zgc")]
+            if let VmHeap::Zgc(h) = self {
+                if let Some(moved_to) = h.forwarded_after_slide(obj.as_ptr() as usize) {
+                    // SAFETY: `forwarded_after_slide` only answers with an
+                    // address the object-start registry currently holds, i.e. a
+                    // live object base inside the arena.
+                    return unsafe { ObjectRef::from_raw(moved_to as *mut u8) };
+                }
+            }
             return obj;
         }
         // SAFETY: the caller guarantees `obj` is a live root. Every
@@ -2485,6 +2527,31 @@ impl VmHeap {
                  concurrent_phase_ms={}",
                 phase_nanos / 1_000_000
             );
+            // PHASE G. `old_retained` is the one that says whether the phase
+            // did anything: it counts the objects a young cycle kept WITHOUT
+            // tracing, i.e. the tracing it did not do. A run with
+            // `young_cycles>0` and `old_retained=0` did full-heap work under a
+            // generational name -- which is precisely the vacuous green a
+            // "generational is on" claim would otherwise be built on. Printed
+            // unconditionally, so a run that never engaged the phase says so
+            // instead of printing nothing.
+            let (young, since_major, retained, remembered, promoted, recards) =
+                h.generational_stats();
+            eprintln!(
+                "[GC] zgc-generational: enabled={} young_cycles={young} \
+                 minors_since_major={since_major} old_retained={retained} \
+                 remembered_roots={remembered} promotions={promoted} \
+                 recards_after_relocation={recards}",
+                h.generational_enabled(),
+            );
+            // THE NURSERY, beside the split it bounds. `sweep_skipped` is the
+            // engagement counter: a run with `young_cycles>0` and
+            // `sweep_skipped=0` swept the whole registry on every young cycle, so
+            // the floor never moved and the O(young) sweep is not happening.
+            let (skipped, floor, old_live) = h.nursery_stats();
+            eprintln!(
+                "[GC] zgc-nursery: sweep_skipped={skipped} floor={floor}                  old_live_bytes={old_live}",
+            );
             // `ZGC_UNSIZABLE_OBJECTS` had no reader anywhere but a unit test.
             // It is the sweep's own count of registered objects whose header it
             // could not size -- i.e. of heap corruption the collector has
@@ -3680,6 +3747,70 @@ mod concurrent_mark_controller_tests {
         );
 
         z.set_mark_active(false);
+    }
+
+    /// **The card barrier is reached through `VmHeap`, by BOTH store channels.**
+    ///
+    /// # Why through the enum and not through `ZgcRealHeap`
+    ///
+    /// The card barrier's whole history is of being wired to something nothing
+    /// calls. Until 2026-08-17 it hung off `GarbageCollector::write_barrier`,
+    /// which this backend's `set_field` never invokes -- so `remembered_roots`
+    /// had no non-test caller and the remembered set was empty on every real
+    /// workload, while the collector-level tests were green. The tests in
+    /// `zgc.rs` cannot see that: they call the accessor directly. This one goes
+    /// through the dispatch the interpreter goes through.
+    ///
+    /// Both channels, because `set_field_suppress_satb` exists to skip the OTHER
+    /// barrier and must not skip this one: SATB is about a reference being LOST,
+    /// a card is about one now being HELD. A single implementation change
+    /// (routing the suppression channel around `set_field_no_satb`) would break
+    /// exactly one of the two assertions below.
+    #[cfg(feature = "zgc")]
+    #[test]
+    fn the_vm_heap_store_channels_both_reach_the_zgc_card_barrier() {
+        let heap = VmHeap::new(GcBackend::Zgc, 64 * 1024 * 1024);
+        let VmHeap::Zgc(z) = &heap else {
+            unreachable!("constructed as Zgc")
+        };
+        z.set_generational_enabled(true);
+        z.set_gen_promotion_age(1);
+        z.set_relocation_enabled(false);
+
+        let plain = heap.alloc_object(ClassId::new(1), 2);
+        let suppressed = heap.alloc_object(ClassId::new(1), 2);
+        let target = heap.alloc_object(ClassId::new(1), 0);
+
+        // Promote all three, then let a young cycle clean the promotion cards --
+        // otherwise the assertions read a set that is dirty for a reason they
+        // did not cause.
+        let mut roots = [plain, suppressed, target];
+        {
+            // SAFETY: single-threaded test.
+            let stw = unsafe { crate::collector::StopTheWorldToken::new() };
+            let _ = z.collect_garbage(&stw, &mut roots, &R6NoMonitors);
+            let _ = z.collect_garbage(&stw, &mut roots, &R6NoMonitors);
+        }
+        let [plain, suppressed, target] = roots;
+        assert!(
+            !z.is_carded_for_test(plain.as_ptr() as usize)
+                && !z.is_carded_for_test(suppressed.as_ptr() as usize),
+            "the young cycle must have cleaned the promotion cards first"
+        );
+
+        heap.set_field(plain, 0, Value::Object(Some(target)));
+        assert!(
+            z.is_carded_for_test(plain.as_ptr() as usize),
+            "an ordinary store through VmHeap must card its receiver"
+        );
+
+        heap.set_field_suppress_satb(suppressed, 0, Value::Object(Some(target)));
+        assert!(
+            z.is_carded_for_test(suppressed.as_ptr() as usize),
+            "...and so must the SATB-suppressed channel: suppressing the \\
+             snapshot barrier must not suppress the card, or every referent \\
+             write silently drops an old-to-young edge"
+        );
     }
 
     /// Every `zgc_*_concurrent_mark` arm of `VmHeap` reaches the collector.

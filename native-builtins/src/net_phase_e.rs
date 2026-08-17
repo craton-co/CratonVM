@@ -1525,7 +1525,7 @@ pub(crate) fn inet_addr_scoped_text(
 /// `pub(crate)` because the duplicate registration in `phases_early.rs` must
 /// answer identically — `getHostName` had six registrations and the winning
 /// pair was on the concrete subclasses (see
-/// `docs/internal/fixed-suite-bugs/inetaddress-tostring-hostname-literal-addresses-FIXED.md`),
+/// `fixed-suite-bugs/inetaddress-tostring-hostname-literal-addresses-FIXED.md`),
 /// so a scope fix applied to only one of them is invisible half the time.
 pub(crate) fn inet_addr_host_address_value(ctx: &mut dyn NativeContext, this: ObjectRef) -> Value {
     // `inet_addr_field` keeps the legacy fallback: an address object we never
@@ -14030,21 +14030,128 @@ fn ws2_get_int(s: usize, level: i32, name: i32) -> Option<i32> {
     (rc == 0).then_some(value)
 }
 
+
+/// Read a `SocketAddress` as **`numeric-host:port`**, preferring the address
+/// the JVM already resolved over any hostname the object also carries.
+///
+/// [`read_inet_socket_address`] answers the hostname first, which is right for
+/// callers that need the NAME (an HTTP `Host:` header, TLS SNI) and wrong for
+/// callers that hand the result to `bind`/`connect`: those pass the string to
+/// the platform resolver, which answers the same question a SECOND time and
+/// may order the answers differently. `localhost` is where the two disagree —
+/// Windows `getaddrinfo` puts `::1` first, glibc with the stock `/etc/hosts`
+/// puts `127.0.0.1` first — so `bind(new InetSocketAddress("localhost", 0))`
+/// bound a different family on the two platforms from identical bytes, while
+/// HotSpot (which uses `isa.getAddress()` and never looks at the name) bound
+/// the loopback v4 address on both. Same rule, same reason, as
+/// `native-io`'s `inet_addr_literal`.
+///
+/// Falls back to [`read_inet_socket_address`] for an UNRESOLVED address
+/// (`createUnresolved`, or a constructor whose lookup failed): there is no
+/// resolved address to prefer, and the name is all the caller has.
+fn read_socket_address_numeric(
+    ctx: &dyn NativeContext,
+    sa: ObjectRef,
+) -> Result<(String, i32), cratonvm_types::error::MethodCallFailed> {
+    let (name_host, port) = read_inet_socket_address(ctx, sa)?;
+    // Real-JDK layout only: `InetSocketAddress.holder.addr`.
+    if let Value::Object(Some(holder)) = ctx.get_field(sa, ISA_HOST) {
+        if ctx.read_string(holder).is_none() {
+            if let Value::Object(Some(ia)) = ctx.get_field(holder, 1) {
+                if let Some(literal) = inet_address_numeric_literal(ctx, ia) {
+                    return Ok((literal, port));
+                }
+            }
+        }
+    }
+    Ok((name_host, port))
+}
+
+/// The numeric literal of an `InetAddress`, from whichever of the three
+/// layouts this VM can present: the ObjectRef-keyed side table, a real-JDK
+/// `Inet6Address.holder6.ipaddress` byte array, or a real-JDK
+/// `InetAddress.holder.address` packed v4 int.
+///
+/// IPv6 is checked BEFORE the v4 int because an `Inet6Address` leaves that int
+/// at zero — reading it would render every v6 address as `0.0.0.0`, i.e. the
+/// v4 wildcard. The v6 form is bracketed so a caller appending `:{port}`
+/// produces something `ToSocketAddrs` can parse.
+fn inet_address_numeric_literal(ctx: &dyn NativeContext, ia: ObjectRef) -> Option<String> {
+    if let Some((_, ip)) = inet_addr_get(ia) {
+        if !ip.is_empty() {
+            return Some(bracket_if_v6(&ip));
+        }
+    }
+    if let Value::Object(Some(h6)) = ctx.get_field_by_name(ia, "holder6") {
+        if let Value::Object(Some(arr)) = ctx.get_field_by_name(h6, "ipaddress") {
+            if ctx.array_length(arr) == 16 {
+                let mut octets = [0u8; 16];
+                for (i, slot) in octets.iter_mut().enumerate() {
+                    match ctx.get_array_element(arr, i) {
+                        Value::Int(b) => *slot = b as u8,
+                        _ => return None,
+                    }
+                }
+                return Some(format!("[{}]", std::net::Ipv6Addr::from(octets)));
+            }
+        }
+    }
+    if let Value::Object(Some(holder)) = ctx.get_field_by_name(ia, "holder") {
+        if let Value::Int(address) = ctx.get_field_by_name(holder, "address") {
+            return Some(std::net::Ipv4Addr::from((address as u32).to_be_bytes()).to_string());
+        }
+    }
+    None
+}
+
+/// Wrap a bare IPv6 literal in brackets so `format!("{host}:{port}")` stays
+/// parseable; leave anything else (a v4 literal, an already-bracketed form)
+/// exactly as it is.
+fn bracket_if_v6(ip: &str) -> String {
+    if ip.contains(':') && !ip.starts_with('[') {
+        format!("[{ip}]")
+    } else {
+        ip.to_string()
+    }
+}
+
+/// Apply the socket options the JDK's own `DatagramSocket` implementation
+/// turns on at construction.
+///
+/// `java.net.DatagramSocket` is a `DatagramChannel` adaptor on JDK 25, and
+/// `DatagramChannelImpl`'s constructor sets `SO_BROADCAST` for the adaptor
+/// case. Measured on HotSpot 25, same host:
+/// `new DatagramSocket().getBroadcast()` is **true**. CratonVM's ctors left
+/// the raw socket at the OS default (false), so a caller that never touches
+/// `setBroadcast` got a socket that silently dropped broadcast sends where the
+/// JDK's would deliver them — and `getBroadcast()` answered a defensible-looking
+/// `false` that nothing contradicted until this class was censused against
+/// HotSpot method by method.
+///
+/// Best-effort: a platform that refuses the option leaves the socket as it was,
+/// which is the pre-fix behaviour.
+fn ds_socket_defaults(ctx: &dyn NativeContext, fd: u32) {
+    let _ = ctx.fd_table().udp_set_broadcast(fd, true);
+}
+
 pub(crate) fn register_re7_datagram_socket(r: &mut NativeMethodRegistry) {
     let ds = "java/net/DatagramSocket";
 
     r.register(ds, "<init>", "()V", |ctx, args| {
         let this = obj_arg(args, 0)?;
         // GAP I6 (UDP half): a datagram bind is a network authority too.
-        let fd = crate::capability_gate::open_udp_gated(&*ctx, Some("0.0.0.0:0")).map_err(|e| {
-            crate::capability_gate::translate_open_failure(e, |io| format!("UDP open: {io}"))
-        })?;
+        // DUAL-STACK wildcard, matching the JDK's DatagramChannel adaptor —
+        // see `open_udp_wildcard_dual_stack_gated`.
+        let fd = crate::capability_gate::open_udp_wildcard_dual_stack_gated(&*ctx, 0).map_err(
+            |e| crate::capability_gate::translate_open_failure(e, |io| format!("UDP open: {io}")),
+        )?;
         let port = ctx
             .fd_table()
             .udp_local_addr(fd)
             .ok()
             .and_then(|s| s.rsplit(':').next().and_then(|p| p.parse::<i32>().ok()))
             .unwrap_or(0);
+        ds_socket_defaults(&*ctx, fd);
         ds_set(this, |s| {
             s.port = port;
             s.closed = 0;
@@ -14056,9 +14163,13 @@ pub(crate) fn register_re7_datagram_socket(r: &mut NativeMethodRegistry) {
     r.register(ds, "<init>", "(I)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let port = args.get(1).and_then(|v| v.as_int()).unwrap_or(0);
-        let addr_spec = format!("0.0.0.0:{port}");
-        // GAP I6 (UDP half).
-        let fd = crate::capability_gate::open_udp_gated(&*ctx, Some(&addr_spec)).map_err(|e| {
+        // GAP I6 (UDP half). Dual-stack, as above: `new DatagramSocket(port)`
+        // is a wildcard bind and the JDK's is AF_INET6 with V6ONLY off.
+        let fd = crate::capability_gate::open_udp_wildcard_dual_stack_gated(
+            &*ctx,
+            port.clamp(0, 65535) as u16,
+        )
+        .map_err(|e| {
             crate::capability_gate::translate_open_failure(e, |io| format!("UDP bind: {io}"))
         })?;
         let actual_port = ctx
@@ -14067,6 +14178,7 @@ pub(crate) fn register_re7_datagram_socket(r: &mut NativeMethodRegistry) {
             .ok()
             .and_then(|s| s.rsplit(':').next().and_then(|p| p.parse::<i32>().ok()))
             .unwrap_or(port);
+        ds_socket_defaults(&*ctx, fd);
         ds_set(this, |s| {
             s.port = actual_port;
             s.closed = 0;
@@ -14095,6 +14207,7 @@ pub(crate) fn register_re7_datagram_socket(r: &mut NativeMethodRegistry) {
             .ok()
             .and_then(|s| s.rsplit(':').next().and_then(|p| p.parse::<i32>().ok()))
             .unwrap_or(port);
+        ds_socket_defaults(&*ctx, fd);
         ds_set(this, |s| {
             s.port = actual_port;
             s.closed = 0;
@@ -14190,6 +14303,32 @@ pub(crate) fn register_re7_datagram_socket(r: &mut NativeMethodRegistry) {
                 "SO_BROADCAST" => ds_box_bool(ctx, sd.broadcast == 1),
                 "SO_REUSEADDR" => ds_box_bool(ctx, sd.reuse_address == 1),
                 "SO_TIMEOUT" => ds_box_int(ctx, sd.timeout),
+                // The three the SETTER already pushes to the real fd, and the
+                // table can read straight back. Refusing them here made
+                // `getOption(SO_RCVBUF)` throw on a socket whose
+                // `setOption(SO_RCVBUF, n)` had just succeeded — an asymmetry
+                // no JDK provider has.
+                "SO_RCVBUF" => {
+                    let n = ctx
+                        .fd_table()
+                        .udp_recv_buffer_size(sd.fd as u32)
+                        .map_err(|e| ioex(format!("SO_RCVBUF: {e}")))?;
+                    ds_box_int(ctx, n as i32)
+                }
+                "SO_SNDBUF" => {
+                    let n = ctx
+                        .fd_table()
+                        .udp_send_buffer_size(sd.fd as u32)
+                        .map_err(|e| ioex(format!("SO_SNDBUF: {e}")))?;
+                    ds_box_int(ctx, n as i32)
+                }
+                "IP_TOS" => {
+                    let n = ctx
+                        .fd_table()
+                        .udp_tos(sd.fd as u32)
+                        .map_err(|e| ioex(format!("IP_TOS: {e}")))?;
+                    ds_box_int(ctx, n as i32)
+                }
                 _ => Err(RuntimeError::UnsupportedOperationException {
                     message: format!("DatagramSocket.getOption: {name} is not supported"),
                 }
@@ -14223,11 +14362,18 @@ pub(crate) fn register_re7_datagram_socket(r: &mut NativeMethodRegistry) {
                 // socket answers the wildcard, which is what the fd reports.
                 return Ok(Some(Value::Object(None)));
             }
+            // `udp_origin_split`, not a bare `rsplit_once(':')`: the split
+            // has to survive a v6 address. Since the wildcard socket is
+            // AF_INET6 the table reports `[::]:PORT`, and the naive split
+            // kept the BRACKETS — `getLocalAddress()` answered `/[::]` where
+            // HotSpot answers `/0:0:0:0:0:0:0:0`. `udp_origin_split` parses
+            // through `SocketAddr` first, so the host comes back as the
+            // address rather than as its textual wrapper.
             let addr = ctx
                 .fd_table()
                 .udp_local_addr(sd.fd as u32)
                 .ok()
-                .and_then(|s| s.rsplit_once(':').map(|(h, _)| h.to_string()))
+                .and_then(|s| udp_origin_split(&s).map(|(h, _)| h))
                 .unwrap_or_else(|| "0.0.0.0".to_string());
             // The UDP socket's own bound address, read back as numeric text.
             let ia = alloc_inet_address_unnamed(ctx, &addr)?;
@@ -14247,11 +14393,21 @@ pub(crate) fn register_re7_datagram_socket(r: &mut NativeMethodRegistry) {
         ds_set(this, |sd| sd.broadcast = i32::from(on));
         Ok(None)
     });
-    r.register(ds, "getBroadcast", "()Z", |_ctx, args| {
+    r.register(ds, "getBroadcast", "()Z", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        // Never set -> the JDK default, which is false for a plain
-        // DatagramSocket.
-        Ok(Some(Value::Int(i32::from(ds_get(this).broadcast == 1))))
+        let sd = ds_get(this);
+        // Ask the SOCKET when nobody has called the setter. The old comment
+        // here asserted "the JDK default, which is false"; measured against
+        // HotSpot 25 on the same host, `new DatagramSocket().getBroadcast()`
+        // is **true** — the JDK's DatagramSocket is a DatagramChannel adaptor
+        // and enables SO_BROADCAST when it opens. A hardcoded `false`
+        // therefore contradicted an option the socket really had on.
+        if sd.broadcast < 0 && sd.fd >= 0 {
+            if let Ok(on) = ctx.fd_table().udp_broadcast(sd.fd as u32) {
+                return Ok(Some(Value::Int(i32::from(on))));
+            }
+        }
+        Ok(Some(Value::Int(i32::from(sd.broadcast == 1))))
     });
     // (A byte-identical SECOND copy of the four registrations above stood here
     // and was removed. It was inert — last-write-wins with the same closure —
@@ -14505,11 +14661,23 @@ pub(crate) fn register_re7_datagram_socket(r: &mut NativeMethodRegistry) {
         ds_set(this, |s| s.reuse_address = i32::from(on));
         Ok(None)
     });
-    r.register(ds, "getReuseAddress", "()Z", |_ctx, args| {
+    r.register(ds, "getReuseAddress", "()Z", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let stored = ds_get(this).reuse_address;
-        // `1` only when nobody ever called the setter — the historical answer.
-        Ok(Some(Value::Int(if stored < 0 { 1 } else { stored })))
+        let sd = ds_get(this);
+        // Ask the SOCKET when nobody called the setter. The historical answer
+        // here was a hardcoded `1`, which HotSpot 25 contradicts on the same
+        // host: `new DatagramSocket().getReuseAddress()` is **false** there.
+        // `udp_reuse_address` did not exist when that constant was written.
+        if sd.reuse_address < 0 && sd.fd >= 0 {
+            if let Ok(on) = ctx.fd_table().udp_reuse_address(sd.fd as u32) {
+                return Ok(Some(Value::Int(i32::from(on))));
+            }
+        }
+        Ok(Some(Value::Int(if sd.reuse_address < 0 {
+            1
+        } else {
+            sd.reuse_address
+        })))
     });
     // These three real-JDK declarations have bytecode that delegates through
     // a private DatagramSocket delegate object.  CratonVM's authoritative
@@ -14610,7 +14778,322 @@ pub(crate) fn register_re7_datagram_socket(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(Some(ia))))
         },
     );
+
+    // ── The rest of the delegate-backed surface ────────────────────────────
+    //
+    // Everything below was UNREGISTERED, and on a real-JDK build that is not
+    // "missing" in a way anyone can see from the outside: `java.net
+    // .DatagramSocket`'s own bytecode for each of these is `delegate().x()`,
+    // and `delegate()` is
+    //
+    //     if (delegate == null) throw new InternalError("Should not get here");
+    //
+    // Every socket this registrar builds has a null `delegate` — its `<init>`
+    // intercepts replace the JDK constructor that would set one — so each call
+    // was a hard `InternalError`, not a wrong answer and not an
+    // `UnsupportedOperationException`. Censused against `javap -p -s
+    // java.net.DatagramSocket` and HotSpot 25 on the same host, one call per
+    // declared method (`probes/DsCensus.java`): twelve of them threw.
+    //
+    // netty's `DnsNameResolverTest.testAddressAlreadyInUse` is the one that
+    // filed it — it does `new DatagramSocket().getLocalSocketAddress()` — but
+    // the census is what says which siblings share the hole.
+
+    // `getLocalSocketAddress()` — null once closed, per the JDK.
+    r.register(
+        ds,
+        "getLocalSocketAddress",
+        "()Ljava/net/SocketAddress;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let sd = ds_get(this);
+            if sd.fd < 0 {
+                return Ok(Some(Value::Object(None)));
+            }
+            let Ok(local) = ctx.fd_table().udp_local_addr(sd.fd as u32) else {
+                return Ok(Some(Value::Object(None)));
+            };
+            let Some((host, port)) = udp_origin_split(&local) else {
+                return Ok(Some(Value::Object(None)));
+            };
+            let isa = alloc_inet_socket_address_resolved(ctx, "", &host, port)?;
+            Ok(Some(Value::Object(Some(isa))))
+        },
+    );
+
+    // `getRemoteSocketAddress()` — the `getInetAddress()`/`getPort()` pair as
+    // one object, and null when unconnected. Answered from the peer table for
+    // the same reason those two are: the JDK keeps answering after close.
+    r.register(
+        ds,
+        "getRemoteSocketAddress",
+        "()Ljava/net/SocketAddress;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let (host, port) = match ds_peer(this) {
+                Some((host, port)) if !host.is_empty() => (host, port),
+                _ => return Ok(Some(Value::Object(None))),
+            };
+            let isa = alloc_inet_socket_address_resolved(ctx, "", &host, port)?;
+            Ok(Some(Value::Object(Some(isa))))
+        },
+    );
+
+    // `bind(SocketAddress)` — a no-op before this, so `new DatagramSocket(null)`
+    // (the JDK's unbound form) could never be bound at all: `isBound()` stayed
+    // false and `getLocalSocketAddress()` stayed null on a socket the caller
+    // had just bound. A null argument is the JDK's "ephemeral wildcard".
+    r.register(ds, "bind", "(Ljava/net/SocketAddress;)V", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let spec = match args.get(1) {
+            Some(Value::Object(Some(sa))) => {
+                let (host, port) = read_socket_address_numeric(&*ctx, *sa)?;
+                format!("{host}:{port}")
+            }
+            _ => "0.0.0.0:0".to_string(),
+        };
+        let sd = ds_get(this);
+        if sd.closed != 0 {
+            return Err(ioex("DatagramSocket: closed"));
+        }
+        let reuse = sd.reuse_address == 1;
+        // Same wildcard rule as the constructors: keep the dual stack.
+        let wildcard_port = cratonvm_native_api::fd_table::wildcard_bind_port(&spec);
+        let fd = if sd.fd >= 0 {
+            // Keep the fd id: it is this socket's identity in every side table.
+            let rebound = match wildcard_port {
+                Some(port) => ctx
+                    .fd_table()
+                    .udp_rebind_dual_stack(sd.fd as u32, port, reuse),
+                None => ctx.fd_table().udp_rebind(sd.fd as u32, Some(&spec), reuse),
+            };
+            // Keep the JDK type: an unavailable address is `BindException`,
+            // not a bare `IOException`. Same reasoning as
+            // `capability_gate::translate_bind_io`, which serves the
+            // constructor paths.
+            rebound.map_err(|e| {
+                crate::capability_gate::translate_bind_failure(e, |io| {
+                    format!("DatagramSocket.bind: {io}")
+                })
+            })?;
+            sd.fd
+        } else {
+            let opened = match wildcard_port {
+                Some(port) => {
+                    crate::capability_gate::open_udp_wildcard_dual_stack_gated(&*ctx, port)
+                }
+                None => crate::capability_gate::open_udp_gated(&*ctx, Some(&spec)),
+            };
+            let fd = opened.map_err(|e| {
+                crate::capability_gate::translate_open_failure(e, |io| {
+                    format!("DatagramSocket.bind: {io}")
+                })
+            })?;
+            fd as i32
+        };
+        let port = ctx
+            .fd_table()
+            .udp_local_addr(fd as u32)
+            .ok()
+            .and_then(|s| udp_origin_split(&s).map(|(_, p)| p))
+            .unwrap_or(0);
+        ds_set(this, |s| {
+            s.fd = fd;
+            s.port = port;
+            s.closed = 0;
+        });
+        Ok(None)
+    });
+
+    // `<init>(SocketAddress)` — with a NULL argument this is the JDK's way to
+    // ask for an UNBOUND socket, which is why it cannot share the `(int)`
+    // ctor: that one always binds. Unregistered, it ran the real JDK
+    // constructor, which left the side table empty — so the object reported
+    // `getLocalSocketAddress() == null` while `send`/`receive` failed with
+    // "closed" on a socket that had really been created.
+    r.register(ds, "<init>", "(Ljava/net/SocketAddress;)V", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let Some(Value::Object(Some(sa))) = args.get(1) else {
+            // Unbound: no fd yet. `bind()` above supplies one.
+            ds_set(this, |s| {
+                s.fd = -1;
+                s.port = 0;
+                s.closed = 0;
+                s.timeout = 0;
+            });
+            return Ok(None);
+        };
+        let (host, port) = read_socket_address_numeric(&*ctx, *sa)?;
+        let opened = if host == "0.0.0.0" || host == "[::]" {
+            crate::capability_gate::open_udp_wildcard_dual_stack_gated(
+                &*ctx,
+                port.clamp(0, 65535) as u16,
+            )
+        } else {
+            crate::capability_gate::open_udp_gated(&*ctx, Some(&format!("{host}:{port}")))
+        };
+        let fd = opened.map_err(|e| {
+            crate::capability_gate::translate_open_failure(e, |io| format!("UDP bind: {io}"))
+        })?;
+        let actual_port = ctx
+            .fd_table()
+            .udp_local_addr(fd)
+            .ok()
+            .and_then(|s| udp_origin_split(&s).map(|(_, p)| p))
+            .unwrap_or(port);
+        ds_socket_defaults(&*ctx, fd);
+        ds_set(this, |s| {
+            s.port = actual_port;
+            s.closed = 0;
+            s.timeout = 0;
+            s.fd = fd as i32;
+        });
+        Ok(None)
+    });
+
+    // The four buffer-size / traffic-class accessors, and `supportedOptions`.
+    // Same `delegate()` InternalError as the rest; each one has a
+    // `FileDescriptorTable` primitive already.
+    r.register(ds, "getSendBufferSize", "()I", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let fd = ds_require_open(this)?;
+        let n = ctx
+            .fd_table()
+            .udp_send_buffer_size(fd)
+            .map_err(|e| ioex(format!("getSendBufferSize: {e}")))?;
+        Ok(Some(Value::Int(n as i32)))
+    });
+    r.register(ds, "setSendBufferSize", "(I)V", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let n = args.get(1).and_then(|v| v.as_int()).unwrap_or(0);
+        if n <= 0 {
+            return Err(iae("negative send buffer size"));
+        }
+        let fd = ds_require_open(this)?;
+        ctx.fd_table()
+            .udp_set_send_buffer_size(fd, n as usize)
+            .map_err(|e| ioex(format!("setSendBufferSize: {e}")))?;
+        Ok(None)
+    });
+    r.register(ds, "getReceiveBufferSize", "()I", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let fd = ds_require_open(this)?;
+        let n = ctx
+            .fd_table()
+            .udp_recv_buffer_size(fd)
+            .map_err(|e| ioex(format!("getReceiveBufferSize: {e}")))?;
+        Ok(Some(Value::Int(n as i32)))
+    });
+    r.register(ds, "setReceiveBufferSize", "(I)V", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let n = args.get(1).and_then(|v| v.as_int()).unwrap_or(0);
+        if n <= 0 {
+            return Err(iae("negative receive buffer size"));
+        }
+        let fd = ds_require_open(this)?;
+        ctx.fd_table()
+            .udp_set_recv_buffer_size(fd, n as usize)
+            .map_err(|e| ioex(format!("setReceiveBufferSize: {e}")))?;
+        Ok(None)
+    });
+    r.register(ds, "getTrafficClass", "()I", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let fd = ds_require_open(this)?;
+        let n = ctx
+            .fd_table()
+            .udp_tos(fd)
+            .map_err(|e| ioex(format!("getTrafficClass: {e}")))?;
+        Ok(Some(Value::Int(n as i32)))
+    });
+    r.register(ds, "setTrafficClass", "(I)V", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let n = args.get(1).and_then(|v| v.as_int()).unwrap_or(0);
+        if !(0..=255).contains(&n) {
+            return Err(iae("tc is not in range 0 -- 255"));
+        }
+        let fd = ds_require_open(this)?;
+        ctx.fd_table()
+            .udp_set_tos(fd, n as u32)
+            .map_err(|e| ioex(format!("setTrafficClass: {e}")))?;
+        Ok(None)
+    });
+
+    // `supportedOptions()` — exactly the names the `setOption`/`getOption`
+    // arms above answer, so the set cannot claim an option the pair refuses.
+    r.register(ds, "supportedOptions", "()Ljava/util/Set;", |ctx, args| {
+        let _this = obj_arg(args, 0)?;
+        ds_supported_options(ctx)
+    });
     ()
+}
+
+/// The fd of an open `DatagramSocket`, or the JDK's "Socket is closed".
+fn ds_require_open(this: ObjectRef) -> Result<u32, cratonvm_types::error::MethodCallFailed> {
+    let fd = ds_get(this).fd;
+    if fd < 0 {
+        return Err(ioex("Socket is closed"));
+    }
+    Ok(fd as u32)
+}
+
+/// Build the `Set<SocketOption<?>>` for `DatagramSocket.supportedOptions()`.
+///
+/// Each element is the real JDK constant, read out of its declaring class by
+/// name, so the identity a caller compares against
+/// (`supportedOptions().contains(SO_RCVBUF)`) is the same object it holds — a
+/// freshly minted look-alike would not be equal. Two declaring classes:
+/// `java.net.StandardSocketOptions` and, for `IP_DONTFRAGMENT`,
+/// `jdk.net.ExtendedSocketOptions`.
+fn ds_supported_options(ctx: &mut dyn NativeContext) -> MethodCallResult {
+    let created = ctx.new_object_initialized("java/util/LinkedHashSet", "()V", &[])?;
+    let Some(Value::Object(Some(set))) = created else {
+        return Ok(Some(Value::Object(None)));
+    };
+    let pin = ctx.pin_native_root(set);
+    // INITIALIZE, do not merely resolve: `class_id_by_name` answers "loaded",
+    // and every one of these constants is assigned in `<clinit>`. Reading them
+    // off a resolved-but-uninitialised class returns eight nulls and the set
+    // comes back empty.
+    // `IP_DONTFRAGMENT` is an EXTENDED option and lives in a different class,
+    // which is exactly why it was the one missing from the first version of
+    // this set: the `setOption`/`getOption` arms above answer it, so leaving
+    // it out broke this function's own invariant — that the advertised set is
+    // the set the pair serves — in the under-advertising direction, the one a
+    // one-way ratchet cannot see. HotSpot 25 lists it too (9 options, not 8).
+    for (class_name, fields) in [
+        (
+            "java/net/StandardSocketOptions",
+            &[
+                "SO_SNDBUF",
+                "SO_RCVBUF",
+                "SO_REUSEADDR",
+                "SO_BROADCAST",
+                "IP_TOS",
+                "IP_MULTICAST_IF",
+                "IP_MULTICAST_TTL",
+                "IP_MULTICAST_LOOP",
+            ][..],
+        ),
+        ("jdk/net/ExtendedSocketOptions", &["IP_DONTFRAGMENT"][..]),
+    ] {
+        // INITIALIZE, do not merely resolve — see above.
+        let Ok(cid) = ctx.ensure_class_initialized(class_name) else {
+            continue;
+        };
+        for field in fields {
+            let Some(idx) = ctx.static_field_index_by_name(cid, field) else {
+                continue;
+            };
+            let value = ctx.get_static_field(cid, idx);
+            if let Value::Object(Some(_)) = value {
+                let set_cur = ctx.read_native_pin(pin, set);
+                let _ = ctx.invoke_virtual(set_cur, "add", "(Ljava/lang/Object;)Z", &[value]);
+            }
+        }
+    }
+    let set_cur = ctx.read_native_pin(pin, set);
+    ctx.unpin_native_roots(pin);
+    Ok(Some(Value::Object(Some(set_cur))))
 }
 
 // ===========================================================================
@@ -15170,7 +15653,7 @@ fn re8_make_interface(ctx: &mut dyn NativeContext, host: &Re8HostIface) -> Resul
         // `/fe80:…%eth0` for every row of `getInetAddresses()`. Labelling them
         // `localhost` / `<hostname>` — which this loop used to do — is the
         // exact divergence
-        // `docs/internal/fixed-suite-bugs/inetaddress-tostring-hostname-literal-addresses-FIXED.md`
+        // `fixed-suite-bugs/inetaddress-tostring-hostname-literal-addresses-FIXED.md`
         // removed everywhere else; this call site was missed. `getHostName()`
         // still answers the numeric text, because that is its no-name
         // fallback.

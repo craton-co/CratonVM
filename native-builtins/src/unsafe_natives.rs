@@ -836,23 +836,56 @@ fn native_unsafe_set_memory_consolidated(
             }
             Ok(None)
         }
-        // Off-heap target: write into the single arena store. Each write is
-        // bounds-checked; the first out-of-arena byte aborts with IAE so an
-        // attacker-controlled (addr, bytes) cannot scribble past an arena.
+        // Off-heap target: ONE bulk write through the same bridge
+        // `copyMemory` uses, not a byte-at-a-time loop.
+        //
+        // PERF: this was `for i in 0..bytes { unsafe_arena_put_byte(offset+i) }`,
+        // and every `put_byte` takes the arena store's `RwLock` for writing and
+        // re-runs a `BTreeMap` range probe to find the block. Measured at
+        // **~20 ns per byte** — 600x HotSpot's 0.03 ns/byte, and 200x this
+        // VM's OWN `copyMemory`, which was already bulk at 0.10 ns/byte. So a
+        // 64 KiB fill cost 1.35 ms.
+        //
+        // `DirectByteBuffer.<init>` zeroes its whole allocation with
+        // `UNSAFE.setMemory(base, size, (byte) 0)`, so EVERY
+        // `ByteBuffer.allocateDirect(n)` paid 20n ns — 7 ms for a 64 KiB
+        // buffer, against HotSpot's 29 us. That is the dominant cost of every
+        // direct-buffer workload in the VM: netty's `AdaptivePoolingAllocator`
+        // (the 4.2 default) allocates direct chunks, and
+        // `PcapWriteHandlerTest.writePcapGreaterThan4Gb` took 294 s here
+        // against HotSpot's 3.8 s, blowing both the harness's 180 s process cap
+        // and the suite's 120 s per-test default — which is what
+        // `pcapwritehandlertest-hang-reopened-20260816` recorded as a HANG.
+        //
+        // Going through `copy_to_native_memory` also picks up the real-pointer
+        // dispatch `copyMemory` already has, so a `setMemory` on a genuine
+        // direct-buffer pointer (rather than a tagged arena handle) no longer
+        // reports "not in any live arena". A tagged-but-dead handle is still
+        // refused before the bridge sees it, exactly as on the copy path — the
+        // liveness check must not be allowed to fall through to a raw store.
         None => {
-            for i in 0..bytes as i64 {
-                if !crate::unsafe_arena_put_byte(offset + i, value) {
-                    invalidate_arena_cache();
-                    return Err(RuntimeError::IllegalArgumentException {
-                        message: format!(
-                            "Unsafe.setMemory: address 0x{:x} is not in any live arena",
-                            offset + i
-                        ),
-                    }
-                    .into());
+            if crate::unsafe_arena_addr_is_tagged(offset) && !crate::unsafe_arena_contains(offset) {
+                invalidate_arena_cache();
+                return Err(RuntimeError::IllegalArgumentException {
+                    message: format!(
+                        "Unsafe.setMemory: address 0x{offset:x} is not in any live arena"
+                    ),
                 }
+                .into());
             }
-            refresh_arena_cache(offset, bytes);
+            let fill = vec![value; bytes];
+            if !ctx.copy_to_native_memory(offset, &fill) {
+                invalidate_arena_cache();
+                return Err(RuntimeError::IllegalArgumentException {
+                    message: format!(
+                        "Unsafe.setMemory: address 0x{offset:x} is not in any live arena"
+                    ),
+                }
+                .into());
+            }
+            if crate::unsafe_arena_contains(offset) {
+                refresh_arena_cache(offset, bytes);
+            }
             Ok(None)
         }
     }
@@ -2214,6 +2247,86 @@ mod tests {
         )
         .unwrap();
         assert_eq!(r, None);
+    }
+
+    /// `setMemory` on an off-heap arena must fill the whole range, refuse a
+    /// range that leaves the block, and leave the neighbouring bytes alone.
+    ///
+    /// Guards the bulk rewrite: the byte-at-a-time loop this replaced took the
+    /// arena write lock and re-probed the block's `BTreeMap` entry per byte
+    /// (~20 ns/byte, so 1.35 ms for a 64 KiB fill), and it also filled up to
+    /// the first out-of-range byte BEFORE throwing — the fill is all-or-nothing
+    /// now.
+    #[test]
+    fn set_memory_off_heap_fills_in_bulk_and_stays_in_bounds() {
+        let _arena_lock = crate::arena_test_lock();
+        let mut ctx = MockNativeContext::new();
+        let addr = crate::unsafe_arena_allocate(64);
+
+        native_unsafe_set_memory_consolidated(
+            &mut ctx,
+            &[
+                dummy_this(),
+                Value::Object(None),
+                Value::Long(addr + 8),
+                Value::Long(16),
+                Value::Int(0xAB),
+            ],
+        )
+        .unwrap();
+        for i in 0..64i64 {
+            let want = if (8..24).contains(&i) { 0xAB } else { 0x00 };
+            assert_eq!(
+                crate::unsafe_arena_get_byte(addr + i),
+                want,
+                "byte {i} of the arena"
+            );
+        }
+
+        // A range that runs off the end of the block is refused, and refused
+        // WITHOUT having written any of it.
+        let err = native_unsafe_set_memory_consolidated(
+            &mut ctx,
+            &[
+                dummy_this(),
+                Value::Object(None),
+                Value::Long(addr + 60),
+                Value::Long(16),
+                Value::Int(0xCD),
+            ],
+        );
+        assert!(err.is_err(), "a fill past the end of the block must be refused");
+        for i in 60..64i64 {
+            assert_eq!(
+                crate::unsafe_arena_get_byte(addr + i),
+                0x00,
+                "byte {i} was partially filled by a refused setMemory"
+            );
+        }
+
+        crate::unsafe_arena_free(addr);
+    }
+
+    /// A freed (tagged-but-dead) handle must keep reporting the use-after-free
+    /// rather than reaching the bridge, where it would be treated as a raw
+    /// pointer and stored through.
+    #[test]
+    fn set_memory_refuses_a_freed_arena_handle() {
+        let _arena_lock = crate::arena_test_lock();
+        let mut ctx = MockNativeContext::new();
+        let addr = crate::unsafe_arena_allocate(32);
+        crate::unsafe_arena_free(addr);
+        let err = native_unsafe_set_memory_consolidated(
+            &mut ctx,
+            &[
+                dummy_this(),
+                Value::Object(None),
+                Value::Long(addr),
+                Value::Long(8),
+                Value::Int(1),
+            ],
+        );
+        assert!(err.is_err(), "setMemory on a freed handle must be refused");
     }
 
     #[test]

@@ -2499,7 +2499,7 @@ unsafe fn try_run_callee_handler(
     args_slice: &[i64],
     exc: cratonvm_types::ObjectRef,
     throw_pc: usize,
-) -> Option<i64> {
+) -> Result<i64, crate::runtime::interpreter::CalleeHandlerMiss> {
     // `exc` arrives here having already been DRAINED out of
     // `thread.jit_pending_exception` by the caller, so for the length of this
     // function it is a bare Rust local — the one heap reference to a live
@@ -2516,7 +2516,9 @@ unsafe fn try_run_callee_handler(
     let resolved = resolve_callee_cached(vm, info, receiver_class_id);
     let Some(cached) = resolved else {
         thread.native_pin_roots.truncate(pin_base);
-        return None;
+        // Nothing was consulted, so nothing is known — keep the caller's
+        // pre-existing conservative fallback rather than claiming "not caught".
+        return Err(crate::runtime::interpreter::CalleeHandlerMiss::Declined);
     };
     let args = decode_dispatch_values(vm, info, args_slice);
     let exc = thread.native_pin_roots[pin_base];
@@ -2525,7 +2527,7 @@ unsafe fn try_run_callee_handler(
     );
     thread.native_pin_roots.truncate(pin_base);
     let res = res?;
-    Some(match res {
+    Ok(match res {
         Ok(Some(Value::Int(v))) => v as i64,
         Ok(Some(Value::Long(v))) => v,
         Ok(Some(Value::Float(f))) => f.to_bits() as i64,
@@ -2757,25 +2759,76 @@ unsafe fn route_implicit_exc_through_callee(
                     } else {
                         usize::MAX
                     };
-                    if let Some(v) =
-                        try_run_callee_handler(vm, thread, info, receiver_class_id, args_slice, exc, throw_pc)
-                    {
-                        // The handler ran and the call is complete, so any
-                        // exceptional frame the callee's compiled body
-                        // published describes a FINISHED attempt. Drop it here
-                        // as well as on the fall-through below. Leaving it
-                        // stashed keeps a heap reference alive for an unbounded
-                        // time, and lets a later drain for the same method
-                        // claim it — the match compares method names only.
-                        cratonvm_jit::deopt::clear_exceptional_frame();
-                        return v;
-                    }
-                    // No handler covers this throw site -- restore the signal
-                    // exactly as it was found and fall through.
-                    if throw_pc == usize::MAX {
-                        set_jit_pending_exception(thread, exc);
-                    } else {
-                        set_jit_pending_exception_with_bci(thread, exc, throw_pc as i64);
+                    match try_run_callee_handler(
+                        vm,
+                        thread,
+                        info,
+                        receiver_class_id,
+                        args_slice,
+                        exc,
+                        throw_pc,
+                    ) {
+                        Ok(v) => {
+                            // The handler ran and the call is complete, so any
+                            // exceptional frame the callee's compiled body
+                            // published describes a FINISHED attempt. Drop it here
+                            // as well as on the fall-through below. Leaving it
+                            // stashed keeps a heap reference alive for an unbounded
+                            // time, and lets a later drain for the same method
+                            // claim it — the match compares method names only.
+                            cratonvm_jit::deopt::clear_exceptional_frame();
+                            return v;
+                        }
+                        // Only trustworthy with a KNOWN throw pc. The
+                        // pc-unknown search deliberately under-reports — it
+                        // skips a catch-all whose region does not span the whole
+                        // method, i.e. every javac `finally` — so "no handler"
+                        // there means "cannot tell", and propagating on it would
+                        // skip cleanup the re-run does perform. bc-java's
+                        // `SymmetricConstraintsTest` is the witness: its
+                        // `finally` restores a PROCESS-WIDE
+                        // `CryptoServicesRegistrar` constraint, and losing it
+                        // failed all 14 `HPKETestVectors` cases afterwards with
+                        // "service does not provide 192 bits of security".
+                        Err(crate::runtime::interpreter::CalleeHandlerMiss::NotCaught)
+                            if throw_pc != usize::MAX =>
+                        {
+                            // The callee's own table does not cover this throw:
+                            // the JVM answer is to propagate to the caller, whose
+                            // table has not been consulted yet. Falling through to
+                            // the whole-method re-run below would execute the
+                            // callee's prefix a SECOND time — and for a prefix
+                            // that is not idempotent that does not merely
+                            // duplicate work, it can swallow the exception
+                            // outright. `CipherInputStream.nextChunk` is the
+                            // witness: `finaliseCipher()` sets `finalized = true`
+                            // and THEN throws on a bad AEAD tag, so the re-run
+                            // takes the `if (finalized) return -1` exit and the
+                            // caller reads a clean EOF over tampered ciphertext
+                            // (bc-java `CipherStreamTest`).
+                            if throw_pc == usize::MAX {
+                                set_jit_pending_exception(thread, exc);
+                            } else {
+                                set_jit_pending_exception_with_bci(thread, exc, throw_pc as i64);
+                            }
+                            // The callee is gone; its exceptional frame can never
+                            // be claimed and must not be left for a later drain.
+                            cratonvm_jit::deopt::clear_exceptional_frame();
+                            return rc;
+                        }
+                        Err(_) => {
+                            // A handler matched but could not be resumed with
+                            // correct locals, or the throw pc is unknown so the
+                            // "not caught" answer above cannot be trusted.
+                            // Restore the signal exactly as it was found and fall
+                            // through to the whole-method re-run, which is this
+                            // branch's pre-existing answer.
+                            if throw_pc == usize::MAX {
+                                set_jit_pending_exception(thread, exc);
+                            } else {
+                                set_jit_pending_exception_with_bci(thread, exc, throw_pc as i64);
+                            }
+                        }
                     }
                 }
                 let _ = take_jit_pending_exception(thread);
@@ -2837,7 +2890,7 @@ unsafe fn route_implicit_exc_through_callee(
             (None, false) => None,
         };
         if let Some(exc) = exc {
-            if let Some(v) = try_run_callee_handler(
+            if let Ok(v) = try_run_callee_handler(
                 vm,
                 thread,
                 info,
@@ -3070,7 +3123,7 @@ unsafe fn handle_compiled_callee_deopt_sentinel(
     let has_handler = mic_callee_has_exception_table(vm, receiver_class_id, info);
     if has_handler {
         if let Some(exc) = signals.exception {
-            if let Some(v) = try_run_callee_handler(
+            if let Ok(v) = try_run_callee_handler(
                 vm,
                 thread,
                 info,
@@ -3110,7 +3163,7 @@ unsafe fn handle_compiled_callee_deopt_sentinel(
                 None => None,
             };
             if let Some(exc) = implicit {
-                if let Some(v) = try_run_callee_handler(
+                if let Ok(v) = try_run_callee_handler(
                     vm,
                     thread,
                     info,

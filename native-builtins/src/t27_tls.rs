@@ -8285,6 +8285,205 @@ mod tests {
         assert_eq!(server.negotiated_alpn.as_deref(), Some("h2"));
     }
 
+    /// A `ServerCertVerifier` that refuses every chain, the way a Java
+    /// `X509TrustManager` throwing `CertificateException` would if its verdict
+    /// reached rustls at verification time instead of after the handshake.
+    #[derive(Debug)]
+    struct AlwaysRejectVerifier {
+        algorithms: rustls::crypto::WebPkiSupportedAlgorithms,
+        /// `false` makes this the ACCEPTING control arm — the verdict the
+        /// deferred design effectively gives rustls today (it always accepts at
+        /// verification time and consults Java afterwards). The control is what
+        /// keeps the assertions below from being vacuous.
+        reject: bool,
+    }
+
+    impl rustls::client::danger::ServerCertVerifier for AlwaysRejectVerifier {
+        fn verify_server_cert(
+            &self,
+            _end_entity: &rustls::pki_types::CertificateDer<'_>,
+            _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+            _server_name: &rustls::pki_types::ServerName<'_>,
+            _ocsp: &[u8],
+            _now: rustls::pki_types::UnixTime,
+        ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+            if !self.reject {
+                return Ok(rustls::client::danger::ServerCertVerified::assertion());
+            }
+            Err(rustls::Error::InvalidCertificate(
+                rustls::CertificateError::ApplicationVerificationFailure,
+            ))
+        }
+        fn verify_tls12_signature(
+            &self,
+            message: &[u8],
+            cert: &rustls::pki_types::CertificateDer<'_>,
+            dss: &rustls::DigitallySignedStruct,
+        ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+            rustls::crypto::verify_tls12_signature_lenient(message, cert, dss, &self.algorithms)
+        }
+        fn verify_tls13_signature(
+            &self,
+            message: &[u8],
+            cert: &rustls::pki_types::CertificateDer<'_>,
+            dss: &rustls::DigitallySignedStruct,
+        ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+            rustls::crypto::verify_tls13_signature_lenient(message, cert, dss, &self.algorithms)
+        }
+        fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+            self.algorithms.supported_schemes()
+        }
+    }
+
+    /// **The destination for the deferred-trust-check refactor, proven before the
+    /// refactor.**
+    ///
+    /// `testHandshakeFailureOnlyFireExceptionOnce` (`SslHandlerTest:1546`) asserts
+    /// the SERVER's handshake future fails when the CLIENT's `TrustManager`
+    /// rejects the chain. Today it cannot: the trust check is armed by
+    /// `engine_take_pending_trust_check`, which fires only once
+    /// `!conn.is_handshaking()` -- by construction AFTER the client's `Finished`
+    /// has gone out. The server therefore completes a valid TLS 1.3 handshake,
+    /// netty runs `setHandshakeSuccess()`, and the alert arriving a moment later
+    /// cannot fail an already-completed promise.
+    ///
+    /// This asserts the property the current design cannot deliver and a
+    /// verifier-time verdict can: with the rejection raised INSIDE
+    /// `verify_server_cert`, the server receives an alert it can DECRYPT while
+    /// `is_handshaking()` is still true -- i.e. under handshake keys, not under
+    /// the application keys the cheap shortcut would need. (That shortcut was
+    /// measured and does not work: discarding rustls's queued flight before
+    /// queueing the alert desynchronises the TLS 1.3 key schedule and the server
+    /// reads `DecryptError` instead of the alert.)
+    ///
+    /// If this ever starts failing, section B of
+    /// `docs/known-issues/netty/openssl-key-material-and-engine-residuals-20260813.md`
+    /// has lost its destination and the plan needs rethinking before any more of
+    /// it is built.
+    /// Drive a client/server `EngineState` pair whose client verifier either
+    /// rejects or accepts, and report what the SERVER observed:
+    /// `(saw_error_while_handshaking, error_text, still_handshaking_at_end)`.
+    fn drive_pair_with_client_verifier(reject: bool) -> (bool, String, bool) {
+        let provider = std::sync::Arc::new(rustls::crypto::ring::default_provider());
+        let verifier: std::sync::Arc<dyn rustls::client::danger::ServerCertVerifier> =
+            std::sync::Arc::new(AlwaysRejectVerifier {
+                algorithms: provider.signature_verification_algorithms.clone(),
+                reject,
+            });
+        let mut client_config = rustls::ClientConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .dangerous()
+            .with_custom_certificate_verifier(verifier)
+            .with_no_client_auth();
+        client_config.alpn_protocols = vec![b"h2".to_vec()];
+
+        let mut client = super::EngineState::default();
+        client.is_client = true;
+        client.peer_host = Some("localhost".to_string());
+        client.alpn_protocols = vec![b"h2".to_vec()];
+        client.client_config = Some(std::sync::Arc::new(client_config));
+
+        let mut server = super::EngineState::default();
+        server.is_client = false;
+        server.alpn_protocols = vec![b"h2".to_vec()];
+        server.server_config = Some(
+            super::build_server_config_single_cert(
+                SERVER_CRT_PEM,
+                SERVER_KEY_PEM,
+                &["h2"],
+                false,
+                None,
+            )
+            .unwrap(),
+        );
+
+        super::engine_begin(&mut client).expect("client begin");
+        super::engine_begin(&mut server).expect("server begin");
+
+        // The client's rejection surfaces out of its own `unwrap` of the server
+        // flight; what matters is what the SERVER can then read.
+        let mut server_saw_alert_while_handshaking = false;
+        let mut server_error: Option<String> = None;
+        for _ in 0..32 {
+            let _ = super::engine_wrap_pump(&mut client, &[], 65536);
+            let to_server = std::mem::take(&mut client.outbound);
+            if !to_server.is_empty() {
+                let was_handshaking = server
+                    .conn
+                    .as_ref()
+                    .map(|c| c.is_handshaking())
+                    .unwrap_or(false);
+                match super::engine_unwrap_pump(&mut server, &to_server) {
+                    Ok(_) => {}
+                    Err(e) => {
+                        // The alert decrypted and rustls reported it. That is the
+                        // whole property: it arrived under handshake keys, so the
+                        // server learns of the failure before it could complete.
+                        if was_handshaking {
+                            server_saw_alert_while_handshaking = true;
+                        }
+                        server_error = Some(format!("{e:?}"));
+                        break;
+                    }
+                }
+            }
+            let _ = super::engine_wrap_pump(&mut server, &[], 65536);
+            let to_client = std::mem::take(&mut server.outbound);
+            if !to_client.is_empty() {
+                // The client's own unwrap is where its verifier runs and where it
+                // raises; that error is not what this test is about.
+                let _ = super::engine_unwrap_pump(&mut client, &to_client);
+            }
+        }
+
+        let still_handshaking = server
+            .conn
+            .as_ref()
+            .map(|c| c.is_handshaking())
+            .unwrap_or(false);
+        (
+            server_saw_alert_while_handshaking,
+            server_error.unwrap_or_default(),
+            still_handshaking,
+        )
+    }
+
+    #[test]
+    fn a_verifier_time_rejection_reaches_the_server_while_it_is_still_handshaking() {
+        // CONTROL first: the same driver with an ACCEPTING verifier -- which is
+        // what the deferred design gives rustls today -- must NOT produce any of
+        // the three signals. Without this arm the assertions below would pass on
+        // a driver that simply never completed a handshake at all.
+        let (accept_saw, accept_err, accept_handshaking) = drive_pair_with_client_verifier(false);
+        assert!(
+            !accept_saw,
+            "control: an accepted chain must not make the server see an error, got {accept_err}"
+        );
+        assert!(
+            !accept_handshaking,
+            "control: with the chain accepted the server must COMPLETE its handshake -- \
+             if it does not, the driver is broken and the reject arm proves nothing"
+        );
+
+        let (saw, err, still_handshaking) = drive_pair_with_client_verifier(true);
+        assert!(
+            saw,
+            "the server must see the client rejection while still handshaking; server_error={err}"
+        );
+        // And it must NOT be a decrypt failure: a `DecryptError` here would mean
+        // the alert went out under the wrong keys, which is exactly what the
+        // discard-the-queued-flight shortcut produced.
+        assert!(
+            !err.contains("DecryptError"),
+            "the alert must be decryptable under handshake keys, got {err}"
+        );
+        assert!(
+            still_handshaking,
+            "the server must still be handshaking, not completed"
+        );
+    }
+
     /// Drive a client/server `EngineState` pair through a complete loopback
     /// handshake (same shape as `wp51_loopback_handshake_via_engine_state`) and
     /// return them, with the client's captured peer chain populated.
