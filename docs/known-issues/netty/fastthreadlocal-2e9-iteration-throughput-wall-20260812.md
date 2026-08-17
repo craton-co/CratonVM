@@ -104,8 +104,11 @@ atomic `fetch_add`.
 
 ## Ground truth
 
-Re-run on the 08-17 binary with a **2400-second cap**: still `rc=124`. No
-`@@TESTFAIL` — nothing has failed, the loop is simply still going.
+Re-run on the 08-17 binary with a **2400-second cap**: still `rc=124`. Re-run
+again on the FINAL 08-17 binary — constructor bind, real new-site flags
+available, and the IR-intrinsic refusal all in — **still `rc=124`**. Two
+independent runs. No `@@TESTFAIL` in either: nothing has failed, the loop is
+simply still going.
 
 That run was on a host under load 20-35 from unrelated work, which inflates
 it. The microbenchmark extrapolation on a quiet host is ~430-500 s, and the
