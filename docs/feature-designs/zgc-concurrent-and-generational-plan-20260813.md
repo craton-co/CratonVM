@@ -22,7 +22,7 @@ that tests drive?
 | **Parallel marking** | **Built, opt-in** | `CRATONVM_ZGC_PARMARK=<n>` reaches `mark_parallel_stw` from `collect_garbage` |
 | **Compacting** | **Built, opt-in** | `CRATONVM_ZGC_RELOCATE=1` reaches `relocate_stw` from `collect_garbage`; returns a non-empty `PointerMap` and rewrites roots |
 | **Concurrent** | **BUILT since 2026-08-16 — the mutators really do run** | `maybe_gc` opens a cycle at a brief STW once allocation crosses `CRATONVM_ZGC_CONC_START`% of the collection threshold; the pool traces the closure while every mutator runs; the next collection's pause replays the SATB ingress, re-scans the roots and certifies the mark set. `set_mark_active(true)` has a production caller, allocation is BLACK during a cycle, and `--verbose:gc` says `mark=concurrent`. See §2 for what landed and how it differs from C1's expected shape |
-| **Generational** | **BUILT since 2026-08-17, opt-in** | `CRATONVM_ZGC_GENERATIONAL=1` makes every collection between two whole-heap ones a young cycle: the old generation is pre-marked and never traced, the remembered set supplies the old-to-young roots, and the sweep ages and promotes. The split is by **object** age, not page age — see §3 for why the page grid cannot do it. `gen=` on the `--verbose:gc` line and `[GC] zgc-generational:` at shutdown say whether it engaged |
+| **Generational** | **BUILT since 2026-08-17, opt-in** | `CRATONVM_ZGC_GENERATIONAL=1` makes every collection between two whole-heap ones a young cycle: the old generation is pre-marked and never traced, the remembered set supplies the old-to-young roots, and the sweep ages and promotes. The split is by **object** age, not page age — see §3 for why the page grid cannot do it. **Measured neutral at the default promotion age and worse at age 1** (§3b): the split saves marking on a collector whose pause is mostly sweeping, and the sweep is O(registry) whatever the split says. `gen=` and `[GC] zgc-generational:` say whether it engaged |
 
 **Updated 2026-08-16.** Concurrency landed. The rest of this section is kept as
 written on 2026-08-13 so the diff between what was planned and what was built
@@ -751,6 +751,117 @@ critical path, and it is a separate design
 
 ---
 
+## 3b. What Phase G actually measured — 2026-08-17
+
+`probes/ZgcGenProbe.java`: 800,000 retained linked nodes (~134 MB live), 600
+rounds of 30,000 short-lived nodes each, and an old-to-young store into every
+16th retained node per round — 48M objects allocated, `-Xmx1200m`, idle Azure
+box, three arms **interleaved**, two reps.
+
+`off` is generational off; `g3` is on at the default promotion age 3; `g1` is on
+at promotion age 1.
+
+| arm | cycles | Σ pause | reclaim | `old_retained` | wall (r1 / r2) |
+|---|---:|---:|---:|---:|---:|
+| off | 9 | 2.78 / 2.89 s | 75.7% | 0 | 115.6 / 119.8 s |
+| **g3** | 9 | **2.85 / 3.00 s** | 75.7% | **4.8M** | 115.6 / 123.2 s |
+| **g1** | 11 | **4.06 / 4.49 s** | **63.7%** | **10.4M** | 119.8 / 127.6 s |
+
+### It is engaged, and it is correct
+
+`young_cycles=6`, `gen=young/800087` on cycles 4–8, `old_retained` 4.8M,
+`remembered_roots` 4.8M. Every arm returned `BAD=0` **and**
+`written_intact=800000` — that second number is the one that matters: it is the
+count of objects reachable *only* through an old-generation field that were still
+intact at the end, so every one of 800,000 old-to-young edges survived six young
+cycles. That is G1's exit criterion, end to end, on a real workload.
+
+### It does not pay on this workload, and the reason is measurable
+
+At the default promotion age the total pause is **+2.5% to +4%** and the reclaim
+rate is identical; at promotion age 1 it is **+46% to +55%** with reclaim down
+from 75.7% to 63.7% and two extra cycles. Wall clock is flat within noise
+throughout.
+
+The per-cycle lines say why. A young cycle's pause is 280–300 µs·10³ and a major
+cycle's is 281–320 — **indistinguishable** — while `sweep` is 182 ms of a 309 ms
+mean pause. The mark was never the bottleneck here: a young cycle skipped tracing
+800k of ~1.7M registered objects and the pause did not move, because **the sweep
+walks every registered object whatever the generation split says.** That is not a
+surprise, it is what §3's G2 predicted in as many words; the measurement is what
+turns it from an expectation into a number.
+
+`g1` is worse for a second, separate reason: promotion age 1 promotes everything
+that survives one cycle, including churn that happened to survive — 11.7M
+promotions — so the old generation fills with floating garbage no young cycle
+will examine, reclaim falls, and the cycle count rises. **A lower promotion age
+is not a stronger version of the same knob.**
+
+### So G2 is not an optimisation of Phase G; it is what makes Phase G worth having
+
+A real young space is reclaimed by *resetting a cursor*, which is the only thing
+that removes an O(registry) sweep. Until then the generation split saves marking
+on a collector whose pause is mostly sweeping. **`CRATONVM_ZGC_GENERATIONAL`
+stays off by default, and now for a measured reason rather than out of caution.**
+
+### The first attempt at this measurement was vacuous, and that is the second time
+
+The 2026-08-17 run before this one came back `off 62.8 s → g3 55.9 s → g1 45.7 s`
+— an apparent **−27% wall-clock win** — with `young_cycles=0` on *every arm*, the
+flag on and 3.2M promotions logged. Every one of those differences was noise. The
+cause was the trigger forcing a major whenever `headroom_low` was set, on a heap
+where the live-bytes threshold is never reached and so *every* collection is
+allocation-driven (see `gen_force_major_next`).
+
+Only the engagement counter separated that from a result. §2b's withdrawn
+multi-threaded pause claim was the same lesson one section earlier: **print what
+the arm CHANGED beside what it COST, or a comparison of two arms that both did
+the same thing reads as a finding.**
+
+---
+
+## 3c. C5 re-measured — the three locks were not the bottleneck
+
+`probes/BigLive.java` at width 4000 / depth 250 (~1M live nodes), `-Xmx1500m`,
+relocation off, `CRATONVM_ZGC_PARMARK` swept, interleaved, two reps. Mean pause
+per collection; `mark_kinds` was `stw-parallel:7` on every non-zero arm and
+`stw-serial:7` at zero, so every arm did what its name says.
+
+| workers | mean pause r1 | r2 | vs 0 | mean `mark_us` r1 / r2 |
+|---:|---:|---:|---:|---:|
+| **0** | **103.9 ms** | **98.7 ms** | — | 86.9 / 82.9 |
+| 1 | 205.6 | 285.2 | **+98% / +189%** | 176.2 / 255.0 |
+| 2 | 212.4 | 265.1 | +104% / +169% | 184.0 / 181.4 |
+| 4 | 638.7 | 380.1 | +515% / +285% | 521.5 / 342.4 |
+| 8 | 364.4 | 466.8 | +251% / +373% | 346.4 / 431.4 |
+
+**The exit criterion is still unmet and the diagnosis was wrong.** All three
+per-object locks are gone (§4's item 1) and four workers still lose to zero by
+3–6×. More decisively: **one worker is +98% to +189%**, and a single worker
+contends with nobody. Lock contention cannot explain a cost that is already
+doubled at one worker.
+
+So the 2026-08-14 note's "a fixed ~30% for driving at all, and contention on
+top" had the split backwards: the **fixed cost is the problem** and it is far
+larger than 30%. Candidates, none of them yet measured: the per-cycle pool
+construction and driver-thread spawn; the striped queues replacing a plain `Vec`;
+and `ZMarkContext::visit_refs` being intrinsically more expensive than
+`enumerate_references` (it is a fork of it, for stated reasons, and the fork has
+never been priced).
+
+**The next step for C5 is `perf record` on a one-worker cycle, not another
+counter.** That is this tree's own standing rule and three rounds of lock hunting
+against a fixed cost is what ignoring it looks like. Note also the spread — 380
+to 639 ms at four workers — so any future comparison needs more than two reps.
+
+The lock removals are kept regardless: they are correctness-neutral, they help
+the serial marker too, and one of them
+(`metadata_pin::roots_for_loader` cloning a `Vec` under an `RwLock` per marked
+object) was a cost its own module had already documented and written a fix for
+that nothing called.
+
+---
+
 ## 4. Sequencing, and what to do first
 
 ```
@@ -777,9 +888,11 @@ frees live old objects.
 
 ### What is still open, 2026-08-17, ranked by what the measurements say
 
-1. **C5 — make the marker scale.** **All three per-object locks are now
-   fixed** (2026-08-17); what is open is whether that is *enough* to meet the
-   exit criterion, which is a measurement, not a change. The three were:
+1. **C5 — make the marker scale.** All three per-object locks are fixed
+   (2026-08-17) and **it was not enough — see §3c.** One worker is already +98%
+   to +189% against zero, and a single worker contends with nobody, so the
+   remaining cost is the engine's fixed overhead and not contention. The next
+   step is `perf record` on a one-worker cycle. The three locks were:
    `metadata_pin::roots_for_loader`, which took its registry `RwLock` and cloned
    a `Vec` for **every** marked object — its own module already had a
    `snapshot()` written for exactly that reason, which nothing called — now
@@ -792,13 +905,15 @@ frees live old objects.
    trick that fixed the other two cannot work there: the skip set is non-empty
    during every cycle in a real run, since it is every registered `Reference`
    object. A filter works because the question is per *object* and almost no
-   object is a `Reference`. The serial marker paid all three too, uncontended.
-   §3c has the sweep.
-2. **G2 — a real young space.** The answer to `sweep_us`, which is 30–52% of the
-   concurrent pause and the pause floor (§2c). A young cycle's mark cost falls
-   with the generation split; its **sweep** cost does not, because the sweep
-   walks every registered object whatever the split says. Needs the page
-   allocator; see §3's G2.
+   object is a `Reference`. The serial marker paid all three too, uncontended,
+   which is why they are kept even though they did not close the item.
+2. **G2 — a real young space.** Promoted by §3b from "the answer to `sweep_us`"
+   to **the thing that makes Phase G worth having at all**: with the split
+   engaged and 4.8M objects skipped per young cycle, the pause did not move,
+   because `sweep` is 182 ms of a 309 ms mean pause and is O(registry) whatever
+   the split says. A young space is reclaimed by resetting a cursor, which is the
+   only construction that removes that. Needs the page allocator; §3's G2 has the
+   five-step list and why step 3 depends on the JIT load barrier.
 3. ~~**`snapshot_us`**, 13% of the threaded concurrent pause~~ — **FIXED
    2026-08-17.** `bases()` materialised a `Vec` of every registered base (10.8M ×
    8 B = 87 MB allocated *inside* the pause, then walked two or three times);
