@@ -50,6 +50,7 @@ public final class JdkOnlyValuesViewProbe {
         valuesViewIteration();
         valuesViewOfCopiedMap();
         capturedBeforeAnyEntry();
+        theFourRemainingTriples();
         System.out.println("CK checks=" + checks);
         System.out.println("CK fails=" + fails);
         System.out.println((fails == 0 ? "PASS " : "FAIL ") + "JdkOnlyValuesViewProbe");
@@ -111,6 +112,106 @@ public final class JdkOnlyValuesViewProbe {
     }
 
     /** Calls {@code values()} through {@code java.util.Map}, not the class. */
+    /**
+     * The four `java/util/ArrayList` triples G60-1's resolution left held:
+     * `iterator()`, `toArray()`, `toArray(T[])`, `isEmpty()` and
+     * `contains(Object)`.
+     *
+     * <p>They were held because arming the whole class with
+     * `CRATONVM_ENFORCE_NATIVE_SHADOW` threw `ConcurrentModificationException`
+     * out of a real `ArrayList$Itr`, which said at least one of them is
+     * load-bearing — but that dial cannot go finer than a class name, so it
+     * could not say WHICH, and the resolved record filed four per-triple trials
+     * as open. This section is the behavioural half of those trials; the table
+     * is the other half.
+     *
+     * <p>Every line is exercised on THREE receiver shapes, because that is where
+     * the risk is: a plain `ArrayList`, an `Arrays.asList` view, and a list
+     * reached through the `java.util.List` interface door — the door
+     * `retired_shadow.rs` warns is registered separately and is not moved by a
+     * concrete-class retirement.
+     */
+    static void theFourRemainingTriples() {
+        List<String> al = new ArrayList<>();
+        ck("four.emptyAtStart", al.isEmpty(), Boolean.TRUE);
+        for (int i = 0; i < 4; i++) {
+            al.add("v" + i);
+        }
+        ck("four.notEmpty", al.isEmpty(), Boolean.FALSE);
+        ck("four.contains", al.contains("v2"), Boolean.TRUE);
+        ck("four.containsMissing", al.contains("nope"), Boolean.FALSE);
+        ck("four.containsNull", al.contains(null), Boolean.FALSE);
+        ck("four.toArrayLen", al.toArray().length, 4);
+        ck("four.toArrayFirst", al.toArray()[0], "v0");
+        String[] typed = al.toArray(new String[0]);
+        ck("four.toArrayTypedLen", typed.length, 4);
+        ck("four.toArrayTypedLast", typed[3], "v3");
+        String[] oversized = al.toArray(new String[6]);
+        ck("four.toArrayOversizedLen", oversized.length, 6);
+        // The JDK nulls the slot just past the copied elements; it does NOT
+        // clear the whole tail. A native that allocates a fresh array instead of
+        // filling the caller's gets this wrong without changing any length.
+        ck("four.toArrayOversizedTerminator", oversized[4], null);
+        int n = 0;
+        StringBuilder seen = new StringBuilder();
+        for (Iterator<String> it = al.iterator(); it.hasNext(); ) {
+            seen.append(it.next()).append(',');
+            n++;
+        }
+        ck("four.iterCount", n, 4);
+        ck("four.iterOrder", seen.toString(), "v0,v1,v2,v3,");
+        // Iterator.remove must write through to the list AND keep modCount in
+        // step, which is the pairing the class-level dial broke.
+        Iterator<String> rem = al.iterator();
+        rem.next();
+        rem.remove();
+        ck("four.sizeAfterItRemove", al.size(), 3);
+        ck("four.firstAfterItRemove", al.get(0), "v1");
+        // A structural change DURING iteration must still throw.
+        boolean cme = false;
+        try {
+            for (String v : al) {
+                al.add("boom" + v);
+            }
+        } catch (java.util.ConcurrentModificationException e) {
+            cme = true;
+        }
+        ck("four.cmeStillThrown", cme, Boolean.TRUE);
+
+        // Arrays.asList — a different carrier, whose iterator() IS retired.
+        List<String> fixed = java.util.Arrays.asList("a", "b", "c");
+        ck("four.asListEmpty", fixed.isEmpty(), Boolean.FALSE);
+        ck("four.asListContains", fixed.contains("b"), Boolean.TRUE);
+        ck("four.asListToArrayLen", fixed.toArray().length, 3);
+        int m = 0;
+        for (Iterator<String> it = fixed.iterator(); it.hasNext(); ) {
+            it.next();
+            m++;
+        }
+        ck("four.asListIterCount", m, 3);
+
+        // Through the interface door.
+        ck("four.viaIfaceIsEmpty", isEmptyOf(al), Boolean.FALSE);
+        ck("four.viaIfaceContains", containsOf(al, "v1"), Boolean.TRUE);
+        ck("four.viaIfaceToArrayLen", toArrayOf(al).length, al.size());
+        ck("four.viaIfaceIterCount", iterCountOf(al), al.size());
+
+        // An empty list's iterator and toArray, the degenerate shapes.
+        List<String> empty = new ArrayList<>();
+        ck("four.emptyIterHasNext", empty.iterator().hasNext(), Boolean.FALSE);
+        ck("four.emptyToArrayLen", empty.toArray().length, 0);
+        ck("four.emptyContains", empty.contains("x"), Boolean.FALSE);
+    }
+
+    static Boolean isEmptyOf(Collection<String> c) { return c.isEmpty(); }
+    static Boolean containsOf(Collection<String> c, String v) { return c.contains(v); }
+    static Object[] toArrayOf(Collection<String> c) { return c.toArray(); }
+    static int iterCountOf(Collection<String> c) {
+        int n = 0;
+        for (Iterator<String> it = c.iterator(); it.hasNext(); ) { it.next(); n++; }
+        return n;
+    }
+
     static Collection<String> valuesOf(Map<String, String> m) {
         return m.values();
     }
