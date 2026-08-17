@@ -1804,9 +1804,18 @@ pub(crate) fn native_uri_init(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
         }
         .into());
     }
-    let url_str = match args.get(1) {
-        Some(Value::Object(Some(o))) => ctx.read_string(*o).unwrap_or_default(),
-        _ => String::new(),
+    // The argument object is pinned HERE, before anything below allocates.
+    // It is restored verbatim at the end of this function (see the note
+    // there); a raw `ObjectRef` re-read from `args` after the parse would be
+    // a from-space address under a moving young collection.
+    let raw_arg = match args.get(1) {
+        Some(Value::Object(Some(o))) => Some(*o),
+        _ => None,
+    };
+    let raw_pin = raw_arg.map(|o| ctx.pin_native_root(o));
+    let url_str = match raw_arg {
+        Some(o) => ctx.read_string(o).unwrap_or_default(),
+        None => String::new(),
     };
     // Reject a malformed scheme name before any other check — the real JDK
     // parser validates this first (see `uri_scheme_name_fail_index`).
@@ -1994,6 +2003,39 @@ pub(crate) fn native_uri_init(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
     }
     url_parse(ctx, this, &url_str);
     uri_store_named(ctx, this, &url_str);
+    // Hand back the text we were GIVEN, not a copy of the decode.
+    //
+    // `url_str` is a Rust `String`, which cannot hold an unpaired surrogate,
+    // so every store built from it substitutes U+FFFD. MEASURED on both VMs
+    // at `e9bed7b89`, with the source built from a `char[]` so no
+    // constant-pool interning is involved:
+    //
+    //   new URI("http://h/a<U+D800>b").toString()
+    //     HotSpot   charAt(10)=d800, and toString() == the argument
+    //     CratonVM  charAt(10)=fffd, and toString() != the argument
+    //
+    // The LENGTH was right on both, which is why this survived: exactly one
+    // code unit differed, so nothing that measures size or splits on ASCII
+    // delimiters ever noticed. `url_str` stays for the PARSING above, which
+    // splits on ASCII delimiters and is unaffected by the substitution.
+    //
+    // Only the verbatim text is restored. The parsed components are still
+    // built from the decode and still carry U+FFFD — see this file's
+    // nomination in `G61-1`; fixing those needs component slicing by code
+    // unit, which is a different and much larger change.
+    //
+    // Slot 6 is written ONLY on our synthetic layout: on a real
+    // `java.net.URI`, slot 6 is `path`, and writing the whole URI there would
+    // corrupt it. Same rule, and the same reason, as the JDK-ONLY-LAYOUT
+    // guard in `phases_early.rs`.
+    if let (Some(pin), Some(raw0)) = (raw_pin, raw_arg) {
+        let raw_ref = ctx.read_native_pin(pin, raw0);
+        ctx.set_field_by_name(this, "string", Value::Object(Some(raw_ref)));
+        if net_phase_e::uri_has_synthetic_layout(ctx, this) {
+            ctx.set_field(this, 6, Value::Object(Some(raw_ref)));
+        }
+        ctx.unpin_native_roots(pin);
+    }
     Ok(None)
 }
 
