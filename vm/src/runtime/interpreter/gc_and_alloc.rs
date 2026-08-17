@@ -2354,6 +2354,38 @@ pub(super) fn process_references_after_gc(
         }
     };
 
+    // THE IDENTITY STAMP -- the exact test the two shape guards above
+    // approximate. See `ReferenceProcessor::identity_stamps`: a shape guard
+    // cannot tell a reclaimed `Reference` whose address was re-issued to
+    // ANOTHER `Reference` from the entry it recorded, and H2 allocates a
+    // `CloseWatcher` (a `PhantomReference`) per connection, so that case is the
+    // common one rather than the exotic one. The stamp is the identity hash the
+    // object carried at `discover_reference` time; it lives in the object's own
+    // mark word and travels with it across a relocation.
+    //
+    // `pre_gc_addr` is the key the processor's table is still on at this point
+    // (`update_after_gc` runs at the very end of this function), `obj` is the
+    // post-relocation object the write would land on.
+    //
+    // Both `0` cases mean "cannot tell" and fall through to the shape guards
+    // rather than declining: an unstamped entry (every in-tree test constructs
+    // those) and a thin-locked object, whose hash is displaced out of the mark
+    // word, must not lose their reference processing.
+    //
+    // Snapshotted rather than read through `ref_proc`: the loops below drain
+    // the processor (`take_newly_cleared`, `remove_collected`), so a live
+    // borrow of it here would not compile.
+    let identity_stamps = ref_proc.identity_stamps_snapshot();
+    let identity_matches = |pre_gc_addr: usize, obj: ObjectRef| -> bool {
+        match identity_stamps.get(&pre_gc_addr) {
+            Some(&stamp) if stamp != 0 => {
+                let now = shared.mem.heap.identity_hash_code(obj);
+                now == 0 || now == stamp
+            }
+            _ => true,
+        }
+    };
+
     // Null referent field (field 0) on cleared weak/soft references.
     // ROOT-CAUSE FIX (2026-06-10): once-only emission — the legacy
     // `cleared_ref_objects()` re-emitted every ever-cleared Reference on
@@ -2410,6 +2442,15 @@ pub(super) fn process_references_after_gc(
         if !is_reference_shaped(obj_ref) {
             if straystack_enabled() {
                 eprintln!("[refproc] SKIP reshaped CLEARED ref @0x{actual_addr:x} (not a Reference)");
+            }
+            continue;
+        }
+        // Shape-clean but a DIFFERENT `Reference` -- see `identity_matches`.
+        if !identity_matches(ref_addr, obj_ref) {
+            if straystack_enabled() {
+                eprintln!(
+                    "[refproc] SKIP reidentified CLEARED ref @0x{actual_addr:x} (identity stamp mismatch)"
+                );
             }
             continue;
         }
@@ -2485,6 +2526,19 @@ pub(super) fn process_references_after_gc(
             if straystack_enabled() {
                 eprintln!(
                     "[refproc] SKIP reshaped ENQUEUE ref @0x{actual_ref:x} into q@0x{actual_q:x} (not Reference/ReferenceQueue)"
+                );
+            }
+            continue;
+        }
+        // The loop that published a re-issued object as a queue head: a
+        // same-class re-issue is shape-clean here, and linking one into a queue
+        // hands it to `ReferenceQueue.poll()` as if it were the reference that
+        // died. Only the Reference is stamped -- a `ReferenceQueue` is not
+        // discovered through this registry, so it has no stamp to check.
+        if !identity_matches(*ref_addr, ref_obj) {
+            if straystack_enabled() {
+                eprintln!(
+                    "[refproc] SKIP reidentified ENQUEUE ref @0x{actual_ref:x} into q@0x{actual_q:x} (identity stamp mismatch)"
                 );
             }
             continue;
@@ -2668,6 +2722,18 @@ pub(super) fn process_references_after_gc(
                         "[refproc] SKIP stale weak/phantom RESTORE ref @0x{:x} (num_fields={})",
                         ref_obj_new,
                         shared.mem.heap.num_fields(ro),
+                    );
+                }
+                continue;
+            }
+            // This pass writes an OBJECT into slot 0, not a null, so a
+            // shape-clean re-issue here installs an unrelated reference in a
+            // live object's first field -- the `java.lang.String` receiver
+            // shape the H2 `TestMultiThread` MVStore-writer report opens with.
+            if !identity_matches(ref_obj_old, ro) {
+                if straystack_enabled() {
+                    eprintln!(
+                        "[refproc] SKIP reidentified weak/phantom RESTORE ref @0x{ref_obj_new:x} (identity stamp mismatch)"
                     );
                 }
                 continue;

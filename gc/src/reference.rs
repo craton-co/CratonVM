@@ -301,6 +301,33 @@ pub struct ReferenceProcessor {
     /// in it is only acted on when `is_marked(referent)` is *false*, and for a
     /// reference whose slot was never nulled that means the referent genuinely
     /// died on its own.
+    /// `reference_obj -> the identity hash the object carried when this
+    /// processor discovered it`.
+    ///
+    /// THE SAME-CLASS HOLE. Every write this processor's consumers perform
+    /// goes through a raw address, and the guards around them are SHAPE tests:
+    /// "does the object at this address still look like a `Reference`?". A
+    /// shape test cannot see the case where a reclaimed `Reference`'s address
+    /// is re-issued to ANOTHER `Reference` -- and H2 allocates
+    /// `org.h2.util.CloseWatcher` (a `PhantomReference`) per connection, so
+    /// that case is not hypothetical. Measured on the fixed VM: over 3200
+    /// phantom references through one queue on 8 threads, 2-5 of them per run
+    /// arrive as a DIFFERENT, half-constructed instance of the same class.
+    ///
+    /// The identity hash is the exact test the shape test approximates. It is
+    /// minted from a monotonic counter (`VmHeap::identity_hash_code`), lives in
+    /// the object's own mark word, and travels with the object when a collector
+    /// relocates it -- so it is the "monotonic registration id written into the
+    /// object" the write-up asked for, and it already exists. A reused address
+    /// answers with a different hash (or is unhashed and mints a fresh one,
+    /// which is likewise different), so the mismatch is decisive.
+    ///
+    /// `0` and a missing key both mean UNSTAMPED, and unstamped falls back to
+    /// the shape guards rather than declining: the in-tree tests construct
+    /// entries with no heap behind them, and a stamp that defaulted to
+    /// "refuse" would silently stop reference processing there.
+    identity_stamps: FxHashMap<usize, i32>,
+
     soft_pre_nulled: FxHashSet<usize>,
 
     stats: ReferenceProcessingStats,
@@ -324,6 +351,7 @@ impl ReferenceProcessor {
             soft_ref_lru_index: BTreeMap::new(),
             soft_ref_addr_index: FxHashMap::default(),
             last_observed_clock_ms: 0,
+            identity_stamps: FxHashMap::default(),
             soft_pre_nulled: FxHashSet::default(),
             stats: ReferenceProcessingStats::default(),
         }
@@ -1067,6 +1095,24 @@ impl ReferenceProcessor {
                 .or_insert(idx);
         }
 
+        // The stamp table is address-keyed too, and a compacting collector
+        // moves the keys. Rebuilt rather than relocated in place: two entries
+        // can swap addresses across one slide (a survivor slides onto the base
+        // a dead object vacated), and an in-place rewrite of a map whose keys
+        // are also its targets picks whichever insert lands second.
+        if !self.identity_stamps.is_empty() {
+            let mut moved: FxHashMap<usize, i32> =
+                FxHashMap::with_capacity_and_hasher(self.identity_stamps.len(), Default::default());
+            for (addr, hash) in self.identity_stamps.iter() {
+                let now = match pointer_map.get(addr) {
+                    Some(&new) if new != 0 => new,
+                    _ => *addr,
+                };
+                moved.insert(now, *hash);
+            }
+            self.identity_stamps = moved;
+        }
+
         // Relocate finalization queue entries
         for addr in &mut self.finalization_queue {
             if let Some(&new_addr) = pointer_map.get(addr) {
@@ -1114,6 +1160,50 @@ impl ReferenceProcessor {
     /// `process_soft_refs`. We rebuild the LRU index from scratch by
     /// re-walking the surviving entries so the `(timestamp, idx)` keys and
     /// stored values reflect the new positions.
+    /// Record the identity hash `reference_obj` carries, so every later write
+    /// through its address can prove the object is still the one discovered.
+    /// See [`Self::identity_stamps`].
+    ///
+    /// Called by the VM immediately after a `discover_*`, because minting the
+    /// hash needs the heap and this crate has only addresses.
+    pub fn stamp_reference(&mut self, reference_obj: usize, identity_hash: i32) {
+        if identity_hash != 0 {
+            self.identity_stamps.insert(reference_obj, identity_hash);
+        }
+    }
+
+    /// The stamp for `reference_obj`, or `None` when it was never stamped.
+    pub fn identity_stamp(&self, reference_obj: usize) -> Option<i32> {
+        self.identity_stamps.get(&reference_obj).copied()
+    }
+
+    /// A copy of the whole stamp table, for a consumer that must check
+    /// identities while it also mutates this processor (the post-GC passes
+    /// take `&mut self` to drain the cleared list, so they cannot hold a
+    /// borrow of it). One clone per collection, the same order as the passes
+    /// themselves.
+    pub fn identity_stamps_snapshot(&self) -> FxHashMap<usize, i32> {
+        self.identity_stamps.clone()
+    }
+
+    /// [`Self::weak_phantom_active_pairs`] plus each entry's identity stamp
+    /// (`0` = unstamped), so the pre-GC referent-null pass can check identity
+    /// after it has dropped this processor's lock.
+    pub fn weak_phantom_active_triples(&self) -> Vec<(usize, usize, i32)> {
+        self.weak_phantom_active_pairs()
+            .into_iter()
+            .map(|(r, t)| (r, t, self.identity_stamp(r).unwrap_or(0)))
+            .collect()
+    }
+
+    /// [`Self::soft_pre_nulled_active_pairs`] with the same stamp column.
+    pub fn soft_pre_nulled_active_triples(&self) -> Vec<(usize, usize, i32)> {
+        self.soft_pre_nulled_active_pairs()
+            .into_iter()
+            .map(|(r, t)| (r, t, self.identity_stamp(r).unwrap_or(0)))
+            .collect()
+    }
+
     pub fn remove_collected(&mut self, is_live: &dyn Fn(usize) -> bool) {
         self.soft_refs.retain(|e| is_live(e.reference_obj));
         self.weak_refs.retain(|e| is_live(e.reference_obj));
@@ -1138,6 +1228,30 @@ impl ReferenceProcessor {
                 .entry(entry.reference_obj)
                 .or_insert(new_idx);
         }
+        // Drop stamps for entries that just left. A leaked stamp is not
+        // dangerous (a later `discover_*` at the same address overwrites it,
+        // which is the ABA case) but it is unbounded, and this walk is already
+        // O(entries).
+        self.prune_identity_stamps();
+    }
+
+    /// Keep only the stamps of entries this processor still holds.
+    fn prune_identity_stamps(&mut self) {
+        if self.identity_stamps.is_empty() {
+            return;
+        }
+        let mut live: FxHashSet<usize> = FxHashSet::default();
+        for e in self
+            .soft_refs
+            .iter()
+            .chain(self.weak_refs.iter())
+            .chain(self.phantom_refs.iter())
+            .chain(self.cleaner_refs.iter())
+            .chain(self.finalizer_refs.iter())
+        {
+            live.insert(e.reference_obj);
+        }
+        self.identity_stamps.retain(|addr, _| live.contains(addr));
     }
 
     /// Retire the registry's bookkeeping entry for a `Reference` the
