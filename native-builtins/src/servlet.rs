@@ -3013,12 +3013,44 @@ fn s2_bb_alloc_direct(ctx: &mut dyn NativeContext, cap: i32) -> MethodCallResult
 
     // No heap array: `s2_bb_arr` must answer None so `s2_bb_direct_addr` is
     // consulted and the buffer reads as direct.
-    ctx.set_field(buf, BB_ARRAY, Value::Object(None));
-    ctx.set_field(buf, BB_POS, Value::Int(0));
-    ctx.set_field(buf, BB_LIMIT, Value::Int(cap));
-    ctx.set_field(buf, BB_CAP, Value::Int(cap));
-    ctx.set_field(buf, BB_MARK, Value::Long(addr));
-    ctx.set_field(buf, BB_ORDER, Value::Int(0)); // JDK default: BIG_ENDIAN
+    //
+    // By NAME first, then the indexed overlay behind the layout screen — the
+    // same order and the same guard `bb_write_hb` and `s2_bb_as_char_buffer`
+    // already use, and for the same reason (G38-1, closing the last unguarded
+    // member of that family). `alloc_concurrent_synthetic` resolves the REAL
+    // (abstract) `java.nio.ByteBuffer` whenever its class bytes are reachable,
+    // and on that layout the six indices alias
+    // `mark@0/position@1/limit@2/capacity@3/address@4/segment@5`: the old
+    // unconditional block wrote `Object(None)` over `mark` (an `int`, coerced
+    // to 0 where the JDK's own ctor leaves -1) and `Int(0)` over `segment` (a
+    // reference, coerced to null — so the ORDER FLAG WAS DESTROYED and every
+    // such buffer decoded as BIG_ENDIAN whatever `order(LITTLE_ENDIAN)` set).
+    // Both are the species in
+    // G30-1-the-silent-reference-slot-coercion-20260817.md, in both
+    // directions. The by-name writes put each value in the field that actually
+    // holds it — `address` is where `s2_bb_direct_addr` looks FIRST, and
+    // `seed_buffer_byte_order` writes the `bigEndian`/`nativeByteOrder` pair
+    // `s2_bb_order` reads on a real layout — so the direct-buffer convention
+    // is unchanged on both shapes.
+    //
+    // `hb`, `offset` and `isReadOnly` are deliberately NOT written: a fresh
+    // allocation already reads back null/0 for all three, which is exactly the
+    // direct, zero-offset, writable shape, and every name written here is one
+    // more slot to get wrong on a layout this function cannot see.
+    ctx.set_field_by_name(buf, "position", Value::Int(0));
+    ctx.set_field_by_name(buf, "limit", Value::Int(cap));
+    ctx.set_field_by_name(buf, "capacity", Value::Int(cap));
+    ctx.set_field_by_name(buf, "mark", Value::Int(-1));
+    ctx.set_field_by_name(buf, "address", Value::Long(addr));
+    cratonvm_native_io::seed_buffer_byte_order(ctx, buf);
+    if s2_bb_synthetic_layout(ctx, buf) {
+        ctx.set_field(buf, BB_ARRAY, Value::Object(None));
+        ctx.set_field(buf, BB_POS, Value::Int(0));
+        ctx.set_field(buf, BB_LIMIT, Value::Int(cap));
+        ctx.set_field(buf, BB_CAP, Value::Int(cap));
+        ctx.set_field(buf, BB_MARK, Value::Long(addr));
+        ctx.set_field(buf, BB_ORDER, Value::Int(0)); // JDK default: BIG_ENDIAN
+    }
 
     ctx.set_field(dealloc, DEALLOC_ID, Value::Long(alloc_id));
     ctx.set_field(cleanable, CLEANABLE_ACTION, Value::Object(Some(dealloc)));
@@ -3839,6 +3871,31 @@ fn s2_bb_no_backing_array() -> MethodCallFailed {
 /// (`order() == ByteOrder.LITTLE_ENDIAN`) and `toString()` behave exactly
 /// like HotSpot. Falls back to a 1-slot synthetic (field 0 = order int)
 /// only when the real class/statics are unavailable (synthetic-jdk mode).
+///
+/// G38-1: the FALLBACK arm was the unrepaired twin of
+/// `phases_late::foreign_ffm::p67_byte_order_object`. Reaching it does not
+/// prove the real class is absent — `ensure_class_initialized` can succeed and
+/// `static_field_index_by_name`/`get_static_field` still miss (a class loaded
+/// but whose `<clinit>` has not published the constants yet, and every
+/// compatibility-mode arm where a synthetic registrar runs against real class
+/// bytes). On that path `alloc_concurrent_synthetic` hands back an object of
+/// the REAL `java.nio.ByteOrder`, whose only instance field is
+/// `private final String name` at slot 0 — so `Value::Int(ord)` was silently
+/// coerced to `null` by `heap::coerce_field_value_by_descriptor`
+/// (G30-1-the-silent-reference-slot-coercion-20260817.md), and BOTH readers
+/// below then decoded the null as BIG_ENDIAN: `LITTLE_ENDIAN.toString()`
+/// printed `BIG_ENDIAN` and `equals` called the two constants equal.
+///
+/// The repair is the correct value in the right slot, not a refusal. The flag
+/// write stays — it is the synthetic-stub layout, and `s2_byte_order_ord`
+/// still falls back to it — and on top of it, when the CLASS actually declares
+/// `name` at a slot this object has, a genuine String goes there. Three
+/// shapes, all covered, exactly as in `p67_byte_order_object`: a fabricated
+/// stub names its fields `_f0..`, so `name` does not resolve and only the flag
+/// lands (byte-identical to before); a real `java.nio.ByteOrder` resolves
+/// `name` to slot 0 and gets the String, which `toString`/`s2_byte_order_ord`
+/// already decode; a resolved index out of range is skipped rather than
+/// written out of bounds.
 pub(crate) fn s2_byte_order_object(ctx: &mut dyn NativeContext, ord: i32) -> Result<ObjectRef, MethodCallFailed> {
     let cid = ctx
         .ensure_class_initialized("java/nio/ByteOrder")
@@ -3858,6 +3915,26 @@ pub(crate) fn s2_byte_order_object(ctx: &mut dyn NativeContext, ord: i32) -> Res
     }
     let bo = try_alloc_concurrent_synthetic(ctx, "java/nio/ByteOrder", 1)?;
     ctx.set_field(bo, 0, Value::Int(ord));
+    let bo_cid = ctx.class_id_of_object(bo);
+    // Bound before the `if let` so the immutable reborrow of `ctx` ends here
+    // rather than spanning the block that needs `&mut ctx`.
+    let name_slot = ctx.resolve_field_index_by_class_id(bo_cid, "name");
+    if let Some(slot) = name_slot {
+        if slot < ctx.object_num_fields(bo) {
+            // `create_string` allocates and can move `bo` (native stale-local
+            // family) — pin it across the call.
+            let bo_pin = ctx.pin_native_root(bo);
+            let name = ctx.create_string(if ord == 1 {
+                "LITTLE_ENDIAN"
+            } else {
+                "BIG_ENDIAN"
+            });
+            let bo = ctx.read_native_pin(bo_pin, bo);
+            ctx.unpin_native_roots(bo_pin);
+            ctx.set_field(bo, slot, Value::Object(Some(name)));
+            return Ok(bo);
+        }
+    }
     Ok(bo)
 }
 
@@ -9522,6 +9599,230 @@ mod tests {
             s2_bb_order(&ctx, buf),
             0,
             "the reader agrees with the refusal instead of decoding `mark` as an order"
+        );
+    }
+
+    // ---- G38-1: the reference slot the ByteOrder fallback used to null ------
+    //
+    // `G38-1-the-live-reference-slot-writes-20260817.md`. Reaching the
+    // fallback in `s2_byte_order_object` does NOT prove the real class is
+    // absent — `ensure_class_initialized` can succeed while the statics are
+    // not yet published, and every compatibility-mode arm runs a synthetic
+    // registrar against real class bytes. On that path the object IS a real
+    // `java.nio.ByteOrder`, whose sole instance field is
+    // `private final String name` at slot 0, and `Value::Int(ord)` there was
+    // coerced to `null` by `heap::coerce_field_value_by_descriptor`.
+
+    /// The falsifying half. Before the fix the fallback wrote ONLY the order
+    /// Int, so on a real layout `name` held an `Int` (mock) / `null` (VM) and
+    /// both readers decoded LITTLE_ENDIAN as BIG_ENDIAN.
+    #[test]
+    fn the_byte_order_fallback_names_the_constant_when_the_class_declares_name() {
+        use cratonvm_native_api::FieldMetadata;
+        let mut ctx = crate::test_utils::MockNativeContext::new();
+        let class_id = ctx
+            .ensure_class_initialized("java/nio/ByteOrder")
+            .expect("class init");
+        ctx.set_declared_fields(
+            class_id,
+            vec![FieldMetadata {
+                name: "name".to_string(),
+                descriptor: "Ljava/lang/String;".to_string(),
+                access_flags: 0,
+                slot_index: 0,
+                declaring_class_id: class_id,
+                is_static: false,
+            }],
+        );
+
+        for (ord, expected) in [(0i32, "BIG_ENDIAN"), (1i32, "LITTLE_ENDIAN")] {
+            let bo = s2_byte_order_object(&mut ctx, ord).expect("byte order object");
+            let name = match ctx.get_field_by_name(bo, "name") {
+                Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
+                other => panic!(
+                    "`ByteOrder.name` is a String reference; the fallback left {other:?} \
+                     — that is the value the descriptor coercion turns into null"
+                ),
+            };
+            assert_eq!(
+                name, expected,
+                "the constant must name ITSELF, not whichever constant a null decodes to"
+            );
+        }
+    }
+
+    /// The other half, so the fix cannot be "write a String everywhere".
+    /// A shape with no in-range `name` slot keeps the order flag and nothing
+    /// else — that is the synthetic-stub layout, where slot 0 is genuinely an
+    /// untyped field and every reader falls back to the Int.
+    #[test]
+    fn a_byte_order_shape_with_no_in_range_name_slot_keeps_only_the_flag() {
+        let mut ctx = crate::test_utils::MockNativeContext::new();
+        let bo = s2_byte_order_object(&mut ctx, 1).expect("byte order object");
+        assert_eq!(
+            ctx.object_num_fields(bo),
+            1,
+            "premise: the fallback allocates the 1-slot stand-in"
+        );
+        assert_eq!(
+            ctx.get_field(bo, 0),
+            Value::Int(1),
+            "no `name` field resolves in range, so only the order flag lands \
+             and the object is byte-identical to the pre-G38 one"
+        );
+    }
+
+    /// And the decode both writers feed: a String at slot 0 must round-trip
+    /// through the SAME `toString`/`equals` natives the Int does, or the fix
+    /// would have moved the defect into the readers.
+    #[test]
+    fn the_byte_order_readers_decode_a_name_string_as_well_as_the_flag() {
+        use cratonvm_native_api::FieldMetadata;
+        let mut registry = cratonvm_native_api::NativeMethodRegistry::new();
+        register_s2_byteorder(&mut registry);
+        let to_string = registry
+            .find("java/nio/ByteOrder", "toString", "()Ljava/lang/String;")
+            .expect("ByteOrder.toString native");
+        let equals = registry
+            .find("java/nio/ByteOrder", "equals", "(Ljava/lang/Object;)Z")
+            .expect("ByteOrder.equals native");
+
+        let mut ctx = crate::test_utils::MockNativeContext::new();
+        let class_id = ctx
+            .ensure_class_initialized("java/nio/ByteOrder")
+            .expect("class init");
+        ctx.set_declared_fields(
+            class_id,
+            vec![FieldMetadata {
+                name: "name".to_string(),
+                descriptor: "Ljava/lang/String;".to_string(),
+                access_flags: 0,
+                slot_index: 0,
+                declaring_class_id: class_id,
+                is_static: false,
+            }],
+        );
+        let big = s2_byte_order_object(&mut ctx, 0).expect("BIG_ENDIAN");
+        let little = s2_byte_order_object(&mut ctx, 1).expect("LITTLE_ENDIAN");
+
+        for (obj, expected) in [(big, "BIG_ENDIAN"), (little, "LITTLE_ENDIAN")] {
+            let rendered = match to_string(&mut ctx, &[Value::Object(Some(obj))]) {
+                Ok(Some(Value::Object(Some(s)))) => ctx.read_string(s).unwrap_or_default(),
+                other => panic!("toString returned {other:?}"),
+            };
+            assert_eq!(rendered, expected);
+        }
+        // `MethodCallFailed` is not `PartialEq`, so unwrap rather than compare
+        // the whole `Result`.
+        let eq = |ctx: &mut crate::test_utils::MockNativeContext, a: ObjectRef, b: ObjectRef| {
+            match equals(ctx, &[Value::Object(Some(a)), Value::Object(Some(b))]) {
+                Ok(Some(Value::Int(v))) => v,
+                other => panic!("equals returned {other:?}"),
+            }
+        };
+        assert_eq!(
+            eq(&mut ctx, big, little),
+            0,
+            "two DIFFERENT constants must not compare equal — they did while \
+             both slot-0 values decoded to 0"
+        );
+        assert_eq!(
+            eq(&mut ctx, big, big),
+            1,
+            "and the same constant must still compare equal to itself"
+        );
+    }
+
+    /// `s2_bb_alloc_direct` gained the by-name writes and the layout screen
+    /// (G38-1). On the bare six-slot synthetic layout — the ONLY shape this
+    /// function is reached on today — the screen is open and every indexed
+    /// slot must end byte-identical to the pre-G38 answer.
+    #[test]
+    fn the_direct_buffer_overlay_is_unchanged_on_the_bare_synthetic_layout() {
+        let mut ctx = crate::test_utils::MockNativeContext::new();
+        let buf = match s2_bb_alloc_direct(&mut ctx, 16) {
+            Ok(Some(Value::Object(Some(o)))) => o,
+            other => panic!("allocateDirect returned {other:?}"),
+        };
+        assert!(
+            s2_bb_synthetic_layout(&ctx, buf),
+            "premise: no real ByteBuffer layout is declared, so the screen is open"
+        );
+        assert_eq!(ctx.get_field(buf, BB_ARRAY), Value::Object(None));
+        assert_eq!(ctx.get_field(buf, BB_POS), Value::Int(0));
+        assert_eq!(ctx.get_field(buf, BB_LIMIT), Value::Int(16));
+        assert_eq!(ctx.get_field(buf, BB_CAP), Value::Int(16));
+        assert!(
+            matches!(ctx.get_field(buf, BB_MARK), Value::Long(_)),
+            "BB_MARK carries the native address on a direct buffer"
+        );
+        assert_eq!(
+            ctx.get_field(buf, BB_ORDER),
+            Value::Int(0),
+            "the order flag still lands in the slot the synthetic readers use"
+        );
+        assert_eq!(s2_bb_order(&ctx, buf), 0);
+        assert!(
+            s2_bb_arr(&ctx, buf).is_none(),
+            "a direct buffer has no backing array"
+        );
+    }
+
+    /// And the screen itself, which is what keeps that overlay off a real
+    /// layout: on the eleven-field JDK 25 `java.nio.ByteBuffer` the six
+    /// indices alias `mark/position/limit/capacity/address/segment`, so
+    /// `BB_ORDER` would land on a REFERENCE and `BB_ARRAY` on an `int`.
+    #[test]
+    fn the_real_byte_buffer_layout_closes_the_direct_overlay_screen() {
+        use cratonvm_native_api::FieldMetadata;
+        let mut ctx = crate::test_utils::MockNativeContext::new();
+        let class_id = ctx
+            .ensure_class_initialized("java/nio/ByteBuffer")
+            .expect("class init");
+        let names = [
+            ("mark", "I"),
+            ("position", "I"),
+            ("limit", "I"),
+            ("capacity", "I"),
+            ("address", "J"),
+            ("segment", "Ljava/lang/foreign/MemorySegment;"),
+            ("hb", "[B"),
+            ("offset", "I"),
+            ("isReadOnly", "Z"),
+            ("bigEndian", "Z"),
+            ("nativeByteOrder", "Z"),
+        ];
+        ctx.set_declared_fields(
+            class_id,
+            names
+                .iter()
+                .enumerate()
+                .map(|(i, (name, descriptor))| FieldMetadata {
+                    name: (*name).to_string(),
+                    descriptor: (*descriptor).to_string(),
+                    access_flags: 0,
+                    slot_index: i,
+                    declaring_class_id: class_id,
+                    is_static: false,
+                })
+                .collect(),
+        );
+        let buf = ctx.alloc_object(class_id, names.len());
+        assert!(
+            !s2_bb_synthetic_layout(&ctx, buf),
+            "an eleven-field real layout must never take the indexed overlay"
+        );
+        assert_eq!(
+            ctx.resolve_field_index_by_class_id(class_id, "segment"),
+            Some(BB_ORDER),
+            "BB_ORDER is exactly the reference-typed `segment` slot — that is \
+             why the unconditional write destroyed the order flag"
+        );
+        assert_eq!(
+            ctx.resolve_field_index_by_class_id(class_id, "mark"),
+            Some(BB_ARRAY),
+            "and BB_ARRAY is `mark`, an int, which is the other direction of \
+             the same coercion"
         );
     }
 }
