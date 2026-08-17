@@ -15028,8 +15028,19 @@ fn precise_exception_frame_sites_supported(
 /// A malformed instruction stream also answers `Some` (at the offending pc,
 /// with the opcode that could not be measured): a walk that cannot find the
 /// next boundary has not proved anything about the rest of the method.
+///
+/// **Public because the OSR door asks the same question.** RBC.6b refused any
+/// OSR compile of a method with a non-empty exception table outright, on the
+/// grounds that an OSR artifact carries no handler ranges. Staging the same
+/// three requests the method-entry path stages (`set_precise_exception_frame_
+/// request` / `set_protected_ranges_request` / `set_pending_exception_ranges`)
+/// gives the OSR body reason-9 frames at its protected-range invokes — but only
+/// where every throwing site in those ranges publishes one. That is exactly
+/// this predicate, so `compile_osr_artifact` calls it rather than growing a
+/// second, drifting copy of the opcode table. See
+/// `docs/known-issues/jit/osr-refuses-any-method-with-an-exception-table-20260817.md`.
 #[cfg(target_arch = "x86_64")]
-fn first_unsupported_precise_frame_site(
+pub fn first_unsupported_precise_frame_site(
     code: &[u8],
     code_len: usize,
     exception_table: &[cratonvm_reader::attribute::ExceptionTableEntry],
