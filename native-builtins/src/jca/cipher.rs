@@ -2095,6 +2095,31 @@ fn try_delegate_cipher_to_provider(
     try_delegate_cipher_to_named_provider(ctx, &provider, algo, cipher_obj)
 }
 
+/// Is this refusal one `Cipher.getInstance` is allowed to hand back unchanged?
+///
+/// Only the two checked exceptions `CipherSpi.engineSetMode`/`engineSetPadding`
+/// declare. Everything else — a `NumberFormatException` out of a provider
+/// parsing a mode name, say — is a provider failure the JDK converts into
+/// "No such algorithm"; see the call site.
+fn cipher_refusal_is_declared(ctx: &mut dyn NativeContext, refusal: &MethodCallFailed) -> bool {
+    let MethodCallFailed::ExceptionThrown(exc) = refusal else {
+        return false;
+    };
+    let mut class_id = ctx.class_id_of_object(*exc);
+    loop {
+        match ctx.class_name_arc_of_id(class_id).as_deref() {
+            Some("java/security/NoSuchAlgorithmException")
+            | Some("javax/crypto/NoSuchPaddingException") => return true,
+            Some("java/lang/Throwable") | None => return false,
+            _ => {}
+        }
+        match ctx.superclass_of(class_id) {
+            Some(parent) => class_id = parent,
+            None => return false,
+        }
+    }
+}
+
 /// Ask ONE named provider to serve `algo`, and on success turn `cipher_obj`
 /// into a wrapper over its SPI. See [`try_delegate_cipher_to_provider`].
 fn try_delegate_cipher_to_named_provider(
@@ -2146,14 +2171,33 @@ fn try_delegate_cipher_to_named_provider(
     ctx.unpin_native_roots(pin);
     if let Some(refusal) = refusal {
         // The provider OWNS the algorithm and refused the mode or the padding.
-        // `Cipher.getInstance(t, provider)` lets `Transform.setModePadding`'s
-        // exception propagate — measured on HotSpot 25, `AES/EAX/PKCS5Padding`
-        // with BouncyCastle is `NoSuchPaddingException: Only NoPadding can be
-        // used with AEAD modes.`, the PROVIDER's own message. Swallowing it and
-        // reporting this engine's "No such algorithm" instead named the wrong
-        // layer and the wrong defect. The chain walk in
-        // `try_delegate_cipher_to_chain` ignores an `Err` and moves to the next
-        // provider, which is what the anonymous overload wants.
+        // `Cipher.getInstance(t, provider)` lets a DECLARED refusal propagate —
+        // measured on HotSpot 25, `AES/EAX/PKCS5Padding` with BouncyCastle is
+        // `NoSuchPaddingException: Only NoPadding can be used with AEAD modes.`,
+        // the PROVIDER's own message. Swallowing that and reporting this
+        // engine's "No such algorithm" instead named the wrong layer and the
+        // wrong defect.
+        //
+        // Anything else the provider throws is not a refusal, it is a provider
+        // failing to parse the string, and the JDK does not let it out:
+        // `createCipher` runs `setModePadding` inside a `catch (Exception)` and
+        // ends the loop with `NoSuchAlgorithmException: No such algorithm: <t>`.
+        // BouncyCastle's `engineSetMode` reads the bit count off a `CFB`/`OFB`
+        // mode name with `Integer.parseInt`, so `AES/CFBNOT_REAL/NoPadding`
+        // raises `NumberFormatException: For input string: "NOT_REAL"` — which
+        // this returned verbatim, from a method declaring neither
+        // (`BlockCipherTest.testIncorrectCipherModes`, index 6).
+        //
+        // The chain walk in `try_delegate_cipher_to_chain` ignores an `Err` and
+        // moves to the next provider, which is what the anonymous overload
+        // wants, so the conversion is done here rather than there.
+        if !cipher_refusal_is_declared(ctx, &refusal) {
+            return Err(crate::phases_early::throw_jca_exc(
+                ctx,
+                "java/security/NoSuchAlgorithmException",
+                &format!("No such algorithm: {algo}"),
+            ));
+        }
         return Err(refusal);
     }
     // The SPI lives in the Java-visible `spi` field so the collector owns it.
