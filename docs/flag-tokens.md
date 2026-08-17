@@ -513,7 +513,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_JIT`
 
-177 tokens.
+178 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -578,6 +578,7 @@ export inherited from a parent shell.
 | `ir-call` | `CRATONVM_JIT_IR_CALL` |
 | `ir-call-special` | `CRATONVM_JIT_IR_CALL_SPECIAL` |
 | `ir-call-virtual` | `CRATONVM_JIT_IR_CALL_VIRTUAL` |
+| `ir-over-intrinsic` | `CRATONVM_JIT_IR_OVER_INTRINSIC` |
 | `ir-deopt-resume` | `CRATONVM_IR_DEOPT_RESUME` |
 | `ir-direct-call` | `CRATONVM_JIT_IR_DIRECT_CALL` |
 | `ir-buffer-estimate` | `CRATONVM_JIT_IR_LEGACY_BUFFER_ESTIMATE` |

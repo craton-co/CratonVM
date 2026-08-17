@@ -13616,6 +13616,16 @@ pub fn ir_stage_reporting() -> bool {
         || cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_IR_COMPILES").is_some()
 }
 
+/// `CRATONVM_JIT_IR_OVER_INTRINSIC=1` — let the optimizing tier take a method
+/// that contains a call-site intrinsic, losing the intrinsic to a dispatch.
+///
+/// Off by default; see the eligibility loop for the measurement. Exists so the
+/// trade can be re-measured in one binary if the IR tier ever grows an
+/// intrinsic emitter, at which point this whole refusal should go away.
+pub fn ir_over_intrinsic_enabled() -> bool {
+    cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_IR_OVER_INTRINSIC").is_some()
+}
+
 pub fn ir_direct_calls_enabled() -> bool {
     if !direct_jit_callee_calls_enabled() {
         return false;
@@ -16212,6 +16222,52 @@ fn try_compile_inner(
                         // `Op::New`, and an elided site emits no `Op::Call` for
                         // this entry to lower.
                         let _is_ctor = is_special && mn == "<init>";
+                        // CALL-SITE INTRINSIC: hand the method back to the
+                        // single-pass backend, which inlines it.
+                        //
+                        // The optimizing tier has no intrinsic emitter. Every
+                        // invoke it admits becomes a real call — a direct
+                        // cross-call for a statically-bound site, a MIC/PIC
+                        // cascade for a virtual one — so admitting a site that
+                        // `try_resolve_intrinsic` matches REPLACES inline
+                        // machine code with a dispatch. That is a large loss,
+                        // not a small one: measured on this branch, JDK 25,
+                        // `for (…) sink = new CtorAtomic()` where the
+                        // constructor body is `i = ATOMIC.getAndIncrement()`
+                        //
+                        //   IR body (intrinsic lost)      ~509 ns/op
+                        //   single-pass (intrinsic kept)  ~183 ns/op
+                        //
+                        // and with the intrinsic kept `ctorAtomic` costs the
+                        // same as `ctorPlain` (`i = ++staticInt`, ~189 ns/op),
+                        // which is the signature of `lock xadd` actually being
+                        // emitted. `CRATONVM_DBG=intrinsic` prints
+                        // "IR body installed (single-pass call-site intrinsics
+                        // NOT registered)" for exactly these bodies.
+                        //
+                        // This is the same lesson as the `Thread.currentThread`
+                        // and String-intrinsic binds recorded in
+                        // `jit_bridge.rs` — an intrinsic registered in one door
+                        // is inert in the others — arrived at from the opposite
+                        // direction: here the other door cannot emit it at all,
+                        // so the fix is to route the method to the door that
+                        // can rather than to duplicate the ladder.
+                        //
+                        // Scoped to methods that ACTUALLY contain such a site;
+                        // everything else keeps the optimizing tier.
+                        // `CRATONVM_JIT_IR_OVER_INTRINSIC=1` restores the old
+                        // behaviour for A/B.
+                        if !ir_over_intrinsic_enabled()
+                            && try_resolve_intrinsic(&cn, &mn, &desc).is_some()
+                        {
+                            all_emittable = false;
+                            if ir_stage_reporting() {
+                                nonemittable = Some(format!(
+                                    "pc={pc}: {cn}.{mn}{desc} is a call-site intrinsic;                                      the IR tier cannot emit one"
+                                ));
+                            }
+                            break;
+                        }
                         let (desc_args, ret) = match static_call_shape(&desc) {
                             Some(t) => t,
                             None => {
