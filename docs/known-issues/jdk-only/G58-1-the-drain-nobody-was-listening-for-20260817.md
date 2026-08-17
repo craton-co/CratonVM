@@ -1,6 +1,6 @@
 # G58-1 — the drain nobody was listening for
 
-**Status:** UNIT-MEASURED, VECTOR-PENDING-BUILD. **Provenance:** the "before"
+**Status:** MEASURED (see the banner below; the body is preserved as written). **Provenance:** the "before"
 rows in §0 are MEASURED by me at `e7e840264` (`C:/craton/target-rel5`,
 `--jdk-only`, diffed against HotSpot 25.0.3+9-LTS); the "after" column is
 **PREDICTED** until the next binary runs the vector. Done in-session by the
@@ -9,6 +9,23 @@ orchestrator.
 This closes **G51-1 N2** (= G44-1 N2), the last of `RSslLiveSession`'s four
 recorded row-groups. Together with `G57-1` it accounts for **every remaining
 failing row on that vector**.
+
+
+> **MEASURED 2026-08-17 — the four `drain.conn.*` rows are green, and §6's
+> stated risk did not materialise.** Binary from `3fcc8d90f`, `--jdk-only`:
+> `RSslLiveSession` is **104 checks, 0 failing**, an empty diff against the
+> oracle.
+>
+> §6 flagged one thing to watch: body drain now recycles the connection view
+> for EVERY https carrier, so a currently-green vector that drains a response
+> and then asks a session accessor would newly get HotSpot's exception. **The
+> full arm is 98 of 99 and no previously-green vector moved.** That was the
+> right thing to flag and the right way to settle it — the whole suite, not
+> `--only=drain`.
+>
+> `drain.session.isValid` and `drain.session.getId.length` — the pair that
+> separates *recycled* from *destroyed* — are still green, which is what makes
+> the recycle correct rather than merely quiet.
 
 ---
 

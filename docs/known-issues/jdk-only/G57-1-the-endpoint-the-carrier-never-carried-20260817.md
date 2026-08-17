@@ -1,6 +1,6 @@
 # G57-1 — the endpoint the carrier never carried
 
-**Status:** SOURCE-VERIFIED / UNIT-MEASURED, VECTOR-PENDING-BUILD.
+**Status:** MEASURED (see the banner below; the body is preserved as written).
 **Provenance:** the "before" rows are G51-1's, MEASURED on `9ae371468`
 (`target-rel3`) and not re-run here. The change itself is compile-clean and
 unit-green (§3); the four vector rows are **PREDICTED** until the binary at
@@ -10,6 +10,20 @@ Done in-session by the orchestrator, not by a lane.
 This closes **G51-1 N1**, which had been open across four lanes for the same
 reason each time: the reader was in one file, the writers in two others, and
 no lane owned all three.
+
+
+> **MEASURED 2026-08-17 — all four rows are green, and so is the vector.**
+> Binary `C:/craton/target-rel6/release/cratonvm.exe` from `3fcc8d90f`,
+> `--jdk-only` against HotSpot 25.0.3+9-LTS:
+>
+> ```text
+> RSslLiveSession   104 checks, 0 failing   diff against the oracle is EMPTY
+> ```
+>
+> `client.peerHost` and `attrs.shadow.peerHost` answer `localhost`; both
+> `peerPort` rows answer the server port. The PREDICTED column below was right,
+> and the full `--jdk-only` arm is **98 of 99** with `RSslLiveSession` among the
+> passes — so nothing else moved to buy it.
 
 ---
 
