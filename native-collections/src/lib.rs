@@ -23243,11 +23243,20 @@ fn native_stream_sorted(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
                 numeric_sort_key(ctx, &e).unwrap_or(0.0)
             })
             .collect();
-        idx.sort_by(|&a, &b| {
-            keys[a]
-                .partial_cmp(&keys[b])
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
+        // `Double.compare` order, NOT `partial_cmp`. `f64::partial_cmp` returns
+        // `None` for a NaN operand, and `unwrap_or(Equal)` turns that into "NaN
+        // equals everything" — which is both the wrong answer (Java sorts every
+        // NaN to the END) and a NON-TRANSITIVE comparator, the shape TimSort
+        // rejects with "Comparison method violates its general contract!". It is
+        // also wrong without any NaN at all: `partial_cmp(-0.0, 0.0)` is `Equal`
+        // where `Double.compare` is `-1`.
+        //
+        // Measured: `Stream.of(...).sorted().limit(3)` over a list containing
+        // two NaNs returned `NaN NaN -inf` against HotSpot's `-inf -1.0 -0.0`.
+        // This is the one live site of that idiom — the sibling `pq_compare` and
+        // `p65_compare_values` primitive arms are unreachable, see the note on
+        // each.
+        idx.sort_by(|&a, &b| cratonvm_types::jfp::double_ordering(keys[a], keys[b]));
     } else {
         // Fallback: sort by string representation.
         // `collect::<Result<..>>` rather than a `?` inside the closure: the
@@ -38757,11 +38766,22 @@ fn pq_compare(
         });
     }
     // Primitive fallback (rare — PQ normally holds boxed objects).
+    //
+    // Measured UNREACHABLE for `Float`/`Double`: a `PriorityQueue<Double>` boxes,
+    // so the `Comparable.compareTo` branch above takes every element and this arm
+    // never sees one. `NanSurface2.java` confirms it — `PriorityQueue.drain`,
+    // `.bulk.drain`, `.reverse.drain` and `PriorityBlockingQueue.drain` all match
+    // HotSpot bit-for-bit with NaNs and signed zeros in the queue.
+    //
+    // Corrected anyway, because `partial_cmp(..).map_or(0, ..)` is a
+    // non-transitive comparator (NaN equal to everything) sitting one refactor
+    // away from being reachable, and because leaving one spelling of this rule
+    // wrong is how the last five copies survived.
     Ok(match (a, b) {
         (Value::Int(a), Value::Int(b)) => a.cmp(b) as i32,
         (Value::Long(a), Value::Long(b)) => a.cmp(b) as i32,
-        (Value::Float(a), Value::Float(b)) => a.partial_cmp(b).map_or(0, |o| o as i32),
-        (Value::Double(a), Value::Double(b)) => a.partial_cmp(b).map_or(0, |o| o as i32),
+        (Value::Float(a), Value::Float(b)) => cratonvm_types::jfp::float_compare(*a, *b),
+        (Value::Double(a), Value::Double(b)) => cratonvm_types::jfp::double_compare(*a, *b),
         _ => 0,
     })
 }
