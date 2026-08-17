@@ -1,14 +1,21 @@
 # A foreign key between uncomparable ARRAY types is accepted — the referential existing-data check does not raise
 
 ## Status
-**OPEN, isolated to a two-table repro, NOT root-caused (2026-08-16).** 1 of the
-15 `org.h2.test.scripts.TestScript` errors on `dev` @ `496bc3c2c`. HotSpot JDK
-25 on the same classpath reports 0 errors. Part of the census in
-[`testscript-sql-divergences-20260816.md`](testscript-sql-divergences-20260816.md).
+**FIXED 2026-08-17 — superseded by**
+[`../../internal/fixed-suite-bugs/h2-suite-bugs/bug-h2-testscript-fk-array-comparability-skipped-by-rowcount-shortcut-FIXED-20260817.md`](../../internal/fixed-suite-bugs/h2-suite-bugs/bug-h2-testscript-fk-array-comparability-skipped-by-rowcount-shortcut-FIXED-20260817.md).
 
-This one is honestly still open at the mechanism level: every component it is
-built from behaves identically on both VMs, and the composition does not. What
-follows is the elimination, not an answer.
+The root cause was **not** in H2's Java at all: CratonVM natively overrides
+`ConstraintReferential.checkExistingData` (`native-builtins/src/apps_h2.rs`), and
+that native returns early when the referencing table has no rows — skipping the
+`prepare` that H2 relies on for the column-type check. All three "start here"
+hypotheses at the end of this record are therefore **wrong**, and wrong in a way
+worth keeping: they all assume the Java body executes, which it does not.
+
+The elimination below is kept per this project's convention of preserving
+investigation history rather than deleting a superseded hypothesis. It is
+accurate as far as it goes — every component really does behave identically on
+both VMs — it just never questioned whether the method under investigation was
+the code being run.
 
 ## The failure
 
@@ -88,7 +95,7 @@ So: the query text is right, the query throws when prepared through JDBC, the
 type machinery is right, and `checkExisting` is not being suppressed wholesale —
 yet the `ALTER TABLE` succeeds.
 
-## What has not been checked yet — start here
+## What had not been checked — and why this list could not have worked
 
 The gap is between `AlterTableAddConstraint.tryUpdate` line 282 and
 `Comparison.optimize`. In descending order of suspicion:

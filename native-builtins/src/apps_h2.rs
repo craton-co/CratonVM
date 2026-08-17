@@ -2126,6 +2126,21 @@ fn h2_constraint_check_existing_data(
         return Ok(None);
     }
 
+    // H2's own `checkExistingData` type-checks the referencing against the
+    // referenced columns as a SIDE EFFECT of PREPARING the probe query: the
+    // generated `... WHERE C."X"=P."Y"` runs through `Comparison.optimize`,
+    // which calls `TypeInfo.checkComparable` and raises
+    // `TYPES_ARE_NOT_COMPARABLE_2` (90110) for, say, an `INTEGER ARRAY` column
+    // referencing a `TIME ARRAY` one. That check does not depend on there being
+    // any rows -- H2 raises it on an empty table too.
+    //
+    // The row-count shortcut below skips the prepare, so it skipped the type
+    // check with it, and CratonVM silently ACCEPTED a foreign key that H2
+    // refuses (`ddl/alterTableAdd.sql:166`). Do the check explicitly, before
+    // the shortcut, so the fast path only skips the part that is genuinely a
+    // no-op on an empty table -- scanning it for orphaned rows.
+    h2_constraint_check_column_types(ctx, this)?;
+
     let table = match ctx.get_field_by_name(this, "table") {
         Value::Object(Some(o)) => o,
         _ => return Ok(None),
@@ -2143,6 +2158,48 @@ fn h2_constraint_check_existing_data(
     }
 
     h2_constraint_run_existing_data_query(ctx, this, session)
+}
+
+/// `TypeInfo.checkComparable(columns[i].type, refColumns[i].type)` for every
+/// column pair of a referential constraint -- the check H2 gets for free by
+/// preparing its probe query (see `h2_constraint_check_existing_data`).
+///
+/// No pinning: `Column.getType()` is a plain field getter and cannot allocate,
+/// so no moving GC can run between reading the two `TypeInfo`s and passing them
+/// as arguments. `checkComparable` itself can allocate (it builds the exception
+/// message), but only after both refs are arguments and therefore rooted.
+fn h2_constraint_check_column_types(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+) -> Result<(), MethodCallFailed> {
+    let columns = match ctx.get_field_by_name(this, "columns") {
+        Value::Object(Some(o)) => o,
+        _ => return Ok(()),
+    };
+    let ref_columns = match ctx.get_field_by_name(this, "refColumns") {
+        Value::Object(Some(o)) => o,
+        _ => return Ok(()),
+    };
+    let len = ctx.array_length(columns).min(ctx.array_length(ref_columns));
+    for i in 0..len {
+        let col = h2_index_column(ctx, columns, i)?;
+        let ref_col = h2_index_column(ctx, ref_columns, i)?;
+        let t1 = match ctx.invoke_virtual(col, "getType", "()Lorg/h2/value/TypeInfo;", &[])? {
+            Some(Value::Object(Some(o))) => o,
+            _ => continue,
+        };
+        let t2 = match ctx.invoke_virtual(ref_col, "getType", "()Lorg/h2/value/TypeInfo;", &[])? {
+            Some(Value::Object(Some(o))) => o,
+            _ => continue,
+        };
+        ctx.invoke(
+            "org/h2/value/TypeInfo",
+            "checkComparable",
+            "(Lorg/h2/value/TypeInfo;Lorg/h2/value/TypeInfo;)V",
+            &[Value::Object(Some(t1)), Value::Object(Some(t2))],
+        )?;
+    }
+    Ok(())
 }
 
 fn h2_constraint_run_existing_data_query(
