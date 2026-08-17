@@ -791,7 +791,20 @@ impl NativeStateSpan {
 /// thing that cannot be true of a thread that just ran a native — and would
 /// then repeat on that thread's every later native call.
 pub fn enter_native_state(site: &'static str) -> NativeStateSpan {
-    with_cell(ThreadExecState::NativeRunning, |cell| {
+    // SEED `JavaRunning`, not `NativeRunning`. `with_cell`'s seed is what a
+    // thread's FIRST observation records, and this funnel is often the first
+    // thing a carrier thread reaches — so seeding `NativeRunning` would make
+    // `from` read back as `NativeRunning` on that first call, the `Starting`
+    // fold below would never fire, and the span would restore `NativeRunning`.
+    // The thread would then be recorded as permanently inside a native, which
+    // is the one state the STW census WAITS for. Seeding `JavaRunning` records
+    // exactly what the three-access version concluded (`Starting` observed,
+    // resume as `JavaRunning`), and is ignored entirely for a thread that has
+    // been observed before.
+    //
+    // Caught by `a_span_on_an_unobserved_thread_resumes_as_java_running`, which
+    // was written before this line existed and failed on the first build.
+    with_cell(ThreadExecState::JavaRunning, |cell| {
         let raw = cell.state.load(Ordering::Relaxed);
         let from = ThreadExecState::from_u8(raw).unwrap_or(ThreadExecState::Starting);
         if stress_checks_enabled() && !is_legal(from, ThreadExecState::NativeRunning) {

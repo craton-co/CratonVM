@@ -15575,6 +15575,12 @@ mod tests {
             );
         });
 
+        // The declined-compile-probe memo. Its value is a call count, and the
+        // key is `(site, receiver class)` like the two caches above.
+        MIC_COMPILE_DECLINED.with(|c| {
+            c.borrow_mut().insert((key, 77), 1);
+        });
+
         // Every memo non-empty first, or the post-flush sweep proves nothing.
         for (name, len) in site_keyed_memo_census() {
             assert!(

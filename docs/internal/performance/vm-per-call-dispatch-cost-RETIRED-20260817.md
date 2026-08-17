@@ -146,6 +146,21 @@ The middle round is reported and discarded rather than dropped silently — its
 -14.9% is the number a single un-paired pair would have produced, and it is the
 one number here that is certainly wrong.
 
+**And on `AdaptiveByteBufAllocatorTest` — the class the page was reopened for —
+it is worth nothing measurable.** ABBA, 127/127 in every arm:
+
+| arm | runs (CPU) | mean |
+| --- | --- | ---: |
+| baseline | 269.07, 271.85 | 270.46 s |
+| fixed | 267.97, 279.71 | 273.84 s |
+
+Fully interleaved, fully overlapping, and the fixed mean is *higher*. That is a
+null result and it is the most useful row in this section: the five round trips
+came off the helper, and this class does not care, because **its cost is
+entering the helper at all** — 259.5 M times. See §7 and the successor page.
+(Both arms now run this class at 261-273 s rather than the 419-461 s earlier
+records quote. That is the host, not a fix: nothing here can be worth 40%.)
+
 The page's own specimen, `probes/NativeFunnelFloorProbe.java`, six arms in the
 order A B B A A B on the Windows box with all five fixes in, every rung in the
 same process:
@@ -301,11 +316,14 @@ page rather than leaving it open:
   one-flag repro.
 
 Neither of those is this page's to build — one is call-site re-binding, the
-other is the inline cascade's exception routing, and both are JIT codegen. A
-page whose every open item is answered and whose residual is a named mechanism
-owned elsewhere belongs in `internal`, not in `known-issues`. **A page that says
-"this is the VM's per-call cost, and here are two levers not worth building" is
-not a bug report; it was a measurement record all along.**
+other is the inline cascade's exception routing, and both are JIT codegen. They
+are filed together, with their counts and their one-flag repro, as
+`known-issues/perf/a-compiled-call-goes-out-to-rust-two-causes-20260817.md`,
+which is this page's successor. A page whose every open item is answered and
+whose residual is a named mechanism owned by a live page belongs in `internal`,
+not in `known-issues`. **A page that says "this is the VM's per-call cost, and
+here are two levers not worth building" is not a bug report; it was a
+measurement record all along.**
 
 ## 8. What did NOT convert — the original §3, unretracted
 
