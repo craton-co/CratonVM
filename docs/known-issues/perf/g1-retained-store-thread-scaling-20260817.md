@@ -139,3 +139,12 @@ first measurement pass.
 **Interleave the arms.** This box swings a factor of two on a 30-second
 measurement; one 768 ms figure re-measured as 4630 ms while another session was
 building (51 concurrent `rustc` processes).
+
+## Related
+
+- `resourceleakdetector-concurrentusage-is-slow-not-hung-CLOSED-20260817` —
+  the retired page this was split out of, with the two G1 fixes that landed and
+  the per-primitive cost table.
+- `../../internal/performance/biginteger-modpow-montgomery-FIXED-20260817.md`
+  (FIXED 2026-08-17) — the other residue filed out of the same pass, since
+  fixed by someone else.

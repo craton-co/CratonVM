@@ -8465,6 +8465,31 @@ pub fn set_reachability_fence_direct_fn(addr: usize) {
     REACHABILITY_FENCE_DIRECT_FN.store(addr, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// `CRATONVM_JIT='-census-direct-helpers'` — stop binding
+/// `Preconditions.checkIndex` / `Reference.reachabilityFence` to their thin
+/// direct helpers and send both back through the generic native funnel.
+/// Default ON.
+///
+/// The switch exists so the blast radius of these binds can be measured on ONE
+/// binary rather than argued across two. It was added after exactly that
+/// mistake: a CratonBench A/B was run against a control binary a day older than
+/// the branch, and reported ~13-19% "regressions" on `arithmetic` and `fib` —
+/// phases that contain no `checkIndex` and no `reachabilityFence` call at all,
+/// so the binds cannot have caused them. A same-binary A/B cannot be
+/// confounded that way.
+pub fn census_direct_helpers_enabled() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| {
+        cratonvm_types::flags::runtime_var("CRATONVM_JIT_CENSUS_DIRECT_HELPERS")
+            .map(|v| {
+                let v = v.trim();
+                !(v == "0" || v.eq_ignore_ascii_case("false") || v.eq_ignore_ascii_case("off"))
+            })
+            .unwrap_or(true)
+    })
+}
+
 /// Sites bound to the two census-driven helpers above, split by compile door,
 /// so "did this land" is answerable without a timing run — the lesson
 /// `LEAF_NATIVE_HITS` was added for.
@@ -12826,6 +12851,32 @@ pub fn mark_jit_bail_listed(class_name: &str, method_name: &str, descriptor: &st
     jit_bail_list().write().insert(h);
 }
 
+/// Bail-list a method AND record the refusal site the compile that just ran left
+/// behind, so `CRATONVM_DBG=jit-method-stats` can name it.
+///
+/// [`mark_jit_bail_listed`] alone leaves the reason unrecorded. That is fine for a
+/// caller that has already recorded one, and wrong for the OSR door in
+/// `vm/src/runtime/interpreter/jit_bridge.rs`, which reaches the backend directly:
+/// its bails arrived in the report as `reason=unrecorded`, which is exactly the
+/// shape that sends a reader looking for a compiler bug somewhere else. An OSR bail
+/// is also the one that matters most — that door compiles a `@Test` method's hot
+/// loop, and a method denied there runs its whole life interpreted with no other
+/// diagnostic. Found the hard way on `HttpHeaderValidationUtilTest`'s two
+/// exhaustive loops (docs/known-issues/jit/osr-refuses-any-method-with-an-exception-table-20260817.md).
+///
+/// Consumes the thread-local site, like `try_compile`'s own recorder.
+pub fn mark_jit_bail_listed_with_site(class_name: &str, method_name: &str, descriptor: &str) {
+    mark_jit_bail_listed(class_name, method_name, descriptor);
+    let site = take_jit_bail_site().unwrap_or((take_jit_pipeline_stage(), 0, 0));
+    record_jit_bail_reason(class_name, method_name, descriptor, site);
+    if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JITC").is_some() {
+        eprintln!(
+            "[cratonvm-jitc] OSR-bail site={} pc={} opcode={:#04x} {class_name}.{method_name}{descriptor}",
+            site.0, site.1, site.2,
+        );
+    }
+}
+
 /// Diagnostic: number of methods currently bail-listed.
 pub fn jit_bail_list_size() -> usize {
     jit_bail_list().read().len()
@@ -13418,6 +13469,44 @@ impl Drop for JitCompileStackGuard {
             debug_assert_eq!(popped.as_ref(), Some(&self.key));
         });
     }
+}
+
+/// Depth of the nested-compile stack on this thread.
+///
+/// `0` outside any compile; `1` inside a top-level `try_compile`; deeper while a
+/// `callee_compiler` compiles a callee inside its caller's compilation.
+///
+/// # Why a VM-side caller needs this
+///
+/// Binding a statically bound call site to a raw `CALL` requires the callee to be
+/// COMPILED ALREADY, and `vm/.../jit_bridge.rs`'s callee resolver
+/// (`direct_callee_lookup`) may compile one transitively to get there. Without a
+/// depth bound, a deep call chain compiled bottom-up on one thread would nest one
+/// compile per level; with one, the chain stops binding directly past the bound
+/// and falls back to the dispatch helper, which is always correct.
+pub fn jit_active_compile_depth() -> usize {
+    JIT_COMPILE_STACK.with(|stack| stack.borrow().len())
+}
+
+/// Whether `(class_name, method_name, descriptor)` is already being compiled
+/// somewhere on this thread's nested-compile stack.
+///
+/// A VM-side transitive callee compile must ask this before recursing:
+/// re-entering a compile that is already open would recurse until the depth bound
+/// (or the native stack) ran out. Same question [`note_jit_recursive_compile_cycle`]
+/// answers for this crate's own `callee_compiler`, minus the cycle bookkeeping —
+/// the VM caller only needs to decline.
+pub fn jit_active_compile_contains(
+    class_name: &str,
+    method_name: &str,
+    descriptor: &str,
+) -> bool {
+    JIT_COMPILE_STACK.with(|stack| {
+        stack
+            .borrow()
+            .iter()
+            .any(|k| k.matches(class_name, method_name, descriptor))
+    })
 }
 
 fn mark_jit_recursive_cycle_method(key: JitCompileMethodKey) {
@@ -15527,9 +15616,17 @@ fn try_compile_inner(
         // would not actually vectorise. The general problem it is a special
         // case of — the optimizing tier replaces a C1 body whenever it CAN,
         // with no evidence the replacement is faster, and every `cov-*` lane
-        // widens the set of methods that happens to — is written up in
-        // `feature-designs/c2/perf-01-sieve-ir-body-6x-slower-than-c1.md`
-        // and is not solved here.
+        // widens the set of methods that happens to — is the open policy
+        // question kept in perf-01-sieve-ir-body-6x-slower-than-c1.md, and is
+        // not solved here.
+        //
+        // The `sieve` REGRESSION that brief was opened for is FIXED (closeout:
+        // perf-01-sieve-ir-body-slower-than-c1-FIXED-20260804.md) — by this
+        // veto — and re-verified 2026-08-17 on CratonBench: checksum `9592` on
+        // HotSpot 25 and on CratonVM, at parity rather than 6.4x
+        // (8.2-10.0 s against HotSpot's 8.9 s on the same host). Only the
+        // policy question above is still open; do not read the brief's
+        // measurement as current.
         && single_pass_only_lowering_for(code, code_len, cached).is_none()
         // Same species as PERF-01 directly above, and measured the same way:
         // where a `java/lang/String` access intrinsic fires, an IR body is a
@@ -16517,6 +16614,7 @@ fn try_compile_inner(
                             // (`census_direct_helper_sites`) so that claim is
                             // checkable rather than assumed.
                             if direct_target.is_none()
+                                && census_direct_helpers_enabled()
                                 && is_static
                                 && direct_class == "jdk/internal/util/Preconditions"
                                 && mn == "checkIndex"
@@ -16538,6 +16636,7 @@ fn try_compile_inner(
                                 }
                             }
                             if direct_target.is_none()
+                                && census_direct_helpers_enabled()
                                 && is_static
                                 && direct_class == "java/lang/ref/Reference"
                                 && mn == "reachabilityFence"
@@ -18227,6 +18326,7 @@ fn try_compile_inner(
                     // JDK-ONLY-WAVE2: see the marker on the
                     // `StringLatin1.toLowerCase` bind above — same list.
                     if direct_jit_callee_calls_enabled
+                        && census_direct_helpers_enabled()
                         && invoke_kind == 3
                         && class_name == "jdk/internal/util/Preconditions"
                         && method_name == "checkIndex"
@@ -18259,6 +18359,7 @@ fn try_compile_inner(
                     }
 
                     if direct_jit_callee_calls_enabled
+                        && census_direct_helpers_enabled()
                         && invoke_kind == 3
                         && class_name == "java/lang/ref/Reference"
                         && method_name == "reachabilityFence"

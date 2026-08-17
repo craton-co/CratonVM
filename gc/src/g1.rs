@@ -1986,7 +1986,12 @@ impl G1Collector {
         // contiguous block (see the `arena` field doc and `alloc_humongous_locked`).
         // Allocated once and never moved/reallocated → every region base and
         // the `region_lookup` table are address-stable for the collector's life.
-        let arena: Box<[u8]> = vec![0u8; num_regions * config.region_size].into_boxed_slice();
+        // Fallible, so an -Xmx the OS will not reserve is reported as a heap
+        // reservation failure rather than as `handle_alloc_error`'s bare
+        // `memory allocation of N bytes failed` — see `alloc_zeroed_heap`.
+        let arena: Box<[u8]> =
+            crate::arena::alloc_zeroed_heap(num_regions * config.region_size, "G1 region array")
+                .into_boxed_slice();
         let arena_base = arena.as_ptr() as usize;
         let arena_end = arena_base + arena.len();
 

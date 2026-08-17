@@ -557,6 +557,78 @@ pub fn format_log2_hist(hist: &[(usize, usize)]) -> String {
         .join(" ")
 }
 
+/// Allocate a zero-filled heap backing store of `capacity` bytes, reporting an
+/// unsatisfiable *reservation* as such instead of as a bare allocator abort.
+///
+/// `vec![0u8; capacity]` is infallible: when the OS refuses the reservation,
+/// `Vec` routes into `std::alloc::handle_alloc_error`, whose entire output is
+///
+/// ```text
+/// memory allocation of 12884901888 bytes failed
+/// note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+/// ```
+///
+/// with an empty stdout and no mention of `-Xmx`, of the heap, or of the
+/// machine. That is actively misleading, and it has already cost real time: the
+/// Tomcat non-passed census filed the two `*LargeHeap` classes as an allocator
+/// defect on the strength of that line, when the harness runs them at
+/// `-Xmx12g` by design and the box simply could not reserve 12 GiB while eight
+/// shards were resident. Both pass at `-Xmx12g` on an idle box.
+///
+/// HotSpot says "Could not reserve enough space for object heap" and names the
+/// size; so does this. `region` names which store failed, because a VM can
+/// stand up several (young semi-spaces, G1's region array) and "which one" is
+/// the first thing worth knowing.
+///
+/// Only the *reservation* path belongs here. A Java-level allocation that
+/// cannot be satisfied inside an existing heap must still raise a catchable
+/// `java.lang.OutOfMemoryError`, which it does — verified against
+/// `TestByteChunkLargeHeap` at `-Xmx2g`:
+/// `OutOfMemoryError: Java heap space (alloc_array length 1610612736)`.
+pub fn alloc_zeroed_heap(capacity: usize, region: &str) -> Vec<u8> {
+    if capacity == 0 {
+        return Vec::new();
+    }
+    // `u8` is align-1, so the only way `from_size_align` can fail is a size
+    // that rounds past `isize::MAX`; report that as the reservation failure it
+    // effectively is rather than unwrapping.
+    let layout = match std::alloc::Layout::from_size_align(capacity, 1) {
+        Ok(l) => l,
+        Err(_) => heap_reservation_failed(capacity, region),
+    };
+    // SAFETY: `layout` has non-zero size (the `capacity == 0` early return
+    // above is the only zero case).
+    let ptr = unsafe { std::alloc::alloc_zeroed(layout) };
+    if ptr.is_null() {
+        heap_reservation_failed(capacity, region);
+    }
+    // SAFETY: `ptr` is a live allocation from the global allocator for exactly
+    // `layout` — size `capacity`, align 1, which is `align_of::<u8>()` — and
+    // `alloc_zeroed` initialised all `capacity` bytes, so every element is a
+    // valid `u8`. Passing `capacity` as both length and capacity matches the
+    // allocation exactly, so the `Vec`'s own deallocation reconstructs the same
+    // layout. This is the allocation `vec![0u8; capacity]` would have made; the
+    // only difference is that a null return is handled instead of aborting.
+    unsafe { Vec::from_raw_parts(ptr, capacity, capacity) }
+}
+
+/// Report a heap reservation the OS refused, and exit.
+///
+/// Exits rather than panics: this runs before there is a Java thread to throw
+/// on, and the state it replaces was already a process abort
+/// (`handle_alloc_error`), so nothing that previously unwound stops doing so.
+fn heap_reservation_failed(capacity: usize, region: &str) -> ! {
+    let mib = capacity / (1024 * 1024);
+    eprintln!("#");
+    eprintln!("# There is insufficient memory for the Java Runtime Environment to continue.");
+    eprintln!("# Could not reserve enough space for object heap ({region})");
+    eprintln!("#   requested {capacity} bytes ({mib} MiB) — this size comes from -Xmx");
+    eprintln!("#   The OS refused the reservation. Either lower -Xmx, or free physical");
+    eprintln!("#   memory / page-file (commit charge) on this machine and retry.");
+    eprintln!("#");
+    std::process::exit(1);
+}
+
 impl Arena {
     /// Create a new arena with the given capacity in bytes.
     pub fn new(capacity: usize) -> Self {
@@ -571,7 +643,7 @@ impl Arena {
         let capacity = capacity & !7;
         // We need the Vec to have length == capacity so we can
         // hand out pointers into it. We zero-initialize for safety.
-        let data = vec![0u8; capacity];
+        let data = alloc_zeroed_heap(capacity, "arena");
         let mut a = Self {
             data,
             cursor: 0,
@@ -2299,6 +2371,66 @@ mod prefer_bump_tests {
             1,
             "and the fall-through must be COUNTED -- otherwise 'the nursery is \
              leaking into the old region' is an inference rather than a number"
+        );
+    }
+
+    /// **A pre-merged run coalesces to the same free list as its members do.**
+    ///
+    /// This is the claim the ZGC young sweep's run merge rests on
+    /// (`zgc_gen_dead_runs`): handing one span per run of adjacent dead objects
+    /// must leave the arena in the state that handing one span per object leaves
+    /// it in, because `coalesce_free_list` merges exactly those spans into
+    /// exactly that run a few statements later either way.
+    ///
+    /// It is not self-evident, and the reason is `add_free_block`'s **region
+    /// routing**: a span goes to the small or the large tier by its own size, so
+    /// a merged run routes differently on the way IN than its members did. What
+    /// makes the result identical is that the coalescer rebuilds the list from
+    /// `low_blocks_sorted` rather than merging in place — so the routing on the
+    /// way in cannot survive it. Asserted rather than assumed, because "the
+    /// coalescer normalises it" is the entire safety argument for the merge and
+    /// it is one refactor away from stopping being true.
+    #[test]
+    fn an_arena_coalesces_pre_merged_runs_to_the_same_shape() {
+        const N: usize = 16;
+        const SZ: usize = 256;
+
+        // Same arena, same bumped region, same total span -- the only difference
+        // is how many calls it arrives in.
+        let shape = |per_object: bool| -> (Vec<(usize, usize)>, usize, usize) {
+            let mut a = Arena::new(64 * 1024);
+            let base = a.base_ptr() as usize;
+            let p = a.alloc(N * SZ, 8).expect("one bumped region") as usize;
+            let off = p - base;
+            if per_object {
+                for i in 0..N {
+                    a.add_free_block(off + i * SZ, SZ);
+                }
+            } else {
+                a.add_free_block(off, N * SZ);
+            }
+            a.coalesce_free_list();
+            (a.free_blocks_sorted(), a.free_list_bytes(), a.largest_free_block())
+        };
+
+        let (blocks_each, bytes_each, largest_each) = shape(true);
+        let (blocks_run, bytes_run, largest_run) = shape(false);
+
+        assert_eq!(
+            blocks_each, blocks_run,
+            "the free list must have the same SPANS either way"
+        );
+        assert_eq!(bytes_each, bytes_run, "and the same total");
+        assert_eq!(
+            largest_each, largest_run,
+            "and the same largest block -- which is the figure an allocation \
+             decision is actually taken on"
+        );
+        assert_eq!(
+            bytes_run,
+            N * SZ,
+            "and the fixture must have freed the whole region, or this compares \
+             two empty lists and passes for nothing"
         );
     }
 

@@ -3069,6 +3069,17 @@ pub trait NativeHeapAccess: NativeInvokeAccess {
         None
     }
 
+    /// Cumulative bytes allocated by ALL threads over the life of the process,
+    /// for `com.sun.management.ThreadMXBean.getTotalThreadAllocatedBytes`.
+    ///
+    /// Must never decrease. Deliberately NOT
+    /// [`Self::heap_allocated_bytes`], which is an occupancy gauge and falls at
+    /// every collection — a caller measuring a window containing a GC would get
+    /// the difference of two occupancies rather than what it allocated.
+    fn total_allocated_bytes(&self) -> Option<u64> {
+        None
+    }
+
     /// Bytes currently COMMITTED for the Java heap — backing storage the VM
     /// holds whether or not anything lives in it. `Runtime.totalMemory()`, the
     /// JMX heap `MemoryUsage.getCommitted()`, and (minus

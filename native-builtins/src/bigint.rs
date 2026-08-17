@@ -297,6 +297,14 @@ impl BigInt {
         }
     }
 
+    /// `BigInteger.abs()` — the magnitude with a non-negative sign.
+    pub(crate) fn abs_value(&self) -> BigInt {
+        BigInt {
+            neg: false,
+            mag: self.mag.clone(),
+        }
+    }
+
     pub(crate) fn neg_value(&self) -> BigInt {
         if self.is_zero() {
             BigInt::zero()
@@ -547,35 +555,71 @@ impl BigInt {
         }
     }
 
-    /// `self^exp mod modulus`, all magnitudes; `exp` must be non-negative and
-    /// `modulus` positive (the native layer handles negative exponents via
-    /// modInverse and a zero/negative modulus separately). Square-and-multiply
-    /// with word-based mul + non-negative `modulo` — no decimal anywhere.
+    /// `self^exp mod modulus`, all magnitudes; `exp` is used by magnitude (the
+    /// native layer handles a genuinely negative exponent via modInverse) and a
+    /// zero/negative modulus is reduced against `|modulus|`, matching
+    /// [`BigInt::modulo`].
+    ///
+    /// **Odd modulus — the whole crypto hot path (RSA, DH, Miller-Rabin) —
+    /// takes windowed Montgomery** ([`crate::montgomery`]): the per-step full
+    /// Knuth-D division is replaced by a multiply and a limb shift, and the
+    /// multiplies are cut by a factor of the window width against a precomputed
+    /// table. Even moduli have no Montgomery form and fall back to
+    /// [`Self::modpow_classic`]. Retires
+    /// `perf/biginteger-modpow-has-no-montgomery-reduction-20260817`.
     pub(crate) fn modpow(&self, exp: &BigInt, modulus: &BigInt) -> BigInt {
         if modulus.is_zero() {
             return BigInt::zero();
         }
         let one = Self::small(1);
-        if modulus.cmp(&one) == Ordering::Equal {
+        // Reduce against |modulus|, as `modulo` does.
+        let m_pos = BigInt {
+            neg: false,
+            mag: modulus.mag.clone(),
+        };
+        if m_pos.cmp(&one) == Ordering::Equal {
             return BigInt::zero(); // anything mod 1 == 0
         }
-        let mut result = one; // 1, already < modulus since modulus > 1
-        let mut base = self.modulo(modulus);
-        let ebits = exp.mag.len() * 32;
-        for i in 0..ebits {
+        let Some(mont) = crate::montgomery::Montgomery::new(&m_pos.mag) else {
+            // Even modulus (or a degenerate one already handled above).
+            return self.modpow_classic(exp, &m_pos);
+        };
+        let n = mont.limbs();
+        let base = self.modulo(&m_pos);
+        // R mod m and R^2 mod m. Two divisions, once, instead of one per step.
+        let mut r1 = one.shl(32 * n as u32).modulo(&m_pos).mag;
+        r1.resize(n, 0);
+        let mut r2 = one.shl(64 * n as u32).modulo(&m_pos).mag;
+        r2.resize(n, 0);
+        let mag = crate::montgomery::modpow_odd(&mont, &base.mag, &exp.mag, &r1, &r2);
+        Self::normalize(mag, false)
+    }
+
+    /// Division-based square-and-multiply — the fallback for an **even**
+    /// modulus, which has no Montgomery form. `modulus` must be positive and
+    /// greater than 1.
+    ///
+    /// Left-to-right over `exp.bit_length()` bits rather than
+    /// `exp.mag.len() * 32`: the old bound squared up to 31 leading zero bits of
+    /// the top word for nothing.
+    fn modpow_classic(&self, exp: &BigInt, modulus: &BigInt) -> BigInt {
+        let mut result = Self::small(1);
+        let base = self.modulo(modulus);
+        let ebits = crate::montgomery::bit_len(&exp.mag);
+        for i in (0..ebits).rev() {
+            result = result.mul(&result).modulo(modulus);
             if (exp.mag[i / 32] >> (i % 32)) & 1 == 1 {
                 result = result.mul(&base).modulo(modulus);
-            }
-            if i + 1 < ebits {
-                base = base.mul(&base).modulo(modulus);
             }
         }
         result
     }
 
-    /// Strong-probable-prime (Miller-Rabin) test with fixed small-prime bases —
-    /// mirrors the decimal `bi_is_probable_prime_str` (trial division < 1000,
-    /// then 13 fixed bases), but on words so the inner `modPow` is fast.
+    /// `BigInteger.modInverse(m)` — the extended Euclidean inverse of `self`
+    /// mod `m`, or `None` when `gcd(self, m) != 1`. `m` must be positive.
+    ///
+    /// (This doc comment used to describe `is_probable_prime`, which is the
+    /// *next* function down; the two had drifted apart.)
     pub(crate) fn mod_inverse(&self, modulus: &BigInt) -> Option<BigInt> {
         if modulus.signum() <= 0 {
             return None;
@@ -608,6 +652,9 @@ impl BigInt {
         Some(t)
     }
 
+    /// Strong-probable-prime (Miller-Rabin) test with fixed small-prime bases —
+    /// mirrors the decimal `bi_is_probable_prime_str` (trial division < 1000,
+    /// then 13 fixed bases), but on words so the inner `modPow` is fast.
     pub(crate) fn is_probable_prime(&self) -> bool {
         if self.neg || self.is_zero() {
             return false;
@@ -822,6 +869,18 @@ mod tests {
         *state
     }
 
+    /// Random positive odd `BigInt` of exactly `bits` bits (top bit set, low
+    /// bit set). `bits >= 1`; `bits == 1` yields 1.
+    fn rand_bits_odd(state: &mut u64, bits: u32) -> BigInt {
+        let words = bits.div_ceil(32) as usize;
+        let mut mag: Vec<u32> = (0..words).map(|_| lcg(state) as u32).collect();
+        let top = (bits - 1) % 32;
+        mag[words - 1] &= (1u32 << top) | ((1u32 << top) - 1);
+        mag[words - 1] |= 1u32 << top;
+        mag[0] |= 1;
+        BigInt::normalize(mag, false)
+    }
+
     /// Random signed decimal string, 1..=48 digits, ~half negative.
     fn rand_decimal(state: &mut u64) -> String {
         let len = (lcg(state) % 48) as usize + 1;
@@ -1025,6 +1084,138 @@ mod tests {
                 bi_mod_pow_str(&ba, &e, &m),
                 "rand modpow({ba}^{e} mod {m})"
             );
+        }
+    }
+
+    /// The Montgomery rewrite's safety net.
+    ///
+    /// `modpow` dispatches on the parity of the modulus: odd goes to windowed
+    /// Montgomery, even to `modpow_classic`. This drives both arms across
+    /// operand sizes with a *third*, independent oracle — the decimal
+    /// `bi_mod_pow_str` — so neither arm is checked only against itself, and
+    /// then cross-checks the two arms against each other on odd moduli (where
+    /// both are defined). A Montgomery bug that produced plausible-looking
+    /// wrong residues would have to fool all three to survive.
+    #[test]
+    fn modpow_montgomery_and_classic_agree_with_decimal() {
+        let mut state = 0x1bad_c0de_5eed_0007u64;
+
+        // Structural cases first: the shapes that break window/limb bookkeeping.
+        let structural: &[(&str, &str, &str)] = &[
+            // modulus 1 -> everything is 0
+            ("123456789", "987654321", "1"),
+            // odd single-limb moduli at the word boundary
+            ("4294967295", "4294967295", "4294967295"),
+            ("4294967296", "4294967296", "4294967295"),
+            ("1", "0", "3"),
+            ("0", "0", "3"),
+            ("0", "1", "3"),
+            // exponent whose top word has 31 leading zero bits (the old
+            // `mag.len() * 32` bound squared all of them for nothing)
+            ("7", "4294967296", "1000000007"),
+            ("7", "18446744073709551616", "1000000007"),
+            // even moduli, including powers of two (the fallback arm)
+            ("123456789", "65537", "2"),
+            ("123456789", "65537", "4294967296"),
+            ("123456789", "65537", "340282366920938463463374607431768211456"),
+            ("123456789", "65537", "1000000008"),
+            (
+                "99999999999999999999999999",
+                "123456789",
+                "618970019642690137449562112",
+            ),
+            // negative base: BigInteger.modPow is always non-negative
+            ("-2", "3", "5"),
+            ("-2", "2", "5"),
+            ("-123456789012345678901234567890", "65537", "1000000007"),
+            ("-123456789012345678901234567890", "65537", "1000000008"),
+            // large odd modulus, RSA-ish exponent
+            (
+                "123456789012345678901234567890123456789012345678901234567890",
+                "65537",
+                "115792089237316195423570985008687907853269984665640564039457584007913129639747",
+            ),
+        ];
+        for &(ba, e, m) in structural {
+            let got = b(ba).modpow(&b(e), &b(m)).to_decimal();
+            assert_eq!(got, bi_mod_pow_str(ba, e, m), "modpow({ba}^{e} mod {m})");
+        }
+
+        // Random sweep across operand widths. `bits` is the modulus width, so
+        // this walks 1-limb moduli up through multi-limb ones; the exponent and
+        // base are independently sized so the window code sees short and long
+        // exponents against both narrow and wide moduli.
+        for &bits in &[1u32, 2, 8, 31, 32, 33, 64, 65, 127, 128, 200, 256] {
+            // The decimal oracle is O(digits^2) per squaring, so it dominates
+            // at the wide end; taper the repeat count rather than the widths.
+            let repeats = if bits >= 128 { 2 } else { 8 };
+            for _ in 0..repeats {
+                let m_odd = rand_bits_odd(&mut state, bits);
+                // Same magnitude made even, so both arms see comparable sizes.
+                let m_even = m_odd.add(&BigInt::small(1));
+                for m in [&m_odd, &m_even] {
+                    if m.cmp(&BigInt::small(1)) != Ordering::Greater {
+                        continue;
+                    }
+                    for &ebits in &[1u32, 5, 17, 24, 70, 197, bits.max(1)] {
+                        let base = rand_bits_odd(&mut state, bits.max(1));
+                        let base = if lcg(&mut state) & 1 == 0 {
+                            base.neg_value()
+                        } else {
+                            base
+                        };
+                        let exp = rand_bits_odd(&mut state, ebits);
+                        let (bs, es, ms) = (base.to_decimal(), exp.to_decimal(), m.to_decimal());
+                        assert_eq!(
+                            base.modpow(&exp, m).to_decimal(),
+                            bi_mod_pow_str(&bs, &es, &ms),
+                            "modpow({bs}^{es} mod {ms})"
+                        );
+                        // Odd moduli: the two arms must agree bit for bit.
+                        if m.mag[0] & 1 == 1 {
+                            assert_eq!(
+                                base.modpow(&exp, m),
+                                base.modpow_classic(&exp, m),
+                                "montgomery vs classic ({bs}^{es} mod {ms})"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// RSA is the failure mode the doc names: a subtly wrong modPow produces
+    /// plausible-looking wrong signatures that still round-trip through the
+    /// encoding layers. Check the algebra directly — `(m^e)^d == m (mod n)` for
+    /// a real keypair, plus the CRT half-exponentiations — so a wrong residue
+    /// cannot hide behind a self-consistent implementation.
+    #[test]
+    fn modpow_round_trips_an_rsa_keypair() {
+        // p, q distinct primes; n = p*q, e = 65537, d = e^-1 mod phi.
+        let p = b("177250851143413106261106096231831452933");
+        let q = b("329539864610483636976818094878219646841");
+        assert!(p.is_probable_prime(), "p prime");
+        assert!(q.is_probable_prime(), "q prime");
+        let n = p.mul(&q);
+        let e = b("65537");
+        let phi = p.sub(&BigInt::small(1)).mul(&q.sub(&BigInt::small(1)));
+        let d = e.mod_inverse(&phi).expect("e invertible mod phi");
+
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        for _ in 0..12 {
+            let msg = rand_bits_odd(&mut state, 200).modulo(&n);
+            let c = msg.modpow(&e, &n);
+            let back = c.modpow(&d, &n);
+            assert_eq!(back, msg, "RSA round trip");
+            assert_ne!(c, msg, "ciphertext is not the plaintext");
+            // The signing direction, and CRT halves against the direct result.
+            let sig = msg.modpow(&d, &n);
+            assert_eq!(sig.modpow(&e, &n), msg, "RSA sign/verify round trip");
+            let dp = d.modulo(&p.sub(&BigInt::small(1)));
+            let dq = d.modulo(&q.sub(&BigInt::small(1)));
+            assert_eq!(msg.modpow(&dp, &p), sig.modulo(&p), "CRT half mod p");
+            assert_eq!(msg.modpow(&dq, &q), sig.modulo(&q), "CRT half mod q");
         }
     }
 
