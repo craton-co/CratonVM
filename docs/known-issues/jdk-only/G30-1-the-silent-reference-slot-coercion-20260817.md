@@ -1,5 +1,23 @@
 # G30-1 — the silent reference-slot coercion, made visible without moving it
 
+> **RECONCILED 2026-08-17 (G59-1) — this instrument has a blind spot, and it
+> is not stated anywhere in this record.**
+>
+> The guard fires on a **descriptor MISMATCH**. A write to the WRONG SLOT whose
+> value happens to fit that field's own descriptor is invisible to it, and no
+> count in this document is a count of wrong writes — only of wrong-*typed*
+> ones.
+>
+> That distinction is not theoretical. G59-1 measured one defect writing four
+> wrong slots on the same line: two warned here, and two landed silently — one
+> setting `URLConnection.connectTimeout` to 1 millisecond, because `Int(1)`
+> into an `I` field is perfectly well typed. **A quiet log is not a clean one.**
+> The warning text now says so; this record's numbers should be read the same
+> way.
+>
+> Unaffected: the mechanism, the file and line, and the census — all of which
+> are about the mismatch path and are correct for it.
+
 **Status:** INSTRUMENTED-SOURCE / CENSUS-MEASURED / RUNTIME-POPULATION-MEASURED
 / AFTER-NOT-MEASURABLE-BY-THIS-LANE.
 **Provenance:** every runtime number below is MEASURED on

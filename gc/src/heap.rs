@@ -1908,7 +1908,12 @@ fn note_field_coercion_loss(
          is one of the collectors that has not yet been given provenance \
          (G30 NOMINATION 1). Run with CRATONVM_DBG_LAYOUT=1 to resolve a \
          class_id to a name, or CRATONVM_DBG_COERCION=1 for every occurrence \
-         with a backtrace.",
+         with a backtrace. THIS GUARD SEES DESCRIPTOR MISMATCHES ONLY: a \
+         wrong slot whose value happens to fit the field's own descriptor is \
+         invisible here, so a quiet log is not a clean one. G59-1 measured \
+         both halves of one defect at once -- two writes warned, and two \
+         more from the same line landed silently on an int and set a 1ms \
+         connect timeout.",
     );
     if verbose {
         tracing::warn!(
