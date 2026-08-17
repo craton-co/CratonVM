@@ -3762,6 +3762,33 @@ impl ZgcRealHeap {
         self.conc_ingress_replayed
             .fetch_add(batch.len(), Ordering::Relaxed);
         pool.push_roots(&batch);
+
+        // RE-ARM if the pool has already finished.
+        //
+        // `ZMarkTerminator::note_work_published` -- which `push_roots` reaches
+        // -- deliberately does NOT clear `terminated`, and its doc says why: a
+        // pool that has declared its fixed point has no running worker left to
+        // clear the flag, so clearing it from outside would produce a state
+        // nobody can leave. The supported transition back is `arm`, which is
+        // what `start_marking` is.
+        //
+        // Without this, the FIRST time the marker catches up with the graph it
+        // stops for good, and every SATB reference published afterwards sits in
+        // the stripes until the collection pause drives `mark_to_completion` --
+        // i.e. exactly the work this phase exists to move OFF the pause, banked
+        // back onto it. Note the narrower case needs nothing: a pool that is
+        // still active picks published work up by itself, because the last
+        // worker out re-probes the queues under the termination lock and
+        // resumes rather than terminating.
+        //
+        // Two mutators racing here both call `arm`, and that is safe: a worker
+        // still inside the older generation leaves its handshake through the
+        // `cycle_generation != my_cycle` arm without touching the active count
+        // (which `arm` has already reset wholesale) and rejoins the new
+        // generation from `ZMarkWorker::run`.
+        if pool.shared().terminator().is_terminated() {
+            pool.start_marking();
+        }
     }
 
     /// Card an OLD object whose fields have just been written --

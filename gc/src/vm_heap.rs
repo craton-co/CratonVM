@@ -2445,6 +2445,34 @@ impl VmHeap {
                  relocation_skipped_jit={skipped_jit} \
                  tlab_retire_skipped={tlab_skipped}"
             );
+            // CONCURRENT marking, on its own line and with five fields rather
+            // than one, because four different runs look identical in any
+            // smaller summary:
+            //
+            //   started=0                 the threshold was never crossed --
+            //                             this run says NOTHING about
+            //                             concurrent marking
+            //   started>0, completed=0    every cycle opened and then failed to
+            //                             certify; the collector fell back to a
+            //                             stop-the-world mark each time
+            //   started>0, replayed=0     the barrier saw no reference
+            //                             overwrites, so the SATB half is
+            //                             untested by this workload
+            //   started>0, phase_ms~0     the cycle opened and the collection
+            //                             arrived immediately, so there was no
+            //                             concurrent phase to speak of
+            //
+            // `black` is the allocate-black count: objects born marked because
+            // a cycle was in flight. Zero of those with a non-zero `phase_ms`
+            // means the mutators allocated nothing while the marker ran.
+            let (started, completed, black, replayed, phase_nanos) =
+                self.zgc_concurrent_mark_stats();
+            eprintln!(
+                "[GC] zgc-concurrent: cycles_started={started} cycles_completed={completed} \
+                 black_allocations={black} satb_replayed={replayed} \
+                 concurrent_phase_ms={}",
+                phase_nanos / 1_000_000
+            );
             // `ZGC_UNSIZABLE_OBJECTS` had no reader anywhere but a unit test.
             // It is the sweep's own count of registered objects whose header it
             // could not size -- i.e. of heap corruption the collector has
