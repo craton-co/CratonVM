@@ -2441,6 +2441,34 @@ pub struct ZgcRealHeap {
     /// the second a raw address kept across a safepoint. Capped, oldest cycles
     /// evicted first, so a long run cannot grow it without bound.
     corpse_ledger: Mutex<FxHashMap<usize, (usize, u32, usize, u64)>>,
+
+    /// `vacated address -> where the object went`, for every object this
+    /// collector's slide has relocated and whose old address has not been
+    /// handed out again.
+    ///
+    /// **This is what makes `VmHeap::load_and_forward` work on this backend.**
+    /// That barrier repairs a possibly-stale reference by reading a FORWARDING
+    /// WORD at the old address, and the slide leaves none: `compact_low_to`
+    /// zeroes the span above the new cursor and the memmove overwrites
+    /// everything below it. So on the DEFAULT collector the barrier was a
+    /// silent no-op at all 46 of its call sites — every one of which exists
+    /// because its caller holds an `ObjectRef` somewhere no root scan can see
+    /// (a native's Rust local, an invoke's popped-argument buffer) across an
+    /// operation that can collect.
+    ///
+    /// Measured before this table existed, with `CRATONVM_DBG_VACATED_FRAMES`
+    /// armed on H2 `TestMultiThread.testConcurrentUpdate`: the barrier was
+    /// handed an address the collector had moved an object away from, from
+    /// `apps_h2::h2_comparison_compare`, `h2_comparison_get_value` and
+    /// `properties_sidetable::mirror_loaded_entries_to_properties_backend`,
+    /// and could not repair any of them.
+    ///
+    /// **Why no pruning is needed for correctness.** A lookup is only consulted
+    /// when the address is NOT a registered object base, so a re-issued address
+    /// never reaches the table — the entry is simply unreachable, not wrong.
+    /// Pruning at the end of each collection is therefore pure memory
+    /// hygiene.
+    relocations: Mutex<FxHashMap<usize, usize>>,
     /// `base -> alloc_size(header)` as the LAST slide left it, taken after the
     /// registry rebuild and before any mutator resumed.
     ///
@@ -3111,6 +3139,7 @@ impl ZgcRealHeap {
             gc_stress_mark: AtomicUsize::new(0),
             critical_pins: Mutex::new(FxHashMap::default()),
             corpse_ledger: Mutex::new(FxHashMap::default()),
+            relocations: Mutex::new(FxHashMap::default()),
             slide_exit_sizes: Mutex::new(FxHashMap::default()),
             corpse_reports: AtomicUsize::new(0),
             corpse_cycle: AtomicU64::new(0),
@@ -5839,6 +5868,16 @@ impl ZgcRealHeap {
             self.registry.insert(*to);
         }
 
+        // Publish this slide's moves so the forwarding barrier has something to
+        // read. See `ZgcRealHeap::relocations`.
+        {
+            let mut reloc = self.relocations.lock();
+            reloc.reserve(pairs.len());
+            for (from, to) in &pairs {
+                reloc.insert(*from, *to);
+            }
+        }
+
         if unwalkable > 0 {
             tracing::error!(
                 target: "cratonvm::gc::guard",
@@ -6679,6 +6718,8 @@ impl ZgcRealHeap {
         // section header for the measurement this replaced.
         self.audit_registry_insert(ptr as usize, size, "alloc_raw");
         self.registry.insert(ptr as usize);
+        // See the same call in `register_allocations`.
+        crate::gc_quiescence::note_allocated(&[ptr as usize]);
         let after = self.allocated.fetch_add(size, Ordering::Relaxed) + size;
         // Arm the native-allocation-pressure latch on the crossing edge. This
         // is the ZGC analogue of G1's `note_region_consumed_locked`
@@ -7319,7 +7360,57 @@ impl ZgcRealHeap {
     /// three things -- whether any registered object CONTAINS the receiver
     /// (an interior pointer, so the caller derived it), how far into that
     /// object it points, and what class that container is.
-     /// The flag-free "was this receiver RECLAIMED?" verdict, for THIS
+     /// Where did the object that used to live at `addr` go?
+    ///
+    /// Chained, because an object can move again in a later cycle and the
+    /// table records each hop separately; bounded so a cycle in the table
+    /// (which would be a bug in the slide, not in a caller) cannot hang the
+    /// barrier. Returns `None` unless the final target is a live object base.
+    ///
+    /// See [`Self::relocations`] for why this exists and why a re-issued
+    /// address cannot reach it.
+    pub fn forwarded_after_slide(&self, addr: usize) -> Option<usize> {
+        let reloc = self.relocations.lock();
+        if reloc.is_empty() {
+            return None;
+        }
+        let mut cur = *reloc.get(&addr)?;
+        for _ in 0..8 {
+            match reloc.get(&cur) {
+                Some(&next) if next != cur => cur = next,
+                _ => break,
+            }
+        }
+        drop(reloc);
+        self.registry.contains(cur).then_some(cur)
+    }
+
+    /// Drop entries whose vacated address has been handed out again — the
+    /// lookup can no longer reach them, so they are pure memory. Called once
+    /// per collection, after the sweep has published the live registry.
+    fn prune_relocations(&self) {
+        let mut reloc = self.relocations.lock();
+        if reloc.is_empty() {
+            return;
+        }
+        reloc.retain(|from, _| !self.registry.contains(*from));
+        // A hard ceiling as well: this table is bounded by the arena in
+        // principle, but "in principle" is not a bound anyone can point at in a
+        // heap dump. Clearing degrades the barrier to what it did before this
+        // table existed, which is the safe direction, and says so.
+        const MAX: usize = 4_000_000;
+        if reloc.len() > MAX {
+            tracing::warn!(
+                target: "cratonvm::gc",
+                entries = reloc.len(),
+                "zgc relocation table exceeded its ceiling and was cleared — the forwarding \
+                 barrier degrades to a no-op for older moves until the next slide"
+            );
+            reloc.clear();
+        }
+    }
+
+    /// The flag-free "was this receiver RECLAIMED?" verdict, for THIS
     /// collector -- the port of `GenerationalHeap::reclaimed_hole_at`.
     ///
     /// ZGC has been the DEFAULT collector since 2026-08-10, and until this
@@ -8947,6 +9038,10 @@ impl ZTlabHeapHooks for ZgcRealHeap {
             }
         }
         self.registry.insert_all(addrs);
+        // `CRATONVM_DBG_VACATED_FRAMES`: these addresses are live objects again,
+        // so a reference to one is no longer evidence that a holder went stale.
+        // See `gc_quiescence::note_allocated`.
+        crate::gc_quiescence::note_allocated(addrs);
         if bytes == 0 {
             return;
         }
@@ -11536,6 +11631,9 @@ impl GarbageCollector for ZgcRealHeap {
         for d in &dead {
             self.registry.remove(*d);
         }
+        // Memory hygiene for the forwarding table, on the same pass that
+        // decided which addresses are live. See `prune_relocations`.
+        self.prune_relocations();
         self.allocated.store(bytes_copied, Ordering::Relaxed);
         // Re-arm the trigger: require at least a quarter of the remaining
         // headroom (min 64 KiB) of NEW allocation before the next

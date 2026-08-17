@@ -209,6 +209,75 @@ fn test_jit_two_sequential_try_catch_blocks_same_method() {
     }
 }
 
+fn callee_exception_shapes_class_files_available() -> bool {
+    let dir = test_resources_dir();
+    std::path::Path::new(&format!(
+        "{dir}/cratonvm/JitCalleeExceptionShapes.class"
+    ))
+    .exists()
+}
+
+#[test]
+fn test_callee_that_cannot_catch_propagates_instead_of_re_running() {
+    if !callee_exception_shapes_class_files_available() {
+        eprintln!("Skipping: .class files not available (javac not on PATH?)");
+        return;
+    }
+    require_class_library!();
+    // A compiled callee that DECLARES a handler but whose throw comes from
+    // outside every protected range must propagate to its caller. The JIT
+    // dispatch helper used to re-execute such a callee from its entry, which
+    // runs the prefix a second time — and when the prefix latches state, the
+    // re-run takes the early exit and the exception disappears. Golden 20000:
+    // every one of 20000 iterations threw exactly once, having run its prefix
+    // exactly once. HotSpot 25 agrees.
+    let mut vm = test_vm();
+    let result = vm.invoke(
+        "cratonvm/JitCalleeExceptionShapes",
+        "outsideTryChecksum",
+        "()I",
+        &[],
+    );
+    match result {
+        Ok(Some(Value::Int(v))) => assert_eq!(
+            v, 20000,
+            "a compiled callee's escaping exception was swallowed or its prefix ran twice \
+             — the pc-unknown handler search matches typed rows by exception CLASS ALONE, \
+             so a `catch (RuntimeException)` over a range the throw is not in can 'catch' \
+             it; see `JitThrowPc::OutsideAllRanges`"
+        ),
+        other => panic!("outsideTryChecksum returned unexpected value: {other:?}"),
+    }
+}
+
+#[test]
+fn test_two_ranges_one_catch_type_each_reach_their_own_handler() {
+    if !callee_exception_shapes_class_files_available() {
+        eprintln!("Skipping: .class files not available (javac not on PATH?)");
+        return;
+    }
+    require_class_library!();
+    // Two disjoint protected ranges catching the SAME type. With the throw pc
+    // unknown a class-only match takes the FIRST row whichever range threw,
+    // which is how BouncyCastle's `ProvRevocationChecker.check` ran its CRL
+    // branch's handler for an OCSP failure and re-issued the query that had
+    // just failed instead of falling back. Golden 0.
+    let mut vm = test_vm();
+    let result = vm.invoke(
+        "cratonvm/JitCalleeExceptionShapes",
+        "twoRangesChecksum",
+        "()I",
+        &[],
+    );
+    match result {
+        Ok(Some(Value::Int(v))) => assert_eq!(
+            v, 0,
+            "a throw reached the handler of the OTHER protected range"
+        ),
+        other => panic!("twoRangesChecksum returned unexpected value: {other:?}"),
+    }
+}
+
 fn liquibase_scope_bisect_class_files_available() -> bool {
     let dir = test_resources_dir();
     std::path::Path::new(&format!("{dir}/cratonvm/LiquibaseScopeBisect.class")).exists()

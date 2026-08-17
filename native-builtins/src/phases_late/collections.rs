@@ -2215,7 +2215,12 @@ pub(crate) fn register_p70_misc(r: &mut NativeMethodRegistry) {
                 comparable_boxed_number(ctx, this),
                 comparable_boxed_number(ctx, other),
             ) {
-                return Ok(Some(Value::Int(ordering_to_int(a.total_cmp(&b)))));
+                // `Double.compare` semantics, not IEEE totalOrder — the two
+                // disagree on a negatively-signed or payload-carrying NaN. See
+                // `cratonvm_types::jfp`. (`comparable_boxed_number` widens
+                // every boxed number to `f64`, so the integral receivers that
+                // dominate this path are unaffected either way.)
+                return Ok(Some(Value::Int(cratonvm_types::jfp::double_compare(a, b))));
             }
             Err(RuntimeError::ClassCastException {
                 message:
