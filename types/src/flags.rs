@@ -1065,6 +1065,21 @@ pub struct LoaderFlags {
     /// `CRATONVM_TRUST_PEM` — path to an extra PEM trust bundle.
     /// [`parse::utf8`].
     pub trust_pem: Option<String>,
+    /// `CRATONVM_TLS_OPENSSL_CLIENT` — back the default `SSLSocket` client
+    /// path with a raw `openssl::SslConnector` instead of
+    /// `native_tls::TlsConnector`. **Default ON** on Unix (no effect
+    /// elsewhere — `openssl` is a Unix-only dependency); `0` turns it off.
+    /// [`parse::on_unless_zero`].
+    ///
+    /// The kill switch exists so the two can be A/B'd in ONE binary. What
+    /// only the raw connector can do: hand out the peer's FULL certificate
+    /// chain (`SSL_get_peer_cert_chain`, which native-tls 0.2 does not
+    /// expose — it has `peer_certificate()` and nothing else), and set the
+    /// certificate security level. Both are load-bearing: an application
+    /// TrustManager cannot build a path from a one-element chain, and
+    /// OpenSSL's default security level of 2 is stricter than the JDK's own
+    /// 1024-bit floor.
+    pub tls_openssl_client: bool,
     /// `CRATONVM_TRACE_UNIMPLEMENTED`
     pub trace_unimplemented: bool,
     /// `CRATONVM_DBG_ACCESS` — [`parse::present_utf8`].
@@ -1140,6 +1155,7 @@ impl LoaderFlags {
             ),
             disable_jar_mmap: present(src, "CRATONVM_DISABLE_JAR_MMAP"),
             trust_pem: utf8(src, "CRATONVM_TRUST_PEM"),
+            tls_openssl_client: on_unless_zero(src, "CRATONVM_TLS_OPENSSL_CLIENT"),
             trace_unimplemented: present(src, "CRATONVM_TRACE_UNIMPLEMENTED"),
             dbg_access: present_utf8(src, "CRATONVM_DBG_ACCESS"),
             dbg_classpath: present(src, "CRATONVM_DBG_CLASSPATH"),

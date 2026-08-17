@@ -1381,6 +1381,13 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::SECURITY, token: "reflect-export-gate", on_key: None, off_key: Some("CRATONVM_REFLECT_NO_EXPORT_GATE"), off_word: None },
     E { group: Group::SECURITY, token: "require-policy", on_key: Some("CRATONVM_REQUIRE_POLICY"), off_key: None, off_word: None },
     E { group: Group::SECURITY, token: "trust-pem", on_key: Some("CRATONVM_TRUST_PEM"), off_key: None, off_word: None },
+    // Default-ON kill switch for the raw-OpenSSL client connector on the
+    // default `SSLSocket` path (Unix only — `openssl` is a Unix-scoped
+    // dependency). `0` reverts that path to `native_tls::TlsConnector`, which
+    // captures ONLY the peer's leaf certificate and cannot set the
+    // certificate security level. SECURITY rather than IO: what the switch
+    // selects is which verifier sees which chain, and at what strength floor.
+    E { group: Group::SECURITY, token: "tls-openssl-client", on_key: Some("CRATONVM_TLS_OPENSSL_CLIENT"), off_key: None, off_word: Some("0") },
     E { group: Group::SECURITY, token: "untrusted-code", on_key: Some("CRATONVM_UNTRUSTED_CODE"), off_key: None, off_word: None },
     E { group: Group::COMPAT, token: "eager-streams", on_key: Some("CRATONVM_EAGER_STREAMS"), off_key: None, off_word: None },
     E { group: Group::COMPAT, token: "foreign-attach", on_key: Some("CRATONVM_FOREIGN_ATTACH"), off_key: None, off_word: None },

@@ -2115,8 +2115,15 @@ pub(crate) struct TlsEntry {
 
 pub(crate) enum TlsClientStream {
     Native(native_tls::TlsStream<TcpStream>),
+    /// A raw `openssl` stream. Two callers produce one: the legacy DSA bridge
+    /// (`s2_legacy_dsa_tls_connect_on`) and — since
+    /// `tls-client-captures-only-the-leaf` — the DEFAULT client path
+    /// (`s2_openssl_tls_connect_on`). The variant was called `LegacyDsa` while
+    /// the first was the only one; nothing downstream ever branched on which
+    /// bridge built it, so the two share it rather than duplicating the
+    /// read/write/shutdown arms.
     #[cfg(unix)]
-    LegacyDsa(openssl::ssl::SslStream<TcpStream>),
+    Openssl(openssl::ssl::SslStream<TcpStream>),
 }
 
 impl TlsClientStream {
@@ -2124,7 +2131,7 @@ impl TlsClientStream {
         match self {
             Self::Native(stream) => stream.get_ref(),
             #[cfg(unix)]
-            Self::LegacyDsa(stream) => stream.get_ref(),
+            Self::Openssl(stream) => stream.get_ref(),
         }
     }
 }
@@ -2287,10 +2294,25 @@ pub(crate) fn s2_tls_connect_on(
     let negotiated_cipher = String::from("TLS_AES_128_GCM_SHA256");
 
     // Capture the peer's leaf certificate DER bytes. native-tls's public API
-    // only exposes the leaf via `peer_certificate()`; the full chain is
-    // validated internally by the backend (SChannel / SecureTransport /
-    // OpenSSL) before `connect` returns, which is why we can rely on a
-    // single-element chain here without weakening security.
+    // only exposes the leaf via `peer_certificate()`; there is no chain
+    // accessor.
+    //
+    // THE REASONING THIS COMMENT USED TO CARRY WAS WRONG, and worth recording
+    // because of HOW it went wrong. It said the full chain "is validated
+    // internally by the backend before `connect` returns, which is why we can
+    // rely on a single-element chain here without weakening security." That
+    // was true when written — the backend WAS the verifier and the captured
+    // leaf was only ever informational. It stopped being true when the
+    // `java_tm_key` path was added to `new13_connect_and_handshake_on`: that
+    // path disables native verification precisely so an application
+    // TrustManager can decide, and it consumes THIS vector. A premise was
+    // invalidated by a later change to a different function and nothing
+    // re-checked it. MEASURED consequence: 20 of 20 live public sites
+    // rejected, every one at `chainLen=1`.
+    //
+    // On Unix the default client path no longer comes through here at all —
+    // see `s2_openssl_tls_connect_on`, which asks OpenSSL for the whole chain.
+    // This arm is what remains: Windows, and `CRATONVM_TLS_OPENSSL_CLIENT=0`.
     let mut peer_cert_chain_der: Vec<Vec<u8>> = Vec::new();
     match tls_stream.peer_certificate() {
         Ok(Some(cert)) => match cert.to_der() {
@@ -2394,19 +2416,245 @@ pub(crate) fn s2_legacy_dsa_tls_connect_on(
     let stream = connection.connect(host, tcp).map_err(|e| {
         TlsConnectFailure::Handshake(format!("legacy DSA TLS handshake: {e}"))
     })?;
-    let mut peer_cert_chain_der = Vec::new();
-    if let Some(cert) = stream.ssl().peer_certificate() {
-        peer_cert_chain_der.push(cert.to_der().map_err(|e| hs(&e))?);
-    }
+    let peer_cert_chain_der = openssl_peer_chain_der(stream.ssl()).map_err(|e| hs(&e))?;
     let raw = stream.get_ref().try_clone().ok();
     let entry = TlsEntry {
-        stream: Arc::new(parking_lot::Mutex::new(TlsClientStream::LegacyDsa(stream))),
+        stream: Arc::new(parking_lot::Mutex::new(TlsClientStream::Openssl(stream))),
         raw,
         peer_host: host.to_string(),
         peer_port: port,
         negotiated_protocol: "TLSv1.2".to_string(),
         negotiated_cipher: "UNKNOWN".to_string(),
         negotiated_alpn: None,
+        peer_cert_chain_der,
+    };
+    let mut reg = s2_registry().lock();
+    let id = s2_next_free_id(&mut reg);
+    reg.tls_streams.insert(id, entry);
+    Ok(id)
+}
+
+
+/// The certificate SECURITY LEVEL the default client connector runs at.
+///
+/// OpenSSL's own default is 2, which requires a >= 2048-bit RSA key and
+/// refuses a SHA-1 signature anywhere in the chain. The JDK's equivalent,
+/// `jdk.certpath.disabledAlgorithms`, draws its line at 1024 bits. That gap is
+/// not theoretical -- MEASURED (`WeakChainProbe`, against an `openssl
+/// s_server` presenting a 1024-bit RSA leaf signed by a 1024-bit CA, with a
+/// JDK image whose `cacerts` trusts that CA):
+///
+/// ```text
+/// HOTSPOT   HANDSHAKE-OK  328 ms
+/// CRATONVM  REFUSED        60 ms   ... (EE certificate key too weak)
+/// ```
+///
+/// Level 1 is OpenSSL's 80-bit tier: RSA/DSA/DH >= 1024, ECC >= 160, SHA-1
+/// permitted -- i.e. the JDK's own floor. It is NOT a blanket relaxation of
+/// the posture: the connector still pins a TLS 1.2 minimum of its own, so the
+/// SSLv3/TLS1.0 suites level 1 would otherwise readmit stay out.
+#[cfg(unix)]
+pub(crate) const CLIENT_SECURITY_LEVEL: i32 = 1;
+
+/// Everything `new13_build_connector` expresses through
+/// `native_tls::TlsConnectorBuilder`, restated for a raw
+/// `openssl::ssl::SslConnector`.
+///
+/// The swap exists because native-tls 0.2 cannot express two things this VM
+/// needs, and no amount of configuration on its side will make it:
+///
+/// * the peer's FULL certificate chain. `TlsStream::peer_certificate()` is the
+///   LEAF and there is no chain accessor, so an application `TrustManager` --
+///   which this VM correctly makes the ONLY verifier -- was handed a
+///   one-element chain and could not build a path to any root. MEASURED across
+///   20 public sites: 20 rejections at `chainLen=1`, against 20 acceptances at
+///   2-4 on HotSpot.
+/// * the certificate security level. See [`CLIENT_SECURITY_LEVEL`].
+#[cfg(unix)]
+pub(crate) struct OpensslClientConfig {
+    /// Trust anchors (DER) to configure on the connector.
+    pub(crate) roots: Vec<Vec<u8>>,
+    /// `true` = `roots` REPLACE the platform set (JSSE's rule for a trust
+    /// store the application named, and for the JDK's own `cacerts`);
+    /// `false` = they are ADDED to it, which is what a per-`SSLContext` custom
+    /// anchor set has always done here.
+    pub(crate) replace_roots: bool,
+    /// Stand OpenSSL's verifier (and its hostname check) DOWN: the caller is
+    /// the verifier and runs immediately after connect, fail-closed. Mirrors
+    /// `danger_accept_invalid_certs` + `danger_accept_invalid_hostnames`.
+    pub(crate) skip_verify: bool,
+    /// Pin the ceiling to TLS 1.2, for a version-specific
+    /// `SSLContext.getInstance("TLSv1.2")`.
+    pub(crate) max_tls12: bool,
+}
+
+/// The peer's certificate chain as DER, leaf first.
+///
+/// `SSL_get_peer_cert_chain` on a CLIENT includes the peer's own certificate
+/// (on a server it does not -- the asymmetry is OpenSSL's, and this is only
+/// ever called on client streams). The `peer_certificate()` fallback is not
+/// belt-and-braces: on a RESUMED session the peer sends no Certificate
+/// message, so the chain is absent while the cached leaf is still there, and
+/// without the fallback a resumed connection would report ZERO certificates
+/// where it used to report one.
+#[cfg(unix)]
+fn openssl_peer_chain_der(
+    ssl: &openssl::ssl::SslRef,
+) -> Result<Vec<Vec<u8>>, openssl::error::ErrorStack> {
+    let mut out: Vec<Vec<u8>> = Vec::new();
+    if let Some(chain) = ssl.peer_cert_chain() {
+        for cert in chain {
+            out.push(cert.to_der()?);
+        }
+    }
+    if out.is_empty() {
+        if let Some(leaf) = ssl.peer_certificate() {
+            out.push(leaf.to_der()?);
+        }
+    }
+    Ok(out)
+}
+
+/// [`s2_openssl_tls_connect_on`], opening the connection here.
+#[cfg(unix)]
+pub(crate) fn s2_openssl_tls_connect(
+    cfg: &OpensslClientConfig,
+    host: &str,
+    port: u16,
+) -> Result<i32, TlsConnectFailure> {
+    let addr = format!("{host}:{port}");
+    let tcp = TcpStream::connect(&addr).map_err(TlsConnectFailure::Tcp)?;
+    s2_openssl_tls_connect_on(cfg, host, port, tcp)
+}
+
+/// The default `SSLSocket` client bridge, over a raw `openssl::SslConnector`.
+///
+/// Drop-in for [`s2_tls_connect_on`]: same timeouts, same SNI, same hostname
+/// verification, same TLS 1.2 floor, same registry entry shape. What differs
+/// is only what [`OpensslClientConfig`] documents -- the full chain and the
+/// security level -- plus the negotiated protocol / cipher / ALPN, which this
+/// backend can actually be asked for instead of being reported from a
+/// compile-time constant.
+///
+/// `SslConnector::builder` already loads the platform roots
+/// (`SSL_CTX_set_default_verify_paths`) and `configure()` already turns on SNI
+/// and hostname verification, so the unconfigured shape here is native-tls's
+/// shape, not a weaker one.
+#[cfg(unix)]
+pub(crate) fn s2_openssl_tls_connect_on(
+    cfg: &OpensslClientConfig,
+    host: &str,
+    port: u16,
+    tcp: TcpStream,
+) -> Result<i32, TlsConnectFailure> {
+    use openssl::ssl::{SslConnector, SslMethod, SslVerifyMode, SslVersion};
+    use openssl::x509::{store::X509StoreBuilder, X509};
+
+    let hs = |e: &dyn std::fmt::Display| TlsConnectFailure::Handshake(e.to_string());
+    // Same 30 s read/write floor `s2_tls_connect_on` sets, and for the same
+    // reason: a hung peer must not deadlock the JVM thread that called
+    // `SSLSocket.getInputStream().read`.
+    let _ = tcp.set_read_timeout(Some(std::time::Duration::from_secs(30)));
+    let _ = tcp.set_write_timeout(Some(std::time::Duration::from_secs(30)));
+
+    let mut builder = SslConnector::builder(SslMethod::tls_client()).map_err(|e| hs(&e))?;
+    builder.set_security_level(CLIENT_SECURITY_LEVEL);
+    builder
+        .set_min_proto_version(Some(SslVersion::TLS1_2))
+        .map_err(|e| hs(&e))?;
+    if cfg.max_tls12 {
+        builder
+            .set_max_proto_version(Some(SslVersion::TLS1_2))
+            .map_err(|e| hs(&e))?;
+    }
+    if !cfg.roots.is_empty() {
+        if cfg.replace_roots {
+            let mut store = X509StoreBuilder::new().map_err(|e| hs(&e))?;
+            let mut added = 0usize;
+            for der in &cfg.roots {
+                match X509::from_der(der) {
+                    Ok(cert) => {
+                        // One unparseable anchor must not sink the whole
+                        // connector -- `new13_build_connector` logs and
+                        // continues. But a REPLACING root set that lost every
+                        // anchor that way would trust nothing at all while
+                        // still looking configured, so the count is checked.
+                        if store.add_cert(cert).is_ok() {
+                            added += 1;
+                        }
+                    }
+                    Err(e) => {
+                        tracing::debug!(
+                            target: "servlet::tls",
+                            "openssl client: skipping unparseable trust anchor DER: {e}"
+                        );
+                    }
+                }
+            }
+            if added == 0 {
+                return Err(TlsConnectFailure::Handshake(
+                    "no usable trust anchor in the configured trust store".to_string(),
+                ));
+            }
+            builder
+                .set_verify_cert_store(store.build())
+                .map_err(|e| hs(&e))?;
+        } else {
+            let store = builder.cert_store_mut();
+            for der in &cfg.roots {
+                match X509::from_der(der) {
+                    Ok(cert) => {
+                        let _ = store.add_cert(cert);
+                    }
+                    Err(e) => {
+                        tracing::debug!(
+                            target: "servlet::tls",
+                            "openssl client: skipping unparseable custom trust anchor DER: {e}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+    if cfg.skip_verify {
+        builder.set_verify(SslVerifyMode::NONE);
+    }
+    let connector = builder.build();
+    let mut connection = connector.configure().map_err(|e| hs(&e))?;
+    if cfg.skip_verify {
+        connection.set_verify_hostname(false);
+    }
+    let stream = connection
+        .connect(host, tcp)
+        .map_err(|e| TlsConnectFailure::Handshake(format!("TLS handshake failed: {e}")))?;
+
+    let peer_cert_chain_der = openssl_peer_chain_der(stream.ssl()).map_err(|e| hs(&e))?;
+    // The values native-tls forced this path to hard-code. `version_str`
+    // already spells JSSE's names ("TLSv1.3"/"TLSv1.2"), and a cipher's
+    // STANDARD name is the IANA/JSSE one: at TLS 1.3 it coincides with
+    // OpenSSL's own ("TLS_AES_128_GCM_SHA256"), at TLS 1.2 it does not
+    // ("ECDHE-RSA-AES128-GCM-SHA256" vs
+    // "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256").
+    let negotiated_protocol = stream.ssl().version_str().to_string();
+    let negotiated_cipher = stream
+        .ssl()
+        .current_cipher()
+        .map(|c| c.standard_name().unwrap_or_else(|| c.name()).to_string())
+        .unwrap_or_else(|| "UNKNOWN".to_string());
+    let negotiated_alpn = stream
+        .ssl()
+        .selected_alpn_protocol()
+        .map(|p| String::from_utf8_lossy(p).into_owned());
+
+    let raw = stream.get_ref().try_clone().ok();
+    let entry = TlsEntry {
+        stream: Arc::new(parking_lot::Mutex::new(TlsClientStream::Openssl(stream))),
+        raw,
+        peer_host: host.to_string(),
+        peer_port: port,
+        negotiated_protocol,
+        negotiated_cipher,
+        negotiated_alpn,
         peer_cert_chain_der,
     };
     let mut reg = s2_registry().lock();
@@ -2609,7 +2857,7 @@ fn s2_tls_read_direct(id: i32, buf: &mut [u8]) -> std::io::Result<usize> {
     let result = match &mut *guard {
         TlsClientStream::Native(stream) => stream.read(buf),
         #[cfg(unix)]
-        TlsClientStream::LegacyDsa(stream) => stream.read(buf),
+        TlsClientStream::Openssl(stream) => stream.read(buf),
     };
     drop(guard);
     s2_tls_classify_after_block(id, result)
@@ -2685,7 +2933,7 @@ pub(crate) fn s2_tls_write(id: i32, data: &[u8]) -> std::io::Result<usize> {
     let result = match &mut *guard {
         TlsClientStream::Native(stream) => stream.write(data),
         #[cfg(unix)]
-        TlsClientStream::LegacyDsa(stream) => stream.write(data),
+        TlsClientStream::Openssl(stream) => stream.write(data),
     };
     drop(guard);
     // Same after-the-fact classification as the read side, and safe for the
@@ -2758,7 +3006,7 @@ pub(crate) fn s2_tls_close(id: i32) -> std::io::Result<()> {
                     let _ = stream.shutdown();
                 }
                 #[cfg(unix)]
-                TlsClientStream::LegacyDsa(stream) => {
+                TlsClientStream::Openssl(stream) => {
                     let _ = stream.shutdown();
                 }
             }
