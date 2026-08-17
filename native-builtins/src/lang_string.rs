@@ -1564,8 +1564,30 @@ pub(crate) fn native_sb_init_capacity(
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(None),
     };
+    // A NEGATIVE capacity is a throw, not a clamp. `AbstractStringBuilder(int
+    // capacity)`'s whole body is the allocation `value = new byte[capacity]`
+    // (or `StringUTF16.newBytesFor(capacity)`), so a negative argument fails in
+    // `anewarray` with `NegativeArraySizeException` whose message is the raw
+    // size. Clamping to 0 with `max(v, 0)` silently built a usable empty
+    // builder instead — `new StringBuilder(-1).length()` answered 0 where
+    // HotSpot throws.
+    //
+    // This is deliberately a DIFFERENT exception class from `setLength(-1)`'s
+    // `StringIndexOutOfBoundsException`, and `RJdkBridge1`'s `sbidx` rows
+    // assert both, one right after the other, precisely because the two
+    // negative-length paths in this class do not agree. MEASURED on
+    // jdk-25.0.3.9: `new StringBuilder(-1)` -> `NegativeArraySizeException: -1`,
+    // `new StringBuffer(-7)` -> `NegativeArraySizeException: -7`.
     let cap = match args.get(1) {
-        Some(Value::Int(v)) => std::cmp::max(*v, 0) as usize,
+        Some(Value::Int(v)) => {
+            if *v < 0 {
+                return Err(
+                    cratonvm_types::error::RuntimeError::NegativeArraySizeException { size: *v }
+                        .into(),
+                );
+            }
+            *v as usize
+        }
         _ => 16,
     };
     let mut scope = NativeHandleScope::new(ctx);
@@ -2559,8 +2581,39 @@ pub(crate) fn native_sb_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -
 /// AbstractStringBuilder.getChars(int srcBegin, int srcEnd, char[] dst, int dstBegin)
 ///
 /// Copies characters from the builder's buffer into `dst` starting at
-/// `dstBegin`.  Throws StringIndexOutOfBoundsException if
-/// srcBegin < 0, srcEnd > count, or srcBegin > srcEnd.
+/// `dstBegin`.
+///
+/// **The two range checks throw DIFFERENT exception classes, and the JDK says
+/// so in one line each.** `AbstractStringBuilder.getChars` is:
+///
+/// ```text
+/// Preconditions.checkFromToIndex(srcBegin, srcEnd, count, Preconditions.SIOOBE_FORMATTER);
+/// int n = srcEnd - srcBegin;
+/// Preconditions.checkFromToIndex(dstBegin, dstBegin + n, dst.length, Preconditions.IOOBE_FORMATTER);
+/// ```
+///
+/// so a bad SOURCE window is a `StringIndexOutOfBoundsException` while a bad
+/// DESTINATION window is the PLAIN `IndexOutOfBoundsException` — not the
+/// `ArrayIndexOutOfBoundsException` the element stores below would otherwise
+/// suggest, and not the `StringIndexOutOfBoundsException` its own source-side
+/// neighbour throws. Both wrong choices are subclasses of the class the JDK
+/// actually throws, so a test that catches the SUPERTYPE cannot tell the
+/// difference; `RJdkBridge1`'s `sbidx` rows assert the EXACT class and can.
+/// MEASURED on jdk-25.0.3.9 — see
+/// `docs/known-issues/jdk-only/G53-1-the-exact-exception-class-and-the-rest-of-sbidx-20260817.md`.
+///
+/// The ORDER is load-bearing too, and is four checks deep:
+/// 1. the source check runs FIRST, so `getChars(3, 1, null, 0)` is a
+///    `StringIndexOutOfBoundsException` and never reaches the null `dst`;
+/// 2. `dst.length` is then read, so a null `dst` is a `NullPointerException`
+///    even when `n == 0` — `getChars(0, 0, null, 0)` throws;
+/// 3. only then is the destination window checked.
+///
+/// Note `java.lang.String.getChars` does NOT share this split: it checks both
+/// windows with `SIOOBE_FORMATTER`, so its too-small-destination case is a
+/// `StringIndexOutOfBoundsException`. It is a different contract in a different
+/// class, and this file does not serve it (`String.getChars` has no native
+/// registration at all — real JDK bytecode runs). Do not unify the two.
 pub(crate) fn native_sb_get_chars(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
@@ -2574,50 +2627,47 @@ pub(crate) fn native_sb_get_chars(ctx: &mut dyn NativeContext, args: &[Value]) -
         Some(Value::Int(v)) => *v,
         _ => 0,
     };
-    // `dst` is dereferenced (`dst.length`, element stores) — a null array is a
-    // NullPointerException per the JDK, not a silent no-op.
-    let dst = match args.get(3) {
-        Some(Value::Object(Some(arr))) => *arr,
-        _ => {
-            return Err(cratonvm_types::error::RuntimeError::NullPointerException {
-                message: Some(
-                    "Cannot store to null char[] in AbstractStringBuilder.getChars".to_string(),
-                ),
-            }
-            .into())
-        }
-    };
     let dst_begin = match args.get(4) {
         Some(Value::Int(v)) => *v,
         _ => 0,
     };
 
     let (buf, count) = sb_state(ctx, this);
-    // Source-range check: `AbstractStringBuilder.getChars` first validates the
-    // [srcBegin, srcEnd) window against the builder length via
-    // `checkRangeSIOOBE`, throwing StringIndexOutOfBoundsException.
+    // (1) Source-range check FIRST, with `SIOOBE_FORMATTER`. This precedes the
+    // null-`dst` dereference, which is why a bad source window beats a null
+    // destination rather than the other way round.
     if src_begin < 0 || src_end > count || src_begin > src_end {
         return Err(cratonvm_types::error::RuntimeError::sioobe_range(src_begin, src_end, count).into());
     }
     let n = (src_end - src_begin) as usize;
-    // Destination-range check: the underlying `System.arraycopy` into `dst`
-    // throws (Array)IndexOutOfBoundsException when `dstBegin < 0` or the copied
-    // window `[dstBegin, dstBegin + n)` would run past `dst.length`. Previously
-    // this was silently ignored, dropping the out-of-bounds writes.
+    // (2) `dst.length` is read next, so a null `dst` is a NullPointerException —
+    // unconditionally, including the `n == 0` case where nothing would be
+    // copied. HotSpot's helpful-NPE wording names the array being read.
+    let dst = match args.get(3) {
+        Some(Value::Object(Some(arr))) => *arr,
+        _ => {
+            return Err(cratonvm_types::error::RuntimeError::NullPointerException {
+                message: Some("Cannot read the array length because \"dst\" is null".to_string()),
+            }
+            .into())
+        }
+    };
+    // (3) Destination-range check, with `IOOBE_FORMATTER`: the PLAIN
+    // `IndexOutOfBoundsException`, carrying `checkFromToIndex`'s range wording
+    // over the DESTINATION window `[dstBegin, dstBegin + n)`.
     let dst_len = ctx.array_length(dst) as i64;
     // Use widening i64 arithmetic so `dstBegin + n` cannot wrap (n is bounded by
     // the validated source window, so it fits in i32, but stay defensive).
     let copy_end = i64::from(dst_begin) + (n as i64);
     if dst_begin < 0 || copy_end > dst_len {
-        // The first offending destination index, matching JDK arraycopy
-        // semantics: a negative dstBegin reports dstBegin; an overrun reports
-        // the last index written.
-        let bad_index = if dst_begin < 0 {
-            dst_begin
-        } else {
-            (copy_end - 1).clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32
-        };
-        return Err(cratonvm_types::error::RuntimeError::aioobe_index_only(bad_index).into());
+        return Err(cratonvm_types::error::RuntimeError::ioobe(
+            cratonvm_types::error::out_of_bounds_message::check_from_to_index(
+                i64::from(dst_begin),
+                copy_end,
+                dst_len,
+            ),
+        )
+        .into());
     }
     let buf = match buf {
         Some(b) => b,
@@ -2858,8 +2908,30 @@ pub(crate) fn native_sb_code_point_count(
         _ => 0,
     };
     let chars = sb_read_chars(ctx, this);
-    if let Some(failure) = sb_check_from_to_index(begin_i32, end_i32, chars.len() as i32) {
-        return Err(failure);
+    // NOT `sb_check_from_to_index` — that helper throws the
+    // `StringIndexOutOfBoundsException` its `delete`/`replace`/`substring`
+    // callers want, and `codePointCount` is the one row in this class that
+    // wants the PLAIN superclass. The JDK passes a null formatter here:
+    //
+    // ```text
+    // Preconditions.checkFromToIndex(beginIndex, endIndex, count, null);
+    // ```
+    //
+    // against `SIOOBE_FORMATTER` two methods away, and a null formatter yields
+    // `java.lang.IndexOutOfBoundsException`. `RJdkBridge1`'s
+    // `sbidx-step=codePointCount(0, len+1)` asserts the exact class, so the
+    // subclass does not pass even though `catch (IndexOutOfBoundsException)`
+    // would not notice. MEASURED on jdk-25.0.3.9.
+    let count_i32 = chars.len() as i32;
+    if begin_i32 < 0 || begin_i32 > end_i32 || end_i32 > count_i32 {
+        return Err(cratonvm_types::error::RuntimeError::ioobe(
+            cratonvm_types::error::out_of_bounds_message::check_from_to_index(
+                i64::from(begin_i32),
+                i64::from(end_i32),
+                i64::from(count_i32),
+            ),
+        )
+        .into());
     }
     let begin = begin_i32 as usize;
     let end = end_i32 as usize;
@@ -14287,8 +14359,75 @@ mod tests {
         ));
     }
 
+    /// The detail message of an `IndexOutOfBoundsException`-family failure.
+    ///
+    /// The exact wording separates `Preconditions`' `checkFromToIndex` shape
+    /// (`Range [a, b) out of bounds for length n`) from the `checkIndex` shape,
+    /// which is how a range check that reports the wrong WINDOW is caught even
+    /// when it reports the right class.
+    fn err_message(e: &cratonvm_types::error::MethodCallFailed) -> Option<String> {
+        match e {
+            cratonvm_types::error::MethodCallFailed::InternalError(
+                cratonvm_types::error::VmError::Runtime(re),
+            ) => match re {
+                cratonvm_types::error::RuntimeError::IndexOutOfBoundsException { message }
+                | cratonvm_types::error::RuntimeError::StringIndexOutOfBoundsException {
+                    message,
+                    ..
+                }
+                | cratonvm_types::error::RuntimeError::ArrayIndexOutOfBoundsException {
+                    message,
+                    ..
+                } => message.clone(),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    // `AbstractStringBuilder.getChars` throws THREE different classes depending
+    // on which argument is wrong, and the choice is not the intuitive one. Its
+    // two range checks are one line apart in the JDK and pass DIFFERENT
+    // formatters — `SIOOBE_FORMATTER` for the source window, `IOOBE_FORMATTER`
+    // for the destination — so the destination case is the PLAIN
+    // `IndexOutOfBoundsException`, the superclass of both the
+    // `ArrayIndexOutOfBoundsException` the element stores suggest and the
+    // `StringIndexOutOfBoundsException` its own source-side neighbour throws.
+    //
+    // These assert through `err_kind`, which discriminates all three, because a
+    // `matches!` on `IndexOutOfBoundsException` alone cannot: the two wrong
+    // answers are SUBCLASSES, so any assertion phrased on the supertype passes
+    // on the broken code. MEASURED against jdk-25.0.3.9; see
+    // `docs/known-issues/jdk-only/G53-1-the-exact-exception-class-and-the-rest-of-sbidx-20260817.md`.
+
     #[test]
-    fn sb_get_chars_negative_dst_begin_throws_aioobe() {
+    fn sb_get_chars_too_small_dst_throws_the_plain_ioobe_not_a_subclass() {
+        let mut ctx = mock_ctx();
+        let sb = make_sb_with(&mut ctx, "abcde");
+        let dst = ctx.new_array(ArrayElementType::Char, 2);
+        // `RJdkBridge1`'s `sbidx-step=getChars into a too-small array`, verbatim.
+        let err = native_sb_get_chars(
+            &mut ctx,
+            &[
+                Value::Object(Some(sb)),
+                Value::Int(0),
+                Value::Int(3),
+                Value::Object(Some(dst)),
+                Value::Int(0),
+            ],
+        )
+        .unwrap_err();
+        assert_eq!(err_kind(&ctx, &err), "ioobe");
+        // The window named is the DESTINATION one, `[dstBegin, dstBegin + n)`
+        // against `dst.length` — not the source window `[0, 3)` against 5.
+        assert_eq!(
+            err_message(&err).as_deref(),
+            Some("Range [0, 3) out of bounds for length 2")
+        );
+    }
+
+    #[test]
+    fn sb_get_chars_negative_dst_begin_throws_the_plain_ioobe() {
         let mut ctx = mock_ctx();
         let sb = make_sb_with(&mut ctx, "abc");
         let dst = ctx.new_array(ArrayElementType::Char, 8);
@@ -14303,11 +14442,15 @@ mod tests {
             ],
         )
         .unwrap_err();
-        assert_eq!(err_kind(&ctx, &err), "aioobe");
+        assert_eq!(err_kind(&ctx, &err), "ioobe");
+        assert_eq!(
+            err_message(&err).as_deref(),
+            Some("Range [-1, 2) out of bounds for length 8")
+        );
     }
 
     #[test]
-    fn sb_get_chars_dst_overrun_throws_aioobe() {
+    fn sb_get_chars_dst_overrun_throws_the_plain_ioobe() {
         let mut ctx = mock_ctx();
         let sb = make_sb_with(&mut ctx, "abcde");
         let dst = ctx.new_array(ArrayElementType::Char, 4);
@@ -14323,12 +14466,69 @@ mod tests {
             ],
         )
         .unwrap_err();
-        assert_eq!(err_kind(&ctx, &err), "aioobe");
+        assert_eq!(err_kind(&ctx, &err), "ioobe");
+        assert_eq!(
+            err_message(&err).as_deref(),
+            Some("Range [2, 7) out of bounds for length 4")
+        );
         // The out-of-bounds store must NOT have silently written anything past
         // the array; in-range slots remain at their zero default.
         for i in 0..ctx.array_length(dst) {
             assert_eq!(ctx.get_array_element(dst, i), Value::Int(0));
         }
+    }
+
+    #[test]
+    fn sb_get_chars_bad_src_range_beats_a_null_destination() {
+        let mut ctx = mock_ctx();
+        let sb = make_sb_with(&mut ctx, "abcde");
+        // The source check runs BEFORE `dst` is dereferenced, so `srcBegin >
+        // srcEnd` with a null `dst` is a StringIndexOutOfBoundsException and
+        // NOT the NullPointerException that checking the argument first would
+        // give. Ordering, not just class choice.
+        let err = native_sb_get_chars(
+            &mut ctx,
+            &[
+                Value::Object(Some(sb)),
+                Value::Int(3),
+                Value::Int(1),
+                Value::Object(None),
+                Value::Int(0),
+            ],
+        )
+        .unwrap_err();
+        assert_eq!(err_kind(&ctx, &err), "sioobe");
+        assert_eq!(
+            err_message(&err).as_deref(),
+            Some("Range [3, 1) out of bounds for length 5")
+        );
+    }
+
+    #[test]
+    fn sb_get_chars_null_dst_throws_npe_even_when_nothing_would_be_copied() {
+        let mut ctx = mock_ctx();
+        let sb = make_sb_with(&mut ctx, "abcde");
+        // `dst.length` is read unconditionally once the source window is
+        // accepted, so a zero-length copy into a null array still throws.
+        let err = native_sb_get_chars(
+            &mut ctx,
+            &[
+                Value::Object(Some(sb)),
+                Value::Int(0),
+                Value::Int(0),
+                Value::Object(None),
+                Value::Int(0),
+            ],
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            cratonvm_types::error::MethodCallFailed::InternalError(
+                cratonvm_types::error::VmError::Runtime(
+                    cratonvm_types::error::RuntimeError::NullPointerException { .. }
+                )
+            )
+        ));
     }
 
     #[test]
@@ -14368,6 +14568,124 @@ mod tests {
             ],
         );
         assert!(r.unwrap().is_none());
+    }
+
+    // `codePointCount` is the ONE range check in this class that the JDK gives a
+    // null formatter (`Preconditions.checkFromToIndex(begin, end, count,
+    // null)`), so it yields the PLAIN `IndexOutOfBoundsException` while its
+    // `delete`/`replace`/`substring` neighbours, checked by the same shared
+    // helper here, yield `StringIndexOutOfBoundsException`. The paired
+    // neighbour assertions below exist so that "fixing" this by changing the
+    // shared helper fails loudly instead of silently regressing four methods.
+
+    #[test]
+    fn sb_code_point_count_bad_range_throws_the_plain_ioobe() {
+        for (begin, end, want_msg) in [
+            (0, 6, "Range [0, 6) out of bounds for length 5"),
+            (-1, 3, "Range [-1, 3) out of bounds for length 5"),
+            (3, 1, "Range [3, 1) out of bounds for length 5"),
+        ] {
+            let mut ctx = mock_ctx();
+            let sb = make_sb_with(&mut ctx, "abcde");
+            let err = native_sb_code_point_count(
+                &mut ctx,
+                &[Value::Object(Some(sb)), Value::Int(begin), Value::Int(end)],
+            )
+            .unwrap_err();
+            assert_eq!(
+                err_kind(&ctx, &err),
+                "ioobe",
+                "codePointCount({begin}, {end})"
+            );
+            assert_eq!(err_message(&err).as_deref(), Some(want_msg));
+        }
+    }
+
+    #[test]
+    fn sb_substring_and_delete_keep_the_string_subclass_that_code_point_count_drops() {
+        let mut ctx = mock_ctx();
+        let sb = make_sb_with(&mut ctx, "abcde");
+        let err = native_sb_substring_range(
+            &mut ctx,
+            &[Value::Object(Some(sb)), Value::Int(3), Value::Int(1)],
+        )
+        .unwrap_err();
+        assert_eq!(err_kind(&ctx, &err), "sioobe");
+
+        let sb = make_sb_with(&mut ctx, "abcde");
+        let err = native_sb_delete(
+            &mut ctx,
+            &[Value::Object(Some(sb)), Value::Int(3), Value::Int(1)],
+        )
+        .unwrap_err();
+        assert_eq!(err_kind(&ctx, &err), "sioobe");
+    }
+
+    #[test]
+    fn sb_code_point_count_valid_window_still_counts_surrogate_pairs() {
+        let mut ctx = mock_ctx();
+        // "a" + U+10437 (a surrogate PAIR) + "b" = 4 units, 3 code points.
+        let sb = make_sb_with(&mut ctx, "a\u{10437}b");
+        let r = native_sb_code_point_count(
+            &mut ctx,
+            &[Value::Object(Some(sb)), Value::Int(0), Value::Int(4)],
+        )
+        .unwrap();
+        assert_eq!(r, Some(Value::Int(3)));
+    }
+
+    #[test]
+    fn sb_init_capacity_negative_throws_negative_array_size_not_a_clamp() {
+        // `AbstractStringBuilder(int)` is just `new byte[capacity]`, so a
+        // negative capacity throws NegativeArraySizeException carrying the raw
+        // size. Clamping to zero built a usable empty builder instead.
+        //
+        // Deliberately a DIFFERENT class from `setLength(-1)`'s
+        // StringIndexOutOfBoundsException — the two negative-length paths in
+        // this class do not agree, and `RJdkBridge1` asserts both in a row.
+        for size in [-1_i32, -7] {
+            let mut ctx = mock_ctx();
+            let cid = ctx
+                .ensure_class_initialized("java/lang/StringBuilder")
+                .unwrap();
+            let sb = ctx.alloc_object(cid, 4);
+            let err =
+                native_sb_init_capacity(&mut ctx, &[Value::Object(Some(sb)), Value::Int(size)])
+                    .unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    cratonvm_types::error::MethodCallFailed::InternalError(
+                        cratonvm_types::error::VmError::Runtime(
+                            cratonvm_types::error::RuntimeError::NegativeArraySizeException {
+                                size: s
+                            }
+                        )
+                    ) if s == size
+                ),
+                "new StringBuilder({size}) must throw NegativeArraySizeException({size})"
+            );
+        }
+    }
+
+    #[test]
+    fn sb_init_capacity_zero_and_positive_still_build_an_empty_builder() {
+        for size in [0_i32, 5] {
+            let mut ctx = mock_ctx();
+            let cid = ctx
+                .ensure_class_initialized("java/lang/StringBuilder")
+                .unwrap();
+            let sb = ctx.alloc_object(cid, 4);
+            native_sb_init_capacity(&mut ctx, &[Value::Object(Some(sb)), Value::Int(size)])
+                .unwrap();
+            // A capacity is not a length: the builder starts empty either way.
+            let len = native_sb_length(&mut ctx, &[Value::Object(Some(sb))]).unwrap();
+            assert_eq!(
+                len,
+                Some(Value::Int(0)),
+                "new StringBuilder({size}).length()"
+            );
+        }
     }
 
     // -----------------------------------------------------------------------
