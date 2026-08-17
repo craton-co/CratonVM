@@ -9701,6 +9701,17 @@ fn handshake_status_of(s: &EngineState) -> i32 {
     }
     let conn = match s.conn.as_ref() {
         Some(c) => c,
+        // The connection is ON LOAN to `do_unwrap`'s record loop, not absent.
+        // Answering NOT_HANDSHAKING here says "the handshake is over", and a
+        // caller that believes it stops driving the engine — which is a HANG,
+        // reached from inside the very Java `TrustManager` upcall the loan
+        // exists to allow (an `X509ExtendedTrustManager` is handed the
+        // `SSLEngine` and JSSE's own tests query it). Measured: without this
+        // arm, `JdkSslEngineTest`'s TLSv1.3 `testMutualAuthSameCertChain` and
+        // `mustCallResumeTrustedOnSessionResumption` time out instead of
+        // failing, 4 of 821 where the control has 0. See
+        // `EngineState::conn_checked_out`.
+        None if s.conn_checked_out => return HS_NEED_UNWRAP_R,
         // A server engine whose connection is held back until the ClientHello
         // arrives (ALPN selector) is still HANDSHAKING as far as the caller is
         // concerned, and what it needs next is the hello.
@@ -11123,6 +11134,20 @@ fn engine_wrap_pump(
 ) -> (usize, usize) {
     // Read before the `&mut state.conn` borrow below starts.
     let finished_reported = state.handshake_finished_reported;
+    if state.conn_checked_out {
+        // Re-entrant wrap while `do_unwrap`'s record loop holds the connection
+        // (see `EngineState::conn_checked_out`). Answering `(0, 0)` is the same
+        // answer as "no connection yet", and it silently DROPS whatever the
+        // caller wanted written — a lost handshake record, i.e. a hang with no
+        // error. It should not be reachable: the loan is confined to one native
+        // call on one thread, and `handshake_status_of` reports NEED_UNWRAP
+        // throughout it so no caller is invited to wrap. Say so if it ever is,
+        // rather than losing the record quietly.
+        eprintln!(
+            "[tls] BUG: wrap on an engine whose connection is checked out by              do_unwrap's record loop; the write is being dropped. Please report              this with CRATONVM_DBG=tls-hs output."
+        );
+        return (0, 0);
+    }
     let conn = match state.conn.as_mut() {
         Some(c) => c,
         None => return (0, 0),
