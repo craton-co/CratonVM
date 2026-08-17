@@ -11359,17 +11359,23 @@ fn capture_sni_matchers(ctx: &mut dyn NativeContext, engine: ObjectRef, params: 
 /// matching `ServerHandshakeContext`, which pairs each received name with the
 /// matcher registered for that name's type and ignores the rest.
 ///
+/// Answers `true` when a matcher REFUSED. The refusal is armed on the engine
+/// (a fatal `unrecognized_name` for the peer, plus
+/// `deferred_handshake_error` for this side) and deliberately NOT raised here
+/// — see the refusal arm in `do_unwrap` for why the throw has to wait for the
+/// wrap that puts the alert on the wire.
+///
 /// Runs with the engine registry lock NOT held: it calls into Java.
 fn engine_run_sni_match_check(
     ctx: &mut dyn NativeContext,
     engine_id: i32,
     engine: ObjectRef,
     host: String,
-) -> Result<(), cratonvm_types::error::MethodCallFailed> {
+) -> Result<bool, cratonvm_types::error::MethodCallFailed> {
     let key = engine_objref_key(ctx, engine);
     let matchers = match engine_sni_matchers_table().lock().get(&key).cloned() {
         Some(m) if !m.is_empty() => m,
-        _ => return Ok(()),
+        _ => return Ok(false),
     };
     let name_str = ctx.create_string(&host);
     let base = ctx.pin_native_root(name_str);
@@ -11383,7 +11389,7 @@ fn engine_run_sni_match_check(
         Ok(Some(Value::Object(Some(o)))) => o,
         _ => {
             ctx.unpin_native_roots(base);
-            return Ok(());
+            return Ok(false);
         }
     };
     let name_pin = ctx.pin_native_root(sni_name);
@@ -11419,18 +11425,36 @@ fn engine_run_sni_match_check(
     }
     ctx.unpin_native_roots(base);
     if !refused {
-        return Ok(());
+        return Ok(false);
     }
     with_engine(engine_id, |s| {
-        if let Some(c) = s.conn.as_mut() {
-            c.queue_fatal_alert(rustls::AlertDescription::UnrecognisedName);
+        match s.conn.as_mut() {
+            Some(c) => c.queue_fatal_alert(rustls::AlertDescription::UnrecognisedName),
+            // The gate runs at ClientHello time, and on a server engine that
+            // is the call BEFORE `engine_begin_or_defer` realizes the rustls
+            // connection — so `conn` is `None` here on the path that actually
+            // matters and `queue_fatal_alert` was a silent no-op. No record
+            // layer exists yet either, which is fine: a pre-keys alert goes
+            // out as TLS plaintext, and that is exactly what JSSE's own
+            // `ServerHandshakeContext` sends when it refuses a hello before a
+            // ServerHello exists. alert(21), legacy_record_version 0x0303,
+            // length 2, level fatal(2), description unrecognized_name(112).
+            None => s
+                .outbound
+                .extend_from_slice(&[21, 0x03, 0x03, 0x00, 0x02, 2, 112]),
         }
+        // Owed to THIS side, but only once the alert above has gone out — the
+        // `SniClientTest.testSniSNIMatcherDoesNotMatchClient` half of the
+        // "a wrap that raises cannot also deliver its alert" defect. Raising
+        // it from this unwrap instead left the client with a closed channel
+        // and no alert at all: `StacklessClosedChannelException` where its
+        // `assertThrows(SSLException.class, …)` wants an `SSLException`.
+        s.deferred_handshake_error = Some((
+            "javax/net/ssl/SSLHandshakeException",
+            format!("Unrecognized server name indication: {host}"),
+        ));
     });
-    Err(crate::phases_early::throw_jca_exc(
-        ctx,
-        "javax/net/ssl/SSLHandshakeException",
-        &format!("Unrecognized server name indication: {host}"),
-    ))
+    Ok(true)
 }
 
 thread_local! {
@@ -13735,7 +13759,38 @@ fn do_unwrap(
     // the record. Nothing is consumed here; on refusal the bytes are never fed
     // to rustls at all, so no ServerHello is ever produced.
     if let Some(host) = engine_pending_sni_host(ctx, id, &src_view, src_pos, src_lim) {
-        engine_run_sni_match_check(ctx, id, this, host)?;
+        if engine_run_sni_match_check(ctx, id, this, host)? {
+            // Refused. The engine now holds a fatal `unrecognized_name` for the
+            // peer and a `deferred_handshake_error` for this side; this call
+            // must report ORDINARY PROGRESS so the caller comes back for the
+            // wrap that emits the alert, and only the wrap after that raises.
+            //
+            // Consuming the hello record is what makes it progress:
+            // `SslHandler.decodeJdkCompatible` hands `unwrap` exactly one TLS
+            // record and treats `bytesConsumed != packetLength` as "not an
+            // SSL/TLS record" (`NotSslRecordException`), and a call that
+            // consumed nothing reports BUFFER_UNDERFLOW — the caller then
+            // waits for network data that is never coming and the deferred
+            // failure is never drained. The bytes are dropped rather than fed
+            // to rustls: a refused hello must not produce a ServerHello.
+            let rec_end = {
+                let b3 = bb_get_byte(ctx, &src_view, src_pos + 3).unwrap_or(0) as usize;
+                let b4 = bb_get_byte(ctx, &src_view, src_pos + 4).unwrap_or(0) as usize;
+                (src_pos + 5 + ((b3 << 8) | b4)).min(src_lim)
+            };
+            if rec_end > src_pos {
+                bb_set_pos(ctx, src, src_view.layout, rec_end);
+            }
+            let consumed = rec_end.saturating_sub(src_pos);
+            if __dbg_hs {
+                eprintln!(
+                    "[dbg-tls-hs] thread={:?} do_unwrap id={} RETURN(sni-refused) status=OK hs=NEED_WRAP consumed={} produced=0",
+                    std::thread::current().id(), id, consumed
+                );
+            }
+            let result = alloc_engine_result(ctx, SR_OK, HS_NEED_WRAP_R, consumed as i32, 0)?;
+            return Ok(Some(Value::Object(Some(result))));
+        }
     }
 
     // Realize the rustls connection — and, on the first inbound handshake
