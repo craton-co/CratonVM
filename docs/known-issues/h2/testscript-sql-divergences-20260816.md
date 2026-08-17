@@ -12,13 +12,13 @@ on `dev` @ `0d8c5f077`; **15** of them still reproduce on `dev` @ `496bc3c2c`
 * [`testscript-foreign-key-existing-data-check-not-run-20260816.md`](testscript-foreign-key-existing-data-check-not-run-20260816.md) — 1 error, **fixed 2026-08-17**
 
 The fixes are written up in
-[`../../internal/fixed-suite-bugs/h2-suite-bugs/bug-h2-testscript-bigdecimal-valueof-double-and-string-codepoints-FIXED-20260816.md`](../../internal/fixed-suite-bugs/h2-suite-bugs/bug-h2-testscript-bigdecimal-valueof-double-and-string-codepoints-FIXED-20260816.md)
+`fixed-suite-bugs/h2-suite-bugs/bug-h2-testscript-bigdecimal-valueof-double-and-string-codepoints-FIXED-20260816.md`
 (`BigDecimal.valueOf(double)`, `String.codePoints()` — 5 errors) and
-[`../../internal/fixed-suite-bugs/h2-suite-bugs/bug-h2-testscript-fk-array-comparability-skipped-by-rowcount-shortcut-FIXED-20260817.md`](../../internal/fixed-suite-bugs/h2-suite-bugs/bug-h2-testscript-fk-array-comparability-skipped-by-rowcount-shortcut-FIXED-20260817.md)
+`fixed-suite-bugs/h2-suite-bugs/bug-h2-testscript-fk-array-comparability-skipped-by-rowcount-shortcut-FIXED-20260817.md`
 (the H2 `checkExistingData` native's empty-table shortcut — 1 error).
 
 None of this was previously recorded anywhere under `docs/known-issues/`.
-`docs/internal/fixed-suite-bugs/h2-suite-bugs/bug-h2-testscript-parsedatetime-german-locale-month-name-FIXED-20260816.md`
+`fixed-suite-bugs/h2-suite-bugs/bug-h2-testscript-parsedatetime-german-locale-month-name-FIXED-20260816.md`
 names these failures as explicitly out of its own scope; this is the record it
 was pointing at. Its own root cause — CratonVM answering locale queries for
 English only — turns out to be the *same* root cause as the `SET COLLATION
