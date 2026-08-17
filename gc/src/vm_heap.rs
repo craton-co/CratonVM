@@ -3448,7 +3448,7 @@ mod concurrent_mark_controller_tests {
     #[cfg(feature = "zgc")]
     #[test]
     fn the_pre_gc_address_predicates_are_correct_for_an_object_compaction_moved() {
-        let heap = VmHeap::Zgc(crate::zgc::ZgcRealHeap::with_capacity(256 * 1024));
+        let heap = VmHeap::Zgc(crate::zgc::ZgcRealHeap::new_shared(256 * 1024));
         let VmHeap::Zgc(z) = &heap else {
             unreachable!("constructed as Zgc")
         };
@@ -3516,7 +3516,7 @@ mod concurrent_mark_controller_tests {
         cratonvm_types::flags::with_thread_overrides(
             &[("CRATONVM_ZGC_RELOCATE", Some("1"))],
             || {
-                let heap = VmHeap::Zgc(crate::zgc::ZgcRealHeap::with_capacity(256 * 1024));
+                let heap = VmHeap::Zgc(crate::zgc::ZgcRealHeap::new_shared(256 * 1024));
                 let VmHeap::Zgc(z) = &heap else {
                     unreachable!("constructed as Zgc")
                 };
@@ -3561,7 +3561,7 @@ mod concurrent_mark_controller_tests {
     #[cfg(feature = "zgc")]
     #[test]
     fn the_vm_heap_satb_arm_reaches_the_zgc_barrier() {
-        let heap = VmHeap::Zgc(crate::zgc::ZgcRealHeap::with_capacity(64 * 1024));
+        let heap = VmHeap::Zgc(crate::zgc::ZgcRealHeap::new_shared(64 * 1024));
         let VmHeap::Zgc(z) = &heap else {
             unreachable!("constructed as Zgc")
         };
@@ -3586,7 +3586,7 @@ mod concurrent_mark_controller_tests {
     #[cfg(feature = "zgc")]
     #[test]
     fn the_vm_heap_satb_arm_is_inert_on_zgc_while_not_marking() {
-        let heap = VmHeap::Zgc(crate::zgc::ZgcRealHeap::with_capacity(64 * 1024));
+        let heap = VmHeap::Zgc(crate::zgc::ZgcRealHeap::new_shared(64 * 1024));
         let VmHeap::Zgc(z) = &heap else {
             unreachable!("constructed as Zgc")
         };
