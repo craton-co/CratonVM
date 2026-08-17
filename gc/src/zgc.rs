@@ -5958,6 +5958,8 @@ impl ZgcRealHeap {
         // section header for the measurement this replaced.
         self.audit_registry_insert(ptr as usize, size, "alloc_raw");
         self.registry.insert(ptr as usize);
+        // See the same call in `register_allocations`.
+        crate::gc_quiescence::note_allocated(&[ptr as usize]);
         let after = self.allocated.fetch_add(size, Ordering::Relaxed) + size;
         // Arm the native-allocation-pressure latch on the crossing edge. This
         // is the ZGC analogue of G1's `note_region_consumed_locked`
@@ -8057,6 +8059,10 @@ impl ZTlabHeapHooks for ZgcRealHeap {
             }
         }
         self.registry.insert_all(addrs);
+        // `CRATONVM_DBG_VACATED_FRAMES`: these addresses are live objects again,
+        // so a reference to one is no longer evidence that a holder went stale.
+        // See `gc_quiescence::note_allocated`.
+        crate::gc_quiescence::note_allocated(addrs);
         if bytes == 0 {
             return;
         }

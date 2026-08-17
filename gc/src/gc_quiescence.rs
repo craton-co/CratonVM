@@ -1896,6 +1896,16 @@ pub fn vacated_frames_enabled() -> bool {
 /// map's keys). One collection at a time, deliberately: the question is "did a
 /// slot survive the collection that moved its object", and carrying older
 /// cycles would answer a different, much noisier one.
+///
+/// **The ledger is only exact because [`note_allocated`] empties it as the
+/// allocator re-issues the space.** A compacting cycle zeroes what it vacated
+/// and hands it straight back, so a reference to a vacated address is
+/// ambiguous the moment a NEW object is allocated there — and the first
+/// version of this instrument, which did not track that, reported eight
+/// perfectly valid frame slots per run (`MVTable.updateRows` local[4] holding
+/// exactly the `SessionLocal$Savepoint` its `astore 4` had put there). With
+/// re-issued addresses removed, a hit is unambiguous: nothing has been
+/// allocated at that address since the collector moved its occupant away.
 pub fn record_vacated(pointer_map: &cratonvm_types::PointerMap) {
     if !vacated_frames_enabled() {
         return;
@@ -1904,6 +1914,25 @@ pub fn record_vacated(pointer_map: &cratonvm_types::PointerMap) {
         pointer_map.iter().map(|(k, v)| (*k, *v)).collect();
     let to: rustc_hash::FxHashSet<usize> = pointer_map.values().copied().collect();
     *VACATED_ADDRS.lock() = Some((from, to));
+}
+
+/// Forget every address in `addrs` — the allocator has re-issued it, so a
+/// reference to it is no longer evidence of anything. Called from the
+/// allocation paths; a no-op unless the ledger is armed.
+pub fn note_allocated(addrs: &[usize]) {
+    if !vacated_frames_enabled() {
+        return;
+    }
+    let mut g = VACATED_ADDRS.lock();
+    let Some((from, _to)) = g.as_mut() else {
+        return;
+    };
+    if from.is_empty() {
+        return;
+    }
+    for a in addrs {
+        from.remove(a);
+    }
 }
 
 /// Did the last recorded collection move an object away from `addr`, and if so

@@ -800,6 +800,34 @@ impl VmHeap {
         // reproduced crash site downstream (`kind_of`, `class_id_of`,
         // `element_type_of`, `identity_hash_code`) now validates its own
         // input independently — see those methods below.
+        // `CRATONVM_DBG_VACATED_FRAMES`: was this barrier just asked to repair a
+        // reference the collector really did move, and did it fail?
+        //
+        // This barrier repairs by reading a FORWARDING WORD at the OLD address.
+        // ZGC's slide has none to read: `Arena::compact_low_to` zeroes the span
+        // above the new cursor and the memmove overwrites everything below it,
+        // so a stale reference either lands on zeroed bytes (not a registered
+        // base — the early return right below) or on another live object (whose
+        // header is not forwarded — the `is_forwarded` return after it). Every
+        // caller that treats this call as the repair for "a collection may have
+        // run since the frame read" is therefore unprotected on the DEFAULT
+        // collector. The ledger is exact (`gc_quiescence::note_allocated`
+        // removes re-issued addresses), so a hit here is proof, not a
+        // suspicion.
+        if crate::gc_quiescence::vacated_frames_enabled() {
+            if let Some(moved_to) = crate::gc_quiescence::was_vacated(obj.as_ptr() as usize) {
+                static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 12 {
+                    tracing::error!(
+                        target: "cratonvm::gc::guard",
+                        obj = format!("{:#x}", obj.as_ptr() as usize),
+                        moved_to = format!("{moved_to:#x}"),
+                        backtrace = %std::backtrace::Backtrace::force_capture(),
+                        "load_and_forward was handed a reference the collector MOVED, and                          cannot repair it: this collector leaves no forwarding word at the                          vacated address. The caller in the backtrace is holding a stale                          ObjectRef that nothing else will fix.",
+                    );
+                }
+            }
+        }
         if self.is_object_address(obj.as_ptr() as usize).is_none() {
             return obj;
         }
