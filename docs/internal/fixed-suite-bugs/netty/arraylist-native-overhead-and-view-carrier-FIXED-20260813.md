@@ -187,7 +187,7 @@ noise.** ~5.5% of attributed samples removed, ~0% of time. (A third attempt, a
 class prefilter on the native-registry lookup, did pay — 4.7% — but only after
 its first cut, which hashed the class name twice on a miss, measured 2.2%
 *slower*.) See
-[the VM-wide per-call page](../../performance/vm-per-call-dispatch-cost-RETIRED-20260813.md)
+[the VM-wide per-call page](../../../known-issues/perf/vm-per-call-dispatch-cost-20260813.md)
 for what the run is actually bound by, and treat a profile percentage on this VM
 as a lead rather than a quantity.
 

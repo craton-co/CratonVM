@@ -28,8 +28,14 @@
 //! refuse the method — `invokestatic` (`0xb8`, no call-target resolution) and
 //! `idiv`/`ldiv`/`irem`/`lrem` (see the safety notes) — so **158** opcodes
 //! actually lower. For comparison, `x64.rs` has an arm for 192 of the same
-//! 202 and lacks only `pop2`, `dup2_x1`, `dup2_x2`, `frem`, `drem`, `jsr`,
-//! `ret`, `wide`, `goto_w`, `jsr_w`.
+//! 202 and lacks only `dup2_x2`, `frem`, `drem`, `jsr`, `ret`, `wide`,
+//! `goto_w`, `jsr_w`. (`pop2` and `dup2_x1` were on that list until the
+//! commons-math throughput fix added x64 arms for them — see
+//! `fixed-suite-bugs/bug-commonsmath-accuratemathtest-psquarepercentiletest-interpreter-throughput-cliff-20260816-FIXED.md`.
+//! `dup2_x2` is the one this backend lowers and x64 still does not, and
+//! `jit_scan` admits it, so on x64 a method containing one reaches the
+//! codegen's `_ =>` catch-all and stays interpreted for the life of the
+//! process.)
 //!
 //! What lowers: constants (`*const_*`, `bipush`, `sipush`,
 //! `ldc`/`ldc_w`/`ldc2_w` for numeric constants), local load/store for
