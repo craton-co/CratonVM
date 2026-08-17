@@ -2462,13 +2462,23 @@ impl ThreadRegistry {
                 // scan section 11, "Root snapshot (for cross-thread GC
                 // scanning)". Remapping an entry to the address the collector
                 // itself reports is always correct, so this is unconditional.
-                let mut snapshot = entry.root_snapshot.lock();
-                for r in snapshot.iter_mut() {
-                    if let Some(&new) = pointer_map.get(&(r.as_ptr() as usize)) {
-                        if new != 0 {
-                            // SAFETY: `new` is a post-move object base the
-                            // collector just published in its pointer map.
-                            *r = unsafe { ObjectRef::from_raw(new as *mut u8) };
+                // `CRATONVM_NO_UNBLOCKED_SNAPSHOT_REMAP=1` restores the
+                // pre-fix behaviour in the SAME binary, so the root-remap audit
+                // can be run as a one-binary A/B instead of a rebuild — the
+                // bisection lever this codebase asks every new gate to carry.
+                if cratonvm_types::flags::runtime_var_os(
+                    "CRATONVM_NO_UNBLOCKED_SNAPSHOT_REMAP",
+                )
+                .is_none()
+                {
+                    let mut snapshot = entry.root_snapshot.lock();
+                    for r in snapshot.iter_mut() {
+                        if let Some(&new) = pointer_map.get(&(r.as_ptr() as usize)) {
+                            if new != 0 {
+                                // SAFETY: `new` is a post-move object base the
+                                // collector just published in its pointer map.
+                                *r = unsafe { ObjectRef::from_raw(new as *mut u8) };
+                            }
                         }
                     }
                 }
