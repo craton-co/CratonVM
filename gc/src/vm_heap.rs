@@ -829,6 +829,20 @@ impl VmHeap {
             }
         }
         if self.is_object_address(obj.as_ptr() as usize).is_none() {
+            // Not a live base. On a collector that leaves a forwarding word
+            // this is the end of the road; ZGC's slide leaves none, so ask its
+            // relocation table instead — that is the whole point of
+            // `ZgcRealHeap::relocations`, and without it this barrier is a
+            // silent no-op on the default collector.
+            #[cfg(feature = "zgc")]
+            if let VmHeap::Zgc(h) = self {
+                if let Some(moved_to) = h.forwarded_after_slide(obj.as_ptr() as usize) {
+                    // SAFETY: `forwarded_after_slide` only answers with an
+                    // address the object-start registry currently holds, i.e. a
+                    // live object base inside the arena.
+                    return unsafe { ObjectRef::from_raw(moved_to as *mut u8) };
+                }
+            }
             return obj;
         }
         // SAFETY: the caller guarantees `obj` is a live root. Every
