@@ -4918,9 +4918,37 @@ pub struct NativeCensusEntry {
     /// Kind of the entry this registration overwrote, if any. `Some` means this
     /// row superseded an earlier registration of the identical triple.
     pub overwrote: Option<NativeKind>,
-    /// Times this slot was dispatched through any path this run. `0` on a
-    /// superseded row: the count belongs to whoever currently owns the slot.
+    /// Times this slot was dispatched **through a path that resolved it by
+    /// name or id** this run. `0` on a superseded row: the count belongs to
+    /// whoever currently owns the slot.
+    ///
+    /// # This is a lower bound, and reading it as a call count has cost time
+    ///
+    /// Not "times the method ran". A dispatch served from a pre-resolved
+    /// function pointer — the interpreter's intrinsic table, the JIT's thin
+    /// direct-call helpers — never touches the registry and is not here.
+    /// MEASURED 2026-08-17: 100,000 `Math.abs` calls report `1`; the same run
+    /// under `CRATONVM_DISABLE_INTRINSICS=1` reports `100,000`. 100,000
+    /// `HashMap.get` calls report `1,873` with the JIT on and `100,001` under
+    /// `--nojit`. Full method, controls and the causal test:
+    /// `docs/known-issues/jdk-only/G33-1-the-instrument-that-under-reported-20260817.md`.
+    ///
+    /// Consequences already paid for in this directory: a lane concluded a
+    /// body was dead from `invocations = 0` when its workload simply never
+    /// reached the counted path, and another was told to read the field as a
+    /// boolean. **Check [`Self::invocations_complete`] first.** For a census
+    /// that is exact for everything measured, run with `--nojit` and
+    /// `CRATONVM_DISABLE_INTRINSICS=1`.
     pub invocations: u64,
+    /// Whether [`Self::invocations`] is a total (`true`) or a floor (`false`)
+    /// for this slot — see
+    /// [`NativeMethodRegistry::mark_invocations_incomplete`].
+    ///
+    /// `true` is the default and means "no dispatch path has declared itself a
+    /// bypass for this slot". Until the sites listed on that method actually
+    /// call it, `true` is the answer for every row, and the honest reading of
+    /// the whole column is still the one on [`Self::invocations`].
+    pub invocations_complete: bool,
     /// Whether this registration still **owns its slot**, i.e. whether a
     /// dispatch of this triple would reach *this* row's callback.
     ///
@@ -5300,6 +5328,36 @@ pub struct NativeMethodRegistry {
     /// the accumulated count carries over to the new owner. See
     /// [`invocations_of_kind`](Self::invocations_of_kind).
     slot_invocations: Vec<std::sync::atomic::AtomicU64>,
+    /// Per-slot "this counter is a **lower bound**" flag, index-parallel with
+    /// `slots` and grown in the same single arm as `slot_invocations`.
+    ///
+    /// # Why the census needs a second bit per slot
+    ///
+    /// [`record_invocation`](Self::record_invocation) is exact for every
+    /// dispatch that reaches it. What it cannot see is a dispatch that never
+    /// consults the registry at all, because some caller resolved this
+    /// triple's callback ONCE and then called the resulting function pointer
+    /// directly. Two such families were measured on 2026-08-17
+    /// (`docs/known-issues/jdk-only/G33-1-the-instrument-that-under-reported-20260817.md`):
+    /// the interpreter's intrinsic table and the JIT's thin direct-call
+    /// helpers. Both are deliberate optimisations, both are correct, and both
+    /// silently removed this counter along with the name resolution it was
+    /// attached to.
+    ///
+    /// Rather than pay a `fetch_add` on those paths — measured at **+9.2 ns
+    /// per call**, which is the whole margin a thin direct-call helper exists
+    /// to buy — a bypassing path sets this bit ONCE, cold, when it binds the
+    /// call site. The census then reports `invocations_complete: false` for
+    /// that slot, and a reader knows the number is a floor rather than a
+    /// count. An instrument that says "at least N" is usable; one that says
+    /// "N" and means "at least N" is not.
+    ///
+    /// `false` (the default) is the *claim*, not the absence of one: it says
+    /// nothing bypassed this slot as far as the registry was told. It is only
+    /// as true as the bypassing paths are honest about calling
+    /// [`mark_invocations_incomplete`](Self::mark_invocations_incomplete) —
+    /// which is why that method's doc carries the list of sites that must.
+    slot_invocations_incomplete: Vec<std::sync::atomic::AtomicBool>,
     /// 128-bit `(class, method, descriptor)` digest -> slot index. A hit here
     /// is a *candidate*, not an answer: `slot_index_for_key` re-checks the full
     /// triple before returning the slot.
@@ -5590,6 +5648,9 @@ impl NativeMethodRegistry {
             // Index-parallel with `slots`; sized identically so the ~3,100 boot
             // pushes never reallocate.
             slot_invocations: Vec::with_capacity(BOOT_REGISTRATION_HINT),
+            // Same index-parallel discipline and the same sizing hint; see the
+            // field doc for what the bit means.
+            slot_invocations_incomplete: Vec::with_capacity(BOOT_REGISTRATION_HINT),
             slot_by_key: FxHashMap::with_capacity_and_hasher(
                 BOOT_REGISTRATION_HINT,
                 Default::default(),
@@ -5993,6 +6054,18 @@ impl NativeMethodRegistry {
                     registered_by: prov.map(|p| format!("{}:{}", p.site.file(), p.site.line())),
                     overwrote: prov.and_then(|p| p.overwrote),
                     invocations,
+                    // Read through the same `owner_slot` reverse index as the
+                    // count itself, so the flag always describes the slot the
+                    // number came from. A superseded row reports `0`
+                    // invocations and therefore `true`: a floor of zero on a
+                    // row that can never be dispatched is exact, and claiming
+                    // it might be higher would invent a doubt.
+                    invocations_complete: owning_slot
+                        .and_then(|slot_idx| {
+                            self.slot_invocations_incomplete.get(slot_idx as usize)
+                        })
+                        .map(|f| !f.load(std::sync::atomic::Ordering::Relaxed))
+                        .unwrap_or(true),
                     // Same index-parallel discipline (and same conservative
                     // fallback direction) as `kind` above: a hypothetical
                     // desync reports "inherited", never a false "adjudicated".
@@ -7197,6 +7270,14 @@ impl NativeMethodRegistry {
                 // `registrations`/`classes_with_natives` pair documents above.
                 self.slot_invocations
                     .push(std::sync::atomic::AtomicU64::new(0));
+                // Index-parallel with `slots` for the same reason and by the
+                // same rule: this is the only arm that grows the slot table,
+                // so it is the only arm that may grow either sidecar. A slot
+                // starts out claiming a complete count; only a bypassing
+                // dispatch path clears that claim, via
+                // `mark_invocations_incomplete`.
+                self.slot_invocations_incomplete
+                    .push(std::sync::atomic::AtomicBool::new(false));
                 self.slot_by_key.insert(key, idx);
             }
         }
@@ -7483,13 +7564,59 @@ impl NativeMethodRegistry {
             .collect()
     }
 
-    /// Count one dispatch of `id`. Called by every dispatch path immediately
-    /// before invoking it (`docs/feature-designs/jdk-only-mode.md` §4).
+    /// Count one dispatch of `id`. Called by every dispatch path **that still
+    /// resolves this triple by name or id** immediately before invoking it
+    /// (`docs/feature-designs/jdk-only-mode.md` §4).
+    ///
+    /// # What this counter does NOT see — read before believing a number
+    ///
+    /// The counter is attached to the *resolution*, not to the call. Every
+    /// optimisation this VM has added to the native path since consists of
+    /// removing the resolution from the hot path, and each one took the
+    /// counter with it. Two families were isolated and causally confirmed on
+    /// 2026-08-17 against the release binary built from `783685c34`
+    /// (`docs/known-issues/jdk-only/G33-1-the-instrument-that-under-reported-20260817.md`):
+    ///
+    /// * **The interpreter's intrinsic table.** Once an invoke cache installs
+    ///   a `CachedInvokeTarget::Intrinsic`, the site holds a raw `fn` pointer
+    ///   and this registry is never consulted again. MEASURED: 100,000
+    ///   `Math.abs` calls report **1**, and the identical run under
+    ///   `CRATONVM_DISABLE_INTRINSICS=1` reports **100,000**. Arm-independent
+    ///   — it is just as blind under `--nojit`.
+    /// * **The JIT's thin direct-call helpers** (`jit_hashmap_put_direct` and
+    ///   its siblings). The compiler emits a direct `CALL` to a VM function
+    ///   that open-codes the native's semantics with no `NativeMethodId` in
+    ///   scope. MEASURED: 100,000 `HashMap.get` calls report **1,873** in the
+    ///   JIT arm and **100,001** under `--nojit`, and the JIT figure does not
+    ///   move with the workload size or with `CRATONVM_JIT_THRESHOLD` — it is
+    ///   frozen at the count reached before the enclosing loop was compiled.
+    ///
+    /// So `invocations` is a **lower bound on Java-level calls**, and an exact
+    /// count of *registry-resolved dispatches*. A zero is not evidence a body
+    /// is dead; a small number is not evidence a body is cold. There is one
+    /// configuration in which it is exact for everything measured —
+    /// `--nojit` with `CRATONVM_DISABLE_INTRINSICS=1` — and that is the
+    /// configuration to take a census in.
+    ///
+    /// A path that knowingly bypasses this counter must say so once, cold, via
+    /// [`mark_invocations_incomplete`](Self::mark_invocations_incomplete), so
+    /// the census can label the row instead of the reader having to know this
+    /// doc comment exists.
     ///
     /// # Cost
     ///
     /// One bounds-checked index into `slot_invocations` and one **relaxed**
-    /// `fetch_add`. No allocation, no lock, no hashing, no string comparison —
+    /// `fetch_add`. MEASURED (`rustc -O`, 12 interleaved rounds, medians, a
+    /// 12,011-entry counter vector matching this branch's registration count):
+    /// **+9.2 ns/call** against a 1.25 ns bounds-checked-index baseline on a
+    /// single hot slot, **+8.4 ns/call** spread over 64 slots. Against the
+    /// ~141 ns Rust native-call boundary (`G20-1` §5) that is ~6% and
+    /// affordable, which is why it sits here. Against a thin direct-call
+    /// helper, whose entire reason to exist is to be cheaper than that
+    /// boundary, it is not — which is why those helpers are expected to set
+    /// the incomplete bit rather than pay this.
+    ///
+    /// No allocation, no lock, no hashing, no string comparison —
     /// the caller already holds the `NativeMethodId`, so there is nothing left
     /// to resolve. `&self`, because every dispatch path holds only `&` on the
     /// registry; that is why the counter is an atomic and not a `u64`.
@@ -7512,6 +7639,12 @@ impl NativeMethodRegistry {
 
     /// Dispatches recorded against `id` this run, or `None` if the handle does
     /// not belong to this registry. O(1).
+    ///
+    /// A **lower bound** on Java-level calls whenever
+    /// [`invocations_complete`](Self::invocations_complete) answers
+    /// `Some(false)` — see [`record_invocation`](Self::record_invocation) for
+    /// the two measured bypass families and for the one configuration in which
+    /// this number is exact.
     #[inline]
     pub fn invocations_of_id(&self, id: NativeMethodId) -> Option<u64> {
         self.slot_invocations
@@ -7519,9 +7652,98 @@ impl NativeMethodRegistry {
             .map(|c| c.load(std::sync::atomic::Ordering::Relaxed))
     }
 
+    /// Declare that this slot is dispatched through a path that does **not**
+    /// call [`record_invocation`](Self::record_invocation), so its count is a
+    /// floor rather than a total.
+    ///
+    /// Call it **once, cold, at bind time** — where a call site is wired to a
+    /// pre-resolved callback — not per dispatch. The whole point of the bit is
+    /// that the bypassing paths cannot afford a per-call atomic; paying one to
+    /// announce that you are not paying one would be absurd.
+    ///
+    /// # The sites that owe this call
+    ///
+    /// Measured 2026-08-17 and recorded in
+    /// `docs/known-issues/jdk-only/G33-1-the-instrument-that-under-reported-20260817.md`.
+    /// None of them calls this yet — this method is the landing point the
+    /// nominations in that record are written against, and it is deliberately
+    /// on the registry rather than in each caller so there is one contract:
+    ///
+    /// * `vm/src/runtime/interpreter/dispatch_static.rs`, where
+    ///   `populate_invoke_cache` installs `CachedInvokeTarget::Intrinsic`, and
+    ///   the matching site in `dispatch_virtual.rs`.
+    /// * `vm/src/jit/helpers.rs`, where `jit::try_compile` binds a call site to
+    ///   `jit_hashmap_put_direct` / `jit_hashmap_get_direct` /
+    ///   `jit_concurrent_hashmap_get_direct` /
+    ///   `jit_string_latin1_to_lower_direct`.
+    /// * `vm/src/vm/vm_exec.rs`'s `invoke_or_native` arms, which resolve with
+    ///   `find_with_kind` and hold no id — that one needs a `resolve_id` first
+    ///   and is the least attractive of the three.
+    ///
+    /// # Sticky by design
+    ///
+    /// Never cleared, including by re-registration of the triple. A
+    /// re-registration updates the slot in place, but a call site already bound
+    /// to the *previous* callback keeps calling it, so the count keeps being
+    /// short. Clearing the bit would make a stale claim of completeness — the
+    /// one direction this instrument must not err in.
+    ///
+    /// An out-of-range `id` is ignored, exactly as in `record_invocation`.
+    #[inline]
+    pub fn mark_invocations_incomplete(&self, id: NativeMethodId) {
+        if let Some(flag) = self.slot_invocations_incomplete.get(id.index()) {
+            flag.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// Whether [`invocations_of_id`](Self::invocations_of_id) for this slot is
+    /// a total (`Some(true)`) or a floor (`Some(false)`); `None` if the handle
+    /// does not belong to this registry. O(1).
+    ///
+    /// `Some(true)` means only that no dispatch path has *declared* itself a
+    /// bypass. It is a claim carried by the code, not a proof — read
+    /// [`record_invocation`](Self::record_invocation)'s bypass list before
+    /// treating it as one.
+    #[inline]
+    pub fn invocations_complete(&self, id: NativeMethodId) -> Option<bool> {
+        self.slot_invocations_incomplete
+            .get(id.index())
+            .map(|f| !f.load(std::sync::atomic::Ordering::Relaxed))
+    }
+
+    /// How many slots have been declared incomplete
+    /// ([`mark_invocations_incomplete`](Self::mark_invocations_incomplete)).
+    ///
+    /// One number a dump header can print so a reader is told the column is a
+    /// floor *before* reading the column, rather than after quoting it. Cold:
+    /// one relaxed load per slot, run once at report time, the same shape and
+    /// the same justification as
+    /// [`invocations_of_kind`](Self::invocations_of_kind).
+    pub fn slots_with_incomplete_invocations(&self) -> usize {
+        self.slot_invocations_incomplete
+            .iter()
+            .filter(|f| f.load(std::sync::atomic::Ordering::Relaxed))
+            .count()
+    }
+
     /// Total dispatches recorded for slots currently classified `kind`
     /// (`docs/feature-designs/jdk-only-mode.md` §4). The CI gate reads this with
     /// `NativeKind::SyntheticStub` and asserts zero.
+    ///
+    /// # What a zero from this gate does and does not prove
+    ///
+    /// It is a sum of [`record_invocation`](Self::record_invocation) counters,
+    /// so it inherits that method's blind spots exactly: a synthetic stub
+    /// dispatched only through the interpreter's intrinsic table or a JIT thin
+    /// direct-call helper contributes **nothing** here. The assertion is
+    /// therefore sound in one direction only — non-zero is proof a stub ran,
+    /// zero is not proof none did. Neither bypass family currently serves a
+    /// `SyntheticStub` (both tables are `java.base` intrinsics and collection
+    /// fast paths, all `Bridge` or `Intrinsic`), which is why the gate has not
+    /// been wrong yet; it is not why it is right. Pair it with
+    /// [`slots_with_incomplete_invocations`](Self::slots_with_incomplete_invocations)
+    /// once the bypassing sites declare themselves, and see
+    /// `docs/known-issues/jdk-only/G33-1-the-instrument-that-under-reported-20260817.md`.
     ///
     /// **Derived, not maintained.** Three per-kind global counters would make
     /// this O(1), but at the price of a SECOND contended atomic RMW on every
@@ -9373,6 +9595,100 @@ mod tests {
         registry.record_invocation(foreign);
         assert!(registry.invocations_of_id(foreign).is_none());
         assert_eq!(registry.invocations_of_kind(NativeKind::Bridge), 3);
+    }
+
+    #[test]
+    fn invocations_are_complete_until_a_bypassing_path_says_otherwise() {
+        let mut registry = NativeMethodRegistry::new();
+        registry.with_category(NativeKind::Bridge, |r| {
+            r.register("c/C", "counted", "()I", dummy_native);
+            r.register("c/C", "bypassed", "()I", dummy_native_2);
+        });
+        let counted = registry
+            .resolve_id("c/C", "counted", "()I")
+            .expect("registered");
+        let bypassed = registry
+            .resolve_id("c/C", "bypassed", "()I")
+            .expect("registered");
+
+        // The default is the claim "nothing bypasses this slot", so a fresh
+        // registry reports every slot complete and none incomplete. A default
+        // of `false` would be honest about the codebase but would make the
+        // column useless — every row would carry the same doubt.
+        assert_eq!(registry.invocations_complete(counted), Some(true));
+        assert_eq!(registry.invocations_complete(bypassed), Some(true));
+        assert_eq!(registry.slots_with_incomplete_invocations(), 0);
+
+        registry.record_invocation(bypassed);
+        registry.mark_invocations_incomplete(bypassed);
+
+        // The count is still readable and still exact as a FLOOR — marking a
+        // slot incomplete must not zero or otherwise disturb the tally, which
+        // is the number a reader falls back on.
+        assert_eq!(registry.invocations_of_id(bypassed), Some(1));
+        assert_eq!(registry.invocations_complete(bypassed), Some(false));
+        assert_eq!(
+            registry.invocations_complete(counted),
+            Some(true),
+            "the flag is per slot, not global"
+        );
+        assert_eq!(registry.slots_with_incomplete_invocations(), 1);
+
+        // Idempotent: a bind site that runs twice (recompilation, a second
+        // call site on the same triple) must not be able to change the answer.
+        registry.mark_invocations_incomplete(bypassed);
+        assert_eq!(registry.slots_with_incomplete_invocations(), 1);
+
+        // Same foreign-handle contract as `record_invocation`: silently
+        // ignored, never a panic, and never a fabricated `Some`.
+        let foreign = NativeMethodId::from_u32(9_999);
+        registry.mark_invocations_incomplete(foreign);
+        assert_eq!(registry.invocations_complete(foreign), None);
+        assert_eq!(registry.slots_with_incomplete_invocations(), 1);
+    }
+
+    #[test]
+    fn the_incomplete_flag_survives_re_registration_and_reaches_the_census() {
+        let mut registry = NativeMethodRegistry::new();
+        registry.with_category(NativeKind::SyntheticStub, |r| {
+            r.register("s/S", "m", "()I", dummy_native);
+        });
+        let id = registry.resolve_id("s/S", "m", "()I").expect("registered");
+        registry.record_invocation(id);
+        registry.mark_invocations_incomplete(id);
+
+        // Re-registering the triple updates the slot in place. A call site
+        // already bound to the previous callback keeps calling it, so the
+        // count keeps being short: clearing the flag here would manufacture a
+        // claim of completeness, the one direction this instrument must not
+        // err in.
+        registry.with_category(NativeKind::Bridge, |r| {
+            r.register("s/S", "m", "()I", dummy_native_2);
+        });
+        assert_eq!(
+            registry.invocations_complete(id),
+            Some(false),
+            "re-registration must not clear the bypass claim"
+        );
+
+        let census = registry.census();
+        assert_eq!(census.len(), 2, "one row per registration");
+        // The superseded row owns no slot, so its zero is exact and it must
+        // NOT inherit the doubt: a floor of zero on a row that can never be
+        // dispatched is a total.
+        assert!(!census[0].owns_slot);
+        assert_eq!(census[0].invocations, 0);
+        assert!(
+            census[0].invocations_complete,
+            "a row that owns no slot reports an exact zero"
+        );
+        // The surviving row carries both the count and the doubt.
+        assert!(census[1].owns_slot);
+        assert_eq!(census[1].invocations, 1);
+        assert!(
+            !census[1].invocations_complete,
+            "the slot owner must carry the bypass claim into the census"
+        );
     }
 
     #[test]

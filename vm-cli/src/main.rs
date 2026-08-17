@@ -512,7 +512,27 @@ struct Args {
     /// block, unchanged, so the stub ratchet still reads it); `invocations` is
     /// the separate per-kind dispatch total. Use this to verify the default
     /// build is synthetic-stub-free, and (via `invocations`) that no synthetic
-    /// stub was dispatched. Absolute registration-site paths are redacted, and
+    /// stub was dispatched.
+    ///
+    /// **`invocations` is a LOWER BOUND on calls, not a call count.** It counts
+    /// dispatches that resolved the triple by name or id, and misses every
+    /// dispatch served from a pre-resolved function pointer — the interpreter's
+    /// intrinsic table and the JIT's thin direct-call helpers. MEASURED
+    /// 2026-08-17: 100,000 `Math.abs` calls report 1, and the identical run
+    /// under `CRATONVM_DISABLE_INTRINSICS=1` reports 100,000; 100,000
+    /// `HashMap.get` calls report 1,873 with the JIT on and 100,001 under
+    /// `--nojit`. A zero therefore does NOT mean a body is dead. **For a census
+    /// whose `invocations` column is exact, run with `--nojit` and
+    /// `CRATONVM_DISABLE_INTRINSICS=1`.** `owns_slot` is unaffected and remains
+    /// the authoritative answer to "which body would run". Full method,
+    /// controls and causal test:
+    /// docs/known-issues/jdk-only/G33-1-the-instrument-that-under-reported-20260817.md.
+    ///
+    /// This flag, like every launcher option, is recognised only BEFORE the
+    /// main class; placed after it, it is a program argument. The launcher now
+    /// warns when that happens.
+    ///
+    /// Absolute registration-site paths are redacted, and
     /// `image_declaring_method` — the per-registration adjudication against the
     /// bytes on the class path, which is what tells a real `ACC_NATIVE` bridge
     /// from a registration nobody adjudicated — is `null`, unless
@@ -1312,6 +1332,139 @@ fn insert_program_args_separator(args: Vec<String>) -> Vec<String> {
         return out;
     }
     out
+}
+
+/// Launcher options that are **silently discarded** when they appear after the
+/// main class, and whose silence is indistinguishable from success.
+///
+/// # Why this list exists and why it is not "every option"
+///
+/// `java` positional semantics are that everything after the program selector
+/// belongs to the program, and [`insert_program_args_separator`] implements
+/// exactly that. For most options a misplacement announces itself: `-cp` in the
+/// tail produces a `ClassNotFoundException`, `-Xmx` in the tail produces an
+/// `ArrayIndexOutOfBoundsException` from a program that did not expect an extra
+/// argument. The options below are the ones where nothing at all happens —
+/// exit 0, no file, no diagnostic — because their entire effect is to write a
+/// diagnostic artefact or to turn a subsystem off.
+///
+/// That silence has cost real time in this campaign. `JDK-ONLY-REPORT-CENSUS-20260812`
+/// closes with "**Flag order matters and is silent when wrong**" as its last
+/// line, and `G33-1` was commissioned partly because it happened again. A
+/// measurement lane that gets an empty result cannot tell "the VM says nothing
+/// happened" from "the VM never heard me".
+///
+/// This is a **warning**, never an error, and the argv is never rewritten. A
+/// Java program is entitled to an argument spelled `--jdk-only-report`, and
+/// silently hoisting it out of the program's own argv would be a far worse bug
+/// than the one being reported. Suppress with
+/// `CRATONVM_NO_MISPLACED_FLAG_WARNING=1` for a program that really does take
+/// one of these names.
+const SILENTLY_IGNORED_IF_MISPLACED: &[&str] = &[
+    // The census/diagnostic dump family (`docs/feature-designs/jdk-only-mode.md`
+    // §9). Every one of these takes a path and its only observable effect is
+    // the file, so a discarded flag looks exactly like a clean run.
+    "--dump-native-registry",
+    "--jdk-only-report",
+    "--dump-class-origins",
+    "--dump-missing-natives",
+    "--dump-missing-natives-grouped",
+    "--dump-phase-report",
+    // The JDK-only mode switches. A discarded `--jdk-only` runs the whole
+    // measurement in Compatible mode, which is the failure that produces a
+    // *confidently wrong* result rather than an empty one.
+    "--jdk-only",
+    "--explain-jdk-only",
+    "--trace-jdk-only",
+    "--XX:AuditMissingNatives",
+    // `--nojit` is on this list for the same reason as `--jdk-only`: a
+    // discarded one silently measures the JIT arm and reports it as the
+    // interpreter arm. `G20-1` §3 is an entire table of paired JIT/`--nojit`
+    // arms; a silent miss there is not recoverable from the output.
+    "--nojit",
+    // Sampling/diagnostic switches whose absence is a quieter run, not an
+    // error.
+    "--stack-dump-on-timeout",
+    "--stack-sample-ms",
+];
+
+/// Environment switch that silences [`misplaced_launcher_flags`]'s warning, for
+/// a Java program that genuinely takes one of those names as its own argument.
+const MISPLACED_FLAG_WARNING_OFF: &str = "CRATONVM_NO_MISPLACED_FLAG_WARNING";
+
+/// Names from [`SILENTLY_IGNORED_IF_MISPLACED`] that appear in `argv` **after**
+/// the program-args separator, i.e. that the launcher will discard.
+///
+/// Pure and order-preserving so it can be tested without a process: takes the
+/// argv as [`insert_program_args_separator`] left it, returns the offending
+/// spellings in the order they appear, each at most once. Both the bare
+/// `--flag` and the inline `--flag=value` forms are recognised; the reported
+/// name is always the bare one, because that is what the user has to move.
+///
+/// Returns empty when there is no separator at all — `java --version` with no
+/// program has no tail, and every token is still a launcher option.
+fn misplaced_launcher_flags(argv: &[String]) -> Vec<&'static str> {
+    let Some(sep) = argv.iter().position(|a| a == "--") else {
+        return Vec::new();
+    };
+    let mut found: Vec<&'static str> = Vec::new();
+    for token in &argv[sep + 1..] {
+        // `--flag=value` and `--flag` both report as `--flag`: the fix is the
+        // same move either way, and naming the value back at the user only
+        // makes the line harder to scan.
+        let name = token.split('=').next().unwrap_or(token.as_str());
+        if let Some(flag) = SILENTLY_IGNORED_IF_MISPLACED
+            .iter()
+            .find(|f| **f == name)
+            .copied()
+        {
+            if !found.contains(&flag) {
+                found.push(flag);
+            }
+        }
+    }
+    found
+}
+
+/// Print the [`misplaced_launcher_flags`] warning, if any, to stderr.
+///
+/// Deliberately loud and deliberately specific: it names each flag, states the
+/// consequence in the tense that matters ("was passed to the Java program and
+/// the launcher ignored it"), and shows the fix. A warning that says only
+/// "check your argument order" leaves the reader doing the work this function
+/// already did.
+fn warn_about_misplaced_launcher_flags(argv: &[String]) {
+    if std::env::var_os(MISPLACED_FLAG_WARNING_OFF).is_some() {
+        return;
+    }
+    let misplaced = misplaced_launcher_flags(argv);
+    if misplaced.is_empty() {
+        return;
+    }
+    for flag in &misplaced {
+        eprintln!(
+            "[cratonvm] WARNING: `{flag}` appears AFTER the main class (or after `-jar <jar>`), \
+             so it was passed to the Java program as an argument and the launcher IGNORED it. \
+             This flag has no effect where it is."
+        );
+    }
+    eprintln!(
+        "[cratonvm] WARNING: move {} before the main class. \
+         Launcher options are recognised only ahead of the program selector, exactly as in \
+         `java`. If the program really does take {} as its own argument, set {}=1 to silence \
+         this.",
+        misplaced
+            .iter()
+            .map(|f| format!("`{f}`"))
+            .collect::<Vec<_>>()
+            .join(", "),
+        if misplaced.len() == 1 {
+            "that name"
+        } else {
+            "those names"
+        },
+        MISPLACED_FLAG_WARNING_OFF,
+    );
 }
 
 /// Rewrite common HotSpot launcher spellings so clap can parse them.
@@ -2546,6 +2699,81 @@ fn trace_jdk_only_violations(
 /// dies on the violation it was launched to find must still leave the census
 /// behind. Writes at most once per process (first caller wins — the failure
 /// path is the informative one).
+/// The absolute path a dump flag's operand actually names, for printing.
+///
+/// # Why every dump message goes through this
+///
+/// A dump flag's operand is trusted verbatim and resolved by the OS, and on
+/// Windows a POSIX-looking path is neither rejected nor mapped: `/tmp/reg.json`
+/// resolves against the current drive to `C:\tmp\reg.json`. The write then
+/// succeeds and the caller — typically a Git Bash shell, where `/tmp` means
+/// something else entirely — goes looking in the wrong place and reads the
+/// absence of the file as the flag having failed. Printing the resolved
+/// absolute path turns that into a one-glance answer, on the success line as
+/// well as the failure line, because the success case is the one that misleads.
+///
+/// Falls back to the operand as given if the path cannot be made absolute
+/// (empty operand, or a platform error): a diagnostic must never be the thing
+/// that fails.
+fn absolute_dump_path(path: &str) -> String {
+    std::path::absolute(path)
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| path.to_string())
+}
+
+/// Why a dump write failed, in the terms that let a caller fix it: the absolute
+/// path attempted, and whether the directory it would have gone in exists.
+///
+/// The OS error alone is not enough. `os error 3` — and its localised text,
+/// which on this host is not English — says "the system cannot find the path",
+/// which is true of a missing parent directory, a typo'd drive letter and a
+/// POSIX path alike. Naming the parent and saying whether it exists separates
+/// those three in one line.
+fn describe_dump_failure(path: &str, error: &impl std::fmt::Display) -> String {
+    let absolute = absolute_dump_path(path);
+    let parent = std::path::Path::new(&absolute)
+        .parent()
+        .map(|p| p.display().to_string());
+    match parent {
+        Some(dir) if !std::path::Path::new(&dir).is_dir() => format!(
+            "{error} (tried to write {absolute}; its directory {dir} does not exist — \
+             create it, or pass a path under an existing directory)"
+        ),
+        Some(dir) => format!("{error} (tried to write {absolute}; its directory {dir} exists)"),
+        None => format!("{error} (tried to write {absolute})"),
+    }
+}
+
+/// The standing caveat on the census's `invocations` column, printed with every
+/// successful `--dump-native-registry`.
+///
+/// MEASURED 2026-08-17 and recorded in
+/// `docs/known-issues/jdk-only/G33-1-the-instrument-that-under-reported-20260817.md`:
+/// the column counts dispatches that resolved the triple by name or id, and
+/// misses every dispatch served from a pre-resolved function pointer — the
+/// interpreter's intrinsic table and the JIT's thin direct-call helpers. 100,000
+/// `Math.abs` calls report 1; the same run under `CRATONVM_DISABLE_INTRINSICS=1`
+/// reports 100,000.
+///
+/// It is printed on the *success* line, next to the number, because that is
+/// where a reader is standing when they decide what the column means. A caveat
+/// that lives only in `--help` or only in a design doc is a caveat that gets
+/// quoted around; a dozen records in `docs/known-issues/jdk-only/` already quote
+/// this tool's output.
+fn census_invocations_caveat(nojit: bool, intrinsics_disabled: bool) -> &'static str {
+    if nojit && intrinsics_disabled {
+        // Both bypass families are off, so the column is a total for
+        // everything measured. Say so — a lane that went to the trouble of
+        // configuring an exact census should be told it got one.
+        "; `invocations` is an exact count in this configuration \
+         (--nojit + CRATONVM_DISABLE_INTRINSICS=1)"
+    } else {
+        "; `invocations` is a LOWER BOUND, not a call count — intrinsic-table and \
+         JIT direct-call dispatches are not counted. For an exact census re-run with \
+         --nojit and CRATONVM_DISABLE_INTRINSICS=1 (see G33-1)"
+    }
+}
+
 fn write_jdk_only_dumps(args: &Args, shared: &cratonvm_vm::SharedVm) {
     if args.dump_class_origins.is_none()
         && args.dump_native_registry.is_none()
@@ -2572,26 +2800,44 @@ fn write_jdk_only_dumps(args: &Args, shared: &cratonvm_vm::SharedVm) {
     // the census and the violation list so the two describe the same instant.
     if let Some(path) = &args.dump_class_origins {
         match shared.dump_class_origins_json(path, verbose) {
-            Ok(n) => eprintln!("[cratonvm] wrote {n} class-origin rows to {path}"),
-            Err(e) => {
-                eprintln!("[cratonvm] warning: could not write class-origin census to {path}: {e}")
-            }
+            Ok(n) => eprintln!(
+                "[cratonvm] wrote {n} class-origin rows to {}",
+                absolute_dump_path(path)
+            ),
+            Err(e) => eprintln!(
+                "[cratonvm] warning: could not write class-origin census: {}",
+                describe_dump_failure(path, &e)
+            ),
         }
     }
 
     if let Some(path) = &args.dump_native_registry {
         match shared.dump_native_census_json(path, verbose) {
+            // `schema 4`, matching the `"schema_version": 4` the writer in
+            // `cratonvm_vm::vm::vm_init` actually emits and the number
+            // `--help` documents. This line said `schema 3` until 2026-08-17,
+            // which is a bad way for the instrument whose job is to be
+            // believed to introduce itself. If the writer's version moves
+            // again, this literal is the second place to change.
             Ok((intrinsic, bridge, stub)) => eprintln!(
-                "[cratonvm] wrote native registry census (schema 3{}) to {path} \
-                 (intrinsic={intrinsic}, bridge={bridge}, synthetic-stub={stub})",
+                "[cratonvm] wrote native registry census (schema 4{}) to {} \
+                 (intrinsic={intrinsic}, bridge={bridge}, synthetic-stub={stub}){}",
                 if verbose {
                     ", image-adjudicated"
                 } else {
                     ", no image adjudication — pass --explain-jdk-only"
-                }
+                },
+                absolute_dump_path(path),
+                census_invocations_caveat(
+                    cratonvm_types::flags::runtime_var("CRATONVM_DISABLE_JIT")
+                        .is_ok_and(|v| !v.is_empty() && v != "0"),
+                    cratonvm_types::flags::runtime_var("CRATONVM_DISABLE_INTRINSICS")
+                        .is_ok_and(|v| !v.is_empty() && v != "0"),
+                ),
             ),
             Err(e) => eprintln!(
-                "[cratonvm] warning: could not write native registry JSON to {path}: {e}"
+                "[cratonvm] warning: could not write native registry JSON: {}",
+                describe_dump_failure(path, &e)
             ),
         }
     }
@@ -2605,14 +2851,16 @@ fn write_jdk_only_dumps(args: &Args, shared: &cratonvm_vm::SharedVm) {
             // units (distinct methods versus events) and adding them would
             // produce a number that means nothing.
             Ok((violations, compatibility_classes)) => eprintln!(
-                "[cratonvm] wrote {} JDK-only report to {path} ({violations} violation(s), \
+                "[cratonvm] wrote {} JDK-only report to {} ({violations} violation(s), \
                  {compatibility_classes} compatibility class(es), {} refusal event(s))",
                 mode.as_str(),
+                absolute_dump_path(path),
                 shared.jdk_only_refusal_counts().total(),
             ),
-            Err(e) => {
-                eprintln!("[cratonvm] warning: could not write JDK-only report to {path}: {e}")
-            }
+            Err(e) => eprintln!(
+                "[cratonvm] warning: could not write JDK-only report: {}",
+                describe_dump_failure(path, &e)
+            ),
         }
     }
 }
@@ -5531,6 +5779,14 @@ fn main() {
     // ordering boundary.
     let early_argv =
         insert_program_args_separator(expand_argfiles(std::env::args().collect::<Vec<_>>()));
+    // A launcher flag parked in the program-args tail is discarded in silence
+    // — exit 0, no file, no diagnostic. Say so before anything else runs, so
+    // the warning is the first thing on stderr rather than the last, and so it
+    // is emitted even on the paths that exit before `run()` ever parses argv.
+    // This is the ONLY consumer of `early_argv` that does not also change
+    // behaviour: nothing is rewritten, `java` positional semantics are intact,
+    // and the misplaced token still reaches the Java program verbatim.
+    warn_about_misplaced_launcher_flags(&early_argv);
     let mut flag_overrides = cratonvm_types::MapSource::empty();
     if launcher_nojit_requested(&early_argv) {
         flag_overrides = flag_overrides.with("CRATONVM_DISABLE_JIT", "1");
@@ -6587,6 +6843,206 @@ mod tests {
             out,
             argv(&["java", "-cp", "bench", "Main", "--", "--help", "0"])
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // misplaced_launcher_flags — the silent-ignore family (G33-1 defect 2).
+    // The detector is pure and reads the argv `insert_program_args_separator`
+    // produced, so these compose the two functions exactly as `main()` does.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn misplaced_dump_flag_after_main_class_is_detected() {
+        // The exact shape that cost this campaign time twice: the census flag
+        // parked behind the main class. The launcher discards it, the VM exits
+        // 0 and writes nothing, and before this warning nothing said so.
+        let out = insert_program_args_separator(argv(&[
+            "cratonvm",
+            "-cp",
+            "build",
+            "RJdkHello",
+            "--dump-native-registry",
+            "reg.json",
+        ]));
+        assert_eq!(
+            misplaced_launcher_flags(&out),
+            vec!["--dump-native-registry"]
+        );
+    }
+
+    #[test]
+    fn correctly_placed_flags_are_not_reported() {
+        // The whole family, all ahead of the selector. A detector that fires
+        // here would train every reader to ignore it, which is worse than not
+        // having one.
+        let out = insert_program_args_separator(argv(&[
+            "cratonvm",
+            "--jdk-only",
+            "--nojit",
+            "--dump-native-registry",
+            "reg.json",
+            "--jdk-only-report",
+            "r.json",
+            "-cp",
+            "build",
+            "Main",
+            "5",
+        ]));
+        assert!(misplaced_launcher_flags(&out).is_empty());
+    }
+
+    #[test]
+    fn misplaced_flags_are_reported_once_each_in_argv_order() {
+        let out = insert_program_args_separator(argv(&[
+            "cratonvm",
+            "-cp",
+            "build",
+            "Main",
+            "--nojit",
+            "--jdk-only",
+            "--nojit",
+            "--dump-native-registry=reg.json",
+        ]));
+        assert_eq!(
+            misplaced_launcher_flags(&out),
+            // Order is argv order, not list order, so the message reads in the
+            // order the user typed. Deduplicated, because a repeated flag is
+            // one mistake.
+            vec!["--nojit", "--jdk-only", "--dump-native-registry"],
+            "the inline `--flag=value` form must report as the bare flag"
+        );
+    }
+
+    #[test]
+    fn misplaced_detection_covers_the_jar_form_too() {
+        // `-jar app.jar` is the other program selector, and it is the form a
+        // build tool is most likely to append flags to.
+        let out = insert_program_args_separator(argv(&[
+            "cratonvm",
+            "-jar",
+            "app.jar",
+            "--jdk-only-report",
+            "r.json",
+        ]));
+        assert_eq!(misplaced_launcher_flags(&out), vec!["--jdk-only-report"]);
+    }
+
+    #[test]
+    fn a_program_argument_that_merely_resembles_a_flag_is_not_reported() {
+        // Only exact spellings from the list. A program arg that shares a
+        // prefix, or a value that happens to look like one, must not fire —
+        // the warning has to survive contact with real command lines.
+        let out = insert_program_args_separator(argv(&[
+            "cratonvm",
+            "-cp",
+            "build",
+            "Main",
+            "--dump-native-registry-v2",
+            "--jdk-only-reporter",
+            "--dump",
+            "-nojit",
+        ]));
+        assert!(misplaced_launcher_flags(&out).is_empty());
+    }
+
+    #[test]
+    fn no_program_selector_means_nothing_is_misplaced() {
+        // `cratonvm --jdk-only --version`: no separator is inserted at all, so
+        // every token is still a launcher option and none is discarded.
+        let out = insert_program_args_separator(argv(&["cratonvm", "--jdk-only", "--version"]));
+        assert!(misplaced_launcher_flags(&out).is_empty());
+    }
+
+    #[test]
+    fn an_explicit_separator_still_delimits_the_tail() {
+        // A caller who writes `--` themselves gets the same treatment: the
+        // tail is the program's, and a launcher flag in it is discarded.
+        let out = insert_program_args_separator(argv(&[
+            "cratonvm",
+            "-cp",
+            "build",
+            "--",
+            "Main",
+            "--trace-jdk-only",
+        ]));
+        assert_eq!(misplaced_launcher_flags(&out), vec!["--trace-jdk-only"]);
+    }
+
+    // -----------------------------------------------------------------------
+    // Dump-path diagnostics — the other half of G33-1 defect 2: a path the
+    // caller cannot find is as bad as no file at all.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn absolute_dump_path_resolves_a_relative_operand() {
+        let resolved = absolute_dump_path("reg.json");
+        let path = std::path::Path::new(&resolved);
+        assert!(
+            path.is_absolute(),
+            "a relative operand must be reported as the absolute path actually written: {resolved}"
+        );
+        assert!(resolved.ends_with("reg.json"));
+    }
+
+    #[test]
+    fn absolute_dump_path_never_fails_on_a_degenerate_operand() {
+        // A diagnostic that can itself fail is not a diagnostic. The empty
+        // operand is the one input `std::path::absolute` rejects.
+        assert_eq!(absolute_dump_path(""), "");
+    }
+
+    #[test]
+    fn dump_failure_names_the_path_and_the_missing_directory() {
+        let err = std::io::Error::from(std::io::ErrorKind::NotFound);
+        let message = describe_dump_failure(
+            "no-such-dir-4b7f1e/deeper/reg.json",
+            &format!("{err} (os error 3)"),
+        );
+        assert!(
+            message.contains("no-such-dir-4b7f1e"),
+            "the attempted path must appear: {message}"
+        );
+        assert!(
+            message.contains("does not exist"),
+            "a missing parent directory is the common cause and must be named: {message}"
+        );
+        assert!(
+            message.contains("os error 3"),
+            "the underlying OS error must survive: {message}"
+        );
+    }
+
+    #[test]
+    fn dump_failure_says_so_when_the_directory_does_exist() {
+        // Distinguishing "no such directory" from "the directory is there and
+        // the write still failed" is the whole point — the second is a
+        // permissions or locking problem and sends the reader somewhere else.
+        let dir = std::env::temp_dir();
+        let path = dir.join("g33-1-existing-dir-probe.json");
+        let err = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+        let message = describe_dump_failure(&path.display().to_string(), &err);
+        assert!(
+            message.contains("exists"),
+            "an existing parent must be reported as existing: {message}"
+        );
+        assert!(!message.contains("does not exist"), "{message}");
+    }
+
+    #[test]
+    fn the_census_caveat_is_only_dropped_when_both_bypasses_are_off() {
+        // Three of the four configurations leave at least one bypass family
+        // live, and in all three the column is a floor. Only the fourth may
+        // claim an exact count.
+        for (nojit, no_intrinsics) in [(false, false), (true, false), (false, true)] {
+            let text = census_invocations_caveat(nojit, no_intrinsics);
+            assert!(
+                text.contains("LOWER BOUND"),
+                "nojit={nojit} intrinsics-off={no_intrinsics} must warn: {text}"
+            );
+        }
+        let exact = census_invocations_caveat(true, true);
+        assert!(exact.contains("exact count"), "{exact}");
+        assert!(!exact.contains("LOWER BOUND"), "{exact}");
     }
 
     #[test]
