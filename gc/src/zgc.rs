@@ -4122,11 +4122,12 @@ impl ZgcRealHeap {
             // `ZMarkContext::is_in_heap` applies to every child pointer.
             return;
         }
-        // Bucket by address so concurrent mutators spread across the ingress
-        // rather than contending on one mutex. `ZMarkIngress::push` masks this
-        // into its bucket count, so any well-distributed key works; the
-        // address shifted past the object-alignment zeros is the cheapest one
-        // available here.
+        // Bucket by THREAD, not by address -- see `satb_ingress_slot`. Any
+        // well-distributed key is correct here (`drain_into` empties every
+        // bucket, so the choice is pure performance), and a per-thread key is the
+        // one that actually separates mutators: an address key collides whenever
+        // two threads store into the same region, and makes each thread cycle
+        // through all 16 locks instead of reusing one.
         // THE HANDOFF COUNT COMES OUT OF THE BUCKET'S OWN LOCK.
         //
         // This was `self.mark_ingress_pushes.fetch_add(1, Relaxed)` -- a
@@ -4143,7 +4144,7 @@ impl ZgcRealHeap {
         // spread over them, handoffs are correspondingly rarer per bucket and
         // about as frequent overall. `Z_SATB_HANDOFF_INTERVAL` is divided by the
         // bucket count for that reason; see its own note.
-        let n = self.mark_ingress.push(old_addr >> 3, old_addr as u64);
+        let n = self.mark_ingress.push(satb_ingress_slot(), old_addr as u64);
         if n % Z_SATB_HANDOFF_PER_BUCKET == 0 {
             self.hand_satb_batch_to_the_marker();
         }
@@ -8617,6 +8618,42 @@ const Z_SATB_HANDOFF_PER_BUCKET: usize =
         1
     };
 
+/// A stable per-thread ingress slot, so SATB pushes distribute by THREAD.
+///
+/// # Why not by address, which is what this used
+///
+/// `ZMarkIngress` buckets its queues across [`mark::Z_MARK_INGRESS_BUCKETS`]
+/// mutexes so mutators publishing SATB work land on different locks. The key was
+/// `old_addr >> 3`, which distributes over the HEAP -- so two threads storing
+/// into the same region collide, and every thread visits all 16 buckets in turn
+/// and takes 16 cold locks instead of one warm one. Distributing by *thread*
+/// gives each mutator its own bucket, which is what "per-thread mark buffers"
+/// (C4) is actually asking for.
+///
+/// # Why this is a `usize` and not the buffer itself
+///
+/// C4's stated shape is a per-thread [`mark::ZMarkMutatorBuffer`], which removes
+/// the lock entirely. It also introduces a lifetime hazard this does not: a
+/// detached buffer dropped non-empty leaves objects **marked and unscanned**, and
+/// the mark bit is what dedups them, so nothing will ever scan them again — a
+/// use-after-free at thread exit. Getting that right needs the buffer's `Drop` to
+/// flush into a heap that may already be gone, i.e. a `Weak` upgrade and a
+/// registration protocol.
+///
+/// A thread-local holding one `usize` has no `Drop`, cannot outlive anything, and
+/// captures the distribution half of the benefit. The buffer remains open work.
+///
+/// Values are handed out by a process-wide counter and never reused, which is
+/// fine: only `slot & mask` is consulted, so the counter wrapping would merely
+/// re-collide and never be wrong.
+fn satb_ingress_slot() -> usize {
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+    thread_local! {
+        static SLOT: usize = NEXT.fetch_add(1, Ordering::Relaxed);
+    }
+    SLOT.with(|s| *s)
+}
+
 /// Words in the skip-set Bloom filter -- see
 /// [`ZgcRealHeap::mark_ref_skip_bloom`]. 512 words is 32768 bits and 4 KiB per
 /// heap; with 1000 `Reference` objects and two bits each the false-positive rate
@@ -10169,8 +10206,9 @@ impl barrier::ZBarrierContext for ZgcRealHeap {
             return;
         }
         // The count comes back from the bucket's own lock; there is no shared
-        // counter on this path either. See `satb_pre_barrier_slow`.
-        let _ = self.mark_ingress.push(absolute >> 3, absolute as u64);
+        // counter on this path either, and the key is per-thread for the same
+        // reason. See `satb_pre_barrier_slow` and `satb_ingress_slot`.
+        let _ = self.mark_ingress.push(satb_ingress_slot(), absolute as u64);
     }
 
     fn stats(&self) -> &barrier::ZBarrierStats {
@@ -14660,6 +14698,41 @@ pub(crate) mod tests {
         assert!(
             via_vec[..bitmap_len].windows(2).all(|w| w[0] < w[1]),
             "the bitmap portion must be strictly ascending"
+        );
+    }
+
+    /// **The SATB ingress slot must be STABLE within a thread and DIFFERENT
+    /// between threads.**
+    ///
+    /// Both halves, because each alone is the property being wrong. If it varied
+    /// within a thread, that thread would cycle through all 16 bucket locks
+    /// instead of reusing one warm one — worse than the address key it replaced.
+    /// If it were the same across threads, every mutator would contend on one
+    /// mutex and the bucketing would be decorative, which is exactly the inert
+    /// state this change exists to leave.
+    #[test]
+    fn the_satb_ingress_slot_is_per_thread_and_stable() {
+        let mine = satb_ingress_slot();
+        assert_eq!(mine, satb_ingress_slot(), "stable within a thread");
+        assert_eq!(mine, satb_ingress_slot(), "and on a third call");
+
+        let others: Vec<usize> = (0..4)
+            .map(|_| std::thread::spawn(satb_ingress_slot))
+            .map(|h| h.join().expect("slot thread"))
+            .collect();
+        for (i, o) in others.iter().enumerate() {
+            assert_ne!(
+                *o, mine,
+                "thread {i} must not share this thread's slot, or every mutator                  contends on one bucket mutex and the striping is decorative"
+            );
+        }
+        let mut sorted = others.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(
+            sorted.len(),
+            others.len(),
+            "and the threads must not share slots with each other: {others:?}"
         );
     }
 
