@@ -113,10 +113,12 @@
 //! what separated the two readings, and neither the census nor the corpus could
 //! do it alone:
 //!
-//!     cratonvm --jdk-only --java-home <JDK> --dump-class-origins cls.json \
-//!         -cp probes DeadSweepReachProbe
-//!     CRATONVM_ARGS=--jdk-only SUITE=all bash regression-suite/run.sh
-//!     # then re-run any red vector on a build WITHOUT this table
+//! ```text
+//! cratonvm --jdk-only --java-home <JDK> --dump-class-origins cls.json \
+//!     -cp probes DeadSweepReachProbe
+//! CRATONVM_ARGS=--jdk-only SUITE=all bash regression-suite/run.sh
+//! # then re-run any red vector on a build WITHOUT this table
+//! ```
 
 /// JDK-namespaced receiver classes declared by none of the six swept images.
 ///
