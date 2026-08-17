@@ -1407,6 +1407,81 @@ impl DenseIntEntries {
 }
 
 #[cfg(test)]
+mod chm_table_size_tests {
+    use super::chm_jdk_table_size_for;
+
+    /// Every one of these is a reading of `ConcurrentHashMap.table.length` on
+    /// HotSpot JDK 25, not a value derived from the constructor's source. The
+    /// source reads like `tableSizeFor(c + (c >>> 1) + 1)`, which would put
+    /// `CHM(11)` at 32; the real map holds 16.
+    #[test]
+    fn matches_the_measured_jdk_table_sizes() {
+        // (initial capacity or size, table length) — sized constructor sweep.
+        let measured = [
+            (1, 2),
+            (2, 4),
+            (3, 8),
+            (4, 8),
+            (5, 8),
+            (6, 16),
+            (11, 16),
+            (12, 32),
+            (23, 32),
+            (24, 64),
+            (47, 64),
+            (48, 128),
+            (95, 128),
+            (512, 1024),
+        ];
+        for (n, want) in measured {
+            assert_eq!(
+                chm_jdk_table_size_for(n),
+                want,
+                "table size for {n} entries"
+            );
+        }
+    }
+
+    /// A default map's growth points, read the same way: it doubles as the
+    /// size reaches 12, 24, 48, 96, 192.
+    #[test]
+    fn matches_the_measured_default_map_growth() {
+        for (size, want) in [
+            (1, 16),
+            (11, 16),
+            (12, 32),
+            (23, 32),
+            (24, 64),
+            (47, 64),
+            (48, 128),
+            (95, 128),
+            (96, 256),
+            (191, 256),
+            (192, 512),
+        ] {
+            assert_eq!(
+                chm_jdk_table_size_for(size).max(16),
+                want,
+                "default map holding {size} entries"
+            );
+        }
+    }
+
+    /// The threshold is STRICT: a table of size P holds up to `0.75P - 1`
+    /// entries, and the entry that reaches `0.75P` is what doubles it. An
+    /// off-by-one here shifts every key's bucket for a whole size band.
+    #[test]
+    fn the_load_threshold_is_strict() {
+        for bits in 4..20 {
+            let cap = 1usize << bits;
+            let threshold = cap - (cap >> 2);
+            assert_eq!(chm_jdk_table_size_for(threshold - 1), cap);
+            assert_eq!(chm_jdk_table_size_for(threshold), cap << 1);
+        }
+    }
+}
+
+#[cfg(test)]
 mod dense_int_entries_tests {
     use super::*;
     #[allow(unused_imports)]
@@ -48026,6 +48101,57 @@ fn chm_all_segments(ctx: &dyn NativeContext, this: ObjectRef) -> Vec<ObjectRef> 
 /// flat-table JDK `ConcurrentHashMap` would currently be sized to", so that
 /// `chm_virtual_bucket` can reorder entries to match HotSpot's single-table
 /// iteration order (see `chm_reorder_by_virtual_bucket`).
+/// The bucket-table size a real JDK `ConcurrentHashMap` holds for `n` entries.
+///
+/// **Measured, not derived.** `probes/ChmTableSizeProbe.java` reads
+/// `ConcurrentHashMap.table.length` by reflection for every initial capacity in
+/// `1..=80` and for a default map at every size up to 200 (JDK 25, Temurin).
+/// The function that fits all of it is: the smallest power of two `P` with
+/// `n < P - (P >>> 2)` — the first table whose 0.75 load threshold is strictly
+/// above `n`. Spot values, all confirmed: `CHM(2)` -> 4, `CHM(3)` -> 8,
+/// `CHM(11)` -> 16, `CHM(12)` -> 32, `CHM(47)` -> 64, `CHM(48)` -> 128; a
+/// default map grows 16 -> 32 -> 64 -> 128 at sizes 12, 24, 48.
+///
+/// Note this is NOT `tableSizeFor(c + (c >>> 1) + 1)`, which the constructor's
+/// source reads like and which predicts 32 for `CHM(11)`. The measurement says
+/// 16. Where the two disagree, the measurement wins.
+fn chm_jdk_table_size_for(n: usize) -> usize {
+    let mut cap = 1usize;
+    // 1 << 30 is `MAXIMUM_CAPACITY`; stop there rather than overflow.
+    while cap < (1usize << 30) && n >= cap - (cap >> 2) {
+        cap <<= 1;
+    }
+    cap
+}
+
+/// Record the table size a real JDK map would have allocated for this
+/// constructor, so iteration can reproduce its bucket order later.
+///
+/// `sizeCtl` is the JDK's OWN field for exactly this — `ConcurrentHashMap(int)`
+/// ends with `this.sizeCtl = cap`, the table size its first `put` will
+/// allocate. Writing it here is descriptor-correct (it is an `int` field on the
+/// real class, so no `Ljava/lang/Object;` coercion), it is a value real-JDK
+/// bytecode reading the field would find plausible, and nothing in this
+/// implementation reads it for any other purpose.
+///
+/// Why it has to be recorded at all: `chm_total_capacity` sums the LIVE segment
+/// bucket arrays, and those resize on PER-SEGMENT load while a real JDK table
+/// resizes on TOTAL load. The two agree at construction and drift apart from
+/// the first segment resize onward — which is precisely the bug this records
+/// against. See `chm_reorder_by_virtual_bucket`.
+fn chm_record_initial_table(ctx: &mut dyn NativeContext, this: ObjectRef, jdk_cap: usize) {
+    ctx.set_field_by_name(this, "sizeCtl", Value::Int(jdk_cap.min(1 << 30) as i32));
+}
+
+/// The recorded construction-time table size, or the default-constructor table
+/// size (16) when nothing was recorded.
+fn chm_initial_table(ctx: &dyn NativeContext, this: ObjectRef) -> usize {
+    match ctx.get_field_by_name(this, "sizeCtl") {
+        Value::Int(v) if v > 0 => (v as usize).next_power_of_two(),
+        _ => 16,
+    }
+}
+
 fn chm_total_capacity(ctx: &dyn NativeContext, this: ObjectRef) -> usize {
     let mut total = 0usize;
     for seg in chm_all_segments(ctx, this) {
@@ -48064,8 +48190,23 @@ fn chm_reorder_by_virtual_bucket<T>(
     this: ObjectRef,
     mut items: Vec<(i32, T)>,
 ) -> Vec<T> {
-    let total_cap = chm_total_capacity(ctx, this).next_power_of_two().max(1);
-    let mask = (total_cap - 1) as u32;
+    // The virtual table size is the one a REAL JDK map would hold for this many
+    // entries, never `chm_total_capacity`. Summing the live segment bucket
+    // arrays looks equivalent and is not: our segments resize on their OWN
+    // load, a real flat table resizes on TOTAL load, so the sum overshoots from
+    // the first segment resize onward and every key's bucket index shifts with
+    // it. Measured on the 8 constraint names of H2's `testScript.sql` SCRIPT
+    // case: the sum was 32 where the real table was 16, and cap 32 reproduces
+    // exactly the wrong order that test saw.
+    //
+    // A stable sort is load-bearing for the tie-break. Two keys in one virtual
+    // bucket share every low bit of the mask, so they also share OUR segment
+    // and (our per-segment table being no larger than the virtual one) our
+    // bucket — one chain, whose order is insertion order. `probes/ChainOrderProbe`
+    // confirms that against HotSpot using equal-hashCode keys, which no table
+    // size can separate.
+    let cap = chm_initial_table(ctx, this).max(chm_jdk_table_size_for(items.len()));
+    let mask = (cap - 1) as u32;
     items.sort_by_key(|(hash, _)| (*hash as u32) & mask);
     items.into_iter().map(|(_, v)| v).collect()
 }
@@ -48815,6 +48956,8 @@ fn native_chm_init_default(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         CHM_DEFAULT_INIT_SEGMENTS,
         CHM_DEFAULT_SEGMENT_CAP,
     );
+    // A real default map allocates its first table at DEFAULT_CAPACITY = 16.
+    chm_record_initial_table(ctx, this, 16);
     Ok(None)
 }
 
@@ -48849,6 +48992,11 @@ fn native_chm_init_capacity(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
         .max(1)
         .next_power_of_two();
     chm_init_segments(ctx, this, CHM_DEFAULT_SEGMENTS, cap_per_seg);
+    // The bucket order a caller observes has to follow the REAL table size for
+    // this initial capacity, which is `chm_jdk_table_size_for` (measured), not
+    // the segment total above — those two agree here but diverge as soon as any
+    // segment resizes.
+    chm_record_initial_table(ctx, this, chm_jdk_table_size_for(total_cap));
     Ok(None)
 }
 
@@ -48877,6 +49025,7 @@ fn native_chm_init_full(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     let adjusted_total = adjusted_total.max(total_cap); // guard against fp underflow
     let cap_per_seg = (adjusted_total / num_segments).max(1).next_power_of_two();
     chm_init_segments(ctx, this, num_segments, cap_per_seg);
+    chm_record_initial_table(ctx, this, chm_jdk_table_size_for(total_cap));
     Ok(None)
 }
 
@@ -48898,6 +49047,7 @@ fn native_chm_init_from_map(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
         source_base
     };
     chm_init_segments(ctx, this, CHM_DEFAULT_SEGMENTS, CHM_DEFAULT_SEGMENT_CAP);
+    chm_record_initial_table(ctx, this, 16);
     let this = ctx.read_native_pin(this_pin0, this);
     let source_refreshed = read_pinned_elem(ctx, source_base, source0);
     // Copy entries from the source map. Use `collect_entries_any` (NOT the
