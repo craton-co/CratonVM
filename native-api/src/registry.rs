@@ -4829,6 +4829,105 @@ pub fn dispatch_baos_event(
     }
 }
 
+/// Event emitted by the native `ByteArrayInputStream` implementation when a
+/// reader reaches the end of the buffer, or closes it.
+///
+/// The mirror image of [`BaosEvent`], and it exists for the mirror-image
+/// reason. A bridge API can hand Java a `ByteArrayInputStream`-shaped object
+/// whose *lifetime* matters to native state the bridge holds elsewhere — the
+/// `https:` response body is the motivating case: HotSpot returns the
+/// connection to its `KeepAliveCache` the moment the body is drained, after
+/// which every CONNECTION-level accessor throws `IllegalStateException:
+/// connection not yet open` again, while the `SSLSession` object the
+/// application already holds stays valid. CratonVM reads that body to
+/// completion inside `perform` and hands it over whole, so the drain is the
+/// only observable "the application is done with this exchange" instant, and
+/// it is observable *here* and nowhere else.
+///
+/// Keeping the observation at the API boundary is what avoids making
+/// `native-io` depend on a higher-level protocol crate, exactly as for
+/// [`BaosEvent`].
+///
+/// # This adds no registration
+///
+/// `ByteArrayInputStream.read()I`, `read([BII)I` and `close()V` are **already**
+/// registered natives owned by `native-io` (MEASURED — `--dump-native-registry`
+/// under `--jdk-only`, `9ae371468`: `owns_slot=true` on all three, at
+/// `native-io/src/lib.rs`). A hook inside an existing body registers nothing,
+/// so `regression-suite/bridge-ratchet.sh` and the baselines under `scripts/`
+/// do not move. Every design that instead added a `Bridge` over concrete
+/// bytecode — a dedicated response-stream class, a `SequenceInputStream`
+/// sentinel, a second `close()V` registration — would have needed a baseline
+/// refresh; see
+/// `docs/known-issues/jdk-only/G48-1-the-input-side-hook-and-a-gate-that-could-go-quiet-20260817.md`.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub enum BaisEvent {
+    /// A read returned `-1`: `pos >= count`, the buffer is exhausted.
+    ///
+    /// **Fires on EVERY exhausted read, not only on the transition**, because
+    /// the transition is not observable: a stream constructed empty is at
+    /// `pos >= count` from its first read, and the two states are
+    /// indistinguishable from inside the read body. Observers must therefore be
+    /// idempotent — which they must be anyway, since a drained stream that is
+    /// then closed produces `Eof` *and* [`BaisEvent::Close`].
+    Eof,
+    /// `close()` was called on the stream.
+    Close,
+}
+
+/// Observer for [`BaisEvent`].
+///
+/// # Why this returns `()` and [`BaosEventHook`] returns `bool`
+///
+/// **Deliberate, and not an oversight in the mirroring.** A `BaosEvent`
+/// observer legitimately *takes over* the write — the bytes go to a native sink
+/// instead of the in-heap buffer — so `Ok(true)` meaning "consumed, skip the
+/// ordinary path" is a real choice with a real second branch behind it.
+///
+/// There is no such choice on the input side. `ByteArrayInputStream.read()`
+/// **must** return `-1` at `pos >= count` and `close()` **must** be a no-op, on
+/// every path, whatever any observer thinks; those are JDK contracts a lifetime
+/// observer has no business editing. A `bool` here would be a return value that
+/// every caller is required to ignore — the kind of parameter that eventually
+/// gets honoured by someone who reads the type and not the doc, silently
+/// turning an EOF into a non-EOF. So the type says what is true: observe, do
+/// not decide.
+///
+/// `Err` is still available and still propagates, for a genuine internal
+/// failure the VM must not swallow. Observers should treat it as such and
+/// **must not** raise a Java exception from here to signal an ordinary
+/// condition: it would surface out of a `ByteArrayInputStream.read()` that
+/// HotSpot completes normally, which is a divergence bought in exchange for
+/// nothing.
+pub type BaisEventHook =
+    fn(&mut dyn NativeContext, ObjectRef, BaisEvent) -> Result<(), MethodCallFailed>;
+
+static BAIS_EVENT_HOOK: OnceLock<BaisEventHook> = OnceLock::new();
+
+/// Install the process-wide optional BAIS lifetime observer. Registration
+/// happens during native bootstrap; repeated registrations are harmless because
+/// the first (and only) bridge implementation wins — same contract as
+/// [`install_baos_event_hook`].
+pub fn install_bais_event_hook(hook: BaisEventHook) {
+    let _ = BAIS_EVENT_HOOK.set(hook);
+}
+
+/// Offer a BAIS lifetime event to the optional observer.
+///
+/// With no hook installed this is one relaxed `OnceLock` load and a return,
+/// which is strictly cheaper than what [`dispatch_baos_event`] already pays on
+/// every single byte written through `ByteArrayOutputStream.write(I)V`.
+pub fn dispatch_bais_event(
+    ctx: &mut dyn NativeContext,
+    stream: ObjectRef,
+    event: BaisEvent,
+) -> Result<(), MethodCallFailed> {
+    match BAIS_EVENT_HOOK.get() {
+        Some(hook) => hook(ctx, stream, event),
+        None => Ok(()),
+    }
+}
+
 /// Classification of a registered native method.
 ///
 /// The native overlay is three different things wearing one uniform; this tag
@@ -4859,6 +4958,86 @@ pub enum NativeKind {
     Intrinsic,
     Bridge,
     SyntheticStub,
+}
+
+/// Per-kind dispatch total, carrying the one fact that says whether it may be
+/// believed. Produced by
+/// [`NativeMethodRegistry::invocations_of_kind_checked`].
+///
+/// The pair exists because the total alone is unfalsifiable in the direction
+/// gates actually assert. `synthetic_stub_invocations == 0` is the L4 gate
+/// (`docs/feature-designs/jdk-only-mode.md` §4); it is read from a sum of
+/// [`NativeMethodRegistry::record_invocation`] counters, and any slot wired to a
+/// bypassing dispatch path contributes nothing to that sum however many times
+/// it runs. Four such slots are `SyntheticStub` today — the Panama
+/// `DowncallHandle` arms in `UNCOUNTED_STACKLESS_NATIVES`; see
+/// [`NativeMethodRegistry::invocations_of_kind`] for the measurement. Reading
+/// `total` without `incomplete_slots` cannot distinguish those two zeroes.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub struct KindInvocations {
+    /// The kind this was measured for.
+    pub kind: NativeKind,
+    /// Counted dispatches summed over every slot of this kind — a **floor** on
+    /// Java-level calls whenever `incomplete_slots > 0`.
+    pub total: u64,
+    /// Slots of this kind that have declared their count a floor
+    /// ([`NativeMethodRegistry::mark_invocations_incomplete`]).
+    pub incomplete_slots: usize,
+}
+
+impl KindInvocations {
+    /// `true` when `total == 0` **and** every slot of this kind is counted, so
+    /// the zero actually means "none ran".
+    ///
+    /// A zero `total` with `incomplete_slots > 0` is not a weaker result than
+    /// this — it is *no result*, and it is the state in which an `== 0`
+    /// assertion passes while proving nothing.
+    pub fn is_conclusive_zero(self) -> bool {
+        self.total == 0 && self.incomplete_slots == 0
+    }
+
+    /// Whether the instrument can currently see every slot of this kind, i.e.
+    /// whether `total` is a total rather than a floor.
+    ///
+    /// Distinguished from [`Self::is_conclusive_zero`] so a caller that wants
+    /// to *report* a non-zero total can still say whether it is the whole
+    /// number.
+    pub fn is_measurable(self) -> bool {
+        self.incomplete_slots == 0
+    }
+
+    /// The gate predicate: no dispatches of this kind were counted **and** none
+    /// could have escaped counting.
+    ///
+    /// Identical to [`Self::is_conclusive_zero`] and named for the call site,
+    /// because the two readings are worth keeping apart in a gate's source:
+    /// `is_conclusive_zero` is a statement about the measurement,
+    /// `is_clean` is the verdict drawn from it. A gate must not pass on
+    /// `total == 0` alone.
+    pub fn is_clean(self) -> bool {
+        self.is_conclusive_zero()
+    }
+
+    /// One line a failing gate can print that names *which* of the two failure
+    /// modes it hit — a gate that says only "assertion failed" sends the reader
+    /// to look for a stub that may not exist.
+    pub fn describe(self) -> String {
+        match (self.total, self.incomplete_slots) {
+            (0, 0) => format!("{}: 0 dispatches, all slots counted", self.kind.as_str()),
+            (0, n) => format!(
+                "{}: 0 counted dispatches, but {n} slot(s) of this kind are declared \
+                 incomplete — this zero proves nothing (see NativeMethodRegistry::\
+                 invocations_of_kind)",
+                self.kind.as_str()
+            ),
+            (t, 0) => format!("{}: {t} dispatches", self.kind.as_str()),
+            (t, n) => format!(
+                "{}: at least {t} dispatches ({n} slot(s) declared incomplete, so this \
+                 is a floor)",
+                self.kind.as_str()
+            ),
+        }
+    }
 }
 
 impl NativeKind {
@@ -7737,13 +7916,45 @@ impl NativeMethodRegistry {
     /// dispatched only through the interpreter's intrinsic table or a JIT thin
     /// direct-call helper contributes **nothing** here. The assertion is
     /// therefore sound in one direction only — non-zero is proof a stub ran,
-    /// zero is not proof none did. Neither bypass family currently serves a
-    /// `SyntheticStub` (both tables are `java.base` intrinsics and collection
-    /// fast paths, all `Bridge` or `Intrinsic`), which is why the gate has not
-    /// been wrong yet; it is not why it is right. Pair it with
-    /// [`slots_with_incomplete_invocations`](Self::slots_with_incomplete_invocations)
-    /// once the bypassing sites declare themselves, and see
-    /// `docs/known-issues/jdk-only/G33-1-the-instrument-that-under-reported-20260817.md`.
+    /// zero is not proof none did.
+    ///
+    /// **G33-1's reason the gate had not been wrong yet has EXPIRED.** That
+    /// record said "neither bypass family currently serves a `SyntheticStub`
+    /// (both tables are `java.base` intrinsics and collection fast paths, all
+    /// `Bridge` or `Intrinsic`)". A **third** family has landed since —
+    /// `vm/src/runtime/interpreter/invoke.rs`'s `UNCOUNTED_STACKLESS_NATIVES`,
+    /// the stackless-invoke path that returns `Handled` before the census
+    /// increment — and **four of its fourteen triples are registered
+    /// `SyntheticStub`**:
+    ///
+    /// ```text
+    /// java/lang/foreign/DowncallHandle  type        ()Ljava/lang/invoke/MethodType;
+    /// java/lang/foreign/DowncallHandle  invoke      ([Ljava/lang/Object;)Ljava/lang/Object;
+    /// java/lang/foreign/DowncallHandle  invokeExact ([Ljava/lang/Object;)Ljava/lang/Object;
+    /// java/lang/foreign/DowncallHandle  invokeBasic ([Ljava/lang/Object;)Ljava/lang/Object;
+    /// ```
+    ///
+    /// MEASURED — `--dump-native-registry`, `9ae371468`, default (`compatible`)
+    /// mode: all four `kind = synthetic-stub`, `owns_slot = true`, registered
+    /// at `native-builtins/src/phases_late/foreign_ffm.rs:4247…4265`. So a
+    /// Panama downcall taken through the stackless path runs a `SyntheticStub`
+    /// and contributes **nothing** to this total: the gate reads zero and says
+    /// PASS. That is the quiet failure, not the loud one.
+    ///
+    /// Under `--jdk-only` those four are not registered at all (same dump,
+    /// `mode: jdk-only`: `synthetic-stub` count **0**, total 10,691), so the
+    /// jdk-only gate is safe **today, by mode** — a fact about what
+    /// `foreign_ffm.rs` currently registers, not a property of this method.
+    ///
+    /// **Do not read a zero from this method on its own.** Use
+    /// [`invocations_of_kind_checked`](Self::invocations_of_kind_checked),
+    /// which returns the same total alongside
+    /// [`incomplete_slots_of_kind`](Self::incomplete_slots_of_kind) so a gate
+    /// can tell a *conclusive* zero from an *uninformative* one and go red
+    /// rather than quiet. See
+    /// `docs/known-issues/jdk-only/G33-1-the-instrument-that-under-reported-20260817.md`
+    /// and
+    /// `docs/known-issues/jdk-only/G48-1-the-input-side-hook-and-a-gate-that-could-go-quiet-20260817.md`.
     ///
     /// **Derived, not maintained.** Three per-kind global counters would make
     /// this O(1), but at the price of a SECOND contended atomic RMW on every
@@ -7768,6 +7979,48 @@ impl NativeMethodRegistry {
             .filter(|(slot, _)| slot.kind == kind)
             .map(|(_, counter)| counter.load(std::sync::atomic::Ordering::Relaxed))
             .sum()
+    }
+
+    /// How many slots currently classified `kind` have declared their
+    /// invocation count a floor
+    /// ([`mark_invocations_incomplete`](Self::mark_invocations_incomplete)).
+    ///
+    /// [`slots_with_incomplete_invocations`](Self::slots_with_incomplete_invocations)
+    /// narrowed to one kind, and it is the number that makes
+    /// [`invocations_of_kind`](Self::invocations_of_kind) readable: **a zero
+    /// total means "none ran" only when this is also zero.** Non-zero here
+    /// means at least one slot of that kind is wired to a dispatch path that
+    /// does not tick the counter, so the total is a floor and a zero total
+    /// carries no information at all.
+    ///
+    /// Same cost and same justification as `invocations_of_kind`: one relaxed
+    /// load per slot, cold, at report time.
+    pub fn incomplete_slots_of_kind(&self, kind: NativeKind) -> usize {
+        self.slots
+            .iter()
+            .zip(self.slot_invocations_incomplete.iter())
+            .filter(|(slot, _)| slot.kind == kind)
+            .filter(|(_, flag)| flag.load(std::sync::atomic::Ordering::Relaxed))
+            .count()
+    }
+
+    /// [`invocations_of_kind`](Self::invocations_of_kind) paired with the one
+    /// number that says whether it may be believed.
+    ///
+    /// This is the form a CI gate must read. The bare total is sound in one
+    /// direction only — non-zero proves a stub ran, zero does not prove none
+    /// did — and a gate that asserts `== 0` on it inherits that asymmetry
+    /// silently: when the instrument goes blind the assertion goes **quiet**,
+    /// which is the worst thing a CI check can do. [`KindInvocations::is_conclusive_zero`]
+    /// is the predicate that distinguishes "measured none" from "cannot tell",
+    /// and [`KindInvocations::is_clean`] is the assertion itself — it refuses
+    /// both a non-zero total and an unmeasurable one.
+    pub fn invocations_of_kind_checked(&self, kind: NativeKind) -> KindInvocations {
+        KindInvocations {
+            kind,
+            total: self.invocations_of_kind(kind),
+            incomplete_slots: self.incomplete_slots_of_kind(kind),
+        }
     }
 
     /// The `(class, method, descriptor)` triple that currently owns `id`.
@@ -9720,6 +9973,153 @@ mod tests {
         );
         assert_eq!(registry.invocations_of_kind(NativeKind::SyntheticStub), 0);
         assert_eq!(registry.invocations_of_kind(NativeKind::Bridge), 2);
+    }
+
+    #[test]
+    fn a_stub_total_of_zero_is_not_a_pass_when_a_stub_slot_is_declared_incomplete() {
+        // The L4 gate is `invocations_of_kind(SyntheticStub) == 0`. This is
+        // the state in which that assertion PASSES while proving nothing —
+        // the quiet failure G33-1 §4 flagged and this test makes loud.
+        //
+        // It is not hypothetical. MEASURED on `9ae371468` in default mode:
+        // the four `java/lang/foreign/DowncallHandle` arms are registered
+        // `synthetic-stub` AND listed in `UNCOUNTED_STACKLESS_NATIVES`, the
+        // stackless-invoke bypass family, which returns `Handled` before the
+        // census increment. G33-1's "neither bypass family currently serves a
+        // SyntheticStub" was true when it was written and is not true now.
+        let mut registry = NativeMethodRegistry::new();
+        registry.with_category(NativeKind::SyntheticStub, |r| {
+            r.register("f/Downcall", "invoke", "()I", dummy_native);
+        });
+        let stub = registry
+            .resolve_id("f/Downcall", "invoke", "()I")
+            .expect("registered");
+        registry.mark_invocations_incomplete(stub);
+
+        // The bare total: zero. The old gate reads this and says PASS.
+        assert_eq!(registry.invocations_of_kind(NativeKind::SyntheticStub), 0);
+
+        // The honest form refuses, and says which of the two failure modes
+        // it hit rather than leaving the reader hunting for a stub.
+        let checked = registry.invocations_of_kind_checked(NativeKind::SyntheticStub);
+        assert_eq!(checked.total, 0);
+        assert_eq!(checked.incomplete_slots, 1);
+        assert!(!checked.is_measurable());
+        assert!(!checked.is_conclusive_zero());
+        assert!(
+            !checked.is_clean(),
+            "a gate must not pass on total == 0 alone"
+        );
+        assert!(
+            checked.describe().contains("proves nothing"),
+            "the failure message must name the blindness, not just the count: {}",
+            checked.describe()
+        );
+    }
+
+    #[test]
+    fn a_stub_total_of_zero_with_every_stub_slot_counted_is_a_pass() {
+        // The other side of the same predicate, so `is_clean` cannot be
+        // satisfied by simply never returning true. Marking a slot of a
+        // DIFFERENT kind incomplete — which is the true state of every
+        // `--jdk-only` run today, where the JIT and interpreter bypass lists
+        // resolve only `Bridge` and `Intrinsic` triples — must not make the
+        // stub verdict unmeasurable.
+        let mut registry = NativeMethodRegistry::new();
+        registry.with_category(NativeKind::SyntheticStub, |r| {
+            r.register("s/S", "m", "()I", dummy_native);
+        });
+        registry.with_category(NativeKind::Bridge, |r| {
+            r.register("b/B", "m", "()I", dummy_native_2);
+        });
+        let bridge = registry.resolve_id("b/B", "m", "()I").expect("registered");
+        registry.mark_invocations_incomplete(bridge);
+        registry.record_invocation(bridge);
+
+        let stubs = registry.invocations_of_kind_checked(NativeKind::SyntheticStub);
+        assert!(
+            stubs.is_clean(),
+            "no stub ran and every stub slot is counted"
+        );
+        assert_eq!(
+            registry.incomplete_slots_of_kind(NativeKind::SyntheticStub),
+            0
+        );
+
+        // The bridge's own total is a floor, and says so.
+        let bridges = registry.invocations_of_kind_checked(NativeKind::Bridge);
+        assert_eq!(bridges.total, 1);
+        assert!(!bridges.is_measurable());
+        assert!(bridges.describe().contains("at least 1"));
+    }
+
+    #[test]
+    fn incomplete_slots_of_kind_follows_the_slots_current_kind() {
+        // The same re-registration consequence
+        // `invocations_of_kind_follows_the_slots_current_kind` pins for the
+        // counter, pinned for the flag — because the two are read together
+        // and a divergence between them would be invisible.
+        //
+        // This is also the one direction that matters for the gate: promoting
+        // a bypassed stub to `Bridge` moves BOTH the count and the blindness
+        // off the stub verdict, which is correct (the stub was fixed). The
+        // reverse — demoting a marked `Bridge` to `SyntheticStub` — makes the
+        // stub verdict unmeasurable, which is exactly when a gate must go red.
+        let mut registry = NativeMethodRegistry::new();
+        registry.with_category(NativeKind::Bridge, |r| {
+            r.register("p/P", "m", "()I", dummy_native);
+        });
+        let id = registry.resolve_id("p/P", "m", "()I").expect("registered");
+        registry.mark_invocations_incomplete(id);
+        assert_eq!(registry.incomplete_slots_of_kind(NativeKind::Bridge), 1);
+        assert_eq!(
+            registry.incomplete_slots_of_kind(NativeKind::SyntheticStub),
+            0
+        );
+        assert!(registry
+            .invocations_of_kind_checked(NativeKind::SyntheticStub)
+            .is_clean());
+
+        // Demote the same triple to a stub. The bit is sticky by design, so
+        // the blindness travels with the slot.
+        registry.with_category(NativeKind::SyntheticStub, |r| {
+            r.register("p/P", "m", "()I", dummy_native_2);
+        });
+        assert_eq!(
+            registry.resolve_id("p/P", "m", "()I"),
+            Some(id),
+            "re-registration must update the slot in place"
+        );
+        assert_eq!(registry.incomplete_slots_of_kind(NativeKind::Bridge), 0);
+        assert_eq!(
+            registry.incomplete_slots_of_kind(NativeKind::SyntheticStub),
+            1
+        );
+        assert!(
+            !registry
+                .invocations_of_kind_checked(NativeKind::SyntheticStub)
+                .is_clean(),
+            "a bypassed slot that becomes a stub must turn the gate red, not quiet"
+        );
+    }
+
+    #[test]
+    fn the_bais_hook_is_absent_until_installed() {
+        // The BAIS observer is a process-wide `OnceLock` and this crate never
+        // installs one, so `native-io`'s dispatch sites are inert here — the
+        // property that makes adding them a no-op for every consumer until
+        // the nominated `http_url_connection.rs` hook lands. Asserted through
+        // the public surface rather than by reading the static, so it stays
+        // true if the storage changes.
+        //
+        // Deliberately not a behavioural test of a hook: installing one would
+        // be irreversible for every other test in this binary. The
+        // behavioural coverage lives in `native-io`, thread-armed for exactly
+        // that reason.
+        assert!(
+            BAIS_EVENT_HOOK.get().is_none(),
+            "no hook may be installed from within native-api's own tests"
+        );
     }
 
     #[test]

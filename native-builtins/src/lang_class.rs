@@ -1725,8 +1725,63 @@ pub(crate) fn native_class_get_primitive_class(
 /// map first (populated by `get_or_create_class_mirror`).  Falls back to
 /// reading field 0 as Int(class_id) for legacy/synthetic compatibility.
 ///
-/// Returns `None` for primitive mirrors (not in the reverse map and
-/// field 0 is no longer Int(-1) вЂ” it's Object(None) in real-JDK mode).
+/// Returns `None` for primitive mirrors (not in the reverse map, and their
+/// slot-0 overlay is the `Int(-1)` sentinel, which the `v >= 0` guard rejects).
+///
+/// # What the slot-0 fallback actually does in real-JDK mode (G46-1, MEASURED)
+///
+/// This is the READ half of W7-84, and `G30-1` §6 pinned the write half without
+/// examining it. The write, in `vm/src/vm/vm_object.rs`, is the DESCRIPTOR-LESS
+/// `heap.set_field(mirror, 0, Value::Int(class_id))`; every collector's
+/// reference arm boxes that into an `AUTOBOX_CLASS_ID` wrapper so the value
+/// survives, and G30 §6's table concludes *"…a wrapper that `get_field`
+/// un-boxes back to `Int`"*. That is true of `Heap::get_field`. **It is not
+/// true of the accessor on this line.**
+///
+/// `NativeContextImpl::get_field` (`vm/src/vm/vm_exec.rs`) is DESCRIPTOR-AWARE:
+/// it resolves the receiver's declared descriptor for the slot and routes the
+/// read through `VmHeap::get_field_as`. `javap -p java.lang.Class` on Adoptium
+/// 25.0.3+9 declares instance field 0 as
+/// `private volatile transient Constructor<T> cachedConstructor`, i.e. `L`. So
+/// the collector un-boxes the wrapper back to `Int(v)` and
+/// `heap::coerce_field_value_for_slot`'s `b'L'` arm then maps that `Int` to
+/// `Value::Object(None)` two frames later. **The `if let Value::Int(v)` below
+/// therefore cannot match for any receiver whose class is the real
+/// `java.lang.Class`**, whatever the overlay holds — and each attempt is one
+/// `primitive-into-reference` event in the `CRATONVM_DBG_COERCION` log.
+///
+/// The fallback is still live where it was written for: a synthetic-stub
+/// `java/lang/Class` (and `MockNativeContext`) carries no usable descriptor, so
+/// `resolve_field_descriptor_byte_cached` short-circuits, the raw read reaches
+/// this line, and the `Int` matches. It is a MODE-dependent path, which nothing
+/// said before.
+///
+/// # Why this is nonetheless the right answer, and is left alone
+///
+/// MEASURED on `C:/craton/target-rel3/release/cratonvm.exe` (`9ae371468`),
+/// `--jdk-only`, `CRATONVM_DBG_COERCION=1`, 36 vectors: **378 events at this
+/// line, and every single one is `descriptor=L value=Int(-1)`**. `Int(-1)` is
+/// `get_or_create_primitive_mirror`'s sentinel — a PRIMITIVE class mirror,
+/// which that function deliberately never registers in `class_mirrors_reverse`
+/// — and `-1` fails the `v >= 0` guard on the next line. So on the whole
+/// measured population the coercion changes nothing: `None` is the answer with
+/// or without it, and `None` is the CORRECT answer for a primitive mirror.
+///
+/// Confirmed by a controlled A/B (`G46MirrorProbe`, same binary and flags):
+/// ten `getName()` calls plus one `Array.newInstance` over PRIMITIVE mirrors
+/// produce 21 events here; the identical program over ORDINARY class mirrors
+/// produces **0**, because `class_id_from_mirror` answers first for those and
+/// this line is never reached.
+///
+/// Making the fallback live again would change what 157 call sites of this
+/// function see, in a mode where it has answered `None` for the whole life of
+/// `--jdk-only`, for a measured beneficiary population of zero. And the
+/// tempting spelling — `get_field_typed(mirror, 0, b'I')` — is actively
+/// dangerous: on a mirror whose `cachedConstructor` holds a genuine
+/// `Constructor` the `b'I'` arm publishes the object's own ADDRESS as an `Int`
+/// (`pointer-into-primitive`), which would sail past `v >= 0` and hand out a
+/// fabricated ClassId. `a_reference_at_slot_zero_is_never_decoded_as_a_class_id`
+/// pins that it must not.
 pub(crate) fn mirror_class_id(
     ctx: &dyn NativeContext,
     mirror: cratonvm_types::ObjectRef,
@@ -1734,28 +1789,36 @@ pub(crate) fn mirror_class_id(
     if let Some(cid) = ctx.class_id_from_mirror(mirror) {
         return Some(cid);
     }
-    if let Value::Int(v) = ctx.get_field(mirror, 0) {
-        if v >= 0 {
-            // JDK-ONLY-LAYOUT evidence item 3, for the `unknown` verdict on the
-            // slot-0 write in `vm/src/vm/vm_object.rs`. That write is an
-            // *overlay*: a VM-internal `Int` deliberately stored on top of
-            // `java.lang.Class`'s instance field 0, which JDK 25 declares as
-            // `Constructor<T> cachedConstructor` — a **reference** slot.
-            //
-            // The marker's question is not "is this the right slot" but "does
-            // anything still depend on it", and this line is the only reader of
-            // the overlay outside the VM — a fallback behind the reverse map.
-            // If a real-JDK run never reaches here, the wave-2 fix is to delete
-            // the overlay outright rather than relocate it, which is strictly
-            // better than either. Nothing in the tree could answer that, so:
-            // say it, once, under the flag the marker already nominates.
-            //
-            // Free when the flag is unset, and this is already the slow half of
-            // a two-step lookup when it is.
-            if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_OVERLAY").is_some() {
-                static REPORTED: std::sync::atomic::AtomicBool =
-                    std::sync::atomic::AtomicBool::new(false);
-                if !REPORTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+    let slot0 = ctx.get_field(mirror, 0);
+    // JDK-ONLY-LAYOUT evidence item 3, for the `unknown` verdict on the slot-0
+    // write in `vm/src/vm/vm_object.rs`. That write is an *overlay*: a
+    // VM-internal `Int` deliberately stored on top of `java.lang.Class`'s
+    // instance field 0, which JDK 25 declares as `Constructor<T>
+    // cachedConstructor` — a **reference** slot.
+    //
+    // The marker's question is not "is this the right slot" but "does anything
+    // still depend on it", and this line is the only reader of the overlay
+    // outside the VM — a fallback behind the reverse map.
+    //
+    // G46-1 moved this report OUT of the `v >= 0` arm, and that is the whole
+    // point of the change. Inside it the line could not fire in real-JDK mode
+    // for either of two independent reasons (the descriptor coercion above, and
+    // the fact that the only measured population is the `-1` sentinel), so it
+    // was an unfalsifiable guard whose silence was read as "the fallback is
+    // never used" when it in fact means "the fallback can never SUCCEED".
+    // Reporting the MISS as well is what tells those two apart, and it is what
+    // a future lane needs before it deletes or relocates the overlay.
+    //
+    // Free when the flag is unset, and this is already the slow half of a
+    // two-step lookup when it is.
+    if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_OVERLAY").is_some() {
+        static REPORTED_HIT: std::sync::atomic::AtomicBool =
+            std::sync::atomic::AtomicBool::new(false);
+        static REPORTED_MISS: std::sync::atomic::AtomicBool =
+            std::sync::atomic::AtomicBool::new(false);
+        match slot0 {
+            Value::Int(v) if v >= 0 => {
+                if !REPORTED_HIT.swap(true, std::sync::atomic::Ordering::Relaxed) {
                     eprintln!(
                         "[cratonvm][overlay] class-mirror slot-0 fallback HIT (ClassId {v}): \
                          `class_id_from_mirror` missed and this read the Int overlay at \
@@ -1764,6 +1827,22 @@ pub(crate) fn mirror_class_id(
                     );
                 }
             }
+            other => {
+                if !REPORTED_MISS.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    eprintln!(
+                        "[cratonvm][overlay] class-mirror slot-0 fallback MISS (slot 0 read \
+                         back as {other:?}): `class_id_from_mirror` missed AND the overlay \
+                         did not decode as a non-negative Int, so this answers None. \
+                         `Int(-1)` is the primitive-mirror sentinel and is the expected \
+                         reading; `Object(None)` means the descriptor-aware read nulled the \
+                         overlay (G46-1) or nothing ever wrote it."
+                    );
+                }
+            }
+        }
+    }
+    if let Value::Int(v) = slot0 {
+        if v >= 0 {
             return Some(cratonvm_types::ClassId::new(v as u32));
         }
     }
@@ -22076,6 +22155,108 @@ mod tests {
         ctx.set_field(mirror, 0, Value::Int(class_id as i32));
         ctx.set_field(mirror, 1, Value::Object(Some(name_obj)));
         mirror
+    }
+
+    // -----------------------------------------------------------------------
+    // G46-1 — the READ half of W7-84: `mirror_class_id`'s slot-0 fallback.
+    //
+    // These four pin the guard that makes the 378 MEASURED
+    // `primitive-into-reference` events at that line a benign read rather than
+    // a lost answer. Every one of those events is `Int(-1)` at
+    // `java.lang.Class.cachedConstructor` — `get_or_create_primitive_mirror`'s
+    // sentinel — and `None` is the correct answer for a primitive mirror with
+    // or without the coercion. See the function's own doc comment.
+    // -----------------------------------------------------------------------
+
+    /// `Int(-1)` is `vm_object.rs::get_or_create_primitive_mirror`'s "this is a
+    /// primitive mirror, it has no ClassId" sentinel, and it is the ONLY value
+    /// the 378 measured events carry. It must answer `None`, not
+    /// `ClassId(0xFFFF_FFFF)`.
+    #[test]
+    fn the_primitive_mirror_sentinel_is_rejected_by_the_slot_zero_fallback() {
+        let mut ctx = mock_ctx();
+        let mirror = ctx.alloc_object(ClassId::new(0), 2);
+        ctx.set_field(mirror, 0, Value::Int(-1));
+        assert_eq!(
+            mirror_class_id(&ctx, mirror),
+            None,
+            "the primitive-mirror sentinel must not become a ClassId"
+        );
+    }
+
+    /// The hazard the doc comment names, pinned so nobody closes G46-1 by
+    /// reading the slot with an `I` descriptor.
+    ///
+    /// On a real `java.lang.Class` slot 0 is `Constructor<T> cachedConstructor`,
+    /// so it can legitimately hold a live reference. A `get_field_typed(.., b'I')`
+    /// would take `heap::coerce_field_value_for_slot`'s `pointer-into-primitive`
+    /// arm and publish that object's own ADDRESS as an `Int` — a large positive
+    /// number that sails past `v >= 0` and yields a fabricated ClassId. The
+    /// descriptor-aware read this function uses cannot do that, and this test
+    /// fails the moment one that can is substituted.
+    #[test]
+    fn a_reference_at_slot_zero_is_never_decoded_as_a_class_id() {
+        let mut ctx = mock_ctx();
+        let mirror = ctx.alloc_object(ClassId::new(0), 2);
+        let ctor = ctx.alloc_object(ClassId::new(0), 1);
+        ctx.set_field(mirror, 0, Value::Object(Some(ctor)));
+        assert_eq!(
+            mirror_class_id(&ctx, mirror),
+            None,
+            "a genuine cachedConstructor reference is not a ClassId"
+        );
+    }
+
+    /// What the descriptor-aware read leaves behind in real-JDK mode after
+    /// `coerce_field_value_for_slot`'s `b'L'` arm has nulled the overlay.
+    ///
+    /// The answer must be `None`. It must specifically NOT be `ClassId(0)`,
+    /// which is `java/lang/Object` — the exact aliasing that produced
+    /// ByteBuddy's *"Failed to resolve super class class java.lang.Object"* and
+    /// that `native_class_get_name`'s strict-name-first ordering exists to
+    /// avoid.
+    #[test]
+    fn a_nulled_slot_zero_overlay_answers_none_not_class_id_zero() {
+        let mut ctx = mock_ctx();
+        let mirror = ctx.alloc_object(ClassId::new(0), 2);
+        ctx.set_field(mirror, 0, Value::Object(None));
+        assert_eq!(mirror_class_id(&ctx, mirror), None);
+    }
+
+    /// The other half, so the three refusals above cannot be satisfied by a
+    /// function that always answers `None`: a non-negative overlay still maps
+    /// to exactly that ClassId. This is the arm that is still live wherever the
+    /// receiver's class carries no usable field descriptor — a synthetic-stub
+    /// `java/lang/Class`, and `MockNativeContext`.
+    #[test]
+    fn a_non_negative_slot_zero_overlay_is_still_that_class_id() {
+        let mut ctx = mock_ctx();
+        let mirror = ctx.alloc_object(ClassId::new(0), 2);
+        ctx.set_field(mirror, 0, Value::Int(7));
+        assert_eq!(mirror_class_id(&ctx, mirror), Some(ClassId::new(7)));
+    }
+
+    /// Source tripwire for the repair that must NOT be made.
+    ///
+    /// Scans only what is ABOVE this test module: the needles appear verbatim
+    /// in the assertions below, so scanning the whole file would find each one
+    /// inside itself and the test would pass whatever the real code said.
+    #[test]
+    fn the_mirror_slot_zero_overlay_is_read_through_the_descriptor_aware_accessor() {
+        let src = include_str!("lang_class.rs")
+            .split("mod tests {")
+            .next()
+            .expect("split always yields a first element");
+        assert!(
+            src.contains("let slot0 = ctx.get_field(mirror, 0);"),
+            "mirror_class_id must read slot 0 through the descriptor-aware \
+             `get_field`, which answers Object(None) for a reference slot"
+        );
+        assert!(
+            !src.contains("ctx.get_field_typed(mirror, 0"),
+            "a descriptor hint at this slot re-types `cachedConstructor`; with \
+             b'I' it publishes a heap ADDRESS as a ClassId (G46-1)"
+        );
     }
 
     fn jspecify_nullable_annotation() -> cratonvm_native_api::AnnotationData {

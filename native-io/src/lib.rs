@@ -3509,6 +3509,17 @@ fn native_bais_read(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
         _ => return Ok(Some(Value::Int(-1))),
     };
     if pos >= count {
+        // EOF. The one instant at which the application is observably done
+        // reading this buffer — see `BaisEvent`'s doc for why a bridge that
+        // handed Java a `ByteArrayInputStream` needs it, and why the observer
+        // cannot change what this returns. `-1` is emitted either way, on
+        // every path, and an observer's `Err` is a genuine internal failure
+        // rather than a Java-level condition.
+        cratonvm_native_api::registry::dispatch_bais_event(
+            ctx,
+            this,
+            cratonvm_native_api::registry::BaisEvent::Eof,
+        )?;
         return Ok(Some(Value::Int(-1)));
     }
     let byte_val = match ctx.get_array_element(data, pos as usize) {
@@ -3735,6 +3746,19 @@ fn native_bais_read_bytes(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
     // ever calls `read()` -- that is the `!has_bais_layout` branch above.
     // Do not "unify" the two.
     if pos >= count {
+        // The same EOF instant as `native_bais_read`'s, reached through the
+        // bulk shape. `read([B)I` delegates here by virtual dispatch, so these
+        // two sites cover all three read descriptors and no fourth is needed.
+        //
+        // This dispatch sits INSIDE the `pos >= count` arm and therefore
+        // BELOW the ordering note above: it must not be hoisted above the
+        // EOF test to "cover the zero-length case too". A `read(b, off, 0)`
+        // on a stream that is not yet exhausted returns 0 and is not an EOF.
+        cratonvm_native_api::registry::dispatch_bais_event(
+            ctx,
+            this,
+            cratonvm_native_api::registry::BaisEvent::Eof,
+        )?;
         return Ok(Some(Value::Int(-1)));
     }
     if len == 0 {
@@ -3882,8 +3906,29 @@ fn native_bais_reset(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     Ok(None)
 }
 
-fn native_bais_close(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    Ok(None) // no-op
+/// `ByteArrayInputStream.close()` / `InputStream.close()`.
+///
+/// **Still a no-op for the stream itself**, and that is the JDK contract:
+/// `ByteArrayInputStream.close()` has no effect and cannot throw. The only
+/// thing added here is the `BaisEvent::Close` observation, which cannot
+/// change that — see `cratonvm_native_api::registry::BaisEventHook`'s doc for
+/// why the observer returns `()` and not a "consumed" flag.
+///
+/// A drained-then-closed stream produces `Eof` (possibly repeatedly) *and*
+/// `Close`, so an observer has to be idempotent; that is stated on
+/// `BaisEvent::Eof` and is not a property either site may quietly rely on the
+/// other to provide.
+fn native_bais_close(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(None),
+    };
+    cratonvm_native_api::registry::dispatch_bais_event(
+        ctx,
+        this,
+        cratonvm_native_api::registry::BaisEvent::Close,
+    )?;
+    Ok(None) // the stream itself: no-op, as in the real JDK
 }
 
 // ---------------------------------------------------------------------------
@@ -27215,6 +27260,205 @@ mod bais_layout_tests {
         assert_eq!(ctx.get_field(this, BAIS_FIELD_POS), Value::Int(3));
         assert_eq!(ctx.get_field(this, BAIS_FIELD_MARK), Value::Int(3));
         assert_eq!(ctx.get_field(this, BAIS_FIELD_COUNT), Value::Int(7));
+    }
+
+    // -----------------------------------------------------------------------
+    // The BAIS lifetime hook (G48-1) — the input-side twin of the BAOS one.
+    //
+    // The observer is a process-wide `OnceLock`, so a test that installs a
+    // hook installs it for EVERY test in this binary. The recorder below is
+    // therefore armed per THREAD: unarmed threads take a `None` branch and
+    // record nothing, which is what keeps this from perturbing the ~dozen
+    // other tests in this module that drain a stream to EOF. Installing is
+    // idempotent through `install_once`, because `OnceLock::set` silently
+    // fails on the second call and a second hook would never be seen.
+    // -----------------------------------------------------------------------
+
+    use cratonvm_native_api::registry::BaisEvent;
+    use std::cell::RefCell;
+
+    thread_local! {
+        static RECORDED: RefCell<Option<Vec<(ObjectRef, BaisEvent)>>> =
+            const { RefCell::new(None) };
+    }
+
+    fn recording_hook(
+        _ctx: &mut dyn NativeContext,
+        stream: ObjectRef,
+        event: BaisEvent,
+    ) -> Result<(), MethodCallFailed> {
+        RECORDED.with(|c| {
+            if let Some(log) = c.borrow_mut().as_mut() {
+                log.push((stream, event));
+            }
+        });
+        Ok(())
+    }
+
+    /// Arm recording on THIS thread and install the process hook if no test
+    /// has yet. Returns the events seen while `body` ran.
+    fn with_recorder(body: impl FnOnce()) -> Vec<(ObjectRef, BaisEvent)> {
+        cratonvm_native_api::registry::install_bais_event_hook(recording_hook);
+        RECORDED.with(|c| *c.borrow_mut() = Some(Vec::new()));
+        body();
+        RECORDED.with(|c| c.borrow_mut().take()).unwrap_or_default()
+    }
+
+    #[test]
+    fn eof_and_close_reach_the_observer_and_do_not_change_what_they_return() {
+        let events = with_recorder(|| {
+            let mut ctx = MockNativeContext::new();
+            let (this, _) = make_bais(&mut ctx, b"ok");
+
+            // Two payload bytes: no EOF yet, so no event yet.
+            for want in [b'o' as i32, b'k' as i32] {
+                let got = native_bais_read(&mut ctx, &[Value::Object(Some(this))]).unwrap();
+                assert_eq!(got, Some(Value::Int(want)));
+            }
+            assert!(
+                RECORDED.with(|c| c.borrow().as_ref().unwrap().is_empty()),
+                "a read that returned a byte is not an EOF and must not fire"
+            );
+
+            // The EOF read still answers -1, with an observer installed.
+            let eof = native_bais_read(&mut ctx, &[Value::Object(Some(this))]).unwrap();
+            assert_eq!(eof, Some(Value::Int(-1)), "the observer must not edit EOF");
+
+            // close() is still a no-op returning no value.
+            let closed = native_bais_close(&mut ctx, &[Value::Object(Some(this))]).unwrap();
+            assert_eq!(closed, None, "BAIS.close() has no effect and no return");
+
+            RECORDED.with(|c| {
+                let log = c.borrow();
+                let log = log.as_ref().unwrap();
+                assert_eq!(
+                    log.iter().map(|(_, e)| *e).collect::<Vec<_>>(),
+                    vec![BaisEvent::Eof, BaisEvent::Close],
+                    "the drain sequence this vector performs, in order"
+                );
+                assert!(
+                    log.iter().all(|(s, _)| *s == this),
+                    "every event must name the stream it came from — the observer \
+                     maps that object back to its carrier and has nothing else to key on"
+                );
+            });
+        });
+        assert_eq!(events.len(), 2);
+    }
+
+    #[test]
+    fn every_exhausted_read_fires_not_only_the_first() {
+        // The contract `BaisEvent::Eof` states, asserted rather than trusted:
+        // the transition into EOF is not observable from inside the read body
+        // (a stream constructed empty is at `pos >= count` on its first read),
+        // so the event fires on every exhausted read and observers MUST be
+        // idempotent. A future "optimisation" that fires only once would make
+        // the empty-body case silent.
+        let events = with_recorder(|| {
+            let mut ctx = MockNativeContext::new();
+            let (empty, _) = make_bais(&mut ctx, b"");
+            for _ in 0..3 {
+                assert_eq!(
+                    native_bais_read(&mut ctx, &[Value::Object(Some(empty))]).unwrap(),
+                    Some(Value::Int(-1))
+                );
+            }
+        });
+        assert_eq!(
+            events.iter().filter(|(_, e)| *e == BaisEvent::Eof).count(),
+            3,
+            "an empty stream is at EOF from its first read; all three must fire"
+        );
+    }
+
+    #[test]
+    fn the_bulk_read_fires_the_same_eof_and_a_zero_length_read_does_not() {
+        let events = with_recorder(|| {
+            let mut ctx = MockNativeContext::new();
+            let (this, _) = make_bais(&mut ctx, b"ok");
+            let dst = ctx.new_array(ArrayElementType::Byte, 8);
+
+            // A zero-length read on a stream that is NOT exhausted returns 0
+            // and is not an EOF. This pins the dispatch BELOW the `pos >=
+            // count` test, which is where the existing ordering comment says
+            // the EOF decision has to be made.
+            let zero = native_bais_read_bytes(
+                &mut ctx,
+                &[
+                    Value::Object(Some(this)),
+                    Value::Object(Some(dst)),
+                    Value::Int(0),
+                    Value::Int(0),
+                ],
+            )
+            .unwrap();
+            assert_eq!(zero, Some(Value::Int(0)));
+            assert!(
+                RECORDED.with(|c| c.borrow().as_ref().unwrap().is_empty()),
+                "read(b, 0, 0) on a live stream is not an EOF"
+            );
+
+            // Drain, then hit EOF through the bulk shape.
+            let n = native_bais_read_bytes(
+                &mut ctx,
+                &[
+                    Value::Object(Some(this)),
+                    Value::Object(Some(dst)),
+                    Value::Int(0),
+                    Value::Int(8),
+                ],
+            )
+            .unwrap();
+            assert_eq!(n, Some(Value::Int(2)));
+            let eof = native_bais_read_bytes(
+                &mut ctx,
+                &[
+                    Value::Object(Some(this)),
+                    Value::Object(Some(dst)),
+                    Value::Int(0),
+                    Value::Int(8),
+                ],
+            )
+            .unwrap();
+            assert_eq!(eof, Some(Value::Int(-1)));
+        });
+        assert_eq!(
+            events.iter().map(|(_, e)| *e).collect::<Vec<_>>(),
+            vec![BaisEvent::Eof],
+            "exactly one EOF, from the exhausted bulk read"
+        );
+    }
+
+    #[test]
+    fn an_unarmed_thread_sees_the_pre_hook_behaviour_exactly() {
+        // The conservatism witness. With no observer recording, every value
+        // this change touches is what it was before: -1 at EOF, `None` from
+        // close(), payload bytes unchanged. `native-builtins` depends on this
+        // crate and nothing installs a hook until the nominated consumer
+        // lands, so this is the state the whole tree is in today.
+        let mut ctx = MockNativeContext::new();
+        let (this, _) = make_bais(&mut ctx, b"ok");
+        assert_eq!(
+            native_bais_read(&mut ctx, &[Value::Object(Some(this))]).unwrap(),
+            Some(Value::Int(b'o' as i32))
+        );
+        assert_eq!(
+            native_bais_read(&mut ctx, &[Value::Object(Some(this))]).unwrap(),
+            Some(Value::Int(b'k' as i32))
+        );
+        assert_eq!(
+            native_bais_read(&mut ctx, &[Value::Object(Some(this))]).unwrap(),
+            Some(Value::Int(-1))
+        );
+        assert_eq!(
+            native_bais_close(&mut ctx, &[Value::Object(Some(this))]).unwrap(),
+            None
+        );
+        // A null receiver still returns quietly rather than dispatching.
+        assert_eq!(
+            native_bais_close(&mut ctx, &[Value::Object(None)]).unwrap(),
+            None
+        );
     }
 }
 
