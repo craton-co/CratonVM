@@ -85,6 +85,69 @@ pub(crate) mod lambda_prof {
     }
 }
 
+/// Engagement census for the lambda JIT tier-up path (`CRATONVM_DBG_LAMBDA_JIT=1`).
+///
+/// A flat A/B on this path cannot tell "the compiled body did not help" from
+/// "no compiled body was ever entered": both read as no change. So every
+/// number this path is quoted with is quoted beside the count of calls that
+/// actually took it. `ELIGIBLE` is the denominator (dispatches that passed the
+/// gates), `COMPILED_HITS` the ones that found a compiled body, `FAST_RETURNS`
+/// the ones that returned through it, `DECLINES` the ones that entered the
+/// primitive and fell back, `NOMINATIONS` the tier-up enqueues that exist only
+/// because of this path.
+///
+/// Counters are plain relaxed atomics behind a `OnceLock` gate, so an
+/// unprofiled run pays one relaxed load per dispatch and nothing else. The
+/// report is periodic (not at-exit) so a profile lands even on a run killed at
+/// a timeout — same reasoning as `lambda_prof::REPORT_EVERY`.
+pub(crate) mod lambda_jit {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::OnceLock;
+
+    pub(crate) static ELIGIBLE: AtomicU64 = AtomicU64::new(0);
+    pub(crate) static COMPILED_HITS: AtomicU64 = AtomicU64::new(0);
+    pub(crate) static FAST_RETURNS: AtomicU64 = AtomicU64::new(0);
+    pub(crate) static DECLINES: AtomicU64 = AtomicU64::new(0);
+    pub(crate) static NOMINATIONS: AtomicU64 = AtomicU64::new(0);
+
+    pub(crate) fn on() -> bool {
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| cratonvm_types::flags::runtime_var("CRATONVM_DBG_LAMBDA_JIT").is_ok())
+    }
+
+    #[inline]
+    pub(crate) fn bump(counter: &AtomicU64) {
+        if on() {
+            counter.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// How often to print, counted in eligible dispatches.
+    pub(crate) const REPORT_EVERY: u64 = 200_000;
+
+    #[inline]
+    pub(crate) fn maybe_report() {
+        if !on() {
+            return;
+        }
+        let eligible = ELIGIBLE.load(Ordering::Relaxed);
+        if eligible % REPORT_EVERY == 0 && eligible > 0 {
+            report();
+        }
+    }
+
+    pub(crate) fn report() {
+        eprintln!(
+            "[LAMBDA-JIT] eligible={} compiled_hits={} fast_returns={} declines={} nominations={}",
+            ELIGIBLE.load(Ordering::Relaxed),
+            COMPILED_HITS.load(Ordering::Relaxed),
+            FAST_RETURNS.load(Ordering::Relaxed),
+            DECLINES.load(Ordering::Relaxed),
+            NOMINATIONS.load(Ordering::Relaxed),
+        );
+    }
+}
+
 /// LambdaMetafactory argument adaptation (`samMethodType` → `instantiatedMethodType`).
 ///
 /// When a functional-interface SAM has erased parameters (commonly `Object`,
@@ -1304,52 +1367,116 @@ pub(super) fn try_invoke_cached_lambda_impl(
     if args.len() != expected_args {
         return Ok(None);
     }
-    // TDigest's lambda adapter repeatedly invokes the concrete array accessor
-    // `(I)D`. When that leaf is already compiled and has no dispatch helpers,
-    // enter it directly instead of materializing an interpreter frame per get.
-    // Other lambda implementations retain the generic cached-frame path below.
-    if !cached.is_static
+    // LAMBDA-JIT-TIERUP — a lambda SAM implementation reached through lambda
+    // dispatch used to touch NEITHER `profile_store.increment_invocation` NOR
+    // `jit.jit_cache`, so it could never be nominated for JIT compilation, no
+    // matter how many times it was called. Confirmed with `CRATONVM_DBG_JITC=1`
+    // against `probes/SamDispatchDecompositionProbe.java`: a lambda's synthetic
+    // `lambda$...` method never once appeared in the tiered-enqueue/bg-compile
+    // log, while the byte-identical body reached through a named or anonymous
+    // class (ordinary `invokeinterface`, which DOES count invocations at its
+    // cache site in `dispatch_virtual.rs`) compiled within a few hundred calls
+    // and ran ~40x faster. See
+    // known-issues/perf/lambda-sam-dispatch-bypasses-the-cached-invoke-path-20260817.md.
+    //
+    // The shape mirrors the twins (`execute_invokestatic_cached`,
+    // `dispatch_virtual.rs`'s poly-cache arm): probe the JIT cache first,
+    // epoch-guarded, and only count invocations while the probe is still
+    // missing. It differs from them in the primitive it enters compiled code
+    // with — `execute_jit_call_oneshot` rather than `execute_jit_call_decoded`
+    // — because this function is a one-shot subroutine that must return a
+    // `Value`, not a step of the interpreter's dispatch loop that can be handed
+    // a pushed frame. Reusing the loop-integrated primitive here is what
+    // crashed the first attempt (section 5.3 of that page); see
+    // `execute_jit_call_oneshot`'s own doc comment.
+    //
+    // Gates, in order of cost. `exception_table.is_empty()` is the same
+    // restriction every other direct-compiled-call site in this VM applies
+    // (`mic_callee_has_exception_table`, `osr_callee_declares_handlers`, the
+    // poly-cache arm's own `cached.exception_table.is_empty()`): a
+    // handler-bearing callee is never entered by a direct compiled call. A
+    // virtual thread is excluded because compiled entry carries none of the
+    // unmount points the interpreter path does, matching the TDigest fast path
+    // this block replaces.
+    if crate::runtime::env_cache::jit_lambda_tierup()
+        && !crate::runtime::env_cache::disable_jit()
         && !matches!(thread.kind, crate::threading::ThreadKind::Virtual)
-        && &*cached.method_name == "get"
-        && &*cached.method_descriptor == "(I)D"
+        && !cached.is_synchronized
+        && cached.exception_table.is_empty()
     {
-        let compiled = {
-            let cache = shared.jit.jit_cache.read();
-            cache.get(
+        lambda_jit::bump(&lambda_jit::ELIGIBLE);
+        // Epoch-guarded exactly like the twins: skip the string-keyed
+        // `JitCache::get` while this entry's snapshot of
+        // `jit_cache_generation()` is still current, because no publication or
+        // invalidation has happened since the probe that missed. Read the
+        // generation BEFORE probing so a racing publication can only cause a
+        // redundant re-probe, never a missed one.
+        let jit_generation = cratonvm_jit::jit_cache_generation();
+        let compiled = if cached.jit_probe_is_current(jit_generation) {
+            None
+        } else {
+            let found = shared.jit.jit_cache.read().get(
                 &cached.class_name,
                 &cached.method_name,
                 &cached.method_descriptor,
                 cached.declaring_class_id,
-            )
+            );
+            if found.is_none() {
+                cached.record_jit_probe_miss(jit_generation);
+            }
+            found
         };
-        if let Some(compiled) = compiled {
-            if !compiled.has_dispatch {
-                let raw = match (args.get(0), args.get(1)) {
-                    (Some(Value::Object(Some(receiver))), Some(Value::Int(index))) => {
-                        let vm_ptr = shared as *const _ as i64;
-                        let jit_args = [receiver.as_ptr() as i64, *index as i64];
-                        let _guard =
-                            crate::jit::conservative_roots::JitEntryGuard::enter_with_compiled(
-                                &*compiled,
-                            );
-                        // SAFETY: the compiled entry's ABI and optional context
-                        // are selected from its own verified metadata above.
-                        unsafe {
-                            if compiled.needs_context() {
-                                compiled.try_call_with_context(vm_ptr, &jit_args)
-                            } else {
-                                compiled.try_call(&jit_args)
-                            }
-                        }
-                        .ok()
+        match compiled {
+            Some(compiled) => {
+                lambda_jit::bump(&lambda_jit::COMPILED_HITS);
+                if let Some(value) =
+                    execute_jit_call_oneshot(shared, thread, &compiled, &cached, args)?
+                {
+                    lambda_jit::bump(&lambda_jit::FAST_RETURNS);
+                    lambda_jit::maybe_report();
+                    return Ok(Some(value));
+                }
+                // Declined (ABI limit, or a deopt with no resumable frame):
+                // nothing was executed that must not be repeated, so fall
+                // through to the interpreted frame build below with the same
+                // `args`.
+                lambda_jit::bump(&lambda_jit::DECLINES);
+            }
+            None => {
+                // Warmup counter, mirroring the twins' `.or_else` arm. This is
+                // the half that fixes the root cause: without it the method is
+                // never nominated, so the probe above can never hit.
+                const JIT_RETRY_STRIDE: u32 = 64;
+                let invoc_key = cached.invoc_key();
+                let threshold = crate::runtime::env_cache::jit_invocation_threshold();
+                let cnt = shared.jit.profile_store.increment_invocation(invoc_key);
+                let should_attempt = cnt >= threshold
+                    && (cnt == threshold || (cnt - threshold) % JIT_RETRY_STRIDE == 0);
+                if should_attempt && crate::runtime::env_cache::bg_compile() {
+                    ensure_bg_compiler_started(shared);
+                    let tiered_key = crate::jit::tiered::MethodKey::new(
+                        cached.class_name.as_ref(),
+                        cached.method_name.as_ref(),
+                        cached.method_descriptor.as_ref(),
+                    );
+                    // Real invocation count — see the invokestatic twin:
+                    // stride-boundary `+= 1` counting deflated the manager's
+                    // hotness view 64x.
+                    let recommended_tier = shared
+                        .jit
+                        .tiered_manager
+                        .on_method_invocation_observed(&tiered_key, cnt as u64);
+                    lambda_jit::bump(&lambda_jit::NOMINATIONS);
+                    if crate::runtime::env_cache::dbg_jitc() {
+                        eprintln!(
+                            "[cratonvm-jitc] lambda-tiered-enqueue {}.{}{} tier={recommended_tier:?} invoc_count={cnt}",
+                            cached.class_name, cached.method_name, cached.method_descriptor,
+                        );
                     }
-                    _ => None,
-                };
-                if let Some(bits) = raw {
-                    return Ok(Some(Some(Value::Double(f64::from_bits(bits as u64)))));
                 }
             }
         }
+        lambda_jit::maybe_report();
     }
     thread.refill_pools_from_shared(
         &shared.mem.operand_stack_pool,
