@@ -2559,6 +2559,11 @@ impl VmHeap {
             // `sweep_skipped=0` swept the whole registry on every young cycle, so
             // the floor never moved and the O(young) sweep is not happening.
             let (skipped, floor, old_live) = h.nursery_stats();
+            let (nursery_fired, nursery_budget) = h.nursery_trigger_stats();
+            eprintln!(
+                "[GC] zgc-nursery-trigger: fired={nursery_fired}                  budget_bytes={nursery_budget} promotions_by_slide={}",
+                h.promotions_by_slide(),
+            );
             eprintln!(
                 "[GC] zgc-nursery: sweep_skipped={skipped} floor={floor}                  old_live_bytes={old_live}",
             );
