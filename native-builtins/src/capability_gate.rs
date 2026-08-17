@@ -154,6 +154,31 @@ pub fn open_udp_gated(
     }
 }
 
+/// [`open_udp_gated`] for a WILDCARD bind, opening a dual-stack AF_INET6
+/// socket the way the JDK's `DatagramSocket` does.
+///
+/// `java.net.DatagramSocket` on JDK 25 is a `DatagramChannel` adaptor, so its
+/// wildcard constructors give an AF_INET6 socket with `IPV6_V6ONLY` off —
+/// measured, `new DatagramSocket().getLocalAddress()` is
+/// `/0:0:0:0:0:0:0:0` on HotSpot 25 and was `/0.0.0.0` here.
+///
+/// That mismatch is observable, and netty's
+/// `DnsNameResolverTest.testAddressAlreadyInUse` is where: it holds a port
+/// with a `DatagramSocket`, points a resolver at the same address, and
+/// asserts a `BindException`. With the socket on AF_INET and the resolver's
+/// channel on dual-stack AF_INET6, the two wildcards did not collide, the
+/// second bind SUCCEEDED, and the test saw a query timeout instead of the
+/// bind failure it was written to observe.
+pub fn open_udp_wildcard_dual_stack_gated(
+    ctx: &dyn NativeContext,
+    port: u16,
+) -> Result<FdId, FdCapabilityError> {
+    match ctx.vm_capabilities() {
+        Some(caps) => ctx.fd_table().open_udp_dual_stack_checked(&caps, port),
+        None => Ok(ctx.fd_table().open_udp_dual_stack_port(port)?),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Error translation
 // ---------------------------------------------------------------------------

@@ -138,6 +138,25 @@ fn open_udp_dual_stack_socket(port: u16) -> Result<std::net::UdpSocket, io::Erro
     }
 }
 
+/// The port of a WILDCARD `host:port` spec, in either family's spelling, or
+/// `None` for a specific address.
+///
+/// Both spellings have to count. `dc_socket_addr` renders the v4 wildcard as
+/// `0.0.0.0` and the v6 one as `[::]` (bracketed, since the caller appends
+/// `:{port}`), and a caller that recognised only the first would bind
+/// `bind(new InetSocketAddress("::", 0))` through the ordinary path — where
+/// `UdpSocket::bind` takes the platform's `IPV6_V6ONLY` default, which is ON
+/// for Windows. That is a v6-ONLY socket where HotSpot gives a dual-stack one:
+/// the same defect as the v4 case, arrived at from the other side.
+pub fn wildcard_bind_port(spec: &str) -> Option<u16> {
+    for prefix in ["0.0.0.0:", "[::]:", "[0:0:0:0:0:0:0:0]:"] {
+        if let Some(port) = spec.strip_prefix(prefix) {
+            return port.parse::<u16>().ok();
+        }
+    }
+    None
+}
+
 /// Render a datagram address the way the JDK's Java-visible API does:
 /// a v4-mapped v6 address (`::ffff:a.b.c.d`) becomes plain `a.b.c.d`.
 ///
@@ -152,6 +171,16 @@ fn open_udp_dual_stack_socket(port: u16) -> Result<std::net::UdpSocket, io::Erro
 /// The unspecified v6 address `::` is NOT mapped — HotSpot reports the v6
 /// wildcard as `/[0:0:0:0:0:0:0:0]` for a dual-stack socket, and collapsing it
 /// to `0.0.0.0` would contradict that.
+///
+/// # Do not "simplify" this to `to_ipv4()`
+///
+/// `Ipv6Addr::to_ipv4` also converts the deprecated **v4-COMPATIBLE** form
+/// (`::a.b.c.d`, i.e. any address whose first twelve bytes are zero), so it
+/// maps `::1` to `0.0.0.1`. That is not a hypothetical: it is bit-for-bit the
+/// transformation Apache MINA applies under `isIPv4CompatibleAddress()`, and
+/// it is what sent every netty DNS query to `0.0.0.1` in the defect this
+/// function was written for. `to_ipv4_mapped` accepts only `::ffff:a.b.c.d`,
+/// which is the only form that actually denotes an IPv4 peer.
 pub fn unmap_v4_mapped(addr: std::net::SocketAddr) -> std::net::SocketAddr {
     match addr {
         std::net::SocketAddr::V6(v6) => match v6.ip().to_ipv4_mapped() {
@@ -1583,11 +1612,16 @@ impl FileDescriptorTable {
     /// often, and a multicast join in particular is family-specific. This
     /// keeps the change to the caller that measurably needed it.
     pub fn open_udp_dual_stack(&self) -> Result<FdId, io::Error> {
+        self.open_udp_dual_stack_port(0)
+    }
+
+    /// [`open_udp_dual_stack`](Self::open_udp_dual_stack) on an explicit port.
+    pub fn open_udp_dual_stack_port(&self, port: u16) -> Result<FdId, io::Error> {
         let fd = self.next_fd.fetch_add(1, Ordering::Relaxed);
         if fd >= u32::MAX - 16 {
             return Err(io::Error::other("file descriptor limit exceeded"));
         }
-        let socket = open_udp_dual_stack_socket(0)?;
+        let socket = open_udp_dual_stack_socket(port)?;
         disable_udp_connreset(&socket);
         self.entries
             .write()
@@ -3458,6 +3492,21 @@ impl FileDescriptorTable {
         };
         caps.check(crate::capability::Capability::Network(scope))?;
         Ok(self.open_udp(bind_addr)?)
+    }
+
+    /// [`open_udp_dual_stack`](Self::open_udp_dual_stack) behind the same
+    /// network capability gate as [`open_udp_checked`](Self::open_udp_checked).
+    ///
+    /// The scope is the wildcard endpoint the socket will actually hold, so a
+    /// policy that would refuse `open_udp(Some("0.0.0.0:0"))` refuses this too.
+    pub fn open_udp_dual_stack_checked(
+        &self,
+        caps: &crate::capability::CapabilitySet,
+        port: u16,
+    ) -> Result<FdId, FdCapabilityError> {
+        let scope = crate::capability::Scope::endpoint_str(&format!("0.0.0.0:{port}"));
+        caps.check(crate::capability::Capability::Network(scope))?;
+        Ok(self.open_udp_dual_stack_port(port)?)
     }
 }
 

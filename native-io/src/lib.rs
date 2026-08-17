@@ -21667,9 +21667,7 @@ fn native_dc_bind(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
     // the second family — see `FileDescriptorTable::udp_rebind_dual_stack`.
     // HotSpot reports `/[0:0:0:0:0:0:0:0]:port` for both `bind(null)` and
     // `bind(new InetSocketAddress("0.0.0.0", 0))`, which is what this matches.
-    let wildcard_port = addr_str
-        .strip_prefix("0.0.0.0:")
-        .and_then(|p| p.parse::<u16>().ok());
+    let wildcard_port = cratonvm_native_api::fd_table::wildcard_bind_port(&addr_str);
     if let Some(existing) = dc_fd(ctx, this) {
         let rebound = match wildcard_port {
             Some(port) => ctx.fd_table().udp_rebind_dual_stack(existing, port, reuse),

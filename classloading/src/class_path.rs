@@ -408,6 +408,11 @@ pub struct ClassPath {
 /// load would trade a latency spike for the throughput win.
 const DIR_INDEX_MAX_ENTRIES: usize = 200_000;
 
+/// Companion bound to [`DIR_INDEX_MAX_ENTRIES`] on the other axis. The walk
+/// follows symlinks, so a directory cycle is reachable and the file cap alone
+/// would not stop it — a cycle of empty directories adds no files.
+const DIR_INDEX_MAX_DIRS: usize = 50_000;
+
 /// Per-archive memoized signing state for a signed JAR.
 ///
 /// Security fix (V3, unsigned-entry attack — JAR spec §"Signature
@@ -2445,6 +2450,13 @@ impl ClassPath {
             // was present.
             self.canonicalize_cache.lock().clear();
             self.root_canonical_cache.lock().clear();
+            // The directory index is keyed on the root path, and a root that
+            // comes back (a `URLClassLoader` closed and reopened over the same
+            // directory) must not be served from the set we walked last time.
+            // Clearing it costs one relazy walk per surviving root; keeping a
+            // stale set would let a retracted-then-recreated directory answer
+            // from contents that no longer exist.
+            self.dir_index.lock().clear();
             debug!("Dynamic classpath: retracted {removed} entrie(s) for {path}");
         }
         removed
@@ -2837,14 +2849,35 @@ impl ClassPath {
     /// [`DIR_INDEX_MAX_ENTRIES`] files — both mean "no index", and every
     /// lookup falls back to the syscall.
     ///
-    /// Symlinked subdirectories are NOT followed. The read path canonicalises
-    /// and refuses anything that escapes the root (see `find_class`), so an
-    /// index that listed a symlink target would only ever produce entries the
-    /// reader then rejects — and following one could walk an unbounded tree.
+    /// Symlinks ARE followed, and that is deliberate rather than permissive.
+    /// A symlinked entry left out of the index is a pass-1 miss that pass 2
+    /// resolves — and pass 2's success invalidates the index, so the NEXT
+    /// class under that symlink rebuilds the whole directory. Skipping
+    /// symlinks would therefore trade one `stat` per lookup for one full
+    /// directory walk per lookup, which is worse than the defect. Following
+    /// them costs a real `metadata` call only on the entries that are
+    /// symlinks; `file_type` answers the other 99.9% for free, out of the
+    /// `FIND_DATA` on Windows and `d_type` on Linux.
+    ///
+    /// Following symlinks means a directory cycle is reachable, so the walk is
+    /// bounded on BOTH axes: [`DIR_INDEX_MAX_ENTRIES`] files and
+    /// `DIR_INDEX_MAX_DIRS` directories. Hitting either abandons the index
+    /// (`None`), and every lookup on that entry falls back to the syscall —
+    /// the pre-index behaviour, never a hang.
+    ///
+    /// Indexing a symlink target is not a security decision: the read path
+    /// canonicalises and fail-closed refuses anything that escapes the root
+    /// (see `find_class`), and that check is unchanged. An index entry only
+    /// says "worth probing".
     fn build_dir_index(dir: &Path) -> Option<Arc<FxHashSet<Box<str>>>> {
         let mut set: FxHashSet<Box<str>> = FxHashSet::default();
         let mut stack = vec![(dir.to_path_buf(), String::new())];
+        let mut dirs_seen = 0usize;
         while let Some((current, prefix)) = stack.pop() {
+            dirs_seen += 1;
+            if dirs_seen > DIR_INDEX_MAX_DIRS {
+                return None;
+            }
             let reader = std::fs::read_dir(&current).ok()?;
             for entry in reader.flatten() {
                 let name = entry.file_name();
@@ -2855,12 +2888,18 @@ impl ClassPath {
                     rel.push('/');
                 }
                 rel.push_str(&name);
-                // `file_type` on the DirEntry is free on every platform this
-                // runs on (Windows carries it in the FIND_DATA, Linux in
-                // d_type), unlike `metadata`, which would re-stat each child
-                // and reintroduce the very syscalls this index removes.
                 let Ok(kind) = entry.file_type() else {
                     return None;
+                };
+                // Only a symlink needs the follow-through `metadata` stat.
+                let kind = if kind.is_symlink() {
+                    match entry.metadata() {
+                        Ok(md) => md.file_type(),
+                        // A dangling link is neither; skip it.
+                        Err(_) => continue,
+                    }
+                } else {
+                    kind
                 };
                 if kind.is_dir() {
                     stack.push((entry.path(), rel));

@@ -14140,9 +14140,11 @@ pub(crate) fn register_re7_datagram_socket(r: &mut NativeMethodRegistry) {
     r.register(ds, "<init>", "()V", |ctx, args| {
         let this = obj_arg(args, 0)?;
         // GAP I6 (UDP half): a datagram bind is a network authority too.
-        let fd = crate::capability_gate::open_udp_gated(&*ctx, Some("0.0.0.0:0")).map_err(|e| {
-            crate::capability_gate::translate_open_failure(e, |io| format!("UDP open: {io}"))
-        })?;
+        // DUAL-STACK wildcard, matching the JDK's DatagramChannel adaptor —
+        // see `open_udp_wildcard_dual_stack_gated`.
+        let fd = crate::capability_gate::open_udp_wildcard_dual_stack_gated(&*ctx, 0).map_err(
+            |e| crate::capability_gate::translate_open_failure(e, |io| format!("UDP open: {io}")),
+        )?;
         let port = ctx
             .fd_table()
             .udp_local_addr(fd)
@@ -14161,9 +14163,13 @@ pub(crate) fn register_re7_datagram_socket(r: &mut NativeMethodRegistry) {
     r.register(ds, "<init>", "(I)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let port = args.get(1).and_then(|v| v.as_int()).unwrap_or(0);
-        let addr_spec = format!("0.0.0.0:{port}");
-        // GAP I6 (UDP half).
-        let fd = crate::capability_gate::open_udp_gated(&*ctx, Some(&addr_spec)).map_err(|e| {
+        // GAP I6 (UDP half). Dual-stack, as above: `new DatagramSocket(port)`
+        // is a wildcard bind and the JDK's is AF_INET6 with V6ONLY off.
+        let fd = crate::capability_gate::open_udp_wildcard_dual_stack_gated(
+            &*ctx,
+            port.clamp(0, 65535) as u16,
+        )
+        .map_err(|e| {
             crate::capability_gate::translate_open_failure(e, |io| format!("UDP bind: {io}"))
         })?;
         let actual_port = ctx
@@ -14356,11 +14362,18 @@ pub(crate) fn register_re7_datagram_socket(r: &mut NativeMethodRegistry) {
                 // socket answers the wildcard, which is what the fd reports.
                 return Ok(Some(Value::Object(None)));
             }
+            // `udp_origin_split`, not a bare `rsplit_once(':')`: the split
+            // has to survive a v6 address. Since the wildcard socket is
+            // AF_INET6 the table reports `[::]:PORT`, and the naive split
+            // kept the BRACKETS — `getLocalAddress()` answered `/[::]` where
+            // HotSpot answers `/0:0:0:0:0:0:0:0`. `udp_origin_split` parses
+            // through `SocketAddr` first, so the host comes back as the
+            // address rather than as its textual wrapper.
             let addr = ctx
                 .fd_table()
                 .udp_local_addr(sd.fd as u32)
                 .ok()
-                .and_then(|s| s.rsplit_once(':').map(|(h, _)| h.to_string()))
+                .and_then(|s| udp_origin_split(&s).map(|(h, _)| h))
                 .unwrap_or_else(|| "0.0.0.0".to_string());
             // The UDP socket's own bound address, read back as numeric text.
             let ia = alloc_inet_address_unnamed(ctx, &addr)?;
@@ -14844,14 +14857,26 @@ pub(crate) fn register_re7_datagram_socket(r: &mut NativeMethodRegistry) {
             return Err(ioex("DatagramSocket: closed"));
         }
         let reuse = sd.reuse_address == 1;
+        // Same wildcard rule as the constructors: keep the dual stack.
+        let wildcard_port = cratonvm_native_api::fd_table::wildcard_bind_port(&spec);
         let fd = if sd.fd >= 0 {
             // Keep the fd id: it is this socket's identity in every side table.
-            ctx.fd_table()
-                .udp_rebind(sd.fd as u32, Some(&spec), reuse)
-                .map_err(|e| ioex(format!("DatagramSocket.bind: {e}")))?;
+            let rebound = match wildcard_port {
+                Some(port) => ctx
+                    .fd_table()
+                    .udp_rebind_dual_stack(sd.fd as u32, port, reuse),
+                None => ctx.fd_table().udp_rebind(sd.fd as u32, Some(&spec), reuse),
+            };
+            rebound.map_err(|e| ioex(format!("DatagramSocket.bind: {e}")))?;
             sd.fd
         } else {
-            let fd = crate::capability_gate::open_udp_gated(&*ctx, Some(&spec)).map_err(|e| {
+            let opened = match wildcard_port {
+                Some(port) => {
+                    crate::capability_gate::open_udp_wildcard_dual_stack_gated(&*ctx, port)
+                }
+                None => crate::capability_gate::open_udp_gated(&*ctx, Some(&spec)),
+            };
+            let fd = opened.map_err(|e| {
                 crate::capability_gate::translate_open_failure(e, |io| {
                     format!("DatagramSocket.bind: {io}")
                 })
@@ -14891,10 +14916,17 @@ pub(crate) fn register_re7_datagram_socket(r: &mut NativeMethodRegistry) {
             return Ok(None);
         };
         let (host, port) = read_socket_address_numeric(&*ctx, *sa)?;
-        let fd = crate::capability_gate::open_udp_gated(&*ctx, Some(&format!("{host}:{port}")))
-            .map_err(|e| {
-                crate::capability_gate::translate_open_failure(e, |io| format!("UDP bind: {io}"))
-            })?;
+        let opened = if host == "0.0.0.0" || host == "[::]" {
+            crate::capability_gate::open_udp_wildcard_dual_stack_gated(
+                &*ctx,
+                port.clamp(0, 65535) as u16,
+            )
+        } else {
+            crate::capability_gate::open_udp_gated(&*ctx, Some(&format!("{host}:{port}")))
+        };
+        let fd = opened.map_err(|e| {
+            crate::capability_gate::translate_open_failure(e, |io| format!("UDP bind: {io}"))
+        })?;
         let actual_port = ctx
             .fd_table()
             .udp_local_addr(fd)
