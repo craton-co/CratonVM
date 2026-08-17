@@ -3178,9 +3178,30 @@ impl ZgcRealHeap {
         // multi-megabyte allocation inside the pause being measured.
         let bases = registered.bases();
         let n_registered = bases.len();
+        // IS THIS WALK DEAD WORK? The anatomy says it is 94-96% of the
+        // mark-start pause (34 ms of 35 on a 6.6M-entry registry, 66 of 69 on a
+        // 10.8M one), so the question is worth one counter.
+        //
+        // The argument that it is redundant: the sweep already visits every
+        // registered object and clears `GC_FLAG_MARKED` on every survivor,
+        // zeroes every corpse, and clears the bit even on the object it refuses
+        // to size. Objects allocated after that sweep are born with clear flags
+        // and `allocate_black_if_marking` is a no-op with no cycle open. So on
+        // the ordinary path nothing should carry a stale bit into mark start.
+        //
+        // The argument that it is NOT: `abandon_concurrent_mark` leaves whatever
+        // the partial trace marked, and no sweep follows it.
+        //
+        // `stale` distinguishes those two without guessing. Counted under
+        // `--verbose:gc` only; the clear itself is unchanged either way, so this
+        // is a pure observation.
+        let mut stale = 0usize;
         for base in bases {
-            self.header_mut(base as *mut u8)
-                .clear_gc_flags(GC_FLAG_MARKED);
+            let h = self.header_mut(base as *mut u8);
+            if armed && h.gc_flags() & GC_FLAG_MARKED != 0 {
+                stale += 1;
+            }
+            h.clear_gc_flags(GC_FLAG_MARKED);
         }
         let clearbits_us = clock.lap();
 
@@ -3209,8 +3230,8 @@ impl ZgcRealHeap {
             eprintln!(
                 "[GC] zgc-markstart: pause_us={} snapshot_us={snapshot_us} \
                  clearbits_us={clearbits_us} poolspawn_us={pool_us} roots_us={roots_us} \
-                 registered={n_registered} roots={} marked_roots={marked_roots} \
-                 workers={workers}",
+                 registered={n_registered} stale_marked={stale} roots={} \
+                 marked_roots={marked_roots} workers={workers}",
                 t0.elapsed().as_micros(),
                 roots.len(),
             );
