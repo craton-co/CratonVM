@@ -44,8 +44,8 @@ Two 2 µs reads is the whole of a `writeByte`:
 | --- | ---: |
 | HotSpot 25, C2 | 2.2 |
 | HotSpot 25, `-Xint` | ~2 030 |
-| CratonVM, before | 2 440 |
-| CratonVM, after | **368** |
+| CratonVM, before | 2 440–2 578 |
+| CratonVM, after | **368–654** |
 
 ## 2. The defect
 
@@ -151,7 +151,7 @@ undone. Migrated, plus `class_name_arc_of_id` in place of
 `class_name_of_id` (which copied the class name into a fresh `String` on every
 `update`).
 
-`update(byte[],0,64)`: **~1 100–1 500 ns → 332 ns.**
+`update(byte[],0,64)`: **1 519–1 529 ns → 315–320 ns**, interleaved, twice.
 
 ## 4. What it is worth, measured
 
@@ -162,12 +162,19 @@ Microbenchmarks, `regression-suite`-style loops, ABBA-interleaved on one host
 | --- | ---: | ---: | ---: |
 | `VarHandle.get` (int field) | 1 979 ns | **155 ns** | 12.8× |
 | `VarHandle.getAcquire` | 1 991 ns | 154 ns | 12.9× |
-| netty `ByteBuf.writeByte` | 2 440 ns | **368 ns** | 6.6× |
-| `MessageDigest.update(byte[],0,64)` | ~1 300 ns | 332 ns | ~3.9× |
+| netty `ByteBuf.writeByte` | 2 440 / 2 578 ns | **368 / 654 ns** | 6.6× / 4.0× |
+| `MessageDigest.update(byte[],0,64)` | 1 519–1 529 ns | 315–320 ns | 4.8× |
 | plain `obj.field` read (control) | 3.0 ns | 3.0 ns | — |
 | user-written 5-deep call chain (control) | 147 ns | 147 ns | — |
 
 The two controls are the point: nothing generic got faster. One call shape did.
+
+`writeByte` carries two figures because it was measured twice — interleaved
+against the `base` arm both times, once at host load ~9 and once at ~20. The
+"after" arm degrades more under load than the "before" arm does, so **quote the
+pair, not one ratio**. `MessageDigest.update(byte)`, the single-byte overload,
+is *not* in this table: it sits at the ordinary native-dispatch floor
+(~170-210 ns before and after) and this change does not touch it.
 
 Class-level, whole suite classes, same host, `-Xmx 1500m`, no per-method cap so
 the class completes rather than being clipped. **Read the CPU column**: this box

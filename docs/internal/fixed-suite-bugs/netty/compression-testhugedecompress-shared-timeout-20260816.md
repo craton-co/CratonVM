@@ -15,13 +15,15 @@ therefore cached a permanent refusal for every one of them. See
 
 | | before | after |
 | --- | ---: | ---: |
-| `ByteBuf.writeByte` (microbenchmark) | 2 440 ns | **368 ns** |
+| `ByteBuf.writeByte` (microbenchmark) | 2 440–2 578 ns | **368–654 ns** |
 | `JdkZlibIntegrationTest#testHugeDecompress`, solo, no per-method cap | 1 063 s | **455–528 s** |
 
 **What that does and does not settle.** The root-cause analysis below stands in
 every structural respect — one shared base-class method, `testHugeDecompress`,
 inherited by all eleven classes, building 256 MiB one byte at a time — and the
-per-iteration cost of that loop has come down 6.6×. It is still not under the
+per-iteration cost of that loop has come down 4.0–6.6× (the spread is host
+load, not the change; both arms were interleaved in each measurement). It is
+still not under the
 suite's 180 s per-class cap. The residual is `MessageDigest.update(byte)` (268 M
 single-byte SHA-256 updates on the compress side and 268 M more on the
 decompress side, at the ~170 ns native-dispatch floor) plus the codec work
@@ -38,7 +40,7 @@ have sent the next reader to the wrong workstream is corrected above.
 One adjacent fix landed from the same profile:
 `MessageDigest.update(byte[], off, len)` was reading the array one element at a
 time through the collector's generic accessor; it now bulk-copies
-(~1 300 ns → 332 ns for a 64-byte update), which is the `update` overload the
+(1 519 ns → 315 ns for a 64-byte update), which is the `update` overload the
 codecs themselves use.
 
 ---
