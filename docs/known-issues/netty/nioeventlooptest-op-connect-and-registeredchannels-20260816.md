@@ -75,7 +75,8 @@ inconsistently with the registration completion signal.
 
 ## Not the two existing FIXED docs
 
-Two docs under `docs/internal/fixed-suite-bugs/netty/` mention this class, but
+Two docs under `fixed-suite-bugs/netty/` in the internal record tree mention
+this class, but
 neither is about either failure above:
 
 * `ea-flag-ignored-so-assert-never-fires-20260812-FIXED.md` — a 123-class
@@ -106,5 +107,5 @@ printf 'io.netty.channel.nio.NioEventLoopTest\n' > /tmp/one.txt
 
 ## Related
 
-* `docs/internal/fixed-suite-bugs/netty/ea-flag-ignored-so-assert-never-fires-20260812-FIXED.md`
-* `docs/internal/fixed-suite-bugs/netty/unsafe-memory-access-property-flips-netty-to-unsafe-paths-20260812-FIXED.md`
+* `fixed-suite-bugs/netty/ea-flag-ignored-so-assert-never-fires-20260812-FIXED.md`
+* `fixed-suite-bugs/netty/unsafe-memory-access-property-flips-netty-to-unsafe-paths-20260812-FIXED.md`

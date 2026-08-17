@@ -11,7 +11,7 @@ Deliberately not fixed: the obvious cheap fix closes one of the five errors and
 makes the other four *worse* rather than better. See "Fixing it".
 
 Same family as
-[`../../internal/fixed-suite-bugs/h2-suite-bugs/bug-h2-testscript-parsedatetime-german-locale-month-name-FIXED-20260816.md`](../../internal/fixed-suite-bugs/h2-suite-bugs/bug-h2-testscript-parsedatetime-german-locale-month-name-FIXED-20260816.md)
+`fixed-suite-bugs/h2-suite-bugs/bug-h2-testscript-parsedatetime-german-locale-month-name-FIXED-20260816.md`
 — that one was CratonVM answering `java.time`'s calendar-field-name queries for
 English only; this one is CratonVM answering `Locale`'s display-name queries for
 no language at all. That record names these failures as out of its scope; this

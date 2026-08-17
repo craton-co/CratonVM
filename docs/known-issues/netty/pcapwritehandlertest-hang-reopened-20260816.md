@@ -7,7 +7,7 @@ ZGC in a same-day full 657-class 3-collector suite run; this page isolates it
 concurrently) and cross-checks against HotSpot 25 on the same host.
 
 This class was previously RESOLVED — see
-`docs/internal/fixed-suite-bugs/netty-pcap-write-handler-udp-bind-and-tcp-close-FIXED-20260813.md`
+`fixed-suite-bugs/netty-pcap-write-handler-udp-bind-and-tcp-close-FIXED-20260813.md`
 (from here on, "the FIXED doc"), which reported the class going from 18/25 to
 25/25 (24/25 on a loaded box) after fixing three residuals: a UDP
 `bind()`-breaks-fd-identity defect that silently dropped all inbound
@@ -107,6 +107,6 @@ printf 'io.netty.handler.pcap.PcapWriteHandlerTest\n' > /tmp/one.txt
 
 ## Related
 
-* `docs/internal/fixed-suite-bugs/netty-pcap-write-handler-udp-bind-and-tcp-close-FIXED-20260813.md`
+* `fixed-suite-bugs/netty-pcap-write-handler-udp-bind-and-tcp-close-FIXED-20260813.md`
   — the original fix this page believes has regressed; its §1c/§2/§6 repro
   snippets are the fastest path to confirming which mechanism broke.
