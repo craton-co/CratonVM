@@ -177,6 +177,17 @@ struct HttpsPeerInfo {
     /// JSSE spelling (see `t27_tls`'s `suite_to_java_cipher_name`), not
     /// rustls's `Debug` spelling.
     cipher: String,
+    /// The CONNECTION-level view of this exchange has been torn down — see
+    /// [`https_recycle_carrier`]. The entry is kept rather than removed for one
+    /// load-bearing reason: [`https_ensure_exchanged`] treats "no entry" as
+    /// "this connection has never handshaked" and drives a fresh exchange, so
+    /// removing the entry would make the very next accessor re-issue the HTTPS
+    /// request over the network and repopulate the table — the accessor would
+    /// answer again, and it would have made a second request to do it.
+    ///
+    /// A `record_https_peer_info` for the same carrier clears it: a connection
+    /// that was recycled and then genuinely re-handshaked is open again.
+    recycled: bool,
 }
 
 /// Peer info per connection object, keyed by identity hash.
@@ -205,8 +216,57 @@ fn record_https_peer_info(
         HttpsPeerInfo {
             chain_der: chain_der.to_vec(),
             cipher: cipher.to_string(),
+            recycled: false,
         },
     );
+}
+
+/// Tear down the CONNECTION-level view of a completed `https:` exchange, the
+/// way HotSpot does when the connection leaves the application's hands.
+///
+/// MEASURED, HotSpot 25.0.3+9-LTS (`scratchpad/g7/TlsProbe.java`, transcribed
+/// in `G7-1` §1d): after `disconnect()` all six `HttpsURLConnection` session
+/// accessors throw `IllegalStateException: connection not yet open` again — the
+/// same exception, with the same message, that a never-handshaked connection
+/// throws. The message describes the STATE and not the call order, which is why
+/// the pre-connect and post-disconnect rows are identical. CratonVM kept
+/// answering for the life of the carrier object.
+///
+/// Both tables are torn down, because the six accessors read from two of them
+/// (`G7-1` §5.1): the five this file owns read [`https_peer_info`], and
+/// `getSSLSession` — the one name this file deliberately does not register —
+/// reads `net_phase_e`'s `https_carrier_sessions`. Recycling one and not the
+/// other would leave the six disagreeing about whether the connection is open,
+/// which is the split that table comment warns about made real.
+///
+/// `forget_https_carrier_session` is called UNCONDITIONALLY, not only when this
+/// file's table has an entry. The two populators do not agree on when they
+/// fire: `record_https_peer_info` early-returns for an empty peer chain, while
+/// `record_https_carrier_session` runs on every completed handshake, so an
+/// anonymous-suite exchange has a carrier session and no peer info. Gating the
+/// release on this table would leak exactly those.
+///
+/// It is also the first call site `net_phase_e::forget_https_carrier_session`
+/// has ever had, and therefore the first time anything is removed from
+/// `https_carrier_sessions` — which, since `aed6a3b73`, also holds a global
+/// root on one `SSLSession` per entry. Until now that table grew by one entry
+/// per HTTPS carrier for the life of the process.
+fn https_recycle_carrier(ctx: &mut dyn NativeContext, this: ObjectRef) {
+    let key = ctx.identity_hash_code(this) as u32 as u64;
+    // Scoped, and NOT written as `if let Some(..) = https_peer_info().lock()
+    // ...`: under Rust 2021's drop rules the guard produced in an `if let`
+    // scrutinee lives to the end of the block, so the process-global lock would
+    // still be held across the `forget_https_carrier_session` call below —
+    // which takes another process-global lock and can release a GC root. That
+    // is the "native holds a lock across a call that re-enters the VM" cycle
+    // this workspace has already paid for once.
+    {
+        let mut table = https_peer_info().lock().unwrap();
+        if let Some(info) = table.get_mut(&key) {
+            info.recycled = true;
+        }
+    }
+    crate::net_phase_e::forget_https_carrier_session(ctx, this);
 }
 
 /// Make sure the exchange that produces the handshake info has actually run.
@@ -225,6 +285,13 @@ fn record_https_peer_info(
 /// `SSLPeerUnverifiedException`, and the caller below raises that when the
 /// table is still empty. A connect failure surfaces properly on the next
 /// `getResponseCode`/`getInputStream`.
+///
+/// The early return below is `contains_key`, deliberately NOT
+/// "contains a live entry": a RECYCLED carrier must not re-issue its request.
+/// That is why [`https_recycle_carrier`] flips a flag instead of removing the
+/// row — remove it and this function would drive a second HTTPS exchange on the
+/// next accessor call, repopulate the table, and answer as if the connection
+/// had never been torn down.
 fn https_ensure_exchanged(ctx: &mut dyn NativeContext, this: ObjectRef) {
     if https_peer_info()
         .lock()
@@ -297,10 +364,19 @@ fn https_not_yet_open(ctx: &mut dyn NativeContext) -> MethodCallFailed {
 /// exchange never completed (`connection not yet open`); an entry with an empty
 /// chain means it did and the peer presented nothing
 /// (`peer not authenticated`).
+///
+/// A RECYCLED entry answers `false`, not `true`. It records that a handshake
+/// once happened, which is not the question — the question is whether this
+/// CONNECTION is open now, and after [`https_recycle_carrier`] it is not. See
+/// that function for HotSpot's measured post-`disconnect()` transcript.
 fn https_has_session(ctx: &mut dyn NativeContext, this: ObjectRef) -> bool {
     https_ensure_exchanged(ctx, this);
     let key = ctx.identity_hash_code(this) as u32 as u64;
-    https_peer_info().lock().unwrap().contains_key(&key)
+    https_peer_info()
+        .lock()
+        .unwrap()
+        .get(&key)
+        .is_some_and(|info| !info.recycled)
 }
 
 /// The peer chain recorded for `this`, or the measured refusal for the state
@@ -312,10 +388,16 @@ fn https_peer_chain_or_throw(
 ) -> Result<Vec<Vec<u8>>, MethodCallFailed> {
     https_ensure_exchanged(ctx, this);
     let key = ctx.identity_hash_code(this) as u32 as u64;
+    // A recycled entry is filtered out here rather than matched below, so it
+    // lands on the `None` arm — `IllegalStateException: connection not yet
+    // open`, which is HotSpot's measured post-`disconnect()` answer, and NOT
+    // `SSLPeerUnverifiedException`, which would claim the connection is open
+    // and the peer anonymous.
     let found = https_peer_info()
         .lock()
         .unwrap()
         .get(&key)
+        .filter(|info| !info.recycled)
         .map(|info| info.chain_der.clone());
     match found {
         Some(chain) if !chain.is_empty() => Ok(chain),
@@ -446,10 +528,14 @@ fn register_https_session_accessors(r: &mut NativeMethodRegistry, cls: &str) {
         let this = obj_arg(args, 0)?;
         https_ensure_exchanged(ctx, this);
         let key = ctx.identity_hash_code(this) as u32 as u64;
+        // `filter` before `map`: a recycled connection has no cipher suite to
+        // report, and falls through to the refusal below. See
+        // `https_recycle_carrier`.
         let cipher = https_peer_info()
             .lock()
             .unwrap()
             .get(&key)
+            .filter(|i| !i.recycled)
             .map(|i| i.cipher.clone());
         match cipher {
             Some(c) if !c.is_empty() => Ok(Some(Value::Object(Some(ctx.create_string(&c))))),
@@ -2622,61 +2708,60 @@ fn huc_verify_hostname(
     let verifier_pin = ctx.pin_native_root(verifier0);
     let host_s0 = ctx.create_string(host);
     let host_pin = ctx.pin_native_root(host_s0);
-    let proto_s0 = ctx.create_string(protocol);
-    let proto_pin = ctx.pin_native_root(proto_s0);
-    let cipher_s0 = ctx.create_string(cipher);
-    let cipher_pin = ctx.pin_native_root(cipher_s0);
-    // The client `SSLSession` shape (`new13_alloc_ssl_session`'s — 4 fields
-    // since E42; the width is `NEW13_SSL_SESS_FIELDS` and must stay that
-    // constant, because `t27_tls`'s slot rules are keyed on it), so the
-    // layout-aware real-mode accessors in `t27_tls::register_ssl_session_real`
-    // read it correctly: `getProtocol`/`getCipherSuite` from these slots,
-    // `getPeerCertificates` from the side table populated just below. A
-    // pinning verifier calls exactly that pair.
-    let session0 = try_alloc_concurrent_synthetic(
-        ctx,
-        "javax/net/ssl/SSLSession",
-        crate::phases_late::ssl_security::NEW13_SSL_SESS_FIELDS,
-    )
-    .map_err(|_| "--jdk-only refused javax/net/ssl/SSLSession".to_string())?;
-    let session_pin = ctx.pin_native_root(session0);
 
-    let proto_s = ctx.read_native_pin(proto_pin, proto_s0);
-    let session = ctx.read_native_pin(session_pin, session0);
-    ctx.set_field(
-        session,
-        crate::phases_late::ssl_security::NEW13_SESS_PROTO,
-        Value::Object(Some(proto_s)),
-    );
-    let cipher_s = ctx.read_native_pin(cipher_pin, cipher_s0);
-    let session = ctx.read_native_pin(session_pin, session0);
-    ctx.set_field(
-        session,
-        crate::phases_late::ssl_security::NEW13_SESS_CIPHER,
-        Value::Object(Some(cipher_s)),
-    );
-    // This session is handed to a HostnameVerifier from the far side of a
-    // handshake that COMPLETED — `verify()` is called to decide whether to
-    // ACCEPT the peer, which is a separate question from whether anything was
-    // negotiated (see STEP 0's comment above, and the real JDK, which records
-    // the session either way). So slot 2 must not carry the "never negotiated"
-    // sentinel `-1`: `t27_tls::session_has_negotiated` reads exactly this slot,
-    // and a verifier that asks `session.isValid()` or `session.getId()` — the
-    // two accessors that predicate decides — would be told the handshake it was
-    // invoked to vet had not happened.
+    // G44 N1 — HAND THE VERIFIER **THE** SESSION, NOT A SECOND ONE.
     //
-    // See `net_phase_e::HTTPS_CLIENT_SESSION_MARKER` for the measured HotSpot
-    // contract, for why this connection cannot be given a real `servlet` TLS id,
-    // and for why the marker's numeric value is not free to choose. Shared with
-    // `net_phase_e::https_session_object`, the other minter of this shape, so
-    // the two cannot drift apart.
-    ctx.set_field(
-        session,
-        crate::phases_late::ssl_security::NEW13_SESS_TLSID,
-        Value::Int(crate::net_phase_e::HTTPS_CLIENT_SESSION_MARKER),
-    );
-    let session = ctx.read_native_pin(session_pin, session0);
-    crate::t27_tls::record_client_peer_chain(ctx, session, peer_chain_der);
+    // MEASURED, `RSslLiveSession` on `9ae371468`:
+    //
+    // ```text
+    // CK RSslLiveSession verifier.sameObjectAsGetSSLSession = false  WANT true
+    // ```
+    //
+    // HotSpot hands `HostnameVerifier.verify` the same `SSLSession` object
+    // that `HttpsURLConnection.getSSLSession()` returns afterwards. This call
+    // site used to mint its OWN — the same four `set_field` calls that
+    // `net_phase_e::https_session_object` makes, deliberately sharing
+    // `HTTPS_CLIENT_SESSION_MARKER` so the two could not drift — and two
+    // minters cannot produce one object however identical their writes are.
+    //
+    // `https_carrier_session_object` is that one minter behind its one
+    // per-carrier cache. STEP 0 above ran `record_https_carrier_session` on
+    // this very connection BEFORE the built-in check's early return, so by the
+    // time control reaches here the entry always exists and this is the fast
+    // path; the local mint below survives only for the two states in which it
+    // does not:
+    //
+    //   * `None`      — no carrier at all (`connection` is `None`, which is how
+    //                   `perform` calls this for a request with no
+    //                   `HttpsURLConnection` object behind it), or no recorded
+    //                   handshake. NOT an error; see the exposed function's
+    //                   own doc.
+    //   * `Some(Err)` — the `javax/net/ssl/SSLSession` allocation was refused.
+    //
+    // Keeping the fallback rather than propagating is deliberate: an installed
+    // verifier that is not consulted is a SECURITY change, and this lane is
+    // fixing an identity row, not the decision the verifier makes.
+    let carrier_session =
+        match connection.and_then(|c| crate::net_phase_e::https_carrier_session_object(ctx, c)) {
+            Some(Ok(session)) => Some(session),
+            _ => None,
+        };
+    let session0 = match carrier_session {
+        Some(session) => session,
+        None => match huc_mint_verifier_session(ctx, protocol, cipher, peer_chain_der) {
+            Ok(session) => session,
+            // The pins taken above are released on THIS exit too. The
+            // `map_err(..)?` this replaces returned straight out of the
+            // function with `verifier_pin` and `host_pin` still on the pin
+            // stack — a leak on the one path that already had nothing to
+            // hand back.
+            Err(message) => {
+                ctx.unpin_native_roots(verifier_pin);
+                return Err(message);
+            }
+        },
+    };
+    let session_pin = ctx.pin_native_root(session0);
 
     let verifier = ctx.read_native_pin(verifier_pin, verifier0);
     let host_s = ctx.read_native_pin(host_pin, host_s0);
@@ -2702,6 +2787,89 @@ fn huc_verify_hostname(
              verifying <{host}>; treating the peer as unverified"
         )),
     }
+}
+
+/// The private `SSLSession` [`huc_verify_hostname`] used to mint on EVERY
+/// verified connection, kept as the fallback for the two states in which the
+/// one per-carrier session is not available (see the G44 N1 comment at that
+/// call site).
+///
+/// The four writes are unchanged and deliberately still the same four
+/// `net_phase_e::https_session_object` makes, sharing
+/// [`net_phase_e::HTTPS_CLIENT_SESSION_MARKER`] so the two shapes cannot drift.
+/// What changed is how OFTEN this runs: it is now the exception rather than the
+/// rule, and a session minted here is by construction NOT the one
+/// `getSSLSession()` will answer with — which is exactly the row N1 closes, and
+/// is why every state that can reach the carrier's session must reach it
+/// instead of coming here.
+///
+/// Slot 2 must not carry the "never negotiated" sentinel `-1`: this session
+/// comes from the far side of a handshake that COMPLETED — `verify()` decides
+/// whether to ACCEPT the peer, a separate question from whether anything was
+/// negotiated — and `t27_tls::session_has_negotiated` reads exactly this slot,
+/// so a verifier that asks `session.isValid()` or `session.getId()` would
+/// otherwise be told the handshake it was invoked to vet had not happened.
+///
+/// GC: every allocated value has to survive the allocations that follow it, so
+/// each is pinned and re-read. The batch is released from THIS function's own
+/// base before returning, which truncates only the pins taken here — the
+/// caller's `verifier_pin`/`host_pin` sit below it and are untouched. There is
+/// no allocation between the final `read_native_pin` and the `return`, so the
+/// address handed back is current.
+fn huc_mint_verifier_session(
+    ctx: &mut dyn NativeContext,
+    protocol: &str,
+    cipher: &str,
+    peer_chain_der: Vec<Vec<u8>>,
+) -> Result<ObjectRef, String> {
+    let proto_s0 = ctx.create_string(protocol);
+    let proto_pin = ctx.pin_native_root(proto_s0);
+    let cipher_s0 = ctx.create_string(cipher);
+    let cipher_pin = ctx.pin_native_root(cipher_s0);
+    // The client `SSLSession` shape (`new13_alloc_ssl_session`'s — 4 fields
+    // since E42; the width is `NEW13_SSL_SESS_FIELDS` and must stay that
+    // constant, because `t27_tls`'s slot rules are keyed on it), so the
+    // layout-aware real-mode accessors in `t27_tls::register_ssl_session_real`
+    // read it correctly: `getProtocol`/`getCipherSuite` from these slots,
+    // `getPeerCertificates` from the side table populated just below. A
+    // pinning verifier calls exactly that pair.
+    let session0 = match try_alloc_concurrent_synthetic(
+        ctx,
+        "javax/net/ssl/SSLSession",
+        crate::phases_late::ssl_security::NEW13_SSL_SESS_FIELDS,
+    ) {
+        Ok(session) => session,
+        Err(_) => {
+            ctx.unpin_native_roots(proto_pin);
+            return Err("--jdk-only refused javax/net/ssl/SSLSession".to_string());
+        }
+    };
+    let session_pin = ctx.pin_native_root(session0);
+
+    let proto_s = ctx.read_native_pin(proto_pin, proto_s0);
+    let session = ctx.read_native_pin(session_pin, session0);
+    ctx.set_field(
+        session,
+        crate::phases_late::ssl_security::NEW13_SESS_PROTO,
+        Value::Object(Some(proto_s)),
+    );
+    let cipher_s = ctx.read_native_pin(cipher_pin, cipher_s0);
+    let session = ctx.read_native_pin(session_pin, session0);
+    ctx.set_field(
+        session,
+        crate::phases_late::ssl_security::NEW13_SESS_CIPHER,
+        Value::Object(Some(cipher_s)),
+    );
+    ctx.set_field(
+        session,
+        crate::phases_late::ssl_security::NEW13_SESS_TLSID,
+        Value::Int(crate::net_phase_e::HTTPS_CLIENT_SESSION_MARKER),
+    );
+    let session = ctx.read_native_pin(session_pin, session0);
+    crate::t27_tls::record_client_peer_chain(ctx, session, peer_chain_der);
+    let session = ctx.read_native_pin(session_pin, session0);
+    ctx.unpin_native_roots(proto_pin);
+    Ok(session)
 }
 
 /// HotSpot's refusal when an application `HostnameVerifier` was consulted and
@@ -4348,6 +4516,12 @@ pub(crate) fn huc_get_content_length_long(
 
 fn huc_disconnect(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
+    // MEASURED, HotSpot (`G7-1` §1d): after `disconnect()` every one of the six
+    // `HttpsURLConnection` session accessors throws `IllegalStateException:
+    // connection not yet open` again. Before both carrier shapes are handled
+    // below, because the session tables are keyed on the carrier's identity and
+    // are the same tables for both.
+    https_recycle_carrier(ctx, this);
     // Real carrier: clear identity-keyed side-table state, never write synthetic
     // slots (they alias real fields on a real-JDK object).
     if is_real_carrier(ctx, this) {
@@ -5048,6 +5222,192 @@ mod http_url_connection_tests {
              `if builtin.is_ok()` early return at body line {early_return} — that is the \
              path every successful request takes, so the capture would only ever fire for \
              connections whose hostname check FAILED. Move it back above STEP 1."
+        );
+    }
+
+    /// SOURCE WITNESS — G44 N1: the verifier gets THE carrier's session, and
+    /// the local mint is only ever the fallback.
+    ///
+    /// MEASURED, `RSslLiveSession` on `9ae371468`:
+    /// `verifier.sameObjectAsGetSSLSession = false  WANT true`. HotSpot hands
+    /// `HostnameVerifier.verify` the same object `getSSLSession()` returns
+    /// afterwards, and two minters cannot satisfy that however identical their
+    /// field writes are — which is why the fix is a lookup and not a fifth copy
+    /// of the same four `set_field` calls.
+    ///
+    /// Asserted against the source for the same reason the witness above is:
+    /// the difference between one object and two is only observable with a live
+    /// TLS peer, so no `MockNativeContext` test can see it. What IS checkable
+    /// here is the shape — that `huc_verify_hostname` consults
+    /// `https_carrier_session_object` and that the only remaining
+    /// `try_alloc_concurrent_synthetic` of a session in this file sits inside
+    /// the fallback helper, not in the verifier path itself.
+    #[test]
+    fn the_verifier_is_handed_the_carriers_session_not_a_second_one() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src")
+            .join("http_url_connection.rs");
+        let Ok(src) = std::fs::read_to_string(&path) else {
+            println!("http_url_connection.rs not on disk at {path:?}; witness skipped");
+            return;
+        };
+        let lines: Vec<&str> = src.lines().map(|l| l.trim_end_matches('\r')).collect();
+        let fn_start = lines
+            .iter()
+            .position(|l| l.starts_with("fn huc_verify_hostname("))
+            .expect("huc_verify_hostname must still exist");
+        let fn_end = lines
+            .iter()
+            .enumerate()
+            .skip(fn_start)
+            .find(|(_, l)| **l == "}")
+            .map(|(i, _)| i)
+            .expect("huc_verify_hostname must be terminated");
+        // CODE lines only. This function's body is more comment than code, and
+        // both assertions below would otherwise be satisfied — or broken — by
+        // prose that merely names the function.
+        let body: Vec<&str> = lines[fn_start..fn_end]
+            .iter()
+            .copied()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect();
+
+        assert!(
+            body.iter()
+                .any(|l| l.contains("https_carrier_session_object(")),
+            "huc_verify_hostname must ask net_phase_e for THE session this carrier already \
+             handed out. Minting a private one here is what made \
+             `verifier.sameObjectAsGetSSLSession` answer false."
+        );
+        assert!(
+            !body
+                .iter()
+                .any(|l| l.contains("try_alloc_concurrent_synthetic(")),
+            "huc_verify_hostname must not allocate an SSLSession itself — the fallback lives \
+             in huc_mint_verifier_session, so that the carrier's session is the DEFAULT and \
+             the private mint is the exception."
+        );
+    }
+
+    /// `disconnect()` tears down the connection-level view of BOTH https
+    /// session tables — and leaves this file's row in place rather than
+    /// deleting it.
+    ///
+    /// MEASURED, HotSpot (`G7-1` §1d): after `disconnect()` all six accessors
+    /// throw `IllegalStateException: connection not yet open` again, the same
+    /// exception a never-handshaked connection throws. Two halves are asserted
+    /// here because each is a separate way to get this wrong:
+    ///
+    ///   * the row must SURVIVE, flagged. Removing it would put
+    ///     `https_ensure_exchanged` back on its "never handshaked" path, and
+    ///     the very next accessor would re-issue the HTTPS request over the
+    ///     network and answer from the fresh entry — a wrong answer AND a
+    ///     second request;
+    ///   * `net_phase_e`'s carrier session must go, because `getSSLSession` is
+    ///     the one of the six that reads THAT table (`G7-1` §5.1). Recycling
+    ///     one table and not the other leaves the six disagreeing about whether
+    ///     the connection is open.
+    #[test]
+    fn disconnect_recycles_both_https_session_tables() {
+        let mut ctx = crate::test_utils::MockNativeContext::new();
+        let carrier = ctx.alloc_object(cratonvm_types::ClassId::new(0), 4);
+        let key = ctx.identity_hash_code(carrier) as u32 as u64;
+        let chain = vec![vec![0x30u8, 0x01, 0x02]];
+
+        record_https_peer_info(&ctx, Some(carrier), &chain, "TLS_AES_256_GCM_SHA384");
+        crate::net_phase_e::record_https_carrier_session(
+            &mut ctx,
+            carrier,
+            "TLSv1.3",
+            "TLS_AES_256_GCM_SHA384",
+            &chain,
+        );
+        assert!(
+            https_peer_info()
+                .lock()
+                .unwrap()
+                .get(&key)
+                .is_some_and(|i| !i.recycled),
+            "a completed exchange starts OPEN"
+        );
+
+        https_recycle_carrier(&mut ctx, carrier);
+
+        let table = https_peer_info().lock().unwrap();
+        let info = table
+            .get(&key)
+            .expect("the row must survive the recycle — see this test's doc comment");
+        assert!(info.recycled, "the row must be flagged, not merely present");
+        assert_eq!(
+            info.cipher, "TLS_AES_256_GCM_SHA384",
+            "recycling reports the connection closed; it does not forge the handshake's data"
+        );
+        drop(table);
+        assert!(
+            crate::net_phase_e::https_carrier_session_object(&mut ctx, carrier).is_none(),
+            "getSSLSession's table must have been evicted too, or five accessors report \
+             `connection not yet open` while the sixth still hands out a session"
+        );
+
+        // Idempotent: `disconnect()` is documented as callable twice, and the
+        // second call must not release a global root a second time.
+        https_recycle_carrier(&mut ctx, carrier);
+
+        // A connection that genuinely re-handshakes is OPEN again — the flag is
+        // cleared by the recorder, not sticky on the carrier's identity.
+        record_https_peer_info(&ctx, Some(carrier), &chain, "TLS_AES_128_GCM_SHA256");
+        assert!(
+            https_peer_info()
+                .lock()
+                .unwrap()
+                .get(&key)
+                .is_some_and(|i| !i.recycled),
+            "re-recording a handshake must clear the recycled flag"
+        );
+        https_peer_info().lock().unwrap().remove(&key);
+    }
+
+    /// SOURCE WITNESS — `https_ensure_exchanged`'s early return must stay a
+    /// presence test, not a liveness test.
+    ///
+    /// It is the one line that keeps a recycled carrier from re-issuing its
+    /// HTTPS request: "no entry" means "never handshaked, go and handshake". A
+    /// later change that made this read `.get(..).is_some_and(|i| !i.recycled)`
+    /// — which is exactly the shape the three ACCESSORS were just given, so it
+    /// looks like consistency — would drive a second network request from the
+    /// next accessor call and repopulate the table with a live entry.
+    #[test]
+    fn the_lazy_exchange_guard_is_a_presence_test_not_a_liveness_test() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src")
+            .join("http_url_connection.rs");
+        let Ok(src) = std::fs::read_to_string(&path) else {
+            println!("http_url_connection.rs not on disk at {path:?}; witness skipped");
+            return;
+        };
+        let lines: Vec<&str> = src.lines().map(|l| l.trim_end_matches('\r')).collect();
+        let fn_start = lines
+            .iter()
+            .position(|l| l.starts_with("fn https_ensure_exchanged("))
+            .expect("https_ensure_exchanged must still exist");
+        let fn_end = lines
+            .iter()
+            .enumerate()
+            .skip(fn_start)
+            .find(|(_, l)| **l == "}")
+            .map(|(i, _)| i)
+            .expect("https_ensure_exchanged must be terminated");
+        let body = &lines[fn_start..fn_end];
+
+        assert!(
+            body.iter().any(|l| l.contains("contains_key(")),
+            "https_ensure_exchanged's guard must be a plain presence test"
+        );
+        assert!(
+            !body.iter().any(|l| l.contains("recycled")),
+            "https_ensure_exchanged must NOT skip recycled rows — treating a recycled row as \
+             absent makes the next accessor re-issue the HTTPS request and answer from the \
+             fresh entry. The flag is read by the accessors, never by this guard."
         );
     }
 

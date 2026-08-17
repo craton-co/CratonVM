@@ -1731,6 +1731,52 @@ fn tls_stream_clear_id(ctx: &mut dyn NativeContext, this: ObjectRef) {
 // negotiated` in this file's test module fails loudly if the two ever part
 // company, so the co-requisite is enforced by the build and not by this
 // comment. See docs/known-issues/jdk-only/E42-1-*.md.
+//
+// ---------------------------------------------------------------------------
+// G44 — **DO NOT WIDEN THIS TO CARRY THE PEER HOST AND PORT.** The obvious fix
+// for four measured rows is the wrong one, and the width tables say so.
+//
+// MEASURED, `RSslLiveSession` on `9ae371468` (`C:/craton/target-rel3`):
+//
+// ```text
+// CK RSslLiveSession client.peerHost                  = null   WANT localhost
+// CK RSslLiveSession client.peerPort.isServerPort     = false  WANT true
+// CK RSslLiveSession attrs.shadow.peerHost            = null   WANT localhost
+// CK RSslLiveSession attrs.shadow.peerPort.isServerPort = false WANT true
+// ```
+//
+// `t27_tls`'s `getPeerHost`/`getPeerPort` read slot 3 and slot 4 on shapes of
+// width `>= 6` and fall back to `session_stream_id` -> `s2_tls_session_info`
+// otherwise. The HTTPS client session is width 4 and its slot 2 is
+// `net_phase_e::HTTPS_CLIENT_SESSION_MARKER`, which is chosen precisely so that
+// every socket-registry lookup MISSES — so the fallback cannot answer, by
+// design, and the rows are `null`/`-1`.
+//
+// Widening this constant does not fix them. Enumerated against the four
+// `t27_tls` readers that key on width, and against the fact that the NULL
+// session (`new13_alloc_null_ssl_session`) is minted from this same constant:
+//
+// | reader | at 4 (today) | at 6 | at 7 |
+// |---|---|---|---|
+// | `session_proto_slot` / `session_cipher_slot` | 0 / 1 | **1 / 0 — SWAPPED** | **1 / 0 — SWAPPED** |
+// | `sslsess_attrs_slot` | `Some(3)` | **`None`** — the attribute API silently becomes a no-op | `Some(6)` |
+// | `session_has_negotiated` | slot 2 `>= 0` | **`_ => true`** — the null session is valid again, which is E42's defect with the sign flipped | slot 2 `!= 0` |
+// | `getSessionContext`'s `engine_shape` (`>= 7`) | not engine | not engine | **engine — also requires membership in `negotiated_session_keys`, which only `engine_session_for` writes, so `getSessionContext()` would answer `null`** |
+//
+// Width 6 costs the attribute family and the null session; width 7 buys the two
+// endpoint slots and loses the three `*.sessionContext.isNull` rows that are
+// green today (`client`, `attrs.shadow`, `verifier`). Either way the swap in
+// row 1 silently reports the protocol as the cipher suite for every minter of
+// this shape. Four rows are not worth that, and a private width used by the
+// HTTPS minters alone would re-introduce the fifth width E42 retired.
+//
+// The fix that costs nothing here is a side table keyed on the SESSION OBJECT,
+// exactly like `t27_tls::record_client_peer_chain` — which already solves the
+// identical problem for the peer certificate chain on this same shape. That
+// puts the reader in `t27_tls` (two lines, ahead of the `session_stream_id`
+// fallback in each of `getPeerHost`/`getPeerPort`) and the writers in the two
+// HTTPS minters. It is NOMINATION N3 of
+// `docs/known-issues/jdk-only/G44-1-the-session-the-verifier-was-handed-20260817.md`.
 pub(crate) const NEW13_SSL_SESS_FIELDS: usize = 4;
 
 pub(crate) const NEW13_SESS_PROTO: usize = 0;
@@ -8750,6 +8796,34 @@ pub(crate) mod new13_tests {
             NEW13_SESS_ATTRS, NEW13_SESS_TLSID,
             "the whole point of the widening: `putValue` must not be able to \
              overwrite the stream id, which is also the negotiation signal"
+        );
+    }
+
+    /// G44 — **the width is load-bearing in `t27_tls`, and the two slot maps
+    /// must agree.** This is the enforcement behind the "DO NOT WIDEN" block on
+    /// [`NEW13_SSL_SESS_FIELDS`].
+    ///
+    /// `t27_tls::session_proto_slot`/`session_cipher_slot` derive the protocol
+    /// and cipher slots FROM THE WIDTH, and they SWAP at `>= 6`. So a lane that
+    /// widens this shape — the obvious move for `RSslLiveSession`'s
+    /// `client.peerHost`/`client.peerPort` rows, since `getPeerHost` reads slot
+    /// 3 on shapes of width `>= 6` — would silently make every minter of this
+    /// shape report its protocol as its cipher suite and vice versa. Asserted
+    /// against the live functions rather than against the number 4, so the test
+    /// keeps meaning what it says if the threshold in `t27_tls` moves instead.
+    #[test]
+    fn this_shapes_slot_map_is_the_one_t27_derives_from_its_width() {
+        assert_eq!(
+            crate::t27_tls::session_proto_slot(NEW13_SSL_SESS_FIELDS),
+            Some(NEW13_SESS_PROTO),
+            "widening this shape past t27_tls's `>= 6` boundary swaps the protocol and \
+             cipher slots. See the G44 block on NEW13_SSL_SESS_FIELDS: the peer host and \
+             port belong in a session-object-keyed side table, not in a wider object."
+        );
+        assert_eq!(
+            crate::t27_tls::session_cipher_slot(NEW13_SSL_SESS_FIELDS),
+            Some(NEW13_SESS_CIPHER),
+            "same boundary, other half of the pair"
         );
     }
 
