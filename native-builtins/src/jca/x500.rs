@@ -675,10 +675,12 @@ fn java_string_hash(s: &str) -> i32 {
     h
 }
 
-/// One AVA in RFC 1779 form, quoting the value when RFC 1779 requires it.
-fn rfc1779_ava(key: &str, value: &str) -> String {
+/// One AVA rendered with `keyword`'s type map, quoting the value when RFC 1779
+/// requires it. Shared by the RFC 1779 form and by `toString`, which differ ONLY
+/// in which types get a keyword.
+fn quoted_ava(key: &str, value: &str, keyword: fn(&str) -> Option<&'static str>) -> String {
     let oid = key_to_oid(key);
-    let ty = match rfc1779_keyword(&oid) {
+    let ty = match keyword(&oid) {
         Some(k) => k.to_string(),
         None => format!("OID.{oid}"),
     };
@@ -709,20 +711,39 @@ fn rfc1779_ava(key: &str, value: &str) -> String {
     format!("{ty}=\"{inner}\"")
 }
 
-/// The RFC 1779 form of a whole DN — RDNs separated by `", "`, AVAs inside one
-/// RDN by `" + "`. This is also what `X500Principal.toString()` prints.
-fn rfc1779_form(groups: &[Vec<(String, String)>]) -> String {
+/// A whole DN in one of the two `", "`-separated forms — RDNs separated by
+/// `", "`, AVAs inside one RDN by `" + "`.
+fn quoted_form(
+    groups: &[Vec<(String, String)>],
+    keyword: fn(&str) -> Option<&'static str>,
+) -> String {
     groups
         .iter()
         .map(|group| {
             group
                 .iter()
-                .map(|(k, v)| rfc1779_ava(k, v))
+                .map(|(k, v)| quoted_ava(k, v, keyword))
                 .collect::<Vec<_>>()
                 .join(" + ")
         })
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+/// The RFC 1779 form: only the seven RFC 1779 keywords, everything else
+/// `OID.<dotted>`.
+fn rfc1779_form(groups: &[Vec<(String, String)>]) -> String {
+    quoted_form(groups, rfc1779_keyword)
+}
+
+/// What `X500Principal.toString()` prints. Same layout and quoting as RFC 1779
+/// but the FULL keyword map — measured on HotSpot 25, `EMAILADDRESS=a@b.com`
+/// where `getName(RFC1779)` writes `OID.1.2.840.113549.1.9.1=a@b.com`, and the
+/// same for `T`/`GIVENNAME`/`SURNAME`/`UID`/`DC`/`SERIALNUMBER`. bc-java's
+/// `AttrCertTest` compares this string literally, including the
+/// `EMAILADDRESS=mlorch@vt.edu` tail.
+fn to_string_form(groups: &[Vec<(String, String)>]) -> String {
+    quoted_form(groups, |oid| oid_to_name(oid))
 }
 
 /// The stored RFC 2253 string of `this`, re-parsed into RDN groups.
@@ -939,16 +960,16 @@ pub fn register(r: &mut NativeMethodRegistry) {
         },
     );
 
-    // toString() -> String. The JDK's is `thisX500Name.toString()`, which is
-    // the RFC 1779 rendering (quoting and all), NOT the RFC 2253 one — measured
-    // on HotSpot 25: `new X500Principal("CN=Good CA,O=Test Certificates,C=US")`
-    // prints `CN=Good CA, O=Test Certificates, C=US`.
+    // toString() -> String. The JDK's is `thisX500Name.toString()`: the `", "`
+    // layout with RFC 1779's quoting, but the FULL keyword map — NOT the RFC
+    // 2253 string this used to answer, and not `getName(RFC1779)` either. See
+    // `to_string_form`.
     r.register(cls, "toString", "()Ljava/lang/String;", |ctx, args| {
         let this = match args.first() {
             Some(Value::Object(Some(o))) => *o,
             _ => return Ok(Some(Value::Object(None))),
         };
-        let s = rfc1779_form(&grouped_of(ctx, this));
+        let s = to_string_form(&grouped_of(ctx, this));
         let so = ctx.create_string(&s);
         Ok(Some(Value::Object(Some(so))))
     });
