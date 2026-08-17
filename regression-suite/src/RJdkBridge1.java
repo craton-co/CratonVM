@@ -1,3 +1,4 @@
+import java.nio.CharBuffer;
 import java.text.Normalizer;
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
@@ -1943,7 +1944,16 @@ public class RJdkBridge1 {
         check(!Normalizer.isNormalized(mixed, Normalizer.Form.NFC),
                 "isNormalized must answer for the runs, not skip them");
 
-        sectionEnd("surrog", 33);
+        // CharBuffer is the ninth bridge class in this family. wrap(char[])
+        // hands back a HeapCharBuffer whose toString had the units in hand and
+        // lost them in the final conversion.
+        step("surrog", "CharBuffer.wrap(char[]).toString() with a lone surrogate");
+        String cbs = CharBuffer.wrap(new char[] {'a', (char) 0xD800, 'b'}).toString();
+        check(cbs.length() == 3 && cbs.charAt(1) == 0xD800,
+                "CharBuffer.wrap(char[]).toString() must carry the surrogate, got charAt(1)="
+                        + Integer.toHexString(cbs.charAt(1)));
+
+        sectionEnd("surrog", 34);
     }
 
     static final int SFF = 15;
