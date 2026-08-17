@@ -89,6 +89,23 @@ pub fn mirrors_for_loader(loader_addr: usize) -> Option<Vec<usize>> {
     }
 }
 
+/// Every pinned mirror address, for a marker that cannot ask per loader.
+///
+/// See [`crate::loader_pin::all_pinned_loaders`] for why a generational young
+/// cycle needs the wholesale form: it never visits an old loader, so it never
+/// reaches the per-loader lookup, and a mirror reachable only that way would be
+/// swept while its class is live.
+pub fn all_pinned_mirrors() -> Vec<usize> {
+    if !NON_EMPTY.load(Ordering::Relaxed) {
+        return Vec::new();
+    }
+    store()
+        .read()
+        .values()
+        .flat_map(|(_vm, mirrors)| mirrors.iter().copied())
+        .collect()
+}
+
 /// Replace the entire registry from an authoritative post-GC snapshot
 /// (`[(loader_addr, mirror_addr)]`, both already remapped to their
 /// post-collection addresses). Called once per GC cycle after `class_mirrors`

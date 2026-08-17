@@ -23698,10 +23698,13 @@ fn parallel_sort_double_slice(
             _ => 0.0,
         })
         .collect();
-    // `Arrays.sort` for doubles uses `Double.compare` which gives
-    // NaN > +inf (all NaNs sort to the end) and distinguishes +0 / -0.
-    // `f64::total_cmp` implements exactly that ordering.
-    buf.sort_by(|a, b| a.total_cmp(b));
+    // `Arrays.sort` for doubles uses `Double.compare`, which gives NaN > +inf
+    // (all NaNs sort to the end) and distinguishes +0 / -0. `f64::total_cmp`
+    // does NOT implement that ordering, whatever this comment used to claim: it
+    // is IEEE totalOrder, which sorts a negatively-signed NaN BELOW -infinity.
+    // `Math.sqrt(-1.0)` is `0xfff8…` on x86, so an array holding one came back
+    // with that element at the FRONT instead of the end.
+    buf.sort_by(|a, b| cratonvm_types::jfp::double_ordering(*a, *b));
     for (k, v) in buf.into_iter().enumerate() {
         ctx.set_array_element(arr, from + k, Value::Double(v));
     }

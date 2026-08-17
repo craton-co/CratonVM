@@ -1721,82 +1721,15 @@ const NEGATIVE_ZERO_DOUBLE_BITS: u64 = 0x8000_0000_0000_0000;
 /// Raw bits of `-0.0f`, matching `Math`'s own `negativeZeroFloatBits`.
 const NEGATIVE_ZERO_FLOAT_BITS: u32 = 0x8000_0000;
 
-/// `Double.doubleToLongBits` semantics: every NaN collapses to one pattern.
-///
-/// This is the difference between `doubleToLongBits` and `doubleToRawLongBits`,
-/// and `Double.compare`, `Double.equals` and `Double.hashCode` are all specified
-/// in terms of the FORMER. Using raw bits makes two NaNs with different payloads
-/// unequal, which is not an exotic case: `Math.sqrt(-1.0)` is `fff8…` on x86 —
-/// on HotSpot too — while the `Double.NaN` constant is `7ff8…`, so a test that
-/// asserts `assertEquals(Double.NaN, Math.sqrt(-1.0), 0.0)` passes on HotSpot
-/// and failed here, printing "expected: Double<NaN> but was: Double<NaN>".
-#[inline]
-pub(crate) fn double_to_long_bits_canonical(v: f64) -> u64 {
-    if v.is_nan() {
-        0x7ff8_0000_0000_0000
-    } else {
-        v.to_bits()
-    }
-}
-
-/// `Float.floatToIntBits` semantics — see the double version.
-#[inline]
-pub(crate) fn float_to_int_bits_canonical(v: f32) -> u32 {
-    if v.is_nan() {
-        0x7fc0_0000
-    } else {
-        v.to_bits()
-    }
-}
-
-/// `Double.compare`, transcribed.
-///
-/// `f64::total_cmp` is NOT this function. It implements IEEE 754 totalOrder,
-/// which deliberately ORDERS NaNs by sign and payload (`-NaN < -inf < … < +inf
-/// < +NaN`); Java canonicalizes first, so all NaNs are equal to each other and
-/// greater than everything else. The two agree on `-0.0 < +0.0` and on
-/// NaN-versus-number, which is why the substitution looked right.
-#[inline]
-pub(crate) fn java_compare_double(a: f64, b: f64) -> i32 {
-    if a < b {
-        return -1;
-    }
-    if a > b {
-        return 1;
-    }
-    let ab = double_to_long_bits_canonical(a);
-    let bb = double_to_long_bits_canonical(b);
-    match ab.cmp(&bb) {
-        std::cmp::Ordering::Equal => 0,
-        // Signed comparison: the bit patterns are read as long, so the negative
-        // zero / negative number ordering falls out of the sign bit.
-        _ => {
-            if (ab as i64) < (bb as i64) {
-                -1
-            } else {
-                1
-            }
-        }
-    }
-}
-
-/// `Float.compare`, transcribed — see the double version.
-#[inline]
-pub(crate) fn java_compare_float(a: f32, b: f32) -> i32 {
-    if a < b {
-        return -1;
-    }
-    if a > b {
-        return 1;
-    }
-    let ab = float_to_int_bits_canonical(a) as i32;
-    let bb = float_to_int_bits_canonical(b) as i32;
-    match ab.cmp(&bb) {
-        std::cmp::Ordering::Equal => 0,
-        std::cmp::Ordering::Less => -1,
-        std::cmp::Ordering::Greater => 1,
-    }
-}
+// `Double`/`Float` value semantics — canonicalizing NaN for equality, hashing
+// and ordering — live in `cratonvm_types::jfp`, transcribed once. They used to
+// be four private helpers here, which is how `Comparator.naturalOrder()` in
+// `native-collections` kept running `f64::total_cmp` after these were repaired.
+use cratonvm_types::jfp::{
+    double_to_long_bits as double_to_long_bits_canonical,
+    float_to_int_bits as float_to_int_bits_canonical,
+};
+use cratonvm_types::jfp::{double_compare as java_compare_double, float_compare as java_compare_float};
 
 // --- trig and math functions ---
 #[inline(always)]

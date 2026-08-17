@@ -1097,7 +1097,7 @@ pub(super) fn compile_osr_artifact(
             // backend may elide only these; a no-arg constructor that is NOT proven empty
             // keeps both its allocation and its call, because eliding it would drop
             // whatever the body writes to global state (see
-            // docs/internal/fixed-suite-bugs/netty/jit-elided-constructor-side-effects-FIXED-20260812.md).
+            // fixed-suite-bugs/netty/jit-elided-constructor-side-effects-FIXED-20260812.md).
             let mut elidable_init_pcs: std::collections::HashSet<usize> =
                 std::collections::HashSet::new();
             for (pc, tclass, pcount) in pending_ctor_sites {
@@ -1203,29 +1203,51 @@ pub(super) fn compile_osr_artifact(
                         &callee_desc,
                         true,
                     );
+                // `CRATONVM_DBG_OSR_BIND=1` names, per call site, whether this
+                // OSR artifact bound a direct machine-code CALL or fell back to
+                // the dispatch helper, and WHICH gate refused. Without it the
+                // two outcomes are indistinguishable from outside, and they are
+                // ~4.6x apart on a call-dense loop — see
+                // `docs/known-issues/netty/httpresponsestatustest-exhaustive-loop-timeout-20260816.md`.
+                let dbg_bind =
+                    cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_OSR_BIND").is_some();
                 if let Some((callee_pin, entry, needs_ctx)) = compiled_callee {
                     baked_callee_pins.push(callee_pin);
-                    if !crate::jit::jit_direct_call_requires_dispatch(
+                    let refuse_dispatch = crate::jit::jit_direct_call_requires_dispatch(
                         &callee_class,
                         &callee_method,
                         &callee_desc,
-                    )
-                    && !osr_callee_declares_handlers(
+                    );
+                    let refuse_handlers = osr_callee_declares_handlers(
                         shared,
                         class_id,
                         &callee_class,
                         &callee_method,
                         &callee_desc,
-                    )
+                    );
                     // jit-invokedynamic-groovy-regression fix: never bake a
                     // direct machine-code CALL to an indy-trap-bearing
                     // artifact — see the matching gate in `callee_compiler`.
-                    && !crate::jit::helpers::compiled_entry_has_indy_trap(
+                    let refuse_indy = crate::jit::helpers::compiled_entry_has_indy_trap(
                         shared,
                         &callee_class,
                         &callee_method,
                         &callee_desc,
-                    ) {
+                    );
+                    if dbg_bind {
+                        eprintln!(
+                            "[osr-bind] {}.{}{} @pc={} compiled=yes direct={} requires_dispatch={} declares_handlers={} indy_trap={}",
+                            callee_class,
+                            callee_method,
+                            callee_desc,
+                            ipc,
+                            !(refuse_dispatch || refuse_handlers || refuse_indy),
+                            refuse_dispatch,
+                            refuse_handlers,
+                            refuse_indy
+                        );
+                    }
+                    if !refuse_dispatch && !refuse_handlers && !refuse_indy {
                         direct_calls2.push((
                             ipc,
                             crate::jit::JitDirectCall {
@@ -1290,6 +1312,12 @@ pub(super) fn compile_osr_artifact(
 
                 // Compilation failed, or the callee participates in a recursive
                 // compile cycle. Fall back to the guarded dispatch helper.
+                if dbg_bind {
+                    eprintln!(
+                        "[osr-bind] {}.{}{} @pc={} -> DISPATCH HELPER",
+                        callee_class, callee_method, callee_desc, ipc
+                    );
+                }
                 let class_box: Box<str> = callee_class.into_boxed_str();
                 let method_box: Box<str> = callee_method.into_boxed_str();
                 let desc_box: Box<str> = callee_desc.clone().into_boxed_str();
@@ -7137,7 +7165,7 @@ pub(super) fn execute_jit_call(
                 || jit_saved_args_to_values(cached, &saved_args, np),
                 |args| args.to_vec(),
             );
-            let throw_pc = jit_local_athrow_pc(cached, sig.athrow_bci);
+            let throw_pc = jit_local_athrow_pc_kind(cached, sig.athrow_bci);
             return route_jit_signal_exception(
                 shared,
                 thread,
@@ -7221,7 +7249,7 @@ pub(super) fn execute_jit_call(
                     thread,
                     frame_idx,
                     cached,
-                    usize::MAX,
+                    JitThrowPc::Unknown,
                     exc,
                     &exc_locals,
                 );
@@ -7268,7 +7296,7 @@ pub(super) fn execute_jit_call(
                     thread,
                     frame_idx,
                     cached,
-                    usize::MAX,
+                    JitThrowPc::Unknown,
                     exc,
                     &exc_locals,
                 );
@@ -7310,7 +7338,7 @@ pub(super) fn execute_jit_call(
                     thread,
                     frame_idx,
                     cached,
-                    usize::MAX,
+                    JitThrowPc::Unknown,
                     exc,
                     &exc_locals,
                 );
@@ -7655,7 +7683,7 @@ pub(super) fn execute_jit_call_decoded(
             // RBC.6 correctness fix — see the identical comment at
             // `execute_jit_call`'s sibling call site: use the athrow's own
             // known bci when available instead of always `usize::MAX`.
-            let throw_pc = jit_local_athrow_pc(cached, sig.athrow_bci);
+            let throw_pc = jit_local_athrow_pc_kind(cached, sig.athrow_bci);
             return route_jit_signal_exception(
                 shared, thread, frame_idx, cached, throw_pc, exc, args_slice,
             )
@@ -7693,7 +7721,7 @@ pub(super) fn execute_jit_call_decoded(
                     thread,
                     frame_idx,
                     cached,
-                    usize::MAX,
+                    JitThrowPc::Unknown,
                     exc,
                     args_slice,
                 )
@@ -7716,7 +7744,7 @@ pub(super) fn execute_jit_call_decoded(
                     thread,
                     frame_idx,
                     cached,
-                    usize::MAX,
+                    JitThrowPc::Unknown,
                     exc,
                     args_slice,
                 )
@@ -7742,7 +7770,7 @@ pub(super) fn execute_jit_call_decoded(
                     thread,
                     frame_idx,
                     cached,
-                    usize::MAX,
+                    JitThrowPc::Unknown,
                     exc,
                     args_slice,
                 )

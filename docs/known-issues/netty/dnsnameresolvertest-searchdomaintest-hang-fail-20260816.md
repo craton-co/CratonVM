@@ -88,7 +88,7 @@ more specific, more actionable fact than "inbound datagrams never arrive" was.
 
 ## Same shape as the 08-13 "regressed" doc — not a new bug, still open
 
-`docs/internal/fixed-suite-bugs/netty/dns-searchdomaintest-and-dnsnameresolvertest-regressed-20260813.md`
+`fixed-suite-bugs/netty/dns-searchdomaintest-and-dnsnameresolvertest-regressed-20260813.md`
 already established, on 2026-08-13:
 
 - `SearchDomainTest` back to **1/7** (matches today's `1/7` exactly).
@@ -129,7 +129,7 @@ grep 'DatagramChannel.send to' runs/repro/*/on-real/shard-0/raw.log
 
 ## Related
 
-- `docs/internal/fixed-suite-bugs/netty/dns-searchdomaintest-and-dnsnameresolvertest-regressed-20260813.md`
+- `fixed-suite-bugs/netty/dns-searchdomaintest-and-dnsnameresolvertest-regressed-20260813.md`
   — the page that first caught this regression on Windows (2026-08-13),
   confirmed it does NOT reproduce on Linux at the same commit, and proposed
   the Windows-only `selector_register`/epoll-refresh code path as the live
@@ -137,7 +137,7 @@ grep 'DatagramChannel.send to' runs/repro/*/on-real/shard-0/raw.log
   this page should be read as confirming that page's OPEN status, not
   superseding it. The two pages together are the current state of knowledge;
   a fix should close both.
-- `docs/internal/fixed-suite-bugs/netty-batch11-inet6-and-sha1-oid-CLOSED-20260812.md`
+- `fixed-suite-bugs/netty-batch11-inet6-and-sha1-oid-CLOSED-20260812.md`
   — cause 3, which first recorded these two classes' pre-08-13 numbers
   (`SearchDomainTest` 1/7, hang) as the *before* state the 08-13 fix moved away
   from and this page's numbers now match again.
