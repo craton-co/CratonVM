@@ -5821,8 +5821,44 @@ pub fn jit_getfield_helper_calls() -> u64 {
     JIT_GETFIELD_HELPER_CALLS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// First few helper calls, dumped with the receiver AND the live bounds table.
+///
+/// The counter says the inline guard fell through; this says WHY. The guard is
+/// null-check, 8-alignment, then containment in one of three `[base, end)`
+/// pairs — so printing the receiver beside all six words names the failing
+/// clause directly instead of leaving it to be inferred from collector A/Bs,
+/// which came back identical on ZGC, Generational and G1 and therefore ruled
+/// out the "ZGC never publishes" story on their own.
+#[inline(never)]
+#[cold]
+fn dump_getfield_guard_failure(obj_ptr: i64) {
+    use std::sync::atomic::Ordering;
+    static DUMPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    if DUMPED.fetch_add(1, Ordering::Relaxed) >= 8 {
+        return;
+    }
+    let base = cratonvm_gc::jit_region_bounds_addr();
+    // SAFETY: `jit_region_bounds_addr` returns the address of the process-global
+    // `JIT_REGION_BOUNDS` static, which is six `AtomicUsize` and lives for the
+    // program's lifetime.
+    let words: Vec<String> = (0..6)
+        .map(|i| unsafe {
+            let w = &*((base + i * 8) as *const std::sync::atomic::AtomicUsize);
+            format!("{:#x}", w.load(Ordering::Acquire))
+        })
+        .collect();
+    eprintln!(
+        "[getfield-guard] receiver={obj_ptr:#x} aligned8={} bounds=[{}]",
+        obj_ptr & 7 == 0,
+        words.join(", ")
+    );
+}
+
 pub unsafe extern "C" fn jit_getfield(vm_ptr: i64, obj_ptr: i64, field_index: i64) -> i64 {
     JIT_GETFIELD_HELPER_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_COMPACT_INLINE").is_some() {
+        dump_getfield_guard_failure(obj_ptr);
+    }
     // WS1: Rust<->JIT boundary — invalidate the per-thread JIT-scan cache
     // (see conservative_roots::note_jit_boundary).
     crate::jit::conservative_roots::note_jit_boundary();
