@@ -4536,6 +4536,7 @@ fn reloc_emit_enabled() -> bool {
                     return;
                 }
                 if self.getfield != 0 {
+                    crate::metrics::note_getfield_arm(5);
                     self.load_reg_from_frame(CALL_ARG_REGS[0], self.context_slot_off);
                     self.load_reg_from_frame(CALL_ARG_REGS[1], self.slot_of(base));
                     self.emit_mov_reg_imm64(CALL_ARG_REGS[2], field_index as i64 as u64);

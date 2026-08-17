@@ -140,8 +140,13 @@ fn maybe_dump_shutdown_reports() {
         // paid the helper's `is_object_address` walk. See
         // known-issues/jit/every-jit-getfield-takes-the-helper-because-the-guarded-inline-check-always-fails-20260817.md.
         eprintln!(
-            "[cratonvm] getfield helper calls: {}",
-            cratonvm_vm::jit::helpers::jit_getfield_helper_calls()
+            "[cratonvm] getfield helper calls: {} | CALL sites emitted by arm: {}",
+            cratonvm_vm::jit::helpers::jit_getfield_helper_calls(),
+            cratonvm_jit::metrics::getfield_arm_emits()
+                .iter()
+                .map(|(n, c)| format!("{n}={c}"))
+                .collect::<Vec<_>>()
+                .join(" ")
         );
         // The bytecode loop rewriter's admission tally, on the same switch and
         // for the same reason: it is what the compiler did, read at exit. The
