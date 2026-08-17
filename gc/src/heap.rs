@@ -2027,6 +2027,27 @@ pub fn coerce_field_value_for_slot(value: Value, desc_byte: u8, site: FieldCoerc
             Value::Float(_) => value,
             Value::Int(i) => Value::Float(f32::from_bits(i as u32)),
             Value::Long(l) => Value::Float(f32::from_bits(l as u32)),
+            // G52, THE ONE CELL THAT DISAGREES WITH ITSELF — reported, not
+            // moved. The `Long` arm one line up reads the slot as a BIT
+            // pattern; this arm reads it as a NUMBER. They are the same
+            // untagged compact slot, so they contradict each other:
+            // `Long(5)` at `F` is `Float(7e-45)` and
+            // `Double(f64::from_bits(5))` at `F` is `Float(0.0)`. Every other
+            // cross-variant pair in this function agrees (see the `b'I'`
+            // `Double` arm for the argument and the invariant it is pinned
+            // by); this is the only pair that does not.
+            //
+            // NOT changed here, deliberately. Either answer is defensible in
+            // isolation — `d as f32` is the correct JVMS `d2f` for a genuine
+            // double, `f32::from_bits(d.to_bits() as u32)` is the correct
+            // decode for an untagged slot — and MEASURED 2026-08-17, zero
+            // `Value::Double` reached ANY `b'F'` slot in a 26-vector-run
+            // sweep, so there is no live population to decide it against and
+            // no run that could falsify a change. Whoever gets a
+            // non-zero count here first should decide it; until then the
+            // disagreement is pinned by
+            // `the_double_and_long_arms_disagree_only_at_a_float_slot` so it
+            // cannot drift in silence.
             Value::Double(d) => Value::Float(d as f32),
             Value::Uninitialized => Value::Float(0.0),
             Value::Object(None) => {
@@ -2048,6 +2069,57 @@ pub fn coerce_field_value_for_slot(value: Value, desc_byte: u8, site: FieldCoerc
             Value::Int(_) => value,
             Value::Long(l) => Value::Int(l as i32),
             Value::Float(f) => Value::Int(f.to_bits() as i32),
+            // G52, DELIBERATE — this is a BIT projection and not `d as i32`,
+            // and the reason is the same one the `b'J'` arm above states.
+            //
+            // `G43-1` NOMINATION 5 asked for this to become the numeric
+            // narrowing `d as i32`, on the ground that a bit-cast makes the
+            // blast radius of a mis-slotted `Double` depend on its VALUE. The
+            // complaint is right; the proposed repair is wrong, three times
+            // over, and this comment exists so nobody has to re-derive that.
+            //
+            // 1. IT IS THE UNTAGGED-COMPACT-SLOT DECODE, NOT A DOUBLE
+            //    CONVERSION. This function declares itself a superset of
+            //    `CompactValue::decode_by_descriptor`, and this is the arm
+            //    that makes the claim true: `types/src/compact_value.rs:1675`
+            //    answers an integral descriptor on an UNTAGGED slot with
+            //    `Value::Int(self.0 as u32 as i32)` — the low 32 raw bits.
+            //    An untagged slot decoded through `to_value()` surfaces as
+            //    `Value::Double(f64::from_bits(raw))`, so a `Value::Double`
+            //    arriving here is, on the shipped compact-layout path,
+            //    OVERWHELMINGLY A LONG/INT BIT PATTERN rather than a number.
+            //    Taking its low half is the correct `l2i`.
+            //
+            // 2. IT IS FORCED BY THE `b'J'` ARM. `Value::Long(l)` and
+            //    `Value::Double(f64::from_bits(l as u64))` are the same
+            //    untagged slot read two ways; they MUST agree about the
+            //    slot's low half, or a long read at `I` and the same long
+            //    read at `J` contradict each other. `d.to_bits() as i32`
+            //    makes them agree for every `l`; `d as i32` makes them
+            //    disagree for every `l` outside the subnormal window —
+            //    `CompactValue::long(5)` would read back as `0`, which is
+            //    Session 93 resurrected at 32 bits. Pinned by
+            //    `a_double_at_an_integral_slot_decodes_like_the_untagged_long_it_usually_is`.
+            //
+            // 3. ON `G43-1`'s OWN CASE THE PROPOSED REPAIR IS STRICTLY WORSE.
+            //    `G43-1` §5.2 shows a synthetic `Provider` version landing on
+            //    the real `java.util.Hashtable.count`, surviving only because
+            //    `25.0f64.to_bits() as i32 == 0` and `getEnumeration`
+            //    early-returns on `count == 0`. Under `d as i32` that same
+            //    write yields `count == 25`, the early return does NOT fire,
+            //    and `keys()` walks the `String` sitting in `table` as an
+            //    `Entry[]` — i.e. the numeric rule converts that record's
+            //    LATENT corruption into a LIVE one. (The producer is gated
+            //    off at HEAD by `provider_has_named_layout`,
+            //    `native-builtins/src/jca/provider_chain.rs:285`.)
+            //
+            // What IS wrong is that the ambiguity is unresolvable here: a
+            // genuine `double` mis-slotted into an `int` field and an
+            // untagged long that round-tripped through `to_value()` arrive as
+            // the same `Value::Double`, and this arm resolves it in favour of
+            // the one that happens on a shipped path. That is a property of
+            // the boxed-`Value` representation, not of this line, and it
+            // cannot be fixed by choosing the other answer.
             Value::Double(d) => Value::Int(d.to_bits() as i32),
             Value::Uninitialized => Value::Int(0),
             // MEASURED, G25-1 §1 consequence 1: this arm is how
@@ -2134,6 +2206,38 @@ pub fn coerce_field_value_for_slot(value: Value, desc_byte: u8, site: FieldCoerc
             // closing it is a behaviour change at an unknown number of sites,
             // so it is reported and NOT repaired here (G30 NOMINATION 6).
             // The value is passed through byte-identically to before.
+            //
+            // G52 — "an unknown number of sites" is no longer unknown, and
+            // the answer is ZERO. This species now has a denominator from
+            // three independent directions:
+            //
+            // * RUNTIME, `primitive-into-reference-uncoerced`: 0 events in
+            //   1,339 (G45-1 §3, 19 vectors) and 0 in a further 638 (G52-1,
+            //   10 vectors). 0 / 1,977.
+            // * RUNTIME, the other instrument: 0 `Float`-at-a-reference-slot
+            //   rows in a 4-vector `CRATONVM_DBG_OVERLAY=1` sweep, whose
+            //   211 `[cross-type]` rows are ALL `Int` at `L`/`[`.
+            // * STATIC: every `Value::Float` reaching a `set_field`-family
+            //   call in the native crates (25 sites) targets a slot whose
+            //   REAL JDK-25 descriptor is `F` — `HashMap`/`Hashtable`
+            //   `loadFactor`, `java.lang.Float.value`, `CharsetEncoder`
+            //   slots 1/2 (`averageBytesPerChar`/`maxBytesPerChar`), and
+            //   `Float` wrapper boxes. Resolved against `javap -p` on
+            //   HotSpot 25.0.3+9; see the G52-1 record for the table.
+            //
+            // `ReturnAddress` is stronger than empty, it is UNREACHABLE: the
+            // only producer in the tree is `jsr`/`jsr_w`
+            // (`vm/src/runtime/interpreter/opcodes.rs:4009`/`:4016`), those
+            // opcodes are illegal in class files of version >= 51, and even
+            // a hypothetical one could only reach a slot through the
+            // interpreter's `putfield`, which does not coerce.
+            //
+            // So closing the hole (nulling `Float` like `Double`) is now a
+            // safe one-line change — and also an UNVERIFIABLE one, because
+            // an empty population means no run can tell the two versions
+            // apart. It is still not taken here for that reason. What WOULD
+            // justify taking it: a non-zero
+            // `primitive-into-reference-uncoerced` count from any vector.
             Value::Float(_) | Value::ReturnAddress(_) => {
                 note_field_coercion_loss(
                     FieldCoercionLoss::PrimitiveIntoReferenceUncoerced,
@@ -3972,6 +4076,156 @@ mod tests {
             "Heap::set_field_as must attribute its loss to the STORE column",
         );
         assert_eq!(heap.get_field(obj, 0), Value::Object(None));
+    }
+
+    // ----- G52: the Double arm, and the theorem clone rests on -------------
+
+    /// Bit-exact `Value` comparison. `PartialEq` on `f32`/`f64` says a NaN is
+    /// not itself, and several arms below legitimately produce one (a long
+    /// bit pattern reinterpreted as a float usually IS a NaN), so a plain
+    /// `assert_eq!` would fail on values that are in fact identical.
+    fn same(a: Value, b: Value) -> bool {
+        match (a, b) {
+            (Value::Float(x), Value::Float(y)) => x.to_bits() == y.to_bits(),
+            (Value::Double(x), Value::Double(y)) => x.to_bits() == y.to_bits(),
+            _ => a == b,
+        }
+    }
+
+    /// THE `b'I'` DOUBLE ARM, PINNED. `G43-1` NOMINATION 5 asked for
+    /// `d as i32` in place of `d.to_bits() as i32`. This test is why that
+    /// must not happen.
+    ///
+    /// `Value::Long(l)` and `Value::Double(f64::from_bits(l as u64))` are the
+    /// SAME untagged compact slot read two ways —
+    /// `CompactValue::to_value()` surfaces an untagged slot as a `Double`,
+    /// which is the whole reason the `b'J'` arm's Session-93 repair exists.
+    /// They must therefore agree about the slot's low 32 bits. The bit
+    /// projection makes them agree for every `l`; the numeric narrowing would
+    /// make `CompactValue::long(5)` read back as `0` at an `int` field.
+    #[test]
+    fn a_double_at_an_integral_slot_decodes_like_the_untagged_long_it_usually_is() {
+        let _g = g30_lock();
+        let site = FieldCoercionSite::store(None, 0);
+        let c = |v: Value, d: u8| coerce_field_value_for_slot(v, d, site);
+
+        // NaN payloads: every pattern below is either not a NaN at all or is
+        // a QUIET NaN (mantissa MSB set), which `f64::from_bits`/`to_bits`
+        // round-trip. Signalling patterns are deliberately not used.
+        for l in [0i64, 1, 5, -1, 0x0123_4567_89AB_CDEF, i64::MIN] {
+            let as_double = Value::Double(f64::from_bits(l as u64));
+            for d in [b'I', b'B', b'C', b'S', b'Z'] {
+                assert!(
+                    same(c(Value::Long(l), d), c(as_double, d)),
+                    "a long and the untagged slot it decodes from must agree \
+                     at descriptor {}: long {l} gave {:?}, double gave {:?}",
+                    d as char,
+                    c(Value::Long(l), d),
+                    c(as_double, d),
+                );
+            }
+            // ...and the same slot at `J`, which is where the rule the `I`
+            // arm mirrors is already documented.
+            assert!(same(c(as_double, b'J'), Value::Long(l)));
+        }
+
+        // `G43-1` §5.2's arithmetic, spelled out so the record and the code
+        // cannot drift apart. A synthetic `Provider` version landing on the
+        // real `java.util.Hashtable.count`:
+        //   25.0 -> 0x4039_0000_0000_0000, low half 0 -> count == 0, and
+        //           `Hashtable.getEnumeration` early-returns. LATENT.
+        //   1.8  -> 0x3FFC_CCCC_CCCC_CCCD, low half 0xCCCC_CCCD.  LIVE.
+        // Under `d as i32` the first line would read `count == 25` and walk
+        // 25 buckets of a table holding a `String` — i.e. the proposed repair
+        // makes that record's own case WORSE, not safer.
+        assert_eq!(c(Value::Double(25.0), b'I'), Value::Int(0));
+        assert_eq!(c(Value::Double(1.8), b'I'), Value::Int(-858_993_459));
+        assert_ne!(
+            c(Value::Double(25.0), b'I'),
+            Value::Int(25),
+            "this arm is a bit projection, not a numeric narrowing; see the \
+             comment at the arm before changing it",
+        );
+    }
+
+    /// The `Double`/`Long` pair agrees at every integral descriptor and at
+    /// `J`/`D` — and disagrees at exactly one place, `b'F'`, because that
+    /// arm's `Long` case is a bit decode and its `Double` case is a numeric
+    /// one. Pinned so the known asymmetry cannot drift in silence, and so
+    /// whoever decides it has a test to change rather than a surprise.
+    #[test]
+    fn the_double_and_long_arms_disagree_only_at_a_float_slot() {
+        let _g = g30_lock();
+        let site = FieldCoercionSite::store(None, 0);
+        let c = |v: Value, d: u8| coerce_field_value_for_slot(v, d, site);
+        let l = 5i64;
+        let as_double = Value::Double(f64::from_bits(l as u64));
+
+        for d in [b'I', b'J', b'D'] {
+            assert!(
+                same(c(Value::Long(l), d), c(as_double, d)),
+                "the pair must agree at {}",
+                d as char,
+            );
+        }
+        assert!(
+            !same(c(Value::Long(l), b'F'), c(as_double, b'F')),
+            "b'F' is the one cell where the pair disagrees; if this now \
+             passes, someone unified them — good, but update the comment at \
+             the arm and the G52-1 record",
+        );
+        assert!(same(
+            c(Value::Long(l), b'F'),
+            Value::Float(f32::from_bits(5))
+        ));
+        assert!(same(c(as_double, b'F'), Value::Float(0.0)));
+    }
+
+    /// IDEMPOTENCE, and it is not an academic property.
+    ///
+    /// `native_object_clone` (`native-builtins/src/lib.rs`) copies a field
+    /// with `ctx.get_field` then `ctx.set_field`, and BOTH of those resolve
+    /// the slot's descriptor and land here (`vm_exec.rs`'s
+    /// `NativeContextImpl`). So every cloned field is coerced TWICE, and the
+    /// clone's contents equal the original's coerced contents only if this
+    /// function is idempotent. Nothing asserted that before G52.
+    ///
+    /// It also bounds any future caller that composes two coercions — a
+    /// read-modify-write through the descriptor-aware pair, a CAS, a
+    /// re-decode after a slot move.
+    #[test]
+    fn the_descriptor_coercion_is_idempotent() {
+        let _g = g30_lock();
+        let heap = Heap::new();
+        let obj = heap.alloc_object(ClassId::new(1), 1);
+        let site = FieldCoercionSite::store(None, 0);
+
+        let values = [
+            Value::Int(7),
+            Value::Long(-3),
+            Value::Float(1.5),
+            Value::Double(2.5),
+            Value::Double(f64::from_bits(5)),
+            Value::Object(None),
+            Value::Object(Some(obj)),
+            Value::Uninitialized,
+            Value::ReturnAddress(9),
+        ];
+        for v in values {
+            for d in [
+                b'J', b'D', b'F', b'I', b'B', b'C', b'S', b'Z', b'L', b'[', b'V',
+            ] {
+                let once = coerce_field_value_for_slot(v, d, site);
+                let twice = coerce_field_value_for_slot(once, d, site);
+                assert!(
+                    same(once, twice),
+                    "coercing {v:?} at {} twice must equal coercing it once, \
+                     got {once:?} then {twice:?} — Object.clone() copies \
+                     every field through two of these",
+                    d as char,
+                );
+            }
+        }
     }
 
     // ----- Part F: GPU/GC coordination tests --------------------------------
