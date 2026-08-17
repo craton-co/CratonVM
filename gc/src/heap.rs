@@ -42,7 +42,7 @@
 //! copying garbage collector. Allocation is linear in from-space. During
 //! collection, live objects are copied to to-space, then spaces are swapped.
 
-use std::sync::atomic::{AtomicI32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicU64, AtomicUsize, Ordering};
 
 use parking_lot::Mutex;
 
@@ -863,13 +863,21 @@ impl Heap {
     /// Out-of-bounds behavior matches `get_field` (panics on bad index).
     pub fn get_field_as(&self, obj_ref: ObjectRef, index: usize, desc_byte: u8) -> Value {
         let raw = self.get_field(obj_ref, index);
-        coerce_field_value_by_descriptor(raw, desc_byte)
+        coerce_field_value_for_slot(
+            raw,
+            desc_byte,
+            FieldCoercionSite::read(Some(self.class_id_of(obj_ref)), index),
+        )
     }
 
     /// Volatile variant of [`get_field_as`].
     pub fn get_field_volatile_as(&self, obj_ref: ObjectRef, index: usize, desc_byte: u8) -> Value {
         let raw = self.get_field_volatile(obj_ref, index);
-        coerce_field_value_by_descriptor(raw, desc_byte)
+        coerce_field_value_for_slot(
+            raw,
+            desc_byte,
+            FieldCoercionSite::read(Some(self.class_id_of(obj_ref)), index),
+        )
     }
 
     /// Set a field value, coercing to the declared type from the descriptor.
@@ -877,8 +885,18 @@ impl Heap {
     /// Symmetric to [`get_field_as`] — if a `Value::Double` lands where the
     /// class file declares `J`, it is reinterpreted as `Value::Long` before
     /// the slot write so downstream readers always see a consistent tag.
+    ///
+    /// G30: the coercion is the provenance-carrying
+    /// [`coerce_field_value_for_slot`], so a value-destroying store made
+    /// through THIS heap names its class and slot in the warning. The three
+    /// collectors on the live `VmHeap` dispatch path do not yet; that is
+    /// NOMINATION 1 and it is a one-line change per call site.
     pub fn set_field_as(&self, obj_ref: ObjectRef, index: usize, value: Value, desc_byte: u8) {
-        let coerced = coerce_field_value_by_descriptor(value, desc_byte);
+        let coerced = coerce_field_value_for_slot(
+            value,
+            desc_byte,
+            FieldCoercionSite::store(Some(self.class_id_of(obj_ref)), index),
+        );
         self.set_field(obj_ref, index, coerced);
     }
 
@@ -890,7 +908,11 @@ impl Heap {
         value: Value,
         desc_byte: u8,
     ) {
-        let coerced = coerce_field_value_by_descriptor(value, desc_byte);
+        let coerced = coerce_field_value_for_slot(
+            value,
+            desc_byte,
+            FieldCoercionSite::store(Some(self.class_id_of(obj_ref)), index),
+        );
         self.set_field_volatile(obj_ref, index, coerced);
     }
 
@@ -1595,6 +1617,308 @@ pub fn default_value_for_descriptor(desc_byte: u8) -> Option<Value> {
     }
 }
 
+// ----- G30: the descriptor-coercion loss instrument -----------------------
+//
+// Why this exists, in one paragraph, because the next reader will otherwise
+// re-derive it from a symptom the way three records already had to.
+//
+// `coerce_field_value_by_descriptor` has two jobs that look alike and are not.
+// Most of its arms NORMALISE: a `Double` bit pattern that was meant as a long
+// is reinterpreted, an `Int` is widened to a `Long`, and no information is
+// lost. Three arms DESTROY: a primitive handed to an `L`/`[` slot becomes
+// `null`, a `null` handed to a primitive slot becomes the typed zero, and an
+// object POINTER handed to a primitive slot becomes its own address as a
+// number. Until 2026-08-17 all three were silent in release, and the only
+// detector that named the species — `overlay_check_access` in
+// `vm/src/vm/vm_exec.rs` — is gated behind `CRATONVM_DBG_OVERLAY` AND
+// requires the class to carry a fabricated shadow layout, so it cannot see a
+// class this VM never modelled.
+//
+// This is NOT the `cratonvm::gc::guard` W7-84 warning and must not be counted
+// with it. MEASURED 2026-08-17, `RJdkHello` `--jdk-only`: all 12 W7-84
+// warnings in a run are `class_id=ClassId(12) index=0`, one class and one
+// slot, the VM's own class-mirror populator over
+// `java.lang.Class.cachedConstructor` (`vm/src/vm/vm_object.rs`). That path is
+// `autobox::box_for_reference_slot` reached from the DESCRIPTOR-LESS
+// `set_field`; it BOXES. This path is descriptor-driven; it NULLS. Different
+// function, different answer, disjoint populations.
+//
+// The instrument deliberately does not change any answer. See
+// `docs/known-issues/jdk-only/G30-1-the-silent-reference-slot-coercion-20260817.md`.
+
+/// Which kind of value-destroying coercion fired.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FieldCoercionLoss {
+    /// A primitive was handed to a slot the class declares `L`/`[`, and was
+    /// replaced by `null`. The G25/G30 headline species.
+    PrimitiveIntoReference,
+    /// A primitive was handed to a slot the class declares `L`/`[` and was
+    /// **stored as-is** (the `Float` / `ReturnAddress` fall-through). Reported
+    /// separately because the value survives — the reader of that slot gets a
+    /// primitive where a reference is declared, rather than a null.
+    PrimitiveIntoReferenceUncoerced,
+    /// `Value::Object(None)` was handed to a primitive slot and became the
+    /// typed JVMS zero — i.e. `null` silently means `0` / `false`.
+    NullIntoPrimitive,
+    /// A live object POINTER was handed to a primitive slot and was published
+    /// as its own address. The worst of the three: the answer is not merely
+    /// wrong, it is non-deterministic and leaks a heap address.
+    PointerIntoPrimitive,
+}
+
+impl FieldCoercionLoss {
+    /// Number of variants; the row count of the counter matrix.
+    pub const COUNT: usize = 4;
+
+    #[inline]
+    fn index(self) -> usize {
+        match self {
+            FieldCoercionLoss::PrimitiveIntoReference => 0,
+            FieldCoercionLoss::PrimitiveIntoReferenceUncoerced => 1,
+            FieldCoercionLoss::NullIntoPrimitive => 2,
+            FieldCoercionLoss::PointerIntoPrimitive => 3,
+        }
+    }
+
+    /// Stable, greppable name for logs and dumps.
+    pub fn name(self) -> &'static str {
+        match self {
+            FieldCoercionLoss::PrimitiveIntoReference => "primitive-into-reference",
+            FieldCoercionLoss::PrimitiveIntoReferenceUncoerced => {
+                "primitive-into-reference-uncoerced"
+            }
+            FieldCoercionLoss::NullIntoPrimitive => "null-into-primitive",
+            FieldCoercionLoss::PointerIntoPrimitive => "pointer-into-primitive",
+        }
+    }
+}
+
+/// Which side of the field access the coercion ran on.
+///
+/// A READ that coerces is usually benign — the slot was never
+/// descriptor-initialised and the read is *repairing* it (MEASURED: 336 of
+/// the 352 coercions in one `RJdkNet` run are reads of
+/// `java.lang.ref.ReferenceQueue.head`, which correctly answer `null`). A
+/// STORE that coerces is the defect. Reporting them in one bucket is how the
+/// signal gets lost, so they are counted separately.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FieldAccessKind {
+    Read,
+    Store,
+    /// The caller did not say. Every collector on the live `VmHeap` dispatch
+    /// path is currently here; see [`coerce_field_value_for_slot`].
+    Unattributed,
+}
+
+impl FieldAccessKind {
+    /// Number of variants; the column count of the counter matrix.
+    pub const COUNT: usize = 3;
+
+    #[inline]
+    fn index(self) -> usize {
+        match self {
+            FieldAccessKind::Read => 0,
+            FieldAccessKind::Store => 1,
+            FieldAccessKind::Unattributed => 2,
+        }
+    }
+
+    /// Stable, greppable name for logs and dumps.
+    pub fn name(self) -> &'static str {
+        match self {
+            FieldAccessKind::Read => "read",
+            FieldAccessKind::Store => "store",
+            FieldAccessKind::Unattributed => "unattributed",
+        }
+    }
+}
+
+/// Everything the instrument knows about where a coercion came from.
+///
+/// `Copy` and three words wide so passing it costs nothing on the arms that
+/// never look at it.
+#[derive(Debug, Clone, Copy)]
+pub struct FieldCoercionSite {
+    pub kind: FieldAccessKind,
+    pub class_id: Option<ClassId>,
+    pub index: Option<usize>,
+}
+
+impl FieldCoercionSite {
+    /// A caller that carries no provenance at all.
+    pub const UNATTRIBUTED: Self = Self {
+        kind: FieldAccessKind::Unattributed,
+        class_id: None,
+        index: None,
+    };
+
+    /// A descriptor-aware READ of `index` on an object of `class_id`.
+    #[inline]
+    pub fn read(class_id: Option<ClassId>, index: usize) -> Self {
+        Self {
+            kind: FieldAccessKind::Read,
+            class_id,
+            index: Some(index),
+        }
+    }
+
+    /// A descriptor-aware STORE to `index` on an object of `class_id`.
+    #[inline]
+    pub fn store(class_id: Option<ClassId>, index: usize) -> Self {
+        Self {
+            kind: FieldAccessKind::Store,
+            class_id,
+            index: Some(index),
+        }
+    }
+}
+
+/// One counter per (species, access kind). Flat so the increment is a single
+/// relaxed `fetch_add` on a cold path.
+static COERCION_LOSSES: [[AtomicU64; FieldAccessKind::COUNT]; FieldCoercionLoss::COUNT] = [
+    [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)],
+    [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)],
+    [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)],
+    [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)],
+];
+
+/// How many times each (species, access kind) pair has fired in this process.
+///
+/// Rows are indexed by [`FieldCoercionLoss`] in declaration order, columns by
+/// [`FieldAccessKind`]. Intended for a shutdown summary or the native-registry
+/// dump; see [`field_coercion_loss_report`] for a rendered form.
+pub fn field_coercion_loss_counts() -> [[u64; FieldAccessKind::COUNT]; FieldCoercionLoss::COUNT] {
+    let mut out = [[0u64; FieldAccessKind::COUNT]; FieldCoercionLoss::COUNT];
+    for (r, row) in COERCION_LOSSES.iter().enumerate() {
+        for (c, cell) in row.iter().enumerate() {
+            out[r][c] = cell.load(Ordering::Relaxed);
+        }
+    }
+    out
+}
+
+/// Total number of value-destroying descriptor coercions in this process.
+pub fn field_coercion_loss_total() -> u64 {
+    COERCION_LOSSES
+        .iter()
+        .flatten()
+        .map(|c| c.load(Ordering::Relaxed))
+        .sum()
+}
+
+/// A one-line-per-species rendering of [`field_coercion_loss_counts`], or
+/// `None` when nothing fired.
+///
+/// `None` rather than an empty string so a caller can print a section header
+/// only when there is something under it.
+pub fn field_coercion_loss_report() -> Option<String> {
+    let counts = field_coercion_loss_counts();
+    if counts.iter().flatten().all(|&n| n == 0) {
+        return None;
+    }
+    let species = [
+        FieldCoercionLoss::PrimitiveIntoReference,
+        FieldCoercionLoss::PrimitiveIntoReferenceUncoerced,
+        FieldCoercionLoss::NullIntoPrimitive,
+        FieldCoercionLoss::PointerIntoPrimitive,
+    ];
+    let kinds = [
+        FieldAccessKind::Read,
+        FieldAccessKind::Store,
+        FieldAccessKind::Unattributed,
+    ];
+    let mut s = String::new();
+    for sp in species {
+        let row = counts[sp.index()];
+        if row.iter().all(|&n| n == 0) {
+            continue;
+        }
+        s.push_str(sp.name());
+        for k in kinds {
+            s.push_str(&format!(" {}={}", k.name(), row[k.index()]));
+        }
+        s.push('\n');
+    }
+    Some(s)
+}
+
+/// `CRATONVM_DBG_COERCION=1` — log EVERY loss with a backtrace instead of the
+/// rate-limited sample.
+///
+/// Read once. This is the flag a lane repairing individual sites wants; the
+/// default sample is for a reader who did not know the defect existed.
+fn coercion_loss_verbose() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("CRATONVM_DBG_COERCION")
+            .map(|v| !v.is_empty() && v != "0")
+            .unwrap_or(false)
+    })
+}
+
+/// The instrument. Counts always; warns on a rate-limited sample.
+///
+/// Rate limit is `n < 4 || n.is_power_of_two()`, PER SPECIES — the same shape
+/// as `autobox::observe_primitive_into_reference_field` and the sibling
+/// `cratonvm::gc::guard` records, chosen so a boot that coerces thousands of
+/// times costs ~a dozen lines rather than minutes of stderr. Per species
+/// rather than globally so a high-frequency benign read population (see
+/// [`FieldAccessKind`]) cannot bury a rare store.
+///
+/// Target `cratonvm::gc::guard`, deliberately: that target already emits on
+/// this VM's default stderr configuration, so anyone who has ever looked at a
+/// CratonVM boot log has the filter for it, and a new target would have been
+/// one more thing to know about.
+///
+/// **No `debug_assert!` and no refusal.** `autobox.rs`'s module note settles
+/// why, and the reasoning transfers verbatim: the population reaching this is
+/// live on shipped paths (400 measured sites), so a hard error converts a
+/// wrong answer into a crash, and an assert reds the synthetic-JDK tests where
+/// a fabricated class's slot genuinely IS the primitive it is handed. Take the
+/// diagnostic half without the behaviour half.
+#[cold]
+fn note_field_coercion_loss(
+    loss: FieldCoercionLoss,
+    site: FieldCoercionSite,
+    value: Value,
+    desc_byte: u8,
+) {
+    let n = COERCION_LOSSES[loss.index()][site.kind.index()].fetch_add(1, Ordering::Relaxed);
+    let verbose = coercion_loss_verbose();
+    if !verbose && !(n < 4 || n.is_power_of_two()) {
+        return;
+    }
+    let descriptor = desc_byte as char;
+    let class = site.class_id.map(|c| c.as_u32() as i64).unwrap_or(-1);
+    let index = site.index.map(|i| i as i64).unwrap_or(-1);
+    tracing::warn!(
+        target: "cratonvm::gc::guard",
+        species = loss.name(),
+        access = site.kind.name(),
+        descriptor = %descriptor,
+        value = ?value,
+        class_id = class,
+        index,
+        occurrence = n,
+        "a descriptor-aware field access DESTROYED the value it was handed \
+         (G30-1-the-silent-reference-slot-coercion-20260817.md). This is NOT \
+         the W7-84 autobox guard: that one boxes and fires only for the class \
+         mirror; this one nulls (or zeroes) and is the shape behind the null \
+         `java.net.ServerSocket.impl`. class_id=-1/index=-1 means the caller \
+         is one of the collectors that has not yet been given provenance \
+         (G30 NOMINATION 1). Run with CRATONVM_DBG_LAYOUT=1 to resolve a \
+         class_id to a name, or CRATONVM_DBG_COERCION=1 for every occurrence \
+         with a backtrace.",
+    );
+    if verbose {
+        tracing::warn!(
+            target: "cratonvm::gc::guard",
+            "  coercion-loss backtrace:\n{}",
+            std::backtrace::Backtrace::force_capture(),
+        );
+    }
+}
+
 /// T10.9.E — Coerce a loaded-from-slot `Value` to match its declared field
 /// type.
 ///
@@ -1615,20 +1939,67 @@ pub fn default_value_for_descriptor(desc_byte: u8) -> Option<Value> {
 /// - unknown descriptor: unchanged (`_ => value`).
 ///
 /// Defensive: never panics; always returns a `Value`.
+///
+/// # G30: the lossy arms are now instrumented, and NOTHING ELSE CHANGED
+///
+/// Three of the arms below do not normalise a value, they DESTROY it, and
+/// until 2026-08-17 every one of them was silent in a release build
+/// (`G30-1-the-silent-reference-slot-coercion-20260817.md`). They are now
+/// routed through [`note_field_coercion_loss`], which counts and (rate-limited)
+/// warns. **The returned `Value` is byte-identical to what this function
+/// returned before**, deliberately: 400 measured sites in this tree rely on
+/// the current answers, `java.util.HashMap.table` load-bearingly so (see the
+/// `b'L'` arm), and a VM that started refusing them all at once would fail
+/// catastrophically and prove nothing. Visibility first; the per-site repairs
+/// are nominated individually.
+///
+/// See [`coerce_field_value_for_slot`] for the variant that carries the
+/// class and slot into the report.
 #[inline]
 pub fn coerce_field_value_by_descriptor(value: Value, desc_byte: u8) -> Value {
+    coerce_field_value_for_slot(value, desc_byte, FieldCoercionSite::UNATTRIBUTED)
+}
+
+/// [`coerce_field_value_by_descriptor`] with provenance for the instrument.
+///
+/// The coercion itself is identical; `site` only decides how good the warning
+/// is. `Heap`'s own four descriptor-aware accessors pass a real site. The
+/// three collectors on the live `VmHeap` dispatch path (`gen_heap.rs`,
+/// `g1.rs`, `zgc.rs` via `collector.rs`) still call the descriptor-only
+/// entry point above and therefore report `UNATTRIBUTED`; upgrading them is
+/// a one-line change per call site and is NOMINATION 1 of the G30 record —
+/// it is not taken here because those files belong to other lanes.
+#[inline]
+pub fn coerce_field_value_for_slot(value: Value, desc_byte: u8, site: FieldCoercionSite) -> Value {
     match desc_byte {
         b'J' => match value {
             Value::Long(_) => value,
             Value::Double(d) => Value::Long(d.to_bits() as i64),
             Value::Float(f) => Value::Long(f.to_bits() as i64),
             Value::Int(i) => Value::Long(i as i64),
-            Value::Object(None) | Value::Uninitialized => Value::Long(0),
+            // `Uninitialized` is the allocator's "no value yet" tag, not a
+            // claim by any writer about what the slot holds, so it is the one
+            // arm here that is NOT a loss and is left silent. Splitting it out
+            // of the shared `Object(None) | Uninitialized` pattern is the only
+            // structural change in this function; both still yield `Long(0)`.
+            Value::Uninitialized => Value::Long(0),
+            Value::Object(None) => {
+                note_field_coercion_loss(FieldCoercionLoss::NullIntoPrimitive, site, value, b'J');
+                Value::Long(0)
+            }
             // An object pointer landing in a long slot is upstream drift;
             // surface the raw pointer as a long so downstream unsafe ops
             // can decode it (matches HotSpot behavior of treating the slot
             // as raw bits).
-            Value::Object(Some(o)) => Value::Long(o.as_ptr() as usize as i64),
+            Value::Object(Some(o)) => {
+                note_field_coercion_loss(
+                    FieldCoercionLoss::PointerIntoPrimitive,
+                    site,
+                    value,
+                    b'J',
+                );
+                Value::Long(o.as_ptr() as usize as i64)
+            }
             Value::ReturnAddress(pc) => Value::Long(pc as i64),
         },
         b'D' => match value {
@@ -1636,8 +2007,20 @@ pub fn coerce_field_value_by_descriptor(value: Value, desc_byte: u8) -> Value {
             Value::Long(l) => Value::Double(f64::from_bits(l as u64)),
             Value::Float(f) => Value::Double(f as f64),
             Value::Int(i) => Value::Double(i as f64),
-            Value::Object(None) | Value::Uninitialized => Value::Double(0.0),
-            Value::Object(Some(o)) => Value::Double(f64::from_bits(o.as_ptr() as usize as u64)),
+            Value::Uninitialized => Value::Double(0.0),
+            Value::Object(None) => {
+                note_field_coercion_loss(FieldCoercionLoss::NullIntoPrimitive, site, value, b'D');
+                Value::Double(0.0)
+            }
+            Value::Object(Some(o)) => {
+                note_field_coercion_loss(
+                    FieldCoercionLoss::PointerIntoPrimitive,
+                    site,
+                    value,
+                    b'D',
+                );
+                Value::Double(f64::from_bits(o.as_ptr() as usize as u64))
+            }
             Value::ReturnAddress(pc) => Value::Double(pc as f64),
         },
         b'F' => match value {
@@ -1645,8 +2028,20 @@ pub fn coerce_field_value_by_descriptor(value: Value, desc_byte: u8) -> Value {
             Value::Int(i) => Value::Float(f32::from_bits(i as u32)),
             Value::Long(l) => Value::Float(f32::from_bits(l as u32)),
             Value::Double(d) => Value::Float(d as f32),
-            Value::Object(None) | Value::Uninitialized => Value::Float(0.0),
-            Value::Object(Some(o)) => Value::Float(f32::from_bits(o.as_ptr() as usize as u32)),
+            Value::Uninitialized => Value::Float(0.0),
+            Value::Object(None) => {
+                note_field_coercion_loss(FieldCoercionLoss::NullIntoPrimitive, site, value, b'F');
+                Value::Float(0.0)
+            }
+            Value::Object(Some(o)) => {
+                note_field_coercion_loss(
+                    FieldCoercionLoss::PointerIntoPrimitive,
+                    site,
+                    value,
+                    b'F',
+                );
+                Value::Float(f32::from_bits(o.as_ptr() as usize as u32))
+            }
             Value::ReturnAddress(pc) => Value::Float(f32::from_bits(pc)),
         },
         b'I' | b'B' | b'C' | b'S' | b'Z' => match value {
@@ -1654,8 +2049,30 @@ pub fn coerce_field_value_by_descriptor(value: Value, desc_byte: u8) -> Value {
             Value::Long(l) => Value::Int(l as i32),
             Value::Float(f) => Value::Int(f.to_bits() as i32),
             Value::Double(d) => Value::Int(d.to_bits() as i32),
-            Value::Object(None) | Value::Uninitialized => Value::Int(0),
-            Value::Object(Some(o)) => Value::Int(o.as_ptr() as usize as i32),
+            Value::Uninitialized => Value::Int(0),
+            // MEASURED, G25-1 §1 consequence 1: this arm is how
+            // `create_ssl_server_socket`'s fourth write — an explicit
+            // `Value::Object(None)` aimed at what its model called slot 3 —
+            // became `java.net.ServerSocket.closed = false`. It is not a
+            // "dropped" store, it is a store of the typed zero.
+            Value::Object(None) => {
+                note_field_coercion_loss(
+                    FieldCoercionLoss::NullIntoPrimitive,
+                    site,
+                    value,
+                    desc_byte,
+                );
+                Value::Int(0)
+            }
+            Value::Object(Some(o)) => {
+                note_field_coercion_loss(
+                    FieldCoercionLoss::PointerIntoPrimitive,
+                    site,
+                    value,
+                    desc_byte,
+                );
+                Value::Int(o.as_ptr() as usize as i32)
+            }
             Value::ReturnAddress(pc) => Value::Int(pc as i32),
         },
         b'L' | b'[' => match value {
@@ -1671,7 +2088,22 @@ pub fn coerce_field_value_by_descriptor(value: Value, desc_byte: u8) -> Value {
             // primitive to null lets `HashMap.resize()`'s
             //   `(oldTab == null) ? 0 : oldTab.length` branch handle the
             // never-initialized case correctly.
-            Value::Int(_) | Value::Long(_) => Value::Object(None),
+            //
+            // G30: this rule is DELIBERATE AND LOAD-BEARING and must not be
+            // deleted — `the_hashmap_table_degrade_to_null_is_pinned` fails if
+            // it is. What was wrong was never the rule; it was that the rule
+            // fired in silence, so the 374 callers writing an `Int` at a
+            // reference slot could not tell they were writing null. The
+            // instrument below is the whole of the change.
+            Value::Int(_) | Value::Long(_) => {
+                note_field_coercion_loss(
+                    FieldCoercionLoss::PrimitiveIntoReference,
+                    site,
+                    value,
+                    desc_byte,
+                );
+                Value::Object(None)
+            }
             // A `Value::Double` landing in a reference-typed (`L`/`[`) field is
             // a genuine type error — the bytecode wrote a primitive where the
             // class layout declares a reference. Degrade it to null, exactly
@@ -1684,8 +2116,34 @@ pub fn coerce_field_value_by_descriptor(value: Value, desc_byte: u8) -> Value {
             // aligned address would be handed to the GC and field accessors as
             // a real object, causing a use-after-free or worse. Numeric data
             // is NOT a pointer — never manufacture one. Coerce to null.
-            Value::Double(_) => Value::Object(None),
-            _ => value,
+            Value::Double(_) => {
+                note_field_coercion_loss(
+                    FieldCoercionLoss::PrimitiveIntoReference,
+                    site,
+                    value,
+                    desc_byte,
+                );
+                Value::Object(None)
+            }
+            // G30, SOURCE-VERIFIED and left alone on purpose: `Float` and
+            // `ReturnAddress` fall through the old `_ => value` arm, so a
+            // `Value::Float` written at a reference slot is neither refused
+            // nor nulled — it is STORED, and a later reader sees a `Float`
+            // where the class declares an object. That asymmetry with the
+            // `Double` arm two lines up is almost certainly an oversight, but
+            // closing it is a behaviour change at an unknown number of sites,
+            // so it is reported and NOT repaired here (G30 NOMINATION 6).
+            // The value is passed through byte-identically to before.
+            Value::Float(_) | Value::ReturnAddress(_) => {
+                note_field_coercion_loss(
+                    FieldCoercionLoss::PrimitiveIntoReferenceUncoerced,
+                    site,
+                    value,
+                    desc_byte,
+                );
+                value
+            }
+            Value::Uninitialized => value,
         },
         _ => value,
     }
@@ -3241,6 +3699,279 @@ mod tests {
             Value::Object(Some(o)) => assert_eq!(o.as_ptr(), other.as_ptr()),
             other => panic!("expected Object(Some), got {other:?}"),
         }
+    }
+
+    // ----- G30: the descriptor-coercion loss instrument ---------------------
+    //
+    // These pin two separate things, and the second matters more than the
+    // first: (a) that the instrument exists and classifies correctly, and
+    // (b) that it changed NO ANSWER. 400 measured sites in this tree write a
+    // primitive at a reference slot; `java.util.HashMap` cannot survive that
+    // store being refused, and `RJdkHello` cannot survive it being boxed.
+    //
+    // Counter isolation: the counters are process-global and `cargo test`
+    // runs this module in parallel, so every test that reads them takes
+    // `G30_COUNTERS` first. The pre-G30 `t10_9_e_*` tests deliberately do NOT
+    // need the lock — they call `coerce_field_value_by_descriptor`, which
+    // lands in the `Unattributed` COLUMN, while every assertion here is on
+    // the `Read`/`Store` columns.
+
+    static G30_COUNTERS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn g30_lock() -> std::sync::MutexGuard<'static, ()> {
+        // A panicking test must not poison the rest of the suite into
+        // failing for an unrelated reason.
+        G30_COUNTERS.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn g30_count(loss: FieldCoercionLoss, kind: FieldAccessKind) -> u64 {
+        field_coercion_loss_counts()[loss.index()][kind.index()]
+    }
+
+    /// THE PIN. `java.util.HashMap.table` is declared
+    /// `[Ljava/util/HashMap$Node;`, and CratonVM's synthetic init paths write
+    /// `Value::Int(capacity)` there. The `b'L' | b'['` arm turning that into
+    /// `null` is what lets `HashMap.resize()`'s
+    /// `(oldTab == null) ? 0 : oldTab.length` handle the never-initialised
+    /// case; without it the JDK's own `arraylength` aborts with
+    /// "expected object reference, got int(N)". This is rule `S111r29` and it
+    /// is LOAD-BEARING.
+    ///
+    /// The obvious reading of the G30 defect — "stop nulling, refuse instead"
+    /// — breaks exactly this, which is why the instrument counts and does not
+    /// intervene. If a later lane deletes the degrade, this test is the thing
+    /// that says so.
+    #[test]
+    fn the_hashmap_table_degrade_to_null_is_pinned() {
+        let _g = g30_lock();
+        let heap = Heap::new();
+        // Slot 2 stands for `HashMap.table`; `[` is its real descriptor byte.
+        let map = heap.alloc_object(ClassId::new(7), 3);
+
+        for capacity in [Value::Int(16), Value::Int(1), Value::Long(64)] {
+            heap.set_field_as(map, 2, capacity, b'[');
+            assert_eq!(
+                heap.get_field(map, 2),
+                Value::Object(None),
+                "a capacity written at HashMap.table must degrade to null so \
+                 `(oldTab == null) ? 0 : oldTab.length` takes the null branch; \
+                 refusing or boxing the store breaks HashMap.resize()",
+            );
+            assert_eq!(
+                heap.get_field_as(map, 2, b'['),
+                Value::Object(None),
+                "and it must still read back as null through the \
+                 descriptor-aware getter",
+            );
+        }
+
+        // A genuine table array is untouched — the degrade must not fire on
+        // the case it exists to make possible.
+        let table = heap.alloc_object(ClassId::new(8), 0);
+        heap.set_field_as(map, 2, Value::Object(Some(table)), b'[');
+        match heap.get_field_as(map, 2, b'[') {
+            Value::Object(Some(o)) => assert_eq!(o.as_ptr(), table.as_ptr()),
+            other => panic!("a real table array must survive, got {other:?}"),
+        }
+    }
+
+    /// The whole point of G30: the instrument observes, it does not repair.
+    /// Every answer below is the answer this function gave BEFORE the
+    /// instrument existed. If any of these move, 400 call sites move with
+    /// them.
+    #[test]
+    fn the_g30_instrument_changes_no_answer() {
+        let heap = Heap::new();
+        let obj = heap.alloc_object(ClassId::new(1), 1);
+        let ptr = obj.as_ptr() as usize;
+        let site = FieldCoercionSite::store(None, 0);
+        let c = |v: Value, d: u8| coerce_field_value_for_slot(v, d, site);
+
+        // Lossless normalisation — untouched arms, listed so a refactor that
+        // "tidies" them fails here.
+        assert_eq!(c(Value::Int(-7), b'J'), Value::Long(-7));
+        assert_eq!(c(Value::Double(f64::from_bits(42)), b'J'), Value::Long(42));
+        assert_eq!(c(Value::Long(5), b'I'), Value::Int(5));
+
+        // `Uninitialized` is the allocator's tag, not a claim about the slot:
+        // still the typed zero, and (see the next test) still silent.
+        assert_eq!(c(Value::Uninitialized, b'J'), Value::Long(0));
+        assert_eq!(c(Value::Uninitialized, b'I'), Value::Int(0));
+        assert_eq!(c(Value::Uninitialized, b'L'), Value::Uninitialized);
+
+        // null -> primitive: the typed zero. G25-1 §1: this is the arm that
+        // turned an `Object(None)` aimed at a model slot into
+        // `java.net.ServerSocket.closed = false`.
+        assert_eq!(c(Value::Object(None), b'J'), Value::Long(0));
+        assert_eq!(c(Value::Object(None), b'I'), Value::Int(0));
+        assert_eq!(c(Value::Object(None), b'Z'), Value::Int(0));
+        assert_eq!(c(Value::Object(None), b'F'), Value::Float(0.0));
+        assert_eq!(c(Value::Object(None), b'D'), Value::Double(0.0));
+
+        // pointer -> primitive: the address, as a number.
+        assert_eq!(c(Value::Object(Some(obj)), b'J'), Value::Long(ptr as i64));
+        assert_eq!(c(Value::Object(Some(obj)), b'I'), Value::Int(ptr as i32));
+
+        // primitive -> reference: null, for Int/Long/Double...
+        assert_eq!(c(Value::Int(99), b'L'), Value::Object(None));
+        assert_eq!(c(Value::Long(99), b'['), Value::Object(None));
+        assert_eq!(c(Value::Double(1.5), b'L'), Value::Object(None));
+        // ...but NOT for Float, which is stored as-is. That asymmetry is
+        // pre-existing and disclosed, not introduced here.
+        assert_eq!(c(Value::Float(1.5), b'L'), Value::Float(1.5));
+
+        // Unknown descriptor still fails open.
+        assert_eq!(c(Value::Int(99), b'V'), Value::Int(99));
+
+        // And the descriptor-only entry point agrees with the sited one.
+        for (v, d) in [
+            (Value::Int(3), b'L'),
+            (Value::Object(None), b'I'),
+            (Value::Float(1.5), b'L'),
+            (Value::Uninitialized, b'J'),
+        ] {
+            assert_eq!(
+                coerce_field_value_by_descriptor(v, d),
+                coerce_field_value_for_slot(v, d, site),
+                "provenance must not change the answer for {v:?} at {}",
+                d as char,
+            );
+        }
+    }
+
+    /// Each destroyed value lands in its own (species, direction) cell.
+    ///
+    /// Direction is the part that earns its keep: MEASURED on the pre-G30
+    /// binary, 336 of the 352 cross-type accesses in one `RJdkNet` run are
+    /// READS of `java.lang.ref.ReferenceQueue.head` on a slot that was never
+    /// descriptor-initialised — benign, because the read answers `null`,
+    /// which is what the field means. Counting those in the same bucket as a
+    /// store is how the 16 real stores become invisible.
+    #[test]
+    fn each_destroyed_value_is_counted_under_its_own_species_and_direction() {
+        let _g = g30_lock();
+        let heap = Heap::new();
+        let obj = heap.alloc_object(ClassId::new(1), 2);
+        let store = FieldCoercionSite::store(Some(ClassId::new(1)), 0);
+        let read = FieldCoercionSite::read(Some(ClassId::new(1)), 0);
+
+        let before = field_coercion_loss_counts();
+        let total_before = field_coercion_loss_total();
+
+        coerce_field_value_for_slot(Value::Int(42), b'L', store);
+        coerce_field_value_for_slot(Value::Double(1.0), b'[', store);
+        coerce_field_value_for_slot(Value::Float(1.0), b'L', store);
+        coerce_field_value_for_slot(Value::Object(None), b'I', store);
+        coerce_field_value_for_slot(Value::Object(Some(obj)), b'J', store);
+        coerce_field_value_for_slot(Value::Int(42), b'L', read);
+
+        let after = field_coercion_loss_counts();
+        let d = |l: FieldCoercionLoss, k: FieldAccessKind| {
+            after[l.index()][k.index()] - before[l.index()][k.index()]
+        };
+        // Fully qualified rather than glob-imported: `Read` and `Store` are
+        // names a future `use` in this module could easily shadow, and the
+        // failure mode would be a type error a long way from here.
+        assert_eq!(
+            d(
+                FieldCoercionLoss::PrimitiveIntoReference,
+                FieldAccessKind::Store
+            ),
+            2,
+            "Int and Double",
+        );
+        assert_eq!(
+            d(
+                FieldCoercionLoss::PrimitiveIntoReference,
+                FieldAccessKind::Read
+            ),
+            1,
+        );
+        assert_eq!(
+            d(
+                FieldCoercionLoss::PrimitiveIntoReferenceUncoerced,
+                FieldAccessKind::Store
+            ),
+            1,
+            "Float",
+        );
+        assert_eq!(
+            d(FieldCoercionLoss::NullIntoPrimitive, FieldAccessKind::Store),
+            1,
+        );
+        assert_eq!(
+            d(
+                FieldCoercionLoss::PointerIntoPrimitive,
+                FieldAccessKind::Store
+            ),
+            1,
+        );
+        assert_eq!(field_coercion_loss_total() - total_before, 6);
+    }
+
+    /// The zero-init contract must stay silent.
+    ///
+    /// `alloc_object_with_descriptors` leaves slots tagged `Uninitialized`,
+    /// and normalising those to the typed zero is the FIX from R1, not a
+    /// defect. If they were counted, every allocation would look like a
+    /// violation and the instrument would be worthless.
+    #[test]
+    fn an_uninitialized_slot_is_not_reported_as_a_loss() {
+        let _g = g30_lock();
+        let site = FieldCoercionSite::store(None, 0);
+        let before = field_coercion_loss_total();
+        for d in [b'J', b'D', b'F', b'I', b'B', b'C', b'S', b'Z', b'L', b'['] {
+            coerce_field_value_for_slot(Value::Uninitialized, d, site);
+        }
+        assert_eq!(
+            field_coercion_loss_total(),
+            before,
+            "Uninitialized is the allocator's 'no value yet' tag, not a \
+             writer's claim about the slot — it must never be counted",
+        );
+    }
+
+    /// The report renders only what fired, and names the species it renders.
+    #[test]
+    fn the_loss_report_names_every_species_that_fired() {
+        let _g = g30_lock();
+        let site = FieldCoercionSite::store(None, 0);
+        coerce_field_value_for_slot(Value::Int(1), b'L', site);
+        let report =
+            field_coercion_loss_report().expect("a loss has fired, so the report must not be None");
+        assert!(
+            report.contains("primitive-into-reference"),
+            "report should name the species that fired: {report}",
+        );
+        assert!(
+            report.contains("store="),
+            "report should break the count down by access direction: {report}",
+        );
+    }
+
+    /// The heap's own descriptor-aware setter reports as a STORE and carries
+    /// the class and slot. This is the shape NOMINATION 1 asks the three
+    /// live collectors to adopt; pinning it here means the nomination can be
+    /// applied mechanically.
+    #[test]
+    fn the_descriptor_aware_setter_reports_a_store_with_provenance() {
+        let _g = g30_lock();
+        let heap = Heap::new();
+        let obj = heap.alloc_object(ClassId::new(3), 1);
+        let before = g30_count(
+            FieldCoercionLoss::PrimitiveIntoReference,
+            FieldAccessKind::Store,
+        );
+        heap.set_field_as(obj, 0, Value::Int(1234), b'L');
+        assert_eq!(
+            g30_count(
+                FieldCoercionLoss::PrimitiveIntoReference,
+                FieldAccessKind::Store,
+            ),
+            before + 1,
+            "Heap::set_field_as must attribute its loss to the STORE column",
+        );
+        assert_eq!(heap.get_field(obj, 0), Value::Object(None));
     }
 
     // ----- Part F: GPU/GC coordination tests --------------------------------

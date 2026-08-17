@@ -1286,6 +1286,40 @@ pub fn get_or_create_class_mirror(shared: &SharedVm, class_id: ClassId) -> Objec
     // and the two inline emitters, or refuse to inline reference loads); this
     // site is the wrong place to force it. Do not re-gate this without first
     // finding the reader that needs the fallback.
+    //
+    // G30 (2026-08-17) — TWO CORRECTIONS TO THE PARAGRAPHS ABOVE, both
+    // MEASURED, and the second one is a trap:
+    //
+    //   1. This site is not "one of the" W7-84 sites, it is THE W7-84 site.
+    //      MEASURED, `RJdkHello --jdk-only` with `CRATONVM_DBG_OVERLAY=1`:
+    //      every one of the 12 `cratonvm::gc::guard` warnings a run emits is
+    //      `class_id=ClassId(12) index=0`, and 12 log lines stand for at
+    //      least 33 stores because the guard is rate-limited to
+    //      `n < 8 || n.is_power_of_two()`. Corroborated across
+    //      `RJdkNet`/`RJdkAsyncChannel`/`RSslNullSession`/`RJdkCollections`/
+    //      `RCrypto`: 11-12 warnings each, same class, same slot. So a W7-84
+    //      count is a census of THIS LINE and of nothing else — it is not a
+    //      proxy for "primitives written at reference slots" anywhere in the
+    //      tree, and G30-1 §1 records two records that read it that way.
+    //
+    //   2. The comment above says `NativeContextImpl::set_field` "also runs
+    //      the value through `set_field_as` with the DECLARED descriptor, so
+    //      the stored tag depends on that coercion — it is not obviously a
+    //      stable Int". That is true of a NATIVE writing this slot and false
+    //      of THIS write, and the difference decides whether the mirror
+    //      works. The call below is the descriptor-LESS `set_field`, whose
+    //      compact-reference arm goes to `gc::autobox::box_for_reference_slot`
+    //      and BOXES: slot 0 ends up holding an `AUTOBOX_CLASS_ID` wrapper
+    //      that `Heap::get_field` un-boxes back to `Int`, which is what
+    //      `mirror_class_id`'s fallback needs. The descriptor-aware
+    //      `set_field_as(.., b'L')` goes to
+    //      `gc::heap::coerce_field_value_for_slot` instead, whose `b'L'` arm
+    //      maps `Int(_)` to `Value::Object(None)` — it would store a NULL,
+    //      the fallback would answer `None`, and `RJdkHello` would fail at
+    //      `System.out instanceof PrintStream` exactly as the gate above
+    //      already made it fail. **Do not "modernise" this to
+    //      `set_field_as`.** `the_class_mirror_id_is_written_without_a_field_descriptor`
+    //      is the tripwire.
     shared
         .mem
         .heap
@@ -2592,6 +2626,62 @@ mod tests {
         assert_eq!(
             get_static_shared(&shared, ClassId::new(2), 0),
             Value::Int(20)
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // G30 — the class-mirror overlay and the coercion it must never meet
+    // -----------------------------------------------------------------------
+
+    /// The two mirror populators write their VM-internal tag into slot 0 of an
+    /// object stamped `java/lang/Class`, whose real JDK 25 slot 0 is
+    /// `Constructor<T> cachedConstructor` — a REFERENCE. Which store they use
+    /// decides what ends up there, and the two answers are not close:
+    ///
+    /// | store | path | slot 0 afterwards |
+    /// |---|---|---|
+    /// | `set_field` (descriptor-less) | `gc::autobox::box_for_reference_slot` | an `AUTOBOX_CLASS_ID` wrapper that `get_field` un-boxes back to `Int` |
+    /// | `set_field_as(.., b'L')` | `gc::heap::coerce_field_value_for_slot` | **`Value::Object(None)`** — the tag is gone |
+    ///
+    /// `mirror_class_id` falls back to slot 0 when `class_mirrors_reverse`
+    /// misses, and that fallback is load-bearing: gating this write off was
+    /// measured to fail `RJdkHello` at `System.out instanceof PrintStream`
+    /// (see the long note at the write site). Nulling it would do the same
+    /// thing by a different route, and would do it silently, because the
+    /// coercion does not refuse — it answers `null` and returns.
+    ///
+    /// This has to scan source. The defect it guards against is a change that
+    /// compiles, runs, and produces a mirror that is wrong only where the
+    /// reverse map happens to miss, so there is nothing to observe from a
+    /// unit test that does not know which lookups will miss.
+    #[test]
+    fn the_class_mirror_id_is_written_without_a_field_descriptor() {
+        // Scan only what is ABOVE this test module. Every needle below also
+        // appears verbatim in this test's own assertions, so scanning the
+        // whole file would find each one inside itself and the test would
+        // pass whatever the real code said.
+        let src = include_str!("vm_object.rs")
+            .split("mod tests {")
+            .next()
+            .expect("split always yields a first element");
+        for (marker, what) in [
+            (
+                "set_field(mirror, 0, Value::Int(class_id.as_u32() as i32))",
+                "get_or_create_class_mirror",
+            ),
+            (
+                "set_field(mirror, 0, Value::Int(-1))",
+                "get_or_create_primitive_mirror",
+            ),
+        ] {
+            assert!(
+                src.contains(marker),
+                "{what} must still write the mirror's ClassId tag into slot 0                  through the DESCRIPTOR-LESS `set_field`. If this fired                  because the call was switched to `set_field_as`, revert it:                  the `b'L'` arm of `gc::heap::coerce_field_value_for_slot`                  maps `Int(_)` to `Object(None)`, so the tag would be replaced                  by null and `mirror_class_id`'s fallback would answer None.                  If it fired because the write was deleted, see the measured                  `RJdkHello` regression recorded at the write site.",
+            );
+        }
+        assert!(
+            !src.contains("set_field_as(mirror, 0"),
+            "slot 0 of a class mirror must never be written through the              descriptor-aware setter — see the table on this test",
         );
     }
 }
