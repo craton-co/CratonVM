@@ -128,8 +128,68 @@ So the guarded inline check is **not** "always failing". It is largely not being
 reached: the hot method is compiled by the tier that declines to inline in the
 first place. The single-pass slow path is real but is the minority (~12%).
 
-`emit_inline_getfield` has seven early-outs; which one fires is the open
-question, and is being counted rather than guessed.
+### The refusal reason, and a fix that closed it without moving the number
+
+Counting the seven early-outs named exactly one:
+
+```
+IR-tier inline-getfield refusals: width-not-int-category=4
+```
+
+`emit_inline_getfield` refused every field that was neither a reference nor
+int-category — i.e. **every `long`, `double` and `float`**. A `long` on a hot
+path is not exotic (BouncyCastle's `GeneralDigest.byteCount` is one), so this
+was fixed: `J`/`D` as 8-byte compact loads, `F` as a 4-byte one (the helper
+ZERO-extends `f.to_bits()`, so `MOVSXD` would corrupt every float with bit 31
+set), each admitted only when the IR node's own type agrees with the descriptor.
+
+**The fix works and changes nothing.**
+
+| | helper calls | arms emitting a CALL | refusals |
+|---|---|---|---|
+| before | 48 974 370 | `sp-compact-inline-slowpath=50` `ir-helper-fallback=4` | `width-not-int-category=4` |
+| after | 48 973 916 | `sp-compact-inline-slowpath=50` | *(none)* |
+
+The four unguarded fallback sites are gone and the refusal count is zero — and
+the helper count is identical. **Keep the fix** (it closes a real gap and
+removes four unguarded `CALL`s) but do **not** bank it as a throughput win: it
+is worth zero on this workload.
+
+### MY OWN MIS-ATTRIBUTION, recorded so it is not repeated
+
+The "~88% comes from the IR tier" claim above was **wrong**, and it was wrong in
+the same way the page's original hypotheses were: inferred from a configuration
+A/B instead of measured. Raising `CRATONVM_TIER_C2_THRESHOLD` moved helper calls
+48.9 M → 5.7 M, and I read that as "the IR arm was executing 43 M times". It is
+not — raising the threshold changes *which code is compiled at all*, not just
+which arm emits. The fix above proves it: removing every IR fallback site left
+the count untouched.
+
+**Emission counts are not execution counts.** The census answers "which arms
+emitted a CALL", which is not the question. Nothing here has yet measured which
+CALL *executes*.
+
+### The instrument this actually needs, and the site the census missed
+
+There is a **sixth** helper call site that was never tagged:
+`ir_lower.rs`'s `emit_inline_getfield` calls the helper from **its own slow
+path**, not only from the fallback. So a site can be counted as "inlined" and
+still take the helper on every execution.
+
+The open contradiction, stated plainly so the next attempt starts from it:
+
+* on Generational the rejected receiver `0x20042400db8` is **inside** published
+  region 0, so it passes null, alignment and containment;
+* the single-pass compact arm routes a *non-compact* receiver to an inline
+  legacy read, not to the helper;
+* yet ~49 M calls arrive, on every collector.
+
+At least one of those three statements is false, and no configuration A/B can
+say which. **The next step is per-call-site EXECUTION counting** — a distinct
+thin helper wrapper per emission arm (including `ir_lower.rs:2444`), each
+bumping its own counter before tail-calling `jit_getfield`. That is the only
+instrument that attributes an execution rather than an emission, and this page
+has now cost four hypotheses for want of it.
 
 ## The part that is not yet explained
 
