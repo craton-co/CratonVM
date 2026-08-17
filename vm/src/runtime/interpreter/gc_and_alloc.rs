@@ -4751,10 +4751,21 @@ pub(crate) fn apply_pointer_map_to_thread(
     // has resumed, so a frame slot holding a map KEY is unambiguously a slot the
     // remap did not reach.
     if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_BLOCKGC").is_some() {
+        // A source address this slide also wrote a SURVIVOR to is not evidence:
+        // survivors slide down into the space vacated objects left, so a slot
+        // legitimately holding that survivor names an address that is also a
+        // map key. Excluding destinations is what separates "the remap missed
+        // this slot" from "this slot holds the object that moved INTO the
+        // address" — the same distinction that made the first vacated-frames
+        // instrument report eight findings a run that were all correct code.
+        let destinations: rustc_hash::FxHashSet<usize> = pointer_map.values().copied().collect();
         for (fi, fr) in thread.frames.iter().enumerate() {
             for li in 0..fr.locals_len() {
                 if let Value::Object(Some(o)) = fr.get_local(li as u16) {
                     let a = o.as_ptr() as usize;
+                    if destinations.contains(&a) {
+                        continue;
+                    }
                     if let Some(new) = pointer_map.get(&a).copied() {
                         eprintln!(
                             "[blockgc] ARRIVE-STALE tid={} frame#{fi} {}.{} pc={} local[{li}] 0x{a:x}->0x{new:x} in_map={}",
@@ -4767,6 +4778,9 @@ pub(crate) fn apply_pointer_map_to_thread(
             for si in 0..fr.stack.len() {
                 if let Value::Object(Some(o)) = fr.stack.peek_at(si) {
                     let a = o.as_ptr() as usize;
+                    if destinations.contains(&a) {
+                        continue;
+                    }
                     if let Some(new) = pointer_map.get(&a).copied() {
                         eprintln!(
                             "[blockgc] ARRIVE-STALE tid={} frame#{fi} {}.{} pc={} stack[{si}] 0x{a:x}->0x{new:x} in_map={}",
