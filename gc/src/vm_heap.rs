@@ -2561,11 +2561,32 @@ impl VmHeap {
             let (skipped, floor, old_live) = h.nursery_stats();
             let (nursery_fired, nursery_budget) = h.nursery_trigger_stats();
             eprintln!(
-                "[GC] zgc-nursery-trigger: fired={nursery_fired}                  budget_bytes={nursery_budget} promotions_by_slide={}",
+                "[GC] zgc-nursery-trigger: fired={nursery_fired}                  budget_bytes={nursery_budget} promotions_by_slide={} \
+                 overshoot_max={}",
                 h.promotions_by_slide(),
+                // BESIDE THE BUDGET, because it is meaningless without it: this
+                // is how far past `budget_bytes` the nursery got before a
+                // safepoint arrived, and it prices "a hard ceiling rather than a
+                // trigger" -- an open item that has had no number attached. See
+                // `ZgcRealHeap::gen_nursery_overshoot_max`.
+                h.nursery_overshoot_max(),
             );
             eprintln!(
                 "[GC] zgc-nursery: sweep_skipped={skipped} floor={floor}                  old_live_bytes={old_live}",
+            );
+            // WHAT THE YOUNG SWEEP STOPPED DOING PER DEAD OBJECT.
+            //
+            // Read the two together and against `young_cycles` above.
+            // `zero_bytes_skipped=0` with `young_cycles>0` means every dead
+            // object was still memset in full, so `CRATONVM_ZGC_GEN_HEADER_ZERO`
+            // is on and inert; `dead_runs == dead_objects` means no two dead
+            // objects were ever adjacent, so the run merge is. Neither number
+            // says it alone -- a small `dead_runs` is equally consistent with a
+            // cycle that found almost no garbage.
+            let (zero_skipped, dead_runs, dead_objects) = h.gen_sweep_cost_stats();
+            eprintln!(
+                "[GC] zgc-sweep-cost: zero_bytes_skipped={zero_skipped} \
+                 dead_runs={dead_runs} dead_objects={dead_objects}",
             );
             // `ZGC_UNSIZABLE_OBJECTS` had no reader anywhere but a unit test.
             // It is the sweep's own count of registered objects whose header it

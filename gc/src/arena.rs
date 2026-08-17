@@ -2374,6 +2374,66 @@ mod prefer_bump_tests {
         );
     }
 
+    /// **A pre-merged run coalesces to the same free list as its members do.**
+    ///
+    /// This is the claim the ZGC young sweep's run merge rests on
+    /// (`zgc_gen_dead_runs`): handing one span per run of adjacent dead objects
+    /// must leave the arena in the state that handing one span per object leaves
+    /// it in, because `coalesce_free_list` merges exactly those spans into
+    /// exactly that run a few statements later either way.
+    ///
+    /// It is not self-evident, and the reason is `add_free_block`'s **region
+    /// routing**: a span goes to the small or the large tier by its own size, so
+    /// a merged run routes differently on the way IN than its members did. What
+    /// makes the result identical is that the coalescer rebuilds the list from
+    /// `low_blocks_sorted` rather than merging in place — so the routing on the
+    /// way in cannot survive it. Asserted rather than assumed, because "the
+    /// coalescer normalises it" is the entire safety argument for the merge and
+    /// it is one refactor away from stopping being true.
+    #[test]
+    fn an_arena_coalesces_pre_merged_runs_to_the_same_shape() {
+        const N: usize = 16;
+        const SZ: usize = 256;
+
+        // Same arena, same bumped region, same total span -- the only difference
+        // is how many calls it arrives in.
+        let shape = |per_object: bool| -> (Vec<(usize, usize)>, usize, usize) {
+            let mut a = Arena::new(64 * 1024);
+            let base = a.base_ptr() as usize;
+            let p = a.alloc(N * SZ, 8).expect("one bumped region") as usize;
+            let off = p - base;
+            if per_object {
+                for i in 0..N {
+                    a.add_free_block(off + i * SZ, SZ);
+                }
+            } else {
+                a.add_free_block(off, N * SZ);
+            }
+            a.coalesce_free_list();
+            (a.free_blocks_sorted(), a.free_list_bytes(), a.largest_free_block())
+        };
+
+        let (blocks_each, bytes_each, largest_each) = shape(true);
+        let (blocks_run, bytes_run, largest_run) = shape(false);
+
+        assert_eq!(
+            blocks_each, blocks_run,
+            "the free list must have the same SPANS either way"
+        );
+        assert_eq!(bytes_each, bytes_run, "and the same total");
+        assert_eq!(
+            largest_each, largest_run,
+            "and the same largest block -- which is the figure an allocation \
+             decision is actually taken on"
+        );
+        assert_eq!(
+            bytes_run,
+            N * SZ,
+            "and the fixture must have freed the whole region, or this compares \
+             two empty lists and passes for nothing"
+        );
+    }
+
     /// **Off by default**, so no other collector's layout changes.
     #[test]
     fn bump_first_is_off_unless_asked_for() {
