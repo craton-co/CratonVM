@@ -12,14 +12,19 @@ import java.util.Objects;
  * small method called REPS times — never a loop inline in `main`, which on this
  * VM measures the interpreter.
  *
- * Measured 2026-08-17 (real-JDK mode, G1), before and after wiring
- * `jit_preconditions_check_index_direct` / `jit_reachability_fence_direct` into
- * all THREE compile doors:
+ * Measured 2026-08-17 (real-JDK mode, G1) as a SAME-BINARY A/B on the kill
+ * switch — `CRATONVM_JIT_CENSUS_DIRECT_HELPERS=0` turns the binds off in all
+ * three compile doors, so the two arms differ by one gate and nothing else:
  *
- *   rung                          HotSpot   before    after
- *   Objects.checkIndex             0.27 ns  352.41    19.70   (18x)
- *   Reference.reachabilityFence    0.28 ns  360.64    18.88   (19x)
- *   both in one loop               0.34 ns 1748.61    45.55   (38x)
+ *   rung                          HotSpot   helpers off   helpers on
+ *   Objects.checkIndex             0.27 ns      143.58        23.71   (6.1x)
+ *   Reference.reachabilityFence    0.28 ns      150.73        23.51   (6.4x)
+ *
+ * Do NOT measure this against a binary built from a different commit. The
+ * first numbers taken here were 352/361 ns "before", from a control a day
+ * older than the branch; they overstate the effect by ~2.5x, and the same
+ * pairing on CratonBench manufactured 13-19% "regressions" on phases that call
+ * neither method.
  *
  * The `main` tail is not decoration: a fast path that got the bounds contract
  * wrong would still print these numbers. `charAt(9)` must stay

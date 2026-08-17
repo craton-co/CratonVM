@@ -829,6 +829,7 @@ pub(super) fn compile_osr_artifact(
                     // after this construction block, so reading one here yields
                     // 0 on the first OSR compile in a process.
                     if invoke_kind == 3
+                        && cratonvm_jit::census_direct_helpers_enabled()
                         && target_class == "jdk/internal/util/Preconditions"
                         && mn == "checkIndex"
                         && desc == "(IILjava/util/function/BiFunction;)I"
@@ -850,6 +851,7 @@ pub(super) fn compile_osr_artifact(
                         continue;
                     }
                     if invoke_kind == 3
+                        && cratonvm_jit::census_direct_helpers_enabled()
                         && target_class == "java/lang/ref/Reference"
                         && mn == "reachabilityFence"
                         && desc == "(Ljava/lang/Object;)V"
