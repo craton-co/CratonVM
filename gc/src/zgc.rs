@@ -2525,6 +2525,30 @@ pub struct ZgcRealHeap {
     /// [`Self::conc_phase_nanos`] can be closed out at mark end. `0` when no
     /// cycle is open.
     conc_mark_started_at: AtomicU64,
+    /// Is every registered object's [`GC_FLAG_MARKED`] known to be clear?
+    ///
+    /// # Why this exists: a 34-66 ms pause spent clearing bits that are clear
+    ///
+    /// `start_concurrent_mark` used to walk the whole registry clearing the mark
+    /// bit. The 2026-08-17 pause anatomy measured that walk at **94-96% of the
+    /// mark-start pause** -- 34 ms of 35 on a 4.6M-entry registry, 66 of 69 on a
+    /// 10.8M one -- and then a counter showed `stale_marked=0` on **every one of
+    /// 20 mark starts**, at two different window settings. The walk was clearing
+    /// a bit that was already clear, every time.
+    ///
+    /// It is redundant because the sweep is exhaustive: it visits every
+    /// registered object and clears `GC_FLAG_MARKED` on every survivor, zeroes
+    /// every corpse, and clears the bit even on the object it refuses to size.
+    /// Objects allocated afterwards are born with clear flags, and
+    /// `allocate_black_if_marking` is a no-op with no cycle open.
+    ///
+    /// It is NOT unconditionally redundant, which is why this is a latch and not
+    /// a deletion: [`Self::abandon_concurrent_mark`] drops a partially-traced
+    /// cycle with **no sweep following it**, so the bits that trace set are still
+    /// there. That is the one path that clears this flag.
+    ///
+    /// Starts `true`: a fresh heap has no objects, so the claim holds vacuously.
+    conc_bits_known_clear: AtomicBool,
     /// `allocated` at which a concurrent cycle opens, precomputed from
     /// [`conc_start_percent_setting`] and [`Self::gc_threshold`]. `0` means
     /// concurrent marking is off for this heap, which is the default.
@@ -2927,6 +2951,7 @@ impl ZgcRealHeap {
             conc_ingress_replayed: AtomicUsize::new(0),
             conc_phase_nanos: AtomicU64::new(0),
             conc_mark_started_at: AtomicU64::new(0),
+            conc_bits_known_clear: AtomicBool::new(true),
             conc_start_bytes: AtomicUsize::new({
                 let pct = conc_start_percent_setting();
                 if pct == 0 {
@@ -3170,40 +3195,51 @@ impl ZgcRealHeap {
         let started_at = armed.then(std::time::Instant::now);
         let mut clock = ZPhaseClock::new(armed);
 
-        // (1)
-        let registered = self.registry.snapshot();
-        let snapshot_us = clock.lap();
-        // ONE `bases()` call: it materialises a `Vec` of every registered
-        // base, so calling it again just to count would double a
-        // multi-megabyte allocation inside the pause being measured.
-        let bases = registered.bases();
-        let n_registered = bases.len();
-        // IS THIS WALK DEAD WORK? The anatomy says it is 94-96% of the
-        // mark-start pause (34 ms of 35 on a 6.6M-entry registry, 66 of 69 on a
-        // 10.8M one), so the question is worth one counter.
+        // (1) CLEAR THE MARK BITS -- only if they might not already be clear.
         //
-        // The argument that it is redundant: the sweep already visits every
-        // registered object and clears `GC_FLAG_MARKED` on every survivor,
-        // zeroes every corpse, and clears the bit even on the object it refuses
-        // to size. Objects allocated after that sweep are born with clear flags
-        // and `allocate_black_if_marking` is a no-op with no cycle open. So on
-        // the ordinary path nothing should carry a stale bit into mark start.
+        // This walk was 94-96% of the mark-start pause and a counter found
+        // `stale_marked=0` on every one of 20 mark starts: it was clearing bits
+        // that the previous sweep had already cleared. See
+        // `conc_bits_known_clear` for the full argument and for the one path
+        // (`abandon_concurrent_mark`) that makes it necessary.
         //
-        // The argument that it is NOT: `abandon_concurrent_mark` leaves whatever
-        // the partial trace marked, and no sweep follows it.
-        //
-        // `stale` distinguishes those two without guessing. Counted under
-        // `--verbose:gc` only; the clear itself is unchanged either way, so this
-        // is a pure observation.
+        // The registry snapshot goes with it: its only consumer was this loop.
         let mut stale = 0usize;
-        for base in bases {
-            let h = self.header_mut(base as *mut u8);
-            if armed && h.gc_flags() & GC_FLAG_MARKED != 0 {
-                stale += 1;
+        let mut n_registered = 0usize;
+        let mut snapshot_us = 0u128;
+        let mut clearbits_us = 0u128;
+        let known_clear = self.conc_bits_known_clear.load(Ordering::Acquire);
+        // In a debug build, VERIFY the latch rather than trusting it: walk
+        // anyway and count. A latch that silently lies here hands the sweep a
+        // mark set with a previous cycle's bits in it, which is a retained
+        // object at best. Release builds skip the walk entirely, which is the
+        // whole point.
+        if !known_clear || cfg!(debug_assertions) {
+            let registered = self.registry.snapshot();
+            snapshot_us = clock.lap();
+            // ONE `bases()` call: it materialises a `Vec` of every registered
+            // base, so calling it again just to count would double a
+            // multi-megabyte allocation inside the pause being measured.
+            let bases = registered.bases();
+            n_registered = bases.len();
+            for base in bases {
+                let h = self.header_mut(base as *mut u8);
+                if h.gc_flags() & GC_FLAG_MARKED != 0 {
+                    stale += 1;
+                }
+                h.clear_gc_flags(GC_FLAG_MARKED);
             }
-            h.clear_gc_flags(GC_FLAG_MARKED);
+            clearbits_us = clock.lap();
+            debug_assert!(
+                !known_clear || stale == 0,
+                "zgc: conc_bits_known_clear was set but {stale} registered objects \
+                 carried GC_FLAG_MARKED into mark start"
+            );
         }
-        let clearbits_us = clock.lap();
+        // Whatever the state was, it is clear now and this cycle is about to
+        // start setting bits again -- so the claim is false from here until the
+        // sweep re-establishes it.
+        self.conc_bits_known_clear.store(false, Ordering::Release);
 
         // (2)
         let _skip = self.begin_concurrent_mark_cycle();
@@ -3394,6 +3430,11 @@ impl ZgcRealHeap {
             drop(p);
         }
         self.end_concurrent_mark_cycle();
+        // The partial trace's mark bits are still set and NO SWEEP FOLLOWS an
+        // abandon, so the next mark start must do the walk. This is the only
+        // path that makes that walk necessary, and dropping this store is how
+        // a retained-object bug would be introduced.
+        self.conc_bits_known_clear.store(false, Ordering::Release);
         tracing::debug!(target: "zgc", "zgc concurrent mark: cycle ABANDONED");
     }
 
@@ -10581,6 +10622,13 @@ impl GarbageCollector for ZgcRealHeap {
         // callsite. Adopting the metrics module is a larger step — it has to be
         // fed from every phase, not just here — so this line stays standalone
         // until then; replace it wholesale at that point.
+        // THE SWEEP HAS JUST MADE EVERY MARK BIT CLEAR. It visited every
+        // registered object: survivors had `GC_FLAG_MARKED` cleared, corpses
+        // were zeroed, and the object it refuses to size had the bit cleared
+        // too. That is what lets the next mark start skip a full registry walk
+        // -- see `conc_bits_known_clear`.
+        self.conc_bits_known_clear.store(true, Ordering::Release);
+
         let sweep_us = clock.lap();
         if let Some(started) = gc_started {
             let pause_us = started.elapsed().as_micros();
@@ -15665,6 +15713,74 @@ pub(crate) mod tests {
             heap.is_object_address(victim_addr).is_none(),
             "the next cycle must reclaim it, or SATB conservatism is a leak"
         );
+    }
+
+    /// The mark-start mark-bit walk is skipped when the sweep has already
+    /// cleared them, and NOT skipped after an abandoned cycle.
+    ///
+    /// # Why the second half is the important half
+    ///
+    /// Skipping the walk is worth 94-96% of the mark-start pause, and it is safe
+    /// only because the sweep is exhaustive. `abandon_concurrent_mark` breaks
+    /// that: it drops a partially-traced cycle with no sweep following, so the
+    /// bits that trace set are still on the objects. If the latch stayed `true`
+    /// across an abandon, the next cycle would inherit them and the sweep would
+    /// retain whatever the abandoned trace had reached -- a leak that grows with
+    /// every abandon and that no reachability assertion can see.
+    #[test]
+    fn the_mark_bit_walk_is_skipped_only_when_the_sweep_has_cleared_them() {
+        let heap = ZgcRealHeap::new_shared(32 * 1024 * 1024);
+        // A fresh heap has no objects, so the claim holds vacuously.
+        assert!(heap.conc_bits_known_clear.load(Ordering::Acquire));
+
+        let (head, chain, garbage) = conc_build_graph(&heap, 400, 80);
+
+        // Opening a cycle invalidates it: this cycle is about to set bits.
+        {
+            // SAFETY: single-threaded test.
+            let stw = unsafe { StopTheWorldToken::new() };
+            assert!(heap.start_concurrent_mark(&stw, &[head.as_ptr() as u64]));
+        }
+        assert!(!heap.conc_bits_known_clear.load(Ordering::Acquire));
+
+        // ABANDON: no sweep follows, so the claim must stay false.
+        heap.abandon_concurrent_mark();
+        assert!(
+            !heap.conc_bits_known_clear.load(Ordering::Acquire),
+            "an abandoned cycle leaves its partial trace's mark bits set and no \
+             sweep behind it -- the next mark start MUST do the walk"
+        );
+
+        // A collection re-establishes it, because the sweep is exhaustive.
+        {
+            // SAFETY: single-threaded test.
+            let stw = unsafe { StopTheWorldToken::new() };
+            let mut roots = [head];
+            let _ = heap.collect_garbage(&stw, &mut roots, &NoMonitors);
+        }
+        assert!(
+            heap.conc_bits_known_clear.load(Ordering::Acquire),
+            "the sweep clears every survivor and zeroes every corpse, so after \
+             one the claim holds"
+        );
+        assert_eq!(conc_walk_chain(&heap, head), chain);
+        assert!(garbage.iter().all(|a| heap.is_object_address(*a).is_none()));
+
+        // And the NEXT cycle, opened on that basis, still marks correctly -- the
+        // skip must not turn into a lost mark set.
+        {
+            // SAFETY: single-threaded test.
+            let stw = unsafe { StopTheWorldToken::new() };
+            assert!(heap.start_concurrent_mark(&stw, &[head.as_ptr() as u64]));
+        }
+        {
+            // SAFETY: single-threaded test.
+            let stw = unsafe { StopTheWorldToken::new() };
+            let mut roots = [head];
+            let _ = heap.collect_garbage(&stw, &mut roots, &NoMonitors);
+        }
+        assert_eq!(heap.concurrent_mark_stats().1, 1, "the second cycle certified");
+        assert_eq!(conc_walk_chain(&heap, head), chain);
     }
 
     /// The trigger fires below the collection threshold and not above it, and
