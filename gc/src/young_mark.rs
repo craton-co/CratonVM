@@ -115,6 +115,28 @@ impl YoungMarkBits {
         }
     }
 
+    /// Clear `addr`'s bit. Returns `true` if it had been set.
+    ///
+    /// The ONLY caller is the late base-resolution pass in
+    /// `sweep_young_non_moving`, and only for an address that pass PROVED is
+    /// object-INTERIOR by chaining the arena's own object grid. Such a mark
+    /// retains nothing (the sweep matches marks against object STARTS) while
+    /// still counting as a "live base" for the phantom-extent guard, which
+    /// then condemns the perfectly valid object containing it. Removing it is
+    /// therefore neutral for retention and restores the guard's premise --
+    /// see `SWEEP_PHANTOM_INTERIOR_MARKS` in `gen_heap.rs`.
+    #[inline]
+    pub(crate) fn unmark(&self, addr: usize) -> bool {
+        match self.locate(addr) {
+            None => false,
+            Some((w, mask)) => {
+                // SAFETY: `locate` bounds-checked `addr`, so `w < nwords`.
+                let prev = unsafe { (*self.words.add(w)).fetch_and(!mask, Ordering::Relaxed) };
+                prev & mask != 0
+            }
+        }
+    }
+
     /// Is `addr` marked? (Replacement for `side_marks.contains`.)
     #[inline]
     pub(crate) fn contains(&self, addr: usize) -> bool {

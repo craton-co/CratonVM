@@ -67,6 +67,18 @@ struct GcBarrierInner {
     arrived: u32,
     /// Pointer map from the last GC, shared with threads for frame updates.
     pointer_map: cratonvm_types::PointerMap,
+    /// The generation `pointer_map` belongs to — the value `gc_generation`
+    /// took when `complete_gc` stored it.
+    ///
+    /// A waiter releases on "the generation moved past the one I arrived for"
+    /// and then clones whatever map is stored. Those are two different facts,
+    /// and if they ever disagree the thread applies ANOTHER collection's
+    /// relocations to its frames: every slot its own pause moved is left
+    /// stale, which is a live object reachable only through an address the
+    /// collector vacated. `CRATONVM_DBG_MAPGEN=1` reports the disagreement at
+    /// the barrier instead of leaving it to surface as a wrong-class receiver
+    /// an unbounded number of collections later.
+    map_generation: u64,
     /// GCAUDIT-0711-FIX (finding 1a): identities (`ThreadId.0`) that THIS
     /// pause's `request_stw_counted_with_live_blocked` census read as
     /// `in_blocked_region == true` and therefore excluded from `expected`.
@@ -134,6 +146,7 @@ impl GcBarrier {
                 expected: 0,
                 arrived: 0,
                 pointer_map: cratonvm_types::PointerMap::default(),
+                map_generation: 0,
                 excluded_blocked: HashSet::new(),
             }),
             all_arrived: Condvar::new(),
@@ -604,6 +617,9 @@ impl GcBarrier {
         inner.pointer_map = pointer_map;
         inner.initiator = None;
         inner.excluded_blocked.clear();
+        // Stamp the map with the generation it belongs to, under the same lock
+        // that publishes it. See `Inner::map_generation`.
+        inner.map_generation = self.gc_generation.load(Ordering::Acquire) + 1;
         self.gc_generation.fetch_add(1, Ordering::Release);
         self.stw_requested.store(false, Ordering::Release);
         self.gc_complete.notify_all();
@@ -733,6 +749,20 @@ impl GcBarrier {
             self.gc_complete.wait(&mut inner);
         }
         thread_state::record_transition(resume_state, "gc_barrier::arrive_and_wait_inner:resume");
+        // The map this thread is about to apply must be the map of the pause it
+        // arrived for. The release condition ("the generation moved") and the
+        // map it then reads are two different facts — see `Inner::map_generation`.
+        if inner.map_generation != arrival_gen + 1
+            && cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_MAPGEN").is_some()
+        {
+            eprintln!(
+                "[mapgen] tid={} arrived_for_gen={} but the stored map is gen={}                  (map_len={}) — this thread's own pause's relocations are NOT in it",
+                tid.0,
+                arrival_gen + 1,
+                inner.map_generation,
+                inner.pointer_map.len(),
+            );
+        }
         inner.pointer_map.clone()
     }
 

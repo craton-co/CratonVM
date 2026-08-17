@@ -366,6 +366,17 @@ pub struct JvmThread {
     /// `*mut Frame` across the dispatch loop instead of re-indexing
     /// `thread.frames[frame_idx]` on every access. See the `FrameStack` docs
     /// for the aliasing rules that come with the raw-pointer API.
+    /// The heap collection count as of the last time SOMETHING remapped this
+    /// thread's frames: the initiator's own `update_all_roots`, the
+    /// safepoint-arrival `apply_pointer_map_to_thread`, or the blocked-region
+    /// wake write-back.
+    ///
+    /// `CRATONVM_DBG_VACATED_FRAMES` prints it beside the heap's current count.
+    /// The two disagreeing at a slot that still names a vacated address is the
+    /// difference between "a heal path ran and missed this slot" and "no heal
+    /// path ran for this thread at all", which want completely different fixes.
+    pub last_heal_collection: u64,
+
     pub frames: FrameStack,
 
     /// Pool of reusable locals (values, tags) pairs (avoids allocation on recursive calls).
@@ -733,6 +744,7 @@ impl JvmThread {
         Self {
             thread_id,
             name: name.to_string(),
+            last_heal_collection: 0,
             frames: FrameStack::new(),
             locals_pool: Vec::new(),
             stacks_pool: Vec::new(),
