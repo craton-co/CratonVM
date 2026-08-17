@@ -4781,35 +4781,53 @@ impl ZgcRealHeap {
         true
     }
 
-    /// Re-card every old object after a relocation has moved objects.
+    /// Card the DESTINATION of every old object a relocation moved.
     ///
-    /// # Why the cards cannot simply survive a slide
+    /// # Why a card cannot simply survive a slide
     ///
-    /// A card is a page id plus a byte offset, so it names a LOCATION. The slide
-    /// moves survivors down across logical page boundaries, and afterwards every
-    /// card names an offset that holds a different object, or nothing. Object
-    /// ages travel in the header and are unaffected, so the generation split
-    /// itself is still correct -- it is only the remembered set that is stale.
+    /// A card is a page id plus a byte offset, so it names a **location**. Object
+    /// ages travel in the header and are unaffected, so the generation split is
+    /// still correct after a slide -- it is only the remembered set that has been
+    /// invalidated, which is what would have made the failure silent.
     ///
-    /// Rewriting each card through the pointer map is possible and is more
-    /// fragile than this: a card whose object did not move has no map entry, a
-    /// card for an object that died has none either, and the difference decides
-    /// between a lost edge and a leak. Re-carding every old object from the
-    /// post-slide live set cannot get that wrong -- it over-approximates, and
-    /// the next young cycle's card cleaning removes whatever was unnecessary.
+    /// # Why the destinations alone are enough, and O(moved) not O(live)
     ///
-    /// Only on cycles that actually moved something, which is why
-    /// `gen_recards_after_relocation` is counted: a configuration where
-    /// relocation moves objects every cycle pays a full pass over the live set
-    /// per collection, and that has to be visible rather than inferred.
-    fn recard_all_old_objects(&self, live: &[usize], promotion_age: u8) -> usize {
-        for page in self.remembered.page_ids() {
-            self.remembered.remove(page);
-        }
+    /// Work through the four cases against the post-slide heap:
+    ///
+    /// 1. **Old, carded, did not move.** Its bit is still at its own address.
+    ///    Correct, untouched.
+    /// 2. **Old, carded, moved.** Its bit is at the vacated address and there is
+    ///    none at the new one -- the **only** case that loses an edge, and the
+    ///    one this fixes.
+    /// 3. **Old, not carded, moved.** It had no young reference when the last
+    ///    young cycle cleaned it, so it needs no card. Carding it anyway would
+    ///    be harmless; not carding it is correct.
+    /// 4. **A survivor that slid INTO a vacated address whose bit is set.** It
+    ///    inherits a card it did not earn -- a false positive, which
+    ///    [`Self::young_extra_roots`] resolves by re-scanning it and keeping the
+    ///    card only if it really does hold a young reference.
+    ///
+    /// So the whole repair is case 2, and the pointer map names exactly those
+    /// objects. The first version of this cleared the table and re-carded the
+    /// entire old generation, which is correct by over-approximation and cost a
+    /// full pass over the live set per relocating cycle: the 2026-08-17 run
+    /// recorded **4.8M re-cards over three collections** with relocation on,
+    /// which is the same order as the mark the phase exists to avoid.
+    ///
+    /// Counted, because a configuration where relocation moves objects on every
+    /// cycle should show that in a number rather than in a wall-clock mystery.
+    fn recard_relocated_old_objects(
+        &self,
+        map: &cratonvm_types::PointerMap,
+        promotion_age: u8,
+    ) -> usize {
         let mut carded = 0usize;
-        for &base in live {
-            if !self.addr_is_young(base, promotion_age) {
-                self.card_object(base);
+        for (_from, to) in map.iter() {
+            // The AGE at the destination, which is the object's own header and
+            // travelled with it. A young destination needs no card: a young cycle
+            // traces it.
+            if !self.addr_is_young(*to, promotion_age) {
+                self.card_object(*to);
                 carded += 1;
             }
         }
@@ -11652,18 +11670,18 @@ impl GarbageCollector for ZgcRealHeap {
                 }
                 // ---- PHASE G: every card names a location that moved ----
                 //
-                // See `recard_all_old_objects`. Object ages ride in the headers
-                // and are unaffected by the slide; the remembered set is
-                // page-id-plus-offset and is now entirely stale, so it is
-                // rebuilt from the post-slide live set rather than rewritten
-                // through the pointer map.
+                // See `recard_relocated_old_objects` for the four-case argument
+                // that the DESTINATIONS alone are enough. Object ages ride in
+                // the headers and are unaffected by the slide; only a card whose
+                // object moved has been invalidated in the direction that loses
+                // an edge.
                 if gen_on && self.has_old_objects.load(Ordering::Relaxed) {
-                    let after: Vec<usize> = self.registry.snapshot().bases();
-                    let carded = self.recard_all_old_objects(&after, promo_age);
+                    let carded = self.recard_relocated_old_objects(&map, promo_age);
                     tracing::debug!(
                         target: "zgc",
                         carded,
-                        "zgc: re-carded the old generation after a slide"
+                        moved,
+                        "zgc: re-carded the old objects a slide moved"
                     );
                 }
                 tracing::debug!(
