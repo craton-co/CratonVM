@@ -478,11 +478,28 @@ pub(crate) fn bc_poly_inverse(a: &[u64], m: usize, ks: &[usize]) -> Option<Vec<u
     Some(bc_poly_reduce(g1, m, ks))
 }
 
+/// The smallest `m_ints` BouncyCastle's `LongArray` ever carries.
+///
+/// `bc_trim_poly` drops trailing zero words, so the ZERO polynomial trims to an
+/// empty slice — and an empty `long[]` is not a value `LongArray` accepts.
+/// `isOne()` reads `a[0]` with no length test (`isZero()` loops and so survives
+/// one, which is why this stayed hidden), and the class's own
+/// `LongArray(BigInteger)` spells the intended representation out: a zero
+/// bigInt becomes `new long[]{ 0L }`, never `new long[0]`. A native handing
+/// back the empty array therefore builds a `LongArray` no BouncyCastle
+/// constructor could have produced, and the next `isOne()` on it raises
+/// `ArrayIndexOutOfBoundsException: Index 0 out of bounds for length 0` —
+/// `GeneralKeyTest.testDstu4145`, via `DSTU4145PointEncoder.encodePoint`.
+const LONG_ARRAY_MIN_WORDS: usize = 1;
+
 pub(crate) fn bc_alloc_long_array(
     ctx: &mut dyn NativeContext,
     words: &[u64],
 ) -> Result<ObjectRef, MethodCallFailed> {
-    let arr = ctx.new_array(cratonvm_types::ArrayElementType::Long, words.len());
+    let arr = ctx.new_array(
+        cratonvm_types::ArrayElementType::Long,
+        words.len().max(LONG_ARRAY_MIN_WORDS),
+    );
     for (i, &word) in words.iter().enumerate() {
         ctx.set_array_element(arr, i, Value::Long(word as i64));
     }
@@ -517,7 +534,11 @@ pub(crate) fn bc_longarray_set_value(
     this: ObjectRef,
     words: &[u64],
 ) -> Result<(), MethodCallFailed> {
-    let arr = ctx.new_array(cratonvm_types::ArrayElementType::Long, words.len());
+    // Same floor as `bc_alloc_long_array`; see `LONG_ARRAY_MIN_WORDS`.
+    let arr = ctx.new_array(
+        cratonvm_types::ArrayElementType::Long,
+        words.len().max(LONG_ARRAY_MIN_WORDS),
+    );
     for (i, &word) in words.iter().enumerate() {
         ctx.set_array_element(arr, i, Value::Long(word as i64));
     }
