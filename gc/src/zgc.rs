@@ -9130,6 +9130,99 @@ impl mark::ZMarkContext for ZgcRealHeap {
     // somebody forgot to fill in.
 }
 
+/// The SATB-suppressed store path, split out of `GarbageCollector::set_field`.
+///
+/// A separate `impl` block because an inherent method cannot live inside a
+/// trait impl, and this one is deliberately NOT on the trait: adding it there
+/// would oblige `GenerationalHeap` and `G1Collector` to grow an arm each, and
+/// G1 already has its own (`set_field_no_satb`) with different semantics.
+impl ZgcRealHeap {
+    /// The store itself, with **no** SATB publication.
+    ///
+    /// # Why this is public and why it has exactly two callers
+    ///
+    /// `VmHeap::set_field_suppress_satb` is the declared channel for the
+    /// weak-reference PROTOCOL writes -- the pre-collection referent null pass
+    /// and the remark-time referent clears. Those are not semantic overwrites:
+    /// the pre-collection nulls are restored for survivors before mutators
+    /// resume, and the remark-time clears are a verdict the collector has
+    /// already reached. Publishing them would hand the marker EVERY active
+    /// referent as a mark root, so no weak, soft, phantom or cleaner reference
+    /// could ever be cleared again -- a silent leak with no assertion able to
+    /// catch it, because every reference test is satisfied by "the referent
+    /// survived".
+    ///
+    /// That channel was a plain `set_field` on this backend until 2026-08-16,
+    /// which was correct while ZGC had no concurrent cycle and no armed
+    /// pre-write barrier of its own. It stopped being correct the moment
+    /// `set_field` grew one.
+    pub fn set_field_no_satb(&self, obj: ObjectRef, index: usize, value: Value) {
+        self.audit_access_receiver(obj.as_ptr() as usize, index, "set_field");
+        let header = self.header(obj);
+        if self.check_field_index(header, index, "set").is_none() {
+            return;
+        }
+        if let Some((offset, storage)) =
+            cratonvm_types::compact_object_field_storage(header, index)
+        {
+            // A non-reference value into a declared-REFERENCE slot: box it,
+            // rather than let `write_compact_field`'s `Reference` arm map it to
+            // raw 0 and drop the write to null. Boxing is what `gen_heap` has
+            // always done for fields, what all four heaps (this one included)
+            // have always done for reference ARRAY elements, and what the
+            // legacy 16-byte cell does by construction
+            // (W7-84-primitive-in-reference-store.md).
+            //
+            // The allocation happens BEFORE `ptr` is taken. It does not have to
+            // on this heap — ZGC does not move an object under its own mutator
+            // — but the four implementations are kept in the same order so a
+            // reader diffing them sees no difference to explain.
+            let value = if storage.is_reference() {
+                crate::autobox::box_for_reference_slot(value, header.class_id, index, |v| {
+                    let wrapper = self.alloc_object(crate::heap::AUTOBOX_CLASS_ID, 1);
+                    <Self as GarbageCollector>::set_field(self, wrapper, 0, v);
+                    wrapper
+                })
+            } else {
+                value
+            };
+            let ptr = unsafe { obj.as_ptr().add(HEADER_SIZE + offset) };
+            unsafe {
+                cratonvm_types::write_compact_field(
+                    ptr,
+                    storage,
+                    value,
+                    Ordering::Relaxed,
+                )
+            };
+            return;
+        }
+        // HIB-DCAST-LATEPHASE.1, write half — see the matching note in
+        // `get_field` above. This one is strictly worse than the read: striding
+        // a 16-byte `Value` cell through a compact-sized body WRITES past the
+        // allocation, corrupting whatever object the allocator placed next.
+        // Drop the store rather than commit it somewhere unrelated.
+        if cratonvm_types::is_compact_object(header) {
+            tracing::warn!(
+                target: "cratonvm::gc::guard",
+                obj = ?obj.as_ptr(),
+                index,
+                class_id = ?header.class_id,
+                "zgc::set_field: compact receiver has no registered layout for \
+                 its (class_id, field_count) — dropping the store rather than \
+                 writing a legacy 16-byte cell past its packed compact body \
+                 (HIB-DCAST-LATEPHASE.1)",
+            );
+            return;
+        }
+        // SAFETY: index validated < num_slots, so the slot is within bounds.
+        unsafe {
+            let ptr = obj.as_ptr().add(HEADER_SIZE + index * SLOT_SIZE);
+            std::ptr::write(ptr as *mut Value, value);
+        }
+    }
+}
+
 impl GarbageCollector for ZgcRealHeap {
     fn alloc_object(&self, class_id: ClassId, num_fields: usize) -> ObjectRef {
         let compact_body =
@@ -9321,11 +9414,6 @@ impl GarbageCollector for ZgcRealHeap {
     }
 
     fn set_field(&self, obj: ObjectRef, index: usize, value: Value) {
-        self.audit_access_receiver(obj.as_ptr() as usize, index, "set_field");
-        let header = self.header(obj);
-        if self.check_field_index(header, index, "set").is_none() {
-            return;
-        }
         // ---- SATB, at the accessor -----------------------------------------
         //
         // Same argument as `set_array_element`'s: `putfield` and every native
@@ -9337,71 +9425,18 @@ impl GarbageCollector for ZgcRealHeap {
         // ONE store path instead of a property of a call-site census that has
         // to stay complete forever.
         //
+        // The one caller that must NOT publish has its own entry point --
+        // see `set_field_no_satb`, and do not fold the two back together.
+        //
         // Cost when nothing is marking: one relaxed load.
         if self.mark_active.load(Ordering::Relaxed) {
             if let Value::Object(Some(old)) = self.get_field(obj, index) {
                 self.satb_pre_barrier(old.as_ptr() as usize);
             }
         }
-        if let Some((offset, storage)) =
-            cratonvm_types::compact_object_field_storage(header, index)
-        {
-            // A non-reference value into a declared-REFERENCE slot: box it,
-            // rather than let `write_compact_field`'s `Reference` arm map it to
-            // raw 0 and drop the write to null. Boxing is what `gen_heap` has
-            // always done for fields, what all four heaps (this one included)
-            // have always done for reference ARRAY elements, and what the
-            // legacy 16-byte cell does by construction
-            // (W7-84-primitive-in-reference-store.md).
-            //
-            // The allocation happens BEFORE `ptr` is taken. It does not have to
-            // on this heap — ZGC does not move an object under its own mutator
-            // — but the four implementations are kept in the same order so a
-            // reader diffing them sees no difference to explain.
-            let value = if storage.is_reference() {
-                crate::autobox::box_for_reference_slot(value, header.class_id, index, |v| {
-                    let wrapper = self.alloc_object(crate::heap::AUTOBOX_CLASS_ID, 1);
-                    <Self as GarbageCollector>::set_field(self, wrapper, 0, v);
-                    wrapper
-                })
-            } else {
-                value
-            };
-            let ptr = unsafe { obj.as_ptr().add(HEADER_SIZE + offset) };
-            unsafe {
-                cratonvm_types::write_compact_field(
-                    ptr,
-                    storage,
-                    value,
-                    Ordering::Relaxed,
-                )
-            };
-            return;
-        }
-        // HIB-DCAST-LATEPHASE.1, write half — see the matching note in
-        // `get_field` above. This one is strictly worse than the read: striding
-        // a 16-byte `Value` cell through a compact-sized body WRITES past the
-        // allocation, corrupting whatever object the allocator placed next.
-        // Drop the store rather than commit it somewhere unrelated.
-        if cratonvm_types::is_compact_object(header) {
-            tracing::warn!(
-                target: "cratonvm::gc::guard",
-                obj = ?obj.as_ptr(),
-                index,
-                class_id = ?header.class_id,
-                "zgc::set_field: compact receiver has no registered layout for \
-                 its (class_id, field_count) — dropping the store rather than \
-                 writing a legacy 16-byte cell past its packed compact body \
-                 (HIB-DCAST-LATEPHASE.1)",
-            );
-            return;
-        }
-        // SAFETY: index validated < num_slots, so the slot is within bounds.
-        unsafe {
-            let ptr = obj.as_ptr().add(HEADER_SIZE + index * SLOT_SIZE);
-            std::ptr::write(ptr as *mut Value, value);
-        }
+        self.set_field_no_satb(obj, index, value);
     }
+
 
     fn get_field_volatile(&self, obj: ObjectRef, index: usize) -> Value {
         let _guard = crate::collector::volatile_stripe_lock(obj, index);

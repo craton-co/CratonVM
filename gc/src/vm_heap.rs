@@ -942,21 +942,33 @@ impl VmHeap {
         dispatch!(self, set_field(obj, index, value))
     }
 
-    /// INT-8: field store with the G1 SATB pre-barrier SUPPRESSED. Reserved
+    /// INT-8: field store with the SATB pre-barrier SUPPRESSED. Reserved
     /// for the weak-reference PROTOCOL writes (the pre-collection referent
     /// null pass and the remark-time referent clears): those are not
     /// semantic overwrites, and SATB-logging them recorded every active
     /// referent as a mark root — the taint that made bitmap-based reference
-    /// processing inert (see `G1Collector::set_field_no_satb`). On the
-    /// Generational and ZGC backends this is a plain `set_field`: their
-    /// reference protocols never depended on hiding these writes (Gen uses
-    /// the watched-referents channel; ZGC processes references against its
-    /// own non-moving mark), so no behavior change there.
+    /// processing inert (see `G1Collector::set_field_no_satb`).
+    ///
+    /// **ZGC joined the suppressed set on 2026-08-16, and it had to.** This was
+    /// a plain `set_field` on that backend, correctly, for as long as ZGC had
+    /// no concurrent cycle and no armed pre-write barrier of its own. Genuine
+    /// concurrent marking gave it both, and `ZgcRealHeap::set_field` now
+    /// publishes the overwritten reference itself — so the unsuppressed arm
+    /// would have handed the concurrent marker EVERY active referent as a mark
+    /// root at the pre-collection null pass, which runs while the cycle is
+    /// still armed. No weak, soft, phantom or cleaner reference would ever
+    /// have been cleared again, and no reference test would have caught it:
+    /// they are all satisfied by "the referent survived".
+    ///
+    /// Generational stays a plain `set_field` — its reference protocol never
+    /// depended on hiding these writes (it uses the watched-referents channel).
     pub fn set_field_suppress_satb(&self, obj: ObjectRef, index: usize, value: Value) {
         #[cfg(debug_assertions)]
         clear_pending_pre_barrier();
         match self {
             VmHeap::G1(h) => h.collector.set_field_no_satb(obj, index, value),
+            #[cfg(feature = "zgc")]
+            VmHeap::Zgc(h) => h.set_field_no_satb(obj, index, value),
             other => dispatch!(other, set_field(obj, index, value)),
         }
     }
@@ -3579,6 +3591,61 @@ mod concurrent_mark_controller_tests {
             1,
             "VmHeap::satb_barrier must reach ZgcRealHeap::satb_pre_barrier"
         );
+    }
+
+    /// `set_field_suppress_satb` really suppresses on ZGC, and plain
+    /// `set_field` really does not.
+    ///
+    /// # The bug this exists to have caught
+    ///
+    /// That method was a plain `set_field` on this backend, and correctly so
+    /// for as long as ZGC had no armed pre-write barrier. Concurrent marking
+    /// gave it one. `weakref_null_referents_pre_gc` nulls EVERY registered
+    /// referent immediately before `collect_garbage` -- i.e. while the cycle is
+    /// still armed -- so the unsuppressed arm would have published every active
+    /// referent into the ingress, `finish_concurrent_mark` would have replayed
+    /// them as mark roots, and no weak, soft, phantom or cleaner reference
+    /// could ever have been cleared again.
+    ///
+    /// It would have been invisible. Every reference test in this tree is
+    /// satisfied by "the referent survived", which is exactly what the bug
+    /// produces; the only symptom is a leak.
+    ///
+    /// Both directions are asserted. A suppression that suppressed everything
+    /// -- including the ordinary store path -- would pass the half of this test
+    /// that matters most and disable the barrier wholesale.
+    #[cfg(feature = "zgc")]
+    #[test]
+    fn zgc_set_field_suppress_satb_suppresses_and_plain_set_field_does_not() {
+        let heap = VmHeap::new(GcBackend::Zgc, 1024 * 1024);
+        let VmHeap::Zgc(z) = &heap else {
+            unreachable!("constructed as Zgc")
+        };
+        let holder = heap.alloc_object(ClassId::new(1), 2);
+        let a = heap.alloc_object(ClassId::new(1), 0);
+        let b = heap.alloc_object(ClassId::new(1), 0);
+        heap.set_field(holder, 0, Value::Object(Some(a)));
+        heap.set_field(holder, 1, Value::Object(Some(b)));
+        z.set_mark_active(true);
+
+        let before = z.mark_ingress_pushes();
+        heap.set_field_suppress_satb(holder, 0, Value::Object(None));
+        assert_eq!(
+            z.mark_ingress_pushes(),
+            before,
+            "the referent-protocol write must NOT reach the concurrent marker"
+        );
+
+        let before = z.mark_ingress_pushes();
+        heap.set_field(holder, 1, Value::Object(None));
+        assert_eq!(
+            z.mark_ingress_pushes(),
+            before + 1,
+            "...while an ordinary store still must, or the suppression has \
+             disabled the barrier rather than exempted one caller"
+        );
+
+        z.set_mark_active(false);
     }
 
     /// Every `zgc_*_concurrent_mark` arm of `VmHeap` reaches the collector.
