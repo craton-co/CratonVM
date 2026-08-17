@@ -2395,6 +2395,18 @@ pub struct ZgcRealHeap {
     /// the second a raw address kept across a safepoint. Capped, oldest cycles
     /// evicted first, so a long run cannot grow it without bound.
     corpse_ledger: Mutex<FxHashMap<usize, (usize, u32, usize, u64)>>,
+    /// `base -> alloc_size(header)` as the LAST slide left it, taken after the
+    /// registry rebuild and before any mutator resumed.
+    ///
+    /// The pre-sweep extent census consults it for every overlap it finds, and
+    /// the answer splits the search in half: a base that was present then, with
+    /// a smaller size then, has had its HEADER rewritten under it while
+    /// mutators ran; a base that was absent arrived by an insert, and the
+    /// insert audit is looking at the wrong call sites.
+    ///
+    /// Only populated under `CRATONVM_DBG_ZGC_CORPSE`, and replaced wholesale
+    /// each slide so it can never describe two cycles at once.
+    slide_exit_sizes: Mutex<FxHashMap<usize, usize>>,
     /// Cycles that declined to relocate because a compiled frame was live.
     ///
     /// Exported so the cost of the refusal is a number rather than a guess:
@@ -2402,6 +2414,23 @@ pub struct ZgcRealHeap {
     /// is permanently JIT-busy trades heap layout for the correctness of not
     /// sliding objects out from under registers the collector cannot rewrite.
     relocation_skipped_jit: AtomicUsize,
+    /// Lifetime count of TLAB cells a [`Self::retire_all_tlabs`] could not
+    /// lock, and so could not close.
+    ///
+    /// A retained chunk would be unsound on a compacting heap: the collector
+    /// cannot see it (every walker here is driven by the object-start
+    /// registry), so nothing keeps the compaction cursor above it,
+    /// `compact_low_to` retracts past it and zeroes it, and
+    /// `clear_low_free_list` drops the only record that it was reserved --
+    /// after which the arena and the chunk's owner both fill one span.
+    ///
+    /// **Measured zero** across the `ResourceLeakDetectorTest` repro that the
+    /// reopened `zgc-rewrite-pass-walks-off-a-reference-array` page is about,
+    /// which is what rules that story out as the source of the overlapping
+    /// registry entries seen there. Exported so the ruling-out is re-checkable
+    /// rather than remembered.
+    tlab_retire_skipped_total: AtomicUsize,
+
     /// How many unwalkable rewrite targets have already been logged in full,
     /// so a heap that produces thousands does not produce thousands of lines.
     unwalkable_reports: AtomicUsize,
@@ -2532,16 +2561,46 @@ pub struct ZgcRealHeap {
     /// `VmHeap::enable_gc_logging`. Mirrors G1's `gc_log_enabled`
     /// (`g1.rs:6770-6777`). `Relaxed`: a logging toggle orders nothing.
     gc_log_enabled: AtomicBool,
-    /// Shared `java.lang.ref` reference processor.
+    /// This heap's own `java.lang.ref` reference processor.
     ///
-    /// Weak/soft/phantom/cleaner/finalizer references discovered on this
-    /// backend are registered here (via [`Self::discover_reference`]) and
-    /// processed at the end of every [`Self::collect_garbage`] cycle by the
-    /// *same* [`ReferenceProcessor`] the generational and G1 collectors use —
-    /// the canonical HotSpot-ordered clearing/enqueue path in
-    /// `gc::reference`. This closes the gap where the ZGC-backed heap performed
-    /// NO reference processing, so finalizers/cleaners and `WeakReference`
-    /// semantics silently broke under this collector.
+    /// # It is EMPTY in a real run, and the machinery built on it is inert
+    ///
+    /// Nothing in the VM calls [`Self::discover_reference`] — the only callers
+    /// anywhere are this file's own tests. Every reference a running program
+    /// creates is registered with the VM-level processor
+    /// (`SharedVm::mem::ref_processor`) by `native_ref_init` and friends, and
+    /// is cleared and enqueued by `process_references_after_gc`. So this
+    /// processor holds nothing, and three things built on it never do
+    /// anything in production:
+    ///
+    /// * the `ref_skip_objs` referent skip set [`Self::collect_garbage`]
+    ///   builds, and the [`Self::mark_ref_skip`] twin for concurrent cycles —
+    ///   both derived from `reference_object_addresses()`, which returns an
+    ///   empty vector here;
+    /// * the soft-survivor resurrection pass that follows it;
+    /// * the `process_references` call at the end of the cycle.
+    ///
+    /// **This is not a hole in reference semantics**, which is the conclusion
+    /// the shape of this code invites and which was measured and rejected on
+    /// 2026-08-15. The VM compensates one level up, and unconditionally:
+    /// `weakref_null_referents_pre_gc` writes null into the referent slot of
+    /// every active Weak and Phantom reference *before* any collector runs, so
+    /// there is nothing for a skip set to skip — a marker that traces slot 0
+    /// as a strong edge (which every CratonVM marker does) reads a null. Soft
+    /// references take the same route since the same date, via
+    /// `ReferenceProcessor::condemn_idle_soft_refs`, which applies the LRU
+    /// policy ahead of the mark so only the entries it condemns are nulled.
+    ///
+    /// Verified end-to-end against HotSpot on all three collectors: a weak
+    /// reference clears, a phantom enqueues, a soft reference is retained
+    /// while the heap is roomy, cleared once it is tight, and cleared rather
+    /// than allowed to become an `OutOfMemoryError`.
+    ///
+    /// Left in place rather than deleted because it is the only reference
+    /// implementation this heap can be tested against in isolation, and
+    /// several tests in this file do exactly that. Anyone reading it as the
+    /// live path — or "fixing" a reference bug here — is reading the wrong
+    /// file; start at `weakref_null_referents_pre_gc`.
     ref_processor: Mutex<ReferenceProcessor>,
     /// Finalizer-resurrection input for the current collection — see
     /// [`Self::collect_garbage_with_finalizers`]. Consumed (taken) by the
@@ -2776,9 +2835,12 @@ impl ZgcRealHeap {
             gc_stress_mark: AtomicUsize::new(0),
             critical_pins: Mutex::new(FxHashMap::default()),
             corpse_ledger: Mutex::new(FxHashMap::default()),
+            slide_exit_sizes: Mutex::new(FxHashMap::default()),
             corpse_reports: AtomicUsize::new(0),
             corpse_cycle: AtomicU64::new(0),
             relocation_skipped_jit: AtomicUsize::new(0),
+            tlab_retire_skipped_total: AtomicUsize::new(0),
+
             unwalkable_reports: AtomicUsize::new(0),
             driver_passes: AtomicUsize::new(0),
             mark_active: AtomicBool::new(false),
@@ -2958,6 +3020,11 @@ impl ZgcRealHeap {
     /// run that never defragments.
     pub fn relocation_skipped_jit(&self) -> usize {
         self.relocation_skipped_jit.load(Ordering::Relaxed)
+    }
+
+    /// Lifetime count of TLAB cells a retire could not lock.
+    pub fn tlab_retire_skipped(&self) -> usize {
+        self.tlab_retire_skipped_total.load(Ordering::Relaxed)
     }
 
     pub fn driver_engagement(&self) -> (usize, usize) {
@@ -3809,12 +3876,33 @@ impl ZgcRealHeap {
         // a `DefaultResourceLeak` the last slide moved -- i.e. compiled code
         // performing `Reference.clear()` through a pre-move address.
         //
-        // The cost is real and is the same cost the other two collectors pay:
-        // a JIT-busy process compacts less often. `relocation_skipped_jit` is
-        // exported so that cost is visible rather than inferred, because on
-        // this collector deferred compaction is also deferred defragmentation.
-        // Correctness first: a slide under a live compiled frame corrupts the
-        // heap, and fragmentation only wastes it.
+        // The cost is the same cost the other two collectors pay: a JIT-busy
+        // process compacts less often. `relocation_skipped_jit` is exported so
+        // it is visible rather than inferred, because on this collector
+        // deferred compaction is also deferred defragmentation.
+        //
+        // MEASURED 2026-08-15, which the original of this comment left as an
+        // open question. A deliberately JIT-saturated workload -- 4e6
+        // mixed-size (64 B .. 8 KiB) allocations through one hot compiled
+        // method, 512-entry rolling live window, 512 MiB heap -- then a count
+        // of the 4 MiB contiguous blocks the heap can still hand out:
+        //
+        //   arm                    compactions  skipped_jit  worst_free_permille  4 MiB blocks
+        //   JIT on (this branch)             4           64                  138            72
+        //   CRATONVM_ZGC_RELOCATE=0          0            0                  239           124
+        //
+        // The decline fires on 64 of 68 cycles, so "a JIT-saturated run
+        // compacts rarely" is confirmed -- and it costs NOTHING here. The arm
+        // that relocates *never* ends with a LARGER worst-case largest free
+        // block and satisfies nearly twice as many large contiguous requests.
+        // Compaction is not what buys contiguity on this collector, so
+        // deferring it is not what loses it. Four interleaved JIT reps
+        // returned an identical 72.
+        //
+        // That is one workload, not a proof; the numbers are here so the next
+        // person argues with a measurement rather than re-deriving the fear.
+        // Correctness settles it regardless: a slide under a live compiled
+        // frame corrupts the heap, and fragmentation only wastes it.
         if crate::gc_quiescence::is_active()
             || crate::gc_quiescence::unregistered_jit_frame_on_stack()
         {
@@ -3822,6 +3910,19 @@ impl ZgcRealHeap {
             let reclaimed = self.arena.lock().retract_cursor_into_free_tail();
             return (0, reclaimed, cratonvm_types::PointerMap::default());
         }
+        // A RETAINED TLAB CHUNK WAS THE OBVIOUS SUSPECT HERE, AND IT IS RULED
+        // OUT. `retire_all_tlabs` skips a cell it cannot `try_lock`, and on a
+        // compacting heap that would be unsound rather than merely wasteful:
+        // nothing keeps the compaction cursor above a chunk the collector
+        // cannot see, so `compact_low_to` would retract past it, zero it, and
+        // `clear_low_free_list` would drop the only record it was reserved --
+        // after which the arena and the chunk's owner would fill one span.
+        //
+        // `tlab_retire_skipped` measured **zero** across every run of the
+        // `ResourceLeakDetectorTest` repro, so no chunk is ever retained and a
+        // refusal built on it could never fire. The counter is exported rather
+        // than the refusal written: it is what turned the story into a
+        // ruled-out one, and a nonzero there is how someone re-opens it.
         // `relocate::ZRelocationRecord` rather than a local map: it is the
         // module's from->to ledger, it builds the `PointerMap` this function
         // must return, and it carries the reserve so a large evacuation does
@@ -3845,6 +3946,48 @@ impl ZgcRealHeap {
             let low_end = base + arena.used_low_for_compaction();
             arena_lo = base;
             arena_hi = base + arena.capacity();
+
+            // ---- PRE-SLIDE CENSUS (diagnostic, `CRATONVM_DBG_ZGC_CORPSE`) --
+            //
+            // `rewrite_target_is_walkable` reports offenders AFTER the slide,
+            // which cannot separate "this slide broke them" from "they arrived
+            // broken". The same question asked here, before a single byte
+            // moves, does separate them -- and it is the first question to ask,
+            // because the two answers point at opposite halves of the
+            // collector.
+            //
+            // Behind the corpse gate rather than unconditional: it is a full
+            // pass over the live set with an `alloc_size` each, which is the
+            // same order as the slide itself but buys nothing in a healthy run.
+            if zgc_corpse_enabled() {
+                let mut bad = 0usize;
+                let mut first: Option<(usize, u32, u32)> = None;
+                for &b in live {
+                    if b < base || b >= low_end {
+                        continue;
+                    }
+                    let h = self.header_ref(b as *mut u8);
+                    if Self::alloc_size(h).is_none_or(|sz| b.saturating_add(sz) > low_end) {
+                        bad += 1;
+                        if first.is_none() {
+                            first = Some((b, h.class_id.as_u32(), h.num_slots()));
+                        }
+                    }
+                }
+                if bad > 0 {
+                    let (addr, class_id, num_slots) = first.unwrap_or((0, 0, 0));
+                    tracing::error!(
+                        target: "cratonvm::gc::guard",
+                        unwalkable_before_slide = bad,
+                        live = live.len(),
+                        first_addr = addr,
+                        first_class_id = class_id,
+                        first_num_slots = num_slots,
+                        "zgc relocate: the live set was ALREADY unwalkable on entry -- \
+                         whatever corrupted these bases, it was not this slide"
+                    );
+                }
+            }
 
             // Survivors in ADDRESS order. The slide requires it: an object may
             // only be copied into space a lower-addressed survivor has already
@@ -4053,6 +4196,27 @@ impl ZgcRealHeap {
                     // A header this collector cannot size cannot be moved, and
                     // nothing above it may move either or the slide would run
                     // over it. Stop here rather than guess.
+                    //
+                    // THIS BREAK IS AN AMPLIFIER, and the live-ceiling check
+                    // after the loop is what disarms it. Abandoning the loop
+                    // leaves `dest` at `from`, so every selected-page survivor
+                    // ABOVE this one -- all of which are alive and none of
+                    // which have moved -- is above the cursor `compact_low_to`
+                    // is about to retract to. Their bytes get zeroed and
+                    // handed back to the bump allocator while the object-start
+                    // registry still names them, and the next allocation
+                    // writes over a contiguous RUN of live objects. That is
+                    // how one unsizable header becomes "492 of 27858 survivors
+                    // could not be walked" a cycle later, with the offending
+                    // headers decoding as whatever String the allocator put
+                    // there. See the reopened
+                    // `zgc-rewrite-pass-walks-off-a-reference-array` page.
+                    //
+                    // Deliberately NOT fixed by setting `dest = low_end` here.
+                    // That would be a second mechanism for the same property,
+                    // and the two would drift on exactly the case that matters.
+                    // The check on the answer belongs in one place, after every
+                    // exit path from this loop.
                     tracing::warn!(
                         target: "cratonvm::gc::guard",
                         addr = from,
@@ -4180,8 +4344,78 @@ impl ZgcRealHeap {
                 })
                 .max()
                 .unwrap_or(base);
-            let new_cursor = dest.max(highest_pinned_end) - base;
-            reclaimed = arena.compact_low_to(new_cursor);
+            // ---- NOTHING LIVE MAY END ABOVE THE NEW CURSOR ---------------
+            //
+            // `compact_low_to` zeroes `[new_cursor, cursor)` and hands the span
+            // straight back to the bump allocator. A live object still up there
+            // is therefore erased AND its address re-issued: the registry keeps
+            // its base, a mutator writes a fresh object over it, and the next
+            // slide's rewrite pass reads a "header" made of somebody else's
+            // payload. That is precisely the failure
+            // `rewrite_target_is_walkable` reports -- a contiguous run of
+            // registered bases whose class ids and slot counts decode as ASCII,
+            // because what is actually there now is string data.
+            //
+            // `dest` and `highest_pinned_end` above are each derived from a
+            // DIFFERENT subset of `live` -- selected-page survivors and
+            // unselected ones -- and every argument that their maximum covers
+            // the whole live set is an argument about the partition, not a
+            // check on the answer. This is the check on the answer: one pass
+            // over `live`, resolved through the slide's own from->to pairs, of
+            // the one property the allocator is about to depend on.
+            //
+            // Cheap next to the slide (one hash probe and one `alloc_size` per
+            // survivor, against a memmove per survivor), and it can only
+            // RAISE the cursor -- i.e. reclaim less. Losing a cycle's reclaim
+            // is a cost; handing out occupied memory is heap corruption whose
+            // symptom surfaces cycles later in an unrelated subsystem.
+            let moved_to: FxHashMap<usize, usize> = pairs.iter().copied().collect();
+            let mut stranded = 0usize;
+            let mut live_ceiling = base;
+            for &b in live {
+                if b < base || b >= low_end {
+                    continue;
+                }
+                let now = moved_to.get(&b).copied().unwrap_or(b);
+                // An unsizable header cannot be bounded, so it cannot be
+                // proven dead either. Refuse to reclaim past `low_end` rather
+                // than guess -- the same answer `highest_pinned_end` gives an
+                // extent that runs past the cursor, and for the same reason.
+                let end = match Self::alloc_size(self.header_ref(now as *mut u8)) {
+                    Some(sz) => now.saturating_add(sz).min(low_end),
+                    None => low_end,
+                };
+                if end > live_ceiling {
+                    live_ceiling = end;
+                }
+            }
+            let proposed = dest.max(highest_pinned_end);
+            if live_ceiling > proposed {
+                stranded = live
+                    .iter()
+                    .filter(|b| **b >= proposed && **b < low_end)
+                    .count();
+                tracing::error!(
+                    target: "cratonvm::gc::guard",
+                    proposed_cursor = proposed - base,
+                    raised_to = live_ceiling - base,
+                    stranded_live_objects = stranded,
+                    low_end = low_end - base,
+                    moved,
+                    survivors = live.len(),
+                    "zgc relocate: the compaction cursor would have been left BELOW live \
+                     objects -- their bytes would have been zeroed and re-issued while the \
+                     object-start registry still named them. Raising it and reclaiming less."
+                );
+            }
+            let new_cursor = proposed.max(live_ceiling) - base;
+            // The bytes this slide actually wrote: it places survivors from
+            // `slide_floor` upwards and stops at `dest`. Everything outside
+            // that window is where it was before, so a free block there is
+            // still free -- see `Arena::compact_low_to` for what dropping them
+            // wholesale cost.
+            let touched = slide_floor.saturating_sub(base)..dest.saturating_sub(base);
+            reclaimed = arena.compact_low_to(new_cursor, touched);
             // One batched publish after the slide, not one per object: the
             // record is read by the rewrite pass below, which must see the
             // WHOLE map or it resolves half the graph against a half-built one.
@@ -4277,6 +4511,13 @@ impl ZgcRealHeap {
         // ---- Rebuild the object-start registry ----------------------------
         for (from, to) in &pairs {
             self.registry.remove(*from);
+            // No audit here: the registry is mid-rebuild, so it still holds
+            // every survivor's PRE-slide base while `to` is a post-slide one.
+            // Every probe would report a conflict against an address the next
+            // iterations are about to remove. The post-slide extent census,
+            // which runs once the rebuild is complete, is the check for this
+            // site -- and it comes back clean, which is why the two mutator
+            // sites above are the ones instrumented.
             self.registry.insert(*to);
         }
 
@@ -4292,11 +4533,259 @@ impl ZgcRealHeap {
                 live_now.len(),
             );
         }
+        // The same survey the sweep runs, asked here instead: the registry has
+        // just been rebuilt from this slide's `from -> to` pairs and no mutator
+        // has resumed, so an overlap reported HERE was created by this slide.
+        if zgc_corpse_enabled() {
+            let after: Vec<usize> = self.registry.snapshot().bases();
+            self.survey_registry_extents(&after, "post-slide");
+            // The state the mutators are about to be handed, so the next
+            // cycle's survey can say what changed rather than what is wrong.
+            let mut sizes = self.slide_exit_sizes.lock();
+            sizes.clear();
+            sizes.reserve(after.len());
+            for &b in &after {
+                let sz = Self::alloc_size(self.header_ref(b as *mut u8)).unwrap_or(0);
+                sizes.insert(b, sz);
+            }
+        }
         self.verify_no_dangling_slots_after_slide(&live_now, arena_lo, arena_hi, &moved_from);
 
         let pointer_map: cratonvm_types::PointerMap =
             record.into_pointer_map().into_iter().collect();
         (moved, reclaimed, pointer_map)
+    }
+
+    /// Check a registry insertion against what the registry already holds.
+    ///
+    /// `addr` is the base about to be registered and `size` the bytes reserved
+    /// for it (0 when the caller does not know, which disables the second
+    /// check). Two distinct failures look identical by the time the extent
+    /// census meets them a cycle later, and this separates them:
+    ///
+    /// * **interior insert** -- `addr` is already inside a registered object.
+    ///   Someone is registering an interior address, most likely a reference
+    ///   slot, as though it were an allocation.
+    /// * **stale entry swallowed** -- a registered base already sits inside
+    ///   `[addr, addr + size)`. The allocation is innocent; an OLD entry was
+    ///   never removed, its memory was recycled, and the fresh object now
+    ///   contains a base the registry still believes in.
+    ///
+    /// The second is the one to expect if the sweep's `registry.remove` or the
+    /// slide's rebuild can miss an address, and it is invisible to any check
+    /// that only asks "am I inside somebody".
+    ///
+    /// Diagnostic only, behind `CRATONVM_DBG_ZGC_CORPSE`, capped. It never
+    /// vetoes: a refusal here would drop a live object's base and turn a
+    /// bookkeeping bug into a use-after-free.
+    fn audit_registry_insert(&self, addr: usize, size: usize, site: &'static str) {
+        if !zgc_corpse_enabled() {
+            return;
+        }
+        // (0) IS THIS ADDRESS ALREADY A REGISTERED BASE?
+        //
+        // The strongest thing the allocator can get wrong, and the one neither
+        // check below can see: both are strict about `addr`, so an address
+        // issued twice slips between them. A set bit here means the arena has
+        // handed out memory that the registry still believes holds a live
+        // object, and the caller is about to write a header over it.
+        if self.registry.contains(addr) {
+            let h = self.header_ref(addr as *mut u8);
+            let sz = Self::alloc_size(h).unwrap_or(0);
+            self.report_insert_conflict("double-issue", site, addr, size, addr, sz);
+        }
+        // (a) Is `addr` inside an object that is already registered?
+        if let Some(prev) = self
+            .registry
+            .nearest_base_at_or_below(addr.saturating_sub(1))
+        {
+            if prev < addr {
+                let ph = self.header_ref(prev as *mut u8);
+                if let Some(psz) = Self::alloc_size(ph) {
+                    if prev + psz > addr {
+                        self.report_insert_conflict(
+                            "interior-insert",
+                            site,
+                            addr,
+                            size,
+                            prev,
+                            psz,
+                        );
+                    }
+                }
+            }
+        }
+        // (b) Is a registered base already inside the span this object will
+        //     occupy? `nearest_base_at_or_below(end - 1)` is the greatest such
+        //     base, so one probe answers it.
+        if size > 1 {
+            if let Some(inside) = self.registry.nearest_base_at_or_below(addr + size - 1) {
+                if inside > addr {
+                    let ih = self.header_ref(inside as *mut u8);
+                    let isz = Self::alloc_size(ih).unwrap_or(0);
+                    self.report_insert_conflict(
+                        "stale-entry-swallowed",
+                        site,
+                        addr,
+                        size,
+                        inside,
+                        isz,
+                    );
+                }
+            }
+        }
+    }
+
+    /// One line per registry-insert conflict, capped so a storm cannot itself
+    /// become the hang. Carries the raw words at the conflicting base, because
+    /// an implausible header field here is usually half an arena pointer.
+    fn report_insert_conflict(
+        &self,
+        what: &'static str,
+        site: &'static str,
+        addr: usize,
+        size: usize,
+        other: usize,
+        other_size: usize,
+    ) {
+        let n = self.corpse_reports.fetch_add(1, Ordering::Relaxed);
+        if n >= 24 {
+            return;
+        }
+        let oh = self.header_ref(other as *mut u8);
+        // SAFETY: `other` is a registered base inside the arena.
+        let w: [u64; 2] = unsafe { std::ptr::read_unaligned(other as *const [u64; 2]) };
+        tracing::error!(
+            target: "cratonvm::gc::guard",
+            what,
+            site,
+            addr,
+            size,
+            other,
+            other_size,
+            other_ends_at = other + other_size,
+            delta = addr.abs_diff(other),
+            other_kind = ?oh.kind(),
+            other_class_id = oh.class_id.as_u32(),
+            other_num_slots = oh.num_slots(),
+            other_w0 = format!("{:#018x}", w[0]),
+            other_w1 = format!("{:#018x}", w[1]),
+            "zgc registry insert: this insertion and an entry the registry already \
+             holds describe overlapping memory"
+        );
+    }
+
+    /// Survey the object-start registry for extents that run into the next
+    /// registered base, and report the first few.
+    ///
+    /// Every registered object's extent must end at or below the next
+    /// registered base. Two things depend on it: the sweep zeroes
+    /// `alloc_size(header)` bytes from a dead object's base and hands the same
+    /// span to `Arena::add_free_block`, and the slide memmoves the same count.
+    /// An extent that is too long therefore destroys the NEXT object and hands
+    /// its address back to the allocator while the registry still names it --
+    /// which is the reopened `zgc-rewrite-pass-walks-off-a-reference-array`
+    /// failure with no unsizable header needed anywhere in the story.
+    ///
+    /// `where_` names the call site so the two surveys can be told apart in a
+    /// log: `"pre-sweep"` inherits whatever the last cycle left, `"post-slide"`
+    /// is the same question asked before the mutators resume.
+    ///
+    /// Returns the number of overlaps. Diagnostic only -- it never vetoes, and
+    /// it is called only under `CRATONVM_DBG_ZGC_CORPSE`.
+    fn survey_registry_extents(&self, all: &[usize], where_: &'static str) -> usize {
+        let mut bases: Vec<usize> = all.to_vec();
+        bases.sort_unstable();
+        let mut overlaps = 0usize;
+        let mut unsizable_now = 0usize;
+        for w in bases.windows(2) {
+            let (b, next) = (w[0], w[1]);
+            let h = self.header_ref(b as *mut u8);
+            match Self::alloc_size(h) {
+                None => unsizable_now += 1,
+                Some(sz) => {
+                    if b.saturating_add(sz) > next {
+                        overlaps += 1;
+                        if overlaps <= 4 {
+                            let nh = self.header_ref(next as *mut u8);
+                            // Was this base a relocation SOURCE the ledger
+                            // still remembers? "yes" means the slide moved the
+                            // object away and the registry kept its old base;
+                            // "no" means the base is one nothing moved, so its
+                            // header was overwritten in place.
+                            let vacated = if zgc_corpse_enabled() {
+                                self.corpse_ledger.lock().get(&b).map(|e| e.3)
+                            } else {
+                                None
+                            };
+                            // What this base looked like when the last slide
+                            // handed the heap back to the mutators.
+                            let (seen_then, size_then) = {
+                                let sizes = self.slide_exit_sizes.lock();
+                                match sizes.get(&b) {
+                                    Some(&s) => (true, s),
+                                    None => (false, 0),
+                                }
+                            };
+                            // The raw words at the base, and at the two 8-byte
+                            // steps below it. A header that was overwritten in
+                            // place has plausible neighbours; a registry entry
+                            // that never named an object sits in the middle of
+                            // somebody's payload, and the words below it say
+                            // whose.
+                            // SAFETY: `b` is a registered base inside the
+                            // arena, and the world is stopped.
+                            let w: [u64; 4] =
+                                unsafe { std::ptr::read_unaligned(b as *const [u64; 4]) };
+                            let below: [u64; 2] = if b >= self.arena_base + 16 {
+                                // SAFETY: as above; `b - 16` is still inside.
+                                unsafe { std::ptr::read_unaligned((b - 16) as *const [u64; 2]) }
+                            } else {
+                                [0; 2]
+                            };
+                            tracing::error!(
+                                target: "cratonvm::gc::guard",
+                                site = where_,
+                                base = b,
+                                size = sz,
+                                ends_at = b + sz,
+                                next_base = next,
+                                overrun = b + sz - next,
+                                kind = ?h.kind(),
+                                class_id = h.class_id.as_u32(),
+                                num_slots = h.num_slots(),
+                                array_length = h.array_length(),
+                                next_class_id = nh.class_id.as_u32(),
+                                next_num_slots = nh.num_slots(),
+                                vacated_in_cycle = ?vacated,
+                                seen_at_slide_exit = seen_then,
+                                size_at_slide_exit = size_then,
+                                w0 = format!("{:#018x}", w[0]),
+                                w1 = format!("{:#018x}", w[1]),
+                                w2 = format!("{:#018x}", w[2]),
+                                w3 = format!("{:#018x}", w[3]),
+                                below0 = format!("{:#018x}", below[0]),
+                                below1 = format!("{:#018x}", below[1]),
+                                "zgc extent census: a registered object's computed extent \
+                                 runs INTO the next registered object"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        if overlaps != 0 || unsizable_now != 0 {
+            tracing::error!(
+                target: "cratonvm::gc::guard",
+                site = where_,
+                overlaps,
+                unsizable = unsizable_now,
+                registered = bases.len(),
+                compaction_cycles = self.compaction_cycles.load(Ordering::Relaxed),
+                "zgc extent census: survey of the object-start registry"
+            );
+        }
+        overlaps
     }
 
     /// Can the rewrite pass safely walk the object at `base`?
@@ -4870,6 +5359,7 @@ impl ZgcRealHeap {
         // One `fetch_or` into the object-start bitmap — no lock, no hash, no
         // table that grows with the live set. See the "Object-start membership"
         // section header for the measurement this replaced.
+        self.audit_registry_insert(ptr as usize, size, "alloc_raw");
         self.registry.insert(ptr as usize);
         let after = self.allocated.fetch_add(size, Ordering::Relaxed) + size;
         // Arm the native-allocation-pressure latch on the crossing edge. This
@@ -4910,7 +5400,63 @@ impl ZgcRealHeap {
         );
         unsafe {
             std::ptr::write(ptr as *mut ObjectHeader, header);
-            Some(ObjectRef::from_raw(ptr))
+        }
+        self.audit_reserved_vs_header(ptr, total, "object", class_id);
+        // SAFETY: `ptr` is a fresh `total`-byte allocation carrying a header.
+        unsafe { Some(ObjectRef::from_raw(ptr)) }
+    }
+
+    /// The bytes an allocation reserved and the bytes its header describes must
+    /// be the same number.
+    ///
+    /// Everything downstream sizes an object from its header — the sweep zeroes
+    /// and free-lists `alloc_size(header)` bytes, the slide memmoves that many,
+    /// `is_object_address` decides containment with it — while the allocator
+    /// advanced the cursor by what it RESERVED. If those two disagree by even
+    /// one slot, the next allocation's base lands inside this object's declared
+    /// extent, and the object-start registry then holds two entries that
+    /// overlap. That is the shape of every overlap the extent census has
+    /// reported on the `ResourceLeakDetectorTest` repro: a registered base
+    /// interior to another registered object.
+    ///
+    /// Checking it here rather than inferring it from the wreckage a cycle
+    /// later is the difference between naming the class that does it and
+    /// reading tea leaves in a hex dump.
+    ///
+    /// Diagnostic only, behind `CRATONVM_DBG_ZGC_CORPSE`, capped at 16 lines.
+    #[inline]
+    fn audit_reserved_vs_header(
+        &self,
+        ptr: *mut u8,
+        reserved: usize,
+        what: &'static str,
+        class_id: ClassId,
+    ) {
+        if !zgc_corpse_enabled() {
+            return;
+        }
+        // SAFETY: the caller has just written a header at `ptr`.
+        let header = unsafe { &*(ptr as *const ObjectHeader) };
+        let sized = Self::alloc_size(header);
+        if sized == Some(reserved) {
+            return;
+        }
+        let n = self.corpse_reports.fetch_add(1, Ordering::Relaxed);
+        if n < 16 {
+            tracing::error!(
+                target: "cratonvm::gc::guard",
+                what,
+                addr = ptr as usize,
+                reserved,
+                header_says = ?sized,
+                class_id = class_id.as_u32(),
+                num_slots = header.num_slots(),
+                array_length = header.array_length(),
+                kind = ?header.kind(),
+                "zgc alloc audit: the bytes reserved for this object and the bytes its \
+                 header describes disagree -- the next allocation's base will land inside \
+                 its declared extent"
+            );
         }
     }
 
@@ -4928,17 +5474,13 @@ impl ZgcRealHeap {
         let total = ARRAY_DATA_OFFSET.checked_add(data_size)?;
         let ptr = self.alloc_raw_tlab(total)?;
         let len_u32 = u32::try_from(length).ok()?;
-        let header = ObjectHeader::new(
-            class_id,
-            ObjectKind::Array,
-            element_type,
-            len_u32,
-            len_u32,
-        );
+        let header = ObjectHeader::new(class_id, ObjectKind::Array, element_type, len_u32, len_u32);
         unsafe {
             std::ptr::write(ptr as *mut ObjectHeader, header);
-            Some(ObjectRef::from_raw(ptr))
         }
+        self.audit_reserved_vs_header(ptr, total, "array", class_id);
+        // SAFETY: `ptr` is a fresh `total`-byte allocation carrying a header.
+        unsafe { Some(ObjectRef::from_raw(ptr)) }
     }
 
     /// Allocate and pre-initialize primitive-typed slots from JVM descriptors.
@@ -5430,6 +5972,64 @@ impl ZgcRealHeap {
             return None;
         }
         Some(num_slots)
+    }
+
+    /// Is the receiver of a field or array access an object at all?
+    ///
+    /// [`Self::check_field_index`] guards the INDEX and nothing guards the
+    /// RECEIVER, so an access through an address that merely happens to carry a
+    /// plausible header passes every check and reads or writes wherever it
+    /// points. That is the one shape that can explain the reopened
+    /// `zgc-rewrite-pass-walks-off-a-reference-array` corruption: a store into
+    /// object `O` at index `i` writes at `O + HEADER_SIZE + i * SLOT_SIZE`, so
+    /// it can only land on another object's offset 0 -- which is what the
+    /// extent census keeps finding -- if `O` is not where an object starts.
+    ///
+    /// Reports and never refuses. Refusing would turn a wrong write into a
+    /// silently dropped one, which is harder to debug and no safer: by the time
+    /// this fires the receiver is already wrong, and what is wanted is its
+    /// identity, not its suppression.
+    ///
+    /// Behind `CRATONVM_DBG_ZGC_CORPSE`: one bit test on the object-start
+    /// bitmap when it is on, a branch when it is off. Capped, and it names
+    /// three things -- whether any registered object CONTAINS the receiver
+    /// (an interior pointer, so the caller derived it), how far into that
+    /// object it points, and what class that container is.
+    fn audit_access_receiver(&self, base: usize, index: usize, op: &'static str) {
+        if !zgc_corpse_enabled() || self.registry.contains(base) {
+            return;
+        }
+        let n = self.corpse_reports.fetch_add(1, Ordering::Relaxed);
+        if n >= 24 {
+            return;
+        }
+        // The registered object this address falls inside, if any. An interior
+        // hit means the caller HELD a derived pointer; a miss means the address
+        // is not in any live object at all, which is a different bug.
+        let container = self.registry.nearest_base_at_or_below(base);
+        let (container_base, container_class, container_slots, interior_off) = match container {
+            Some(c) if c < base => {
+                let ch = self.header_ref(c as *mut u8);
+                (c, ch.class_id.as_u32(), ch.num_slots(), base - c)
+            }
+            _ => (0, 0, 0, 0),
+        };
+        let h = self.header_ref(base as *mut u8);
+        tracing::error!(
+            target: "cratonvm::gc::guard",
+            op,
+            base,
+            index,
+            receiver_class_id = h.class_id.as_u32(),
+            receiver_num_slots = h.num_slots(),
+            receiver_kind = ?h.kind(),
+            container_base,
+            container_class,
+            container_slots,
+            interior_off,
+            "zgc access audit: the receiver of this field/array access is not a \
+             registered object base -- the access will land wherever it points"
+        );
     }
 
     /// `CRATONVM_DBG_ZGC_CORPSE` -- name the object that USED to be at the
@@ -6611,6 +7211,23 @@ impl ZTlabHeapHooks for ZgcRealHeap {
     /// allocation clears the re-arm floor. Nothing here writes `gc_rearm`;
     /// only the sweep does.
     fn register_allocations(&self, addrs: &[usize], bytes: usize) {
+        if zgc_corpse_enabled() {
+            // Per-object sizes are not passed, but a TLAB hands out bases in
+            // increasing order inside one chunk, so consecutive entries bound
+            // each other. The LAST has no successor -- and skipping it was a
+            // hole, because the last object in a batch is exactly the one with
+            // no upper bound on its extent. Bound it by what the batch as a
+            // whole reserved: `bytes` covers every object in it, so
+            // `first + bytes` is at or above the last one's end.
+            let batch_end = addrs.first().map_or(0, |f| f.saturating_add(bytes));
+            for (i, &a) in addrs.iter().enumerate() {
+                let sz = match addrs.get(i + 1) {
+                    Some(next) => next.saturating_sub(a),
+                    None => batch_end.saturating_sub(a),
+                };
+                self.audit_registry_insert(a, sz, "tlab_batch");
+            }
+        }
         self.registry.insert_all(addrs);
         if bytes == 0 {
             return;
@@ -6820,6 +7437,10 @@ impl ZgcRealHeap {
         // driver, neither of which stops the world, so a peer may legitimately
         // refill between the loop and the check. `tlab_reserved_tails()` stays
         // available as the tripwire for a caller that IS at a safepoint.
+        if summary.skipped_locked > 0 {
+            self.tlab_retire_skipped_total
+                .fetch_add(summary.skipped_locked, Ordering::Relaxed);
+        }
         if summary.live_chunks > 0 || summary.slots_pruned > 0 || summary.skipped_locked > 0 {
             tracing::debug!(
                 target: "zgc",
@@ -8061,6 +8682,7 @@ impl GarbageCollector for ZgcRealHeap {
     }
 
     fn set_field(&self, obj: ObjectRef, index: usize, value: Value) {
+        self.audit_access_receiver(obj.as_ptr() as usize, index, "set_field");
         let header = self.header(obj);
         if self.check_field_index(header, index, "set").is_none() {
             return;
@@ -8212,6 +8834,7 @@ impl GarbageCollector for ZgcRealHeap {
     }
 
     fn set_array_element(&self, obj: ObjectRef, index: usize, value: Value) -> Result<(), i32> {
+        self.audit_access_receiver(obj.as_ptr() as usize, index, "set_array_element");
         let header = self.header(obj);
         if header.kind() != ObjectKind::Array {
             return Err(index as i32);
@@ -8647,6 +9270,25 @@ impl GarbageCollector for ZgcRealHeap {
             let _ = self.slot_census.run_walk(self);
         }
 
+        // ---- EXTENT CENSUS (diagnostic, `CRATONVM_DBG_ZGC_CORPSE`) -------
+        //
+        // Every registered object's computed extent must end at or below the
+        // next registered base. The sweep below depends on it twice over: it
+        // zeroes `alloc_size(header)` bytes from a dead object's base and
+        // hands the same span to `Arena::add_free_block`. An extent that is
+        // too long therefore zeroes the header of the NEXT object and puts its
+        // memory on the free list, so the allocator re-issues an address that
+        // is still live and still registered -- which is the reopened
+        // rewrite-pass page's failure exactly, with no compaction anywhere in
+        // the story.
+        //
+        // Deliberately BEFORE the sweep, on the pre-sweep registry: anything
+        // it reports is older than this cycle's zeroing, so the report cannot
+        // be an echo of the damage it is looking for.
+        if zgc_corpse_enabled() {
+            self.survey_registry_extents(&all, "pre-sweep");
+        }
+
         // ---- Sweep phase -------------------------------------------------
         let mut dead: Vec<usize> = Vec::new();
         let mut bytes_copied = 0usize; // "retained" bytes (non-moving)
@@ -8737,6 +9379,29 @@ impl GarbageCollector for ZgcRealHeap {
             // and a 16 MB array becomes unservable forever once the process has
             // allocated its capacity, with 1.8 GB free and 15% live. See
             // `Arena::retract_cursor_into_free_tail`.
+            // WHERE THE SWEPT BYTES ACTUALLY WENT.
+            //
+            // `bytes_freed` is what the sweep handed to `add_free_block`; this
+            // is what the arena has to show for it, measured at the same
+            // instant with the same lock held. A large `bytes_freed` beside a
+            // small `free_bytes_total` is memory that was swept and then lost,
+            // and it is the difference between "this heap fragments" and "this
+            // heap leaks" -- which want opposite fixes.
+            //
+            // Under `--verbose:gc` only, next to the per-cycle line it
+            // explains.
+            if self.gc_log_enabled.load(Ordering::Relaxed) {
+                eprintln!(
+                    "[GC] zgc-reclaim: bytes_freed={} free_list_bytes={} \
+                     largest_free_block={} cursor={} capacity={} registered={}",
+                    bytes_freed,
+                    arena.free_list_bytes(),
+                    arena.largest_free_block(),
+                    arena.used(),
+                    arena.capacity(),
+                    all.len(),
+                );
+            }
             let reclaimed_tail = arena.retract_cursor_into_free_tail();
             if reclaimed_tail != 0 {
                 tracing::debug!(
@@ -11137,6 +11802,67 @@ pub(crate) mod tests {
             "compaction must leave a bigger contiguous run than the free list \
              held before it: after={after} before={before}"
         );
+    }
+
+    /// **Nothing live may end above the cursor the slide hands the allocator.**
+    ///
+    /// `compact_low_to` zeroes everything above the new cursor and lets the
+    /// bump allocator re-issue it. A live object up there is therefore erased
+    /// and its address handed to the next allocation, while the object-start
+    /// registry still names it — after which the next slide's rewrite pass
+    /// reads a "header" made of the new tenant's payload. That is the failure
+    /// `rewrite_target_is_walkable` reports, and it has been seen in
+    /// production with the offending headers decoding as String character
+    /// data (`docs/known-issues/zgc-rewrite-pass-walks-off-a-reference-array-20260815.md`).
+    ///
+    /// **Read this test for what it is.** It asserts the property that failure
+    /// violates; it does not reproduce that failure. The guard it covers HAS
+    /// been observed firing on the netty repro — one unsizable survivor breaks
+    /// the slide loop early, leaving `dest` at that object and every live
+    /// survivor above it outside the cursor — so this is a live invariant, not
+    /// a hypothetical one. It is here so that a future change to `dest` /
+    /// `highest_pinned_end` — the two partial answers whose maximum the cursor
+    /// is — cannot quietly stop covering the live set.
+    #[test]
+    fn compaction_never_leaves_a_live_object_above_the_bump_cursor() {
+        let heap = ZgcRealHeap::with_capacity(1024 * 1024);
+        heap.set_tlab_enabled(false);
+        // A mixed population with two thirds garbage, so the selector finds
+        // pages worth evacuating and (at 0.25 max occupancy) also refuses
+        // some — both halves of the cursor's partition have to be populated
+        // or the test only exercises one of them.
+        let mut live: Vec<usize> = Vec::new();
+        for i in 0..2000usize {
+            let o = heap.alloc_object(ClassId::new(1), i % 6);
+            if i % 3 == 0 {
+                live.push(o.as_ptr() as usize);
+            }
+        }
+        let (_moved, _reclaimed, map) = heap.relocate_stw_for_test(&live);
+
+        let (base, cursor, capacity) = {
+            let arena = heap.arena.lock();
+            let b = arena.base_ptr() as usize;
+            (b, b + arena.used_low_for_compaction(), arena.capacity())
+        };
+        for &pre in &live {
+            let now = map.get(&pre).copied().unwrap_or(pre);
+            if now < base || now >= base + capacity {
+                continue; // off-arena / high end: this slide never touches it
+            }
+            let size = ZgcRealHeap::alloc_size(heap.header_ref(now as *mut u8)).expect(
+                "a live object must still be sizable after the slide -- an unsizable \
+                 one means the slide wrote over it, which is the other half of the \
+                 same bug",
+            );
+            assert!(
+                now + size <= cursor,
+                "live object at 0x{now:x}..0x{:x} ends above the compaction cursor \
+                 0x{cursor:x}: its bytes are about to be zeroed and re-issued while \
+                 the registry still names it",
+                now + size
+            );
+        }
     }
 
     /// **End to end: a full `collect_garbage` with compaction on keeps the

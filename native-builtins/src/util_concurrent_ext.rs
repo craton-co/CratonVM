@@ -925,6 +925,61 @@ fn report_layout_alias(class_name: &str, num_fields: usize, real: usize) {
 /// native that wanted the shape, not this one forwarding line — see the
 /// matching note on `NativeContext::try_ensure_synthetic_class`. This funnel has
 /// ~2,000 call sites, so without it the census cannot name a single one.
+/// Build a Java reference array whose elements come from an ALLOCATING
+/// producer, keeping the array rooted across every one of those allocations.
+///
+/// **The bug this exists to stop.** `let arr = ctx.new_ref_array(..); for i {
+/// let el = <allocates>; ctx.set_array_element(arr, i, el) }` is wrong: `arr`
+/// is a raw `ObjectRef`, the producer can trigger a moving young collection,
+/// and every `set_array_element` after that point writes through a stale
+/// reference — silently DROPPED by the heap guard. The live array keeps
+/// whatever the collector left in those slots.
+///
+/// It is not a theoretical hazard. Both `getAcceptedIssuers` implementations
+/// had exactly this shape, and netty's `ParameterizedSslHandlerTest` saw both
+/// of its faces intermittently through
+/// `ReferenceCountedOpenSslServerContext.newSessionContext`:
+/// `IllegalArgumentException: Null element in chain: [null × 32]`, and
+/// `NoSuchMethodError: sun.security.util.DerValue.getEncoded()` — a `DerValue`
+/// left in a vacated slot by the certificate parsing the producer had just
+/// done.
+///
+/// `make` is handed the context and the index and must return the element; if
+/// IT allocates after building the element, IT must pin the element (see
+/// `keystore::make_x509_mirror`, which does). An `Err` stops the fill and
+/// propagates, after the array is unpinned.
+pub(crate) fn build_rooted_ref_array<F>(
+    ctx: &mut dyn NativeContext,
+    class_id: cratonvm_types::ClassId,
+    len: usize,
+    mut make: F,
+) -> Result<ObjectRef, MethodCallFailed>
+where
+    F: FnMut(&mut dyn NativeContext, usize) -> Result<ObjectRef, MethodCallFailed>,
+{
+    let arr0 = ctx.new_ref_array(class_id, len);
+    let pin = ctx.pin_native_root(arr0);
+    let mut arr = arr0;
+    let mut failure = None;
+    for i in 0..len {
+        match make(ctx, i) {
+            Ok(element) => {
+                arr = ctx.read_native_pin(pin, arr0);
+                ctx.set_array_element(arr, i, cratonvm_types::Value::Object(Some(element)));
+            }
+            Err(e) => {
+                failure = Some(e);
+                break;
+            }
+        }
+    }
+    ctx.unpin_native_roots(pin);
+    match failure {
+        Some(e) => Err(e),
+        None => Ok(arr),
+    }
+}
+
 #[track_caller]
 pub(crate) fn try_alloc_concurrent_synthetic(
     ctx: &mut dyn NativeContext,

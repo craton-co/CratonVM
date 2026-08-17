@@ -3775,22 +3775,26 @@ fn jit_newarray_oom(vm: &SharedVm, length: usize) -> i64 {
     )
 }
 
-/// G1 last-ditch full mark cycle on allocation failure — see the
-/// interpreter's `g1_force_full_cycle`: young pauses cannot reclaim dead
-/// Old/humongous spans, only a completed mark cycle's cleanup can. Returns
-/// `true` when the cycle was attempted (caller should retry the allocation
+/// Last-ditch reclamation on allocation failure — see the interpreter's
+/// `last_ditch_reclaim`: a completed G1 mark cycle for dead Old/humongous
+/// spans, then a collection with every SoftReference condemned, which
+/// `java.lang.ref` requires before the VM may throw `OutOfMemoryError`.
+/// Returns `true` when it was attempted (caller should retry the allocation
 /// once before surfacing OOM).
+///
+/// The G1 gate this used to open with is gone: it belonged to step 1 alone,
+/// and applying it to the whole function made the soft-reference rule
+/// G1-only — so a ZGC or Generational program OOME'd with a heap of softly
+/// reachable garbage, which is exactly the failure the interpreter-side ladder
+/// was fixed for. `last_ditch_reclaim` re-applies it to the step that owns it.
 #[cold]
 fn jit_g1_last_ditch_full_cycle(vm: &SharedVm) -> bool {
-    if !vm.mem.heap.is_g1() {
-        return false;
-    }
     // SAFETY: called only from the JIT allocation slow-path helpers, on a
     // mutator thread that entered compiled code through the JIT entry
     // trampoline — the same contract as the surrounding `jit_thread_mut`
     // calls in those helpers.
     if let Some((thread, _guard)) = unsafe { jit_thread_mut() } {
-        crate::runtime::interpreter::g1_force_full_cycle(vm, thread);
+        crate::runtime::interpreter::last_ditch_reclaim(vm, thread);
         true
     } else {
         false

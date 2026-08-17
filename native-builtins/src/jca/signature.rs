@@ -77,7 +77,10 @@ const SIG_OFF_KEYID: usize = 4;
 // the SunEC ECDSA drive path (`crate::route_ec_to_real`); the GC scans synthetic
 // object slots, so the ref stays live/forwarded across init→update→sign.
 const SIG_OFF_KEYOBJ: usize = 5;
-const SIG_PRIVATE_SLOTS: usize = 6;
+/// The application `SignatureSpi` instance, when this `Signature` came from a
+/// third-party provider (see `sig_user_spi_table`). GC-scanned like slot 5.
+const SIG_OFF_SPIOBJ: usize = 6;
+const SIG_PRIVATE_SLOTS: usize = 7;
 
 // ---------------------------------------------------------------------------
 // SigProbe fix: process-wide side tables for Signature algorithm / state /
@@ -158,6 +161,51 @@ fn sig_payload_table() -> &'static parking_lot::Mutex<rustc_hash::FxHashMap<SigK
     T.get_or_init(|| parking_lot::Mutex::new(rustc_hash::FxHashMap::default()))
 }
 
+/// `PSSParameterSpec`s installed via `Signature.setParameter`, same
+/// `(vm_identity, identity_hash)` key discipline as the tables above and the
+/// same reason: plain Rust data, GC-stable key, no heap refs to scan.
+fn sig_pss_table() -> &'static parking_lot::Mutex<rustc_hash::FxHashMap<SigKey, PssParams>> {
+    use std::sync::OnceLock;
+    static T: OnceLock<parking_lot::Mutex<rustc_hash::FxHashMap<SigKey, PssParams>>> =
+        OnceLock::new();
+    T.get_or_init(|| parking_lot::Mutex::new(rustc_hash::FxHashMap::default()))
+}
+
+fn get_sig_pss(ctx: &mut dyn NativeContext, this: ObjectRef) -> Option<PssParams> {
+    let key = sig_key(ctx, this);
+    sig_pss_table().lock().get(&key).copied()
+}
+
+/// `(provider name, SPI class)` for a `Signature` obtained from a THIRD-PARTY
+/// provider, i.e. one this VM does not service natively.
+///
+/// See `provider_chain::third_party_service_class`. When an entry is present,
+/// every operation on this `Signature` is forwarded to the application's own
+/// `SignatureSpi` object (slot `SIG_OFF_SPIOBJ`) rather than to the native
+/// dispatch tables — the whole point of the application having registered it.
+fn sig_user_spi_table() -> &'static parking_lot::Mutex<rustc_hash::FxHashMap<SigKey, (String, String)>>
+{
+    use std::sync::OnceLock;
+    static T: OnceLock<
+        parking_lot::Mutex<rustc_hash::FxHashMap<SigKey, (String, String)>>,
+    > = OnceLock::new();
+    T.get_or_init(|| parking_lot::Mutex::new(rustc_hash::FxHashMap::default()))
+}
+
+fn get_sig_user_spi(ctx: &mut dyn NativeContext, this: ObjectRef) -> Option<(String, String)> {
+    let key = sig_key(ctx, this);
+    sig_user_spi_table().lock().get(&key).cloned()
+}
+
+/// The live application `SignatureSpi` for this `Signature`, if it has one.
+fn sig_user_spi_obj(ctx: &mut dyn NativeContext, this: ObjectRef) -> Option<ObjectRef> {
+    let base = synthetic_base_offset(ctx, "java/security/Signature");
+    match ctx.get_field(this, base + SIG_OFF_SPIOBJ) {
+        Value::Object(Some(o)) => Some(o),
+        _ => None,
+    }
+}
+
 fn set_sig_algo(ctx: &mut dyn NativeContext, this: ObjectRef, idx: i32) {
     let key = sig_key(ctx, this);
     sig_algo_table().lock().insert(key, idx);
@@ -236,6 +284,11 @@ const SIG_SHA1_DSA: i32 = 21;
 /// 2026-08-14 — `algo_idx` had no arm and no provider in the chain advertises
 /// it, so `signature_name_is_offered` answered false on both halves.
 const SIG_NONE_RSA: i32 = 22;
+/// `MD5andSHA1withRSA` — the TLS 1.0/1.1 CertificateVerify signature: PKCS#1
+/// v1.5 block type 1 over `MD5(m) || SHA1(m)` with NO DigestInfo (there is no
+/// OID for the pair). SunJSSE serves it, not SunRsaSign, and netty's
+/// `JdkDelegatingPrivateKeyMethod` maps `SSL_SIGN_RSA_PKCS1_MD5_SHA1` onto it.
+const SIG_MD5_SHA1_RSA: i32 = 23;
 
 fn algo_idx(name: &str) -> i32 {
     let upper = name.to_ascii_uppercase();
@@ -245,6 +298,7 @@ fn algo_idx(name: &str) -> i32 {
         "SHA512WITHRSA" => SIG_SHA512_RSA,
         "SHA1WITHRSA" | "SHA-1WITHRSA" => SIG_SHA1_RSA,
         "NONEWITHRSA" => SIG_NONE_RSA,
+        "MD5ANDSHA1WITHRSA" => SIG_MD5_SHA1_RSA,
         // RSASSA-PSS (JWA PS256/384/512). keycloak's `JavaAlgorithm` resolves
         // these to BouncyCastle's `SHA{256,384,512}withRSAandMGF1`; accept the
         // `/PSS` aliases too. (Bare "RSASSA-PSS" carries its hash in a
@@ -301,6 +355,7 @@ fn algo_name(idx: i32) -> &'static str {
         SIG_SHA512_RSA => "SHA512withRSA",
         SIG_SHA1_RSA => "SHA1withRSA",
         SIG_NONE_RSA => "NONEwithRSA",
+        SIG_MD5_SHA1_RSA => "MD5andSHA1withRSA",
         SIG_SHA384_ECDSA => "SHA384withECDSA",
         SIG_SHA256_ECDSA => "SHA256withECDSA",
         SIG_SHA512_ECDSA => "SHA512withECDSA",
@@ -481,9 +536,55 @@ fn clear_data(ctx: &mut dyn NativeContext, this: ObjectRef) {
 /// SHA-384/512 we hash first via the `hash_function`-returning helper and
 /// then pad-and-modpow through PKCS#1 v1.5.  Out of scope for the probe;
 /// the probe is SHA-256 only.
+/// The `PSSParameterSpec` a caller installed with
+/// `Signature.setParameter(...)`: message digest, MGF1 digest, salt length.
+///
+/// PSS is the one JCA signature family whose ALGORITHM NAME does not fix its
+/// parameters — `Signature.getInstance("RSASSA-PSS")` carries none until
+/// `setParameter` supplies them, and JSSE, netty and every TLS stack rely on
+/// that. `setParameter` was a no-op here, so the spec never reached the
+/// signer: `sign()` used SHA-256/salt-32 whatever was asked for, and `verify()`
+/// accepted a signature made under a DIFFERENT spec (measured: sign with
+/// SHA-256/32, verify with SHA-512/64 → `true`, where HotSpot answers `false`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PssParams {
+    hash: crypto_impl::PssHash,
+    mgf_hash: crypto_impl::PssHash,
+    salt_len: usize,
+}
+
 fn sign_dispatch(alg: i32, key_id: u64, data: &[u8]) -> Option<Vec<u8>> {
+    sign_dispatch_with(alg, key_id, data, None)
+}
+
+fn sign_dispatch_with(
+    alg: i32,
+    key_id: u64,
+    data: &[u8],
+    pss: Option<PssParams>,
+) -> Option<Vec<u8>> {
+    use cratonvm_native_builtins_crypto::signature::DigestAlgorithm as D;
+    if let (Some(p), true) = (pss, is_pss(alg)) {
+        return crypto_impl::rsa_sign_pss_ex_by_id(
+            key_id,
+            p.hash,
+            p.mgf_hash,
+            p.salt_len,
+            data,
+        );
+    }
     match alg {
         SIG_SHA256_RSA => crypto_impl::rsa_sign(key_id, data),
+        // SHA-1/384/512 differ from SHA-256 only in the DigestInfo prefix, and
+        // the VERIFY side has taken a `DigestAlgorithm` all along. Until this
+        // arm existed, `Signature.getInstance("SHA512withRSA").sign()` refused
+        // with "this VM has no native implementation for that algorithm" —
+        // after `getInstance` had already advertised the name and `initSign`
+        // had already accepted the key.
+        SIG_SHA1_RSA => crypto_impl::rsa_sign_digest(key_id, D::Sha1, data),
+        SIG_SHA384_RSA => crypto_impl::rsa_sign_digest(key_id, D::Sha384, data),
+        SIG_SHA512_RSA => crypto_impl::rsa_sign_digest(key_id, D::Sha512, data),
+        SIG_MD5_SHA1_RSA => crypto_impl::rsa_sign_md5_sha1(key_id, data),
         SIG_NONE_RSA => crypto_impl::rsa_sign_none(key_id, data),
         SIG_PSS_SHA256 => {
             crypto_impl::rsa_sign_pss_by_id(key_id, crypto_impl::PssHash::Sha256, data)
@@ -513,6 +614,10 @@ fn natively_dispatched(alg: i32) -> bool {
     matches!(
         alg,
         SIG_SHA256_RSA
+            | SIG_SHA1_RSA
+            | SIG_SHA384_RSA
+            | SIG_SHA512_RSA
+            | SIG_MD5_SHA1_RSA
             | SIG_NONE_RSA
             | SIG_PSS_SHA256
             | SIG_PSS_SHA384
@@ -603,9 +708,38 @@ fn refuse_unanswerable(
     )
 }
 
+fn is_pss(alg: i32) -> bool {
+    matches!(alg, SIG_PSS_SHA256 | SIG_PSS_SHA384 | SIG_PSS_SHA512)
+}
+
 fn verify_dispatch(alg: i32, key_id: u64, data: &[u8], sig: &[u8]) -> Option<bool> {
+    verify_dispatch_with(alg, key_id, data, sig, None)
+}
+
+fn verify_dispatch_with(
+    alg: i32,
+    key_id: u64,
+    data: &[u8],
+    sig: &[u8],
+    pss: Option<PssParams>,
+) -> Option<bool> {
+    use cratonvm_native_builtins_crypto::signature::DigestAlgorithm as D;
+    if let (Some(p), true) = (pss, is_pss(alg)) {
+        return crypto_impl::rsa_verify_pss_ex_by_id(
+            key_id,
+            p.hash,
+            p.mgf_hash,
+            p.salt_len,
+            data,
+            sig,
+        );
+    }
     match alg {
         SIG_SHA256_RSA => crypto_impl::rsa_verify(key_id, data, sig),
+        SIG_SHA1_RSA => crypto_impl::rsa_verify_digest(key_id, D::Sha1, data, sig),
+        SIG_SHA384_RSA => crypto_impl::rsa_verify_digest(key_id, D::Sha384, data, sig),
+        SIG_SHA512_RSA => crypto_impl::rsa_verify_digest(key_id, D::Sha512, data, sig),
+        SIG_MD5_SHA1_RSA => crypto_impl::rsa_verify_md5_sha1(key_id, data, sig),
         SIG_NONE_RSA => crypto_impl::rsa_verify_none(key_id, data, sig),
         SIG_PSS_SHA256 => {
             crypto_impl::rsa_verify_pss_by_id(key_id, crypto_impl::PssHash::Sha256, data, sig)
@@ -1032,6 +1166,30 @@ fn sig_get_instance(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
             &format!("{alg} Signature not available"),
         ));
     }
+    // A THIRD-PARTY provider's own implementation class, if this lookup names
+    // one. Resolved here (not at `initSign`) because the SPI instance has to
+    // exist before `setParameter`, which callers do first.
+    let requested_provider = match args.get(1) {
+        Some(Value::Object(Some(p))) => {
+            let is_string = ctx
+                .class_name_of_id(ctx.class_id_of_object(*p))
+                .is_some_and(|n| n == "java/lang/String");
+            if is_string {
+                ctx.read_string(*p)
+            } else {
+                match ctx.invoke_virtual(*p, "getName", "()Ljava/lang/String;", &[]) {
+                    Ok(Some(Value::Object(Some(s)))) => ctx.read_string(s),
+                    _ => None,
+                }
+            }
+        }
+        _ => None,
+    };
+    let user_spi = crate::jca::provider_chain::third_party_service_class(
+        requested_provider.as_deref(),
+        "Signature",
+        &alg,
+    );
     let base = synthetic_base_offset(ctx, "java/security/Signature");
     let obj = try_alloc_concurrent_synthetic(ctx, "java/security/Signature", base + SIG_PRIVATE_SLOTS)?;
     // SigProbe fix: side-table is the authoritative store; the base-offset
@@ -1048,17 +1206,214 @@ fn sig_get_instance(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     ctx.set_field(obj, base + SIG_OFF_PROVIDER, Value::Int(0));
     ctx.set_field(obj, base + SIG_OFF_PENDING, Value::Int(0));
     ctx.set_field(obj, base + SIG_OFF_KEYID, Value::Long(0));
+    if let Some(spi_class) = user_spi {
+        // Construct the application's SPI now, exactly as
+        // `Provider.Service.newInstance` does. A provider whose class cannot
+        // be constructed is not a usable provider — but that is the
+        // APPLICATION's class, so let its failure escape rather than falling
+        // back to the native engine and signing with the wrong thing.
+        let obj_pin = ctx.pin_native_root(obj);
+        let spi = match ctx.new_object_initialized(&spi_class, "()V", &[])? {
+            Some(Value::Object(Some(o))) => o,
+            _ => {
+                ctx.unpin_native_roots(obj_pin);
+                return Err(crate::jca::provider_chain::throw_no_such_algorithm_public(
+                    ctx,
+                    &format!("{alg} Signature: provider class {spi_class} could not be instantiated"),
+                ));
+            }
+        };
+        let obj = ctx.read_native_pin(obj_pin, obj);
+        ctx.unpin_native_roots(obj_pin);
+        ctx.set_field(obj, base + SIG_OFF_SPIOBJ, Value::Object(Some(spi)));
+        let key = sig_key(ctx, obj);
+        sig_user_spi_table().lock().insert(
+            key,
+            (
+                requested_provider.unwrap_or_else(|| {
+                    crate::jca::provider_chain::find_service_provider("Signature", &alg)
+                        .unwrap_or_default()
+                }),
+                spi_class,
+            ),
+        );
+        return Ok(Some(Value::Object(Some(obj))));
+    }
     Ok(Some(Value::Object(Some(obj))))
+}
+
+/// Forward one call to the application's `SignatureSpi`, pinning the receiver
+/// across it. Any exception the SPI raises propagates verbatim — that is the
+/// contract callers such as netty's provider search depend on
+/// (`InvalidKeyException` from `engineInitSign` is how it learns to try the
+/// next provider).
+fn user_spi_call(
+    ctx: &mut dyn NativeContext,
+    spi: ObjectRef,
+    method: &str,
+    desc: &str,
+    args: &[Value],
+) -> MethodCallResult {
+    ctx.invoke_virtual(spi, method, desc, args)
+}
+
+/// Complete a `sign()`/`verify()` on an application `SignatureSpi`: hand it the
+/// buffered `update()` payload, then ask it for the answer.
+///
+/// The payload is buffered here rather than forwarded per `update()` call for
+/// the same reason `drive_real_signature_spi` does it — one `engineUpdate`
+/// with the whole message is what every `SignatureSpi` implementation
+/// supports, and it keeps `update()` free of a second code path.
+fn drive_user_spi(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    spi: ObjectRef,
+    verify_sig: Option<Vec<u8>>,
+) -> MethodCallResult {
+    let data = take_data(ctx, this)?;
+    let spi_pin = ctx.pin_native_root(spi);
+    let result = (|| {
+        if !data.is_empty() {
+            let arr = alloc_byte_array(ctx, &data);
+            let spi = ctx.read_native_pin(spi_pin, spi);
+            user_spi_call(
+                ctx,
+                spi,
+                "engineUpdate",
+                "([BII)V",
+                &[
+                    Value::Object(Some(arr)),
+                    Value::Int(0),
+                    Value::Int(data.len() as i32),
+                ],
+            )?;
+        }
+        let spi = ctx.read_native_pin(spi_pin, spi);
+        match verify_sig {
+            Some(sig_bytes) => {
+                let sigarr = alloc_byte_array(ctx, &sig_bytes);
+                let spi = ctx.read_native_pin(spi_pin, spi);
+                let ok = user_spi_call(
+                    ctx,
+                    spi,
+                    "engineVerify",
+                    "([B)Z",
+                    &[Value::Object(Some(sigarr))],
+                )?;
+                Ok(match ok {
+                    Some(Value::Int(n)) => Some(Value::Int(if n != 0 { 1 } else { 0 })),
+                    _ => Some(Value::Int(0)),
+                })
+            }
+            None => user_spi_call(ctx, spi, "engineSign", "()[B", &[]),
+        }
+    })();
+    ctx.unpin_native_roots(spi_pin);
+    result
+}
+
+/// `java.security.InvalidKeyException` — what BOTH `initSign` and `initVerify`
+/// declare, and what HotSpot raises for a key its provider cannot use.
+///
+/// **`init*` is where a caller decides which provider to use.** netty's
+/// `JdkDelegatingPrivateKeyMethod.findCompatibleSignature` asks the default
+/// provider first, `catch (InvalidKeyException)`, and only then walks
+/// `Security.getProviders()` looking for one that accepts the key — which is
+/// how an opaque `PrivateKey` (`getEncoded() == null`, the entire point of
+/// `OpenSslPrivateKeyMethod`) finds the application provider that CAN sign
+/// with it. Accepting the key here and refusing at `sign()` instead makes that
+/// search stop at the first provider and commit to one that can never work:
+/// the exception then arrives from inside the TLS callback, not from the
+/// probe, and the handshake fails.
+///
+/// Measured on Temurin 25.0.3+9 with a `PrivateKey` whose `getEncoded()`
+/// returns null: `SHA*withRSA` → `InvalidKeyException: Missing key encoding`,
+/// `RSASSA-PSS` → `InvalidKeyException: key must be RSAPrivateKey`.
+fn refuse_unusable_key(
+    ctx: &mut dyn NativeContext,
+    alg: i32,
+) -> cratonvm_types::error::MethodCallFailed {
+    crate::phases_early::throw_jca_exc(
+        ctx,
+        "java/security/InvalidKeyException",
+        &format!(
+            "Missing key encoding: this key carries no material this VM can use for \
+             {} (getEncoded() returned null, or the key was created by another provider)",
+            algo_name(alg)
+        ),
+    )
+}
+
+/// The algorithms whose ONLY route is the synthetic `crypto_impl` RSA key
+/// store, so a key that is not in that store cannot be used at all.
+///
+/// Deliberately narrow: EC/EdDSA/ML-DSA/DSA are driven through the real JDK
+/// SPI with the key OBJECT (`SIG_OFF_KEYOBJ`), where a zero `key_id` is normal
+/// and the real SPI raises its own `InvalidKeyException`.
+fn needs_registered_rsa_key(alg: i32) -> bool {
+    matches!(
+        alg,
+        SIG_SHA256_RSA
+            | SIG_SHA1_RSA
+            | SIG_SHA384_RSA
+            | SIG_SHA512_RSA
+            | SIG_MD5_SHA1_RSA
+            | SIG_NONE_RSA
+            | SIG_PSS_SHA256
+            | SIG_PSS_SHA384
+            | SIG_PSS_SHA512
+    )
 }
 
 fn sig_init_sign(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = this_arg(args)?;
+    if let Some(spi) = sig_user_spi_obj(ctx, this) {
+        // The application's own SPI decides whether it can use this key, and
+        // its `InvalidKeyException` must reach the caller unchanged: a
+        // provider search (netty's `findCompatibleSignature`) is written
+        // around catching exactly that to move on to the next provider.
+        let key = match args.get(1) {
+            Some(Value::Object(Some(k))) => Value::Object(Some(*k)),
+            _ => Value::Object(None),
+        };
+        user_spi_call(
+            ctx,
+            spi,
+            "engineInitSign",
+            "(Ljava/security/PrivateKey;)V",
+            &[key],
+        )?;
+        set_sig_state(ctx, this, STATE_SIGN);
+        clear_data(ctx, this);
+        return Ok(None);
+    }
     let base = synthetic_base_offset(ctx, "java/security/Signature");
     set_sig_state(ctx, this, STATE_SIGN);
     ctx.set_field(this, base + SIG_OFF_STATE, Value::Int(STATE_SIGN));
     ctx.set_field(this, base + SIG_OFF_PENDING, Value::Int(0));
     if let Some(Value::Object(Some(k))) = args.get(1) {
-        let kid = extract_key_id_from_key(ctx, *k);
+        let mut kid = extract_key_id_from_key(ctx, *k);
+        let alg = get_sig_algo(ctx, this).unwrap_or(-1);
+        if needs_registered_rsa_key(alg) && !crypto_impl::rsa_key_registered(kid) {
+            // A key this VM did not mint. Import it from the standard
+            // `java.security.interfaces.RSA{Private,Public}Key` accessors
+            // before refusing — the JDK's own engines consume any provider's
+            // key that exposes that interface, and so must ours. This became
+            // load-bearing the moment `KeyPairGenerator.getInstance(alg, "BC")`
+            // started returning BouncyCastle's OWN keys: a `BCRSAPrivateCrtKey`
+            // handed to an ANONYMOUS `Signature.getInstance("SHA256withRSA")`
+            // was refused with "Missing key encoding" while HotSpot signs with
+            // it through SunRsaSign, and bc-java's `cmp` suite does exactly
+            // that pairing. `register_rsa_priv_sign_material` no-ops for a key with no
+            // usable accessors, so a genuinely OPAQUE key still lands on the
+            // refusal below — which is the behaviour netty's provider search
+            // depends on.
+            crate::jca::key_factory::register_rsa_priv_sign_material(ctx, *k);
+            kid = extract_key_id_from_key(ctx, *k);
+            if !crypto_impl::rsa_key_registered(kid) {
+                return Err(refuse_unusable_key(ctx, alg));
+            }
+        }
         set_sig_keyid(ctx, this, kid);
         ctx.set_field(this, base + SIG_OFF_KEYID, Value::Long(kid as i64));
         // Stash the real key object for the SunEC ECDSA drive path (slot is
@@ -1071,12 +1426,49 @@ fn sig_init_sign(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
 
 fn sig_init_verify(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = this_arg(args)?;
+    if let Some(spi) = sig_user_spi_obj(ctx, this) {
+        let key = match args.get(1) {
+            Some(Value::Object(Some(k))) => Value::Object(Some(*k)),
+            _ => Value::Object(None),
+        };
+        user_spi_call(
+            ctx,
+            spi,
+            "engineInitVerify",
+            "(Ljava/security/PublicKey;)V",
+            &[key],
+        )?;
+        set_sig_state(ctx, this, STATE_VERIFY);
+        clear_data(ctx, this);
+        return Ok(None);
+    }
     let base = synthetic_base_offset(ctx, "java/security/Signature");
     set_sig_state(ctx, this, STATE_VERIFY);
     ctx.set_field(this, base + SIG_OFF_STATE, Value::Int(STATE_VERIFY));
     ctx.set_field(this, base + SIG_OFF_PENDING, Value::Int(0));
     if let Some(Value::Object(Some(k))) = args.get(1) {
-        let kid = extract_key_id_from_key(ctx, *k);
+        let mut kid = extract_key_id_from_key(ctx, *k);
+        let alg = get_sig_algo(ctx, this).unwrap_or(-1);
+        if needs_registered_rsa_key(alg) && !crypto_impl::rsa_key_registered(kid) {
+            // A key this VM did not mint. Import it from the standard
+            // `java.security.interfaces.RSA{Private,Public}Key` accessors
+            // before refusing — the JDK's own engines consume any provider's
+            // key that exposes that interface, and so must ours. This became
+            // load-bearing the moment `KeyPairGenerator.getInstance(alg, "BC")`
+            // started returning BouncyCastle's OWN keys: a `BCRSAPrivateCrtKey`
+            // handed to an ANONYMOUS `Signature.getInstance("SHA256withRSA")`
+            // was refused with "Missing key encoding" while HotSpot signs with
+            // it through SunRsaSign, and bc-java's `cmp` suite does exactly
+            // that pairing. `register_rsa_pub_verify_material` no-ops for a key with no
+            // usable accessors, so a genuinely OPAQUE key still lands on the
+            // refusal below — which is the behaviour netty's provider search
+            // depends on.
+            crate::jca::key_factory::register_rsa_pub_verify_material(ctx, *k);
+            kid = extract_key_id_from_key(ctx, *k);
+            if !crypto_impl::rsa_key_registered(kid) {
+                return Err(refuse_unusable_key(ctx, alg));
+            }
+        }
         set_sig_keyid(ctx, this, kid);
         ctx.set_field(this, base + SIG_OFF_KEYID, Value::Long(kid as i64));
         // Stash the real key object for the SunEC ECDSA drive path (slot is
@@ -1282,6 +1674,9 @@ fn sig_sign(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     if state != STATE_SIGN {
         return Err(refuse_uninitialized(ctx, "object not initialized for signing"));
     }
+    if let Some(spi) = sig_user_spi_obj(ctx, this) {
+        return drive_user_spi(ctx, this, spi, None);
+    }
     let alg = require_sig_algo(ctx, this)?;
     // EC: drive the real SunEC ECDSASignature SPI (real key, real DER output).
     if let Some(spi_class) = ecdsa_real_spi_class(ctx, alg) {
@@ -1308,7 +1703,7 @@ fn sig_sign(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // P0: `.unwrap_or_default()` here produced an EMPTY byte[] and returned it
     // as the signature. A caller storing that into a JWS/JAR/token sees a
     // successful `sign()` and ships an unsigned artefact.
-    let sig_bytes = match sign_dispatch(alg, key_id, &data) {
+    let sig_bytes = match sign_dispatch_with(alg, key_id, &data, get_sig_pss(ctx, this)) {
         Some(bytes) => bytes,
         None => return Err(refuse_unanswerable(ctx, alg, "sign()")),
     };
@@ -1322,6 +1717,36 @@ fn sig_sign_into(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
     if state != STATE_SIGN {
         return Err(refuse_uninitialized(ctx, "object not initialized for signing"));
     }
+    if let Some(spi) = sig_user_spi_obj(ctx, this) {
+        // Produce the bytes through the application SPI, then apply the same
+        // "a signature that does not fit is not a shorter signature" rule.
+        let produced = drive_user_spi(ctx, this, spi, None)?;
+        let sig_bytes = match produced {
+            Some(Value::Object(Some(arr))) => read_byte_array_full(ctx, arr),
+            _ => Vec::new(),
+        };
+        let off = match args.get(2) {
+            Some(Value::Int(n)) => *n as usize,
+            _ => 0,
+        };
+        let max_len = match args.get(3) {
+            Some(Value::Int(n)) => *n as usize,
+            _ => sig_bytes.len(),
+        };
+        if max_len < sig_bytes.len() {
+            return Err(crate::phases_early::throw_jca_exc(
+                ctx,
+                SIGNATURE_EXCEPTION,
+                "partial signatures not returned",
+            ));
+        }
+        if let Some(Value::Object(Some(out))) = args.get(1) {
+            for (i, &b) in sig_bytes.iter().enumerate() {
+                ctx.set_array_element(*out, off + i, Value::Int(b as i8 as i32));
+            }
+        }
+        return Ok(Some(Value::Int(sig_bytes.len() as i32)));
+    }
     let alg = require_sig_algo(ctx, this)?;
     let key_id = key_id_of(ctx, this);
     // C18: surface a missing payload as the checked SignatureException rather than
@@ -1332,7 +1757,7 @@ fn sig_sign_into(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
     // P0, as in `sig_sign`: an empty signature written into the caller's
     // buffer with a `written` count of 0 reads as "signed, zero-length" rather
     // than "not signed".
-    let sig_bytes = match sign_dispatch(alg, key_id, &data) {
+    let sig_bytes = match sign_dispatch_with(alg, key_id, &data, get_sig_pss(ctx, this)) {
         Some(bytes) => bytes,
         None => return Err(refuse_unanswerable(ctx, alg, "sign(byte[],int,int)")),
     };
@@ -1373,6 +1798,13 @@ fn sig_verify(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let state = require_sig_state(ctx, this)?;
     if state != STATE_VERIFY {
         return Err(refuse_uninitialized(ctx, "object not initialized for verification"));
+    }
+    if let Some(spi) = sig_user_spi_obj(ctx, this) {
+        let provided = match args.get(1) {
+            Some(Value::Object(Some(arr))) => read_byte_array_full(ctx, *arr),
+            _ => Vec::new(),
+        };
+        return drive_user_spi(ctx, this, spi, Some(provided));
     }
     let alg = require_sig_algo(ctx, this)?;
     // EC: drive the real SunEC ECDSASignature SPI (real key, real DER verify).
@@ -1422,7 +1854,7 @@ fn sig_verify(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // decision the caller asked for and it stays a `false`. `None` is
     // "never checked" and now raises. `.unwrap_or(false)` conflated the two,
     // so an unusable key was reported as a bad signature.
-    let ok = match verify_dispatch(alg, key_id, &data, &provided) {
+    let ok = match verify_dispatch_with(alg, key_id, &data, &provided, get_sig_pss(ctx, this)) {
         Some(answer) => answer,
         None => return Err(refuse_unanswerable(ctx, alg, "verify()")),
     };
@@ -1457,7 +1889,7 @@ fn sig_verify_off_len(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     };
     // P0 — same split as `sig_verify`: `Some(false)` is the preserved genuine
     // negative, `None` is "the question was never asked" and raises.
-    let ok = match verify_dispatch(alg, key_id, &data, &provided) {
+    let ok = match verify_dispatch_with(alg, key_id, &data, &provided, get_sig_pss(ctx, this)) {
         Some(answer) => answer,
         None => return Err(refuse_unanswerable(ctx, alg, "verify(byte[],int,int)")),
     };
@@ -1480,7 +1912,107 @@ fn sig_get_algorithm(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     Ok(Some(Value::Object(Some(s))))
 }
 
-fn sig_set_parameter(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+/// Map a JCA digest NAME (`"SHA-256"`, `"SHA256"`, …) onto a `PssHash`.
+fn pss_hash_for_jca_name(name: &str) -> Option<crypto_impl::PssHash> {
+    let n: String = name
+        .chars()
+        .filter(|c| !c.is_ascii_whitespace() && *c != '-')
+        .collect::<String>()
+        .to_ascii_uppercase();
+    match n.as_str() {
+        "SHA1" | "SHA" => Some(crypto_impl::PssHash::Sha1),
+        "SHA256" => Some(crypto_impl::PssHash::Sha256),
+        "SHA384" => Some(crypto_impl::PssHash::Sha384),
+        "SHA512" => Some(crypto_impl::PssHash::Sha512),
+        _ => None,
+    }
+}
+
+/// `Signature.setParameter(AlgorithmParameterSpec)` — record a
+/// `PSSParameterSpec` so the PSS sign/verify actually uses it.
+///
+/// Everything that is not a `PSSParameterSpec` stays a no-op, exactly as
+/// before: the other algorithms here take no parameters, and inventing a
+/// refusal for a spec we simply ignore would break callers that pass one
+/// harmlessly.
+fn sig_set_parameter(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let Ok(this) = this_arg(args) else {
+        return Ok(None);
+    };
+    if let Some(spi) = sig_user_spi_obj(ctx, this) {
+        // Only the `AlgorithmParameterSpec` overload has an SPI counterpart
+        // worth forwarding; the deprecated `(String, Object)` one is a no-op
+        // on the JDK providers too.
+        if let Some(Value::Object(Some(spec))) = args.get(1) {
+            let is_string = ctx
+                .class_name_of_id(ctx.class_id_of_object(*spec))
+                .is_some_and(|n| n == "java/lang/String");
+            if !is_string {
+                let spec = Value::Object(Some(*spec));
+                user_spi_call(
+                    ctx,
+                    spi,
+                    "engineSetParameter",
+                    "(Ljava/security/spec/AlgorithmParameterSpec;)V",
+                    &[spec],
+                )?;
+            }
+        }
+        return Ok(None);
+    }
+    // The `(String, Object)` overload never carries a PSSParameterSpec.
+    let Some(Value::Object(Some(spec))) = args.get(1) else {
+        return Ok(None);
+    };
+    let spec = *spec;
+    if !ctx
+        .class_name_of_id(ctx.class_id_of_object(spec))
+        .is_some_and(|n| n == "java/security/spec/PSSParameterSpec")
+    {
+        return Ok(None);
+    }
+    let pin = ctx.pin_native_root(this);
+    let read_name = |ctx: &mut dyn NativeContext, recv: ObjectRef, m: &str| -> Option<String> {
+        match ctx.invoke_virtual(recv, m, "()Ljava/lang/String;", &[]) {
+            Ok(Some(Value::Object(Some(s)))) => ctx.read_string(s),
+            _ => None,
+        }
+    };
+    let hash = read_name(ctx, spec, "getDigestAlgorithm").and_then(|n| pss_hash_for_jca_name(&n));
+    // `getMGFParameters()` is the MGF1ParameterSpec; its digest is the MGF
+    // digest, which RFC 8017 allows to differ from the message digest.
+    let mgf_hash = match ctx.invoke_virtual(
+        spec,
+        "getMGFParameters",
+        "()Ljava/security/spec/AlgorithmParameterSpec;",
+        &[],
+    ) {
+        Ok(Some(Value::Object(Some(mgf)))) => {
+            read_name(ctx, mgf, "getDigestAlgorithm").and_then(|n| pss_hash_for_jca_name(&n))
+        }
+        _ => None,
+    };
+    let salt_len = ctx
+        .invoke_virtual(spec, "getSaltLength", "()I", &[])
+        .ok()
+        .flatten()
+        .and_then(|v| v.as_int())
+        .filter(|v| *v >= 0)
+        .map(|v| v as usize);
+    let this = ctx.read_native_pin(pin, this);
+    ctx.unpin_native_roots(pin);
+    // A spec we cannot fully read is not applied at all — a HALF-applied spec
+    // would sign under parameters no caller asked for, which is worse than the
+    // algorithm-name default.
+    if let (Some(hash), Some(salt_len)) = (hash, salt_len) {
+        let params = PssParams {
+            hash,
+            mgf_hash: mgf_hash.unwrap_or(hash),
+            salt_len,
+        };
+        let key = sig_key(ctx, this);
+        sig_pss_table().lock().insert(key, params);
+    }
     Ok(None)
 }
 
@@ -1500,6 +2032,14 @@ fn sig_get_provider_null(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     let Ok(this) = this_arg(args) else {
         return Ok(Some(Value::Object(None)));
     };
+    // A `Signature` from a third-party provider reports THAT provider, not
+    // the one this VM would have used for the algorithm name.
+    if let Some((provider, _)) = get_sig_user_spi(ctx, this) {
+        if !provider.is_empty() {
+            let p = crate::jca::make_named_provider(ctx, &provider)?;
+            return Ok(Some(Value::Object(Some(p))));
+        }
+    }
     let base = synthetic_base_offset(ctx, "java/security/Signature");
     let idx =
         get_sig_algo(ctx, this).unwrap_or_else(|| match ctx.get_field(this, base + SIG_OFF_ALGO) {
@@ -1512,6 +2052,9 @@ fn sig_get_provider_null(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         // BEFORE the `contains("RSA")` arm: `NONEwithRSA` is the one RSA name
         // SunJCE owns, and the generic arm below would answer SunRsaSign.
         "NONEwithRSA" => "SunJCE",
+        // Also before the `contains("RSA")` arm: the MD5+SHA1 pair has no OID,
+        // so SunRsaSign does not offer it — SunJSSE does (measured on jdk-25).
+        "MD5andSHA1withRSA" => "SunJSSE",
         a if a.ends_with("ECDSA") => "SunEC",
         "Ed25519" | "Ed448" | "EdDSA" => "SunEC",
         a if a.ends_with("DSA") || a.starts_with("ML-DSA") => "SUN",
@@ -1958,6 +2501,11 @@ mod tests {
         // Handled by both dispatch tables.
         for alg in [
             SIG_SHA256_RSA,
+            SIG_SHA1_RSA,
+            SIG_SHA384_RSA,
+            SIG_SHA512_RSA,
+            SIG_MD5_SHA1_RSA,
+            SIG_NONE_RSA,
             SIG_PSS_SHA256,
             SIG_PSS_SHA384,
             SIG_PSS_SHA512,
@@ -1970,9 +2518,6 @@ mod tests {
         // Not handled — these reach the `_ => None` arm and must be reported
         // as such so the refusal message is accurate.
         for alg in [
-            SIG_SHA384_RSA,
-            SIG_SHA512_RSA,
-            SIG_SHA1_RSA,
             SIG_SHA512_ECDSA,
             SIG_SHA256_DSA,
             SIG_SHA1_DSA,
@@ -1984,6 +2529,112 @@ mod tests {
                 "alg {alg} has no dispatch arm and must not be claimed as one"
             );
         }
+    }
+
+    #[test]
+    fn every_rsa_digest_signs_and_verifies_and_the_digests_do_not_cross() {
+        // Before this, only SHA256withRSA had a sign arm: `getInstance`
+        // advertised SHA-1/384/512 and `MD5andSHA1withRSA`, `initSign`
+        // accepted the key, and `sign()` then refused with "this VM has no
+        // native implementation for that algorithm". netty's
+        // `JdkDelegatingPrivateKeyMethod` asks for all five by name.
+        let id = shared_rsa_key_id();
+        let msg = b"the message that was signed";
+        let algs = [
+            SIG_SHA1_RSA,
+            SIG_SHA256_RSA,
+            SIG_SHA384_RSA,
+            SIG_SHA512_RSA,
+            SIG_MD5_SHA1_RSA,
+        ];
+        let mut sigs = Vec::new();
+        for alg in algs {
+            let sig = sign_dispatch(alg, id, msg)
+                .unwrap_or_else(|| panic!("{} must sign", algo_name(alg)));
+            assert!(!sig.is_empty(), "{} produced no signature", algo_name(alg));
+            assert_eq!(
+                sig.len(),
+                128,
+                "{} must be modulus-length for a 1024-bit key",
+                algo_name(alg)
+            );
+            assert_eq!(
+                verify_dispatch(alg, id, msg, &sig),
+                Some(true),
+                "{} must verify its own signature",
+                algo_name(alg)
+            );
+            assert_eq!(
+                verify_dispatch(alg, id, b"a different message", &sig),
+                Some(false),
+                "{} must reject a different message",
+                algo_name(alg)
+            );
+            sigs.push((alg, sig));
+        }
+        // The DigestInfo prefix is what separates these algorithms; a shared
+        // one would make them interchangeable and every signature meaningless.
+        for (a, sig) in &sigs {
+            for b in algs {
+                if b == *a {
+                    continue;
+                }
+                assert_ne!(
+                    verify_dispatch(b, id, msg, sig),
+                    Some(true),
+                    "{} accepted a {} signature",
+                    algo_name(b),
+                    algo_name(*a)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_pss_parameter_spec_reaches_the_signer() {
+        // `Signature.setParameter` was a no-op, so PSS signed and verified
+        // under the algorithm-name default whatever spec was installed —
+        // measured against HotSpot: sign SHA-256/salt-32, verify with
+        // SHA-512/salt-64 answered `true` here and `false` there.
+        let id = shared_rsa_key_id();
+        let msg = b"pss payload";
+        let spec32 = PssParams {
+            hash: crypto_impl::PssHash::Sha256,
+            mgf_hash: crypto_impl::PssHash::Sha256,
+            salt_len: 32,
+        };
+        let spec20 = PssParams {
+            salt_len: 20,
+            ..spec32
+        };
+        let sig = sign_dispatch_with(SIG_PSS_SHA256, id, msg, Some(spec32))
+            .expect("PSS with an explicit spec must sign");
+        assert_eq!(
+            verify_dispatch_with(SIG_PSS_SHA256, id, msg, &sig, Some(spec32)),
+            Some(true)
+        );
+        assert_eq!(
+            verify_dispatch_with(SIG_PSS_SHA256, id, msg, &sig, Some(spec20)),
+            Some(false),
+            "a different salt length is a different signature scheme"
+        );
+        // No spec: the algorithm-name default, unchanged.
+        assert_eq!(verify_dispatch(SIG_PSS_SHA256, id, msg, &sig), Some(true));
+    }
+
+    #[test]
+    fn pss_hash_names_are_read_the_way_jca_spells_them() {
+        for (name, want) in [
+            ("SHA-256", crypto_impl::PssHash::Sha256),
+            ("SHA256", crypto_impl::PssHash::Sha256),
+            ("sha-512", crypto_impl::PssHash::Sha512),
+            ("SHA-1", crypto_impl::PssHash::Sha1),
+            ("SHA-384", crypto_impl::PssHash::Sha384),
+        ] {
+            assert_eq!(pss_hash_for_jca_name(name), Some(want), "{name}");
+        }
+        assert_eq!(pss_hash_for_jca_name("SHA3-256"), None);
+        assert_eq!(pss_hash_for_jca_name(""), None);
     }
 
     /// The `Option` contract the whole fix rests on: `None` means "never

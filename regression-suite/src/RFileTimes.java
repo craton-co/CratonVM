@@ -11,6 +11,7 @@ import java.nio.file.attribute.BasicFileAttributeView;
 import java.nio.file.attribute.BasicFileAttributes;
 import java.nio.file.attribute.FileTime;
 import java.time.Instant;
+import java.util.Arrays;
 import java.util.Enumeration;
 import java.util.jar.JarEntry;
 import java.util.jar.JarFile;
@@ -91,6 +92,7 @@ public class RFileTimes {
             File archive = writeArchive(dir);
             entryTimesRoundTrip(archive);
             extractedFileTimes(dir, archive);
+            entryStreamContract(dir);
             // Spelled `CK RFileTimes checks=N`, not the older `CK checks N`.
             // The count is the suite's guard against a vector that silently
             // emitted FEWER observables than the oracle (harness-guard.sh, G3),
@@ -208,6 +210,95 @@ public class RFileTimes {
                     .getFileAttributeView(target.toPath(), BasicFileAttributeView.class)
                     .readAttributes();
                 emit("extracted." + target.getName(), attrs.lastModifiedTime().toInstant());
+            }
+        }
+    }
+
+    /**
+     * Stage 5: what `ZipFile.getInputStream` hands back has to behave like the
+     * stream the JDK hands back, and the JDK hands back two DIFFERENT ones.
+     *
+     * A DEFLATED entry gets `ZipFile$ZipFileInflaterInputStream`, whose
+     * `InflaterInputStream.read` returns 0 for `len == 0` before it looks at
+     * anything else. A STORED entry gets `ZipFile$ZipFileInputStream`, which
+     * checks `rem == 0` first and answers -1. CratonVM returns the inflated
+     * bytes over a stand-in stream, so this is the row it can get wrong in
+     * either direction, and -1 for the DEFLATED case is not academic: a caller
+     * looping `if (channel.read(dst) < 0) throw new EOFException()` over a
+     * buffer with nothing left to read treats it as end-of-file. That is
+     * `org.h2.store.fs.FileUtils.readFully`, and it is why
+     * `TestFileSystem.testZipFileSystem` threw `EOFException` on `zip:` and
+     * `cache:zip:` while HotSpot passed.
+     *
+     * Two things are deliberately NOT emitted:
+     *
+     *  - The class NAME. It is a legitimate implementation difference, and
+     *    pinning it would freeze the stand-in rather than its behaviour.
+     *  - `markSupported()` for the STORED entry. Both JDK zip streams answer
+     *    false; CratonVM's STORED stand-in answers true, and mark/reset then
+     *    genuinely work on it — a capability offered where the JDK offers
+     *    none, so no caller can break on it either way. Closing it would mean
+     *    wrapping the STORED path in a stream whose `skip` is the
+     *    `InputStream` default read-loop, a real cost on stored nested jars
+     *    for no behavioural gain. It IS emitted for the DEFLATED entry, where
+     *    the wrapper this fix added gets it right.
+     */
+    static void entryStreamContract(File dir) throws IOException {
+        File zipFile = new File(dir, "streams.zip");
+        byte[] payload = new byte[1000];
+        for (int i = 0; i < payload.length; i++) {
+            payload[i] = (byte) i;
+        }
+        try (java.util.zip.ZipOutputStream zo =
+                new java.util.zip.ZipOutputStream(new FileOutputStream(zipFile))) {
+            ZipEntry deflated = new ZipEntry("deflated");
+            deflated.setMethod(ZipEntry.DEFLATED);
+            zo.putNextEntry(deflated);
+            zo.write(payload);
+            zo.closeEntry();
+
+            ZipEntry stored = new ZipEntry("stored");
+            stored.setMethod(ZipEntry.STORED);
+            java.util.zip.CRC32 crc = new java.util.zip.CRC32();
+            crc.update(payload);
+            stored.setSize(payload.length);
+            stored.setCompressedSize(payload.length);
+            stored.setCrc(crc.getValue());
+            zo.putNextEntry(stored);
+            zo.write(payload);
+            zo.closeEntry();
+        }
+        byte[] scratch = new byte[64];
+        try (ZipFile zip = new ZipFile(zipFile)) {
+            for (String name : new String[] { "deflated", "stored" }) {
+                ZipEntry entry = zip.getEntry(name);
+                emit("stream." + name + ".size", entry.getSize());
+                try (InputStream in = zip.getInputStream(entry)) {
+                    emit("stream." + name + ".freshAvailable", in.available());
+                    emit("stream." + name + ".freshReadZeroLen", in.read(scratch, 0, 0));
+                    if ("deflated".equals(name)) {
+                        emit("stream." + name + ".markSupported", in.markSupported());
+                    }
+                    byte[] all = in.readAllBytes();
+                    emit("stream." + name + ".drained", all.length);
+                    emit("stream." + name + ".contentMatches", Arrays.equals(all, payload));
+                    // THE row. DEFLATED: 0. STORED: -1.
+                    emit("stream." + name + ".eofReadZeroLen", in.read(scratch, 0, 0));
+                    emit("stream." + name + ".eofReadOneByte", in.read(scratch, 0, 1));
+                    emit("stream." + name + ".eofAvailable", in.available());
+                    emit("stream." + name + ".eofSkip", in.skip(5));
+                }
+                // Skipping forward then reading is how a random-access reader
+                // over a zip entry gets to an offset (H2's FileZip.seek).
+                try (InputStream in = zip.getInputStream(entry)) {
+                    emit("stream." + name + ".skip600", in.skip(600));
+                    int n = in.read(scratch, 0, scratch.length);
+                    emit("stream." + name + ".readAfterSkip", n);
+                    emit("stream." + name + ".byteAfterSkip",
+                            n > 0 ? (scratch[0] & 0xff) : -1);
+                    emit("stream." + name + ".skipPastEnd", in.skip(payload.length * 4L));
+                    emit("stream." + name + ".skipAtEnd", in.skip(1));
+                }
             }
         }
     }

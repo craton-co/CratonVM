@@ -904,15 +904,34 @@ pub fn selector_set_interest(id: i32, net_fd: i32, ops: i32) -> Result<(), Metho
         // already published the new mask, so the `epoll_wait` that thread is
         // about to enter evaluates it. The nudge exists only for a select that
         // is ALREADY parked.
-        if st.in_flight_selects != 0 {
-            if let Some(wfd) = st.wakeup_pipe_write {
-                let byte: u8 = b'I';
-                // SAFETY: `wfd` is this selector's own pipe write end, held live by
-                // `st`; the pointer is to a one-byte stack local and the length says
-                // one byte.
-                let _ = unsafe { libc::write(wfd, &byte as *const u8 as *const libc::c_void, 1) };
-            }
-        }
+        // REMOVED (netty ParameterizedSslHandlerTest selector spin, 2026-08-15).
+        //
+        // The nudge above was written on the premise that "epoll_ctl(MOD) does
+        // not reliably interrupt an already-blocked epoll_wait". On Linux that
+        // premise is false: `ep_modify()` re-evaluates the file's readiness
+        // against the NEW event mask and wakes the epoll waiters itself, which
+        // is precisely why `epoll_ctl` is safe to call from another thread while
+        // one is parked. The `epoll_ctl(EPOLL_CTL_MOD)` immediately above is
+        // therefore already the wakeup.
+        //
+        // What the extra byte bought instead was a guaranteed ZERO-KEY return:
+        // it lands on the wakeup fd, phase 3 sets `woken` and counts nothing, so
+        // `select(timeout)` comes back at once having selected nothing. A Netty
+        // event loop sets interest ops between every select, so this fires
+        // continuously — `NioIoHandler` logs "Selector.select() returned
+        // prematurely 512 times in a row; rebuilding Selector", rebuilds (which
+        // re-registers every channel, which sets more interest ops, which queues
+        // more nudges) and never converges: 687 rebuilds in one
+        // `ParameterizedSslHandlerTest` run, which then never finished at all.
+        //
+        // Gating it on `in_flight_selects != 0` (the previous fix) bounded the
+        // storm for a client with a handful of connections but not for an event
+        // loop, because between-selects IS the steady state there.
+        //
+        // The worst case without it is a readiness change that the kernel does
+        // not deliver until the current wait times out — latency, not a stall —
+        // and Linux does deliver it. The non-Linux branch below keeps its own
+        // nudge: WSAPoll genuinely cannot observe an interest change mid-wait.
     }
     // Windows/non-Linux equivalent of the epoll self-pipe nudge above: a
     // thread already blocked in WSAPoll cannot observe this interest_ops

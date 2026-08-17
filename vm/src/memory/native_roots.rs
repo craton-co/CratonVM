@@ -450,11 +450,16 @@ fn scan_tls(_: &crate::vm::SharedVm, roots: &mut Vec<ObjectRef>) {
     cratonvm_native_builtins::t27_tls::gc_scan_tls_ctx_trust_manager_roots(roots);
     cratonvm_native_builtins::t27_tls::gc_scan_tls_ctx_key_manager_roots(roots);
     cratonvm_native_builtins::t27_tls::gc_scan_default_ssl_context_root(roots);
+    // The live `PrivateKey` objects a `KeyManagerState` holds for keys with no
+    // PKCS#8 encoding of their own (netty's `OpenSslPrivateKey`, PKCS#11 keys).
+    // Nothing else references them once `KeyManagerFactory.init` returns.
+    cratonvm_native_builtins::x509_manager::gc_scan_key_manager_roots(roots);
 }
 fn remap_tls(_: &crate::vm::SharedVm, map: &cratonvm_types::PointerMap) {
     cratonvm_native_builtins::t27_tls::gc_update_tls_ctx_trust_manager_refs(map);
     cratonvm_native_builtins::t27_tls::gc_update_tls_ctx_key_manager_refs(map);
     cratonvm_native_builtins::t27_tls::gc_update_default_ssl_context_ref(map);
+    cratonvm_native_builtins::x509_manager::gc_update_key_manager_refs(map);
 }
 fn scan_forkjoin(_: &crate::vm::SharedVm, roots: &mut Vec<ObjectRef>) {
     cratonvm_native_builtins::phases_early::gc_scan_forkjoin_roots(roots);

@@ -2046,15 +2046,25 @@ fn rb_contains_key(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
 // `java.time.format.DateTimeTextProvider.createStore`, which asks
 // `sun.util.locale.provider.CalendarDataUtility.retrieveJavaTimeFieldValueNames`
 // (plural → `Map<name,value>`) and, for narrow month/day whose names collapse
-// in a Map, `retrieveJavaTimeFieldValueName` (singular). Both walk the
-// `jdk.localedata` class-based CLDR bundles CratonVM doesn't surface, so they
-// return null/empty and the formatter falls back to the raw NUMERIC value —
-// e.g. Spring's RFC-1123 `HttpHeaders` date formatter (built with `Locale.US`)
-// renders "4, 18 12 2008 …" instead of "Thu, 18 Dec 2008 …". We answer these
-// two statics directly from the en/US CLDR name tables, mirroring the
-// `FormatData` / `getDateTimePattern` overrides in this file. Only English
-// (and the root locale) is served; other languages return null so the
-// formatter keeps its existing numeric fallback rather than showing English.
+// in a Map, `retrieveJavaTimeFieldValueName` (singular). Both walk the JDK's
+// own `LocaleServiceProviderPool` → `CalendarNameProviderImpl` chain, which
+// NPEs in CratonVM's partial bootstrap, so without an override they return
+// null/empty and the formatter falls back to the raw NUMERIC value — e.g.
+// Spring's RFC-1123 `HttpHeaders` date formatter (built with `Locale.US`)
+// renders "4, 18 12 2008 …" instead of "Thu, 18 Dec 2008 …".
+//
+// We answer these two statics ourselves, out of the JDK image's own CLDR
+// `FormatData` for the requested locale — the same [`load_cldr_table`] reader
+// W7-80 built for `DateFormatSymbols`. The curated English tables below are the
+// fallback for an image that has no CLDR data at all (synthetic-JDK mode, a
+// jlinked image without `jdk.localedata`), and only for English/root locales.
+//
+// This was English-only until 2026-08-16, and the gap it left was NOT cosmetic:
+// `java.text.DateFormatSymbols.getInstance(Locale.GERMAN).getMonths()[1]`
+// answered "Februar" (W7-80's path) while `MMMM` under the same locale rendered
+// and parsed the NUMBER `2`, because `java.time` never reaches
+// `DateFormatSymbols` — it reaches the two statics below. H2's
+// `PARSEDATETIME('3. FEBRUAR 2001', 'd. MMMM yyyy', 'de')` was the witness.
 
 // java.util.Calendar field constants.
 const CAL_ERA: i32 = 0;
@@ -2077,22 +2087,12 @@ fn int_arg(args: &[Value], i: usize) -> i32 {
     }
 }
 
-/// True when the `Locale` argument is English or the root/empty locale — the
-/// only families our hardcoded en/US CLDR names are valid for. A missing
-/// locale is treated as English (the JDK default the Spring suite runs under).
-fn locale_is_english(ctx: &mut dyn NativeContext, arg: Option<&Value>) -> bool {
-    match arg {
-        Some(Value::Object(Some(loc))) => {
-            match ctx.invoke_virtual(*loc, "getLanguage", "()Ljava/lang/String;", &[]) {
-                Ok(Some(Value::Object(Some(s)))) => {
-                    let lang = ctx.read_string(s).unwrap_or_default();
-                    lang.is_empty() || lang == "en"
-                }
-                _ => true,
-            }
-        }
-        _ => true,
-    }
+/// True for English or the root/empty language — the only families the
+/// hardcoded en/US CLDR names below are valid for, and therefore the only ones
+/// allowed to reach them when the image carries no CLDR data. A missing locale
+/// is treated as English (the JDK default the Spring suite runs under).
+fn language_is_english(lang: &str) -> bool {
+    lang.is_empty() || lang == "en"
 }
 
 /// English CLDR display names for a `gregory` Calendar field at a given style,
@@ -2166,6 +2166,186 @@ fn en_calendar_field_names(field: i32, style: i32) -> Option<Vec<(&'static str, 
         }
         _ => None,
     }
+}
+
+/// The CLDR `FormatData` key a Calendar `(field, style)` pair resolves to,
+/// mirroring `sun.util.locale.provider.CalendarNameProviderImpl.getResourceKeyFor`
+/// for the CLDR adapter and the `gregory` calendar (the only one these two
+/// statics answer — see [`calendar_id_is_gregorian`]). `None` for the fields and
+/// styles the JDK itself does not key (`ALL_STYLES`, `YEAR`).
+///
+/// Read out of JDK 25's own source rather than inferred: ERA ignores the
+/// standalone bit and spells its styles `long.Eras` / `Eras` / `narrow.Eras`;
+/// MONTH and DAY_OF_WEEK take a `standalone.` prefix and a
+/// `Names` / `Abbreviations` / `Narrows` suffix; AM_PM takes `narrow.` for
+/// narrow and nothing otherwise — NOT `abbreviated.`, which the JDK reaches
+/// only from `DateFormatSymbols`, never from here.
+fn calendar_resource_key(field: i32, style: i32) -> Option<String> {
+    let base = style & !CAL_STANDALONE_MASK;
+    let standalone = if style != base { "standalone." } else { "" };
+    let styled = match base {
+        CAL_STYLE_SHORT => "Abbreviations",
+        CAL_STYLE_NARROW => "Narrows",
+        CAL_STYLE_LONG => "Names",
+        _ => return None,
+    };
+    Some(match field {
+        CAL_ERA => match base {
+            CAL_STYLE_NARROW => "narrow.Eras".to_string(),
+            CAL_STYLE_LONG => "long.Eras".to_string(),
+            _ => "Eras".to_string(),
+        },
+        CAL_MONTH => format!("{standalone}Month{styled}"),
+        CAL_DAY_OF_WEEK => format!("{standalone}Day{styled}"),
+        CAL_AM_PM => match base {
+            CAL_STYLE_NARROW => "narrow.AmPmMarkers".to_string(),
+            _ => "AmPmMarkers".to_string(),
+        },
+        _ => return None,
+    })
+}
+
+/// The localized name array for a Calendar `(field, style)` in `(lang, country)`,
+/// straight out of the JDK image's CLDR `FormatData`.
+///
+/// Four candidate keys, in the JDK's own order. `retrieveJavaTimeFieldValueName(s)`
+/// asks `CalendarNameProviderImpl` with `javatime = true` first, which prefixes
+/// the key with `java.time.`, and falls back to the plain (non-javatime) call
+/// when that answers null; `getDisplayNameImpl` inside each pass retries once
+/// with the `standalone.` prefix stripped. The `java.time.`-prefixed keys are
+/// real rows in these bundles — root `FormatData` carries `java.time.long.Eras`
+/// = `[BCE, CE]` beside `long.Eras`, which is exactly the pair the two passes
+/// exist to tell apart — so the prefixed lookup is not dead code, and dropping
+/// it would silently serve `java.util.Calendar`'s era spelling to `java.time`.
+fn cldr_calendar_name_array(
+    ctx: &mut dyn NativeContext,
+    lang: &str,
+    country: &str,
+    field: i32,
+    style: i32,
+) -> Option<Vec<String>> {
+    let key = calendar_resource_key(field, style)?;
+    let table = cldr_format_data(ctx, lang, country)?;
+    let bare = key.strip_prefix("standalone.");
+    let mut candidates: Vec<String> = vec![format!("java.time.{key}")];
+    if let Some(bare) = bare {
+        candidates.push(format!("java.time.{bare}"));
+    }
+    candidates.push(key.clone());
+    if let Some(bare) = bare {
+        candidates.push(bare.to_string());
+    }
+    for cand in candidates {
+        if let Some(v) = cldr_arr(&table, &cand) {
+            return Some(v.clone());
+        }
+    }
+    None
+}
+
+/// True when any two entries of `names` are equal — the JDK's own
+/// `CalendarNameProviderImpl.hasDuplicates`, empty slots included. Narrow month
+/// and day arrays are the reason it exists: `[J, F, M, A, M, J, …]` cannot be
+/// inverted into a `Map<name, value>`, so the JDK returns no map at all and the
+/// caller falls back to the singular per-value lookup.
+fn calendar_names_have_duplicates(names: &[String]) -> bool {
+    names
+        .iter()
+        .enumerate()
+        .any(|(i, a)| names[i + 1..].iter().any(|b| b == a))
+}
+
+/// `(name, Calendar field value)` pairs for a localized name array, mirroring
+/// `CalendarNameProviderImpl.getDisplayNamesImpl`: empty slots are skipped (CLDR
+/// leaves the 13th month and the unused day-period slots blank), the value base
+/// is 1 for `DAY_OF_WEEK` and 0 elsewhere, and a duplicated array yields nothing
+/// — except for `AM_PM`, whose flexible day-period slots legitimately repeat and
+/// which the JDK exempts by name.
+fn calendar_name_entries(names: &[String], field: i32) -> Vec<(String, i32)> {
+    if field != CAL_AM_PM && calendar_names_have_duplicates(names) {
+        return Vec::new();
+    }
+    let base = if field == CAL_DAY_OF_WEEK { 1 } else { 0 };
+    names
+        .iter()
+        .enumerate()
+        .rev()
+        .filter(|(_, name)| !name.is_empty())
+        .map(|(i, name)| (name.clone(), base + i as i32))
+        .collect()
+}
+
+/// `(name, Calendar value)` pairs for a `(field, style)` in the `Locale`
+/// argument's language.
+///
+/// CLDR first. The curated English tables are reached only when the image
+/// carries no CLDR data for the family at all *and* the language is English or
+/// root — a non-English locale on such an image gets nothing, which leaves
+/// `DateTimeTextProvider` on its numeric fallback rather than printing English
+/// month names for German. When CLDR *does* answer, its answer stands even if
+/// it is empty: an empty result there is the duplicate-narrow-names case, and
+/// falling through to the English table would answer a question the JDK
+/// deliberately declines.
+fn locale_calendar_entries(
+    ctx: &mut dyn NativeContext,
+    locale_arg: Option<&Value>,
+    field: i32,
+    style: i32,
+) -> Vec<(String, i32)> {
+    let (lang, country) = arg_locale(ctx, locale_arg);
+    if let Some(names) = cldr_calendar_name_array(ctx, &lang, &country, field, style) {
+        return calendar_name_entries(&names, field);
+    }
+    if !language_is_english(&lang) {
+        return Vec::new();
+    }
+    en_calendar_field_names(field, style)
+        .map(|e| {
+            e.into_iter()
+                .map(|(name, value)| (name.to_string(), value))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The single localized name for one Calendar field VALUE — the singular
+/// `retrieveJavaTimeFieldValueName` path, which the JDK indexes directly and
+/// therefore does NOT subject to the duplicate check (it is how narrow month and
+/// day names are served at all).
+///
+/// `DAY_OF_WEEK` is 1-based (SUNDAY=1) where the array is 0-based; every other
+/// field indexes straight. A standalone style whose slot CLDR leaves empty
+/// retries once at the format style, as `getDisplayNameImpl` does.
+fn locale_calendar_name(
+    ctx: &mut dyn NativeContext,
+    locale_arg: Option<&Value>,
+    field: i32,
+    value: i32,
+    style: i32,
+) -> Option<String> {
+    let (lang, country) = arg_locale(ctx, locale_arg);
+    if let Some(names) = cldr_calendar_name_array(ctx, &lang, &country, field, style) {
+        let index = if field == CAL_DAY_OF_WEEK { value - 1 } else { value };
+        if index >= 0 {
+            if let Some(name) = names.get(index as usize) {
+                if !name.is_empty() {
+                    return Some(name.clone());
+                }
+            }
+        }
+        let base = style & !CAL_STANDALONE_MASK;
+        if base != style {
+            return locale_calendar_name(ctx, locale_arg, field, value, base);
+        }
+        return None;
+    }
+    if !language_is_english(&lang) {
+        return None;
+    }
+    en_calendar_field_names(field, style)?
+        .into_iter()
+        .find(|(_, v)| *v == value)
+        .map(|(name, _)| name.to_string())
 }
 
 pub fn register(registry: &mut NativeMethodRegistry) {
@@ -3011,16 +3191,15 @@ pub fn register(registry: &mut NativeMethodRegistry) {
     // The java.time text-name entry point (see the module note above). Build a
     // real java.util.HashMap of name -> Calendar-value so the downstream
     // real-JDK `DateTimeTextProvider.createStore` bytecode can iterate its
-    // `entrySet()` unchanged. Serve only the `gregory` calendar in English;
-    // everything else returns null (numeric fallback), matching HotSpot for
-    // the locales the suite exercises.
+    // `entrySet()` unchanged. Serve only the `gregory` calendar; the names come
+    // from the requested locale's CLDR data, English only as a fallback for an
+    // image that carries none.
     registry.register(
         "sun/util/locale/provider/CalendarDataUtility",
         "retrieveJavaTimeFieldValueNames",
         "(Ljava/lang/String;IILjava/util/Locale;)Ljava/util/Map;",
         |ctx, args| {
-            if !calendar_id_is_gregorian(ctx, args.first()) || !locale_is_english(ctx, args.get(3))
-            {
+            if !calendar_id_is_gregorian(ctx, args.first()) {
                 return Ok(Some(Value::Object(None)));
             }
             let field = int_arg(args, 1);
@@ -3028,21 +3207,29 @@ pub fn register(registry: &mut NativeMethodRegistry) {
             // Narrow month/day names have duplicates ("J"/"J"/"J", "S"/"S")
             // that a Map<String,Integer> would collapse; DateTimeTextProvider
             // handles those via the singular per-value lookup below, so return
-            // null here to steer it there.
+            // null here to steer it there. `calendar_name_entries` enforces the
+            // same rule for any other array CLDR happens to duplicate; this
+            // early exit keeps the common case from loading a table to find out.
             let base = style & !CAL_STANDALONE_MASK;
             if base == CAL_STYLE_NARROW && (field == CAL_MONTH || field == CAL_DAY_OF_WEEK) {
                 return Ok(Some(Value::Object(None)));
             }
-            let entries = match en_calendar_field_names(field, style) {
-                Some(e) => e,
-                None => return Ok(Some(Value::Object(None))),
-            };
+            let entries = locale_calendar_entries(ctx, args.get(3), field, style);
+            if entries.is_empty() {
+                return Ok(Some(Value::Object(None)));
+            }
             let map = match ctx.new_object_initialized("java/util/HashMap", "()V", &[])? {
                 Some(Value::Object(Some(m))) => m,
                 _ => return Ok(Some(Value::Object(None))),
             };
+            // Every `create_string` / `valueOf` / `put` below allocates, so the
+            // map can move under any of them. Pin once and re-read per entry,
+            // the same discipline `put_arr` uses a few hundred lines up.
+            let map_pin = ctx.pin_native_root(map);
+            let mut map = map;
             for (name, val) in entries {
-                let k = ctx.create_string(name);
+                let k = ctx.create_string(&name);
+                let k_pin = ctx.pin_native_root(k);
                 let boxed = ctx
                     .invoke(
                         "java/lang/Integer",
@@ -3051,13 +3238,18 @@ pub fn register(registry: &mut NativeMethodRegistry) {
                         &[Value::Int(val)],
                     )?
                     .unwrap_or(Value::Object(None));
+                map = ctx.read_native_pin(map_pin, map);
+                let k = ctx.read_native_pin(k_pin, k);
                 ctx.invoke_virtual(
                     map,
                     "put",
                     "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
                     &[Value::Object(Some(k)), boxed],
                 )?;
+                map = ctx.read_native_pin(map_pin, map);
+                ctx.unpin_native_roots(k_pin);
             }
+            ctx.unpin_native_roots(map_pin);
             Ok(Some(Value::Object(Some(map))))
         },
     );
@@ -3066,31 +3258,26 @@ pub fn register(registry: &mut NativeMethodRegistry) {
     //     String id, int field, int value, int style, Locale locale) -> String
     // Singular sibling of the above — used by `DateTimeTextProvider` for narrow
     // month/day (and as a fallback for any other style whose plural map came
-    // back null). Returns the single English CLDR name for the requested
-    // Calendar field value.
+    // back null). Returns the requested locale's CLDR name for one Calendar
+    // field value.
     registry.register(
         "sun/util/locale/provider/CalendarDataUtility",
         "retrieveJavaTimeFieldValueName",
         "(Ljava/lang/String;IIILjava/util/Locale;)Ljava/lang/String;",
         |ctx, args| {
-            if !calendar_id_is_gregorian(ctx, args.first()) || !locale_is_english(ctx, args.get(4))
-            {
+            if !calendar_id_is_gregorian(ctx, args.first()) {
                 return Ok(Some(Value::Object(None)));
             }
             let field = int_arg(args, 1);
             let value = int_arg(args, 2);
             let style = int_arg(args, 3);
-            let entries = match en_calendar_field_names(field, style) {
-                Some(e) => e,
-                None => return Ok(Some(Value::Object(None))),
-            };
-            for (name, val) in entries {
-                if val == value {
-                    let s = ctx.create_string(name);
-                    return Ok(Some(Value::Object(Some(s))));
+            match locale_calendar_name(ctx, args.get(4), field, value, style) {
+                Some(name) => {
+                    let s = ctx.create_string(&name);
+                    Ok(Some(Value::Object(Some(s))))
                 }
+                None => Ok(Some(Value::Object(None))),
             }
-            Ok(Some(Value::Object(None)))
         },
     );
 

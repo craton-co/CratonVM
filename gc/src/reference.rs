@@ -290,6 +290,19 @@ pub struct ReferenceProcessor {
     /// A caller that supplies `0` gets the real clock instead of a dead policy.
     last_observed_clock_ms: u64,
 
+    /// `reference_obj` addresses of the SOFT entries the *pre-collection* pass
+    /// condemned for this cycle, i.e. the ones whose referent slot the VM
+    /// nulled before the marker ran (see [`Self::condemn_idle_soft_refs`]).
+    ///
+    /// Rewritten wholesale by every `condemn_idle_soft_refs` call, which is
+    /// the reset point: the set describes one collection and must never span
+    /// two. A cycle that skips the pre-collection pass entirely therefore sees
+    /// the previous cycle's set, and that is deliberately harmless — an entry
+    /// in it is only acted on when `is_marked(referent)` is *false*, and for a
+    /// reference whose slot was never nulled that means the referent genuinely
+    /// died on its own.
+    soft_pre_nulled: FxHashSet<usize>,
+
     stats: ReferenceProcessingStats,
 }
 
@@ -311,6 +324,7 @@ impl ReferenceProcessor {
             soft_ref_lru_index: BTreeMap::new(),
             soft_ref_addr_index: FxHashMap::default(),
             last_observed_clock_ms: 0,
+            soft_pre_nulled: FxHashSet::default(),
             stats: ReferenceProcessingStats::default(),
         }
     }
@@ -751,6 +765,68 @@ impl ReferenceProcessor {
         let threshold_ms = self
             .soft_ref_lru_policy_ms_per_mb
             .saturating_mul(free_heap_mb as u64);
+
+        // ---- Entries condemned BEFORE the mark ---------------------------
+        //
+        // `condemn_idle_soft_refs` already applied the LRU rule to these, on
+        // the pre-collection heap headroom, and the VM nulled their referent
+        // slot so the marker could not keep the referent alive through the
+        // `SoftReference` itself. They are settled here rather than by the
+        // range scan below for two independent reasons:
+        //
+        // * re-deriving the verdict now would use POST-collection headroom,
+        //   which is larger, which makes `threshold_ms` larger — so the
+        //   re-derivation can only ever disagree in the direction of "keep".
+        //   Keeping an entry whose referent this collection has already
+        //   reclaimed leaves a dead address inside an entry that still reads
+        //   as active;
+        // * `candidate_indices` below is derived from that same larger
+        //   threshold, so a condemned entry can fall outside the range and
+        //   never be visited at all.
+        //
+        // `is_marked` still has the last word. A condemned referent that was
+        // reachable on a strong path was marked anyway and is kept; the
+        // post-GC restore pass writes its slot back
+        // (`soft_pre_nulled_active_pairs`).
+        if !self.soft_pre_nulled.is_empty() {
+            // (index, reference_obj, queue_addr, last_access_time_ms) — read
+            // out first so the mutation loop is not holding a borrow of
+            // `self.soft_refs` while it touches `pending_queues` / the LRU
+            // index, which are disjoint fields the borrow checker cannot see
+            // through `self`.
+            let mut condemned: Vec<(usize, usize, Option<usize>, u64)> = Vec::new();
+            for (idx, entry) in self.soft_refs.iter().enumerate() {
+                if entry.cleared
+                    || entry.enqueued
+                    || !self.soft_pre_nulled.contains(&entry.reference_obj)
+                    || is_marked(entry.referent)
+                {
+                    continue;
+                }
+                condemned.push((
+                    idx,
+                    entry.reference_obj,
+                    entry.queue_addr,
+                    entry.last_access_time_ms,
+                ));
+            }
+            for (idx, reference_obj, queue_addr, last_access) in condemned {
+                self.soft_refs[idx].cleared = true;
+                self.stats.soft_refs_cleared += 1;
+                if let Some(q) = queue_addr {
+                    self.pending_queues
+                        .entry(q)
+                        .or_default()
+                        .push(reference_obj);
+                    self.soft_refs[idx].enqueued = true;
+                }
+                // Same LRU-index hygiene the range scan below applies when it
+                // clears an entry: a cleared soft ref is never a candidate
+                // again, so its key would make every later range scan re-walk
+                // it.
+                self.soft_ref_lru_index.remove(&(last_access, idx));
+            }
+        }
 
         // Use the BTreeMap index to efficiently find soft refs whose
         // last_access_time is old enough to exceed the idle threshold.
@@ -1323,6 +1399,128 @@ impl ReferenceProcessor {
     /// SoftReferences are intentionally excluded — they stay strongly reachable
     /// (kept alive) so soft-cache semantics are unchanged; only weak + phantom
     /// references must allow their referent to be reclaimed.
+    /// Apply the SoftReference LRU policy *before* the collection and report
+    /// the entries it condemns, so the caller can null their referent slot
+    /// ahead of the mark.
+    ///
+    /// # Why the decision has to happen here and not after the mark
+    ///
+    /// [`Self::process_soft_refs`] refuses to clear an entry whose referent
+    /// `is_marked`, and CratonVM's markers trace a `Reference`'s slot 0 as an
+    /// ordinary strong edge. A soft referent is therefore *always* marked
+    /// through its own `SoftReference`, that check always wins, and the LRU
+    /// policy underneath it is unreachable — soft references behaved exactly
+    /// like strong ones on every collector. Measured 2026-08-15 with a
+    /// four-arm probe in a 64 MiB heap: HotSpot cleared the soft reference and
+    /// allocated 30 MiB past it; CratonVM threw `OutOfMemoryError` under both
+    /// ZGC and G1 with the referent still reachable only softly.
+    ///
+    /// `weakref_null_referents_pre_gc` already solves precisely this problem
+    /// for Weak and Phantom by nulling slot 0 before the mark, which is why
+    /// those two work. Soft differs in exactly one respect: a weak referent
+    /// dies whenever nothing else holds it, while a soft referent dies only
+    /// when the LRU policy judges the heap tight enough. So the policy runs
+    /// first and only its condemned set is nulled; an entry the policy wants
+    /// to keep is left traced strongly and is retained bit-for-bit as before.
+    ///
+    /// `free_heap_mb` and `current_time_ms` carry the same meaning as in
+    /// [`Self::process_references`], including the `0`-clock convention: the
+    /// processor substitutes the mutator clock it has observed through
+    /// [`Self::touch_soft_reference`] when the caller has none.
+    ///
+    /// Returns `(reference_obj, referent)` per condemned entry. Calling this
+    /// also RESETS the condemned set, so it must be called once per
+    /// collection, before the mark.
+    ///
+    /// # The clock argument is load-bearing here, unlike post-GC
+    ///
+    /// `current_time_ms == 0` makes "now" the last value a mutator handed
+    /// [`Self::touch_soft_reference`] — i.e. the moment of the most recent
+    /// `SoftReference.get()` anywhere in the process. For the reference that
+    /// *made* that call the idle window is then exactly zero, forever, and a
+    /// program in a tight allocation loop reading its own cache is precisely
+    /// the program that keeps re-stamping it. The caller here is ordinary VM
+    /// code on the mutator side of a safepoint, so it can and does supply a
+    /// real `SystemTime` reading; `0` is accepted only so tests can pin the
+    /// clock.
+    pub fn condemn_idle_soft_refs(
+        &mut self,
+        free_heap_mb: usize,
+        current_time_ms: u64,
+    ) -> Vec<(usize, usize)> {
+        let now_ms = current_time_ms.max(self.last_observed_clock_ms);
+        let threshold_ms = self
+            .soft_ref_lru_policy_ms_per_mb
+            .saturating_mul(free_heap_mb as u64);
+        self.condemn(|e| now_ms.saturating_sub(e.last_access_time_ms) > threshold_ms)
+    }
+
+    /// Condemn EVERY active soft reference, ignoring the LRU policy: the
+    /// last-ditch rule the `java.lang.ref` specification states outright —
+    /// "all soft references to softly-reachable objects are guaranteed to have
+    /// been cleared before the virtual machine throws an
+    /// `OutOfMemoryError`". HotSpot implements it as
+    /// `SoftRefPolicy::should_clear_all_soft_refs`, armed for the full GC it
+    /// runs when an allocation has already failed.
+    ///
+    /// This is a genuinely different rule from [`Self::condemn_idle_soft_refs`]
+    /// and not a limiting case of it: the LRU policy asks how long ago the
+    /// application last read the reference, and a program looping on its own
+    /// soft-referenced cache re-stamps that clock on every iteration, so its
+    /// idle window never opens however tight the heap gets. Measured: a
+    /// 64 MiB heap where HotSpot cleared the reference and completed, and
+    /// CratonVM threw `OutOfMemoryError` with a megabyte of softly-reachable
+    /// garbage in hand.
+    ///
+    /// `is_marked` still decides the outcome, exactly as for the idle set: a
+    /// condemned referent that is also strongly reachable was marked anyway
+    /// and is kept, then restored. "Clear all soft references" means all the
+    /// ones nothing else holds.
+    pub fn condemn_all_soft_refs(&mut self) -> Vec<(usize, usize)> {
+        self.condemn(|_| true)
+    }
+
+    /// Whether any soft entry is still live enough to be worth a last-ditch
+    /// collection — so the escalation ladder can skip one full GC when the
+    /// application uses no soft references at all.
+    pub fn has_active_soft_refs(&self) -> bool {
+        self.soft_refs.iter().any(|e| !e.cleared && !e.enqueued)
+    }
+
+    /// Shared body of the two condemnation rules: select from the active soft
+    /// entries, publish the selection as this cycle's condemned set (replacing
+    /// any previous cycle's), and hand the pairs back for the caller to null.
+    fn condemn(&mut self, pick: impl Fn(&ReferenceEntry) -> bool) -> Vec<(usize, usize)> {
+        let condemned: Vec<(usize, usize)> = self
+            .soft_refs
+            .iter()
+            .filter(|e| !e.cleared && !e.enqueued)
+            .filter(|e| pick(e))
+            .map(|e| (e.reference_obj, e.referent))
+            .collect();
+        self.soft_pre_nulled.clear();
+        self.soft_pre_nulled
+            .extend(condemned.iter().map(|&(ref_obj, _)| ref_obj));
+        condemned
+    }
+
+    /// The `(reference_obj, referent)` pairs [`Self::condemn_idle_soft_refs`]
+    /// condemned this cycle whose entry is STILL active — the referent turned
+    /// out to be strongly reachable, so `process_soft_refs` kept it and the
+    /// slot 0 the pre-collection pass nulled has to be written back.
+    ///
+    /// The soft twin of [`Self::weak_phantom_active_pairs`], consumed by the
+    /// same post-GC restore loop.
+    pub fn soft_pre_nulled_active_pairs(&self) -> Vec<(usize, usize)> {
+        self.soft_refs
+            .iter()
+            .filter(|e| {
+                !e.cleared && !e.enqueued && self.soft_pre_nulled.contains(&e.reference_obj)
+            })
+            .map(|e| (e.reference_obj, e.referent))
+            .collect()
+    }
+
     pub fn weak_phantom_active_pairs(&self) -> Vec<(usize, usize)> {
         let mut v = Vec::with_capacity(self.weak_refs.len() + self.phantom_refs.len());
         for e in self.weak_refs.iter().chain(self.phantom_refs.iter()) {
@@ -1996,6 +2194,171 @@ mod tests {
         assert_eq!(result.stats.weak_refs_cleared, 1);
         assert!(!proc.weak_refs[0].cleared); // referent 100 alive
         assert!(proc.weak_refs[1].cleared); // referent 200 dead
+    }
+
+    // 28b. SOFT-CLEAR GAP (2026-08-15) -------------------------------------
+    //
+    // These five pin the fix for the defect the retired
+    // `zgc-resourceleakdetector-corpse-read` write-up left as an open
+    // question. `process_soft_refs` skips any entry whose referent
+    // `is_marked`, and the VM's markers trace a `Reference`'s slot 0 as an
+    // ordinary strong edge -- so a soft referent was always marked through its
+    // own `SoftReference` and the LRU policy underneath was unreachable on
+    // every collector. `condemn_idle_soft_refs` moves the decision ahead of
+    // the mark, where the VM can null the slot the way it already does for
+    // weak and phantom.
+
+    /// The policy picks out the idle entries and leaves the freshly-read one.
+    #[test]
+    fn condemn_idle_soft_refs_selects_only_the_idle_entries() {
+        let mut proc = ReferenceProcessor::new_with_policy(1000);
+        proc.discover_reference(ReferenceType::Soft, 10, 100, Some(900));
+        proc.discover_reference(ReferenceType::Soft, 20, 200, None);
+        proc.touch_soft_reference(10, 1_000);
+        proc.touch_soft_reference(20, 61_000);
+        // 1 MB allocatable => a 1000 ms idle threshold; "now" is the mutator
+        // clock the processor observed (61_000), so entry 10 is 60 s idle and
+        // entry 20 is 0 s idle.
+        assert_eq!(proc.condemn_idle_soft_refs(1, 0), vec![(10, 100)]);
+    }
+
+    /// A roomy heap condemns nothing -- the LRU threshold scales with free
+    /// megabytes, so the same 60 s idle window is nowhere near it.
+    #[test]
+    fn condemn_idle_soft_refs_condemns_nothing_when_the_heap_is_roomy() {
+        let mut proc = ReferenceProcessor::new_with_policy(1000);
+        proc.discover_reference(ReferenceType::Soft, 10, 100, None);
+        proc.discover_reference(ReferenceType::Soft, 20, 200, None);
+        proc.touch_soft_reference(10, 1_000);
+        proc.touch_soft_reference(20, 61_000);
+        assert!(proc.condemn_idle_soft_refs(1024, 0).is_empty());
+        assert!(proc.soft_pre_nulled_active_pairs().is_empty());
+    }
+
+    /// The load-bearing one. The pre-mark verdict has to STAND even though
+    /// re-deriving it after the collection would say "keep": the collection
+    /// freed memory, so the post-GC threshold is larger, and the BTreeMap
+    /// range the ordinary scan walks is derived from that same larger
+    /// threshold -- here it selects no candidates at all. Without the
+    /// pre-condemned pass the referent is gone (its slot was nulled before the
+    /// mark) while the entry still reads as active, holding a dead address.
+    #[test]
+    fn a_pre_condemned_soft_ref_is_cleared_even_when_the_post_gc_threshold_would_keep_it() {
+        let mut proc = ReferenceProcessor::new_with_policy(1000);
+        proc.discover_reference(ReferenceType::Soft, 10, 100, Some(900));
+        proc.discover_reference(ReferenceType::Soft, 20, 200, None);
+        proc.touch_soft_reference(10, 1_000);
+        proc.touch_soft_reference(20, 61_000);
+        assert_eq!(proc.condemn_idle_soft_refs(1, 0), vec![(10, 100)]);
+
+        // 10_000 MB free after the collection => a 10_000_000 ms threshold, so
+        // the range scan's cutoff is 0 and it visits nothing.
+        let result = proc.process_references(&always_dead, 10_000, 0);
+        assert!(
+            proc.soft_refs[0].cleared,
+            "the pre-mark verdict must stand: this referent is already gone"
+        );
+        assert!(proc.soft_refs[0].enqueued);
+        assert!(result.to_enqueue.contains(&(10, 900)));
+        // The entry the policy KEPT is untouched, dead referent or not --
+        // nothing nulled its slot, so the marker kept its referent alive and
+        // `always_dead` is a fiction for it.
+        assert!(!proc.soft_refs[1].cleared);
+    }
+
+    /// A condemned entry whose referent turned out to be strongly reachable is
+    /// kept, and is reported for the post-GC slot-0 restore.
+    #[test]
+    fn a_condemned_soft_ref_whose_referent_survived_is_offered_for_restore() {
+        let mut proc = ReferenceProcessor::new_with_policy(1000);
+        proc.discover_reference(ReferenceType::Soft, 10, 100, None);
+        proc.discover_reference(ReferenceType::Soft, 20, 200, None);
+        proc.touch_soft_reference(10, 1_000);
+        proc.touch_soft_reference(20, 61_000);
+        assert_eq!(proc.condemn_idle_soft_refs(1, 0), vec![(10, 100)]);
+
+        let live = [100usize];
+        proc.process_references(&live_set(&live), 1, 0);
+        assert!(!proc.soft_refs[0].cleared);
+        assert_eq!(proc.soft_pre_nulled_active_pairs(), vec![(10, 100)]);
+    }
+
+    /// The condemned set describes ONE collection. A later cycle that condemns
+    /// nothing must not inherit the previous cycle's verdict -- otherwise an
+    /// entry the policy has since decided to keep would be cleared the moment
+    /// its referent looked unmarked for any other reason.
+    #[test]
+    fn condemn_idle_soft_refs_resets_the_condemned_set_each_cycle() {
+        let mut proc = ReferenceProcessor::new_with_policy(1000);
+        proc.discover_reference(ReferenceType::Soft, 10, 100, None);
+        proc.discover_reference(ReferenceType::Soft, 20, 200, None);
+        proc.touch_soft_reference(10, 1_000);
+        proc.touch_soft_reference(20, 61_000);
+        assert_eq!(proc.condemn_idle_soft_refs(1, 0), vec![(10, 100)]);
+        // Second cycle, roomy heap: nothing is condemned, so nothing carries
+        // over.
+        assert!(proc.condemn_idle_soft_refs(1024, 0).is_empty());
+        assert!(proc.soft_pre_nulled_active_pairs().is_empty());
+        proc.process_references(&always_dead, 1024, 0);
+        assert!(
+            !proc.soft_refs[0].cleared,
+            "no slot was nulled this cycle, so no entry may be force-cleared"
+        );
+    }
+
+    /// The last-ditch rule clears a reference the LRU policy would keep, which
+    /// is the whole point of having it: a program looping on its own
+    /// soft-referenced cache re-stamps the LRU clock every iteration, so its
+    /// idle window never opens however tight the heap becomes.
+    #[test]
+    fn the_last_ditch_rule_condemns_a_soft_ref_the_lru_policy_would_keep() {
+        let mut proc = ReferenceProcessor::new_with_policy(1000);
+        proc.discover_reference(ReferenceType::Soft, 10, 100, Some(900));
+        // Read just now: zero idle time, so the LRU policy keeps it even with
+        // the heap reporting no free megabytes at all.
+        proc.touch_soft_reference(10, 61_000);
+        assert!(proc.condemn_idle_soft_refs(0, 61_000).is_empty());
+
+        assert_eq!(proc.condemn_all_soft_refs(), vec![(10, 100)]);
+        let result = proc.process_references(&always_dead, 0, 61_000);
+        assert!(proc.soft_refs[0].cleared);
+        assert!(result.to_enqueue.contains(&(10, 900)));
+    }
+
+    /// "Clear all soft references" means all the ones nothing else holds. A
+    /// condemned referent that is still strongly reachable was marked anyway
+    /// and must survive — otherwise the last-ditch collection would hand the
+    /// application a null for an object it can still reach by a strong path.
+    #[test]
+    fn the_last_ditch_rule_still_keeps_a_strongly_reachable_referent() {
+        let mut proc = ReferenceProcessor::new_with_policy(1000);
+        proc.discover_reference(ReferenceType::Soft, 10, 100, None);
+        proc.discover_reference(ReferenceType::Soft, 20, 200, None);
+        proc.touch_soft_reference(10, 61_000);
+        proc.touch_soft_reference(20, 61_000);
+        assert_eq!(
+            proc.condemn_all_soft_refs(),
+            vec![(10, 100), (20, 200)]
+        );
+        let live = [100usize];
+        proc.process_references(&live_set(&live), 0, 61_000);
+        assert!(!proc.soft_refs[0].cleared, "referent 100 is strongly reachable");
+        assert!(proc.soft_refs[1].cleared, "referent 200 is only softly reachable");
+        assert_eq!(proc.soft_pre_nulled_active_pairs(), vec![(10, 100)]);
+    }
+
+    /// The ladder skips its extra collection when there is nothing to clear.
+    #[test]
+    fn has_active_soft_refs_tracks_the_uncleared_population() {
+        let mut proc = ReferenceProcessor::new();
+        assert!(!proc.has_active_soft_refs());
+        proc.discover_reference(ReferenceType::Weak, 1, 2, None);
+        assert!(!proc.has_active_soft_refs(), "a weak ref is not a soft ref");
+        proc.discover_reference(ReferenceType::Soft, 10, 100, None);
+        assert!(proc.has_active_soft_refs());
+        proc.condemn_all_soft_refs();
+        proc.process_references(&always_dead, 0, 1);
+        assert!(!proc.has_active_soft_refs());
     }
 
     // 29. CleanerThread start/stop -----------------------------------------

@@ -14393,11 +14393,17 @@ use std::sync::Arc;
         .unwrap()
         .unwrap();
         match r {
-            // Exact. `Math.sinh` IS `f64::sinh` (see `native_math_sinh`), so
-            // both sides are the same expression and a tolerance's only effect
-            // is to stop the test noticing a rewiring — e.g. onto the fdlibm
-            // body, which `StrictMath.sinh` now uses and `Math.sinh` must not.
-            Value::Double(v) => assert_eq!(v.to_bits(), 1.0_f64.sinh().to_bits()),
+            // Exact, and against FDLIBM — not `f64::sinh`. This assertion used
+            // to read `1.0_f64.sinh()`, under a comment asserting that
+            // `Math.sinh` "must not" be the fdlibm body. That was backwards:
+            // JDK 25's `Math.sinh` is a one-line `return StrictMath.sinh(x);`
+            // and HotSpot has no `sinh` intrinsic, so the oracle's `Math.sinh`
+            // IS fdlibm — the old assertion froze a 77-in-5400 divergence in
+            // place. See the census table above `let strict` in
+            // `lang_math.rs`, and the registration-level tests beside it.
+            Value::Double(v) => {
+                assert_eq!(v.to_bits(), cratonvm_types::fdlibm::sinh(1.0).to_bits())
+            }
             _ => panic!("expected double"),
         }
     }
