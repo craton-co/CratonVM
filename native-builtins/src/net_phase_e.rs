@@ -2716,6 +2716,55 @@ pub(crate) fn uri_has_synthetic_layout(ctx: &dyn NativeContext, uri: ObjectRef) 
 /// when the receiver actually has it — on a real `java.net.URI` slot 6 is
 /// `path` and slot 5 is `port`, so reading them answers the wrong field and,
 /// for slot 5, a primitive where a `String` was expected.
+/// The Java `String` OBJECT holding this URI's full text, when there is one.
+///
+/// Mirrors [`uri_raw_string`]'s search order exactly and returns the object
+/// rather than a decoded copy, for the one caller whose answer IS that string:
+/// `URI.toString()`.
+///
+/// WHY THIS EXISTS. A Rust `String` cannot hold an unpaired surrogate, so
+/// `read_string` -> `create_string` is a lossy round trip. MEASURED on
+/// `RJdkBridge1`'s `surrog` family at `3fcc8d90f`: `new URI` over a path
+/// carrying a lone high surrogate came back with U+FFFD in its place, where
+/// HotSpot returns the 12-character string with the surrogate intact. The
+/// text was never lost on the OBJECT -- a real `java.net.URI` caches it in
+/// its `string` field and our synthetic layout keeps it in slot 6/5/0 --
+/// only in the decode. Handing the object back preserves it by construction,
+/// and allocates nothing.
+///
+/// Same defect class as `G55-1`'s, and its N1. The difference is that this
+/// caller does not need to REASON about the text, so it needs no units
+/// reader: it needs to stop copying.
+fn uri_raw_string_object(ctx: &dyn NativeContext, uri: ObjectRef) -> Option<ObjectRef> {
+    if let Value::Object(Some(s)) = ctx.get_field_by_name(uri, "string") {
+        if ctx.read_string(s).is_some_and(|r| !r.is_empty()) {
+            return Some(s);
+        }
+    }
+    if !uri_has_synthetic_layout(ctx, uri) {
+        return None;
+    }
+    for &idx in &[6usize, 5usize] {
+        if let Value::Object(Some(s)) = ctx.get_field(uri, idx) {
+            if ctx.read_string(s).is_some_and(|r| !r.is_empty()) {
+                return Some(s);
+            }
+        }
+    }
+    // Slot 0 is the scheme on both layouts and only answers here when it
+    // happens to hold a whole URI -- the same guard `uri_raw_string` applies,
+    // kept identical so the two cannot disagree about which slot won.
+    if let Value::Object(Some(s)) = ctx.get_field(uri, 0) {
+        if ctx
+            .read_string(s)
+            .is_some_and(|v| v.contains(":/") || v.contains(":\\"))
+        {
+            return Some(s);
+        }
+    }
+    None
+}
+
 pub(crate) fn uri_raw_string(ctx: &dyn NativeContext, uri: ObjectRef) -> String {
     // Real-JDK `java.net.URI` caches its full text in the `string` field.
     // Reading it by NAME works regardless of the instance-field slot order
@@ -3799,9 +3848,19 @@ pub(crate) fn uri_publish_named(
 fn register_uri_natives(r: &mut NativeMethodRegistry) {
     let uri = "java/net/URI";
 
-    // toString() → raw string
+    // toString() -> the cached text, as the OBJECT, not a decoded copy.
+    //
+    // HotSpot's `URI.toString()` is `string != null ? string : defineString()`
+    // -- it hands back the very string it cached. Doing the same here is both
+    // exact and free: see `uri_raw_string_object` for the measured reason (a
+    // Rust `String` cannot carry an unpaired surrogate, so the copy
+    // substituted U+FFFD). The decode fallback stays for a URI with no cached
+    // text to hand back.
     r.register(uri, "toString", "()Ljava/lang/String;", |ctx, args| {
         let this = obj_arg(args, 0)?;
+        if let Some(s) = uri_raw_string_object(ctx, this) {
+            return Ok(Some(Value::Object(Some(s))));
+        }
         let s = uri_raw_string(ctx, this);
         Ok(Some(Value::Object(Some(ctx.create_string(&s)))))
     });
