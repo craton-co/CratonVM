@@ -8440,6 +8440,48 @@ pub fn set_monitor_direct_fns(enter: usize, exit: usize) {
     MONITOR_EXIT_DIRECT_FN.store(exit, std::sync::atomic::Ordering::Release);
 }
 
+/// `jdk/internal/util/Preconditions.checkIndex(II[BiFunction])I` thin
+/// direct-call helper. Top of the `--dump-native-registry` invocation census on
+/// `probes/NioAccessorRate.java`: 4 000 000 calls for 800 000 `ByteBuffer`
+/// accessor operations, ahead of the store itself. `0` = not wired.
+pub static PRECONDITIONS_CHECK_INDEX_DIRECT_FN: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Register the `Preconditions.checkIndex` thin direct-call helper (called once
+/// from `build_helpers`).
+pub fn set_preconditions_check_index_direct_fn(addr: usize) {
+    PRECONDITIONS_CHECK_INDEX_DIRECT_FN.store(addr, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// `java/lang/ref/Reference.reachabilityFence(Object)V` thin direct-call
+/// helper. Second on the same census (3 200 000 calls), and its registered
+/// native does nothing but be opaque about its argument. `0` = not wired.
+pub static REACHABILITY_FENCE_DIRECT_FN: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Register the `Reference.reachabilityFence` thin direct-call helper (called
+/// once from `build_helpers`).
+pub fn set_reachability_fence_direct_fn(addr: usize) {
+    REACHABILITY_FENCE_DIRECT_FN.store(addr, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Sites bound to the two census-driven helpers above, split by compile door,
+/// so "did this land" is answerable without a timing run — the lesson
+/// `LEAF_NATIVE_HITS` was added for.
+pub static PRECONDITIONS_CHECK_INDEX_SITES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub static REACHABILITY_FENCE_SITES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// `(checkIndex, reachabilityFence)` sites bound to a thin direct helper.
+pub fn census_direct_helper_sites() -> (u64, u64) {
+    (
+        PRECONDITIONS_CHECK_INDEX_SITES.load(std::sync::atomic::Ordering::Relaxed),
+        REACHABILITY_FENCE_SITES.load(std::sync::atomic::Ordering::Relaxed),
+    )
+}
+
+
 /// Resolve a method invocation to a JIT call-site intrinsic, if one applies.
 ///
 /// Returns `Some((entry, num_params, return_type))` where `entry` is the
@@ -16390,6 +16432,60 @@ fn try_compile_inner(
                                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                 }
                             }
+                            // The two census-driven helpers, at THIS door too.
+                            // The scope note above says the other six stayed
+                            // single-pass-only because none had been A/B'd at
+                            // the optimizing tier; these two are added here
+                            // deliberately, because the workload that motivates
+                            // them — netty's `writeZero`, 131 072
+                            // `ByteBuffer.putLong` per MiB — runs entirely in
+                            // OSR/optimizing-tier bodies, so a single-pass-only
+                            // bind would be inert exactly where it is needed.
+                            // Both doors are counted separately
+                            // (`census_direct_helper_sites`) so that claim is
+                            // checkable rather than assumed.
+                            if direct_target.is_none()
+                                && is_static
+                                && direct_class == "jdk/internal/util/Preconditions"
+                                && mn == "checkIndex"
+                                && desc == "(IILjava/util/function/BiFunction;)I"
+                            {
+                                let entry = direct_native_helper(
+                                    &PRECONDITIONS_CHECK_INDEX_DIRECT_FN,
+                                    jdk_only,
+                                    intrinsic_resolver,
+                                    direct_class,
+                                    &mn,
+                                    &desc,
+                                );
+                                if entry != 0 {
+                                    direct_target = Some((entry, true));
+                                    direct_target_is_thin_helper = true;
+                                    PRECONDITIONS_CHECK_INDEX_SITES
+                                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                }
+                            }
+                            if direct_target.is_none()
+                                && is_static
+                                && direct_class == "java/lang/ref/Reference"
+                                && mn == "reachabilityFence"
+                                && desc == "(Ljava/lang/Object;)V"
+                            {
+                                let entry = direct_native_helper(
+                                    &REACHABILITY_FENCE_DIRECT_FN,
+                                    jdk_only,
+                                    intrinsic_resolver,
+                                    direct_class,
+                                    &mn,
+                                    &desc,
+                                );
+                                if entry != 0 {
+                                    direct_target = Some((entry, true));
+                                    direct_target_is_thin_helper = true;
+                                    REACHABILITY_FENCE_SITES
+                                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                }
+                            }
                             if direct_target.is_none()
                                 && !closes_cycle
                                 && !jit_direct_call_requires_dispatch(direct_class, &mn, &desc)
@@ -18037,6 +18133,84 @@ fn try_compile_inner(
                                     needs_context: true,
                                     num_params: 0,
                                     return_type: b'L',
+                                    guard_class_id: 0,
+                                },
+                            ));
+                            continue;
+                        }
+                    }
+
+                    // `Preconditions.checkIndex` / `Reference.reachabilityFence`
+                    // thin direct calls. Both are census-driven rather than
+                    // guessed: `--dump-native-registry` reports a per-native
+                    // invocation count, and on `probes/NioAccessorRate.java`
+                    // these two are the top two entries — 4 000 000 and
+                    // 3 200 000 calls for 800 000 `ByteBuffer` accessor
+                    // operations, i.e. ~4.5 of the ~7 native calls a single
+                    // `ByteBuffer.putLong` executes. Both are statically bound
+                    // with a registered native callee, so `callee_compiler`
+                    // can never find a body for them and the generic dispatch
+                    // fallback pays the full ~160 ns funnel per call.
+                    //
+                    // JDK-ONLY-WAVE2: see the marker on the
+                    // `StringLatin1.toLowerCase` bind above — same list.
+                    if direct_jit_callee_calls_enabled
+                        && invoke_kind == 3
+                        && class_name == "jdk/internal/util/Preconditions"
+                        && method_name == "checkIndex"
+                        && descriptor == "(IILjava/util/function/BiFunction;)I"
+                    {
+                        let entry = direct_native_helper(
+                            &PRECONDITIONS_CHECK_INDEX_DIRECT_FN,
+                            jdk_only,
+                            intrinsic_resolver,
+                            &class_name,
+                            &method_name,
+                            &descriptor,
+                        );
+                        if entry != 0 {
+                            PRECONDITIONS_CHECK_INDEX_SITES
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            needs_heap = true;
+                            direct_calls.push((
+                                pc,
+                                JitDirectCall {
+                                    entry,
+                                    needs_context: true,
+                                    num_params: 3,
+                                    return_type: b'I',
+                                    guard_class_id: 0,
+                                },
+                            ));
+                            continue;
+                        }
+                    }
+
+                    if direct_jit_callee_calls_enabled
+                        && invoke_kind == 3
+                        && class_name == "java/lang/ref/Reference"
+                        && method_name == "reachabilityFence"
+                        && descriptor == "(Ljava/lang/Object;)V"
+                    {
+                        let entry = direct_native_helper(
+                            &REACHABILITY_FENCE_DIRECT_FN,
+                            jdk_only,
+                            intrinsic_resolver,
+                            &class_name,
+                            &method_name,
+                            &descriptor,
+                        );
+                        if entry != 0 {
+                            REACHABILITY_FENCE_SITES
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            needs_heap = true;
+                            direct_calls.push((
+                                pc,
+                                JitDirectCall {
+                                    entry,
+                                    needs_context: true,
+                                    num_params: 1,
+                                    return_type: b'V',
                                     guard_class_id: 0,
                                 },
                             ));
