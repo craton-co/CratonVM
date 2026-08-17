@@ -317,6 +317,11 @@ pub fn register_bouncycastle_shims(registry: &mut NativeMethodRegistry) {
     crate::phases_late::register_bc_blake2s_digest(registry);
     // BouncyCastle Keccak absorb/extract/permutation fast-path for CSHAKE/KMAC.
     crate::phases_late::register_bc_keccak_digest(registry);
+    // BouncyCastle SHA-256 compression leaf (Intrinsic). LMS/HSS builds
+    // `SHA256Digest` directly rather than going through `MessageDigest`, so the
+    // native JCA SHA-256 never sees this workload; see
+    // `register_bc_sha256_digest` for why `processBlock` is the seam.
+    crate::phases_late::register_bc_sha256_digest(registry);
     // BouncyCastle legacy GOST3411 compression-block fast-path for the
     // million-'a' digest regression under the org/bouncycastle JIT ban.
     crate::phases_late::register_bc_gost3411_digest(registry);
