@@ -475,10 +475,12 @@ cycle, so the mark really did leave the pause.
    `sweep + snapshot`. Concurrent *marking* cannot touch it; a concurrent sweep
    is a separate project.
 3. **The mark-start pause, 22–69 ms, of which 94–96% is `clearbits`** — a full
-   registry walk (6.6M entries single-threaded, 10.8M threaded) clearing
+   registry walk (4.6M entries single-threaded, 10.8M threaded) clearing
    `GC_FLAG_MARKED`, inside a pause, once per cycle. The stop-the-world arm
    folds the same walk into `mark_us`; the concurrent arm pays it as its own
-   pause.
+   pause. **Fixed the same day — see the ranked list below; it is now ~0.1 ms.**
+   The table above is the pre-fix state, kept because the other two rows are
+   still current.
 
 ### The window sweep
 
@@ -508,14 +510,32 @@ decides the total, and the window does not move it.**
    alone doubles the cycle count and it is why the total pause is worse. It is
    the floating-garbage cost of allocate-black, and Phase G (generational) is the
    structural answer. Nothing short of that has been shown to move it.
-2. **`clearbits`, ~95% of a 22–69 ms pause.** Two candidate fixes, and the first
-   may be free: the sweep already clears `GC_FLAG_MARKED` on every survivor,
-   zeroes every corpse, and clears the bit on the object it refuses to size — so
-   on the ordinary path the mark-start walk may be **entirely redundant**. The
-   exception is `abandon_concurrent_mark`, which leaves a partial trace's bits
-   behind with no sweep following. Failing that, the standard answer is a
-   colour-parity flip instead of a clear, and `ZColor::Marked0`/`Marked1` and
-   `mark_color_for` already exist in `zgc::vaddr` for exactly this.
+2. ~~**`clearbits`, ~95% of a 22–69 ms pause.**~~ **FIXED, same day.** The walk
+   was clearing bits that were already clear: a counter reported
+   `stale_marked=0` on **every one of 20 mark starts**, at two window settings.
+   The sweep is exhaustive — every survivor's `GC_FLAG_MARKED` cleared, every
+   corpse zeroed, the bit cleared even on the object it refuses to size — and
+   objects allocated afterwards are born clear with `allocate_black_if_marking`
+   inert outside a cycle. It is now behind `conc_bits_known_clear`, which
+   `abandon_concurrent_mark` clears because that path drops a partial trace with
+   no sweep behind it.
+
+   | | before | after |
+   |---|---:|---:|
+   | mark-start pause, single-threaded (4.6M registry) | 35,441 µs | **101 µs** |
+   | mark-start pause, 8 threads (10.8M registry) | 68,707 µs | **126 µs** |
+
+   **The verification is the DEBUG test run, not the release counter.** In
+   release the walk does not run, so `stale_marked` stays 0 whether or not the
+   latch is honest — a vacuous zero. Debug builds do the walk anyway and
+   `debug_assert` the latch; 1598 gc tests pass with that check live, and
+   `the_mark_bit_walk_is_skipped_only_when_the_sweep_has_cleared_them` pins the
+   abandon case specifically.
+
+   The colour-parity alternative (`ZColor::Marked0`/`Marked1` and
+   `mark_color_for`, already in `zgc::vaddr`) is no longer needed for this, and
+   would be the answer only if some future path had to set mark bits without a
+   sweep behind it.
 3. **`sweep_us`, the floor.** A concurrent sweep, which is its own project and
    is not in Phase C.
 4. **`snapshot_us`**, 13% of the threaded concurrent pause: `bases()`
