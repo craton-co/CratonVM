@@ -17502,6 +17502,16 @@ fn try_compile_inner(
             if compact_fields {
                 if let Some((c_off, c_ref)) = compact_slot {
                     compact_field_info.push((pc, c_off, c_ref));
+                } else if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_COMPACT_INLINE")
+                    .is_some()
+                {
+                    // ENGAGEMENT CENSUS — see the OSR twin in
+                    // `vm/src/runtime/interpreter/jit_bridge.rs`. A `None` here
+                    // costs a `jit_getfield` call on EVERY access to a compact
+                    // receiver, not merely a missed inline.
+                    eprintln!(
+                        "[compact-inline] MISS entry pc={pc} field_index={field_index} -> guarded-uniform arm (helper on every compact receiver)"
+                    );
                 }
             }
             if code[pc] == 0xb5 && (type_tag == b'L' || type_tag == b'[') {

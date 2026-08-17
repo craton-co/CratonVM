@@ -5804,7 +5804,25 @@ unsafe fn jit_field_cell_ptr(
 // the object layout. ptr::read is used because Value may contain non-Copy
 // variants (ObjectRef).
 #[allow(clippy::not_unsafe_ptr_arg_deref)]
+/// How many times compiled code fell through to this helper.
+///
+/// The companion to the compile-time `[compact-inline]` census: that one counts
+/// SITES that cannot inline, this counts ACCESSES that actually paid for it. A
+/// fast path can be emitted at 35 sites and still never run, which is exactly
+/// what this pair exists to tell apart — see
+/// known-issues/jit/every-jit-getfield-takes-the-helper-because-the-guarded-inline-check-always-fails-20260817.md.
+/// Relaxed, and read once at shutdown; the increment is one `lock xadd`-free
+/// add on a path that already does a heap-membership walk.
+pub static JIT_GETFIELD_HELPER_CALLS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Snapshot of [`JIT_GETFIELD_HELPER_CALLS`] for the shutdown diagnostic.
+pub fn jit_getfield_helper_calls() -> u64 {
+    JIT_GETFIELD_HELPER_CALLS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 pub unsafe extern "C" fn jit_getfield(vm_ptr: i64, obj_ptr: i64, field_index: i64) -> i64 {
+    JIT_GETFIELD_HELPER_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     // WS1: Rust<->JIT boundary — invalidate the per-thread JIT-scan cache
     // (see conservative_roots::note_jit_boundary).
     crate::jit::conservative_roots::note_jit_boundary();
