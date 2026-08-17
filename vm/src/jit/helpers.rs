@@ -11443,6 +11443,99 @@ pub unsafe extern "C" fn jit_integer_int_value_direct(vm_ptr: i64, receiver: i64
     )
 }
 
+/// Synthetic call-site info for [`jit_preconditions_check_index_direct`]'s
+/// cold arm — the out-of-range case, which must throw exactly what the
+/// registered native throws.
+static PRECONDITIONS_CHECK_INDEX_INFO: JitInvokeInfo = JitInvokeInfo {
+    class_name: "jdk/internal/util/Preconditions",
+    method_name: "checkIndex",
+    descriptor: "(IILjava/util/function/BiFunction;)I",
+    num_jit_args: 3,
+    return_type: b'I',
+    invoke_kind: 3,
+    declaring_class_id: 0,
+};
+
+/// Thin direct-call target for JIT `invokestatic
+/// jdk/internal/util/Preconditions.checkIndex(int,int,BiFunction)` sites
+/// (registered into `cratonvm_jit::PRECONDITIONS_CHECK_INDEX_DIRECT_FN` by
+/// `build_helpers`, recognised in `jit::try_compile`'s ladder and the IR path).
+///
+/// **Why this one.** `--dump-native-registry`'s invocation census on
+/// `probes/NioAccessorRate.java` put it at the TOP of the list — 4 000 000
+/// calls for 800 000 `ByteBuffer` accessor operations, ~2.5 per accessor,
+/// ahead of the store itself. `Objects.checkIndex` sits under every
+/// `java.nio.Buffer` absolute accessor, every `String` index check and every
+/// `List` bounds check, and it is a compare and a branch: paying the ~160 ns
+/// generic native funnel for it is the single largest rung under
+/// `HttpContentDecompressorTest.testZipBomb`
+/// (docs/known-issues/netty/httpcontentdecompressortest-hang-20260816.md).
+///
+/// Fast path: `0 <= index < length` returns `index`, with no funnel, no
+/// argument buffer, no `safe_native_call` wrapper. **Everything else — an
+/// out-of-range index, a negative length, anything that must throw — falls
+/// through to the generic dispatcher**, so the exception's class, message and
+/// the `BiFunction` formatter selection stay byte-for-byte what the registered
+/// native produces. That matters here more than usual: `throw_out_of_bounds`
+/// reads `Preconditions`' three static formatters to tell
+/// `StringIndexOutOfBoundsException` from `IndexOutOfBoundsException`, and
+/// reimplementing that choice in the fast path is exactly how the wrong-class
+/// bug the module comment warns about comes back.
+///
+/// SAFETY: called only from JIT-compiled code with a live `vm_ptr`.
+pub unsafe extern "C" fn jit_preconditions_check_index_direct(
+    vm_ptr: i64,
+    index: i64,
+    length: i64,
+    formatter: i64,
+) -> i64 {
+    crate::jit::conservative_roots::note_jit_boundary();
+    let i = index as i32;
+    let n = length as i32;
+    if i >= 0 && n >= 0 && i < n {
+        return i as i64;
+    }
+    // Throwing case (and any shape this fast path declines to judge): the
+    // generic dispatcher runs the registered native, formatter and all.
+    let args = [index, length, formatter];
+    jit_invoke_dispatch(
+        vm_ptr,
+        &PRECONDITIONS_CHECK_INDEX_INFO as *const JitInvokeInfo as i64,
+        args.as_ptr() as i64,
+        3,
+    )
+}
+
+/// Thin direct-call target for JIT `invokestatic
+/// java/lang/ref/Reference.reachabilityFence(Object)` sites (registered into
+/// `cratonvm_jit::REACHABILITY_FENCE_DIRECT_FN` by `build_helpers`).
+///
+/// Second on the same census — 3 200 000 calls, ~2 per `ByteBuffer` accessor —
+/// and its registered body is `black_box(args.first()); Ok(None)`, i.e. it does
+/// nothing but be opaque. Paying ~160 ns of generic native funnel for that is
+/// pure loss.
+///
+/// **Deliberately still a CALL, not an elision.** HotSpot intrinsifies
+/// `reachabilityFence` to no instructions at all, but it can afford to: its
+/// compiler models the fence as a liveness constraint, so the referent stays in
+/// the oop map without any code. This JIT has no such model, and the ONE thing
+/// the method exists for is keeping the argument reachable across a region
+/// where the compiler would otherwise consider it dead. Emitting nothing would
+/// silently delete that guarantee, and the failure — an object collected while
+/// a native still holds its address — is unreproducible and catastrophic.
+/// Passing the reference to an opaque `extern "C"` function keeps it live in
+/// the argument register and on the conservative scan, exactly as the
+/// registered native did, while removing the funnel. ~160 ns becomes the cost
+/// of a direct `CALL`.
+///
+/// SAFETY: called only from JIT-compiled code with a live `vm_ptr`.
+pub unsafe extern "C" fn jit_reachability_fence_direct(_vm_ptr: i64, referent: i64) {
+    crate::jit::conservative_roots::note_jit_boundary();
+    // The whole contract: be opaque about `referent` so nothing upstream may
+    // conclude it is dead. `black_box` is what the registered native used.
+    let _ = std::hint::black_box(referent);
+}
+
 /// Synthetic call-site info for [`jit_thread_current_thread_direct`]'s
 /// cold arm (the first call on a thread whose mirror has not been built).
 static THREAD_CURRENT_THREAD_INFO: JitInvokeInfo = JitInvokeInfo {
@@ -16968,6 +17061,12 @@ fn build_helpers_opt(vm_for_helpers: Option<&crate::vm::SharedVm>) -> JitRuntime
         );
         cratonvm_jit::set_thread_current_thread_direct_fn(
             jit_thread_current_thread_direct as *const () as usize,
+        );
+        cratonvm_jit::set_preconditions_check_index_direct_fn(
+            jit_preconditions_check_index_direct as *const () as usize,
+        );
+        cratonvm_jit::set_reachability_fence_direct_fn(
+            jit_reachability_fence_direct as *const () as usize,
         );
     }
 
