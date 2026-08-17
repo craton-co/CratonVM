@@ -695,7 +695,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_GC`
 
-48 tokens.
+51 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -744,6 +744,9 @@ export inherited from a parent shell.
 | `zgc-relocate` | `CRATONVM_ZGC_RELOCATE` |
 | `zgc-conc-start` | `CRATONVM_ZGC_CONC_START` |
 | `zgc-conc-workers` | `CRATONVM_ZGC_CONC_WORKERS` |
+| `zgc-generational` | `CRATONVM_ZGC_GENERATIONAL` |
+| `zgc-gen-promotion-age` | `CRATONVM_ZGC_GEN_PROMOTION_AGE` |
+| `zgc-gen-minors-per-major` | `CRATONVM_ZGC_GEN_MINORS_PER_MAJOR` |
 | `zgc-startbits` | `CRATONVM_ZGC_STARTBITS` |
 | `zgc-tlab` | `CRATONVM_ZGC_TLAB` |
 | `young-pause-goal-ms` | `CRATONVM_GC_YOUNG_PAUSE_MS` |

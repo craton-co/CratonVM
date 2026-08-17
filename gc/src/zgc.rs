@@ -2600,9 +2600,69 @@ pub struct ZgcRealHeap {
     /// which is the whole reason a generational collector can look at less
     /// than the whole heap.
     remembered: remembered::ZRememberedSetTable,
-    /// Page ids the last cycle classified as old. Read by the store barrier to
-    /// decide whether a store is an old-to-young edge worth remembering.
+    /// Page ids the last relocating cycle classified as old, and the input to
+    /// [`generation::ZGenerationScope`].
+    ///
+    /// **Page-level accounting, and no longer what decides a young cycle.**
+    /// Phase G splits the generations by OBJECT age
+    /// ([`ObjectHeader::gc_age`]), for a reason the logical grid cannot get
+    /// around: a page's age only ever rises, the bump cursor sits inside a page
+    /// that has therefore usually already aged past the promotion age, and the
+    /// allocator serves most steady-state requests out of free-list holes
+    /// scattered over every page. So a freshly allocated object -- exactly the
+    /// object a young cycle exists to collect -- is born into an old page and
+    /// read as old, and the phase reclaims nothing. An object's own age has none
+    /// of that: it is 0 at allocation wherever the bytes came from.
     old_page_ids: Mutex<Vec<u64>>,
+    /// Generational mode, and its two tunables, **per heap**.
+    ///
+    /// Seeded from [`zgc_generational_enabled`], [`zgc_gen_promotion_age`] and
+    /// [`zgc_gen_minors_per_major`] at construction, then owned by this
+    /// instance -- the same shape as `tlab_enabled`. `zgc::generation`'s module
+    /// header says why ("Every piece of state is instance-owned. There is no
+    /// `static`, no `OnceLock`, and no process-global cache -- this tree has had
+    /// parallel-test crashes caused by process-global GC caches, and a VM host
+    /// may own more than one heap at a time"), and it is also the only way a
+    /// test can exercise the phase: the flag readers cache in a `OnceLock`, so
+    /// the first test to touch one fixes it for the whole process.
+    /// The stop-the-world slide, per heap -- see
+    /// [`Self::relocation_requested_by_default`].
+    relocation_enabled: AtomicBool,
+    generational_enabled: AtomicBool,
+    gen_promotion_age: std::sync::atomic::AtomicU32,
+    gen_minors_per_major: AtomicUsize,
+    /// Has any object been promoted yet? The card barrier's gate.
+    ///
+    /// # Why a flag and not a lock
+    ///
+    /// The card barrier now sits on the store ACCESSOR (see
+    /// [`Self::set_field_no_satb`]), which is every reference store in the VM.
+    /// Its original gate asked `old_page_ids.lock().is_empty()` -- fine for a
+    /// barrier nothing called, and a mutex acquire per `putfield` for one that
+    /// is called. This is the same shape as the SATB gate: one relaxed load and
+    /// a not-taken branch for the whole of a run that never promotes, which is
+    /// every run with `CRATONVM_ZGC_GENERATIONAL` unset.
+    ///
+    /// Monotone. An object's age never falls, so once one has been promoted the
+    /// barrier stays armed until [`Self::reset_generational_state`].
+    has_old_objects: AtomicBool,
+    /// Young (minor) collections completed, and minor cycles since the last
+    /// whole-heap one -- the counter [`zgc_gen_minors_per_major`] bounds.
+    young_cycles: AtomicUsize,
+    minors_since_major: AtomicUsize,
+    /// Objects a young cycle retained WITHOUT tracing, because they are old.
+    ///
+    /// This is the number the whole phase is for: it counts the tracing a young
+    /// cycle did not do. A generational run whose `gen_old_retained` is zero is
+    /// doing full-heap work under a generational name, which is the vacuous
+    /// green this tree keeps catching -- so it is on the `--verbose:gc` line and
+    /// asserted by a test, not merely available.
+    gen_old_retained: AtomicUsize,
+    /// Extra roots a young cycle took from the remembered set.
+    gen_remembered_roots: AtomicUsize,
+    /// Objects promoted, and cards written after a relocation.
+    gen_promotions: AtomicUsize,
+    gen_recards_after_relocation: AtomicUsize,
     /// Cycles in which the parallel marker ran, and in which compaction moved
     /// at least one object, plus the objects it moved.
     ///
@@ -2969,6 +3029,17 @@ impl ZgcRealHeap {
             page_ages: Mutex::new(Vec::new()),
             remembered: remembered::ZRememberedSetTable::new(),
             old_page_ids: Mutex::new(Vec::new()),
+            relocation_enabled: AtomicBool::new(Self::relocation_requested_by_default()),
+            generational_enabled: AtomicBool::new(zgc_generational_enabled()),
+            gen_promotion_age: std::sync::atomic::AtomicU32::new(zgc_gen_promotion_age()),
+            gen_minors_per_major: AtomicUsize::new(zgc_gen_minors_per_major()),
+            has_old_objects: AtomicBool::new(false),
+            young_cycles: AtomicUsize::new(0),
+            minors_since_major: AtomicUsize::new(0),
+            gen_old_retained: AtomicUsize::new(0),
+            gen_remembered_roots: AtomicUsize::new(0),
+            gen_promotions: AtomicUsize::new(0),
+            gen_recards_after_relocation: AtomicUsize::new(0),
             parallel_mark_cycles: AtomicUsize::new(0),
             compaction_cycles: AtomicUsize::new(0),
             objects_relocated: AtomicUsize::new(0),
@@ -3916,11 +3987,12 @@ impl ZgcRealHeap {
     ///
     /// # Cost while there is no old generation
     ///
-    /// One `is_empty` check on a lock that is uncontended and, until a cycle
-    /// has aged a page past the promotion age, always empty.
+    /// One relaxed load and a not-taken branch -- see [`Self::has_old_objects`].
+    /// It used to be an `is_empty` check on a mutex, which was free for a
+    /// barrier nothing called and is not free for one on every `putfield`.
     #[inline]
     pub fn note_ref_store(&self, obj_addr: usize) {
-        if self.old_page_ids.lock().is_empty() {
+        if !self.has_old_objects.load(Ordering::Relaxed) {
             return;
         }
         self.note_ref_store_slow(obj_addr);
@@ -3928,18 +4000,53 @@ impl ZgcRealHeap {
 
     #[cold]
     fn note_ref_store_slow(&self, obj_addr: usize) {
-        let base = self.arena.lock().base_ptr() as usize;
-        if obj_addr < base {
+        // A store into a YOUNG object needs no card: a young cycle traces every
+        // young object anyway. The test is the object's own age, one relaxed
+        // load out of a header this thread has just written to.
+        let promo = self.promotion_age();
+        if self.header_ref(obj_addr as *mut u8).gc_age() < promo {
+            return;
+        }
+        self.card_object(obj_addr);
+    }
+
+    /// Card `obj_addr` with no age test -- the promotion path and the
+    /// post-relocation re-card, both of which already know the object is old.
+    ///
+    /// # The card is page-keyed and the object may be anywhere
+    ///
+    /// `page` and `offset` are a plain division of `addr - base`, so
+    /// `base + page * PAGE + offset == addr` for **every** arena address,
+    /// including the large-object region above the logical grid. The grid is
+    /// therefore conceptual here rather than a bound: a card can name any object
+    /// in the arena, and [`Self::young_extra_roots`] reconstructs the same
+    /// address from the same arithmetic.
+    fn card_object(&self, obj_addr: usize) {
+        let base = self.arena_base;
+        if base == 0 || obj_addr < base {
             return;
         }
         let page = ((obj_addr - base) / Self::Z_LOGICAL_PAGE_BYTES) as u64;
-        if !self.old_page_ids.lock().contains(&page) {
-            // A store into a young page needs no card: a young cycle scans
-            // every young page anyway.
-            return;
-        }
         let offset = (obj_addr - base) % Self::Z_LOGICAL_PAGE_BYTES;
+        // Idempotent, and after the first store to a page it is a read-lock
+        // probe. Registering on demand rather than pre-registering the whole
+        // grid keeps the table to the pages that actually hold old objects with
+        // written fields.
+        self.remembered
+            .register_old_page(page, Self::Z_LOGICAL_PAGE_BYTES);
         self.remember_old_to_young(page, offset);
+    }
+
+    /// The promotion age, clamped into what a 4-bit header field can express.
+    ///
+    /// [`cratonvm_types::MAX_GC_AGE`] is 15 and [`ObjectHeader::set_gc_age`]
+    /// saturates there, so a promotion age above it would promote nothing, ever
+    /// -- the phase would be on, cost the barrier, and never skip an object.
+    #[inline]
+    fn promotion_age(&self) -> u8 {
+        self.gen_promotion_age
+            .load(Ordering::Relaxed)
+            .clamp(1, cratonvm_types::MAX_GC_AGE as u32) as u8
     }
 
     /// How many old-to-young edges are currently remembered. Diagnostic, and
@@ -4339,6 +4446,284 @@ impl ZgcRealHeap {
         roots
     }
 
+    // =====================================================================
+    // PHASE G -- A YOUNG-ONLY COLLECTION
+    // =====================================================================
+    //
+    // # A young cycle is the same collection with the old generation pre-marked
+    //
+    // The obvious shape is a second `collect_garbage` scoped to young objects,
+    // which is what `zgc::generation`'s `collect_young` does over the page
+    // allocator. It is the wrong shape for THIS heap: `collect_garbage` also
+    // runs a finalizer resurrection pass, the reference processor, a
+    // soft-referent remark, two censuses and a sweep that coalesces the arena,
+    // and a second copy of all of it would be a second place for the old code
+    // and the new to disagree about what "live" means.
+    //
+    // So a young cycle inverts one arm of a pass that already runs. The mark-bit
+    // clear SETS the bit on every OLD object instead of clearing it, and every
+    // phase downstream is then correct with no change at all:
+    //
+    //   * the mark loop's `already visited` test skips old objects, so their
+    //     fields are never enumerated -- that is the entire saving;
+    //   * `process_references` asks `is_marked_addr`, so an old referent reads
+    //     as live and is not cleared;
+    //   * the finalizer pass sees an old finalizable object as a survivor, so it
+    //     waits for a major instead of being finalized early;
+    //   * the sweep sees old objects as survivors, clears the bit, retains them.
+    //
+    // What has to be written is only what that inversion cannot express: the
+    // roots the old generation contributes ([`Self::young_extra_roots`]), the
+    // aging and promotion the sweep performs, and the card the promotion has to
+    // leave behind.
+    //
+    // # Why the split is per OBJECT and the page grid is not used
+    //
+    // `page_ages` + `age_pages_and_split` age the logical grid, and that cannot
+    // be the generational split here. A page's age only rises; the bump cursor
+    // sits inside a page that has usually already aged past the promotion age;
+    // and in steady state the allocator serves most requests from free-list
+    // holes scattered over every page. A freshly allocated object -- precisely
+    // what a young cycle exists to collect -- would therefore be born into an
+    // old page and read as old, and the phase would reclaim nothing while still
+    // paying for the barrier. `ObjectHeader::gc_age` has none of that: it is 0
+    // at allocation wherever the bytes came from, and it is the same field
+    // `gen_heap` and G1 already promote on.
+    //
+    // The page-keyed remembered set stays, because a card table is exactly what
+    // it is: the page id is an index, not a claim about the generation of
+    // everything on that page.
+
+    /// Is the object at `addr` young -- has it survived fewer than
+    /// `promotion_age` collections?
+    #[inline]
+    fn addr_is_young(&self, addr: usize, promotion_age: u8) -> bool {
+        self.header_ref(addr as *mut u8).gc_age() < promotion_age
+    }
+
+    /// The roots a young cycle takes from the old generation, and the card
+    /// cleaning that keeps the set from growing without bound.
+    ///
+    /// Without these a young collection is simply WRONG: an object reachable
+    /// only from an old-generation field has no path from the thread roots and
+    /// would be swept while live. The reference stays in place and the memory is
+    /// zeroed, so the failure surfaces later as a field that reads null or a
+    /// header with `num_slots=0` -- not as a wild pointer at the point of the
+    /// bug.
+    ///
+    /// # Why the cards are cleaned rather than accumulated
+    ///
+    /// A card that is never cleared is correct and unbounded: every old object
+    /// ever written stays in the set forever, so this scan converges on
+    /// re-enumerating the whole old generation and the phase stops saving
+    /// anything. The fix is why [`remembered::ZRememberedSet`] has two buffers:
+    /// `swap_all` moves the current bits aside and clears them, the scan runs off
+    /// the snapshot, and a card is **re-dirtied only if the object still holds a
+    /// young reference**.
+    ///
+    /// Clearing unconditionally would be a use-after-free -- the edge outlives
+    /// the store that created it, and nothing would rewrite that field to
+    /// re-card it. Both directions are asserted by
+    /// `a_card_is_kept_while_the_edge_lives_and_dropped_when_it_dies`, because
+    /// each alone is a green that hides the opposite bug.
+    ///
+    /// Safe here and nowhere else: the world is stopped, so no store can land
+    /// between the swap and the re-dirty.
+    fn young_extra_roots(&self, promotion_age: u8) -> Vec<usize> {
+        use census::ZCensusHeapView;
+        let base = self.arena_base;
+        let mut roots: Vec<usize> = Vec::new();
+        self.remembered.swap_all();
+        let mut emptied: Vec<u64> = Vec::new();
+        for set in self.remembered.snapshot() {
+            let page_base = base + set.page_id() as usize * Self::Z_LOGICAL_PAGE_BYTES;
+            let mut carded: Vec<usize> = Vec::new();
+            set.iterate_snapshot(|offset| carded.push(page_base + offset));
+            for obj in carded {
+                if !self.registry.contains(obj) {
+                    continue; // the card outlived its object
+                }
+                let mut still_needed = false;
+                self.reference_slots(obj as u64, &mut |slot| {
+                    let target = slot.raw_word as usize;
+                    if target == 0 || !self.registry.contains(target) {
+                        return;
+                    }
+                    if self.addr_is_young(target, promotion_age) {
+                        roots.push(target);
+                        still_needed = true;
+                    }
+                });
+                if still_needed {
+                    self.remember_old_to_young(set.page_id(), obj - page_base);
+                }
+            }
+            set.clear_snapshot();
+            if set.bits_set() == 0 {
+                emptied.push(set.page_id());
+            }
+        }
+        // Drop the sets that hold nothing. The barrier re-registers on demand,
+        // so this is not a decision the store path can be wrong about -- it is
+        // only the table not keeping a bitmap per page forever.
+        for page in emptied {
+            self.remembered.remove(page);
+        }
+        roots
+    }
+
+    /// Age one survivor and, if this collection promoted it, card it.
+    ///
+    /// Called from the sweep, which already holds the header and already writes
+    /// to it, so the cost is one branch per survivor on a generational run.
+    ///
+    /// # The card at promotion is what makes the young cycle sound
+    ///
+    /// The barrier cards a store only when the receiver is ALREADY old, so every
+    /// reference an object wrote during its young life is un-carded at the moment
+    /// it is promoted. A young cycle that trusted the (empty) card set for a
+    /// freshly promoted object would miss exactly those edges. Carding it here
+    /// makes the debt explicit and settles it once: the next young cycle
+    /// re-scans the object, keeps the card if it still points into young, and
+    /// drops it otherwise.
+    ///
+    /// This is the per-object answer to the hazard the plan described in page
+    /// terms ("the first young cycle after a promotion must treat the newly-old
+    /// page as wholly dirty"). Per object it is exact and costs one card instead
+    /// of a scan of every object on the page.
+    ///
+    /// Returns `true` if this call promoted the object.
+    fn age_survivor(&self, base: usize, header: &ObjectHeader, promotion_age: u8) -> bool {
+        let age = header.gc_age();
+        if age >= promotion_age {
+            return false; // already old; nothing to age and nothing to card
+        }
+        let next = age.saturating_add(1);
+        header.set_gc_age(next);
+        if next < promotion_age {
+            return false;
+        }
+        self.card_object(base);
+        true
+    }
+
+    /// Re-card every old object after a relocation has moved objects.
+    ///
+    /// # Why the cards cannot simply survive a slide
+    ///
+    /// A card is a page id plus a byte offset, so it names a LOCATION. The slide
+    /// moves survivors down across logical page boundaries, and afterwards every
+    /// card names an offset that holds a different object, or nothing. Object
+    /// ages travel in the header and are unaffected, so the generation split
+    /// itself is still correct -- it is only the remembered set that is stale.
+    ///
+    /// Rewriting each card through the pointer map is possible and is more
+    /// fragile than this: a card whose object did not move has no map entry, a
+    /// card for an object that died has none either, and the difference decides
+    /// between a lost edge and a leak. Re-carding every old object from the
+    /// post-slide live set cannot get that wrong -- it over-approximates, and
+    /// the next young cycle's card cleaning removes whatever was unnecessary.
+    ///
+    /// Only on cycles that actually moved something, which is why
+    /// `gen_recards_after_relocation` is counted: a configuration where
+    /// relocation moves objects every cycle pays a full pass over the live set
+    /// per collection, and that has to be visible rather than inferred.
+    fn recard_all_old_objects(&self, live: &[usize], promotion_age: u8) -> usize {
+        for page in self.remembered.page_ids() {
+            self.remembered.remove(page);
+        }
+        let mut carded = 0usize;
+        for &base in live {
+            if !self.addr_is_young(base, promotion_age) {
+                self.card_object(base);
+                carded += 1;
+            }
+        }
+        self.gen_recards_after_relocation
+            .fetch_add(carded, Ordering::Relaxed);
+        carded
+    }
+
+    /// Throw the remembered set and the barrier's arming away.
+    ///
+    /// Object ages are deliberately NOT cleared: they are in the headers, they
+    /// are still true, and clearing them would need a pass over the live set
+    /// this function does not have. What it does guarantee is that no card
+    /// survives -- so the caller must either re-card
+    /// ([`Self::recard_all_old_objects`]) or accept that the next cycle is a
+    /// full one, which is what a disarmed barrier forces: with
+    /// `has_old_objects` down, `young_cycle` is false.
+    fn reset_generational_state(&self) {
+        for page in self.remembered.page_ids() {
+            self.remembered.remove(page);
+        }
+        self.has_old_objects.store(false, Ordering::Relaxed);
+    }
+
+    /// Turn young-only collections on or off for THIS heap.
+    ///
+    /// The process-wide default comes from `CRATONVM_ZGC_GENERATIONAL`; this is
+    /// how a test drives the phase, and how a host owning two heaps configures
+    /// them differently.
+    pub fn set_generational_enabled(&self, on: bool) {
+        self.generational_enabled.store(on, Ordering::Relaxed);
+        if !on {
+            self.reset_generational_state();
+        }
+    }
+
+    /// Is generational mode on for this heap?
+    pub fn generational_enabled(&self) -> bool {
+        self.generational_enabled.load(Ordering::Relaxed)
+    }
+
+    /// Collections an object must survive before it is old. Clamped into
+    /// `1..=MAX_GC_AGE` on read -- see [`Self::promotion_age`].
+    pub fn set_gen_promotion_age(&self, age: u32) {
+        self.gen_promotion_age.store(age, Ordering::Relaxed);
+    }
+
+    /// Young cycles allowed between whole-heap ones -- see
+    /// [`zgc_gen_minors_per_major`] for why there has to be a ceiling.
+    pub fn set_gen_minors_per_major(&self, n: usize) {
+        self.gen_minors_per_major.store(n, Ordering::Relaxed);
+    }
+
+    /// Is `obj_addr` carded right now?
+    ///
+    /// A test that asserts on `remembered_edge_count()` alone is asserting on a
+    /// TOTAL, and the total moves for reasons the test did not cause: promotion
+    /// cards the object it promotes, so a cycle that promotes anything changes
+    /// it. Asking about one object is the question the tests actually have.
+    #[cfg(test)]
+    pub(crate) fn is_carded_for_test(&self, obj_addr: usize) -> bool {
+        let base = self.arena_base;
+        if base == 0 || obj_addr < base {
+            return false;
+        }
+        let page = ((obj_addr - base) / Self::Z_LOGICAL_PAGE_BYTES) as u64;
+        let offset = (obj_addr - base) % Self::Z_LOGICAL_PAGE_BYTES;
+        self.remembered
+            .get(page)
+            .is_some_and(|set| set.is_remembered(offset))
+    }
+
+    /// Generational counters -- `(young_cycles, minors_since_major,
+    /// old_retained, remembered_roots, promotions, recards_after_relocation)`.
+    ///
+    /// `old_retained` is the one that says whether the feature did anything; see
+    /// the field's own note.
+    pub fn generational_stats(&self) -> (usize, usize, usize, usize, usize, usize) {
+        (
+            self.young_cycles.load(Ordering::Relaxed),
+            self.minors_since_major.load(Ordering::Relaxed),
+            self.gen_old_retained.load(Ordering::Relaxed),
+            self.gen_remembered_roots.load(Ordering::Relaxed),
+            self.gen_promotions.load(Ordering::Relaxed),
+            self.gen_recards_after_relocation.load(Ordering::Relaxed),
+        )
+    }
+
     /// Apply the ZGC **load barrier** to one reference slot, in place.
     ///
     /// This is the read path Phase 4 is about. Given the address of an 8-byte
@@ -4463,6 +4848,25 @@ impl ZgcRealHeap {
     /// *safety* question (is the JIT off?) and lives in `vm_init`; this one
     /// answers an *intent* question and lives here. A caller needs both.
     fn relocation_requested(&self) -> bool {
+        // PER HEAP, seeded from the variable below at construction. Two reasons
+        // it is not read straight from the environment here: a host may own more
+        // than one heap, and a test that needs addresses to hold still for the
+        // length of an assertion has no other way to ask for that -- the
+        // variable is process-wide and a test that set it would decide the
+        // question for every other test in the binary.
+        self.relocation_enabled.load(Ordering::Relaxed)
+    }
+
+    /// Turn the stop-the-world slide on or off for THIS heap.
+    ///
+    /// The process-wide default is `CRATONVM_ZGC_RELOCATE` (on unless set to
+    /// `0`/`off`/`false`/`no`).
+    pub fn set_relocation_enabled(&self, on: bool) {
+        self.relocation_enabled.store(on, Ordering::Relaxed);
+    }
+
+    /// The process-wide default for [`Self::set_relocation_enabled`].
+    fn relocation_requested_by_default() -> bool {
         // DEFAULT-ON since 2026-08-13, for the gauntlet.
         //
         // `CRATONVM_ZGC_RELOCATE=0` (or `off`/`false`/`no`) is the kill switch
@@ -7732,6 +8136,92 @@ fn conc_start_percent_setting() -> usize {
     })
 }
 
+/// `CRATONVM_ZGC_GENERATIONAL` -- run young-only collections. **Default off.**
+///
+/// # Why it is off, on a collector whose measured problem it is meant to fix
+///
+/// The 2026-08-17 pause anatomy named the reclaim rate as the number that
+/// decides ZGC's total pause: concurrent marking halved it (54.3% of the
+/// registry to 27.1%), because everything allocated during a cycle is floating
+/// garbage, so the cycle count doubled and the total pause got worse even where
+/// the per-cycle pause improved by a third. Generational is the structural
+/// answer, and this flag is how that claim gets measured rather than assumed.
+///
+/// Off by default because this tree has been bitten by the opposite order: ZGC's
+/// parallel marking shipped default-ON verified only for correctness and
+/// engagement, and cost +31% pause at one worker and +153% at four. The exit
+/// criterion here is a measurement on a real workload -- a young cycle doing
+/// strictly less work than a full one AND a total pause that improves.
+///
+/// # What turning it on changes
+///
+/// * Every reference store cards its receiver once that receiver is old
+///   ([`ZgcRealHeap::note_ref_store`]). Until the first promotion this is one
+///   relaxed load.
+/// * The sweep ages every survivor and cards it on the collection that promotes
+///   it.
+/// * Every [`zgc_gen_minors_per_major`]th collection is whole-heap, as are
+///   collections driven by allocation failure and collections whose mark set
+///   came from a concurrent cycle (that mark set is whole-heap already).
+/// * `CRATONVM_ZGC_RELOCATE` still applies; a relocation that MOVES an object
+///   re-cards the old generation from the post-slide live set.
+fn zgc_generational_enabled() -> bool {
+    static CACHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CACHED.get_or_init(|| {
+        match cratonvm_types::flags::runtime_var_os("CRATONVM_ZGC_GENERATIONAL") {
+            Some(raw) => {
+                let v = raw.to_string_lossy().trim().to_ascii_lowercase();
+                !matches!(v.as_str(), "" | "0" | "off" | "false" | "no")
+            }
+            None => false,
+        }
+    })
+}
+
+/// `CRATONVM_ZGC_GEN_PROMOTION_AGE` -- collections an object must survive
+/// before it is old. Default [`generation::Z_DEFAULT_PROMOTION_AGE`] (3), the
+/// figure the `GenerationalZgc` simulation and [`crate::gen_heap`] both use.
+///
+/// Clamped into `1..=MAX_GC_AGE` where it is read: 0 would promote every object
+/// on its first collection, and anything above 15 would promote none at all,
+/// because [`ObjectHeader::set_gc_age`] saturates on a 4-bit field.
+fn zgc_gen_promotion_age() -> u32 {
+    static CACHED: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *CACHED.get_or_init(|| {
+        match cratonvm_types::flags::runtime_var("CRATONVM_ZGC_GEN_PROMOTION_AGE")
+            .ok()
+            .and_then(|v| v.trim().parse::<u32>().ok())
+        {
+            Some(a) => a,
+            None => generation::Z_DEFAULT_PROMOTION_AGE,
+        }
+    })
+}
+
+/// `CRATONVM_ZGC_GEN_MINORS_PER_MAJOR` -- young cycles allowed between
+/// whole-heap ones. Default [`generation::Z_DEFAULT_MINORS_PER_MAJOR`] (8).
+///
+/// # Why there has to be a ceiling at all
+///
+/// A young cycle retains every old object without asking whether it is
+/// reachable, so garbage promoted before it died is invisible to every young
+/// cycle. Without a periodic major that accumulates until the heap is full of
+/// objects nothing points at -- the classic generational leak, and it presents
+/// as an OutOfMemoryError on a workload with plenty of dead data rather than as
+/// a slowdown.
+fn zgc_gen_minors_per_major() -> usize {
+    static CACHED: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *CACHED.get_or_init(|| {
+        match cratonvm_types::flags::runtime_var("CRATONVM_ZGC_GEN_MINORS_PER_MAJOR")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+        {
+            Some(n) => n,
+            None => generation::Z_DEFAULT_MINORS_PER_MAJOR as usize,
+        }
+    })
+}
+
 /// A fragmentation reading, taken post-sweep — the "steady state" of Phase 2.2.
 ///
 /// `worst_permille` is `largest_free_block * 1000 / capacity` at its lowest
@@ -9462,6 +9952,45 @@ impl ZgcRealHeap {
     /// pre-write barrier of its own. It stopped being correct the moment
     /// `set_field` grew one.
     pub fn set_field_no_satb(&self, obj: ObjectRef, index: usize, value: Value) {
+        self.set_field_no_card(obj, index, value);
+        // ---- CARD BARRIER, AT THE ACCESSOR --------------------------------
+        //
+        // # This barrier was on no store path at all until 2026-08-17
+        //
+        // `note_ref_store` was reached only from
+        // `GarbageCollector::write_barrier`, and this backend's `set_field`
+        // never calls it. The interpreter says otherwise in as many words --
+        // "write_barrier fires automatically inside set_field /
+        // set_field_volatile" (`opcodes.rs`) -- and that is true of `gen_heap`,
+        // whose `set_field` does call it, and false here. So every interpreted
+        // `putfield` skipped the card barrier and the remembered set was empty
+        // on any real workload. It is the shape of defect this tree keeps
+        // finding: an INERT registration looks exactly like a missing feature,
+        // and `remembered_roots` having no non-test caller read as an
+        // unfinished phase rather than a hole.
+        //
+        // Placed at the accessor for the same reason the SATB barrier is (see
+        // `set_field`'s note): coverage becomes a property of the ONE store path
+        // instead of a property of a call-site census that has to stay complete
+        // forever. Both `set_field` and `set_field_suppress_satb` funnel through
+        // here, and the suppression channel must NOT suppress this one -- SATB
+        // is about a reference being LOST, a card is about one now being HELD.
+        //
+        // AFTER the store, not before. A card written first could be cleaned by
+        // a collection that stopped this thread between the card and the store,
+        // and the edge would then exist with no card naming it. Same order as
+        // `gen_heap`'s.
+        //
+        // Cost with no old generation: one relaxed load. `value` is deliberately
+        // not consulted -- see `write_barrier`'s note on why over-carding is
+        // safe and under-carding is a use-after-free.
+        self.note_ref_store(obj.as_ptr() as usize);
+    }
+
+    /// [`Self::set_field_no_satb`] without the card -- the store itself. Split
+    /// out so the card is paid once, after whichever of the three exits below
+    /// this store takes, rather than repeated at each.
+    fn set_field_no_card(&self, obj: ObjectRef, index: usize, value: Value) {
         self.audit_access_receiver(obj.as_ptr() as usize, index, "set_field");
         let header = self.header(obj);
         if self.check_field_index(header, index, "set").is_none() {
@@ -9933,6 +10462,21 @@ impl GarbageCollector for ZgcRealHeap {
                 write_prim_element(base, index, element_type, value);
             }
         }
+        // ---- CARD BARRIER, on reference-element stores --------------------
+        //
+        // The other half of the hole documented in `set_field_no_satb`. A
+        // reference stored into an array of an old object needs a card for
+        // exactly the reason a field does, and `aastore` reaches `write_barrier`
+        // no more than `putfield` does. `System.arraycopy` is the case that
+        // makes call-site coverage hopeless -- it copies a reference array one
+        // element at a time straight through this accessor -- which is the same
+        // argument the SATB publication above makes.
+        //
+        // Gated on the element type as well as on the arming bit: a primitive
+        // element cannot be an old-to-young edge.
+        if element_type == ArrayElementType::Reference {
+            self.note_ref_store(obj.as_ptr() as usize);
+        }
         Ok(())
     }
 
@@ -10063,17 +10607,78 @@ impl GarbageCollector for ZgcRealHeap {
         let all: Vec<usize> = registered.bases();
         let snapshot_us = clock.lap();
 
+        // ---- PHASE G: IS THIS A YOUNG CYCLE? -----------------------------
+        //
+        // Decided here because the next statement is the mark-bit pass, and on a
+        // young cycle that pass is where the old generation is pre-marked. See
+        // the PHASE G block above `addr_is_young` for why a young cycle is the
+        // same collection with one arm of one loop inverted.
+        let gen_on = self.generational_enabled.load(Ordering::Relaxed);
+        let promo_age = self.promotion_age();
+        // FOUR reasons this collection must look at the whole heap.
+        //
+        //  * `marked_concurrently` -- the mark set `finish_concurrent_mark`
+        //    handed over IS the whole-heap closure. It cannot be scoped after
+        //    the fact, and re-marking would throw away the concurrent phase's
+        //    entire product.
+        //  * `headroom_low` / `hard_alloc_failure` -- the caller could not serve
+        //    an allocation. A young cycle retains the whole old generation
+        //    unexamined, so it is the wrong tool for "the heap is full": it may
+        //    reclaim nothing and the allocation fails again.
+        //  * the `minors_per_major` ceiling -- see `zgc_gen_minors_per_major`
+        //    for why an unbounded run of young cycles is a leak.
+        let force_major = marked_concurrently
+            || self.headroom_low.load(Ordering::Relaxed)
+            || self.hard_alloc_failure.load(Ordering::Relaxed)
+            || self.minors_since_major.load(Ordering::Relaxed)
+                >= self.gen_minors_per_major.load(Ordering::Relaxed);
+        // `has_old_objects` rather than just `gen_on`: with nothing promoted yet
+        // a young cycle IS a full cycle, and counting it as a minor would burn
+        // the `minors_per_major` budget on cycles that saved nothing.
+        let young_cycle =
+            gen_on && !force_major && self.has_old_objects.load(Ordering::Relaxed);
+
         // Clear all mark bits first (objects may carry a stale bit from a
         // prior cycle's survivors).
         //
         // SKIPPED after a certified concurrent mark: those bits ARE this
         // cycle's answer, and clearing them here would discard the whole
         // closure and hand the sweep an empty live set.
+        //
+        // ON A YOUNG CYCLE THIS PASS IS ALSO THE OLD GENERATION'S MARK. Setting
+        // the bit on an old object makes every phase downstream treat it as a
+        // survivor without any of them being taught about generations: the mark
+        // loop's `already visited` test skips it (so its fields are never
+        // enumerated -- the saving), the reference processor's `is_marked_addr`
+        // reads it as live, and the sweep clears the bit and retains it. Folded
+        // into a pass that already runs, so a young cycle costs no extra walk of
+        // the registry.
+        let mut gen_old_retained = 0usize;
         if !marked_concurrently {
             for &base in &all {
-                self.header_mut(base as *mut u8)
-                    .clear_gc_flags(GC_FLAG_MARKED);
+                let header = self.header_mut(base as *mut u8);
+                if young_cycle && header.gc_age() >= promo_age {
+                    header.add_gc_flags(GC_FLAG_MARKED);
+                    gen_old_retained += 1;
+                } else {
+                    header.clear_gc_flags(GC_FLAG_MARKED);
+                }
             }
+        }
+        // The old generation's contribution to the root set. Computed after the
+        // pre-mark so the mark bits and `addr_is_young` agree, and before either
+        // marker runs so both get the same roots.
+        let gen_extra_roots: Vec<usize> = if young_cycle {
+            let extra = self.young_extra_roots(promo_age);
+            self.gen_remembered_roots
+                .fetch_add(extra.len(), Ordering::Relaxed);
+            extra
+        } else {
+            Vec::new()
+        };
+        if young_cycle {
+            self.gen_old_retained
+                .fetch_add(gen_old_retained, Ordering::Relaxed);
         }
 
         // INT-8: snapshot the referent-slot skip set — the currently
@@ -10132,7 +10737,13 @@ impl GarbageCollector for ZgcRealHeap {
         // 94.4 ms on a 1M-object live set). Only `0` takes the hand-written
         // path, and that is the kill switch.
         if parallel_workers >= 1 {
-            let root_addrs: Vec<u64> = roots.iter().map(|r| r.as_ptr() as u64).collect();
+            let mut root_addrs: Vec<u64> = roots.iter().map(|r| r.as_ptr() as u64).collect();
+            // The remembered set's roots go to WHICHEVER marker runs, or a young
+            // cycle is correct with one marker and a use-after-free with the
+            // other. They are young by construction (`young_extra_roots` filters
+            // on `addr_is_young`), so they are real work rather than something
+            // the engine's mark-bit dedup would drop.
+            root_addrs.extend(gen_extra_roots.iter().map(|a| *a as u64));
             // OPEN THE CYCLE FIRST. `mark_parallel_stw`'s doc calls this "the
             // caller's contract" and this caller violated it until 2026-08-13.
             //
@@ -10184,6 +10795,7 @@ impl GarbageCollector for ZgcRealHeap {
         for r in roots.iter() {
             work.push(r.as_ptr() as usize);
         }
+        work.extend(gen_extra_roots.iter().copied());
         while let Some(addr) = work.pop() {
             if addr == 0 {
                 continue;
@@ -10411,6 +11023,8 @@ impl GarbageCollector for ZgcRealHeap {
         // Registered bases whose header could not be sized this cycle — see
         // the refusal in the sweep loop below.
         let mut unsizable = 0usize;
+        // Survivors this sweep promoted out of the young generation.
+        let mut gen_promoted = 0usize;
         {
             let mut arena = self.arena.lock();
             let arena_base = arena.base_ptr() as usize;
@@ -10439,6 +11053,14 @@ impl GarbageCollector for ZgcRealHeap {
                     header.clear_gc_flags(GC_FLAG_MARKED);
                     bytes_copied += size;
                     objects_copied += 1;
+                    // PHASE G: one more collection survived. `age_survivor`
+                    // returns true on the collection that promotes it, and
+                    // cards it -- see there for why the card at promotion is
+                    // what makes a young cycle sound. Free on a non-
+                    // generational run: one relaxed load and a branch.
+                    if gen_on && self.age_survivor(base, header, promo_age) {
+                        gen_promoted += 1;
+                    }
                 } else {
                     // Dead: zero the bytes (so a later scan can't see a stale
                     // header) and return the span to the arena free list.
@@ -10525,6 +11147,27 @@ impl GarbageCollector for ZgcRealHeap {
                     "zgc sweep: retracted the bump cursor into a free tail",
                 );
             }
+        }
+
+        // ---- PHASE G bookkeeping, after the sweep and before the log -----
+        if gen_promoted != 0 {
+            self.gen_promotions
+                .fetch_add(gen_promoted, Ordering::Relaxed);
+            // ARM THE BARRIER. Published after the sweep has set every one of
+            // those ages and written every promotion card, so a store that sees
+            // this bit set finds a table that already names the objects it has
+            // to name.
+            self.has_old_objects.store(true, Ordering::Relaxed);
+        }
+        if young_cycle {
+            self.young_cycles.fetch_add(1, Ordering::Relaxed);
+            self.minors_since_major.fetch_add(1, Ordering::Relaxed);
+        } else if gen_on {
+            // Reset on EVERY non-young collection, including one that was
+            // whole-heap because nothing had been promoted yet: the budget means
+            // "young cycles since the whole heap was last examined", and any
+            // full trace is such a time.
+            self.minors_since_major.store(0, Ordering::Relaxed);
         }
 
         if unsizable != 0 {
@@ -10645,8 +11288,20 @@ impl GarbageCollector for ZgcRealHeap {
             } else {
                 "stw-serial"
             };
+            // `gen=` is to Phase G what `mark=` is to Phase C: without it a
+            // young cycle and a full one are the same line, and the whole claim
+            // is about the difference. `young/N` names the objects the cycle
+            // retained WITHOUT tracing -- the work it did not do -- and
+            // `major/+N` the objects it promoted.
+            let gen = if young_cycle {
+                format!("young/{gen_old_retained}")
+            } else if gen_on {
+                format!("major/+{gen_promoted}")
+            } else {
+                "off".to_string()
+            };
             eprintln!(
-                "[GC] zgc-real: cycle={cycle} pause_us={pause_us} mark={mark} \
+                "[GC] zgc-real: cycle={cycle} pause_us={pause_us} mark={mark} gen={gen} \
                  objects_copied={objects_copied} bytes_copied={bytes_copied} \
                  bytes_freed={bytes_freed} occupancy={bytes_copied}/{cap} bytes",
             );
@@ -10703,6 +11358,22 @@ impl GarbageCollector for ZgcRealHeap {
                         // inside the arena, 8-byte aligned by construction.
                         *r = unsafe { ObjectRef::from_raw(*to as *mut u8) };
                     }
+                }
+                // ---- PHASE G: every card names a location that moved ----
+                //
+                // See `recard_all_old_objects`. Object ages ride in the headers
+                // and are unaffected by the slide; the remembered set is
+                // page-id-plus-offset and is now entirely stale, so it is
+                // rebuilt from the post-slide live set rather than rewritten
+                // through the pointer map.
+                if gen_on && self.has_old_objects.load(Ordering::Relaxed) {
+                    let after: Vec<usize> = self.registry.snapshot().bases();
+                    let carded = self.recard_all_old_objects(&after, promo_age);
+                    tracing::debug!(
+                        target: "zgc",
+                        carded,
+                        "zgc: re-carded the old generation after a slide"
+                    );
                 }
                 tracing::debug!(
                     target: "zgc",
@@ -13187,37 +13858,49 @@ pub(crate) mod tests {
     /// there is no old generation.**
     ///
     /// The inert half is the cost argument: `note_ref_store` sits on every
-    /// reference store, and a program short enough never to promote a page
-    /// must not pay more than one length check for it.
+    /// reference store, and a program short enough never to promote an object
+    /// must not pay more than one relaxed load for it.
+    ///
+    /// Rewritten 2026-08-17 from a page-age gate to an OBJECT-age one -- see the
+    /// PHASE G block for why a logical page's age cannot be the generational
+    /// split on this heap.
     #[test]
-    fn the_card_barrier_is_inert_until_a_page_is_old_then_records_the_edge() {
+    fn the_card_barrier_is_inert_until_an_object_is_old_then_records_the_edge() {
         let heap = ZgcRealHeap::with_capacity(64 * 1024);
         heap.set_tlab_enabled(false);
+        heap.set_generational_enabled(true);
+        heap.set_gen_promotion_age(1);
         let holder = heap.alloc_object(ClassId::new(1), 1);
+        let addr = holder.as_ptr() as usize;
         let _slot = first_ref_slot_addr(&heap, holder);
 
-        // No page is old yet.
-        heap.note_ref_store(holder.as_ptr() as usize);
+        // Nothing has been promoted, so the gate is down.
+        heap.note_ref_store(addr);
         assert_eq!(
             heap.remembered_edge_count(),
             0,
             "with no old generation there is nothing to remember"
         );
 
-        // Age page 0 into old, and register its remembered set the way a
-        // cycle does.
-        let policy = generation::ZPromotionPolicy::with_age(1);
-        let (_young, old) = heap.age_pages_and_split(1, &policy);
-        assert_eq!(old, vec![0]);
-        heap.remembered
-            .register_old_page(0, ZgcRealHeap::Z_LOGICAL_PAGE_BYTES);
-        heap.old_page_ids.lock().clone_from(&old);
+        // Age the OBJECT past the promotion age and arm the gate, the way a
+        // sweep does.
+        heap.header_ref(holder.as_ptr()).set_gc_age(1);
+        heap.has_old_objects.store(true, Ordering::Relaxed);
 
-        heap.note_ref_store(holder.as_ptr() as usize);
-        assert_eq!(
-            heap.remembered_edge_count(),
-            1,
-            "a store into an old page must be remembered"
+        heap.note_ref_store(addr);
+        assert!(
+            heap.is_carded_for_test(addr),
+            "a store into an old object must be remembered"
+        );
+
+        // And a store into a YOUNG object still is not, with the gate armed:
+        // the young cycle traces every young object anyway, so a card there is
+        // pure cost.
+        let young = heap.alloc_object(ClassId::new(2), 1);
+        heap.note_ref_store(young.as_ptr() as usize);
+        assert!(
+            !heap.is_carded_for_test(young.as_ptr() as usize),
+            "a young receiver needs no card even with the barrier armed"
         );
     }
 
@@ -13236,17 +13919,15 @@ pub(crate) mod tests {
         let young_target = heap.alloc_object(ClassId::new(2), 0);
         heap.set_field(old_holder, 0, Value::Object(Some(young_target)));
 
-        // Page 0 becomes old and the store is carded.
-        let policy = generation::ZPromotionPolicy::with_age(1);
-        let (_y, old) = heap.age_pages_and_split(1, &policy);
-        heap.remembered
-            .register_old_page(0, ZgcRealHeap::Z_LOGICAL_PAGE_BYTES);
-        heap.old_page_ids.lock().clone_from(&old);
+        // The holder becomes old and the store is carded.
+        heap.set_generational_enabled(true);
+        heap.set_gen_promotion_age(1);
+        heap.header_ref(old_holder.as_ptr()).set_gc_age(1);
+        heap.has_old_objects.store(true, Ordering::Relaxed);
         heap.note_ref_store(old_holder.as_ptr() as usize);
-        assert_eq!(heap.remembered_edge_count(), 1);
+        assert!(heap.is_carded_for_test(old_holder.as_ptr() as usize));
 
-        let base = heap.arena.lock().base_ptr() as usize;
-        let roots = heap.remembered_roots(base);
+        let roots = heap.young_extra_roots(1);
 
         assert!(
             roots.contains(&(young_target.as_ptr() as usize)),
@@ -13270,18 +13951,543 @@ pub(crate) mod tests {
         heap.set_tlab_enabled(false);
         let holder = heap.alloc_object(ClassId::new(1), 1);
 
-        let policy = generation::ZPromotionPolicy::with_age(1);
-        let (_y, old) = heap.age_pages_and_split(1, &policy);
-        heap.remembered
-            .register_old_page(0, ZgcRealHeap::Z_LOGICAL_PAGE_BYTES);
-        heap.old_page_ids.lock().clone_from(&old);
+        heap.set_generational_enabled(true);
+        heap.set_gen_promotion_age(1);
+        heap.header_ref(holder.as_ptr()).set_gc_age(1);
+        heap.has_old_objects.store(true, Ordering::Relaxed);
 
         heap.write_barrier(holder, Value::Object(None));
 
-        assert_eq!(
-            heap.remembered_edge_count(),
-            1,
+        assert!(
+            heap.is_carded_for_test(holder.as_ptr() as usize),
             "write_barrier must card the written object"
+        );
+    }
+
+    // -- Phase G: a young-only collection ----------------------------------
+
+    /// A heap with generational mode on, promotion at the first collection,
+    /// TLABs off and the slide off.
+    ///
+    /// Promotion age 1 so one collection promotes: these tests are about what a
+    /// young cycle DOES, not about how many collections it takes to get one.
+    /// The slide is off so an address a test is holding still names the same
+    /// object after a collection -- `a_relocation_recards_the_old_generation`
+    /// is the one test that turns it back on.
+    fn gen_heap_for_test(bytes: usize) -> std::sync::Arc<ZgcRealHeap> {
+        let heap = ZgcRealHeap::new_shared(bytes);
+        heap.set_tlab_enabled(false);
+        heap.set_relocation_enabled(false);
+        heap.set_generational_enabled(true);
+        heap.set_gen_promotion_age(1);
+        // High enough that these tests choose the cycle kind, not the ceiling.
+        heap.set_gen_minors_per_major(1_000);
+        heap
+    }
+
+    /// One collection at a stop-the-world with `roots` as the root set.
+    fn gen_collect(heap: &ZgcRealHeap, roots: &mut [ObjectRef]) -> GcResult {
+        // SAFETY: single-threaded test; the token stands for the safepoint the
+        // VM takes around a collection.
+        let stw = unsafe { StopTheWorldToken::new() };
+        heap.collect_garbage(&stw, roots, &NoMonitors)
+    }
+
+    /// Rebuild an `ObjectRef` from an address this test took from one.
+    fn gen_ref(addr: usize) -> ObjectRef {
+        // SAFETY: the caller took `addr` out of an `ObjectRef` in the same test,
+        // and relocation is off in `gen_heap_for_test`, so it is still a base.
+        unsafe { ObjectRef::from_raw(addr as *mut u8) }
+    }
+
+    /// **THE EXIT CRITERION: an object reachable only through an
+    /// old-generation field survives a young cycle.**
+    ///
+    /// # Why this test and not `a_young_scope_treats_remembered_old_slots_as_roots`
+    ///
+    /// That test calls `note_ref_store` by hand and reads `remembered_roots` by
+    /// hand, so it asserts that the remembered-set PLUMBING works. It passes
+    /// with the card barrier reachable from nothing at all -- which is what was
+    /// true until 2026-08-17, because this backend's `set_field` never called
+    /// `write_barrier`. This one drives the store accessor the interpreter uses
+    /// and then drives a real collection, so it can only pass if every link is
+    /// connected.
+    ///
+    /// The failure it guards is not a crash: the reference stays in place and the
+    /// memory is zeroed, so a survivor count reads as a pass and the defect
+    /// surfaces much later as a field that reads null. Hence the self-tag.
+    #[test]
+    fn a_young_cycle_keeps_an_object_reachable_only_through_an_old_field() {
+        let heap = gen_heap_for_test(64 * 1024 * 1024);
+        let (head, chain, _garbage) = conc_build_graph(&heap, 200, 0);
+
+        // Collection 1 is whole-heap (nothing is old yet) and promotes every
+        // survivor, carding each as it goes.
+        let mut roots = [head];
+        let _ = gen_collect(&heap, &mut roots);
+        let head = roots[0];
+        let (young_cycles, _, _, _, promotions, _) = heap.generational_stats();
+        assert_eq!(young_cycles, 0, "the first collection cannot be a minor");
+        assert!(promotions >= 200, "it must promote the chain: {promotions}");
+
+        // Now make an OLD object the sole holder of a fresh young object. The
+        // store goes through the accessor, so the card barrier is what records
+        // it; nothing here touches `note_ref_store`.
+        let young = heap.alloc_object(ClassId::new(77), 1);
+        let young_addr = young.as_ptr() as usize;
+        // A self-tag: if this object is reclaimed and zeroed, slot 0 reads null
+        // instead of pointing back at itself.
+        heap.set_field(young, 0, Value::Object(Some(young)));
+        heap.set_field(gen_ref(chain[10]), 1, Value::Object(Some(young)));
+        assert!(
+            heap.remembered_edge_count() > 0,
+            "the store accessor must have carded the old holder"
+        );
+
+        // Collection 2 is a YOUNG cycle. `young` is reachable ONLY from the old
+        // generation, so it survives if and only if the remembered set is read.
+        let mut roots = [head];
+        let _ = gen_collect(&heap, &mut roots);
+        let (young_cycles, _, old_retained, remembered_roots, _, _) =
+            heap.generational_stats();
+        assert_eq!(young_cycles, 1, "collection 2 must have been a minor");
+        assert!(
+            old_retained >= 200,
+            "a young cycle must retain objects WITHOUT tracing them, or it is a \
+             full cycle wearing a generational name: old_retained={old_retained}"
+        );
+        assert!(
+            remembered_roots > 0,
+            "and the card must have produced a root"
+        );
+
+        assert!(
+            heap.is_object_address(young_addr).is_some(),
+            "an object held only by an old-generation field must survive a young \
+             cycle -- this is the missing-card use-after-free"
+        );
+        assert_eq!(
+            heap.get_field(gen_ref(young_addr), 0),
+            Value::Object(Some(gen_ref(young_addr))),
+            "and its bytes must be intact: a freed-then-zeroed object still \
+             looks plausible to a stale reference, so a survivor count alone \
+             cannot tell"
+        );
+        assert_eq!(
+            conc_walk_chain(&heap, roots[0]).len(),
+            chain.len(),
+            "and the old generation is still walkable"
+        );
+    }
+
+    /// **A young cycle still reclaims young garbage.**
+    ///
+    /// The companion to the test above, and the one that fails if `young_cycle`
+    /// pre-marks too much: a phase that retains everything is trivially correct
+    /// and useless. Pair them or the first alone is satisfied by a collector
+    /// that never frees anything.
+    #[test]
+    fn a_young_cycle_still_reclaims_young_garbage() {
+        let heap = gen_heap_for_test(64 * 1024 * 1024);
+        let (head, _chain, _g) = conc_build_graph(&heap, 50, 0);
+        let mut roots = [head];
+        let _ = gen_collect(&heap, &mut roots);
+        let head = roots[0];
+
+        // Fresh, unreachable, age 0.
+        let junk: Vec<usize> = (0..500)
+            .map(|_| heap.alloc_object(ClassId::new(43), 2).as_ptr() as usize)
+            .collect();
+
+        let mut roots = [head];
+        let _ = gen_collect(&heap, &mut roots);
+        assert_eq!(heap.generational_stats().0, 1, "that was a minor");
+        assert!(
+            junk.iter().all(|a| heap.is_object_address(*a).is_none()),
+            "a young cycle must free young garbage -- retaining everything is \
+             correct and pointless"
+        );
+    }
+
+    /// **The card barrier is on the store ACCESSORS, not only on
+    /// `write_barrier`.**
+    ///
+    /// The regression test for the defect that made Phase G impossible. This
+    /// backend's `set_field` never called `write_barrier`, and the interpreter
+    /// relies on it doing so ("write_barrier fires automatically inside
+    /// set_field / set_field_volatile" -- `opcodes.rs`), so every interpreted
+    /// `putfield` and every `aastore` skipped the card barrier and the
+    /// remembered set was empty on any real workload.
+    ///
+    /// Both accessors are asserted, because an array store is a different one
+    /// and `System.arraycopy` reaches only that.
+    #[test]
+    fn the_store_accessors_card_an_old_object() {
+        // 64 MiB, not a few: a heap too small for `zgc_headroom_margin` has
+        // `headroom_low` set on every cycle, which forces every collection to be
+        // a major -- so the card cleaning this test depends on would never run
+        // and the failure would read as "the barrier is broken".
+        let heap = gen_heap_for_test(64 * 1024 * 1024);
+        let holder = heap.alloc_object(ClassId::new(1), 1);
+        let arr = heap.alloc_array(ClassId::new(0), ArrayElementType::Reference, 2);
+        let target = heap.alloc_object(ClassId::new(2), 0);
+        let ints = heap.alloc_array(ClassId::new(0), ArrayElementType::Int, 4);
+
+        // TWO collections. The first promotes all four and CARDS each as it does
+        // (see `age_survivor`); the second is a young cycle, whose card cleaning
+        // drops all four again because none of them points into young. Without
+        // both, the assertions below would be reading a set that is already
+        // dirty for a reason they did not cause.
+        let mut roots = [holder, arr, target, ints];
+        let _ = gen_collect(&heap, &mut roots);
+        assert!(
+            heap.header_ref(roots[0].as_ptr()).gc_age() >= 1,
+            "the fixture must be old for a card to be wanted"
+        );
+        let _ = gen_collect(&heap, &mut roots);
+        let [holder, arr, target, ints] = roots;
+        assert_eq!(
+            heap.generational_stats().0,
+            1,
+            "collection 2 must be a MINOR, or the card cleaning never ran"
+        );
+        for (name, obj) in [("holder", holder), ("arr", arr), ("ints", ints)] {
+            assert!(
+                !heap.is_carded_for_test(obj.as_ptr() as usize),
+                "{name}: the young cycle must have cleaned the promotion card"
+            );
+        }
+
+        heap.set_field(holder, 0, Value::Object(Some(target)));
+        assert!(
+            heap.is_carded_for_test(holder.as_ptr() as usize),
+            "putfield must card its receiver: without this the remembered set is \
+             empty on every interpreted workload"
+        );
+
+        heap.set_array_element(arr, 0, Value::Object(Some(target)))
+            .expect("in bounds");
+        assert!(
+            heap.is_carded_for_test(arr.as_ptr() as usize),
+            "aastore must card its array too -- System.arraycopy reaches this \
+             accessor and no call site above it"
+        );
+
+        // And a PRIMITIVE element store must not card. The gate is cheap but it
+        // should not be paying for stores that cannot hold a reference, and an
+        // int[] that IS old and un-carded is the only way to tell that gate from
+        // the age gate.
+        heap.set_array_element(ints, 0, Value::Int(7))
+            .expect("in bounds");
+        assert!(
+            !heap.is_carded_for_test(ints.as_ptr() as usize),
+            "an int[] element cannot be an old-to-young edge"
+        );
+    }
+
+    /// **A card is KEPT while its edge lives and DROPPED when it dies.**
+    ///
+    /// Both directions, because each alone is a green that hides the opposite
+    /// bug: never clearing is correct and unbounded (the root scan converges on
+    /// re-enumerating the whole old generation and the phase stops saving
+    /// anything), and always clearing is a use-after-free (the edge outlives the
+    /// store that created it, and nothing rewrites the field to re-card it).
+    #[test]
+    fn a_card_is_kept_while_the_edge_lives_and_dropped_when_it_dies() {
+        let heap = gen_heap_for_test(64 * 1024 * 1024);
+        let holder = heap.alloc_object(ClassId::new(80), 2);
+        let mut roots = [holder];
+        let _ = gen_collect(&heap, &mut roots);
+        let holder = roots[0];
+
+        // A fresh young object held only by the old `holder`.
+        let holder_addr = holder.as_ptr() as usize;
+        let keeper = heap.alloc_object(ClassId::new(77), 1);
+        let keeper_addr = keeper.as_ptr() as usize;
+        heap.set_field(holder, 1, Value::Object(Some(keeper)));
+        assert!(heap.is_carded_for_test(holder_addr), "the holder is carded");
+
+        // A young cycle consumes the card and must PUT IT BACK -- the edge is
+        // still there, and `keeper` was young when the scan read it.
+        let mut roots = [holder];
+        let _ = gen_collect(&heap, &mut roots);
+        assert_eq!(heap.generational_stats().0, 1, "that was a minor");
+        assert!(heap.is_object_address(keeper_addr).is_some());
+        assert!(
+            heap.is_carded_for_test(holder_addr),
+            "the edge existed and pointed into young, so the card must survive \
+             the scan that consumed it"
+        );
+
+        // Another young cycle. `keeper` has now been promoted itself, so the
+        // holder's edge is old-to-old and the card is correctly dropped -- but
+        // `keeper` must still survive, now because it is old rather than because
+        // of a card. That is the same object staying alive across the transition,
+        // which is the case a clear-unconditionally bug loses.
+        let mut roots = [holder];
+        let _ = gen_collect(&heap, &mut roots);
+        assert!(
+            heap.is_object_address(keeper_addr).is_some(),
+            "held by an old field across the cycle that promoted it"
+        );
+        for cycle in 3..=5 {
+            let mut roots = [holder];
+            let _ = gen_collect(&heap, &mut roots);
+            assert!(
+                heap.is_object_address(keeper_addr).is_some(),
+                "still held through young cycle {cycle}"
+            );
+        }
+        assert!(
+            !heap.is_carded_for_test(holder_addr),
+            "and once both ends are old the card is pure cost, so it must be gone"
+        );
+    }
+
+    /// **A card whose target stays YOUNG is re-dirtied for as long as it does.**
+    ///
+    /// The companion to the test above, which lets its target be promoted. Here
+    /// the target is replaced with a fresh young object before every cycle, so
+    /// the edge is old-to-young every time and the card must be re-dirtied every
+    /// time. This is the assertion a clear-unconditionally implementation fails.
+    #[test]
+    fn a_card_into_young_is_re_dirtied_on_every_cycle() {
+        let heap = gen_heap_for_test(64 * 1024 * 1024);
+        let holder = heap.alloc_object(ClassId::new(80), 2);
+        let mut roots = [holder];
+        let _ = gen_collect(&heap, &mut roots);
+        let holder = roots[0];
+        let holder_addr = holder.as_ptr() as usize;
+
+        for cycle in 1..=4 {
+            // A brand-new young object, replacing whatever the slot held.
+            let fresh = heap.alloc_object(ClassId::new(77), 1);
+            let fresh_addr = fresh.as_ptr() as usize;
+            heap.set_field(holder, 1, Value::Object(Some(fresh)));
+            assert!(heap.is_carded_for_test(holder_addr));
+
+            let mut roots = [holder];
+            let _ = gen_collect(&heap, &mut roots);
+            assert!(
+                heap.is_object_address(fresh_addr).is_some(),
+                "cycle {cycle}: the young target must survive on the card alone"
+            );
+            assert!(
+                heap.is_carded_for_test(holder_addr),
+                "cycle {cycle}: the edge still points into young, so the card \
+                 must have been re-dirtied by the scan that consumed it"
+            );
+        }
+    }
+
+    /// **A card whose target is OLD is dropped, and the target survives
+    /// anyway.**
+    ///
+    /// The other half of the cleaning rule. An old-to-old edge needs no card --
+    /// a young cycle retains both ends without looking -- and keeping one would
+    /// mean every old object that ever pointed at another stayed in the set for
+    /// the life of the process.
+    #[test]
+    fn an_old_to_old_edge_is_not_carded_and_both_ends_survive() {
+        let heap = gen_heap_for_test(64 * 1024 * 1024);
+        let holder = heap.alloc_object(ClassId::new(80), 2);
+        let target = heap.alloc_object(ClassId::new(81), 1);
+        let target_addr = target.as_ptr() as usize;
+
+        // Promote both, then link them. The store cards `holder` (the barrier
+        // does not consult the value -- over-carding is safe).
+        let mut roots = [holder, target];
+        let _ = gen_collect(&heap, &mut roots);
+        let [holder, target] = roots;
+        let holder_addr = holder.as_ptr() as usize;
+        heap.set_field(holder, 1, Value::Object(Some(target)));
+        assert!(heap.is_carded_for_test(holder_addr), "over-carding is safe");
+
+        // The young cycle's card cleaning finds an old target and drops it.
+        let mut roots = [holder];
+        let _ = gen_collect(&heap, &mut roots);
+        assert!(
+            !heap.is_carded_for_test(holder_addr),
+            "an old-to-old edge must not stay carded"
+        );
+        assert!(
+            heap.is_object_address(target_addr).is_some(),
+            "and the target survives because it is old, not because of a card"
+        );
+    }
+
+    /// **The `minors_per_major` ceiling eventually collects old garbage.**
+    ///
+    /// A young cycle keeps every old object without asking whether it is
+    /// reachable, so garbage promoted before it died is invisible to every young
+    /// cycle. The ceiling is the only thing that ever collects it, and without
+    /// this test it is a number nothing reads.
+    #[test]
+    fn the_minors_per_major_ceiling_eventually_collects_old_garbage() {
+        let heap = gen_heap_for_test(64 * 1024 * 1024);
+        heap.set_gen_minors_per_major(3);
+        let holder = heap.alloc_object(ClassId::new(79), 1);
+        let doomed = heap.alloc_object(ClassId::new(78), 1);
+        let doomed_addr = doomed.as_ptr() as usize;
+        heap.set_field(holder, 0, Value::Object(Some(doomed)));
+
+        // Collection 1: whole-heap, promotes both.
+        let mut roots = [holder];
+        let _ = gen_collect(&heap, &mut roots);
+        let holder = roots[0];
+        assert!(heap.has_old_objects.load(Ordering::Relaxed));
+
+        // Drop the only reference. `doomed` is now OLD garbage.
+        heap.set_field(holder, 0, Value::Object(None));
+
+        // Three young cycles retain it. Asserting that is what makes the fourth
+        // collection meaningful -- and it is also the honest statement of the
+        // phase's cost.
+        for cycle in 1..=3 {
+            let mut roots = [holder];
+            let _ = gen_collect(&heap, &mut roots);
+            assert_eq!(heap.generational_stats().0, cycle, "minor {cycle}");
+            assert!(
+                heap.is_object_address(doomed_addr).is_some(),
+                "young cycle {cycle} must retain old garbage without examining it"
+            );
+        }
+
+        // The fourth hits the ceiling and is a major.
+        let mut roots = [holder];
+        let _ = gen_collect(&heap, &mut roots);
+        assert_eq!(
+            heap.generational_stats().0,
+            3,
+            "the ceiling must have forced a whole-heap cycle, not a fourth minor"
+        );
+        assert!(
+            heap.is_object_address(doomed_addr).is_none(),
+            "and that cycle must reclaim the old garbage every minor kept"
+        );
+    }
+
+    /// **A concurrently-marked cycle is never a young cycle.**
+    ///
+    /// `finish_concurrent_mark` hands over the whole-heap closure and the pass
+    /// that would pre-mark the old generation is SKIPPED on that path
+    /// (`if !marked_concurrently`). A young cycle there would sweep against a
+    /// mark set nobody scoped, and the two features would silently corrupt each
+    /// other -- the collection would be labelled `young` while behaving as a
+    /// major, or worse.
+    #[test]
+    fn a_concurrently_marked_cycle_is_never_a_young_cycle() {
+        let heap = gen_heap_for_test(64 * 1024 * 1024);
+        let (head, chain, garbage) = conc_build_graph(&heap, 400, 90);
+
+        // Promote everything with one ordinary collection.
+        let mut roots = [head];
+        let _ = gen_collect(&heap, &mut roots);
+        let head = roots[0];
+        assert!(heap.has_old_objects.load(Ordering::Relaxed));
+
+        // Now open a concurrent cycle and let the next collection close it.
+        {
+            // SAFETY: single-threaded test.
+            let stw = unsafe { StopTheWorldToken::new() };
+            assert!(heap.start_concurrent_mark(&stw, &[head.as_ptr() as u64]));
+        }
+        let before = heap.generational_stats().0;
+        let mut roots = [head];
+        let _ = gen_collect(&heap, &mut roots);
+        assert_eq!(
+            heap.generational_stats().0,
+            before,
+            "the collection that closes a concurrent cycle must be a MAJOR: its \
+             mark set is the whole-heap closure and nothing scoped it"
+        );
+        assert_eq!(heap.concurrent_mark_stats().1, 1, "and it certified");
+        assert_eq!(conc_walk_chain(&heap, roots[0]), chain);
+        assert!(garbage.iter().all(|a| heap.is_object_address(*a).is_none()));
+    }
+
+    /// **A relocation re-cards the old generation.**
+    ///
+    /// A card is a page id plus a byte offset, so a slide invalidates every one
+    /// of them at once. Object ages ride in the header and are fine, which is
+    /// what makes the failure silent: the split is still correct, the remembered
+    /// set is not, and the next young cycle frees an object an old field still
+    /// points at.
+    #[test]
+    fn a_relocation_recards_the_old_generation() {
+        let heap = gen_heap_for_test(64 * 1024 * 1024);
+        heap.set_relocation_enabled(true);
+        let holder = heap.alloc_object(ClassId::new(80), 2);
+        let mut roots = [holder];
+        let _ = gen_collect(&heap, &mut roots);
+        let holder = roots[0];
+        assert!(heap.has_old_objects.load(Ordering::Relaxed));
+
+        let keeper = heap.alloc_object(ClassId::new(77), 1);
+        heap.set_field(holder, 1, Value::Object(Some(keeper)));
+
+        // Whether this heap's selector chooses to move anything is its own
+        // decision, so the assertion is conditional on it having done so --
+        // stated rather than assumed, because a test that silently measured
+        // "nothing moved" would be vacuous.
+        let mut roots = [holder];
+        let _ = gen_collect(&heap, &mut roots);
+        let (_, _, _, _, _, recards) = heap.generational_stats();
+        if heap.compaction_cycles.load(Ordering::Relaxed) == 0 {
+            // Nothing moved; there is nothing to re-card and nothing to assert
+            // beyond the graph still being intact.
+            assert_eq!(recards, 0);
+            return;
+        }
+        assert!(
+            recards > 0,
+            "a slide moved objects, so every card named a stale location and the \
+             old generation must have been re-carded"
+        );
+        // And the edge is still found: `keeper` survives the NEXT young cycle,
+        // which is the one that would fail on a stale card set.
+        let holder = roots[0];
+        let keeper_now = match heap.get_field(holder, 1) {
+            Value::Object(Some(k)) => k.as_ptr() as usize,
+            other => panic!("the holder must still name its target, got {other:?}"),
+        };
+        let mut roots = [holder];
+        let _ = gen_collect(&heap, &mut roots);
+        assert!(
+            heap.is_object_address(keeper_now).is_some(),
+            "the re-carded edge must keep it alive through a young cycle"
+        );
+    }
+
+    /// **A promotion age above `MAX_GC_AGE` promotes nothing, so it is
+    /// clamped.**
+    ///
+    /// `set_gc_age` saturates on a 4-bit field, so an age of 16 would leave
+    /// every object reading 15 forever: the phase would be on, would pay the
+    /// barrier on every store, and would never skip a single object. The clamp
+    /// is in `promotion_age`, and it is the kind of thing that is obvious in the
+    /// header and invisible in a run.
+    #[test]
+    fn the_promotion_age_is_clamped_into_what_the_header_can_hold() {
+        let heap = gen_heap_for_test(1024 * 1024);
+        heap.set_gen_promotion_age(0);
+        assert_eq!(heap.promotion_age(), 1, "0 would promote on the first cycle");
+        heap.set_gen_promotion_age(1_000);
+        assert_eq!(
+            heap.promotion_age(),
+            cratonvm_types::MAX_GC_AGE,
+            "above MAX_GC_AGE nothing would ever be promoted"
+        );
+
+        // And with the clamped age the phase still promotes rather than stalling.
+        let obj = heap.alloc_object(ClassId::new(90), 1);
+        let mut roots = [obj];
+        for _ in 0..cratonvm_types::MAX_GC_AGE {
+            let _ = gen_collect(&heap, &mut roots);
+        }
+        assert!(
+            heap.has_old_objects.load(Ordering::Relaxed),
+            "MAX_GC_AGE collections must reach the clamped promotion age"
         );
     }
 
@@ -13449,18 +14655,28 @@ pub(crate) mod tests {
     #[test]
     fn compaction_is_on_by_default_and_zero_is_the_kill_switch() {
         let heap = ZgcRealHeap::with_capacity(64 * 1024);
+        // The VARIABLE is read by `relocation_requested_by_default`, which seeds
+        // the per-heap switch at construction; `relocation_requested` reads the
+        // switch. Both halves are asserted, because reading only the variable
+        // would pass with the switch wired to nothing.
         let on = cratonvm_types::flags::with_thread_overrides(
             &[("CRATONVM_ZGC_RELOCATE", None)],
-            || heap.relocation_requested(),
+            ZgcRealHeap::relocation_requested_by_default,
         );
         assert!(on, "compaction must be on by default");
         for off in ["0", "off", "false", "no"] {
             let v = cratonvm_types::flags::with_thread_overrides(
                 &[("CRATONVM_ZGC_RELOCATE", Some(off))],
-                || heap.relocation_requested(),
+                ZgcRealHeap::relocation_requested_by_default,
             );
             assert!(!v, "CRATONVM_ZGC_RELOCATE={off} must be a kill switch");
         }
+        assert!(heap.relocation_requested(), "the switch follows the default");
+        heap.set_relocation_enabled(false);
+        assert!(
+            !heap.relocation_requested(),
+            "and the per-heap switch has to reach the consumer, or a test that              turned it off would still be compacting"
+        );
     }
 
     /// **A dense page BETWEEN two selected pages must not be slid over.**
