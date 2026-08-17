@@ -6069,6 +6069,7 @@ impl ZgcRealHeap {
     /// O(live) under the registry lock, so terminal error paths only, and
     /// `cap`ped.
     pub fn live_holders_of(&self, addr: usize, cap: usize) -> Vec<(usize, u32, usize)> {
+        use census::ZCensusHeapView;
         let mut out: Vec<(usize, u32, usize)> = Vec::new();
         if cap == 0 {
             return out;
