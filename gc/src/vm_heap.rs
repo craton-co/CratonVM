@@ -2544,6 +2544,14 @@ impl VmHeap {
                  recards_after_relocation={recards}",
                 h.generational_enabled(),
             );
+            // THE NURSERY, beside the split it bounds. `sweep_skipped` is the
+            // engagement counter: a run with `young_cycles>0` and
+            // `sweep_skipped=0` swept the whole registry on every young cycle, so
+            // the floor never moved and the O(young) sweep is not happening.
+            let (skipped, floor, old_live) = h.nursery_stats();
+            eprintln!(
+                "[GC] zgc-nursery: sweep_skipped={skipped} floor={floor}                  old_live_bytes={old_live}",
+            );
             // `ZGC_UNSIZABLE_OBJECTS` had no reader anywhere but a unit test.
             // It is the sweep's own count of registered objects whose header it
             // could not size -- i.e. of heap corruption the collector has
