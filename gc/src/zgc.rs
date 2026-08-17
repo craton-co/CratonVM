@@ -2813,6 +2813,53 @@ pub struct ZgcRealHeap {
     /// [`Self::concurrent_mark_skip_set`] for what `visit_refs` then does and
     /// why that direction was chosen.
     mark_ref_skip: parking_lot::RwLock<Option<std::sync::Arc<FxHashSet<usize>>>>,
+    /// A Bloom filter over [`Self::mark_ref_skip`]'s addresses, so the
+    /// per-object path does not take that `RwLock`.
+    ///
+    /// # The third per-object lock, and why it needed a different answer
+    ///
+    /// `visit_refs` asked `concurrent_mark_skip_set()` once per marked object,
+    /// which is an `RwLock` read (a contended `compare_exchange` on one shared
+    /// word) plus an `Arc` clone and drop (two more contended atomic RMWs on
+    /// another). Three contended atomics per object, on every mark worker. That
+    /// fits the 2026-08-14 signature exactly: four workers cost **+153% pause**
+    /// against zero and the rise is monotonic in worker count, which is a lock.
+    ///
+    /// The other two per-object locks in this path were fixed with an
+    /// "is it empty?" latch ([`cratonvm_types::metadata_pin`],
+    /// [`crate::external_roots`]). That does not work here: the skip set is
+    /// **non-empty during every cycle in a real run** — it is every registered
+    /// weak, soft and phantom `Reference` object — so a latch would be true
+    /// throughout and buy nothing.
+    ///
+    /// A Bloom filter does, because the question is per OBJECT and almost every
+    /// object is not a `Reference`. Two bits per member over
+    /// `Z_SKIP_BLOOM_WORDS * 64` bits: a miss is definitive and lock-free, and
+    /// only a hit falls through to the exact set. With 1000 `Reference`s in
+    /// 32768 bits the hit rate is ~0.35%, so ~99.6% of objects take no lock at
+    /// all.
+    ///
+    /// **A Bloom filter can never give a false negative**, which is the only
+    /// direction that would be a correctness bug: a member always sets both its
+    /// bits, so an object in the skip set always reaches the exact check. A
+    /// false positive costs one lock acquisition and nothing else.
+    ///
+    /// Deliberately NOT an `AtomicPtr` to the set itself, which would be one
+    /// atomic instead of two bit tests. That would need the `Arc` to outlive
+    /// every worker that can read the pointer, and the two mark paths reach
+    /// `end_concurrent_mark_cycle` by different routes — one after a join, one
+    /// after a handshake. A raw pointer whose lifetime argument depends on which
+    /// of two call chains ran is the kind of thing that is correct until someone
+    /// adds a third. Plain atomics have no such argument to get wrong.
+    mark_ref_skip_bloom: Box<[AtomicU64; Z_SKIP_BLOOM_WORDS]>,
+    /// Is [`Self::mark_ref_skip_bloom`] meaningful — i.e. is a cycle open?
+    ///
+    /// Separate from the filter because "no cycle" and "the filter says no" are
+    /// different answers: the first must trace referents as strong edges and warn
+    /// (see [`Self::concurrent_mark_skip_set`] for why leaking beats dropping an
+    /// edge), the second must not. Published `Release` after the filter is
+    /// filled and read `Acquire`, so a worker that sees it armed sees the bits.
+    mark_ref_skip_armed: AtomicBool,
 
     /// One-shot latch for the "`visit_refs` ran with no skip-set snapshot"
     /// warning. Without it the warning is one line per object visited, which
@@ -3051,6 +3098,8 @@ impl ZgcRealHeap {
             resurrected_finalizers: Mutex::new(Vec::new()),
             slot_census: census::ZSlotCensus::new(),
             mark_ref_skip: parking_lot::RwLock::new(None),
+            mark_ref_skip_bloom: Box::new(std::array::from_fn(|_| AtomicU64::new(0))),
+            mark_ref_skip_armed: AtomicBool::new(false),
             mark_ref_skip_warned: AtomicBool::new(false),
             // NOTE (E0063 class of break): this is the ONE struct literal for
             // `ZgcRealHeap` — `new()` and `Default` both delegate here — so a
@@ -7613,8 +7662,64 @@ impl ZgcRealHeap {
             rp.reference_object_addresses().into_iter().collect()
         };
         let shared = std::sync::Arc::new(snapshot);
+        // FILL THE FILTER BEFORE ARMING IT. See `mark_ref_skip_bloom`: the
+        // `Release` store below is what makes these bits visible to a worker
+        // that `Acquire`-loads the flag, and a worker that saw the flag set over
+        // a half-filled filter would get a false NEGATIVE -- the one direction
+        // that is a use-after-free rather than a wasted lock.
+        for word in self.mark_ref_skip_bloom.iter() {
+            word.store(0, Ordering::Relaxed);
+        }
+        for addr in shared.iter() {
+            let (w1, b1, w2, b2) = Self::skip_bloom_slots(*addr);
+            self.mark_ref_skip_bloom[w1].fetch_or(1u64 << b1, Ordering::Relaxed);
+            self.mark_ref_skip_bloom[w2].fetch_or(1u64 << b2, Ordering::Relaxed);
+        }
         *self.mark_ref_skip.write() = Some(std::sync::Arc::clone(&shared));
+        self.mark_ref_skip_armed.store(true, Ordering::Release);
         shared
+    }
+
+    /// The two `(word, bit)` pairs an address occupies in the skip-set filter.
+    ///
+    /// Two independent hashes out of one 64-bit mix (the splitmix64 finaliser):
+    /// the low half indexes the first bit, the high half the second. One mix
+    /// rather than two because the finaliser's halves are independent enough for
+    /// a filter whose only failure mode is an occasional extra lock acquisition.
+    ///
+    /// Addresses are 8-aligned, so the low three bits carry no information and
+    /// are shifted out before mixing -- without that, a third of the filter's
+    /// bits would be unreachable.
+    #[inline]
+    fn skip_bloom_slots(addr: usize) -> (usize, u32, usize, u32) {
+        let mut x = (addr >> 3) as u64;
+        x ^= x >> 33;
+        x = x.wrapping_mul(0xff51_afd7_ed55_8ccd);
+        x ^= x >> 33;
+        x = x.wrapping_mul(0xc4ce_b9fe_1a85_ec53);
+        x ^= x >> 33;
+        let bits = (Z_SKIP_BLOOM_WORDS * 64) as u64;
+        let h1 = x % bits;
+        let h2 = (x >> 32) % bits;
+        (
+            (h1 / 64) as usize,
+            (h1 % 64) as u32,
+            (h2 / 64) as usize,
+            (h2 % 64) as u32,
+        )
+    }
+
+    /// Could `addr` be in this cycle's skip set?
+    ///
+    /// `false` is definitive: `addr` is certainly not in it, and the caller may
+    /// skip the exact check and its lock. `true` means "take the lock and ask".
+    /// Returns `false` with no cycle open, which the caller must NOT read as
+    /// "not a reference" -- it checks `mark_ref_skip_armed` itself first.
+    #[inline]
+    fn skip_bloom_may_contain(&self, addr: usize) -> bool {
+        let (w1, b1, w2, b2) = Self::skip_bloom_slots(addr);
+        self.mark_ref_skip_bloom[w1].load(Ordering::Relaxed) & (1u64 << b1) != 0
+            && self.mark_ref_skip_bloom[w2].load(Ordering::Relaxed) & (1u64 << b2) != 0
     }
 
     /// Close the concurrent mark cycle opened by
@@ -7627,6 +7732,10 @@ impl ZgcRealHeap {
     /// `visit_refs` and must still see the cycle's snapshot rather than an
     /// empty set.
     pub fn end_concurrent_mark_cycle(&self) {
+        // The flag first: from here `visit_refs` takes the no-cycle arm and does
+        // not consult the filter at all, so the bits may be left as they are
+        // until the next `begin` clears them.
+        self.mark_ref_skip_armed.store(false, Ordering::Release);
         *self.mark_ref_skip.write() = None;
     }
 
@@ -8186,6 +8295,12 @@ fn conc_start_percent_setting() -> usize {
         }
     })
 }
+
+/// Words in the skip-set Bloom filter -- see
+/// [`ZgcRealHeap::mark_ref_skip_bloom`]. 512 words is 32768 bits and 4 KiB per
+/// heap; with 1000 `Reference` objects and two bits each the false-positive rate
+/// is about 0.35%, so roughly one object in 285 falls through to the lock.
+const Z_SKIP_BLOOM_WORDS: usize = 512;
 
 /// `CRATONVM_ZGC_GENERATIONAL` -- run young-only collections. **Default off.**
 ///
@@ -9862,7 +9977,29 @@ impl mark::ZMarkContext for ZgcRealHeap {
         }
         let base = addr as usize;
 
-        let skip_index = match self.concurrent_mark_skip_set() {
+        // THE FILTER FIRST -- see `mark_ref_skip_bloom`. `armed` plus two relaxed
+        // loads answers this for ~99.6% of objects without touching the `RwLock`
+        // or the `Arc`, which between them were three contended atomic RMWs per
+        // object on every mark worker.
+        let skip_index = if !self.mark_ref_skip_armed.load(Ordering::Acquire) {
+            // No cycle open. Trace everything (including referents) and say so
+            // ONCE -- see `concurrent_mark_skip_set` for why leaking beats
+            // dropping an edge, and why the latch is not optional.
+            if !self.mark_ref_skip_warned.swap(true, Ordering::Relaxed) {
+                tracing::warn!(
+                    target: "zgc",
+                    "zgc concurrent mark: visit_refs ran with no skip-set snapshot; \
+                     begin_concurrent_mark_cycle was not called, so weak/soft/phantom \
+                     referents are being traced as STRONG edges and cannot be cleared"
+                );
+            }
+            None
+        } else if !self.skip_bloom_may_contain(base) {
+            // Definitive: a member always sets both its bits, so a filter miss
+            // cannot be a false negative.
+            None
+        } else {
+            match self.concurrent_mark_skip_set() {
             Some(skip) => {
                 if skip.contains(&base) {
                     Some(0usize)
@@ -9883,6 +10020,7 @@ impl mark::ZMarkContext for ZgcRealHeap {
                     );
                 }
                 None
+            }
             }
         };
 
@@ -14029,6 +14167,99 @@ pub(crate) mod tests {
             heap.is_carded_for_test(holder.as_ptr() as usize),
             "write_barrier must card the written object"
         );
+    }
+
+    // -- C5: the skip-set Bloom filter -------------------------------------
+
+    /// **The filter must have NO false negatives, and it must be armed and
+    /// disarmed with the cycle.**
+    ///
+    /// # The only direction that is a bug
+    ///
+    /// A false POSITIVE costs one lock acquisition. A false NEGATIVE makes
+    /// `visit_refs` report a `Reference`'s referent as a strong edge — so the
+    /// referent is reachable through its own `Reference`, `process_references`
+    /// can never clear it, and `WeakReference` and `Cleaner` silently stop
+    /// working. That is a leak rather than a crash, which is exactly why it needs
+    /// an assertion rather than a run.
+    ///
+    /// Asserted over every member of a realistically sized set, not one address:
+    /// a hash that dropped the low bits, or an off-by-one in the word/bit split,
+    /// would pass on a single probe.
+    #[test]
+    fn the_skip_set_bloom_filter_has_no_false_negatives() {
+        let heap = ZgcRealHeap::with_capacity(8 * 1024 * 1024);
+        heap.set_tlab_enabled(false);
+
+        // Register enough `Reference` objects that the filter is realistically
+        // loaded rather than nearly empty.
+        let mut refs: Vec<usize> = Vec::new();
+        for _ in 0..1_000 {
+            let r = heap.alloc_object(ClassId::new(60), 2);
+            let referent = heap.alloc_object(ClassId::new(62), 0);
+            heap.discover_reference(ReferenceType::Weak, r, referent, None);
+            refs.push(r.as_ptr() as usize);
+        }
+
+        // Nothing is armed yet: the filter must not be consulted, and
+        // `visit_refs` must take the no-cycle arm.
+        assert!(!heap.mark_ref_skip_armed.load(Ordering::Acquire));
+
+        let skip = heap.begin_concurrent_mark_cycle();
+        assert!(
+            heap.mark_ref_skip_armed.load(Ordering::Acquire),
+            "opening a cycle must arm the filter, or every object takes the \
+             no-cycle arm and every referent becomes immortal"
+        );
+        assert_eq!(skip.len(), refs.len(), "every reference is in the exact set");
+
+        // NO FALSE NEGATIVES: every member must reach the exact check.
+        for addr in &refs {
+            assert!(
+                heap.skip_bloom_may_contain(*addr),
+                "address {addr:#x} is in the skip set but the filter said no -- \
+                 its referent would be traced as a strong edge and could never \
+                 be cleared"
+            );
+        }
+
+        // And the filter has to be SELECTIVE, or it is a lock with extra steps.
+        // Measured over addresses that are not in the set: the false-positive
+        // rate should be a few per cent at worst, not most of them.
+        let mut probes = 0usize;
+        let mut hits = 0usize;
+        for _ in 0..2_000 {
+            let plain = heap.alloc_object(ClassId::new(61), 1);
+            probes += 1;
+            if heap.skip_bloom_may_contain(plain.as_ptr() as usize) {
+                hits += 1;
+            }
+        }
+        assert!(
+            hits * 10 < probes,
+            "the filter let {hits} of {probes} non-members through; above ~10% it \
+             is not buying the lock elision it exists for"
+        );
+
+        heap.end_concurrent_mark_cycle();
+        assert!(
+            !heap.mark_ref_skip_armed.load(Ordering::Acquire),
+            "closing the cycle must disarm it, or a later collection reads a \
+             stale filter"
+        );
+
+        // A SECOND cycle re-fills the filter from scratch, and every member of
+        // the new set must still be found. The clear happens at `begin` rather
+        // than at `end` precisely so that this holds without `end` having to
+        // touch 4 KiB of atomics on a path that is inside a pause.
+        let skip2 = heap.begin_concurrent_mark_cycle();
+        assert_eq!(skip2.len(), refs.len());
+        let missed = refs
+            .iter()
+            .filter(|a| !heap.skip_bloom_may_contain(**a))
+            .count();
+        assert_eq!(missed, 0, "a second cycle must re-arm the filter completely");
+        heap.end_concurrent_mark_cycle();
     }
 
     // -- Phase G: a young-only collection ----------------------------------
