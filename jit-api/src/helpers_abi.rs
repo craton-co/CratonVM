@@ -1309,8 +1309,15 @@ const _: () = {
          a displacement as one silently removes its only sanity check",
     );
     assert!(required == 43, "required-slot count changed");
+    // 13 -> 12 on 2026-08-16, merging `dev`: `aastore_type_check` was promoted
+    // from optional to required, so an optional slot LEFT the set. The check
+    // this guard exists to force -- "does the new optional slot have a zero
+    // check at its emitter call site?" -- has no subject when the count goes
+    // DOWN, and the twelve that remain kept the zero checks they already had.
+    // The runtime test below (`functions - required == 12`) was already on
+    // the new number; this const was the only site still carrying 13.
     assert!(
-        optional_fns == 13,
+        optional_fns == 12,
         "the optional-callable count changed — every optional slot MUST have a \
          zero check at its emitter call site; confirm the new one does before \
          updating this number",
