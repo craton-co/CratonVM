@@ -2,11 +2,13 @@
 
 ## Status
 
-**STILL OPEN 2026-08-17, but no longer unexplained.** Three real defects behind
-it were found and fixed on `fix/h2-mvstore-writer-object-identity-20260816`, one
-of which this page had filed as a separate curiosity; the failure itself still
-reproduces on the fixed build, and the mechanism now has a measured name instead
-of four candidate explanations.
+**STILL OPEN 2026-08-17, but no longer unexplained.** **Six** real defects
+behind it were found and fixed on
+`fix/h2-mvstore-writer-object-identity-20260816` — three in the reference
+machinery (below) and three in the stale-reference family the second pass went
+after — one of which this page had filed as a separate curiosity. The failure
+itself still reproduces, and the mechanism now has a measured name instead of
+four candidate explanations.
 
 **What the failure IS, measured:** a live object relocated by the ZGC slide,
 with one holder never rewritten. The verdict comes out of the collector itself
@@ -89,7 +91,7 @@ barrier does not sit on — a `checkcast`'s operand, and a `getfield` whose
 RECEIVER is stale (which makes every field it reads garbage). `set_local`
 already reports zero, so the remaining producer is not writing into frames.
 
-## The three defects fixed on the way
+## The three reference-machinery defects fixed on the way
 
 ### 1. `Collections.synchronizedSet` / `synchronizedMap` / `synchronizedList` never took their `mutex`
 
