@@ -777,15 +777,18 @@ fn corpus() -> Vec<Case> {
     // as long, but a differ only reports, it does not fail.
     // lload_0 / pop2 / iconst_0 / ireturn
     c.push(Case::new("stack/pop2_cat2", 2, 2, vec![0x1e, 0x58, 0x03, 0xac]));
-    // dup2_x1 FORM-2, the `return this.doubleField = value;` shape:
-    // aload_0 / dload_1 / dup2_x1 / pop / pop2 / dreturn
-    // (`pop`/`pop2` stand in for the putfield so the case needs no constant
-    // pool, leaving the same stack shape behind.)
+    // dup2_x1 FORM-2, the `return this.doubleField = value;` shape, minus the
+    // putfield so the case needs no constant pool:
+    // aload_0 / dload_1 / dup2_x1 / dreturn
+    // Returning with operands still on the stack is legal and keeps the case to
+    // the one opcode under test — an earlier draft ended in `pop / pop2`, and
+    // it was the trailing `pop2` (whose width oracle cannot classify a `pop`)
+    // that recorded REFUSED, not the dup2_x1 the case is named for.
     c.push(Case::new(
         "stack/dup2_x1_cat2",
         3,
         4,
-        vec![0x2a, 0x18, 0x01, 0x5d, 0x57, 0x58, 0xaf],
+        vec![0x2a, 0x18, 0x01, 0x5d, 0xaf],
     ));
     // The chained-assignment shape `a = b = 0.0` — the second `dup2` follows a
     // STORE, which the width oracle can only classify via the dup-then-store
