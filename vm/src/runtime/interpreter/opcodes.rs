@@ -3466,6 +3466,28 @@ pub(super) fn execute_instruction(
                         // only after a cast has already failed, and the
                         // reclamation ring is bounded, so a match means the
                         // address really was freed recently.
+                        //
+                        // MIGRATED 2026-08-17. `memory::reclaim_guard`'s header
+                        // named this the "remaining un-migrated" copy of the
+                        // verdict, and the divergence had teeth: the shared
+                        // reporter asks the free-list question on ZGC (the
+                        // default collector) and consults ZGC's relocation
+                        // ledger, and this copy asked neither -- so the H2
+                        // `TestMultiThread` MVStore-writer failure, which
+                        // surfaces as `ClassCastException: java.math.BigDecimal
+                        // cannot be cast to org.h2.mvstore.Page` on a
+                        // COMPACTING heap, printed nothing at all. `_forced`
+                        // rather than the gated entry point for the reason the
+                        // comment above gives: the re-served face has a
+                        // non-zero class id, which is exactly what the gate
+                        // suppresses.
+                        crate::memory::reclaim_guard::report_reclaimed_receiver_forced(
+                            shared,
+                            obj_ref.as_ptr() as usize,
+                            "checkcast",
+                            &target_binary,
+                            shared.mem.heap.class_id_of(obj_ref).as_u32(),
+                        );
                         {
                             let addr = obj_ref.as_ptr() as usize;
                             if let Some((cid, kind, site, seq, fbase, fsize, fflags)) =
