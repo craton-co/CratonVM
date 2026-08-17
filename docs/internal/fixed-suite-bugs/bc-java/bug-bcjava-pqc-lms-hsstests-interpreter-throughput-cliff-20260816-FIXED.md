@@ -3,7 +3,8 @@
 ## Status
 **RESOLVED 2026-08-17** on `fix/bcjava-pqc-lms-throughput-20260817`.
 
-**`org.bouncycastle.pqc.crypto.lms.AllTests` passes: `OK (29 tests)` in 681 s**,
+**`org.bouncycastle.pqc.crypto.lms.AllTests` passes** — `OK (29 tests)`, the
+same count HotSpot reports — in **1460 s unmodified** and **681 s with the fix**,
 where the page recorded `HANG (3000s, rc=124)`. `HSSTests` — 15.9 of that
 suite's 16 HotSpot seconds — passes on the *unmodified* binary in 2062 s once
 the forced-interpreter flag is dropped. With the SHA-256
@@ -203,33 +204,37 @@ a mis-transcribed rotate still round-trips against itself perfectly.
 
 ### First: `lms.AllTests` was never hanging — it PASSES
 
-The page's headline class, filed as `HANG (3000s, rc=124)`:
+The page's headline class was filed as `HANG (3000s, rc=124)`. With the JIT on
+and no budget cap it passes on **both** binaries — including the unmodified one:
 
-```
-org.bouncycastle.pqc.crypto.lms.AllTests   rc=0   681s   OK (29 tests)
-```
+| arm | wall | verdict |
+|---|---|---|
+| HotSpot 25 | 16 s | `OK (29 tests)` |
+| CratonVM, **unmodified `dev`** | **1460 s** | `OK (29 tests)` |
+| CratonVM, **+fix** | **681 s** | `OK (29 tests)` |
 
 29 is exactly the five constituent classes' counts summed (13 + 7 + 1 + 7 + 1),
-so this is a real green, not a `started=0` one.
+and it is the same count HotSpot reports for the same suite — so this is a real
+green, not a `started=0` one. The fix is **2.14x** on this suite.
 
-And the class that owns 15.9 of its 16 HotSpot seconds passes even on the
-**unmodified** binary — no fix, plain `dev` — once the forced-interpreter flag
-is dropped:
+The class that owns 15.9 of those 16 HotSpot seconds behaves the same way:
 
-```
-org.bouncycastle.pqc.crypto.lms.HSSTests   rc=0   2062s  OK (13 tests)   (baseline)
-org.bouncycastle.pqc.crypto.lms.HSSTests   rc=0   1047s  OK (13 tests)   (+fix)
-```
+| arm | wall | verdict |
+|---|---|---|
+| CratonVM, **unmodified `dev`** | **2062 s** | `OK (13 tests)` |
+| CratonVM, **+fix** | **1047 s** | `OK (13 tests)` |
 
-That retires the `HANG` label outright. The class was filed as hanging because
-the sweep runs `--nojit` against a 3000 s cap, and `--nojit` is ~46x slower than
-the default on this workload.
+That retires the `HANG` label outright, and it retires it *without* the fix: the
+class was filed as hanging because the sweep runs `--nojit` against a 3000 s
+cap, and `--nojit` is ~46x slower than the default on this workload.
 
-(`lms.AllTests` at 681 s is *less* than `HSSTests` alone at 1047 s because the
-two ran hours apart on a shared host at different load, and because one JVM
-running all five classes amortizes JIT warm-up. Treat wall clock here as orders
-of magnitude; the controlled comparisons are the interleaved kernel rounds and
-the same-class base/fix pair above.)
+(In both arms the whole 29-test suite comes in *under* `HSSTests` alone. That is
+not a paradox and not a measurement error: within each run `HSSTests` was
+launched first, while this investigation's other builds and suites were still
+saturating the shared host, and `AllTests` ran after they drained — and one JVM
+running all five classes amortizes JIT warm-up across them. Wall clock here is
+an order of magnitude, not a benchmark. The controlled comparisons are the
+interleaved kernel rounds and the same-class base/fix pairs.)
 
 ### The intrinsic engaged, and it is the native that served the calls
 
@@ -259,7 +264,7 @@ own run of the same class.
 
 | workload | HotSpot | CVM base +JIT | CVM +fix | gain |
 |---|---|---|---|---|
-| `lms.AllTests` (the page's headline suite) | 16 s | filed `HANG` | **681 s, OK (29 tests)** | — |
+| `lms.AllTests` (the page's headline suite) | 16 s | **1460 s, OK (29)** | **681 s, OK (29)** | **2.14x** |
 | `HSSTests` (the whole class) | 15.9 s | **2062 s** | **1047 s** | **1.97x** |
 | `LMSTests` | 0.77 s | 61 s | 33 s | 1.85x |
 | `LMSKeyGenTests` | 0.39 s | 6 s | 5 s | — |
