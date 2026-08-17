@@ -817,6 +817,20 @@ pub(crate) fn maybe_gc(shared: &SharedVm, thread: &mut JvmThread) {
     // First, check if another thread requested STW — if so, participate
     safepoint_check(shared, thread);
 
+    // ZGC: open a CONCURRENT mark cycle once allocation crosses the start
+    // threshold, so the transitive closure is traced with the mutators
+    // running instead of inside the collection pause. Checked before
+    // `needs_gc` because the two are mutually exclusive by construction:
+    // `should_start_concurrent_mark` refuses at or above the collection
+    // threshold, where a cycle would get no concurrent phase at all.
+    //
+    // Costs one `match` and two relaxed loads per allocation that reaches
+    // here, and exactly that on the other two backends (their arm is a
+    // compile-time `false`).
+    if shared.mem.heap.zgc_should_start_concurrent_mark() {
+        zgc_concurrent_mark_cycle(shared, thread);
+    }
+
     if shared.mem.heap.needs_gc()
         || shared
             .mem
@@ -1195,6 +1209,16 @@ pub(super) fn self_call_identity_stable(shared: &SharedVm, class_id: ClassId) ->
 
 pub fn maybe_gc_forced_pub(shared: &SharedVm, thread: &mut JvmThread) {
     maybe_gc_forced(shared, thread);
+}
+
+/// `zgc_concurrent_mark_cycle` for the JIT allocation helpers.
+///
+/// Same reason `maybe_gc_forced_pub` exists: `vm/src/jit/helpers.rs` is a
+/// sibling module and the cycle opener is `pub(super)`. See
+/// `jit_maybe_start_zgc_concurrent_mark` for why the JIT needs its own call
+/// site at all -- a fully compiled allocation loop reaches `maybe_gc` never.
+pub fn zgc_concurrent_mark_cycle_pub(shared: &SharedVm, thread: &mut JvmThread) {
+    zgc_concurrent_mark_cycle(shared, thread);
 }
 
 /// Allocate a dynamically-produced `java.lang.String` under the SAME
@@ -2354,6 +2378,38 @@ pub(super) fn process_references_after_gc(
         }
     };
 
+    // THE IDENTITY STAMP -- the exact test the two shape guards above
+    // approximate. See `ReferenceProcessor::identity_stamps`: a shape guard
+    // cannot tell a reclaimed `Reference` whose address was re-issued to
+    // ANOTHER `Reference` from the entry it recorded, and H2 allocates a
+    // `CloseWatcher` (a `PhantomReference`) per connection, so that case is the
+    // common one rather than the exotic one. The stamp is the identity hash the
+    // object carried at `discover_reference` time; it lives in the object's own
+    // mark word and travels with it across a relocation.
+    //
+    // `pre_gc_addr` is the key the processor's table is still on at this point
+    // (`update_after_gc` runs at the very end of this function), `obj` is the
+    // post-relocation object the write would land on.
+    //
+    // Both `0` cases mean "cannot tell" and fall through to the shape guards
+    // rather than declining: an unstamped entry (every in-tree test constructs
+    // those) and a thin-locked object, whose hash is displaced out of the mark
+    // word, must not lose their reference processing.
+    //
+    // Snapshotted rather than read through `ref_proc`: the loops below drain
+    // the processor (`take_newly_cleared`, `remove_collected`), so a live
+    // borrow of it here would not compile.
+    let identity_stamps = ref_proc.identity_stamps_snapshot();
+    let identity_matches = |pre_gc_addr: usize, obj: ObjectRef| -> bool {
+        match identity_stamps.get(&pre_gc_addr) {
+            Some(&stamp) if stamp != 0 => {
+                let now = shared.mem.heap.identity_hash_code(obj);
+                now == 0 || now == stamp
+            }
+            _ => true,
+        }
+    };
+
     // Null referent field (field 0) on cleared weak/soft references.
     // ROOT-CAUSE FIX (2026-06-10): once-only emission — the legacy
     // `cleared_ref_objects()` re-emitted every ever-cleared Reference on
@@ -2410,6 +2466,15 @@ pub(super) fn process_references_after_gc(
         if !is_reference_shaped(obj_ref) {
             if straystack_enabled() {
                 eprintln!("[refproc] SKIP reshaped CLEARED ref @0x{actual_addr:x} (not a Reference)");
+            }
+            continue;
+        }
+        // Shape-clean but a DIFFERENT `Reference` -- see `identity_matches`.
+        if !identity_matches(ref_addr, obj_ref) {
+            if straystack_enabled() {
+                eprintln!(
+                    "[refproc] SKIP reidentified CLEARED ref @0x{actual_addr:x} (identity stamp mismatch)"
+                );
             }
             continue;
         }
@@ -2485,6 +2550,19 @@ pub(super) fn process_references_after_gc(
             if straystack_enabled() {
                 eprintln!(
                     "[refproc] SKIP reshaped ENQUEUE ref @0x{actual_ref:x} into q@0x{actual_q:x} (not Reference/ReferenceQueue)"
+                );
+            }
+            continue;
+        }
+        // The loop that published a re-issued object as a queue head: a
+        // same-class re-issue is shape-clean here, and linking one into a queue
+        // hands it to `ReferenceQueue.poll()` as if it were the reference that
+        // died. Only the Reference is stamped -- a `ReferenceQueue` is not
+        // discovered through this registry, so it has no stamp to check.
+        if !identity_matches(*ref_addr, ref_obj) {
+            if straystack_enabled() {
+                eprintln!(
+                    "[refproc] SKIP reidentified ENQUEUE ref @0x{actual_ref:x} into q@0x{actual_q:x} (identity stamp mismatch)"
                 );
             }
             continue;
@@ -2668,6 +2746,18 @@ pub(super) fn process_references_after_gc(
                         "[refproc] SKIP stale weak/phantom RESTORE ref @0x{:x} (num_fields={})",
                         ref_obj_new,
                         shared.mem.heap.num_fields(ro),
+                    );
+                }
+                continue;
+            }
+            // This pass writes an OBJECT into slot 0, not a null, so a
+            // shape-clean re-issue here installs an unrelated reference in a
+            // live object's first field -- the `java.lang.String` receiver
+            // shape the H2 `TestMultiThread` MVStore-writer report opens with.
+            if !identity_matches(ref_obj_old, ro) {
+                if straystack_enabled() {
+                    eprintln!(
+                        "[refproc] SKIP reidentified weak/phantom RESTORE ref @0x{ref_obj_new:x} (identity stamp mismatch)"
                     );
                 }
                 continue;
@@ -4714,6 +4804,8 @@ pub(crate) fn apply_pointer_map_to_thread(
             pointer_map.len()
         );
     }
+    // See `JvmThread::last_heal_collection`.
+    thread.last_heal_collection = heap.collection_count();
     for frame in &mut thread.frames {
         frame.update_local_refs(pointer_map, heap);
         frame.stack.update_object_refs(pointer_map, heap);
@@ -4743,12 +4835,39 @@ pub(crate) fn apply_pointer_map_to_thread(
     }
     // DIAGNOSTIC-ONLY (cceres3): mirror of the wake-time WAKE-STALE verifier;
     // catches a frame slot left stale right after a safepoint-arrival remap.
+    //
+    // THE PREDICATE IS THE POINTER MAP, NOT THE FORWARDING WORD (2026-08-17).
+    // `debug_forwarded_target` reads a forwarding word at the old address, and
+    // ZGC's slide leaves none — `compact_low_to` zeroes what it vacated and the
+    // memmove overwrites the rest — so on the DEFAULT collector this verifier
+    // reported zero whatever the truth was, which is how it stayed silent while
+    // the H2 MVStore-writer residual reproduced under it. `pointer_map` is the
+    // authoritative record of this collection's moves and is right here in
+    // hand.
+    //
+    // This is also the only EXACT place to ask the question. Every address-keyed
+    // instrument outside the pause cannot tell an old reference to the moved
+    // object from a new reference to whatever the allocator has since put at
+    // that address; here, the remap has just run and no mutator on this thread
+    // has resumed, so a frame slot holding a map KEY is unambiguously a slot the
+    // remap did not reach.
     if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_BLOCKGC").is_some() {
+        // A source address this slide also wrote a SURVIVOR to is not evidence:
+        // survivors slide down into the space vacated objects left, so a slot
+        // legitimately holding that survivor names an address that is also a
+        // map key. Excluding destinations is what separates "the remap missed
+        // this slot" from "this slot holds the object that moved INTO the
+        // address" — the same distinction that made the first vacated-frames
+        // instrument report eight findings a run that were all correct code.
+        let destinations: rustc_hash::FxHashSet<usize> = pointer_map.values().copied().collect();
         for (fi, fr) in thread.frames.iter().enumerate() {
             for li in 0..fr.locals_len() {
                 if let Value::Object(Some(o)) = fr.get_local(li as u16) {
                     let a = o.as_ptr() as usize;
-                    if let Some(new) = heap.debug_forwarded_target(a) {
+                    if destinations.contains(&a) {
+                        continue;
+                    }
+                    if let Some(new) = pointer_map.get(&a).copied() {
                         eprintln!(
                             "[blockgc] ARRIVE-STALE tid={} frame#{fi} {}.{} pc={} local[{li}] 0x{a:x}->0x{new:x} in_map={}",
                             thread.thread_id.0, fr.class_name(), fr.method_name(), fr.pc,
@@ -4760,7 +4879,10 @@ pub(crate) fn apply_pointer_map_to_thread(
             for si in 0..fr.stack.len() {
                 if let Value::Object(Some(o)) = fr.stack.peek_at(si) {
                     let a = o.as_ptr() as usize;
-                    if let Some(new) = heap.debug_forwarded_target(a) {
+                    if destinations.contains(&a) {
+                        continue;
+                    }
+                    if let Some(new) = pointer_map.get(&a).copied() {
                         eprintln!(
                             "[blockgc] ARRIVE-STALE tid={} frame#{fi} {}.{} pc={} stack[{si}] 0x{a:x}->0x{new:x} in_map={}",
                             thread.thread_id.0, fr.class_name(), fr.method_name(), fr.pc,
@@ -5242,6 +5364,100 @@ pub(super) fn maybe_concurrent_gc(shared: &SharedVm, thread: &mut JvmThread) {
 // ---------------------------------------------------------------------------
 // G1 concurrent marking cycle
 // ---------------------------------------------------------------------------
+
+/// Phase 1 of a ZGC concurrent cycle: **mark start**, at a brief STW pause.
+///
+/// Opens the cycle and returns. The transitive closure is then traced by
+/// `ZMarkCoordinator`'s worker threads while every mutator in this VM runs;
+/// the cycle is closed inside the next `collect_garbage`, which replays the
+/// SATB ingress, re-scans the roots, and only then sweeps.
+///
+/// # Why this is shaped exactly like `g1_concurrent_mark_cycle`
+///
+/// Because the constraint is the VM's, not the collector's: a stop-the-world
+/// pause in this VM can only be initiated by a thread that is in the thread
+/// registry, holds a `JvmThread`, and can drive `stw_take_over_and_wait` for
+/// in-JIT peers. A GC background thread is none of those. So the two phase
+/// boundaries a concurrent collector needs — mark start and mark end — are
+/// both taken by mutators, and the collector's own threads do only the part
+/// that needs no safepoint: the tracing.
+///
+/// The open-coded `request → takeover-wait → work → complete` (rather than
+/// `brief_stw_counted_with_live_blocked`) is INT-3's residual fix, copied
+/// deliberately: that helper's internal plain `wait_for_all()` stalls forever
+/// on a peer spinning in compiled code, and its root set covers such a peer
+/// only through a STALE deposit snapshot. A missed root here is an object the
+/// concurrent phase never traces.
+///
+/// Mark-only pause: nothing moves, so there is no pointer map, no pin set and
+/// no root rewrite — the frozen peers' conservative roots are simply extra
+/// mark roots.
+pub(super) fn zgc_concurrent_mark_cycle(shared: &SharedVm, thread: &mut JvmThread) {
+    let mut counted_os_tids: Vec<u32> = Vec::new();
+    let stw_taken = shared
+        .mem
+        .gc_barrier
+        .request_stw_counted_with_live_blocked(thread.thread_id, || {
+            let (n, blocked, tids, blocked_tids) = shared
+                .threads
+                .thread_registry
+                .alive_count_blocked_and_os_tids();
+            counted_os_tids = tids;
+            (
+                u32::try_from(n).unwrap_or(u32::MAX),
+                u32::try_from(blocked).unwrap_or(u32::MAX),
+                blocked_tids,
+            )
+        });
+    if !stw_taken {
+        // Another STW is in progress. Nothing has been done, so there is
+        // nothing to unwind: the next allocation re-tests the threshold and
+        // re-opens the cycle. If that other STW is a collection, the threshold
+        // will have dropped and the cycle correctly does not open.
+        return;
+    }
+    {
+        let mut xt_roots: Vec<ObjectRef> = Vec::new();
+        let taken = stw_take_over_and_wait(shared, &mut xt_roots, &counted_os_tids);
+
+        // SAFETY: `stw_take_over_and_wait` above has parked every other mutator
+        // at a safepoint (or forcibly stopped and conservatively scanned it),
+        // and `taken` is still held, so this thread is the only mutator for the
+        // whole block below.
+        let stw = unsafe { cratonvm_gc::collector::StopTheWorldToken::new() };
+
+        let roots =
+            cratonvm_gc::gc_quiescence::with_class_unload_marking(|| collect_roots(shared, thread));
+        let snapshot_roots = shared.threads.thread_registry.collect_all_root_snapshots();
+        let all_roots: Vec<ObjectRef> = roots
+            .into_iter()
+            .chain(snapshot_roots.into_iter())
+            // INT-3 — frozen in-JIT peers' conservative register/stack roots.
+            .chain(xt_roots.into_iter())
+            .collect();
+
+        let opened = shared
+            .mem
+            .heap
+            .zgc_start_concurrent_mark(&stw, &all_roots);
+
+        // Clear TLAB skip regions + resume frozen peers BEFORE reopening the
+        // world — same race rationale as `maybe_gc`'s epilogue.
+        shared.mem.heap.clear_jit_tlab_skip_regions();
+        crate::jit::xt_root_scan::resume(taken);
+        shared
+            .mem
+            .gc_barrier
+            .complete_gc(cratonvm_types::PointerMap::default());
+
+        if opened {
+            tracing::debug!(
+                "[ZGC] concurrent mark started: {} roots seeded",
+                all_roots.len()
+            );
+        }
+    }
+}
 
 /// Execute a full G1 concurrent marking cycle:
 /// 1. Initial Mark (brief STW) — mark roots, activate SATB

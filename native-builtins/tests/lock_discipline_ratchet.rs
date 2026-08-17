@@ -42,12 +42,48 @@
 //! the four raw locks that had landed since the last freeze. Each met the same
 //! standard: every acquisition site read, no `ctx` call under the guard.
 //!
+//! Twenty-four more on 2026-08-17, all at `LockLevel::Scratch`, paying back the
+//! twenty-four raw locks that had landed since the 2026-08-11 freeze (`dev` was
+//! red at 456). They were found by blaming every raw-lock site and taking the
+//! ones newer than that freeze, which is also why they cluster: five JFR tables
+//! in `src/jfr.rs`, eleven TLS side-tables in `src/t27_tls.rs`, and one each in
+//! `src/tls.rs`, `src/jca/signature.rs` (two), `src/http_url_connection.rs`,
+//! `src/phases_late/ssl_security.rs`, `src/locale_bootstrap.rs`,
+//! `src/locale_resources.rs` and `src/phases_early.rs`.
+//!
+//! Sixteen already met the standard as written. The other eight did not, and
+//! were made to — which is the part worth reading, because each was a real
+//! lock-held-across-a-VM-re-entry, not a bookkeeping detail:
+//!
+//! * Five evaluated `ctx.identity_hash_code` (via `gc_stable_objref_key` /
+//!   `engine_objref_key` / `sig_key`) *inside* the lock expression, e.g.
+//!   `table().lock().insert(gc_stable_objref_key(ctx, ses), sid)`. The key is
+//!   idempotent, so hoisting it to a `let` above the acquisition is
+//!   behaviour-preserving and takes the `ctx` call out from under the guard.
+//! * Three held a guard across a body that re-enters the VM, because in edition
+//!   2021 an `if let` / `match` scrutinee's temporaries live for the whole
+//!   construct: `client_session_cache` across `touch_session_access_time`,
+//!   `kmf_live_km_id_by_identity` across a field walk, and `https_peer_info`
+//!   across `throw_jca_exc`. Each now binds the (copied or cloned) row to a
+//!   local first, so the guard drops before the body runs.
+//!
 //! Not converted, and worth naming so the next person does not re-derive it:
 //! `boot_layer_memo` (`src/jboss_jdkspecific.rs`) and `p60_current_handle_memo`
 //! (`src/phases_late.rs`) both hold their guard across `ctx.add_global_root`,
 //! which is exactly the re-entrant shape a level is supposed to forbid. They
 //! need the publish restructured before a level can honestly be stamped on
 //! them, so they stay in the §A6 backlog rather than being given one.
+//!
+//! Joined on 2026-08-17 by `java_recordings` and `java_event_streams`
+//! (`src/jfr.rs`), for a harder version of the same reason: both hold their
+//! guard across a `ctx.resolve_global_root` that runs *per element*, inside an
+//! `iter().position(..)` predicate over the table itself. That cannot be
+//! hoisted the way the eight above were — it needs the lookup restructured — so
+//! they keep no level, and the two JFR tables that ARE taken under their guard
+//! (`java_events_admitted`, `java_events_known_disabled`) say so in their own
+//! comments. Those two are only safely `Scratch` *because* the enclosing lock
+//! is unordered; if `java_recordings` is ever given a level, it must be a
+//! higher one than theirs, not an equal one.
 //!
 //! ## Why this gate ratchets instead of converting
 //!
@@ -89,6 +125,12 @@ use std::path::{Path, PathBuf};
 /// and the change removes no lock construction at all. Recorded here rather than
 /// silently adjusted, because a baseline moved by someone other than the author
 /// of the improvement is the bookkeeping this ratchet exists to keep honest.
+///
+/// Held at 432 again on 2026-08-17 while converting twenty-four locks, for the
+/// same reason as the 2026-08-11 entry below: `dev` had gone red at 456, and
+/// the twenty-four conversions pay that regression back exactly. No lock has
+/// been retired below the frozen figure, so lowering the number would overstate
+/// what was won.
 ///
 /// Held at 432 on 2026-08-11 while converting one lock. `jar_manifest`'s
 /// `mtime_memo` landed as a raw `Mutex` on 2026-08-10 (14f3eb6e0) and took the

@@ -395,10 +395,80 @@ static JDK_ONLY_NATIVE_SHADOW_UNENFORCED: std::sync::atomic::AtomicU64 =
 /// [`cratonvm_native_api::NativeKind`] spelling — the kind is always `Bridge`
 /// here, and what the row has to say is that this one DISPATCHED in front of
 /// real bytes. Same convention as the JIT's `"jit-thin-direct-helper"`.
-pub const JDK_ONLY_SHADOW_UNENFORCED_TAG: &str = "bridge-ran-over-bytecode";
+///
+/// **Now an alias**, not a definition. The tag is the discriminator between the
+/// two opposite outcomes a `NativeShadowsBytecode` row can carry, and `types` is
+/// the crate that writes those rows' `summary`, `reason` and JSON — so `types`
+/// owns the spelling and both sides cannot drift. See
+/// [`cratonvm_types::error::NATIVE_SHADOW_RAN_TAG`], which records what the split
+/// spelling cost the first time somebody read the report without it.
+pub const JDK_ONLY_SHADOW_UNENFORCED_TAG: &str =
+    cratonvm_types::error::NATIVE_SHADOW_RAN_TAG;
 
-/// Maximum number of distinct structured observations retained.
+/// Maximum number of distinct structured observations retained, by default.
+///
+/// Read through [`jdk_only_native_shadow_cap`], never directly: an operator can
+/// raise it, and a site that reads this constant would report the default while
+/// the sink obeyed something else.
 pub const JDK_ONLY_NATIVE_SHADOW_CAP: usize = 256;
+
+/// Ceiling on the operator override below. 65,536 distinct triples is more than
+/// twice the whole registry, so it cannot be reached by a real workload — it is
+/// there so a mistyped value cannot turn a diagnostic sink into a memory leak.
+const JDK_ONLY_NATIVE_SHADOW_CAP_MAX: usize = 65_536;
+
+/// The cap this process is actually using.
+///
+/// # Why this is an override and not a bigger constant
+///
+/// 256 is right for the workload the sink was designed against — a probe or a
+/// regression vector, where the population fits and the list is the answer. It
+/// is **not enough for an application**, and that is measured rather than
+/// argued: embedded Tomcat booting, serving one GET and one 404, and shutting
+/// down under `--jdk-only` saturates it, with 188 distinct `native-won` triples
+/// recorded before the sink stopped learning — against 58 for the reflection
+/// vector G60-1 §1 counted. So the record's §5 N3 ("run this report against an
+/// application, not a vector") cannot be *completed* at 256: the answer arrives
+/// truncated, and narrowing the workload until it fits is the opposite of what
+/// N3 asks for.
+///
+/// Raising the default instead was the alternative and is worse. The cap bounds
+/// a process-global `Vec` that every strict dispatch can push to, on a VM whose
+/// contract §2 forbids new process globals for compatibility state and whose
+/// existing two are already logged as violations to remove. A default nobody
+/// asked for that costs every strict run more memory is a change to the shipping
+/// configuration; an override is a change to the instrument.
+///
+/// Read once, at the first observation. `CRATONVM_NATIVE_SHADOW_SINK_CAP=0`, a
+/// non-numeric value, or anything above
+/// [`JDK_ONLY_NATIVE_SHADOW_CAP_MAX`] leaves the default in place — a
+/// diagnostic must never be the thing that fails, and a cap of zero would
+/// silently report an empty population as a complete one, which is the exact
+/// failure this whole area exists to remove.
+///
+/// **The filter is deliberately NOT resized with it.**
+/// [`JDK_ONLY_NATIVE_SHADOW_FILTER_SLOTS`] stays 512, so above that the filter
+/// stops absorbing most repeats and each new triple costs one extra mutex
+/// acquisition on a cold path. That is a throughput cost on a census run, paid
+/// only by a run that asked for a bigger sink, and `Vec::contains` keeps the
+/// buffer correct regardless — the filter's own doc says correctness never
+/// depends on it.
+pub fn jdk_only_native_shadow_cap() -> usize {
+    static CAP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *CAP.get_or_init(|| {
+        // `runtime_var`, not `std::env::var`: the flag is DECLARED
+        // (`flag_groups::INVENTORY`, `CRATONVM_DBG=native-shadow-sink-cap`), and a
+        // declared name read through bare `getenv` comes from a different source
+        // than the latched snapshot every other knob is served from ---
+        // `types/tests/flag_declaration_guard.rs` documents that split, and it is
+        // the reason an undeclared read site is a defect rather than untidiness.
+        cratonvm_types::flags::runtime_var("CRATONVM_NATIVE_SHADOW_SINK_CAP")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .filter(|n| *n > 0 && *n <= JDK_ONLY_NATIVE_SHADOW_CAP_MAX)
+            .unwrap_or(JDK_ONLY_NATIVE_SHADOW_CAP)
+    })
+}
 
 /// Slots in the lock-free "already recorded" filter. A power of two so the
 /// index is a mask, and larger than the cap so a saturated buffer still
@@ -471,6 +541,44 @@ pub fn jdk_only_native_shadow_attempts() -> u64 {
 /// counters never describe the same event twice.
 pub fn jdk_only_native_shadow_unenforced() -> u64 {
     JDK_ONLY_NATIVE_SHADOW_UNENFORCED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Did the bounded observation sink SATURATE -- i.e. was at least one distinct
+/// observation dropped for want of room?
+///
+/// The one question `--jdk-only-report`'s violation list could not answer about
+/// itself. `violations[]` is one row per distinct triple, capped at
+/// [`JDK_ONLY_NATIVE_SHADOW_CAP`], and a truncated list is identical in SHAPE to
+/// a complete one -- so a reader who took the list as the population got a floor
+/// and could not tell. G60-1 §4 states the hazard exactly: *a saturated buffer
+/// looks exactly like a complete one from the JSON*.
+///
+/// **Not `recorded.len() == CAP`.** That test is wrong in the one place it
+/// matters: a run whose last distinct observation is the 256th fills the buffer
+/// exactly and drops nothing, and would be reported truncated. The flag below is
+/// set by [`offer_native_shadow_observation`] only when an offer arrives and
+/// finds no room, so it means "something WAS dropped", which is the fact a
+/// reader needs. Reading it costs one relaxed load and is never hot.
+///
+/// Once it is true the sink teaches nothing further and
+/// [`jdk_only_shadow_already_observed`] answers `true` for every triple, which
+/// is also what freezes [`jdk_only_native_shadow_unenforced`] -- so this flag is
+/// simultaneously the "the list is a floor" and the "the counter is a floor"
+/// signal. Both facts, one bit.
+pub fn jdk_only_native_shadow_sink_saturated() -> bool {
+    JDK_ONLY_NATIVE_SHADOW_FULL.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// How many distinct observations the sink is holding right now.
+///
+/// The denominator for [`jdk_only_native_shadow_sink_saturated`], and cheaper
+/// than [`jdk_only_native_shadow_observations`] for a caller that only wants the
+/// count: it clones nothing. Both recorders share this one sink -- the
+/// bytecode-won rows and the `bridge-ran-over-bytecode` rows -- so this is the
+/// number to compare against [`JDK_ONLY_NATIVE_SHADOW_CAP`], not the count of
+/// either kind on its own.
+pub fn jdk_only_native_shadow_sink_len() -> usize {
+    jdk_only_native_shadows().lock().len()
 }
 
 /// Has this triple already been offered to the observation buffer?
@@ -560,7 +668,7 @@ fn offer_native_shadow_observation(
         native_kind: kind_tag,
     };
     let mut recorded = jdk_only_native_shadows().lock();
-    if recorded.len() >= JDK_ONLY_NATIVE_SHADOW_CAP {
+    if recorded.len() >= jdk_only_native_shadow_cap() {
         JDK_ONLY_NATIVE_SHADOW_FULL.store(true, Ordering::Relaxed);
         return;
     }
@@ -2144,6 +2252,65 @@ fn varhandle_reference_return_mismatch(
     Some(actual)
 }
 
+/// The descriptors a signature-polymorphic `MethodHandle` / `VarHandle`
+/// native is actually registered under.
+///
+/// A polymorphic call site names its OWN descriptor (`(LFoo;)I`), which is
+/// never the registration descriptor, so a registry lookup by the call-site
+/// triple always misses. The dispatch tail below re-probes with these three,
+/// in this order, and so does the JIT's per-call-site native cache
+/// (`jit::helpers::resolve_native_owner_for_receiver`) — the constant is
+/// shared so the two cannot drift.
+pub(crate) const SIGNATURE_POLYMORPHIC_NATIVE_DESCRIPTORS: [&str; 3] = [
+    "([Ljava/lang/Object;)Ljava/lang/Object;",
+    "([Ljava/lang/Object;)V",
+    "([Ljava/lang/Object;)Z",
+];
+
+/// Is this one of the method names JVMS §5.4.3.4's signature-polymorphic rule
+/// covers? Extracted from the dispatch tail below so the JIT site cache asks
+/// exactly the same question.
+pub(crate) fn is_signature_polymorphic_method_name(method_name: &str) -> bool {
+    matches!(
+        method_name,
+        "invoke"
+            | "invokeExact"
+            | "invokeWithArguments"
+            | "invokeBasic"
+            | "get"
+            | "set"
+            | "getVolatile"
+            | "setVolatile"
+            | "getOpaque"
+            | "setOpaque"
+            | "getAcquire"
+            | "setRelease"
+            | "compareAndSet"
+            | "compareAndExchange"
+            | "compareAndExchangeAcquire"
+            | "compareAndExchangeRelease"
+            | "weakCompareAndSet"
+            | "weakCompareAndSetPlain"
+            | "weakCompareAndSetAcquire"
+            | "weakCompareAndSetRelease"
+            | "getAndSet"
+            | "getAndSetAcquire"
+            | "getAndSetRelease"
+            | "getAndAdd"
+            | "getAndAddAcquire"
+            | "getAndAddRelease"
+            | "getAndBitwiseOr"
+            | "getAndBitwiseOrAcquire"
+            | "getAndBitwiseOrRelease"
+            | "getAndBitwiseAnd"
+            | "getAndBitwiseAndAcquire"
+            | "getAndBitwiseAndRelease"
+            | "getAndBitwiseXor"
+            | "getAndBitwiseXorAcquire"
+            | "getAndBitwiseXorRelease"
+    )
+}
+
 fn is_method_handle_signature_polymorphic_receiver(class_name: &str) -> bool {
     class_name == "java/lang/invoke/MethodHandle"
         || class_name.starts_with("java/lang/invoke/MethodHandle")
@@ -2151,7 +2318,7 @@ fn is_method_handle_signature_polymorphic_receiver(class_name: &str) -> bool {
         || class_name == "java/lang/foreign/DowncallHandle"
 }
 
-fn is_var_handle_signature_polymorphic_receiver(class_name: &str) -> bool {
+pub(crate) fn is_var_handle_signature_polymorphic_receiver(class_name: &str) -> bool {
     class_name == "java/lang/invoke/VarHandle"
         || class_name.starts_with("java/lang/invoke/VarHandle")
         || (class_name.starts_with("java/lang/invoke/") && class_name.contains("VarHandle"))
@@ -2590,6 +2757,27 @@ struct NativeDiagState {
     ring_idx: Option<usize>,
     /// Whether the straystack thread-local was pushed and must be popped.
     straystack_pushed: bool,
+}
+
+/// Forward one `Value` crossing the native-API boundary through the read
+/// barrier.
+///
+/// Natives hold `ObjectRef`s in Rust locals, which are in no root set, across
+/// operations that can collect — that is precisely why every entry point of
+/// this API already forwards its RECEIVER. The VALUES they hand back were not
+/// forwarded, so a native that read an object before a callback and stored it
+/// afterwards wrote a stale pointer straight into the heap, where the next
+/// reader `checkcast`s it and gets whatever now occupies the address.
+///
+/// Cheap and confined: this is the native boundary, not the interpreter's
+/// `putfield`, and the barrier short-circuits on anything that is not a moved
+/// object.
+#[inline]
+fn forward_boundary_value(heap: &crate::memory::VmHeap, value: Value) -> Value {
+    match value {
+        Value::Object(Some(obj)) => Value::Object(Some(heap.load_and_forward(obj))),
+        other => other,
+    }
 }
 
 pub fn safe_native_call(
@@ -3237,28 +3425,27 @@ fn safe_native_call_impl(
     // the early returns below it. A native that opened a blocking region and
     // came back is left in whatever `end_blocking_region` recorded until this
     // guard restores the caller's state — both are tabled edges.
-    struct NativeStateGuard(ThreadExecState);
+    //
+    // ONE thread-local access for the pair, not three. This was
+    // `current_state()` + `record_transition(NativeRunning)` + a `Drop` that
+    // recorded the prior state, and `native_funnel_profile::funnel_cost_
+    // breakdown` prices that trio at 10.8-14.4 ns of a 29-36 ns funnel — the
+    // largest single component, with `current_state()` alone at 0.9 ns, which
+    // is what says the cost was the repetition rather than the read.
+    // `NativeStateSpan` takes the cell once and restores through a raw pointer;
+    // the `Starting` correction the old code did here moved into
+    // `enter_native_state`, where every caller gets it.
+    struct NativeStateGuard(Option<thread_state::NativeStateSpan>);
     impl Drop for NativeStateGuard {
         fn drop(&mut self) {
-            thread_state::record_transition(self.0, "vm_exec::safe_native_call_impl:return");
+            if let Some(span) = self.0.take() {
+                span.restore("vm_exec::safe_native_call_impl:return");
+            }
         }
     }
-    let _native_state_guard = NativeStateGuard(match thread_state::current_state() {
-        // `Starting` is ALSO the recorder's answer for a thread it has never
-        // observed (`current_state`'s doc), and this funnel is often the first
-        // thing a carrier records. Restoring it would assert the one thing the
-        // table says cannot be true of a thread that just ran a native
-        // (`Starting -> NativeRunning` is deliberately absent), and would then
-        // repeat on that thread's every later native call. Resume as
-        // `JavaRunning`: the state such a thread demonstrably reached, and the
-        // tabled return edge from a native.
-        ThreadExecState::Starting => ThreadExecState::JavaRunning,
-        prior => prior,
-    });
-    thread_state::record_transition(
-        ThreadExecState::NativeRunning,
+    let _native_state_guard = NativeStateGuard(Some(thread_state::enter_native_state(
         "vm_exec::safe_native_call_impl",
-    );
+    )));
 
     let result = {
         // Heap-exhaustion unwind permission. The callback below runs directly
@@ -6397,6 +6584,8 @@ impl<'a> NativeContextImpl<'a> {
             crate::native::jni::update_local_refs_after_gc(&fixup);
         }
 
+        // See `JvmThread::last_heal_collection`.
+        self.thread.last_heal_collection = self.shared.mem.heap.collection_count();
         // cceres3 FIX: exact per-slot write-back for the blocked window.
         // Runs after the chain application above — any slot the chain already
         // healed reads back != orig and is skipped; any slot the chain MISSED
@@ -6465,12 +6654,19 @@ impl<'a> NativeContextImpl<'a> {
         // the wake-time fixup application — catches both "chain key missing"
         // (was_key=false) and "frame held an intermediate address" desyncs at
         // the exact wake where they surface.
+        // Predicate: the FIXUP CHAIN's keys, not a forwarding word. Same
+        // correction as the arrival-site ARRIVE-STALE verifier — the forwarding
+        // word does not exist on the default collector (ZGC's slide leaves
+        // none), so this reported zero whatever the truth was. The chain's keys
+        // are exactly the pre-move addresses this thread slept through, and the
+        // write-back above has just run, so a frame slot still holding one is a
+        // slot the write-back did not reach.
         if blockgc_dbg() {
             for (fi, fr) in self.thread.frames.iter().enumerate() {
                 for li in 0..fr.locals_len() {
                     if let Value::Object(Some(o)) = fr.get_local(li as u16) {
                         let a = o.as_ptr() as usize;
-                        if let Some(new) = self.shared.mem.heap.debug_forwarded_target(a) {
+                        if let Some(new) = fixup.get(&a).copied() {
                             eprintln!(
                                 "[blockgc] WAKE-STALE tid={} frame#{fi} {}.{} pc={} local[{li}] 0x{a:x}->0x{new:x} was_key={} was_val={} fixup_len={}",
                                 self.thread.thread_id.0, fr.class_name(), fr.method_name(), fr.pc,
@@ -6484,7 +6680,7 @@ impl<'a> NativeContextImpl<'a> {
                 for si in 0..fr.stack.len() {
                     if let Value::Object(Some(o)) = fr.stack.peek_at(si) {
                         let a = o.as_ptr() as usize;
-                        if let Some(new) = self.shared.mem.heap.debug_forwarded_target(a) {
+                        if let Some(new) = fixup.get(&a).copied() {
                             eprintln!(
                                 "[blockgc] WAKE-STALE tid={} frame#{fi} {}.{} pc={} stack[{si}] 0x{a:x}->0x{new:x} was_key={} was_val={} fixup_len={}",
                                 self.thread.thread_id.0, fr.class_name(), fr.method_name(), fr.pc,
@@ -11443,6 +11639,7 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
 
     fn set_field(&self, obj: ObjectRef, index: usize, value: Value) {
         let obj = self.shared.mem.heap.load_and_forward(obj);
+        let value = forward_boundary_value(&self.shared.mem.heap, value);
         // DIAGNOSTIC-ONLY (cce0079 tree-key tail): decisive probe - capture
         // the minor-GC epoch at entry and compare at exit. A delta proves a
         // GC completed INSIDE a plain ref store (and names the stack);
@@ -11574,6 +11771,7 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
 
     fn set_field_by_name(&self, obj: ObjectRef, field_name: &str, value: Value) {
         let obj = self.shared.mem.heap.load_and_forward(obj);
+        let value = forward_boundary_value(&self.shared.mem.heap, value);
         let class_id = self.shared.mem.heap.class_id_of(obj);
         let cm = self.shared.classes.class_manager.read();
         if let Some(index) = resolve_field_index_in_hierarchy(class_id, field_name, &cm.class_store)
@@ -11847,6 +12045,7 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
     /// already suppressed by the time we see the result.
     fn set_array_element(&self, obj: ObjectRef, index: usize, value: Value) {
         let obj = self.shared.mem.heap.load_and_forward(obj);
+        let value = forward_boundary_value(&self.shared.mem.heap, value);
         // Deliberate discard: `NativeContext::set_array_element` is `-> ()`
         // and its contract is "no-op or VM error, never an out-of-bounds heap
         // write". The caller range-checks; `native-builtins`'s
@@ -11970,6 +12169,90 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
             }
         }
         n
+    }
+
+    fn read_int_array_into(&self, arr: ObjectRef, src_off: usize, dst: &mut [i32]) -> usize {
+        if self.shared.mem.heap.kind_of(arr) != ObjectKind::Array {
+            return 0;
+        }
+        if self.shared.mem.heap.element_type_of(arr) != ArrayElementType::Int {
+            return 0;
+        }
+        let len = self.shared.mem.heap.array_length(arr);
+        if src_off > len {
+            return 0;
+        }
+        let available = len - src_off;
+        let n = available.min(dst.len());
+        if n == 0 {
+            return 0;
+        }
+        // SAFETY: bounds checked above. Int arrays are a flat 4-bytes-per-element
+        // payload (`element_byte_size`), so `n * 4` bytes from `base + src_off*4`
+        // is exactly elements `src_off..src_off+n`, in host order — the same
+        // convention the char twin above relies on. `dst` is caller-owned and
+        // cannot alias the heap arena.
+        match self.shared.mem.heap.array_data_ptr(arr) {
+            Some(base) => unsafe {
+                std::ptr::copy_nonoverlapping(
+                    base.add(src_off * 4),
+                    dst.as_mut_ptr() as *mut u8,
+                    n * 4,
+                );
+            },
+            // G1 humongous int[]: region-safe per-element read, same fallback
+            // shape as the byte/char twins.
+            None => {
+                for (i, slot) in dst.iter_mut().take(n).enumerate() {
+                    match self.shared.mem.heap.get_array_element(arr, src_off + i) {
+                        Ok(Value::Int(x)) => *slot = x,
+                        _ => return i,
+                    }
+                }
+            }
+        }
+        n
+    }
+
+    fn write_int_array_from(&mut self, arr: ObjectRef, dst_off: usize, src: &[i32]) -> bool {
+        if self.shared.mem.heap.kind_of(arr) != ObjectKind::Array {
+            return false;
+        }
+        if self.shared.mem.heap.element_type_of(arr) != ArrayElementType::Int {
+            return false;
+        }
+        let len = self.shared.mem.heap.array_length(arr);
+        if dst_off.checked_add(src.len()).map_or(true, |end| end > len) {
+            return false;
+        }
+        if src.is_empty() {
+            return true;
+        }
+        // SAFETY: bounds checked above; see `read_int_array_into` for the
+        // 4-bytes-per-element layout argument.
+        match self.shared.mem.heap.array_data_ptr(arr) {
+            Some(base) => unsafe {
+                std::ptr::copy_nonoverlapping(
+                    src.as_ptr() as *const u8,
+                    base.add(dst_off * 4),
+                    src.len() * 4,
+                );
+            },
+            None => {
+                for (i, v) in src.iter().enumerate() {
+                    if self
+                        .shared
+                        .mem
+                        .heap
+                        .set_array_element(arr, dst_off + i, Value::Int(*v))
+                        .is_err()
+                    {
+                        return false;
+                    }
+                }
+            }
+        }
+        true
     }
 
     fn read_char_array_into(&self, arr: ObjectRef, src_off: usize, dst: &mut [u16]) -> usize {
@@ -12736,6 +13019,17 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
         Some(self.thread.tlab.thread_allocated_bytes())
     }
 
+    fn total_allocated_bytes(&self) -> Option<u64> {
+        // Every thread's RETIRED total, plus this thread's live TLAB span. A
+        // peer's in-flight cursor may not be read while its owner runs, so the
+        // under-count is bounded by one TLAB per running thread — and the value
+        // stays monotonic, which the occupancy gauge this replaced was not.
+        Some(
+            cratonvm_gc::tlab::process_allocated_bytes()
+                .saturating_add(self.thread.tlab.thread_allocated_bytes()),
+        )
+    }
+
     fn committed_heap_bytes(&self) -> usize {
         self.shared.mem.heap.committed_bytes()
     }
@@ -13146,12 +13440,18 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
         // the synthetic `Cleaner$Cleanable` shape, whose slot 0 is its action
         // rather than a referent, so it must never reach the pre-GC
         // referent-nulling pass. See `ReferenceEntry::runs_cleaner`.
+        // THE IDENTITY STAMP (see `ReferenceProcessor::identity_stamps`).
+        // Minted here because it needs the heap: `identity_hash_code` installs
+        // a value from a monotonic counter into the object's own mark word when
+        // it has none and returns the existing one otherwise. It travels with
+        // the object across a relocation, so it identifies the OBJECT rather
+        // than its address -- which is what every guard downstream of this
+        // registry has been approximating with a class-shape test.
+        let stamp = self.shared.mem.heap.identity_hash_code(reference_obj);
         if ref_type == 4 {
-            self.shared
-                .mem
-                .ref_processor
-                .lock()
-                .discover_phantom_cleaner(ref_addr, referent_addr, queue_addr);
+            let mut rp = self.shared.mem.ref_processor.lock();
+            rp.discover_phantom_cleaner(ref_addr, referent_addr, queue_addr);
+            rp.stamp_reference(ref_addr, stamp);
             return;
         }
         let rt = match ref_type {
@@ -13161,12 +13461,9 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
             3 => ReferenceType::Cleaner,
             _ => return,
         };
-        self.shared.mem.ref_processor.lock().discover_reference(
-            rt,
-            ref_addr,
-            referent_addr,
-            queue_addr,
-        );
+        let mut rp = self.shared.mem.ref_processor.lock();
+        rp.discover_reference(rt, ref_addr, referent_addr, queue_addr);
+        rp.stamp_reference(ref_addr, stamp);
     }
 
     /// PGJDBC-PHANTOM-GHOST (2026-08-07): see the trait doc and
@@ -16629,6 +16926,7 @@ impl<'a> NativeSystemAccess for NativeContextImpl<'a> {
     }
 
     fn set_static_field(&mut self, class_id: ClassId, field_index: usize, value: Value) {
+        let value = forward_boundary_value(&self.shared.mem.heap, value);
         super::set_static_shared(self.shared, class_id, field_index, value);
     }
 
@@ -25725,42 +26023,7 @@ fn invoke_on_class_shared_inner(
                 // MethodHandle.invoke / invokeExact / invokeWithArguments and
                 // VarHandle.get / set / compareAndSet etc. are called with the
                 // call-site descriptor, but registered with a generic one.
-                if method_name == "invoke"
-                    || method_name == "invokeExact"
-                    || method_name == "invokeWithArguments"
-                    || method_name == "invokeBasic"
-                    || method_name == "get"
-                    || method_name == "set"
-                    || method_name == "getVolatile"
-                    || method_name == "setVolatile"
-                    || method_name == "getOpaque"
-                    || method_name == "setOpaque"
-                    || method_name == "getAcquire"
-                    || method_name == "setRelease"
-                    || method_name == "compareAndSet"
-                    || method_name == "compareAndExchange"
-                    || method_name == "compareAndExchangeAcquire"
-                    || method_name == "compareAndExchangeRelease"
-                    || method_name == "weakCompareAndSet"
-                    || method_name == "weakCompareAndSetPlain"
-                    || method_name == "weakCompareAndSetAcquire"
-                    || method_name == "weakCompareAndSetRelease"
-                    || method_name == "getAndSet"
-                    || method_name == "getAndSetAcquire"
-                    || method_name == "getAndSetRelease"
-                    || method_name == "getAndAdd"
-                    || method_name == "getAndAddAcquire"
-                    || method_name == "getAndAddRelease"
-                    || method_name == "getAndBitwiseOr"
-                    || method_name == "getAndBitwiseOrAcquire"
-                    || method_name == "getAndBitwiseOrRelease"
-                    || method_name == "getAndBitwiseAnd"
-                    || method_name == "getAndBitwiseAndAcquire"
-                    || method_name == "getAndBitwiseAndRelease"
-                    || method_name == "getAndBitwiseXor"
-                    || method_name == "getAndBitwiseXorAcquire"
-                    || method_name == "getAndBitwiseXorRelease"
-                {
+                if is_signature_polymorphic_method_name(method_name) {
                     // Check if receiver is a MethodHandle or VarHandle.
                     // DirectMethodHandle / BoundMethodHandle / DelegatingMethodHandle
                     // and their inner species (e.g. DirectMethodHandle$Constructor,
@@ -25823,11 +26086,7 @@ fn invoke_on_class_shared_inner(
                         //
                         // Try all possible registered descriptors for signature-polymorphic methods.
                         // These methods are registered with generic Object[] params but varying return types.
-                        let poly_descs = [
-                            "([Ljava/lang/Object;)Ljava/lang/Object;",
-                            "([Ljava/lang/Object;)V",
-                            "([Ljava/lang/Object;)Z",
-                        ];
+                        let poly_descs = SIGNATURE_POLYMORPHIC_NATIVE_DESCRIPTORS;
                         let prefer_exact =
                             prefers_exact_signature_polymorphic_receiver(&class_name);
                         // The resolved owner of invokeExact is MethodHandle, not
@@ -27755,6 +28014,12 @@ mod native_funnel_profile {
             let prior = thread_state::current_state();
             thread_state::record_transition(ThreadExecState::NativeRunning, "funnel-profile");
             thread_state::record_transition(prior, "funnel-profile");
+        });
+        // What the funnel does instead since 2026-08-17: the same pair of
+        // transitions, one thread-local access. The row above is the control
+        // and stays, because "the new one is fast" is only a claim next to it.
+        rung("component:   ... as one NativeStateSpan", || {
+            thread_state::enter_native_state("funnel-profile").restore("funnel-profile");
         });
         rung("component:   ... current_state() alone", || {
             black_box(thread_state::current_state());

@@ -142,6 +142,16 @@ fn snapshot() -> Vec<(String, f64, &'static str)> {
     provider_chain().lock().clone()
 }
 
+/// The installed providers' names, in chain (preference) order.
+///
+/// Exists so an engine whose own `getInstance` interception cannot serve a name
+/// can do what `ProviderList.getService` does — ask each installed provider in
+/// turn — instead of refusing outright. `getinstance_get_service_search` already
+/// walked this list; nothing outside this module could.
+pub(crate) fn chain_provider_names() -> Vec<String> {
+    snapshot().into_iter().map(|(name, _, _)| name).collect()
+}
+
 pub(crate) fn find(name: &str) -> Option<(f64, &'static str)> {
     provider_chain()
         .lock()
@@ -1097,6 +1107,11 @@ struct ServiceEntry {
     /// "Cipher.AES/GCM/NoPadding"), retained so `getService` /
     /// debugging can render it verbatim.
     key: String,
+    /// The service's attributes, as `("SupportedCurves", "...")` pairs — the
+    /// `Type.Algorithm AttrName` legacy rows. Kept in insertion order rather
+    /// than a map because there are a handful per service and the order is
+    /// what a provider's own listing shows.
+    attributes: Vec<(String, String)>,
 }
 
 /// Process-wide service map, keyed `(provider_name → (type, algo) → entry)`.
@@ -1625,18 +1640,55 @@ fn parse_legacy_key(key: &str) -> Option<(String, String, String, Option<String>
 /// the mechanism `provider_put_native` and `provider_parse_legacy_put_native`
 /// both funnel through.
 fn put_service(provider: &str, type_str: &str, algorithm: &str, value: &str) {
+    let type_n = normalize_engine(type_str);
+    let algo_n = normalize_algo(algorithm);
+    let mut s = services().lock();
+    let map = s.entry(provider.to_string()).or_default();
+    // A provider may `put` the attribute rows before the primary row (the
+    // order inside `Provider.putAll` is a HashMap iteration order), so the
+    // primary must not wipe attributes already recorded under the same key.
+    let attributes = map
+        .get(&(type_n.clone(), algo_n.clone()))
+        .map(|e| e.attributes.clone())
+        .unwrap_or_default();
     let entry = ServiceEntry {
         type_str: type_str.to_string(),
         algorithm: algorithm.to_string(),
         class_name: value.to_string(),
         key: format!("{type_str}.{algorithm}"),
+        attributes,
     };
+    map.insert((type_n, algo_n), entry);
+}
+
+/// Record a `Type.Algorithm AttrName` legacy row against its service.
+///
+/// The service itself may not have been `put` yet, so a placeholder entry with
+/// an empty class name is created and later filled in by `put_service` — which
+/// carries the attributes over.
+fn put_service_attribute(provider: &str, type_str: &str, algorithm: &str, attr: &str, value: &str) {
     let type_n = normalize_engine(type_str);
     let algo_n = normalize_algo(algorithm);
     let mut s = services().lock();
-    s.entry(provider.to_string())
-        .or_default()
-        .insert((type_n, algo_n), entry);
+    let map = s.entry(provider.to_string()).or_default();
+    let entry = map
+        .entry((type_n, algo_n))
+        .or_insert_with(|| ServiceEntry {
+            type_str: type_str.to_string(),
+            algorithm: algorithm.to_string(),
+            class_name: String::new(),
+            key: format!("{type_str}.{algorithm}"),
+            attributes: Vec::new(),
+        });
+    if let Some(slot) = entry
+        .attributes
+        .iter_mut()
+        .find(|(name, _)| name.eq_ignore_ascii_case(attr))
+    {
+        slot.1 = value.to_string();
+    } else {
+        entry.attributes.push((attr.to_string(), value.to_string()));
+    }
 }
 
 /// Seed ownership data for the direct-native KeyFactory, Signature,
@@ -2286,6 +2338,50 @@ fn seed_sunjce_pbe_services() {
         "PBES2",
         "com.sun.crypto.provider.PBES2Parameters$General",
     );
+    // SunJCE's SYMMETRIC `AlgorithmParameters` services. Enumerated from
+    // `Security.getProvider("SunJCE").getServices()` on JDK 25, not guessed —
+    // the block-cipher rows were missing here entirely, so
+    // `AlgorithmParameters.getInstance("AES", "SunJCE")` answered
+    // `no such algorithm: AES for provider SunJCE` while HotSpot serves it.
+    // BouncyCastle's `EnvelopedDataHelper.createAlgorithmParameters` asks by
+    // exactly that (name, provider) pair to decode a CMS content-encryption
+    // AlgorithmIdentifier, so every `SunProviderTest`/`NullProviderTest` KeyTrans
+    // case in bc-java's `cms` suite lost the IV and failed to decrypt.
+    //
+    // Note `GCM` lives in `sun.security.util`, not `com.sun.crypto.provider` —
+    // the one row whose package differs from its siblings.
+    for (algo, cls) in [
+        ("AES", "com.sun.crypto.provider.AESParameters"),
+        ("GCM", "sun.security.util.GCMParameters"),
+        ("DESede", "com.sun.crypto.provider.DESedeParameters"),
+        ("DES", "com.sun.crypto.provider.DESParameters"),
+        ("Blowfish", "com.sun.crypto.provider.BlowfishParameters"),
+        ("RC2", "com.sun.crypto.provider.RC2Parameters"),
+        (
+            "ChaCha20-Poly1305",
+            "com.sun.crypto.provider.ChaCha20Poly1305Parameters",
+        ),
+        ("DiffieHellman", "com.sun.crypto.provider.DHParameters"),
+    ] {
+        put_service(P, "AlgorithmParameters", algo, cls);
+    }
+    // The PKCS#12 / PKCS#5 v1.5 PBE rows, which all share one SPI class.
+    for algo in [
+        "PBEWithMD5AndDES",
+        "PBEWithMD5AndTripleDES",
+        "PBEWithSHA1AndDESede",
+        "PBEWithSHA1AndRC2_40",
+        "PBEWithSHA1AndRC2_128",
+        "PBEWithSHA1AndRC4_40",
+        "PBEWithSHA1AndRC4_128",
+    ] {
+        put_service(
+            P,
+            "AlgorithmParameters",
+            algo,
+            "com.sun.crypto.provider.PBEParameters",
+        );
+    }
     const HASHES: &[&str] = &[
         "SHA1",
         "SHA224",
@@ -2635,11 +2731,16 @@ fn apply_legacy_put(provider: &str, key: &str, value: &str) -> bool {
             true
         }
         "attr" => {
-            // Attribute on an existing service.  Ignore here — attribute
-            // semantics (`SupportedModes`, `SupportedKeyClasses`, …) are
-            // queried by `Service.supportsParameter` which we don't
-            // intercept.  Returning true so callers can distinguish
-            // "ignored shape" (false) from "recognized but no-op" (true).
+            // Attribute on a service. These used to be DROPPED, on the reading
+            // that only `Service.supportsParameter` consumes them — but
+            // `Service.getAttribute` is public and applications read it
+            // directly: bc-java's `ECAlgorithmParametersTest` asks
+            // `getService("AlgorithmParameters", "EC").getAttribute("SupportedCurves")`
+            // and NPE'd on the null, and `BouncyCastleProviderTest` asserts an
+            // attribute is visible through an ALIAS as well.
+            if let Some(attr) = parsed.3.as_deref() {
+                put_service_attribute(provider, &parsed.1, &parsed.2, attr, value);
+            }
             true
         }
         _ => false,
@@ -2872,6 +2973,20 @@ fn provider_get_object(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
 /// object slot can go stale across the `getService` -> `newInstance` window and
 /// read back empty. Keying on an integer id (primitives are never relocated)
 /// makes className retrieval robust.
+/// `Provider$Service` identity hash -> its attribute rows.
+///
+/// Same reasoning as [`service_classname_table`]: the synthetic
+/// `Provider$Service`'s own reference slots are not a reliable place to hang
+/// state, and the JDK's `getAttribute` reads a map keyed by its private
+/// `UString` wrapper, which we cannot populate from here.
+fn service_attributes_table(
+) -> &'static parking_lot::Mutex<rustc_hash::FxHashMap<i64, Vec<(String, String)>>> {
+    static T: std::sync::OnceLock<
+        parking_lot::Mutex<rustc_hash::FxHashMap<i64, Vec<(String, String)>>>,
+    > = std::sync::OnceLock::new();
+    T.get_or_init(Default::default)
+}
+
 fn service_classname_table() -> &'static parking_lot::Mutex<rustc_hash::FxHashMap<i64, String>> {
     use std::sync::OnceLock;
     static T: OnceLock<parking_lot::Mutex<rustc_hash::FxHashMap<i64, String>>> = OnceLock::new();
@@ -2938,6 +3053,9 @@ fn make_service(
     service_classname_table()
         .lock()
         .insert(ih, entry.class_name.clone());
+    service_attributes_table()
+        .lock()
+        .insert(ih, entry.attributes.clone());
     ctx.unpin_native_roots(prov_pin);
     Ok(svc)
 }
@@ -3086,6 +3204,41 @@ fn provider_service_class_name_from_registry(
 /// implementation class name.  Required by the BC fallback path and by
 /// `Cipher.getInstance(algo, providerName)` to render diagnostics when
 /// resolution fails.  Reads slot 3 (populated in `make_service`).
+/// `Provider.Service.getAttribute(String)` — answered from the attribute rows
+/// the provider actually `put`, case-insensitively as the JDK's own `UString`
+/// key is.
+fn provider_service_get_attribute(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let Some(Value::Object(Some(svc))) = args.first() else {
+        return Ok(Some(Value::Object(None)));
+    };
+    let name = match args.get(1) {
+        Some(Value::Object(Some(n))) => ctx.read_string(*n).unwrap_or_default(),
+        // `getAttribute(null)` is a `NullPointerException` on the JDK.
+        _ => {
+            return Err(cratonvm_types::error::RuntimeError::NullPointerException {
+                message: Some("attribute name is null".to_string()),
+            }
+            .into())
+        }
+    };
+    let ih = ctx.identity_hash_code(*svc) as i64;
+    let found = service_attributes_table().lock().get(&ih).and_then(|rows| {
+        rows.iter()
+            .find(|(n, _)| n.eq_ignore_ascii_case(&name))
+            .map(|(_, v)| v.clone())
+    });
+    match found {
+        Some(v) => {
+            let s = ctx.create_string(&v);
+            Ok(Some(Value::Object(Some(s))))
+        }
+        None => Ok(Some(Value::Object(None))),
+    }
+}
+
 fn provider_service_get_class_name(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -3431,6 +3584,30 @@ fn throw_missing_provider(
 /// unconditionally and so ignored any `KeyManagerFactory` service a caller
 /// registered on their own `Provider` via `Security.addProvider` +
 /// `Provider.put("KeyManagerFactory.<algo>", ...)`.
+/// Every THIRD-PARTY provider's implementation class for `(type_str, algo)`, in
+/// chain order.
+///
+/// [`third_party_service_class`] answers only the FIRST provider on the chain
+/// and then discards it if that provider is one this VM services natively — so
+/// a name that SunEC also registers hides every third-party implementation
+/// behind it. That is fine for choosing a default and wrong for a fallback,
+/// which needs the candidates the JDK's own delayed provider selection would
+/// walk (`Signature$Delegate.chooseProvider` moves to the next provider when
+/// the current one refuses the key).
+pub(crate) fn chain_third_party_service_classes(type_str: &str, algo: &str) -> Vec<String> {
+    snapshot()
+        .into_iter()
+        .filter(|(name, _, _)| {
+            !NATIVELY_SERVICED_PROVIDERS
+                .iter()
+                .any(|b| b.eq_ignore_ascii_case(name))
+        })
+        .filter_map(|(name, _, _)| get_service_entry(&name, type_str, algo))
+        .map(|e| e.class_name.replace('.', "/"))
+        .filter(|c| !c.trim().is_empty())
+        .collect()
+}
+
 pub(crate) fn find_service_provider(type_str: &str, algo: &str) -> Option<String> {
     snapshot()
         .into_iter()
@@ -4445,6 +4622,18 @@ pub(crate) fn register(r: &mut NativeMethodRegistry) {
         "getClassName",
         "()Ljava/lang/String;",
         provider_service_get_class_name,
+    );
+
+    // `getAttribute` is public API, not just `supportsParameter` plumbing —
+    // see `provider_service_get_attribute`. The JDK's own body reads a map
+    // keyed by its private `UString` wrapper, which nothing outside
+    // `java.security` can populate, so answering it here is the only way the
+    // attribute rows a provider `put` become visible.
+    r.register(
+        svc,
+        "getAttribute",
+        "(Ljava/lang/String;)Ljava/lang/String;",
+        provider_service_get_attribute,
     );
 
     r.register(

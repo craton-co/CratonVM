@@ -8818,8 +8818,10 @@ pub(crate) fn register_p71_biginteger_extras(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             // Limb-based modPow (rewrite step 3). The non-negative-exponent
             // case — the crypto hot path (Miller-Rabin, RSA, DH) — runs
-            // entirely on words via BigInt: read mag:[I directly, square-and-
-            // multiply on limbs, write mag:[I back, with NO decimal round-trip.
+            // entirely on words via BigInt: read mag:[I directly, exponentiate
+            // on limbs (windowed Montgomery for an odd modulus, see
+            // `crate::montgomery`), write mag:[I back, with NO decimal round
+            // trip.
             let m_int = bi_read_int(ctx, obj_arg(args, 2)?);
             if m_int.is_zero() {
                 return Err(RuntimeError::ArithmeticException {
@@ -8833,19 +8835,24 @@ pub(crate) fn register_p71_biginteger_extras(r: &mut NativeMethodRegistry) {
                 let res = base_int.modpow(&exp_int, &m_int);
                 return Ok(Some(Value::Object(Some(bi_alloc_int(ctx, &res)?))));
             }
-            // Negative exponent is rare (modInverse-based); keep the decimal
-            // path until step 5 lands a limb modInverse.
-            let base = bi_read(ctx, obj_arg(args, 0)?);
-            let exp = bi_read(ctx, obj_arg(args, 1)?);
-            let m = bi_read(ctx, obj_arg(args, 2)?);
-            let inv = bi_mod_inverse_str(&base, &m).ok_or_else(|| {
+            // Negative exponent: Java defines it as
+            // `this.modInverse(m).modPow(-exponent, m)`. Limb-based on both
+            // halves since step 5 landed `BigInt::mod_inverse` — the decimal
+            // `bi_mod_inverse_str`/`bi_mod_pow_str` round trip this used to take
+            // was the last O(digits^2) hop left in modPow.
+            //
+            // `mod_inverse` needs a positive modulus; the decimal reference
+            // inverted against `|m|`, so keep that (a negative modulus is
+            // outside the BigInteger spec, which requires m > 0).
+            let base_int = bi_read_int(ctx, obj_arg(args, 0)?);
+            let m_abs = m_int.abs_value();
+            let inv = base_int.mod_inverse(&m_abs).ok_or_else(|| {
                 MethodCallFailed::from(RuntimeError::ArithmeticException {
                     message: "BigInteger not invertible.".into(),
                 })
             })?;
-            let pos_exp = exp.trim_start_matches('-');
-            let res = bi_mod_pow_str(&inv, pos_exp, &m);
-            Ok(Some(Value::Object(Some(bi_alloc(ctx, &res)?))))
+            let res = inv.modpow(&exp_int.abs_value(), &m_abs);
+            Ok(Some(Value::Object(Some(bi_alloc_int(ctx, &res)?))))
         },
     );
     r.register(

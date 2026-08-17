@@ -37,7 +37,7 @@ cargo build --workspace --all-targets
 | `gpu` / `gpu-driver` | `cratonvm-cli` | Enable GPU offload plumbing (stub) / real CUDA driver. See [GPU Offload](../gpu/overview.md). |
 | `mimalloc` | `cratonvm-cli` | Use mimalloc as the global allocator (on by default; faster on Windows). |
 | `awt` | `vm` | AWT/Swing/Java2D natives (on by default). |
-| `zgc` | `cratonvm-cli` → `vm` → `gc` | Compile the ZGC backend in. **On by default since 2026-08-10**, because it gates the `GcAlgorithm::Zgc` variant and that variant is now the default collector. Turning it off (`--no-default-features`) leaves a launcher where `-XX:+UseZGC` warns and falls back to Generational. It is a stop-the-world non-moving mark-sweep, not production ZGC — see [The Garbage Collector](../internals/garbage-collector.md#collectors). |
+| `zgc` | `cratonvm-cli` → `vm` → `gc` | Compile the ZGC backend in. **On by default since 2026-08-10**, because it gates the `GcAlgorithm::Zgc` variant and that variant is now the default collector. Turning it off (`--no-default-features`) leaves a launcher where `-XX:+UseZGC` warns and falls back to Generational. It can **mark concurrently** since 2026-08-16, opt-in via `CRATONVM_ZGC_CONC_START=60`; the sweep and any relocation are still stop-the-world, and it is still not production ZGC — see [The Garbage Collector](../internals/garbage-collector.md#collectors). |
 
 ```bash
 # A java[.exe] alias alongside cratonvm

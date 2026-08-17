@@ -96,7 +96,7 @@ What it *is*: `CRATONVM_DBG_JIT_SCAN_PROF=1` reports **`jit_entries=2 980 692`**
 for ~1.4 M loop iterations — **~2 compiled-code entries per byte written**. The
 chain is not inlined, so every byte pays two JIT↔interpreter transitions at the
 300–700 ns each that
-[`jit-entries-per-call-cost`](../performance/vm-per-call-dispatch-cost-RETIRED-20260813.md)
+`jit-entries-per-call-cost`
 prices. `--nojit` gives 9 415 ns for the same call, so the JIT *is* helping
 (3.6x) — it just cannot inline through it, where the same JIT gives 31x on a
 plain array store.

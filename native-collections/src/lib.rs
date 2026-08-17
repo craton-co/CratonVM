@@ -1443,6 +1443,81 @@ impl DenseIntEntries {
 }
 
 #[cfg(test)]
+mod chm_table_size_tests {
+    use super::chm_jdk_table_size_for;
+
+    /// Every one of these is a reading of `ConcurrentHashMap.table.length` on
+    /// HotSpot JDK 25, not a value derived from the constructor's source. The
+    /// source reads like `tableSizeFor(c + (c >>> 1) + 1)`, which would put
+    /// `CHM(11)` at 32; the real map holds 16.
+    #[test]
+    fn matches_the_measured_jdk_table_sizes() {
+        // (initial capacity or size, table length) — sized constructor sweep.
+        let measured = [
+            (1, 2),
+            (2, 4),
+            (3, 8),
+            (4, 8),
+            (5, 8),
+            (6, 16),
+            (11, 16),
+            (12, 32),
+            (23, 32),
+            (24, 64),
+            (47, 64),
+            (48, 128),
+            (95, 128),
+            (512, 1024),
+        ];
+        for (n, want) in measured {
+            assert_eq!(
+                chm_jdk_table_size_for(n),
+                want,
+                "table size for {n} entries"
+            );
+        }
+    }
+
+    /// A default map's growth points, read the same way: it doubles as the
+    /// size reaches 12, 24, 48, 96, 192.
+    #[test]
+    fn matches_the_measured_default_map_growth() {
+        for (size, want) in [
+            (1, 16),
+            (11, 16),
+            (12, 32),
+            (23, 32),
+            (24, 64),
+            (47, 64),
+            (48, 128),
+            (95, 128),
+            (96, 256),
+            (191, 256),
+            (192, 512),
+        ] {
+            assert_eq!(
+                chm_jdk_table_size_for(size).max(16),
+                want,
+                "default map holding {size} entries"
+            );
+        }
+    }
+
+    /// The threshold is STRICT: a table of size P holds up to `0.75P - 1`
+    /// entries, and the entry that reaches `0.75P` is what doubles it. An
+    /// off-by-one here shifts every key's bucket for a whole size band.
+    #[test]
+    fn the_load_threshold_is_strict() {
+        for bits in 4..20 {
+            let cap = 1usize << bits;
+            let threshold = cap - (cap >> 2);
+            assert_eq!(chm_jdk_table_size_for(threshold - 1), cap);
+            assert_eq!(chm_jdk_table_size_for(threshold), cap << 1);
+        }
+    }
+}
+
+#[cfg(test)]
 mod dense_int_entries_tests {
     use super::*;
     #[allow(unused_imports)]
@@ -4703,6 +4778,12 @@ fn register_map_view_carrier_natives(r: &mut NativeMethodRegistry) {
             native_al_for_each,
         );
         r.register(c, "stream", "()Ljava/util/stream/Stream;", native_al_stream);
+        r.register(
+            c,
+            "spliterator",
+            "()Ljava/util/Spliterator;",
+            native_al_spliterator,
+        );
         r.register(
             c,
             "removeIf",
@@ -8981,11 +9062,13 @@ fn map_hash_key(ctx: &mut dyn NativeContext, key: ObjectRef) -> Result<i32, Meth
         let h = match prim {
             Value::Int(v) => v,
             Value::Long(v) => (v ^ (v >> 32)) as i32,
-            Value::Float(v) => v.to_bits() as i32,
-            Value::Double(v) => {
-                let bits = v.to_bits() as i64;
-                (bits ^ (bits >> 32)) as i32
-            }
+            // Canonical bits, not raw: `Float.equals`/`Double.equals` (below,
+            // and in `values_equal`) canonicalize the NaN payload, so hashing
+            // from raw bits puts two keys that are `equals` in different
+            // buckets. A `HashMap` with `Double.NaN` and `Math.sqrt(-1.0)` as
+            // keys then held two entries where HotSpot holds one.
+            Value::Float(v) => cratonvm_types::jfp::float_hash_code(v),
+            Value::Double(v) => cratonvm_types::jfp::double_hash_code(v),
             _ => ctx.identity_hash_code(key),
         };
         return Ok(h ^ ((h as u32) >> 16) as i32);
@@ -9055,11 +9138,9 @@ fn element_hash_code(ctx: &mut dyn NativeContext, v: &Value) -> Result<i32, Meth
         Value::Object(None) => Ok(0),
         Value::Int(x) => Ok(*x),
         Value::Long(x) => Ok((*x ^ (*x >> 32)) as i32),
-        Value::Float(x) => Ok(x.to_bits() as i32),
-        Value::Double(x) => {
-            let bits = x.to_bits() as i64;
-            Ok((bits ^ (bits >> 32)) as i32)
-        }
+        // Canonical bits — see the note in `map_hash_key`.
+        Value::Float(x) => Ok(cratonvm_types::jfp::float_hash_code(*x)),
+        Value::Double(x) => Ok(cratonvm_types::jfp::double_hash_code(*x)),
         Value::Object(Some(obj)) => {
             // String hashCode by value, asked of the VM so it is computed from
             // the receiver's own UTF-16 storage. Decoding to a Rust `String`
@@ -9162,12 +9243,8 @@ fn map_keys_equal(
             //     with `==` the second put silently overwrote the first.
             // `is_nan() || to_bits()` reproduces floatToIntBits exactly,
             // including its canonicalisation of every NaN payload.
-            (Value::Float(x), Value::Float(y)) => {
-                (x.is_nan() && y.is_nan()) || x.to_bits() == y.to_bits()
-            }
-            (Value::Double(x), Value::Double(y)) => {
-                (x.is_nan() && y.is_nan()) || x.to_bits() == y.to_bits()
-            }
+            (Value::Float(x), Value::Float(y)) => cratonvm_types::jfp::float_equals(x, y),
+            (Value::Double(x), Value::Double(y)) => cratonvm_types::jfp::double_equals(x, y),
             (Value::Int(x), Value::Long(y)) => (x as i64) == y,
             (Value::Long(x), Value::Int(y)) => x == (y as i64),
             _ => false,
@@ -23912,6 +23989,66 @@ fn native_al_stream(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     Ok(Some(Value::Object(Some(stream))))
 }
 
+/// `spliterator()` for a [`MAP_VIEW_CARRIERS`] (a map's `values()` view,
+/// ArrayList-layout under its own class — e.g. `TreeMap$Values`,
+/// `HashMap$Values`).
+///
+/// The `Set`-shaped twin of this gap (`keySet()`/`entrySet()` views) was
+/// already covered by [`native_hs_spliterator`], registered alongside
+/// `native_hs_stream` in `register_set_view_carrier_natives`. This one was
+/// missing its `Collection`-shaped equivalent: `register_map_view_carrier_natives`
+/// registered `stream` (`native_al_stream`, above) but never `spliterator`, so
+/// `StreamSupport.stream(view.spliterator(), false)` — as opposed to
+/// `view.stream()` — fell through to the real inherited `AbstractCollection
+/// .spliterator()` bytecode, which this ArrayList-layout carrier's fields
+/// don't back correctly and which silently produced an EMPTY spliterator
+/// rather than throwing. `view.stream()` was unaffected (it has its own
+/// native, above) — only the explicit `.spliterator()` call broke. First
+/// surfaced as `Hibernate boot metadata: `Database.getNamespaces()`
+/// (`TreeMap$Values`) streamed via `StreamSupport.stream(iterable
+/// .spliterator(), false).flatMap(...)` (e.g. `CommentsTest`,
+/// `SchemaUpdateTest`) silently finding zero tables/namespaces.
+///
+/// Mirrors [`native_hs_spliterator`]'s synthetic `java/util/Spliterator`
+/// (fields: backing array, cursor, limit) built from a snapshot — reuses
+/// `al_or_collection_elements`, the same element-reading helper
+/// `native_al_stream` already relies on, so any collection `stream()` gets
+/// right, `spliterator()` now gets right too.
+fn native_al_spliterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => {
+            let arr = alloc_ref_array(ctx, 0);
+            let spl = try_alloc_synthetic(ctx, "java/util/Spliterator", 3)?;
+            ctx.set_field(spl, 0, Value::Object(Some(arr)));
+            ctx.set_field(spl, 1, Value::Int(0));
+            ctx.set_field(spl, 2, Value::Int(0));
+            return Ok(Some(Value::Object(Some(spl))));
+        }
+    };
+    let this_pin = ctx.pin_native_root(this);
+    let this = ctx.read_native_pin(this_pin, this);
+    let this = resync_values_view(ctx, this)?;
+    let this = ctx.read_native_pin(this_pin, this);
+    let len = al_or_collection_elements(ctx, this)?.len();
+    let arr = alloc_ref_array(ctx, len);
+    let arr_pin = ctx.pin_native_root(arr);
+    let this = ctx.read_native_pin(this_pin, this);
+    let elements = al_or_collection_elements(ctx, this)?;
+    let arr = ctx.read_native_pin(arr_pin, arr);
+    for (i, element) in elements.iter().enumerate().take(len) {
+        ctx.set_array_element(arr, i, *element);
+    }
+    let spl = try_alloc_synthetic(ctx, "java/util/Spliterator", 3)?;
+    let arr = ctx.read_native_pin(arr_pin, arr);
+    ctx.set_field(spl, 0, Value::Object(Some(arr)));
+    ctx.set_field(spl, 1, Value::Int(0));
+    ctx.set_field(spl, 2, Value::Int(len as i32));
+    ctx.unpin_native_roots(this_pin);
+    ctx.unpin_native_roots(arr_pin);
+    Ok(Some(Value::Object(Some(spl))))
+}
+
 fn native_hs_stream(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(r))) => *r,
@@ -24340,11 +24477,20 @@ fn native_stream_sorted(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
                 numeric_sort_key(ctx, &e).unwrap_or(0.0)
             })
             .collect();
-        idx.sort_by(|&a, &b| {
-            keys[a]
-                .partial_cmp(&keys[b])
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
+        // `Double.compare` order, NOT `partial_cmp`. `f64::partial_cmp` returns
+        // `None` for a NaN operand, and `unwrap_or(Equal)` turns that into "NaN
+        // equals everything" — which is both the wrong answer (Java sorts every
+        // NaN to the END) and a NON-TRANSITIVE comparator, the shape TimSort
+        // rejects with "Comparison method violates its general contract!". It is
+        // also wrong without any NaN at all: `partial_cmp(-0.0, 0.0)` is `Equal`
+        // where `Double.compare` is `-1`.
+        //
+        // Measured: `Stream.of(...).sorted().limit(3)` over a list containing
+        // two NaNs returned `NaN NaN -inf` against HotSpot's `-inf -1.0 -0.0`.
+        // This is the one live site of that idiom — the sibling `pq_compare` and
+        // `p65_compare_values` primitive arms are unreachable, see the note on
+        // each.
+        idx.sort_by(|&a, &b| cratonvm_types::jfp::double_ordering(keys[a], keys[b]));
     } else {
         // Fallback: sort by string representation.
         // `collect::<Result<..>>` rather than a `?` inside the closure: the
@@ -31187,11 +31333,7 @@ fn native_double_stream_flat_map(ctx: &mut dyn NativeContext, args: &[Value]) ->
 /// difference between `DoubleStream.of(0.0/0.0, 0.0/0.0).distinct().count()`
 /// answering `1` (HotSpot) and `2`.
 fn java_double_to_long_bits(d: f64) -> i64 {
-    if d.is_nan() {
-        0x7ff8_0000_0000_0000u64 as i64
-    } else {
-        d.to_bits() as i64
-    }
+    cratonvm_types::jfp::double_to_long_bits(d) as i64
 }
 
 /// `Double.compare(d1, d2)` as an `Ordering`, and a total order — which is what
@@ -31202,13 +31344,7 @@ fn java_double_to_long_bits(d: f64) -> i64 {
 /// puts every NaN at the top. `f64::total_cmp` is a third order again (it sorts
 /// negatively-signed NaN below `-inf`), so neither stock comparator will do.
 fn java_double_compare(a: f64, b: f64) -> std::cmp::Ordering {
-    if a < b {
-        return std::cmp::Ordering::Less;
-    }
-    if a > b {
-        return std::cmp::Ordering::Greater;
-    }
-    java_double_to_long_bits(a).cmp(&java_double_to_long_bits(b))
+    cratonvm_types::jfp::double_ordering(a, b)
 }
 
 /// Read a stream element as an `f64`, widening the integral shapes the way the
@@ -33165,17 +33301,9 @@ fn comparing_key_as_f64(
 /// `java.lang.Double.compare` semantics: total ordering with NaN greatest and
 /// `-0.0 < 0.0` (so it is a valid `Comparator` even with NaN/zero keys).
 fn double_compare(a: f64, b: f64) -> i32 {
-    if a < b {
-        -1
-    } else if a > b {
-        1
-    } else {
-        // Equal under `<`/`>` (covers both zeros and both NaN cases): fall back
-        // to the bit pattern, exactly like Double.compare.
-        let ab = a.to_bits() as i64;
-        let bb = b.to_bits() as i64;
-        ab.cmp(&bb) as i32
-    }
+    // Was a local transcription that fell back to RAW bits, so two NaNs with
+    // different payloads compared unequal. See `cratonvm_types::jfp`.
+    cratonvm_types::jfp::double_compare(a, b)
 }
 
 /// Natural ordering: compare by string content or by wrapper field 0 value.
@@ -33228,11 +33356,20 @@ fn natural_compare(ctx: &mut dyn NativeContext, a: &Value, b: &Value) -> MethodC
                     (Value::Long(a), Value::Long(b)) => {
                         return Ok(Some(Value::Int(a.cmp(&b) as i32)))
                     }
+                    // `Float.compare`/`Double.compare`, NOT `total_cmp`: Java
+                    // canonicalizes the NaN payload first, so all NaNs are
+                    // equal to each other and greater than every number, where
+                    // IEEE totalOrder sorts a negatively-signed NaN BELOW
+                    // -infinity and orders NaNs among themselves by payload.
+                    // With `total_cmp` a natural-order `TreeSet<Double>` built
+                    // from 23 values held 13 elements where HotSpot holds 9,
+                    // and `Comparator.naturalOrder().compare` disagreed with
+                    // `Double.compare` on 206 of 529 sampled pairs.
                     (Value::Float(a), Value::Float(b)) => {
-                        return Ok(Some(Value::Int(a.total_cmp(&b) as i32)))
+                        return Ok(Some(Value::Int(cratonvm_types::jfp::float_compare(a, b))))
                     }
                     (Value::Double(a), Value::Double(b)) => {
-                        return Ok(Some(Value::Int(a.total_cmp(&b) as i32)))
+                        return Ok(Some(Value::Int(cratonvm_types::jfp::double_compare(a, b))))
                     }
                     _ => {}
                 }
@@ -33248,8 +33385,12 @@ fn natural_compare(ctx: &mut dyn NativeContext, a: &Value, b: &Value) -> MethodC
         // Compare bare ints/longs/etc. (for comparingInt results)
         (Value::Int(a), Value::Int(b)) => Ok(Some(Value::Int(a.cmp(b) as i32))),
         (Value::Long(a), Value::Long(b)) => Ok(Some(Value::Int(a.cmp(b) as i32))),
-        (Value::Float(a), Value::Float(b)) => Ok(Some(Value::Int(a.total_cmp(b) as i32))),
-        (Value::Double(a), Value::Double(b)) => Ok(Some(Value::Int(a.total_cmp(b) as i32))),
+        (Value::Float(a), Value::Float(b)) => {
+            Ok(Some(Value::Int(cratonvm_types::jfp::float_compare(*a, *b))))
+        }
+        (Value::Double(a), Value::Double(b)) => {
+            Ok(Some(Value::Int(cratonvm_types::jfp::double_compare(*a, *b))))
+        }
         _ => Ok(Some(Value::Int(0))),
     }
 }
@@ -40118,11 +40259,22 @@ fn pq_compare(
         });
     }
     // Primitive fallback (rare — PQ normally holds boxed objects).
+    //
+    // Measured UNREACHABLE for `Float`/`Double`: a `PriorityQueue<Double>` boxes,
+    // so the `Comparable.compareTo` branch above takes every element and this arm
+    // never sees one. `NanSurface2.java` confirms it — `PriorityQueue.drain`,
+    // `.bulk.drain`, `.reverse.drain` and `PriorityBlockingQueue.drain` all match
+    // HotSpot bit-for-bit with NaNs and signed zeros in the queue.
+    //
+    // Corrected anyway, because `partial_cmp(..).map_or(0, ..)` is a
+    // non-transitive comparator (NaN equal to everything) sitting one refactor
+    // away from being reachable, and because leaving one spelling of this rule
+    // wrong is how the last five copies survived.
     Ok(match (a, b) {
         (Value::Int(a), Value::Int(b)) => a.cmp(b) as i32,
         (Value::Long(a), Value::Long(b)) => a.cmp(b) as i32,
-        (Value::Float(a), Value::Float(b)) => a.partial_cmp(b).map_or(0, |o| o as i32),
-        (Value::Double(a), Value::Double(b)) => a.partial_cmp(b).map_or(0, |o| o as i32),
+        (Value::Float(a), Value::Float(b)) => cratonvm_types::jfp::float_compare(*a, *b),
+        (Value::Double(a), Value::Double(b)) => cratonvm_types::jfp::double_compare(*a, *b),
         _ => 0,
     })
 }
@@ -49439,6 +49591,57 @@ fn chm_all_segments(ctx: &dyn NativeContext, this: ObjectRef) -> Vec<ObjectRef> 
 /// flat-table JDK `ConcurrentHashMap` would currently be sized to", so that
 /// `chm_virtual_bucket` can reorder entries to match HotSpot's single-table
 /// iteration order (see `chm_reorder_by_virtual_bucket`).
+/// The bucket-table size a real JDK `ConcurrentHashMap` holds for `n` entries.
+///
+/// **Measured, not derived.** `probes/ChmTableSizeProbe.java` reads
+/// `ConcurrentHashMap.table.length` by reflection for every initial capacity in
+/// `1..=80` and for a default map at every size up to 200 (JDK 25, Temurin).
+/// The function that fits all of it is: the smallest power of two `P` with
+/// `n < P - (P >>> 2)` — the first table whose 0.75 load threshold is strictly
+/// above `n`. Spot values, all confirmed: `CHM(2)` -> 4, `CHM(3)` -> 8,
+/// `CHM(11)` -> 16, `CHM(12)` -> 32, `CHM(47)` -> 64, `CHM(48)` -> 128; a
+/// default map grows 16 -> 32 -> 64 -> 128 at sizes 12, 24, 48.
+///
+/// Note this is NOT `tableSizeFor(c + (c >>> 1) + 1)`, which the constructor's
+/// source reads like and which predicts 32 for `CHM(11)`. The measurement says
+/// 16. Where the two disagree, the measurement wins.
+fn chm_jdk_table_size_for(n: usize) -> usize {
+    let mut cap = 1usize;
+    // 1 << 30 is `MAXIMUM_CAPACITY`; stop there rather than overflow.
+    while cap < (1usize << 30) && n >= cap - (cap >> 2) {
+        cap <<= 1;
+    }
+    cap
+}
+
+/// Record the table size a real JDK map would have allocated for this
+/// constructor, so iteration can reproduce its bucket order later.
+///
+/// `sizeCtl` is the JDK's OWN field for exactly this — `ConcurrentHashMap(int)`
+/// ends with `this.sizeCtl = cap`, the table size its first `put` will
+/// allocate. Writing it here is descriptor-correct (it is an `int` field on the
+/// real class, so no `Ljava/lang/Object;` coercion), it is a value real-JDK
+/// bytecode reading the field would find plausible, and nothing in this
+/// implementation reads it for any other purpose.
+///
+/// Why it has to be recorded at all: `chm_total_capacity` sums the LIVE segment
+/// bucket arrays, and those resize on PER-SEGMENT load while a real JDK table
+/// resizes on TOTAL load. The two agree at construction and drift apart from
+/// the first segment resize onward — which is precisely the bug this records
+/// against. See `chm_reorder_by_virtual_bucket`.
+fn chm_record_initial_table(ctx: &mut dyn NativeContext, this: ObjectRef, jdk_cap: usize) {
+    ctx.set_field_by_name(this, "sizeCtl", Value::Int(jdk_cap.min(1 << 30) as i32));
+}
+
+/// The recorded construction-time table size, or the default-constructor table
+/// size (16) when nothing was recorded.
+fn chm_initial_table(ctx: &dyn NativeContext, this: ObjectRef) -> usize {
+    match ctx.get_field_by_name(this, "sizeCtl") {
+        Value::Int(v) if v > 0 => (v as usize).next_power_of_two(),
+        _ => 16,
+    }
+}
+
 fn chm_total_capacity(ctx: &dyn NativeContext, this: ObjectRef) -> usize {
     let mut total = 0usize;
     for seg in chm_all_segments(ctx, this) {
@@ -49477,8 +49680,23 @@ fn chm_reorder_by_virtual_bucket<T>(
     this: ObjectRef,
     mut items: Vec<(i32, T)>,
 ) -> Vec<T> {
-    let total_cap = chm_total_capacity(ctx, this).next_power_of_two().max(1);
-    let mask = (total_cap - 1) as u32;
+    // The virtual table size is the one a REAL JDK map would hold for this many
+    // entries, never `chm_total_capacity`. Summing the live segment bucket
+    // arrays looks equivalent and is not: our segments resize on their OWN
+    // load, a real flat table resizes on TOTAL load, so the sum overshoots from
+    // the first segment resize onward and every key's bucket index shifts with
+    // it. Measured on the 8 constraint names of H2's `testScript.sql` SCRIPT
+    // case: the sum was 32 where the real table was 16, and cap 32 reproduces
+    // exactly the wrong order that test saw.
+    //
+    // A stable sort is load-bearing for the tie-break. Two keys in one virtual
+    // bucket share every low bit of the mask, so they also share OUR segment
+    // and (our per-segment table being no larger than the virtual one) our
+    // bucket — one chain, whose order is insertion order. `probes/ChainOrderProbe`
+    // confirms that against HotSpot using equal-hashCode keys, which no table
+    // size can separate.
+    let cap = chm_initial_table(ctx, this).max(chm_jdk_table_size_for(items.len()));
+    let mask = (cap - 1) as u32;
     items.sort_by_key(|(hash, _)| (*hash as u32) & mask);
     items.into_iter().map(|(_, v)| v).collect()
 }
@@ -50279,6 +50497,8 @@ fn native_chm_init_default(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         CHM_DEFAULT_INIT_SEGMENTS,
         CHM_DEFAULT_SEGMENT_CAP,
     );
+    // A real default map allocates its first table at DEFAULT_CAPACITY = 16.
+    chm_record_initial_table(ctx, this, 16);
     Ok(None)
 }
 
@@ -50313,6 +50533,11 @@ fn native_chm_init_capacity(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
         .max(1)
         .next_power_of_two();
     chm_init_segments(ctx, this, CHM_DEFAULT_SEGMENTS, cap_per_seg);
+    // The bucket order a caller observes has to follow the REAL table size for
+    // this initial capacity, which is `chm_jdk_table_size_for` (measured), not
+    // the segment total above — those two agree here but diverge as soon as any
+    // segment resizes.
+    chm_record_initial_table(ctx, this, chm_jdk_table_size_for(total_cap));
     Ok(None)
 }
 
@@ -50341,6 +50566,7 @@ fn native_chm_init_full(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     let adjusted_total = adjusted_total.max(total_cap); // guard against fp underflow
     let cap_per_seg = (adjusted_total / num_segments).max(1).next_power_of_two();
     chm_init_segments(ctx, this, num_segments, cap_per_seg);
+    chm_record_initial_table(ctx, this, chm_jdk_table_size_for(total_cap));
     Ok(None)
 }
 
@@ -50362,6 +50588,7 @@ fn native_chm_init_from_map(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
         source_base
     };
     chm_init_segments(ctx, this, CHM_DEFAULT_SEGMENTS, CHM_DEFAULT_SEGMENT_CAP);
+    chm_record_initial_table(ctx, this, 16);
     let this = ctx.read_native_pin(this_pin0, this);
     let source_refreshed = read_pinned_elem(ctx, source_base, source0);
     // Copy entries from the source map. Use `collect_entries_any` (NOT the

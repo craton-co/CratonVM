@@ -950,8 +950,14 @@ Three of those are worth reading before acting anywhere in this tree:
   map into a real JDK class. **Two of its four wrong writes were invisible to
   the guard**, because a well-typed value in the wrong slot is not a descriptor
   mismatch. Read this before treating a quiet coercion log as a clean one.
-* **`G60-1`** — `--jdk-only` counts its own violations and nobody had read the
-  count. 0 classes fabricated, 0 synthetic stubs run, and **81 natives that won
-  over real JDK bytecode**, 24 of them on ordinary Java classes this VM
-  interprets every day. That is the shape of what "finishing" the mode still
-  means, and `retired_shadow.rs` is the mechanism it already has.
+* **`G60-1`** — **RESOLVED 2026-08-17, moved to
+  `jdk-only/G60-1-what-jdk-only-still-overrides-RESOLVED-20260817.md`.**
+  `--jdk-only` counts its own violations and nobody had read the count. 0 classes
+  fabricated, 0 synthetic stubs run. Read the resolved record before quoting any
+  of its numbers: **the "81 natives that won over real JDK bytecode" was 58.**
+  The other 23 rows are recorded on the YIELD path — §1.4 enforced, the bridge
+  losing to real bytes — and the report gave them a `summary` saying the
+  opposite, which is now fixed and carries an explicit `outcome` field. A real
+  application (embedded Tomcat, booting and serving under `--jdk-only`) puts the
+  population at **521 native-won triples**, so one vector was about a ninth of
+  it, and the report now says out loud when its own list is truncated.

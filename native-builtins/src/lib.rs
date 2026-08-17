@@ -4201,6 +4201,11 @@ pub mod tls_deny;
 // Additive only — nothing routes through it yet; later steps migrate the
 // BigInteger natives off the O(digits^2) decimal-string primitives onto this.
 pub(crate) mod bigint;
+// Montgomery modular arithmetic shared by both limb bignums (`bigint::BigInt`
+// behind java.math.BigInteger.modPow, and `crypto_impl::BigUint` behind the
+// native RSA private-key path). Retires
+// `perf/biginteger-modpow-has-no-montgomery-reduction-20260817`.
+pub(crate) mod montgomery;
 // Real crypto primitives (RustCrypto SHA/AES/RSA/ECDSA/X509/keystore). Always
 // compiled — the always-on JCA/TLS/x509 paths depend on it. Previously this was
 // a submodule of the feature-gated `crypto` module, which broke the
@@ -20492,6 +20497,172 @@ pub fn register_essential_natives_with_shims(
     /// the zone strings are not explicitly set and falls through to
     /// `getDisplayName`, so the fix must live here. `style` follows
     /// `TimeZone.SHORT` (0) / `TimeZone.LONG` (1).
+    /// The real CLDR row for `(zone id, locale)`, cached.
+    ///
+    /// `[id, longStandard, shortStandard, longDaylight, shortDaylight,
+    /// longGeneric, shortGeneric]` — the layout `TimeZoneNamesBundle` stores and
+    /// `DateFormatSymbols.getZoneStrings()` reproduces.
+    ///
+    /// `sun.util.resources.cldr.ext.TimeZoneNames` (in `jdk.localedata`) carries
+    /// every locale but English; `sun.util.resources.cldr.TimeZoneNames` (in
+    /// `java.base`) carries English. Both load here — measured — which is what
+    /// makes localized zone names available at all: the table below this
+    /// function is English-only, so `getDisplayName(false, LONG, Locale.GERMAN)`
+    /// for `GMT` answered `Greenwich Mean Time` where HotSpot answers `Mittlere
+    /// Greenwich-Zeit`, and bc-java's `i18n` suite compares the whole formatted
+    /// German string.
+    ///
+    /// Cached because `SimpleDateFormat`'s `z` field calls `getDisplayName` on
+    /// every format — this is the HTTP `Date`-header path — and a
+    /// `ResourceBundle.getBundle` per call would be a real cost there.
+    fn tz_cldr_row(
+        ctx: &mut dyn NativeContext,
+        id: &str,
+        locale: ObjectRef,
+    ) -> Option<Vec<String>> {
+        use std::sync::OnceLock;
+        static CACHE: OnceLock<
+            parking_lot::Mutex<rustc_hash::FxHashMap<(String, String), Option<Vec<String>>>>,
+        > = OnceLock::new();
+        let cache = CACHE.get_or_init(Default::default);
+
+        let tag = match ctx.invoke_virtual(locale, "toLanguageTag", "()Ljava/lang/String;", &[]) {
+            Ok(Some(Value::Object(Some(s)))) => ctx.read_string(s).unwrap_or_default(),
+            _ => return None,
+        };
+        let key = (tag, id.to_string());
+        if let Some(hit) = cache.lock().get(&key) {
+            return hit.clone();
+        }
+        let row = tz_cldr_row_uncached(ctx, id, locale);
+        cache.lock().insert(key, row.clone());
+        row
+    }
+
+    fn tz_cldr_row_uncached(
+        ctx: &mut dyn NativeContext,
+        id: &str,
+        locale: ObjectRef,
+    ) -> Option<Vec<String>> {
+        for base in [
+            "sun.util.resources.cldr.ext.TimeZoneNames",
+            "sun.util.resources.cldr.TimeZoneNames",
+        ] {
+            let locale_pin = ctx.pin_native_root(locale);
+            let base_s = ctx.create_string(base);
+            let locale_now = ctx.read_native_pin(locale_pin, locale);
+            let bundle = ctx.invoke(
+                "java/util/ResourceBundle",
+                "getBundle",
+                "(Ljava/lang/String;Ljava/util/Locale;)Ljava/util/ResourceBundle;",
+                &[Value::Object(Some(base_s)), Value::Object(Some(locale_now))],
+            );
+            ctx.unpin_native_roots(locale_pin);
+            let Ok(Some(Value::Object(Some(bundle)))) = bundle else {
+                continue;
+            };
+            let bundle_pin = ctx.pin_native_root(bundle);
+            let id_s = ctx.create_string(id);
+            let bundle_now = ctx.read_native_pin(bundle_pin, bundle);
+            // `getObject` RAISES for a missing key, and a zone the ext bundle
+            // does not carry is an ordinary outcome (the English rows live in
+            // the other base name), so ask first.
+            let has = matches!(
+                ctx.invoke_virtual(
+                    bundle_now,
+                    "containsKey",
+                    "(Ljava/lang/String;)Z",
+                    &[Value::Object(Some(id_s))],
+                ),
+                Ok(Some(Value::Int(1)))
+            );
+            if !has {
+                ctx.unpin_native_roots(bundle_pin);
+                continue;
+            }
+            let id_s = ctx.create_string(id);
+            let bundle_now = ctx.read_native_pin(bundle_pin, bundle);
+            let arr = ctx.invoke_virtual(
+                bundle_now,
+                "getStringArray",
+                "(Ljava/lang/String;)[Ljava/lang/String;",
+                &[Value::Object(Some(id_s))],
+            );
+            ctx.unpin_native_roots(bundle_pin);
+            let Ok(Some(Value::Object(Some(arr)))) = arr else {
+                continue;
+            };
+            let n = ctx.array_length(arr);
+            let mut out = Vec::with_capacity(n);
+            for i in 0..n {
+                match ctx.get_array_element(arr, i) {
+                    Value::Object(Some(s)) => out.push(ctx.read_string(s).unwrap_or_default()),
+                    _ => out.push(String::new()),
+                }
+            }
+            if !out.is_empty() {
+                return Some(out);
+            }
+        }
+        None
+    }
+
+    /// The CLDR display name for `(zone id, daylight, style, locale)`, or `None`
+    /// when CLDR has no row for that zone.
+    fn tz_display_name_from_jdk(
+        ctx: &mut dyn NativeContext,
+        id: &str,
+        daylight: bool,
+        long_style: bool,
+        locale: Option<ObjectRef>,
+    ) -> Option<String> {
+        if id.is_empty() {
+            return None;
+        }
+        let locale = match locale {
+            Some(l) => l,
+            None => match ctx.invoke(
+                "java/util/Locale",
+                "getDefault",
+                "()Ljava/util/Locale;",
+                &[],
+            ) {
+                Ok(Some(Value::Object(Some(l)))) => l,
+                _ => return None,
+            },
+        };
+        let row = tz_cldr_row(ctx, id, locale)?;
+        // Row layout is `[id, longStd, shortStd, longDst, shortDst, ...]`.
+        let idx = match (daylight, long_style) {
+            (false, true) => 1,
+            (false, false) => 2,
+            (true, true) => 3,
+            (true, false) => 4,
+        };
+        row.get(idx).filter(|t| !t.is_empty()).cloned()
+    }
+
+    fn tz_display_name_full(
+        ctx: &mut dyn NativeContext,
+        this: ObjectRef,
+        daylight: bool,
+        long_style: bool,
+        locale: Option<ObjectRef>,
+    ) -> Result<String, MethodCallFailed> {
+        let id = match ctx.get_field_by_name(this, "ID") {
+            Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
+            _ => String::new(),
+        };
+        // A custom `GMT+hh:mm` id has no CLDR name and displays verbatim, which
+        // is what HotSpot does for a `ZoneInfo` with no localized name.
+        if !(id.starts_with("GMT+") || id.starts_with("GMT-")) {
+            if let Some(name) = tz_display_name_from_jdk(ctx, &id, daylight, long_style, locale) {
+                return Ok(name);
+            }
+        }
+        tz_display_name(ctx, this, long_style)
+    }
+
     fn tz_display_name(ctx: &mut dyn NativeContext, this: ObjectRef, long_style: bool) -> Result<String, MethodCallFailed> {
         let id = match ctx.get_field_by_name(this, "ID") {
             Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
@@ -20601,7 +20772,7 @@ pub fn register_essential_natives_with_shims(
         "()Ljava/lang/String;",
         |ctx, args| {
             let name = match args.first() {
-                Some(Value::Object(Some(o))) => tz_display_name(ctx, *o, true),
+                Some(Value::Object(Some(o))) => tz_display_name_full(ctx, *o, false, true, None),
                 _ => Ok("UTC".to_string()),
             };
             Ok(Some(Value::Object(Some(ctx.create_string(&name?)))))
@@ -20612,8 +20783,12 @@ pub fn register_essential_natives_with_shims(
         "getDisplayName",
         "(Ljava/util/Locale;)Ljava/lang/String;",
         |ctx, args| {
+            let locale = match args.get(1) {
+                Some(Value::Object(Some(l))) => Some(*l),
+                _ => None,
+            };
             let name = match args.first() {
-                Some(Value::Object(Some(o))) => tz_display_name(ctx, *o, true),
+                Some(Value::Object(Some(o))) => tz_display_name_full(ctx, *o, false, true, locale),
                 _ => Ok("UTC".to_string()),
             };
             Ok(Some(Value::Object(Some(ctx.create_string(&name?)))))
@@ -20627,9 +20802,16 @@ pub fn register_essential_natives_with_shims(
         "getDisplayName",
         "(ZILjava/util/Locale;)Ljava/lang/String;",
         |ctx, args| {
+            let daylight = matches!(args.get(1), Some(Value::Int(v)) if *v != 0);
             let long_style = matches!(args.get(2), Some(Value::Int(v)) if *v != 0);
+            let locale = match args.get(3) {
+                Some(Value::Object(Some(l))) => Some(*l),
+                _ => None,
+            };
             let name = match args.first() {
-                Some(Value::Object(Some(o))) => tz_display_name(ctx, *o, long_style),
+                Some(Value::Object(Some(o))) => {
+                    tz_display_name_full(ctx, *o, daylight, long_style, locale)
+                }
                 _ => Ok("UTC".to_string()),
             };
             Ok(Some(Value::Object(Some(ctx.create_string(&name?)))))

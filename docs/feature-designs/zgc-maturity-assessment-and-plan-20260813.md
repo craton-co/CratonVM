@@ -224,7 +224,13 @@ tell what they are running.
 > instead of asking whether the thing being measured still existed.
 >
 > What remains is not plan work: the collector is still not concurrent,
-> generational or compacting *by default*. Those are the two directions
+> generational or compacting *by default*.
+>
+> **[Superseded 2026-08-16 for two of the three.]** Compaction became
+> default-on later that same day, and concurrent marking landed on 2026-08-16
+> — see the concurrent+generational plan's §2. Generational is still a project.
+> This block is left as written because the paragraph it belongs to is about
+> the plan's method, not its inventory. Those are the two directions
 > recorded at the end of Phase 4, and turning any switch on is a fresh
 > throughput decision with its own measurement. That is by design —
 > the plan's own preamble says so: *"Each has an exit criterion that is a

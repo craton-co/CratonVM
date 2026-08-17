@@ -8414,6 +8414,32 @@ pub static STATIC_SITES_SEEN_IR: std::sync::atomic::AtomicU64 =
 pub static THREAD_CURRENT_THREAD_SITES_OSR: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
+/// Statically bound call sites at which a ladder ASKED `callee_compiler` for a
+/// direct target, split by whether it got one.
+///
+/// The question these answer is the one netty's census raised and no other
+/// instrument could: `AdaptiveByteBufAllocatorTest` runs 259 M
+/// `jit_invoke_dispatch` calls of which **98.4% are `DISPATCH_CACHE` hits** —
+/// a compiled callee, reached through a Rust helper, on every call. The callee
+/// is compiled; the caller simply could not bind it, because at the caller's
+/// compile time it was not compiled YET, and a call site's binding is decided
+/// once and never revisited. A miss here is that event, counted.
+///
+/// Compile-time only — one relaxed `fetch_add` per statically bound site per
+/// compile, never on a runtime path.
+pub static DIRECT_CALLEE_BIND_HITS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub static DIRECT_CALLEE_BIND_MISSES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// `(bound, unbound)` — see [`DIRECT_CALLEE_BIND_HITS`].
+pub fn direct_callee_bind_counts() -> (u64, u64) {
+    (
+        DIRECT_CALLEE_BIND_HITS.load(std::sync::atomic::Ordering::Relaxed),
+        DIRECT_CALLEE_BIND_MISSES.load(std::sync::atomic::Ordering::Relaxed),
+    )
+}
+
 /// `(single-pass, IR)` counts of `invokestatic` sites each direct-call ladder
 /// examined since process start.
 pub fn static_sites_seen() -> (u64, u64) {
@@ -8447,6 +8473,73 @@ pub fn set_monitor_direct_fns(enter: usize, exit: usize) {
     MONITOR_ENTER_DIRECT_FN.store(enter, std::sync::atomic::Ordering::Release);
     MONITOR_EXIT_DIRECT_FN.store(exit, std::sync::atomic::Ordering::Release);
 }
+
+/// `jdk/internal/util/Preconditions.checkIndex(II[BiFunction])I` thin
+/// direct-call helper. Top of the `--dump-native-registry` invocation census on
+/// `probes/NioAccessorRate.java`: 4 000 000 calls for 800 000 `ByteBuffer`
+/// accessor operations, ahead of the store itself. `0` = not wired.
+pub static PRECONDITIONS_CHECK_INDEX_DIRECT_FN: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Register the `Preconditions.checkIndex` thin direct-call helper (called once
+/// from `build_helpers`).
+pub fn set_preconditions_check_index_direct_fn(addr: usize) {
+    PRECONDITIONS_CHECK_INDEX_DIRECT_FN.store(addr, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// `java/lang/ref/Reference.reachabilityFence(Object)V` thin direct-call
+/// helper. Second on the same census (3 200 000 calls), and its registered
+/// native does nothing but be opaque about its argument. `0` = not wired.
+pub static REACHABILITY_FENCE_DIRECT_FN: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Register the `Reference.reachabilityFence` thin direct-call helper (called
+/// once from `build_helpers`).
+pub fn set_reachability_fence_direct_fn(addr: usize) {
+    REACHABILITY_FENCE_DIRECT_FN.store(addr, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// `CRATONVM_JIT='-census-direct-helpers'` — stop binding
+/// `Preconditions.checkIndex` / `Reference.reachabilityFence` to their thin
+/// direct helpers and send both back through the generic native funnel.
+/// Default ON.
+///
+/// The switch exists so the blast radius of these binds can be measured on ONE
+/// binary rather than argued across two. It was added after exactly that
+/// mistake: a CratonBench A/B was run against a control binary a day older than
+/// the branch, and reported ~13-19% "regressions" on `arithmetic` and `fib` —
+/// phases that contain no `checkIndex` and no `reachabilityFence` call at all,
+/// so the binds cannot have caused them. A same-binary A/B cannot be
+/// confounded that way.
+pub fn census_direct_helpers_enabled() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| {
+        cratonvm_types::flags::runtime_var("CRATONVM_JIT_CENSUS_DIRECT_HELPERS")
+            .map(|v| {
+                let v = v.trim();
+                !(v == "0" || v.eq_ignore_ascii_case("false") || v.eq_ignore_ascii_case("off"))
+            })
+            .unwrap_or(true)
+    })
+}
+
+/// Sites bound to the two census-driven helpers above, split by compile door,
+/// so "did this land" is answerable without a timing run — the lesson
+/// `LEAF_NATIVE_HITS` was added for.
+pub static PRECONDITIONS_CHECK_INDEX_SITES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub static REACHABILITY_FENCE_SITES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// `(checkIndex, reachabilityFence)` sites bound to a thin direct helper.
+pub fn census_direct_helper_sites() -> (u64, u64) {
+    (
+        PRECONDITIONS_CHECK_INDEX_SITES.load(std::sync::atomic::Ordering::Relaxed),
+        REACHABILITY_FENCE_SITES.load(std::sync::atomic::Ordering::Relaxed),
+    )
+}
+
 
 /// Resolve a method invocation to a JIT call-site intrinsic, if one applies.
 ///
@@ -12846,6 +12939,32 @@ pub fn mark_jit_bail_listed(class_name: &str, method_name: &str, descriptor: &st
     jit_bail_list().write().insert(h);
 }
 
+/// Bail-list a method AND record the refusal site the compile that just ran left
+/// behind, so `CRATONVM_DBG=jit-method-stats` can name it.
+///
+/// [`mark_jit_bail_listed`] alone leaves the reason unrecorded. That is fine for a
+/// caller that has already recorded one, and wrong for the OSR door in
+/// `vm/src/runtime/interpreter/jit_bridge.rs`, which reaches the backend directly:
+/// its bails arrived in the report as `reason=unrecorded`, which is exactly the
+/// shape that sends a reader looking for a compiler bug somewhere else. An OSR bail
+/// is also the one that matters most — that door compiles a `@Test` method's hot
+/// loop, and a method denied there runs its whole life interpreted with no other
+/// diagnostic. Found the hard way on `HttpHeaderValidationUtilTest`'s two
+/// exhaustive loops (docs/known-issues/jit/osr-refuses-any-method-with-an-exception-table-20260817.md).
+///
+/// Consumes the thread-local site, like `try_compile`'s own recorder.
+pub fn mark_jit_bail_listed_with_site(class_name: &str, method_name: &str, descriptor: &str) {
+    mark_jit_bail_listed(class_name, method_name, descriptor);
+    let site = take_jit_bail_site().unwrap_or((take_jit_pipeline_stage(), 0, 0));
+    record_jit_bail_reason(class_name, method_name, descriptor, site);
+    if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JITC").is_some() {
+        eprintln!(
+            "[cratonvm-jitc] OSR-bail site={} pc={} opcode={:#04x} {class_name}.{method_name}{descriptor}",
+            site.0, site.1, site.2,
+        );
+    }
+}
+
 /// Diagnostic: number of methods currently bail-listed.
 pub fn jit_bail_list_size() -> usize {
     jit_bail_list().read().len()
@@ -13440,6 +13559,44 @@ impl Drop for JitCompileStackGuard {
     }
 }
 
+/// Depth of the nested-compile stack on this thread.
+///
+/// `0` outside any compile; `1` inside a top-level `try_compile`; deeper while a
+/// `callee_compiler` compiles a callee inside its caller's compilation.
+///
+/// # Why a VM-side caller needs this
+///
+/// Binding a statically bound call site to a raw `CALL` requires the callee to be
+/// COMPILED ALREADY, and `vm/.../jit_bridge.rs`'s callee resolver
+/// (`direct_callee_lookup`) may compile one transitively to get there. Without a
+/// depth bound, a deep call chain compiled bottom-up on one thread would nest one
+/// compile per level; with one, the chain stops binding directly past the bound
+/// and falls back to the dispatch helper, which is always correct.
+pub fn jit_active_compile_depth() -> usize {
+    JIT_COMPILE_STACK.with(|stack| stack.borrow().len())
+}
+
+/// Whether `(class_name, method_name, descriptor)` is already being compiled
+/// somewhere on this thread's nested-compile stack.
+///
+/// A VM-side transitive callee compile must ask this before recursing:
+/// re-entering a compile that is already open would recurse until the depth bound
+/// (or the native stack) ran out. Same question [`note_jit_recursive_compile_cycle`]
+/// answers for this crate's own `callee_compiler`, minus the cycle bookkeeping —
+/// the VM caller only needs to decline.
+pub fn jit_active_compile_contains(
+    class_name: &str,
+    method_name: &str,
+    descriptor: &str,
+) -> bool {
+    JIT_COMPILE_STACK.with(|stack| {
+        stack
+            .borrow()
+            .iter()
+            .any(|k| k.matches(class_name, method_name, descriptor))
+    })
+}
+
 fn mark_jit_recursive_cycle_method(key: JitCompileMethodKey) {
     jit_recursive_cycle_methods().write().insert(key);
 }
@@ -13676,6 +13833,16 @@ fn single_pass_only_lowering_for(
 pub fn ir_stage_reporting() -> bool {
     cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JITC").is_some()
         || cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_IR_COMPILES").is_some()
+}
+
+/// `CRATONVM_JIT_IR_OVER_INTRINSIC=1` — let the optimizing tier take a method
+/// that contains a call-site intrinsic, losing the intrinsic to a dispatch.
+///
+/// Off by default; see the eligibility loop for the measurement. Exists so the
+/// trade can be re-measured in one binary if the IR tier ever grows an
+/// intrinsic emitter, at which point this whole refusal should go away.
+pub fn ir_over_intrinsic_enabled() -> bool {
+    cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_IR_OVER_INTRINSIC").is_some()
 }
 
 pub fn ir_direct_calls_enabled() -> bool {
@@ -15537,9 +15704,17 @@ fn try_compile_inner(
         // would not actually vectorise. The general problem it is a special
         // case of — the optimizing tier replaces a C1 body whenever it CAN,
         // with no evidence the replacement is faster, and every `cov-*` lane
-        // widens the set of methods that happens to — is written up in
-        // `feature-designs/c2/perf-01-sieve-ir-body-6x-slower-than-c1.md`
-        // and is not solved here.
+        // widens the set of methods that happens to — is the open policy
+        // question kept in perf-01-sieve-ir-body-6x-slower-than-c1.md, and is
+        // not solved here.
+        //
+        // The `sieve` REGRESSION that brief was opened for is FIXED (closeout:
+        // perf-01-sieve-ir-body-slower-than-c1-FIXED-20260804.md) — by this
+        // veto — and re-verified 2026-08-17 on CratonBench: checksum `9592` on
+        // HotSpot 25 and on CratonVM, at parity rather than 6.4x
+        // (8.2-10.0 s against HotSpot's 8.9 s on the same host). Only the
+        // policy question above is still open; do not read the brief's
+        // measurement as current.
         && single_pass_only_lowering_for(code, code_len, cached).is_none()
         // Same species as PERF-01 directly above, and measured the same way:
         // where a `java/lang/String` access intrinsic fires, an IR body is a
@@ -16274,6 +16449,68 @@ fn try_compile_inner(
                         // `Op::New`, and an elided site emits no `Op::Call` for
                         // this entry to lower.
                         let _is_ctor = is_special && mn == "<init>";
+                        // CALL-SITE INTRINSIC: hand the method back to the
+                        // single-pass backend, which inlines it.
+                        //
+                        // The optimizing tier has no intrinsic emitter. Every
+                        // invoke it admits becomes a real call — a direct
+                        // cross-call for a statically-bound site, a MIC/PIC
+                        // cascade for a virtual one — so admitting a site that
+                        // `try_resolve_intrinsic` matches REPLACES inline
+                        // machine code with a dispatch. That is a large loss,
+                        // not a small one: measured on this branch, JDK 25,
+                        // `for (…) sink = new CtorAtomic()` where the
+                        // constructor body is `i = ATOMIC.getAndIncrement()`
+                        //
+                        //   IR body (intrinsic lost)      ~509 ns/op
+                        //   single-pass (intrinsic kept)  ~183 ns/op
+                        //
+                        // and with the intrinsic kept `ctorAtomic` costs the
+                        // same as `ctorPlain` (`i = ++staticInt`, ~189 ns/op),
+                        // which is the signature of `lock xadd` actually being
+                        // emitted. `CRATONVM_DBG=intrinsic` prints
+                        // "IR body installed (single-pass call-site intrinsics
+                        // NOT registered)" for exactly these bodies.
+                        //
+                        // This is the same lesson as the `Thread.currentThread`
+                        // and String-intrinsic binds recorded in
+                        // `jit_bridge.rs` — an intrinsic registered in one door
+                        // is inert in the others — arrived at from the opposite
+                        // direction: here the other door cannot emit it at all,
+                        // so the fix is to route the method to the door that
+                        // can rather than to duplicate the ladder.
+                        //
+                        // Scoped to methods that ACTUALLY contain such a site;
+                        // everything else keeps the optimizing tier.
+                        // `CRATONVM_JIT_IR_OVER_INTRINSIC=1` restores the old
+                        // behaviour for A/B.
+                        // THREE resolvers, not one. The layout-independent
+                        // ladder is `try_resolve_intrinsic`; `AtomicInteger`
+                        // and `String` have their own because they need a
+                        // field layout, and checking only the first one made
+                        // this refusal miss exactly the family that motivated
+                        // it (`AtomicInteger.getAndIncrement`, netty's
+                        // `FastThreadLocal` constructor). Both extra probes
+                        // are asked in their most permissive form — any
+                        // guard/layout — because the question here is "would
+                        // the single-pass backend inline this?", not "can it
+                        // inline it at this exact site": a false positive
+                        // costs one method the optimizing tier, a false
+                        // negative costs every call the intrinsic.
+                        let is_intrinsic_site = try_resolve_intrinsic(&cn, &mn, &desc).is_some()
+                            || try_resolve_atomic_intrinsic(&cn, &mn, &desc, 0).is_some()
+                            || cn == "java/util/concurrent/atomic/AtomicInteger"
+                            || try_resolve_string_intrinsic(&cn, &mn, &desc, None).is_some()
+                            || cn == "java/lang/String";
+                        if !ir_over_intrinsic_enabled() && is_intrinsic_site {
+                            all_emittable = false;
+                            if ir_stage_reporting() {
+                                nonemittable = Some(format!(
+                                    "pc={pc}: {cn}.{mn}{desc} is a call-site intrinsic;                                      the IR tier cannot emit one"
+                                ));
+                            }
+                            break;
+                        }
                         let (desc_args, ret) = match static_call_shape(&desc) {
                             Some(t) => t,
                             None => {
@@ -16452,6 +16689,62 @@ fn try_compile_inner(
                                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                 }
                             }
+                            // The two census-driven helpers, at THIS door too.
+                            // The scope note above says the other six stayed
+                            // single-pass-only because none had been A/B'd at
+                            // the optimizing tier; these two are added here
+                            // deliberately, because the workload that motivates
+                            // them — netty's `writeZero`, 131 072
+                            // `ByteBuffer.putLong` per MiB — runs entirely in
+                            // OSR/optimizing-tier bodies, so a single-pass-only
+                            // bind would be inert exactly where it is needed.
+                            // Both doors are counted separately
+                            // (`census_direct_helper_sites`) so that claim is
+                            // checkable rather than assumed.
+                            if direct_target.is_none()
+                                && census_direct_helpers_enabled()
+                                && is_static
+                                && direct_class == "jdk/internal/util/Preconditions"
+                                && mn == "checkIndex"
+                                && desc == "(IILjava/util/function/BiFunction;)I"
+                            {
+                                let entry = direct_native_helper(
+                                    &PRECONDITIONS_CHECK_INDEX_DIRECT_FN,
+                                    jdk_only,
+                                    intrinsic_resolver,
+                                    direct_class,
+                                    &mn,
+                                    &desc,
+                                );
+                                if entry != 0 {
+                                    direct_target = Some((entry, true));
+                                    direct_target_is_thin_helper = true;
+                                    PRECONDITIONS_CHECK_INDEX_SITES
+                                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                }
+                            }
+                            if direct_target.is_none()
+                                && census_direct_helpers_enabled()
+                                && is_static
+                                && direct_class == "java/lang/ref/Reference"
+                                && mn == "reachabilityFence"
+                                && desc == "(Ljava/lang/Object;)V"
+                            {
+                                let entry = direct_native_helper(
+                                    &REACHABILITY_FENCE_DIRECT_FN,
+                                    jdk_only,
+                                    intrinsic_resolver,
+                                    direct_class,
+                                    &mn,
+                                    &desc,
+                                );
+                                if entry != 0 {
+                                    direct_target = Some((entry, true));
+                                    direct_target_is_thin_helper = true;
+                                    REACHABILITY_FENCE_SITES
+                                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                }
+                            }
                             if direct_target.is_none()
                                 && !closes_cycle
                                 && !jit_direct_call_requires_dispatch(direct_class, &mn, &desc)
@@ -16470,9 +16763,20 @@ fn try_compile_inner(
                                             )
                                         {
                                             direct_target = Some((entry, callee_needs_ctx));
+                                            DIRECT_CALLEE_BIND_HITS
+                                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                         } else {
                                             mark_current_jit_compile_method_recursive_cycle();
+                                            DIRECT_CALLEE_BIND_MISSES
+                                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                         }
+                                    } else {
+                                        // The one that matters: the compiler had
+                                        // nothing to give, so this site is bound
+                                        // to the dispatch helper for the life of
+                                        // this body. See `DIRECT_CALLEE_BIND_HITS`.
+                                        DIRECT_CALLEE_BIND_MISSES
+                                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                     }
                                 }
                             }
@@ -18106,6 +18410,86 @@ fn try_compile_inner(
                         }
                     }
 
+                    // `Preconditions.checkIndex` / `Reference.reachabilityFence`
+                    // thin direct calls. Both are census-driven rather than
+                    // guessed: `--dump-native-registry` reports a per-native
+                    // invocation count, and on `probes/NioAccessorRate.java`
+                    // these two are the top two entries — 4 000 000 and
+                    // 3 200 000 calls for 800 000 `ByteBuffer` accessor
+                    // operations, i.e. ~4.5 of the ~7 native calls a single
+                    // `ByteBuffer.putLong` executes. Both are statically bound
+                    // with a registered native callee, so `callee_compiler`
+                    // can never find a body for them and the generic dispatch
+                    // fallback pays the full ~160 ns funnel per call.
+                    //
+                    // JDK-ONLY-WAVE2: see the marker on the
+                    // `StringLatin1.toLowerCase` bind above — same list.
+                    if direct_jit_callee_calls_enabled
+                        && census_direct_helpers_enabled()
+                        && invoke_kind == 3
+                        && class_name == "jdk/internal/util/Preconditions"
+                        && method_name == "checkIndex"
+                        && descriptor == "(IILjava/util/function/BiFunction;)I"
+                    {
+                        let entry = direct_native_helper(
+                            &PRECONDITIONS_CHECK_INDEX_DIRECT_FN,
+                            jdk_only,
+                            intrinsic_resolver,
+                            &class_name,
+                            &method_name,
+                            &descriptor,
+                        );
+                        if entry != 0 {
+                            PRECONDITIONS_CHECK_INDEX_SITES
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            needs_heap = true;
+                            direct_calls.push((
+                                pc,
+                                JitDirectCall {
+                                    entry,
+                                    needs_context: true,
+                                    num_params: 3,
+                                    return_type: b'I',
+                                    guard_class_id: 0,
+                                },
+                            ));
+                            continue;
+                        }
+                    }
+
+                    if direct_jit_callee_calls_enabled
+                        && census_direct_helpers_enabled()
+                        && invoke_kind == 3
+                        && class_name == "java/lang/ref/Reference"
+                        && method_name == "reachabilityFence"
+                        && descriptor == "(Ljava/lang/Object;)V"
+                    {
+                        let entry = direct_native_helper(
+                            &REACHABILITY_FENCE_DIRECT_FN,
+                            jdk_only,
+                            intrinsic_resolver,
+                            &class_name,
+                            &method_name,
+                            &descriptor,
+                        );
+                        if entry != 0 {
+                            REACHABILITY_FENCE_SITES
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            needs_heap = true;
+                            direct_calls.push((
+                                pc,
+                                JitDirectCall {
+                                    entry,
+                                    needs_context: true,
+                                    num_params: 1,
+                                    return_type: b'V',
+                                    guard_class_id: 0,
+                                },
+                            ));
+                            continue;
+                        }
+                    }
+
                     if direct_jit_callee_calls_enabled
                         && invoke_kind == 3
                         && class_name == "java/lang/Integer"
@@ -18178,9 +18562,17 @@ fn try_compile_inner(
                     // are why this only bites a small overridable method.
                     if direct_jit_callee_calls_enabled && matches!(invoke_kind, 1 | 3) {
                         if let Some(compiler) = callee_compiler.as_ref() {
-                            if let Some((entry, callee_needs_ctx)) =
-                                compiler(&class_name, &method_name, &descriptor)
-                            {
+                            let probed = compiler(&class_name, &method_name, &descriptor);
+                            if probed.is_none() {
+                                // See `DIRECT_CALLEE_BIND_HITS`: this site is now
+                                // bound to `jit_invoke_dispatch` permanently, and
+                                // the callee is very often compiled moments later.
+                                DIRECT_CALLEE_BIND_MISSES
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            }
+                            if let Some((entry, callee_needs_ctx)) = probed {
+                                DIRECT_CALLEE_BIND_HITS
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                 if jit_direct_call_requires_dispatch(
                                     &class_name,
                                     &method_name,

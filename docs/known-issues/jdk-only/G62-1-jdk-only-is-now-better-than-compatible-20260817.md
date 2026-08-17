@@ -99,8 +99,21 @@ cost three commands and would have surfaced it on day one — and the DEFAULT
 arm is red, which means the failure is not even hidden behind an unusual
 invocation.
 
-**N3 — `G60-1` N3 re-raised and now sharper.** Run `--jdk-only-report` against
-a real application. `APP-READINESS-20260812.md` has the Spring and Tomcat
-classpaths, and its harness caveats were cleared on 2026-08-17, so the run
-costs one command. With the suite at 99 of 99, an application is the only
-place a new defect can now come from.
+**N3 — `G60-1` N3 re-raised and now sharper.** ~~Run `--jdk-only-report` against
+a real application.~~ **DONE 2026-08-17** —
+`jdk-only/G60-1-what-jdk-only-still-overrides-RESOLVED-20260817.md`
+§4. Embedded Tomcat 12 boots, serves a GET and a 404, and shuts down under
+`--jdk-only`, verdict-identical to HotSpot, and the census says **521 distinct
+`native-won` triples** against the vector's 58. It also found that the run
+SATURATED the 256-row observation sink, which nothing in the JSON said at the
+time — so the first application census would have reported 188 and read as
+complete. Both are fixed there.
+
+Two of that record's findings bear directly on §2 of this one. **The census
+number this record quotes needs correcting: "81 natives that win over real
+bytecode" was 58** — 23 of the 81 are rows recorded where the bridge LOST, which
+the report's own text described as the violation. And the 24 pure-Java triples
+this record's N1 contrasts itself against are no longer all without a failing row
+behind them: two of them (`ArrayList.get`, `ArrayList.size`) were retired on
+measurement, and `Properties.getProperty` was measured NOT retirable, with the
+precondition named.

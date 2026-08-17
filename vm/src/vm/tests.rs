@@ -69784,6 +69784,93 @@ use std::sync::Arc;
 
     // --- M15: Logging MDC and level checks ---
 
+    /// SLF4J's VARARGS overload must SPREAD its `Object[]` across the `{}`
+    /// placeholders.
+    ///
+    /// Before 2026-08-16 the shim read `args[2..]`, which for
+    /// `info(String, Object...)` is the ARRAY ITSELF: it rendered the array's
+    /// `toString()` into the first placeholder and left every later one
+    /// literal. Testcontainers' Ryuk diagnostic is the face this was found on:
+    ///
+    /// ```text
+    /// Can not connect to Ryuk at [Ljava.lang.Object;@2795a:{}
+    /// ```
+    ///
+    /// against HotSpot's `Can not connect to Ryuk at localhost:60499`. Every
+    /// multi-argument SLF4J call in every workload was losing all but its
+    /// first argument, which is why the failing run could not be read.
+    #[test]
+    fn m15_slf4j_varargs_spreads_the_array_across_every_placeholder() {
+        let shared = Arc::new(SharedVm::new(VmConfig::default()));
+        let mut thread = JvmThread::new(ThreadId(0), "test");
+
+        let name = create_java_string(&shared, "test.RyukLogger");
+        let logger = call_native(
+            &shared,
+            &mut thread,
+            "org/slf4j/LoggerFactory",
+            "getLogger",
+            "(Ljava/lang/String;)Lorg/slf4j/Logger;",
+            &[Value::Object(Some(name))],
+        )
+        .unwrap()
+        .unwrap();
+        let lg = match logger {
+            Value::Object(Some(l)) => l,
+            _ => panic!("no logger"),
+        };
+
+        let fmt = create_java_string(&shared, "Can not connect to Ryuk at {}:{}");
+        let host = create_java_string(&shared, "localhost");
+        let port = alloc_receiver(&shared, &mut thread, "java/lang/Integer", 1);
+        shared.mem.heap.set_field(port, 0, Value::Int(60499));
+
+        let arr = shared
+            .mem
+            .heap
+            .alloc_array(ClassId::new(0), ArrayElementType::Reference, 2);
+        let _ = shared
+            .mem
+            .heap
+            .set_array_element(arr, 0, Value::Object(Some(host)));
+        let _ = shared
+            .mem
+            .heap
+            .set_array_element(arr, 1, Value::Object(Some(port)));
+
+        call_native(
+            &shared,
+            &mut thread,
+            "org/slf4j/Logger",
+            "warn",
+            "(Ljava/lang/String;[Ljava/lang/Object;)V",
+            &[
+                Value::Object(Some(lg)),
+                Value::Object(Some(fmt)),
+                Value::Object(Some(arr)),
+            ],
+        )
+        .unwrap();
+
+        let line = thread
+            .printed_lines
+            .last()
+            .cloned()
+            .unwrap_or_else(|| "<nothing logged>".to_string());
+        assert!(
+            line.contains("localhost:60499"),
+            "both varargs arguments must reach their placeholders; got {line:?}",
+        );
+        assert!(
+            !line.contains("{}"),
+            "no placeholder may survive substitution; got {line:?}",
+        );
+        assert!(
+            !line.contains("[Ljava.lang.Object;"),
+            "the argument ARRAY must never be rendered as an argument; got {line:?}",
+        );
+    }
+
     #[test]
     fn m15_slf4j_level_check_respects_stored_level() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));

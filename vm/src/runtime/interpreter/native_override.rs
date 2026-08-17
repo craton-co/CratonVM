@@ -1501,6 +1501,16 @@ pub(crate) fn is_bc_crypto_math_native_override(
             (method_name == "G" && descriptor == "(IIIIII)V")
                 || (method_name == "compress" && descriptor == "([BI)V")
         }
+        // LMS/HSS hashes through this class directly (its `DigestUtil` builds
+        // `new SHA256Digest()`), never through `MessageDigest`, so the native
+        // JCA SHA-256 is on a path that workload cannot reach. `processBlock`
+        // is the compression leaf; everything around it stays real bytecode.
+        // `SHA256Digest` has no BouncyCastle subclass, so the superclass walk
+        // in `intercept_force_registered_native` cannot divert another digest's
+        // `processBlock` here.
+        "org/bouncycastle/crypto/digests/SHA256Digest" => {
+            method_name == "processBlock" && descriptor == "()V"
+        }
         "org/bouncycastle/crypto/digests/KeccakDigest" => matches!(
             (method_name, descriptor),
             ("KeccakPermutation" | "KeccakExtract", "()V") | ("KeccakAbsorb", "([BI)V")

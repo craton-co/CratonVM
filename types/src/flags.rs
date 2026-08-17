@@ -883,6 +883,15 @@ pub struct GcFlags {
     /// see fixed-suite-bugs/
     /// g1-native-alloc-no-safepoint-oom-FIXED.md.
     pub g1_dbg_diag: bool,
+    /// `CRATONVM_DBG_G1ACCESSOR` — at VM exit, print how many of this
+    /// collector's field/array accessor calls had to take the global `regions`
+    /// lock, and how many answered from `may_be_humongous` without it.
+    ///
+    /// The load-independent half of the accessor-lock measurement: absolute
+    /// wall time on a shared box is worth a factor of several, but "1 lock
+    /// acquisition per store" versus "0" is a structural fact that no
+    /// concurrent build can move. See `G1Collector::may_be_humongous`.
+    pub g1_dbg_accessor: bool,
     /// `CRATONVM_G1_DBG_PINS`
     pub g1_dbg_pins: bool,
     /// `CRATONVM_G1_DBG_REACH`
@@ -985,6 +994,7 @@ impl GcFlags {
             no_oldgen_coalesce: present(src, "CRATONVM_NO_OLDGEN_COALESCE"),
             g1_dbg_headers: present(src, "CRATONVM_G1_DBG_HEADERS"),
             g1_dbg_diag: present(src, "CRATONVM_DBG_G1DIAG"),
+            g1_dbg_accessor: present(src, "CRATONVM_DBG_G1ACCESSOR"),
             g1_dbg_pins: present(src, "CRATONVM_G1_DBG_PINS"),
             g1_dbg_reach: present(src, "CRATONVM_G1_DBG_REACH"),
             g1_dbg_rootcensus: present(src, "CRATONVM_G1_DBG_ROOTCENSUS"),
