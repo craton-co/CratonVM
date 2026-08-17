@@ -178,22 +178,31 @@ is *not* in this table: it sits at the ordinary native-dispatch floor
 
 Class-level, whole suite classes, same host, `-Xmx 1500m`, no per-method cap so
 the class completes rather than being clipped. **Read the CPU column**: this box
-carried unrelated load of 10-35 throughout and its wall clock is worth ±20% at
+carried unrelated load of 8-35 throughout and its wall clock is worth ±20% at
 best (`performance/vm-per-call-dispatch-cost-RETIRED-20260813.md` §6). Every
 class passes exactly what it passed before.
 
-| class | tests | before wall / CPU | after wall / CPU |
-| --- | ---: | ---: | ---: |
-| `JdkZlibIntegrationTest#testHugeDecompress`, solo | 1/1 | 1 063 s / 1 023 s | **455–528 s / 453–517 s** |
-| `AdaptiveByteBufAllocatorTest` | 127/127 | 715 s / 713 s | **270 s / 274 s** |
-| `AdaptiveByteBufAllocatorGrowthTest` | 400/400 | 1 081 s / 2 963 s | **645 s / 2 042 s** |
-| `AdaptiveByteBufAllocatorUseCacheForNonEventLoopThreadsTest` | 128/128 | 752 s / 754 s | **435 s / 432 s** |
-| `search.SearchProcessorTest` | 15/15 | 153 s / 141 s | **131–139 s / 130–135 s** |
-| `BigEndianHeapByteBufTest` | 414/414 | 37.4 s / 56.5 s | 38.4 s / **48.5 s** |
+| class | tests | before wall / CPU | after wall / CPU | ratio (CPU) |
+| --- | ---: | ---: | ---: | ---: |
+| `JdkZlibIntegrationTest#testHugeDecompress`, solo | 1/1 | 1 063 s / 1 023 s | **455–528 s / 453–517 s** | ~2.1× |
+| `AdaptiveByteBufAllocatorTest` | 127/127 | 635–725 s / 638–727 s | **419–432 s / 421–435 s** | 1.51–1.67× (n=2 pairs) |
+| `AdaptiveByteBufAllocatorGrowthTest` | 400/400 | 1 081 s / 2 963 s | **645 s / 2 042 s** | 1.45× |
+| `AdaptiveByteBufAllocatorUseCacheForNonEventLoopThreadsTest` | 128/128 | 752 s / 754 s | **435 s / 432 s** | 1.75× |
+| `search.SearchProcessorTest` | 15/15 | 153 s / 141 s | **131–139 s / 130–135 s** | ~1.07× |
+| `BigEndianHeapByteBufTest` | 414/414 | 37.4 s / 56.5 s | 38.4 s / **48.5 s** | 1.17× |
 
 The last row is the useful negative: a class whose wall is dominated by JUnit
 discovery rather than buffer work moves 14% in CPU and not at all in wall. The
 fix is worth what the workload's `VarHandle` share is, and nothing more.
+
+**The `AdaptiveByteBufAllocatorTest` row is the second useful negative, and it
+is about method.** An un-paired run of it on the fixed binary returned 270 s,
+which reads as 2.6×. Interleaved against `base` on the same host it is 432 s,
+with 419, 426 and 475 s on further runs against a `base` of 725 s and 635 s —
+i.e. the 270 s was the box. The microbenchmark rows above are ratios of 3 ns-to-2 µs quantities and survive
+this box; the class rows are minutes and do not. Every class row here is a
+`base`/`after` pair run adjacently, and where it is a range, that is the
+observed spread, not a choice.
 
 ## 5. What this does NOT close
 
