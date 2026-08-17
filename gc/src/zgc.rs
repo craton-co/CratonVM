@@ -5995,7 +5995,132 @@ impl ZgcRealHeap {
     /// three things -- whether any registered object CONTAINS the receiver
     /// (an interior pointer, so the caller derived it), how far into that
     /// object it points, and what class that container is.
-    fn audit_access_receiver(&self, base: usize, index: usize, op: &'static str) {
+     /// The flag-free "was this receiver RECLAIMED?" verdict, for THIS
+    /// collector -- the port of `GenerationalHeap::reclaimed_hole_at`.
+    ///
+    /// ZGC has been the DEFAULT collector since 2026-08-10, and until this
+    /// existed the whole H2-CID0 apparatus in `vm::memory::reclaim_guard`
+    /// answered `None` on it: a receiver that reads back as `java.lang.Object`
+    /// (`ClassId(0)` -- which is also the all-zero header the sweep leaves over
+    /// a span it freed, and also an ordinary `new Object()`) reached the reader
+    /// with no way to tell those three apart, and the `NoSuchMethodError
+    /// method="java/lang/Object.<anything>"` terminal printed nothing else at
+    /// all. That is exactly the state the H2 `TestMultiThread` MVStore-writer
+    /// write-up is stuck in.
+    ///
+    /// Free-list membership is not ambiguous here either: a live object is
+    /// never inside a free block and never in the un-bumped middle between the
+    /// two cursors, so the arena can answer outright with no flag set in
+    /// advance. Costs both the arena lock and a scan of the free list, so it is
+    /// asked only from terminal error paths.
+    ///
+    /// Deliberately does NOT report an interior address of a LIVE object: that
+    /// is a derived pointer, not reclaimed memory, and reporting it under a
+    /// message that says "RECLAIMED" would be worse than silence.
+    /// `audit_access_receiver` covers that case.
+    pub fn reclaimed_hole_at(&self, addr: usize) -> Option<(&'static str, usize, usize)> {
+        // A registered base is a live object, whatever its header says.
+        if self.registry.contains(addr) {
+            return None;
+        }
+        let arena = self.arena.lock();
+        let base = arena.base_ptr() as usize;
+        let cap = arena.capacity();
+        if addr < base || addr >= base + cap {
+            return None;
+        }
+        let off = addr - base;
+        for (o, size) in arena.free_blocks_sorted() {
+            if off >= o && off < o.saturating_add(size) {
+                return Some(("zgc arena free list (swept and coalesced)", base + o, size));
+            }
+        }
+        // The un-bumped middle. `used()` is both regions together, so the low
+        // cursor is recovered from it and the high one rather than read
+        // directly (the field is private, and deriving it here keeps the two
+        // definitions from drifting).
+        let high = arena.high_cursor();
+        let low = arena.used().saturating_sub(cap.saturating_sub(high));
+        if off >= low && off < high {
+            return Some((
+                "zgc arena un-bumped middle (never allocated, or retracted into)",
+                base + low,
+                high - low,
+            ));
+        }
+        None
+    }
+
+    /// Live objects that still name `addr` in a decoded reference slot.
+    ///
+    /// The companion half of [`Self::reclaimed_hole_at`], and the one fact the
+    /// "survived un-rewritten" face has never had on this collector: the
+    /// verdict says the address is reclaimed, this says WHO still points at it.
+    /// Decoded through `reference_slots` -- each object's own slot enumerator,
+    /// which knows the compact and legacy cell shapes apart -- rather than a
+    /// raw word scan, which on this heap reports ~1M stale `Value`-cell padding
+    /// words per compaction.
+    ///
+    /// The third element is the ordinal of the slot within the object's OWN
+    /// reference-slot enumeration, not a field index: this walker sees words,
+    /// not fields, and an invented field index would be a wrong number rather
+    /// than a missing one.
+    ///
+    /// O(live) under the registry lock, so terminal error paths only, and
+    /// `cap`ped.
+    pub fn live_holders_of(&self, addr: usize, cap: usize) -> Vec<(usize, u32, usize)> {
+        let mut out: Vec<(usize, u32, usize)> = Vec::new();
+        if cap == 0 {
+            return out;
+        }
+        let target = addr as u64;
+        for holder in self.registry.snapshot().bases() {
+            let mut ordinal = 0usize;
+            let mut hit: Option<usize> = None;
+            self.reference_slots(holder as u64, &mut |slot| {
+                if hit.is_none() && slot.raw_word == target {
+                    hit = Some(ordinal);
+                }
+                ordinal += 1;
+            });
+            if let Some(slot) = hit {
+                let cid = self.header_ref(holder as *mut u8).class_id.as_u32();
+                out.push((holder, cid, slot));
+                if out.len() >= cap {
+                    break;
+                }
+            }
+        }
+        out
+    }
+
+    /// `CRATONVM_DBG_ZGC_CORPSE` -- what the slide moved AWAY from `addr`, if
+    /// the ledger was armed for this run.
+    ///
+    /// Returns `(from, moved_to, class_id, size, still_live_at_target)`. The
+    /// exact base first, then an interior hit, matching `report_corpse_read`.
+    /// `None` when the flag is off (the ledger costs a map insert per relocated
+    /// object, and a cycle relocates hundreds of thousands) or when no record
+    /// covers the address.
+    pub fn corpse_lookup(&self, addr: usize) -> Option<(usize, usize, u32, usize, bool)> {
+        if !zgc_corpse_enabled() {
+            return None;
+        }
+        let hit = {
+            let ledger = self.corpse_ledger.lock();
+            ledger.get(&addr).copied().map(|v| (addr, v)).or_else(|| {
+                ledger
+                    .iter()
+                    .find(|(from, (_, _, size, _))| addr > **from && addr < **from + *size)
+                    .map(|(from, v)| (*from, *v))
+            })
+        };
+        hit.map(|(from, (to, class_id, size, _cycle))| {
+            (from, to, class_id, size, self.registry.contains(to))
+        })
+    }
+
+   fn audit_access_receiver(&self, base: usize, index: usize, op: &'static str) {
         if !zgc_corpse_enabled() || self.registry.contains(base) {
             return;
         }
@@ -9670,131 +9795,6 @@ impl GarbageCollector for ZgcRealHeap {
             },
             pointer_map,
         }
-    }
-
-    /// The flag-free "was this receiver RECLAIMED?" verdict, for THIS
-    /// collector -- the port of `GenerationalHeap::reclaimed_hole_at`.
-    ///
-    /// ZGC has been the DEFAULT collector since 2026-08-10, and until this
-    /// existed the whole H2-CID0 apparatus in `vm::memory::reclaim_guard`
-    /// answered `None` on it: a receiver that reads back as `java.lang.Object`
-    /// (`ClassId(0)` -- which is also the all-zero header the sweep leaves over
-    /// a span it freed, and also an ordinary `new Object()`) reached the reader
-    /// with no way to tell those three apart, and the `NoSuchMethodError
-    /// method="java/lang/Object.<anything>"` terminal printed nothing else at
-    /// all. That is exactly the state the H2 `TestMultiThread` MVStore-writer
-    /// write-up is stuck in.
-    ///
-    /// Free-list membership is not ambiguous here either: a live object is
-    /// never inside a free block and never in the un-bumped middle between the
-    /// two cursors, so the arena can answer outright with no flag set in
-    /// advance. Costs both the arena lock and a scan of the free list, so it is
-    /// asked only from terminal error paths.
-    ///
-    /// Deliberately does NOT report an interior address of a LIVE object: that
-    /// is a derived pointer, not reclaimed memory, and reporting it under a
-    /// message that says "RECLAIMED" would be worse than silence.
-    /// `audit_access_receiver` covers that case.
-    pub fn reclaimed_hole_at(&self, addr: usize) -> Option<(&'static str, usize, usize)> {
-        // A registered base is a live object, whatever its header says.
-        if self.registry.contains(addr) {
-            return None;
-        }
-        let arena = self.arena.lock();
-        let base = arena.base_ptr() as usize;
-        let cap = arena.capacity();
-        if addr < base || addr >= base + cap {
-            return None;
-        }
-        let off = addr - base;
-        for (o, size) in arena.free_blocks_sorted() {
-            if off >= o && off < o.saturating_add(size) {
-                return Some(("zgc arena free list (swept and coalesced)", base + o, size));
-            }
-        }
-        // The un-bumped middle. `used()` is both regions together, so the low
-        // cursor is recovered from it and the high one rather than read
-        // directly (the field is private, and deriving it here keeps the two
-        // definitions from drifting).
-        let high = arena.high_cursor();
-        let low = arena.used().saturating_sub(cap.saturating_sub(high));
-        if off >= low && off < high {
-            return Some((
-                "zgc arena un-bumped middle (never allocated, or retracted into)",
-                base + low,
-                high - low,
-            ));
-        }
-        None
-    }
-
-    /// Live objects that still name `addr` in a decoded reference slot.
-    ///
-    /// The companion half of [`Self::reclaimed_hole_at`], and the one fact the
-    /// "survived un-rewritten" face has never had on this collector: the
-    /// verdict says the address is reclaimed, this says WHO still points at it.
-    /// Decoded through `reference_slots` -- each object's own slot enumerator,
-    /// which knows the compact and legacy cell shapes apart -- rather than a
-    /// raw word scan, which on this heap reports ~1M stale `Value`-cell padding
-    /// words per compaction.
-    ///
-    /// The third element is the ordinal of the slot within the object's OWN
-    /// reference-slot enumeration, not a field index: this walker sees words,
-    /// not fields, and an invented field index would be a wrong number rather
-    /// than a missing one.
-    ///
-    /// O(live) under the registry lock, so terminal error paths only, and
-    /// `cap`ped.
-    pub fn live_holders_of(&self, addr: usize, cap: usize) -> Vec<(usize, u32, usize)> {
-        let mut out: Vec<(usize, u32, usize)> = Vec::new();
-        if cap == 0 {
-            return out;
-        }
-        let target = addr as u64;
-        for holder in self.registry.snapshot().bases() {
-            let mut ordinal = 0usize;
-            let mut hit: Option<usize> = None;
-            self.reference_slots(holder as u64, &mut |slot| {
-                if hit.is_none() && slot.raw_word == target {
-                    hit = Some(ordinal);
-                }
-                ordinal += 1;
-            });
-            if let Some(slot) = hit {
-                let cid = self.header_ref(holder as *mut u8).class_id.as_u32();
-                out.push((holder, cid, slot));
-                if out.len() >= cap {
-                    break;
-                }
-            }
-        }
-        out
-    }
-
-    /// `CRATONVM_DBG_ZGC_CORPSE` -- what the slide moved AWAY from `addr`, if
-    /// the ledger was armed for this run.
-    ///
-    /// Returns `(from, moved_to, class_id, size, still_live_at_target)`. The
-    /// exact base first, then an interior hit, matching `report_corpse_read`.
-    /// `None` when the flag is off (the ledger costs a map insert per relocated
-    /// object, and a cycle relocates hundreds of thousands) or when no record
-    /// covers the address.
-    pub fn corpse_lookup(&self, addr: usize) -> Option<(usize, usize, u32, usize, bool)> {
-        if !zgc_corpse_enabled() {
-            return None;
-        }
-        let hit = {
-            let ledger = self.corpse_ledger.lock();
-            ledger.get(&addr).copied().map(|v| (addr, v)).or_else(|| {
-                ledger
-                    .iter()
-                    .find(|(from, (_, _, size, _))| addr > **from && addr < **from + *size)
-                    .map(|(from, v)| (*from, *v))
-            })
-        };
-        hit.map(|(from, (to, class_id, size, _cycle))| {
-            (from, to, class_id, size, self.registry.contains(to))
-        })
     }
 
     /// Card the written object when it lives in an old page --
