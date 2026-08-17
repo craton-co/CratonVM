@@ -697,9 +697,41 @@ fn p67_receiver_session(ctx: &mut dyn NativeContext, receiver: ObjectRef) -> Res
     // allocated it, and the answer is that arena's session — this is what makes
     // `arena.scope() == segment.scope()` hold.
     if ctx.object_num_fields(receiver) > P67_SEGMENT_ARENA {
-        if let Value::Object(Some(arena)) = ctx.get_field(receiver, P67_SEGMENT_ARENA) {
-            if let Some(session) = p67_arena_session(ctx, arena) {
+        if let Value::Object(Some(owner)) = ctx.get_field(receiver, P67_SEGMENT_ARENA) {
+            if let Some(session) = p67_arena_session(ctx, owner) {
                 return Ok(Value::Object(Some(session)));
+            }
+            // G19-1: OR THE SLOT HOLDS THE SESSION ITSELF.
+            //
+            // `panama::pe_segment_slice` has stamped a slice's slot 2 with the
+            // PARENT'S SESSION — not with an arena — since W7-89, and
+            // `panama::pe_segment_session` has had a "tolerate a segment
+            // stamped with the session directly" arm for exactly that shape
+            // the whole time. This reader never grew the matching arm, so the
+            // two files disagreed about what slot 2 can hold and every
+            // `slice.scope()` fell through to the fresh mint below.
+            //
+            // MEASURED before this arm (`--jdk-only`, 25.0.3+9-LTS oracle):
+            //
+            //     conf.allocate(16).asSlice(4,4).scope() == seg.scope()
+            //        CratonVM false   HotSpot true
+            //     MemorySegment.ofArray(new byte[16]).scope() == ... .scope()
+            //        CratonVM false   HotSpot true
+            //
+            // A fresh session is always open, so this was not only an identity
+            // divergence: a slice of a CLOSED arena reported a live scope.
+            //
+            // `panama::pe_session_modelled` and NOT the local
+            // `p67_session_modelled`: the local one is width-and-state-word
+            // only, and slot 2's OTHER tenant on an `ofArray` mirror carrier is
+            // the Java backing ARRAY. `object_num_fields`/`get_field` on an
+            // array are not the two-int shape the local predicate assumes, so
+            // recognising a session by shape alone here would risk reading an
+            // `int[]`'s element 0 as a session state word — the class-name test
+            // in panama's copy is exactly the guard that rules that out, and
+            // it is memoised so the extra precision is an integer compare.
+            if crate::panama::pe_session_modelled(ctx, owner) {
+                return Ok(Value::Object(Some(owner)));
             }
         }
     }
@@ -869,9 +901,22 @@ pub(crate) fn p67_segment_check_scope(
     // `p67_receiver_session`, which mints a fresh (always-open) session when it
     // finds nothing — that would make every check trivially pass.
     if ctx.object_num_fields(segment) > P67_SEGMENT_ARENA {
-        if let Value::Object(Some(arena)) = ctx.get_field(segment, P67_SEGMENT_ARENA) {
-            if let Some(session) = p67_arena_session(ctx, arena) {
+        if let Value::Object(Some(owner)) = ctx.get_field(segment, P67_SEGMENT_ARENA) {
+            if let Some(session) = p67_arena_session(ctx, owner) {
                 p67_session_check_valid(ctx, session)?;
+            } else if crate::panama::pe_session_modelled(ctx, owner) {
+                // G19-1: the slot's third tenant — the session ITSELF, which is
+                // what `panama::pe_segment_slice` stamps onto a slice and what
+                // `pe_of_array_alias` now stamps onto a heap carrier. Without
+                // this arm the one shape whose scope IS resolvable was the one
+                // shape that skipped the check, which is the same fail-open
+                // W7-89 closed one branch up.
+                //
+                // The class-name-checked predicate, for the reason spelled out
+                // in `p67_receiver_session`: the local `p67_session_modelled`
+                // would accept slot 2's OTHER tenant, an `ofArray` mirror's
+                // backing array, and read an element as a state word.
+                p67_session_check_valid(ctx, owner)?;
             }
         }
     }
@@ -4257,6 +4302,93 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(Some(obj))))
         },
     );
+    // G19-1: THE TWO READERS OF THE CARRIER THE TWO FACTORIES ABOVE MINT.
+    //
+    // MEASURED, `--jdk-only` against 25.0.3+9-LTS, before this registration:
+    //
+    //     FunctionDescriptor.of(JAVA_LONG, ADDRESS).returnLayout()
+    //       -> AbstractMethodError: method java/lang/foreign/FunctionDescriptor
+    //          .returnLayout()Ljava/util/Optional; has no Code attribute
+    //     ... .argumentLayouts()
+    //       -> AbstractMethodError: ... .argumentLayouts()Ljava/util/List;
+    //
+    // That is the whole of `RJdkForeign`'s `[layouts]` step failure: the two
+    // factories are registered HERE — `register_pe_function_descriptor` in
+    // `panama.rs`, which does carry a `returnLayout`, is reached only from
+    // `register_pe_panama`/`register_synthetic_overrides` and does not run in
+    // `--jdk-only` (registry dump: the only two `FunctionDescriptor` rows are
+    // `of` and `ofVoid`, both `foreign_ffm.rs`, `owns_slot=true`). So the
+    // carrier was mintable and unreadable.
+    //
+    // Both are declared ABSTRACT on the sealed interface and have no `Object`
+    // fallback, which is why a registration here wins where one for
+    // `toString`/`equals` would not — see the record's NOM-2.
+    //
+    // `argumentLayouts()` is `java.util.List`, NOT `ValueLayout[]`. The array
+    // spelling is the pre-JDK-22 preview signature and it is what
+    // `panama.rs`'s dead copy still registers; a caller writing `.size()` on
+    // the JDK 22+ API would have got the same `AbstractMethodError` even after
+    // that registrar was reached.
+    r.register(fd, "returnLayout", "()Ljava/util/Optional;", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        // MEASURED: `of(JAVA_LONG, ADDRESS).returnLayout()` is `Optional[j8]`
+        // and `ofVoid(JAVA_INT).returnLayout()` is `Optional.empty` — so the
+        // void carrier's null slot 0 must become an EMPTY Optional and not a
+        // present one holding null. `p67_optional` is the local helper the
+        // `name()`/`targetLayout()` readers already use, and it is measured
+        // working on a real `java.util.Optional` in `--jdk-only`
+        // (`JAVA_LONG.name()` prints `Optional.empty` today).
+        let value = ctx.get_field(this, 0);
+        let opt = p67_optional(ctx, value)?;
+        Ok(Some(Value::Object(Some(opt))))
+    });
+    r.register(fd, "argumentLayouts", "()Ljava/util/List;", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        // Read the slot into a local FIRST: a `match` whose scrutinee is a
+        // `&self` call keeps that borrow alive for the whole match, and the
+        // fallback arm needs `&mut ctx` to mint the empty array.
+        let stored = ctx.get_field(this, 1);
+        let array = match stored {
+            Value::Object(Some(arr)) => arr,
+            _ => ctx.new_array(ArrayElementType::Reference, 0),
+        };
+        // `List.of` with an `Arrays.asList` fallback is this tree's idiom for
+        // handing back an immutable list (`lang_invoke::vh_coordinate_types`),
+        // and it is measured working in this binary: `RJdkForeign`'s
+        // `layoutVarHandles` step asserts
+        // `coordinateTypes().equals(List.of(MemorySegment.class, long.class))`
+        // and is green. The fallback matters for a descriptor built with a
+        // null member, which `List.of` refuses and `Arrays.asList` accepts —
+        // the oracle refuses that descriptor at the FACTORY (NPE), which this
+        // lane did not change, so the fallback keeps a carrier that already
+        // exists readable rather than turning a read into a second refusal.
+        let array_pin = ctx.pin_native_root(array);
+        let list = ctx
+            .invoke(
+                "java/util/List",
+                "of",
+                "([Ljava/lang/Object;)Ljava/util/List;",
+                &[Value::Object(Some(array))],
+            )
+            .ok()
+            .flatten();
+        let list = match list {
+            Some(Value::Object(Some(_))) => list,
+            _ => {
+                let array = ctx.read_native_pin(array_pin, array);
+                ctx.invoke(
+                    "java/util/Arrays",
+                    "asList",
+                    "([Ljava/lang/Object;)Ljava/util/List;",
+                    &[Value::Object(Some(array))],
+                )
+                .ok()
+                .flatten()
+            }
+        };
+        ctx.unpin_native_roots(array_pin);
+        Ok(Some(list.unwrap_or(Value::Object(None))))
+    });
 
     // SymbolLookup — `loaderLookup`/`libraryLookup`/`find` are registered by
     // `panama::register_pe_symbol_lookup` (promoted to `Bridge` category
@@ -4286,4 +4418,109 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
     // clean unavailable signal.
     r.set_category(__prev_cat);
     ()
+}
+
+#[cfg(test)]
+mod g19_scope_tests {
+    use super::*;
+    use crate::test_utils::mock_ctx;
+    use cratonvm_native_api::{NativeClassAccess, NativeHeapAccess};
+
+    /// Build the synthetic segment shape `panama::pe_of_array_alias` and
+    /// `panama::pe_segment_slice` mint: eight slots, `[1]=byteSize`, and
+    /// `[2]` = the segment's own session.
+    fn stamped_segment(ctx: &mut dyn NativeContext, session: Value, byte_size: i64) -> ObjectRef {
+        let seg =
+            try_alloc_concurrent_synthetic(ctx, "java/lang/foreign/MemorySegment", 8).unwrap();
+        ctx.set_field(seg, 0, Value::Long(0));
+        ctx.set_field(seg, 1, Value::Long(byte_size));
+        ctx.set_field(seg, P67_SEGMENT_ARENA, session);
+        ctx.set_field(seg, 3, Value::Int(0));
+        ctx.set_field(seg, 4, Value::Int(1));
+        ctx.set_field(seg, 5, Value::Long(0));
+        seg
+    }
+
+    /// G19-1: `scope()` on a carrier stamped with its session must hand back
+    /// THAT session, not a fresh one.
+    ///
+    /// MEASURED on 25.0.3+9-LTS: `heap.scope() == heap.scope()` and
+    /// `seg.asSlice(4,4).scope() == seg.scope()` are both true; CratonVM
+    /// answered false for both because this reader only ever looked for an
+    /// ARENA in slot 2, while `panama::pe_segment_slice` had been stamping the
+    /// SESSION there since W7-89. The `RForeignLayoutJdkInterfaces` assertion
+    /// "a heap segment's scope is stable" is this row.
+    #[test]
+    fn a_stamped_session_is_the_scope_and_it_is_the_same_object_every_time() {
+        let mut ctx = mock_ctx();
+        let session = p67_memory_session(&mut ctx).unwrap();
+        let seg = stamped_segment(&mut ctx, session, 16);
+
+        let first = p67_receiver_session(&mut ctx, seg).unwrap();
+        let second = p67_receiver_session(&mut ctx, seg).unwrap();
+        assert_eq!(first, session, "scope() must answer the stamped session");
+        assert_eq!(
+            first, second,
+            "scope() must answer the SAME object on every call"
+        );
+    }
+
+    /// The negative half, and it is not optional: slot 2's other tenant on an
+    /// `ofArray` MIRROR carrier is the Java backing array, and a reader that
+    /// accepted it as a session would read an array element as a state word.
+    ///
+    /// A carrier with nothing in slot 2 keeps the historical behaviour (a fresh
+    /// session), which is a separate, still-open divergence — see the record's
+    /// §"what this lane did NOT do".
+    #[test]
+    fn an_array_in_slot_two_is_not_a_scope() {
+        let mut ctx = mock_ctx();
+        let array = ctx.new_array(cratonvm_types::ArrayElementType::Byte, 16);
+        let seg = stamped_segment(&mut ctx, Value::Object(Some(array)), 16);
+        let scope = p67_receiver_session(&mut ctx, seg).unwrap();
+        assert_ne!(
+            scope,
+            Value::Object(Some(array)),
+            "the backing array must never be handed out as a scope"
+        );
+        assert_eq!(
+            ctx.class_name_of_id(ctx.class_id_of_object(match scope {
+                Value::Object(Some(obj)) => obj,
+                other => panic!("scope() answered {other:?}"),
+            }))
+            .as_deref(),
+            Some("jdk/internal/foreign/MemorySessionImpl"),
+            "the fallback is still a session"
+        );
+    }
+
+    /// G19-1: and the stamped session is CHECKED, not merely reported.
+    ///
+    /// The arm added to `p67_receiver_session` without the matching arm here
+    /// would be the W7-89 fail-open one branch over: the one shape whose scope
+    /// resolves would be the one shape that skips the validity check. Oracle:
+    /// a closed arena's segment answers `IllegalStateException: Already closed`
+    /// on every access.
+    #[test]
+    fn a_stamped_session_that_has_closed_refuses_the_access() {
+        let mut ctx = mock_ctx();
+        let session = p67_memory_session(&mut ctx).unwrap();
+        let seg = stamped_segment(&mut ctx, session, 16);
+        assert!(
+            p67_segment_check_scope(&mut ctx, seg).is_ok(),
+            "an open session must let the access through"
+        );
+
+        let session_obj = match session {
+            Value::Object(Some(obj)) => obj,
+            other => panic!("p67_memory_session answered {other:?}"),
+        };
+        let slots = p67_session_slots(&ctx, session_obj);
+        ctx.set_field(session_obj, slots.state, Value::Int(0));
+        let err = p67_segment_check_scope(&mut ctx, seg).unwrap_err();
+        assert!(
+            format!("{err:?}").contains("Already closed"),
+            "a closed stamped session must refuse; got {err:?}"
+        );
+    }
 }

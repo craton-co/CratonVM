@@ -232,8 +232,22 @@ const SS_LISTENER_ID: usize = 3;
 // W3-A2 side-tables — bypass the synthetic-vs-real-JDK field-layout
 // collision by storing Socket / ServerSocket state in process-wide HashMaps
 // keyed by ObjectRef. Synthetic field slots collide with real-JDK private
-// fields (e.g. real `ServerSocket` slot 0 is `boolean created`, not the int
-// port we write through SS_PORT=0). Side-tables are independent of layout.
+// fields. Side-tables are independent of layout.
+//
+// The example this comment used to give was wrong in a way that matters:
+// real `ServerSocket` slot 0 is NOT `boolean created`, it is `impl`, the
+// reference-typed `SocketImpl`. MEASURED 2026-08-17, `javap -p
+// java.net.ServerSocket` on JDK 25, declaration order:
+//
+//     0 impl (SocketImpl)   1 created (boolean)   2 bound (boolean)
+//     3 closed (boolean)    4 socketLock (Object) 5 options (Set)
+//
+// A `Value::Int` written into slot 0 is therefore DROPPED by the field guard
+// rather than merely misfiled, `impl` stays null, and every inherited method
+// whose bytecode reads `getImpl()` throws NPE. That is not hypothetical: it
+// is how `RSslLiveSession` died on `ServerSocket.setSoTimeout` in the
+// `javax.net.ssl.SSLServerSocket` twin of this surface. See
+// `docs/known-issues/jdk-only/` record `G16-1` (2026-08-17).
 // ---------------------------------------------------------------------------
 
 #[derive(Default, Debug, Clone)]
@@ -857,13 +871,36 @@ pub fn gc_update_ds_refs(pointer_map: &cratonvm_types::PointerMap) {
 /// `setSessionCacheSize`/`setSessionTimeout`. Side-tabled for the same reason
 /// as the socket state above, and one more: the carrier is an instance of the
 /// real `SSLSessionContext`, which is an INTERFACE declaring zero fields, so
-/// there are no instance slots to write at all. Both defaults are 0, which is
-/// this API's spelling of "unlimited" / "no expiry" and matches the answer the
-/// constant getters used to give.
-#[derive(Default, Debug, Clone, Copy)]
+/// there are no instance slots to write at all.
+///
+/// The defaults used to be 0/0, on the reading that 0 is this API's spelling
+/// of "unlimited" / "no expiry". MEASURED 2026-08-17 (probe `G16Ctx`, HotSpot
+/// 25.0.3+9-LTS): a freshly `init`-ed `SSLContext` answers **20480** and
+/// **86400** on both its client and its server context, on the first call,
+/// before anything is configured. 0 is a value a caller can SET — and setting
+/// it does read back as 0 on HotSpot, so the two are distinguishable states
+/// and the old default was reporting the configured one as the initial one.
+#[derive(Debug, Clone, Copy)]
 struct SscSide {
     cache_size: i32,
     timeout_secs: i32,
+}
+
+/// `sun.security.ssl.SSLSessionContextImpl`'s initial cache bound. MEASURED,
+/// not derived: it is `javax.net.ssl.sessionCacheSize`'s built-in value.
+const SSC_DEFAULT_CACHE_SIZE: i32 = 20480;
+
+/// The initial session lifetime in SECONDS (24 h). MEASURED alongside the
+/// cache bound above.
+const SSC_DEFAULT_TIMEOUT_SECS: i32 = 86400;
+
+impl Default for SscSide {
+    fn default() -> Self {
+        SscSide {
+            cache_size: SSC_DEFAULT_CACHE_SIZE,
+            timeout_secs: SSC_DEFAULT_TIMEOUT_SECS,
+        }
+    }
 }
 
 /// Which logical session context a carrier stands for: the identity hash of
@@ -899,7 +936,11 @@ fn ssc_owner_table() -> &'static Mutex<HashMap<i32, SscKey>> {
     T.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-fn ssc_bind(ctx: &dyn NativeContext, carrier: ObjectRef, owner: ObjectRef, tag: u8) {
+/// `pub(crate)` for the session-accessor lanes outside this file: a carrier
+/// minted anywhere else has to be bound to its owning `SSLContext` here, or
+/// `ssc_key` files it under `SSC_TAG_ORPHAN` and it round-trips only against
+/// itself.
+pub(crate) fn ssc_bind(ctx: &dyn NativeContext, carrier: ObjectRef, owner: ObjectRef, tag: u8) {
     let carrier_id = ctx.identity_hash_code(carrier);
     let key = (ctx.identity_hash_code(owner), tag);
     ssc_owner_table().lock().insert(carrier_id, key);
@@ -927,6 +968,60 @@ fn ssc_set<F: FnOnce(&mut SscSide)>(ctx: &dyn NativeContext, this: ObjectRef, f:
     let key = ssc_key(ctx, this);
     let mut t = ssc_side_table().lock();
     f(t.entry(key).or_default());
+}
+
+/// One `SscKey` -> the ONE carrier object that stands for it, as a global-root
+/// handle.
+///
+/// MEASURED 2026-08-17 (probe `G16Ctx`, HotSpot 25.0.3+9-LTS):
+///
+/// ```text
+/// ctx.getServerSessionContext() == ctx.getServerSessionContext()   ->  true
+/// ```
+///
+/// Every call used to mint a FRESH carrier, so that row read `false` here.
+/// `ssc_owner_table` already made the state round-trip across two different
+/// carriers, which is why the values agreed while the identity did not — and
+/// identity is not cosmetic on this API: a caller that caches the context and
+/// later compares, or uses it as a map key, silently accumulates one entry per
+/// call.
+fn ssc_carrier_roots() -> &'static Mutex<HashMap<SscKey, usize>> {
+    static T: OnceLock<Mutex<HashMap<SscKey, usize>>> = OnceLock::new();
+    T.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// The carrier for `(owner, tag)`, minted once and handed back thereafter.
+///
+/// GC-safety: `try_alloc_concurrent_synthetic` can relocate `owner`, so the
+/// caller pins it and this reads the forwarded address back before binding the
+/// identity hash. The carrier itself is remembered as a root HANDLE, never a
+/// bare `ObjectRef`.
+fn ssc_carrier(
+    ctx: &mut dyn NativeContext,
+    owner: ObjectRef,
+    tag: u8,
+) -> Result<ObjectRef, MethodCallFailed> {
+    let key = (ctx.identity_hash_code(owner), tag);
+    let known = ssc_carrier_roots().lock().get(&key).copied();
+    if let Some(root) = known {
+        if let Some(carrier) = ctx.resolve_global_root(root) {
+            return Ok(carrier);
+        }
+    }
+    let owner_pin = ctx.pin_native_root(owner);
+    let carrier = try_alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLSessionContext", 0)?;
+    let owner = ctx.read_native_pin(owner_pin, owner);
+    ssc_bind(ctx, carrier, owner, tag);
+    ctx.unpin_native_roots(owner_pin);
+    let root = ctx.add_global_root(carrier);
+    if root == 0 {
+        // No root available: hand back the fresh carrier rather than fail. It
+        // still round-trips through `ssc_owner_table`; only the identity row
+        // degrades to the pre-2026-08-17 behaviour.
+        return Ok(carrier);
+    }
+    ssc_carrier_roots().lock().insert(key, root);
+    Ok(ctx.resolve_global_root(root).unwrap_or(carrier))
 }
 
 fn ds_default() -> DsSide {
@@ -2560,6 +2655,7 @@ pub fn register_phase_e_networking(registry: &mut NativeMethodRegistry) {
     register_uri_natives(registry);
     register_re5_http_client(registry);
     register_re6_ssl_context(registry);
+    register_ssl_server_socket_options(registry);
     register_re7_datagram_socket(registry);
     register_re8_network_interface(registry);
     register_re9_nio_selector(registry);
@@ -8292,14 +8388,42 @@ fn https_session_object(
 /// anything that constructed one directly, and its three abstract declarations
 /// have no Code attribute at all, so without a native there is nothing to run.
 ///
-/// REGISTRATION ORDER. `register()` is last-write-wins, and
-/// `http_url_connection.rs`'s `register_one` DOES overwrite this file's
-/// registrations for the shared request surface (`connect`, `getResponseCode`,
-/// `getInputStream`, ... -- confirmed in a `--dump-native-registry` dump, where
-/// this file's rows for those read `owns_slot: false`). None of the six names
-/// below appear in `register_one`, so none of them can be overwritten by it.
-/// If a later change adds any of them there, THAT copy wins and this one goes
-/// silently dead -- check the dump, not the source order.
+/// REGISTRATION ORDER -- and a correction. `register()` is last-write-wins.
+/// The note that used to stand here checked ONE function, `http_url_connection
+/// .rs`'s `register_one`, found none of these six names in it, and concluded
+/// they could not be overwritten. That conclusion is FALSE, and the dump says
+/// so. `http_url_connection.rs` holds a SECOND registrar with the same
+/// function name as this one -- `register_https_session_accessors`, at
+/// `http_url_connection.rs:404` -- and it runs later.
+///
+/// MEASURED 2026-08-17, `--dump-native-registry` under `--jdk-only` on the
+/// binary from `d87dff06a`+2, both carrier classes, identical rows:
+///
+/// ```text
+/// getCipherSuite         owns_slot=false  net_phase_e.rs:8315
+/// getCipherSuite         owns_slot=TRUE   http_url_connection.rs:307  overwrote=bridge
+/// getServerCertificates  owns_slot=false  net_phase_e.rs:8323
+/// getServerCertificates  owns_slot=TRUE   http_url_connection.rs:283  overwrote=bridge
+/// getLocalCertificates   owns_slot=false  net_phase_e.rs:8346
+/// getLocalCertificates   owns_slot=TRUE   http_url_connection.rs:301  overwrote=bridge
+/// getPeerPrincipal       owns_slot=false  net_phase_e.rs:8364
+/// getPeerPrincipal       owns_slot=TRUE   http_url_connection.rs:325  overwrote=bridge
+/// getLocalPrincipal      owns_slot=false  net_phase_e.rs:8377
+/// getLocalPrincipal      owns_slot=TRUE   http_url_connection.rs:351  overwrote=bridge
+/// getSSLSession          owns_slot=TRUE   net_phase_e.rs:8395
+/// ```
+///
+/// So FIVE of the six bodies below are dead: only `getSSLSession` runs, and
+/// only because the other file does not register it. A change to any of the
+/// other five here has no runtime effect at all -- it must be made in
+/// `http_url_connection.rs::register_https_session_accessors` instead (that
+/// file is not this lane's to edit; see the NOMINATION in
+/// `G16-1-the-server-socket-impl-and-how-far-RSslLiveSession-got-20260817.md`).
+///
+/// The general lesson, which the old note had exactly backwards: a shadowing
+/// registrar is not ruled out by grepping one function for one name. Only the
+/// dump settles it. `owns_slot=true` with a non-zero `invocations` is proof;
+/// source order is not.
 fn register_https_session_accessors(r: &mut NativeMethodRegistry) {
     // Bridge, explicitly and locally: these stand in for real JDK bytecode that
     // exists and would work if `delegate` were populated. Set here rather than
@@ -13418,16 +13542,12 @@ pub(crate) fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
         "getClientSessionContext",
         "()Ljavax/net/ssl/SSLSessionContext;",
         |ctx, args| {
-            // GC-safety: the allocation below can relocate `this`, and the
-            // identity hash we bind afterwards must be read from the live
-            // object. Pin across the alloc and read the forwarded address.
-            let this0 = obj_arg(args, 0)?;
-            let this_pin = ctx.pin_native_root(this0);
-            let obj = try_alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLSessionContext", 0)?;
-            let this = ctx.read_native_pin(this_pin, this0);
-            ssc_bind(ctx, obj, this, SSC_TAG_CLIENT);
-            ctx.unpin_native_roots(this_pin);
-            Ok(Some(Value::Object(Some(obj))))
+            // One carrier per (SSLContext, side), not one per call — see
+            // `ssc_carrier` for the measured identity row this restores. The
+            // GC-safety that used to live here moved in there with it.
+            let this = obj_arg(args, 0)?;
+            let carrier = ssc_carrier(ctx, this, SSC_TAG_CLIENT)?;
+            Ok(Some(Value::Object(Some(carrier))))
         },
     );
 
@@ -13438,13 +13558,9 @@ pub(crate) fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
         "getServerSessionContext",
         "()Ljavax/net/ssl/SSLSessionContext;",
         |ctx, args| {
-            let this0 = obj_arg(args, 0)?;
-            let this_pin = ctx.pin_native_root(this0);
-            let obj = try_alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLSessionContext", 0)?;
-            let this = ctx.read_native_pin(this_pin, this0);
-            ssc_bind(ctx, obj, this, SSC_TAG_SERVER);
-            ctx.unpin_native_roots(this_pin);
-            Ok(Some(Value::Object(Some(obj))))
+            let this = obj_arg(args, 0)?;
+            let carrier = ssc_carrier(ctx, this, SSC_TAG_SERVER)?;
+            Ok(Some(Value::Object(Some(carrier))))
         },
     );
     // SSLSessionContext cache tuning, as driven by Tomcat's `SSLHostConfig`.
@@ -13468,7 +13584,12 @@ pub(crate) fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
         let this = obj_arg(args, 0)?;
         let size = args.get(1).and_then(|v| v.as_int()).unwrap_or(0);
         if size < 0 {
-            return Err(iae(format!("negative session cache size: {size}")));
+            // MEASURED: HotSpot throws `IllegalArgumentException` with a NULL
+            // message here, not a described one. Empty string is this crate's
+            // marker for a null `getMessage()` (see `types/src/error.rs`), and
+            // a message that cannot be derived can only be transcribed --
+            // here the transcription is "no message at all".
+            return Err(iae(String::new()));
         }
         ssc_set(ctx, this, |s| s.cache_size = size);
         Ok(None)
@@ -13477,7 +13598,9 @@ pub(crate) fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
         let this = obj_arg(args, 0)?;
         let secs = args.get(1).and_then(|v| v.as_int()).unwrap_or(0);
         if secs < 0 {
-            return Err(iae(format!("negative session timeout: {secs}")));
+            // Same null message as `setSessionCacheSize` above, measured on the
+            // same run.
+            return Err(iae(String::new()));
         }
         ssc_set(ctx, this, |s| s.timeout_secs = secs);
         Ok(None)
@@ -13520,7 +13643,19 @@ pub(crate) fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
         ssc,
         "getSession",
         "([B)Ljavax/net/ssl/SSLSession;",
-        |_ctx, _args| Ok(Some(Value::Object(None))),
+        |_ctx, args| {
+            // MEASURED (probe `G16Ctx`, HotSpot 25.0.3+9-LTS):
+            // `getSession(null)` throws `NullPointerException("session id
+            // cannot be null")`. It is the ONLY row of this family where a
+            // null argument is not just "nothing cached under that id": the
+            // empty array and an unknown id both answer null, and both already
+            // agreed. Returning null for a null id told a caller its lookup
+            // had MISSED when the JDK would have refused the call.
+            match args.get(1) {
+                Some(Value::Object(Some(_))) => Ok(Some(Value::Object(None))),
+                _ => Err(npe("session id cannot be null")),
+            }
+        },
     );
 
     let sf = "javax/net/ssl/SSLSocketFactory";
@@ -14009,6 +14144,260 @@ pub(crate) fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
     // `native-builtins/tests/registry_contracts.rs::
     // ssl_default_factory_and_context_have_the_documented_single_owner`.
     // See `fixed-suite-bugs/springboot/sslsocketfactory-getdefault-aether-resolution-regression-20260804-FIXED.md`.
+}
+
+// ===========================================================================
+// RE.6b - the `java.net.ServerSocket` surface `javax.net.ssl.SSLServerSocket`
+//         INHERITS
+// ===========================================================================
+//
+// MEASURED 2026-08-17 on HotSpot 25.0.3+9-LTS vs the `--jdk-only` binary from
+// `d87dff06a`+2 (probe `G16Sweep`, record
+// `G16-1-the-server-socket-impl-and-how-far-RSslLiveSession-got-20260817.md`).
+//
+// `t27_tls::create_ssl_server_socket` hands back an instance of the REAL
+// `javax.net.ssl.SSLServerSocket`, then stores its listener id / local port /
+// closed flag in object slots 0/1/2. Those are not free slots: `javap -p
+// java.net.ServerSocket` (JDK 25) declares
+//
+//     0 impl (SocketImpl)   1 created (boolean)   2 bound (boolean)
+//     3 closed (boolean)    4 socketLock (Object) 5 options (Set)
+//
+// so slot 0 is the reference-typed `impl`. Writing a `Value::Int` there is
+// DROPPED by the field-layout guard (the same drop `SockSide`/`SsSide` were
+// introduced for), `impl` stays null, and every inherited method whose real
+// bytecode reads `getImpl()` throws
+//
+//     NullPointerException: Cannot invoke "java.net.SocketImpl.setOption(int,
+//     Object)" because the return value of "java.net.ServerSocket.getImpl()"
+//     is null
+//
+// which is where `RSslLiveSession` died on its FIRST statement,
+// `ss.setSoTimeout(SO_TIMEOUT_MS)`, before any TLS work.
+//
+// The repair here does not transcribe the JDK's answers - it borrows them.
+// Each of these nine methods is forwarded to a real, **unbound**
+// `java.net.ServerSocket` created on first use and remembered per receiver.
+// That is not an approximation: the sweep measured all four lifecycle points
+// on both VMs and every option row of a BOUND `sun.security.ssl.
+// SSLServerSocketImpl` is byte-identical to the same row on an UNBOUND plain
+// `ServerSocket` - value, exception class and message alike, including
+// `SO_REUSEPORT` -> `UnsupportedOperationException("'SO_REUSEPORT' not
+// supported")`, `setSoTimeout(-1)` -> `IllegalArgumentException("timeout <
+// 0")`, `setReceiveBufferSize(0)` -> `IllegalArgumentException("negative
+// receive size")` and `getOption(null)` -> a message-less NPE. The two
+// argument-check orderings that differ between siblings (`setSoTimeout` tests
+// closed-ness FIRST, `setReceiveBufferSize` tests the argument first) come
+// out right for free, because they are the real bytecode's orderings.
+//
+// Deliberately NOT registered here, and nominated to `t27_tls.rs` instead:
+// `isBound`, `getInetAddress`, `getLocalSocketAddress` and `toString`. They
+// need the bind ADDRESS, which only `create_ssl_server_socket` sees, and they
+// have to move together: `ServerSocket.toString()` returns the constant
+// `"ServerSocket[unbound]"` while `isBound()` is false, so making `isBound()`
+// answer the oracle's `true` on its own converts a row that currently AGREES
+// with HotSpot into an NPE on `impl.getInetAddress()`.
+
+/// The real, unbound `java.net.ServerSocket` standing behind one
+/// `javax.net.ssl.SSLServerSocket`'s inherited option surface.
+///
+/// Held as a global-root HANDLE (`NativeContext::add_global_root`), never a
+/// bare `ObjectRef`: the collector moves objects and a stale reference
+/// resolves to whatever now occupies the slot. Same rule as `lang_class`'s
+/// package cache and `jca::provider_chain`'s provider table.
+#[derive(Clone, Copy, Debug)]
+struct SssOptionDelegate {
+    /// `add_global_root` handle of the delegate `java.net.ServerSocket`.
+    root: usize,
+    /// Whether the SSL socket's `close()` has already been mirrored onto the
+    /// delegate. One-way — a `ServerSocket` never reopens.
+    closed: bool,
+}
+
+/// Receiver identity hash -> its delegate. Only a `usize` handle and a `bool`
+/// are stored, so the table needs no GC roots of its own and survives object
+/// relocation (identity hash codes are stable across a move).
+fn sss_option_delegates() -> &'static Mutex<HashMap<i32, SssOptionDelegate>> {
+    static T: OnceLock<Mutex<HashMap<i32, SssOptionDelegate>>> = OnceLock::new();
+    T.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Resolve — creating on first use — the delegate handle for `this`, and bring
+/// its closed-ness up to date with the SSL socket's.
+///
+/// `isClosed()` is asked of the SSL socket itself rather than read out of any
+/// field: `t27_tls` owns that native, its side table is the authority, and the
+/// object slot it also writes (`SSS_CLOSED = 2`) is really `ServerSocket.bound`
+/// (see the layout above), so the field says the opposite thing.
+fn sss_option_delegate_root(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+) -> Result<usize, MethodCallFailed> {
+    let key = ctx.identity_hash_code(this);
+    let known = sss_option_delegates().lock().get(&key).copied();
+
+    let mut entry = match known {
+        Some(e) if ctx.resolve_global_root(e.root).is_some() => e,
+        _ => {
+            let created = match ctx.new_object_initialized("java/net/ServerSocket", "()V", &[])? {
+                Some(Value::Object(Some(obj))) => obj,
+                _ => {
+                    return Err(ioex(
+                        "SSLServerSocket: could not create the delegate java.net.ServerSocket",
+                    ))
+                }
+            };
+            let root = ctx.add_global_root(created);
+            if root == 0 {
+                return Err(ioex(
+                    "SSLServerSocket: no global root for the delegate java.net.ServerSocket",
+                ));
+            }
+            // A FRESH delegate is open, whatever the previous one was, so the
+            // flag starts false and the sync below re-derives it from the SSL
+            // socket and closes this one if it has to. Inheriting the old
+            // `closed: true` would skip that sync and leave an OPEN delegate
+            // answering for a CLOSED socket -- the one state where every row of
+            // this surface is supposed to throw.
+            let fresh = SssOptionDelegate {
+                root,
+                closed: false,
+            };
+            sss_option_delegates().lock().insert(key, fresh);
+            fresh
+        }
+    };
+
+    if !entry.closed {
+        let closed = ctx
+            .invoke_virtual(this, "isClosed", "()Z", &[])?
+            .and_then(|v| v.as_int())
+            .unwrap_or(0)
+            != 0;
+        if closed {
+            let delegate = ctx.resolve_global_root(entry.root).ok_or_else(|| {
+                ioex("SSLServerSocket: delegate java.net.ServerSocket was collected")
+            })?;
+            ctx.invoke_virtual(delegate, "close", "()V", &[])?;
+            entry.closed = true;
+            sss_option_delegates().lock().insert(key, entry);
+        }
+    }
+    Ok(entry.root)
+}
+
+/// Forward one inherited call to the delegate, unchanged.
+///
+/// Every reference argument is pinned across the delegate lookup: creating the
+/// delegate runs a Java constructor and `isClosed()` runs a registered native,
+/// and either can move objects under the collector.
+fn sss_option_call(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+    name: &str,
+    descriptor: &str,
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let pin_base = ctx.pin_native_root(this);
+    let mut pinned: Vec<(usize, ObjectRef)> = Vec::new();
+    for value in args.iter().skip(1) {
+        if let Value::Object(Some(obj)) = value {
+            pinned.push((ctx.pin_native_root(*obj), *obj));
+        }
+    }
+    let receiver = ctx.read_native_pin(pin_base, this);
+    let root = match sss_option_delegate_root(ctx, receiver) {
+        Ok(root) => root,
+        Err(error) => {
+            ctx.unpin_native_roots(pin_base);
+            return Err(error);
+        }
+    };
+    let mut rest: Vec<Value> = Vec::with_capacity(args.len().saturating_sub(1));
+    let mut next = 0usize;
+    for value in args.iter().skip(1) {
+        match value {
+            Value::Object(Some(_)) => {
+                let (handle, fallback) = pinned[next];
+                next += 1;
+                rest.push(Value::Object(Some(ctx.read_native_pin(handle, fallback))));
+            }
+            other => rest.push(*other),
+        }
+    }
+    let delegate = ctx.resolve_global_root(root);
+    ctx.unpin_native_roots(pin_base);
+    let delegate = delegate
+        .ok_or_else(|| ioex("SSLServerSocket: delegate java.net.ServerSocket was collected"))?;
+    ctx.invoke_virtual(delegate, name, descriptor, &rest)
+}
+
+/// Descriptor of `ServerSocket.setOption`, spelled once so the registration and
+/// the forwarded call cannot drift apart.
+const SSS_SET_OPTION_DESC: &str =
+    "(Ljava/net/SocketOption;Ljava/lang/Object;)Ljava/net/ServerSocket;";
+
+/// Register the nine inherited `java.net.ServerSocket` methods that a
+/// `javax.net.ssl.SSLServerSocket` receiver cannot answer for itself.
+///
+/// Every name here is disjoint from the set `t27_tls::register_sslserversocket`
+/// claims on the same class (`accept`, `bind`, `close`, `isClosed`,
+/// `getLocalPort`, and the protocol/client-auth pairs). That matters: this
+/// registrar runs from `register_phase_e_networking` (lib.rs:18688) and
+/// `register_sslserversocket` runs later, from `register_t27_natives`
+/// (lib.rs:18731), so a name in both files would be silently taken over by
+/// t27's body — the shadowing shape that has already cost this codebase a
+/// working fix more than once. `ssl_server_socket_option_registrar_*` below
+/// fails if a t27-owned name is ever added here.
+fn register_ssl_server_socket_options(r: &mut NativeMethodRegistry) {
+    let sss = "javax/net/ssl/SSLServerSocket";
+
+    r.register(sss, "getSoTimeout", "()I", |ctx, args| {
+        sss_option_call(ctx, args, "getSoTimeout", "()I")
+    });
+    r.register(sss, "setSoTimeout", "(I)V", |ctx, args| {
+        sss_option_call(ctx, args, "setSoTimeout", "(I)V")
+    });
+    r.register(sss, "getReuseAddress", "()Z", |ctx, args| {
+        sss_option_call(ctx, args, "getReuseAddress", "()Z")
+    });
+    r.register(sss, "setReuseAddress", "(Z)V", |ctx, args| {
+        sss_option_call(ctx, args, "setReuseAddress", "(Z)V")
+    });
+    r.register(sss, "getReceiveBufferSize", "()I", |ctx, args| {
+        sss_option_call(ctx, args, "getReceiveBufferSize", "()I")
+    });
+    r.register(sss, "setReceiveBufferSize", "(I)V", |ctx, args| {
+        sss_option_call(ctx, args, "setReceiveBufferSize", "(I)V")
+    });
+    r.register(sss, "supportedOptions", "()Ljava/util/Set;", |ctx, args| {
+        sss_option_call(ctx, args, "supportedOptions", "()Ljava/util/Set;")
+    });
+    r.register(
+        sss,
+        "getOption",
+        "(Ljava/net/SocketOption;)Ljava/lang/Object;",
+        |ctx, args| {
+            sss_option_call(
+                ctx,
+                args,
+                "getOption",
+                "(Ljava/net/SocketOption;)Ljava/lang/Object;",
+            )
+        },
+    );
+    // `setOption` returns the socket for chaining, and it must be the SSL
+    // socket the caller passed in — handing back the delegate would let
+    // `ss.setOption(..).accept()` accept on the plain listener instead.
+    r.register(sss, "setOption", SSS_SET_OPTION_DESC, |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let pin = ctx.pin_native_root(this);
+        let result = sss_option_call(ctx, args, "setOption", SSS_SET_OPTION_DESC);
+        let this = ctx.read_native_pin(pin, this);
+        ctx.unpin_native_roots(pin);
+        result?;
+        Ok(Some(Value::Object(Some(this))))
+    });
 }
 
 // ===========================================================================
@@ -19398,6 +19787,128 @@ mod tests {
         let (stream, _) = listener.accept().unwrap();
         let req = parse_http_request(stream).unwrap();
         assert_eq!(req.body, b"hi");
+    }
+
+    /// MEASURED 2026-08-17 (probe `G16Ctx`, HotSpot 25.0.3+9-LTS): a freshly
+    /// `init`-ed `SSLContext`'s session contexts answer 20480 and 86400 on the
+    /// first call, before anything is configured. They used to answer 0 and 0 —
+    /// which is not "no answer", it is the answer a caller gets after SETTING
+    /// zero, so the initial state was reporting itself as a configured one.
+    #[test]
+    fn ssl_session_context_defaults_are_the_measured_hotspot_values() {
+        let fresh = SscSide::default();
+        assert_eq!(
+            fresh.cache_size, 20480,
+            "SSLSessionContext.getSessionCacheSize() on an unconfigured context"
+        );
+        assert_eq!(
+            fresh.timeout_secs, 86400,
+            "SSLSessionContext.getSessionTimeout() on an unconfigured context, in seconds"
+        );
+    }
+
+    /// The nine inherited `java.net.ServerSocket` methods RE.6b takes over on a
+    /// `javax.net.ssl.SSLServerSocket` receiver. Each one was MEASURED throwing
+    /// `NullPointerException: ... the return value of
+    /// "java.net.ServerSocket.getImpl()" is null` before this registrar existed
+    /// (probe `G16Sweep`, 2026-08-17); `RSslLiveSession` died on the second of
+    /// them at its first statement.
+    #[test]
+    fn ssl_server_socket_inherited_option_surface_is_registered() {
+        let mut registry = NativeMethodRegistry::new();
+        register_ssl_server_socket_options(&mut registry);
+        for (method, descriptor) in [
+            ("getSoTimeout", "()I"),
+            ("setSoTimeout", "(I)V"),
+            ("getReuseAddress", "()Z"),
+            ("setReuseAddress", "(Z)V"),
+            ("getReceiveBufferSize", "()I"),
+            ("setReceiveBufferSize", "(I)V"),
+            ("supportedOptions", "()Ljava/util/Set;"),
+            ("getOption", "(Ljava/net/SocketOption;)Ljava/lang/Object;"),
+            (
+                "setOption",
+                "(Ljava/net/SocketOption;Ljava/lang/Object;)Ljava/net/ServerSocket;",
+            ),
+        ] {
+            assert!(
+                registry
+                    .find("javax/net/ssl/SSLServerSocket", method, descriptor)
+                    .is_some(),
+                "missing SSLServerSocket.{method}{descriptor} native"
+            );
+        }
+    }
+
+    /// The registrar must NOT claim any name `t27_tls::register_sslserversocket`
+    /// owns on the same class. `register_phase_e_networking` runs at
+    /// lib.rs:18688 and `register_t27_natives` at lib.rs:18731, so a name in
+    /// both files is silently taken over by t27's later body — a fix that
+    /// compiles, registers, and never runs. That failure shape has already
+    /// landed twice in this codebase (HANDOFF-20260814 §5); this test is the
+    /// tripwire for the third time.
+    #[test]
+    fn ssl_server_socket_option_registrar_leaves_the_t27_owned_names_alone() {
+        let mut registry = NativeMethodRegistry::new();
+        register_ssl_server_socket_options(&mut registry);
+        for (method, descriptor) in [
+            ("accept", "()Ljava/net/Socket;"),
+            ("bind", "(Ljava/net/SocketAddress;)V"),
+            ("close", "()V"),
+            ("isClosed", "()Z"),
+            ("getLocalPort", "()I"),
+            ("getEnabledProtocols", "()[Ljava/lang/String;"),
+            ("getSupportedProtocols", "()[Ljava/lang/String;"),
+            ("setEnabledProtocols", "([Ljava/lang/String;)V"),
+            ("getNeedClientAuth", "()Z"),
+            ("setNeedClientAuth", "(Z)V"),
+            ("getWantClientAuth", "()Z"),
+            ("setWantClientAuth", "(Z)V"),
+        ] {
+            assert!(
+                registry
+                    .find("javax/net/ssl/SSLServerSocket", method, descriptor)
+                    .is_none(),
+                "SSLServerSocket.{method}{descriptor} is t27_tls's; registering it \
+                 here is dead code, because register_t27_natives runs later and wins"
+            );
+        }
+    }
+
+    /// `isBound` / `getInetAddress` / `getLocalSocketAddress` / `toString` are
+    /// deliberately absent, and must stay absent until the bind ADDRESS reaches
+    /// this surface. MEASURED: `ServerSocket.toString()` short-circuits to the
+    /// constant `"ServerSocket[unbound]"` while `isBound()` is false, which is
+    /// the only reason `toString()` currently agrees with HotSpot on a live SSL
+    /// server socket. Registering `isBound` alone flips that agreeing row into
+    /// `NullPointerException: ... "this.impl" is null`. They move together or
+    /// not at all — see the NOMINATION in
+    /// `G16-1-the-server-socket-impl-and-how-far-RSslLiveSession-got-20260817.md`.
+    #[test]
+    fn ssl_server_socket_bound_identity_rows_are_not_registered_piecemeal() {
+        let mut registry = NativeMethodRegistry::new();
+        register_ssl_server_socket_options(&mut registry);
+        let bound_rows = [
+            ("isBound", "()Z"),
+            ("getInetAddress", "()Ljava/net/InetAddress;"),
+            ("getLocalSocketAddress", "()Ljava/net/SocketAddress;"),
+            ("toString", "()Ljava/lang/String;"),
+        ];
+        let mut registered = 0usize;
+        for (method, descriptor) in bound_rows {
+            if registry
+                .find("javax/net/ssl/SSLServerSocket", method, descriptor)
+                .is_some()
+            {
+                registered += 1;
+            }
+        }
+        assert!(
+            registered == 0 || registered == bound_rows.len(),
+            "{registered} of {} bind-address-dependent rows registered; isBound and \
+             toString are one contract and cannot land separately",
+            bound_rows.len()
+        );
     }
 
     #[test]

@@ -21099,12 +21099,64 @@ pub(crate) fn register_phase54_logging_extras(r: &mut NativeMethodRegistry) {
 
     // --- Handler (abstract base, 1-field: level=0) ---
     let handler = "java/util/logging/Handler";
+    // `setLevel` REFUSES a null level, and the refusal happens BEFORE the
+    // store. Both halves are MEASURED (2026-08-17, `scratchpad/g21`, HotSpot
+    // 25.0.3+9-LTS vs `--jdk-only`):
+    //
+    //   Handler.setLevel(null)                          HotSpot NPE msg=null
+    //   Handler.getLevel() after the REFUSED setLevel   HotSpot ALL
+    //
+    // The second row is why the check cannot be "store, then throw": this body
+    // used to write the null and return, so `getLevel()` afterwards answered
+    // `null` where HotSpot still answers the level that was there. Two
+    // assertions of `RJdkIntrinsics3`'s `logrec` family ride on this one body.
+    //
+    // The NPE is BARE. `Level.parse(null)` in `logmanager.rs` carried an
+    // invented `"Name cannot be null"` for months on a row whose CLASS was
+    // already right; do not add a message here that HotSpot does not produce.
+    // `Handler.setFormatter(null)` and `LogRecord.setLevel(null)` are the same
+    // bare shape.
+    //
+    // NOT A BLANKET JUL RULE, and the surrounding rows prove it. MEASURED on
+    // the same oracle run, same probe:
+    //
+    //   Handler.setFilter(null)      RETURNS   Handler.setEncoding(null) RETURNS
+    //   Logger.setLevel(null)        RETURNS   <- the SAME NAME, opposite verdict
+    //   Logger.removeHandler(null)   RETURNS   while addHandler(null) throws
+    //   LogRecord.set{Message,LoggerName,Parameters,Thrown,ResourceBundle,
+    //     ResourceBundleName}(null) RETURN, and so do the retired
+    //     set{SourceClassName,SourceMethodName} pair
+    //     -- those six ARE the `lr_set` store-then-return bodies a few dozen
+    //     lines above, so "add a null check to the JUL setters" would break
+    //     six measured rows in THIS function to fix one. Only
+    //     `LogRecord.setLevel` and `setInstant` throw, and this file registers
+    //     NEITHER: the real bytecode already gets both right.
+    //
+    // The shape underneath: a JUL method throws when its own first statement
+    // dereferences the argument, and returns when the argument is merely
+    // stored. `Handler.setLevel` opens `if (newLevel == null) throw`; on
+    // `Logger` a null level MEANS "inherit from the parent" and is a legal
+    // state. That explains the difference; it does not license deriving any
+    // other row from it. G21-1, G15-1 §2, HANDOFF-20260814 §5.
+    //
+    // In `Compatible` this registration does not own the slot --
+    // `reflect_annotations.rs:370` overwrites it and already carries this
+    // contract (MEASURED: `owns_slot=false inv=0` here, `owns_slot=true inv=11`
+    // there). `--jdk-only` never runs `register_synthetic_overrides`, so THIS
+    // body is the only one, and it owns the slot (MEASURED: `kind=intrinsic
+    // owns_slot=true overwrote=null inv=12`). The `java/util/logging/` shadow
+    // retirement does not reach it either: `retired_shadow.rs:445` lists the
+    // triple, but that retag fires only on an effective category of `Bridge`
+    // and this function's ambient category is `Intrinsic`.
     r.register(
         handler,
         "setLevel",
         "(Ljava/util/logging/Level;)V",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
+            if matches!(args.get(1), None | Some(Value::Object(None))) {
+                return Err(RuntimeError::NullPointerException { message: None }.into());
+            }
             ctx.set_field(this, 0, args[1]);
             Ok(Some(Value::Object(None)))
         },
@@ -21193,14 +21245,23 @@ pub(crate) fn register_phase54_logging_extras(r: &mut NativeMethodRegistry) {
             |ctx, args| match args.get(1) {
                 Some(Value::Object(Some(rec))) => jul_formatter_format_message(ctx, *rec),
                 // A null record is an NPE on HotSpot (`record.getMessage()` is
-                // the method's first act). This row has answered with an empty
-                // string since it was written and nothing measured exercises
-                // the null, so the historical answer is kept rather than
-                // introducing a throw that no test can adjudicate.
-                _ => {
-                    let s = ctx.create_string("");
-                    Ok(Some(Value::Object(Some(s))))
+                // the method's first act). This arm used to answer with the
+                // EMPTY STRING, and its comment used to say "nothing measured
+                // exercises the null, so the historical answer is kept". That
+                // is no longer true: MEASURED 2026-08-17 (`scratchpad/g21`),
+                // HotSpot 25.0.3+9-LTS throws the helpful NPE below, and
+                // CratonVM returned `""` in BOTH modes — this registration owns
+                // the slot in both (`owns_slot=true overwrote=null inv=2`).
+                //
+                // The message is TRANSCRIBED from that run, not derived. It is
+                // a helpful-NPE naming the parameter `record`, unlike the BARE
+                // NPE of `Handler.setLevel(null)` a few dozen lines above; the
+                // two rows are in the same family and do not share a shape.
+                // G21-1 N2 / G15-1 §6 N2.
+                _ => Err(RuntimeError::NullPointerException {
+                    message: Some(JUL_NPE_NULL_FORMAT_RECORD.to_string()),
                 }
+                .into()),
             },
         );
     });
@@ -21274,6 +21335,16 @@ pub(crate) fn register_phase54_logging_extras(r: &mut NativeMethodRegistry) {
     });
     r.set_category(__prev_cat);
 }
+
+/// HotSpot's helpful-NPE text for `Formatter.formatMessage(null)`.
+///
+/// TRANSCRIBED from a HotSpot 25.0.3+9-LTS run (`scratchpad/g21`, 2026-08-17),
+/// not derived: `formatMessage`'s first act is `record.getMessage()`, and the
+/// helpful-NPE machinery names the receiver expression and the parameter. The
+/// class alone is not enough to assert — `Level.parse(null)` shipped the right
+/// class with an invented `"Name cannot be null"` for months (G15-1 §4).
+const JUL_NPE_NULL_FORMAT_RECORD: &str =
+    "Cannot invoke \"java.util.logging.LogRecord.getMessage()\" because \"record\" is null";
 
 /// Does the message look like a `java.text` format string?
 ///
@@ -25355,5 +25426,285 @@ mod t2_tests {
         // for a digit, and must not miss a pattern that follows one.
         assert!(!jul_message_is_java_text_format("héllo {x}"));
         assert!(jul_message_is_java_text_format("héllo {0}"));
+    }
+
+    // =======================================================================
+    // G21 — the JUL null axis on the rows THIS file owns.
+    //
+    // Every expectation below is transcribed from a HotSpot 25.0.3+9-LTS run
+    // (`scratchpad/g21/G21Probe.java`, 2026-08-17, 34 rows), not read off the
+    // JDK source and not carried over from another record.
+    //
+    // The tests come in PAIRS on purpose, and the second half is the half that
+    // matters. `Handler.setLevel(null)` throws while `Handler.setFilter(null)`,
+    // `Logger.setLevel(null)` and NINE `LogRecord` setters return normally — a
+    // blanket "JUL rejects null" rule passes every throws-test here and breaks
+    // 22 measured rows. HANDOFF-20260814 §5 records that generalisation as
+    // having already cost this family working paths once. If a later change
+    // adds a null guard to `lr_set`, or to the `Handler` setters this file does
+    // not register, `jul_log_record_reference_setters_accept_null_and_must_not_
+    // throw` and `jul_this_file_registers_no_other_handler_setter` are what go
+    // red.
+    // =======================================================================
+
+    /// A registry with only this file's JUL rows in it.
+    fn jul_registry() -> NativeMethodRegistry {
+        let mut r = NativeMethodRegistry::new();
+        register_phase54_logging_extras(&mut r);
+        r
+    }
+
+    fn jul_find(
+        r: &NativeMethodRegistry,
+        class: &str,
+        name: &str,
+        desc: &str,
+    ) -> cratonvm_native_api::NativeCallback {
+        r.find(class, name, desc)
+            .unwrap_or_else(|| panic!("{class}.{name}{desc} is not registered by this file"))
+    }
+
+    fn jul_runtime_error(failed: MethodCallFailed) -> RuntimeError {
+        match failed {
+            MethodCallFailed::InternalError(cratonvm_types::error::VmError::Runtime(e)) => e,
+            other => panic!("expected a RuntimeError, got {other:?}"),
+        }
+    }
+
+    /// Assert an NPE whose message is EXACTLY `expected` — `None` for the bare
+    /// NPE HotSpot throws from `Handler.setLevel`. The message is asserted, not
+    /// just the class: `Level.parse(null)` threw the right class with an
+    /// invented `"Name cannot be null"` for months (G15-1 §4), so a
+    /// class-only assertion is not enough to pin one of these rows.
+    fn jul_assert_npe(result: MethodCallResult, expected: Option<&str>, what: &str) {
+        let err = result
+            .err()
+            .unwrap_or_else(|| panic!("{what}: expected a throw, got a return"));
+        match jul_runtime_error(err) {
+            RuntimeError::NullPointerException { message } => assert_eq!(
+                message.as_deref(),
+                expected,
+                "{what}: NPE message must be HotSpot's text verbatim"
+            ),
+            other => panic!("{what}: expected NullPointerException, got {other:?}"),
+        }
+    }
+
+    const JUL_SET_LEVEL_DESC: &str = "(Ljava/util/logging/Level;)V";
+    const JUL_GET_LEVEL_DESC: &str = "()Ljava/util/logging/Level;";
+
+    /// MEASURED: `Handler.setLevel(null)` throws a BARE `NullPointerException`
+    /// (`getMessage()` is null), and — the half a "store, then throw" fix would
+    /// still get wrong — `getLevel()` afterwards answers the level that was
+    /// already there.
+    #[test]
+    fn jul_handler_set_level_null_is_refused_before_the_store() {
+        let r = jul_registry();
+        let set_level = jul_find(
+            &r,
+            "java/util/logging/Handler",
+            "setLevel",
+            JUL_SET_LEVEL_DESC,
+        );
+        let get_level = jul_find(
+            &r,
+            "java/util/logging/Handler",
+            "getLevel",
+            JUL_GET_LEVEL_DESC,
+        );
+
+        let mut ctx = mock_ctx();
+        let handler = ctx.alloc_object(ClassId::new(0), 1);
+        let level = ctx.alloc_object(ClassId::new(1), 0);
+        set_level(
+            &mut ctx,
+            &[Value::Object(Some(handler)), Value::Object(Some(level))],
+        )
+        .expect("a non-null level must be stored");
+
+        jul_assert_npe(
+            set_level(
+                &mut ctx,
+                &[Value::Object(Some(handler)), Value::Object(None)],
+            ),
+            None,
+            "Handler.setLevel(null)",
+        );
+
+        // The store must NOT have happened. This is the second `RJdkIntrinsics3`
+        // assertion: `logrec:Handler.getLevel() unchanged by the failed set`.
+        assert_eq!(
+            get_level(&mut ctx, &[Value::Object(Some(handler))]).unwrap(),
+            Some(Value::Object(Some(level))),
+            "a refused setLevel(null) must leave the previous level in place"
+        );
+    }
+
+    /// The happy path still stores, so the guard cannot be a blanket refusal.
+    #[test]
+    fn jul_handler_set_level_still_stores_a_real_level() {
+        let r = jul_registry();
+        let set_level = jul_find(
+            &r,
+            "java/util/logging/Handler",
+            "setLevel",
+            JUL_SET_LEVEL_DESC,
+        );
+        let get_level = jul_find(
+            &r,
+            "java/util/logging/Handler",
+            "getLevel",
+            JUL_GET_LEVEL_DESC,
+        );
+
+        let mut ctx = mock_ctx();
+        let handler = ctx.alloc_object(ClassId::new(0), 1);
+        let warning = ctx.alloc_object(ClassId::new(1), 0);
+        let all = ctx.alloc_object(ClassId::new(1), 0);
+
+        set_level(
+            &mut ctx,
+            &[Value::Object(Some(handler)), Value::Object(Some(warning))],
+        )
+        .unwrap();
+        assert_eq!(
+            get_level(&mut ctx, &[Value::Object(Some(handler))]).unwrap(),
+            Some(Value::Object(Some(warning)))
+        );
+        set_level(
+            &mut ctx,
+            &[Value::Object(Some(handler)), Value::Object(Some(all))],
+        )
+        .unwrap();
+        assert_eq!(
+            get_level(&mut ctx, &[Value::Object(Some(handler))]).unwrap(),
+            Some(Value::Object(Some(all))),
+            "setLevel must still overwrite an existing level"
+        );
+    }
+
+    /// **The anti-generalisation half.** Nine `LogRecord` setters take null and
+    /// RETURN on HotSpot. Six of them are reference-typed rows this test can
+    /// reach through the shared `lr_set` store-then-return body; the
+    /// `setSourceClassName` / `setSourceMethodName` pair is left out because it
+    /// is `Bridge`-tagged and retired under `--jdk-only`, and
+    /// `setLongThreadID` is not reference-typed. MEASURED rows 23-30 of the G21
+    /// probe: `setLoggerName`, `setMessage`, `setParameters`, `setThrown`,
+    /// `setResourceBundle`, `setResourceBundleName` all RETURNED, on HotSpot
+    /// and on CratonVM alike.
+    ///
+    /// This test fails the moment someone "fixes the JUL null contract" by
+    /// putting a guard in `lr_set`.
+    #[test]
+    fn jul_log_record_reference_setters_accept_null_and_must_not_throw() {
+        let r = jul_registry();
+        let lr = "java/util/logging/LogRecord";
+        let legal: [(&str, &str); 6] = [
+            ("setLoggerName", "(Ljava/lang/String;)V"),
+            ("setMessage", "(Ljava/lang/String;)V"),
+            ("setParameters", "([Ljava/lang/Object;)V"),
+            ("setThrown", "(Ljava/lang/Throwable;)V"),
+            ("setResourceBundle", "(Ljava/util/ResourceBundle;)V"),
+            ("setResourceBundleName", "(Ljava/lang/String;)V"),
+        ];
+        let mut ctx = mock_ctx();
+        let record = ctx.alloc_object(ClassId::new(0), 12);
+        for (name, desc) in legal {
+            let cb = jul_find(&r, lr, name, desc);
+            let result = cb(
+                &mut ctx,
+                &[Value::Object(Some(record)), Value::Object(None)],
+            );
+            assert!(
+                result.is_ok(),
+                "LogRecord.{name}{desc} with null is LEGAL on HotSpot and must not throw"
+            );
+        }
+    }
+
+    /// `LogRecord.setLevel` and `setInstant` DO throw on HotSpot — and this
+    /// file must not be the reason. Neither is registered here, so the real
+    /// bytecode runs and throws on its own; MEASURED rows 21 and 31 already
+    /// match on `--jdk-only` with no native involved.
+    ///
+    /// Pinning the absence keeps a later lane from "completing the set" by
+    /// adding a raw-slot `setLevel` here, which is exactly how `Handler`'s
+    /// unguarded body got written.
+    #[test]
+    fn jul_log_record_set_level_and_set_instant_are_left_to_real_bytecode() {
+        let r = jul_registry();
+        let lr = "java/util/logging/LogRecord";
+        assert!(
+            r.find(lr, "setLevel", JUL_SET_LEVEL_DESC).is_none(),
+            "LogRecord.setLevel must stay unregistered: the real bytecode already throws"
+        );
+        assert!(
+            r.find(lr, "setInstant", "(Ljava/time/Instant;)V").is_none(),
+            "LogRecord.setInstant must stay unregistered: the real bytecode already throws"
+        );
+    }
+
+    /// **The other anti-generalisation half.** `Handler.setFilter(null)`,
+    /// `setEncoding(null)` RETURN on HotSpot while `setFormatter(null)` and
+    /// `setErrorManager(null)` throw — four siblings, two verdicts. This file
+    /// registers NONE of them, so under `--jdk-only` the real bytecode gives
+    /// all four the right answer (MEASURED rows 3-10, all matching).
+    ///
+    /// Registering any of them here would put the verdict back in Rust's hands
+    /// for no measured gain, and the two that must RETURN are the ones a
+    /// copy of the `setLevel` guard would break.
+    #[test]
+    fn jul_this_file_registers_no_other_handler_setter() {
+        let r = jul_registry();
+        let handler = "java/util/logging/Handler";
+        let untouched: [(&str, &str); 4] = [
+            ("setFilter", "(Ljava/util/logging/Filter;)V"),
+            ("setEncoding", "(Ljava/lang/String;)V"),
+            ("setFormatter", "(Ljava/util/logging/Formatter;)V"),
+            ("setErrorManager", "(Ljava/util/logging/ErrorManager;)V"),
+        ];
+        for (name, desc) in untouched {
+            assert!(
+                r.find(handler, name, desc).is_none(),
+                "Handler.{name}{desc} is served correctly by real bytecode; do not register it here"
+            );
+        }
+    }
+
+    /// MEASURED: `Formatter.formatMessage(null)` throws a HELPFUL NPE naming
+    /// the `record` parameter — a different shape from `Handler.setLevel`'s
+    /// bare one, in the same family, which is why both are asserted verbatim.
+    /// This row was wrong in BOTH modes (it answered `""`).
+    #[test]
+    fn jul_formatter_format_message_null_record_throws_the_measured_npe() {
+        let r = jul_registry();
+        let cb = jul_find(
+            &r,
+            "java/util/logging/Formatter",
+            "formatMessage",
+            "(Ljava/util/logging/LogRecord;)Ljava/lang/String;",
+        );
+        let mut ctx = mock_ctx();
+        let formatter = ctx.alloc_object(ClassId::new(0), 0);
+        jul_assert_npe(
+            cb(
+                &mut ctx,
+                &[Value::Object(Some(formatter)), Value::Object(None)],
+            ),
+            Some(JUL_NPE_NULL_FORMAT_RECORD),
+            "Formatter.formatMessage(null)",
+        );
+    }
+
+    /// The one NPE message this file hard-codes, transcribed from the oracle
+    /// run. `Handler.setLevel`'s NPE has no message at all and is pinned as
+    /// `None` above; if HotSpot's text ever changes, these are the two cells to
+    /// re-measure.
+    #[test]
+    fn jul_the_null_messages_are_the_measured_hotspot_text() {
+        assert_eq!(
+            JUL_NPE_NULL_FORMAT_RECORD,
+            "Cannot invoke \"java.util.logging.LogRecord.getMessage()\" because \"record\" is null"
+        );
     }
 }

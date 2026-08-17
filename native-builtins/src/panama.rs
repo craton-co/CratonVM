@@ -2710,23 +2710,41 @@ fn pe_segment_slice(
     if let Some(view) = heap_segment_view(ctx, this) {
         let read_only = i32::from(read_only_override.unwrap_or(view.read_only));
         let start = view.start.saturating_add(offset);
-        // The allocation below can MOVE the backing array (the native
-        // stale-local family), so pin it and re-read it through the
-        // pin — the same discipline the session handling below uses.
+        // G19-1: A SLICE OF A HEAP SEGMENT SHARES ITS PARENT'S SCOPE.
+        //
+        // MEASURED on 25.0.3+9-LTS (`G19Probe` SC8/SC9):
+        // `heap.asSlice(4,4).scope() == heap.scope()` and
+        // `heap.asReadOnly().scope() == heap.scope()` are both **true** — and
+        // `asReadOnly()` reaches this same body, so one write covers both. Slot
+        // 2 was an unconditional `Object(None)` here, which is the same
+        // "no scope resolvable" hole the NATIVE arm below closed for W7-89 and
+        // this arm never did; the fresh session `p67_receiver_session` minted
+        // instead was a different object on every call.
+        let parent_session = pe_segment_session(ctx, this);
+        // The allocation below can MOVE the backing array and the session (the
+        // native stale-local family), so pin both and re-read them through the
+        // pins — the same discipline the session handling below uses.
+        // `unpin_native_roots` truncates to its argument, so releasing the
+        // FIRST handle releases both.
         let base_pin = ctx.pin_native_root(view.base);
+        let session_pin = parent_session.map(|session| ctx.pin_native_root(session));
         let slice = try_alloc_concurrent_synthetic(
             ctx,
             "java/lang/foreign/MemorySegment",
             SEG_HEAP_FIELDS,
         )?;
         let base = ctx.read_native_pin(base_pin, view.base);
+        let scope_value = match (parent_session, session_pin) {
+            (Some(session), Some(pin)) => Value::Object(Some(ctx.read_native_pin(pin, session))),
+            _ => Value::Object(None),
+        };
         ctx.unpin_native_roots(base_pin);
         // Slot 0 stays 0: a heap slice has no machine address either,
         // and `segment_address` must keep answering the value every
         // raw-pointer consumer already refuses on.
         ctx.set_field(slice, 0, Value::Long(0));
         ctx.set_field(slice, 1, Value::Long(new_size));
-        ctx.set_field(slice, 2, Value::Object(None));
+        ctx.set_field(slice, 2, scope_value);
         ctx.set_field(slice, 3, Value::Int(read_only));
         ctx.set_field(slice, 4, Value::Int(1));
         ctx.set_field(slice, 5, Value::Long(0));
@@ -2966,6 +2984,21 @@ impl PeClassMemo {
         let relaxed = std::sync::atomic::Ordering::Relaxed;
         let class_id = ctx.class_id_of_object(obj);
         let raw = class_id.as_u32();
+        // G19-1: THE MEMO IS BYPASSED UNDER `cfg(test)`, AND ONLY THERE.
+        //
+        // Class ids are process-stable on the real VM, which is the whole
+        // premise of remembering one. Under `MockNativeContext` they are a
+        // PER-CONTEXT counter, so id 7 names `MemorySegment` in one test and
+        // `MemorySessionImpl` in the next — and this struct remembers exactly
+        // one hit and one miss for the whole process, so the second test is
+        // handed the first test's answer for a class it never saw. That made
+        // every test of a session-shaped predicate non-deterministic (it
+        // depends on which sibling test ran last, and they run in threads).
+        // The memo is a pure cache: skipping it changes no answer, only the
+        // number of `class_name_arc_of_id` calls.
+        if cfg!(test) {
+            return ctx.class_name_arc_of_id(class_id).as_deref() == Some(expected);
+        }
         if raw == self.hit.load(relaxed) {
             return true;
         }
@@ -2998,7 +3031,7 @@ static PE_SESSION_CLASS_MEMO: PeClassMemo = PeClassMemo::new();
 /// W7-58, never once fired. Calling the shared resolver keeps the decision in
 /// ONE implementation; open-coding the index here is what let the two files
 /// drift out of step in the first place.
-fn pe_session_modelled(ctx: &dyn NativeContext, session: ObjectRef) -> bool {
+pub(crate) fn pe_session_modelled(ctx: &dyn NativeContext, session: ObjectRef) -> bool {
     if !PE_SESSION_CLASS_MEMO.matches(ctx, session, PE_SESSION_CLASS) {
         return false;
     }
@@ -3493,7 +3526,8 @@ fn pe_segment_as_slice(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
 /// `MemorySegment.ofArray(byte[] | short[] | char[])` — an ALIAS carrier.
 ///
 /// Mints the H2 shape: `[0]=0` (no machine address), `[1]=byteSize`,
-/// `[6]=the array`, `[7]=0`. The element width is read off the array itself
+/// `[2]=this segment's session`, `[6]=the array`, `[7]=0`. The element width is
+/// read off the array itself
 /// through [`heap_element_width`], so the factory and the accessors cannot
 /// disagree about the stride. See the registration site for why these three
 /// alias where the four `int[]/long[]/float[]/double[]` arms copy.
@@ -3516,18 +3550,59 @@ fn pe_of_array_alias(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
         }
     };
     let byte_size = (ctx.array_length(array) as i64).saturating_mul(width);
-    // The allocation can MOVE `array` — pin and re-read through the pin.
-    let pin = ctx.pin_native_root(array);
+    // G19-1: THE SCOPE IS MINTED HERE, ONCE, NOT ON EVERY `scope()` CALL.
+    //
+    // MEASURED on 25.0.3+9-LTS (`G19Probe` §SC): a heap segment's scope is a
+    // per-segment session that can never close —
+    //
+    //     ofArray(new byte[16]).scope().getClass()
+    //         = jdk.internal.foreign.GlobalSession$HeapSession
+    //     heap.scope() == heap.scope()                  true
+    //     heap.asSlice(4,4).scope() == heap.scope()     true
+    //     heap.asReadOnly().scope() == heap.scope()     true
+    //     ofArray(a).scope() == ofArray(a).scope()      FALSE  (same array!)
+    //     heap.scope() == Arena.global().scope()        FALSE
+    //
+    // so it is neither a fresh object per CALL nor a process-wide singleton:
+    // it is one object per SEGMENT, shared by everything derived from it. With
+    // slot 2 left empty, `p67_receiver_session` found nothing on this carrier
+    // and minted a fresh always-open session on every `scope()` — measured
+    // `heap.scope() == heap.scope()` = **false**, which is the assertion
+    // `RForeignLayoutJdkInterfaces` dies on ("a heap segment's scope is
+    // stable").
+    //
+    // Slot 2 is the right home and not a new convention: `pe_segment_session`
+    // above already documents "tolerate a segment stamped with the session
+    // directly", and every OTHER reader of slot 2 in this file
+    // (`sync_heap_backed_segment`, `pe_segment_heap_base`'s fallback, the
+    // `isNative` discriminator) gates on `ctx.object_is_array`, which a session
+    // is not — so none of them changes its answer.
+    let array_pin = ctx.pin_native_root(array);
+    let session = crate::phases_late::foreign_ffm::p67_memory_session(ctx)?;
+    let array = ctx.read_native_pin(array_pin, array);
+    ctx.unpin_native_roots(array_pin);
+    // Both the array and the session must survive the segment's allocation, so
+    // both are pinned across it; `unpin_native_roots` truncates the pin stack
+    // to its argument, so the FIRST handle releases both.
+    let array_pin = ctx.pin_native_root(array);
+    let session_obj = match session {
+        Value::Object(Some(obj)) => Some((ctx.pin_native_root(obj), obj)),
+        _ => None,
+    };
     let seg = try_alloc_concurrent_synthetic(
         ctx,
         "java/lang/foreign/MemorySegment",
         SEG_HEAP_FIELDS,
     )?;
-    let array = ctx.read_native_pin(pin, array);
-    ctx.unpin_native_roots(pin);
+    let array = ctx.read_native_pin(array_pin, array);
+    let session = match session_obj {
+        Some((pin, obj)) => Value::Object(Some(ctx.read_native_pin(pin, obj))),
+        None => Value::Object(None),
+    };
+    ctx.unpin_native_roots(array_pin);
     ctx.set_field(seg, 0, Value::Long(0));
     ctx.set_field(seg, 1, Value::Long(byte_size));
-    ctx.set_field(seg, 2, Value::Object(None));
+    ctx.set_field(seg, 2, session);
     ctx.set_field(seg, 3, Value::Int(0));
     ctx.set_field(seg, 4, Value::Int(1));
     ctx.set_field(seg, 5, Value::Long(0));
@@ -9244,6 +9319,136 @@ mod tests {
                 "the write must alias the caller's {elem:?} array"
             );
         }
+    }
+
+    /// G19-1: a heap segment's scope is ONE session, minted with the segment,
+    /// and every view derived from it hands back that same object.
+    ///
+    /// MEASURED on 25.0.3+9-LTS (`G19Probe` §SC), and every row below is one of
+    /// those rows:
+    ///
+    /// ```text
+    /// heap.scope() == heap.scope()                 true
+    /// heap.asSlice(4,4).scope() == heap.scope()    true
+    /// heap.asReadOnly().scope() == heap.scope()    true
+    /// ofArray(a).scope() == ofArray(a).scope()     FALSE   (the same array!)
+    /// ```
+    ///
+    /// The last row is the one that says the answer is per-SEGMENT and not a
+    /// process-wide singleton, so it is asserted as a NEGATIVE — a fix that
+    /// handed every heap segment one shared session would satisfy the first
+    /// three and fail this one.
+    ///
+    /// Asserted through `pe_segment_session` as well as by slot, because the
+    /// slot write is only half the repair: the reader in `foreign_ffm`
+    /// (`p67_receiver_session`) has to recognise a session in slot 2, and if it
+    /// does not, `scope()` still mints a fresh one and this whole family stays
+    /// red with the carrier looking correct.
+    #[test]
+    fn a_heap_segments_scope_is_one_session_shared_by_its_slices() {
+        let mut ctx = mock_ctx();
+        let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, 16);
+        let seg = match pe_of_array_alias(&mut ctx, &[Value::Object(Some(arr))]).unwrap() {
+            Some(Value::Object(Some(seg))) => seg,
+            other => panic!("ofArray answered {other:?}"),
+        };
+
+        let session = match ctx.get_field(seg, PE_SEGMENT_ARENA_FIELD) {
+            Value::Object(Some(session)) => session,
+            other => panic!("slot 2 must carry the segment's session, got {other:?}"),
+        };
+        assert_eq!(
+            ctx.class_name_of_id(ctx.class_id_of_object(session))
+                .as_deref(),
+            Some(PE_SESSION_CLASS),
+            "the stamped object must be a session, not an arena and not the array"
+        );
+        assert_eq!(
+            pe_segment_session(&ctx, seg),
+            Some(session),
+            "the resolver must find the stamped session"
+        );
+
+        // A slice and a read-only view both go through `pe_segment_slice`, so
+        // one write covers both — assert both anyway, because that sharing is a
+        // property of today's call graph and not of the rule.
+        let slice = match pe_segment_as_slice(
+            &mut ctx,
+            &[Value::Object(Some(seg)), Value::Long(4), Value::Long(4)],
+        )
+        .unwrap()
+        {
+            Some(Value::Object(Some(slice))) => slice,
+            other => panic!("asSlice answered {other:?}"),
+        };
+        assert_eq!(
+            ctx.get_field(slice, PE_SEGMENT_ARENA_FIELD),
+            Value::Object(Some(session)),
+            "a slice of a heap segment must share its parent's scope"
+        );
+        assert_eq!(pe_segment_session(&ctx, slice), Some(session));
+
+        let read_only = match pe_segment_slice(&mut ctx, seg, 0, 16, Some(true)).unwrap() {
+            Some(Value::Object(Some(view))) => view,
+            other => panic!("asReadOnly answered {other:?}"),
+        };
+        assert_eq!(
+            pe_segment_session(&ctx, read_only),
+            Some(session),
+            "asReadOnly must not drop the scope on the floor"
+        );
+
+        // Per SEGMENT, not per array and not per process.
+        let twin = match pe_of_array_alias(&mut ctx, &[Value::Object(Some(arr))]).unwrap() {
+            Some(Value::Object(Some(twin))) => twin,
+            other => panic!("ofArray answered {other:?}"),
+        };
+        assert_ne!(
+            pe_segment_session(&ctx, twin),
+            Some(session),
+            "two segments over the SAME array have distinct scopes on the oracle"
+        );
+    }
+
+    /// G19-1: stamping the session into slot 2 must not disturb the slot's two
+    /// older tenants.
+    ///
+    /// Slot 2 is [`SEG_BACKING_ARRAY_FIELD`] on an `ofArray` MIRROR carrier and
+    /// the owning arena on an arena-allocated one, and three readers key off it
+    /// — `sync_heap_backed_segment`, `pe_segment_heap_base`'s fallback and the
+    /// `isNative` discriminator. All three gate on `ctx.object_is_array`, which
+    /// a session is not, so all three must answer exactly what they answered
+    /// before. `heapBase()` is the one with a visible return value, so it is the
+    /// one asserted: the oracle says an alias carrier's `heapBase()` is present
+    /// and holds the caller's array (`G6-1` §6, row 1).
+    #[test]
+    fn stamping_the_scope_does_not_disturb_the_other_tenants_of_slot_two() {
+        let mut ctx = mock_ctx();
+        let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, 16);
+        let seg = match pe_of_array_alias(&mut ctx, &[Value::Object(Some(arr))]).unwrap() {
+            Some(Value::Object(Some(seg))) => seg,
+            other => panic!("ofArray answered {other:?}"),
+        };
+        assert_eq!(
+            pe_segment_heap_base(&ctx, seg),
+            Value::Object(Some(arr)),
+            "heapBase() must still be the caller's array, read from slot 6"
+        );
+        assert!(
+            heap_segment_view(&ctx, seg).is_some(),
+            "the carrier must still decode as a heap view"
+        );
+        // The read-only contagion still withholds the array, and it does so on a
+        // carrier whose slot 2 is now occupied.
+        let read_only = match pe_segment_slice(&mut ctx, seg, 0, 16, Some(true)).unwrap() {
+            Some(Value::Object(Some(view))) => view,
+            other => panic!("asReadOnly answered {other:?}"),
+        };
+        assert_eq!(
+            pe_segment_heap_base(&ctx, read_only),
+            Value::Object(None),
+            "a read-only view must not hand back the writable array"
+        );
     }
 
     /// A slice of a heap segment is still a heap segment — and this is the
