@@ -1,4 +1,4 @@
-# Every JIT `getfield` takes the checked helper: the guarded inline path is emitted, and its runtime guard always fails
+# Every JIT `getfield` takes the checked helper — but NOT because the guarded inline check fails (see the CORRECTION)
 
 ## Status
 **OPEN**, found 2026-08-17 on `dev` @`a276dfe09` while profiling the bc-java PQC
@@ -67,6 +67,69 @@ On ZGC the table is **never published**. `gen_heap.rs`'s own doc says so:
 `GenerationalHeap`. ZGC has been the **default collector since 2026-08-10**, so
 since that date the default configuration has taken the helper on every
 compiled field read.
+
+## CORRECTION (2026-08-17, same day): the title is wrong, and so were both hypotheses
+
+Instrumenting it — which is what this page asked for — refuted its own story
+three times over. Recorded in full because each refutation cost a build, and the
+next person should not re-run them.
+
+**1. "Sites cannot resolve a compact layout."** Refuted. A compile-time census
+over every field site (`CRATONVM_DBG_COMPACT_INLINE`, extended to report
+`MISS`) reports **50 inline sites emitted and ZERO misses**. Every field site
+resolves its compact offset.
+
+**2. "ZGC never publishes `JIT_REGION_BOUNDS`, so the check always fails."**
+True as a *fact*, false as *the cause*. A runtime helper-call counter across
+collectors:
+
+| collector | `jit_getfield` calls |
+|---|---|
+| ZGC (default) | 49 632 791 |
+| Generational | 48 973 210 |
+| G1 | 49 632 591 |
+
+Generational publishes real bounds and pays exactly the same price. A cause that
+is absent on one collector cannot explain a number identical on all three.
+
+**3. "The guard rejects live receivers."** Refuted directly. Dumping the
+receiver beside the six live bounds words on Generational:
+
+```
+receiver=0x20042400db8 aligned8=true
+bounds=[0x20042400000, 0x20052400000, 0x20054400000, 0x20064400000, 0x2000e000000, 0x2002e000000]
+```
+
+`0x20042400db8` is inside `[0x20042400000, 0x20052400000)` — it satisfies null,
+alignment *and* containment, so it should have taken the inline branch.
+
+### What is actually happening
+
+Attributing every emitted `CALL jit_getfield` to its emission arm, then turning
+the optimizing tier off:
+
+| arm | CALL sites emitted |
+|---|---|
+| single-pass compact-inline slow path | 50 |
+| **IR (optimizing) tier fallback** | **4** |
+
+| configuration | helper calls |
+|---|---|
+| default (both tiers) | 48 972 303 |
+| C2/IR threshold raised out of reach | **5 706 715** |
+
+**~88% of the calls come from four sites in the optimizing tier**, whose
+`ir_lower::emit_inline_getfield` returns `false` and emits an **unguarded**
+`CALL jit_getfield`. That path never reads `JIT_REGION_BOUNDS` at all — which is
+why the count is collector-independent, and why an in-bounds receiver still
+reached the helper.
+
+So the guarded inline check is **not** "always failing". It is largely not being
+reached: the hot method is compiled by the tier that declines to inline in the
+first place. The single-pass slow path is real but is the minority (~12%).
+
+`emit_inline_getfield` has seven early-outs; which one fires is the open
+question, and is being counted rather than guessed.
 
 ## The part that is not yet explained
 
