@@ -1203,29 +1203,51 @@ pub(super) fn compile_osr_artifact(
                         &callee_desc,
                         true,
                     );
+                // `CRATONVM_DBG_OSR_BIND=1` names, per call site, whether this
+                // OSR artifact bound a direct machine-code CALL or fell back to
+                // the dispatch helper, and WHICH gate refused. Without it the
+                // two outcomes are indistinguishable from outside, and they are
+                // ~4.6x apart on a call-dense loop — see
+                // `docs/known-issues/netty/httpresponsestatustest-exhaustive-loop-timeout-20260816.md`.
+                let dbg_bind =
+                    cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_OSR_BIND").is_some();
                 if let Some((callee_pin, entry, needs_ctx)) = compiled_callee {
                     baked_callee_pins.push(callee_pin);
-                    if !crate::jit::jit_direct_call_requires_dispatch(
+                    let refuse_dispatch = crate::jit::jit_direct_call_requires_dispatch(
                         &callee_class,
                         &callee_method,
                         &callee_desc,
-                    )
-                    && !osr_callee_declares_handlers(
+                    );
+                    let refuse_handlers = osr_callee_declares_handlers(
                         shared,
                         class_id,
                         &callee_class,
                         &callee_method,
                         &callee_desc,
-                    )
+                    );
                     // jit-invokedynamic-groovy-regression fix: never bake a
                     // direct machine-code CALL to an indy-trap-bearing
                     // artifact — see the matching gate in `callee_compiler`.
-                    && !crate::jit::helpers::compiled_entry_has_indy_trap(
+                    let refuse_indy = crate::jit::helpers::compiled_entry_has_indy_trap(
                         shared,
                         &callee_class,
                         &callee_method,
                         &callee_desc,
-                    ) {
+                    );
+                    if dbg_bind {
+                        eprintln!(
+                            "[osr-bind] {}.{}{} @pc={} compiled=yes direct={} requires_dispatch={} declares_handlers={} indy_trap={}",
+                            callee_class,
+                            callee_method,
+                            callee_desc,
+                            ipc,
+                            !(refuse_dispatch || refuse_handlers || refuse_indy),
+                            refuse_dispatch,
+                            refuse_handlers,
+                            refuse_indy
+                        );
+                    }
+                    if !refuse_dispatch && !refuse_handlers && !refuse_indy {
                         direct_calls2.push((
                             ipc,
                             crate::jit::JitDirectCall {
@@ -1290,6 +1312,12 @@ pub(super) fn compile_osr_artifact(
 
                 // Compilation failed, or the callee participates in a recursive
                 // compile cycle. Fall back to the guarded dispatch helper.
+                if dbg_bind {
+                    eprintln!(
+                        "[osr-bind] {}.{}{} @pc={} -> DISPATCH HELPER",
+                        callee_class, callee_method, callee_desc, ipc
+                    );
+                }
                 let class_box: Box<str> = callee_class.into_boxed_str();
                 let method_box: Box<str> = callee_method.into_boxed_str();
                 let desc_box: Box<str> = callee_desc.clone().into_boxed_str();
