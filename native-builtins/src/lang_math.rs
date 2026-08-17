@@ -9,6 +9,7 @@ use cratonvm_types::Value;
 
 use crate::lang_string::{
     format_double, format_float, native_string_chars, native_string_code_point_at,
+    native_string_code_points,
     native_string_code_point_count, native_string_format, native_string_format_locale,
     native_string_formatted, native_string_indent, native_string_is_blank, native_string_lines,
     native_string_offset_by_code_points, native_string_region_matches,
@@ -786,7 +787,7 @@ pub(crate) fn register_wrapper_natives(registry: &mut NativeMethodRegistry) {
         "java/lang/String",
         "codePoints",
         "()Ljava/util/stream/IntStream;",
-        native_string_chars, // Same as chars for BMP
+        native_string_code_points,
     );
     registry.register(
         "java/lang/String",
