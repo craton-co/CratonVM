@@ -2209,10 +2209,13 @@ impl ZObjectStartsSnapshot {
     /// individually: it is a small set and it is not address-ordered.
     #[inline]
     fn for_each_base_from(&self, floor: usize, mut f: impl FnMut(usize)) {
-        let first_word = floor
-            .saturating_sub(self.base)
-            .div_ceil(8)          // bit index
-            / 64;                 // word index
+        // FLOOR division, both times. Rounding the bit index UP would skip the
+        // word containing `floor` whenever the bit index landed on a word
+        // boundary from below, and the only thing that makes that unreachable
+        // today is that object starts are 8-aligned. Starting one word early
+        // costs one word of scan and cannot be wrong; the `addr >= floor` test
+        // inside the loop is what makes the bound exact.
+        let first_word = (floor.saturating_sub(self.base) / 8) / 64;
         for (w, &word) in self.words.iter().enumerate().skip(first_word) {
             let mut word = word;
             while word != 0 {
@@ -15496,6 +15499,47 @@ pub(crate) mod tests {
             heap.is_object_address(doomed_addr).is_none(),
             "and a whole-heap cycle must get it, or the cost is a LEAK"
         );
+    }
+
+    /// **A bounded scan must report EXACTLY the bases at or above the floor.**
+    ///
+    /// The floor is turned into a starting WORD index, and the word containing it
+    /// straddles: it holds bases both below and above the floor. Off by one word
+    /// in one direction silently drops objects from the sweep — they are neither
+    /// freed nor unmarked — and in the other direction it sweeps below the floor,
+    /// which is merely slow. So the assertion is set EQUALITY against a filter of
+    /// the unbounded reader, at floors chosen to land mid-word.
+    #[test]
+    fn a_bounded_scan_reports_exactly_the_bases_above_the_floor() {
+        let heap = ZgcRealHeap::with_capacity(16 * 1024 * 1024);
+        heap.set_tlab_enabled(false);
+        for i in 0..3_000u32 {
+            let _ = heap.alloc_object(ClassId::new(1 + (i % 5)), (i % 4) as usize);
+        }
+        let _big = heap.alloc_array(ClassId::new(0), ArrayElementType::Byte, 2 * 1024 * 1024);
+        let snap = heap.registry.snapshot();
+        let all = snap.bases();
+        assert!(all.len() > 2_500, "fixture registered: {}", all.len());
+
+        // Floors at every 8-byte step across a whole word's worth of the bitmap,
+        // plus the extremes, so a straddling first word is actually exercised.
+        let mid = all[all.len() / 2];
+        let mut floors: Vec<usize> = vec![0, heap.arena_base, usize::MAX / 2];
+        for k in 0..80 {
+            floors.push(mid.saturating_sub(k * 8));
+            floors.push(mid + k * 8);
+        }
+        for floor in floors {
+            let mut got: Vec<usize> = Vec::new();
+            snap.for_each_base_from(floor, |b| got.push(b));
+            let mut want: Vec<usize> = all.iter().copied().filter(|b| *b >= floor).collect();
+            got.sort_unstable();
+            want.sort_unstable();
+            assert_eq!(
+                got, want,
+                "floor {floor:#x}: a bounded scan must equal the filtered                  unbounded one -- dropping a base means the sweep neither frees                  nor unmarks it"
+            );
+        }
     }
 
     /// **A card whose target is OLD is dropped, and the target survives
