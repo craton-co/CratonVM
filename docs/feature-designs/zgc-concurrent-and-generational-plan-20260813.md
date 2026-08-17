@@ -934,7 +934,14 @@ rebuild: `CRATONVM_ZGC_GEN_HEADER_ZERO=0` restores the whole-body memset,
 number says it alone — a small `dead_runs` is equally consistent with a cycle that
 found almost no garbage — which is why both are reported.
 
-**Not yet measured.** The prediction is arithmetic from a figure the collector
+**Not yet measured, and deliberately so.** The Azure host was at **load average
+32 on 8 cores** with three other sessions' benchmarks and two `rustc` processes
+running when these landed. That is the same condition that made the *first* G2
+measurement worthless (§3b records the box at load 25–35), and a number taken
+there would be indistinguishable from noise in the direction of whatever ran
+alongside it. Take it on a quiet box, interleaved, with the §3b probe and args.
+
+The prediction is arithmetic from a figure the collector
 already prints: `bytes_freed` on the `[GC] zgc-reclaim:` line *is* the memset
 volume G2e removes, so on the §3b workload (75.7% reclaim of a 1.2 GB heap) it is
 of the order of 900 MB per cycle against a 182 ms sweep. Stating it here so the
@@ -953,7 +960,15 @@ fills, a bounded sweep reclaims, and a slide promotes out of. What a
   budget that triggers a collection of its own, so its cost no longer scales with
   the gap between whole-heap collections. What a *sized space* would still add on
   top is a hard ceiling rather than a trigger — today an allocation burst can
-  overshoot the budget before the next safepoint.
+  overshoot the budget before the next safepoint. **Priced 2026-08-17, and it is
+  not the collector's to fix.** `nursery_overshoot_max` on the
+  `[GC] zgc-nursery-trigger:` line reports the worst overshoot seen, beside the
+  budget it is an overshoot of. A real ceiling cannot live where the trigger
+  lives: refusing the allocation turns a servable request into an
+  `OutOfMemoryError`, and collecting on the spot needs a safepoint the allocation
+  path cannot take. So a ceiling needs an **allocation-site safepoint poll**,
+  which is a VM-wide change, and the gauge is what says whether it is worth
+  asking for — a few percent of the budget prices it at nothing.
 * **Per-page `ZObjectStarts`**, without which `is_object_address` stops being
   O(1) once the registry is per page.
 
@@ -1268,6 +1283,17 @@ frees live old objects.
    `pending_hint` cache line *and* one on the caller's own counter. Striping N
    locks behind a single shared counter is not striping. The counters now live
    inside each bucket's mutex, which the push already holds.
+
+   **SEQUENCE THIS AFTER C5, 2026-08-17.** §3c measured the marker at **+98% with
+   ONE worker**, which contends with nobody — so the engine's fixed overhead, not
+   handoff, is what the marker costs. A per-thread buffer makes *mutators* hand
+   off faster into a consumer that is already the bottleneck, and the current
+   handoff is not obviously the problem either: `ZMarkIngress` buckets across 16
+   mutexes keyed by thread, and since 2026-08-17 the counters live inside the
+   bucket mutex the push already holds, so a mutator's cost is one uncontended
+   lock in ≤16-thread workloads. Deliberately **not** built on 2026-08-17 for that
+   reason, and because it carries a use-after-free with no measurement to justify
+   taking it — see the `ZMarkHandle::new_buffer` rule below.
 
    What remains is the genuine per-thread buffer, and it needs thread-keyed state
    on the heap because `satb_pre_barrier` is reached with **no thread context at

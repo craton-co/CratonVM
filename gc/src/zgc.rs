@@ -2864,6 +2864,28 @@ pub struct ZgcRealHeap {
     gen_dead_runs: AtomicUsize,
     /// Dead objects the runs in [`Self::gen_dead_runs`] covered.
     gen_dead_objects: AtomicUsize,
+    /// The most the nursery has ever been over budget when a collection
+    /// finally ran, in bytes.
+    ///
+    /// # Why this is a gauge and not a bug
+    ///
+    /// [`zgc_gen_nursery_percent`] is a TRIGGER: `needs_gc` answers `true` and
+    /// the mutator keeps allocating until the VM reaches a safepoint and decides
+    /// to collect. So the nursery passes its budget by however much is allocated
+    /// in that window, and G2's open list has carried "a hard ceiling rather than
+    /// a trigger" ever since — with no number, which is the same as no priority.
+    ///
+    /// **A ceiling is not implementable where this trigger lives.** Refusing the
+    /// allocation would turn a servable request into an `OutOfMemoryError`, and
+    /// collecting on the spot needs a safepoint the allocation path cannot take.
+    /// A real ceiling therefore needs an allocation-site safepoint poll, which is
+    /// a VM-wide change and not a collector one. This measures what that change
+    /// would be worth: an overshoot that is a few percent of the budget prices
+    /// the item at nothing, and one that is a multiple of it prices it high.
+    ///
+    /// Reported beside the budget it is measured against, because "17 MB over" is
+    /// meaningless without it.
+    gen_nursery_overshoot_max: AtomicUsize,
     /// Survivors a relocating cycle promoted by moving them below the nursery
     /// floor, cumulative.
     ///
@@ -3339,6 +3361,7 @@ impl ZgcRealHeap {
             gen_nursery_watermark: AtomicUsize::new(0),
             gen_nursery_triggered: AtomicBool::new(false),
             gen_nursery_triggers: AtomicUsize::new(0),
+            gen_nursery_overshoot_max: AtomicUsize::new(0),
             gen_header_zero_only: AtomicBool::new(zgc_gen_header_zero()),
             gen_dead_runs_enabled: AtomicBool::new(zgc_gen_dead_runs()),
             gen_zero_bytes_skipped: AtomicUsize::new(0),
@@ -5207,6 +5230,24 @@ impl ZgcRealHeap {
     /// -- G2d's engagement counter. Zero triggers on a generational run means
     /// every collection still came from the whole-heap predicate, so young cycles
     /// are as rare as full collections were.
+    /// Size the nursery directly, in bytes — see [`zgc_gen_nursery_percent`] for
+    /// the percentage this is normally derived from, and `0` to disable the
+    /// trigger.
+    ///
+    /// Per heap for the reason `set_relocation_enabled` is: the percentage is
+    /// process-wide and latched on first read, so a test that set it would decide
+    /// the question for every other test in the binary.
+    pub fn set_gen_nursery_bytes(&self, bytes: usize) {
+        self.gen_nursery_bytes.store(bytes, Ordering::Relaxed);
+    }
+
+    /// The worst the nursery has been over its budget when a collection ran —
+    /// see [`Self::gen_nursery_overshoot_max`]. Read against the budget on
+    /// [`Self::nursery_trigger_stats`]; alone it says nothing.
+    pub fn nursery_overshoot_max(&self) -> usize {
+        self.gen_nursery_overshoot_max.load(Ordering::Relaxed)
+    }
+
     pub fn nursery_trigger_stats(&self) -> (usize, usize) {
         (
             self.gen_nursery_triggers.load(Ordering::Relaxed),
@@ -12190,6 +12231,21 @@ impl GarbageCollector for ZgcRealHeap {
         }
         if self.gen_nursery_triggered.swap(false, Ordering::Relaxed) {
             self.gen_nursery_triggers.fetch_add(1, Ordering::Relaxed);
+            // HOW FAR PAST THE BUDGET THE NURSERY GOT. Measured from
+            // `self.allocated` -- which this collection has NOT reset yet, the
+            // reset being ~60 lines below -- against the same watermark and
+            // budget the trigger compared, which is likewise still the old one.
+            // Nobody allocates during the stop-the-world, so this is exactly the
+            // figure `needs_gc` last saw. See `gen_nursery_overshoot_max` for why this is a gauge
+            // on an open item rather than a defect.
+            let budget = self.gen_nursery_bytes.load(Ordering::Relaxed);
+            let grew = self
+                .allocated
+                .load(Ordering::Relaxed)
+                .saturating_sub(self.gen_nursery_watermark.load(Ordering::Relaxed));
+            let over = grew.saturating_sub(budget);
+            self.gen_nursery_overshoot_max
+                .fetch_max(over, Ordering::Relaxed);
         }
         if young_cycle {
             self.young_cycles.fetch_add(1, Ordering::Relaxed);
@@ -15615,6 +15671,66 @@ pub(crate) mod tests {
     /// The arena's cursor, for the accounting identity above.
     fn self_used(heap: &ZgcRealHeap) -> usize {
         heap.arena.lock().used()
+    }
+
+    /// **The nursery's overshoot is measured, so "a hard ceiling" can be priced
+    /// instead of carried.**
+    ///
+    /// `zgc_gen_nursery_percent` is a trigger: `needs_gc` says yes and the
+    /// mutator keeps allocating until the VM reaches a safepoint. G2's open list
+    /// has carried "a hard ceiling rather than a trigger" ever since, with no
+    /// number — and no number is the same as no priority.
+    ///
+    /// A ceiling is not implementable where the trigger lives (refusing the
+    /// allocation makes a servable request an `OutOfMemoryError`; collecting on
+    /// the spot needs a safepoint the allocation path cannot take), so this
+    /// measures what an allocation-site safepoint poll would be worth rather than
+    /// pretending the collector can decide it.
+    ///
+    /// Asserted against the BUDGET and not just as "greater than zero": an
+    /// overshoot means nothing without the figure it is an overshoot of.
+    #[test]
+    fn the_nursery_overshoot_is_measured_against_its_budget() {
+        let heap = gen_heap_for_test(64 * 1024 * 1024);
+        let keeper = gen_promote_one(&heap);
+        // After the promoting collection, which resets the watermark.
+        const BUDGET: usize = 64 * 1024;
+        heap.set_gen_nursery_bytes(BUDGET);
+        assert_eq!(
+            heap.nursery_overshoot_max(),
+            0,
+            "nothing has overshot yet, and a gauge that starts nonzero measures \
+             its own initialisation"
+        );
+
+        // Well past the budget, and far below anything the whole-heap clauses
+        // would fire on -- otherwise `needs_gc` returns early and the nursery
+        // latch is never armed, which would make this test pass for the wrong
+        // reason.
+        for _ in 0..4096 {
+            let _ = heap.alloc_object(ClassId::new(4), 2);
+        }
+        assert!(
+            heap.needs_gc(),
+            "the nursery must be over budget -- this is what arms the latch"
+        );
+
+        let mut roots = [keeper];
+        let _ = gen_collect(&heap, &mut roots);
+        let (fired, budget) = heap.nursery_trigger_stats();
+        assert_eq!(fired, 1, "the trigger must have been the reason");
+        assert_eq!(budget, BUDGET, "and it must report the budget it used");
+        let over = heap.nursery_overshoot_max();
+        assert!(
+            over > 0,
+            "the nursery was allocated well past {BUDGET} bytes, so the \
+             overshoot cannot be zero -- got {over}"
+        );
+        assert!(
+            over < heap.heap_capacity(),
+            "and it must be a plausible figure rather than an underflowed \
+             subtraction: {over}"
+        );
     }
 
     /// **THE EXIT CRITERION: an object reachable only through an

@@ -2561,8 +2561,15 @@ impl VmHeap {
             let (skipped, floor, old_live) = h.nursery_stats();
             let (nursery_fired, nursery_budget) = h.nursery_trigger_stats();
             eprintln!(
-                "[GC] zgc-nursery-trigger: fired={nursery_fired}                  budget_bytes={nursery_budget} promotions_by_slide={}",
+                "[GC] zgc-nursery-trigger: fired={nursery_fired}                  budget_bytes={nursery_budget} promotions_by_slide={} \
+                 overshoot_max={}",
                 h.promotions_by_slide(),
+                // BESIDE THE BUDGET, because it is meaningless without it: this
+                // is how far past `budget_bytes` the nursery got before a
+                // safepoint arrived, and it prices "a hard ceiling rather than a
+                // trigger" -- an open item that has had no number attached. See
+                // `ZgcRealHeap::gen_nursery_overshoot_max`.
+                h.nursery_overshoot_max(),
             );
             eprintln!(
                 "[GC] zgc-nursery: sweep_skipped={skipped} floor={floor}                  old_live_bytes={old_live}",
