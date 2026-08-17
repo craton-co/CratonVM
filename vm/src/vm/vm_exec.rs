@@ -6303,12 +6303,19 @@ impl<'a> NativeContextImpl<'a> {
         // the wake-time fixup application — catches both "chain key missing"
         // (was_key=false) and "frame held an intermediate address" desyncs at
         // the exact wake where they surface.
+        // Predicate: the FIXUP CHAIN's keys, not a forwarding word. Same
+        // correction as the arrival-site ARRIVE-STALE verifier — the forwarding
+        // word does not exist on the default collector (ZGC's slide leaves
+        // none), so this reported zero whatever the truth was. The chain's keys
+        // are exactly the pre-move addresses this thread slept through, and the
+        // write-back above has just run, so a frame slot still holding one is a
+        // slot the write-back did not reach.
         if blockgc_dbg() {
             for (fi, fr) in self.thread.frames.iter().enumerate() {
                 for li in 0..fr.locals_len() {
                     if let Value::Object(Some(o)) = fr.get_local(li as u16) {
                         let a = o.as_ptr() as usize;
-                        if let Some(new) = self.shared.mem.heap.debug_forwarded_target(a) {
+                        if let Some(new) = fixup.get(&a).copied() {
                             eprintln!(
                                 "[blockgc] WAKE-STALE tid={} frame#{fi} {}.{} pc={} local[{li}] 0x{a:x}->0x{new:x} was_key={} was_val={} fixup_len={}",
                                 self.thread.thread_id.0, fr.class_name(), fr.method_name(), fr.pc,
@@ -6322,7 +6329,7 @@ impl<'a> NativeContextImpl<'a> {
                 for si in 0..fr.stack.len() {
                     if let Value::Object(Some(o)) = fr.stack.peek_at(si) {
                         let a = o.as_ptr() as usize;
-                        if let Some(new) = self.shared.mem.heap.debug_forwarded_target(a) {
+                        if let Some(new) = fixup.get(&a).copied() {
                             eprintln!(
                                 "[blockgc] WAKE-STALE tid={} frame#{fi} {}.{} pc={} stack[{si}] 0x{a:x}->0x{new:x} was_key={} was_val={} fixup_len={}",
                                 self.thread.thread_id.0, fr.class_name(), fr.method_name(), fr.pc,

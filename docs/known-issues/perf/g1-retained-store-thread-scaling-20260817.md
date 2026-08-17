@@ -106,5 +106,6 @@ Interleave the arms — this host swings a factor of two on a 30 s measurement.
 - `resourceleakdetector-concurrentusage-is-slow-not-hung-CLOSED-20260817` —
   the retired page this was split out of, with the two G1 fixes that landed and
   the per-primitive cost table.
-- `biginteger-modpow-has-no-montgomery-reduction-20260817.md` — the other
+- `../../internal/performance/biginteger-modpow-montgomery-FIXED-20260817.md`
+  (FIXED 2026-08-17) — the other
   residue filed out of the same pass.

@@ -65,6 +65,16 @@ this area and it is filed separately as
 — deliberately NOT attempted here, because it is a crypto-correctness-sensitive
 rewrite and not what this page was about.
 
+**Update 2026-08-17:** that page is now
+[FIXED](../../performance/biginteger-modpow-montgomery-FIXED-20260817.md).
+`modPow` took Montgomery reduction plus a window and moved 2.05x, RSA keygen
+2.09x — but the `SHA256withRSA` row above moved only 1.21x, and the attribution
+there shows why: the signature is bound by a full-width private exponentiation
+that ignores the CRT parameters already on the key, which is filed separately as
+`perf/rsa-private-key-op-ignores-the-crt-parameters-it-already-has-20260817.md`.
+§3's conclusion is unchanged — keygen is a minority of a certificate, so none of
+this moves a certificate by anything like 2x.
+
 **4. One of the six methods uses the real internet.**
 `simpleOcspQueryTest` opens `https://apple.com` and runs a live OCSP query. The
 class total therefore swings **110-240 s run to run on the identical binary**

@@ -981,6 +981,10 @@ impl VmHeap {
         // of the wrong class, which is why the value being pushed looks clean
         // and the `checkcast` one instruction later does not.
         crate::gc_quiescence::report_vacated_receiver(obj.as_ptr() as usize, "get_field");
+        // The re-issue-proof half of the same question — see
+        // `gc_quiescence::stale_use_verdict` for why the exact ledger above
+        // cannot answer it.
+        crate::gc_quiescence::check_stale_use(obj.as_ptr() as usize, "get_field receiver");
         dispatch!(self, get_field(obj, index))
     }
 
