@@ -412,6 +412,31 @@ pub(crate) fn register_string_builder_natives(registry: &mut NativeMethodRegistr
         &format!("(ID)L{class};"),
         native_sb_insert_double,
     );
+    // The TWO REFERENCE overloads that still had no native, which is the same
+    // gap the four scalars above closed and the last one on `insert`. Real
+    // `AbstractStringBuilder.insert(int, CharSequence[, int, int])` bytecode
+    // ran against the synthetic char[]/count layout and silently OVERWROTE
+    // instead of inserting — `new StringBuilder("xy").insert(1,
+    // (CharSequence) "AB")` answered `xA` where HotSpot answers `xABy` — and
+    // left the receiver inconsistent, so the next `charAt` aborted the VM.
+    // MEASURED both ways; see `native_sb_insert_charsequence_range`.
+    //
+    // A `String` argument reaches these only through a `CharSequence`-typed
+    // call site, because javac picks the `(ILjava/lang/String;)` overload for
+    // a `String`-typed one. Both must agree, and the 2-arg body delegates so
+    // that they agree by construction rather than by two copies matching.
+    registry.register(
+        class,
+        "insert",
+        &format!("(ILjava/lang/CharSequence;)L{class};"),
+        native_sb_insert_charsequence,
+    );
+    registry.register(
+        class,
+        "insert",
+        &format!("(ILjava/lang/CharSequence;II)L{class};"),
+        native_sb_insert_charsequence_range,
+    );
     registry.register(
         class,
         "delete",
@@ -1457,11 +1482,16 @@ pub(crate) fn native_sb_init_string(
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(None),
     };
-    let text = match args.get(1) {
-        Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
-        _ => String::new(),
+    // Code UNITS, not `read_string` + `encode_utf16`: a Rust `str` cannot hold
+    // an unpaired surrogate, so `new StringBuilder(s)` for an `s` holding one
+    // lone `\uDC00` built a builder containing U+FFFD — and the builder then
+    // disagreed with the String it was constructed from
+    // (`s.contentEquals(new StringBuilder(s))` answered false). MEASURED,
+    // `scratchpad/g26/G26Builder.java` rows c1/c2/c3/c5/c7/e1/e4.
+    let chars: Vec<u16> = match args.get(1) {
+        Some(Value::Object(Some(s))) => read_string_chars(&*ctx, *s),
+        _ => Vec::new(),
     };
-    let chars: Vec<u16> = text.encode_utf16().collect();
     let cap = chars.len() + 16;
     let mut scope = NativeHandleScope::new(ctx);
     let this_h = scope.root(this);
@@ -1503,11 +1533,17 @@ pub(crate) fn native_sb_init_charsequence(
     // will) and `new_array`; the handle slot remains current across both.
     let mut scope = NativeHandleScope::new(ctx);
     let this_h = scope.root(this);
-    let text = match args.get(1) {
-        Some(Value::Object(Some(o))) => invoke_to_string(&mut *scope, *o).unwrap_or_default(),
-        _ => String::new(),
+    // `charsequence_chars`, not `invoke_to_string`: `AbstractStringBuilder`'s
+    // own `(CharSequence)` constructor is `this(seq.length() + 16);
+    // append(seq);`, so the characters it stores are the ones `append` reads —
+    // by `charAt` for anything but the fast-path shapes, never `toString()`.
+    // The units form also carries an unpaired surrogate, which the `str` this
+    // replaces could not: MEASURED rows c6/c8/c9 of
+    // `scratchpad/g26/G26Builder.java`.
+    let chars: Vec<u16> = match args.get(1) {
+        Some(Value::Object(Some(o))) => charsequence_chars(&mut *scope, *o, None)?,
+        _ => Vec::new(),
     };
-    let chars: Vec<u16> = text.encode_utf16().collect();
     let cap = chars.len() + 16;
     let buf = scope.new_array(ArrayElementType::Char, cap);
     let this = scope.get(&this_h);
@@ -1560,12 +1596,16 @@ pub(crate) fn native_sb_append_string(
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(None),
     };
-    let text = match args.get(1) {
-        Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_else(|| "null".to_string()),
-        Some(Value::Object(None)) => "null".to_string(),
-        _ => "null".to_string(),
+    // Code UNITS: `sb.append(s)` must store what `s` holds, and a Rust `str`
+    // cannot hold an unpaired surrogate. MEASURED, `G26Builder` rows
+    // a1/a2/a12 — U+DC00 on HotSpot, U+FFFD here. The `"null"` substitution
+    // for a null argument is `AbstractStringBuilder.appendNull` and is
+    // unchanged.
+    let chars: Vec<u16> = match args.get(1) {
+        Some(Value::Object(Some(s))) => read_string_chars(&*ctx, *s),
+        _ => "null".encode_utf16().collect(),
     };
-    let this = sb_append_str(ctx, this, &text);
+    let this = sb_append_chars(ctx, this, &chars);
     Ok(Some(Value::Object(Some(this))))
 }
 
@@ -1738,12 +1778,15 @@ pub(crate) fn native_sb_repeat_charsequence(
     };
     let mut scope = NativeHandleScope::new(ctx);
     let this_handle = scope.root(this);
-    let text = match cs {
-        Some(o) => invoke_to_string(&mut *scope, o).unwrap_or_default(),
-        None => "null".to_string(),
+    // `charsequence_chars`, not `invoke_to_string`: the JDK's
+    // `repeat(CharSequence, int)` appends the sequence's CHARACTERS, and code
+    // units carry an unpaired surrogate where a Rust `str` cannot. MEASURED,
+    // `G26Builder` rows r2/r3.
+    let units: Vec<u16> = match cs {
+        Some(o) => charsequence_chars(&mut *scope, o, None)?,
+        None => "null".encode_utf16().collect(),
     };
     let this = scope.get(&this_handle);
-    let units: Vec<u16> = text.encode_utf16().collect();
     let mut chars = sb_read_chars(&*scope, this);
     for _ in 0..count {
         chars.extend_from_slice(&units);
@@ -1931,13 +1974,54 @@ pub(crate) fn invoke_to_string(
 /// Like [`invoke_to_string`], but returns `Ok(None)` when `toString()`
 /// legitimately returns a Java `null` reference, instead of coercing it to
 /// the text `"null"`. Needed by `String.valueOf(Object)` — see its call site.
+///
+/// A thin lossy view of [`invoke_to_string_units_opt`], which is where the
+/// dispatch lives. `String::from_utf16_lossy` over those units is what
+/// `ctx.read_string` already answered for every one of this function's
+/// callers, so nothing here moves.
 fn invoke_to_string_opt(
     ctx: &mut dyn NativeContext,
     obj: cratonvm_types::ObjectRef,
 ) -> Result<Option<String>, cratonvm_types::error::MethodCallFailed> {
-    // Fast path: if it's already a String object, just read it
+    Ok(invoke_to_string_units_opt(ctx, obj)?.map(|u| String::from_utf16_lossy(&u)))
+}
+
+/// [`invoke_to_string`]'s text as raw UTF-16 code units, with the same
+/// `Ok(None)` for a `toString()` that really returned Java `null`.
+///
+/// # Why the units form is the primary one
+///
+/// Every arm below that produced a Rust `String` from a Java `String` went
+/// through `ctx.read_string`, which cannot carry an unpaired surrogate: a
+/// `str` is well-formed UTF-8, so each lone `\uD800..\uDFFF` silently became
+/// U+FFFD. `sb.append((Object) s)` and `sb.insert(0, (Object) s)` therefore
+/// lost a surrogate that `sb.append(char)` on the line before had kept.
+///
+/// MEASURED before the change (`scratchpad/g26/G26Builder.java` rows a4 and
+/// i2, HotSpot 25.0.3+9-LTS as the oracle): U+DC00 there, U+FFFD here.
+///
+/// The wrapper and fallback arms are unchanged and simply
+/// `encode_utf16` their own ASCII text — none of them can produce a
+/// surrogate, so the conversion is exact and the only behavioural difference
+/// is on the two arms that read a Java `String`.
+fn invoke_to_string_units_opt(
+    ctx: &mut dyn NativeContext,
+    obj: cratonvm_types::ObjectRef,
+) -> Result<Option<Vec<u16>>, cratonvm_types::error::MethodCallFailed> {
+    // Fast path: if it's already a String object, read its code units.
+    //
+    // The class test comes FIRST and `read_string` stays as the fallback: on a
+    // class the VM cannot name, `read_string`'s structural decode is still the
+    // best answer available, and keeping it means this refactor cannot lose a
+    // route it used to serve.
+    let this_class = ctx
+        .class_name_of_id(ctx.class_id_of_object(obj))
+        .unwrap_or_default();
+    if this_class == "java/lang/String" {
+        return Ok(Some(read_string_chars(&*ctx, obj)));
+    }
     if let Some(s) = ctx.read_string(obj) {
-        return Ok(Some(s));
+        return Ok(Some(s.encode_utf16().collect()));
     }
 
     // Fast path for wrapper types: if the object has exactly 1 field and its
@@ -1989,17 +2073,17 @@ fn invoke_to_string_opt(
                         // Integer
                         v.to_string()
                     };
-                    return Ok(Some(formatted));
+                    return Ok(Some(formatted.encode_utf16().collect()));
                 }
-                Value::Long(v) => return Ok(Some(v.to_string())),
+                Value::Long(v) => return Ok(Some(v.to_string().encode_utf16().collect())),
                 // Use the Java-spec formatters (NOT raw `{}`), so a boxed Double/Float
                 // rendered via String.valueOf(Object) / StringBuilder.append(Object) /
                 // object string-concat matches `Double.toString` — incl. the
                 // 10^-3..10^7 scientific-notation threshold, "Infinity", and "-0.0".
                 // Raw `format!("{}")` dropped the ".0", printed "inf"/"-0", and never
                 // used E-notation (e.g. boxed 1e7 -> "10000000.0", -0.0 -> "-0").
-                Value::Float(v) => return Ok(Some(format_float(v))),
-                Value::Double(v) => return Ok(Some(format_double(v))),
+                Value::Float(v) => return Ok(Some(format_float(v).encode_utf16().collect())),
+                Value::Double(v) => return Ok(Some(format_double(v).encode_utf16().collect())),
                 _ => {} // Not a primitive wrapper
             }
         }
@@ -2022,10 +2106,27 @@ fn invoke_to_string_opt(
     // malformed return value uses the historical identity fallback.
     let result = ctx.invoke_virtual(obj, "toString", "()Ljava/lang/String;", &[]);
     match result {
-        Ok(Some(Value::Object(Some(str_ref)))) => Ok(Some(
-            ctx.read_string(str_ref)
-                .unwrap_or_else(|| "null".to_string()),
-        )),
+        // The override's answer is read as UNITS, so a `toString()` that
+        // itself returns a lone surrogate is carried through rather than
+        // replaced. `read_string_chars` on a non-String is empty, which is
+        // why the `read_string` fallback stays for the class the VM cannot
+        // name — and the descriptor guarantees a `String` here in every
+        // ordinary case.
+        Ok(Some(Value::Object(Some(str_ref)))) => {
+            let ret_class = ctx
+                .class_name_of_id(ctx.class_id_of_object(str_ref))
+                .unwrap_or_default();
+            if ret_class == "java/lang/String" {
+                Ok(Some(read_string_chars(&*ctx, str_ref)))
+            } else {
+                Ok(Some(
+                    ctx.read_string(str_ref)
+                        .unwrap_or_else(|| "null".to_string())
+                        .encode_utf16()
+                        .collect(),
+                ))
+            }
+        }
         // toString() legitimately returned null (e.g. TestJspWriterImpl's
         // bug54241b: an anonymous class whose toString() explicitly `return
         // null;`) — this is NOT a dispatch failure, don't fall through to the
@@ -2039,10 +2140,23 @@ fn invoke_to_string_opt(
             } else {
                 "Object".to_string()
             };
-            Ok(Some(format!("{}@{:x}", name, ctx.identity_hash_code(obj))))
+            Ok(Some(
+                format!("{}@{:x}", name, ctx.identity_hash_code(obj))
+                    .encode_utf16()
+                    .collect(),
+            ))
         }
         Err(err) => Err(err),
     }
+}
+
+/// [`invoke_to_string`] as raw UTF-16 code units — the text `"null"` for a
+/// `toString()` that returned Java `null`, exactly as the `String` form does.
+pub(crate) fn invoke_to_string_units(
+    ctx: &mut dyn NativeContext,
+    obj: cratonvm_types::ObjectRef,
+) -> Result<Vec<u16>, cratonvm_types::error::MethodCallFailed> {
+    Ok(invoke_to_string_units_opt(ctx, obj)?.unwrap_or_else(|| "null".encode_utf16().collect()))
 }
 
 pub(crate) fn native_sb_append_object(
@@ -2097,8 +2211,7 @@ fn charsequence_chars(
     cs: cratonvm_types::ObjectRef,
     range: Option<(i32, i32)>,
 ) -> Result<Vec<u16>, MethodCallFailed> {
-    if let Some(text) = charsequence_fast_text(ctx, cs)? {
-        let units: Vec<u16> = text.encode_utf16().collect();
+    if let Some(units) = charsequence_fast_units(ctx, cs)? {
         let n = units.len() as i32;
         let (lo, hi) = match range {
             None => (0, n),
@@ -2153,8 +2266,8 @@ fn charsequence_length(
     ctx: &mut dyn NativeContext,
     cs: cratonvm_types::ObjectRef,
 ) -> Result<i32, MethodCallFailed> {
-    if let Some(text) = charsequence_fast_text(ctx, cs)? {
-        return Ok(text.encode_utf16().count() as i32);
+    if let Some(units) = charsequence_fast_units(ctx, cs)? {
+        return Ok(units.len() as i32);
     }
     match ctx.invoke_virtual(cs, "length", "()I", &[])? {
         Some(Value::Int(n)) => Ok(n),
@@ -2164,20 +2277,45 @@ fn charsequence_length(
 
 /// The three shapes whose text can be read in Rust without changing the answer
 /// -- see [`charsequence_chars`]. `Ok(None)` means "walk `charAt`".
-fn charsequence_fast_text(
+///
+/// # Code UNITS, not a Rust `String`
+///
+/// A Rust `str` is well-formed UTF-8 and cannot hold an unpaired surrogate, so
+/// every arm that went through one replaced each lone `\uD800..\uDFFF` with
+/// U+FFFD — while the `charAt` walk in [`charsequence_chars`], the slow path
+/// this function exists to skip, carried it through untouched. The two arms of
+/// one function disagreed about the same sequence.
+///
+/// MEASURED on HotSpot 25.0.3+9-LTS and this VM before the change
+/// (`scratchpad/g26/G26Builder.java`, rows a3/a5/a6/a10/a11/c6/c8/c9/r3):
+/// `sb.append((CharSequence) s)` where `s` holds one `\uDC00` answered U+FFFD
+/// here and U+DC00 there. Nothing threw; the substitution is unrecoverable.
+/// [`sb_string_from_units`] is the same fix on the write side.
+fn charsequence_fast_units(
     ctx: &mut dyn NativeContext,
     cs: cratonvm_types::ObjectRef,
-) -> Result<Option<String>, MethodCallFailed> {
+) -> Result<Option<Vec<u16>>, MethodCallFailed> {
     let cid = ctx.class_id_of_object(cs);
     let name = ctx.class_name_of_id(cid).unwrap_or_default();
     if name == "java/lang/String" {
-        return Ok(ctx.read_string(cs));
+        return Ok(Some(read_string_chars(&*ctx, cs)));
     }
     if name == "java/lang/StringBuilder" || name == "java/lang/StringBuffer" {
-        return Ok(Some(invoke_to_string(ctx, cs)?));
+        // `sb_read_chars` is what `StringBuilder.toString()` answers on this
+        // VM — `native_sb_to_string` reads the same two slots — so this is the
+        // same value the `invoke_to_string` it replaces produced, minus the
+        // `str` round trip and minus a Java re-entry that could move `cs`.
+        return Ok(Some(sb_read_chars(&*ctx, cs)));
     }
     if name.starts_with("java/nio/") && name.contains("CharBuffer") {
-        return Ok(crate::phases_late::charset_buffers::cb_read_text(ctx, cs));
+        // `cb_read_text` still answers a Rust `String`; it lives in
+        // `phases_late::charset_buffers`, which this lane does not own, so a
+        // lone surrogate inside a `CharBuffer` is still lossy on this one arm.
+        // Recorded as a NOMINATION in
+        // `docs/known-issues/jdk-only/G26-1-four-families-of-RJdkIntrinsics3-20260817.md`
+        // rather than fixed from here.
+        return Ok(crate::phases_late::charset_buffers::cb_read_text(ctx, cs)
+            .map(|t| t.encode_utf16().collect()));
     }
     Ok(None)
 }
@@ -2588,7 +2726,30 @@ pub(crate) fn native_sb_char_at(ctx: &mut dyn NativeContext, args: &[Value]) -> 
         // SIOOBE_FORMATTER)`.
         return Err(cratonvm_types::error::RuntimeError::sioobe_index(index, count).into());
     }
-    let buf = buf.unwrap();
+    // `buf.unwrap()` here ABORTED THE VM. A builder whose slot 0 is not a
+    // `char[]` reaches this with `count > 0` and `buf == None`, and a Rust
+    // panic is not a Java throwable: it terminates the process instead of
+    // unwinding to the `catch` the caller wrote.
+    //
+    // MEASURED reproducer before the fix (`scratchpad/g26/G26Builder.java`
+    // row i6): `new StringBuilder("xy").insert(1, (CharSequence) s)` had no
+    // native, so real `AbstractStringBuilder` bytecode ran against this VM's
+    // synthetic `char[]`/`count` layout and left the receiver inconsistent;
+    // the next `charAt` panicked at this line —
+    // `thread 'main-vm' panicked ... called Option::unwrap() on a None value`,
+    // exit without a stack trace. The registration gap is closed below
+    // (`insert(int, CharSequence)` and its 4-arg sibling), so nothing in the
+    // suite reaches this arm any more; it stays because the guard must not
+    // depend on that.
+    //
+    // `sioobe_index` is the same refusal the bounds arm above raises, so a
+    // caller sees one class for "this index is not readable" either way. Its
+    // message is TRANSCRIBED from HotSpot and asserted by the probe rows
+    // n21/n22/n23 (`Index 5 out of bounds for length 2`), which match today
+    // and must keep matching.
+    let Some(buf) = buf else {
+        return Err(cratonvm_types::error::RuntimeError::sioobe_index(index, count).into());
+    };
     let ch = ctx.get_array_element(buf, index as usize);
     Ok(Some(ch))
 }
@@ -2886,11 +3047,11 @@ pub(crate) fn native_sb_insert_string(
         Some(Value::Int(i)) => *i,
         _ => 0,
     };
-    let insert_str = match args.get(2) {
-        Some(Value::Object(Some(obj))) => ctx.read_string(*obj).unwrap_or_default(),
-        _ => "null".to_string(),
+    // Code UNITS — `G26Builder` row i1. See `native_sb_append_string`.
+    let insert_chars: Vec<u16> = match args.get(2) {
+        Some(Value::Object(Some(obj))) => read_string_chars(&*ctx, *obj),
+        _ => "null".encode_utf16().collect(),
     };
-    let insert_chars: Vec<u16> = insert_str.encode_utf16().collect();
 
     let chars = sb_read_chars(ctx, this);
     if let Some(failure) = sb_check_offset(offset, chars.len() as i32) {
@@ -2903,6 +3064,217 @@ pub(crate) fn native_sb_insert_string(
     result.extend_from_slice(&chars[offset..]);
     let this = sb_write_chars(ctx, this, &result);
     Ok(Some(Value::Object(Some(this))))
+}
+
+/// `insert(int, CharSequence, int, int)` — JDK 25's four-argument insert.
+///
+/// # Why this has to exist at all
+///
+/// It had NO native, so real `AbstractStringBuilder` bytecode ran — and that
+/// bytecode writes the JDK's compact `byte[] value` / `byte coder` / `int
+/// count` layout, which this VM's builders do not have (slot 0 is a `char[]`,
+/// slot 1 is the count). The same layout mismatch the ten registrations above
+/// exist to prevent. MEASURED before the fix
+/// (`scratchpad/g26/G26Insert.java`, HotSpot 25.0.3+9-LTS as the oracle):
+///
+/// | call | HotSpot | before |
+/// |---|---|---|
+/// | `new StringBuilder("xy").insert(1, (CharSequence) "AB")` | `xABy` | `xA` |
+/// | `…insert(1, (CharSequence) sb)` | `xABy` | `xA` |
+/// | `…insert(1, seq, 0, 1)` | `xPy` | `xP` |
+/// | `…insert(1, (CharSequence) null)` | `xnully` | `xn` |
+/// | `new StringBuffer("xy").insert(1, (CharSequence) "AB")` | `xABy` | `xA` |
+///
+/// It did not throw — it OVERWROTE and truncated, which reads as a successful
+/// insert of the wrong text. Worse, it left the receiver's count and buffer
+/// inconsistent, and the next `charAt` on it hit an `unwrap()` in
+/// [`native_sb_char_at`] and **aborted the VM** (`G26Builder` row i6). That
+/// `unwrap` is now a throw, but the registration is the actual repair.
+///
+/// # The contract, TRANSCRIBED
+///
+/// Every row below is measured on HotSpot 25.0.3+9-LTS
+/// (`scratchpad/g26/G26InsCs.java`), not derived from the javadoc. The two
+/// refusals are DIFFERENT classes and the order between them is observable:
+///
+/// | call, on `new StringBuilder("xy")` | HotSpot |
+/// |---|---|
+/// | `insert(5, "AB", 0, 1)` | `StringIndexOutOfBoundsException: Range [5, 2) out of bounds for length 2` |
+/// | `insert(-1, "AB", 0, 1)` | `StringIndexOutOfBoundsException: Range [-1, 2) out of bounds for length 2` |
+/// | `insert(1, "AB", 0, 9)` | `IndexOutOfBoundsException: Range [0, 9) out of bounds for length 2` |
+/// | `insert(1, "AB", -1, 1)` | `IndexOutOfBoundsException: Range [-1, 1) out of bounds for length 2` |
+/// | `insert(1, "AB", 2, 1)` | `IndexOutOfBoundsException: Range [2, 1) out of bounds for length 2` |
+/// | `insert(9, "AB", 0, 9)` — BOTH wrong | the `StringIndex…` one: the offset check is first |
+/// | `insert(1, null, 0, 9)` | `IndexOutOfBoundsException: Range [0, 9) out of bounds for length 4` |
+/// | `insert(1, null, 0, 4)` | no throw, `xnully` |
+/// | `insert(5, cs)` whose `length()` throws | that `IllegalStateException` — see the 2-arg form |
+/// | `insert(5, cs, 0, 1)` whose `length()` throws | the offset `StringIndex…`; `length()` is never called |
+/// | `insert(1, "AB", 1, 1)` | no throw, `xy` — an empty window is legal |
+///
+/// So the order is: substitute `"null"`, then `checkOffset` (a
+/// `StringIndexOutOfBoundsException`), then `checkRange` against
+/// `s.length()` (the PLAIN `IndexOutOfBoundsException`). The null
+/// substitution happens before the range check, which is why the length in
+/// the `insert(1, null, 0, 9)` message is 4 and not the receiver's 2 — the
+/// same rule [`native_sb_append_charsequence_off_len`] records, and the same
+/// two message helpers, so the two overloads cannot drift.
+pub(crate) fn native_sb_insert_charsequence_range(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    // args: [this, dstOffset, s, start, end]
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let offset = match args.get(1) {
+        Some(Value::Int(i)) => *i,
+        _ => 0,
+    };
+    let cs = match args.get(2) {
+        Some(Value::Object(Some(o))) => Some(*o),
+        _ => None,
+    };
+    let start = match args.get(3) {
+        Some(Value::Int(i)) => *i,
+        _ => 0,
+    };
+    let end = match args.get(4) {
+        Some(Value::Int(i)) => *i,
+        _ => 0,
+    };
+
+    // GC: `charsequence_length` and `charsequence_chars` both re-enter Java
+    // for anything but the fast-path shapes, so the receiver AND the sequence
+    // are rooted before either runs — the obligation every re-entrant native
+    // in this file discharges.
+    let mut scope = NativeHandleScope::new(ctx);
+    let this_handle = scope.root(this);
+    let cs_handle = cs.map(|o| scope.root(o));
+
+    // 1. checkOffset(dstOffset, count) — BEFORE the sequence is touched at
+    //    all. The `Thrower` row is what pins this ordering: a `length()` that
+    //    throws is never reached when the offset is already wrong.
+    let this_now = scope.get(&this_handle);
+    let count = sb_read_chars(&*scope, this_now).len() as i32;
+    if let Some(failure) = sb_check_offset(offset, count) {
+        return Err(failure);
+    }
+
+    // 2. checkRange(start, end, s.length()) — a null sequence is the four
+    //    characters "null", so the length checked against is 4.
+    let s_len = match &cs_handle {
+        Some(handle) => {
+            let cs_now = scope.get(handle);
+            charsequence_length(&mut *scope, cs_now)?
+        }
+        None => 4,
+    };
+    if start < 0 || end < start || end > s_len {
+        return Err(cratonvm_types::error::RuntimeError::ioobe(
+            cratonvm_types::error::out_of_bounds_message::check_from_to_index(
+                i64::from(start),
+                i64::from(end),
+                i64::from(s_len),
+            ),
+        )
+        .into());
+    }
+
+    // 3. The window's CHARACTERS. `charsequence_chars` reads them by `charAt`
+    //    for every implementation but the fast-path shapes, which is what the
+    //    JDK does, and answers code units so an unpaired surrogate survives.
+    let insert_chars: Vec<u16> = match &cs_handle {
+        Some(handle) => {
+            let cs_now = scope.get(handle);
+            charsequence_chars(&mut *scope, cs_now, Some((start, end)))?
+        }
+        None => "null".encode_utf16().collect::<Vec<u16>>()[start as usize..end as usize].to_vec(),
+    };
+
+    // 4. Splice. The receiver is re-read because steps 2 and 3 may have run
+    //    arbitrary Java; a `length()`/`charAt` that mutated the receiver could
+    //    have shortened it under us, and slicing on the stale `offset` would
+    //    panic. Refusing with the same class the offset check uses keeps a
+    //    pathological sequence from aborting the VM.
+    let this_now = scope.get(&this_handle);
+    let chars = sb_read_chars(&*scope, this_now);
+    if let Some(failure) = sb_check_offset(offset, chars.len() as i32) {
+        return Err(failure);
+    }
+    let offset = offset as usize;
+    let mut result = Vec::with_capacity(chars.len() + insert_chars.len());
+    result.extend_from_slice(&chars[..offset]);
+    result.extend_from_slice(&insert_chars);
+    result.extend_from_slice(&chars[offset..]);
+    let this_now = sb_write_chars(&mut *scope, this_now, &result);
+    Ok(Some(Value::Object(Some(this_now))))
+}
+
+/// `insert(int, CharSequence)` — JDK 25's two-argument insert.
+///
+/// The body is `if (s == null) s = "null"; if (s instanceof String) return
+/// insert(dstOffset, (String) s); return insert(dstOffset, s, 0, s.length());`
+/// and BOTH branches are observable:
+///
+/// * a `String` (and a null, which becomes one) takes the `insert(int,
+///   String)` path, so `length()` is never called on it;
+/// * anything else evaluates `s.length()` as an ARGUMENT of the four-argument
+///   call, i.e. **before** that call's offset check. MEASURED: on
+///   `new StringBuilder("xy")`, `insert(5, seq)` whose `length()` throws
+///   answers that `IllegalStateException`, while `insert(5, seq, 0, 1)`
+///   answers the offset `StringIndexOutOfBoundsException`. Two calls, same
+///   receiver, same bad offset, same sequence, different exceptions —
+///   transcribed rather than derived, because either ordering looks equally
+///   reasonable from the javadoc.
+pub(crate) fn native_sb_insert_charsequence(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    // args: [this, dstOffset, s]
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let offset = match args.get(1) {
+        Some(Value::Int(i)) => *i,
+        _ => 0,
+    };
+    let cs = match args.get(2) {
+        Some(Value::Object(Some(o))) => *o,
+        // `s == null` becomes the String "null", and a String goes to the
+        // `insert(int, String)` overload — which already substitutes "null"
+        // for a null argument, after its own `checkOffset`.
+        _ => return native_sb_insert_string(ctx, args),
+    };
+    let name = ctx
+        .class_name_of_id(ctx.class_id_of_object(cs))
+        .unwrap_or_default();
+    if name == "java/lang/String" {
+        return native_sb_insert_string(ctx, args);
+    }
+
+    // GC: `charsequence_length` re-enters Java, so both refs are rooted and
+    // re-read before they are handed to the four-argument body.
+    let mut scope = NativeHandleScope::new(ctx);
+    let this_handle = scope.root(this);
+    let cs_handle = scope.root(cs);
+    let len = {
+        let cs_now = scope.get(&cs_handle);
+        charsequence_length(&mut *scope, cs_now)?
+    };
+    let this_now = scope.get(&this_handle);
+    let cs_now = scope.get(&cs_handle);
+    native_sb_insert_charsequence_range(
+        &mut *scope,
+        &[
+            Value::Object(Some(this_now)),
+            Value::Int(offset),
+            Value::Object(Some(cs_now)),
+            Value::Int(0),
+            Value::Int(len),
+        ],
+    )
 }
 
 /// `insert(int, char)` — insert a single char. `checkOffset(offset, count)`.
@@ -2980,17 +3352,38 @@ pub(crate) fn native_sb_insert_object(
         Some(Value::Int(i)) => *i,
         _ => 0,
     };
-    let text = match args.get(2) {
-        Some(Value::Object(Some(obj))) => {
-            ctx.read_string(*obj).unwrap_or_else(|| "null".to_string())
-        }
-        Some(Value::Object(None)) => "null".to_string(),
-        Some(Value::Int(v)) => v.to_string(),
-        Some(Value::Long(v)) => v.to_string(),
-        _ => "null".to_string(),
+    // `insert(int, Object)` is `insert(dstOffset, String.valueOf(obj))`, so
+    // the object must be ASKED. This read `ctx.read_string(obj)` instead,
+    // which answers `None` for everything that is not a `java.lang.String` —
+    // so every other object was inserted as the four characters `"null"`.
+    // MEASURED (`scratchpad/g26/G26Insert.java`, HotSpot 25.0.3+9-LTS):
+    //
+    // | call | HotSpot | before |
+    // |---|---|---|
+    // | `insert(0, Integer.valueOf(7))` | `7ab` | `nullab` |
+    // | `insert(0, obj with toString()="CUSTOM")` | `CUSTOMab` | `nullab` |
+    // | `insert(0, Boolean.TRUE)` | `trueab` | `nullab` |
+    // | `insert(0, Double.valueOf(1.5))` | `1.5ab` | `nullab` |
+    // | `insert(0, new int[]{1})` | `[I@…ab` | `nullab` |
+    //
+    // `append(Object)` two hundred lines up already used `invoke_to_string`
+    // and already measured correct — the sibling overload, same file, one
+    // helper apart. The units form is [`invoke_to_string`]'s, so a
+    // `toString()` answering a lone surrogate survives too (row i2).
+    //
+    // GC: `invoke_to_string_units` re-enters Java and can move `this`, so the
+    // receiver is pinned across it — the same obligation
+    // `native_sb_append_object` discharges.
+    let mut scope = NativeHandleScope::new(ctx);
+    let this_handle = scope.root(this);
+    let insert_chars: Vec<u16> = match args.get(2) {
+        Some(Value::Object(Some(obj))) => invoke_to_string_units(&mut *scope, *obj)?,
+        Some(Value::Int(v)) => v.to_string().encode_utf16().collect(),
+        Some(Value::Long(v)) => v.to_string().encode_utf16().collect(),
+        _ => "null".encode_utf16().collect(),
     };
-    let insert_chars: Vec<u16> = text.encode_utf16().collect();
-    let chars = sb_read_chars(ctx, this);
+    let this = scope.get(&this_handle);
+    let chars = sb_read_chars(&*scope, this);
     if let Some(failure) = sb_check_offset(offset, chars.len() as i32) {
         return Err(failure);
     }
@@ -2999,7 +3392,7 @@ pub(crate) fn native_sb_insert_object(
     result.extend_from_slice(&chars[..offset]);
     result.extend_from_slice(&insert_chars);
     result.extend_from_slice(&chars[offset..]);
-    let this = sb_write_chars(ctx, this, &result);
+    let this = sb_write_chars(&mut *scope, this, &result);
     Ok(Some(Value::Object(Some(this))))
 }
 
@@ -3336,8 +3729,9 @@ pub(crate) fn native_sb_replace(ctx: &mut dyn NativeContext, args: &[Value]) -> 
     if let Some(failure) = sb_check_from_to_index(start, end, count) {
         return Err(failure);
     }
-    let replacement = match args.get(3) {
-        Some(Value::Object(Some(obj))) => ctx.read_string(*obj).unwrap_or_default(),
+    // Code UNITS — `G26Builder` row r1. See `native_sb_append_string`.
+    let repl_chars: Vec<u16> = match args.get(3) {
+        Some(Value::Object(Some(obj))) => read_string_chars(&*ctx, *obj),
         Some(Value::Object(None)) => {
             return Err(cratonvm_types::error::RuntimeError::NullPointerException {
                 message: Some(
@@ -3346,9 +3740,8 @@ pub(crate) fn native_sb_replace(ctx: &mut dyn NativeContext, args: &[Value]) -> 
             }
             .into())
         }
-        _ => String::new(),
+        _ => Vec::new(),
     };
-    let repl_chars: Vec<u16> = replacement.encode_utf16().collect();
     chars.splice(start as usize..end as usize, repl_chars);
     let this = sb_write_chars(ctx, this, &chars);
     Ok(Some(Value::Object(Some(this))))
@@ -14813,5 +15206,561 @@ mod f22_utf16_formatter_tests {
         assert!(has_unpaired_surrogate(&[0xDC00, 0xD800]));
         // A trailing high surrogate with nothing after it.
         assert!(has_unpaired_surrogate(&[0x0061, 0xD83D]));
+    }
+}
+
+/// G26 — the builder family's TEXT-carrying entry points.
+///
+/// Two defects, one file, measured on HotSpot 25.0.3+9-LTS before the fix
+/// (`docs/known-issues/jdk-only/G26-1-four-families-of-RJdkIntrinsics3-20260817.md`):
+///
+///   * every `String`/`Object`/`CharSequence` argument was read through a Rust
+///     `str`, which cannot hold an unpaired surrogate — 28 divergent rows of
+///     66 in `scratchpad/g26/G26Builder.java`;
+///   * `insert(int, CharSequence[, int, int])` had no native at all, so real
+///     bytecode ran against the synthetic layout, truncated silently, and left
+///     the receiver in a state where the next `charAt` ABORTED the VM.
+///
+/// These tests assert the units, not a `read_string` round trip: a test written
+/// through `read_string` passes on the broken code, because that is the very
+/// conversion that loses the surrogate.
+#[cfg(test)]
+mod g26_builder_text_tests {
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{
+        NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess,
+        NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess,
+    };
+
+    use super::*;
+    use crate::test_utils::{mock_ctx, MockNativeContext};
+    // `ObjectRef` is NOT re-exported by the parent's `use` list — it is spelled
+    // `cratonvm_types::ObjectRef` at every signature there — so `use super::*`
+    // does not bring it in.
+    use cratonvm_types::{ArrayElementType, ObjectRef};
+
+    /// A `java.lang.String` holding RAW code units, including ones no Rust
+    /// `str` can carry. `create_string` takes a `&str` and so cannot build the
+    /// input this family is about; the char[] is written directly, which is
+    /// the same shape `create_string` produces.
+    fn mock_string_of_units(ctx: &mut MockNativeContext, units: &[u16]) -> ObjectRef {
+        let s = ctx.create_string("");
+        let arr = ctx.new_array(ArrayElementType::Char, units.len());
+        for (i, &u) in units.iter().enumerate() {
+            ctx.set_array_element(arr, i, Value::Int(i32::from(u)));
+        }
+        ctx.set_field(s, 0, Value::Object(Some(arr)));
+        s
+    }
+
+    fn fresh_builder(ctx: &mut MockNativeContext) -> ObjectRef {
+        let cid = ctx
+            .ensure_class_initialized("java/lang/StringBuilder")
+            .unwrap();
+        let sb = ctx.alloc_object(cid, 4);
+        native_sb_init_default(ctx, &[Value::Object(Some(sb))]).unwrap();
+        sb
+    }
+
+    fn units_of(ctx: &MockNativeContext, sb: ObjectRef) -> Vec<u16> {
+        sb_read_chars(ctx, sb)
+    }
+
+    fn utf16(text: &str) -> Vec<u16> {
+        text.encode_utf16().collect()
+    }
+
+    fn failure_class(
+        ctx: &dyn NativeContext,
+        e: &cratonvm_types::error::MethodCallFailed,
+    ) -> &'static str {
+        match e {
+            cratonvm_types::error::MethodCallFailed::InternalError(
+                cratonvm_types::error::VmError::Runtime(re),
+            ) => match re {
+                cratonvm_types::error::RuntimeError::StringIndexOutOfBoundsException { .. } => {
+                    "sioobe"
+                }
+                cratonvm_types::error::RuntimeError::IndexOutOfBoundsException { .. } => "ioobe",
+                _ => "other-runtime",
+            },
+            cratonvm_types::error::MethodCallFailed::ExceptionThrown(obj) => {
+                let class_id = ctx.class_id_of_object(*obj);
+                match ctx.class_name_of_id(class_id).unwrap_or_default().as_str() {
+                    "java/lang/StringIndexOutOfBoundsException" => "sioobe",
+                    "java/lang/IndexOutOfBoundsException" => "ioobe",
+                    _ => "other-thrown",
+                }
+            }
+            _ => "other-failed",
+        }
+    }
+
+    fn failure_message(e: &cratonvm_types::error::MethodCallFailed) -> String {
+        match e {
+            cratonvm_types::error::MethodCallFailed::InternalError(
+                cratonvm_types::error::VmError::Runtime(re),
+            ) => match re {
+                cratonvm_types::error::RuntimeError::StringIndexOutOfBoundsException {
+                    message,
+                    ..
+                } => message.clone().unwrap_or_default(),
+                cratonvm_types::error::RuntimeError::IndexOutOfBoundsException { message } => {
+                    message.clone().unwrap_or_default()
+                }
+                _ => String::new(),
+            },
+            _ => String::new(),
+        }
+    }
+
+    /// The whole point of the helper: a lone LOW surrogate survives the read.
+    /// `read_string` on the same object answers U+FFFD, and asserting that
+    /// difference here is what stops the fix being undone by a "simplification"
+    /// back to `read_string`.
+    #[test]
+    fn read_string_chars_carries_what_read_string_cannot() {
+        let mut ctx = mock_ctx();
+        let s = mock_string_of_units(&mut ctx, &[0x0070, 0xDC00, 0x0071]);
+        assert_eq!(read_string_chars(&ctx, s), vec![0x0070, 0xDC00, 0x0071]);
+        // The lossy twin, for contrast: this is what every entry point below
+        // used to call.
+        assert_eq!(
+            utf16(&ctx.read_string(s).unwrap()),
+            vec![0x0070, 0xFFFD, 0x0071],
+            "read_string is expected to be lossy — that is why it was replaced"
+        );
+    }
+
+    /// `new StringBuilder(s)` — MEASURED rows c1/c2/c3/c5/c7.
+    #[test]
+    fn init_from_string_keeps_an_unpaired_surrogate() {
+        let mut ctx = mock_ctx();
+        let s = mock_string_of_units(&mut ctx, &[0xDC00]);
+        let cid = ctx
+            .ensure_class_initialized("java/lang/StringBuilder")
+            .unwrap();
+        let sb = ctx.alloc_object(cid, 4);
+        native_sb_init_string(&mut ctx, &[Value::Object(Some(sb)), Value::Object(Some(s))])
+            .unwrap();
+        assert_eq!(units_of(&ctx, sb), vec![0xDC00]);
+
+        // A well-formed pair is untouched — the control that would catch a
+        // mutant that broke ordinary text on the way to fixing this row.
+        let cid = ctx
+            .ensure_class_initialized("java/lang/StringBuilder")
+            .unwrap();
+        let sb2 = ctx.alloc_object(cid, 4);
+        let pair = mock_string_of_units(&mut ctx, &[0xD83D, 0xDE00]);
+        native_sb_init_string(
+            &mut ctx,
+            &[Value::Object(Some(sb2)), Value::Object(Some(pair))],
+        )
+        .unwrap();
+        assert_eq!(units_of(&ctx, sb2), vec![0xD83D, 0xDE00]);
+    }
+
+    /// `sb.append(s)` / `sb.insert(i, s)` / `sb.replace(a, b, s)` — MEASURED
+    /// rows a1/a2/a12, i1, r1. One test for the three because they are the same
+    /// defect with the same fix, and any one of them passing alone would not
+    /// show the other two had been touched.
+    #[test]
+    fn append_insert_replace_keep_an_unpaired_surrogate() {
+        let mut ctx = mock_ctx();
+        let lone = mock_string_of_units(&mut ctx, &[0xD800]);
+
+        let sb = fresh_builder(&mut ctx);
+        native_sb_append_string(
+            &mut ctx,
+            &[Value::Object(Some(sb)), Value::Object(Some(lone))],
+        )
+        .unwrap();
+        assert_eq!(units_of(&ctx, sb), vec![0xD800], "append(String)");
+
+        let sb2 = fresh_builder(&mut ctx);
+        let xy = ctx.create_string("xy");
+        native_sb_append_string(
+            &mut ctx,
+            &[Value::Object(Some(sb2)), Value::Object(Some(xy))],
+        )
+        .unwrap();
+        native_sb_insert_string(
+            &mut ctx,
+            &[
+                Value::Object(Some(sb2)),
+                Value::Int(1),
+                Value::Object(Some(lone)),
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            units_of(&ctx, sb2),
+            vec![0x0078, 0xD800, 0x0079],
+            "insert(int, String)"
+        );
+
+        let sb3 = fresh_builder(&mut ctx);
+        let xyz = ctx.create_string("xyz");
+        native_sb_append_string(
+            &mut ctx,
+            &[Value::Object(Some(sb3)), Value::Object(Some(xyz))],
+        )
+        .unwrap();
+        native_sb_replace(
+            &mut ctx,
+            &[
+                Value::Object(Some(sb3)),
+                Value::Int(1),
+                Value::Int(2),
+                Value::Object(Some(lone)),
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            units_of(&ctx, sb3),
+            vec![0x0078, 0xD800, 0x007A],
+            "replace(int, int, String)"
+        );
+    }
+
+    /// `append(String)` still substitutes the four characters `"null"` for a
+    /// null argument (`AbstractStringBuilder.appendNull`). The units rewrite
+    /// runs through the same `match`, so the null arm is asserted rather than
+    /// assumed.
+    #[test]
+    fn append_string_null_is_still_the_null_literal() {
+        let mut ctx = mock_ctx();
+        let sb = fresh_builder(&mut ctx);
+        native_sb_append_string(&mut ctx, &[Value::Object(Some(sb)), Value::Object(None)]).unwrap();
+        assert_eq!(units_of(&ctx, sb), utf16("null"));
+    }
+
+    /// `insert(int, Object)` must ASK the object. It read `ctx.read_string`,
+    /// which answers `None` for everything that is not a `java.lang.String`,
+    /// so every other object was inserted as the four characters `"null"`.
+    ///
+    /// MEASURED on HotSpot 25.0.3+9-LTS: `new StringBuilder("ab").insert(0,
+    /// Integer.valueOf(7))` is `7ab`; this VM answered `nullab`.
+    ///
+    /// The mock's `Integer` is a one-field object of that class, which is the
+    /// shape `invoke_to_string_units_opt`'s wrapper fast path recognises — the
+    /// same shape the sibling `append(Object)` has always gone through.
+    #[test]
+    fn insert_object_asks_the_object_instead_of_answering_null() {
+        let mut ctx = mock_ctx();
+        let sb = fresh_builder(&mut ctx);
+        let ab = ctx.create_string("ab");
+        native_sb_append_string(
+            &mut ctx,
+            &[Value::Object(Some(sb)), Value::Object(Some(ab))],
+        )
+        .unwrap();
+
+        let int_cid = ctx.ensure_class_initialized("java/lang/Integer").unwrap();
+        let boxed = ctx.alloc_object(int_cid, 1);
+        ctx.set_field(boxed, 0, Value::Int(7));
+
+        native_sb_insert_object(
+            &mut ctx,
+            &[
+                Value::Object(Some(sb)),
+                Value::Int(0),
+                Value::Object(Some(boxed)),
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            units_of(&ctx, sb),
+            utf16("7ab"),
+            "insert(0, Integer.valueOf(7)) must be 7ab, not nullab"
+        );
+    }
+
+    /// A `String` argument to `insert(int, Object)` keeps its raw units —
+    /// MEASURED row i2, and the arm the fix above must not have traded away.
+    #[test]
+    fn insert_object_keeps_an_unpaired_surrogate_from_a_string() {
+        let mut ctx = mock_ctx();
+        let sb = fresh_builder(&mut ctx);
+        let lone = mock_string_of_units(&mut ctx, &[0xDC00]);
+        native_sb_insert_object(
+            &mut ctx,
+            &[
+                Value::Object(Some(sb)),
+                Value::Int(0),
+                Value::Object(Some(lone)),
+            ],
+        )
+        .unwrap();
+        assert_eq!(units_of(&ctx, sb), vec![0xDC00]);
+    }
+
+    /// `insert(int, CharSequence)` had NO native: real bytecode ran against the
+    /// synthetic layout and `new StringBuilder("xy").insert(1, (CharSequence)
+    /// "AB")` answered `xA` where HotSpot answers `xABy`.
+    #[test]
+    fn insert_charsequence_inserts_rather_than_overwrites() {
+        let mut ctx = mock_ctx();
+        let sb = fresh_builder(&mut ctx);
+        let xy = ctx.create_string("xy");
+        native_sb_append_string(
+            &mut ctx,
+            &[Value::Object(Some(sb)), Value::Object(Some(xy))],
+        )
+        .unwrap();
+        let ab = ctx.create_string("AB");
+        native_sb_insert_charsequence(
+            &mut ctx,
+            &[
+                Value::Object(Some(sb)),
+                Value::Int(1),
+                Value::Object(Some(ab)),
+            ],
+        )
+        .unwrap();
+        assert_eq!(units_of(&ctx, sb), utf16("xABy"));
+    }
+
+    /// A null `CharSequence` becomes the four characters `"null"` — HotSpot
+    /// answers `xnully`, this VM answered `xn`.
+    #[test]
+    fn insert_charsequence_null_is_the_null_literal() {
+        let mut ctx = mock_ctx();
+        let sb = fresh_builder(&mut ctx);
+        let xy = ctx.create_string("xy");
+        native_sb_append_string(
+            &mut ctx,
+            &[Value::Object(Some(sb)), Value::Object(Some(xy))],
+        )
+        .unwrap();
+        native_sb_insert_charsequence(
+            &mut ctx,
+            &[Value::Object(Some(sb)), Value::Int(1), Value::Object(None)],
+        )
+        .unwrap();
+        assert_eq!(units_of(&ctx, sb), utf16("xnully"));
+    }
+
+    /// The four-argument form's window, and the empty window that must be a
+    /// no-op rather than a refusal — `insert(1, "AB", 1, 1)` answers `xy`.
+    #[test]
+    fn insert_charsequence_range_takes_the_window() {
+        let mut ctx = mock_ctx();
+        let sb = fresh_builder(&mut ctx);
+        let xy = ctx.create_string("xy");
+        native_sb_append_string(
+            &mut ctx,
+            &[Value::Object(Some(sb)), Value::Object(Some(xy))],
+        )
+        .unwrap();
+        let abc = ctx.create_string("ABC");
+        native_sb_insert_charsequence_range(
+            &mut ctx,
+            &[
+                Value::Object(Some(sb)),
+                Value::Int(1),
+                Value::Object(Some(abc)),
+                Value::Int(1),
+                Value::Int(3),
+            ],
+        )
+        .unwrap();
+        assert_eq!(units_of(&ctx, sb), utf16("xBCy"));
+
+        let sb2 = fresh_builder(&mut ctx);
+        let xy2 = ctx.create_string("xy");
+        native_sb_append_string(
+            &mut ctx,
+            &[Value::Object(Some(sb2)), Value::Object(Some(xy2))],
+        )
+        .unwrap();
+        let ab = ctx.create_string("AB");
+        native_sb_insert_charsequence_range(
+            &mut ctx,
+            &[
+                Value::Object(Some(sb2)),
+                Value::Int(1),
+                Value::Object(Some(ab)),
+                Value::Int(1),
+                Value::Int(1),
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            units_of(&ctx, sb2),
+            utf16("xy"),
+            "an empty window is legal and changes nothing"
+        );
+    }
+
+    /// The two refusals are DIFFERENT classes with DIFFERENT messages, and the
+    /// offset check runs FIRST. Every string here is TRANSCRIBED from HotSpot
+    /// 25.0.3+9-LTS (`scratchpad/g26/G26InsCs.java`), not derived: the javadoc
+    /// names only the classes.
+    ///
+    /// The `insert(9, "AB", 0, 9)` row is the ordering discriminator — BOTH
+    /// arguments are out of range and HotSpot answers the offset one. A body
+    /// that checked the range first would pass every other row here.
+    #[test]
+    fn insert_charsequence_range_refusals_are_transcribed() {
+        let mut ctx = mock_ctx();
+        let ab = ctx.create_string("AB");
+
+        // Offset out of range -> StringIndexOutOfBoundsException.
+        for (offset, expected) in [
+            (5, "Range [5, 2) out of bounds for length 2"),
+            (-1, "Range [-1, 2) out of bounds for length 2"),
+        ] {
+            let sb = fresh_builder(&mut ctx);
+            let xy = ctx.create_string("xy");
+            native_sb_append_string(
+                &mut ctx,
+                &[Value::Object(Some(sb)), Value::Object(Some(xy))],
+            )
+            .unwrap();
+            let e = native_sb_insert_charsequence_range(
+                &mut ctx,
+                &[
+                    Value::Object(Some(sb)),
+                    Value::Int(offset),
+                    Value::Object(Some(ab)),
+                    Value::Int(0),
+                    Value::Int(1),
+                ],
+            )
+            .expect_err("an offset out of range must be refused");
+            assert_eq!(failure_class(&ctx, &e), "sioobe", "offset {offset}");
+            assert_eq!(failure_message(&e), expected, "offset {offset}");
+            // A refused insert must not be a partial one.
+            assert_eq!(units_of(&ctx, sb), utf16("xy"));
+        }
+
+        // Window out of range -> the PLAIN IndexOutOfBoundsException.
+        for (start, end, expected) in [
+            (0, 9, "Range [0, 9) out of bounds for length 2"),
+            (-1, 1, "Range [-1, 1) out of bounds for length 2"),
+            (2, 1, "Range [2, 1) out of bounds for length 2"),
+        ] {
+            let sb = fresh_builder(&mut ctx);
+            let xy = ctx.create_string("xy");
+            native_sb_append_string(
+                &mut ctx,
+                &[Value::Object(Some(sb)), Value::Object(Some(xy))],
+            )
+            .unwrap();
+            let e = native_sb_insert_charsequence_range(
+                &mut ctx,
+                &[
+                    Value::Object(Some(sb)),
+                    Value::Int(1),
+                    Value::Object(Some(ab)),
+                    Value::Int(start),
+                    Value::Int(end),
+                ],
+            )
+            .expect_err("a window out of range must be refused");
+            assert_eq!(failure_class(&ctx, &e), "ioobe", "[{start}, {end})");
+            assert_eq!(failure_message(&e), expected, "[{start}, {end})");
+        }
+
+        // BOTH wrong: the OFFSET check wins.
+        let sb = fresh_builder(&mut ctx);
+        let xy = ctx.create_string("xy");
+        native_sb_append_string(
+            &mut ctx,
+            &[Value::Object(Some(sb)), Value::Object(Some(xy))],
+        )
+        .unwrap();
+        let e = native_sb_insert_charsequence_range(
+            &mut ctx,
+            &[
+                Value::Object(Some(sb)),
+                Value::Int(9),
+                Value::Object(Some(ab)),
+                Value::Int(0),
+                Value::Int(9),
+            ],
+        )
+        .expect_err("both out of range must be refused");
+        assert_eq!(failure_class(&ctx, &e), "sioobe");
+        assert_eq!(
+            failure_message(&e),
+            "Range [9, 2) out of bounds for length 2"
+        );
+
+        // A null sequence is checked against the LENGTH OF "null", i.e. 4 —
+        // so `[0, 9)` is refused and reports 4, while `[0, 4)` succeeds.
+        let sb = fresh_builder(&mut ctx);
+        let xy = ctx.create_string("xy");
+        native_sb_append_string(
+            &mut ctx,
+            &[Value::Object(Some(sb)), Value::Object(Some(xy))],
+        )
+        .unwrap();
+        let e = native_sb_insert_charsequence_range(
+            &mut ctx,
+            &[
+                Value::Object(Some(sb)),
+                Value::Int(1),
+                Value::Object(None),
+                Value::Int(0),
+                Value::Int(9),
+            ],
+        )
+        .expect_err("a window past the \"null\" literal must be refused");
+        assert_eq!(failure_class(&ctx, &e), "ioobe");
+        assert_eq!(
+            failure_message(&e),
+            "Range [0, 9) out of bounds for length 4"
+        );
+    }
+
+    /// `charAt` on a builder whose slot 0 is not a `char[]` used to be
+    /// `buf.unwrap()`, and a Rust panic is not a Java throwable: it terminated
+    /// the VM instead of unwinding. MEASURED reproducer: `insert(1,
+    /// (CharSequence) s)` corrupted the layout, and the next `charAt` printed
+    /// `called Option::unwrap() on a None value` and killed the process.
+    ///
+    /// The registration gap is closed, so nothing in the suite reaches this
+    /// arm any more — which is exactly why it needs a test that reaches it
+    /// directly.
+    #[test]
+    fn char_at_refuses_an_unreadable_buffer_instead_of_aborting() {
+        let mut ctx = mock_ctx();
+        let sb = fresh_builder(&mut ctx);
+        // A count that claims content, with no backing array behind it.
+        ctx.set_field(sb, 0, Value::Object(None));
+        sb_set_count(&mut ctx, sb, 3);
+        let e = native_sb_char_at(&mut ctx, &[Value::Object(Some(sb)), Value::Int(0)])
+            .expect_err("an unreadable buffer must throw, not panic");
+        assert_eq!(failure_class(&ctx, &e), "sioobe");
+
+        // The ordinary bounds refusal is unchanged, message included — it is
+        // TRANSCRIBED from HotSpot and matched before this change.
+        let sb2 = fresh_builder(&mut ctx);
+        let ab = ctx.create_string("ab");
+        native_sb_append_string(
+            &mut ctx,
+            &[Value::Object(Some(sb2)), Value::Object(Some(ab))],
+        )
+        .unwrap();
+        let e = native_sb_char_at(&mut ctx, &[Value::Object(Some(sb2)), Value::Int(5)])
+            .expect_err("index 5 of a 2-char builder must be refused");
+        assert_eq!(failure_class(&ctx, &e), "sioobe");
+        assert_eq!(failure_message(&e), "Index 5 out of bounds for length 2");
+    }
+
+    /// `charsequence_fast_units` is the one place four `append`/`repeat`
+    /// overloads read their text, so its `String` arm is the fix for all of
+    /// them at once. Asserting through it, rather than through each caller,
+    /// is what makes the single-home claim checkable.
+    #[test]
+    fn charsequence_fast_units_reads_raw_units_for_a_string() {
+        let mut ctx = mock_ctx();
+        let s = mock_string_of_units(&mut ctx, &[0x0061, 0xD800, 0x0062]);
+        let got = charsequence_fast_units(&mut ctx, s)
+            .expect("no Java is re-entered for a String")
+            .expect("a String is a fast-path shape");
+        assert_eq!(got, vec![0x0061, 0xD800, 0x0062]);
     }
 }
