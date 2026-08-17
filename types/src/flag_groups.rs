@@ -1090,8 +1090,6 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::JIT, token: "xt-peer-deadline-ms", on_key: Some("CRATONVM_XT_PEER_DEADLINE_MS"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "xt-peer-total-ms", on_key: Some("CRATONVM_XT_PEER_TOTAL_MS"), off_key: None, off_word: None },
     E { group: Group::GC, token: "card-metrics", on_key: Some("CRATONVM_GC_CARD_METRICS"), off_key: None, off_word: None },
-    E { group: Group::GC, token: "dbg-mapgen", on_key: Some("CRATONVM_DBG_MAPGEN"), off_key: None, off_word: None },
-    E { group: Group::GC, token: "dbg-vacated-frames", on_key: Some("CRATONVM_DBG_VACATED_FRAMES"), off_key: None, off_word: None },
     E { group: Group::GC, token: "card-table-only", on_key: Some("CRATONVM_CARD_TABLE_ONLY"), off_key: None, off_word: None },
     E { group: Group::GC, token: "compact-ref-fields", on_key: Some("CRATONVM_COMPACT_REF_FIELDS"), off_key: None, off_word: None },
     E { group: Group::GC, token: "pack-fields-by-width", on_key: Some("CRATONVM_PACK_FIELDS_BY_WIDTH"), off_key: None, off_word: None },
