@@ -3620,14 +3620,32 @@ pub(crate) fn tl_with_initial_suppliers(
     S.get_or_init(|| parking_lot::Mutex::new(rustc_hash::FxHashMap::default()))
 }
 
-/// Identity hashes of every TL instance whose runtime class is (or extends)
-/// `java/lang/InheritableThreadLocal`. Populated by `<init>` of the ITL
-/// variant; consulted by `Thread.start` when building the child's
+/// Every TL instance whose runtime class is (or extends)
+/// `java/lang/InheritableThreadLocal`, keyed by JLS identity hash → the
+/// ThreadLocal OBJECT itself. Populated by `<init>` of the ITL variant;
+/// consulted by `Thread.<init>` / `Thread.start` when building the child's
 /// inherited snapshot.
-pub(crate) fn tl_inheritable_ids() -> &'static parking_lot::Mutex<rustc_hash::FxHashSet<i32>> {
-    static S: std::sync::OnceLock<parking_lot::Mutex<rustc_hash::FxHashSet<i32>>> =
+///
+/// G43-1: this was an `FxHashSet<i32>`. A bare identity hash is enough to
+/// decide WHETHER an entry is inherited, but not WHAT the child receives:
+/// HotSpot's `ThreadLocal.createInheritedMap` stores `key.childValue(value)`,
+/// and an overriding subclass is arbitrary application bytecode that needs a
+/// receiver to be invoked on. There was no receiver here, so `childValue` was
+/// never applied and every child got the parent value verbatim (G36-2 §3.1,
+/// oracle row 16: HotSpot `cv(cvparent)`, CratonVM `cvparent`).
+///
+/// GC (same contract as `tl_with_initial_suppliers` above): the object is
+/// registered with `register_var_handle_root` at `native_itl_init` and re-read
+/// with `read_var_handle_root` — keyed by the map key, which IS its identity
+/// hash — at every use. The raw `ObjectRef` stored here is a
+/// stale-after-a-moving-GC fallback for contexts that do not implement the
+/// registry (mocks), never the address we call through when the registry
+/// answers.
+pub(crate) fn tl_inheritable_ids(
+) -> &'static parking_lot::Mutex<rustc_hash::FxHashMap<i32, ObjectRef>> {
+    static S: std::sync::OnceLock<parking_lot::Mutex<rustc_hash::FxHashMap<i32, ObjectRef>>> =
         std::sync::OnceLock::new();
-    S.get_or_init(|| parking_lot::Mutex::new(rustc_hash::FxHashSet::default()))
+    S.get_or_init(|| parking_lot::Mutex::new(rustc_hash::FxHashMap::default()))
 }
 
 /// Map from a child Java Thread's identity hash → snapshot of inherited
@@ -3740,7 +3758,13 @@ fn native_tl_init(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallRe
 fn native_itl_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     let id = ctx.identity_hash_code(this);
-    tl_inheritable_ids().lock().insert(id);
+    // G43-1: root the ITL object itself, because `snapshot_inheritable_tl_entries`
+    // has to invoke `childValue` ON it and the table outlives every frame that
+    // could otherwise keep it reachable. `register_var_handle_root` is the
+    // pattern `tl_with_initial_suppliers` uses for its suppliers; the identity
+    // key it is read back by is the same `id` we key the table with.
+    ctx.register_var_handle_root(this);
+    tl_inheritable_ids().lock().insert(id, this);
     Ok(None)
 }
 
@@ -3828,32 +3852,117 @@ fn native_tl_with_initial(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
 }
 
 /// Build a snapshot of this OS thread's TL entries whose keys are
-/// flagged inheritable. Called from `native_thread_start0` (parent side)
-/// before the child OS thread is spawned. Returns `None` if there are
-/// no inheritable entries to copy.
+/// flagged inheritable, with `InheritableThreadLocal.childValue` applied to
+/// each. This is CratonVM's `ThreadLocal.createInheritedMap`.
 ///
-/// NOTE: this only sees the parent's local map. Suppliers registered via
-/// `withInitial` are NOT eagerly evaluated for the child — the child's
-/// first `get()` will invoke its own supplier copy. That matches JDK
-/// semantics: `InheritableThreadLocal` inherits only set values, and
-/// `withInitial` ThreadLocals are not inheritable by default anyway.
+/// Called from `lang_system::capture_inheritable_tl_at_construction` (the
+/// construction-time capture the nine `Thread.<init>` bridges in `lib.rs` go
+/// through) and, only when nothing was captured at construction, from
+/// `native_thread_start0`. Exactly one of the two runs per child, so
+/// `childValue` is applied exactly once per constructed Thread — matching
+/// HotSpot, MEASURED (G36-2 §3.1 `G36Cv` rows 6 and 8: one call for a Thread
+/// that is started, one for a Thread that never is), and it runs on the
+/// CONSTRUCTING thread (row 10), which is where this function already was.
+///
+/// Returns `None` if there are no inheritable entries to copy.
+///
+/// NOTE: this sees the parent's local map, plus (since G43-1) whatever the
+/// parent itself inherited but has not yet read — see the drain at the top of
+/// the body. Suppliers registered via `withInitial` are NOT eagerly evaluated
+/// for the child — the child's first `get()` will invoke its own supplier
+/// copy. That matches JDK semantics: `InheritableThreadLocal` inherits only
+/// set values, and `withInitial` ThreadLocals are not inheritable by default
+/// anyway.
+///
+/// An explicitly stored `null` IS an entry, so `childValue(null)` is called
+/// for it; a `remove()`d ThreadLocal is not an entry, so nothing is called.
+/// Both MEASURED against HotSpot (`G36Cv` rows 4 and 5).
 pub(crate) fn snapshot_inheritable_tl_entries(
     ctx: &mut dyn NativeContext,
 ) -> Option<rustc_hash::FxHashMap<i32, ThreadLocalValue>> {
-    let inheritable = tl_inheritable_ids().lock();
-    if inheritable.is_empty() {
+    // G43-1 row 24 — inheritance must be TRANSITIVE. The drain is lazy: a
+    // thread's own inherited entries sit in `tl_inherited_pending` until its
+    // first `ThreadLocal` get/set/remove moves them into `TL_MAP`. A thread
+    // that inherited a value and then constructs a child WITHOUT ever reading
+    // it had an empty `TL_MAP` here, so the grandchild inherited nothing —
+    // `null` where HotSpot gives the grandparent's value. Draining first makes
+    // "what this thread would see if it read now" the thing we snapshot, which
+    // is what `createInheritedMap` copies on HotSpot. Idempotent, and a single
+    // bool check after the first call.
+    drain_inherited_for_current_thread(ctx);
+
+    // Three passes, and the split is NOT cosmetic. Pass 3 calls `childValue`,
+    // which is arbitrary application bytecode: an override that reads any
+    // ThreadLocal re-enters `TL_MAP.borrow()` (a `RefCell` double-borrow
+    // PANIC), and one that constructs an `InheritableThreadLocal` re-enters
+    // `native_itl_init` and this same non-reentrant `parking_lot::Mutex` (a
+    // DEADLOCK on the thread-construction path, i.e. a hang in every executor
+    // that ever mints a worker). So: take the table out and drop the lock,
+    // read the values out and drop the borrow, and only then call into Java
+    // holding neither.
+
+    // PASS 1 — copy the inheritable table; the lock is released at the brace.
+    let inheritable: Vec<(i32, ObjectRef)> = {
+        let guard = tl_inheritable_ids().lock();
+        if guard.is_empty() {
+            return None;
+        }
+        guard.iter().map(|(&k, &tl)| (k, tl)).collect()
+    };
+
+    // PASS 2 — copy this thread's own values for those keys. `ThreadLocalValue`
+    // is `Copy` and each `Root` variant already holds a global-root handle, so
+    // nothing here needs `ctx` and nothing here can allocate: the borrow is
+    // held across pure copies only, and is released at the closure's end.
+    let mut parent_entries: Vec<(i32, ObjectRef, ThreadLocalValue)> = Vec::new();
+    TL_MAP.with(|m| {
+        let map = m.borrow();
+        for &(key, tl) in &inheritable {
+            if let Some(stored) = map.get(&key) {
+                parent_entries.push((key, tl, *stored));
+            }
+        }
+    });
+    if parent_entries.is_empty() {
         return None;
     }
-    let snap: rustc_hash::FxHashMap<i32, ThreadLocalValue> = TL_MAP.with(|m| {
-        let map = m.borrow();
-        map.iter()
-            .filter(|(k, _)| inheritable.contains(k))
-            .map(|(k, v)| {
-                let java_value = tl_value_to_java(ctx, *v);
-                (*k, tl_value_from_java(ctx, java_value))
-            })
-            .collect()
-    });
+
+    // PASS 3 — apply `childValue`. No lock, no borrow, re-entrant-safe.
+    //
+    // The erased descriptor `(Ljava/lang/Object;)Ljava/lang/Object;` is the
+    // one that reaches BOTH `InheritableThreadLocal.childValue` itself and
+    // javac's synthetic bridge for a `childValue(String)`-shaped override.
+    //
+    // Values are re-resolved through `tl_value_to_java` immediately around the
+    // call rather than materialised in pass 2: `childValue` can allocate, and
+    // a moving GC would leave a pre-computed `ObjectRef` stale. The
+    // `ThreadLocalValue` we carry is the GC-stable form.
+    //
+    // BOUNDED DEVIATION (recorded here because it cannot be fixed at this
+    // layer): HotSpot propagates an exception thrown by `childValue` out of
+    // `Thread.<init>`. This function returns `Option`, not `Result`, and its
+    // callers are nine `Thread.<init>` bodies that return `()`, so a throwing
+    // override is swallowed and the child inherits the PARENT value — which is
+    // also what the base implementation would have produced. `Ok(None)` (no
+    // body found, e.g. a synthetic-JDK image that does not declare
+    // `childValue`) takes the same arm for the same reason.
+    let mut snap: rustc_hash::FxHashMap<i32, ThreadLocalValue> = rustc_hash::FxHashMap::default();
+    for (key, cached_tl, stored) in parent_entries {
+        let tl = ctx.read_var_handle_root(key).unwrap_or(cached_tl);
+        let parent_value = tl_value_to_java(ctx, stored);
+        let called = ctx.invoke_virtual(
+            tl,
+            "childValue",
+            "(Ljava/lang/Object;)Ljava/lang/Object;",
+            &[parent_value],
+        );
+        let child_value = match called {
+            Ok(Some(v)) => v,
+            // Re-resolve: the callee may have run a moving GC under us.
+            Ok(None) | Err(_) => tl_value_to_java(ctx, stored),
+        };
+        snap.insert(key, tl_value_from_java(ctx, child_value));
+    }
     if snap.is_empty() {
         None
     } else {
@@ -25925,5 +26034,239 @@ mod t2_tests {
         let this = crate::try_alloc_concurrent_synthetic(&mut ctx, "java/util/EnumMap", 3).unwrap();
         let e = native_em_init(&mut ctx, &[Value::Object(Some(this))]).unwrap_err();
         assert!(refusal(e).starts_with("NullPointerException"));
+    }
+
+    // -----------------------------------------------------------------
+    // G43-1 — `InheritableThreadLocal`: `childValue` and transitivity.
+    //
+    // Each body runs on its OWN `std::thread`. `TL_MAP` and the
+    // `TL_INHERITED_DRAINED` one-shot are thread-locals, so a fresh thread is
+    // the only way to be sure the drain under test has not already been run by
+    // a sibling — which is exactly the state that would make these tests pass
+    // vacuously under `--test-threads=1`.
+    // -----------------------------------------------------------------
+
+    /// Register `obj` as an `InheritableThreadLocal` through the real `<init>`
+    /// native and return the key the snapshot will use for it.
+    fn itl_register(ctx: &mut MockNativeContext, obj: ObjectRef) -> i32 {
+        native_itl_init(ctx, &[Value::Object(Some(obj))]).expect("ITL <init> must not fail");
+        ctx.identity_hash_code(obj)
+    }
+
+    #[test]
+    fn g43_1_snapshot_applies_child_value_to_each_inherited_entry() {
+        std::thread::spawn(|| {
+            let mut ctx = mock_ctx();
+            let itl = ctx.alloc_object(ClassId::new(0), 0);
+            let key = itl_register(&mut ctx, itl);
+
+            let parent = ctx.alloc_object(ClassId::new(0), 0);
+            native_tl_set(
+                &mut ctx,
+                &[Value::Object(Some(itl)), Value::Object(Some(parent))],
+            )
+            .expect("set must not fail");
+
+            // The one scripted `invoke_virtual` stands in for an override of
+            // `childValue`. HotSpot stores `key.childValue(value)`; CratonVM
+            // stored `value` verbatim, which is oracle row 16.
+            let child = ctx.alloc_object(ClassId::new(0), 0);
+            ctx.set_invoke_virtual_result(Ok(Some(Value::Object(Some(child)))));
+
+            let snap = snapshot_inheritable_tl_entries(&mut ctx).expect("one inheritable entry");
+            let stored = *snap.get(&key).expect("the ITL entry");
+            assert_eq!(
+                tl_value_to_java(&ctx, stored),
+                Value::Object(Some(child)),
+                "the child must receive childValue(parent), not the parent value verbatim"
+            );
+            assert_ne!(
+                tl_value_to_java(&ctx, stored),
+                Value::Object(Some(parent)),
+                "returning the parent value here is precisely the divergence"
+            );
+
+            tl_inheritable_ids().lock().remove(&key);
+        })
+        .join()
+        .expect("test thread must not panic");
+    }
+
+    #[test]
+    fn g43_1_child_value_falls_back_to_the_parent_value_with_no_body_or_a_throw() {
+        std::thread::spawn(|| {
+            // No override and no scripted result: `invoke_virtual` answers
+            // `Ok(None)`, the shape a synthetic-JDK image that does not declare
+            // `childValue` produces. The base implementation returns its
+            // argument, so the parent value is the correct fallback.
+            let mut ctx = mock_ctx();
+            let itl = ctx.alloc_object(ClassId::new(0), 0);
+            let key = itl_register(&mut ctx, itl);
+            let parent = ctx.alloc_object(ClassId::new(0), 0);
+            native_tl_set(
+                &mut ctx,
+                &[Value::Object(Some(itl)), Value::Object(Some(parent))],
+            )
+            .expect("set must not fail");
+
+            let snap = snapshot_inheritable_tl_entries(&mut ctx).expect("one entry");
+            assert_eq!(
+                tl_value_to_java(&ctx, *snap.get(&key).expect("entry")),
+                Value::Object(Some(parent)),
+                "Ok(None) must fall back to the parent value"
+            );
+
+            // A THROWING override takes the same arm — the bounded deviation
+            // recorded at the call site: this function returns `Option`, not
+            // `Result`, so the throw cannot propagate out of `Thread.<init>`
+            // the way it does on HotSpot.
+            let exc = ctx.alloc_object(ClassId::new(0), 0);
+            ctx.set_invoke_virtual_result(Err(MethodCallFailed::ExceptionThrown(exc)));
+            let snap = snapshot_inheritable_tl_entries(&mut ctx).expect("one entry");
+            assert_eq!(
+                tl_value_to_java(&ctx, *snap.get(&key).expect("entry")),
+                Value::Object(Some(parent)),
+                "a throwing childValue must degrade to the base implementation, not lose the entry"
+            );
+
+            tl_inheritable_ids().lock().remove(&key);
+        })
+        .join()
+        .expect("test thread must not panic");
+    }
+
+    #[test]
+    fn g43_1_child_value_runs_for_an_explicit_null_but_not_after_remove() {
+        std::thread::spawn(|| {
+            let mut ctx = mock_ctx();
+            let itl = ctx.alloc_object(ClassId::new(0), 0);
+            let key = itl_register(&mut ctx, itl);
+
+            // MEASURED on HotSpot (`G36Cv` row 4): an explicitly stored `null`
+            // IS an entry, so `childValue(null)` runs and its result is what
+            // the child gets.
+            native_tl_set(&mut ctx, &[Value::Object(Some(itl)), Value::Object(None)])
+                .expect("set(null) must not fail");
+            let child = ctx.alloc_object(ClassId::new(0), 0);
+            ctx.set_invoke_virtual_result(Ok(Some(Value::Object(Some(child)))));
+            let snap = snapshot_inheritable_tl_entries(&mut ctx)
+                .expect("an explicit null is still an inherited entry");
+            assert_eq!(
+                tl_value_to_java(&ctx, *snap.get(&key).expect("entry")),
+                Value::Object(Some(child)),
+                "childValue must be applied to a stored null too"
+            );
+
+            // MEASURED (`G36Cv` row 5): after `remove()` there is no entry, so
+            // nothing is called and nothing is inherited.
+            native_tl_remove(&mut ctx, &[Value::Object(Some(itl))]).expect("remove");
+            assert!(
+                snapshot_inheritable_tl_entries(&mut ctx).is_none(),
+                "a removed ThreadLocal must not be inherited"
+            );
+
+            tl_inheritable_ids().lock().remove(&key);
+        })
+        .join()
+        .expect("test thread must not panic");
+    }
+
+    #[test]
+    fn g43_1_snapshot_drains_this_threads_pending_inheritance_first() {
+        std::thread::spawn(|| {
+            let mut ctx = mock_ctx();
+            let itl = ctx.alloc_object(ClassId::new(0), 0);
+            let key = itl_register(&mut ctx, itl);
+
+            // The state a child thread is in before its FIRST ThreadLocal
+            // access: its inherited entries are queued, not yet in `TL_MAP`.
+            // Constructing a grandchild from here used to snapshot an empty
+            // map, which is oracle row 24 (`gp-init` on HotSpot, `null` here).
+            let gp_value = ctx.alloc_object(ClassId::new(0), 0);
+            let mut pending: rustc_hash::FxHashMap<i32, ThreadLocalValue> =
+                rustc_hash::FxHashMap::default();
+            let rooted = tl_value_from_java(&mut ctx, Value::Object(Some(gp_value)));
+            pending.insert(key, rooted);
+
+            // The mock mints a fresh "current thread" object on every call and
+            // steps its pointer by 8 (`test_utils::alloc_entry`), and identity
+            // hash IS the pointer — so the object the drain is about to
+            // allocate is one step past this probe. Nothing between here and
+            // the call may allocate.
+            let probe = ctx.current_thread_object();
+            let drain_thread_hash = ctx.identity_hash_code(probe).wrapping_add(8);
+            queue_inherited_tl_for_child(drain_thread_hash, pending);
+
+            let snap = snapshot_inheritable_tl_entries(&mut ctx)
+                .expect("pending inheritance must be drained before the snapshot is taken");
+            assert_eq!(
+                tl_value_to_java(&ctx, *snap.get(&key).expect("entry")),
+                Value::Object(Some(gp_value)),
+                "inheritance must be transitive even when this thread never read the value"
+            );
+
+            tl_inheritable_ids().lock().remove(&key);
+        })
+        .join()
+        .expect("test thread must not panic");
+    }
+
+    /// The hazard that stopped the previous lane, pinned as a test: `childValue`
+    /// is application bytecode, and the old body called into Java while holding
+    /// `tl_inheritable_ids().lock()` AND `TL_MAP.borrow()`. An override that
+    /// constructs an `InheritableThreadLocal` re-enters `native_itl_init` (the
+    /// same non-reentrant `parking_lot::Mutex` — a deadlock on the
+    /// thread-construction path, i.e. a hang in every executor), and one that
+    /// reads a `ThreadLocal` re-enters `TL_MAP.borrow_mut()` (a `RefCell`
+    /// double-borrow panic). This hook does BOTH from inside the callback.
+    /// The test hanging or panicking is the regression.
+    #[test]
+    fn g43_1_child_value_may_reenter_the_threadlocal_machinery() {
+        fn reentrant_child_value(
+            ctx: &mut MockNativeContext,
+            _receiver: ObjectRef,
+            method: &str,
+            _descriptor: &str,
+            args: &[Value],
+        ) -> Option<MethodCallResult> {
+            if method != "childValue" {
+                return None;
+            }
+            // Re-enter the global mutex...
+            let nested = ctx.alloc_object(ClassId::new(0), 0);
+            native_itl_init(ctx, &[Value::Object(Some(nested))]).expect("nested ITL <init>");
+            let nested_key = ctx.identity_hash_code(nested);
+            tl_inheritable_ids().lock().remove(&nested_key);
+            // ...and the RefCell, through a real ThreadLocal write.
+            let other = ctx.alloc_object(ClassId::new(0), 0);
+            native_tl_set(ctx, &[Value::Object(Some(other)), Value::Object(None)])
+                .expect("nested set");
+            // Hand the parent value straight back.
+            let parent = args.first().copied().unwrap_or(Value::Object(None));
+            Some(Ok(Some(parent)))
+        }
+
+        std::thread::spawn(|| {
+            let mut ctx = mock_ctx();
+            ctx.set_invoke_virtual_hook(reentrant_child_value);
+            let itl = ctx.alloc_object(ClassId::new(0), 0);
+            let key = itl_register(&mut ctx, itl);
+            let parent = ctx.alloc_object(ClassId::new(0), 0);
+            native_tl_set(
+                &mut ctx,
+                &[Value::Object(Some(itl)), Value::Object(Some(parent))],
+            )
+            .expect("set must not fail");
+
+            let snap = snapshot_inheritable_tl_entries(&mut ctx).expect("one entry");
+            assert_eq!(
+                tl_value_to_java(&ctx, *snap.get(&key).expect("entry")),
+                Value::Object(Some(parent))
+            );
+
+            tl_inheritable_ids().lock().remove(&key);
+        })
+        .join()
+        .expect("test thread must not deadlock or panic");
     }
 }
