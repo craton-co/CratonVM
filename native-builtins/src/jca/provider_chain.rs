@@ -134,6 +134,16 @@ fn snapshot() -> Vec<(String, f64, &'static str)> {
     provider_chain().lock().clone()
 }
 
+/// The installed providers' names, in chain (preference) order.
+///
+/// Exists so an engine whose own `getInstance` interception cannot serve a name
+/// can do what `ProviderList.getService` does — ask each installed provider in
+/// turn — instead of refusing outright. `getinstance_get_service_search` already
+/// walked this list; nothing outside this module could.
+pub(crate) fn chain_provider_names() -> Vec<String> {
+    snapshot().into_iter().map(|(name, _, _)| name).collect()
+}
+
 pub(crate) fn find(name: &str) -> Option<(f64, &'static str)> {
     provider_chain()
         .lock()

@@ -536,6 +536,204 @@ fn get_der(ctx: &mut dyn NativeContext, this: ObjectRef) -> Vec<u8> {
 }
 
 // ---------------------------------------------------------------------------
+// The three JDK string forms
+// ---------------------------------------------------------------------------
+//
+// `X500Principal` has three of them and they are NOT interchangeable:
+//
+// | form      | keywords            | case      | whitespace           |
+// |-----------|---------------------|-----------|----------------------|
+// | RFC2253   | RFC 2253 set        | as-parsed | as-parsed            |
+// | RFC1779   | RFC 1779 set + OID. | as-parsed | as-parsed, quoted    |
+// | CANONICAL | RFC 2253 set, lower | LOWERCASE | trimmed + collapsed  |
+//
+// Every one of them used to answer the RFC2253 string, and `equals` compared
+// THAT — so two DNs that differ only in attribute-name case or in runs of
+// spaces compared UNEQUAL here and EQUAL on HotSpot. That is not cosmetic:
+// PKIX name chaining is defined on the canonical form, so bc-java's PKITS
+// vectors 4.3.3/4.3.4/4.3.5/4.3.11 (whitespace, case and UTF8 name chaining)
+// could not match a CRL to its issuer — `No CRLs found for issuer ...` — and
+// `AttrCertTest` reported `principal[0] for entity names don't match`.
+//
+// `hashCode` is the canonical form's `String.hashCode()`, which is what makes
+// it consistent with the new `equals` (the JDK's own `X500Name.hashCode()` is
+// defined that way, and the two agree value-for-value on every DN in
+// `probes/`).
+
+/// The attribute types RFC 2253 gives a keyword; everything else is written as
+/// its dotted OID in the 2253 and canonical forms.
+fn rfc2253_keyword(oid: &str) -> Option<&'static str> {
+    match oid {
+        "2.5.4.3" => Some("CN"),
+        "2.5.4.7" => Some("L"),
+        "2.5.4.8" => Some("ST"),
+        "2.5.4.10" => Some("O"),
+        "2.5.4.11" => Some("OU"),
+        "2.5.4.6" => Some("C"),
+        "2.5.4.9" => Some("STREET"),
+        "0.9.2342.19200300.100.1.25" => Some("DC"),
+        "0.9.2342.19200300.100.1.1" => Some("UID"),
+        _ => None,
+    }
+}
+
+/// The narrower RFC 1779 keyword set. Anything outside it is spelled
+/// `OID.<dotted>` — measured on HotSpot 25, where `DC=example` renders as
+/// `OID.0.9.2342.19200300.100.1.25=example`.
+fn rfc1779_keyword(oid: &str) -> Option<&'static str> {
+    match oid {
+        "2.5.4.3" => Some("CN"),
+        "2.5.4.7" => Some("L"),
+        "2.5.4.8" => Some("ST"),
+        "2.5.4.10" => Some("O"),
+        "2.5.4.11" => Some("OU"),
+        "2.5.4.6" => Some("C"),
+        "2.5.4.9" => Some("STREET"),
+        _ => None,
+    }
+}
+
+/// Resolve whatever the stored string used as an attribute name (a keyword or
+/// an already-dotted OID) to its dotted OID.
+fn key_to_oid(key: &str) -> String {
+    name_to_oid(key)
+        .map(str::to_string)
+        .unwrap_or_else(|| key.to_string())
+}
+
+/// One AVA in canonical form: lowercase type, escaped + trimmed +
+/// space-collapsed + lowercased value.
+fn canonical_ava(key: &str, value: &str) -> String {
+    let oid = key_to_oid(key);
+    let ty = match rfc2253_keyword(&oid) {
+        Some(k) => k.to_ascii_lowercase(),
+        None => oid.clone(),
+    };
+    // Escapes first, so an escaped separator is not mistaken for one later.
+    // `#` is escaped only in leading position (measured: HotSpot's canonical
+    // for `CN=with#hash` is `cn=with#hash`, unescaped).
+    let mut escaped = String::with_capacity(value.len());
+    for (i, c) in value.chars().enumerate() {
+        match c {
+            ',' | '+' | '"' | '\\' | '<' | '>' | ';' => {
+                escaped.push('\\');
+                escaped.push(c);
+            }
+            '#' if i == 0 => {
+                escaped.push('\\');
+                escaped.push('#');
+            }
+            _ => escaped.push(c),
+        }
+    }
+    // Then trim, collapse runs of SPACE (only U+0020 — HotSpot leaves a TAB
+    // alone: `CN=Tab<TAB>Inside` canonicalises with the tab intact), lowercase.
+    let mut out = String::with_capacity(escaped.len());
+    let mut pending_space = false;
+    for c in escaped.trim().chars() {
+        if c == ' ' {
+            pending_space = true;
+            continue;
+        }
+        if pending_space {
+            out.push(' ');
+            pending_space = false;
+        }
+        out.push(c);
+    }
+    format!("{ty}={}", out.to_lowercase())
+}
+
+/// The RFC 2253 CANONICAL form of a whole DN.
+///
+/// A multi-valued RDN's AVAs are SORTED by their rendered strings, which is
+/// what makes `CN=a+OU=b+O=c` and `O=c+CN=a+OU=b` the same name (HotSpot:
+/// `cn=a+o=c+ou=b`). RDN order itself is significant and preserved.
+fn canonical_form(groups: &[Vec<(String, String)>]) -> String {
+    groups
+        .iter()
+        .map(|group| {
+            let mut avas: Vec<String> =
+                group.iter().map(|(k, v)| canonical_ava(k, v)).collect();
+            avas.sort();
+            avas.join("+")
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// `java.lang.String.hashCode()` over the UTF-16 code units of `s`.
+///
+/// Must be the JAVA hash, not a Rust one: `X500Principal.hashCode()` is
+/// `getName(CANONICAL).hashCode()` on the JDK, and code that keys a `HashMap`
+/// on principals depends on the exact value.
+fn java_string_hash(s: &str) -> i32 {
+    let mut h: i32 = 0;
+    for u in s.encode_utf16() {
+        h = h.wrapping_mul(31).wrapping_add(u as i32);
+    }
+    h
+}
+
+/// One AVA in RFC 1779 form, quoting the value when RFC 1779 requires it.
+fn rfc1779_ava(key: &str, value: &str) -> String {
+    let oid = key_to_oid(key);
+    let ty = match rfc1779_keyword(&oid) {
+        Some(k) => k.to_string(),
+        None => format!("OID.{oid}"),
+    };
+    // Quote when the value has a leading or trailing space, a run of two or
+    // more spaces, or any character RFC 1779 lists as special.
+    let chars: Vec<char> = value.chars().collect();
+    let mut quote = chars.first() == Some(&' ') || chars.last() == Some(&' ');
+    let mut prev_space = false;
+    for &c in &chars {
+        if matches!(c, ',' | '+' | '=' | '"' | '<' | '>' | '#' | ';' | '\n') {
+            quote = true;
+        }
+        if c == ' ' && prev_space {
+            quote = true;
+        }
+        prev_space = c == ' ';
+    }
+    if !quote {
+        return format!("{ty}={value}");
+    }
+    let mut inner = String::with_capacity(value.len() + 2);
+    for c in &chars {
+        if *c == '"' || *c == '\\' {
+            inner.push('\\');
+        }
+        inner.push(*c);
+    }
+    format!("{ty}=\"{inner}\"")
+}
+
+/// The RFC 1779 form of a whole DN — RDNs separated by `", "`, AVAs inside one
+/// RDN by `" + "`. This is also what `X500Principal.toString()` prints.
+fn rfc1779_form(groups: &[Vec<(String, String)>]) -> String {
+    groups
+        .iter()
+        .map(|group| {
+            group
+                .iter()
+                .map(|(k, v)| rfc1779_ava(k, v))
+                .collect::<Vec<_>>()
+                .join(" + ")
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// The stored RFC 2253 string of `this`, re-parsed into RDN groups.
+fn grouped_of(ctx: &mut dyn NativeContext, this: ObjectRef) -> Vec<Vec<(String, String)>> {
+    match get_canonical(ctx, this) {
+        Some(text) => parse_grouped_rdns(&text),
+        None => Vec::new(),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Registration
 // ---------------------------------------------------------------------------
 
@@ -724,46 +922,56 @@ pub fn register(r: &mut NativeMethodRegistry) {
                 Some(Value::Object(Some(f))) => ctx.read_string(*f).unwrap_or_default(),
                 _ => String::new(),
             };
-            // Stored canonical is RFC2253 (comma, no space). RFC1779 separates
-            // RDNs with ", " (comma + space); RFC2253/CANONICAL keep no space.
-            let s = get_canonical(ctx, this).unwrap_or_default();
+            // The stored string is the RFC 2253 form. RFC1779 and CANONICAL are
+            // genuinely different renderings of it, not the same string with the
+            // separators swapped: the old `s.replace(',', ", ")` answered an
+            // unquoted RFC2253 string for RFC1779 and the RFC2253 string
+            // verbatim for CANONICAL.
             let s = if fmt.eq_ignore_ascii_case("RFC1779") {
-                s.replace(',', ", ")
+                rfc1779_form(&grouped_of(ctx, this))
+            } else if fmt.eq_ignore_ascii_case("CANONICAL") {
+                canonical_form(&grouped_of(ctx, this))
             } else {
-                s
+                get_canonical(ctx, this).unwrap_or_default()
             };
             let so = ctx.create_string(&s);
             Ok(Some(Value::Object(Some(so))))
         },
     );
 
-    // toString() -> String  (delegates to getName())
+    // toString() -> String. The JDK's is `thisX500Name.toString()`, which is
+    // the RFC 1779 rendering (quoting and all), NOT the RFC 2253 one — measured
+    // on HotSpot 25: `new X500Principal("CN=Good CA,O=Test Certificates,C=US")`
+    // prints `CN=Good CA, O=Test Certificates, C=US`.
     r.register(cls, "toString", "()Ljava/lang/String;", |ctx, args| {
         let this = match args.first() {
             Some(Value::Object(Some(o))) => *o,
             _ => return Ok(Some(Value::Object(None))),
         };
-        let s = get_canonical(ctx, this).unwrap_or_default();
+        let s = rfc1779_form(&grouped_of(ctx, this));
         let so = ctx.create_string(&s);
         Ok(Some(Value::Object(Some(so))))
     });
 
-    // hashCode() -> int  (DER bytes XOR-fold to int).
+    // hashCode() -> int. The JDK's is the CANONICAL name's `String.hashCode()`
+    // (`X500Name.hashCode()`), so it must be that here too — a DER-derived hash
+    // disagrees with the new canonical `equals` for exactly the DN pairs equals
+    // now (correctly) calls equal, which would file two equal principals in
+    // different `HashMap` buckets.
     r.register(cls, "hashCode", "()I", |ctx, args| {
         let this = match args.first() {
             Some(Value::Object(Some(o))) => *o,
             _ => return Ok(Some(Value::Int(0))),
         };
-        let der = get_der(ctx, this);
-        let mut h: u32 = 0;
-        for &b in &der {
-            h = h.wrapping_mul(31).wrapping_add(b as u32);
-        }
-        Ok(Some(Value::Int(h as i32)))
+        let canon = canonical_form(&grouped_of(ctx, this));
+        Ok(Some(Value::Int(java_string_hash(&canon))))
     });
 
-    // equals(Object) -> boolean  (compare canonical strings, falling
-    // back to DER bytes if the other side is a different shape).
+    // equals(Object) -> boolean. `X500Principal.equals` is defined on the
+    // CANONICAL form: two DNs are the same name when they differ only in
+    // attribute-name case, value case, or runs of whitespace. Comparing the
+    // stored RFC 2253 strings (and then the DER) answered `false` for exactly
+    // those pairs — see the table above this file's string-form helpers.
     r.register(cls, "equals", "(Ljava/lang/Object;)Z", |ctx, args| {
         let this = match args.first() {
             Some(Value::Object(Some(o))) => *o,
@@ -773,17 +981,17 @@ pub fn register(r: &mut NativeMethodRegistry) {
             Some(Value::Object(Some(o))) => *o,
             _ => return Ok(Some(Value::Int(0))),
         };
-        let a_canon = get_canonical(ctx, this);
-        let b_canon = get_canonical(ctx, other);
-        if let (Some(a), Some(b)) = (&a_canon, &b_canon) {
-            if a == b {
-                return Ok(Some(Value::Int(1)));
-            }
+        // A non-`X500Principal` argument has no DN to canonicalise; the JDK
+        // answers `false` for it rather than comparing something else.
+        let other_is_principal = ctx
+            .class_name_of_id(ctx.class_id_of_object(other))
+            .is_some_and(|n| n == "javax/security/auth/x500/X500Principal");
+        if !other_is_principal {
+            return Ok(Some(Value::Int(0)));
         }
-        let a_der = get_der(ctx, this);
-        let b_der = get_der(ctx, other);
-        let same = !a_der.is_empty() && a_der == b_der;
-        Ok(Some(Value::Int(if same { 1 } else { 0 })))
+        let a = canonical_form(&grouped_of(ctx, this));
+        let b = canonical_form(&grouped_of(ctx, other));
+        Ok(Some(Value::Int(i32::from(!a.is_empty() && a == b))))
     });
 
     // sun.security.x509.X500Name.asX500Principal() — kcfull #12.
