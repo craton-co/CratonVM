@@ -22,7 +22,7 @@ that tests drive?
 | **Parallel marking** | **Built, opt-in** | `CRATONVM_ZGC_PARMARK=<n>` reaches `mark_parallel_stw` from `collect_garbage` |
 | **Compacting** | **Built, opt-in** | `CRATONVM_ZGC_RELOCATE=1` reaches `relocate_stw` from `collect_garbage`; returns a non-empty `PointerMap` and rewrites roots |
 | **Concurrent** | **BUILT since 2026-08-16 — the mutators really do run** | `maybe_gc` opens a cycle at a brief STW once allocation crosses `CRATONVM_ZGC_CONC_START`% of the collection threshold; the pool traces the closure while every mutator runs; the next collection's pause replays the SATB ingress, re-scans the roots and certifies the mark set. `set_mark_active(true)` has a production caller, allocation is BLACK during a cycle, and `--verbose:gc` says `mark=concurrent`. See §2 for what landed and how it differs from C1's expected shape |
-| **Generational** | **NOT BUILT** | page ages, the card barrier and `ZGenerationScope` are computed inside `relocate_stw`, but `remembered_roots` has **no non-test caller** and there is no young-only collection. (`minor_collect` in `zgc.rs` belongs to the *simulation* half, not `ZgcRealHeap`.) |
+| **Generational** | **BUILT since 2026-08-17, opt-in** | `CRATONVM_ZGC_GENERATIONAL=1` makes every collection between two whole-heap ones a young cycle: the old generation is pre-marked and never traced, the remembered set supplies the old-to-young roots, and the sweep ages and promotes. The split is by **object** age, not page age — see §3 for why the page grid cannot do it. `gen=` on the `--verbose:gc` line and `[GC] zgc-generational:` at shutdown say whether it engaged |
 
 **Updated 2026-08-16.** Concurrency landed. The rest of this section is kept as
 written on 2026-08-13 so the diff between what was planned and what was built
@@ -31,7 +31,10 @@ are not, and C1 closed in a **different shape** than it was specified in — for
 an architectural reason that is worth reading before the next collector change
 proposes a background thread that takes a safepoint.
 
-Generational is still a project and is untouched by this.
+**Updated 2026-08-17.** Generational landed too, and §3 has been rewritten
+around what building it actually found. The rest of this section is kept as
+written on 2026-08-13 so the diff between what was planned and what was built
+stays legible.
 
 **What already exists, and is the reason this is weeks and not months:**
 
@@ -48,6 +51,8 @@ Generational is still a project and is untouched by this.
   Armed by a flag nothing sets.
 * `ZgcRealHeap::note_ref_store` + `remembered::ZRememberedSetTable` — the card
   barrier, fed by `GarbageCollector::write_barrier`. Same shape: wired, unarmed.
+  **This line was wrong in a way that mattered, and §3 opens with it: it was not
+  fed by anything at all.**
 
 ---
 
@@ -545,41 +550,161 @@ decides the total, and the window does not move it.**
 
 ---
 
-## 3. Phase G — generational
+## 3. Phase G — generational — **BUILT 2026-08-17, opt-in**
 
-Everything here already exists as *accounting*; what is missing is a cycle that
-uses it.
+This section said "everything here already exists as *accounting*; what is
+missing is a cycle that uses it". Building the cycle found why nothing had ever
+used it, and the answer was not that the cycle was missing.
 
-### G1 — A young-only collection
+### G0 — the card barrier was on no store path at all
 
-`collect_garbage` marks the whole heap from the thread roots. A young cycle
-marks only young pages, from the thread roots **plus** `remembered_roots`.
+`note_ref_store` was reachable only from `GarbageCollector::write_barrier`, and
+this backend's `set_field` never calls it. The interpreter says otherwise in as
+many words —
 
-The pieces are in place: `ZGenerationScope::admits(addr)` decides membership,
-`remembered_roots` supplies the old-to-young edges, and the card barrier keeps
-the table current. What has to be written is the cycle itself and its sweep:
-a young sweep must reclaim only within the scope, or it will free old objects
-it never marked.
+> write_barrier fires automatically inside set_field / set_field_volatile
 
-**The correctness hazard to plan around:** the card barrier is armed only once
-a page is old, so edges created *before* the first promotion are not recorded.
-The first young cycle after a promotion must therefore treat the newly-old page
-as wholly dirty rather than trust an empty card set for it.
+(`vm/src/runtime/interpreter/opcodes.rs`) — and that is **true of `gen_heap`**,
+whose `set_field` does call it, and **false of ZGC**. So every interpreted
+`putfield` and every `aastore` skipped the card barrier. `remembered_roots`
+having no non-test caller was not an unfinished phase; it was a hole, and the
+three tests covering the barrier all passed because each called
+`note_ref_store` by hand.
 
-**Exit:** a young cycle collects a young-only workload with strictly less work
-than a full cycle, and a test proves an object reachable only through an old
-field survives it — the assertion that already exists for `remembered_roots`,
-promoted to end-to-end.
+This is the shape this tree keeps finding: **an inert registration looks exactly
+like a missing feature.** The barrier now sits on the store **accessors** —
+`set_field_no_satb` (which both `set_field` and `set_field_suppress_satb` funnel
+through) and `set_array_element` — for the same reason the SATB barrier does:
+coverage becomes a property of the *one* store path instead of a property of a
+call-site census that has to stay complete forever. `System.arraycopy` is the
+case that makes call sites hopeless; it copies a reference array one element at
+a time straight through the accessor.
 
-### G2 — Promotion, and a real young space
+### G1 — a young-only collection — **CLOSED**
 
-Today "promotion" ages a logical grid cell. A real generational collector
-*moves* survivors into an old space. That needs `ZPageAllocator`, which is the
-one place this plan and the page-allocator question meet: **generational
-promotion is the first thing that genuinely requires it**, because a logical
-grid cannot separate young from old in address space.
+**Not a second `collect_garbage`.** That was the obvious shape and it is the
+wrong one here: `collect_garbage` also runs a finalizer resurrection pass, the
+reference processor, a soft-referent remark, two censuses and a sweep that
+coalesces the arena, and a second copy of all of it would be a second place for
+the old code and the new to disagree about what "live" means.
 
-Sequence it last, and treat the allocator swap as its own change with its own
+Instead a young cycle **inverts one arm of a pass that already runs**. The
+mark-bit clear SETS the bit on old objects, and every phase downstream is then
+correct untouched:
+
+| phase | why it needs no change |
+|---|---|
+| the mark loop | its `already visited` test skips old objects, so their fields are never enumerated — **this is the entire saving** |
+| `process_references` | asks `is_marked_addr`, so an old referent reads as live and is not cleared |
+| the finalizer pass | sees an old finalizable object as a survivor, so it waits for a major rather than being finalized early |
+| the sweep | sees old objects as survivors, clears the bit, retains them |
+
+What had to be written is only what that inversion cannot express: the roots the
+old generation contributes, the aging and promotion the sweep performs, and the
+card the promotion has to leave behind.
+
+#### The split is per OBJECT, and the page grid cannot do it
+
+`page_ages` + `age_pages_and_split` were the obvious input and they are the
+wrong one. A page's age only rises; the bump cursor sits inside a page that has
+usually already aged past the promotion age; and in steady state the allocator
+serves most requests out of free-list holes scattered over every page. So a
+freshly allocated object — **precisely what a young cycle exists to collect** —
+would be born into an old page, read as old, and the phase would reclaim nothing
+while still paying for the barrier.
+
+`ObjectHeader::gc_age` has none of that: it is 0 at allocation wherever the bytes
+came from, and it is the field `gen_heap` and G1 already promote on. The
+page-keyed remembered set stays, because a card table is what it is — a page id
+is an index, not a claim about the generation of everything on that page.
+
+`page_ages` / `age_pages_and_split` / `old_page_ids` are unchanged and still feed
+`ZGenerationScope` from inside `relocate_stw`. They are page-level *accounting*
+now, and nothing gates on them.
+
+#### The three correctness rules, each asserted in both directions
+
+1. **A card is cleaned when its object no longer points into young, and kept
+   while it does.** Never clearing is correct and unbounded — the root scan
+   converges on re-enumerating the whole old generation and the phase saves
+   nothing. Always clearing is a use-after-free: the edge outlives the store that
+   created it, and nothing rewrites the field to re-card it. `swap_all` +
+   re-dirty is why `ZRememberedSet` has two buffers.
+2. **Promotion cards the object it promotes.** The barrier cards a store only
+   when the receiver is *already* old, so every reference an object wrote during
+   its young life is un-carded at the instant it is promoted. This is the
+   per-object answer to the hazard this section originally stated in page terms
+   ("the first young cycle after a promotion must treat the newly-old page as
+   wholly dirty") — and per object it is **exact**, costing one card instead of a
+   scan of every object on the page.
+3. **The four pin registries are rooted wholesale.** A young cycle never
+   *visits* an old object, so it never pushes the edges `collect_garbage`'s mark
+   loop pushes per marked object: the class's loader, that loader's mirrors, its
+   metadata roots, and the native collection overlays it owns. **Not one of the
+   four is written through `set_field`**, so no card could ever have covered
+   them. An old `HashMap` with a native overlay holding young contents had those
+   contents freed while the map was live — no wild pointer, no failing
+   assertion, and the symptom is a collection that has silently emptied.
+
+   Rooted wholesale rather than per old object: O(registry) once instead of
+   O(old objects) × four global lookups, and safe in the right direction.
+   `gen_heap` already does this for the overlays, which is why the predicate form
+   of the provider API exists.
+
+   **The test that catches it was red before the fix, and the ZGC fixture's own
+   `roots_for_matching_owners: |_p| Vec::new()` stub was hiding it.** The real
+   provider in `native-collections` implements that arm, so the stub was the
+   difference between the fixture and production, not the feature.
+
+#### Two interactions that are refusals, not features
+
+* **A concurrently-marked cycle is never a young cycle.** The mark set
+  `finish_concurrent_mark` hands over *is* the whole-heap closure; it cannot be
+  scoped after the fact, and re-marking would throw away the concurrent phase's
+  whole product. Same for a collection driven by allocation failure: a young
+  cycle retains the entire old generation unexamined, so it is the wrong tool
+  for "the heap is full".
+* **A relocation that moved anything re-cards the old generation.** A card is a
+  page id plus an offset, so a slide invalidates every one at once; object ages
+  ride in the header and are unaffected, which is what would have made the
+  failure silent. Rebuilt from the post-slide live set rather than rewritten
+  through the pointer map, because a card whose object did not move has no map
+  entry and neither does one whose object died — and the difference between those
+  two decides between a lost edge and a leak.
+
+**Exit criterion**, as written: *a young cycle collects a young-only workload
+with strictly less work than a full cycle, and a test proves an object reachable
+only through an old field survives it.* Both are met —
+`a_young_cycle_keeps_an_object_reachable_only_through_an_old_field` drives the
+store **accessor** and then a real collection, which is the only version of that
+test that could have failed before G0; and `old_retained` is the count of objects
+a young cycle retained without tracing. §3b has the measurement.
+
+### G2 — promotion, and a real young space — **NOT BUILT, and re-scoped**
+
+This item said promotion needs `ZPageAllocator` because "a logical grid cannot
+separate young from old in address space". That is true and it is no longer the
+blocker it was described as, because **G1 does not separate them in address
+space at all** — it separates them by header age, and a non-moving mark-sweep
+collector does not need young and old to be contiguous.
+
+What is still missing, and what it would buy:
+
+* **Moving survivors into an old space.** Today a promoted object stays where it
+  is. A real young space would give the young generation contiguous, sequentially
+  allocated memory and let a young cycle reclaim it by *resetting a cursor*
+  rather than by sweeping the whole registry. That is the answer to
+  `sweep_us` — 30–52% of the concurrent pause and the pause floor (§2c) — and it
+  is the only one, because a sweep over a flat registry is O(all objects)
+  whatever the generation split says.
+* **A young-only sweep.** G1's sweep still walks every registered object,
+  including every old one it has just pre-marked. The pre-mark makes that walk
+  cheap (a flag set, no field enumeration) but it is still O(registry), so a
+  young cycle's *sweep* cost does not fall with the generation split even though
+  its *mark* cost does.
+
+Those two are the same project and it does need the page allocator. Sequence it
+after C5, and treat the allocator swap as its own change with its own
 measurement.
 
 ---
@@ -587,12 +712,16 @@ measurement.
 ## 4. Sequencing, and what to do first
 
 ```
-C1 safepoint ──┬─> C3 resurrection ─> [concurrent mark works]
+C1 safepoint ──┬─> C3 resurrection ─> [concurrent mark works]  DONE 08-16
 C2 ownership ──┘                              │
                                               v
-                              C4 per-thread buffers (throughput)
+                              C4 per-thread buffers (throughput)  OPEN
 
-G1 young cycle ─> G2 promotion + ZPageAllocator (needs the allocator swap)
+G0 card barrier on the accessor ─> G1 young cycle    DONE 08-17
+                                       │
+                                       v
+                     G2 real young space + ZPageAllocator   OPEN
+                       (and it is what `sweep_us` needs)
 ```
 
 **C1 and C2 are independent and are both on the critical path.** C2 is the
@@ -604,6 +733,38 @@ concurrency before relocation: a bug in concurrent marking costs throughput or
 surfaces as a missed object under a test, while a bug in a young cycle's sweep
 frees live old objects.
 
+### What is still open, 2026-08-17, ranked by what the measurements say
+
+1. **C5 — make the marker scale.** Unaddressed and it is the one with a number:
+   four workers cost **+153% pause** against zero on `probes/BigLive.java`, so
+   `Z_PARMARK_DEFAULT_WORKERS` is 0 and parallel marking is a feature nobody can
+   turn on. The rise is monotonic in worker count, which is a lock, and building
+   Phase G found three per-object candidates that all fit:
+   `metadata_pin::roots_for_loader` takes its registry `RwLock` and clones a
+   `Vec` for **every** marked object (its own module already has a `snapshot()`
+   written for exactly this reason, which nothing calls);
+   `external_roots::snapshot()` **clones the provider `Vec` per object**; and
+   `concurrent_mark_skip_set` takes an `RwLock` read plus an `Arc` clone per
+   object. The serial marker pays all three too — uncontended.
+2. **G2 — a real young space.** The answer to `sweep_us`, which is 30–52% of the
+   concurrent pause and the pause floor (§2c). A young cycle's mark cost falls
+   with the generation split; its **sweep** cost does not, because the sweep
+   walks every registered object whatever the split says. Needs the page
+   allocator; see §3's G2.
+3. **`snapshot_us`**, 13% of the threaded concurrent pause: `bases()`
+   materialises a `Vec` of every registered base — 10.8M × 8 B = 87 MB allocated
+   inside the pause. Iterating the bitmap in place removes it.
+4. **C4 — per-thread mark buffers.** Pure throughput, and the larger half of it
+   is already done (`hand_satb_batch_to_the_marker`). What remains needs
+   thread-keyed state on the heap, because `satb_pre_barrier` is reached with no
+   thread context at all. **Must use `ZMarkHandle::new_buffer`, never
+   `ZMarkMutatorBuffer::new`** — the latter is detached, and a detached buffer
+   dropped non-empty leaves objects marked-and-unscanned, which is a
+   use-after-free because the mark bit is what dedups them.
+5. **A concurrent sweep.** Its own project, not in Phase C as written, and
+   largely superseded by G2: a young space reclaimed by resetting a cursor has
+   no sweep to make concurrent.
+
 ---
 
 ## 5. What this plan does not do
@@ -613,3 +774,9 @@ on a measurement, and the two properties that *are* built —
 `CRATONVM_ZGC_PARMARK` and `CRATONVM_ZGC_RELOCATE` — should have their gauntlet
 numbers in hand before a third and fourth join them. Flipping four switches at
 once produces one result and four candidate explanations.
+
+That now covers four switches, not two: `CRATONVM_ZGC_CONC_START` and
+`CRATONVM_ZGC_GENERATIONAL` are both off by default for the same reason, and
+each has an engagement counter on the `--verbose:gc` line (`mark=`, `gen=`) so a
+run that did not exercise the feature says so instead of being read as evidence
+about it.
