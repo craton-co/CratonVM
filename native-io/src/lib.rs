@@ -21622,6 +21622,37 @@ fn native_dc_open(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallRes
     Ok(Some(Value::Object(Some(dc))))
 }
 
+/// Turn a UDP bind failure into the exception HotSpot raises for it.
+///
+/// `java.nio.channels.DatagramChannel.bind` surfaces an unavailable address as
+/// `java.net.BindException`, and callers test for it by type — netty's
+/// `DnsNameResolverTest.testAddressAlreadyInUse` asserts
+/// `assertInstanceOf(BindException.class, cause.getCause())`. A plain
+/// `IOException` carrying the OS text satisfies nothing that looks at the
+/// type, and on Windows the text is localised on top of that.
+///
+/// Windows reports a clash two different ways depending on whether the caller
+/// asked for `SO_REUSEADDR`: `WSAEADDRINUSE` without it, `WSAEACCES` (mapped
+/// by Rust to `PermissionDenied`) with it, because the holder owns the port
+/// exclusively. Both are `BindException` on HotSpot, so both are here.
+fn dc_bind_error(addr: &str, e: std::io::Error) -> RuntimeError {
+    use std::io::ErrorKind;
+    match e.kind() {
+        ErrorKind::AddrInUse => RuntimeError::BindException {
+            message: format!("Address already in use: bind to {addr}"),
+        },
+        ErrorKind::AddrNotAvailable => RuntimeError::BindException {
+            message: format!("Cannot assign requested address: bind to {addr}"),
+        },
+        ErrorKind::PermissionDenied => RuntimeError::BindException {
+            message: format!("Permission denied: bind to {addr}"),
+        },
+        _ => RuntimeError::IOException {
+            message: format!("DatagramChannel.bind: {e}"),
+        },
+    }
+}
+
 fn native_dc_bind(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg92(args, 0)?;
     // `DatagramChannel.bind(null)` is the JDK contract for a wildcard,
@@ -21673,9 +21704,7 @@ fn native_dc_bind(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
             Some(port) => ctx.fd_table().udp_rebind_dual_stack(existing, port, reuse),
             None => ctx.fd_table().udp_rebind(existing, Some(&addr_str), reuse),
         };
-        rebound.map_err(|e| RuntimeError::IOException {
-            message: format!("DatagramChannel.bind: {e}"),
-        })?;
+        rebound.map_err(|e| dc_bind_error(&addr_str, e))?;
         if let Ok(fresh) = ctx.fd_table().udp_try_clone(existing) {
             crate::nio_selector::selector_refresh_udp(existing as i32, &fresh);
         }
@@ -21688,9 +21717,7 @@ fn native_dc_bind(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
         _ if reuse => ctx.fd_table().open_udp_reuse(Some(&addr_str)),
         _ => ctx.fd_table().open_udp(Some(&addr_str)),
     }
-    .map_err(|e| RuntimeError::IOException {
-        message: format!("DatagramChannel.bind: {e}"),
-    })?;
+    .map_err(|e| dc_bind_error(&addr_str, e))?;
 
     set_dc_fd(ctx, this, fd_id);
     Ok(Some(Value::Object(Some(this))))

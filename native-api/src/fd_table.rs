@@ -115,27 +115,40 @@ fn disable_udp_connreset(_socket: &std::net::UdpSocket) {}
 /// address names — the dual-stack choice only applies to the wildcard, exactly
 /// as in `Net.socket`.
 fn open_udp_dual_stack_socket(port: u16) -> Result<std::net::UdpSocket, io::Error> {
-    let v6 = (|| -> Result<std::net::UdpSocket, io::Error> {
-        let socket = socket2::Socket::new(
-            socket2::Domain::IPV6,
-            socket2::Type::DGRAM,
-            Some(socket2::Protocol::UDP),
-        )?;
-        socket.set_only_v6(false)?;
-        let addr = std::net::SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, port));
-        socket.bind(&addr.into())?;
-        Ok(socket.into())
-    })();
-    match v6 {
-        Ok(socket) => Ok(socket),
-        // No IPv6 stack (or the kernel refuses a dual-stack bind). The v4
-        // wildcard is the JDK's own fallback and every existing caller's
-        // previous behaviour, so this cannot be worse than not trying.
-        Err(_) => std::net::UdpSocket::bind(std::net::SocketAddr::from((
-            std::net::Ipv4Addr::UNSPECIFIED,
-            port,
-        ))),
-    }
+    // The fallback covers exactly one condition: this host has no usable IPv6
+    // stack, so the SOCKET cannot be created (or cannot be made dual-stack).
+    // It must NOT cover a failing bind.
+    //
+    // It did, once, and the bug it caused is worth keeping written down. With
+    // `Err(_) => bind v4` wrapped around the whole thing, a genuine
+    // `EADDRINUSE` on `[::]:P` was swallowed and the socket silently bound
+    // `0.0.0.0:P` instead — which Windows permits alongside a dual-stack v6
+    // holder. So `DatagramChannel.bind(addressAlreadyInUse)` SUCCEEDED and
+    // reported a different family than it was asked for, where HotSpot throws
+    // `BindException`. netty's `DnsNameResolverTest.testAddressAlreadyInUse`
+    // is the test that says so. An error-swallowing fallback around an
+    // operation that has its own legitimate failures is never right; scope it
+    // to the capability probe.
+    let socket = match socket2::Socket::new(
+        socket2::Domain::IPV6,
+        socket2::Type::DGRAM,
+        Some(socket2::Protocol::UDP),
+    )
+    .and_then(|s| s.set_only_v6(false).map(|()| s))
+    {
+        Ok(s) => s,
+        // No IPv6 stack. The v4 wildcard is the JDK's own fallback and every
+        // caller's pre-dual-stack behaviour.
+        Err(_) => {
+            return std::net::UdpSocket::bind(std::net::SocketAddr::from((
+                std::net::Ipv4Addr::UNSPECIFIED,
+                port,
+            )))
+        }
+    };
+    let addr = std::net::SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, port));
+    socket.bind(&addr.into())?;
+    Ok(socket.into())
 }
 
 /// The port of a WILDCARD `host:port` spec, in either family's spelling, or

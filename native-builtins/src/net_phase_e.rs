@@ -14867,7 +14867,15 @@ pub(crate) fn register_re7_datagram_socket(r: &mut NativeMethodRegistry) {
                     .udp_rebind_dual_stack(sd.fd as u32, port, reuse),
                 None => ctx.fd_table().udp_rebind(sd.fd as u32, Some(&spec), reuse),
             };
-            rebound.map_err(|e| ioex(format!("DatagramSocket.bind: {e}")))?;
+            // Keep the JDK type: an unavailable address is `BindException`,
+            // not a bare `IOException`. Same reasoning as
+            // `capability_gate::translate_bind_io`, which serves the
+            // constructor paths.
+            rebound.map_err(|e| {
+                crate::capability_gate::translate_bind_failure(e, |io| {
+                    format!("DatagramSocket.bind: {io}")
+                })
+            })?;
             sd.fd
         } else {
             let opened = match wildcard_port {

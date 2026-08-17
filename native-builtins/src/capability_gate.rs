@@ -202,7 +202,53 @@ pub fn translate_open_failure(
 ) -> MethodCallFailed {
     match err {
         FdCapabilityError::Denied(denied) => denied.into(),
-        FdCapabilityError::Io(io) => cratonvm_types::error::RuntimeError::IOException {
+        FdCapabilityError::Io(io) => translate_bind_io(io, io_message),
+    }
+}
+
+/// The I/O arm of [`translate_open_failure`], split out so the BIND failures
+/// keep their JDK type.
+///
+/// An unavailable address is `java.net.BindException` on HotSpot, and callers
+/// test for it by type rather than by message —
+/// `new DatagramSocket(portAlreadyBound)` is specified to throw
+/// `SocketException`, and the JDK narrows it to `BindException`. A flat
+/// `IOException` here also loses to locale: the Windows text for
+/// `WSAEADDRINUSE` is translated, so a message match cannot substitute.
+///
+/// Windows reports the clash as `WSAEADDRINUSE` normally and as `WSAEACCES`
+/// (Rust `PermissionDenied`) when the caller set `SO_REUSEADDR` against an
+/// exclusively-held port. Both are `BindException` on HotSpot.
+/// [`translate_bind_io`] for a caller that already has a bare `io::Error` —
+/// the `rebind` paths, which never go through the capability gate because the
+/// socket they replace was gated when it was opened.
+pub fn translate_bind_failure(
+    io: std::io::Error,
+    io_message: impl FnOnce(&std::io::Error) -> String,
+) -> MethodCallFailed {
+    translate_bind_io(io, io_message)
+}
+
+fn translate_bind_io(
+    io: std::io::Error,
+    io_message: impl FnOnce(&std::io::Error) -> String,
+) -> MethodCallFailed {
+    use cratonvm_types::error::RuntimeError;
+    use std::io::ErrorKind;
+    match io.kind() {
+        ErrorKind::AddrInUse => RuntimeError::BindException {
+            message: format!("Address already in use: {}", io_message(&io)),
+        }
+        .into(),
+        ErrorKind::AddrNotAvailable => RuntimeError::BindException {
+            message: format!("Cannot assign requested address: {}", io_message(&io)),
+        }
+        .into(),
+        ErrorKind::PermissionDenied => RuntimeError::BindException {
+            message: format!("Permission denied: {}", io_message(&io)),
+        }
+        .into(),
+        _ => RuntimeError::IOException {
             message: io_message(&io),
         }
         .into(),
