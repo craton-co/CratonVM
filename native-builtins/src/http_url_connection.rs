@@ -2614,6 +2614,7 @@ fn huc_verify_hostname(
     ctx: &mut dyn NativeContext,
     connection: Option<ObjectRef>,
     host: &str,
+    port: u16,
     protocol: &str,
     cipher: &str,
     peer_chain_der: Vec<Vec<u8>>,
@@ -2651,6 +2652,8 @@ fn huc_verify_hostname(
             protocol,
             cipher,
             &peer_chain_der,
+            host,
+            port,
         );
     }
 
@@ -2748,7 +2751,7 @@ fn huc_verify_hostname(
         };
     let session0 = match carrier_session {
         Some(session) => session,
-        None => match huc_mint_verifier_session(ctx, protocol, cipher, peer_chain_der) {
+        None => match huc_mint_verifier_session(ctx, protocol, cipher, peer_chain_der, host, port) {
             Ok(session) => session,
             // The pins taken above are released on THIS exit too. The
             // `map_err(..)?` this replaces returned straight out of the
@@ -2821,6 +2824,8 @@ fn huc_mint_verifier_session(
     protocol: &str,
     cipher: &str,
     peer_chain_der: Vec<Vec<u8>>,
+    peer_host: &str,
+    peer_port: u16,
 ) -> Result<ObjectRef, String> {
     let proto_s0 = ctx.create_string(protocol);
     let proto_pin = ctx.pin_native_root(proto_s0);
@@ -2867,6 +2872,13 @@ fn huc_mint_verifier_session(
     );
     let session = ctx.read_native_pin(session_pin, session0);
     crate::t27_tls::record_client_peer_chain(ctx, session, peer_chain_der);
+    // G51-1 N1, the fallback half. This session is by construction NOT the one
+    // `getSSLSession()` answers with, so no row on `RSslLiveSession` reaches
+    // it — but a verifier that asks the session it was handed where the peer
+    // is must not get `null`/`-1` just because the carrier was unavailable.
+    // Same source as the carrier path: the host and port the URL NAMED.
+    let session = ctx.read_native_pin(session_pin, session0);
+    crate::t27_tls::record_session_peer_endpoint(ctx, session, peer_host, i32::from(peer_port));
     let session = ctx.read_native_pin(session_pin, session0);
     ctx.unpin_native_roots(proto_pin);
     Ok(session)
@@ -3405,6 +3417,10 @@ fn perform(
                     ctx,
                     connection,
                     &parsed.host,
+                    // The RESOLVED port — `parse_url` fills the scheme default
+                    // when the URL named none, so a plain `https://h/p` records
+                    // 443, which is the port this connection dialled. G51-1 N1.
+                    parsed.port,
                     protocol,
                     &cipher,
                     peer_chain_der,
@@ -5321,6 +5337,8 @@ mod http_url_connection_tests {
             "TLSv1.3",
             "TLS_AES_256_GCM_SHA384",
             &chain,
+            "example.test",
+            443,
         );
         assert!(
             https_peer_info()

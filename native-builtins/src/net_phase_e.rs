@@ -8464,6 +8464,24 @@ struct HttpsCarrierSession {
     /// real — `getId()` is seeded from the object's identity, so two reads of
     /// one connection disagreed about the same handshake.
     session_root: usize,
+    /// The endpoint this connection DIALLED, as the URL named it — never
+    /// derived from the peer certificate and never from SNI.
+    ///
+    /// G51-1 §1 MEASURED both derivations wrong, with the IP-literal request
+    /// as the counter-example: leaf subject `CN=localhost`, SNI `localhost`,
+    /// and HotSpot's `getPeerHost()` answering `127.0.0.1`. The port is the
+    /// resolved one, so a default-port `https:` URL records `443` — which is
+    /// what the connection actually connected to.
+    ///
+    /// Carried here rather than looked up later because
+    /// [`https_session_object`] mints at the first ACCESSOR call, arbitrarily
+    /// long after the request returned; G51-1 §2 refused a "last dialled
+    /// endpoint" latch for exactly that reason, since `RSslLiveSession`'s
+    /// `distinct` family opens a second connection before re-reading the
+    /// first session and a latch would answer one connection's endpoint for
+    /// another's session.
+    peer_host: String,
+    peer_port: i32,
 }
 
 fn https_carrier_sessions() -> &'static OrderedPlMutex<HashMap<NativeObjKey, HttpsCarrierSession>> {
@@ -8476,8 +8494,8 @@ fn https_carrier_sessions() -> &'static OrderedPlMutex<HashMap<NativeObjKey, Htt
 /// `HttpsURLConnection` carrier that made it.
 ///
 /// Called from the handshake path in `http_url_connection.rs`, which is the one
-/// place that has the protocol, the cipher suite and the peer chain in hand at
-/// the same time. Without a call to this, every accessor below answers
+/// place that has the protocol, the cipher suite, the peer chain and the
+/// dialled endpoint in hand at the same time. Without a call to this, every accessor below answers
 /// `IllegalStateException: connection not yet open`, which is HotSpot's own
 /// answer for a connection that has not handshaken -- so a missing call is a
 /// missing ANSWER, never a wrong one.
@@ -8501,6 +8519,8 @@ pub(crate) fn record_https_carrier_session(
     protocol: &str,
     cipher: &str,
     peer_chain_der: &[Vec<u8>],
+    peer_host: &str,
+    peer_port: u16,
 ) {
     let key = native_obj_key(&*ctx, connection);
     let stale = {
@@ -8513,6 +8533,8 @@ pub(crate) fn record_https_carrier_session(
                 cipher: cipher.to_string(),
                 peer_chain_der: peer_chain_der.to_vec(),
                 session_root: 0,
+                peer_host: peer_host.to_string(),
+                peer_port: i32::from(peer_port),
             },
         );
         stale
@@ -8738,6 +8760,21 @@ fn https_session_object(
     );
     let session = ctx.read_native_pin(session_pin, session0);
     crate::t27_tls::record_client_peer_chain(ctx, session, s.peer_chain_der.clone());
+    // G51-1 N1. `getPeerHost()`/`getPeerPort()` cannot be answered from this
+    // shape or from the socket registry: slot 2 carries
+    // `HTTPS_CLIENT_SESSION_MARKER`, a constant chosen SO THAT every
+    // socket-registry lookup misses (see its doc comment for why this
+    // connection cannot be given a real `servlet` TLS id without leaking a
+    // registry entry per request). The fallback therefore misses by design,
+    // and the side table is the only place the answer can live.
+    //
+    // `record_session_peer_endpoint` is a no-op on an empty host AND a
+    // non-positive port, so a carrier recorded before this field existed —
+    // or any future path that cannot name an endpoint — leaves the readers
+    // falling through to `session_stream_id` exactly as they did before,
+    // rather than being shadowed by a row of `("", -1)`.
+    let session = ctx.read_native_pin(session_pin, session0);
+    crate::t27_tls::record_session_peer_endpoint(ctx, session, &s.peer_host, s.peer_port);
 
     // Publish it as THE session for this carrier. The root is taken before the
     // table is touched, and the table is consulted under its own lock with no
@@ -20279,7 +20316,15 @@ mod tests {
         let carrier = ctx.alloc_object(ClassId::new(0), 4);
         let key = native_obj_key(&ctx, carrier);
 
-        record_https_carrier_session(&mut ctx, carrier, "TLSv1.3", "TLS_AES_256_GCM_SHA384", &[]);
+        record_https_carrier_session(
+            &mut ctx,
+            carrier,
+            "TLSv1.3",
+            "TLS_AES_256_GCM_SHA384",
+            &[],
+            "example.test",
+            443,
+        );
         let first = https_carrier_session(&ctx, carrier).expect("the handshake was recorded");
         assert_eq!(first.protocol, "TLSv1.3");
         assert_eq!(first.cipher, "TLS_AES_256_GCM_SHA384");
@@ -20299,12 +20344,106 @@ mod tests {
             7
         );
 
-        record_https_carrier_session(&mut ctx, carrier, "TLSv1.2", "TLS_RSA_WITH_AES_128", &[]);
+        record_https_carrier_session(
+            &mut ctx,
+            carrier,
+            "TLSv1.2",
+            "TLS_RSA_WITH_AES_128",
+            &[],
+            "example.test",
+            443,
+        );
         let second = https_carrier_session(&ctx, carrier).expect("still recorded");
         assert_eq!(second.protocol, "TLSv1.2");
         assert_eq!(
             second.session_root, 0,
             "a new handshake must not hand out the previous handshake's SSLSession"
+        );
+    }
+
+    /// G51-1 N1 — the carrier must CARRY the dialled endpoint, because the
+    /// object that needs it is minted long after the request returned.
+    ///
+    /// `https_session_object` runs at the first ACCESSOR call. By then
+    /// `perform` has returned, its `Url1` is gone, and — as G51-1 §2 measured
+    /// on `RSslLiveSession`'s own `distinct` family — a second connection may
+    /// already have been opened. Anything that recovers the endpoint at mint
+    /// time rather than carrying it from the handshake reports one
+    /// connection's peer for another's session. This test is what stops the
+    /// two fields being quietly dropped as unused.
+    #[test]
+    fn a_recorded_handshake_carries_the_endpoint_the_url_named() {
+        let mut ctx = MockNativeContext::new();
+        let carrier = ctx.alloc_object(ClassId::new(0), 4);
+
+        record_https_carrier_session(
+            &mut ctx,
+            carrier,
+            "TLSv1.3",
+            "TLS_AES_256_GCM_SHA384",
+            &[],
+            "127.0.0.1",
+            45123,
+        );
+
+        let s = https_carrier_session(&ctx, carrier).expect("the handshake was recorded");
+        assert_eq!(
+            s.peer_host, "127.0.0.1",
+            "the host is the one the URL NAMED. G51-1 §1 measured HotSpot answering the              IP literal for a request to https://127.0.0.1/, against a leaf subject of              CN=localhost and an SNI of localhost — so neither the certificate nor SNI              may be used to derive it"
+        );
+        assert_eq!(s.peer_port, 45123);
+    }
+
+    /// SOURCE WITNESS — `https_session_object` must write the endpoint it
+    /// carries into the side table the readers consult.
+    ///
+    /// This cannot be asserted behaviourally from here: `https_session_object`
+    /// allocates a real `javax/net/ssl/SSLSession` through
+    /// `try_alloc_concurrent_synthetic` and publishes it under a global root,
+    /// none of which the mock context models. What CAN be checked is that the
+    /// call is present and that it sits after the session is re-read from its
+    /// pin — a `record_session_peer_endpoint` on a stale `ObjectRef` would key
+    /// the table on a vacated from-space address and answer nothing, which is
+    /// indistinguishable from the bug this closes.
+    #[test]
+    fn the_minted_session_records_its_endpoint() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src")
+            .join("net_phase_e.rs");
+        let Ok(src) = std::fs::read_to_string(&path) else {
+            println!("net_phase_e.rs not on disk at {path:?}; witness skipped");
+            return;
+        };
+        let lines: Vec<&str> = src.lines().map(|l| l.trim_end_matches('\r')).collect();
+
+        let fn_start = lines
+            .iter()
+            .position(|l| l.contains("fn https_session_object("))
+            .expect("https_session_object must still exist");
+        let fn_end = lines
+            .iter()
+            .enumerate()
+            .skip(fn_start)
+            .find(|(_, l)| **l == "}")
+            .map(|(i, _)| i)
+            .expect("https_session_object must be terminated");
+        let body = &lines[fn_start..fn_end];
+
+        let write = body
+            .iter()
+            .position(|l| l.contains("record_session_peer_endpoint("))
+            .expect(
+                "https_session_object must record the dialled endpoint; without it                  getPeerHost()/getPeerPort() answer null/-1 on every HTTPS client                  session — slot 2 is HTTPS_CLIENT_SESSION_MARKER, chosen so that the                  socket-registry fallback misses BY DESIGN, so the side table is the                  only place the answer can come from",
+            );
+        let reread = body[..write]
+            .iter()
+            .rposition(|l| l.contains("read_native_pin(session_pin, session0)"))
+            .expect("the session must be re-read from its pin before it is used");
+        assert!(
+            body[reread + 1..write]
+                .iter()
+                .all(|l| !l.contains("ctx.create_string(") && !l.contains("try_alloc")),
+            "an allocation sits between the session's re-read at body line {reread} and              record_session_peer_endpoint at body line {write} — a moving young GC there              leaves the table keyed on a vacated address"
         );
     }
 
@@ -20316,7 +20455,15 @@ mod tests {
     fn forgetting_a_recycled_carrier_removes_the_entry_entirely() {
         let mut ctx = MockNativeContext::new();
         let carrier = ctx.alloc_object(ClassId::new(0), 4);
-        record_https_carrier_session(&mut ctx, carrier, "TLSv1.3", "TLS_AES_128_GCM_SHA256", &[]);
+        record_https_carrier_session(
+            &mut ctx,
+            carrier,
+            "TLSv1.3",
+            "TLS_AES_128_GCM_SHA256",
+            &[],
+            "example.test",
+            443,
+        );
         assert!(https_carrier_session(&ctx, carrier).is_some());
 
         forget_https_carrier_session(&mut ctx, carrier);
