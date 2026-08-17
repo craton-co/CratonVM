@@ -611,9 +611,11 @@ relied on.
 2. **The IR tier has no guarded-inline lowering.** §9 is the instrument for
    deciding whether to build one; the answer depends on how much of a real
    workload the optimizing tier ends up accepting.
-3. **`CRATONVM_JIT_GUARDED_VIRTUAL_INLINE` is default-OFF and unsoaked.**
-   Turning it on is a soak decision with a measurement behind it, not a code
-   change.
+3. **`CRATONVM_JIT_GUARDED_VIRTUAL_INLINE` is default-OFF and — measured
+   2026-08-17 — it MISCOMPILES with both gates on. Do not enable it.**
+   This item used to say "turning it on is a soak decision with a measurement
+   behind it, not a code change". The measurement has now been run and it is
+   negative: there IS a code change to make first. See §11.
 4. **Nothing registers `StableType` assumptions from the compiler.** The
    channel is wired and tested on the manager side (§5); using it needs
    `InvalidationManager` threaded out from behind `jit_realm`'s mutex. The
@@ -636,3 +638,105 @@ relied on.
    truncation layered on top because the live profile store has no notion of
    it. Give it a recorder before reading anything from it — every counter in it
    is permanently zero at runtime.
+
+## 11. The soak measurement §10.3 asked for — run 2026-08-17, and it is negative
+
+§10.3 said turning the flag on was "a soak decision with a measurement behind
+it, not a code change". The measurement has been run. **With both gates set,
+guarded virtual inlining miscompiles.** It is not a soak-and-ship; there is a
+correctness defect to find first.
+
+Workload `io.netty.buffer.BigEndianHeapByteBufTest` (414 test methods, the
+`io.netty` suite's densest virtual-dispatch class), Azure Linux
+`20.80.105.49`, one binary, arms ABBA-interleaved because that box runs at
+load 8-16 and its wall clock is not trustworthy to better than ~20%.
+
+Because both gates are independent, all four cells were measured. The defect
+needs BOTH, which is the whole reason it has never been seen: the flag alone is
+inert, so "flag on, suite green" was true and meaningless.
+
+| `CRATONVM_TIER_PGO` | `CRATONVM_JIT_GUARDED_VIRTUAL_INLINE` | ok | failed |
+|---|---|---:|---:|
+| off | off | 414 | 0 |
+| off | **on** | 414 | 0 |
+| **on** | off | 414 | 0 |
+| **on** | **on** | **165** | **249** |
+
+Confirmed on two binaries a fortnight of dev apart (`377aadd08` and
+`95ecf08fb`), 249-250 failures every run:
+
+| arm | ok | failed | `jit_entries` | wall | `NoSuchMethodError` lines |
+|---|---:|---:|---:|---:|---:|
+| A baseline | 414 | 0 | 116,169,136 | 71 s | 0 |
+| C `TIER_PGO` only | 414 | 0 | 115,622,562 | 74 s | 0 |
+| B both | 165 | 249 | 7,996,311 | 33 s | 1482 |
+| B both (repeat) | 166 | 248 | 7,631,894 | 34 s | 1482 |
+| C `TIER_PGO` only | 414 | 0 | 114,079,183 | 74 s | 0 |
+| A baseline | 414 | 0 | 116,363,268 | 66 s | 0 |
+
+**`TIER_PGO` on its own is clean and free** — 414/414 in both its arms, and
+`jit_entries` within noise of baseline. So profile *recording* is not implicated
+and the attribution is to the guarded-inline codegen alone, with the control run
+in the same interleave rather than inferred.
+
+### Do not read arm B's numbers as a speedup
+
+Arm B is 2x faster with 14x fewer `jit_entries`. **Both are artifacts of 249
+tests failing early instead of doing their work** — exactly the confounded-arm
+trap the netty per-call throughput record (netty-per-call-throughput-20260813,
+§3.2) documents, where a 17-passing arm was read as a 7x win over a 126-passing
+one. An arm that does not do the same work is not a measurement of doing it
+faster. Any future A/B here must gate on `failed=0` before comparing anything.
+
+### The signature
+
+Every failure is one method, 1482 stderr lines of it:
+
+```
+java.lang.NoSuchMethodError: 'long org.junit.jupiter.engine.extension
+    .TimeoutInvocationFactory$TimeoutInvocationParameters.getValue()'
+  org.junit.jupiter.engine.extension.SameThreadTimeoutInvocation.proceed(...:45)
+  org.junit.jupiter.engine.extension.TimeoutExtension.intercept(...:161)
+```
+
+A `NoSuchMethodError` raised out of compiled code, for a method the interpreted
+arm resolves without complaint, is the shape of a spliced body resolved against
+the wrong class — which is precisely the hazard
+`InlineRefusal::CalleeUnresolved`'s own doc comment describes for the speculated
+case: "the guard would admit exactly that class, so the body behind it must be
+the one that class dispatches to, and if the VM cannot hand back that
+body — or cannot prove the body it found is the one real dispatch would
+select — there is nothing safe to splice." The refusal exists; something is
+getting past it, or the guard and the body it carries disagree. §3's
+package-private caveat (§10.6) and the bimorphic second guard are the two
+places to look first.
+
+`getValue()` returning `long` is worth noting: `TimeoutInvocationParameters` is
+a small carrier type, so this is a tiny accessor on a hot interception path —
+the most-inlined shape there is.
+
+### Repro
+
+```bash
+cd apps/netty-suite-runner
+CLS=io.netty.buffer.BigEndianHeapByteBufTest
+# clean (control) — either gate alone
+CRATONVM_TIER_PGO=1 <cv-bin> --java-home <jdk25> --Xmx 1500m \
+    @common.args -Dcraton.batch=1 CratonRunner $CLS
+# 249 failures
+CRATONVM_TIER_PGO=1 CRATONVM_JIT_GUARDED_VIRTUAL_INLINE=1 <cv-bin> \
+    --java-home <jdk25> --Xmx 1500m @common.args -Dcraton.batch=1 CratonRunner $CLS
+```
+
+### Why this was being measured at all
+
+Not to soak the flag. The `io.netty` suite has a 20-class HANG cluster that is
+entirely wall-clock — `Bzip2IntegrationTest` is 21 s on HotSpot and 1964 s here,
+and every one of those classes passes when given room. The cause is ~826 M
+non-inlined calls at a few hundred ns each, and the ByteBuf chain that pays it
+(`AbstractByteBuf.writeByte` -> `ensureWritable0` -> `_setByte` ->
+`HeapByteBufUtil`) is *entirely virtual*, which `InlineRefusal::GuardNotEmittable`
+records the single-pass backend as unable to inline at all. This feature is the
+one built mechanism that would change that, so it was the obvious lever to
+price. It cannot be priced until it is correct — and its correctness, not its
+throughput, is what this section is about.

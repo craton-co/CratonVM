@@ -3511,12 +3511,22 @@ pub(crate) fn native_p65_pbq_poll(ctx: &mut dyn NativeContext, args: &[Value]) -
     Ok(Some(result))
 }
 
+/// Heap ordering for the P65 blocking queues.
+///
+/// The float arms were `partial_cmp(..).unwrap_or(0)`, i.e. "NaN equals
+/// everything" — the wrong answer (Java sorts NaN last) and a non-transitive
+/// comparator besides, and wrong for signed zeros with no NaN in sight.
+///
+/// Measured UNREACHABLE for `Float`/`Double` today: these queues hold boxed
+/// elements, and `NanSurface2.java` shows `PriorityBlockingQueue<Double>` draining
+/// bit-identically to HotSpot with NaNs and signed zeros in it. Corrected anyway —
+/// see the matching note on `pq_compare` in `native-collections`.
 pub(crate) fn p65_compare_values(a: Value, b: Value) -> i32 {
     match (a, b) {
         (Value::Int(x), Value::Int(y)) => x.cmp(&y) as i32,
         (Value::Long(x), Value::Long(y)) => x.cmp(&y) as i32,
-        (Value::Float(x), Value::Float(y)) => x.partial_cmp(&y).map(|o| o as i32).unwrap_or(0),
-        (Value::Double(x), Value::Double(y)) => x.partial_cmp(&y).map(|o| o as i32).unwrap_or(0),
+        (Value::Float(x), Value::Float(y)) => cratonvm_types::jfp::float_compare(x, y),
+        (Value::Double(x), Value::Double(y)) => cratonvm_types::jfp::double_compare(x, y),
         _ => 0,
     }
 }

@@ -4117,62 +4117,54 @@ fn native_bd_value_of_long(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
     Ok(Some(Value::Object(Some(result?))))
 }
 
+/// `BigDecimal.valueOf(double)` --- specified as
+/// `new BigDecimal(Double.toString(val))`, so both halves of that sentence
+/// have to hold.
+///
+/// This used to render the double with Rust's `format!("{}", d)` and then take
+/// the scale from the position of the `.`. Rust's `Display` for `f64` is not
+/// `Double.toString`: it never uses E-notation and it prints `2.0` as `2`. So
+/// `valueOf(1e100)` produced a scale-0 integer with 101 digits instead of
+/// unscaled 10 at scale -99, and `valueOf(2.0)` lost the trailing zero (scale 0
+/// instead of 1). H2 renders a DOUBLE into JSON through
+/// `ValueDouble.getBigDecimal()` -> `BigDecimal.valueOf(double)` ->
+/// `BigDecimal.toString()`, which is why `CAST(1e100 AS JSON)` came back as 101
+/// literal digits (`datatypes/json.sql:46`, `:49`).
+///
+/// `format_double` is the shared `Double.toString` formatter, and the mantissa
+/// digits + exponent are turned straight into the exact `(unscaled, scale)`
+/// pair rather than going back through a decimal string --- `bd_alloc`'s
+/// string path has no E-notation handling and would strip significant trailing
+/// zeros for a negative scale.
 fn native_bd_value_of_double(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let d = match args.first() {
         Some(Value::Double(v)) => *v,
         _ => 0.0,
     };
-    // The JDK specifies this EXACTLY: `valueOf(double) = new BigDecimal(
-    // Double.toString(val))`. The old body used `format!("{}", d)`, which is
-    // Rust's Display and NOT Double.toString -- Rust prints `10000000` where
-    // Java prints `1.0E7` -- and then derived the scale by looking for a '.',
-    // which cannot see an exponent at all. MEASURED 2026-08-13
-    // (scratchpad/orch/Vb.java), six rows wrong at once:
-    //
-    //   valueOf(1e7)   HotSpot 1.0E+7     was 10000000
-    //   valueOf(1e6)   HotSpot 1000000.0  was 1000000
-    //   valueOf(1e-7)  HotSpot 1.0E-7     was 1E-7
-    //   valueOf(1e-6)  HotSpot 0.0000010  was 0.000001
-    //   valueOf(0.0)   HotSpot 0.0        was 0
-    //   valueOf(1e21)  HotSpot 1.0E+21    was 1000000000000000000000
-    //
-    // `new BigDecimal(String)` has no native and runs real JDK bytecode, so it
-    // was already right -- only this entry point was wrong.
-    if !d.is_finite() {
-        return Err(RuntimeError::NumberFormatException {
-            message: "Infinite or NaN".into(),
-        }
-        .into());
-    }
-    // Ask Java for the canonical text rather than reproducing Double.toString.
-    let text = match ctx.invoke(
-        "java/lang/Double",
-        "toString",
-        "(D)Ljava/lang/String;",
-        &[Value::Double(d)],
-    ) {
-        Ok(Some(Value::Object(Some(s)))) => ctx.read_string(s).unwrap_or_default(),
-        _ => String::new(),
+    let (unscaled, scale) = bd_parts_of_java_double_string(&crate::lang_string::format_double(d));
+    let result = bd_alloc_bigint(ctx, &crate::bigint::BigInt::from_decimal(&unscaled), scale);
+    Ok(Some(Value::Object(Some(result?))))
+}
+
+/// Split a `Double.toString`-shaped string into the `(unscaled digits, scale)`
+/// pair `new BigDecimal(String)` would produce.
+///
+/// `Double.toString` output is always `[-]<digit>.<digits>[E[-]<exp>]`, so the
+/// scale is "digits after the point, less the exponent" --- e.g. `1.0E100` ->
+/// (`10`, `1 - 100` = `-99`), `2.0` -> (`20`, `1`), `1.0E-7` -> (`10`, `8`).
+/// Non-finite doubles cannot reach here: `valueOf` on them throws inside the
+/// `Double.toString`-fed `BigDecimal(String)` parse, and H2 screens them out
+/// before the call.
+fn bd_parts_of_java_double_string(s: &str) -> (String, i32) {
+    let (mantissa, exp) = match s.find(['E', 'e']) {
+        Some(i) => (&s[..i], s[i + 1..].parse::<i32>().unwrap_or(0)),
+        None => (s, 0),
     };
-    let text = if text.is_empty() {
-        // No real class library (synthetic mode): keep a plain rendering rather
-        // than failing the call. Scientific notation is what differs, and a
-        // synthetic run has no JDK formatter to disagree with.
-        format!("{d}")
-    } else {
-        text
+    let frac_digits = match mantissa.find('.') {
+        Some(p) => (mantissa.len() - p - 1) as i32,
+        None => 0,
     };
-    // Decompose `[-]D.DDD[E[-]X]` into unscaled digits and a scale, the way
-    // BigDecimal(String) does: scale = (fraction digits) - exponent.
-    let (mantissa, exp) = match text.split_once(['E', 'e']) {
-        Some((m, e)) => (m, e.parse::<i32>().unwrap_or(0)),
-        None => (text.as_str(), 0),
-    };
-    let frac_len = mantissa.split_once('.').map_or(0, |(_, f)| f.len() as i32);
-    let digits = mantissa.replace('.', "");
-    let scale = frac_len - exp;
-    let result = bd_alloc(ctx, &digits, scale)?;
-    Ok(Some(Value::Object(Some(result))))
+    (mantissa.replace('.', ""), frac_digits - exp)
 }
 
 fn bd_unscaled_bigint(ctx: &dyn NativeContext, this: ObjectRef) -> (crate::bigint::BigInt, i32) {

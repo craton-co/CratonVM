@@ -708,6 +708,10 @@ pub fn update_all_roots(
         return;
     }
     gcpart_record(shared.mem.heap.collection_count(), pointer_map);
+    // `CRATONVM_DBG_VACATED_FRAMES` — remember what this collection moved
+    // objects away FROM, so the next safepoint's frame audit can name any slot
+    // still holding one. No-op unless the flag is set.
+    cratonvm_gc::gc_quiescence::record_vacated(pointer_map);
     crate::runtime::interpreter::remap_trace_push(
         shared,
         thread,
@@ -826,6 +830,8 @@ pub fn update_all_roots(
         );
     }
     // 1. Thread frames — locals and operand stacks (SoA layout)
+    // See `JvmThread::last_heal_collection`.
+    thread.last_heal_collection = shared.mem.heap.collection_count();
     for frame in &mut thread.frames {
         frame.update_local_refs(pointer_map, &shared.mem.heap);
         frame
@@ -1174,6 +1180,7 @@ pub fn update_all_roots(
     // The historical notes below document the individual registered sources.
     crate::memory::native_roots::remap_all_roots(shared, pointer_map);
 
+
     // 9a. Native upcall table — rewrite each live slot's callback `target` to its
     //     post-relocation address so the legacy `pe_upcall_invoke` dispatch path
     //     does not read a stale pointer after a moving collection (root scan in
@@ -1355,6 +1362,7 @@ pub fn update_all_roots(
         .thread_registry
         .fold_pointer_map_into_blocked_audited(pointer_map, Some(&shared.mem.heap));
 
+
     // 21. Registry java.lang.Thread mirrors + the unpark(Thread) reverse
     //     index (keyed by mirror address). Scanned as roots in roots.rs
     //     step 10b; without the remap the registry serves stale mirrors
@@ -1378,6 +1386,60 @@ pub fn update_all_roots(
     // reclaimed reference fields in OTHER objects (not just this thread's
     // frames) — where the residual ClassLoader/Locale stale-ref actually lives.
     verify_heap_object_fields(shared, pointer_map);
+    // THE SCAN INVENTORY AND THE REMAP INVENTORY ARE TWO LISTS
+    // (`CRATONVM_DBG_ROOT_REMAP_AUDIT=1`).
+    //
+    // `roots.rs` decides what the collector MARKS from; `native_roots.rs`
+    // decides what gets REWRITTEN afterwards. A side table present in the first
+    // and missing from the second keeps its object alive and then keeps naming
+    // the address the collector moved it away from — which is the exact
+    // signature the H2 MVStore-writer residual has left after the heap slots
+    // and both frame-remap sites were verified complete.
+    //
+    // So ask directly: re-run the scan and look for an address this collection
+    // moved. Destinations are excluded for the reason the frame verifier
+    // excludes them — a survivor slides INTO a vacated address, and a root
+    // legitimately naming that survivor is not a finding.
+    //
+    // `CRATONVM_DBG_ROOT_SOURCE=1` alongside this names WHICH source, which is
+    // the fix's address.
+    if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_ROOT_REMAP_AUDIT").is_some() {
+        let destinations: rustc_hash::FxHashSet<usize> = pointer_map.values().copied().collect();
+        let after = crate::memory::roots::collect_roots(shared, thread);
+        let mut reported = 0usize;
+        for (index, r) in after.iter().enumerate() {
+            let a = r.as_ptr() as usize;
+            if destinations.contains(&a) {
+                continue;
+            }
+            if let Some(&new) = pointer_map.get(&a) {
+                reported += 1;
+                if reported <= 8 {
+                    tracing::error!(
+                        target: "cratonvm::gc::guard",
+                        obj = format!("{a:#x}"),
+                        moved_to = format!("{new:#x}"),
+                        source = crate::memory::native_roots::root_source_of(a)
+                            .unwrap_or("<not-attributed>"),
+                        // Which SECTION of the scan produced it. `root_source_of`
+                        // only covers the uniform native-root registry; this
+                        // covers the other forty.
+                        scan_section = crate::memory::roots::scan_section_of(index),
+                        "a ROOT this collection just scanned still names the address it moved                          the object away from — the scan inventory contains a source the remap                          inventory does not."
+                    );
+                }
+            }
+        }
+        if reported > 0 {
+            tracing::error!(
+                target: "cratonvm::gc::guard",
+                unremapped_roots = reported,
+                scanned = after.len(),
+                map = pointer_map.len(),
+                "root remap audit: that many scanned roots were left naming a vacated address"
+            );
+        }
+    }
 }
 
 /// Opt-in young-object size validator (`CRATONVM_DBG_VALIDATE_NEW=1`). Walks

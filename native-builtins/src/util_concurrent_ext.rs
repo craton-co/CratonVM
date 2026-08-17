@@ -7526,6 +7526,75 @@ pub(crate) fn native_synchronized_collection(
     }
 }
 
+/// Hold the wrapper's `mutex` across `body`, exactly as the JDK's
+/// `Collections$Synchronized{Collection,Set,List,Map}` bytecode does
+/// (`synchronized (mutex) { c.add(e); }`).
+///
+/// Every one of those methods was a bare forward to the backing collection --
+/// the `mutex` field was written by the constructor and then read by nobody.
+/// The wrapper's whole contract is the lock, so what
+/// `Collections.synchronizedSet(new HashSet<>())` actually handed out was an
+/// unsynchronized `HashSet` behind a class name that promises otherwise: eight
+/// threads adding and then removing 4000 distinct elements each ended the run
+/// at `size() == 3716` where HotSpot ends at `0` (`SyncSetProbe`, 2026-08-16;
+/// the H2 `TestMultiThread` write-up saw the same shape as a NEGATIVE size).
+/// A registered native shadows the class's own bytecode at every dispatch
+/// site, so the real JDK implementation could not compensate -- including for
+/// `SynchronizedList`, which has no natives of its own but inherits `add` /
+/// `remove` / `size` from `SynchronizedCollection`, and so lost elements too
+/// (26540 of 32000).
+///
+/// **Contended entry is GC-safe on purpose.** These wrappers are contended by
+/// construction, and the owner is inside `HashMap.put`, which allocates and can
+/// therefore be parked at a collection safepoint while it holds the mutex. A
+/// plain `monitor_enter` leaves the waiter counted in the STW barrier's
+/// `expected` set -- the three-way wedge `Monitor::block_enter`'s own doc names
+/// (owner waits for GC, contender waits for owner, GC waits for contender). The
+/// price of the GC-safe wait is that a moving collection CAN run inside it, so
+/// `this`, the mutex and every reference argument are pinned across it and
+/// re-read afterwards; nothing below may use a pre-wait `ObjectRef`.
+pub(crate) fn with_sync_mutex<F>(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    args: &[Value],
+    body: F,
+) -> MethodCallResult
+where
+    F: FnOnce(&mut dyn NativeContext, ObjectRef, &[Value]) -> MethodCallResult,
+{
+    let mutex = match ctx.get_field_by_name(this, "mutex") {
+        Value::Object(Some(m)) => m,
+        // A wrapper that reached us without going through `native_sync_*_init`
+        // has no `mutex` yet; the JDK's one-argument constructor uses `this`,
+        // which is also the only lock that can be correct for such an object.
+        _ => this,
+    };
+    let base = ctx.pin_native_root(this);
+    let mutex_h = ctx.pin_native_root(mutex);
+    let arg_h: Vec<Option<usize>> = args
+        .iter()
+        .map(|a| match a {
+            Value::Object(Some(o)) => Some(ctx.pin_native_root(*o)),
+            _ => None,
+        })
+        .collect();
+    ctx.monitor_enter_gc_safe(mutex);
+    // Post-wait addresses only, for every reference we still name.
+    let mutex = ctx.read_native_pin(mutex_h, mutex);
+    let this = ctx.read_native_pin(base, this);
+    let mut fixed: Vec<Value> = Vec::with_capacity(args.len());
+    for (a, h) in args.iter().zip(arg_h.iter()) {
+        fixed.push(match (a, h) {
+            (Value::Object(Some(o)), Some(h)) => Value::Object(Some(ctx.read_native_pin(*h, *o))),
+            _ => *a,
+        });
+    }
+    let out = body(ctx, this, &fixed);
+    ctx.unpin_native_roots(base);
+    ctx.monitor_exit(mutex);
+    out
+}
+
 pub(crate) fn native_sync_collection_init(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -7548,10 +7617,12 @@ pub(crate) fn native_sync_collection_add(
 ) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     let elem = args.get(1).copied().unwrap_or(Value::Object(None));
-    match sync_collection_backing(ctx, this) {
-        Some(c) => ctx.invoke_virtual(c, "add", "(Ljava/lang/Object;)Z", &[elem]),
-        None => Ok(Some(Value::Int(0))),
-    }
+    with_sync_mutex(ctx, this, &[elem], |ctx, this, a| {
+        match sync_collection_backing(ctx, this) {
+            Some(c) => ctx.invoke_virtual(c, "add", "(Ljava/lang/Object;)Z", &a[..1]),
+            None => Ok(Some(Value::Int(0))),
+        }
+    })
 }
 
 pub(crate) fn native_sync_collection_contains(
@@ -7560,10 +7631,12 @@ pub(crate) fn native_sync_collection_contains(
 ) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     let elem = args.get(1).copied().unwrap_or(Value::Object(None));
-    match sync_collection_backing(ctx, this) {
-        Some(c) => ctx.invoke_virtual(c, "contains", "(Ljava/lang/Object;)Z", &[elem]),
-        None => Ok(Some(Value::Int(0))),
-    }
+    with_sync_mutex(ctx, this, &[elem], |ctx, this, a| {
+        match sync_collection_backing(ctx, this) {
+            Some(c) => ctx.invoke_virtual(c, "contains", "(Ljava/lang/Object;)Z", &a[..1]),
+            None => Ok(Some(Value::Int(0))),
+        }
+    })
 }
 
 pub(crate) fn native_sync_collection_remove(
@@ -7572,10 +7645,12 @@ pub(crate) fn native_sync_collection_remove(
 ) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     let elem = args.get(1).copied().unwrap_or(Value::Object(None));
-    match sync_collection_backing(ctx, this) {
-        Some(c) => ctx.invoke_virtual(c, "remove", "(Ljava/lang/Object;)Z", &[elem]),
-        None => Ok(Some(Value::Int(0))),
-    }
+    with_sync_mutex(ctx, this, &[elem], |ctx, this, a| {
+        match sync_collection_backing(ctx, this) {
+            Some(c) => ctx.invoke_virtual(c, "remove", "(Ljava/lang/Object;)Z", &a[..1]),
+            None => Ok(Some(Value::Int(0))),
+        }
+    })
 }
 
 pub(crate) fn native_sync_collection_size(
@@ -7583,10 +7658,12 @@ pub(crate) fn native_sync_collection_size(
     args: &[Value],
 ) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
-    match sync_collection_backing(ctx, this) {
-        Some(c) => ctx.invoke_virtual(c, "size", "()I", &[]),
-        None => Ok(Some(Value::Int(0))),
-    }
+    with_sync_mutex(ctx, this, &[], |ctx, this, _a| {
+        match sync_collection_backing(ctx, this) {
+            Some(c) => ctx.invoke_virtual(c, "size", "()I", &[]),
+            None => Ok(Some(Value::Int(0))),
+        }
+    })
 }
 
 pub(crate) fn native_sync_collection_is_empty(
@@ -7594,12 +7671,19 @@ pub(crate) fn native_sync_collection_is_empty(
     args: &[Value],
 ) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
-    match sync_collection_backing(ctx, this) {
-        Some(c) => ctx.invoke_virtual(c, "isEmpty", "()Z", &[]),
-        None => Ok(Some(Value::Int(1))),
-    }
+    with_sync_mutex(ctx, this, &[], |ctx, this, _a| {
+        match sync_collection_backing(ctx, this) {
+            Some(c) => ctx.invoke_virtual(c, "isEmpty", "()Z", &[]),
+            None => Ok(Some(Value::Int(1))),
+        }
+    })
 }
 
+/// NOT synchronized, deliberately: `SynchronizedCollection.iterator()` is the
+/// one mutating-surface method the JDK forwards outside the lock, because the
+/// returned iterator is used outside it too ("it is imperative that the user
+/// manually synchronize on the returned collection when traversing"). Locking
+/// here would diverge from the JDK without making traversal safe.
 pub(crate) fn native_sync_collection_iterator(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -7616,13 +7700,15 @@ pub(crate) fn native_sync_collection_to_array(
     args: &[Value],
 ) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
-    match sync_collection_backing(ctx, this) {
-        Some(c) => ctx.invoke_virtual(c, "toArray", "()[Ljava/lang/Object;", &[]),
-        None => {
-            let empty = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0);
-            Ok(Some(Value::Object(Some(empty))))
+    with_sync_mutex(ctx, this, &[], |ctx, this, _a| {
+        match sync_collection_backing(ctx, this) {
+            Some(c) => ctx.invoke_virtual(c, "toArray", "()[Ljava/lang/Object;", &[]),
+            None => {
+                let empty = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0);
+                Ok(Some(Value::Object(Some(empty))))
+            }
         }
-    }
+    })
 }
 
 /// Forward one `Collections$Synchronized{Collection,Set}` method to the wrapped
@@ -7643,6 +7729,27 @@ pub(crate) fn native_sync_collection_to_array(
 /// `fallback` is what to answer when the wrapper has no `c` — a shape that
 /// cannot arise from either constructor, so it is chosen per method only to keep
 /// the return type honest rather than to encode behaviour.
+/// Forward one `Collections$Synchronized{Collection,Set,List}` method to the
+/// wrapped collection, under the wrapper's `mutex`.
+///
+/// The named-method stubs above cover the surface the wrapper needed while
+/// `Collections.synchronizedCollection(...)` was its only source. Since
+/// 2026-08-13 `Hashtable`/`Properties` views are wrapped too -- the JDK's own
+/// `Hashtable.keySet()` is `Collections.synchronizedSet(new KeySet(), this)`, so
+/// matching `getClass()` means returning the wrapper -- and those views are asked
+/// for the whole `Collection` contract (`toString`, `stream`, `forEach`,
+/// `containsAll`, ...). In real-JDK mode the class's own bytecode answers all of
+/// it and these are dropped as `SyntheticStub`s; in synthetic-JDK mode they are
+/// the only implementation there is, and a MISSING one is worse than a slow one:
+/// the call falls through to an interface-level native that reads the wrapper as
+/// if it were the collection and reports it EMPTY.
+///
+/// `fallback` is what to answer when the wrapper has no `c` -- a shape that
+/// cannot arise from either constructor, so it is chosen per method only to keep
+/// the return type honest rather than to encode behaviour.
+///
+/// `stream` / `parallelStream` / `spliterator` are forwarded WITHOUT the lock,
+/// matching the JDK, for the same reason `iterator()` is.
 pub(crate) fn sync_collection_delegate(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -7651,10 +7758,22 @@ pub(crate) fn sync_collection_delegate(
     fallback: Option<Value>,
 ) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
-    match sync_collection_backing(ctx, this) {
-        Some(c) => ctx.invoke_virtual(c, method, descriptor, &args[1..]),
-        None => Ok(fallback),
+    if matches!(
+        method,
+        "iterator" | "stream" | "parallelStream" | "spliterator"
+    ) {
+        return match sync_collection_backing(ctx, this) {
+            Some(c) => ctx.invoke_virtual(c, method, descriptor, &args[1..]),
+            None => Ok(fallback),
+        };
     }
+    let rest: Vec<Value> = args[1..].to_vec();
+    with_sync_mutex(ctx, this, &rest, |ctx, this, a| {
+        match sync_collection_backing(ctx, this) {
+            Some(c) => ctx.invoke_virtual(c, method, descriptor, a),
+            None => Ok(fallback),
+        }
+    })
 }
 
 pub(crate) fn native_sync_map_init(
@@ -7676,25 +7795,31 @@ pub(crate) fn native_sync_map_init(
 pub(crate) fn native_sync_map_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     let key = args.get(1).copied().unwrap_or(Value::Object(None));
-    match sync_map_backing(ctx, this) {
-        Some(m) => ctx.invoke_virtual(m, "get", "(Ljava/lang/Object;)Ljava/lang/Object;", &[key]),
-        None => Ok(Some(Value::Object(None))),
-    }
+    with_sync_mutex(ctx, this, &[key], |ctx, this, a| {
+        match sync_map_backing(ctx, this) {
+            Some(m) => {
+                ctx.invoke_virtual(m, "get", "(Ljava/lang/Object;)Ljava/lang/Object;", &a[..1])
+            }
+            None => Ok(Some(Value::Object(None))),
+        }
+    })
 }
 
 pub(crate) fn native_sync_map_put(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     let key = args.get(1).copied().unwrap_or(Value::Object(None));
     let value = args.get(2).copied().unwrap_or(Value::Object(None));
-    match sync_map_backing(ctx, this) {
-        Some(m) => ctx.invoke_virtual(
-            m,
-            "put",
-            "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
-            &[key, value],
-        ),
-        None => Ok(Some(Value::Object(None))),
-    }
+    with_sync_mutex(ctx, this, &[key, value], |ctx, this, a| {
+        match sync_map_backing(ctx, this) {
+            Some(m) => ctx.invoke_virtual(
+                m,
+                "put",
+                "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+                &a[..2],
+            ),
+            None => Ok(Some(Value::Object(None))),
+        }
+    })
 }
 
 pub(crate) fn native_sync_map_contains_key(
@@ -7703,10 +7828,12 @@ pub(crate) fn native_sync_map_contains_key(
 ) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     let key = args.get(1).copied().unwrap_or(Value::Object(None));
-    match sync_map_backing(ctx, this) {
-        Some(m) => ctx.invoke_virtual(m, "containsKey", "(Ljava/lang/Object;)Z", &[key]),
-        None => Ok(Some(Value::Int(0))),
-    }
+    with_sync_mutex(ctx, this, &[key], |ctx, this, a| {
+        match sync_map_backing(ctx, this) {
+            Some(m) => ctx.invoke_virtual(m, "containsKey", "(Ljava/lang/Object;)Z", &a[..1]),
+            None => Ok(Some(Value::Int(0))),
+        }
+    })
 }
 
 pub(crate) fn native_sync_map_remove(
@@ -7715,15 +7842,14 @@ pub(crate) fn native_sync_map_remove(
 ) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     let key = args.get(1).copied().unwrap_or(Value::Object(None));
-    match sync_map_backing(ctx, this) {
-        Some(m) => ctx.invoke_virtual(
-            m,
-            "remove",
-            "(Ljava/lang/Object;)Ljava/lang/Object;",
-            &[key],
-        ),
-        None => Ok(Some(Value::Object(None))),
-    }
+    with_sync_mutex(ctx, this, &[key], |ctx, this, a| {
+        match sync_map_backing(ctx, this) {
+            Some(m) => {
+                ctx.invoke_virtual(m, "remove", "(Ljava/lang/Object;)Ljava/lang/Object;", &a[..1])
+            }
+            None => Ok(Some(Value::Object(None))),
+        }
+    })
 }
 
 pub(crate) fn native_sync_map_size(
@@ -7731,10 +7857,12 @@ pub(crate) fn native_sync_map_size(
     args: &[Value],
 ) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
-    match sync_map_backing(ctx, this) {
-        Some(m) => ctx.invoke_virtual(m, "size", "()I", &[]),
-        None => Ok(Some(Value::Int(0))),
-    }
+    with_sync_mutex(ctx, this, &[], |ctx, this, _a| {
+        match sync_map_backing(ctx, this) {
+            Some(m) => ctx.invoke_virtual(m, "size", "()I", &[]),
+            None => Ok(Some(Value::Int(0))),
+        }
+    })
 }
 
 pub(crate) fn native_sync_map_is_empty(
@@ -7742,10 +7870,12 @@ pub(crate) fn native_sync_map_is_empty(
     args: &[Value],
 ) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
-    match sync_map_backing(ctx, this) {
-        Some(m) => ctx.invoke_virtual(m, "isEmpty", "()Z", &[]),
-        None => Ok(Some(Value::Int(1))),
-    }
+    with_sync_mutex(ctx, this, &[], |ctx, this, _a| {
+        match sync_map_backing(ctx, this) {
+            Some(m) => ctx.invoke_virtual(m, "isEmpty", "()Z", &[]),
+            None => Ok(Some(Value::Int(1))),
+        }
+    })
 }
 
 pub(crate) fn native_sync_map_entry_set(
@@ -7753,10 +7883,12 @@ pub(crate) fn native_sync_map_entry_set(
     args: &[Value],
 ) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
-    match sync_map_backing(ctx, this) {
-        Some(m) => ctx.invoke_virtual(m, "entrySet", "()Ljava/util/Set;", &[]),
-        None => Ok(Some(Value::Object(None))),
-    }
+    with_sync_mutex(ctx, this, &[], |ctx, this, _a| {
+        match sync_map_backing(ctx, this) {
+            Some(m) => ctx.invoke_virtual(m, "entrySet", "()Ljava/util/Set;", &[]),
+            None => Ok(Some(Value::Object(None))),
+        }
+    })
 }
 
 pub(crate) fn native_sync_map_key_set(
@@ -7764,10 +7896,12 @@ pub(crate) fn native_sync_map_key_set(
     args: &[Value],
 ) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
-    match sync_map_backing(ctx, this) {
-        Some(m) => ctx.invoke_virtual(m, "keySet", "()Ljava/util/Set;", &[]),
-        None => Ok(Some(Value::Object(None))),
-    }
+    with_sync_mutex(ctx, this, &[], |ctx, this, _a| {
+        match sync_map_backing(ctx, this) {
+            Some(m) => ctx.invoke_virtual(m, "keySet", "()Ljava/util/Set;", &[]),
+            None => Ok(Some(Value::Object(None))),
+        }
+    })
 }
 
 pub(crate) fn native_sync_map_values(
@@ -7775,10 +7909,12 @@ pub(crate) fn native_sync_map_values(
     args: &[Value],
 ) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
-    match sync_map_backing(ctx, this) {
-        Some(m) => ctx.invoke_virtual(m, "values", "()Ljava/util/Collection;", &[]),
-        None => Ok(Some(Value::Object(None))),
-    }
+    with_sync_mutex(ctx, this, &[], |ctx, this, _a| {
+        match sync_map_backing(ctx, this) {
+            Some(m) => ctx.invoke_virtual(m, "values", "()Ljava/util/Collection;", &[]),
+            None => Ok(Some(Value::Object(None))),
+        }
+    })
 }
 
 pub(crate) fn native_sync_map_clear(
@@ -7786,10 +7922,12 @@ pub(crate) fn native_sync_map_clear(
     args: &[Value],
 ) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
-    if let Some(m) = sync_map_backing(ctx, this) {
-        ctx.invoke_virtual(m, "clear", "()V", &[])?;
-    }
-    Ok(None)
+    with_sync_mutex(ctx, this, &[], |ctx, this, _a| {
+        if let Some(m) = sync_map_backing(ctx, this) {
+            ctx.invoke_virtual(m, "clear", "()V", &[])?;
+        }
+        Ok(None)
+    })
 }
 
 pub(crate) fn native_sync_map_compute_if_absent(
@@ -7798,38 +7936,46 @@ pub(crate) fn native_sync_map_compute_if_absent(
 ) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     let key = args.get(1).copied().unwrap_or(Value::Object(None));
-    let mapper = match args.get(2) {
-        Some(Value::Object(Some(f))) => Some(*f),
-        _ => None,
-    };
-    let Some(m) = sync_map_backing(ctx, this) else {
-        return Ok(Some(Value::Object(None)));
-    };
-    if let Some(v @ Value::Object(Some(_))) =
-        ctx.invoke_virtual(m, "get", "(Ljava/lang/Object;)Ljava/lang/Object;", &[key])?
-    {
-        return Ok(Some(v));
-    }
-    let Some(mapper) = mapper else {
-        return Ok(Some(Value::Object(None)));
-    };
-    let computed = ctx
-        .invoke_virtual(
-            mapper,
-            "apply",
-            "(Ljava/lang/Object;)Ljava/lang/Object;",
-            &[key],
-        )?
-        .unwrap_or(Value::Object(None));
-    if matches!(computed, Value::Object(Some(_))) {
-        let _ = ctx.invoke_virtual(
-            m,
-            "put",
-            "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
-            &[key, computed],
-        );
-    }
-    Ok(Some(computed))
+    let mapper_arg = args.get(2).copied().unwrap_or(Value::Object(None));
+    // The get/apply/put trio is ONE critical section, exactly as the real
+    // wrapper's `synchronized (mutex) { m.computeIfAbsent(...) }` is. Running it
+    // unlocked is what let two threads both miss the `get` and both `put` --
+    // the duplicate-holder race this method's own doc above describes.
+    with_sync_mutex(ctx, this, &[key, mapper_arg], |ctx, this, a| {
+        let key = a[0];
+        let mapper = match a[1] {
+            Value::Object(Some(f)) => Some(f),
+            _ => None,
+        };
+        let Some(m) = sync_map_backing(ctx, this) else {
+            return Ok(Some(Value::Object(None)));
+        };
+        if let Some(v @ Value::Object(Some(_))) =
+            ctx.invoke_virtual(m, "get", "(Ljava/lang/Object;)Ljava/lang/Object;", &[key])?
+        {
+            return Ok(Some(v));
+        }
+        let Some(mapper) = mapper else {
+            return Ok(Some(Value::Object(None)));
+        };
+        let computed = ctx
+            .invoke_virtual(
+                mapper,
+                "apply",
+                "(Ljava/lang/Object;)Ljava/lang/Object;",
+                &[key],
+            )?
+            .unwrap_or(Value::Object(None));
+        if matches!(computed, Value::Object(Some(_))) {
+            let _ = ctx.invoke_virtual(
+                m,
+                "put",
+                "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+                &[key, computed],
+            );
+        }
+        Ok(Some(computed))
+    })
 }
 
 pub(crate) fn native_iss_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {

@@ -444,11 +444,15 @@ type CldrTable = std::sync::Arc<std::collections::BTreeMap<String, CldrValue>>;
 /// `(simple-name, language, country)` → the merged table, or `None` when not a
 /// single candidate class loaded. The `None` is cached too: a miss costs a
 /// `find_resource` probe per candidate and there is no point repeating it.
-fn cldr_cache() -> &'static std::sync::Mutex<std::collections::HashMap<String, Option<CldrTable>>> {
+/// ARCH-2026-08-04 A6 — `LockLevel::Scratch` (L0) — two acquisition sites, both in
+/// `cldr_table_for`: the hit check, whose innermost body is a bare `return`,
+/// and the store. The `ctx.find_resource` probing that builds the table runs
+/// between them, after the read guard has been dropped.
+fn cldr_cache() -> &'static cratonvm_types::lock_order::OrderedMutex<std::collections::HashMap<String, Option<CldrTable>>> {
     static INSTANCE: std::sync::OnceLock<
-        std::sync::Mutex<std::collections::HashMap<String, Option<CldrTable>>>,
+        cratonvm_types::lock_order::OrderedMutex<std::collections::HashMap<String, Option<CldrTable>>>,
     > = std::sync::OnceLock::new();
-    INSTANCE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+    INSTANCE.get_or_init(|| cratonvm_types::lock_order::OrderedMutex::new(std::collections::HashMap::new(), cratonvm_types::lock_order::LockLevel::Scratch))
 }
 
 /// The two packages that hold a `LocaleData` base name's CLDR classes: the
@@ -722,6 +726,129 @@ fn arg_locale(ctx: &mut dyn NativeContext, arg: Option<&Value>) -> (String, Stri
         }
         _ => (String::new(), String::new()),
     }
+}
+
+/// A locale display NAME out of the JDK image's own CLDR `LocaleNames` bundles.
+///
+/// `code` is the thing being named — a language subtag (`"tr"`) or a region
+/// subtag (`"US"`) — and `display_*` is the locale to name it IN. CLDR keys
+/// both kinds into one bundle, languages lowercase and regions uppercase, so
+/// one lookup serves `getDisplayLanguage` and `getDisplayCountry` alike.
+///
+/// This is the table H2's `CompareMode.getName` round-trips through: it asks
+/// every collation locale for its ENGLISH display name and matches the answer
+/// against the requested collation. Returning the subtag instead — which is
+/// what the display-name overrides in `locale_bootstrap.rs` used to do, on the
+/// reasoning that any caller "just wants a non-null human-readable string" —
+/// makes `SET COLLATION TURKISH` unresolvable, because nothing in the table
+/// ever answers `TURKISH`.
+pub(crate) fn cldr_locale_display_name(
+    ctx: &mut dyn NativeContext,
+    code: &str,
+    display_lang: &str,
+    display_country: &str,
+) -> Option<String> {
+    if code.is_empty() {
+        return None;
+    }
+    let table = load_cldr_table(
+        ctx,
+        "sun.util.resources.cldr.LocaleNames",
+        display_lang,
+        display_country,
+    )?;
+    match table.get(code) {
+        Some(CldrValue::Str(name)) if !name.is_empty() => Some(name.clone()),
+        _ => None,
+    }
+}
+
+/// The collation TAILORING for a locale — the rule fragment the JDK's
+/// `CollatorProviderImpl` concatenates onto `CollationRules.DEFAULTRULES`.
+///
+/// This family does NOT live under a `cldr` package, so `load_cldr_table`
+/// cannot reach it: the real classes are `sun/text/resources/ext/CollationData_XX`
+/// (47 of them in a JDK 25 image, `_tr` and `_da` and `_sv` among them). Same
+/// reader, different package, and no ROOT candidate — an absent tailoring means
+/// "the default rules are already right for this locale", which is true for
+/// English and most others, so returning `None` is the correct answer rather
+/// than a fallback.
+///
+/// Without this the synthetic `CollationData` bundle is EMPTY, the provider
+/// reads `""` for its rules, and every locale gets a collator built from the
+/// default rules alone — `Collator.getInstance(new Locale("tr"))` really is a
+/// `java.text.RuleBasedCollator` on this VM, it just is not a Turkish one.
+pub(crate) fn cldr_collation_rule(
+    ctx: &mut dyn NativeContext,
+    lang: &str,
+    country: &str,
+) -> Option<String> {
+    if lang.is_empty() {
+        return None;
+    }
+    // Cache like `load_cldr_table` does, and for the same reason: the rule
+    // string is read by instantiating the bundle class and walking its
+    // `getContents()` array, which is far too expensive to repeat. A collation
+    // rule is asked for once per `Collator.getInstance`, and callers that build
+    // one per comparison are common.
+    let cache_key = format!("CollationRule|{lang}|{country}");
+    if let Ok(cache) = collation_rule_cache().lock() {
+        if let Some(hit) = cache.get(&cache_key) {
+            return hit.clone();
+        }
+    }
+    let found = cldr_collation_rule_uncached(ctx, lang, country);
+    if let Ok(mut cache) = collation_rule_cache().lock() {
+        cache.insert(cache_key, found.clone());
+    }
+    found
+}
+
+fn collation_rule_cache(
+) -> &'static cratonvm_types::lock_order::OrderedMutex<std::collections::HashMap<String, Option<String>>>
+{
+    static INSTANCE: std::sync::OnceLock<
+        cratonvm_types::lock_order::OrderedMutex<
+            std::collections::HashMap<String, Option<String>>,
+        >,
+    > = std::sync::OnceLock::new();
+    INSTANCE.get_or_init(|| {
+        cratonvm_types::lock_order::OrderedMutex::new(
+            std::collections::HashMap::new(),
+            cratonvm_types::lock_order::LockLevel::Scratch,
+        )
+    })
+}
+
+fn cldr_collation_rule_uncached(
+    ctx: &mut dyn NativeContext,
+    lang: &str,
+    country: &str,
+) -> Option<String> {
+    // Most specific first: a `_tr_TR` tailoring wins over `_tr`. Unlike the
+    // CLDR chain there is nothing to merge — a bundle either carries the whole
+    // `Rule` for that locale or does not exist.
+    let mut candidates = Vec::new();
+    if !country.is_empty() {
+        candidates.push(format!("sun/text/resources/ext/CollationData_{lang}_{country}"));
+    }
+    candidates.push(format!("sun/text/resources/ext/CollationData_{lang}"));
+    for cand in candidates {
+        if ctx.find_resource(&format!("{cand}.class")).is_none() {
+            continue;
+        }
+        let mut merged: std::collections::BTreeMap<String, CldrValue> =
+            std::collections::BTreeMap::new();
+        if !read_cldr_contents(ctx, &cand, &mut merged) {
+            continue;
+        }
+        if let Some(CldrValue::Str(rule)) = merged.get("Rule") {
+            if !rule.is_empty() {
+                return Some(rule.clone());
+            }
+        }
+    }
+    None
 }
 
 /// The FormatData table for a locale. One name for the base string so the six
@@ -999,6 +1126,16 @@ fn build_bundle(
         {
             let map_now = ctx.read_native_pin(map_pin, map);
             populate_currency_names_en(ctx, map_now);
+        } else if bundle_name.starts_with("sun.text.resources.CollationData")
+            || bundle_name.starts_with("sun.text.resources.ext.CollationData")
+        {
+            // `LocaleResources.getCollationData()` reads exactly one key from
+            // this bundle and hands it to `new RuleBasedCollator(DEFAULTRULES +
+            // rule)`. An empty bundle is not a degraded collator, it is the
+            // wrong language's collator with no way for the caller to tell.
+            if let Some(rule) = cldr_collation_rule(ctx, lang, country) {
+                crate::phases_late::text_intl::put_str(ctx, map_pin, map, "Rule", &rule);
+            }
         }
 
         // W7-80: overlay the JDK image's own CLDR data for the REQUESTED

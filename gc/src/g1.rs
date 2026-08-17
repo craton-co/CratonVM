@@ -1467,6 +1467,29 @@ const MARK_WORKLIST_CAP: usize = 1 << 20;
 /// records are evicted (and counted) so memory stays bounded.
 const PAUSE_HISTORY_CAP: usize = 1 << 16;
 
+/// How many [`GarbageCollector::needs_gc`] queries may be answered from
+/// [`G1Collector::free_region_count`] before it is re-scanned, as a backstop
+/// for a region-type transition that forgot to publish a fresh count.
+///
+/// Every path that MOVES a region out of the Free pool already publishes
+/// (`note_region_consumed_locked`, the TLAB refill's own reserve count) and a
+/// collection publishes on its way out, so in practice the cache is exact.
+/// This bound only decides how long a hypothetical missed transition could go
+/// unnoticed: 1024 allocations is at most ~40 KB of objects, against a trigger
+/// that fires on 25% of the whole heap.
+const NEEDS_GC_RECOUNT_INTERVAL: usize = 1024;
+
+/// Slots in the per-thread remembered-set edge memo — see the
+/// `RSET_EDGE_MEMO` thread-local in `post_write_barrier_rset`.
+///
+/// Four, because a reference-store loop into one destination array reaches
+/// objects spread over several SOURCE regions, and a one-slot memo alternates
+/// between them and misses every time. Measured (`BarrierProbe refstore`, 8
+/// threads, 2M stores, ordinary arrays): one slot left the mode scaling 4.9x
+/// from one thread to eight while the barrier-free modes went flat.
+const RSET_EDGE_MEMO_SLOTS: usize = 4;
+
+
 // ---------------------------------------------------------------------------
 // Collection type
 // ---------------------------------------------------------------------------
@@ -1599,6 +1622,45 @@ pub struct G1Collector {
     /// set several times per pause). Decays back to the baseline after a
     /// clean collection so healthy workloads keep the larger eden.
     needs_gc_free_percent: AtomicUsize,
+
+    /// Cached count of `RegionType::Free` regions — the answer
+    /// [`GarbageCollector::needs_gc`] needs, kept as an atomic so that query
+    /// costs one relaxed load instead of `regions.lock()` plus an
+    /// O(num_regions) scan.
+    ///
+    /// `maybe_gc` runs `needs_gc()` after EVERY `new` / `newarray` /
+    /// `anewarray` bytecode, so the scan it used to do ran once per allocated
+    /// object over every region in the heap — 1500 regions at `-Xmx1500m`,
+    /// under the one mutex every allocation path also needs. Single-threaded
+    /// that is ~1 us of pure overhead per object; with several mutators it is
+    /// a convoy, and the same total allocation work measured 1.5 s on one
+    /// thread against 13.4 s on eight (ZGC, whose trigger is O(1), was flat at
+    /// 0.8 s for both). `note_region_consumed_locked` already documents the
+    /// discipline this violated: count Free regions when a region is
+    /// CONSUMED, never per object.
+    ///
+    /// Refreshed wherever the count is already being computed under the lock
+    /// (region consumption, TLAB refill, the end of a collection) and, as a
+    /// self-healing backstop for any region-type transition that does neither,
+    /// re-scanned every [`NEEDS_GC_RECOUNT_INTERVAL`] queries.
+    /// `CRATONVM_DBG_G1ACCESSOR` census: field/array accessor calls that
+    /// answered from [`Self::may_be_humongous`] with NO `regions` lock, and
+    /// calls that had to take it. The load-independent half of the
+    /// accessor-lock measurement — see the flag's own doc.
+    accessor_calls_lockfree: AtomicU64,
+    accessor_calls_locked: AtomicU64,
+    /// Same census, remembered-set half: cross-region reference stores whose
+    /// edge the per-thread memo had already recorded (no lock), against those
+    /// that had to reach `RememberedSet::add_reference_in_generation` and take
+    /// its per-region mutex. `rset_edge_same_region` counts the stores that
+    /// never needed an entry at all.
+    rset_edge_memo_hit: AtomicU64,
+    rset_edge_recorded: AtomicU64,
+    rset_edge_same_region: AtomicU64,
+    free_region_count: AtomicUsize,
+    /// Queries since [`Self::free_region_count`] was last re-scanned. See
+    /// [`NEEDS_GC_RECOUNT_INTERVAL`].
+    needs_gc_since_recount: AtomicUsize,
 
     /// Native-allocation pressure latch — G1's half of the "the allocation
     /// wrappers cannot collect, so the next `safe_native_call` boundary does
@@ -1924,7 +1986,12 @@ impl G1Collector {
         // contiguous block (see the `arena` field doc and `alloc_humongous_locked`).
         // Allocated once and never moved/reallocated → every region base and
         // the `region_lookup` table are address-stable for the collector's life.
-        let arena: Box<[u8]> = vec![0u8; num_regions * config.region_size].into_boxed_slice();
+        // Fallible, so an -Xmx the OS will not reserve is reported as a heap
+        // reservation failure rather than as `handle_alloc_error`'s bare
+        // `memory allocation of N bytes failed` — see `alloc_zeroed_heap`.
+        let arena: Box<[u8]> =
+            crate::arena::alloc_zeroed_heap(num_regions * config.region_size, "G1 region array")
+                .into_boxed_slice();
         let arena_base = arena.as_ptr() as usize;
         let arena_end = arena_base + arena.len();
 
@@ -1964,6 +2031,16 @@ impl G1Collector {
             current_eden: AtomicUsize::new(usize::MAX), // no eden yet
             next_hash_code: AtomicI32::new(1),
             needs_gc_free_percent: AtomicUsize::new(25),
+            // Every region starts Free (`G1Region::from_arena`). Seeding this
+            // at 0 instead would make the first `needs_gc()` on a brand-new
+            // heap answer "collect now".
+            accessor_calls_lockfree: AtomicU64::new(0),
+            accessor_calls_locked: AtomicU64::new(0),
+            rset_edge_memo_hit: AtomicU64::new(0),
+            rset_edge_recorded: AtomicU64::new(0),
+            rset_edge_same_region: AtomicU64::new(0),
+            free_region_count: AtomicUsize::new(num_regions),
+            needs_gc_since_recount: AtomicUsize::new(0),
             native_alloc_pressure: AtomicBool::new(false),
             mark_start_snapshot: Mutex::new(Vec::new()),
             gc_state: Arc::new(ConcurrentGcState::new()),
@@ -2050,10 +2127,36 @@ impl G1Collector {
             .iter()
             .filter(|r| r.region_type == RegionType::Free)
             .count();
+        self.publish_free_region_count(free);
         let pct = self.needs_gc_free_percent.load(Ordering::Relaxed).max(1);
         if free * 100 < regions.len() * pct {
             self.native_alloc_pressure.store(true, Ordering::Relaxed);
         }
+    }
+
+    /// Hand a freshly-counted Free-region total to [`Self::free_region_count`]
+    /// and restart the backstop interval. Call this from anywhere that has
+    /// just done the O(num_regions) count under the lock — the point of the
+    /// cache is that nobody should ever do that count for `needs_gc` alone.
+    #[inline]
+    fn publish_free_region_count(&self, free: usize) {
+        self.free_region_count.store(free, Ordering::Relaxed);
+        self.needs_gc_since_recount.store(0, Ordering::Relaxed);
+    }
+
+    /// Recount Free regions under the lock and publish the result.
+    ///
+    /// Only for callers that do NOT already hold `regions` — everything that
+    /// does should call [`Self::publish_free_region_count`] with the count it
+    /// already has.
+    fn recount_free_regions(&self) -> usize {
+        let regions = self.regions.lock();
+        let free = regions
+            .iter()
+            .filter(|r| r.region_type == RegionType::Free)
+            .count();
+        self.publish_free_region_count(free);
+        free
     }
 
     /// Native-allocation pressure signal — see the field doc. Consumed at the
@@ -3180,6 +3283,16 @@ impl G1Collector {
     pub fn with_regions_mut<F: FnOnce(&mut [G1Region])>(&self, f: F) {
         let mut guard = self.regions.lock();
         f(&mut guard);
+        // The closure is allowed to retype regions, and the Free-region count
+        // is the one input `needs_gc`'s cache depends on. Republish it here so
+        // this — the sanctioned "mutate the region table" API — leaves the
+        // cache EXACT instead of leaning on the backstop re-scan. See
+        // `G1Collector::free_region_count`.
+        let free = guard
+            .iter()
+            .filter(|r| r.region_type == RegionType::Free)
+            .count();
+        self.publish_free_region_count(free);
     }
 
     /// Phase H (RH.8) — select the old regions that will be evacuated
@@ -8621,6 +8734,7 @@ impl G1Collector {
             .iter()
             .filter(|r| r.region_type == RegionType::Free)
             .count();
+        self.publish_free_region_count(free_count);
         if free_count <= self.tlab_reserve_regions(regions.len()) {
             // Latch the pressure signal on the way out: the workload is
             // allocating hard enough to exhaust the pool and something must
@@ -8824,7 +8938,12 @@ impl G1Collector {
         // Only record cross-region references.
         let (src_idx, dst_idx) = match (src_region, dst_region) {
             (Some(s), Some(d)) if s != d => (s, d),
-            _ => return,
+            _ => {
+                if gc_flags().g1_dbg_accessor {
+                    self.rset_edge_same_region.fetch_add(1, Ordering::Relaxed);
+                }
+                return;
+            }
         };
 
         let collector_id = self.instance_id;
@@ -8842,7 +8961,80 @@ impl G1Collector {
             // than as a deref-then-call.
             static LAST_RSET_TARGET: std::cell::Cell<Option<(u64, usize, *const G1Region, u64)>>
                 = const { std::cell::Cell::new(None) };
+            /// Edges this thread has already recorded, as PACKED
+            /// `(dst_idx << 32) | src_idx` keys — `0` means empty.
+            ///
+            /// Four slots, not one. One slot was the first shape and it thrashes
+            /// on the workload that matters: a loop storing references into one
+            /// array reaches objects spread over SEVERAL source regions, so a
+            /// single-entry memo alternates between two or three live edges and
+            /// misses every time. Packing the pair into one `u64` is what makes
+            /// four slots affordable — the whole memo is 32 bytes to copy out of
+            /// the `Cell`, against 160 for an array of
+            /// `Option<(u64, usize, usize, u64)>`, which is the cost that made
+            /// the first attempt at four slots a wash.
+            static RSET_EDGE_MEMO: std::cell::Cell<[u64; RSET_EDGE_MEMO_SLOTS]>
+                = const { std::cell::Cell::new([0; RSET_EDGE_MEMO_SLOTS]) };
+            /// The `(collector_id, epoch)` the memo above was built under. Any
+            /// change invalidates all of it at once, which is what keeps the
+            /// per-slot compare down to a single `u64`.
+            static RSET_EDGE_MEMO_TAG: std::cell::Cell<(u64, u64)>
+                = const { std::cell::Cell::new((u64::MAX, u64::MAX)) };
         }
+
+        // An rset is a SET of source region indices, so re-recording an edge
+        // this thread already recorded in this epoch is a no-op — and taking a
+        // per-destination `Mutex<FxHashMap>` to discover that is what every
+        // reference store into a hot region was paying. Mutators writing into
+        // the same current Eden region all contend on that one mutex, so the
+        // cost is a convoy rather than an uncontended lock: the same total
+        // number of retained-object stores measured 1.0 s on one thread and
+        // 6.8 s on eight (ZGC flat at ~1.1 s), with ZERO collections in either
+        // run — the pauses were never involved.
+        //
+        // `epoch` is what makes skipping sound, and it is the same epoch the
+        // region-pointer cache below already relies on: a recycle/retype phase
+        // bumps it under the regions lock, and `G1Region::reset` (which clears
+        // the rset) only happens inside such a phase. A stale memo therefore
+        // cannot survive the clear that would invalidate it. Coarsening does
+        // not need to be tracked either — an add to a coarsened rset returns
+        // early anyway, so skipping it changes nothing.
+        // Packed key. `dst_idx`/`src_idx` are region indices, bounded by
+        // `heap_size / region_size`, so 32 bits each is enormous headroom; the
+        // `+ 1` keeps `0` free as the empty marker.
+        let edge_key = (((dst_idx as u64) + 1) << 32) | ((src_idx as u64) + 1);
+        let tag_ok = RSET_EDGE_MEMO_TAG.with(|c| {
+            if c.get() == (collector_id, cur_epoch) {
+                true
+            } else {
+                // A new collector instance or a new reclassification epoch
+                // retires the whole memo in one step.
+                c.set((collector_id, cur_epoch));
+                RSET_EDGE_MEMO.with(|m| m.set([0; RSET_EDGE_MEMO_SLOTS]));
+                false
+            }
+        });
+        if tag_ok && RSET_EDGE_MEMO.with(|m| m.get()).contains(&edge_key) {
+            if gc_flags().g1_dbg_accessor {
+                self.rset_edge_memo_hit.fetch_add(1, Ordering::Relaxed);
+            }
+            return;
+        }
+        // Record the edge as memoized only after an add below actually lands.
+        // Insert at the front so the most recent edge is found first; the
+        // oldest falls off the end.
+        let remember_edge = |epoch: u64| {
+            if gc_flags().g1_dbg_accessor {
+                self.rset_edge_recorded.fetch_add(1, Ordering::Relaxed);
+            }
+            RSET_EDGE_MEMO_TAG.with(|c| c.set((collector_id, epoch)));
+            RSET_EDGE_MEMO.with(|m| {
+                let mut memo = m.get();
+                memo.rotate_right(1);
+                memo[0] = edge_key;
+                m.set(memo);
+            });
+        };
 
         let hit = LAST_RSET_TARGET.with(|cell| {
             if let Some((cached_collector, cached_idx, cached_ptr, cached_epoch)) = cell.get() {
@@ -8882,6 +9074,7 @@ impl G1Collector {
             false
         });
         if hit {
+            remember_edge(cur_epoch);
             return;
         }
 
@@ -8924,6 +9117,7 @@ impl G1Collector {
         regions[dst_idx]
             .rset
             .add_reference_in_generation(src_idx, epoch_under_lock);
+        remember_edge(epoch_under_lock);
     }
 
     /// Region indices that hold a conservatively-discovered JIT root this cycle
@@ -9214,23 +9408,54 @@ impl G1Collector {
     /// for some region. The check uses `self.config.region_size` instead of
     /// the per-region `data.len()` because every region's backing buffer is
     /// allocated at exactly `region_size` bytes (see [`G1Region::from_arena`]).
+    ///
+    /// O(1) ARITHMETIC, not the binary search this used to be. Region `i`'s
+    /// base is exactly `arena_base + i * region_size` — `new` carves one
+    /// contiguous `arena` into adjacent equal slices and never reallocates it —
+    /// so the index is a subtraction and a divide, and the same form is already
+    /// used by `header_verdict_at` and the walkers.
+    ///
+    /// It matters because this is the hottest read in the collector: the
+    /// reference write barrier calls it TWICE per store. A `partition_point`
+    /// over 1500 entries touches ~11 scattered cache lines each time, and eight
+    /// mutators doing that 4M times apiece thrash the shared cache — which is
+    /// not a lock, so it does not show up as one, but it scaled just like one.
+    /// Isolated with a store whose referent is its own array, so the barrier
+    /// returns immediately after these two lookups and nothing else runs
+    /// (`BarrierProbe refself`, 2M stores): **1051 ms on one thread, 4923 ms on
+    /// eight**, matching `refstore`'s scaling exactly and proving the residue
+    /// was here rather than in the remembered set (whose mutex the census
+    /// recorded being taken 27 times in that entire run).
     #[inline]
     fn lookup_region_for_addr(&self, addr: usize) -> Option<usize> {
-        // Find the largest base address that is <= addr.
-        // `partition_point` returns the first index where the predicate is
-        // false; subtracting 1 gives the last index where it is true.
-        let pp = self
-            .region_lookup
-            .partition_point(|(base, _)| *base <= addr);
-        if pp == 0 {
+        if addr < self.arena_base || addr >= self.arena_end {
             return None;
         }
-        let (base, idx) = self.region_lookup[pp - 1];
-        if addr < base.wrapping_add(self.config.region_size) {
-            Some(idx)
-        } else {
-            None
+        let region_size = self.config.region_size;
+        if region_size == 0 {
+            return None;
         }
+        let idx = (addr - self.arena_base) / region_size;
+        debug_assert_eq!(
+            Some(idx),
+            {
+                let pp = self
+                    .region_lookup
+                    .partition_point(|(base, _)| *base <= addr);
+                if pp == 0 {
+                    None
+                } else {
+                    let (base, i) = self.region_lookup[pp - 1];
+                    if addr < base.wrapping_add(region_size) {
+                        Some(i)
+                    } else {
+                        None
+                    }
+                }
+            },
+            "arithmetic region index disagrees with the region_lookup table at              addr=0x{addr:x} — the arena is no longer a run of equal adjacent              slices and every caller of this function is now wrong"
+        );
+        Some(idx)
     }
 
     // -----------------------------------------------------------------------
@@ -9245,12 +9470,91 @@ impl G1Collector {
     // below could read/write that flat range directly; `humongous_copy` is
     // retained so the existing field/array accessor call sites are unchanged.
 
+    /// Could an object of `total_object_size` bytes possibly be humongous?
+    ///
+    /// Lock-free, and exact in the direction that matters. `alloc_in_region`
+    /// routes a request to `alloc_humongous_locked` iff
+    /// `size > region_size / 2`, and `refill_tlab` refuses to carve a chunk
+    /// above the same bound — so anything at or below it was allocated inside
+    /// ONE region, and its [`Self::humongous_span`] is necessarily `None`.
+    ///
+    /// Answering `false` therefore licenses skipping the `regions` lock
+    /// altogether, which is the entire point of this predicate. Every accessor
+    /// on this collector — `get_field`, `set_field`, `get_array_element`,
+    /// `set_array_element` — took that one global mutex on EVERY call, and the
+    /// only thing it protected was the `region_type` read inside
+    /// `humongous_span`. So a `putfield` on one thread serialized against a
+    /// `getfield` on every other, and an `int[]` store paid for a humongous
+    /// check that could not possibly apply to it. Measured with a
+    /// constant-total-work store loop (`BarrierProbe primstore` — an `int[]`
+    /// store, no GC barrier of any kind): **768 ms on one thread, 3172 ms on
+    /// eight**, against ZGC flat at ~790/850 ms.
+    ///
+    /// Only the SIZE is consulted, never the object's address, so this is safe
+    /// to call before any region state is stable.
+    #[inline]
+    fn may_be_humongous(&self, total_object_size: usize) -> bool {
+        total_object_size > self.config.region_size / 2
+    }
+
+    /// Record one accessor call for the `CRATONVM_DBG_G1ACCESSOR` census, and
+    /// answer the same thing [`Self::may_be_humongous`] does.
+    ///
+    /// Wrapping the predicate rather than counting at each of the four call
+    /// sites keeps the census and the decision impossible to disagree: whatever
+    /// routed the call is what gets counted.
+    #[inline]
+    fn accessor_needs_regions_lock(&self, total_object_size: usize) -> bool {
+        let locked = self.may_be_humongous(total_object_size);
+        if gc_flags().g1_dbg_accessor {
+            if locked {
+                self.accessor_calls_locked.fetch_add(1, Ordering::Relaxed);
+            } else {
+                self.accessor_calls_lockfree.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        locked
+    }
+
+    /// Print the `CRATONVM_DBG_G1ACCESSOR` census. Called once, at VM exit.
+    pub fn dbg_report_accessor_census(&self) {
+        if !gc_flags().g1_dbg_accessor {
+            return;
+        }
+        let free = self.accessor_calls_lockfree.load(Ordering::Relaxed);
+        let locked = self.accessor_calls_locked.load(Ordering::Relaxed);
+        let total = free + locked;
+        let memo_hit = self.rset_edge_memo_hit.load(Ordering::Relaxed);
+        let recorded = self.rset_edge_recorded.load(Ordering::Relaxed);
+        let same_region = self.rset_edge_same_region.load(Ordering::Relaxed);
+        eprintln!(
+            "[g1-accessor] rset cross_region_stores={} memo_hit={memo_hit} took_rset_mutex={recorded} same_region_skipped={same_region} memo_hit_pct={:.2}",
+            memo_hit + recorded,
+            if memo_hit + recorded == 0 {
+                0.0
+            } else {
+                memo_hit as f64 * 100.0 / (memo_hit + recorded) as f64
+            }
+        );
+        eprintln!(
+            "[g1-accessor] field/array accessor calls={total} lock_free={free} took_regions_lock={locked} lock_free_pct={:.2}",
+            if total == 0 {
+                0.0
+            } else {
+                free as f64 * 100.0 / total as f64
+            }
+        );
+    }
+
     /// If `obj`'s start address names a `HumongousStart` region, return the
     /// start region index and the total payload byte count (object size minus
     /// the single ObjectHeader). Returns `None` for ordinary (non-humongous)
     /// objects, whose access uses the plain flat-offset path.
     ///
     /// Takes the already-held `regions` slice to avoid re-locking.
+    ///
+    /// Gate every call on [`Self::may_be_humongous`] — it answers the same
+    /// question for the common case without the lock this one needs.
     fn humongous_span(
         &self,
         regions: &[G1Region],
@@ -9640,7 +9944,12 @@ impl G1Collector {
         // C2 (round-12 gc): humongous objects are region-fragmented; translate
         // the flat payload offset to the owning continuation region's buffer so
         // the read can never escape the object's backing memory.
-        {
+        //
+        // `may_be_humongous` first, so an ordinary object's field read never
+        // touches the `regions` lock. This block used to take it
+        // unconditionally, making every `getfield` on this collector contend
+        // with every other thread's field access — see `may_be_humongous`.
+        if self.accessor_needs_regions_lock(total_size) {
             let regions = self.regions.lock();
             if let Some((start, total_payload)) = self.humongous_span(&regions, obj, total_size) {
                 let mut tmp = [0u64; 2];
@@ -9962,7 +10271,37 @@ impl GarbageCollector for G1Collector {
 
         // C2 (round-12 gc): route humongous stores through the region-aware
         // translation so the write can never escape the object's memory.
-        let stored = {
+        //
+        // The flat arm is hoisted into a closure so it can run WITHOUT the
+        // `regions` lock: `may_be_humongous` settles the question by size, and
+        // an ordinary object's field write has no business serializing against
+        // every other thread's field access. See `may_be_humongous`.
+        //
+        // SAFETY (both call sites): `index < num_slots`, so the slot is
+        // in-bounds of the object's single-region backing store.
+        //
+        // PLAIN-SLOT TEARING FIX (2026-07-06): was a bare `ptr::write::<Value>`
+        // -- see the matching note on `get_field`'s read side above. The
+        // atomic write is what makes the lock-free path safe against a
+        // concurrent plain `get_field_raw` on the same slot; the lock never
+        // provided that ordering anyway, because the read side took it
+        // separately.
+        let flat_store = || {
+            let ptr = unsafe { obj.as_ptr().add(ARRAY_DATA_OFFSET + payload_off) };
+            if let Some((_, storage)) = compact {
+                unsafe {
+                    cratonvm_types::write_compact_field(ptr, storage, value, Ordering::Relaxed)
+                };
+            } else {
+                unsafe {
+                    cratonvm_types::write_value_atomic(ptr as *mut Value, value);
+                }
+            }
+            true
+        };
+        let stored = if !self.accessor_needs_regions_lock(total_size) {
+            flat_store()
+        } else {
             let regions = self.regions.lock();
             if let Some((start, total_payload)) = self.humongous_span(&regions, obj, total_size) {
                 let mut tmp = [0u64; 2];
@@ -9990,23 +10329,10 @@ impl GarbageCollector for G1Collector {
                     true,
                 )
             } else {
-                // SAFETY: `index < num_slots`, so the slot is in-bounds of the
-                // object's single-region backing store.
-                //
-                // PLAIN-SLOT TEARING FIX (2026-07-06): was a bare
-                // `ptr::write::<Value>` -- see the matching note on
-                // `get_field`'s read side above.
-                let ptr = unsafe { obj.as_ptr().add(ARRAY_DATA_OFFSET + payload_off) };
-                if let Some((_, storage)) = compact {
-                    unsafe {
-                        cratonvm_types::write_compact_field(ptr, storage, value, Ordering::Relaxed)
-                    };
-                } else {
-                    unsafe {
-                        cratonvm_types::write_value_atomic(ptr as *mut Value, value);
-                    }
-                }
-                true
+                // `may_be_humongous` said "maybe" on size alone and the region
+                // type says otherwise — an ordinary object that happens to be
+                // large. Same flat store, just reached with the lock held.
+                flat_store()
             }
         };
 
@@ -10080,12 +10406,25 @@ impl GarbageCollector for G1Collector {
         // translates to the owning continuation region. Either way the read is
         // bounds-confined to the object's own backing memory.
         let mut raw = [0u8; 8]; // largest element is 8 bytes (long/double/ref)
-        {
+        // C2: array data_size mirrors HEADER_SIZE + elements; recompute the
+        // total so the humongous span / payload bound is exact.
+        let total_size =
+            ARRAY_DATA_OFFSET + crate::heap::array_data_size(len, element_type).unwrap_or(0);
+        // SAFETY: `index < len` so `[payload_off, payload_off+elem_size)` is
+        // inside the array's single-region payload.
+        let flat_read = |raw: &mut [u8; 8]| {
+            let slot_ptr = unsafe { obj.as_ptr().add(ARRAY_DATA_OFFSET + payload_off) };
+            unsafe {
+                std::ptr::copy_nonoverlapping(slot_ptr, raw.as_mut_ptr(), elem_size);
+            }
+        };
+        // `may_be_humongous` first: an ordinary array's element read must not
+        // take the `regions` lock, which this block used to do on every call —
+        // see `may_be_humongous` for what that cost.
+        if !self.accessor_needs_regions_lock(total_size) {
+            flat_read(&mut raw);
+        } else {
             let regions = self.regions.lock();
-            // C2: array data_size mirrors HEADER_SIZE + elements; recompute the
-            // total so the humongous span / payload bound is exact.
-            let total_size =
-                ARRAY_DATA_OFFSET + crate::heap::array_data_size(len, element_type).unwrap_or(0);
             if let Some((start, total_payload)) = self.humongous_span(&regions, obj, total_size) {
                 if !self.humongous_copy(
                     &regions,
@@ -10099,12 +10438,7 @@ impl GarbageCollector for G1Collector {
                     return Err(index as i32);
                 }
             } else {
-                // SAFETY: `index < len` so `[payload_off, payload_off+elem_size)`
-                // is inside the array's single-region payload.
-                let slot_ptr = unsafe { obj.as_ptr().add(ARRAY_DATA_OFFSET + payload_off) };
-                unsafe {
-                    std::ptr::copy_nonoverlapping(slot_ptr, raw.as_mut_ptr(), elem_size);
-                }
+                flat_read(&mut raw);
             }
         }
         let value = array_element_from_bytes(element_type, &raw);
@@ -10172,13 +10506,39 @@ impl GarbageCollector for G1Collector {
         // weak-reference PROTOCOL writes never log an edge as a mark root.
         // `satb_pre_barrier` touches only TLS + the SATB shards (never the
         // `regions` lock), so calling it here cannot deadlock.
-        let stored = {
+        //
+        // …but only when the lock buys something. Two things can want it: a
+        // humongous span (settled by SIZE alone — see `may_be_humongous`) and
+        // the SATB read-then-store pair above. When marking is idle there is no
+        // SATB read, so an ordinary array store was taking the one global
+        // regions mutex purely to ask a question whose answer its own `len`
+        // already determined. That is what made an `int[]` store convoy: 768 ms
+        // on one thread against 3172 ms on eight for the same total work
+        // (`BarrierProbe primstore`), with ZGC flat.
+        let total_size =
+            ARRAY_DATA_OFFSET + crate::heap::array_data_size(len, element_type).unwrap_or(0);
+        let needs_satb_read =
+            is_ref && self.satb_pre_barrier_required() && !satb_pre_suppressed();
+        // SAFETY: `index < len` so the slot is inside the array payload.
+        let flat_store = || {
+            let slot_ptr = unsafe { obj.as_ptr().add(ARRAY_DATA_OFFSET + payload_off) };
+            unsafe {
+                std::ptr::copy_nonoverlapping(raw.as_ptr(), slot_ptr, elem_size);
+            }
+            true
+        };
+        // Evaluate the predicate BEFORE the `&&`, not inside it: `&&`
+        // short-circuits, so with the census wired through
+        // `accessor_needs_regions_lock` a store that takes the lock for SATB
+        // would never be counted at all — a funnel with one branch invisible.
+        let size_needs_lock = self.accessor_needs_regions_lock(total_size);
+        let stored = if !needs_satb_read && !size_needs_lock {
+            flat_store()
+        } else {
             let regions = self.regions.lock();
-            let total_size =
-                ARRAY_DATA_OFFSET + crate::heap::array_data_size(len, element_type).unwrap_or(0);
             let span = self.humongous_span(&regions, obj, total_size);
 
-            if is_ref && self.satb_pre_barrier_required() && !satb_pre_suppressed() {
+            if needs_satb_read {
                 let mut old_raw = [0u8; 8];
                 let read_ok = match span {
                     Some((start, total_payload)) => self.humongous_copy(
@@ -10223,12 +10583,7 @@ impl GarbageCollector for G1Collector {
                     true,
                 )
             } else {
-                // SAFETY: `index < len` so the slot is inside the array payload.
-                let slot_ptr = unsafe { obj.as_ptr().add(ARRAY_DATA_OFFSET + payload_off) };
-                unsafe {
-                    std::ptr::copy_nonoverlapping(raw.as_ptr(), slot_ptr, elem_size);
-                }
-                true
+                flat_store()
             }
         };
         if !stored {
@@ -10245,12 +10600,21 @@ impl GarbageCollector for G1Collector {
     }
 
     fn needs_gc(&self) -> bool {
-        let regions = self.regions.lock();
-        let free_count = regions
-            .iter()
-            .filter(|r| r.region_type == RegionType::Free)
-            .count();
-        let total = regions.len();
+        // Read the cache; re-scan only every `NEEDS_GC_RECOUNT_INTERVAL`
+        // queries. This used to lock `regions` and count Free regions on every
+        // call — and `maybe_gc` calls this after every single `new` bytecode.
+        // See `G1Collector::free_region_count` for the measurement.
+        // `regions` is built once in `new` and never grows or shrinks, so its
+        // length is exactly the figure `new` computed — no lock needed to
+        // learn it.
+        let total = self.config.heap_size / self.config.region_size;
+        let free_count = if self.needs_gc_since_recount.fetch_add(1, Ordering::Relaxed)
+            >= NEEDS_GC_RECOUNT_INTERVAL
+        {
+            self.recount_free_regions()
+        } else {
+            self.free_region_count.load(Ordering::Relaxed)
+        };
         // Trigger a GC when the Free fraction drops below the (adaptive)
         // threshold. Baseline 25%; raised after a collection that hit
         // evacuation failure so the NEXT pause starts with a to-space pool
@@ -10395,6 +10759,12 @@ impl GarbageCollector for G1Collector {
         //    latch; the next region claim re-latches it if the workload is
         //    still outrunning the collector (see `native_alloc_pressure`).
         self.native_alloc_pressure.store(false, Ordering::Relaxed);
+
+        // 5. …and that rebuilt pool is exactly what `needs_gc` reads. Republish
+        //    it here, or the cache keeps answering with the pre-collection
+        //    count and every allocation until the next backstop re-scan asks
+        //    for another collection. See `G1Collector::free_region_count`.
+        self.recount_free_regions();
 
         result
     }
@@ -12305,6 +12675,79 @@ mod tests {
         // OOB index is rejected, not a wild write.
         assert!(gc.set_array_element(arr, n, Value::Int(1)).is_err());
         assert!(gc.get_array_element(arr, n).is_err());
+    }
+
+    /// `may_be_humongous` is what licenses every accessor to skip the `regions`
+    /// lock, so it must never answer `false` for an object the allocator
+    /// actually placed in a `HumongousStart` region. If it ever does, that
+    /// object's field/element access takes the FLAT path and reads or writes
+    /// the wrong memory — silently.
+    ///
+    /// This pins the predicate against the allocator's own admission rule
+    /// rather than against a hardcoded size, which is the only way the two can
+    /// be kept in agreement as `region_size` or the humongous threshold move.
+    #[test]
+    fn may_be_humongous_covers_everything_the_allocator_made_humongous() {
+        let gc = make_collector();
+        let region_size = gc.config.region_size;
+        // Walk element counts across the humongous threshold from well below to
+        // well above, including the exact boundary, and check the predicate
+        // against the region classification the allocator chose.
+        let per_elem = crate::heap::element_byte_size(ArrayElementType::Int);
+        let boundary_elems = (region_size / 2).saturating_sub(ARRAY_DATA_OFFSET) / per_elem;
+        for delta in [
+            -(boundary_elems as isize) / 2,
+            -2,
+            -1,
+            0,
+            1,
+            2,
+            boundary_elems as isize,
+        ] {
+            let n = ((boundary_elems as isize) + delta).max(1) as usize;
+            let arr = gc.alloc_array(ClassId::new(0), ArrayElementType::Int, n);
+            let total = ARRAY_DATA_OFFSET
+                + crate::heap::array_data_size(n, ArrayElementType::Int).unwrap();
+            let really_humongous = gc.is_humongous(arr);
+            assert!(
+                !really_humongous || gc.may_be_humongous(total),
+                "n={n} total={total} region_size={region_size}: the allocator made this \
+                 humongous but may_be_humongous said no, so every accessor would take \
+                 the flat path over a region-spanning object"
+            );
+            // And it must still round-trip through the accessors, whichever
+            // path the predicate routed it down.
+            for &i in &[0usize, n / 2, n - 1] {
+                gc.set_array_element(arr, i, Value::Int(i as i32 ^ 0x1234))
+                    .unwrap();
+                assert_eq!(
+                    gc.get_array_element(arr, i).unwrap().as_int(),
+                    Some(i as i32 ^ 0x1234),
+                    "n={n} index={i} did not round-trip"
+                );
+            }
+        }
+    }
+
+    /// The same agreement for an ORDINARY object's field slots: a plain object
+    /// is never humongous, so `set_field`/`get_field` must round-trip on the
+    /// lock-free path.
+    #[test]
+    fn an_ordinary_object_field_round_trips_without_the_regions_lock() {
+        let gc = make_collector();
+        let obj = gc.alloc_object(ClassId::new(0), 8);
+        assert!(!gc.is_humongous(obj));
+        let total = object_total_size(gc.get_header(obj));
+        assert!(
+            !gc.may_be_humongous(total),
+            "an 8-field object must take the lock-free accessor path"
+        );
+        for i in 0..8usize {
+            gc.set_field(obj, i, Value::Int(i as i32 * 31));
+        }
+        for i in 0..8usize {
+            assert_eq!(gc.get_field(obj, i).as_int(), Some(i as i32 * 31));
+        }
     }
 
     // G1 SIGSEGV regression (CpuOnlyBench / gpu-bench-cpu): a humongous array
@@ -14219,16 +14662,48 @@ mod tests {
         let gc = make_collector();
         assert!(!gc.needs_gc()); // all 8 regions free
 
-        // Use up most regions
-        {
-            let mut regions = gc.regions.lock();
+        // Use up most regions. Through `with_regions_mut`, NOT a raw
+        // `gc.regions.lock()`: `needs_gc` answers from a cached Free count
+        // (see `G1Collector::free_region_count`), and the sanctioned mutation
+        // API republishes that count while a raw lock cannot. A raw retype is
+        // only picked up by the backstop re-scan, i.e. after
+        // `NEEDS_GC_RECOUNT_INTERVAL` further queries — which is exactly the
+        // contract this asserts, one call later.
+        gc.with_regions_mut(|regions| {
             for i in 0..7 {
                 regions[i].region_type = RegionType::Eden;
                 regions[i].cursor = 100;
             }
-        }
+        });
         // 1 free out of 8 = 12.5% free, threshold is 25%
         assert!(gc.needs_gc());
+    }
+
+    /// The cached Free count must not be able to answer "collect" on a heap
+    /// that a collection has just emptied — the failure mode that would turn
+    /// one stale read into a GC on every allocation. Pairs with
+    /// `needs_gc_when_regions_full`: same collector, opposite direction.
+    #[test]
+    fn needs_gc_clears_once_regions_are_free_again() {
+        let gc = make_collector();
+        gc.with_regions_mut(|regions| {
+            for r in regions.iter_mut() {
+                r.region_type = RegionType::Eden;
+                r.cursor = 100;
+            }
+        });
+        assert!(gc.needs_gc(), "no Free regions at all must ask for a GC");
+        gc.with_regions_mut(|regions| {
+            for r in regions.iter_mut() {
+                r.region_type = RegionType::Free;
+                r.cursor = 0;
+            }
+        });
+        assert!(
+            !gc.needs_gc(),
+            "an all-Free heap must not still be asking for a collection — a \
+             cached Free count that survives the recycle is a GC per allocation"
+        );
     }
 
     // -- Allocated bytes --
@@ -14672,6 +15147,82 @@ mod tests {
 
         // The write barrier should have tracked the cross-region reference
         // (or it's a same-region ref, which is fine too — we just verify no crash)
+    }
+
+    /// The per-thread edge memo in `post_write_barrier_rset` skips the rset add
+    /// for an edge this thread already recorded. If it ever skips one the rset
+    /// does NOT actually hold, the collector loses a cross-region reference and
+    /// reclaims a live object — silently. Two directions, both pinned here:
+    ///
+    /// 1. the FIRST store of an edge always records it, and repeats are
+    ///    genuinely redundant (the rset still names the source);
+    /// 2. a `rset_cache_epoch` bump — what every recycle/retype phase does, and
+    ///    what accompanies the `G1Region::reset` that CLEARS an rset — retires
+    ///    the memo, so the next store re-records the edge instead of trusting a
+    ///    memo that outlived the set it described.
+    #[test]
+    fn the_rset_edge_memo_is_retired_by_an_epoch_bump() {
+        let gc = make_collector();
+        // Two Old regions so nothing recycles them underneath the test, and a
+        // known cross-region edge: an object in region 3 referencing one in 2.
+        gc.with_regions_mut(|regions| {
+            regions[2].region_type = RegionType::Old;
+            regions[3].region_type = RegionType::Old;
+        });
+        let (src_addr, dst_addr) = {
+            let regions = gc.regions.lock();
+            (
+                regions[3].data.as_ptr() as usize,
+                regions[2].data.as_ptr() as usize,
+            )
+        };
+        // SAFETY: region bases are real, mapped arena addresses; the barrier
+        // only reads them to resolve a region index.
+        let src_obj = unsafe { ObjectRef::from_raw(src_addr as *mut u8) };
+        let dst_obj = unsafe { ObjectRef::from_raw(dst_addr as *mut u8) };
+
+        gc.post_write_barrier_rset(src_obj, dst_obj);
+        let after_first = {
+            let regions = gc.regions.lock();
+            regions[2].rset.sources()
+        };
+        assert!(
+            after_first.contains(&3),
+            "the first store of a cross-region edge must record it: {after_first:?}"
+        );
+
+        // A repeat is redundant — the memo may skip it, and the set is unchanged.
+        gc.post_write_barrier_rset(src_obj, dst_obj);
+        let after_repeat = {
+            let regions = gc.regions.lock();
+            regions[2].rset.sources()
+        };
+        assert_eq!(
+            after_first, after_repeat,
+            "a repeated edge must leave the rset exactly as it was"
+        );
+
+        // Now do what a pause does: clear the set and bump the epoch. A memo
+        // that survived this would suppress the re-record and lose the edge.
+        gc.with_regions_mut(|regions| regions[2].rset.clear());
+        gc.rset_cache_epoch.fetch_add(1, Ordering::Release);
+        assert!(
+            {
+                let regions = gc.regions.lock();
+                regions[2].rset.sources().is_empty()
+            },
+            "test setup: the rset must actually be empty before the re-record"
+        );
+
+        gc.post_write_barrier_rset(src_obj, dst_obj);
+        let after_epoch_bump = {
+            let regions = gc.regions.lock();
+            regions[2].rset.sources()
+        };
+        assert!(
+            after_epoch_bump.contains(&3),
+            "an epoch bump must retire the edge memo — the edge was dropped, which              is how a live cross-region referent gets reclaimed: {after_epoch_bump:?}"
+        );
     }
 
     #[test]

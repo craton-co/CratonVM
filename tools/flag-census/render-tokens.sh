@@ -43,6 +43,19 @@ END{
 }' "$rows" > "$body"
 
 # Keep the hand-written prose; replace the generated tables.
+# The prose header is preserved VERBATIM, which is how a merge conflict can
+# survive regeneration: the markers sit in that header and every rerun copies
+# them forward. Refuse rather than launder them — for a conflict that is not
+# vacuous, silently dropping the markers would pick a side at random. (This
+# already happened to docs/config/flag-inventory.md, whose generator preserves
+# its head the same way.)
+if grep -qE '^(<<<<<<< |>>>>>>> |=======$)' "$OUT"; then
+  echo "$OUT has unresolved merge-conflict markers; its prose header is" >&2
+  echo "preserved verbatim, so regenerating would copy them forward." >&2
+  echo "Resolve the conflict in the file first, then rerun." >&2
+  exit 1
+fi
+
 head -n "$(( $(grep -n '^## `CRATONVM_' "$OUT" | head -1 | cut -d: -f1) - 1 ))" "$OUT" > "$OUT.tmp"
 cat "$body" >> "$OUT.tmp"
 mv "$OUT.tmp" "$OUT"

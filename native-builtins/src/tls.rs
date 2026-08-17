@@ -1706,10 +1706,15 @@ fn trust_store_keystore_id(ctx: &mut dyn NativeContext, allow_jdk_cacerts: bool)
     // Keyed by (path, password) so repeated `init(null)` calls — every
     // `SSLContext` build in a long-running app — parse the file once and
     // reuse one registry id instead of leaking a fresh keystore per call.
+    // ARCH-2026-08-04 A6 — `LockLevel::Scratch` (L0). Two acquisitions, both
+    // in this function: a `get(..).copied()` whose `if let` body is a bare
+    // `return`, and the `insert` at the end. The file read and parse happen
+    // between them, with no guard held and no `ctx` in this function at all.
     static CACHE: std::sync::OnceLock<
-        parking_lot::Mutex<std::collections::HashMap<(String, String), i32>>,
+        cratonvm_types::lock_order::OrderedPlMutex<std::collections::HashMap<(String, String), i32>>,
     > = std::sync::OnceLock::new();
-    let cache = CACHE.get_or_init(|| parking_lot::Mutex::new(std::collections::HashMap::new()));
+    let cache =
+        CACHE.get_or_init(|| cratonvm_types::lock_order::OrderedPlMutex::new(std::collections::HashMap::new(), cratonvm_types::lock_order::LockLevel::Scratch));
     let key = (path.clone(), password.clone());
     if let Some(id) = cache.lock().get(&key).copied() {
         return id;

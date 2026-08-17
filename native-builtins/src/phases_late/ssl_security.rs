@@ -239,6 +239,22 @@ pub(crate) fn register_p68_crypto_mac(r: &mut NativeMethodRegistry) {
                 &mac_algorithm_supported,
             )
             .unwrap_or(algo);
+            // A name this engine cannot compute is not automatically a missing
+            // algorithm: the ANONYMOUS overload promised "whatever the chain
+            // gives me". Ask the installed providers first, exactly as the
+            // provider-taking overload below already does — without this,
+            // `Mac.getInstance("1.3.14.3.2.26")` (HMAC-SHA1 by OID, which is how
+            // BouncyCastle's `JcePKCS12MacCalculatorBuilder` asks) refused while
+            // BouncyCastle implements it and HotSpot serves it.
+            if !mac_algorithm_supported(&algo) {
+                if let Some(p) = crate::jca::provider_chain::find_service_provider("Mac", &algo) {
+                    if let Some(obj) =
+                        crate::jca::provider_chain::build_real_mac(ctx, &p, &algo, &algo)?
+                    {
+                        return Ok(Some(Value::Object(Some(obj))));
+                    }
+                }
+            }
             // W4-3: refuse BEFORE allocating a receiver. An unimplemented name
             // used to yield a working-looking Mac that computed HMAC-SHA-256
             // under whatever name the caller asked for — see
@@ -264,10 +280,20 @@ pub(crate) fn register_p68_crypto_mac(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(Some(obj))))
         },
     );
+    // Both provider-taking overloads. `getInstance(String, Provider)` was never
+    // registered, so it fell through to the real `Mac.getInstance` bytecode and
+    // built a receiver whose state this crate's `init`/`update`/`doFinal` do not
+    // manage. `check_named_provider_arg` and `provider_arg_name` already
+    // discriminate the two argument shapes by the argument's own class, so one
+    // body serves both.
+    for desc in [
+        "(Ljava/lang/String;Ljava/lang/String;)Ljavax/crypto/Mac;",
+        "(Ljava/lang/String;Ljava/security/Provider;)Ljavax/crypto/Mac;",
+    ] {
     r.register(
         mac,
         "getInstance",
-        "(Ljava/lang/String;Ljava/lang/String;)Ljavax/crypto/Mac;",
+        desc,
         |ctx, args| {
             // State lives off-object in mac_state_table, keyed by identity hash
             // (bug-26 L3).
@@ -545,6 +571,8 @@ pub(crate) fn register_p68_crypto_mac(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(Some(obj))))
         },
     );
+    }
+
     r.register(mac, "init", "(Ljava/security/Key;)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
         if let Some(spi) = mac_delegate_spi(ctx, this) {
@@ -925,6 +953,25 @@ pub(crate) fn register_p68_crypto_mac(r: &mut NativeMethodRegistry) {
         "(Ljava/security/Key;Ljava/security/spec/AlgorithmParameterSpec;)V",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
+            // Its one-argument sibling routes a provider-delegated Mac to the
+            // SPI; this overload did not, so a BouncyCastle `Mac` initialised
+            // with a parameter spec never had `engineInit` called at all. The
+            // symptom is downstream and names the wrong layer: BC's own
+            // lightweight engine reports `IllegalStateException: DESede engine
+            // not initialised` / `GCM cipher needs to be initialised` /
+            // `CCM cipher unitialized` at the first `update`, which reads as a
+            // BouncyCastle bug rather than a dropped `init`. bc-java's whole
+            // `NewAuthenticatedDataTest` family failed that way.
+            if let Some(spi) = mac_delegate_spi(ctx, this) {
+                let key = args.get(1).copied().unwrap_or(Value::Object(None));
+                let spec = args.get(2).copied().unwrap_or(Value::Object(None));
+                return ctx.invoke_virtual(
+                    spi,
+                    "engineInit",
+                    "(Ljava/security/Key;Ljava/security/spec/AlgorithmParameterSpec;)V",
+                    &[key, spec],
+                );
+            }
             let key_bytes = match args.get(1) {
                 Some(Value::Object(Some(k))) => mac_extract_key_bytes(ctx, *k),
                 _ => Vec::new(),
@@ -2970,10 +3017,13 @@ pub(crate) fn kmf_keystore_id_by_identity(
 /// two independent id spaces sharing one integer slot is the exact shape that
 /// produced the `KEY_VALUES_MISMATCH` family this page's section A was about —
 /// right only while the two counters happened to be aligned.
-fn kmf_live_km_id_by_identity() -> &'static parking_lot::Mutex<rustc_hash::FxHashMap<i32, i32>> {
-    static T: std::sync::OnceLock<parking_lot::Mutex<rustc_hash::FxHashMap<i32, i32>>> =
+/// ARCH-2026-08-04 A6 — `LockLevel::Scratch` (L0) — two sites: a one-statement
+/// `insert` at `init` time, and the `getKeyManagers` read, now bound in a block
+/// so its guard drops before the arm that walks the object through `ctx`.
+fn kmf_live_km_id_by_identity() -> &'static cratonvm_types::lock_order::OrderedPlMutex<rustc_hash::FxHashMap<i32, i32>> {
+    static T: std::sync::OnceLock<cratonvm_types::lock_order::OrderedPlMutex<rustc_hash::FxHashMap<i32, i32>>> =
         std::sync::OnceLock::new();
-    T.get_or_init(|| parking_lot::Mutex::new(rustc_hash::FxHashMap::default()))
+    T.get_or_init(|| cratonvm_types::lock_order::OrderedPlMutex::new(rustc_hash::FxHashMap::default(), cratonvm_types::lock_order::LockLevel::Scratch))
 }
 
 /// FIX (tomcat-clientauth-engine-config): same pattern as
@@ -6509,7 +6559,13 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
                 let km = try_alloc_concurrent_synthetic(ctx, mirror, 2)?;
                 crate::x509_manager::set_km_id(ctx, km, km_id);
                 km
-            } else if let Some(km_id) = kmf_live_km_id_by_identity().lock().get(&ih).copied() {
+            } else if let Some(km_id) = {
+                // Bound in a block so the guard drops before the arm's body,
+                // which reads fields through `ctx` — a re-entry into the VM
+                // this table's `LockLevel` promises never happens under it.
+                let live = kmf_live_km_id_by_identity().lock().get(&ih).copied();
+                live
+            } {
                 // A caller's own `KeyStore`, already enumerated at `init` time.
                 // Same mirror class and the same `km_registry` id space as the
                 // branch above, so `getCertificateChain`/`getPrivateKey` are the

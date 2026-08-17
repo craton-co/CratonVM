@@ -20041,6 +20041,54 @@ const AFC_FIELD_PATH: usize = 1;
 const AFC_FIELD_OPEN: usize = 2;
 const AFC_NUM_FIELDS: usize = 3;
 
+/// Opt-in `AsynchronousFileChannel` tracing (`CRATONVM_DBG_AIO=1`), added
+/// 2026-08-16 for the hibernate-reactive `WrongCredentialsTest` investigation.
+///
+/// The Windows Docker transport (`docker-java`'s `NamedPipeSocket`) drives
+/// `\.\pipe\docker_engine` entirely through this family, so a hang there is
+/// only legible if each line carries the HANDLE ID next to the path — the
+/// previous round of tracing could not tell whether two Java channel objects
+/// were two pipes or one, which is exactly the question a shared-handle
+/// defect turns on. Every line therefore leads with `id=`.
+fn afc_trace_enabled() -> bool {
+    io_flags().dbg_aio
+}
+
+macro_rules! afc_trace {
+    ($($arg:tt)*) => {
+        if afc_trace_enabled() {
+            // Millisecond stamp: the one question this family keeps asking is
+            // "how long did that take", and a bare line cannot answer it. The
+            // 2026-08-16 asynchronous-submit experiment turned on exactly this
+            // reading -- `close` entered and `close ... cancelled-pending-io`
+            // 58.5 s later.
+            eprintln!(
+                "[dbg-afc {}] {}",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() % 1_000_000)
+                    .unwrap_or(0),
+                format!($($arg)*)
+            );
+        }
+    };
+}
+
+/// First `n` bytes of a payload rendered so a chunked-HTTP frame is readable
+/// at a glance: printable ASCII verbatim, everything else as `\xNN`.
+fn afc_preview(buf: &[u8], n: usize) -> String {
+    let mut out = String::new();
+    for &b in buf.iter().take(n) {
+        match b {
+            b'\r' => out.push_str("\\r"),
+            b'\n' => out.push_str("\\n"),
+            0x20..=0x7e => out.push(b as char),
+            _ => out.push_str(&format!("\\x{b:02x}")),
+        }
+    }
+    out
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum AfcSyncMode {
     None,
@@ -20073,15 +20121,47 @@ impl Default for AfcOpenOptions {
     }
 }
 
+/// An open `AsynchronousFileChannel` handle.
+///
+/// IMMUTABLE after construction, and deliberately NOT behind a `Mutex`.
+///
+/// It used to be `Arc<Mutex<..>>`, with every read/write taking the mutex for
+/// the whole of a genuinely blocking OS call because the emulation needed
+/// `&mut File` to `seek` / `read` / `seek` back. On a regular file that is
+/// merely slow; on a Windows named PIPE it is the
+/// `WrongCredentialsTest`/Testcontainers hang (2026-08-16). `docker-java`'s
+/// `NamedPipeSocket` drives `\\.\pipe\docker_engine` through this family, and
+/// Testcontainers follows a container's log with `follow=true`. When the
+/// container goes quiet the follow read parks in `ReadFile` — correctly, there
+/// are no bytes — and the wait strategy, having already matched, calls
+/// `close()` on the stream. `close()` then had to take the SAME mutex, so it
+/// waited for bytes that would not arrive; and because it took the handle
+/// table's global lock in the same statement (`if let Some(e) =
+/// afc_files().lock().remove(&id)` keeps that guard alive for the whole `if
+/// let` under edition 2021), EVERY `AsynchronousFileChannel` operation in the
+/// process froze with it. Measured: Ryuk's log went quiet at 03:06:39, close
+/// blocked, the next `open` did not run until 03:07:39 when Ryuk finally
+/// printed again — a 60 s freeze that Testcontainers reports as
+/// "Container ... started in PT1M0.99S" and then "Could not connect to Ryuk".
+///
+/// The fix is to stop needing the lock at all: `read(dst, position, ..)` is a
+/// POSITIONAL read by definition, and both platforms expose that as a `&self`
+/// call (`FileExt::seek_read`/`seek_write` on Windows, `read_at`/`write_at` on
+/// Unix). That is also strictly more correct than the old emulation, which
+/// mutated a shared file pointer and restored it afterwards.
 struct AfcFileHandle {
     file: fs::File,
     readable: bool,
     writable: bool,
     sync: AfcSyncMode,
     delete_on_close: Option<PathBuf>,
+    /// Set by `close()`. An operation already parked in the OS when the
+    /// channel is closed must report `AsynchronousCloseException` rather than
+    /// a torn count, per `AsynchronousChannel`'s contract.
+    closed: AtomicBool,
 }
 
-type AfcFileEntry = Arc<Mutex<AfcFileHandle>>;
+type AfcFileEntry = Arc<AfcFileHandle>;
 
 fn afc_files() -> &'static Mutex<HashMap<u32, AfcFileEntry>> {
     static FILES: OnceLock<Mutex<HashMap<u32, AfcFileEntry>>> = OnceLock::new();
@@ -20102,7 +20182,7 @@ fn afc_next_file_id() -> io::Result<u32> {
 
 fn afc_insert_file(handle: AfcFileHandle) -> io::Result<u32> {
     let id = afc_next_file_id()?;
-    afc_files().lock().insert(id, Arc::new(Mutex::new(handle)));
+    afc_files().lock().insert(id, Arc::new(handle));
     Ok(id)
 }
 
@@ -20115,13 +20195,52 @@ fn afc_file_entry(id: u32) -> io::Result<AfcFileEntry> {
     })
 }
 
+/// Ask the OS to abandon any I/O already parked on `file`.
+///
+/// Windows only, and the reason `close()` is prompt rather than merely
+/// non-blocking: `CancelIoEx` with a null OVERLAPPED cancels every outstanding
+/// request on the handle **regardless of the thread that issued it**, which
+/// includes a synchronous `ReadFile` parked on an idle pipe. Verified against
+/// `\\.\pipe\docker_engine`: the parked read returns
+/// `ERROR_OPERATION_ABORTED` (995) within a millisecond of the call.
+///
+/// The caller still holds an `Arc` to the handle and the parked reader holds
+/// one too, so the handle cannot have been closed underneath this call.
+/// A failure is ignored: "nothing was pending" is the common case and is not
+/// an error condition.
+#[cfg(windows)]
+fn afc_cancel_pending_io(file: &fs::File) {
+    use std::os::windows::io::AsRawHandle;
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn CancelIoEx(handle: *mut std::ffi::c_void, overlapped: *mut std::ffi::c_void) -> i32;
+    }
+    // SAFETY: `file` is a live open handle for the duration of this call.
+    unsafe {
+        CancelIoEx(file.as_raw_handle().cast(), std::ptr::null_mut());
+    }
+}
+
+/// Unix has no portable equivalent, and does not need one here: this family is
+/// only reached for regular files there (the Docker transport uses a Unix
+/// domain socket, which goes through `uds.rs`), and a regular-file read never
+/// parks indefinitely.
+#[cfg(not(windows))]
+fn afc_cancel_pending_io(_file: &fs::File) {}
+
 fn afc_remove_file(id: u32) {
-    if let Some(entry) = afc_files().lock().remove(&id) {
-        let delete_on_close = entry.lock().delete_on_close.clone();
-        drop(entry);
-        if let Some(path) = delete_on_close {
-            let _ = fs::remove_file(path);
-        }
+    // Take the entry out and RELEASE the table lock before touching anything
+    // that can block. Folding these two into one `if let` is what froze every
+    // channel in the process behind one parked pipe read; see `AfcFileHandle`.
+    let entry = afc_files().lock().remove(&id);
+    let Some(entry) = entry else { return };
+    entry.closed.store(true, Ordering::SeqCst);
+    afc_cancel_pending_io(&entry.file);
+    afc_trace!("close  id={id} cancelled-pending-io");
+    let delete_on_close = entry.delete_on_close.clone();
+    drop(entry);
+    if let Some(path) = delete_on_close {
+        let _ = fs::remove_file(path);
     }
 }
 
@@ -20340,68 +20459,130 @@ fn afc_open_file(path: &str, opts: AfcOpenOptions) -> io::Result<u32> {
     }
 
     let file = open.open(path)?;
-    afc_insert_file(AfcFileHandle {
+    let id = afc_insert_file(AfcFileHandle {
         file,
         readable: opts.read,
         writable: opts.write,
         sync: opts.sync,
         delete_on_close: opts.delete_on_close.then(|| PathBuf::from(path)),
-    })
+        closed: AtomicBool::new(false),
+    })?;
+    afc_trace!(
+        "open   id={id} read={} write={} path={path}",
+        opts.read,
+        opts.write
+    );
+    Ok(id)
+}
+
+/// One positional read, on `&File` — no seek, no shared file pointer, no lock.
+#[inline]
+fn afc_pread(file: &fs::File, buf: &mut [u8], position: u64) -> io::Result<usize> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::FileExt;
+        file.seek_read(buf, position)
+    }
+    #[cfg(not(windows))]
+    {
+        use std::os::unix::fs::FileExt;
+        file.read_at(buf, position)
+    }
+}
+
+/// One positional write, on `&File`. Loops like `write_all` because a
+/// positional write may be short.
+#[inline]
+fn afc_pwrite_all(file: &fs::File, data: &[u8], position: u64) -> io::Result<()> {
+    let mut off = 0usize;
+    while off < data.len() {
+        #[cfg(windows)]
+        let n = {
+            use std::os::windows::fs::FileExt;
+            file.seek_write(&data[off..], position + off as u64)?
+        };
+        #[cfg(not(windows))]
+        let n = {
+            use std::os::unix::fs::FileExt;
+            file.write_at(&data[off..], position + off as u64)?
+        };
+        if n == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::WriteZero,
+                "asynchronous positional write made no progress",
+            ));
+        }
+        off += n;
+    }
+    Ok(())
+}
+
+/// `ERROR_OPERATION_ABORTED` — what a parked read returns once `close()` has
+/// called `CancelIoEx` on the handle. Reported as `AsynchronousCloseException`
+/// by the callers, which is the contract.
+#[cfg(windows)]
+const AFC_ERROR_OPERATION_ABORTED: i32 = 995;
+
+/// Was this the OS telling us `close()` cancelled the operation?
+fn afc_is_cancelled_error(e: &io::Error) -> bool {
+    #[cfg(windows)]
+    {
+        e.raw_os_error() == Some(AFC_ERROR_OPERATION_ABORTED)
+    }
+    #[cfg(not(windows))]
+    {
+        matches!(e.kind(), io::ErrorKind::Interrupted)
+    }
 }
 
 fn afc_read_at(id: u32, buf: &mut [u8], position: u64) -> io::Result<usize> {
     let entry = afc_file_entry(id)?;
-    let mut handle = entry.lock();
-    if !handle.readable {
+    if !entry.readable {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             "channel was not opened for reading",
         ));
     }
-    let saved = handle.file.stream_position()?;
-    handle.file.seek(SeekFrom::Start(position))?;
-    let read_result = handle.file.read(buf);
-    let restore_result = handle.file.seek(SeekFrom::Start(saved));
-    match (read_result, restore_result) {
-        (Err(e), _) => Err(e),
-        (Ok(_), Err(e)) => Err(e),
-        (Ok(n), Ok(_)) => Ok(n),
-    }
+    afc_trace!("os-read  id={id} pos={position} want={} ENTER", buf.len());
+    let read_result = afc_pread(&entry.file, buf, position);
+    afc_trace!("os-read  id={id} pos={position} -> {:?}", read_result);
+    read_result
 }
 
 fn afc_write_at(id: u32, data: &[u8], position: u64) -> io::Result<usize> {
     let entry = afc_file_entry(id)?;
-    let mut handle = entry.lock();
-    if !handle.writable {
+    if !entry.writable {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             "channel was not opened for writing",
         ));
     }
-    let saved = handle.file.stream_position()?;
-    handle.file.seek(SeekFrom::Start(position))?;
-    let write_result = handle.file.write_all(data).and_then(|_| match handle.sync {
-        AfcSyncMode::None => Ok(()),
-        AfcSyncMode::Data => handle.file.sync_data(),
-        AfcSyncMode::All => handle.file.sync_all(),
-    });
-    let restore_result = handle.file.seek(SeekFrom::Start(saved));
-    match (write_result, restore_result) {
-        (Err(e), _) => Err(e),
-        (Ok(_), Err(e)) => Err(e),
-        (Ok(_), Ok(_)) => Ok(data.len()),
+    afc_pwrite_all(&entry.file, data, position)?;
+    match entry.sync {
+        AfcSyncMode::None => {}
+        AfcSyncMode::Data => entry.file.sync_data()?,
+        AfcSyncMode::All => entry.file.sync_all()?,
+    }
+    Ok(data.len())
+}
+
+/// Did `close()` run while an operation was parked in the OS?
+fn afc_handle_closed(id: u32) -> bool {
+    match afc_file_entry(id) {
+        Ok(entry) => entry.closed.load(Ordering::SeqCst),
+        // Gone from the table at all means closed.
+        Err(_) => true,
     }
 }
 
 fn afc_file_size(id: u32) -> io::Result<u64> {
     let entry = afc_file_entry(id)?;
-    let handle = entry.lock();
-    Ok(handle.file.metadata()?.len())
+    Ok(entry.file.metadata()?.len())
 }
 
 fn afc_file_writable(id: u32) -> bool {
     match afc_file_entry(id) {
-        Ok(entry) => entry.lock().writable,
+        Ok(entry) => entry.writable,
         Err(_) => false,
     }
 }
@@ -20411,10 +20592,9 @@ fn afc_file_writable(id: u32) -> bool {
 /// current file size, only ever shrinks.
 fn afc_truncate_at(id: u32, new_len: u64) -> io::Result<()> {
     let entry = afc_file_entry(id)?;
-    let handle = entry.lock();
-    let cur_len = handle.file.metadata()?.len();
+    let cur_len = entry.file.metadata()?.len();
     if new_len < cur_len {
-        handle.file.set_len(new_len)?;
+        entry.file.set_len(new_len)?;
     }
     Ok(())
 }
@@ -20445,8 +20625,11 @@ fn afc_truncate_at(id: u32, new_len: u64) -> io::Result<()> {
 /// descriptor succeeds as a no-op. Returning an `Err` here would invent an
 /// `IOException` that neither platform's JDK raises.
 pub fn afc_sync_at(id: u32, metadata: bool) -> io::Result<()> {
-    let entry = afc_file_entry(id)?;
-    let handle = entry.lock();
+    // No `.lock()`: the 2026-08-17 dev merge took dev's `AfcFileEntry =
+    // Arc<AfcFileHandle>`, which dropped the per-handle `Mutex` this function
+    // was written against. `sync_all`/`sync_data` take `&self` and `writable` is
+    // read-only, so the handle is usable straight through the `Arc`.
+    let handle = afc_file_entry(id)?;
     if !handle.writable {
         return Ok(());
     }
@@ -21457,19 +21640,22 @@ fn afc_read_boxed(ctx: &mut dyn NativeContext, args: &[Value]) -> Result<Value, 
     let mut buf = vec![0u8; remaining];
     // STW-TAKEOVER guard (same class of bug as the documented
     // AsynchronousSocketChannel.read/write fix elsewhere in this file):
-    // afc_read_at parks on a real Mutex::lock() around genuinely blocking
-    // disk I/O. Under testConcurrent's tight two-thread read/write loop
-    // (H2 TestFileSystem, "async:" filesystem) contention on that mutex
-    // is real, and without a GC-safepoint-cooperation bracket a
-    // concurrent STW pause waits forever for this thread to reach an
-    // interpreter safepoint it never hits while parked in the lock/I-O
-    // call -- observed as TestFileSystem hanging at the 300s harness
-    // timeout instead of completing. `bb` is used again after the call
-    // (bb_write_byte/buf_set_position below), so it must survive any GC
-    // that ran while blocked; re-derive `view` from the refreshed `bb`
-    // rather than reusing the pre-block one, in case a moving GC
-    // relocated its backing array too.
+    // `afc_read_at` performs genuinely blocking I/O, and on a pipe it can park
+    // indefinitely. Without a GC-safepoint-cooperation bracket a concurrent
+    // STW pause waits forever for this thread to reach an interpreter
+    // safepoint it never hits while parked in the OS call -- observed as
+    // TestFileSystem hanging at the 300 s harness timeout instead of
+    // completing. `bb` is used again after the call
+    // (bb_write_byte/buf_set_position below), so it must survive any GC that
+    // ran while blocked; re-derive `view` from the refreshed `bb` rather than
+    // reusing the pre-block one, in case a moving GC relocated its backing
+    // array too.
+    //
+    // 2026-08-16: the call no longer holds ANY lock while parked (see
+    // `AfcFileHandle`), so `close()` on another thread runs immediately and
+    // cancels this read rather than queueing behind it.
     let mut blocked_refs = [Value::Object(Some(bb))];
+    afc_trace!("read   id={handle_id} pos={position} bb[{pos}..{lim}] want={remaining} ENTER");
     ctx.begin_blocking_region();
     let read_result = afc_read_at(handle_id, &mut buf, position);
     ctx.end_blocking_region_refs(&mut blocked_refs);
@@ -21477,11 +21663,37 @@ fn afc_read_boxed(ctx: &mut dyn NativeContext, args: &[Value]) -> Result<Value, 
         Value::Object(Some(o)) => o,
         _ => bb,
     };
-    let n = read_result.map_err(|e| RuntimeError::IOException {
-        message: format!("async read: {e}"),
-    })?;
+    let n = match read_result {
+        Ok(n) => n,
+        // `close()` cancelled us. That is not an I/O failure, it is the
+        // documented completion for an outstanding operation on a closed
+        // asynchronous channel.
+        Err(ref e) if afc_is_cancelled_error(e) || afc_handle_closed(handle_id) => {
+            afc_trace!("read   id={handle_id} pos={position} CANCELLED by close");
+            return Err(afc_raise_async_close(ctx));
+        }
+        Err(e) => {
+            return Err(RuntimeError::IOException {
+                message: format!("async read: {e}"),
+            }
+            .into())
+        }
+    };
+    if afc_handle_closed(handle_id) {
+        afc_trace!("read   id={handle_id} pos={position} CLOSED after {n} bytes");
+        return Err(afc_raise_async_close(ctx));
+    }
 
     if n == 0 {
+        afc_trace!("read   id={handle_id} pos={position} want={remaining} EOF -> -1");
+        // The dev side of this 2026-08-17 merge conflict wrapped the EOF
+        // result in `wrap_completed_future` here. That belongs to the native
+        // ENTRY POINT, not to this helper: `afc_read_boxed` hands back the boxed
+        // `Integer` and its caller wraps once. Wrapping here wrapped twice, and
+        // `RJdkAsyncChannel` caught it as
+        // `ClassCastException: CompletableFuture cannot be cast to Integer` at
+        // `checkCompletedFuture`. Every other exit point of this function returns
+        // `afc_box_integer(..)` unwrapped, which is the tell.
         return afc_box_integer(ctx, -1);
     }
 
@@ -21490,6 +21702,28 @@ fn afc_read_boxed(ctx: &mut dyn NativeContext, args: &[Value]) -> Result<Value, 
         bb_write_byte(ctx, view, pos as usize + i, b)?;
     }
     buf_set_position(ctx, bb, pos + n as i32);
+    if afc_trace_enabled() {
+        // Report what the OS handed over AND what actually landed in the Java
+        // buffer. The two can differ (a short write-back, a stale view, a
+        // relocated backing array) and only the second is what the client
+        // parses -- reading the bytes back out of `bb` is the one instrument
+        // that can tell those apart.
+        let mut back = vec![0u8; n];
+        let delivered = bb_read_bytes(ctx, view, pos as usize, &mut back).is_ok();
+        let matched = delivered && back[..] == buf[..n];
+        afc_trace!(
+            "read   id={handle_id} pos={position} want={remaining} got={n}              bbpos={} delivered_ok={matched} :: {}",
+            pos + n as i32,
+            afc_preview(&buf[..n], 96)
+        );
+        if !matched {
+            afc_trace!(
+                "read   id={handle_id} MISMATCH os={} bb={}",
+                afc_preview(&buf[..n], 96),
+                afc_preview(&back, 96)
+            );
+        }
+    }
     // BUG (async read/write Future path, found via H2
     // TestFileSystem.testConcurrent against the "async:" filesystem):
     // this used to pass a bare Value::Int straight into
@@ -21559,6 +21793,10 @@ fn afc_write_boxed(ctx: &mut dyn NativeContext, args: &[Value]) -> Result<Value,
     // only `bb` needs to survive the blocking window (buf_set_position
     // below touches it again).
     let mut blocked_refs = [Value::Object(Some(bb))];
+    afc_trace!(
+        "write  id={handle_id} pos={position} n={remaining} :: {}",
+        afc_preview(&data, 160)
+    );
     ctx.begin_blocking_region();
     let write_result = afc_write_at(handle_id, &data, position);
     ctx.end_blocking_region_refs(&mut blocked_refs);
@@ -21566,15 +21804,52 @@ fn afc_write_boxed(ctx: &mut dyn NativeContext, args: &[Value]) -> Result<Value,
         Value::Object(Some(o)) => o,
         _ => bb,
     };
-    let n = write_result.map_err(|e| RuntimeError::IOException {
-        message: format!("async write: {e}"),
-    })?;
+    let n = match write_result {
+        Ok(n) => n,
+        // See the matching arm in `native_afc_read`.
+        Err(ref e) if afc_is_cancelled_error(e) || afc_handle_closed(handle_id) => {
+            afc_trace!("write  id={handle_id} pos={position} CANCELLED by close");
+            return Err(afc_raise_async_close(ctx));
+        }
+        Err(e) => {
+            return Err(RuntimeError::IOException {
+                message: format!("async write: {e}"),
+            }
+            .into())
+        }
+    };
 
     buf_set_position(ctx, bb, pos + n as i32);
     // See afc_read_boxed above for the full rationale: box before
     // wrapping, matching the CompletionHandler overloads' afc_box_integer
     // usage, so Future<Integer>.get()'s checkcast Integer succeeds.
     afc_box_integer(ctx, n as i32)
+}
+
+/// Raise `java.nio.channels.AsynchronousCloseException`.
+///
+/// `AsynchronousChannel`'s contract: closing a channel causes every
+/// outstanding operation on it to complete with this exception. Before the
+/// 2026-08-16 fix nothing could reach this state — `close()` could not run
+/// until the parked operation finished, which is the whole defect.
+///
+/// The concrete type is load-bearing, not decoration -- a caller catching
+/// `AsynchronousCloseException` (or its `ClosedChannelException` supertype)
+/// walks straight past a bare `IOException` whose message merely mentions the
+/// name. Same idiom, and the same reasoning, as `pipe::async_close_error`.
+fn afc_raise_async_close(ctx: &mut dyn NativeContext) -> MethodCallFailed {
+    match ctx.new_object_initialized("java/nio/channels/AsynchronousCloseException", "()V", &[]) {
+        Ok(Some(Value::Object(Some(exc)))) => {
+            let pin = ctx.pin_native_root(exc);
+            let exc = ctx.read_native_pin(pin, exc);
+            ctx.unpin_native_roots(pin);
+            MethodCallFailed::ExceptionThrown(exc)
+        }
+        _ => RuntimeError::IOException {
+            message: "channel closed while an asynchronous operation was pending".into(),
+        }
+        .into(),
+    }
 }
 
 fn afc_box_integer(ctx: &mut dyn NativeContext, n: i32) -> Result<Value, MethodCallFailed> {
@@ -21704,6 +21979,7 @@ pub(crate) fn native_afc_close(ctx: &mut dyn NativeContext, args: &[Value]) -> M
             Value::Int(v) if v > 0 => v as u32,
             _ => 0,
         };
+        afc_trace!("close  id={handle_id}");
         afc_remove_file(handle_id);
         ctx.set_field(this, AFC_FIELD_OPEN, Value::Int(0));
     }
@@ -23706,9 +23982,13 @@ fn native_dc_socket(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
 }
 
 fn native_dc_open(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+    // DUAL-STACK, matching `sun.nio.ch.Net.socket(family, stream=false)`: with
+    // no `ProtocolFamily` argument the JDK opens AF_INET6 with `IPV6_V6ONLY`
+    // off whenever IPv6 is available. An AF_INET channel here refused every
+    // IPv6 destination with `EAFNOSUPPORT` — see `open_udp_dual_stack_socket`.
     let fd_id = ctx
         .fd_table()
-        .open_udp(None)
+        .open_udp_dual_stack()
         .map_err(|e| RuntimeError::IOException {
             message: format!("DatagramChannel.open: {e}"),
         })?;
@@ -23721,6 +24001,37 @@ fn native_dc_open(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallRes
     dc_set_blocking(ctx, dc, true);
     set_dc_fd(ctx, dc, fd_id);
     Ok(Some(Value::Object(Some(dc))))
+}
+
+/// Turn a UDP bind failure into the exception HotSpot raises for it.
+///
+/// `java.nio.channels.DatagramChannel.bind` surfaces an unavailable address as
+/// `java.net.BindException`, and callers test for it by type — netty's
+/// `DnsNameResolverTest.testAddressAlreadyInUse` asserts
+/// `assertInstanceOf(BindException.class, cause.getCause())`. A plain
+/// `IOException` carrying the OS text satisfies nothing that looks at the
+/// type, and on Windows the text is localised on top of that.
+///
+/// Windows reports a clash two different ways depending on whether the caller
+/// asked for `SO_REUSEADDR`: `WSAEADDRINUSE` without it, `WSAEACCES` (mapped
+/// by Rust to `PermissionDenied`) with it, because the holder owns the port
+/// exclusively. Both are `BindException` on HotSpot, so both are here.
+fn dc_bind_error(addr: &str, e: std::io::Error) -> RuntimeError {
+    use std::io::ErrorKind;
+    match e.kind() {
+        ErrorKind::AddrInUse => RuntimeError::BindException {
+            message: format!("Address already in use: bind to {addr}"),
+        },
+        ErrorKind::AddrNotAvailable => RuntimeError::BindException {
+            message: format!("Cannot assign requested address: bind to {addr}"),
+        },
+        ErrorKind::PermissionDenied => RuntimeError::BindException {
+            message: format!("Permission denied: bind to {addr}"),
+        },
+        _ => RuntimeError::IOException {
+            message: format!("DatagramChannel.bind: {e}"),
+        },
+    }
 }
 
 fn native_dc_bind(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -23762,29 +24073,101 @@ fn native_dc_bind(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
     // bind succeeded, the send worked, and inbound traffic simply never
     // reached the event loop. `PcapWriteHandlerTest`'s `udpV4*` cases and
     // `io.netty.resolver.dns`'s transport are the visible half of that.
+    // A WILDCARD bind must keep the channel dual-stack. `open()` gave this
+    // channel an AF_INET6 socket with `IPV6_V6ONLY` off; rebinding it to the
+    // literal v4 wildcard would replace that with AF_INET and silently drop
+    // the second family — see `FileDescriptorTable::udp_rebind_dual_stack`.
+    // HotSpot reports `/[0:0:0:0:0:0:0:0]:port` for both `bind(null)` and
+    // `bind(new InetSocketAddress("0.0.0.0", 0))`, which is what this matches.
+    let wildcard_port = cratonvm_native_api::fd_table::wildcard_bind_port(&addr_str);
     if let Some(existing) = dc_fd(ctx, this) {
-        ctx.fd_table()
-            .udp_rebind(existing, Some(&addr_str), reuse)
-            .map_err(|e| RuntimeError::IOException {
-                message: format!("DatagramChannel.bind: {e}"),
-            })?;
+        let rebound = match wildcard_port {
+            Some(port) => ctx.fd_table().udp_rebind_dual_stack(existing, port, reuse),
+            None => ctx.fd_table().udp_rebind(existing, Some(&addr_str), reuse),
+        };
+        rebound.map_err(|e| dc_bind_error(&addr_str, e))?;
         if let Ok(fresh) = ctx.fd_table().udp_try_clone(existing) {
             crate::nio_selector::selector_refresh_udp(existing as i32, &fresh);
         }
         return Ok(Some(Value::Object(Some(this))));
     }
 
-    let fd_id = if reuse {
-        ctx.fd_table().open_udp_reuse(Some(&addr_str))
-    } else {
-        ctx.fd_table().open_udp(Some(&addr_str))
+    // No socket yet (a legacy channel layout). Same wildcard rule as above.
+    let fd_id = match (wildcard_port, reuse) {
+        (Some(_), false) => ctx.fd_table().open_udp_dual_stack(),
+        _ if reuse => ctx.fd_table().open_udp_reuse(Some(&addr_str)),
+        _ => ctx.fd_table().open_udp(Some(&addr_str)),
     }
-    .map_err(|e| RuntimeError::IOException {
-        message: format!("DatagramChannel.bind: {e}"),
-    })?;
+    .map_err(|e| dc_bind_error(&addr_str, e))?;
 
     set_dc_fd(ctx, this, fd_id);
     Ok(Some(Value::Object(Some(this))))
+}
+
+/// Render a real-JDK `java.net.InetAddress`'s NUMERIC address as a literal
+/// that `std::net::ToSocketAddrs` parses without consulting a resolver —
+/// dotted-quad for v4, bracketed for v6 so `format!("{host}:{port}")` stays
+/// unambiguous.
+///
+/// Returns `None` for anything that is not a real-JDK holder layout, and for
+/// an `InetSocketAddress` whose `addr` is null (an unresolved one); the caller
+/// falls back to the hostname there.
+///
+/// # Why the caller must prefer this over the hostname
+///
+/// `dc_socket_addr` used to answer `InetSocketAddressHolder.hostname` first,
+/// and `InetAddressHolder.hostName` after it, reaching the numeric `address`
+/// int only when both were absent. That handed a NAME to
+/// `UdpSocket::bind`/`send_to`, which resolves it again through the platform
+/// resolver — a second, independent answer to a question Java had already
+/// answered.
+///
+/// The two resolvers disagree on `localhost`. Windows `getaddrinfo` orders
+/// `::1` first; glibc, with the stock `127.0.0.1 localhost` line ahead of
+/// `::1 localhost` in `/etc/hosts`, orders `127.0.0.1` first. So
+/// `DatagramChannel.bind(new InetSocketAddress("localhost", 0))` — whose
+/// `InetSocketAddress` already holds a resolved `127.0.0.1` — bound `::1` on
+/// Windows and `127.0.0.1` on Linux, from identical bytes. HotSpot never has
+/// this divergence: `sun.nio.ch.Net.bind` takes `isa.getAddress()` and never
+/// looks at the name.
+///
+/// Downstream that produced a destination address no test constructs.
+/// Apache MINA's `NioDatagramAcceptor.localAddress()` rewrites any bound
+/// `Inet6Address` for which `isIPv4CompatibleAddress()` holds into the v4
+/// address in its last four bytes ("Ugly hack to workaround a problem on
+/// linux", per its own comment). `::1` satisfies that predicate, and its last
+/// four bytes are `[0, 0, 0, 1]` — so netty's `TestDnsServer.localAddress()`
+/// answered `0.0.0.1`, every `DnsNameResolver` query went to `0.0.0.1`, and
+/// Windows failed each one with `WSAENETUNREACH`.
+fn inet_addr_literal(ctx: &dyn NativeContext, inet_addr: ObjectRef) -> Option<String> {
+    // IPv6 FIRST. `Inet6Address` keeps its sixteen bytes in a separate
+    // `holder6` (`Inet6Address$Inet6AddressHolder.ipaddress`), and the base
+    // holder's `address` int stays 0 for it — reading that would render every
+    // v6 address as `0.0.0.0`, which binds the v4 wildcard.
+    if let Value::Object(Some(h6)) = ctx.get_field_by_name(inet_addr, "holder6") {
+        if let Value::Object(Some(arr)) = ctx.get_field_by_name(h6, "ipaddress") {
+            if ctx.array_length(arr) == 16 {
+                let mut octets = [0u8; 16];
+                for (i, slot) in octets.iter_mut().enumerate() {
+                    match ctx.get_array_element(arr, i) {
+                        Value::Int(b) => *slot = b as u8,
+                        _ => return None,
+                    }
+                }
+                // Bracketed: the caller appends `:{port}`, and a bare v6
+                // literal there is ambiguous to every parser that sees it.
+                return Some(format!("[{}]", std::net::Ipv6Addr::from(octets)));
+            }
+        }
+    }
+    let inet_holder = match ctx.get_field_by_name(inet_addr, "holder") {
+        Value::Object(Some(h)) => h,
+        _ => return None,
+    };
+    match ctx.get_field_by_name(inet_holder, "address") {
+        Value::Int(address) => Some(std::net::Ipv4Addr::from((address as u32).to_be_bytes()).to_string()),
+        _ => None,
+    }
 }
 
 /// Extract a printable host:port from both the real JDK 25 holder layout and
@@ -23795,30 +24178,25 @@ fn dc_socket_addr(ctx: &dyn NativeContext, addr: ObjectRef) -> Option<String> {
             Value::Int(port) if (0..=65_535).contains(&port) => port,
             _ => return None,
         };
+        // The RESOLVED address wins over the hostname, and this ordering is
+        // load-bearing — see [`inet_addr_literal`]. Java has already resolved
+        // the name; handing the name back to the OS asks a SECOND resolver the
+        // same question and takes whichever answer it happens to order first.
+        if let Value::Object(Some(inet_addr)) = ctx.get_field_by_name(holder, "addr") {
+            if let Some(host) = inet_addr_literal(ctx, inet_addr) {
+                return Some(format!("{host}:{port}"));
+            }
+        }
+        // Only an UNRESOLVED `InetSocketAddress` (`createUnresolved`, or a
+        // constructor whose lookup failed) reaches here with a name and no
+        // address; the name is then all there is, and the OS resolver is the
+        // right place to send it.
         let hostname = match ctx.get_field_by_name(holder, "hostname") {
             Value::Object(Some(hostname)) => ctx.read_string(hostname).unwrap_or_default(),
             _ => String::new(),
         };
         if !hostname.is_empty() {
             return Some(format!("{hostname}:{port}"));
-        }
-        if let Value::Object(Some(inet_addr)) = ctx.get_field_by_name(holder, "addr") {
-            if let Value::Object(Some(inet_holder)) = ctx.get_field_by_name(inet_addr, "holder") {
-                if let Value::Object(Some(host_name)) =
-                    ctx.get_field_by_name(inet_holder, "hostName")
-                {
-                    if let Some(host_name) = ctx.read_string(host_name) {
-                        if !host_name.is_empty() {
-                            return Some(format!("{host_name}:{port}"));
-                        }
-                    }
-                }
-                if let Value::Int(address) = ctx.get_field_by_name(inet_holder, "address") {
-                    let octets = (address as u32).to_be_bytes();
-                    let host = std::net::Ipv4Addr::from(octets);
-                    return Some(format!("{host}:{port}"));
-                }
-            }
         }
         return None;
     }

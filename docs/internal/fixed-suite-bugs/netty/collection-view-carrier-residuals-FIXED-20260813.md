@@ -238,4 +238,4 @@ Not a throughput item, and it stayed that way. The per-call cost this family
 used to carry was closed with the values-view carrier; what remains is dispatch
 and heap-access cost that no collection change reaches. Anyone arriving here
 from a slow collection-heavy class wants
-[the VM-wide per-call page](../../performance/vm-per-call-dispatch-cost-RETIRED-20260813.md).
+the VM-wide per-call page.

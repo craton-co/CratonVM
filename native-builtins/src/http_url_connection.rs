@@ -196,9 +196,14 @@ struct HttpsPeerInfo {
 /// `RealReq` table above documents: a real-JDK
 /// `sun.net.www.protocol.https.HttpsURLConnectionImpl` carries the JDK's own
 /// instance layout, and writing a synthetic slot into it corrupts a real field.
-fn https_peer_info() -> &'static Mutex<HashMap<u64, HttpsPeerInfo>> {
-    static R: OnceLock<Mutex<HashMap<u64, HttpsPeerInfo>>> = OnceLock::new();
-    R.get_or_init(|| Mutex::new(HashMap::new()))
+/// ARCH-2026-08-04 A6 — `LockLevel::Scratch` (L0), after the three sites that
+/// evaluated `ctx.identity_hash_code` inside the lock expression (or held the
+/// guard across `throw_jca_exc`) were restructured to compute the key, or clone
+/// the row out, first. The fourth site already did: a `get(..).map(..)` whose
+/// result is matched after the guard has dropped.
+fn https_peer_info() -> &'static cratonvm_types::lock_order::OrderedMutex<HashMap<u64, HttpsPeerInfo>> {
+    static R: OnceLock<cratonvm_types::lock_order::OrderedMutex<HashMap<u64, HttpsPeerInfo>>> = OnceLock::new();
+    R.get_or_init(|| cratonvm_types::lock_order::OrderedMutex::new(HashMap::new(), cratonvm_types::lock_order::LockLevel::Scratch))
 }
 
 fn record_https_peer_info(
@@ -211,8 +216,11 @@ fn record_https_peer_info(
     if chain_der.is_empty() {
         return;
     }
+    // Key before the guard: `ctx.identity_hash_code` is a re-entry into the
+    // VM, and this table's `LockLevel` claims it is never held across one.
+    let key = ctx.identity_hash_code(conn) as u32 as u64;
     https_peer_info().lock().unwrap().insert(
-        ctx.identity_hash_code(conn) as u32 as u64,
+        key,
         HttpsPeerInfo {
             chain_der: chain_der.to_vec(),
             cipher: cipher.to_string(),
@@ -384,11 +392,9 @@ fn https_recycle_carrier_by_key(
 /// next accessor call, repopulate the table, and answer as if the connection
 /// had never been torn down.
 fn https_ensure_exchanged(ctx: &mut dyn NativeContext, this: ObjectRef) {
-    if https_peer_info()
-        .lock()
-        .unwrap()
-        .contains_key(&(ctx.identity_hash_code(this) as u32 as u64))
-    {
+    // Key before the guard — see `record_https_peer_info`.
+    let key = ctx.identity_hash_code(this) as u32 as u64;
+    if https_peer_info().lock().unwrap().contains_key(&key) {
         return;
     }
     if let Some(url_str) = huc_real_object_url(ctx, this) {

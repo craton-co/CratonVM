@@ -373,11 +373,14 @@ fn ctx_obj_key(ctx: &mut dyn NativeContext, obj: ObjectRef) -> Result<u64, Metho
 ///
 /// Plain `Arc`s, no heap `ObjectRef`s — nothing for the GC to scan.
 #[allow(clippy::type_complexity)]
+/// ARCH-2026-08-04 A6 — `LockLevel::Scratch` (L0) — one acquisition site
+/// (`ctx_client_session_store`), an `entry(key).or_insert_with(..)` whose
+/// closure builds a rustls store and touches no `ctx`.
 fn ctx_client_session_store_table(
-) -> &'static Mutex<HashMap<u64, Arc<dyn rustls::client::ClientSessionStore>>> {
-    static T: OnceLock<Mutex<HashMap<u64, Arc<dyn rustls::client::ClientSessionStore>>>> =
+) -> &'static cratonvm_types::lock_order::OrderedPlMutex<HashMap<u64, Arc<dyn rustls::client::ClientSessionStore>>> {
+    static T: OnceLock<cratonvm_types::lock_order::OrderedPlMutex<HashMap<u64, Arc<dyn rustls::client::ClientSessionStore>>>> =
         OnceLock::new();
-    T.get_or_init(|| Mutex::new(HashMap::new()))
+    T.get_or_init(|| cratonvm_types::lock_order::OrderedPlMutex::new(HashMap::new(), cratonvm_types::lock_order::LockLevel::Scratch))
 }
 
 /// Built `ClientConfig`s, keyed by `(SSLContext key, engine shape)`.
@@ -398,9 +401,12 @@ fn ctx_client_session_store_table(
 ///
 /// Plain `Arc`s, no heap `ObjectRef`s — nothing for the GC to scan.
 #[allow(clippy::type_complexity)]
-fn ctx_client_config_table() -> &'static Mutex<HashMap<(u64, String), Arc<ClientConfig>>> {
-    static T: OnceLock<Mutex<HashMap<(u64, String), Arc<ClientConfig>>>> = OnceLock::new();
-    T.get_or_init(|| Mutex::new(HashMap::new()))
+/// ARCH-2026-08-04 A6 — `LockLevel::Scratch` (L0) — two acquisition sites, both
+/// temporary guards over an already-built key: a `.get(..).cloned()` inside an
+/// `and_then` closure and an `entry(..).or_insert(config).clone()`.
+fn ctx_client_config_table() -> &'static cratonvm_types::lock_order::OrderedPlMutex<HashMap<(u64, String), Arc<ClientConfig>>> {
+    static T: OnceLock<cratonvm_types::lock_order::OrderedPlMutex<HashMap<(u64, String), Arc<ClientConfig>>>> = OnceLock::new();
+    T.get_or_init(|| cratonvm_types::lock_order::OrderedPlMutex::new(HashMap::new(), cratonvm_types::lock_order::LockLevel::Scratch))
 }
 
 fn ctx_client_session_store(key: u64) -> Arc<dyn rustls::client::ClientSessionStore> {
@@ -478,12 +484,14 @@ impl rustls::client::ClientSessionStore for TracingClientSessionStore {
 }
 
 #[allow(clippy::type_complexity)]
+/// ARCH-2026-08-04 A6 — `LockLevel::Scratch` (L0) — the server twin of
+/// `ctx_client_session_store_table`, same single `or_insert_with` site.
 fn ctx_server_session_store_table(
-) -> &'static Mutex<HashMap<u64, Arc<dyn rustls::server::StoresServerSessions + Send + Sync>>> {
+) -> &'static cratonvm_types::lock_order::OrderedPlMutex<HashMap<u64, Arc<dyn rustls::server::StoresServerSessions + Send + Sync>>> {
     static T: OnceLock<
-        Mutex<HashMap<u64, Arc<dyn rustls::server::StoresServerSessions + Send + Sync>>>,
+        cratonvm_types::lock_order::OrderedPlMutex<HashMap<u64, Arc<dyn rustls::server::StoresServerSessions + Send + Sync>>>,
     > = OnceLock::new();
-    T.get_or_init(|| Mutex::new(HashMap::new()))
+    T.get_or_init(|| cratonvm_types::lock_order::OrderedPlMutex::new(HashMap::new(), cratonvm_types::lock_order::LockLevel::Scratch))
 }
 
 fn ctx_server_session_store(
@@ -642,9 +650,11 @@ pub(crate) fn attach_trust_managers_to_ctx(
 ///
 /// Absent = `true`: no application manager is installed, so JSSE's own default
 /// (which this VM stands in for) is the one that identifies.
-fn ctx_jsse_identifies_table() -> &'static Mutex<HashMap<u64, bool>> {
-    static T: OnceLock<Mutex<HashMap<u64, bool>>> = OnceLock::new();
-    T.get_or_init(|| Mutex::new(HashMap::new()))
+/// ARCH-2026-08-04 A6 — `LockLevel::Scratch` (L0) — three sites, all one-statement
+/// `remove` / `insert` / `.get(&key).copied()` over a key built beforehand.
+fn ctx_jsse_identifies_table() -> &'static cratonvm_types::lock_order::OrderedPlMutex<HashMap<u64, bool>> {
+    static T: OnceLock<cratonvm_types::lock_order::OrderedPlMutex<HashMap<u64, bool>>> = OnceLock::new();
+    T.get_or_init(|| cratonvm_types::lock_order::OrderedPlMutex::new(HashMap::new(), cratonvm_types::lock_order::LockLevel::Scratch))
 }
 
 fn ctx_jsse_identifies(ctx_key: Option<u64>) -> bool {
@@ -9263,6 +9273,205 @@ mod tests {
         assert_eq!(server.negotiated_alpn.as_deref(), Some("h2"));
     }
 
+    /// A `ServerCertVerifier` that refuses every chain, the way a Java
+    /// `X509TrustManager` throwing `CertificateException` would if its verdict
+    /// reached rustls at verification time instead of after the handshake.
+    #[derive(Debug)]
+    struct AlwaysRejectVerifier {
+        algorithms: rustls::crypto::WebPkiSupportedAlgorithms,
+        /// `false` makes this the ACCEPTING control arm — the verdict the
+        /// deferred design effectively gives rustls today (it always accepts at
+        /// verification time and consults Java afterwards). The control is what
+        /// keeps the assertions below from being vacuous.
+        reject: bool,
+    }
+
+    impl rustls::client::danger::ServerCertVerifier for AlwaysRejectVerifier {
+        fn verify_server_cert(
+            &self,
+            _end_entity: &rustls::pki_types::CertificateDer<'_>,
+            _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+            _server_name: &rustls::pki_types::ServerName<'_>,
+            _ocsp: &[u8],
+            _now: rustls::pki_types::UnixTime,
+        ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+            if !self.reject {
+                return Ok(rustls::client::danger::ServerCertVerified::assertion());
+            }
+            Err(rustls::Error::InvalidCertificate(
+                rustls::CertificateError::ApplicationVerificationFailure,
+            ))
+        }
+        fn verify_tls12_signature(
+            &self,
+            message: &[u8],
+            cert: &rustls::pki_types::CertificateDer<'_>,
+            dss: &rustls::DigitallySignedStruct,
+        ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+            rustls::crypto::verify_tls12_signature_lenient(message, cert, dss, &self.algorithms)
+        }
+        fn verify_tls13_signature(
+            &self,
+            message: &[u8],
+            cert: &rustls::pki_types::CertificateDer<'_>,
+            dss: &rustls::DigitallySignedStruct,
+        ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+            rustls::crypto::verify_tls13_signature_lenient(message, cert, dss, &self.algorithms)
+        }
+        fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+            self.algorithms.supported_schemes()
+        }
+    }
+
+    /// **The destination for the deferred-trust-check refactor, proven before the
+    /// refactor.**
+    ///
+    /// `testHandshakeFailureOnlyFireExceptionOnce` (`SslHandlerTest:1546`) asserts
+    /// the SERVER's handshake future fails when the CLIENT's `TrustManager`
+    /// rejects the chain. Today it cannot: the trust check is armed by
+    /// `engine_take_pending_trust_check`, which fires only once
+    /// `!conn.is_handshaking()` -- by construction AFTER the client's `Finished`
+    /// has gone out. The server therefore completes a valid TLS 1.3 handshake,
+    /// netty runs `setHandshakeSuccess()`, and the alert arriving a moment later
+    /// cannot fail an already-completed promise.
+    ///
+    /// This asserts the property the current design cannot deliver and a
+    /// verifier-time verdict can: with the rejection raised INSIDE
+    /// `verify_server_cert`, the server receives an alert it can DECRYPT while
+    /// `is_handshaking()` is still true -- i.e. under handshake keys, not under
+    /// the application keys the cheap shortcut would need. (That shortcut was
+    /// measured and does not work: discarding rustls's queued flight before
+    /// queueing the alert desynchronises the TLS 1.3 key schedule and the server
+    /// reads `DecryptError` instead of the alert.)
+    ///
+    /// If this ever starts failing, section B of
+    /// `docs/known-issues/netty/openssl-key-material-and-engine-residuals-20260813.md`
+    /// has lost its destination and the plan needs rethinking before any more of
+    /// it is built.
+    /// Drive a client/server `EngineState` pair whose client verifier either
+    /// rejects or accepts, and report what the SERVER observed:
+    /// `(saw_error_while_handshaking, error_text, still_handshaking_at_end)`.
+    fn drive_pair_with_client_verifier(reject: bool) -> (bool, String, bool) {
+        let provider = std::sync::Arc::new(rustls::crypto::ring::default_provider());
+        let verifier: std::sync::Arc<dyn rustls::client::danger::ServerCertVerifier> =
+            std::sync::Arc::new(AlwaysRejectVerifier {
+                algorithms: provider.signature_verification_algorithms.clone(),
+                reject,
+            });
+        let mut client_config = rustls::ClientConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .dangerous()
+            .with_custom_certificate_verifier(verifier)
+            .with_no_client_auth();
+        client_config.alpn_protocols = vec![b"h2".to_vec()];
+
+        let mut client = super::EngineState::default();
+        client.is_client = true;
+        client.peer_host = Some("localhost".to_string());
+        client.alpn_protocols = vec![b"h2".to_vec()];
+        client.client_config = Some(std::sync::Arc::new(client_config));
+
+        let mut server = super::EngineState::default();
+        server.is_client = false;
+        server.alpn_protocols = vec![b"h2".to_vec()];
+        server.server_config = Some(
+            super::build_server_config_single_cert(
+                SERVER_CRT_PEM,
+                SERVER_KEY_PEM,
+                &["h2"],
+                false,
+                None,
+            )
+            .unwrap(),
+        );
+
+        super::engine_begin(&mut client).expect("client begin");
+        super::engine_begin(&mut server).expect("server begin");
+
+        // The client's rejection surfaces out of its own `unwrap` of the server
+        // flight; what matters is what the SERVER can then read.
+        let mut server_saw_alert_while_handshaking = false;
+        let mut server_error: Option<String> = None;
+        for _ in 0..32 {
+            let _ = super::engine_wrap_pump(&mut client, &[], 65536);
+            let to_server = std::mem::take(&mut client.outbound);
+            if !to_server.is_empty() {
+                let was_handshaking = server
+                    .conn
+                    .as_ref()
+                    .map(|c| c.is_handshaking())
+                    .unwrap_or(false);
+                match super::engine_unwrap_pump(&mut server, &to_server) {
+                    Ok(_) => {}
+                    Err(e) => {
+                        // The alert decrypted and rustls reported it. That is the
+                        // whole property: it arrived under handshake keys, so the
+                        // server learns of the failure before it could complete.
+                        if was_handshaking {
+                            server_saw_alert_while_handshaking = true;
+                        }
+                        server_error = Some(format!("{e:?}"));
+                        break;
+                    }
+                }
+            }
+            let _ = super::engine_wrap_pump(&mut server, &[], 65536);
+            let to_client = std::mem::take(&mut server.outbound);
+            if !to_client.is_empty() {
+                // The client's own unwrap is where its verifier runs and where it
+                // raises; that error is not what this test is about.
+                let _ = super::engine_unwrap_pump(&mut client, &to_client);
+            }
+        }
+
+        let still_handshaking = server
+            .conn
+            .as_ref()
+            .map(|c| c.is_handshaking())
+            .unwrap_or(false);
+        (
+            server_saw_alert_while_handshaking,
+            server_error.unwrap_or_default(),
+            still_handshaking,
+        )
+    }
+
+    #[test]
+    fn a_verifier_time_rejection_reaches_the_server_while_it_is_still_handshaking() {
+        // CONTROL first: the same driver with an ACCEPTING verifier -- which is
+        // what the deferred design gives rustls today -- must NOT produce any of
+        // the three signals. Without this arm the assertions below would pass on
+        // a driver that simply never completed a handshake at all.
+        let (accept_saw, accept_err, accept_handshaking) = drive_pair_with_client_verifier(false);
+        assert!(
+            !accept_saw,
+            "control: an accepted chain must not make the server see an error, got {accept_err}"
+        );
+        assert!(
+            !accept_handshaking,
+            "control: with the chain accepted the server must COMPLETE its handshake -- \
+             if it does not, the driver is broken and the reject arm proves nothing"
+        );
+
+        let (saw, err, still_handshaking) = drive_pair_with_client_verifier(true);
+        assert!(
+            saw,
+            "the server must see the client rejection while still handshaking; server_error={err}"
+        );
+        // And it must NOT be a decrypt failure: a `DecryptError` here would mean
+        // the alert went out under the wrong keys, which is exactly what the
+        // discard-the-queued-flight shortcut produced.
+        assert!(
+            !err.contains("DecryptError"),
+            "the alert must be decryptable under handshake keys, got {err}"
+        );
+        assert!(
+            still_handshaking,
+            "the server must still be handshaking, not completed"
+        );
+    }
+
     /// Drive a client/server `EngineState` pair through a complete loopback
     /// handshake (same shape as `wp51_loopback_handshake_via_engine_state`) and
     /// return them, with the client's captured peer chain populated.
@@ -13492,9 +13701,15 @@ fn peek_server_hello_session_id(buf: &[u8]) -> Option<Vec<u8>> {
 /// Holds a live `ObjectRef`, so it is scanned and remapped by
 /// `gc_scan_tls_ctx_trust_manager_roots` / `gc_update_tls_ctx_trust_manager_refs`
 /// alongside this module's other object-holding tables.
-fn engine_alpn_selector_table() -> &'static Mutex<HashMap<u64, ObjectRef>> {
-    static T: OnceLock<Mutex<HashMap<u64, ObjectRef>>> = OnceLock::new();
-    T.get_or_init(|| Mutex::new(HashMap::new()))
+/// ARCH-2026-08-04 A6 — `LockLevel::Scratch` (L0). Seven sites: four one-statement
+/// `get`/`insert`/`remove`s, the `defer_for_alpn` test (whose key is now
+/// hoisted out of the lock expression — see there), and the GC scan/remap pair,
+/// which `drop` each guard before taking the next. The GC scan runs with the
+/// heap lock (L8) held, which is legal: L0 < L8 is the descending order the
+/// wrapper asserts.
+fn engine_alpn_selector_table() -> &'static cratonvm_types::lock_order::OrderedPlMutex<HashMap<u64, ObjectRef>> {
+    static T: OnceLock<cratonvm_types::lock_order::OrderedPlMutex<HashMap<u64, ObjectRef>>> = OnceLock::new();
+    T.get_or_init(|| cratonvm_types::lock_order::OrderedPlMutex::new(HashMap::new(), cratonvm_types::lock_order::LockLevel::Scratch))
 }
 
 /// Run the installed server-side ALPN selector against the ClientHello sitting
@@ -13664,17 +13879,23 @@ fn capture_sni_matchers(ctx: &mut dyn NativeContext, engine: ObjectRef, params: 
 /// matching `ServerHandshakeContext`, which pairs each received name with the
 /// matcher registered for that name's type and ignores the rest.
 ///
+/// Answers `true` when a matcher REFUSED. The refusal is armed on the engine
+/// (a fatal `unrecognized_name` for the peer, plus
+/// `deferred_handshake_error` for this side) and deliberately NOT raised here
+/// — see the refusal arm in `do_unwrap` for why the throw has to wait for the
+/// wrap that puts the alert on the wire.
+///
 /// Runs with the engine registry lock NOT held: it calls into Java.
 fn engine_run_sni_match_check(
     ctx: &mut dyn NativeContext,
     engine_id: i32,
     engine: ObjectRef,
     host: String,
-) -> Result<(), cratonvm_types::error::MethodCallFailed> {
+) -> Result<bool, cratonvm_types::error::MethodCallFailed> {
     let key = engine_objref_key(ctx, engine);
     let matchers = match engine_sni_matchers_table().lock().get(&key).cloned() {
         Some(m) if !m.is_empty() => m,
-        _ => return Ok(()),
+        _ => return Ok(false),
     };
     let name_str = ctx.create_string(&host);
     let base = ctx.pin_native_root(name_str);
@@ -13688,7 +13909,7 @@ fn engine_run_sni_match_check(
         Ok(Some(Value::Object(Some(o)))) => o,
         _ => {
             ctx.unpin_native_roots(base);
-            return Ok(());
+            return Ok(false);
         }
     };
     let name_pin = ctx.pin_native_root(sni_name);
@@ -13724,18 +13945,36 @@ fn engine_run_sni_match_check(
     }
     ctx.unpin_native_roots(base);
     if !refused {
-        return Ok(());
+        return Ok(false);
     }
     with_engine(engine_id, |s| {
-        if let Some(c) = s.conn.as_mut() {
-            c.queue_fatal_alert(rustls::AlertDescription::UnrecognisedName);
+        match s.conn.as_mut() {
+            Some(c) => c.queue_fatal_alert(rustls::AlertDescription::UnrecognisedName),
+            // The gate runs at ClientHello time, and on a server engine that
+            // is the call BEFORE `engine_begin_or_defer` realizes the rustls
+            // connection — so `conn` is `None` here on the path that actually
+            // matters and `queue_fatal_alert` was a silent no-op. No record
+            // layer exists yet either, which is fine: a pre-keys alert goes
+            // out as TLS plaintext, and that is exactly what JSSE's own
+            // `ServerHandshakeContext` sends when it refuses a hello before a
+            // ServerHello exists. alert(21), legacy_record_version 0x0303,
+            // length 2, level fatal(2), description unrecognized_name(112).
+            None => s
+                .outbound
+                .extend_from_slice(&[21, 0x03, 0x03, 0x00, 0x02, 2, 112]),
         }
+        // Owed to THIS side, but only once the alert above has gone out — the
+        // `SniClientTest.testSniSNIMatcherDoesNotMatchClient` half of the
+        // "a wrap that raises cannot also deliver its alert" defect. Raising
+        // it from this unwrap instead left the client with a closed channel
+        // and no alert at all: `StacklessClosedChannelException` where its
+        // `assertThrows(SSLException.class, …)` wants an `SSLException`.
+        s.deferred_handshake_error = Some((
+            "javax/net/ssl/SSLHandshakeException",
+            format!("Unrecognized server name indication: {host}"),
+        ));
     });
-    Err(crate::phases_early::throw_jca_exc(
-        ctx,
-        "javax/net/ssl/SSLHandshakeException",
-        &format!("Unrecognized server name indication: {host}"),
-    ))
+    Ok(true)
 }
 
 thread_local! {
@@ -14346,9 +14585,12 @@ pub fn engine_negotiated_alpn_internal(engine_id: i32) -> Option<String> {
 /// `gc_scan_tls_ctx_trust_manager_roots` /
 /// `gc_update_tls_ctx_trust_manager_refs` alongside this module's other
 /// object-holding tables.
-fn engine_session_table() -> &'static Mutex<HashMap<(u64, bool), ObjectRef>> {
-    static T: OnceLock<Mutex<HashMap<(u64, bool), ObjectRef>>> = OnceLock::new();
-    T.get_or_init(|| Mutex::new(HashMap::new()))
+/// ARCH-2026-08-04 A6 — `LockLevel::Scratch` (L0). Five sites: an `if let` whose body
+/// is a bare `return`, two one-statement `insert`s, and the GC scan/remap pair
+/// (each `drop`s its guard before the next table's).
+fn engine_session_table() -> &'static cratonvm_types::lock_order::OrderedPlMutex<HashMap<(u64, bool), ObjectRef>> {
+    static T: OnceLock<cratonvm_types::lock_order::OrderedPlMutex<HashMap<(u64, bool), ObjectRef>>> = OnceLock::new();
+    T.get_or_init(|| cratonvm_types::lock_order::OrderedPlMutex::new(HashMap::new(), cratonvm_types::lock_order::LockLevel::Scratch))
 }
 
 /// The client-side session cache: `(SSLContext key, host, port)` → the
@@ -14372,9 +14614,13 @@ fn engine_session_table() -> &'static Mutex<HashMap<(u64, bool), ObjectRef>> {
 /// Holds live `ObjectRef`s → scanned and remapped alongside
 /// `engine_session_table` (see `gc_scan_tls_ctx_trust_manager_roots`).
 #[allow(clippy::type_complexity)]
-fn client_session_cache() -> &'static Mutex<HashMap<(u64, String, i32), ObjectRef>> {
-    static T: OnceLock<Mutex<HashMap<(u64, String, i32), ObjectRef>>> = OnceLock::new();
-    T.get_or_init(|| Mutex::new(HashMap::new()))
+/// ARCH-2026-08-04 A6 — `LockLevel::Scratch` (L0), after the resumed-session read in
+/// `engine_session_for` was bound to a local so its guard drops before the body
+/// (see there). The remaining sites are a `contains_key` inside a debug
+/// `eprintln!`, a one-statement `insert`, and the GC scan/remap pair.
+fn client_session_cache() -> &'static cratonvm_types::lock_order::OrderedPlMutex<HashMap<(u64, String, i32), ObjectRef>> {
+    static T: OnceLock<cratonvm_types::lock_order::OrderedPlMutex<HashMap<(u64, String, i32), ObjectRef>>> = OnceLock::new();
+    T.get_or_init(|| cratonvm_types::lock_order::OrderedPlMutex::new(HashMap::new(), cratonvm_types::lock_order::LockLevel::Scratch))
 }
 
 /// The cache key for a client engine, or `None` when this engine has no
@@ -14397,9 +14643,12 @@ fn client_session_cache_key(id: i32) -> Option<(u64, String, i32)> {
 /// like `session_wire_id_table` beside it; absent means "never reused", and
 /// `getLastAccessedTime` then answers the creation time, which is what JSSE
 /// reports for a session used exactly once.
-fn session_last_accessed_table() -> &'static Mutex<HashMap<u64, i64>> {
-    static T: OnceLock<Mutex<HashMap<u64, i64>>> = OnceLock::new();
-    T.get_or_init(|| Mutex::new(HashMap::new()))
+/// ARCH-2026-08-04 A6 — `LockLevel::Scratch` (L0) — two sites, both with the key
+/// computed before the guard: `touch_session_access_time`'s `insert`, and a
+/// `get(..).copied()` whose `if let` body is a bare `return`.
+fn session_last_accessed_table() -> &'static cratonvm_types::lock_order::OrderedPlMutex<HashMap<u64, i64>> {
+    static T: OnceLock<cratonvm_types::lock_order::OrderedPlMutex<HashMap<u64, i64>>> = OnceLock::new();
+    T.get_or_init(|| cratonvm_types::lock_order::OrderedPlMutex::new(HashMap::new(), cratonvm_types::lock_order::LockLevel::Scratch))
 }
 
 fn touch_session_access_time(ctx: &mut dyn NativeContext, ses: ObjectRef) {
@@ -14430,9 +14679,9 @@ fn engine_handshake_was_resumed(id: i32) -> bool {
 /// object itself has no spare slot to record it in (all eight are in use, and
 /// `javax/net/ssl/SSLSession` is a real interface with no fields of its own to
 /// widen into). Keyed by `gc_stable_objref_key` — the same GC-stable identity
-/// `getId` derives its pseudo-id bytes from.
+/// `getId` already derives its bytes from.
 ///
-/// **G7 — this set answers "is this session object COMPLETE", which is a
+/// **G7 -- this set answers "is this session object COMPLETE", which is a
 /// different question from "did this session negotiate anything", and the two
 /// doors that ask them are not the same door.** It used to be read by `getId`
 /// as a second gate on top of `session_has_negotiated`; the only state the two
@@ -14440,10 +14689,14 @@ fn engine_handshake_was_resumed(id: i32) -> bool {
 /// `getId()` a full 32 bytes. `getSessionContext()` is the door that wants this
 /// distinction: HotSpot answers `null` for a session still being negotiated and
 /// an `SSLSessionContextImpl` once its handshake completes. See both
-/// registrations, and `docs/known-issues/jdk-only/G7-1-*.md` §2/§3.
-fn negotiated_session_keys() -> &'static Mutex<std::collections::HashSet<u64>> {
-    static T: OnceLock<Mutex<std::collections::HashSet<u64>>> = OnceLock::new();
-    T.get_or_init(|| Mutex::new(std::collections::HashSet::new()))
+/// registrations, and `jdk-only/G7-1-*.md` §2/§3. Kept across the 2026-08-17
+/// dev merge, which took the `OrderedPlMutex` type from dev and this
+/// behavioural note from here.
+/// ARCH-2026-08-04 A6 — `LockLevel::Scratch` (L0) — two sites, a `contains` and an
+/// `insert`, each a single statement over a key built beforehand.
+fn negotiated_session_keys() -> &'static cratonvm_types::lock_order::OrderedPlMutex<std::collections::HashSet<u64>> {
+    static T: OnceLock<cratonvm_types::lock_order::OrderedPlMutex<std::collections::HashSet<u64>>> = OnceLock::new();
+    T.get_or_init(|| cratonvm_types::lock_order::OrderedPlMutex::new(std::collections::HashSet::new(), cratonvm_types::lock_order::LockLevel::Scratch))
 }
 
 /// Has this session object been through a COMPLETED handshake — as opposed to
@@ -14491,7 +14744,13 @@ fn engine_session_for(
             );
         }
         if engine_handshake_was_resumed(id) {
-            if let Some(prev) = client_session_cache().lock().get(ck).copied() {
+            // Bound to a local first: as an `if let` scrutinee (edition 2021)
+            // the guard would live for the whole body, which takes
+            // `engine_session_table` and re-enters the VM through
+            // `touch_session_access_time`. `ObjectRef` is `Copy`, so the read
+            // is complete once the guard drops.
+            let prev = client_session_cache().lock().get(ck).copied();
+            if let Some(prev) = prev {
                 engine_session_table().lock().insert(key, prev);
                 touch_session_access_time(ctx, prev);
                 return Ok(prev);
@@ -14609,9 +14868,11 @@ fn build_synthetic_ssl_session(ctx: &mut dyn NativeContext, id: i32) -> Result<O
     if proto == "TLSv1.2" {
         let sid = with_engine(id, |s| s.negotiated_session_id.clone()).unwrap_or_default();
         if !sid.is_empty() {
-            session_wire_id_table()
-                .lock()
-                .insert(gc_stable_objref_key(ctx, ses), sid);
+            // Key computed before the guard: `gc_stable_objref_key` calls
+            // `ctx.identity_hash_code`, and this table's `LockLevel` claims it
+            // is never held across a re-entry into the VM.
+            let wire_key = gc_stable_objref_key(ctx, ses);
+            session_wire_id_table().lock().insert(wire_key, sid);
         }
     }
     // GC: the pin taken around the `create_string`/`set_field` pairs above is
@@ -15014,10 +15275,12 @@ fn register_engine_impl_natives(r: &mut NativeMethodRegistry) {
         // `engine_apply_alpn_selector`), which is also when a server engine has
         // anything to do — JSSE's server-side `beginHandshake()` cannot produce
         // a byte before it has seen the hello either.
+        // `engine_objref_key` calls `ctx.identity_hash_code`; computing it
+        // BEFORE the guard keeps `engine_alpn_selector_table` off the
+        // re-entrant path, which is what its `LockLevel` claims.
+        let alpn_key = engine_objref_key(ctx, this);
         let defer_for_alpn = with_engine(id, |s| !s.is_client && s.conn.is_none()).unwrap_or(false)
-            && engine_alpn_selector_table()
-                .lock()
-                .contains_key(&engine_objref_key(ctx, this));
+            && engine_alpn_selector_table().lock().contains_key(&alpn_key);
         if defer_for_alpn {
             with_engine(id, |s| {
                 s.alpn_selection_deferred = true;
@@ -16107,7 +16370,38 @@ fn do_unwrap(
     // the record. Nothing is consumed here; on refusal the bytes are never fed
     // to rustls at all, so no ServerHello is ever produced.
     if let Some(host) = engine_pending_sni_host(ctx, id, &src_view, src_pos, src_lim) {
-        engine_run_sni_match_check(ctx, id, this, host)?;
+        if engine_run_sni_match_check(ctx, id, this, host)? {
+            // Refused. The engine now holds a fatal `unrecognized_name` for the
+            // peer and a `deferred_handshake_error` for this side; this call
+            // must report ORDINARY PROGRESS so the caller comes back for the
+            // wrap that emits the alert, and only the wrap after that raises.
+            //
+            // Consuming the hello record is what makes it progress:
+            // `SslHandler.decodeJdkCompatible` hands `unwrap` exactly one TLS
+            // record and treats `bytesConsumed != packetLength` as "not an
+            // SSL/TLS record" (`NotSslRecordException`), and a call that
+            // consumed nothing reports BUFFER_UNDERFLOW — the caller then
+            // waits for network data that is never coming and the deferred
+            // failure is never drained. The bytes are dropped rather than fed
+            // to rustls: a refused hello must not produce a ServerHello.
+            let rec_end = {
+                let b3 = bb_get_byte(ctx, &src_view, src_pos + 3).unwrap_or(0) as usize;
+                let b4 = bb_get_byte(ctx, &src_view, src_pos + 4).unwrap_or(0) as usize;
+                (src_pos + 5 + ((b3 << 8) | b4)).min(src_lim)
+            };
+            if rec_end > src_pos {
+                bb_set_pos(ctx, src, src_view.layout, rec_end);
+            }
+            let consumed = rec_end.saturating_sub(src_pos);
+            if __dbg_hs {
+                eprintln!(
+                    "[dbg-tls-hs] thread={:?} do_unwrap id={} RETURN(sni-refused) status=OK hs=NEED_WRAP consumed={} produced=0",
+                    std::thread::current().id(), id, consumed
+                );
+            }
+            let result = alloc_engine_result(ctx, SR_OK, HS_NEED_WRAP_R, consumed as i32, 0)?;
+            return Ok(Some(Value::Object(Some(result))));
+        }
     }
 
     // Realize the rustls connection — and, on the first inbound handshake
@@ -17105,9 +17399,13 @@ pub(crate) fn set_engine_trust_ctx_key(
 /// configured with a matcher that refuses every name still completed the
 /// handshake — netty's `SniClientTest.testSniSNIMatcherDoesNotMatchClient`
 /// asserts an `SSLException` and got `AssertionError: expected SSLException`.
-fn engine_sni_matchers_table() -> &'static Mutex<HashMap<u64, Vec<ObjectRef>>> {
-    static T: OnceLock<Mutex<HashMap<u64, Vec<ObjectRef>>>> = OnceLock::new();
-    T.get_or_init(|| Mutex::new(HashMap::new()))
+/// ARCH-2026-08-04 A6 — `LockLevel::Scratch` (L0). Five sites: a `remove`, a
+/// remove-or-insert whose guard covers only that choice, a
+/// `match ..get(..).cloned()` that ends before the `ctx.create_string` below
+/// it, and the GC scan/remap pair.
+fn engine_sni_matchers_table() -> &'static cratonvm_types::lock_order::OrderedPlMutex<HashMap<u64, Vec<ObjectRef>>> {
+    static T: OnceLock<cratonvm_types::lock_order::OrderedPlMutex<HashMap<u64, Vec<ObjectRef>>>> = OnceLock::new();
+    T.get_or_init(|| cratonvm_types::lock_order::OrderedPlMutex::new(HashMap::new(), cratonvm_types::lock_order::LockLevel::Scratch))
 }
 
 /// GC root scan for `ctx_trust_managers_table` — see the table's doc for why
@@ -17454,9 +17752,11 @@ pub fn register_sslengine_real(r: &mut NativeMethodRegistry) {
 /// The real TLS session id (ServerHello `legacy_session_id`) for a session
 /// object, keyed by `gc_stable_objref_key` like the other session side-tables.
 /// Populated for TLS 1.2 sessions only — see [`peek_server_hello_session_id`].
-fn session_wire_id_table() -> &'static Mutex<HashMap<u64, Vec<u8>>> {
-    static T: OnceLock<Mutex<HashMap<u64, Vec<u8>>>> = OnceLock::new();
-    T.get_or_init(|| Mutex::new(HashMap::new()))
+/// ARCH-2026-08-04 A6 — `LockLevel::Scratch` (L0) — two sites, both of which now
+/// compute their `gc_stable_objref_key` before taking the guard (see there).
+fn session_wire_id_table() -> &'static cratonvm_types::lock_order::OrderedPlMutex<HashMap<u64, Vec<u8>>> {
+    static T: OnceLock<cratonvm_types::lock_order::OrderedPlMutex<HashMap<u64, Vec<u8>>>> = OnceLock::new();
+    T.get_or_init(|| cratonvm_types::lock_order::OrderedPlMutex::new(HashMap::new(), cratonvm_types::lock_order::LockLevel::Scratch))
 }
 
 fn session_peer_certs_table() -> &'static Mutex<HashMap<u64, Vec<Vec<u8>>>> {
@@ -18371,10 +18671,9 @@ fn register_ssl_session_real(r: &mut NativeMethodRegistry) {
         // per-object pseudo-id can never satisfy it. (Under TLS 1.3 nothing is
         // recorded here and the pseudo-id below stands, which is what the same
         // test's `assertFalse(Arrays.equals(...))` branch wants.)
-        let wire_id = session_wire_id_table()
-            .lock()
-            .get(&gc_stable_objref_key(ctx, this))
-            .cloned();
+        // Key before the guard — see the store site.
+        let wire_key = gc_stable_objref_key(ctx, this);
+        let wire_id = session_wire_id_table().lock().get(&wire_key).cloned();
         if let Some(id) = wire_id {
             let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, id.len());
             for (i, b) in id.iter().enumerate() {

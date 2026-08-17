@@ -4084,35 +4084,129 @@ fn s2_bb_int_byte_off(bs: i32, unit: i32) -> i32 {
         .unwrap_or(-1)
 }
 
+/// Read `N` bytes starting at logical index `idx`, resolving the buffer's
+/// storage ONCE.
+///
+/// The six multi-byte accessors below used to call [`s2_bb_get_byte`] /
+/// [`s2_bb_put_byte`] once per byte, and each of those re-resolves the whole
+/// storage view from scratch — `get_field_by_name(buf, "hb")`, then `"offset"`,
+/// then possibly `"address"` — i.e. up to three NAME-keyed field lookups per
+/// byte. A `putLong` therefore paid that resolution EIGHT times.
+///
+/// **This was written as a throughput fix and it is NOT one — recorded here so
+/// the next reader does not re-derive the same wrong hypothesis.** Interleaved
+/// before/after on `probes/NioAccessorRate.java` (2026-08-17, real-JDK mode,
+/// G1, two rounds), `direct ByteBuffer.putLong` measured 918 -> 943 and
+/// 864 -> 877 ns/op: no change outside the noise. The per-byte re-resolution
+/// was real, but it is not what the time goes to.
+///
+/// What the time actually goes to is the NATIVE CALL itself. On the same
+/// probe a single-byte `ByteBuffer.put(int,byte)` — one native, one stored
+/// byte — costs ~260 ns against HotSpot's 0.29, and `putLong` is ~3.5x that
+/// rather than 8x, which is the shape of "one native call plus a few
+/// name-keyed field reads", not "eight byte stores". See
+/// `docs/known-issues/netty/httpcontentdecompressortest-hang-20260816.md`
+/// for the full decomposition and for why this is what makes
+/// `testZipBomb` exceed its wall.
+///
+/// The rewrite is kept because it is strictly less work per access and it is
+/// pinned by a differential oracle (`probes/NioAccessorOracle.java`, which
+/// checksums every width x endianness x storage-kind x alignment plus the
+/// out-of-range and read-only contracts, and must print the same TOTAL on
+/// HotSpot and CratonVM). It is not kept on the strength of a measurement.
+///
+/// Semantics are preserved exactly, including the benign out-of-range
+/// behaviour this family documents: a read past the array reads back zero for
+/// the bytes that are out of range, and a write past it drops them, rather
+/// than throwing from this deep a helper. Only the number of storage
+/// resolutions changes.
+fn s2_bb_read_n<const N: usize>(ctx: &dyn NativeContext, buf: ObjectRef, idx: i32) -> [u8; N] {
+    let mut out = [0u8; N];
+    if idx < 0 {
+        return out;
+    }
+    match s2_bb_storage(ctx, buf) {
+        Some(S2BbStorage::Heap { arr, base }) => {
+            let Some(start) = base.checked_add(idx as usize) else {
+                return out;
+            };
+            let len = ctx.array_length(arr);
+            for (k, slot) in out.iter_mut().enumerate() {
+                let Some(i) = start.checked_add(k) else { break };
+                if i >= len {
+                    break;
+                }
+                *slot = ctx.get_array_element(arr, i).as_int().unwrap_or(0) as u8;
+            }
+        }
+        Some(S2BbStorage::Direct { addr }) => {
+            // One bulk copy; on failure every byte keeps this family's benign
+            // zero, exactly as the per-byte helper's `else { 0 }` arm did.
+            if !ctx.copy_from_native_memory(addr.saturating_add(idx as i64), &mut out) {
+                out = [0u8; N];
+            }
+        }
+        None => {}
+    }
+    out
+}
+
+/// Write side of [`s2_bb_read_n`] — same single-resolution contract, same
+/// benign drop-on-out-of-range behaviour.
+fn s2_bb_write_n<const N: usize>(
+    ctx: &mut dyn NativeContext,
+    buf: ObjectRef,
+    idx: i32,
+    bytes: [u8; N],
+) {
+    if idx < 0 {
+        return;
+    }
+    match s2_bb_storage(ctx, buf) {
+        Some(S2BbStorage::Heap { arr, base }) => {
+            let Some(start) = base.checked_add(idx as usize) else {
+                return;
+            };
+            let len = ctx.array_length(arr);
+            for (k, &b) in bytes.iter().enumerate() {
+                let Some(i) = start.checked_add(k) else { return };
+                if i >= len {
+                    return;
+                }
+                ctx.set_array_element(arr, i, Value::Int(b as i8 as i32));
+            }
+        }
+        Some(S2BbStorage::Direct { addr }) => {
+            let _ = ctx.copy_to_native_memory(addr.saturating_add(idx as i64), &bytes);
+        }
+        None => {}
+    }
+}
+
 fn s2_bb_read2(ctx: &dyn NativeContext, buf: ObjectRef, idx: i32) -> i16 {
-    let b0 = s2_bb_get_byte(ctx, buf, idx) as u8 as u16;
-    let b1 = s2_bb_get_byte(ctx, buf, s2_bb_off(idx, 1)) as u8 as u16;
+    let bs = s2_bb_read_n::<2>(ctx, buf, idx);
     if s2_bb_order(ctx, buf) == 1 {
-        (b1 << 8 | b0) as i16
+        i16::from_le_bytes(bs)
     } else {
-        (b0 << 8 | b1) as i16
+        i16::from_be_bytes(bs)
     }
 }
 
 fn s2_bb_write2(ctx: &mut dyn NativeContext, buf: ObjectRef, idx: i32, val: i16) {
-    let (b0, b1) = if s2_bb_order(ctx, buf) == 1 {
-        (val as u8, (val >> 8) as u8)
+    let bytes = if s2_bb_order(ctx, buf) == 1 {
+        val.to_le_bytes()
     } else {
-        ((val >> 8) as u8, val as u8)
+        val.to_be_bytes()
     };
-    s2_bb_put_byte(ctx, buf, idx, b0 as i8);
-    s2_bb_put_byte(ctx, buf, s2_bb_off(idx, 1), b1 as i8);
+    s2_bb_write_n::<2>(ctx, buf, idx, bytes);
 }
 
 fn s2_bb_read4(ctx: &dyn NativeContext, buf: ObjectRef, idx: i32) -> i32 {
-    let b0 = s2_bb_get_byte(ctx, buf, idx) as u8 as u32;
-    let b1 = s2_bb_get_byte(ctx, buf, s2_bb_off(idx, 1)) as u8 as u32;
-    let b2 = s2_bb_get_byte(ctx, buf, s2_bb_off(idx, 2)) as u8 as u32;
-    let b3 = s2_bb_get_byte(ctx, buf, s2_bb_off(idx, 3)) as u8 as u32;
+    let bs = s2_bb_read_n::<4>(ctx, buf, idx);
     if s2_bb_order(ctx, buf) == 1 {
-        (b3 << 24 | b2 << 16 | b1 << 8 | b0) as i32
+        i32::from_le_bytes(bs)
     } else {
-        (b0 << 24 | b1 << 16 | b2 << 8 | b3) as i32
+        i32::from_be_bytes(bs)
     }
 }
 
@@ -4122,16 +4216,11 @@ fn s2_bb_write4(ctx: &mut dyn NativeContext, buf: ObjectRef, idx: i32, val: i32)
     } else {
         val.to_be_bytes()
     };
-    for (i, &b) in bytes.iter().enumerate() {
-        s2_bb_put_byte(ctx, buf, s2_bb_off(idx, i as i32), b as i8);
-    }
+    s2_bb_write_n::<4>(ctx, buf, idx, bytes);
 }
 
 fn s2_bb_read8(ctx: &dyn NativeContext, buf: ObjectRef, idx: i32) -> i64 {
-    let mut bs = [0u8; 8];
-    for i in 0..8i32 {
-        bs[i as usize] = s2_bb_get_byte(ctx, buf, s2_bb_off(idx, i)) as u8;
-    }
+    let bs = s2_bb_read_n::<8>(ctx, buf, idx);
     if s2_bb_order(ctx, buf) == 1 {
         i64::from_le_bytes(bs)
     } else {
@@ -4145,9 +4234,7 @@ fn s2_bb_write8(ctx: &mut dyn NativeContext, buf: ObjectRef, idx: i32, val: i64)
     } else {
         val.to_be_bytes()
     };
-    for (i, &b) in bytes.iter().enumerate() {
-        s2_bb_put_byte(ctx, buf, s2_bb_off(idx, i as i32), b as i8);
-    }
+    s2_bb_write_n::<8>(ctx, buf, idx, bytes);
 }
 
 // ---- Socket address helper -------------------------------------------------

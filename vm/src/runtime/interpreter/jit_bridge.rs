@@ -588,6 +588,7 @@ pub(super) fn compile_osr_artifact(
             // lock drops, and emit elidable ones as `Object.<init>` so codegen
             // drops the per-object dispatch. See `execute` for the rationale.
             let ctor_direct_call_off = crate::runtime::env_cache::ctor_direct_call_disabled();
+            let osr_ctor_bind_off = crate::runtime::env_cache::osr_ctor_bind_disabled();
             let mut pending_ctor_sites: Vec<(usize, String, usize)> = Vec::new();
             // THIRD COMPILE DOOR, 2026-08-13. `java/lang/String`'s call-site
             // intrinsics (`length`/`isEmpty`/`charAt`/`hashCode`/`equals`/
@@ -799,6 +800,73 @@ pub(super) fn compile_osr_artifact(
                                 needs_context: true,
                                 num_params: 0,
                                 return_type: b'L',
+                                guard_class_id: 0,
+                            },
+                        ));
+                        continue;
+                    }
+                    // `Preconditions.checkIndex` / `Reference.reachabilityFence`
+                    // thin direct calls — the THIRD door.
+                    //
+                    // Both are recognised in `jit::try_compile`'s single-pass
+                    // ladder and in its IR path, and for `checkIndex` that was
+                    // enough: it is reached through `Objects.checkIndex`, a JDK
+                    // method the method-entry door compiles, so the bind landed
+                    // inside the callee. `reachabilityFence` has no such
+                    // intermediary — a hot loop calls it directly — and a hot
+                    // loop's body is compiled HERE, by the OSR door, which runs
+                    // its own callee-binding loop rather than that ladder.
+                    // Wiring the other two doors and not this one bound
+                    // `Preconditions.checkIndex=2 Reference.reachabilityFence=0`
+                    // (`CRATONVM_DBG=jit-method-stats`) while the fence's cost
+                    // did not move — 361 ns before, 142 after, against
+                    // `Objects.checkIndex`'s 352 -> 15. Three doors, and the
+                    // counter is what said which one was missing.
+                    //
+                    // Address taken directly rather than through the jit-crate
+                    // atomic, for the reason the `Thread.currentThread` bind
+                    // above states: `build_helpers` registers those cells only
+                    // after this construction block, so reading one here yields
+                    // 0 on the first OSR compile in a process.
+                    if invoke_kind == 3
+                        && cratonvm_jit::census_direct_helpers_enabled()
+                        && target_class == "jdk/internal/util/Preconditions"
+                        && mn == "checkIndex"
+                        && desc == "(IILjava/util/function/BiFunction;)I"
+                    {
+                        let entry = crate::jit::helpers::jit_preconditions_check_index_direct
+                            as *const () as usize;
+                        cratonvm_jit::PRECONDITIONS_CHECK_INDEX_SITES
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        direct_calls2.push((
+                            pc,
+                            crate::jit::JitDirectCall {
+                                entry,
+                                needs_context: true,
+                                num_params: 3,
+                                return_type: b'I',
+                                guard_class_id: 0,
+                            },
+                        ));
+                        continue;
+                    }
+                    if invoke_kind == 3
+                        && cratonvm_jit::census_direct_helpers_enabled()
+                        && target_class == "java/lang/ref/Reference"
+                        && mn == "reachabilityFence"
+                        && desc == "(Ljava/lang/Object;)V"
+                    {
+                        let entry = crate::jit::helpers::jit_reachability_fence_direct
+                            as *const () as usize;
+                        cratonvm_jit::REACHABILITY_FENCE_SITES
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        direct_calls2.push((
+                            pc,
+                            crate::jit::JitDirectCall {
+                                entry,
+                                needs_context: true,
+                                num_params: 1,
+                                return_type: b'V',
                                 guard_class_id: 0,
                             },
                         ));
@@ -1097,7 +1165,7 @@ pub(super) fn compile_osr_artifact(
             // backend may elide only these; a no-arg constructor that is NOT proven empty
             // keeps both its allocation and its call, because eliding it would drop
             // whatever the body writes to global state (see
-            // docs/internal/fixed-suite-bugs/netty/jit-elided-constructor-side-effects-FIXED-20260812.md).
+            // fixed-suite-bugs/netty/jit-elided-constructor-side-effects-FIXED-20260812.md).
             let mut elidable_init_pcs: std::collections::HashSet<usize> =
                 std::collections::HashSet::new();
             for (pc, tclass, pcount) in pending_ctor_sites {
@@ -1136,25 +1204,47 @@ pub(super) fn compile_osr_artifact(
                     let info_ptr: *const _ = &*info;
                     owned_jit_invoke_infos2.push(info);
                     invoke_info.push((pc, info_ptr));
-                } else {
-                    // NOT elidable: keep the dispatch, exactly as before.
+                } else if !osr_ctor_bind_off {
+                    // NOT elidable, and the site joins `pending_callee_compiles`
+                    // for the same eager-compile + direct bind every other
+                    // statically-bound site in this door gets. This is what the
+                    // `new FastThreadLocal<Boolean>()` loop was paying a
+                    // per-allocation `jit_invoke_dispatch` for.
                     //
-                    // Routing these through the eager-compile + direct-bind
-                    // path below was tried and REVERTED (2026-08-13). It makes
+                    // HISTORY, because the obvious reading of it is wrong.
+                    // This reroute was tried on 2026-08-13 and REVERTED: it made
                     // `compile_with_param_slots` refuse the enclosing method,
-                    // which marks it **OSR-denied for the process** — so the
-                    // hot loop interprets forever. Measured, same host, same
-                    // run: `new A()` where `A(){i=ATOMIC.getAndIncrement();}`
-                    // went 311 ns -> 1412 ns (4.5x SLOWER), and the real
-                    // `new FastThreadLocal<Boolean>()` 451 ns -> 1868 ns, with
-                    // `OSR-compile FAILED … marked OSR-denied` in the trace.
+                    // and an OSR refusal is not a fallback to a slower compile —
+                    // it marks the method OSR-denied for the process lifetime,
+                    // so the hot loop interpreted forever (`new A()` 311 ns ->
+                    // 1412 ns). The page filed that as "why the codegen refuses
+                    // that shape is unresolved".
                     //
-                    // The sibling admission for non-`()V` `invokespecial` in
-                    // the scan loop above does NOT hit this and is a 2.3x win,
-                    // so the refusal is specific to the `()V` shape reaching
-                    // the bind through here — not to binding `invokespecial`
-                    // as such. Why the codegen refuses it is unresolved; see
-                    // the FastThreadLocal page.
+                    // It was not the shape. A direct-bound site ALSO needs a
+                    // `JitInvokeInfo` — the codegen's direct-call arm reads it
+                    // to name the callee for the exceptional-return service —
+                    // and this door pushed none, which is exactly the refusal
+                    // the sibling non-`()V` `invokespecial` admission hit and
+                    // fixed a few hundred lines below ("an `invokespecial` bind
+                    // without it makes `compile_with_param_slots` refuse the
+                    // whole method"). That fix landed for kind-1 sites arriving
+                    // through the scan loop; `()V` ctor sites arrive through
+                    // HERE, bypassed it, and so still had none. Routing them
+                    // into the same list makes them take the same bind, and the
+                    // `JitInvokeInfo` comes with it.
+                    //
+                    // `CRATONVM_NO_OSR_CTOR_BIND=1` restores the dispatch.
+                    pending_callee_compiles.push((
+                        pc,
+                        tclass,
+                        "<init>".to_string(),
+                        "()V".to_string(),
+                        pcount,
+                        1u8,
+                    ));
+                } else {
+                    // `CRATONVM_NO_OSR_CTOR_BIND=1`: keep the per-allocation
+                    // dispatch, the pre-2026-08-17 behaviour.
                     let class_box: Box<str> = tclass.into_boxed_str();
                     let method_box: Box<str> = "<init>".to_string().into_boxed_str();
                     let desc_box: Box<str> = "()V".to_string().into_boxed_str();
@@ -1203,29 +1293,52 @@ pub(super) fn compile_osr_artifact(
                         &callee_desc,
                         true,
                     );
+                // `CRATONVM_DBG_OSR_BIND=1` names, per call site, whether this
+                // OSR artifact bound a direct machine-code CALL or fell back to
+                // the dispatch helper, and WHICH gate refused. Without it the
+                // two outcomes are indistinguishable from outside, and they are
+                // ~4.6x apart on a call-dense loop — see
+                // `docs/known-issues/netty/httpresponsestatustest-exhaustive-loop-timeout-20260816.md`.
+                let dbg_bind =
+                    cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_OSR_BIND").is_some();
                 if let Some((callee_pin, entry, needs_ctx)) = compiled_callee {
                     baked_callee_pins.push(callee_pin);
-                    if !crate::jit::jit_direct_call_requires_dispatch(
+                    let refuse_dispatch = crate::jit::jit_direct_call_requires_dispatch(
                         &callee_class,
                         &callee_method,
                         &callee_desc,
-                    )
-                    && !osr_callee_declares_handlers(
+                    );
+                    let refuse_handlers = osr_callee_declares_handlers(
                         shared,
                         class_id,
                         &callee_class,
                         &callee_method,
                         &callee_desc,
-                    )
+                    );
                     // jit-invokedynamic-groovy-regression fix: never bake a
                     // direct machine-code CALL to an indy-trap-bearing
                     // artifact — see the matching gate in `callee_compiler`.
-                    && !crate::jit::helpers::compiled_entry_has_indy_trap(
+                    let refuse_indy = crate::jit::helpers::compiled_entry_has_indy_trap(
                         shared,
                         &callee_class,
                         &callee_method,
                         &callee_desc,
-                    ) {
+                    );
+                    if dbg_bind {
+                        eprintln!(
+                            "[osr-bind] {}.{}{} @pc={} compiled=yes direct={} entry={:#x} requires_dispatch={} declares_handlers={} indy_trap={}",
+                            callee_class,
+                            callee_method,
+                            callee_desc,
+                            ipc,
+                            !(refuse_dispatch || refuse_handlers || refuse_indy),
+                            entry,
+                            refuse_dispatch,
+                            refuse_handlers,
+                            refuse_indy
+                        );
+                    }
+                    if !refuse_dispatch && !refuse_handlers && !refuse_indy {
                         direct_calls2.push((
                             ipc,
                             crate::jit::JitDirectCall {
@@ -1290,6 +1403,12 @@ pub(super) fn compile_osr_artifact(
 
                 // Compilation failed, or the callee participates in a recursive
                 // compile cycle. Fall back to the guarded dispatch helper.
+                if dbg_bind {
+                    eprintln!(
+                        "[osr-bind] {}.{}{} @pc={} -> DISPATCH HELPER",
+                        callee_class, callee_method, callee_desc, ipc
+                    );
+                }
                 let class_box: Box<str> = callee_class.into_boxed_str();
                 let method_box: Box<str> = callee_method.into_boxed_str();
                 let desc_box: Box<str> = callee_desc.clone().into_boxed_str();
@@ -1481,19 +1600,31 @@ pub(super) fn compile_osr_artifact(
                                 }
                             };
                             if accessible {
-                                let num_fields = shared
-                                    .classes
-                                    .class_manager
-                                    .read()
-                                    .get_class(target_id)
-                                    .map(|c| c.num_total_fields)
-                                    .unwrap_or(0);
+                                // `(true, true)` unless `CRATONVM_JIT_REAL_NEW_SITE_FLAGS`
+                                // is set — see `jit_new_site_flags` for what
+                                // the literal costs (nothing measurable, as it
+                                // turns out) and why the real flags are behind
+                                // a lever rather than on.
+                                let (num_fields, has_prim_init, has_finalizer) = {
+                                    let cm = shared.classes.class_manager.read();
+                                    if crate::runtime::env_cache::jit_real_new_site_flags() {
+                                        jit_new_site_flags(&cm, target_id)
+                                    } else {
+                                        (
+                                            cm.get_class(target_id)
+                                                .map(|c| c.num_total_fields)
+                                                .unwrap_or(0),
+                                            true,
+                                            true,
+                                        )
+                                    }
+                                };
                                 new_info2.push((
                                     pc_new,
                                     target_id.as_u32(),
                                     num_fields,
-                                    true,
-                                    true,
+                                    has_prim_init,
+                                    has_finalizer,
                                 ));
                             } else {
                                 // Inaccessible at compile time — defer, so the
@@ -1645,7 +1776,21 @@ pub(super) fn compile_osr_artifact(
                 // RBC.2 — a backend bail here is just as permanent as one in
                 // `jit::try_compile`; record it so neither this OSR path nor
                 // the invocation-counter path re-runs the pipeline.
-                crate::jit::mark_jit_bail_listed(&class_name, &method_name, &method_descriptor);
+                //
+                // Record the REASON as well, which this door never did.
+                // `jit::try_compile` records one, so `CRATONVM_DBG=jit-method-stats`
+                // can say WHY a permanently uncompilable method is stuck; an OSR
+                // bail reached the same table as `reason=unrecorded`. That is the
+                // bail that matters most — this door compiles a `@Test` method's
+                // hot loop, and a method denied here runs its whole life in the
+                // interpreter with no other diagnostic. See
+                // docs/known-issues/jit/osr-refuses-any-method-with-an-exception-table-20260817.md,
+                // which took a six-arm shape bisect to find for exactly this reason.
+                crate::jit::mark_jit_bail_listed_with_site(
+                    &class_name,
+                    &method_name,
+                    &method_descriptor,
+                );
                 return None;
             };
             cm.compiled_via_osr = true;
@@ -1661,6 +1806,34 @@ pub(super) fn compile_osr_artifact(
             cm._jit_invoke_infos = owned_jit_invoke_infos2;
             cm._jit_mic_slots.extend(owned_mic_slots2);
             cm._jit_pic_slots.extend(owned_pic_slots2);
+            // `CRATONVM_DBG_JIT_CODE=<substring>` dumped single-pass and IR
+            // bodies but never an OSR one, so the artifact that actually runs a
+            // `@Test` method's hot loop was the one body no diff could see.
+            // That is precisely the artifact the compile-order question turns
+            // on — see
+            // docs/known-issues/netty/httpresponsestatustest-exhaustive-loop-timeout-20260816.md,
+            // where the callee's body was byte-comparable between the fast and
+            // slow arms and the CALLER's was not observable at all. Same
+            // format as the other two dumps, tagged `backend=osr`.
+            if let Ok(want) = cratonvm_types::flags::runtime_var("CRATONVM_DBG_JIT_CODE") {
+                let full = format!("{class_name}.{method_name}{method_descriptor}");
+                if full.contains(&want) {
+                    let slice = cm._buffer_slice_for_debug();
+                    let mut hex = String::new();
+                    for b in slice {
+                        hex.push_str(&format!("{:02x}", b));
+                    }
+                    eprintln!(
+                        "[JIT_CODE] backend=osr {} entry={:p} entry_pc={} len={}
+{}",
+                        full,
+                        cm.entry_ptr(),
+                        entry_pc,
+                        slice.len(),
+                        hex
+                    );
+                }
+            }
             stamp_compilation_epoch(
                 shared,
                 &class_name_arc,
@@ -2470,8 +2643,66 @@ pub(super) fn resolve_jit_new_site(
             has_finalizer: true,
         });
     };
+    let _ = target;
+    let (num_fields, has_prim_init, has_finalizer) = jit_new_site_flags(cm, target_id);
+    Some(JitNewSite::Resolved {
+        class_id: target_id.as_u32(),
+        num_fields,
+        has_prim_init,
+        has_finalizer,
+    })
+}
+
+/// `(num_fields, has_prim_init, has_finalizer)` for an already-resolved `new`
+/// target — the three values every compile door has to put in its `new_info`
+/// row, computed once here so the doors cannot disagree about them.
+///
+/// # Why this is not just an extract-method
+///
+/// The two flags decide whether the codegen may take the pure inline-TLAB
+/// path: `bytecode_walk`'s `skip_helper = !has_prim_init && !has_finalizer`,
+/// and only that arm emits an allocation with **no call in it**. Everything
+/// else routes through `jit_post_tlab_init`, or — when `can_inline` is false
+/// outright — through the full `jit_new_object` helper.
+///
+/// [`resolve_jit_new_site`] has computed the real flags since it was written.
+/// The other two doors did not call it: the interpreter's first-call compile
+/// path and `compile_osr_artifact` both pushed a literal
+///
+/// ```text
+/// new_info.push((pc_new, target_id.as_u32(), num_fields, true, true));
+/// ```
+///
+/// under a comment promising "a follow-up should extract the real flags from
+/// class metadata to enable the skip path". So on those two doors — which
+/// includes **every OSR-compiled hot loop** — no `new` site could ever be
+/// inline-allocated, whatever the class actually looked like.
+///
+/// That is what made `CRATONVM_JIT_ENABLE_INLINE_NEW=1` look like a dead
+/// lever. The flag forces `can_inline`, but it does not touch `skip_helper`,
+/// so it swapped a `jit_new_object` call for an inline bump plus a
+/// `jit_post_tlab_init` call and measured flat (5 243 769/s vs 5 277 311/s
+/// in 2026-08-12's table, 108.7 vs 108.6 ns/op when re-taken 2026-08-17).
+/// The `fastthreadlocal-2e9-iteration-throughput-wall` page read that flat
+/// result as "the gating flags are not what this loop is paying for" and
+/// filed the in-tree TODO as measured-and-refuted. The A/B was sound; what it
+/// could not show is that the arm never reached the path being tested.
+///
+/// Conservative in exactly the two places the old code was: an unresolvable
+/// class or an unknown superclass reports `(.., true, true)`, which keeps the
+/// helper call.
+pub(super) fn jit_new_site_flags(
+    cm: &crate::classloading::ClassManager,
+    target_id: ClassId,
+) -> (usize, bool, bool) {
+    let Some(target) = cm.get_class(target_id) else {
+        return (0, true, true);
+    };
     let num_fields = target.num_total_fields;
     let has_finalizer = target.has_finalizer;
+    // Mirrors the hierarchy walk in `crate::jit::helpers::jit_init_primitive_fields`:
+    // only long/float/double need a non-zero `Value` tag, so an int-family
+    // field is already correct in a body the codegen has cleared to zero.
     let mut has_prim_init = false;
     let mut cid = Some(target_id);
     while let Some(current) = cid {
@@ -2488,12 +2719,7 @@ pub(super) fn resolve_jit_new_site(
         }
         cid = c.superclass;
     }
-    Some(JitNewSite::Resolved {
-        class_id: target_id.as_u32(),
-        num_fields,
-        has_prim_init,
-        has_finalizer,
-    })
+    (num_fields, has_prim_init, has_finalizer)
 }
 
 /// Would dispatching `class_name.<init>()V` reach a native, rather than the
@@ -4737,6 +4963,60 @@ pub(super) fn try_jit_compile_wrapped_entry(
 /// GC itself takes none of these during STW (it scans deposited root snapshots),
 /// so the worker's transient holds only matter via the mutator-stall path above.
 #[allow(clippy::type_complexity)]
+/// Deepest nested-compile stack at which the callee resolver will still compile a
+/// not-yet-compiled statically bound callee in order to bind it directly
+/// (`eager-callee-chain`).
+///
+/// Six levels covers the chains that matter in practice — a JUnit `assertEquals`
+/// reaches `AssertionUtils.objectsAreEqual` in three, a `java.nio` absolute
+/// accessor reaches its `ScopedMemoryAccess` leaf in three — while bounding the
+/// worst-case native stack use and the worst-case latency of one tier-up. Past the
+/// bound a site keeps the checked dispatch helper, which is always correct.
+const MAX_EAGER_CALLEE_CHAIN_DEPTH: usize = 6;
+
+/// Transitive callee compiles allowed per TOP-LEVEL compile.
+///
+/// The depth bound alone does not bound fan-out: a method with forty statically
+/// bound sites, each of whose callees has forty of its own, would turn one tier-up
+/// into thousands of compiles and a visible pause. This caps the total. It is
+/// deliberately generous — the chains this exists for are a handful of methods deep
+/// and a handful wide — so an ordinary method never reaches it.
+const MAX_EAGER_CALLEE_CHAIN_PER_COMPILE: u32 = 96;
+
+thread_local! {
+    /// Transitive callee compiles spent under the current top-level compile. Reset
+    /// by [`eager_callee_chain_enter_top_level`], which every entry to
+    /// [`try_jit_compile_callee_slow`] calls; only the entry that finds no compile
+    /// open on this thread actually clears it.
+    static EAGER_CALLEE_CHAIN_SPENT: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// Start a fresh `eager-callee-chain` budget if this is a top-level compile.
+///
+/// "Top level" is `jit_active_compile_depth() == 0`: the jit crate pushes its
+/// compile-stack entry inside `try_compile`, which this function has not called
+/// yet, so a nested (callee) entry always sees a non-zero depth here and keeps the
+/// outer budget.
+fn eager_callee_chain_enter_top_level() {
+    if cratonvm_jit::jit_active_compile_depth() == 0 {
+        EAGER_CALLEE_CHAIN_SPENT.with(|c| c.set(0));
+    }
+}
+
+/// Charge one transitive callee compile against the current budget. `false` means
+/// the budget is spent and the site must keep dispatch.
+fn eager_callee_chain_try_spend() -> bool {
+    EAGER_CALLEE_CHAIN_SPENT.with(|c| {
+        let spent = c.get();
+        if spent >= MAX_EAGER_CALLEE_CHAIN_PER_COMPILE {
+            false
+        } else {
+            c.set(spent + 1);
+            true
+        }
+    })
+}
+
 pub(super) fn try_jit_compile_callee_slow(
     shared: &SharedVm,
     class_name: &str,
@@ -4749,6 +5029,9 @@ pub(super) fn try_jit_compile_callee_slow(
     cache_negative: &mut bool,
     allow_synchronized_wrapped_entry: bool,
 ) -> Option<(std::sync::Arc<cratonvm_jit::CompiledMethod>, usize, bool)> {
+    // `eager-callee-chain`: a top-level compile starts with a fresh transitive
+    // callee-compile budget; a nested one inherits the outer compile's.
+    eager_callee_chain_enter_top_level();
     // RFJP.1 — never JIT a method whose declaring class transitively extends
     // `java/util/concurrent/ForkJoinTask`. The recursive `compute()` body
     // miscompiles under deep recursion (returns 0 from depth ~10), and the
@@ -5345,14 +5628,86 @@ pub(super) fn try_jit_compile_callee_slow(
         let callee_class_arc: Arc<str> = Arc::from(callee_class);
         let callee_method_arc: Arc<str> = Arc::from(callee_method);
         let callee_desc_arc: Arc<str> = Arc::from(callee_desc);
-        let jit_cache = shared.jit.jit_cache.read();
-        let Some(compiled) = jit_cache.get(
-            &callee_class_arc,
-            &callee_method_arc,
-            &callee_desc_arc,
-            callee_class_id,
-        ) else {
-            dc_no!("callee-not-yet-compiled");
+        // Probe in a scope so the read lock is RELEASED before the transitive
+        // compile below, which takes the same cache for writing.
+        let cached_body = {
+            let jit_cache = shared.jit.jit_cache.read();
+            jit_cache.get(
+                &callee_class_arc,
+                &callee_method_arc,
+                &callee_desc_arc,
+                callee_class_id,
+            )
+        };
+        // TRANSITIVE EAGER CALLEE COMPILE (`eager-callee-chain`).
+        //
+        // This resolver used to stop here with `callee-not-yet-compiled`, which
+        // made eager callee binding exactly ONE level deep: the mutator door's
+        // `callee_compiler` compiled a direct callee, but that callee was itself
+        // compiled through this function, whose resolver bound ITS statically bound
+        // sites to the generic `jit_invoke_dispatch` helper whenever they were not
+        // compiled yet — and a compiled body never re-binds. So the whole chain's
+        // speed depended on the ORDER the tiered manager happened to reach the
+        // methods in, permanently.
+        //
+        // Measured on `probes/org/junit/jupiter/api/CompileOrderProbe.java` (JUnit's
+        // `assertEquals` chain under a hot loop, real-JDK mode, G1): 478 ns/iter
+        // compiling top-down against 73 bottom-up, with `CRATONVM_DBG_MIC_PROF=1`
+        // reporting `disp_calls` 2 003 538 against 3 926 — one helper round trip per
+        // iteration, ~150 ns of it, at ONE site (`CRATONVM_DBG_MIC_TRACE=1` named it:
+        // `AssertEquals.assertEquals(Object,Object,String)`, reached from the
+        // two-argument overload that had been compiled first).
+        //
+        // Compiling the callee here makes the bind order-independent: whichever
+        // method the tiered manager reaches first, its statically bound callees are
+        // compiled before its body is emitted, so the site binds directly.
+        //
+        // Bounded three ways, because this recursion is unbounded in principle:
+        //  * DEPTH — `jit_active_compile_depth`; past the bound the site simply
+        //    keeps dispatch, which is always correct;
+        //  * CYCLES — `jit_active_compile_contains` declines a callee already open
+        //    on this thread's compile stack (the jit crate's own
+        //    `note_jit_recursive_compile_cycle` answers the same question for its
+        //    `callee_compiler`);
+        //  * FAN-OUT — a per-top-level-compile budget, so a method with many call
+        //    sites cannot turn one compile into a whole-program one.
+        //
+        // Every other refusal is unchanged: this arm is reached only when the callee
+        // passed all of the gates above and the ONLY thing missing was a compiled
+        // body.
+        let compiled = match cached_body {
+            Some(compiled) => compiled,
+            None => {
+                if !crate::runtime::env_cache::jit_eager_callee_chain() {
+                    dc_no!("callee-not-yet-compiled");
+                }
+                if cratonvm_jit::jit_active_compile_depth() > MAX_EAGER_CALLEE_CHAIN_DEPTH {
+                    dc_no!("eager-callee-chain-depth");
+                }
+                if cratonvm_jit::jit_active_compile_contains(
+                    callee_class,
+                    callee_method,
+                    callee_desc,
+                ) {
+                    dc_no!("eager-callee-chain-cycle");
+                }
+                if !eager_callee_chain_try_spend() {
+                    dc_no!("eager-callee-chain-budget");
+                }
+                // `optimize` is this compile's own backend selection, so a C1 body's
+                // callees are compiled at C1 and a C2 body's at C2 — the callee never
+                // arrives at a tier its caller was not compiled against.
+                let Some((body, _entry, _needs_ctx)) = try_jit_compile_callee(
+                    shared,
+                    callee_class,
+                    callee_method,
+                    callee_desc,
+                    optimize,
+                ) else {
+                    dc_no!("eager-callee-chain-compile-declined");
+                };
+                body
+            }
         };
         if compiled.has_indy_trap {
             dc_no!("indy-trap");
@@ -7137,7 +7492,7 @@ pub(super) fn execute_jit_call(
                 || jit_saved_args_to_values(cached, &saved_args, np),
                 |args| args.to_vec(),
             );
-            let throw_pc = jit_local_athrow_pc(cached, sig.athrow_bci);
+            let throw_pc = jit_local_athrow_pc_kind(cached, sig.athrow_bci);
             return route_jit_signal_exception(
                 shared,
                 thread,
@@ -7221,7 +7576,7 @@ pub(super) fn execute_jit_call(
                     thread,
                     frame_idx,
                     cached,
-                    usize::MAX,
+                    JitThrowPc::Unknown,
                     exc,
                     &exc_locals,
                 );
@@ -7268,7 +7623,7 @@ pub(super) fn execute_jit_call(
                     thread,
                     frame_idx,
                     cached,
-                    usize::MAX,
+                    JitThrowPc::Unknown,
                     exc,
                     &exc_locals,
                 );
@@ -7310,7 +7665,7 @@ pub(super) fn execute_jit_call(
                     thread,
                     frame_idx,
                     cached,
-                    usize::MAX,
+                    JitThrowPc::Unknown,
                     exc,
                     &exc_locals,
                 );
@@ -7655,7 +8010,7 @@ pub(super) fn execute_jit_call_decoded(
             // RBC.6 correctness fix — see the identical comment at
             // `execute_jit_call`'s sibling call site: use the athrow's own
             // known bci when available instead of always `usize::MAX`.
-            let throw_pc = jit_local_athrow_pc(cached, sig.athrow_bci);
+            let throw_pc = jit_local_athrow_pc_kind(cached, sig.athrow_bci);
             return route_jit_signal_exception(
                 shared, thread, frame_idx, cached, throw_pc, exc, args_slice,
             )
@@ -7693,7 +8048,7 @@ pub(super) fn execute_jit_call_decoded(
                     thread,
                     frame_idx,
                     cached,
-                    usize::MAX,
+                    JitThrowPc::Unknown,
                     exc,
                     args_slice,
                 )
@@ -7716,7 +8071,7 @@ pub(super) fn execute_jit_call_decoded(
                     thread,
                     frame_idx,
                     cached,
-                    usize::MAX,
+                    JitThrowPc::Unknown,
                     exc,
                     args_slice,
                 )
@@ -7742,7 +8097,7 @@ pub(super) fn execute_jit_call_decoded(
                     thread,
                     frame_idx,
                     cached,
-                    usize::MAX,
+                    JitThrowPc::Unknown,
                     exc,
                     args_slice,
                 )

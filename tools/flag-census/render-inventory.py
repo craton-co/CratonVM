@@ -182,6 +182,22 @@ def main():
 
     doc = open(OUT, encoding='utf-8').read()
     head = doc.split('## Full inventory')[0]
+    # The head is the hand-written prose above `## Full inventory`, and it is
+    # carried through VERBATIM. That is what let a merge conflict survive
+    # regeneration: the markers sat in the head, so every rerun copied them
+    # forward, and the `re.sub` below has no `count=`, so it rewrote the row on
+    # BOTH sides of the conflict to the same number and made the conflict look
+    # vacuous. Refuse instead of laundering them — for a conflict that is NOT
+    # vacuous, silently dropping the markers would pick a side at random.
+    for marker in ('<<<<<<< ', '\n=======\n', '>>>>>>> '):
+        if marker in head:
+            sys.exit(
+                '%s has unresolved merge-conflict markers above '
+                '"## Full inventory".\n'
+                '  That region is preserved verbatim, so regenerating would '
+                'copy them forward.\n'
+                '  Resolve the conflict in the file first, then rerun.'
+                % OUT)
     head = re.sub(
         r'(\| \*\*declared\*\* in `flag_groups::INVENTORY` \+ scalars \+ '
         r'group variables \| \*\*)\d+(\*\* \|)',

@@ -2941,6 +2941,23 @@ pub(crate) fn engine_set_key_entry(
         // No PKCS#8 encoding available (e.g. a PKCS#11/HSM-backed key with
         // getEncoded() == null) -- nothing we can stage natively. Lenient,
         // matches the same leniency engine_set_certificate_entry takes.
+        //
+        // But not SILENT: an opaque key is the normal case for a delegating
+        // provider (`MockAlternativeKeyProvider` in netty's
+        // `JdkDelegatingPrivateKeyMethodTest`, any PKCS#11 or HSM key), and
+        // dropping its entry with no trace means the alias simply is not there
+        // later — indistinguishable from a keystore that was never populated.
+        // `docs/known-issues/netty/openssl-key-material-and-engine-residuals-20260813.md`
+        // asked for exactly this line. The store keeps working through the
+        // live-keystore enumeration path
+        // (`x509_manager::build_key_manager_state_from_live_keystore`), which
+        // holds such a key BY REFERENCE, so this is a note about the NATIVE
+        // staging only, not necessarily a broken handshake.
+        eprintln!(
+            "[keystore] setKeyEntry store_id={id} alias={alias:?} NOT staged natively: the key              reports no encoding (getEncoded() == null / empty), which is normal for an opaque              provider key. algorithm={:?} format={:?}; the live-KeyStore enumeration path keeps              it by reference instead.",
+            string_from_virtual(ctx, key, "getAlgorithm", "()Ljava/lang/String;"),
+            string_from_virtual(ctx, key, "getFormat", "()Ljava/lang/String;"),
+        );
         return Ok(None);
     }
     let mut chain: Vec<Vec<u8>> = Vec::new();
