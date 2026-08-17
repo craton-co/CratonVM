@@ -1,10 +1,12 @@
 # G18-1 — the proxy invocation contract, and the two vectors that ride on it
 
-**Status:** PART-FIXED-MEASURED. Everything below is MEASURED on both VMs, and
-each row says which. **Provenance:** MEAS on both VMs. HotSpot 25.0.3+9-LTS
-(`$JAVA_HOME`) is the oracle throughout; CratonVM is
-`C:/craton/target-fcheck/release/cratonvm.exe`, `--jdk-only`, binary stamped
-`2026-08-17 00:44:49`. Probes (kept out of the repo, in this session's
+**Status:** PART-FIXED-MEASURED. Everything below is MEASURED on both VMs,
+**before and after**, and each row says which. **Provenance:** MEAS on both VMs.
+HotSpot 25.0.3+9-LTS (`$JAVA_HOME`) is the oracle throughout; CratonVM is
+`C:/craton/target-fcheck/release/cratonvm.exe`, `--jdk-only`. The **before**
+binary is stamped `2026-08-17 00:44:49`; the **after** binary is
+`2026-08-17 01:41:07`, and no `.rs` in the tree is newer than it (the last write
+to `reflect_annotations.rs` was `00:59:35`, 42 minutes before the link). Probes (kept out of the repo, in this session's
 scratchpad): `PJdkProxy.java` (return + refusal families), `POrder.java`
 (refusal ORDER and return-type compatibility), `PSig.java` (the exact
 `shortSignature` text), `PMhProxy.java` (`MethodHandleProxies` refusals).
@@ -20,12 +22,27 @@ registry evidence for which body to change.
 
 ## 0. The headline
 
-| vector | before (MEASURED) | after |
+| surface | before (MEASURED) | after (MEASURED) |
 |---|---|---|
-| `RJdkProxy` | aborts at check **32 of 37**, `AssertionError: null for an int-returning proxy method must NPE` | unchanged — the defect is in `invoke.rs` (§6.1) |
-| `RJdkProxyIface` | **37 checks / oracle 38**, `FAIL step refusals` | unchanged — the defect is in `asType` (§6.2) |
-| `Proxy` refusal family | **11 of 17** `newProxyInstance` rows and **5 of 6** `getProxyClass` rows diverge | fixed in `reflect_annotations.rs` (§4) |
-| `Proxy` return-coercion family | **26 of 30** rows diverge | NOMINATED, not touched (§6.1) |
+| `RJdkProxy` | aborts at check **32 of 37**, `AssertionError: null for an int-returning proxy method must NPE` | **unchanged, 32 of 37** — the defect is in `invoke.rs` (§6.1) |
+| `RJdkProxyIface` | **37 checks / oracle 38**, `FAIL step refusals` | **unchanged, 37 of 38** — the defect is in `asType` (§6.2) |
+| `newProxyInstance` refusals | **11 of 17** rows diverge | **0 of 17** — differential-clean, messages included |
+| `getProxyClass` refusals | **5 of 6** rows diverge | **0 of 6** |
+| `isProxyClass` / `getInvocationHandler` | **2 of 5** rows diverge | **0 of 5** |
+| refusal ORDER (`POrder`, 12 rows) | 8 diverge | **0** |
+| return-type compatibility (`POrder` 13 + `PSig` 6) | 19 diverge | **0** |
+| `Proxy` return coercion | **26 of 30** rows diverge | **26 of 30** — NOMINATED, not touched (§6.1) |
+| proxy class flags (`isSynthetic`, `ACC_PUBLIC`) | 2 diverge | 2 — NOMINATED (§6.3) |
+
+Vectors held green on the after binary: `RJdkReflect` 67, `RReflect` 40,
+`RJdkHandles` 331 (40 steps), `RJdkStrict` 359, `RJdkReflBox` 107,
+`RArrayStoreInterfaces` 108 — the last four being every other vector that calls
+`java.lang.reflect.Proxy`.
+
+`PJdkProxy`'s D/E/F sections, the whole of `POrder`, and the whole of `PSig` now
+diff clean against HotSpot with `tr -d '\r'`. The only residue in those three
+probes is the `$ProxyN` counter in a printed class name, which the probes print
+and no vector asserts.
 
 `RJdkProxy` reaches check 32 because `exceptionSemantics()` is the fourth of
 four sections: 20 checks in `basics()`, 8 in `loaderIdentityAndCaching()`, then
@@ -339,19 +356,25 @@ decided. The `None`-means-fail-open contract is asserted directly.
   prediction.
 * **Did not re-measure §2c.** The UndeclaredThrowableException family already
   matched on all six rows, message text included.
-* **Did not verify the after-state of §4 on a binary containing it.** The lane
-  was forbidden `cargo build`; the binary available to it
-  (`2026-08-17 00:44:49`) predates the change. The before-state of every table
-  above is measured on that binary; the after-state of §4 is **PREDICTED** and
-  must be re-run before this record's status is upgraded. §0's "after" column
-  says *unchanged* only for the two rows this lane did not touch, which is a
-  statement about ownership, not a measurement.
+* **Did not build the binary it measured.** `cargo build` was forbidden. The
+  lane measured the before-state on the `00:44:49` binary, wrote the fix, and
+  re-measured on the `01:41:07` binary the orchestrator produced. That the fix
+  is in that binary is established by BEHAVIOUR, not by timestamps: eleven
+  refusals that previously did not fire now fire with the exact measured
+  messages, and `POrder` and `PSig` went from 27 diverging rows to zero.
 
 ---
 
 ## 6. NOMINATIONS
 
 ### 6.1 `vm/src/runtime/interpreter/invoke.rs` — the proxy return coercion
+
+> **Taken up.** `G24-1-the-proxy-return-coercion-on-the-live-path-20260817.md`
+> is the lane that owns `invoke.rs` and `vm_exec.rs` acting on this. It
+> re-derived the live body from the registry rather than taking it on trust,
+> widened the probe to 59 rows, and reports 29 of the 32 divergences closed.
+> Its fix is NOT in the `01:41:07` binary, which is why `RJdkProxy` still
+> measures 32 of 37 in §0.
 
 In the `is_proxy_dispatch` block (around line 1915, immediately after
 `crate::vm::proxy_invoke_handler_shared`), the result is coerced with five
@@ -449,21 +472,18 @@ HotSpot clears `ACC_PUBLIC` when any proxied interface is non-public.
 
 ## 8. What could not be settled
 
-* **The after-state of §4.** No `cargo build` was permitted and the binary
-  never turned over during the lane; every "before" here is measured on
-  `2026-08-17 00:44:49` and the fix is not in it. Re-run `PJdkProxy`,
-  `POrder` and `PSig` against a binary containing the change and diff with
-  `tr -d '\r'`; §3's tables are the expected output.
-* **Whether the `ensureVisible` arm fires at all.** Its two signals are
-  measured to be *available* (the table in §4), but whether
-  `NativeContext::loader_id_of_class` and `module_name_of_class` agree with
-  `Class.getClassLoader()` / `Class.getModule()` — which is what that table
-  actually measured — was not. If they do not, the arm is inert and the two
-  visibility rows stay red; it cannot become over-eager, because both signals
-  must say "not bootstrap".
+* **Whether `ensureVisible` is right for a NON-null loader.** Its null-loader
+  arm is measured working in both directions on the after binary — it refuses
+  `{PJdkProxy$Prims}` and `{pkgb.Hidden}` and does not refuse `{Runnable}` —
+  but a loader that is non-null and still cannot see the interface is accepted
+  here and refused by HotSpot (§5).
 * **Where `asType`'s conversion check lives.** §6.2 rules out the two natives
   it would obviously be (`MethodHandleProxies` has none registered;
   `MethodHandle.asType` has `invocations=0`), but does not name the live body.
 * **`java.sql.Connection`'s defining loader** (§4) — bootstrap on CratonVM,
   PlatformClassLoader on HotSpot. Observed in passing; no vector asserts it and
   it was not investigated.
+* **Whether the single-interface narrowing of `checkReturnTypes` (§4) ever
+  costs a row.** No measured case needs it, and javac forbids the shape inside
+  one hierarchy — but a hand-built classfile could carry it, and this would
+  accept it.
