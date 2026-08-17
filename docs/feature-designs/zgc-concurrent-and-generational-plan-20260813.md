@@ -934,18 +934,20 @@ rebuild: `CRATONVM_ZGC_GEN_HEADER_ZERO=0` restores the whole-body memset,
 number says it alone — a small `dead_runs` is equally consistent with a cycle that
 found almost no garbage — which is why both are reported.
 
-**Not yet measured, and deliberately so.** The Azure host was at **load average
-32 on 8 cores** with three other sessions' benchmarks and two `rustc` processes
-running when these landed. That is the same condition that made the *first* G2
-measurement worthless (§3b records the box at load 25–35), and a number taken
-there would be indistinguishable from noise in the direction of whatever ran
-alongside it. Take it on a quiet box, interleaved, with the §3b probe and args.
+**MEASURED 2026-08-17 — see §3d. One of the two pays, the other measures zero,
+and the prediction written here before the run was wrong.**
 
-The prediction is arithmetic from a figure the collector
-already prints: `bytes_freed` on the `[GC] zgc-reclaim:` line *is* the memset
-volume G2e removes, so on the §3b workload (75.7% reclaim of a 1.2 GB heap) it is
-of the order of 900 MB per cycle against a 182 ms sweep. Stating it here so the
-measurement can contradict it.
+That prediction was: `bytes_freed` on the `[GC] zgc-reclaim:` line is the memset
+volume G2e removes, "of the order of 900 MB per cycle against a 182 ms sweep".
+Both halves were the wrong number for the wrong cycle. The measured memset volume
+is **400 MB across 24 young cycles — 17 MB each**, because **G2d had already
+capped it**: a bounded nursery bounds the garbage a young cycle reclaims, so the
+earlier change took most of the win the later one was predicted to. And 182 ms was
+a mean over *all* cycles, dominated by the whole-heap ones; a young cycle's sweep
+was 9.0 ms before this and 6.3 ms after.
+
+Reading `bytes_freed` off a whole-heap cycle and calling it a young cycle's memset
+volume is the same category error §3b made about `sweep` in the first place.
 
 ### G2 — what is still missing, and it is smaller than it was
 
@@ -1236,6 +1238,182 @@ the serial marker too, and one of them
 (`metadata_pin::roots_for_loader` cloning a `Vec` under an `RwLock` per marked
 object) was a cost its own module had already documented and written a fix for
 that nothing called.
+
+---
+
+## 3d. G2e/G2f measured, and §3b's diagnosis corrected — 2026-08-17
+
+`probes/ZgcGenProbe.java` at `800000 30000 600` (800k retained, 600 rounds of 30k
+churn), `-Xmx1200m`, `CRATONVM_ZGC_GENERATIONAL=1`, defaults otherwise. One
+binary, four env combinations, **arms interleaved**, two reps — so any drift from
+the neighbour benchmark on the host hits every arm equally. Host at load 1.8–3.2
+on 8 cores (two cores taken by another session), against the load 25–35 that
+invalidated the first G2 attempt.
+
+Means over the **24 young cycles** and the **7 whole-heap cycles separately**. A
+mean over all 31 is worthless here: one whole-heap cycle sweeps 13.0M dead objects
+and a young cycle sweeps 137k, so the "mean" is the major.
+
+| arm | `HEADER_ZERO` | `DEAD_RUNS` | young `sweep_us` | young `mark_us` | young `total_us` | full `sweep_us` |
+|---|---|---|---:|---:|---:|---:|
+| **A** | on | on | **6381 / 6242** | 105132 / 100770 | 114215 / 109719 | 170128 / 168733 |
+| **B** | off | off | **9223 / 8821** | 101545 / 100090 | 113482 / 111569 | 168900 / 165842 |
+| **C** | off | on | **6331 / 6308** | 101586 / 101439 | 110781 / 110497 | 172216 / 170915 |
+| **D** | on | off | **9179 / 8913** | 101031 / 100412 | 112892 / 112035 | 169114 / 166059 |
+
+### The attribution is unambiguous, and it is corroborated twice
+
+**A ≈ C** (6312 vs 6320 — 0.1% apart) and **B ≈ D** (9022 vs 9046 — 0.3%). Both
+pairs differ only in `HEADER_ZERO`, so **G2e is worth nothing measurable**, said
+from two directions rather than one. Grouped by `DEAD_RUNS`, (A,C) = 6316 against
+(B,D) = 9034: **G2f is −30.1% on the young sweep**, with within-arm spread of
+23–402 µs against a 2718 µs effect.
+
+**The whole-heap cycles are the control and they come out equal**, which is what
+must happen — both features are ANDed with `young_cycle`. Range 165.8–172.2 ms
+across all eight runs with no arm separating: that spread, ~3.8%, is also this
+measurement's noise floor.
+
+### And it does not move the pause, because the sweep is not the pause
+
+`young total_us` is 111.97 ms (A) against 112.53 ms (B): **−0.5%, inside the noise
+floor.** A 30% cut to a term worth 5.6% of the pause is 1.7%, and 1.7% is not
+visible here.
+
+**This is where §3b's diagnosis was wrong, and the correction is the finding.**
+§3b said the split "does not pay, because `sweep` is 182 ms of a 309 ms pause and
+walks every registered object whatever the split says", and promoted "a real young
+space, reclaimed by resetting a cursor" to *the thing that makes Phase G worth
+having*. On a **young** cycle, after G2a/G2d:
+
+| phase | young cycle | share |
+|---|---:|---:|
+| `mark_us` | ~101–105 ms | **~90%** |
+| `sweep_us` | 6.3 ms | 5.6% |
+| `snapshot_us` | 2.7 ms | 2.4% |
+| `markend_us` | 0 | — |
+
+The 182 ms figure was a mean over all cycles and belongs to the whole-heap ones
+(`full sweep_us` is still 170 ms of a 264 ms pause, i.e. 64%). Generalising it to
+young cycles pointed the whole G2 programme at a term worth 5.6%.
+
+### The real reason Phase G does not pay here: the young mark costs MORE than a full mark
+
+| | mark |
+|---|---:|
+| young cycle | **100.8–105.1 ms** |
+| whole-heap cycle | **90.6–92.2 ms** |
+
+A young cycle's trace is **~11% more expensive than a full trace**, and the full
+cycles had *more* registered objects when they ran (14.65M against 11.78M), which
+makes the gap wider than it looks.
+
+`remembered_roots = 19,200,000` over 24 young cycles is **exactly 800,000 per
+cycle — exactly the retained set.** Every old object is a remembered-set root on
+every young cycle, so the young trace covers the whole old generation *and* pays
+for the card machinery on top: collect the roots, scan them, re-dirty the ones
+whose edge still points into young.
+
+**That is correct behaviour on an adversarial workload, not a defect.** The probe
+rewrites a reference in the retained set every round, on purpose — §3's G0 says
+why: without those stores the remembered set stays empty and a young cycle is
+trivially correct with no cards at all, which is the vacuous configuration the
+probe must not be. But it means **this probe cannot show a young-mark saving**, and
+the structural point stands beyond the probe: the card is per-object and never
+coarsens, so any workload that touches most of its old set between collections
+turns a young mark into a full mark plus overhead.
+
+### What this means for the sequencing
+
+* **G2f stays** — −30% on a real term, no cost, and the majors are untouched.
+* **G2e stays but measures zero**, and the honest reason is that **G2d already took
+  the win**: a bounded nursery bounds the garbage a young cycle reclaims, so the
+  memset volume it removes is 17 MB per cycle rather than the ~900 MB predicted
+  above. It is kept because the redundancy argument is sound and the volume scales
+  with dead-object *size* — a workload of large dead arrays would see it where a
+  workload of 64-byte nodes cannot.
+* **A cursor-reset young space is no longer the top of the G2 list.** It attacks
+  5.6% of a young pause. The 90% is the mark, and the lever on the mark is the
+  **remembered set** — card coarsening, or a summary that does not re-root the
+  whole old generation when most of it has been written. That is a new item and it
+  is not in this plan yet.
+* Every arm reported `BAD=0 OK` with `written_intact` intact, so the correctness
+  channel held throughout. Note that G2e does **not** blind that check: a
+  header-zeroed corpse has `num_slots=0`, `check_field_index` refuses every index,
+  `get_field` returns null, and `report_corpse_read` fires — so the detector is
+  *louder* than the silent zero-read the body memset gave it. That was the missing
+  step in G2e's argument and it is now checked rather than assumed.
+
+---
+
+## 3e. C5's `perf record`, and the largest cost in the marker is not in the marker
+
+The step §3c asked for, taken 2026-08-17 on `BigLive 4000 250`, `-Xmx1500m`,
+`CRATONVM_ZGC_RELOCATE=0`, `perf record -g --call-graph dwarf`, **with the
+zero-worker serial arm recorded too** — a profile with no control names whatever
+is biggest rather than whatever is *different*.
+
+| symbol | 0 workers (serial) | 1 worker |
+|---|---:|---:|
+| `native_collections::gc_overlay_roots_for_collection` | **12.14%** | **12.78%** |
+| `external_roots::external_roots_for_owner` | **16.50%** | 7.52% |
+| `ZHeapMarkBridge::try_mark` | — | 7.14% |
+| `ZMarkWorker::drain::{closure#0}` | — | 4.89% |
+| kernel, on the mark threads | — | ~6.8% |
+
+**Between them 20–29% of samples on both arms.** `external_roots_for_owner` is
+the caller and `gc_overlay_roots_for_collection` the callee, split differently by
+the inliner on each arm — so read the pair, not either number. This is called
+**once per marked object**, from `ZgcRealHeap::visit_refs` and from
+`collect_garbage`'s serial loop alike, and it takes a `std::sync::Mutex` and
+hashes the owner address every time.
+
+**It is the fourth instance of the pattern §4's item 1 lists three of**, and it
+survived that cleanup for a structural reason worth keeping: the other three were
+found by reading `gc/`, and this one lives in **another crate**, reached through a
+provider indirection. Reading `gc/` could not have found it.
+
+### The obvious fix is inert, and it was measured before being believed
+
+An empty-index latch — the fix the other three got — was built, and it **does not
+work here**: the profile still showed the symbol at 5–14% with the latch in. The
+premise is false. `widened_obj_key` calls `register_overlay_owner_key` on **every**
+native-backed collection operation, and the JDK bootstrap alone performs enough of
+them that `overlay_owner_keys` is non-empty from startup onwards. "This heap has
+no native collections" is not a state a real run is ever in.
+
+Not merged, deliberately. An optimisation that is on and inert reads exactly like
+a missing one, and shipping it would have made the 20–29% look addressed.
+
+### What would work
+
+The question asked per object is *"is this address an overlay owner?"*, over a set
+that is non-empty but that **almost no object belongs to** — which is precisely
+the shape the skip-set filter already solves in `zgc.rs`
+(`mark_ref_skip_bloom`, `Z_SKIP_BLOOM_WORDS`, two bits per member, no false
+negatives possible). A Bloom filter over owner addresses answers nearly every
+object with two relaxed loads and no lock, and falls through to the mutex only on
+a hit. The precedent, the sizing and the correctness argument are all already in
+this tree.
+
+### And the C5 gap itself is still open
+
+`try_mark` (7.14%), the worker `drain` closure (4.89%) and ~6.8% of kernel time on
+the mark threads exist only on the parallel arm — the marker's structure, not
+contention, which is what §3c concluded from timings and this confirms from a
+profile. The overlay cost above is **not** the C5 gap: it is paid equally by both
+arms. Fixing it makes every ZGC collection faster and leaves parallel-vs-serial
+exactly where it was.
+
+### A note on the measurement itself
+
+The wall-clock A/B of the two binaries is **not reported here, because it is not
+usable**. The host went from load 1.8 to load 18 mid-run (another session started
+a benchmark and two `rustc`), and the arms were ordered old-then-new in every rep,
+so drift and order are confounded with the change. `perf record --call-graph
+dwarf` also inflated a 2.2 s run to 13–36 s, which is the overhead and not the
+binary. The profile shares above are used instead precisely because a **symbol
+share is structural**: it cannot be moved by the neighbour benchmark.
 
 ---
 
