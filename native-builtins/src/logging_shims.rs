@@ -2538,6 +2538,20 @@ pub fn register_slf4j_binder_stubs_pub(registry: &mut NativeMethodRegistry) {
         "(Ljava/lang/String;[Ljava/lang/Object;)V",
         "(Ljava/lang/String;Ljava/lang/Throwable;)V",
     ] {
+        // The VARARGS descriptor must SPREAD its `Object[]` across the `{}`
+        // placeholders; every other descriptor passes its arguments
+        // positionally already. See `slf4j_spread_varargs` -- and note that
+        // this loop, not `register_slf4j_natives`' block, is the registration
+        // that decides (last-registration-wins, per the comment above).
+        let varargs = sig == "(Ljava/lang/String;[Ljava/lang/Object;)V";
+        if varargs {
+            registry.register(lg, "trace", sig, slf4j_trace_msg_varargs);
+            registry.register(lg, "debug", sig, slf4j_debug_msg_varargs);
+            registry.register(lg, "info", sig, slf4j_log_msg_varargs);
+            registry.register(lg, "warn", sig, slf4j_log_msg_varargs);
+            registry.register(lg, "error", sig, slf4j_log_msg_varargs);
+            continue;
+        }
         registry.register(lg, "trace", sig, slf4j_trace_msg);
         registry.register(lg, "debug", sig, slf4j_debug_msg);
         registry.register(lg, "info", sig, slf4j_log_msg);
@@ -2747,11 +2761,13 @@ pub(crate) fn register_slf4j_natives(registry: &mut NativeMethodRegistry) {
         "(Ljava/lang/String;Ljava/lang/Object;Ljava/lang/Object;)V",
         slf4j_trace_msg,
     );
+    // VARARGS form: the array must be SPREAD across the placeholders, not
+    // rendered as one argument. See `slf4j_spread_varargs`.
     registry.register(
         lg,
         "trace",
         "(Ljava/lang/String;[Ljava/lang/Object;)V",
-        slf4j_trace_msg,
+        slf4j_trace_msg_varargs,
     );
 
     // debug(String)
@@ -2768,11 +2784,13 @@ pub(crate) fn register_slf4j_natives(registry: &mut NativeMethodRegistry) {
         "(Ljava/lang/String;Ljava/lang/Object;Ljava/lang/Object;)V",
         slf4j_log_msg,
     );
+    // VARARGS form: the array must be SPREAD across the placeholders, not
+    // rendered as one argument. See `slf4j_spread_varargs`.
     registry.register(
         lg,
         "debug",
         "(Ljava/lang/String;[Ljava/lang/Object;)V",
-        slf4j_log_msg,
+        slf4j_log_msg_varargs,
     );
 
     // info(String)
@@ -2789,11 +2807,13 @@ pub(crate) fn register_slf4j_natives(registry: &mut NativeMethodRegistry) {
         "(Ljava/lang/String;Ljava/lang/Object;Ljava/lang/Object;)V",
         slf4j_log_msg,
     );
+    // VARARGS form: the array must be SPREAD across the placeholders, not
+    // rendered as one argument. See `slf4j_spread_varargs`.
     registry.register(
         lg,
         "info",
         "(Ljava/lang/String;[Ljava/lang/Object;)V",
-        slf4j_log_msg,
+        slf4j_log_msg_varargs,
     );
 
     // warn(String)
@@ -2810,11 +2830,13 @@ pub(crate) fn register_slf4j_natives(registry: &mut NativeMethodRegistry) {
         "(Ljava/lang/String;Ljava/lang/Object;Ljava/lang/Object;)V",
         slf4j_log_msg,
     );
+    // VARARGS form: the array must be SPREAD across the placeholders, not
+    // rendered as one argument. See `slf4j_spread_varargs`.
     registry.register(
         lg,
         "warn",
         "(Ljava/lang/String;[Ljava/lang/Object;)V",
-        slf4j_log_msg,
+        slf4j_log_msg_varargs,
     );
     registry.register(
         lg,
@@ -2837,11 +2859,13 @@ pub(crate) fn register_slf4j_natives(registry: &mut NativeMethodRegistry) {
         "(Ljava/lang/String;Ljava/lang/Object;Ljava/lang/Object;)V",
         slf4j_log_msg,
     );
+    // VARARGS form: the array must be SPREAD across the placeholders, not
+    // rendered as one argument. See `slf4j_spread_varargs`.
     registry.register(
         lg,
         "error",
         "(Ljava/lang/String;[Ljava/lang/Object;)V",
-        slf4j_log_msg,
+        slf4j_log_msg_varargs,
     );
     registry.register(
         lg,
@@ -3246,7 +3270,7 @@ pub(crate) fn register_slf4j_natives(registry: &mut NativeMethodRegistry) {
         log4j_lg,
         "trace",
         "(Ljava/lang/String;[Ljava/lang/Object;)V",
-        slf4j_trace_msg,
+        slf4j_trace_msg_varargs,
     );
     // Each level goes through its own threshold-gated emitter (the same ones
     // the SLF4J `Logger` block above uses), so the `is*Enabled` guards further
@@ -3257,28 +3281,28 @@ pub(crate) fn register_slf4j_natives(registry: &mut NativeMethodRegistry) {
         log4j_lg,
         "debug",
         "(Ljava/lang/String;[Ljava/lang/Object;)V",
-        slf4j_debug_msg,
+        slf4j_debug_msg_varargs,
     );
     registry.register(log4j_lg, "info", "(Ljava/lang/String;)V", slf4j_info_msg);
     registry.register(
         log4j_lg,
         "info",
         "(Ljava/lang/String;[Ljava/lang/Object;)V",
-        slf4j_info_msg,
+        slf4j_info_msg_varargs,
     );
     registry.register(log4j_lg, "warn", "(Ljava/lang/String;)V", slf4j_warn_msg);
     registry.register(
         log4j_lg,
         "warn",
         "(Ljava/lang/String;[Ljava/lang/Object;)V",
-        slf4j_warn_msg,
+        slf4j_warn_msg_varargs,
     );
     registry.register(log4j_lg, "error", "(Ljava/lang/String;)V", slf4j_error_msg);
     registry.register(
         log4j_lg,
         "error",
         "(Ljava/lang/String;[Ljava/lang/Object;)V",
-        slf4j_error_msg,
+        slf4j_error_msg_varargs,
     );
     registry.register(
         log4j_lg,
@@ -3743,6 +3767,64 @@ fn slf4j_render_arg(ctx: &mut dyn NativeContext, obj: ObjectRef) -> String {
         format!("{cls}@{:x}", ctx.identity_hash_code(obj))
     })
 }
+
+/// Spread an SLF4J VARARGS call's `Object[]` into positional arguments.
+///
+/// `info(String, Object...)` arrives here as `[this, format, theArray]`, so a
+/// handler that reads `args[2..]` sees ONE argument -- the array -- renders its
+/// `toString()` into the first `{}`, and leaves every later placeholder
+/// unsubstituted. Testcontainers' Ryuk diagnostic is the canonical face:
+///
+/// ```text
+/// Can not connect to Ryuk at [Ljava.lang.Object;@2795a:{}
+/// ```
+///
+/// where HotSpot prints `localhost:60499`. That is the same class of defect as
+/// the 2026-08-14 `Object@<argument index>` fix (see
+/// `wrongcredentialstest-...`, section 5) and was left behind by it: that one
+/// corrected HOW an argument is rendered, this one corrects WHICH arguments
+/// there are. Every multi-placeholder SLF4J call in every workload was losing
+/// all but its first argument.
+///
+/// SLF4J's own `MessageFormatter.arrayFormat` is the spec being matched. The
+/// non-varargs 1- and 2-argument overloads are unaffected: javac routes a call
+/// whose sole argument IS an `Object[]` to `info(String, Object)`, so an array
+/// arriving on the varargs descriptor is always a spread.
+fn slf4j_spread_varargs(ctx: &mut dyn NativeContext, args: &[Value]) -> Vec<Value> {
+    let mut out: Vec<Value> = args.iter().take(2).copied().collect();
+    match args.get(2) {
+        Some(Value::Object(Some(arr))) => {
+            let n = ctx.array_length(*arr);
+            for i in 0..n {
+                out.push(ctx.get_array_element(*arr, i));
+            }
+        }
+        // `info(fmt, (Object[]) null)` -- SLF4J renders no arguments at all.
+        Some(Value::Object(None)) => {}
+        _ => out.extend(args.iter().skip(2).copied()),
+    }
+    out
+}
+
+/// One spreading wrapper per level-gated emitter. Every `(String, Object[])`
+/// registration must use the `_varargs` form -- there are two registrars for
+/// `org/slf4j/Logger` in this file and the LAST one wins, so fixing only one
+/// of them changes nothing.
+macro_rules! slf4j_varargs_wrapper {
+    ($name:ident, $inner:ident) => {
+        fn $name(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+            let spread = slf4j_spread_varargs(ctx, args);
+            $inner(ctx, &spread)
+        }
+    };
+}
+
+slf4j_varargs_wrapper!(slf4j_log_msg_varargs, slf4j_log_msg);
+slf4j_varargs_wrapper!(slf4j_trace_msg_varargs, slf4j_trace_msg);
+slf4j_varargs_wrapper!(slf4j_debug_msg_varargs, slf4j_debug_msg);
+slf4j_varargs_wrapper!(slf4j_info_msg_varargs, slf4j_info_msg);
+slf4j_varargs_wrapper!(slf4j_warn_msg_varargs, slf4j_warn_msg);
+slf4j_varargs_wrapper!(slf4j_error_msg_varargs, slf4j_error_msg);
 
 fn slf4j_log_msg(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // args[0] = this (Logger), args[1] = format string, args[2..] = params

@@ -18072,15 +18072,47 @@ impl Default for AfcOpenOptions {
     }
 }
 
+/// An open `AsynchronousFileChannel` handle.
+///
+/// IMMUTABLE after construction, and deliberately NOT behind a `Mutex`.
+///
+/// It used to be `Arc<Mutex<..>>`, with every read/write taking the mutex for
+/// the whole of a genuinely blocking OS call because the emulation needed
+/// `&mut File` to `seek` / `read` / `seek` back. On a regular file that is
+/// merely slow; on a Windows named PIPE it is the
+/// `WrongCredentialsTest`/Testcontainers hang (2026-08-16). `docker-java`'s
+/// `NamedPipeSocket` drives `\\.\pipe\docker_engine` through this family, and
+/// Testcontainers follows a container's log with `follow=true`. When the
+/// container goes quiet the follow read parks in `ReadFile` — correctly, there
+/// are no bytes — and the wait strategy, having already matched, calls
+/// `close()` on the stream. `close()` then had to take the SAME mutex, so it
+/// waited for bytes that would not arrive; and because it took the handle
+/// table's global lock in the same statement (`if let Some(e) =
+/// afc_files().lock().remove(&id)` keeps that guard alive for the whole `if
+/// let` under edition 2021), EVERY `AsynchronousFileChannel` operation in the
+/// process froze with it. Measured: Ryuk's log went quiet at 03:06:39, close
+/// blocked, the next `open` did not run until 03:07:39 when Ryuk finally
+/// printed again — a 60 s freeze that Testcontainers reports as
+/// "Container ... started in PT1M0.99S" and then "Could not connect to Ryuk".
+///
+/// The fix is to stop needing the lock at all: `read(dst, position, ..)` is a
+/// POSITIONAL read by definition, and both platforms expose that as a `&self`
+/// call (`FileExt::seek_read`/`seek_write` on Windows, `read_at`/`write_at` on
+/// Unix). That is also strictly more correct than the old emulation, which
+/// mutated a shared file pointer and restored it afterwards.
 struct AfcFileHandle {
     file: fs::File,
     readable: bool,
     writable: bool,
     sync: AfcSyncMode,
     delete_on_close: Option<PathBuf>,
+    /// Set by `close()`. An operation already parked in the OS when the
+    /// channel is closed must report `AsynchronousCloseException` rather than
+    /// a torn count, per `AsynchronousChannel`'s contract.
+    closed: AtomicBool,
 }
 
-type AfcFileEntry = Arc<Mutex<AfcFileHandle>>;
+type AfcFileEntry = Arc<AfcFileHandle>;
 
 fn afc_files() -> &'static Mutex<HashMap<u32, AfcFileEntry>> {
     static FILES: OnceLock<Mutex<HashMap<u32, AfcFileEntry>>> = OnceLock::new();
@@ -18101,7 +18133,7 @@ fn afc_next_file_id() -> io::Result<u32> {
 
 fn afc_insert_file(handle: AfcFileHandle) -> io::Result<u32> {
     let id = afc_next_file_id()?;
-    afc_files().lock().insert(id, Arc::new(Mutex::new(handle)));
+    afc_files().lock().insert(id, Arc::new(handle));
     Ok(id)
 }
 
@@ -18114,13 +18146,52 @@ fn afc_file_entry(id: u32) -> io::Result<AfcFileEntry> {
     })
 }
 
+/// Ask the OS to abandon any I/O already parked on `file`.
+///
+/// Windows only, and the reason `close()` is prompt rather than merely
+/// non-blocking: `CancelIoEx` with a null OVERLAPPED cancels every outstanding
+/// request on the handle **regardless of the thread that issued it**, which
+/// includes a synchronous `ReadFile` parked on an idle pipe. Verified against
+/// `\\.\pipe\docker_engine`: the parked read returns
+/// `ERROR_OPERATION_ABORTED` (995) within a millisecond of the call.
+///
+/// The caller still holds an `Arc` to the handle and the parked reader holds
+/// one too, so the handle cannot have been closed underneath this call.
+/// A failure is ignored: "nothing was pending" is the common case and is not
+/// an error condition.
+#[cfg(windows)]
+fn afc_cancel_pending_io(file: &fs::File) {
+    use std::os::windows::io::AsRawHandle;
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn CancelIoEx(handle: *mut std::ffi::c_void, overlapped: *mut std::ffi::c_void) -> i32;
+    }
+    // SAFETY: `file` is a live open handle for the duration of this call.
+    unsafe {
+        CancelIoEx(file.as_raw_handle().cast(), std::ptr::null_mut());
+    }
+}
+
+/// Unix has no portable equivalent, and does not need one here: this family is
+/// only reached for regular files there (the Docker transport uses a Unix
+/// domain socket, which goes through `uds.rs`), and a regular-file read never
+/// parks indefinitely.
+#[cfg(not(windows))]
+fn afc_cancel_pending_io(_file: &fs::File) {}
+
 fn afc_remove_file(id: u32) {
-    if let Some(entry) = afc_files().lock().remove(&id) {
-        let delete_on_close = entry.lock().delete_on_close.clone();
-        drop(entry);
-        if let Some(path) = delete_on_close {
-            let _ = fs::remove_file(path);
-        }
+    // Take the entry out and RELEASE the table lock before touching anything
+    // that can block. Folding these two into one `if let` is what froze every
+    // channel in the process behind one parked pipe read; see `AfcFileHandle`.
+    let entry = afc_files().lock().remove(&id);
+    let Some(entry) = entry else { return };
+    entry.closed.store(true, Ordering::SeqCst);
+    afc_cancel_pending_io(&entry.file);
+    afc_trace!("close  id={id} cancelled-pending-io");
+    let delete_on_close = entry.delete_on_close.clone();
+    drop(entry);
+    if let Some(path) = delete_on_close {
+        let _ = fs::remove_file(path);
     }
 }
 
@@ -18286,6 +18357,7 @@ fn afc_open_file(path: &str, opts: AfcOpenOptions) -> io::Result<u32> {
         writable: opts.write,
         sync: opts.sync,
         delete_on_close: opts.delete_on_close.then(|| PathBuf::from(path)),
+        closed: AtomicBool::new(false),
     })?;
     afc_trace!(
         "open   id={id} read={} write={} path={path}",
@@ -18295,64 +18367,114 @@ fn afc_open_file(path: &str, opts: AfcOpenOptions) -> io::Result<u32> {
     Ok(id)
 }
 
+/// One positional read, on `&File` — no seek, no shared file pointer, no lock.
+#[inline]
+fn afc_pread(file: &fs::File, buf: &mut [u8], position: u64) -> io::Result<usize> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::FileExt;
+        file.seek_read(buf, position)
+    }
+    #[cfg(not(windows))]
+    {
+        use std::os::unix::fs::FileExt;
+        file.read_at(buf, position)
+    }
+}
+
+/// One positional write, on `&File`. Loops like `write_all` because a
+/// positional write may be short.
+#[inline]
+fn afc_pwrite_all(file: &fs::File, data: &[u8], position: u64) -> io::Result<()> {
+    let mut off = 0usize;
+    while off < data.len() {
+        #[cfg(windows)]
+        let n = {
+            use std::os::windows::fs::FileExt;
+            file.seek_write(&data[off..], position + off as u64)?
+        };
+        #[cfg(not(windows))]
+        let n = {
+            use std::os::unix::fs::FileExt;
+            file.write_at(&data[off..], position + off as u64)?
+        };
+        if n == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::WriteZero,
+                "asynchronous positional write made no progress",
+            ));
+        }
+        off += n;
+    }
+    Ok(())
+}
+
+/// `ERROR_OPERATION_ABORTED` — what a parked read returns once `close()` has
+/// called `CancelIoEx` on the handle. Reported as `AsynchronousCloseException`
+/// by the callers, which is the contract.
+#[cfg(windows)]
+const AFC_ERROR_OPERATION_ABORTED: i32 = 995;
+
+/// Was this the OS telling us `close()` cancelled the operation?
+fn afc_is_cancelled_error(e: &io::Error) -> bool {
+    #[cfg(windows)]
+    {
+        e.raw_os_error() == Some(AFC_ERROR_OPERATION_ABORTED)
+    }
+    #[cfg(not(windows))]
+    {
+        matches!(e.kind(), io::ErrorKind::Interrupted)
+    }
+}
+
 fn afc_read_at(id: u32, buf: &mut [u8], position: u64) -> io::Result<usize> {
     let entry = afc_file_entry(id)?;
-    let mut handle = entry.lock();
-    if !handle.readable {
+    if !entry.readable {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             "channel was not opened for reading",
         ));
     }
-    let saved = handle.file.stream_position()?;
-    handle.file.seek(SeekFrom::Start(position))?;
-    afc_trace!(
-        "os-read  id={id} pos={position} saved={saved} want={} ENTER",
-        buf.len()
-    );
-    let read_result = handle.file.read(buf);
+    afc_trace!("os-read  id={id} pos={position} want={} ENTER", buf.len());
+    let read_result = afc_pread(&entry.file, buf, position);
     afc_trace!("os-read  id={id} pos={position} -> {:?}", read_result);
-    let restore_result = handle.file.seek(SeekFrom::Start(saved));
-    match (read_result, restore_result) {
-        (Err(e), _) => Err(e),
-        (Ok(_), Err(e)) => Err(e),
-        (Ok(n), Ok(_)) => Ok(n),
-    }
+    read_result
 }
 
 fn afc_write_at(id: u32, data: &[u8], position: u64) -> io::Result<usize> {
     let entry = afc_file_entry(id)?;
-    let mut handle = entry.lock();
-    if !handle.writable {
+    if !entry.writable {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             "channel was not opened for writing",
         ));
     }
-    let saved = handle.file.stream_position()?;
-    handle.file.seek(SeekFrom::Start(position))?;
-    let write_result = handle.file.write_all(data).and_then(|_| match handle.sync {
-        AfcSyncMode::None => Ok(()),
-        AfcSyncMode::Data => handle.file.sync_data(),
-        AfcSyncMode::All => handle.file.sync_all(),
-    });
-    let restore_result = handle.file.seek(SeekFrom::Start(saved));
-    match (write_result, restore_result) {
-        (Err(e), _) => Err(e),
-        (Ok(_), Err(e)) => Err(e),
-        (Ok(_), Ok(_)) => Ok(data.len()),
+    afc_pwrite_all(&entry.file, data, position)?;
+    match entry.sync {
+        AfcSyncMode::None => {}
+        AfcSyncMode::Data => entry.file.sync_data()?,
+        AfcSyncMode::All => entry.file.sync_all()?,
+    }
+    Ok(data.len())
+}
+
+/// Did `close()` run while an operation was parked in the OS?
+fn afc_handle_closed(id: u32) -> bool {
+    match afc_file_entry(id) {
+        Ok(entry) => entry.closed.load(Ordering::SeqCst),
+        // Gone from the table at all means closed.
+        Err(_) => true,
     }
 }
 
 fn afc_file_size(id: u32) -> io::Result<u64> {
     let entry = afc_file_entry(id)?;
-    let handle = entry.lock();
-    Ok(handle.file.metadata()?.len())
+    Ok(entry.file.metadata()?.len())
 }
 
 fn afc_file_writable(id: u32) -> bool {
     match afc_file_entry(id) {
-        Ok(entry) => entry.lock().writable,
+        Ok(entry) => entry.writable,
         Err(_) => false,
     }
 }
@@ -18362,10 +18484,9 @@ fn afc_file_writable(id: u32) -> bool {
 /// current file size, only ever shrinks.
 fn afc_truncate_at(id: u32, new_len: u64) -> io::Result<()> {
     let entry = afc_file_entry(id)?;
-    let handle = entry.lock();
-    let cur_len = handle.file.metadata()?.len();
+    let cur_len = entry.file.metadata()?.len();
     if new_len < cur_len {
-        handle.file.set_len(new_len)?;
+        entry.file.set_len(new_len)?;
     }
     Ok(())
 }
@@ -19217,18 +19338,20 @@ fn native_afc_read(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
     let mut buf = vec![0u8; remaining];
     // STW-TAKEOVER guard (same class of bug as the documented
     // AsynchronousSocketChannel.read/write fix elsewhere in this file):
-    // afc_read_at parks on a real Mutex::lock() around genuinely blocking
-    // disk I/O. Under testConcurrent's tight two-thread read/write loop
-    // (H2 TestFileSystem, "async:" filesystem) contention on that mutex
-    // is real, and without a GC-safepoint-cooperation bracket a
-    // concurrent STW pause waits forever for this thread to reach an
-    // interpreter safepoint it never hits while parked in the lock/I-O
-    // call -- observed as TestFileSystem hanging at the 300s harness
-    // timeout instead of completing. `bb` is used again after the call
-    // (bb_write_byte/buf_set_position below), so it must survive any GC
-    // that ran while blocked; re-derive `view` from the refreshed `bb`
-    // rather than reusing the pre-block one, in case a moving GC
-    // relocated its backing array too.
+    // `afc_read_at` performs genuinely blocking I/O, and on a pipe it can park
+    // indefinitely. Without a GC-safepoint-cooperation bracket a concurrent
+    // STW pause waits forever for this thread to reach an interpreter
+    // safepoint it never hits while parked in the OS call -- observed as
+    // TestFileSystem hanging at the 300 s harness timeout instead of
+    // completing. `bb` is used again after the call
+    // (bb_write_byte/buf_set_position below), so it must survive any GC that
+    // ran while blocked; re-derive `view` from the refreshed `bb` rather than
+    // reusing the pre-block one, in case a moving GC relocated its backing
+    // array too.
+    //
+    // 2026-08-16: the call no longer holds ANY lock while parked (see
+    // `AfcFileHandle`), so `close()` on another thread runs immediately and
+    // cancels this read rather than queueing behind it.
     let mut blocked_refs = [Value::Object(Some(bb))];
     afc_trace!("read   id={handle_id} pos={position} bb[{pos}..{lim}] want={remaining} ENTER");
     ctx.begin_blocking_region();
@@ -19238,9 +19361,26 @@ fn native_afc_read(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
         Value::Object(Some(o)) => o,
         _ => bb,
     };
-    let n = read_result.map_err(|e| RuntimeError::IOException {
-        message: format!("async read: {e}"),
-    })?;
+    let n = match read_result {
+        Ok(n) => n,
+        // `close()` cancelled us. That is not an I/O failure, it is the
+        // documented completion for an outstanding operation on a closed
+        // asynchronous channel.
+        Err(ref e) if afc_is_cancelled_error(e) || afc_handle_closed(handle_id) => {
+            afc_trace!("read   id={handle_id} pos={position} CANCELLED by close");
+            return Err(afc_raise_async_close(ctx));
+        }
+        Err(e) => {
+            return Err(RuntimeError::IOException {
+                message: format!("async read: {e}"),
+            }
+            .into())
+        }
+    };
+    if afc_handle_closed(handle_id) {
+        afc_trace!("read   id={handle_id} pos={position} CLOSED after {n} bytes");
+        return Err(afc_raise_async_close(ctx));
+    }
 
     if n == 0 {
         afc_trace!("read   id={handle_id} pos={position} want={remaining} EOF -> -1");
@@ -19367,9 +19507,20 @@ fn native_afc_write(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
         Value::Object(Some(o)) => o,
         _ => bb,
     };
-    let n = write_result.map_err(|e| RuntimeError::IOException {
-        message: format!("async write: {e}"),
-    })?;
+    let n = match write_result {
+        Ok(n) => n,
+        // See the matching arm in `native_afc_read`.
+        Err(ref e) if afc_is_cancelled_error(e) || afc_handle_closed(handle_id) => {
+            afc_trace!("write  id={handle_id} pos={position} CANCELLED by close");
+            return Err(afc_raise_async_close(ctx));
+        }
+        Err(e) => {
+            return Err(RuntimeError::IOException {
+                message: format!("async write: {e}"),
+            }
+            .into())
+        }
+    };
 
     buf_set_position(ctx, bb, pos + n as i32);
     // See native_afc_read above for the full rationale: box before
@@ -19377,6 +19528,32 @@ fn native_afc_write(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     // usage, so Future<Integer>.get()'s checkcast Integer succeeds.
     let boxed = afc_box_integer(ctx, n as i32)?;
     Ok(Some(wrap_completed_future(ctx, boxed)?))
+}
+
+/// Raise `java.nio.channels.AsynchronousCloseException`.
+///
+/// `AsynchronousChannel`'s contract: closing a channel causes every
+/// outstanding operation on it to complete with this exception. Before the
+/// 2026-08-16 fix nothing could reach this state — `close()` could not run
+/// until the parked operation finished, which is the whole defect.
+///
+/// The concrete type is load-bearing, not decoration -- a caller catching
+/// `AsynchronousCloseException` (or its `ClosedChannelException` supertype)
+/// walks straight past a bare `IOException` whose message merely mentions the
+/// name. Same idiom, and the same reasoning, as `pipe::async_close_error`.
+fn afc_raise_async_close(ctx: &mut dyn NativeContext) -> MethodCallFailed {
+    match ctx.new_object_initialized("java/nio/channels/AsynchronousCloseException", "()V", &[]) {
+        Ok(Some(Value::Object(Some(exc)))) => {
+            let pin = ctx.pin_native_root(exc);
+            let exc = ctx.read_native_pin(pin, exc);
+            ctx.unpin_native_roots(pin);
+            MethodCallFailed::ExceptionThrown(exc)
+        }
+        _ => RuntimeError::IOException {
+            message: "channel closed while an asynchronous operation was pending".into(),
+        }
+        .into(),
+    }
 }
 
 fn afc_box_integer(ctx: &mut dyn NativeContext, n: i32) -> Result<Value, MethodCallFailed> {
