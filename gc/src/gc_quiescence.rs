@@ -1882,7 +1882,8 @@ type VacatedLedger = (
     rustc_hash::FxHashSet<usize>,
 );
 
-static VACATED_ADDRS: parking_lot::Mutex<Option<VacatedLedger>> = parking_lot::Mutex::new(None);
+static VACATED_ADDRS: parking_lot::RwLock<Option<VacatedLedger>> =
+    parking_lot::RwLock::new(None);
 
 /// `CRATONVM_DBG_VACATED_FRAMES=1` — arm the vacated-address ledger.
 pub fn vacated_frames_enabled() -> bool {
@@ -1911,7 +1912,7 @@ pub fn record_vacated(pointer_map: &cratonvm_types::PointerMap) {
         return;
     }
     let to: rustc_hash::FxHashSet<usize> = pointer_map.values().copied().collect();
-    let mut g = VACATED_ADDRS.lock();
+    let mut g = VACATED_ADDRS.write();
     let (from, dests) = g.get_or_insert_with(Default::default);
     // ACCUMULATE across collections rather than replace. A stale reference is
     // not necessarily consumed before the next cycle, and a ledger that only
@@ -1943,7 +1944,7 @@ pub fn note_allocated(addrs: &[usize]) {
     if !vacated_frames_enabled() {
         return;
     }
-    let mut g = VACATED_ADDRS.lock();
+    let mut g = VACATED_ADDRS.write();
     let Some((from, _to)) = g.as_mut() else {
         return;
     };
@@ -1965,7 +1966,7 @@ pub fn was_vacated(addr: usize) -> Option<usize> {
     if !vacated_frames_enabled() {
         return None;
     }
-    let g = VACATED_ADDRS.lock();
+    let g = VACATED_ADDRS.read();
     let (from, dests) = g.as_ref()?;
     if dests.contains(&addr) {
         return None;
