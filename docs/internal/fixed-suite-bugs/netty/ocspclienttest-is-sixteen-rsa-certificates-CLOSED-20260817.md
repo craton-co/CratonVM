@@ -61,7 +61,7 @@ registration over `math_bignum.rs`'s decimal-string one — LAST-write-wins), so
 the 11x there is square-and-multiply with a Knuth-D division per step against
 HotSpot's Montgomery intrinsics. That is the one named, contained lever left in
 this area and it is filed separately as
-`docs/known-issues/biginteger-modpow-has-no-montgomery-reduction-20260817.md`
+`docs/known-issues/perf/biginteger-modpow-has-no-montgomery-reduction-20260817.md`
 — deliberately NOT attempted here, because it is a crypto-correctness-sensitive
 rewrite and not what this page was about.
 

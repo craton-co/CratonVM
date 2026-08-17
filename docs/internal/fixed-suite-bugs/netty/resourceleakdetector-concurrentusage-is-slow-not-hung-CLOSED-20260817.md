@@ -192,5 +192,5 @@ cd apps/netty-suite-runner
 - `sniclienttest-sni-refusal-alert-FIXED-20260817.md`,
   `ocspclienttest-is-sixteen-rsa-certificates-CLOSED-20260817.md` — the two
   sibling pages retired in the same pass.
-- `docs/known-issues/g1-retained-store-thread-scaling-20260817.md` — the
+- `docs/known-issues/perf/g1-retained-store-thread-scaling-20260817.md` — the
   residue of the write-barrier finding above, filed with its measurement.
