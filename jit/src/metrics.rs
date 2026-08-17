@@ -2746,3 +2746,48 @@ pub fn getfield_arm_emits() -> Vec<(&'static str, u64)> {
         .filter(|(_, v)| *v > 0)
         .collect()
 }
+
+/// Why the IR tier declined to inline a `getfield`, by early-out.
+///
+/// The tier A/B (C2 threshold raised out of reach) moved helper calls
+/// 48.9 M -> 5.7 M, so ~88% of them are this function's `return false`
+/// fallback, which emits an UNGUARDED `CALL jit_getfield`. It has seven
+/// early-outs; this says which.
+pub static IR_GETFIELD_DECLINE: [std::sync::atomic::AtomicU64; 7] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
+
+/// Names for [`IR_GETFIELD_DECLINE`], index-parallel.
+pub const IR_GETFIELD_DECLINE_NAMES: [&str; 7] = [
+    "no-helper-addr",
+    "no-bytecode-pc",
+    "no-compact-slot-for-pc",
+    "narrow-oops-or-zgc-barrier",
+    "inline-gates-off",
+    "type-tag-disagrees",
+    "width-not-int-category",
+];
+
+/// Record an IR-tier inline-`getfield` refusal.
+#[inline]
+pub fn note_ir_getfield_decline(reason: usize) {
+    if let Some(c) = IR_GETFIELD_DECLINE.get(reason) {
+        c.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// `(name, count)` for every refusal reason that fired.
+pub fn ir_getfield_declines() -> Vec<(&'static str, u64)> {
+    IR_GETFIELD_DECLINE_NAMES
+        .iter()
+        .zip(IR_GETFIELD_DECLINE.iter())
+        .map(|(n, c)| (*n, c.load(std::sync::atomic::Ordering::Relaxed)))
+        .filter(|(_, v)| *v > 0)
+        .collect()
+}

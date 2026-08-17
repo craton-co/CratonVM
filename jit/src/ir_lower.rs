@@ -2341,20 +2341,25 @@ fn reloc_emit_enabled() -> bool {
         slot: i32,
     ) -> bool {
         if self.getfield == 0 {
+            crate::metrics::note_ir_getfield_decline(0);
             return false;
         }
         let Some(pc) = node_pc else {
+            crate::metrics::note_ir_getfield_decline(1);
             return false;
         };
         let Some(&(c_off, c_is_ref, type_tag)) = self.compact_fields.get(&pc) else {
+            crate::metrics::note_ir_getfield_decline(2);
             return false;
         };
         if crate::x64::narrow_oops_block_inline_fields() {
+            crate::metrics::note_ir_getfield_decline(3);
             return false;
         }
         let raw_mode = crate::x64::inline_getfield_enabled();
         let guarded = crate::x64::guarded_inline_getfield_enabled() && self.region_bounds_addr != 0;
         if !raw_mode && !guarded {
+            crate::metrics::note_ir_getfield_decline(4);
             return false;
         }
         // The node type and the resolved descriptor must agree. They can only
@@ -2364,9 +2369,11 @@ fn reloc_emit_enabled() -> bool {
         let ref_node = node_ty == IrType::Ref;
         let ref_tag = matches!(type_tag, b'L' | b'[');
         if ref_node != ref_tag || ref_tag != c_is_ref {
+            crate::metrics::note_ir_getfield_decline(5);
             return false;
         }
         if !ref_node && !matches!(type_tag, b'I' | b'Z' | b'B' | b'C' | b'S') {
+            crate::metrics::note_ir_getfield_decline(6);
             return false;
         }
 

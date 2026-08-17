@@ -148,6 +148,14 @@ fn maybe_dump_shutdown_reports() {
                 .collect::<Vec<_>>()
                 .join(" ")
         );
+        eprintln!(
+            "[cratonvm] IR-tier inline-getfield refusals: {}",
+            cratonvm_jit::metrics::ir_getfield_declines()
+                .iter()
+                .map(|(n, c)| format!("{n}={c}"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
         // The bytecode loop rewriter's admission tally, on the same switch and
         // for the same reason: it is what the compiler did, read at exit. The
         // counters themselves are always collected (they do not consult
