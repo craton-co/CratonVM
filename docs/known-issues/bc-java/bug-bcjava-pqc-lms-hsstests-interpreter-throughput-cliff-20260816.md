@@ -241,6 +241,20 @@ The host is shared, so treat wall clock as orders of magnitude; the interleaved
 kernel rounds and the identical-binary `HSSTests` pair are the controlled
 comparisons.
 
+**In `--nojit` — the mode the harness actually runs — the intrinsic is worth
+much more**, because there it replaces interpreted bytecode rather than
+compiled code:
+
+| `--nojit` kernel | base | +fix | gain |
+|---|---|---|---|
+| round 1 | 1 808 166 ns/op | 301 026 | **6.0x** |
+| round 2 | 1 804 905 ns/op | 333 612 | **5.4x** |
+
+That does not rescue `--nojit` as a sweep mode: forced interpretation is still
+~35–60x the JIT-on cost, so `HSSTests` under `--nojit` remains far beyond any
+sane per-class budget even after a 6x. It is an argument for dropping the flag,
+not for raising the timeout.
+
 ### Re-profiled after the fix
 
 | | before | after |
