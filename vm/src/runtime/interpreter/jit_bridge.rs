@@ -2133,6 +2133,13 @@ pub(super) fn route_osr_exception_out_of_artifact(
         shared, thread, frame_idx, &rframe, compiled, handler_pc, exc_ref,
     ) {
         Ok(()) => {
+            // The engagement counter for the whole lift. `osr_entered` says an
+            // artifact was entered; only this says an exception raised inside
+            // one was routed through the method's own handler — the thing
+            // RBC.6b refused to allow at all. Read it beside `osr_entered` and
+            // `osr_exited`: a run with `osr_entered` climbing and this at zero
+            // is a loop whose `catch` never fires, not a working lift.
+            cratonvm_jit::metrics::record_osr_event("osr_exception_handler_entered");
             fire_jvmti_exception_catch(shared.vm_identity, &thread.frames[frame_idx], handler_pc);
             OsrExceptionExit::EnteredHandler
         }
@@ -2167,6 +2174,18 @@ pub(super) fn try_osr(
     // paths that used to re-stash + safe-reject; see `OsrBackoffOutcome::
     // ThrowJava` for why the safe reject was wrong there.
     throw_out: &mut Option<ObjectRef>,
+    // Out-channel: set when the OSR'd body RAN and this frame was advanced by
+    // it, even though the return is `None`. Today that is exactly one path —
+    // the RBC.6b lift's handler entry, where the frame is left parked at a
+    // `catch` block with the throwable on its stack.
+    //
+    // `None` from this function otherwise means "the OSR attempt was rejected,
+    // nothing ran", and the caller charges it against the per-pc rejection
+    // budget (`record_osr_rejection`, permanent after `OSR_MAX_ATTEMPTS = 5`).
+    // Charging a caught exception against that budget would turn OSR off after
+    // the fifth `catch` — on a loop with netty's measured 7.7% throw rate, some
+    // sixty-five compiled iterations out of four billion.
+    committed_out: &mut bool,
 ) -> Option<Option<Value>> {
     // Not gated on `class_was_redefined`. That predicate is true forever once
     // a class has been redefined, so it barred OSR from a redefined class for
@@ -2459,7 +2478,10 @@ pub(super) fn try_osr(
             &method_descriptor,
             exc,
         ) {
-            OsrExceptionExit::EnteredHandler => return None,
+            OsrExceptionExit::EnteredHandler => {
+                *committed_out = true;
+                return None;
+            }
             OsrExceptionExit::Propagate => {
                 *throw_out = Some(exc);
                 return None;
@@ -2498,7 +2520,10 @@ pub(super) fn try_osr(
                     &method_descriptor,
                     exc,
                 ) {
-                    OsrExceptionExit::EnteredHandler => return None,
+                    OsrExceptionExit::EnteredHandler => {
+                        *committed_out = true;
+                        return None;
+                    }
                     OsrExceptionExit::Propagate => {
                         *throw_out = Some(exc);
                         return None;
@@ -2542,7 +2567,10 @@ pub(super) fn try_osr(
                     &method_descriptor,
                     exc_obj,
                 ) {
-                    OsrExceptionExit::EnteredHandler => return None,
+                    OsrExceptionExit::EnteredHandler => {
+                        *committed_out = true;
+                        return None;
+                    }
                     OsrExceptionExit::Propagate => {
                         *throw_out = Some(exc_obj);
                         return None;
@@ -2587,7 +2615,10 @@ pub(super) fn try_osr(
                     &method_descriptor,
                     exc,
                 ) {
-                    OsrExceptionExit::EnteredHandler => return None,
+                    OsrExceptionExit::EnteredHandler => {
+                        *committed_out = true;
+                        return None;
+                    }
                     OsrExceptionExit::Propagate => {
                         *throw_out = Some(exc);
                         return None;

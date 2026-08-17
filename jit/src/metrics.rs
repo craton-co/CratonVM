@@ -1376,7 +1376,7 @@ pub fn clear_reports() {
 ///
 /// Same shape as [`SCHEDULING_EVENTS`]: a closed set, a fixed array of relaxed
 /// counters, no allocation and no initialization order.
-pub const OSR_EVENTS: [&str; 12] = [
+pub const OSR_EVENTS: [&str; 13] = [
     // An OSR entry was actually taken: the trampoline ran and control reached
     // compiled code at a back edge. The denominator for everything below.
     "osr_entered",
@@ -1447,10 +1447,28 @@ pub const OSR_EVENTS: [&str; 12] = [
     "osr_published_but_unenterable",
     // The method is on the OSR-denied list, so no back edge in it will enter.
     "osr_method_denied",
+    // An exception raised inside an OSR'd body was routed through that method's
+    // OWN exception table and the live frame was parked at the handler — the
+    // thing RBC.6b refused to allow at all until 2026-08-17.
+    //
+    // This is the engagement counter for the lift, and it is the row to read
+    // when a `try`/`catch` loop is "still slow". `osr_entered` climbing with
+    // this at zero means the loop's `catch` never fires (so the lift is not
+    // what is costing you); this climbing means it fires, and each one is an
+    // OSR exit plus a re-entry at the next back edge.
+    //
+    // It also names the shape that ate the lift once already: each of these
+    // used to be charged to the per-pc rejection budget
+    // (`Frame::record_osr_rejection`), which retires OSR after
+    // `OSR_MAX_ATTEMPTS = 5`. A loop with netty's 7.7% throw rate therefore ran
+    // compiled for about sixty-five of four billion iterations while passing
+    // every correctness probe.
+    "osr_exception_handler_entered",
 ];
 
 /// One relaxed counter per [`OSR_EVENTS`] entry.
 static OSR_COUNTERS: [AtomicU64; OSR_EVENTS.len()] = [
+    AtomicU64::new(0),
     AtomicU64::new(0),
     AtomicU64::new(0),
     AtomicU64::new(0),

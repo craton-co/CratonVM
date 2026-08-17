@@ -65,6 +65,13 @@ public final class OsrExcTableProbe {
         }
     }
 
+    /** The escape arm's thrower — see `loopThrowEscapes`. */
+    static void lateThrow(int i, int at) {
+        if (i == at) {
+            throw IAE;
+        }
+    }
+
     static void otherThrow(int i) {
         if ((i & 0x3FFF) == 0) {
             throw IAE;
@@ -134,9 +141,12 @@ public final class OsrExcTableProbe {
             } catch (IllegalStateException e) {
                 catchCount++;
             }
-            if (i == throwAt) {
-                throw IAE;
-            }
+            // Through a CALLEE, not a bare `throw`: an `athrow` in the method
+            // body is refused by RBC.6, a separate and still-standing gate, and
+            // an arm that never compiles tests the interpreter rather than the
+            // lift. (Measured: with `throw IAE` written inline here this method
+            // read `OSR-compile FAILED` while its two siblings compiled.)
+            lateThrow(i, throwAt);
             i++;
         } while (i != n);
     }
