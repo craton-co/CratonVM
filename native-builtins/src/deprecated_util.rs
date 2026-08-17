@@ -660,7 +660,7 @@ fn native_string_init_from_string_builder(
     let this = obj_arg(args, 0)?;
     let sb = obj_arg(args, 1)?; // null builder -> NPE, matching the JDK ctor
     let (buf, count) = crate::lang_string::sb_state(ctx, sb);
-    let bytes = match buf {
+    let units: Vec<u16> = match buf {
         Some(b) => {
             let n = count.max(0) as usize;
             let mut chars = Vec::with_capacity(n);
@@ -671,11 +671,34 @@ fn native_string_init_from_string_builder(
                 };
                 chars.push(ch);
             }
-            String::from_utf16_lossy(&chars).into_bytes()
+            chars
         }
         None => Vec::new(),
     };
-    string_from_bytes_utf8(ctx, this, &bytes)
+    // Write the UTF-16 units STRAIGHT into `this`.
+    //
+    // This used to be `String::from_utf16_lossy(&chars).into_bytes()` fed to
+    // `string_from_bytes_utf8`, and the round trip through a Rust `String` is
+    // the bug: a `str` cannot hold an unpaired surrogate at all, so every lone
+    // surrogate in the builder became U+FFFD. MEASURED on HotSpot 25.0.3+9 —
+    // `sb.append((char) 0xDC00); new String(sb).charAt(0)` is 56320, where this
+    // answered 65533. The builder itself was never lossy: `sb.charAt(0)` and
+    // `sb.toString().charAt(0)` both already answered 56320, so this
+    // constructor disagreed with the very object it was copying.
+    //
+    // `init_string_from_units` is the units-preserving primitive and the only
+    // one that applies here. Note it is NOT interchangeable with
+    // `lang_string::sb_string_from_units`, which ALLOCATES a fresh String and
+    // returns it — correct for a String-returning native, wrong for a
+    // constructor, which must populate the receiver the caller already has a
+    // reference to. Both end in the same `populate_java_string_fields`.
+    if !ctx.init_string_from_units(this, &units) {
+        return Err(RuntimeError::OutOfMemoryError {
+            message: "Java heap space (String from StringBuilder)".to_string(),
+        }
+        .into());
+    }
+    Ok(None)
 }
 
 /// `<init>([BII)V` — `new String(byte[], int offset, int length)`.
@@ -3574,5 +3597,129 @@ mod tests {
             "Expected at least 39 registered natives, got {}",
             reg.len()
         );
+    }
+
+    // -------------------------------------------------------------------------
+    // G32: `new String(StringBuilder)` must carry UTF-16 units, not a Rust str
+    // -------------------------------------------------------------------------
+
+    /// Build a CratonVM synthetic `StringBuilder`: field 0 = char[] buffer,
+    /// field 1 = count. `sb_state` reads exactly this shape.
+    fn make_builder(ctx: &mut MockNativeContext, units: &[u16], capacity: usize) -> ObjectRef {
+        let buf = ctx.new_array(cratonvm_types::ArrayElementType::Char, capacity);
+        for (i, &u) in units.iter().enumerate() {
+            ctx.set_array_element(buf, i, Value::Int(u as i32));
+        }
+        let sb = ctx.alloc_object(cratonvm_types::ClassId::new(0), 2);
+        ctx.set_field(sb, 0, Value::Object(Some(buf)));
+        ctx.set_field(sb, 1, Value::Int(units.len() as i32));
+        sb
+    }
+
+    /// Read back what `init_string_from_units` wrote. `MockNativeContext` uses
+    /// the trait's default impl, which stores the units as a char[] in field 0,
+    /// so this observes UNITS and never a `String` round trip.
+    fn read_units(ctx: &MockNativeContext, obj: ObjectRef) -> Vec<u16> {
+        let Value::Object(Some(arr)) = ctx.get_field(obj, 0) else {
+            panic!("no units array was written into the receiver");
+        };
+        (0..ctx.array_length(arr))
+            .map(|i| match ctx.get_array_element(arr, i) {
+                Value::Int(v) => v as u16,
+                other => panic!("non-int unit at {i}: {other:?}"),
+            })
+            .collect()
+    }
+
+    /// The bug this pins: the body used to be
+    /// `String::from_utf16_lossy(&chars).into_bytes()`, and a Rust `str` cannot
+    /// hold an unpaired surrogate, so U+DC00 came back as U+FFFD.
+    ///
+    /// MEASURED on HotSpot 25.0.3+9: `sb.append((char) 0xDC00);
+    /// new String(sb).charAt(0)` is 56320 (0xDC00), and `.length()` is 1.
+    ///
+    /// Asserted as UNITS on purpose. A test written through `read_string`
+    /// passes on the BROKEN code, because that conversion is the defect.
+    #[test]
+    fn new_string_from_builder_keeps_a_lone_low_surrogate() {
+        let mut ctx = MockNativeContext::new();
+        let sb = make_builder(&mut ctx, &[0xDC00], 16);
+        let this = ctx.alloc_object(cratonvm_types::ClassId::new(0), 4);
+        native_string_init_from_string_builder(
+            &mut ctx,
+            &[Value::Object(Some(this)), Value::Object(Some(sb))],
+        )
+        .expect("constructor must not fail");
+        assert_eq!(read_units(&ctx, this), vec![0xDC00_u16]);
+    }
+
+    /// The high half, and the round trip through a mixed sequence: the
+    /// surrogate must survive with its NEIGHBOURS intact and the length must
+    /// stay 4. A lossy conversion answers `97,98,65533,99` here — same length,
+    /// so a length-only assertion would pass on the broken code.
+    #[test]
+    fn new_string_from_builder_keeps_a_lone_high_surrogate_among_ascii() {
+        let mut ctx = MockNativeContext::new();
+        let sb = make_builder(&mut ctx, &[0x0061, 0x0062, 0xD800, 0x0063], 32);
+        let this = ctx.alloc_object(cratonvm_types::ClassId::new(0), 4);
+        native_string_init_from_string_builder(
+            &mut ctx,
+            &[Value::Object(Some(this)), Value::Object(Some(sb))],
+        )
+        .expect("constructor must not fail");
+        assert_eq!(
+            read_units(&ctx, this),
+            vec![0x0061_u16, 0x0062, 0xD800, 0x0063]
+        );
+    }
+
+    /// Only `count` units are copied, never the buffer's CAPACITY. The builder
+    /// below has a 32-slot array holding 5 characters; reading the whole array
+    /// is the padding bug `read_string`'s class guard exists to prevent, and
+    /// this constructor must not reintroduce it.
+    #[test]
+    fn new_string_from_builder_copies_count_not_capacity() {
+        let mut ctx = MockNativeContext::new();
+        let sb = make_builder(&mut ctx, &[0x0068, 0x0065, 0x006C, 0x006C, 0x006F], 32);
+        let this = ctx.alloc_object(cratonvm_types::ClassId::new(0), 4);
+        native_string_init_from_string_builder(
+            &mut ctx,
+            &[Value::Object(Some(this)), Value::Object(Some(sb))],
+        )
+        .expect("constructor must not fail");
+        assert_eq!(read_units(&ctx, this).len(), 5);
+        assert_eq!(
+            read_units(&ctx, this),
+            vec![0x0068_u16, 0x0065, 0x006C, 0x006C, 0x006F]
+        );
+    }
+
+    /// A well-formed surrogate PAIR is two units and must stay two units — the
+    /// fix must not "helpfully" combine them into one code point.
+    #[test]
+    fn new_string_from_builder_keeps_a_well_formed_pair_as_two_units() {
+        let mut ctx = MockNativeContext::new();
+        let sb = make_builder(&mut ctx, &[0xD83D, 0xDE00], 16);
+        let this = ctx.alloc_object(cratonvm_types::ClassId::new(0), 4);
+        native_string_init_from_string_builder(
+            &mut ctx,
+            &[Value::Object(Some(this)), Value::Object(Some(sb))],
+        )
+        .expect("constructor must not fail");
+        assert_eq!(read_units(&ctx, this), vec![0xD83D_u16, 0xDE00]);
+    }
+
+    /// An empty builder produces an empty String, not a failure.
+    #[test]
+    fn new_string_from_builder_handles_an_empty_builder() {
+        let mut ctx = MockNativeContext::new();
+        let sb = make_builder(&mut ctx, &[], 16);
+        let this = ctx.alloc_object(cratonvm_types::ClassId::new(0), 4);
+        native_string_init_from_string_builder(
+            &mut ctx,
+            &[Value::Object(Some(this)), Value::Object(Some(sb))],
+        )
+        .expect("constructor must not fail");
+        assert!(read_units(&ctx, this).is_empty());
     }
 }

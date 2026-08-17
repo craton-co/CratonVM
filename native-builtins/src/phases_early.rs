@@ -6174,6 +6174,36 @@ pub(crate) fn register_enum_map_natives(r: &mut NativeMethodRegistry) {
 
 fn native_em_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
+    // A null key type is a `NullPointerException`, in BOTH modes.
+    //
+    // `EnumMap(Class<K> keyType)` is `keyUniverse = getKeyUniverse(keyType)`,
+    // which reaches `keyType.getEnumConstantsShared()` — an unguarded
+    // dereference, so the JDK throws before storing anything. This body instead
+    // fell through to the `_ =>` arm below, built a zero-length universe and
+    // RETURNED, leaving a live `EnumMap` with a null `keyType` whose every
+    // subsequent `put` would fail somewhere else with an unrelated message.
+    //
+    // The message is HotSpot 25.0.3+9's helpful-NPE text, transcribed:
+    // `Cannot invoke "java.lang.Class.getEnumConstantsShared()" because "klass"
+    // is null`. `RJdkIntrinsics3`'s `ckX` compares only the exception CLASS, so
+    // the text is fidelity rather than gate; it is recorded here so a later
+    // lane that does compare messages has the measured one and not a guess.
+    //
+    // Placed ahead of the real/synthetic split deliberately: the contract is
+    // the Java one and does not depend on which layout backs the map, and no
+    // in-VM caller constructs an `EnumMap` with a null class (the bootstrap
+    // logging path that motivated the essential-set registration passes a real
+    // enum class; `alloc_enum_map` builds its instance without this ctor).
+    if matches!(args.get(1), None | Some(Value::Object(None))) {
+        return Err(RuntimeError::NullPointerException {
+            message: Some(
+                "Cannot invoke \"java.lang.Class.getEnumConstantsShared()\" \
+                 because \"klass\" is null"
+                    .to_string(),
+            ),
+        }
+        .into());
+    }
     // `<init>` is dispatched via invokespecial, where a registered native
     // ALWAYS wins over bytecode (see `invoke_special_shared`'s "Native
     // override always wins" priority) — unlike invokevirtual calls such as
@@ -12652,6 +12682,51 @@ fn p52_isa_check_port(port: i32) -> Result<i32, cratonvm_types::error::MethodCal
     Ok(port)
 }
 
+/// `InetSocketAddress.checkHost` — a null hostname is an
+/// `IllegalArgumentException`, NOT the `NullPointerException` a native that
+/// simply dereferences the argument produces.
+///
+/// The message is TRANSCRIBED from HotSpot 25.0.3+9, not paraphrased: it is
+/// `hostname can't be null` — an apostrophe, no article, no trailing period.
+///
+/// **The order this runs in relative to [`p52_isa_check_port`] is different in
+/// the two callers, and neither is derivable from the other.** The JDK:
+///
+/// ```java
+/// public static InetSocketAddress createUnresolved(String host, int port) {
+///     return new InetSocketAddress(checkPort(port), checkHost(host));
+/// }
+/// public InetSocketAddress(String hostname, int port) {
+///     checkHost(hostname);
+///     ...
+///     holder = new InetSocketAddressHolder(host, addr, checkPort(port));
+/// }
+/// ```
+///
+/// `createUnresolved` evaluates `checkPort` FIRST because it is the first
+/// *argument*; the constructor calls `checkHost` first as its first
+/// *statement*. MEASURED, both wrong at once:
+///
+/// | call | HotSpot |
+/// |---|---|
+/// | `createUnresolved(null, -1)` | `IllegalArgumentException: port out of range:-1` |
+/// | `new InetSocketAddress((String) null, -1)` | `IllegalArgumentException: hostname can't be null` |
+///
+/// Two methods that look interchangeable, opposite answers. A guard written
+/// once and shared in one order gets one of these rows right and the other
+/// wrong, and the wrong one is the row a reviewer would call obviously
+/// equivalent. Do not "simplify" the two call sites into a common helper that
+/// fixes an order.
+fn p52_isa_check_host(host: Value) -> Result<(), MethodCallFailed> {
+    if matches!(host, Value::Object(None)) {
+        return Err(RuntimeError::IllegalArgumentException {
+            message: "hostname can't be null".to_string(),
+        }
+        .into());
+    }
+    Ok(())
+}
+
 fn p52_isa_set(ctx: &mut dyn NativeContext, this: ObjectRef, host: Value, addr: Value, port: i32) -> Result<(), MethodCallFailed> {
     // Cross-call GC-safety (2026-08-04): `alloc_concurrent_synthetic` allocates
     // (and on a cold VM also loads + initialises the holder class), so `this`,
@@ -12864,6 +12939,14 @@ pub(crate) fn register_phase52_inet_socket_address(r: &mut NativeMethodRegistry)
     });
     r.register(isa, "<init>", "(Ljava/lang/String;I)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
+        // HOST FIRST, then port — see [`p52_isa_check_host`]. This is the
+        // opposite order from `createUnresolved` below, and it is measured, not
+        // assumed: `new InetSocketAddress((String) null, -1)` reports the
+        // hostname on HotSpot while `createUnresolved(null, -1)` reports the
+        // port. `obj_arg(args, 1)?` used to run here and raised
+        // `NullPointerException: null object argument` for both.
+        let host_val = args.get(1).copied().unwrap_or(Value::Object(None));
+        p52_isa_check_host(host_val)?;
         let host = obj_arg(args, 1)?;
         let port = p52_isa_check_port(args[2].as_int().unwrap_or(0))?;
         // Real JDK resolves the hostname via `InetAddress.getByName(host)`
@@ -12955,8 +13038,15 @@ pub(crate) fn register_phase52_inet_socket_address(r: &mut NativeMethodRegistry)
         "createUnresolved",
         "(Ljava/lang/String;I)Ljava/net/InetSocketAddress;",
         |ctx, args| {
-            let host = obj_arg(args, 0)?;
+            // PORT FIRST, then host — the reverse of the `(String,I)V`
+            // constructor above, because `createUnresolved` is
+            // `new InetSocketAddress(checkPort(port), checkHost(host))` and
+            // `checkPort` is the first argument evaluated. MEASURED:
+            // `createUnresolved(null, -1)` is `port out of range:-1`, not
+            // `hostname can't be null`. See [`p52_isa_check_host`].
             let port = p52_isa_check_port(args[1].as_int().unwrap_or(0))?;
+            p52_isa_check_host(args.first().copied().unwrap_or(Value::Object(None)))?;
+            let host = obj_arg(args, 0)?;
             // Cross-call GC-safety: the allocation below can move `host`.
             let mut scope = NativeHandleScope::new(ctx);
             let host_h = scope.root(host);
@@ -25706,5 +25796,134 @@ mod t2_tests {
             JUL_NPE_NULL_FORMAT_RECORD,
             "Cannot invoke \"java.util.logging.LogRecord.getMessage()\" because \"record\" is null"
         );
+    }
+
+    // -------------------------------------------------------------------------
+    // G32: InetSocketAddress's two guards, and the ORDER each caller runs them in
+    // -------------------------------------------------------------------------
+
+    /// Pull the class and message out of whatever a guard returned.
+    fn refusal(e: MethodCallFailed) -> String {
+        match e {
+            MethodCallFailed::InternalError(cratonvm_types::error::VmError::Runtime(r)) => {
+                format!("{r}")
+            }
+            other => format!("UNEXPECTED {other:?}"),
+        }
+    }
+
+    /// TRANSCRIBED from HotSpot 25.0.3+9, not paraphrased: an apostrophe, no
+    /// article, no trailing period. This body used to raise
+    /// `NullPointerException: null object argument` instead, because it read the
+    /// host with `obj_arg`.
+    #[test]
+    fn g32_isa_null_host_is_illegal_argument_with_the_measured_text() {
+        let e = p52_isa_check_host(Value::Object(None)).unwrap_err();
+        assert_eq!(
+            refusal(e),
+            "IllegalArgumentException: hostname can't be null"
+        );
+    }
+
+    /// A non-null host passes, and so does a host the VM cannot read as text —
+    /// the guard is about NULLNESS only, and must not start decoding.
+    #[test]
+    fn g32_isa_non_null_host_passes_the_guard() {
+        let mut ctx = mock_ctx();
+        let s = ctx.create_string("example.invalid");
+        assert!(p52_isa_check_host(Value::Object(Some(s))).is_ok());
+    }
+
+    /// `port out of range:-1` — NO SPACE after the colon. A `{port}` written as
+    /// `: {port}` reads identically in a review and differs on the wire.
+    #[test]
+    fn g32_isa_port_message_has_no_space_after_the_colon() {
+        let e = p52_isa_check_port(-1).unwrap_err();
+        assert_eq!(refusal(e), "IllegalArgumentException: port out of range:-1");
+        let e = p52_isa_check_port(65536).unwrap_err();
+        assert_eq!(
+            refusal(e),
+            "IllegalArgumentException: port out of range:65536"
+        );
+    }
+
+    /// 0 and 65535 are both LEGAL — 65535 is the last legal port, and an
+    /// exclusive upper bound is the obvious off-by-one here.
+    #[test]
+    fn g32_isa_port_bounds_are_inclusive_at_both_ends() {
+        assert_eq!(p52_isa_check_port(0).unwrap(), 0);
+        assert_eq!(p52_isa_check_port(65535).unwrap(), 65535);
+    }
+
+    /// **The row that cannot be derived, pinned in both directions.**
+    ///
+    /// When host AND port are both invalid, the two entry points disagree about
+    /// which one to report, because the JDK writes them differently:
+    ///
+    /// ```java
+    /// createUnresolved(host, port) -> new InetSocketAddress(checkPort(port), checkHost(host));
+    /// InetSocketAddress(hostname, port) { checkHost(hostname); ... checkPort(port) ... }
+    /// ```
+    ///
+    /// `checkPort` is `createUnresolved`'s first *argument*; `checkHost` is the
+    /// constructor's first *statement*. MEASURED on HotSpot 25.0.3+9:
+    /// `createUnresolved(null, -1)` answers `port out of range:-1` and
+    /// `new InetSocketAddress((String) null, -1)` answers
+    /// `hostname can't be null`.
+    ///
+    /// This test reproduces the two call sites' orderings rather than calling
+    /// the registered natives (which need a live heap), so it fails the moment
+    /// someone "simplifies" the two into one shared guard — which is exactly the
+    /// change that looks obviously correct and is not.
+    #[test]
+    fn g32_isa_the_two_entry_points_check_in_opposite_orders() {
+        // createUnresolved: PORT first.
+        let created = p52_isa_check_port(-1)
+            .map(|_| ())
+            .and_then(|_| p52_isa_check_host(Value::Object(None)));
+        assert_eq!(
+            refusal(created.unwrap_err()),
+            "IllegalArgumentException: port out of range:-1",
+            "createUnresolved(null, -1) must report the PORT"
+        );
+
+        // <init>(String, int): HOST first.
+        let constructed = p52_isa_check_host(Value::Object(None))
+            .and_then(|_| p52_isa_check_port(-1).map(|_| ()));
+        assert_eq!(
+            refusal(constructed.unwrap_err()),
+            "IllegalArgumentException: hostname can't be null",
+            "new InetSocketAddress((String) null, -1) must report the HOST"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // G32: EnumMap(null)
+    // -------------------------------------------------------------------------
+
+    /// `EnumMap(Class)` reaches `keyType.getEnumConstantsShared()` unguarded, so
+    /// a null key type is a `NullPointerException` before anything is stored.
+    /// This body used to build a zero-length universe and RETURN, leaving a live
+    /// map with a null `keyType`.
+    #[test]
+    fn g32_enum_map_null_key_type_throws_npe() {
+        let mut ctx = mock_ctx();
+        let this = crate::try_alloc_concurrent_synthetic(&mut ctx, "java/util/EnumMap", 3).unwrap();
+        let e = native_em_init(&mut ctx, &[Value::Object(Some(this)), Value::Object(None)])
+            .unwrap_err();
+        assert!(
+            refusal(e).starts_with("NullPointerException"),
+            "a null key type must be an NPE"
+        );
+    }
+
+    /// A MISSING argument is the same case as an explicit null — a native must
+    /// not read a shorter `args` slice as "no key type was requested".
+    #[test]
+    fn g32_enum_map_missing_key_type_arg_throws_npe() {
+        let mut ctx = mock_ctx();
+        let this = crate::try_alloc_concurrent_synthetic(&mut ctx, "java/util/EnumMap", 3).unwrap();
+        let e = native_em_init(&mut ctx, &[Value::Object(Some(this))]).unwrap_err();
+        assert!(refusal(e).starts_with("NullPointerException"));
     }
 }
