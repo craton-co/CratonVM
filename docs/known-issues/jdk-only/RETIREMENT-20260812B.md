@@ -39,24 +39,26 @@ below without a control column, the control was run and agreed.
 
 ## 0. Where retired records go, verified before anything moved
 
-**`docs/internal/retired/`, named `jdk-only-<slug>-RETIRED-<date>.md`.** The
-directory exists, is populated (46 files) and is tracked — the four records
-`RETIREMENT-20260812.md` moved are there today
-(`docs/internal/retired/jdk-only-W7-4-differential-probe-widening-round-2-RETIRED-20260812.md`
+**`retired/` in the internal record tree, named
+`jdk-only-<slug>-RETIRED-<date>.md`.** The directory exists, is populated
+(46 files) and is tracked — the four records `RETIREMENT-20260812.md` moved are
+there today
+(`retired/jdk-only-W7-4-differential-probe-widening-round-2-RETIRED-20260812.md`
 and its three siblings) and the worktree is clean, which an untracked add would
 not be. README's phrase *"the internal record tree"* means this path.
 
 **It is subject to a history rewrite, and that does not change the
-destination.** An orchestrator effort has been removing `docs/internal/` from a
-fresh public history since 2026-07-27 (durable design docs were relocated to
-`docs/architecture/`, `docs/known-gaps/` and `docs/` top level; bug-hunting
-logs, dated results and handoffs go with the folder). The rule that follows is
+destination.** An orchestrator effort has been removing the internal record
+tree from a fresh public history since 2026-07-27 (durable design docs were
+relocated to `docs/architecture/`, `docs/known-gaps/` and `docs/` top level;
+bug-hunting logs, dated results and handoffs go with the folder). The rule that
+follows is
 **not** "pick another destination" — retiring a known-issue write-up *into*
-`docs/internal/` is what that folder is for, and every retirement pass in this
-directory has used it. The rule is about **citations**:
+the internal record tree is what that folder is for, and every retirement pass
+in this directory has used it. The rule is about **citations**:
 
-* never write a `docs/internal/...` path into a `.rs` comment or into a doc that
-  survives under `docs/known-issues/` — refer to the retired write-up **by
+* never write an internal-record-tree path into a `.rs` comment or into a doc
+  that survives under `docs/known-issues/` — refer to the retired write-up **by
   name** ("the retired `W7-13-strict-mh-insert-wrapper` write-up");
 * put the durable facts — root cause, repro, residual — into the surviving
   record or the source comment *before* the move, not into the file being moved.
@@ -362,28 +364,28 @@ directory already exists and is tracked.
 
 ```sh
 git mv docs/known-issues/jdk-only/W7-59-layout-detector-coverage.md \
-       docs/internal/retired/jdk-only-W7-59-layout-detector-coverage-RETIRED-20260812.md
+       retired/jdk-only-W7-59-layout-detector-coverage-RETIRED-20260812.md
 
 git mv docs/known-issues/jdk-only/W7-13-strict-mh-insert-wrapper.md \
-       docs/internal/retired/jdk-only-W7-13-strict-mh-insert-wrapper-RETIRED-20260812.md
+       retired/jdk-only-W7-13-strict-mh-insert-wrapper-RETIRED-20260812.md
 
 git mv docs/known-issues/jdk-only/W7-40-differential-at-14.md \
-       docs/internal/retired/jdk-only-W7-40-differential-at-14-SUPERSEDED-20260812.md
+       retired/jdk-only-W7-40-differential-at-14-SUPERSEDED-20260812.md
 
 git mv docs/known-issues/jdk-only/W7-48-fjp-unapplied-patches.md \
-       docs/internal/retired/jdk-only-W7-48-fjp-unapplied-patches-RETIRED-20260812.md
+       retired/jdk-only-W7-48-fjp-unapplied-patches-RETIRED-20260812.md
 
 git mv docs/known-issues/jdk-only/W7-82-forname-duplicate-define.md \
-       docs/internal/retired/jdk-only-W7-82-forname-duplicate-define-RETIRED-20260812.md
+       retired/jdk-only-W7-82-forname-duplicate-define-RETIRED-20260812.md
 
 git mv docs/known-issues/jdk-only/W7-38-crypto-trio-verified.md \
-       docs/internal/retired/jdk-only-W7-38-crypto-trio-verified-RETIRED-20260812.md
+       retired/jdk-only-W7-38-crypto-trio-verified-RETIRED-20260812.md
 
 git mv docs/known-issues/jdk-only/W7-67-host-default-locale.md \
-       docs/internal/retired/jdk-only-W7-67-host-default-locale-RETIRED-20260812.md
+       retired/jdk-only-W7-67-host-default-locale-RETIRED-20260812.md
 
 git mv docs/known-issues/jdk-only/W7-92-system-timezone-answers-utc.md \
-       docs/internal/retired/jdk-only-W7-92-system-timezone-answers-utc-RETIRED-20260812.md
+       retired/jdk-only-W7-92-system-timezone-answers-utc-RETIRED-20260812.md
 ```
 
 `W7-40` takes `SUPERSEDED` rather than `RETIRED`, matching the

@@ -2,7 +2,7 @@
 
 ## Status
 **FIXED 2026-08-17 — superseded by**
-[`../../internal/fixed-suite-bugs/h2-suite-bugs/bug-h2-testscript-fk-array-comparability-skipped-by-rowcount-shortcut-FIXED-20260817.md`](../../internal/fixed-suite-bugs/h2-suite-bugs/bug-h2-testscript-fk-array-comparability-skipped-by-rowcount-shortcut-FIXED-20260817.md).
+`fixed-suite-bugs/h2-suite-bugs/bug-h2-testscript-fk-array-comparability-skipped-by-rowcount-shortcut-FIXED-20260817.md`.
 
 The root cause was **not** in H2's Java at all: CratonVM natively overrides
 `ConstraintReferential.checkExistingData` (`native-builtins/src/apps_h2.rs`), and
