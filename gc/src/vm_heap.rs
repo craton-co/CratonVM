@@ -981,6 +981,10 @@ impl VmHeap {
         // of the wrong class, which is why the value being pushed looks clean
         // and the `checkcast` one instruction later does not.
         crate::gc_quiescence::report_vacated_receiver(obj.as_ptr() as usize, "get_field");
+        // The re-issue-proof half of the same question — see
+        // `gc_quiescence::stale_use_verdict` for why the exact ledger above
+        // cannot answer it.
+        crate::gc_quiescence::check_stale_use(obj.as_ptr() as usize, "get_field receiver");
         dispatch!(self, get_field(obj, index))
     }
 
@@ -2449,6 +2453,11 @@ impl VmHeap {
     pub fn print_gc_summary(&self) {
         if let VmHeap::G1(g1) = self {
             g1.print_gc_summary();
+            // Independent of GC stats being requested: this census answers
+            // "how many accessor calls still take the global regions lock?",
+            // which is a question about the MUTATOR, not about collections.
+            // Gated by its own flag (`CRATONVM_DBG_G1ACCESSOR`).
+            g1.dbg_report_accessor_census();
         }
         // ZGC: the same unconditional-counts treatment the generational branch
         // below gets, and for the same reason — without it a `--verbose:gc` run
@@ -2561,11 +2570,32 @@ impl VmHeap {
             let (skipped, floor, old_live) = h.nursery_stats();
             let (nursery_fired, nursery_budget) = h.nursery_trigger_stats();
             eprintln!(
-                "[GC] zgc-nursery-trigger: fired={nursery_fired}                  budget_bytes={nursery_budget} promotions_by_slide={}",
+                "[GC] zgc-nursery-trigger: fired={nursery_fired}                  budget_bytes={nursery_budget} promotions_by_slide={} \
+                 overshoot_max={}",
                 h.promotions_by_slide(),
+                // BESIDE THE BUDGET, because it is meaningless without it: this
+                // is how far past `budget_bytes` the nursery got before a
+                // safepoint arrived, and it prices "a hard ceiling rather than a
+                // trigger" -- an open item that has had no number attached. See
+                // `ZgcRealHeap::gen_nursery_overshoot_max`.
+                h.nursery_overshoot_max(),
             );
             eprintln!(
                 "[GC] zgc-nursery: sweep_skipped={skipped} floor={floor}                  old_live_bytes={old_live}",
+            );
+            // WHAT THE YOUNG SWEEP STOPPED DOING PER DEAD OBJECT.
+            //
+            // Read the two together and against `young_cycles` above.
+            // `zero_bytes_skipped=0` with `young_cycles>0` means every dead
+            // object was still memset in full, so `CRATONVM_ZGC_GEN_HEADER_ZERO`
+            // is on and inert; `dead_runs == dead_objects` means no two dead
+            // objects were ever adjacent, so the run merge is. Neither number
+            // says it alone -- a small `dead_runs` is equally consistent with a
+            // cycle that found almost no garbage.
+            let (zero_skipped, dead_runs, dead_objects) = h.gen_sweep_cost_stats();
+            eprintln!(
+                "[GC] zgc-sweep-cost: zero_bytes_skipped={zero_skipped} \
+                 dead_runs={dead_runs} dead_objects={dead_objects}",
             );
             // `ZGC_UNSIZABLE_OBJECTS` had no reader anywhere but a unit test.
             // It is the sweep's own count of registered objects whose header it
@@ -2573,6 +2603,17 @@ impl VmHeap {
             // already met and silently worked around, one warning per process.
             // A run that ends with a nonzero here has corrupt headers whatever
             // else it reports.
+            // A NOTIFICATION THAT IS MISSING IS A SLOWDOWN, NOT A FAILURE.
+            // The mark driver's fixed-point wait is a `wait_for`, so a lost
+            // notification costs a poll interval and is otherwise
+            // indistinguishable from a working one -- which is how the driver
+            // came to poll a never-notified condvar on a 5 ms grid for months.
+            // Nonzero here means it is back. A count, so it reads the same on a
+            // loaded host as on a quiet one.
+            eprintln!(
+                "[GC] zgc-mark-wait: park_timeouts={}",
+                h.mark_park_timeouts(),
+            );
             eprintln!(
                 "[GC] zgc-integrity: unsizable_registered_objects={}",
                 crate::zgc::ZGC_UNSIZABLE_OBJECTS.load(std::sync::atomic::Ordering::Relaxed),

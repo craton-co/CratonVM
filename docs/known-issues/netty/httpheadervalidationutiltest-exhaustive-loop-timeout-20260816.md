@@ -1,25 +1,38 @@
-# `HttpHeaderValidationUtilTest` — 8.6e9 iterations against a 180s wall, at ~11 calls each
+# `HttpHeaderValidationUtilTest` — both exhaustive loops run INTERPRETED, because a `try` in the method makes the OSR door refuse it
 
-**Status: OPEN, throughput. Sized 2026-08-17.** Original measurement
-2026-08-16 on commit `3ef3eb744`; the sizing below is 2026-08-17 on
-`cf141b8a8`, Windows host, release build, G1, real-JDK mode, against HotSpot 25
-on the same host.
+**Status: OPEN, and this page's 2026-08-16/08-17 diagnosis was wrong.** It sized
+the class as "the same compiled-code throughput wall as the sibling, with twice
+the iteration count and 1.5x the work per iteration". It is not a compiled-code
+wall: **the two exhaustive `@Test` methods are never compiled at all.** Measured
+2026-08-17 on `perf/netty-exhaustive-loop-walls-20260817`, Windows host, release
+build, G1, real-JDK mode, against HotSpot 25 on the same host.
 
 ## Summary
 
 | | found | ok | failed | wall |
 |---|---|---|---|---|
-| CratonVM G1 (isolated) | 0 | 0 | 0 | **HANG, rc=124 @ 180s** |
+| CratonVM G1 (isolated), 2026-08-16 | 0 | 0 | 0 | **HANG, rc=124 @ 180s** |
 | HotSpot 25 (isolated) | 5506 | 5506 | 0 | 39.9s |
 
-Isolated and HotSpot passes the whole class (5506 sub-tests, almost all from
-parameterization) in under 40 s. Not a contention artifact, not a harness gap.
+The 39.9 s figure does not survive re-measurement, and the number that matters is
+per method. `ProgressRunner` on this host, HotSpot 25:
+
+| method | HotSpot wall |
+|---|---:|
+| `headerValueValidationMustRejectAllValuesRejectedByOldAlgorithm` | **54.8 s** |
+| `headerNameValidationMustRejectAllNamesRejectedByOldAlgorithm` | **32.6 s** |
+| both, plus the ~5504 quick parameterized subtests | **~87.4 s** |
+
+So the 180 s per-class wall allows CratonVM **~2.06x HotSpot** on this class —
+where the sibling
+[`httpresponsestatustest-exhaustive-loop-timeout-20260816.md`](httpresponsestatustest-exhaustive-loop-timeout-20260816.md)
+allows ~69x. Calling the two "the same wall" was the mis-sizing that produced
+every wrong estimate below it.
 
 ## The budget
 
 Two `@Test` methods, both annotated
-`@DisabledForJreRange(max = JRE.JAVA_17) // This test is much too slow on older
-Java versions`, iterate every possible 32-bit value:
+`@DisabledForJreRange(max = JRE.JAVA_17)`, iterate every possible 32-bit value:
 
 ```java
 int i = Integer.MIN_VALUE;
@@ -35,63 +48,135 @@ do {
 } while (i != Integer.MIN_VALUE);
 ```
 
-`headerValueValidationMustRejectAllValuesRejectedByOldAlgorithm` and its twin
-`headerNameValidationMustRejectAllNamesRejectedByOldAlgorithm` over
-`validateToken`: **4 294 967 296 iterations each, 8 589 934 592 in total**,
-plus the ~5504 quick parameterized tests. HotSpot does all of it in 39.9 s, so
-its whole-class rate is ~4.6 ns per exhaustive iteration.
+**4 294 967 296 iterations each, 8 589 934 592 in total.** 180 s over one loop is
+42 ns/iteration; over both it is **21 ns/iteration**, against HotSpot's 9.4 and
+8.2. That is the real budget, and no arrangement of the existing compiler reaches
+it — see [What is left](#what-is-left).
 
-To fit the 180 s wall CratonVM needs **~21 ns/iteration**, and each iteration
-is not one operation:
+## The finding: the loops never leave the interpreter
 
-* `ByteBuffer.putInt(0, i)` — a registered native on this VM, ~900 ns measured
-  standalone (`probes/NioAccessorRate.java`);
-* `oldHeaderValueValidationAlgorithm(asciiString)` — a 4-iteration inner loop
-  calling `seq.length()` and `seq.charAt(index)` on an `AsciiString` plus a
-  static state-machine step per character, i.e. ~9 more calls;
-* on the ~5% of inputs containing `0x00`, `0x0b`, `0x0c` or a bad CR/LF
-  sequence, a throw of a preallocated exception plus two
-  `validateValidHeaderValue` calls.
+`CRATONVM_DBG_JITC=1`, one run of the probe below:
 
-So this class is the same wall as
-`httpresponsestatustest-exhaustive-loop-timeout-20260816.md` with roughly twice
-the iteration count and roughly 1.5x the work per iteration. It is the harder
-of the two by a wide margin and should be attacked second.
+```
+OSR-recompile reason=no-cached-artifact  HeaderValidationLoopRate.headerValueLoop(I)V entry_pc=79
+OSR-compile FAILED                      HeaderValidationLoopRate.headerValueLoop(I)V osr_bci=79
+                                        — method marked OSR-denied for the rest of this process
+OSR-recompile reason=no-cached-artifact  HeaderValidationLoopRate.headerNameLoop(I)V  entry_pc=79
+OSR-compile FAILED                      HeaderValidationLoopRate.headerNameLoop(I)V  osr_bci=79
+                                        — method marked OSR-denied for the rest of this process
+```
 
-## The two mechanisms it inherits
+A `@Test` method is invoked ONCE, so OSR is its only route out of the
+interpreter. Refused, permanently, and the loop is interpreted for its whole
+life. `CRATONVM_DBG=jit-method-stats` on the same run (131 072 iterations):
+**`deopts=65115 c2_bailouts=65105`**,
+`hot_but_stuck_in_interpreter=3 (ineligible-by-policy=3)`.
 
-Both are measured on the sibling page and both apply here unchanged:
+What the loops actually cost, therefore:
 
-1. **Compile order.** A hot method that compiles before the library beneath it
-   binds its call sites to the slow route and never re-binds:
-   `probes/org/junit/jupiter/api/CompileOrderProbe.java` measures 382-399
-   ns/iter cold against 82-84 prewarm — **4.6x**, deterministic, and 0.95x when
-   the warming is done *after* the caller is compiled. A `@Test` method's loop
-   crosses the OSR threshold long before JUnit's assertion chain is hot, which
-   is exactly the cold arm.
-2. **No inlining at the optimizing tier.** Every `tier=c2 path=optimizing`
-   compile in these runs reports `inline_candidates=0` — the inliner runs only
-   on the single-pass path, whose body is then replaced by the c2 one. So each
-   of the ~11 calls per iteration stays a real call frame where C2 collapses the
-   whole body.
+| | HotSpot 25 | CratonVM | ratio |
+|---|---:|---:|---:|
+| value loop | 9.4 ns/iter | **309 423 ns/iter** | **33 000x** |
+| name loop | 8.2 ns/iter | **19 242 ns/iter** | **2 100x** |
 
-Additionally, unlike the sibling, this loop *does* hit a registered native per
-iteration (`ByteBuffer.putInt`), so the native-call floor sized in
-`httpcontentdecompressortest-hang-20260816.md` applies to it directly:
-`AtomicInteger.getAndIncrement` with a JIT intrinsic costs 5.3 ns where
-`AtomicInteger.get` without one costs 160 ns, in the same process and the same
-compile door.
+Not the "~1.5x the sibling's per-iteration work" this page estimated. The sibling
+is a compiled loop that is 2.9x too slow; this is an interpreted loop four to
+five orders of magnitude too slow.
 
-## A timeout that did not fire is not itself evidence of a hang
+## Why: `RBC.6b`, and it is deliberate
 
-`common.args` sets `-Djunit.jupiter.execution.timeout.default=120s`, which
-should apply to both loops. No `TimeoutException` was printed before the
-harness's own 180 s cap fired, which is consistent with JUnit Jupiter's default
-`SAME_THREAD` timeout mode being unable to preempt a synchronous,
-non-interruption-checking loop. (Contrast
-`HttpContentDecompressorTest.testZipBomb`, where the same 120 s timeout *does*
-fire — that one blocks in codec work rather than spinning.) Not read as a
-separate CratonVM defect.
+`vm/src/runtime/interpreter/jit_bridge.rs`, `compile_osr_artifact`, refuses **any
+method with a non-empty exception table** — before codegen, which is why there is
+no `codegen-bail` line to find. `probes/OsrDenyShapeProbe.java` isolates it in one
+run: six once-called methods with hot loops, and `try`/`catch` is the only
+discriminator (an allocation before the loop, an anonymous class before the loop,
+`do`/`while` instead of `for` all compile).
+
+The refusal exists because `compile_with_param_slots` is not given an exception
+table, so an OSR artifact carries no handler ranges and a callee exception
+unwinding into that frame would escape a `catch` that textually guards the call —
+observed once as a servlet's `try { resp.resetBuffer(); } catch (...)` silently
+ceasing to catch. It must not simply be deleted.
+
+The full write-up, the shape bisect, and the design for lifting it safely are in
+[`../jit/osr-refuses-any-method-with-an-exception-table-20260817.md`](../jit/osr-refuses-any-method-with-an-exception-table-20260817.md).
+That page is the one to fix; this one is a consumer of it.
+
+## The probe, and the two wrong ways to write it
+
+`probes/io/netty/handler/codec/http/HeaderValidationLoopRate.java` is the two
+`@Test` bodies verbatim, each reached exactly once, with bounded sampling. Getting
+the sampling right took three attempts, and the two failures are worth recording
+because both look correct:
+
+* **`i++` from `Integer.MIN_VALUE`, bounded** — 75.4 ns/iter on HotSpot against
+  the real 12.8. A prefix window can sit entirely inside the ~5% of values
+  containing `0x00`/`0x0b`/`0x0c`, which THROW and then run two `validateXxx`
+  calls in the `catch`.
+* **a fixed stride across the whole range** — 85.1 ns/iter, and *not* because the
+  throw rate is wrong (it is 7.68%, measured, which is right). It is the branch
+  predictor: the old algorithm is two data-dependent `switch`es per character over
+  four characters, consecutive values make those branches near-perfectly
+  predicted, and a strided walk makes them random. The real loop is contiguous.
+* **contiguous WINDOWS of `i++`, window starts spread across the range** — 9.2 /
+  8.1 ns/iter against the real 12.8 / 7.6. That is the shape to use.
+
+One more thing the probe needs: **prime the two `HttpHeaderValidationUtil` entry
+points the `catch` arm calls, before either loop runs.** The catch arm runs on
+~7.7% of iterations, so in a bounded probe it is a cold branch the JIT sees late,
+whereas in the real class the 5504 parameterized subtests have already made both
+entry points hot. Without priming, HotSpot prices the catch arm at ~820 ns
+against the ~74 ns the real method pays on the same VM — a 9x error that swamps
+everything the probe exists to measure.
+
+## What was ruled out, and what the eager-callee-chain fix did here
+
+* **The `ByteBuffer.putInt(0, i)` native floor.** Still real — a heap
+  `HeapByteBuffer.putInt(int,int)` is `session()` + `Buffer.checkIndex` +
+  `byteOffset` + `ScopedMemoryAccess.putIntUnaligned`, of which two were
+  registered natives on the ~160 ns funnel (see
+  [`httpcontentdecompressortest-hang-20260816.md`](httpcontentdecompressortest-hang-20260816.md)).
+  Thin direct helpers for `Buffer.session()` and
+  `ScopedMemoryAccess.{put,get}IntUnaligned` were written on this branch and
+  **reverted, because the census says they never bind**: those JDK accessor
+  methods take the OPTIMIZING (IR) pipeline, whose direct-call lowering is
+  register-only (`emit_direct_cross_call` requires
+  `num_args + needs_context <= ENTRY_ABI_REGS.len()`, i.e. 4 on Windows), so a
+  6-argument `putIntUnaligned` cannot be bound there at all and the single-pass
+  and OSR binds are never reached for it. With the helpers on and off,
+  `--dump-native-registry` on `NioAccessorRate` reports the identical census —
+  `putIntUnaligned` 400 000 either way, `DirectByteBuffer.session()` 1 200 000
+  either way. Anyone picking this up should start by giving the IR path
+  stack-arg marshalling, not by writing more helpers. **It is not this page's
+  wall either way**: an interpreted loop reaches no JIT bind at all.
+* **Compile order.** The mechanism the sibling page was about is fixed, and it
+  applies to this class too — but for the same reason, not yet visibly.
+* **The 120 s JUnit method timeout not firing.** Unchanged and still not read as a
+  separate defect: `common.args` sets
+  `-Djunit.jupiter.execution.timeout.default=120s`, and Jupiter's default
+  `SAME_THREAD` mode cannot preempt a synchronous non-interruption-checking loop.
+
+## What is left
+
+Two things, in order, and the first does not by itself retire this page:
+
+1. **Precise OSR exception exits**, so `RBC.6b` can be lifted — the design is in
+   the JIT page linked above. Until that lands these loops are interpreted and no
+   other work on this class is measurable.
+2. **21 ns/iteration.** Even fully compiled, this loop is ~10 call frames plus a
+   4-byte NIO store plus a 7.7%-frequency throw/catch, and CratonVM's numbers for
+   those pieces today are ~6 ns per virtual call
+   (`probes/CallCostProbe.java`) and **~600 ns per throw/catch**
+   (`probes/ThrowCostProbe.java`: 276 ns/iter no-throw against 900 throw-all,
+   where HotSpot is 1.6). 7.7% of 600 ns is 46 ns/iteration on its own — twice the
+   entire budget. So this class additionally needs a cheap throw/catch and a
+   nesting inliner; it is not one fix.
+
+An honest reading of that second item is that this page's wall is the furthest
+from reach of the three `codec-http` walls, which is the opposite of what its
+2026-08-17 sizing concluded — it had this class as "the harder of the two by a
+wide margin and should be attacked second", correctly, but for the wrong reason
+and at the wrong scale.
 
 ## Repro
 
@@ -102,17 +187,30 @@ printf 'io.netty.handler.codec.http.HttpHeaderValidationUtilTest\n' > /tmp/one.t
 ./run-netty-suite.sh --list /tmp/one.txt --hotspot --shards 1 --out runs/repro
 ```
 
-To localise which of the two exhaustive methods a run is inside, use a
-per-test-progress launcher (`@@BEGIN` / `@@END` per test) — the suite harness
-prints a line only for failing tests, which is why the 2026-08-16 page could
-not say.
+The per-method HotSpot walls, and the refusal:
+
+```bash
+java @common.args ProgressRunner \
+  'io.netty.handler.codec.http.HttpHeaderValidationUtilTest#headerValueValidationMustRejectAllValuesRejectedByOldAlgorithm' \
+  'io.netty.handler.codec.http.HttpHeaderValidationUtilTest#headerNameValidationMustRejectAllNamesRejectedByOldAlgorithm'
+
+CRATONVM_DBG_JITC=1 cratonvm --java-home <jdk> @common.args \
+  io.netty.handler.codec.http.HeaderValidationLoopRate 65536 2>&1 | grep 'OSR-compile'
+CRATONVM_DBG_JIT_METHOD_STATS=1 cratonvm --java-home <jdk> @common.args \
+  io.netty.handler.codec.http.HeaderValidationLoopRate 65536
+cratonvm --java-home <jdk> -cp . OsrDenyShapeProbe 300000     # the shape bisect
+cratonvm --java-home <jdk> -cp . ThrowCostProbe 200000 20     # the throw/catch floor
+```
 
 ## Related
 
-* `httpresponsestatustest-exhaustive-loop-timeout-20260816.md` — the same
-  mechanism at half the iteration count; the per-iteration decomposition and
-  the compile-order measurement live there.
-* `httpcontentdecompressortest-hang-20260816.md` — the native-call floor this
-  class's `ByteBuffer.putInt` pays once per iteration.
-* `fastthreadlocal-2e9-iteration-throughput-wall-20260812.md` — the same family
-  of finding, with per-component throughput measurements.
+* [`../jit/osr-refuses-any-method-with-an-exception-table-20260817.md`](../jit/osr-refuses-any-method-with-an-exception-table-20260817.md)
+  — what this page turned out to be, with the shape bisect and the fix design.
+* [`httpresponsestatustest-exhaustive-loop-timeout-20260816.md`](httpresponsestatustest-exhaustive-loop-timeout-20260816.md)
+  — the sibling. Its compile-ORDER mechanism is fixed; its residual is a
+  non-nesting inliner. Genuinely a different problem from this one.
+* [`httpcontentdecompressortest-hang-20260816.md`](httpcontentdecompressortest-hang-20260816.md)
+  — the native-call floor this class's `ByteBuffer.putInt` pays once per
+  iteration, once the loop compiles.
+* [`fastthreadlocal-2e9-iteration-throughput-wall-20260812.md`](fastthreadlocal-2e9-iteration-throughput-wall-20260812.md)
+  — the same family of finding, with per-component throughput measurements.

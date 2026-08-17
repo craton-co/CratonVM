@@ -861,6 +861,92 @@ the collection**, not a `fetch_add` in `needs_gc` — the predicate is polled on
 allocation path and stays true from the moment it is reached until the collection
 runs, so counting observations would report allocations rather than collections.
 
+### G2e/G2f — what the sweep does to each dead object — **BUILT 2026-08-17**
+
+G2a bounded *which* objects a young sweep visits. §3b then measured the phase
+engaged, correct, and not paying: with 4.8M objects skipped per young cycle the
+pause did not move. These two bound what the sweep *does to each object it does
+visit*, and both terms it removes are **O(reclaimed volume)** rather than
+O(objects) — which is why bounding the walk could not move the number.
+
+**G2e — zero the HEADER, not the body.** The sweep's own comment gives the reason
+for zeroing: "so a later scan can't see a stale header". That reason is satisfied
+entirely by the header. `HEADER_SIZE` is the whole `ObjectHeader` (`class_id`,
+`shape`, `mark_word` — 4 + 4 + 8) and `ARRAY_DATA_OFFSET == HEADER_SIZE`, so an
+array's length lives in `shape` and not in a body prefix; zeroing those 16 bytes
+leaves the identical `class_id=0, num_slots=0` corpse a reader of a vacated span
+already met (see `corpse_ledger`, which exists *because* that is what a reader
+sees). And the body is only reachable **through** that header: every field read
+sizes the object from `num_slots`, every extent walk from `alloc_size(header)`,
+every membership test goes through the registry the sweep has just removed the
+base from. Nothing can reach the bytes this stops writing.
+
+The other candidate reason — "a reused block may contain stale bytes" — is
+already handled at the far end, and unconditionally: `alloc_raw` memsets every
+allocation it hands out, and `tlab_refill` memsets a whole chunk. So the body
+zeroing was **redundant with the allocator's**, and every dead object was memset
+twice: once when it died, once when its span was handed out again. What it cost
+was a memset of the entire reclaimed volume, inside the pause, every cycle — on a
+cycle that reclaims 900 MB, 900 MB of zeroes at memory bandwidth.
+
+**G2f — one free-list span per RUN of adjacent dead objects.** The walk is
+already ascending, and that is a correctness property rather than an accident:
+the coalescer only sees adjacent dead spans as adjacent because they arrive in
+order. So the merge is a comparison against the previous span's end, and objects
+die in runs. `coalesce_free_list` merges exactly these spans into exactly these
+maximal runs a few statements later, so the post-coalesce state is the same
+either way — which is **asserted** in
+`an_arena_coalesces_pre_merged_runs_to_the_same_shape` and not assumed, because
+the tier a span routes to genuinely differs on the way in (a merged run is large
+where its members were small) and "the coalescer normalises it" is the whole
+safety argument. What goes is the churn: 4.8M `push_block_routed` calls and a
+4.8M-element sort inside the pause.
+
+Three ways the merge can be silently wrong, all guarded:
+
+* **Crossing into the large-object end.** `add_free_block` routes by offset and
+  bounds a low span by the low cursor, so a run grown past `high_cursor` would be
+  pushed onto the low tier while covering high-region bytes — and the arena would
+  then serve the same memory from the free list and from the high cursor both.
+  The two ends share one middle, so this is reachable, not hypothetical.
+* **Handing a span over out of order.** The non-mergeable arm must flush the
+  pending run first, or the coalescer stops seeing adjacency for the rest of the
+  cycle. That is the measured `CopyChurn`-at-`-Xmx256m` failure (§ G2a), not a
+  tuning matter.
+* **The final run.** It has no successor to flush it, and if it is dropped the
+  span is simply never mentioned again — no assertion in the collector fires and
+  the cursor retraction cannot reclaim what is not on the list. So the test
+  asserts the *accounting identity* (every freed byte is on the free list or
+  below a retracted cursor) rather than a counter.
+
+Both are ANDed with `young_cycle`, so a whole-heap sweep is byte-for-byte what it
+was. That is not a claim the argument is weaker for a major — it is not — only
+that this landed during a gauntlet sweep and the arm under measurement is the one
+already behind `CRATONVM_ZGC_GENERATIONAL`. Promoting either is one condition,
+with its own measurement.
+
+Kill switches in the `zgc-relocate` shape, so the A/B is a re-run and not a
+rebuild: `CRATONVM_ZGC_GEN_HEADER_ZERO=0` restores the whole-body memset,
+`CRATONVM_ZGC_GEN_DEAD_RUNS=0` the per-object calls. Engagement counters on the
+`[GC] zgc-sweep-cost:` line, read against `young_cycles`:
+`zero_bytes_skipped=0` means every dead object was still memset in full, and
+`dead_runs == dead_objects` means no two dead objects were ever adjacent. Neither
+number says it alone — a small `dead_runs` is equally consistent with a cycle that
+found almost no garbage — which is why both are reported.
+
+**Not yet measured, and deliberately so.** The Azure host was at **load average
+32 on 8 cores** with three other sessions' benchmarks and two `rustc` processes
+running when these landed. That is the same condition that made the *first* G2
+measurement worthless (§3b records the box at load 25–35), and a number taken
+there would be indistinguishable from noise in the direction of whatever ran
+alongside it. Take it on a quiet box, interleaved, with the §3b probe and args.
+
+The prediction is arithmetic from a figure the collector
+already prints: `bytes_freed` on the `[GC] zgc-reclaim:` line *is* the memset
+volume G2e removes, so on the §3b workload (75.7% reclaim of a 1.2 GB heap) it is
+of the order of 900 MB per cycle against a 182 ms sweep. Stating it here so the
+measurement can contradict it.
+
 ### G2 — what is still missing, and it is smaller than it was
 
 With G2a/b/c in, the young generation is a real address range that allocation
@@ -874,7 +960,15 @@ fills, a bounded sweep reclaims, and a slide promotes out of. What a
   budget that triggers a collection of its own, so its cost no longer scales with
   the gap between whole-heap collections. What a *sized space* would still add on
   top is a hard ceiling rather than a trigger — today an allocation burst can
-  overshoot the budget before the next safepoint.
+  overshoot the budget before the next safepoint. **Priced 2026-08-17, and it is
+  not the collector's to fix.** `nursery_overshoot_max` on the
+  `[GC] zgc-nursery-trigger:` line reports the worst overshoot seen, beside the
+  budget it is an overshoot of. A real ceiling cannot live where the trigger
+  lives: refusing the allocation turns a servable request into an
+  `OutOfMemoryError`, and collecting on the spot needs a safepoint the allocation
+  path cannot take. So a ceiling needs an **allocation-site safepoint poll**,
+  which is a VM-wide change, and the gauge is what says whether it is worth
+  asking for — a few percent of the budget prices it at nothing.
 * **Per-page `ZObjectStarts`**, without which `is_object_address` stops being
   O(1) once the registry is per page.
 
@@ -931,7 +1025,43 @@ rather than from "replace `Arena`":
 Steps 1, 2 and 5 are the allocator swap; 3 and 4 are the generational part and
 cannot be done first.
 
-**CORRECTED 2026-08-17: step 3 is NOT gated on the JIT load barrier.** This
+**CORRECTED AGAIN 2026-08-17: what step 3 IS gated on is the moving-young
+coverage proof, and ZGC consults it zero times.**
+
+Saying step 3 is not gated on the load barrier was right and it was not the whole
+answer, because it left the impression that nothing gates it. Something does, and
+naming it is the difference between a five-step list and a plan.
+
+`relocate_stw` refuses outright whenever `gc_quiescence::is_active()` or
+`unregistered_jit_frame_on_stack()` — a compiled frame may hold object pointers
+in **registers and spill slots**, which are not slots the collector can find and
+not slots it can rewrite. Promotion by copy is a move, so it inherits that
+refusal exactly. Measured 2026-08-15 on a deliberately JIT-saturated workload:
+the refusal fires on **64 of 68 cycles**. A young space whose reclaim is "copy the
+survivors out and reset a cursor" therefore would not run at all on a JIT-hot
+workload — it would divert to the very sweep it was built to remove.
+
+**This VM already solved that problem, on the other collector.** `gen_heap`'s
+moving young generation is exactly a promote-by-copy cycle running under live
+compiled frames, and it gets there with a **coverage proof** rather than a
+barrier: `CRATONVM_MOVING_YOUNG`, per-safepoint oop maps and shadow homes
+published from the JIT entry chain, plus `moving_young_coverage_incomplete()` and
+`force_non_moving_jit_roots()` as the fail-closed conditions
+(`gen_heap.rs:5730`ff, and read the deleted second gate there — a flag whose only
+job was to permit correct behaviour). That machinery makes a compiled frame's
+roots *precise and rewritable*, which is the property a move needs and a load
+barrier does not supply: a barrier fires on a load, and a pointer already sitting
+in a register is never loaded again.
+
+**ZGC consults none of it.** `grep moving_young gc/src/zgc.rs` returns zero hits.
+So the honest critical path for steps 3 and 4 is *adopting the moving-young
+coverage proof onto this collector*, and it should be sequenced and priced as
+that rather than as an allocator swap with a promotion step attached.
+
+Which is also the argument for G2e/G2f above: they reduce the same `sweep_us` and
+they run on **every** cycle, JIT-hot or not, because they move nothing.
+
+**On the JIT load barrier, for the record: step 3 is NOT gated on it.** This
 paragraph said its dependency on that barrier was "the real critical path", and
 the source says otherwise: **stage (a) of
 [`zgc-jit-load-barrier.md`](zgc-jit-load-barrier.md) landed on 2026-08-13.**
@@ -1048,6 +1178,54 @@ and `ZMarkContext::visit_refs` being intrinsically more expensive than
 `enumerate_references` (it is a fork of it, for stated reasons, and the fork has
 never been priced).
 
+### One part of that fixed cost was a wait nobody notified — FIXED 2026-08-17
+
+Found by reading rather than by profiling, and it is worth recording *how*,
+because the profile would not have shown it as anything but "slower".
+
+**The mark driver's fixed-point wait was the one wait in the marker that is not
+notified.** `ZgcConcurrentMarkController::await_fixed_point` polled
+`ZgcConcurrentMarkState`'s *own* condvar on a `DRIVER_POLL_MS` = 5 ms grid. The
+only thing that ever notified that condvar outside a stop was
+`notify_work_available`, and it had **zero callers on any ZGC path** —
+`vm_heap.rs`'s single call site is G1's controller. So every pass of every cycle
+waited out the full 5 ms before noticing a fixed point the workers had often
+reached immediately. Every *other* wait in `mark.rs` is properly notified
+(`worker_idle` sets `terminated` and calls `notify_all`; publishing work bumps
+`work_generation` and notifies; `release_pause` notifies) — this one was not, and
+it was the one the pause waits on.
+
+**Why it survived.** Every wait in the marker is a `wait_for` and never a bare
+`wait`, deliberately, so a lost notification costs a poll interval instead of a
+hang. That insurance makes the failure *invisible*: a wait that always times out
+behaves identically to one that is notified, only 5 ms slower, and no assertion
+anywhere fires. `ZMarkTerminator::park_timeouts` and `park_termination_wakes` now
+count expiries and termination-edge wakes, and `[GC] zgc-mark-wait:` reports the
+first at shutdown — **counts, so they read the same on a loaded host as on a
+quiet one**, which is the whole reason they are counts.
+
+**And the stated reason for polling was wrong about the API it described.** The
+`DRIVER_POLL_MS` comment said `ZMarkTerminator::wait_for_fixed_point` "can only
+be released by the *pool's* stop flag, not by this controller's". It takes the
+stop flag **as a parameter**; it is `ZMarkCoordinator`'s no-argument *wrapper*
+that hardwires the pool's flag, and the comment described the wrapper while the
+driver had the terminator in hand. A test's doc had inherited the same claim —
+"if it waited on the pool's own condvar instead, this would deadlock, which is the
+whole reason `await_fixed_point` polls" — and that test
+(`stopping_the_driver_mid_cycle_does_not_hang`, run against a deliberately wedged
+pool) now passes with the driver waiting on exactly that condvar. Interruption is
+in fact *faster* than before: the flag is re-read every `Z_MARK_PARK_POLL_MS`
+**and** kicked directly by `ZMarkTerminator::wake_blocked_waiters`.
+
+**How much of C5 this is: a small part, and it must not be reported as more.** At
+`Z_PARMARK_RESTART_BUDGET = 1` the driver waits at most twice per cycle, so the
+ceiling is ~5–10 ms of a ~100 ms gap. What it removes is a **floor** under the
+parallel-mark pause that no amount of worker scaling could have reached, and a
+5 ms quantum inside the loop that every per-cycle timing above was carrying as
+instrument noise. Fix the instrument, then measure — the remaining candidates in
+the paragraph above are unchanged and still want `perf record` on a one-worker
+cycle.
+
 **The next step for C5 is `perf record` on a one-worker cycle, not another
 counter.** That is this tree's own standing rule and three rounds of lock hunting
 against a fixed cost is what ignoring it looks like. Note also the spread — 380
@@ -1088,7 +1266,15 @@ frees live old objects.
 ### What is still open, 2026-08-17, ranked by what the measurements say
 
 1. **C5 — make the marker scale.** All three per-object locks are fixed
-   (2026-08-17) and **it was not enough — see §3c.** One worker is already +98%
+   (2026-08-17) and **it was not enough — see §3c.** A fourth thing was fixed the
+   same day and is also not enough on its own: **the driver's fixed-point wait
+   was polling a condvar nothing notified**, on a 5 ms grid, so every pass paid an
+   interval it did not need to. Worth ~5–10 ms of a ~100 ms gap, but it was a
+   *floor* under the pause that worker count could not reach, and a 5 ms quantum
+   that every timing in §3c was carrying. `[GC] zgc-mark-wait: park_timeouts=`
+   is nonzero if it returns. **The next step is still `perf record` on a
+   one-worker cycle**, and it now measures the marker rather than the marker plus
+   a poll interval. One worker is already +98%
    to +189% against zero, and a single worker contends with nobody, so the
    remaining cost is the engine's fixed overhead and not contention. The next
    step is `perf record` on a one-worker cycle. The three locks were:
@@ -1106,7 +1292,22 @@ frees live old objects.
    object. A filter works because the question is per *object* and almost no
    object is a `Reference`. The serial marker paid all three too, uncontended,
    which is why they are kept even though they did not close the item.
-2. **G2 — a real young space.** **G2a and G2b landed** — the nursery floor makes a
+2. **G2 — a real young space.** **G2a/b/c/d landed, and so do G2e/G2f
+   (2026-08-17), which are the two that attack `sweep_us` without moving
+   anything.** Read §3's G2e/G2f first: the young sweep's two remaining
+   per-dead-object costs were both O(reclaimed *volume*) — a memset of every dead
+   body, redundant with the memset `alloc_raw` already does on every handout, and
+   a free-list push per object followed by a sort over all of them — which is why
+   bounding *which* objects the sweep visits (G2a) could not move the number.
+   **And the critical path for the remaining, moving half is now named
+   correctly**: not the ZGC load barrier (stage (a) landed 2026-08-13) but the
+   **moving-young coverage proof**, which `gen_heap` has and ZGC consults zero
+   times. Without it a promote-by-copy young cycle is refused whenever a compiled
+   frame is live — 64 of 68 cycles on a JIT-saturated run, measured — so it would
+   divert to the sweep it exists to remove. See §3's G2 for both.
+
+   The older text of this item follows, because its measurement still stands.
+   **G2a and G2b landed** — the nursery floor makes a
    young sweep O(young) (§3's G2a), and the slide now promotes its survivors into
    the old region and leaves the nursery empty (§3's G2b), which is promotion by
    copy. Neither needed the page allocator, and **neither needed the JIT load
@@ -1138,6 +1339,17 @@ frees live old objects.
    `pending_hint` cache line *and* one on the caller's own counter. Striping N
    locks behind a single shared counter is not striping. The counters now live
    inside each bucket's mutex, which the push already holds.
+
+   **SEQUENCE THIS AFTER C5, 2026-08-17.** §3c measured the marker at **+98% with
+   ONE worker**, which contends with nobody — so the engine's fixed overhead, not
+   handoff, is what the marker costs. A per-thread buffer makes *mutators* hand
+   off faster into a consumer that is already the bottleneck, and the current
+   handoff is not obviously the problem either: `ZMarkIngress` buckets across 16
+   mutexes keyed by thread, and since 2026-08-17 the counters live inside the
+   bucket mutex the push already holds, so a mutator's cost is one uncontended
+   lock in ≤16-thread workloads. Deliberately **not** built on 2026-08-17 for that
+   reason, and because it carries a use-after-free with no measurement to justify
+   taking it — see the `ZMarkHandle::new_buffer` rule below.
 
    What remains is the genuine per-thread buffer, and it needs thread-keyed state
    on the heap because `satb_pre_barrier` is reached with **no thread context at

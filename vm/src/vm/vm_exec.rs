@@ -3073,28 +3073,27 @@ fn safe_native_call_impl(
     // the early returns below it. A native that opened a blocking region and
     // came back is left in whatever `end_blocking_region` recorded until this
     // guard restores the caller's state — both are tabled edges.
-    struct NativeStateGuard(ThreadExecState);
+    //
+    // ONE thread-local access for the pair, not three. This was
+    // `current_state()` + `record_transition(NativeRunning)` + a `Drop` that
+    // recorded the prior state, and `native_funnel_profile::funnel_cost_
+    // breakdown` prices that trio at 10.8-14.4 ns of a 29-36 ns funnel — the
+    // largest single component, with `current_state()` alone at 0.9 ns, which
+    // is what says the cost was the repetition rather than the read.
+    // `NativeStateSpan` takes the cell once and restores through a raw pointer;
+    // the `Starting` correction the old code did here moved into
+    // `enter_native_state`, where every caller gets it.
+    struct NativeStateGuard(Option<thread_state::NativeStateSpan>);
     impl Drop for NativeStateGuard {
         fn drop(&mut self) {
-            thread_state::record_transition(self.0, "vm_exec::safe_native_call_impl:return");
+            if let Some(span) = self.0.take() {
+                span.restore("vm_exec::safe_native_call_impl:return");
+            }
         }
     }
-    let _native_state_guard = NativeStateGuard(match thread_state::current_state() {
-        // `Starting` is ALSO the recorder's answer for a thread it has never
-        // observed (`current_state`'s doc), and this funnel is often the first
-        // thing a carrier records. Restoring it would assert the one thing the
-        // table says cannot be true of a thread that just ran a native
-        // (`Starting -> NativeRunning` is deliberately absent), and would then
-        // repeat on that thread's every later native call. Resume as
-        // `JavaRunning`: the state such a thread demonstrably reached, and the
-        // tabled return edge from a native.
-        ThreadExecState::Starting => ThreadExecState::JavaRunning,
-        prior => prior,
-    });
-    thread_state::record_transition(
-        ThreadExecState::NativeRunning,
+    let _native_state_guard = NativeStateGuard(Some(thread_state::enter_native_state(
         "vm_exec::safe_native_call_impl",
-    );
+    )));
 
     let result = {
         // Heap-exhaustion unwind permission. The callback below runs directly
@@ -6303,12 +6302,19 @@ impl<'a> NativeContextImpl<'a> {
         // the wake-time fixup application — catches both "chain key missing"
         // (was_key=false) and "frame held an intermediate address" desyncs at
         // the exact wake where they surface.
+        // Predicate: the FIXUP CHAIN's keys, not a forwarding word. Same
+        // correction as the arrival-site ARRIVE-STALE verifier — the forwarding
+        // word does not exist on the default collector (ZGC's slide leaves
+        // none), so this reported zero whatever the truth was. The chain's keys
+        // are exactly the pre-move addresses this thread slept through, and the
+        // write-back above has just run, so a frame slot still holding one is a
+        // slot the write-back did not reach.
         if blockgc_dbg() {
             for (fi, fr) in self.thread.frames.iter().enumerate() {
                 for li in 0..fr.locals_len() {
                     if let Value::Object(Some(o)) = fr.get_local(li as u16) {
                         let a = o.as_ptr() as usize;
-                        if let Some(new) = self.shared.mem.heap.debug_forwarded_target(a) {
+                        if let Some(new) = fixup.get(&a).copied() {
                             eprintln!(
                                 "[blockgc] WAKE-STALE tid={} frame#{fi} {}.{} pc={} local[{li}] 0x{a:x}->0x{new:x} was_key={} was_val={} fixup_len={}",
                                 self.thread.thread_id.0, fr.class_name(), fr.method_name(), fr.pc,
@@ -6322,7 +6328,7 @@ impl<'a> NativeContextImpl<'a> {
                 for si in 0..fr.stack.len() {
                     if let Value::Object(Some(o)) = fr.stack.peek_at(si) {
                         let a = o.as_ptr() as usize;
-                        if let Some(new) = self.shared.mem.heap.debug_forwarded_target(a) {
+                        if let Some(new) = fixup.get(&a).copied() {
                             eprintln!(
                                 "[blockgc] WAKE-STALE tid={} frame#{fi} {}.{} pc={} stack[{si}] 0x{a:x}->0x{new:x} was_key={} was_val={} fixup_len={}",
                                 self.thread.thread_id.0, fr.class_name(), fr.method_name(), fr.pc,
@@ -12650,6 +12656,17 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
 
     fn current_thread_allocated_bytes(&self) -> Option<u64> {
         Some(self.thread.tlab.thread_allocated_bytes())
+    }
+
+    fn total_allocated_bytes(&self) -> Option<u64> {
+        // Every thread's RETIRED total, plus this thread's live TLAB span. A
+        // peer's in-flight cursor may not be read while its owner runs, so the
+        // under-count is bounded by one TLAB per running thread — and the value
+        // stays monotonic, which the occupancy gauge this replaced was not.
+        Some(
+            cratonvm_gc::tlab::process_allocated_bytes()
+                .saturating_add(self.thread.tlab.thread_allocated_bytes()),
+        )
     }
 
     fn committed_heap_bytes(&self) -> usize {
@@ -26907,6 +26924,12 @@ mod native_funnel_profile {
             let prior = thread_state::current_state();
             thread_state::record_transition(ThreadExecState::NativeRunning, "funnel-profile");
             thread_state::record_transition(prior, "funnel-profile");
+        });
+        // What the funnel does instead since 2026-08-17: the same pair of
+        // transitions, one thread-local access. The row above is the control
+        // and stays, because "the new one is fast" is only a claim next to it.
+        rung("component:   ... as one NativeStateSpan", || {
+            thread_state::enter_native_state("funnel-profile").restore("funnel-profile");
         });
         rung("component:   ... current_state() alone", || {
             black_box(thread_state::current_state());

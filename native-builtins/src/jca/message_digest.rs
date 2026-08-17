@@ -900,9 +900,29 @@ fn md_clone(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // A provider's digest clones itself — `MessageDigest.clone()` is not final,
     // but this native is registered on the base class and would otherwise hand
     // back one of OUR synthetics carrying none of the provider's state.
+    //
+    // Handing it back VIRTUALLY cannot work: the only way this native is
+    // reached with a provider receiver is the provider's own override calling
+    // `super.clone()`, so a virtual re-dispatch returns to the caller and
+    // recurses until the stack ends. Every BouncyCastle digest does exactly
+    // that — `MD2$Digest.clone()` is `(Digest)super.clone()` followed by a deep
+    // copy of the `digest` field — so `MessageDigest.getInstance(alg, "BC")`
+    // could not be cloned at all, for any algorithm, on either the interpreter
+    // (`StackOverflowError`) or the JIT (`InternalError: JIT dispatch into
+    // BCMessageDigest.clone() failed`).
+    //
+    // What `super.clone()` asks for is `java.security.MessageDigest.clone()`
+    // exactly — invokespecial semantics, no retarget to the receiver's class —
+    // which shallow-copies through `Object.clone()` and lets the provider's
+    // override deep-copy the fields it owns.
     if let Ok(this) = obj_arg(args, 0) {
         if !md_receiver_is_ours(ctx, this) {
-            return ctx.invoke_virtual(this, "clone", "()Ljava/lang/Object;", &[]);
+            return ctx.invoke_special_bytecode_only(
+                "java/security/MessageDigest",
+                "clone",
+                "()Ljava/lang/Object;",
+                &[Value::Object(Some(this))],
+            );
         }
     }
     let this = obj_arg(args, 0)?;

@@ -115,7 +115,7 @@ fn maybe_dump_shutdown_reports() {
 
     // How many native-registry probes one invoke cost, self-gated on
     // `CRATONVM_DBG_NATIVE_LOOKUPS=1`. This is the number
-    // `docs/known-issues/perf/vm-per-call-dispatch-cost-20260813.md` §2 asks for
+    // `performance/vm-per-call-dispatch-cost-RETIRED-20260817.md` §2 asks for
     // before anyone restructures the dispatch entry points: a profile share can
     // say `slot_for_exact` is 8.5%, but only this says whether a "one lookup
     // per invoke" rewrite would divide it by 1 or by 10.
@@ -4574,6 +4574,18 @@ fn run() -> Result<()> {
              invokestatic sites those ladders examined)",
             cratonvm_vm::jit::helpers::jit_funnel_bypass_count()
         );
+        // Why a compiled callee is reached through a Rust helper at all.
+        //
+        // The netty census (`[DISP_CENSUS]`, `CRATONVM_DBG=mic-prof`) says 98.4%
+        // of `jit_invoke_dispatch` calls are `DISPATCH_CACHE` hits — a callee
+        // that IS compiled, entered through the helper on every call. These two
+        // say why: a statically bound site is offered a direct `CALL` exactly
+        // once, while its caller is being compiled, and a callee that is not
+        // compiled yet at that instant leaves the site on the helper forever.
+        let (bind_hits, bind_misses) = cratonvm_jit::direct_callee_bind_counts();
+        eprintln!(
+            "[cratonvm] direct callee binds: {bind_hits} bound, {bind_misses} left on the dispatch helper (statically bound sites where a ladder asked for a direct target)"
+        );
     }
 
     // JDK-ONLY-WAVE2 §8/§11 census dumps (`CRATONVM_DBG_CHECK_OVERRIDE=1`).
@@ -4620,7 +4632,14 @@ fn run() -> Result<()> {
     // `--verbose:gc` or the `CRATONVM_GC_STATS` env knob so a gauntlet runner
     // can collect the table without `RUST_LOG`. No-op for the generational
     // collector and when no G1 collection ran.
-    if args.verbose_gc || std::env::var_os("CRATONVM_GC_STATS").is_some() {
+    // `CRATONVM_DBG_G1ACCESSOR` too: the accessor census rides inside
+    // `print_gc_summary`, and a census whose only output path is gated behind a
+    // DIFFERENT flag prints nothing when you ask for it — which reads as
+    // "zero accessor calls" rather than "you never enabled the report".
+    if args.verbose_gc
+        || std::env::var_os("CRATONVM_GC_STATS").is_some()
+        || cratonvm_types::flags::flags().gc.g1_dbg_accessor
+    {
         vm.shared.mem.heap.print_gc_summary();
         {
             // Cross-thread STW peer-scan coverage. A non-zero count means the

@@ -480,11 +480,28 @@ pub(crate) fn bc_poly_inverse(a: &[u64], m: usize, ks: &[usize]) -> Option<Vec<u
     Some(bc_poly_reduce(g1, m, ks))
 }
 
+/// The smallest `m_ints` BouncyCastle's `LongArray` ever carries.
+///
+/// `bc_trim_poly` drops trailing zero words, so the ZERO polynomial trims to an
+/// empty slice — and an empty `long[]` is not a value `LongArray` accepts.
+/// `isOne()` reads `a[0]` with no length test (`isZero()` loops and so survives
+/// one, which is why this stayed hidden), and the class's own
+/// `LongArray(BigInteger)` spells the intended representation out: a zero
+/// bigInt becomes `new long[]{ 0L }`, never `new long[0]`. A native handing
+/// back the empty array therefore builds a `LongArray` no BouncyCastle
+/// constructor could have produced, and the next `isOne()` on it raises
+/// `ArrayIndexOutOfBoundsException: Index 0 out of bounds for length 0` —
+/// `GeneralKeyTest.testDstu4145`, via `DSTU4145PointEncoder.encodePoint`.
+const LONG_ARRAY_MIN_WORDS: usize = 1;
+
 pub(crate) fn bc_alloc_long_array(
     ctx: &mut dyn NativeContext,
     words: &[u64],
 ) -> Result<ObjectRef, MethodCallFailed> {
-    let arr = ctx.new_array(cratonvm_types::ArrayElementType::Long, words.len());
+    let arr = ctx.new_array(
+        cratonvm_types::ArrayElementType::Long,
+        words.len().max(LONG_ARRAY_MIN_WORDS),
+    );
     for (i, &word) in words.iter().enumerate() {
         ctx.set_array_element(arr, i, Value::Long(word as i64));
     }
@@ -519,7 +536,11 @@ pub(crate) fn bc_longarray_set_value(
     this: ObjectRef,
     words: &[u64],
 ) -> Result<(), MethodCallFailed> {
-    let arr = ctx.new_array(cratonvm_types::ArrayElementType::Long, words.len());
+    // Same floor as `bc_alloc_long_array`; see `LONG_ARRAY_MIN_WORDS`.
+    let arr = ctx.new_array(
+        cratonvm_types::ArrayElementType::Long,
+        words.len().max(LONG_ARRAY_MIN_WORDS),
+    );
     for (i, &word) in words.iter().enumerate() {
         ctx.set_array_element(arr, i, Value::Long(word as i64));
     }
@@ -6120,8 +6141,86 @@ pub(crate) fn bc_aes_native_generate_working_key(
     Ok(Some(Value::Object(Some(wk))))
 }
 
+/// Are BouncyCastle services constraints installed?
+///
+/// Every AES engine entry point that CratonVM replaces natively ends, in
+/// BouncyCastle's own bytecode, with a
+/// `CryptoServicesRegistrar.checkConstraints(...)` call: the constructors
+/// check the algorithm at full strength, `init` checks the key that was
+/// actually supplied. That call raises `CryptoServiceConstraintsException`
+/// when the process has constraints installed and the service does not meet
+/// them, and a native that REPLACES the whole method drops it — an
+/// under-strength key then initialises with no error at all, which is exactly
+/// the failure a constraints policy exists to prevent
+/// (`SymmetricConstraintsTest.testAES`, "no exception!").
+///
+/// Constraints are off by default and these natives exist for that default
+/// path, so ask the registrar and hand the call straight back to the bytecode
+/// whenever anything other than the built-in no-op constraints object is
+/// installed. The real method then performs the real check with BouncyCastle's
+/// own `DefaultServiceProperties`, which carry a per-engine bits-of-security
+/// figure and a purpose derived from the direction — not something worth
+/// transcribing here, where it would silently rot against the library.
+///
+/// Every uncertain answer (registrar unloadable, field renamed, accessor
+/// missing) reports `true`: declining to the bytecode is always correct, only
+/// slower, whereas skipping the check is a security hole.
+fn bc_services_constraints_active(ctx: &mut dyn NativeContext) -> bool {
+    const REGISTRAR: &str = "org/bouncycastle/crypto/CryptoServicesRegistrar";
+    let Ok(class_id) = ctx.ensure_class_initialized(REGISTRAR) else {
+        return true;
+    };
+    let Some(idx) = ctx.static_field_index_by_name(class_id, "noConstraintsImpl") else {
+        return true;
+    };
+    let Value::Object(no_constraints) = ctx.get_static_field(class_id, idx) else {
+        return true;
+    };
+    match ctx.invoke(
+        REGISTRAR,
+        "getServicesConstraints",
+        "()Lorg/bouncycastle/crypto/CryptoServicesConstraints;",
+        &[],
+    ) {
+        Ok(Some(Value::Object(current))) => current != no_constraints,
+        _ => true,
+    }
+}
+
+/// `<init>()` for the three AES engines. BouncyCastle's constructors are not
+/// empty: each one checks its algorithm against the installed constraints at
+/// full strength (`AESEngine` hardcodes 256, the other two ask
+/// `bitsOfSecurity()`). With no constraints installed there is genuinely
+/// nothing to do — the key schedule is built lazily by `init` /
+/// `generateWorkingKey`, and no field initialiser runs — so the native keeps
+/// the empty fast path that `newInstance()`'s `alloc_object` path wants, and
+/// defers to the bytecode only when the check can actually fire.
+pub(crate) fn bc_aes_native_ctor(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    if bc_services_constraints_active(ctx) {
+        let Some(class_name) = ctx.class_name_arc_of_id(ctx.class_id_of_object(this)) else {
+            return Ok(None);
+        };
+        return ctx.invoke_special_bytecode_only(
+            &class_name,
+            "<init>",
+            "()V",
+            &[Value::Object(Some(this))],
+        );
+    }
+    Ok(None)
+}
+
 pub(crate) fn bc_aes_native_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
+    if bc_services_constraints_active(ctx) {
+        return ctx.invoke_virtual_bytecode_only(
+            this,
+            "init",
+            "(ZLorg/bouncycastle/crypto/CipherParameters;)V",
+            &args[1..],
+        );
+    }
     let for_enc = matches!(args.get(1), Some(Value::Int(v)) if *v != 0);
     let params = obj_arg(args, 2)?;
     let key_arr = match ctx.get_field_by_name(params, "key") {
@@ -6575,13 +6674,15 @@ pub(crate) fn register_bc_aes_engine(r: &mut NativeMethodRegistry) {
         Ok(None)
     });
 
-    // KEEP (genuinely empty): BouncyCastle's own `AESEngine()` no-arg
-    // constructor has an empty body — the key schedule is built lazily by
-    // `init`/`generateWorkingKey` (registered below), not at construction. The
-    // native exists only so `newInstance()`'s `alloc_object` + the real
-    // `MultiBlockCipher` call path do not have to run interpreted bytecode for
-    // a method that does nothing; it shadows nothing of substance.
-    r.register(aes, "<init>", "()V", |_ctx, _args| Ok(None));
+    // KEEP (empty only while no constraints are installed): the key schedule
+    // is built lazily by `init`/`generateWorkingKey` (registered below), not at
+    // construction, and BouncyCastle's own `AESEngine()` declares no field
+    // initialiser — so with the registrar at its default the native body is
+    // genuinely nothing, which is what `newInstance()`'s `alloc_object` + the
+    // real `MultiBlockCipher` call path want. The constructor is NOT empty
+    // otherwise: it checks AES-256 against the installed constraints, so
+    // `bc_aes_native_ctor` hands the call back to the bytecode when any are.
+    r.register(aes, "<init>", "()V", bc_aes_native_ctor);
     r.register(
         aes,
         "newInstance",
@@ -6652,6 +6753,16 @@ pub(crate) fn register_bc_aes_engine(r: &mut NativeMethodRegistry) {
         "(ZLorg/bouncycastle/crypto/CipherParameters;)V",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
+            // Same dropped `CryptoServicesRegistrar.checkConstraints` as in
+            // `bc_aes_native_init`; see `bc_services_constraints_active`.
+            if bc_services_constraints_active(ctx) {
+                return ctx.invoke_virtual_bytecode_only(
+                    this,
+                    "init",
+                    "(ZLorg/bouncycastle/crypto/CipherParameters;)V",
+                    &args[1..],
+                );
+            }
             let for_enc = matches!(args.get(1), Some(Value::Int(v)) if *v != 0);
             let params = obj_arg(args, 2)?;
             let key_arr = match ctx.get_field_by_name(params, "key") {
@@ -6688,16 +6799,19 @@ pub(crate) fn register_bc_aes_engine(r: &mut NativeMethodRegistry) {
         "org/bouncycastle/crypto/engines/AESLightEngine",
         "org/bouncycastle/crypto/engines/AESFastEngine",
     ] {
-        // Verified trivial constructor. BouncyCastle's block ciphers carry all
-        // their state in fields that `init(boolean, CipherParameters)` writes —
-        // here `bc_aes_native_init` (registered a few lines below for this same
-        // class) sets `ROUNDS`, `WorkingKey`, `forEncryption` and `s`. The
-        // no-arg constructor itself declares no field initializers and only
-        // chains to `Object.<init>`, and `bc_aes_native_process_block` refuses
-        // to run on an object whose `WorkingKey` is still unset
-        // ("AES engine not initialised"), so the real initialiser is provably
-        // on the use path and an empty constructor body loses nothing. KEEP.
-        r.register(aes_impl, "<init>", "()V", native_noop);
+        // Trivial constructor with one caveat. BouncyCastle's block ciphers
+        // carry all their state in fields that `init(boolean,
+        // CipherParameters)` writes — here `bc_aes_native_init` (registered a
+        // few lines below for this same class) sets `ROUNDS`, `WorkingKey`,
+        // `forEncryption` and `s`. The no-arg constructor declares no field
+        // initializers and only chains to `Object.<init>`, and
+        // `bc_aes_native_process_block` refuses to run on an object whose
+        // `WorkingKey` is still unset ("AES engine not initialised"), so the
+        // real initialiser is provably on the use path. What the body does
+        // carry is a constraints check on `bitsOfSecurity()`, so
+        // `bc_aes_native_ctor` runs the bytecode whenever constraints are
+        // installed and stays empty otherwise. KEEP.
+        r.register(aes_impl, "<init>", "()V", bc_aes_native_ctor);
         r.register(aes_impl, "encryptBlock", desc, bc_aes_native_encrypt_block);
         r.register(aes_impl, "decryptBlock", desc, bc_aes_native_decrypt_block);
         r.register(

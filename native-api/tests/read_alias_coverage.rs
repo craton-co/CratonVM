@@ -405,7 +405,14 @@ fn every_read_side_observation_is_gated_and_observation_only() {
                 // the call at every site.
                 let window_start = idx.saturating_sub(400);
                 let window = &src[window_start..idx];
-                let Some(gate_rel) = window.rfind("if layout_alias::enabled() {") else {
+                // The gate may carry any path prefix: `if layout_alias::enabled() {`
+                // and `if cratonvm_native_api::layout_alias::enabled() {` are the
+                // same gate and both occur in the tree. Matching only the
+                // unqualified spelling made this fire on two CORRECTLY gated sites
+                // in `phases_early.rs` — which is the failure mode the sibling gate
+                // in this file warns about in as many words: a gate that fires on
+                // an untouched tree gets deleted, not investigated.
+                let Some(gate_rel) = find_enabled_gate(window) else {
                     offenders.push(format!(
                         "{name}: an `observe_read` call with no `if layout_alias::enabled() {{` \
                          above it"
@@ -501,6 +508,110 @@ fn the_calibration_site_is_still_observed_before_its_own_read() {
     );
 }
 
+/// Byte offset of an `if <path>layout_alias::enabled() {` gate in `window`,
+/// searching from the end, or `None` when the window holds no gate.
+///
+/// Any path prefix counts. What the gate has to BE is `if` + a call to
+/// `layout_alias::enabled()` + a block; spelling the module path out is legal
+/// Rust and three sites in the tree do it. Only the `if` is load-bearing —
+/// a bare `layout_alias::enabled()` in an expression is not a gate.
+fn find_enabled_gate(window: &str) -> Option<usize> {
+    const NEEDLE: &str = "layout_alias::enabled() {";
+    let mut from = window.len();
+    while let Some(rel) = window[..from].rfind(NEEDLE) {
+        // Walk back over the path prefix (`a::b::`) to its first character.
+        let mut start = rel;
+        while start > 0 {
+            let c = window.as_bytes()[start - 1];
+            if c.is_ascii_alphanumeric() || c == b'_' || c == b':' {
+                start -= 1;
+            } else {
+                break;
+            }
+        }
+        if window[..start].trim_end().ends_with("if") {
+            return Some(start);
+        }
+        if rel == 0 {
+            break;
+        }
+        from = rel;
+    }
+    None
+}
+
+/// Every slot-map identifier `declare_slot_map` is called with, anywhere, with
+/// any path qualification stripped off.
+fn published_slot_map_idents(src: &str) -> std::collections::HashSet<String> {
+    const CALL: &str = "declare_slot_map(&";
+    let mut out = std::collections::HashSet::new();
+    for (idx, _) in src.match_indices(CALL) {
+        let arg: String = src[idx + CALL.len()..]
+            .chars()
+            .take_while(|c| c.is_alphanumeric() || *c == '_' || *c == ':')
+            .collect();
+        if let Some(last) = arg.rsplit("::").next().filter(|s| !s.is_empty()) {
+            out.insert(last.to_string());
+        }
+    }
+    out
+}
+
+/// The two matchers above were widened to accept path-qualified spellings.
+/// Widening a gate is how a gate stops catching anything, so both directions are
+/// pinned here: what it must accept, and what it must still reject.
+#[test]
+fn the_gate_matchers_accept_paths_without_going_blind() {
+    // --- find_enabled_gate: accepts ---
+    assert!(
+        find_enabled_gate("if layout_alias::enabled() {").is_some(),
+        "the unqualified spelling is the common one"
+    );
+    assert!(
+        find_enabled_gate("if cratonvm_native_api::layout_alias::enabled() {").is_some(),
+        "the fully qualified spelling is what phases_early.rs uses"
+    );
+    assert!(
+        find_enabled_gate("    if crate::layout_alias::enabled() {\n        foo();\n").is_some(),
+        "a crate-relative path is still a gate"
+    );
+
+    // --- find_enabled_gate: still rejects ---
+    assert!(
+        find_enabled_gate("let on = layout_alias::enabled();").is_none(),
+        "a bare call with no `if` is not a gate — this is the case the whole \
+         instrument exists to catch"
+    );
+    assert!(
+        find_enabled_gate("while layout_alias::enabled() {").is_none(),
+        "only `if` is the gate shape the rationale is written about"
+    );
+    assert!(
+        find_enabled_gate("if some_other::enabled() {").is_none(),
+        "a different predicate is not this gate"
+    );
+    assert!(find_enabled_gate("").is_none(), "an empty window has no gate");
+
+    // --- published_slot_map_idents: accepts both spellings ---
+    let found = published_slot_map_idents(
+        "declare_slot_map(&MONTH_SLOT_MAP);\n\
+         read_alias::declare_slot_map(&crate::lang_class::METHOD_LEGACY_SLOT_MAP);",
+    );
+    assert!(found.contains("MONTH_SLOT_MAP"));
+    assert!(
+        found.contains("METHOD_LEGACY_SLOT_MAP"),
+        "a path-qualified argument publishes the map it names"
+    );
+
+    // --- published_slot_map_idents: still reports nothing for an unpublished map ---
+    let none = published_slot_map_idents("static ORPHAN_SLOT_MAP: SlotMap = SlotMap::new();");
+    assert!(
+        !none.contains("ORPHAN_SLOT_MAP"),
+        "declaring a map is not publishing it — if this ever passes, the orphan \
+         check below can never fail"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Link 6 — a declared slot map is a published slot map
 // ---------------------------------------------------------------------------
@@ -560,9 +671,15 @@ fn every_declared_slot_map_is_published() {
             }
         }
     }
+    // A publication may name its map through any path:
+    // `declare_slot_map(&MONTH_SLOT_MAP)` and
+    // `declare_slot_map(&crate::lang_class::METHOD_LEGACY_SLOT_MAP)` both publish.
+    // Matching the bare identifier reported the latter as an orphan while
+    // `lang_reflect.rs` had been publishing it on every boot.
+    let published_idents = published_slot_map_idents(&published);
     let orphans: Vec<String> = declared
         .iter()
-        .filter(|(_, ident)| !published.contains(&format!("declare_slot_map(&{ident})")))
+        .filter(|(_, ident)| !published_idents.contains(ident.as_str()))
         .map(|(file, ident)| format!("{file}: {ident}"))
         .collect();
     assert!(

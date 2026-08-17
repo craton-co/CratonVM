@@ -201,6 +201,38 @@ call (`JitDirectCall::guard_class_id`) or a receiver-typed variant.
 one native per accessor is the floor, and a thin helper would price it at ~15 ns
 rather than ~160.
 
+### The next two rungs cannot be bound until the IR path can spill arguments
+
+Attempted 2026-08-17 and **reverted**, with the census as the reason. Thin direct
+helpers for the two names at the head of the table above — `Buffer.session()`
+(constant `null`) and `ScopedMemoryAccess.putIntUnaligned`/`getIntUnaligned` (the
+store and load themselves) — were written and bound in the single-pass ladder and
+in the OSR door, exactly like `checkIndex` and `reachabilityFence`. They bound
+**one** site between them, and the invocation census was byte-identical with the
+switch on and off:
+
+| invocations (200 000 ops) | helpers ON | helpers OFF |
+|---|---:|---:|
+| `DirectByteBuffer.session()` | 1 200 000 | 1 200 000 |
+| `ScopedMemoryAccess.putLongUnaligned` | 800 000 | 800 000 |
+| `ScopedMemoryAccess.putIntUnaligned` | 400 000 | 400 000 |
+| `HeapByteBuffer.session()` | 399 999 | 400 000 |
+
+The reason is the **third door again, but a different third door**: these JDK
+accessor methods are compiled by the OPTIMIZING (IR) pipeline
+(`CRATONVM_DBG_IR_COMPILES=1` shows `HeapByteBuffer.put`, `HeapByteBuffer.ix`,
+`DirectByteBuffer.putInt` each "admitted to the optimizing pipeline"), and the IR
+path has no thin-helper bind for a virtual site — nor can it get one for these:
+`ir_lower::emit_direct_cross_call` is register-only and requires
+`num_args + needs_context <= ENTRY_ABI_REGS.len()`, which is **4 on Windows**.
+`putIntUnaligned` needs 7 (receiver + five arguments + the context pointer).
+
+So the next step for this page is not another helper. It is **stack-argument
+marshalling in the IR direct-call lowering**, for which the single-pass
+`x64::frames::emit_stack_arg_setup` (Win64 shadow space, 16-byte alignment,
+materialise-stack-args-then-registers) is a working model. Only after that can
+the store rungs be priced.
+
 ## What was ruled out, with the measurement that ruled it out
 
 * **Per-byte storage re-resolution in `servlet.rs`.** `s2_bb_write8` /

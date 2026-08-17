@@ -8406,6 +8406,32 @@ pub static STATIC_SITES_SEEN_IR: std::sync::atomic::AtomicU64 =
 pub static THREAD_CURRENT_THREAD_SITES_OSR: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
+/// Statically bound call sites at which a ladder ASKED `callee_compiler` for a
+/// direct target, split by whether it got one.
+///
+/// The question these answer is the one netty's census raised and no other
+/// instrument could: `AdaptiveByteBufAllocatorTest` runs 259 M
+/// `jit_invoke_dispatch` calls of which **98.4% are `DISPATCH_CACHE` hits** —
+/// a compiled callee, reached through a Rust helper, on every call. The callee
+/// is compiled; the caller simply could not bind it, because at the caller's
+/// compile time it was not compiled YET, and a call site's binding is decided
+/// once and never revisited. A miss here is that event, counted.
+///
+/// Compile-time only — one relaxed `fetch_add` per statically bound site per
+/// compile, never on a runtime path.
+pub static DIRECT_CALLEE_BIND_HITS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub static DIRECT_CALLEE_BIND_MISSES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// `(bound, unbound)` — see [`DIRECT_CALLEE_BIND_HITS`].
+pub fn direct_callee_bind_counts() -> (u64, u64) {
+    (
+        DIRECT_CALLEE_BIND_HITS.load(std::sync::atomic::Ordering::Relaxed),
+        DIRECT_CALLEE_BIND_MISSES.load(std::sync::atomic::Ordering::Relaxed),
+    )
+}
+
 /// `(single-pass, IR)` counts of `invokestatic` sites each direct-call ladder
 /// examined since process start.
 pub fn static_sites_seen() -> (u64, u64) {
@@ -12851,6 +12877,32 @@ pub fn mark_jit_bail_listed(class_name: &str, method_name: &str, descriptor: &st
     jit_bail_list().write().insert(h);
 }
 
+/// Bail-list a method AND record the refusal site the compile that just ran left
+/// behind, so `CRATONVM_DBG=jit-method-stats` can name it.
+///
+/// [`mark_jit_bail_listed`] alone leaves the reason unrecorded. That is fine for a
+/// caller that has already recorded one, and wrong for the OSR door in
+/// `vm/src/runtime/interpreter/jit_bridge.rs`, which reaches the backend directly:
+/// its bails arrived in the report as `reason=unrecorded`, which is exactly the
+/// shape that sends a reader looking for a compiler bug somewhere else. An OSR bail
+/// is also the one that matters most — that door compiles a `@Test` method's hot
+/// loop, and a method denied there runs its whole life interpreted with no other
+/// diagnostic. Found the hard way on `HttpHeaderValidationUtilTest`'s two
+/// exhaustive loops (docs/known-issues/jit/osr-refuses-any-method-with-an-exception-table-20260817.md).
+///
+/// Consumes the thread-local site, like `try_compile`'s own recorder.
+pub fn mark_jit_bail_listed_with_site(class_name: &str, method_name: &str, descriptor: &str) {
+    mark_jit_bail_listed(class_name, method_name, descriptor);
+    let site = take_jit_bail_site().unwrap_or((take_jit_pipeline_stage(), 0, 0));
+    record_jit_bail_reason(class_name, method_name, descriptor, site);
+    if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JITC").is_some() {
+        eprintln!(
+            "[cratonvm-jitc] OSR-bail site={} pc={} opcode={:#04x} {class_name}.{method_name}{descriptor}",
+            site.0, site.1, site.2,
+        );
+    }
+}
+
 /// Diagnostic: number of methods currently bail-listed.
 pub fn jit_bail_list_size() -> usize {
     jit_bail_list().read().len()
@@ -13443,6 +13495,44 @@ impl Drop for JitCompileStackGuard {
             debug_assert_eq!(popped.as_ref(), Some(&self.key));
         });
     }
+}
+
+/// Depth of the nested-compile stack on this thread.
+///
+/// `0` outside any compile; `1` inside a top-level `try_compile`; deeper while a
+/// `callee_compiler` compiles a callee inside its caller's compilation.
+///
+/// # Why a VM-side caller needs this
+///
+/// Binding a statically bound call site to a raw `CALL` requires the callee to be
+/// COMPILED ALREADY, and `vm/.../jit_bridge.rs`'s callee resolver
+/// (`direct_callee_lookup`) may compile one transitively to get there. Without a
+/// depth bound, a deep call chain compiled bottom-up on one thread would nest one
+/// compile per level; with one, the chain stops binding directly past the bound
+/// and falls back to the dispatch helper, which is always correct.
+pub fn jit_active_compile_depth() -> usize {
+    JIT_COMPILE_STACK.with(|stack| stack.borrow().len())
+}
+
+/// Whether `(class_name, method_name, descriptor)` is already being compiled
+/// somewhere on this thread's nested-compile stack.
+///
+/// A VM-side transitive callee compile must ask this before recursing:
+/// re-entering a compile that is already open would recurse until the depth bound
+/// (or the native stack) ran out. Same question [`note_jit_recursive_compile_cycle`]
+/// answers for this crate's own `callee_compiler`, minus the cycle bookkeeping —
+/// the VM caller only needs to decline.
+pub fn jit_active_compile_contains(
+    class_name: &str,
+    method_name: &str,
+    descriptor: &str,
+) -> bool {
+    JIT_COMPILE_STACK.with(|stack| {
+        stack
+            .borrow()
+            .iter()
+            .any(|k| k.matches(class_name, method_name, descriptor))
+    })
 }
 
 fn mark_jit_recursive_cycle_method(key: JitCompileMethodKey) {
@@ -16611,9 +16701,20 @@ fn try_compile_inner(
                                             )
                                         {
                                             direct_target = Some((entry, callee_needs_ctx));
+                                            DIRECT_CALLEE_BIND_HITS
+                                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                         } else {
                                             mark_current_jit_compile_method_recursive_cycle();
+                                            DIRECT_CALLEE_BIND_MISSES
+                                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                         }
+                                    } else {
+                                        // The one that matters: the compiler had
+                                        // nothing to give, so this site is bound
+                                        // to the dispatch helper for the life of
+                                        // this body. See `DIRECT_CALLEE_BIND_HITS`.
+                                        DIRECT_CALLEE_BIND_MISSES
+                                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                     }
                                 }
                             }
@@ -18399,9 +18500,17 @@ fn try_compile_inner(
                     // are why this only bites a small overridable method.
                     if direct_jit_callee_calls_enabled && matches!(invoke_kind, 1 | 3) {
                         if let Some(compiler) = callee_compiler.as_ref() {
-                            if let Some((entry, callee_needs_ctx)) =
-                                compiler(&class_name, &method_name, &descriptor)
-                            {
+                            let probed = compiler(&class_name, &method_name, &descriptor);
+                            if probed.is_none() {
+                                // See `DIRECT_CALLEE_BIND_HITS`: this site is now
+                                // bound to `jit_invoke_dispatch` permanently, and
+                                // the callee is very often compiled moments later.
+                                DIRECT_CALLEE_BIND_MISSES
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            }
+                            if let Some((entry, callee_needs_ctx)) = probed {
+                                DIRECT_CALLEE_BIND_HITS
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                 if jit_direct_call_requires_dispatch(
                                     &class_name,
                                     &method_name,
