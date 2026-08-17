@@ -4201,6 +4201,11 @@ pub mod tls_deny;
 // Additive only — nothing routes through it yet; later steps migrate the
 // BigInteger natives off the O(digits^2) decimal-string primitives onto this.
 pub(crate) mod bigint;
+// Montgomery modular arithmetic shared by both limb bignums (`bigint::BigInt`
+// behind java.math.BigInteger.modPow, and `crypto_impl::BigUint` behind the
+// native RSA private-key path). Retires
+// `perf/biginteger-modpow-has-no-montgomery-reduction-20260817`.
+pub(crate) mod montgomery;
 // Real crypto primitives (RustCrypto SHA/AES/RSA/ECDSA/X509/keystore). Always
 // compiled — the always-on JCA/TLS/x509 paths depend on it. Previously this was
 // a submodule of the feature-gated `crypto` module, which broke the
