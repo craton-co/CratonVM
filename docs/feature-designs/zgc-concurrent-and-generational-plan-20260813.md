@@ -699,6 +699,43 @@ a young cycle retained without tracing. §3b has the measurement.
   defining trade, not a defect.
 * **A whole-heap sweep on every cycle, including young ones.** See G2.
 
+### G2a — a nursery FLOOR, so a young sweep is O(young) — **BUILT 2026-08-17**
+
+§3b's finding was that the split works and the pause does not move, because
+`sweep` was 182 ms of a 309 ms mean and **walks every registered object whatever
+the split says**. The split decides how much a young cycle *traces*; it says
+nothing about how much it *sweeps*.
+
+**A sweep can only be bounded by address.** The registry is a bitmap over the
+arena indexed from its base, so a lower bound on the address is a lower bound on
+the word index — the scan simply starts later. Everything allocated since the
+last whole-heap collection lies at or above that collection's final cursor, so
+`[gen_young_floor, cursor)` is a nursery in the ordinary bump-allocator sense and
+a young cycle sweeps only that. A whole-heap cycle publishes the floor and the
+old live-byte total; a young cycle sweeps above the floor and adds the total back.
+
+Four things have to hold together, and each alone is satisfiable by something
+broken:
+
+| must hold | what it is satisfiable by otherwise |
+|---|---|
+| the sweep really skips | a floor stuck at 0 makes `for_each_base_from(0, ..)` the unbounded loop and **every test still passes** — that is the state §3b measured. `gen_sweep_skipped` is the engagement counter, and the test was verified by disabling the floor and watching it go red |
+| young garbage above the floor is still reclaimed | a sweep that skips everything is fast and useless |
+| `allocated` still reports the WHOLE live set | the sweep counts only what it visited, so uncorrected the heap reads as nearly empty after every young cycle and the trigger stops firing until an allocation fails. `gen_old_live_bytes` is carried forward; `objects_copied` is deliberately NOT corrected, because it means "survivors this cycle examined" |
+| `conc_bits_known_clear` goes FALSE | objects below the floor keep the mark bit the pre-mark pass set, so the next mark start must not skip its clearing walk — that would hand the sweep a mark set carrying a previous cycle's bits |
+
+**The cost, and it is asserted rather than assumed.** The free list hands out
+space *below* the floor, so an object allocated into a hole left by an earlier
+sweep is inside the old region and a young cycle will not reclaim it until a
+major. That is over-retention, never unsoundness — the test pins **both** halves,
+that it survives the minor and that the major gets it, which is the difference
+between a bounded cost and a leak. Removing it is what needs a real young space,
+i.e. G2 below.
+
+A slide drops the floor and arms `gen_force_major_next`: after a relocation an
+address no longer says which generation an object is in, and re-deriving the
+boundary would be guesswork.
+
 ### G2 — promotion, and a real young space — **NOT BUILT, and re-scoped**
 
 This item said promotion needs `ZPageAllocator` because "a logical grid cannot
@@ -716,11 +753,12 @@ What is still missing, and what it would buy:
   `sweep_us` — 30–52% of the concurrent pause and the pause floor (§2c) — and it
   is the only one, because a sweep over a flat registry is O(all objects)
   whatever the generation split says.
-* **A young-only sweep.** G1's sweep still walks every registered object,
-  including every old one it has just pre-marked. The pre-mark makes that walk
-  cheap (a flag set, no field enumeration) but it is still O(registry), so a
-  young cycle's *sweep* cost does not fall with the generation split even though
-  its *mark* cost does.
+* ~~**A young-only sweep.**~~ **Done by G2a above, partially.** The sweep is now
+  bounded below by the nursery floor, so it is O(young) for everything the bump
+  cursor served. What a real young space adds is the *other* half: an object the
+  free list placed below the floor is still swept only by a major, and a page-based
+  young space has no free list below anything — it reclaims by resetting a cursor,
+  so there is no sweep at all.
 
 Those two are the same project and it does need the page allocator. Sequence it
 after C5, and treat the allocator swap as its own change with its own
@@ -907,7 +945,10 @@ frees live old objects.
    object. A filter works because the question is per *object* and almost no
    object is a `Reference`. The serial marker paid all three too, uncontended,
    which is why they are kept even though they did not close the item.
-2. **G2 — a real young space.** Promoted by §3b from "the answer to `sweep_us`"
+2. **G2 — a real young space.** **G2a landed** — the nursery floor makes a young
+   sweep O(young) for bump-served objects (§3's G2a), which is the half that needs
+   no allocator. What is left is the half that does. Promoted by §3b from "the
+   answer to `sweep_us`"
    to **the thing that makes Phase G worth having at all**: with the split
    engaged and 4.8M objects skipped per young cycle, the pause did not move,
    because `sweep` is 182 ms of a 309 ms mean pause and is O(registry) whatever
