@@ -37,24 +37,57 @@ what landed there.
 | a thread that no heal path reached | `thread_last_heal == heap_collection` at every reported stale slot |
 | a waiter applying another pause's pointer map | `CRATONVM_DBG_MAPGEN=1`: **0** mismatches — every waiter gets the map of the pause it arrived for |
 | a thread running Java while censused as blocked | `CRATONVM_DBG_BLOCKED_ACCESS=warn`: 0 violations |
+| a live frame slot left naming a vacated address | 0, once the ledger stopped counting re-issued addresses — the 8-per-run the first version of that instrument reported were fresh allocations in the vacated span |
+| a stale reference being STORED into a frame local | `set_local` detector: 0 hits across every reproduced failure |
 
-### Where that leaves it
+### The stale-reference hunt (2026-08-17, second pass)
 
-A frame slot is stale **after** a heal that ran for the very collection that
-moved its object, with the right map, on a thread that took a heal path. So the
-address is not surviving the heal — it is being **re-introduced after it**. The
-one place this VM is known to hold an `ObjectRef` where no heal can see it is a
-Rust local: arguments popped off the operand stack before the callee frame is
-pushed (`monitor_enter_synchronized_method` pins exactly these for the
-synchronized case, and its doc says why), and any native that holds a receiver
-or an argument across an operation that can collect.
+The address is not surviving the heal — it is **re-introduced after it**, by
+code holding an `ObjectRef` in a Rust local where no root scan can see it. Three
+defects of that family were found by pointing the (now exact) vacated-address
+ledger at the forwarding barrier, and all three are fixed:
 
-**Next step:** verify popped arguments and native-held receivers against the
-collection's pointer map at the point they are consumed — the same test
-`CRATONVM_DBG_VACATED_FRAMES` applies to frame slots, applied to the values that
-are not in a frame at all. `CRATONVM_DBG_STALE_OBJREF=1` is the existing
-deterministic detector for that family, but it is Generational-only; the ZGC arm
-is missing.
+* **The forwarding barrier had nothing to read on this collector.**
+  `VmHeap::load_and_forward` — the repair every one of its 46 call sites relies
+  on, precisely because its caller holds a reference the collector cannot see —
+  works by reading a FORWARDING WORD at the old address. ZGC's slide leaves
+  none: `Arena::compact_low_to` zeroes the span above the new cursor and the
+  memmove overwrites the rest. **The barrier was a silent no-op on the default
+  collector.** The slide now publishes its `from -> to` pairs into
+  `ZgcRealHeap::relocations` and the barrier consults them when the address is
+  not a live object base (which is also why a re-issued address can never reach
+  the table, so no pruning is needed for correctness).
+* **`apps_h2::h2_comparison_compare` / `h2_comparison_get_value`** kept
+  `session`, `left`, `right` and the two operand expressions in Rust locals
+  across several `ctx` callbacks. Caught red-handed: with the ledger armed, a
+  failing run logged the barrier being handed a moved address from exactly these
+  two functions, and the failure it produced is the `SessionLocal` receiver at
+  the top of this page. Now pinned and re-read.
+* **`NativeContext`'s write entry points forwarded the RECEIVER but not the
+  VALUE.** A native that read an object before a callback and stored it
+  afterwards wrote a stale pointer straight into the heap
+  (`properties_sidetable::mirror_loaded_entries_to_properties_backend` was
+  caught doing it), where the next reader `checkcast`s it. `set_field`,
+  `set_field_by_name`, `set_array_element` and `set_static_field` now forward
+  the value too.
+
+**The failure still reproduces**, so at least one producer of the same family is
+still open: the surviving witnesses are `ClassCastException` at a `checkcast`,
+i.e. a stale pointer read back out of a heap slot or read THROUGH a stale
+receiver, with no `load_and_forward` on the path to catch it. The A/B over the
+fix set is inconclusive at the rates measured (pre-fix 4 of 12 corrupt,
+post-fix 3 of 8), which is exactly what one would expect if each fix removes one
+producer out of several.
+
+**What is no longer in doubt:** the residual is entirely a compaction problem.
+`CRATONVM_ZGC_RELOCATE=0` is now **29 runs, 0 failures** (14 on the pre-fix
+binary, 15 on the fixed one) against roughly a third of runs corrupt with
+relocation on, under identical GC stress.
+
+**Next step:** the same ledger, applied at the two consumption points the
+barrier does not sit on — a `checkcast`'s operand, and a `getfield` whose
+RECEIVER is stale (which makes every field it reads garbage). `set_local`
+already reports zero, so the remaining producer is not writing into frames.
 
 ## The three defects fixed on the way
 
