@@ -362,7 +362,51 @@ pub struct ClassPath {
     /// that is both a startup classpath root and a dynamically added one keeps
     /// its startup entry when the dynamic loader closes.
     static_len: Option<usize>,
+    /// Relative paths present under each `Directory` entry, so a MISS on that
+    /// entry costs a hash probe instead of a `File::exists` syscall.
+    ///
+    /// # Why a directory needed one when a JAR already had one
+    ///
+    /// A `JarFile` entry carries `entry_index` for exactly this reason — "hot
+    /// class/resource lookup reject[s] misses without taking the ZipArchive
+    /// lock". `Directory` had no equivalent, so [`ClassPath::find_class`] did
+    /// a real `dir.join(rel).exists()` for every directory entry on every
+    /// lookup. That is one syscall per directory per class, and a class is
+    /// found in at most one of them, so the whole cost is misses.
+    ///
+    /// Measured on the netty suite's classpath (308 entries: 197 JARs, **111
+    /// directories** — one `target/classes` and one `target/test-classes` per
+    /// reactor module) loading netty's slf4j/logback first-touch, 1102 class
+    /// definitions, Windows host:
+    ///
+    /// | classpath | first `DefaultThreadFactory.newThread` |
+    /// |---|---|
+    /// | all 308 entries | 2195 ms |
+    /// | the 4 entries actually needed | 188 ms |
+    ///
+    /// 111 x 1102 = 122k stats at ~15-20 us each is the whole difference.
+    /// Linux hides it — the same probe costs 483 ms there, faster than HotSpot
+    /// — because a `stat` on a warm dentry cache is ~1 us. It is the same
+    /// shape as the `JarFile` accessor defect written up in
+    /// `a_stat_per_accessor_call_hid_behind_an_o1_cache`, one layer out.
+    ///
+    /// # Staleness
+    ///
+    /// The index is built once per directory, on first use, and never
+    /// invalidated — so a class written into a classpath directory *after*
+    /// that point is absent from it. That is why an index MISS is not the end
+    /// of the lookup: `find_class` falls back to the real `exists()` probe for
+    /// directory entries when no entry claimed the class, which is precisely
+    /// the pre-index behaviour. Anything the old code could find, this finds;
+    /// the index only removes syscalls from the path that succeeds.
+    dir_index: Mutex<HashMap<PathBuf, Option<Arc<FxHashSet<Box<str>>>>>>,
 }
+
+/// Above this many files, a directory is left UNINDEXED and every lookup
+/// stats it, as before. A classpath root with a million files under it is not
+/// a normal `target/classes`, and building a set that size on the first class
+/// load would trade a latency spike for the throughput win.
+const DIR_INDEX_MAX_ENTRIES: usize = 200_000;
 
 /// Per-archive memoized signing state for a signed JAR.
 ///
@@ -1617,6 +1661,7 @@ impl ClassPath {
             root_canonical_cache: Mutex::new(HashMap::new()),
             dynamic_specs: HashMap::new(),
             static_len: None,
+            dir_index: Mutex::new(HashMap::new()),
         }
     }
 
@@ -2508,6 +2553,29 @@ impl ClassPath {
             });
         }
 
+        // PASS 1 consults `dir_index` and never stats a directory that cannot
+        // hold this class; PASS 2 is the historical stat-per-directory scan,
+        // and runs only when pass 1 found nothing anywhere. See the
+        // `dir_index` field doc for the measurement and for why the second
+        // pass is what keeps this exactly as correct as the single pass it
+        // replaces: a class created after a directory was indexed is invisible
+        // to pass 1 and still found by pass 2.
+        match self.find_class_pass(class_name, true) {
+            Ok(bytes) => return Ok(bytes),
+            Err(ClassFileError::ClassNotFound { .. }) => {}
+            Err(other) => return Err(other),
+        }
+        self.find_class_pass(class_name, false)
+    }
+
+    /// One search of the entry list. `use_dir_index` selects pass 1 (skip a
+    /// directory whose index says the class is absent) or pass 2 (probe every
+    /// directory with a real `exists()`, as before the index existed).
+    fn find_class_pass(
+        &self,
+        class_name: &str,
+        use_dir_index: bool,
+    ) -> Result<SharedBytes, ClassFileError> {
         let relative_path = format!("{}.class", class_name);
         // Executable WAR / Spring-Boot WAR support: when a class is requested
         // by its binary name, also probe the common archive-internal class
@@ -2528,8 +2596,22 @@ impl ClassPath {
         for entry in &self.entries {
             match entry {
                 ClassPathEntry::Directory(dir) => {
+                    // The syscall this whole index exists to avoid. `Some(false)`
+                    // is a definite absence at index-build time, and pass 2 is
+                    // what covers the case where that has since changed.
+                    if use_dir_index && self.dir_index_contains(dir, &relative_path) == Some(false)
+                    {
+                        continue;
+                    }
                     let full_path = dir.join(Path::new(&relative_path));
                     if full_path.exists() {
+                        if !use_dir_index {
+                            // Pass 2 found what pass 1's index denied: the
+                            // directory has grown. Drop the stale index so the
+                            // next lookup rebuilds rather than falling through
+                            // to pass 2 forever.
+                            self.dir_index_invalidate(dir);
+                        }
                         // Audit-fix #5: symlink-traversal check is now
                         // fail-CLOSED. If we cannot canonicalize either
                         // the classpath root or the resolved file we
@@ -2586,6 +2668,10 @@ impl ClassPath {
                             });
                     }
                 }
+                // Pass 2 exists only for the directory staleness window; every
+                // archive kind answers from an in-memory index that pass 1
+                // already consulted, so repeating them would be pure waste.
+                _ if !use_dir_index => continue,
                 ClassPathEntry::JarFile {
                     archive,
                     multi_release,
@@ -2707,6 +2793,86 @@ impl ClassPath {
         Err(ClassFileError::ClassNotFound {
             class_name: class_name.to_string(),
         })
+    }
+
+
+    /// Is `relative_path` present under the `Directory` entry `dir`, according
+    /// to [`ClassPath::dir_index`]?
+    ///
+    /// `Some(false)` is the answer worth having: it lets `find_class` skip a
+    /// `stat` for a directory that cannot hold this class. `Some(true)` means
+    /// the file was there when the index was built and the caller should go on
+    /// to the ordinary probe (which re-checks existence anyway). `None` means
+    /// there is no usable index — an unreadable or oversized directory — and
+    /// the caller must probe.
+    ///
+    /// Builds the index on first use, under the map lock. Two threads racing
+    /// on the same cold directory can both walk it; the second insert wins and
+    /// the sets are equal, so the race costs one redundant walk and nothing
+    /// else. Holding the lock across the walk instead would serialise every
+    /// other directory's first lookup behind it.
+    fn dir_index_contains(&self, dir: &Path, relative_path: &str) -> Option<bool> {
+        if let Some(index) = self.dir_index.lock().get(dir) {
+            return index.as_ref().map(|set| set.contains(relative_path));
+        }
+        let built = Self::build_dir_index(dir);
+        let answer = built.as_ref().map(|set| set.contains(relative_path));
+        self.dir_index.lock().insert(dir.to_path_buf(), built.clone());
+        answer
+    }
+
+    /// Drop the cached index for `dir` so the next lookup rebuilds it.
+    ///
+    /// Called when the stat-based fallback finds a file the index said was
+    /// absent, i.e. the directory has grown since the walk. One rebuild then
+    /// serves every later lookup, instead of the fallback running forever.
+    fn dir_index_invalidate(&self, dir: &Path) {
+        self.dir_index.lock().remove(dir);
+    }
+
+    /// Walk `dir` and collect every file's path relative to it, in classpath
+    /// form (`/` separators, no leading slash).
+    ///
+    /// Returns `None` when the directory cannot be read or holds more than
+    /// [`DIR_INDEX_MAX_ENTRIES`] files — both mean "no index", and every
+    /// lookup falls back to the syscall.
+    ///
+    /// Symlinked subdirectories are NOT followed. The read path canonicalises
+    /// and refuses anything that escapes the root (see `find_class`), so an
+    /// index that listed a symlink target would only ever produce entries the
+    /// reader then rejects — and following one could walk an unbounded tree.
+    fn build_dir_index(dir: &Path) -> Option<Arc<FxHashSet<Box<str>>>> {
+        let mut set: FxHashSet<Box<str>> = FxHashSet::default();
+        let mut stack = vec![(dir.to_path_buf(), String::new())];
+        while let Some((current, prefix)) = stack.pop() {
+            let reader = std::fs::read_dir(&current).ok()?;
+            for entry in reader.flatten() {
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                let mut rel = String::with_capacity(prefix.len() + 1 + name.len());
+                rel.push_str(&prefix);
+                if !prefix.is_empty() {
+                    rel.push('/');
+                }
+                rel.push_str(&name);
+                // `file_type` on the DirEntry is free on every platform this
+                // runs on (Windows carries it in the FIND_DATA, Linux in
+                // d_type), unlike `metadata`, which would re-stat each child
+                // and reintroduce the very syscalls this index removes.
+                let Ok(kind) = entry.file_type() else {
+                    return None;
+                };
+                if kind.is_dir() {
+                    stack.push((entry.path(), rel));
+                } else if kind.is_file() {
+                    if set.len() >= DIR_INDEX_MAX_ENTRIES {
+                        return None;
+                    }
+                    set.insert(rel.into_boxed_str());
+                }
+            }
+        }
+        Some(Arc::new(set))
     }
 
     /// Find the filesystem path of the classpath entry that holds the given

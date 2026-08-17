@@ -14115,6 +14115,25 @@ fn bracket_if_v6(ip: &str) -> String {
     }
 }
 
+/// Apply the socket options the JDK's own `DatagramSocket` implementation
+/// turns on at construction.
+///
+/// `java.net.DatagramSocket` is a `DatagramChannel` adaptor on JDK 25, and
+/// `DatagramChannelImpl`'s constructor sets `SO_BROADCAST` for the adaptor
+/// case. Measured on HotSpot 25, same host:
+/// `new DatagramSocket().getBroadcast()` is **true**. CratonVM's ctors left
+/// the raw socket at the OS default (false), so a caller that never touches
+/// `setBroadcast` got a socket that silently dropped broadcast sends where the
+/// JDK's would deliver them — and `getBroadcast()` answered a defensible-looking
+/// `false` that nothing contradicted until this class was censused against
+/// HotSpot method by method.
+///
+/// Best-effort: a platform that refuses the option leaves the socket as it was,
+/// which is the pre-fix behaviour.
+fn ds_socket_defaults(ctx: &dyn NativeContext, fd: u32) {
+    let _ = ctx.fd_table().udp_set_broadcast(fd, true);
+}
+
 pub(crate) fn register_re7_datagram_socket(r: &mut NativeMethodRegistry) {
     let ds = "java/net/DatagramSocket";
 
@@ -14130,6 +14149,7 @@ pub(crate) fn register_re7_datagram_socket(r: &mut NativeMethodRegistry) {
             .ok()
             .and_then(|s| s.rsplit(':').next().and_then(|p| p.parse::<i32>().ok()))
             .unwrap_or(0);
+        ds_socket_defaults(&*ctx, fd);
         ds_set(this, |s| {
             s.port = port;
             s.closed = 0;
@@ -14152,6 +14172,7 @@ pub(crate) fn register_re7_datagram_socket(r: &mut NativeMethodRegistry) {
             .ok()
             .and_then(|s| s.rsplit(':').next().and_then(|p| p.parse::<i32>().ok()))
             .unwrap_or(port);
+        ds_socket_defaults(&*ctx, fd);
         ds_set(this, |s| {
             s.port = actual_port;
             s.closed = 0;
@@ -14180,6 +14201,7 @@ pub(crate) fn register_re7_datagram_socket(r: &mut NativeMethodRegistry) {
             .ok()
             .and_then(|s| s.rsplit(':').next().and_then(|p| p.parse::<i32>().ok()))
             .unwrap_or(port);
+        ds_socket_defaults(&*ctx, fd);
         ds_set(this, |s| {
             s.port = actual_port;
             s.closed = 0;
@@ -14626,11 +14648,23 @@ pub(crate) fn register_re7_datagram_socket(r: &mut NativeMethodRegistry) {
         ds_set(this, |s| s.reuse_address = i32::from(on));
         Ok(None)
     });
-    r.register(ds, "getReuseAddress", "()Z", |_ctx, args| {
+    r.register(ds, "getReuseAddress", "()Z", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let stored = ds_get(this).reuse_address;
-        // `1` only when nobody ever called the setter — the historical answer.
-        Ok(Some(Value::Int(if stored < 0 { 1 } else { stored })))
+        let sd = ds_get(this);
+        // Ask the SOCKET when nobody called the setter. The historical answer
+        // here was a hardcoded `1`, which HotSpot 25 contradicts on the same
+        // host: `new DatagramSocket().getReuseAddress()` is **false** there.
+        // `udp_reuse_address` did not exist when that constant was written.
+        if sd.reuse_address < 0 && sd.fd >= 0 {
+            if let Ok(on) = ctx.fd_table().udp_reuse_address(sd.fd as u32) {
+                return Ok(Some(Value::Int(i32::from(on))));
+            }
+        }
+        Ok(Some(Value::Int(if sd.reuse_address < 0 {
+            1
+        } else {
+            sd.reuse_address
+        })))
     });
     // These three real-JDK declarations have bytecode that delegates through
     // a private DatagramSocket delegate object.  CratonVM's authoritative
@@ -14867,6 +14901,7 @@ pub(crate) fn register_re7_datagram_socket(r: &mut NativeMethodRegistry) {
             .ok()
             .and_then(|s| udp_origin_split(&s).map(|(_, p)| p))
             .unwrap_or(port);
+        ds_socket_defaults(&*ctx, fd);
         ds_set(this, |s| {
             s.port = actual_port;
             s.closed = 0;
