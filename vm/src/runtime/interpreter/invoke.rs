@@ -2955,6 +2955,175 @@ pub(super) fn dump_stack_on_soe(thread: &JvmThread) {
 // redefinition rules that make an override yield: `interpreter/native_override.rs`.
 
 
+/// Every constant registry triple [`try_stackless_invoke`] can dispatch from an
+/// arm that holds a `NativeCallback` but **no `NativeMethodId`**, and therefore
+/// never reaches `NativeMethodRegistry::record_invocation`.
+///
+/// This is the sweep `G33-1` §8 asked for, run over this file. It is a **third
+/// bypass family**, distinct from the interpreter's intrinsic table (§2
+/// mechanism 1) and the JIT's thin direct-call helpers (§2 mechanism 2), and it
+/// is arm-independent: none of it depends on the JIT or on
+/// `CRATONVM_DISABLE_INTRINSICS`, so the two-part exact-census recipe in §4 does
+/// **not** make these rows exact.
+///
+/// The gap is already acknowledged in code — the census increment further down
+/// this function says a `None` id "means the callback came from one of the
+/// exotic arms, which resolve other triples and are the wave-2 census gap noted
+/// at step 1". What was missing is any way for a *reader of the dump* to learn
+/// that. These marks supply it.
+///
+/// Three arms are deliberately absent because their triple is not constant and
+/// cannot be enumerated here; see the record for the nomination:
+///
+///  * the superclass walk (`find(&parent.name, method_name, descriptor)`),
+///    whose class comes from a runtime hierarchy;
+///  * the three `sun/security/ssl/*Impl` → `javax/net/ssl/*` aliases, whose
+///    method and descriptor come from the call site;
+///  * `surefire_lazy_launcher_discover_native`, whose whole triple is
+///    discovered from the runtime receiver.
+///
+/// A triple not registered in this VM does not resolve and is not marked.
+const UNCOUNTED_STACKLESS_NATIVES: [(&str, &str, &str); 14] = [
+    // The `JarFile` invokespecial constructor bridge — four registered
+    // descriptor shapes, dispatched and returned `Handled` before the census
+    // increment below is ever reached.
+    ("java/util/jar/JarFile", "<init>", "(Ljava/io/File;)V"),
+    ("java/util/jar/JarFile", "<init>", "(Ljava/io/File;Z)V"),
+    ("java/util/jar/JarFile", "<init>", "(Ljava/io/File;ZI)V"),
+    (
+        "java/util/jar/JarFile",
+        "<init>",
+        "(Ljava/io/File;ZILjava/lang/Runtime$Version;)V",
+    ),
+    // The `super.close()` bridge: the call site names `JarFile` or `ZipFile`,
+    // the dispatch always resolves `ZipFile.close`.
+    ("java/util/zip/ZipFile", "close", "()V"),
+    // Reflection. `NCS_METHOD_INVOKE` / `NCS_CONSTRUCTOR_NEW_INSTANCE` memoize
+    // the callback per registry generation and return `Handled` directly, so
+    // every reflective call through these two reads as zero.
+    (
+        "java/lang/reflect/Method",
+        "invoke",
+        "(Ljava/lang/Object;[Ljava/lang/Object;)Ljava/lang/Object;",
+    ),
+    (
+        "java/lang/reflect/Constructor",
+        "newInstance",
+        "([Ljava/lang/Object;)Ljava/lang/Object;",
+    ),
+    // Panama: the receiver-gated `DowncallHandle` arms.
+    (
+        "java/lang/foreign/DowncallHandle",
+        "type",
+        "()Ljava/lang/invoke/MethodType;",
+    ),
+    (
+        "java/lang/foreign/DowncallHandle",
+        "invoke",
+        "([Ljava/lang/Object;)Ljava/lang/Object;",
+    ),
+    (
+        "java/lang/foreign/DowncallHandle",
+        "invokeExact",
+        "([Ljava/lang/Object;)Ljava/lang/Object;",
+    ),
+    (
+        "java/lang/foreign/DowncallHandle",
+        "invokeBasic",
+        "([Ljava/lang/Object;)Ljava/lang/Object;",
+    ),
+    // The signature-polymorphic `MethodHandle` bridge, registered under the
+    // erased `Object[]` descriptor while the call site carries a concrete one.
+    // This is the same species as `G33-1` §8 N4's `vm_exec.rs` finding, seen
+    // from the interpreter's stackless path.
+    (
+        "java/lang/invoke/MethodHandle",
+        "invoke",
+        "([Ljava/lang/Object;)Ljava/lang/Object;",
+    ),
+    (
+        "java/lang/invoke/MethodHandle",
+        "invokeExact",
+        "([Ljava/lang/Object;)Ljava/lang/Object;",
+    ),
+    (
+        "java/lang/invoke/MethodHandle",
+        "invokeBasic",
+        "([Ljava/lang/Object;)Ljava/lang/Object;",
+    ),
+];
+
+/// Declare every [`UNCOUNTED_STACKLESS_NATIVES`] slot's `invocations` count
+/// incomplete, once per (VM, registry generation).
+///
+/// # Where this is called from, and why not per dispatch
+///
+/// From the points in [`try_stackless_invoke`] where an uncounted native is
+/// about to be dispatched, all of which are already committed to a
+/// `safe_native_call` — so the steady-state cost is three relaxed loads and a
+/// predictable branch on a path whose next act costs ~141 ns, and nothing at all
+/// on the ordinary counted path.
+///
+/// It marks the whole list rather than the one triple that fired, deliberately.
+/// The bit's claim is that a bypassing path **exists** for the slot, which is a
+/// property of this function's shape and is statically true for all fourteen
+/// however the call arrived; and the alternative — recovering the triple that
+/// produced the callback — would mean either a `resolve_id` per dispatch or a
+/// reverse lookup from a callback address, on the interpreter's hottest
+/// function.
+///
+/// Making these rows *exact* instead is a separate, real option: the arms take
+/// the full `safe_native_call` funnel, against which `G33-1` §5's measured
+/// +9.2 ns is the same ~6% the counter already costs everywhere else it sits.
+/// It is not taken here because it means rewriting eleven `find` calls in
+/// `try_stackless_invoke` into `resolve_id` + `callback_of`, and this lane could
+/// neither build nor measure. It is nominated in the record instead.
+///
+/// The latch and its race are the same shape as the JIT side's — see
+/// `jit::helpers::mark_direct_call_helper_natives_incomplete`. Repeats are
+/// no-ops; a VM that was never marked can never be skipped.
+#[cold]
+fn mark_stackless_exotic_natives_incomplete(shared: &SharedVm) {
+    use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+    static MARKED_ANY: AtomicBool = AtomicBool::new(false);
+    static MARKED_VM: AtomicUsize = AtomicUsize::new(0);
+    static MARKED_GENERATION: AtomicU32 = AtomicU32::new(0);
+
+    let registry = &shared.natives.native_methods;
+    let generation = registry.generation();
+    if MARKED_ANY.load(Ordering::Relaxed)
+        && MARKED_VM.load(Ordering::Relaxed) == shared.vm_identity
+        && MARKED_GENERATION.load(Ordering::Relaxed) == generation
+    {
+        return;
+    }
+    mark_stackless_exotic_natives_incomplete_in(registry);
+    MARKED_VM.store(shared.vm_identity, Ordering::Relaxed);
+    MARKED_GENERATION.store(generation, Ordering::Relaxed);
+    MARKED_ANY.store(true, Ordering::Relaxed);
+}
+
+/// The registry half of [`mark_stackless_exotic_natives_incomplete`], split out
+/// so the marking can be driven against a registry built in a test rather than
+/// only through a live `SharedVm` and a real reflective call.
+///
+/// Returns how many of [`UNCOUNTED_STACKLESS_NATIVES`] resolved in this
+/// registry. A triple that does not resolve is not an error — a VM that never
+/// registered the Panama or `MethodHandle` bridges simply has nothing to
+/// declare about them.
+fn mark_stackless_exotic_natives_incomplete_in(
+    registry: &cratonvm_native_api::NativeMethodRegistry,
+) -> usize {
+    let mut marked = 0usize;
+    for &(class_name, method_name, descriptor) in UNCOUNTED_STACKLESS_NATIVES.iter() {
+        if let Some(id) = registry.resolve_id(class_name, method_name, descriptor) {
+            registry.mark_invocations_incomplete(id);
+            marked += 1;
+        }
+    }
+    marked
+}
+
 /// Stackless invoke: resolve a method and either call native (Handled) or push
 /// a bytecode frame (FramePushed).  Returns `CacheMiss` for exotic cases that
 /// cannot be handled stacklessly (signature-polymorphic, JNI, etc.), in which
@@ -3091,6 +3260,9 @@ pub(super) fn try_stackless_invoke(
                 .native_methods
                 .find("java/util/jar/JarFile", method_name, descriptor)
         {
+            // §4 census: this arm holds a callback and no id, and returns
+            // without reaching the increment below.
+            mark_stackless_exotic_natives_incomplete(shared);
             safe_native_call(shared, thread, callback, args)?;
             return Ok(CachedCallResult::Handled);
         }
@@ -3118,6 +3290,8 @@ pub(super) fn try_stackless_invoke(
                 .native_methods
                 .find("java/util/zip/ZipFile", method_name, descriptor)
         {
+            // §4 census: uncounted arm, same as the constructor bridge above.
+            mark_stackless_exotic_natives_incomplete(shared);
             safe_native_call(shared, thread, callback, args)?;
             return Ok(CachedCallResult::Handled);
         }
@@ -3171,6 +3345,10 @@ pub(super) fn try_stackless_invoke(
             method_name,
             descriptor,
         ) {
+            // §4 census: `NativeCallSite` hands back a callback, never an id,
+            // and this arm returns `Handled` without reaching the increment
+            // below — so every reflective `Method.invoke` reads as zero.
+            mark_stackless_exotic_natives_incomplete(shared);
             let result = safe_native_call(shared, thread, callback, args)?;
             if let Some(value) = result.filter(|_| ret_type != b'V') {
                 push_invoke_return_value(
@@ -3198,6 +3376,8 @@ pub(super) fn try_stackless_invoke(
             method_name,
             descriptor,
         ) {
+            // §4 census: uncounted arm, same shape as `Method.invoke` above.
+            mark_stackless_exotic_natives_incomplete(shared);
             let result = safe_native_call(shared, thread, callback, args)?;
             if let Some(value) = result.filter(|_| ret_type != b'V') {
                 push_invoke_return_value(
@@ -3609,6 +3789,14 @@ pub(super) fn try_stackless_invoke(
         // other triples and are the wave-2 census gap noted at step 1.
         if let Some(id) = step1_native_id {
             shared.natives.native_methods.record_invocation(id);
+        } else {
+            // `None` is the gap, and this is where it is declared rather than
+            // merely commented. The dispatch below is about to run a native
+            // that nothing will count; mark the enumerable triples that can
+            // reach here so the census reports them as floors. See
+            // [`UNCOUNTED_STACKLESS_NATIVES`] — including which two arms are
+            // NOT enumerable and remain silent.
+            mark_stackless_exotic_natives_incomplete(shared);
         }
         let call_args = downcall_adapter_args.as_deref().unwrap_or(args);
         let result = safe_native_call(shared, thread, callback, call_args)?;
@@ -4385,5 +4573,157 @@ pub(super) fn invokespecial_owner_class_name(
     match store.get(start) {
         Some(c) => Arc::from(&*c.name),
         None => Arc::clone(method_class_name),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // -----------------------------------------------------------------------
+    // §4 census — `try_stackless_invoke`'s exotic arms declare themselves
+    // uncounted
+    // (docs/known-issues/jdk-only/G37-1-marking-the-bypasses-20260817.md)
+    // -----------------------------------------------------------------------
+
+    fn census_probe_native(
+        _ctx: &mut dyn cratonvm_native_api::NativeContext,
+        _args: &[Value],
+    ) -> cratonvm_types::error::MethodCallResult {
+        Ok(None)
+    }
+
+    /// The signature-polymorphic rows must stay on the **erased** descriptor.
+    ///
+    /// `MethodHandle.invoke*` and `DowncallHandle.invoke*` are registered under
+    /// `([Ljava/lang/Object;)Ljava/lang/Object;` while a real call site carries
+    /// its concrete signature — that mismatch is the whole reason those arms
+    /// exist, and it is also the reason the census row that loses the call is
+    /// the erased one. "Tidying" these rows to concrete descriptors would leave
+    /// the table resolving nothing and the marks silently absent, which reads
+    /// identically to a fixed instrument.
+    ///
+    /// Duplicate-free for the same reason the JIT-side list is: a duplicate
+    /// would make the count assertions below pass over one triple twice.
+    #[test]
+    fn the_signature_polymorphic_rows_use_the_erased_descriptor() {
+        const ERASED: &str = "([Ljava/lang/Object;)Ljava/lang/Object;";
+        for (class, method, descriptor) in UNCOUNTED_STACKLESS_NATIVES {
+            if matches!(
+                class,
+                "java/lang/invoke/MethodHandle" | "java/lang/foreign/DowncallHandle"
+            ) && matches!(method, "invoke" | "invokeExact" | "invokeBasic")
+            {
+                assert_eq!(
+                    descriptor, ERASED,
+                    "{class}.{method} is dispatched through the erased bridge; a \
+                     concrete descriptor here resolves nothing and marks nothing"
+                );
+            }
+        }
+
+        let mut seen: Vec<(&str, &str, &str)> = Vec::new();
+        for row in UNCOUNTED_STACKLESS_NATIVES {
+            assert!(
+                !seen.contains(&row),
+                "UNCOUNTED_STACKLESS_NATIVES lists {row:?} twice"
+            );
+            seen.push(row);
+        }
+    }
+
+    /// Marking must turn exactly the exotic-arm rows into floors, leave a
+    /// counted row exact, and leave the tallies alone.
+    ///
+    /// The counted control here is deliberately the shape this function's
+    /// ordinary path takes: a native reached through `resolve_step1_native`,
+    /// which holds the id and calls `record_invocation`. Those rows are exact
+    /// and must keep saying so — the point of the bit is to separate them from
+    /// the eleven arms that are not, not to blanket the census in doubt.
+    #[test]
+    fn marking_the_stackless_exotic_arms_turns_their_rows_into_floors() {
+        let mut registry = cratonvm_native_api::NativeMethodRegistry::new();
+        registry.with_category(cratonvm_native_api::NativeKind::Bridge, |r| {
+            for (class, method, descriptor) in UNCOUNTED_STACKLESS_NATIVES {
+                r.register(class, method, descriptor, census_probe_native);
+            }
+            r.register(
+                "java/lang/System",
+                "identityHashCode",
+                "(Ljava/lang/Object;)I",
+                census_probe_native,
+            );
+        });
+
+        let counted = registry
+            .resolve_id(
+                "java/lang/System",
+                "identityHashCode",
+                "(Ljava/lang/Object;)I",
+            )
+            .expect("control registered");
+        let method_invoke = registry
+            .resolve_id(
+                "java/lang/reflect/Method",
+                "invoke",
+                "(Ljava/lang/Object;[Ljava/lang/Object;)Ljava/lang/Object;",
+            )
+            .expect("registered");
+
+        assert_eq!(registry.slots_with_incomplete_invocations(), 0);
+        registry.record_invocation(counted);
+
+        let marked = mark_stackless_exotic_natives_incomplete_in(&registry);
+        assert_eq!(
+            marked,
+            UNCOUNTED_STACKLESS_NATIVES.len(),
+            "every listed triple was registered above, so every one must resolve"
+        );
+
+        assert_eq!(
+            registry.invocations_complete(method_invoke),
+            Some(false),
+            "reflective Method.invoke is dispatched from an arm that holds no \
+             NativeMethodId, so its zero proves nothing"
+        );
+        assert_eq!(
+            registry.invocations_complete(counted),
+            Some(true),
+            "the ordinary step-1 path counts, and must keep claiming to"
+        );
+        assert_eq!(
+            registry.invocations_of_id(counted),
+            Some(1),
+            "marking other slots must not disturb a counted tally"
+        );
+        assert_eq!(
+            registry.slots_with_incomplete_invocations(),
+            UNCOUNTED_STACKLESS_NATIVES.len()
+        );
+
+        // Idempotent: the marker is called from five dispatch points and the
+        // latch is an optimisation, not a correctness requirement.
+        assert_eq!(
+            mark_stackless_exotic_natives_incomplete_in(&registry),
+            UNCOUNTED_STACKLESS_NATIVES.len()
+        );
+        assert_eq!(
+            registry.slots_with_incomplete_invocations(),
+            UNCOUNTED_STACKLESS_NATIVES.len()
+        );
+    }
+
+    /// A registry without the Panama / `MethodHandle` bridges must be marked
+    /// with nothing rather than panic. This runs on the interpreter's hottest
+    /// function; an unregistered triple is an ordinary state, not an error.
+    #[test]
+    fn marking_an_empty_registry_marks_nothing_and_does_not_panic() {
+        let registry = cratonvm_native_api::NativeMethodRegistry::new();
+        assert_eq!(mark_stackless_exotic_natives_incomplete_in(&registry), 0);
+        assert_eq!(registry.slots_with_incomplete_invocations(), 0);
     }
 }

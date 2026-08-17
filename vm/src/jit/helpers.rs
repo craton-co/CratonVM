@@ -11326,6 +11326,169 @@ static STRING_LATIN1_LOWER_DIRECT_INFO: JitInvokeInfo = JitInvokeInfo {
     declaring_class_id: 0,
 };
 
+/// Every registry triple this file can reach through a **thin direct-call
+/// helper**, i.e. every slot whose `invocations` column is a floor rather than
+/// a total once the JIT is wired in this VM.
+///
+/// A site `jit::try_compile` binds to one of these helpers reaches the native's
+/// semantics without ever redeeming a `NativeMethodId`, so
+/// [`NativeMethodRegistry::record_invocation`] is never called for it. Only the
+/// helpers' own `jit_invoke_dispatch` fallbacks count, and a warm site does not
+/// take them. MEASURED
+/// (`docs/known-issues/jdk-only/G33-1-the-instrument-that-under-reported-20260817.md`
+/// §2): 100,000 `HashMap.put` calls report **2,000** with the JIT on against
+/// **100,000** under `--nojit`, and the JIT figure does not move with the
+/// workload size or with `CRATONVM_JIT_THRESHOLD` — it is frozen at the count
+/// reached before the enclosing loop was compiled.
+///
+/// **This list is the source-verified sweep of this file, and it is longer than
+/// the two helpers `G33-1` §8 N1 nominated.** `jit_integer_value_of_direct`,
+/// `jit_integer_int_value_direct` and `jit_thread_current_thread_direct` return
+/// from their fast arms without counting too. `G33-1` §2's remark that "the
+/// `Integer` siblings in the same file route through `call_integer_native_raw`"
+/// is true of the `jit_invoke_dispatch` route ONLY: the standalone direct
+/// helpers are separate bodies that never enter that wrapper. The same section
+/// read `StringLatin1.toLowerCase` counting exactly and concluded "the
+/// direct-call family is not uniformly broken"; the body of
+/// `jit_string_latin1_to_lower_direct` contains no census call at all, so that
+/// probe's exact figure must have come from sites that never bound the helper,
+/// not from the helper counting.
+///
+/// Both `ConcurrentMap.get` and `ConcurrentHashMap.get` are listed. They are
+/// two registry slots holding the same `native_chm_get`;
+/// `CONCURRENT_HASHMAP_GET_DIRECT_INFO` names the interface while
+/// `jit_concurrent_hashmap_get_direct`'s fast arm only fires for an exact
+/// `ConcurrentHashMap` receiver, so the row that loses the call is whichever of
+/// the two the fallback would have resolved. A triple that is not registered in
+/// this VM simply does not resolve and is not marked.
+///
+/// [`NativeMethodRegistry::record_invocation`]: cratonvm_native_api::NativeMethodRegistry::record_invocation
+const DIRECT_CALL_HELPER_NATIVES: [(&str, &str, &str); 8] = [
+    // `jit_integer_value_of_direct` — TLAB-allocated wrapper, and the cold arm
+    // that calls `intrinsic_integer_value_of` through `safe_native_call`
+    // directly. Neither counts.
+    ("java/lang/Integer", "valueOf", "(I)Ljava/lang/Integer;"),
+    // `jit_integer_int_value_direct` — heap-validated field-0 read.
+    ("java/lang/Integer", "intValue", "()I"),
+    // `jit_hashmap_put_direct` / `jit_hashmap_get_direct` — the overlay probe
+    // and the `safe_native_call_prevalidated_objects` arm below it.
+    (
+        "java/util/HashMap",
+        "put",
+        "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+    ),
+    (
+        "java/util/HashMap",
+        "get",
+        "(Ljava/lang/Object;)Ljava/lang/Object;",
+    ),
+    // `jit_string_latin1_to_lower_direct` — delegates to
+    // `lang_string::jit_string_to_lower_case` without touching the registry.
+    (
+        "java/lang/StringLatin1",
+        "toLowerCase",
+        "(Ljava/lang/String;[BLjava/util/Locale;)Ljava/lang/String;",
+    ),
+    // `jit_concurrent_hashmap_get_direct` — calls `native_chm_get` directly.
+    (
+        "java/util/concurrent/ConcurrentMap",
+        "get",
+        "(Ljava/lang/Object;)Ljava/lang/Object;",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap",
+        "get",
+        "(Ljava/lang/Object;)Ljava/lang/Object;",
+    ),
+    // `jit_thread_current_thread_direct` — returns the per-thread mirror. It
+    // bumps `JIT_FUNNEL_BYPASS_HITS`, which is a different instrument: that
+    // counter answers "did compiled code take this path", not "how many
+    // Java-level calls did this registry slot serve".
+    ("java/lang/Thread", "currentThread", "()Ljava/lang/Thread;"),
+];
+
+/// Declare every [`DIRECT_CALL_HELPER_NATIVES`] slot's `invocations` count
+/// incomplete for `shared`, so the census labels those rows a floor instead of
+/// leaving the reader to know this file exists.
+///
+/// # Why here, and why not a per-call counter
+///
+/// This runs from [`build_helpers_opt`], at the point the helper addresses are
+/// published into `cratonvm_jit`'s `*_DIRECT_FN` cells — the closest thing this
+/// side of the boundary has to a bind event, and the last moment before a
+/// compiled site can be pointed at one of these bodies. It is cold by
+/// construction: a JIT compile is orders of magnitude more expensive than the
+/// eight triple hashes below, and the latch makes even those once per (VM,
+/// registry generation).
+///
+/// The alternative — `record_invocation` inside each helper — was measured and
+/// rejected. `G33-1` §5: **+9.2 ns/call** against a 1.25 ns baseline, ~6% of the
+/// ~141 ns Rust native-call boundary but plausibly *the entire margin* a thin
+/// direct-call helper exists to buy. Paying it here would partly undo
+/// `perf/halfgap-20260717`. A bit set once and read only at report time costs
+/// nothing per call and turns a number that lies into a number that says "at
+/// least".
+///
+/// # What the bit claims
+///
+/// That a bypassing path is **wired** for the slot, not that a bypassing
+/// dispatch has **happened**. That is the statically true statement, and it is
+/// the one that survives: whether a given compile binds a given site is a fact
+/// no report-time reader can recover. Under `--nojit` nothing calls
+/// `build_helpers*` at all, so those runs keep an unmarked — and, for these
+/// slots, exact — census.
+///
+/// # The latch
+///
+/// Keyed on `(vm_identity, registry generation)`, the same pair
+/// `jit_invoke_dispatch`'s site cache uses, so a `RegisterNatives` that adds one
+/// of these triples after the first compile is picked up on the next one. Races
+/// between two compiling threads can only cause the marking to be *repeated*,
+/// never skipped for a VM that was never marked: `MARKED_VM` is stored after the
+/// marks, so observing it means some thread has already marked that VM.
+/// `mark_invocations_incomplete` is idempotent and sticky, so a repeat is a
+/// no-op.
+fn mark_direct_call_helper_natives_incomplete(shared: &crate::vm::SharedVm) {
+    use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+    static MARKED_ANY: AtomicBool = AtomicBool::new(false);
+    static MARKED_VM: AtomicUsize = AtomicUsize::new(0);
+    static MARKED_GENERATION: AtomicU32 = AtomicU32::new(0);
+
+    let registry = &shared.natives.native_methods;
+    let generation = registry.generation();
+    if MARKED_ANY.load(Ordering::Relaxed)
+        && MARKED_VM.load(Ordering::Relaxed) == shared.vm_identity
+        && MARKED_GENERATION.load(Ordering::Relaxed) == generation
+    {
+        return;
+    }
+    mark_direct_call_helper_natives_incomplete_in(registry);
+    MARKED_VM.store(shared.vm_identity, Ordering::Relaxed);
+    MARKED_GENERATION.store(generation, Ordering::Relaxed);
+    MARKED_ANY.store(true, Ordering::Relaxed);
+}
+
+/// The registry half of [`mark_direct_call_helper_natives_incomplete`], split
+/// out so the marking can be driven against a registry built in a test rather
+/// than only through a live `SharedVm` and a JIT compile.
+///
+/// Returns how many of [`DIRECT_CALL_HELPER_NATIVES`] resolved in this registry.
+/// A triple that does not resolve is not an error: `register_collections_natives`
+/// is a separate registrar from `register_essential_natives`, and a VM that
+/// registered neither still gets a correct — empty — set of marks.
+fn mark_direct_call_helper_natives_incomplete_in(
+    registry: &cratonvm_native_api::NativeMethodRegistry,
+) -> usize {
+    let mut marked = 0usize;
+    for &(class_name, method_name, descriptor) in DIRECT_CALL_HELPER_NATIVES.iter() {
+        if let Some(id) = registry.resolve_id(class_name, method_name, descriptor) {
+            registry.mark_invocations_incomplete(id);
+            marked += 1;
+        }
+    }
+    marked
+}
+
 thread_local! {
     static CONCURRENT_HASHMAP_CLASS_CACHE: std::cell::Cell<Option<(usize, u32)>> =
         const { std::cell::Cell::new(None) };
@@ -14694,6 +14857,196 @@ mod tests {
         }
     }
 
+    // -----------------------------------------------------------------------
+    // §4 census — the thin direct-call helpers declare themselves uncounted
+    // (docs/known-issues/jdk-only/G37-1-marking-the-bypasses-20260817.md)
+    // -----------------------------------------------------------------------
+
+    fn census_probe_native(
+        _ctx: &mut dyn cratonvm_native_api::NativeContext,
+        _args: &[Value],
+    ) -> cratonvm_types::error::MethodCallResult {
+        Ok(None)
+    }
+
+    /// Every helper the JIT can bind a call site to must be on the bypass list.
+    ///
+    /// The list is the only thing standing between a reader and a census row
+    /// that claims an exact `invocations` count it cannot deliver, and it is a
+    /// hand-written table over the same triples the `JitInvokeInfo` statics
+    /// carry. A helper added with a new `*_DIRECT_INFO` and no list row fails
+    /// silently and in the one direction `mark_invocations_incomplete`'s doc
+    /// says this instrument must never err.
+    ///
+    /// Note what this test does NOT assert: that every list row has an info.
+    /// `ConcurrentHashMap.get` deliberately has none — see
+    /// [`DIRECT_CALL_HELPER_NATIVES`] for why both concurrent-map slots are
+    /// listed while only the interface one appears in a `JitInvokeInfo`.
+    #[test]
+    fn every_thin_direct_call_helper_is_on_the_census_bypass_list() {
+        for info in [
+            &INTEGER_VALUE_OF_INFO,
+            &INTEGER_INT_VALUE_INFO,
+            &HASHMAP_PUT_DIRECT_INFO,
+            &HASHMAP_GET_DIRECT_INFO,
+            &CONCURRENT_HASHMAP_GET_DIRECT_INFO,
+            &STRING_LATIN1_LOWER_DIRECT_INFO,
+            &THREAD_CURRENT_THREAD_INFO,
+        ] {
+            assert!(
+                DIRECT_CALL_HELPER_NATIVES
+                    .iter()
+                    .any(|&(class, method, descriptor)| {
+                        class == info.class_name
+                            && method == info.method_name
+                            && descriptor == info.descriptor
+                    }),
+                "{}.{}{} is served by a thin direct-call helper but is missing \
+                 from DIRECT_CALL_HELPER_NATIVES, so its census row would report \
+                 `invocations_complete: true` for a count the helper never \
+                 increments",
+                info.class_name,
+                info.method_name,
+                info.descriptor
+            );
+        }
+
+        // Duplicate-free. A duplicate is harmless at run time — the mark is
+        // idempotent — but it would let the count assertions below pass while
+        // one triple was covered twice and another not at all.
+        let mut seen: Vec<(&str, &str, &str)> = Vec::new();
+        for row in DIRECT_CALL_HELPER_NATIVES {
+            assert!(
+                !seen.contains(&row),
+                "DIRECT_CALL_HELPER_NATIVES lists {row:?} twice"
+            );
+            seen.push(row);
+        }
+    }
+
+    /// Marking must turn exactly the helper-served rows into floors, leave a
+    /// control row exact, and leave the tally itself alone.
+    ///
+    /// The last part is the one worth pinning: the whole design rests on the
+    /// count staying readable and staying a floor. A mark that zeroed or
+    /// otherwise disturbed `invocations` would replace an under-report with no
+    /// report, which is worse — `G33-1` §4's safe reading ("did this ever run,
+    /// through a counted path") depends on the number surviving.
+    #[test]
+    fn marking_the_direct_call_helpers_turns_their_rows_into_floors() {
+        let mut registry = cratonvm_native_api::NativeMethodRegistry::new();
+        registry.with_category(cratonvm_native_api::NativeKind::Bridge, |r| {
+            for (class, method, descriptor) in DIRECT_CALL_HELPER_NATIVES {
+                r.register(class, method, descriptor, census_probe_native);
+            }
+            // `G33-1` §2's control: a native with no direct helper, measured at
+            // exactly 100,000 of 100,000 calls in every arm. It must not pick
+            // up doubt from its neighbours.
+            r.register(
+                "java/lang/System",
+                "identityHashCode",
+                "(Ljava/lang/Object;)I",
+                census_probe_native,
+            );
+        });
+
+        let control = registry
+            .resolve_id(
+                "java/lang/System",
+                "identityHashCode",
+                "(Ljava/lang/Object;)I",
+            )
+            .expect("control registered");
+        let hashmap_put = registry
+            .resolve_id(
+                "java/util/HashMap",
+                "put",
+                "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+            )
+            .expect("registered");
+
+        // Premise: nothing is marked until a bypassing path says so.
+        assert_eq!(registry.slots_with_incomplete_invocations(), 0);
+        // The counted dispatches this row DID see — the 2,000 of `G33-1` §2's
+        // table, in miniature.
+        registry.record_invocation(hashmap_put);
+        registry.record_invocation(hashmap_put);
+
+        let marked = mark_direct_call_helper_natives_incomplete_in(&registry);
+        assert_eq!(
+            marked,
+            DIRECT_CALL_HELPER_NATIVES.len(),
+            "every listed triple was registered above, so every one must resolve"
+        );
+
+        for (class, method, descriptor) in DIRECT_CALL_HELPER_NATIVES {
+            let id = registry
+                .resolve_id(class, method, descriptor)
+                .expect("registered");
+            assert_eq!(
+                registry.invocations_complete(id),
+                Some(false),
+                "{class}.{method}{descriptor} must report its count as a floor"
+            );
+        }
+        assert_eq!(
+            registry.invocations_complete(control),
+            Some(true),
+            "the flag is per slot: a native with no direct helper stays exact"
+        );
+        assert_eq!(
+            registry.slots_with_incomplete_invocations(),
+            DIRECT_CALL_HELPER_NATIVES.len()
+        );
+        assert_eq!(
+            registry.invocations_of_id(hashmap_put),
+            Some(2),
+            "the count must survive marking — it is the floor the reader falls \
+             back on, not a value the flag replaces"
+        );
+
+        // Idempotent: `build_helpers_for` runs once per compile, and the latch
+        // is an optimisation, not a correctness requirement.
+        assert_eq!(
+            mark_direct_call_helper_natives_incomplete_in(&registry),
+            DIRECT_CALL_HELPER_NATIVES.len()
+        );
+        assert_eq!(
+            registry.slots_with_incomplete_invocations(),
+            DIRECT_CALL_HELPER_NATIVES.len()
+        );
+
+        // The census is the door a reader actually uses. Every helper-served
+        // row must carry the doubt out through it.
+        let census = registry.census();
+        for entry in &census {
+            let listed = DIRECT_CALL_HELPER_NATIVES
+                .iter()
+                .any(|&(class, method, descriptor)| {
+                    entry.class == class && entry.name == method && entry.descriptor == descriptor
+                });
+            assert_eq!(
+                entry.invocations_complete, !listed,
+                "{}.{}{} census row: invocations_complete should be {}",
+                entry.class, entry.name, entry.descriptor, !listed
+            );
+        }
+    }
+
+    /// A registry that never registered the collection natives must still be
+    /// marked correctly — with nothing.
+    ///
+    /// `register_collections_natives` is a separate registrar from
+    /// `register_essential_natives`, and `jit::helpers` is reached from VM-less
+    /// unit tests as well as from a live VM. Resolving a triple that is not
+    /// there must be a quiet no-op, not a panic on the compile path.
+    #[test]
+    fn marking_an_empty_registry_marks_nothing_and_does_not_panic() {
+        let registry = cratonvm_native_api::NativeMethodRegistry::new();
+        assert_eq!(mark_direct_call_helper_natives_incomplete_in(&registry), 0);
+        assert_eq!(registry.slots_with_incomplete_invocations(), 0);
+    }
+
     #[test]
     fn dispatch_cache_does_not_serve_another_vms_compiled_entry() {
         let info_ptr = &HASHMAP_GET_DIRECT_INFO as *const JitInvokeInfo as usize;
@@ -16772,6 +17125,19 @@ fn build_helpers_opt(vm_for_helpers: Option<&crate::vm::SharedVm>) -> JitRuntime
         cratonvm_jit::set_thread_current_thread_direct_fn(
             jit_thread_current_thread_direct as *const () as usize,
         );
+        // §4 census, declared at the wiring point rather than paid per call.
+        // Every helper wired immediately above reaches its native without a
+        // `NativeMethodId`, so `record_invocation` never fires for it and those
+        // rows' `invocations` are floors — see
+        // [`DIRECT_CALL_HELPER_NATIVES`] for the measured evidence and
+        // [`mark_direct_call_helper_natives_incomplete`] for why the bit goes
+        // here instead of a `+9.2 ns/call` counter inside bodies that exist to
+        // avoid a 141 ns boundary. A VM-less `build_helpers()` has no registry
+        // to tell, and `--nojit` never reaches this function at all, which is
+        // exactly right: those runs' counts really are exact.
+        if let Some(shared) = vm_for_helpers {
+            mark_direct_call_helper_natives_incomplete(shared);
+        }
     }
 
     let (jit_card_table_addr, jit_card_old_base, jit_card_old_end) =
