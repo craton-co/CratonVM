@@ -8498,28 +8498,75 @@ pub(crate) fn register_bc_blake2s_digest(r: &mut NativeMethodRegistry) {
     r.set_category(__prev_cat);
 }
 
-/// Read `SHA256Digest`'s `X[64]` scratch array field, validating its length.
-fn bc_sha256_x_array(
-    ctx: &dyn NativeContext,
-    this: ObjectRef,
-) -> Result<ObjectRef, MethodCallFailed> {
-    let arr = match ctx.get_field_by_name(this, "X") {
-        Value::Object(Some(o)) => o,
-        _ => {
-            return Err(RuntimeError::IllegalStateException {
-                message: "SHA256Digest: missing X".into(),
-            }
-            .into())
-        }
-    };
-    if ctx.array_length(arr) < 64 {
-        return Err(RuntimeError::aioobe_index_only(64).into());
-    }
-    Ok(arr)
+/// The eight chaining words `H1..H8`, in order, plus the two remaining fields
+/// `processBlock` touches.
+const BC_SHA256_STATE_FIELDS: [&str; 8] = ["H1", "H2", "H3", "H4", "H5", "H6", "H7", "H8"];
+
+/// Resolved heap slot indices for one `SHA256Digest` class: `(H1..H8, X, xOff)`.
+#[derive(Clone, Copy)]
+struct BcSha256Slots {
+    h: [usize; 8],
+    x: usize,
+    x_off: usize,
 }
 
-/// The eight chaining words `H1..H8`, in order.
-const BC_SHA256_STATE_FIELDS: [&str; 8] = ["H1", "H2", "H3", "H4", "H5", "H6", "H7", "H8"];
+/// Slot cache, keyed by the receiver's `ClassId`.
+///
+/// `get_field_by_name` takes the class-manager read lock and walks the class
+/// hierarchy by name on every call; `processBlock` touches ten fields and is
+/// called once per 64-byte block, so paying that eighteen times per block would
+/// cost more than the bytecode this native replaces. The indices are a property
+/// of the class layout, so they are resolved once and reused.
+///
+/// Keyed on `ClassId` rather than cached unconditionally because the same class
+/// name can be loaded by two class loaders (two `ClassId`s, two layouts); a
+/// mismatch simply re-resolves rather than reading the wrong slots.
+static BC_SHA256_SLOTS: std::sync::RwLock<Option<(u32, BcSha256Slots)>> =
+    std::sync::RwLock::new(None);
+
+fn bc_sha256_slots(
+    ctx: &dyn NativeContext,
+    this: ObjectRef,
+) -> Result<BcSha256Slots, MethodCallFailed> {
+    let class_id = ctx.class_id_of_object(this);
+    let key = class_id.as_u32();
+    if let Ok(guard) = BC_SHA256_SLOTS.read() {
+        if let Some((cached_key, slots)) = *guard {
+            if cached_key == key {
+                return Ok(slots);
+            }
+        }
+    }
+    let bad = |what: &str| -> MethodCallFailed {
+        RuntimeError::IllegalStateException {
+            message: format!("SHA256Digest: cannot resolve field {what}"),
+        }
+        .into()
+    };
+    // `declared_fields` reports fields declared BY this class with an absolute
+    // heap slot index; H1..H8, X and xOff are all declared on `SHA256Digest`
+    // itself, so no super-class walk is needed.
+    let fields = ctx.declared_fields(class_id);
+    let index_of = |name: &str| -> Option<usize> {
+        fields
+            .iter()
+            .find(|f| f.name == name && !f.is_static)
+            .map(|f| f.slot_index)
+    };
+    let mut h = [0usize; 8];
+    for (slot, name) in h.iter_mut().zip(BC_SHA256_STATE_FIELDS) {
+        *slot = index_of(name).ok_or_else(|| bad(name))?;
+    }
+    let slots = BcSha256Slots {
+        h,
+        x: index_of("X").ok_or_else(|| bad("X"))?,
+        x_off: index_of("xOff").ok_or_else(|| bad("xOff"))?,
+    };
+    if let Ok(mut guard) = BC_SHA256_SLOTS.write() {
+        *guard = Some((key, slots));
+    }
+    Ok(slots)
+}
 
 /// Native `org.bouncycastle.crypto.digests.SHA256Digest.processBlock()`.
 ///
@@ -8555,26 +8602,37 @@ pub(crate) fn register_bc_sha256_digest(r: &mut NativeMethodRegistry) {
         "()V",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            let x_arr = bc_sha256_x_array(ctx, this)?;
+            let slots = bc_sha256_slots(ctx, this)?;
 
             let mut state = [0u32; 8];
-            for (slot, name) in state.iter_mut().zip(BC_SHA256_STATE_FIELDS) {
-                match ctx.get_field_by_name(this, name) {
+            for (slot, index) in state.iter_mut().zip(slots.h) {
+                match ctx.get_field(this, index) {
                     Value::Int(v) => *slot = v as u32,
                     _ => {
                         return Err(RuntimeError::IllegalStateException {
-                            message: format!("SHA256Digest: malformed {name}"),
+                            message: "SHA256Digest: malformed chaining word".into(),
                         }
                         .into())
                     }
                 }
             }
 
+            let x_arr = match ctx.get_field(this, slots.x) {
+                Value::Object(Some(o)) => o,
+                _ => {
+                    return Err(RuntimeError::IllegalStateException {
+                        message: "SHA256Digest: missing X".into(),
+                    }
+                    .into())
+                }
+            };
+
             // One bulk read of all 64 words rather than 64 `get_array_element`
             // round trips — the per-element path costs a virtual dispatch plus a
             // `Value` box per word, which is most of what this native exists to
             // remove. Only `X[0..16]` is live input; the tail is read so the
-            // single bulk write-back below can restore the whole array.
+            // single bulk write-back below can restore the whole array. A short
+            // read means `X` is not the 64-word `int[]` the class declares.
             let mut words = [0i32; 64];
             if ctx.read_int_array_into(x_arr, 0, &mut words) != 64 {
                 return Err(RuntimeError::IllegalStateException {
@@ -8589,8 +8647,8 @@ pub(crate) fn register_bc_sha256_digest(r: &mut NativeMethodRegistry) {
 
             cratonvm_native_builtins_crypto::bc_digest::sha256_process_block(&mut state, &mut x);
 
-            for (word, name) in state.iter().zip(BC_SHA256_STATE_FIELDS) {
-                ctx.set_field_by_name(this, name, Value::Int(*word as i32));
+            for (word, index) in state.iter().zip(slots.h) {
+                ctx.set_field(this, index, Value::Int(*word as i32));
             }
             for (dst, src) in words.iter_mut().zip(x.iter()) {
                 *dst = *src as i32;
@@ -8599,7 +8657,7 @@ pub(crate) fn register_bc_sha256_digest(r: &mut NativeMethodRegistry) {
             // BouncyCastle's `xOff = 0`, which `processWord` reads to decide
             // when the next block is full. Omitting it would leave the digest
             // permanently mid-block.
-            ctx.set_field_by_name(this, "xOff", Value::Int(0));
+            ctx.set_field(this, slots.x_off, Value::Int(0));
             Ok(None)
         },
     );
