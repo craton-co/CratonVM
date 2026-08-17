@@ -1120,6 +1120,7 @@ applies to `flag_env_mutation_guard.rs`.
 | `CRATONVM_JIT_ENABLE_CALLEE_SAVED_GPR_LOCALS` | JIT | `CRATONVM_JIT=enable-callee-saved-gpr-locals` | opt-in | off | behaviour | snapshot | jit |
 | `CRATONVM_JIT_ENABLE_INLINE_NEW` | JIT | `CRATONVM_JIT=enable-inline-new` | opt-in | off | behaviour | snapshot | jit |
 | `CRATONVM_JIT_FIELD_SITE_CACHE` | JIT | `CRATONVM_JIT=field-site-cache` | opt-in | off | behaviour | snapshot | vm |
+| `CRATONVM_JIT_NO_NEW_SITE_CACHE` | JIT | `CRATONVM_JIT=new-site-cache` | opt-out | on | behaviour | snapshot | vm |
 | `CRATONVM_JIT_FIELD_SITE_CACHE_LOADER` | JIT | `CRATONVM_JIT=field-site-cache-loader` | opt-in | off | behaviour | snapshot | vm |
 | `CRATONVM_JIT_FIELD_SITE_SLOTS` | JIT | `CRATONVM_JIT=field-site-slots` | opt-in | off | behaviour | snapshot | vm |
 | `CRATONVM_JIT_FORCE_C2` | JIT | `CRATONVM_JIT=force-c2` | opt-in | off | behaviour | snapshot | difftest, jit |

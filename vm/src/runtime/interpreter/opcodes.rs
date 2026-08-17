@@ -15,6 +15,59 @@
 //! here is the decode-and-do.
 
 use super::*;
+use super::site_cache::{site_stats, ClassSiteCache, ResolvedNewSite};
+
+/// `CRATONVM_JIT_NO_NEW_SITE_CACHE=1` — withdraw the per-thread `new`-site
+/// cache, so one binary can be A/B'd against its own pre-change behaviour.
+/// Comparing against a separately built branch would confound this with
+/// everything else that landed.
+///
+/// Default-ON, unlike its field and method siblings. Those are off because
+/// their hit rate does not generalise — a Spring Boot class measured 52%, and a
+/// miss there still leaves the authoritative path to run. This one is on for a
+/// different reason: what a `new` site miss re-derives is not a revalidation
+/// but a `String` allocation plus a full class resolution plus four
+/// `class_manager` read acquisitions, and a `new` executed once is a `new`
+/// whose class was just loaded — the very case whose resolution cost the most.
+/// `CRATONVM_DBG=field-site` reports `new: hit/miss/fill/reject_loader` beside
+/// the other two arms; read it before quoting a timing number.
+fn new_site_cache_enabled() -> bool {
+    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FLAG.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_NEW_SITE_CACHE").is_none()
+    })
+}
+
+/// Does this referencing class resolve constant-pool class names in a loader
+/// namespace of its own?
+///
+/// The admission test for [`ClassSiteCache`]. `true` means
+/// `resolve_class_loader_aware` may consult the initiating-resolution memo or
+/// drive a user `loadClass`, and the site is refused. `false` means the answer
+/// comes from the global name → `ClassId` mapping, which the entry's two epochs
+/// cover completely.
+///
+/// Both halves are immutable for a class: a defining loader is fixed when the
+/// class is defined, and the class-manager loader id it is cross-checked
+/// against never becomes `UserDefined` afterwards. That is what lets the fill
+/// site be the only place this is asked — a hit needs no re-check.
+///
+/// The side-table probe comes first because it is lock-free; the
+/// `class_manager` read behind it runs once per site, on the miss that fills it.
+fn referencing_class_has_loader_namespace(shared: &SharedVm, class_id: ClassId) -> bool {
+    if cratonvm_native_builtins::classloader::defining_loader_for(
+        shared.vm_identity,
+        class_id.as_u32(),
+    )
+    .is_some()
+    {
+        return true;
+    }
+    matches!(
+        shared.classes.class_manager.read().get_loader_id(class_id),
+        Some(cratonvm_types::ClassLoaderId::UserDefined(_))
+    )
+}
 
 // ---------------------------------------------------------------------------
 // Deoptimisation and OSR-exit frame reconstruction
@@ -2508,6 +2561,48 @@ pub(super) fn execute_instruction(
         // -- Object creation --
         Instruction::New(index) => {
             let referencing_class_id = thread.frames[frame_idx].class_id;
+            // ---- Resolved constant pool: per-thread `new`-site cache --------
+            //
+            // Everything between here and `gc_alloc_object` below is
+            // re-derivation: a `String` for the class name, a full
+            // `resolve_class_loader_aware`, the JVMS 5.4.4 access check, the
+            // initialization check and the field count — four separate
+            // `class_manager` read acquisitions and one heap allocation, on
+            // EVERY execution of a `new`. A hit answers all of it with an array
+            // index and four integer compares.
+            //
+            // See `site_cache::ClassSiteCache` for which sites are admissible
+            // (loader-blind referencing classes only, a property immutable per
+            // class) and why a hit may skip the access and initialization
+            // checks. `maybe_gc` at the end of this arm still runs on both
+            // paths, so the cache changes what is COMPUTED, never when a
+            // collection can happen.
+            let new_site_epochs = if new_site_cache_enabled() {
+                if let Some(hit) = thread.class_sites.get(referencing_class_id, *index) {
+                    let hit = *hit;
+                    site_stats::bump(site_stats::NEW_HIT);
+                    let obj_ref = gc_alloc_object(
+                        shared,
+                        thread,
+                        hit.class_id,
+                        // Widening: u32 → usize
+                        hit.num_fields as usize,
+                    )?;
+                    if remap_trace_on() {
+                        push_prov_record(obj_ref.as_ptr() as usize, "new");
+                    }
+                    thread.frames[frame_idx]
+                        .stack
+                        .push(Value::Object(Some(obj_ref)))?;
+                    maybe_gc(shared, thread);
+                    return Ok(InstructionResult::Continue);
+                }
+                site_stats::bump(site_stats::NEW_MISS);
+                // Read BEFORE resolving; see `SiteCache::put`.
+                Some(ClassSiteCache::epochs_now())
+            } else {
+                None
+            };
             let class_name = {
                 let cm = shared.classes.class_manager.read();
                 let class =
@@ -2600,6 +2695,36 @@ pub(super) fn execute_instruction(
                 .get_class(target_class_id)
                 .map(|c| c.num_total_fields)
                 .unwrap_or(0);
+            // Offer the site now that resolution, the access check and
+            // initialization have all succeeded. Refused for a referencing
+            // class with a loader namespace, and for an array name — `new` on
+            // an array type is not legal bytecode, but the resolver's `[` arm
+            // is loader-faithful in its own way and nothing here should be the
+            // first to assume otherwise.
+            if let Some(epochs_at_entry) = new_site_epochs {
+                if class_name.starts_with('[') || referencing_class_has_loader_namespace(
+                    shared,
+                    referencing_class_id,
+                ) {
+                    site_stats::bump(site_stats::NEW_REJECT_LOADER);
+                } else {
+                    thread.class_sites.put(
+                        referencing_class_id,
+                        *index,
+                        epochs_at_entry,
+                        ResolvedNewSite {
+                            class_id: target_class_id,
+                            // Narrowing: a class-file field table is u16-sized,
+                            // so this is unreachable for a verified class; the
+                            // saturating form keeps a corrupt synthetic caller
+                            // out of a panic on the allocation path, exactly as
+                            // `init_object_header` does with the same value.
+                            num_fields: u32::try_from(num_fields).unwrap_or(u32::MAX),
+                        },
+                    );
+                    site_stats::bump(site_stats::NEW_FILL);
+                }
+            }
             let obj_ref = gc_alloc_object(shared, thread, target_class_id, num_fields)?;
             // SPORTME-NSEE-TRACE: print full Java stack when NoSuchElementException is constructed.
             if class_name == "java/util/NoSuchElementException"

@@ -8203,7 +8203,9 @@ pub use field_access::*;
 // for field and method constant-pool references. `pub` so `vm-cli` can print
 // the `CRATONVM_DBG=field-site` tally at exit.
 pub mod site_cache;
-pub use site_cache::{FieldSiteCache, MethodSiteCache, MethodSiteInfo};
+pub use site_cache::{
+    ClassSiteCache, FieldSiteCache, MethodSiteCache, MethodSiteInfo, ResolvedNewSite,
+};
 // ---------------------------------------------------------------------------
 // Helper: Method invocation
 // ---------------------------------------------------------------------------
