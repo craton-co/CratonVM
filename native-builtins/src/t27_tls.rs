@@ -14551,6 +14551,18 @@ fn do_unwrap(
                         // server engine, let the handshake driver observe NEED_WRAP
                         // and flush it before the channel closes; otherwise Netty
                         // reports only ClosedChannelException to the client.
+                        //
+                        // A CLIENT does NOT defer, and that was MEASURED rather than
+                        // assumed. Deferring its own `TrustManager` rejection so the
+                        // next `wrap` could drain the alert first looked right — it is
+                        // the shape the server branch uses — and it wedged the client
+                        // instead: netty never issued that wrap, so the deferred error
+                        // never drained and `handshakeFuture().await()` never returned.
+                        // `testHandshakeFailureOnlyFireExceptionOnce` went from ~50%
+                        // to a 10 s `@Timeout` on every run, failing at line 1545 (the
+                        // CLIENT's assertion) instead of 1546 (the server's). The
+                        // NEED_WRAP-while-pending rule can only be relied on where the
+                        // caller is already in a wrap-driving state.
                         if matches!(&*conn, EngineConn::Server(_)) {
                             // Deferred, not discarded: the next `wrap` drains
                             // the alert and then raises this.
