@@ -1649,6 +1649,14 @@ pub struct G1Collector {
     /// accessor-lock measurement — see the flag's own doc.
     accessor_calls_lockfree: AtomicU64,
     accessor_calls_locked: AtomicU64,
+    /// Same census, remembered-set half: cross-region reference stores whose
+    /// edge the per-thread memo had already recorded (no lock), against those
+    /// that had to reach `RememberedSet::add_reference_in_generation` and take
+    /// its per-region mutex. `rset_edge_same_region` counts the stores that
+    /// never needed an entry at all.
+    rset_edge_memo_hit: AtomicU64,
+    rset_edge_recorded: AtomicU64,
+    rset_edge_same_region: AtomicU64,
     free_region_count: AtomicUsize,
     /// Queries since [`Self::free_region_count`] was last re-scanned. See
     /// [`NEEDS_GC_RECOUNT_INTERVAL`].
@@ -2023,6 +2031,9 @@ impl G1Collector {
             // heap answer "collect now".
             accessor_calls_lockfree: AtomicU64::new(0),
             accessor_calls_locked: AtomicU64::new(0),
+            rset_edge_memo_hit: AtomicU64::new(0),
+            rset_edge_recorded: AtomicU64::new(0),
+            rset_edge_same_region: AtomicU64::new(0),
             free_region_count: AtomicUsize::new(num_regions),
             needs_gc_since_recount: AtomicUsize::new(0),
             native_alloc_pressure: AtomicBool::new(false),
@@ -8922,7 +8933,12 @@ impl G1Collector {
         // Only record cross-region references.
         let (src_idx, dst_idx) = match (src_region, dst_region) {
             (Some(s), Some(d)) if s != d => (s, d),
-            _ => return,
+            _ => {
+                if gc_flags().g1_dbg_accessor {
+                    self.rset_edge_same_region.fetch_add(1, Ordering::Relaxed);
+                }
+                return;
+            }
         };
 
         let collector_id = self.instance_id;
@@ -8994,12 +9010,18 @@ impl G1Collector {
             }
         });
         if tag_ok && RSET_EDGE_MEMO.with(|m| m.get()).contains(&edge_key) {
+            if gc_flags().g1_dbg_accessor {
+                self.rset_edge_memo_hit.fetch_add(1, Ordering::Relaxed);
+            }
             return;
         }
         // Record the edge as memoized only after an add below actually lands.
         // Insert at the front so the most recent edge is found first; the
         // oldest falls off the end.
         let remember_edge = |epoch: u64| {
+            if gc_flags().g1_dbg_accessor {
+                self.rset_edge_recorded.fetch_add(1, Ordering::Relaxed);
+            }
             RSET_EDGE_MEMO_TAG.with(|c| c.set((collector_id, epoch)));
             RSET_EDGE_MEMO.with(|m| {
                 let mut memo = m.get();
@@ -9466,6 +9488,18 @@ impl G1Collector {
         let free = self.accessor_calls_lockfree.load(Ordering::Relaxed);
         let locked = self.accessor_calls_locked.load(Ordering::Relaxed);
         let total = free + locked;
+        let memo_hit = self.rset_edge_memo_hit.load(Ordering::Relaxed);
+        let recorded = self.rset_edge_recorded.load(Ordering::Relaxed);
+        let same_region = self.rset_edge_same_region.load(Ordering::Relaxed);
+        eprintln!(
+            "[g1-accessor] rset cross_region_stores={} memo_hit={memo_hit} took_rset_mutex={recorded} same_region_skipped={same_region} memo_hit_pct={:.2}",
+            memo_hit + recorded,
+            if memo_hit + recorded == 0 {
+                0.0
+            } else {
+                memo_hit as f64 * 100.0 / (memo_hit + recorded) as f64
+            }
+        );
         eprintln!(
             "[g1-accessor] field/array accessor calls={total} lock_free={free} took_regions_lock={locked} lock_free_pct={:.2}",
             if total == 0 {
