@@ -7,13 +7,13 @@
 | **Totals** | G1 598 PASS / 30 HANG / 14 FAIL / 6 CRASH / 3 NOSUMMARY · ZGC 605 PASS / 17 HANG / 20 FAIL / 6 CRASH / 3 NOSUMMARY |
 | **Why this page** | The per-shard logs name 64 classes and nothing said which of them share a cause. Nine causes do. |
 
-## TL;DR — the 64 classes are nine problems, and four groups are not VM defects
+## TL;DR — the 64 classes are nine problems, and five groups are not VM defects
 
-1. **4 classes are host pagefile exhaustion**, not defects — the VM could not reserve its own 2 GiB heap. Remove them from any tally.
+1. **6 classes are host resource exhaustion**, not defects — the VM could not reserve its heap (4 at 2 GiB, 2 at the harness's 12 GiB). Remove them from any tally.
 2. **29 of 64 fail on exactly one backend.** With one shard per backend this run cannot separate "GC-specific" from "flaky"; the pagefile event proves the box was a variable.
-3. **2 classes abort the process where they should throw `OutOfMemoryError`** — the clearest new defect on this page.
-4. **3 classes share one interface-dispatch defect** (`AbstractMethodError ... has no Code attribute` on a JUnit 4 interface).
-5. **2 classes share one JMX defect** (`NoSuchMethodError` on a JDK-internal virtual-thread scheduler).
+3. **FIXED:** an unsatisfiable heap *reservation* died with a bare `memory allocation of N bytes failed` naming neither `-Xmx` nor the heap. That silence is what got §3 filed wrong in the first place; it now prints a HotSpot-style diagnostic.
+4. **3 classes share one JIT inline-cache miscompile** — `AbstractMethodError` on a JUnit 4 interface method; interface dispatch itself is fine (§4, corrected).
+5. **2 classes share one wrong-object-in-a-local** at a single `Lock.lock()` call site — not a missing JDK method (§5, corrected).
 6. **~13 classes are wall-clock**, not stuck — the documented VM-wide per-call cost against a 300 s cap.
 7. **~10 classes are environmental** — HotSpot fails them identically on this host.
 8. **2 classes are permanent by-design gaps** (rustls implements no TLS 1.2 renegotiation).
@@ -132,25 +132,51 @@ Leading hypothesis, unproven: the inline PIC/megamorphic cascade's **miss edge**
 
 **Not fixed.** This path is on every interface dispatch in the VM, so a change here without the trigger isolated risks silent miscompiles far beyond these three classes. The safe interim lever is per-method: `CRATONVM_JIT_DENY=org/junit/validator/AnnotationsValidator$AnnotatableValidator.validateAnnotatable` makes all three classes pass.
 
-## 5. One JMX defect: a JDK-internal virtual-thread scheduler method (2 classes)
+## 5. CORRECTED — one wrong-object-in-a-local at a single call site (2 classes)
 
-| class | G1 | ZGC |
-|---|---|---|
-| `org.apache.catalina.loader.TestVirtualWebappLoader` | PASS | FAIL |
-| `org.apache.catalina.webresources.war.TestHandlerIntegration` | PASS | FAIL |
+**Originally filed as "a JDK-internal virtual-thread scheduler method this VM does not model". That was wrong, and it would have sent someone to add a missing method.** There is no missing method. Corrected 2026-08-17:
+
+| class | G1 | ZGC | receiver named in the error |
+|---|---|---|---|
+| `org.apache.catalina.loader.TestVirtualWebappLoader` | PASS | FAIL | `com.sun.management.internal.VirtualThreadSchedulerImpls$BoundVirtualThreadSchedulerImpl` |
+| `org.apache.catalina.webresources.war.TestHandlerIntegration` | PASS | FAIL | `com.sun.jmx.mbeanserver.JmxMBeanServer` |
+
+Both fail at the **same call site** with the **same method**, and only the receiver class differs:
 
 ```
-Caused by: java.lang.NoSuchMethodError: 'void com.sun.management.internal
-    .VirtualThreadSchedulerImpls$BoundVirtualThreadSchedulerImpl.lock()'
-  at org.apache.tomcat.util.modeler.OperationInfo.getSignature(OperationInfo.java:134)
-  at org.apache.tomcat.util.modeler.OperationInfo.getMBeanParameterInfo(OperationInfo.java:198)
-  at org.apache.tomcat.util.modeler.ManagedBean.getMBeanInfo(ManagedBean.java:434)
-  at org.apache.tomcat.util.modeler.BaseModelMBean.getMBeanInfo(BaseModelMBean.java:230)
+NoSuchMethodError method="com/sun/jmx/mbeanserver/JmxMBeanServer.lock()V"
+  caller="org/apache/tomcat/util/modeler/OperationInfo.getSignature()... @pc=16"
 ```
 
-Tomcat's own MBean modeler reflects over operation signatures, and doing so reaches a JDK-internal virtual-thread scheduler implementation this VM does not fully model. Both classes fail only under ZGC in this run, but nothing in that stack is collector-shaped — treat the single-backend showing as §1's one-observation problem, not as evidence about ZGC.
+That is the tell. `getSignature` is nine bytecodes long and takes a read lock:
 
-`getSignature` is a **reflective** walk, so the trigger is which MBeans happen to be registered rather than what the test asserts. That makes it a plausible latent cause under other JMX-touching classes too.
+```
+ 1: getfield        parametersLock : java/util/concurrent/locks/ReadWriteLock
+ 4: invokeinterface ReadWriteLock.readLock() : java/util/concurrent/locks/Lock
+ 9: astore_1
+10: aload_1
+11: invokeinterface Lock.lock()V        <-- fails (reported pc 16 = 11 + the 5-byte invokeinterface)
+16: aload_0
+```
+
+Local 1 must hold the `Lock` that `readLock()` returned at pc 4. At pc 11 it holds **an unrelated live object** instead — an MBean server, a virtual-thread scheduler. Neither implements `Lock`, so `lock()V` is genuinely absent from them and the VM's message is accurate; the object is simply the wrong one. `BoundVirtualThreadSchedulerImpl` was incidental — whatever occupied that reference, not a class needing support.
+
+**So the fix is not "implement `lock()` somewhere".** It is to find why a reference in a local slot is replaced between two adjacent bytecodes. Both observations are ZGC-only, and ZGC is the relocating collector, which makes a mis-rewritten slot during relocation the first hypothesis.
+
+### Not reproduced — seven configurations, all green
+
+Neither class fails outside the concurrent suite. On the current binary, `TestVirtualWebappLoader` is `OK (3 tests)` and `TestHandlerIntegration` is `OK (1 test)` under every one of:
+
+* standalone, default collector
+* the runner's four env vars (`CRATONVM_REAL_NET_SOCKETS`, `CRATONVM_REAL_AQS`, `CRATONVM_DISABLE_DEFAULT_WATCHDOG`, `CRATONVM_ROOTSNAP_CACHE`)
+* explicit `-XX:+UseZGC`
+* `CRATONVM_JIT_THRESHOLD=1` and `=3` (compile essentially everything, immediately)
+* `CRATONVM_DBG_GC_STRESS=65536`, relocation ON
+* the same with `CRATONVM_ZGC_RELOCATE=0`
+
+Both original failures are also timestamped **15:11:51 and 15:13:39** — inside the 15:12-15:25 commit-charge window §1 and §2 document. That does not make the signature benign (host pressure changes timing, it does not put an MBean server into a local slot), but it does mean the only condition that has ever produced it is the full eight-shard concurrent run.
+
+**Next step is a reproduction, not a patch.** Re-run these two classes under the full concurrent load with `CRATONVM_ZGC_RELOCATE=0` as the A/B; if the signature survives relocation being off, relocation is exonerated and the search moves to the root-scanning side. Do not change reference-tracking code without a repro that can prove the change did something.
 
 ## 6. Individually diagnosed, one class each
 
