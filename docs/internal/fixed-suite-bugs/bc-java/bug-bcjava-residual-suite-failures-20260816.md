@@ -25,7 +25,8 @@ inside `SCrypt.SMix`; that is not a CratonVM defect either way.
 Unchanged, and not a correctness defect: the class does real ML-KEM/ML-DSA in
 BouncyCastle's pure Java and exceeds the budget where HotSpot takes 271 s. It
 has its own page,
-`docs/known-issues/bc-java/bug-bcjava-pqc-lms-hsstests-interpreter-throughput-cliff-20260816.md`.
+bug-bcjava-pqc-lms-hsstests-interpreter-throughput-cliff-20260816-FIXED.md
+(this directory), resolved 2026-08-17.
 
 ### Residual A — the CMS/PKCS cipher-stream family — FIXED
 Not one bug but five, all in `javax.crypto.Cipher`, all of the same species: a

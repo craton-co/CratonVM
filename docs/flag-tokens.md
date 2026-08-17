@@ -701,13 +701,11 @@ export inherited from a parent shell.
 
 ## `CRATONVM_GC`
 
-53 tokens.
+52 tokens.
 
 | Token | Expands to |
 | --- | --- |
 | `card-metrics` | `CRATONVM_GC_CARD_METRICS` |
-| `dbg-mapgen` | `CRATONVM_DBG_MAPGEN` |
-| `dbg-vacated-frames` | `CRATONVM_DBG_VACATED_FRAMES` |
 | `card-table-only` | `CRATONVM_CARD_TABLE_ONLY` |
 | `compact-ref-fields` | `CRATONVM_COMPACT_REF_FIELDS` |
 | `pack-fields-by-width` | `CRATONVM_PACK_FIELDS_BY_WIDTH` |
@@ -755,6 +753,7 @@ export inherited from a parent shell.
 | `zgc-generational` | `CRATONVM_ZGC_GENERATIONAL` |
 | `zgc-gen-promotion-age` | `CRATONVM_ZGC_GEN_PROMOTION_AGE` |
 | `zgc-gen-minors-per-major` | `CRATONVM_ZGC_GEN_MINORS_PER_MAJOR` |
+| `zgc-gen-nursery-percent` | `CRATONVM_ZGC_GEN_NURSERY_PERCENT` |
 | `zgc-startbits` | `CRATONVM_ZGC_STARTBITS` |
 | `zgc-tlab` | `CRATONVM_ZGC_TLAB` |
 | `young-pause-goal-ms` | `CRATONVM_GC_YOUNG_PAUSE_MS` |

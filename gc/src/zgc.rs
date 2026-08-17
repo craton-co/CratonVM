@@ -2814,6 +2814,31 @@ pub struct ZgcRealHeap {
     /// mis-fires in whichever direction the omission points. Carried forward
     /// instead of recomputed, which is the whole point.
     gen_old_live_bytes: AtomicUsize,
+    /// Bytes of fresh allocation that fill the nursery, precomputed from
+    /// [`zgc_gen_nursery_percent`] so the allocation path never divides.
+    gen_nursery_bytes: AtomicUsize,
+    /// `allocated` as of the end of the last collection — the nursery's zero.
+    ///
+    /// `allocated - gen_nursery_watermark` is bytes allocated since, which on a
+    /// bump-first heap (G2c) is the nursery's size. Exact, O(1), and it needs no
+    /// counter of its own: `allocated` is already incremented on the allocation
+    /// path for the live-bytes trigger, and already read by `needs_gc`.
+    gen_nursery_watermark: AtomicUsize,
+    /// Did the nursery-size clause of `needs_gc` fire? Consumed by the
+    /// collection it asked for.
+    ///
+    /// A latch and not a `fetch_add`, because `needs_gc` is POLLED on the
+    /// allocation path: the condition stays true from the moment it is reached
+    /// until the collection actually runs, so counting on each observation would
+    /// report allocations, not collections.
+    gen_nursery_triggered: AtomicBool,
+    /// Young collections the nursery-size trigger asked for.
+    ///
+    /// The engagement counter for G2d: this at zero on a generational run means
+    /// every collection still came from the whole-heap trigger, so young cycles
+    /// are as rare as full collections were and the nursery is unbounded in
+    /// practice. That was the state before 2026-08-17.
+    gen_nursery_triggers: AtomicUsize,
     /// Survivors a relocating cycle promoted by moving them below the nursery
     /// floor, cumulative.
     ///
@@ -3285,6 +3310,10 @@ impl ZgcRealHeap {
             gen_promotion_age: std::sync::atomic::AtomicU32::new(zgc_gen_promotion_age()),
             gen_minors_per_major: AtomicUsize::new(zgc_gen_minors_per_major()),
             gen_force_major_next: AtomicBool::new(false),
+            gen_nursery_bytes: AtomicUsize::new(cap / 100 * zgc_gen_nursery_percent()),
+            gen_nursery_watermark: AtomicUsize::new(0),
+            gen_nursery_triggered: AtomicBool::new(false),
+            gen_nursery_triggers: AtomicUsize::new(0),
             gen_promotions_by_slide: AtomicUsize::new(0),
             gen_sweep_skipped: AtomicUsize::new(0),
             gen_young_floor: AtomicUsize::new(0),
@@ -5116,6 +5145,17 @@ impl ZgcRealHeap {
     /// [`Self::gen_promotions_by_slide`].
     pub fn promotions_by_slide(&self) -> usize {
         self.gen_promotions_by_slide.load(Ordering::Relaxed)
+    }
+
+    /// `(collections the nursery trigger asked for, the nursery budget in bytes)`
+    /// -- G2d's engagement counter. Zero triggers on a generational run means
+    /// every collection still came from the whole-heap predicate, so young cycles
+    /// are as rare as full collections were.
+    pub fn nursery_trigger_stats(&self) -> (usize, usize) {
+        (
+            self.gen_nursery_triggers.load(Ordering::Relaxed),
+            self.gen_nursery_bytes.load(Ordering::Relaxed),
+        )
     }
 
     /// Apply the ZGC **load barrier** to one reference slot, in place.
@@ -8773,6 +8813,44 @@ fn zgc_gen_promotion_age() -> u32 {
     })
 }
 
+/// `CRATONVM_ZGC_GEN_NURSERY_PERCENT` -- the nursery's size as a percentage of
+/// heap capacity. Default 10; `0` is the kill switch and restores the
+/// whole-heap-only trigger.
+///
+/// # Why a young cycle needs a trigger of its own
+///
+/// `needs_gc`'s two clauses are both about the WHOLE HEAP -- live bytes against
+/// `gc_threshold`, and allocatable space via `headroom_low`. Neither asks whether
+/// enough has been allocated *since the last collection* to be worth a young
+/// cycle, so before this a young cycle happened only when a full collection would
+/// have. Young cycles were therefore exactly as rare as the collections they were
+/// meant to replace: the 2026-08-17 measurement recorded **six** in a 600-round
+/// run, and a generational split that runs six times cannot pay for the barrier
+/// it costs on every store.
+///
+/// # Why 10 and not `Z_DEFAULT_YOUNG_FRACTION`'s 25
+///
+/// `generation::Z_DEFAULT_YOUNG_FRACTION` is 0.25 and describes a young
+/// generation's share of a heap it *owns* -- a sized space that survivors are
+/// evacuated out of. This nursery is not that: it is the tail of one arena, it is
+/// reclaimed by a bounded sweep rather than by a cursor reset, and its cost is
+/// proportional to the objects in it. A smaller budget therefore buys the thing
+/// this trigger is for (frequent, cheap young cycles) where 25% would give six
+/// large ones on a 1.2 GB heap -- which is what the measurement already showed.
+/// Revisit when a young cycle reclaims by resetting a cursor.
+fn zgc_gen_nursery_percent() -> usize {
+    static CACHED: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *CACHED.get_or_init(|| {
+        match cratonvm_types::flags::runtime_var("CRATONVM_ZGC_GEN_NURSERY_PERCENT")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+        {
+            Some(p) => p.min(100),
+            None => 10,
+        }
+    })
+}
+
 /// `CRATONVM_ZGC_GEN_MINORS_PER_MAJOR` -- young cycles allowed between
 /// whole-heap ones. Default [`generation::Z_DEFAULT_MINORS_PER_MAJOR`] (8).
 ///
@@ -11122,8 +11200,48 @@ impl GarbageCollector for ZgcRealHeap {
         //
         // Both keep the `gc_rearm` floor, so neither can fire a cycle per
         // allocation against a live set parked above the threshold.
-        a >= self.gc_rearm.load(Ordering::Relaxed)
+        if a >= self.gc_rearm.load(Ordering::Relaxed)
             && (a >= self.gc_threshold || self.headroom_low.load(Ordering::Relaxed))
+        {
+            return true;
+        }
+
+        // ---- G2d: THE NURSERY IS FULL ------------------------------------
+        //
+        // Both clauses above are about the WHOLE HEAP: `gc_threshold` is live
+        // bytes and `headroom_low` is allocatable space. Neither ever asks "has
+        // enough been allocated since the last collection to be worth a young
+        // cycle?", so before this a young cycle happened only when a full
+        // collection would have — i.e. young cycles were exactly as rare as the
+        // collections they were meant to replace, and the generational split had
+        // no opportunity to pay for itself. The 2026-08-17 measurement saw six
+        // young cycles in a 600-round run for that reason.
+        //
+        // `allocated - watermark` is the nursery's size: `allocated` is already
+        // incremented on the allocation path and already loaded above, so this
+        // costs two relaxed loads and two compares on the miss.
+        //
+        // # Why this cannot storm, without consulting `gc_rearm`
+        //
+        // It deliberately does NOT go through the `gc_rearm` floor, because that
+        // floor is a quarter of remaining headroom and is therefore much larger
+        // than a nursery budget — ANDing them would make this clause
+        // unreachable. It does not need the floor: the watermark is reset at the
+        // end of every collection, so firing requires `budget` bytes of genuinely
+        // NEW allocation each time. A live set parked above the threshold cannot
+        // re-trigger it, which is the one thing `gc_rearm` exists to prevent.
+        if !self.generational_enabled.load(Ordering::Relaxed) {
+            return false;
+        }
+        let budget = self.gen_nursery_bytes.load(Ordering::Relaxed);
+        if budget == 0 {
+            return false; // the kill switch, see `zgc_gen_nursery_percent`
+        }
+        if a.saturating_sub(self.gen_nursery_watermark.load(Ordering::Relaxed)) >= budget {
+            self.gen_nursery_triggered.store(true, Ordering::Relaxed);
+            return true;
+        }
+        false
     }
 
     fn collect_garbage(
@@ -11819,6 +11937,9 @@ impl GarbageCollector for ZgcRealHeap {
             // to name.
             self.has_old_objects.store(true, Ordering::Relaxed);
         }
+        if self.gen_nursery_triggered.swap(false, Ordering::Relaxed) {
+            self.gen_nursery_triggers.fetch_add(1, Ordering::Relaxed);
+        }
         if young_cycle {
             self.young_cycles.fetch_add(1, Ordering::Relaxed);
             self.minors_since_major.fetch_add(1, Ordering::Relaxed);
@@ -11880,6 +12001,12 @@ impl GarbageCollector for ZgcRealHeap {
         // decided which addresses are live. See `prune_relocations`.
         self.prune_relocations();
         self.allocated.store(live_bytes, Ordering::Relaxed);
+        // THE NURSERY'S ZERO. Reset on every collection, young or full, and from
+        // the same figure `allocated` was just given -- so "bytes allocated since
+        // the last collection" is exact rather than an estimate, and the trigger
+        // above cannot storm.
+        self.gen_nursery_watermark
+            .store(live_bytes, Ordering::Relaxed);
         // Re-arm the trigger: require at least a quarter of the remaining
         // headroom (min 64 KiB) of NEW allocation before the next
         // threshold-triggered collection, so a live set parked above the
@@ -15892,6 +16019,99 @@ pub(crate) mod tests {
             reused > 0,
             "with the mode OFF the allocator must reuse the swept holes -- if it              does not, the ON assertion above proves nothing about the policy"
         );
+    }
+
+    /// **G2d: the nursery-size trigger must ASK for collections the whole-heap
+    /// predicate would not, and must not storm.**
+    ///
+    /// # The state this leaves
+    ///
+    /// `needs_gc`'s two clauses are both about the whole heap — live bytes, and
+    /// allocatable space. Neither asks whether enough has been allocated since the
+    /// last collection to be worth a young cycle, so before this a young cycle
+    /// happened only when a full collection would have. The 2026-08-17
+    /// measurement recorded six young cycles in a 600-round run for exactly that
+    /// reason, and a split that runs six times cannot pay for a barrier on every
+    /// store.
+    ///
+    /// # Three assertions, and the third is the one that could bite
+    ///
+    /// It fires when the nursery fills; it does NOT fire when the mode is off (or
+    /// the budget is 0, the kill switch); and **it does not storm** — the
+    /// watermark is reset by every collection, so firing again requires a fresh
+    /// budget's worth of allocation. That is why the clause deliberately bypasses
+    /// `gc_rearm`: that floor is a quarter of remaining headroom and would make
+    /// the clause unreachable, so the anti-storm property has to come from the
+    /// watermark instead and is worth pinning.
+    #[test]
+    fn the_nursery_size_trigger_asks_for_a_collection_and_does_not_storm() {
+        let heap = gen_heap_for_test(64 * 1024 * 1024);
+        let (_, budget) = heap.nursery_trigger_stats();
+        assert!(budget > 0, "the default budget must be non-zero: {budget}");
+        assert!(
+            budget < heap.heap_capacity(),
+            "and smaller than the heap, or it can never be reached before the              whole-heap trigger"
+        );
+
+        // A fresh heap is below every threshold, so nothing asks yet.
+        assert!(
+            !heap.needs_gc(),
+            "an empty heap must not want a collection"
+        );
+
+        // (1) FILL THE NURSERY. Allocate past the budget without making the live
+        // set large enough for the whole-heap clauses.
+        let mut allocated = 0usize;
+        while allocated < budget + 64 * 1024 {
+            let o = heap.alloc_object(ClassId::new(43), 4);
+            allocated += alloc_footprint(&heap, o);
+        }
+        assert!(
+            heap.allocated_bytes() < heap.gc_threshold,
+            "the fixture must stay below the live-bytes threshold, or this test              cannot tell the nursery clause from the old ones: allocated={}              threshold={}",
+            heap.allocated_bytes(),
+            heap.gc_threshold
+        );
+        assert!(
+            heap.needs_gc(),
+            "the nursery is over budget, so a collection must be wanted"
+        );
+
+        // (2) THE COLLECTION CONSUMES THE TRIGGER AND IT IS COUNTED.
+        let keep = heap.alloc_object(ClassId::new(2), 1);
+        let mut roots = [keep];
+        let _ = gen_collect(&heap, &mut roots);
+        let (fired, _) = heap.nursery_trigger_stats();
+        assert_eq!(
+            fired, 1,
+            "the collection must record which trigger asked for it -- zero here              means every collection still comes from the whole-heap predicate"
+        );
+
+        // (3) IT MUST NOT STORM. Immediately after a collection the nursery is
+        // empty, so nothing is wanted until a fresh budget accumulates.
+        assert!(
+            !heap.needs_gc(),
+            "the watermark is reset by the collection, so the trigger must be              disarmed -- this clause bypasses `gc_rearm`, so the anti-storm              property comes from here and nowhere else"
+        );
+
+        // And the mode being off disarms it entirely.
+        let plain = ZgcRealHeap::new_shared(64 * 1024 * 1024);
+        plain.set_tlab_enabled(false);
+        plain.set_generational_enabled(false);
+        let mut n = 0usize;
+        while n < budget + 64 * 1024 {
+            let o = plain.alloc_object(ClassId::new(43), 4);
+            n += alloc_footprint(&plain, o);
+        }
+        assert!(
+            !plain.needs_gc(),
+            "with generational mode off the nursery clause must not fire, or this              changes every default run"
+        );
+    }
+
+    /// The allocated footprint of `o`, for a test that counts bytes.
+    fn alloc_footprint(heap: &ZgcRealHeap, o: ObjectRef) -> usize {
+        ZgcRealHeap::alloc_size(heap.header_ref(o.as_ptr())).unwrap_or(64)
     }
 
     /// **A card whose target is OLD is dropped, and the target survives

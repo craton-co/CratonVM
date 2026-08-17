@@ -759,6 +759,39 @@ The comparison to make, once the box is quiet: the same probe and arguments as
 the number to watch is `sweep` in `[GC] zgc-pause:` — 182 ms of a 309 ms mean
 before, and O(young) is only worth having if that falls.
 
+### G2b — the slide IS the promotion — **BUILT 2026-08-17**
+
+With the JIT-load-barrier blocker gone (see the correction under the five-step
+list above), the promotion increment turned out to be a **deletion plus two
+stores**, because the machinery was already there.
+
+`compact_low_to` packs survivors from the first selected page upward and drops
+the cursor to the end of the compacted region, so after a slide **every live
+object is below the cursor** — the ones on unselected dense pages never moved and
+are below it too. G2a's floor was being *thrown away* at that point, on the
+reasoning that a slide rewrites the low region so an address no longer says which
+generation an object is in. That was backwards: a slide rewrites the low region
+into exactly the shape a nursery wants.
+
+So the floor is now re-established at the post-slide cursor. Three consequences:
+
+* **it is promotion by copy** — survivors are moved out of the young region and
+  the nursery is left EMPTY, which is G2's defining behaviour;
+* **it carries no floating garbage**, because the registry at that point holds
+  live objects only (the sweep pruned the dead a few statements earlier), so
+  declaring everything below the cursor old retains nothing unreachable. That is
+  strictly better than G2a's floor, which inherited whatever the free list had
+  placed below it;
+* **a relocating cycle no longer forces a whole-heap cycle behind it.** It used
+  to arm `gen_force_major_next`, which meant the split was off every other
+  collection whenever relocation was on — i.e. by default.
+
+`gen_promotions_by_slide` is the engagement counter: `compaction_cycles > 0`
+with that at zero is the old behaviour exactly. The test asserts the counter, that
+**no** live base sits at or above the floor, and that the force-major latch stays
+clear — and it was checked for the vacuous case, that the selector really does
+move in its fixture rather than declining and passing through the early return.
+
 ### G2c — the nursery is where allocation GOES — **BUILT 2026-08-17**
 
 G2a had to document a cost: `Arena::alloc` serves the free list before the bump
@@ -790,6 +823,44 @@ Both directions are tested, because the ON assertion alone would be satisfied by
 an allocator that happened not to reuse holes: the same fixture with the mode OFF
 must put objects back in the swept holes.
 
+### G2d — a BOUNDED nursery, so young cycles actually happen — **BUILT 2026-08-17**
+
+`needs_gc`'s two clauses are both about the **whole heap**: live bytes against
+`gc_threshold`, and allocatable space via `headroom_low`. Neither ever asks
+*"has enough been allocated since the last collection to be worth a young
+cycle?"* — so a young cycle happened only when a full collection would have. Young
+cycles were exactly as rare as the collections they were meant to replace, and
+§3b's six-in-600-rounds is that, not a property of the workload. **A split that
+runs six times cannot pay for a barrier on every store.**
+
+`CRATONVM_ZGC_GEN_NURSERY_PERCENT` (default 10, `0` is the kill switch) adds the
+missing clause: `allocated - watermark >= budget`, where the watermark is
+`allocated` as of the end of the last collection. It needs no counter of its own —
+`allocated` is already incremented on the allocation path and already loaded by
+`needs_gc` — so a miss costs two relaxed loads and two compares.
+
+**It deliberately bypasses `gc_rearm`, and that is why the anti-storm property
+had to be argued.** `gc_rearm` is a quarter of remaining headroom, which is far
+larger than a nursery budget, so ANDing them would make the clause unreachable.
+It does not need the floor: the watermark is reset by *every* collection, so
+firing again requires a fresh budget's worth of genuinely new allocation. A live
+set parked above the threshold cannot re-trigger it, which is the one thing
+`gc_rearm` exists to prevent — and the test pins exactly that, asserting the
+trigger is disarmed immediately after the collection it asked for.
+
+**10%, not `Z_DEFAULT_YOUNG_FRACTION`'s 25%.** That constant describes a young
+generation's share of a heap it *owns* — a sized space survivors are evacuated out
+of. This nursery is the tail of one arena, reclaimed by a bounded sweep rather
+than a cursor reset, so its cost is proportional to the objects in it. A smaller
+budget is what buys frequent cheap cycles; 25% of a 1.2 GB heap gives six large
+ones, which is what §3b already measured. Revisit when a young cycle reclaims by
+resetting a cursor.
+
+`gen_nursery_triggers` is the engagement counter, and it is a **latch consumed by
+the collection**, not a `fetch_add` in `needs_gc` — the predicate is polled on the
+allocation path and stays true from the moment it is reached until the collection
+runs, so counting observations would report allocations rather than collections.
+
 ### G2 — what is still missing, and it is smaller than it was
 
 With G2a/b/c in, the young generation is a real address range that allocation
@@ -799,10 +870,11 @@ fills, a bounded sweep reclaims, and a slide promotes out of. What a
 * **Reclaim with no sweep at all.** A young cycle still walks the nursery's
   registered objects. A page-based young space frees a whole page by resetting a
   cursor, so the survivors' cost is the copy and the garbage costs nothing.
-* **A bounded nursery.** Today the nursery is "everything above the floor", so it
-  grows until the next collection. A sized young space is what makes the young
-  cycle's cost predictable rather than proportional to the gap between
-  collections.
+* ~~**A bounded nursery.**~~ **Done by G2d above.** The nursery now has a size
+  budget that triggers a collection of its own, so its cost no longer scales with
+  the gap between whole-heap collections. What a *sized space* would still add on
+  top is a hard ceiling rather than a trigger — today an allocation burst can
+  overshoot the budget before the next safepoint.
 * **Per-page `ZObjectStarts`**, without which `is_object_address` stops being
   O(1) once the registry is per page.
 
@@ -877,40 +949,6 @@ refusal while a JIT frame is on a stack). A load barrier is what **concurrent**
 relocation needs. The lesson is the tree's own: re-derive a stated blocker from
 the source before pricing work around it — this one had been closed for four
 days.
-
-### G2b — the slide IS the promotion — **BUILT 2026-08-17**
-
-With that blocker gone, the first increment of G2 turned out to be a **deletion
-plus two stores**, because the machinery was already there.
-
-`compact_low_to` packs survivors from the first selected page upward and drops
-the cursor to the end of the compacted region, so after a slide **every live
-object is below the cursor** — the ones on unselected dense pages never moved and
-are below it too. G2a's floor was being *thrown away* at that point, on the
-reasoning that a slide rewrites the low region so an address no longer says which
-generation an object is in. That was backwards: a slide rewrites the low region
-into exactly the shape a nursery wants.
-
-So the floor is now re-established at the post-slide cursor. Three consequences:
-
-* **it is promotion by copy** — survivors are moved out of the young region and
-  the nursery is left EMPTY, which is G2's defining behaviour;
-* **it carries no floating garbage**, because the registry at that point holds
-  live objects only (the sweep pruned the dead a few statements earlier), so
-  declaring everything below the cursor old retains nothing unreachable. That is
-  strictly better than G2a's floor, which inherited whatever the free list had
-  placed below it;
-* **a relocating cycle no longer forces a whole-heap cycle behind it.** It used
-  to arm `gen_force_major_next`, which meant the split was off every other
-  collection whenever relocation was on — i.e. by default.
-
-`gen_promotions_by_slide` is the engagement counter: `compaction_cycles > 0`
-with that at zero is the old behaviour exactly. The test asserts the counter, that
-**no** live base sits at or above the floor, and that the force-major latch stays
-clear — and it was checked for the vacuous case, that the selector really does
-move in its fixture rather than declining and passing through the early return.
-
----
 
 ## 3b. What Phase G actually measured — 2026-08-17
 

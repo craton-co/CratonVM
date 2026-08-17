@@ -2774,6 +2774,51 @@ pub trait NativeHeapAccess: NativeInvokeAccess {
         n
     }
 
+    /// Bulk read from a Java `int[]` array into a host `i32` buffer.
+    ///
+    /// Default: per-element loop. VM override: one `copy_nonoverlapping` of
+    /// `n * 4` bytes from the compact int-array payload. Added for the
+    /// BouncyCastle digest kernels, whose whole reason for existing as a
+    /// native is that the per-element `get_array_element` path costs a virtual
+    /// dispatch plus a `Value` box per word — 16 of them per compression
+    /// block, which is most of what the intrinsic was meant to remove.
+    fn read_int_array_into(&self, arr: ObjectRef, src_off: usize, dst: &mut [i32]) -> usize {
+        // Same out-of-bounds guard as `read_byte_array_into`.
+        let src_len = self.array_length(arr);
+        if src_off > src_len {
+            return 0;
+        }
+        let available = src_len - src_off;
+        let n = available.min(dst.len());
+        for i in 0..n {
+            match self.get_array_element(arr, src_off + i) {
+                Value::Int(v) => dst[i] = v,
+                _ => return i,
+            }
+        }
+        n
+    }
+
+    /// Bulk write from a host `i32` buffer into a Java `int[]` array at the
+    /// given destination offset. Returns `true` on success, `false` on bounds
+    /// error / wrong array kind. Symmetric to [`read_int_array_into`](Self::read_int_array_into).
+    fn write_int_array_from(&mut self, arr: ObjectRef, dst_off: usize, src: &[i32]) -> bool {
+        // Bounds-check the destination before any writes so we never overflow
+        // past the array end while reporting `true` (the CRIT fix the byte and
+        // char twins above carry).
+        let dst_len = self.array_length(arr);
+        if dst_off
+            .checked_add(src.len())
+            .map_or(true, |end| end > dst_len)
+        {
+            return false;
+        }
+        for (i, v) in src.iter().enumerate() {
+            self.set_array_element(arr, dst_off + i, Value::Int(*v));
+        }
+        true
+    }
+
     /// Bulk write from a host `u16` buffer into a Java `char[]` array at
     /// the given destination offset. Returns `true` on success, `false` on
     /// bounds error / wrong array kind.

@@ -749,6 +749,28 @@ fn native_rq_poll(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
     // The whole pop — read head, read head.next, publish next as the new head —
     // runs under the queue's monitor. See [`with_queue_monitor`]: without it two
     // concurrent pollers hand the same Reference to both callers.
+    //
+    // Empty-queue fast path, taken WITHOUT that monitor. `poll()` on an empty
+    // queue is the overwhelmingly common call: netty's
+    // `ResourceLeakDetector.track()` polls its shared queue once per tracked
+    // object (`reportLeak`), so a workload that tracks millions of objects
+    // through one detector makes millions of polls that return null — and each
+    // one used to take the monitor of a single queue object contended by every
+    // mutator at once. Measured (`RefCostMt refpoll`, 8 threads, ZGC): 5.1 us
+    // per iteration against 2.0 us for the same loop with the poll removed.
+    //
+    // Racing this read is sound in a way racing the POP is not. `head == null`
+    // means "nothing was enqueued as of this read", and a reference enqueued
+    // concurrently is one this call was never obliged to see — the JDK's own
+    // `poll` answers null too whenever it wins its lock first. The duplicate
+    // delivery `with_queue_monitor` exists to prevent is a property of
+    // read-head-then-write-head, and that whole sequence still runs under the
+    // monitor below, which re-reads `head` for itself.
+    if ctx.object_num_fields(this) < 2
+        || !matches!(ctx.get_field(this, RQ_FIELD_HEAD), Value::Object(Some(_)))
+    {
+        return Ok(Some(Value::Object(None)));
+    }
     let this_pin = ctx.pin_native_root(this);
     let result = with_queue_monitor(ctx, this, |ctx, this| -> MethodCallResult {
         let this = ctx.read_native_pin(this_pin, this);
