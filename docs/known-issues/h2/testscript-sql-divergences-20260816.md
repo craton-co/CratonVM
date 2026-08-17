@@ -1,15 +1,27 @@
 # `org.h2.test.scripts.TestScript` — the SQL-level divergences, censused against a HotSpot oracle
 
 ## Status
-**OPEN as a group, mostly fixed (updated 2026-08-17).** 16 errors were reported
-on `dev` @ `0d8c5f077`; **15** of them still reproduce on `dev` @ `496bc3c2c`
-(`functions/numeric/cosh.sql:7` was fixed in between, see below). Of those 15,
-**6 are now fixed** (worktree `/data/cvm-h2sql-20260816`, Azure host
-`azureuser@20.80.105.49`) under three root causes; **9 remain open** under two:
+**CLOSED 2026-08-17.** `org.h2.test.scripts.TestScript` reports **0 errors**
+under CratonVM, the same as HotSpot JDK 25 on the identical classpath — measured
+serialized so no arm holds the database file another needs (CratonVM 993s,
+HotSpot 9s; the baseline immediately before the last two fixes was 9 errors in
+1083s).
 
-* [`testscript-concurrenthashmap-iteration-order-20260816.md`](testscript-concurrenthashmap-iteration-order-20260816.md) — 4 errors, **open**
-* [`testscript-collation-turkish-and-locale-display-names-20260816.md`](testscript-collation-turkish-and-locale-display-names-20260816.md) — 5 errors, **open**
-* [`testscript-foreign-key-existing-data-check-not-run-20260816.md`](testscript-foreign-key-existing-data-check-not-run-20260816.md) — 1 error, **fixed 2026-08-17**
+16 errors were reported on `dev` @ `0d8c5f077`; 15 still reproduced on `dev` @
+`496bc3c2c` (`functions/numeric/cosh.sql:7` was fixed in between, see below).
+All 15 are now fixed, under five root causes. The last two clusters:
+
+* `testscript-concurrenthashmap-iteration-order-20260816` — 4 errors, **fixed**,
+  now `fixed-suite-bugs/h2-suite-bugs/testscript-concurrenthashmap-iteration-order-20260816-FIXED`
+* `testscript-collation-turkish-and-locale-display-names-20260816` — 5 errors,
+  **fixed**, now
+  `fixed-suite-bugs/h2-suite-bugs/testscript-collation-turkish-and-locale-display-names-20260816-FIXED`
+* `testscript-foreign-key-existing-data-check-not-run-20260816` — 1 error,
+  **fixed 2026-08-17**, superseded by
+  `fixed-suite-bugs/h2-suite-bugs/bug-h2-testscript-fk-array-comparability-skipped-by-rowcount-shortcut-FIXED-20260817`
+
+This record stays under `known-issues/` as the census and the oracle procedure;
+the failures it enumerates are all closed.
 
 The fixes are written up in
 [`../../internal/fixed-suite-bugs/h2-suite-bugs/bug-h2-testscript-bigdecimal-valueof-double-and-string-codepoints-FIXED-20260816.md`](../../internal/fixed-suite-bugs/h2-suite-bugs/bug-h2-testscript-bigdecimal-valueof-double-and-string-codepoints-FIXED-20260816.md)
