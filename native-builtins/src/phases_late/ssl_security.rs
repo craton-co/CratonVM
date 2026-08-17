@@ -813,7 +813,7 @@ pub(crate) fn register_p68_crypto_mac(r: &mut NativeMethodRegistry) {
     // doFinal([BI)V — compute the MAC into the caller's buffer at `outOffset`.
     //
     // THIS OVERLOAD WAS MISSING, and its absence is what broke every
-    // SCRAM-SHA-256 login on this VM (hibernate-reactive / Vert.x reactive
+    // SCRAM-SHA-256 login on this VM (hibernate / Vert.x reactive
     // Postgres: `FATAL: expected SASL response, got message type 88`, where 88
     // is 'X' — the client giving up and sending Terminate).
     //
@@ -1267,7 +1267,7 @@ fn mac_normalise(algo: &str) -> String {
 /// RFC 2104 over the digests `crate::compute_digest` already supplies … and
 /// each needs its own HMAC block size … and this lane could neither build nor
 /// run". `HmacSHA224` joined on 2026-08-12 (W7-39); the remaining six followed
-/// the same day, from the hibernate-reactive SCRAM investigation.
+/// the same day, from the hibernate SCRAM investigation.
 ///
 /// The block size was the stated obstacle, and `hmac::Hmac<D>` removes it: it
 /// reads the size from `D::BlockSize`, so none of 64 / 128 / 144 / 136 / 104 /
