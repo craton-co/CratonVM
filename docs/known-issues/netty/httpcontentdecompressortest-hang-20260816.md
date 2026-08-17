@@ -1,10 +1,9 @@
-# `HttpContentDecompressorTest` hangs past 180s with zero test progress; HotSpot passes in 12s
+# `HttpContentDecompressorTest` — `testZipBomb` moves 256 MiB through `ByteBuffer` accessors that cost ~260 ns each
 
-**Status: OPEN.** Measured 2026-08-16, commit `3ef3eb744`, Windows host,
-`cratonvm.exe` release build, G1. Flagged HANG on generational, G1, and ZGC in
-a same-day full 657-class 3-collector suite run; this page isolates it
-(`--shards 1`, one class alone per process, no other collector running
-concurrently) and cross-checks against HotSpot 25 on the same host.
+**Status: OPEN, throughput. Diagnosed 2026-08-17** (was: observed but
+undiagnosed, 2026-08-16). Original measurement 2026-08-16 on commit
+`3ef3eb744`; diagnosis 2026-08-17 on `cf141b8a8`, Windows host, release build,
+G1, real-JDK mode, cross-checked against HotSpot 25 on the same host.
 
 ## Summary
 
@@ -13,46 +12,133 @@ concurrently) and cross-checks against HotSpot 25 on the same host.
 | CratonVM G1 (isolated) | 0 | 0 | 0 | **HANG, rc=124 @ 180s** |
 | HotSpot 25 (isolated) | 8 | 8 | 0 | 11.8s |
 
-Isolated (no other class or collector running concurrently) and HotSpot
-passes clean — this is not a full-suite contention artifact and not a harness
-gap.
+## It is one test, and it is slow rather than stuck
 
-## No test-progress evidence at all
+The 2026-08-16 page could not say which of the four tests the process was
+inside, because the harness prints a line only for a *failing* test. Running
+the class under a per-test-progress launcher (`@@BEGIN` / `@@END` around every
+individual test) answers it in one run:
 
-Between the JUnit launcher's startup log ("Discovered 4
-'junit-platform.properties' configuration files...") and the process being
-killed at the 180s cap, the raw log has **zero** further lines — no
-`@@TESTFAIL`, no application log output, nothing. The harness only prints a
-line per test on *failure*; a passing test is silent. That means this run
-gives no way to tell whether it hung on the class's first test or its last —
-only that it never reached `@@RESULT`.
+```
+@@BEGIN  ...testZipBomb(java.lang.String)/[test-template-invocation:#1]
+@@END    FAILED 193144ms ...#1
+         java.util.concurrent.TimeoutException: testZipBomb timed out after 120 seconds
+@@BEGIN  ...testZipBomb(java.lang.String)/[test-template-invocation:#2]
+```
 
-## What the class contains
+Parameterization **#1 is `gzip`**. It takes 193 s, and JUnit's 120 s default
+timeout *does* fire on it; the harness's 180 s process cap then kills the run
+while `#2` (`deflate`) is starting. So this is not a hang and not a livelock —
+it is throughput, and the class needs five such parameterizations plus three
+other tests.
 
-Four test methods (`HttpContentDecompressorTest.java`):
+## Where the 193 s goes
 
-* `testInvokeReadWhenNotProduceMessage` — small `EmbeddedChannel` pipeline
-  test, no real I/O.
-* `testFlowControlHandlerEmitsOneMessagePerRead` — same shape.
-* `testZipBomb(String encoding)` — parameterized over up to 5 encodings
-  (`gzip`, `deflate`, `br` if brotli4j is available, `zstd` if available,
-  `snappy`); per parameterization it compresses 256 `MiB` (256 × 1 `MiB`
-  chunks) through `HttpContentCompressor`, then decompresses it through
-  `HttpContentDecompressor(0)` while a `ZipBombIncomingHandler` enforces a
-  128 `MiB` memory cap.
-* `testBrotliDecodingHonorsMaxAllocationAsOutputCap` — requires
-  `Brotli.isAvailable()`; compresses a 128 KiB payload and decompresses it
-  with a deliberately tiny `maxAllocation` to check the decoder emits many
-  small chunks rather than a few large ones.
+`probes/NettyZipBombPhases.java` runs `testZipBomb`'s phases with a settable
+chunk count. Marginal cost per 1 MiB chunk:
 
-Unlike the other two `codec-http` classes flagged in the same batch
-(`HttpHeaderValidationUtilTest`, `HttpResponseStatusTest`), nothing here is a
-literal billion-iteration loop — the `testZipBomb` parameterizations move
-real megabytes through real gzip/deflate/brotli/zstd/snappy codec paths, and
-the memory-cap enforcement itself is exactly the kind of logic that could
-spin or block if the cap check doesn't trip correctly. This class's shape
-does not obviously predict "throughput cliff" the way the other two do — it
-is presented here as an observed hang, not a diagnosed one.
+| phase | HotSpot | CratonVM | ratio |
+|---|---|---|---|
+| compress (`writeOutbound` of one 1 MiB `HttpContent`) | 4.3 ms/MiB | **345 ms/MiB** | 80x |
+| decompress | ~0.2 ms/MiB | ~15 ms/MiB | 75x |
+
+Splitting the per-chunk work further (alloc / fill / pipeline write):
+
+| | HotSpot | CratonVM |
+|---|---|---|
+| `alloc.buffer(1 MiB)` | 2.8 ms/MiB | 1.3 ms/MiB |
+| **`buffer.writeZero(1 MiB)`** | **0.3 ms/MiB** | **534 ms/MiB** |
+| `ch.writeOutbound(...)` | 5.7 ms/MiB | 14.0 ms/MiB |
+
+`writeZero` is the whole cost, and it is **1780x**. It is not a codec problem —
+the zlib primitives are within 1.3x (`CRC32.update` 0.37 vs 0.04 ms/MiB,
+`Deflater.deflate` 5.42 vs 4.05 ms/MiB, `Deflater` SYNC_FLUSH loop 5.88 vs
+4.28 ms/MiB).
+
+## `writeZero` is a loop of `ByteBuffer` accessors, and each one is a native call
+
+`AbstractByteBuf.writeZero(int)` is `length >>> 3` calls to `_setLong`, i.e.
+**131 072 per MiB**, and the test moves 256 MiB — 33.5 million of them per
+parameterization. netty selects its *non-Unsafe* `PooledDirectByteBuf` here
+(see "What was ruled out"), whose `_setLong` is
+`java.nio.ByteBuffer.putLong(int, long)`, which CratonVM services with a
+registered native.
+
+`probes/NioAccessorRate.java`, same host:
+
+| op | HotSpot | CratonVM | ratio |
+|---|---|---|---|
+| `byte[]` store | 0.16 ns | 4.53 ns | 28x |
+| `ByteBuffer.put(int,byte)` direct | 0.29 ns | **282 ns** | 970x |
+| `ByteBuffer.put(int,byte)` heap | 0.45 ns | 221 ns | 490x |
+| `ByteBuffer.putInt(int,int)` direct | — | ~900 ns | — |
+| **`ByteBuffer.putLong(int,long)` direct** | 0.30 ns | **1088 ns** | **3600x** |
+| **`ByteBuffer.putLong(int,long)` heap** | 0.28 ns | **1058 ns** | **3800x** |
+| `ByteBuffer.getLong(int)` direct | 0.49 ns | 1430 ns | 2900x |
+
+131 072 x ~1090 ns is 143 ms/MiB from `putLong` alone; the `EmbeddedChannel`
+allocator's buffer measured 534 ms/MiB — the same shape at a different buffer
+kind. Either way 256 MiB of it does not fit in 180 s.
+
+**A single-byte `put` already costs ~260-280 ns** — one native call, one stored
+byte. That per-call floor, not anything about the buffer, is the finding.
+
+## What was ruled out, with the measurement that ruled it out
+
+* **Per-byte storage re-resolution.** `s2_bb_write8` / `s2_bb_read8`
+  (`native-builtins/src/servlet.rs`) really did call `s2_bb_put_byte` /
+  `s2_bb_get_byte` once per byte, and each of those re-resolved the backing
+  store from scratch through up to three NAME-keyed field lookups (`hb`,
+  `offset`, `address`) — 8x redundant work per `putLong`. It looked like the
+  answer. It is not: rewriting all six accessors to resolve storage ONCE
+  (`s2_bb_read_n` / `s2_bb_write_n`, landed 2026-08-17) moved `direct putLong`
+  from 918 to 943 and from 864 to 877 ns/op, interleaved, two rounds — nothing.
+  The `putLong`-to-`put(byte)` ratio is ~3.5x, not 8x, which is the shape of one
+  native call plus a few field reads rather than eight byte stores. The rewrite
+  is kept (strictly less work, pinned by `probes/NioAccessorOracle.java`) but it
+  is **not** a fix for this page.
+* **netty refusing `sun.misc.Unsafe`.** netty does select the non-Unsafe
+  `PooledDirectByteBuf` on CratonVM, and `-Dio.netty.noUnsafe=false` cuts the
+  compress phase 11499 -> 1735 ms (6.6x). But **HotSpot 25 reports the identical
+  `hasUnsafe()=false` with the identical cause** — "sun.misc.Unsafe: unavailable
+  (io.netty.noUnsafe=true by default on Java 25+)". That is netty's own Java-25
+  policy on both VMs, so the non-Unsafe path is the path HotSpot also takes, and
+  HotSpot still runs `writeZero` at 0.3 ms/MiB. Not a CratonVM defect, and not a
+  legitimate accommodation either.
+* **The compression codec.** See the zlib table above — 1.3x.
+* **Leak detection / `refCnt` on this path.** netty's own
+  `-Dio.netty.buffer.checkAccessible=false` drops `ByteBuf.setByte` from 3065 to
+  668 ns, so the `ensureAccessible()` -> `refCnt()` ->
+  `AtomicIntegerFieldUpdater.get` chain *is* ~2400 ns per checked accessor
+  (`AIFU.get` alone measures 701 ns against HotSpot's 0.21, and
+  `AIFU.compareAndSet` 752 ns against 4.66). But `writeZero` uses the unchecked
+  `_setLong`, and its cost was **unchanged** by that switch — 1097 / 1068 /
+  1101 ns across baseline, `checkAccessible=false`, and `+checkBounds=false`.
+  `refCnt` is a real and large defect for every *checked* netty accessor; it is
+  just not this page's.
+
+## What would fix it
+
+The per-call native floor. Two in-tree data points size the prize, measured in
+one process and in both compile doors: `AtomicInteger.getAndIncrement`, which
+has a JIT intrinsic, costs **5.3 ns**; `AtomicInteger.get`, which does not,
+costs **160 ns**. The same funnel prices every other trivial accessor —
+`sun.misc.Unsafe.getInt` 573 ns, `Unsafe.getIntVolatile` 614 ns,
+`Enum.ordinal` 222 ns, `Object.getClass` 220 ns, `Object.equals` 190 ns,
+`Object.hashCode` 173 ns — all registered natives whose real JDK bodies are one
+or two bytecodes.
+
+Bringing `ByteBuffer`'s absolute accessors onto that intrinsic ladder, or onto
+the thin `*_DIRECT_FN` helper pattern already used for `Integer.valueOf`,
+`Integer.intValue`, the two `HashMap` fast paths and `Thread.currentThread`, is
+what takes `writeZero` from 534 ms/MiB to something that fits: at the intrinsic
+rate the 33.5 M `putLong` calls per parameterization cost ~0.2 s instead of
+~36 s.
+
+Note the scope caveat recorded at the IR direct-call site in `jit/src/lib.rs`:
+those six existing helpers are still single-pass-only, and wiring one into the
+optimizing tier "changes what the optimizing tier emits on a measured hot path".
+Any such addition needs an interleaved A/B at both doors.
 
 ## Repro
 
@@ -63,14 +149,20 @@ printf 'io.netty.handler.codec.http.HttpContentDecompressorTest\n' > /tmp/one.tx
 ./run-netty-suite.sh --list /tmp/one.txt --hotspot --shards 1 --out runs/repro
 ```
 
-To pin down which method/parameterization is stuck, the next step is running
-each of the four tests individually (JUnit `-Dtest=` style selection via a
-small dedicated runner, or a short per-method `-Djunit.jupiter.execution.timeout.default`)
-rather than the whole class at once.
+The three probes that carry the numbers above (compile against the suite
+classpath in `apps/netty-suite-runner/cp-javac.args`):
+
+```bash
+cratonvm --java-home <jdk> @common.args NettyZipBombPhases gzip 32
+cratonvm --java-home <jdk> @common.args NioAccessorRate 4000000 40
+cratonvm --java-home <jdk> -cp . NioAccessorOracle   # must print HotSpot's TOTAL exactly
+```
 
 ## Related
 
 * `httpheadervalidationutiltest-exhaustive-loop-timeout-20260816.md`,
   `httpresponsestatustest-exhaustive-loop-timeout-20260816.md` — the other two
-  `codec-http` HANGs from the same batch; both of those *do* have an obvious
-  billion-iteration-loop explanation, which this one lacks.
+  `codec-http` walls from the same batch. Different mechanism: those are
+  compiled-code call cost, this one is native-call cost.
+* `adaptive-bytebuf-allocator-throughput-20260812.md` — the same per-entry
+  transfer machinery, reached from a different netty class.
