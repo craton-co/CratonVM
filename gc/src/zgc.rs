@@ -3126,23 +3126,31 @@ impl ZgcRealHeap {
     ///
     /// # Ordering, and why each step is where it is
     ///
-    /// 1. **Retire every TLAB.** A TLAB is a private slice of the arena, and
-    ///    `allocate_black_if_marking` has to see every allocation from here
-    ///    on. Retiring first means the next allocation on every thread takes a
-    ///    fresh chunk, after the barrier below is armed.
-    /// 2. **Clear every mark bit**, over a registry snapshot taken here. This
+    /// 1. **Clear every mark bit**, over a registry snapshot taken here. This
     ///    is the last moment at which "no object is marked" is true, and it
     ///    must precede arming the barrier or an allocate-black object's bit
     ///    would be cleared right back off.
-    /// 3. **Snapshot the reference skip set.** `visit_refs` needs it for the
+    /// 2. **Snapshot the reference skip set.** `visit_refs` needs it for the
     ///    whole cycle; without it every weak/soft/phantom referent is traced
     ///    as a strong edge and can never be cleared.
-    /// 4. **Arm the SATB barrier** (`set_mark_active(true)`), which also
+    /// 3. **Arm the SATB barrier** (`set_mark_active(true)`), which also
     ///    clears the ingress. From here every reference store in the VM
     ///    publishes its overwritten value.
-    /// 5. **Build the pool and push the roots**, then arm the workers. Roots
+    /// 4. **Build the pool and push the roots**, then arm the workers. Roots
     ///    are pushed before `start_marking` because a worker that finds an
     ///    empty stripe set terminates immediately.
+    ///
+    /// # What this deliberately does NOT do: retire the TLABs
+    ///
+    /// `collect_garbage` retires every TLAB as its first statement, and the
+    /// instinct is to copy that. It buys three things there -- chunk tails
+    /// back on the free list, a walkable arena, and "no mutator owns a private
+    /// slice" -- and marking needs none of them: it follows registered bases
+    /// from roots, never walks, and a TLAB-served object enters the registry
+    /// at hand-out. What retiring WOULD do here is put every chunk tail on the
+    /// free list at the exact moment the mutators are about to resume and
+    /// re-carve chunks, for no marking benefit, inside a pause this phase
+    /// exists to keep short.
     pub fn start_concurrent_mark(&self, _stw: &StopTheWorldToken, roots: &[u64]) -> bool {
         if self.conc_cycle_active.load(Ordering::Relaxed) {
             return false;
@@ -3154,23 +3162,20 @@ impl ZgcRealHeap {
             return false;
         };
 
-        // (1) -- see the doc comment's numbered ordering.
-        self.retire_all_tlabs();
-
-        // (2)
+        // (1)
         let registered = self.registry.snapshot();
         for base in registered.bases() {
             self.header_mut(base as *mut u8)
                 .clear_gc_flags(GC_FLAG_MARKED);
         }
 
-        // (3)
+        // (2)
         let _skip = self.begin_concurrent_mark_cycle();
 
-        // (4). Must follow (2): this is what makes the next allocation black.
+        // (3). Must follow (1): this is what makes the next allocation black.
         self.set_mark_active(true);
 
-        // (5)
+        // (4)
         let workers = self.conc_mark_workers();
         let ctx: std::sync::Arc<dyn mark::ZMarkContext> = me;
         let coordinator = std::sync::Arc::new(mark::ZMarkCoordinator::new(ctx, workers));
@@ -3705,7 +3710,58 @@ impl ZgcRealHeap {
         // address shifted past the object-alignment zeros is the cheapest one
         // available here.
         self.mark_ingress.push(old_addr >> 3, old_addr as u64);
-        self.mark_ingress_pushes.fetch_add(1, Ordering::Relaxed);
+        let n = self.mark_ingress_pushes.fetch_add(1, Ordering::Relaxed) + 1;
+        if n % Z_SATB_HANDOFF_INTERVAL == 0 {
+            self.hand_satb_batch_to_the_marker();
+        }
+    }
+
+    /// Move what the SATB barrier has accumulated into the CONCURRENT marker's
+    /// own queues, so the workers trace it while the mutators are still
+    /// running.
+    ///
+    /// # Why this exists rather than draining only at mark end
+    ///
+    /// Two reasons, and the second would eventually have been a bug report
+    /// rather than a slow phase:
+    ///
+    /// * **Pause time.** Everything still in the ingress when the collection
+    ///   arrives is traced INSIDE the pause. Handing it over in batches moves
+    ///   that tracing into the concurrent phase, which is the whole point of
+    ///   the phase.
+    /// * **Memory.** `mark_ingress` is unbounded. A store-heavy workload with
+    ///   a long concurrent phase would park millions of `u64`s in it -- growth
+    ///   proportional to reference stores, not to the live set, and invisible
+    ///   in every heap figure the VM reports.
+    ///
+    /// `ZMarkCoordinator::push_roots` is the right receiver: it gates each
+    /// address through `is_in_heap`, claims it with the atomic `try_mark` (so
+    /// an address a worker has already marked is dropped), distributes the
+    /// survivors across the stripes and wakes the pool.
+    ///
+    /// Rare by construction -- once per [`Z_SATB_HANDOFF_INTERVAL`] stores --
+    /// so taking the pool mutex here costs nothing measurable on the store
+    /// path.
+    #[cold]
+    fn hand_satb_batch_to_the_marker(&self) {
+        let pool = {
+            let guard = self.conc_pool.lock();
+            match guard.as_ref() {
+                Some(p) => std::sync::Arc::clone(p),
+                // No pool: either the cycle is closing (the mark-end handshake
+                // has already taken it) or the barrier is armed by a test. The
+                // ingress keeps the entries either way, and
+                // `finish_concurrent_mark` replays whatever is left.
+                None => return,
+            }
+        };
+        let mut batch: Vec<u64> = Vec::new();
+        if self.mark_ingress.drain_into(&mut batch) == 0 {
+            return;
+        }
+        self.conc_ingress_replayed
+            .fetch_add(batch.len(), Ordering::Relaxed);
+        pool.push_roots(&batch);
     }
 
     /// Card an OLD object whose fields have just been written --
@@ -7335,6 +7391,15 @@ const Z_CONC_START_PERCENT_DEFAULT: usize = 60;
 /// loop provably converges -- the budget is a hang-stop, not a policy.
 const Z_CONC_MARK_END_RESTART_BUDGET: usize = 8;
 
+/// How many SATB publications accumulate before the mutator hands the batch to
+/// the concurrent marker. See
+/// [`ZgcRealHeap::hand_satb_batch_to_the_marker`].
+///
+/// Large enough that the pool mutex is untouched on all but 1 store in 8192,
+/// small enough that the ingress cannot grow past ~64 KiB per handoff window
+/// however hard the workload stores.
+const Z_SATB_HANDOFF_INTERVAL: usize = 8192;
+
 /// A fragmentation reading, taken post-sweep — the "steady state" of Phase 2.2.
 ///
 /// `worst_permille` is `largest_free_block * 1000 / capacity` at its lowest
@@ -9234,6 +9299,23 @@ impl GarbageCollector for ZgcRealHeap {
         if self.check_field_index(header, index, "set").is_none() {
             return;
         }
+        // ---- SATB, at the accessor -----------------------------------------
+        //
+        // Same argument as `set_array_element`'s: `putfield` and every native
+        // `NativeContext::set_field` publish the overwritten reference at the
+        // call site, but this accessor is also reachable directly (VM
+        // internals, reflection helpers, `Unsafe`), and a reference lost there
+        // during a concurrent cycle is a use-after-free rather than a missed
+        // optimisation. Publishing here makes the coverage a property of the
+        // ONE store path instead of a property of a call-site census that has
+        // to stay complete forever.
+        //
+        // Cost when nothing is marking: one relaxed load.
+        if self.mark_active.load(Ordering::Relaxed) {
+            if let Value::Object(Some(old)) = self.get_field(obj, index) {
+                self.satb_pre_barrier(old.as_ptr() as usize);
+            }
+        }
         if let Some((offset, storage)) =
             cratonvm_types::compact_object_field_storage(header, index)
         {
@@ -9390,6 +9472,31 @@ impl GarbageCollector for ZgcRealHeap {
             return Err(index as i32);
         }
         let element_type = header.element_type();
+        // ---- SATB, at the accessor rather than only at the call site ------
+        //
+        // `aastore` publishes the overwritten reference itself
+        // (`opcodes.rs` -> `VmHeap::satb_barrier`), and so does every native
+        // `NativeContext::set_field`. **`System.arraycopy` does not.** It
+        // copies a reference array one element at a time through
+        // `NativeContext::set_array_element`, which lands here with no
+        // pre-barrier anywhere above it -- so a concurrent cycle that relied
+        // on the call sites alone would lose every reference an arraycopy
+        // overwrote, and the sweep would free objects that are still
+        // referenced from the source array.
+        //
+        // Publishing here instead of hunting call sites is the
+        // convert-the-idiom fix: this accessor is the ONE place every
+        // reference-array store in the VM passes through, and a duplicate
+        // publication from a call site that also barriers costs nothing
+        // (`push_roots` dedups on the mark bit).
+        //
+        // Cost when nothing is marking: one relaxed load, on
+        // reference-element stores only.
+        if element_type == ArrayElementType::Reference && self.mark_active.load(Ordering::Relaxed) {
+            if let Ok(Value::Object(Some(old))) = self.get_array_element(obj, index) {
+                self.satb_pre_barrier(old.as_ptr() as usize);
+            }
+        }
         // SAFETY: bounds check passed; data area starts at base + HEADER_SIZE.
         unsafe {
             let base = obj.as_ptr().add(ARRAY_DATA_OFFSET);
@@ -10088,8 +10195,21 @@ impl GarbageCollector for ZgcRealHeap {
         // until then; replace it wholesale at that point.
         if let Some(started) = gc_started {
             let pause_us = started.elapsed().as_micros();
+            // `mark=` is the ONE field that says whether this collection's
+            // mark phase was paid for inside the pause. Without it a
+            // `pause_us` reading cannot be attributed: a short pause on a
+            // concurrent cycle and a short pause because the live set happened
+            // to be small are the same number, and this feature's whole claim
+            // is about the first.
+            let mark = if marked_concurrently {
+                "concurrent"
+            } else if parallel_workers >= 1 && parallel_ok {
+                "stw-parallel"
+            } else {
+                "stw-serial"
+            };
             eprintln!(
-                "[GC] zgc-real: cycle={cycle} pause_us={pause_us} \
+                "[GC] zgc-real: cycle={cycle} pause_us={pause_us} mark={mark} \
                  objects_copied={objects_copied} bytes_copied={bytes_copied} \
                  bytes_freed={bytes_freed} occupancy={bytes_copied}/{cap} bytes",
             );
@@ -14733,4 +14853,379 @@ pub(crate) mod tests {
             other => panic!("expected the raw word back, got {other:?}"),
         }
     }
+
+    // ---------------------------------------------------------------------
+    // GENUINE CONCURRENT MARKING
+    // ---------------------------------------------------------------------
+    //
+    // Every test below asserts on `concurrent_mark_stats()` as well as on the
+    // survivor set, and that pairing is deliberate. A concurrent cycle that
+    // never opens leaves the collector a correct stop-the-world mark-sweep, so
+    // "the live graph survived" is satisfied by the feature being switched off
+    // — it is the textbook vacuous green for this change. `started` and
+    // `completed` are what make each assertion about the concurrent path.
+
+    /// Build a chain of `n` objects, each pointing at the next, plus `garbage`
+    /// unreferenced objects. Returns `(head, chain_addrs, garbage_addrs)`.
+    fn conc_build_graph(
+        heap: &ZgcRealHeap,
+        n: usize,
+        garbage: usize,
+    ) -> (ObjectRef, Vec<usize>, Vec<usize>) {
+        assert!(n >= 1);
+        let mut chain: Vec<ObjectRef> = Vec::with_capacity(n);
+        for _ in 0..n {
+            // Two slots: 0 is the chain link, 1 is the slot the mutation tests
+            // overwrite so the link itself is never disturbed.
+            chain.push(heap.alloc_object(ClassId::new(41), 2));
+        }
+        for i in 0..n - 1 {
+            heap.set_field(chain[i], 0, Value::Object(Some(chain[i + 1])));
+        }
+        let garbage_addrs: Vec<usize> = (0..garbage)
+            .map(|_| heap.alloc_object(ClassId::new(42), 1).as_ptr() as usize)
+            .collect();
+        let chain_addrs: Vec<usize> = chain.iter().map(|o| o.as_ptr() as usize).collect();
+        (chain[0], chain_addrs, garbage_addrs)
+    }
+
+    /// Walk the chain from `head` and return the addresses actually reachable
+    /// through slot 0. Reads the heap, so it also proves the survivors are
+    /// still parseable rather than merely still registered.
+    fn conc_walk_chain(heap: &ZgcRealHeap, head: ObjectRef) -> Vec<usize> {
+        let mut out = vec![head.as_ptr() as usize];
+        let mut cur = head;
+        loop {
+            match heap.get_field(cur, 0) {
+                Value::Object(Some(next)) => {
+                    out.push(next.as_ptr() as usize);
+                    cur = next;
+                }
+                _ => break,
+            }
+        }
+        out
+    }
+
+    /// The property this whole change is about: the transitive closure is
+    /// traced by the worker pool **while this thread keeps running**, and the
+    /// collection that closes the cycle keeps exactly the live set.
+    #[test]
+    fn a_concurrent_cycle_traces_the_graph_while_the_mutator_runs() {
+        let heap = ZgcRealHeap::new_shared(64 * 1024 * 1024);
+        let (head, chain, garbage) = conc_build_graph(&heap, 4_000, 500);
+
+        // SAFETY: this test is the only mutator until the cycle is open; the
+        // token stands for the mark-start safepoint the VM would take here.
+        let stw = unsafe { StopTheWorldToken::new() };
+        assert!(
+            heap.start_concurrent_mark(&stw, &[head.as_ptr() as u64]),
+            "an Arc-owned heap must be able to open a cycle"
+        );
+        assert!(heap.concurrent_mark_active());
+        drop(stw);
+
+        // ---- the concurrent phase: this thread is a running mutator -------
+        //
+        // Allocate, and overwrite a live object's slot 1 through the same
+        // pre-write barrier `VmHeap::satb_barrier` drives. The overwritten
+        // value has to reach the marker or it is a lost object; that is the
+        // whole of what SATB is.
+        let mut fresh: Vec<usize> = Vec::new();
+        for i in 0..1_000 {
+            let o = heap.alloc_object(ClassId::new(43), 1);
+            fresh.push(o.as_ptr() as usize);
+            // Link every tenth new object into the live chain, so the survivor
+            // assertion below is about objects that are live ONLY because they
+            // were allocated black and then attached.
+            if i % 10 == 0 {
+                // SAFETY: `chain` holds registered bases of this heap and
+                // nothing has swept since they were recorded.
+                let target = unsafe { ObjectRef::from_raw(chain[i % chain.len()] as *mut u8) };
+                if let Value::Object(Some(prev)) = heap.get_field(target, 1) {
+                    heap.satb_pre_barrier(prev.as_ptr() as usize);
+                }
+                heap.set_field(target, 1, Value::Object(Some(o)));
+            }
+        }
+
+        // ---- the mark-end safepoint + sweep -------------------------------
+        let stw = unsafe { StopTheWorldToken::new() };
+        let mut roots = [head];
+        let _ = heap.collect_garbage(&stw, &mut roots, &NoMonitors);
+
+        let (started, completed, black, _replayed, _nanos) = heap.concurrent_mark_stats();
+        assert_eq!(started, 1, "exactly one cycle opened");
+        assert_eq!(
+            completed, 1,
+            "the mark-end handshake must CERTIFY the cycle; a fallback to the \
+             stop-the-world marker would make every survivor assertion below \
+             true for the wrong reason"
+        );
+        assert_eq!(
+            black, 1_000,
+            "every object allocated during the cycle is born marked"
+        );
+
+        // The chain is intact, all 4000 of it, and still walkable.
+        let walked = conc_walk_chain(&heap, head);
+        assert_eq!(walked, chain, "the whole chain survived and still links up");
+
+        // The objects attached during the concurrent phase survived. They are
+        // reachable from no mark-start root, so they survive only because they
+        // were allocated black.
+        for (i, addr) in fresh.iter().enumerate() {
+            if i % 10 == 0 {
+                assert!(
+                    heap.is_object_address(*addr).is_some(),
+                    "an object allocated during the cycle and attached to a live \
+                     object was RECLAIMED WHILE LIVE (index {i}, {addr:#x})"
+                );
+            }
+        }
+
+        // ...and the pre-cycle garbage did not.
+        let reclaimed = garbage
+            .iter()
+            .filter(|a| heap.is_object_address(**a).is_none())
+            .count();
+        assert_eq!(
+            reclaimed,
+            garbage.len(),
+            "a concurrent cycle must still reclaim what was already dead at mark \
+             start; keeping everything is the other way to pass this test"
+        );
+    }
+
+    /// The mark set a concurrent cycle produces is the mark set the
+    /// stop-the-world marker produces, on the same graph with no mutation in
+    /// between.
+    ///
+    /// Two heaps rather than two runs on one: a collection prunes the registry,
+    /// so a second run on the same heap would compare a swept graph against an
+    /// unswept one.
+    #[test]
+    fn a_concurrent_cycle_and_a_stw_mark_agree_on_the_survivor_set() {
+        let conc = ZgcRealHeap::new_shared(64 * 1024 * 1024);
+        let (c_head, c_chain, c_garbage) = conc_build_graph(&conc, 1_500, 200);
+        {
+            // SAFETY: single-threaded test.
+            let stw = unsafe { StopTheWorldToken::new() };
+            assert!(conc.start_concurrent_mark(&stw, &[c_head.as_ptr() as u64]));
+        }
+        {
+            let stw = unsafe { StopTheWorldToken::new() };
+            let mut roots = [c_head];
+            let _ = conc.collect_garbage(&stw, &mut roots, &NoMonitors);
+        }
+
+        let stw_heap = ZgcRealHeap::new_shared(64 * 1024 * 1024);
+        let (s_head, s_chain, s_garbage) = conc_build_graph(&stw_heap, 1_500, 200);
+        {
+            let stw = unsafe { StopTheWorldToken::new() };
+            let mut roots = [s_head];
+            let _ = stw_heap.collect_garbage(&stw, &mut roots, &NoMonitors);
+        }
+
+        assert_eq!(conc.concurrent_mark_stats().1, 1, "the concurrent arm ran");
+        assert_eq!(
+            stw_heap.concurrent_mark_stats().0,
+            0,
+            "the control arm must NOT have opened a cycle, or this compares one \
+             marker against itself"
+        );
+
+        let c_live = c_chain
+            .iter()
+            .filter(|a| conc.is_object_address(**a).is_some())
+            .count();
+        let s_live = s_chain
+            .iter()
+            .filter(|a| stw_heap.is_object_address(**a).is_some())
+            .count();
+        assert_eq!(c_live, 1_500);
+        assert_eq!(s_live, 1_500, "the control arm kept the same live set");
+
+        let c_dead = c_garbage
+            .iter()
+            .filter(|a| conc.is_object_address(**a).is_none())
+            .count();
+        let s_dead = s_garbage
+            .iter()
+            .filter(|a| stw_heap.is_object_address(**a).is_none())
+            .count();
+        assert_eq!(c_dead, s_dead, "both markers reclaim the same garbage");
+        assert_eq!(c_dead, 200);
+    }
+
+    /// Several real mutator threads allocate and overwrite references while
+    /// the cycle traces. They are joined before the mark-end safepoint --
+    /// which is exactly what the VM does, since that pause stops every mutator
+    /// before the handshake runs.
+    #[test]
+    fn several_mutator_threads_run_during_the_concurrent_phase() {
+        let heap = ZgcRealHeap::new_shared(128 * 1024 * 1024);
+        let (head, chain, _garbage) = conc_build_graph(&heap, 3_000, 0);
+
+        {
+            // SAFETY: the spawned mutators below start only after this returns.
+            let stw = unsafe { StopTheWorldToken::new() };
+            assert!(heap.start_concurrent_mark(&stw, &[head.as_ptr() as u64]));
+        }
+
+        let mut handles = Vec::new();
+        for t in 0..4usize {
+            let heap = std::sync::Arc::clone(&heap);
+            let chain = chain.clone();
+            handles.push(
+                std::thread::Builder::new()
+                    .name(format!("conc-mutator-{t}"))
+                    .spawn(move || {
+                        let mut mine = Vec::new();
+                        for i in 0..500usize {
+                            let o = heap.alloc_object(ClassId::new(50 + t as u32), 1);
+                            mine.push(o.as_ptr() as usize);
+                            let idx = (t * 500 + i) % chain.len();
+                            // SAFETY: `chain` holds registered bases of this
+                            // heap and nothing has swept since.
+                            let target = unsafe { ObjectRef::from_raw(chain[idx] as *mut u8) };
+                            if let Value::Object(Some(prev)) = heap.get_field(target, 1) {
+                                heap.satb_pre_barrier(prev.as_ptr() as usize);
+                            }
+                            heap.set_field(target, 1, Value::Object(Some(o)));
+                        }
+                        mine
+                    })
+                    .expect("mutator thread"),
+            );
+        }
+        let attached: Vec<usize> = handles
+            .into_iter()
+            .flat_map(|h| h.join().expect("mutator thread panicked"))
+            .collect();
+
+        {
+            // SAFETY: every mutator thread above has been joined.
+            let stw = unsafe { StopTheWorldToken::new() };
+            let mut roots = [head];
+            let _ = heap.collect_garbage(&stw, &mut roots, &NoMonitors);
+        }
+
+        let (started, completed, black, _replayed, _nanos) = heap.concurrent_mark_stats();
+        assert_eq!((started, completed), (1, 1));
+        assert_eq!(black, 2_000, "4 threads x 500 allocations, all born marked");
+
+        assert_eq!(
+            conc_walk_chain(&heap, head),
+            chain,
+            "the chain survived four concurrent mutators"
+        );
+        // Only the LAST object stored into any given slot is still reachable,
+        // so not every `attached` address is live -- but every one that is
+        // still referenced must be, and none may have been swept out from
+        // under a live referrer. Check the strong version: walk the chain's
+        // slot 1 and require every referent to be a registered object.
+        for &base in &chain {
+            // SAFETY: registered base of this heap.
+            let obj = unsafe { ObjectRef::from_raw(base as *mut u8) };
+            if let Value::Object(Some(r)) = heap.get_field(obj, 1) {
+                assert!(
+                    heap.is_object_address(r.as_ptr() as usize).is_some(),
+                    "a live object's slot 1 points at a RECLAIMED object -- the \
+                     concurrent mark lost it"
+                );
+            }
+        }
+        assert!(!attached.is_empty());
+    }
+
+    /// The trigger fires below the collection threshold and not above it, and
+    /// `CRATONVM_ZGC_CONC_START=0` is a real kill switch.
+    ///
+    /// Reads the threshold arithmetic directly rather than through the env
+    /// var: `conc_start_percent` caches its answer in a process-wide
+    /// `OnceLock`, so a test that set the variable would decide the value for
+    /// every other test in the binary.
+    #[test]
+    fn the_concurrent_start_trigger_brackets_the_collection_threshold() {
+        let heap = ZgcRealHeap::new_shared(64 * 1024 * 1024);
+        let threshold = heap.gc_threshold;
+        let pct = heap.conc_start_percent();
+        assert!(pct > 0 && pct < 100, "the default must leave a real window");
+
+        // Below the start point: no cycle.
+        heap.allocated
+            .store(threshold / 100 * pct / 2, Ordering::Relaxed);
+        assert!(!heap.should_start_concurrent_mark());
+
+        // In the window: open.
+        heap.allocated
+            .store(threshold / 100 * pct + 1, Ordering::Relaxed);
+        assert!(heap.should_start_concurrent_mark());
+
+        // At or above the collection threshold: refuse. A cycle opened here
+        // would get no concurrent phase, only the mark-start pause.
+        heap.allocated.store(threshold, Ordering::Relaxed);
+        assert!(!heap.should_start_concurrent_mark());
+
+        // And a cycle already in flight is not re-opened.
+        heap.allocated
+            .store(threshold / 100 * pct + 1, Ordering::Relaxed);
+        heap.conc_cycle_active.store(true, Ordering::Relaxed);
+        assert!(!heap.should_start_concurrent_mark());
+        heap.conc_cycle_active.store(false, Ordering::Relaxed);
+    }
+
+    /// A heap built with `with_capacity` (every pre-existing unit test) refuses
+    /// to open a cycle rather than reaching for an `Arc` it does not have.
+    #[test]
+    fn a_heap_without_an_arc_identity_stays_stop_the_world() {
+        let heap = ZgcRealHeap::new();
+        let obj = heap.alloc_object(ClassId::new(7), 1);
+        // SAFETY: single-threaded test.
+        let stw = unsafe { StopTheWorldToken::new() };
+        assert!(
+            !heap.start_concurrent_mark(&stw, &[obj.as_ptr() as u64]),
+            "no Arc identity means no concurrent cycle"
+        );
+        assert!(!heap.concurrent_mark_active());
+        assert!(
+            !heap.mark_active(),
+            "a refused cycle must not leave the SATB barrier armed"
+        );
+    }
+
+    /// Abandoning an open cycle disarms the barrier, drops the pool and leaves
+    /// the collector able to mark stop-the-world.
+    #[test]
+    fn an_abandoned_cycle_leaves_the_collector_usable() {
+        let heap = ZgcRealHeap::new_shared(32 * 1024 * 1024);
+        let (head, chain, garbage) = conc_build_graph(&heap, 500, 100);
+        {
+            // SAFETY: single-threaded test.
+            let stw = unsafe { StopTheWorldToken::new() };
+            assert!(heap.start_concurrent_mark(&stw, &[head.as_ptr() as u64]));
+        }
+        assert!(heap.mark_active());
+        heap.abandon_concurrent_mark();
+        assert!(!heap.concurrent_mark_active());
+        assert!(!heap.mark_active());
+        // Idempotent.
+        heap.abandon_concurrent_mark();
+
+        let stw = unsafe { StopTheWorldToken::new() };
+        let mut roots = [head];
+        let _ = heap.collect_garbage(&stw, &mut roots, &NoMonitors);
+        assert_eq!(
+            heap.concurrent_mark_stats().1,
+            0,
+            "an abandoned cycle is not a completed one"
+        );
+        assert_eq!(conc_walk_chain(&heap, head), chain);
+        assert!(garbage
+            .iter()
+            .all(|a| heap.is_object_address(*a).is_none()));
+    }
+
+
 }

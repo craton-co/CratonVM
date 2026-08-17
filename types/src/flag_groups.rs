@@ -1160,6 +1160,15 @@ pub const INVENTORY: &[E] = &[
     // serial; `relocate` reads 0/off/false/no as off.
     E { group: Group::GC, token: "zgc-parmark", on_key: Some("CRATONVM_ZGC_PARMARK"), off_key: None, off_word: Some("0") },
     E { group: Group::GC, token: "zgc-relocate", on_key: Some("CRATONVM_ZGC_RELOCATE"), off_key: None, off_word: Some("0") },
+    // Declared 2026-08-16 with genuine concurrent marking. `conc-start` is the
+    // percentage of the collection threshold at which a CONCURRENT mark cycle
+    // opens, and its parser reads `0` as "never" -- so `0` really is the
+    // falsey word and the kill switch, exactly like `zgc-parmark`'s worker
+    // count. `conc-workers` is a count with no meaningful off state: a
+    // concurrent cycle with zero workers would open and never trace, so `0` is
+    // clamped up to 1 and the token carries no `off_word`.
+    E { group: Group::GC, token: "zgc-conc-start", on_key: Some("CRATONVM_ZGC_CONC_START"), off_key: None, off_word: Some("0") },
+    E { group: Group::GC, token: "zgc-conc-workers", on_key: Some("CRATONVM_ZGC_CONC_WORKERS"), off_key: None, off_word: None },
     E { group: Group::GC, token: "zgc-startbits", on_key: Some("CRATONVM_ZGC_STARTBITS"), off_key: None, off_word: Some("0") },
     E { group: Group::GC, token: "zgc-tlab", on_key: Some("CRATONVM_ZGC_TLAB"), off_key: None, off_word: Some("0") },
     // Declared 2026-08-06 with the DBG/JIT block: a millisecond goal that
