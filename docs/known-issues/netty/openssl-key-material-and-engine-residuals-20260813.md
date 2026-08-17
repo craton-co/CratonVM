@@ -366,18 +366,49 @@ HotSpot.
   the local `common.args` carries), the class reproduces the residual exactly, and
   the box is not the 8-core Azure host that sat at load 17-35 with 14-16 users.
 
-  Read this class **per-METHOD, not by count**: HotSpot itself fails three
-  `testSessionTickets*` tests on this host, and which members of that family fail
-  moves run to run on BOTH arms. ABBA-interleaved:
+  **This test has TWO failure modes and they must be separated before any claim
+  about it means anything.** The method carries its own
+  `@Timeout(value = 10000, unit = MILLISECONDS)`, and on this VM it needs 7-19 s
+  where HotSpot needs 4-7 s — so on a busy box BOTH arms simply time out, and the
+  timeout tells you nothing about the defect:
 
-  | | control | fix | HotSpot |
-  |---|---|---|---|
-  | `testHandshakeFailureOnlyFireExceptionOnce` | FAILS every run | **passes every run** | passes |
-  | `testSessionTickets*` (4 members) | 1-4 fail, membership varies | 1-2 fail, membership varies | 3 fail |
-  | `testHandshakeFailureCipherMissmatchTLSv13OpenSsl` | ABORTED | ABORTED | ABORTED |
+  | mode | what it means | seen on |
+  |---|---|---|
+  | `AssertionFailedError` at line **1546** (`expected: <false> but was: <true>`) | the SERVER's handshake SUCCEEDED where it must fail — **the defect this section is about** | control only |
+  | `TimeoutException` at line **1545**, suppressed `SslHandler$LazyChannelPromise(incomplete)` | the CLIENT's promise had not completed at the 10 s budget — a LATENCY overrun | control and fix, equally |
 
-  The `testSessionTickets*` family is a pre-existing load-sensitive flake on this
-  host, on both VMs — not a regression, and not something this change touches.
+  Under load the two arms are indistinguishable: 5 control and 5 fix runs all gave
+  `TIMEOUT@1545` at 10.9-25.6 s. So the correctness question was answered with the
+  latency variable removed — `-Djunit.jupiter.execution.timeout.mode=disabled`,
+  which switches off `@Timeout` annotations too — and then it separates cleanly,
+  ABBA-interleaved:
+
+  ```
+  tlsctl  FAILED     ms=12400   ASSERT@1546   <- the server completed its handshake
+  tlsfix  SUCCESSFUL ms=10292
+  tlsfix  SUCCESSFUL ms= 7465
+  tlsctl  FAILED     ms= 9739   ASSERT@1546
+  tlsctl  FAILED     ms=17145   ASSERT@1546
+  ```
+
+  `ASSERT@1546` never appears on the fix arm and appears on every control run.
+  That is the property this section asked for.
+
+  **The `TIMEOUT@1545` overrun is left open and is NOT attributable to this
+  change** — it is present on the control at the same rate and with the same
+  timing distribution, and it is the same shape as
+  `fixed-suite-bugs/netty/nioeventlooptest-unbound-registration-fd-slot-collision-FIXED-20260817.md`
+  §2: a netty test whose own `@Timeout` is tighter than this VM's cold-start plus
+  handshake cost. On a quiet box the fix arm passes with the annotation left on
+  (measured 6815, 7685, 9494, 9813, 9828 ms against the 10 000 ms budget); on a
+  busy one it does not, and neither does the control.
+
+  Read the rest of this class **per-METHOD, not by count**: HotSpot itself fails
+  three `testSessionTickets*` tests on this host, and which members of that family
+  fail moves run to run on BOTH arms — a pre-existing load-sensitive flake, not a
+  regression, and not something this change touches.
+  `testHandshakeFailureCipherMissmatchTLSv13OpenSsl` ABORTS on all three arms
+  (its `assumeFalse(OpenSsl.isBoringSSL())`).
 
   **What this does NOT cover.** Only the CLIENT's `checkServerTrusted` moved into
   verification, because that is what `verify_server_cert` is. A SERVER engine's
