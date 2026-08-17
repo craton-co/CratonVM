@@ -76,7 +76,19 @@ Isolated with a constant-total-work allocation probe (`ScaleProbe alloc`,
 | 8 | 19 574 ms | **1416 ms** | 1185 ms |
 | 50 | ~30 800 ms | **9767 ms** | — |
 
-**13.8x at eight threads**, and G1 now tracks ZGC instead of diverging from it.
+Re-measured interleaved ABBA on the merged binary, two runs per arm, quiet host
+— because a single-arm sweep on this box is worth about a factor of two:
+
+| threads | G1 control | G1 fixed | ratio |
+|---|---|---|---|
+| 1 | 1462, 1342 ms | **861, 772 ms** | 1.7x |
+| 8 | 18 127, 14 738 ms | **1170, 3102 ms** | 7.7x |
+
+So the honest headline is **~8x at eight threads and ~1.7x at one**, and G1 now
+tracks ZGC (1185 ms at eight threads) instead of diverging from it. The
+single-thread figure in the first table was taken on a busier host; the ABBA
+pair supersedes it. The eight-thread ratio is the robust one — it is the
+convoy, and it is what the workload in this page actually pays.
 The fix is an atomic cached Free count, published wherever the count is already
 being taken under the lock (`note_region_consumed_locked`, the TLAB refill's
 own reserve count, `with_regions_mut`, and the end of `collect_garbage`), with

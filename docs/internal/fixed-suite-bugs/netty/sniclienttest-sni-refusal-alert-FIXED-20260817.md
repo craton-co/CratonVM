@@ -139,8 +139,15 @@ independent (the two runs failed on different tests: a
 `NoSuchMethodError: Object.checkServerTrusted` on one control run, a peer-reset
 `IOException` on one fixed run).
 
-Rust gates: `cargo test -p cratonvm-gc --lib` 1596 pass / 0 fail;
-`cargo test -p cratonvm-native-builtins --lib` 3583 pass / 0 fail.
+Post-merge with `origin/dev` `eb3749f83` (which had landed its own substantial
+`t27_tls.rs` work in `fix/netty-nio-pcap-tls-residuals-20260817`), re-verified
+through the same instrument: **27/27 SUCCESSFUL on G1 and on ZGC**, and through
+the suite runner `PASS 27 found / 27 ok / 0 failed`.
+
+Rust gates on the merged tree: `cargo test -p cratonvm-gc --lib` 1619 pass /
+0 fail; `cargo test -p cratonvm-native-builtins --lib` 3587 pass / 0 fail, and
+3762 / 0 with `--features synthetic-jdk`; `cargo clippy -p cratonvm-gc
+-p cratonvm-native-builtins` clean.
 
 ## Related
 
