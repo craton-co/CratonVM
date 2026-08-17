@@ -1479,6 +1479,7 @@ const PAUSE_HISTORY_CAP: usize = 1 << 16;
 /// that fires on 25% of the whole heap.
 const NEEDS_GC_RECOUNT_INTERVAL: usize = 1024;
 
+
 // ---------------------------------------------------------------------------
 // Collection type
 // ---------------------------------------------------------------------------
@@ -3248,6 +3249,16 @@ impl G1Collector {
     pub fn with_regions_mut<F: FnOnce(&mut [G1Region])>(&self, f: F) {
         let mut guard = self.regions.lock();
         f(&mut guard);
+        // The closure is allowed to retype regions, and the Free-region count
+        // is the one input `needs_gc`'s cache depends on. Republish it here so
+        // this — the sanctioned "mutate the region table" API — leaves the
+        // cache EXACT instead of leaning on the backstop re-scan. See
+        // `G1Collector::free_region_count`.
+        let free = guard
+            .iter()
+            .filter(|r| r.region_type == RegionType::Free)
+            .count();
+        self.publish_free_region_count(free);
     }
 
     /// Phase H (RH.8) — select the old regions that will be evacuated
@@ -8911,7 +8922,42 @@ impl G1Collector {
             // than as a deref-then-call.
             static LAST_RSET_TARGET: std::cell::Cell<Option<(u64, usize, *const G1Region, u64)>>
                 = const { std::cell::Cell::new(None) };
+            /// The last `(collector_id, dst_idx, src_idx, epoch)` edge this
+            /// thread recorded. ONE slot, not a set: this sits on the hot store
+            /// path, so it has to be cheaper than the lock it replaces —
+            /// widening it to an array made every barrier copy the whole array
+            /// in and out of the `Cell`.
+            static LAST_RSET_EDGE: std::cell::Cell<Option<(u64, usize, usize, u64)>>
+                = const { std::cell::Cell::new(None) };
         }
+
+        // An rset is a SET of source region indices, so re-recording an edge
+        // this thread already recorded in this epoch is a no-op — and taking a
+        // per-destination `Mutex<FxHashMap>` to discover that is what every
+        // reference store into a hot region was paying. Mutators writing into
+        // the same current Eden region all contend on that one mutex, so the
+        // cost is a convoy rather than an uncontended lock: the same total
+        // number of retained-object stores measured 1.0 s on one thread and
+        // 6.8 s on eight (ZGC flat at ~1.1 s), with ZERO collections in either
+        // run — the pauses were never involved.
+        //
+        // `epoch` is what makes skipping sound, and it is the same epoch the
+        // region-pointer cache below already relies on: a recycle/retype phase
+        // bumps it under the regions lock, and `G1Region::reset` (which clears
+        // the rset) only happens inside such a phase. A stale memo therefore
+        // cannot survive the clear that would invalidate it. Coarsening does
+        // not need to be tracked either — an add to a coarsened rset returns
+        // early anyway, so skipping it changes nothing.
+        if LAST_RSET_EDGE.with(|cell| cell.get())
+            == Some((collector_id, dst_idx, src_idx, cur_epoch))
+        {
+            return;
+        }
+        // Record the edge as memoized only after an add below actually lands.
+        let remember_edge = |epoch: u64| {
+            LAST_RSET_EDGE
+                .with(|cell| cell.set(Some((collector_id, dst_idx, src_idx, epoch))));
+        };
 
         let hit = LAST_RSET_TARGET.with(|cell| {
             if let Some((cached_collector, cached_idx, cached_ptr, cached_epoch)) = cell.get() {
@@ -8951,6 +8997,7 @@ impl G1Collector {
             false
         });
         if hit {
+            remember_edge(cur_epoch);
             return;
         }
 
@@ -8993,6 +9040,7 @@ impl G1Collector {
         regions[dst_idx]
             .rset
             .add_reference_in_generation(src_idx, epoch_under_lock);
+        remember_edge(epoch_under_lock);
     }
 
     /// Region indices that hold a conservatively-discovered JIT root this cycle
@@ -14303,16 +14351,48 @@ mod tests {
         let gc = make_collector();
         assert!(!gc.needs_gc()); // all 8 regions free
 
-        // Use up most regions
-        {
-            let mut regions = gc.regions.lock();
+        // Use up most regions. Through `with_regions_mut`, NOT a raw
+        // `gc.regions.lock()`: `needs_gc` answers from a cached Free count
+        // (see `G1Collector::free_region_count`), and the sanctioned mutation
+        // API republishes that count while a raw lock cannot. A raw retype is
+        // only picked up by the backstop re-scan, i.e. after
+        // `NEEDS_GC_RECOUNT_INTERVAL` further queries — which is exactly the
+        // contract this asserts, one call later.
+        gc.with_regions_mut(|regions| {
             for i in 0..7 {
                 regions[i].region_type = RegionType::Eden;
                 regions[i].cursor = 100;
             }
-        }
+        });
         // 1 free out of 8 = 12.5% free, threshold is 25%
         assert!(gc.needs_gc());
+    }
+
+    /// The cached Free count must not be able to answer "collect" on a heap
+    /// that a collection has just emptied — the failure mode that would turn
+    /// one stale read into a GC on every allocation. Pairs with
+    /// `needs_gc_when_regions_full`: same collector, opposite direction.
+    #[test]
+    fn needs_gc_clears_once_regions_are_free_again() {
+        let gc = make_collector();
+        gc.with_regions_mut(|regions| {
+            for r in regions.iter_mut() {
+                r.region_type = RegionType::Eden;
+                r.cursor = 100;
+            }
+        });
+        assert!(gc.needs_gc(), "no Free regions at all must ask for a GC");
+        gc.with_regions_mut(|regions| {
+            for r in regions.iter_mut() {
+                r.region_type = RegionType::Free;
+                r.cursor = 0;
+            }
+        });
+        assert!(
+            !gc.needs_gc(),
+            "an all-Free heap must not still be asking for a collection — a \
+             cached Free count that survives the recycle is a GC per allocation"
+        );
     }
 
     // -- Allocated bytes --
