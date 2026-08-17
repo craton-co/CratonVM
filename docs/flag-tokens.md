@@ -724,6 +724,7 @@ export inherited from a parent shell.
 | `exact-refproc-survival` | `CRATONVM_NO_EXACT_REFPROC_SURVIVAL` |
 | `g1-coverage-pin` | `CRATONVM_G1_COVERAGE_PIN` |
 | `g1-evac-retry` | `CRATONVM_G1_NO_EVAC_RETRY` |
+| `g1-live-region-memo` | `CRATONVM_G1_NO_LIVE_REGION_MEMO` |
 | `g1-parallel-evac` | `CRATONVM_G1_PARALLEL_EVAC` |
 | `g1-eager-humongous` | `CRATONVM_G1_EAGER_HUMONGOUS` |
 | `g1-workers` | `CRATONVM_G1_WORKERS` |

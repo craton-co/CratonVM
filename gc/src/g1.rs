@@ -9756,6 +9756,15 @@ impl G1Collector {
             return false;
         }
         let idx = (addr - self.arena_base) / region_size;
+        // Per-thread POSITIVE memo, checked before the lock. See
+        // `live_region_memo` for the soundness argument; the epoch is read
+        // BEFORE the lock below so a recycle concurrent with this call can only
+        // ever produce a memo that is already stale-tagged, never one that
+        // outlives its region.
+        let epoch = self.rset_cache_epoch.load(Ordering::Acquire);
+        if live_region_memo::hit(self.instance_id, epoch, idx, addr) {
+            return true;
+        }
         let regions = self.regions.lock();
         match regions.get(idx) {
             None => false,
@@ -9792,8 +9801,17 @@ impl G1Collector {
                     if self.kept_unresolved_any.load(Ordering::Acquire)
                         && self.kept_unresolved_regions.lock().contains(&idx)
                     {
+                        // Deliberately NOT memoized: liveness here is a
+                        // per-ADDRESS question (the recorded self-forwarded
+                        // set), not a per-span one, and the memo can only
+                        // express a span.
                         return self.kept_unresolved_live.lock().contains(&addr);
                     }
+                    // Memoize the span this answer came from, so the next
+                    // address in the same region — the common case for a
+                    // stack scan or a run of native calls, which see the same
+                    // Eden over and over — is answered without the lock.
+                    live_region_memo::fill(self.instance_id, epoch, idx, base, base + r.cursor);
                     true
                 }
             },
@@ -11667,6 +11685,169 @@ pub fn select_evacuation_candidates(
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+/// A per-thread positive memo over `G1Collector::is_addr_in_live_region`.
+///
+/// # The cost it removes
+///
+/// `is_addr_in_live_region` rejects an out-of-arena address lock-free, and that
+/// gate is what made the conservative stack scan affordable. Every address that
+/// passes it — i.e. every REAL object pointer — then takes `regions.lock()`, a
+/// process-global mutex, to read one region's type, base and cursor. The
+/// callers are not rare: `is_object_address` runs it per candidate word of every
+/// JIT frame scan and once per object-shaped argument of every native call
+/// (`pin_value_for_native_call`). On netty's `PcapWriteHandler` loop — whose
+/// stacks are full of genuine `ByteBuf` pointers, so the arena gate rejects
+/// almost nothing — `is_addr_in_live_region` was the largest single symbol in
+/// the profile at **9.1%**, of which the `MutexGuard` drop alone was 2.9%.
+///
+/// This is the same shape as the two G1 lock defects already closed
+/// (`G1::needs_gc`'s per-allocation region scan, and every G1 accessor taking
+/// this mutex to ask `humongous_span`): a global lock on a per-operation path.
+///
+/// # Why it is sound
+///
+/// The memo answers **only "yes"**, and only for an address it has already seen
+/// this exact answer for, from a region incarnation it can prove is unchanged:
+///
+/// * **Span.** An entry records `[base, limit)` where `limit` was `base +
+///   cursor` at fill time. A region's cursor only ever GROWS within one
+///   incarnation, so a memoized limit is an UNDER-approximation of the live
+///   span: an address past it misses and takes the authoritative path, which
+///   then refreshes the entry. There is no way for the memo to accept an
+///   address the locked path would have rejected on cursor grounds.
+///
+/// * **Incarnation.** Recycling or retyping a region is exactly what
+///   `rset_cache_epoch` counts — it is bumped under the `regions` lock, with
+///   `Release` ordering, at the start of `young_collection`, `mixed_collection`
+///   and `cleanup`. An entry carries the epoch READ BEFORE its fill took the
+///   lock, so a recycle racing that fill leaves the entry stamped with an
+///   already-superseded epoch and it can never be believed. This is the same
+///   invariant `post_write_barrier_rset`'s TLS cache already relies on, for the
+///   same hazard — a cached view of a region that a collection may have
+///   recycled underneath it — so the memo adds no new maintenance obligation.
+///
+/// * **Collector identity.** `instance_id` is minted per collector and never
+///   reused, so a new collector constructed at a dropped one's address cannot
+///   inherit its entries (the failure `post_write_barrier_rset` hit with
+///   `self as *const Self`, and the reason that field exists).
+///
+/// * **Thread locality.** Entries live in thread-local storage, so there is no
+///   sharing, no atomics beyond the one epoch load, and no way for one thread's
+///   view to be published to another.
+///
+/// The evacuation-failure arm (`kept_unresolved_*`) is deliberately excluded:
+/// liveness there is a per-address set membership, not a span, and the memo can
+/// only express a span. Those addresses keep taking the lock.
+///
+/// # What a miss costs
+///
+/// One extra atomic load and up to `WAYS` integer compares before the lock that
+/// was going to be taken anyway. `CRATONVM_G1_NO_LIVE_REGION_MEMO=1` withdraws
+/// the memo entirely so one binary can be A/B'd against its own pre-change
+/// behaviour.
+mod live_region_memo {
+    /// Entries per thread. Small and fixed: a stack scan walks one or two
+    /// regions (the current Eden, plus whatever survivors it points into), and
+    /// a linear walk of four is cheaper than any hashing.
+    const WAYS: usize = 4;
+
+    #[derive(Clone, Copy)]
+    struct Entry {
+        instance_id: u64,
+        epoch: u64,
+        region_idx: usize,
+        base: usize,
+        limit: usize,
+    }
+
+    impl Entry {
+        const EMPTY: Entry = Entry {
+            instance_id: 0,
+            epoch: 0,
+            region_idx: usize::MAX,
+            base: 0,
+            // An empty entry can never accept: `addr >= base && addr < limit`
+            // is false for every address when `limit == 0`.
+            limit: 0,
+        };
+    }
+
+    thread_local! {
+        static ENTRIES: std::cell::Cell<[Entry; WAYS]> =
+            const { std::cell::Cell::new([Entry::EMPTY; WAYS]) };
+        /// Round-robin victim, so a fifth region does not permanently evict the
+        /// same slot while three others idle.
+        static VICTIM: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    /// `CRATONVM_G1_NO_LIVE_REGION_MEMO=1` — withdraw the memo. Read once.
+    fn enabled() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| {
+            cratonvm_types::flags::runtime_var_os("CRATONVM_G1_NO_LIVE_REGION_MEMO").is_none()
+        })
+    }
+
+    /// Is `addr` inside a span this thread has already proved live, in a region
+    /// incarnation `epoch` says is still current?
+    #[inline]
+    pub(super) fn hit(instance_id: u64, epoch: u64, region_idx: usize, addr: usize) -> bool {
+        if !enabled() {
+            return false;
+        }
+        ENTRIES.with(|c| {
+            let entries = c.get();
+            for e in entries.iter() {
+                if e.region_idx == region_idx
+                    && e.instance_id == instance_id
+                    && e.epoch == epoch
+                    && addr >= e.base
+                    && addr < e.limit
+                {
+                    return true;
+                }
+            }
+            false
+        })
+    }
+
+    /// Record the span the authoritative path just accepted from.
+    ///
+    /// `epoch` must be the value read BEFORE the `regions` lock was taken — see
+    /// the module doc's incarnation argument.
+    #[inline]
+    pub(super) fn fill(
+        instance_id: u64,
+        epoch: u64,
+        region_idx: usize,
+        base: usize,
+        limit: usize,
+    ) {
+        if !enabled() {
+            return;
+        }
+        ENTRIES.with(|c| {
+            let mut entries = c.get();
+            let slot = entries
+                .iter()
+                .position(|e| e.region_idx == region_idx && e.instance_id == instance_id)
+                .unwrap_or_else(|| VICTIM.with(|v| {
+                    let s = v.get();
+                    v.set((s + 1) % WAYS);
+                    s
+                }));
+            entries[slot] = Entry {
+                instance_id,
+                epoch,
+                region_idx,
+                base,
+                limit,
+            };
+            c.set(entries);
+        });
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -15695,6 +15876,67 @@ mod tests {
         // O(1) index agrees with the authoritative binary-search lookup for the
         // live address (sanity on the `(addr - arena_base) / region_size` math).
         assert!(gc.lookup_region_for_addr(addr).is_some());
+    }
+
+    /// The lock-free positive memo must answer, and must stop answering the
+    /// instant its region's incarnation is superseded.
+    ///
+    /// Both halves matter and they fail differently. If the memo never fires,
+    /// the change is inert and every timing number attributed to it is noise —
+    /// so the first assertion reaches past the public predicate and asks
+    /// `live_region_memo::hit` directly, which is the only way to distinguish
+    /// "answered by the memo" from "answered by the lock" (the two return the
+    /// same `true`). If the memo keeps firing across a recycle it reports a
+    /// dead address as live, which is a dangling root — so the second half
+    /// bumps `rset_cache_epoch`, exactly as `young_collection` does, and
+    /// requires the entry to fall silent.
+    #[test]
+    fn live_region_memo_answers_and_expires_with_the_region_incarnation() {
+        let gc = make_collector();
+        let obj = gc
+            .try_alloc_object(ClassId::new(0), 3)
+            .expect("alloc should succeed on a fresh heap");
+        let addr = obj.as_ptr() as usize;
+        let idx = (addr - gc.arena_base) / gc.config.region_size;
+
+        // Cold: nothing memoized yet, so the memo must NOT claim this address.
+        // (Asserted before the fill so a leftover entry from another test on
+        // this thread would show up here rather than being mistaken for a hit
+        // below — instance ids are never reused, which is what makes that true.)
+        let epoch = gc.rset_cache_epoch.load(Ordering::Acquire);
+        assert!(
+            !super::live_region_memo::hit(gc.instance_id, epoch, idx, addr),
+            "a cold memo must not answer — a memo that answers before any fill              is keyed on something it should not be"
+        );
+
+        // The authoritative call fills it.
+        assert!(gc.is_addr_in_live_region(addr));
+        assert!(
+            super::live_region_memo::hit(gc.instance_id, epoch, idx, addr),
+            "the memo must be warm after one authoritative accept — if it is not,              every address still takes the regions lock and this change is inert"
+        );
+
+        // A recycle supersedes the incarnation. `rset_cache_epoch` is bumped
+        // under the regions lock at the start of every collection that
+        // recycles or retypes regions; that bump is the memo's whole
+        // invalidation condition.
+        gc.rset_cache_epoch.fetch_add(1, Ordering::Release);
+        let after = gc.rset_cache_epoch.load(Ordering::Acquire);
+        assert!(
+            !super::live_region_memo::hit(gc.instance_id, after, idx, addr),
+            "a memo entry must not survive its region's incarnation — surviving              one reports a recycled address as a live root"
+        );
+
+        // And a different collector must never inherit the entry, even at the
+        // same region index and the same epoch value.
+        assert!(
+            !super::live_region_memo::hit(gc.instance_id.wrapping_add(1), epoch, idx, addr),
+            "the memo must be keyed on collector identity"
+        );
+
+        // The public predicate is still correct after all of that: it falls
+        // through to the lock and re-answers from the regions table.
+        assert!(gc.is_addr_in_live_region(addr));
     }
 
     /// `region_for_ptr_with_regions` (write-barrier hot path) must agree

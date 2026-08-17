@@ -1056,6 +1056,7 @@ applies to `flag_env_mutation_guard.rs`.
 | `CRATONVM_G1_DBG_ZERO` | DBG | `CRATONVM_DBG=g1-dbg-zero` | opt-in | off | diag | snapshot | types |
 | `CRATONVM_G1_EAGER_HUMONGOUS` | GC | `CRATONVM_GC=g1-eager-humongous` | default-on | on | behaviour | snapshot | types |
 | `CRATONVM_G1_NO_EVAC_RETRY` | GC | `CRATONVM_GC=g1-evac-retry` | opt-out | on | behaviour | snapshot | types |
+| `CRATONVM_G1_NO_LIVE_REGION_MEMO` | GC | `CRATONVM_GC=g1-live-region-memo` | opt-out | on | behaviour | snapshot | gc |
 | `CRATONVM_G1_PARALLEL_EVAC` | GC | `CRATONVM_GC=g1-parallel-evac` | default-on | on | behaviour | snapshot | types |
 | `CRATONVM_G1_RSET_SOURCE_CAP` | GC | `CRATONVM_GC=g1-rset-source-cap` | opt-in | off | behaviour | snapshot | gc |
 | `CRATONVM_G1_VERIFY_BUDGET` | GC | `CRATONVM_GC=g1-verify-budget` | opt-in | off | behaviour | snapshot | gc |
