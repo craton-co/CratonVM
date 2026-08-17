@@ -756,12 +756,53 @@ pub(crate) fn bi_gcd_str(a: &str, b: &str) -> String {
 }
 
 /// `BigInteger.modPow(exp, m)` — `base^exp mod m` for arbitrary-precision
-/// signed decimal strings. Negative exponents require `modInverse` and are
-/// rejected here (Java throws `ArithmeticException`); callers should handle
-/// that branch explicitly.
+/// signed decimal strings.
+///
+/// TOTAL since 2026-08-16 (lane G10, closing F31-1 N3). This used to end a
+/// negative exponent with
+///
+/// ```text
+///     panic!("bi_mod_pow_str: negative exponent — caller must compute modInverse first");
+/// ```
+///
+/// whose own comment said it chose to "panic to be loud". A Rust `panic!` in a
+/// native is not a Java throwable: it unwinds past every `catch` and takes the
+/// VM with it, which is the one failure mode no Java program can survive. A
+/// negative exponent is *legal* `BigInteger` — MEASURED on
+/// `openjdk 25.0.3 2026-04-21 LTS (25.0.3+9-LTS)` (Temurin),
+/// `scratchpad/g10/BiProbe.java`:
+///
+/// ```text
+/// 3.modPow(-1, 7)  = 5        (-3).modPow(3, 7) = 1        3.modPow(2, 1) = 0
+/// 2.modPow(-1, 4) !! ArithmeticException: BigInteger not invertible.
+/// 3.modPow(2, 0)  !! ArithmeticException: BigInteger: modulus not positive
+/// 3.modPow(2, -7) !! ArithmeticException: BigInteger: modulus not positive
+/// ```
+///
+/// So there is exactly one shape a `-> String` signature cannot express: a
+/// negative exponent over a non-invertible base. [`bi_mod_pow_str_opt`] is the
+/// real body and returns `None` for it; this wrapper keeps the infallible
+/// signature its out-of-lane caller (`phases_late::register_p71_biginteger_extras`)
+/// needs and answers `"0"` there.
+///
+/// **`"0"` is a wrong value, and it is deliberately preferred to a VM abort.**
+/// Priority order for this family is: a VM abort is worse than a wrong value.
+/// No in-tree caller can reach it — all four (`bi_miller_rabin_str`, this file's
+/// `modPow` native, `phases_late:8847`, and `bigint.rs`'s differential tests)
+/// strip the sign or invert the base before calling. Callers that can see a
+/// caller-chosen exponent should take [`bi_mod_pow_str_opt`] and raise
+/// `ArithmeticException("BigInteger not invertible.")` on `None`; that is this
+/// lane's NOMINATION for `phases_late.rs`.
 pub(crate) fn bi_mod_pow_str(base: &str, exp: &str, m: &str) -> String {
+    bi_mod_pow_str_opt(base, exp, m).unwrap_or_else(|| "0".to_string())
+}
+
+/// [`bi_mod_pow_str`] with the one case a `String` cannot carry: `None` means
+/// "negative exponent over a base with no inverse mod `m`", i.e. HotSpot's
+/// `ArithmeticException("BigInteger not invertible.")`.
+pub(crate) fn bi_mod_pow_str_opt(base: &str, exp: &str, m: &str) -> Option<String> {
     if m == "1" || m == "-1" {
-        return "0".to_string();
+        return Some("0".to_string());
     }
     let (m_neg, m_abs) = bi_parse_sign(m);
     let _ = m_neg; // modulus magnitude is what matters
@@ -771,14 +812,14 @@ pub(crate) fn bi_mod_pow_str(base: &str, exp: &str, m: &str) -> String {
     if b.starts_with('-') {
         b = bi_add_str(&b, m_abs);
     }
-    // exp must be non-negative for plain modPow.
+    // A negative exponent is what `BigInteger.modPow` calls
+    // `this.modInverse(m).modPow(exp.negate(), m)` (JDK 25
+    // `BigInteger.java:2564-2566`) — invert the base, then raise the inverse to
+    // |exp|. `bi_mod_inverse_str` is thirty lines further down this file, so
+    // this is the JDK's own rule and not a substitution for it.
     let (e_neg, e_abs) = bi_parse_sign(exp);
     if e_neg {
-        // Caller is responsible for inverting base first.
-        // Fallback: treat as |exp| (consistent with our previous buggy
-        // wrapping_mul behavior is not OK; instead return 0 sentinel — but
-        // returning 0 is itself a synthetic stub, so panic to be loud).
-        panic!("bi_mod_pow_str: negative exponent — caller must compute modInverse first");
+        b = bi_mod_inverse_str(&b, m_abs)?;
     }
     let mut result = "1".to_string();
     // Iterate bits of exp from LSB to MSB by repeated div2.
@@ -793,7 +834,7 @@ pub(crate) fn bi_mod_pow_str(base: &str, exp: &str, m: &str) -> String {
             b = bi_mod_unsigned(&bi_mul_unsigned(&b, &b), m_abs);
         }
     }
-    result
+    Some(result)
 }
 
 /// `BigInteger.modInverse(m)` — extended Euclidean on arbitrary-precision
@@ -1808,9 +1849,9 @@ mod argument_driven_range_tests {
         NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess,
     };
     use super::{
-        bd_narrowing_truncates_to_zero, bd_plain_string_check, bd_pow_ten_check,
-        bd_rescale_operand, bd_to_big_integer_check, bd_truncate, bi_pow_check_range,
-        bi_shift_right_str,
+        bd_narrowing_truncates_to_zero, bd_plain_string_check, bd_pow_ten_check, bd_product_scale,
+        bd_rescale_operand, bd_to_big_integer_check, bd_to_f32, bd_to_f64, bd_truncate,
+        bi_pow_check_range, bi_shift_right_str,
     };
     use crate::bigint::BigInt;
     use cratonvm_types::error::{MethodCallFailed, VmError};
@@ -2150,6 +2191,216 @@ mod argument_driven_range_tests {
         assert_eq!(bi_shift_right_str("-9", 1), "-5");
         assert_eq!(bi_shift_right_str("9", 1), "4");
         assert_eq!(bi_shift_right_str("0", i32::MAX), "0");
+    }
+
+    // -----------------------------------------------------------------
+    // G10 (2026-08-16) — `multiply`'s product scale, `doubleValue`, and the
+    // no-panic pin over every rescale path. Every expectation below is a
+    // transcript line from `scratchpad/g10/{BdProbe,Bd2Probe}.java` on Temurin
+    // OpenJDK 25.0.3+9, not a derivation from this implementation.
+    // -----------------------------------------------------------------
+
+    /// `a.multiply(b)`'s product scale, exactly as `native_bd_multiply`
+    /// composes it: the RECEIVER's unscaled value decides the refusal.
+    fn product_scale(ua: &str, sa: i32, sb: i32) -> Result<i32, String> {
+        bd_product_scale(&BigInt::from_decimal(ua), sa, sb).map_err(thrown)
+    }
+
+    /// ```text
+    /// bd(1,MAX).multiply(bd(1,MAX))  !! ArithmeticException: Underflow
+    /// bd(0,MAX).multiply(bd(1,MAX))   = unscaled=0 scale=2147483647
+    /// bd(1,MIN).multiply(bd(1,MIN))  !! ArithmeticException: Overflow
+    /// bd(0,MIN).multiply(bd(1,MIN))   = unscaled=0 scale=-2147483648
+    /// bd(1,MAX).multiply(bd(1,MIN))   = unscaled=1 scale=-1
+    /// bd(1,MAX).multiply(bd(1,0))     = unscaled=1 scale=2147483647
+    /// ```
+    #[test]
+    fn multiply_product_scale_matches_hotspot() {
+        // Non-zero receiver, sum past Integer.MAX_VALUE -> "Underflow".
+        assert_eq!(
+            product_scale("1", i32::MAX, i32::MAX),
+            Err("ArithmeticException: Underflow".to_string())
+        );
+        assert_eq!(
+            product_scale("1", i32::MAX, 1),
+            Err("ArithmeticException: Underflow".to_string())
+        );
+        assert_eq!(
+            product_scale("1", 1_073_741_824, 1_073_741_824),
+            Err("ArithmeticException: Underflow".to_string())
+        );
+        // Non-zero receiver, sum past Integer.MIN_VALUE -> "Overflow".
+        // The two words are NOT interchangeable.
+        assert_eq!(
+            product_scale("1", i32::MIN, i32::MIN),
+            Err("ArithmeticException: Overflow".to_string())
+        );
+        assert_eq!(
+            product_scale("1", i32::MIN, -1),
+            Err("ArithmeticException: Overflow".to_string())
+        );
+        assert_eq!(
+            product_scale("1", -1_073_741_824, -1_073_741_825),
+            Err("ArithmeticException: Overflow".to_string())
+        );
+        // A ZERO receiver clamps and answers -- and it is the RECEIVER's
+        // zeroness, not the product's: `bd(1,MAX).multiply(bd(0,MAX))` throws.
+        assert_eq!(product_scale("0", i32::MAX, i32::MAX), Ok(i32::MAX));
+        assert_eq!(
+            product_scale("0", 1_073_741_824, 1_073_741_824),
+            Ok(i32::MAX)
+        );
+        assert_eq!(product_scale("0", i32::MIN, i32::MIN), Ok(i32::MIN));
+        assert_eq!(product_scale("0", i32::MIN, -1), Ok(i32::MIN));
+        // In-range sums are just the sum, at both extremes.
+        assert_eq!(product_scale("1", i32::MAX, 0), Ok(i32::MAX));
+        assert_eq!(product_scale("1", i32::MIN, 0), Ok(i32::MIN));
+        assert_eq!(product_scale("1", i32::MAX, i32::MIN), Ok(-1));
+        assert_eq!(product_scale("1", 2, 3), Ok(5));
+        assert_eq!(product_scale("-1", -2, -3), Ok(-5));
+    }
+
+    /// `scratchpad/g10/Bd2Probe.java`. Every row is `bd(u,s).doubleValue()` on
+    /// Temurin OpenJDK 25.0.3+9, and every one of them answers in 0 ms without
+    /// HotSpot rendering anything — which is the point: the old body rendered
+    /// `scale.unsigned_abs()` zeros first.
+    #[test]
+    fn double_value_matches_hotspot() {
+        let d = |u: &str, s: i32| bd_to_f64(&BigInt::from_decimal(u), s);
+        // The scale extremes, on both signs and on zero.
+        assert_eq!(d("1", i32::MIN), f64::INFINITY);
+        assert_eq!(d("-1", i32::MIN), f64::NEG_INFINITY);
+        assert_eq!(d("1", i32::MIN + 1), f64::INFINITY);
+        assert_eq!(d("1", i32::MAX), 0.0);
+        assert_eq!(d("-1", i32::MAX), -0.0);
+        assert!(d("-1", i32::MAX).is_sign_negative());
+        assert_eq!(d("0", i32::MIN), 0.0);
+        assert_eq!(d("0", i32::MAX), 0.0);
+        // A zero value is +0.0 at EVERY scale -- never -0.0.
+        assert!(d("0", i32::MIN).is_sign_positive());
+        assert!(d("0", 324).is_sign_positive());
+        // The overflow boundary, one scale apart.
+        assert_eq!(d("1", -308), 1.0e308);
+        assert_eq!(d("1", -309), f64::INFINITY);
+        assert_eq!(d("15", -308), f64::INFINITY);
+        assert_eq!(d("17976931348623157", -292), 1.7976931348623157e308);
+        assert_eq!(d("17976931348623159", -292), f64::INFINITY);
+        // The underflow boundary. `bd(1,324)` rounds to zero but `bd(15,324)`
+        // does not, and they share an adjusted exponent -- which is why the
+        // clamp is at -325 and not -324.
+        assert_eq!(d("1", 323), 9.9e-324);
+        assert_eq!(d("1", 324), 0.0);
+        assert_eq!(d("15", 324), 1.5e-323);
+        assert_eq!(d("49", 326), 0.0);
+        assert_eq!(d("1", 325), 0.0);
+        assert_eq!(d("-1", 324), -0.0);
+        assert!(d("-1", 324).is_sign_negative());
+        // Ordinary values, and the round-to-nearest-even row that a truncating
+        // implementation gets wrong.
+        assert_eq!(d("1", 0), 1.0);
+        assert_eq!(d("1", 1), 0.1);
+        assert_eq!(d("1", -1), 10.0);
+        assert_eq!(d("15", 1), 1.5);
+        assert_eq!(d("-15", -1), -150.0);
+        assert_eq!(d("9007199254740993", 0), 9.007199254740992e15);
+        assert_eq!(d("9007199254740993", 324), 9.007199254740994e-309);
+    }
+
+    /// `floatValue()` is `Float.parseFloat(toString())`, NOT `(float)
+    /// doubleValue()` -- the clamps are `f32`'s and the rounding is single.
+    #[test]
+    fn float_value_matches_hotspot() {
+        let f = |u: &str, s: i32| bd_to_f32(&BigInt::from_decimal(u), s);
+        assert_eq!(f("1", i32::MIN), f32::INFINITY);
+        assert_eq!(f("-1", i32::MIN), f32::NEG_INFINITY);
+        assert_eq!(f("1", i32::MAX), 0.0);
+        assert!(f("-1", i32::MAX).is_sign_negative());
+        assert_eq!(f("0", i32::MIN), 0.0);
+        // `bd(1,-308)` is 1.0E308 as a double and Infinity as a float.
+        assert_eq!(f("1", -308), f32::INFINITY);
+        assert_eq!(f("1", 308), 0.0);
+        assert!(f("-1", 308).is_sign_negative());
+        assert_eq!(f("1", 1), 0.1f32);
+        assert_eq!(f("15", 1), 1.5f32);
+        assert_eq!(f("-15", -1), -150.0f32);
+        assert_eq!(f("9007199254740993", 1), 9.0071994e14f32);
+    }
+
+    /// **The no-panic pin.** A Rust panic in a native is not a Java throwable:
+    /// it is not catchable and it takes the VM down where HotSpot throws. Every
+    /// rescale path in this file is exercised here at `Integer.MIN_VALUE`,
+    /// `Integer.MIN_VALUE + 1`, `Integer.MAX_VALUE` and `0` — the four scales
+    /// where a `-scale` / `sa + sb` / `s - sa` spelling overflows — on a zero
+    /// operand and a non-zero one. The assertion is not on the VALUE: it is
+    /// that each call RETURNS, either an answer or a `MethodCallFailed`.
+    ///
+    /// These are the four shapes that have each been a live abort in this
+    /// family at some point: `apply_scale`'s `-scale` (F20), `bd_set_scale_impl`'s
+    /// `new_scale - scale` (F31), `bd_rescale_operand`'s `s - sa` (F31), and
+    /// `native_bd_multiply`'s `sa + sb` (G10).
+    #[test]
+    fn every_rescale_path_is_total_at_the_scale_extremes() {
+        let scales = [i32::MIN, i32::MIN + 1, -1, 0, 1, i32::MAX - 1, i32::MAX];
+        let operands = ["0", "1", "-1", "15", "-9007199254740993"];
+        for &s in &scales {
+            for u in &operands {
+                let v = BigInt::from_decimal(u);
+                // toBigInteger()'s guard, then its arithmetic. `bd_truncate`
+                // is only reached when the guard admits, exactly as
+                // `bd_truncated_bigint` composes them.
+                if bd_to_big_integer_check(&v, s).is_ok() {
+                    let _ = bd_truncate(&v, s).to_decimal();
+                }
+                // intValue()/longValue(): no guard at all, by design.
+                let _ = narrow_int(u, s);
+                let _ = narrow_long(u, s);
+                // toPlainString()'s guard.
+                let _ = bd_plain_string_check(u, s);
+                // doubleValue()/floatValue(): total, no guard needed.
+                let _ = bd_to_f64(&v, s);
+                let _ = bd_to_f32(&v, s);
+                for &s2 in &scales {
+                    // multiply()'s product scale.
+                    let _ = bd_product_scale(&v, s, s2);
+                    // add()/subtract()'s per-operand raise. The `i64`
+                    // subtraction is the caller's job and is spelled here the
+                    // way `native_bd_add` spells it.
+                    let common = s.max(s2);
+                    let _ = bd_rescale_operand(&v, i64::from(common) - i64::from(s));
+                    let _ = bd_rescale_operand(&v, i64::from(common) - i64::from(s2));
+                }
+            }
+        }
+    }
+
+    /// `bi_mod_pow_str` used to `panic!` on a negative exponent. MEASURED on
+    /// Temurin OpenJDK 25.0.3+9 (`scratchpad/g10/BiProbe.java`):
+    ///
+    /// ```text
+    /// 3.modPow(-1, 7)  = 5      3.modPow(2, 1) = 0      (-3).modPow(3, 7) = 1
+    /// 2.modPow(-1, 4) !! ArithmeticException: BigInteger not invertible.
+    /// ```
+    #[test]
+    fn mod_pow_negative_exponent_no_longer_panics() {
+        use super::{bi_mod_pow_str, bi_mod_pow_str_opt};
+        // The invertible case is now COMPUTED, not aborted.
+        assert_eq!(bi_mod_pow_str_opt("3", "-1", "7").as_deref(), Some("5"));
+        assert_eq!(bi_mod_pow_str_opt("2", "-1", "7").as_deref(), Some("4"));
+        assert_eq!(bi_mod_pow_str_opt("3", "-2", "10").as_deref(), Some("9"));
+        assert_eq!(bi_mod_pow_str_opt("2", "-3", "7").as_deref(), Some("1"));
+        // The one shape a `-> String` cannot express.
+        assert_eq!(bi_mod_pow_str_opt("2", "-1", "4"), None);
+        assert_eq!(bi_mod_pow_str_opt("2", "-1", "8"), None);
+        assert_eq!(bi_mod_pow_str_opt("0", "-5", "7"), None);
+        // ...and the infallible wrapper RETURNS there rather than aborting the
+        // VM. `"0"` is a wrong value, deliberately preferred to a panic; no
+        // in-tree caller can reach it.
+        assert_eq!(bi_mod_pow_str("2", "-1", "4"), "0");
+        assert_eq!(bi_mod_pow_str("0", "-5", "7"), "0");
+        // The non-negative rows are unchanged.
+        assert_eq!(bi_mod_pow_str("3", "4", "7"), "4");
+        assert_eq!(bi_mod_pow_str("-3", "3", "7"), "1");
+        assert_eq!(bi_mod_pow_str("3", "2", "1"), "0");
     }
 }
 
@@ -2545,15 +2796,94 @@ fn native_bi_abs(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
     Ok(Some(Value::Object(Some(result?))))
 }
 
+/// The runtime class name of an object, when the VM can tell us. `None` means
+/// "could not resolve" and every caller here treats that as "do not refuse":
+/// a type screen that fires on an unresolvable name would break working paths,
+/// and this family's job is to stop *fabricating*, not to invent refusals.
+fn bi_runtime_class_name(ctx: &dyn NativeContext, o: ObjectRef) -> Option<String> {
+    ctx.class_name_of_id(ctx.class_id_of_object(o))
+}
+
+/// `true` when `other` is positively known NOT to be a `java.math.BigInteger`,
+/// given a `this` that is one.
+///
+/// `BigInteger` is `final`, so an exact class match is the whole subtype test.
+/// The fast arm is two `ClassId` reads and no allocation — `compareTo` is on
+/// BouncyCastle's field-arithmetic and Lucene's `TestUtil.nextLong` hot paths,
+/// so a per-call `String` would have paid for this screen out of throughput.
+/// The name lookup runs only when the ids already differ, i.e. only on calls
+/// that are about to refuse anyway (or on the one shape that is not a refusal:
+/// two `BigInteger` classes from different loaders).
+fn bi_is_definitely_not_biginteger(
+    ctx: &dyn NativeContext,
+    this: ObjectRef,
+    other: ObjectRef,
+) -> bool {
+    if ctx.class_id_of_object(this) == ctx.class_id_of_object(other) {
+        return false;
+    }
+    matches!(bi_runtime_class_name(ctx, other), Some(n) if n != "java/math/BigInteger")
+}
+
+/// `NullPointerException` for `BigInteger.compareTo(null)`, transcribed.
+///
+/// MEASURED on Temurin OpenJDK 25.0.3+9 (`scratchpad/g10/Bd2Probe.java`):
+///
+/// ```text
+/// BigInteger.ONE.compareTo(null)
+///   !! java.lang.NullPointerException: Cannot read field "signum" because "val" is null
+/// ```
+///
+/// This is HotSpot's helpful-NPE naming `compareTo`'s own parameter, so it is
+/// transcribed and not derived — deriving it would have produced the JDK 8
+/// message (`null`) or a guess at the field.
+fn bi_compare_to_null_npe() -> MethodCallFailed {
+    RuntimeError::NullPointerException {
+        message: Some("Cannot read field \"signum\" because \"val\" is null".to_string()),
+    }
+    .into()
+}
+
 fn native_bi_compare_to(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Int(0))),
     };
+    // `compareTo(null)` used to answer **0** — "these two are equal" — from a
+    // native registered for BOTH the typed and the erased descriptor. That is
+    // fabricated success in the worst place for it: a `TreeMap` or a
+    // `Collections.sort` over a list containing one null silently produced an
+    // ordering instead of throwing. HotSpot NPEs; see `bi_compare_to_null_npe`.
     let other = match args.get(1) {
         Some(Value::Object(Some(o))) => *o,
+        Some(Value::Object(None)) | None => return Err(bi_compare_to_null_npe()),
         _ => return Ok(Some(Value::Int(0))),
     };
+    // The erased `Comparable.compareTo(Object)` bridge is registered by the
+    // same registrar, so a non-`BigInteger` argument reaches here where the
+    // real bridge bytecode would have run `checkcast java/math/BigInteger`
+    // first. Reading a `java.lang.String` through `BigInteger`'s field layout
+    // answered *something* — a comparison result computed out of another
+    // class's slots.
+    //
+    // MEASURED: `((Comparable) BigInteger.ONE).compareTo("1")` !!
+    // `ClassCastException: class java.lang.String cannot be cast to class
+    // java.math.BigInteger (java.lang.String and java.math.BigInteger are in
+    // module java.base of loader 'bootstrap')`. The parenthetical is built by
+    // the VM from the two classes' modules and loaders; that builder lives in
+    // `vm/src/runtime/exceptions.rs` and is not reachable from this crate, so
+    // the message here is the class-correct prefix ONLY. Wrong message text
+    // (class (e)) in place of a fabricated answer (class (b)) — and a
+    // NOMINATION to route it through the canonical builder.
+    if bi_is_definitely_not_biginteger(ctx, this, other) {
+        let name = bi_runtime_class_name(ctx, other)
+            .unwrap_or_else(|| "java/lang/Object".to_string())
+            .replace('/', ".");
+        return Err(RuntimeError::ClassCastException {
+            message: format!("class {name} cannot be cast to class java.math.BigInteger"),
+        }
+        .into());
+    }
     // Word-based limb compare — the decimal path paid two O(words^2)
     // mag->decimal conversions per call, and compareTo is on the hot path of
     // both BC field arithmetic and Lucene's TestUtil.nextLong.
@@ -2573,8 +2903,19 @@ fn native_bi_equals(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     };
     let other = match args.get(1) {
         Some(Value::Object(Some(o))) => *o,
+        // `equals(null)` is `false`, MEASURED. That arm was already right.
         _ => return Ok(Some(Value::Int(0))),
     };
+    // `BigInteger.equals(Object)`'s first line is
+    // `if (!(x instanceof BigInteger xInt)) return false;`
+    // (`BigInteger.java:3806`). This body had no such line: it read ANY
+    // argument through `BigInteger`'s `signum`+`mag` slots, so
+    // `BigInteger.ONE.equals("1")` compared a `String`'s field slots against a
+    // magnitude and answered whatever they happened to hold. MEASURED:
+    // `ONE.equals("1")` = false, `ONE.equals(Integer.valueOf(1))` = false.
+    if bi_is_definitely_not_biginteger(ctx, this, other) {
+        return Ok(Some(Value::Int(0)));
+    }
     // BigInt is normalized (no trailing zero limbs, canonical zero), so
     // structural equality is value equality.
     let a = bi_read_int(ctx, this);
@@ -3683,7 +4024,22 @@ fn native_bd_init_bigint(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     let bi_obj = match args.get(1) {
         Some(Value::Object(Some(o))) => *o,
         _ => {
-            return Err(RuntimeError::NullPointerException { message: None }.into());
+            // MEASURED on Temurin OpenJDK 25.0.3+9 (`scratchpad/g10/BdProbe.java`):
+            //
+            //     new BigDecimal((BigInteger) null)
+            //       !! NullPointerException: Cannot invoke "Object.getClass()" because "val" is null
+            //
+            // The message is HotSpot's helpful-NPE naming the real ctor's own
+            // parameter and the first thing it dereferences (`compactValFor`'s
+            // `val.getClass()`), so it is transcribed, not derived. This arm
+            // threw a message-less NPE, which is the right exception with the
+            // wrong text.
+            return Err(RuntimeError::NullPointerException {
+                message: Some(
+                    "Cannot invoke \"Object.getClass()\" because \"val\" is null".to_string(),
+                ),
+            }
+            .into());
         }
     };
     let v = bi_read_int(ctx, bi_obj);
@@ -3952,13 +4308,94 @@ fn native_bd_multiply(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
     };
-    // Exact: result scale = sa + sb; multiply the unscaled integers directly.
+    // Exact: result scale = checkScale(sa + sb); multiply the unscaled
+    // integers directly. `sa + sb` used to be a bare `i32` addition of two
+    // caller-chosen scales — see `bd_product_scale`.
     let (ua, sa) = bd_unscaled_bigint(ctx, this);
     let (ub, sb) = bd_unscaled_bigint(ctx, other);
-    let s = sa + sb;
+    let s = bd_product_scale(&ua, sa, sb)?;
     let prod = ua.mul(&ub);
     let result = bd_alloc_bigint(ctx, &prod, s);
     Ok(Some(Value::Object(Some(result?))))
+}
+
+/// `multiply`'s product scale — `this.checkScale((long) scale + multiplicand.scale)`,
+/// JDK 25 `BigDecimal.multiply` (`BigDecimal.java:1655`) through `checkScale`
+/// (`BigDecimal.java:4568-4578`).
+///
+/// # The addition has to happen in an `i64`, and the RECEIVER decides the refusal
+///
+/// `native_bd_multiply` computed `sa + sb` in `i32`. Both are caller-chosen
+/// `BigDecimal` scales, so `bd(1,MAX).multiply(bd(1,1))` **overflowed**: a
+/// panic in a debug build — and a Rust panic in a native is not a Java
+/// throwable, it takes the VM down where HotSpot throws — and a silent wrap in
+/// release, which then wrote a *negative* scale into the result and rendered
+/// 2 GB of trailing zeros the first time anything printed it.
+///
+/// `checkScale` refuses only when the RECEIVER is non-zero:
+///
+/// ```java
+///     int asInt = (int)val;
+///     if (asInt != val) {
+///         asInt = val > Integer.MAX_VALUE ? Integer.MAX_VALUE : Integer.MIN_VALUE;
+///         BigInteger b;
+///         if (intCompact != 0 && ((b = intVal) == null || b.signum() != 0))
+///             throw new ArithmeticException(asInt > 0 ? "Underflow" : "Overflow");
+///     }
+///     return asInt;
+/// ```
+///
+/// A zero receiver clamps to `Integer.MAX_VALUE`/`MIN_VALUE` and answers. This
+/// is the same "the zero operand is exempt" shape F31-1 found for `add`, with
+/// one difference that has to be transcribed rather than derived: it is the
+/// **receiver**'s zeroness, not the product's. `bd(1,MAX).multiply(bd(0,MAX))`
+/// throws even though the product is zero.
+///
+/// # MEASURED — `scratchpad/g10/Bd2Probe.java`, Temurin OpenJDK 25.0.3+9
+///
+/// ```text
+/// bd(1,MAX).multiply(bd(1,MAX))    !! ArithmeticException: Underflow
+/// bd(1,MAX).multiply(bd(1,1))      !! ArithmeticException: Underflow
+/// bd(1,MAX).multiply(bd(0,MAX))    !! ArithmeticException: Underflow
+/// bd(0,MAX).multiply(bd(1,MAX))     = unscaled=0 scale=2147483647
+/// bd(0,MAX).multiply(bd(0,MAX))     = unscaled=0 scale=2147483647
+/// bd(1,MAX).multiply(bd(1,0))       = unscaled=1 scale=2147483647
+/// bd(1,MIN).multiply(bd(1,MIN))    !! ArithmeticException: Overflow
+/// bd(1,MIN).multiply(bd(1,-1))     !! ArithmeticException: Overflow
+/// bd(0,MIN).multiply(bd(1,MIN))     = unscaled=0 scale=-2147483648
+/// bd(1,MAX).multiply(bd(1,MIN))     = unscaled=1 scale=-1
+/// bd(1,2^30).multiply(bd(1,2^30))  !! ArithmeticException: Underflow
+/// bd(0,2^30).multiply(bd(1,2^30))   = unscaled=0 scale=2147483647
+/// ```
+///
+/// The two words are NOT interchangeable and neither is the sign: a sum past
+/// `Integer.MAX_VALUE` is `"Underflow"` (the *value* underflows as the scale
+/// grows) and a sum past `Integer.MIN_VALUE` is `"Overflow"`.
+fn bd_product_scale(
+    receiver_unscaled: &crate::bigint::BigInt,
+    sa: i32,
+    sb: i32,
+) -> Result<i32, MethodCallFailed> {
+    let sum = i64::from(sa) + i64::from(sb);
+    if sum >= i64::from(i32::MIN) && sum <= i64::from(i32::MAX) {
+        return Ok(sum as i32);
+    }
+    if receiver_unscaled.is_zero() {
+        // `checkScale` clamps and returns; only a non-zero receiver throws.
+        return Ok(if sum > i64::from(i32::MAX) {
+            i32::MAX
+        } else {
+            i32::MIN
+        });
+    }
+    if sum > i64::from(i32::MAX) {
+        Err(bd_underflow())
+    } else {
+        Err(RuntimeError::ArithmeticException {
+            message: "Overflow".to_string(),
+        }
+        .into())
+    }
 }
 
 fn native_bd_divide(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -4384,13 +4821,127 @@ fn native_bd_to_big_integer(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     Ok(Some(Value::Object(Some(obj?))))
 }
 
+/// `(unscaled, scale)` as a `f64` — **without rendering the value**.
+///
+/// # This closes F31-1 §10's first residual, on the one caller that ships
+///
+/// `native_bd_double_value` was `bd_read_unchecked(ctx, this).parse()`.
+/// `bd_read_unchecked` is `apply_scale`, which for a negative scale appends
+/// `scale.unsigned_abs()` literal `'0'` characters: `bd(1, Integer.MIN_VALUE)`
+/// asked for a 2_147_483_649-byte `String` from one ordinary
+/// `doubleValue()` call and then handed it to a decimal parser. HotSpot answers
+/// that same call `Infinity` in 0 ms — it never renders anything
+/// (`BigDecimal.doubleValue`, `BigDecimal.java:3600-3641`). So this cannot be
+/// closed by refusing; it closes by not rendering, and the rendering that
+/// remains here is bounded by the OPERAND's digit count, never by the argument.
+///
+/// # Why a string round-trip at all, and why it is exact
+///
+/// `unscaled × 10^-scale` = `0.<digits> × 10^(len(digits) - scale)`, so the
+/// decimal handed to the parser is the exact value and Rust's `f64` parser is
+/// correctly rounded — the same round-to-nearest-even
+/// `Double.parseDouble(this.toString())` performs on the JDK's own fall-through
+/// path. The two clamps below exist only so the exponent handed to the parser
+/// cannot be `-i64::from(i32::MIN)`-shaped: they are *proved*, not tuned.
+/// `adjusted` is the decimal exponent of the leading digit.
+///
+/// * `adjusted >= 309` ⇒ `|v| >= 10^309 > f64::MAX (1.797e308)` ⇒ `±Infinity`.
+/// * `adjusted <= -325` ⇒ `|v| < 10^-324 < 2.47e-324`, half of the smallest
+///   subnormal (`4.9e-324`) ⇒ `±0.0`.
+///
+/// Everything in between leaves the parser an exponent in `-324..=309`.
+///
+/// # MEASURED — `scratchpad/g10/Bd2Probe.java`, Temurin OpenJDK 25.0.3+9
+///
+/// ```text
+/// bd(1,MIN)   = Infinity      bd(-1,MIN)  = -Infinity     bd(0,MIN)  = 0.0
+/// bd(1,-309)  = Infinity      bd(1,-308)  = 1.0E308       bd(15,-308) = Infinity
+/// bd(1,MAX)   = 0.0           bd(-1,MAX)  = -0.0          bd(0,MAX)  = 0.0
+/// bd(1,323)   = 9.9E-324      bd(1,324)   = 0.0           bd(-1,324) = -0.0
+/// bd(15,324)  = 1.5E-323      bd(49,326)  = 0.0           bd(1,325)  = 0.0
+/// bd(17976931348623157,-292) = 1.7976931348623157E308
+/// bd(17976931348623159,-292) = Infinity
+/// bd(9007199254740993,0)     = 9.007199254740992E15   (round-to-even, not truncation)
+/// ```
+///
+/// The `bd(1,323)` / `bd(1,324)` pair is the one that pins the low clamp at
+/// `-325` and not `-324`: `1E-324` still rounds to zero, but the *bound* has to
+/// admit it so that `bd(15,324)` (same `adjusted`, different answer) is
+/// computed rather than clamped.
+fn bd_to_f64(u: &crate::bigint::BigInt, scale: i32) -> f64 {
+    if u.is_zero() {
+        // MEASURED: every `bd(0, s)` is `0.0`, never `-0.0`, at every scale.
+        return 0.0;
+    }
+    let dec = u.to_decimal();
+    let (neg, digits) = match dec.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, dec.as_str()),
+    };
+    // `i64::from(scale)`, never `-scale`: `-i32::MIN` is the shape this whole
+    // family exists to remove.
+    let e10 = digits.len() as i64 - i64::from(scale); // v = 0.<digits> * 10^e10
+    let adjusted = e10 - 1; // decimal exponent of the leading digit
+    if adjusted >= 309 {
+        return if neg {
+            f64::NEG_INFINITY
+        } else {
+            f64::INFINITY
+        };
+    }
+    if adjusted <= -325 {
+        return if neg { -0.0 } else { 0.0 };
+    }
+    let sign = if neg { "-" } else { "" };
+    let text = format!("{sign}0.{digits}E{e10}");
+    text.parse::<f64>().unwrap_or(0.0)
+}
+
+/// The same value as an `f32`, parsed at `f32` precision rather than rounded
+/// twice through an `f64` — `BigDecimal.floatValue()`'s general road is
+/// `Float.parseFloat(this.toString())` (`BigDecimal.java:3573-3597`), and
+/// double rounding is observable.
+///
+/// The clamps are `f32`'s: `f32::MAX` is `3.4e38` so `adjusted >= 39` is
+/// `±Infinity`, and the smallest subnormal is `1.4e-45` so `adjusted <= -46`
+/// is `±0.0`.
+///
+/// MEASURED — `bd(1,-308).floatValue() = Infinity` while its `doubleValue()` is
+/// `1.0E308`; `bd(-1,308).floatValue() = -0.0`; `bd(9007199254740993,1)` is
+/// `9.0071994E14` as a float and `9.007199254740992E14` as a double.
+fn bd_to_f32(u: &crate::bigint::BigInt, scale: i32) -> f32 {
+    if u.is_zero() {
+        return 0.0;
+    }
+    let dec = u.to_decimal();
+    let (neg, digits) = match dec.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, dec.as_str()),
+    };
+    let e10 = digits.len() as i64 - i64::from(scale);
+    let adjusted = e10 - 1;
+    if adjusted >= 39 {
+        return if neg {
+            f32::NEG_INFINITY
+        } else {
+            f32::INFINITY
+        };
+    }
+    if adjusted <= -46 {
+        return if neg { -0.0 } else { 0.0 };
+    }
+    let sign = if neg { "-" } else { "" };
+    let text = format!("{sign}0.{digits}E{e10}");
+    text.parse::<f32>().unwrap_or(0.0)
+}
+
 fn native_bd_double_value(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Double(0.0))),
     };
-    let v: f64 = bd_read_unchecked(ctx, this).parse().unwrap_or(0.0);
-    Ok(Some(Value::Double(v)))
+    let (u, scale) = bd_unscaled_bigint(ctx, this);
+    Ok(Some(Value::Double(bd_to_f64(&u, scale))))
 }
 
 fn native_bd_float_value(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -4398,8 +4949,8 @@ fn native_bd_float_value(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Float(0.0))),
     };
-    let v: f64 = bd_read_unchecked(ctx, this).parse().unwrap_or(0.0);
-    Ok(Some(Value::Float(v as f32)))
+    let (u, scale) = bd_unscaled_bigint(ctx, this);
+    Ok(Some(Value::Float(bd_to_f32(&u, scale))))
 }
 
 fn native_bd_scale(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
