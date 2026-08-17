@@ -15038,6 +15038,70 @@ pub(crate) mod tests {
         );
     }
 
+    /// **A card works for an object in the LARGE-OBJECT region, above the
+    /// logical grid.**
+    ///
+    /// # Why this is not covered by the other tests
+    ///
+    /// The remembered set is keyed by *logical page*, and the logical grid is
+    /// defined over the small-object region only. A large object lives above it,
+    /// so `(addr - base) / Z_LOGICAL_PAGE_BYTES` is a page index the grid does
+    /// not have. That is deliberate and it works because the arithmetic is exact
+    /// — `base + page * PAGE + offset == addr` for **every** arena address — so
+    /// the grid is conceptual here rather than a bound, and `young_extra_roots`
+    /// reconstructs the same address from the same division.
+    ///
+    /// It is worth a test because the alternative failure is silent: a
+    /// `byte[]`-backed structure or a large `Object[]` holding the only reference
+    /// to a young object is exactly the shape a collection library produces, and
+    /// an off-by-one in that arithmetic would card the wrong address and free the
+    /// target with the reference left in place.
+    #[test]
+    fn a_large_object_above_the_grid_is_carded_and_keeps_its_young_target() {
+        let heap = gen_heap_for_test(64 * 1024 * 1024);
+        // Big enough to be served from the high region rather than the low bump
+        // area: `Z_LOGICAL_PAGE_BYTES` is 2 MiB, so a 4 MiB array cannot sit
+        // inside one logical page.
+        let big = heap.alloc_array(ClassId::new(0), ArrayElementType::Reference, 600_000);
+        let mut roots = [big];
+        let _ = gen_collect(&heap, &mut roots);
+        let big = roots[0];
+        assert!(
+            heap.header_ref(big.as_ptr()).gc_age() >= 1,
+            "the array must be old for a card to be wanted"
+        );
+
+        let young = heap.alloc_object(ClassId::new(77), 1);
+        let young_addr = young.as_ptr() as usize;
+        heap.set_field(young, 0, Value::Object(Some(young))); // self-tag
+        heap.set_array_element(big, 123_456, Value::Object(Some(young)))
+            .expect("in bounds");
+        assert!(
+            heap.is_carded_for_test(big.as_ptr() as usize),
+            "the store accessor must card a receiver above the logical grid too"
+        );
+
+        let mut roots = [big];
+        let _ = gen_collect(&heap, &mut roots);
+        assert_eq!(heap.generational_stats().0, 1, "that was a minor");
+        assert!(
+            heap.is_object_address(young_addr).is_some(),
+            "an object held only by an OLD element of a large array must survive \
+             a young cycle"
+        );
+        assert_eq!(
+            heap.get_field(gen_ref(young_addr), 0),
+            Value::Object(Some(gen_ref(young_addr))),
+            "and its bytes must be intact -- a freed-then-zeroed object still \
+             looks plausible to a stale reference"
+        );
+        assert_eq!(
+            heap.get_array_element(roots[0], 123_456),
+            Ok(Value::Object(Some(gen_ref(young_addr)))),
+            "and the array still names it"
+        );
+    }
+
     /// **A card whose target is OLD is dropped, and the target survives
     /// anyway.**
     ///
