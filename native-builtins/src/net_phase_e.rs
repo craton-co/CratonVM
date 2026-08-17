@@ -10002,15 +10002,49 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
                 "java/net/HttpURLConnection"
             };
             let conn = try_alloc_concurrent_synthetic(ctx, carrier, 16)?;
-            // Field HUC_URL holds the originating URL so `huc_url_string`
-            // and `getInputStream` can recover its external form.
-            ctx.set_field(conn, HUC_URL, Value::Object(Some(this)));
+            // BY NAME, NOT BY SLOT — and this is not a style preference.
+            //
+            // Both carriers selected above are REAL JDK classes with the
+            // JDK's own field layout, and this file's `HUC_*` constants are a
+            // synthetic map that does not match it. MEASURED at `e7e840264`
+            // on `RSslLiveSession`, with `CRATONVM_DBG_COERCION=1` naming
+            // this closure as the writer and `CRATONVM_DBG_LAYOUT=1`
+            // resolving the class (`cid=735 ... refs=7 fields=20`, which is
+            // exactly `javap`'s flattened instance-field list):
+            //
+            // ```text
+            //  slot  this file meant   the real field it hit        outcome
+            //  ----  ---------------   --------------------------  --------------------
+            //   0    HUC_URL           URLConnection.url      (L)   right by luck
+            //   1    HUC_METHOD        URLConnection.doInput  (Z)   String -> DESTROYED
+            //   7    HUC_DO_INPUT      URLConnection.connectTimeout (I)  silently = 1ms
+            //   9    HUC_CONNECTED     URLConnection.requests (L)   Int -> DESTROYED, null
+            // ```
+            //
+            // The guard fired on two of the four and said nothing about the
+            // other two, because `connectTimeout` is an `I` and takes an
+            // `Int(1)` without complaint. So the visible half was a warning
+            // and the invisible half was a 1-millisecond connect timeout on
+            // every connection this path hands out.
+            //
+            // `sun.net.www.MessageHeader requests` is the field that holds
+            // every request header the JDK's own code path would send, and it
+            // was being set to null on construction.
+            //
+            // Writing by name asks the class where its field is, so the four
+            // values land where they mean something: this is also the ONLY
+            // reason `HUC_URL` looked correct — `url` genuinely is slot 0.
+            // See `http_url_connection.rs`, which states the same rule for
+            // itself ("never write synthetic slots (they alias real fields on
+            // a real-JDK object)") and keeps its state in an identity-keyed
+            // side table.
+            ctx.set_field_by_name(conn, "url", Value::Object(Some(this)));
             // Default request method "GET" so `huc_perform` doesn't trip
             // on a missing method when the http(s) path is exercised.
             let m = ctx.create_string("GET");
-            ctx.set_field(conn, HUC_METHOD, Value::Object(Some(m)));
-            ctx.set_field(conn, HUC_DO_INPUT, Value::Int(1));
-            ctx.set_field(conn, HUC_CONNECTED, Value::Int(0));
+            ctx.set_field_by_name(conn, "method", Value::Object(Some(m)));
+            ctx.set_field_by_name(conn, "doInput", Value::Int(1));
+            ctx.set_field_by_name(conn, "connected", Value::Int(0));
             Ok(Some(Value::Object(Some(conn))))
         },
     );
@@ -20382,6 +20416,68 @@ mod tests {
         assert_eq!(
             second.session_root, 0,
             "a new handshake must not hand out the previous handshake's SSLSession"
+        );
+    }
+
+    /// SOURCE WITNESS — the real-JDK carriers must be initialised BY NAME.
+    ///
+    /// `URL.openConnection()` hands back an instance of a real JDK class
+    /// (`HttpsURLConnectionImpl`, or the abstract `java/net/HttpURLConnection`),
+    /// and this file's `HUC_*` constants are a synthetic slot map that does not
+    /// match the JDK's layout. Four indexed writes landed on `url`, `doInput`,
+    /// `connectTimeout` and `requests`; the coercion guard caught two of them
+    /// and the other two were silent, because an `Int(1)` into `connectTimeout`
+    /// is a perfectly well-typed 1-millisecond timeout.
+    ///
+    /// This cannot be asserted behaviourally here: the mock context has no
+    /// real class layout, so an indexed write and a by-name write are the same
+    /// operation to it — which is exactly why the bug survived a full unit
+    /// suite. The witness is against the source, deliberately, and it is
+    /// scoped to the carrier branch rather than the whole file: the `jrt:`
+    /// carrier a few lines above IS a CratonVM synthetic with 16 slots of our
+    /// own, and indexed writes are correct there.
+    #[test]
+    fn the_real_jdk_carriers_are_initialised_by_field_name() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src")
+            .join("net_phase_e.rs");
+        let Ok(src) = std::fs::read_to_string(&path) else {
+            println!("net_phase_e.rs not on disk at {path:?}; witness skipped");
+            return;
+        };
+        let lines: Vec<&str> = src.lines().map(|l| l.trim_end_matches('\r')).collect();
+
+        let anchor = lines
+            .iter()
+            .position(|l| l.contains(r#""sun/net/www/protocol/https/HttpsURLConnectionImpl""#))
+            .expect("the https carrier class must still be named here");
+        let alloc = lines[anchor..]
+            .iter()
+            .position(|l| l.contains("try_alloc_concurrent_synthetic(ctx, carrier"))
+            .map(|i| anchor + i)
+            .expect("the carrier allocation must still follow the class choice");
+        // The initialisation runs until the closure hands the object back.
+        let end = lines[alloc..]
+            .iter()
+            .position(|l| l.contains("Ok(Some(Value::Object(Some(conn))))"))
+            .map(|i| alloc + i)
+            .expect("the carrier must still be returned");
+
+        let indexed: Vec<&&str> = lines[alloc..end]
+            .iter()
+            .filter(|l| l.contains("ctx.set_field(conn,"))
+            .collect();
+        assert!(
+            indexed.is_empty(),
+            "a real-JDK carrier is being written by SLOT INDEX: {indexed:?}. Those              constants are this file's synthetic map and do not match the JDK's field              layout — MEASURED, slot 1 is URLConnection.doInput and slot 9 is              URLConnection.requests. Use ctx.set_field_by_name."
+        );
+        assert!(
+            lines[alloc..end]
+                .iter()
+                .filter(|l| l.contains("ctx.set_field_by_name(conn,"))
+                .count()
+                >= 4,
+            "the four values this carrier needs (url, method, doInput, connected) must              each be written by name"
         );
     }
 
