@@ -15030,10 +15030,12 @@ fn ds_require_open(this: ObjectRef) -> Result<u32, cratonvm_types::error::Method
 
 /// Build the `Set<SocketOption<?>>` for `DatagramSocket.supportedOptions()`.
 ///
-/// Each element is the real `StandardSocketOptions` constant, read out of its
-/// declaring class by name, so the identity a caller compares against
+/// Each element is the real JDK constant, read out of its declaring class by
+/// name, so the identity a caller compares against
 /// (`supportedOptions().contains(SO_RCVBUF)`) is the same object it holds — a
-/// freshly minted look-alike would not be equal.
+/// freshly minted look-alike would not be equal. Two declaring classes:
+/// `java.net.StandardSocketOptions` and, for `IP_DONTFRAGMENT`,
+/// `jdk.net.ExtendedSocketOptions`.
 fn ds_supported_options(ctx: &mut dyn NativeContext) -> MethodCallResult {
     let created = ctx.new_object_initialized("java/util/LinkedHashSet", "()V", &[])?;
     let Some(Value::Object(Some(set))) = created else {
@@ -15044,22 +15046,37 @@ fn ds_supported_options(ctx: &mut dyn NativeContext) -> MethodCallResult {
     // and every one of these constants is assigned in `<clinit>`. Reading them
     // off a resolved-but-uninitialised class returns eight nulls and the set
     // comes back empty.
-    let sso = ctx.ensure_class_initialized("java/net/StandardSocketOptions");
-    if let Ok(sso) = sso {
-        for field in [
-            "SO_SNDBUF",
-            "SO_RCVBUF",
-            "SO_REUSEADDR",
-            "SO_BROADCAST",
-            "IP_TOS",
-            "IP_MULTICAST_IF",
-            "IP_MULTICAST_TTL",
-            "IP_MULTICAST_LOOP",
-        ] {
-            let Some(idx) = ctx.static_field_index_by_name(sso, field) else {
+    // `IP_DONTFRAGMENT` is an EXTENDED option and lives in a different class,
+    // which is exactly why it was the one missing from the first version of
+    // this set: the `setOption`/`getOption` arms above answer it, so leaving
+    // it out broke this function's own invariant — that the advertised set is
+    // the set the pair serves — in the under-advertising direction, the one a
+    // one-way ratchet cannot see. HotSpot 25 lists it too (9 options, not 8).
+    for (class_name, fields) in [
+        (
+            "java/net/StandardSocketOptions",
+            &[
+                "SO_SNDBUF",
+                "SO_RCVBUF",
+                "SO_REUSEADDR",
+                "SO_BROADCAST",
+                "IP_TOS",
+                "IP_MULTICAST_IF",
+                "IP_MULTICAST_TTL",
+                "IP_MULTICAST_LOOP",
+            ][..],
+        ),
+        ("jdk/net/ExtendedSocketOptions", &["IP_DONTFRAGMENT"][..]),
+    ] {
+        // INITIALIZE, do not merely resolve — see above.
+        let Ok(cid) = ctx.ensure_class_initialized(class_name) else {
+            continue;
+        };
+        for field in fields {
+            let Some(idx) = ctx.static_field_index_by_name(cid, field) else {
                 continue;
             };
-            let value = ctx.get_static_field(sso, idx);
+            let value = ctx.get_static_field(cid, idx);
             if let Value::Object(Some(_)) = value {
                 let set_cur = ctx.read_native_pin(pin, set);
                 let _ = ctx.invoke_virtual(set_cur, "add", "(Ljava/lang/Object;)Z", &[value]);
