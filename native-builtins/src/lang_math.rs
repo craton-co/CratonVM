@@ -117,7 +117,9 @@ pub(crate) fn register_math_natives(registry: &mut NativeMethodRegistry, class: 
     // five residuals moved the iteration onto a trajectory that reached an
     // exact fixed point in nine evaluations, the checker reported convergence,
     // and `TooManyEvaluationsException` was never thrown. See
-    // docs/known-issues/commons-math/bug-commonsmath-gaussnewton-testmaxevaluations-no-exception-20260816.md.
+    // bug-commonsmath-gaussnewton-testmaxevaluations-no-exception-20260816-FIXED,
+    // and bug-commonsmath-iterative-numeric-fp-divergence-cluster-20260816-CLOSED
+    // for the per-row census that settles which backing each split row takes.
     let strict = class == "java/lang/StrictMath";
 
     // --- Shared fdlibm rows (left column above): NOT a `Math`-vs-`StrictMath`
@@ -1816,19 +1818,58 @@ pub(crate) fn native_math_pow(_ctx: &mut dyn NativeContext, args: &[Value]) -> M
         Some(Value::Double(v)) => *v,
         _ => 0.0,
     };
-    // HotSpot-style fast path: integer-valued exponent with finite base.
-    // - Gated on a.is_finite() && b.is_finite() so NaN/±infinity edge cases fall through to powf,
-    //   preserving Java/JLS special-value semantics (e.g. pow(NaN, 0) == 1, pow(±0, neg) == ±inf,
-    //   pow(1, ±inf) == NaN per JLS, etc.).
-    // - b.fract() == 0.0 ensures b is an exact integer (also false for NaN, but we already gated that).
-    // - |b| < 64 keeps powi cheap and avoids producing values that overflow to ±inf when powf
-    //   would have given a finite (but huge) result via continuous exponentiation.
-    // - Negative bases with integer exponents are fine: powi does repeated multiplication, which
-    //   matches Java's result for integer-valued b. Only fractional b on negative a yields NaN in
-    //   Java, and we route those through powf.
-    if a.is_finite() && b.is_finite() && b.fract() == 0.0 && b.abs() < 64.0 {
-        let bi = b as i32;
-        return Ok(Some(Value::Double(a.powi(bi))));
+    // The two rows where C99 `pow` is NOT `java.lang.Math.pow`. C returns 1.0
+    // for `pow(1, y)` at every `y`, NaN included; the JLS makes the second
+    // argument dominant — "if the second argument is NaN, then the result is
+    // NaN", and "if the absolute value of the first argument equals 1 and the
+    // second argument is infinite, then the result is NaN". `f64::powf` is the
+    // C rule, so those five inputs (`pow(±1, NaN)`, `pow(±1, ±inf)`) came back
+    // as 1.0 where HotSpot returns NaN. `b == 0.0` is excluded because zero is
+    // neither NaN nor infinite and `powf(x, 0)` is already 1.0 for every `x`.
+    if b.is_nan() || (b.is_infinite() && a.abs() == 1.0) {
+        return Ok(Some(Value::Double(f64::NAN)));
+    }
+    // Integer-exponent fast path, restricted to the four exponents where it is
+    // EXACT.
+    //
+    // This used to run `a.powi(b as i32)` for every integer `b` with
+    // `|b| < 64`, described as a "HotSpot-style fast path". HotSpot has no such
+    // path — its `_dpow` intrinsic is the general Intel LIBM algorithm at every
+    // exponent — and `powi` is repeated squaring, which rounds once per
+    // multiply. `java.lang.Math.pow` is specified to be "within 1 ulp of the
+    // exact result"; measured against a HotSpot JDK 25 oracle over 1040 bases
+    // per exponent, `powi` was outside that from `b = 3` upward and the error
+    // grew with the exponent:
+    //
+    // | exponent | disagrees | max ULP |
+    // | ---      | ---       | ---     |
+    // | ±1, 0, 2 | 0/1040    | 0       |
+    // | 3        | 273/1040  | 1       |
+    // | 8        | 783/1040  | 4       |
+    // | 17       | 900/1040  | 9       |
+    // | 31       | 980/1040  | 20      |
+    // | 62       | 1008/1040 | 40      |
+    // | ≥64      | 0/1040    | 0       |
+    //
+    // — 24026 of 35360 sampled `|b| < 64` inputs wrong, against 1 of 6240 for
+    // the `powf` path just outside it. The exponents kept below are the ones
+    // that round exactly once, so each is the correctly-rounded power and each
+    // measured 0/1040: `x^0` is 1, `x^1` is `x`, `x^2` is a single multiply of
+    // the exact product, and `x^-1` is a single divide. `x^-2` is NOT in the
+    // list — `1/(x*x)` rounds twice and missed on 299 of 1040.
+    if a.is_finite() && b.is_finite() && b.fract() == 0.0 {
+        if b == 0.0 {
+            return Ok(Some(Value::Double(1.0)));
+        }
+        if b == 1.0 {
+            return Ok(Some(Value::Double(a)));
+        }
+        if b == 2.0 {
+            return Ok(Some(Value::Double(a * a)));
+        }
+        if b == -1.0 {
+            return Ok(Some(Value::Double(1.0 / a)));
+        }
     }
     Ok(Some(Value::Double(a.powf(b))))
 }
@@ -5188,6 +5229,270 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// The other direction of the same rule: the rows HotSpot DOES intrinsify
+    /// must stay split, `StrictMath` on fdlibm and `Math` on platform libm.
+    ///
+    /// `math_and_strictmath_agree_on_non_intrinsified_rows` is a one-way
+    /// ratchet — it fails when a shared row is split, and is blind to a split
+    /// row being merged. Merging is the cheaper-looking edit ("why do we carry
+    /// two bodies for `sin`?") and it is the one that costs accuracy, because
+    /// for every row below fdlibm is measurably FURTHER from HotSpot's answer
+    /// than the host libm is. Against a HotSpot JDK 25 oracle of 5400 sampled
+    /// inputs per function (`Math.f` on a stock JVM, so the Intel LIBM
+    /// intrinsic answer):
+    ///
+    /// | row     | libm disagrees | fdlibm disagrees |
+    /// | ---     | ---            | ---              |
+    /// | `sin`   | 9              | 134              |
+    /// | `cos`   | 9              | 137              |
+    /// | `tan`   | 20             | 158              |
+    /// | `exp`   | 4              | 181              |
+    /// | `log`   | 0              | 78               |
+    /// | `log10` | 116            | 125              |
+    /// | `cbrt`  | 11             | 435              |
+    /// | `pow`   | 1              | 89               |
+    ///
+    /// all at 1 ULP. Re-run the same oracle with
+    /// `-XX:+UnlockDiagnosticVMOptions -XX:DisableIntrinsic=_dsin,_dcos,_dtan,`
+    /// `_dexp,_dlog,_dlog10,_dpow,_dcbrt,_dtanh` — which makes HotSpot run the
+    /// Java `StrictMath` bodies — and the right column becomes 0/5400 on every
+    /// row while the left one becomes the larger. That is the whole story of
+    /// this split: the port is exact against fdlibm, HotSpot's `Math` is not
+    /// fdlibm, and libm is the closer of the two approximations to it.
+    ///
+    /// Asserted against the Rust helpers rather than against pinned result
+    /// bits, because the `Math` column IS the host's libm and its value is a
+    /// platform fact — pinning glibc's answer would fail on Windows for a
+    /// reason that is not a defect.
+    #[test]
+    fn math_and_strictmath_stay_split_on_intrinsified_rows() {
+        let mut math = NativeMethodRegistry::new();
+        register_math_natives(&mut math, "java/lang/Math");
+        let mut strict = NativeMethodRegistry::new();
+        register_math_natives(&mut strict, "java/lang/StrictMath");
+        let mut ctx = mock_ctx();
+
+        let samples = [
+            0.1_f64, -0.1, 0.5, 0.75, 0.9999, 1.0, 2.5, 3.25, 17.0, 1e-8, 1e8,
+        ];
+
+        let call1 = |reg: &NativeMethodRegistry,
+                     ctx: &mut MockNativeContext,
+                     class: &str,
+                     name: &str,
+                     x: f64|
+         -> u64 {
+            let cb = reg
+                .find(class, name, "(D)D")
+                .unwrap_or_else(|| panic!("{class}.{name} not registered"));
+            match cb(ctx, &[Value::Double(x)]) {
+                Ok(Some(Value::Double(v))) => v.to_bits(),
+                other => panic!("{class}.{name} returned {other:?}"),
+            }
+        };
+
+        // `tanh` is deliberately absent: glibc's `tanh` IS the fdlibm body, so
+        // on Linux the two backings coincide bit-for-bit and there is nothing
+        // to distinguish. It stays split in `register_math_natives` for the
+        // platforms where that coincidence does not hold.
+        let unary: [(&str, fn(f64) -> f64, fn(f64) -> f64); 8] = [
+            ("sin", |x| x.sin(), cratonvm_types::fdlibm::sin),
+            ("cos", |x| x.cos(), cratonvm_types::fdlibm::cos),
+            ("tan", |x| x.tan(), cratonvm_types::fdlibm::tan),
+            ("exp", |x| x.exp(), cratonvm_types::fdlibm::exp),
+            ("log", |x| x.ln(), cratonvm_types::fdlibm::log),
+            ("log10", |x| x.log10(), cratonvm_types::fdlibm::log10),
+            ("cbrt", |x| x.cbrt(), cratonvm_types::fdlibm::cbrt),
+            ("tanh", |x| x.tanh(), cratonvm_types::fdlibm::tanh),
+        ];
+        for (name, libm, fd) in unary {
+            for &x in &samples {
+                assert_eq!(
+                    call1(&math, &mut ctx, "java/lang/Math", name, x),
+                    libm(x).to_bits(),
+                    "Math.{name}({x}) is not the host libm — the split collapsed"
+                );
+                assert_eq!(
+                    call1(&strict, &mut ctx, "java/lang/StrictMath", name, x),
+                    fd(x).to_bits(),
+                    "StrictMath.{name}({x}) is not fdlibm — the strict contract broke"
+                );
+            }
+        }
+
+        let math_pow = math.find("java/lang/Math", "pow", "(DD)D").unwrap();
+        let strict_pow = strict.find("java/lang/StrictMath", "pow", "(DD)D").unwrap();
+        let call2 = |cb: cratonvm_native_api::NativeCallback,
+                     ctx: &mut MockNativeContext,
+                     x: f64,
+                     y: f64|
+         -> u64 {
+            match cb(ctx, &[Value::Double(x), Value::Double(y)]) {
+                Ok(Some(Value::Double(v))) => v.to_bits(),
+                other => panic!("pow returned {other:?}"),
+            }
+        };
+        for &x in &samples {
+            for &y in &samples {
+                // `native_math_pow` keeps four exact integer-exponent shortcuts
+                // (`x^0`, `x^1`, `x^2`, `x^-1`); those are not libm calls and
+                // are covered by `math_pow_at_integer_exponents_is_within_one_ulp`.
+                if y == 0.0 || y == 1.0 || y == 2.0 || y == -1.0 {
+                    continue;
+                }
+                assert_eq!(
+                    call2(math_pow, &mut ctx, x, y),
+                    x.powf(y).to_bits(),
+                    "Math.pow({x}, {y}) is not the host libm — the split collapsed"
+                );
+                assert_eq!(
+                    call2(strict_pow, &mut ctx, x, y),
+                    cratonvm_types::fdlibm::pow(x, y).to_bits(),
+                    "StrictMath.pow({x}, {y}) is not fdlibm — the strict contract broke"
+                );
+            }
+        }
+    }
+
+    /// ULP distance between two `f64`s, NaNs equal, mixed infinities far apart.
+    fn ulps_apart(a: f64, b: f64) -> u64 {
+        if a == b {
+            return 0;
+        }
+        if a.is_nan() || b.is_nan() {
+            return if a.is_nan() && b.is_nan() { 0 } else { u64::MAX };
+        }
+        if a.is_infinite() || b.is_infinite() {
+            return u64::MAX;
+        }
+        let ord = |x: f64| {
+            let bits = x.to_bits() as i64;
+            if bits < 0 {
+                i64::MIN.wrapping_sub(bits)
+            } else {
+                bits
+            }
+        };
+        ord(a).wrapping_sub(ord(b)).unsigned_abs()
+    }
+
+    /// `Math.pow` at a whole-number exponent must still be within the 1 ULP
+    /// `java.lang.Math` promises.
+    ///
+    /// It was not. `native_math_pow` carried an integer-exponent fast path,
+    /// `a.powi(b as i32)` for every `|b| < 64`, labelled "HotSpot-style" —
+    /// HotSpot has no such path. `powi` is repeated squaring and rounds once
+    /// per multiply, so the error grew with the exponent: 1 ULP at `b = 3`,
+    /// 9 at 17, **40 at 62**, on 24026 of 35360 sampled inputs. The fast path
+    /// covered exactly the exponents real numeric code uses —
+    /// commons-math's `TestFunction.SUM_POW` is `Math.pow(abs(x), i + 2)` and
+    /// `PERM` is `Math.pow(j + 1, i + 1)` — while the general `Math` census,
+    /// which draws both operands at random and so essentially never produces a
+    /// whole-number exponent, reported `pow` as 1 disagreement in 5400 and hid
+    /// it completely.
+    ///
+    /// The bound is asserted against `fdlibm::pow` rather than against captured
+    /// libm bits because `Math.pow` IS the host libm here and its exact value
+    /// is a platform fact; the ULP *distance* is not.
+    #[test]
+    fn math_pow_at_integer_exponents_is_within_one_ulp() {
+        let mut math = NativeMethodRegistry::new();
+        register_math_natives(&mut math, "java/lang/Math");
+        let cb = math.find("java/lang/Math", "pow", "(DD)D").unwrap();
+        let mut ctx = mock_ctx();
+        let mut call = |x: f64, y: f64| -> f64 {
+            match cb(&mut ctx, &[Value::Double(x), Value::Double(y)]) {
+                Ok(Some(Value::Double(v))) => v,
+                other => panic!("Math.pow returned {other:?}"),
+            }
+        };
+
+        // Captured from Temurin JDK 25 — `Math.pow` and `StrictMath.pow` return
+        // the same bits at these three, so they pin a platform-independent fact.
+        let base = f64::from_bits(0x3fdf_9400_6b2b_4f00); // 0.49340830293407123
+        for (exp, want) in [
+            (3.0_f64, 0x3fbe_c041_eae6_1253_u64),
+            (24.0, 0x3e67_4582_5a70_10ec),
+            (62.0, 0x3bfc_1bcf_c1c7_7a64),
+        ] {
+            assert_eq!(
+                call(base, exp).to_bits(),
+                want,
+                "Math.pow(0.49340830293407123, {exp})"
+            );
+        }
+
+        // And the rule itself, across the whole range the fast path used to own.
+        let bases = [
+            0.5_f64, 0.9, 1.5, 2.0, 3.7, 7.25, -0.5, -1.5, -3.7, 0.49340830293407123,
+            1.0000001, 0.9999999,
+        ];
+        for &x in &bases {
+            for e in -63..=63_i32 {
+                let y = f64::from(e);
+                let got = call(x, y);
+                let want = cratonvm_types::fdlibm::pow(x, y);
+                if !got.is_finite() || !want.is_finite() {
+                    continue; // overflow to infinity is not a rounding question
+                }
+                let d = ulps_apart(got, want);
+                assert!(
+                    d <= 1,
+                    "Math.pow({x}, {y}) = {got:e} is {d} ULP from {want:e}; \
+                     java.lang.Math promises 1"
+                );
+            }
+        }
+    }
+
+    /// `java.lang.Math.pow` is not C99 `pow` when the base is ±1.
+    ///
+    /// C returns 1.0 for `pow(1, y)` at every `y` — NaN and infinity included —
+    /// and `f64::powf` is the C rule. The JLS makes the exponent dominant
+    /// there: NaN exponent gives NaN, and an infinite exponent on a base of
+    /// absolute value 1 gives NaN. All five rows below returned `1.0` before
+    /// this was gated, against HotSpot's NaN.
+    ///
+    /// The old body's own comment claimed these "fall through to powf,
+    /// preserving Java/JLS special-value semantics (… `pow(1, ±inf) == NaN` per
+    /// JLS …)". Falling through to `powf` is precisely what produced the C
+    /// answer; the comment stated the rule the code did not implement.
+    #[test]
+    fn math_pow_follows_the_jls_not_c99_when_the_base_is_one() {
+        let mut math = NativeMethodRegistry::new();
+        register_math_natives(&mut math, "java/lang/Math");
+        let cb = math.find("java/lang/Math", "pow", "(DD)D").unwrap();
+        let mut ctx = mock_ctx();
+        let mut call = |x: f64, y: f64| -> f64 {
+            match cb(&mut ctx, &[Value::Double(x), Value::Double(y)]) {
+                Ok(Some(Value::Double(v))) => v,
+                other => panic!("Math.pow returned {other:?}"),
+            }
+        };
+
+        for (x, y) in [
+            (1.0_f64, f64::NAN),
+            (1.0, f64::INFINITY),
+            (1.0, f64::NEG_INFINITY),
+            (-1.0, f64::INFINITY),
+            (-1.0, f64::NEG_INFINITY),
+        ] {
+            let v = call(x, y);
+            assert!(v.is_nan(), "Math.pow({x}, {y}) = {v}, expected NaN");
+            // HotSpot hands back the canonical positive NaN here, and so must we
+            // — `Double.doubleToRawLongBits` on the result is observable.
+            assert_eq!(v.to_bits(), 0x7ff8_0000_0000_0000, "Math.pow({x}, {y}) NaN payload");
+        }
+
+        // The neighbours that must NOT be swept up: a zero exponent wins over a
+        // NaN base, and a NaN base with a non-zero exponent is still NaN.
+        assert_eq!(call(f64::NAN, 0.0).to_bits(), 1.0_f64.to_bits());
+        assert_eq!(call(f64::NAN, -0.0).to_bits(), 1.0_f64.to_bits());
+        assert!(call(f64::NAN, 1.0).is_nan());
+        assert_eq!(call(f64::INFINITY, 0.0).to_bits(), 1.0_f64.to_bits());
+        assert_eq!(call(1.0, 0.0).to_bits(), 1.0_f64.to_bits());
     }
 
     /// `signum` and `ulp` hand back the NaN they were given; `StrictMath.copySign`
