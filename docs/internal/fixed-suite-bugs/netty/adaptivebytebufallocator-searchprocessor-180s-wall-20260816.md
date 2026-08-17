@@ -19,15 +19,27 @@ succeed. `VarHandle.get` on an `int` field cost **1 979 ns**; it now costs
 
 Re-measured on this page's own four classes, same host, same day, `-Xmx 1500m`,
 no per-method cap (so the class completes instead of being clipped). The host
-carried unrelated load of 10-35 throughout, so read the CPU column, not wall:
+carried unrelated load of 8-35 throughout, so read the CPU column, not wall:
 
-| class | before (wall / CPU) | after (wall / CPU) |
-| --- | ---: | ---: |
-| `AdaptiveByteBufAllocatorTest` | 715 s / 713 s | **270 s / 274 s** |
-| `AdaptiveByteBufAllocatorGrowthTest` | 1 081 s / 2 963 s | **645 s / 2 042 s** |
-| `AdaptiveByteBufAllocatorUseCacheForNonEventLoopThreadsTest` | 752 s / 754 s | **435 s / 432 s** |
-| `search.SearchProcessorTest` | 153 s / 141 s | **131–139 s / 130–135 s** |
-| `BigEndianHeapByteBufTest` (control, not on this page) | 37.4 s / 56.5 s | 38.4 s / **48.5 s** |
+| class | before (wall / CPU) | after (wall / CPU) | ratio (CPU) |
+| --- | ---: | ---: | ---: |
+| `AdaptiveByteBufAllocatorTest` | 635–725 s / 638–727 s | **419–432 s / 421–435 s** | 1.51–1.67× |
+| `AdaptiveByteBufAllocatorGrowthTest` | 1 081 s / 2 963 s | **645 s / 2 042 s** | 1.45× |
+| `AdaptiveByteBufAllocatorUseCacheForNonEventLoopThreadsTest` | 752 s / 754 s | **435 s / 432 s** | 1.75× |
+| `search.SearchProcessorTest` | 153 s / 141 s | **131–139 s / 130–135 s** | ~1.07× |
+| `BigEndianHeapByteBufTest` (control, not on this page) | 37.4 s / 56.5 s | 38.4 s / **48.5 s** | 1.17× |
+
+**One reading in this table was nearly a cherry-pick, and naming it is the
+point.** An un-paired run of `AdaptiveByteBufAllocatorTest` on the fixed binary
+came back at **270 s**, which would have made that row read 2.6×. Re-run
+interleaved against `base` — same class, same host, adjacent — it measured
+**432 s** and **419 s** against a `base` of 725 s and 635 s, with two further
+un-paired runs at 426 s and 475 s. The 270 s was this box, not this change, and
+1.45-1.75x is where the family actually sits. The ancestor page said so in
+advance
+(`docs/known-issues/perf/vm-per-call-dispatch-cost-20260813.md` §6: the same class
+measured 450, 551, 559 and 594 s on one binary): **interleave, or do not
+compare.**
 
 All of them still pass every test they did before — `AdaptiveByteBufAllocatorTest`
 127/127, `GrowthTest` 400/400, `UseCacheForNonEventLoopThreadsTest` 128/128,
@@ -37,21 +49,22 @@ half of this that a timing table cannot show.
 **What this settles, and what it does not.**
 
 * The **misattribution** is settled. Anyone arriving here should not read these
-  classes as evidence for the size of the generic per-call cost; a 2.6× on the
+  classes as evidence for the size of the generic per-call cost; a 1.7× on the
   allocator class came out of one cache, not out of the dispatcher.
-* The **wall cap** is not settled. `AdaptiveByteBufAllocatorTest` is 270 s
-  against a 180 s cap — 1.5× over, down from 4×. The other two remain further
+* The **wall cap** is not settled. `AdaptiveByteBufAllocatorTest` is 419-432 s
+  against a 180 s cap — 2.4× over, down from 4×. The other two remain further
   over. Under the suite's 180 s cap all three still report HANG, and this page
   still answers why.
 * `SearchProcessorTest` is unchanged in kind: it is the same load-margin case
   the fix doc it cites already recorded, now with ~15% more headroom. The
   quiet-box re-run this page asked for has still not been taken on a genuinely
-  quiet box — every measurement above was made at load 10-35.
+  quiet box — every measurement above was made at load 8-35.
 
-The residual is the ordinary native-dispatch floor (~150-200 ns per registered
+The residual is the ordinary native-dispatch floor (~150-210 ns per registered
 native call from compiled code), which is
-`performance/vm-per-call-dispatch-cost-RETIRED-20260813.md` and not a netty
-matter. This page moves here because its one actionable finding has been found
+`docs/known-issues/perf/vm-per-call-dispatch-cost-20260813.md` — reopened on
+2026-08-17 because these classes are what is still failing on it — and not a
+netty matter. This page moves here because its one actionable finding has been found
 and fixed and because its stated cause is now corrected.
 
 ---

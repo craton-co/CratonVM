@@ -28,9 +28,11 @@ suite's 180 s per-class cap. The residual is `MessageDigest.update(byte)` (268 M
 single-byte SHA-256 updates on the compress side and 268 M more on the
 decompress side, at the ~170 ns native-dispatch floor) plus the codec work
 itself. That floor is not netty's and not this page's: it is
-`performance/vm-per-call-dispatch-cost-RETIRED-20260813.md`, whose own
-conclusion — that restructuring `invoke_or_native` cannot be justified by a
-lever too small to measure after it lands — is unchanged.
+`docs/known-issues/perf/vm-per-call-dispatch-cost-20260813.md`, which was
+reopened on 2026-08-17 because it is the named residual of these eleven classes
+and of the sibling `io.netty.buffer` page. Its own conclusion — that
+restructuring `invoke_or_native` cannot be justified by a lever too small to
+measure after it lands — is unchanged.
 
 So the eleven classes will still report HANG at a 180 s cap, and this page still
 answers "why" for whoever sees that. It moves here because the one actionable
@@ -218,7 +220,7 @@ Nothing codec- or class-specific. The fix belongs entirely to the
 `ByteBuf`/interpreter↔JIT per-call-cost workstream, already tracked at
 [`../../performance/netty-per-call-throughput-20260813.md`](../../performance/netty-per-call-throughput-20260813.md)
 (RETIRED, kept as a measurement record) and
-[`../../performance/vm-per-call-dispatch-cost-RETIRED-20260813.md`](../../performance/vm-per-call-dispatch-cost-RETIRED-20260813.md).
+[`docs/known-issues/perf/vm-per-call-dispatch-cost-20260813.md`](../../../known-issues/perf/vm-per-call-dispatch-cost-20260813.md).
 When a per-byte `ByteBuf` call chain inlines (or the JIT↔interpreter transition
 cost drops well below the current ~300-700 ns/entry), all eleven classes
 should clear `testHugeDecompress` together — there is no per-class work to do
@@ -252,4 +254,4 @@ printf '%s\n' \
 
 * [`netty-brotli-huge-decompress-not-a-hang-FIXED-20260812.md`](../../fixed-suite-bugs/netty-brotli-huge-decompress-not-a-hang-FIXED-20260812.md) — the original per-class diagnosis (watchdog fix + throughput measurement), whose predicted outcome this doc confirms across the whole package.
 * [`../../performance/netty-per-call-throughput-20260813.md`](../../performance/netty-per-call-throughput-20260813.md) — retired, kept as the measurement record for the underlying `ByteBuf` per-call cost.
-* [`../../performance/vm-per-call-dispatch-cost-RETIRED-20260813.md`](../../performance/vm-per-call-dispatch-cost-RETIRED-20260813.md) — the VM-wide per-call dispatch cost this belongs to.
+* [`docs/known-issues/perf/vm-per-call-dispatch-cost-20260813.md`](../../../known-issues/perf/vm-per-call-dispatch-cost-20260813.md) — the VM-wide per-call dispatch cost this belongs to.

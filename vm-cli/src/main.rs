@@ -115,7 +115,7 @@ fn maybe_dump_shutdown_reports() {
 
     // How many native-registry probes one invoke cost, self-gated on
     // `CRATONVM_DBG_NATIVE_LOOKUPS=1`. This is the number
-    // `performance/vm-per-call-dispatch-cost-RETIRED-20260813.md` §2 asks for
+    // `docs/known-issues/perf/vm-per-call-dispatch-cost-20260813.md` §2 asks for
     // before anyone restructures the dispatch entry points: a profile share can
     // say `slot_for_exact` is 8.5%, but only this says whether a "one lookup
     // per invoke" rewrite would divide it by 1 or by 10.
