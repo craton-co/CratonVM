@@ -252,7 +252,98 @@ fn record_https_peer_info(
 /// root on one `SSLSession` per entry. Until now that table grew by one entry
 /// per HTTPS carrier for the life of the process.
 fn https_recycle_carrier(ctx: &mut dyn NativeContext, this: ObjectRef) {
-    let key = ctx.identity_hash_code(this) as u32 as u64;
+    let carrier_key = crate::net_phase_e::native_obj_key(&*ctx, this);
+    https_recycle_carrier_by_key(ctx, carrier_key);
+}
+
+/// The response streams currently outstanding for an `https` carrier, mapping
+/// the stream's identity to the carrier's key.
+///
+/// WHY A TABLE AND NOT A FIELD ON THE STREAM. The object handed to Java is a
+/// `java/io/ByteArrayInputStream` with the JDK's own four-field layout
+/// (`buf`, `pos`, `mark`, `count`); there is no spare slot, and writing one
+/// would corrupt a real field — the same rule `HttpsPeerInfo`'s own comment
+/// states for the carrier. The observer is handed the stream and nothing
+/// else, so the association has to live somewhere it can be looked up by
+/// stream identity.
+///
+/// **Bounded.** A row is inserted only for a carrier that already has an
+/// `https_peer_info` entry (i.e. a real TLS exchange), and is removed by the
+/// first `Eof` or `Close` the stream produces. A stream that is neither
+/// drained nor closed leaves one two-integer row — strictly less than what
+/// this whole mechanism removes, since an unrecycled carrier holds a GC root
+/// on an `SSLSession` for the life of the process.
+fn https_response_streams() -> &'static Mutex<HashMap<u64, crate::net_phase_e::NativeObjKey>> {
+    static R: OnceLock<Mutex<HashMap<u64, crate::net_phase_e::NativeObjKey>>> = OnceLock::new();
+    R.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Remember that `stream` is the response body of `carrier`, so draining it
+/// recycles the connection the way HotSpot's `KeepAliveCache` does.
+///
+/// A no-op unless the carrier has a recorded TLS exchange: a plain `http:`
+/// connection has no session state to tear down, and registering one would
+/// grow the table for every non-TLS request in the process for no effect.
+fn note_response_stream(ctx: &dyn NativeContext, stream: ObjectRef, carrier: Option<ObjectRef>) {
+    let Some(carrier) = carrier else { return };
+    let carrier_key = crate::net_phase_e::native_obj_key(ctx, carrier);
+    if !https_peer_info()
+        .lock()
+        .map(|t| t.contains_key(&(carrier_key.identity as u32 as u64)))
+        .unwrap_or(false)
+    {
+        return;
+    }
+    if let Ok(mut table) = https_response_streams().lock() {
+        table.insert(ctx.identity_hash_code(stream) as u32 as u64, carrier_key);
+    }
+}
+
+/// The `BaisEvent` observer: HotSpot's drain instant, made observable.
+///
+/// MEASURED contract (G44-1 N2, `RSslLiveSession`'s `drainTrap` family): once
+/// the response body is fully drained the connection returns to the
+/// `KeepAliveCache` and every CONNECTION-level accessor throws
+/// `IllegalStateException: connection not yet open` again — the same exception
+/// a never-handshaked connection throws — while **the `SSLSession` object the
+/// application already holds stays valid**. That second half is the row that
+/// separates "recycled" from "destroyed", and it is why this recycles the
+/// CARRIER's view and never touches the session object.
+///
+/// Both events are handled and the row is removed on the first of them, so
+/// the `Eof`-then-`Close` sequence a drained-and-closed stream produces
+/// recycles once. `BaisEvent::Eof` fires on every exhausted read rather than
+/// on the transition (its doc explains why the transition is not observable),
+/// so idempotence here is required, not defensive.
+fn huc_live_bais_event(
+    ctx: &mut dyn NativeContext,
+    stream: ObjectRef,
+    _event: cratonvm_native_api::registry::BaisEvent,
+) -> Result<(), MethodCallFailed> {
+    let stream_key = ctx.identity_hash_code(stream) as u32 as u64;
+    // Scoped so the lock is released before the call below, which takes two
+    // more process-global locks and can release a GC root. Same rule, and the
+    // same reason, as the scoped guard in `https_recycle_carrier_by_key`.
+    let carrier_key = {
+        let Ok(mut table) = https_response_streams().lock() else {
+            return Ok(());
+        };
+        table.remove(&stream_key)
+    };
+    if let Some(key) = carrier_key {
+        https_recycle_carrier_by_key(ctx, key);
+    }
+    Ok(())
+}
+
+/// [`https_recycle_carrier`] for a caller holding the carrier's KEY rather
+/// than the object — see [`huc_live_bais_event`], which is handed the response
+/// stream and has no way back to the carrier except this key.
+fn https_recycle_carrier_by_key(
+    ctx: &mut dyn NativeContext,
+    carrier_key: crate::net_phase_e::NativeObjKey,
+) {
+    let key = carrier_key.identity as u32 as u64;
     // Scoped, and NOT written as `if let Some(..) = https_peer_info().lock()
     // ...`: under Rust 2021's drop rules the guard produced in an `if let`
     // scrutinee lives to the end of the block, so the process-global lock would
@@ -266,7 +357,7 @@ fn https_recycle_carrier(ctx: &mut dyn NativeContext, this: ObjectRef) {
             info.recycled = true;
         }
     }
-    crate::net_phase_e::forget_https_carrier_session(ctx, this);
+    crate::net_phase_e::forget_https_carrier_session_by_key(ctx, carrier_key);
 }
 
 /// Make sure the exchange that produces the handshake info has actually run.
@@ -1305,8 +1396,18 @@ fn make_response_input_stream(
     ctx: &mut dyn NativeContext,
     body: &[u8],
     truncated: bool,
+    carrier: Option<ObjectRef>,
 ) -> MethodCallResult {
     let head = make_byte_array_input_stream(ctx, body);
+    // Associate the BAIS — never the `SequenceInputStream` wrapper — with the
+    // carrier: the BAIS is what `native-io` observes, and on the truncated
+    // path the wrapper produces no `BaisEvent` of its own. The truncated case
+    // is registered too, deliberately: its EOF still means the application is
+    // done with the bytes that arrived, and the error tail that follows is a
+    // read failure, not a reason to keep the connection's view open.
+    if let Ok(Value::Object(Some(head_ref))) = head {
+        note_response_stream(&*ctx, head_ref, carrier);
+    }
     if !truncated {
         return Ok(Some(head?));
     }
@@ -4173,7 +4274,7 @@ fn huc_get_input_stream(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
                 huc_real_perform(ctx, this, &full)?;
                 let body = huc_real_body(ctx, this);
                 let truncated = huc_real_truncated(ctx, this);
-                return make_response_input_stream(ctx, &body, truncated);
+                return make_response_input_stream(ctx, &body, truncated, Some(this));
             }
             return ctx.invoke_virtual(maybe_url, "openStream", "()Ljava/io/InputStream;", &[]);
         }
@@ -4205,7 +4306,7 @@ fn huc_get_input_stream(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
             }
         }
     }
-    make_response_input_stream(ctx, &body_bytes, truncated)
+    make_response_input_stream(ctx, &body_bytes, truncated, Some(this))
 }
 
 fn huc_get_error_stream(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -4219,7 +4320,7 @@ fn huc_get_error_stream(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
             }
             let body = huc_real_body(ctx, this);
             let truncated = huc_real_truncated(ctx, this);
-            return make_response_input_stream(ctx, &body, truncated);
+            return make_response_input_stream(ctx, &body, truncated, Some(this));
         }
     }
     if !matches!(ctx.get_field(this, HUC_CONNECTED), Value::Int(1)) {
@@ -5056,6 +5157,13 @@ fn register_one(r: &mut NativeMethodRegistry, cls: &str) {
 
 pub fn register_http_url_connection_real(r: &mut NativeMethodRegistry) {
     install_baos_event_hook(huc_live_baos_event);
+    // The input-side mirror. `native-io` has dispatched `BaisEvent` since
+    // a1cfdb122 and nothing consumed it; this is the consumer that closes the
+    // four `drain.conn.*` rows. Installing a hook is not a native
+    // registration, so `bridge-ratchet.sh` and the baselines under `scripts/`
+    // do not move — see `BaisEvent`'s "This adds no registration" note for the
+    // designs that were rejected because they would have.
+    cratonvm_native_api::registry::install_bais_event_hook(huc_live_bais_event);
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
     // The legacy `sun.net.www.protocol.http.HttpURLConnection` is the bulk of
@@ -5323,6 +5431,89 @@ mod http_url_connection_tests {
     ///     the one of the six that reads THAT table (`G7-1` §5.1). Recycling
     ///     one table and not the other leaves the six disagreeing about whether
     ///     the connection is open.
+    /// G51-1 N2 — draining the response body recycles the connection's view,
+    /// the way HotSpot's `KeepAliveCache` does at the same instant.
+    ///
+    /// Drives the observer directly rather than through `native-io`: the
+    /// dispatch sites are that crate's and already have their own tests
+    /// (`native-io/src/lib.rs`, the `BaisEvent` recorder). What is this file's
+    /// to prove is that the observer maps a stream back to its carrier, that
+    /// it recycles exactly once, and that an unregistered stream is inert.
+    #[test]
+    fn draining_the_response_body_recycles_the_carrier() {
+        use cratonvm_native_api::registry::BaisEvent;
+        let mut ctx = crate::test_utils::MockNativeContext::new();
+        let carrier = ctx.alloc_object(cratonvm_types::ClassId::new(0), 4);
+        let stream = ctx.alloc_object(cratonvm_types::ClassId::new(0), 4);
+        let key = ctx.identity_hash_code(carrier) as u32 as u64;
+        let chain = vec![vec![0x30u8, 0x01, 0x02]];
+
+        record_https_peer_info(&ctx, Some(carrier), &chain, "TLS_AES_256_GCM_SHA384");
+        note_response_stream(&ctx, stream, Some(carrier));
+        assert!(
+            https_peer_info()
+                .lock()
+                .unwrap()
+                .get(&key)
+                .is_some_and(|i| !i.recycled),
+            "a completed exchange starts OPEN"
+        );
+
+        huc_live_bais_event(&mut ctx, stream, BaisEvent::Eof).expect("the observer must not fail");
+        assert!(
+            https_peer_info()
+                .lock()
+                .unwrap()
+                .get(&key)
+                .is_some_and(|i| i.recycled),
+            "at body EOF the CONNECTION-level view is torn down — every accessor throws              IllegalStateException: connection not yet open again"
+        );
+        assert!(
+            https_peer_info().lock().unwrap().contains_key(&key),
+            "the ROW must survive: https_ensure_exchanged reads a missing entry as              \"never handshaked\" and would re-issue the request over the network"
+        );
+
+        // Eof fires on EVERY exhausted read and a closed stream produces Close
+        // as well, so the second and third events must find nothing to do.
+        assert!(
+            https_response_streams()
+                .lock()
+                .unwrap()
+                .get(&(ctx.identity_hash_code(stream) as u32 as u64))
+                .is_none(),
+            "the association is consumed by the first event"
+        );
+        huc_live_bais_event(&mut ctx, stream, BaisEvent::Close).expect("idempotent");
+    }
+
+    /// A stream that was never associated with an `https` carrier must be
+    /// inert. Every `ByteArrayInputStream` in the process reaches this
+    /// observer — a plain `http:` body, an application's own buffer, a
+    /// resource read through `URLClassLoader` — and recycling anything for
+    /// those would tear down state they have nothing to do with.
+    #[test]
+    fn an_unassociated_stream_recycles_nothing() {
+        use cratonvm_native_api::registry::BaisEvent;
+        let mut ctx = crate::test_utils::MockNativeContext::new();
+        let carrier = ctx.alloc_object(cratonvm_types::ClassId::new(0), 4);
+        let stranger = ctx.alloc_object(cratonvm_types::ClassId::new(0), 4);
+        let key = ctx.identity_hash_code(carrier) as u32 as u64;
+
+        record_https_peer_info(&ctx, Some(carrier), &[vec![0x30u8]], "TLS_AES_128_GCM_SHA256");
+        // Deliberately NOT noted, and noted with no carrier — both are the
+        // shapes an ordinary BAIS arrives in.
+        note_response_stream(&ctx, stranger, None);
+        huc_live_bais_event(&mut ctx, stranger, BaisEvent::Eof).expect("inert");
+        assert!(
+            https_peer_info()
+                .lock()
+                .unwrap()
+                .get(&key)
+                .is_some_and(|i| !i.recycled),
+            "an unrelated stream's EOF must not recycle a live connection"
+        );
+    }
+
     #[test]
     fn disconnect_recycles_both_https_session_tables() {
         let mut ctx = crate::test_utils::MockNativeContext::new();

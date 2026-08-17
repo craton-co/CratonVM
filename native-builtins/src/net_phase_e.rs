@@ -336,13 +336,23 @@ pub(crate) struct SsSide {
     pub so_timeout: i32,
 }
 
+/// A GC-stable identity for a Java object, used as a side-table key.
+///
+/// `pub(crate)` because `http_url_connection` has to hold one ACROSS the life
+/// of a response stream — see `forget_https_carrier_session_by_key`. Both
+/// fields are plain integers and both survive relocation, which is the whole
+/// reason this shape exists rather than a raw `ObjectRef`.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-struct NativeObjKey {
+pub(crate) struct NativeObjKey {
     vm: usize,
-    identity: i32,
+    /// `System.identityHashCode`. Exposed because the sibling table in
+    /// `http_url_connection` (`https_peer_info`) is keyed on
+    /// `identity_hash_code as u32 as u64`, so one `NativeObjKey` is enough to
+    /// address both tables and a caller does not have to carry two keys.
+    pub(crate) identity: i32,
 }
 
-fn native_obj_key(ctx: &dyn NativeContext, obj: ObjectRef) -> NativeObjKey {
+pub(crate) fn native_obj_key(ctx: &dyn NativeContext, obj: ObjectRef) -> NativeObjKey {
     NativeObjKey {
         vm: ctx.vm_identity(),
         identity: ctx.identity_hash_code(obj),
@@ -8575,6 +8585,20 @@ pub(crate) fn record_https_carrier_session(
 /// does, one per HTTPS carrier ever handshaked.
 pub(crate) fn forget_https_carrier_session(ctx: &mut dyn NativeContext, connection: ObjectRef) {
     let key = native_obj_key(&*ctx, connection);
+    forget_https_carrier_session_by_key(ctx, key);
+}
+
+/// [`forget_https_carrier_session`] for a caller that has the KEY but not the
+/// object.
+///
+/// The response-body drain observer is that caller. It is handed the
+/// `ByteArrayInputStream` and nothing else, and the carrier it must recycle
+/// may by then be unreachable from any root the observer can see — so the key
+/// is captured when the stream is built and carried, rather than the object.
+/// A `NativeObjKey` is two integers and holds nothing alive, which is exactly
+/// why it can be stored across an arbitrary span of Java execution when an
+/// `ObjectRef` could not.
+pub(crate) fn forget_https_carrier_session_by_key(ctx: &mut dyn NativeContext, key: NativeObjKey) {
     let stale = {
         let mut table = https_carrier_sessions().lock();
         table.remove(&key).map(|e| e.session_root).unwrap_or(0)
