@@ -2009,6 +2009,53 @@ impl Compiler {
                     pc += 1;
                 }
 
+                // pop2
+                //
+                // Absent until 2026-08-17, and not a rare shape: javac emits
+                // `pop2` whenever a call returning `long`/`double` is used as a
+                // STATEMENT. commons-math's `PSquarePercentile$Markers` has one
+                // in `adjustHeightsOfMarkers` (discarding `estimate(int)`) and
+                // one in `findCellAndUpdateMinMax` (discarding a synthetic
+                // `access$502` setter), and those two methods are called once
+                // per `increment()` — so the whole P-square hot loop refused to
+                // compile over a missing stack-height adjustment. See
+                // bug-commonsmath-accuratemathtest-psquarepercentiletest-interpreter-throughput-cliff-20260816.
+                //
+                // The operand model holds ONE entry per VALUE, not per JVM slot,
+                // so form 2 (a single category-2 value) pops once and form 1
+                // (two category-1 values) pops twice. `dup2_top_cat2` answers
+                // the same width question `dup2` asks, from the producing
+                // instruction.
+                0x58 => {
+                    match self.dup2_top_cat2(code, pc) {
+                        // FORM-2: one category-2 value occupies one entry.
+                        Some(true) => {
+                            let _ = self.pop_stack();
+                        }
+                        // FORM-1: two category-1 values.
+                        Some(false) if self.stack.len() >= 2 => {
+                            let _ = self.pop_stack();
+                            let _ = self.pop_stack();
+                        }
+                        _ => {
+                            // Unprovable top width (or a malformed FORM-1 with
+                            // height < 2). Mirror `dup2`: keep the modelled
+                            // height plausible for the rest of the dispatch loop
+                            // so a later handler does not raise a second,
+                            // misleading failure before the post-loop `failed`
+                            // check discards this compilation.
+                            self.fail("singlepass-codegen/pop2-unprovable-top-width");
+                            for _ in 0..2 {
+                                if self.stack.is_empty() {
+                                    break;
+                                }
+                                let _ = self.pop_stack();
+                            }
+                        }
+                    }
+                    pc += 1;
+                }
+
                 // dup
                 0x59 => {
                     let top = self.peek_stack();

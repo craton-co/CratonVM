@@ -770,6 +770,13 @@ fn corpus() -> Vec<Case> {
         2,
         vec![0x1a, 0x1b, 0x58, 0x03, 0xac],
     ));
+    // FORM-2: a single category-2 value discarded. This is the shape javac
+    // emits for a `long`/`double`-returning call used as a statement, and the
+    // one that kept commons-math's P-square hot loop interpreted while
+    // `pop2` was unimplemented — the cat-1 case above recorded REFUSED for just
+    // as long, but a differ only reports, it does not fail.
+    // lload_0 / pop2 / iconst_0 / ireturn
+    c.push(Case::new("stack/pop2_cat2", 2, 2, vec![0x1e, 0x58, 0x03, 0xac]));
     c.push(Case::new(
         "stack/dup2_x1",
         3,
