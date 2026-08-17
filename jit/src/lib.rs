@@ -8465,6 +8465,31 @@ pub fn set_reachability_fence_direct_fn(addr: usize) {
     REACHABILITY_FENCE_DIRECT_FN.store(addr, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// `CRATONVM_JIT='-census-direct-helpers'` — stop binding
+/// `Preconditions.checkIndex` / `Reference.reachabilityFence` to their thin
+/// direct helpers and send both back through the generic native funnel.
+/// Default ON.
+///
+/// The switch exists so the blast radius of these binds can be measured on ONE
+/// binary rather than argued across two. It was added after exactly that
+/// mistake: a CratonBench A/B was run against a control binary a day older than
+/// the branch, and reported ~13-19% "regressions" on `arithmetic` and `fib` —
+/// phases that contain no `checkIndex` and no `reachabilityFence` call at all,
+/// so the binds cannot have caused them. A same-binary A/B cannot be
+/// confounded that way.
+pub fn census_direct_helpers_enabled() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| {
+        cratonvm_types::flags::runtime_var("CRATONVM_JIT_CENSUS_DIRECT_HELPERS")
+            .map(|v| {
+                let v = v.trim();
+                !(v == "0" || v.eq_ignore_ascii_case("false") || v.eq_ignore_ascii_case("off"))
+            })
+            .unwrap_or(true)
+    })
+}
+
 /// Sites bound to the two census-driven helpers above, split by compile door,
 /// so "did this land" is answerable without a timing run — the lesson
 /// `LEAF_NATIVE_HITS` was added for.
@@ -15527,9 +15552,17 @@ fn try_compile_inner(
         // would not actually vectorise. The general problem it is a special
         // case of — the optimizing tier replaces a C1 body whenever it CAN,
         // with no evidence the replacement is faster, and every `cov-*` lane
-        // widens the set of methods that happens to — is written up in
-        // `feature-designs/c2/perf-01-sieve-ir-body-6x-slower-than-c1.md`
-        // and is not solved here.
+        // widens the set of methods that happens to — is the open policy
+        // question kept in perf-01-sieve-ir-body-6x-slower-than-c1.md, and is
+        // not solved here.
+        //
+        // The `sieve` REGRESSION that brief was opened for is FIXED (closeout:
+        // perf-01-sieve-ir-body-slower-than-c1-FIXED-20260804.md) — by this
+        // veto — and re-verified 2026-08-17 on CratonBench: checksum `9592` on
+        // HotSpot 25 and on CratonVM, at parity rather than 6.4x
+        // (8.2-10.0 s against HotSpot's 8.9 s on the same host). Only the
+        // policy question above is still open; do not read the brief's
+        // measurement as current.
         && single_pass_only_lowering_for(code, code_len, cached).is_none()
         // Same species as PERF-01 directly above, and measured the same way:
         // where a `java/lang/String` access intrinsic fires, an IR body is a
@@ -16517,6 +16550,7 @@ fn try_compile_inner(
                             // (`census_direct_helper_sites`) so that claim is
                             // checkable rather than assumed.
                             if direct_target.is_none()
+                                && census_direct_helpers_enabled()
                                 && is_static
                                 && direct_class == "jdk/internal/util/Preconditions"
                                 && mn == "checkIndex"
@@ -16538,6 +16572,7 @@ fn try_compile_inner(
                                 }
                             }
                             if direct_target.is_none()
+                                && census_direct_helpers_enabled()
                                 && is_static
                                 && direct_class == "java/lang/ref/Reference"
                                 && mn == "reachabilityFence"
@@ -18227,6 +18262,7 @@ fn try_compile_inner(
                     // JDK-ONLY-WAVE2: see the marker on the
                     // `StringLatin1.toLowerCase` bind above — same list.
                     if direct_jit_callee_calls_enabled
+                        && census_direct_helpers_enabled()
                         && invoke_kind == 3
                         && class_name == "jdk/internal/util/Preconditions"
                         && method_name == "checkIndex"
@@ -18259,6 +18295,7 @@ fn try_compile_inner(
                     }
 
                     if direct_jit_callee_calls_enabled
+                        && census_direct_helpers_enabled()
                         && invoke_kind == 3
                         && class_name == "java/lang/ref/Reference"
                         && method_name == "reachabilityFence"

@@ -516,7 +516,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_JIT`
 
-178 tokens.
+179 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -538,6 +538,7 @@ export inherited from a parent shell.
 | `bytecode-loop-xform` | `CRATONVM_JIT_BYTECODE_LOOP_XFORM` |
 | `bulk-byte-loops` | `CRATONVM_JIT_BULK_BYTE_LOOPS` |
 | `c1-vector-veto` | `CRATONVM_JIT_C1_VECTOR_VETO` |
+| `census-direct-helpers` | `CRATONVM_JIT_CENSUS_DIRECT_HELPERS` |
 | `c2-first-call` | `CRATONVM_JIT_C2_FIRST_CALL` |
 | `c2-supersede` | `CRATONVM_C2_SUPERSEDE` |
 | `callee-oop-flush` | `CRATONVM_JIT_NO_CALLEE_OOP_FLUSH` |

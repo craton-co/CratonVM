@@ -1105,6 +1105,7 @@ applies to `flag_env_mutation_guard.rs`.
 | `CRATONVM_JIT_BYTECODE_LOOP_XFORM` | JIT | `CRATONVM_JIT=bytecode-loop-xform` | opt-in | off | behaviour | snapshot | jit |
 | `CRATONVM_JIT_C1_VECTOR_VETO` | JIT | `CRATONVM_JIT=c1-vector-veto` | default-on | on | behaviour | snapshot | jit |
 | `CRATONVM_JIT_C2_FIRST_CALL` | JIT | `CRATONVM_JIT=c2-first-call` | opt-in | off | behaviour | snapshot | vm |
+| `CRATONVM_JIT_CENSUS_DIRECT_HELPERS` | JIT | `CRATONVM_JIT=census-direct-helpers` | default-on | on | behaviour | snapshot | jit |
 | `CRATONVM_JIT_CODE_CACHE_MAX_MB` | JIT | `CRATONVM_JIT=code-cache-max-mb` | opt-in | off | behaviour | snapshot | jit |
 | `CRATONVM_JIT_DENY` | JIT | `CRATONVM_JIT=deny` | opt-in | off | behaviour | snapshot | jit |
 | `CRATONVM_JIT_DIRECT_CALLEE_CALLS` | JIT | `CRATONVM_JIT=direct-callee-calls` | opt-in | off | behaviour | snapshot | jit |
