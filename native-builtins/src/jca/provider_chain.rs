@@ -3318,6 +3318,30 @@ fn throw_missing_provider(
 /// unconditionally and so ignored any `KeyManagerFactory` service a caller
 /// registered on their own `Provider` via `Security.addProvider` +
 /// `Provider.put("KeyManagerFactory.<algo>", ...)`.
+/// Every THIRD-PARTY provider's implementation class for `(type_str, algo)`, in
+/// chain order.
+///
+/// [`third_party_service_class`] answers only the FIRST provider on the chain
+/// and then discards it if that provider is one this VM services natively — so
+/// a name that SunEC also registers hides every third-party implementation
+/// behind it. That is fine for choosing a default and wrong for a fallback,
+/// which needs the candidates the JDK's own delayed provider selection would
+/// walk (`Signature$Delegate.chooseProvider` moves to the next provider when
+/// the current one refuses the key).
+pub(crate) fn chain_third_party_service_classes(type_str: &str, algo: &str) -> Vec<String> {
+    snapshot()
+        .into_iter()
+        .filter(|(name, _, _)| {
+            !NATIVELY_SERVICED_PROVIDERS
+                .iter()
+                .any(|b| b.eq_ignore_ascii_case(name))
+        })
+        .filter_map(|(name, _, _)| get_service_entry(&name, type_str, algo))
+        .map(|e| e.class_name.replace('.', "/"))
+        .filter(|c| !c.trim().is_empty())
+        .collect()
+}
+
 pub(crate) fn find_service_provider(type_str: &str, algo: &str) -> Option<String> {
     snapshot()
         .into_iter()
