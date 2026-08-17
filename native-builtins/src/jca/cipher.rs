@@ -684,6 +684,39 @@ fn cipher_init_record(
 
 /// [`cipher_init_record`] with an explicit ChaCha20 block counter. Every other
 /// cipher passes 0 and never reads it back.
+/// The IV length a transformation needs when the caller supplied none, or
+/// `None` for a transformation that takes no IV at all.
+///
+/// `Cipher.init(ENCRYPT_MODE, key)` on an IV-taking mode does not fail on a real
+/// provider: SunJCE GENERATES a random IV and hands it back through `getIV()`
+/// and `getParameters()`, and the caller is expected to persist it alongside the
+/// ciphertext. This engine recorded an EMPTY IV instead, and the damage surfaced
+/// two layers away — bc-java's `cms` `SunProviderTest` builds its CMS content
+/// encryptor exactly that way, reads `cipher.getParameters()` (which answered
+/// null), writes an `AlgorithmIdentifier` with ABSENT parameters, and the very
+/// next `doFinal` died inside SunJCE's own `engineInit` with
+/// `InvalidAlgorithmParameterException: Wrong IV length: must be 16 bytes long`.
+///
+/// The `ChaCha20` families are not here: they generate their nonce in
+/// `chacha20_spec_params`, which also has to police nonce REUSE.
+fn auto_generated_iv_len(algo: &str) -> Option<usize> {
+    let (name, mode, _) = parse_transformation(algo);
+    let block = match cipher_family(&name)? {
+        CipherFamily::Aes | CipherFamily::AesFixed(_) => 16,
+        CipherFamily::DesFamily | CipherFamily::Blowfish => 8,
+        // ECB-only or IV-less by construction: key wrap, RSA, RC4, PBES2
+        // (whose own arm derives the IV from the parameters).
+        _ => return None,
+    };
+    match mode.as_str() {
+        // A GCM nonce is 12 bytes whatever the block size — SunJCE's own
+        // default, and the only length its `engineInit` will auto-generate.
+        "GCM" => Some(12),
+        "CBC" | "CFB" | "OFB" | "CTR" => Some(block),
+        _ => None,
+    }
+}
+
 fn cipher_init_record_with_counter(
     ctx: &mut dyn NativeContext,
     this: ObjectRef,
@@ -743,6 +776,21 @@ fn cipher_init_record_with_counter(
     } else {
         (Vec::new(), Vec::new())
     };
+    // ENCRYPT (1) and WRAP (3) with no IV supplied: mint one, as SunJCE does.
+    // DECRYPT/UNWRAP has nothing to invent — the IV has to come from the
+    // caller — so an empty IV there stays empty and the refusal stands.
+    let iv_bytes = if iv_bytes.is_empty() && (mode == 1 || mode == 3) {
+        match auto_generated_iv_len(&algo) {
+            Some(n) => {
+                let mut generated = vec![0u8; n];
+                crate::crypto_impl::secure_random_fill(0, &mut generated);
+                generated
+            }
+            None => iv_bytes,
+        }
+    } else {
+        iv_bytes
+    };
     let previous = with_table_read(|t| t.get(&tkey).and_then(|s| s.chacha_last_encrypt));
     let last_encrypt =
         chacha20_check_nonce_reuse(ctx, &algo, mode, &key_bytes, &iv_bytes, previous)?;
@@ -773,6 +821,106 @@ fn cipher_init_record_with_counter(
 /// isn't shaped as expected — e.g. a null `AlgorithmParameters` (some callers
 /// pass null and expect the cipher to self-generate on first `doFinal`,
 /// which we don't support; behaves as before, not worse).
+/// Unwrap a `java.security.AlgorithmParameters` into the
+/// `AlgorithmParameterSpec` this engine reads its IV/nonce out of.
+///
+/// `AlgorithmParameters` and `AlgorithmParameterSpec` are the SAME parameters in
+/// two containers, and every real provider converts the first into the second
+/// (`engineInit` -> `engineGetParameterSpec`) before touching it. Tries the
+/// spec classes an intercepted transformation can actually consume, most
+/// specific first, and returns `None` when the parameters carry none of them —
+/// `getParameterSpec` answers `InvalidParameterSpecException` for a class it
+/// cannot produce, which is an ordinary outcome here, not a failure to report.
+fn algorithm_parameters_to_spec(
+    ctx: &mut dyn NativeContext,
+    alg_params: ObjectRef,
+    algo: &str,
+) -> Option<ObjectRef> {
+    let (_, mode, _) = parse_transformation(algo);
+    // GCM parameters carry a tag length an `IvParameterSpec` cannot express, so
+    // for a GCM transformation that class is asked for FIRST. Everything else
+    // this engine computes takes a plain IV.
+    let candidates: &[&str] = if mode == "GCM" {
+        &[
+            "javax/crypto/spec/GCMParameterSpec",
+            "javax/crypto/spec/IvParameterSpec",
+        ]
+    } else {
+        &[
+            "javax/crypto/spec/IvParameterSpec",
+            "javax/crypto/spec/GCMParameterSpec",
+        ]
+    };
+    let pin = ctx.pin_native_root(alg_params);
+    let mut found = None;
+    for name in candidates {
+        let Some(cid) = ctx.class_id_by_name(name) else {
+            continue;
+        };
+        let mirror = ctx.get_class_mirror(cid);
+        let params_now = ctx.read_native_pin(pin, alg_params);
+        if let Ok(Some(Value::Object(Some(spec)))) = ctx.invoke_virtual(
+            params_now,
+            "getParameterSpec",
+            "(Ljava/lang/Class;)Ljava/security/spec/AlgorithmParameterSpec;",
+            &[Value::Object(Some(mirror))],
+        ) {
+            found = Some(spec);
+            break;
+        }
+    }
+    ctx.unpin_native_roots(pin);
+    found
+}
+
+/// `Cipher.init(mode, key, AlgorithmParameters)` for every transformation this
+/// engine computes itself.
+///
+/// PBES2 keeps its own arm — it needs the salt and iteration count, not just an
+/// IV. Everything else used to fall through to `cipher_init_record(.., Vec::new())`,
+/// which recorded an EMPTY IV and dropped the caller's parameters on the floor.
+/// A CBC encrypt initialised that way ran with no IV at all and died later, at
+/// `doFinal`, inside SunJCE's own `engineInit` with
+/// `InvalidAlgorithmParameterException: Wrong IV length: must be 16 bytes long`
+/// — reported by bc-java as `CRMFException: cannot process data: Error during
+/// cipher finalisation` and `CMSException: unable to parse internal stream`,
+/// because `EnvelopedDataHelper.createContentCipher` is exactly this call: it
+/// rebuilds an `AlgorithmParameters` from the ASN.1 `AlgorithmIdentifier` and
+/// inits with THAT, never with a spec.
+fn cipher_init_from_algorithm_parameters(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    mode: i32,
+    key: ObjectRef,
+    alg_params: Option<ObjectRef>,
+) -> MethodCallResult {
+    let tkey = obj_key(ctx, this);
+    let algo = with_table_read(|t| {
+        t.get(&tkey)
+            .map(|s| s.algorithm.clone())
+            .unwrap_or_default()
+    });
+    if pbes2_aes_params(&algo).is_some() {
+        return cipher_init_record_pbes2(ctx, this, mode, key, alg_params);
+    }
+    // `getParameterSpec` runs real bytecode, so `this` and `key` can both move
+    // under it; re-read both from their pins afterwards.
+    let this_pin = ctx.pin_native_root(this);
+    let key_pin = ctx.pin_native_root(key);
+    let spec = alg_params.and_then(|p| algorithm_parameters_to_spec(ctx, p, &algo));
+    let this = ctx.read_native_pin(this_pin, this);
+    let key = ctx.read_native_pin(key_pin, key);
+    ctx.unpin_native_roots(this_pin);
+    if let Some((nonce, counter)) = chacha20_spec_params(ctx, &algo, spec, mode)? {
+        return cipher_init_record_with_counter(ctx, this, mode, key, nonce, counter);
+    }
+    let iv_bytes = match spec {
+        Some(spec) => extract_iv_bytes(ctx, spec),
+        None => Vec::new(),
+    };
+    cipher_init_record(ctx, this, mode, key, iv_bytes)
+}
+
 fn cipher_init_record_pbes2(
     ctx: &mut dyn NativeContext,
     this: ObjectRef,
@@ -1614,6 +1762,92 @@ fn key_length_reason(algo: &str, key_len: usize) -> Option<String> {
     }
 }
 
+/// A `java.security.AlgorithmParameters` carrying `iv`, named for `algo`'s own
+/// family — what `Cipher.getParameters()` answers for a non-PBE transformation.
+///
+/// Returns `Ok(null)` rather than an error whenever the parameters cannot be
+/// built (no IV recorded, a family with no `AlgorithmParameters` service, an
+/// `init` this VM cannot service): `getParameters()` is DECLARED to return null
+/// when the cipher has none, so a null is a legitimate answer and never a
+/// reason to fail the caller's `init`.
+fn cipher_iv_parameters(
+    ctx: &mut dyn NativeContext,
+    algo: &str,
+    iv: &[u8],
+) -> MethodCallResult {
+    if iv.is_empty() {
+        return Ok(Some(Value::Object(None)));
+    }
+    let (name, mode, _) = parse_transformation(algo);
+    let Some(family) = cipher_family(&name) else {
+        return Ok(Some(Value::Object(None)));
+    };
+    // The service name `AlgorithmParameters` is registered under, which is the
+    // ALGORITHM, not the transformation.
+    let service = match family {
+        CipherFamily::Aes | CipherFamily::AesFixed(_) => {
+            if mode == "GCM" {
+                "GCM"
+            } else {
+                "AES"
+            }
+        }
+        CipherFamily::DesFamily => {
+            if name.eq_ignore_ascii_case("DES") {
+                "DES"
+            } else {
+                "DESede"
+            }
+        }
+        CipherFamily::Blowfish => "Blowfish",
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let service_s = ctx.create_string(service);
+    let ap = ctx.invoke(
+        "java/security/AlgorithmParameters",
+        "getInstance",
+        "(Ljava/lang/String;)Ljava/security/AlgorithmParameters;",
+        &[Value::Object(Some(service_s))],
+    );
+    let Ok(Some(Value::Object(Some(ap_obj)))) = ap else {
+        return Ok(Some(Value::Object(None)));
+    };
+    let ap_pin = ctx.pin_native_root(ap_obj);
+    let iv_arr = make_bytes_array(ctx, iv);
+    let spec = if service == "GCM" {
+        // A GCM tag is 128 bits unless the caller said otherwise, and this
+        // engine only computes the 128-bit one.
+        ctx.new_object_initialized(
+            "javax/crypto/spec/GCMParameterSpec",
+            "(I[B)V",
+            &[Value::Int(128), Value::Object(Some(iv_arr))],
+        )
+    } else {
+        ctx.new_object_initialized(
+            "javax/crypto/spec/IvParameterSpec",
+            "([B)V",
+            &[Value::Object(Some(iv_arr))],
+        )
+    };
+    let ap_obj = ctx.read_native_pin(ap_pin, ap_obj);
+    let Ok(Some(spec)) = spec else {
+        ctx.unpin_native_roots(ap_pin);
+        return Ok(Some(Value::Object(None)));
+    };
+    let init = ctx.invoke_virtual(
+        ap_obj,
+        "init",
+        "(Ljava/security/spec/AlgorithmParameterSpec;)V",
+        &[spec],
+    );
+    let ap_obj = ctx.read_native_pin(ap_pin, ap_obj);
+    ctx.unpin_native_roots(ap_pin);
+    match init {
+        Ok(_) => Ok(Some(Value::Object(Some(ap_obj)))),
+        Err(_) => Ok(Some(Value::Object(None))),
+    }
+}
+
 /// Allocate a freshly initialised Cipher synthetic and register an empty
 /// `CipherState` for it. The algorithm string is stashed in the side-table — we
 /// do **not** write it to any instance field of the real JDK class, because
@@ -1770,6 +2004,16 @@ fn cipher_is_delegated(ctx: &mut dyn NativeContext, this: ObjectRef) -> bool {
 }
 
 /// The delegate `CipherSpi`, read back from the `Cipher`'s own `spi` field.
+/// The object at `idx` in a native call's argument list, or `None` for a null
+/// or absent slot. The same three-line `match` this file spells inline in a
+/// dozen places.
+fn obj_at(args: &[Value], idx: usize) -> Option<ObjectRef> {
+    match args.get(idx) {
+        Some(Value::Object(Some(o))) => Some(*o),
+        _ => None,
+    }
+}
+
 fn cipher_delegate_spi(ctx: &mut dyn NativeContext, this: ObjectRef) -> Option<ObjectRef> {
     match ctx.get_field_by_name(this, "spi") {
         Value::Object(Some(spi)) => Some(spi),
@@ -1813,11 +2057,22 @@ fn try_delegate_cipher_to_provider(
     if provider.is_empty() || provider == "<unknown>" {
         return Ok(false);
     }
+    try_delegate_cipher_to_named_provider(ctx, &provider, algo, cipher_obj)
+}
+
+/// Ask ONE named provider to serve `algo`, and on success turn `cipher_obj`
+/// into a wrapper over its SPI. See [`try_delegate_cipher_to_provider`].
+fn try_delegate_cipher_to_named_provider(
+    ctx: &mut dyn NativeContext,
+    provider: &str,
+    algo: &str,
+    cipher_obj: ObjectRef,
+) -> Result<bool, MethodCallFailed> {
     // A transformation is `alg[/mode/padding]`; providers register the service
     // under the bare algorithm and handle mode/padding through
     // `engineSetMode`/`engineSetPadding`.
     let base = algo.split('/').next().unwrap_or(algo);
-    let Some(result) = crate::jca::provider_chain::build_jca_impl(ctx, &provider, "Cipher", base)
+    let Some(result) = crate::jca::provider_chain::build_jca_impl(ctx, provider, "Cipher", base)
     else {
         return Ok(false);
     };
@@ -1836,24 +2091,35 @@ fn try_delegate_cipher_to_provider(
     // case this provider cannot serve the transformation after all.
     let parts: Vec<&str> = algo.split('/').collect();
     let pin = ctx.pin_native_root(spi);
-    let mut ok = true;
+    let mut refusal: Option<MethodCallFailed> = None;
     if parts.len() == 3 {
         for (idx, method) in [(1usize, "engineSetMode"), (2usize, "engineSetPadding")] {
             let spi_now = ctx.read_native_pin(pin, spi);
             let arg = ctx.create_string(parts[idx]);
-            if ctx
-                .invoke_virtual(spi_now, method, "(Ljava/lang/String;)V", &[Value::Object(Some(arg))])
-                .is_err()
-            {
-                ok = false;
+            if let Err(e) = ctx.invoke_virtual(
+                spi_now,
+                method,
+                "(Ljava/lang/String;)V",
+                &[Value::Object(Some(arg))],
+            ) {
+                refusal = Some(e);
                 break;
             }
         }
     }
     let spi = ctx.read_native_pin(pin, spi);
     ctx.unpin_native_roots(pin);
-    if !ok {
-        return Ok(false);
+    if let Some(refusal) = refusal {
+        // The provider OWNS the algorithm and refused the mode or the padding.
+        // `Cipher.getInstance(t, provider)` lets `Transform.setModePadding`'s
+        // exception propagate — measured on HotSpot 25, `AES/EAX/PKCS5Padding`
+        // with BouncyCastle is `NoSuchPaddingException: Only NoPadding can be
+        // used with AEAD modes.`, the PROVIDER's own message. Swallowing it and
+        // reporting this engine's "No such algorithm" instead named the wrong
+        // layer and the wrong defect. The chain walk in
+        // `try_delegate_cipher_to_chain` ignores an `Err` and moves to the next
+        // provider, which is what the anonymous overload wants.
+        return Err(refusal);
     }
     // The SPI lives in the Java-visible `spi` field so the collector owns it.
     ctx.set_field_by_name(cipher_obj, "spi", Value::Object(Some(spi)));
@@ -1866,12 +2132,55 @@ fn try_delegate_cipher_to_provider(
     Ok(true)
 }
 
+/// Walk the installed provider chain, in order, for a transformation this
+/// engine cannot compute — exactly what `Cipher.getInstance(String)` does on a
+/// real JDK, and what the ANONYMOUS overload here never did.
+///
+/// The refusal it replaces was structural, not a missing algorithm: this VM's
+/// `getInstance(String)` consulted a hand-written serviceable-transformation
+/// table and threw `NoSuchAlgorithmException: Cannot find any provider
+/// supporting <name>` if the name was not on it, without asking a single
+/// installed provider. Every X.509/PKCS/CMS caller names its content cipher by
+/// OID and lets the chain resolve it, so bc-java's `cms` and `pkcs` suites hit
+/// this on `1.2.840.113549.1.12.1.3` (PKCS#12 PBEWithSHAAnd3KeyTripleDES) and
+/// `2.16.840.1.101.3.4.4.1` (ML-KEM-512) while HotSpot served both from
+/// BouncyCastle.
+///
+/// Deliberately ordered AFTER this engine's own verdict, never before it: a
+/// name this VM can compute keeps being computed here, so no existing caller's
+/// answer changes. Only the refusal path is reachable from here.
+fn try_delegate_cipher_to_chain(
+    ctx: &mut dyn NativeContext,
+    algo: &str,
+    cipher_obj: ObjectRef,
+) -> Result<bool, MethodCallFailed> {
+    let pin = ctx.pin_native_root(cipher_obj);
+    for provider in crate::jca::provider_chain::chain_provider_names() {
+        let obj = ctx.read_native_pin(pin, cipher_obj);
+        // A provider that owns the name but whose class will not instantiate is
+        // reported by `try_delegate_cipher_to_named_provider` as `Err`. That is
+        // one provider's problem, not the chain's — a real `ProviderList` walk
+        // moves on to the next candidate — so keep looking.
+        if let Ok(true) = try_delegate_cipher_to_named_provider(ctx, &provider, algo, obj) {
+            ctx.unpin_native_roots(pin);
+            return Ok(true);
+        }
+    }
+    ctx.unpin_native_roots(pin);
+    Ok(false)
+}
+
 /// Forward `Cipher.init` to the delegate SPI.
 ///
-/// `SecureRandom` is passed as null. Every `engineInit` contract treats null as
-/// "use the provider's default source", and the decrypt-side callers this path
-/// exists for never draw from it; an ENCRYPT init on a provider that does would
-/// see the same null a JDK caller of `init(mode, key)` without a random gets.
+/// The caller's `SecureRandom` is forwarded, not dropped. Passing null here
+/// ("every `engineInit` treats null as use-the-provider's-default") is only
+/// harmless for callers that never draw from it — and the ones that DO are
+/// exactly the ones that can tell: bc-java's `AESTest.wrapTest(2, ...)` inits an
+/// `AESRFC3211WRAP` cipher with a `FixedSecureRandom` and asserts a FIXED
+/// ciphertext, and with the argument dropped BouncyCastle drew its IV from its
+/// own default source and produced a different answer on every run. A null
+/// argument is still passed through as null, which is what a JDK caller of
+/// `init(mode, key)` gets.
 fn cipher_delegate_init(
     ctx: &mut dyn NativeContext,
     this: ObjectRef,
@@ -1879,6 +2188,7 @@ fn cipher_delegate_init(
     key: Option<ObjectRef>,
     params: Option<ObjectRef>,
     params_is_spec: bool,
+    random: Option<ObjectRef>,
 ) -> MethodCallResult {
     let Some(spi) = cipher_delegate_spi(ctx, this) else {
         return Err(cratonvm_types::error::RuntimeError::IllegalStateException {
@@ -1886,22 +2196,54 @@ fn cipher_delegate_init(
         }
         .into());
     };
+    // Every reference below survives the (allocating) `SecureRandom`
+    // construction: pin them before it runs.
+    let spi_pin = ctx.pin_native_root(spi);
+    let key_pin = key.map(|k| ctx.pin_native_root(k));
+    let params_pin = params.map(|p| ctx.pin_native_root(p));
     let key_v = Value::Object(key);
+    // `Cipher.init(mode, key)` does NOT pass a null `SecureRandom` on a real
+    // JDK — it passes `JCAUtil.getSecureRandom()`. A provider is entitled to
+    // dereference it: BouncyCastle's `BaseWrapCipher.engineInit` wraps the
+    // argument in a `ParametersWithRandom` and `RFC3211WrapEngine` calls
+    // `nextBytes` on it, which is `NullPointerException: Cannot invoke
+    // "java.security.SecureRandom.nextBytes(byte[])"` on every one of
+    // bc-java's `RFC3211WrapTest` cases when the argument is null.
+    let random = match random {
+        Some(r) => Some(r),
+        None => match ctx.new_object_initialized("java/security/SecureRandom", "()V", &[]) {
+            Ok(Some(Value::Object(Some(r)))) => Some(r),
+            _ => None,
+        },
+    };
+    let random_v = Value::Object(random);
     let args: Vec<Value> = match params {
         Some(p) => vec![
             Value::Int(mode),
             key_v,
             Value::Object(Some(p)),
-            Value::Object(None),
+            random_v,
         ],
-        None => vec![Value::Int(mode), key_v, Value::Object(None)],
+        None => vec![Value::Int(mode), key_v, random_v],
     };
     let desc = match (params.is_some(), params_is_spec) {
         (false, _) => SPI_INIT_PLAIN,
         (true, true) => SPI_INIT_SPEC,
         (true, false) => SPI_INIT_PARAMS,
     };
-    ctx.invoke_virtual(spi, "engineInit", desc, &args)?;
+    // Re-read every argument from its pin: `new SecureRandom()` above may have
+    // moved them.
+    let spi = ctx.read_native_pin(spi_pin, spi);
+    let mut args = args;
+    if let (Some(pin), Some(k)) = (key_pin, key) {
+        args[1] = Value::Object(Some(ctx.read_native_pin(pin, k)));
+    }
+    if let (Some(pin), Some(p)) = (params_pin, params) {
+        args[2] = Value::Object(Some(ctx.read_native_pin(pin, p)));
+    }
+    let result = ctx.invoke_virtual(spi, "engineInit", desc, &args);
+    ctx.unpin_native_roots(spi_pin);
+    result?;
     Ok(None)
 }
 
@@ -3899,9 +4241,22 @@ fn register_cipher_dispatch(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let algo = obj_arg(args, 0)?;
             let algo_str = ctx.read_string(algo).unwrap_or_default();
-            check_transformation_supported(ctx, &algo_str, GetInstanceForm::Anonymous)?;
-            let obj = cipher_alloc(ctx, algo)?;
-            Ok(Some(Value::Object(Some(obj))))
+            match check_transformation_supported(ctx, &algo_str, GetInstanceForm::Anonymous) {
+                Ok(_) => {
+                    let obj = cipher_alloc(ctx, algo)?;
+                    Ok(Some(Value::Object(Some(obj))))
+                }
+                Err(refusal) => {
+                    // Not a name this engine computes. Ask the installed
+                    // providers, in chain order, before refusing — see
+                    // `try_delegate_cipher_to_chain`.
+                    let obj = cipher_alloc(ctx, algo)?;
+                    match try_delegate_cipher_to_chain(ctx, &algo_str, obj)? {
+                        true => Ok(Some(Value::Object(Some(obj)))),
+                        false => Err(refusal),
+                    }
+                }
+            }
         },
     );
     r.register(
@@ -3955,7 +4310,7 @@ fn register_cipher_dispatch(r: &mut NativeMethodRegistry) {
         let mode = args[1].as_int().unwrap_or(0);
         let key = obj_arg(args, 2)?;
         if cipher_is_delegated(ctx, this) {
-            return cipher_delegate_init(ctx, this, mode, Some(key), None, false);
+            return cipher_delegate_init(ctx, this, mode, Some(key), None, false, None);
         }
         // A ChaCha20 cipher initialised with no parameters at all still needs a
         // nonce, and SunJCE GENERATES one for ENCRYPT rather than refusing —
@@ -3982,7 +4337,7 @@ fn register_cipher_dispatch(r: &mut NativeMethodRegistry) {
                 _ => None,
             };
             if cipher_is_delegated(ctx, this) {
-                return cipher_delegate_init(ctx, this, mode, Some(key), spec, true);
+                return cipher_delegate_init(ctx, this, mode, Some(key), spec, true, None);
             }
             // ChaCha20 needs the spec's TYPE and its counter, not just its
             // field 0, so it is resolved before the generic IV read.
@@ -4011,7 +4366,7 @@ fn register_cipher_dispatch(r: &mut NativeMethodRegistry) {
                 _ => None,
             };
             if cipher_is_delegated(ctx, this) {
-                return cipher_delegate_init(ctx, this, mode, Some(key), spec, true);
+                return cipher_delegate_init(ctx, this, mode, Some(key), spec, true, obj_at(args, 4));
             }
             // ChaCha20 needs the spec's TYPE and its counter, not just its
             // field 0, so it is resolved before the generic IV read.
@@ -4051,9 +4406,9 @@ fn register_cipher_dispatch(r: &mut NativeMethodRegistry) {
                 _ => None,
             };
             if cipher_is_delegated(ctx, this) {
-                return cipher_delegate_init(ctx, this, mode, Some(key), alg_params, false);
+                return cipher_delegate_init(ctx, this, mode, Some(key), alg_params, false, None);
             }
-            cipher_init_record_pbes2(ctx, this, mode, key, alg_params)
+            cipher_init_from_algorithm_parameters(ctx, this, mode, key, alg_params)
         },
     );
 
@@ -4070,10 +4425,81 @@ fn register_cipher_dispatch(r: &mut NativeMethodRegistry) {
                 _ => None,
             };
             if cipher_is_delegated(ctx, this) {
-                return cipher_delegate_init(ctx, this, mode, Some(key), alg_params, false);
+                return cipher_delegate_init(ctx, this, mode, Some(key), alg_params, false, obj_at(args, 4));
             }
-            cipher_init_record_pbes2(ctx, this, mode, key, alg_params)
+            cipher_init_from_algorithm_parameters(ctx, this, mode, key, alg_params)
         },
+    );
+
+    // `Cipher.init(mode, Certificate)` and its `SecureRandom` twin. Both are
+    // `Cipher.getPublicKey(cert)` followed by the `Key` form — the JDK body is
+    // literally that, plus a KeyUsage check — but neither was registered, so
+    // both fell through to real `Cipher` bytecode against a receiver whose state
+    // lives in `CIPHER_TABLE`. S/MIME and CMS enveloping reach for exactly this
+    // overload when the recipient is named by certificate rather than by key.
+    //
+    // The key-usage rule mirrors `javax.crypto.Cipher.init(int, Certificate)`:
+    // an X.509 certificate whose KeyUsage extension is PRESENT and denies
+    // `keyEncipherment` (bit 2) must be refused. An absent extension is a null
+    // array and is silently allowed, which makes this a no-op for every
+    // certificate that does not carry it.
+    for desc in [
+        "(ILjava/security/cert/Certificate;)V",
+        "(ILjava/security/cert/Certificate;Ljava/security/SecureRandom;)V",
+    ] {
+        r.register(cipher, "init", desc, |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let mode = args[1].as_int().unwrap_or(0);
+            let cert = obj_arg(args, 2)?;
+            let cert_pin = ctx.pin_native_root(cert);
+            let this_pin = ctx.pin_native_root(this);
+            let usage_denies_encipherment =
+                match ctx.invoke_virtual(cert, "getKeyUsage", "()[Z", &[]) {
+                    Ok(Some(Value::Object(Some(arr)))) => {
+                        ctx.array_length(arr) > 2 && ctx.get_array_element(arr, 2) == Value::Int(0)
+                    }
+                    _ => false,
+                };
+            let cert = ctx.read_native_pin(cert_pin, cert);
+            let this = ctx.read_native_pin(this_pin, this);
+            if usage_denies_encipherment {
+                ctx.unpin_native_roots(cert_pin);
+                return Err(crate::phases_early::throw_jca_exc(
+                    ctx,
+                    "java/security/InvalidKeyException",
+                    "Wrong key usage",
+                ));
+            }
+            let key = ctx.invoke_virtual(cert, "getPublicKey", "()Ljava/security/PublicKey;", &[]);
+            let this = ctx.read_native_pin(this_pin, this);
+            ctx.unpin_native_roots(cert_pin);
+            let key = match key? {
+                Some(Value::Object(Some(k))) => k,
+                _ => {
+                    return Err(crate::phases_early::throw_jca_exc(
+                        ctx,
+                        "java/security/InvalidKeyException",
+                        "certificate carries no public key",
+                    ))
+                }
+            };
+            if cipher_is_delegated(ctx, this) {
+                return cipher_delegate_init(ctx, this, mode, Some(key), None, false, obj_at(args, 3));
+            }
+            cipher_init_record(ctx, this, mode, key, Vec::new())
+        });
+    }
+
+    // `getExemptionMechanism()` — the last unregistered public method on
+    // `javax.crypto.Cipher`. There is no exemption mechanism here (and none on a
+    // stock JDK either: `Cipher.getInstance("AES").getExemptionMechanism()` is
+    // null on HotSpot 25), but leaving it unregistered means the real body runs
+    // `chooseFirstProvider()` against a synthetic receiver.
+    r.register(
+        cipher,
+        "getExemptionMechanism",
+        "()Ljavax/crypto/ExemptionMechanism;",
+        |_ctx, _args| Ok(Some(Value::Object(None))),
     );
 
     r.register(
@@ -4085,7 +4511,7 @@ fn register_cipher_dispatch(r: &mut NativeMethodRegistry) {
             let mode = args[1].as_int().unwrap_or(0);
             let key = obj_arg(args, 2)?;
             if cipher_is_delegated(ctx, this) {
-                return cipher_delegate_init(ctx, this, mode, Some(key), None, false);
+                return cipher_delegate_init(ctx, this, mode, Some(key), None, false, obj_at(args, 3));
             }
             cipher_init_record(ctx, this, mode, key, Vec::new())
         },
@@ -4408,6 +4834,57 @@ fn register_cipher_dispatch(r: &mut NativeMethodRegistry) {
     // state lives in `CIPHER_TABLE` — so a caller that passed its AAD by range
     // or by `ByteBuffer` got an exception where the array overload silently
     // dropped it. One engine, three doors, one behaviour.
+    // The `ByteBuffer` AAD door. The note above says "one engine, three doors,
+    // one behaviour" and then registered TWO — a caller that passed its AAD as a
+    // buffer still fell through to the real `Cipher.updateAAD` bytecode and its
+    // `checkCipherState()`. `javax.crypto.Cipher` declares exactly three.
+    r.register(
+        cipher,
+        "updateAAD",
+        "(Ljava/nio/ByteBuffer;)V",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let Some(Value::Object(Some(src))) = args.get(1).cloned() else {
+                return Ok(None);
+            };
+            let remaining = match ctx.invoke_virtual(src, "remaining", "()I", &[])? {
+                Some(Value::Int(n)) if n > 0 => n as usize,
+                _ => return Ok(None),
+            };
+            let tmp = ctx.new_array(cratonvm_types::ArrayElementType::Byte, remaining);
+            // Bulk get consumes the buffer and advances position -> limit, which
+            // is what `Cipher.updateAAD(ByteBuffer)` promises.
+            ctx.invoke_virtual(
+                src,
+                "get",
+                "([B)Ljava/nio/ByteBuffer;",
+                &[Value::Object(Some(tmp))],
+            )?;
+            if cipher_is_delegated(ctx, this) {
+                if let Some(spi) = cipher_delegate_spi(ctx, this) {
+                    return ctx.invoke_virtual(
+                        spi,
+                        "engineUpdateAAD",
+                        "([BII)V",
+                        &[
+                            Value::Object(Some(tmp)),
+                            Value::Int(0),
+                            Value::Int(remaining as i32),
+                        ],
+                    );
+                }
+            }
+            let bytes = read_bytes(ctx, tmp);
+            let tkey = obj_key(ctx, this);
+            with_table_write(|t| {
+                if let Some(s) = t.get_mut(&tkey) {
+                    s.aad.extend_from_slice(&bytes);
+                }
+            });
+            Ok(None)
+        },
+    );
+
     r.register(cipher, "updateAAD", "([BII)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let arr = match args.get(1) {
@@ -4495,87 +4972,121 @@ fn register_cipher_dispatch(r: &mut NativeMethodRegistry) {
     // "Cipher not initialized" (the synthetic Cipher's real SPI state is unset
     // because we service `init` natively). Compute the result and copy it into
     // the caller's `output` array.
-    r.register(cipher, "doFinal", "([BII[B)I", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        // The three sibling `doFinal` overloads route a delegated cipher to its
-        // provider; this one did not, so a caller reaching for the
-        // write-into-my-buffer form got OUR implementation of a transformation
-        // the provider was chosen to supply.
-        let delegated_result = if cipher_is_delegated(ctx, this) {
-            let input = match args.get(1) {
-                Some(Value::Object(Some(b))) => Some(*b),
-                _ => None,
+    // The three write-into-my-buffer `doFinal` overloads. All of them are one
+    // engine call with the output range spelled differently, so they share one
+    // body: `([BI)I` finalises whatever was accumulated, `([BII[B)I` writes at
+    // offset 0, `([BII[BI)I` at the caller's offset. Only the first was
+    // registered as its own arm; the other two fell through to the real
+    // `Cipher` bytecode, whose `checkCipherState()` throws `IllegalStateException:
+    // Cipher not initialized` against a receiver whose state lives in
+    // `CIPHER_TABLE` — measured on bc-java's
+    // `AEADTest.testGCMParameterSpecWithMultipleUpdates`, which streams through
+    // `update(in, off, len, out, outOff)` and finishes with
+    // `doFinal(in, off, len, out, outOff)`.
+    for desc in ["([BI)I", "([BII[B)I", "([BII[BI)I"] {
+        r.register(cipher, "doFinal", desc, |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            // `register` takes a fn pointer, so which overload is running has to
+            // come from the arguments themselves: receiver + 2 for `([BI)I`,
+            // + 4 for `([BII[B)I`, + 5 for `([BII[BI)I`.
+            let has_input = args.len() >= 5;
+            let (input, off, len, output, out_off) = if has_input {
+                let input = match args.get(1) {
+                    Some(Value::Object(Some(b))) => Some(*b),
+                    _ => None,
+                };
+                let off = args.get(2).and_then(|v| v.as_int()).unwrap_or(0);
+                let len = args.get(3).and_then(|v| v.as_int()).unwrap_or(0);
+                let output = obj_arg(args, 4)?;
+                let out_off = args.get(5).and_then(|v| v.as_int()).unwrap_or(0);
+                (input, off, len, output, out_off)
+            } else {
+                let output = obj_arg(args, 1)?;
+                let out_off = args.get(2).and_then(|v| v.as_int()).unwrap_or(0);
+                (None, 0, 0, output, out_off)
             };
-            let off = args.get(2).and_then(|v| v.as_int()).unwrap_or(0);
-            let len = args.get(3).and_then(|v| v.as_int()).unwrap_or(0);
-            Some(cipher_delegate_bytes(ctx, this, "engineDoFinal", input, off, len))
-        } else {
-            None
-        };
-        if delegated_result.is_none() {
-            accumulate_slice(ctx, this, args.get(1), args.get(2), args.get(3));
-        }
-        let output = obj_arg(args, 4)?;
-        let opin = ctx.pin_native_root(output);
-        let res = match delegated_result {
-            Some(r) => r,
-            None => cipher_do_final_impl(ctx, this),
-        };
-        let out_bytes = match res {
-            Ok(Some(Value::Object(Some(a)))) => read_bytes(ctx, a),
-            // P0: this used to be `Ok(_) => Vec::new()`, which wrote nothing
-            // into the caller's buffer and returned 0 — "the cipher produced
-            // zero bytes", indistinguishable from a legitimate empty result.
-            // `cipher_do_final_impl` only ever returns `Err` or a real byte[],
-            // so reaching here means an unexpected shape, not an empty
-            // ciphertext. Refuse rather than report a successful zero-length
-            // encryption.
-            Ok(other) => {
-                ctx.unpin_native_roots(opin);
-                return Err(RuntimeError::IllegalStateException {
-                    message: format!(
-                        "Cipher.doFinal produced no output buffer ({other:?}); \
-                         refusing to report 0 bytes written as success"
-                    ),
+            // The three sibling `doFinal` overloads route a delegated cipher to
+            // its provider; these did not, so a caller reaching for the
+            // write-into-my-buffer form got OUR implementation of a
+            // transformation the provider was chosen to supply.
+            let delegated_result = if cipher_is_delegated(ctx, this) {
+                Some(cipher_delegate_bytes(
+                    ctx,
+                    this,
+                    "engineDoFinal",
+                    input,
+                    off,
+                    len,
+                ))
+            } else {
+                None
+            };
+            if delegated_result.is_none() && has_input {
+                accumulate_slice(ctx, this, args.get(1), args.get(2), args.get(3));
+            }
+            let opin = ctx.pin_native_root(output);
+            let res = match delegated_result {
+                Some(r) => r,
+                None => cipher_do_final_impl(ctx, this),
+            };
+            let out_bytes = match res {
+                Ok(Some(Value::Object(Some(a)))) => read_bytes(ctx, a),
+                // P0: this used to be `Ok(_) => Vec::new()`, which wrote nothing
+                // into the caller's buffer and returned 0 — "the cipher produced
+                // zero bytes", indistinguishable from a legitimate empty result.
+                // `cipher_do_final_impl` only ever returns `Err` or a real byte[],
+                // so reaching here means an unexpected shape, not an empty
+                // ciphertext. Refuse rather than report a successful zero-length
+                // encryption.
+                Ok(other) => {
+                    ctx.unpin_native_roots(opin);
+                    return Err(RuntimeError::IllegalStateException {
+                        message: format!(
+                            "Cipher.doFinal produced no output buffer ({other:?});                              refusing to report 0 bytes written as success"
+                        ),
+                    }
+                    .into());
                 }
-                .into());
+                Err(e) => {
+                    ctx.unpin_native_roots(opin);
+                    return Err(e);
+                }
+            };
+            let output = ctx.read_native_pin(opin, output);
+            ctx.unpin_native_roots(opin);
+            // The caller's buffer has to be able to hold the result. This loop
+            // used to write `out_bytes.len()` elements into `output` with NO
+            // bounds check at all — a 32-byte ciphertext into a 1-byte array —
+            // so the census answer for `ShortBufferException` on this overload
+            // was "raises NOTHING of its own"; what a caller saw was whatever
+            // `set_array_element` did past the end, which is an
+            // `ArrayIndexOutOfBoundsException` at best and is unchecked either
+            // way.
+            //
+            // SunJCE measured on Temurin 25.0.3+9:
+            // `ShortBufferException: Output buffer must be (at least) 32 bytes
+            // long` — checked, and the exception `doFinal(byte[],int,int,byte[])`
+            // declares. The check is made against the ACTUAL output length
+            // rather than `getOutputSize`, which is documented one screen down
+            // as an UPPER bound: refusing on the estimate would reject buffers
+            // that fit.
+            let out_off = out_off.max(0) as usize;
+            if ctx.array_length(output) < out_off.saturating_add(out_bytes.len()) {
+                return Err(crate::phases_early::throw_jca_exc(
+                    ctx,
+                    "javax/crypto/ShortBufferException",
+                    &format!(
+                        "Output buffer must be (at least) {} bytes long",
+                        out_off + out_bytes.len()
+                    ),
+                ));
             }
-            Err(e) => {
-                ctx.unpin_native_roots(opin);
-                return Err(e);
+            for (i, &b) in out_bytes.iter().enumerate() {
+                ctx.set_array_element(output, out_off + i, Value::Int(b as i8 as i32));
             }
-        };
-        let output = ctx.read_native_pin(opin, output);
-        ctx.unpin_native_roots(opin);
-        // The caller's buffer has to be able to hold the result. This loop used
-        // to write `out_bytes.len()` elements into `output` with NO bounds
-        // check at all — a 32-byte ciphertext into a 1-byte array — so the
-        // census answer for `ShortBufferException` on this overload was
-        // "raises NOTHING of its own"; what a caller saw was whatever
-        // `set_array_element` did past the end, which is an
-        // `ArrayIndexOutOfBoundsException` at best and is unchecked either way.
-        //
-        // SunJCE measured on Temurin 25.0.3+9:
-        // `ShortBufferException: Output buffer must be (at least) 32 bytes long`
-        // — checked, and the exception `doFinal(byte[],int,int,byte[])`
-        // declares. The check is made against the ACTUAL output length rather
-        // than `getOutputSize`, which is documented one screen down as an UPPER
-        // bound: refusing on the estimate would reject buffers that fit.
-        if ctx.array_length(output) < out_bytes.len() {
-            return Err(crate::phases_early::throw_jca_exc(
-                ctx,
-                "javax/crypto/ShortBufferException",
-                &format!(
-                    "Output buffer must be (at least) {} bytes long",
-                    out_bytes.len()
-                ),
-            ));
-        }
-        for (i, &b) in out_bytes.iter().enumerate() {
-            ctx.set_array_element(output, i, Value::Int(b as i8 as i32));
-        }
-        Ok(Some(Value::Int(out_bytes.len() as i32)))
-    });
+            Ok(Some(Value::Int(out_bytes.len() as i32)))
+        });
+    }
 
     // `getOutputSize(inputLen)` → the byte count `doFinal` will produce, so the
     // caller can pre-size its output buffer. Must be EXACT for the AES-GCM
@@ -4799,7 +5310,12 @@ fn register_cipher_dispatch(r: &mut NativeMethodRegistry) {
                     .unwrap_or_default()
             });
             if pbes2_aes_params(&algo).is_none() || salt.is_empty() {
-                return Ok(Some(Value::Object(None)));
+                // Not PBES2. `getParameters()` still has to answer the IV this
+                // cipher is running with — that is how a caller persists it
+                // (`AlgorithmIdentifier` in CMS, `AlgorithmId` in PKCS#12) and
+                // how the decrypt side gets it back. Answering null made every
+                // such caller write "no parameters" and then fail to decrypt.
+                return cipher_iv_parameters(ctx, &algo, &iv);
             }
             let algo_str = ctx.create_string(&algo);
             let ap = ctx.invoke(

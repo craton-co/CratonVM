@@ -10557,6 +10557,26 @@ pub(crate) fn bc_pkcs12_generator_bytes(
     }
 }
 
+/// Is this `PKCS12ParametersGenerator` the SHA-1 one the native KDF computes?
+///
+/// PKCS#12's KDF is parameterised by a digest: `new PKCS12ParametersGenerator(
+/// new SHA1Digest())` is the common case and the only one
+/// `bc_pkcs12_derive_sha1` implements. Every other digest — SHA-256, GOST3411 —
+/// must run BouncyCastle's OWN bytecode, exactly as the `PKCS5S2` sibling does
+/// for a PRF this VM has no arm for. Raising instead turned three bc-java
+/// `PfxPduTest` cases (`testGOST1`, `testGOST2`, `testCreateAES256andSHA256`)
+/// into hard errors from inside the MAC-calculator builder.
+fn bc_pkcs12_is_sha1(ctx: &dyn NativeContext, this: ObjectRef) -> bool {
+    let Value::Object(Some(digest)) = ctx.get_field_by_name(this, "digest") else {
+        return false;
+    };
+    matches!(
+        ctx.class_name_arc_of_id(ctx.class_id_of_object(digest))
+            .as_deref(),
+        Some("org/bouncycastle/crypto/digests/SHA1Digest")
+    )
+}
+
 pub(crate) fn bc_pkcs12_require_sha1(
     ctx: &dyn NativeContext,
     this: ObjectRef,
@@ -10710,6 +10730,14 @@ pub(crate) fn register_bc_pkcs12_parameters_generator(r: &mut NativeMethodRegist
                 }
                 _ => 0,
             };
+            if !bc_pkcs12_is_sha1(ctx, this) {
+                return ctx.invoke_virtual_bytecode_only(
+                    this,
+                    "generateDerivedParameters",
+                    "(I)Lorg/bouncycastle/crypto/CipherParameters;",
+                    &[args.get(1).copied().unwrap_or(Value::Int(0))],
+                );
+            }
             let (password, salt, iteration_count) = bc_pkcs12_read_state(ctx, this)?;
             let key = bc_pkcs12_derive_sha1(&password, &salt, iteration_count, 1, key_size);
             let obj = bc_pkcs12_key_parameter(ctx, &key)?;
@@ -10736,6 +10764,14 @@ pub(crate) fn register_bc_pkcs12_parameters_generator(r: &mut NativeMethodRegist
                 }
                 _ => 0,
             };
+            if !bc_pkcs12_is_sha1(ctx, this) {
+                return ctx.invoke_virtual_bytecode_only(
+                    this,
+                    "generateDerivedParameters",
+                    "(II)Lorg/bouncycastle/crypto/CipherParameters;",
+                    &[args.get(1).copied().unwrap_or(Value::Int(0)), args.get(2).copied().unwrap_or(Value::Int(0))],
+                );
+            }
             let (password, salt, iteration_count) = bc_pkcs12_read_state(ctx, this)?;
             let key = bc_pkcs12_derive_sha1(&password, &salt, iteration_count, 1, key_size);
             let iv = bc_pkcs12_derive_sha1(&password, &salt, iteration_count, 2, iv_size);
@@ -10756,6 +10792,14 @@ pub(crate) fn register_bc_pkcs12_parameters_generator(r: &mut NativeMethodRegist
                 }
                 _ => 0,
             };
+            if !bc_pkcs12_is_sha1(ctx, this) {
+                return ctx.invoke_virtual_bytecode_only(
+                    this,
+                    "generateDerivedMacParameters",
+                    "(I)Lorg/bouncycastle/crypto/CipherParameters;",
+                    &[args.get(1).copied().unwrap_or(Value::Int(0))],
+                );
+            }
             let (password, salt, iteration_count) = bc_pkcs12_read_state(ctx, this)?;
             let key = bc_pkcs12_derive_sha1(&password, &salt, iteration_count, 3, key_size);
             let obj = bc_pkcs12_key_parameter(ctx, &key)?;
