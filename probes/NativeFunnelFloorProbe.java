@@ -40,6 +40,34 @@ public final class NativeFunnelFloorProbe {
     /** The control: a user-written call of the same shape, no native at all. */
     static int plain(int i) { return i & 0xFFFF; }
 
+    /**
+     * Three Java-callee shapes, so the DISPATCH helper's own cost is measurable
+     * from Java the way the native funnel's is.
+     *
+     * `plain` is `invokestatic` on a class the caller's compile can bind
+     * directly. `Op.apply` is `invokeinterface` on one implementation, so the
+     * call site is monomorphic but cannot be statically bound. `Guarded.apply`
+     * is the same shape with a never-taken `try`/`catch` in the callee, which
+     * bars it from the inline machine-code MIC/PIC cascade
+     * (`mic_publish_exception_table_callees`) and routes every call through the
+     * Rust-level entry cache instead — the shape netty's buffer methods have.
+     */
+    interface Op { int apply(int i); }
+
+    static final class Direct implements Op {
+        @Override public int apply(int i) { return i & 0xFFFF; }
+    }
+
+    static final class Guarded implements Op {
+        @Override public int apply(int i) {
+            try { return i & 0xFFFF; }
+            catch (RuntimeException e) { return -1; }
+        }
+    }
+
+    static final Op DIRECT = new Direct();
+    static final Op GUARDED = new Guarded();
+
     static long a_empty(int n)        { long a=0; for (int i=0;i<n;i++) { a += i; } return a; }
     static long b_plainCall(int n)    { long a=0; for (int i=0;i<n;i++) { a += plain(i); } return a; }
     static long c_atomicGet(int n)    { long a=0; for (int i=0;i<n;i++) { a += AI.get(); } return a; }
@@ -48,6 +76,8 @@ public final class NativeFunnelFloorProbe {
     static long f_nanoTime(int n)     { long a=0; for (int i=0;i<n;i++) { a += System.nanoTime(); } return a; }
     static long g_mdUpdateByte(int n) { long a=0; for (int i=0;i<n;i++) { MD.update((byte) i); a += i; } return a; }
     static long h_currentThread(int n){ Object o=null; for (int i=0;i<n;i++) { o = Thread.currentThread(); } osink=o; return 1; }
+    static long i_iface(int n)        { long a=0; for (int i=0;i<n;i++) { a += DIRECT.apply(i); } return a; }
+    static long j_ifaceGuarded(int n) { long a=0; for (int i=0;i<n;i++) { a += GUARDED.apply(i); } return a; }
 
     interface Arm { long run(int n); }
 
@@ -73,6 +103,8 @@ public final class NativeFunnelFloorProbe {
         time("FUNNEL System.nanoTime",      NativeFunnelFloorProbe::f_nanoTime, n, reps);
         time("FUNNEL MessageDigest.update", NativeFunnelFloorProbe::g_mdUpdateByte, n, reps);
         time("Thread.currentThread",        NativeFunnelFloorProbe::h_currentThread, n, reps);
+        time("JAVA iface call (1 impl)",     NativeFunnelFloorProbe::i_iface, n, reps);
+        time("JAVA iface call, try/catch",   NativeFunnelFloorProbe::j_ifaceGuarded, n, reps);
 
         // Not decoration: a fast path that broke the digest contract would
         // still print the numbers above. This is the SHA-256 of the 8 bytes
