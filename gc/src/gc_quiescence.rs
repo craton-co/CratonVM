@@ -1882,7 +1882,8 @@ type VacatedLedger = (
     rustc_hash::FxHashSet<usize>,
 );
 
-static VACATED_ADDRS: parking_lot::Mutex<Option<VacatedLedger>> = parking_lot::Mutex::new(None);
+static VACATED_ADDRS: parking_lot::RwLock<Option<VacatedLedger>> =
+    parking_lot::RwLock::new(None);
 
 /// `CRATONVM_DBG_VACATED_FRAMES=1` — arm the vacated-address ledger.
 pub fn vacated_frames_enabled() -> bool {
@@ -1911,7 +1912,7 @@ pub fn record_vacated(pointer_map: &cratonvm_types::PointerMap) {
         return;
     }
     let to: rustc_hash::FxHashSet<usize> = pointer_map.values().copied().collect();
-    let mut g = VACATED_ADDRS.lock();
+    let mut g = VACATED_ADDRS.write();
     let (from, dests) = g.get_or_insert_with(Default::default);
     // ACCUMULATE across collections rather than replace. A stale reference is
     // not necessarily consumed before the next cycle, and a ledger that only
@@ -1936,6 +1937,74 @@ pub fn record_vacated(pointer_map: &cratonvm_types::PointerMap) {
     *dests = to;
 }
 
+/// Addresses the per-bci local-liveness filter kept OUT of a root snapshot,
+/// with the frame that held them.
+///
+/// `CRATONVM_DBG_VACATED_FRAMES` only. The filter's contract is that a slot it
+/// reports dead can never be read again under bytecode semantics — so if an
+/// address it dropped later turns up as a failing receiver, the analysis was
+/// wrong about that slot, and this names the method and the slot to look at.
+/// Bounded; oldest entries are simply overwritten.
+static LIVENESS_FILTERED: parking_lot::RwLock<Option<rustc_hash::FxHashMap<usize, String>>> =
+    parking_lot::RwLock::new(None);
+
+const LIVENESS_FILTERED_MAX: usize = 8192;
+
+/// Record that `addr` was in `where_` and the liveness filter dropped it.
+pub fn note_liveness_filtered(addr: usize, where_: impl FnOnce() -> String) {
+    if !vacated_frames_enabled() {
+        return;
+    }
+    let mut g = LIVENESS_FILTERED.write();
+    let map = g.get_or_insert_with(Default::default);
+    if map.len() >= LIVENESS_FILTERED_MAX {
+        map.clear();
+    }
+    map.insert(addr, where_());
+}
+
+/// Was `addr` dropped from a root snapshot by the liveness filter, and where?
+pub fn liveness_filtered_at(addr: usize) -> Option<String> {
+    if !vacated_frames_enabled() {
+        return None;
+    }
+    LIVENESS_FILTERED.read().as_ref()?.get(&addr).cloned()
+}
+
+/// Report a heap access whose RECEIVER is an address this collector moved an
+/// object away from, with the Rust caller chain.
+///
+/// A stale receiver is worse than a stale value: every field read off it
+/// returns whatever now occupies the memory, which is a perfectly valid object
+/// of an unrelated class. The value that reaches the operand stack therefore
+/// looks clean to every other instrument, and only the `checkcast` one
+/// instruction later disagrees.
+#[inline(always)]
+pub fn report_vacated_receiver(addr: usize, site: &'static str) {
+    if !vacated_frames_enabled() {
+        return;
+    }
+    if let Some(moved_to) = was_vacated(addr) {
+        report_vacated_receiver_cold(addr, moved_to, site);
+    }
+}
+
+#[cold]
+fn report_vacated_receiver_cold(addr: usize, moved_to: usize, site: &'static str) {
+    static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) >= 12 {
+        return;
+    }
+    tracing::error!(
+        target: "cratonvm::gc::guard",
+        obj = format!("{addr:#x}"),
+        moved_to = format!("{moved_to:#x}"),
+        site,
+        backtrace = %std::backtrace::Backtrace::force_capture(),
+        "a heap access RECEIVER is an address the collector moved an object away from —          every field read through it returns whatever now occupies that memory. The          backtrace names the VM code holding it."
+    );
+}
+
 /// Forget every address in `addrs` — the allocator has re-issued it, so a
 /// reference to it is no longer evidence of anything. Called from the
 /// allocation paths; a no-op unless the ledger is armed.
@@ -1943,7 +2012,7 @@ pub fn note_allocated(addrs: &[usize]) {
     if !vacated_frames_enabled() {
         return;
     }
-    let mut g = VACATED_ADDRS.lock();
+    let mut g = VACATED_ADDRS.write();
     let Some((from, _to)) = g.as_mut() else {
         return;
     };
@@ -1965,7 +2034,7 @@ pub fn was_vacated(addr: usize) -> Option<usize> {
     if !vacated_frames_enabled() {
         return None;
     }
-    let g = VACATED_ADDRS.lock();
+    let g = VACATED_ADDRS.read();
     let (from, dests) = g.as_ref()?;
     if dests.contains(&addr) {
         return None;

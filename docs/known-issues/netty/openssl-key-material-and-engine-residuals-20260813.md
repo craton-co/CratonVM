@@ -291,11 +291,46 @@ HotSpot.
   `engine_run_trust_check` becomes the fallback for paths with no published
   context.
 
-  Prove the destination before the refactor: an in-tree client/server
-  `EngineState` pair test (the `engine_wrap_pump`/`engine_unwrap_pump` harness
-  around line 8030) with a client verifier that always rejects should show the
-  SERVER receiving a decryptable alert while `is_handshaking()` is still
-  true — which is the whole property the current design cannot deliver.
+  **The destination is PROVEN, 2026-08-17.** The in-tree pair test this page
+  asked for exists:
+  `t27_tls::tests::a_verifier_time_rejection_reaches_the_server_while_it_is_still_handshaking`.
+  A client whose `ServerCertVerifier` returns
+  `InvalidCertificate(ApplicationVerificationFailure)` produces an alert the
+  server DECRYPTS (no `DecryptError`) while `is_handshaking()` is still true, so
+  a verifier-time verdict does deliver the property. The test carries its own
+  ACCEPTING control arm through the same driver — with the chain accepted the
+  server must COMPLETE its handshake and see no error — because otherwise the
+  three assertions would also pass on a driver that never handshook at all.
+
+  So what is left is only the plumbing, and it is the plumbing that is
+  expensive. Sizing it, measured on the source rather than estimated:
+
+  * The record loop is `do_unwrap`'s
+    `if let (true, Some(conn)) = (src_resolved, s.conn.as_mut()) { loop { … } }`,
+    ~210 lines, inside a single `let (status, hs, plaintext, pending_trust_check) = { … }`
+    block that holds `engine_registry().write()` across the pre-loop replay, the
+    loop, and ~150 lines of post-loop work. Splitting it into
+    lock / no-lock / lock means moving all three.
+  * The loop body itself IS clean: a census of `s.*` accesses between the loop's
+    braces finds none — every one belongs to the pre- or post-loop section — so
+    checking `conn` out of `EngineState` for the loop's duration is sound. It
+    needs an RAII restore guard rather than an explicit put-back, because the
+    loop has an early `return Err(throw_jca_exc(…))` on the
+    `process_new_packets` error path and a missed restore leaves `s.conn == None`
+    for the life of that engine, i.e. every later wrap and unwrap on it fails.
+  * `set_active_native_context` publishes the ctx with no lifetime on its guard,
+    and three call sites already publish-then-keep-using `ctx`, so the
+    verifier's upcall has a working mechanism.
+
+  **Not attempted on `fix/netty-nio-pcap-tls-residuals-20260817`, deliberately.**
+  This is the busiest path in the TLS engine, and its verification surface is
+  `JdkSslEngineTest` (821 tests), `SslHandlerTest`, `SslContextBuilderTest` and
+  `ParameterizedSslHandlerTest`, ABBA-interleaved — which this page itself says
+  must be read only from a QUIET host. The Azure box sat at load 17-35 with
+  14-16 users throughout this session. Shipping an unverifiable restructuring of
+  the record loop to fix ONE test risks the hundreds that pass today, and the
+  failure mode of getting the restore wrong is a permanently dead engine, not a
+  test failure. The next session should start from the proof test above.
 * ~~`testClientHandshakeTimeoutBecauseExecutorNotExecute` /
   `testServerHandshakeTimeoutBecauseExecutorNotExecute`~~ — FIXED 2026-08-16.
   The engine implements JSSE's delegated-task contract now; `DelegatedTask` in
