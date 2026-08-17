@@ -21,15 +21,17 @@ that tests drive?
 |---|---|---|
 | **Parallel marking** | **Built, opt-in** | `CRATONVM_ZGC_PARMARK=<n>` reaches `mark_parallel_stw` from `collect_garbage` |
 | **Compacting** | **Built, opt-in** | `CRATONVM_ZGC_RELOCATE=1` reaches `relocate_stw` from `collect_garbage`; returns a non-empty `PointerMap` and rewrites roots |
-| **Concurrent** | **PARTLY BUILT — the driver runs, the mutators do not** | Since 2026-08-14 `ZgcConcurrentMarkController` drives every collection against `ZgcRealHeap`, with its restart loop, mark-end handshake and `mark_set_complete` verdict. What is not concurrent is the mutator half: the cycle runs **at a safepoint**, so `ZgcNoMutatorSafepoint` is legitimately a no-op and `set_mark_active(true)` still has no non-test caller. C1 and C2 below are what make it concurrent |
+| **Concurrent** | **BUILT since 2026-08-16 — the mutators really do run** | `maybe_gc` opens a cycle at a brief STW once allocation crosses `CRATONVM_ZGC_CONC_START`% of the collection threshold; the pool traces the closure while every mutator runs; the next collection's pause replays the SATB ingress, re-scans the roots and certifies the mark set. `set_mark_active(true)` has a production caller, allocation is BLACK during a cycle, and `--verbose:gc` says `mark=concurrent`. See §2 for what landed and how it differs from C1's expected shape |
 | **Generational** | **NOT BUILT** | page ages, the card barrier and `ZGenerationScope` are computed inside `relocate_stw`, but `remembered_roots` has **no non-test caller** and there is no young-only collection. (`minor_collect` in `zgc.rs` belongs to the *simulation* half, not `ZgcRealHeap`.) |
 
-So the first two are a flag away, generational is a project, and concurrency
-is now half a project: the machinery runs, the mutators are still stopped while
-it does. Saying "ZGC isn't concurrent by default" would be wrong in a way this
-tree has been burned by before — it is not off, and it is no longer wholly
-absent either. The precise missing thing is a `ZgcMarkSafepoint` that really
-stops mutators and a pool that outlives it.
+**Updated 2026-08-16.** Concurrency landed. The rest of this section is kept as
+written on 2026-08-13 so the diff between what was planned and what was built
+stays legible; §2's per-item headers say which of C1–C5 are closed and which
+are not, and C1 closed in a **different shape** than it was specified in — for
+an architectural reason that is worth reading before the next collector change
+proposes a background thread that takes a safepoint.
+
+Generational is still a project and is untouched by this.
 
 **What already exists, and is the reason this is weeks and not months:**
 
@@ -56,7 +58,74 @@ barrier feeding `mark::ZMarkIngress`, and a decision on
 `collect_garbage_with_finalizers`'s resurrection pass". The barrier is done.
 Two remain, plus the piece that phase did not name.
 
-### C1 — `ZgcMarkSafepoint` for the real VM *(the critical path)*
+### C1 — a real mark safepoint — **CLOSED 2026-08-16, in a different shape**
+
+**What was built, and why it is not what this item asked for.** This item
+specified an `Arc<dyn ZgcMarkSafepoint>` whose implementor drives the VM's STW
+path, so that `ZgcConcurrentMarkController`'s *driver thread* could take the
+mark-end pause itself. That cannot be built in this VM, and the reason is
+structural rather than a matter of effort:
+
+* `GcBarrier::request_stw_counted_with_live_blocked` is keyed on a **registered
+  `ThreadId`**;
+* `stw_take_over_and_wait` forcibly stops in-JIT peers using the *initiator's*
+  own JIT context and conservatively scans them;
+* `StopTheWorldToken` is `!Send` on purpose, and this item's own text
+  acknowledges that by making the implementor own it on the stopping thread.
+
+A GC background thread satisfies none of the three. G1 hit the same wall and
+answered it by putting **both** phase boundaries on mutators —
+`g1_concurrent_mark_cycle` opens the cycle, `g1_final_remark_cleanup` closes it
+— with the background worker doing only the part that needs no safepoint.
+
+ZGC now does the same:
+
+```text
+  mark start   MUTATOR, brief STW   zgc_concurrent_mark_cycle -> start_concurrent_mark
+  concurrent   MARK WORKERS         the pool traces; every mutator runs
+  mark end     MUTATOR, the GC STW  collect_garbage -> finish_concurrent_mark
+  sweep        MUTATOR, same STW    the unchanged collect_garbage tail
+```
+
+`ZgcMarkSafepoint` and `ZgcNoMutatorSafepoint` are untouched and still correct
+for the stop-the-world driver path in `mark_with_controller_stw`. What this VM
+does not have is a caller for a *non*-no-op implementation, and after this
+change it is clear that it never will — that is worth knowing before the next
+collector change proposes one.
+
+**Two things SATB needed beyond the pre-write barrier, and both are in
+`gc/src/zgc.rs`:**
+
+* **Allocation is BLACK during a cycle** (`allocate_black_if_marking`). The
+  concurrent mark closes over the root set *as it was at mark start*; nothing
+  allocated afterwards is in it, so without this the sweep frees the entire
+  live set a busy allocator produced while the marker ran. It is set AFTER the
+  header write, because `ptr::write` of an `ObjectHeader` clobbers the flags
+  byte and a bit set before it would be erased silently.
+* **The roots are re-scanned inside the mark-end pause.** A thread created
+  during the concurrent phase has a stack the mark-start scan never saw.
+
+**And one hole the call-site census had:** `System.arraycopy` copies a
+reference array element by element through `NativeContext::set_array_element`,
+and no pre-write barrier sat anywhere above that path. Both accessors
+(`ZgcRealHeap::set_field` and `set_array_element`) now publish the overwritten
+reference themselves, so coverage is a property of the ONE store path rather
+than of a census that has to stay complete forever. **G1 has the same hole and
+it is still open there** — G1's concurrent marking is reachable today, so this
+is a live defect on that backend, not a hypothetical.
+
+**Fails closed.** If the mark-end handshake cannot certify a complete mark set,
+`finish_concurrent_mark` returns `None`, `collect_garbage` clears every mark bit
+and marks from scratch. A sweep against an uncertified mark set is a
+use-after-free; this is the same fail-closed discipline
+`mark_with_controller_stw` already had.
+
+**Kill switch:** `CRATONVM_ZGC_CONC_START=0` (or `CRATONVM_GC=-zgc-conc-start`).
+
+<details>
+<summary>The 2026-08-13 specification, kept for the diff</summary>
+
+#### C1 (as specified) — `ZgcMarkSafepoint` for the real VM *(the critical path)*
 
 **Narrowed 2026-08-14.** The driver, its restart loop and its verdict are now
 exercised on the real heap every cycle, so this is no longer "wire up an
@@ -87,7 +156,36 @@ correct and it is the thing to fix second, not first (C4).
 **Exit:** a concurrent cycle runs to `Complete` on a real heap with mutators
 running, under a test that allocates and stores from several threads.
 
-### C2 — Own the coordinator across cycles
+</details>
+
+**Exit MET.** `several_mutator_threads_run_during_the_concurrent_phase` in
+`gc/src/zgc.rs` runs four mutator threads that allocate and store into the live
+set for the whole concurrent phase, then asserts `cycles_completed == 1` — not
+merely that the graph survived, which is satisfied by the feature being
+switched off and is the vacuous green this change had available to it.
+
+### C2 — an owner for the coordinator — **CLOSED 2026-08-16, option (1)**
+
+`VmHeap::Zgc` holds `Arc<ZgcRealHeap>`. That is the "honest fix" this item
+recommended, and it cost far less than the 69-site estimate: `Arc<T>` derefs to
+`T` and `ZgcRealHeap` has **no `&mut self` method**, so every existing
+`VmHeap::Zgc(h) => h.method()` compiles unchanged. The heap is then handed to
+the engine as the `Arc<dyn ZMarkContext>` it already implements — no bridge, no
+`unsafe`, and no "the heap is never moved" argument.
+
+One correction to this item's framing: the pool is built at mark start and
+**dropped at mark end**, not kept across cycles. A coordinator parked on the
+heap would hold `Arc<ZgcRealHeap>`, i.e. a reference cycle, and the heap and its
+worker threads would never be freed. Dropping it at mark end breaks that cycle
+at a point the collector controls, and `ZMarkCoordinator::drop` stops and JOINS
+every worker there — so no thread holding a clone of the heap outlives the
+cycle. The cost is one pool spawn per *concurrent cycle*, which is strictly
+fewer than the per-*collection* spawn `mark_parallel_stw` was already paying.
+
+<details>
+<summary>The 2026-08-13 specification, kept for the diff</summary>
+
+#### C2 (as specified) — Own the coordinator across cycles
 
 `mark_parallel_stw` builds a `ZMarkCoordinator` per collection and joins it,
 which is sound (see `ZHeapMarkBridge`) and pays a pool spawn every GC. A
@@ -111,7 +209,34 @@ justified for a pool that outlives the call.
 **Exit:** one worker pool per heap, surviving across collections; the
 per-collection spawn disappears from `mark_parallel_stw` too.
 
-### C3 — Decide the resurrection pass
+</details>
+
+**Exit MET in substance, not in letter.** One pool per *cycle* rather than per
+heap, for the ownership reason above. `mark_parallel_stw` keeps its own
+per-collection pool: it is the fallback path now, and giving it a shared pool
+would put a live coordinator on the heap for exactly the reason this item's
+option (1) exists to avoid.
+
+### C3 — the resurrection pass — **DECIDED 2026-08-16: the first option**
+
+It runs inside the mark-end safepoint, before the sweep, exactly where it
+already was. The second option — feeding the finalizable roots through
+`ZNonStrongRefHook::keep_alive` so the driver re-drains them — was written for
+a design in which the driver thread owns the mark-end pause. It does not, and
+cannot (see C1), so there is no shorter pause to protect: the resurrection pass
+and the sweep are already in the same stop-the-world block, and moving the pass
+into a hook would relocate work from one half of that block to the other while
+adding a phase.
+
+The cost this item warned about is real and is accepted: the pause is longer by
+the finalizable subtree. What made that acceptable is what changed around it —
+the *strong* closure, which is the part that scales with the live set, has left
+the pause entirely.
+
+<details>
+<summary>The 2026-08-13 specification, kept for the diff</summary>
+
+#### C3 (as specified) — Decide the resurrection pass
 
 `collect_garbage_with_finalizers` marks dead-but-finalizable objects and their
 subtrees live *after* the main closure, so that "unmarked" means dead. Under a
@@ -130,7 +255,29 @@ discover:
 The second is what `ZNonStrongRefHook` was designed for. Prefer it; measure the
 restart count.
 
-### C4 — Per-thread mark buffers
+</details>
+
+### C4 — per-thread mark buffers — **PARTLY SUPERSEDED 2026-08-16**
+
+The problem this item names — SATB work sitting in a queue nobody is draining —
+turned out to have a larger half than the per-store mutex, and the larger half
+is fixed. `ZgcRealHeap::hand_satb_batch_to_the_marker` moves the accumulated
+ingress into the marker's own stripes every `Z_SATB_HANDOFF_INTERVAL` (8192)
+publications, and **re-arms the pool if it has already terminated** — without
+that, the first time the marker caught up with the graph it stopped for good and
+every SATB reference published afterwards waited for the pause. It also bounds
+the ingress, which was otherwise growing with the reference-store count rather
+than with the live set and appeared in no heap figure the VM reports.
+
+What is NOT done is the per-thread buffer itself. `satb_pre_barrier` is reached
+through `VmHeap::satb_barrier` with no thread context at all, so a real
+`ZMarkHandle::new_buffer` per mutator needs thread-keyed state on the heap
+first. It is still worth doing and it is still pure throughput.
+
+<details>
+<summary>The 2026-08-13 specification, kept for the diff</summary>
+
+#### C4 (as specified) — Per-thread mark buffers
 
 Replace the shared-ingress push with `ZMarkHandle::new_buffer` per mutator
 thread, flushed at the mark-end safepoint. **Construct them with
@@ -140,6 +287,8 @@ marked-and-unscanned, which is a use-after-free rather than a lost
 optimisation, because the mark bit is what dedups them.
 
 Pure throughput; do it after C1–C3 work.
+
+</details>
 
 ### C5 — Make the marker actually scale *(new 2026-08-14, and it is the one with a number)*
 

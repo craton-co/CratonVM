@@ -35,10 +35,14 @@ unconditional.
   sweep phases run inline on the mutator that initiated the cycle, holding
   `old_gen_lock()`. Other mutators keep running, so the pause is short, but the
   initiating thread pays the whole phase.
-- **ZGC is not concurrent.** `gc/src/zgc_concurrent.rs` compiles and is
-  unit-tested but has no non-doc callers; no `ZMarkContext`-backed coordinator
-  is ever spawned for `ZgcRealHeap`. See
-  [`zgc-production-implementation-plan.md`](zgc-production-implementation-plan.md).
+- ~~**ZGC is not concurrent.**~~ **Landed 2026-08-16.** A `ZMarkCoordinator`
+  over `Arc<ZgcRealHeap>` traces the strong closure while every mutator runs;
+  the cycle opens at a brief STW from `maybe_gc` and closes inside the next
+  collection's pause. Kill switch `CRATONVM_ZGC_CONC_START=0`. See
+  [`zgc-concurrent-and-generational-plan-20260813.md`](zgc-concurrent-and-generational-plan-20260813.md)
+  §2, whose C1 records why the mark-end safepoint is taken by a **mutator**
+  rather than by `zgc_concurrent.rs`'s driver thread — no background thread in
+  this VM can take a safepoint, and G1 answers it the same way.
 - **G1 parallel evacuation has no gauntlet-scale soak.** It is on by default since 2026-08-13 on
   the strength of unit coverage and a differential checksum probe; the large-heap soak and the
   throughput measurement that would justify the flip on performance grounds have not been run.

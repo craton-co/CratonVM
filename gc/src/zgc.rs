@@ -9609,8 +9609,30 @@ impl GarbageCollector for ZgcRealHeap {
             .load(Ordering::Relaxed)
             .then(std::time::Instant::now);
 
+        // ---- CLOSE AN IN-FLIGHT CONCURRENT CYCLE -------------------------
+        //
+        // Before the TLAB retire, and therefore before ANYTHING in this
+        // function touches the arena. `finish_concurrent_mark` is where the
+        // mark workers are driven to a certified fixed point and then JOINED
+        // (`ZMarkCoordinator::drop` joins, it does not detach), so putting it
+        // first is what makes "no mark worker is running for the rest of this
+        // collection" true rather than merely likely -- and the statements
+        // below install filler headers, mutate the arena free list and
+        // eventually zero dead objects.
+        //
+        // `Some(off_heap)` means the mark bits in this heap are the certified
+        // transitive closure of the root set and the sweep may act on them:
+        // the mark phase for THIS collection already happened, mostly with the
+        // mutators running. `None` means either that no cycle was open or that
+        // the handshake refused to certify one -- in both cases the mark loop
+        // below runs from scratch, which is the same fail-closed fallback
+        // `mark_with_controller_stw` has always had.
+        let concurrent_off_heap = self.finish_concurrent_mark(roots);
+        let marked_concurrently = concurrent_off_heap.is_some();
+
         // ---- RETIRE EVERY TLAB -------------------------------------------
-        // FIRST statement of the cycle, before the registry snapshot below and
+        // First statement after the concurrent-cycle handshake above, before
+        // the registry snapshot below and
         // therefore before anything reads or walks a heap byte. This is the
         // module invariant `gc::zgc::tlab` states, honoured here for the three
         // things it actually buys on THIS heap:
@@ -9651,22 +9673,6 @@ impl GarbageCollector for ZgcRealHeap {
         // membership is O(1). On the bitmap arm it copies one bit per 8 arena
         // bytes rather than 8+ bytes per live object, so it is also strictly
         // cheaper than the set clone at any occupancy above ~1.5%.
-        // ---- CLOSE AN IN-FLIGHT CONCURRENT CYCLE -------------------------
-        //
-        // FIRST, and before the registry snapshot below, because the handshake
-        // replays the mutator ingress and re-scans the roots -- both of which
-        // can newly mark an object, and the snapshot is the sweep's oracle.
-        //
-        // `Some(off_heap)` means the mark bits in this heap are the certified
-        // transitive closure of the root set and the sweep may act on them:
-        // the mark phase for THIS collection already happened, mostly with the
-        // mutators running. `None` means either that no cycle was open or that
-        // the handshake refused to certify one -- in both cases the mark loop
-        // below runs from scratch, which is the same fail-closed fallback
-        // `mark_with_controller_stw` has always had.
-        let concurrent_off_heap = self.finish_concurrent_mark(roots);
-        let marked_concurrently = concurrent_off_heap.is_some();
-
         let registered: ZObjectStartsSnapshot = self.registry.snapshot();
         let all: Vec<usize> = registered.bases();
 
@@ -15164,6 +15170,132 @@ pub(crate) mod tests {
             }
         }
         assert!(!attached.is_empty());
+    }
+
+
+    /// The store accessors publish the overwritten reference themselves.
+    ///
+    /// # The hole this pins shut
+    ///
+    /// `putfield` and `aastore` call `VmHeap::satb_barrier` at the CALL SITE,
+    /// and a census of those call sites is how SATB coverage used to be
+    /// argued. `System.arraycopy` is not in that census: it copies a reference
+    /// array one element at a time through `NativeContext::set_array_element`,
+    /// which reaches `ZgcRealHeap::set_array_element` with no pre-write barrier
+    /// anywhere above it. Under a concurrent cycle that loses every reference
+    /// the copy overwrote, and the sweep then frees objects the source array
+    /// still points at.
+    ///
+    /// This asserts the barrier FIRES, not that some object survived. A
+    /// survival assertion is satisfied by the marker having happened to trace
+    /// the object already, which is a race the test would win almost every
+    /// time and lose in CI.
+    #[test]
+    fn the_store_accessors_publish_the_overwritten_reference() {
+        let heap = ZgcRealHeap::new_shared(16 * 1024 * 1024);
+        let holder = heap.alloc_object(ClassId::new(61), 1);
+        let arr = heap.alloc_array(ClassId::new(62), ArrayElementType::Reference, 2);
+        let victim_a = heap.alloc_object(ClassId::new(63), 0);
+        let victim_b = heap.alloc_object(ClassId::new(63), 0);
+        heap.set_field(holder, 0, Value::Object(Some(victim_a)));
+        heap.set_array_element(arr, 0, Value::Object(Some(victim_b)))
+            .expect("in bounds");
+
+        // No cycle: the barrier is disarmed and neither store publishes.
+        assert_eq!(heap.mark_ingress_pushes(), 0);
+
+        // SAFETY: single-threaded test.
+        let stw = unsafe { StopTheWorldToken::new() };
+        assert!(heap.start_concurrent_mark(&stw, &[holder.as_ptr() as u64]));
+
+        // A field overwrite through the ACCESSOR, with no `satb_pre_barrier`
+        // call of our own -- exactly what a VM-internal or reflective store
+        // looks like.
+        let before = heap.mark_ingress_pushes();
+        heap.set_field(holder, 0, Value::Object(None));
+        assert_eq!(
+            heap.mark_ingress_pushes(),
+            before + 1,
+            "set_field must publish the overwritten reference"
+        );
+
+        // ...and an array-element overwrite, which is the `System.arraycopy`
+        // shape.
+        let before = heap.mark_ingress_pushes();
+        heap.set_array_element(arr, 0, Value::Object(None))
+            .expect("in bounds");
+        assert_eq!(
+            heap.mark_ingress_pushes(),
+            before + 1,
+            "set_array_element must publish the overwritten reference -- this is \
+             the System.arraycopy hole"
+        );
+
+        // A null overwrite carries no edge and must not publish, or the
+        // ingress fills with nothing on every array initialisation.
+        let before = heap.mark_ingress_pushes();
+        heap.set_array_element(arr, 1, Value::Object(None))
+            .expect("in bounds");
+        assert_eq!(heap.mark_ingress_pushes(), before);
+
+        heap.abandon_concurrent_mark();
+    }
+
+    /// Under SATB, an object whose only reference is overwritten DURING the
+    /// cycle survives that cycle. End-to-end over the accessor path, with no
+    /// hand-written barrier call anywhere.
+    ///
+    /// The chain is long and `holder` sits at the far end of it so the marker
+    /// has real work ahead of it, but the assertion does NOT depend on winning
+    /// that race: SATB keeps the victim either way, and that is the point --
+    /// the collector must not need the marker to be slow.
+    #[test]
+    fn satb_keeps_a_reference_overwritten_during_the_cycle() {
+        let heap = ZgcRealHeap::new_shared(64 * 1024 * 1024);
+        let (head, chain, _garbage) = conc_build_graph(&heap, 5_000, 0);
+        // The last chain node holds the only reference to `victim`.
+        // SAFETY: registered base of this heap.
+        let tail = unsafe { ObjectRef::from_raw(chain[chain.len() - 1] as *mut u8) };
+        let victim = heap.alloc_object(ClassId::new(64), 0);
+        let victim_addr = victim.as_ptr() as usize;
+        heap.set_field(tail, 1, Value::Object(Some(victim)));
+
+        {
+            // SAFETY: single-threaded test.
+            let stw = unsafe { StopTheWorldToken::new() };
+            assert!(heap.start_concurrent_mark(&stw, &[head.as_ptr() as u64]));
+        }
+        // Cut the only edge to `victim`, through the accessor.
+        heap.set_field(tail, 1, Value::Object(None));
+
+        {
+            // SAFETY: single-threaded test.
+            let stw = unsafe { StopTheWorldToken::new() };
+            let mut roots = [head];
+            let _ = heap.collect_garbage(&stw, &mut roots, &NoMonitors);
+        }
+
+        assert_eq!(heap.concurrent_mark_stats().1, 1, "the cycle was certified");
+        assert!(
+            heap.is_object_address(victim_addr).is_some(),
+            "an object whose only reference was overwritten mid-cycle must survive \
+             THIS cycle -- snapshot-at-the-beginning is conservative, and the \
+             alternative is freeing an object a mutator may still hold in a \
+             register"
+        );
+
+        // ...and it is collected by the NEXT cycle, which is what makes the
+        // conservatism floating garbage rather than a leak.
+        {
+            // SAFETY: single-threaded test.
+            let stw = unsafe { StopTheWorldToken::new() };
+            let mut roots = [head];
+            let _ = heap.collect_garbage(&stw, &mut roots, &NoMonitors);
+        }
+        assert!(
+            heap.is_object_address(victim_addr).is_none(),
+            "the next cycle must reclaim it, or SATB conservatism is a leak"
+        );
     }
 
     /// The trigger fires below the collection threshold and not above it, and
