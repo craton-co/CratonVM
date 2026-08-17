@@ -1719,6 +1719,83 @@ const NEGATIVE_ZERO_DOUBLE_BITS: u64 = 0x8000_0000_0000_0000;
 /// Raw bits of `-0.0f`, matching `Math`'s own `negativeZeroFloatBits`.
 const NEGATIVE_ZERO_FLOAT_BITS: u32 = 0x8000_0000;
 
+/// `Double.doubleToLongBits` semantics: every NaN collapses to one pattern.
+///
+/// This is the difference between `doubleToLongBits` and `doubleToRawLongBits`,
+/// and `Double.compare`, `Double.equals` and `Double.hashCode` are all specified
+/// in terms of the FORMER. Using raw bits makes two NaNs with different payloads
+/// unequal, which is not an exotic case: `Math.sqrt(-1.0)` is `fff8…` on x86 —
+/// on HotSpot too — while the `Double.NaN` constant is `7ff8…`, so a test that
+/// asserts `assertEquals(Double.NaN, Math.sqrt(-1.0), 0.0)` passes on HotSpot
+/// and failed here, printing "expected: Double<NaN> but was: Double<NaN>".
+#[inline]
+pub(crate) fn double_to_long_bits_canonical(v: f64) -> u64 {
+    if v.is_nan() {
+        0x7ff8_0000_0000_0000
+    } else {
+        v.to_bits()
+    }
+}
+
+/// `Float.floatToIntBits` semantics — see the double version.
+#[inline]
+pub(crate) fn float_to_int_bits_canonical(v: f32) -> u32 {
+    if v.is_nan() {
+        0x7fc0_0000
+    } else {
+        v.to_bits()
+    }
+}
+
+/// `Double.compare`, transcribed.
+///
+/// `f64::total_cmp` is NOT this function. It implements IEEE 754 totalOrder,
+/// which deliberately ORDERS NaNs by sign and payload (`-NaN < -inf < … < +inf
+/// < +NaN`); Java canonicalizes first, so all NaNs are equal to each other and
+/// greater than everything else. The two agree on `-0.0 < +0.0` and on
+/// NaN-versus-number, which is why the substitution looked right.
+#[inline]
+pub(crate) fn java_compare_double(a: f64, b: f64) -> i32 {
+    if a < b {
+        return -1;
+    }
+    if a > b {
+        return 1;
+    }
+    let ab = double_to_long_bits_canonical(a);
+    let bb = double_to_long_bits_canonical(b);
+    match ab.cmp(&bb) {
+        std::cmp::Ordering::Equal => 0,
+        // Signed comparison: the bit patterns are read as long, so the negative
+        // zero / negative number ordering falls out of the sign bit.
+        _ => {
+            if (ab as i64) < (bb as i64) {
+                -1
+            } else {
+                1
+            }
+        }
+    }
+}
+
+/// `Float.compare`, transcribed — see the double version.
+#[inline]
+pub(crate) fn java_compare_float(a: f32, b: f32) -> i32 {
+    if a < b {
+        return -1;
+    }
+    if a > b {
+        return 1;
+    }
+    let ab = float_to_int_bits_canonical(a) as i32;
+    let bb = float_to_int_bits_canonical(b) as i32;
+    match ab.cmp(&bb) {
+        std::cmp::Ordering::Equal => 0,
+        std::cmp::Ordering::Less => -1,
+        std::cmp::Ordering::Greater => 1,
+    }
+}
+
 // --- trig and math functions ---
 #[inline(always)]
 pub(crate) fn native_math_sqrt(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -4001,10 +4078,13 @@ pub(crate) fn native_wrapper_float_hash_code(
         Value::Float(v) => v,
         _ => 0.0,
     };
-    Ok(Some(Value::Int(val.to_bits() as i32)))
+    Ok(Some(Value::Int(float_to_int_bits_canonical(val) as i32)))
 }
 
-// hashCode for Double wrapper: bits = doubleToLongBits; (bits ^ (bits >>> 32)) as i32
+// hashCode for Double wrapper: bits = doubleToLongBits; (bits ^ (bits >>> 32)) as i32.
+// `doubleToLongBits`, not the raw one: `equals` canonicalizes, so `hashCode`
+// must too, or two NaNs that are `equals` land in different hash buckets and a
+// `HashMap` keyed on a NaN sentinel silently misses.
 pub(crate) fn native_wrapper_double_hash_code(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -4017,7 +4097,7 @@ pub(crate) fn native_wrapper_double_hash_code(
         Value::Double(v) => v,
         _ => 0.0,
     };
-    let bits = val.to_bits() as i64;
+    let bits = double_to_long_bits_canonical(val) as i64;
     Ok(Some(Value::Int(
         (bits ^ ((bits as u64 >> 32) as i64)) as i32,
     )))
@@ -4154,14 +4234,19 @@ pub(crate) fn native_wrapper_float_equals(
         Value::Float(v) => v,
         _ => return Ok(Some(Value::Int(0))),
     };
-    Ok(Some(Value::Int(if a.to_bits() == b.to_bits() {
-        1
-    } else {
-        0
-    })))
+    Ok(Some(Value::Int(
+        if float_to_int_bits_canonical(a) == float_to_int_bits_canonical(b) {
+            1
+        } else {
+            0
+        },
+    )))
 }
 
-// equals for Double wrapper (NaN == NaN is true per Double.equals spec, using to_bits)
+// `Double.equals` is `doubleToLongBits(value) == doubleToLongBits(other.value)`.
+// It is the CANONICALIZING conversion, so `NaN.equals(NaN)` is true for any two
+// NaNs — not only for two copies of the same bit pattern, which is all that raw
+// `to_bits` gave. See `double_to_long_bits_canonical`.
 pub(crate) fn native_wrapper_double_equals(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -4185,11 +4270,13 @@ pub(crate) fn native_wrapper_double_equals(
         Value::Double(v) => v,
         _ => return Ok(Some(Value::Int(0))),
     };
-    Ok(Some(Value::Int(if a.to_bits() == b.to_bits() {
-        1
-    } else {
-        0
-    })))
+    Ok(Some(Value::Int(
+        if double_to_long_bits_canonical(a) == double_to_long_bits_canonical(b) {
+            1
+        } else {
+            0
+        },
+    )))
 }
 
 // ---------------------------------------------------------------------------
@@ -4854,8 +4941,7 @@ pub(crate) fn native_float_compare(
         Some(Value::Float(v)) => *v,
         _ => 0.0,
     };
-    // total_cmp matches Java semantics: -0.0 < +0.0, NaN > everything
-    Ok(Some(Value::Int(a.total_cmp(&b) as i32)))
+    Ok(Some(Value::Int(java_compare_float(a, b))))
 }
 
 pub(crate) fn native_double_compare(
@@ -4870,7 +4956,7 @@ pub(crate) fn native_double_compare(
         Some(Value::Double(v)) => *v,
         _ => 0.0,
     };
-    Ok(Some(Value::Int(a.total_cmp(&b) as i32)))
+    Ok(Some(Value::Int(java_compare_double(a, b))))
 }
 
 // --- Byte ---
