@@ -1,5 +1,6 @@
 import java.io.ByteArrayOutputStream;
 import java.io.PrintStream;
+import java.io.StringReader;
 import java.math.BigDecimal;
 import java.math.BigInteger;
 import java.math.RoundingMode;
@@ -2357,7 +2358,27 @@ public class RJdkIntrinsics3 {
         }
         ckX("regex:findWithinHorizon(s, -1)", t, "java.lang.IllegalArgumentException");
 
-        sectionEnd("regex", 42);
+        // Scanner over a READABLE, not a String. Every Scanner row above uses
+        // the String constructor, which is why an empty Scanner(Reader) was
+        // invisible: `new Scanner(System.in)`, `new Scanner(new FileReader(f))`
+        // and `new Scanner(new InputStreamReader(s))` all take this path.
+        Scanner sr = new Scanner(new StringReader("hello 42 world"));
+        ckB("regex:Scanner(Reader).hasNext()", sr.hasNext(), true);
+        ckS("regex:Scanner(Reader).next()", sr.next(), "hello");
+        ckI("regex:Scanner(Reader).nextInt()", sr.nextInt(), 42);
+
+        // Longer than one read chunk, so a chunked drain that stops after the
+        // first block is caught. 5000 'a' then a space then a token.
+        StringBuilder big = new StringBuilder();
+        for (int i = 0; i < 5000; i++) {
+            big.append('a');
+        }
+        big.append(" tail");
+        Scanner sr2 = new Scanner(new StringReader(big.toString()));
+        ckI("regex:Scanner(Reader) first token spans chunks", sr2.next().length(), 5000);
+        ckS("regex:Scanner(Reader) token after the chunk boundary", sr2.next(), "tail");
+
+        sectionEnd("regex", 47);
     }
 
     // ========================================================================
