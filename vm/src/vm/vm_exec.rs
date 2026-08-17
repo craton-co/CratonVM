@@ -2348,6 +2348,27 @@ struct NativeDiagState {
     straystack_pushed: bool,
 }
 
+/// Forward one `Value` crossing the native-API boundary through the read
+/// barrier.
+///
+/// Natives hold `ObjectRef`s in Rust locals, which are in no root set, across
+/// operations that can collect — that is precisely why every entry point of
+/// this API already forwards its RECEIVER. The VALUES they hand back were not
+/// forwarded, so a native that read an object before a callback and stored it
+/// afterwards wrote a stale pointer straight into the heap, where the next
+/// reader `checkcast`s it and gets whatever now occupies the address.
+///
+/// Cheap and confined: this is the native boundary, not the interpreter's
+/// `putfield`, and the barrier short-circuits on anything that is not a moved
+/// object.
+#[inline]
+fn forward_boundary_value(heap: &crate::memory::VmHeap, value: Value) -> Value {
+    match value {
+        Value::Object(Some(obj)) => Value::Object(Some(heap.load_and_forward(obj))),
+        other => other,
+    }
+}
+
 pub fn safe_native_call(
     shared: &SharedVm,
     thread: &mut JvmThread,
@@ -11192,6 +11213,7 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
 
     fn set_field(&self, obj: ObjectRef, index: usize, value: Value) {
         let obj = self.shared.mem.heap.load_and_forward(obj);
+        let value = forward_boundary_value(&self.shared.mem.heap, value);
         // DIAGNOSTIC-ONLY (cce0079 tree-key tail): decisive probe - capture
         // the minor-GC epoch at entry and compare at exit. A delta proves a
         // GC completed INSIDE a plain ref store (and names the stack);
@@ -11323,6 +11345,7 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
 
     fn set_field_by_name(&self, obj: ObjectRef, field_name: &str, value: Value) {
         let obj = self.shared.mem.heap.load_and_forward(obj);
+        let value = forward_boundary_value(&self.shared.mem.heap, value);
         let class_id = self.shared.mem.heap.class_id_of(obj);
         let cm = self.shared.classes.class_manager.read();
         if let Some(index) = resolve_field_index_in_hierarchy(class_id, field_name, &cm.class_store)
@@ -11596,6 +11619,7 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
     /// already suppressed by the time we see the result.
     fn set_array_element(&self, obj: ObjectRef, index: usize, value: Value) {
         let obj = self.shared.mem.heap.load_and_forward(obj);
+        let value = forward_boundary_value(&self.shared.mem.heap, value);
         // Deliberate discard: `NativeContext::set_array_element` is `-> ()`
         // and its contract is "no-op or VM error, never an out-of-bounds heap
         // write". The caller range-checks; `native-builtins`'s
@@ -16381,6 +16405,7 @@ impl<'a> NativeSystemAccess for NativeContextImpl<'a> {
     }
 
     fn set_static_field(&mut self, class_id: ClassId, field_index: usize, value: Value) {
+        let value = forward_boundary_value(&self.shared.mem.heap, value);
         super::set_static_shared(self.shared, class_id, field_index, value);
     }
 

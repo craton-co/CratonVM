@@ -366,11 +366,12 @@ with its self-tags intact.
 
 * **The cycle count roughly doubles** (6 → 12, 3 → 5). Everything allocated
   after mark start is floating garbage for that cycle, so each collection
-  reclaims less and the next arrives sooner. On the single-threaded probe that
-  turns a 38% per-cycle win into a **worse total pause** (2.22 s → 2.76 s); on
-  the multi-threaded one the total still improves (1.83 s → 1.27 s). A pause
-  measurement that quoted only the per-cycle figure would have hidden that,
-  which is why the cycle count is in the table.
+  reclaims less and the next arrives sooner. That turns a per-cycle win into a
+  **worse total pause**. ~~On the multi-threaded probe the total still improves
+  (1.83 s → 1.27 s).~~ **Withdrawn 2026-08-17 — that figure was wrong in the
+  concurrent arm's favour, because the mark-start pause was not being measured
+  at all. §2c has the corrected totals: the total pause is worse on BOTH
+  probes.**
 * **Wall clock rises 37–55%.** Two causes the arms can separate only partly:
   the mark workers compete with mutators that already saturate the box (1
   worker is cheaper than 2 on the single-threaded probe, where the mutator is
@@ -417,6 +418,130 @@ multi-threaded probe engaged only because its peers still run interpreted code.
 safepoint poll is not an alternative: `emit_safepoint_poll` fires only once
 `stw_requested` is set, which is a consequence of a collection rather than a
 cause of one.
+
+---
+
+## 2c. Why there is still a pause — the anatomy, 2026-08-17
+
+§2b measured the pause and said nothing about what was in it. Two instruments
+(`[GC] zgc-markstart:`, `[GC] zgc-pause:`, `[GC] zgc-markend:`) answer that, and
+the first thing they found was a hole in §2b itself.
+
+### The correction: the mark-start pause was measured NOWHERE
+
+`--verbose:gc`'s `pause_us` is taken inside `collect_garbage`. A concurrent
+cycle has **two** pauses, and the other one — mark start — was in no figure
+anywhere. It is 22–69 ms and it happens once per cycle. Corrected totals, idle
+box, same probes:
+
+| probe | arm | collections | Σ collection | Σ mark-start | **Σ ALL PAUSE** |
+|---|---|---:|---:|---:|---:|
+| single-threaded | stop-the-world | 7 | 2.26 s | — | **2.26 s** |
+| single-threaded | concurrent | 13 | 2.37 s | 0.47 s | **2.85 s** |
+| single-threaded | concurrent (worse rep) | 13 | 3.88 s | 0.46 s | **4.34 s** |
+| 8 mutator threads | stop-the-world | 4 | 1.80 s | — | **1.80 s** |
+| 8 mutator threads | concurrent | 6 | 1.64 s | 0.41 s | **2.05 s** |
+
+**Total pause is worse on both probes** — +26% to +92% single-threaded, +14%
+multi-threaded. §2b's claim that the multi-threaded total improved is withdrawn.
+Per-cycle it is still a win (597 → 394 µs·10³ on the threaded probe, −34%),
+which is the honest statement: **concurrent marking trades total pause for
+per-cycle pause**, and §2b reported only the half that flattered it.
+
+### What the remaining pause is made of
+
+Means over steady-state cycles (cycle 1 dropped — it collects a heap still being
+built). `mark_us` is the stop-the-world marker; it is **0** on every concurrent
+cycle, so the mark really did leave the pause.
+
+| arm | total | markend | sweep | snapshot | mark | mark-start (of which clearbits) |
+|---|---:|---:|---:|---:|---:|---:|
+| single / STW | 375 ms | — | 139 ms (37%) | 13 ms | **224 ms (60%)** | — |
+| single / conc | 197–323 ms | **80–208 ms (41–64%)** | 98–102 ms (30–52%) | 15–17 ms | 0 | 35 ms (96%) |
+| threads / STW | 597 ms | — | 210 ms (35%) | 26 ms | **360 ms (60%)** | — |
+| threads / conc | 325 ms | **136 ms (42%)** | 147 ms (45%) | 42 ms (13%) | 0 | 69 ms (96%) |
+
+**Three phases, and none of them is the concurrent mark:**
+
+1. **`markend_us`, 41–64% — the concurrent phase does not converge.**
+   `scanned_at_safepoint` says **8–28% of all tracing still happens inside the
+   pause**. The window (`CRATONVM_ZGC_CONC_START=60` → 40% of the threshold's
+   worth of allocation) is not long enough, and the SATB replay adds tracing the
+   stop-the-world arm never does. This is the biggest single lever and it is a
+   constant.
+2. **`sweep_us`, 30–52% — and it never leaves the pause at all.** ~100–147 ms,
+   stop-the-world by construction. **This is the floor:** even with a perfectly
+   converged mark, the pause on this heap cannot go below roughly
+   `sweep + snapshot`. Concurrent *marking* cannot touch it; a concurrent sweep
+   is a separate project.
+3. **The mark-start pause, 22–69 ms, of which 94–96% is `clearbits`** — a full
+   registry walk (4.6M entries single-threaded, 10.8M threaded) clearing
+   `GC_FLAG_MARKED`, inside a pause, once per cycle. The stop-the-world arm
+   folds the same walk into `mark_us`; the concurrent arm pays it as its own
+   pause. **Fixed the same day — see the ranked list below; it is now ~0.1 ms.**
+   The table above is the pre-fix state, kept because the other two rows are
+   still current.
+
+### The window sweep
+
+One rep each, `CRATONVM_ZGC_CONC_START` swept, single-threaded probe:
+
+| START | cycles | collection | markend | sweep | mark-start | **total/cycle** | tracing in pause | reclaimed |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 20 | 13 | 241 ms | **13 ms** | 104 ms | 22 ms | **263 ms** | **0.2%** | 29.3% |
+| 40 | 13 | 291 ms | 173 ms | 101 ms | 35 ms | 325 ms | 29.6% | 27.1% |
+| 60 | 13 | 194 ms | 68 ms | 109 ms | 37 ms | 231 ms | 11.6% | 27.1% |
+| 80 | 9 | 399 ms | 253 ms | 133 ms | 42 ms | 441 ms | 44.0% | 39.3% |
+
+**`START=20` converges: 0.2% of tracing in the pause and `markend_us` collapses
+to 13 ms.** That is the lever working, and it confirms the diagnosis rather than
+just correlating with it. The 40/60/80 rows swing non-monotonically and should
+not be read individually — `markend_us` varied 80–208 ms across two reps at
+START=60 alone.
+
+**It does not fix the total, though.** Reclaim stays at 29.3% against the
+stop-the-world arm's **54.3%**, so the cycle count stays doubled: 13 × 263 ms =
+3.4 s of pause against 7 × 375 ms = 2.6 s. **The reclaim rate is the number that
+decides the total, and the window does not move it.**
+
+### Ranked, with what each is worth
+
+1. **The reclaim rate, 54.3% → 27.1%.** Everything else is second order: it
+   alone doubles the cycle count and it is why the total pause is worse. It is
+   the floating-garbage cost of allocate-black, and Phase G (generational) is the
+   structural answer. Nothing short of that has been shown to move it.
+2. ~~**`clearbits`, ~95% of a 22–69 ms pause.**~~ **FIXED, same day.** The walk
+   was clearing bits that were already clear: a counter reported
+   `stale_marked=0` on **every one of 20 mark starts**, at two window settings.
+   The sweep is exhaustive — every survivor's `GC_FLAG_MARKED` cleared, every
+   corpse zeroed, the bit cleared even on the object it refuses to size — and
+   objects allocated afterwards are born clear with `allocate_black_if_marking`
+   inert outside a cycle. It is now behind `conc_bits_known_clear`, which
+   `abandon_concurrent_mark` clears because that path drops a partial trace with
+   no sweep behind it.
+
+   | | before | after |
+   |---|---:|---:|
+   | mark-start pause, single-threaded (4.6M registry) | 35,441 µs | **101 µs** |
+   | mark-start pause, 8 threads (10.8M registry) | 68,707 µs | **126 µs** |
+
+   **The verification is the DEBUG test run, not the release counter.** In
+   release the walk does not run, so `stale_marked` stays 0 whether or not the
+   latch is honest — a vacuous zero. Debug builds do the walk anyway and
+   `debug_assert` the latch; 1598 gc tests pass with that check live, and
+   `the_mark_bit_walk_is_skipped_only_when_the_sweep_has_cleared_them` pins the
+   abandon case specifically.
+
+   The colour-parity alternative (`ZColor::Marked0`/`Marked1` and
+   `mark_color_for`, already in `zgc::vaddr`) is no longer needed for this, and
+   would be the answer only if some future path had to set mark bits without a
+   sweep behind it.
+3. **`sweep_us`, the floor.** A concurrent sweep, which is its own project and
+   is not in Phase C.
+4. **`snapshot_us`**, 13% of the threaded concurrent pause: `bases()`
+   materialises a `Vec` of every registered base — 10.8M × 8 B = 87 MB allocated
+   inside the pause, twice per concurrent cycle. Iterating the bitmap in place
+   would remove it.
 
 ---
 

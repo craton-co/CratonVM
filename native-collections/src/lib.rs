@@ -8573,11 +8573,13 @@ fn map_hash_key(ctx: &mut dyn NativeContext, key: ObjectRef) -> Result<i32, Meth
         let h = match prim {
             Value::Int(v) => v,
             Value::Long(v) => (v ^ (v >> 32)) as i32,
-            Value::Float(v) => v.to_bits() as i32,
-            Value::Double(v) => {
-                let bits = v.to_bits() as i64;
-                (bits ^ (bits >> 32)) as i32
-            }
+            // Canonical bits, not raw: `Float.equals`/`Double.equals` (below,
+            // and in `values_equal`) canonicalize the NaN payload, so hashing
+            // from raw bits puts two keys that are `equals` in different
+            // buckets. A `HashMap` with `Double.NaN` and `Math.sqrt(-1.0)` as
+            // keys then held two entries where HotSpot holds one.
+            Value::Float(v) => cratonvm_types::jfp::float_hash_code(v),
+            Value::Double(v) => cratonvm_types::jfp::double_hash_code(v),
             _ => ctx.identity_hash_code(key),
         };
         return Ok(h ^ ((h as u32) >> 16) as i32);
@@ -8647,11 +8649,9 @@ fn element_hash_code(ctx: &mut dyn NativeContext, v: &Value) -> Result<i32, Meth
         Value::Object(None) => Ok(0),
         Value::Int(x) => Ok(*x),
         Value::Long(x) => Ok((*x ^ (*x >> 32)) as i32),
-        Value::Float(x) => Ok(x.to_bits() as i32),
-        Value::Double(x) => {
-            let bits = x.to_bits() as i64;
-            Ok((bits ^ (bits >> 32)) as i32)
-        }
+        // Canonical bits — see the note in `map_hash_key`.
+        Value::Float(x) => Ok(cratonvm_types::jfp::float_hash_code(*x)),
+        Value::Double(x) => Ok(cratonvm_types::jfp::double_hash_code(*x)),
         Value::Object(Some(obj)) => {
             // String hashCode by value (UTF-16 code units, wrapping mul+add).
             if let Some(s) = ctx.read_string(*obj) {
@@ -8750,12 +8750,8 @@ fn map_keys_equal(
             //     with `==` the second put silently overwrote the first.
             // `is_nan() || to_bits()` reproduces floatToIntBits exactly,
             // including its canonicalisation of every NaN payload.
-            (Value::Float(x), Value::Float(y)) => {
-                (x.is_nan() && y.is_nan()) || x.to_bits() == y.to_bits()
-            }
-            (Value::Double(x), Value::Double(y)) => {
-                (x.is_nan() && y.is_nan()) || x.to_bits() == y.to_bits()
-            }
+            (Value::Float(x), Value::Float(y)) => cratonvm_types::jfp::float_equals(x, y),
+            (Value::Double(x), Value::Double(y)) => cratonvm_types::jfp::double_equals(x, y),
             (Value::Int(x), Value::Long(y)) => (x as i64) == y,
             (Value::Long(x), Value::Int(y)) => x == (y as i64),
             _ => false,
@@ -30094,11 +30090,7 @@ fn native_double_stream_flat_map(ctx: &mut dyn NativeContext, args: &[Value]) ->
 /// difference between `DoubleStream.of(0.0/0.0, 0.0/0.0).distinct().count()`
 /// answering `1` (HotSpot) and `2`.
 fn java_double_to_long_bits(d: f64) -> i64 {
-    if d.is_nan() {
-        0x7ff8_0000_0000_0000u64 as i64
-    } else {
-        d.to_bits() as i64
-    }
+    cratonvm_types::jfp::double_to_long_bits(d) as i64
 }
 
 /// `Double.compare(d1, d2)` as an `Ordering`, and a total order — which is what
@@ -30109,13 +30101,7 @@ fn java_double_to_long_bits(d: f64) -> i64 {
 /// puts every NaN at the top. `f64::total_cmp` is a third order again (it sorts
 /// negatively-signed NaN below `-inf`), so neither stock comparator will do.
 fn java_double_compare(a: f64, b: f64) -> std::cmp::Ordering {
-    if a < b {
-        return std::cmp::Ordering::Less;
-    }
-    if a > b {
-        return std::cmp::Ordering::Greater;
-    }
-    java_double_to_long_bits(a).cmp(&java_double_to_long_bits(b))
+    cratonvm_types::jfp::double_ordering(a, b)
 }
 
 /// Read a stream element as an `f64`, widening the integral shapes the way the
@@ -32072,17 +32058,9 @@ fn comparing_key_as_f64(
 /// `java.lang.Double.compare` semantics: total ordering with NaN greatest and
 /// `-0.0 < 0.0` (so it is a valid `Comparator` even with NaN/zero keys).
 fn double_compare(a: f64, b: f64) -> i32 {
-    if a < b {
-        -1
-    } else if a > b {
-        1
-    } else {
-        // Equal under `<`/`>` (covers both zeros and both NaN cases): fall back
-        // to the bit pattern, exactly like Double.compare.
-        let ab = a.to_bits() as i64;
-        let bb = b.to_bits() as i64;
-        ab.cmp(&bb) as i32
-    }
+    // Was a local transcription that fell back to RAW bits, so two NaNs with
+    // different payloads compared unequal. See `cratonvm_types::jfp`.
+    cratonvm_types::jfp::double_compare(a, b)
 }
 
 /// Natural ordering: compare by string content or by wrapper field 0 value.
@@ -32118,11 +32096,20 @@ fn natural_compare(ctx: &mut dyn NativeContext, a: &Value, b: &Value) -> MethodC
                     (Value::Long(a), Value::Long(b)) => {
                         return Ok(Some(Value::Int(a.cmp(&b) as i32)))
                     }
+                    // `Float.compare`/`Double.compare`, NOT `total_cmp`: Java
+                    // canonicalizes the NaN payload first, so all NaNs are
+                    // equal to each other and greater than every number, where
+                    // IEEE totalOrder sorts a negatively-signed NaN BELOW
+                    // -infinity and orders NaNs among themselves by payload.
+                    // With `total_cmp` a natural-order `TreeSet<Double>` built
+                    // from 23 values held 13 elements where HotSpot holds 9,
+                    // and `Comparator.naturalOrder().compare` disagreed with
+                    // `Double.compare` on 206 of 529 sampled pairs.
                     (Value::Float(a), Value::Float(b)) => {
-                        return Ok(Some(Value::Int(a.total_cmp(&b) as i32)))
+                        return Ok(Some(Value::Int(cratonvm_types::jfp::float_compare(a, b))))
                     }
                     (Value::Double(a), Value::Double(b)) => {
-                        return Ok(Some(Value::Int(a.total_cmp(&b) as i32)))
+                        return Ok(Some(Value::Int(cratonvm_types::jfp::double_compare(a, b))))
                     }
                     _ => {}
                 }
@@ -32138,8 +32125,12 @@ fn natural_compare(ctx: &mut dyn NativeContext, a: &Value, b: &Value) -> MethodC
         // Compare bare ints/longs/etc. (for comparingInt results)
         (Value::Int(a), Value::Int(b)) => Ok(Some(Value::Int(a.cmp(b) as i32))),
         (Value::Long(a), Value::Long(b)) => Ok(Some(Value::Int(a.cmp(b) as i32))),
-        (Value::Float(a), Value::Float(b)) => Ok(Some(Value::Int(a.total_cmp(b) as i32))),
-        (Value::Double(a), Value::Double(b)) => Ok(Some(Value::Int(a.total_cmp(b) as i32))),
+        (Value::Float(a), Value::Float(b)) => {
+            Ok(Some(Value::Int(cratonvm_types::jfp::float_compare(*a, *b))))
+        }
+        (Value::Double(a), Value::Double(b)) => {
+            Ok(Some(Value::Int(cratonvm_types::jfp::double_compare(*a, *b))))
+        }
         _ => Ok(Some(Value::Int(0))),
     }
 }
