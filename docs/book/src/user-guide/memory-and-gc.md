@@ -65,7 +65,7 @@ With `--verbose:gc`, the chosen default is printed at startup, e.g.:
 
 | Collector | How to select | Status |
 |-----------|---------------|--------|
-| **ZGC** (default since 2026-08-10) | (default), `-XX:+UseZGC`, or `--XX:UseGc ZGC` | **The default.** Real and wired end to end, but **not** a real ZGC: a memory-backed, **non-moving**, non-generational, whole-heap stop-the-world mark-sweep over one arena. It has thread-local allocation buffers (default-on). Budget ~1.5x the heap a compacting collector needs. |
+| **ZGC** (default since 2026-08-10) | (default), `-XX:+UseZGC`, or `--XX:UseGc ZGC` | **The default.** Real and wired end to end, but **not** a real ZGC: a memory-backed, non-generational, whole-heap mark-sweep over one arena, whose **marking is concurrent** since 2026-08-16 (kill switch `CRATONVM_ZGC_CONC_START=0`) and whose sweep is stop-the-world. It has thread-local allocation buffers (default-on). Budget ~1.5x the heap a compacting collector needs. |
 | **Generational** | `-XX:+UseGenerationalGC` or `-XX:-UseZGC` | Stable. Young/old generations, write barriers, card table. Moving (Cheney) young copy plus non-moving sweep with selective promotion. The fallback whenever ZGC is not compiled in. |
 | **G1** (region-based) | `-XX:+UseG1GC` | **Experimental.** Region-based collector; the generational collector remains the safety net during its maturation. |
 
