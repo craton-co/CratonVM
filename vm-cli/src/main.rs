@@ -4932,6 +4932,22 @@ fn run() -> Result<()> {
         eprintln!(
             "[cratonvm] direct callee binds: {bind_hits} bound, {bind_misses} left on the dispatch helper (statically bound sites where a ladder asked for a direct target)"
         );
+        // WHICH gate refused. A bare miss total cannot separate a compile-ORDER
+        // accident (the callee simply was not compiled yet — repairable by
+        // re-binding) from a standing policy refusal (an exception table, a
+        // native shadow — which no re-bind touches), and those two want
+        // opposite fixes. `unattributed` is the mutator-side door's arms that
+        // return a bare `None`; a large value there means this list is the one
+        // to extend next, not that the misses are unexplained.
+        let reasons = cratonvm_jit::direct_callee_bind_refusal_reasons();
+        let attributed: u64 = reasons.iter().map(|(_, c)| *c).sum();
+        for (reason, count) in &reasons {
+            eprintln!("[cratonvm]   bind refused, {reason}: {count}");
+        }
+        eprintln!(
+            "[cratonvm]   bind refused, unattributed: {}",
+            bind_misses.saturating_sub(attributed)
+        );
     }
 
     // JDK-ONLY-WAVE2 §8/§11 census dumps (`CRATONVM_DBG_CHECK_OVERRIDE=1`).
