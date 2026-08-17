@@ -9403,23 +9403,54 @@ impl G1Collector {
     /// for some region. The check uses `self.config.region_size` instead of
     /// the per-region `data.len()` because every region's backing buffer is
     /// allocated at exactly `region_size` bytes (see [`G1Region::from_arena`]).
+    ///
+    /// O(1) ARITHMETIC, not the binary search this used to be. Region `i`'s
+    /// base is exactly `arena_base + i * region_size` — `new` carves one
+    /// contiguous `arena` into adjacent equal slices and never reallocates it —
+    /// so the index is a subtraction and a divide, and the same form is already
+    /// used by `header_verdict_at` and the walkers.
+    ///
+    /// It matters because this is the hottest read in the collector: the
+    /// reference write barrier calls it TWICE per store. A `partition_point`
+    /// over 1500 entries touches ~11 scattered cache lines each time, and eight
+    /// mutators doing that 4M times apiece thrash the shared cache — which is
+    /// not a lock, so it does not show up as one, but it scaled just like one.
+    /// Isolated with a store whose referent is its own array, so the barrier
+    /// returns immediately after these two lookups and nothing else runs
+    /// (`BarrierProbe refself`, 2M stores): **1051 ms on one thread, 4923 ms on
+    /// eight**, matching `refstore`'s scaling exactly and proving the residue
+    /// was here rather than in the remembered set (whose mutex the census
+    /// recorded being taken 27 times in that entire run).
     #[inline]
     fn lookup_region_for_addr(&self, addr: usize) -> Option<usize> {
-        // Find the largest base address that is <= addr.
-        // `partition_point` returns the first index where the predicate is
-        // false; subtracting 1 gives the last index where it is true.
-        let pp = self
-            .region_lookup
-            .partition_point(|(base, _)| *base <= addr);
-        if pp == 0 {
+        if addr < self.arena_base || addr >= self.arena_end {
             return None;
         }
-        let (base, idx) = self.region_lookup[pp - 1];
-        if addr < base.wrapping_add(self.config.region_size) {
-            Some(idx)
-        } else {
-            None
+        let region_size = self.config.region_size;
+        if region_size == 0 {
+            return None;
         }
+        let idx = (addr - self.arena_base) / region_size;
+        debug_assert_eq!(
+            Some(idx),
+            {
+                let pp = self
+                    .region_lookup
+                    .partition_point(|(base, _)| *base <= addr);
+                if pp == 0 {
+                    None
+                } else {
+                    let (base, i) = self.region_lookup[pp - 1];
+                    if addr < base.wrapping_add(region_size) {
+                        Some(i)
+                    } else {
+                        None
+                    }
+                }
+            },
+            "arithmetic region index disagrees with the region_lookup table at              addr=0x{addr:x} — the arena is no longer a run of equal adjacent              slices and every caller of this function is now wrong"
+        );
+        Some(idx)
     }
 
     // -----------------------------------------------------------------------
