@@ -1479,6 +1479,16 @@ const PAUSE_HISTORY_CAP: usize = 1 << 16;
 /// that fires on 25% of the whole heap.
 const NEEDS_GC_RECOUNT_INTERVAL: usize = 1024;
 
+/// Slots in the per-thread remembered-set edge memo — see the
+/// `RSET_EDGE_MEMO` thread-local in `post_write_barrier_rset`.
+///
+/// Four, because a reference-store loop into one destination array reaches
+/// objects spread over several SOURCE regions, and a one-slot memo alternates
+/// between them and misses every time. Measured (`BarrierProbe refstore`, 8
+/// threads, 2M stores, ordinary arrays): one slot left the mode scaling 4.9x
+/// from one thread to eight while the barrier-free modes went flat.
+const RSET_EDGE_MEMO_SLOTS: usize = 4;
+
 
 // ---------------------------------------------------------------------------
 // Collection type
@@ -8930,13 +8940,25 @@ impl G1Collector {
             // than as a deref-then-call.
             static LAST_RSET_TARGET: std::cell::Cell<Option<(u64, usize, *const G1Region, u64)>>
                 = const { std::cell::Cell::new(None) };
-            /// The last `(collector_id, dst_idx, src_idx, epoch)` edge this
-            /// thread recorded. ONE slot, not a set: this sits on the hot store
-            /// path, so it has to be cheaper than the lock it replaces —
-            /// widening it to an array made every barrier copy the whole array
-            /// in and out of the `Cell`.
-            static LAST_RSET_EDGE: std::cell::Cell<Option<(u64, usize, usize, u64)>>
-                = const { std::cell::Cell::new(None) };
+            /// Edges this thread has already recorded, as PACKED
+            /// `(dst_idx << 32) | src_idx` keys — `0` means empty.
+            ///
+            /// Four slots, not one. One slot was the first shape and it thrashes
+            /// on the workload that matters: a loop storing references into one
+            /// array reaches objects spread over SEVERAL source regions, so a
+            /// single-entry memo alternates between two or three live edges and
+            /// misses every time. Packing the pair into one `u64` is what makes
+            /// four slots affordable — the whole memo is 32 bytes to copy out of
+            /// the `Cell`, against 160 for an array of
+            /// `Option<(u64, usize, usize, u64)>`, which is the cost that made
+            /// the first attempt at four slots a wash.
+            static RSET_EDGE_MEMO: std::cell::Cell<[u64; RSET_EDGE_MEMO_SLOTS]>
+                = const { std::cell::Cell::new([0; RSET_EDGE_MEMO_SLOTS]) };
+            /// The `(collector_id, epoch)` the memo above was built under. Any
+            /// change invalidates all of it at once, which is what keeps the
+            /// per-slot compare down to a single `u64`.
+            static RSET_EDGE_MEMO_TAG: std::cell::Cell<(u64, u64)>
+                = const { std::cell::Cell::new((u64::MAX, u64::MAX)) };
         }
 
         // An rset is a SET of source region indices, so re-recording an edge
@@ -8956,15 +8978,35 @@ impl G1Collector {
         // cannot survive the clear that would invalidate it. Coarsening does
         // not need to be tracked either — an add to a coarsened rset returns
         // early anyway, so skipping it changes nothing.
-        if LAST_RSET_EDGE.with(|cell| cell.get())
-            == Some((collector_id, dst_idx, src_idx, cur_epoch))
-        {
+        // Packed key. `dst_idx`/`src_idx` are region indices, bounded by
+        // `heap_size / region_size`, so 32 bits each is enormous headroom; the
+        // `+ 1` keeps `0` free as the empty marker.
+        let edge_key = (((dst_idx as u64) + 1) << 32) | ((src_idx as u64) + 1);
+        let tag_ok = RSET_EDGE_MEMO_TAG.with(|c| {
+            if c.get() == (collector_id, cur_epoch) {
+                true
+            } else {
+                // A new collector instance or a new reclassification epoch
+                // retires the whole memo in one step.
+                c.set((collector_id, cur_epoch));
+                RSET_EDGE_MEMO.with(|m| m.set([0; RSET_EDGE_MEMO_SLOTS]));
+                false
+            }
+        });
+        if tag_ok && RSET_EDGE_MEMO.with(|m| m.get()).contains(&edge_key) {
             return;
         }
         // Record the edge as memoized only after an add below actually lands.
+        // Insert at the front so the most recent edge is found first; the
+        // oldest falls off the end.
         let remember_edge = |epoch: u64| {
-            LAST_RSET_EDGE
-                .with(|cell| cell.set(Some((collector_id, dst_idx, src_idx, epoch))));
+            RSET_EDGE_MEMO_TAG.with(|c| c.set((collector_id, epoch)));
+            RSET_EDGE_MEMO.with(|m| {
+                let mut memo = m.get();
+                memo.rotate_right(1);
+                memo[0] = edge_key;
+                m.set(memo);
+            });
         };
 
         let hit = LAST_RSET_TARGET.with(|cell| {
@@ -15035,6 +15077,82 @@ mod tests {
 
         // The write barrier should have tracked the cross-region reference
         // (or it's a same-region ref, which is fine too — we just verify no crash)
+    }
+
+    /// The per-thread edge memo in `post_write_barrier_rset` skips the rset add
+    /// for an edge this thread already recorded. If it ever skips one the rset
+    /// does NOT actually hold, the collector loses a cross-region reference and
+    /// reclaims a live object — silently. Two directions, both pinned here:
+    ///
+    /// 1. the FIRST store of an edge always records it, and repeats are
+    ///    genuinely redundant (the rset still names the source);
+    /// 2. a `rset_cache_epoch` bump — what every recycle/retype phase does, and
+    ///    what accompanies the `G1Region::reset` that CLEARS an rset — retires
+    ///    the memo, so the next store re-records the edge instead of trusting a
+    ///    memo that outlived the set it described.
+    #[test]
+    fn the_rset_edge_memo_is_retired_by_an_epoch_bump() {
+        let gc = make_collector();
+        // Two Old regions so nothing recycles them underneath the test, and a
+        // known cross-region edge: an object in region 3 referencing one in 2.
+        gc.with_regions_mut(|regions| {
+            regions[2].region_type = RegionType::Old;
+            regions[3].region_type = RegionType::Old;
+        });
+        let (src_addr, dst_addr) = {
+            let regions = gc.regions.lock();
+            (
+                regions[3].data.as_ptr() as usize,
+                regions[2].data.as_ptr() as usize,
+            )
+        };
+        // SAFETY: region bases are real, mapped arena addresses; the barrier
+        // only reads them to resolve a region index.
+        let src_obj = unsafe { ObjectRef::from_raw(src_addr as *mut u8) };
+        let dst_obj = unsafe { ObjectRef::from_raw(dst_addr as *mut u8) };
+
+        gc.post_write_barrier_rset(src_obj, dst_obj);
+        let after_first = {
+            let regions = gc.regions.lock();
+            regions[2].rset.sources()
+        };
+        assert!(
+            after_first.contains(&3),
+            "the first store of a cross-region edge must record it: {after_first:?}"
+        );
+
+        // A repeat is redundant — the memo may skip it, and the set is unchanged.
+        gc.post_write_barrier_rset(src_obj, dst_obj);
+        let after_repeat = {
+            let regions = gc.regions.lock();
+            regions[2].rset.sources()
+        };
+        assert_eq!(
+            after_first, after_repeat,
+            "a repeated edge must leave the rset exactly as it was"
+        );
+
+        // Now do what a pause does: clear the set and bump the epoch. A memo
+        // that survived this would suppress the re-record and lose the edge.
+        gc.with_regions_mut(|regions| regions[2].rset.clear());
+        gc.rset_cache_epoch.fetch_add(1, Ordering::Release);
+        assert!(
+            {
+                let regions = gc.regions.lock();
+                regions[2].rset.sources().is_empty()
+            },
+            "test setup: the rset must actually be empty before the re-record"
+        );
+
+        gc.post_write_barrier_rset(src_obj, dst_obj);
+        let after_epoch_bump = {
+            let regions = gc.regions.lock();
+            regions[2].rset.sources()
+        };
+        assert!(
+            after_epoch_bump.contains(&3),
+            "an epoch bump must retire the edge memo — the edge was dropped, which              is how a live cross-region referent gets reclaimed: {after_epoch_bump:?}"
+        );
     }
 
     #[test]
