@@ -1617,10 +1617,32 @@ fn presented_cert_is_anchor(
     presented_der: &[u8],
     parsed: &ParsedCert,
 ) -> bool {
-    match anchor.full_cert_der.as_deref() {
-        Some(anchor_der) => anchor_der == presented_der,
-        None => anchor.subject_der == parsed.subject_der && anchor.spki_der == parsed.spki_der,
+    // Exact-encoding equality FIRST, because it is the common case and costs a
+    // memcmp.
+    if anchor.full_cert_der.as_deref() == Some(presented_der) {
+        return true;
     }
+    // Then the identity RFC 5280 §6.1.1 actually defines for a trust anchor:
+    // the (issuer NAME, public KEY) pair. A trust anchor is not a certificate
+    // — the certificate is only one way to carry it, and its own signature is
+    // never checked.
+    //
+    // Requiring the exact bytes refused a shape the public internet serves
+    // every day: a peer that sends a CROSS-SIGNED copy of a root that IS in
+    // the trust store. MEASURED — `www.cloudflare.com` and `adoptium.net`
+    // both end their chain with `CN=GTS Root R4` as signed by
+    // `CN=GlobalSign Root CA`, which JDK 25's cacerts no longer ships, while
+    // the self-signed `GTS Root R4` it DOES ship differs from it byte for
+    // byte. The exact-match failed, the fallback then looked up the
+    // GlobalSign issuer and found nothing, and the verdict was
+    // `NoTrustAnchor` on a chain HotSpot accepts.
+    //
+    // This is not a widening. What the anchor contributes to the rest of
+    // validation is its SPKI, and the SPKI compared here is byte-identical to
+    // the stored one — so every signature below is still verified against the
+    // key the application installed. A forged certificate carrying that same
+    // subject and key is useless without the matching private key.
+    anchor.subject_der == parsed.subject_der && anchor.spki_der == parsed.spki_der
 }
 
 /// Is this exact presented certificate one the application installed as a
@@ -2580,7 +2602,8 @@ fn verify_one_signature(
     issuer_spki: &[u8],
 ) -> Result<(), TrustError> {
     use crate::crypto_impl::{
-        parse_ecdsa_public_key, parse_rsa_public_key, Ecdsa, Rsa, Sha256, Sha384, Sha512,
+        parse_named_ec_public_key, parse_rsa_public_key, verify_named_ecdsa, Rsa, Sha256, Sha384,
+        Sha512,
     };
     use cratonvm_native_builtins_crypto::signature::DigestAlgorithm;
 
@@ -2620,11 +2643,22 @@ fn verify_one_signature(
         || oid == OID_SIG_ECDSA_SHA512
     {
         // ECDSA: DER-decoded (r, s), check u1*G + u2*Q.x ≡ r (mod n).
-        // `verify_with_digest` takes a PRE-HASHED digest and truncates it to
+        // `verify_named_ecdsa` takes a PRE-HASHED digest and truncates it to
         // the curve order's bit length itself (FIPS 186-4 §6.4), which is
         // exactly why SHA-384/512 need no separate verify path — only the
         // right hash over the TBS.
-        let pk = match parse_ecdsa_public_key(issuer_spki) {
+        //
+        // ON THE CURVE, not on P-256. `parse_ecdsa_public_key` (still used by
+        // the JCE-facing P-256 paths) discards the SPKI's named-curve OID and
+        // then requires a 65-byte point, so a P-384 issuer key came back as
+        // `None` and this returned `BadSignature` — a refusal indistinguishable
+        // from a forged certificate. MEASURED across 20 live public sites the
+        // first time this validator was handed real chains: SIX rejected, all
+        // six with a P-384 issuer (Let's Encrypt Root YE / YE1 / YE2, Sectigo
+        // Root E46, DigiCert Global G3 TLS ECC, Google GTS Root R4). See
+        // `crypto_impl`'s named-curve section for why that was invisible until
+        // the leaf-only chain capture was fixed.
+        let pk = match parse_named_ec_public_key(issuer_spki) {
             Some(k) => k,
             None => return Err(TrustError::BadSignature { at }),
         };
@@ -2635,7 +2669,7 @@ fn verify_one_signature(
         } else {
             Sha256::digest(tbs).to_vec()
         };
-        if Ecdsa::verify_with_digest(&pk, &digest, sig) {
+        if verify_named_ecdsa(&pk, &digest, sig) {
             Ok(())
         } else {
             Err(TrustError::BadSignature { at })
@@ -3108,11 +3142,15 @@ fn verify_ocsp_response_signature(
                 )
             }
             oid if oid == OID_SIG_ECDSA_SHA256 => {
-                let Some(pk) = crate::crypto_impl::parse_ecdsa_public_key(spki) else {
+                // Named-curve, for the same reason the chain verifier is: an
+                // OCSP responder under a P-384 CA is exactly as ordinary as a
+                // certificate under one, and the P-256-only parser answered
+                // `None` -- i.e. "signature invalid" -- for every such key.
+                let Some(pk) = crate::crypto_impl::parse_named_ec_public_key(spki) else {
                     return false;
                 };
                 let digest = crate::crypto_impl::Sha256::digest(&resp.tbs_response_data_der);
-                crate::crypto_impl::Ecdsa::verify_with_digest(&pk, &digest, &resp.signature)
+                crate::crypto_impl::verify_named_ecdsa(&pk, &digest, &resp.signature)
             }
             _ => false,
         }
