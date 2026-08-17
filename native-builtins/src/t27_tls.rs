@@ -2477,28 +2477,37 @@ impl rustls::client::danger::ServerCertVerifier for PassthroughServerCertVerifie
         let Some(trust_ctx_key) = self.trust_ctx_key else {
             return Ok(rustls::client::danger::ServerCertVerified::assertion());
         };
-        let Some((engine_id, engine_obj)) = active_engine_binding() else {
-            return Ok(rustls::client::danger::ServerCertVerified::assertion());
-        };
         let mut chain: Vec<Vec<u8>> = Vec::with_capacity(1 + intermediates.len());
         chain.push(end_entity.as_ref().to_vec());
         chain.extend(intermediates.iter().map(|c| c.as_ref().to_vec()));
-        let pending = PendingTrustCheck {
-            engine_id,
-            is_client: true,
-            peer_chain_der: chain,
-            trust_ctx_key: Some(trust_ctx_key),
-            // The suite is not settled at verification time, and `auth_type` is
-            // only ever a hint a manager may branch or log on — never a security
-            // check. `engine_consult_trust_managers` falls back to "RSA", which
-            // is what it already does for any unrecognised suite.
-            negotiated_cipher_suite_name: None,
-            // Already applied above, on the chain rustls handed us.
-            endpoint_identity: None,
-        };
+        // One reborrow for the binding read AND the call: the engine reference
+        // comes back through its pin, so it must be read with the same ctx that
+        // is about to run the upcall.
+        let mut engine_id = 0i32;
         let verdict = with_active_native_context(|ctx| {
-            engine_consult_trust_managers(ctx, pending, Some(engine_obj), TrustCheckMode::InVerifier)
-        });
+            let (id, engine_obj) = active_engine_binding(ctx)?;
+            engine_id = id;
+            let pending = PendingTrustCheck {
+                engine_id: id,
+                is_client: true,
+                peer_chain_der: chain,
+                trust_ctx_key: Some(trust_ctx_key),
+                // The suite is not settled at verification time, and `auth_type`
+                // is only ever a hint a manager may branch or log on — never a
+                // security check. `engine_consult_trust_managers` falls back to
+                // "RSA", which is what it already does for an unrecognised suite.
+                negotiated_cipher_suite_name: None,
+                // Already applied above, on the chain rustls handed us.
+                endpoint_identity: None,
+            };
+            Some(engine_consult_trust_managers(
+                ctx,
+                pending,
+                Some(engine_obj),
+                TrustCheckMode::InVerifier,
+            ))
+        })
+        .flatten();
         match verdict {
             // No ctx published: not a Java-reachable path (see above).
             None => Ok(rustls::client::danger::ServerCertVerified::assertion()),
@@ -2891,7 +2900,16 @@ thread_local! {
     /// verifier is built once at `engine_begin` and an `ObjectRef` is not
     /// GC-stable across the calls in between, whereas this window is a single
     /// native call.
-    static ACTIVE_TLS_ENGINE: std::cell::Cell<Option<(i32, ObjectRef)>> =
+    /// `(engine id, pin handle, the ObjectRef as it was when pinned)`.
+    ///
+    /// A pin handle, NOT a bare `ObjectRef`: this is read back from inside
+    /// `process_new_packets`, which runs the application's Java `TrustManager`
+    /// and therefore allocates, and a moving young collection in that window
+    /// relocates the engine mirror. Holding the raw reference across it is the
+    /// "native local held live across an allocation" family — the same shape
+    /// `engine_run_trust_check`'s own chain-array pin exists for. The `ObjectRef`
+    /// is kept alongside only as `read_native_pin`'s fallback.
+    static ACTIVE_TLS_ENGINE: std::cell::Cell<Option<(i32, usize, ObjectRef)>> =
         const { std::cell::Cell::new(None) };
 }
 
@@ -2906,13 +2924,26 @@ impl Drop for ActiveEngineObjGuard {
     }
 }
 
-fn set_active_engine_binding(id: i32, engine: ObjectRef) -> ActiveEngineObjGuard {
-    ACTIVE_TLS_ENGINE.with(|c| c.set(Some((id, engine))));
-    ActiveEngineObjGuard { _private: () }
+/// Publish `engine` for the record-loop window, PINNED.
+///
+/// The returned guard clears the thread-local; the pin frame itself is released
+/// by the caller's `unpin_native_roots`, which must bracket the same window (a
+/// pin taken here and never released would root the engine mirror forever).
+fn set_active_engine_binding(
+    ctx: &mut dyn NativeContext,
+    id: i32,
+    engine: ObjectRef,
+) -> (ActiveEngineObjGuard, usize) {
+    let pin = ctx.pin_native_root(engine);
+    ACTIVE_TLS_ENGINE.with(|c| c.set(Some((id, pin, engine))));
+    (ActiveEngineObjGuard { _private: () }, pin)
 }
 
-fn active_engine_binding() -> Option<(i32, ObjectRef)> {
-    ACTIVE_TLS_ENGINE.with(|c| c.get())
+/// The engine currently unwrapping on this thread, re-read through its pin so a
+/// collection during the Java upcall cannot hand back a stale reference.
+fn active_engine_binding(ctx: &mut dyn NativeContext) -> Option<(i32, ObjectRef)> {
+    let (id, pin, orig) = ACTIVE_TLS_ENGINE.with(|c| c.get())?;
+    Some((id, ctx.read_native_pin(pin, orig)))
 }
 
 /// Record that this engine's `TrustManager`s have already been consulted, so
@@ -10373,6 +10404,22 @@ fn claim_delegated_task(id: i32) -> bool {
 /// Returns `Ok(true)` when the work was DEFERRED (the caller must now be told
 /// `NEED_TASK` and given no bytes), `Ok(false)` when it was done or was not
 /// needed.
+/// Release a native pin frame when the enclosing scope ends, including on the
+/// record loop's early `return Err(...)`. A leaked frame roots every object in
+/// it for the life of the process.
+struct UnpinOnDrop {
+    base: usize,
+}
+
+impl Drop for UnpinOnDrop {
+    fn drop(&mut self) {
+        // The ctx is the one published for this same window; if it is gone the
+        // frame goes with the call anyway.
+        let base = self.base;
+        let _ = with_active_native_context(move |ctx| ctx.unpin_native_roots(base));
+    }
+}
+
 /// Hold `EngineState::conn` outside the registry while `do_unwrap`'s record
 /// loop runs, and put it back on EVERY exit.
 ///
@@ -14357,7 +14404,11 @@ fn do_unwrap(
     {
         let mut checkout = ConnCheckout::take(id);
         let _active_ctx = set_active_native_context(ctx);
-        let _active_engine = set_active_engine_binding(id, this);
+        // Pinned for the window and released with it — see
+        // `set_active_engine_binding`. `unpin_native_roots(pin)` releases this
+        // frame and anything a nested `engine_run_trust_check` took above it.
+        let (_active_engine, engine_pin) = set_active_engine_binding(ctx, id, this);
+        let _unpin = UnpinOnDrop { base: engine_pin };
         if let (true, Some(conn)) = (src_resolved, checkout.conn.as_mut()) {
             loop {
                 if offset >= src_lim {

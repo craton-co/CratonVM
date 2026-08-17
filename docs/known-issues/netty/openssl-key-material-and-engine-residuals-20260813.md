@@ -211,8 +211,11 @@ HotSpot.
   well as on this branch, measured 2026-08-16. So it is a per-process latch,
   not a residual of the class-run fix, and a solo `#testTruncatedPacket`
   result says nothing about it either way.
-* `testHandshakeFailureOnlyFireExceptionOnce` — the ONE real residual, and it
-  needs an architectural change. Examined 2026-08-16.
+* ~~`testHandshakeFailureOnlyFireExceptionOnce`~~ — **FIXED 2026-08-17.** The
+  anatomy below stands; what changed is that the refactor it asks for is built.
+  Jump to "What the fix actually was" at the end of this bullet for the outcome.
+
+  Examined 2026-08-16.
 
   The failing assertion is `SslHandlerTest:1546`,
   `assertFalse(serverSslHandler.handshakeFuture().await().isSuccess())`: the
@@ -322,15 +325,77 @@ HotSpot.
     and three call sites already publish-then-keep-using `ctx`, so the
     verifier's upcall has a working mechanism.
 
-  **Not attempted on `fix/netty-nio-pcap-tls-residuals-20260817`, deliberately.**
-  This is the busiest path in the TLS engine, and its verification surface is
-  `JdkSslEngineTest` (821 tests), `SslHandlerTest`, `SslContextBuilderTest` and
-  `ParameterizedSslHandlerTest`, ABBA-interleaved — which this page itself says
-  must be read only from a QUIET host. The Azure box sat at load 17-35 with
-  14-16 users throughout this session. Shipping an unverifiable restructuring of
-  the record loop to fix ONE test risks the hundreds that pass today, and the
-  failure mode of getting the restore wrong is a permanently dead engine, not a
-  test failure. The next session should start from the proof test above.
+  **What the fix actually was** (`fix/netty-tls-verifier-time-trust-20260817`).
+
+  `do_unwrap` is now three phases: PHASE 1 (registry LOCKED) does the
+  delegated-task replay, PHASE 2 runs the record loop with the lock **DROPPED**
+  and the connection checked out through `ConnCheckout`, PHASE 3 (LOCKED) writes
+  back and classifies. The loop body is untouched.
+
+  `ConnCheckout` restores through `Drop`, not an explicit put-back, because the
+  loop has an early `return Err(throw_jca_exc(...))` and a missed restore is not a
+  test failure — it leaves `conn == None` for the life of that engine, so every
+  later `wrap`/`unwrap` silently does nothing.
+  `a_checked_out_connection_is_restored_on_every_exit` covers the normal exit, the
+  early return and a panic-driven unwind, and asserts `engine_begin` refuses to
+  build a rival connection in the window (the restore would discard it, along with
+  anything the re-entrant caller had done to it).
+
+  `engine_run_trust_check` is NOT duplicated; it gains a `TrustCheckMode`.
+  `PostHandshake` keeps today's behaviour byte for byte. `InVerifier` REPORTS the
+  verdict instead of acting on it: rustls emits its own fatal alert from inside its
+  state machine, under handshake keys, and a Java exception thrown from that frame
+  would sit pending on `ctx` and surface at an arbitrary later call. A Java `Error`
+  (not `Exception`) still propagates through the post-handshake gate untouched, so
+  `throwable_is_error`'s rule stays in one place.
+
+  The verifier marks `trust_check_done` through `with_engine` — a registry lock
+  taken from INSIDE `process_new_packets`, which is exactly the re-entrancy the
+  split buys and would have deadlocked before it. That is also what stops the
+  post-handshake gate asking a manager that has already answered; a double
+  consultation is observable, because an application manager may count its calls.
+
+  `handshake_error_message` spends the recorded rejection detail so the caller
+  still reads "TrustManager rejected the peer certificate chain: …" rather than
+  rustls's "application verification failure" — moving the check earlier must not
+  cost diagnostics.
+
+  **Measured on the LOCAL 32-core Windows box, not on Azure.** BoringSSL is
+  available to both VMs there (`OpenSsl.isAvailable()=true`,
+  `versionString=BoringSSL`, from the `netty-tcnative-boringssl-static-…-windows-x86_64.jar`
+  the local `common.args` carries), the class reproduces the residual exactly, and
+  the box is not the 8-core Azure host that sat at load 17-35 with 14-16 users.
+
+  Read this class **per-METHOD, not by count**: HotSpot itself fails three
+  `testSessionTickets*` tests on this host, and which members of that family fail
+  moves run to run on BOTH arms. ABBA-interleaved:
+
+  | | control | fix | HotSpot |
+  |---|---|---|---|
+  | `testHandshakeFailureOnlyFireExceptionOnce` | FAILS every run | **passes every run** | passes |
+  | `testSessionTickets*` (4 members) | 1-4 fail, membership varies | 1-2 fail, membership varies | 3 fail |
+  | `testHandshakeFailureCipherMissmatchTLSv13OpenSsl` | ABORTED | ABORTED | ABORTED |
+
+  The `testSessionTickets*` family is a pre-existing load-sensitive flake on this
+  host, on both VMs — not a regression, and not something this change touches.
+
+  **What this does NOT cover.** Only the CLIENT's `checkServerTrusted` moved into
+  verification, because that is what `verify_server_cert` is. A SERVER engine's
+  `checkClientTrusted` still runs post-handshake through
+  `engine_take_pending_trust_check`, so a server whose TrustManager rejects a
+  CLIENT certificate has the mirror-image problem: it will have completed its own
+  handshake first. No test in this suite asks for it, and closing it means the same
+  treatment for `ClientCertVerifier::verify_client_cert` — the plumbing built here
+  (`ConnCheckout`, the published binding, `TrustCheckMode::InVerifier`) is what it
+  would reuse.
+
+  One GC note worth carrying: the engine's `ObjectRef` is published for the window
+  as a PIN HANDLE, not a bare reference (`set_active_engine_binding`). The window
+  spans `process_new_packets`, which runs the application's Java TrustManager and
+  therefore allocates, so a bare reference there is the "native local held live
+  across an allocation" family — the same hazard `engine_run_trust_check`'s own
+  chain-array pin already exists for. `UnpinOnDrop` releases the frame on the
+  early-return path too.
 * ~~`testClientHandshakeTimeoutBecauseExecutorNotExecute` /
   `testServerHandshakeTimeoutBecauseExecutorNotExecute`~~ — FIXED 2026-08-16.
   The engine implements JSSE's delegated-task contract now; `DelegatedTask` in
