@@ -59,7 +59,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_DBG`
 
-451 tokens.
+452 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -194,6 +194,7 @@ export inherited from a parent shell.
 | `gdm-prof` | `CRATONVM_DBG_GDM_PROF` |
 | `g1-dbg-zero` | `CRATONVM_G1_DBG_ZERO` |
 | `g1diag` | `CRATONVM_DBG_G1DIAG` |
+| `g1accessor` | `CRATONVM_DBG_G1ACCESSOR` |
 | `gc-array-guard-bt` | `CRATONVM_GC_ARRAY_GUARD_BT` |
 | `gc-fallback-reasons` | `CRATONVM_DBG_GC_FALLBACK_REASONS` |
 | `gc-overhead` | `CRATONVM_DBG_GC_OVERHEAD` |
