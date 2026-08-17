@@ -279,12 +279,27 @@ too, so the check is whether anything *else* moved. Base vs fix, same host:
 | suite | base | +fix | outcome |
 |---|---|---|---|
 | `crypto.test.AllTests` | 1407 s | **707 s** | `Tests run: 21, Failures: 1, Errors: 14` on **both**, and the 15 failing test names diff **identical** |
+| `cms.test.AllTests` | 187 s | 221 s | `Tests run: 433, Failures: 0, Errors: 1` on **both**, same single test name |
+| `lms.AllTests` | 1008 s | **315 s** | `OK (29 tests)` on both |
+| `openssl.test.AllTests` | 18 s | 20 s | `OK (5 tests)` on **both** |
 | `jce.provider.test.AllTests` | 2 s | 2 s | identical on both (a harness artefact — the class exposes no JUnit suite, same as `crypto.test.RegressionTest`) |
+| `crypto.test.RegressionTest` | 8 s | 7 s | identical (same harness artefact) |
 
-`crypto.test.AllTests`'s 15 residuals are pre-existing and unrelated: fourteen
-are `HPKETestVectors` failing `CryptoServiceConstraintsException: service does
-not provide 192 bits of security only 128`. They fail identically without the
-intrinsic. **Same behaviour, 1.99x the speed.**
+**Six suites, zero regressions.** Every verdict, count and failing test name is
+the same on both arms.
+
+The residuals are pre-existing and unrelated. `crypto.test.AllTests`'s fourteen
+errors are all `HPKETestVectors` failing `CryptoServiceConstraintsException:
+service does not provide 192 bits of security only 128`; `cms.test.AllTests`'s
+single error is `NewEnvelopedDataTest.testKeyTransDESEDE3Short`. Every one fails
+identically without the intrinsic.
+
+**`cms.test.AllTests` is the honest counter-example**: 187 s → 221 s, i.e. no
+gain, and if anything slightly worse inside run-to-run variance on a loaded
+shared host. That is expected — CMS is not SHA-256-bound, and this fix buys
+nothing where the digest is not the workload. It is reported rather than
+dropped, because a table of only the favourable suites would misrepresent what
+the intrinsic does.
 
 ### Throughput
 
