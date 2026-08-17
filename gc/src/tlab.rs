@@ -440,6 +440,17 @@ impl Tlab {
     /// `install_tail_filler` short-circuits on a null cursor and the three
     /// stores are already-null stores.
     pub fn retire(&mut self) {
+        // Read the span the THREAD consumed before the filler runs.
+        // `install_tail_filler` sets `cursor = end` by design (see
+        // `install_tail_filler_always_consumes_the_tlab`), so reading
+        // `consumed_bytes()` after it charges the thread for the whole TLAB
+        // chunk including the unused tail. That made
+        // `ThreadMXBean.getThreadAllocatedBytes` report the collector's TLAB
+        // sizing rather than the program's allocation: the same Hibernate HQL
+        // parse reported 488 MB under ZGC (large chunks) and 49 MB under
+        // Generational (small ones). A counter whose answer depends on which
+        // collector is running cannot be measuring the Java work.
+        let consumed = self.consumed_bytes() as u64;
         // SAFETY: see method-level note — backing memory valid, single owner.
         unsafe {
             self.install_tail_filler(TLAB_FILLER_CLASS_ID);
@@ -447,10 +458,8 @@ impl Tlab {
         // Roll the consumed span into the thread's running total BEFORE the
         // pointers are nulled — `consumed_bytes()` is `cursor - start` and
         // reads 0 the instant either is null. Idempotent for the same reason:
-        // a second `retire()` adds 0.
-        self.thread_alloc_carry = self
-            .thread_alloc_carry
-            .saturating_add(self.consumed_bytes() as u64);
+        // a second `retire()` adds 0 (the pre-filler read above is 0 too).
+        self.thread_alloc_carry = self.thread_alloc_carry.saturating_add(consumed);
         self.start = std::ptr::null_mut();
         self.cursor = std::ptr::null_mut();
         self.end = std::ptr::null_mut();
@@ -1661,6 +1670,43 @@ mod tests {
     /// sub-8-byte-slack path used to return with `cursor < end` still true,
     /// which left a publishable span the filler had not covered.
     #[test]
+    /// `retire` must charge the thread for what it CONSUMED, not for the whole
+    /// chunk. `install_tail_filler` sets `cursor = end`, so a `consumed_bytes()`
+    /// read taken after it returns the TLAB size — which made
+    /// `ThreadMXBean.getThreadAllocatedBytes` a function of the collector's TLAB
+    /// sizing rather than of the program: the same Hibernate HQL parse reported
+    /// 488 MB under ZGC and 49 MB under Generational.
+    #[test]
+    fn retire_charges_the_thread_for_consumed_bytes_not_the_whole_chunk() {
+        for (chunk, consumed) in [(64usize, 8usize), (4096, 64), (65536, 1024)] {
+            let (_owner, base, usable) = aligned_buffer(chunk);
+            let mut tlab = unsafe { Tlab::new(base, usable) };
+            tlab.alloc(consumed, 8).unwrap();
+            let before = tlab.thread_allocated_bytes();
+            assert_eq!(before, consumed as u64, "live span, chunk={chunk}");
+            tlab.retire();
+            assert_eq!(
+                tlab.thread_allocated_bytes(),
+                consumed as u64,
+                "retire must not add the unused tail (chunk={chunk}, usable={usable})"
+            );
+        }
+    }
+
+    /// A second `retire` still adds nothing, now that the span is read before
+    /// the filler rather than after it.
+    #[test]
+    fn retire_remains_idempotent_for_the_allocation_counter() {
+        let (_owner, base, usable) = aligned_buffer(4096);
+        let mut tlab = unsafe { Tlab::new(base, usable) };
+        tlab.alloc(128, 8).unwrap();
+        tlab.retire();
+        let once = tlab.thread_allocated_bytes();
+        tlab.retire();
+        assert_eq!(tlab.thread_allocated_bytes(), once);
+        assert_eq!(once, 128);
+    }
+
     fn install_tail_filler_always_consumes_the_tlab() {
         for consumed in [0usize, 8, 40, 56, 64] {
             let (_owner, base, usable) = aligned_buffer(64);
