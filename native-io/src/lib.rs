@@ -1439,6 +1439,79 @@ fn fis_set_fd(ctx: &mut dyn NativeContext, this: ObjectRef, fd: FdId) {
 /// Tries, in order: the `FileDescriptor` object's `fd`/`handle` fields,
 /// a raw int in instance slot 0, then the `fd+1` encoding in slot 1
 /// (canonical `System.in`).
+/// The `java.io.IOException` a `FileInputStream`/`FileOutputStream` raises for
+/// any operation attempted after `close()`.
+///
+/// **Transcribed, not derived.** Measured on Eclipse Adoptium
+/// 25.0.3+9-LTS (2026-08-16), a real `FileInputStream`/`FileOutputStream` on
+/// Windows:
+///
+/// ```text
+/// fos.write(65)  after close -> java.io.IOException: Stream Closed
+/// fis.read()     after close -> java.io.IOException: Stream Closed
+/// fis.read(b)    after close -> java.io.IOException: Stream Closed
+/// fis.available() after close -> java.io.IOException: Stream Closed
+/// fis.skip(1)    after close -> java.io.IOException: Stream Closed
+/// ```
+///
+/// Note the capital `C`. The `Writer` side of `java.io` says `"Stream closed"`
+/// with a lower-case `c` (measured on `BufferedWriter` and
+/// `OutputStreamWriter` in the same run), so this string cannot be shared
+/// between the two families and must not be "tidied up" into one constant.
+fn io_stream_closed() -> MethodCallFailed {
+    RuntimeError::IOException {
+        message: "Stream Closed".to_string(),
+    }
+    .into()
+}
+
+/// Does this `FileInputStream`/`FileOutputStream` carry a POSITIVE marker that
+/// it has been closed?
+///
+/// This is the discriminator that makes the after-close refusals safe. Every
+/// read/write/available/skip body below resolves its descriptor with
+/// `fis_get_fd`/`fos_get_fd`, and those return `None` for **two different
+/// reasons**: the stream was closed (the close natives latch `fd = -1` /
+/// `handle = -1` on the `FileDescriptor`, or `Int(-1)` in slot 0 for the legacy
+/// synthetic layout), or the receiver simply never carried a descriptor this
+/// crate understands. Only the FIRST is an `IOException`; turning every `None`
+/// into a throw would be exactly the blanket widening the campaign's records
+/// keep warning about, and it would fire on receivers no measurement covers.
+///
+/// So the refusal is gated on a marker that is only ever written by a close:
+/// `fd` **and** `handle` both negative on the `FileDescriptor`, or `Int(v < 0)`
+/// in instance slot 0. Anything else keeps the previous answer unchanged.
+///
+/// Both close natives write both fields — `native_fd_close0` (the real-JDK
+/// route, via `FileDescriptor.closeAll`) and `native_fis_close`/
+/// `native_fos_close` (the fallback bodies) — so the marker is present however
+/// the close was dispatched.
+fn io_stream_is_closed(
+    ctx: &dyn NativeContext,
+    this: ObjectRef,
+    fd_obj: Option<ObjectRef>,
+) -> bool {
+    if let Some(fd_obj) = fd_obj {
+        let fd_negative = matches!(ctx.get_field_by_name(fd_obj, "fd"), Value::Int(v) if v < 0);
+        let handle_negative =
+            matches!(ctx.get_field_by_name(fd_obj, "handle"), Value::Long(v) if v < 0);
+        if fd_negative && handle_negative {
+            return true;
+        }
+    }
+    matches!(ctx.get_field(this, 0), Value::Int(v) if v < 0)
+}
+
+/// `io_stream_is_closed` for a `FileInputStream` receiver.
+fn fis_is_closed(ctx: &dyn NativeContext, this: ObjectRef) -> bool {
+    io_stream_is_closed(ctx, this, fis_fd_object(ctx, this))
+}
+
+/// `io_stream_is_closed` for a `FileOutputStream` receiver.
+fn fos_is_closed(ctx: &dyn NativeContext, this: ObjectRef) -> bool {
+    io_stream_is_closed(ctx, this, fos_fd_object(ctx, this))
+}
+
 fn fis_get_fd(ctx: &dyn NativeContext, this: ObjectRef) -> Option<FdId> {
     if let Some(fd_obj) = fis_fd_object(ctx, this) {
         match ctx.get_field_by_name(fd_obj, "fd") {
@@ -1611,6 +1684,15 @@ fn native_fis_read(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
     };
     let fd = match fis_get_fd(ctx, this) {
         Some(fd) => fd,
+        // `-1` is END OF FILE, and it is the value every copy loop in the world
+        // stops on. Answering it for a stream that has been CLOSED told the
+        // caller the file had been read to the end; a
+        // `while ((n = in.read()) != -1)` over a stream another thread closed
+        // exited cleanly and the copy came out silently truncated. HotSpot
+        // throws (measured: `java.io.IOException: Stream Closed`). Only a
+        // positively-marked close is refused — see `io_stream_is_closed`.
+        // G4-1-the-io-and-nio-fabricated-success-sweep-measured-20260816.md
+        None if fis_is_closed(ctx, this) => return Err(io_stream_closed()),
         None => return Ok(Some(Value::Int(-1))),
     };
     // FileInputStream also backs System.in and subprocess stdout/stderr.
@@ -1662,6 +1744,8 @@ fn native_fis_read_bytes(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     }
     let fd = match fis_get_fd(ctx, this) {
         Some(fd) => fd,
+        // See `native_fis_read`: a closed stream is an `IOException`, not EOF.
+        None if fis_is_closed(ctx, this) => return Err(io_stream_closed()),
         None => return Ok(Some(Value::Int(-1))),
     };
     let mut buf = vec![0u8; len];
@@ -1703,6 +1787,8 @@ fn native_fis_read_byte_array(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
     let len = ctx.array_length(arr);
     let fd = match fis_get_fd(ctx, this) {
         Some(fd) => fd,
+        // See `native_fis_read`: a closed stream is an `IOException`, not EOF.
+        None if fis_is_closed(ctx, this) => return Err(io_stream_closed()),
         None => return Ok(Some(Value::Int(-1))),
     };
     let mut buf = vec![0u8; len];
@@ -1730,8 +1816,21 @@ fn native_fis_available(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     };
     let fd = match fis_get_fd(ctx, this) {
         Some(fd) => fd,
+        // `available()` on a closed stream is `IOException: Stream Closed`
+        // (measured), not `0`. `0` is indistinguishable from "nothing buffered
+        // right now", which is a legal answer callers poll on.
+        // G4-1-the-io-and-nio-fabricated-success-sweep-measured-20260816.md
+        None if fis_is_closed(ctx, this) => return Err(io_stream_closed()),
         None => return Ok(Some(Value::Int(0))),
     };
+    // The trailing `unwrap_or(0)` is a second, smaller fabrication on this same
+    // line and is DELIBERATELY LEFT ALONE. `FdTable::available` ends in
+    // `_ => Err(...)` for every entry kind that is not a file read or a child
+    // pipe, so propagating it here would start throwing on receivers no
+    // measurement in this lane covers, and `0` is a legal answer for
+    // `available()` in a way that `-1` is not for `read()`. Recorded, not
+    // widened — see the "What this lane did NOT do" section of
+    // G4-1-the-io-and-nio-fabricated-success-sweep-measured-20260816.md.
     let n = ctx.fd_table().available(fd).unwrap_or(0);
     Ok(Some(Value::Int(n as i32)))
 }
@@ -1805,6 +1904,10 @@ fn native_fis_skip(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
     }
     let fd = match fis_get_fd(ctx, this) {
         Some(fd) => fd,
+        // `skip` on a closed stream is `IOException: Stream Closed` (measured),
+        // not a `0` that reads as "nothing left to skip".
+        // G4-1-the-io-and-nio-fabricated-success-sweep-measured-20260816.md
+        None if fis_is_closed(ctx, this) => return Err(io_stream_closed()),
         None => return Ok(Some(Value::Long(0))),
     };
     // Read and discard up to `n` bytes. `read_bytes` is not guaranteed
@@ -2117,6 +2220,13 @@ fn native_fos_write_byte(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     };
     let fd = match fos_get_fd(ctx, this) {
         Some(fd) => fd,
+        // The purest member of this species: a `void` write that returns having
+        // written nothing. `out.write(b)` on a CLOSED `FileOutputStream`
+        // reported success and dropped the byte; HotSpot throws (measured:
+        // `java.io.IOException: Stream Closed`). Only a positively-marked close
+        // is refused — see `io_stream_is_closed`.
+        // G4-1-the-io-and-nio-fabricated-success-sweep-measured-20260816.md
+        None if fos_is_closed(ctx, this) => return Err(io_stream_closed()),
         None => return Ok(None),
     };
     ctx.fd_table().write_byte(fd, b).map_err(io_err)?;
@@ -2159,6 +2269,9 @@ fn native_fos_write_bytes(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
     let len = len as usize;
     let fd = match fos_get_fd(ctx, this) {
         Some(fd) => fd,
+        // See `native_fos_write_byte`: a write to a closed stream is an
+        // `IOException`, not a silent no-op.
+        None if fos_is_closed(ctx, this) => return Err(io_stream_closed()),
         None => return Ok(None),
     };
     let mut buf = vec![0u8; len];
@@ -2184,6 +2297,8 @@ fn native_fos_write_byte_array(ctx: &mut dyn NativeContext, args: &[Value]) -> M
     let len = ctx.array_length(arr);
     let fd = match fos_get_fd(ctx, this) {
         Some(fd) => fd,
+        // See `native_fos_write_byte`.
+        None if fos_is_closed(ctx, this) => return Err(io_stream_closed()),
         None => return Ok(None),
     };
     let mut buf = vec![0u8; len];
@@ -2209,6 +2324,10 @@ fn native_fos_write_byte_ignore_append(
     };
     let fd = match fos_get_fd(ctx, this) {
         Some(fd) => fd,
+        // See `native_fos_write_byte`. This is the JDK 25 descriptor the real
+        // `FileOutputStream.write(int)` bytecode calls, so it is the one the
+        // shipping modes reach.
+        None if fos_is_closed(ctx, this) => return Err(io_stream_closed()),
         None => return Ok(None),
     };
     ctx.fd_table().write_byte(fd, b).map_err(io_err)?;
@@ -2244,6 +2363,9 @@ fn native_fos_write_bytes_ignore_append(
     let len = len_i as usize;
     let fd = match fos_get_fd(ctx, this) {
         Some(fd) => fd,
+        // See `native_fos_write_byte`. This is the JDK 25 descriptor the real
+        // `FileOutputStream.write(byte[],int,int)` bytecode calls.
+        None if fos_is_closed(ctx, this) => return Err(io_stream_closed()),
         None => return Ok(None),
     };
     let mut buf = vec![0u8; len];
@@ -19527,11 +19649,61 @@ fn make_path_stream(ctx: &mut dyn NativeContext, elements: &[Value]) -> MethodCa
     Ok(Some(Value::Object(Some(stream))))
 }
 
+/// The refusal `Files.list` / `Files.walk` owe a path that is not there.
+///
+/// **WHICH BODY RUNS — read this before editing either of the two.** The triples
+/// `java/nio/file/Files.list(Path)Stream` and
+/// `java/nio/file/Files.walk(Path,[FileVisitOption)Stream` are registered
+/// TWICE, here and in
+/// `native-builtins/src/phases_late/nio_file.rs::register_phase57_nio_file`,
+/// and `register()` is last-write-wins, so the winner differs BY MODE:
+///
+/// | arm (`vm/src/vm/vm_init.rs`) | order | winner |
+/// |---|---|---|
+/// | `--synthetic-jdk` | `register_builtins` then `register_io_natives` | **this file** |
+/// | feature build, real-JDK | `register_io_natives`, then `register_phase57_nio_file` LATER in the same arm | `nio_file.rs` |
+/// | shipping `cratonvm-cli` (`--jdk-only` / `--real-jdk`) | same | `nio_file.rs` |
+///
+/// That contradicts W7-8 §9.1's "`register_io_natives` is last in all three":
+/// it is last among the calls that record enumerated, but both real-JDK arms
+/// call `register_phase57_nio_file` (and `register_phase57_file`) AFTER it.
+/// Verified on this tree, `vm_init.rs`: `:2267` then `:2354`, and `:2849` then
+/// `:2919`.
+///
+/// So this body is the `--synthetic-jdk` half of a pair, and the two must be
+/// repaired together or the fix lands in whichever half the reader happened to
+/// open. Both halves used to answer a MISSING directory with an EMPTY Stream —
+/// `collect_dir_entries_inner`'s `Err(e) => return` swallows the `read_dir`
+/// failure — and HotSpot throws (measured on Adoptium 25.0.3+9, 2026-08-16:
+/// `Files.list(<missing>)` and `Files.walk(<missing>)` both raise
+/// `NoSuchFileException` at CONSTRUCTION, before any terminal operation).
+///
+/// The `<regular file>` case is NOT repaired here: HotSpot answers
+/// `NotDirectoryException` and `cratonvm_types::error::RuntimeError` has no
+/// such variant, which is a change to `types/src/error.rs` and therefore a
+/// nomination rather than an edit. `nio_file.rs`'s half — the one the shipping
+/// modes run — does raise the typed `NotDirectoryException`, via
+/// `p57_not_directory`.
+/// G4-1-the-io-and-nio-fabricated-success-sweep-measured-20260816.md
+fn files_listing_missing_refusal(dir: &str) -> Option<MethodCallFailed> {
+    if fs::symlink_metadata(dir).is_ok() {
+        return None;
+    }
+    Some(MethodCallFailed::InternalError(VmError::Runtime(
+        RuntimeError::NoSuchFileException {
+            path: dir.to_string(),
+        },
+    )))
+}
+
 /// Files.walk(Path, FileVisitOption...) -> Stream<Path>
 fn native_files_walk(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let dir = files_path_str(ctx, args);
     if dir.is_empty() {
         return make_path_stream(ctx, &[]);
+    }
+    if let Some(refused) = files_listing_missing_refusal(&dir) {
+        return Err(refused);
     }
     // Include the root directory itself
     let root = alloc_path(ctx, &dir);
@@ -19546,6 +19718,9 @@ fn native_files_list(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     let dir = files_path_str(ctx, args);
     if dir.is_empty() {
         return make_path_stream(ctx, &[]);
+    }
+    if let Some(refused) = files_listing_missing_refusal(&dir) {
+        return Err(refused);
     }
     let elements = collect_dir_entries(ctx, &dir, false);
     make_path_stream(ctx, &elements)

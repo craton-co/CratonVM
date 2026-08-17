@@ -8371,6 +8371,99 @@ pub(crate) mod new13_tests {
         r
     }
 
+    fn cb_addr(r: &NativeMethodRegistry, cls: &str, name: &str, desc: &str) -> Option<usize> {
+        r.find(cls, name, desc).map(|cb| cb as usize)
+    }
+
+    /// **Which of this file's ten `javax/net/ssl/SSLSession` registrations are
+    /// alive, stated as an assertion instead of as a comment.**
+    ///
+    /// G7. This file registers ten triples on `javax/net/ssl/SSLSession`.
+    /// `t27_tls::register_ssl_session_real` registers seventeen, and it runs
+    /// LATER on both real-JDK paths — `phases_late.rs:6670` `register_p68_ssl`
+    /// then `:6674` `register_t27_natives`, and `lib.rs:18665` then `:18726`.
+    /// Registration is last-write-wins with no unregister API, so seven of this
+    /// file's ten are dead in the mode `--jdk-only` runs, and three are live:
+    ///
+    /// ```text
+    ///   DEAD (t27_tls wins)   getProtocol  getCipherSuite  isValid  getId
+    ///                         getPeerCertificates  getCreationTime
+    ///                         getLastAccessedTime
+    ///   LIVE (this file owns) getPeerPrincipal  getLocalCertificates
+    ///                         getLocalPrincipal
+    /// ```
+    ///
+    /// This is not hypothetical bookkeeping. E12-1 landed eight edits in this
+    /// file and E22-1's `--dump-native-registry` dump then found that three of
+    /// them (`getProtocol`, `getCipherSuite`, `getId`) had gone into bodies
+    /// that never run — a green build that proved nothing, which is
+    /// HANDOFF-20260814 §5's named trap. A future lane reading these ten
+    /// registrations has no way to tell the two groups apart by looking at
+    /// them, so the split is asserted here: land a session fix in one of the
+    /// seven and this test still passes, but the fix is inert; MOVE one of the
+    /// three into `t27_tls` and this test fails and names it.
+    ///
+    /// SOURCE-VERIFIED (the two `lib.rs`/`phases_late.rs` call orders were
+    /// read, and the callback identity below is compared directly). NOT
+    /// verified against a `--dump-native-registry` dump — no binary carrying
+    /// this change exists yet.
+    #[test]
+    fn seven_of_this_files_ssl_session_doors_are_dead_and_three_are_live() {
+        let mut p68_only = NativeMethodRegistry::new();
+        register_p68_ssl(&mut p68_only);
+
+        // The real-JDK order, as `phases_late::register_phase68_natives` runs
+        // it: this file first, `t27_tls` second.
+        let mut boot = NativeMethodRegistry::new();
+        register_p68_ssl(&mut boot);
+        crate::t27_tls::register_sslengine_real(&mut boot);
+
+        let cls = "javax/net/ssl/SSLSession";
+
+        for (name, desc) in [
+            ("getProtocol", "()Ljava/lang/String;"),
+            ("getCipherSuite", "()Ljava/lang/String;"),
+            ("isValid", "()Z"),
+            ("getId", "()[B"),
+            ("getPeerCertificates", "()[Ljava/security/cert/Certificate;"),
+            ("getCreationTime", "()J"),
+            ("getLastAccessedTime", "()J"),
+        ] {
+            let mine = cb_addr(&p68_only, cls, name, desc)
+                .unwrap_or_else(|| panic!("register_p68_ssl must register {cls}.{name}{desc}"));
+            let winner = cb_addr(&boot, cls, name, desc)
+                .unwrap_or_else(|| panic!("{cls}.{name}{desc} must be registered after both"));
+            assert_ne!(
+                winner, mine,
+                "{cls}.{name}{desc}: this file's body is DEAD in real-JDK mode \
+                 — `t27_tls::register_ssl_session_real` runs later and owns the \
+                 slot. If this now passes with the two equal, t27_tls has \
+                 dropped its registration and every measured contract it \
+                 carries for this door (E12/E31/E42/F18/G7) has silently \
+                 reverted to this file's older body."
+            );
+        }
+
+        for (name, desc) in [
+            ("getPeerPrincipal", "()Ljava/security/Principal;"),
+            ("getLocalCertificates", "()[Ljava/security/cert/Certificate;"),
+            ("getLocalPrincipal", "()Ljava/security/Principal;"),
+        ] {
+            let mine = cb_addr(&p68_only, cls, name, desc)
+                .unwrap_or_else(|| panic!("register_p68_ssl must register {cls}.{name}{desc}"));
+            let winner = cb_addr(&boot, cls, name, desc)
+                .unwrap_or_else(|| panic!("{cls}.{name}{desc} must be registered after both"));
+            assert_eq!(
+                winner, mine,
+                "{cls}.{name}{desc}: this file's body is the LIVE one — \
+                 t27_tls deliberately does not re-register these three. If \
+                 t27_tls has started registering it, this file's body is now \
+                 dead and any fix landed here (the peer/local principal \
+                 derivation, the `in_client_trust_check` gate) stopped running."
+            );
+        }
+    }
+
     #[test]
     fn ssl_context_getinstance_and_init_are_registered() {
         let r = build_registry();

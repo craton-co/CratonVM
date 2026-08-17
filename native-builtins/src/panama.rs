@@ -1009,24 +1009,36 @@ pub(crate) fn register_pe_memory_segment(r: &mut NativeMethodRegistry) {
             let offset = pe_long_arg(args, 1);
             let new_size = pe_long_arg(args, 2);
             let align = pe_long_arg(args, 3);
-            if align <= 0 || (align & (align - 1)) != 0 {
-                return Err(RuntimeError::IllegalArgumentException {
-                    message: format!("Invalid alignment constraint: {align}"),
-                }
-                .into());
-            }
-            let addr = pe_segment_base_address(ctx, this).saturating_add(offset);
-            if addr % align != 0 {
-                return Err(RuntimeError::IllegalArgumentException {
-                    message: format!("Target offset {offset} incompatible with alignment {align}"),
-                }
-                .into());
-            }
+            // Bounds, then power-of-two, then alignment — the oracle's order,
+            // measured. See [`pe_slice_bounds_check`].
+            pe_slice_bounds_check(ctx, this, offset, new_size)?;
+            pe_slice_alignment_check(ctx, this, offset, align)?;
             pe_segment_slice(ctx, this, offset, new_size, None)
         },
     );
 
-    // asSlice(long offset, MemoryLayout layout) — size taken from the layout.
+    // asSlice(long offset, MemoryLayout layout) — size AND ALIGNMENT taken
+    // from the layout.
+    //
+    // The JDK's body is `asSlice(offset, layout.byteSize(),
+    // layout.byteAlignment())`, so the layout's alignment is a CONSTRAINT, not
+    // merely a width. Dropping it made this the one slice arity that could
+    // hand back a view the oracle refuses to create:
+    //
+    // | call | oracle | before |
+    // |---|---|---|
+    // | `ofArray(byte[16]).asSlice(0, JAVA_INT)` | IAE | 4-byte slice |
+    // | `ofArray(byte[16]).asSlice(0, JAVA_INT_UNALIGNED)` | 4-byte slice | 4-byte slice |
+    // | `ofArray(int[8]).asSlice(2, JAVA_INT)` | IAE | 4-byte slice |
+    // | `ofArray(int[8]).asSlice(4, JAVA_INT)` | 4-byte slice | 4-byte slice |
+    // | `ofArray(byte[16]).asSlice(0, sequenceLayout(2, JAVA_INT))` | IAE | 8-byte slice |
+    // | `ofArray(byte[16]).asSlice(0, paddingLayout(4))` | 4-byte slice | 4-byte slice |
+    //
+    // (measured, `FfmProbe` C16/C17 and `FfmProbe3` M3a–M3i). The width comes
+    // from [`p67_layout_size_align`] rather than `pe_memory_layout_width` so
+    // that the size and the alignment are read out of the SAME carrier slots
+    // in one call — two readers for one four-slot object is how the two got to
+    // disagree in the first place.
     r.register(
         ms,
         "asSlice",
@@ -1035,28 +1047,39 @@ pub(crate) fn register_pe_memory_segment(r: &mut NativeMethodRegistry) {
             let this = obj_arg(args, 0)?;
             let offset = pe_long_arg(args, 1);
             let layout = obj_arg(args, 2)?;
-            let width = pe_memory_layout_width(ctx, layout);
+            let (width, align) =
+                crate::phases_late::foreign_ffm::p67_layout_size_align(ctx, layout);
+            pe_slice_bounds_check(ctx, this, offset, width)?;
+            pe_slice_alignment_check(ctx, this, offset, align)?;
             pe_segment_slice(ctx, this, offset, width, None)
         },
     );
 
-    // maxByteAlignment() — the JDK's rule is the largest power of two that
-    // divides the segment's base address, and the address-layout alignment for
-    // a base of 0.
+    // maxByteAlignment().
     //
-    // The base address is read through [`pe_segment_base_address`], not
-    // `segment_address`, so it is the SAME number `address()` answers: on a
-    // heap carrier `segment_address` is deliberately 0 (F27 — a length is not
-    // an address), and reading it here would have claimed 8-byte alignment for
-    // every heap slice regardless of where in the array it starts.
+    // SETTLED 2026-08-16 against the oracle; the previous body was a
+    // hypothesis and both of its arms were wrong.
+    //
+    // * **Heap.** The answer is the BACKING ARRAY'S ELEMENT ALIGNMENT, capped
+    //   by the low bit of the offset within that array — not the offset alone.
+    //   Measured: `ofArray(byte[16])`→1, `short[8]`→2, `char[8]`→2,
+    //   `int[8]`→4, `long[8]`→8, `float[8]`→4, `double[8]`→8, and
+    //   `ofArray(byte[0])`→1, `ofArray(long[0])`→8 (an empty segment still
+    //   knows its element type). The old body answered **8 for every one of
+    //   them** at offset 0, and 1/2/4 by accident of the offset elsewhere:
+    //   `ofArray(byte[16]).maxByteAlignment()` was 8 where the oracle says 1,
+    //   which is the difference between refusing and admitting
+    //   `get(JAVA_LONG, 0)` on a byte array.
+    // * **Native.** A base of 0 answers **2^62**, not 8 — measured on
+    //   `MemorySegment.NULL` and `ofAddress(0)`. 8 made `NULL.asSlice(0,0,16)`
+    //   an `IllegalArgumentException` where HotSpot returns a segment.
+    //
+    // Both arms live in [`pe_segment_max_byte_alignment`], which is the same
+    // reader `asSlice`'s alignment arms and the heap `get`/`set` gate go
+    // through, so this method and the refusals it explains cannot drift apart.
     r.register(ms, "maxByteAlignment", "()J", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let addr = pe_segment_base_address(ctx, this);
-        Ok(Some(Value::Long(if addr == 0 {
-            8
-        } else {
-            addr & addr.wrapping_neg()
-        })))
+        Ok(Some(Value::Long(pe_segment_max_byte_alignment(ctx, this))))
     });
 
     // heapBase() — present only for a heap segment, whose Java array this
@@ -1070,17 +1093,28 @@ pub(crate) fn register_pe_memory_segment(r: &mut NativeMethodRegistry) {
     // (`[6]=array, [7]=start`), the two that `isNative()` already reports as
     // non-native. The mirror is kept as the fallback because its array lives in
     // slot 2 and `heap_segment_view` does not claim it.
+    // A READ-ONLY SEGMENT HAS NO `heapBase`. MEASURED, and it is a
+    // CAPABILITY, not a formatting detail.
+    //
+    // | call | oracle |
+    // |---|---|
+    // | `ofArray(byte[16]).heapBase().isPresent()` | `true` |
+    // | `ofArray(byte[16]).asReadOnly().heapBase().isPresent()` | **`false`** |
+    // | `asReadOnly().asSlice(3,4).heapBase().isPresent()` | `false` |
+    // | `asReadOnly().elements(JAVA_BYTE).findFirst().get().heapBase().isPresent()` | `false` |
+    // | `ofBuffer(ByteBuffer.allocate(8).asReadOnlyBuffer()).heapBase().isPresent()` | `false` |
+    // | native `allocate(8).asReadOnly().heapBase().isPresent()` | `false` |
+    //
+    // (`FfmProbe` B12, `FfmProbe3` M4a–M4k.) The array `heapBase()` hands back
+    // is the segment's own storage and is fully writable through plain array
+    // stores, so returning it from a read-only view gives away exactly the
+    // capability `asReadOnly()` was called to remove — F26's "a wrong
+    // capability" and F21's "read-only is contagious", one call apart. Reads
+    // through the segment still work (`asReadOnly().toArray(JAVA_BYTE)` is
+    // 16 elements on the oracle); it is only the escape hatch that closes.
     r.register(ms, "heapBase", "()Ljava/util/Optional;", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let base = match heap_segment_view(ctx, this) {
-            Some(view) => Value::Object(Some(view.base)),
-            None => match ctx.get_field(this, SEG_BACKING_ARRAY_FIELD) {
-                Value::Object(Some(array)) if ctx.object_is_array(array) => {
-                    Value::Object(Some(array))
-                }
-                _ => Value::Object(None),
-            },
-        };
+        let base = pe_segment_heap_base(ctx, this);
         ctx.invoke(
             "java/util/Optional",
             "ofNullable",
@@ -2074,6 +2108,67 @@ fn pe_segment_to_array(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         }
         .into());
     }
+
+    // The alignment gate, AFTER the size gate — that order is the JDK's and it
+    // is measured, not assumed. `AbstractMemorySegmentImpl.toArray` runs
+    // `checkArraySize` (the `IllegalStateException` above) and only then hands
+    // the segment to `MemorySegment.copy`, which is where the alignment
+    // `IllegalArgumentException` comes from. So a segment that is BOTH badly
+    // sized and badly aligned reports the size:
+    //
+    // | call | oracle |
+    // |---|---|
+    // | `ofArray(byte[15]).toArray(JAVA_INT)` | ISE `Segment size is not a multiple of 4. Size: 15` |
+    // | `ofArray(byte[16]).toArray(JAVA_INT)` | IAE `Source segment incompatible with alignment constraints` |
+    // | `ofArray(byte[16]).toArray(JAVA_INT_UNALIGNED)` | `[50462976, 117835012, 185207048, 252579084]` |
+    // | `ofArray(int[8]).toArray(JAVA_LONG)` | IAE, same message |
+    // | `ofArray(int[8]).asSlice(4).toArray(JAVA_INT).length` | 7 |
+    //
+    // Note the message is `Source segment ...`, not the `Incompatible
+    // alignment constraints` that `spliterator` answers: they come from
+    // different JDK call sites and both are transcribed
+    // (`FfmProbe` G2/G3/G5/G50, `FfmProbe3` M1n/M2a).
+    let layout_align = crate::panama_libffi::layout_align(ctx, layout) as i64;
+    if layout_align > pe_segment_max_byte_alignment(ctx, this) {
+        return Err(RuntimeError::IllegalArgumentException {
+            message: "Source segment incompatible with alignment constraints".into(),
+        }
+        .into());
+    }
+
+    // A HEAP SEGMENT'S BYTES ARE IN A JAVA ARRAY, NOT AT AN ADDRESS.
+    //
+    // `segment_address` answers 0 for every heap carrier (F27), and the raw
+    // loop below then took its `base.is_null()` early return and handed back a
+    // correctly-sized array of ZEROS. `MemorySegment.ofArray(new byte[]{1,2,3})
+    // .toArray(JAVA_BYTE)` answered `[0, 0, 0]` where the oracle answers
+    // `[1, 2, 3]` — a silent wrong answer, not a refusal, on the one method
+    // whose entire job is to hand the bytes back. It reached real
+    // `HeapMemorySegmentImpl$Of*` receivers and every heap slice this file
+    // mints (`asSlice` is force-routed, so a slice of a real heap segment is
+    // one of ours).
+    //
+    // `heap_segment_read` is the same reader `get` uses, so `toArray` and a
+    // loop of `get`s cannot disagree about the stride or the byte order.
+    if let Some(view) = heap_segment_view(ctx, this) {
+        let arr = ctx.new_array(kind, count as usize);
+        for i in 0..count as usize {
+            let raw = heap_segment_read(ctx, &view, i as i64 * width, width as usize);
+            let value = match kind {
+                AET::Boolean => Value::Int(i32::from((raw & 0xff) != 0)),
+                AET::Byte => Value::Int(i32::from(raw as u8 as i8)),
+                AET::Char => Value::Int(i32::from(raw as u16)),
+                AET::Short => Value::Int(i32::from(raw as u16 as i16)),
+                AET::Int => Value::Int(raw as u32 as i32),
+                AET::Float => Value::Float(f32::from_bits(raw as u32)),
+                AET::Long => Value::Long(raw as i64),
+                _ => Value::Double(f64::from_bits(raw)),
+            };
+            ctx.set_array_element(arr, i, value);
+        }
+        return Ok(Some(Value::Object(Some(arr))));
+    }
+
     let base = crate::panama_libffi::segment_address(ctx, this) as *const u8;
     let arr = ctx.new_array(kind, count as usize);
     if base.is_null() {
@@ -2302,7 +2397,27 @@ fn pe_segment_spliterator(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         }
         .into());
     }
-    if crate::panama_libffi::segment_address(ctx, this) % elem_align != 0 {
+    // `maxByteAlignment`, NOT `segment_address % elem_align`.
+    //
+    // On a heap carrier `segment_address` is deliberately 0 (F27), and
+    // `0 % anything == 0`, so this gate admitted EVERY element layout on every
+    // heap segment. Measured refusals it let through:
+    //
+    // | call | oracle |
+    // |---|---|
+    // | `ofArray(byte[16]).spliterator(JAVA_INT)` | IAE `Incompatible alignment constraints` |
+    // | `ofArray(byte[16]).elements(JAVA_INT)` | IAE, same message |
+    // | `ofArray(int[8]).asSlice(2).elements(JAVA_INT)` | IAE, same message |
+    // | `ofArray(byte[16]).elements(JAVA_INT_UNALIGNED)` | 4 elements |
+    // | `ofArray(int[8]).elements(JAVA_INT)` | 8 elements |
+    // | `ofArray(int[8]).asSlice(4).elements(JAVA_INT)` | 7 elements |
+    //
+    // (`FfmProbe` G22/G24/G48, `FfmProbe3` M1k/M1l/M1o.) The alignment gate
+    // also precedes the size-multiple gate below: `ofArray(byte[15])
+    // .elements(JAVA_INT)` is the alignment message, not
+    // `Segment size is not a multiple of layout size` (M2b/M2c), which is the
+    // order these four checks are already written in.
+    if elem_align > pe_segment_max_byte_alignment(ctx, this) {
         return Err(RuntimeError::IllegalArgumentException {
             message: "Incompatible alignment constraints".into(),
         }
@@ -2368,6 +2483,199 @@ fn pe_segment_base_address(ctx: &dyn NativeContext, seg: ObjectRef) -> i64 {
     }
 }
 
+/// The value inside the `Optional` that `MemorySegment.heapBase()` answers.
+///
+/// A free function rather than a closure body so the read-only rule below has
+/// a test that does not need a whole `NativeMethodRegistry` stood up — the same
+/// reason F35 lifted `pe_segment_as_slice` out of its closure.
+///
+/// `Value::Object(None)` means the empty `Optional`.
+fn pe_segment_heap_base(ctx: &dyn NativeContext, seg: ObjectRef) -> Value {
+    let read_only = match heap_segment_view(ctx, seg) {
+        Some(view) => view.read_only,
+        None => matches!(
+            match ctx.get_field_by_name(seg, "readOnly") {
+                v @ Value::Int(_) => v,
+                _ => ctx.get_field(seg, 3),
+            },
+            Value::Int(n) if n != 0
+        ),
+    };
+    if read_only {
+        return Value::Object(None);
+    }
+    match heap_segment_view(ctx, seg) {
+        Some(view) => Value::Object(Some(view.base)),
+        None => match ctx.get_field(seg, SEG_BACKING_ARRAY_FIELD) {
+            Value::Object(Some(array)) if ctx.object_is_array(array) => Value::Object(Some(array)),
+            _ => Value::Object(None),
+        },
+    }
+}
+
+/// The alignment a native carrier can promise, given the address it starts at.
+///
+/// MEASURED on 25.0.3+9-LTS (`FfmProbe` rows H18–H21, A30, P6):
+/// `ofAddress(16)`→16, `ofAddress(12)`→4, `ofAddress(1)`→1, and
+/// `MemorySegment.NULL`/`ofAddress(0)`→**4611686018427387904 = 2^62**, not 8.
+/// The JDK's rule is `lowestOneBit(address | maxAlignMask)` with the mask
+/// falling back to the largest representable power of two when there is no
+/// address to constrain it — a zero address constrains nothing, so nothing is
+/// refused on it. Answering 8 (what this file used to answer) refused
+/// `NULL.asSlice(0, 0, 16)` where the oracle allows it.
+fn native_max_byte_alignment(addr: i64) -> i64 {
+    if addr == 0 {
+        1_i64 << 62
+    } else {
+        addr & addr.wrapping_neg()
+    }
+}
+
+/// The alignment a HEAP carrier can promise at `byte_offset` bytes into its
+/// backing array.
+///
+/// MEASURED (`FfmProbe2` row P1, every offset 0..=16 of seven element types):
+/// the answer is `min(elementAlignment, lowestOneBit(byteOffset))`, with
+/// offset 0 answering the element alignment outright. Transcribed:
+///
+/// ```text
+/// byte[32]   0:1 1:1 2:1 3:1 4:1 ... 16:1
+/// short[16]  0:2 1:1 2:2 3:1 4:2 ... 16:2
+/// int[8]     0:4 1:1 2:2 3:1 4:4 ... 16:4
+/// long[4]    0:8 1:1 2:2 3:1 4:4 8:8 12:4 16:8
+/// ```
+///
+/// `byte_offset` is the ABSOLUTE offset within the array — `view.start` for
+/// the segment itself, `view.start + access_offset` for an access inside it.
+/// Passing only `view.start` and then re-checking the access offset modulo the
+/// alignment is NOT the same rule and is stricter than the oracle: a slice
+/// starting at 2 of an `int[]` has `maxByteAlignment()==2`, yet
+/// `int[8].asSlice(2).get(JAVA_INT, 2)` SUCCEEDS on HotSpot (absolute offset
+/// 4) while `get(JAVA_INT, 0)` is refused — measured, `FfmProbe3` rows M1c/M1d.
+fn heap_max_byte_alignment(elem_width: i64, byte_offset: i64) -> i64 {
+    if byte_offset == 0 {
+        elem_width.max(1)
+    } else {
+        elem_width
+            .max(1)
+            .min(byte_offset & byte_offset.wrapping_neg())
+    }
+}
+
+/// `MemorySegment.maxByteAlignment()` for any carrier this VM can decode.
+///
+/// One reader for the one rule. Every alignment decision in this file —
+/// `maxByteAlignment()` itself, `asSlice(long,long,long)`,
+/// `asSlice(long,MemoryLayout)`, `spliterator`/`elements`, `toArray`, and the
+/// heap `get`/`set` gate — is `constraint <= maxByteAlignment(base + offset)`,
+/// and that equivalence is MEASURED, not assumed: `FfmProbe2` §P2/§P3/§P4
+/// cross every offset 0..=16 against alignments 1/2/4/8/16 on four heap
+/// element types and a native segment, comparing each call's success against
+/// `seg.asSlice(off).maxByteAlignment()` **as HotSpot itself computes it**, and
+/// report zero mismatches in all nine sweeps.
+fn pe_segment_max_byte_alignment(ctx: &dyn NativeContext, seg: ObjectRef) -> i64 {
+    match heap_segment_view(ctx, seg) {
+        Some(view) => heap_max_byte_alignment(view.elem_width as i64, view.start),
+        None => native_max_byte_alignment(crate::panama_libffi::segment_address(ctx, seg)),
+    }
+}
+
+/// The alignment available at `offset` bytes into `seg`, i.e. what
+/// `seg.asSlice(offset).maxByteAlignment()` answers.
+fn pe_segment_max_byte_alignment_at(ctx: &dyn NativeContext, seg: ObjectRef, offset: i64) -> i64 {
+    match heap_segment_view(ctx, seg) {
+        Some(view) => {
+            heap_max_byte_alignment(view.elem_width as i64, view.start.saturating_add(offset))
+        }
+        None => native_max_byte_alignment(
+            crate::panama_libffi::segment_address(ctx, seg).saturating_add(offset),
+        ),
+    }
+}
+
+/// The bounds half of every slice, extracted so the alignment-checked arity
+/// can run it FIRST.
+///
+/// MEASURED order (`FfmProbe3`/`FfmProbe2` §P5): `byte[16].asSlice(20, 4, 3)`
+/// is an `IndexOutOfBoundsException`, not the `IllegalArgumentException:
+/// Invalid alignment constraint : 3` that the same bad alignment produces in
+/// bounds — so bounds precede both the power-of-two check and the alignment
+/// check. Doing them in the other order reports the second-most-interesting
+/// problem.
+fn pe_slice_bounds_check(
+    ctx: &dyn NativeContext,
+    this: ObjectRef,
+    offset: i64,
+    new_size: i64,
+) -> Result<(), MethodCallFailed> {
+    let size = crate::panama_libffi::segment_byte_size(ctx, this);
+    let end = offset.checked_add(new_size);
+    if offset < 0 || new_size < 0 || end.map_or(true, |n| n > size) {
+        // `IndexOutOfBoundsException`, NOT `IllegalStateException`.
+        //
+        // MEASURED, every out-of-range slice arity on both carriers:
+        // `IndexOutOfBoundsException: Out of bound access on segment
+        // MemorySegment{ kind: heap, heapBase: [B@7c1503a3, address: 0x0,
+        // byteSize: 16 }; new offset = 17; new length = 0`. A caller writing
+        // `catch (IndexOutOfBoundsException)` — the idiom for a bounds check,
+        // and what `heap_segment_check_access` already answers for `get`/`set`
+        // — could not catch the `IllegalStateException` this used to raise.
+        // The bracketed receiver text is HotSpot's `toString()` and carries an
+        // identity hash we cannot reproduce; the CLASS and the two trailing
+        // clauses are what a program can act on, and those are exact.
+        return Err(RuntimeError::IndexOutOfBoundsException {
+            message: Some(format!(
+                "Out of bound access on segment MemorySegment{{ kind: {}, address: 0x{:x}, \
+                 byteSize: {} }}; new offset = {}; new length = {}",
+                if heap_segment_view(ctx, this).is_some() {
+                    "heap"
+                } else {
+                    "native"
+                },
+                pe_segment_base_address(ctx, this),
+                size,
+                offset,
+                new_size
+            )),
+        }
+        .into());
+    }
+    Ok(())
+}
+
+/// The alignment half, shared by `asSlice(long,long,long)` and
+/// `asSlice(long,MemoryLayout)`.
+///
+/// MEASURED refusal texts, transcribed character for character (note the space
+/// before the colon in the first — it is HotSpot's, not a typo):
+///
+/// * `IllegalArgumentException: Invalid alignment constraint : 3`
+/// * `IllegalArgumentException: Target offset incompatible with alignment constraints`
+///
+/// Neither message interpolates the offset. The version this replaces wrote
+/// `Target offset {offset} incompatible with alignment {align}`, which is a
+/// different string on every row.
+fn pe_slice_alignment_check(
+    ctx: &dyn NativeContext,
+    this: ObjectRef,
+    offset: i64,
+    align: i64,
+) -> Result<(), MethodCallFailed> {
+    if align <= 0 || (align & (align - 1)) != 0 {
+        return Err(RuntimeError::IllegalArgumentException {
+            message: format!("Invalid alignment constraint : {align}"),
+        }
+        .into());
+    }
+    if align > pe_segment_max_byte_alignment_at(ctx, this, offset) {
+        return Err(RuntimeError::IllegalArgumentException {
+            message: "Target offset incompatible with alignment constraints".into(),
+        }
+        .into());
+    }
+    Ok(())
+}
+
 /// The body behind `asSlice(long,long)`, `asSlice(long)`, `asSlice(long,long,
 /// long)`, `asSlice(long,MemoryLayout)` and `asReadOnly()`.
 ///
@@ -2383,17 +2691,7 @@ fn pe_segment_slice(
     new_size: i64,
     read_only_override: Option<bool>,
 ) -> MethodCallResult {
-    let size = crate::panama_libffi::segment_byte_size(ctx, this);
-    let end = offset.checked_add(new_size);
-    if offset < 0 || new_size < 0 || end.map_or(true, |n| n > size) {
-        return Err(RuntimeError::IllegalStateException {
-            message: format!(
-                "slice offset {} + size {} exceeds segment size {}",
-                offset, new_size, size
-            ),
-        }
-        .into());
-    }
+    pe_slice_bounds_check(ctx, this, offset, new_size)?;
     // A SLICE OF A HEAP SEGMENT IS A HEAP SEGMENT.
     //
     // The address arithmetic below is only meaningful for a carrier
@@ -3086,13 +3384,26 @@ fn heap_segment_write(
 /// | `ofArray(int[8]).get(JAVA_LONG, 0)` | `IllegalArgumentException` (`maxByteAlignment` is 4) |
 /// | `ofArray(int[8]).get(JAVA_LONG_UNALIGNED, 0)` | OK |
 ///
-/// The alignment rule has TWO halves and both are needed: a `byte[]` segment's
-/// address is 0, so `(address + offset) % 4 == 0` alone would ADMIT
-/// `get(JAVA_INT, 0)` on one, where the oracle refuses it. The second half is
-/// `maxByteAlignment`, which for a heap segment is the element type's own
-/// alignment, further capped by the low bit of the address when it is not 0
-/// (measured: `byte[]`=1, `int[]`=4, `long[]`=8; and `asSlice(3)` has
-/// `address()==3`, whose lowest set bit is 1).
+/// The alignment rule is ONE predicate, and CORRECTED 2026-08-16: the
+/// constraint must be no larger than the alignment available at the
+/// **absolute** offset `view.start + offset`, i.e. exactly
+/// `seg.asSlice(offset).maxByteAlignment()`. The previous spelling was
+/// `align <= maxByteAlignment(view.start) && (view.start + offset) % align == 0`,
+/// which is one conjunct too many and is STRICTER than the oracle whenever a
+/// slice starts at a worse alignment than the offset inside it reaches:
+///
+/// | call | oracle | previous |
+/// |---|---|---|
+/// | `ofArray(int[8]).asSlice(2).get(JAVA_INT, 2)` | reads (absolute 4) | refused |
+/// | `ofArray(int[8]).asSlice(2).get(JAVA_INT, 0)` | refused (absolute 2) | refused |
+/// | `ofArray(long[4]).asSlice(4).get(JAVA_LONG, 4)` | reads (absolute 8) | refused |
+///
+/// (measured, `FfmProbe3` rows M1c/M1d/M1h; `int[8].asSlice(2)` reports
+/// `maxByteAlignment()==2` and `asSlice(2).asSlice(2)` reports 4.) Both halves
+/// are still present — they are just the two halves of
+/// [`heap_max_byte_alignment`]: the element width, and the low bit of the
+/// offset. A `byte[]` segment's element width is 1, which is what refuses
+/// `get(JAVA_INT, 0)` on one where a bare modulo would admit it.
 ///
 /// This is enforced on the HEAP path only. The raw-address path has never
 /// checked alignment and is not changed here — a native segment's real
@@ -3132,12 +3443,9 @@ fn heap_segment_check_access(
 
     let align = crate::panama_libffi::layout_align(ctx, layout) as i64;
     if align > 1 {
-        let max_align = if view.start == 0 {
-            view.elem_width as i64
-        } else {
-            (view.elem_width as i64).min(view.start & view.start.wrapping_neg())
-        };
-        if align > max_align || (view.start + offset) % align != 0 {
+        let max_align =
+            heap_max_byte_alignment(view.elem_width as i64, view.start.saturating_add(offset));
+        if align > max_align {
             return Err(RuntimeError::IllegalArgumentException {
                 message: format!(
                     "Target offset {} is incompatible with alignment constraint {} for segment \
@@ -5593,45 +5901,22 @@ fn register_pe2_struct_layouts(r: &mut NativeMethodRegistry) {
     );
 }
 
-/// A layout's byte size, across BOTH layout shapes this tree mints.
-///
-/// This file's own (test-only, since F16) shape is `[0]=kind(Int),
-/// [1]=byteSize`; `phases_late::foreign_ffm`'s — the ONE shape a shipping
-/// binary sees, where `ValueLayout.JAVA_INT` comes from `p67_layout_object` —
-/// is `[0]=byteSize(Long), [1]=byteAlignment(Long)`.
-///
-/// The `_ => -1` this replaces treated the second shape as an unknown KIND, and
-/// `-1` is `< 10`, so `ffi::layout_byte_size(-1)` answered **1 byte for every
-/// layout in real-JDK mode**. Measured with `FfmInterfaceAuditProbe`:
-/// `segment.asSlice(8, JAVA_INT).byteSize()` answered 1 where HotSpot says 4.
-/// Silently wrong, in every caller of this helper — which is why it surfaced
-/// only once `asSlice(J,MemoryLayout)` above gave it a caller that reports.
-///
-/// This is the ONLY survivor of the layout block that used to sit here.
-/// `pe_memory_layout_path_target`, `pe_memory_layout_var_handle`,
-/// `pe_struct_layout`, `pe_union_layout`, `pe_sequence_layout` and
-/// `pe_layout_name_value` were deleted with the registrations that reached
-/// them (F16, 2026-08-13) — see the banner above `register_pe2_struct_layouts`
-/// for why, and `foreign_ffm.rs`'s "THE ONE LAYOUT CARRIER ENCODING" banner for
-/// what replaced them. Keeping them would also not compile: the four compound
-/// `LAYOUT_*` tags they read are test-only imports in this file now.
-fn pe_memory_layout_width(ctx: &mut dyn NativeContext, layout: ObjectRef) -> i64 {
-    match ctx.get_field(layout, 0) {
-        Value::Int(kind) => {
-            if kind < 10 {
-                ffi::layout_byte_size(kind) as i64
-            } else {
-                match ctx.get_field(layout, 1) {
-                    Value::Long(v) => v,
-                    _ => 1,
-                }
-            }
-        }
-        // `foreign_ffm`'s shape: slot 0 IS the byte size.
-        Value::Long(size) if size > 0 => size,
-        _ => 1,
-    }
-}
+// THE LAST SURVIVOR OF THE GROUP-LAYOUT FAMILY IS GONE TOO (G6, 2026-08-16).
+//
+// `pe_memory_layout_width` stood here — a size reader that understood BOTH
+// this file's old `[0]=Int(kind)` carrier and `foreign_ffm`'s
+// `[0]=Long(byteSize)` one. It had exactly one caller,
+// `asSlice(long, MemoryLayout)`, and that caller now reads size AND alignment
+// out of the four-slot carrier in one call through
+// `foreign_ffm::p67_layout_size_align`, because the JDK's own body is
+// `asSlice(offset, layout.byteSize(), layout.byteAlignment())` and a reader
+// that answers only the size cannot express the second half.
+//
+// This closes F16-1's remaining question. The reconciling arm this function
+// existed for — "which of the two encodings am I looking at?" — has nothing
+// left to reconcile: `pe_make_layout`, the only minter of `[0]=Int(kind)`, is
+// `#[cfg(test)]`, and every shipping carrier comes from `p67_layout_object` or
+// the four group-layout factories beside it. One encoding, one reader.
 
 // --- String marshaling helpers ---
 
@@ -8184,6 +8469,712 @@ mod tests {
             Value::Int(0),
             "and the refused write must not have happened"
         );
+    }
+
+    // ===================================================================
+    // G6 (2026-08-16): the three callers `pe_segment_slice`'s heap arm
+    // reached and nothing tested — `spliterator`, `elements`, `toArray` —
+    // plus the `maxByteAlignment` rule the merge left UNSETTLED and the
+    // `heapBase` capability the oracle withholds from a read-only view.
+    //
+    // ORACLE. Every number and message below is `java` on this host, Temurin
+    // 25.0.3+9-LTS, transcribed from the probes `FfmProbe`, `FfmProbe2` and
+    // `FfmProbe3` (see the G6-1 record for the full tables). NOTHING here has
+    // been measured on a CratonVM binary.
+    //
+    // MOCK. These tests build their heap carriers with [`heap_alias_segment`],
+    // the eight-slot H2 shape, and NOT with [`make_real_heap_segment`]. That
+    // is not a preference. `make_real_heap_segment` writes `base`/`offset`/
+    // `readOnly`/`length` BY NAME, and `MockNativeContext::set_field_by_name`
+    // resolves a name through `mock_field_slot`, whose whole chain — including
+    // `cratonvm_classloading::synthetic_stub_field_model` — has no entry for
+    // `jdk/internal/foreign/HeapMemorySegmentImpl$Of*`. An unresolved name is
+    // a SILENT no-op on write and `Value::Int(0)` on read, so
+    // `heap_segment_view` cannot resolve such a carrier under the mock and
+    // answers `None`. H2 resolves by SLOT (`[6]=array, [7]=start`) and needs
+    // no name table, which is why `of_array_covers_byte_short_and_char_and_
+    // the_carrier_aliases` — the one existing test that proves a write reaches
+    // the caller's array — uses it. See the G6-1 record's NOM-1: the fix is a
+    // `mock_field_slot` arm in `test_utils.rs`, which this lane does not own.
+    // ===================================================================
+
+    /// The H2 heap carrier: `[0]=0` (no machine address), `[1]=byteSize`,
+    /// `[2]=scope`, `[3]=readOnly`, `[4]=1`, `[5]=0`, `[6]=array`,
+    /// `[7]=startWithinArray`.
+    ///
+    /// This is the production shape, not a test fixture: it is exactly what
+    /// [`pe_of_array_alias`] mints for `ofArray(byte[]|short[]|char[])` and
+    /// what [`pe_segment_slice`]'s heap arm mints for every slice of a heap
+    /// segment — including a slice of a REAL `HeapMemorySegmentImpl$Of*`,
+    /// because `asSlice` is force-routed. So it is also the receiver that
+    /// `toArray`/`elements`/`spliterator` actually see in the field.
+    fn heap_alias_segment(
+        ctx: &mut dyn NativeContext,
+        array: ObjectRef,
+        start: i64,
+        size: i64,
+        read_only: bool,
+    ) -> ObjectRef {
+        let seg =
+            try_alloc_concurrent_synthetic(ctx, "java/lang/foreign/MemorySegment", SEG_HEAP_FIELDS)
+                .unwrap();
+        ctx.set_field(seg, 0, Value::Long(0));
+        ctx.set_field(seg, 1, Value::Long(size));
+        ctx.set_field(seg, 2, Value::Object(None));
+        ctx.set_field(seg, 3, Value::Int(i32::from(read_only)));
+        ctx.set_field(seg, 4, Value::Int(1));
+        ctx.set_field(seg, 5, Value::Long(0));
+        ctx.set_field(seg, SEG_HEAP_BASE_FIELD, Value::Object(Some(array)));
+        ctx.set_field(seg, SEG_HEAP_START_FIELD, Value::Long(start));
+        seg
+    }
+
+    /// A `byte[]`-backed heap segment holding `bytes`, plus the array itself.
+    fn heap_byte_segment(ctx: &mut dyn NativeContext, bytes: &[i32]) -> (ObjectRef, ObjectRef) {
+        let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, bytes.len());
+        for (i, b) in bytes.iter().enumerate() {
+            ctx.set_array_element(arr, i, Value::Int(*b));
+        }
+        let seg = heap_alias_segment(ctx, arr, 0, bytes.len() as i64, false);
+        (seg, arr)
+    }
+
+    /// An `int[]`-backed heap segment holding `values`, plus the array itself.
+    fn heap_int_segment(ctx: &mut dyn NativeContext, values: &[i32]) -> (ObjectRef, ObjectRef) {
+        let arr = ctx.new_array(cratonvm_types::ArrayElementType::Int, values.len());
+        for (i, v) in values.iter().enumerate() {
+            ctx.set_array_element(arr, i, Value::Int(*v));
+        }
+        let seg = heap_alias_segment(ctx, arr, 0, values.len() as i64 * 4, false);
+        (seg, arr)
+    }
+
+    /// `maxByteAlignment()` is the BACKING ARRAY'S element alignment, not 8.
+    ///
+    /// This is the question the merge lane left open, and both arms of the
+    /// answer it guessed were wrong. Oracle rows, transcribed:
+    ///
+    /// | receiver | `maxByteAlignment()` |
+    /// |---|---|
+    /// | `ofArray(byte[16])` | 1 |
+    /// | `ofArray(short[8])` / `ofArray(char[8])` | 2 |
+    /// | `ofArray(int[8])` / `ofArray(float[8])` | 4 |
+    /// | `ofArray(long[8])` / `ofArray(double[8])` | 8 |
+    /// | `ofArray(byte[0])` | 1 |
+    /// | `ofArray(long[0])` | 8 |
+    /// | `ofArray(long[4]).asSlice(4)` | 4 |
+    /// | `ofArray(int[8]).asSlice(2)` | 2 |
+    /// | `ofArray(byte[16]).asSlice(8)` | 1 |
+    /// | `MemorySegment.NULL` / `ofAddress(0)` | 4611686018427387904 |
+    /// | `ofAddress(16)` | 16 |
+    /// | `ofAddress(12)` | 4 |
+    ///
+    /// MUTATION: the previous body was `addr == 0 ? 8 : addr & -addr` over the
+    /// segment's START, so every row with start 0 answered 8. Rows 1-3, 5 and
+    /// 10 are red under it; row 4 (`long[8]` -> 8) is the single row that
+    /// agreed, which is why reading one row would have settled nothing.
+    #[test]
+    fn max_byte_alignment_is_the_element_type_not_a_constant_eight() {
+        use cratonvm_types::ArrayElementType as A;
+        let mut ctx = mock_ctx();
+        for (elem, len, expected) in [
+            (A::Byte, 16usize, 1_i64),
+            (A::Short, 8, 2),
+            (A::Char, 8, 2),
+            (A::Int, 8, 4),
+            (A::Float, 8, 4),
+            (A::Long, 8, 8),
+            (A::Double, 8, 8),
+            (A::Byte, 0, 1),
+            (A::Long, 0, 8),
+        ] {
+            let width = heap_element_width(elem).unwrap() as i64;
+            let arr = ctx.new_array(elem, len);
+            let seg = heap_alias_segment(&mut ctx, arr, 0, len as i64 * width, false);
+            assert_eq!(
+                pe_segment_max_byte_alignment(&ctx, seg),
+                expected,
+                "a {elem:?}[] segment starting at offset 0 promises its element \
+                 alignment, not 8"
+            );
+        }
+
+        // The offset cap, on the element type wide enough to show it.
+        let longs = ctx.new_array(A::Long, 4);
+        for (start, expected) in [(0_i64, 8_i64), (1, 1), (2, 2), (4, 4), (8, 8), (12, 4)] {
+            let seg = heap_alias_segment(&mut ctx, longs, start, 32 - start, false);
+            assert_eq!(
+                pe_segment_max_byte_alignment(&ctx, seg),
+                expected,
+                "long[4] at byte offset {start} promises min(8, lowestOneBit({start}))"
+            );
+        }
+
+        // A byte[] never promises more than 1, at any offset — the row the old
+        // body got most wrong.
+        let bytes = ctx.new_array(A::Byte, 16);
+        for start in [0_i64, 1, 4, 8, 12] {
+            let seg = heap_alias_segment(&mut ctx, bytes, start, 16 - start, false);
+            assert_eq!(pe_segment_max_byte_alignment(&ctx, seg), 1);
+        }
+
+        // The native arm, including the address-0 row that used to answer 8.
+        assert_eq!(native_max_byte_alignment(0), 1_i64 << 62);
+        assert_eq!(native_max_byte_alignment(16), 16);
+        assert_eq!(native_max_byte_alignment(12), 4);
+        assert_eq!(native_max_byte_alignment(1), 1);
+    }
+
+    /// `toArray` on a heap receiver hands back the ARRAY'S BYTES.
+    ///
+    /// It used to hand back zeros: `segment_address` is 0 for every heap
+    /// carrier (F27), and the raw-pointer loop took its `base.is_null()` early
+    /// return and returned a correctly-sized array of the type's default.
+    /// Oracle:
+    ///
+    /// * `ofArray(new byte[]{0..7}).toArray(JAVA_BYTE)` -> `[0, 1, ..., 7]`
+    /// * `ofArray(byte[16]).asSlice(3,4).toArray(JAVA_BYTE)` -> `[3, 4, 5, 6]`
+    /// * `ofArray(new int[]{10,20,30,40}).toArray(JAVA_INT)` -> `[10, 20, 30, 40]`
+    ///
+    /// MUTATION: delete the heap arm and every assertion below reads 0.
+    #[test]
+    fn to_array_on_a_heap_receiver_reads_the_arrays_own_bytes() {
+        let mut ctx = mock_ctx();
+        let byte_layout = jdk_byte_layout(&mut ctx);
+        let (seg, _arr) = heap_byte_segment(&mut ctx, &[0, 1, 2, 3, 4, 5, 6, 7]);
+
+        let out = pe_segment_to_array(
+            &mut ctx,
+            &[Value::Object(Some(seg)), Value::Object(Some(byte_layout))],
+        )
+        .unwrap();
+        let Some(Value::Object(Some(out))) = out else {
+            panic!("toArray must answer an array")
+        };
+        assert_eq!(ctx.array_length(out), 8);
+        for i in 0..8 {
+            assert_eq!(
+                ctx.get_array_element(out, i),
+                Value::Int(i as i32),
+                "byte {i} must come from the backing array, not from address 0"
+            );
+        }
+
+        // A SLICE of that heap segment is the receiver `elements` and
+        // `spliterator` hand on, and the one `asSlice` mints from a REAL
+        // `HeapMemorySegmentImpl$Of*`.
+        let Some(Value::Object(Some(slice))) = pe_segment_slice(&mut ctx, seg, 3, 4, None).unwrap()
+        else {
+            panic!("a heap slice must be a segment")
+        };
+        let sliced = pe_segment_to_array(
+            &mut ctx,
+            &[Value::Object(Some(slice)), Value::Object(Some(byte_layout))],
+        )
+        .unwrap();
+        let Some(Value::Object(Some(sliced))) = sliced else {
+            panic!("toArray must answer an array")
+        };
+        assert_eq!(ctx.array_length(sliced), 4);
+        for (i, expected) in [3, 4, 5, 6].into_iter().enumerate() {
+            assert_eq!(
+                ctx.get_array_element(sliced, i),
+                Value::Int(expected),
+                "a heap slice's toArray starts at the slice, not at the array"
+            );
+        }
+
+        // A wider element type, so the stride is exercised and not only the
+        // byte-for-byte identity case.
+        let int_layout = make_jdk_layout(
+            &mut ctx,
+            "jdk/internal/foreign/layout/ValueLayouts$OfIntImpl",
+            4,
+            4,
+        );
+        let (int_seg, _) = heap_int_segment(&mut ctx, &[10, 20, 30, 40]);
+        let out = pe_segment_to_array(
+            &mut ctx,
+            &[
+                Value::Object(Some(int_seg)),
+                Value::Object(Some(int_layout)),
+            ],
+        )
+        .unwrap();
+        let Some(Value::Object(Some(out))) = out else {
+            panic!("toArray must answer an array")
+        };
+        assert_eq!(ctx.array_length(out), 4);
+        for (i, v) in [10, 20, 30, 40].into_iter().enumerate() {
+            assert_eq!(ctx.get_array_element(out, i), Value::Int(v));
+        }
+    }
+
+    /// `toArray`'s two refusals, in the oracle's ORDER.
+    ///
+    /// | call | oracle |
+    /// |---|---|
+    /// | `ofArray(byte[15]).toArray(JAVA_INT)` | ISE `Segment size is not a multiple of 4. Size: 15` |
+    /// | `ofArray(byte[16]).toArray(JAVA_INT)` | IAE `Source segment incompatible with alignment constraints` |
+    /// | `ofArray(byte[16]).toArray(JAVA_INT_UNALIGNED)` | 4 elements |
+    /// | `ofArray(int[8]).toArray(JAVA_LONG)` | IAE, same message |
+    /// | `ofArray(int[8]).toArray(JAVA_INT)` | 8 elements |
+    ///
+    /// Row 1 is the ordering witness: that segment is BOTH badly sized and
+    /// badly aligned, and HotSpot reports the SIZE, because
+    /// `AbstractMemorySegmentImpl.toArray` runs `checkArraySize` before it
+    /// hands the segment to `MemorySegment.copy`.
+    #[test]
+    fn to_array_alignment_gate_matches_the_oracle_and_runs_after_the_size_gate() {
+        let mut ctx = mock_ctx();
+        let int_aligned = make_jdk_layout(
+            &mut ctx,
+            "jdk/internal/foreign/layout/ValueLayouts$OfIntImpl",
+            4,
+            4,
+        );
+        // Same CLASS, alignment 1: that is exactly how the JDK spells
+        // `JAVA_INT_UNALIGNED` — one `OfIntImpl` with a different alignment
+        // slot — so the element-kind sniff and the alignment gate are being
+        // read off the two different places they are read off in production.
+        let int_unaligned = jdk_int_unaligned(&mut ctx);
+        let long_aligned = make_jdk_layout(
+            &mut ctx,
+            "jdk/internal/foreign/layout/ValueLayouts$OfLongImpl",
+            8,
+            8,
+        );
+
+        let (b15, _) = heap_byte_segment(&mut ctx, &[0; 15]);
+        let err = pe_segment_to_array(
+            &mut ctx,
+            &[Value::Object(Some(b15)), Value::Object(Some(int_aligned))],
+        )
+        .unwrap_err();
+        let text = format!("{err:?}");
+        assert!(
+            text.contains("IllegalState") && text.contains("not a multiple of 4"),
+            "a segment that is both badly sized and badly aligned reports the \
+             SIZE on the oracle, got {text}"
+        );
+
+        let (b16, _) = heap_byte_segment(&mut ctx, &[0; 16]);
+        let err = pe_segment_to_array(
+            &mut ctx,
+            &[Value::Object(Some(b16)), Value::Object(Some(int_aligned))],
+        )
+        .unwrap_err();
+        let text = format!("{err:?}");
+        assert!(
+            text.contains("IllegalArgument") && text.contains("Source segment incompatible"),
+            "a byte[] segment's maxByteAlignment is 1, so JAVA_INT is refused, \
+             got {text}"
+        );
+        assert!(
+            pe_segment_to_array(
+                &mut ctx,
+                &[Value::Object(Some(b16)), Value::Object(Some(int_unaligned))]
+            )
+            .is_ok(),
+            "JAVA_INT_UNALIGNED on the same receiver is the oracle's OK row"
+        );
+
+        let (int_seg, _) = heap_int_segment(&mut ctx, &[0; 8]);
+        assert!(
+            pe_segment_to_array(
+                &mut ctx,
+                &[
+                    Value::Object(Some(int_seg)),
+                    Value::Object(Some(long_aligned))
+                ]
+            )
+            .is_err(),
+            "an int[] segment's maxByteAlignment is 4, so JAVA_LONG is refused"
+        );
+        assert!(pe_segment_to_array(
+            &mut ctx,
+            &[
+                Value::Object(Some(int_seg)),
+                Value::Object(Some(int_aligned))
+            ]
+        )
+        .is_ok());
+    }
+
+    /// `spliterator` and `elements` count a heap receiver's elements and share
+    /// ONE alignment gate — the one that reads `maxByteAlignment`.
+    ///
+    /// The gate used to be `segment_address % elemAlign`, and a heap segment's
+    /// address is 0, so it admitted every element layout on every heap
+    /// receiver. Oracle:
+    ///
+    /// | call | oracle |
+    /// |---|---|
+    /// | `ofArray(byte[16]).spliterator(JAVA_BYTE).estimateSize()` | 16 |
+    /// | `ofArray(byte[16]).spliterator(JAVA_INT_UNALIGNED).estimateSize()` | 4 |
+    /// | `ofArray(byte[16]).spliterator(JAVA_INT)` | IAE `Incompatible alignment constraints` |
+    /// | `ofArray(int[8]).spliterator(JAVA_INT).estimateSize()` | 8 |
+    /// | `ofArray(int[8]).elements(JAVA_LONG)` | IAE, same message |
+    /// | `ofArray(byte[15]).elements(JAVA_INT_UNALIGNED)` | IAE `Segment size is not a multiple of layout size` |
+    ///
+    /// MUTATION: restore `segment_address % elemAlign` and rows 3 and 5 turn
+    /// into successful streams over misaligned memory.
+    #[test]
+    fn spliterator_and_elements_gate_a_heap_receiver_on_max_byte_alignment() {
+        let mut ctx = mock_ctx();
+        let byte_layout = jdk_byte_layout(&mut ctx);
+        let int_unaligned = jdk_int_unaligned(&mut ctx);
+        let int_aligned = make_jdk_layout(
+            &mut ctx,
+            "jdk/internal/foreign/layout/ValueLayouts$OfIntImpl",
+            4,
+            4,
+        );
+        let long_aligned = make_jdk_layout(
+            &mut ctx,
+            "jdk/internal/foreign/layout/ValueLayouts$OfLongImpl",
+            8,
+            8,
+        );
+
+        fn split(
+            ctx: &mut dyn NativeContext,
+            seg: ObjectRef,
+            layout: ObjectRef,
+        ) -> MethodCallResult {
+            pe_segment_spliterator(
+                ctx,
+                &[Value::Object(Some(seg)), Value::Object(Some(layout))],
+            )
+        }
+        fn elements(
+            ctx: &mut dyn NativeContext,
+            seg: ObjectRef,
+            layout: ObjectRef,
+        ) -> MethodCallResult {
+            pe_segment_elements(
+                ctx,
+                &[Value::Object(Some(seg)), Value::Object(Some(layout))],
+            )
+        }
+
+        let (b16, _) = heap_byte_segment(&mut ctx, &[0; 16]);
+
+        let Some(Value::Object(Some(s))) = split(&mut ctx, b16, byte_layout).unwrap() else {
+            panic!("a byte-layout spliterator over a byte[16] heap segment must exist")
+        };
+        assert_eq!(pe_splitter_state(&mut ctx, s), (16, 1, 0));
+
+        let Some(Value::Object(Some(s))) = split(&mut ctx, b16, int_unaligned).unwrap() else {
+            panic!("JAVA_INT_UNALIGNED is the oracle's OK row on a byte[] receiver")
+        };
+        assert_eq!(pe_splitter_state(&mut ctx, s), (4, 4, 0));
+
+        let err = split(&mut ctx, b16, int_aligned).unwrap_err();
+        let text = format!("{err:?}");
+        assert!(
+            text.contains("IllegalArgument") && text.contains("Incompatible alignment constraints"),
+            "a byte[] segment's maxByteAlignment is 1, so JAVA_INT is refused, \
+             got {text}"
+        );
+
+        let (int_seg, _) = heap_int_segment(&mut ctx, &[0; 8]);
+        let Some(Value::Object(Some(s))) = split(&mut ctx, int_seg, int_aligned).unwrap() else {
+            panic!("JAVA_INT over an int[] receiver is the oracle's 8-element row")
+        };
+        assert_eq!(pe_splitter_state(&mut ctx, s), (8, 4, 0));
+        assert!(
+            split(&mut ctx, int_seg, long_aligned).is_err(),
+            "an int[] segment's maxByteAlignment is 4, so JAVA_LONG is refused"
+        );
+
+        // `elements` is `spliterator` plus a Stream carrier, so its REFUSALS
+        // must be identical — the gate runs before anything is allocated.
+        assert!(
+            elements(&mut ctx, b16, int_aligned).is_err(),
+            "elements() shares spliterator()'s alignment gate"
+        );
+        assert!(
+            elements(&mut ctx, int_seg, long_aligned).is_err(),
+            "elements() shares spliterator()'s alignment gate"
+        );
+        assert!(matches!(
+            elements(&mut ctx, int_seg, int_aligned),
+            Ok(Some(Value::Object(Some(_))))
+        ));
+
+        // The size-multiple gate, on a receiver the alignment gate admits.
+        let (b15, _) = heap_byte_segment(&mut ctx, &[0; 15]);
+        let err = split(&mut ctx, b15, int_unaligned).unwrap_err();
+        assert!(
+            format!("{err:?}").contains("Segment size is not a multiple of layout size"),
+            "got {err:?}"
+        );
+    }
+
+    /// The splitter walks a heap receiver, and each element it mints is a HEAP
+    /// slice over the same array — not a synthetic native carrier parked at a
+    /// small integer address.
+    ///
+    /// Oracle: `ofArray(new int[]{10,20,30,40}).spliterator(JAVA_INT)` advances
+    /// four times then reports exhausted; the second element has
+    /// `address() == 4`, `isNative() == false`, `heapBase()` present, and reads
+    /// `20`.
+    #[test]
+    fn the_splitter_walks_a_heap_receiver_element_by_element() {
+        let mut ctx = mock_ctx();
+        let int_aligned = make_jdk_layout(
+            &mut ctx,
+            "jdk/internal/foreign/layout/ValueLayouts$OfIntImpl",
+            4,
+            4,
+        );
+        let (seg, arr) = heap_int_segment(&mut ctx, &[10, 20, 30, 40]);
+
+        let Some(Value::Object(Some(splitter))) = pe_segment_spliterator(
+            &mut ctx,
+            &[Value::Object(Some(seg)), Value::Object(Some(int_aligned))],
+        )
+        .unwrap() else {
+            panic!("spliterator over an int[4] heap segment must exist")
+        };
+        assert_eq!(pe_splitter_state(&mut ctx, splitter), (4, 4, 0));
+
+        // A null consumer exercises the mint and the advance without needing
+        // the mock to dispatch `Consumer.accept`.
+        for expected_index in 1..=4_i64 {
+            assert_eq!(
+                pe_splitter_try_advance(&mut ctx, &[Value::Object(Some(splitter))]).unwrap(),
+                Some(Value::Int(1)),
+                "element {expected_index} of 4 must be produced"
+            );
+            assert_eq!(pe_splitter_state(&mut ctx, splitter).2, expected_index);
+        }
+        assert_eq!(
+            pe_splitter_try_advance(&mut ctx, &[Value::Object(Some(splitter))]).unwrap(),
+            Some(Value::Int(0)),
+            "the fifth advance is exhausted"
+        );
+
+        // And the element body itself — the same `pe_segment_slice` call
+        // `tryAdvance` makes for index 1.
+        let Some(Value::Object(Some(elem))) = pe_segment_slice(&mut ctx, seg, 4, 4, None).unwrap()
+        else {
+            panic!("element 1 must be a segment")
+        };
+        assert_eq!(pe_segment_base_address(&ctx, elem), 4, "address() is 4");
+        assert_eq!(
+            pe_segment_heap_base(&ctx, elem),
+            Value::Object(Some(arr)),
+            "an element of a heap segment is a HEAP segment over the SAME \
+             array, not a native carrier parked at the small integer 4"
+        );
+        assert_eq!(
+            pe_segment_get_impl(&mut ctx, elem, int_aligned, 0).unwrap(),
+            Some(Value::Int(20)),
+            "element 1 reads the array's second int"
+        );
+    }
+
+    /// A read-only segment has NO `heapBase`.
+    ///
+    /// Oracle (`FfmProbe` B12, `FfmProbe3` M4a-M4g): `heapBase()` is present on
+    /// a writable heap segment and EMPTY on `asReadOnly()`, on a slice of a
+    /// read-only segment, on an element of one, on a read-only `ofBuffer`
+    /// segment, and on a read-only native segment.
+    ///
+    /// This is a capability, not cosmetics: the array `heapBase()` returns is
+    /// writable through plain array stores, so handing it out from a read-only
+    /// view returns exactly the capability `asReadOnly()` removed — F26's
+    /// "a copying slice is a wrong capability", one call further on.
+    ///
+    /// MUTATION: drop the read-only arm and rows 2, 3 and 4 hand the array
+    /// back.
+    #[test]
+    fn a_read_only_segment_hands_out_no_backing_array() {
+        let mut ctx = mock_ctx();
+        let (writable, arr) = heap_byte_segment(&mut ctx, &[1, 2, 3, 4]);
+        assert_eq!(
+            pe_segment_heap_base(&ctx, writable),
+            Value::Object(Some(arr)),
+            "a writable heap segment answers its array"
+        );
+
+        let read_only = heap_alias_segment(&mut ctx, arr, 0, 4, true);
+        assert_eq!(
+            pe_segment_heap_base(&ctx, read_only),
+            Value::Object(None),
+            "a read-only heap segment must not hand out its writable array"
+        );
+
+        // Read-only is contagious through `asSlice` (F21), so the slice must
+        // withhold it too — the arm that would otherwise leak the array one
+        // call after the fix.
+        let Some(Value::Object(Some(slice))) =
+            pe_segment_slice(&mut ctx, read_only, 1, 2, None).unwrap()
+        else {
+            panic!("a heap slice must be a segment")
+        };
+        assert_eq!(
+            pe_segment_heap_base(&ctx, slice),
+            Value::Object(None),
+            "a slice of a read-only segment is read-only, so it has no \
+             heapBase either"
+        );
+
+        // And `asReadOnly()`'s own shape: the same body with the flag FORCED.
+        let Some(Value::Object(Some(forced))) =
+            pe_segment_slice(&mut ctx, writable, 0, 4, Some(true)).unwrap()
+        else {
+            panic!("asReadOnly must answer a segment")
+        };
+        assert_eq!(
+            pe_segment_heap_base(&ctx, forced),
+            Value::Object(None),
+            "asReadOnly() of a writable heap segment withholds the array"
+        );
+
+        // Reads still work through the read-only view — the oracle's
+        // `asReadOnly().toArray(JAVA_BYTE).length == 16` row. Withholding the
+        // array must not become "a read-only segment is unreadable".
+        let byte_layout = jdk_byte_layout(&mut ctx);
+        let out = pe_segment_to_array(
+            &mut ctx,
+            &[
+                Value::Object(Some(read_only)),
+                Value::Object(Some(byte_layout)),
+            ],
+        )
+        .unwrap();
+        let Some(Value::Object(Some(out))) = out else {
+            panic!("a read-only segment still reads")
+        };
+        assert_eq!(ctx.get_array_element(out, 0), Value::Int(1));
+    }
+
+    /// The slice arities refuse in the oracle's ORDER, with the oracle's
+    /// exception CLASSES and message TEXTS.
+    ///
+    /// | call | oracle |
+    /// |---|---|
+    /// | `ofArray(byte[16]).asSlice(17, 0)` | `IndexOutOfBoundsException` |
+    /// | `ofArray(byte[16]).asSlice(4, -1)` | `IndexOutOfBoundsException` |
+    /// | `ofArray(byte[16]).asSlice(20, 4, 3)` | `IndexOutOfBoundsException` (bounds beat a bad alignment) |
+    /// | `ofArray(byte[16]).asSlice(4, 4, 3)` | IAE `Invalid alignment constraint : 3` |
+    /// | `ofArray(byte[16]).asSlice(4, 4, 0)` | IAE `Invalid alignment constraint : 0` |
+    /// | `ofArray(byte[16]).asSlice(0, 8, 8)` | IAE `Target offset incompatible with alignment constraints` |
+    /// | `ofArray(byte[16]).asSlice(4, 4, 1)` | OK |
+    /// | `ofArray(int[8]).asSlice(0, 4, 4)` | OK |
+    /// | `ofArray(int[8]).asSlice(2, 4, 4)` | IAE, alignment |
+    /// | `ofArray(int[8]).asSlice(0, 8, 8)` | IAE, alignment |
+    ///
+    /// Note the SPACE before the colon in `Invalid alignment constraint : 3`.
+    /// It is HotSpot's, transcribed; the previous text had no space, and
+    /// interpolated the offset into the second message, which HotSpot does not
+    /// do at all.
+    #[test]
+    fn slice_refusals_are_the_oracles_classes_texts_and_order() {
+        let mut ctx = mock_ctx();
+        let (b16, _) = heap_byte_segment(&mut ctx, &[0; 16]);
+
+        let oob = pe_slice_bounds_check(&ctx, b16, 17, 0).unwrap_err();
+        assert!(
+            format!("{oob:?}").contains("IndexOutOfBounds"),
+            "an over-long slice is IndexOutOfBoundsException, not \
+             IllegalStateException, got {oob:?}"
+        );
+        assert!(pe_slice_bounds_check(&ctx, b16, 4, -1).is_err());
+        assert!(pe_slice_bounds_check(&ctx, b16, -1, 4).is_err());
+        assert!(pe_slice_bounds_check(&ctx, b16, 16, 0).is_ok());
+
+        let bad_power = pe_slice_alignment_check(&ctx, b16, 4, 3).unwrap_err();
+        assert!(
+            format!("{bad_power:?}").contains("Invalid alignment constraint : 3"),
+            "the space before the colon is the oracle's, got {bad_power:?}"
+        );
+        let zero = pe_slice_alignment_check(&ctx, b16, 4, 0).unwrap_err();
+        assert!(format!("{zero:?}").contains("Invalid alignment constraint : 0"));
+        let unmeetable = pe_slice_alignment_check(&ctx, b16, 0, 8).unwrap_err();
+        let text = format!("{unmeetable:?}");
+        assert!(
+            text.contains("Target offset incompatible with alignment constraints"),
+            "the message does not interpolate the offset, got {text}"
+        );
+        assert!(
+            pe_slice_alignment_check(&ctx, b16, 4, 1).is_ok(),
+            "alignment 1 is always available"
+        );
+
+        let (int_seg, _) = heap_int_segment(&mut ctx, &[0; 8]);
+        assert!(pe_slice_alignment_check(&ctx, int_seg, 0, 4).is_ok());
+        assert!(pe_slice_alignment_check(&ctx, int_seg, 4, 4).is_ok());
+        assert!(
+            pe_slice_alignment_check(&ctx, int_seg, 2, 4).is_err(),
+            "absolute offset 2 cannot carry a 4-byte alignment"
+        );
+        assert!(
+            pe_slice_alignment_check(&ctx, int_seg, 0, 8).is_err(),
+            "an int[] segment's maxByteAlignment is 4"
+        );
+    }
+
+    /// A slice's own start does NOT disqualify a better-aligned offset inside
+    /// it.
+    ///
+    /// This is the conjunct the previous `heap_segment_check_access` had one
+    /// too many of. Oracle (`FfmProbe3` M1a-M1j):
+    ///
+    /// | call | oracle |
+    /// |---|---|
+    /// | `ofArray(int[8]).asSlice(2).maxByteAlignment()` | 2 |
+    /// | `ofArray(int[8]).asSlice(2).get(JAVA_INT, 2)` | reads (absolute 4) |
+    /// | `ofArray(int[8]).asSlice(2).get(JAVA_INT, 0)` | IAE (absolute 2) |
+    /// | `ofArray(long[4]).asSlice(4).get(JAVA_LONG, 4)` | reads (absolute 8) |
+    ///
+    /// MUTATION: re-add `align <= maxByteAlignment(view.start)` and rows 2 and
+    /// 4 are refused.
+    #[test]
+    fn alignment_is_judged_at_the_absolute_offset_not_the_slice_start() {
+        let mut ctx = mock_ctx();
+        let int_aligned = make_jdk_layout(
+            &mut ctx,
+            "jdk/internal/foreign/layout/ValueLayouts$OfIntImpl",
+            4,
+            4,
+        );
+        let long_aligned = make_jdk_layout(
+            &mut ctx,
+            "jdk/internal/foreign/layout/ValueLayouts$OfLongImpl",
+            8,
+            8,
+        );
+
+        let ints = ctx.new_array(cratonvm_types::ArrayElementType::Int, 8);
+        let at2 = heap_alias_segment(&mut ctx, ints, 2, 30, false);
+        assert_eq!(
+            pe_segment_max_byte_alignment(&ctx, at2),
+            2,
+            "a slice starting at byte 2 of an int[] promises 2"
+        );
+        assert!(
+            pe_segment_get_impl(&mut ctx, at2, int_aligned, 2).is_ok(),
+            "offset 2 of a slice starting at 2 is absolute 4, which the oracle \
+             reads"
+        );
+        assert!(
+            pe_segment_get_impl(&mut ctx, at2, int_aligned, 0).is_err(),
+            "offset 0 of the same slice is absolute 2, which the oracle refuses"
+        );
+
+        let longs = ctx.new_array(cratonvm_types::ArrayElementType::Long, 4);
+        let at4 = heap_alias_segment(&mut ctx, longs, 4, 28, false);
+        assert_eq!(pe_segment_max_byte_alignment(&ctx, at4), 4);
+        assert!(
+            pe_segment_get_impl(&mut ctx, at4, long_aligned, 4).is_ok(),
+            "absolute offset 8 carries an 8-byte alignment even though the \
+             slice starts at 4"
+        );
+        assert!(pe_segment_get_impl(&mut ctx, at4, long_aligned, 0).is_err());
     }
 
     /// The zero-size refusal on the RAW-ADDRESS path changed class too, and

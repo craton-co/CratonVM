@@ -9635,15 +9635,24 @@ mod tests {
         );
     }
 
-    /// `getSessionContext()` answers `null`, and `null` is a value the
-    /// interface's own contract permits ("This context may be unavailable in
-    /// some environments, in which case this method returns null" —
-    /// jdk25src/java.base/javax/net/ssl/SSLSession.java:77-84). This VM has no
-    /// session cache, so "unavailable" is true of it.
+    /// `getSessionContext()` answers `null` for a session that is in no
+    /// context, and a real carrier for one that is.
     ///
-    /// Pinned because the tempting "fix" is a fabricated context object, which
-    /// would answer every subsequent question on it wrongly — the shape
-    /// `--jdk-only` exists to refuse.
+    /// **G7 rewrote this test with the registration it pins.** It used to
+    /// assert `null` for BOTH a negotiated and a never-negotiated shape, and
+    /// said so deliberately: the interface's own contract permits `null`
+    /// ("This context may be unavailable in some environments…" —
+    /// `javax/net/ssl/SSLSession.getSessionContext`) and this VM was described
+    /// as having no session cache. The second half of that was false —
+    /// `net_phase_e` allocates a `javax/net/ssl/SSLSessionContext` carrier for
+    /// `SSLContext.get{Client,Server}SessionContext()` and registers its whole
+    /// six-method surface — so the door was under-reporting against its own
+    /// siblings, not against a capability the VM lacks.
+    ///
+    /// The tempting wrong fix is still a fabricated context, and the tempting
+    /// wrong REFUSAL is still a blanket `null`; the arms below pin the boundary
+    /// between them at the measured place: negotiated AND not invalidated.
+    /// MEASURED, HotSpot 25.0.3+9-LTS, `scratchpad/g7/TlsProbe.java`.
     #[test]
     fn get_session_context_answers_null_rather_than_fabricating_one() {
         use crate::test_utils::MockNativeContext;
@@ -9656,18 +9665,168 @@ mod tests {
                 "()Ljavax/net/ssl/SSLSessionContext;",
             )
             .expect("getSessionContext registered");
-        // Both a negotiated and a never-negotiated shape: HotSpot's answer
-        // differs between them (SSLSessionContextImpl vs null) and this VM's
-        // does not, which is the under-report the registration's comment
-        // records rather than hides.
-        for tls_id in [-1, 5] {
-            let sess = ctx.alloc_object(cratonvm_types::ClassId::new(0), 4);
-            ctx.set_field(sess, 2, Value::Int(tls_id));
-            assert_eq!(
-                get_ctx(&mut ctx, &[Value::Object(Some(sess))]).unwrap(),
-                Some(Value::Object(None))
-            );
+        let invalidate = r
+            .find("javax/net/ssl/SSLSession", "invalidate", "()V")
+            .expect("invalidate registered");
+
+        // ARM 1 — width-4 socket shape, slot 2 = -1: nothing was negotiated.
+        let never = ctx.alloc_object(cratonvm_types::ClassId::new(0), 4);
+        ctx.set_field(never, 2, Value::Int(-1));
+        assert_eq!(
+            get_ctx(&mut ctx, &[Value::Object(Some(never))]).unwrap(),
+            Some(Value::Object(None)),
+            "a session that negotiated nothing is in no context — HotSpot \
+             answers null on an unconnected socket's session and on a \
+             pre-handshake engine's alike"
+        );
+
+        // ARM 2 — width-4 socket shape with a real stream id: negotiated and
+        // not invalidated, so it IS in a context. This is the row the old
+        // unconditional `null` got wrong, and the row netty's
+        // `SSLEngineTest.testSessionAfterHandshake0` asserts non-null on.
+        let live = ctx.alloc_object(cratonvm_types::ClassId::new(0), 4);
+        ctx.set_field(live, 2, Value::Int(5));
+        match get_ctx(&mut ctx, &[Value::Object(Some(live))]).unwrap() {
+            Some(Value::Object(Some(_))) => {}
+            other => panic!(
+                "a negotiated, valid session must answer a real \
+                 javax/net/ssl/SSLSessionContext carrier — the same zero-field \
+                 object net_phase_e hands out from \
+                 SSLContext.getClientSessionContext(), whose six methods it \
+                 registers. Got {other:?}"
+            ),
         }
+
+        // ARM 3 — and `invalidate()` takes it back out. MEASURED: the second
+        // thing invalidate() moves, after isValid().
+        invalidate(&mut ctx, &[Value::Object(Some(live))]).expect("invalidate must not fail");
+        assert_eq!(
+            get_ctx(&mut ctx, &[Value::Object(Some(live))]).unwrap(),
+            Some(Value::Object(None)),
+            "invalidate() evicts the session from its context; HotSpot's \
+             ctx.getSession(id) answers null afterwards where it answered \
+             SAME-OBJECT before"
+        );
+    }
+
+    /// The engine shape's three states, which the socket shape cannot express:
+    /// a fresh engine, a handshake in flight, and a completed one. This is the
+    /// gate G7 moved off `getId()` and onto this door, so it is tested here and
+    /// its absence is tested next door.
+    ///
+    /// MEASURED, HotSpot 25.0.3+9-LTS (`scratchpad/g7/TlsProbe.java`), sampling
+    /// `SSLEngine.getHandshakeSession()` from inside
+    /// `X509ExtendedTrustManager.checkServerTrusted(chain, authType, SSLEngine)`:
+    /// mid-handshake the session already answers a 32-byte id, a real cipher
+    /// suite and `isValid() == true`, and `getSessionContext()` is still `null`.
+    /// A gate on validity alone cannot produce that row.
+    #[test]
+    fn a_handshake_still_in_flight_has_no_session_context_yet() {
+        use crate::test_utils::MockNativeContext;
+        let r = session_registry();
+        let mut ctx = MockNativeContext::new();
+        let get_ctx = r
+            .find(
+                "javax/net/ssl/SSLSession",
+                "getSessionContext",
+                "()Ljavax/net/ssl/SSLSessionContext;",
+            )
+            .expect("getSessionContext registered");
+
+        // Fresh engine: `build_synthetic_ssl_session` writes slot 2 = 0 because
+        // `conn.negotiated_cipher_suite()` is None.
+        let fresh = ctx.alloc_object(cratonvm_types::ClassId::new(0), 8);
+        ctx.set_field(fresh, 2, Value::Int(0));
+        assert_eq!(
+            get_ctx(&mut ctx, &[Value::Object(Some(fresh))]).unwrap(),
+            Some(Value::Object(None))
+        );
+
+        // Mid-handshake: a suite HAS been negotiated (slot 2 = 1) but
+        // `engine_session_for` has not recorded this object as belonging to a
+        // completed epoch.
+        let mid = ctx.alloc_object(cratonvm_types::ClassId::new(0), 8);
+        ctx.set_field(mid, 2, Value::Int(1));
+        assert_eq!(
+            get_ctx(&mut ctx, &[Value::Object(Some(mid))]).unwrap(),
+            Some(Value::Object(None)),
+            "mid-handshake the session is valid and has an id, and HotSpot \
+             still answers null here"
+        );
+
+        // Completed: the key `engine_session_for` inserts is present.
+        let done = ctx.alloc_object(cratonvm_types::ClassId::new(0), 8);
+        ctx.set_field(done, 2, Value::Int(1));
+        let key = super::gc_stable_objref_key(&ctx, done);
+        super::negotiated_session_keys().lock().insert(key);
+        let answer = get_ctx(&mut ctx, &[Value::Object(Some(done))]).unwrap();
+        // Removed before asserting: `negotiated_session_keys` is a process
+        // global and `MockNativeContext` restarts its pointer sequence per
+        // instance, so a leaked key can be re-derived by another test's object.
+        super::negotiated_session_keys().lock().remove(&key);
+        match answer {
+            Some(Value::Object(Some(_))) => {}
+            other => panic!(
+                "a completed engine session must answer a real context. Got {other:?}"
+            ),
+        }
+    }
+
+    /// The other half of the same move: `getId()` must NOT consult
+    /// `negotiated_session_keys` any more.
+    ///
+    /// MEASURED: mid-handshake HotSpot answers `byte[32]`, byte-identical to
+    /// the id the completed session then reports. The old second gate answered
+    /// `byte[0]` in exactly that state, and Tomcat's `JSSESupport.getSessionId`
+    /// tests `length == 0` exactly, so `byte[0]` there presents a live
+    /// handshake as an untrackable session.
+    ///
+    /// The fresh-engine row is the one netty's `SSLEngineTest.testSSLSessionId`
+    /// asserts (`assertEquals(0, engine.getSession().getId().length)`), and it
+    /// is answered by `session_has_negotiated` alone.
+    #[test]
+    fn get_id_answers_thirty_two_bytes_while_the_handshake_is_still_running() {
+        use crate::test_utils::MockNativeContext;
+        let r = session_registry();
+        let mut ctx = MockNativeContext::new();
+        let get_id = r
+            .find("javax/net/ssl/SSLSession", "getId", "()[B")
+            .expect("getId registered");
+
+        // Fresh engine — no suite negotiated. Still byte[0].
+        let fresh = ctx.alloc_object(cratonvm_types::ClassId::new(0), 8);
+        ctx.set_field(fresh, 2, Value::Int(0));
+        let len = match get_id(&mut ctx, &[Value::Object(Some(fresh))]) {
+            Ok(Some(Value::Object(Some(arr)))) => ctx.array_length(arr),
+            other => panic!("getId must return an array, got {other:?}"),
+        };
+        assert_eq!(
+            len, 0,
+            "a freshly created engine's session has no id — netty's \
+             SSLEngineTest.testSSLSessionId asserts exactly this"
+        );
+
+        // Mid-handshake — a suite has been negotiated, the epoch key is absent.
+        let mid = ctx.alloc_object(cratonvm_types::ClassId::new(0), 8);
+        ctx.set_field(mid, 2, Value::Int(1));
+        assert!(
+            !super::negotiated_session_keys()
+                .lock()
+                .contains(&super::gc_stable_objref_key(&ctx, mid)),
+            "this arm is only meaningful while the epoch key is absent"
+        );
+        let len = match get_id(&mut ctx, &[Value::Object(Some(mid))]) {
+            Ok(Some(Value::Object(Some(arr)))) => ctx.array_length(arr),
+            other => panic!("getId must return an array, got {other:?}"),
+        };
+        assert_eq!(
+            len, 32,
+            "mid-handshake HotSpot answers a 32-byte id. If this reads 0, the \
+             `engine_shape && !session_is_negotiated(..)` gate has come back to \
+             getId — it belongs on getSessionContext, which is the door whose \
+             oracle answer actually changes across that boundary. See \
+             docs/known-issues/jdk-only/G7-1-*.md §3."
+        );
     }
 
     /// `getPeerHost`/`getPeerPort` must not read slot 3 and 4 on a shape where
@@ -13257,14 +13416,26 @@ fn engine_handshake_was_resumed(id: i32) -> bool {
 /// object itself has no spare slot to record it in (all eight are in use, and
 /// `javax/net/ssl/SSLSession` is a real interface with no fields of its own to
 /// widen into). Keyed by `gc_stable_objref_key` — the same GC-stable identity
-/// `getId` already derives its bytes from.
+/// `getId` derives its pseudo-id bytes from.
+///
+/// **G7 — this set answers "is this session object COMPLETE", which is a
+/// different question from "did this session negotiate anything", and the two
+/// doors that ask them are not the same door.** It used to be read by `getId`
+/// as a second gate on top of `session_has_negotiated`; the only state the two
+/// predicates disagree about is mid-handshake, and there the oracle gives
+/// `getId()` a full 32 bytes. `getSessionContext()` is the door that wants this
+/// distinction: HotSpot answers `null` for a session still being negotiated and
+/// an `SSLSessionContextImpl` once its handshake completes. See both
+/// registrations, and `docs/known-issues/jdk-only/G7-1-*.md` §2/§3.
 fn negotiated_session_keys() -> &'static Mutex<std::collections::HashSet<u64>> {
     static T: OnceLock<Mutex<std::collections::HashSet<u64>>> = OnceLock::new();
     T.get_or_init(|| Mutex::new(std::collections::HashSet::new()))
 }
 
-/// Has this session object been through a completed handshake? See
-/// [`negotiated_session_keys`].
+/// Has this session object been through a COMPLETED handshake — as opposed to
+/// merely having negotiated a cipher suite, which is true from ServerHello
+/// onwards? See [`negotiated_session_keys`]. Sole caller:
+/// `SSLSession.getSessionContext()`.
 fn session_is_negotiated(ctx: &mut dyn NativeContext, ses: ObjectRef) -> bool {
     let key = gc_stable_objref_key(ctx, ses);
     negotiated_session_keys().lock().contains(&key)
@@ -16900,30 +17071,70 @@ fn register_ssl_session_real(r: &mut NativeMethodRegistry) {
     // a trackable one. Measured HotSpot 25.0.3+9-LTS, E12-1 §1/§4.
     r.register(cls, "getId", "()[B", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        // Two gates, one question, because the two families of session shape
-        // record "was anything negotiated" in different places.
+        // ONE gate, and G7 removed the second one. `session_has_negotiated` is
+        // the width-aware predicate every other door in this file uses
+        // (E12/E42): on the 4-field socket shapes it reads the stream id in
+        // slot 2, and a session that negotiated nothing carries `-1`; on the
+        // 7/8-field engine shape it reads the `isValid` flag that
+        // `build_synthetic_ssl_session` writes from
+        // `conn.negotiated_cipher_suite().is_some()`.
         //
-        // `session_has_negotiated` is the width-aware predicate every other
-        // door in this file uses (E12/E42): on the 4-field socket shapes it
-        // reads the stream id in slot 2, and a session that negotiated nothing
-        // carries `-1`.
+        // **The second gate produced `byte[0]` in exactly one state, and that
+        // is the state where the oracle says 32 bytes.** It was
+        // `engine_shape && !session_is_negotiated(...)` —
+        // `negotiated_session_keys` membership, which `engine_session_for`
+        // writes only in the handshake-COMPLETED epoch. Enumerate what it could
+        // add over the first gate:
         //
-        // The 7/8-field engine shape needs the second gate as well. Its slot 2
-        // is the `isValid` flag written at mint time, while WHICH HANDSHAKE
-        // EPOCH a cached session object belongs to is known only to
-        // `engine_session_for` — see `negotiated_session_keys`. netty's
-        // `SSLEngineTest.testSSLSessionId` asserts
-        // `assertEquals(0, engine.getSession().getId().length)` on a
-        // freshly-created engine and got 32.
+        //   * fresh engine, no `conn`      slot 2 = 0 -> gate 1 already refuses
+        //   * mid-handshake, past ServerHello  slot 2 = 1, not yet in the set
+        //     -> gate 1 admits, gate 2 REFUSED
+        //   * completed                    slot 2 = 1, in the set -> both admit
         //
-        // Both predicates are hoisted into `let`s rather than chained inline:
-        // `session_has_negotiated` takes `&dyn` and `session_is_negotiated`
-        // `&mut dyn`, and this file already records (see `getPeerHost`) how
-        // easily a reborrow in a compound scrutinee collides with the `&mut`
+        // So the only row it decided was mid-handshake. MEASURED, HotSpot
+        // 25.0.3+9-LTS, `scratchpad/g7/TlsProbe.java`, sampled inside
+        // `X509ExtendedTrustManager.checkServerTrusted(chain, authType, Socket)`
+        // and again inside the `SSLEngine` overload:
+        //
+        // ```text
+        //   getId          = byte[32] 2310720247a7e8...  (and byte-identical to
+        //                    the id the COMPLETED session then reported)
+        //   getCipherSuite = "TLS_AES_256_GCM_SHA384"
+        //   getProtocol    = "TLSv1.3"
+        //   isValid        = true
+        //   getSessionContext        = null
+        //   getPeerCertificates      = THROWS SSLPeerUnverifiedException
+        // ```
+        //
+        // netty's `SSLEngineTest.testSSLSessionId` — the test the second gate
+        // was added for — asserts `assertEquals(0, engine.getSession().getId()
+        // .length)` on a FRESHLY CREATED engine, which is the first row above,
+        // and gate 1 alone already answers it: no `conn` means no negotiated
+        // cipher suite means slot 2 is `0`. Dropping gate 2 cannot regress it.
+        //
+        // The gate itself was not deleted — it moved to `getSessionContext`,
+        // which is the door the oracle shows needs exactly this discrimination
+        // (`null` mid-handshake, non-null once complete).
+        //
+        // RESIDUAL, and it is a real one: HotSpot's handshake session IS the
+        // session, so the 32 bytes read mid-handshake are the same 32 bytes the
+        // completed session reports. Here `engine_session_for` caches on
+        // `(engine, handshaked)`, so the two are DIFFERENT objects and the
+        // pseudo-id below — seeded from `gc_stable_objref_key` — differs
+        // between them. The LENGTH is now right (which is what Tomcat's
+        // `JSSESupport.getSessionId` tests, `length == 0` exactly) and the
+        // CONTINUITY is not. Merging the two cache entries is not a free fix:
+        // the pre-handshake entry has the "nothing negotiated" sentinels frozen
+        // into slots 0/1 at mint time, so reusing that object after the
+        // handshake would make a completed session report
+        // `SSL_NULL_WITH_NULL_NULL`. Recorded in G7-1 §4 rather than half-done.
+        //
+        // Hoisted into a `let` rather than chained inline: `session_has_negotiated`
+        // takes `&dyn`, and this file already records (see `getPeerHost`) how
+        // easily a reborrow in a compound scrutinee collides with an `&mut`
         // beside it.
         let negotiated = session_has_negotiated(ctx, this);
-        let engine_shape = ctx.object_num_fields(this) >= 7;
-        if !negotiated || (engine_shape && !session_is_negotiated(ctx, this)) {
+        if !negotiated {
             return Ok(Some(Value::Object(Some(
                 ctx.new_array(cratonvm_types::ArrayElementType::Byte, 0),
             ))));
@@ -17176,33 +17387,103 @@ fn register_ssl_session_real(r: &mut NativeMethodRegistry) {
     // doors that had none (the others being `invalidate`, `getPeerHost` and
     // `getPeerPort`, all above).
     //
-    // `null` IS the answer, not a stand-in for one. The interface says so in
-    // the method's own contract:
+    // G7 — **this used to answer `null` unconditionally, and the premise the
+    // constant rested on was false.** The comment it replaced said "This VM has
+    // no `SSLSessionContext` — no session cache, no id-keyed lookup, no
+    // timeout". SOURCE-VERIFIED, and it is not so: `net_phase_e
+    // ::register_phase_e_networking` allocates a zero-field
+    // `javax/net/ssl/SSLSessionContext` carrier for
+    // `SSLContext.getClientSessionContext()` / `getServerSessionContext()` and
+    // registers the WHOLE interface on it — `getIds()Ljava/util/Enumeration;`,
+    // `getSession([B)Ljavax/net/ssl/SSLSession;`, `get/setSessionCacheSize(I)`,
+    // `get/setSessionTimeout(I)`. So the object exists, it has a live method
+    // surface, and applications already receive it through the other two doors.
+    // Answering `null` here was not `--jdk-only` restraint; it was this door
+    // disagreeing with its two siblings about whether the VM has a context.
     //
-    //   "This context may be unavailable in some environments, in which case
-    //    this method returns null."
-    //   -- C:\craton\jdk25src/java.base/javax/net/ssl/SSLSession.java:77-84
+    // MEASURED, HotSpot 25.0.3+9-LTS, `scratchpad/g7/TlsProbe.java`
+    // (loopback `SSLServerSocket` + a paired in-memory `SSLEngine`; see
+    // `docs/known-issues/jdk-only/G7-1-*.md` §1 for the whole surface):
     //
-    // This VM has no `SSLSessionContext` — no session cache, no id-keyed
-    // lookup, no timeout — so "unavailable" is a true statement about it, and
-    // saying so is the `--jdk-only` posture rather than a fabricated context
-    // object that would answer every subsequent question wrongly. Contrast
-    // `getCipherSuite`, where the honest value is a JSSE sentinel because the
-    // method may not return null at all.
+    // ```text
+    //   never-connected SSLSocket session        getSessionContext() = null
+    //   fresh SSLEngine session                  getSessionContext() = null
+    //   MID-HANDSHAKE (inside checkServerTrusted) getSessionContext() = null
+    //   completed handshake                      = SSLSessionContextImpl
+    //   resumed handshake                        = SSLSessionContextImpl
+    //   HttpsURLConnection.getSSLSession().get() = SSLSessionContextImpl
+    //   after invalidate()                       = null
+    // ```
     //
-    // MEASURED (`scratchpad/f18/F18SessionContract.java`, three runs): HotSpot
-    // answers `null` on the unconnected socket's session and on the
-    // pre-handshake engine's, `SSLSessionContextImpl` after a completed
-    // handshake, and `null` AGAIN once `invalidate()` has been called — the
-    // second thing `invalidate()` moves, which no record in this directory had
-    // noted. So the constant is right in three of HotSpot's four states and
-    // under-reports the fourth, and it is right in the invalidated state for
-    // free.
+    // Four states, and the rule behind them is exactly "is this session IN a
+    // context" — a session enters one when its handshake COMPLETES and leaves
+    // it when `invalidate()` evicts it (`ctx.getSession(id)` answered
+    // SAME-OBJECT before the invalidate and `null` after, same probe). The
+    // mid-handshake `null` is the row that matters most here: it is the one
+    // state where the session already has its 32-byte id, its cipher suite and
+    // `isValid() == true` and still has no context, so a gate on validity alone
+    // would get it wrong.
+    //
+    // The two gates below are that rule, and the second one is the gate this
+    // merge moved OFF `getId()`:
+    //
+    //   * `session_is_valid` = `session_has_negotiated && !invalidated`. It
+    //     covers the never-negotiated states (slot-2 sentinel `-1`, or the
+    //     engine shape's `isValid` flag `0`) and the invalidated one.
+    //   * `session_is_negotiated` — the `negotiated_session_keys` membership
+    //     `engine_session_for` writes ONLY in the handshake-completed epoch —
+    //     covers mid-handshake. It is consulted for the 7/8-field engine shape
+    //     alone, because that is the only shape whose object can be handed out
+    //     while a handshake is still running (`SSLEngineImpl
+    //     .getHandshakeSession` above). The socket door answers `null` for its
+    //     whole handshake window, so no width-4 session is observable there.
+    //
+    // Both predicates already existed. `getId()` used to stack them and was
+    // wrong for it — see its registration — and moving the second one here is
+    // what keeps `negotiated_session_keys` load-bearing instead of leaving it a
+    // write-only set.
+    //
+    // WHY A CARRIER AND NOT A FABRICATION. The interface's own escape hatch
+    // ("This context may be unavailable in some environments, in which case
+    // this method returns null" — `javax/net/ssl/SSLSession.getSessionContext`)
+    // is still the right answer for the three states above that answer `null`.
+    // What it does not license is claiming unavailability for a completed
+    // handshake while `SSLContext.getClientSessionContext()` hands the same
+    // application a context object one call away. The carrier this mints is
+    // that same object, not a new shape: zero fields, `javax/net/ssl/
+    // SSLSessionContext`, so every method on it lands on net_phase_e's
+    // registrations rather than on an `AbstractMethodError`.
+    //
+    // TWO RESIDUALS, stated rather than hidden — both are net_phase_e's to
+    // close and are NOMINATED in the record:
+    //   1. `getIds()` answers an empty enumeration and `getSession(id)` answers
+    //      `null`, where HotSpot's context lists this session and returns the
+    //      SAME object for its id. A context that does not contain the session
+    //      that pointed at it is a real inconsistency; it is bounded (rustls
+    //      owns the cache and exposes no enumeration) and it is strictly less
+    //      wrong than `null`, which fails a plain non-null check.
+    //   2. `getSessionCacheSize()`/`getSessionTimeout()` read net_phase_e's
+    //      `ssc_side_table` under an ORPHAN key, so they answer its default
+    //      `0`/`0` where HotSpot measured `20480`/`86400`. `ssc_bind` is
+    //      private to that file, so this carrier cannot be bound from here.
     r.register(
         cls,
         "getSessionContext",
         "()Ljavax/net/ssl/SSLSessionContext;",
-        |_ctx, _args| Ok(Some(Value::Object(None))),
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            // Hoisted, not chained: `session_is_valid` takes `&dyn` and
+            // `session_is_negotiated` `&mut dyn`, and this file already records
+            // (see `getPeerHost`, and `getId` below) how easily a reborrow in a
+            // compound scrutinee collides with the `&mut` beside it.
+            let valid = session_is_valid(ctx, this);
+            let engine_shape = ctx.object_num_fields(this) >= 7;
+            if !valid || (engine_shape && !session_is_negotiated(ctx, this)) {
+                return Ok(Some(Value::Object(None)));
+            }
+            let obj = try_alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLSessionContext", 0)?;
+            Ok(Some(Value::Object(Some(obj))))
+        },
     );
 
     // creation / last-accessed time: the 8-field engine session stores a

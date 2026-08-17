@@ -4759,6 +4759,19 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let path_obj = obj_arg(args, 0)?;
             let p = p57_read_path(ctx, path_obj);
+            // `Files.list` is `newDirectoryStream(dir)` wrapped in a Stream, and
+            // it inherits that method's refusals: a missing path is a
+            // `NoSuchFileException` and a regular file a `NotDirectoryException`,
+            // both raised HERE, at construction, before any element is produced
+            // (measured on HotSpot 25.0.3+9 — `Files.list(missing)` throws from
+            // the `Files.list(...)` call itself, not from the terminal op).
+            // `vfs_or_host_list` answers BOTH conditions with an empty Vec, so
+            // this used to hand back an empty Stream and the caller's
+            // `.forEach(...)` did nothing at all, successfully.
+            // G4-1-the-io-and-nio-fabricated-success-sweep-measured-20260816.md
+            if let Some(refused) = p57_dir_listing_refusal(ctx, &p, true)? {
+                return Err(refused);
+            }
             let entries = vfs_or_host_list(&p);
             let mut vals = Vec::with_capacity(entries.len());
             for e in &entries {
@@ -4776,6 +4789,20 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         follow_links: bool,
     ) -> MethodCallResult {
         let p = p57_read_path(ctx, path_obj);
+        // `Files.walk(missing)` throws `NoSuchFileException` at CONSTRUCTION on
+        // HotSpot (measured 2026-08-16: both `Files.walk(missing)` and
+        // `Files.walk(missing).count()` throw it) because `FileTreeWalker`
+        // reads the start element's attributes before yielding anything. This
+        // walker instead pushed the start path unconditionally
+        // (`out.push(p.to_string())`) and then found no children, so a walk over
+        // a path that is not there returned a one-element Stream containing the
+        // path that is not there. A regular file IS a legal start element and
+        // yields exactly itself (measured: `Files.walk(<file>).count() == 1`),
+        // so the directory requirement is off here.
+        // G4-1-the-io-and-nio-fabricated-success-sweep-measured-20260816.md
+        if let Some(refused) = p57_dir_listing_refusal(ctx, &p, false)? {
+            return Err(refused);
+        }
         let mut paths = Vec::new();
         vfs_or_host_walk(&p, 0, max_depth, follow_links, &mut paths);
         let mut vals = Vec::with_capacity(paths.len());
@@ -4805,6 +4832,12 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let follow = p57_visit_options_follow_links(ctx, args.get(2));
             let path_obj = obj_arg(args, 0)?;
+            // A negative depth is the one value the JDK refuses, and the arm
+            // below promoted it to `usize::MAX` — an UNBOUNDED walk where the
+            // caller asked for a bounded one. See `p57_max_depth_refusal`.
+            if let Some(refused) = p57_max_depth_refusal(args.get(1)) {
+                return Err(refused);
+            }
             let max_depth = match args.get(1) {
                 Some(Value::Int(n)) if *n >= 0 => *n as usize,
                 _ => usize::MAX,
@@ -4821,6 +4854,16 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             let follow = p57_visit_options_follow_links(ctx, args.get(3));
             let path_obj = obj_arg(args, 0)?;
             let p = p57_read_path(ctx, path_obj);
+            // Same two refusals as `walk` — `Files.find` is `walk` with a
+            // predicate and shares both contracts (measured 2026-08-16:
+            // `Files.find(missing,1,…)` -> NoSuchFileException,
+            // `Files.find(dir,-1,…)` -> IllegalArgumentException).
+            if let Some(refused) = p57_max_depth_refusal(args.get(1)) {
+                return Err(refused);
+            }
+            if let Some(refused) = p57_dir_listing_refusal(ctx, &p, false)? {
+                return Err(refused);
+            }
             let max_depth = match args.get(1) {
                 Some(Value::Int(n)) if *n >= 0 => *n as usize,
                 _ => usize::MAX,
@@ -5736,10 +5779,33 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let path_obj = obj_arg(args, 1)?;
             let p = p57_read_path(ctx, path_obj);
-            // 2 fields: slot 0 = materialised Object[] of Paths, slot 1 = the
-            // closed flag `close()` sets (see the `close`/`iterator`
-            // registrations below).
-            let stream = try_alloc_concurrent_synthetic(ctx, "java/nio/file/DirectoryStream", 2)?;
+            // TWO fabricated successes used to live in this body, and both
+            // reported the operation as having been performed when it had not:
+            //
+            //   1. the host arm's `Err(_) => vec![]` answered a MISSING
+            //      directory, a REGULAR FILE and an unreadable directory with
+            //      an empty listing, so every caller was told "this directory
+            //      is empty" and proceeded;
+            //   2. the `DirectoryStream$Filter` in slot 2 was never read, so a
+            //      filtered stream — `Files.newDirectoryStream(dir, "*.txt")`
+            //      builds one, and so does every `Files.newDirectoryStream(dir,
+            //      filter)` caller — handed back EVERY entry in the directory.
+            //      A `for (Path q : ds) Files.delete(q);` over a glob deleted
+            //      the files the glob excluded.
+            //
+            // Refuse before anything is allocated, exactly where the JDK does
+            // (measured on Adoptium 25.0.3+9, 2026-08-16:
+            // `provider.newDirectoryStream(<missing>, …)` -> NoSuchFileException,
+            // `provider.newDirectoryStream(<regular file>, …)` ->
+            // NotDirectoryException).
+            // G4-1-the-io-and-nio-fabricated-success-sweep-measured-20260816.md
+            if let Some(refused) = p57_dir_listing_refusal(ctx, &p, true)? {
+                return Err(refused);
+            }
+            // 3 fields: slot 0 = materialised Object[] of Paths, slot 1 = the
+            // closed flag `close()` sets, slot 2 = the "an Iterator has already
+            // been handed out" latch (see the `iterator` registration below).
+            let stream = try_alloc_concurrent_synthetic(ctx, "java/nio/file/DirectoryStream", 3)?;
             // Pin across the array/Path allocs below — a moving young GC there
             // would relocate the fresh stream/array (native stale-local family).
             let stream_pin = ctx.pin_native_root(stream);
@@ -5760,7 +5826,14 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
                         .filter_map(|e| e.ok())
                         .map(|e| e.path().to_string_lossy().replace('\\', "/"))
                         .collect(),
-                    Err(_) => vec![],
+                    // `p57_dir_listing_refusal` above has already established
+                    // that `p` exists and is a directory, so a failure here is a
+                    // genuine I/O condition (permissions, a racing unlink) and
+                    // must not be laundered into "the directory is empty".
+                    Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                        return Err(p57_access_denied(ctx, &p)?)
+                    }
+                    Err(e) => return Err(p57_io_error(&e)),
                 }
             };
             use cratonvm_types::ArrayElementType;
@@ -5771,9 +5844,89 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
                 let arr = ctx.read_native_pin(arr_pin, arr);
                 ctx.set_array_element(arr, i, Value::Object(Some(ep)));
             }
+            // Apply the filter. Nothing is held across `accept` except the two
+            // pinned arrays and the pinned filter — every `ObjectRef` is re-read
+            // from its pin after the call, because `accept` runs arbitrary
+            // bytecode and can move all three. `Files.find`'s `BiPredicate`
+            // loop, a few hundred lines above, is the worked example.
+            //
+            // Deviation stated rather than hidden: the JDK applies the filter
+            // LAZILY, in `hasNext()`, and wraps a filter `IOException` in a
+            // `DirectoryIteratorException` (measured). This listing is eager —
+            // it always has been — so a throwing filter surfaces here, from
+            // `newDirectoryStream`, with its own exception rather than the
+            // wrapper. Both are loud; neither is the silent "filter ignored"
+            // this replaces.
+            let filter = match args.get(2).copied() {
+                Some(Value::Object(Some(f))) => Some(f),
+                _ => None,
+            };
+            let arr = if let Some(filter) = filter {
+                let filter_pin = ctx.pin_native_root(filter);
+                let n = {
+                    let arr = ctx.read_native_pin(arr_pin, arr);
+                    ctx.array_length(arr)
+                };
+                let mut accepted: Vec<usize> = Vec::with_capacity(n);
+                for i in 0..n {
+                    let arr = ctx.read_native_pin(arr_pin, arr);
+                    let elem = match ctx.get_array_element(arr, i) {
+                        Value::Object(Some(e)) => e,
+                        _ => continue,
+                    };
+                    let f = ctx.read_native_pin(filter_pin, filter);
+                    let verdict = ctx.invoke_virtual(
+                        f,
+                        "accept",
+                        "(Ljava/lang/Object;)Z",
+                        &[Value::Object(Some(elem))],
+                    )?;
+                    match verdict {
+                        Some(Value::Int(v)) => {
+                            if v != 0 {
+                                accepted.push(i);
+                            }
+                        }
+                        // Answering `false` here — which is what the sibling
+                        // `Files.find` matcher does — would DROP the entry, i.e.
+                        // shorten the listing on a dispatch fault. That is the
+                        // same species this whole body is being repaired for.
+                        _ => {
+                            ctx.unpin_native_roots(filter_pin);
+                            ctx.unpin_native_roots(arr_pin);
+                            ctx.unpin_native_roots(stream_pin);
+                            return Err(RuntimeError::IOException {
+                                message:
+                                    "DirectoryStream.Filter.accept did not return a boolean"
+                                        .to_string(),
+                            }
+                            .into());
+                        }
+                    }
+                }
+                let filtered = ctx.new_array(ArrayElementType::Reference, accepted.len());
+                let filtered_pin = ctx.pin_native_root(filtered);
+                for (dst, src) in accepted.iter().enumerate() {
+                    let arr = ctx.read_native_pin(arr_pin, arr);
+                    let elem = ctx.get_array_element(arr, *src);
+                    let filtered = ctx.read_native_pin(filtered_pin, filtered);
+                    ctx.set_array_element(filtered, dst, elem);
+                }
+                // Read back UNDER the pin and hand the ref straight to the
+                // `set_field` below without unpinning first — nothing between
+                // here and the store allocates, but leaving the pin in place
+                // until `stream_pin` is released means that stays true even if
+                // something is inserted later.
+                ctx.read_native_pin(filtered_pin, filtered)
+            } else {
+                ctx.read_native_pin(arr_pin, arr)
+            };
             let stream = ctx.read_native_pin(stream_pin, stream);
-            let arr = ctx.read_native_pin(arr_pin, arr);
             ctx.set_field(stream, 0, Value::Object(Some(arr)));
+            ctx.set_field(stream, 1, Value::Int(0));
+            ctx.set_field(stream, 2, Value::Int(0));
+            // `stream_pin` is the OUTERMOST watermark, so releasing it also
+            // releases `arr_pin`, `filter_pin` and `filtered_pin` above it.
             ctx.unpin_native_roots(stream_pin);
             Ok(Some(Value::Object(Some(stream))))
         },
@@ -5792,12 +5945,35 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         // which IS an `IllegalStateException` (that is its declared supertype),
         // so this is the same class of failure real `UnixDirectoryStream`
         // raises — not a substitute for it.
+        //
+        // The MESSAGE is transcribed, not invented: HotSpot 25.0.3+9 says
+        // `Directory stream is closed` (measured 2026-08-16). This body said
+        // `directory stream is closed`, lower-case, which is the sort of
+        // one-character divergence that fails a differential with every
+        // assertion passing.
         if matches!(ctx.get_field(this, 1), Value::Int(v) if v != 0) {
             return Err(RuntimeError::IllegalStateException {
-                message: "directory stream is closed".to_string(),
+                message: "Directory stream is closed".to_string(),
             }
             .into());
         }
+        // `DirectoryStream` is single-use: "@throws IllegalStateException if
+        // this directory stream is closed or the iterator has already been
+        // returned". Measured on HotSpot: a SECOND `iterator()` raises
+        // `IllegalStateException: Iterator already obtained`. This body handed
+        // out a fresh iterator over the same listing every time, so a caller
+        // that iterated twice by mistake silently processed every entry twice
+        // and never learned it had done so. The closed test above runs FIRST,
+        // matching the JDK (measured: after `close()` the answer is the closed
+        // message even when an iterator had already been obtained).
+        // G4-1-the-io-and-nio-fabricated-success-sweep-measured-20260816.md
+        if matches!(ctx.get_field(this, 2), Value::Int(v) if v != 0) {
+            return Err(RuntimeError::IllegalStateException {
+                message: "Iterator already obtained".to_string(),
+            }
+            .into());
+        }
+        ctx.set_field(this, 2, Value::Int(1));
         let arr = match ctx.get_field(this, 0) {
             Value::Object(Some(a)) => a,
             _ => ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0),
@@ -9083,6 +9259,136 @@ pub(crate) fn p57_access_denied(ctx: &mut dyn NativeContext, path: &str) -> Resu
     ctx.set_field_by_name(exc, "file", Value::Object(Some(file_str)));
     ctx.unpin_native_roots(exc_pin);
     Ok(MethodCallFailed::ExceptionThrown(exc))
+}
+
+/// Build a *typed* `java.nio.file.NotDirectoryException` for `path` (mirrors
+/// [`p57_no_such_file`]).
+///
+/// `NotDirectoryException extends FileSystemException extends IOException`, so
+/// the thrown object matches `catch (NotDirectoryException)` and every
+/// supertype. Measured on Eclipse Adoptium 25.0.3+9 (2026-08-16):
+///
+/// ```text
+/// Files.list(<regular file>)                       -> NotDirectoryException: <path>
+/// provider.newDirectoryStream(<regular file>, all) -> NotDirectoryException: <path>
+/// Files.newDirectoryStream(<regular file>)         -> NotDirectoryException: <path>
+/// ```
+///
+/// The message is the path alone, which is what `FileSystemException.getMessage`
+/// builds from the `file` field, so `detailMessage` is deliberately left null —
+/// same convention as [`p57_no_such_file`], for the same reason (a populated
+/// `detailMessage` renders as `<path>: <path>`).
+pub(crate) fn p57_not_directory(
+    ctx: &mut dyn NativeContext,
+    path: &str,
+) -> Result<MethodCallFailed, MethodCallFailed> {
+    let exc = try_alloc_concurrent_synthetic(ctx, "java/nio/file/NotDirectoryException", 4)?;
+    // Pin across the create_string below — a moving young GC there would
+    // relocate the fresh exception (native stale-local family).
+    let exc_pin = ctx.pin_native_root(exc);
+    let file_str = p57_exception_path_string(ctx, path);
+    let exc = ctx.read_native_pin(exc_pin, exc);
+    ctx.set_field_by_name(exc, "file", Value::Object(Some(file_str)));
+    ctx.unpin_native_roots(exc_pin);
+    Ok(MethodCallFailed::ExceptionThrown(exc))
+}
+
+/// The refusal every directory-listing entry point owes a path it cannot list.
+///
+/// **This is the fix for the largest fabricated-success row on the shipping
+/// `java.nio.file` surface.** `newDirectoryStream`, `Files.list`, `Files.walk`
+/// and `Files.find` all reached the host through
+/// [`vfs_or_host_list`], whose host arm ends
+///
+/// ```text
+/// match std::fs::read_dir(p) { Ok(rd) => …, Err(_) => vec![] }
+/// ```
+///
+/// — so a directory that does not exist, a path that is a *regular file*, and a
+/// directory the process may not read were all answered with an **empty
+/// listing**. Nothing threw; the caller was told the directory is empty. That is
+/// the worst shape in this species, because "empty" is a legal answer that every
+/// scan/backup/clean loop accepts and acts on: a `Files.list(dir)` over a
+/// mistyped path deletes nothing, copies nothing and reports success.
+///
+/// Measured on Eclipse Adoptium 25.0.3+9 (2026-08-16), all three entry points
+/// agree:
+///
+/// ```text
+/// Files.list(<missing>)      -> NoSuchFileException:   <path>
+/// Files.list(<regular file>) -> NotDirectoryException: <path>
+/// Files.walk(<missing>)      -> NoSuchFileException:   <path>   (at construction)
+/// Files.find(<missing>, …)   -> NoSuchFileException:   <path>
+/// provider.newDirectoryStream(<missing>, …)      -> NoSuchFileException
+/// provider.newDirectoryStream(<regular file>, …) -> NotDirectoryException
+/// ```
+///
+/// The classification is taken from `symlink_metadata`/`metadata` rather than
+/// from `read_dir`'s `ErrorKind`, deliberately: `ErrorKind::NotADirectory` is a
+/// recent addition and Windows reports the same condition as a raw OS error
+/// code, so keying on it would make this check platform- and toolchain-
+/// dependent. An explicit stat answers the same question on every host.
+///
+/// Returns `Some(exception)` when the listing must be refused and `None` when it
+/// may proceed. `require_directory` is false for the callers that are allowed to
+/// name a non-directory — `Files.walk`/`Files.find` accept a regular file and
+/// yield exactly that one element (measured: `Files.walk(<file>).count() == 1`).
+pub(crate) fn p57_dir_listing_refusal(
+    ctx: &mut dyn NativeContext,
+    path: &str,
+    require_directory: bool,
+) -> Result<Option<MethodCallFailed>, MethodCallFailed> {
+    // jar:/jrt: namespaces are decoded, not stat-ed. `vfs_classify` is the one
+    // authority there and it already distinguishes the three cases.
+    if let Some(kind) = vfs_classify(path) {
+        return Ok(match kind {
+            JarFsKind::Absent => Some(p57_no_such_file(ctx, path)?),
+            JarFsKind::File if require_directory => Some(p57_not_directory(ctx, path)?),
+            _ => None,
+        });
+    }
+    // `symlink_metadata` first so a DANGLING symlink is reported as the
+    // NoSuchFileException the JDK raises (an `lstat` succeeds on it, a `stat`
+    // does not) rather than being mistaken for "not a directory".
+    if std::fs::symlink_metadata(path).is_err() {
+        return Ok(Some(p57_no_such_file(ctx, path)?));
+    }
+    match std::fs::metadata(path) {
+        // A link whose target is gone: the JDK's open fails, and it fails with
+        // the missing-file answer.
+        Err(_) => Ok(Some(p57_no_such_file(ctx, path)?)),
+        Ok(m) if require_directory && !m.is_dir() => Ok(Some(p57_not_directory(ctx, path)?)),
+        Ok(_) => Ok(None),
+    }
+}
+
+/// The refusal `Files.walk` / `Files.find` owe a negative `maxDepth`.
+///
+/// Measured on Eclipse Adoptium 25.0.3+9 (2026-08-16):
+///
+/// ```text
+/// Files.walk(dir, -1)          -> IllegalArgumentException: 'maxDepth' is negative
+/// Files.find(dir, -1, (p,a)->…) -> IllegalArgumentException: 'maxDepth' is negative
+/// ```
+///
+/// The quoting is HotSpot's own (`FileTreeIterator` builds the message as
+/// `"'maxDepth' is negative"`), so it is transcribed rather than derived.
+///
+/// This is not a cosmetic row. Both call sites read the depth as
+/// `Some(Value::Int(n)) if *n >= 0 => *n as usize, _ => usize::MAX`, so a
+/// **negative** depth — the one input the JDK refuses outright — was silently
+/// promoted to an **unbounded** walk. The caller asked for a bounded traversal,
+/// was given the opposite, and got no diagnostic.
+pub(crate) fn p57_max_depth_refusal(depth: Option<&Value>) -> Option<MethodCallFailed> {
+    match depth {
+        Some(Value::Int(n)) if *n < 0 => Some(
+            RuntimeError::IllegalArgumentException {
+                message: "'maxDepth' is negative".to_string(),
+            }
+            .into(),
+        ),
+        _ => None,
+    }
 }
 
 /// Build a *typed* `java.nio.channels.ClosedChannelException`.

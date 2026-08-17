@@ -100,9 +100,15 @@ pub(crate) fn p58_pushback_in_init_size(
     args: &[Value],
 ) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
+    // `*v as usize` below turns a NEGATIVE size into `usize::MAX` and asks
+    // `new_array` for a 16-exbibyte buffer. The JDK refuses it outright — see
+    // `p58_pushback_size_refusal`.
+    if let Some(refused) = p58_pushback_size_refusal(args.get(2)) {
+        return Err(refused);
+    }
     ctx.set_field(this, 0, args.get(1).copied().unwrap_or(Value::Object(None)));
     let size = match args.get(2) {
-        Some(Value::Int(v)) => *v as usize,
+        Some(Value::Int(v)) if *v > 0 => *v as usize,
         _ => 1,
     };
     // Pin across the buffer alloc below — a moving young GC there would
@@ -153,13 +159,29 @@ pub(crate) fn p58_pushback_in_unread(
         Value::Int(v) => v,
         _ => 0,
     };
-    if pos > 0 {
-        let new_pos = pos - 1;
-        if let Value::Object(Some(buf)) = ctx.get_field(this, 1) {
-            ctx.set_array_element(buf, new_pos as usize, byte_val);
+    if pos <= 0 {
+        // FABRICATED SUCCESS. `pos == 0` means the pushback buffer is FULL, and
+        // this body's `if pos > 0 { … }` had no `else`: the byte the caller
+        // pushed back was DISCARDED and `unread` returned normally. A parser
+        // that pushes back a lookahead byte it has just decided it cannot
+        // consume then reads the NEXT byte instead, silently losing one byte of
+        // input with no diagnostic anywhere.
+        //
+        // HotSpot raises `java.io.IOException` (measured on Adoptium 25.0.3+9,
+        // 2026-08-16). The message is `PushbackInputStream`'s own and is NOT the
+        // one `PushbackReader` uses ("Pushback buffer overflow") — transcribed
+        // per class, not unified.
+        // G4-1-the-io-and-nio-fabricated-success-sweep-measured-20260816.md
+        return Err(RuntimeError::IOException {
+            message: "Push back buffer is full".into(),
         }
-        ctx.set_field(this, 2, Value::Int(new_pos));
+        .into());
     }
+    let new_pos = pos - 1;
+    if let Value::Object(Some(buf)) = ctx.get_field(this, 1) {
+        ctx.set_array_element(buf, new_pos as usize, byte_val);
+    }
+    ctx.set_field(this, 2, Value::Int(new_pos));
     Ok(None)
 }
 
@@ -210,9 +232,13 @@ pub(crate) fn p58_pushback_reader_init_size(
     args: &[Value],
 ) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
+    // As in `p58_pushback_in_init_size`: a negative size became `usize::MAX`.
+    if let Some(refused) = p58_pushback_size_refusal(args.get(2)) {
+        return Err(refused);
+    }
     ctx.set_field(this, 0, args.get(1).copied().unwrap_or(Value::Object(None)));
     let size = match args.get(2) {
-        Some(Value::Int(v)) => *v as usize,
+        Some(Value::Int(v)) if *v > 0 => *v as usize,
         _ => 1,
     };
     // Pin across the buffer alloc below — a moving young GC there would
@@ -261,19 +287,72 @@ pub(crate) fn p58_pushback_reader_unread(
         Value::Int(v) => v,
         _ => 0,
     };
-    if pos > 0 {
-        let new_pos = pos - 1;
-        if let Value::Object(Some(buf)) = ctx.get_field(this, 1) {
-            ctx.set_array_element(buf, new_pos as usize, ch_val);
+    if pos <= 0 {
+        // Same silent discard as `p58_pushback_in_unread` above, on the char
+        // side, with `PushbackReader`'s own message (measured, and different
+        // from `PushbackInputStream`'s).
+        // G4-1-the-io-and-nio-fabricated-success-sweep-measured-20260816.md
+        return Err(RuntimeError::IOException {
+            message: "Pushback buffer overflow".into(),
         }
-        ctx.set_field(this, 2, Value::Int(new_pos));
+        .into());
     }
+    let new_pos = pos - 1;
+    if let Value::Object(Some(buf)) = ctx.get_field(this, 1) {
+        ctx.set_array_element(buf, new_pos as usize, ch_val);
+    }
+    ctx.set_field(this, 2, Value::Int(new_pos));
     Ok(None)
 }
 
 // =============================================================================
 // PushbackReader = 3-field (reader=0, buf=1 char[], pos=2)
 // =============================================================================
+
+/// What `PushbackReader.ensureOpen()` throws once `close()` has nulled `buf`.
+///
+/// **Transcribed, not derived.** Measured on Eclipse Adoptium 25.0.3+9-LTS
+/// (2026-08-16): `read()`, `ready()` and `unread()` on a closed
+/// `PushbackReader` all raise `java.io.IOException: Stream closed` — a
+/// lower-case `c`, where `FileInputStream`/`FileOutputStream` in the same run
+/// say `"Stream Closed"`. The two strings must not be shared.
+fn p66_pushback_reader_closed() -> cratonvm_types::error::MethodCallFailed {
+    RuntimeError::IOException {
+        message: "Stream closed".into(),
+    }
+    .into()
+}
+
+/// The refusal both pushback constructors owe a non-positive buffer size.
+///
+/// Measured on Eclipse Adoptium 25.0.3+9-LTS (2026-08-16) — all four spellings
+/// agree, and the string carries no size:
+///
+/// ```text
+/// new PushbackReader(r, 0)       -> IllegalArgumentException: size <= 0
+/// new PushbackReader(r, -1)      -> IllegalArgumentException: size <= 0
+/// new PushbackInputStream(i, 0)  -> IllegalArgumentException: size <= 0
+/// new PushbackInputStream(i, -1) -> IllegalArgumentException: size <= 0
+/// ```
+///
+/// The two constructors this replaces disagreed with each other and both were
+/// wrong: `register_p66_pushback_reader` clamped with `(*v).max(1)`, silently
+/// giving a caller who asked for zero pushback a one-character buffer, and
+/// `p58_pushback_reader_init_size` did `*v as usize`, which turns `-1` into
+/// `usize::MAX` and asks the allocator for a 16-exbibyte array.
+fn p58_pushback_size_refusal(
+    size: Option<&Value>,
+) -> Option<cratonvm_types::error::MethodCallFailed> {
+    match size {
+        Some(Value::Int(v)) if *v <= 0 => Some(
+            RuntimeError::IllegalArgumentException {
+                message: "size <= 0".into(),
+            }
+            .into(),
+        ),
+        _ => None,
+    }
+}
 
 pub(crate) fn register_p66_pushback_reader(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
@@ -289,9 +368,14 @@ pub(crate) fn register_p66_pushback_reader(r: &mut NativeMethodRegistry) {
     });
     r.register(pr, "<init>", "(Ljava/io/Reader;I)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
+        // Refuse before anything is stored — the JDK's check is the first
+        // statement of the constructor. See `p58_pushback_size_refusal`.
+        if let Some(refused) = p58_pushback_size_refusal(args.get(2)) {
+            return Err(refused);
+        }
         ctx.set_field(this, 0, args.get(1).copied().unwrap_or(Value::Object(None)));
         let size = match args.get(2) {
-            Some(Value::Int(v)) => (*v).max(1) as usize,
+            Some(Value::Int(v)) if *v > 0 => *v as usize,
             _ => 1,
         };
         let buf = ctx.new_array(cratonvm_types::ArrayElementType::Char, size);
@@ -306,8 +390,13 @@ pub(crate) fn register_p66_pushback_reader(r: &mut NativeMethodRegistry) {
             _ => 0,
         };
         let buf = match ctx.get_field(this, 1) {
+            // `close()` below nulls slot 1, and `<init>` always fills it, so a
+            // null buffer here IS the closed state. HotSpot's `ensureOpen()`
+            // raises `IOException("Stream closed")` (measured on Adoptium
+            // 25.0.3+9, 2026-08-16 — lower-case `c`, unlike
+            // `FileInputStream`'s "Stream Closed").
             Value::Object(Some(b)) => b,
-            _ => return Ok(Some(Value::Int(-1))),
+            _ => return Err(p66_pushback_reader_closed()),
         };
         let buf_len = ctx.array_length(buf);
         if pos < buf_len {
@@ -316,7 +405,26 @@ pub(crate) fn register_p66_pushback_reader(r: &mut NativeMethodRegistry) {
             ctx.set_field(this, 2, Value::Int((pos + 1) as i32));
             return Ok(Some(ch));
         }
-        // Otherwise return -1 (simplified — real impl would delegate to inner reader)
+        // FABRICATED EOF. This arm used to be `Ok(Some(Value::Int(-1)))` with
+        // the comment "simplified — real impl would delegate to inner reader",
+        // and it is the whole class: a `PushbackReader` starts with an EMPTY
+        // pushback buffer, so the very first `read()` took this arm and
+        // answered `-1`. Every `while ((c = r.read()) != -1)` over a
+        // `PushbackReader` therefore terminated immediately and read NOTHING,
+        // successfully. Measured on HotSpot: a fresh
+        // `PushbackReader(new StringReader("abc"))` answers 97, 98, 99, -1.
+        //
+        // This registrar runs AFTER `register_p58_pushback` inside
+        // `register_synthetic_overrides` (lib.rs: phase58 then phase66) and
+        // `register()` is last-write-wins, so it is THIS body that dispatches
+        // and the correct sibling twenty lines away in the same file
+        // (`p58_pushback_reader_read`, which does delegate) never ran. The
+        // "scripted edit landed on the wrong twin" shape, arrived at by hand.
+        // G4-1-the-io-and-nio-fabricated-success-sweep-measured-20260816.md
+        if let Value::Object(Some(reader)) = ctx.get_field(this, 0) {
+            let ch = ctx.invoke_virtual(reader, "read", "()I", &[])?;
+            return Ok(ch.or(Some(Value::Int(-1))));
+        }
         Ok(Some(Value::Int(-1)))
     });
     r.register(pr, "unread", "(I)V", |ctx, args| {
@@ -326,16 +434,28 @@ pub(crate) fn register_p66_pushback_reader(r: &mut NativeMethodRegistry) {
             Value::Int(v) => v as usize,
             _ => 0,
         };
+        let buf = match ctx.get_field(this, 1) {
+            Value::Object(Some(b)) => b,
+            // Closed — checked BEFORE the overflow test, as `ensureOpen()` is
+            // the first statement of the JDK's `unread`.
+            _ => return Err(p66_pushback_reader_closed()),
+        };
         if pos == 0 {
-            return Err(RuntimeError::IllegalStateException {
+            // WRONG TYPE, corrected. HotSpot raises `java.io.IOException`
+            // ("Pushback buffer overflow" — measured), and
+            // `IllegalStateException` is NOT an `IOException`, so the
+            // `catch (IOException)` every caller of a `Reader` writes did not
+            // match and the failure escaped as an unchecked exception out of a
+            // method declared `throws IOException`.
+            //
+            // The sibling class does NOT share this string:
+            // `PushbackInputStream` says "Push back buffer is full" (measured
+            // in the same run). Transcribed per class, not unified.
+            return Err(RuntimeError::IOException {
                 message: "Pushback buffer overflow".into(),
             }
             .into());
         }
-        let buf = match ctx.get_field(this, 1) {
-            Value::Object(Some(b)) => b,
-            _ => return Ok(None),
-        };
         ctx.set_array_element(buf, pos - 1, ch);
         ctx.set_field(this, 2, Value::Int((pos - 1) as i32));
         Ok(None)
@@ -348,10 +468,22 @@ pub(crate) fn register_p66_pushback_reader(r: &mut NativeMethodRegistry) {
         };
         let buf = match ctx.get_field(this, 1) {
             Value::Object(Some(b)) => b,
-            _ => return Ok(Some(Value::Int(0))),
+            _ => return Err(p66_pushback_reader_closed()),
         };
         let buf_len = ctx.array_length(buf);
-        Ok(Some(Value::Int(if pos < buf_len { 1 } else { 0 })))
+        if pos < buf_len {
+            return Ok(Some(Value::Int(1)));
+        }
+        // Same fabrication as `read` above, one method over: with the pushback
+        // buffer empty the JDK answers `in.ready()`, and this answered a flat
+        // `false`. Measured: `pr.ready()` is `true` even at end-of-input on a
+        // `StringReader`, because `StringReader.ready()` is unconditionally
+        // true — so "false" was never merely conservative.
+        if let Value::Object(Some(reader)) = ctx.get_field(this, 0) {
+            let ready = ctx.invoke_virtual(reader, "ready", "()Z", &[])?;
+            return Ok(ready.or(Some(Value::Int(0))));
+        }
+        Ok(Some(Value::Int(0)))
     });
     r.register(pr, "close", "()V", |ctx, args| {
         let this = obj_arg(args, 0)?;
@@ -376,6 +508,29 @@ pub(crate) fn register_p66_pushback_reader(r: &mut NativeMethodRegistry) {
 
 /// Read a single byte from an InputStream. Returns -1 on EOF.
 pub(crate) fn ois_read_byte(ctx: &mut dyn NativeContext, stream: ObjectRef) -> i32 {
+    // NOTE ON THE SWALLOW HERE — deliberate, and narrowed rather than removed.
+    //
+    // `_ => -1` maps a THROWN `IOException` from the underlying stream onto the
+    // same `-1` that means end-of-stream, so a serialization read over a
+    // failing socket reported a truncated-but-clean object graph. That is this
+    // record's species. It is not repaired here because the repair is a
+    // signature change: `ois_read_byte` returns a bare `i32` and its eleven
+    // call sites (`ois_read_n`, `readObject`, `readInt`, `readLong`, `readUTF`,
+    // `readBoolean`, `readDouble`, `readFloat`, `readByte`, `readChar`,
+    // `readShort`) all consume it as one, so propagating means touching all of
+    // them, and this whole `ObjectInputStream` fallback is a
+    // `--synthetic-jdk`-only shape (`register_p70_object_streams` is in
+    // `SYNTHETIC_ONLY_CLOSURE`) whose wire format is already a stub.
+    //
+    // A SENTINEL WAS TRIED HERE AND WITHDRAWN, which is worth recording because
+    // it is the cheap-looking wrong answer. Returning `i32::MIN` for the `Err`
+    // arm keeps every `if b < 0 { break }` correct — but `readByte` does
+    // `b as i8 as i32`, and `i32::MIN as i8` is `0`, so the sentinel silently
+    // turned a failed read into the byte `0` at one of the four call sites.
+    // Half-distinguishing a failure is worse than naming it, so the swallow
+    // stays whole and is named instead. Recorded in the "What this lane did NOT
+    // do" section of
+    // G4-1-the-io-and-nio-fabricated-success-sweep-measured-20260816.md.
     match ctx.invoke_virtual(stream, "read", "()I", &[]) {
         Ok(Some(Value::Int(b))) => b,
         _ => -1,

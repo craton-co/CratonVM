@@ -10713,6 +10713,22 @@ fn native_map_put_evict(
     if is_unmod_wrapper(ctx, this) {
         return Err(unsupported_op());
     }
+    // The `Hashtable` null axis, VALUE BEFORE KEY. `Hashtable.put` reads:
+    //
+    // ```java
+    // // Make sure the value is not null
+    // if (value == null) { throw new NullPointerException(); }
+    // // Makes sure the key is not already in the hashtable.
+    // Entry<?,?> tab[] = table;
+    // int hash = key.hashCode();
+    // ```
+    //
+    // so `put(null, null)` is message-less (MEASURED), not the helpful-NPE
+    // text — the order is observable and must be preserved. A plain
+    // `Hashtable` receiver never reaches the CHM / LHM / TreeMap redirects
+    // below, so testing here costs nothing on those paths.
+    ht_reject_null_value(ctx, this, args.get(2))?;
+    ht_reject_null_key(ctx, this, args.get(1))?;
     // A `java/util/Map.put` interface native dispatched on a
     // ConcurrentHashMap receiver must use the segmented CHM path — the
     // plain-HashMap bucket code would treat the segments array as buckets.
@@ -11204,6 +11220,13 @@ fn native_map_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
+    // RULE K. `Hashtable.get` is `int hash = key.hashCode();` on its second
+    // line, so a null key never reaches a bucket. `HashMap.get(null)` is legal
+    // and answers null, which is why this is receiver-routed rather than a
+    // guard on the shared body. It also covers `Hashtable.getOrDefault`, whose
+    // JDK body is `V result = get(key);` over this very native, and the
+    // `compute*` natives, which open with a `native_map_get`.
+    ht_reject_null_key(ctx, this, args.get(1))?;
     if is_tree_map_receiver(ctx, this) {
         return native_tm_get(ctx, args);
     }
@@ -11555,6 +11578,9 @@ fn native_map_remove(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
         _ => return Ok(Some(Value::Object(None))),
     };
     let key_val = args.get(1).copied().unwrap_or(Value::Object(None));
+    // RULE K — `Hashtable.remove(Object)` is `int hash = key.hashCode();` on
+    // its second line, exactly like `get`.
+    ht_reject_null_key(ctx, this, args.get(1))?;
 
     // Keep both arguments rooted from native entry. `HashSet.remove()` is used
     // by ThreadPoolExecutor.processWorkerExit while another thread can drive a
@@ -11849,44 +11875,247 @@ fn native_map_remove_pinned(
 // the receiver routing (LinkedHashMap / TreeMap / ConcurrentHashMap /
 // Hashtable) themselves.
 
-/// `Hashtable` (and `Properties`) reject a null value in all three of these
-/// methods (`Objects.requireNonNull(value)` is the first statement of each);
-/// `HashMap`/`LinkedHashMap` accept null values throughout. One helper so the
-/// three natives below stay a faithful mirror of whichever override the
-/// receiver actually has.
-fn map_kv_reject_null_for_hashtable(
+// ---------------------------------------------------------------------------
+// The `java.util.Hashtable` null axis
+// ---------------------------------------------------------------------------
+//
+// MEASURED on the oracle 2026-08-16 (HotSpot 25.0.3+9-LTS,
+// `scratchpad/g1/{Probe,Probe2}.java`; the full table is in
+// `docs/known-issues/jdk-only/G1-1-...`). `Hashtable`'s rule is TWO rules, and
+// they are not the two `Properties` has:
+//
+//   RULE V (value/function). Every `Hashtable` method that takes a value or a
+//     function opens with `Objects.requireNonNull(...)` — or, in `contains` and
+//     `containsValue`, a literal `throw new NullPointerException()`. The NPE
+//     carries **no message**, and it is checked FIRST, before the key is even
+//     looked at: `put(null, null)`, `remove(null, null)`,
+//     `replace(null, null)`, `replace(null, null, null)` all measure
+//     message-less.
+//
+//   RULE K (key). Once the value check passes, a null key dies on the bucket
+//     walk's own `key.hashCode()`, so HotSpot's helpful-NPE names the local:
+//     `Cannot invoke "Object.hashCode()" because "key" is null`. That is a
+//     TRANSCRIBED string, not a derived one.
+//
+// The one row that generalising would have got wrong: `Hashtable.merge` does
+// **not** `requireNonNull` its value — only its remapping function — so
+// `ht.merge("k", null, f)` computes and returns normally where
+// `HashMap.merge("k", null, f)` throws. (`Hashtable.merge` is not registered
+// natively here, so no code below needs the exception; it is recorded so the
+// next lane does not "fix" it.)
+//
+// `Properties` is a DIFFERENT contract and must not be folded in: its write
+// path delegates to a side `ConcurrentHashMap`, so every refusal is
+// message-less (no `hashCode` text) and `props.remove(k, null)` does not throw
+// at all — it answers `false`. Hence every predicate below distinguishes
+// `is_plain_hashtable_receiver` (Hashtable, Properties EXCLUDED) from
+// `is_hashtable_receiver` (Properties INCLUDED).
+
+/// HotSpot's helpful-NPE text when a `java.util.Hashtable` bucket walk
+/// dereferences a null key. MEASURED, transcribed character for character:
+///
+/// ```text
+/// java.util.Hashtable | get(null) | java.lang.NullPointerException
+///     msg=<<Cannot invoke "Object.hashCode()" because "key" is null>>
+/// ```
+///
+/// The local name is `key` in every `Hashtable` method that produces it, which
+/// is why one constant serves the whole family.
+const HASHTABLE_NULL_KEY_MSG: &str = "Cannot invoke \"Object.hashCode()\" because \"key\" is null";
+
+/// `java.util.Hashtable` or an ordinary subclass, with `java.util.Properties`
+/// EXCLUDED — the receiver test the null axis needs.
+///
+/// It is the same bit `uses_native_hashtable_layout` reads
+/// (`CF_HASHTABLE_LAYOUT`, memoized per `ClassId`), asked for a different
+/// reason: there, "does this receiver keep its entries in the native bucket
+/// array"; here, "does this receiver have `Hashtable`'s null contract rather
+/// than `Properties`' side-`ConcurrentHashMap` one". Both questions have the
+/// same answer for the same reason — `Properties` is the subclass that stops
+/// behaving like `Hashtable` — so they share the flag rather than paying for a
+/// second class walk.
+#[inline]
+fn is_plain_hashtable_receiver(ctx: &dyn NativeContext, this: ObjectRef) -> bool {
+    uses_native_hashtable_layout(ctx, this)
+}
+
+/// RULE K. Refuse an explicitly-passed null key on a plain `Hashtable`
+/// receiver, with the transcribed helpful-NPE text.
+///
+/// `key` is `args.get(n)`, not an `unwrap_or`-flattened `Value`, on purpose:
+/// a MISSING argument is a malformed native call and must not be reported as a
+/// program-level NPE (the same distinction `native_map_merge` draws for its
+/// remapping function).
+fn ht_reject_null_key(
     ctx: &dyn NativeContext,
     this: ObjectRef,
-    value: &Value,
-    method: &str,
+    key: Option<&Value>,
 ) -> Result<(), MethodCallFailed> {
-    if matches!(value, Value::Object(None)) && is_hashtable_receiver(ctx, this) {
+    if matches!(key, Some(Value::Object(None))) && is_plain_hashtable_receiver(ctx, this) {
         return Err(RuntimeError::NullPointerException {
-            // MEASURED 2026-08-13 (scratchpad/orch/PropAxis.java): HotSpot's
-            // `Objects.requireNonNull(value)` carries NO message here. The old
-            // `format!("Hashtable.{method}: null value")` was a FABRICATED string
-            // that appears nowhere in the JDK -- right exception KIND, invented
-            // text, so any test asserting only the type read as passing.
-            message: None,
+            message: Some(HASHTABLE_NULL_KEY_MSG.to_string()),
         }
         .into());
     }
     Ok(())
 }
 
-
-/// The KEY half of the same contract, which the value helper above did not
-/// cover: MEASURED 2026-08-13, `Hashtable`/`Properties` throw for a null key in
-/// `replace(k,v)`, `replace(k,old,new)` and `remove(k,v)` as well, with no
-/// message. `HashMap` accepts a null key in all three, so this must stay
-/// receiver-routed exactly like its sibling.
-fn map_k_reject_null_for_hashtable(
+/// RULE V. Refuse an explicitly-passed null value on a plain `Hashtable`
+/// receiver. `Objects.requireNonNull` and `throw new NullPointerException()`
+/// both produce a message-less NPE, and inventing text here is exactly the
+/// defect F41-1 §3 caught twice.
+fn ht_reject_null_value(
     ctx: &dyn NativeContext,
     this: ObjectRef,
-    key: &Value,
+    value: Option<&Value>,
 ) -> Result<(), MethodCallFailed> {
-    if matches!(key, Value::Object(None)) && is_hashtable_receiver(ctx, this) {
+    if matches!(value, Some(Value::Object(None))) && is_plain_hashtable_receiver(ctx, this) {
         return Err(RuntimeError::NullPointerException { message: None }.into());
+    }
+    Ok(())
+}
+
+/// Message-less NPE, the shape `Objects.requireNonNull` and
+/// `ConcurrentHashMap`'s explicit `throw new NullPointerException()` share.
+#[inline]
+fn bare_npe() -> MethodCallFailed {
+    RuntimeError::NullPointerException { message: None }.into()
+}
+
+/// RULE F. Refuse an explicitly-passed null **functional argument** — the
+/// `Consumer`, `BiConsumer`, `Function`, `BiFunction`, `UnaryOperator` or
+/// `Predicate` that `forEach` / `replaceAll` / `removeIf` / `compute*` /
+/// `merge` take.
+///
+/// MEASURED on HotSpot 25.0.3+9-LTS, 2026-08-16, and the answer is the one
+/// uniform column this whole sweep produced: **a bare, message-less
+/// `NullPointerException` on every mutable receiver** — `HashMap`,
+/// `LinkedHashMap`, `TreeMap`, `Hashtable`, `Properties`,
+/// `ConcurrentHashMap`, `ConcurrentSkipListMap`, `IdentityHashMap`,
+/// `WeakHashMap`, `ArrayList`, `LinkedList`, `Vector`, `Stack`, `HashSet`,
+/// `LinkedHashSet`, `TreeSet`, `ArrayDeque`, `PriorityQueue`,
+/// `CopyOnWriteArrayList`, `ConcurrentLinkedQueue`, and every `values()` /
+/// `keySet()` / `entrySet()` view of the six map families. Every one of those
+/// methods opens `Objects.requireNonNull(<the function>)`.
+///
+/// Three properties of that rule are load-bearing and none is guessable:
+///
+/// * **It fires on an EMPTY receiver too.** `new HashMap<>().forEach(null)`
+///   throws; the refusal is not a side effect of reaching the first element.
+///   Every body below therefore checks BEFORE it looks at the contents.
+/// * **It fires BEFORE the null-key check.** MEASURED across all six map
+///   receivers: `ht.computeIfAbsent(null, null)` is message-less, while
+///   `ht.computeIfAbsent(null, F)` carries [`HASHTABLE_NULL_KEY_MSG`]. That is
+///   G1-1's RULE V / RULE K ordering, extended to the function argument, and
+///   it is why callers put this call ahead of [`ht_reject_null_key`].
+/// * **It does NOT extend to an immutable receiver, and it does NOT extend to
+///   `sort`.** MEASURED: `List.of("a").removeIf(null)`,
+///   `.replaceAll(null)`, `.sort(null)` and
+///   `Collections.unmodifiableMap(m).replaceAll(null)` all throw
+///   `UnsupportedOperationException`, not NPE — immutability is checked first
+///   — while `List.of("a").forEach(null)` (which mutates nothing) throws the
+///   NPE. And `list.sort(null)` is not a null-argument error at all: a null
+///   `Comparator` MEANS natural ordering and sorts normally
+///   (`ArrayList`, `LinkedList`, `Vector`, `Stack`, `CopyOnWriteArrayList`,
+///   `Arrays.asList`, `subList`, `Collections.sort(l, null)` and
+///   `Arrays.sort(a, null)` were all measured returning `[a, b]`).
+///   So this helper is called from the mutable-receiver bodies only, and never
+///   from a `*_sort_comparator` body — `native_al_sort_comparator` and
+///   `native_collections_sort_comparator` already route a null comparator to
+///   natural ordering and are correct as they stand.
+///
+/// `arg` is `args.get(n)`, NOT an `unwrap_or`-flattened `Value`, for the same
+/// reason [`ht_reject_null_key`] takes it that way: a **missing** argument is a
+/// malformed native call and must keep its existing no-op, while an
+/// **explicitly passed** null is a program-level error the JDK reports. The
+/// bodies below all previously collapsed both cases into "return the empty
+/// answer", which is the fabricated-success shape — the caller is told the
+/// operation succeeded and nothing happened.
+#[inline]
+fn reject_null_functional(arg: Option<&Value>) -> Result<(), MethodCallFailed> {
+    if matches!(arg, Some(Value::Object(None))) {
+        return Err(bare_npe());
+    }
+    Ok(())
+}
+
+/// `remove(Object, Object)`'s receiver-routed null contract.
+///
+/// MEASURED, and the three receivers disagree in three different ways:
+///
+/// | receiver | `remove(null, v)` | `remove(k, null)` | `remove(null, null)` |
+/// |---|---|---|---|
+/// | `HashMap` | `false` | `false` | `false` |
+/// | `Hashtable` | NPE `Cannot invoke "Object.hashCode()"...` | NPE (no msg) | NPE (no msg) |
+/// | `Properties` | NPE (no msg) | **`false`** | NPE (no msg) |
+///
+/// `Hashtable.remove(k,v)` is `Objects.requireNonNull(value)` then the bucket
+/// walk, so the VALUE is checked first. `Properties.remove(k,v)` delegates to
+/// its side `ConcurrentHashMap`, whose `remove(k,v)` is
+/// `if (key == null) throw new NullPointerException(); return value != null && ...`
+/// — the key is checked first and a null value is simply "no match".
+fn map_remove_kv_null_contract(
+    ctx: &dyn NativeContext,
+    this: ObjectRef,
+    key: Option<&Value>,
+    value: Option<&Value>,
+) -> Result<(), MethodCallFailed> {
+    if is_plain_hashtable_receiver(ctx, this) {
+        ht_reject_null_value(ctx, this, value)?;
+        ht_reject_null_key(ctx, this, key)?;
+    } else if is_hashtable_receiver(ctx, this) {
+        // `Properties`: key only, message-less. Deliberately no value check —
+        // measured `false`, and the previous shared helper threw here.
+        if matches!(key, Some(Value::Object(None))) {
+            return Err(bare_npe());
+        }
+    }
+    Ok(())
+}
+
+/// `replace(K, V)`'s receiver-routed null contract. `Hashtable.replace` is
+/// `Objects.requireNonNull(value)` then the bucket walk;
+/// `Properties.replace` delegates to `ConcurrentHashMap.replace`, which
+/// refuses both, message-less. MEASURED: `ht.replace(null, null)` is
+/// message-less, so the value must be checked BEFORE the key.
+fn map_replace_kv_null_contract(
+    ctx: &dyn NativeContext,
+    this: ObjectRef,
+    key: Option<&Value>,
+    value: Option<&Value>,
+) -> Result<(), MethodCallFailed> {
+    if is_plain_hashtable_receiver(ctx, this) {
+        ht_reject_null_value(ctx, this, value)?;
+        ht_reject_null_key(ctx, this, key)?;
+    } else if is_hashtable_receiver(ctx, this) {
+        if matches!(value, Some(Value::Object(None))) || matches!(key, Some(Value::Object(None))) {
+            return Err(bare_npe());
+        }
+    }
+    Ok(())
+}
+
+/// `replace(K, V, V)`'s receiver-routed null contract. `Hashtable.replace`
+/// requires BOTH values non-null (old first, then new) before the bucket walk
+/// reaches the key; `Properties` refuses all three message-less. MEASURED.
+fn map_replace3_null_contract(
+    ctx: &dyn NativeContext,
+    this: ObjectRef,
+    key: Option<&Value>,
+    old_value: Option<&Value>,
+    new_value: Option<&Value>,
+) -> Result<(), MethodCallFailed> {
+    if is_plain_hashtable_receiver(ctx, this) {
+        ht_reject_null_value(ctx, this, old_value)?;
+        ht_reject_null_value(ctx, this, new_value)?;
+        ht_reject_null_key(ctx, this, key)?;
+    } else if is_hashtable_receiver(ctx, this) {
+        if matches!(old_value, Some(Value::Object(None)))
+            || matches!(new_value, Some(Value::Object(None)))
+            || matches!(key, Some(Value::Object(None)))
+        {
+            return Err(bare_npe());
+        }
     }
     Ok(())
 }
@@ -11906,8 +12135,7 @@ fn native_map_remove_kv(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     };
     let key = args.get(1).copied().unwrap_or(Value::Object(None));
     let expected = args.get(2).copied().unwrap_or(Value::Object(None));
-    map_kv_reject_null_for_hashtable(ctx, this, &expected, "remove")?;
-    map_k_reject_null_for_hashtable(ctx, this, &key)?;
+    map_remove_kv_null_contract(ctx, this, args.get(1), args.get(2))?;
     // GC-safety: `get`/`containsKey`/`remove` each dispatch the key's
     // `hashCode()`/`equals()` — arbitrary Java that can complete a moving young
     // GC — so every receiver/key/value local is re-read from its pin after each
@@ -11958,8 +12186,7 @@ fn native_map_replace(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     };
     let key = args.get(1).copied().unwrap_or(Value::Object(None));
     let new_val = args.get(2).copied().unwrap_or(Value::Object(None));
-    map_k_reject_null_for_hashtable(ctx, this, &key)?;
-    map_kv_reject_null_for_hashtable(ctx, this, &new_val, "replace")?;
+    map_replace_kv_null_contract(ctx, this, args.get(1), args.get(2))?;
     let this_pin = ctx.pin_native_root(this);
     let key_pin = pin_value(ctx, key);
     let new_pin = pin_value(ctx, new_val);
@@ -12008,9 +12235,7 @@ fn native_map_replace_kv(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     let key = args.get(1).copied().unwrap_or(Value::Object(None));
     let old_val = args.get(2).copied().unwrap_or(Value::Object(None));
     let new_val = args.get(3).copied().unwrap_or(Value::Object(None));
-    map_k_reject_null_for_hashtable(ctx, this, &key)?;
-    map_kv_reject_null_for_hashtable(ctx, this, &old_val, "replace")?;
-    map_kv_reject_null_for_hashtable(ctx, this, &new_val, "replace")?;
+    map_replace3_null_contract(ctx, this, args.get(1), args.get(2), args.get(3))?;
     let this_pin = ctx.pin_native_root(this);
     let key_pin = pin_value(ctx, key);
     let old_pin = pin_value(ctx, old_val);
@@ -12087,6 +12312,8 @@ fn native_map_contains_key(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Int(0))),
     };
+    // RULE K — `Hashtable.containsKey` opens with `key.hashCode()` too.
+    ht_reject_null_key(ctx, this, args.get(1))?;
     if is_tree_map_receiver(ctx, this) {
         return native_tm_contains_key(ctx, args);
     }
@@ -12236,6 +12463,12 @@ fn native_map_contains_value(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
         _ => return Ok(Some(Value::Int(0))),
     };
     let target = args.get(1).copied().unwrap_or(Value::Object(None));
+    // RULE V. `Hashtable.containsValue` is `return contains(value);` and
+    // `Hashtable.contains` opens with a literal
+    // `if (value == null) throw new NullPointerException();` — so it refuses
+    // even on an EMPTY table (measured). `HashMap.containsValue(null)` is legal
+    // and answers false.
+    ht_reject_null_value(ctx, this, args.get(1))?;
     if is_chm_receiver(ctx, this) {
         return native_chm_contains_value(ctx, args);
     }
@@ -12799,6 +13032,30 @@ fn native_map_put_all(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(None),
     };
+    // A null source map silently no-op'd here. MEASURED on the oracle, and the
+    // message is receiver-routed because the two JDK bodies dereference
+    // different members of it:
+    //
+    // * `HashMap.putAll(m)`   -> `putMapEntries(m, true)` -> `int s = m.size();`
+    //   `Cannot invoke "java.util.Map.size()" because "m" is null`
+    //   (`LinkedHashMap` and `Properties` measure identically)
+    // * `Hashtable.putAll(t)` -> `for (Map.Entry e : t.entrySet())`
+    //   `Cannot invoke "java.util.Map.entrySet()" because "t" is null`
+    //
+    // Both are TRANSCRIBED, including the JDK's own parameter names `m` / `t`.
+    // As everywhere else here, only an explicitly-passed null throws; a
+    // missing argument stays the malformed-call no-op it was.
+    if matches!(args.get(1), Some(Value::Object(None))) {
+        let message = if is_plain_hashtable_receiver(ctx, this) {
+            "Cannot invoke \"java.util.Map.entrySet()\" because \"t\" is null"
+        } else {
+            "Cannot invoke \"java.util.Map.size()\" because \"m\" is null"
+        };
+        return Err(RuntimeError::NullPointerException {
+            message: Some(message.to_string()),
+        }
+        .into());
+    }
     let other = match args.get(1) {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(None),
@@ -14517,7 +14774,14 @@ fn vc_route(
     };
     let vals: Vec<Value> = entries.into_iter().map(|(_, v)| v).collect();
     let source = ctx.read_native_pin(source_pin, source);
-    let list = match make_view_list_of(ctx, source, &vals) {
+    // The carrier comes from the SOURCE map, not from `this`: this function
+    // rebuilds the carrier `native_map_values` would have produced for that
+    // map, and `this` is the view we are re-routing. Every other
+    // `make_view_list_of` call site derives it the same way. (The parameter and
+    // this call site arrived on opposite sides of the 2026-08-16 `dev` merge,
+    // which is why git produced a clean 3-argument call to a 4-argument fn.)
+    let carrier = values_carrier_for(&*ctx, source);
+    let list = match make_view_list_of(ctx, source, &vals, carrier) {
         Ok(l) => l,
         Err(e) => {
             ctx.unpin_native_roots(source_pin);
@@ -18351,6 +18615,12 @@ fn native_collections_unmodifiable_list(
 // ===========================================================================
 
 fn native_al_for_each(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    // RULE F, and deliberately AHEAD of both routes. MEASURED: a null action
+    // throws on a `values()` / `keySet()` / `entrySet()` view exactly as it
+    // does on a plain list, and on an EMPTY one, so nothing is gained by
+    // rebuilding a carrier first — and `vc_route` re-enters this same body,
+    // where the check would fire anyway. See `reject_null_functional`.
+    reject_null_functional(args.get(1))?;
     if let Some(r) = ksv_route(ctx, args, native_ksv_for_each) {
         return r;
     }
@@ -18467,6 +18737,9 @@ fn native_map_for_each(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(None),
     };
+    // RULE F. MEASURED bare NPE on every map receiver INCLUDING an empty one,
+    // so the check precedes the entry walk. See `reject_null_functional`.
+    reject_null_functional(args.get(1))?;
     let action = match args.get(1) {
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(None),
@@ -18507,6 +18780,8 @@ fn native_map_for_each(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
 }
 
 fn native_hs_for_each(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    // RULE F, ahead of the route — see the note in `native_al_for_each`.
+    reject_null_functional(args.get(1))?;
     if let Some(r) = ksv_route(ctx, args, native_ksv_for_each) {
         return r;
     }
@@ -19182,6 +19457,12 @@ fn native_al_remove_if(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Int(0))),
     };
+    // RULE F. MEASURED on `ArrayList`, `Vector`, `Stack`, `LinkedList`,
+    // `HashSet`, `TreeSet`, `ArrayDeque` and the map views, empty or not.
+    // NOTE this body serves MUTABLE receivers only — an immutable one answers
+    // `UnsupportedOperationException` instead, and is not registered here.
+    // See `reject_null_functional`.
+    reject_null_functional(args.get(1))?;
     let predicate = match args.get(1) {
         Some(Value::Object(Some(p))) => *p,
         _ => return Ok(Some(Value::Int(0))),
@@ -19267,6 +19548,10 @@ fn native_al_replace_all(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(None),
     };
+    // RULE F, empty receiver included. `replaceAll` takes a `UnaryOperator`;
+    // `sort` takes a `Comparator` and a null one is NOT an error there — see
+    // `reject_null_functional`'s third bullet and `native_al_sort_comparator`.
+    reject_null_functional(args.get(1))?;
     let operator = match args.get(1) {
         Some(Value::Object(Some(op))) => *op,
         _ => return Ok(None),
@@ -19321,6 +19606,9 @@ fn native_map_compute_if_absent(ctx: &mut dyn NativeContext, args: &[Value]) -> 
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
+    // RULE F, ahead of the key: MEASURED `computeIfAbsent(null, null)` is
+    // message-less on all six map receivers. See `reject_null_functional`.
+    reject_null_functional(args.get(2))?;
     let key = args.get(1).copied().unwrap_or(Value::Object(None));
     let function = match args.get(2) {
         Some(Value::Object(Some(f))) => *f,
@@ -19389,6 +19677,8 @@ fn native_map_compute(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
+    // RULE F, ahead of the key. See `reject_null_functional`.
+    reject_null_functional(args.get(2))?;
     let key = args.get(1).copied().unwrap_or(Value::Object(None));
     let bi_function = match args.get(2) {
         Some(Value::Object(Some(f))) => *f,
@@ -19461,6 +19751,10 @@ fn native_map_compute_if_present(ctx: &mut dyn NativeContext, args: &[Value]) ->
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
+    // RULE F, ahead of the key. MEASURED: this fires even when the key is
+    // ABSENT (`computeIfPresent("zz", null)` throws), so it cannot be folded
+    // into the present-branch. See `reject_null_functional`.
+    reject_null_functional(args.get(2))?;
     let key = args.get(1).copied().unwrap_or(Value::Object(None));
     let bi_function = match args.get(2) {
         Some(Value::Object(Some(f))) => *f,
@@ -19633,6 +19927,8 @@ fn native_map_replace_all(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(None),
     };
+    // RULE F, empty receiver included. See `reject_null_functional`.
+    reject_null_functional(args.get(1))?;
     let bi_function = match args.get(1) {
         Some(Value::Object(Some(f))) => *f,
         _ => return Ok(None),
@@ -36269,6 +36565,8 @@ fn native_ll_remove_if(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(Some(Value::Int(0))),
     };
+    // RULE F, empty receiver included. See `reject_null_functional`.
+    reject_null_functional(args.get(1))?;
     let predicate = match args.get(1) {
         Some(Value::Object(Some(p))) => *p,
         _ => return Ok(Some(Value::Int(0))),
@@ -37420,6 +37718,8 @@ fn native_lhm_compute_if_absent(ctx: &mut dyn NativeContext, args: &[Value]) -> 
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
     };
+    // RULE F, ahead of the key. See `reject_null_functional`.
+    reject_null_functional(args.get(2))?;
     let key = args.get(1).copied().unwrap_or(Value::Object(None));
     let function = match args.get(2) {
         Some(Value::Object(Some(f))) => *f,
@@ -38385,6 +38685,8 @@ fn native_lhm_for_each(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(None),
     };
+    // RULE F, empty receiver included. See `reject_null_functional`.
+    reject_null_functional(args.get(1))?;
     let consumer = match args.get(1) {
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(None),
@@ -39393,6 +39695,9 @@ fn native_ad_for_each(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(None),
     };
+    // RULE F, empty receiver included. MEASURED on `ArrayDeque` and
+    // `PriorityQueue` alike. See `reject_null_functional`.
+    reject_null_functional(args.get(1))?;
     let consumer = match args.get(1) {
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(None),
@@ -45946,6 +46251,11 @@ fn native_tm_for_each(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(None),
     };
+    // RULE F, and deliberately AHEAD of `tm_sync_native_state`: the JDK's
+    // `Objects.requireNonNull(action)` is `forEach`'s first statement, so a
+    // null action must win over anything the sync could raise (it re-enters a
+    // user `Comparator`). See `reject_null_functional`.
+    reject_null_functional(args.get(1))?;
     tm_sync_native_state(ctx, this)?;
     let action = match args.get(1) {
         Some(Value::Object(Some(r))) => *r,
@@ -46455,6 +46765,11 @@ fn native_tm_compute_if_absent(ctx: &mut dyn NativeContext, args: &[Value]) -> M
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
+    // RULE F, ahead of the key. MEASURED: `TreeMap.computeIfAbsent(null, null)`
+    // and `(null, F)` are BOTH message-less here — unlike `Hashtable`, whose
+    // key arm carries text — so the ordering is unobservable for this receiver
+    // and the check is placed first for consistency with the family.
+    reject_null_functional(args.get(2))?;
     let key = args.get(1).copied().unwrap_or(Value::Object(None));
     let mapper = match args.get(2) {
         Some(Value::Object(Some(r))) => *r,
@@ -46515,6 +46830,13 @@ fn native_tm_merge(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
+    // RULE F. MEASURED `TreeMap.merge(k, v, null)` -> bare NPE, present or
+    // absent key. The null-VALUE arm (`merge(k, null, f)`, also a bare NPE on
+    // `TreeMap`) is NOT added here: `native_map_merge` refuses it for the
+    // `HashMap` family, but `Hashtable.merge(k, null, f)` SUCCEEDS on the
+    // oracle (G1-1 §5), so the value rule is per-receiver and this lane does
+    // not widen it from one row. See `reject_null_functional`.
+    reject_null_functional(args.get(3))?;
     let key = args.get(1).copied().unwrap_or(Value::Object(None));
     let value = args.get(2).copied().unwrap_or(Value::Object(None));
     let remap_fn = match args.get(3) {
@@ -47318,6 +47640,9 @@ fn ts_remove_element(
 }
 
 fn native_ts_for_each(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    // RULE F, ahead of `resync_ts_view` for the same reason `native_tm_for_each`
+    // puts it ahead of `tm_sync_native_state`. See `reject_null_functional`.
+    reject_null_functional(args.get(1))?;
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(None),
@@ -49530,12 +49855,63 @@ fn register_concurrent_hashmap_natives(r: &mut NativeMethodRegistry) {
 
 // --- ConcurrentHashMap segmented native functions (Phase 86.2) ---
 
+/// `ConcurrentHashMap`'s null-key refusal on the LOOKUP path — `get`,
+/// `getOrDefault`, `containsKey`, `remove(Object)`.
+///
+/// MEASURED on the oracle 2026-08-16. None of these has an explicit null test:
+/// each opens with `int h = spread(key.hashCode());`, so HotSpot's helpful-NPE
+/// names the parameter and the text is TRANSCRIBED, not derived:
+///
+/// ```text
+/// j.u.c.ConcurrentHashMap | get(null)          | java.lang.NullPointerException
+///     msg=<<Cannot invoke "Object.hashCode()" because "key" is null>>
+/// j.u.c.ConcurrentHashMap | getOrDefault(null,d) | ... same
+/// j.u.c.ConcurrentHashMap | containsKey(null)  | ... same
+/// j.u.c.ConcurrentHashMap | remove(null)       | ... same
+/// ```
+///
+/// The string that used to be here — `"ConcurrentHashMap does not permit null
+/// keys"` — appears nowhere in the JDK. It was a FABRICATION of the same kind
+/// F41-1 §3 found twice in the `Properties` axis: right exception KIND,
+/// invented text, invisible to any assertion that checks only the type.
+///
+/// This is NOT the message for the WRITE path. `put` / `putIfAbsent` /
+/// `replace` / `merge` / `compute*` and `remove(Object,Object)` all reach an
+/// explicit `throw new NullPointerException()` (`putVal`'s
+/// `if (key == null || value == null)`, `remove(k,v)`'s
+/// `if (key == null)`), which carries NO message — see `chm_bare_npe_on_null`.
 fn chm_reject_null_key(key: &Value) -> Result<(), MethodCallFailed> {
     if matches!(key, Value::Object(None)) {
         return Err(RuntimeError::NullPointerException {
-            message: Some("ConcurrentHashMap does not permit null keys".to_string()),
+            // Same text `java.util.Hashtable` produces for the same reason: the
+            // dereferenced local is named `key` in both.
+            message: Some(HASHTABLE_NULL_KEY_MSG.to_string()),
         }
         .into());
+    }
+    Ok(())
+}
+
+/// `ConcurrentHashMap`'s WRITE-path null refusal. `putVal` opens with
+///
+/// ```text
+///  0: aload_1        // key
+///  1: ifnull    8
+///  4: aload_2        // value
+///  5: ifnonnull 16
+///  8: new       #162  // class java/lang/NullPointerException
+/// 12: invokespecial  // NullPointerException."<init>":()V
+/// 15: athrow
+/// ```
+///
+/// (`javap -p -c java.util.concurrent.ConcurrentHashMap`, JDK 25.0.3+9). The
+/// no-arg constructor means **no message at all** — MEASURED:
+/// `put(null,v)`, `put(k,null)`, `putIfAbsent` both ways and
+/// `remove(null,null)` every one reads `msg=<NO-MESSAGE>`.
+#[inline]
+fn chm_bare_npe_on_null(key: &Value, value: &Value) -> Result<(), MethodCallFailed> {
+    if matches!(key, Value::Object(None)) || matches!(value, Value::Object(None)) {
+        return Err(bare_npe());
     }
     Ok(())
 }
@@ -50132,13 +50508,10 @@ fn native_chm_put(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
     };
     let key = args.get(1).copied().unwrap_or(Value::Object(None));
     let value = args.get(2).copied().unwrap_or(Value::Object(None));
-    // C24 (HIGH): ConcurrentHashMap.put rejects null keys and null values per JDK spec.
-    if matches!(key, Value::Object(None)) || matches!(value, Value::Object(None)) {
-        return Err(RuntimeError::NullPointerException {
-            message: Some("ConcurrentHashMap does not permit null keys or values".to_string()),
-        }
-        .into());
-    }
+    // C24 (HIGH): ConcurrentHashMap.put rejects null keys and null values per
+    // JDK spec — `putVal`'s opening `if (key == null || value == null) throw
+    // new NullPointerException();`. Message-less: see `chm_bare_npe_on_null`.
+    chm_bare_npe_on_null(&key, &value)?;
     // GC-safety: `chm_key_hash` invokes arbitrary `hashCode()` bytecode and
     // `acquire_gc_safe`'s contended wait can span a completed moving GC, so
     // every raw local captured above must be pinned and re-read before use.
@@ -50204,13 +50577,9 @@ fn native_chm_put_if_absent(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     };
     let key = args.get(1).copied().unwrap_or(Value::Object(None));
     let value = args.get(2).copied().unwrap_or(Value::Object(None));
-    // C24 (HIGH): JDK rejects null key/value.
-    if matches!(key, Value::Object(None)) || matches!(value, Value::Object(None)) {
-        return Err(RuntimeError::NullPointerException {
-            message: Some("ConcurrentHashMap does not permit null keys or values".to_string()),
-        }
-        .into());
-    }
+    // C24 (HIGH): JDK rejects null key/value. `putIfAbsent` is
+    // `putVal(key, value, true)`, i.e. the same message-less refusal as `put`.
+    chm_bare_npe_on_null(&key, &value)?;
     let this_pin = ctx.pin_native_root(this);
     let key_pin = pin_value(ctx, key);
     let value_pin = pin_value(ctx, value);
@@ -50431,14 +50800,10 @@ fn native_chm_compute_if_absent(ctx: &mut dyn NativeContext, args: &[Value]) -> 
     };
     let key = args.get(1).copied().unwrap_or(Value::Object(None));
     let func = args.get(2).copied().unwrap_or(Value::Object(None));
-    // C24 (HIGH): JDK rejects null key and null mappingFunction.
+    // C24 (HIGH): JDK rejects null key and null mappingFunction. MEASURED
+    // message-less on the oracle — see `chm_bare_npe_on_null`.
     if matches!(key, Value::Object(None)) || matches!(func, Value::Object(None)) {
-        return Err(RuntimeError::NullPointerException {
-            message: Some(
-                "ConcurrentHashMap.computeIfAbsent: null key or mappingFunction".to_string(),
-            ),
-        }
-        .into());
+        return Err(bare_npe());
     }
     let roots_base = ctx.pin_native_root(this);
     let key_pin = pin_value(ctx, key);
@@ -50480,12 +50845,10 @@ fn native_chm_compute(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     };
     let key = args.get(1).copied().unwrap_or(Value::Object(None));
     let func = args.get(2).copied().unwrap_or(Value::Object(None));
-    // C24 (HIGH): JDK rejects null key and null remappingFunction.
+    // C24 (HIGH): JDK rejects null key and null remappingFunction. MEASURED
+    // message-less on the oracle — see `chm_bare_npe_on_null`.
     if matches!(key, Value::Object(None)) || matches!(func, Value::Object(None)) {
-        return Err(RuntimeError::NullPointerException {
-            message: Some("ConcurrentHashMap.compute: null key or remappingFunction".to_string()),
-        }
-        .into());
+        return Err(bare_npe());
     }
     let roots_base = ctx.pin_native_root(this);
     let key_pin = pin_value(ctx, key);
@@ -50517,13 +50880,9 @@ fn native_chm_compute_if_present(ctx: &mut dyn NativeContext, args: &[Value]) ->
     let key = args.get(1).copied().unwrap_or(Value::Object(None));
     let func = args.get(2).copied().unwrap_or(Value::Object(None));
     // JDK ConcurrentHashMap rejects null key and null remappingFunction.
+    // MEASURED message-less on the oracle — see `chm_bare_npe_on_null`.
     if matches!(key, Value::Object(None)) || matches!(func, Value::Object(None)) {
-        return Err(RuntimeError::NullPointerException {
-            message: Some(
-                "ConcurrentHashMap.computeIfPresent: null key or remappingFunction".to_string(),
-            ),
-        }
-        .into());
+        return Err(bare_npe());
     }
     let roots_base = ctx.pin_native_root(this);
     let key_pin = pin_value(ctx, key);
@@ -50576,16 +50935,12 @@ fn native_chm_merge(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     let value = args.get(2).copied().unwrap_or(Value::Object(None));
     let func = args.get(3).copied().unwrap_or(Value::Object(None));
     // C24 (HIGH): JDK rejects null key, null value, and null remappingFunction.
+    // MEASURED message-less on the oracle — see `chm_bare_npe_on_null`.
     if matches!(key, Value::Object(None))
         || matches!(value, Value::Object(None))
         || matches!(func, Value::Object(None))
     {
-        return Err(RuntimeError::NullPointerException {
-            message: Some(
-                "ConcurrentHashMap.merge: null key, value, or remappingFunction".to_string(),
-            ),
-        }
-        .into());
+        return Err(bare_npe());
     }
     let roots_base = ctx.pin_native_root(this);
     let key_pin = pin_value(ctx, key);
@@ -50711,6 +51066,11 @@ fn native_chm_replace_all(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(None),
     };
+    // RULE F. Without this the null function reached `native_map_replace_all`
+    // once per segment, which returned its own silent no-op — so an empty CHM
+    // and a populated one both answered "done". MEASURED bare NPE for both.
+    // See `reject_null_functional`.
+    reject_null_functional(args.get(1))?;
     let func = args.get(1).copied().unwrap_or(Value::Object(None));
     let _resize_flag = ChmResizeLockGuard::enter();
     // GC-safety: pinned-slice iteration — each per-segment lock wait is
@@ -50744,6 +51104,10 @@ fn native_chm_for_each(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(None),
     };
+    // RULE F. G1-1 gave the CHM write path `chm_bare_npe_on_null` but did not
+    // reach `forEach`/`replaceAll`, which take no key or value to test.
+    // MEASURED bare NPE, empty receiver included. See `reject_null_functional`.
+    reject_null_functional(args.get(1))?;
     let action = match args.get(1) {
         Some(Value::Object(Some(a))) => *a,
         _ => return Ok(None),
@@ -51087,7 +51451,15 @@ fn native_chm_remove_kv(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     };
     let key = args.get(1).copied().unwrap_or(Value::Object(None));
     let expected_val = args.get(2).copied().unwrap_or(Value::Object(None));
-    chm_reject_null_key(&key)?;
+    // WRITE path, so the explicit refusal, not the helpful-NPE one:
+    // `ConcurrentHashMap.remove(Object,Object)` opens with
+    // `if (key == null) throw new NullPointerException();` and then answers
+    // `false` for a null value rather than throwing. MEASURED:
+    // `remove(null,v)` and `remove(null,null)` are `<NO-MESSAGE>`,
+    // `remove(k,null)` is `OK -> false`.
+    if matches!(key, Value::Object(None)) {
+        return Err(bare_npe());
+    }
     // GC-safety: pin across hashCode()/equals() dispatch and the
     // GC-pausable segment-lock wait — see `native_chm_put`.
     let this_pin = ctx.pin_native_root(this);
@@ -51134,13 +51506,9 @@ fn native_chm_replace(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     };
     let key = args.get(1).copied().unwrap_or(Value::Object(None));
     let new_val = args.get(2).copied().unwrap_or(Value::Object(None));
-    // C24 (HIGH): JDK rejects null key/value.
-    if matches!(key, Value::Object(None)) || matches!(new_val, Value::Object(None)) {
-        return Err(RuntimeError::NullPointerException {
-            message: Some("ConcurrentHashMap.replace: null key or value".to_string()),
-        }
-        .into());
-    }
+    // C24 (HIGH): JDK rejects null key/value. MEASURED message-less on the
+    // oracle — see `chm_bare_npe_on_null`.
+    chm_bare_npe_on_null(&key, &new_val)?;
     // GC-safety: pin across hashCode() dispatch, the GC-pausable segment-lock
     // wait, and the GC-capable put (the returned `current` must be the
     // relocated address, not the pre-put one) — see `native_chm_put`.
@@ -51188,15 +51556,13 @@ fn native_chm_replace_kv(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     let key = args.get(1).copied().unwrap_or(Value::Object(None));
     let old_val = args.get(2).copied().unwrap_or(Value::Object(None));
     let new_val = args.get(3).copied().unwrap_or(Value::Object(None));
-    // C24 (HIGH): JDK rejects null key/old/new.
+    // C24 (HIGH): JDK rejects null key/old/new. MEASURED message-less on the
+    // oracle — see `chm_bare_npe_on_null`.
     if matches!(key, Value::Object(None))
         || matches!(old_val, Value::Object(None))
         || matches!(new_val, Value::Object(None))
     {
-        return Err(RuntimeError::NullPointerException {
-            message: Some("ConcurrentHashMap.replace(k,old,new): nulls not permitted".to_string()),
-        }
-        .into());
+        return Err(bare_npe());
     }
     // GC-safety: pin across hashCode()/equals() dispatch and the
     // GC-pausable segment-lock wait — see `native_chm_put`.
@@ -51244,6 +51610,11 @@ fn native_chm_for_each_parallel(ctx: &mut dyn NativeContext, args: &[Value]) -> 
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(None),
     };
+    // RULE F on argument **2**, not 1: this is
+    // `forEach(long parallelismThreshold, BiConsumer)`, whose first parameter
+    // is a `long`. Confirming which argument is the function before copying the
+    // guard is the point — the sibling `native_chm_for_each` checks arg 1.
+    reject_null_functional(args.get(2))?;
     let action = match args.get(2) {
         Some(Value::Object(Some(a))) => *a,
         _ => return Ok(None),
@@ -51454,11 +51825,13 @@ fn native_chm_key_set_view(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         _ => return Ok(Some(Value::Object(None))),
     };
     let mapped = args.get(1).copied().unwrap_or(Value::Object(None));
+    // MEASURED 2026-08-16: `keySet(null)` is `msg=<NO-MESSAGE>`. The JDK body
+    // opens `0: aload_1 / 1: ifnonnull 12 / 4: new NullPointerException /
+    // 8: invokespecial <init>()V / 11: athrow` — the no-arg constructor again.
+    // `"ConcurrentHashMap.keySet(null)"` was the tenth fabricated string in
+    // this family; see G1-1.
     if matches!(mapped, Value::Object(None)) {
-        return Err(RuntimeError::NullPointerException {
-            message: Some("ConcurrentHashMap.keySet(null)".to_string()),
-        }
-        .into());
+        return Err(bare_npe());
     }
     let view = make_key_set_view(ctx, this, mapped)?;
     Ok(Some(Value::Object(Some(view))))
@@ -52070,6 +52443,11 @@ fn native_ksv_for_each(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(None),
     };
+    // RULE F. MEASURED on `ConcurrentHashMap.keySet()`, empty or not. Also
+    // reached via `ksv_route` from `native_al_for_each` / `native_hs_for_each`,
+    // which already check — the duplicate is idempotent and keeps this body
+    // correct when it is entered directly by its own registration.
+    reject_null_functional(args.get(1))?;
     let action = match args.get(1) {
         Some(Value::Object(Some(a))) => *a,
         _ => return Ok(None),
@@ -52286,6 +52664,8 @@ fn native_ksv_remove_if(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Int(0))),
     };
+    // RULE F, empty receiver included. See `reject_null_functional`.
+    reject_null_functional(args.get(1))?;
     let pred = match args.get(1) {
         Some(Value::Object(Some(p))) => *p,
         _ => return Ok(Some(Value::Int(0))),
@@ -53277,8 +53657,10 @@ fn register_properties_natives(registry: &mut NativeMethodRegistry) {
     // `Hashtable` (and `Properties`, which overrides them again) declare their
     // own bucket-walking `remove(k,v)` / `replace(k,v)` / `replace(k,old,new)`.
     // Same gap, same fix — see `register_map_conditional_mutators`. The null
-    // rejection those overrides open with is honoured by
-    // `map_kv_reject_null_for_hashtable`.
+    // rejections those overrides open with are honoured by
+    // `map_remove_kv_null_contract` / `map_replace_kv_null_contract` /
+    // `map_replace3_null_contract`, which route `Hashtable` and `Properties`
+    // differently because the JDK does.
     register_map_conditional_mutators(registry, ht);
     register_map_conditional_mutators(registry, p);
     // Note: `keys()` / `elements()` are registered by
@@ -59816,12 +60198,24 @@ fn pbq_ensure_capacity(ctx: &mut dyn NativeContext, this: ObjectRef, needed: usi
     this
 }
 
+/// MEASURED on the oracle 2026-08-16, alongside its `java.util.PriorityQueue`
+/// twin:
+///
+/// ```text
+/// java.util.PriorityQueue    | offer(null) | java.lang.NullPointerException msg=<NO-MESSAGE>
+/// j.u.c.PriorityBlockingQueue| offer(null) | java.lang.NullPointerException msg=<NO-MESSAGE>
+/// ```
+///
+/// Both `offer` bodies are `if (e == null) throw new NullPointerException();`
+/// compiled to the no-arg constructor (`javap -p -c java.util.PriorityQueue`),
+/// so there is no text to carry. `"PriorityBlockingQueue does not permit null
+/// elements"` was a FABRICATION — the javadoc sentence, not the message — and
+/// `thrownDetail` prints a message when there is one, so it was itself the
+/// divergence. `ad_refuse_null`, the `ArrayDeque`/`PriorityQueue` sibling, had
+/// already got this right and says so in its own doc comment.
 fn pbq_reject_null_element(elem: Value) -> Result<(), MethodCallFailed> {
     if matches!(elem, Value::Object(None)) {
-        return Err(RuntimeError::NullPointerException {
-            message: Some("PriorityBlockingQueue does not permit null elements".to_string()),
-        }
-        .into());
+        return Err(bare_npe());
     }
     Ok(())
 }
@@ -66520,5 +66914,237 @@ mod tests {
                 ),
             }
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // RULE F — the null functional argument.
+    //
+    // G8 lane, 2026-08-16. The oracle rows these pin are in
+    // `docs/known-issues/jdk-only/G8-1-...md` §2 and were MEASURED on HotSpot
+    // 25.0.3+9-LTS. Nothing here has been observed on a CratonVM binary.
+    // -----------------------------------------------------------------------
+
+    /// True when `r` is the message-less NPE every one of these methods raises.
+    /// A message would be as wrong as no throw at all: `getMessage()` is `null`
+    /// on the oracle, printed distinctly from `""` in the probe on purpose.
+    fn is_bare_npe(r: &MethodCallResult) -> bool {
+        matches!(
+            r,
+            Err(MethodCallFailed::InternalError(
+                cratonvm_types::error::VmError::Runtime(
+                    cratonvm_types::error::RuntimeError::NullPointerException { message: None },
+                )
+            ))
+        )
+    }
+
+    /// The helper's own truth table, with no VM in the way.
+    ///
+    /// The middle row is the one that matters and the one a "just check for
+    /// null" rewrite loses: a MISSING argument is a malformed native call, not
+    /// a program-level NPE, and must keep the body's existing no-op.
+    #[test]
+    fn reject_null_functional_separates_a_missing_arg_from_an_explicit_null() {
+        assert!(
+            reject_null_functional(None).is_ok(),
+            "a MISSING argument is a dispatch defect, not a Java-visible NPE"
+        );
+        assert!(
+            reject_null_functional(Some(&Value::Int(0))).is_ok(),
+            "a non-reference argument is not this helper's business"
+        );
+        // Never dereferenced — the helper only inspects the discriminant. Same
+        // fabricated-address idiom the `dense_int_entries_tests` module uses.
+        let some_fn = Some(unsafe { ObjectRef::from_raw(0x1000 as *mut u8) });
+        assert!(
+            reject_null_functional(Some(&Value::Object(some_fn))).is_ok(),
+            "a real function object must pass"
+        );
+        let refused = reject_null_functional(Some(&Value::Object(None)));
+        assert!(
+            matches!(
+                refused,
+                Err(MethodCallFailed::InternalError(
+                    cratonvm_types::error::VmError::Runtime(
+                        cratonvm_types::error::RuntimeError::NullPointerException { message: None },
+                    )
+                ))
+            ),
+            "an explicitly passed null must be the MESSAGE-LESS NPE, got {refused:?}"
+        );
+    }
+
+    /// Every body on the axis, with an explicitly null function, must throw.
+    ///
+    /// This is the fabricated-success direction: before this lane each of these
+    /// returned `Ok` — the empty answer for its return type — so the caller was
+    /// told the operation had succeeded and nothing had happened. The argument
+    /// INDEX is carried per row rather than assumed, because it is not uniform:
+    /// `native_chm_for_each_parallel` takes `(long, BiConsumer)` so its
+    /// function is argument 2, and `native_tm_merge`'s is argument 3.
+    #[test]
+    fn every_null_function_body_refuses_an_explicit_null() {
+        use lbq_blocking_tests::MockCtx;
+        let mut ctx = MockCtx::new(1);
+        ctx.define_class(ClassId::new(0), "java/util/HashMap");
+        let this = ctx.alloc_object(ClassId::new(0), 8);
+        let recv = Value::Object(Some(this));
+        let nul = Value::Object(None);
+        let key = Value::Int(1);
+
+        type Body = fn(&mut dyn NativeContext, &[Value]) -> MethodCallResult;
+        let cases: Vec<(&str, Body, Vec<Value>)> = vec![
+            ("native_map_for_each", native_map_for_each, vec![recv, nul]),
+            (
+                "native_map_replace_all",
+                native_map_replace_all,
+                vec![recv, nul],
+            ),
+            (
+                "native_map_compute_if_absent",
+                native_map_compute_if_absent,
+                vec![recv, key, nul],
+            ),
+            (
+                "native_map_compute",
+                native_map_compute,
+                vec![recv, key, nul],
+            ),
+            (
+                "native_map_compute_if_present",
+                native_map_compute_if_present,
+                vec![recv, key, nul],
+            ),
+            (
+                "native_lhm_compute_if_absent",
+                native_lhm_compute_if_absent,
+                vec![recv, key, nul],
+            ),
+            ("native_lhm_for_each", native_lhm_for_each, vec![recv, nul]),
+            ("native_tm_for_each", native_tm_for_each, vec![recv, nul]),
+            (
+                "native_tm_compute_if_absent",
+                native_tm_compute_if_absent,
+                vec![recv, key, nul],
+            ),
+            (
+                "native_tm_merge",
+                native_tm_merge,
+                vec![recv, key, key, nul],
+            ),
+            ("native_al_for_each", native_al_for_each, vec![recv, nul]),
+            ("native_al_remove_if", native_al_remove_if, vec![recv, nul]),
+            (
+                "native_al_replace_all",
+                native_al_replace_all,
+                vec![recv, nul],
+            ),
+            ("native_ll_remove_if", native_ll_remove_if, vec![recv, nul]),
+            ("native_hs_for_each", native_hs_for_each, vec![recv, nul]),
+            ("native_ts_for_each", native_ts_for_each, vec![recv, nul]),
+            ("native_ad_for_each", native_ad_for_each, vec![recv, nul]),
+            ("native_ksv_for_each", native_ksv_for_each, vec![recv, nul]),
+            (
+                "native_ksv_remove_if",
+                native_ksv_remove_if,
+                vec![recv, nul],
+            ),
+            ("native_chm_for_each", native_chm_for_each, vec![recv, nul]),
+            (
+                "native_chm_replace_all",
+                native_chm_replace_all,
+                vec![recv, nul],
+            ),
+            (
+                "native_chm_for_each_parallel",
+                native_chm_for_each_parallel,
+                vec![recv, Value::Long(1), nul],
+            ),
+        ];
+
+        assert_eq!(
+            cases.len(),
+            22,
+            "the sweep is the point: a body added to the axis without a row here \
+             is a body that can silently go back to answering success"
+        );
+
+        for (name, body, args) in cases {
+            let r = body(&mut ctx, &args);
+            assert!(
+                is_bare_npe(&r),
+                "{name}: an explicitly null function must raise a MESSAGE-LESS \
+                 NullPointerException (MEASURED on all six map receivers and \
+                 every collection receiver, empty or not), got {r:?}"
+            );
+        }
+    }
+
+    /// The over-set direction, and the reason the helper takes `Option<&Value>`.
+    ///
+    /// A native invoked with the functional argument MISSING is a dispatch
+    /// defect inside this VM. Reporting it as a Java `NullPointerException`
+    /// would put a VM bug into an application's catch block wearing the costume
+    /// of a program error. Each of these calls is short by one argument and
+    /// must keep the body's pre-existing no-op.
+    #[test]
+    fn a_missing_functional_argument_is_not_reported_as_a_java_npe() {
+        use lbq_blocking_tests::MockCtx;
+        let mut ctx = MockCtx::new(1);
+        ctx.define_class(ClassId::new(0), "java/util/HashMap");
+        let this = ctx.alloc_object(ClassId::new(0), 8);
+        let recv = Value::Object(Some(this));
+
+        type Body = fn(&mut dyn NativeContext, &[Value]) -> MethodCallResult;
+        let cases: Vec<(&str, Body, Vec<Value>)> = vec![
+            ("native_map_for_each", native_map_for_each, vec![recv]),
+            ("native_map_replace_all", native_map_replace_all, vec![recv]),
+            ("native_al_remove_if", native_al_remove_if, vec![recv]),
+            ("native_al_replace_all", native_al_replace_all, vec![recv]),
+            ("native_ll_remove_if", native_ll_remove_if, vec![recv]),
+            ("native_ksv_remove_if", native_ksv_remove_if, vec![recv]),
+        ];
+
+        for (name, body, args) in cases {
+            let r = body(&mut ctx, &args);
+            assert!(
+                !is_bare_npe(&r),
+                "{name}: a MISSING argument is a malformed native call and must \
+                 not be reported to Java as an NPE, got {r:?}"
+            );
+        }
+    }
+
+    /// The trap this axis sets, pinned so a later sweep cannot walk into it.
+    ///
+    /// `sort` takes a `Comparator`, and a null `Comparator` is NOT a null
+    /// functional argument — it MEANS natural ordering. MEASURED returning
+    /// `[a, b]` on `ArrayList`, `LinkedList`, `Vector`, `Stack`,
+    /// `CopyOnWriteArrayList`, `Arrays.asList`, `subList`,
+    /// `Collections.sort(l, null)` and `Arrays.sort(a, null)`. A blanket
+    /// "refuse every null function argument" rule — exactly the generalisation
+    /// HANDOFF-20260814 §5 warns against — would turn nine working paths into
+    /// throws.
+    #[test]
+    fn a_null_comparator_means_natural_ordering_and_is_never_refused() {
+        use lbq_blocking_tests::MockCtx;
+        let mut ctx = MockCtx::new(1);
+        ctx.define_class(ClassId::new(0), "java/util/ArrayList");
+        let this = ctx.alloc_object(ClassId::new(0), 8);
+        let args = [Value::Object(Some(this)), Value::Object(None)];
+
+        let r = native_al_sort_comparator(&mut ctx, &args);
+        assert!(
+            !is_bare_npe(&r),
+            "List.sort(null) sorts by natural ordering on the oracle; refusing \
+             it would be a fabricated failure, got {r:?}"
+        );
+
+        let r = native_collections_sort_comparator(&mut ctx, &args);
+        assert!(
+            !is_bare_npe(&r),
+            "Collections.sort(l, null) sorts by natural ordering on the oracle, \
+             got {r:?}"
+        );
     }
 }

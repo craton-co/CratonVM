@@ -7735,6 +7735,18 @@ fn format_impl(
                         //   `%x`   → next ordinary index (advances the counter)
                         // Only ordinary conversions advance `arg_idx`, matching
                         // java.util.Formatter (explicit/relative specs do not).
+                        //
+                        // A `'<'` with NO previous conversion is a REFUSAL, not
+                        // a fallback to argument 0. `Formatter.format`'s loop
+                        // is `case -1 -> { if (last < 0 || …) throw new
+                        // MissingFormatArgumentException(fs.toString()); … }`
+                        // and `last` starts at -1. Measured on HotSpot
+                        // 25.0.3+9: `String.format("%<s", "a")` is
+                        // `MissingFormatArgumentException: Format specifier
+                        // '%<s'`, and so is `String.format("%<tY", 0L)`. This
+                        // answered args[0] instead, silently.
+                        let relative_without_previous =
+                            flags.contains('<') && last_used_index.is_none();
                         let use_idx = if flags.contains('<') {
                             last_used_index.unwrap_or(0)
                         } else if let Some(ei) = explicit_index {
@@ -7754,6 +7766,23 @@ fn format_impl(
                             fmt_check_spec(explicit_index, &flags, width, precision, spec)
                         {
                             return Err(fmt_raise(ctx, &fault));
+                        }
+                        // ...and the missing PREVIOUS argument is raised here,
+                        // with the same standing as a missing NEXT one: both
+                        // are `format`'s own range test, which runs after every
+                        // `FormatSpecifier` constructor has passed its checks.
+                        // `%<0d` is therefore the flag mismatch, not this.
+                        if relative_without_previous {
+                            return Err(fmt_raise(
+                                ctx,
+                                &FmtFault::MissingArgument(fmt_spec_text(
+                                    explicit_index,
+                                    &flags,
+                                    width,
+                                    precision,
+                                    spec,
+                                )),
+                            ));
                         }
                         // "If there are fewer arguments than format specifiers,
                         // the argument index is out of range ... a
@@ -7894,6 +7923,15 @@ fn format_impl(
                                 ctx,
                                 &FmtFault::MissingWidth(dt_spec_text()),
                             ));
+                        }
+                        // `'<'` with no previous conversion — the same refusal
+                        // the general arm makes, quoting this arm's own
+                        // specifier text. Measured on HotSpot 25.0.3+9:
+                        // `String.format("%<tY", 0L)` is
+                        // `MissingFormatArgumentException: Format specifier
+                        // '%<tY'`.
+                        if flags.contains('<') && last_used_index.is_none() {
+                            return Err(fmt_raise(ctx, &FmtFault::MissingArgument(dt_spec_text())));
                         }
                         let use_idx = if flags.contains('<') {
                             last_used_index.unwrap_or(0)
@@ -8237,28 +8275,46 @@ impl FmtZone {
 /// 0 for a method the class does not have), so `%tH` of an `Instant` printed
 /// a plausible UTC hour where HotSpot refuses.
 ///
-/// The five flags are the field GROUPS the JDK's switch actually partitions
+/// The flags are the field GROUPS the JDK's switch actually partitions
 /// on, not a per-type table — a table would have to be re-derived for a
-/// seventh source type, and this does not. Measured group membership:
+/// further source type, and this does not. Measured group membership (G2-1
+/// swept 11 sources × all 31 fields on HotSpot 25.0.3+9, 2026-08-16):
 ///
-/// | source | date | time | sub_second | instant | zone |
-/// |---|---|---|---|---|---|
-/// | `long` / `Long` / `Date` / `Calendar` | ✓ | ✓ | ✓ | ✓ | ✓ |
-/// | `Instant` | | | ✓ | ✓ | |
-/// | `LocalDate` | ✓ | | | | |
-/// | `LocalTime` | | ✓ | ✓ | | |
-/// | `LocalDateTime` | ✓ | ✓ | ✓ | | |
-/// | `ZonedDateTime` / `OffsetDateTime` | ✓ | ✓ | ✓ | ✓ | ✓ |
+/// | source | year | month | day | time | sub_second | instant | zone |
+/// |---|---|---|---|---|---|---|---|
+/// | `long` / `Long` / `Date` / `Calendar` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+/// | `Instant` | | | | | ✓ | ✓ | |
+/// | `LocalDate` | ✓ | ✓ | ✓ | | | | |
+/// | `LocalTime` | | | | ✓ | ✓ | | |
+/// | `LocalDateTime` | ✓ | ✓ | ✓ | ✓ | ✓ | | |
+/// | `ZonedDateTime` / `OffsetDateTime` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+/// | `OffsetTime` | | | | ✓ | ✓ | | ✓ |
+/// | `Year` | ✓ | | | | | | |
+/// | `YearMonth` | ✓ | ✓ | | | | | |
+/// | `MonthDay` | | ✓ | ✓ | | | | |
+/// | `Month` | | ✓ | | | | | |
 ///
 /// The epoch-shaped sources are `ALL` because they do not take the
 /// `TemporalAccessor` printer at all — `printDateTime` builds a `Calendar`,
 /// whose printer has an arm for every field and refuses none of them.
+///
+/// **Why `date` is three flags and not one.** It was one until G2-1 swept the
+/// partial `java.time` types. `Year` answers `%tY %ty %tC` and refuses `%tm`;
+/// `YearMonth` answers those and `%tm %tB %tb %th` and refuses `%td`;
+/// `MonthDay` answers the month and day fields and refuses `%tY`. A single
+/// `date` flag cannot express any of the three, and — because `%tD`, `%tF` and
+/// `%tc` each report the FIRST missing inner field — it cannot express their
+/// refusal CHARACTERS either (measured: `%tF` of a `Year` is `m`, of a
+/// `YearMonth` is `d`, of a `MonthDay` is `F`).
 #[derive(Clone, Copy)]
 struct FmtSupport {
-    /// `YEAR_OF_ERA`, `MONTH_OF_YEAR`, `DAY_OF_MONTH`, `DAY_OF_WEEK`,
-    /// `DAY_OF_YEAR` — the `%tY %ty %tC %tm %td %te %tj %ta %tA %tb %tB %th`
-    /// group, plus `%tD` and `%tF`.
-    date: bool,
+    /// `YEAR_OF_ERA` — `%tY %ty %tC`, and the year slots of `%tD`/`%tF`/`%tc`.
+    year: bool,
+    /// `MONTH_OF_YEAR` — `%tm %tB %tb %th`, and the month slots of the three
+    /// composites.
+    month: bool,
+    /// `DAY_OF_MONTH` — `%td %te`, and the day slots of the three composites.
+    day: bool,
     /// `HOUR_OF_DAY`, `CLOCK_HOUR_OF_AMPM`, `MINUTE_OF_HOUR`,
     /// `SECOND_OF_MINUTE`, `AMPM_OF_DAY` — `%tH %tk %tI %tl %tM %tS %tp`, plus
     /// `%tR %tT %tr`.
@@ -8274,8 +8330,9 @@ struct FmtSupport {
     /// starting to refuse; see [`FmtZone::known`].
     zone: bool,
     /// **Which of `printDateTime`'s two printers this source takes**, not a
-    /// support question — and it cannot be derived from the five above, because
-    /// a `ZonedDateTime` supports every group and still takes the OTHER printer.
+    /// support question — and it cannot be derived from the flags above,
+    /// because a `ZonedDateTime` supports every group and still takes the
+    /// OTHER printer.
     ///
     /// `java.util.Formatter.printDateTime` dispatches
     /// `long`/`Long`/`Date`/`Calendar` to `print(Formatter, Calendar, char,
@@ -8312,13 +8369,36 @@ impl FmtSupport {
     /// The epoch-shaped sources, which take the `Calendar` printer and refuse
     /// nothing.
     const ALL: FmtSupport = FmtSupport {
-        date: true,
+        year: true,
+        month: true,
+        day: true,
         time: true,
         sub_second: true,
         instant: true,
         zone: true,
         calendar_printer: true,
     };
+
+    /// `DAY_OF_WEEK` (`%tA %ta`) and `DAY_OF_YEAR` (`%tj`) — both DERIVED,
+    /// because neither can be answered without a complete year/month/day and
+    /// every source that has all three answers both.
+    ///
+    /// Measured over the 11 sources G2-1 swept: `LocalDate`, `LocalDateTime`,
+    /// `ZonedDateTime`, `OffsetDateTime` and the four `ChronoLocalDate`s have
+    /// y+m+d and answer `%tA %ta %tj`; `Instant`, `LocalTime`, `OffsetTime`,
+    /// `Year`, `YearMonth`, `MonthDay` and `Month` each lack at least one of
+    /// the three and refuse all three fields.
+    ///
+    /// **One measured source contradicts the derivation and is deliberately
+    /// not decoded**: `java.time.DayOfWeek` answers `%tA`/`%ta` while having
+    /// no year, month or day at all (and its `%tc` reports `b`, not the `a`
+    /// this derivation would give). `extract_temporal_fields` refuses it, so
+    /// the shape never reaches here. Decoding it needs a day-of-week that does
+    /// not come from a date, which is a plumbing change through
+    /// `format_temporal_field`; see G2-1's residuals.
+    const fn full_date(self) -> bool {
+        self.year && self.month && self.day
+    }
 }
 
 /// The character `IllegalFormatConversionException` reports for `field` on a
@@ -8335,11 +8415,18 @@ impl FmtSupport {
 /// | `LocalDate` | `H` | `I` | ok | ok | `H` |
 /// | `LocalTime` | ok | ok | `m` | `F` | `a` |
 /// | `LocalDateTime` | ok | ok | ok | ok | `Z` |
+/// | `OffsetTime` | ok | ok | `m` | `F` | `a` |
+/// | `Year` | `H` | `I` | `m` | `m` | `a` |
+/// | `YearMonth` | `H` | `I` | `d` | `d` | `a` |
+/// | `MonthDay` | `H` | `I` | `y` | `F` | `a` |
+/// | `Month` | `H` | `I` | `d` | `F` | `a` |
 ///
-/// `%tF` is the one composite that reports its OWN character, because
-/// `ISO_STANDARD_DATE` reads the year with `t.get(yearField)` inline instead
-/// of delegating — read in `Formatter.java`, then confirmed by the `Instant`
-/// and `LocalTime` rows above.
+/// The last four rows are G2-1's, measured 2026-08-16, and they are what
+/// forces the three composites to walk their inner fields in ORDER rather than
+/// consult a single `date` flag: `%tD` is `mm/dd/yy` and reports `m`, `d` or
+/// `y`; `%tF` is `YYYY-mm-dd` and reports its OWN `F` only when the YEAR is
+/// the missing one (`ISO_STANDARD_DATE` reads the year with `t.get(yearField)`
+/// inline instead of delegating), then `m`, then `d`.
 fn fmt_temporal_fault_char(field: char, s: FmtSupport) -> Option<char> {
     fn need(ok: bool, c: char) -> Option<char> {
         if ok {
@@ -8358,22 +8445,55 @@ fn fmt_temporal_fault_char(field: char, s: FmtSupport) -> Option<char> {
         // separately observable.
         'Q' => need(s.instant && s.sub_second, field),
         'z' | 'Z' => need(s.zone, field),
-        'B' | 'b' | 'h' | 'A' | 'a' | 'C' | 'Y' | 'y' | 'j' | 'm' | 'd' | 'e' => {
-            need(s.date, field)
-        }
+        'B' | 'b' | 'h' | 'm' => need(s.month, field),
+        'd' | 'e' => need(s.day, field),
+        'C' | 'Y' | 'y' => need(s.year, field),
+        // DAY_OF_WEEK and DAY_OF_YEAR — see [`FmtSupport::full_date`] for why
+        // both are the same derived predicate and which source contradicts it.
+        'A' | 'a' | 'j' => need(s.full_date(), field),
         'R' | 'T' => need(s.time, 'H'),
         'r' => need(s.time, 'I'),
-        'D' => need(s.date, 'm'),
-        'F' => need(s.date, field),
-        // `a`(date) `b`(date) `d`(date) `T`(->`H`, time) `Z`(zone) `Y`(date),
-        // in that order, so the FIRST unsupported group names the character.
+        // `mm/dd/yy`, in that order.
+        'D' => {
+            if !s.month {
+                Some('m')
+            } else if !s.day {
+                Some('d')
+            } else if !s.year {
+                Some('y')
+            } else {
+                None
+            }
+        }
+        // `YYYY-mm-dd`, in that order, and the year slot reports the OUTER
+        // character.
+        'F' => {
+            if !s.year {
+                Some(field)
+            } else if !s.month {
+                Some('m')
+            } else if !s.day {
+                Some('d')
+            } else {
+                None
+            }
+        }
+        // `a`(DAY_OF_WEEK) `b`(month) `d`(day) `T`(->`H`, time) `Z`(zone)
+        // `Y`(year), in that order, so the FIRST unsupported group names the
+        // character.
         'c' => {
-            if !s.date {
+            if !s.full_date() {
                 Some('a')
+            } else if !s.month {
+                Some('b')
+            } else if !s.day {
+                Some('d')
             } else if !s.time {
                 Some('H')
             } else if !s.zone {
                 Some('Z')
+            } else if !s.year {
+                Some('Y')
             } else {
                 None
             }
@@ -8876,7 +8996,9 @@ fn extract_temporal_fields(
                     (y, m, d, h, mi, s, nano),
                     FmtZone::NONE,
                     FmtSupport {
-                        date: false,
+                        year: false,
+                        month: false,
+                        day: false,
                         time: false,
                         sub_second: true,
                         instant: true,
@@ -8892,7 +9014,9 @@ fn extract_temporal_fields(
                     (year, month, day, 0, 0, 0, 0),
                     FmtZone::NONE,
                     FmtSupport {
-                        date: true,
+                        year: true,
+                        month: true,
+                        day: true,
                         time: false,
                         sub_second: false,
                         instant: false,
@@ -8909,9 +9033,134 @@ fn extract_temporal_fields(
                     (1970, 1, 1, hour, minute, second, nano),
                     FmtZone::NONE,
                     FmtSupport {
-                        date: false,
+                        year: false,
+                        month: false,
+                        day: false,
                         time: true,
                         sub_second: true,
+                        instant: false,
+                        zone: false,
+                        calendar_printer: false,
+                    },
+                ))
+            } else if is_a(ctx, "java/time/OffsetTime") {
+                // G2-1. `OffsetTime` was the one `java.time` type with a
+                // printer on HotSpot that this decoder had no arm for, so all
+                // 31 fields fell to the `else` below and refused — including
+                // the FOURTEEN the JDK answers. Measured on HotSpot 25.0.3+9
+                // for `2025-08-16T05:00:45.123+05:30`:
+                // `%tH`=`05` `%tI`=`05` `%tk`=`5` `%tl`=`5` `%tM`=`00`
+                // `%tS`=`45` `%tL`=`123` `%tN`=`123000000` `%tp`=`am`
+                // `%tz`=`+0530` `%tZ`=`+05:30` `%tR`=`05:00` `%tT`=`05:00:45`
+                // `%tr`=`05:00:45 AM`.
+                //
+                // It is `LocalTime` plus a zone and NOT an instant: measured,
+                // `%ts` is `s != java.time.OffsetTime` and `%tQ` is
+                // `Q != java.time.OffsetTime`, because `INSTANT_SECONDS` needs
+                // a date the type does not carry. `getOffset()` is a
+                // `ZoneOffset`, which is what [`fmt_temporal_zone`] and
+                // [`fmt_temporal_zone_name`]'s non-`ZonedDateTime` arm already
+                // read — the latter's `getId()` is where `+05:30` comes from.
+                let hour = invoke_i32(ctx, obj, "getHour");
+                let minute = invoke_i32(ctx, obj, "getMinute");
+                let second = invoke_i32(ctx, obj, "getSecond");
+                let nano = invoke_i32(ctx, obj, "getNano");
+                let zone = fmt_temporal_zone(ctx, obj);
+                Ok((
+                    (1970, 1, 1, hour, minute, second, nano),
+                    zone,
+                    FmtSupport {
+                        year: false,
+                        month: false,
+                        day: false,
+                        time: true,
+                        sub_second: true,
+                        instant: false,
+                        zone: true,
+                        calendar_printer: false,
+                    },
+                ))
+            } else if is_a(ctx, "java/time/YearMonth") {
+                // G2-1, and the three arms below it. These are the PARTIAL
+                // `java.time` types: each supports a proper subset of the date
+                // group, which is why [`FmtSupport`] carries `year`/`month`/
+                // `day` separately instead of one `date` flag. Measured on
+                // HotSpot 25.0.3+9 (`Locale.US`):
+                //
+                // | source | answers | refuses |
+                // |---|---|---|
+                // | `YearMonth.of(2020,2)` | `%tY`=`2020` `%ty`=`20` `%tC`=`20` `%tm`=`02` `%tB`=`February` `%tb`=`%th`=`Feb` | 24 |
+                // | `MonthDay.of(1,2)` | `%tm`=`01` `%td`=`02` `%te`=`2` `%tB`=`January` `%tb`=`%th`=`Jan` | 25 |
+                // | `Year.of(2020)` | `%tY`=`2020` `%ty`=`20` `%tC`=`20` | 28 |
+                // | `Month.JANUARY` | `%tm`=`01` `%tB`=`January` `%tb`=`%th`=`Jan` | 27 |
+                //
+                // The unread slots are left at the epoch defaults; every field
+                // that would read one is refused by
+                // [`fmt_temporal_fault_char`], exactly as for `Instant`.
+                let year = invoke_i32(ctx, obj, "getYear") as i64;
+                let month = invoke_i32(ctx, obj, "getMonthValue");
+                Ok((
+                    (year, month, 1, 0, 0, 0, 0),
+                    FmtZone::NONE,
+                    FmtSupport {
+                        year: true,
+                        month: true,
+                        day: false,
+                        time: false,
+                        sub_second: false,
+                        instant: false,
+                        zone: false,
+                        calendar_printer: false,
+                    },
+                ))
+            } else if is_a(ctx, "java/time/MonthDay") {
+                let month = invoke_i32(ctx, obj, "getMonthValue");
+                let day = invoke_i32(ctx, obj, "getDayOfMonth");
+                Ok((
+                    (1970, month, day, 0, 0, 0, 0),
+                    FmtZone::NONE,
+                    FmtSupport {
+                        year: false,
+                        month: true,
+                        day: true,
+                        time: false,
+                        sub_second: false,
+                        instant: false,
+                        zone: false,
+                        calendar_printer: false,
+                    },
+                ))
+            } else if is_a(ctx, "java/time/Year") {
+                // `Year.getValue()`, not `getYear()` — the type has no
+                // `getYear`.
+                let year = invoke_i32(ctx, obj, "getValue") as i64;
+                Ok((
+                    (year, 1, 1, 0, 0, 0, 0),
+                    FmtZone::NONE,
+                    FmtSupport {
+                        year: true,
+                        month: false,
+                        day: false,
+                        time: false,
+                        sub_second: false,
+                        instant: false,
+                        zone: false,
+                        calendar_printer: false,
+                    },
+                ))
+            } else if is_a(ctx, "java/time/Month") {
+                // `Month` is an enum and its `getValue()` is 1..=12, which is
+                // already this decoder's month convention.
+                let month = invoke_i32(ctx, obj, "getValue");
+                Ok((
+                    (1970, month, 1, 0, 0, 0, 0),
+                    FmtZone::NONE,
+                    FmtSupport {
+                        year: false,
+                        month: true,
+                        day: false,
+                        time: false,
+                        sub_second: false,
                         instant: false,
                         zone: false,
                         calendar_printer: false,
@@ -8947,7 +9196,9 @@ fn extract_temporal_fields(
                     (year, month, day, hour, minute, second, nano),
                     zone,
                     FmtSupport {
-                        date: true,
+                        year: true,
+                        month: true,
+                        day: true,
                         time: true,
                         sub_second: true,
                         instant: zoned,
@@ -10649,7 +10900,31 @@ pub(crate) fn format_arg(
                     _ => true,
                 };
                 if !applicable {
-                    return Err(fmt_raise(ctx, &FmtFault::WrongType(spec, class_id)));
+                    // The conversion character the exception carries is the
+                    // LOWER-case one. `FormatSpecifier.conversion(char)` folds
+                    // every upper-case conversion down —
+                    // `if (Character.isUpperCase(conv)) { f.add(Flags.UPPERCASE);
+                    // this.c = Character.toLowerCase(conv); }` — and `c` is
+                    // what `failConversion` hands
+                    // `IllegalFormatConversionException`. `format_arg_full`
+                    // remaps only `S`/`B`/`C`/`H` (the four whose RENDERING
+                    // changes), so `X`/`E`/`G`/`A` arrive here as written and
+                    // this is the one place the fold has to be repeated.
+                    // Measured on HotSpot 25.0.3+9, `Boolean.TRUE` as the
+                    // argument, message and `getConversion()` both:
+                    //
+                    //   %X -> "x != java.lang.Boolean", conv='x'
+                    //   %E -> "e != java.lang.Boolean", conv='e'
+                    //   %G -> "g != java.lang.Boolean", conv='g'
+                    //   %A -> "a != java.lang.Boolean", conv='a'
+                    //
+                    // `%tY` is NOT folded — `printDateTime` reports the FIELD
+                    // character as typed ("Y != java.lang.String", measured) —
+                    // which is why this is done here and not in `fmt_raise`.
+                    return Err(fmt_raise(
+                        ctx,
+                        &FmtFault::WrongType(spec.to_ascii_lowercase(), class_id),
+                    ));
                 }
                 // A BigDecimal at its DEFAULT precision still has to come from
                 // its own digits — `%f` of `new BigDecimal("2.3")` is
@@ -13955,8 +14230,10 @@ mod f22_utf16_formatter_tests {
 
     /// Which `java.time` sources refuse which `%t` fields — the full measured
     /// matrix from HotSpot 25 (`String.format(Locale.ROOT, "%t"+f, src)` for
-    /// each of the 31 fields against each of the six sources, under
-    /// `-Duser.timezone=Asia/Kolkata`).
+    /// each of the 31 fields against each source, under
+    /// `-Duser.timezone=Asia/Kolkata`). The six original sources are F28-1's;
+    /// `OffsetTime`, `YearMonth`, `MonthDay`, `Year` and `Month` are G2-1's,
+    /// measured 2026-08-16.
     ///
     /// This is the check the lane exists for: every one of these used to be
     /// ANSWERED here, from a fabricated 0, because `invoke_i32` returns 0 for
@@ -13975,7 +14252,9 @@ mod f22_utf16_formatter_tests {
     #[test]
     fn temporal_support_matrix_matches_hotspot() {
         const INSTANT: FmtSupport = FmtSupport {
-            date: false,
+            year: false,
+            month: false,
+            day: false,
             time: false,
             sub_second: true,
             instant: true,
@@ -13983,7 +14262,9 @@ mod f22_utf16_formatter_tests {
             calendar_printer: false,
         };
         const LOCAL_DATE: FmtSupport = FmtSupport {
-            date: true,
+            year: true,
+            month: true,
+            day: true,
             time: false,
             sub_second: false,
             instant: false,
@@ -13991,7 +14272,9 @@ mod f22_utf16_formatter_tests {
             calendar_printer: false,
         };
         const LOCAL_TIME: FmtSupport = FmtSupport {
-            date: false,
+            year: false,
+            month: false,
+            day: false,
             time: true,
             sub_second: true,
             instant: false,
@@ -13999,7 +14282,9 @@ mod f22_utf16_formatter_tests {
             calendar_printer: false,
         };
         const LOCAL_DATE_TIME: FmtSupport = FmtSupport {
-            date: true,
+            year: true,
+            month: true,
+            day: true,
             time: true,
             sub_second: true,
             instant: false,
@@ -14007,29 +14292,86 @@ mod f22_utf16_formatter_tests {
             calendar_printer: false,
         };
         const ZONED: FmtSupport = FmtSupport {
-            date: true,
+            year: true,
+            month: true,
+            day: true,
             time: true,
             sub_second: true,
             instant: true,
             zone: true,
             calendar_printer: false,
         };
+        // G2-1's four partial `java.time` sources, plus `OffsetTime`.
+        const OFFSET_TIME: FmtSupport = FmtSupport {
+            year: false,
+            month: false,
+            day: false,
+            time: true,
+            sub_second: true,
+            instant: false,
+            zone: true,
+            calendar_printer: false,
+        };
+        const YEAR_MONTH: FmtSupport = FmtSupport {
+            year: true,
+            month: true,
+            day: false,
+            time: false,
+            sub_second: false,
+            instant: false,
+            zone: false,
+            calendar_printer: false,
+        };
+        const MONTH_DAY: FmtSupport = FmtSupport {
+            year: false,
+            month: true,
+            day: true,
+            time: false,
+            sub_second: false,
+            instant: false,
+            zone: false,
+            calendar_printer: false,
+        };
+        const YEAR_ONLY: FmtSupport = FmtSupport {
+            year: true,
+            month: false,
+            day: false,
+            time: false,
+            sub_second: false,
+            instant: false,
+            zone: false,
+            calendar_printer: false,
+        };
+        const MONTH_ONLY: FmtSupport = FmtSupport {
+            year: false,
+            month: true,
+            day: false,
+            time: false,
+            sub_second: false,
+            instant: false,
+            zone: false,
+            calendar_printer: false,
+        };
 
-        // `calendar_printer` is NOT derivable from the five support flags:
+        // `calendar_printer` is NOT derivable from the support flags:
         // `ZONED` sets every one of them and still takes the OTHER printer.
         // That is the whole reason it is a stored field, so assert it.
         assert!(FmtSupport::ALL.calendar_printer);
         assert!(!ZONED.calendar_printer);
         assert_eq!(
             (
-                ZONED.date,
+                ZONED.year,
+                ZONED.month,
+                ZONED.day,
                 ZONED.time,
                 ZONED.sub_second,
                 ZONED.instant,
                 ZONED.zone
             ),
             (
-                FmtSupport::ALL.date,
+                FmtSupport::ALL.year,
+                FmtSupport::ALL.month,
+                FmtSupport::ALL.day,
                 FmtSupport::ALL.time,
                 FmtSupport::ALL.sub_second,
                 FmtSupport::ALL.instant,
@@ -14038,6 +14380,48 @@ mod f22_utf16_formatter_tests {
             "a ZonedDateTime supports exactly what a Calendar does; only the \
              PRINTER differs, so `calendar_printer` cannot be computed"
         );
+
+        // G2-1, measured 2026-08-16 on HotSpot 25.0.3+9. Each row is the
+        // source's complete ANSWERED set out of the 31 fields; everything not
+        // listed refuses, with the character given below it. Kills a
+        // "one `date` flag" implementation at every one of the five sources.
+        for (name, sup, answers) in [
+            ("OffsetTime", OFFSET_TIME, "HIklMSLNpzZRTr"),
+            ("YearMonth", YEAR_MONTH, "CYymBbh"),
+            ("MonthDay", MONTH_DAY, "mdeBbh"),
+            ("Year", YEAR_ONLY, "CYy"),
+            ("Month", MONTH_ONLY, "mBbh"),
+        ] {
+            for f in FMT_DATETIME_FIELDS.chars() {
+                let got = fmt_temporal_fault_char(f, sup);
+                if answers.contains(f) {
+                    assert_eq!(got, None, "%t{f} must be ANSWERED on {name}");
+                } else {
+                    assert!(got.is_some(), "%t{f} must be REFUSED on {name}");
+                }
+            }
+        }
+        // The composites' refusal characters, which a per-type table cannot
+        // produce and a single `date` flag cannot distinguish.
+        for (name, sup, d, ff, c) in [
+            ("OffsetTime", OFFSET_TIME, 'm', 'F', 'a'),
+            ("YearMonth", YEAR_MONTH, 'd', 'd', 'a'),
+            ("MonthDay", MONTH_DAY, 'y', 'F', 'a'),
+            ("Year", YEAR_ONLY, 'm', 'm', 'a'),
+            ("Month", MONTH_ONLY, 'd', 'F', 'a'),
+        ] {
+            assert_eq!(fmt_temporal_fault_char('D', sup), Some(d), "%tD on {name}");
+            assert_eq!(fmt_temporal_fault_char('F', sup), Some(ff), "%tF on {name}");
+            assert_eq!(fmt_temporal_fault_char('c', sup), Some(c), "%tc on {name}");
+        }
+        // `%tA`/`%ta`/`%tj` need a COMPLETE date, which is the derivation in
+        // `FmtSupport::full_date`.
+        for f in "Aaj".chars() {
+            assert_eq!(fmt_temporal_fault_char(f, LOCAL_DATE), None);
+            for sup in [YEAR_MONTH, MONTH_DAY, YEAR_ONLY, MONTH_ONLY, OFFSET_TIME] {
+                assert_eq!(fmt_temporal_fault_char(f, sup), Some(f));
+            }
+        }
 
         // An epoch-shaped argument takes the `Calendar` printer and refuses
         // NOTHING — all 31 fields.

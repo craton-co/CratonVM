@@ -242,22 +242,98 @@ fn https_ensure_exchanged(ctx: &mut dyn NativeContext, this: ObjectRef) {
     let _ = ensure_connected(ctx, this);
 }
 
-/// The peer chain recorded for `this`, or an `SSLPeerUnverifiedException` when
-/// there is none — the JSSE contract `HttpsURLConnection.getServerCertificates`
-/// documents, and the one callers actually catch.
+/// `IllegalStateException: connection not yet open` — HotSpot's answer for a
+/// session accessor called on a connection that has never handshaked.
+///
+/// **G7 — this is a DIFFERENT refusal from `SSLPeerUnverifiedException`, and
+/// the two were conflated here.** MEASURED, HotSpot 25.0.3+9-LTS,
+/// `scratchpad/g7/TlsProbe.java`, against a real loopback HTTPS server:
+///
+/// ```text
+///   before connect()   getCipherSuite         -> IllegalStateException: connection not yet open
+///                      getServerCertificates  -> IllegalStateException: connection not yet open
+///                      getLocalCertificates   -> IllegalStateException: connection not yet open
+///                      getPeerPrincipal       -> IllegalStateException: connection not yet open
+///                      getLocalPrincipal      -> IllegalStateException: connection not yet open
+///                      getSSLSession          -> IllegalStateException: connection not yet open
+///   after  connect()   real values; getSSLSession isPresent = true
+///   after  disconnect() IllegalStateException: connection not yet open   (again)
+/// ```
+///
+/// All six, one message, and the post-`disconnect()` row shows the message is
+/// about the state and not about the call order. `SSLPeerUnverifiedException`
+/// is the answer to a DIFFERENT question — the connection is open and the peer
+/// did not authenticate — and it is the one `getServerCertificates` and
+/// `getPeerPrincipal` declare in their throws clause.
+///
+/// SOURCE-VERIFIED, `javap -p javax.net.ssl.HttpsURLConnection` on the oracle:
+///
+/// ```text
+///   public abstract java.lang.String getCipherSuite();
+///   public abstract java.security.cert.Certificate[] getLocalCertificates();
+///   public abstract java.security.cert.Certificate[] getServerCertificates()
+///           throws javax.net.ssl.SSLPeerUnverifiedException;
+///   public java.security.Principal getPeerPrincipal()
+///           throws javax.net.ssl.SSLPeerUnverifiedException;
+///   public java.security.Principal getLocalPrincipal();
+/// ```
+///
+/// So `getCipherSuite` and the two "local" accessors have NO checked exception
+/// in their signature at all: raising `SSLPeerUnverifiedException` (an
+/// `IOException` subclass) out of them delivered an undeclared checked
+/// exception through a `throws`-free method, which no `catch` written against
+/// this API can name.
+fn https_not_yet_open(ctx: &mut dyn NativeContext) -> MethodCallFailed {
+    crate::phases_early::throw_jca_exc(
+        ctx,
+        "java/lang/IllegalStateException",
+        "connection not yet open",
+    )
+}
+
+/// Has a handshake been recorded against `this` at all?
+///
+/// The discriminator between the two refusals above: no entry means the
+/// exchange never completed (`connection not yet open`); an entry with an empty
+/// chain means it did and the peer presented nothing
+/// (`peer not authenticated`).
+fn https_has_session(ctx: &mut dyn NativeContext, this: ObjectRef) -> bool {
+    https_ensure_exchanged(ctx, this);
+    let key = ctx.identity_hash_code(this) as u32 as u64;
+    https_peer_info().lock().unwrap().contains_key(&key)
+}
+
+/// The peer chain recorded for `this`, or the measured refusal for the state
+/// it is in: `IllegalStateException` when no handshake was ever recorded,
+/// `SSLPeerUnverifiedException` when one was and it carried no chain.
 fn https_peer_chain_or_throw(
     ctx: &mut dyn NativeContext,
     this: ObjectRef,
 ) -> Result<Vec<Vec<u8>>, MethodCallFailed> {
     https_ensure_exchanged(ctx, this);
     let key = ctx.identity_hash_code(this) as u32 as u64;
-    match https_peer_info().lock().unwrap().get(&key) {
-        Some(info) if !info.chain_der.is_empty() => Ok(info.chain_der.clone()),
-        _ => Err(crate::phases_early::throw_jca_exc(
+    let found = https_peer_info()
+        .lock()
+        .unwrap()
+        .get(&key)
+        .map(|info| info.chain_der.clone());
+    match found {
+        Some(chain) if !chain.is_empty() => Ok(chain),
+        // An entry exists, so the handshake happened; it just produced no
+        // chain. That is the state `SSLPeerUnverifiedException` names, and it
+        // is the exception both of this helper's callers declare.
+        Some(_) => Err(crate::phases_early::throw_jca_exc(
             ctx,
             "javax/net/ssl/SSLPeerUnverifiedException",
             "peer not authenticated",
         )),
+        // RESIDUAL, stated because it makes this arm reachable more often than
+        // it should be: `record_https_peer_info` early-returns when the chain
+        // is empty, so an anonymous-suite handshake leaves NO entry and lands
+        // here rather than one line above. Fixing that means recording the
+        // entry unconditionally, which is `record_https_peer_info`'s call
+        // contract and is left alone here — see G7-1 §5.
+        None => Err(https_not_yet_open(ctx)),
     }
 }
 
@@ -279,6 +355,52 @@ fn https_peer_chain_or_throw(
 /// needed: an app that reads the chain almost always reads the cipher suite
 /// beside it, and leaving the siblings abstract just moves the same
 /// `AbstractMethodError` one line down.
+///
+/// ## G7 — THIS registrar wins, and the other one's comment says it cannot
+///
+/// `net_phase_e.rs` has a function of the SAME NAME,
+/// `register_https_session_accessors`, registering the same six names on the
+/// same two classes. Its doc comment reasons about which copy is live and
+/// concludes: *"None of the six names below appear in `register_one`, so none
+/// of them can be overwritten by it. If a later change adds any of them there,
+/// THAT copy wins and this one goes silently dead."*
+///
+/// The premise is true of `register_one` and the conclusion is false, because
+/// the names were added to THIS function instead — a second registrar in the
+/// same file, reached from the same `register_http_url_connection_real`:
+///
+/// ```text
+///   lib.rs:18688  net_phase_e::register_phase_e_networking
+///                   -> register_re4_url_http -> register_https_session_accessors  (6 names)
+///   lib.rs:18805  http_url_connection::register_http_url_connection_real
+///                   -> register_https_session_accessors(r, "sun/net/www/protocol/https/HttpsURLConnectionImpl")
+///                   -> register_https_session_accessors(r, "javax/net/ssl/HttpsURLConnection")   (5 names)
+/// ```
+///
+/// Both calls are inside `register_essential_natives_with_shims`, 18805 after
+/// 18688, and registration is last-write-wins. So on the real-JDK path the
+/// bodies below own `getServerCertificates`, `getLocalCertificates`,
+/// `getCipherSuite`, `getPeerPrincipal` and `getLocalPrincipal`, and
+/// net_phase_e's five copies are dead. `getSSLSession` is the ONE name this
+/// function does not register, so net_phase_e's survives for it alone.
+///
+/// **The consequence is that the six accessors answer from TWO DIFFERENT
+/// TABLES.** These five read `https_peer_info()` (this file, populated by
+/// `record_https_peer_info` on the handshake path); the surviving
+/// `getSSLSession` reads net_phase_e's `https_carrier_session` (populated by
+/// `record_https_carrier_session`, called from `huc_verify_hostname` STEP 0).
+/// Both populators run on the same successful exchange, so the split is not
+/// currently observable — but it is one deleted call away from being so, and
+/// it is why the refusal wording had drifted apart between the two halves
+/// (net_phase_e's `https_not_yet_open` was already right; this file's
+/// `SSLPeerUnverifiedException` was not). NOMINATED in G7-1: collapse the two
+/// registrars and the two tables into one.
+///
+/// Established by reading the two call sites in `lib.rs`, not from either
+/// comment — this file's own history (C6-3) is that a comment about which body
+/// runs is the least reliable thing in the tree. It has NOT been confirmed
+/// against a `--dump-native-registry` dump, because no binary carrying this
+/// change exists yet; that check is listed for the orchestrator in G7-1 §7.
 fn register_https_session_accessors(r: &mut NativeMethodRegistry, cls: &str) {
     r.register(
         cls,
@@ -297,12 +419,28 @@ fn register_https_session_accessors(r: &mut NativeMethodRegistry, cls: &str) {
     );
     // No client certificate is ever sent by `perform` (it builds its rustls
     // client config without one), so this is `null` — the JDK's own answer for
-    // a connection that did not authenticate itself, not a stand-in.
+    // a connection that did not authenticate itself, not a stand-in. MEASURED
+    // and confirmed: a completed client connection answers `null` here, and so
+    // does `getLocalPrincipal` below.
+    //
+    // G7: but only ONCE THE CONNECTION IS OPEN. This body used to answer `null`
+    // unconditionally, including before any handshake, where HotSpot throws
+    // `IllegalStateException: connection not yet open` (measured — see
+    // `https_not_yet_open`). A `null` there is the silent-lie shape this VM
+    // removes elsewhere: it tells a caller "no local certificate was sent" for
+    // a connection that has not been opened, which is an answer to a question
+    // that has no answer yet.
     r.register(
         cls,
         "getLocalCertificates",
         "()[Ljava/security/cert/Certificate;",
-        |_ctx, _args| Ok(Some(Value::Object(None))),
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            if !https_has_session(ctx, this) {
+                return Err(https_not_yet_open(ctx));
+            }
+            Ok(Some(Value::Object(None)))
+        },
     );
     r.register(cls, "getCipherSuite", "()Ljava/lang/String;", |ctx, args| {
         let this = obj_arg(args, 0)?;
@@ -315,11 +453,14 @@ fn register_https_session_accessors(r: &mut NativeMethodRegistry, cls: &str) {
             .map(|i| i.cipher.clone());
         match cipher {
             Some(c) if !c.is_empty() => Ok(Some(Value::Object(Some(ctx.create_string(&c))))),
-            _ => Err(crate::phases_early::throw_jca_exc(
-                ctx,
-                "javax/net/ssl/SSLPeerUnverifiedException",
-                "peer not authenticated",
-            )),
+            // G7: `IllegalStateException`, not `SSLPeerUnverifiedException`.
+            // `getCipherSuite()` is declared `public abstract String
+            // getCipherSuite();` with NO throws clause (SOURCE-VERIFIED by
+            // `javap` — see `https_not_yet_open`), so the old refusal was an
+            // undeclared checked exception out of a method whose signature
+            // cannot name it. HotSpot's measured refusal in this state is
+            // `IllegalStateException: connection not yet open`.
+            _ => Err(https_not_yet_open(ctx)),
         }
     });
     r.register(
@@ -348,11 +489,20 @@ fn register_https_session_accessors(r: &mut NativeMethodRegistry, cls: &str) {
             }
         },
     );
+    // Same split as `getLocalCertificates` above: `null` once the connection is
+    // open (MEASURED — a client that sent no certificate has no local
+    // principal), the "not yet open" refusal before that.
     r.register(
         cls,
         "getLocalPrincipal",
         "()Ljava/security/Principal;",
-        |_ctx, _args| Ok(Some(Value::Object(None))),
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            if !https_has_session(ctx, this) {
+                return Err(https_not_yet_open(ctx));
+            }
+            Ok(Some(Value::Object(None)))
+        },
     );
 }
 
@@ -4587,6 +4737,69 @@ mod http_url_connection_tests {
     #[allow(unused_imports)]
     use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
+
+    /// **Which of the two `register_https_session_accessors` functions owns
+    /// each of the six names.**
+    ///
+    /// G7. There are two functions with that name — this file's and
+    /// `net_phase_e`'s — registering the same six triples on the same two
+    /// classes, and `lib.rs` calls net_phase_e's first (18688) and this file's
+    /// second (18805), both inside `register_essential_natives_with_shims`.
+    /// Registration is last-write-wins, so this file's five bodies are live and
+    /// net_phase_e's five are dead, while `getSSLSession` — the one name this
+    /// file does not register — stays net_phase_e's.
+    ///
+    /// net_phase_e's own comment reasons the opposite way and rules the
+    /// overwrite out by checking only `register_one`. That is exactly the trap
+    /// HANDOFF-20260814 §5 names: a correct body silently shadowed by a later
+    /// registrar. This test makes the SPLIT itself executable, so that:
+    ///
+    ///   * adding `getSSLSession` here fails, instead of silently killing
+    ///     net_phase_e's copy (the only one with a body for it); and
+    ///   * removing any of the five here fails, instead of silently reviving
+    ///     net_phase_e's — which reads a different table.
+    ///
+    /// Asserted on `register_http_url_connection_real` ALONE, which is what
+    /// makes it a statement about this file rather than about a call order it
+    /// cannot see.
+    #[test]
+    fn this_files_registrar_owns_five_of_the_six_https_session_accessors() {
+        use cratonvm_native_api::NativeMethodRegistry;
+        let mut r = NativeMethodRegistry::new();
+        super::register_http_url_connection_real(&mut r);
+
+        for cls in [
+            "sun/net/www/protocol/https/HttpsURLConnectionImpl",
+            "javax/net/ssl/HttpsURLConnection",
+        ] {
+            for (name, desc) in [
+                ("getServerCertificates", "()[Ljava/security/cert/Certificate;"),
+                ("getLocalCertificates", "()[Ljava/security/cert/Certificate;"),
+                ("getCipherSuite", "()Ljava/lang/String;"),
+                ("getPeerPrincipal", "()Ljava/security/Principal;"),
+                ("getLocalPrincipal", "()Ljava/security/Principal;"),
+            ] {
+                assert!(
+                    r.find(cls, name, desc).is_some(),
+                    "{cls}.{name}{desc} must be registered by THIS file. \
+                     lib.rs runs this registrar after net_phase_e's, so \
+                     dropping it here does not restore the abstract \
+                     declaration — it silently hands the door back to \
+                     net_phase_e's copy, which answers from a different table \
+                     (`https_carrier_session`, not `https_peer_info`)."
+                );
+            }
+            assert!(
+                r.find(cls, "getSSLSession", "()Ljava/util/Optional;").is_none(),
+                "{cls}.getSSLSession()Ljava/util/Optional; must NOT be \
+                 registered here. net_phase_e owns it precisely because this \
+                 file leaves it alone; registering it here would run last and \
+                 make net_phase_e's the dead copy. If you need to serve it \
+                 from this file, move the whole family — do not split it \
+                 further. See G7-1."
+            );
+        }
+    }
 
     /// rustls's TLS 1.3 spelling is not JSSE's, and `getCipherSuite()` is
     /// contracted to answer JSSE's. Both directions asserted: the five

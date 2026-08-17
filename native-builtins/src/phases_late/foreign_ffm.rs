@@ -1333,12 +1333,35 @@ pub(crate) fn p67_layout_render(ctx: &dyn NativeContext, layout: ObjectRef) -> S
             Value::Object(Some(e)) => p67_layout_render(ctx, e),
             _ => String::new(),
         };
-        let count = match ctx.get_field(layout, 2) {
-            Value::Object(Some(e)) => {
-                let es = p67_layout_size_of(ctx, e);
-                if es > 0 { size / es } else { 0 }
+        // The STORED count (slot 4) first — see the `elementCount()`
+        // registration. Division is the fallback for a four-slot carrier and
+        // is wrong whenever the element's byteSize is 0: the oracle renders
+        // `sequenceLayout(3, structLayout())` as `[3:[]]`, and the division
+        // would print `[0:[]]`.
+        let stored = if ctx.object_num_fields(layout) > 4 {
+            // Read slot 4 only AFTER the width check — a four-slot carrier has
+            // no slot 4 to read, and asking for one is the out-of-bounds field
+            // access this file's carrier notes keep warning about.
+            match ctx.get_field(layout, 4) {
+                Value::Long(count) => Some(count),
+                _ => None,
             }
-            _ => 0,
+        } else {
+            None
+        };
+        let count = match stored {
+            Some(count) => count,
+            None => match ctx.get_field(layout, 2) {
+                Value::Object(Some(e)) => {
+                    let es = p67_layout_size_of(ctx, e);
+                    if es > 0 {
+                        size / es
+                    } else {
+                        0
+                    }
+                }
+                _ => 0,
+            },
         };
         format!("[{count}:{elem}]")
     } else if class_name.contains("StructLayout")
@@ -3380,11 +3403,17 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
             let mut size = 0_i64;
             let mut max_align = 1_i64;
             for i in 0..count {
-                let Some(member) = (match ctx.get_array_element(members, i) {
-                    Value::Object(Some(obj)) => Some(obj),
-                    _ => None,
-                }) else {
-                    continue;
+                // A NULL member is a `NullPointerException`, not a member to
+                // skip. MEASURED 2026-08-16: `structLayout((MemoryLayout) null)`
+                // and `structLayout(JAVA_INT, null)` are both
+                // `NullPointerException` with a null message
+                // (`Objects.requireNonNull` inside `MemoryLayout.structLayout`).
+                // The `continue` this replaces answered a layout that was one
+                // member short — `structLayout(JAVA_LONG, null)` was `j8`,
+                // byteSize 8, with nothing to say a member had gone missing.
+                let member = match ctx.get_array_element(members, i) {
+                    Value::Object(Some(obj)) => obj,
+                    _ => return Err(RuntimeError::NullPointerException { message: None }.into()),
                 };
                 let Some((member_size, member_align)) = p67_member_size_align(ctx, member) else {
                     // Not a layout carrier. Name it rather than defaulting to
@@ -3412,10 +3441,24 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
                     .into());
                 }
                 let Some(next) = size.checked_add(member_size.max(0)) else {
-                    // `Math.addExact` in the JDK; an overflow there is an
-                    // ArithmeticException, not a silent wrap.
-                    return Err(RuntimeError::ArithmeticException {
-                        message: "long overflow".to_string(),
+                    // MEASURED 2026-08-16, and NOT what this said before.
+                    //
+                    // The JDK does use `Math.addExact` here, but it does not
+                    // let the `ArithmeticException` out: `AbstractLayout`
+                    // catches it and rethrows. Oracle, with
+                    // `big = sequenceLayout(Long.MAX_VALUE, JAVA_BYTE)`:
+                    //
+                    //     structLayout(big, JAVA_BYTE) -> IllegalArgumentException:
+                    //                          Layout size exceeds Long.MAX_VALUE
+                    //     structLayout(big, big)       -> the same
+                    //
+                    // "an overflow there is an ArithmeticException" was a
+                    // PREDICTION read off the `Math.addExact` call, and it is
+                    // the wrong exception CLASS — a caller catching
+                    // `IllegalArgumentException`, which is what every other
+                    // refusal in this factory throws, would not have caught it.
+                    return Err(RuntimeError::IllegalArgumentException {
+                        message: "Layout size exceeds Long.MAX_VALUE".to_string(),
                     }
                     .into());
                 };
@@ -3478,17 +3521,51 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
                 }
                 .into());
             }
+            // The remaining three refusals, in the ORDER the oracle applies
+            // them. MEASURED 2026-08-16 (`FfmProbe4`, `P5`):
+            //
+            // | call | oracle |
+            // |---|---|
+            // | `sequenceLayout(-1, null)` | IAE `The provided elementCount is negative: -1` |
+            // | `sequenceLayout(4, null)` | `NullPointerException` |
+            // | `sequenceLayout(0, structLayout(JAVA_INT, JAVA_BYTE))` | IAE `Element layout size is not multiple of alignment` |
+            // | `sequenceLayout(2, JAVA_INT.withByteAlignment(8))` | IAE, same message |
+            // | `sequenceLayout(Long.MAX_VALUE, JAVA_INT)` | IAE `Layout size exceeds Long.MAX_VALUE` |
+            // | `sequenceLayout(Long.MAX_VALUE, JAVA_BYTE)` | 9223372036854775807 |
+            //
+            // The negative-count check above wins even over a null element
+            // (`sequenceLayout(-1, null)` is the count message, not an NPE),
+            // which is why it stays first.
             let element = match args.get(1) {
-                Some(Value::Object(Some(e))) => Some(*e),
-                _ => None,
+                Some(Value::Object(Some(e))) => *e,
+                _ => return Err(RuntimeError::NullPointerException { message: None }.into()),
             };
-            let (elem_size, elem_align) = element.map_or((0, 1), |e| p67_layout_size_align(ctx, e));
+            let (elem_size, elem_align) = p67_layout_size_align(ctx, element);
+            // An element whose own size is not a whole number of its own
+            // alignment cannot tile, and the JDK refuses it AT THE FACTORY —
+            // before the count is even multiplied in, which is why count 0
+            // refuses too. Without this,
+            // `sequenceLayout(2, structLayout(JAVA_INT, JAVA_BYTE))` answered a
+            // 10-byte layout with alignment 4, whose second element starts at
+            // byte 5. `pe_segment_spliterator` already carries this exact check
+            // and this exact message for a segment's element layout; the
+            // factory is where the oracle puts it.
+            if elem_align > 0 && elem_size % elem_align != 0 {
+                return Err(RuntimeError::IllegalArgumentException {
+                    message: "Element layout size is not multiple of alignment".to_string(),
+                }
+                .into());
+            }
             // `SequenceLayoutImpl`'s constructor is
-            // `Math.multiplyExact(elemCount, elementLayout.byteSize())`, so an
-            // overflow is an ArithmeticException, not a saturated size.
+            // `Math.multiplyExact(elemCount, elementLayout.byteSize())`, but
+            // the `ArithmeticException` does not escape — the JDK rethrows it.
+            // MEASURED: `sequenceLayout(Long.MAX_VALUE, JAVA_INT)` is
+            // `IllegalArgumentException: Layout size exceeds Long.MAX_VALUE`.
+            // "an overflow is an ArithmeticException" was a PREDICTION read
+            // off the `multiplyExact` call and is the wrong exception class.
             let Some(total) = count.checked_mul(elem_size) else {
-                return Err(RuntimeError::ArithmeticException {
-                    message: "long overflow".to_string(),
+                return Err(RuntimeError::IllegalArgumentException {
+                    message: "Layout size exceeds Long.MAX_VALUE".to_string(),
                 }
                 .into());
             };
@@ -3499,23 +3576,36 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
             // `p67_sequence_element_layout` — the single reader both the
             // `byteOffset` and the `varHandle` path walks go through — reads a
             // sequence's element from slot 2. Six slots would have left the
-            // walk reading `Int(littleEndian)` as a layout. The count is not
-            // stored because it is derivable, and a stored copy is one more
-            // thing that can disagree with `byteSize`: `elementCount()` below
-            // divides the total by the element size.
-            let element_pin = element.map(|e| ctx.pin_native_root(e));
-            let obj = try_alloc_concurrent_synthetic(ctx, "java/lang/foreign/SequenceLayout", 4)?;
+            // walk reading `Int(littleEndian)` as a layout.
+            //
+            // THE COUNT IS STORED, AT SLOT 4, AND IT IS NOT DERIVABLE.
+            //
+            // This carrier used to be exactly four slots on the reasoning that
+            // `elementCount()` could divide `byteSize` by the element size. The
+            // oracle falsifies it: an element layout may have byteSize ZERO,
+            // and then the total is 0 for every count. MEASURED —
+            // `sequenceLayout(3, structLayout()).byteSize()` is 0 and its
+            // `elementCount()` is **3**; `sequenceLayout(2, sequenceLayout(0,
+            // JAVA_INT)).elementCount()` is 2. The division answered 0 for all
+            // of them (it is guarded against a divide-by-zero, so it was a
+            // quiet wrong number rather than a crash).
+            //
+            // Slot 4 is a SEQUENCE-ONLY EXTENSION and changes nothing about the
+            // shared prefix: `[0]=byteSize, [1]=byteAlignment, [2]=payload,
+            // [3]=name` is still what `p67_layout_size_align`,
+            // `p67_layout_name` and `p67_sequence_element_layout` read, and
+            // slot 4 is read by `elementCount()` alone. It is NOT the six-slot
+            // carrier F16 removed: that one put the ELEMENT at slot 4, where
+            // the walk expects it at slot 2.
+            let element_pin = ctx.pin_native_root(element);
+            let obj = try_alloc_concurrent_synthetic(ctx, "java/lang/foreign/SequenceLayout", 5)?;
             ctx.set_field(obj, 0, Value::Long(total));
             ctx.set_field(obj, 1, Value::Long(elem_align.max(1)));
-            let element = match (element, element_pin) {
-                (Some(e), Some(pin)) => Value::Object(Some(ctx.read_native_pin(pin, e))),
-                _ => Value::Object(None),
-            };
-            ctx.set_field(obj, 2, element);
+            let element = ctx.read_native_pin(element_pin, element);
+            ctx.set_field(obj, 2, Value::Object(Some(element)));
             ctx.set_field(obj, 3, Value::Object(None));
-            if let Some(pin) = element_pin {
-                ctx.unpin_native_roots(pin);
-            }
+            ctx.set_field(obj, 4, Value::Long(count));
+            ctx.unpin_native_roots(element_pin);
             Ok(Some(Value::Object(Some(obj))))
         },
     );
@@ -3552,7 +3642,11 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
                     Value::Object(Some(obj)) => Some(obj),
                     _ => None,
                 }) else {
-                    continue;
+                    // MEASURED: `unionLayout(JAVA_INT, null)` is a
+                    // `NullPointerException`, the same rule `structLayout`
+                    // above now follows. Skipping the member answered a union
+                    // sized by the members that happened to be non-null.
+                    return Err(RuntimeError::NullPointerException { message: None }.into());
                 };
                 let Some((member_size, member_align)) = p67_member_size_align(ctx, member) else {
                     let cls = ctx
@@ -3734,8 +3828,22 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
             Ok(Some(ctx.get_field(this, 2)))
         },
     );
+    // `elementCount()` reads the STORED count (slot 4), falling back to the
+    // division only for a carrier minted before slot 4 existed.
+    //
+    // The division is not equivalent, and the oracle says so: an element with
+    // byteSize 0 makes every total 0, and `sequenceLayout(3, structLayout())
+    // .elementCount()` is **3** on HotSpot where the division answers 0
+    // (MEASURED, `FfmProbe4` N7/N10/N12). The fallback is kept — and only the
+    // fallback divides — so a four-slot sequence carrier from any other mint
+    // still answers what it used to instead of reading past its own end.
     r.register(seq_layout, "elementCount", "()J", |ctx, args| {
         let this = obj_arg(args, 0)?;
+        if ctx.object_num_fields(this) > 4 {
+            if let Value::Long(count) = ctx.get_field(this, 4) {
+                return Ok(Some(Value::Long(count)));
+            }
+        }
         let total = p67_layout_size_of(ctx, this);
         let elem = match ctx.get_field(this, 2) {
             Value::Object(Some(e)) => p67_layout_size_of(ctx, e),

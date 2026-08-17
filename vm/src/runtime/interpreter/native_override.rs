@@ -5433,6 +5433,35 @@ fn redefine_immune_synthetic_collection_native(class_name: &str) -> bool {
 /// A subclass that overrides `initialValue()` is unaffected either way — that
 /// override is the subclass's own bytecode and dispatch resolves to it before
 /// reaching this gate.
+///
+/// # `--jdk-only` reads this table too (G5-1, 2026-08-16)
+///
+/// It is easy to read the paragraphs above as a `Compatible`-mode story. It is
+/// not. `register_thread_local_natives` (`native-builtins/src/phases_early.rs`)
+/// wraps all six registrations in `set_category(NativeKind::Intrinsic)`, and
+/// `resolve_native_dispatch_wave1` (`vm/src/vm/vm_exec.rs`) admits an
+/// `Intrinsic` over concrete bytecode under `--jdk-only` as well — §1.4's
+/// reviewed exception. So under `--jdk-only`, exactly as under `Compatible`,
+/// `Thread.threadLocals` and `Thread.inheritableThreadLocals` are never
+/// written by anything in the process.
+///
+/// That is not only a storage detail. It silently disables three real-JDK
+/// behaviours that live in `java.lang.Thread`'s and `java.lang.ThreadLocal`'s
+/// own bytecode and have no analogue in `TL_MAP`:
+///
+/// * the construction-time inheritance copy at pc 175..201 of the master
+///   `Thread(ThreadGroup, String, int, Runnable, long)` constructor — its
+///   `ifnull` at pc 182 always takes the skip branch;
+/// * the `characteristics & 4` opt-out that `Thread(g, r, n, ss, false)` sets;
+/// * `InheritableThreadLocal.childValue(T)` overrides, which the JDK applies
+///   inside `createInheritedMap`.
+///
+/// All three are MEASURED divergences on Temurin 25.0.3+9 and are written up,
+/// with the demotion nomination that would restore them, in
+/// `docs/known-issues/jdk-only/G5-1-inheritable-threadlocal-captures-at-
+/// construction-20260816.md`. Do not "fix" the ITL timing anywhere downstream
+/// without reading §5 there first: the workaround it describes lives in
+/// `native-builtins/src/lang_system.rs::native_thread_start0`, not here.
 fn redefine_immune_thread_local_native(class_name: &str) -> bool {
     matches!(
         class_name,
