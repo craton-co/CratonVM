@@ -23365,7 +23365,7 @@ pub fn register_synthetic_overrides(registry: &mut NativeMethodRegistry) {
         "java/lang/String",
         "codePoints",
         "()Ljava/util/stream/IntStream;",
-        native_string_chars, // Same as chars() for BMP characters
+        native_string_code_points,
     );
     registry.register(
         "java/lang/String",
