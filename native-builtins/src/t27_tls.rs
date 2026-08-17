@@ -1094,9 +1094,6 @@ pub(crate) fn build_engine_client_config_with_identity_ciphers(
                 provider,
                 &versions,
                 None,
-                // No engine on this path, so the pass-through verifier consults
-                // nothing and the post-handshake gate does the work.
-                None,
             );
         }
     }
@@ -1108,7 +1105,6 @@ pub(crate) fn build_engine_client_config_with_identity_ciphers(
         use_java_trust_manager,
         provider,
         &versions,
-        None,
         None,
     )
 }
@@ -2408,21 +2404,6 @@ struct PassthroughServerCertVerifier {
     /// handler recorded `IllegalStateException("handshake complete. expected
     /// failure")` even though the client did reject the certificate.
     endpoint_identity: Option<(String, String)>,
-    /// The `ctx_trust_managers_table` key this config's `SSLContext` registered
-    /// its Java `TrustManager`s under, so `verify_server_cert` can consult them
-    /// AT VERIFICATION TIME rather than after the handshake.
-    ///
-    /// Per-ENGINE, because `engine_begin` builds one `ClientConfig` per engine
-    /// (it already threads `endpoint_identity` — per-engine `SSLParameters`
-    /// state — through here for the same reason).
-    ///
-    /// `None` means "no application TrustManager on this context", in which case
-    /// rustls's own chain verification is the whole check and this verifier stays
-    /// the pass-through it was named for. The engine's ID and its Java object are
-    /// NOT fields: they come from `active_engine_binding()`, published only for
-    /// the window in which a call can actually reach Java, and an `ObjectRef`
-    /// stored across `engine_begin` would not be GC-stable anyway.
-    trust_ctx_key: Option<u64>,
 }
 
 impl rustls::client::danger::ServerCertVerifier for PassthroughServerCertVerifier {
@@ -2452,86 +2433,7 @@ impl rustls::client::danger::ServerCertVerifier for PassthroughServerCertVerifie
                 ));
             }
         }
-        // Now the application's Java `TrustManager`s, IN the handshake.
-        //
-        // Deferring this until `!conn.is_handshaking()` — which is what
-        // `engine_take_pending_trust_check` does, and all this engine used to do
-        // — is by construction after the client has sent its `Finished`. The
-        // server therefore completes a valid TLS 1.3 handshake, netty runs
-        // `setHandshakeSuccess()`, and the alert that follows cannot fail an
-        // already-completed promise: `testHandshakeFailureOnlyFireExceptionOnce`
-        // (`SslHandlerTest:1546`) asserts the SERVER's future fails and it did
-        // not. Answering `Err` from here makes rustls abort BEFORE `Finished`
-        // and emit its fatal alert under handshake keys, which the peer can
-        // decrypt — the property
-        // `a_verifier_time_rejection_reaches_the_server_while_it_is_still_handshaking`
-        // pins.
-        //
-        // Everything needed to get to Java is already published for this window
-        // by `do_unwrap`: `ctx` (the mechanism `JavaKeyManagerResolver::resolve`
-        // has used from inside this same `process_new_packets` all along) and the
-        // engine binding. When either is absent this is not a path that can reach
-        // Java — a native client socket, `HttpURLConnection`, an in-tree
-        // `EngineState` test — and the post-handshake gate remains the whole
-        // check, exactly as before.
-        let Some(trust_ctx_key) = self.trust_ctx_key else {
-            return Ok(rustls::client::danger::ServerCertVerified::assertion());
-        };
-        let mut chain: Vec<Vec<u8>> = Vec::with_capacity(1 + intermediates.len());
-        chain.push(end_entity.as_ref().to_vec());
-        chain.extend(intermediates.iter().map(|c| c.as_ref().to_vec()));
-        // One reborrow for the binding read AND the call: the engine reference
-        // comes back through its pin, so it must be read with the same ctx that
-        // is about to run the upcall.
-        let mut engine_id = 0i32;
-        let verdict = with_active_native_context(|ctx| {
-            let (id, engine_obj) = active_engine_binding(ctx)?;
-            engine_id = id;
-            let pending = PendingTrustCheck {
-                engine_id: id,
-                is_client: true,
-                peer_chain_der: chain,
-                trust_ctx_key: Some(trust_ctx_key),
-                // The suite is not settled at verification time, and `auth_type`
-                // is only ever a hint a manager may branch or log on — never a
-                // security check. `engine_consult_trust_managers` falls back to
-                // "RSA", which is what it already does for an unrecognised suite.
-                negotiated_cipher_suite_name: None,
-                // Already applied above, on the chain rustls handed us.
-                endpoint_identity: None,
-            };
-            Some(engine_consult_trust_managers(
-                ctx,
-                pending,
-                Some(engine_obj),
-                TrustCheckMode::InVerifier,
-            ))
-        })
-        .flatten();
-        match verdict {
-            // No ctx published: not a Java-reachable path (see above).
-            None => Ok(rustls::client::danger::ServerCertVerified::assertion()),
-            Some(Ok(TrustOutcome::Accepted)) => {
-                mark_trust_check_done(engine_id);
-                Ok(rustls::client::danger::ServerCertVerified::assertion())
-            }
-            Some(Ok(TrustOutcome::Rejected(detail))) => {
-                mark_trust_check_done(engine_id);
-                if crate::nbflags().dbg_tls_auth_ok {
-                    eprintln!("[dbg-tls-auth] (in-handshake) TrustManager rejected: {detail}");
-                }
-                Err(rustls::Error::InvalidCertificate(
-                    rustls::CertificateError::ApplicationVerificationFailure,
-                ))
-            }
-            // A Java `Error` (not `Exception`) came out of the manager. JSSE lets
-            // those through untouched rather than treating them as a rejection,
-            // and there is no way to carry one out of a rustls verifier — so do
-            // NOT mark the check done, and let the post-handshake gate raise it
-            // exactly as it does today. This keeps the `Error`-is-not-a-rejection
-            // rule in one place (`throwable_is_error`).
-            Some(Err(_)) => Ok(rustls::client::danger::ServerCertVerified::assertion()),
-        }
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
     }
 
     fn verify_tls12_signature(
@@ -2740,7 +2642,6 @@ fn build_client_config_ex(
         Arc::new(cbc_augmented_default_provider()),
         &[],
         None,
-        None,
     )
 }
 
@@ -2762,12 +2663,6 @@ fn build_client_config_ex_with_provider(
     provider: Arc<rustls::crypto::CryptoProvider>,
     versions: &[&'static rustls::SupportedProtocolVersion],
     endpoint_identity: Option<(String, String)>,
-    // `trust_ctx_key`: the engine's `ctx_trust_managers_table` key, when this
-    // config is being built FOR an engine. `None` from the wrapper builders,
-    // which serve paths with no engine — their pass-through verifier keeps
-    // consulting nothing and the post-handshake gate keeps doing the work,
-    // exactly as before.
-    trust_ctx_key: Option<u64>,
 ) -> Result<Arc<ClientConfig>, String> {
     // `with_protocol_versions(&[])` is an error in rustls, and so is a list
     // whose versions the provider cannot serve — fall back to the safe
@@ -2793,7 +2688,6 @@ fn build_client_config_ex_with_provider(
             Arc::new(PassthroughServerCertVerifier {
                 algorithms: provider.signature_verification_algorithms.clone(),
                 endpoint_identity,
-                trust_ctx_key,
             });
         with_versions!(ClientConfig::builder_with_provider(provider.clone()))
             .dangerous()
@@ -2887,78 +2781,6 @@ thread_local! {
     // erased from could expire — see `set_active_native_context`.
     static ACTIVE_TLS_NATIVE_CTX: std::cell::Cell<Option<*mut (dyn NativeContext + 'static)>> =
         std::cell::Cell::new(None);
-}
-
-thread_local! {
-    /// The Java `SSLEngine` whose `unwrap` is currently running on this thread,
-    /// published alongside the ctx for the duration of `do_unwrap`'s record loop.
-    ///
-    /// `PassthroughServerCertVerifier` needs it for the THREE-argument
-    /// `X509ExtendedTrustManager.checkServerTrusted(chain, authType, SSLEngine)`
-    /// overload — the one JSSE uses when the manager is extended, and the one
-    /// netty's own wrappers expect. It cannot be a field on the verifier: the
-    /// verifier is built once at `engine_begin` and an `ObjectRef` is not
-    /// GC-stable across the calls in between, whereas this window is a single
-    /// native call.
-    /// `(engine id, pin handle, the ObjectRef as it was when pinned)`.
-    ///
-    /// A pin handle, NOT a bare `ObjectRef`: this is read back from inside
-    /// `process_new_packets`, which runs the application's Java `TrustManager`
-    /// and therefore allocates, and a moving young collection in that window
-    /// relocates the engine mirror. Holding the raw reference across it is the
-    /// "native local held live across an allocation" family — the same shape
-    /// `engine_run_trust_check`'s own chain-array pin exists for. The `ObjectRef`
-    /// is kept alongside only as `read_native_pin`'s fallback.
-    static ACTIVE_TLS_ENGINE: std::cell::Cell<Option<(i32, usize, ObjectRef)>> =
-        const { std::cell::Cell::new(None) };
-}
-
-/// RAII: publish `engine` as the engine currently unwrapping on this thread.
-pub(crate) struct ActiveEngineObjGuard {
-    _private: (),
-}
-
-impl Drop for ActiveEngineObjGuard {
-    fn drop(&mut self) {
-        ACTIVE_TLS_ENGINE.with(|c| c.set(None));
-    }
-}
-
-/// Publish `engine` for the record-loop window, PINNED.
-///
-/// The returned guard clears the thread-local; the pin frame itself is released
-/// by the caller's `unpin_native_roots`, which must bracket the same window (a
-/// pin taken here and never released would root the engine mirror forever).
-fn set_active_engine_binding(
-    ctx: &mut dyn NativeContext,
-    id: i32,
-    engine: ObjectRef,
-) -> (ActiveEngineObjGuard, usize) {
-    let pin = ctx.pin_native_root(engine);
-    ACTIVE_TLS_ENGINE.with(|c| c.set(Some((id, pin, engine))));
-    (ActiveEngineObjGuard { _private: () }, pin)
-}
-
-/// The engine currently unwrapping on this thread, re-read through its pin so a
-/// collection during the Java upcall cannot hand back a stale reference.
-fn active_engine_binding(ctx: &mut dyn NativeContext) -> Option<(i32, ObjectRef)> {
-    let (id, pin, orig) = ACTIVE_TLS_ENGINE.with(|c| c.get())?;
-    Some((id, ctx.read_native_pin(pin, orig)))
-}
-
-/// Record that this engine's `TrustManager`s have already been consulted, so
-/// `engine_take_pending_trust_check` does not ask them a SECOND time after the
-/// handshake. A double consultation is observable — an application manager may
-/// count its calls, and netty's test managers do — and the second one would be
-/// asking a manager that has already answered.
-///
-/// Called from inside `verify_server_cert`, i.e. from inside
-/// `process_new_packets`, which is only possible because `do_unwrap` runs its
-/// record loop with the registry lock DROPPED (see `ConnCheckout`). Before that
-/// change this very call would have deadlocked, which is the reason the trust
-/// check was deferred in the first place.
-fn mark_trust_check_done(id: i32) {
-    with_engine(id, |s| s.trust_check_done = true);
 }
 
 /// RAII guard returned by `set_active_native_context`; clears the
@@ -4951,7 +4773,6 @@ pub(crate) fn drive_pending_layered_handshake(pending_id: i32) -> Result<i32, St
             pending.use_java_trust_manager,
             provider,
             &versions,
-            None,
             None,
         )
         .map_err(|e| format!("layered client config: {e}"))?;
@@ -8464,85 +8285,6 @@ mod tests {
         assert_eq!(server.negotiated_alpn.as_deref(), Some("h2"));
     }
 
-    /// `ConnCheckout` must put the connection back on EVERY exit, including the
-    /// early `return Err(...)` the record loop takes on a `process_new_packets`
-    /// failure. A missed restore does not fail a test — it leaves `conn == None`
-    /// for the life of that engine, so every later `wrap`/`unwrap` silently does
-    /// nothing and the connection just stops.
-    #[test]
-    fn a_checked_out_connection_is_restored_on_every_exit() {
-        let id = super::engine_alloc_id();
-        {
-            let mut st = super::EngineState::default();
-            st.is_client = true;
-            st.peer_host = Some("localhost".to_string());
-            st.client_config = Some(
-                super::build_client_config(
-                    {
-                        let mut roots = RootCertStore::empty();
-                        for c in parse_cert_chain_pem(CA_CRT_PEM).unwrap() {
-                            roots.add(c).unwrap();
-                        }
-                        roots
-                    },
-                    &["h2"],
-                    None,
-                )
-                .unwrap(),
-            );
-            super::engine_begin(&mut st).expect("begin");
-            assert!(st.conn.is_some());
-            super::engine_registry().write().insert(id, st);
-        }
-
-        // Normal scope exit.
-        {
-            let checkout = super::ConnCheckout::take(id);
-            assert!(checkout.conn.is_some(), "the connection must come out");
-            assert!(
-                super::with_engine(id, |s| s.conn.is_none() && s.conn_checked_out).unwrap(),
-                "while on loan the engine must report `conn_checked_out`, not just an absent conn"
-            );
-            // `engine_begin` must refuse to build a rival connection in this
-            // window — the restore below would silently discard it.
-            super::with_engine(id, |s| {
-                super::engine_begin(s).expect("begin during checkout");
-                assert!(
-                    s.conn.is_none(),
-                    "engine_begin built a second connection while one was on loan"
-                );
-            });
-        }
-        assert!(
-            super::with_engine(id, |s| s.conn.is_some() && !s.conn_checked_out).unwrap(),
-            "the connection must be back after a normal scope exit"
-        );
-
-        // Early-return exit, the shape the record loop's `return Err(...)` takes.
-        fn bails_out(id: i32) -> Result<(), ()> {
-            let _checkout = super::ConnCheckout::take(id);
-            Err(())
-        }
-        assert!(bails_out(id).is_err());
-        assert!(
-            super::with_engine(id, |s| s.conn.is_some() && !s.conn_checked_out).unwrap(),
-            "the connection must be back after an early return"
-        );
-
-        // A `?`-style exit out of a nested scope, and a panic-driven unwind.
-        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _checkout = super::ConnCheckout::take(id);
-            panic!("simulated fault inside the record loop");
-        }));
-        assert!(unwound.is_err());
-        assert!(
-            super::with_engine(id, |s| s.conn.is_some() && !s.conn_checked_out).unwrap(),
-            "the connection must be back after an unwind"
-        );
-
-        super::engine_registry().write().remove(&id);
-    }
-
     /// A `ServerCertVerifier` that refuses every chain, the way a Java
     /// `X509TrustManager` throwing `CertificateException` would if its verdict
     /// reached rustls at verification time instead of after the handshake.
@@ -9211,21 +8953,6 @@ pub(crate) struct EngineState {
     /// `None` until `beginHandshake` realizes the connection (we need
     /// client-vs-server + ALPN list known before constructing rustls).
     conn: Option<EngineConn>,
-    /// `conn` is not absent, it is ON LOAN to `do_unwrap`'s record loop.
-    ///
-    /// The loop needs `&mut conn` while the engine-registry lock is DROPPED, so
-    /// that the Java `TrustManager` upcall `PassthroughServerCertVerifier`
-    /// makes from inside `process_new_packets` can re-enter `with_engine`
-    /// instead of deadlocking on a non-reentrant write guard. It does that by
-    /// `take()`ing the connection out and putting it back through
-    /// [`ConnCheckout`]'s `Drop`.
-    ///
-    /// Every reader that treats `conn == None` as "not begun yet" must consult
-    /// this first. `handshake_status_of` already answers "still handshaking" for
-    /// `None`, which is the right answer here too; `engine_begin` does NOT — it
-    /// would build a SECOND connection and the checkout's restore would then
-    /// throw it away, losing whatever the re-entrant caller had done to it.
-    conn_checked_out: bool,
     is_client: bool,
     /// In-process inbound buffer. `unwrap` appends to this from the source
     /// ByteBuffer, then drains via `read_tls` into rustls.
@@ -9378,7 +9105,6 @@ impl Default for EngineState {
     fn default() -> Self {
         Self {
             conn: None,
-            conn_checked_out: false,
             is_client: true,
             inbound: Vec::new(),
             outbound: Vec::new(),
@@ -9701,17 +9427,6 @@ fn handshake_status_of(s: &EngineState) -> i32 {
     }
     let conn = match s.conn.as_ref() {
         Some(c) => c,
-        // The connection is ON LOAN to `do_unwrap`'s record loop, not absent.
-        // Answering NOT_HANDSHAKING here says "the handshake is over", and a
-        // caller that believes it stops driving the engine — which is a HANG,
-        // reached from inside the very Java `TrustManager` upcall the loan
-        // exists to allow (an `X509ExtendedTrustManager` is handed the
-        // `SSLEngine` and JSSE's own tests query it). Measured: without this
-        // arm, `JdkSslEngineTest`'s TLSv1.3 `testMutualAuthSameCertChain` and
-        // `mustCallResumeTrustedOnSessionResumption` time out instead of
-        // failing, 4 of 821 where the control has 0. See
-        // `EngineState::conn_checked_out`.
-        None if s.conn_checked_out => return HS_NEED_UNWRAP_R,
         // A server engine whose connection is held back until the ClientHello
         // arrives (ALPN selector) is still HANDSHAKING as far as the caller is
         // concerned, and what it needs next is the hello.
@@ -10335,29 +10050,6 @@ enum DelegatedTask {
 /// engine and requires `SSLProtocolException` specifically, and JSSE's
 /// `SSLEngineInputRecord` raises exactly that for an unexpected handshake
 /// message.
-/// The message for a handshake error, naming the application's `TrustManager`
-/// when that is what actually refused.
-///
-/// rustls reports a verifier rejection as
-/// `InvalidCertificate(ApplicationVerificationFailure)`, which stringifies to
-/// something about "application verification failure" and says nothing about
-/// WHICH manager said no or why. The reason was recorded by
-/// `engine_consult_trust_managers` on its way out
-/// (`set_last_trust_rejection_detail`), and this is where it is spent — so a
-/// caller sees the same sentence it saw when the check ran after the handshake
-/// rather than a downgrade in diagnostics as the price of moving it earlier.
-fn handshake_error_message(e: &rustls::Error) -> String {
-    if matches!(
-        e,
-        rustls::Error::InvalidCertificate(rustls::CertificateError::ApplicationVerificationFailure)
-    ) {
-        if let Some(detail) = take_last_trust_rejection_detail() {
-            return format!("TrustManager rejected the peer certificate chain: {detail}");
-        }
-    }
-    format!("rustls: {e}")
-}
-
 fn jsse_handshake_exception_class(e: &rustls::Error) -> &'static str {
     match e {
         rustls::Error::InappropriateMessage { .. }
@@ -10415,87 +10107,6 @@ fn claim_delegated_task(id: i32) -> bool {
 /// Returns `Ok(true)` when the work was DEFERRED (the caller must now be told
 /// `NEED_TASK` and given no bytes), `Ok(false)` when it was done or was not
 /// needed.
-/// Release a native pin frame when the enclosing scope ends, including on the
-/// record loop's early `return Err(...)`. A leaked frame roots every object in
-/// it for the life of the process.
-struct UnpinOnDrop {
-    base: usize,
-}
-
-impl Drop for UnpinOnDrop {
-    fn drop(&mut self) {
-        // The ctx is the one published for this same window; if it is gone the
-        // frame goes with the call anyway.
-        let base = self.base;
-        let _ = with_active_native_context(move |ctx| ctx.unpin_native_roots(base));
-    }
-}
-
-/// Hold `EngineState::conn` outside the registry while `do_unwrap`'s record
-/// loop runs, and put it back on EVERY exit.
-///
-/// Why the loop cannot simply keep the lock: rustls calls
-/// `ServerCertVerifier::verify_server_cert` from inside `process_new_packets`,
-/// and that verifier has to consult the application's Java `TrustManager` — a
-/// bytecode upcall which may call straight back into an engine native. The
-/// registry's `parking_lot` write guard is not reentrant, so an upcall under it
-/// deadlocks the thread. Deferring the trust decision until after the handshake
-/// is what this replaces, and that deferral is why
-/// `testHandshakeFailureOnlyFireExceptionOnce` could not pass: the client had
-/// already sent its `Finished` before anybody asked Java, so the server
-/// completed a valid handshake and the later alert could not fail an
-/// already-completed promise.
-///
-/// `Drop` rather than an explicit put-back because the loop has early
-/// `return Err(throw_jca_exc(...))` exits. A missed restore does not fail a
-/// test — it leaves `conn == None` for the life of that engine, so every later
-/// `wrap`/`unwrap` on it silently does nothing.
-struct ConnCheckout {
-    id: i32,
-    conn: Option<EngineConn>,
-}
-
-impl ConnCheckout {
-    /// Take the connection out of the registry, marking the engine as on-loan.
-    /// Answers an empty checkout (a harmless no-op on drop) when the engine has
-    /// no connection yet, so callers need no special case.
-    fn take(id: i32) -> Self {
-        let conn = {
-            let regs = engine_registry();
-            let mut g = regs.write();
-            match g.get_mut(&id) {
-                Some(s) => {
-                    let c = s.conn.take();
-                    s.conn_checked_out = c.is_some();
-                    c
-                }
-                None => None,
-            }
-        };
-        Self { id, conn }
-    }
-}
-
-impl Drop for ConnCheckout {
-    fn drop(&mut self) {
-        let Some(conn) = self.conn.take() else {
-            return;
-        };
-        let regs = engine_registry();
-        let mut g = regs.write();
-        if let Some(s) = g.get_mut(&self.id) {
-            // Unconditional overwrite: `engine_begin` refuses to run while
-            // `conn_checked_out` holds, so nothing can have installed a rival
-            // connection in the window.
-            s.conn = Some(conn);
-            s.conn_checked_out = false;
-        }
-        // An engine dropped from the registry mid-loop (close on another
-        // thread) simply loses the connection here, which is what closing it
-        // means; there is nowhere to put it back.
-    }
-}
-
 fn engine_begin_or_defer(id: i32) -> Result<bool, String> {
     let mut g = engine_registry().write();
     let Some(s) = g.get_mut(&id) else {
@@ -10560,15 +10171,6 @@ fn engine_begin_if_needed(state: &mut EngineState) -> Result<(), String> {
 /// Begin the handshake — construct the rustls connection from the cached
 /// configs (or defaults) and stash it on the engine.
 fn engine_begin(state: &mut EngineState) -> Result<(), String> {
-    if state.conn_checked_out {
-        // The connection exists; it is on loan to `do_unwrap`'s record loop
-        // (see `EngineState::conn_checked_out`). Building a fresh one here
-        // would be silently discarded when the loan is returned, and any state
-        // the caller then set on it would go with it. A re-entrant caller in
-        // this window is by definition inside our own handshake processing, so
-        // "already begun" is the truthful answer.
-        return Ok(());
-    }
     if state.conn.is_some() {
         if crate::nbflags().dbg_tls_auth_ok {
             eprintln!(
@@ -10738,10 +10340,6 @@ fn engine_begin(state: &mut EngineState) -> Result<(), String> {
                     provider,
                     &versions,
                     endpoint_identity,
-                    // The engine path, and the only one that can consult Java
-                    // from inside verification: see
-                    // `PassthroughServerCertVerifier::trust_ctx_key`.
-                    state.trust_managers_ctx_key,
                 )?
             }
         };
@@ -11134,20 +10732,6 @@ fn engine_wrap_pump(
 ) -> (usize, usize) {
     // Read before the `&mut state.conn` borrow below starts.
     let finished_reported = state.handshake_finished_reported;
-    if state.conn_checked_out {
-        // Re-entrant wrap while `do_unwrap`'s record loop holds the connection
-        // (see `EngineState::conn_checked_out`). Answering `(0, 0)` is the same
-        // answer as "no connection yet", and it silently DROPS whatever the
-        // caller wanted written — a lost handshake record, i.e. a hang with no
-        // error. It should not be reachable: the loan is confined to one native
-        // call on one thread, and `handshake_status_of` reports NEED_UNWRAP
-        // throughout it so no caller is invited to wrap. Say so if it ever is,
-        // rather than losing the record quietly.
-        eprintln!(
-            "[tls] BUG: wrap on an engine whose connection is checked out by              do_unwrap's record loop; the write is being dropped. Please report              this with CRATONVM_DBG=tls-hs output."
-        );
-        return (0, 0);
-    }
     let conn = match state.conn.as_mut() {
         Some(c) => c,
         None => return (0, 0),
@@ -11775,17 +11359,23 @@ fn capture_sni_matchers(ctx: &mut dyn NativeContext, engine: ObjectRef, params: 
 /// matching `ServerHandshakeContext`, which pairs each received name with the
 /// matcher registered for that name's type and ignores the rest.
 ///
+/// Answers `true` when a matcher REFUSED. The refusal is armed on the engine
+/// (a fatal `unrecognized_name` for the peer, plus
+/// `deferred_handshake_error` for this side) and deliberately NOT raised here
+/// — see the refusal arm in `do_unwrap` for why the throw has to wait for the
+/// wrap that puts the alert on the wire.
+///
 /// Runs with the engine registry lock NOT held: it calls into Java.
 fn engine_run_sni_match_check(
     ctx: &mut dyn NativeContext,
     engine_id: i32,
     engine: ObjectRef,
     host: String,
-) -> Result<(), cratonvm_types::error::MethodCallFailed> {
+) -> Result<bool, cratonvm_types::error::MethodCallFailed> {
     let key = engine_objref_key(ctx, engine);
     let matchers = match engine_sni_matchers_table().lock().get(&key).cloned() {
         Some(m) if !m.is_empty() => m,
-        _ => return Ok(()),
+        _ => return Ok(false),
     };
     let name_str = ctx.create_string(&host);
     let base = ctx.pin_native_root(name_str);
@@ -11799,7 +11389,7 @@ fn engine_run_sni_match_check(
         Ok(Some(Value::Object(Some(o)))) => o,
         _ => {
             ctx.unpin_native_roots(base);
-            return Ok(());
+            return Ok(false);
         }
     };
     let name_pin = ctx.pin_native_root(sni_name);
@@ -11835,18 +11425,36 @@ fn engine_run_sni_match_check(
     }
     ctx.unpin_native_roots(base);
     if !refused {
-        return Ok(());
+        return Ok(false);
     }
     with_engine(engine_id, |s| {
-        if let Some(c) = s.conn.as_mut() {
-            c.queue_fatal_alert(rustls::AlertDescription::UnrecognisedName);
+        match s.conn.as_mut() {
+            Some(c) => c.queue_fatal_alert(rustls::AlertDescription::UnrecognisedName),
+            // The gate runs at ClientHello time, and on a server engine that
+            // is the call BEFORE `engine_begin_or_defer` realizes the rustls
+            // connection — so `conn` is `None` here on the path that actually
+            // matters and `queue_fatal_alert` was a silent no-op. No record
+            // layer exists yet either, which is fine: a pre-keys alert goes
+            // out as TLS plaintext, and that is exactly what JSSE's own
+            // `ServerHandshakeContext` sends when it refuses a hello before a
+            // ServerHello exists. alert(21), legacy_record_version 0x0303,
+            // length 2, level fatal(2), description unrecognized_name(112).
+            None => s
+                .outbound
+                .extend_from_slice(&[21, 0x03, 0x03, 0x00, 0x02, 2, 112]),
         }
+        // Owed to THIS side, but only once the alert above has gone out — the
+        // `SniClientTest.testSniSNIMatcherDoesNotMatchClient` half of the
+        // "a wrap that raises cannot also deliver its alert" defect. Raising
+        // it from this unwrap instead left the client with a closed channel
+        // and no alert at all: `StacklessClosedChannelException` where its
+        // `assertThrows(SSLException.class, …)` wants an `SSLException`.
+        s.deferred_handshake_error = Some((
+            "javax/net/ssl/SSLHandshakeException",
+            format!("Unrecognized server name indication: {host}"),
+        ));
     });
-    Err(crate::phases_early::throw_jca_exc(
-        ctx,
-        "javax/net/ssl/SSLHandshakeException",
-        &format!("Unrecognized server name indication: {host}"),
-    ))
+    Ok(true)
 }
 
 thread_local! {
@@ -11909,63 +11517,11 @@ pub(crate) fn in_client_trust_check() -> bool {
 /// Then — and this is a SEPARATE gate, not a consequence of the one above —
 /// runs endpoint identification when the engine was configured with an
 /// identification algorithm. See `engine_check_endpoint_identity`.
-/// Where the TrustManager consultation is happening, which decides what a
-/// rejection DOES.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum TrustCheckMode {
-    /// After the handshake, from `do_wrap`/`do_unwrap`. A rejection queues the
-    /// fatal alert itself and throws `SSLHandshakeException`. This is the
-    /// original behaviour and the only mode for callers with no live rustls
-    /// verification frame (native client sockets, `HttpURLConnection`).
-    PostHandshake,
-    /// Inside `ServerCertVerifier::verify_server_cert`. A rejection is REPORTED,
-    /// not acted on: rustls emits its own fatal alert when the verifier answers
-    /// `Err`, and it does so under HANDSHAKE keys before generating `Finished`
-    /// — which is the whole point of moving the check here. Throwing a Java
-    /// exception from this frame is also wrong: it would sit pending on `ctx`
-    /// and surface at an arbitrary later call.
-    InVerifier,
-}
-
-/// The outcome of consulting the application's TrustManagers.
-enum TrustOutcome {
-    Accepted,
-    /// Rejected, with the reason already recorded via
-    /// `set_last_trust_rejection_detail`.
-    Rejected(String),
-}
-
 fn engine_run_trust_check(
     ctx: &mut dyn NativeContext,
     pending: PendingTrustCheck,
     engine_obj: Option<ObjectRef>,
 ) -> Result<(), cratonvm_types::error::MethodCallFailed> {
-    match engine_consult_trust_managers(
-        ctx,
-        pending,
-        engine_obj,
-        TrustCheckMode::PostHandshake,
-    )? {
-        TrustOutcome::Accepted => Ok(()),
-        // Unreachable: `PostHandshake` throws from inside
-        // `engine_consult_trust_managers` rather than returning `Rejected`.
-        // Kept as a belt-and-braces arm rather than an `unreachable!` so a
-        // future edit that changes that cannot turn into a panic in a TLS
-        // handshake.
-        TrustOutcome::Rejected(detail) => Err(crate::phases_early::throw_jca_exc(
-            ctx,
-            "javax/net/ssl/SSLHandshakeException",
-            &format!("TrustManager rejected the peer certificate chain: {detail}"),
-        )),
-    }
-}
-
-fn engine_consult_trust_managers(
-    ctx: &mut dyn NativeContext,
-    pending: PendingTrustCheck,
-    engine_obj: Option<ObjectRef>,
-    mode: TrustCheckMode,
-) -> Result<TrustOutcome, cratonvm_types::error::MethodCallFailed> {
     let trust_managers = match pending.trust_ctx_key {
         Some(key) => ctx_trust_managers_table()
             .lock()
@@ -11985,13 +11541,7 @@ fn engine_consult_trust_managers(
         // identification still applies: in real JSSE it is the DEFAULT
         // `X509TrustManagerImpl` that performs it, so "no custom manager" is
         // the case where it is most certainly enforced.
-        if mode == TrustCheckMode::InVerifier {
-            // The identity half already ran at the top of
-            // `verify_server_cert`, on the chain rustls handed it.
-            return Ok(TrustOutcome::Accepted);
-        }
-        return engine_check_endpoint_identity(ctx, &pending, jsse_identifies)
-            .map(|()| TrustOutcome::Accepted);
+        return engine_check_endpoint_identity(ctx, &pending, jsse_identifies);
     }
 
     // Real JSSE authType is the key-exchange/signature algorithm; we don't
@@ -12160,11 +11710,6 @@ fn engine_consult_trust_managers(
     if rejected {
         let detail = rejection.unwrap_or_else(|| "no exception detail available".to_string());
         set_last_trust_rejection_detail(&detail);
-        if mode == TrustCheckMode::InVerifier {
-            // No `reject_peer_with_fatal_alert` and no throw: rustls is about to
-            // do the equivalent, correctly, from inside its own state machine.
-            return Ok(TrustOutcome::Rejected(detail));
-        }
         reject_peer_with_fatal_alert(pending.engine_id);
         return Err(crate::phases_early::throw_jca_exc(
             ctx,
@@ -12172,10 +11717,7 @@ fn engine_consult_trust_managers(
             &format!("TrustManager rejected the peer certificate chain: {detail}"),
         ));
     }
-    if mode == TrustCheckMode::InVerifier {
-        return Ok(TrustOutcome::Accepted);
-    }
-    engine_check_endpoint_identity(ctx, &pending, jsse_identifies).map(|()| TrustOutcome::Accepted)
+    engine_check_endpoint_identity(ctx, &pending, jsse_identifies)
 }
 
 /// Tell the peer that its certificate was refused, the way JSSE does: queue a
@@ -12681,46 +12223,7 @@ fn engine_session_for(
             }
         }
     }
-    // Carry the BINDINGS of the session that was being negotiated, not the
-    // object.
-    //
-    // This table is keyed `(engine, handshaked)`, so an engine asked for a
-    // session DURING its handshake and again after it gets two objects. JSSE has
-    // one: `getHandshakeSession()` answers "the session being negotiated" and,
-    // once negotiation succeeds, that same session is what `getSession()`
-    // returns — so whatever an application bound to it mid-handshake is still
-    // bound afterwards.
-    //
-    // `SSLEngineTest.mustCallResumeTrustedOnSessionResumption` is exactly that
-    // application: its `X509ExtendedTrustManager` does
-    // `engine.getHandshakeSession().putValue("key", "client")` and the test then
-    // blocks on `engine.getSession().getValue("key")`. While the TrustManager was
-    // consulted AFTER the handshake both calls saw the same object and it worked
-    // by accident; consulting it inside `verify_server_cert` (where JSSE consults
-    // it) made the write land on the pending object and the read find nothing —
-    // `LinkedBlockingQueue.take()` never returned and the test HUNG.
-    //
-    // Only the ATTRIBUTE MAP is shared, deliberately. Promoting the whole object
-    // was tried first and is much too broad a change: it makes the pending object
-    // the negotiated one, and `testSessionAfterHandshake`,
-    // `…KeyManagerFactory`, `…MutualAuth` and `…KeyManagerFactoryMutualAuth` then
-    // fail 12 parameterisations each (48 of 821) on `expected: <0> but was: <1>`.
-    // Sharing the map leaves session IDENTITY exactly as it was and moves only
-    // the thing JSSE's contract is actually about.
     let ses = build_synthetic_ssl_session(ctx, id)?;
-    if handshaked {
-        let pending = engine_session_table().lock().get(&(key.0, false)).copied();
-        if let Some(pending) = pending {
-            let attrs_slot = ctx.object_num_fields(pending) - 1;
-            if let Value::Object(Some(attrs)) = ctx.get_field(pending, attrs_slot) {
-                // Only when the pending session actually has a map — allocating
-                // one here would hand every negotiated session a non-null slot
-                // it did not have before.
-                let ses_slot = ctx.object_num_fields(ses) - 1;
-                ctx.set_field(ses, ses_slot, Value::Object(Some(attrs)));
-            }
-        }
-    }
     if handshaked {
         let k = gc_stable_objref_key(ctx, ses);
         negotiated_session_keys().lock().insert(k);
@@ -14256,7 +13759,38 @@ fn do_unwrap(
     // the record. Nothing is consumed here; on refusal the bytes are never fed
     // to rustls at all, so no ServerHello is ever produced.
     if let Some(host) = engine_pending_sni_host(ctx, id, &src_view, src_pos, src_lim) {
-        engine_run_sni_match_check(ctx, id, this, host)?;
+        if engine_run_sni_match_check(ctx, id, this, host)? {
+            // Refused. The engine now holds a fatal `unrecognized_name` for the
+            // peer and a `deferred_handshake_error` for this side; this call
+            // must report ORDINARY PROGRESS so the caller comes back for the
+            // wrap that emits the alert, and only the wrap after that raises.
+            //
+            // Consuming the hello record is what makes it progress:
+            // `SslHandler.decodeJdkCompatible` hands `unwrap` exactly one TLS
+            // record and treats `bytesConsumed != packetLength` as "not an
+            // SSL/TLS record" (`NotSslRecordException`), and a call that
+            // consumed nothing reports BUFFER_UNDERFLOW — the caller then
+            // waits for network data that is never coming and the deferred
+            // failure is never drained. The bytes are dropped rather than fed
+            // to rustls: a refused hello must not produce a ServerHello.
+            let rec_end = {
+                let b3 = bb_get_byte(ctx, &src_view, src_pos + 3).unwrap_or(0) as usize;
+                let b4 = bb_get_byte(ctx, &src_view, src_pos + 4).unwrap_or(0) as usize;
+                (src_pos + 5 + ((b3 << 8) | b4)).min(src_lim)
+            };
+            if rec_end > src_pos {
+                bb_set_pos(ctx, src, src_view.layout, rec_end);
+            }
+            let consumed = rec_end.saturating_sub(src_pos);
+            if __dbg_hs {
+                eprintln!(
+                    "[dbg-tls-hs] thread={:?} do_unwrap id={} RETURN(sni-refused) status=OK hs=NEED_WRAP consumed={} produced=0",
+                    std::thread::current().id(), id, consumed
+                );
+            }
+            let result = alloc_engine_result(ctx, SR_OK, HS_NEED_WRAP_R, consumed as i32, 0)?;
+            return Ok(Some(Value::Object(Some(result))));
+        }
     }
 
     // Realize the rustls connection — and, on the first inbound handshake
@@ -14358,25 +13892,7 @@ fn do_unwrap(
         Ok(false) => {}
     }
 
-    // These five span all three phases below, so they live outside every lock.
-    let mut plaintext: Vec<u8> = Vec::new();
-    let mut underflow = false;
-    // Collected inside the record loop (which holds the connection mutably) and
-    // written back to the engine once the loan is returned.
-    let mut captured_session_id: Option<Vec<u8>> = None;
-    // The loop stopped because the caller's destination could not hold the
-    // next record's plaintext — BUFFER_OVERFLOW, not BUFFER_UNDERFLOW. The
-    // two are opposite instructions ("give me a bigger buffer" vs "read more
-    // network data"), and answering UNDERFLOW when nothing more is coming is
-    // how a caller spins.
-    let mut dst_too_small = false;
-    let mut deferred_error: Option<(&'static str, String)> = None;
-
-    // ---- PHASE 1 (registry LOCKED): the deferred-task replay. --------------
-    //
-    // Split out from the record loop because the loop must run with the lock
-    // DROPPED — see `ConnCheckout`. This phase touches `s` and cannot.
-    {
+    let (status, hs, plaintext, pending_trust_check) = {
         let mut g = engine_registry().write();
         let s = match g.get_mut(&id) {
             Some(s) => s,
@@ -14394,6 +13910,18 @@ fn do_unwrap(
                 .into());
             }
         };
+        let mut plaintext: Vec<u8> = Vec::new();
+        let mut underflow = false;
+        // Collected inside the loop (which holds `s.conn` mutably) and written
+        // back to the engine once that borrow ends.
+        let mut captured_session_id: Option<Vec<u8>> = None;
+        // The loop stopped because the caller's destination could not hold the
+        // next record's plaintext — BUFFER_OVERFLOW, not BUFFER_UNDERFLOW. The
+        // two are opposite instructions ("give me a bigger buffer" vs "read more
+        // network data"), and answering UNDERFLOW when nothing more is coming is
+        // how a caller spins.
+        let mut dst_too_small = false;
+        let mut deferred_error: Option<(&'static str, String)> = None;
         // Replay whatever a delegated task deferred. These records were taken
         // out of the caller's buffer before the connection existed (see the
         // NEED_TASK arm above), so the caller will never present them again —
@@ -14448,32 +13976,8 @@ fn do_unwrap(
                 }
             }
         }
-    }
-    // ---- PHASE 2 (registry UNLOCKED, connection ON LOAN): the record loop. --
-    //
-    // The lock is dropped and the connection checked out for exactly this
-    // stretch, because `process_new_packets` below calls
-    // `PassthroughServerCertVerifier::verify_server_cert`, which consults the
-    // application's Java `TrustManager`. That upcall may call back into an
-    // engine native, and the registry's write guard is not reentrant.
-    //
-    // `ctx` is published for the same window so the verifier can reborrow it —
-    // the mechanism `JavaKeyManagerResolver::resolve` already uses from inside
-    // this same `process_new_packets`.
-    //
-    // The loop body is unchanged: a census of `s.*` accesses between its braces
-    // finds none. Its early `return Err(...)` exits are safe because
-    // `ConnCheckout::drop` restores the connection on every path.
-    let src_resolved = !matches!(src_view.backing, BbBacking::Unresolved);
-    {
-        let mut checkout = ConnCheckout::take(id);
-        let _active_ctx = set_active_native_context(ctx);
-        // Pinned for the window and released with it — see
-        // `set_active_engine_binding`. `unpin_native_roots(pin)` releases this
-        // frame and anything a nested `engine_run_trust_check` took above it.
-        let (_active_engine, engine_pin) = set_active_engine_binding(ctx, id, this);
-        let _unpin = UnpinOnDrop { base: engine_pin };
-        if let (true, Some(conn)) = (src_resolved, checkout.conn.as_mut()) {
+        let src_resolved = !matches!(src_view.backing, BbBacking::Unresolved);
+        if let (true, Some(conn)) = (src_resolved, s.conn.as_mut()) {
             loop {
                 if offset >= src_lim {
                     break;
@@ -14615,29 +14119,20 @@ fn do_unwrap(
                         // server engine, let the handshake driver observe NEED_WRAP
                         // and flush it before the channel closes; otherwise Netty
                         // reports only ClosedChannelException to the client.
-                        //
-                        // A CLIENT does NOT defer, and that was MEASURED rather than
-                        // assumed. Deferring its own `TrustManager` rejection so the
-                        // next `wrap` could drain the alert first looked right — it is
-                        // the shape the server branch uses — and it wedged the client
-                        // instead: netty never issued that wrap, so the deferred error
-                        // never drained and `handshakeFuture().await()` never returned.
-                        // `testHandshakeFailureOnlyFireExceptionOnce` went from ~50%
-                        // to a 10 s `@Timeout` on every run, failing at line 1545 (the
-                        // CLIENT's assertion) instead of 1546 (the server's). The
-                        // NEED_WRAP-while-pending rule can only be relied on where the
-                        // caller is already in a wrap-driving state.
                         if matches!(&*conn, EngineConn::Server(_)) {
                             // Deferred, not discarded: the next `wrap` drains
                             // the alert and then raises this.
                             deferred_error =
-                                Some((jsse_handshake_exception_class(&e), handshake_error_message(&e)));
+                                Some((jsse_handshake_exception_class(&e), format!("rustls: {}", e)));
                             offset = rec_end;
                             break;
                         }
                         let cls = jsse_handshake_exception_class(&e);
-                        let msg = handshake_error_message(&e);
-                        return Err(crate::phases_early::throw_jca_exc(ctx, cls, &msg));
+                        return Err(crate::phases_early::throw_jca_exc(
+                            ctx,
+                            cls,
+                            &format!("rustls: {}", e),
+                        ));
                     }
                     // POST-handshake record-layer failure. `SSLException`, not
                     // a bare `IOException`, for the same reason the handshake
@@ -14696,21 +14191,6 @@ fn do_unwrap(
                 }
             }
         }
-    } // <- ConnCheckout drops here: the connection is back in the registry and
-      //    `conn_checked_out` is clear, so PHASE 3 sees a normal engine.
-
-    // ---- PHASE 3 (registry LOCKED): write back and classify. ---------------
-    let (status, hs, pending_trust_check) = {
-        let mut g = engine_registry().write();
-        let s = match g.get_mut(&id) {
-            Some(s) => s,
-            None => {
-                return Err(RuntimeError::IOException {
-                    message: "engine handle missing".into(),
-                }
-                .into());
-            }
-        };
         if let Some(sid) = captured_session_id {
             if s.negotiated_session_id.is_empty() {
                 s.negotiated_session_id = sid;
@@ -14789,10 +14269,8 @@ fn do_unwrap(
         }
         // Extract-only — see `engine_take_pending_trust_check`'s doc for why
         // the actual Java call must happen after this lock is dropped.
-        // A verifier-time consultation has already set `trust_check_done`, so
-        // this answers `None` on its own — see `mark_trust_check_done`.
         let pending_trust_check = engine_take_pending_trust_check(id, s);
-        (status, hs, pending_trust_check)
+        (status, hs, plaintext, pending_trust_check)
     };
     if let Some(pending) = pending_trust_check {
         engine_run_trust_check(ctx, pending, Some(this))?;
