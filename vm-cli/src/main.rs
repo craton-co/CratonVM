@@ -4532,6 +4532,15 @@ fn run() -> Result<()> {
             "[cratonvm] compiled site-cached native dispatches (non-leaf): {}",
             cratonvm_vm::jit::helpers::site_cached_native_hit_count()
         );
+        // The subset of the line above served as a plain field load rather
+        // than a native call: signature-polymorphic `VarHandle` read modes on
+        // an ordinary instance field. Zero here beside a non-zero site-cached
+        // count means every VarHandle site refused the plan, which is a
+        // different fault from "no VarHandle site was reached".
+        eprintln!(
+            "[cratonvm]   of which VarHandle instance-field reads served directly: {}",
+            cratonvm_vm::jit::helpers::varhandle_field_read_hit_count()
+        );
         // The exact-receiver `java/util/regex/Matcher` leaf, which is neither of
         // the two above: it is the one by-name fast path that decides per
         // dispatch rather than at cache-fill time. Reported separately because
