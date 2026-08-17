@@ -1,6 +1,63 @@
 # commons-math: cluster of iterative-numeric-algorithm and RNG-dependent tests diverging from HotSpot by small floating-point margins
 
 ## Status
+**LARGELY CLOSED 2026-08-16 — root cause identified, and half the cluster
+dissolves on re-measurement.** Everything below the "The evidence" heading is
+the original filing, kept as written; this section records what was found
+afterwards. Nothing here contradicts the original *observations*, only some of
+the inferences drawn from them.
+
+**The mechanism the doc could not isolate: `java.lang.Math` was backed by
+platform libm where HotSpot runs fdlibm.** In JDK 25 every `Math`
+transcendental is a one-line `return StrictMath.f(...)`, so the two classes are
+the same function on HotSpot except where it substitutes an intrinsic — and
+`asin`, `acos`, `atan`, `atan2`, `hypot`, `sinh`, `cosh`, `expm1` and `log1p`
+have no intrinsic. Backing them with libm produced exactly the doc's shape:
+ULP-scale differences, invisible in isolation, that change an iteration count.
+A HotSpot-oracle census put numbers on it — `atan2` disagreed on 884 of 5400
+sampled inputs, `hypot` on 405. Fixed by registering those rows from the
+fdlibm port for `Math` as well as `StrictMath`. See the retired
+`bug-commonsmath-gaussnewton-testmaxevaluations-no-exception-20260816`
+write-up, which is where this was tracked down (a `hypot` ULP made an optimizer
+converge in 9 evaluations instead of exceeding a 100-evaluation budget).
+
+**Now passing** on the fixed binary, all previously failing:
+`MiniBatchKMeansClustererTest` (the "genuinely different final clustering"),
+`CalinskiHarabaszTest`, `SimplexOptimizerMultiDirectionalTest`.
+
+**Not CratonVM defects — they fail on HotSpot too.** The doc's opening claim
+that "all classes below pass on HotSpot" does not hold for three of them.
+Measured directly, JDK 25, identical classpath:
+
+| class | HotSpot | CratonVM (fixed) |
+| --- | --- | --- |
+| `SimplexOptimizerNelderMeadTest` | 1 failed | 3 failed |
+| `SimplexOptimizerTest` | 36 failed | 43 failed |
+| `FastSineTransformerTest` | **4 of 10 runs failed** | 6 of 10 |
+
+`FastSineTransformerTest` deserves its own note, because it is the doc's
+headline evidence — the "directly-measured ULP-level divergence". It builds its
+input from `RandomSource.MWC_256.create()` with **no seed** and compares a
+reference DST against the library's FFT to a 1e-13/1e-14 relative tolerance, so
+each run draws fresh data and the assertion sits near the edge. It fails on
+HotSpot 4 times in 10. A single observed failure of it is a coin flip, not a
+measurement, and the specific value quoted in the doc cannot be reproduced
+because the input that produced it no longer exists.
+
+**Genuinely still open:** the residual gap on the two `SimplexOptimizer`
+classes — 3 failures against HotSpot's 1, and 43 against 36. Much smaller than
+filed, and now bounded by a HotSpot number rather than by "passes on HotSpot",
+but not zero. The remaining `Math` divergences are `sin`, `cos`, `tan`, `exp`,
+`log10`, `cbrt`, `tanh` and `pow`, all ≤2 ULP: HotSpot intrinsifies those, its
+answers come from Intel LIBM assembly that matches neither fdlibm nor the host
+libm, and libm is already the closer of the two by one to two orders of
+magnitude. Whether that residue is what moves these two classes' iteration
+counts is untested.
+
+---
+
+*Original filing follows.*
+
 **OPEN, confirmed CratonVM-specific in aggregate, root cause NOT identified**
 — found 2026-08-16 running commons-math under CratonVM on Azure.
 Differential-verified against real HotSpot JDK 25: all classes below pass on

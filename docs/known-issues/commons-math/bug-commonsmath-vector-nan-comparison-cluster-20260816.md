@@ -1,10 +1,27 @@
 # commons-math: `expected NaN but was NaN` assertion failures in vector/statistics tests (root cause not yet confirmed)
 
 ## Status
-**OPEN, confirmed CratonVM-specific, root cause NOT yet identified** — found
-2026-08-16 running commons-math under CratonVM on Azure. Differential-verified
-against real HotSpot JDK 25: all affected classes pass on HotSpot with the
-identical classpath.
+**PARTLY FIXED 2026-08-16; the NaN-shaped core is still OPEN and not
+root-caused.** Found 2026-08-16 running commons-math under CratonVM on Azure.
+Differential-verified against real HotSpot JDK 25: all affected classes pass on
+HotSpot with the identical classpath.
+
+**Closed since filing:** `StatUtilsTest` (`testMax`, `testMin`) — the
+`expected:<NaN> but was:<-Infinity>` sibling listed below. It was never a
+comparison problem at all: `Math.max`/`Math.min` were backed by Rust's
+`f64::max`/`f64::min`, whose IEEE-754-2019 `maxNum` semantics deliberately
+**ignore** a NaN operand and return the other one, where Java's `Math.max`
+propagates it. Folding an array that contains `Double.NaN` therefore returned
+the fold's identity element, `-Infinity`, instead of `NaN`. Fixed in
+`native-builtins/src/lang_math.rs` (`java_max_double` and friends now transcribe
+`java.lang.Math`'s own bodies, signed-zero clause included), found by the
+HotSpot-oracle census described in the retired
+`bug-commonsmath-gaussnewton-testmaxevaluations-no-exception-20260816`
+write-up. `StatUtilsTest` is now 18/18.
+
+**Still OPEN, unchanged by that fix** (identical failure counts before and
+after): `RealVectorTest` (2), `SparseRealVectorTest` (3),
+`KendallsCorrelationTest` (4). Everything below this line concerns those.
 
 Filed as OPEN-not-root-caused rather than with a confident diagnosis because
 the obvious hypothesis was checked directly and **ruled out** — see "What was
@@ -40,9 +57,11 @@ Also seen, not NaN-shaped but likely part of the same general "vector entry
 comparison" family and worth investigating together:
 * `SparseRealVectorTest:testSubtractSameType` — `entry #45, left = 0.0, right
   = NaN` (a genuine 0.0-vs-NaN numeric divergence, not a same-value
-  comparison quirk).
+  comparison quirk). **Still open.**
 * `StatUtilsTest:testMax` — `expected:<NaN> but was:<-Infinity>` (also a
-  genuine numeric divergence).
+  genuine numeric divergence). **FIXED** — see the Status section: `Math.max`
+  was dropping the NaN. This one being a real arithmetic defect while the
+  NaN-shaped ones are not is the reason they were worth separating.
 
 ## What was ruled out
 A minimal, H2/commons-math-independent probe (`NanEqualsProbe.java`) checked
@@ -82,10 +101,15 @@ actual compared values) — not yet identified.
   HotSpot's, that alone could explain a divergent `assertEquals` behavior
   unrelated to `Double` semantics at all. Worth eliminating before assuming
   anything CratonVM-specific about `Double`.
-* Investigate the two non-NaN-shaped siblings (`SparseRealVectorTest`,
-  `StatUtilsTest`) separately once the NaN-shaped ones are understood — they
-  may turn out to be the same underlying numeric-divergence bug manifesting
-  with and without a NaN sentinel, or genuinely separate.
+* Investigate the remaining non-NaN-shaped sibling (`SparseRealVectorTest`)
+  separately. Its former partner `StatUtilsTest` turned out to be an ordinary
+  arithmetic defect with nothing to do with comparison, which is weak evidence
+  that this one is too — check `Math`/`JdkMath` primitives on the actual
+  operands before assuming a comparison or vector-machinery cause.
+* Run the same trick that found the `StatUtilsTest` cause: replay a HotSpot
+  oracle over `java.lang.Math` (`probes/MathCensus.java`) rather than reasoning
+  about which primitive "should" be fine. It takes minutes and it named two
+  defects that inspection had missed.
 
 ## Repro
 ```bash
