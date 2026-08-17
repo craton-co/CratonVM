@@ -6231,17 +6231,57 @@ fn register_sslserversocket(r: &mut NativeMethodRegistry) {
         // comment on a constant that has never existed in this tree — the
         // width rule they pointed at was only ever `num_fields - 1` open-coded
         // at five call sites. It exists now.
-        let session = try_alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLSession", 4)?;
+        let session0 = try_alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLSession", 4)?;
+        // GC: the four lines this replaces held `session` — and `p` — raw
+        // across `create_string`, which can run a moving young collection. The
+        // session's own pin is taken AFTER `sock_pin` so the single
+        // `unpin_native_roots(sock_pin)` at the end of this body still
+        // truncates both; the same discipline the ALPN stash and
+        // `new13_finish_socket` already use here.
+        let session_pin = ctx.pin_native_root(session0);
         let p = ctx.create_string(&proto);
-        let c = ctx.create_string(&cipher);
-        let sock = ctx.read_native_pin(sock_pin, sock);
+        let session = ctx.read_native_pin(session_pin, session0);
         ctx.set_field(session, 0, Value::Object(Some(p)));
+        let c = ctx.create_string(&cipher);
+        let session = ctx.read_native_pin(session_pin, session0);
         ctx.set_field(session, 1, Value::Object(Some(c)));
         // Offset id here too: the session accessors subtract
         // `RUSTLS_SOCK_ID_BASE` before asking `rustls_session_info`, and pass
         // anything below it to the native-tls lookup instead.
         ctx.set_field(session, 2, Value::Int(tls_id));
+        let sock = ctx.read_native_pin(sock_pin, sock);
         ctx.set_field(sock, SSS_SOCK_SESSION, Value::Object(Some(session)));
+        // G51 — the two facts this session carries that its four slots have no
+        // room for, both keyed on the session object.
+        //
+        // MEASURED, `RSslLiveSession` on `9ae371468`: `server.peerPort.isPositive
+        // = false WANT true`, and `server.localPrincipal` / `.class` /
+        // `server.localCertificates.length` all answering "no local identity"
+        // for a server that had just proved one. The endpoint is the CLIENT's
+        // — the server's peer is the client, so this is an ephemeral port and
+        // NOT the listener's; see `session_peer_endpoint_table` for the whole
+        // measured family. `rustls_session_info`'s SNI is deliberately not used
+        // as the host: HotSpot answers the peer's address literal here even
+        // when a different SNI name was sent, measured in both directions.
+        if let Some((peer_host, peer_port)) = rustls_server_peer_endpoint(stream_id) {
+            record_session_peer_endpoint(ctx, session, &peer_host, peer_port);
+        }
+        // The listener's own certificate chain — what this side sent the peer,
+        // which is what `getLocalCertificates()`/`getLocalPrincipal()` answer.
+        // Read from `sss_listener_identities`, whose row is inserted by
+        // `create_ssl_server_socket` from the very identity the rustls
+        // `ServerConfig` above was built out of, so the chain reported here and
+        // the chain presented on the wire have one source.
+        let local_pem = sss_listener_identities()
+            .lock()
+            .get(&id)
+            .map(|identity| identity.cert_pem.clone());
+        if let Some(pem) = local_pem {
+            let chain: Vec<Vec<u8>> = parse_cert_chain_pem(&pem)
+                .map(|certs| certs.iter().map(|c| c.as_ref().to_vec()).collect())
+                .unwrap_or_default();
+            record_local_cert_chain(ctx, session, chain);
+        }
         // Stash ALPN on the socket so `getApplicationProtocol()` can read it.
         // We use a side-table rather than widening SSLSocket's shape.
         if let Some(alpn_str) = alpn {
@@ -10504,6 +10544,203 @@ mod tests {
         );
     }
 
+    /// G51 — the peer endpoint on the shape that has no slot for one.
+    ///
+    /// MEASURED, `RSslLiveSession` on `9ae371468` (`target-rel3`), 2026-08-17:
+    ///
+    /// ```text
+    /// CK RSslLiveSession client.peerHost                    = null   WANT localhost
+    /// CK RSslLiveSession client.peerPort.isServerPort       = false  WANT true
+    /// CK RSslLiveSession attrs.shadow.peerHost              = null   WANT localhost
+    /// CK RSslLiveSession attrs.shadow.peerPort.isServerPort = false  WANT true
+    /// CK RSslLiveSession server.peerPort.isPositive         = false  WANT true
+    /// ```
+    ///
+    /// The trap is armed in the same breath: slot 3 carries a populated
+    /// ATTRIBUTE MAP, which is the state E31-1 §2 records — a width-blind read
+    /// hands a `java.util.HashMap` back through a `()Ljava/lang/String;`
+    /// descriptor. The recorded endpoint must be answered from the SIDE TABLE
+    /// and the attribute slot must stay untouched, which is the whole reason
+    /// G44-1 §4 rejected widening the session shape instead.
+    #[test]
+    fn a_recorded_peer_endpoint_answers_the_shape_that_has_no_slot_for_one() {
+        use crate::test_utils::MockNativeContext;
+        let r = session_registry();
+        let mut ctx = MockNativeContext::new();
+
+        // The width-4 HTTPS/accept shape, with the attribute map populated.
+        let sess = ctx.alloc_object(cratonvm_types::ClassId::new(0), 4);
+        ctx.set_field(
+            sess,
+            2,
+            Value::Int(crate::net_phase_e::HTTPS_CLIENT_SESSION_MARKER),
+        );
+        let map = ctx.alloc_object(cratonvm_types::ClassId::new(0), 1);
+        ctx.set_field(sess, 3, Value::Object(Some(map)));
+        let this = &[Value::Object(Some(sess))];
+
+        let host = r
+            .find(
+                "javax/net/ssl/SSLSession",
+                "getPeerHost",
+                "()Ljava/lang/String;",
+            )
+            .expect("getPeerHost registered");
+        let port = r
+            .find("javax/net/ssl/SSLSession", "getPeerPort", "()I")
+            .expect("getPeerPort registered");
+
+        // MUTATION GUARD, and the before-state: with nothing recorded the two
+        // accessors must still answer HotSpot's never-negotiated pair, because
+        // that is what `RSslNullSession` (89 checks, green) asserts.
+        assert_eq!(host(&mut ctx, this).unwrap(), Some(Value::Object(None)));
+        assert_eq!(port(&mut ctx, this).unwrap(), Some(Value::Int(-1)));
+
+        super::record_session_peer_endpoint(&ctx, sess, "localhost", 45123);
+        match host(&mut ctx, this).unwrap() {
+            Some(Value::Object(Some(s))) => {
+                assert_eq!(ctx.read_string(s).as_deref(), Some("localhost"))
+            }
+            other => panic!("getPeerHost must answer the recorded host, got {other:?}"),
+        }
+        assert_eq!(port(&mut ctx, this).unwrap(), Some(Value::Int(45123)));
+        assert_eq!(
+            ctx.get_field(sess, 3),
+            Value::Object(Some(map)),
+            "the attribute slot is not the peer host and must not be disturbed \
+             — E31-1 §2, and the reason G44-1 §4 refuses to widen this shape"
+        );
+    }
+
+    /// The recorded endpoint must NOT outrank the slots on the shapes that
+    /// genuinely carry a peer host and port.
+    ///
+    /// The width branch runs first, deliberately: the 6- and 8-field shapes are
+    /// written by their own minters and a side-table row for one of them would
+    /// be a second source of truth for a fact the object already states. This
+    /// is the mutation check on the ORDER of the two lookups — a reader that
+    /// consulted the table first would pass every other test in this file.
+    #[test]
+    fn a_recorded_endpoint_does_not_shadow_the_slots_that_carry_one() {
+        use crate::test_utils::MockNativeContext;
+        let r = session_registry();
+        let mut ctx = MockNativeContext::new();
+        let host = r
+            .find(
+                "javax/net/ssl/SSLSession",
+                "getPeerHost",
+                "()Ljava/lang/String;",
+            )
+            .expect("getPeerHost registered");
+        let port = r
+            .find("javax/net/ssl/SSLSession", "getPeerPort", "()I")
+            .expect("getPeerPort registered");
+
+        for width in [6, 8] {
+            let sess = ctx.alloc_object(cratonvm_types::ClassId::new(0), width);
+            let h = ctx.create_string("example.test");
+            ctx.set_field(sess, 3, Value::Object(Some(h)));
+            ctx.set_field(sess, 4, Value::Int(8443));
+            super::record_session_peer_endpoint(&ctx, sess, "wrong.test", 1);
+            let this = &[Value::Object(Some(sess))];
+            assert_eq!(
+                host(&mut ctx, this).unwrap(),
+                Some(Value::Object(Some(h))),
+                "slot 3 wins at width {width}"
+            );
+            assert_eq!(port(&mut ctx, this).unwrap(), Some(Value::Int(8443)));
+        }
+    }
+
+    /// "Nothing to say" must stay ABSENT, not become a recorded blank.
+    ///
+    /// An absent row means "nobody recorded an endpoint", and both readers fall
+    /// THROUGH it to `session_stream_id` and the socket registry — which is the
+    /// only answer the `SSLSocketFactory.createSocket` client shape has. A row
+    /// of `("", -1)` would shadow that. HotSpot's never-connected pair
+    /// (`null`, `-1`) is measured in `session_peer_endpoint_table`'s table.
+    #[test]
+    fn an_empty_endpoint_is_not_recorded_at_all() {
+        use crate::test_utils::MockNativeContext;
+        let mut ctx = MockNativeContext::new();
+        let sess = ctx.alloc_object(cratonvm_types::ClassId::new(0), 4);
+        super::record_session_peer_endpoint(&ctx, sess, "", -1);
+        assert!(
+            super::session_peer_endpoint(&ctx, sess).is_none(),
+            "an empty host and a non-positive port say nothing, and a row that \
+             says nothing shadows the socket-registry fallback"
+        );
+        super::record_session_peer_endpoint(&ctx, sess, "", 4711);
+        assert_eq!(
+            super::session_peer_endpoint(&ctx, sess),
+            Some((String::new(), 4711)),
+            "a port with no host is still an answer for getPeerPort"
+        );
+    }
+
+    /// G51 — the SERVER session's own certificate chain.
+    ///
+    /// MEASURED, `RSslLiveSession` on `9ae371468`: `server.localPrincipal =
+    /// null WANT CN=localhost`, `server.localPrincipal.class = null`, and
+    /// `server.localCertificates.length = -1 WANT 1`. All three read
+    /// `session_local_certs_table`, whose only writer before G51 was an
+    /// open-coded insert at the tail of `build_synthetic_ssl_session` — a
+    /// function `SSLServerSocket.accept()` never reaches.
+    ///
+    /// The empty-chain contract is the other half and is NOT a tidiness rule:
+    /// `client.localCertificates = null` and `client.localPrincipal = null` are
+    /// measured GREEN rows for a client with no configured identity, and
+    /// `ssl_security`'s two readers answer `null` on an empty chain. A writer
+    /// that recorded an empty vector would turn those into `Certificate[0]`.
+    #[test]
+    fn the_local_chain_writer_records_a_chain_and_declines_an_empty_one() {
+        use crate::test_utils::MockNativeContext;
+        let mut ctx = MockNativeContext::new();
+        let sess = ctx.alloc_object(cratonvm_types::ClassId::new(0), 4);
+        super::record_local_cert_chain(&ctx, sess, vec![]);
+        assert!(
+            super::local_certs_for_session(&ctx, sess).is_empty(),
+            "an empty chain must leave the table empty: getLocalCertificates() \
+             answers null there, which is the measured client-side row"
+        );
+        super::record_local_cert_chain(&ctx, sess, vec![vec![0x30, 0x82, 0x03]]);
+        assert_eq!(
+            super::local_certs_for_session(&ctx, sess),
+            vec![vec![0x30u8, 0x82, 0x03]],
+            "the accepted server session's local chain is what \
+             getLocalCertificates() returns and what getLocalPrincipal() takes \
+             its subject from — one fact, three rows"
+        );
+    }
+
+    /// A dual-stack listener reports a loopback client as `::ffff:127.0.0.1`.
+    ///
+    /// MEASURED on HotSpot (`scratchpad/g51/G51Probe.java`): the server-side
+    /// `getPeerHost()` is `127.0.0.1`, equal to the accepted socket's own
+    /// `getInetAddress().getHostAddress()`, and it is never reverse-resolved to
+    /// a name. A real IPv6 peer keeps its own spelling.
+    #[test]
+    fn an_ipv4_mapped_peer_address_is_reported_in_ipv4_spelling() {
+        use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+        let mapped = SocketAddr::from((Ipv4Addr::new(127, 0, 0, 1).to_ipv6_mapped(), 53114));
+        assert_eq!(
+            super::socket_addr_endpoint(mapped),
+            ("127.0.0.1".to_string(), 53114)
+        );
+        let v4 = SocketAddr::from((Ipv4Addr::new(127, 0, 0, 1), 53114));
+        assert_eq!(
+            super::socket_addr_endpoint(v4),
+            ("127.0.0.1".to_string(), 53114)
+        );
+        let v6 = SocketAddr::from((Ipv6Addr::LOCALHOST, 53114));
+        assert_eq!(
+            super::socket_addr_endpoint(v6),
+            ("::1".to_string(), 53114),
+            "a genuine IPv6 peer is not an IPv4-mapped one and keeps its \
+             spelling"
+        );
+    }
+
     /// The two peer-identity doors must see ONE chain.
     ///
     /// `t27_tls::getPeerCertificates` and `ssl_security::getPeerPrincipal` are
@@ -14431,11 +14668,11 @@ fn build_synthetic_ssl_session(ctx: &mut dyn NativeContext, id: i32) -> Result<O
         .and_then(|pem| parse_cert_chain_pem(&pem).ok())
         .map(|certs| certs.iter().map(|c| c.as_ref().to_vec()).collect())
         .unwrap_or_default();
-    if !local_chain.is_empty() {
-        session_local_certs_table()
-            .lock()
-            .insert(gc_stable_objref_key(ctx, ses), local_chain);
-    }
+    // G51: was an open-coded `.lock().insert(..)`, the table's only writer.
+    // Routed through `record_local_cert_chain` so the accept path added there
+    // and this one cannot drift — including the empty-chain contract, which is
+    // load-bearing (`client.localCertificates = null` is a measured green row).
+    record_local_cert_chain(ctx, ses, local_chain);
     Ok(ses)
 }
 
@@ -17248,6 +17485,183 @@ pub(crate) fn local_certs_for_session(ctx: &dyn NativeContext, session: ObjectRe
         .unwrap_or_default()
 }
 
+/// The crate-visible WRITER for `session_local_certs_table`, named by
+/// `session_local_certs_table`'s own doc comment since that table was written —
+/// and, until G51, not present in the tree at all. `grep -rn
+/// 'record_local_cert_chain'` over `native-builtins/src/` returned exactly one
+/// hit, the doc comment promising it. The table had ONE writer, an open-coded
+/// `.lock().insert(..)` at the tail of `build_synthetic_ssl_session`, and that
+/// function is reached only from the engine path.
+///
+/// MEASURED consequence, `RSslLiveSession` on `9ae371468` (`target-rel3`),
+/// 2026-08-17 — the server side of a completed loopback handshake, through
+/// `SSLServerSocket.accept()`, which never goes near
+/// `build_synthetic_ssl_session`:
+///
+/// ```text
+/// CK RSslLiveSession server.localPrincipal          = null  WANT CN=localhost
+/// CK RSslLiveSession server.localPrincipal.class    = null  WANT javax.security.auth.x500.X500Principal
+/// CK RSslLiveSession server.localCertificates.length = -1   WANT 1
+/// ```
+///
+/// All three are one fact: `ssl_security`'s `getLocalCertificates` and
+/// `getLocalPrincipal` both read this table (the second derives the subject
+/// from the leaf of what the first returns, which is exactly HotSpot's
+/// contract), and for an accepted server session it was empty.
+///
+/// A no-op on an empty chain, for the same reason [`record_client_peer_chain`]
+/// is: a client with no configured identity legitimately has none, and
+/// `getLocalCertificates()` answering `null` there is the measured HotSpot
+/// answer (`client.localCertificates = null`, green today and still green).
+pub(crate) fn record_local_cert_chain(
+    ctx: &dyn NativeContext,
+    session: ObjectRef,
+    chain_der: Vec<Vec<u8>>,
+) {
+    if chain_der.is_empty() {
+        return;
+    }
+    session_local_certs_table()
+        .lock()
+        .insert(gc_stable_objref_key(ctx, session), chain_der);
+}
+
+/// Side-table associating an `SSLSession` object with the ENDPOINT its peer was
+/// reached at — `(host, port)` — for the session shapes that have no slot to
+/// carry one.
+///
+/// **Why a side table and not a wider session.** G44-1 §4 enumerated the
+/// widening against every width-keyed reader in this file and it fails at every
+/// width: at 6 `session_proto_slot`/`session_cipher_slot` SWAP, `sslsess_attrs_slot`
+/// goes `None` so the whole attribute API silently no-ops, and
+/// `session_has_negotiated` falls into `_ => true` — which makes the NULL
+/// session valid again and takes the green `RSslNullSession` with it; at 7 the
+/// swap remains and the three green `*.sessionContext.isNull` rows go red.
+/// `phases_late::ssl_security::NEW13_SSL_SESS_FIELDS` now carries that table as
+/// a "DO NOT WIDEN" block with a test asserting the slot map against this
+/// file's two slot functions. This is the shape that costs nothing:
+/// [`session_peer_certs_table`] already solves the identical problem — a fact
+/// about the peer that the narrow shape has no slot for — keyed the same way,
+/// on the session OBJECT.
+///
+/// **The port is `i32`, not `u16`.** `-1` is HotSpot's measured answer for "no
+/// peer", and a table that could only hold `0..=65535` would have to spell that
+/// as an absent row, which is a different statement: absent means "nobody
+/// recorded an endpoint for this session", and the readers below fall THROUGH
+/// an absent row to the socket registry. A recorded `-1` would be a claim.
+/// Nothing writes one today; the type is what keeps the distinction available.
+///
+/// MEASURED, HotSpot 25.0.3+9-LTS `Microsoft-13877124`, this host, 2026-08-17
+/// (`scratchpad/g51/G51Probe.java` and `G51Engine.java`, the full
+/// peer-endpoint family):
+///
+/// ```text
+///                                              getPeerHost()   getPeerPort()
+///   never-connected SSLSocket                  null            -1
+///   client SSLSocket dialled by hostname       localhost       the server port
+///   client SSLSocket dialled by IP literal     127.0.0.1       the server port
+///     ... and the SAME with an explicit SNIHostName("localhost") set:
+///         SNI does NOT reach getPeerHost, in either direction
+///   the SERVER's view of that handshake        127.0.0.1       the CLIENT's
+///                                              (the literal,     ephemeral port
+///                                               never reverse    (positive, and
+///                                               resolved)        NOT the listener's)
+///   SSLEngine, no peer named                   null            -1
+///   SSLEngine("example.test", 8443), pre-hs    null            -1
+///   SSLEngine("example.test", 8443), post-hs   example.test    8443
+///   SSLEngine server side of that handshake    null            -1
+///   any of the above after invalidate()        unchanged
+/// ```
+///
+/// Two of those rows are the whole design. **The host is the one the CALLER
+/// NAMED, not one derived from the peer's certificate and not one derived from
+/// SNI** — the IP-literal row proves it (leaf subject `CN=localhost`, SNI
+/// `localhost`, answer `127.0.0.1`). And **the server's peer is the CLIENT**,
+/// so its port is an ephemeral one and comparing it to the listener's port is
+/// the wrong test; `RSslLiveSession` asserts `> 0` there and `== port` on the
+/// client side, and those are different questions on purpose.
+fn session_peer_endpoint_table() -> &'static Mutex<HashMap<u64, (String, i32)>> {
+    static T: OnceLock<Mutex<HashMap<u64, (String, i32)>>> = OnceLock::new();
+    T.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Record the endpoint a session's peer was reached at. See
+/// [`session_peer_endpoint_table`] for the measured contract and for why this
+/// is a side table rather than two more fields on the session.
+///
+/// A no-op when there is nothing to say — an empty host AND a non-positive
+/// port. That is not tidiness: the readers below FALL THROUGH an absent row to
+/// `session_stream_id`, and a row of `("", -1)` would shadow a real answer the
+/// socket registry could still have given.
+pub(crate) fn record_session_peer_endpoint(
+    ctx: &dyn NativeContext,
+    session: ObjectRef,
+    host: &str,
+    port: i32,
+) {
+    if host.is_empty() && port <= 0 {
+        return;
+    }
+    session_peer_endpoint_table()
+        .lock()
+        .insert(gc_stable_objref_key(ctx, session), (host.to_string(), port));
+}
+
+/// The recorded endpoint for a session object, or `None` if none was recorded.
+fn session_peer_endpoint(ctx: &dyn NativeContext, session: ObjectRef) -> Option<(String, i32)> {
+    session_peer_endpoint_table()
+        .lock()
+        .get(&gc_stable_objref_key(ctx, session))
+        .cloned()
+}
+
+/// The remote address of an accepted rustls server stream, as
+/// `(host-literal, port)`.
+///
+/// `rustls_server_accept_within` binds the accepted peer address as `_peer` and
+/// drops it, and `TlsServerStreamEntry` — unlike its client twin, which carries
+/// `peer_host`/`peer_port` — has no field for it. Rather than widen the entry
+/// for one accessor, this asks the duplicate socket handle the entry already
+/// keeps for exactly this class of out-of-band question (`raw`; see
+/// [`TlsClientStreamEntry::raw`]).
+///
+/// The literal is normalised out of IPv4-mapped IPv6 form: a dual-stack
+/// listener reports a loopback client as `::ffff:127.0.0.1`, and HotSpot's
+/// measured answer is `127.0.0.1` (`G51Probe`, `server.peerHost`, which agrees
+/// with the accepted socket's own `getInetAddress().getHostAddress()`).
+/// HotSpot does NOT reverse-resolve it to a name, so neither does this.
+pub(crate) fn rustls_server_peer_endpoint(rid: i32) -> Option<(String, i32)> {
+    let reg = sreg().lock();
+    let address = reg
+        .server_streams
+        .get(&rid)?
+        .raw
+        .as_ref()?
+        .peer_addr()
+        .ok()?;
+    Some(socket_addr_endpoint(address))
+}
+
+/// `(host-literal, port)` for a remote socket address, in the spelling HotSpot
+/// answers `SSLSession.getPeerHost()` with.
+///
+/// Split out of [`rustls_server_peer_endpoint`] because the only interesting
+/// thing in it — the IPv4-mapped normalisation — needs no socket to test, and a
+/// rule that lives inside a function requiring a live TLS peer is a rule
+/// nothing checks. A dual-stack listener reports a loopback client as
+/// `::ffff:127.0.0.1`; HotSpot's measured answer is `127.0.0.1`, matching the
+/// accepted socket's own `getInetAddress().getHostAddress()`.
+fn socket_addr_endpoint(address: std::net::SocketAddr) -> (String, i32) {
+    let ip = match address.ip() {
+        std::net::IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) => std::net::IpAddr::V4(v4),
+            None => std::net::IpAddr::V6(v6),
+        },
+        other => other,
+    };
+    (ip.to_string(), address.port() as i32)
+}
+
 /// FIX (netty-https-client-trust residual): populate `session_peer_certs_table`
 /// for a CLIENT-side `SSLSession` (allocated by `phases_late::new13_alloc_ssl_session`
 /// for the native-tls `SSLSocketFactory.createSocket` path). Without this, the
@@ -18143,6 +18557,30 @@ fn register_ssl_session_real(r: &mut NativeMethodRegistry) {
             }
             return Ok(Some(Value::Object(None)));
         }
+        // G51: the object-keyed endpoint table, consulted BEFORE the socket
+        // registry and AFTER the width branch above. See
+        // `session_peer_endpoint_table` for the measured family and for why the
+        // answer cannot live in a session slot on this shape.
+        //
+        // Order matters in one direction only. A recorded row is the endpoint
+        // the caller NAMED for this exact session object; the registry lookup
+        // below is keyed on a TLS stream id, and the shape that most needs an
+        // answer here — the HTTPS client session — carries
+        // `net_phase_e::HTTPS_CLIENT_SESSION_MARKER` in slot 2 precisely so
+        // that every socket-registry lookup MISSES (see that constant: it
+        // cannot be given a real stream id without leaking one registry entry
+        // per request). So for that shape the fallback cannot answer by
+        // design, and for the accepted server session the registry has no row
+        // either — `s2_tls_session_info` reads `servlet`'s native-tls table,
+        // and an accepted rustls stream lives in this file's `server_streams`.
+        // Same `let`-binding discipline as the fallback below.
+        let recorded = session_peer_endpoint(ctx, this)
+            .map(|(host, _)| host)
+            .filter(|h| !h.is_empty());
+        if let Some(host) = recorded {
+            let s = ctx.create_string(&host);
+            return Ok(Some(Value::Object(Some(s))));
+        }
         // Bound to a `let`, and NOT written as `if let Some(id) =
         // session_stream_id(ctx, this)`: the `&*ctx` reborrow in an `if let`
         // scrutinee is a temporary that lives to the end of the block under
@@ -18176,6 +18614,18 @@ fn register_ssl_session_real(r: &mut NativeMethodRegistry) {
                 return Ok(Some(Value::Int(if p == 0 { -1 } else { p })));
             }
             return Ok(Some(Value::Int(-1)));
+        }
+        // G51 — the endpoint table, same position and same reasoning as
+        // `getPeerHost` above. A recorded row whose port is non-positive is NOT
+        // an answer: `record_session_peer_endpoint` accepts a host-only row
+        // (nothing writes one today, but the shape is reachable), and falling
+        // through to the registry there is right for the same reason an absent
+        // row falls through.
+        let recorded = session_peer_endpoint(ctx, this)
+            .map(|(_, port)| port)
+            .filter(|p| *p > 0);
+        if let Some(p) = recorded {
+            return Ok(Some(Value::Int(p)));
         }
         // Same `let`-binding discipline as `getPeerHost` above. This body has
         // no `&mut ctx` use inside the block today, so the hazard is latent
