@@ -153,10 +153,38 @@ rediscovered.
 **N1 — `String.intern()`, §4.** A one-method defect with a measured oracle row
 and no vector covering it. The natural first step is a vector row, not a fix.
 
-**N2 — the URI components, §4.** Three measured rows, one shape
-(`net_uri_inet`'s parse writing components from `&str` slices). Bigger than N1
-and worth doing with `G55-1`'s `JavaText` in hand rather than inventing a
-fourth spelling.
+**N2 — the URI components, §4. EXAMINED IN-SESSION AND REFUSED; the reason is
+the value of this nomination.** Three measured rows, one shape:
+`net_uri_inet::url_parse` derives every component from `&str` slices.
+
+Converting it to units is not a local change. `url_parse` serves the `file:`
+fast path, the `jar:` path, opaque URIs and the hierarchical splitter, with
+component strings created at a dozen sites — **all of them currently green**,
+including the entire 50-row `uri` family and every `file:`/`jar:` consumer in
+the tree (`Class.getProtectionDomain`, the Spring Boot launcher's
+`getSchemeSpecificPart` → `new File`). The rewrite's blast radius is that
+whole surface; the evidence behind it is three rows on lone-surrogate input
+that no vector asserts and no consumer has ever been shown to reach.
+
+Two bounded alternatives were designed and both rejected:
+
+* **A units-space splitter used only when `has_unpaired_surrogate` is true.**
+  Cannot regress anything, since it runs only on input already answered
+  wrongly. Rejected because it is a *second* implementation of URI splitting —
+  precisely the "fourth copy of one search rule" this directory has already
+  paid for once (`F18-1`) — kept alive by a branch almost nothing takes, which
+  is how a copy drifts unnoticed.
+* **A byte-offset → unit-offset translation reusing `url_parse`'s own
+  decisions.** No duplicated parsing, and it is the right shape. Rejected
+  because `url_parse` does not expose ranges — it creates the strings directly
+  — so obtaining them means either changing its return type across every call
+  site or locating substrings by search, which is ambiguous.
+
+**What this leaves true:** `toString()` is now exact, so the units ARE
+recoverable by any caller that needs them. The derived components are not.
+Taking this properly means giving `url_parse` a range-returning shape first,
+as its own change, with the `uri` family as the regression net — and then the
+component fix is small. That sequencing is the nomination.
 
 **N3 — `java/net/URI.<init>(Ljava/lang/String;)V` is registered twice, and one
 of the two is dead under `--jdk-only`.** Last-write-wins with no unregister

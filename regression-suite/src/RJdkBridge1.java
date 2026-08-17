@@ -1764,7 +1764,7 @@ public class RJdkBridge1 {
     }
 
     // ------------------------------------------------------------------
-    // surrog — hazard 6, across SEVEN bridge classes. A Rust `str` cannot
+    // surrog — hazard 6, across EIGHT bridge classes. A Rust `str` cannot
     // hold an unpaired UTF-16 surrogate, so any bridge that round-trips a
     // Java String through one either rejects it, replaces it with U+FFFD, or
     // reshapes it. Every assertion here is on the CHAR VALUES, never on a
@@ -1873,7 +1873,24 @@ public class RJdkBridge1 {
         check(ns.length() == 3 && ns.charAt(1) == 0xD800,
                 "new String(char[]) must not sanitise an unpaired surrogate");
 
-        sectionEnd("surrog", 22);
+        // intern() is the one ACC_NATIVE method left in java.lang.String, and
+        // the obvious implementation routes the content through a pool keyed
+        // by host-language text -- which cannot hold an unpaired surrogate.
+        // Two rows, because the first alone can be passed by returning the
+        // receiver, and that silently breaks the contract the second asserts.
+        step("surrog", "String.intern() with a lone surrogate");
+        String is1 = new String(new char[] {'a', (char) 0xD800, 'b'}).intern();
+        check(is1.length() == 3 && is1.charAt(1) == 0xD800,
+                "intern() must answer the same TEXT, surrogate intact, got charAt(1)="
+                        + Integer.toHexString(is1.charAt(1)));
+
+        step("surrog", "String.intern() identity across two equal lone-surrogate strings");
+        String is2 = new String(new char[] {'a', (char) 0xD800, 'b'}).intern();
+        check(is1 == is2,
+                "s.equals(t) must imply s.intern() == t.intern(), including when the text "
+                        + "is not representable in the host language");
+
+        sectionEnd("surrog", 24);
     }
 
     static final int SFF = 15;

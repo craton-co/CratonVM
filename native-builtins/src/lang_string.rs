@@ -602,10 +602,82 @@ pub(crate) fn native_string_intern(
     // dropped at end-of-scope (intentionally — we only needed its pool
     // side-effect), but its underlying bytes remain interned globally so
     // subsequent calls hit the pool's read path with no allocation.
+    // A string whose content is not representable as Rust text cannot go
+    // through the pools above: `read_string` decodes an unpaired surrogate to
+    // U+FFFD and `create_string` re-encodes that substitution, so `intern()`
+    // answered a DIFFERENT string than the receiver. MEASURED on both VMs at
+    // `89e2c56f1`, alongside seven siblings that are all exact
+    // (`substring`, `concat`, `StringBuilder.append`, `toCharArray`,
+    // `indexOf`, `equals`, and String construction itself):
+    //
+    // ```text
+    //   "a<U+D800>b".intern().charAt(1)     HotSpot d800    CratonVM fffd
+    // ```
+    //
+    // Returning the receiver would fix that row and BREAK the contract that
+    // makes `intern` worth having: `s.equals(t)` must imply
+    // `s.intern() == t.intern()`, and two equal lone-surrogate strings would
+    // then answer two different objects. So the unrepresentable case gets its
+    // own pool, keyed on the UTF-16 units — which ARE Java's equality — with
+    // the first caller's receiver becoming the canonical instance.
+    let units = read_string_chars(&*ctx, this);
+    if has_unpaired_surrogate(&units) {
+        return Ok(Some(Value::Object(Some(intern_unrepresentable(
+            ctx, this, units,
+        )))));
+    }
+
     let text = ctx.read_string(this).unwrap_or_default();
     let arc = intern_arc(&text);
     let interned = ctx.create_string(&arc);
     Ok(Some(Value::Object(Some(interned))))
+}
+
+/// The intern pool for strings Rust text cannot hold, keyed by UTF-16 units.
+///
+/// Values are global-root HANDLES, never `ObjectRef`s: the collector owns the
+/// reference and hands back its current, possibly relocated address. Same
+/// shape, and the same reason, as `net_phase_e::HttpsCarrierSession`'s cached
+/// session.
+///
+/// Unbounded in principle, exactly as the real intern pool is — and in
+/// practice bounded by how many distinct lone-surrogate strings a program
+/// interns, which is a set every measurement in this tree has found empty
+/// outside a test.
+fn surrogate_intern_pool() -> &'static std::sync::Mutex<std::collections::HashMap<Vec<u16>, usize>>
+{
+    static P: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<Vec<u16>, usize>>,
+    > = std::sync::OnceLock::new();
+    P.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Canonical instance for a string the Rust-text pools cannot represent.
+///
+/// The root is taken BEFORE the table is consulted, and a loser releases its
+/// own root rather than leaving it held for the life of the VM — the
+/// `https_session_object` idiom. Written that way because the alternative,
+/// holding the lock across `add_global_root`, is the "native holds a
+/// process-global lock across a call that re-enters the VM" cycle this
+/// workspace has already paid for once.
+fn intern_unrepresentable(
+    ctx: &mut dyn NativeContext,
+    this: cratonvm_types::ObjectRef,
+    units: Vec<u16>,
+) -> cratonvm_types::ObjectRef {
+    let handle = ctx.add_global_root(this);
+    let winner = {
+        let Ok(mut pool) = surrogate_intern_pool().lock() else {
+            return this;
+        };
+        *pool.entry(units).or_insert(handle)
+    };
+    if winner != handle {
+        ctx.remove_global_root(handle);
+    }
+    // `resolve_global_root` is the only correct way back: the winning object
+    // may have been relocated since it was rooted.
+    ctx.resolve_global_root(winner).unwrap_or(this)
 }
 
 /// `String(AbstractStringBuilder, Void)` — private/package constructor used by
