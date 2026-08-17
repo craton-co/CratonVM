@@ -7137,7 +7137,7 @@ pub(super) fn execute_jit_call(
                 || jit_saved_args_to_values(cached, &saved_args, np),
                 |args| args.to_vec(),
             );
-            let throw_pc = jit_local_athrow_pc(cached, sig.athrow_bci);
+            let throw_pc = jit_local_athrow_pc_kind(cached, sig.athrow_bci);
             return route_jit_signal_exception(
                 shared,
                 thread,
@@ -7221,7 +7221,7 @@ pub(super) fn execute_jit_call(
                     thread,
                     frame_idx,
                     cached,
-                    usize::MAX,
+                    JitThrowPc::Unknown,
                     exc,
                     &exc_locals,
                 );
@@ -7268,7 +7268,7 @@ pub(super) fn execute_jit_call(
                     thread,
                     frame_idx,
                     cached,
-                    usize::MAX,
+                    JitThrowPc::Unknown,
                     exc,
                     &exc_locals,
                 );
@@ -7310,7 +7310,7 @@ pub(super) fn execute_jit_call(
                     thread,
                     frame_idx,
                     cached,
-                    usize::MAX,
+                    JitThrowPc::Unknown,
                     exc,
                     &exc_locals,
                 );
@@ -7655,7 +7655,7 @@ pub(super) fn execute_jit_call_decoded(
             // RBC.6 correctness fix — see the identical comment at
             // `execute_jit_call`'s sibling call site: use the athrow's own
             // known bci when available instead of always `usize::MAX`.
-            let throw_pc = jit_local_athrow_pc(cached, sig.athrow_bci);
+            let throw_pc = jit_local_athrow_pc_kind(cached, sig.athrow_bci);
             return route_jit_signal_exception(
                 shared, thread, frame_idx, cached, throw_pc, exc, args_slice,
             )
@@ -7693,7 +7693,7 @@ pub(super) fn execute_jit_call_decoded(
                     thread,
                     frame_idx,
                     cached,
-                    usize::MAX,
+                    JitThrowPc::Unknown,
                     exc,
                     args_slice,
                 )
@@ -7716,7 +7716,7 @@ pub(super) fn execute_jit_call_decoded(
                     thread,
                     frame_idx,
                     cached,
-                    usize::MAX,
+                    JitThrowPc::Unknown,
                     exc,
                     args_slice,
                 )
@@ -7742,7 +7742,7 @@ pub(super) fn execute_jit_call_decoded(
                     thread,
                     frame_idx,
                     cached,
-                    usize::MAX,
+                    JitThrowPc::Unknown,
                     exc,
                     args_slice,
                 )
