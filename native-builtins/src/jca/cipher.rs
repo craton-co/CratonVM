@@ -1922,11 +1922,27 @@ const SPI_INIT_PLAIN: &str = "(ILjava/security/Key;Ljava/security/SecureRandom;)
 
 /// Shared body of the two provider-taking `Cipher.getInstance` overloads.
 ///
-/// This VM's own implementation is preferred whenever it can serve the
-/// transformation — the behaviour every currently-passing caller sees. Only
-/// when it CANNOT does the named provider get a turn, and only then; if that
-/// provider does not own the service either, the original refusal is raised
-/// unchanged.
+/// A THIRD-PARTY provider the caller named by hand wins outright, even for a
+/// transformation this engine could serve itself. `getInstance(t, p)` is not a
+/// request for the best available implementation of `t` — it is a request for
+/// `p`'s, and answering it with another one is wrong however good the answer
+/// is. It had also become self-contradictory: `record_requested_provider` made
+/// `getProvider()` report the name the caller asked for while the work went to
+/// this crate's own AES/GCM engine, so the object described a provider it was
+/// not using. That is what let `AESTest`'s GCM reuse checks fail — BouncyCastle
+/// refuses a second `doFinal` and a repeated nonce, this engine had no such
+/// guard, and the `Cipher` said "BC" throughout.
+///
+/// "Third-party" is `provider_chain::third_party_service_class`'s own test: a
+/// provider outside `NATIVELY_SERVICED_PROVIDERS` that really registers the
+/// service. Naming `SunJCE` or another provider this VM implements natively
+/// still takes the native path, which is the same implementation by a
+/// different route.
+///
+/// Otherwise this VM's own implementation is preferred whenever it can serve
+/// the transformation, and only when it CANNOT does the named provider get a
+/// turn; if that provider does not own the service either, the original
+/// refusal is raised unchanged.
 fn cipher_get_instance_with_provider(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -1934,6 +1950,25 @@ fn cipher_get_instance_with_provider(
     algo_str: &str,
 ) -> MethodCallResult {
     let requested_provider = crate::jca::provider_chain::provider_arg_name(ctx, args, 1);
+    if let Some(provider) = requested_provider.as_deref() {
+        // Providers register a `Cipher` service under the bare algorithm and
+        // take mode/padding through `engineSetMode`/`engineSetPadding`, so the
+        // ownership question is asked about the base name only.
+        let base = algo_str.split('/').next().unwrap_or(algo_str);
+        if crate::jca::provider_chain::third_party_service_class(Some(provider), "Cipher", base)
+            .is_some()
+        {
+            let obj = cipher_alloc(ctx, algo)?;
+            // An `Err` here is the named provider refusing its own service's
+            // mode or padding, which is exactly what HotSpot surfaces from
+            // `Transform.setModePadding`. It must not be swallowed in favour of
+            // this engine's answer — see `try_delegate_cipher_to_named_provider`.
+            if try_delegate_cipher_to_named_provider(ctx, provider, algo_str, obj)? {
+                crate::jca::provider_chain::record_requested_provider(ctx, obj, provider);
+                return Ok(Some(Value::Object(Some(obj))));
+            }
+        }
+    }
     match check_transformation_supported(ctx, algo_str, GetInstanceForm::WithProvider) {
         Ok(_) => {
             let obj = cipher_alloc(ctx, algo)?;
@@ -2060,6 +2095,31 @@ fn try_delegate_cipher_to_provider(
     try_delegate_cipher_to_named_provider(ctx, &provider, algo, cipher_obj)
 }
 
+/// Is this refusal one `Cipher.getInstance` is allowed to hand back unchanged?
+///
+/// Only the two checked exceptions `CipherSpi.engineSetMode`/`engineSetPadding`
+/// declare. Everything else — a `NumberFormatException` out of a provider
+/// parsing a mode name, say — is a provider failure the JDK converts into
+/// "No such algorithm"; see the call site.
+fn cipher_refusal_is_declared(ctx: &mut dyn NativeContext, refusal: &MethodCallFailed) -> bool {
+    let MethodCallFailed::ExceptionThrown(exc) = refusal else {
+        return false;
+    };
+    let mut class_id = ctx.class_id_of_object(*exc);
+    loop {
+        match ctx.class_name_arc_of_id(class_id).as_deref() {
+            Some("java/security/NoSuchAlgorithmException")
+            | Some("javax/crypto/NoSuchPaddingException") => return true,
+            Some("java/lang/Throwable") | None => return false,
+            _ => {}
+        }
+        match ctx.superclass_of(class_id) {
+            Some(parent) => class_id = parent,
+            None => return false,
+        }
+    }
+}
+
 /// Ask ONE named provider to serve `algo`, and on success turn `cipher_obj`
 /// into a wrapper over its SPI. See [`try_delegate_cipher_to_provider`].
 fn try_delegate_cipher_to_named_provider(
@@ -2111,14 +2171,33 @@ fn try_delegate_cipher_to_named_provider(
     ctx.unpin_native_roots(pin);
     if let Some(refusal) = refusal {
         // The provider OWNS the algorithm and refused the mode or the padding.
-        // `Cipher.getInstance(t, provider)` lets `Transform.setModePadding`'s
-        // exception propagate — measured on HotSpot 25, `AES/EAX/PKCS5Padding`
-        // with BouncyCastle is `NoSuchPaddingException: Only NoPadding can be
-        // used with AEAD modes.`, the PROVIDER's own message. Swallowing it and
-        // reporting this engine's "No such algorithm" instead named the wrong
-        // layer and the wrong defect. The chain walk in
-        // `try_delegate_cipher_to_chain` ignores an `Err` and moves to the next
-        // provider, which is what the anonymous overload wants.
+        // `Cipher.getInstance(t, provider)` lets a DECLARED refusal propagate —
+        // measured on HotSpot 25, `AES/EAX/PKCS5Padding` with BouncyCastle is
+        // `NoSuchPaddingException: Only NoPadding can be used with AEAD modes.`,
+        // the PROVIDER's own message. Swallowing that and reporting this
+        // engine's "No such algorithm" instead named the wrong layer and the
+        // wrong defect.
+        //
+        // Anything else the provider throws is not a refusal, it is a provider
+        // failing to parse the string, and the JDK does not let it out:
+        // `createCipher` runs `setModePadding` inside a `catch (Exception)` and
+        // ends the loop with `NoSuchAlgorithmException: No such algorithm: <t>`.
+        // BouncyCastle's `engineSetMode` reads the bit count off a `CFB`/`OFB`
+        // mode name with `Integer.parseInt`, so `AES/CFBNOT_REAL/NoPadding`
+        // raises `NumberFormatException: For input string: "NOT_REAL"` — which
+        // this returned verbatim, from a method declaring neither
+        // (`BlockCipherTest.testIncorrectCipherModes`, index 6).
+        //
+        // The chain walk in `try_delegate_cipher_to_chain` ignores an `Err` and
+        // moves to the next provider, which is what the anonymous overload
+        // wants, so the conversion is done here rather than there.
+        if !cipher_refusal_is_declared(ctx, &refusal) {
+            return Err(crate::phases_early::throw_jca_exc(
+                ctx,
+                "java/security/NoSuchAlgorithmException",
+                &format!("No such algorithm: {algo}"),
+            ));
+        }
         return Err(refusal);
     }
     // The SPI lives in the Java-visible `spi` field so the collector owns it.
@@ -2248,6 +2327,53 @@ fn cipher_delegate_init(
 }
 
 /// Forward a byte-array-in / byte-array-out `Cipher` call to the delegate SPI.
+/// `CipherSpi.engineUpdate`/`engineDoFinal(byte[], int, int, byte[], int)` —
+/// the write-into-the-caller's-buffer form, which is exactly what
+/// `javax.crypto.Cipher` invokes for the matching `update`/`doFinal`
+/// overloads on a real provider.
+///
+/// The array-returning `([BII)[B` form cannot stand in for it. It CONSUMES the
+/// input and hands back a fresh array, so the output buffer is only measured
+/// afterwards — and a `ShortBufferException` raised at that point leaves the
+/// cipher state already advanced, with the produced block still to come. The
+/// next `update` then emits it as a spurious leading block: measured as
+/// `BlockCipherTest` index 6, "update DES failed decryption", whose `got` is
+/// the expected stream with one extra 8-byte block in front. Providers own
+/// this decision and make it BEFORE processing — BouncyCastle's
+/// `BaseBlockCipher.engineUpdate` refuses on
+/// `outputOffset + getUpdateOutputSize(inputLen) > output.length` — so calling
+/// their own method both keeps the state clean and reports the refusal in
+/// their own words, instead of this file re-deciding it one step too late.
+fn cipher_delegate_into_buffer(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    engine_method: &str,
+    input: Option<ObjectRef>,
+    off: i32,
+    len: i32,
+    output: ObjectRef,
+    out_off: i32,
+) -> MethodCallResult {
+    let Some(spi) = cipher_delegate_spi(ctx, this) else {
+        return Err(cratonvm_types::error::RuntimeError::IllegalStateException {
+            message: "Cipher was marked as provider-delegated but carries no SPI".to_string(),
+        }
+        .into());
+    };
+    ctx.invoke_virtual(
+        spi,
+        engine_method,
+        "([BII[BI)I",
+        &[
+            Value::Object(input),
+            Value::Int(off),
+            Value::Int(len),
+            Value::Object(Some(output)),
+            Value::Int(out_off),
+        ],
+    )
+}
+
 fn cipher_delegate_bytes(
     ctx: &mut dyn NativeContext,
     this: ObjectRef,
@@ -4801,25 +4927,20 @@ fn register_cipher_dispatch(r: &mut NativeMethodRegistry) {
             let off = args.get(2).and_then(|v| v.as_int()).unwrap_or(0);
             let len = args.get(3).and_then(|v| v.as_int()).unwrap_or(0);
             let output = obj_arg(args, 4)?;
-            let out_off = args.get(5).and_then(|v| v.as_int()).unwrap_or(0).max(0) as usize;
+            let out_off = args.get(5).and_then(|v| v.as_int()).unwrap_or(0);
             if cipher_is_delegated(ctx, this) {
-                let opin = ctx.pin_native_root(output);
-                let produced = cipher_delegate_bytes(ctx, this, "engineUpdate", input, off, len);
-                let output = ctx.read_native_pin(opin, output);
-                ctx.unpin_native_roots(opin);
-                let bytes = match produced? {
-                    Some(Value::Object(Some(a))) => read_bytes(ctx, a),
-                    _ => Vec::new(),
-                };
-                if out_off + bytes.len() > ctx.array_length(output) {
-                    return Err(crate::phases_early::throw_jca_exc(
-                        ctx,
-                        "javax/crypto/ShortBufferException",
-                        "output buffer too small",
-                    ));
-                }
-                ctx.write_byte_array_from(output, out_off, &bytes);
-                return Ok(Some(Value::Int(bytes.len() as i32)));
+                // The provider writes into the caller's buffer itself and owns
+                // the short-buffer refusal; see `cipher_delegate_into_buffer`.
+                return cipher_delegate_into_buffer(
+                    ctx,
+                    this,
+                    "engineUpdate",
+                    input,
+                    off,
+                    len,
+                    output,
+                    out_off,
+                );
             }
             // Non-delegated behaviour matches the other `update` overloads:
             // buffer into the accumulator, produce nothing until `doFinal`.
@@ -5008,27 +5129,29 @@ fn register_cipher_dispatch(r: &mut NativeMethodRegistry) {
             // The three sibling `doFinal` overloads route a delegated cipher to
             // its provider; these did not, so a caller reaching for the
             // write-into-my-buffer form got OUR implementation of a
-            // transformation the provider was chosen to supply.
-            let delegated_result = if cipher_is_delegated(ctx, this) {
-                Some(cipher_delegate_bytes(
+            // transformation the provider was chosen to supply. It goes to the
+            // provider's OWN write-into-the-buffer method rather than to the
+            // array-returning one plus a bounds check here — see
+            // `cipher_delegate_into_buffer`. `Cipher.doFinal(byte[], int)`
+            // passes `(null, 0, 0, output, outputOffset)`, which is exactly
+            // what the no-input overload builds above.
+            if cipher_is_delegated(ctx, this) {
+                return cipher_delegate_into_buffer(
                     ctx,
                     this,
                     "engineDoFinal",
                     input,
                     off,
                     len,
-                ))
-            } else {
-                None
-            };
-            if delegated_result.is_none() && has_input {
+                    output,
+                    out_off,
+                );
+            }
+            if has_input {
                 accumulate_slice(ctx, this, args.get(1), args.get(2), args.get(3));
             }
             let opin = ctx.pin_native_root(output);
-            let res = match delegated_result {
-                Some(r) => r,
-                None => cipher_do_final_impl(ctx, this),
-            };
+            let res = cipher_do_final_impl(ctx, this);
             let out_bytes = match res {
                 Ok(Some(Value::Object(Some(a)))) => read_bytes(ctx, a),
                 // P0: this used to be `Ok(_) => Vec::new()`, which wrote nothing
