@@ -1362,6 +1362,30 @@ pub fn update_all_roots(
         .thread_registry
         .fold_pointer_map_into_blocked_audited(pointer_map, Some(&shared.mem.heap));
 
+
+    // 21. Registry java.lang.Thread mirrors + the unpark(Thread) reverse
+    //     index (keyed by mirror address). Scanned as roots in roots.rs
+    //     step 10b; without the remap the registry serves stale mirrors
+    //     back into bytecode and `LockSupport.unpark(Thread)` lookups by
+    //     the relocated address silently miss (lost wakeups).
+    shared
+        .threads
+        .thread_registry
+        .update_thread_objs_after_gc(pointer_map);
+
+    // 22. Uniform native-root registry — the post-move companion to
+    //     `roots.rs` step 21, driven above via `native_roots::remap_all_roots`.
+    //     Fans out over `native_roots::VM_ROOT_SOURCES`, repointing each held
+    //     ObjectRef through `pointer_map`. Each remap self-guards the empty
+    //     (non-moving) map, and each receives the OWNING `SharedVm` so one VM's
+    //     fixup cannot rewrite another VM's entries.
+
+    // Post-GC verification: check that no frame refs still point to relocated addresses.
+    verify_no_stale_refs(thread, pointer_map);
+    // Opt-in (CRATONVM_DBG_HEAP_STALE=1) deep heap-walk: catch un-forwarded /
+    // reclaimed reference fields in OTHER objects (not just this thread's
+    // frames) — where the residual ClassLoader/Locale stale-ref actually lives.
+    verify_heap_object_fields(shared, pointer_map);
     // THE SCAN INVENTORY AND THE REMAP INVENTORY ARE TWO LISTS
     // (`CRATONVM_DBG_ROOT_REMAP_AUDIT=1`).
     //
@@ -1416,30 +1440,6 @@ pub fn update_all_roots(
             );
         }
     }
-
-    // 21. Registry java.lang.Thread mirrors + the unpark(Thread) reverse
-    //     index (keyed by mirror address). Scanned as roots in roots.rs
-    //     step 10b; without the remap the registry serves stale mirrors
-    //     back into bytecode and `LockSupport.unpark(Thread)` lookups by
-    //     the relocated address silently miss (lost wakeups).
-    shared
-        .threads
-        .thread_registry
-        .update_thread_objs_after_gc(pointer_map);
-
-    // 22. Uniform native-root registry — the post-move companion to
-    //     `roots.rs` step 21, driven above via `native_roots::remap_all_roots`.
-    //     Fans out over `native_roots::VM_ROOT_SOURCES`, repointing each held
-    //     ObjectRef through `pointer_map`. Each remap self-guards the empty
-    //     (non-moving) map, and each receives the OWNING `SharedVm` so one VM's
-    //     fixup cannot rewrite another VM's entries.
-
-    // Post-GC verification: check that no frame refs still point to relocated addresses.
-    verify_no_stale_refs(thread, pointer_map);
-    // Opt-in (CRATONVM_DBG_HEAP_STALE=1) deep heap-walk: catch un-forwarded /
-    // reclaimed reference fields in OTHER objects (not just this thread's
-    // frames) — where the residual ClassLoader/Locale stale-ref actually lives.
-    verify_heap_object_fields(shared, pointer_map);
 }
 
 /// Opt-in young-object size validator (`CRATONVM_DBG_VALIDATE_NEW=1`). Walks
